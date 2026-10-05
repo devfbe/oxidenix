@@ -78,7 +78,11 @@ impl Console {
     }
 
     pub fn write_str(&mut self, s: &str) {
-        for byte in s.bytes() {
+        self.write_bytes(s.as_bytes());
+    }
+
+    pub fn write_bytes(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
             match byte {
                 0x20..=0x7e | b'\n' | b'\r' => self.write_byte(byte),
                 _ => self.write_byte(b'?'),
@@ -149,6 +153,14 @@ pub fn _print(args: fmt::Arguments) {
     x86_64::instructions::interrupts::without_interrupts(|| {
         if let Some(c) = CONSOLE.lock().as_mut() {
             let _ = c.write_fmt(args);
+        }
+    });
+}
+
+pub fn write_bytes(bytes: &[u8]) {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        if let Some(c) = CONSOLE.lock().as_mut() {
+            c.write_bytes(bytes);
         }
     });
 }

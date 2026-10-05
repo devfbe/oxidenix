@@ -11,11 +11,13 @@ use core::panic::PanicInfo;
 mod drivers;
 mod interrupts;
 mod memory;
+mod process;
 mod shell;
 
 pub static BOOTLOADER_CONFIG: BootloaderConfig = {
     let mut config = BootloaderConfig::new_default();
     config.mappings.physical_memory = Some(Mapping::Dynamic);
+    config.mappings.dynamic_range_start = Some(0xffff_8000_0000_0000);
     config
 };
 
@@ -31,6 +33,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         .into_option()
         .expect("Bootloader hat physischen Speicher nicht gemappt");
     memory::init(&boot_info.memory_regions, phys_offset);
+    process::init();
     shell::run();
 }
 

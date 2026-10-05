@@ -8,6 +8,7 @@ pub fn dispatch(cmd: &str, args: &Vec<&str, 8>) {
         "halt" => cmd_halt(),
         "info" => cmd_info(),
         "mem" => cmd_mem(),
+        "run" => cmd_run(args),
         "" => {}
         other => crate::printkln!("unbekannter befehl: {}", other),
     }
@@ -20,6 +21,7 @@ fn cmd_help() {
     crate::printkln!("  echo <text>   - Text ausgeben");
     crate::printkln!("  info          - CPU-Infos");
     crate::printkln!("  mem           - Speicherstatistik + Selbsttest");
+    crate::printkln!("  run <prog>    - Userspace-Programm starten");
     crate::printkln!("  halt          - System anhalten");
 }
 
@@ -142,4 +144,19 @@ fn cmd_mem() {
         ok(frames_ok),
         ok(after.used_frames == before.used_frames)
     );
+}
+
+fn cmd_run(args: &Vec<&str, 8>) {
+    let Some(&name) = args.first() else {
+        crate::printk!("Programme:");
+        for (name, _) in crate::process::PROGRAMS {
+            crate::printk!(" {}", name);
+        }
+        crate::printkln!();
+        return;
+    };
+    match crate::process::run(name, args) {
+        Ok(code) => crate::printkln!("[{} beendet mit Code {}]", name, code),
+        Err(e) => crate::printkln!("run: {}", e),
+    }
 }

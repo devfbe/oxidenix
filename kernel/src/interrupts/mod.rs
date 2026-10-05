@@ -28,6 +28,9 @@ lazy_static! {
                 .set_stack_index(gdt::DOUBLE_FAULT_IST_INDEX);
         }
         idt.page_fault.set_handler_fn(handlers::page_fault_handler);
+        idt.general_protection_fault
+            .set_handler_fn(handlers::general_protection_handler);
+        idt.invalid_opcode.set_handler_fn(handlers::invalid_opcode_handler);
         idt[InterruptIndex::Keyboard as u8]
             .set_handler_fn(handlers::keyboard_interrupt_handler);
         idt

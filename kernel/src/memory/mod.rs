@@ -6,11 +6,13 @@ use linked_list_allocator::LockedHeap;
 use spin::{Mutex, Once};
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::{
-    FrameAllocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags, Size4KiB,
+    FrameAllocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags, PhysFrame,
+    Size4KiB,
 };
 use x86_64::VirtAddr;
 
-pub const HEAP_START: u64 = 0x4444_4444_0000;
+// Obere Adresshaelfte; die untere gehoert den Prozessen.
+pub const HEAP_START: u64 = 0xffff_c000_0000_0000;
 pub const HEAP_SIZE: u64 = 2 * 1024 * 1024;
 
 #[global_allocator]
@@ -18,9 +20,11 @@ static HEAP: LockedHeap = LockedHeap::empty();
 
 pub static FRAMES: Mutex<Option<PhysFrameAllocator>> = Mutex::new(None);
 static PHYS_OFFSET: Once<VirtAddr> = Once::new();
+static KERNEL_L4: Once<PhysFrame> = Once::new();
 
 pub fn init(regions: &'static [MemoryRegion], phys_offset: u64) {
     let phys_offset = *PHYS_OFFSET.call_once(|| VirtAddr::new(phys_offset));
+    KERNEL_L4.call_once(|| Cr3::read().0);
     let mut frames = PhysFrameAllocator::new(regions, phys_offset);
     let mut mapper = unsafe { active_page_table() };
 
@@ -44,6 +48,23 @@ pub unsafe fn active_page_table() -> OffsetPageTable<'static> {
     let (l4_frame, _) = Cr3::read();
     let l4: *mut PageTable = (offset + l4_frame.start_address().as_u64()).as_mut_ptr();
     unsafe { OffsetPageTable::new(&mut *l4, offset) }
+}
+
+pub fn phys_offset() -> VirtAddr {
+    *PHYS_OFFSET.get().expect("memory::init fehlt")
+}
+
+pub fn kernel_l4() -> PhysFrame {
+    *KERNEL_L4.get().expect("memory::init fehlt")
+}
+
+/// Liefert einen virtuellen Zeiger auf eine physische Adresse.
+pub fn phys_to_virt(addr: u64) -> *mut u8 {
+    (phys_offset() + addr).as_mut_ptr()
+}
+
+pub fn with_frames<R>(f: impl FnOnce(&mut PhysFrameAllocator) -> R) -> R {
+    f(FRAMES.lock().as_mut().expect("memory::init fehlt"))
 }
 
 pub struct Stats {

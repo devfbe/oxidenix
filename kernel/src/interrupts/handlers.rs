@@ -1,4 +1,5 @@
 use x86_64::instructions::port::Port;
+use x86_64::PrivilegeLevel;
 use x86_64::structures::idt::{InterruptStackFrame, PageFaultErrorCode};
 
 pub extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFrame) {
@@ -17,6 +18,14 @@ pub extern "x86-interrupt" fn page_fault_handler(
     error_code: PageFaultErrorCode,
 ) {
     use x86_64::registers::control::Cr2;
+    if from_user(&stack_frame) {
+        crate::printkln!(
+            "[kernel] Speicherzugriffsfehler bei {:#x} (rip {:#x}) - Programm beendet",
+            Cr2::read_raw(),
+            stack_frame.instruction_pointer.as_u64()
+        );
+        unsafe { crate::process::return_to_kernel(-11) };
+    }
     crate::printkln!("EXCEPTION: PAGE FAULT");
     crate::printkln!("Accessed Address: {:?}", Cr2::read());
     crate::printkln!("Error Code: {:?}", error_code);
@@ -36,4 +45,30 @@ pub extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: Interrupt
             .lock()
             .notify_end_of_interrupt(crate::interrupts::InterruptIndex::Keyboard as u8);
     }
+}
+
+pub extern "x86-interrupt" fn general_protection_handler(stack_frame: InterruptStackFrame, error_code: u64) {
+    if from_user(&stack_frame) {
+        crate::printkln!(
+            "[kernel] Schutzverletzung (rip {:#x}) - Programm beendet",
+            stack_frame.instruction_pointer.as_u64()
+        );
+        unsafe { crate::process::return_to_kernel(-11) };
+    }
+    panic!("EXCEPTION: GENERAL PROTECTION ({:#x})\n{:#?}", error_code, stack_frame);
+}
+
+pub extern "x86-interrupt" fn invalid_opcode_handler(stack_frame: InterruptStackFrame) {
+    if from_user(&stack_frame) {
+        crate::printkln!(
+            "[kernel] Ungueltiger Befehl (rip {:#x}) - Programm beendet",
+            stack_frame.instruction_pointer.as_u64()
+        );
+        unsafe { crate::process::return_to_kernel(-4) };
+    }
+    panic!("EXCEPTION: INVALID OPCODE\n{:#?}", stack_frame);
+}
+
+fn from_user(frame: &InterruptStackFrame) -> bool {
+    frame.code_segment.rpl() == PrivilegeLevel::Ring3
 }
