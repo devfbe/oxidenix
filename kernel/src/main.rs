@@ -1,15 +1,18 @@
 #![no_std]
 #![no_main]
+#![feature(abi_x86_interrupt)]
 
 use bootloader_api::{entry_point, BootInfo};
 use core::panic::PanicInfo;
 
 mod drivers;
+mod interrupts;
 
 entry_point!(kernel_main);
 
 fn kernel_main(_boot_info: &'static mut BootInfo) -> ! {
-    printkln!("Kernel gestartet!");
+    interrupts::init();
+    printkln!("Interrupts initialisiert.");
     loop {}
 }
 
