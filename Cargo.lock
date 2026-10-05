@@ -250,7 +250,6 @@ dependencies = [
  "pc-keyboard",
  "pic8259",
  "spin",
- "volatile",
  "x86_64 0.15.5",
 ]
 
