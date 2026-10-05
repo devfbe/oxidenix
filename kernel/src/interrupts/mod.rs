@@ -12,6 +12,7 @@ pub const PIC_2_OFFSET: u8 = 40;
 #[derive(Debug, Clone, Copy)]
 #[repr(u8)]
 pub enum InterruptIndex {
+    Timer = PIC_1_OFFSET,
     Keyboard = PIC_1_OFFSET + 1,
 }
 
@@ -31,6 +32,7 @@ lazy_static! {
         idt.general_protection_fault
             .set_handler_fn(handlers::general_protection_handler);
         idt.invalid_opcode.set_handler_fn(handlers::invalid_opcode_handler);
+        idt[InterruptIndex::Timer as u8].set_handler_fn(handlers::timer_interrupt_handler);
         idt[InterruptIndex::Keyboard as u8]
             .set_handler_fn(handlers::keyboard_interrupt_handler);
         idt
@@ -43,8 +45,9 @@ pub fn init() {
     unsafe {
         let mut pics = PICS.lock();
         pics.initialize();
-        // Nur IRQ1 (Keyboard) zulassen; IRQ0 (Timer) hat keinen Handler.
-        pics.write_masks(0b1111_1101, 0b1111_1111);
+        // Nur IRQ0 (Timer) und IRQ1 (Keyboard) zulassen.
+        pics.write_masks(0b1111_1100, 0b1111_1111);
+        init_pit(100);
         drain_ps2_output();
     }
     x86_64::instructions::interrupts::enable();
@@ -58,4 +61,15 @@ unsafe fn drain_ps2_output() {
     while status.read() & 1 != 0 {
         data.read();
     }
+}
+
+/// Programmiert den PIT-Kanal 0 als periodischen Timer.
+unsafe fn init_pit(hz: u32) {
+    use x86_64::instructions::port::Port;
+    let divisor = (1_193_182 / hz) as u16;
+    let mut cmd: Port<u8> = Port::new(0x43);
+    let mut ch0: Port<u8> = Port::new(0x40);
+    cmd.write(0x36);
+    ch0.write(divisor as u8);
+    ch0.write((divisor >> 8) as u8);
 }

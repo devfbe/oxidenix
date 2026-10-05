@@ -155,8 +155,19 @@ fn cmd_run(args: &Vec<&str, 8>) {
         crate::printkln!();
         return;
     };
-    match crate::process::run(name, args) {
-        Ok(code) => crate::printkln!("[{} beendet mit Code {}]", name, code),
-        Err(e) => crate::printkln!("run: {}", e),
+    let pid = match crate::process::spawn(name, args) {
+        Ok(pid) => pid,
+        Err(errno) => {
+            crate::printkln!("run: {} nicht startbar (errno {})", name, errno);
+            return;
+        }
+    };
+    match crate::process::wait_for(pid) {
+        Ok(status) => match crate::process::decode_status(status) {
+            (true, code) => crate::printkln!("[{} (pid {}) beendet mit Code {}]", name, pid, code),
+            (false, sig) => crate::printkln!("[{} (pid {}) durch Signal {} beendet]", name, pid, sig),
+        },
+        Err(errno) => crate::printkln!("run: warten fehlgeschlagen (errno {})", errno),
     }
+    crate::process::reap_orphans();
 }

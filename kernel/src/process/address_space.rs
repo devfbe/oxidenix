@@ -4,6 +4,7 @@ use x86_64::structures::paging::{
     FrameAllocator, FrameDeallocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags,
     PhysFrame, Size4KiB, Translate,
 };
+use x86_64::structures::paging::page_table::PageTableEntry;
 use x86_64::VirtAddr;
 
 pub const USER_END: u64 = 0x0000_8000_0000_0000;
@@ -84,6 +85,40 @@ impl AddressSpace {
         Ok(())
     }
 
+    /// Tiefe Kopie aller User-Seiten (fuer fork).
+    pub fn clone_user(&self) -> Result<AddressSpace, &'static str> {
+        let new = AddressSpace::new().ok_or("kein Speicher frei")?;
+        let mut mapper = new.mapper();
+        let parent = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+        // Fehler erst ausserhalb von with_frames zurueckgeben: Drop von `new` braucht den Lock.
+        memory::with_frames(|frames| {
+            let l4 = table_at(self.l4);
+            for i4 in 0..256 {
+                for (i3, l3e) in children(&l4[i4]) {
+                    for (i2, l2e) in children(l3e) {
+                        for (i1, leaf) in children(l2e) {
+                            let va = (i4 as u64) << 39 | (i3 as u64) << 30 | (i2 as u64) << 21 | (i1 as u64) << 12;
+                            let frame = frames.allocate_frame().ok_or("kein Speicher frei")?;
+                            unsafe {
+                                core::ptr::copy_nonoverlapping(
+                                    memory::phys_to_virt(leaf.addr().as_u64()),
+                                    memory::phys_to_virt(frame.start_address().as_u64()),
+                                    PAGE as usize,
+                                )
+                            };
+                            let page = Page::<Size4KiB>::containing_address(VirtAddr::new(va));
+                            unsafe { mapper.map_to_with_table_flags(page, frame, leaf.flags(), parent, frames) }
+                                .map_err(|_| "map_to fehlgeschlagen")?
+                                .ignore();
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })?;
+        Ok(new)
+    }
+
     pub fn activate(&self) {
         unsafe { Cr3::write(self.l4, Cr3Flags::empty()) };
     }
@@ -117,6 +152,16 @@ unsafe fn free_level(frames: &mut memory::frame::PhysFrameAllocator, table_frame
         }
     }
     unsafe { frames.deallocate_frame(table_frame) };
+}
+
+/// Belegte Eintraege der Tabelle, auf die `entry` zeigt (leer, wenn ungenutzt).
+fn children(entry: &PageTableEntry) -> impl Iterator<Item = (usize, &'static PageTableEntry)> {
+    let table: Option<&'static PageTable> = (!entry.is_unused())
+        .then(|| &*table_at(PhysFrame::containing_address(entry.addr())));
+    table
+        .into_iter()
+        .flat_map(|t| t.iter().enumerate())
+        .filter(|(_, e)| !e.is_unused())
 }
 
 fn table_at(frame: PhysFrame) -> &'static mut PageTable {

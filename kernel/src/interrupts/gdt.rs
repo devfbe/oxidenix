@@ -4,8 +4,6 @@ use x86_64::structures::tss::TaskStateSegment;
 use x86_64::VirtAddr;
 
 pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
-/// Fuer Assembler-Code, der keine Laufzeit-Selektoren lesen kann.
-pub const KERNEL_DATA_SELECTOR: u16 = 0x10;
 
 const STACK_SIZE: usize = 4096 * 5;
 
@@ -21,16 +19,10 @@ fn stack_top(stack: *const Stack) -> VirtAddr {
     VirtAddr::from_ptr(stack) + STACK_SIZE as u64
 }
 
-lazy_static! {
-    static ref TSS: TaskStateSegment = {
-        let mut tss = TaskStateSegment::new();
-        tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] =
-            stack_top(&raw const DOUBLE_FAULT_STACK);
-        // Stack fuer Interrupts, die im Ring 3 eintreffen.
-        tss.privilege_stack_table[0] = stack_top(&raw const RING0_STACK);
-        tss
-    };
+// Veraenderbar, weil rsp0 bei jedem Prozesswechsel neu gesetzt wird.
+static mut TSS: TaskStateSegment = TaskStateSegment::new();
 
+lazy_static! {
     // Reihenfolge ist durch sysret vorgegeben: user data direkt vor user code.
     static ref GDT: (GlobalDescriptorTable, Selectors) = {
         let mut gdt = GlobalDescriptorTable::new();
@@ -38,7 +30,7 @@ lazy_static! {
         let kernel_data = gdt.append(Descriptor::kernel_data_segment());
         let user_data = gdt.append(Descriptor::user_data_segment());
         let user_code = gdt.append(Descriptor::user_code_segment());
-        let tss = gdt.append(Descriptor::tss_segment(&TSS));
+        let tss = gdt.append(Descriptor::tss_segment(unsafe { &*(&raw const TSS) }));
         (
             gdt,
             Selectors {
@@ -69,7 +61,12 @@ pub fn init() {
     use x86_64::instructions::segmentation::{Segment, CS, DS, ES, SS};
     use x86_64::instructions::tables::load_tss;
 
-    assert_eq!(GDT.1.kernel_data.0, KERNEL_DATA_SELECTOR);
+    unsafe {
+        let tss = &mut *(&raw mut TSS);
+        tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] =
+            stack_top(&raw const DOUBLE_FAULT_STACK);
+        tss.privilege_stack_table[0] = stack_top(&raw const RING0_STACK);
+    }
     GDT.0.load();
     unsafe {
         CS::set_reg(GDT.1.kernel_code);
@@ -78,4 +75,9 @@ pub fn init() {
         ES::set_reg(GDT.1.kernel_data);
         load_tss(GDT.1.tss);
     }
+}
+
+/// Stack, auf den die CPU bei Interrupts aus dem Ring 3 wechselt.
+pub fn set_kernel_stack(top: VirtAddr) {
+    unsafe { (*(&raw mut TSS)).privilege_stack_table[0] = top };
 }

@@ -165,6 +165,13 @@ pub fn write_bytes(bytes: &[u8]) {
     });
 }
 
+/// (Spalten, Zeilen)
+pub fn size() -> (usize, usize) {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        CONSOLE.lock().as_ref().map_or((80, 25), |c| (c.cols(), c.rows()))
+    })
+}
+
 pub fn clear_screen() {
     if let Some(c) = CONSOLE.lock().as_mut() {
         c.clear_screen();

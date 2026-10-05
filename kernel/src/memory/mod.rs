@@ -13,7 +13,7 @@ use x86_64::VirtAddr;
 
 // Obere Adresshaelfte; die untere gehoert den Prozessen.
 pub const HEAP_START: u64 = 0xffff_c000_0000_0000;
-pub const HEAP_SIZE: u64 = 2 * 1024 * 1024;
+pub const HEAP_SIZE: u64 = 16 * 1024 * 1024;
 
 #[global_allocator]
 static HEAP: LockedHeap = LockedHeap::empty();

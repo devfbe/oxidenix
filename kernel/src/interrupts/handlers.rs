@@ -24,7 +24,7 @@ pub extern "x86-interrupt" fn page_fault_handler(
             Cr2::read_raw(),
             stack_frame.instruction_pointer.as_u64()
         );
-        unsafe { crate::process::return_to_kernel(-11) };
+        crate::process::exit(11);
     }
     crate::printkln!("EXCEPTION: PAGE FAULT");
     crate::printkln!("Accessed Address: {:?}", Cr2::read());
@@ -32,6 +32,18 @@ pub extern "x86-interrupt" fn page_fault_handler(
     crate::printkln!("{:#?}", stack_frame);
     loop {
         x86_64::instructions::hlt();
+    }
+}
+
+pub extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFrame) {
+    unsafe {
+        crate::interrupts::PICS
+            .lock()
+            .notify_end_of_interrupt(crate::interrupts::InterruptIndex::Timer as u8);
+    }
+    // Der Kernel ist nicht praeemptiv: nur Userspace-Code wird unterbrochen.
+    if from_user(&stack_frame) {
+        crate::process::schedule();
     }
 }
 
@@ -53,7 +65,7 @@ pub extern "x86-interrupt" fn general_protection_handler(stack_frame: InterruptS
             "[kernel] Schutzverletzung (rip {:#x}) - Programm beendet",
             stack_frame.instruction_pointer.as_u64()
         );
-        unsafe { crate::process::return_to_kernel(-11) };
+        crate::process::exit(11);
     }
     panic!("EXCEPTION: GENERAL PROTECTION ({:#x})\n{:#?}", error_code, stack_frame);
 }
@@ -64,7 +76,7 @@ pub extern "x86-interrupt" fn invalid_opcode_handler(stack_frame: InterruptStack
             "[kernel] Ungueltiger Befehl (rip {:#x}) - Programm beendet",
             stack_frame.instruction_pointer.as_u64()
         );
-        unsafe { crate::process::return_to_kernel(-4) };
+        crate::process::exit(4);
     }
     panic!("EXCEPTION: INVALID OPCODE\n{:#?}", stack_frame);
 }
