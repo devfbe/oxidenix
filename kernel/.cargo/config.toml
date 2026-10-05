@@ -6,4 +6,4 @@ build-std-features = ["compiler-builtins-mem"]
 target = "x86_64-unknown-none"
 
 [target.x86_64-unknown-none]
-runner = "cargo run --manifest-path ../builder/Cargo.toml --"
+runner = "./run-builder.sh"
