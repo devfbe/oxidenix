@@ -7,6 +7,7 @@ pub fn dispatch(cmd: &str, args: &Vec<&str, 8>) {
         "echo" => cmd_echo(args),
         "halt" => cmd_halt(),
         "info" => cmd_info(),
+        "mem" => cmd_mem(),
         "" => {}
         other => crate::printkln!("unbekannter befehl: {}", other),
     }
@@ -18,6 +19,7 @@ fn cmd_help() {
     crate::printkln!("  clear         - Bildschirm leeren");
     crate::printkln!("  echo <text>   - Text ausgeben");
     crate::printkln!("  info          - CPU-Infos");
+    crate::printkln!("  mem           - Speicherstatistik + Selbsttest");
     crate::printkln!("  halt          - System anhalten");
 }
 
@@ -84,4 +86,60 @@ fn cmd_info() {
         }
     }
     crate::printkln!();
+}
+
+fn cmd_mem() {
+    use crate::memory;
+    use alloc::{boxed::Box, format, vec::Vec};
+    use x86_64::structures::paging::{FrameAllocator, FrameDeallocator};
+
+    let before = memory::stats();
+
+    let v: Vec<u64> = (0..10_000).collect();
+    let b = Box::new(0xdead_beef_u64);
+    let s = format!("heap ok {}", v.len());
+    let heap_ok = v.iter().sum::<u64>() == 49_995_000 && *b == 0xdead_beef && s == "heap ok 10000";
+    let heap_during = memory::stats().heap_used;
+    drop((v, b, s));
+    let heap_back = memory::stats().heap_used == before.heap_used;
+
+    let frames_ok = {
+        let mut guard = memory::FRAMES.lock();
+        let fa = guard.as_mut().unwrap();
+        let a = fa.allocate_frame().unwrap();
+        let b = fa.allocate_frame().unwrap();
+        unsafe {
+            fa.deallocate_frame(a);
+            fa.deallocate_frame(b);
+        }
+        let b2 = fa.allocate_frame().unwrap();
+        let a2 = fa.allocate_frame().unwrap();
+        unsafe {
+            fa.deallocate_frame(a2);
+            fa.deallocate_frame(b2);
+        }
+        a != b && a2 == a && b2 == b
+    };
+    let after = memory::stats();
+
+    crate::printkln!(
+        "RAM:  {} / {} KiB belegt ({} Frames frei)",
+        after.used_frames * 4,
+        after.total_frames * 4,
+        after.total_frames - after.used_frames
+    );
+    crate::printkln!(
+        "Heap: {} / {} KiB belegt",
+        after.heap_used / 1024,
+        (after.heap_used + after.heap_free) / 1024
+    );
+    let ok = |b: bool| if b { "ok" } else { "FEHLER" };
+    crate::printkln!(
+        "Test: heap alloc {} (peak {} KiB), heap free {}, frame reuse {}, frames balanced {}",
+        ok(heap_ok),
+        heap_during / 1024,
+        ok(heap_back),
+        ok(frames_ok),
+        ok(after.used_frames == before.used_frames)
+    );
 }
