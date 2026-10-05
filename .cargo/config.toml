@@ -1,0 +1,2 @@
+# Workspace-root config — intentionally minimal.
+# Kernel-specific settings (target, build-std, runner) live in kernel/.cargo/config.toml

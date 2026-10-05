@@ -1,0 +1,9 @@
+[workspace]
+members = ["kernel", "builder"]
+resolver = "2"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

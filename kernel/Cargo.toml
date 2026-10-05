@@ -1,0 +1,25 @@
+[package]
+name = "kernel"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "kernel"
+test = false
+bench = false
+
+[dependencies]
+bootloader_api = "0.11"
+x86_64 = "0.15"
+pic8259 = "0.10"
+pc-keyboard = "0.7"
+spin = "0.9"
+volatile = "0.4"
+heapless = "0.8"
+lazy_static = { version = "1.0", features = ["spin_no_std"] }
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
