@@ -12,8 +12,13 @@ entry_point!(kernel_main);
 
 fn kernel_main(_boot_info: &'static mut BootInfo) -> ! {
     interrupts::init();
-    printkln!("Interrupts initialisiert.");
-    loop {}
+    printkln!("Druecke eine Taste...");
+    loop {
+        if let Some(sc) = drivers::keyboard::pop_scancode() {
+            printkln!("Scancode: {:#x}", sc);
+        }
+        x86_64::instructions::hlt();
+    }
 }
 
 #[panic_handler]

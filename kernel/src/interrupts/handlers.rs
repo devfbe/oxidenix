@@ -1,3 +1,4 @@
+use x86_64::instructions::port::Port;
 use x86_64::structures::idt::{InterruptStackFrame, PageFaultErrorCode};
 
 pub extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFrame) {
@@ -22,5 +23,17 @@ pub extern "x86-interrupt" fn page_fault_handler(
     crate::printkln!("{:#?}", stack_frame);
     loop {
         x86_64::instructions::hlt();
+    }
+}
+
+pub extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    let mut port = Port::new(0x60);
+    let scancode: u8 = unsafe { port.read() };
+    crate::drivers::keyboard::push_scancode(scancode);
+
+    unsafe {
+        crate::interrupts::PICS
+            .lock()
+            .notify_end_of_interrupt(crate::interrupts::InterruptIndex::Keyboard as u8);
     }
 }
