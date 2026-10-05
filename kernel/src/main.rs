@@ -7,22 +7,19 @@ use core::panic::PanicInfo;
 
 mod drivers;
 mod interrupts;
+mod shell;
 
 entry_point!(kernel_main);
 
 fn kernel_main(_boot_info: &'static mut BootInfo) -> ! {
     interrupts::init();
-    printkln!("Druecke eine Taste...");
-    loop {
-        if let Some(sc) = drivers::keyboard::pop_scancode() {
-            printkln!("Scancode: {:#x}", sc);
-        }
-        x86_64::instructions::hlt();
-    }
+    shell::run();
 }
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    printkln!("PANIC: {}", info);
-    loop {}
+    printkln!("KERNEL PANIC: {}", info);
+    loop {
+        x86_64::instructions::hlt();
+    }
 }
