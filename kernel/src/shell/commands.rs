@@ -22,7 +22,7 @@ fn cmd_help() {
 }
 
 fn cmd_clear() {
-    crate::drivers::vga::clear_screen();
+    crate::drivers::console::clear_screen();
 }
 
 fn cmd_echo(args: &Vec<&str, 8>) {

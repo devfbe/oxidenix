@@ -12,7 +12,7 @@ lazy_static! {
             const STACK_SIZE: usize = 4096 * 5;
             static mut STACK: [u8; STACK_SIZE] = [0; STACK_SIZE];
             // SAFETY: single-threaded kernel init, executed once
-            let stack_start = VirtAddr::from_ptr(unsafe { &raw const STACK });
+            let stack_start = VirtAddr::from_ptr(&raw const STACK);
             stack_start + STACK_SIZE as u64
         };
         tss
@@ -21,23 +21,28 @@ lazy_static! {
     static ref GDT: (GlobalDescriptorTable, Selectors) = {
         let mut gdt = GlobalDescriptorTable::new();
         let code = gdt.append(Descriptor::kernel_code_segment());
+        let data = gdt.append(Descriptor::kernel_data_segment());
         let tss_sel = gdt.append(Descriptor::tss_segment(&TSS));
-        (gdt, Selectors { code, tss: tss_sel })
+        (gdt, Selectors { code, data, tss: tss_sel })
     };
 }
 
 struct Selectors {
     code: SegmentSelector,
+    data: SegmentSelector,
     tss: SegmentSelector,
 }
 
 pub fn init() {
-    use x86_64::instructions::segmentation::{Segment, CS};
+    use x86_64::instructions::segmentation::{Segment, CS, DS, ES, SS};
     use x86_64::instructions::tables::load_tss;
 
     GDT.0.load();
     unsafe {
         CS::set_reg(GDT.1.code);
+        SS::set_reg(GDT.1.data);
+        DS::set_reg(GDT.1.data);
+        ES::set_reg(GDT.1.data);
         load_tss(GDT.1.tss);
     }
 }

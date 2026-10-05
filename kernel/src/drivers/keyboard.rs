@@ -10,5 +10,5 @@ pub fn push_scancode(scancode: u8) {
 }
 
 pub fn pop_scancode() -> Option<u8> {
-    SCANCODE_QUEUE.lock().dequeue()
+    x86_64::instructions::interrupts::without_interrupts(|| SCANCODE_QUEUE.lock().dequeue())
 }

@@ -12,8 +12,7 @@ pub const PIC_2_OFFSET: u8 = 40;
 #[derive(Debug, Clone, Copy)]
 #[repr(u8)]
 pub enum InterruptIndex {
-    Timer = PIC_1_OFFSET,        // 32
-    Keyboard = PIC_1_OFFSET + 1, // 33
+    Keyboard = PIC_1_OFFSET + 1,
 }
 
 pub static PICS: Mutex<ChainedPics> =
@@ -39,7 +38,21 @@ pub fn init() {
     gdt::init();
     IDT.load();
     unsafe {
-        PICS.lock().initialize();
+        let mut pics = PICS.lock();
+        pics.initialize();
+        // Nur IRQ1 (Keyboard) zulassen; IRQ0 (Timer) hat keinen Handler.
+        pics.write_masks(0b1111_1101, 0b1111_1111);
+        drain_ps2_output();
     }
     x86_64::instructions::interrupts::enable();
+}
+
+// Ein vom BIOS liegengelassenes Byte blockiert neue IRQ1-Flanken, bis es gelesen wird.
+unsafe fn drain_ps2_output() {
+    use x86_64::instructions::port::Port;
+    let mut status: Port<u8> = Port::new(0x64);
+    let mut data: Port<u8> = Port::new(0x60);
+    while status.read() & 1 != 0 {
+        data.read();
+    }
 }

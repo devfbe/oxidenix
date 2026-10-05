@@ -11,7 +11,10 @@ mod shell;
 
 entry_point!(kernel_main);
 
-fn kernel_main(_boot_info: &'static mut BootInfo) -> ! {
+fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
+    if let Some(fb) = boot_info.framebuffer.as_mut() {
+        drivers::console::init(fb);
+    }
     interrupts::init();
     shell::run();
 }

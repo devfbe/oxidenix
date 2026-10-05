@@ -1,2 +1,2 @@
 pub mod keyboard;
-pub mod vga;
+pub mod console;

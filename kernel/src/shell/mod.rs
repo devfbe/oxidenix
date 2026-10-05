@@ -45,7 +45,7 @@ fn read_line() -> String<256> {
                         DecodedKey::Unicode('\x08') => {
                             if !buf.is_empty() {
                                 buf.pop();
-                                crate::drivers::vga::backspace();
+                                crate::drivers::console::backspace();
                             }
                         }
                         DecodedKey::Unicode(c) if c.is_ascii() && !c.is_ascii_control() => {

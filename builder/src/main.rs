@@ -1,10 +1,10 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{self, Command};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: builder <kernel-elf-path>");
+        eprintln!("Usage: builder <kernel-elf-path> [qemu-args...]");
         process::exit(1);
     }
 
@@ -26,10 +26,9 @@ fn main() {
             "-m",
             "128M",
         ])
+        .args(&args[2..])
         .status()
         .expect("Failed to run QEMU");
 
-    // QEMU exit code 33 = halt via isa-debug-exit (write 0 → exit(2*0+1=1), not 33)
-    // success means user closed window or halt command ran
     process::exit(exit_status.code().unwrap_or(0));
 }
