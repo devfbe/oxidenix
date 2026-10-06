@@ -15,6 +15,7 @@ const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
 const AT_REMOVEDIR: u64 = 0x200;
 const AT_EMPTY_PATH: u64 = 0x1000;
 const S_IFIFO: u32 = 0o010000;
+const S_IFSOCK: u32 = 0o140000;
 const UMASK: u32 = 0o022;
 
 fn file(fd: u64) -> Result<Arc<OpenFile>, i64> {
@@ -151,6 +152,7 @@ pub fn fstat(fd: u64, buf: u64) -> SysResult {
     let f = file(fd)?;
     match f.inode() {
         Some(inode) => stat_inode(inode, buf),
+        None if f.socket().is_some() => write_stat(buf, Arc::as_ptr(&f) as u64, S_IFSOCK | 0o777, 0, (1, 0, 0, 0)),
         None => write_stat(buf, Arc::as_ptr(&f) as u64, S_IFIFO | 0o600, 0, (1, 0, 0, 0)),
     }
 }

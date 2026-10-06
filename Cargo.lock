@@ -423,8 +423,16 @@ dependencies = [
 name = "netd"
 version = "0.1.0"
 dependencies = [
+ "netproto",
  "oxrt",
  "smoltcp",
+]
+
+[[package]]
+name = "netproto"
+version = "0.1.0"
+dependencies = [
+ "fsproto",
 ]
 
 [[package]]
@@ -448,6 +456,7 @@ dependencies = [
  "heapless",
  "lazy_static",
  "linked_list_allocator",
+ "netproto",
  "noto-sans-mono-bitmap",
  "pc-keyboard",
  "pic8259",

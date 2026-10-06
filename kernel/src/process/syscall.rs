@@ -1,7 +1,7 @@
 use super::address_space::USER_END;
 use super::errno::*;
 use super::sys_file::{self, AT_FDCWD};
-use super::{signal, sys_mem, uaccess};
+use super::{signal, sys_mem, sys_net, uaccess};
 use crate::interrupts::gdt;
 use x86_64::registers::model_specific::{Efer, EferFlags, FsBase, LStar, SFMask, Star};
 use x86_64::registers::rflags::RFlags;
@@ -171,7 +171,22 @@ extern "sysv64" fn dispatch(f: &mut Frame) {
         35 => nanosleep(a0),
         39 | 186 | 218 => Ok(super::current_pid() as i64),
         40 => sys_file::sendfile(a0, a1, a2, a3),
-        41 => Err(EAFNOSUPPORT), // socket: there is no network stack
+        41 => sys_net::socket(a0, a1, a2),
+        42 => sys_net::connect(a0, a1, a2),
+        43 => sys_net::accept(a0, a1, a2, 0),
+        44 => sys_net::sendto(a0, a1, a2, a3, a4, a5),
+        45 => sys_net::recvfrom(a0, a1, a2, a3, a4, a5),
+        46 => sys_net::sendmsg(a0, a1, a2),
+        47 => sys_net::recvmsg(a0, a1, a2),
+        48 => sys_net::shutdown(a0, a1),
+        49 => sys_net::bind(a0, a1, a2),
+        50 => sys_net::listen(a0, a1),
+        51 => sys_net::getsockname(a0, a1, a2, false),
+        52 => sys_net::getsockname(a0, a1, a2, true),
+        53 => Err(EOPNOTSUPP), // socketpair: no AF_UNIX
+        54 => sys_net::setsockopt(a0),
+        55 => sys_net::getsockopt(a0, a1, a2, a3, a4),
+        288 => sys_net::accept(a0, a1, a2, a3),
         36 => getitimer(a0, a1),
         37 => {
             let (old, _) = super::set_alarm((a0 as u32 as u64).saturating_mul(1_000_000), 0);

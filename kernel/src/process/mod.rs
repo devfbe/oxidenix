@@ -7,6 +7,7 @@ mod loader;
 pub mod signal;
 mod sys_file;
 mod sys_mem;
+mod sys_net;
 pub mod syscall;
 pub mod uaccess;
 

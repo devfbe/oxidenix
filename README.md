@@ -64,14 +64,16 @@ Its [commit history](#development-history) records every step.
   `diskfs`, an ordinary ring-3 process that talks to the kernel over IPC and reaches the disk
   through I/O ports the kernel granted it. If it dies, the kernel restarts it on the next access, and
   the rest of the system keeps running.
-- **Networking (in progress)**: `netd` drives a virtio network card from user space, runs the
-  smoltcp TCP/IP stack and configures itself by DHCP. Sockets for user programs are next.
+- **Networking**: TCP and UDP sockets over IPv4 with DNS, so `wget`, `nc` and `nslookup` from
+  BusyBox reach the Internet through QEMU's user network. The driver for the virtio network
+  card and the TCP/IP stack (smoltcp) run in `netd`, a user-space server; the interface is
+  configured by DHCP, and loopback (`127.0.0.1`) works too.
 - **Persistent storage**: the data disk is mounted at `/data`, survives reboots, and stays
   consistent enough that `e2fsck` on the host accepts it.
 - **Wall-clock time** from the CMOS real-time clock (`date`, file timestamps).
 - **Terminal**: a termios line discipline (canonical and raw mode, echo, erase/kill/word-erase,
   EOF), the ANSI escape sequences BusyBox and readline use, a German keyboard layout and UTF-8.
-- **~90 Linux system calls**, enough for Bash and BusyBox (see [System calls](#system-calls)).
+- **~120 Linux system calls**, enough for Bash and BusyBox (see [System calls](#system-calls)).
 
 ## Quick start
 
@@ -99,7 +101,8 @@ The kernel boots straight into Bash. Things to try:
 
 ```sh
 ls -l /bin | head          # BusyBox applets
-cowtest; sigtest; jobtest; oomtest; fstest; forktest # kernel self-tests in user space
+cowtest; sigtest; jobtest; oomtest; fstest; forktest; nettest # self-tests in user space
+wget -O - http://example.com # DNS and HTTP through netd; nslookup and nc work as well
 sh /etc/test.sh            # filesystem, pipes, quotas, rename semantics
 sh /etc/disktest.sh        # ext2: big files, directories, truncate, rename, symlinks
 echo hello > /data/x       # survives a reboot; df -h shows the disk
@@ -118,7 +121,7 @@ The window scales when it is resized (`zoom-to-fit`), and Ctrl+Alt+F toggles ful
  │  GNU Bash 5.3   BusyBox 1.37   test programs     │  diskfs server (Rust, no_std)    │
  │  statically linked against musl libc             │  ext2 + ATA driver, I/O ports    │
  │                                                  │  netd server: virtio-net, DMA,   │
- │                                                  │  IRQs, smoltcp TCP/IP, DHCP      │
+ │                                                  │  IRQs, smoltcp TCP/IP, sockets   │
  └───────────────────────┬────────────────▲─────────┴────────▲──────────────┬──────────┘
           syscall / fault / IRQ       iretq            IPC receive/reply   in/out
  ┌───────────────────────▼────────────────┴──────────────────┴──────────────│──────────┐
@@ -128,6 +131,7 @@ The window scales when it is resized (`zoom-to-fit`), and Ctrl+Alt+F toggles ful
  │  processes       scheduler, fork/exec/wait, sleep/wakeup, pgid/sid, ioperm          │
  │  memory          frame allocator (refcounted), heap, address spaces, COW │          │
  │  VFS             memory inodes, remote inodes (fs/remote.rs), pipes, cpio│          │
+ │  sockets         Linux socket ABI, forwarded to netd (net.rs)            │          │
  │  terminal        TTY line discipline ─ console (framebuffer, ANSI) ─ keyboard       │
  │  CPU             GDT, TSS with I/O permission bitmap, IDT, PIC, PIT, SSE │          │
  └──────────────────────────────────────────────────────────────────────────▼──────────┘
@@ -152,12 +156,14 @@ oxidenix/
 │       │   ├── syscall.rs       syscall entry/return, dispatch table
 │       │   ├── sys_file.rs      file, directory, pipe, tty-ioctl, poll/select
 │       │   ├── sys_mem.rs       brk, mmap, munmap
+│       │   ├── sys_net.rs       socket syscalls (sockaddr_in, msghdr, options)
 │       │   ├── signal.rs        signal state, delivery, sigreturn, kill
 │       │   ├── loader.rs        ELF loading and the Linux initial stack
 │       │   ├── elf.rs           ELF64 parser
 │       │   ├── ipc.rs           services and message passing
 │       │   ├── irq.rs           device interrupts for user-space drivers
 │       │   └── uaccess.rs       checked access to user memory
+│       ├── net.rs               socket client: operations become netd requests
 │       ├── fs/                  VFS (mod.rs), open files and pipes (file.rs),
 │       │                        initramfs unpacker (cpio.rs), IPC client for
 │       │                        filesystem servers (remote.rs)
@@ -167,16 +173,18 @@ oxidenix/
 │       └── shell/               built-in kernel monitor (fallback shell)
 ├── servers/
 │   ├── diskfs/                  user-space ext2 server with its own ATA driver
-│   └── netd/                    network server: virtio-net driver, smoltcp, DHCP
+│   └── netd/                    network server: virtio-net driver (virtio.rs), loopback
+│                                (nic.rs), sockets on smoltcp (service.rs), DHCP
 ├── crates/
 │   ├── ext2fs/                  ext2 as a library over a `Device` trait
 │   ├── fsproto/                 message format between the VFS and filesystem servers
+│   ├── netproto/                socket operations between the kernel and netd
 │   └── oxrt/                    runtime for servers: entry, syscalls, heap, port I/O
 ├── builder/                     host tool: rootfs + cpio + boot image + ext2 data disk + QEMU
 └── userspace/                   C test programs, build script, rootfs and data disk templates
 ```
 
-About 6,928 lines of Rust in the kernel and 2,154 in the servers, their libraries and runtime, plus a small host-side builder.
+About 7,467 lines of Rust in the kernel and 2,965 in the servers, their libraries and runtime, plus a small host-side builder.
 
 ### Boot sequence
 
@@ -338,6 +346,33 @@ interrupt dispatch; drivers and filesystems move into user-space servers.
 - Still in the kernel today: the VFS itself, pipes, the TTY, console and keyboard. They are the
   next candidates for servers.
 
+### Networking
+
+- **netd** (`servers/netd`) owns the network card. The kernel finds it on PCI (a virtio-net
+  card in legacy mode, whose registers are all I/O ports) and hands netd its ports, its
+  interrupt line and a 512 KiB DMA area. netd sets up the two virtqueues with 64 fixed 2 KiB
+  buffers each, sleeps in `ipc_receive` until a request, a card interrupt or the next timer
+  of the TCP/IP stack, and runs [smoltcp](https://github.com/smoltcp-rs/smoltcp) for ARP,
+  IPv4, ICMP, TCP, UDP and the DHCP client.
+- **Loopback**: frames to the host's own address or to `127.0.0.0/8` never reach the card;
+  netd's device layer feeds them back as received frames and answers ARP for those addresses
+  itself, so a program can talk to a server on the same machine.
+- **Sockets** (`process/sys_net.rs`, `net.rs`): `socket`, `bind`, `listen`, `accept`/`accept4`,
+  `connect`, `send*`/`recv*` (also `sendmsg`/`recvmsg`), `shutdown`, `getsockname`,
+  `getpeername` and `getsockopt(SO_ERROR)` for `AF_INET` stream and datagram sockets. A socket is
+  an open file, so `read`, `write`, `poll`, `select`, `fcntl(O_NONBLOCK)`, `dup` and `fork`
+  work as usual. Every operation is a `netproto` request to netd; closing the last descriptor
+  posts `Close` without waiting.
+- **Blocking without blocking netd**: netd keeps a request that cannot complete yet (accept
+  without a connection, recv without data, a connect in progress) and answers it after the
+  stack made progress, while it keeps serving other requests. A signal interrupts the waiting
+  program: the kernel abandons the request (`EINTR`) and tells netd to drop it.
+- **Configuration**: `/etc/resolv.conf` points to QEMU's DNS proxy (`10.0.2.3`); DHCP gives
+  `10.0.2.15/24` with gateway `10.0.2.2`. The self-tests use an echo service that QEMU provides
+  at `10.0.2.100:7` (`guestfwd` to `cat` on the host).
+- Not yet: IPv6, raw sockets (so no `ping`), `AF_UNIX`, interface configuration from user space
+  (`ifconfig`), and restarting netd after a crash.
+
 ### Persistent storage
 
 - **ATA PIO driver** in `diskfs` for the second IDE disk (primary bus, slave). It uses LBA28,
@@ -386,7 +421,7 @@ cpio archive and hands it to the bootloader as a ramdisk.
 
 ## System calls
 
-Linux x86_64 numbers, grouped by area (about 90 in total):
+Linux x86_64 numbers, grouped by area (about 120 in total):
 
 | Area | Calls |
 |---|---|
@@ -401,7 +436,8 @@ Linux x86_64 numbers, grouped by area (about 90 in total):
 | Filesystems | `statfs` `fstatfs` `sync` `fsync` `fdatasync` |
 | Servers | `ioperm` (privileged servers only), `ipc_register` (1000), `ipc_receive` (1001, with timeout and interrupt notifications), `ipc_reply` (1002), `irq_enable` (1003), `dma_map` (1004) |
 | Power | `reboot` (power off ends QEMU, restart resets the machine) |
-| Time and misc | `nanosleep` `clock_gettime` (`CLOCK_REALTIME` from the RTC) `uname` `getrandom` `socket` (fails with `EAFNOSUPPORT`) |
+| Sockets | `socket` `bind` `listen` `accept` `accept4` `connect` `sendto` `recvfrom` `sendmsg` `recvmsg` `shutdown` `getsockname` `getpeername` `setsockopt` (ignored) `getsockopt` (`AF_INET` only) |
+| Time and misc | `nanosleep` `clock_gettime` (`CLOCK_REALTIME` from the RTC) `uname` `getrandom` |
 
 Everything runs as root. Unknown syscalls print a kernel message and return `ENOSYS`.
 
@@ -421,6 +457,7 @@ Each of these programs and scripts lives in the root filesystem and runs inside 
 | `sigtest` | handlers, killing a busy loop, `SIGCHLD`, `EINTR` on pipe reads, blocked and ignored signals, FPU state across asynchronous handlers, `alarm` and repeating `setitimer` |
 | `jobtest` | stop/continue reporting through `wait4`, restart of a stopped `read()`, `SIGKILL` on stopped processes, `SA_RESTART` |
 | `forktest` | `fork`, `execve`, `wait4`, preemptive interleaving of two workers |
+| `nettest` | TCP to an echo service through QEMU, `ECONNREFUSED`, `listen`/`accept` over loopback with a forked client, EOF after the peer closed, non-blocking `accept` and `connect` with `poll` and `SO_ERROR`, `EINTR` in a blocking `recv`, UDP over loopback, `AF_INET6` rejected |
 | `sh /etc/test.sh` | files, pipes, `cd`, `mkdir`/`touch`/`rm`, rename cycles via symlinks, file quota |
 | `fstest` | descriptor access modes (`EBADF` on read-only/write-only fds), `O_NOFOLLOW` on symlinks, unlinked-but-open files (kept until closed, never shared with new files), ext2 size limits, overflowing `mmap` offsets |
 | `sh /etc/disktest.sh` | ext2: 150-file directory, 1.5 MiB file (double indirect), append, truncate, rename, cycles, symlinks, `rm -r`, space accounting |
@@ -467,7 +504,8 @@ kernel. Its program is fixed at boot (see self-healing), but a bug in it is a ke
 - [x] Persistent storage: a disk driver and an on-disk filesystem
 - [x] Unlinked-but-open files kept until closed
 - [ ] Hard links and a block cache
-- [ ] Networking: card driver and DHCP done (`netd`); sockets for user programs next
+- [x] Networking: TCP/UDP sockets, DNS, DHCP and loopback through a user-space server (`netd`)
+- [ ] IPv6, raw sockets (`ping`), `AF_UNIX`, `ifconfig`, restarting netd after a crash
 - [ ] SMP, dynamic linking, real entropy, users and permissions
 
 ## Development history

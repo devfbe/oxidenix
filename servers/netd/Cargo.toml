@@ -11,6 +11,7 @@ bench = false
 
 [dependencies]
 oxrt = { path = "../../crates/oxrt" }
+netproto = { path = "../../crates/netproto" }
 smoltcp = { version = "0.14", default-features = false, features = [
     "alloc", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-udp", "socket-dhcpv4",
 ] }

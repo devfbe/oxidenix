@@ -206,7 +206,51 @@ pub fn call(service: usize, message: Vec<u8>) -> Result<Vec<u8>, i64> {
     })
 }
 
+/// Like `call`, but a signal ends the wait with EINTR, for requests that may
+/// wait a long time (a socket waiting for data). A request still queued is
+/// withdrawn; one the server has taken is abandoned (its reply will be
+/// dropped) and the message `cancel(id)` is posted so the server forgets it.
+pub fn call_interruptible(service: usize, message: Vec<u8>, cancel: impl FnOnce(u64) -> Vec<u8>) -> Result<Vec<u8>, i64> {
+    without_interrupts(|| {
+        let id = enqueue(service, message, true)?;
+        let mut cancel = Some(cancel);
+        wait_reply_with(id, &mut || {
+            let taken = lock(|ipc| match ipc.requests.get(&id).map(|r| r.state) {
+                Some(State::Queued) => {
+                    ipc.requests.remove(&id);
+                    if let Some(s) = ipc.services.get_mut(service) {
+                        s.queue.retain(|&q| q != id);
+                    }
+                    Some(false)
+                }
+                Some(State::Taken) => {
+                    ipc.requests.get_mut(&id).expect("present").waits = false;
+                    Some(true)
+                }
+                _ => None,
+            });
+            match taken {
+                Some(true) => {
+                    if let Some(cancel) = cancel.take() {
+                        post(service, cancel(id));
+                    }
+                    true
+                }
+                Some(false) => true,
+                // Already answered: take the reply instead.
+                None => false,
+            }
+        })
+    })
+}
+
 fn wait_reply(id: u64) -> Result<Vec<u8>, i64> {
+    wait_reply_with(id, &mut || false)
+}
+
+/// Waits for the reply to `id`. When a signal is pending, `abandon` may
+/// give up the request (returns true; the result is then EINTR).
+fn wait_reply_with(id: u64, abandon: &mut dyn FnMut() -> bool) -> Result<Vec<u8>, i64> {
     loop {
         let done = lock(|ipc| match ipc.requests.get(&id).map(|r| r.state) {
             Some(State::Done) => Some(Ok(ipc.requests.remove(&id).expect("present").reply)),
@@ -218,6 +262,9 @@ fn wait_reply(id: u64) -> Result<Vec<u8>, i64> {
         });
         if let Some(result) = done {
             return result;
+        }
+        if super::signal::interrupted() && abandon() {
+            return Err(EINTR);
         }
         sleep_on(request_chan(id));
     }

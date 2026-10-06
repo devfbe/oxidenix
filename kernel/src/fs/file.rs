@@ -58,6 +58,7 @@ pub enum Kind {
     Inode(Arc<Inode>),
     PipeRead(Arc<Pipe>),
     PipeWrite(Arc<Pipe>),
+    Socket(crate::net::Socket),
 }
 
 /// Open file description; several descriptors may share it (dup, fork).
@@ -143,7 +144,14 @@ impl OpenFile {
         }
     }
 
-    fn nonblocking(&self) -> bool {
+    pub fn socket(&self) -> Option<&crate::net::Socket> {
+        match &self.kind {
+            Kind::Socket(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    pub fn nonblocking(&self) -> bool {
         self.flags.load(Ordering::Relaxed) & O_NONBLOCK != 0
     }
 
@@ -155,6 +163,7 @@ impl OpenFile {
             Kind::Inode(inode) => self.read_inode(inode, buf),
             Kind::PipeRead(pipe) => self.read_pipe(pipe, buf),
             Kind::PipeWrite(_) => Err(EBADF),
+            Kind::Socket(s) => s.recv(buf, self.nonblocking(), false).map(|(n, _)| n),
         }
     }
 
@@ -166,6 +175,7 @@ impl OpenFile {
             Kind::Inode(inode) => self.write_inode(inode, buf),
             Kind::PipeWrite(pipe) => self.write_pipe(pipe, buf),
             Kind::PipeRead(_) => Err(EBADF),
+            Kind::Socket(s) => s.send(buf, None, self.nonblocking()),
         }
     }
 
@@ -304,6 +314,7 @@ impl OpenFile {
                     0
                 }
             }
+            Kind::Socket(s) => s.poll(events),
         };
         ready & (events | POLLERR | POLLHUP)
     }
@@ -320,7 +331,7 @@ impl Drop for OpenFile {
                 p.writers.fetch_sub(1, Ordering::Relaxed);
                 wakeup(p.read_chan());
             }
-            Kind::Inode(_) => {}
+            Kind::Inode(_) | Kind::Socket(_) => {}
         }
     }
 }

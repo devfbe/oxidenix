@@ -29,7 +29,12 @@ pub const ENAMETOOLONG: i64 = 36;
 pub const ENOSYS: i64 = 38;
 pub const ENOTEMPTY: i64 = 39;
 pub const ELOOP: i64 = 40;
+pub const ENOTSOCK: i64 = 88;
+pub const EMSGSIZE: i64 = 90;
+pub const EPROTONOSUPPORT: i64 = 93;
+pub const EOPNOTSUPP: i64 = 95;
 pub const EAFNOSUPPORT: i64 = 97;
+pub const ENETDOWN: i64 = 100;
 pub const ETIMEDOUT: i64 = 110;
 
 /// Syscall result: Ok(return value) or Err(positive errno).

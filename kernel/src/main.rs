@@ -14,6 +14,7 @@ mod drivers;
 mod fs;
 mod interrupts;
 mod memory;
+mod net;
 mod process;
 mod shell;
 
