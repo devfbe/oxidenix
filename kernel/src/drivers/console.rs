@@ -1,5 +1,8 @@
-//! Framebuffer text console with a cell grid, 16 colors, a visible cursor
-//! and the subset of ANSI escape sequences used by BusyBox.
+//! Framebuffer text console with a cell grid, 16 colors and a visible
+//! cursor. It implements the Linux console's terminal type (`TERM=linux`):
+//! the capabilities its terminfo entry lists, such as scroll regions, line
+//! insertion and deletion, the DEC line-drawing set, insert mode and the
+//! palette sequences, so that full-screen curses programs (htop) work.
 
 use bootloader_api::info::{FrameBuffer, FrameBufferInfo, PixelFormat};
 use core::fmt;
@@ -47,9 +50,51 @@ struct Cell {
     ch: char,
     fg: u8,
     bg: u8,
+    underline: bool,
 }
 
-const BLANK: Cell = Cell { ch: ' ', fg: DEFAULT_FG, bg: DEFAULT_BG };
+const BLANK: Cell = Cell { ch: ' ', fg: DEFAULT_FG, bg: DEFAULT_BG, underline: false };
+
+/// The DEC special graphics set (VT100 line drawing) for the characters
+/// that select it, as the terminfo `acsc` string of the Linux console maps
+/// them.
+fn dec_graphics(ch: char) -> char {
+    match ch {
+        '`' => '◆',
+        'a' => '▒',
+        'f' => '°',
+        'g' => '±',
+        'h' => '░',
+        'i' => '§',
+        'j' => '┘',
+        'k' => '┐',
+        'l' => '┌',
+        'm' => '└',
+        'n' => '┼',
+        'o' => '⎺',
+        'p' => '⎻',
+        'q' => '─',
+        'r' => '⎼',
+        's' => '⎽',
+        't' => '├',
+        'u' => '┤',
+        'v' => '┴',
+        'w' => '┬',
+        'x' => '│',
+        'y' => '≤',
+        'z' => '≥',
+        '{' => 'π',
+        '|' => '≠',
+        '}' => '£',
+        '~' => '·',
+        '0' => '█',
+        '+' => '→',
+        ',' => '←',
+        '-' => '↑',
+        '.' => '↓',
+        c => c,
+    }
+}
 
 /// The console starts before the heap exists, so the cell grid is static.
 static mut CELLS: [[Cell; MAX_COLS]; MAX_ROWS] = [[BLANK; MAX_COLS]; MAX_ROWS];
@@ -59,6 +104,12 @@ enum Parse {
     Normal,
     Escape,
     Csi,
+    /// ESC ( or ESC ): the next byte designates the G0 or G1 character set.
+    Charset(u8),
+    /// ESC ] P: seven hex digits redefine a palette entry (Linux).
+    Palette,
+    /// Any other operating system command, up to BEL or ESC \.
+    Osc,
 }
 
 pub struct Console {
@@ -87,6 +138,20 @@ pub struct Console {
     utf8_need: usize,
     reply: [u8; 32],
     reply_len: usize,
+    /// Scroll region, first and last row (inclusive).
+    top: usize,
+    bottom: usize,
+    /// G0/G1 designate the line-drawing set; SO selects G1, SI G0.
+    g0_graphics: bool,
+    g1_graphics: bool,
+    shift_out: bool,
+    underline: bool,
+    insert_mode: bool,
+    autowrap: bool,
+    palette: [(u8, u8, u8); 16],
+    /// ESC ] P digits collected so far.
+    osc: [u8; 7],
+    osc_len: usize,
 }
 
 impl Console {
@@ -103,18 +168,32 @@ impl Console {
 
     fn draw_cell(&mut self, col: usize, row: usize, invert: bool) {
         let cell = self.cells[row][col];
-        let (mut fg, mut bg) = (PALETTE[cell.fg as usize], PALETTE[cell.bg as usize]);
+        let (mut fg, mut bg) = (self.palette[cell.fg as usize], self.palette[cell.bg as usize]);
         if invert {
             core::mem::swap(&mut fg, &mut bg);
         }
-        let raster = get_raster(cell.ch, FONT_WEIGHT, RASTER_HEIGHT)
-            .or_else(|| get_raster('?', FONT_WEIGHT, RASTER_HEIGHT))
-            .expect("font lacks '?'");
-        let glyph = raster.raster();
+        let special = super::glyphs::is_special(cell.ch);
+        let raster = if special {
+            None
+        } else {
+            Some(
+                get_raster(cell.ch, FONT_WEIGHT, RASTER_HEIGHT)
+                    .or_else(|| get_raster('?', FONT_WEIGHT, RASTER_HEIGHT))
+                    .expect("font lacks '?'"),
+            )
+        };
+        let glyph = raster.as_ref().map(|r| r.raster());
         let (x0, y0) = (col * CHAR_WIDTH, row * LINE_HEIGHT);
         for dy in 0..LINE_HEIGHT {
+            let underline_row = cell.underline && dy == LINE_HEIGHT - 3;
             for dx in 0..CHAR_WIDTH {
-                let a = glyph.get(dy).and_then(|l| l.get(dx)).copied().unwrap_or(0) as u16;
+                let a = if underline_row {
+                    255
+                } else if let Some(glyph) = glyph {
+                    glyph.get(dy).and_then(|l| l.get(dx)).copied().unwrap_or(0) as u16
+                } else {
+                    super::glyphs::coverage(cell.ch, dx, dy, CHAR_WIDTH, LINE_HEIGHT).unwrap_or(0) as u16
+                };
                 let mix = |f: u8, b: u8| ((f as u16 * a + b as u16 * (255 - a)) / 255) as u8;
                 self.put_pixel(x0 + dx, y0 + dy, (mix(fg.0, bg.0), mix(fg.1, bg.1), mix(fg.2, bg.2)));
             }
@@ -127,7 +206,7 @@ impl Console {
     }
 
     fn blank(&self) -> Cell {
-        Cell { ch: ' ', fg: DEFAULT_FG, bg: self.bg }
+        Cell { ch: ' ', fg: DEFAULT_FG, bg: self.bg, underline: false }
     }
 
     fn hide_cursor(&mut self) {
@@ -144,39 +223,84 @@ impl Console {
         }
     }
 
-    fn scroll_up(&mut self) {
+    /// Moves rows `first..=last` up by `n` (text and pixels); the rows that
+    /// open up at the bottom are blank.
+    fn scroll_up(&mut self, first: usize, last: usize, n: usize) {
+        if first > last || last >= self.rows {
+            return;
+        }
+        let n = n.min(last - first + 1);
         let line = LINE_HEIGHT * self.info.stride * self.info.bytes_per_pixel;
-        let used = self.rows * line;
-        self.fb.copy_within(line..used, 0);
-        for r in 1..self.rows {
-            self.cells[r - 1] = self.cells[r];
+        self.fb.copy_within((first + n) * line..(last + 1) * line, first * line);
+        for r in first..=last - n {
+            self.cells[r] = self.cells[r + n];
         }
         let blank = self.blank();
-        for c in 0..self.cols {
-            self.set_cell(c, self.rows - 1, blank);
+        for r in last + 1 - n..=last {
+            for c in 0..self.cols {
+                self.set_cell(c, r, blank);
+            }
         }
     }
 
+    /// Moves rows `first..=last` down by `n`; blank rows open up at the top.
+    fn scroll_down(&mut self, first: usize, last: usize, n: usize) {
+        if first > last || last >= self.rows {
+            return;
+        }
+        let n = n.min(last - first + 1);
+        let line = LINE_HEIGHT * self.info.stride * self.info.bytes_per_pixel;
+        self.fb.copy_within(first * line..(last + 1 - n) * line, (first + n) * line);
+        for r in (first + n..=last).rev() {
+            self.cells[r] = self.cells[r - n];
+        }
+        let blank = self.blank();
+        for r in first..first + n {
+            for c in 0..self.cols {
+                self.set_cell(c, r, blank);
+            }
+        }
+    }
+
+    /// Line feed (index): at the bottom of the scroll region the region
+    /// scrolls; below it the cursor just moves until the last row.
     fn line_feed(&mut self) {
-        if self.row + 1 < self.rows {
+        if self.row == self.bottom {
+            self.scroll_up(self.top, self.bottom, 1);
+        } else if self.row + 1 < self.rows {
             self.row += 1;
-        } else {
-            self.scroll_up();
+        }
+    }
+
+    /// Reverse index (ESC M): the mirror image of `line_feed`.
+    fn reverse_index(&mut self) {
+        if self.row == self.top {
+            self.scroll_down(self.top, self.bottom, 1);
+        } else if self.row > 0 {
+            self.row -= 1;
         }
     }
 
     fn put_char(&mut self, ch: char) {
-        if self.wrap_pending {
+        if self.wrap_pending && self.autowrap {
             self.wrap_pending = false;
             self.col = 0;
             self.line_feed();
         }
+        let graphics = if self.shift_out { self.g1_graphics } else { self.g0_graphics };
+        let ch = if graphics { dec_graphics(ch) } else { ch };
         let mut fg = if self.bold && self.fg < 8 { self.fg + 8 } else { self.fg };
         let mut bg = self.bg;
         if self.reverse {
             core::mem::swap(&mut fg, &mut bg);
         }
-        self.set_cell(self.col, self.row, Cell { ch, fg, bg });
+        if self.insert_mode {
+            for c in (self.col + 1..self.cols).rev() {
+                let src = self.cells[self.row][c - 1];
+                self.set_cell(c, self.row, src);
+            }
+        }
+        self.set_cell(self.col, self.row, Cell { ch, fg, bg, underline: self.underline });
         if self.col + 1 >= self.cols {
             self.wrap_pending = true;
         } else {
@@ -245,9 +369,13 @@ impl Console {
                     self.bg = DEFAULT_BG;
                     self.bold = false;
                     self.reverse = false;
+                    self.underline = false;
                 }
                 1 => self.bold = true,
                 22 => self.bold = false,
+                4 => self.underline = true,
+                24 => self.underline = false,
+                // 2 dim, 5 blink, 10/11 fonts: accepted, not shown.
                 7 => self.reverse = true,
                 27 => self.reverse = false,
                 30..=37 => self.fg = (p - 30) as u8,
@@ -325,8 +453,54 @@ impl Console {
             }
             b's' => self.saved = (col, row),
             b'u' => self.move_to(self.saved.0, self.saved.1),
+            // Scroll region; the cursor goes home.
+            b'r' if !self.private => {
+                let top = self.param(0, 1) - 1;
+                let bottom = self.param(1, self.rows as u16) - 1;
+                if top < bottom && bottom < self.rows {
+                    self.top = top;
+                    self.bottom = bottom;
+                } else {
+                    self.top = 0;
+                    self.bottom = self.rows - 1;
+                }
+                self.move_to(0, 0);
+            }
+            // Insert and delete lines: only inside the scroll region.
+            b'L' if (self.top..=self.bottom).contains(&row) => self.scroll_down(row, self.bottom, n),
+            b'M' if (self.top..=self.bottom).contains(&row) => self.scroll_up(row, self.bottom, n),
+            b'S' => self.scroll_up(self.top, self.bottom, n),
+            b'T' if !self.private => self.scroll_down(self.top, self.bottom, n),
+            b'h' | b'l' if self.private && self.param(0, 0) == 7 => self.autowrap = final_byte == b'h',
+            b'h' | b'l' if !self.private && self.param(0, 0) == 4 => self.insert_mode = final_byte == b'h',
+            // Device attributes: a VT102, as the Linux console answers.
+            b'c' if !self.private && self.param(0, 0) == 0 => self.push_reply(b"\x1b[?6c"),
             _ => {}
         }
+    }
+
+    fn reset_palette(&mut self) {
+        self.palette = PALETTE;
+        self.redraw();
+    }
+
+    /// Draws every cell again (after a palette change).
+    fn redraw(&mut self) {
+        for r in 0..self.rows {
+            for c in 0..self.cols {
+                self.draw_cell(c, r, false);
+            }
+        }
+        self.cursor_drawn = None;
+    }
+
+    /// ESC ] P n rr gg bb: palette entry n (hex digits) becomes #rrggbb.
+    fn set_palette(&mut self) {
+        let hex = |b: u8| (b as char).to_digit(16).unwrap_or(0) as u8;
+        let d = self.osc;
+        let entry = hex(d[0]) as usize;
+        self.palette[entry] = (hex(d[1]) << 4 | hex(d[2]), hex(d[3]) << 4 | hex(d[4]), hex(d[5]) << 4 | hex(d[6]));
+        self.redraw();
     }
 
     fn control(&mut self, b: u8) {
@@ -339,6 +513,10 @@ impl Console {
             b'\r' => self.move_to(0, self.row),
             0x08 => self.move_to(self.col.min(self.cols - 1).saturating_sub(1), self.row),
             b'\t' => self.move_to((self.col / 8 + 1) * 8, self.row),
+            0x0b | 0x0c => self.line_feed(),
+            // Shift out / shift in: G1 / G0.
+            0x0e => self.shift_out = true,
+            0x0f => self.shift_out = false,
             0x1b => self.parse = Parse::Escape,
             _ => {}
         }
@@ -357,12 +535,68 @@ impl Console {
                     }
                     b'7' => self.saved = (self.col, self.row),
                     b'8' => self.move_to(self.saved.0, self.saved.1),
+                    b'D' => self.line_feed(),
+                    b'E' => {
+                        self.col = 0;
+                        self.wrap_pending = false;
+                        self.line_feed();
+                    }
+                    b'M' => self.reverse_index(),
+                    b'(' => self.parse = Parse::Charset(0),
+                    b')' => self.parse = Parse::Charset(1),
+                    b']' => {
+                        self.parse = Parse::Osc;
+                        self.osc_len = 0;
+                    }
                     b'c' => {
                         self.fg = DEFAULT_FG;
                         self.bg = DEFAULT_BG;
+                        self.top = 0;
+                        self.bottom = self.rows - 1;
+                        self.g0_graphics = false;
+                        self.g1_graphics = true;
+                        self.shift_out = false;
+                        self.insert_mode = false;
+                        self.autowrap = true;
+                        self.underline = false;
+                        self.reset_palette();
                         self.clear_screen();
                     }
                     _ => {}
+                }
+            }
+            Parse::Charset(g) => {
+                self.parse = Parse::Normal;
+                let graphics = b == b'0';
+                if g == 0 {
+                    self.g0_graphics = graphics;
+                } else {
+                    self.g1_graphics = graphics;
+                }
+            }
+            Parse::Osc => {
+                match b {
+                    // ESC ] P: a palette entry follows; ESC ] R resets them.
+                    b'P' if self.osc_len == 0 => self.parse = Parse::Palette,
+                    b'R' if self.osc_len == 0 => {
+                        self.parse = Parse::Normal;
+                        self.reset_palette();
+                    }
+                    0x07 => self.parse = Parse::Normal,
+                    0x1b => self.parse = Parse::Escape,
+                    _ => self.osc_len = 1,
+                }
+            }
+            Parse::Palette => {
+                if !(b as char).is_ascii_hexdigit() {
+                    self.parse = Parse::Normal;
+                } else {
+                    self.osc[self.osc_len] = b;
+                    self.osc_len += 1;
+                    if self.osc_len == self.osc.len() {
+                        self.parse = Parse::Normal;
+                        self.set_palette();
+                    }
                 }
             }
             Parse::Csi => match b {
@@ -480,7 +714,19 @@ pub fn init(fb: &'static mut FrameBuffer) {
         utf8_need: 0,
         reply: [0; 32],
         reply_len: 0,
+        top: 0,
+        bottom: 0,
+        g0_graphics: false,
+        g1_graphics: true,
+        shift_out: false,
+        underline: false,
+        insert_mode: false,
+        autowrap: true,
+        palette: PALETTE,
+        osc: [0; 7],
+        osc_len: 0,
     };
+    console.bottom = console.rows - 1;
     console.fb.fill(0);
     console.clear_screen();
     console.draw_logo();

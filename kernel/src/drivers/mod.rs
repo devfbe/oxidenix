@@ -1,5 +1,6 @@
 pub mod acpi;
 pub mod console;
+pub mod glyphs;
 pub mod keyboard;
 pub mod pci;
 pub mod rtc;

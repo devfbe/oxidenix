@@ -180,7 +180,7 @@ oxidenix/
 │       ├── fs/                  VFS (mod.rs), open files and pipes (file.rs),
 │       │                        initramfs unpacker (cpio.rs), IPC client for
 │       │                        filesystem servers (remote.rs)
-│       ├── drivers/             framebuffer console (console.rs), TTY (tty.rs),
+│       ├── drivers/             framebuffer console (console.rs, glyphs.rs), TTY (tty.rs),
 │       │                        PS/2 keyboard (keyboard.rs), CMOS clock (rtc.rs),
 │       │                        serial port mirror (serial.rs), PCI scan (pci.rs),
 │       │                        ACPI MADT (acpi.rs)
@@ -471,8 +471,15 @@ interrupt dispatch; drivers and filesystems move into user-space servers.
 ### Terminal and console
 
 - **Console**: a cell grid on the framebuffer with a 24 px Noto Sans Mono bitmap font, 16 ANSI
-  colors, a visible cursor, deferred line wrap, UTF-8 (Latin-1), cursor movement, erase,
-  insert/delete characters, SGR attributes and cursor position reports.
+  colors, a visible cursor, deferred line wrap and UTF-8. It implements the Linux console's
+  terminal type, so `TERM=linux` (and with it ncurses and htop) works: scroll regions, line
+  and character insertion and deletion, index and reverse index, the DEC line-drawing set
+  (G0/G1, SO/SI), insert mode, auto-wrap control, underline, the palette sequences
+  (`ESC ] P`, `ESC ] R`), cursor position reports and device attributes.
+- **Drawn glyphs** (`drivers/glyphs.rs`): box drawing (light, heavy, double, rounded), block
+  elements and shades, triangles, diamonds, circles, squares, arrows and the VT100 scan lines
+  are drawn geometrically for the exact cell, so lines join seamlessly across cells, as in
+  modern terminals.
 - **Boot logo**: drawn centered above the first boot message. Its source is
   `kernel/assets/logo.svg`; `kernel/build.rs` decodes the rendered `logo.png` into raw RGB at
   build time, so the kernel needs no image decoder. Like on Linux, the logo is plain pixels and
