@@ -1,9 +1,12 @@
 pub mod frame;
 
 use bootloader_api::info::MemoryRegion;
+use core::alloc::{GlobalAlloc, Layout};
+use core::ptr::{null_mut, NonNull};
 use frame::PhysFrameAllocator;
-use linked_list_allocator::LockedHeap;
+use linked_list_allocator::Heap;
 use spin::{Mutex, Once};
+use x86_64::instructions::interrupts::without_interrupts;
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::{
     FrameAllocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags, PhysFrame,
@@ -13,10 +16,70 @@ use x86_64::VirtAddr;
 
 // Upper half; the lower half belongs to processes.
 pub const HEAP_START: u64 = 0xffff_c000_0000_0000;
-pub const HEAP_SIZE: u64 = 16 * 1024 * 1024;
+const HEAP_INITIAL: u64 = 8 * 1024 * 1024;
+/// Virtual space reserved for the heap; physical frames are added on demand.
+const HEAP_MAX: u64 = 1024 * 1024 * 1024;
+const HEAP_GROW_STEP: u64 = 1024 * 1024;
+const PAGE: u64 = 4096;
+
+/// Kernel heap that grows by mapping more frames when an allocation fails,
+/// so it is bounded by physical memory instead of a fixed size.
+struct GrowingHeap(Mutex<Heap>);
 
 #[global_allocator]
-static HEAP: LockedHeap = LockedHeap::empty();
+static HEAP: GrowingHeap = GrowingHeap(Mutex::new(Heap::empty()));
+
+unsafe impl GlobalAlloc for GrowingHeap {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        loop {
+            if let Ok(p) = self.0.lock().allocate_first_fit(layout) {
+                return p.as_ptr();
+            }
+            if !self.grow(layout) {
+                return null_mut();
+            }
+        }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { self.0.lock().deallocate(NonNull::new_unchecked(ptr), layout) };
+    }
+}
+
+impl GrowingHeap {
+    fn grow(&self, layout: Layout) -> bool {
+        let want = ((layout.size() + layout.align()) as u64).max(HEAP_GROW_STEP).next_multiple_of(PAGE);
+        without_interrupts(|| {
+            // try_lock: an allocation made while the frame lock is held must
+            // fail instead of deadlocking.
+            let Some(mut guard) = FRAMES.try_lock() else { return false };
+            let Some(frames) = guard.as_mut() else { return false };
+            let mut heap = self.0.lock();
+            let top = heap.top() as u64;
+            if top + want > HEAP_START + HEAP_MAX || frames.free_frames() < want / PAGE + 8 {
+                return false;
+            }
+            if map_heap(top, want, frames).is_err() {
+                return false;
+            }
+            unsafe { heap.extend(want as usize) };
+            true
+        })
+    }
+}
+
+fn map_heap(start: u64, len: u64, frames: &mut PhysFrameAllocator) -> Result<(), ()> {
+    let mut mapper = unsafe { active_page_table() };
+    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
+    let first = Page::<Size4KiB>::containing_address(VirtAddr::new(start));
+    let last = Page::containing_address(VirtAddr::new(start + len - 1));
+    for page in Page::range_inclusive(first, last) {
+        let frame = frames.allocate_frame().ok_or(())?;
+        // The heap's upper-half tables are shared by every address space.
+        unsafe { mapper.map_to(page, frame, flags, frames) }.map_err(|_| ())?.flush();
+    }
+    Ok(())
+}
 
 pub static FRAMES: Mutex<Option<PhysFrameAllocator>> = Mutex::new(None);
 static PHYS_OFFSET: Once<VirtAddr> = Once::new();
@@ -26,18 +89,8 @@ pub fn init(regions: &'static [MemoryRegion], phys_offset: u64) {
     let phys_offset = *PHYS_OFFSET.call_once(|| VirtAddr::new(phys_offset));
     KERNEL_L4.call_once(|| Cr3::read().0);
     let mut frames = PhysFrameAllocator::new(regions, phys_offset);
-    let mut mapper = unsafe { active_page_table() };
-
-    let first = Page::<Size4KiB>::containing_address(VirtAddr::new(HEAP_START));
-    let last = Page::containing_address(VirtAddr::new(HEAP_START + HEAP_SIZE - 1));
-    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
-    for page in Page::range_inclusive(first, last) {
-        let frame = frames.allocate_frame().expect("no frame for kernel heap");
-        unsafe { mapper.map_to(page, frame, flags, &mut frames) }
-            .expect("heap page already mapped")
-            .flush();
-    }
-    unsafe { HEAP.lock().init(HEAP_START as *mut u8, HEAP_SIZE as usize) };
+    map_heap(HEAP_START, HEAP_INITIAL, &mut frames).expect("cannot map the initial kernel heap");
+    unsafe { HEAP.0.lock().init(HEAP_START as *mut u8, HEAP_INITIAL as usize) };
     frames.enable_refcounts();
     *FRAMES.lock() = Some(frames);
 }
@@ -80,7 +133,7 @@ pub fn stats() -> Stats {
         .lock()
         .as_ref()
         .map_or((0, 0), |f| (f.total_frames, f.used_frames));
-    let heap = HEAP.lock();
+    let heap = HEAP.0.lock();
     Stats {
         total_frames,
         used_frames,

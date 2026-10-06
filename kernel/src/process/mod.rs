@@ -30,6 +30,8 @@ use x86_64::VirtAddr;
 pub type Pid = u64;
 
 const KSTACK_SIZE: usize = 64 * 1024;
+/// Upper bound on processes, so fork bombs fail with EAGAIN.
+const MAX_PROCS: usize = 256;
 const MMAP_TOP: u64 = 0x0000_7000_0000_0000;
 pub const TIMER_HZ: u64 = 100;
 
@@ -306,9 +308,15 @@ pub fn wakeup(chan: usize) {
 
 /// New process that, when first scheduled, enters ring 3 with `frame`
 /// via `user_return`.
-fn new_process(pid: Pid, ppid: Pid, name: String, space: AddressSpace, frame: Frame) -> Box<Process> {
-    // new_zeroed instead of Box::new: no temporary on the (small) kernel stack.
-    let mut kstack = unsafe { Box::<KernelStack>::new_zeroed().assume_init() };
+fn new_process(pid: Pid, ppid: Pid, name: String, space: AddressSpace, frame: Frame) -> Result<Box<Process>, i64> {
+    // Kernel stacks are demanded by user space (fork), so they must not
+    // eat into the reserve the kernel heap relies on.
+    if !crate::memory::with_frames(|f| f.user_may_take((KSTACK_SIZE / 4096) as u64)) {
+        return Err(ENOMEM);
+    }
+    // try_new_zeroed instead of Box::new: no temporary on the (small) kernel
+    // stack, and running out of memory is an error, not a panic.
+    let mut kstack = unsafe { Box::<KernelStack>::try_new_zeroed().map_err(|_| ENOMEM)?.assume_init() };
     let top = kstack.0.as_mut_ptr() as u64 + KSTACK_SIZE as u64;
     let frame_addr = top - core::mem::size_of::<Frame>() as u64;
     unsafe {
@@ -319,7 +327,7 @@ fn new_process(pid: Pid, ppid: Pid, name: String, space: AddressSpace, frame: Fr
             ((frame_addr - 8 - i * 8) as *mut u64).write(0);
         }
     }
-    Box::new(Process {
+    Ok(Box::new(Process {
         pid,
         ppid,
         pgid: pid,
@@ -337,7 +345,7 @@ fn new_process(pid: Pid, ppid: Pid, name: String, space: AddressSpace, frame: Fr
         brk_end: 0,
         mmap_next: MMAP_TOP,
         signals: signal::Signals::default(),
-    })
+    }))
 }
 
 fn basename(path: &str) -> &str {
@@ -365,24 +373,30 @@ pub fn spawn(name: &str, args: &[&str]) -> Result<Pid, i64> {
         .collect();
     let image = load_path("/", &path, &args, &envs)?;
     let console = OpenFile::console();
-    Ok(interrupts::without_interrupts(|| {
+    interrupts::without_interrupts(|| {
         let s = sched();
+        if s.procs.len() >= MAX_PROCS {
+            return Err(EAGAIN);
+        }
         let pid = s.next_pid;
         s.next_pid += 1;
         let frame = Frame::user_start(image.entry, image.sp);
-        let mut p = new_process(pid, s.current, basename(&path).to_string(), image.space, frame);
+        let mut p = new_process(pid, s.current, basename(&path).to_string(), image.space, frame)?;
         p.fds = vec![Some(FdEntry { file: console, cloexec: false }); 3];
         p.brk_start = image.brk;
         p.brk_end = image.brk;
         s.procs.insert(pid, p);
         s.ready.push_back(pid);
         crate::drivers::tty::set_foreground(pid);
-        pid
-    }))
+        Ok(pid)
+    })
 }
 
 pub fn fork(frame: &Frame) -> Result<Pid, i64> {
     let s = sched();
+    if s.procs.len() >= MAX_PROCS {
+        return Err(EAGAIN);
+    }
     let space = s
         .cur()
         .space
@@ -395,7 +409,7 @@ pub fn fork(frame: &Frame) -> Result<Pid, i64> {
     let pid = s.next_pid;
     s.next_pid += 1;
     let parent = s.cur();
-    let mut child = new_process(pid, parent.pid, parent.name.clone(), space, child_frame);
+    let mut child = new_process(pid, parent.pid, parent.name.clone(), space, child_frame)?;
     child.pgid = parent.pgid;
     child.sid = parent.sid;
     child.fds = parent.fds.clone();

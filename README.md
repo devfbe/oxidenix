@@ -163,7 +163,7 @@ About 5,000 lines of Rust in the kernel plus a small host-side builder.
 | `mmap` area | top-down from `0x7000_0000_0000` | anonymous and private file mappings |
 | User stack | below `0x7fff_ffff_f000` | 256 KiB, Linux initial stack (argc, argv, envp, auxv) |
 | Kernel image, stacks, boot info, framebuffer, physical memory map | upper half, chosen by the bootloader | shared by all address spaces |
-| Kernel heap | `0xffff_c000_0000_0000` | 16 MiB, `linked_list_allocator` |
+| Kernel heap | `0xffff_c000_0000_0000` | starts at 8 MiB and grows on demand (up to 1 GiB virtual) |
 
 - **Frame allocator**: a bump allocator over the usable regions of the boot memory map, plus a
   free list threaded through the freed frames themselves. Every frame carries a **reference
@@ -175,6 +175,11 @@ About 5,000 lines of Rust in the kernel plus a small host-side builder.
   processes and are tagged with an OS-available page table bit. A write fault either copies the
   frame or, for the last owner, just restores write access. Kernel writes into user memory
   resolve COW first, because they would not fault.
+- **Out of memory is an error, not a panic**: the kernel heap grows by mapping more frames
+  when an allocation fails. User memory (pages, page tables, kernel stacks for `fork`) may not
+  take the last 16 MiB of RAM, which stay reserved for the heap. Large allocations that user space
+  can trigger (kernel stacks, file contents, pipe buffers, `execve` arguments) are fallible and
+  return `ENOMEM`/`E2BIG`, and at most 256 processes can exist (`EAGAIN` beyond that).
 - **User memory access** (`uaccess.rs`) checks every page of a user range against the active
   page tables before the kernel touches it. Bad pointers yield `EFAULT`, never a kernel fault.
 
@@ -276,7 +281,8 @@ Each of these programs and scripts lives in the root filesystem and runs inside 
 
 | Test | Covers |
 |---|---|
-| `cowtest` | copy-on-write isolation between parent and child, kernel writes into shared pages, 50 forks |
+| `cowtest` | copy-on-write isolation between parent and child, kernel writes into shared pages, 50 forks, shared read-only frames under `brk` |
+| `oomtest` | fork bomb (stops at the process limit), memory exhaustion via `mmap`, 100 full pipes; the kernel survives and memory is reusable |
 | `sigtest` | handlers, killing a busy loop, `SIGCHLD`, `EINTR` on pipe reads, blocked and ignored signals |
 | `forktest` | `fork`, `execve`, `wait4`, preemptive interleaving of two workers |
 | `sh /etc/test.sh` | files, pipes, `cd`, `mkdir`/`touch`/`rm`, rename cycles via symlinks, file quota |
@@ -297,21 +303,21 @@ fixed:
 - arithmetic overflows that panicked the kernel (`nanosleep`, `brk`/`mmap` sizes, `kill(INT_MIN)`, `sigreturn` stack pointer)
 - `iretq` to non-user addresses (signal handlers, ELF entry points, restored contexts), which
   would fault in ring 0
-- kernel heap exhaustion through huge or numerous files (global quota, per-inode accounting,
-  `NAME_MAX`)
+- kernel heap exhaustion through huge or numerous files, pipes, processes or arguments (quotas,
+  process limit, `ARG_MAX`, a frame reserve for the heap and fallible allocations)
 - directory cycles through `rename` (also via symlinks) and recursion deep enough to overflow
   the kernel stack
 - spinlock self-deadlocks and sleeping while holding an inode lock
 - the `sysret` non-canonical return problem, which the `iretq` return path avoids entirely
 
-Known open issues: running out of kernel heap memory still panics instead of returning `ENOMEM`,
-`getrandom` and `AT_RANDOM` are not cryptographically secure, and there are no users or
-permissions (everything runs as root).
+Known open issues: `getrandom` and `AT_RANDOM` are not cryptographically secure, the kernel heap
+never returns grown memory to the frame allocator, and there are no users or permissions
+(everything runs as root).
 
 ## Limitations and roadmap
 
 - [x] Copy-on-write `fork`
-- [ ] `ENOMEM` instead of a kernel panic when the kernel heap is exhausted
+- [x] `ENOMEM` instead of a kernel panic when memory runs out
 - [ ] Job control: stopping (Ctrl+Z), `fg`/`bg`, `SIGCONT`
 - [ ] Persistent storage: a disk driver and an on-disk filesystem
 - [ ] Networking, SMP, dynamic linking, real entropy, users and permissions
@@ -329,6 +335,7 @@ permissions (everything runs as root).
 | Signals | POSIX signals with handlers, Ctrl+C and EINTR |
 | Bash | boot into an interactive Bash; harden signal and exec paths |
 | Copy-on-write | copy-on-write fork and an optimized dev profile |
+| Out of memory | grow the kernel heap and turn memory exhaustion into errors |
 
 Run `git log` for the full history, including the security fixes between these steps.
 

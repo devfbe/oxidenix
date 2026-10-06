@@ -30,7 +30,7 @@ pub const MAX_FILE_SIZE: usize = 64 * 1024 * 1024;
 pub const FILE_QUOTA: usize = 8 * 1024 * 1024;
 static FILE_BYTES: AtomicUsize = AtomicUsize::new(0);
 
-fn charge(bytes: usize) -> Result<(), i64> {
+pub fn charge(bytes: usize) -> Result<(), i64> {
     FILE_BYTES
         .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
             used.checked_add(bytes).filter(|&n| n <= FILE_QUOTA)
@@ -39,7 +39,7 @@ fn charge(bytes: usize) -> Result<(), i64> {
         .map_err(|_| ENOSPC)
 }
 
-fn release(bytes: usize) {
+pub fn release(bytes: usize) {
     FILE_BYTES.fetch_sub(bytes, Ordering::Relaxed);
 }
 
@@ -78,13 +78,29 @@ impl Data {
         if len > old {
             charge(len - old)?;
         }
-        match self {
+        // Allocation failures become ENOMEM instead of a kernel panic.
+        let grown = match self {
             Data::Static(b) => {
-                let mut v = b.to_vec();
-                v.resize(len, 0);
-                *self = Data::Owned(v);
+                let mut v = Vec::new();
+                let ok = v.try_reserve_exact(len).is_ok();
+                if ok {
+                    v.extend_from_slice(&b[..b.len().min(len)]);
+                    v.resize(len, 0);
+                    *self = Data::Owned(v);
+                }
+                ok
             }
-            Data::Owned(v) => v.resize(len, 0),
+            Data::Owned(v) => {
+                let ok = len <= v.len() || v.try_reserve(len - v.len()).is_ok();
+                if ok {
+                    v.resize(len, 0);
+                }
+                ok
+            }
+        };
+        if !grown {
+            release(len - old);
+            return Err(ENOMEM);
         }
         if len < old {
             release(old - len);

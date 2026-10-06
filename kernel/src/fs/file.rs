@@ -38,6 +38,12 @@ impl Pipe {
     }
 }
 
+impl Drop for Pipe {
+    fn drop(&mut self) {
+        crate::fs::release(self.buf.lock().len());
+    }
+}
+
 pub enum Kind {
     Inode(Arc<Inode>),
     PipeRead(Arc<Pipe>),
@@ -173,6 +179,7 @@ impl OpenFile {
                         *dst = src;
                     }
                     drop(q);
+                    crate::fs::release(n);
                     wakeup(pipe.write_chan());
                     return Ok(n);
                 }
@@ -196,11 +203,22 @@ impl OpenFile {
             if pipe.readers.load(Ordering::Relaxed) == 0 {
                 return if written > 0 { Ok(written) } else { Err(EPIPE) };
             }
+            // Buffered bytes count against the filesystem quota; when it is
+            // exhausted (or the heap is), the pipe behaves as if it were full.
             let pushed = {
                 let mut q = pipe.buf.lock();
                 let n = (PIPE_CAPACITY - q.len()).min(buf.len() - written);
-                q.extend(&buf[written..written + n]);
-                n
+                if n > 0 && crate::fs::charge(n).is_ok() {
+                    if q.try_reserve(n).is_ok() {
+                        q.extend(&buf[written..written + n]);
+                        n
+                    } else {
+                        crate::fs::release(n);
+                        0
+                    }
+                } else {
+                    0
+                }
             };
             if pushed > 0 {
                 written += pushed;

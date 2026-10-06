@@ -5,6 +5,8 @@ use x86_64::structures::paging::{FrameAllocator, FrameDeallocator, PhysFrame, Si
 use x86_64::{PhysAddr, VirtAddr};
 
 const FRAME_SIZE: u64 = 4096;
+/// Frames user memory may not take, so the kernel heap can always grow.
+pub const KERNEL_RESERVE_FRAMES: u64 = 4096;
 
 /// Hands out fresh frames from the usable regions first; freed frames go to
 /// a free list whose `next` pointer is stored in the frame itself.
@@ -85,6 +87,16 @@ impl PhysFrameAllocator {
         }
     }
 
+    pub fn free_frames(&self) -> u64 {
+        self.total_frames - self.used_frames
+    }
+
+    /// Whether `n` more frames may go to user memory (or other memory a
+    /// user can demand) without eating into the kernel reserve.
+    pub fn user_may_take(&self, n: u64) -> bool {
+        self.free_frames() >= KERNEL_RESERVE_FRAMES + n
+    }
+
     pub fn refcount(&self, frame: PhysFrame) -> u32 {
         self.refs.get(Self::index(frame)).copied().unwrap_or(0)
     }
@@ -122,6 +134,19 @@ impl FrameDeallocator<Size4KiB> for PhysFrameAllocator {
         unsafe { self.slot(addr).write(self.free_head) };
         self.free_head = addr;
         self.used_frames -= 1;
+    }
+}
+
+/// Frame source for user memory: refuses to dip into the kernel reserve.
+pub struct UserFrames<'a>(pub &'a mut PhysFrameAllocator);
+
+unsafe impl FrameAllocator<Size4KiB> for UserFrames<'_> {
+    fn allocate_frame(&mut self) -> Option<PhysFrame> {
+        if self.0.user_may_take(1) {
+            self.0.allocate_frame()
+        } else {
+            None
+        }
     }
 }
 

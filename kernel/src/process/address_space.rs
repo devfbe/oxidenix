@@ -1,4 +1,5 @@
 use crate::memory;
+use crate::memory::frame::UserFrames;
 use x86_64::registers::control::{Cr3, Cr3Flags};
 use x86_64::structures::paging::{
     FrameAllocator, FrameDeallocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags,
@@ -21,7 +22,7 @@ pub struct AddressSpace {
 
 impl AddressSpace {
     pub fn new() -> Option<Self> {
-        let l4 = memory::with_frames(|f| f.allocate_frame())?;
+        let l4 = memory::with_frames(|f| UserFrames(f).allocate_frame())?;
         let table = table_at(l4);
         let kernel = table_at(memory::kernel_l4());
         for i in 0..256 {
@@ -50,13 +51,14 @@ impl AddressSpace {
         let first = Page::<Size4KiB>::containing_address(VirtAddr::new(start));
         let last = Page::containing_address(VirtAddr::new(end - 1));
         memory::with_frames(|frames| {
+            let mut frames = UserFrames(frames);
             for page in Page::range_inclusive(first, last) {
                 if let Ok(frame) = mapper.translate_page(page) {
                     let old = leaf_flags(&mapper, page);
                     let mut merged = merge(old, flags);
                     // A frame shared with another address space must never become
                     // writable in place; it gets copy-on-write semantics instead.
-                    let shared = old.contains(COW) || frames.refcount(frame) > 1;
+                    let shared = old.contains(COW) || frames.0.refcount(frame) > 1;
                     if shared && merged.contains(PageTableFlags::WRITABLE) {
                         merged.remove(PageTableFlags::WRITABLE);
                         merged.insert(COW);
@@ -68,7 +70,7 @@ impl AddressSpace {
                 }
                 let frame = frames.allocate_frame().ok_or("out of memory")?;
                 unsafe { core::ptr::write_bytes(memory::phys_to_virt(frame.start_address().as_u64()), 0, PAGE as usize) };
-                unsafe { mapper.map_to_with_table_flags(page, frame, flags, parent, frames) }
+                unsafe { mapper.map_to_with_table_flags(page, frame, flags, parent, &mut frames) }
                     .map_err(|_| "map_to failed")?
                     .ignore();
             }
@@ -120,6 +122,7 @@ impl AddressSpace {
         let parent = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
         // Return errors only outside of with_frames: dropping `new` needs the lock.
         let result = memory::with_frames(|frames| {
+            let mut frames = UserFrames(frames);
             let l4 = table_at(self.l4);
             for i4 in 0..256 {
                 for (i3, l3e) in children(&l4[i4]) {
@@ -134,9 +137,9 @@ impl AddressSpace {
                                 leaf.set_flags(flags);
                             }
                             let frame = PhysFrame::containing_address(leaf.addr());
-                            frames.share(frame);
+                            frames.0.share(frame);
                             let page = Page::<Size4KiB>::containing_address(VirtAddr::new(va));
-                            unsafe { mapper.map_to_with_table_flags(page, frame, flags, parent, frames) }
+                            unsafe { mapper.map_to_with_table_flags(page, frame, flags, parent, &mut frames) }
                                 .map_err(|_| "map_to failed")?
                                 .ignore();
                         }
@@ -251,7 +254,7 @@ pub fn resolve_cow(va: u64) -> bool {
             entry.set_flags(writable);
             return true;
         }
-        let Some(new) = frames.allocate_frame() else { return false };
+        let Some(new) = UserFrames(frames).allocate_frame() else { return false };
         unsafe {
             core::ptr::copy_nonoverlapping(
                 memory::phys_to_virt(old.start_address().as_u64()),

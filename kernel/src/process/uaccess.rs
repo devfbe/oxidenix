@@ -52,12 +52,16 @@ pub fn read_cstr(ptr: u64) -> Result<String, i64> {
     Err(ENAMETOOLONG)
 }
 
+/// Total size limit for argv or envp, like Linux's ARG_MAX.
+const ARG_MAX: usize = 128 * 1024;
+
 /// Reads a NULL-terminated array of C strings (argv/envp).
 pub fn read_cstr_array(ptr: u64) -> Result<Vec<String>, i64> {
     let mut out = Vec::new();
     if ptr == 0 {
         return Ok(out);
     }
+    let mut total = 0;
     loop {
         if out.len() >= 1024 {
             return Err(E2BIG);
@@ -66,6 +70,11 @@ pub fn read_cstr_array(ptr: u64) -> Result<Vec<String>, i64> {
         if p == 0 {
             return Ok(out);
         }
-        out.push(read_cstr(p)?);
+        let s = read_cstr(p)?;
+        total += s.len() + 1;
+        if total > ARG_MAX {
+            return Err(E2BIG);
+        }
+        out.push(s);
     }
 }
