@@ -36,28 +36,46 @@ fn resolve_at(dirfd: u64, path: &str, follow: bool) -> Result<(Arc<Inode>, Strin
     Ok((inode, fs::join(&fs::normalize(&base, path))))
 }
 
+/// Whether a read of `f` that filled a whole buffer may go on with the
+/// next one: for files and memory devices, which never block. Pipes, the
+/// terminal and sockets answer with what they have, and asking again could
+/// block.
+fn reads_on(f: &OpenFile) -> bool {
+    f.inode().is_some_and(|i| i.device() != Some(fs::Device::Console))
+}
+
+fn read_file(f: &OpenFile, buf: u64, len: u64) -> Result<usize, i64> {
+    uaccess::read_to_user(buf, len, reads_on(f), |chunk, _| f.read(chunk))
+}
+
+fn write_file(f: &OpenFile, buf: u64, len: u64) -> Result<usize, i64> {
+    uaccess::write_from_user(buf, len, |chunk, _| f.write(chunk))
+}
+
 pub fn read(fd: u64, buf: u64, len: u64) -> SysResult {
     let f = file(fd)?;
-    Ok(f.read(uaccess::slice_mut(buf, len)?)? as i64)
+    Ok(read_file(&f, buf, len)? as i64)
 }
 
 pub fn write(fd: u64, buf: u64, len: u64) -> SysResult {
     let f = file(fd)?;
-    Ok(f.write(uaccess::slice(buf, len)?)? as i64)
+    Ok(write_file(&f, buf, len)? as i64)
 }
 
 pub fn pread(fd: u64, buf: u64, len: u64, off: i64) -> SysResult {
     if off < 0 {
         return Err(EINVAL);
     }
-    Ok(file(fd)?.read_at(off as u64, uaccess::slice_mut(buf, len)?)? as i64)
+    let f = file(fd)?;
+    Ok(uaccess::read_to_user(buf, len, true, |chunk, done| f.read_at(off as u64 + done, chunk))? as i64)
 }
 
 pub fn pwrite(fd: u64, buf: u64, len: u64, off: i64) -> SysResult {
     if off < 0 {
         return Err(EINVAL);
     }
-    Ok(file(fd)?.write_at(off as u64, uaccess::slice(buf, len)?)? as i64)
+    let f = file(fd)?;
+    Ok(uaccess::write_from_user(buf, len, |chunk, done| f.write_at(off as u64 + done, chunk))? as i64)
 }
 
 fn iovecs(iov: u64, count: u64) -> Result<Vec<(u64, u64)>, i64> {
@@ -71,7 +89,11 @@ pub fn readv(fd: u64, iov: u64, count: u64) -> SysResult {
     let f = file(fd)?;
     let mut total = 0;
     for (base, len) in iovecs(iov, count)? {
-        let n = f.read(uaccess::slice_mut(base, len)?)?;
+        let n = match read_file(&f, base, len) {
+            Ok(n) => n,
+            Err(e) if total == 0 => return Err(e),
+            Err(_) => break,
+        };
         total += n as i64;
         if n < len as usize {
             break;
@@ -84,7 +106,15 @@ pub fn writev(fd: u64, iov: u64, count: u64) -> SysResult {
     let f = file(fd)?;
     let mut total = 0;
     for (base, len) in iovecs(iov, count)? {
-        total += f.write(uaccess::slice(base, len)?)? as i64;
+        let n = match write_file(&f, base, len) {
+            Ok(n) => n,
+            Err(e) if total == 0 => return Err(e),
+            Err(_) => break,
+        };
+        total += n as i64;
+        if n < len as usize {
+            break;
+        }
     }
     Ok(total)
 }
@@ -188,32 +218,42 @@ pub fn getdents64(fd: u64, buf: u64, len: u64) -> SysResult {
     let f = file(fd)?;
     let inode = f.inode().ok_or(ENOTDIR)?;
     let mut snapshot = f.dir_snapshot.lock();
-    let mut off = f.offset.lock();
+    let off = f.offset.lock();
     if *off == 0 || snapshot.is_none() {
         *snapshot = Some(inode.list()?);
     }
     let entries = snapshot.as_ref().expect("taken above");
-    let out = uaccess::slice_mut(buf, len)?;
-    let mut pos = 0;
-    while let Some((name, ino, dtype)) = entries.get(*off as usize) {
+    let mut out = Vec::new();
+    let mut next = *off;
+    while let Some((name, ino, dtype)) = entries.get(next as usize) {
         let reclen = (19 + name.len() + 1).next_multiple_of(8);
-        if pos + reclen > out.len() {
-            if pos == 0 {
+        if out.len() + reclen > len as usize {
+            if out.is_empty() {
                 return Err(EINVAL);
             }
             break;
         }
-        let rec = &mut out[pos..pos + reclen];
-        rec.fill(0);
+        let at = out.len();
+        out.resize(at + reclen, 0);
+        let rec = &mut out[at..];
         rec[0..8].copy_from_slice(&ino.to_le_bytes());
-        rec[8..16].copy_from_slice(&(*off + 1).to_le_bytes());
+        rec[8..16].copy_from_slice(&(next + 1).to_le_bytes());
         rec[16..18].copy_from_slice(&(reclen as u16).to_le_bytes());
         rec[18] = *dtype;
         rec[19..19 + name.len()].copy_from_slice(name.as_bytes());
-        pos += reclen;
-        *off += 1;
+        next += 1;
     }
-    Ok(pos as i64)
+    let start = *off;
+    drop(off);
+    drop(snapshot);
+    // No lock is held while user memory is written (a fault may sleep);
+    // the position moves only once the entries reached the caller.
+    uaccess::copy_to(buf, &out)?;
+    let mut off = f.offset.lock();
+    if *off == start {
+        *off = next;
+    }
+    Ok(out.len() as i64)
 }
 
 pub fn pipe2(fds: u64, flags: u64) -> SysResult {
@@ -433,9 +473,9 @@ pub fn getcwd(buf: u64, size: u64) -> SysResult {
     if (size as usize) < cwd.len() + 1 {
         return Err(ERANGE);
     }
-    let out = uaccess::slice_mut(buf, cwd.len() as u64 + 1)?;
-    out[..cwd.len()].copy_from_slice(cwd.as_bytes());
-    out[cwd.len()] = 0;
+    let mut out = cwd.clone().into_bytes();
+    out.push(0);
+    uaccess::copy_to(buf, &out)?;
     Ok(cwd.len() as i64 + 1)
 }
 
@@ -498,7 +538,7 @@ pub fn readlinkat(dirfd: u64, path: u64, buf: u64, size: u64) -> SysResult {
     let (inode, _) = resolve_at(dirfd, &path, false)?;
     let target = inode.readlink()?;
     let n = target.len().min(size as usize);
-    uaccess::slice_mut(buf, n as u64)?.copy_from_slice(&target.as_bytes()[..n]);
+    uaccess::copy_to(buf, &target.as_bytes()[..n])?;
     Ok(n as i64)
 }
 

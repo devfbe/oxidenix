@@ -420,13 +420,15 @@ fn prlimit(old: u64) -> SysResult {
 
 /// Not cryptographically secure: xorshift seeded from the timestamp counter.
 fn getrandom(buf: u64, len: u64) -> SysResult {
-    let out = uaccess::slice_mut(buf, len)?;
     let mut x = unsafe { core::arch::x86_64::_rdtsc() } | 1;
-    for b in out.iter_mut() {
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        *b = x as u8;
-    }
-    Ok(len as i64)
+    let n = uaccess::read_to_user(buf, len, true, |out, _| {
+        for b in out.iter_mut() {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            *b = x as u8;
+        }
+        Ok(out.len())
+    })?;
+    Ok(n as i64)
 }

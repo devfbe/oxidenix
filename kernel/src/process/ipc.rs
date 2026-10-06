@@ -82,7 +82,7 @@ pub fn register(name: u64, len: u64, arg: u64) -> SysResult {
     if len > 64 {
         return Err(EINVAL);
     }
-    let name = String::from_utf8(uaccess::slice(name, len)?.to_vec()).map_err(|_| EINVAL)?;
+    let name = String::from_utf8(uaccess::read_vec(name, len)?).map_err(|_| EINVAL)?;
     let me = super::current_pid();
     lock(|ipc| {
         let generation = ipc.next_generation;
@@ -143,8 +143,10 @@ fn receive_loop(buf: u64, len: u64, id_out: u64, deadline: Option<u64>) -> SysRe
                     fail(id);
                     continue;
                 }
-                uaccess::slice_mut(buf, message.len() as u64)?.copy_from_slice(&message);
-                uaccess::write(id_out, id)?;
+                if let Err(e) = uaccess::copy_to(buf, &message).and_then(|_| uaccess::write(id_out, id)) {
+                    fail(id);
+                    return Err(e);
+                }
                 return Ok(message.len() as i64);
             }
             Err(()) => {
@@ -166,7 +168,7 @@ pub fn reply(id: u64, buf: u64, len: u64) -> SysResult {
     if len as usize > MAX_MESSAGE {
         return Err(EINVAL);
     }
-    let data = uaccess::slice(buf, len)?.to_vec();
+    let data = uaccess::read_vec(buf, len)?;
     let me = super::current_pid();
     lock(|ipc| {
         let req = ipc.requests.get(&id).ok_or(EINVAL)?;

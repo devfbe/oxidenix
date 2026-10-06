@@ -71,7 +71,7 @@ fn write_addr(addr: u64, len_ptr: u64, ep: Endpoint) -> Result<(), i64> {
     raw[4..8].copy_from_slice(&ep.addr.to_be_bytes());
     let len: u32 = uaccess::read(len_ptr)?;
     let n = (len as usize).min(raw.len());
-    uaccess::slice_mut(addr, n as u64)?.copy_from_slice(&raw[..n]);
+    uaccess::copy_to(addr, &raw[..n])?;
     uaccess::write(len_ptr, raw.len() as u32)
 }
 
@@ -117,10 +117,11 @@ pub fn connect(fd: u64, addr: u64, len: u64) -> SysResult {
 pub fn sendto(fd: u64, buf: u64, len: u64, flags: u64, addr: u64, alen: u64) -> SysResult {
     let f = socket_file(fd)?;
     let to = if addr != 0 { Some(read_addr(addr, alen)?) } else { None };
-    // Sent straight from user memory, chunk by chunk: no kernel copy of
-    // an arbitrarily large buffer.
-    let data = uaccess::slice(buf, len)?;
-    let n = sock(&f).send(data, to, f.nonblocking() || flags & MSG_DONTWAIT != 0)?;
+    // Passed on chunk by chunk: no kernel copy of an arbitrarily large
+    // buffer. A datagram larger than a chunk is too large for netd anyway
+    // (EMSGSIZE), so it is never split.
+    let nonblocking = f.nonblocking() || flags & MSG_DONTWAIT != 0;
+    let n = uaccess::write_from_user(buf, len, |chunk, _| sock(&f).send(chunk, to, nonblocking))?;
     Ok(n as i64)
 }
 
@@ -129,7 +130,7 @@ pub fn recvfrom(fd: u64, buf: u64, len: u64, flags: u64, addr: u64, len_ptr: u64
     let mut data = vec![0u8; (len as usize).min(MAX_MSG)];
     let nonblocking = f.nonblocking() || flags & MSG_DONTWAIT != 0;
     let (n, from) = sock(&f).recv(&mut data, nonblocking, flags & MSG_PEEK != 0)?;
-    uaccess::slice_mut(buf, n as u64)?.copy_from_slice(&data[..n]);
+    uaccess::copy_to(buf, &data[..n])?;
     write_addr(addr, len_ptr, from)?;
     Ok(n as i64)
 }
@@ -162,7 +163,7 @@ pub fn sendmsg(fd: u64, msg: u64, flags: u64) -> SysResult {
         if len > (MAX_MSG - data.len()) as u64 {
             return Err(EMSGSIZE);
         }
-        data.extend_from_slice(uaccess::slice(base, len)?);
+        data.extend_from_slice(&uaccess::read_vec(base, len)?);
     }
     let f = socket_file(fd)?;
     let to = if h.name != 0 { Some(read_addr(h.name, h.namelen as u64)?) } else { None };
@@ -180,7 +181,7 @@ pub fn recvmsg(fd: u64, msg: u64, flags: u64) -> SysResult {
     let mut done = 0;
     for (base, len) in h.iov {
         let chunk = (len as usize).min(n - done);
-        uaccess::slice_mut(base, chunk as u64)?.copy_from_slice(&data[done..done + chunk]);
+        uaccess::copy_to(base, &data[done..done + chunk])?;
         done += chunk;
     }
     // msg_namelen is updated by write_addr; no control data; no flags.

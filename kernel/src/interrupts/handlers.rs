@@ -74,18 +74,28 @@ fn exception(frame: &mut Frame) {
     let vector = frame.vector as u8;
     let mut sig = exception_signal(vector);
     if vector == 14 {
-        use crate::process::address_space::{handle_fault, Access, Fault};
+        use crate::process::address_space::{handle_fault, Access, Fault, USER_END};
         let addr = Cr2::read_raw();
         // Error code: bit 1 = write, bit 4 = instruction fetch.
         let access = Access { write: frame.error & 2 != 0, exec: frame.error & 16 != 0 };
-        match handle_fault(addr, access) {
-            Ok(()) => return,
-            Err(Fault::Bus) => sig = signal::SIGBUS,
-            Err(Fault::Oom) if frame.from_user() => {
-                crate::printkln!("[kernel] out of memory at {:#x}: process killed", addr);
-                crate::process::exit(signal::SIGKILL as i32);
+        // The kernel touches user memory only in uaccess's copy routine; a
+        // fault there is handled like the user's own, and if the access is
+        // not allowed the copy ends early (EFAULT) instead of the kernel.
+        let fixup = if frame.from_user() { None } else { crate::process::uaccess::fixup(frame.rip) };
+        if frame.from_user() || (fixup.is_some() && addr < USER_END) {
+            match handle_fault(addr, access) {
+                Ok(()) => return,
+                Err(_) if fixup.is_some() => {
+                    frame.rip = fixup.expect("checked");
+                    return;
+                }
+                Err(Fault::Bus) => sig = signal::SIGBUS,
+                Err(Fault::Oom) => {
+                    crate::printkln!("[kernel] out of memory at {:#x}: process killed", addr);
+                    crate::process::exit(signal::SIGKILL as i32);
+                }
+                Err(Fault::Segv) => {}
             }
-            Err(_) => {}
         }
     }
     if frame.from_user() && vector != 18 {

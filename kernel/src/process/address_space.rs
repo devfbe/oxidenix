@@ -3,8 +3,8 @@
 //!
 //! Memory is demand-paged: `mmap`, `brk` and the stack only create areas;
 //! a page gets a frame on its first access (`fault`), which also performs
-//! copy-on-write and grows stacks downwards. Kernel accesses to user memory
-//! (`user_range_ok`) fault pages in the same way before touching them.
+//! copy-on-write and grows stacks downwards. Faults of the kernel's own
+//! accesses to user memory (`uaccess`) are handled the same way.
 //!
 //! Writable private memory is committed when it is mapped, against a
 //! system-wide limit (`memory::commit`), so running out of memory is an
@@ -866,28 +866,6 @@ fn leaf_entry(l4: PhysFrame, va: u64) -> Option<&'static mut PageTableEntry> {
     }
     let e = &mut table[v.p1_index()];
     (!e.is_unused()).then_some(e)
-}
-
-/// Makes [addr, addr+len) of the running process accessible for a kernel
-/// access (`write` or read), faulting pages in as a user access would.
-/// False if any page may not be accessed (EFAULT).
-pub fn user_range_ok(addr: u64, len: u64, write: bool) -> bool {
-    let Some(end) = addr.checked_add(len) else { return false };
-    if end > USER_END {
-        return false;
-    }
-    if len == 0 {
-        return true;
-    }
-    let l4 = Cr3::read().0;
-    user_pages(addr, end).all(|p| {
-        let va = p.start_address().as_u64();
-        let ready = leaf_entry(l4, va).is_some_and(|e| {
-            let f = e.flags();
-            f.contains(PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE) && (!write || f.contains(PageTableFlags::WRITABLE))
-        });
-        ready || super::with_current(|p| p.space.as_mut().is_some_and(|s| s.fault(va, Access { write, exec: false }).is_ok()))
-    })
 }
 
 /// The page fault handler's part: satisfies a fault of the running

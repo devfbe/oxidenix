@@ -177,7 +177,7 @@ oxidenix/
 │       │   ├── elf.rs           ELF64 parser
 │       │   ├── ipc.rs           services and message passing
 │       │   ├── irq.rs           device interrupts for user-space drivers
-│       │   └── uaccess.rs       checked access to user memory
+│       │   └── uaccess.rs       copies to and from user memory
 │       ├── net.rs               socket client: operations become netd requests
 │       ├── fs/                  VFS (mod.rs), open files and pipes (file.rs),
 │       │                        initramfs unpacker (cpio.rs), IPC client for
@@ -271,8 +271,11 @@ About 9,200 lines of Rust (without comments and blank lines) in the kernel and 3
   take the last 16 MiB of RAM, which stay reserved for the heap. Large allocations that user space
   can trigger (kernel stacks, file contents, pipe buffers, `execve` arguments) are fallible and
   return `ENOMEM`/`E2BIG`, and at most 256 processes can exist (`EAGAIN` beyond that).
-- **User memory access** (`uaccess.rs`) faults in every page of a user range (or finds it not
-  allowed) before the kernel touches it. Bad pointers yield `EFAULT`, never a kernel fault.
+- **User memory access** (`uaccess.rs`): the kernel copies to and from user memory only in one
+  copy routine, never through references. A page fault in it is handled like the program's own
+  (demand paging, copy-on-write); if the access is not allowed, the fault handler resumes at a
+  fixup that ends the copy, and the syscall returns `EFAULT`. File and socket data passes
+  through kernel buffers of 64 KiB, so no lock is ever held while user memory is touched.
 - What a context switch saves (FS base, FPU state) lives apart from the process's own state, so
   a task may sleep in a page fault (reading a file page) while it holds its address space.
 

@@ -123,6 +123,6 @@ pub fn proc_query(op: u64, arg: u64, buf: u64, len: u64) -> SysResult {
     if bytes.len() as u64 > len {
         return Err(ERANGE);
     }
-    uaccess::slice_mut(buf, bytes.len() as u64)?.copy_from_slice(&bytes);
+    uaccess::copy_to(buf, &bytes)?;
     Ok(bytes.len() as i64)
 }

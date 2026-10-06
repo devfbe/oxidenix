@@ -162,6 +162,21 @@ int main(void) {
     check("MAP_FIXED_NOREPLACE fails with EEXIST", mmap(a, 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0) == MAP_FAILED && errno == EEXIST);
     munmap(a, 4096);
 
+    /* The kernel's own accesses to user memory follow the same rules. */
+    int pfd[2];
+    pipe(pfd);
+    char *kb = mmap(NULL, 2 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    write(pfd[1], "lazy", 4);
+    check("read into a lazily mapped buffer works", read(pfd[0], kb + 4096 - 2, 4) == 4 && memcmp(kb + 4094, "lazy", 4) == 0);
+    mprotect(kb, 4096, PROT_READ);
+    write(pfd[1], "ro", 2);
+    check("read into a read-only buffer fails with EFAULT", read(pfd[0], kb, 2) == -1 && errno == EFAULT);
+    munmap(kb, 2 * 4096);
+    check("write from unmapped memory fails with EFAULT", write(pfd[1], kb, 1) == -1 && errno == EFAULT);
+    check("a path in unmapped memory fails with EFAULT", open((char *)kb, O_RDONLY) == -1 && errno == EFAULT);
+    close(pfd[0]);
+    close(pfd[1]);
+
     /* The stack grows on demand (here to about 4 MiB). */
     pid_t deep = fork();
     if (deep == 0) _exit(depth(4000) == 0 ? 1 : 0);

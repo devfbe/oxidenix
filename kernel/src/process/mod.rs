@@ -217,7 +217,7 @@ pub fn sched_setaffinity(pid: Pid, size: u64, mask: u64) -> SysResult {
     }
     let mut bytes = [0u8; 8];
     let n = size.min(8);
-    bytes[..n as usize].copy_from_slice(uaccess::slice(mask, n)?);
+    uaccess::copy_from(mask, &mut bytes[..n as usize])?;
     let wanted = u64::from_le_bytes(bytes) & online_mask();
     if wanted == 0 {
         return Err(EINVAL);
