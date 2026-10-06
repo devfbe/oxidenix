@@ -153,6 +153,11 @@ impl GroupSignals {
         GroupSignals { actions: self.actions, ..GroupSignals::default() }
     }
 
+    /// Whether a group stop is in progress (new threads join it).
+    pub fn joins_stop(&self) -> bool {
+        self.stopping != 0
+    }
+
     /// Exec resets caught signals to their default action.
     pub fn reset_on_exec(&mut self) {
         for a in self.actions.iter_mut() {
@@ -164,6 +169,10 @@ impl GroupSignals {
 }
 
 impl ThreadSignals {
+    pub fn set_stop(&mut self) {
+        self.stop = true;
+    }
+
     /// A new thread or process keeps the creator's mask, nothing else.
     pub fn inherit(&self) -> ThreadSignals {
         ThreadSignals { mask: self.mask, ..ThreadSignals::default() }
@@ -294,29 +303,49 @@ fn post(group: &Arc<ThreadGroup>, thread: Option<&Arc<Task>>, sig: u32) {
             Some(t) => t.sig.lock().pending |= bit(sig),
             None => g.pending |= bit(sig),
         }
-        if !g.ignored(sig) || thread.is_some_and(|t| t.sig.lock().waiting_for & bit(sig) != 0) {
-            // A thread that takes it: the target, or the first one that
-            // does not block it (or waits for it in sigtimedwait).
-            let takes = |t: &Arc<Task>| {
-                let ts = t.sig.lock();
-                ts.mask & bit(sig) == 0 || bit(sig) & UNBLOCKABLE != 0 || ts.waiting_for & bit(sig) != 0
-            };
-            match thread {
-                Some(t) => {
-                    if takes(t) {
-                        kick(t);
-                    }
+        // A thread that takes it: one waiting for it in sigtimedwait (even
+        // if it is ignored), else the target or the first thread that does
+        // not block it.
+        let ignored = g.ignored(sig);
+        let takes = |t: &Arc<Task>| {
+            let ts = t.sig.lock();
+            ts.waiting_for & bit(sig) != 0 || (!ignored && (ts.mask & bit(sig) == 0 || bit(sig) & UNBLOCKABLE != 0))
+        };
+        match thread {
+            Some(t) => {
+                if takes(t) {
+                    kick(t);
                 }
-                None => {
-                    if let Some(t) = info.threads.iter().find(|t| takes(t)) {
-                        kick(t);
-                    }
+            }
+            None => {
+                if let Some(t) = info.threads.iter().find(|t| takes(t)) {
+                    kick(t);
                 }
             }
         }
     }
     if let Some(ppid) = continued_parent {
         notify_parent(ppid);
+    }
+}
+
+/// Hands the process's pending signals to another thread that can take
+/// them, after a thread blocked them or left (the thread first kicked may
+/// never deliver them).
+pub fn retarget(group: &Arc<ThreadGroup>) {
+    let info = group.info.lock();
+    let g = group.sig.lock();
+    if g.pending == 0 {
+        return;
+    }
+    let me = current();
+    let taker = info.threads.iter().filter(|t| !core::ptr::eq(&***t, me)).find(|t| {
+        let ts = t.sig.lock();
+        let open = g.pending & !(ts.mask & !UNBLOCKABLE);
+        (1..=NSIG).any(|s| open & bit(s) != 0 && !g.ignored(s)) || g.pending & ts.waiting_for != 0
+    });
+    if let Some(t) = taker {
+        kick(t);
     }
 }
 
@@ -559,7 +588,7 @@ pub fn sigprocmask(how: u64, set: u64, oldset: u64) -> SysResult {
     const SIG_UNBLOCK: u64 = 1;
     const SIG_SETMASK: u64 = 2;
     let new: Option<u64> = if set != 0 { Some(uaccess::read(set)?) } else { None };
-    let old = {
+    let (old, blocked_more) = {
         let mut s = current().sig.lock();
         let old = s.mask;
         if let Some(n) = new {
@@ -570,8 +599,11 @@ pub fn sigprocmask(how: u64, set: u64, oldset: u64) -> SysResult {
                 _ => return Err(EINVAL),
             } & !UNBLOCKABLE;
         }
-        old
+        (old, s.mask & !old != 0)
     };
+    if blocked_more {
+        retarget(&current().group);
+    }
     if oldset != 0 {
         uaccess::write(oldset, old)?;
     }
@@ -793,6 +825,14 @@ pub fn sigreturn(frame: &mut Frame) -> SysResult {
     saved.rflags = (saved.rflags & USER_FLAGS) | 0x202;
     *frame = saved;
     fxrstor(sf.fpu);
-    current().sig.lock().mask = sf.saved_mask & !UNBLOCKABLE;
+    let blocked_more = {
+        let mut t = current().sig.lock();
+        let old = t.mask;
+        t.mask = sf.saved_mask & !UNBLOCKABLE;
+        t.mask & !old != 0
+    };
+    if blocked_more {
+        retarget(&current().group);
+    }
     Ok(frame.rax as i64)
 }

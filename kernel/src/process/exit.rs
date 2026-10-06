@@ -84,6 +84,9 @@ pub fn exit_thread(status: i32) -> ! {
         table.tasks.remove(&me.tid());
         let mut info = group.info.lock();
         info.threads.retain(|t| !core::ptr::eq(&**t, me));
+        if me.tid() == group.tgid {
+            info.main_status = Some(status);
+        }
         info.dead_utime += me.utime.load(Ordering::Relaxed);
         info.dead_stime += me.stime.load(Ordering::Relaxed);
         let last = info.threads.is_empty();
@@ -95,11 +98,15 @@ pub fn exit_thread(status: i32) -> ! {
     // An exec in another thread waits for this one to be gone.
     wakeup(group_chan(group.tgid));
     if last {
+        let main_status = group.info.lock().main_status;
         let status = match group.sig.lock().exit {
             GroupExit::Exiting(s) => s,
-            _ => status,
+            _ => main_status.unwrap_or(status),
         };
         process_exit(&group, status);
+    } else {
+        // Process signals this thread was meant to take go to another.
+        signal::retarget(&group);
     }
     {
         let _w = me.wake_lock.lock();

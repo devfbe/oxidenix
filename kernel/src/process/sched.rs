@@ -22,7 +22,6 @@ use super::task::{KernelStack, State, Task, ThreadGroup};
 use super::Pid;
 use crate::smp::{self, Cpu};
 use crate::sync::IrqSpinLock;
-use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -86,9 +85,15 @@ impl PidReservation {
     pub fn insert(mut self, task: Arc<Task>) -> Result<(), i64> {
         let mut table = TABLE.lock();
         let group = task.group.clone();
-        let mut info = group.info.lock();
-        if task.tid() != group.tgid && group.sig.lock().exit != super::signal::GroupExit::None {
+        // Nothing new comes out of a process that is ending or exec'ing:
+        // neither a thread nor a forked child.
+        if current().group.sig.lock().exit != super::signal::GroupExit::None {
             return Err(super::errno::EAGAIN);
+        }
+        let mut info = group.info.lock();
+        if task.tid() != group.tgid && group.sig.lock().joins_stop() {
+            // A thread born during a group stop stops too.
+            task.sig.lock().set_stop();
         }
         info.threads.try_reserve(1).map_err(|_| super::errno::ENOMEM)?;
         info.threads.push(task.clone());
@@ -527,8 +532,8 @@ unsafe extern "C" fn idle_first_run() {
 
 /// Prepares `stack` so that the first switch to it runs `entry`; `frame`
 /// (if any) is placed at the top for `user_return`. Returns the saved rsp.
-pub fn prepare_stack(stack: &mut KernelStack, frame: Option<super::syscall::Frame>, user: bool) -> u64 {
-    let top = stack.0.as_mut_ptr() as u64 + stack.0.len() as u64;
+pub fn prepare_stack(stack: &KernelStack, frame: Option<super::syscall::Frame>, user: bool) -> u64 {
+    let top = stack.top();
     let frame_addr = match frame {
         Some(f) => {
             let a = top - core::mem::size_of::<super::syscall::Frame>() as u64;
@@ -551,8 +556,8 @@ pub fn prepare_stack(stack: &mut KernelStack, frame: Option<super::syscall::Fram
 /// A new idle task with its own stack (for the bootstrap CPU, whose boot
 /// stack belongs to the kernel monitor).
 pub fn new_idle_task(cpu: usize) -> Arc<Task> {
-    let mut stack = unsafe { Box::<KernelStack>::new_zeroed().assume_init() };
-    let rsp = prepare_stack(&mut stack, None, false);
+    let stack = KernelStack::new(false).expect("no kernel stack for an idle task");
+    let rsp = prepare_stack(&stack, None, false);
     Arc::new(Task::idle_task(cpu, Some(stack), rsp))
 }
 

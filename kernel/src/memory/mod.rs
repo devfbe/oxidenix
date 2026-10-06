@@ -1,4 +1,5 @@
 pub mod frame;
+pub mod kstack;
 
 use bootloader_api::info::MemoryRegion;
 use core::alloc::{GlobalAlloc, Layout};
@@ -72,6 +73,11 @@ impl GrowingHeap {
                 return false;
             }
             unsafe { heap.extend(want as usize) };
+            // The heap never gives memory back: these frames are no longer
+            // there for programs, so less can be promised to them.
+            let _ = COMMIT_LIMIT.try_update(core::sync::atomic::Ordering::Relaxed, core::sync::atomic::Ordering::Relaxed, |l| {
+                Some(l.saturating_sub(want / PAGE))
+            });
             true
         }
     }
@@ -143,6 +149,7 @@ pub fn init(regions: &'static [MemoryRegion], phys_offset: u64) {
         LOW_FRAME.call_once(|| low);
     }
     map_heap(HEAP_START, HEAP_INITIAL, &mut frames).expect("cannot map the initial kernel heap");
+    kstack::init(Cr3::read().0, &mut frames);
     unsafe { HEAP.0.lock().init(HEAP_START as *mut u8, HEAP_INITIAL as usize) };
     frames.enable_refcounts();
     COMMIT_LIMIT.store(

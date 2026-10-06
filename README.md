@@ -166,7 +166,7 @@ oxidenix/
 │       │                        the trap dispatcher (entry.rs, handlers.rs), local and I/O APIC
 │       │                        with timer calibration (apic.rs),
 │       │                        exception, timer and keyboard handlers (handlers.rs)
-│       ├── memory/              physical frame allocator with refcounts (frame.rs),
+│       ├── memory/              physical frame allocator with refcounts (frame.rs), kernel stacks (kstack.rs),
 │       │                        kernel heap and page table access (mod.rs)
 │       ├── process/             process lifecycle and syscalls on it (mod.rs),
 │       │   ├── task.rs          tasks (threads), thread groups (processes), shared tables
@@ -288,14 +288,22 @@ About 9,200 lines of Rust (without comments and blank lines) in the kernel and 3
   faults (if the page is missing it drops the lock, faults it in and retries), so the check and
   the enqueue are atomic with respect to a waker.
 - **Out of memory is an error, not a panic**: the kernel heap grows by mapping more frames
-  when an allocation fails. User memory (pages, page tables, kernel stacks for `fork`) may not
-  take the last 16 MiB of RAM, which stay reserved for the heap. Large allocations that user space
-  can trigger (kernel stacks, file contents, pipe buffers, `execve` arguments) are fallible and
-  return `ENOMEM`/`E2BIG`, and at most 256 processes can exist (`EAGAIN` beyond that).
+  when an allocation fails. It never shrinks, so each growth lowers the commit limit by as
+  much. User memory (pages, page tables, kernel stacks) may not take the last 16 MiB of RAM,
+  which stay reserved for the heap. Large allocations that user space can trigger (kernel
+  stacks, file contents, pipe buffers, `execve` arguments) are fallible and return
+  `ENOMEM`/`E2BIG`, and at most 256 tasks (threads and zombies) can exist (`EAGAIN` beyond that).
+- **Kernel stacks** (`memory/kstack.rs`) are not on the heap: each has a slot in its own
+  virtual region, mapped page by page with 64 KiB of unmapped guard below, so an overflow
+  faults instead of corrupting a neighbor. A user task's stack is charged to the commit limit
+  (so `clone` fails with `ENOMEM` before promised memory runs out), and its frames go back to
+  the frame allocator when the task is gone. Freed slots are reused only after one flush of the
+  region on every CPU.
 - **User memory access** (`uaccess.rs`): the kernel copies to and from user memory only in one
   copy routine, never through references. A page fault in it is handled like the program's own
   (demand paging, copy-on-write); if the access is not allowed, the fault handler resumes at a
-  fixup that ends the copy, and the syscall returns `EFAULT`. File and socket data passes
+  fixup that ends the copy, and the syscall returns `EFAULT`. Reads take data from a file, pipe
+  or socket only for the part of the buffer that may be written, so a bad buffer loses nothing. File and socket data passes
   through kernel buffers of 64 KiB, so no lock is ever held while user memory is touched.
 - What a context switch saves (FS base, FPU state) lives apart from the process's own state, so
   a task may sleep in a page fault (reading a file page) while it holds its address space.
@@ -324,7 +332,7 @@ The scheduler is built for several CPUs (`process/sched.rs`, design in
   first ends the others and takes over the process id. `fork` copies only the calling thread.
   `vfork` (and `clone` with `CLONE_VM|CLONE_VFORK`, as `posix_spawn` uses it) shares the address
   space and suspends the parent until the child execs or exits.
-- **One kernel stack per task** (64 KiB). A context switch saves callee-saved registers,
+- **One kernel stack per task** (64 KiB, see Memory). A context switch saves callee-saved registers,
   the FPU/SSE state (`fxsave`), the FS base (musl's TLS pointer), and switches CR3, the TSS
   stack and I/O bitmap, and the syscall stack in the CPU block.
 - **Per-CPU run queues**, round robin, driven by each CPU's local APIC timer at 100 Hz

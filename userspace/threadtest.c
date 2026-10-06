@@ -127,6 +127,20 @@ static void main_exits_first(void) {
     pthread_exit(NULL);
 }
 
+static void *exit_zero_later(void *arg) {
+    (void)arg;
+    usleep(50000);
+    syscall(SYS_exit, 0);
+    return NULL;
+}
+
+/* The main thread leaves with 3 (one thread only), the last one with 0. */
+static void main_status_counts(void) {
+    pthread_t t;
+    pthread_create(&t, NULL, exit_zero_later, NULL);
+    syscall(SYS_exit, 3);
+}
+
 static void killed_by_signal(void) {
     pthread_t t[3];
     for (int i = 0; i < 3; i++) pthread_create(&t[i], NULL, sleeper, NULL);
@@ -279,7 +293,23 @@ int main(void) {
     check("exit() in a thread ends all threads", WIFEXITED(st) && WEXITSTATUS(st) == 3);
     st = in_child(main_exits_first);
     check("the process lives on after its main thread", WIFEXITED(st) && WEXITSTATUS(st) == 7);
+    st = in_child(main_status_counts);
+    check("the main thread's exit status is the process's", WIFEXITED(st) && WEXITSTATUS(st) == 3);
+
+    /* sigtimedwait takes a signal whose default is to be ignored. */
+    sigset_t chld;
+    sigemptyset(&chld);
+    sigaddset(&chld, SIGCHLD);
+    pthread_sigmask(SIG_BLOCK, &chld, NULL);
     pid_t child = fork();
+    if (child == 0) _exit(0);
+    struct timespec two = {2, 0};
+    int got_sig = sigtimedwait(&chld, NULL, &two);
+    waitpid(child, &st, 0);
+    pthread_sigmask(SIG_UNBLOCK, &chld, NULL);
+    check("sigtimedwait wakes for SIGCHLD", got_sig == SIGCHLD);
+
+    child = fork();
     if (child == 0) killed_by_signal();
     usleep(50000);
     kill(child, SIGTERM);

@@ -74,12 +74,19 @@ pub fn exec(frame: &mut Frame, path: &str, args: &[String], envs: &[String]) -> 
     let cwd = with_current(|p| p.cwd());
     let image = load_path(&cwd, path, args, envs)?;
     let mm = Mm::new(image.space).ok_or(ENOMEM)?;
-    // A shared descriptor table becomes the process's own.
-    let files = with_current(|p| p.files().cloned())?;
-    let files = if alloc::sync::Arc::strong_count(&files) > 1 { files.duplicate().ok_or(ENOMEM)? } else { files };
     // The point of no return: from here on the old program is gone.
     de_thread()?;
     let me = current();
+    // A descriptor table still shared (CLONE_FILES without CLONE_THREAD)
+    // becomes the process's own, as it is once the other threads are gone.
+    let shared = with_current(|p| p.files.as_ref().filter(|f| alloc::sync::Arc::strong_count(f) > 1).cloned());
+    let files = match shared {
+        Some(f) => match f.duplicate() {
+            Some(copy) => Some(copy),
+            None => super::exit_group(signal::SIGKILL as i32),
+        },
+        None => None,
+    };
     {
         let mut info = me.group.info.lock();
         info.name = basename(path).to_string();
@@ -94,7 +101,10 @@ pub fn exec(frame: &mut Frame, path: &str, args: &[String], envs: &[String]) -> 
     let (closed, old_mm, old_files) = with_current(|p| {
         tlb::switch(p.mm.as_ref().map(|m| &*m.tlb), Some(&mm.tlb));
         let old_mm = p.mm.replace(mm);
-        let old_files = p.files.replace(files);
+        let old_files = match files {
+            Some(f) => p.files.replace(f),
+            None => None,
+        };
         p.io_bitmap = None;
         p.server = None;
         p.clear_child_tid = 0;

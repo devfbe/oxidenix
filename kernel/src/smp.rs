@@ -286,8 +286,8 @@ fn start_all() {
             break;
         }
         let block = new_block(index);
-        let stack = unsafe { alloc::boxed::Box::<crate::process::task::KernelStack>::new_zeroed().assume_init() };
-        let stack_top = stack.0.as_ptr() as u64 + stack.0.len() as u64;
+        let stack = crate::memory::kstack::KernelStack::new(false).expect("no kernel stack for a CPU");
+        let stack_top = stack.top();
         // The stack becomes the CPU's idle task's stack for good.
         core::mem::forget(stack);
         unsafe {

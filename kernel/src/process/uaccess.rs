@@ -142,6 +142,23 @@ pub fn write<T: Copy>(ptr: u64, val: T) -> Result<(), i64> {
     copy_to(ptr, bytes)
 }
 
+/// How many bytes from `ptr` (up to `len`) the program may write: pages are
+/// faulted in for writing until the first one that may not be written.
+/// Data is consumed only for that much, so a bad buffer loses nothing (a
+/// later unmap by another thread can still make the copy fail).
+fn writable_prefix(ptr: u64, len: u64) -> u64 {
+    use super::address_space::{handle_fault, Access, PAGE};
+    let mut at = ptr;
+    let end = ptr + len;
+    while at < end {
+        if handle_fault(at, Access { write: true, exec: false }).is_err() {
+            return at - ptr;
+        }
+        at = (at & !(PAGE - 1)) + PAGE;
+    }
+    len
+}
+
 /// Moves up to `len` bytes that `produce` delivers into user memory at
 /// `ptr`, a kernel buffer of at most CHUNK bytes at a time. `produce` gets
 /// the buffer and the number of bytes delivered so far. With `more`, it is
@@ -155,7 +172,10 @@ pub fn read_to_user(ptr: u64, len: u64, more: bool, mut produce: impl FnMut(&mut
     buf.resize((len as usize).min(CHUNK), 0);
     let mut done = 0u64;
     while done < len {
-        let want = ((len - done) as usize).min(CHUNK);
+        let want = writable_prefix(ptr + done, ((len - done) as usize).min(CHUNK) as u64) as usize;
+        if want == 0 {
+            return if done == 0 { Err(EFAULT) } else { Ok(done as usize) };
+        }
         let n = match produce(&mut buf[..want], done) {
             Ok(n) => n.min(want),
             Err(e) if done == 0 => return Err(e),

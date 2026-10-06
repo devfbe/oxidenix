@@ -28,10 +28,7 @@ use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
-pub const KSTACK_SIZE: usize = 64 * 1024;
-
-#[repr(C, align(16))]
-pub struct KernelStack(pub [u8; KSTACK_SIZE]);
+pub use crate::memory::kstack::KernelStack;
 
 #[repr(C, align(16))]
 pub struct FpuState(pub [u8; 512]);
@@ -85,6 +82,9 @@ pub struct Info {
     pub exit_status: Option<i32>,
     /// Stop/continue event not yet collected by the parent's wait4.
     pub report: Option<i32>,
+    /// Exit status of the main thread if it exited on its own (the
+    /// process's status unless a group exit sets one).
+    pub main_status: Option<i32>,
     /// Signal the parent gets when the process ends (SIGCHLD; 0: none).
     pub exit_signal: u32,
     /// prctl state: signal sent when the parent dies (0: none), core
@@ -116,6 +116,7 @@ impl Info {
             name,
             exit_status: None,
             report: None,
+            main_status: None,
             exit_signal: super::signal::SIGCHLD,
             pdeath_sig: 0,
             dumpable: true,
@@ -326,7 +327,7 @@ pub struct Task {
     pub kernel_rsp: UnsafeCell<u64>,
     /// None for tasks running on a stack they did not allocate (the
     /// kernel monitor on the boot stack, an AP's idle loop).
-    pub kstack: Option<Box<KernelStack>>,
+    pub kstack: Option<KernelStack>,
     own: UnsafeCell<Process>,
     cpu: UnsafeCell<CpuState>,
 }
@@ -336,7 +337,7 @@ unsafe impl Sync for Task {}
 unsafe impl Send for Task {}
 
 impl Task {
-    pub fn new(tid: Pid, group: Arc<ThreadGroup>, comm: String, own: Process, kstack: Option<Box<KernelStack>>, kernel_rsp: u64) -> Task {
+    pub fn new(tid: Pid, group: Arc<ThreadGroup>, comm: String, own: Process, kstack: Option<KernelStack>, kernel_rsp: u64) -> Task {
         Task {
             tid: AtomicU64::new(tid),
             group,
@@ -362,7 +363,7 @@ impl Task {
         }
     }
 
-    pub fn idle_task(cpu: usize, kstack: Option<Box<KernelStack>>, kernel_rsp: u64) -> Task {
+    pub fn idle_task(cpu: usize, kstack: Option<KernelStack>, kernel_rsp: u64) -> Task {
         let id = u64::MAX - cpu as u64;
         let name = alloc::format!("idle/{cpu}");
         let group = ThreadGroup::new(id, Info::new(0, 0, 0, name.clone()), GroupSignals::default()).expect("idle task at boot");
@@ -399,7 +400,7 @@ impl Task {
     }
 
     pub fn kstack_top(&self) -> Option<u64> {
-        self.kstack.as_ref().map(|s| s.0.as_ptr() as u64 + KSTACK_SIZE as u64)
+        self.kstack.as_ref().map(|s| s.top())
     }
 
     /// The task's own state.

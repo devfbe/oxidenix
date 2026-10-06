@@ -92,6 +92,9 @@ struct Request {
 static REQUEST: Request = Request { l4: AtomicU64::new(0), start: AtomicU64::new(0), end: AtomicU64::new(0), pending: AtomicU64::new(0) };
 static SHOOTER: spin::Mutex<()> = spin::Mutex::new(());
 
+/// `Request::l4` of a flush of kernel mappings, which every CPU does.
+const KERNEL: u64 = 0;
+
 /// Flushes for the current request if it targets this CPU (from the IPI
 /// handler, and from every wait of the protocol).
 pub fn serve() {
@@ -99,7 +102,8 @@ pub fn serve() {
     if REQUEST.pending.load(Ordering::Acquire) & bit == 0 {
         return;
     }
-    if Cr3::read().0.start_address().as_u64() == REQUEST.l4.load(Ordering::Relaxed) {
+    let l4 = REQUEST.l4.load(Ordering::Relaxed);
+    if l4 == KERNEL || Cr3::read().0.start_address().as_u64() == l4 {
         flush_local(REQUEST.start.load(Ordering::Relaxed), REQUEST.end.load(Ordering::Relaxed));
     }
     REQUEST.pending.fetch_and(!bit, Ordering::AcqRel);
@@ -120,6 +124,22 @@ pub fn shootdown(space: &Tlb, start: u64, end: u64) {
     // or it loads CR3 after the page table changes above.
     fence(Ordering::SeqCst);
     let others = space.cpus.load(Ordering::SeqCst) & !my_bit();
+    request(space.l4.start_address().as_u64(), others, start, end);
+}
+
+/// Drops the entries for [start, end) of the kernel's own mappings (shared
+/// by every address space) from every CPU's TLB. The kernel does not mark
+/// them global, so a full flush reaches them too.
+pub fn shootdown_kernel(start: u64, end: u64) {
+    flush_local(start, end);
+    fence(Ordering::SeqCst);
+    let all = (0..smp::MAX_CPUS).filter(|&i| smp::by_index(i).is_some()).fold(0u64, |m, i| m | 1 << i);
+    request(KERNEL, all & !my_bit(), start, end);
+}
+
+/// Has the CPUs in `targets` flush [start, end) of `l4` and waits for them.
+fn request(l4: u64, targets: u64, start: u64, end: u64) {
+    let others = targets;
     if others == 0 {
         return;
     }
@@ -130,7 +150,7 @@ pub fn shootdown(space: &Tlb, start: u64, end: u64) {
         serve();
         core::hint::spin_loop();
     };
-    REQUEST.l4.store(space.l4.start_address().as_u64(), Ordering::Relaxed);
+    REQUEST.l4.store(l4, Ordering::Relaxed);
     REQUEST.start.store(start, Ordering::Relaxed);
     REQUEST.end.store(end, Ordering::Relaxed);
     REQUEST.pending.store(others, Ordering::Release);

@@ -171,7 +171,17 @@ int main(void) {
     mprotect(kb, 4096, PROT_READ);
     write(pfd[1], "ro", 2);
     check("read into a read-only buffer fails with EFAULT", read(pfd[0], kb, 2) == -1 && errno == EFAULT);
+    char kept[2] = {0};
+    check("... and the data stays in the pipe", read(pfd[0], kept, 2) == 2 && memcmp(kept, "ro", 2) == 0);
     munmap(kb, 2 * 4096);
+    kb = mmap(NULL, 2 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    munmap(kb + 4096, 4096);
+    write(pfd[1], "hello", 5);
+    long part = read(pfd[0], kb + 4096 - 2, 100);
+    char rest[8] = {0};
+    long more = read(pfd[0], rest, sizeof rest);
+    check("a read up to a hole keeps the rest in the pipe", part == 2 && memcmp(kb + 4094, "he", 2) == 0 && more == 3 && memcmp(rest, "llo", 3) == 0);
+    munmap(kb, 4096);
     check("write from unmapped memory fails with EFAULT", write(pfd[1], kb, 1) == -1 && errno == EFAULT);
     check("a path in unmapped memory fails with EFAULT", open((char *)kb, O_RDONLY) == -1 && errno == EFAULT);
     close(pfd[0]);

@@ -330,15 +330,10 @@ pub fn yield_now() {
 /// A new user task with a kernel stack whose first switch enters ring 3
 /// with `frame`.
 fn new_task(tid: Pid, group: Arc<ThreadGroup>, comm: String, own: Process, frame: Frame) -> Result<Arc<Task>, i64> {
-    // Kernel stacks are demanded by user space (fork), so they must not
-    // eat into the reserve the kernel heap relies on.
-    if !memory::with_frames(|f| f.user_may_take((task::KSTACK_SIZE / 4096) as u64)) {
-        return Err(ENOMEM);
-    }
-    // try_new_zeroed: no temporary on the (small) kernel stack, and running
-    // out of memory is an error, not a panic.
-    let mut kstack = unsafe { Box::<KernelStack>::try_new_zeroed().map_err(|_| ENOMEM)?.assume_init() };
-    let rsp = sched::prepare_stack(&mut kstack, Some(frame), true);
+    // Kernel stacks are demanded by user space (clone): charged to the
+    // commit limit, so running out is ENOMEM.
+    let kstack = KernelStack::new(true).ok_or(ENOMEM)?;
+    let rsp = sched::prepare_stack(&kstack, Some(frame), true);
     Arc::try_new(Task::new(tid, group, comm, own, Some(kstack), rsp)).map_err(|_| ENOMEM)
 }
 
