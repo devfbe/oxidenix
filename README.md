@@ -494,7 +494,7 @@ Linux x86_64 numbers, grouped by area (about 120 in total):
 | Servers | `ioperm` (privileged servers only), `ipc_register` (1000), `ipc_receive` (1001, with timeout and interrupt notifications), `ipc_reply` (1002), `irq_enable` (1003), `dma_map` (1004) |
 | Power | `reboot` (power off ends QEMU, restart resets the machine) |
 | Sockets | `socket` `bind` `listen` `accept` `accept4` `connect` `sendto` `recvfrom` `sendmsg` `recvmsg` `shutdown` `getsockname` `getpeername` `setsockopt` (ignored) `getsockopt` (`AF_INET` only: TCP, UDP, raw ICMP) |
-| Time and misc | `nanosleep` `clock_gettime` (`CLOCK_REALTIME` from the RTC) `uname` `getrandom` |
+| Time and misc | `nanosleep` `clock_gettime` (`CLOCK_REALTIME` from the RTC) `uname` (reports `oxidenix`, not Linux) `getrandom` |
 
 Everything runs as root. Unknown syscalls print a kernel message and return `ENOSYS`.
 
