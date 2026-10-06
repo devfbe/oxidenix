@@ -345,7 +345,7 @@ pub fn poll(fds: u64, nfds: u64, timeout_ms: i64) -> SysResult {
         if ready > 0 || deadline.is_some_and(|d| super::ticks() >= d) {
             return Ok(ready);
         }
-        super::sleep_ticks(1);
+        super::sleep_ticks(1)?;
     }
 }
 

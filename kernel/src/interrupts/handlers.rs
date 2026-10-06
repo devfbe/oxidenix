@@ -1,4 +1,5 @@
 use x86_64::instructions::port::Port;
+use crate::process::syscall::Frame;
 use x86_64::PrivilegeLevel;
 use x86_64::structures::idt::{InterruptStackFrame, PageFaultErrorCode};
 
@@ -35,7 +36,35 @@ pub extern "x86-interrupt" fn page_fault_handler(
     }
 }
 
-pub extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStackFrame) {
+/// Timer entry: completes the CPU's interrupt frame to a full `Frame`, so
+/// that signal delivery can redirect a preempted user program.
+#[unsafe(naked)]
+pub unsafe extern "C" fn timer_entry() {
+    core::arch::naked_asm!(
+        "push r15",
+        "push r14",
+        "push r13",
+        "push r12",
+        "push r11",
+        "push r10",
+        "push r9",
+        "push r8",
+        "push rbp",
+        "push rdi",
+        "push rsi",
+        "push rdx",
+        "push rcx",
+        "push rbx",
+        "push rax",
+        "mov rdi, rsp",
+        "call {handler}",
+        "jmp {ret}",
+        handler = sym timer_interrupt,
+        ret = sym crate::process::syscall::user_return,
+    );
+}
+
+extern "sysv64" fn timer_interrupt(frame: &mut Frame) {
     unsafe {
         crate::interrupts::PICS
             .lock()
@@ -43,8 +72,9 @@ pub extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStac
     }
     crate::process::tick();
     // The kernel is not preemptive: only user-space code is interrupted.
-    if from_user(&stack_frame) {
+    if frame.from_user() {
         crate::process::schedule();
+        crate::process::signal::deliver(frame);
     }
 }
 

@@ -2,6 +2,7 @@ pub mod address_space;
 pub mod elf;
 pub mod errno;
 mod loader;
+pub mod signal;
 mod sys_file;
 mod sys_mem;
 pub mod syscall;
@@ -84,6 +85,7 @@ struct Process {
     brk_start: u64,
     brk_end: u64,
     mmap_next: u64,
+    signals: signal::Signals,
 }
 
 impl Process {
@@ -177,6 +179,7 @@ pub fn init() {
         brk_start: 0,
         brk_end: 0,
         mmap_next: 0,
+        signals: signal::Signals::default(),
     };
     let mut procs = BTreeMap::new();
     procs.insert(0, Box::new(kernel));
@@ -208,10 +211,6 @@ pub fn current_pid() -> Pid {
 
 pub fn current_ppid() -> Pid {
     with_current(|p| p.ppid)
-}
-
-pub fn exists(pid: Pid) -> bool {
-    interrupts::without_interrupts(|| sched().procs.contains_key(&pid))
 }
 
 /// `pid` 0 means the calling process.
@@ -260,10 +259,26 @@ pub fn tick() {
     wakeup(TICK_CHAN);
 }
 
-pub fn sleep_ticks(n: u64) {
+/// Sleeps for `n` timer ticks; a signal ends the sleep early with EINTR.
+pub fn sleep_ticks(n: u64) -> Result<(), i64> {
     let deadline = ticks().saturating_add(n);
     while ticks() < deadline {
         sleep_on(TICK_CHAN);
+        if signal::interrupted() {
+            return Err(EINTR);
+        }
+    }
+    Ok(())
+}
+
+/// pause(2): sleeps until a signal arrives.
+pub fn pause() -> SysResult {
+    const PAUSE_CHAN: usize = 3;
+    loop {
+        if signal::interrupted() {
+            return Err(EINTR);
+        }
+        sleep_on(PAUSE_CHAN);
     }
 }
 
@@ -290,7 +305,7 @@ pub fn wakeup(chan: usize) {
 }
 
 /// New process that, when first scheduled, enters ring 3 with `frame`
-/// via `syscall_return`.
+/// via `user_return`.
 fn new_process(pid: Pid, ppid: Pid, name: String, space: AddressSpace, frame: Frame) -> Box<Process> {
     // new_zeroed instead of Box::new: no temporary on the (small) kernel stack.
     let mut kstack = unsafe { Box::<KernelStack>::new_zeroed().assume_init() };
@@ -299,7 +314,7 @@ fn new_process(pid: Pid, ppid: Pid, name: String, space: AddressSpace, frame: Fr
     unsafe {
         (frame_addr as *mut Frame).write(frame);
         // Expected by switch_stacks: r15..rbx (6 words) and a return address.
-        ((frame_addr - 8) as *mut u64).write(syscall::syscall_return as *const () as u64);
+        ((frame_addr - 8) as *mut u64).write(syscall::user_return as *const () as u64);
         for i in 1..=6 {
             ((frame_addr - 8 - i * 8) as *mut u64).write(0);
         }
@@ -321,6 +336,7 @@ fn new_process(pid: Pid, ppid: Pid, name: String, space: AddressSpace, frame: Fr
         brk_start: 0,
         brk_end: 0,
         mmap_next: MMAP_TOP,
+        signals: signal::Signals::default(),
     })
 }
 
@@ -387,6 +403,7 @@ pub fn fork(frame: &Frame) -> Result<Pid, i64> {
     child.brk_start = parent.brk_start;
     child.brk_end = parent.brk_end;
     child.mmap_next = parent.mmap_next;
+    child.signals = parent.signals.for_child();
     child.fs_base = FsBase::read().as_u64();
     unsafe { fxsave(&mut child.fpu) };
     s.procs.insert(pid, child);
@@ -405,6 +422,7 @@ pub fn exec(frame: &mut Frame, path: &str, args: &[String], envs: &[String]) -> 
         p.brk_start = image.brk;
         p.brk_end = image.brk;
         p.mmap_next = MMAP_TOP;
+        p.signals.reset_on_exec();
         p.fds
             .iter_mut()
             .filter(|e| e.as_ref().is_some_and(|e| e.cloexec))
@@ -440,6 +458,7 @@ pub fn exit(status: i32) -> ! {
     if s.procs.get(&ppid).is_some_and(|p| p.state == State::WaitChild) {
         s.make_ready(ppid);
     }
+    signal::send(ppid, signal::SIGCHLD);
     schedule();
     unreachable!("zombie was scheduled again");
 }
@@ -462,6 +481,10 @@ fn wait_child(target: Option<Pid>, nohang: bool) -> Result<Option<(Pid, i32)>, i
         }
         if nohang {
             return Ok(None);
+        }
+        // Checked after the zombie scan: a finished child wins over a signal.
+        if signal::interrupted() {
+            return Err(EINTR);
         }
         s.cur().state = State::WaitChild;
         schedule();

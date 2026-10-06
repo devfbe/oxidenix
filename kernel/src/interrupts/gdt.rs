@@ -4,6 +4,9 @@ use x86_64::structures::tss::TaskStateSegment;
 use x86_64::VirtAddr;
 
 pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
+/// User selectors for assembly; `init` checks them against the GDT.
+pub const USER_SS: u16 = 0x1b;
+pub const USER_CS: u16 = 0x23;
 
 const STACK_SIZE: usize = 4096 * 5;
 
@@ -67,6 +70,7 @@ pub fn init() {
             stack_top(&raw const DOUBLE_FAULT_STACK);
         tss.privilege_stack_table[0] = stack_top(&raw const RING0_STACK);
     }
+    assert_eq!((GDT.1.user_data.0, GDT.1.user_code.0), (USER_SS, USER_CS));
     GDT.0.load();
     unsafe {
         CS::set_reg(GDT.1.kernel_code);

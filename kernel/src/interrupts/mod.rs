@@ -32,7 +32,10 @@ lazy_static! {
         idt.general_protection_fault
             .set_handler_fn(handlers::general_protection_handler);
         idt.invalid_opcode.set_handler_fn(handlers::invalid_opcode_handler);
-        idt[InterruptIndex::Timer as u8].set_handler_fn(handlers::timer_interrupt_handler);
+        unsafe {
+            idt[InterruptIndex::Timer as u8]
+                .set_handler_addr(x86_64::VirtAddr::new(handlers::timer_entry as *const () as u64));
+        }
         idt[InterruptIndex::Keyboard as u8]
             .set_handler_fn(handlers::keyboard_interrupt_handler);
         idt

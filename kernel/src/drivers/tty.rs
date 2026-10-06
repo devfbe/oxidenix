@@ -5,6 +5,7 @@
 
 use super::console;
 use crate::process::errno::*;
+use crate::process::signal::{SIGINT, SIGQUIT, SIGTSTP};
 use crate::process::{sleep_on, wakeup};
 use heapless::{Deque, Vec};
 use spin::Mutex;
@@ -85,6 +86,8 @@ struct Tty {
     /// Pending end-of-file marks (Ctrl+D on an empty line).
     eofs: usize,
     fg_pgrp: u64,
+    /// Signal raised by a control character, sent once the lock is released.
+    signal: Option<u32>,
 }
 
 static TTY: Mutex<Tty> = Mutex::new(Tty {
@@ -93,6 +96,7 @@ static TTY: Mutex<Tty> = Mutex::new(Tty {
     ready: Deque::new(),
     eofs: 0,
     fg_pgrp: 0,
+    signal: None,
 });
 
 /// Collects echo output while the TTY lock is held.
@@ -162,14 +166,24 @@ impl Tty {
             b = b'\r';
         }
 
-        // Signals are not implemented yet: Ctrl+C only discards pending input.
-        if self.flag(ISIG) && b == t.cc[VINTR] {
-            self.line.clear();
-            self.ready.clear();
-            if self.flag(ECHO) {
-                echo.push(b"^C\n");
+        if self.flag(ISIG) {
+            let sig = match b {
+                _ if b == t.cc[VINTR] => Some(SIGINT),
+                _ if b == t.cc[VQUIT] => Some(SIGQUIT),
+                _ if b == t.cc[VSUSP] => Some(SIGTSTP),
+                _ => None,
+            };
+            if let Some(sig) = sig {
+                self.line.clear();
+                self.ready.clear();
+                self.eofs = 0;
+                if self.flag(ECHO) {
+                    echo.char(b, t.lflag);
+                    echo.push(b"\n");
+                }
+                self.signal = Some(sig);
+                return;
             }
-            return;
         }
 
         if !self.flag(ICANON) {
@@ -241,13 +255,17 @@ impl Tty {
 /// Feeds bytes typed on the keyboard (or terminal replies) into the TTY.
 pub fn input(bytes: &[u8]) {
     let mut echo = Echo { buf: [0; 64], len: 0 };
-    without_interrupts(|| {
+    let (signal, fg) = without_interrupts(|| {
         let mut tty = TTY.lock();
         for &b in bytes {
             tty.input_byte(b, &mut echo);
         }
+        (tty.signal.take(), tty.fg_pgrp)
     });
     console::write_bytes(&echo.buf[..echo.len]);
+    if let Some(sig) = signal {
+        crate::process::signal::send_group(fg, sig);
+    }
     wakeup(TTY_CHAN);
 }
 
@@ -259,6 +277,9 @@ pub fn read(buf: &mut [u8], nonblock: bool) -> Result<usize, i64> {
         }
         if nonblock {
             return Err(EAGAIN);
+        }
+        if crate::process::signal::interrupted() {
+            return Err(EINTR);
         }
         sleep_on(TTY_CHAN);
     })

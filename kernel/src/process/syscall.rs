@@ -1,7 +1,7 @@
 use super::address_space::USER_END;
 use super::errno::*;
 use super::sys_file::{self, AT_FDCWD};
-use super::{sys_mem, uaccess};
+use super::{signal, sys_mem, uaccess};
 use crate::interrupts::gdt;
 use x86_64::registers::model_specific::{Efer, EferFlags, FsBase, LStar, SFMask, Star};
 use x86_64::registers::rflags::RFlags;
@@ -12,44 +12,55 @@ static mut SYSCALL_STACK_TOP: u64 = 0;
 #[unsafe(no_mangle)]
 static mut SYSCALL_USER_RSP: u64 = 0;
 
-/// Complete user register frame, in the order `syscall_entry` pushes it
-/// (lowest address first).
+/// Complete user register state. The tail (rip..ss) is exactly what the CPU
+/// pushes on an interrupt from ring 3, so syscalls and interrupts share this
+/// layout and both return through `user_return` (iretq).
 #[repr(C)]
-#[derive(Clone, Default)]
+#[derive(Clone, Copy, Default)]
 pub struct Frame {
     pub rax: u64,
-    pub rdi: u64,
-    pub rsi: u64,
+    pub rbx: u64,
+    pub rcx: u64,
     pub rdx: u64,
-    pub r10: u64,
+    pub rsi: u64,
+    pub rdi: u64,
+    pub rbp: u64,
     pub r8: u64,
     pub r9: u64,
-    pub rbx: u64,
-    pub rbp: u64,
+    pub r10: u64,
+    pub r11: u64,
     pub r12: u64,
     pub r13: u64,
     pub r14: u64,
     pub r15: u64,
     pub rip: u64,
+    pub cs: u64,
     pub rflags: u64,
     pub rsp: u64,
+    pub ss: u64,
 }
 
 impl Frame {
     pub fn user_start(entry: u64, sp: u64) -> Self {
         Frame {
             rip: entry,
-            rsp: sp,
+            cs: gdt::USER_CS as u64,
             rflags: 0x202,
+            rsp: sp,
+            ss: gdt::USER_SS as u64,
             ..Default::default()
         }
+    }
+
+    pub fn from_user(&self) -> bool {
+        self.cs & 3 == 3
     }
 }
 
 pub fn init() {
     let s = gdt::selectors();
     Star::write(s.user_code, s.user_data, s.kernel_code, s.kernel_data)
-        .expect("GDT layout does not match sysret");
+        .expect("GDT layout does not match syscall/sysret");
     LStar::write(VirtAddr::new(syscall_entry as *const () as u64));
     // Clear IF: the kernel is not preemptive, syscalls run without IRQs.
     SFMask::write(RFlags::INTERRUPT_FLAG | RFlags::DIRECTION_FLAG | RFlags::TRAP_FLAG);
@@ -60,62 +71,68 @@ pub fn set_kernel_stack(top: u64) {
     unsafe { SYSCALL_STACK_TOP = top };
 }
 
+/// Builds a `Frame` on the kernel stack (iret part first, as an interrupt
+/// would) and dispatches the syscall.
 #[unsafe(naked)]
 unsafe extern "C" fn syscall_entry() {
     core::arch::naked_asm!(
         "mov [rip + SYSCALL_USER_RSP], rsp",
         "mov rsp, [rip + SYSCALL_STACK_TOP]",
+        "push {ss}",
         "push qword ptr [rip + SYSCALL_USER_RSP]",
         "push r11",
+        "push {cs}",
         "push rcx",
         "push r15",
         "push r14",
         "push r13",
         "push r12",
-        "push rbp",
-        "push rbx",
+        "push r11",
+        "push r10",
         "push r9",
         "push r8",
-        "push r10",
-        "push rdx",
-        "push rsi",
+        "push rbp",
         "push rdi",
+        "push rsi",
+        "push rdx",
+        "push rcx",
+        "push rbx",
         "push rax",
         "mov rdi, rsp",
         "call {dispatch}",
-        "mov [rsp], rax",
         "jmp {ret}",
+        ss = const gdt::USER_SS,
+        cs = const gdt::USER_CS,
         dispatch = sym dispatch,
-        ret = sym syscall_return,
+        ret = sym user_return,
     );
 }
 
-/// Restores the `Frame` at rsp and returns to ring 3 via sysret. New
-/// processes start through this path.
+/// Restores the `Frame` at rsp and returns with iretq. Used after syscalls,
+/// after interrupts from ring 3, and as the first entry of new processes.
 #[unsafe(naked)]
-pub unsafe extern "C" fn syscall_return() {
+pub unsafe extern "C" fn user_return() {
     core::arch::naked_asm!(
         "pop rax",
-        "pop rdi",
-        "pop rsi",
+        "pop rbx",
+        "pop rcx",
         "pop rdx",
-        "pop r10",
+        "pop rsi",
+        "pop rdi",
+        "pop rbp",
         "pop r8",
         "pop r9",
-        "pop rbx",
-        "pop rbp",
+        "pop r10",
+        "pop r11",
         "pop r12",
         "pop r13",
         "pop r14",
         "pop r15",
-        "pop rcx",
-        "pop r11",
-        "pop rsp",
-        "sysretq",
+        "iretq",
     );
 }
 
-extern "sysv64" fn dispatch(f: &mut Frame) -> i64 {
+extern "sysv64" fn dispatch(f: &mut Frame) {
     let (a0, a1, a2, a3, a4, a5) = (f.rdi, f.rsi, f.rdx, f.r10, f.r8, f.r9);
     let cwd = AT_FDCWD as u64;
     let result: SysResult = match f.rax {
@@ -132,8 +149,9 @@ extern "sysv64" fn dispatch(f: &mut Frame) -> i64 {
         10 => Ok(0), // mprotect: pages keep the protection they were mapped with
         11 => sys_mem::munmap(a0, a1),
         12 => sys_mem::brk(a0),
-        13 => sigaction(a2, a3),
-        14 => sigprocmask(a2, a3),
+        13 => signal::sigaction(a0, a1, a2),
+        14 => signal::sigprocmask(a0, a1, a2),
+        15 => signal::sigreturn(f),
         16 => sys_file::ioctl(a0, a1, a2),
         19 => sys_file::readv(a0, a1, a2),
         20 => sys_file::writev(a0, a1, a2),
@@ -145,6 +163,7 @@ extern "sysv64" fn dispatch(f: &mut Frame) -> i64 {
         }
         32 => sys_file::dup(a0),
         33 => sys_file::dup3(a0, a1, 0, true),
+        34 => super::pause(),
         35 => nanosleep(a0),
         39 | 186 | 218 => Ok(super::current_pid() as i64),
         40 => sys_file::sendfile(a0, a1, a2, a3),
@@ -152,7 +171,7 @@ extern "sysv64" fn dispatch(f: &mut Frame) -> i64 {
         59 => execve(f, a0, a1, a2),
         60 | 231 => super::exit(((a0 & 0xff) << 8) as i32),
         61 => super::wait4(a0 as i64, a1, a2),
-        62 => kill(a0 as i64, a1),
+        62 => signal::kill(a0 as i64, a1),
         63 => uname(a0),
         72 => sys_file::fcntl(a0, a1, a2),
         77 => sys_file::ftruncate(a0, a1),
@@ -175,7 +194,10 @@ extern "sysv64" fn dispatch(f: &mut Frame) -> i64 {
         111 => super::getpgid(0),
         121 => super::getpgid(a0),
         124 => super::getsid(a0),
+        131 => Ok(0), // sigaltstack: handlers always run on the normal stack
         158 => arch_prctl(a0, a1),
+        200 => signal::kill(a0 as i64, a1),            // tkill
+        234 => signal::kill(a1 as i64, a2),            // tgkill
         217 => sys_file::getdents64(a0, a1, a2),
         228 => clock_gettime(a1),
         257 => sys_file::openat(a0, a1, a2, a3),
@@ -200,18 +222,8 @@ extern "sysv64" fn dispatch(f: &mut Frame) -> i64 {
             Err(ENOSYS)
         }
     };
-    result.unwrap_or_else(|e| -e)
-}
-
-/// Signals are not implemented yet: only existence checks (signal 0) and
-/// SIGCONT (nothing is ever stopped) succeed.
-fn kill(pid: i64, sig: u64) -> SysResult {
-    const SIGCONT: u64 = 18;
-    match sig {
-        0 | SIGCONT if pid <= 0 || super::exists(pid as u64) => Ok(0),
-        0 | SIGCONT => Err(ESRCH),
-        _ => Err(ENOSYS),
-    }
+    f.rax = result.unwrap_or_else(|e| -e) as u64;
+    super::signal::deliver(f);
 }
 
 fn execve(f: &mut Frame, path: u64, argv: u64, envp: u64) -> SysResult {
@@ -219,22 +231,6 @@ fn execve(f: &mut Frame, path: u64, argv: u64, envp: u64) -> SysResult {
     let args = uaccess::read_cstr_array(argv)?;
     let envs = uaccess::read_cstr_array(envp)?;
     super::exec(f, &path, &args, &envs)?;
-    Ok(0)
-}
-
-/// No signals yet: handlers are accepted but never invoked.
-fn sigaction(oldact: u64, size: u64) -> SysResult {
-    if oldact != 0 {
-        uaccess::slice_mut(oldact, 24 + size)?.fill(0);
-    }
-    Ok(0)
-}
-
-/// No signals yet; the old mask is always empty.
-fn sigprocmask(oldset: u64, size: u64) -> SysResult {
-    if oldset != 0 {
-        uaccess::slice_mut(oldset, size)?.fill(0);
-    }
     Ok(0)
 }
 
@@ -268,7 +264,7 @@ fn clock_gettime(ts: u64) -> SysResult {
 fn nanosleep(req: u64) -> SysResult {
     let [sec, nsec]: [u64; 2] = uaccess::read(req)?;
     let tick_ns = 1_000_000_000 / super::TIMER_HZ;
-    super::sleep_ticks(sec.saturating_mul(super::TIMER_HZ).saturating_add(nsec.div_ceil(tick_ns)));
+    super::sleep_ticks(sec.saturating_mul(super::TIMER_HZ).saturating_add(nsec.div_ceil(tick_ns)))?;
     Ok(0)
 }
 

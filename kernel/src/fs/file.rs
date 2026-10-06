@@ -1,5 +1,6 @@
 use super::{Device, Inode, Node};
 use crate::process::errno::*;
+use crate::process::signal::interrupted;
 use crate::process::{sleep_on, wakeup};
 use alloc::collections::VecDeque;
 use alloc::string::String;
@@ -182,6 +183,9 @@ impl OpenFile {
             if self.nonblocking() {
                 return Err(EAGAIN);
             }
+            if interrupted() {
+                return Err(EINTR);
+            }
             sleep_on(pipe.read_chan());
         }
     }
@@ -205,6 +209,9 @@ impl OpenFile {
             }
             if self.nonblocking() {
                 return if written > 0 { Ok(written) } else { Err(EAGAIN) };
+            }
+            if interrupted() {
+                return if written > 0 { Ok(written) } else { Err(EINTR) };
             }
             sleep_on(pipe.write_chan());
         }
