@@ -63,7 +63,7 @@ impl RemoteFs {
         if !ipc::is_alive(self.service.load(Ordering::Relaxed)) {
             self.revive()?;
         }
-        let message = fsproto::encode_request(op, args, payload);
+        let message = fsproto::encode_request(op, crate::process::current_pid() as u32, args, payload);
         let raw = ipc::call(self.service.load(Ordering::Relaxed), message)?;
         let r = fsproto::decode_response(&raw).ok_or(EIO)?;
         if r.status < 0 {
@@ -177,7 +177,7 @@ impl RemoteFs {
     }
 
     fn release(&self, ino: u32) {
-        ipc::post(self.service.load(Ordering::Relaxed), fsproto::encode_request(Op::Release, [ino as u64, 0, 0, 0], &[]));
+        ipc::post(self.service.load(Ordering::Relaxed), fsproto::encode_request(Op::Release, 0, [ino as u64, 0, 0, 0], &[]));
     }
 
     pub fn unlink(&self, dir: u32, name: &str, want_dir: bool) -> Result<(), i64> {

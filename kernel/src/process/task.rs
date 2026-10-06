@@ -80,11 +80,33 @@ pub struct Info {
     pub pdeath_sig: u32,
     pub dumpable: bool,
     pub no_new_privs: bool,
+    /// Arguments of the running program, NUL-terminated (capped at 4 KiB),
+    /// and its absolute path.
+    pub cmdline: Vec<u8>,
+    pub exe: String,
+    /// Page count of its address space (None for kernel tasks and zombies).
+    pub mem: Option<Arc<super::address_space::MemStats>>,
+    /// Scheduling niceness, -20 (favored) to 19.
+    pub nice: i8,
 }
 
 impl Info {
     pub fn new(ppid: super::Pid, pgid: super::Pid, sid: super::Pid, name: String) -> Info {
-        Info { ppid, pgid, sid, name, exit_status: None, report: None, pdeath_sig: 0, dumpable: true, no_new_privs: false }
+        Info {
+            ppid,
+            pgid,
+            sid,
+            name,
+            exit_status: None,
+            report: None,
+            pdeath_sig: 0,
+            dumpable: true,
+            no_new_privs: false,
+            cmdline: Vec::new(),
+            exe: String::new(),
+            mem: None,
+            nice: 0,
+        }
     }
 }
 
@@ -125,6 +147,11 @@ pub struct Task {
     pub wake_at: AtomicU64,
     /// Serializes wakeups with the task descheduling itself.
     pub wake_lock: IrqSpinLock<()>,
+    /// Timer ticks spent in user mode and in the kernel, and the tick it
+    /// was created at.
+    pub utime: AtomicU64,
+    pub stime: AtomicU64,
+    pub start_ticks: u64,
     /// Servers started by the kernel: may register IPC services and ask
     /// for I/O ports; protected from user signals.
     pub privileged: AtomicBool,
@@ -155,6 +182,9 @@ impl Task {
             wait_chan: AtomicUsize::new(0),
             wake_at: AtomicU64::new(0),
             wake_lock: IrqSpinLock::new(()),
+            utime: AtomicU64::new(0),
+            stime: AtomicU64::new(0),
+            start_ticks: super::sched::ticks(),
             privileged: AtomicBool::new(false),
             info: IrqSpinLock::new(info),
             sig: IrqSpinLock::new(Signals::default()),

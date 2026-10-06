@@ -37,9 +37,10 @@ fn cmd_cpus() {
     crate::printkln!("  CPU  APIC  BUSY  SWITCHES  QUEUED");
     for i in 0..crate::smp::MAX_CPUS {
         let Some(cpu) = crate::smp::by_index(i) else { continue };
-        let (busy, idle, switches, queued) = crate::process::sched::cpu_stats(cpu);
-        let percent = busy * 100 / (busy + idle).max(1);
-        crate::printkln!("{:5} {:5} {:4}% {:9} {:7}", i, cpu.apic_id(), percent, switches, queued);
+        let s = crate::process::sched::cpu_stats(cpu);
+        let busy = s.user + s.system;
+        let percent = busy * 100 / (busy + s.idle).max(1);
+        crate::printkln!("{:5} {:5} {:4}% {:9} {:7}", i, cpu.apic_id(), percent, s.switches, s.queued);
     }
 }
 

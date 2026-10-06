@@ -28,6 +28,8 @@ pub mod sys {
     pub const IRQ_ENABLE: u64 = 1003;
     /// (&physical address) -> address of the server's DMA area
     pub const DMA_MAP: u64 = 1004;
+    /// (op, argument, buffer, length) -> bytes of process/system information
+    pub const PROC_QUERY: u64 = 1005;
 }
 
 /// Raw system call; returns the kernel's result (negative errno on error).
@@ -127,6 +129,15 @@ pub fn irq_enable(line: u8) -> Result<(), i64> {
     match syscall(sys::IRQ_ENABLE, [line as u64, 0, 0, 0, 0, 0]) {
         0 => Ok(()),
         e => Err(e),
+    }
+}
+
+/// Asks the kernel for process or system information (see `procproto`);
+/// returns the number of bytes written to `buf`.
+pub fn proc_query(op: u64, arg: u64, buf: &mut [u8]) -> Result<usize, i64> {
+    match syscall(sys::PROC_QUERY, [op, arg, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0]) {
+        e if e < 0 => Err(e),
+        n => Ok(n as usize),
     }
 }
 

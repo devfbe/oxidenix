@@ -12,7 +12,7 @@ pub extern "sysv64" fn trap(frame: &mut Frame) {
         0..=31 => exception(frame),
         apic::TIMER_VECTOR => {
             apic::eoi();
-            crate::process::tick();
+            crate::process::tick(frame.from_user());
             // The kernel is not preemptive: only user code is interrupted.
             if frame.from_user() {
                 crate::process::schedule();

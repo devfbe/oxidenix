@@ -53,8 +53,16 @@ pub struct PidReservation {
     done: bool,
 }
 
+static FORKS: AtomicU64 = AtomicU64::new(0);
+
+/// Processes created since boot.
+pub fn forks() -> u64 {
+    FORKS.load(Ordering::Relaxed)
+}
+
 /// Takes the next pid, or EAGAIN at the process limit.
 pub fn reserve_pid() -> Result<PidReservation, i64> {
+    FORKS.fetch_add(1, Ordering::Relaxed);
     let mut table = TABLE.lock();
     if table.tasks.len() + table.reserved >= MAX_PROCS {
         return Err(super::errno::EAGAIN);
@@ -98,8 +106,10 @@ pub struct CpuSched {
     idle: UnsafeCell<Option<Arc<Task>>>,
     /// In the idle loop's `hlt`: new work for it needs an IPI.
     halted: AtomicBool,
-    /// Timer ticks spent running tasks and idling, and context switches.
-    pub busy_ticks: AtomicU64,
+    /// Timer ticks spent in user mode, in the kernel and idling, and
+    /// context switches.
+    pub user_ticks: AtomicU64,
+    pub system_ticks: AtomicU64,
     pub idle_ticks: AtomicU64,
     pub switches: AtomicU64,
 }
@@ -112,7 +122,8 @@ impl CpuSched {
             prev: UnsafeCell::new(None),
             idle: UnsafeCell::new(None),
             halted: AtomicBool::new(false),
-            busy_ticks: AtomicU64::new(0),
+            user_ticks: AtomicU64::new(0),
+            system_ticks: AtomicU64::new(0),
             idle_ticks: AtomicU64::new(0),
             switches: AtomicU64::new(0),
         }
@@ -199,10 +210,44 @@ fn pick_next(cpu: &Cpu) -> Option<Arc<Task>> {
     })
 }
 
-/// (busy ticks, idle ticks, context switches, queued tasks) of a CPU.
-pub fn cpu_stats(cpu: &Cpu) -> (u64, u64, u64, usize) {
+/// Time and switches of one CPU.
+pub struct CpuStats {
+    pub user: u64,
+    pub system: u64,
+    pub idle: u64,
+    pub switches: u64,
+    pub queued: usize,
+}
+
+pub fn cpu_stats(cpu: &Cpu) -> CpuStats {
     let s = &cpu.sched;
-    (s.busy_ticks.load(Ordering::Relaxed), s.idle_ticks.load(Ordering::Relaxed), s.switches.load(Ordering::Relaxed), s.rq.lock().len())
+    CpuStats {
+        user: s.user_ticks.load(Ordering::Relaxed),
+        system: s.system_ticks.load(Ordering::Relaxed),
+        idle: s.idle_ticks.load(Ordering::Relaxed),
+        switches: s.switches.load(Ordering::Relaxed),
+        queued: s.rq.lock().len(),
+    }
+}
+
+/// Load average as Linux keeps it: exponentially decaying averages of the
+/// number of runnable tasks over 1, 5 and 15 minutes, in fixed point with
+/// 11 fractional bits, updated every 5 seconds.
+pub const LOAD_SHIFT: u32 = 11;
+const LOAD_ONE: u64 = 1 << LOAD_SHIFT;
+const LOAD_EXP: [u64; 3] = [1884, 2014, 2037];
+static LOAD: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+pub fn loadavg() -> [u64; 3] {
+    [0, 1, 2].map(|i| LOAD[i].load(Ordering::Relaxed))
+}
+
+fn update_load(runnable: u64) {
+    for (i, exp) in LOAD_EXP.iter().enumerate() {
+        let old = LOAD[i].load(Ordering::Relaxed);
+        let new = (old * exp + runnable * LOAD_ONE * (LOAD_ONE - exp)) >> LOAD_SHIFT;
+        LOAD[i].store(new, Ordering::Relaxed);
+    }
 }
 
 fn has_work(cpu: &Cpu) -> bool {
@@ -511,16 +556,34 @@ pub extern "C" fn idle_loop() -> ! {
 
 // ---------------------------------------------------------------- timer
 
-/// Called on every CPU's timer interrupt. The bootstrap CPU keeps the
-/// global time: ticks, sleep deadlines and interval timers.
-pub fn tick() {
+/// Called on every CPU's timer interrupt; `user` tells whether it hit user
+/// code. The bootstrap CPU keeps the global time: ticks, sleep deadlines,
+/// interval timers and the load average.
+pub fn tick(user: bool) {
     let cpu = smp::cpu();
-    let counter = if current().idle { &cpu.sched.idle_ticks } else { &cpu.sched.busy_ticks };
-    counter.fetch_add(1, Ordering::Relaxed);
+    let cur = current();
+    let (cpu_counter, task_counter) = match (cur.idle, user) {
+        (true, _) => (&cpu.sched.idle_ticks, None),
+        (false, true) => (&cpu.sched.user_ticks, Some(&cur.utime)),
+        (false, false) => (&cpu.sched.system_ticks, Some(&cur.stime)),
+    };
+    cpu_counter.fetch_add(1, Ordering::Relaxed);
+    if let Some(c) = task_counter {
+        c.fetch_add(1, Ordering::Relaxed);
+    }
     if cpu.index != 0 {
         return;
     }
     let now = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
+    if now % (5 * super::TIMER_HZ) == 0 {
+        let runnable = TABLE
+            .lock()
+            .tasks
+            .values()
+            .filter(|t| matches!(t.state(), State::Running | State::Runnable) && t.pid != 0)
+            .count();
+        update_load(runnable as u64);
+    }
     let mut due: heapless::Vec<Arc<Task>, MAX_PROCS> = heapless::Vec::new();
     {
         let table = TABLE.lock();

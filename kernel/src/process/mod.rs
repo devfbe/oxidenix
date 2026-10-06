@@ -5,6 +5,7 @@ pub mod ipc;
 pub mod irq;
 mod loader;
 mod prctl;
+pub mod query;
 pub mod sched;
 pub mod signal;
 mod sys_file;
@@ -246,8 +247,8 @@ pub fn getcpu(cpu: u64, node: u64) -> SysResult {
 }
 
 /// Called from every CPU's timer interrupt.
-pub fn tick() {
-    sched::tick();
+pub fn tick(user: bool) {
+    sched::tick(user);
 }
 
 /// Sleeps for `n` timer ticks; a signal ends the sleep early with EINTR.
@@ -293,6 +294,31 @@ fn new_task(pid: Pid, info: Info, own: Process, frame: Frame) -> Result<Arc<Task
     let mut kstack = unsafe { Box::<KernelStack>::try_new_zeroed().map_err(|_| ENOMEM)?.assume_init() };
     let rsp = sched::prepare_stack(&mut kstack, Some(frame), true);
     Arc::try_new(Task::new(pid, info, own, Some(kstack), rsp)).map_err(|_| ENOMEM)
+}
+
+/// argv as /proc/<pid>/cmdline shows it: NUL-terminated, at most 4 KiB.
+fn cmdline_of(args: &[String]) -> Vec<u8> {
+    const MAX: usize = 4096;
+    let mut out = Vec::new();
+    for a in args {
+        if out.len() + a.len() + 1 > MAX {
+            break;
+        }
+        out.extend_from_slice(a.as_bytes());
+        out.push(0);
+    }
+    out
+}
+
+/// Absolute form of `path` relative to `cwd` (for /proc/<pid>/exe).
+fn absolute(cwd: &str, path: &str) -> String {
+    if path.starts_with('/') {
+        path.to_string()
+    } else if cwd.ends_with('/') {
+        alloc::format!("{cwd}{path}")
+    } else {
+        alloc::format!("{cwd}/{path}")
+    }
 }
 
 fn basename(path: &str) -> &str {
@@ -457,7 +483,7 @@ pub fn spawn(name: &str, args: &[&str]) -> Result<Pid, i64> {
     let path = if name.contains('/') { name.to_string() } else { alloc::format!("/bin/{name}") };
     let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
     let image = load_path("/", &path, &args, &start_env())?;
-    spawn_with(&path, image, None)
+    spawn_with(&path, image, None, &args)
 }
 
 /// Starts a privileged server process: it may register IPC services and
@@ -466,10 +492,10 @@ pub fn spawn_server(server: &Arc<Server>) -> Result<Pid, i64> {
     let mut args = alloc::vec![server.path.to_string()];
     args.extend(server.args.iter().cloned());
     let image = loader::load(&server.image, &args, &start_env())?;
-    spawn_with(server.path, image, Some(server))
+    spawn_with(server.path, image, Some(server), &args)
 }
 
-fn spawn_with(path: &str, image: loader::Image, server: Option<&Arc<Server>>) -> Result<Pid, i64> {
+fn spawn_with(path: &str, image: loader::Image, server: Option<&Arc<Server>>, args: &[String]) -> Result<Pid, i64> {
     let console = OpenFile::console();
     let slot = sched::reserve_pid()?;
     let pid = slot.pid;
@@ -477,7 +503,10 @@ fn spawn_with(path: &str, image: loader::Image, server: Option<&Arc<Server>>) ->
     // (re)started them, so no program can wait for or signal them.
     let parent = if server.is_some() { 0 } else { current_pid() };
     let name = basename(path).to_string();
-    let info = Info::new(parent, pid, pid, name);
+    let mut info = Info::new(parent, pid, pid, name);
+    info.cmdline = cmdline_of(args);
+    info.exe = path.to_string();
+    info.mem = Some(image.space.stats.clone());
     let mut own = Process::empty();
     own.space = Some(image.space);
     own.fds = vec![Some(FdEntry { file: console, cloexec: false }); 3];
@@ -506,7 +535,15 @@ pub fn fork(frame: &Frame) -> Result<Pid, i64> {
     let info = {
         let i = me.info.lock();
         // The parent-death signal is cleared for the child, as on Linux.
-        Info { dumpable: i.dumpable, no_new_privs: i.no_new_privs, ..Info::new(me.pid, i.pgid, i.sid, i.name.clone()) }
+        Info {
+            dumpable: i.dumpable,
+            no_new_privs: i.no_new_privs,
+            cmdline: i.cmdline.clone(),
+            exe: i.exe.clone(),
+            mem: Some(space.stats.clone()),
+            nice: i.nice,
+            ..Info::new(me.pid, i.pgid, i.sid, i.name.clone())
+        }
     };
     let mut fpu = task::FpuState::initial();
     unsafe { core::arch::asm!("fxsave64 [{}]", in(reg) fpu.0.as_mut_ptr(), options(nostack)) };
@@ -535,7 +572,13 @@ pub fn exec(frame: &mut Frame, path: &str, args: &[String], envs: &[String]) -> 
     let image = load_path(&cwd, path, args, envs)?;
     image.space.activate();
     let me = current();
-    me.info.lock().name = basename(path).to_string();
+    {
+        let mut info = me.info.lock();
+        info.name = basename(path).to_string();
+        info.cmdline = cmdline_of(args);
+        info.exe = absolute(&cwd, path);
+        info.mem = Some(image.space.stats.clone());
+    }
     me.sig.lock().reset_on_exec();
     // A new program gets no inherited hardware access.
     me.privileged.store(false, Ordering::Relaxed);
@@ -584,6 +627,7 @@ pub fn exit(status: i32) -> ! {
     unsafe { Cr3::write(memory::kernel_l4(), Cr3Flags::empty()) };
     unsafe { me.own() }.space = None;
     unsafe { me.own() }.server = None;
+    me.info.lock().mem = None;
     // Orphans go to the kernel, which reaps them; those that asked for it
     // (PR_SET_PDEATHSIG) get a signal.
     let mut death_signals: Vec<(Pid, u32)> = Vec::new();

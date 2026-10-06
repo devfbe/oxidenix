@@ -64,6 +64,27 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 fn start_servers() {
     start_diskfs();
     start_netd();
+    start_procfs();
+}
+
+/// procfs: the Linux view of processes and the system, built from the
+/// kernel's native information (proc_query).
+fn start_procfs() {
+    let server = match process::Server::load("procfs", "/sbin/procfs") {
+        Ok(server) => Arc::new(server),
+        Err(e) => return printkln!("[boot] cannot load /sbin/procfs (errno {})", e),
+    };
+    match server.start() {
+        Ok((service, root)) => {
+            if let Err(e) = fs::mount_remote(server.clone(), service, root as u32, "proc", "proc", "proc") {
+                printkln!("[boot] cannot mount /proc (errno {})", e);
+            }
+            if let Err(e) = fs::mount_remote(server, service, procproto::SYSFS_ROOT, "sys", "sysfs", "sysfs") {
+                printkln!("[boot] cannot mount /sys (errno {})", e);
+            }
+        }
+        Err(e) => printkln!("[boot] procfs did not start (errno {}); /proc stays static", e),
+    }
 }
 
 fn start_diskfs() {
@@ -74,7 +95,7 @@ fn start_diskfs() {
     };
     match server.start() {
         Ok((service, root)) => {
-            if let Err(e) = fs::mount_remote(server, service, root as u32, "data", "/dev/hdb") {
+            if let Err(e) = fs::mount_remote(server, service, root as u32, "data", "/dev/hdb", "ext2") {
                 printkln!("[boot] cannot mount /data (errno {})", e);
             }
         }

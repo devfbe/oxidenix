@@ -23,10 +23,27 @@ fn user_pages(start: u64, end: u64) -> impl Iterator<Item = Page<Size4KiB>> {
         .map(|a| Page::containing_address(VirtAddr::new(a)))
 }
 
+/// Pages mapped in an address space, readable by anyone (procfs) while
+/// only the owning process changes the mappings.
+#[derive(Default)]
+pub struct MemStats {
+    pub pages: core::sync::atomic::AtomicU64,
+}
+
 /// Own level-4 table: the lower half belongs to the process, the upper
 /// (kernel) half is shared with the kernel address space.
 pub struct AddressSpace {
     l4: PhysFrame,
+    pub stats: alloc::sync::Arc<MemStats>,
+}
+
+fn count(stats: &MemStats, delta: i64) {
+    use core::sync::atomic::Ordering;
+    if delta >= 0 {
+        stats.pages.fetch_add(delta as u64, Ordering::Relaxed);
+    } else {
+        stats.pages.fetch_sub(delta.unsigned_abs(), Ordering::Relaxed);
+    }
 }
 
 impl AddressSpace {
@@ -40,7 +57,8 @@ impl AddressSpace {
         for i in 256..512 {
             table[i] = kernel[i].clone();
         }
-        Some(AddressSpace { l4 })
+        let stats = alloc::sync::Arc::try_new(MemStats::default()).ok()?;
+        Some(AddressSpace { l4, stats })
     }
 
     fn mapper(&self) -> OffsetPageTable<'static> {
@@ -76,12 +94,14 @@ impl AddressSpace {
                     continue;
                 }
                 let frame = frames.allocate_frame().ok_or("out of memory")?;
+                count(&self.stats, 1);
                 unsafe { core::ptr::write_bytes(memory::phys_to_virt(frame.start_address().as_u64()), 0, PAGE as usize) };
                 match unsafe { mapper.map_to_with_table_flags(page, frame, flags, parent, &mut frames) } {
                     Ok(flush) => flush.ignore(),
                     Err(_) => {
                         // Not mapped, so nothing else will ever free it.
                         unsafe { frames.0.deallocate_frame(frame) };
+                        count(&self.stats, -1);
                         return Err("map_to failed");
                     }
                 }
@@ -105,6 +125,7 @@ impl AddressSpace {
                     .map_err(|_| "map_to failed")?
                     .ignore();
                 frames.share(frame);
+                count(&self.stats, 1);
             }
             Ok(())
         })
@@ -119,6 +140,7 @@ impl AddressSpace {
                 if let Ok((frame, flush)) = mapper.unmap(page) {
                     flush.flush();
                     unsafe { frames.deallocate_frame(frame) };
+                    count(&self.stats, -1);
                 }
             }
         });
@@ -173,6 +195,7 @@ impl AddressSpace {
                                 .ignore();
                             // Only a successful mapping owns a reference.
                             frames.0.share(frame);
+                            count(&new.stats, 1);
                         }
                     }
                 }

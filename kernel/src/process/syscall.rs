@@ -199,6 +199,7 @@ extern "sysv64" fn dispatch(f: &mut Frame) {
         54 => sys_net::setsockopt(a0),
         55 => sys_net::getsockopt(a0, a1, a2, a3, a4),
         288 => sys_net::accept(a0, a1, a2, a3),
+        99 => super::query::sysinfo(a0),
         125 => super::prctl::capget(a0, a1),
         128 => signal::sigtimedwait(a0, a1, a2, a3),
         126 => super::prctl::capset(a0, a1),
@@ -254,6 +255,7 @@ extern "sysv64" fn dispatch(f: &mut Frame) {
         1002 => super::ipc::reply(a0, a1, a2),
         1003 => super::irq::enable(a0),
         1004 => super::dma_map(a0),
+        1005 => super::query::proc_query(a0, a1, a2, a3),
         200 => signal::kill(a0 as i64, a1),            // tkill
         234 => signal::kill(a1 as i64, a2),            // tgkill
         217 => sys_file::getdents64(a0, a1, a2),

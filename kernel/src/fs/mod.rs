@@ -563,14 +563,26 @@ pub fn init(ramdisk: Option<&'static [u8]>) {
 }
 
 /// Rewrites the static /proc/mounts, which tools like df read.
-fn write_proc_mounts(extra: &str) {
-    let mut mounts = String::from("rootfs / tmpfs rw 0 0\n");
-    mounts.push_str(extra);
-    write_proc("mounts", &mounts);
+/// The mount table in /proc/mounts format.
+static MOUNTS: spin::Mutex<String> = spin::Mutex::new(String::new());
+
+pub fn mounts() -> String {
+    let m = MOUNTS.lock();
+    alloc::format!("rootfs / tmpfs rw 0 0\n{}", *m)
 }
 
-/// (Re)writes the static, read-only file /proc/<name>.
+/// Records a mount; /proc/mounts stays a static file until procfs serves it.
+fn write_proc_mounts(extra: &str) {
+    MOUNTS.lock().push_str(extra);
+    write_proc("mounts", &mounts());
+}
+
+/// (Re)writes the static, read-only file /proc/<name>, as long as no
+/// procfs server provides /proc.
 pub fn write_proc(name: &str, content: &str) {
+    if PROC_SERVED.load(Ordering::Relaxed) {
+        return;
+    }
     let proc_dir = mkdir_p(&root(), "proc");
     let _ = proc_dir.unlink(name, false);
     if let Ok(file) = proc_dir.create(name, NewNode::File, 0o444) {
@@ -578,15 +590,42 @@ pub fn write_proc(name: &str, content: &str) {
     }
 }
 
-/// Mounts the filesystem a server registered under `service` at `/<name>`.
-pub fn mount_remote(server: Arc<crate::process::Server>, service: usize, root_ino: u32, name: &str, device: &str) -> Result<(), i64> {
+/// Mounts the filesystem a server registered under `service` at `/<name>`,
+/// replacing what is there (the static /proc of the boot, for procfs).
+pub fn mount_remote(
+    server: Arc<crate::process::Server>,
+    service: usize,
+    root_ino: u32,
+    name: &str,
+    device: &str,
+    fstype: &str,
+) -> Result<(), i64> {
     let fs = remote::RemoteFs::new(service, server);
-    let (bs, blocks, free, _, _) = fs.usage();
-    root().insert(name, fs.inode(root_ino))?;
-    write_proc_mounts(&alloc::format!("{device} /{name} ext2 rw 0 0\n"));
-    crate::printkln!("[fs] /{} mounted from user-space server ({} of {} KiB free)", name, free * bs / 1024, blocks * bs / 1024);
+    let root = root();
+    if let Ok(old) = root.child(name) {
+        for (entry, _, _) in old.list()? {
+            if entry != "." && entry != ".." {
+                old.unlink(&entry, false)?;
+            }
+        }
+        root.unlink(name, true)?;
+    }
+    root.insert(name, fs.inode(root_ino))?;
+    if name == "proc" {
+        PROC_SERVED.store(true, Ordering::Relaxed);
+    }
+    write_proc_mounts(&alloc::format!("{device} /{name} {fstype} rw 0 0\n"));
+    if fstype == "ext2" {
+        let (bs, blocks, free, _, _) = fs.usage();
+        crate::printkln!("[fs] /{} mounted from user-space server ({} of {} KiB free)", name, free * bs / 1024, blocks * bs / 1024);
+    } else {
+        crate::printkln!("[fs] /{} mounted from user-space server ({})", name, fstype);
+    }
     Ok(())
 }
+
+/// Whether a procfs server provides /proc (then no static files are written).
+static PROC_SERVED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Creates all missing directories and returns the last one.
 pub fn mkdir_p(base: &Arc<Inode>, path: &str) -> Arc<Inode> {

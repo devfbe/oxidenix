@@ -1,6 +1,7 @@
 //! Message format between the kernel's VFS and filesystem servers.
 //!
-//! A request is a 40-byte header (operation and four arguments) followed by
+//! A request is a 40-byte header (operation, the calling process's pid and
+//! four arguments) followed by
 //! a payload (names, file data); a response is a 56-byte header (status and
 //! six values) followed by a payload. All integers are little-endian. The
 //! status is the result (>= 0) or a negative errno, as in Linux syscalls.
@@ -77,10 +78,12 @@ fn u64_at(b: &[u8], o: usize) -> u64 {
     u64::from_le_bytes(b[o..o + 8].try_into().unwrap())
 }
 
-pub fn encode_request(op: Op, args: [u64; 4], payload: &[u8]) -> Vec<u8> {
+/// `caller` is the pid of the process the kernel asks for (procfs answers
+/// /proc/self with it).
+pub fn encode_request(op: Op, caller: u32, args: [u64; 4], payload: &[u8]) -> Vec<u8> {
     let mut m = Vec::with_capacity(REQUEST_HEADER + payload.len());
     m.extend_from_slice(&(op as u32).to_le_bytes());
-    m.extend_from_slice(&0u32.to_le_bytes());
+    m.extend_from_slice(&caller.to_le_bytes());
     for a in args {
         m.extend_from_slice(&a.to_le_bytes());
     }
@@ -90,6 +93,7 @@ pub fn encode_request(op: Op, args: [u64; 4], payload: &[u8]) -> Vec<u8> {
 
 pub struct Request<'a> {
     pub op: Option<Op>,
+    pub caller: u32,
     pub args: [u64; 4],
     pub payload: &'a [u8],
 }
@@ -100,6 +104,7 @@ pub fn decode_request(m: &[u8]) -> Option<Request<'_>> {
     }
     Some(Request {
         op: Op::from_u32(u32_at(m, 0)),
+        caller: u32_at(m, 4),
         args: [u64_at(m, 8), u64_at(m, 16), u64_at(m, 24), u64_at(m, 32)],
         payload: &m[REQUEST_HEADER..],
     })

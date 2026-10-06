@@ -61,7 +61,9 @@ Its [commit history](#development-history) records every step.
   and **Ctrl+C** interrupting any foreground program, even a busy loop without system calls.
 - **Job control**: Ctrl+Z stops the foreground job, then `jobs`, `fg`, `bg` and `kill %n` work
   in Bash; background jobs reading from the terminal are stopped with `SIGTTIN`.
-- **procfs (static)**: `/proc/mounts` and `/proc/cpuinfo`.
+- **htop, ps, top, free, uptime**: `/proc` and the CPU part of `/sys` are served live by a
+  user-space server, from the kernel's own process accounting (CPU time per process and CPU,
+  memory, load average).
 - **Filesystem**: an in-memory, tmpfs-like VFS populated from a cpio initramfs, with files,
   directories, symlinks, `/dev/{console,tty,null,zero}`, and quotas against heap exhaustion.
 - **Microkernel-style drivers**: the ATA driver and the read-write **ext2** filesystem run in
@@ -186,12 +188,15 @@ oxidenix/
 │       └── shell/               built-in kernel monitor (fallback shell)
 ├── servers/
 │   ├── diskfs/                  user-space ext2 server with its own ATA driver
+│   ├── procfs/                  /proc and /sys from the kernel's process information
+│   │                            (main.rs: tree and inodes, render.rs: Linux formats)
 │   └── netd/                    network server: virtio-net driver (virtio.rs), loopback
 │                                (nic.rs), sockets on smoltcp (service.rs), DHCP
 ├── crates/
 │   ├── ext2fs/                  ext2 as a library over a `Device` trait
 │   ├── fsproto/                 message format between the VFS and filesystem servers
 │   ├── netproto/                socket operations between the kernel and netd
+│   ├── procproto/               native process and system information for procfs
 │   └── oxrt/                    runtime for servers: entry, syscalls, heap, port I/O
 ├── builder/                     host tool: rootfs + cpio + boot image + ext2 data disk + QEMU
 └── userspace/                   C test programs, build script, rootfs and data disk templates
@@ -215,7 +220,8 @@ About 9,206 lines of Rust in the kernel and 3,067 in the servers, their librarie
    and registers as service `diskfs`; the kernel then mounts it at `/data`. Then the kernel
    scans PCI for a virtio network card and starts `/sbin/netd` with its ports, interrupt line
    and a DMA area; netd registers as service `net` once DHCP has configured the interface
-   (or after three seconds without an answer).
+   (or after three seconds without an answer). Last, `/sbin/procfs` provides `/proc` and
+   `/sys`, replacing the static `/proc` files of the early boot.
 4. Process 0 (the kernel monitor) spawns `/bin/bash` as the foreground process and waits for
    it. If Bash exits, the monitor takes over the terminal.
 
@@ -389,6 +395,16 @@ interrupt dispatch; drivers and filesystems move into user-space servers.
 - **Servers in Rust**: `servers/diskfs` and `servers/netd` are `no_std` Rust programs built for
   `x86_64-unknown-none` as a static `ET_EXEC` binary, using `crates/oxrt` for its entry point,
   syscalls, heap and port I/O. They share no code with the kernel except the message format.
+- **procfs: the Linux personality** (`servers/procfs`). The kernel has no `/proc`. It keeps
+  native accounting (user and system ticks per process and CPU, start time, mapped pages,
+  command line, program path, a Linux-style load average) and hands it out as fixed binary
+  records through `proc_query` (syscall 1005, privileged servers only, `crates/procproto`).
+  The procfs server renders the Linux formats from them on every read (`/proc/stat`,
+  `meminfo`, `loadavg`, `uptime`, `cpuinfo`, `mounts`, `version`, `/proc/sys/kernel/*`,
+  `/proc/<pid>/{stat,statm,status,cmdline,comm,exe,task}`) and the CPU list in
+  `/sys/devices/system/cpu`; the kernel mounts its two trees at `/proc` and `/sys`. Requests
+  carry the caller's pid, which `/proc/self` resolves to. A non-Linux userland would simply not
+  run this server.
 - Still in the kernel today: the VFS itself, pipes, the TTY, console and keyboard. They are the
   next candidates for servers.
 
@@ -492,10 +508,11 @@ Linux x86_64 numbers, grouped by area (about 120 in total):
 | Signals | `rt_sigaction` `rt_sigprocmask` `rt_sigreturn` `kill` `tkill` `tgkill` `pause` `sigaltstack` `alarm` `setitimer` `getitimer` (`ITIMER_REAL`, 10 ms resolution) `rt_sigtimedwait` |
 | Process control | `prctl` (name, parent-death signal, dumpable, no-new-privs, capability bounding set) `capget` `capset` (everything runs as root with every capability) |
 | Filesystems | `statfs` `fstatfs` `sync` `fsync` `fdatasync` |
-| Servers | `ioperm` (privileged servers only), `ipc_register` (1000), `ipc_receive` (1001, with timeout and interrupt notifications), `ipc_reply` (1002), `irq_enable` (1003), `dma_map` (1004) |
+| Servers | `ioperm` (privileged servers only), `ipc_register` (1000), `ipc_receive` (1001, with timeout and interrupt notifications), `ipc_reply` (1002), `irq_enable` (1003), `dma_map` (1004), `proc_query` (1005) |
+| System information | `sysinfo` `uname` (reports `oxidenix`, not Linux) |
 | Power | `reboot` (power off ends QEMU, restart resets the machine) |
 | Sockets | `socket` `bind` `listen` `accept` `accept4` `connect` `sendto` `recvfrom` `sendmsg` `recvmsg` `shutdown` `getsockname` `getpeername` `setsockopt` (ignored) `getsockopt` (`AF_INET` only: TCP, UDP, raw ICMP) |
-| Time and misc | `nanosleep` `clock_gettime` (`CLOCK_REALTIME` from the RTC) `uname` (reports `oxidenix`, not Linux) `getrandom` |
+| Time and misc | `nanosleep` `clock_gettime` (`CLOCK_REALTIME` from the RTC) `getrandom` |
 
 Everything runs as root. Unknown syscalls print a kernel message and return `ENOSYS`.
 
@@ -515,7 +532,7 @@ Each of these programs and scripts lives in the root filesystem and runs inside 
 | `sigtest` | handlers, killing a busy loop, `SIGCHLD`, `EINTR` on pipe reads, blocked and ignored signals, FPU state across asynchronous handlers, `alarm` and repeating `setitimer`, catchable `SIGFPE`/`SIGSEGV`/`SIGTRAP` from CPU exceptions, an uncaught `SIGFPE` killing the process |
 | `jobtest` | stop/continue reporting through `wait4`, restart of a stopped `read()`, `SIGKILL` on stopped processes, `SA_RESTART` |
 | `forktest` | `fork`, `execve`, `wait4`, preemptive interleaving of two workers |
-| `proctest` | `prctl` name round-trip, `capget`/`capset` versions and the full capability set, no-new-privs, `PR_SET_PDEATHSIG` delivered to an orphan (via `sigwait`) |
+| `proctest` | `prctl` name round-trip, `capget`/`capset` versions and the full capability set, no-new-privs, `PR_SET_PDEATHSIG` delivered to an orphan (via `sigwait`); `/proc` as htop reads it (directory fds with `O_PATH` and `openat`), `/proc/self`, the formats of `stat`, `meminfo`, `loadavg`, `uptime` and `/proc/<pid>/{stat,cmdline,exe}`, `sysinfo`, the CPU list in `/sys`, read-only `/proc` |
 | `smptest` | CPU count and affinity (pinning to every CPU, empty masks), parallel speed-up of CPU-bound processes, `fork`/`exit`/`wait` on every CPU at once, 5000 pipe round trips between two CPUs, signals to a process running on another CPU |
 | `nettest` | TCP to an echo service through QEMU, `ECONNREFUSED`, `listen`/`accept` over loopback with a forked client, EOF after the peer closed, non-blocking `accept` and `connect` with `poll` and `SO_ERROR`, `EINTR` in a blocking `recv`, UDP over loopback, raw ICMP echo to the gateway and over loopback, source address for off-subnet destinations, overflowing message vectors, `AF_INET6` rejected |
 | `sh /etc/test.sh` | files, pipes, `cd`, `mkdir`/`touch`/`rm`, rename cycles via symlinks, file quota |
