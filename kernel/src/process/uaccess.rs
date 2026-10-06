@@ -148,8 +148,9 @@ pub fn write<T: Copy>(ptr: u64, val: T) -> Result<(), i64> {
 /// later unmap by another thread can still make the copy fail).
 fn writable_prefix(ptr: u64, len: u64) -> u64 {
     use super::address_space::{handle_fault, Access, PAGE};
+    // Callers checked the range; stay safe without relying on it.
+    let Some(end) = ptr.checked_add(len).filter(|&e| e <= USER_END) else { return 0 };
     let mut at = ptr;
-    let end = ptr + len;
     while at < end {
         if handle_fault(at, Access { write: true, exec: false }).is_err() {
             return at - ptr;
