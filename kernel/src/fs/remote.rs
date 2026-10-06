@@ -3,7 +3,7 @@
 
 use super::{Inode, NewNode};
 use crate::process::errno::*;
-use crate::process::ipc;
+use crate::process::{ipc, Server};
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
@@ -28,9 +28,8 @@ pub struct RemoteStat {
 
 pub struct RemoteFs {
     service: AtomicUsize,
-    /// Service name and program, to restart the server after a crash.
-    name: String,
-    program: String,
+    /// The server behind the service, restarted after a crash.
+    server: Arc<Server>,
     restarts: AtomicU32,
     restarting: AtomicBool,
     cache: Mutex<BTreeMap<u32, Weak<Inode>>>,
@@ -46,11 +45,10 @@ struct Reply {
 }
 
 impl RemoteFs {
-    pub fn new(service: usize, name: &str, program: &str) -> Arc<RemoteFs> {
+    pub fn new(service: usize, server: Arc<Server>) -> Arc<RemoteFs> {
         Arc::new(RemoteFs {
             service: AtomicUsize::new(service),
-            name: String::from(name),
-            program: String::from(program),
+            server,
             restarts: AtomicU32::new(0),
             restarting: AtomicBool::new(false),
             cache: Mutex::new(BTreeMap::new()),
@@ -62,12 +60,12 @@ impl RemoteFs {
     /// wait for it to register. Inode numbers live on disk, so every
     /// existing `Arc<Inode>` stays valid with the new server.
     fn revive(&self) -> Result<(), i64> {
-        if let Some((service, _)) = ipc::lookup(&self.name) {
+        if let Some((service, _)) = ipc::lookup(self.server.name) {
             self.service.store(service, Ordering::Relaxed);
             return Ok(());
         }
         if self.restarting.swap(true, Ordering::Relaxed) {
-            let (service, _) = ipc::wait_for(&self.name, 3 * crate::process::TIMER_HZ).ok_or(EIO)?;
+            let (service, _) = ipc::wait_for(self.server.name, 3 * crate::process::TIMER_HZ).ok_or(EIO)?;
             self.service.store(service, Ordering::Relaxed);
             return Ok(());
         }
@@ -75,10 +73,10 @@ impl RemoteFs {
         let result = if attempt > MAX_RESTARTS {
             Err(EIO)
         } else {
-            crate::printkln!("[kernel] {} died; restarting it (attempt {} of {})", self.name, attempt, MAX_RESTARTS);
-            crate::process::spawn_server(&self.program)
+            crate::printkln!("[kernel] {} died; restarting it (attempt {} of {})", self.server.name, attempt, MAX_RESTARTS);
+            crate::process::spawn_server(&self.server)
                 .ok()
-                .and_then(|_| ipc::wait_for(&self.name, 3 * crate::process::TIMER_HZ))
+                .and_then(|_| ipc::wait_for(self.server.name, 3 * crate::process::TIMER_HZ))
                 .map(|(service, _)| self.service.store(service, Ordering::Relaxed))
                 .ok_or(EIO)
         };

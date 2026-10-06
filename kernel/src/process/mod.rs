@@ -20,6 +20,7 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
+use core::ops::Range;
 use core::sync::atomic::{AtomicU64, Ordering};
 use errno::*;
 use syscall::Frame;
@@ -99,6 +100,8 @@ struct Process {
     /// I/O permission bitmap (0 = allowed) installed in the TSS while
     /// this process runs.
     io_bitmap: Option<Box<[u8; gdt::IOMAP_BYTES]>>,
+    /// I/O port ranges this process may request with ioperm.
+    io_ports: &'static [Range<u64>],
 }
 
 impl Process {
@@ -196,6 +199,7 @@ pub fn init() {
         report: None,
         privileged: false,
         io_bitmap: None,
+        io_ports: &[],
     };
     let mut procs = BTreeMap::new();
     procs.insert(0, Box::new(kernel));
@@ -266,11 +270,15 @@ pub fn setsid() -> SysResult {
 }
 
 /// ioperm(from, count, on) for privileged servers: grants or revokes
-/// access to I/O ports via the TSS bitmap.
+/// access to I/O ports via the TSS bitmap. Only the ports the kernel
+/// assigned to the server can be granted.
 pub fn ioperm(from: u64, count: u64, on: u64) -> SysResult {
     let end = from.checked_add(count).filter(|&e| e <= 0x10000).ok_or(EINVAL)?;
     with_current(|p| {
         if !p.privileged {
+            return Err(EPERM);
+        }
+        if on != 0 && !p.io_ports.iter().any(|r| r.start <= from && end <= r.end) {
             return Err(EPERM);
         }
         let bitmap = p.io_bitmap.get_or_insert_with(|| Box::new([0xff; gdt::IOMAP_BYTES]));
@@ -404,6 +412,7 @@ fn new_process(pid: Pid, ppid: Pid, name: String, space: AddressSpace, frame: Fr
         report: None,
         privileged: false,
         io_bitmap: None,
+        io_ports: &[],
     }))
 }
 
@@ -419,26 +428,55 @@ fn load_path(cwd: &str, path: &str, args: &[String], envs: &[String]) -> Result<
     inode.with_contents(|bytes| loader::load(bytes, args, envs))?
 }
 
+/// A user-space server the kernel starts and restarts.
+pub struct Server {
+    /// Name of the IPC service it registers.
+    pub name: &'static str,
+    pub path: &'static str,
+    /// The program, read once at boot: a restart must not run whatever
+    /// was written to `path` since then with the server's privileges.
+    image: Vec<u8>,
+    /// I/O port ranges (start..end) the server may request with ioperm.
+    ports: &'static [Range<u64>],
+}
+
+impl Server {
+    pub fn load(name: &'static str, path: &'static str, ports: &'static [Range<u64>]) -> Result<Arc<Server>, i64> {
+        let inode = fs::resolve("/", path, true)?;
+        if inode.file_type() != fs::S_IFREG {
+            return Err(ENOEXEC);
+        }
+        let image = inode.with_contents(|bytes| {
+            let mut image = Vec::new();
+            image.try_reserve_exact(bytes.len()).map_err(|_| ENOMEM)?;
+            image.extend_from_slice(bytes);
+            Ok::<_, i64>(image)
+        })??;
+        Ok(Arc::new(Server { name, path, image, ports }))
+    }
+}
+
+fn start_env() -> Vec<String> {
+    ["PATH=/bin", "HOME=/root", "TERM=linux", "PS1=\\w # "].iter().map(|e| e.to_string()).collect()
+}
+
 /// Starts a program as a child of the kernel shell, with the console as
 /// stdin/stdout/stderr. Names without '/' are looked up in /bin.
 pub fn spawn(name: &str, args: &[&str]) -> Result<Pid, i64> {
-    spawn_with(name, args, false)
+    let path = if name.contains('/') { name.to_string() } else { alloc::format!("/bin/{name}") };
+    let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    let image = load_path("/", &path, &args, &start_env())?;
+    spawn_with(&path, image, None)
 }
 
 /// Starts a privileged server process: it may register IPC services and
-/// request I/O ports, and it does not take over the terminal.
-pub fn spawn_server(path: &str) -> Result<Pid, i64> {
-    spawn_with(path, &[path], true)
+/// request its I/O ports, and it does not take over the terminal.
+pub fn spawn_server(server: &Server) -> Result<Pid, i64> {
+    let image = loader::load(&server.image, &[server.path.to_string()], &start_env())?;
+    spawn_with(server.path, image, Some(server))
 }
 
-fn spawn_with(name: &str, args: &[&str], server: bool) -> Result<Pid, i64> {
-    let path = if name.contains('/') { name.to_string() } else { alloc::format!("/bin/{name}") };
-    let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
-    let envs: Vec<String> = ["PATH=/bin", "HOME=/root", "TERM=linux", "PS1=\\w # "]
-        .iter()
-        .map(|e| e.to_string())
-        .collect();
-    let image = load_path("/", &path, &args, &envs)?;
+fn spawn_with(path: &str, image: loader::Image, server: Option<&Server>) -> Result<Pid, i64> {
     let console = OpenFile::console();
     interrupts::without_interrupts(|| {
         let s = sched();
@@ -450,15 +488,16 @@ fn spawn_with(name: &str, args: &[&str], server: bool) -> Result<Pid, i64> {
         let frame = Frame::user_start(image.entry, image.sp);
         // Servers belong to the kernel, even when a program's request
         // (re)started them, so no program can wait for or signal them.
-        let parent = if server { 0 } else { s.current };
-        let mut p = new_process(pid, parent, basename(&path).to_string(), image.space, frame)?;
+        let parent = if server.is_some() { 0 } else { s.current };
+        let mut p = new_process(pid, parent, basename(path).to_string(), image.space, frame)?;
         p.fds = vec![Some(FdEntry { file: console, cloexec: false }); 3];
         p.brk_start = image.brk;
         p.brk_end = image.brk;
-        p.privileged = server;
+        p.privileged = server.is_some();
+        p.io_ports = server.map_or(&[], |s| s.ports);
         s.procs.insert(pid, p);
         s.ready.push_back(pid);
-        if !server {
+        if server.is_none() {
             crate::drivers::tty::set_foreground(pid);
         }
         Ok(pid)
@@ -513,6 +552,7 @@ pub fn exec(frame: &mut Frame, path: &str, args: &[String], envs: &[String]) -> 
         // A new program gets no inherited hardware access.
         p.privileged = false;
         p.io_bitmap = None;
+        p.io_ports = &[];
         gdt::set_io_bitmap(None);
         p.fds
             .iter_mut()

@@ -286,9 +286,10 @@ interrupt dispatch; drivers and filesystems move into user-space servers.
   (releasing an unlinked inode while dropping it). Messages up to 64 KiB are copied through the
   kernel.
 - **Hardware access without kernel drivers**: servers started by the kernel are *privileged*
-  and may call `ioperm`. The kernel then grants exactly those ports through the TSS I/O
-  permission bitmap, which is installed on every switch to that process. The server cannot
-  touch other ports or disable interrupts (no IOPL 3).
+  and may call `ioperm`, but only for the ports the kernel assigned to them (diskfs gets the
+  primary ATA channel, `0x1f0`-`0x1f7` and `0x3f6`; anything else is `EPERM`). Granted ports
+  are set in the TSS I/O permission bitmap, which is installed on every switch to that process.
+  The server cannot touch other ports or disable interrupts (no IOPL 3).
 - **Remote filesystems**: the VFS has a second kind of inode whose operations become
   `fsproto` requests to a server (`fs/remote.rs`). Reads and writes are split into 32 KiB
   messages. The kernel still decides when an unlinked inode may be freed, because only it knows
@@ -301,6 +302,8 @@ interrupt dispatch; drivers and filesystems move into user-space servers.
   that were in flight during the crash still fail with `EIO`, since they may or may not have
   been carried out. After five restarts the kernel gives up and the mount stays at `EIO`.
   Restarted servers are children of the kernel, never of the program that triggered them.
+  The kernel reads each server program once at boot and restarts it from that copy, so
+  replacing `/sbin/diskfs` later cannot smuggle a different program into a privileged process.
 - **Protected servers**: like init on Linux, privileged servers ignore signals from user space:
   a direct `kill` fails with `EPERM`, and group, broadcast and terminal signals skip them. Only
   the kernel can stop them (the monitor's `kill <pid|name>` does, for testing).
@@ -394,7 +397,7 @@ Each of these programs and scripts lives in the root filesystem and runs inside 
 | `sh /etc/disktest.sh` | ext2: 150-file directory, 1.5 MiB file (double indirect), append, truncate, rename, cycles, symlinks, `rm -r`, space accounting |
 | `e2fsck -fn disk.img` (host) | the filesystem written by oxidenix is consistent |
 | `kill -9 1` in Bash | user space cannot kill a server (`EPERM`) |
-| `kill diskfs` in the kernel monitor | the next `/data` access restarts the server; open files survive; after five restarts accesses fail with `EIO` |
+| `kill diskfs` in the kernel monitor | the next `/data` access restarts the server; open files survive; after five restarts accesses fail with `EIO`; a restart still runs the boot-time program even after `/sbin/diskfs` was overwritten |
 | `mem` (kernel monitor) | frame and heap accounting, allocator self-test, leak checks after workloads |
 
 During development the AI drove these tests through the QEMU monitor socket (`sendkey`,

@@ -48,13 +48,20 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     shell::run();
 }
 
+/// I/O ports of the primary ATA channel (0x1f0-0x1f7, control at 0x3f6).
+const DISKFS_PORTS: &[core::ops::Range<u64>] = &[0x1f0..0x1f8, 0x3f6..0x3f7];
+
 /// Starts the user-space servers and mounts what they provide. Drivers
 /// and filesystems live in these processes, not in the kernel.
 fn start_servers() {
-    match process::spawn_server("/sbin/diskfs") {
-        Ok(pid) => match process::ipc::wait_for("diskfs", 3 * process::TIMER_HZ) {
+    let server = match process::Server::load("diskfs", "/sbin/diskfs", DISKFS_PORTS) {
+        Ok(server) => server,
+        Err(e) => return printkln!("[boot] cannot load /sbin/diskfs (errno {})", e),
+    };
+    match process::spawn_server(&server) {
+        Ok(pid) => match process::ipc::wait_for(server.name, 3 * process::TIMER_HZ) {
             Some((service, root)) => {
-                if let Err(e) = fs::mount_remote(service, root as u32, "data", "/dev/hdb", ("diskfs", "/sbin/diskfs")) {
+                if let Err(e) = fs::mount_remote(server, service, root as u32, "data", "/dev/hdb") {
                     printkln!("[boot] cannot mount /data (errno {})", e);
                 }
             }

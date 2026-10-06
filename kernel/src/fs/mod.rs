@@ -574,8 +574,8 @@ fn write_proc_mounts(extra: &str) {
 }
 
 /// Mounts the filesystem a server registered under `service` at `/<name>`.
-pub fn mount_remote(service: usize, root_ino: u32, name: &str, device: &str, server: (&str, &str)) -> Result<(), i64> {
-    let fs = remote::RemoteFs::new(service, server.0, server.1);
+pub fn mount_remote(server: Arc<crate::process::Server>, service: usize, root_ino: u32, name: &str, device: &str) -> Result<(), i64> {
+    let fs = remote::RemoteFs::new(service, server);
     let (bs, blocks, free, _, _) = fs.usage();
     root().insert(name, fs.inode(root_ino))?;
     write_proc_mounts(&alloc::format!("{device} /{name} ext2 rw 0 0\n"));
