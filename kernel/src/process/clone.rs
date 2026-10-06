@@ -84,7 +84,7 @@ pub fn clone(frame: &Frame, flags: u64, stack: u64, parent_tid: u64, child_tid: 
         return Err(EINVAL);
     }
     let thread = flags & CLONE_THREAD != 0;
-    if thread && flags & CSIGNAL != 0 {
+    if (thread && flags & CSIGNAL != 0) || flags & CSIGNAL > signal::NSIG as u64 {
         return Err(EINVAL);
     }
     if flags & CLONE_SETTLS != 0 && tls >= super::address_space::USER_END {
@@ -118,7 +118,10 @@ pub fn clone(frame: &Frame, flags: u64, stack: u64, parent_tid: u64, child_tid: 
         me.group.clone()
     } else {
         let i = me.group.info.lock();
-        let ppid = if flags & CLONE_PARENT != 0 { i.ppid } else { me.tgid() };
+        // With CLONE_PARENT the caller's parent gets the caller's exit
+        // signal, not one of the caller's choosing (as on Linux).
+        let (ppid, exit_signal) =
+            if flags & CLONE_PARENT != 0 { (i.ppid, i.exit_signal) } else { (me.tgid(), (flags & CSIGNAL) as u32) };
         // The parent-death signal is cleared for the child, as on Linux.
         let info = Info {
             dumpable: i.dumpable,
@@ -127,7 +130,7 @@ pub fn clone(frame: &Frame, flags: u64, stack: u64, parent_tid: u64, child_tid: 
             exe: i.exe.clone(),
             mem: Some(mm.stats.clone()),
             nice: i.nice,
-            exit_signal: (flags & CSIGNAL) as u32,
+            exit_signal,
             ..Info::new(ppid, i.pgid, i.sid, i.name.clone())
         };
         drop(i);

@@ -254,7 +254,7 @@ pub fn kick(t: &Arc<Task>) {
 /// process right away; SIGKILL wakes stopped threads to die. Never
 /// allocates (it runs in interrupt context for Ctrl+C).
 fn post(group: &Arc<ThreadGroup>, thread: Option<&Arc<Task>>, sig: u32) {
-    if group.tgid == 0 {
+    if group.tgid == 0 || sig == 0 || sig > NSIG {
         return;
     }
     let mut continued_parent = None;

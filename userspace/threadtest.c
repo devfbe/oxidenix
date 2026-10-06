@@ -327,6 +327,10 @@ int main(void) {
     st = in_child(exec_in_thread);
     check("exec in a thread ends the others, runs the program", WIFEXITED(st) && WEXITSTATUS(st) == 5);
 
+    long r = syscall(SYS_clone, 200UL, 0, 0, 0, 0);
+    if (r == 0) _exit(0);
+    check("clone refuses an exit signal beyond 64", r == -1 && errno == EINVAL);
+
     /* vfork shares memory until exec or exit; posix_spawn uses it. */
     static volatile int shared_by_vfork;
     shared_by_vfork = 0;

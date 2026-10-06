@@ -123,6 +123,8 @@ fn process_exit(group: &Arc<ThreadGroup>, status: i32) {
             let mut info = g.info.lock();
             if info.ppid == pid && g.tgid != pid {
                 info.ppid = 0;
+                // The new parent hears of the end the ordinary way.
+                info.exit_signal = signal::SIGCHLD;
                 if info.pdeath_sig != 0 {
                     death_signals.push((g.tgid, info.pdeath_sig));
                 }
@@ -139,6 +141,9 @@ fn process_exit(group: &Arc<ThreadGroup>, status: i32) {
         (info.ppid, info.exit_signal)
     };
     notify_parent(ppid);
+    // A protected (server) parent accepts nothing but SIGCHLD.
+    let parent_protected = TABLE.lock().groups.get(&ppid).is_some_and(|g| g.privileged.load(Ordering::Relaxed));
+    let exit_signal = if parent_protected && exit_signal != 0 { signal::SIGCHLD } else { exit_signal };
     if exit_signal != 0 {
         signal::send(ppid, exit_signal);
     }
