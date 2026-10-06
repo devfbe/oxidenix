@@ -78,7 +78,7 @@ extern "sysv64" fn timer_interrupt(frame: &mut Frame) {
     // The kernel is not preemptive: only user-space code is interrupted.
     if frame.from_user() {
         crate::process::schedule();
-        crate::process::signal::deliver(frame);
+        crate::process::signal::deliver(frame, None);
     }
 }
 

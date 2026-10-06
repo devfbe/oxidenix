@@ -572,6 +572,11 @@ pub fn sendfile(out_fd: u64, in_fd: u64, offset: u64, count: u64) -> SysResult {
         }
         out.write(&buf[..n])?;
         total += n as u64;
+        // Like Linux, return after a short read (a terminal line, a pipe
+        // chunk) instead of blocking for more; the caller sees EOF as 0.
+        if n < want {
+            break;
+        }
     }
     Ok(total as i64)
 }

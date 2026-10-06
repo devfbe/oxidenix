@@ -51,8 +51,10 @@ Its [commit history](#development-history) records every step.
   redirections, subshells, command substitution and arithmetic.
 - **Preemptive multitasking**: round-robin scheduler at 100 Hz, separate address spaces,
   `fork` with **copy-on-write**, `execve`, `wait4`, process groups and sessions.
-- **POSIX signals**: handlers, masks, `kill`, `SIGCHLD`, `EINTR`, and **Ctrl+C** interrupting
-  any foreground program, even a busy loop without system calls.
+- **POSIX signals**: handlers, masks, `kill`, `SIGCHLD`, `EINTR` with automatic syscall restart,
+  and **Ctrl+C** interrupting any foreground program, even a busy loop without system calls.
+- **Job control**: Ctrl+Z stops the foreground job, then `jobs`, `fg`, `bg` and `kill %n` work
+  in Bash; background jobs reading from the terminal are stopped with `SIGTTIN`.
 - **Filesystem**: an in-memory, tmpfs-like VFS populated from a cpio initramfs, with files,
   directories, symlinks, `/dev/{console,tty,null,zero}`, and quotas against heap exhaustion.
 - **Terminal**: a termios line discipline (canonical and raw mode, echo, erase/kill/word-erase,
@@ -83,9 +85,9 @@ The kernel boots straight into Bash. Things to try:
 
 ```sh
 ls -l /bin | head          # BusyBox applets
-cowtest; sigtest; forktest # kernel self-tests in user space
+cowtest; sigtest; jobtest; oomtest; forktest # kernel self-tests in user space
 sh /etc/test.sh            # filesystem, pipes, quotas, rename semantics
-sleep 100                  # then press Ctrl+C
+sleep 100                  # then press Ctrl+Z, try jobs / bg / fg, then Ctrl+C
 exit                       # drops to the built-in kernel monitor ('help', 'mem', 'run bash')
 ```
 
@@ -216,10 +218,17 @@ About 5,000 lines of Rust in the kernel plus a small host-side builder.
 - Per process: 64 actions, a blocked mask and a pending set. `fork` inherits actions and mask,
   `exec` resets caught signals.
 - **Delivery** happens on every return to user space (after syscalls and after timer
-  preemption). Default actions terminate or ignore. For handlers, the kernel pushes a signal
-  frame on the user stack: restorer address, saved register frame, saved mask and `siginfo`.
+  preemption). Default actions terminate, ignore or stop. For handlers, the kernel pushes a
+  signal frame on the user stack: restorer address, saved register frame, saved mask, the
+  FPU/SSE state (asynchronous handlers would otherwise clobber it) and `siginfo`.
 - Blocking calls (TTY and pipe I/O, `wait4`, `nanosleep`, `poll`/`select`, `pause`) return
   `EINTR`, but only after checking for available data or a finished child first.
+- **Syscall restart**: a call interrupted by a stop, or by a handler installed with
+  `SA_RESTART`, is rewound to its `syscall` instruction and runs again, so `cat` survives
+  Ctrl+Z / `fg`. Sleeps and polls report `EINTR` instead, as on Linux.
+- **Job control**: stopped processes leave the run queue until `SIGCONT` (or `SIGKILL`), and
+  parents learn about stops and continues through `SIGCHLD` and `wait4` with `WUNTRACED` and
+  `WCONTINUED`. `wait4` supports the POSIX process group selectors (`pid` 0 and < -1).
 - The TTY turns Ctrl+C, Ctrl+\ and Ctrl+Z into `SIGINT`, `SIGQUIT` and `SIGTSTP` for the
   foreground process group.
 
@@ -283,7 +292,8 @@ Each of these programs and scripts lives in the root filesystem and runs inside 
 |---|---|
 | `cowtest` | copy-on-write isolation between parent and child, kernel writes into shared pages, 50 forks, shared read-only frames under `brk` |
 | `oomtest` | fork bomb (stops at the process limit), memory exhaustion via `mmap`, 100 full pipes; the kernel survives and memory is reusable |
-| `sigtest` | handlers, killing a busy loop, `SIGCHLD`, `EINTR` on pipe reads, blocked and ignored signals |
+| `sigtest` | handlers, killing a busy loop, `SIGCHLD`, `EINTR` on pipe reads, blocked and ignored signals, FPU state across asynchronous handlers |
+| `jobtest` | stop/continue reporting through `wait4`, restart of a stopped `read()`, `SIGKILL` on stopped processes, `SA_RESTART` |
 | `forktest` | `fork`, `execve`, `wait4`, preemptive interleaving of two workers |
 | `sh /etc/test.sh` | files, pipes, `cd`, `mkdir`/`touch`/`rm`, rename cycles via symlinks, file quota |
 | `mem` (kernel monitor) | frame and heap accounting, allocator self-test, leak checks after workloads |
@@ -318,7 +328,7 @@ never returns grown memory to the frame allocator, and there are no users or per
 
 - [x] Copy-on-write `fork`
 - [x] `ENOMEM` instead of a kernel panic when memory runs out
-- [ ] Job control: stopping (Ctrl+Z), `fg`/`bg`, `SIGCONT`
+- [x] Job control: stopping (Ctrl+Z), `fg`/`bg`, `SIGCONT`
 - [ ] Persistent storage: a disk driver and an on-disk filesystem
 - [ ] Networking, SMP, dynamic linking, real entropy, users and permissions
 
@@ -336,6 +346,7 @@ never returns grown memory to the frame allocator, and there are no users or per
 | Bash | boot into an interactive Bash; harden signal and exec paths |
 | Copy-on-write | copy-on-write fork and an optimized dev profile |
 | Out of memory | grow the kernel heap and turn memory exhaustion into errors |
+| Job control | job control with stopped processes and syscall restart |
 
 Run `git log` for the full history, including the security fixes between these steps.
 

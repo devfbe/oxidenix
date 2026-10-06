@@ -15,8 +15,8 @@ pub const SIGCHLD: u32 = 17;
 pub const SIGCONT: u32 = 18;
 pub const SIGSTOP: u32 = 19;
 pub const SIGTSTP: u32 = 20;
-const SIGTTIN: u32 = 21;
-const SIGTTOU: u32 = 22;
+pub const SIGTTIN: u32 = 21;
+pub const SIGTTOU: u32 = 22;
 const SIGURG: u32 = 23;
 const SIGWINCH: u32 = 28;
 const NSIG: u32 = 64;
@@ -24,6 +24,7 @@ const NSIG: u32 = 64;
 const SIG_DFL: u64 = 0;
 const SIG_IGN: u64 = 1;
 const SA_RESTORER: u64 = 0x0400_0000;
+const SA_RESTART: u64 = 0x1000_0000;
 const SA_NODEFER: u64 = 0x4000_0000;
 const SA_RESETHAND: u64 = 0x8000_0000;
 
@@ -62,8 +63,20 @@ fn bit(sig: u32) -> u64 {
 const UNBLOCKABLE: u64 = (1 << (SIGKILL - 1)) | (1 << (SIGSTOP - 1));
 
 fn default_ignored(sig: u32) -> bool {
-    // Stop signals are ignored too: there is no job suspension yet.
-    matches!(sig, SIGCHLD | SIGCONT | SIGURG | SIGWINCH | SIGSTOP | SIGTSTP | SIGTTIN | SIGTTOU)
+    matches!(sig, SIGCHLD | SIGCONT | SIGURG | SIGWINCH)
+}
+
+fn is_stop(sig: u32) -> bool {
+    matches!(sig, SIGSTOP | SIGTSTP | SIGTTIN | SIGTTOU)
+}
+
+const STOP_SIGNALS: u64 = (1 << (SIGSTOP - 1)) | (1 << (SIGTSTP - 1)) | (1 << (SIGTTIN - 1)) | (1 << (SIGTTOU - 1));
+
+/// Wait status reported for a stopped (`sig << 8 | 0x7f`) or continued child.
+pub const CONTINUED_STATUS: i32 = 0xffff;
+
+pub fn stopped_status(sig: u32) -> i32 {
+    ((sig as i32) << 8) | 0x7f
 }
 
 impl Signals {
@@ -97,21 +110,66 @@ impl Signals {
     }
 }
 
+/// Background processes reading from the terminal get SIGTTIN (and EINTR,
+/// so the read restarts once they are continued in the foreground), or EIO
+/// if they ignore or block it.
+pub fn check_tty_read(foreground: Pid) -> Result<(), i64> {
+    interrupts::without_interrupts(|| {
+        let p = sched().cur();
+        if p.pid == 0 || foreground == 0 || p.pgid == foreground {
+            return Ok(());
+        }
+        let ignored = p.signals.actions[SIGTTIN as usize - 1].handler == SIG_IGN;
+        if ignored || p.signals.mask & bit(SIGTTIN) != 0 {
+            return Err(EIO);
+        }
+        let pgid = p.pgid;
+        send_group(pgid, SIGTTIN);
+        Err(EINTR)
+    })
+}
+
 /// Whether a blocking syscall of the current process should return EINTR.
 pub fn interrupted() -> bool {
     interrupts::without_interrupts(|| sched().cur().signals.deliverable() != 0)
 }
 
+/// Wakes a parent blocked in wait4 and sends it SIGCHLD.
+fn notify_parent(ppid: Pid) {
+    let s = sched();
+    if s.procs.get(&ppid).is_some_and(|p| p.state == State::WaitChild) {
+        s.make_ready(ppid);
+    }
+    post(ppid, SIGCHLD);
+}
+
 /// Marks `sig` pending for `pid` and wakes it from an interruptible sleep.
+/// SIGCONT resumes a stopped process right away; SIGKILL wakes it to die.
 fn post(pid: Pid, sig: u32) {
     let s = sched();
     let Some(p) = s.procs.get_mut(&pid) else { return };
     if pid == 0 || matches!(p.state, State::Zombie(_)) {
         return;
     }
+    if sig == SIGCONT {
+        p.signals.pending &= !STOP_SIGNALS;
+        if p.state == State::Stopped {
+            p.report = Some(CONTINUED_STATUS);
+            let ppid = p.ppid;
+            s.make_ready(pid);
+            notify_parent(ppid);
+        }
+    } else if is_stop(sig) {
+        p.signals.pending &= !bit(SIGCONT);
+    }
+    let Some(p) = s.procs.get_mut(&pid) else { return };
     p.signals.pending |= bit(sig);
-    let sleeping = matches!(p.state, State::Sleeping(_) | State::WaitChild);
-    if sleeping && p.signals.deliverable() != 0 {
+    let wake = match p.state {
+        State::Sleeping(_) | State::WaitChild => p.signals.deliverable() != 0,
+        State::Stopped => sig == SIGKILL,
+        _ => false,
+    };
+    if wake {
         s.make_ready(pid);
     }
 }
@@ -120,7 +178,6 @@ pub fn send(pid: Pid, sig: u32) {
     interrupts::without_interrupts(|| post(pid, sig));
 }
 
-/// Sends `sig` to every process in group `pgid`; returns whether one existed.
 /// Sends `sig` to every process in group `pgid`. Called from interrupt
 /// context (Ctrl+C), so it must not allocate.
 pub fn send_group(pgid: Pid, sig: u32) {
@@ -220,54 +277,123 @@ pub fn sigprocmask(how: u64, set: u64, oldset: u64) -> SysResult {
 }
 
 /// What a signal handler finds on its stack, from low to high addresses:
-/// the return address (the restorer), then the saved state for sigreturn,
-/// then a minimal siginfo.
+/// the return address (the restorer), then the saved state for sigreturn
+/// (registers, mask and the FPU/SSE state, which an asynchronous handler
+/// would otherwise clobber), then a minimal siginfo.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct SigFrame {
     restorer: u64,
     saved: Frame,
     saved_mask: u64,
+    fpu: [u8; 512],
     info: [u32; 32],
 }
 
-/// Delivers at most one pending signal before returning to user space:
-/// terminates the process (default action) or redirects `frame` to the
-/// handler.
-pub fn deliver(frame: &mut Frame) {
+#[repr(C, align(16))]
+struct FxArea([u8; 512]);
+
+fn fxsave() -> [u8; 512] {
+    let mut area = FxArea([0; 512]);
+    unsafe { core::arch::asm!("fxsave64 [{}]", in(reg) area.0.as_mut_ptr(), options(nostack)) };
+    area.0
+}
+
+/// Restores an FPU image that came from user memory.
+fn fxrstor(image: [u8; 512]) {
+    let mut area = FxArea(image);
+    // Reserved MXCSR bits would make fxrstor fault in ring 0.
+    let mxcsr = u32::from_le_bytes(area.0[24..28].try_into().unwrap()) & 0xffbf;
+    area.0[24..28].copy_from_slice(&mxcsr.to_le_bytes());
+    unsafe { core::arch::asm!("fxrstor64 [{}]", in(reg) area.0.as_ptr(), options(nostack)) };
+}
+
+/// Whether a syscall interrupted with EINTR may be re-executed. Sleeps and
+/// waits for events report the interruption instead, as on Linux. After
+/// rt_sigreturn, rax holds the restored value of the *earlier* syscall, which
+/// must not be mistaken for an EINTR of rt_sigreturn itself.
+fn restartable(nr: u64) -> bool {
+    !matches!(nr, 7 | 15 | 23 | 34 | 35 | 270 | 271)
+}
+
+/// Makes the interrupted syscall `nr` run again when the frame resumes.
+fn rewind(frame: &mut Frame, nr: u64) {
+    frame.rax = nr;
+    frame.rip -= 2; // length of the `syscall` instruction
+}
+
+/// Stops the current process until SIGCONT (or SIGKILL) arrives.
+fn stop(sig: u32) {
+    interrupts::without_interrupts(|| {
+        let p = sched().cur();
+        p.state = State::Stopped;
+        p.report = Some(stopped_status(sig));
+        let ppid = p.ppid;
+        notify_parent(ppid);
+        super::schedule();
+    });
+}
+
+/// Handles pending signals before returning to user space: stops the
+/// process, terminates it, or redirects `frame` to a handler. `syscall` is
+/// the number of the syscall that is returning, if any, so that calls
+/// interrupted with EINTR can be restarted.
+pub fn deliver(frame: &mut Frame, syscall: Option<u64>) {
     if !frame.from_user() {
         return;
     }
-    let action = interrupts::without_interrupts(|| {
-        let p = sched().cur();
-        let set = p.signals.deliverable();
-        if set == 0 {
-            // Drop signals that are pending but ignored.
-            let ignored = p.signals.pending & !p.signals.mask;
-            p.signals.pending &= !ignored;
-            return None;
+    let mut interrupted = syscall.filter(|&nr| frame.rax == (-EINTR) as u64 && restartable(nr));
+    loop {
+        let action = interrupts::without_interrupts(|| {
+            let p = sched().cur();
+            let set = p.signals.deliverable();
+            if set == 0 {
+                // Drop signals that are pending but ignored.
+                let ignored = p.signals.pending & !p.signals.mask;
+                p.signals.pending &= !ignored;
+                return None;
+            }
+            let sig = set.trailing_zeros() + 1;
+            p.signals.pending &= !bit(sig);
+            let action = p.signals.actions[sig as usize - 1];
+            if action.handler == SIG_DFL {
+                return Some((sig, action, 0));
+            }
+            let old_mask = p.signals.mask;
+            let mut block = action.mask;
+            if action.flags & SA_NODEFER == 0 {
+                block |= bit(sig);
+            }
+            p.signals.mask = (p.signals.mask | block) & !UNBLOCKABLE;
+            if action.flags & SA_RESETHAND != 0 {
+                p.signals.actions[sig as usize - 1] = SigAction::default();
+            }
+            Some((sig, action, old_mask))
+        });
+        let Some((sig, action, old_mask)) = action else {
+            // Nothing ran in user space, so the interrupted call can simply go on.
+            if let Some(nr) = interrupted {
+                rewind(frame, nr);
+            }
+            return;
+        };
+        if action.handler == SIG_DFL && is_stop(sig) {
+            stop(sig);
+            continue;
         }
-        let sig = set.trailing_zeros() + 1;
-        p.signals.pending &= !bit(sig);
-        let action = p.signals.actions[sig as usize - 1];
         if action.handler == SIG_DFL {
-            return Some((sig, action, 0));
+            super::exit(sig as i32);
         }
-        let old_mask = p.signals.mask;
-        let mut block = action.mask;
-        if action.flags & SA_NODEFER == 0 {
-            block |= bit(sig);
+        if let Some(nr) = interrupted.take() {
+            if action.flags & SA_RESTART != 0 {
+                rewind(frame, nr);
+            }
         }
-        p.signals.mask = (p.signals.mask | block) & !UNBLOCKABLE;
-        if action.flags & SA_RESETHAND != 0 {
-            p.signals.actions[sig as usize - 1] = SigAction::default();
-        }
-        Some((sig, action, old_mask))
-    });
-    let Some((sig, action, old_mask)) = action else { return };
-    if action.handler == SIG_DFL {
-        super::exit(sig as i32);
+        return push_handler_frame(frame, sig, action, old_mask);
     }
+}
+
+fn push_handler_frame(frame: &mut Frame, sig: u32, action: SigAction, old_mask: u64) {
     // Without a restorer the handler could never return; a handler outside
     // user space would make iretq fault in ring 0.
     if action.flags & SA_RESTORER == 0 || action.handler >= USER_END {
@@ -276,7 +402,7 @@ pub fn deliver(frame: &mut Frame) {
 
     let mut info = [0u32; 32];
     info[0] = sig;
-    let sigframe = SigFrame { restorer: action.restorer, saved: *frame, saved_mask: old_mask, info };
+    let sigframe = SigFrame { restorer: action.restorer, saved: *frame, saved_mask: old_mask, fpu: fxsave(), info };
     // Skip the red zone; at handler entry rsp+8 must be 16-byte aligned.
     let size = core::mem::size_of::<SigFrame>() as u64;
     let sp = ((frame.rsp.wrapping_sub(128).wrapping_sub(size)) & !0xf).wrapping_sub(8);
@@ -311,6 +437,7 @@ pub fn sigreturn(frame: &mut Frame) -> SysResult {
     saved.ss = gdt::USER_SS as u64;
     saved.rflags = (saved.rflags & USER_FLAGS) | 0x202;
     *frame = saved;
+    fxrstor(sf.fpu);
     interrupts::without_interrupts(|| sched().cur().signals.mask = sf.saved_mask & !UNBLOCKABLE);
     Ok(frame.rax as i64)
 }

@@ -272,6 +272,7 @@ pub fn input(bytes: &[u8]) {
 /// Blocking read honoring canonical/raw mode.
 pub fn read(buf: &mut [u8], nonblock: bool) -> Result<usize, i64> {
     without_interrupts(|| loop {
+        crate::process::signal::check_tty_read(foreground())?;
         if let Some(n) = TTY.lock().try_read(buf) {
             return Ok(n);
         }
@@ -318,6 +319,12 @@ pub fn set_termios(t: Termios, flush: bool) {
         tty.termios = t;
     });
     wakeup(TTY_CHAN);
+}
+
+/// Back to cooked mode with default settings, e.g. after a program that
+/// switched the terminal to raw mode died.
+pub fn reset() {
+    set_termios(Termios::default(), true);
 }
 
 pub fn flush_input() {

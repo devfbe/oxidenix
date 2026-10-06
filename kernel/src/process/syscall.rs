@@ -133,6 +133,7 @@ pub unsafe extern "C" fn user_return() {
 }
 
 extern "sysv64" fn dispatch(f: &mut Frame) {
+    let nr = f.rax;
     let (a0, a1, a2, a3, a4, a5) = (f.rdi, f.rsi, f.rdx, f.r10, f.r8, f.r9);
     let cwd = AT_FDCWD as u64;
     let result: SysResult = match f.rax {
@@ -228,7 +229,7 @@ extern "sysv64" fn dispatch(f: &mut Frame) {
         }
     };
     f.rax = result.unwrap_or_else(|e| -e) as u64;
-    super::signal::deliver(f);
+    super::signal::deliver(f, Some(nr));
 }
 
 /// Everything runs as root: real, effective and saved IDs are all 0.

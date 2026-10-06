@@ -13,6 +13,7 @@ pub fn run() -> ! {
     crate::printkln!("oxidenix monitor. Type 'help' for help, 'run bash' for a shell.");
     loop {
         crate::drivers::tty::set_foreground(0);
+        crate::drivers::tty::reset();
         crate::printk!("> ");
         let line = read_line();
         let (cmd, args) = parse(&line);

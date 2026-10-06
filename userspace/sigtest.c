@@ -13,6 +13,24 @@ static void on_usr1(int sig) { got_usr1 = sig; }
 static void on_usr2(int sig) { got_usr2 = sig; }
 static void on_chld(int sig) { got_chld++; (void)sig; }
 
+static volatile double handler_sink;
+static volatile int fpu_signals;
+
+/* Uses SSE registers, like any compiled code doing floating point. */
+static void on_alrm(int sig) {
+    double d = sig;
+    for (int i = 0; i < 100; i++) d = d * 1.5 + 0.25;
+    handler_sink = d;
+    fpu_signals++;
+}
+
+/* Floating-point work without syscalls, so signals arrive asynchronously. */
+static double fpu_work(void) {
+    double acc = 0.0;
+    for (int i = 1; i < 3000000; i++) acc += 1.0 / (double)i;
+    return acc;
+}
+
 static int failures;
 
 static void check(const char *name, int ok) {
@@ -80,6 +98,22 @@ int main(void) {
     signal(SIGUSR1, SIG_IGN);
     raise(SIGUSR1);
     check("ignored signal does nothing", 1);
+
+    handle(SIGALRM, on_alrm);
+    double expected = fpu_work();
+    pid_t pinger = fork();
+    if (pinger == 0) {
+        for (int i = 0; i < 40; i++) {
+            sleep_ms(10);
+            kill(getppid(), SIGALRM);
+        }
+        _exit(0);
+    }
+    int same = 1;
+    for (int round = 0; round < 6; round++) same &= fpu_work() == expected;
+    while (waitpid(pinger, NULL, 0) < 0 && errno == EINTR) {
+    }
+    check("async handlers keep the FPU/SSE state intact", same && fpu_signals > 0);
 
     printf("sigtest: %s\n", failures ? "FAILED" : "all passed");
     return failures;

@@ -60,6 +60,8 @@ enum State {
     WaitChild,
     /// Sleeps until `wakeup` is called with this channel.
     Sleeping(usize),
+    /// Stopped by a signal until SIGCONT.
+    Stopped,
     /// Wait status in Linux format (exit code << 8 or signal number).
     Zombie(i32),
 }
@@ -88,6 +90,8 @@ struct Process {
     brk_end: u64,
     mmap_next: u64,
     signals: signal::Signals,
+    /// Stop/continue event not yet collected by the parent's wait4.
+    report: Option<i32>,
 }
 
 impl Process {
@@ -182,6 +186,7 @@ pub fn init() {
         brk_end: 0,
         mmap_next: 0,
         signals: signal::Signals::default(),
+        report: None,
     };
     let mut procs = BTreeMap::new();
     procs.insert(0, Box::new(kernel));
@@ -345,6 +350,7 @@ fn new_process(pid: Pid, ppid: Pid, name: String, space: AddressSpace, frame: Fr
         brk_end: 0,
         mmap_next: MMAP_TOP,
         signals: signal::Signals::default(),
+        report: None,
     }))
 }
 
@@ -477,13 +483,29 @@ pub fn exit(status: i32) -> ! {
     unreachable!("zombie was scheduled again");
 }
 
-/// Waits for a child (`target` = None: any). Returns (pid, status), or
-/// None with `nohang` if none has finished yet.
-fn wait_child(target: Option<Pid>, nohang: bool) -> Result<Option<(Pid, i32)>, i64> {
+const WNOHANG: u64 = 1;
+const WUNTRACED: u64 = 2;
+const WCONTINUED: u64 = 8;
+
+/// Waits for a child selected like wait4's `pid` (> 0: that child, 0: same
+/// process group, -1: any, < -1: group -pid). Returns (pid, wait status),
+/// or None with WNOHANG if nothing is ready. Stops and continues are
+/// reported with WUNTRACED and WCONTINUED.
+fn wait_child(pid: i64, options: u64) -> Result<Option<(Pid, i32)>, i64> {
     loop {
         let s = sched();
         let me = s.current;
-        let is_target = |p: &Process| p.ppid == me && p.pid != me && target.is_none_or(|t| t == p.pid);
+        let my_pgid = s.cur().pgid;
+        let is_target = |p: &Process| {
+            p.ppid == me
+                && p.pid != me
+                && match pid {
+                    p_ if p_ > 0 => p.pid == p_ as Pid,
+                    0 => p.pgid == my_pgid,
+                    -1 => true,
+                    p_ => p.pgid == p_.unsigned_abs(),
+                }
+        };
         if !s.procs.values().any(|p| is_target(p)) {
             return Err(ECHILD);
         }
@@ -493,10 +515,18 @@ fn wait_child(target: Option<Pid>, nohang: bool) -> Result<Option<(Pid, i32)>, i
             s.procs.remove(&pid);
             return Ok(Some((pid, status)));
         }
-        if nohang {
+        let wanted = |r: i32| {
+            (r == signal::CONTINUED_STATUS && options & WCONTINUED != 0)
+                || (r != signal::CONTINUED_STATUS && options & WUNTRACED != 0)
+        };
+        if let Some(p) = s.procs.values_mut().find(|p| is_target(p) && p.report.is_some_and(wanted)) {
+            let status = p.report.take().expect("checked above");
+            return Ok(Some((p.pid, status)));
+        }
+        if options & WNOHANG != 0 {
             return Ok(None);
         }
-        // Checked after the zombie scan: a finished child wins over a signal.
+        // Checked after the scans: a finished child wins over a signal.
         if signal::interrupted() {
             return Err(EINTR);
         }
@@ -506,9 +536,7 @@ fn wait_child(target: Option<Pid>, nohang: bool) -> Result<Option<(Pid, i32)>, i
 }
 
 pub fn wait4(pid: i64, status_ptr: u64, options: u64) -> SysResult {
-    const WNOHANG: u64 = 1;
-    let target = if pid > 0 { Some(pid as Pid) } else { None };
-    match wait_child(target, options & WNOHANG != 0)? {
+    match wait_child(pid, options)? {
         Some((pid, status)) => {
             if status_ptr != 0 {
                 uaccess::write(status_ptr, status)?;
@@ -519,15 +547,15 @@ pub fn wait4(pid: i64, status_ptr: u64, options: u64) -> SysResult {
     }
 }
 
-/// For the kernel shell: blocks until a specific child exits.
+/// For the kernel shell: blocks until a specific child exits or stops.
 pub fn wait_for(pid: Pid) -> Result<i32, i64> {
-    interrupts::without_interrupts(|| wait_child(Some(pid), false))
+    interrupts::without_interrupts(|| wait_child(pid as i64, WUNTRACED))
         .map(|r| r.expect("blocking wait always yields a result").1)
 }
 
 /// Reaps zombies whose parent (the kernel) no longer waits for them.
 pub fn reap_orphans() {
-    interrupts::without_interrupts(|| while let Ok(Some(_)) = wait_child(None, true) {});
+    interrupts::without_interrupts(|| while let Ok(Some(_)) = wait_child(-1, WNOHANG) {});
 }
 
 pub fn yield_now() {
@@ -612,11 +640,16 @@ unsafe extern "sysv64" fn switch_stacks(save: *mut u64, next: u64) {
     );
 }
 
-/// (true, exit code) on normal exit, (false, signal) when killed.
-pub fn decode_status(status: i32) -> (bool, i32) {
-    if status & 0x7f == 0 {
-        (true, (status >> 8) & 0xff)
-    } else {
-        (false, status & 0x7f)
+pub enum WaitStatus {
+    Exited(i32),
+    Killed(i32),
+    Stopped(i32),
+}
+
+pub fn decode_status(status: i32) -> WaitStatus {
+    match status & 0x7f {
+        0 => WaitStatus::Exited((status >> 8) & 0xff),
+        0x7f => WaitStatus::Stopped((status >> 8) & 0xff),
+        sig => WaitStatus::Killed(sig),
     }
 }

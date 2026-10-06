@@ -165,12 +165,21 @@ pub fn run_program(args: &[&str]) {
             return;
         }
     };
-    match crate::process::wait_for(pid) {
-        Ok(status) => match crate::process::decode_status(status) {
-            (true, code) => crate::printkln!("[{} (pid {}) exited with code {}]", name, pid, code),
-            (false, sig) => crate::printkln!("[{} (pid {}) killed by signal {}]", name, pid, sig),
-        },
-        Err(errno) => crate::printkln!("run: wait failed (errno {})", errno),
+    use crate::process::WaitStatus;
+    loop {
+        match crate::process::wait_for(pid).map(crate::process::decode_status) {
+            Ok(WaitStatus::Exited(code)) => crate::printkln!("[{} (pid {}) exited with code {}]", name, pid, code),
+            Ok(WaitStatus::Killed(sig)) => crate::printkln!("[{} (pid {}) killed by signal {}]", name, pid, sig),
+            Ok(WaitStatus::Stopped(sig)) => {
+                // The monitor has no job control: resume the program in the foreground.
+                crate::printkln!("[{} (pid {}) stopped by signal {}; the monitor resumes it]", name, pid, sig);
+                crate::drivers::tty::set_foreground(pid);
+                crate::process::signal::send(pid, crate::process::signal::SIGCONT);
+                continue;
+            }
+            Err(errno) => crate::printkln!("run: wait failed (errno {})", errno),
+        }
+        break;
     }
     crate::process::reap_orphans();
 }
