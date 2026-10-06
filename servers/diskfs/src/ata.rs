@@ -24,6 +24,12 @@ const CMD_IDENTIFY: u8 = 0xec;
 const SLAVE_LBA: u8 = 0xf0;
 const SECTOR_SIZE: usize = 512;
 
+/// How long a command may keep the drive busy. A cache flush can take
+/// seconds when the emulator's host disk is slow.
+const TIMEOUT_MS: u64 = 30_000;
+/// Status polls before waiting starts to give the CPU away.
+const FAST_POLLS: u32 = 10_000;
+
 pub struct Ata {
     sectors: u64,
 }
@@ -33,13 +39,23 @@ fn status() -> u8 {
 }
 
 fn wait_not_busy() -> Result<u8, ()> {
-    for _ in 0..1_000_000 {
+    for _ in 0..FAST_POLLS {
         let s = status();
         if s & STATUS_BSY == 0 {
             return Ok(s);
         }
     }
-    Err(())
+    let deadline = oxrt::uptime_ms() + TIMEOUT_MS;
+    loop {
+        let s = status();
+        if s & STATUS_BSY == 0 {
+            return Ok(s);
+        }
+        if oxrt::uptime_ms() > deadline {
+            return Err(());
+        }
+        oxrt::sched_yield();
+    }
 }
 
 fn wait_data() -> Result<(), ()> {

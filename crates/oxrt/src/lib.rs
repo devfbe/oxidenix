@@ -13,6 +13,7 @@ use linked_list_allocator::LockedHeap;
 pub mod sys {
     pub const WRITE: u64 = 1;
     pub const MMAP: u64 = 9;
+    pub const SCHED_YIELD: u64 = 24;
     pub const GETPID: u64 = 39;
     pub const EXIT_GROUP: u64 = 231;
     pub const IOPERM: u64 = 173;
@@ -59,6 +60,19 @@ pub fn now() -> u64 {
     let mut ts = [0u64; 2];
     syscall(sys::CLOCK_GETTIME, [0, ts.as_mut_ptr() as u64, 0, 0, 0, 0]);
     ts[0]
+}
+
+/// Milliseconds since boot (monotonic, timer resolution).
+pub fn uptime_ms() -> u64 {
+    const CLOCK_MONOTONIC: u64 = 1;
+    let mut ts = [0u64; 2];
+    syscall(sys::CLOCK_GETTIME, [CLOCK_MONOTONIC, ts.as_mut_ptr() as u64, 0, 0, 0, 0]);
+    ts[0] * 1000 + ts[1] / 1_000_000
+}
+
+/// Lets other processes run before this one continues.
+pub fn sched_yield() {
+    syscall(sys::SCHED_YIELD, [0; 6]);
 }
 
 /// Asks the kernel for access to I/O ports [from, from + count).
