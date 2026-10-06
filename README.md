@@ -455,6 +455,9 @@ Known open issues: `getrandom` and `AT_RANDOM` are not cryptographically secure,
 call `reboot` (everything runs as root), the kernel heap
 never returns grown memory to the frame allocator, and there are no users or permissions
 (everything runs as root). The ext2 driver trusts the on-disk metadata of the image it was given.
+There is no IOMMU support: a server that drives a bus-mastering device (netd) can make the
+device read or write any physical memory, so such a server is effectively as trusted as the
+kernel. Its program is fixed at boot (see self-healing), but a bug in it is a kernel-level bug.
 
 ## Limitations and roadmap
 
