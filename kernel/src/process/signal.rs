@@ -206,7 +206,10 @@ fn post(t: &Arc<Task>, sig: u32) {
 }
 
 pub fn send(pid: Pid, sig: u32) {
-    if let Some(t) = sched::TABLE.lock().tasks.get(&pid).cloned() {
+    // The table lock must be released before posting: SIGCONT notifies
+    // the parent, which sends again.
+    let target = sched::TABLE.lock().tasks.get(&pid).cloned();
+    if let Some(t) = target {
         post(&t, sig);
     }
 }

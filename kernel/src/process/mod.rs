@@ -38,7 +38,6 @@ pub use task::Process;
 
 pub type Pid = u64;
 
-const MAX_PROCS: usize = sched::MAX_PROCS;
 const MMAP_TOP: u64 = 0x0000_7000_0000_0000;
 pub const TIMER_HZ: u64 = 100;
 
@@ -417,20 +416,10 @@ pub fn spawn_server(server: &Arc<Server>) -> Result<Pid, i64> {
     spawn_with(server.path, image, Some(server))
 }
 
-/// Takes the next pid, or EAGAIN at the process limit.
-fn reserve_pid() -> Result<Pid, i64> {
-    let mut table = TABLE.lock();
-    if table.tasks.len() >= MAX_PROCS {
-        return Err(EAGAIN);
-    }
-    let pid = table.next_pid;
-    table.next_pid += 1;
-    Ok(pid)
-}
-
 fn spawn_with(path: &str, image: loader::Image, server: Option<&Arc<Server>>) -> Result<Pid, i64> {
     let console = OpenFile::console();
-    let pid = reserve_pid()?;
+    let slot = sched::reserve_pid()?;
+    let pid = slot.pid;
     // Servers belong to the kernel, even when a program's request
     // (re)started them, so no program can wait for or signal them.
     let parent = if server.is_some() { 0 } else { current_pid() };
@@ -445,7 +434,7 @@ fn spawn_with(path: &str, image: loader::Image, server: Option<&Arc<Server>>) ->
     own.server = server.cloned();
     let t = new_task(pid, info, own, Frame::user_start(image.entry, image.sp))?;
     t.privileged.store(server.is_some(), Ordering::Relaxed);
-    TABLE.lock().tasks.insert(pid, t.clone());
+    slot.insert(t.clone());
     if server.is_none() {
         crate::drivers::tty::set_foreground(pid);
     }
@@ -454,7 +443,8 @@ fn spawn_with(path: &str, image: loader::Image, server: Option<&Arc<Server>>) ->
 }
 
 pub fn fork(frame: &Frame) -> Result<Pid, i64> {
-    let pid = reserve_pid()?;
+    let slot = sched::reserve_pid()?;
+    let pid = slot.pid;
     let me = current();
     let parent = unsafe { me.own() };
     let space = parent.space.as_ref().ok_or(EINVAL)?.clone_user().map_err(|_| ENOMEM)?;
@@ -480,7 +470,7 @@ pub fn fork(frame: &Frame) -> Result<Pid, i64> {
     };
     let child = new_task(pid, info, own, child_frame)?;
     *child.sig.lock() = me.sig.lock().for_child();
-    TABLE.lock().tasks.insert(pid, child.clone());
+    slot.insert(child.clone());
     sched::start(child);
     Ok(pid)
 }

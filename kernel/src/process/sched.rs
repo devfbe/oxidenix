@@ -39,9 +39,48 @@ pub const MAX_PROCS: usize = 256;
 pub struct Table {
     pub tasks: BTreeMap<Pid, Arc<Task>>,
     pub next_pid: Pid,
+    /// Pids handed out whose task is still being built: they count against
+    /// the limit, so concurrent forks on several CPUs cannot exceed it.
+    pub reserved: usize,
 }
 
-pub static TABLE: IrqSpinLock<Table> = IrqSpinLock::new(Table { tasks: BTreeMap::new(), next_pid: 1 });
+pub static TABLE: IrqSpinLock<Table> = IrqSpinLock::new(Table { tasks: BTreeMap::new(), next_pid: 1, reserved: 0 });
+
+/// A pid taken under the process limit; `insert` turns it into a listed
+/// task, dropping it gives the slot back.
+pub struct PidReservation {
+    pub pid: Pid,
+    done: bool,
+}
+
+/// Takes the next pid, or EAGAIN at the process limit.
+pub fn reserve_pid() -> Result<PidReservation, i64> {
+    let mut table = TABLE.lock();
+    if table.tasks.len() + table.reserved >= MAX_PROCS {
+        return Err(super::errno::EAGAIN);
+    }
+    let pid = table.next_pid;
+    table.next_pid += 1;
+    table.reserved += 1;
+    Ok(PidReservation { pid, done: false })
+}
+
+impl PidReservation {
+    pub fn insert(mut self, task: Arc<Task>) {
+        let mut table = TABLE.lock();
+        table.tasks.insert(self.pid, task);
+        table.reserved -= 1;
+        self.done = true;
+    }
+}
+
+impl Drop for PidReservation {
+    fn drop(&mut self) {
+        if !self.done {
+            TABLE.lock().reserved -= 1;
+        }
+    }
+}
 
 static TICKS: AtomicU64 = AtomicU64::new(0);
 
