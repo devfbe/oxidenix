@@ -72,19 +72,27 @@ fn exception_name(vector: u8) -> &'static str {
 
 fn exception(frame: &mut Frame) {
     let vector = frame.vector as u8;
+    let mut sig = exception_signal(vector);
     if vector == 14 {
-        let write_to_present = 0b11; // caused by a write, protection violation
-        if frame.error & write_to_present == write_to_present
-            && crate::process::address_space::resolve_cow(Cr2::read_raw())
-        {
-            return;
+        use crate::process::address_space::{handle_fault, Access, Fault};
+        let addr = Cr2::read_raw();
+        // Error code: bit 1 = write, bit 4 = instruction fetch.
+        let access = Access { write: frame.error & 2 != 0, exec: frame.error & 16 != 0 };
+        match handle_fault(addr, access) {
+            Ok(()) => return,
+            Err(Fault::Bus) => sig = signal::SIGBUS,
+            Err(Fault::Oom) if frame.from_user() => {
+                crate::printkln!("[kernel] out of memory at {:#x}: process killed", addr);
+                crate::process::exit(signal::SIGKILL as i32);
+            }
+            Err(_) => {}
         }
     }
     if frame.from_user() && vector != 18 {
-        let sig = exception_signal(vector);
         if signal::force(sig) {
             // No handler: the process dies, so say why.
             match vector {
+                14 if sig == signal::SIGBUS => crate::printkln!("[kernel] bus error at {:#x} (rip {:#x}), process killed", Cr2::read_raw(), frame.rip),
                 14 => crate::printkln!(
                     "[kernel] segmentation fault at {:#x} (rip {:#x}), process killed",
                     Cr2::read_raw(),

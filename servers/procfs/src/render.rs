@@ -67,8 +67,8 @@ pub fn meminfo(s: &System) -> String {
         ("SUnreclaim", kb(s.kernel_heap)),
         ("KernelStack", 0),
         ("PageTables", 0),
-        ("CommitLimit", kb(s.mem_total)),
-        ("Committed_AS", kb(s.mem_total - s.mem_free)),
+        ("CommitLimit", kb(s.commit_limit)),
+        ("Committed_AS", kb(s.committed)),
         ("HugePages_Total", 0),
         ("Hugepagesize", 2048),
     ] {
@@ -150,7 +150,7 @@ const PF_KTHREAD: u64 = 0x0020_0000;
 pub fn pid_stat(p: &Process, s: &System) -> String {
     let flags = if p.flags & FLAG_KERNEL != 0 { PF_KTHREAD } else { 0 };
     let priority = 20 + p.nice;
-    let vsize = p.pages * s.page_size;
+    let vsize = p.virt_pages * s.page_size;
     format!(
         "{pid} ({name}) {state} {ppid} {pgid} {sid} 0 -1 {flags} 0 0 0 0 {utime} {stime} 0 0 {priority} {nice} {threads} 0 {start} {vsize} {rss} 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 {cpu} 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
         pid = p.pid,
@@ -171,7 +171,7 @@ pub fn pid_stat(p: &Process, s: &System) -> String {
 
 /// /proc/<pid>/statm: size resident shared text lib data dt (pages).
 pub fn pid_statm(p: &Process) -> String {
-    format!("{} {} 0 0 0 {} 0\n", p.pages, p.pages, p.pages)
+    format!("{} {} 0 0 0 {} 0\n", p.virt_pages, p.pages, p.pages)
 }
 
 pub fn pid_status(p: &Process, s: &System) -> String {
@@ -183,9 +183,10 @@ pub fn pid_status(p: &Process, s: &System) -> String {
         _ => "? (unknown)",
     };
     let kb = p.pages * 4;
+    let virt_kb = p.virt_pages * 4;
     format!(
         "Name:\t{name}\nUmask:\t0022\nState:\t{state}\nTgid:\t{pid}\nNgid:\t0\nPid:\t{pid}\nPPid:\t{ppid}\nTracerPid:\t0\n\
-         Uid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nFDSize:\t256\nGroups:\t\nVmPeak:\t{kb:>8} kB\nVmSize:\t{kb:>8} kB\n\
+         Uid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nFDSize:\t256\nGroups:\t\nVmPeak:\t{virt_kb:>8} kB\nVmSize:\t{virt_kb:>8} kB\n\
          VmRSS:\t{kb:>8} kB\nRssAnon:\t{kb:>8} kB\nVmSwap:\t       0 kB\nThreads:\t{threads}\nCpus_allowed_list:\t0-{last}\n",
         name = name(p),
         pid = p.pid,

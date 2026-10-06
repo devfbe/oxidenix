@@ -109,7 +109,7 @@ The kernel boots straight into Bash. Things to try:
 
 ```sh
 ls -l /bin | head          # BusyBox applets
-cowtest; sigtest; jobtest; oomtest; fstest; forktest; nettest; smptest # self-tests
+cowtest; vmtest; sigtest; jobtest; oomtest; fstest; forktest; nettest; smptest # self-tests
 nproc; cat /proc/cpuinfo   # 4 CPUs; 'cpus' in the kernel monitor shows their load
 wget -O - http://example.com # DNS and HTTP through netd; nslookup and nc work as well
 ping -c 3 1.1.1.1          # raw ICMP sockets; oxidenix answers pings itself, too
@@ -167,10 +167,10 @@ oxidenix/
 │       ├── process/             process lifecycle and syscalls on it (mod.rs),
 │       │   ├── task.rs          tasks: owned state, locked info and signals
 │       │   ├── sched.rs         run queues, wait queues, context switch, idle
-│       │   ├── address_space.rs per-process page tables, copy-on-write
+│       │   ├── address_space.rs areas, demand paging, copy-on-write
 │       │   ├── syscall.rs       syscall entry/return, dispatch table
 │       │   ├── sys_file.rs      file, directory, pipe, tty-ioctl, poll/select
-│       │   ├── sys_mem.rs       brk, mmap, munmap
+│       │   ├── sys_mem.rs       brk, mmap, mprotect, mremap
 │       │   ├── sys_net.rs       socket syscalls (sockaddr_in, msghdr, options)
 │       │   ├── signal.rs        signal state, delivery, sigreturn, kill
 │       │   ├── loader.rs        ELF loading and the Linux initial stack
@@ -204,7 +204,7 @@ oxidenix/
 └── userspace/                   C test programs, build script, rootfs and data disk templates
 ```
 
-About 9,206 lines of Rust in the kernel and 3,067 in the servers, their libraries and runtime, plus a small host-side builder.
+About 9,200 lines of Rust (without comments and blank lines) in the kernel and 3,200 in the servers, their libraries and runtime, plus a small host-side builder.
 
 ### Boot sequence
 
@@ -233,10 +233,10 @@ About 9,206 lines of Rust in the kernel and 3,067 in the servers, their librarie
 
 | Region | Address | Notes |
 |---|---|---|
-| User ELF image | from `0x40_0000` | static `ET_EXEC` binaries, segments mapped with W/NX from program headers |
-| `brk` heap | after the highest segment | grows on demand |
-| `mmap` area | top-down from `0x7000_0000_0000` | anonymous and private file mappings |
-| User stack | below `0x7fff_ffff_f000` | 256 KiB, Linux initial stack (argc, argv, envp, auxv) |
+| User ELF image | from `0x40_0000` | static `ET_EXEC` binaries, one area per segment with its rights (read, write, execute) |
+| `brk` heap | after the highest segment | one area that grows and shrinks; never over another mapping |
+| `mmap` area | below `0x7000_0000_0000` | free gaps searched top-down; anonymous, shared and file mappings |
+| User stack | below `0x7fff_ffff_f000` | starts at 256 KiB (Linux initial stack: argc, argv, envp, auxv), grows on demand to 8 MiB |
 | Kernel image, stacks, boot info, framebuffer, physical memory map | upper half, chosen by the bootloader | shared by all address spaces |
 | Kernel heap | `0xffff_c000_0000_0000` | starts at 8 MiB and grows on demand (up to 1 GiB virtual) |
 
@@ -246,17 +246,35 @@ About 9,206 lines of Rust in the kernel and 3,067 in the servers, their librarie
 - **Address spaces**: each process has its own level-4 table. The lower half belongs to the
   process, the upper half entries are copied from the kernel's table. Dropping an address space
   walks the lower half and releases every table and frame.
-- **Copy-on-write**: `fork` shares all user frames. Writable pages become read-only in both
+- **Areas (VMAs)** (`process/address_space.rs`): each address space keeps its areas (start,
+  end, rights, backing) next to its page tables. Backings: zero-filled private memory, shared
+  anonymous memory (one object whose frames every mapping and every `fork` child sees),
+  private file mappings and device memory (DMA). `mmap`, `munmap`, `mprotect` and `mremap` cut
+  and join areas at page granularity.
+- **Demand paging**: mapping creates an area, not pages. The first access faults; the handler
+  checks the area's rights (else `SIGSEGV`), then maps a zeroed frame, the shared object's
+  frame, or a page read from the file (`SIGBUS` beyond its end). An access just below a stack
+  grows it, up to 8 MiB. Kernel accesses to user memory fault pages in the same way first.
+- **Protection**: `mprotect` really changes the rights (including `PROT_NONE`, which keeps the
+  pages' contents in entries marked by a software bit) and execution is denied by NX unless an
+  area is executable, so JIT compilers can write code and then make it executable (W^X).
+- **Commit accounting** (like Linux's `overcommit_memory=2`): writable private memory is
+  promised when it is mapped, against all usable RAM except the kernel's reserve. Running out is
+  an `ENOMEM` from `mmap`, `brk`, `mprotect`, `mremap` or `fork`, not a killed process.
+  `PROT_NONE` and `MAP_NORESERVE` mappings promise nothing until they become writable, so huge
+  reservations (as V8 makes) are cheap. `/proc/meminfo` shows `Committed_AS` and `CommitLimit`.
+- **Copy-on-write**: `fork` shares all private frames. Writable pages become read-only in both
   processes and are tagged with an OS-available page table bit. A write fault either copies the
-  frame or, for the last owner, just restores write access. Kernel writes into user memory
-  resolve COW first, because they would not fault.
+  frame or, for the last owner, just restores write access. Shared memory stays shared.
 - **Out of memory is an error, not a panic**: the kernel heap grows by mapping more frames
   when an allocation fails. User memory (pages, page tables, kernel stacks for `fork`) may not
   take the last 16 MiB of RAM, which stay reserved for the heap. Large allocations that user space
   can trigger (kernel stacks, file contents, pipe buffers, `execve` arguments) are fallible and
   return `ENOMEM`/`E2BIG`, and at most 256 processes can exist (`EAGAIN` beyond that).
-- **User memory access** (`uaccess.rs`) checks every page of a user range against the active
-  page tables before the kernel touches it. Bad pointers yield `EFAULT`, never a kernel fault.
+- **User memory access** (`uaccess.rs`) faults in every page of a user range (or finds it not
+  allowed) before the kernel touches it. Bad pointers yield `EFAULT`, never a kernel fault.
+- What a context switch saves (FS base, FPU state) lives apart from the process's own state, so
+  a task may sleep in a page fault (reading a file page) while it holds its address space.
 
 ### Processes and scheduling
 
@@ -516,7 +534,7 @@ Linux x86_64 numbers, grouped by area (about 120 in total):
 | Metadata | `stat` `fstat` `lstat` `newfstatat` `access` `faccessat` `faccessat2` `readlink` `readlinkat` `chmod` `fchmodat` `utimes` `futimesat` `utimensat` `umask` |
 | Directories | `getdents64` `getcwd` `chdir` `fchdir` `mkdir` `mkdirat` `rmdir` `unlink` `unlinkat` `rename` `renameat` `renameat2` `symlink` `symlinkat` |
 | I/O multiplexing | `poll` `ppoll` `select` `pselect6` |
-| Memory | `brk` `mmap` `munmap` `mprotect` (no-op) |
+| Memory | `brk` `mmap` (private, shared, anonymous, file, `MAP_FIXED[_NOREPLACE]`, `MAP_NORESERVE`, `MAP_POPULATE`) `munmap` `mprotect` `mremap` `madvise` (`DONTNEED`, `FREE`) `msync` `mlock` (no-ops) |
 | CPUs | `sched_getaffinity` `sched_setaffinity` `getcpu` |
 | Processes | `fork` `vfork` (as `fork`) `execve` `exit` `exit_group` `wait4` `getpid` `getppid` `gettid` `set_tid_address` `sched_yield` `arch_prctl` `prlimit64` `getrusage` |
 | Groups and IDs | `setpgid` `getpgid` `getpgrp` `setsid` `getsid` `getuid` `geteuid` `getgid` `getegid` `getresuid` `getresgid` `setuid` `setgid` |
@@ -542,12 +560,13 @@ Each of these programs and scripts lives in the root filesystem and runs inside 
 
 | Test | Covers |
 |---|---|
-| `cowtest` | copy-on-write isolation between parent and child, kernel writes into shared pages, 50 forks, shared read-only frames under `brk` |
+| `cowtest` | copy-on-write isolation between parent and child, kernel writes into shared pages, 50 forks, shared read-only frames stay unchanged, `brk` does not grow over a mapping |
 | `oomtest` | fork bomb (stops at the process limit), memory exhaustion via `mmap`, 100 full pipes; the kernel survives and memory is reusable |
 | `sigtest` | handlers, killing a busy loop, `SIGCHLD`, `EINTR` on pipe reads, blocked and ignored signals, FPU state across asynchronous handlers, `alarm` and repeating `setitimer`, catchable `SIGFPE`/`SIGSEGV`/`SIGTRAP` from CPU exceptions, an uncaught `SIGFPE` killing the process |
 | `jobtest` | stop/continue reporting through `wait4`, restart of a stopped `read()`, `SIGKILL` on stopped processes, `SA_RESTART` |
 | `forktest` | `fork`, `execve`, `wait4`, preemptive interleaving of two workers |
 | `proctest` | `prctl` name round-trip, `capget`/`capset` versions and the full capability set, no-new-privs, `PR_SET_PDEATHSIG` delivered to an orphan (via `sigwait`); `/proc` as htop reads it (directory fds with `O_PATH` and `openat`), `/proc/self`, the formats of `stat`, `meminfo`, `loadavg`, `uptime` and `/proc/<pid>/{stat,cmdline,exe}`, `sysinfo`, the CPU list in `/sys`, read-only `/proc` |
+| `vmtest` | demand paging (a 64 MiB mapping costs nothing until touched), `SIGSEGV` on read-only and `PROT_NONE` pages with contents kept, split areas after a partial `munmap`, NX and the JIT pattern (1 GiB `PROT_NONE` reservation, write code, `mprotect` to executable, call it), commit limit and `MAP_NORESERVE`, `mremap` in place and moving, `MADV_DONTNEED`, shared vs. private memory across `fork`, lazy file mappings and `SIGBUS` beyond the end, `MAP_FIXED_NOREPLACE`, stack growth to 4 MiB and overflow beyond 8 MiB |
 | `smptest` | CPU count and affinity (pinning to every CPU, empty masks), parallel speed-up of CPU-bound processes, `fork`/`exit`/`wait` on every CPU at once, 5000 pipe round trips between two CPUs, signals to a process running on another CPU, no lost timer ticks while a program floods the console with palette changes on the timekeeping CPU |
 | `nettest` | TCP to an echo service through QEMU, `ECONNREFUSED`, `listen`/`accept` over loopback with a forked client, EOF after the peer closed, non-blocking `accept` and `connect` with `poll` and `SO_ERROR`, `EINTR` in a blocking `recv`, UDP over loopback, raw ICMP echo to the gateway and over loopback, source address for off-subnet destinations, overflowing message vectors, `AF_INET6` rejected |
 | `sh /etc/test.sh` | files, pipes, `cd`, `mkdir`/`touch`/`rm`, rename cycles via symlinks, file quota |

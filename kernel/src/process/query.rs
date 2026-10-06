@@ -33,6 +33,9 @@ fn system() -> System {
         s.max_pid = table.next_pid;
     }
     s.forks = sched::forks();
+    let (committed, limit) = crate::memory::commit_stats();
+    s.committed = committed * 4096;
+    s.commit_limit = limit * 4096;
     s
 }
 
@@ -54,6 +57,7 @@ fn process(pid: Pid) -> Result<Process, i64> {
         stime: t.stime.load(Ordering::Relaxed),
         start: t.start_ticks,
         pages: info.mem.as_ref().map_or(0, |m| m.pages.load(Ordering::Relaxed)),
+        virt_pages: info.mem.as_ref().map_or(0, |m| m.virt_pages.load(Ordering::Relaxed)),
         nice: info.nice as i64,
         threads: 1,
         cpu: t.last_cpu.load(Ordering::Relaxed) as u64,

@@ -57,6 +57,9 @@ pub struct System {
     /// Processes created since boot.
     pub forks: u64,
     pub max_pid: u64,
+    /// Memory promised to processes and the most that may be (bytes).
+    pub committed: u64,
+    pub commit_limit: u64,
 }
 
 /// Process states, as the letters of /proc/<pid>/stat.
@@ -84,6 +87,8 @@ pub struct Process {
     pub start: u64,
     /// Mapped pages (resident: there is no swapping).
     pub pages: u64,
+    /// Pages of address space (all areas, mapped or not yet).
+    pub virt_pages: u64,
     pub nice: i64,
     pub threads: u64,
     pub cpu: u64,

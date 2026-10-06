@@ -110,16 +110,22 @@ impl Info {
     }
 }
 
+/// What a context switch saves and restores. Kept apart from `Process`, so
+/// switching away from a task never touches the state the task itself may
+/// hold borrowed while it sleeps (its address space during a page fault
+/// that reads a file, for example).
+pub struct CpuState {
+    pub fs_base: u64,
+    pub fpu: Box<FpuState>,
+}
+
 /// State owned by the task itself (see the module comment).
 pub struct Process {
     pub space: Option<AddressSpace>,
-    pub fs_base: u64,
-    pub fpu: Box<FpuState>,
     pub fds: Vec<Option<FdEntry>>,
     pub cwd: String,
     pub brk_start: u64,
     pub brk_end: u64,
-    pub mmap_next: u64,
     /// I/O permission bitmap (0 = allowed) installed in the TSS while
     /// this process runs.
     pub io_bitmap: Option<Box<[u8; gdt::IOMAP_BYTES]>>,
@@ -163,6 +169,7 @@ pub struct Task {
     /// kernel monitor on the boot stack, an AP's idle loop).
     pub kstack: Option<Box<KernelStack>>,
     own: UnsafeCell<Process>,
+    cpu: UnsafeCell<CpuState>,
 }
 
 // Shared across CPUs; the UnsafeCells follow the ownership rules above.
@@ -191,6 +198,7 @@ impl Task {
             kernel_rsp: UnsafeCell::new(kernel_rsp),
             kstack,
             own: UnsafeCell::new(own),
+            cpu: UnsafeCell::new(CpuState { fs_base: 0, fpu: FpuState::initial() }),
         }
     }
 
@@ -228,19 +236,25 @@ impl Task {
     pub unsafe fn own(&self) -> &mut Process {
         unsafe { &mut *self.own.get() }
     }
+
+    /// The saved CPU state.
+    ///
+    /// SAFETY: only the CPU switching to or from the task, or its creator
+    /// before it first runs.
+    #[allow(clippy::mut_from_ref)]
+    pub unsafe fn cpu_state(&self) -> &mut CpuState {
+        unsafe { &mut *self.cpu.get() }
+    }
 }
 
 impl Process {
     pub fn empty() -> Process {
         Process {
             space: None,
-            fs_base: 0,
-            fpu: FpuState::initial(),
             fds: Vec::new(),
             cwd: alloc::string::ToString::to_string("/"),
             brk_start: 0,
             brk_end: 0,
-            mmap_next: 0,
             io_bitmap: None,
             server: None,
         }

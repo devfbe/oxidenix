@@ -40,7 +40,6 @@ pub use task::Process;
 
 pub type Pid = u64;
 
-const MMAP_TOP: u64 = 0x0000_7000_0000_0000;
 pub const TIMER_HZ: u64 = 100;
 
 #[derive(Clone)]
@@ -463,10 +462,10 @@ pub fn dma_map(phys_out: u64) -> SysResult {
     };
     let len = server.dma_pages * 4096;
     let start = with_current(|p| -> Result<u64, i64> {
-        p.mmap_next = p.mmap_next.checked_sub(len).filter(|&a| a > p.brk_end).ok_or(ENOMEM)?;
-        let start = p.mmap_next;
-        let flags = x86_64::structures::paging::PageTableFlags::WRITABLE | x86_64::structures::paging::PageTableFlags::NO_EXECUTE;
-        p.space()?.map_phys(start, phys, server.dma_pages, flags).map_err(|_| ENOMEM)?;
+        let floor = p.brk_end;
+        let space = p.space()?;
+        let start = space.find_free(len, floor).ok_or(ENOMEM)?;
+        space.map_phys(start, phys, server.dma_pages, address_space::Prot::RW).map_err(|_| ENOMEM)?;
         Ok(start)
     })?;
     uaccess::write(phys_out, phys)?;
@@ -512,7 +511,6 @@ fn spawn_with(path: &str, image: loader::Image, server: Option<&Arc<Server>>, ar
     own.fds = vec![Some(FdEntry { file: console, cloexec: false }); 3];
     own.brk_start = image.brk;
     own.brk_end = image.brk;
-    own.mmap_next = MMAP_TOP;
     own.server = server.cloned();
     let t = new_task(pid, info, own, Frame::user_start(image.entry, image.sp))?;
     t.privileged.store(server.is_some(), Ordering::Relaxed);
@@ -545,21 +543,22 @@ pub fn fork(frame: &Frame) -> Result<Pid, i64> {
             ..Info::new(me.pid, i.pgid, i.sid, i.name.clone())
         }
     };
-    let mut fpu = task::FpuState::initial();
-    unsafe { core::arch::asm!("fxsave64 [{}]", in(reg) fpu.0.as_mut_ptr(), options(nostack)) };
     let own = Process {
         space: Some(space),
-        fs_base: FsBase::read().as_u64(),
-        fpu,
         fds: parent.fds.clone(),
         cwd: parent.cwd.clone(),
         brk_start: parent.brk_start,
         brk_end: parent.brk_end,
-        mmap_next: parent.mmap_next,
         io_bitmap: None,
         server: None,
     };
     let child = new_task(pid, info, own, child_frame)?;
+    // The child resumes with the parent's FPU registers and TLS pointer.
+    unsafe {
+        let state = child.cpu_state();
+        state.fs_base = FsBase::read().as_u64();
+        core::arch::asm!("fxsave64 [{}]", in(reg) state.fpu.0.as_mut_ptr(), options(nostack));
+    }
     *child.sig.lock() = me.sig.lock().for_child();
     child.affinity.store(me.affinity.load(Ordering::Relaxed), Ordering::Relaxed);
     slot.insert(child.clone());
@@ -587,7 +586,6 @@ pub fn exec(frame: &mut Frame, path: &str, args: &[String], envs: &[String]) -> 
         p.space = Some(image.space);
         p.brk_start = image.brk;
         p.brk_end = image.brk;
-        p.mmap_next = MMAP_TOP;
         p.io_bitmap = None;
         p.server = None;
         crate::smp::cpu().tables().set_io_bitmap(None);

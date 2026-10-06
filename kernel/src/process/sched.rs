@@ -411,9 +411,9 @@ fn context_switch(next: Arc<Task>) {
 
     let prev = unsafe { (*cs.current.get()).take().expect("no current task") };
     unsafe {
-        let p = prev.own();
-        p.fs_base = FsBase::read().as_u64();
-        fxsave(&mut p.fpu);
+        let saved = prev.cpu_state();
+        saved.fs_base = FsBase::read().as_u64();
+        fxsave(&mut saved.fpu);
         let n = next.own();
         match &n.space {
             Some(space) => space.activate(),
@@ -425,8 +425,9 @@ fn context_switch(next: Arc<Task>) {
             cpu.set_kernel_stack(top);
         }
         cpu.tables().set_io_bitmap(n.io_bitmap.as_deref());
-        FsBase::write(VirtAddr::new(n.fs_base));
-        fxrstor(&n.fpu);
+        let restored = next.cpu_state();
+        FsBase::write(VirtAddr::new(restored.fs_base));
+        fxrstor(&restored.fpu);
     }
     let prev_rsp = prev.kernel_rsp.get();
     let next_rsp = unsafe { *next.kernel_rsp.get() };

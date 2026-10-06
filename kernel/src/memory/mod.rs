@@ -145,6 +145,10 @@ pub fn init(regions: &'static [MemoryRegion], phys_offset: u64) {
     map_heap(HEAP_START, HEAP_INITIAL, &mut frames).expect("cannot map the initial kernel heap");
     unsafe { HEAP.0.lock().init(HEAP_START as *mut u8, HEAP_INITIAL as usize) };
     frames.enable_refcounts();
+    COMMIT_LIMIT.store(
+        frames.free_frames().saturating_sub(frame::KERNEL_RESERVE_FRAMES),
+        core::sync::atomic::Ordering::Relaxed,
+    );
     *FRAMES.lock() = Some(frames);
 }
 
@@ -216,6 +220,32 @@ pub fn map_physical(phys: u64, len: u64, caching: Caching) -> Result<VirtAddr, &
 /// Returns a virtual pointer to a physical address.
 pub fn phys_to_virt(addr: u64) -> *mut u8 {
     (phys_offset() + addr).as_mut_ptr()
+}
+
+/// Pages of memory promised to processes (writable private mappings, see
+/// process::address_space), and the most that may be promised: all usable
+/// frames except the kernel's reserve. Committing up front makes running
+/// out of memory an ENOMEM at mmap/brk/fork time instead of a fault.
+static COMMITTED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static COMMIT_LIMIT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Promises `pages` pages; false (nothing promised) if over the limit.
+pub fn commit(pages: u64) -> bool {
+    use core::sync::atomic::Ordering;
+    let limit = COMMIT_LIMIT.load(Ordering::Relaxed);
+    COMMITTED
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |c| c.checked_add(pages).filter(|&n| n <= limit))
+        .is_ok()
+}
+
+pub fn uncommit(pages: u64) {
+    COMMITTED.fetch_sub(pages, core::sync::atomic::Ordering::Relaxed);
+}
+
+/// (committed, limit) in pages.
+pub fn commit_stats() -> (u64, u64) {
+    use core::sync::atomic::Ordering;
+    (COMMITTED.load(Ordering::Relaxed), COMMIT_LIMIT.load(Ordering::Relaxed))
 }
 
 pub fn with_frames<R>(f: impl FnOnce(&mut PhysFrameAllocator) -> R) -> R {

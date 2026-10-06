@@ -1,11 +1,12 @@
-use super::address_space::AddressSpace;
+use super::address_space::{AddressSpace, Backing, Fault, Prot, PAGE};
 use super::elf::{Elf, PF_W, PF_X, PT_LOAD, PT_PHDR};
 use super::errno::*;
 use alloc::string::String;
 use alloc::vec::Vec;
-use x86_64::structures::paging::PageTableFlags;
 
 const STACK_TOP: u64 = 0x0000_7fff_ffff_f000;
+/// The stack area at start (it holds the arguments); it grows on demand up
+/// to address_space::STACK_LIMIT.
 const STACK_SIZE: u64 = 256 * 1024;
 
 pub struct Image {
@@ -33,16 +34,10 @@ pub fn load(image: &[u8], args: &[String], envs: &[String]) -> Result<Image, i64
     for ph in elf.program_headers() {
         match ph.kind {
             PT_LOAD => {
-                let mut flags = PageTableFlags::empty();
-                if ph.flags & PF_W != 0 {
-                    flags |= PageTableFlags::WRITABLE;
-                }
-                if ph.flags & PF_X == 0 {
-                    flags |= PageTableFlags::NO_EXECUTE;
-                }
-                space.map_zeroed(ph.vaddr, ph.memsz, flags).map_err(|_| ENOMEM)?;
+                let prot = Prot { read: true, write: ph.flags & PF_W != 0, exec: ph.flags & PF_X != 0 };
+                map_segment(&mut space, ph.vaddr, ph.memsz, prot)?;
                 let bytes = elf.segment_bytes(&ph).map_err(|_| ENOEXEC)?;
-                space.write(ph.vaddr, bytes).map_err(|_| ENOEXEC)?;
+                space.write(ph.vaddr, bytes).map_err(fault_errno)?;
                 if ph.offset == 0 {
                     phdr.get_or_insert(ph.vaddr + elf.phoff);
                 }
@@ -68,15 +63,41 @@ pub fn load(image: &[u8], args: &[String], envs: &[String]) -> Result<Image, i64
     Ok(Image { space, entry: elf.entry, sp, brk })
 }
 
+fn fault_errno(f: Fault) -> i64 {
+    match f {
+        Fault::Oom => ENOMEM,
+        _ => ENOEXEC,
+    }
+}
+
+/// An area for a loadable segment. Segments may share a boundary page; that
+/// page gets the union of their rights.
+fn map_segment(space: &mut AddressSpace, vaddr: u64, memsz: u64, prot: Prot) -> Result<(), i64> {
+    let start = vaddr & !(PAGE - 1);
+    let end = page_up(vaddr.checked_add(memsz).ok_or(ENOEXEC)?);
+    let mut at = start;
+    while at < end {
+        match space.vma(at).map(|v| (v.prot, v.end)) {
+            Some((old, _)) => {
+                let union = Prot { read: old.read || prot.read, write: old.write || prot.write, exec: old.exec || prot.exec };
+                space.protect(at, PAGE, union).map_err(fault_errno)?;
+                at += PAGE;
+            }
+            None => {
+                let next = (at..end).step_by(PAGE as usize).find(|&a| space.vma(a).is_some()).unwrap_or(end);
+                space.map(at, next - at, prot, Backing::Anon, false).map_err(fault_errno)?;
+                at = next;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Linux initial stack: argc, argv[], NULL, envp[], NULL, auxv pairs, AT_NULL.
-fn build_stack(space: &mut AddressSpace, args: &[String], envs: &[String], auxv: &[(u64, u64)]) -> Result<u64, &'static str> {
-    space.map_zeroed(
-        STACK_TOP - STACK_SIZE,
-        STACK_SIZE,
-        PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE,
-    )?;
+fn build_stack(space: &mut AddressSpace, args: &[String], envs: &[String], auxv: &[(u64, u64)]) -> Result<u64, Fault> {
+    space.map_stack(STACK_TOP, STACK_SIZE)?;
     let mut sp = STACK_TOP;
-    let mut push_str = |space: &mut AddressSpace, s: &str| -> Result<u64, &'static str> {
+    let mut push_str = |space: &mut AddressSpace, s: &str| -> Result<u64, Fault> {
         sp -= s.len() as u64 + 1;
         space.write(sp, s.as_bytes())?;
         Ok(sp)
@@ -101,7 +122,7 @@ fn build_stack(space: &mut AddressSpace, args: &[String], envs: &[String], auxv:
 
     sp = (sp - words.len() as u64 * 8) & !0xf;
     if sp < STACK_TOP - STACK_SIZE {
-        return Err("arguments too large");
+        return Err(Fault::Oom);
     }
     let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     space.write(sp, &bytes)?;

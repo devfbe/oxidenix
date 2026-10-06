@@ -165,9 +165,13 @@ extern "sysv64" fn dispatch(f: &mut Frame) {
         7 => sys_file::poll(a0, a1, a2 as i32 as i64),
         8 => sys_file::lseek(a0, a1 as i64, a2),
         9 => sys_mem::mmap(a0, a1, a2, a3, a4, a5),
-        10 => Ok(0), // mprotect: pages keep the protection they were mapped with
+        10 => sys_mem::mprotect(a0, a1, a2),
         11 => sys_mem::munmap(a0, a1),
         12 => sys_mem::brk(a0),
+        25 => sys_mem::mremap(a0, a1, a2, a3, a4),
+        28 => sys_mem::madvise(a0, a1, a2),
+        // msync: no page cache to write back; mlock*: nothing is swapped.
+        26 | 149 | 150 | 151 | 152 => Ok(0),
         13 => signal::sigaction(a0, a1, a2),
         14 => signal::sigprocmask(a0, a1, a2),
         15 => signal::sigreturn(f),
