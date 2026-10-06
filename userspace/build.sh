@@ -9,7 +9,7 @@ mkdir -p "$OUT"
 CC=x86_64-unknown-linux-musl-cc
 cmds=""
 for f in "$SRC"/*.c; do
-    cmds+="$CC -static -O2 -o '$OUT/$(basename "$f" .c)' '$f' && "
+    cmds+="$CC -static -O2 -s -o '$OUT/$(basename "$f" .c)' '$f' && "
 done
 cmds+="true"
 if command -v "$CC" >/dev/null; then
@@ -38,5 +38,8 @@ done
 # htop, with the terminfo entry for the console (TERM=linux).
 HTOP="$(nix-build '<nixpkgs>' -A pkgsStatic.htop --no-out-link)"
 install -m 755 "$HTOP/bin/htop" "$OUT/htop"
+# The bootloader reads the initramfs at about 1 MB/s without KVM: no symbols.
+OBJCOPY="$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin/llvm-objcopy"
+[ -x "$OBJCOPY" ] && "$OBJCOPY" --strip-all "$OUT/htop"
 TERMINFO_SRC="$(nix-build '<nixpkgs>' -A pkgsStatic.ncurses --no-out-link)/share/terminfo"
 install -D -m 644 "$TERMINFO_SRC/l/linux" "$ROOT/usr/share/terminfo/l/linux"

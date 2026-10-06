@@ -4,6 +4,38 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
 
+/// A copy of `kernel` without debug information (`<kernel>.boot`), made
+/// with the toolchain's llvm-objcopy; the original if that is unavailable.
+fn strip_debug_info(kernel: &Path) -> PathBuf {
+    let stripped = kernel.with_extension("boot");
+    let objcopy = Command::new("rustc")
+        .args(["--print", "sysroot"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|sysroot| {
+            let host = std::env::consts::ARCH.to_string() + "-unknown-linux-gnu";
+            Path::new(sysroot.trim()).join("lib/rustlib").join(host).join("bin/llvm-objcopy")
+        })
+        .filter(|p| p.exists());
+    let Some(objcopy) = objcopy else {
+        eprintln!("warning: llvm-objcopy not found (rustup component llvm-tools); booting the unstripped kernel");
+        return kernel.to_path_buf();
+    };
+    let ok = Command::new(&objcopy)
+        .arg("--strip-debug")
+        .arg(kernel)
+        .arg(&stripped)
+        .status()
+        .is_ok_and(|s| s.success());
+    if ok {
+        stripped
+    } else {
+        eprintln!("warning: stripping the kernel failed; booting the unstripped kernel");
+        kernel.to_path_buf()
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
@@ -34,8 +66,14 @@ fn main() {
         create_data_disk(&data_disk).expect("Failed to create the data disk");
     }
 
+    // The BIOS bootloader copies the whole ELF through real-mode disk reads
+    // (about 1 MB/s under QEMU), and most of a debug build is DWARF debug
+    // information the kernel never uses. Boot a stripped copy; the full ELF
+    // stays next to it for debuggers.
+    let boot_kernel = strip_debug_info(kernel_path);
+
     println!("Building BIOS disk image...");
-    bootloader::BiosBoot::new(kernel_path)
+    bootloader::BiosBoot::new(&boot_kernel)
         .set_ramdisk(&cpio_path)
         .create_disk_image(&img_path)
         .expect("Failed to create disk image");

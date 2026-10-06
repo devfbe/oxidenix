@@ -206,7 +206,9 @@ About 9,206 lines of Rust in the kernel and 3,067 in the servers, their librarie
 
 ### Boot sequence
 
-1. The **bootloader** (BIOS, `bootloader` 0.11) loads the position-independent kernel ELF into
+1. The **bootloader** (BIOS, `bootloader` 0.11) loads the position-independent kernel ELF (the
+   builder hands it a copy without debug information: 1.5 MB instead of 16 MB, since the BIOS
+   reads at about 1 MB/s under emulation) into
    the upper half (`dynamic_range_start = 0xffff_8000_0000_0000`). It maps all physical
    memory at a dynamic offset, sets up a VESA framebuffer and loads the initramfs as a ramdisk.
 2. `kernel_main` runs these steps in order: framebuffer console and boot logo → GDT/TSS/IDT

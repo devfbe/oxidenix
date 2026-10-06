@@ -9,3 +9,5 @@ opt-level = 2
 
 [profile.release]
 panic = "abort"
+# Servers ship in the initramfs, which the bootloader reads slowly.
+strip = "symbols"
