@@ -1,3 +1,5 @@
+use alloc::vec;
+use alloc::vec::Vec;
 use bootloader_api::info::{MemoryRegion, MemoryRegionKind};
 use x86_64::structures::paging::{FrameAllocator, FrameDeallocator, PhysFrame, Size4KiB};
 use x86_64::{PhysAddr, VirtAddr};
@@ -6,12 +8,16 @@ const FRAME_SIZE: u64 = 4096;
 
 /// Hands out fresh frames from the usable regions first; freed frames go to
 /// a free list whose `next` pointer is stored in the frame itself.
+///
+/// Once `enable_refcounts` ran, every frame carries a reference count so that
+/// copy-on-write pages can be shared; `deallocate_frame` drops one reference.
 pub struct PhysFrameAllocator {
     regions: &'static [MemoryRegion],
     region_idx: usize,
     next: u64,
     free_head: u64,
     phys_offset: VirtAddr,
+    refs: Vec<u32>,
     pub total_frames: u64,
     pub used_frames: u64,
 }
@@ -29,6 +35,7 @@ impl PhysFrameAllocator {
             next: 0,
             free_head: 0,
             phys_offset,
+            refs: Vec::new(),
             total_frames,
             used_frames: 0,
         }
@@ -53,6 +60,34 @@ impl PhysFrameAllocator {
     fn slot(&self, frame_addr: u64) -> *mut u64 {
         (self.phys_offset + frame_addr).as_mut_ptr()
     }
+
+    /// Needs the heap, so it runs after the heap has been mapped. Frames
+    /// handed out before keep a count of 0 and are never freed.
+    pub fn enable_refcounts(&mut self) {
+        let max = self
+            .regions
+            .iter()
+            .filter(|r| r.kind == MemoryRegionKind::Usable)
+            .map(|r| align_down(r.end))
+            .max()
+            .unwrap_or(0);
+        self.refs = vec![0; (max / FRAME_SIZE) as usize];
+    }
+
+    fn index(frame: PhysFrame) -> usize {
+        (frame.start_address().as_u64() / FRAME_SIZE) as usize
+    }
+
+    /// Adds a reference to an allocated frame (it is now shared).
+    pub fn share(&mut self, frame: PhysFrame) {
+        if let Some(r) = self.refs.get_mut(Self::index(frame)) {
+            *r += 1;
+        }
+    }
+
+    pub fn refcount(&self, frame: PhysFrame) -> u32 {
+        self.refs.get(Self::index(frame)).copied().unwrap_or(0)
+    }
 }
 
 unsafe impl FrameAllocator<Size4KiB> for PhysFrameAllocator {
@@ -65,12 +100,24 @@ unsafe impl FrameAllocator<Size4KiB> for PhysFrameAllocator {
             self.next_fresh()?
         };
         self.used_frames += 1;
-        Some(PhysFrame::containing_address(PhysAddr::new(addr)))
+        let frame = PhysFrame::containing_address(PhysAddr::new(addr));
+        if let Some(r) = self.refs.get_mut(Self::index(frame)) {
+            *r = 1;
+        }
+        Some(frame)
     }
 }
 
 impl FrameDeallocator<Size4KiB> for PhysFrameAllocator {
+    /// Drops one reference; the frame is freed when the last one goes.
     unsafe fn deallocate_frame(&mut self, frame: PhysFrame) {
+        if let Some(r) = self.refs.get_mut(Self::index(frame)) {
+            if *r > 1 {
+                *r -= 1;
+                return;
+            }
+            *r = 0;
+        }
         let addr = frame.start_address().as_u64();
         unsafe { self.slot(addr).write(self.free_head) };
         self.free_head = addr;

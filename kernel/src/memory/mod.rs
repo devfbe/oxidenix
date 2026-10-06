@@ -38,6 +38,7 @@ pub fn init(regions: &'static [MemoryRegion], phys_offset: u64) {
             .flush();
     }
     unsafe { HEAP.lock().init(HEAP_START as *mut u8, HEAP_SIZE as usize) };
+    frames.enable_refcounts();
     *FRAMES.lock() = Some(frames);
 }
 

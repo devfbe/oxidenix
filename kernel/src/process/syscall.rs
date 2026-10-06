@@ -188,6 +188,7 @@ extern "sysv64" fn dispatch(f: &mut Frame) {
         89 => sys_file::readlinkat(cwd, a0, a1, a2),
         90 => sys_file::fchmodat(cwd, a0, a1),
         95 => Ok(0o022), // umask
+        98 => uaccess::write(a1, [0u64; 18]).map(|_| 0), // getrusage: no accounting yet
         102 | 104 | 107 | 108 => Ok(0), // getuid/getgid/geteuid/getegid: everything is root
         105 | 106 => Ok(0), // setuid/setgid
         109 => super::setpgid(a0, a1),

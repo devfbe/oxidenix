@@ -9,6 +9,9 @@ use x86_64::VirtAddr;
 
 pub const USER_END: u64 = 0x0000_8000_0000_0000;
 const PAGE: u64 = 4096;
+/// Marks a read-only mapping of a shared frame that becomes private on the
+/// first write (an OS-available page table bit).
+pub const COW: PageTableFlags = PageTableFlags::BIT_9;
 
 /// Own level-4 table: the lower half belongs to the process, the upper
 /// (kernel) half is shared with the kernel address space.
@@ -49,7 +52,12 @@ impl AddressSpace {
         memory::with_frames(|frames| {
             for page in Page::range_inclusive(first, last) {
                 if mapper.translate_page(page).is_ok() {
-                    let merged = merge(leaf_flags(&mapper, page), flags);
+                    let old = leaf_flags(&mapper, page);
+                    let mut merged = merge(old, flags);
+                    // A shared copy-on-write page must stay read-only.
+                    if old.contains(COW) {
+                        merged.remove(PageTableFlags::WRITABLE);
+                    }
                     unsafe { mapper.update_flags(page, merged) }
                         .map_err(|_| "update_flags failed")?
                         .ignore();
@@ -101,29 +109,31 @@ impl AddressSpace {
         Ok(())
     }
 
-    /// Deep copy of all user pages (for fork).
+    /// Copy-on-write clone for fork: both spaces share every user frame;
+    /// writable pages become read-only COW pages in both of them.
     pub fn clone_user(&self) -> Result<AddressSpace, &'static str> {
         let new = AddressSpace::new().ok_or("out of memory")?;
         let mut mapper = new.mapper();
         let parent = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
         // Return errors only outside of with_frames: dropping `new` needs the lock.
-        memory::with_frames(|frames| {
+        let result = memory::with_frames(|frames| {
             let l4 = table_at(self.l4);
             for i4 in 0..256 {
                 for (i3, l3e) in children(&l4[i4]) {
                     for (i2, l2e) in children(l3e) {
-                        for (i1, leaf) in children(l2e) {
+                        let l1 = table_at(PhysFrame::containing_address(l2e.addr()));
+                        for (i1, leaf) in l1.iter_mut().enumerate().filter(|(_, e)| !e.is_unused()) {
                             let va = (i4 as u64) << 39 | (i3 as u64) << 30 | (i2 as u64) << 21 | (i1 as u64) << 12;
-                            let frame = frames.allocate_frame().ok_or("out of memory")?;
-                            unsafe {
-                                core::ptr::copy_nonoverlapping(
-                                    memory::phys_to_virt(leaf.addr().as_u64()),
-                                    memory::phys_to_virt(frame.start_address().as_u64()),
-                                    PAGE as usize,
-                                )
-                            };
+                            let mut flags = leaf.flags();
+                            if flags.contains(PageTableFlags::WRITABLE) {
+                                flags.remove(PageTableFlags::WRITABLE);
+                                flags.insert(COW);
+                                leaf.set_flags(flags);
+                            }
+                            let frame = PhysFrame::containing_address(leaf.addr());
+                            frames.share(frame);
                             let page = Page::<Size4KiB>::containing_address(VirtAddr::new(va));
-                            unsafe { mapper.map_to_with_table_flags(page, frame, leaf.flags(), parent, frames) }
+                            unsafe { mapper.map_to_with_table_flags(page, frame, flags, parent, frames) }
                                 .map_err(|_| "map_to failed")?
                                 .ignore();
                         }
@@ -131,8 +141,12 @@ impl AddressSpace {
                 }
             }
             Ok(())
-        })?;
-        Ok(new)
+        });
+        // The parent's pages just lost their write permission.
+        if Cr3::read().0 == self.l4 {
+            x86_64::instructions::tlb::flush_all();
+        }
+        result.map(|_| new)
     }
 
     pub fn activate(&self) {
@@ -201,8 +215,60 @@ fn merge(a: PageTableFlags, b: PageTableFlags) -> PageTableFlags {
     f
 }
 
+/// The level-1 entry for `va`, if all upper levels are present.
+fn leaf_entry(l4: PhysFrame, va: u64) -> Option<&'static mut PageTableEntry> {
+    let v = VirtAddr::new(va);
+    let mut table = table_at(l4);
+    for index in [v.p4_index(), v.p3_index(), v.p2_index()] {
+        let e = &table[index];
+        if e.is_unused() || e.flags().contains(PageTableFlags::HUGE_PAGE) {
+            return None;
+        }
+        table = table_at(PhysFrame::containing_address(e.addr()));
+    }
+    let e = &mut table[v.p1_index()];
+    (!e.is_unused()).then_some(e)
+}
+
+/// Makes the copy-on-write page at `va` in the active address space
+/// privately writable. Returns false if it is not a COW page or memory ran out.
+pub fn resolve_cow(va: u64) -> bool {
+    if va >= USER_END {
+        return false;
+    }
+    let Some(entry) = leaf_entry(Cr3::read().0, va) else { return false };
+    let flags = entry.flags();
+    if !flags.contains(COW) {
+        return false;
+    }
+    let writable = (flags - COW) | PageTableFlags::WRITABLE;
+    let old = PhysFrame::containing_address(entry.addr());
+    let done = memory::with_frames(|frames| {
+        if frames.refcount(old) <= 1 {
+            entry.set_flags(writable);
+            return true;
+        }
+        let Some(new) = frames.allocate_frame() else { return false };
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                memory::phys_to_virt(old.start_address().as_u64()),
+                memory::phys_to_virt(new.start_address().as_u64()),
+                PAGE as usize,
+            );
+            entry.set_addr(new.start_address(), writable);
+            frames.deallocate_frame(old);
+        }
+        true
+    });
+    if done {
+        x86_64::instructions::tlb::flush(VirtAddr::new(va));
+    }
+    done
+}
+
 /// Checks in the active address space whether [addr, addr+len) is fully
-/// mapped for user space.
+/// mapped for user space. For writes, copy-on-write pages are made
+/// private first, since kernel writes would not fault on them.
 pub fn user_range_ok(addr: u64, len: u64, write: bool) -> bool {
     let Some(end) = addr.checked_add(len) else { return false };
     if end > USER_END {
@@ -211,12 +277,15 @@ pub fn user_range_ok(addr: u64, len: u64, write: bool) -> bool {
     if len == 0 {
         return true;
     }
-    let mut need = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
-    if write {
-        need |= PageTableFlags::WRITABLE;
-    }
+    let need = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
     let mapper = unsafe { memory::active_page_table() };
     let first = Page::<Size4KiB>::containing_address(VirtAddr::new(addr));
     let last = Page::containing_address(VirtAddr::new(end - 1));
-    Page::range_inclusive(first, last).all(|p| leaf_flags(&mapper, p).contains(need))
+    Page::range_inclusive(first, last).all(|p| {
+        let flags = leaf_flags(&mapper, p);
+        if !flags.contains(need) {
+            return false;
+        }
+        !write || flags.contains(PageTableFlags::WRITABLE) || resolve_cow(p.start_address().as_u64())
+    })
 }

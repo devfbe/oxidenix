@@ -19,6 +19,10 @@ pub extern "x86-interrupt" fn page_fault_handler(
     error_code: PageFaultErrorCode,
 ) {
     use x86_64::registers::control::Cr2;
+    let write_to_present = PageFaultErrorCode::CAUSED_BY_WRITE | PageFaultErrorCode::PROTECTION_VIOLATION;
+    if error_code.contains(write_to_present) && crate::process::address_space::resolve_cow(Cr2::read_raw()) {
+        return;
+    }
     if from_user(&stack_frame) {
         crate::printkln!(
             "[kernel] segmentation fault at {:#x} (rip {:#x}), process killed",

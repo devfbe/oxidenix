@@ -4,6 +4,8 @@ resolver = "2"
 
 [profile.dev]
 panic = "abort"
+# Unoptimized page-table code made fork/exec ~10x slower; keep debug info.
+opt-level = 2
 
 [profile.release]
 panic = "abort"
