@@ -1,7 +1,8 @@
-# rust-kernel
+# oxidenix
 
 Bare-metal x86_64 kernel in Rust (bootloader 0.11, BIOS) that boots in QEMU and
-runs static musl binaries (BusyBox) via a Linux-compatible syscall ABI.
+runs static musl binaries (Bash, BusyBox) via a Linux-compatible syscall ABI.
+An AI research project; see README.md.
 
 ## Language
 
@@ -23,3 +24,4 @@ runs static musl binaries (BusyBox) via a Linux-compatible syscall ABI.
 
 - Commit every finished, tested step without asking and continue directly
   with the next step.
+- After every commit, push to GitHub (`origin`, account devfbe).

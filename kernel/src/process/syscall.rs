@@ -260,7 +260,7 @@ fn arch_prctl(code: u64, addr: u64) -> SysResult {
 
 fn uname(buf: u64) -> SysResult {
     let mut uts = [0u8; 6 * 65];
-    for (i, field) in ["Linux", "rust-kernel", "6.0.0-rust", "#1", "x86_64", "(none)"].iter().enumerate() {
+    for (i, field) in ["Linux", "oxidenix", "6.0.0-oxidenix", "#1", "x86_64", "(none)"].iter().enumerate() {
         uts[i * 65..i * 65 + field.len()].copy_from_slice(field.as_bytes());
     }
     uaccess::write(buf, uts)?;

@@ -1,10 +1,10 @@
 [package]
-name = "kernel"
+name = "oxidenix"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "kernel"
+name = "oxidenix"
 test = false
 bench = false
 

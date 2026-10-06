@@ -241,21 +241,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kernel"
-version = "0.1.0"
-dependencies = [
- "bootloader_api",
- "heapless",
- "lazy_static",
- "linked_list_allocator",
- "noto-sans-mono-bitmap",
- "pc-keyboard",
- "pic8259",
- "spin",
- "x86_64 0.15.5",
-]
-
-[[package]]
 name = "lazy_static"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -336,6 +321,21 @@ name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
+
+[[package]]
+name = "oxidenix"
+version = "0.1.0"
+dependencies = [
+ "bootloader_api",
+ "heapless",
+ "lazy_static",
+ "linked_list_allocator",
+ "noto-sans-mono-bitmap",
+ "pc-keyboard",
+ "pic8259",
+ "spin",
+ "x86_64 0.15.5",
+]
 
 [[package]]
 name = "pc-keyboard"
