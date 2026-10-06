@@ -18,6 +18,8 @@ An AI research project; see README.md.
 - `cd kernel && cargo run` builds the rootfs, the disk image and starts QEMU
   (extra arguments after `--` are passed to QEMU).
 - `cargo` lives in `~/.cargo/bin`.
+- `cd kernel && OXIDENIX_TEST=1 cargo run` runs all self-tests (`/etc/runtests.sh`) and
+  exits QEMU with 1 on success, 3 on failure; CI runs the same on every push.
 - QEMU must always run with a visible window; never use `-display none`.
 
 ## Workflow

@@ -206,6 +206,7 @@ extern "sysv64" fn dispatch(f: &mut Frame) {
         137 => sys_file::statfs(a0, a1),
         138 => sys_file::fstatfs(a0, a1),
         158 => arch_prctl(a0, a1),
+        169 => reboot(a0, a1, a2),
         173 => super::ioperm(a0, a1, a2),
         1000 => super::ipc::register(a0, a1, a2),
         1001 => super::ipc::receive(a0, a1, a2),
@@ -239,6 +240,23 @@ extern "sysv64" fn dispatch(f: &mut Frame) {
     };
     f.rax = result.unwrap_or_else(|e| -e) as u64;
     super::signal::deliver(f, Some(nr));
+}
+
+/// reboot(2): power off (QEMU exits) or restart the machine.
+fn reboot(magic: u64, magic2: u64, cmd: u64) -> SysResult {
+    const MAGIC: u64 = 0xfee1_dead;
+    const MAGIC2: [u64; 4] = [0x2812_1969, 0x0512_1996, 0x1604_1998, 0x2011_2000];
+    const RESTART: u64 = 0x0123_4567;
+    const HALT: u64 = 0xcdef_0123;
+    const POWER_OFF: u64 = 0x4321_fedc;
+    if magic != MAGIC || !MAGIC2.contains(&magic2) {
+        return Err(EINVAL);
+    }
+    match cmd {
+        POWER_OFF | HALT => crate::power_off(0),
+        RESTART => crate::restart(),
+        _ => Err(EINVAL),
+    }
 }
 
 /// Everything runs as root: real, effective and saved IDs are all 0.

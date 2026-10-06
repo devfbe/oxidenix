@@ -157,21 +157,28 @@ fn cmd_run(args: &Vec<&str, 8>) {
 }
 
 /// Starts `args[0]` (from /bin unless it contains a '/') in the foreground
-/// and waits for it.
-pub fn run_program(args: &[&str]) {
+/// and waits for it; returns how it ended.
+pub fn run_program(args: &[&str]) -> Option<crate::process::WaitStatus> {
     let name = args[0];
     let pid = match crate::process::spawn(name, args) {
         Ok(pid) => pid,
         Err(errno) => {
             crate::printkln!("run: cannot start {} (errno {})", name, errno);
-            return;
+            return None;
         }
     };
     use crate::process::WaitStatus;
+    let mut result = None;
     loop {
         match crate::process::wait_for(pid).map(crate::process::decode_status) {
-            Ok(WaitStatus::Exited(code)) => crate::printkln!("[{} (pid {}) exited with code {}]", name, pid, code),
-            Ok(WaitStatus::Killed(sig)) => crate::printkln!("[{} (pid {}) killed by signal {}]", name, pid, sig),
+            Ok(WaitStatus::Exited(code)) => {
+                crate::printkln!("[{} (pid {}) exited with code {}]", name, pid, code);
+                result = Some(WaitStatus::Exited(code));
+            }
+            Ok(WaitStatus::Killed(sig)) => {
+                crate::printkln!("[{} (pid {}) killed by signal {}]", name, pid, sig);
+                result = Some(WaitStatus::Killed(sig));
+            }
             Ok(WaitStatus::Stopped(sig)) => {
                 // The monitor has no job control: resume the program in the foreground.
                 crate::printkln!("[{} (pid {}) stopped by signal {}; the monitor resumes it]", name, pid, sig);
@@ -184,6 +191,7 @@ pub fn run_program(args: &[&str]) {
         break;
     }
     crate::process::reap_orphans();
+    result
 }
 
 

@@ -5,6 +5,14 @@ pub mod commands;
 use heapless::{String, Vec};
 
 pub fn run() -> ! {
+    // Test mode: the builder links /etc/autorun to the test script; its exit
+    // status becomes QEMU's (1 = success, 3 = failure).
+    if crate::fs::resolve("/", "/etc/autorun", true).is_ok() {
+        crate::printkln!("[autorun] running /etc/autorun");
+        let ok = matches!(commands::run_program(&["sh", "/etc/autorun"]), Some(crate::process::WaitStatus::Exited(0)));
+        crate::printkln!("[autorun] {}", if ok { "success" } else { "failure" });
+        crate::power_off(if ok { 0 } else { 1 });
+    }
     let shell = if crate::fs::resolve("/", "/bin/bash", true).is_ok() { "bash" } else { "sh" };
     crate::printkln!("\x1b[1;33m  oxidenix\x1b[0m - a Unix-like kernel in Rust, built with AI");
     crate::printkln!("  starting /bin/{} ('exit' returns to the kernel monitor)\n", shell);

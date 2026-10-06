@@ -8,6 +8,7 @@ It boots in QEMU and runs an unmodified, statically linked **GNU Bash 5.3** and 
 on top of a Linux-compatible system call interface. It is moving towards a **microkernel**: the
 disk driver and the ext2 filesystem already run as a user-space server.
 
+[![test](https://github.com/devfbe/oxidenix/actions/workflows/test.yml/badge.svg)](https://github.com/devfbe/oxidenix/actions/workflows/test.yml)
 ![Rust](https://img.shields.io/badge/language-Rust%20(nightly)-orange?logo=rust)
 ![Arch](https://img.shields.io/badge/arch-x86__64-blue)
 ![Boot](https://img.shields.io/badge/boot-BIOS%20via%20bootloader%200.11-lightgrey)
@@ -362,11 +363,17 @@ Linux x86_64 numbers, grouped by area (about 90 in total):
 | Signals | `rt_sigaction` `rt_sigprocmask` `rt_sigreturn` `kill` `tkill` `tgkill` `pause` `sigaltstack` |
 | Filesystems | `statfs` `fstatfs` `sync` `fsync` `fdatasync` |
 | Servers | `ioperm` (privileged servers only), `ipc_register` (1000), `ipc_receive` (1001), `ipc_reply` (1002) |
+| Power | `reboot` (power off ends QEMU, restart resets the machine) |
 | Time and misc | `nanosleep` `clock_gettime` (`CLOCK_REALTIME` from the RTC) `uname` `getrandom` `socket` (fails with `EAFNOSUPPORT`) |
 
 Everything runs as root. Unknown syscalls print a kernel message and return `ENOSYS`.
 
 ## Testing
+
+`OXIDENIX_TEST=1 cargo run` (in `kernel/`) boots straight into `/etc/runtests.sh`, which runs
+every self-test below. The kernel mirrors its console to the serial port and powers off when
+the script ends; QEMU's exit status is 1 if everything passed and 3 otherwise. GitHub Actions
+does exactly this on every push (without a display), then checks the ext2 image with `e2fsck`.
 
 Each of these programs and scripts lives in the root filesystem and runs inside oxidenix:
 

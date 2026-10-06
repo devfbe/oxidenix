@@ -16,8 +16,14 @@ fn main() {
     let rootfs = kernel_path.with_extension("rootfs");
     let cpio_path = kernel_path.with_extension("cpio");
 
+    // OXIDENIX_TEST=1: boot straight into the self-tests and let their result
+    // become QEMU's exit status (1 = success, 3 = failure).
+    let test_mode = std::env::var_os("OXIDENIX_TEST").is_some();
     println!("Building root filesystem...");
     build_rootfs(&rootfs).expect("Failed to build root filesystem");
+    if test_mode {
+        std::os::unix::fs::symlink("runtests.sh", rootfs.join("etc/autorun")).expect("Failed to link /etc/autorun");
+    }
     let mut cpio = io::BufWriter::new(fs::File::create(&cpio_path).expect("Failed to create cpio"));
     write_cpio(&rootfs, &mut cpio).expect("Failed to write cpio");
     drop(cpio);
@@ -35,7 +41,16 @@ fn main() {
         .expect("Failed to create disk image");
 
     println!("Starting QEMU with {}", img_path.display());
-    let exit_status = Command::new("qemu-system-x86_64")
+    let mut qemu = Command::new("qemu-system-x86_64");
+    if test_mode {
+        // The serial port carries the kernel's output to stdout. CI has no
+        // display; locally the window stays.
+        qemu.args(["-serial", "stdio", "-no-reboot"]);
+        if std::env::var_os("CI").is_some() {
+            qemu.args(["-display", "none"]);
+        }
+    }
+    let exit_status = qemu
         .args([
             "-drive",
             &format!("format=raw,file={},if=ide,index=0", img_path.display()),
@@ -45,10 +60,13 @@ fn main() {
             "isa-debug-exit,iobase=0xf4,iosize=0x04",
             "-m",
             "256M",
-            // Scale the guest picture with the window (resize or fullscreen).
-            "-display",
-            "gtk,zoom-to-fit=on",
         ])
+        .args(if std::env::var_os("CI").is_some() && test_mode {
+            &[][..]
+        } else {
+            // Scale the guest picture with the window (resize or fullscreen).
+            &["-display", "gtk,zoom-to-fit=on"][..]
+        })
         .args(&args[2..])
         .status()
         .expect("Failed to run QEMU");

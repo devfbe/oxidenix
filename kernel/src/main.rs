@@ -26,6 +26,7 @@ pub static BOOTLOADER_CONFIG: BootloaderConfig = {
 entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
+    drivers::serial::init();
     if let Some(fb) = boot_info.framebuffer.as_mut() {
         drivers::console::init(fb);
     }
@@ -60,6 +61,26 @@ fn start_servers() {
             None => printkln!("[boot] diskfs (pid {}) did not register; /data is not mounted", pid),
         },
         Err(e) => printkln!("[boot] cannot start /sbin/diskfs (errno {})", e),
+    }
+}
+
+/// Leaves QEMU through its isa-debug-exit device; the exit status of QEMU
+/// becomes `code * 2 + 1`. On real hardware this just halts.
+pub fn power_off(code: u32) -> ! {
+    printkln!("[kernel] power off");
+    unsafe { x86_64::instructions::port::Port::<u32>::new(0xf4).write(code) };
+    loop {
+        x86_64::instructions::interrupts::disable();
+        x86_64::instructions::hlt();
+    }
+}
+
+/// Resets the machine through the keyboard controller.
+pub fn restart() -> ! {
+    printkln!("[kernel] restart");
+    unsafe { x86_64::instructions::port::Port::<u8>::new(0x64).write(0xfe) };
+    loop {
+        x86_64::instructions::hlt();
     }
 }
 

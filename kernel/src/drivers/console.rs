@@ -477,6 +477,7 @@ macro_rules! printkln {
 
 pub fn _print(args: fmt::Arguments) {
     use core::fmt::Write;
+    super::serial::write_fmt(args);
     without_interrupts(|| {
         if let Some(c) = CONSOLE.lock().as_mut() {
             let _ = c.write_fmt(args);
@@ -485,6 +486,7 @@ pub fn _print(args: fmt::Arguments) {
 }
 
 pub fn write_bytes(bytes: &[u8]) {
+    super::serial::write_bytes(bytes);
     without_interrupts(|| {
         if let Some(c) = CONSOLE.lock().as_mut() {
             c.write_bytes(bytes);
