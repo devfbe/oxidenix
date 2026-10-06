@@ -3,8 +3,7 @@
 use super::errno::*;
 use super::{uaccess, with_current, FdEntry};
 use crate::fs::file::*;
-use crate::fs::{self, Data, Inode, Node, S_IFDIR, S_IFLNK, S_IFREG};
-use alloc::collections::BTreeMap;
+use crate::fs::{self, Inode, NewNode};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
@@ -84,9 +83,7 @@ pub fn openat(dirfd: u64, path: u64, flags: u64, mode: u64) -> SysResult {
         Ok(inode) => inode,
         Err(ENOENT) if flags & O_CREAT != 0 => {
             let (dir, name) = fs::resolve_parent(&base, &path)?;
-            let inode = Inode::new(Node::File(Data::empty()), mode as u32 & !UMASK)?;
-            dir.insert(&name, inode.clone())?;
-            inode
+            dir.create(&name, NewNode::File, mode as u32 & !UMASK)?
         }
         Err(e) => return Err(e),
     };
@@ -97,10 +94,8 @@ pub fn openat(dirfd: u64, path: u64, flags: u64, mode: u64) -> SysResult {
     if flags & O_DIRECTORY != 0 && !inode.is_dir() {
         return Err(ENOTDIR);
     }
-    if flags & O_TRUNC != 0 && writable {
-        if let Node::File(data) = &mut *inode.node.lock() {
-            *data = Data::empty();
-        }
+    if flags & O_TRUNC != 0 && writable && inode.file_type() == fs::S_IFREG {
+        inode.truncate(0)?;
     }
     let abs = fs::join(&fs::normalize(&base, &path));
     let f = OpenFile::new(Kind::Inode(inode), flags, Some(abs));
@@ -113,11 +108,15 @@ pub fn close(fd: u64) -> SysResult {
     old.ok_or(EBADF).map(|_| 0)
 }
 
-fn write_stat(buf: u64, ino: u64, mode: u32, size: u64) -> SysResult {
+fn write_stat(buf: u64, ino: u64, mode: u32, size: u64, extra: (u64, u64, u64, u64)) -> SysResult {
+    let (nlink, atime, mtime, ctime) = extra;
     let mut st = [0u8; 144];
     st[8..16].copy_from_slice(&ino.to_le_bytes());
-    st[16..24].copy_from_slice(&1u64.to_le_bytes()); // nlink
+    st[16..24].copy_from_slice(&nlink.to_le_bytes());
     st[24..28].copy_from_slice(&mode.to_le_bytes());
+    st[72..80].copy_from_slice(&atime.to_le_bytes());
+    st[88..96].copy_from_slice(&mtime.to_le_bytes());
+    st[104..112].copy_from_slice(&ctime.to_le_bytes());
     st[48..56].copy_from_slice(&size.to_le_bytes());
     st[56..64].copy_from_slice(&4096u64.to_le_bytes()); // blksize
     st[64..72].copy_from_slice(&size.div_ceil(512).to_le_bytes()); // blocks
@@ -126,14 +125,14 @@ fn write_stat(buf: u64, ino: u64, mode: u32, size: u64) -> SysResult {
 }
 
 fn stat_inode(inode: &Inode, buf: u64) -> SysResult {
-    write_stat(buf, inode.ino, inode.mode(), inode.size())
+    write_stat(buf, inode.ino, inode.mode(), inode.size(), inode.stat_extra())
 }
 
 pub fn fstat(fd: u64, buf: u64) -> SysResult {
     let f = file(fd)?;
     match f.inode() {
         Some(inode) => stat_inode(inode, buf),
-        None => write_stat(buf, Arc::as_ptr(&f) as u64, S_IFIFO | 0o600, 0),
+        None => write_stat(buf, Arc::as_ptr(&f) as u64, S_IFIFO | 0o600, 0, (1, 0, 0, 0)),
     }
 }
 
@@ -167,24 +166,13 @@ pub fn lseek(fd: u64, offset: i64, whence: u64) -> SysResult {
 pub fn getdents64(fd: u64, buf: u64, len: u64) -> SysResult {
     let f = file(fd)?;
     let inode = f.inode().ok_or(ENOTDIR)?;
-    let entries: Vec<(String, u64, u8)> = match &*inode.node.lock() {
-        Node::Dir(map) => {
-            let mut v = vec![(".".into(), inode.ino, 4u8), ("..".into(), inode.ino, 4u8)];
-            v.extend(map.iter().map(|(name, child)| {
-                let dtype = match child.file_type() {
-                    S_IFDIR => 4,
-                    S_IFREG => 8,
-                    S_IFLNK => 10,
-                    _ => 2,
-                };
-                (name.clone(), child.ino, dtype)
-            }));
-            v
-        }
-        _ => return Err(ENOTDIR),
-    };
-    let out = uaccess::slice_mut(buf, len)?;
+    let mut snapshot = f.dir_snapshot.lock();
     let mut off = f.offset.lock();
+    if *off == 0 || snapshot.is_none() {
+        *snapshot = Some(inode.list()?);
+    }
+    let entries = snapshot.as_ref().expect("taken above");
+    let out = uaccess::slice_mut(buf, len)?;
     let mut pos = 0;
     while let Some((name, ino, dtype)) = entries.get(*off as usize) {
         let reclen = (19 + name.len() + 1).next_multiple_of(8);
@@ -450,91 +438,44 @@ pub fn fchdir(fd: u64) -> SysResult {
     Ok(0)
 }
 
-fn create_at(dirfd: u64, path: u64, node: Node, perm: u32) -> SysResult {
+fn create_at(dirfd: u64, path: u64, kind: NewNode, perm: u32) -> SysResult {
     let path = uaccess::read_cstr(path)?;
     let base = base_dir(dirfd, &path)?;
     let (dir, name) = fs::resolve_parent(&base, &path)?;
-    dir.insert(&name, Inode::new(node, perm)?)?;
+    dir.create(&name, kind, perm)?;
     Ok(0)
 }
 
 pub fn mkdirat(dirfd: u64, path: u64, mode: u64) -> SysResult {
-    create_at(dirfd, path, Node::Dir(BTreeMap::new()), mode as u32 & !UMASK)
+    create_at(dirfd, path, NewNode::Dir, mode as u32 & !UMASK)
 }
 
 pub fn symlinkat(target: u64, dirfd: u64, path: u64) -> SysResult {
     let target = uaccess::read_cstr(target)?;
-    create_at(dirfd, path, Node::Symlink(target), 0o777)
+    create_at(dirfd, path, NewNode::Symlink(target), 0o777)
 }
 
 pub fn unlinkat(dirfd: u64, path: u64, flags: u64) -> SysResult {
     let path = uaccess::read_cstr(path)?;
     let base = base_dir(dirfd, &path)?;
     let (dir, name) = fs::resolve_parent(&base, &path)?;
-    let child = dir.child(&name)?;
-    match (&*child.node.lock(), flags & AT_REMOVEDIR != 0) {
-        (Node::Dir(m), true) if !m.is_empty() => return Err(ENOTEMPTY),
-        (Node::Dir(_), true) => {}
-        (Node::Dir(_), false) => return Err(EISDIR),
-        (_, true) => return Err(ENOTDIR),
-        (_, false) => {}
-    }
-    if let Node::Dir(m) = &mut *dir.node.lock() {
-        m.remove(&name);
-    }
+    dir.unlink(&name, flags & AT_REMOVEDIR != 0)?;
     Ok(0)
 }
 
 pub fn renameat(olddirfd: u64, oldpath: u64, newdirfd: u64, newpath: u64) -> SysResult {
     let oldpath = uaccess::read_cstr(oldpath)?;
     let newpath = uaccess::read_cstr(newpath)?;
-    let (obase, nbase) = (base_dir(olddirfd, &oldpath)?, base_dir(newdirfd, &newpath)?);
-    let (odir, oname) = fs::resolve_parent(&obase, &oldpath)?;
-    let (ndir, nname) = fs::resolve_parent(&nbase, &newpath)?;
-    let node = odir.child(&oname)?;
-    // Moving a directory below itself would detach it in a reference cycle.
-    if fs::contains(&node, &ndir) {
-        return Err(EINVAL);
-    }
-    if let Ok(existing) = ndir.child(&nname) {
-        if Arc::ptr_eq(&existing, &node) {
-            return Ok(0);
-        }
-        // Replacing only ever drops a file or an empty directory, never a
-        // whole subtree (whose recursive drop could overflow the stack).
-        // Read both properties first: the inode locks are not reentrant.
-        let existing_dir = match &*existing.node.lock() {
-            Node::Dir(m) => Some(m.is_empty()),
-            _ => None,
-        };
-        match (existing_dir, node.is_dir()) {
-            (Some(false), true) => return Err(ENOTEMPTY),
-            (Some(_), false) => return Err(EISDIR),
-            (None, true) => return Err(ENOTDIR),
-            _ => {}
-        }
-    }
-    if nname.len() > fs::NAME_MAX {
-        return Err(ENAMETOOLONG);
-    }
-    if let Node::Dir(m) = &mut *odir.node.lock() {
-        m.remove(&oname);
-    }
-    let replaced = match &mut *ndir.node.lock() {
-        Node::Dir(m) => m.insert(nname, node),
-        _ => None,
-    };
-    drop(replaced);
+    let (odir, oname) = fs::resolve_parent(&base_dir(olddirfd, &oldpath)?, &oldpath)?;
+    let (ndir, nname) = fs::resolve_parent(&base_dir(newdirfd, &newpath)?, &newpath)?;
+    fs::rename(&odir, &oname, &ndir, &nname)?;
     Ok(0)
 }
 
 pub fn readlinkat(dirfd: u64, path: u64, buf: u64, size: u64) -> SysResult {
     let path = uaccess::read_cstr(path)?;
     let (inode, _) = resolve_at(dirfd, &path, false)?;
-    let target = match &*inode.node.lock() {
-        Node::Symlink(t) => t.clone(),
-        _ => return Err(EINVAL),
-    };
+    let target = inode.readlink()?;
     let n = target.len().min(size as usize);
     uaccess::slice_mut(buf, n as u64)?.copy_from_slice(&target.as_bytes()[..n]);
     Ok(n as i64)
@@ -543,18 +484,14 @@ pub fn readlinkat(dirfd: u64, path: u64, buf: u64, size: u64) -> SysResult {
 pub fn fchmodat(dirfd: u64, path: u64, mode: u64) -> SysResult {
     let path = uaccess::read_cstr(path)?;
     let (inode, _) = resolve_at(dirfd, &path, true)?;
-    *inode.perm.lock() = mode as u32 & 0o7777;
+    inode.set_perm(mode as u32)?;
     Ok(0)
 }
 
 pub fn ftruncate(fd: u64, len: u64) -> SysResult {
     let f = file(fd)?;
-    let inode = f.inode().ok_or(EINVAL)?;
-    let result = match &mut *inode.node.lock() {
-        Node::File(data) => data.resize(usize::try_from(len).map_err(|_| EFBIG)?).map(|_| 0),
-        _ => Err(EINVAL),
-    };
-    result
+    f.inode().ok_or(EINVAL)?.truncate(len)?;
+    Ok(0)
 }
 
 pub fn sendfile(out_fd: u64, in_fd: u64, offset: u64, count: u64) -> SysResult {
@@ -588,4 +525,35 @@ pub fn utimensat(dirfd: u64, path: u64, flags: u64) -> SysResult {
     }
     let path = uaccess::read_cstr(path)?;
     resolve_at(dirfd, &path, flags & AT_SYMLINK_NOFOLLOW == 0).map(|_| 0)
+}
+
+/// statfs/fstatfs: the ext2 disk reports its real usage, everything else
+/// the in-memory filesystem and its quota.
+fn write_statfs(inode: &Inode, buf: u64) -> SysResult {
+    const EXT2_MAGIC: u64 = 0xef53;
+    const TMPFS_MAGIC: u64 = 0x0102_1994;
+    let (kind, bsize, blocks, free, files, ffree) = match inode.filesystem() {
+        Some(fs) => {
+            let (bs, blocks, free, inodes, free_inodes) = fs.usage();
+            (EXT2_MAGIC, bs, blocks, free, inodes, free_inodes)
+        }
+        None => {
+            let (used, quota) = fs::quota_usage();
+            (TMPFS_MAGIC, 4096, quota as u64 / 4096, (quota - used) as u64 / 4096, 0, 0)
+        }
+    };
+    let words: [u64; 15] = [kind, bsize, blocks, free, free, files, ffree, 0, fs::NAME_MAX as u64, bsize, 0, 0, 0, 0, 0];
+    uaccess::write(buf, words)?;
+    Ok(0)
+}
+
+pub fn statfs(path: u64, buf: u64) -> SysResult {
+    let path = uaccess::read_cstr(path)?;
+    let (inode, _) = resolve_at(AT_FDCWD as u64, &path, true)?;
+    write_statfs(&inode, buf)
+}
+
+pub fn fstatfs(fd: u64, buf: u64) -> SysResult {
+    let f = file(fd)?;
+    write_statfs(f.inode().ok_or(EINVAL)?, buf)
 }

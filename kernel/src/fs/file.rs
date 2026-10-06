@@ -1,9 +1,10 @@
-use super::{Device, Inode, Node};
+use super::{Device, Inode};
 use crate::process::errno::*;
 use crate::process::signal::interrupted;
 use crate::process::{sleep_on, wakeup};
 use alloc::collections::VecDeque;
 use alloc::string::String;
+use alloc::vec::Vec;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use spin::Mutex;
@@ -66,6 +67,10 @@ pub struct OpenFile {
     pub flags: AtomicU32,
     /// Absolute path if opened by path (for *at syscalls).
     pub path: Option<String>,
+    /// Directory listing taken when reading starts at offset 0; getdents
+    /// continues from it, so entries removed meanwhile (rm -r) never shift
+    /// the position and skip others.
+    pub dir_snapshot: Mutex<Option<Vec<(String, u64, u8)>>>,
 }
 
 impl OpenFile {
@@ -75,6 +80,7 @@ impl OpenFile {
             offset: Mutex::new(0),
             flags: AtomicU32::new(flags & !O_CLOEXEC),
             path,
+            dir_snapshot: Mutex::new(None),
         })
     }
 
@@ -104,8 +110,7 @@ impl OpenFile {
     }
 
     pub fn is_console(&self) -> bool {
-        self.inode()
-            .is_some_and(|i| matches!(&*i.node.lock(), Node::Device(Device::Console)))
+        self.inode().is_some_and(|i| i.device() == Some(Device::Console))
     }
 
     fn nonblocking(&self) -> bool {
@@ -129,25 +134,17 @@ impl OpenFile {
     }
 
     fn read_inode(&self, inode: &Inode, buf: &mut [u8]) -> Result<usize, i64> {
-        // The TTY may sleep, so it must be called without the inode lock.
-        if self.is_console() {
-            return crate::drivers::tty::read(buf, self.nonblocking());
-        }
-        match &*inode.node.lock() {
-            Node::Dir(_) => Err(EISDIR),
-            Node::Symlink(_) => Err(EINVAL),
-            Node::Device(Device::Null) => Ok(0),
-            Node::Device(Device::Zero) => {
+        match inode.device() {
+            // The TTY may sleep, so no inode lock may be held here.
+            Some(Device::Console) => crate::drivers::tty::read(buf, self.nonblocking()),
+            Some(Device::Null) => Ok(0),
+            Some(Device::Zero) => {
                 buf.fill(0);
                 Ok(buf.len())
             }
-            Node::Device(Device::Console) => unreachable!("handled above"),
-            Node::File(data) => {
+            None => {
                 let mut off = self.offset.lock();
-                let bytes = data.bytes();
-                let start = (*off as usize).min(bytes.len());
-                let n = buf.len().min(bytes.len() - start);
-                buf[..n].copy_from_slice(&bytes[start..start + n]);
+                let n = inode.read_at(*off, buf)?;
                 *off += n as u64;
                 Ok(n)
             }
@@ -155,23 +152,17 @@ impl OpenFile {
     }
 
     fn write_inode(&self, inode: &Inode, buf: &[u8]) -> Result<usize, i64> {
-        if self.is_console() {
-            return Ok(crate::drivers::tty::write(buf));
-        }
-        match &mut *inode.node.lock() {
-            Node::Dir(_) => Err(EISDIR),
-            Node::Symlink(_) => Err(EINVAL),
-            Node::Device(Device::Console) => unreachable!("handled above"),
-            Node::Device(_) => Ok(buf.len()),
-            Node::File(data) => {
+        match inode.device() {
+            Some(Device::Console) => Ok(crate::drivers::tty::write(buf)),
+            Some(_) => Ok(buf.len()),
+            None => {
                 let mut off = self.offset.lock();
                 if self.flags.load(Ordering::Relaxed) & O_APPEND != 0 {
-                    *off = data.bytes().len() as u64;
+                    *off = inode.size();
                 }
-                let start = usize::try_from(*off).map_err(|_| EFBIG)?;
-                data.write_at(start, buf)?;
-                *off += buf.len() as u64;
-                Ok(buf.len())
+                let n = inode.write_at(*off, buf)?;
+                *off += n as u64;
+                Ok(n)
             }
         }
     }

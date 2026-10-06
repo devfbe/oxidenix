@@ -9,7 +9,7 @@ pub mod syscall;
 pub mod uaccess;
 
 use crate::fs::file::OpenFile;
-use crate::fs::{self, Node};
+use crate::fs;
 use crate::interrupts::gdt;
 use address_space::AddressSpace;
 use alloc::boxed::Box;
@@ -360,12 +360,10 @@ fn basename(path: &str) -> &str {
 
 fn load_path(cwd: &str, path: &str, args: &[String], envs: &[String]) -> Result<loader::Image, i64> {
     let inode = fs::resolve(cwd, path, true)?;
-    let node = inode.node.lock();
-    match &*node {
-        Node::File(data) => loader::load(data.bytes(), args, envs),
-        Node::Dir(_) => Err(EISDIR),
-        _ => Err(ENOEXEC),
+    if inode.file_type() != fs::S_IFREG {
+        return Err(if inode.is_dir() { EISDIR } else { ENOEXEC });
     }
+    inode.with_contents(|bytes| loader::load(bytes, args, envs))?
 }
 
 /// Starts a program as a child of the kernel shell, with the console as

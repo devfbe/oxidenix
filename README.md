@@ -57,6 +57,10 @@ Its [commit history](#development-history) records every step.
   in Bash; background jobs reading from the terminal are stopped with `SIGTTIN`.
 - **Filesystem**: an in-memory, tmpfs-like VFS populated from a cpio initramfs, with files,
   directories, symlinks, `/dev/{console,tty,null,zero}`, and quotas against heap exhaustion.
+- **Persistent storage**: an ATA disk driver and a read-write **ext2** implementation. The data
+  disk is mounted at `/data`, survives reboots, and stays consistent enough that `e2fsck` on the
+  host accepts it.
+- **Wall-clock time** from the CMOS real-time clock (`date`, file timestamps).
 - **Terminal**: a termios line discipline (canonical and raw mode, echo, erase/kill/word-erase,
   EOF), the ANSI escape sequences BusyBox and readline use, a German keyboard layout and UTF-8.
 - **~90 Linux system calls**, enough for Bash and BusyBox (see [System calls](#system-calls)).
@@ -79,6 +83,8 @@ cargo run
 
 This builds the kernel, assembles the root filesystem (C test programs, Bash, BusyBox and
 `userspace/rootfs/`), packs it as a cpio initramfs, creates a BIOS disk image and starts QEMU.
+On the first run it also creates `disk.img`, a 64 MiB ext2 data disk (via `mke2fs` from nixpkgs,
+pre-filled from `userspace/disk/`). This file is kept between runs; delete it for a fresh disk.
 Extra arguments after `--` are passed to QEMU.
 
 The kernel boots straight into Bash. Things to try:
@@ -87,6 +93,8 @@ The kernel boots straight into Bash. Things to try:
 ls -l /bin | head          # BusyBox applets
 cowtest; sigtest; jobtest; oomtest; forktest # kernel self-tests in user space
 sh /etc/test.sh            # filesystem, pipes, quotas, rename semantics
+sh /etc/disktest.sh        # ext2: big files, directories, truncate, rename, symlinks
+echo hello > /data/x       # survives a reboot; df -h shows the disk
 sleep 100                  # then press Ctrl+Z, try jobs / bg / fg, then Ctrl+C
 exit                       # drops to the built-in kernel monitor ('help', 'mem', 'run bash')
 ```
@@ -135,15 +143,16 @@ oxidenix/
 │       │   ├── elf.rs           ELF64 parser
 │       │   └── uaccess.rs       checked access to user memory
 │       ├── fs/                  VFS (mod.rs), open files and pipes (file.rs),
-│       │                        initramfs unpacker (cpio.rs)
+│       │                        initramfs unpacker (cpio.rs), ext2 (ext2.rs)
 │       ├── drivers/             framebuffer console (console.rs), TTY (tty.rs),
-│       │                        PS/2 keyboard (keyboard.rs)
+│       │                        PS/2 keyboard (keyboard.rs), ATA disk (ata.rs),
+│       │                        CMOS clock (rtc.rs)
 │       └── shell/               built-in kernel monitor (fallback shell)
-├── builder/                     host tool: rootfs + cpio + disk image + QEMU launch
-└── userspace/                   C test programs, build script, rootfs template
+├── builder/                     host tool: rootfs + cpio + boot image + ext2 data disk + QEMU
+└── userspace/                   C test programs, build script, rootfs and data disk templates
 ```
 
-About 5,000 lines of Rust in the kernel plus a small host-side builder.
+About 7,500 lines of Rust in the kernel plus a small host-side builder.
 
 ### Boot sequence
 
@@ -152,7 +161,8 @@ About 5,000 lines of Rust in the kernel plus a small host-side builder.
    memory at a dynamic offset, sets up a VESA framebuffer and loads the initramfs as a ramdisk.
 2. `kernel_main` runs these steps in order: framebuffer console → GDT/TSS/IDT and PIC/PIT
    (interrupts still off) → frame allocator and 16 MiB kernel heap → VFS from the cpio
-   ramdisk → process subsystem (SSE, syscall MSRs, process 0) → **interrupts on**.
+   ramdisk, real-time clock and ext2 mount → process subsystem (SSE, syscall MSRs, process 0) →
+   **interrupts on**.
 3. Process 0 (the kernel monitor) spawns `/bin/bash` as the foreground process and waits for
    it. If Bash exits, the monitor takes over the terminal.
 
@@ -247,6 +257,25 @@ About 5,000 lines of Rust in the kernel plus a small host-side builder.
   and single files are limited to 64 MiB (`EFBIG`). Without this, user programs could exhaust
   the kernel heap.
 
+### Persistent storage
+
+- **ATA PIO driver** for the second IDE disk (primary bus, slave). It uses LBA28, polls with
+  the controller interrupt disabled, and flushes the write cache after every write.
+- **ext2** (revision 1 with the `filetype` feature, 1/2/4 KiB blocks) supports reading and
+  writing files through direct, single, double and triple indirect blocks, holes, truncation
+  (freeing whole indirect subtrees), directories growing by blocks, fast and block symlinks,
+  `rename` across directories (with `..` and link count updates and a cycle check), `rmdir`, and
+  `chmod`. Allocation goes through the block and inode bitmaps, and group descriptors and the
+  superblock's free counts are updated on every change.
+- Writes are synchronous (no cache), so `sync`/`fsync` have nothing left to do. After a session,
+  `e2fsck -fn disk.img` on the host reports a clean filesystem, and `debugfs` can read the files.
+- **VFS integration**: every inode operation (`child`, `list`, `create`, `unlink`, `read_at`,
+  `write_at`, `truncate`, ...) works on memory and ext2 inodes alike. ext2 inodes are cached per
+  filesystem so that one disk inode always maps to one `Arc<Inode>`. The disk root is mounted
+  at `/data`, and `statfs` and a static `/proc/mounts` make `df` work.
+- Directory reads take a snapshot at offset 0, so `rm -r` deleting entries while it reads never
+  skips any.
+
 ### Terminal and console
 
 - **Console**: a cell grid on the framebuffer with a 24 px Noto Sans Mono bitmap font, 16 ANSI
@@ -280,7 +309,8 @@ Linux x86_64 numbers, grouped by area (about 90 in total):
 | Processes | `fork` `execve` `exit` `exit_group` `wait4` `getpid` `getppid` `gettid` `set_tid_address` `sched_yield` `arch_prctl` `prlimit64` `getrusage` |
 | Groups and IDs | `setpgid` `getpgid` `getpgrp` `setsid` `getsid` `getuid` `geteuid` `getgid` `getegid` `getresuid` `getresgid` `setuid` `setgid` |
 | Signals | `rt_sigaction` `rt_sigprocmask` `rt_sigreturn` `kill` `tkill` `tgkill` `pause` `sigaltstack` |
-| Time and misc | `nanosleep` `clock_gettime` `uname` `getrandom` `socket` (fails with `EAFNOSUPPORT`) |
+| Filesystems | `statfs` `fstatfs` `sync` `fsync` `fdatasync` |
+| Time and misc | `nanosleep` `clock_gettime` (`CLOCK_REALTIME` from the RTC) `uname` `getrandom` `socket` (fails with `EAFNOSUPPORT`) |
 
 Everything runs as root. Unknown syscalls print a kernel message and return `ENOSYS`.
 
@@ -296,6 +326,8 @@ Each of these programs and scripts lives in the root filesystem and runs inside 
 | `jobtest` | stop/continue reporting through `wait4`, restart of a stopped `read()`, `SIGKILL` on stopped processes, `SA_RESTART` |
 | `forktest` | `fork`, `execve`, `wait4`, preemptive interleaving of two workers |
 | `sh /etc/test.sh` | files, pipes, `cd`, `mkdir`/`touch`/`rm`, rename cycles via symlinks, file quota |
+| `sh /etc/disktest.sh` | ext2: 150-file directory, 1.5 MiB file (double indirect), append, truncate, rename, cycles, symlinks, `rm -r`, space accounting |
+| `e2fsck -fn disk.img` (host) | the filesystem written by oxidenix is consistent |
 | `mem` (kernel monitor) | frame and heap accounting, allocator self-test, leak checks after workloads |
 
 During development the AI drove these tests through the QEMU monitor socket (`sendkey`,
@@ -321,15 +353,17 @@ fixed:
 - the `sysret` non-canonical return problem, which the `iretq` return path avoids entirely
 
 Known open issues: `getrandom` and `AT_RANDOM` are not cryptographically secure, the kernel heap
-never returns grown memory to the frame allocator, and there are no users or permissions
-(everything runs as root).
+never returns grown memory to the frame allocator, an ext2 file that is deleted while still open
+is freed immediately, and there are no users or permissions (everything runs as root). The ext2
+driver trusts the on-disk metadata of the image it was given.
 
 ## Limitations and roadmap
 
 - [x] Copy-on-write `fork`
 - [x] `ENOMEM` instead of a kernel panic when memory runs out
 - [x] Job control: stopping (Ctrl+Z), `fg`/`bg`, `SIGCONT`
-- [ ] Persistent storage: a disk driver and an on-disk filesystem
+- [x] Persistent storage: a disk driver and an on-disk filesystem
+- [ ] Hard links, a block cache, unlinked-but-open files kept until closed
 - [ ] Networking, SMP, dynamic linking, real entropy, users and permissions
 
 ## Development history
@@ -347,6 +381,7 @@ never returns grown memory to the frame allocator, and there are no users or per
 | Copy-on-write | copy-on-write fork and an optimized dev profile |
 | Out of memory | grow the kernel heap and turn memory exhaustion into errors |
 | Job control | job control with stopped processes and syscall restart |
+| Disk | persistent ext2 data disk on an ATA drive, wall-clock time |
 
 Run `git log` for the full history, including the security fixes between these steps.
 

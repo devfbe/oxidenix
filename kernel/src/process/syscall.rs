@@ -177,6 +177,7 @@ extern "sysv64" fn dispatch(f: &mut Frame) {
         62 => signal::kill(a0 as i64, a1),
         63 => uname(a0),
         72 => sys_file::fcntl(a0, a1, a2),
+        74 | 75 | 162 => Ok(0), // fsync/fdatasync/sync: every write already reached the disk
         77 => sys_file::ftruncate(a0, a1),
         79 => sys_file::getcwd(a0, a1),
         80 => sys_file::chdir(a0),
@@ -200,11 +201,13 @@ extern "sysv64" fn dispatch(f: &mut Frame) {
         121 => super::getpgid(a0),
         124 => super::getsid(a0),
         131 => Ok(0), // sigaltstack: handlers always run on the normal stack
+        137 => sys_file::statfs(a0, a1),
+        138 => sys_file::fstatfs(a0, a1),
         158 => arch_prctl(a0, a1),
         200 => signal::kill(a0 as i64, a1),            // tkill
         234 => signal::kill(a1 as i64, a2),            // tgkill
         217 => sys_file::getdents64(a0, a1, a2),
-        228 => clock_gettime(a1),
+        228 => clock_gettime(a0, a1),
         257 => sys_file::openat(a0, a1, a2, a3),
         258 => sys_file::mkdirat(a0, a1, a2),
         262 => sys_file::newfstatat(a0, a1, a2, a3),
@@ -268,10 +271,19 @@ fn uname(buf: u64) -> SysResult {
     Ok(0)
 }
 
-fn clock_gettime(ts: u64) -> SysResult {
-    let ticks = super::ticks();
-    let hz = super::TIMER_HZ;
-    uaccess::write(ts, [ticks / hz, (ticks % hz) * (1_000_000_000 / hz)])?;
+/// CLOCK_REALTIME (and its coarse variant) is wall-clock time from the
+/// RTC; all other clocks count from boot.
+fn clock_gettime(clock: u64, ts: u64) -> SysResult {
+    const CLOCK_REALTIME: u64 = 0;
+    const CLOCK_REALTIME_COARSE: u64 = 5;
+    let (sec, nsec) = if matches!(clock, CLOCK_REALTIME | CLOCK_REALTIME_COARSE) {
+        crate::drivers::rtc::now_precise()
+    } else {
+        let ticks = super::ticks();
+        let hz = super::TIMER_HZ;
+        (ticks / hz, (ticks % hz) * (1_000_000_000 / hz))
+    };
+    uaccess::write(ts, [sec, nsec])?;
     Ok(0)
 }
 

@@ -3,7 +3,6 @@
 use super::errno::*;
 use super::loader::page_up;
 use super::with_current;
-use crate::fs::Node;
 use x86_64::structures::paging::PageTableFlags;
 
 const PROT_WRITE: u64 = 2;
@@ -63,11 +62,13 @@ pub fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64) ->
     })?;
     if let Some(file) = file {
         let inode = file.inode().ok_or(EINVAL)?;
-        if let Node::File(data) = &*inode.node.lock() {
-            let bytes = data.bytes();
-            let from = (offset as usize).min(bytes.len());
-            let n = (len as usize).min(bytes.len() - from);
-            with_current(|p| p.space()?.write(start, &bytes[from..from + n]).map_err(|_| EFAULT))?;
+        let mut page = [0u8; 4096];
+        for done in (0..len).step_by(4096) {
+            let n = inode.read_at(offset + done, &mut page)?;
+            if n == 0 {
+                break;
+            }
+            with_current(|p| p.space()?.write(start + done, &page[..n]).map_err(|_| EFAULT))?;
         }
     }
     Ok(start as i64)

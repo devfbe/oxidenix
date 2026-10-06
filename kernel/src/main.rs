@@ -38,6 +38,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let ramdisk = boot_info.ramdisk_addr.into_option().map(|addr| unsafe {
         core::slice::from_raw_parts(addr as *const u8, boot_info.ramdisk_len as usize)
     });
+    drivers::rtc::init();
     fs::init(ramdisk);
     process::init();
     // Only now: the timer interrupt needs the scheduler.

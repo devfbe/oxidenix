@@ -22,6 +22,12 @@ fn main() {
     write_cpio(&rootfs, &mut cpio).expect("Failed to write cpio");
     drop(cpio);
 
+    let data_disk = Path::new(env!("CARGO_MANIFEST_DIR")).join("../disk.img");
+    if !data_disk.exists() {
+        println!("Creating persistent ext2 disk {}...", data_disk.display());
+        create_data_disk(&data_disk).expect("Failed to create the data disk");
+    }
+
     println!("Building BIOS disk image...");
     bootloader::BiosBoot::new(kernel_path)
         .set_ramdisk(&cpio_path)
@@ -32,7 +38,9 @@ fn main() {
     let exit_status = Command::new("qemu-system-x86_64")
         .args([
             "-drive",
-            &format!("format=raw,file={}", img_path.display()),
+            &format!("format=raw,file={},if=ide,index=0", img_path.display()),
+            "-drive",
+            &format!("format=raw,file={},if=ide,index=1", data_disk.display()),
             "-device",
             "isa-debug-exit,iobase=0xf4,iosize=0x04",
             "-m",
@@ -62,6 +70,23 @@ fn build_rootfs(root: &Path) -> io::Result<()> {
         .status()?;
     if !status.success() {
         return Err(io::Error::other("userspace/build.sh failed"));
+    }
+    Ok(())
+}
+
+/// A 64 MiB ext2 filesystem (1 KiB blocks, 128-byte inodes, no extensions the
+/// kernel does not implement), pre-filled from userspace/disk.
+fn create_data_disk(path: &Path) -> io::Result<()> {
+    let content = Path::new(env!("CARGO_MANIFEST_DIR")).join("../userspace/disk");
+    let mkfs = format!(
+        "unset SOURCE_DATE_EPOCH; mke2fs -q -t ext2 -b 1024 -I 128 -O none,filetype,sparse_super,large_file -L oxidenix -d '{}' -F '{}' 65536",
+        content.display(),
+        path.display()
+    );
+    let status = Command::new("nix-shell").args(["-p", "e2fsprogs", "--run", &mkfs]).status()?;
+    if !status.success() {
+        let _ = fs::remove_file(path);
+        return Err(io::Error::other("mke2fs failed"));
     }
     Ok(())
 }
