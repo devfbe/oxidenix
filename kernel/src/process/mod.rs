@@ -428,7 +428,10 @@ fn spawn_with(name: &str, args: &[&str], server: bool) -> Result<Pid, i64> {
         let pid = s.next_pid;
         s.next_pid += 1;
         let frame = Frame::user_start(image.entry, image.sp);
-        let mut p = new_process(pid, s.current, basename(&path).to_string(), image.space, frame)?;
+        // Servers belong to the kernel, even when a program's request
+        // (re)started them, so no program can wait for or signal them.
+        let parent = if server { 0 } else { s.current };
+        let mut p = new_process(pid, parent, basename(&path).to_string(), image.space, frame)?;
         p.fds = vec![Some(FdEntry { file: console, cloexec: false }); 3];
         p.brk_start = image.brk;
         p.brk_end = image.brk;

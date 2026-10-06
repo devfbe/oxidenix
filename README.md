@@ -62,8 +62,8 @@ Its [commit history](#development-history) records every step.
   directories, symlinks, `/dev/{console,tty,null,zero}`, and quotas against heap exhaustion.
 - **Microkernel-style drivers**: the ATA driver and the read-write **ext2** filesystem run in
   `diskfs`, an ordinary ring-3 process that talks to the kernel over IPC and reaches the disk
-  through I/O ports the kernel granted it. If it dies, `/data` accesses fail with `EIO` and the
-  rest of the system keeps running.
+  through I/O ports the kernel granted it. If it dies, the kernel restarts it on the next access, and
+  the rest of the system keeps running.
 - **Persistent storage**: the data disk is mounted at `/data`, survives reboots, and stays
   consistent enough that `e2fsck` on the host accepts it.
 - **Wall-clock time** from the CMOS real-time clock (`date`, file timestamps).
@@ -293,9 +293,14 @@ interrupt dispatch; drivers and filesystems move into user-space servers.
   `fsproto` requests to a server (`fs/remote.rs`). Reads and writes are split into 32 KiB
   messages. The kernel still decides when an unlinked inode may be freed, because only it knows
   whether a file is open.
-- **Fault isolation**: when a server dies, its services are marked dead and every pending or
-  later request fails with `EIO`. Programs see I/O errors on that mount; the kernel and the
-  rest of user space keep running.
+- **Fault isolation**: when a server dies, its services are marked dead and every pending
+  request fails with `EIO`; the kernel and the rest of user space keep running.
+- **Self-healing**: the next request to a dead filesystem server starts it again (in the
+  context of the requesting program, which may sleep) and continues transparently. Inode numbers
+  live on disk, so files and directories that were open before the crash stay usable. Requests
+  that were in flight during the crash still fail with `EIO`, since they may or may not have
+  been carried out. After five restarts the kernel gives up and the mount stays at `EIO`.
+  Restarted servers are children of the kernel, never of the program that triggered them.
 - **Protected servers**: like init on Linux, privileged servers ignore signals from user space:
   a direct `kill` fails with `EPERM`, and group, broadcast and terminal signals skip them. Only
   the kernel can stop them (the monitor's `kill <pid>` does, for testing).
@@ -389,7 +394,7 @@ Each of these programs and scripts lives in the root filesystem and runs inside 
 | `sh /etc/disktest.sh` | ext2: 150-file directory, 1.5 MiB file (double indirect), append, truncate, rename, cycles, symlinks, `rm -r`, space accounting |
 | `e2fsck -fn disk.img` (host) | the filesystem written by oxidenix is consistent |
 | `kill -9 1` in Bash | user space cannot kill a server (`EPERM`) |
-| `kill 1` in the kernel monitor | a dead filesystem server only turns `/data` accesses into `EIO` |
+| `kill 1` in the kernel monitor | the next `/data` access restarts the server; open files survive; after five restarts accesses fail with `EIO` |
 | `mem` (kernel monitor) | frame and heap accounting, allocator self-test, leak checks after workloads |
 
 During development the AI drove these tests through the QEMU monitor socket (`sendkey`,
@@ -414,7 +419,8 @@ fixed:
 - spinlock self-deadlocks and sleeping while holding an inode lock
 - the `sysret` non-canonical return problem, which the `iretq` return path avoids entirely
 
-Known open issues: `getrandom` and `AT_RANDOM` are not cryptographically secure, the kernel heap
+Known open issues: `getrandom` and `AT_RANDOM` are not cryptographically secure, any process may
+call `reboot` (everything runs as root), the kernel heap
 never returns grown memory to the frame allocator, and there are no users or permissions
 (everything runs as root). The ext2 driver trusts the on-disk metadata of the image it was given.
 
@@ -445,6 +451,8 @@ never returns grown memory to the frame allocator, and there are no users or per
 | Job control | job control with stopped processes and syscall restart |
 | Disk | persistent ext2 data disk on an ATA drive, wall-clock time |
 | Microkernel | move the disk driver and ext2 into a user-space server |
+| CI | run the self-tests in QEMU on every push |
+| Self-healing | restart a crashed filesystem server on the next access |
 
 Run `git log` for the full history, including the security fixes between these steps.
 

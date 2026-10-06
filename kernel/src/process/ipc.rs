@@ -237,6 +237,10 @@ pub fn lookup(name: &str) -> Option<(usize, u64)> {
     lock(|ipc| ipc.services.iter().position(|s| s.alive && s.name == name).map(|i| (i, ipc.services[i].arg)))
 }
 
+pub fn is_alive(service: usize) -> bool {
+    lock(|ipc| ipc.services.get(service).is_some_and(|s| s.alive))
+}
+
 /// Waits up to `ticks` timer ticks for `name` to be registered.
 pub fn wait_for(name: &str, ticks: u64) -> Option<(usize, u64)> {
     let deadline = super::ticks() + ticks;

@@ -54,7 +54,7 @@ fn start_servers() {
     match process::spawn_server("/sbin/diskfs") {
         Ok(pid) => match process::ipc::wait_for("diskfs", 3 * process::TIMER_HZ) {
             Some((service, root)) => {
-                if let Err(e) = fs::mount_remote(service, root as u32, "data", "/dev/hdb") {
+                if let Err(e) = fs::mount_remote(service, root as u32, "data", "/dev/hdb", ("diskfs", "/sbin/diskfs")) {
                     printkln!("[boot] cannot mount /data (errno {})", e);
                 }
             }

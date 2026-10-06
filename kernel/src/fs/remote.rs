@@ -8,8 +8,12 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use fsproto::{Op, MAX_DATA};
 use spin::Mutex;
+
+/// How often a dead server is restarted before its mount gives up.
+const MAX_RESTARTS: u32 = 5;
 
 /// Metadata of a remote inode.
 #[derive(Clone, Copy)]
@@ -23,7 +27,12 @@ pub struct RemoteStat {
 }
 
 pub struct RemoteFs {
-    service: usize,
+    service: AtomicUsize,
+    /// Service name and program, to restart the server after a crash.
+    name: String,
+    program: String,
+    restarts: AtomicU32,
+    restarting: AtomicBool,
     cache: Mutex<BTreeMap<u32, Weak<Inode>>>,
     /// Unlinked inodes still open here; released when the last VFS
     /// reference is dropped.
@@ -37,17 +46,54 @@ struct Reply {
 }
 
 impl RemoteFs {
-    pub fn new(service: usize) -> Arc<RemoteFs> {
+    pub fn new(service: usize, name: &str, program: &str) -> Arc<RemoteFs> {
         Arc::new(RemoteFs {
-            service,
+            service: AtomicUsize::new(service),
+            name: String::from(name),
+            program: String::from(program),
+            restarts: AtomicU32::new(0),
+            restarting: AtomicBool::new(false),
             cache: Mutex::new(BTreeMap::new()),
             deferred: Mutex::new(BTreeSet::new()),
         })
     }
 
+    /// Brings a dead server back: the first caller starts it again, others
+    /// wait for it to register. Inode numbers live on disk, so every
+    /// existing `Arc<Inode>` stays valid with the new server.
+    fn revive(&self) -> Result<(), i64> {
+        if let Some((service, _)) = ipc::lookup(&self.name) {
+            self.service.store(service, Ordering::Relaxed);
+            return Ok(());
+        }
+        if self.restarting.swap(true, Ordering::Relaxed) {
+            let (service, _) = ipc::wait_for(&self.name, 3 * crate::process::TIMER_HZ).ok_or(EIO)?;
+            self.service.store(service, Ordering::Relaxed);
+            return Ok(());
+        }
+        let attempt = self.restarts.fetch_add(1, Ordering::Relaxed) + 1;
+        let result = if attempt > MAX_RESTARTS {
+            Err(EIO)
+        } else {
+            crate::printkln!("[kernel] {} died; restarting it (attempt {} of {})", self.name, attempt, MAX_RESTARTS);
+            crate::process::spawn_server(&self.program)
+                .ok()
+                .and_then(|_| ipc::wait_for(&self.name, 3 * crate::process::TIMER_HZ))
+                .map(|(service, _)| self.service.store(service, Ordering::Relaxed))
+                .ok_or(EIO)
+        };
+        self.restarting.store(false, Ordering::Relaxed);
+        result
+    }
+
     fn call(&self, op: Op, args: [u64; 4], payload: &[u8]) -> Result<Reply, i64> {
+        // A request that was in flight when the server died stays EIO (it
+        // may or may not have been carried out); the next one revives it.
+        if !ipc::is_alive(self.service.load(Ordering::Relaxed)) {
+            self.revive()?;
+        }
         let message = fsproto::encode_request(op, args, payload);
-        let raw = ipc::call(self.service, message)?;
+        let raw = ipc::call(self.service.load(Ordering::Relaxed), message)?;
         let r = fsproto::decode_response(&raw).ok_or(EIO)?;
         if r.status < 0 {
             return Err(-r.status);
@@ -160,7 +206,7 @@ impl RemoteFs {
     }
 
     fn release(&self, ino: u32) {
-        ipc::post(self.service, fsproto::encode_request(Op::Release, [ino as u64, 0, 0, 0], &[]));
+        ipc::post(self.service.load(Ordering::Relaxed), fsproto::encode_request(Op::Release, [ino as u64, 0, 0, 0], &[]));
     }
 
     pub fn unlink(&self, dir: u32, name: &str, want_dir: bool) -> Result<(), i64> {
