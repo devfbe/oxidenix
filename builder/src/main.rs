@@ -40,6 +40,12 @@ fn main() {
         .create_disk_image(&img_path)
         .expect("Failed to create disk image");
 
+    // OXIDENIX_BUILD_ONLY=1: produce the images without starting QEMU.
+    if std::env::var_os("OXIDENIX_BUILD_ONLY").is_some() {
+        println!("Images ready: {} and {}", img_path.display(), data_disk.display());
+        return;
+    }
+
     println!("Starting QEMU with {}", img_path.display());
     let mut qemu = Command::new("qemu-system-x86_64");
     if test_mode {

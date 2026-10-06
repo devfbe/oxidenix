@@ -99,7 +99,7 @@ This builds the kernel, assembles the root filesystem (C test programs, Bash, Bu
 `userspace/rootfs/`), packs it as a cpio initramfs, creates a BIOS disk image and starts QEMU.
 On the first run it also creates `disk.img`, a 64 MiB ext2 data disk (via `mke2fs` from nixpkgs,
 pre-filled from `userspace/disk/`). This file is kept between runs; delete it for a fresh disk.
-Extra arguments after `--` are passed to QEMU.
+Extra arguments after `--` are passed to QEMU; `OXIDENIX_BUILD_ONLY=1 cargo run` only builds the images.
 
 The kernel boots straight into Bash. Things to try:
 
