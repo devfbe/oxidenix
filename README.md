@@ -53,13 +53,15 @@ Its [commit history](#development-history) records every step.
 - **Interactive shell** with line editing, history (arrow keys), tab completion, colors, pipes,
   redirections, subshells, command substitution and arithmetic.
 - **Symmetric multiprocessing**: all CPUs (QEMU runs with 4) execute user programs and the
-  kernel in parallel, with fine-grained locks instead of a big kernel lock.
+  kernel in parallel, with fine-grained locks instead of a big kernel lock. CPU-bound programs
+  scale (about 3x on 4 emulated CPUs), and `sched_setaffinity` pins processes to CPUs.
 - **Preemptive multitasking**: round-robin scheduler at 100 Hz, separate address spaces,
   `fork` with **copy-on-write**, `execve`, `wait4`, process groups and sessions.
 - **POSIX signals**: handlers, masks, `kill`, `SIGCHLD`, `EINTR` with automatic syscall restart,
   and **Ctrl+C** interrupting any foreground program, even a busy loop without system calls.
 - **Job control**: Ctrl+Z stops the foreground job, then `jobs`, `fg`, `bg` and `kill %n` work
   in Bash; background jobs reading from the terminal are stopped with `SIGTTIN`.
+- **procfs (static)**: `/proc/mounts` and `/proc/cpuinfo`.
 - **Filesystem**: an in-memory, tmpfs-like VFS populated from a cpio initramfs, with files,
   directories, symlinks, `/dev/{console,tty,null,zero}`, and quotas against heap exhaustion.
 - **Microkernel-style drivers**: the ATA driver and the read-write **ext2** filesystem run in
@@ -103,14 +105,15 @@ The kernel boots straight into Bash. Things to try:
 
 ```sh
 ls -l /bin | head          # BusyBox applets
-cowtest; sigtest; jobtest; oomtest; fstest; forktest; nettest # self-tests in user space
+cowtest; sigtest; jobtest; oomtest; fstest; forktest; nettest; smptest # self-tests
+nproc; cat /proc/cpuinfo   # 4 CPUs; 'cpus' in the kernel monitor shows their load
 wget -O - http://example.com # DNS and HTTP through netd; nslookup and nc work as well
 ping -c 3 1.1.1.1          # raw ICMP sockets; oxidenix answers pings itself, too
 sh /etc/test.sh            # filesystem, pipes, quotas, rename semantics
 sh /etc/disktest.sh        # ext2: big files, directories, truncate, rename, symlinks
 echo hello > /data/x       # survives a reboot; df -h shows the disk
 sleep 100                  # then press Ctrl+Z, try jobs / bg / fg, then Ctrl+C
-exit                       # drops to the built-in kernel monitor ('help', 'ps', 'lspci', 'mem', 'run bash')
+exit                       # drops to the built-in kernel monitor ('help', 'ps', 'cpus', 'lspci', 'mem', 'run bash')
 ```
 
 The window scales when it is resized (`zoom-to-fit`), and Ctrl+Alt+F toggles fullscreen.
@@ -194,7 +197,7 @@ oxidenix/
 └── userspace/                   C test programs, build script, rootfs and data disk templates
 ```
 
-About 7,467 lines of Rust in the kernel and 2,965 in the servers, their libraries and runtime, plus a small host-side builder.
+About 9,206 lines of Rust in the kernel and 3,067 in the servers, their libraries and runtime, plus a small host-side builder.
 
 ### Boot sequence
 
@@ -259,8 +262,10 @@ The scheduler is built for several CPUs (`process/sched.rs`, design in
   stack and I/O bitmap, and the syscall stack in the CPU block.
 - **Per-CPU run queues**, round robin, driven by each CPU's local APIC timer at 100 Hz
   (calibrated against the PIT once at boot). A woken task goes to an idle CPU if there is
-  one (preferring the CPU it last ran on, woken by an IPI) and an idle CPU steals work from
-  the others. Each CPU has an idle task; idling loads the kernel's page table, so an address
+  one (preferring the CPU it last ran on); the waker claims that CPU atomically and wakes it
+  with an IPI, so a burst of new tasks spreads over all idle CPUs. An idle CPU steals work
+  from the others. Each task has a CPU affinity mask (`sched_setaffinity`, inherited by
+  `fork`) that queueing, stealing and migration respect. Each CPU has an idle task; idling loads the kernel's page table, so an address
   space is only ever active on the CPU running its process.
 - **`on_cpu`** marks a task whose kernel stack is still in use; a CPU that picks it waits
   until its previous CPU finished switching away, and the reaper frees a zombie only then.
@@ -481,6 +486,7 @@ Linux x86_64 numbers, grouped by area (about 120 in total):
 | Directories | `getdents64` `getcwd` `chdir` `fchdir` `mkdir` `mkdirat` `rmdir` `unlink` `unlinkat` `rename` `renameat` `renameat2` `symlink` `symlinkat` |
 | I/O multiplexing | `poll` `ppoll` `select` `pselect6` |
 | Memory | `brk` `mmap` `munmap` `mprotect` (no-op) |
+| CPUs | `sched_getaffinity` `sched_setaffinity` `getcpu` |
 | Processes | `fork` `vfork` (as `fork`) `execve` `exit` `exit_group` `wait4` `getpid` `getppid` `gettid` `set_tid_address` `sched_yield` `arch_prctl` `prlimit64` `getrusage` |
 | Groups and IDs | `setpgid` `getpgid` `getpgrp` `setsid` `getsid` `getuid` `geteuid` `getgid` `getegid` `getresuid` `getresgid` `setuid` `setgid` |
 | Signals | `rt_sigaction` `rt_sigprocmask` `rt_sigreturn` `kill` `tkill` `tgkill` `pause` `sigaltstack` `alarm` `setitimer` `getitimer` (`ITIMER_REAL`, 10 ms resolution) |
@@ -508,6 +514,7 @@ Each of these programs and scripts lives in the root filesystem and runs inside 
 | `sigtest` | handlers, killing a busy loop, `SIGCHLD`, `EINTR` on pipe reads, blocked and ignored signals, FPU state across asynchronous handlers, `alarm` and repeating `setitimer`, catchable `SIGFPE`/`SIGSEGV`/`SIGTRAP` from CPU exceptions, an uncaught `SIGFPE` killing the process |
 | `jobtest` | stop/continue reporting through `wait4`, restart of a stopped `read()`, `SIGKILL` on stopped processes, `SA_RESTART` |
 | `forktest` | `fork`, `execve`, `wait4`, preemptive interleaving of two workers |
+| `smptest` | CPU count and affinity (pinning to every CPU, empty masks), parallel speed-up of CPU-bound processes, `fork`/`exit`/`wait` on every CPU at once, 5000 pipe round trips between two CPUs, signals to a process running on another CPU |
 | `nettest` | TCP to an echo service through QEMU, `ECONNREFUSED`, `listen`/`accept` over loopback with a forked client, EOF after the peer closed, non-blocking `accept` and `connect` with `poll` and `SO_ERROR`, `EINTR` in a blocking `recv`, UDP over loopback, raw ICMP echo to the gateway and over loopback, source address for off-subnet destinations, overflowing message vectors, `AF_INET6` rejected |
 | `sh /etc/test.sh` | files, pipes, `cd`, `mkdir`/`touch`/`rm`, rename cycles via symlinks, file quota |
 | `fstest` | descriptor access modes (`EBADF` on read-only/write-only fds), `O_NOFOLLOW` on symlinks, unlinked-but-open files (kept until closed, never shared with new files), ext2 size limits, overflowing `mmap` offsets |
@@ -561,7 +568,8 @@ kernel. Its program is fixed at boot (see self-healing), but a bug in it is a ke
 - [x] Networking: TCP/UDP sockets, DNS, DHCP and loopback through a user-space server (`netd`)
 - [x] `ping` (raw ICMP sockets)
 - [ ] IPv6, `AF_UNIX`, `ifconfig`
-- [ ] SMP, dynamic linking, real entropy, users and permissions
+- [x] SMP with fine-grained locking, per-CPU run queues and CPU affinity
+- [ ] Dynamic linking, real entropy, users and permissions
 
 ## Development history
 

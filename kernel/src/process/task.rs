@@ -107,6 +107,8 @@ pub struct Task {
     pub on_rq: AtomicBool,
     /// CPU it ran on last; wakeups prefer it.
     pub last_cpu: AtomicUsize,
+    /// CPUs it may run on (bit per CPU index), see sched_setaffinity.
+    pub affinity: AtomicU64,
     /// Channel it waits on (0: none) and its deadline in ticks (0: none).
     pub wait_chan: AtomicUsize,
     pub wake_at: AtomicU64,
@@ -138,6 +140,7 @@ impl Task {
             on_cpu: AtomicBool::new(false),
             on_rq: AtomicBool::new(true),
             last_cpu: AtomicUsize::new(0),
+            affinity: AtomicU64::new(u64::MAX),
             wait_chan: AtomicUsize::new(0),
             wake_at: AtomicU64::new(0),
             wake_lock: IrqSpinLock::new(()),
@@ -165,6 +168,10 @@ impl Task {
     /// Changes the state; callers hold `wake_lock` where a wakeup could race.
     pub fn set_state(&self, s: State) {
         self.state.store(s as u8, Ordering::Release);
+    }
+
+    pub fn may_run_on(&self, cpu: usize) -> bool {
+        self.affinity.load(Ordering::Relaxed) & (1 << cpu) != 0
     }
 
     pub fn kstack_top(&self) -> Option<u64> {

@@ -98,6 +98,10 @@ pub struct CpuSched {
     idle: UnsafeCell<Option<Arc<Task>>>,
     /// In the idle loop's `hlt`: new work for it needs an IPI.
     halted: AtomicBool,
+    /// Timer ticks spent running tasks and idling, and context switches.
+    pub busy_ticks: AtomicU64,
+    pub idle_ticks: AtomicU64,
+    pub switches: AtomicU64,
 }
 
 impl CpuSched {
@@ -108,6 +112,9 @@ impl CpuSched {
             prev: UnsafeCell::new(None),
             idle: UnsafeCell::new(None),
             halted: AtomicBool::new(false),
+            busy_ticks: AtomicU64::new(0),
+            idle_ticks: AtomicU64::new(0),
+            switches: AtomicU64::new(0),
         }
     }
 }
@@ -146,34 +153,60 @@ fn halted(cpu: &Cpu) -> bool {
     cpu.sched.halted.load(Ordering::SeqCst)
 }
 
-/// Puts a runnable task into a run queue: an idle CPU's if there is one
-/// (preferring the task's last CPU), else its last CPU's.
+/// Claims a halted CPU for new work: the first enqueuer to clear its flag
+/// wakes it, the next one picks another idle CPU instead of piling on.
+fn claim(cpu: &Cpu) -> bool {
+    cpu.sched.halted.compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst).is_ok()
+}
+
+/// Puts a runnable task into the run queue of a CPU it may run on: an idle
+/// one if there is one (preferring the task's last CPU, and claiming it so
+/// that concurrent wakeups spread out), else its last CPU's, else the first
+/// allowed.
 fn enqueue(task: Arc<Task>) {
     let last = task.last_cpu.load(Ordering::Relaxed);
-    let target = smp::by_index(last)
-        .filter(|c| halted(c))
-        .or_else(|| (0..smp::MAX_CPUS).filter_map(smp::by_index).find(|c| halted(c)))
-        .or_else(|| smp::by_index(last))
+    let allowed = |c: &&Cpu| task.may_run_on(c.index);
+    let cpus = || (0..smp::MAX_CPUS).filter_map(smp::by_index);
+    let claimed = smp::by_index(last)
+        .filter(|c| allowed(c) && claim(c))
+        .or_else(|| cpus().filter(allowed).find(|c| claim(c)));
+    let target = claimed
+        .or_else(|| smp::by_index(last).filter(allowed))
+        .or_else(|| cpus().find(allowed))
         .unwrap_or_else(smp::cpu);
     target.sched.rq.lock().push_back(task);
     // Pairs with the fence in `idle_loop`: either the idle CPU sees the
     // task, or we see it halted and wake it.
     fence(Ordering::SeqCst);
-    if target.index != smp::cpu().index && halted(target) {
+    let wake = claimed.is_some() || claim(target);
+    if wake && target.index != smp::cpu().index {
         crate::interrupts::apic::ipi::send_vector(target.apic_id(), crate::interrupts::apic::ipi::RESCHEDULE_VECTOR);
     }
 }
 
 /// The next task for this CPU: its own queue first, else one stolen from
-/// the back of another CPU's queue.
+/// the back of another CPU's queue (one that may run here). A task whose
+/// affinity no longer allows this CPU moves on to one it may run on.
 fn pick_next(cpu: &Cpu) -> Option<Arc<Task>> {
-    if let Some(t) = cpu.sched.rq.lock().pop_front() {
-        return Some(t);
+    loop {
+        let t = cpu.sched.rq.lock().pop_front();
+        match t {
+            Some(t) if t.may_run_on(cpu.index) => return Some(t),
+            Some(t) => enqueue(t),
+            None => break,
+        }
     }
-    (0..smp::MAX_CPUS)
-        .filter(|&i| i != cpu.index)
-        .filter_map(smp::by_index)
-        .find_map(|other| other.sched.rq.lock().pop_back())
+    (0..smp::MAX_CPUS).filter(|&i| i != cpu.index).filter_map(smp::by_index).find_map(|other| {
+        let mut rq = other.sched.rq.lock();
+        let i = rq.iter().rposition(|t| t.may_run_on(cpu.index))?;
+        rq.remove(i)
+    })
+}
+
+/// (busy ticks, idle ticks, context switches, queued tasks) of a CPU.
+pub fn cpu_stats(cpu: &Cpu) -> (u64, u64, u64, usize) {
+    let s = &cpu.sched;
+    (s.busy_ticks.load(Ordering::Relaxed), s.idle_ticks.load(Ordering::Relaxed), s.switches.load(Ordering::Relaxed), s.rq.lock().len())
 }
 
 fn has_work(cpu: &Cpu) -> bool {
@@ -296,9 +329,14 @@ pub fn schedule() {
         {
             let _w = cur.wake_lock.lock();
             match cur.state() {
-                State::Running if !cur.idle => {
+                State::Running if !cur.idle && cur.may_run_on(cpu.index) => {
                     cur.set_state(State::Runnable);
                     cs.rq.lock().push_back(current_arc());
+                }
+                // Its affinity excludes this CPU now: move it.
+                State::Running if !cur.idle => {
+                    cur.set_state(State::Runnable);
+                    enqueue(current_arc());
                 }
                 State::Running | State::Runnable => {}
                 // Sleeping, stopped or dead: leave the run queues.
@@ -328,6 +366,7 @@ fn context_switch(next: Arc<Task>) {
     next.on_cpu.store(true, Ordering::Relaxed);
     next.set_state(State::Running);
     next.last_cpu.store(cpu.index, Ordering::Relaxed);
+    cs.switches.fetch_add(1, Ordering::Relaxed);
 
     let prev = unsafe { (*cs.current.get()).take().expect("no current task") };
     unsafe {
@@ -479,7 +518,10 @@ pub extern "C" fn idle_loop() -> ! {
 /// Called on every CPU's timer interrupt. The bootstrap CPU keeps the
 /// global time: ticks, sleep deadlines and interval timers.
 pub fn tick() {
-    if smp::cpu().index != 0 {
+    let cpu = smp::cpu();
+    let counter = if current().idle { &cpu.sched.idle_ticks } else { &cpu.sched.busy_ticks };
+    counter.fetch_add(1, Ordering::Relaxed);
+    if cpu.index != 0 {
         return;
     }
     let now = TICKS.fetch_add(1, Ordering::Relaxed) + 1;

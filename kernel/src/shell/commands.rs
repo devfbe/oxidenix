@@ -12,6 +12,7 @@ pub fn dispatch(cmd: &str, args: &Vec<&str, 8>) {
         "kill" => cmd_kill(args),
         "ps" => cmd_ps(),
         "lspci" => cmd_lspci(),
+        "cpus" => cmd_cpus(),
         "" => {}
         other => crate::printkln!("unknown command: {}", other),
     }
@@ -27,8 +28,19 @@ fn cmd_help() {
     crate::printkln!("  run <prog>    - start a program from /bin");
     crate::printkln!("  ps            - list processes");
     crate::printkln!("  lspci         - list PCI devices");
+    crate::printkln!("  cpus          - CPUs with load and context switches");
     crate::printkln!("  kill <pid|name> - send SIGKILL (the kernel may also stop servers)");
     crate::printkln!("  halt          - halt the system");
+}
+
+fn cmd_cpus() {
+    crate::printkln!("  CPU  APIC  BUSY  SWITCHES  QUEUED");
+    for i in 0..crate::smp::MAX_CPUS {
+        let Some(cpu) = crate::smp::by_index(i) else { continue };
+        let (busy, idle, switches, queued) = crate::process::sched::cpu_stats(cpu);
+        let percent = busy * 100 / (busy + idle).max(1);
+        crate::printkln!("{:5} {:5} {:4}% {:9} {:7}", i, cpu.apic_id(), percent, switches, queued);
+    }
 }
 
 fn cmd_lspci() {

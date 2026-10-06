@@ -199,6 +199,9 @@ extern "sysv64" fn dispatch(f: &mut Frame) {
         54 => sys_net::setsockopt(a0),
         55 => sys_net::getsockopt(a0, a1, a2, a3, a4),
         288 => sys_net::accept(a0, a1, a2, a3),
+        203 => super::sched_setaffinity(a0, a1, a2),
+        204 => super::sched_getaffinity(a0, a1, a2),
+        309 => super::getcpu(a0, a1),
         36 => getitimer(a0, a1),
         37 => {
             let (old, _) = super::set_alarm((a0 as u32 as u64).saturating_mul(1_000_000), 0);

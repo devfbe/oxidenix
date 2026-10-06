@@ -226,6 +226,38 @@ fn new_block(index: usize) -> &'static mut Cpu {
 pub fn start_aps() {
     start_all();
     crate::printkln!("[smp] {} of {} CPUs online", online(), crate::drivers::acpi::madt().cpus.len());
+    crate::fs::write_proc("cpuinfo", &cpuinfo());
+}
+
+/// /proc/cpuinfo in the Linux format (the fields programs read).
+fn cpuinfo() -> alloc::string::String {
+    use core::arch::x86_64::__cpuid;
+    let regs = |leaf: u32| __cpuid(leaf);
+    // The bytes of CPUID registers in the given order (ASCII strings).
+    let words = |order: [u32; 4]| -> alloc::vec::Vec<u8> { order.iter().flat_map(|w| w.to_le_bytes()).collect() };
+    let v = regs(0);
+    let vendor = words([v.ebx, v.edx, v.ecx, 0]);
+    let vendor = alloc::string::String::from_utf8_lossy(&vendor[..12]).into_owned();
+    let mut brand = alloc::vec::Vec::new();
+    if regs(0x8000_0000).eax >= 0x8000_0004 {
+        for leaf in 0x8000_0002..=0x8000_0004 {
+            let r = regs(leaf);
+            brand.extend(words([r.eax, r.ebx, r.ecx, r.edx]));
+        }
+    }
+    let brand: alloc::string::String = alloc::string::String::from_utf8_lossy(&brand).trim_matches(|c: char| c == '\0' || c == ' ').into();
+    let sig = regs(1).eax;
+    let family = (sig >> 8) & 0xf;
+    let model = ((sig >> 4) & 0xf) | ((sig >> 12) & 0xf0);
+    let mut out = alloc::string::String::new();
+    for i in 0..online() {
+        let apic = by_index(i).map_or(0, |c| c.apic_id());
+        out.push_str(&alloc::format!(
+            "processor\t: {i}\nvendor_id\t: {vendor}\ncpu family\t: {family}\nmodel\t\t: {model}\nmodel name\t: {brand}\nphysical id\t: 0\nsiblings\t: {n}\ncore id\t\t: {i}\ncpu cores\t: {n}\napicid\t\t: {apic}\n\n",
+            n = online()
+        ));
+    }
+    out
 }
 
 fn start_all() {

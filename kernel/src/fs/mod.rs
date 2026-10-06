@@ -566,10 +566,15 @@ pub fn init(ramdisk: Option<&'static [u8]>) {
 fn write_proc_mounts(extra: &str) {
     let mut mounts = String::from("rootfs / tmpfs rw 0 0\n");
     mounts.push_str(extra);
+    write_proc("mounts", &mounts);
+}
+
+/// (Re)writes the static, read-only file /proc/<name>.
+pub fn write_proc(name: &str, content: &str) {
     let proc_dir = mkdir_p(&root(), "proc");
-    let _ = proc_dir.unlink("mounts", false);
-    if let Ok(file) = proc_dir.create("mounts", NewNode::File, 0o444) {
-        let _ = file.write_at(0, mounts.as_bytes());
+    let _ = proc_dir.unlink(name, false);
+    if let Ok(file) = proc_dir.create(name, NewNode::File, 0o444) {
+        let _ = file.write_at(0, content.as_bytes());
     }
 }
 

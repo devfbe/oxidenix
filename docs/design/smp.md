@@ -1,7 +1,6 @@
 # Symmetric multiprocessing in oxidenix
 
-Status: steps 1-5 done; all CPUs run. This document describes the target design; the README
-describes what is implemented.
+Status: implemented (all six steps). The README describes the details as built.
 
 ## Goals
 

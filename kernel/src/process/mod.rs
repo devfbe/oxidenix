@@ -192,6 +192,58 @@ pub fn list() -> Vec<(Pid, Pid, String, &'static str, bool, usize)> {
         .collect()
 }
 
+/// Bit mask of the CPUs that run.
+pub fn online_mask() -> u64 {
+    (0..crate::smp::MAX_CPUS).filter(|&i| crate::smp::by_index(i).is_some()).fold(0, |m, i| m | 1 << i)
+}
+
+/// sched_getaffinity(pid, size, mask): the CPUs the task may run on, as a
+/// 64-bit mask; returns the bytes written, as Linux does.
+pub fn sched_getaffinity(pid: Pid, size: u64, mask: u64) -> SysResult {
+    if size < 8 {
+        return Err(EINVAL);
+    }
+    let t = task(pid).ok_or(ESRCH)?;
+    uaccess::write(mask, t.affinity.load(Ordering::Relaxed) & online_mask())?;
+    Ok(8)
+}
+
+/// sched_setaffinity(pid, size, mask): restricts the task to the CPUs in
+/// `mask` that run. If the caller excludes its own CPU it moves at once.
+pub fn sched_setaffinity(pid: Pid, size: u64, mask: u64) -> SysResult {
+    if size == 0 {
+        return Err(EINVAL);
+    }
+    let mut bytes = [0u8; 8];
+    let n = size.min(8);
+    bytes[..n as usize].copy_from_slice(uaccess::slice(mask, n)?);
+    let wanted = u64::from_le_bytes(bytes) & online_mask();
+    if wanted == 0 {
+        return Err(EINVAL);
+    }
+    let t = task(pid).ok_or(ESRCH)?;
+    if t.privileged.load(Ordering::Relaxed) && current_pid() != 0 {
+        return Err(EPERM);
+    }
+    t.affinity.store(wanted, Ordering::Relaxed);
+    if core::ptr::eq(&*t, current()) && !t.may_run_on(crate::smp::cpu().index) {
+        schedule();
+    }
+    Ok(0)
+}
+
+/// getcpu(&cpu, &node, cache): the CPU the caller runs on; one NUMA node.
+pub fn getcpu(cpu: u64, node: u64) -> SysResult {
+    let index = crate::smp::cpu().index as u32;
+    if cpu != 0 {
+        uaccess::write(cpu, index)?;
+    }
+    if node != 0 {
+        uaccess::write(node, 0u32)?;
+    }
+    Ok(0)
+}
+
 /// Called from every CPU's timer interrupt.
 pub fn tick() {
     sched::tick();
@@ -470,6 +522,7 @@ pub fn fork(frame: &Frame) -> Result<Pid, i64> {
     };
     let child = new_task(pid, info, own, child_frame)?;
     *child.sig.lock() = me.sig.lock().for_child();
+    child.affinity.store(me.affinity.load(Ordering::Relaxed), Ordering::Relaxed);
     slot.insert(child.clone());
     sched::start(child);
     Ok(pid)
