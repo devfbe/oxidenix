@@ -45,28 +45,18 @@ pub fn write(fd: u64, buf: u64, len: u64) -> SysResult {
     Ok(f.write(uaccess::slice(buf, len)?)? as i64)
 }
 
-/// File behind `fd` for positional I/O: pipes and devices have no position.
-fn positional(fd: u64, off: i64) -> Result<Arc<OpenFile>, i64> {
+pub fn pread(fd: u64, buf: u64, len: u64, off: i64) -> SysResult {
     if off < 0 {
         return Err(EINVAL);
     }
-    let f = file(fd)?;
-    match f.inode() {
-        Some(inode) if inode.device().is_none() => Ok(f),
-        _ => Err(ESPIPE),
-    }
-}
-
-pub fn pread(fd: u64, buf: u64, len: u64, off: i64) -> SysResult {
-    let f = positional(fd, off)?;
-    let inode = f.inode().expect("checked by positional");
-    Ok(inode.read_at(off as u64, uaccess::slice_mut(buf, len)?)? as i64)
+    Ok(file(fd)?.read_at(off as u64, uaccess::slice_mut(buf, len)?)? as i64)
 }
 
 pub fn pwrite(fd: u64, buf: u64, len: u64, off: i64) -> SysResult {
-    let f = positional(fd, off)?;
-    let inode = f.inode().expect("checked by positional");
-    Ok(inode.write_at(off as u64, uaccess::slice(buf, len)?)? as i64)
+    if off < 0 {
+        return Err(EINVAL);
+    }
+    Ok(file(fd)?.write_at(off as u64, uaccess::slice(buf, len)?)? as i64)
 }
 
 fn iovecs(iov: u64, count: u64) -> Result<Vec<(u64, u64)>, i64> {
@@ -518,6 +508,9 @@ pub fn fchmodat(dirfd: u64, path: u64, mode: u64) -> SysResult {
 
 pub fn ftruncate(fd: u64, len: u64) -> SysResult {
     let f = file(fd)?;
+    if !f.writable() {
+        return Err(EINVAL);
+    }
     f.inode().ok_or(EINVAL)?.truncate(len)?;
     Ok(0)
 }

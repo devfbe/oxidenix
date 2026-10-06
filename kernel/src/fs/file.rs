@@ -113,11 +113,44 @@ impl OpenFile {
         self.inode().is_some_and(|i| i.device() == Some(Device::Console))
     }
 
+    pub fn readable(&self) -> bool {
+        self.flags.load(Ordering::Relaxed) & O_ACCMODE != O_WRONLY
+    }
+
+    pub fn writable(&self) -> bool {
+        self.flags.load(Ordering::Relaxed) & O_ACCMODE != 0
+    }
+
+    /// Positional read for pread64: no offset change, regular inodes only.
+    pub fn read_at(&self, off: u64, buf: &mut [u8]) -> Result<usize, i64> {
+        if !self.readable() {
+            return Err(EBADF);
+        }
+        match self.inode() {
+            Some(inode) if inode.device().is_none() => inode.read_at(off, buf),
+            _ => Err(ESPIPE),
+        }
+    }
+
+    /// Positional write for pwrite64: no offset change, regular inodes only.
+    pub fn write_at(&self, off: u64, buf: &[u8]) -> Result<usize, i64> {
+        if !self.writable() {
+            return Err(EBADF);
+        }
+        match self.inode() {
+            Some(inode) if inode.device().is_none() => inode.write_at(off, buf),
+            _ => Err(ESPIPE),
+        }
+    }
+
     fn nonblocking(&self) -> bool {
         self.flags.load(Ordering::Relaxed) & O_NONBLOCK != 0
     }
 
     pub fn read(&self, buf: &mut [u8]) -> Result<usize, i64> {
+        if !self.readable() {
+            return Err(EBADF);
+        }
         match &self.kind {
             Kind::Inode(inode) => self.read_inode(inode, buf),
             Kind::PipeRead(pipe) => self.read_pipe(pipe, buf),
@@ -126,6 +159,9 @@ impl OpenFile {
     }
 
     pub fn write(&self, buf: &[u8]) -> Result<usize, i64> {
+        if !self.writable() {
+            return Err(EBADF);
+        }
         match &self.kind {
             Kind::Inode(inode) => self.write_inode(inode, buf),
             Kind::PipeWrite(pipe) => self.write_pipe(pipe, buf),

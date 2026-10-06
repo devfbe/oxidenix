@@ -57,6 +57,24 @@ int main(void) {
     check("mmap with an overflowing offset fails", m == MAP_FAILED);
     close(fd);
     unlink(path);
+
+    snprintf(path, sizeof path, "%s/modes", dir);
+    fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    write(fd, "data", 4);
+    errno = 0;
+    check("read on a write-only fd fails with EBADF", read(fd, buf, 4) < 0 && errno == EBADF);
+    close(fd);
+    fd = open(path, O_RDONLY);
+    errno = 0;
+    check("write on a read-only fd fails with EBADF", write(fd, "x", 1) < 0 && errno == EBADF);
+    errno = 0;
+    check("pwrite on a read-only fd fails with EBADF", pwrite(fd, "x", 1, 0) < 0 && errno == EBADF);
+    errno = 0;
+    check("ftruncate on a read-only fd fails with EINVAL", ftruncate(fd, 0) < 0 && errno == EINVAL);
+    memset(buf, 0, sizeof buf);
+    check("the file is unchanged", pread(fd, buf, 8, 0) == 4 && strcmp(buf, "data") == 0);
+    close(fd);
+    unlink(path);
     rmdir(dir);
 
     printf("fstest: %s\n", failures ? "FAILED" : "all passed");

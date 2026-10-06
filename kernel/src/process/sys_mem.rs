@@ -48,7 +48,11 @@ pub fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64) ->
     }
     // File contents are copied (MAP_PRIVATE semantics, no write-back).
     let file = if flags & MAP_ANONYMOUS == 0 {
-        Some(with_current(|p| p.file(fd))?)
+        let f = with_current(|p| p.file(fd))?;
+        if !f.readable() {
+            return Err(EACCES);
+        }
+        Some(f)
     } else {
         None
     };

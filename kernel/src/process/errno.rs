@@ -8,6 +8,7 @@ pub const EBADF: i64 = 9;
 pub const ECHILD: i64 = 10;
 pub const EAGAIN: i64 = 11;
 pub const ENOMEM: i64 = 12;
+pub const EACCES: i64 = 13;
 pub const EFAULT: i64 = 14;
 pub const EBUSY: i64 = 16;
 pub const EEXIST: i64 = 17;

@@ -330,7 +330,7 @@ Each of these programs and scripts lives in the root filesystem and runs inside 
 | `jobtest` | stop/continue reporting through `wait4`, restart of a stopped `read()`, `SIGKILL` on stopped processes, `SA_RESTART` |
 | `forktest` | `fork`, `execve`, `wait4`, preemptive interleaving of two workers |
 | `sh /etc/test.sh` | files, pipes, `cd`, `mkdir`/`touch`/`rm`, rename cycles via symlinks, file quota |
-| `fstest` | `O_NOFOLLOW` on symlinks, unlinked-but-open files (kept until closed, never shared with new files), ext2 size limits, overflowing `mmap` offsets |
+| `fstest` | descriptor access modes (`EBADF` on read-only/write-only fds), `O_NOFOLLOW` on symlinks, unlinked-but-open files (kept until closed, never shared with new files), ext2 size limits, overflowing `mmap` offsets |
 | `sh /etc/disktest.sh` | ext2: 150-file directory, 1.5 MiB file (double indirect), append, truncate, rename, cycles, symlinks, `rm -r`, space accounting |
 | `e2fsck -fn disk.img` (host) | the filesystem written by oxidenix is consistent |
 | `mem` (kernel monitor) | frame and heap accounting, allocator self-test, leak checks after workloads |
