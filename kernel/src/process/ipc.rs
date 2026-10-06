@@ -76,7 +76,7 @@ fn lock<R>(f: impl FnOnce(&mut Ipc) -> R) -> R {
 /// ipc_register(name, length, arg): makes the calling (privileged) process
 /// the server behind `name`. A dead server's name can be taken over.
 pub fn register(name: u64, len: u64, arg: u64) -> SysResult {
-    if !super::sched::current().privileged.load(core::sync::atomic::Ordering::Relaxed) {
+    if !super::sched::current().group.privileged.load(core::sync::atomic::Ordering::Relaxed) {
         return Err(EPERM);
     }
     if len > 64 {

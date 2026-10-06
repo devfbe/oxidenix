@@ -24,11 +24,14 @@ on several CPUs, so these are the parts that change.
 
 - `IrqSpinLock<T>`: a ticket spinlock (FIFO-fair) that disables interrupts while held and
   restores the previous interrupt state on release. Every lock that an interrupt handler may
-  take is an `IrqSpinLock`; for simplicity all kernel locks are.
+  take is an `IrqSpinLock`; so are almost all kernel locks. State held across operations
+  that sleep (an address space during a page fault that reads a file, a file's offset during a
+  read from a file server) uses a sleeping `sync::Mutex` instead.
 - No lock is held across a context switch, except the run-queue lock, which `schedule`
   hands over to the next task and releases in `finish_switch`.
-- Lock order (outer to inner): process table → task signal state → wait-queue bucket →
-  run queue. IPC, TTY, console, frames and heap are leaves.
+- Lock order (outer to inner): process table → process info → process signal state → thread
+  signal state → wait-queue bucket → task wake lock → run queue. IPC, TTY, console, frames and
+  heap are leaves.
 
 ### Per-CPU data
 

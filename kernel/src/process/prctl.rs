@@ -85,20 +85,20 @@ pub fn prctl(option: u64, arg2: u64) -> SysResult {
             if arg2 > 64 {
                 return Err(EINVAL);
             }
-            me.info.lock().pdeath_sig = arg2 as u32;
+            me.group.info.lock().pdeath_sig = arg2 as u32;
             Ok(0)
         }
         PR_GET_PDEATHSIG => {
-            let sig = me.info.lock().pdeath_sig;
+            let sig = me.group.info.lock().pdeath_sig;
             uaccess::write(arg2, sig as i32)?;
             Ok(0)
         }
-        PR_GET_DUMPABLE => Ok(me.info.lock().dumpable as i64),
+        PR_GET_DUMPABLE => Ok(me.group.info.lock().dumpable as i64),
         PR_SET_DUMPABLE => {
             if arg2 > 1 {
                 return Err(EINVAL);
             }
-            me.info.lock().dumpable = arg2 == 1;
+            me.group.info.lock().dumpable = arg2 == 1;
             Ok(0)
         }
         PR_SET_NAME => {
@@ -110,12 +110,17 @@ pub fn prctl(option: u64, arg2: u64) -> SysResult {
                 }
             }
             let len = raw.iter().position(|&b| b == 0).unwrap_or(COMM_LEN - 1);
-            me.info.lock().name = alloc::string::String::from_utf8_lossy(&raw[..len]).into_owned();
+            let name = alloc::string::String::from_utf8_lossy(&raw[..len]).into_owned();
+            // The main thread's name is the process's name.
+            if me.tid() == me.tgid() {
+                me.group.info.lock().name = name.clone();
+            }
+            *me.comm.lock() = name;
             Ok(0)
         }
         PR_GET_NAME => {
             let mut raw = [0u8; COMM_LEN];
-            let name = me.info.lock().name.clone();
+            let name = me.comm.lock().clone();
             let n = name.len().min(COMM_LEN - 1);
             raw[..n].copy_from_slice(&name.as_bytes()[..n]);
             uaccess::write(arg2, raw)?;
@@ -131,10 +136,10 @@ pub fn prctl(option: u64, arg2: u64) -> SysResult {
             if arg2 != 1 {
                 return Err(EINVAL);
             }
-            me.info.lock().no_new_privs = true;
+            me.group.info.lock().no_new_privs = true;
             Ok(0)
         }
-        PR_GET_NO_NEW_PRIVS => Ok(me.info.lock().no_new_privs as i64),
+        PR_GET_NO_NEW_PRIVS => Ok(me.group.info.lock().no_new_privs as i64),
         _ => Err(EINVAL),
     }
 }

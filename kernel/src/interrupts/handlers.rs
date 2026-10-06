@@ -105,7 +105,7 @@ fn exception(frame: &mut Frame) {
                 Err(Fault::Bus) => sig = signal::SIGBUS,
                 Err(Fault::Oom) => {
                     crate::printkln!("[kernel] out of memory at {:#x}: process killed", addr);
-                    crate::process::exit(signal::SIGKILL as i32);
+                    crate::process::exit_group(signal::SIGKILL as i32);
                 }
                 Err(Fault::Segv) => {}
             }

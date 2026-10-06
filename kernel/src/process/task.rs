@@ -1,16 +1,24 @@
-//! A task: one process (or a CPU's idle loop) as the scheduler sees it.
+//! Tasks and thread groups.
 //!
-//! Its state splits by who may touch it:
-//! - `Process` (address space, descriptors, cwd, FPU, ...) belongs to the
-//!   task itself: only the CPU running it, the CPU switching to or from it,
-//!   or the reaper once it is dead and off every CPU may use it.
-//! - `info` (relations, name, exit/stop reports) and `sig` (signal state and
-//!   timer) are shared and locked.
+//! A task is one thread as the scheduler sees it (or a CPU's idle loop); a
+//! thread group is a process: the tasks that share a process id, signal
+//! handlers and pending process signals, relations, and the exit status.
+//! Like on Linux, what threads share beyond that is chosen by clone flags:
+//! address space (`Mm`), descriptor table (`Files`) and working directory
+//! (`FsInfo`) are separate shared objects that a task holds references to.
+//!
+//! A task's state splits by who may touch it:
+//! - `Process` (references to those objects, I/O permissions, the futex
+//!   word to clear at exit) belongs to the task itself: only the CPU
+//!   running it, or the CPU switching to or from it, may use it.
+//! - `sig` (its signal mask and pending signals) is locked, after the
+//!   group's signal lock.
 //! - The scheduling fields are atomics, written under `wake_lock`.
 
 use super::address_space::Mm;
-use super::signal::Signals;
+use super::signal::{GroupSignals, ThreadSignals};
 use super::{FdEntry, Pid, Server};
+use crate::fs::file::OpenFile;
 use crate::interrupts::gdt;
 use crate::sync::IrqSpinLock;
 use alloc::boxed::Box;
@@ -49,8 +57,8 @@ pub enum State {
     Sleeping = 2,
     /// Stopped by a signal until SIGCONT (or SIGKILL).
     Stopped = 3,
-    /// Exited; waits to be reaped.
-    Zombie = 4,
+    /// Exited; never runs again.
+    Dead = 4,
 }
 
 impl State {
@@ -60,21 +68,25 @@ impl State {
             1 => State::Runnable,
             2 => State::Sleeping,
             3 => State::Stopped,
-            _ => State::Zombie,
+            _ => State::Dead,
         }
     }
 }
 
-/// Shared, locked process information.
+/// Process information, shared by the threads and locked.
 pub struct Info {
     pub ppid: Pid,
     pub pgid: Pid,
     pub sid: Pid,
+    /// Process name (the main thread's name).
     pub name: String,
-    /// Wait status once exited (exit code << 8, or the signal number).
+    /// Wait status once the last thread exited (exit code << 8, or the
+    /// signal number): the process is a zombie until its parent reaps it.
     pub exit_status: Option<i32>,
     /// Stop/continue event not yet collected by the parent's wait4.
     pub report: Option<i32>,
+    /// Signal the parent gets when the process ends (SIGCHLD; 0: none).
+    pub exit_signal: u32,
     /// prctl state: signal sent when the parent dies (0: none), core
     /// dumps allowed, no new privileges (kept across fork and exec).
     pub pdeath_sig: u32,
@@ -84,10 +96,15 @@ pub struct Info {
     /// and its absolute path.
     pub cmdline: Vec<u8>,
     pub exe: String,
-    /// Page count of its address space (None for kernel tasks and zombies).
+    /// Page counts of its address space (None for kernel tasks and zombies).
     pub mem: Option<Arc<super::address_space::MemStats>>,
     /// Scheduling niceness, -20 (favored) to 19.
     pub nice: i8,
+    /// Live threads, in creation order.
+    pub threads: Vec<Arc<Task>>,
+    /// Timer ticks of threads that exited (user, system).
+    pub dead_utime: u64,
+    pub dead_stime: u64,
 }
 
 impl Info {
@@ -99,6 +116,7 @@ impl Info {
             name,
             exit_status: None,
             report: None,
+            exit_signal: super::signal::SIGCHLD,
             pdeath_sig: 0,
             dumpable: true,
             no_new_privs: false,
@@ -106,7 +124,36 @@ impl Info {
             exe: String::new(),
             mem: None,
             nice: 0,
+            threads: Vec::new(),
+            dead_utime: 0,
+            dead_stime: 0,
         }
+    }
+}
+
+/// A process: the threads that share a pid.
+pub struct ThreadGroup {
+    pub tgid: Pid,
+    /// Servers started by the kernel: may register IPC services and ask
+    /// for I/O ports; protected from user signals.
+    pub privileged: AtomicBool,
+    pub start_ticks: u64,
+    pub info: IrqSpinLock<Info>,
+    /// Handlers, pending process signals, the interval timer, and group
+    /// stops and exits. Taken before any thread's `sig`.
+    pub sig: IrqSpinLock<GroupSignals>,
+}
+
+impl ThreadGroup {
+    pub fn new(tgid: Pid, info: Info, sig: GroupSignals) -> Option<Arc<ThreadGroup>> {
+        Arc::try_new(ThreadGroup {
+            tgid,
+            privileged: AtomicBool::new(false),
+            start_ticks: super::sched::ticks(),
+            info: IrqSpinLock::new(info),
+            sig: IrqSpinLock::new(sig),
+        })
+        .ok()
     }
 }
 
@@ -119,21 +166,133 @@ pub struct CpuState {
     pub fpu: Box<FpuState>,
 }
 
+/// A descriptor table, shared by the tasks cloned with CLONE_FILES.
+/// Descriptors are taken out under the lock and dropped after it: closing
+/// a file may wake others or talk to a server.
+pub struct Files {
+    fds: IrqSpinLock<Vec<Option<FdEntry>>>,
+}
+
+/// Most descriptors a process may have open.
+pub const MAX_FDS: usize = 256;
+
+impl Files {
+    pub fn new(fds: Vec<Option<FdEntry>>) -> Option<Arc<Files>> {
+        Arc::try_new(Files { fds: IrqSpinLock::new(fds) }).ok()
+    }
+
+    /// A copy for a new process (fork), or for exec of a shared table.
+    pub fn duplicate(&self) -> Option<Arc<Files>> {
+        let mut copy = Vec::new();
+        copy.try_reserve_exact(MAX_FDS).ok()?;
+        copy.extend(self.fds.lock().iter().cloned());
+        Files::new(copy)
+    }
+
+    pub fn get(&self, fd: u64) -> Result<Arc<OpenFile>, i64> {
+        self.fds.lock().get(fd as usize).and_then(|e| e.as_ref()).map(|e| e.file.clone()).ok_or(super::errno::EBADF)
+    }
+
+    /// Installs `file` at the lowest free descriptor >= `min`.
+    pub fn alloc(&self, file: Arc<OpenFile>, cloexec: bool, min: usize) -> Result<i64, i64> {
+        let mut fds = self.fds.lock();
+        let fd = (min..MAX_FDS).find(|&i| fds.get(i).is_none_or(|e| e.is_none())).ok_or(super::errno::EMFILE)?;
+        if fds.len() <= fd {
+            let more = fd + 1 - fds.len();
+            fds.try_reserve(more).map_err(|_| super::errno::ENOMEM)?;
+            fds.resize(fd + 1, None);
+        }
+        fds[fd] = Some(FdEntry { file, cloexec });
+        Ok(fd as i64)
+    }
+
+    /// Puts `entry` at `fd`; returns what was there (for the caller to drop
+    /// after the lock).
+    pub fn replace(&self, fd: u64, entry: FdEntry) -> Result<Option<FdEntry>, i64> {
+        if fd as usize >= MAX_FDS {
+            return Err(super::errno::EBADF);
+        }
+        let mut fds = self.fds.lock();
+        if fds.len() <= fd as usize {
+            let more = fd as usize + 1 - fds.len();
+            fds.try_reserve(more).map_err(|_| super::errno::ENOMEM)?;
+            fds.resize(fd as usize + 1, None);
+        }
+        Ok(fds[fd as usize].replace(entry))
+    }
+
+    pub fn take(&self, fd: u64) -> Option<FdEntry> {
+        self.fds.lock().get_mut(fd as usize).and_then(|e| e.take())
+    }
+
+    pub fn cloexec(&self, fd: u64) -> Result<bool, i64> {
+        self.fds.lock().get(fd as usize).and_then(|e| e.as_ref()).map(|e| e.cloexec).ok_or(super::errno::EBADF)
+    }
+
+    pub fn set_cloexec(&self, fd: u64, on: bool) -> Result<(), i64> {
+        let mut fds = self.fds.lock();
+        fds.get_mut(fd as usize).and_then(|e| e.as_mut()).ok_or(super::errno::EBADF)?.cloexec = on;
+        Ok(())
+    }
+
+    /// Takes out the descriptors marked close-on-exec (to drop after the lock).
+    pub fn take_cloexec(&self) -> Vec<FdEntry> {
+        let mut out = Vec::new();
+        let _ = out.try_reserve_exact(MAX_FDS);
+        let mut fds = self.fds.lock();
+        for e in fds.iter_mut() {
+            if e.as_ref().is_some_and(|e| e.cloexec) && out.len() < out.capacity() {
+                out.push(e.take().expect("checked"));
+            }
+        }
+        out
+    }
+}
+
+/// Working directory, shared by the tasks cloned with CLONE_FS.
+pub struct FsInfo {
+    cwd: IrqSpinLock<String>,
+}
+
+impl FsInfo {
+    pub fn new(cwd: String) -> Option<Arc<FsInfo>> {
+        Arc::try_new(FsInfo { cwd: IrqSpinLock::new(cwd) }).ok()
+    }
+
+    pub fn cwd(&self) -> String {
+        self.cwd.lock().clone()
+    }
+
+    pub fn set_cwd(&self, cwd: String) {
+        let old = core::mem::replace(&mut *self.cwd.lock(), cwd);
+        drop(old);
+    }
+}
+
 /// State owned by the task itself (see the module comment).
 pub struct Process {
     /// The address space (None for kernel tasks and after exit).
     pub mm: Option<Arc<Mm>>,
-    pub fds: Vec<Option<FdEntry>>,
-    pub cwd: String,
+    /// Descriptors and working directory (None only after exit).
+    pub files: Option<Arc<Files>>,
+    pub fs: Option<Arc<FsInfo>>,
     /// I/O permission bitmap (0 = allowed) installed in the TSS while
-    /// this process runs.
+    /// this task runs (per thread, as ioperm is on Linux).
     pub io_bitmap: Option<Box<[u8; gdt::IOMAP_BYTES]>>,
-    /// The server this process runs, with the resources assigned to it.
+    /// The server this task runs, with the resources assigned to it.
     pub server: Option<Arc<Server>>,
+    /// CLONE_CHILD_CLEARTID / set_tid_address: cleared and woken (futex)
+    /// when the task exits, which is how a thread is joined.
+    pub clear_child_tid: u64,
+    /// A vfork parent sleeps until this is set: the child exec'd or exited.
+    pub vfork_done: Option<Arc<AtomicBool>>,
 }
 
 pub struct Task {
-    pub pid: Pid,
+    /// Thread id; the main thread's equals the process id. Changes only
+    /// when another thread execs and takes over the main thread's id.
+    tid: AtomicU64,
+    pub group: Arc<ThreadGroup>,
     /// A CPU's idle loop: never queued, never in the process table.
     pub idle: bool,
     state: AtomicU8,
@@ -156,16 +315,13 @@ pub struct Task {
     /// it waits in (a requeue may move it).
     pub futex_woken: AtomicBool,
     pub futex_bucket: AtomicUsize,
-    /// Timer ticks spent in user mode and in the kernel, and the tick it
-    /// was created at.
+    /// Timer ticks spent in user mode and in the kernel.
     pub utime: AtomicU64,
     pub stime: AtomicU64,
-    pub start_ticks: u64,
-    /// Servers started by the kernel: may register IPC services and ask
-    /// for I/O ports; protected from user signals.
-    pub privileged: AtomicBool,
-    pub info: IrqSpinLock<Info>,
-    pub sig: IrqSpinLock<Signals>,
+    /// Thread name (comm), at most 15 bytes.
+    pub comm: IrqSpinLock<String>,
+    /// Its signal mask and the signals sent to this thread.
+    pub sig: IrqSpinLock<ThreadSignals>,
     /// Saved kernel stack pointer while switched out.
     pub kernel_rsp: UnsafeCell<u64>,
     /// None for tasks running on a stack they did not allocate (the
@@ -180,9 +336,10 @@ unsafe impl Sync for Task {}
 unsafe impl Send for Task {}
 
 impl Task {
-    pub fn new(pid: Pid, info: Info, own: Process, kstack: Option<Box<KernelStack>>, kernel_rsp: u64) -> Task {
+    pub fn new(tid: Pid, group: Arc<ThreadGroup>, comm: String, own: Process, kstack: Option<Box<KernelStack>>, kernel_rsp: u64) -> Task {
         Task {
-            pid,
+            tid: AtomicU64::new(tid),
+            group,
             idle: false,
             state: AtomicU8::new(State::Runnable as u8),
             on_cpu: AtomicBool::new(false),
@@ -196,10 +353,8 @@ impl Task {
             futex_bucket: AtomicUsize::new(0),
             utime: AtomicU64::new(0),
             stime: AtomicU64::new(0),
-            start_ticks: super::sched::ticks(),
-            privileged: AtomicBool::new(false),
-            info: IrqSpinLock::new(info),
-            sig: IrqSpinLock::new(Signals::default()),
+            comm: IrqSpinLock::new(comm),
+            sig: IrqSpinLock::new(ThreadSignals::default()),
             kernel_rsp: UnsafeCell::new(kernel_rsp),
             kstack,
             own: UnsafeCell::new(own),
@@ -208,11 +363,26 @@ impl Task {
     }
 
     pub fn idle_task(cpu: usize, kstack: Option<Box<KernelStack>>, kernel_rsp: u64) -> Task {
-        let info = Info::new(0, 0, 0, alloc::format!("idle/{cpu}"));
-        let mut t = Task::new(u64::MAX - cpu as u64, info, Process::empty(), kstack, kernel_rsp);
+        let id = u64::MAX - cpu as u64;
+        let name = alloc::format!("idle/{cpu}");
+        let group = ThreadGroup::new(id, Info::new(0, 0, 0, name.clone()), GroupSignals::default()).expect("idle task at boot");
+        let mut t = Task::new(id, group, name, Process::empty(), kstack, kernel_rsp);
         t.idle = true;
         t.state = AtomicU8::new(State::Running as u8);
         t
+    }
+
+    pub fn tid(&self) -> Pid {
+        self.tid.load(Ordering::Relaxed)
+    }
+
+    /// Takes over the main thread's id (exec in another thread).
+    pub fn set_tid(&self, tid: Pid) {
+        self.tid.store(tid, Ordering::Relaxed);
+    }
+
+    pub fn tgid(&self) -> Pid {
+        self.group.tgid
     }
 
     pub fn state(&self) -> State {
@@ -234,9 +404,8 @@ impl Task {
 
     /// The task's own state.
     ///
-    /// SAFETY: only the task itself (running), the CPU switching to or from
-    /// it, or the reaper of a dead, off-CPU task may call this, and never
-    /// twice at the same time.
+    /// SAFETY: only the task itself (running), or the CPU switching to or
+    /// from it, may call this, and never twice at the same time.
     #[allow(clippy::mut_from_ref)]
     pub unsafe fn own(&self) -> &mut Process {
         unsafe { &mut *self.own.get() }
@@ -256,10 +425,12 @@ impl Process {
     pub fn empty() -> Process {
         Process {
             mm: None,
-            fds: Vec::new(),
-            cwd: alloc::string::ToString::to_string("/"),
+            files: None,
+            fs: None,
             io_bitmap: None,
             server: None,
+            clear_child_tid: 0,
+            vfork_done: None,
         }
     }
 }

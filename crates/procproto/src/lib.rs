@@ -52,6 +52,8 @@ pub struct System {
     pub load: [u64; 3],
     pub load_shift: u64,
     pub processes: u64,
+    /// Threads of all processes, and those running or runnable.
+    pub threads: u64,
     pub running: u64,
     pub context_switches: u64,
     /// Processes created since boot.

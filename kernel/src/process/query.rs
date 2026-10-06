@@ -28,7 +28,8 @@ fn system() -> System {
     s.load_shift = sched::LOAD_SHIFT as u64;
     {
         let table = TABLE.lock();
-        s.processes = table.tasks.len() as u64;
+        s.processes = table.groups.len() as u64;
+        s.threads = table.tasks.len() as u64;
         s.running = table.tasks.values().filter(|t| matches!(t.state(), State::Running | State::Runnable)).count() as u64;
         s.max_pid = table.next_pid;
     }
@@ -40,31 +41,38 @@ fn system() -> System {
 }
 
 fn process(pid: Pid) -> Result<Process, i64> {
-    let t = TABLE.lock().tasks.get(&pid).cloned().ok_or(ESRCH)?;
-    let info = t.info.lock();
+    let g = TABLE.lock().groups.get(&pid).cloned().ok_or(ESRCH)?;
+    let info = g.info.lock();
+    // The process's state is its main thread's (or the first live one's):
+    // running if any thread runs.
+    let state = if info.threads.is_empty() {
+        STATE_ZOMBIE
+    } else if info.threads.iter().any(|t| matches!(t.state(), State::Running | State::Runnable)) {
+        STATE_RUNNING
+    } else if info.threads.iter().all(|t| t.state() == State::Stopped) {
+        STATE_STOPPED
+    } else {
+        STATE_SLEEPING
+    };
+    let sum = |f: fn(&super::task::Task) -> u64| info.threads.iter().map(|t| f(t)).sum::<u64>();
     let mut p = Process {
         pid,
         ppid: info.ppid,
         pgid: info.pgid,
         sid: info.sid,
-        state: match t.state() {
-            State::Running | State::Runnable => STATE_RUNNING,
-            State::Sleeping => STATE_SLEEPING,
-            State::Stopped => STATE_STOPPED,
-            State::Zombie => STATE_ZOMBIE,
-        } as u64,
-        utime: t.utime.load(Ordering::Relaxed),
-        stime: t.stime.load(Ordering::Relaxed),
-        start: t.start_ticks,
+        state: state as u64,
+        utime: info.dead_utime + sum(|t| t.utime.load(Ordering::Relaxed)),
+        stime: info.dead_stime + sum(|t| t.stime.load(Ordering::Relaxed)),
+        start: g.start_ticks,
         pages: info.mem.as_ref().map_or(0, |m| m.pages.load(Ordering::Relaxed)),
         virt_pages: info.mem.as_ref().map_or(0, |m| m.virt_pages.load(Ordering::Relaxed)),
         nice: info.nice as i64,
-        threads: 1,
-        cpu: t.last_cpu.load(Ordering::Relaxed) as u64,
+        threads: info.threads.len() as u64,
+        cpu: info.threads.first().map_or(0, |t| t.last_cpu.load(Ordering::Relaxed)) as u64,
         flags: 0,
         name: [0; 16],
     };
-    if t.privileged.load(Ordering::Relaxed) {
+    if g.privileged.load(Ordering::Relaxed) {
         p.flags |= FLAG_SERVER;
     }
     if pid == 0 {
@@ -76,8 +84,8 @@ fn process(pid: Pid) -> Result<Process, i64> {
 }
 
 fn text_of(pid: Pid, f: impl FnOnce(&super::task::Info) -> Vec<u8>) -> Result<Vec<u8>, i64> {
-    let t = TABLE.lock().tasks.get(&pid).cloned().ok_or(ESRCH)?;
-    let info = t.info.lock();
+    let g = TABLE.lock().groups.get(&pid).cloned().ok_or(ESRCH)?;
+    let info = g.info.lock();
     Ok(f(&info))
 }
 
@@ -104,13 +112,13 @@ pub fn sysinfo(buf: u64) -> SysResult {
 /// its length; ERANGE if it does not fit (except QUERY_PIDS, which fills
 /// what fits).
 pub fn proc_query(op: u64, arg: u64, buf: u64, len: u64) -> SysResult {
-    if !sched::current().privileged.load(Ordering::Relaxed) {
+    if !sched::current().group.privileged.load(Ordering::Relaxed) {
         return Err(EPERM);
     }
     let bytes: Vec<u8> = match op {
         QUERY_SYSTEM => as_bytes(&system()).to_vec(),
         QUERY_PIDS => {
-            let pids: Vec<u64> = TABLE.lock().tasks.keys().copied().collect();
+            let pids: Vec<u64> = TABLE.lock().groups.keys().copied().collect();
             let fit = (len / 8) as usize;
             pids.iter().take(fit).flat_map(|p| p.to_le_bytes()).collect()
         }

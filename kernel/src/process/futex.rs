@@ -268,6 +268,12 @@ fn requeue(uaddr: u64, n_wake: u64, n_move: u64, uaddr2: u64, cmp: Option<u32>, 
     }
 }
 
+/// Wakes one waiter of the (shared-keyed) futex at `uaddr`: the join of a
+/// thread that exits (CLONE_CHILD_CLEARTID).
+pub fn wake_one(uaddr: u64) -> Result<i64, i64> {
+    wake(uaddr, 1, FUTEX_BITSET_MATCH_ANY, false)
+}
+
 /// futex(uaddr, op, val, timeout/val2, uaddr2, val3).
 pub fn futex(uaddr: u64, op: u64, val: u64, timeout: u64, uaddr2: u64, val3: u64) -> SysResult {
     let private = op & FUTEX_PRIVATE_FLAG != 0;

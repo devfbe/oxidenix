@@ -1,11 +1,20 @@
-//! POSIX signals: per-process actions, mask and pending set; delivery on
-//! every return to user space.
+//! POSIX signals for processes with threads, following Linux.
+//!
+//! Handlers, the process's pending set (signals sent to the process) and
+//! the interval timer belong to the thread group; each thread has its own
+//! mask and pending set (signals sent to the thread: tkill, faults). A
+//! process signal is taken by whichever thread does not block it. Default
+//! actions act on the whole process: a fatal signal ends every thread (a
+//! group exit), a stop signal stops every thread (a group stop) until
+//! SIGCONT. Delivery happens on every return to user space.
+//!
+//! Lock order: group info → group signals → thread signals → wake_lock.
 
 use super::address_space::USER_END;
 use super::errno::*;
 use super::syscall::Frame;
 use super::sched::{self, current, try_wake};
-use super::task::{State, Task};
+use super::task::{State, Task, ThreadGroup};
 use super::{uaccess, Pid, TIMER_HZ};
 use crate::interrupts::gdt;
 use alloc::sync::Arc;
@@ -28,7 +37,7 @@ pub const SIGTTIN: u32 = 21;
 pub const SIGTTOU: u32 = 22;
 const SIGURG: u32 = 23;
 const SIGWINCH: u32 = 28;
-const NSIG: u32 = 64;
+pub const NSIG: u32 = 64;
 
 const SIG_DFL: u64 = 0;
 const SIG_IGN: u64 = 1;
@@ -47,30 +56,55 @@ pub struct SigAction {
     mask: u64,
 }
 
+/// How a process is ending, if it is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum GroupExit {
+    None,
+    /// exit_group or a fatal signal: every thread exits; the status of
+    /// the process.
+    Exiting(i32),
+    /// The thread with this id execs: every other thread exits.
+    Exec(Pid),
+}
+
+/// A process's signal state.
 #[derive(Clone)]
-pub struct Signals {
+pub struct GroupSignals {
     actions: [SigAction; NSIG as usize],
-    pub mask: u64,
+    /// Signals sent to the process.
     pending: u64,
     /// ITIMER_REAL: next SIGALRM tick (0: off) and the reload interval.
     alarm_at: u64,
     alarm_every: u64,
-    /// Signals a sigtimedwait is waiting for (they are usually blocked, so
-    /// they would not wake the task otherwise).
-    waiting_for: u64,
+    /// The stop signal of a group stop in progress (0: none).
+    stopping: u32,
+    pub exit: GroupExit,
 }
 
-impl Default for Signals {
+impl Default for GroupSignals {
     fn default() -> Self {
-        Signals {
+        GroupSignals {
             actions: [SigAction::default(); NSIG as usize],
-            mask: 0,
             pending: 0,
             alarm_at: 0,
             alarm_every: 0,
-            waiting_for: 0,
+            stopping: 0,
+            exit: GroupExit::None,
         }
     }
+}
+
+/// A thread's signal state.
+#[derive(Clone, Default)]
+pub struct ThreadSignals {
+    pub mask: u64,
+    /// Signals sent to this thread.
+    pending: u64,
+    /// Signals a sigtimedwait is waiting for (they are usually blocked, so
+    /// they would not wake the thread otherwise).
+    waiting_for: u64,
+    /// A group stop asks this thread to stop.
+    stop: bool,
 }
 
 fn bit(sig: u32) -> u64 {
@@ -97,25 +131,26 @@ pub fn stopped_status(sig: u32) -> i32 {
     ((sig as i32) << 8) | 0x7f
 }
 
-impl Signals {
-    /// Pending, unblocked signals that would actually do something.
-    fn deliverable(&self) -> u64 {
-        let mut set = self.pending & !(self.mask & !UNBLOCKABLE);
+impl GroupSignals {
+    fn ignored(&self, sig: u32) -> bool {
+        let handler = self.actions[sig as usize - 1].handler;
+        handler == SIG_IGN || (handler == SIG_DFL && default_ignored(sig))
+    }
+
+    /// Pending signals a thread with `t` would act on.
+    fn deliverable(&self, t: &ThreadSignals) -> u64 {
+        let mut set = (t.pending | self.pending) & !(t.mask & !UNBLOCKABLE);
         for sig in 1..=NSIG {
-            if set & bit(sig) == 0 {
-                continue;
-            }
-            let handler = self.actions[sig as usize - 1].handler;
-            if handler == SIG_IGN || (handler == SIG_DFL && default_ignored(sig)) {
+            if set & bit(sig) != 0 && self.ignored(sig) {
                 set &= !bit(sig);
             }
         }
         set
     }
 
-    /// Fork keeps actions and mask, but not pending signals or timers.
-    pub fn for_child(&self) -> Signals {
-        Signals { pending: 0, alarm_at: 0, alarm_every: 0, ..self.clone() }
+    /// Fork keeps the actions, but not pending signals, timers or stops.
+    pub fn for_child(&self) -> GroupSignals {
+        GroupSignals { actions: self.actions, ..GroupSignals::default() }
     }
 
     /// Exec resets caught signals to their default action.
@@ -128,19 +163,26 @@ impl Signals {
     }
 }
 
+impl ThreadSignals {
+    /// A new thread or process keeps the creator's mask, nothing else.
+    pub fn inherit(&self) -> ThreadSignals {
+        ThreadSignals { mask: self.mask, ..ThreadSignals::default() }
+    }
+}
+
 /// Background processes reading from the terminal get SIGTTIN (and EINTR,
 /// so the read restarts once they are continued in the foreground), or EIO
 /// if they ignore or block it.
 pub fn check_tty_read(foreground: Pid) -> Result<(), i64> {
     let me = current();
-    let pgid = me.info.lock().pgid;
-    if me.pid == 0 || foreground == 0 || pgid == foreground {
+    let pgid = me.group.info.lock().pgid;
+    if me.tgid() == 0 || foreground == 0 || pgid == foreground {
         return Ok(());
     }
     {
-        let sig = me.sig.lock();
-        let ignored = sig.actions[SIGTTIN as usize - 1].handler == SIG_IGN;
-        if ignored || sig.mask & bit(SIGTTIN) != 0 {
+        let g = me.group.sig.lock();
+        let ignored = g.actions[SIGTTIN as usize - 1].handler == SIG_IGN;
+        if ignored || me.sig.lock().mask & bit(SIGTTIN) != 0 {
             return Err(EIO);
         }
     }
@@ -148,27 +190,41 @@ pub fn check_tty_read(foreground: Pid) -> Result<(), i64> {
     Err(EINTR)
 }
 
-/// Whether a blocking syscall of the current process should return EINTR.
+/// Whether a blocking syscall of the current thread should return EINTR:
+/// a signal to act on, or a group stop to join.
 pub fn interrupted() -> bool {
-    current().sig.lock().deliverable() != 0
+    let me = current();
+    let g = me.group.sig.lock();
+    let t = me.sig.lock();
+    t.stop || g.deliverable(&t) != 0
 }
 
-/// Raises `sig` for a fault of the current process (a CPU exception). Such
+/// Whether SIGKILL is pending for the current thread (ends waits that
+/// ignore other signals).
+pub fn killed() -> bool {
+    let me = current();
+    let g = me.group.sig.lock();
+    (me.sig.lock().pending | g.pending) & bit(SIGKILL) != 0
+}
+
+/// Raises `sig` for a fault of the current thread (a CPU exception). Such
 /// a signal can be neither blocked nor ignored: as on Linux, the action is
 /// reset to the default (terminate) in that case. Returns whether the
 /// process will die of it (no handler).
 pub fn force(sig: u32) -> bool {
-    let mut s = current().sig.lock();
-    let blocked = s.mask & bit(sig) != 0;
-    let action = &mut s.actions[sig as usize - 1];
+    let me = current();
+    let mut g = me.group.sig.lock();
+    let mut t = me.sig.lock();
+    let blocked = t.mask & bit(sig) != 0;
+    let action = &mut g.actions[sig as usize - 1];
     let default = if blocked || action.handler == SIG_IGN {
         *action = SigAction::default();
         true
     } else {
         action.handler == SIG_DFL
     };
-    s.mask &= !bit(sig);
-    s.pending |= bit(sig);
+    t.mask &= !bit(sig);
+    t.pending |= bit(sig);
     default
 }
 
@@ -178,61 +234,127 @@ fn notify_parent(ppid: Pid) {
     send(ppid, SIGCHLD);
 }
 
-/// Marks `sig` pending for `t` and wakes it from an interruptible sleep.
-/// SIGCONT resumes a stopped process right away; SIGKILL wakes it to die.
-fn post(t: &Arc<Task>, sig: u32) {
-    if t.pid == 0 || t.state() == State::Zombie {
+/// Gets `t` to look at its signals: wakes it from an interruptible sleep,
+/// or, if it runs on another CPU, interrupts it there (it checks on its
+/// way back to user space).
+pub fn kick(t: &Arc<Task>) {
+    if try_wake(t, State::Sleeping) {
+        return;
+    }
+    let cpu = t.last_cpu.load(Ordering::Relaxed);
+    if t.on_cpu.load(Ordering::Acquire) && cpu != crate::smp::cpu().index {
+        if let Some(c) = crate::smp::by_index(cpu) {
+            crate::interrupts::apic::ipi::send_vector(c.apic_id(), crate::interrupts::apic::ipi::RESCHEDULE_VECTOR);
+        }
+    }
+}
+
+/// Queues `sig` for `group` (process-directed) or for one of its threads,
+/// and wakes a thread that will act on it. SIGCONT resumes a stopped
+/// process right away; SIGKILL wakes stopped threads to die. Never
+/// allocates (it runs in interrupt context for Ctrl+C).
+fn post(group: &Arc<ThreadGroup>, thread: Option<&Arc<Task>>, sig: u32) {
+    if group.tgid == 0 {
         return;
     }
     let mut continued_parent = None;
-    let (wake, resume) = {
-        let mut s = t.sig.lock();
-        if sig == SIGCONT {
-            s.pending &= !STOP_SIGNALS;
-        } else if is_stop(sig) {
-            s.pending &= !bit(SIGCONT);
+    {
+        let mut info = group.info.lock();
+        if info.threads.is_empty() {
+            return;
         }
-        s.pending |= bit(sig);
-        let resume = sig == SIGCONT || sig == SIGKILL;
-        (s.deliverable() != 0 || s.waiting_for & bit(sig) != 0, resume)
-    };
-    if resume && try_wake(t, State::Stopped) && sig == SIGCONT {
-        let mut info = t.info.lock();
-        info.report = Some(CONTINUED_STATUS);
-        continued_parent = Some(info.ppid);
-    }
-    if wake {
-        try_wake(t, State::Sleeping);
+        let mut g = group.sig.lock();
+        if sig == SIGCONT {
+            let stopped = g.stopping != 0 || info.threads.iter().any(|t| t.state() == State::Stopped);
+            g.pending &= !STOP_SIGNALS;
+            g.stopping = 0;
+            for t in info.threads.iter() {
+                let mut ts = t.sig.lock();
+                ts.pending &= !STOP_SIGNALS;
+                ts.stop = false;
+                drop(ts);
+                try_wake(t, State::Stopped);
+            }
+            if stopped {
+                info.report = Some(CONTINUED_STATUS);
+                continued_parent = Some(info.ppid);
+            }
+        } else if is_stop(sig) {
+            g.pending &= !bit(SIGCONT);
+            for t in info.threads.iter() {
+                t.sig.lock().pending &= !bit(SIGCONT);
+            }
+        }
+        if sig == SIGKILL {
+            for t in info.threads.iter() {
+                try_wake(t, State::Stopped);
+            }
+        }
+        match thread {
+            Some(t) => t.sig.lock().pending |= bit(sig),
+            None => g.pending |= bit(sig),
+        }
+        if !g.ignored(sig) || thread.is_some_and(|t| t.sig.lock().waiting_for & bit(sig) != 0) {
+            // A thread that takes it: the target, or the first one that
+            // does not block it (or waits for it in sigtimedwait).
+            let takes = |t: &Arc<Task>| {
+                let ts = t.sig.lock();
+                ts.mask & bit(sig) == 0 || bit(sig) & UNBLOCKABLE != 0 || ts.waiting_for & bit(sig) != 0
+            };
+            match thread {
+                Some(t) => {
+                    if takes(t) {
+                        kick(t);
+                    }
+                }
+                None => {
+                    if let Some(t) = info.threads.iter().find(|t| takes(t)) {
+                        kick(t);
+                    }
+                }
+            }
+        }
     }
     if let Some(ppid) = continued_parent {
         notify_parent(ppid);
     }
 }
 
+/// Sends SIGKILL to one thread (a group exit or exec ends the others).
+pub fn kill_thread(t: &Arc<Task>) {
+    post(&t.group.clone(), Some(t), SIGKILL);
+}
+
+/// The process with id `pid`, or the process of the thread with that id.
+fn group_of(pid: Pid) -> Option<Arc<ThreadGroup>> {
+    let table = sched::TABLE.lock();
+    table.groups.get(&pid).cloned().or_else(|| table.tasks.get(&pid).map(|t| t.group.clone()))
+}
+
+/// Sends `sig` to process `pid` (from the kernel: no permission checks).
 pub fn send(pid: Pid, sig: u32) {
     // The table lock must be released before posting: SIGCONT notifies
     // the parent, which sends again.
-    let target = sched::TABLE.lock().tasks.get(&pid).cloned();
-    if let Some(t) = target {
-        post(&t, sig);
+    if let Some(g) = group_of(pid) {
+        post(&g, None, sig);
     }
 }
 
 /// Sends `sig` to every process in group `pgid`. Called from interrupt
 /// context (Ctrl+C), so it must not allocate.
 pub fn send_group(pgid: Pid, sig: u32) {
-    let mut targets: heapless::Vec<Arc<Task>, { sched::MAX_PROCS }> = heapless::Vec::new();
+    let mut targets: heapless::Vec<Arc<ThreadGroup>, { sched::MAX_PROCS }> = heapless::Vec::new();
     {
         let table = sched::TABLE.lock();
         // Servers never belong to a terminal's job; skip them regardless.
-        for t in table.tasks.values() {
-            if t.pid != 0 && !t.privileged.load(Ordering::Relaxed) && t.info.lock().pgid == pgid {
-                let _ = targets.push(t.clone());
+        for g in table.groups.values() {
+            if g.tgid != 0 && !g.privileged.load(Ordering::Relaxed) && g.info.lock().pgid == pgid {
+                let _ = targets.push(g.clone());
             }
         }
     }
-    for t in &targets {
-        post(t, sig);
+    for g in &targets {
+        post(g, None, sig);
     }
 }
 
@@ -245,25 +367,32 @@ pub fn kill(pid: i64, sig: u64) -> SysResult {
     }
     let sig = sig as u32;
     let me = current();
-    let (my_pid, my_pgid) = (me.pid, me.info.lock().pgid);
-    let mut targets: heapless::Vec<Arc<Task>, { sched::MAX_PROCS }> = heapless::Vec::new();
-    {
-        let table = sched::TABLE.lock();
-        if pid > 0 && my_pid != 0 && table.tasks.get(&(pid as Pid)).is_some_and(|t| t.privileged.load(Ordering::Relaxed)) {
+    let (my_pid, my_pgid) = (me.tgid(), me.group.info.lock().pgid);
+    let mut targets: heapless::Vec<Arc<ThreadGroup>, { sched::MAX_PROCS }> = heapless::Vec::new();
+    if pid > 0 {
+        let g = group_of(pid as Pid).filter(|g| g.tgid != 0 && g.info.lock().exit_status.is_none()).ok_or(ESRCH)?;
+        if my_pid != 0 && g.privileged.load(Ordering::Relaxed) {
             return Err(EPERM);
         }
-        for t in table.tasks.values() {
-            if t.pid == 0 || t.state() == State::Zombie || (my_pid != 0 && t.privileged.load(Ordering::Relaxed)) {
+        let _ = targets.push(g);
+    } else {
+        let table = sched::TABLE.lock();
+        for g in table.groups.values() {
+            if g.tgid == 0 || (my_pid != 0 && g.privileged.load(Ordering::Relaxed)) {
+                continue;
+            }
+            let info = g.info.lock();
+            if info.exit_status.is_some() {
                 continue;
             }
             let selected = match pid {
-                p if p > 0 => t.pid == p as Pid,
-                0 => t.info.lock().pgid == my_pgid,
-                -1 => t.pid != 1 && t.pid != my_pid,
-                p => t.info.lock().pgid == p.unsigned_abs(),
+                0 => info.pgid == my_pgid,
+                -1 => g.tgid != 1 && g.tgid != my_pid,
+                p => info.pgid == p.unsigned_abs(),
             };
+            drop(info);
             if selected {
-                let _ = targets.push(t.clone());
+                let _ = targets.push(g.clone());
             }
         }
     }
@@ -271,9 +400,27 @@ pub fn kill(pid: i64, sig: u64) -> SysResult {
         return Err(ESRCH);
     }
     if sig != 0 {
-        for t in &targets {
-            post(t, sig);
+        for g in &targets {
+            post(g, None, sig);
         }
+    }
+    Ok(0)
+}
+
+/// tgkill(tgid, tid, sig) and tkill (`tgid` None): a signal for one thread.
+pub fn tgkill(tgid: Option<i64>, tid: i64, sig: u64) -> SysResult {
+    if sig > NSIG as u64 || tid <= 0 || tgid.is_some_and(|g| g <= 0) {
+        return Err(EINVAL);
+    }
+    let t = sched::TABLE.lock().tasks.get(&(tid as Pid)).cloned().ok_or(ESRCH)?;
+    if tgid.is_some_and(|g| g as Pid != t.tgid()) {
+        return Err(ESRCH);
+    }
+    if current().tgid() != 0 && t.group.privileged.load(Ordering::Relaxed) && t.tgid() != current().tgid() {
+        return Err(EPERM);
+    }
+    if sig != 0 {
+        post(&t.group.clone(), Some(&t), sig as u32);
     }
     Ok(0)
 }
@@ -281,19 +428,19 @@ pub fn kill(pid: i64, sig: u64) -> SysResult {
 /// Sends SIGALRM to every process whose interval timer expired by `now`
 /// and reloads it. Runs in the timer interrupt; never allocates.
 pub fn expire_alarms(now: u64) {
-    let mut due: heapless::Vec<Arc<Task>, { sched::MAX_PROCS }> = heapless::Vec::new();
+    let mut due: heapless::Vec<Arc<ThreadGroup>, { sched::MAX_PROCS }> = heapless::Vec::new();
     {
         let table = sched::TABLE.lock();
-        for t in table.tasks.values() {
-            let mut s = t.sig.lock();
+        for g in table.groups.values() {
+            let mut s = g.sig.lock();
             if s.alarm_at != 0 && s.alarm_at <= now {
                 s.alarm_at = if s.alarm_every != 0 { now.saturating_add(s.alarm_every) } else { 0 };
-                let _ = due.push(t.clone());
+                let _ = due.push(g.clone());
             }
         }
     }
-    for t in &due {
-        post(t, SIGALRM);
+    for g in &due {
+        post(g, None, SIGALRM);
     }
 }
 
@@ -303,7 +450,7 @@ pub fn set_alarm(value_us: u64, interval_us: u64) -> (u64, u64) {
     let to_ticks = |us: u64| us.saturating_mul(TIMER_HZ).div_ceil(1_000_000);
     let to_us = |ticks: u64| ticks.saturating_mul(1_000_000) / TIMER_HZ;
     let now = sched::ticks();
-    let mut s = current().sig.lock();
+    let mut s = current().group.sig.lock();
     let old = (to_us(s.alarm_at.saturating_sub(now)), to_us(s.alarm_every));
     s.alarm_at = if value_us == 0 { 0 } else { now.saturating_add(to_ticks(value_us).max(1)) };
     s.alarm_every = if value_us == 0 { 0 } else { to_ticks(interval_us) };
@@ -313,7 +460,7 @@ pub fn set_alarm(value_us: u64, interval_us: u64) -> (u64, u64) {
 /// The current ITIMER_REAL setting: (remaining, interval) in microseconds.
 pub fn get_alarm() -> (u64, u64) {
     let now = sched::ticks();
-    let s = current().sig.lock();
+    let s = current().group.sig.lock();
     let remaining = if s.alarm_at == 0 { 0 } else { s.alarm_at.saturating_sub(now).max(1) };
     let to_us = |ticks: u64| ticks.saturating_mul(1_000_000) / TIMER_HZ;
     (to_us(remaining), to_us(s.alarm_every))
@@ -341,14 +488,19 @@ pub fn sigtimedwait(set: u64, info: u64, timeout: u64, size: u64) -> SysResult {
     let result = loop {
         let wait = sched::prepare_to_sleep();
         {
-            let mut s = me.sig.lock();
-            let ready = s.pending & wanted;
+            let mut g = me.group.sig.lock();
+            let mut t = me.sig.lock();
+            let ready = (t.pending | g.pending) & wanted;
             if ready != 0 {
                 let sig = ready.trailing_zeros() + 1;
-                s.pending &= !bit(sig);
+                if t.pending & bit(sig) != 0 {
+                    t.pending &= !bit(sig);
+                } else {
+                    g.pending &= !bit(sig);
+                }
                 break Ok(sig);
             }
-            s.waiting_for = wanted;
+            t.waiting_for = wanted;
         }
         if interrupted() {
             break Err(EINTR);
@@ -379,13 +531,19 @@ pub fn sigaction(sig: u64, act: u64, oldact: u64) -> SysResult {
         return Err(EINVAL);
     }
     let old = {
-        let mut s = current().sig.lock();
-        let old = s.actions[sig as usize - 1];
+        let group = &current().group;
+        let info = group.info.lock();
+        let mut g = group.sig.lock();
+        let old = g.actions[sig as usize - 1];
         if let Some(mut new) = new {
             new.mask &= !UNBLOCKABLE;
-            s.actions[sig as usize - 1] = new;
-            if new.handler == SIG_IGN || (new.handler == SIG_DFL && default_ignored(sig)) {
-                s.pending &= !bit(sig);
+            g.actions[sig as usize - 1] = new;
+            // A signal that is now ignored is dropped wherever it pends.
+            if g.ignored(sig) {
+                g.pending &= !bit(sig);
+                for t in info.threads.iter() {
+                    t.sig.lock().pending &= !bit(sig);
+                }
             }
         }
         old
@@ -466,26 +624,50 @@ fn rewind(frame: &mut Frame, nr: u64) {
     frame.rip -= 2; // length of the `syscall` instruction
 }
 
-/// Stops the current process until SIGCONT (or SIGKILL) arrives. A
-/// SIGCONT that came in meanwhile cancels the stop: it is checked under the
-/// signal lock, which `post` takes too.
-fn stop(sig: u32) {
+/// Joins (or starts) the group stop for `sig`: stops the current thread
+/// until SIGCONT (or SIGKILL). The last thread to stop reports the stop
+/// to the parent. A SIGCONT that came in meanwhile cancels the stop: it is
+/// checked under the group's signal lock, which `post` takes too.
+fn group_stop(sig: u32) {
     let me = current();
-    {
-        let s = me.sig.lock();
-        if s.pending & (bit(SIGCONT) | bit(SIGKILL)) != 0 {
+    let report = {
+        let info = me.group.info.lock();
+        let mut g = me.group.sig.lock();
+        if g.exit != GroupExit::None {
             return;
         }
-        let _w = me.wake_lock.lock();
-        me.set_state(State::Stopped);
-    }
-    let ppid = {
-        let mut info = me.info.lock();
-        info.report = Some(stopped_status(sig));
-        info.ppid
+        if g.stopping == 0 {
+            if sig == 0 {
+                return;
+            }
+            // Start the group stop: every other thread joins it.
+            g.stopping = sig;
+            for t in info.threads.iter().filter(|t| !core::ptr::eq(&***t, me)) {
+                t.sig.lock().stop = true;
+                kick(t);
+            }
+        }
+        if (me.sig.lock().pending | g.pending) & (bit(SIGCONT) | bit(SIGKILL)) != 0 {
+            return;
+        }
+        {
+            let _w = me.wake_lock.lock();
+            me.set_state(State::Stopped);
+        }
+        let all = info.threads.iter().all(|t| t.state() == State::Stopped);
+        all.then(|| (info.ppid, stopped_status(g.stopping)))
     };
-    notify_parent(ppid);
+    if let Some((ppid, status)) = report {
+        me.group.info.lock().report = Some(status);
+        notify_parent(ppid);
+    }
     sched::schedule();
+}
+
+/// The current thread dies of `sig`: with the whole process, unless the
+/// process is already ending (then just this thread).
+fn die(sig: u32) -> ! {
+    super::exit_group(sig as i32)
 }
 
 /// Handles pending signals before returning to user space: stops the
@@ -498,52 +680,71 @@ pub fn deliver(frame: &mut Frame, syscall: Option<u64>) {
     }
     let mut interrupted = syscall.filter(|&nr| frame.rax == (-EINTR) as u64 && restartable(nr));
     loop {
-        let action = (|| {
-            let mut s = current().sig.lock();
-            let set = s.deliverable();
-            if set == 0 {
+        enum Next {
+            Done,
+            Stop(u32),
+            Die(u32),
+            Handle(u32, SigAction, u64),
+        }
+        let next = {
+            let me = current();
+            let mut g = me.group.sig.lock();
+            let mut t = me.sig.lock();
+            let set = g.deliverable(&t);
+            if t.stop && set & bit(SIGKILL) == 0 {
+                t.stop = false;
+                Next::Stop(0)
+            } else if set == 0 {
                 // Drop signals that are pending but ignored.
-                let ignored = s.pending & !s.mask;
-                s.pending &= !ignored;
-                return None;
+                let ignored = (t.pending | g.pending) & !t.mask;
+                t.pending &= !ignored;
+                g.pending &= !ignored;
+                Next::Done
+            } else {
+                let sig = set.trailing_zeros() + 1;
+                if t.pending & bit(sig) != 0 {
+                    t.pending &= !bit(sig);
+                } else {
+                    g.pending &= !bit(sig);
+                }
+                let action = g.actions[sig as usize - 1];
+                if action.handler == SIG_DFL && is_stop(sig) {
+                    Next::Stop(sig)
+                } else if action.handler == SIG_DFL {
+                    Next::Die(sig)
+                } else {
+                    let old_mask = t.mask;
+                    let mut block = action.mask;
+                    if action.flags & SA_NODEFER == 0 {
+                        block |= bit(sig);
+                    }
+                    t.mask = (t.mask | block) & !UNBLOCKABLE;
+                    if action.flags & SA_RESETHAND != 0 {
+                        g.actions[sig as usize - 1] = SigAction::default();
+                    }
+                    Next::Handle(sig, action, old_mask)
+                }
             }
-            let sig = set.trailing_zeros() + 1;
-            s.pending &= !bit(sig);
-            let action = s.actions[sig as usize - 1];
-            if action.handler == SIG_DFL {
-                return Some((sig, action, 0));
-            }
-            let old_mask = s.mask;
-            let mut block = action.mask;
-            if action.flags & SA_NODEFER == 0 {
-                block |= bit(sig);
-            }
-            s.mask = (s.mask | block) & !UNBLOCKABLE;
-            if action.flags & SA_RESETHAND != 0 {
-                s.actions[sig as usize - 1] = SigAction::default();
-            }
-            Some((sig, action, old_mask))
-        })();
-        let Some((sig, action, old_mask)) = action else {
-            // Nothing ran in user space, so the interrupted call can simply go on.
-            if let Some(nr) = interrupted {
-                rewind(frame, nr);
-            }
-            return;
         };
-        if action.handler == SIG_DFL && is_stop(sig) {
-            stop(sig);
-            continue;
-        }
-        if action.handler == SIG_DFL {
-            super::exit(sig as i32);
-        }
-        if let Some(nr) = interrupted.take() {
-            if action.flags & SA_RESTART != 0 {
-                rewind(frame, nr);
+        match next {
+            Next::Done => {
+                // Nothing ran in user space, so the interrupted call can simply go on.
+                if let Some(nr) = interrupted {
+                    rewind(frame, nr);
+                }
+                return;
+            }
+            Next::Stop(sig) => group_stop(sig),
+            Next::Die(sig) => die(sig),
+            Next::Handle(sig, action, old_mask) => {
+                if let Some(nr) = interrupted.take() {
+                    if action.flags & SA_RESTART != 0 {
+                        rewind(frame, nr);
+                    }
+                }
+                return push_handler_frame(frame, sig, action, old_mask);
             }
         }
-        return push_handler_frame(frame, sig, action, old_mask);
     }
 }
 
@@ -551,7 +752,7 @@ fn push_handler_frame(frame: &mut Frame, sig: u32, action: SigAction, old_mask: 
     // Without a restorer the handler could never return; a handler outside
     // user space would make iretq fault in ring 0.
     if action.flags & SA_RESTORER == 0 || action.handler >= USER_END {
-        super::exit(sig as i32);
+        die(sig);
     }
 
     let mut info = [0u32; 32];
@@ -561,7 +762,7 @@ fn push_handler_frame(frame: &mut Frame, sig: u32, action: SigAction, old_mask: 
     let size = core::mem::size_of::<SigFrame>() as u64;
     let sp = ((frame.rsp.wrapping_sub(128).wrapping_sub(size)) & !0xf).wrapping_sub(8);
     if uaccess::write(sp, sigframe).is_err() {
-        super::exit(11);
+        die(SIGSEGV);
     }
     frame.rsp = sp;
     frame.rip = action.handler;
@@ -578,12 +779,12 @@ pub fn sigreturn(frame: &mut Frame) -> SysResult {
     let base = frame.rsp.wrapping_sub(8);
     let sf: SigFrame = match uaccess::read(base) {
         Ok(sf) => sf,
-        Err(_) => super::exit(11),
+        Err(_) => die(SIGSEGV),
     };
     let mut saved = sf.saved;
     // A non-canonical or kernel address would make iretq fault in ring 0.
     if saved.rip >= USER_END || saved.rsp >= USER_END {
-        super::exit(11);
+        die(SIGSEGV);
     }
     // Never let user space choose privileged selectors or flags.
     const USER_FLAGS: u64 = 0xcd5; // CF PF AF ZF SF TF DF OF

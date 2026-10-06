@@ -90,8 +90,9 @@ pub fn loadavg(s: &System) -> String {
         fixed(s.load[0], s.load_shift),
         fixed(s.load[1], s.load_shift),
         fixed(s.load[2], s.load_shift),
+        // Runnable and all scheduling entities: threads, as on Linux.
         s.running,
-        s.processes,
+        s.threads,
         s.max_pid.saturating_sub(1)
     )
 }

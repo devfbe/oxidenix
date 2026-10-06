@@ -1,8 +1,8 @@
 //! The SMP scheduler: per-CPU run queues, wait queues, context switches.
 //!
-//! Lock order (outer to inner): process table → task info → task signals →
-//! wait-queue bucket → task wake_lock → run queue. The heap and the frame
-//! allocator are leaves.
+//! Lock order (outer to inner): process table → group info → group
+//! signals → thread signals → wait-queue bucket → task wake_lock → run
+//! queue. The heap and the frame allocator are leaves.
 //!
 //! Sleeping uses the classic protocol that cannot lose a wakeup:
 //!
@@ -18,7 +18,7 @@
 //! A wakeup that finds the task still on its CPU (not yet descheduled) only
 //! sets it Running again; `schedule` then keeps it. Otherwise it is queued.
 
-use super::task::{KernelStack, State, Task};
+use super::task::{KernelStack, State, Task, ThreadGroup};
 use super::Pid;
 use crate::smp::{self, Cpu};
 use crate::sync::IrqSpinLock;
@@ -34,18 +34,24 @@ use x86_64::VirtAddr;
 
 pub const MAX_PROCS: usize = 256;
 
-/// All processes by pid (idle tasks are not listed).
+/// All threads by thread id and all processes (live and zombies) by
+/// process id; idle tasks are not listed. Thread and process ids share
+/// one number space: a process's id is its main thread's.
 pub struct Table {
     pub tasks: BTreeMap<Pid, Arc<Task>>,
+    pub groups: BTreeMap<Pid, Arc<ThreadGroup>>,
     pub next_pid: Pid,
-    /// Pids handed out whose task is still being built: they count against
+    /// Ids handed out whose task is still being built: they count against
     /// the limit, so concurrent forks on several CPUs cannot exceed it.
     pub reserved: usize,
+    /// Processes whose threads all exited and that wait to be reaped.
+    pub zombies: usize,
 }
 
-pub static TABLE: IrqSpinLock<Table> = IrqSpinLock::new(Table { tasks: BTreeMap::new(), next_pid: 1, reserved: 0 });
+pub static TABLE: IrqSpinLock<Table> =
+    IrqSpinLock::new(Table { tasks: BTreeMap::new(), groups: BTreeMap::new(), next_pid: 1, reserved: 0, zombies: 0 });
 
-/// A pid taken under the process limit; `insert` turns it into a listed
+/// An id taken under the task limit; `insert` turns it into a listed
 /// task, dropping it gives the slot back.
 pub struct PidReservation {
     pub pid: Pid,
@@ -59,11 +65,12 @@ pub fn forks() -> u64 {
     FORKS.load(Ordering::Relaxed)
 }
 
-/// Takes the next pid, or EAGAIN at the process limit.
+/// Takes the next id, or EAGAIN at the limit of tasks (threads and
+/// zombies).
 pub fn reserve_pid() -> Result<PidReservation, i64> {
     FORKS.fetch_add(1, Ordering::Relaxed);
     let mut table = TABLE.lock();
-    if table.tasks.len() + table.reserved >= MAX_PROCS {
+    if table.tasks.len() + table.zombies + table.reserved >= MAX_PROCS {
         return Err(super::errno::EAGAIN);
     }
     let pid = table.next_pid;
@@ -73,11 +80,26 @@ pub fn reserve_pid() -> Result<PidReservation, i64> {
 }
 
 impl PidReservation {
-    pub fn insert(mut self, task: Arc<Task>) {
+    /// Lists `task` (and its process, if it is the main thread of a new
+    /// one). A new thread of a process that is already ending is refused
+    /// (EAGAIN), so no thread outlives a group exit or exec.
+    pub fn insert(mut self, task: Arc<Task>) -> Result<(), i64> {
         let mut table = TABLE.lock();
+        let group = task.group.clone();
+        let mut info = group.info.lock();
+        if task.tid() != group.tgid && group.sig.lock().exit != super::signal::GroupExit::None {
+            return Err(super::errno::EAGAIN);
+        }
+        info.threads.try_reserve(1).map_err(|_| super::errno::ENOMEM)?;
+        info.threads.push(task.clone());
+        drop(info);
         table.tasks.insert(self.pid, task);
+        if self.pid == group.tgid {
+            table.groups.insert(self.pid, group);
+        }
         table.reserved -= 1;
         self.done = true;
+        Ok(())
     }
 }
 
@@ -291,7 +313,7 @@ pub fn prepare_to_wait(chan: usize) -> Wait {
 
 /// Prepares a sleep that ends only at a deadline or by a signal.
 pub fn prepare_to_sleep() -> Wait {
-    prepare_to_wait(private_chan(current().pid))
+    prepare_to_wait(private_chan(current().tid()))
 }
 
 impl Wait {
@@ -579,7 +601,7 @@ pub fn tick(user: bool) {
             .lock()
             .tasks
             .values()
-            .filter(|t| matches!(t.state(), State::Running | State::Runnable) && t.pid != 0)
+            .filter(|t| matches!(t.state(), State::Running | State::Runnable) && t.tid() != 0)
             .count();
         update_load(runnable as u64);
     }

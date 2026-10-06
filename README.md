@@ -57,6 +57,10 @@ Its [commit history](#development-history) records every step.
   scale (about 3x on 4 emulated CPUs), and `sched_setaffinity` pins processes to CPUs.
 - **Preemptive multitasking**: round-robin scheduler at 100 Hz, separate address spaces,
   `fork` with **copy-on-write**, `execve`, `wait4`, process groups and sessions.
+- **Threads**: `clone` with Linux's sharing flags, so musl's pthreads work unchanged (mutexes
+  and condition variables on `futex`, thread-local storage, join, detached threads); threads of
+  one process run in parallel on all CPUs, with TLB shootdowns keeping their view of memory
+  coherent. Real `vfork` and `posix_spawn`.
 - **POSIX signals**: handlers, masks, `kill`, `SIGCHLD`, `EINTR` with automatic syscall restart,
   and **Ctrl+C** interrupting any foreground program, even a busy loop without system calls.
 - **Job control**: Ctrl+Z stops the foreground job, then `jobs`, `fg`, `bg` and `kill %n` work
@@ -109,7 +113,7 @@ The kernel boots straight into Bash. Things to try:
 
 ```sh
 ls -l /bin | head          # BusyBox applets
-cowtest; vmtest; futextest; sigtest; jobtest; oomtest; fstest; forktest; nettest; smptest # self-tests
+cowtest; vmtest; futextest; threadtest; sigtest; jobtest; oomtest; fstest; forktest; nettest; smptest # self-tests
 nproc; cat /proc/cpuinfo   # 4 CPUs; 'cpus' in the kernel monitor shows their load
 wget -O - http://example.com # DNS and HTTP through netd; nslookup and nc work as well
 ping -c 3 1.1.1.1          # raw ICMP sockets; oxidenix answers pings itself, too
@@ -165,7 +169,10 @@ oxidenix/
 │       ├── memory/              physical frame allocator with refcounts (frame.rs),
 │       │                        kernel heap and page table access (mod.rs)
 │       ├── process/             process lifecycle and syscalls on it (mod.rs),
-│       │   ├── task.rs          tasks: owned state, locked info and signals
+│       │   ├── task.rs          tasks (threads), thread groups (processes), shared tables
+│       │   ├── clone.rs         clone, fork, vfork
+│       │   ├── exec.rs          execve, ending the other threads first
+│       │   ├── exit.rs          thread and process exit, wait4
 │       │   ├── sched.rs         run queues, wait queues, context switch, idle
 │       │   ├── address_space.rs areas, demand paging, copy-on-write
 │       │   ├── tlb.rs           which CPUs use an address space, TLB shootdowns
@@ -298,11 +305,26 @@ About 9,200 lines of Rust (without comments and blank lines) in the kernel and 3
 The scheduler is built for several CPUs (`process/sched.rs`, design in
 [docs/design/smp.md](docs/design/smp.md)); there is no big kernel lock.
 
-- **Tasks** (`process/task.rs`): a process is an `Arc<Task>`. What only the process itself
-  touches (address space, descriptors, cwd, FPU state) is owned by the task; relations,
-  name and exit/stop reports (`info`) and signal state with the interval timer (`sig`) have
-  their own locks; the scheduling state is atomic. The process table maps pids to tasks.
-- **One kernel stack per process** (64 KiB). A context switch saves callee-saved registers,
+- **Tasks and thread groups** (`process/task.rs`): a task is one thread; a process is a
+  thread group (`ThreadGroup`) of tasks that share the process id, signal handlers, the
+  process's pending signals and interval timer, relations, and the exit status (each with its
+  own lock). As on Linux, the rest is shared per clone flag: the address space (`Mm`,
+  `CLONE_VM`), the descriptor table (`Files`, `CLONE_FILES`) and the working directory
+  (`FsInfo`, `CLONE_FS`) are separate objects that tasks hold references to. A task owns those
+  references, its I/O permissions and its `CLONE_CHILD_CLEARTID` word; FPU state and TLS
+  pointer are saved per task; scheduling state is atomic. The process table maps thread ids to
+  tasks and process ids to thread groups (zombies included); both share one number space, and a
+  process's id is its main thread's.
+- **Threads** (`clone.rs`, `exit.rs`, `exec.rs`): `clone` checks Linux's flag rules (threads
+  need shared handlers, shared handlers need shared memory), sets the new thread's stack, TLS
+  (`CLONE_SETTLS`) and id words (`CLONE_PARENT_SETTID`, `CLONE_CHILD_SETTID`). A thread that
+  exits clears its `CLONE_CHILD_CLEARTID` word and wakes its futex (that is how
+  `pthread_join` works) and leaves no trace; the last thread ends the process, which stays a
+  zombie until reaped. `exit_group` and fatal signals end all threads; `execve` in a thread
+  first ends the others and takes over the process id. `fork` copies only the calling thread.
+  `vfork` (and `clone` with `CLONE_VM|CLONE_VFORK`, as `posix_spawn` uses it) shares the address
+  space and suspends the parent until the child execs or exits.
+- **One kernel stack per task** (64 KiB). A context switch saves callee-saved registers,
   the FPU/SSE state (`fxsave`), the FS base (musl's TLS pointer), and switches CR3, the TSS
   stack and I/O bitmap, and the syscall stack in the CPU block.
 - **Per-CPU run queues**, round robin, driven by each CPU's local APIC timer at 100 Hz
@@ -313,7 +335,8 @@ The scheduler is built for several CPUs (`process/sched.rs`, design in
   `fork`) that queueing, stealing and migration respect. Each CPU has an idle task; idling loads the kernel's page table, so an address
   space is only ever active on the CPU running its process.
 - **`on_cpu`** marks a task whose kernel stack is still in use; a CPU that picks it waits
-  until its previous CPU finished switching away, and the reaper frees a zombie only then.
+  until its previous CPU finished switching away. An exited task's last reference is dropped
+  by the next task on that CPU, after the switch, so its stack is freed only then.
 - **Sleeping without lost wakeups**: a blocking path first registers on its wait channel
   (`prepare_to_wait`), then checks its condition, then sleeps; a per-task wake lock
   serializes wakeups with the task descheduling itself. Pipes, the TTY, IPC, `wait4`, stops
@@ -352,8 +375,14 @@ The scheduler is built for several CPUs (`process/sched.rs`, design in
 
 ### Signals
 
-- Per process: 64 actions, a blocked mask and a pending set. `fork` inherits actions and mask,
+- Per process: 64 actions, the pending set of signals sent to the process, and the interval
+  timer. Per thread: the blocked mask and the pending set of signals sent to that thread
+  (`tkill`/`tgkill`, faults). A process signal goes to the first thread that does not block it,
+  which is woken (or interrupted on its CPU by an IPI). `fork` inherits actions and mask,
   `exec` resets caught signals.
+- Default actions act on the whole process, as on Linux: a fatal signal ends every thread, and
+  a stop signal starts a group stop that every thread joins; the last one to stop reports it
+  to the parent, and `SIGCONT` resumes them all.
 - **Delivery** happens on every return to user space (after syscalls and after timer
   preemption). Default actions terminate, ignore or stop. For handlers, the kernel pushes a
   signal frame on the user stack: restorer address, saved register frame, saved mask, the
@@ -553,7 +582,7 @@ Linux x86_64 numbers, grouped by area (about 120 in total):
 | I/O multiplexing | `poll` `ppoll` `select` `pselect6` |
 | Memory | `brk` `mmap` (private, shared, anonymous, file, `MAP_FIXED[_NOREPLACE]`, `MAP_NORESERVE`, `MAP_POPULATE`) `munmap` `mprotect` `mremap` `madvise` (`DONTNEED`, `FREE`) `msync` `mlock` (no-ops) |
 | CPUs | `sched_getaffinity` `sched_setaffinity` `getcpu` |
-| Processes | `fork` `vfork` (as `fork`) `execve` `exit` `exit_group` `wait4` `getpid` `getppid` `gettid` `set_tid_address` `sched_yield` `arch_prctl` `prlimit64` `getrusage` |
+| Processes and threads | `clone` (`CLONE_VM` `FS` `FILES` `SIGHAND` `THREAD` `VFORK` `PARENT` `SETTLS` `PARENT_SETTID` `CHILD_SETTID` `CHILD_CLEARTID`) `fork` `vfork` `execve` `exit` (one thread) `exit_group` `wait4` `getpid` `getppid` `gettid` `set_tid_address` `sched_yield` `arch_prctl` `prlimit64` `getrusage` |
 | Groups and IDs | `setpgid` `getpgid` `getpgrp` `setsid` `getsid` `getuid` `geteuid` `getgid` `getegid` `getresuid` `getresgid` `setuid` `setgid` |
 | Synchronization | `futex` (`WAIT`, `WAKE`, `WAIT_BITSET`, `WAKE_BITSET`, `REQUEUE`, `CMP_REQUEUE`; private and shared, monotonic and realtime timeouts) |
 | Signals | `rt_sigaction` `rt_sigprocmask` `rt_sigreturn` `kill` `tkill` `tgkill` `pause` `sigaltstack` `alarm` `setitimer` `getitimer` (`ITIMER_REAL`, 10 ms resolution) `rt_sigtimedwait` |
@@ -584,6 +613,7 @@ Each of these programs and scripts lives in the root filesystem and runs inside 
 | `jobtest` | stop/continue reporting through `wait4`, restart of a stopped `read()`, `SIGKILL` on stopped processes, `SA_RESTART` |
 | `forktest` | `fork`, `execve`, `wait4`, preemptive interleaving of two workers |
 | `proctest` | `prctl` name round-trip, `capget`/`capset` versions and the full capability set, no-new-privs, `PR_SET_PDEATHSIG` delivered to an orphan (via `sigwait`); `/proc` as htop reads it (directory fds with `O_PATH` and `openat`), `/proc/self`, the formats of `stat`, `meminfo`, `loadavg`, `uptime` and `/proc/<pid>/{stat,cmdline,exe}`, `sysinfo`, the CPU list in `/sys`, read-only `/proc` |
+| `threadtest` | pthreads: create/join, own tids, TLS, 4 threads counting under a mutex, condition variables and timed waits, 300 threads in a row, `Threads:` in `/proc/self/status`, `exit` and fatal signals ending all threads, the process outliving its main thread, group stop and continue, process signals reaching a thread that does not block them, `pthread_kill`, `fork` and `execve` in a thread, real `vfork`, `posix_spawn`, `munmap` and `mprotect` reaching a writer on another CPU (TLB shootdown) |
 | `futextest` | `FUTEX_WAIT` on a changed value (`EAGAIN`), timeouts, `EINVAL`/`EFAULT`, interruption by a signal (`EINTR`), shared futexes across processes, private memory keeping separate keys after `fork`, bitsets, `FUTEX_CMP_REQUEUE` |
 | `vmtest` | demand paging (a 64 MiB mapping costs nothing until touched), `SIGSEGV` on read-only and `PROT_NONE` pages with contents kept, split areas after a partial `munmap`, NX and the JIT pattern (1 GiB `PROT_NONE` reservation, write code, `mprotect` to executable, call it), commit limit and `MAP_NORESERVE`, `mremap` in place and moving, `MADV_DONTNEED`, shared vs. private memory across `fork`, lazy file mappings and `SIGBUS` beyond the end, `MAP_FIXED_NOREPLACE`, stack growth to 4 MiB and overflow beyond 8 MiB |
 | `smptest` | CPU count and affinity (pinning to every CPU, empty masks), parallel speed-up of CPU-bound processes, `fork`/`exit`/`wait` on every CPU at once, 5000 pipe round trips between two CPUs, signals to a process running on another CPU, no lost timer ticks while a program floods the console with palette changes on the timekeeping CPU |
@@ -641,6 +671,8 @@ kernel. Its program is fixed at boot (see self-healing), but a bug in it is a ke
 - [x] `ping` (raw ICMP sockets)
 - [ ] IPv6, `AF_UNIX`, `ifconfig`
 - [x] SMP with fine-grained locking, per-CPU run queues and CPU affinity
+- [x] Threads: `clone`, `futex`, TLB shootdowns
+- [ ] `epoll`, `eventfd`, a TSC clock; a page cache with file-backed shared mappings
 - [ ] Dynamic linking, real entropy, users and permissions
 
 ## Development history

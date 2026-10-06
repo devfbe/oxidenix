@@ -191,7 +191,9 @@ extern "sysv64" fn dispatch(f: &mut Frame) {
         33 => sys_file::dup3(a0, a1, 0, true),
         34 => super::pause(),
         35 => nanosleep(a0),
-        39 | 186 | 218 => Ok(super::current_pid() as i64),
+        39 => Ok(super::current_pid() as i64),
+        186 => Ok(super::current_tid() as i64),
+        218 => super::set_tid_address(a0).map(|tid| tid as i64),
         40 => sys_file::sendfile(a0, a1, a2, a3),
         41 => sys_net::socket(a0, a1, a2),
         42 => sys_net::connect(a0, a1, a2),
@@ -223,10 +225,12 @@ extern "sysv64" fn dispatch(f: &mut Frame) {
             Ok(old.div_ceil(1_000_000) as i64)
         }
         38 => setitimer(a0, a1, a2),
-        // vfork as fork: a copy-on-write child is a valid vfork child.
-        57 | 58 => super::fork(f).map(|pid| pid as i64),
+        56 => super::clone(f, a0, a1, a2, a3, a4).map(|tid| tid as i64),
+        57 => super::clone::fork(f).map(|pid| pid as i64),
+        58 => super::clone::vfork(f).map(|pid| pid as i64),
         59 => execve(f, a0, a1, a2),
-        60 | 231 => super::exit(((a0 & 0xff) << 8) as i32),
+        60 => super::exit_thread(((a0 & 0xff) << 8) as i32),
+        231 => super::exit_group(((a0 & 0xff) << 8) as i32),
         61 => super::wait4(a0 as i64, a1, a2),
         62 => signal::kill(a0 as i64, a1),
         63 => uname(a0),
@@ -266,8 +270,8 @@ extern "sysv64" fn dispatch(f: &mut Frame) {
         1003 => super::irq::enable(a0),
         1004 => super::dma_map(a0),
         1005 => super::query::proc_query(a0, a1, a2, a3),
-        200 => signal::kill(a0 as i64, a1),            // tkill
-        234 => signal::kill(a1 as i64, a2),            // tgkill
+        200 => signal::tgkill(None, a0 as i64, a1),
+        234 => signal::tgkill(Some(a0 as i64), a1 as i64, a2),
         202 => super::futex::futex(a0, a1, a2, a3, a4, a5),
         217 => sys_file::getdents64(a0, a1, a2),
         228 => clock_gettime(a0, a1),

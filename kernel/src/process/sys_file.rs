@@ -1,7 +1,7 @@
 //! File syscalls.
 
 use super::errno::*;
-use super::{uaccess, with_current, FdEntry};
+use super::{current_files, uaccess, with_current, FdEntry};
 use crate::fs::file::*;
 use crate::fs::{self, Inode, NewNode};
 use alloc::string::String;
@@ -25,7 +25,7 @@ fn file(fd: u64) -> Result<Arc<OpenFile>, i64> {
 /// Directory against which a relative path of an *at syscall is resolved.
 fn base_dir(dirfd: u64, path: &str) -> Result<String, i64> {
     if path.starts_with('/') || dirfd as i64 == AT_FDCWD {
-        return Ok(with_current(|p| p.cwd.clone()));
+        return Ok(with_current(|p| p.cwd()));
     }
     file(dirfd)?.path.clone().ok_or(ENOTDIR)
 }
@@ -152,7 +152,7 @@ pub fn openat(dirfd: u64, path: u64, flags: u64, mode: u64) -> SysResult {
 }
 
 pub fn close(fd: u64) -> SysResult {
-    let old = with_current(|p| p.fds.get_mut(fd as usize).and_then(|e| e.take()));
+    let old = current_files()?.take(fd);
     // Dropped only here: may wake the other end of a pipe.
     old.ok_or(EBADF).map(|_| 0)
 }
@@ -284,12 +284,8 @@ pub fn dup3(old: u64, new: u64, flags: u64, allow_same: bool) -> SysResult {
         return Err(EBADF);
     }
     let cloexec = flags as u32 & O_CLOEXEC != 0;
-    let replaced = with_current(|p| {
-        if p.fds.len() <= new as usize {
-            p.fds.resize(new as usize + 1, None);
-        }
-        p.fds[new as usize].replace(FdEntry { file: f, cloexec })
-    });
+    let replaced = current_files()?.replace(new, FdEntry { file: f, cloexec })?;
+    // Closed only here, after the table's lock.
     drop(replaced);
     Ok(new as i64)
 }
@@ -305,14 +301,8 @@ pub fn fcntl(fd: u64, cmd: u64, arg: u64) -> SysResult {
     let f = file(fd)?;
     match cmd {
         F_DUPFD | F_DUPFD_CLOEXEC => with_current(|p| p.alloc_fd(f, cmd == F_DUPFD_CLOEXEC, arg as usize)),
-        F_GETFD => with_current(|p| {
-            let entry = p.fds[fd as usize].as_ref().ok_or(EBADF)?;
-            Ok(if entry.cloexec { FD_CLOEXEC as i64 } else { 0 })
-        }),
-        F_SETFD => with_current(|p| {
-            p.fds[fd as usize].as_mut().ok_or(EBADF)?.cloexec = arg & FD_CLOEXEC != 0;
-            Ok(0)
-        }),
+        F_GETFD => Ok(if current_files()?.cloexec(fd)? { FD_CLOEXEC as i64 } else { 0 }),
+        F_SETFD => current_files()?.set_cloexec(fd, arg & FD_CLOEXEC != 0).map(|_| 0),
         F_GETFL => Ok(f.flags.load(Ordering::Relaxed) as i64),
         F_SETFL => {
             let changeable = O_APPEND | O_NONBLOCK;
@@ -469,7 +459,7 @@ pub fn faccessat(dirfd: u64, path: u64) -> SysResult {
 }
 
 pub fn getcwd(buf: u64, size: u64) -> SysResult {
-    let cwd = with_current(|p| p.cwd.clone());
+    let cwd = with_current(|p| p.cwd());
     if (size as usize) < cwd.len() + 1 {
         return Err(ERANGE);
     }
@@ -485,7 +475,7 @@ pub fn chdir(path: u64) -> SysResult {
     if !inode.is_dir() {
         return Err(ENOTDIR);
     }
-    with_current(|p| p.cwd = abs);
+    with_current(|p| p.set_cwd(abs));
     Ok(0)
 }
 
@@ -495,7 +485,7 @@ pub fn fchdir(fd: u64) -> SysResult {
         return Err(ENOTDIR);
     }
     let path = f.path.clone().ok_or(ENOTDIR)?;
-    with_current(|p| p.cwd = path);
+    with_current(|p| p.set_cwd(path));
     Ok(0)
 }
 

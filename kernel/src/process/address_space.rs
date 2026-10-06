@@ -773,13 +773,30 @@ impl AddressSpace {
     }
 
     /// Writes into the address space (faulting pages in), also when it is
-    /// not active (the loader).
+    /// not active, regardless of the areas' rights (the loader fills
+    /// read-only segments). A shared copy-on-write frame is copied first.
     pub fn write(&mut self, addr: u64, data: &[u8]) -> Result<(), Fault> {
+        self.write_as(addr, data, false)
+    }
+
+    /// Writes into the address space as a user write would (the area must
+    /// be writable), also when it is not active (a fork child's copy).
+    pub fn write_user(&mut self, addr: u64, data: &[u8]) -> Result<(), Fault> {
+        self.write_as(addr, data, true)
+    }
+
+    fn write_as(&mut self, addr: u64, data: &[u8], user: bool) -> Result<(), Fault> {
         let mut done = 0;
         while done < data.len() {
             let va = addr + done as u64;
-            self.fault(va, Access { write: false, exec: false })?;
-            let e = leaf_entry(self.l4, page_down(va)).ok_or(Fault::Segv)?;
+            self.fault(va, Access { write: user, exec: false })?;
+            let page = page_down(va);
+            if leaf_entry(self.l4, page).is_some_and(|e| e.flags().contains(COW)) {
+                // (break_cow makes the page writable: only for writable areas.)
+                let v = self.vma(page).cloned().filter(|v| v.prot.write).ok_or(Fault::Segv)?;
+                self.break_cow(page, &v)?;
+            }
+            let e = leaf_entry(self.l4, page).ok_or(Fault::Segv)?;
             let phys = e.addr().as_u64() + va % PAGE;
             let chunk = ((PAGE - va % PAGE) as usize).min(data.len() - done);
             unsafe { core::ptr::copy_nonoverlapping(data[done..].as_ptr(), memory::phys_to_virt(phys), chunk) };
