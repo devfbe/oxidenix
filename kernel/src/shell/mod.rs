@@ -16,7 +16,7 @@ lazy_static! {
 
 pub fn run() -> ! {
     crate::printkln!("rust-kernel shell v0.1");
-    crate::printkln!("Tippe 'help' fuer Hilfe.");
+    crate::printkln!("Type 'help' for help.");
     crate::printkln!();
 
     loop {

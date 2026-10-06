@@ -10,8 +10,8 @@ use x86_64::VirtAddr;
 pub const USER_END: u64 = 0x0000_8000_0000_0000;
 const PAGE: u64 = 4096;
 
-/// Eigene Level-4-Tabelle: untere Haelfte gehoert dem Prozess,
-/// obere Haelfte (Kernel) wird mit dem Kernel-Adressraum geteilt.
+/// Own level-4 table: the lower half belongs to the process, the upper
+/// (kernel) half is shared with the kernel address space.
 pub struct AddressSpace {
     l4: PhysFrame,
 }
@@ -34,13 +34,13 @@ impl AddressSpace {
         unsafe { OffsetPageTable::new(table_at(self.l4), memory::phys_offset()) }
     }
 
-    /// Mappt [start, start+len) mit genullten Frames. Bereits gemappte Seiten
-    /// bekommen die Vereinigung der Flags.
+    /// Maps [start, start+len) with zeroed frames. Pages that are already
+    /// mapped get the union of the flags.
     pub fn map_zeroed(&mut self, start: u64, len: u64, flags: PageTableFlags) -> Result<(), &'static str> {
         if len == 0 {
             return Ok(());
         }
-        let end = start.checked_add(len).filter(|&e| e <= USER_END).ok_or("Adresse ausserhalb des Userspace")?;
+        let end = start.checked_add(len).filter(|&e| e <= USER_END).ok_or("address outside of user space")?;
         let flags = flags | PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
         let parent = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
         let mut mapper = self.mapper();
@@ -51,21 +51,21 @@ impl AddressSpace {
                 if mapper.translate_page(page).is_ok() {
                     let merged = merge(leaf_flags(&mapper, page), flags);
                     unsafe { mapper.update_flags(page, merged) }
-                        .map_err(|_| "update_flags fehlgeschlagen")?
+                        .map_err(|_| "update_flags failed")?
                         .ignore();
                     continue;
                 }
-                let frame = frames.allocate_frame().ok_or("kein Speicher frei")?;
+                let frame = frames.allocate_frame().ok_or("out of memory")?;
                 unsafe { core::ptr::write_bytes(memory::phys_to_virt(frame.start_address().as_u64()), 0, PAGE as usize) };
                 unsafe { mapper.map_to_with_table_flags(page, frame, flags, parent, frames) }
-                    .map_err(|_| "map_to fehlgeschlagen")?
+                    .map_err(|_| "map_to failed")?
                     .ignore();
             }
             Ok(())
         })
     }
 
-    /// Entfernt alle Mappings in [start, start+len) und gibt die Frames frei.
+    /// Removes all mappings in [start, start+len) and frees their frames.
     pub fn unmap(&mut self, start: u64, len: u64) {
         let Some(end) = start.checked_add(len).filter(|&e| e <= USER_END && len > 0) else { return };
         let mut mapper = self.mapper();
@@ -81,13 +81,13 @@ impl AddressSpace {
         });
     }
 
-    /// Schreibt in den Adressraum, ohne ihn aktivieren zu muessen.
+    /// Writes into the address space without activating it.
     pub fn write(&self, addr: u64, data: &[u8]) -> Result<(), &'static str> {
         let mapper = self.mapper();
         let mut done = 0;
         while done < data.len() {
             let va = addr + done as u64;
-            let phys = mapper.translate_addr(VirtAddr::new(va)).ok_or("Ziel nicht gemappt")?;
+            let phys = mapper.translate_addr(VirtAddr::new(va)).ok_or("target not mapped")?;
             let chunk = ((PAGE - va % PAGE) as usize).min(data.len() - done);
             unsafe {
                 core::ptr::copy_nonoverlapping(
@@ -101,12 +101,12 @@ impl AddressSpace {
         Ok(())
     }
 
-    /// Tiefe Kopie aller User-Seiten (fuer fork).
+    /// Deep copy of all user pages (for fork).
     pub fn clone_user(&self) -> Result<AddressSpace, &'static str> {
-        let new = AddressSpace::new().ok_or("kein Speicher frei")?;
+        let new = AddressSpace::new().ok_or("out of memory")?;
         let mut mapper = new.mapper();
         let parent = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
-        // Fehler erst ausserhalb von with_frames zurueckgeben: Drop von `new` braucht den Lock.
+        // Return errors only outside of with_frames: dropping `new` needs the lock.
         memory::with_frames(|frames| {
             let l4 = table_at(self.l4);
             for i4 in 0..256 {
@@ -114,7 +114,7 @@ impl AddressSpace {
                     for (i2, l2e) in children(l3e) {
                         for (i1, leaf) in children(l2e) {
                             let va = (i4 as u64) << 39 | (i3 as u64) << 30 | (i2 as u64) << 21 | (i1 as u64) << 12;
-                            let frame = frames.allocate_frame().ok_or("kein Speicher frei")?;
+                            let frame = frames.allocate_frame().ok_or("out of memory")?;
                             unsafe {
                                 core::ptr::copy_nonoverlapping(
                                     memory::phys_to_virt(leaf.addr().as_u64()),
@@ -124,7 +124,7 @@ impl AddressSpace {
                             };
                             let page = Page::<Size4KiB>::containing_address(VirtAddr::new(va));
                             unsafe { mapper.map_to_with_table_flags(page, frame, leaf.flags(), parent, frames) }
-                                .map_err(|_| "map_to fehlgeschlagen")?
+                                .map_err(|_| "map_to failed")?
                                 .ignore();
                         }
                     }
@@ -151,7 +151,7 @@ impl Drop for AddressSpace {
     }
 }
 
-/// Gibt rekursiv alle Frames der unteren Haelfte frei, inklusive der Tabelle selbst.
+/// Recursively frees all lower-half frames, including the table itself.
 unsafe fn free_level(frames: &mut memory::frame::PhysFrameAllocator, table_frame: PhysFrame, level: u8) {
     let table = table_at(table_frame);
     let entries = if level == 4 { 0..256 } else { 0..512 };
@@ -170,7 +170,7 @@ unsafe fn free_level(frames: &mut memory::frame::PhysFrameAllocator, table_frame
     unsafe { frames.deallocate_frame(table_frame) };
 }
 
-/// Belegte Eintraege der Tabelle, auf die `entry` zeigt (leer, wenn ungenutzt).
+/// Used entries of the table `entry` points to (empty if unused).
 fn children(entry: &PageTableEntry) -> impl Iterator<Item = (usize, &'static PageTableEntry)> {
     let table: Option<&'static PageTable> = (!entry.is_unused())
         .then(|| &*table_at(PhysFrame::containing_address(entry.addr())));
@@ -201,8 +201,8 @@ fn merge(a: PageTableFlags, b: PageTableFlags) -> PageTableFlags {
     f
 }
 
-/// Prueft im aktiven Adressraum, ob [addr, addr+len) komplett fuer den
-/// Userspace gemappt ist.
+/// Checks in the active address space whether [addr, addr+len) is fully
+/// mapped for user space.
 pub fn user_range_ok(addr: u64, len: u64, write: bool) -> bool {
     let Some(end) = addr.checked_add(len) else { return false };
     if end > USER_END {

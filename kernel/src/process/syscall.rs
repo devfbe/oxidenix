@@ -12,8 +12,8 @@ static mut SYSCALL_STACK_TOP: u64 = 0;
 #[unsafe(no_mangle)]
 static mut SYSCALL_USER_RSP: u64 = 0;
 
-/// Vollstaendiges User-Registerabbild, in der Reihenfolge, in der
-/// `syscall_entry` pusht (niedrigste Adresse zuerst).
+/// Complete user register frame, in the order `syscall_entry` pushes it
+/// (lowest address first).
 #[repr(C)]
 #[derive(Clone, Default)]
 pub struct Frame {
@@ -49,9 +49,9 @@ impl Frame {
 pub fn init() {
     let s = gdt::selectors();
     Star::write(s.user_code, s.user_data, s.kernel_code, s.kernel_data)
-        .expect("GDT-Layout passt nicht zu sysret");
+        .expect("GDT layout does not match sysret");
     LStar::write(VirtAddr::new(syscall_entry as *const () as u64));
-    // IF loeschen: der Kernel ist nicht praeemptiv, Syscalls laufen ohne IRQs.
+    // Clear IF: the kernel is not preemptive, syscalls run without IRQs.
     SFMask::write(RFlags::INTERRUPT_FLAG | RFlags::DIRECTION_FLAG | RFlags::TRAP_FLAG);
     unsafe { Efer::update(|f| *f |= EferFlags::SYSTEM_CALL_EXTENSIONS) };
 }
@@ -90,8 +90,8 @@ unsafe extern "C" fn syscall_entry() {
     );
 }
 
-/// Stellt das `Frame` ab rsp wieder her und kehrt per sysret in den Ring 3
-/// zurueck. Neue Prozesse starten ueber diesen Pfad.
+/// Restores the `Frame` at rsp and returns to ring 3 via sysret. New
+/// processes start through this path.
 #[unsafe(naked)]
 pub unsafe extern "C" fn syscall_return() {
     core::arch::naked_asm!(
@@ -128,7 +128,7 @@ extern "sysv64" fn dispatch(f: &mut Frame) -> i64 {
         6 => sys_file::newfstatat(cwd, a0, a1, 0x100),
         8 => sys_file::lseek(a0, a1 as i64, a2),
         9 => sys_mem::mmap(a0, a1, a2, a3, a4, a5),
-        10 => Ok(0), // mprotect: Seiten bleiben, wie sie gemappt wurden
+        10 => Ok(0), // mprotect: pages keep the protection they were mapped with
         11 => sys_mem::munmap(a0, a1),
         12 => sys_mem::brk(a0),
         13 => sigaction(a2, a3),
@@ -165,7 +165,7 @@ extern "sysv64" fn dispatch(f: &mut Frame) -> i64 {
         89 => sys_file::readlinkat(cwd, a0, a1, a2),
         90 => sys_file::fchmodat(cwd, a0, a1),
         95 => Ok(0o022), // umask
-        102 | 104 | 107 | 108 => Ok(0), // getuid/getgid/geteuid/getegid: alles root
+        102 | 104 | 107 | 108 => Ok(0), // getuid/getgid/geteuid/getegid: everything is root
         105 | 106 | 109 | 112 => Ok(0), // setuid/setgid/setpgid/setsid
         110 => Ok(super::current_ppid() as i64),
         111 | 121 | 124 => Ok(super::current_pid() as i64), // getpgrp/getpgid/getsid
@@ -189,7 +189,7 @@ extern "sysv64" fn dispatch(f: &mut Frame) -> i64 {
         302 => prlimit(a3),
         318 => getrandom(a0, a1),
         nr => {
-            crate::printkln!("[kernel] syscall {} nicht implementiert", nr);
+            crate::printkln!("[kernel] syscall {} not implemented", nr);
             Err(ENOSYS)
         }
     };
@@ -204,7 +204,7 @@ fn execve(f: &mut Frame, path: u64, argv: u64, envp: u64) -> SysResult {
     Ok(0)
 }
 
-/// Signale gibt es noch nicht: Handler werden angenommen, aber nie ausgeloest.
+/// No signals yet: handlers are accepted but never invoked.
 fn sigaction(oldact: u64, size: u64) -> SysResult {
     if oldact != 0 {
         uaccess::slice_mut(oldact, 24 + size)?.fill(0);
@@ -212,7 +212,7 @@ fn sigaction(oldact: u64, size: u64) -> SysResult {
     Ok(0)
 }
 
-/// Signale gibt es noch nicht; die alte Maske ist immer leer.
+/// No signals yet; the old mask is always empty.
 fn sigprocmask(oldset: u64, size: u64) -> SysResult {
     if oldset != 0 {
         uaccess::slice_mut(oldset, size)?.fill(0);
@@ -250,7 +250,7 @@ fn clock_gettime(ts: u64) -> SysResult {
 fn nanosleep(req: u64) -> SysResult {
     let [sec, nsec]: [u64; 2] = uaccess::read(req)?;
     let tick_ns = 1_000_000_000 / super::TIMER_HZ;
-    super::sleep_ticks(sec * super::TIMER_HZ + nsec.div_ceil(tick_ns));
+    super::sleep_ticks(sec.saturating_mul(super::TIMER_HZ).saturating_add(nsec.div_ceil(tick_ns)));
     Ok(0)
 }
 
@@ -261,7 +261,7 @@ fn prlimit(old: u64) -> SysResult {
     Ok(0)
 }
 
-/// Kein kryptografischer Zufall: xorshift ueber dem Zeitstempelzaehler.
+/// Not cryptographically secure: xorshift seeded from the timestamp counter.
 fn getrandom(buf: u64, len: u64) -> SysResult {
     let out = uaccess::slice_mut(buf, len)?;
     let mut x = unsafe { core::arch::x86_64::_rdtsc() } | 1;

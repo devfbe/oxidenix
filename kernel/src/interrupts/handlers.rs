@@ -20,7 +20,7 @@ pub extern "x86-interrupt" fn page_fault_handler(
     use x86_64::registers::control::Cr2;
     if from_user(&stack_frame) {
         crate::printkln!(
-            "[kernel] Speicherzugriffsfehler bei {:#x} (rip {:#x}) - Programm beendet",
+            "[kernel] segmentation fault at {:#x} (rip {:#x}), process killed",
             Cr2::read_raw(),
             stack_frame.instruction_pointer.as_u64()
         );
@@ -42,7 +42,7 @@ pub extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStac
             .notify_end_of_interrupt(crate::interrupts::InterruptIndex::Timer as u8);
     }
     crate::process::tick();
-    // Der Kernel ist nicht praeemptiv: nur Userspace-Code wird unterbrochen.
+    // The kernel is not preemptive: only user-space code is interrupted.
     if from_user(&stack_frame) {
         crate::process::schedule();
     }
@@ -63,7 +63,7 @@ pub extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: Interrupt
 pub extern "x86-interrupt" fn general_protection_handler(stack_frame: InterruptStackFrame, error_code: u64) {
     if from_user(&stack_frame) {
         crate::printkln!(
-            "[kernel] Schutzverletzung (rip {:#x}) - Programm beendet",
+            "[kernel] general protection fault (rip {:#x}), process killed",
             stack_frame.instruction_pointer.as_u64()
         );
         crate::process::exit(11);
@@ -74,7 +74,7 @@ pub extern "x86-interrupt" fn general_protection_handler(stack_frame: InterruptS
 pub extern "x86-interrupt" fn invalid_opcode_handler(stack_frame: InterruptStackFrame) {
     if from_user(&stack_frame) {
         crate::printkln!(
-            "[kernel] Ungueltiger Befehl (rip {:#x}) - Programm beendet",
+            "[kernel] invalid opcode (rip {:#x}), process killed",
             stack_frame.instruction_pointer.as_u64()
         );
         crate::process::exit(4);

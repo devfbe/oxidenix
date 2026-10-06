@@ -32,14 +32,14 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let phys_offset = boot_info
         .physical_memory_offset
         .into_option()
-        .expect("Bootloader hat physischen Speicher nicht gemappt");
+        .expect("bootloader did not map physical memory");
     memory::init(&boot_info.memory_regions, phys_offset);
     let ramdisk = boot_info.ramdisk_addr.into_option().map(|addr| unsafe {
         core::slice::from_raw_parts(addr as *const u8, boot_info.ramdisk_len as usize)
     });
     fs::init(ramdisk);
     process::init();
-    // Erst jetzt: der Timer-Interrupt braucht den Scheduler.
+    // Only now: the timer interrupt needs the scheduler.
     x86_64::instructions::interrupts::enable();
     shell::run();
 }

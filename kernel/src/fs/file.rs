@@ -20,6 +20,8 @@ pub const O_NOFOLLOW: u32 = 0o400000;
 pub const O_CLOEXEC: u32 = 0o2000000;
 
 const PIPE_CAPACITY: usize = 64 * 1024;
+/// Files live in kernel heap memory; this keeps one file from exhausting it.
+pub const MAX_FILE_SIZE: usize = 64 * 1024 * 1024;
 
 pub struct Pipe {
     buf: Mutex<VecDeque<u8>>,
@@ -43,12 +45,12 @@ pub enum Kind {
     PipeWrite(Arc<Pipe>),
 }
 
-/// Geoeffnete Datei; mehrere Deskriptoren koennen sie teilen (dup, fork).
+/// Open file description; several descriptors may share it (dup, fork).
 pub struct OpenFile {
     pub kind: Kind,
     pub offset: Mutex<u64>,
     pub flags: AtomicU32,
-    /// Absoluter Pfad, falls ueber einen Pfad geoeffnet (fuer *at-Syscalls).
+    /// Absolute path if opened by path (for *at syscalls).
     pub path: Option<String>,
 }
 
@@ -63,7 +65,7 @@ impl OpenFile {
     }
 
     pub fn console() -> Arc<OpenFile> {
-        let inode = super::resolve("/", "/dev/console", true).expect("/dev/console fehlt");
+        let inode = super::resolve("/", "/dev/console", true).expect("/dev/console missing");
         OpenFile::new(Kind::Inode(inode), O_RDWR, Some("/dev/console".into()))
     }
 
@@ -120,7 +122,7 @@ impl OpenFile {
                 buf.fill(0);
                 Ok(buf.len())
             }
-            // Tastatureingabe fuer Prozesse gibt es noch nicht.
+            // Keyboard input for processes does not exist yet.
             Node::Device(Device::Console) => Ok(0),
             Node::File(data) => {
                 let mut off = self.offset.lock();
@@ -150,10 +152,11 @@ impl OpenFile {
                     *off = v.len() as u64;
                 }
                 let start = *off as usize;
-                if v.len() < start + buf.len() {
-                    v.resize(start + buf.len(), 0);
+                let end = start.checked_add(buf.len()).filter(|&e| e <= MAX_FILE_SIZE).ok_or(EFBIG)?;
+                if v.len() < end {
+                    v.resize(end, 0);
                 }
-                v[start..start + buf.len()].copy_from_slice(buf);
+                v[start..end].copy_from_slice(buf);
                 *off += buf.len() as u64;
                 Ok(buf.len())
             }

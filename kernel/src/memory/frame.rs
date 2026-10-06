@@ -4,8 +4,8 @@ use x86_64::{PhysAddr, VirtAddr};
 
 const FRAME_SIZE: u64 = 4096;
 
-/// Vergibt Frames zuerst frisch aus den Usable-Regionen; freigegebene Frames
-/// landen in einer Freiliste, deren `next`-Zeiger im Frame selbst steht.
+/// Hands out fresh frames from the usable regions first; freed frames go to
+/// a free list whose `next` pointer is stored in the frame itself.
 pub struct PhysFrameAllocator {
     regions: &'static [MemoryRegion],
     region_idx: usize,
@@ -37,7 +37,7 @@ impl PhysFrameAllocator {
     fn next_fresh(&mut self) -> Option<u64> {
         while let Some(region) = self.regions.get(self.region_idx) {
             if region.kind == MemoryRegionKind::Usable {
-                // Frame 0 bleibt reserviert, weil 0 das Ende der Freiliste markiert.
+                // Frame 0 stays reserved because 0 marks the end of the free list.
                 let start = align_up(region.start).max(FRAME_SIZE);
                 let addr = self.next.max(start);
                 if addr + FRAME_SIZE <= align_down(region.end) {

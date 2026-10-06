@@ -45,14 +45,14 @@ pub fn init() {
     unsafe {
         let mut pics = PICS.lock();
         pics.initialize();
-        // Nur IRQ0 (Timer) und IRQ1 (Keyboard) zulassen.
+        // Only allow IRQ0 (timer) and IRQ1 (keyboard).
         pics.write_masks(0b1111_1100, 0b1111_1111);
         init_pit(100);
         drain_ps2_output();
     }
 }
 
-// Ein vom BIOS liegengelassenes Byte blockiert neue IRQ1-Flanken, bis es gelesen wird.
+// A byte left behind by the BIOS blocks new IRQ1 edges until it is read.
 unsafe fn drain_ps2_output() {
     use x86_64::instructions::port::Port;
     let mut status: Port<u8> = Port::new(0x64);
@@ -62,7 +62,7 @@ unsafe fn drain_ps2_output() {
     }
 }
 
-/// Programmiert den PIT-Kanal 0 als periodischen Timer.
+/// Programs PIT channel 0 as a periodic timer.
 unsafe fn init_pit(hz: u32) {
     use x86_64::instructions::port::Port;
     let divisor = (1_193_182 / hz) as u16;

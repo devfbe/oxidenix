@@ -77,7 +77,7 @@ fn copy_tree(from: &Path, to: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Schreibt `root` als cpio-Archiv im "newc"-Format (wie Linux-Initramfs).
+/// Writes `root` as a cpio archive in "newc" format (like a Linux initramfs).
 fn write_cpio(root: &Path, out: &mut impl Write) -> io::Result<()> {
     let mut entries = Vec::new();
     collect(root, root, &mut entries)?;

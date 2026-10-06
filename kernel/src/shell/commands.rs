@@ -10,19 +10,19 @@ pub fn dispatch(cmd: &str, args: &Vec<&str, 8>) {
         "mem" => cmd_mem(),
         "run" => cmd_run(args),
         "" => {}
-        other => crate::printkln!("unbekannter befehl: {}", other),
+        other => crate::printkln!("unknown command: {}", other),
     }
 }
 
 fn cmd_help() {
-    crate::printkln!("Verfuegbare Befehle:");
-    crate::printkln!("  help          - diese Hilfe");
-    crate::printkln!("  clear         - Bildschirm leeren");
-    crate::printkln!("  echo <text>   - Text ausgeben");
-    crate::printkln!("  info          - CPU-Infos");
-    crate::printkln!("  mem           - Speicherstatistik + Selbsttest");
-    crate::printkln!("  run <prog>    - Programm aus /bin starten");
-    crate::printkln!("  halt          - System anhalten");
+    crate::printkln!("Available commands:");
+    crate::printkln!("  help          - this help");
+    crate::printkln!("  clear         - clear the screen");
+    crate::printkln!("  echo <text>   - print text");
+    crate::printkln!("  info          - CPU info");
+    crate::printkln!("  mem           - memory statistics + self-test");
+    crate::printkln!("  run <prog>    - start a program from /bin");
+    crate::printkln!("  halt          - halt the system");
 }
 
 fn cmd_clear() {
@@ -40,7 +40,7 @@ fn cmd_echo(args: &Vec<&str, 8>) {
 }
 
 fn cmd_halt() {
-    crate::printkln!("Tschuess!");
+    crate::printkln!("Bye!");
     // isa-debug-exit: write to port 0xf4 exits QEMU with code 2*val+1
     use x86_64::instructions::port::Port;
     unsafe {
@@ -125,13 +125,13 @@ fn cmd_mem() {
     let after = memory::stats();
 
     crate::printkln!(
-        "RAM:  {} / {} KiB belegt ({} Frames frei)",
+        "RAM:  {} / {} KiB used ({} frames free)",
         after.used_frames * 4,
         after.total_frames * 4,
         after.total_frames - after.used_frames
     );
     crate::printkln!(
-        "Heap: {} / {} KiB belegt",
+        "Heap: {} / {} KiB used",
         after.heap_used / 1024,
         (after.heap_used + after.heap_free) / 1024
     );
@@ -148,22 +148,22 @@ fn cmd_mem() {
 
 fn cmd_run(args: &Vec<&str, 8>) {
     let Some(&name) = args.first() else {
-        crate::printkln!("usage: run <programm> [args...]  (sucht in /bin, z.B. run ls -l /)");
+        crate::printkln!("usage: run <program> [args...]  (looked up in /bin, e.g. run ls -l /)");
         return;
     };
     let pid = match crate::process::spawn(name, args) {
         Ok(pid) => pid,
         Err(errno) => {
-            crate::printkln!("run: {} nicht startbar (errno {})", name, errno);
+            crate::printkln!("run: cannot start {} (errno {})", name, errno);
             return;
         }
     };
     match crate::process::wait_for(pid) {
         Ok(status) => match crate::process::decode_status(status) {
-            (true, code) => crate::printkln!("[{} (pid {}) beendet mit Code {}]", name, pid, code),
-            (false, sig) => crate::printkln!("[{} (pid {}) durch Signal {} beendet]", name, pid, sig),
+            (true, code) => crate::printkln!("[{} (pid {}) exited with code {}]", name, pid, code),
+            (false, sig) => crate::printkln!("[{} (pid {}) killed by signal {}]", name, pid, sig),
         },
-        Err(errno) => crate::printkln!("run: warten fehlgeschlagen (errno {})", errno),
+        Err(errno) => crate::printkln!("run: wait failed (errno {})", errno),
     }
     crate::process::reap_orphans();
 }

@@ -1,4 +1,4 @@
-//! Datei-Syscalls.
+//! File syscalls.
 
 use super::errno::*;
 use super::{uaccess, with_current, FdEntry};
@@ -22,7 +22,7 @@ fn file(fd: u64) -> Result<Arc<OpenFile>, i64> {
     with_current(|p| p.file(fd))
 }
 
-/// Verzeichnis, gegen das ein relativer Pfad eines *at-Syscalls aufgeloest wird.
+/// Directory against which a relative path of an *at syscall is resolved.
 fn base_dir(dirfd: u64, path: &str) -> Result<String, i64> {
     if path.starts_with('/') || dirfd as i64 == AT_FDCWD {
         return Ok(with_current(|p| p.cwd.clone()));
@@ -109,7 +109,7 @@ pub fn openat(dirfd: u64, path: u64, flags: u64, mode: u64) -> SysResult {
 
 pub fn close(fd: u64) -> SysResult {
     let old = with_current(|p| p.fds.get_mut(fd as usize).and_then(|e| e.take()));
-    // Erst hier fallen lassen: kann Pipe-Partner wecken.
+    // Dropped only here: may wake the other end of a pipe.
     old.ok_or(EBADF).map(|_| 0)
 }
 
@@ -360,9 +360,15 @@ pub fn unlinkat(dirfd: u64, path: u64, flags: u64) -> SysResult {
 pub fn renameat(olddirfd: u64, oldpath: u64, newdirfd: u64, newpath: u64) -> SysResult {
     let oldpath = uaccess::read_cstr(oldpath)?;
     let newpath = uaccess::read_cstr(newpath)?;
-    let (odir, oname) = fs::resolve_parent(&base_dir(olddirfd, &oldpath)?, &oldpath)?;
-    let (ndir, nname) = fs::resolve_parent(&base_dir(newdirfd, &newpath)?, &newpath)?;
+    let (obase, nbase) = (base_dir(olddirfd, &oldpath)?, base_dir(newdirfd, &newpath)?);
+    let (odir, oname) = fs::resolve_parent(&obase, &oldpath)?;
+    let (ndir, nname) = fs::resolve_parent(&nbase, &newpath)?;
     let node = odir.child(&oname)?;
+    // Moving a directory below itself would detach it in a reference cycle.
+    let (from, to) = (fs::normalize(&obase, &oldpath), fs::normalize(&nbase, &newpath));
+    if node.is_dir() && to.len() > from.len() && to.starts_with(&from) {
+        return Err(EINVAL);
+    }
     if let Node::Dir(m) = &mut *odir.node.lock() {
         m.remove(&oname);
     }
@@ -392,6 +398,9 @@ pub fn fchmodat(dirfd: u64, path: u64, mode: u64) -> SysResult {
 }
 
 pub fn ftruncate(fd: u64, len: u64) -> SysResult {
+    if len > MAX_FILE_SIZE as u64 {
+        return Err(EFBIG);
+    }
     let f = file(fd)?;
     let inode = f.inode().ok_or(EINVAL)?;
     let result = match &mut *inode.node.lock() {
@@ -423,7 +432,7 @@ pub fn sendfile(out_fd: u64, in_fd: u64, offset: u64, count: u64) -> SysResult {
     Ok(total as i64)
 }
 
-/// Zeitstempel werden nicht gespeichert; geprueft wird nur, ob das Ziel existiert.
+/// Timestamps are not stored; this only checks that the target exists.
 pub fn utimensat(dirfd: u64, path: u64, flags: u64) -> SysResult {
     if path == 0 {
         return file(dirfd).map(|_| 0);

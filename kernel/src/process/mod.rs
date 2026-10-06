@@ -55,9 +55,9 @@ enum State {
     Ready,
     Running,
     WaitChild,
-    /// Schlaeft, bis `wakeup` mit diesem Kanal aufgerufen wird.
+    /// Sleeps until `wakeup` is called with this channel.
     Sleeping(usize),
-    /// Wait-Status im Linux-Format (exit code << 8 oder Signalnummer).
+    /// Wait status in Linux format (exit code << 8 or signal number).
     Zombie(i32),
 }
 
@@ -127,7 +127,7 @@ struct Scheduler {
 impl Scheduler {
     fn cur(&mut self) -> &mut Process {
         let pid = self.current;
-        self.procs.get_mut(&pid).expect("aktueller Prozess fehlt")
+        self.procs.get_mut(&pid).expect("current process missing")
     }
 
     fn make_ready(&mut self, pid: Pid) {
@@ -138,19 +138,19 @@ impl Scheduler {
     }
 }
 
-/// Einkern-System: Zugriff nur mit abgeschalteten Interrupts. Ein Mutex
-/// ginge nicht, weil ueber Kontextwechsel hinweg kein Lock gehalten werden darf.
+/// Single-core system: access only with interrupts disabled. A mutex would
+/// not work because no lock may be held across a context switch.
 struct SchedCell(UnsafeCell<Option<Scheduler>>);
 unsafe impl Sync for SchedCell {}
 static SCHED: SchedCell = SchedCell(UnsafeCell::new(None));
 
 fn sched() -> &'static mut Scheduler {
     debug_assert!(!interrupts::are_enabled());
-    unsafe { (*SCHED.0.get()).as_mut().expect("process::init fehlt") }
+    unsafe { (*SCHED.0.get()).as_mut().expect("process::init not called") }
 }
 
-/// Fuehrt `f` auf dem aktuellen Prozess aus. Darf nichts tun, was den
-/// Scheduler erneut betritt (schlafen, Dateien schliessen).
+/// Runs `f` on the current process. Must not do anything that re-enters
+/// the scheduler (sleeping, closing files).
 fn with_current<R>(f: impl FnOnce(&mut Process) -> R) -> R {
     interrupts::without_interrupts(|| f(sched().cur()))
 }
@@ -186,7 +186,7 @@ pub fn init() {
     };
 }
 
-/// musl nutzt SSE; ohne OSFXSR loest jede SSE-Instruktion #UD aus.
+/// musl uses SSE; without OSFXSR every SSE instruction raises #UD.
 fn enable_sse() {
     use x86_64::registers::control::{Cr0, Cr0Flags, Cr4, Cr4Flags};
     unsafe {
@@ -210,14 +210,14 @@ pub fn ticks() -> u64 {
     TICKS.load(Ordering::Relaxed)
 }
 
-/// Vom Timer-Interrupt aufgerufen.
+/// Called from the timer interrupt.
 pub fn tick() {
     TICKS.fetch_add(1, Ordering::Relaxed);
     wakeup(TICK_CHAN);
 }
 
 pub fn sleep_ticks(n: u64) {
-    let deadline = ticks() + n;
+    let deadline = ticks().saturating_add(n);
     while ticks() < deadline {
         sleep_on(TICK_CHAN);
     }
@@ -245,16 +245,16 @@ pub fn wakeup(chan: usize) {
     });
 }
 
-/// Neuer Prozess, der beim ersten Einplanen ueber `syscall_return` mit
-/// `frame` in den Ring 3 springt.
+/// New process that, when first scheduled, enters ring 3 with `frame`
+/// via `syscall_return`.
 fn new_process(pid: Pid, ppid: Pid, name: String, space: AddressSpace, frame: Frame) -> Box<Process> {
-    // new_zeroed statt Box::new: kein Zwischenobjekt auf dem (kleinen) Kernel-Stack.
+    // new_zeroed instead of Box::new: no temporary on the (small) kernel stack.
     let mut kstack = unsafe { Box::<KernelStack>::new_zeroed().assume_init() };
     let top = kstack.0.as_mut_ptr() as u64 + KSTACK_SIZE as u64;
     let frame_addr = top - core::mem::size_of::<Frame>() as u64;
     unsafe {
         (frame_addr as *mut Frame).write(frame);
-        // Von switch_stacks erwartet: r15..rbx (6 Woerter) und Ruecksprungadresse.
+        // Expected by switch_stacks: r15..rbx (6 words) and a return address.
         ((frame_addr - 8) as *mut u64).write(syscall::syscall_return as *const () as u64);
         for i in 1..=6 {
             ((frame_addr - 8 - i * 8) as *mut u64).write(0);
@@ -292,8 +292,8 @@ fn load_path(cwd: &str, path: &str, args: &[String], envs: &[String]) -> Result<
     }
 }
 
-/// Startet ein Programm als Kind der Kernel-Shell, mit der Konsole als
-/// stdin/stdout/stderr. Namen ohne '/' werden in /bin gesucht.
+/// Starts a program as a child of the kernel shell, with the console as
+/// stdin/stdout/stderr. Names without '/' are looked up in /bin.
 pub fn spawn(name: &str, args: &[&str]) -> Result<Pid, i64> {
     let path = if name.contains('/') { name.to_string() } else { alloc::format!("/bin/{name}") };
     let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
@@ -350,7 +350,7 @@ pub fn exec(frame: &mut Frame, path: &str, args: &[String], envs: &[String]) -> 
     let image = load_path(&cwd, path, args, envs)?;
     image.space.activate();
     let closed: Vec<FdEntry> = with_current(|p| {
-        // Alter Adressraum wird hier freigegeben; er ist nicht mehr aktiv.
+        // The old address space is freed here; it is no longer active.
         p.space = Some(image.space);
         p.name = basename(path).to_string();
         p.brk_start = image.brk;
@@ -371,13 +371,13 @@ pub fn exec(frame: &mut Frame, path: &str, args: &[String], envs: &[String]) -> 
 
 pub fn exit(status: i32) -> ! {
     interrupts::disable();
-    // Dateien zuerst schliessen: das kann Leser/Schreiber von Pipes wecken.
+    // Close files first: this may wake pipe readers/writers.
     let fds = core::mem::take(&mut sched().cur().fds);
     drop(fds);
 
     let s = sched();
     let pid = s.current;
-    assert!(pid != 0, "Kernel-Task darf nicht exit aufrufen");
+    assert!(pid != 0, "kernel task must not call exit");
     for p in s.procs.values_mut() {
         if p.ppid == pid {
             p.ppid = 0;
@@ -392,11 +392,11 @@ pub fn exit(status: i32) -> ! {
         s.make_ready(ppid);
     }
     schedule();
-    unreachable!("Zombie wurde wieder eingeplant");
+    unreachable!("zombie was scheduled again");
 }
 
-/// Wartet auf ein Kind (`target` = None: beliebiges). Liefert (pid, status)
-/// oder None bei `nohang`, wenn noch keins fertig ist.
+/// Waits for a child (`target` = None: any). Returns (pid, status), or
+/// None with `nohang` if none has finished yet.
 fn wait_child(target: Option<Pid>, nohang: bool) -> Result<Option<(Pid, i32)>, i64> {
     loop {
         let s = sched();
@@ -433,13 +433,13 @@ pub fn wait4(pid: i64, status_ptr: u64, options: u64) -> SysResult {
     }
 }
 
-/// Fuer die Kernel-Shell: wartet blockierend auf ein bestimmtes Kind.
+/// For the kernel shell: blocks until a specific child exits.
 pub fn wait_for(pid: Pid) -> Result<i32, i64> {
     interrupts::without_interrupts(|| wait_child(Some(pid), false))
-        .map(|r| r.expect("blockierendes Warten liefert immer ein Ergebnis").1)
+        .map(|r| r.expect("blocking wait always yields a result").1)
 }
 
-/// Gibt Zombies frei, deren Eltern (Kernel) nicht mehr auf sie warten.
+/// Reaps zombies whose parent (the kernel) no longer waits for them.
 pub fn reap_orphans() {
     interrupts::without_interrupts(|| while let Ok(Some(_)) = wait_child(None, true) {});
 }
@@ -448,8 +448,8 @@ pub fn yield_now() {
     interrupts::without_interrupts(schedule);
 }
 
-/// Waehlt den naechsten lauffaehigen Prozess (Round Robin). Muss mit
-/// abgeschalteten Interrupts aufgerufen werden.
+/// Picks the next runnable process (round robin). Must be called with
+/// interrupts disabled.
 pub fn schedule() {
     loop {
         let s = sched();
@@ -465,7 +465,7 @@ pub fn schedule() {
             }
             return;
         }
-        // Nichts lauffaehig: auf einen Interrupt warten.
+        // Nothing runnable: wait for an interrupt.
         interrupts::enable_and_hlt();
         interrupts::disable();
     }
@@ -478,7 +478,7 @@ fn switch_to(next: Pid) {
     unsafe { fxsave(&mut prev.fpu) };
     let prev_rsp: *mut u64 = &mut prev.kernel_rsp;
 
-    let n = s.procs.get_mut(&next).expect("naechster Prozess fehlt");
+    let n = s.procs.get_mut(&next).expect("next process missing");
     n.state = State::Running;
     match &n.space {
         Some(space) => space.activate(),
@@ -503,8 +503,8 @@ unsafe fn fxrstor(area: &FpuState) {
     unsafe { core::arch::asm!("fxrstor64 [{}]", in(reg) area.0.as_ptr(), options(nostack)) };
 }
 
-/// Sichert die callee-saved Register auf dem aktuellen Kernel-Stack,
-/// speichert rsp nach `*save` und setzt auf dem Stack `next` fort.
+/// Saves the callee-saved registers on the current kernel stack, stores
+/// rsp to `*save` and continues on stack `next`.
 #[unsafe(naked)]
 unsafe extern "sysv64" fn switch_stacks(save: *mut u64, next: u64) {
     core::arch::naked_asm!(
@@ -526,7 +526,7 @@ unsafe extern "sysv64" fn switch_stacks(save: *mut u64, next: u64) {
     );
 }
 
-/// (true, exit code) bei normalem Ende, (false, Signal) bei Abbruch.
+/// (true, exit code) on normal exit, (false, signal) when killed.
 pub fn decode_status(status: i32) -> (bool, i32) {
     if status & 0x7f == 0 {
         (true, (status >> 8) & 0xff)

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Baut alle userspace/*.c als statische musl-Binaries nach $1 und legt
-# BusyBox samt Applet-Symlinks dazu.
+# Builds all userspace/*.c as static musl binaries into $1 and adds
+# BusyBox with its applet symlinks.
 set -euo pipefail
 OUT="$1"
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

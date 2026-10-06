@@ -11,7 +11,7 @@ use x86_64::structures::paging::{
 };
 use x86_64::VirtAddr;
 
-// Obere Adresshaelfte; die untere gehoert den Prozessen.
+// Upper half; the lower half belongs to processes.
 pub const HEAP_START: u64 = 0xffff_c000_0000_0000;
 pub const HEAP_SIZE: u64 = 16 * 1024 * 1024;
 
@@ -32,39 +32,39 @@ pub fn init(regions: &'static [MemoryRegion], phys_offset: u64) {
     let last = Page::containing_address(VirtAddr::new(HEAP_START + HEAP_SIZE - 1));
     let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
     for page in Page::range_inclusive(first, last) {
-        let frame = frames.allocate_frame().expect("kein Frame fuer Kernel-Heap");
+        let frame = frames.allocate_frame().expect("no frame for kernel heap");
         unsafe { mapper.map_to(page, frame, flags, &mut frames) }
-            .expect("Heap-Seite bereits gemappt")
+            .expect("heap page already mapped")
             .flush();
     }
     unsafe { HEAP.lock().init(HEAP_START as *mut u8, HEAP_SIZE as usize) };
     *FRAMES.lock() = Some(frames);
 }
 
-/// SAFETY: Aufrufer muss sicherstellen, dass keine zweite `&mut` auf die
-/// aktive Level-4-Tabelle gleichzeitig existiert.
+/// SAFETY: the caller must ensure that no second `&mut` to the active
+/// level-4 table exists at the same time.
 pub unsafe fn active_page_table() -> OffsetPageTable<'static> {
-    let offset = *PHYS_OFFSET.get().expect("memory::init fehlt");
+    let offset = *PHYS_OFFSET.get().expect("memory::init not called");
     let (l4_frame, _) = Cr3::read();
     let l4: *mut PageTable = (offset + l4_frame.start_address().as_u64()).as_mut_ptr();
     unsafe { OffsetPageTable::new(&mut *l4, offset) }
 }
 
 pub fn phys_offset() -> VirtAddr {
-    *PHYS_OFFSET.get().expect("memory::init fehlt")
+    *PHYS_OFFSET.get().expect("memory::init not called")
 }
 
 pub fn kernel_l4() -> PhysFrame {
-    *KERNEL_L4.get().expect("memory::init fehlt")
+    *KERNEL_L4.get().expect("memory::init not called")
 }
 
-/// Liefert einen virtuellen Zeiger auf eine physische Adresse.
+/// Returns a virtual pointer to a physical address.
 pub fn phys_to_virt(addr: u64) -> *mut u8 {
     (phys_offset() + addr).as_mut_ptr()
 }
 
 pub fn with_frames<R>(f: impl FnOnce(&mut PhysFrameAllocator) -> R) -> R {
-    f(FRAMES.lock().as_mut().expect("memory::init fehlt"))
+    f(FRAMES.lock().as_mut().expect("memory::init not called"))
 }
 
 pub struct Stats {

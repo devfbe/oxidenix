@@ -1,4 +1,4 @@
-//! Speicher-Syscalls: brk, mmap, munmap.
+//! Memory syscalls: brk, mmap, munmap.
 
 use super::errno::*;
 use super::loader::page_up;
@@ -44,7 +44,7 @@ pub fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64) ->
         return Err(EINVAL);
     }
     let len = page_up(len);
-    // Dateiinhalt wird kopiert (MAP_PRIVATE-Semantik, keine Rueckschreibung).
+    // File contents are copied (MAP_PRIVATE semantics, no write-back).
     let file = if flags & MAP_ANONYMOUS == 0 {
         Some(with_current(|p| p.file(fd))?)
     } else {

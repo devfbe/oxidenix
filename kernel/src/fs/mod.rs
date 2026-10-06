@@ -1,4 +1,4 @@
-//! In-Memory-Dateisystem (tmpfs-artig), beim Boot aus der Initramfs befuellt.
+//! In-memory filesystem (tmpfs-like), populated from the initramfs at boot.
 
 pub mod cpio;
 pub mod file;
@@ -25,7 +25,7 @@ pub enum Device {
 }
 
 pub enum Data {
-    /// Unveraenderte Datei aus der Initramfs; wird beim ersten Schreiben kopiert.
+    /// Unmodified file from the initramfs; copied on first write.
     Static(&'static [u8]),
     Owned(Vec<u8>),
 }
@@ -120,14 +120,14 @@ impl Inode {
 }
 
 pub fn root() -> Arc<Inode> {
-    ROOT.get().expect("fs::init fehlt").clone()
+    ROOT.get().expect("fs::init not called").clone()
 }
 
 pub fn init(ramdisk: Option<&'static [u8]>) {
     let root = ROOT.call_once(|| Inode::new(Node::Dir(BTreeMap::new()), 0o755));
     if let Some(data) = ramdisk {
         if let Err(e) = cpio::unpack(root, data) {
-            crate::printkln!("[fs] initramfs kaputt: {}", e);
+            crate::printkln!("[fs] corrupt initramfs: {}", e);
         }
     }
     let dev = mkdir_p(root, "dev");
@@ -137,7 +137,7 @@ pub fn init(ramdisk: Option<&'static [u8]>) {
     mkdir_p(root, "tmp");
 }
 
-/// Legt alle fehlenden Verzeichnisse an und liefert das letzte.
+/// Creates all missing directories and returns the last one.
 pub fn mkdir_p(base: &Arc<Inode>, path: &str) -> Arc<Inode> {
     let mut cur = base.clone();
     for c in path.split('/').filter(|c| !c.is_empty()) {
@@ -153,7 +153,7 @@ pub fn mkdir_p(base: &Arc<Inode>, path: &str) -> Arc<Inode> {
     cur
 }
 
-/// Zerlegt `path` relativ zu `cwd` in absolute Komponenten ohne "." und "..".
+/// Splits `path` relative to `cwd` into absolute components without "." and "..".
 pub fn normalize(cwd: &str, path: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let joined = if path.starts_with('/') { path.to_string() } else { alloc::format!("{cwd}/{path}") };
@@ -176,7 +176,7 @@ pub fn join(components: &[String]) -> String {
     components.iter().fold(String::new(), |acc, c| acc + "/" + c)
 }
 
-/// Loest einen Pfad auf. `follow`: Symlink in der letzten Komponente folgen.
+/// Resolves a path. `follow`: follow a symlink in the last component.
 pub fn resolve(cwd: &str, path: &str, follow: bool) -> Result<Arc<Inode>, i64> {
     if path.is_empty() {
         return Err(ENOENT);
@@ -213,7 +213,7 @@ pub fn resolve(cwd: &str, path: &str, follow: bool) -> Result<Arc<Inode>, i64> {
     Ok(cur)
 }
 
-/// Liefert das Elternverzeichnis und den letzten Namen (fuer create/unlink).
+/// Returns the parent directory and the last name (for create/unlink).
 pub fn resolve_parent(cwd: &str, path: &str) -> Result<(Arc<Inode>, String), i64> {
     let mut comps = normalize(cwd, path);
     let name = comps.pop().ok_or(EEXIST)?;

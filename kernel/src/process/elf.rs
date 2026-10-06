@@ -35,16 +35,16 @@ fn u64_at(d: &[u8], o: usize) -> u64 {
 impl<'a> Elf<'a> {
     pub fn parse(data: &'a [u8]) -> Result<Self, &'static str> {
         if data.len() < 64 || &data[0..4] != b"\x7fELF" {
-            return Err("keine ELF-Datei");
+            return Err("not an ELF file");
         }
         if data[4] != 2 || data[5] != 1 {
-            return Err("nur 64-bit little-endian ELF");
+            return Err("only 64-bit little-endian ELF");
         }
         if u16_at(data, 16) != 2 {
-            return Err("nur statische Executables (ET_EXEC)");
+            return Err("only static executables (ET_EXEC)");
         }
         if u16_at(data, 18) != 0x3e {
-            return Err("nicht x86_64");
+            return Err("not x86_64");
         }
         let elf = Elf {
             data,
@@ -55,7 +55,7 @@ impl<'a> Elf<'a> {
         };
         let table_end = elf.phoff + elf.phentsize as u64 * elf.phnum as u64;
         if elf.phentsize < 56 || table_end > data.len() as u64 {
-            return Err("Program-Header-Tabelle kaputt");
+            return Err("corrupt program header table");
         }
         Ok(elf)
     }
@@ -76,9 +76,9 @@ impl<'a> Elf<'a> {
     }
 
     pub fn segment_bytes(&self, ph: &ProgramHeader) -> Result<&'a [u8], &'static str> {
-        let end = ph.offset.checked_add(ph.filesz).ok_or("Segment kaputt")?;
+        let end = ph.offset.checked_add(ph.filesz).ok_or("corrupt segment")?;
         if ph.filesz > ph.memsz || end > self.data.len() as u64 {
-            return Err("Segment ausserhalb der Datei");
+            return Err("segment outside of file");
         }
         Ok(&self.data[ph.offset as usize..end as usize])
     }

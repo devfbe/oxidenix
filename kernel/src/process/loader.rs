@@ -12,12 +12,12 @@ pub struct Image {
     pub space: AddressSpace,
     pub entry: u64,
     pub sp: u64,
-    /// Erste freie Adresse hinter dem hoechsten Segment (Start von brk).
+    /// First free address after the highest segment (start of brk).
     pub brk: u64,
 }
 
 pub fn page_up(x: u64) -> u64 {
-    (x + 4095) & !4095
+    x.saturating_add(4095) & !4095
 }
 
 pub fn load(image: &[u8], args: &[String], envs: &[String]) -> Result<Image, i64> {
@@ -64,7 +64,7 @@ pub fn load(image: &[u8], args: &[String], envs: &[String]) -> Result<Image, i64
     Ok(Image { space, entry: elf.entry, sp, brk })
 }
 
-/// Linux-Startstack: argc, argv[], NULL, envp[], NULL, auxv-Paare, AT_NULL.
+/// Linux initial stack: argc, argv[], NULL, envp[], NULL, auxv pairs, AT_NULL.
 fn build_stack(space: &mut AddressSpace, args: &[String], envs: &[String], auxv: &[(u64, u64)]) -> Result<u64, &'static str> {
     space.map_zeroed(
         STACK_TOP - STACK_SIZE,
@@ -97,7 +97,7 @@ fn build_stack(space: &mut AddressSpace, args: &[String], envs: &[String], auxv:
 
     sp = (sp - words.len() as u64 * 8) & !0xf;
     if sp < STACK_TOP - STACK_SIZE {
-        return Err("Argumente zu gross");
+        return Err("arguments too large");
     }
     let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     space.write(sp, &bytes)?;

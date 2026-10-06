@@ -12,6 +12,7 @@ pub const EISDIR: i64 = 21;
 pub const EINVAL: i64 = 22;
 pub const EMFILE: i64 = 24;
 pub const ENOTTY: i64 = 25;
+pub const EFBIG: i64 = 27;
 pub const ESPIPE: i64 = 29;
 pub const EPIPE: i64 = 32;
 pub const ERANGE: i64 = 34;
@@ -20,5 +21,5 @@ pub const ENOSYS: i64 = 38;
 pub const ENOTEMPTY: i64 = 39;
 pub const ELOOP: i64 = 40;
 
-/// Ergebnis eines Syscalls: Ok(Rueckgabewert) oder Err(positive errno).
+/// Syscall result: Ok(return value) or Err(positive errno).
 pub type SysResult = Result<i64, i64>;

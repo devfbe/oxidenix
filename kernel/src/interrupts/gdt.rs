@@ -19,11 +19,11 @@ fn stack_top(stack: *const Stack) -> VirtAddr {
     VirtAddr::from_ptr(stack) + STACK_SIZE as u64
 }
 
-// Veraenderbar, weil rsp0 bei jedem Prozesswechsel neu gesetzt wird.
+// Mutable because rsp0 is updated on every process switch.
 static mut TSS: TaskStateSegment = TaskStateSegment::new();
 
 lazy_static! {
-    // Reihenfolge ist durch sysret vorgegeben: user data direkt vor user code.
+    // Order is dictated by sysret: user data directly before user code.
     static ref GDT: (GlobalDescriptorTable, Selectors) = {
         let mut gdt = GlobalDescriptorTable::new();
         let kernel_code = gdt.append(Descriptor::kernel_code_segment());
@@ -77,7 +77,7 @@ pub fn init() {
     }
 }
 
-/// Stack, auf den die CPU bei Interrupts aus dem Ring 3 wechselt.
+/// Stack the CPU switches to on interrupts from ring 3.
 pub fn set_kernel_stack(top: VirtAddr) {
     unsafe { (*(&raw mut TSS)).privilege_stack_table[0] = top };
 }

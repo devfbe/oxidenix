@@ -1,4 +1,4 @@
-//! Zugriff auf Userspeicher des aktuellen Prozesses mit Pruefung der Mappings.
+//! Access to the current process's user memory with mapping checks.
 
 use super::address_space::user_range_ok;
 use super::errno::{E2BIG, EFAULT, ENAMETOOLONG};
@@ -52,7 +52,7 @@ pub fn read_cstr(ptr: u64) -> Result<String, i64> {
     Err(ENAMETOOLONG)
 }
 
-/// Liest ein NULL-terminiertes Array von C-Strings (argv/envp).
+/// Reads a NULL-terminated array of C strings (argv/envp).
 pub fn read_cstr_array(ptr: u64) -> Result<Vec<String>, i64> {
     let mut out = Vec::new();
     if ptr == 0 {
