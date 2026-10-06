@@ -9,6 +9,7 @@ pub fn dispatch(cmd: &str, args: &Vec<&str, 8>) {
         "info" => cmd_info(),
         "mem" => cmd_mem(),
         "run" => cmd_run(args),
+        "kill" => cmd_kill(args),
         "" => {}
         other => crate::printkln!("unknown command: {}", other),
     }
@@ -22,6 +23,7 @@ fn cmd_help() {
     crate::printkln!("  info          - CPU info");
     crate::printkln!("  mem           - memory statistics + self-test");
     crate::printkln!("  run <prog>    - start a program from /bin");
+    crate::printkln!("  kill <pid>    - send SIGKILL (the kernel may also stop servers)");
     crate::printkln!("  halt          - halt the system");
 }
 
@@ -184,3 +186,15 @@ pub fn run_program(args: &[&str]) {
     crate::process::reap_orphans();
 }
 
+
+fn cmd_kill(args: &Vec<&str, 8>) {
+    let Some(pid) = args.first().and_then(|p| p.parse::<i64>().ok()).filter(|&p| p > 0) else {
+        crate::printkln!("usage: kill <pid>");
+        return;
+    };
+    match crate::process::signal::kill(pid, 9) {
+        Ok(_) => crate::printkln!("killed {}", pid),
+        Err(errno) => crate::printkln!("kill: errno {}", errno),
+    }
+    crate::process::reap_orphans();
+}

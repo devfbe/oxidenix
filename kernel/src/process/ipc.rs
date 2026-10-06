@@ -92,6 +92,10 @@ pub fn register(name: u64, len: u64, arg: u64) -> SysResult {
 /// ipc_receive(buffer, length, &id): waits for the next request to one of
 /// the caller's services and returns its length.
 pub fn receive(buf: u64, len: u64, id_out: u64) -> SysResult {
+    without_interrupts(|| receive_loop(buf, len, id_out))
+}
+
+fn receive_loop(buf: u64, len: u64, id_out: u64) -> SysResult {
     let me = super::current_pid();
     loop {
         let next = lock(|ipc| {
@@ -177,8 +181,16 @@ fn enqueue(service: usize, message: Vec<u8>, waits: bool) -> Result<u64, i64> {
 /// Sends `message` to `service` and sleeps until the reply. Not
 /// interruptible by signals: the server may already be working on it.
 pub fn call(service: usize, message: Vec<u8>) -> Result<Vec<u8>, i64> {
-    let id = enqueue(service, message, true)?;
-    without_interrupts(|| loop {
+    // Enqueueing, checking and sleeping happen with interrupts off, so the
+    // reply cannot slip in between the check and the sleep.
+    without_interrupts(|| {
+        let id = enqueue(service, message, true)?;
+        wait_reply(id)
+    })
+}
+
+fn wait_reply(id: u64) -> Result<Vec<u8>, i64> {
+    loop {
         let done = lock(|ipc| match ipc.requests.get(&id).map(|r| r.state) {
             Some(State::Done) => Some(Ok(ipc.requests.remove(&id).expect("present").reply)),
             Some(State::Failed) | None => {
@@ -191,7 +203,7 @@ pub fn call(service: usize, message: Vec<u8>) -> Result<Vec<u8>, i64> {
             return result;
         }
         sleep_on(request_chan(id));
-    })
+    }
 }
 
 /// Sends `message` without waiting for (or receiving) a reply. Never

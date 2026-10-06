@@ -183,7 +183,8 @@ pub fn send(pid: Pid, sig: u32) {
 pub fn send_group(pgid: Pid, sig: u32) {
     interrupts::without_interrupts(|| {
         let mut pids: heapless::Vec<Pid, 256> = heapless::Vec::new();
-        for p in sched().procs.values().filter(|p| p.pgid == pgid && p.pid != 0) {
+        // Servers never belong to a terminal's job; skip them regardless.
+        for p in sched().procs.values().filter(|p| p.pgid == pgid && p.pid != 0 && !p.privileged) {
             let _ = pids.push(p.pid);
         }
         for pid in pids {
@@ -192,6 +193,9 @@ pub fn send_group(pgid: Pid, sig: u32) {
     })
 }
 
+/// kill(2). Privileged servers are protected like init on Linux: only the
+/// kernel may signal them. A direct kill fails with EPERM, group and
+/// broadcast kills skip them.
 pub fn kill(pid: i64, sig: u64) -> SysResult {
     if sig > NSIG as u64 {
         return Err(EINVAL);
@@ -201,10 +205,14 @@ pub fn kill(pid: i64, sig: u64) -> SysResult {
         let s = sched();
         let me = s.cur();
         let (my_pid, my_pgid) = (me.pid, me.pgid);
+        if pid > 0 && my_pid != 0 && s.procs.get(&(pid as Pid)).is_some_and(|p| p.privileged) {
+            return Err(EPERM);
+        }
         let targets: alloc::vec::Vec<Pid> = s
             .procs
             .values()
             .filter(|p| p.pid != 0 && !matches!(p.state, State::Zombie(_)))
+            .filter(|p| my_pid == 0 || !p.privileged)
             .filter(|p| match pid {
                 p_ if p_ > 0 => p.pid == p_ as Pid,
                 0 => p.pgid == my_pgid,

@@ -60,8 +60,8 @@ Its [commit history](#development-history) records every step.
   directories, symlinks, `/dev/{console,tty,null,zero}`, and quotas against heap exhaustion.
 - **Microkernel-style drivers**: the ATA driver and the read-write **ext2** filesystem run in
   `diskfs`, an ordinary ring-3 process that talks to the kernel over IPC and reaches the disk
-  through I/O ports the kernel granted it. Killing it fails `/data` accesses with `EIO` and
-  leaves the rest of the system running.
+  through I/O ports the kernel granted it. If it dies, `/data` accesses fail with `EIO` and the
+  rest of the system keeps running.
 - **Persistent storage**: the data disk is mounted at `/data`, survives reboots, and stays
   consistent enough that `e2fsck` on the host accepts it.
 - **Wall-clock time** from the CMOS real-time clock (`date`, file timestamps).
@@ -294,6 +294,9 @@ interrupt dispatch; drivers and filesystems move into user-space servers.
 - **Fault isolation**: when a server dies, its services are marked dead and every pending or
   later request fails with `EIO`. Programs see I/O errors on that mount; the kernel and the
   rest of user space keep running.
+- **Protected servers**: like init on Linux, privileged servers ignore signals from user space:
+  a direct `kill` fails with `EPERM`, and group, broadcast and terminal signals skip them. Only
+  the kernel can stop them (the monitor's `kill <pid>` does, for testing).
 - **Servers in Rust**: `servers/diskfs` is a `no_std` Rust program built for
   `x86_64-unknown-none` as a static `ET_EXEC` binary, using `crates/oxrt` for its entry point,
   syscalls, heap and port I/O. It shares no code with the kernel except the message format.
@@ -377,7 +380,8 @@ Each of these programs and scripts lives in the root filesystem and runs inside 
 | `fstest` | descriptor access modes (`EBADF` on read-only/write-only fds), `O_NOFOLLOW` on symlinks, unlinked-but-open files (kept until closed, never shared with new files), ext2 size limits, overflowing `mmap` offsets |
 | `sh /etc/disktest.sh` | ext2: 150-file directory, 1.5 MiB file (double indirect), append, truncate, rename, cycles, symlinks, `rm -r`, space accounting |
 | `e2fsck -fn disk.img` (host) | the filesystem written by oxidenix is consistent |
-| `kill -9 <diskfs pid>` | a crashed filesystem server only turns `/data` accesses into `EIO` |
+| `kill -9 1` in Bash | user space cannot kill a server (`EPERM`) |
+| `kill 1` in the kernel monitor | a dead filesystem server only turns `/data` accesses into `EIO` |
 | `mem` (kernel monitor) | frame and heap accounting, allocator self-test, leak checks after workloads |
 
 During development the AI drove these tests through the QEMU monitor socket (`sendkey`,
