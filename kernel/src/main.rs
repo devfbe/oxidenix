@@ -42,6 +42,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let ramdisk = boot_info.ramdisk_addr.into_option().map(|addr| unsafe {
         core::slice::from_raw_parts(addr as *const u8, boot_info.ramdisk_len as usize)
     });
+    let rsdp = boot_info.rsdp_addr.into_option().expect("bootloader found no ACPI RSDP");
+    interrupts::init_controllers(rsdp, process::TIMER_HZ);
     drivers::rtc::init();
     fs::init(ramdisk);
     process::init();

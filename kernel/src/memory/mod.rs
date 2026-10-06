@@ -129,6 +129,54 @@ pub fn kernel_l4() -> PhysFrame {
     *KERNEL_L4.get().expect("memory::init not called")
 }
 
+/// Virtual window for device registers and firmware tables, outside the
+/// physical-memory mapping (which only covers RAM and is cached).
+const MMIO_START: u64 = 0xffff_d000_0000_0000;
+const MMIO_SIZE: u64 = 1 << 30;
+static MMIO_NEXT: IrqSpinLock<u64> = IrqSpinLock::new(MMIO_START);
+
+/// How a physical range is mapped by `map_physical`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Caching {
+    /// Device registers: uncached, so every access reaches the device.
+    Uncached,
+    /// Firmware tables in RAM.
+    WriteBack,
+}
+
+/// Maps `len` bytes of physical memory at `phys` into the kernel half of
+/// every address space and returns the virtual address of `phys`. Done at
+/// boot, before processes exist, so their page tables share the mapping.
+pub fn map_physical(phys: u64, len: u64, caching: Caching) -> Result<VirtAddr, &'static str> {
+    let first = phys & !(PAGE - 1);
+    let end = phys.checked_add(len).and_then(|e| e.checked_next_multiple_of(PAGE)).ok_or("range overflows")?;
+    let size = end - first;
+    let virt = {
+        let mut next = MMIO_NEXT.lock();
+        let virt = *next;
+        if virt + size > MMIO_START + MMIO_SIZE {
+            return Err("MMIO window exhausted");
+        }
+        *next += size;
+        virt
+    };
+    let mut flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
+    if caching == Caching::Uncached {
+        flags |= PageTableFlags::NO_CACHE | PageTableFlags::WRITE_THROUGH;
+    }
+    let mut guard = FRAMES.lock();
+    let frames = guard.as_mut().ok_or("memory::init not called")?;
+    let offset = phys_offset();
+    let l4: *mut PageTable = (offset + kernel_l4().start_address().as_u64()).as_mut_ptr();
+    let mut mapper = unsafe { OffsetPageTable::new(&mut *l4, offset) };
+    for i in 0..size / PAGE {
+        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(virt + i * PAGE));
+        let frame = PhysFrame::containing_address(x86_64::PhysAddr::new(first + i * PAGE));
+        unsafe { mapper.map_to(page, frame, flags, frames) }.map_err(|_| "map_to failed")?.flush();
+    }
+    Ok(VirtAddr::new(virt + (phys - first)))
+}
+
 /// Returns a virtual pointer to a physical address.
 pub fn phys_to_virt(addr: u64) -> *mut u8 {
     (phys_offset() + addr).as_mut_ptr()

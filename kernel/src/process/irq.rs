@@ -7,7 +7,7 @@
 
 use super::errno::*;
 use super::{current_pid, wakeup, with_current, Pid};
-use crate::interrupts::{PICS, PIC_1_OFFSET};
+use crate::interrupts::apic;
 use core::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
 
 const LINES: usize = 16;
@@ -23,16 +23,7 @@ pub fn server_chan(pid: Pid) -> usize {
 }
 
 fn set_masked(line: u8, masked: bool) {
-    let mut pics = PICS.lock();
-    let [mut m1, mut m2] = unsafe { pics.read_masks() };
-    if line < 8 {
-        m1 = if masked { m1 | 1 << line } else { m1 & !(1 << line) };
-    } else {
-        m2 = if masked { m2 | 1 << (line - 8) } else { m2 & !(1 << (line - 8)) };
-        // The slave controller reaches the CPU through line 2.
-        m1 &= !(1 << 2);
-    }
-    unsafe { pics.write_masks(m1, m2) };
+    apic::set_masked(line, masked);
 }
 
 /// irq_enable(line): takes the line on first use and unmasks it.
@@ -75,7 +66,7 @@ pub fn fire(line: u8) {
         set_masked(line, true);
         PENDING.fetch_or(1 << line, Ordering::Relaxed);
     }
-    unsafe { PICS.lock().notify_end_of_interrupt(PIC_1_OFFSET + line) };
+    apic::eoi();
     if owner != 0 {
         wakeup(server_chan(owner as Pid));
     }

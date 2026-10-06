@@ -134,7 +134,7 @@ The window scales when it is resized (`zoom-to-fit`), and Ctrl+Alt+F toggles ful
  │  VFS             memory inodes, remote inodes (fs/remote.rs), pipes, cpio│          │
  │  sockets         Linux socket ABI, forwarded to netd (net.rs)            │          │
  │  terminal        TTY line discipline ─ console (framebuffer, ANSI) ─ keyboard       │
- │  CPU             GDT, TSS with I/O permission bitmap, IDT, PIC, PIT, SSE │          │
+ │  CPU             GDT, TSS + I/O bitmap, IDT, local + I/O APIC (ACPI), SSE│          │
  └──────────────────────────────────────────────────────────────────────────▼──────────┘
            bootloader 0.11 (BIOS), QEMU x86_64, 256 MiB RAM, IDE disk, virtio-net
 ```
@@ -148,7 +148,8 @@ oxidenix/
 │   ├── build.rs                 turns the logo into raw pixels for the kernel
 │   └── src/
 │       ├── main.rs              entry point, boot configuration, init order
-│       ├── interrupts/          GDT/TSS (gdt.rs), IDT + PIC + PIT (mod.rs),
+│       ├── interrupts/          GDT/TSS (gdt.rs), IDT (mod.rs), local and I/O APIC
+│       │                        with timer calibration (apic.rs),
 │       │                        exception, timer and keyboard handlers (handlers.rs)
 │       ├── memory/              physical frame allocator with refcounts (frame.rs),
 │       │                        kernel heap and page table access (mod.rs)
@@ -170,7 +171,9 @@ oxidenix/
 │       │                        filesystem servers (remote.rs)
 │       ├── drivers/             framebuffer console (console.rs), TTY (tty.rs),
 │       │                        PS/2 keyboard (keyboard.rs), CMOS clock (rtc.rs),
-│       │                        serial port mirror (serial.rs), PCI scan (pci.rs)
+│       │                        serial port mirror (serial.rs), PCI scan (pci.rs),
+│       │                        ACPI MADT (acpi.rs)
+│       ├── sync.rs              IrqSpinLock: fair, interrupt-safe ticket lock
 │       └── shell/               built-in kernel monitor (fallback shell)
 ├── servers/
 │   ├── diskfs/                  user-space ext2 server with its own ATA driver
@@ -192,8 +195,9 @@ About 7,467 lines of Rust in the kernel and 2,965 in the servers, their librarie
 1. The **bootloader** (BIOS, `bootloader` 0.11) loads the position-independent kernel ELF into
    the upper half (`dynamic_range_start = 0xffff_8000_0000_0000`). It maps all physical
    memory at a dynamic offset, sets up a VESA framebuffer and loads the initramfs as a ramdisk.
-2. `kernel_main` runs these steps in order: framebuffer console and boot logo → GDT/TSS/IDT and PIC/PIT
-   (interrupts still off) → frame allocator and 16 MiB kernel heap → VFS from the cpio
+2. `kernel_main` runs these steps in order: framebuffer console and boot logo → GDT/TSS/IDT
+   (interrupts still off) → frame allocator and 16 MiB kernel heap → ACPI tables (MADT), the
+   local APIC with its calibrated timer and the I/O APIC (the 8259 PICs are masked) → VFS from the cpio
    ramdisk and real-time clock → process subsystem (SSE, syscall MSRs, process 0) →
    **interrupts on**.
 3. The kernel starts the servers: `/sbin/diskfs` asks for its I/O ports, mounts the ext2 disk
@@ -238,7 +242,8 @@ About 7,467 lines of Rust in the kernel and 2,965 in the servers, their librarie
 - **One kernel stack per process** (64 KiB). A context switch saves callee-saved registers,
   the FPU/SSE state (`fxsave`), the FS base (musl's TLS pointer), and switches CR3, `TSS.rsp0`
   and the syscall stack pointer.
-- **Round-robin scheduling** driven by the PIT at 100 Hz. Only user code is preempted. The
+- **Round-robin scheduling** driven by the local APIC timer at 100 Hz (calibrated against the
+  PIT once at boot). Only user code is preempted. The
   kernel itself is non-preemptive and runs syscalls with interrupts disabled, which keeps the
   single-core design free of most locking.
 - **Blocking** uses `sleep_on(channel)` / `wakeup(channel)` (pipes, TTY, timer ticks). Waiting

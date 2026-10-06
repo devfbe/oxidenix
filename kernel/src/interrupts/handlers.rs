@@ -69,11 +69,7 @@ pub unsafe extern "C" fn timer_entry() {
 }
 
 extern "sysv64" fn timer_interrupt(frame: &mut Frame) {
-    unsafe {
-        crate::interrupts::PICS
-            .lock()
-            .notify_end_of_interrupt(crate::interrupts::InterruptIndex::Timer as u8);
-    }
+    super::apic::eoi();
     crate::process::tick();
     // The kernel is not preemptive: only user-space code is interrupted.
     if frame.from_user() {
@@ -82,15 +78,26 @@ extern "sysv64" fn timer_interrupt(frame: &mut Frame) {
     }
 }
 
-pub extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
+fn keyboard_interrupt() {
     let mut port = Port::new(0x60);
     let scancode: u8 = unsafe { port.read() };
     crate::drivers::keyboard::handle_scancode(scancode);
+    super::apic::eoi();
+}
 
-    unsafe {
-        crate::interrupts::PICS
-            .lock()
-            .notify_end_of_interrupt(crate::interrupts::InterruptIndex::Keyboard as u8);
+/// Spurious interrupts from the local APIC need no EOI.
+pub extern "x86-interrupt" fn spurious_handler(_stack_frame: InterruptStackFrame) {}
+
+/// An I/O APIC interrupt: the keyboard, or a line owned by a user-space
+/// driver (see process::irq).
+fn gsi_interrupt(gsi: u32) {
+    let Some(irq) = (0..16u8).find(|&irq| super::apic::gsi_of(irq) == gsi) else {
+        return super::apic::eoi();
+    };
+    if irq == super::KEYBOARD_IRQ {
+        keyboard_interrupt();
+    } else {
+        crate::process::irq::fire(irq);
     }
 }
 
@@ -120,17 +127,18 @@ fn from_user(frame: &InterruptStackFrame) -> bool {
     frame.code_segment.rpl() == PrivilegeLevel::Ring3
 }
 
-/// Interrupt lines 3-15 belong to user-space drivers (see process::irq).
-macro_rules! device_irqs {
-    ($($name:ident = $line:literal),*) => {
-        $(pub extern "x86-interrupt" fn $name(_stack_frame: InterruptStackFrame) {
-            crate::process::irq::fire($line);
+/// One handler per I/O APIC pin (GSI 0-23).
+macro_rules! gsi_handlers {
+    ($($name:ident = $gsi:literal),*) => {
+        $(extern "x86-interrupt" fn $name(_stack_frame: InterruptStackFrame) {
+            gsi_interrupt($gsi);
         })*
-        pub const DEVICE_IRQS: &[(u8, extern "x86-interrupt" fn(InterruptStackFrame))] = &[$(($line, $name)),*];
+        pub const GSI_HANDLERS: &[extern "x86-interrupt" fn(InterruptStackFrame)] = &[$($name),*];
     };
 }
 
-device_irqs!(
-    irq3 = 3, irq4 = 4, irq5 = 5, irq6 = 6, irq7 = 7, irq8 = 8, irq9 = 9, irq10 = 10,
-    irq11 = 11, irq12 = 12, irq13 = 13, irq14 = 14, irq15 = 15
+gsi_handlers!(
+    gsi0 = 0, gsi1 = 1, gsi2 = 2, gsi3 = 3, gsi4 = 4, gsi5 = 5, gsi6 = 6, gsi7 = 7, gsi8 = 8, gsi9 = 9,
+    gsi10 = 10, gsi11 = 11, gsi12 = 12, gsi13 = 13, gsi14 = 14, gsi15 = 15, gsi16 = 16, gsi17 = 17,
+    gsi18 = 18, gsi19 = 19, gsi20 = 20, gsi21 = 21, gsi22 = 22, gsi23 = 23
 );

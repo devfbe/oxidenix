@@ -1,23 +1,9 @@
+pub mod apic;
 pub mod gdt;
 pub mod handlers;
 
 use lazy_static::lazy_static;
-use pic8259::ChainedPics;
-use spin::Mutex;
 use x86_64::structures::idt::InterruptDescriptorTable;
-
-pub const PIC_1_OFFSET: u8 = 32;
-pub const PIC_2_OFFSET: u8 = 40;
-
-#[derive(Debug, Clone, Copy)]
-#[repr(u8)]
-pub enum InterruptIndex {
-    Timer = PIC_1_OFFSET,
-    Keyboard = PIC_1_OFFSET + 1,
-}
-
-pub static PICS: Mutex<ChainedPics> =
-    Mutex::new(unsafe { ChainedPics::new(PIC_1_OFFSET, PIC_2_OFFSET) });
 
 lazy_static! {
     static ref IDT: InterruptDescriptorTable = {
@@ -33,30 +19,38 @@ lazy_static! {
             .set_handler_fn(handlers::general_protection_handler);
         idt.invalid_opcode.set_handler_fn(handlers::invalid_opcode_handler);
         unsafe {
-            idt[InterruptIndex::Timer as u8]
+            idt[apic::TIMER_VECTOR]
                 .set_handler_addr(x86_64::VirtAddr::new(handlers::timer_entry as *const () as u64));
         }
-        idt[InterruptIndex::Keyboard as u8]
-            .set_handler_fn(handlers::keyboard_interrupt_handler);
-        for &(line, handler) in handlers::DEVICE_IRQS {
-            idt[PIC_1_OFFSET + line].set_handler_fn(handler);
+        for (gsi, &handler) in handlers::GSI_HANDLERS.iter().enumerate() {
+            idt[apic::IRQ_BASE + gsi as u8].set_handler_fn(handler);
         }
+        idt[apic::SPURIOUS_VECTOR].set_handler_fn(handlers::spurious_handler);
         idt
     };
 }
 
+/// GDT, TSS and IDT of the bootstrap CPU. The interrupt controllers come
+/// later (`init_controllers`), once memory and ACPI are available.
 pub fn init() {
     gdt::init();
     IDT.load();
-    unsafe {
-        let mut pics = PICS.lock();
-        pics.initialize();
-        // Only allow IRQ0 (timer) and IRQ1 (keyboard).
-        pics.write_masks(0b1111_1100, 0b1111_1111);
-        init_pit(100);
-        drain_ps2_output();
+    unsafe { drain_ps2_output() };
+}
+
+/// Local and I/O APIC; the keyboard interrupt is routed and unmasked, the
+/// other ISA lines are routed but stay masked until a driver enables them.
+pub fn init_controllers(rsdp: u64, hz: u64) {
+    crate::drivers::acpi::init(rsdp).expect("ACPI");
+    apic::init(hz).expect("APIC");
+    for irq in 1..16 {
+        if irq != 2 {
+            apic::route_isa(irq, irq != KEYBOARD_IRQ);
+        }
     }
 }
+
+pub const KEYBOARD_IRQ: u8 = 1;
 
 // A byte left behind by the BIOS blocks new IRQ1 edges until it is read.
 unsafe fn drain_ps2_output() {
@@ -66,15 +60,4 @@ unsafe fn drain_ps2_output() {
     while status.read() & 1 != 0 {
         data.read();
     }
-}
-
-/// Programs PIT channel 0 as a periodic timer.
-unsafe fn init_pit(hz: u32) {
-    use x86_64::instructions::port::Port;
-    let divisor = (1_193_182 / hz) as u16;
-    let mut cmd: Port<u8> = Port::new(0x43);
-    let mut ch0: Port<u8> = Port::new(0x40);
-    cmd.write(0x36);
-    ch0.write(divisor as u8);
-    ch0.write((divisor >> 8) as u8);
 }

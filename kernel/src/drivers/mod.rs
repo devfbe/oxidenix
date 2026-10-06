@@ -1,3 +1,4 @@
+pub mod acpi;
 pub mod console;
 pub mod keyboard;
 pub mod pci;
