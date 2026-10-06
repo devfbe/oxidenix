@@ -5,8 +5,8 @@ use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::{null_mut, NonNull};
 use frame::PhysFrameAllocator;
 use linked_list_allocator::Heap;
-use spin::{Mutex, Once};
-use x86_64::instructions::interrupts::without_interrupts;
+use crate::sync::IrqSpinLock;
+use spin::Once;
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::{
     FrameAllocator, FrameDeallocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags, PhysFrame,
@@ -24,10 +24,10 @@ const PAGE: u64 = 4096;
 
 /// Kernel heap that grows by mapping more frames when an allocation fails,
 /// so it is bounded by physical memory instead of a fixed size.
-struct GrowingHeap(Mutex<Heap>);
+struct GrowingHeap(IrqSpinLock<Heap>);
 
 #[global_allocator]
-static HEAP: GrowingHeap = GrowingHeap(Mutex::new(Heap::empty()));
+static HEAP: GrowingHeap = GrowingHeap(IrqSpinLock::new(Heap::empty()));
 
 unsafe impl GlobalAlloc for GrowingHeap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
@@ -55,10 +55,12 @@ impl GrowingHeap {
         else {
             return false;
         };
-        without_interrupts(|| {
-            // try_lock: an allocation made while the frame lock is held must
-            // fail instead of deadlocking.
-            let Some(mut guard) = FRAMES.try_lock() else { return false };
+        {
+            // Lock order FRAMES -> HEAP, taken only here. Nothing allocates
+            // from the heap while holding FRAMES (the frame allocator keeps
+            // its free list inside the free frames), so this cannot deadlock;
+            // try_lock would fail spuriously whenever another CPU holds FRAMES.
+            let mut guard = FRAMES.lock();
             let Some(frames) = guard.as_mut() else { return false };
             let mut heap = self.0.lock();
             let top = heap.top() as u64;
@@ -71,7 +73,7 @@ impl GrowingHeap {
             }
             unsafe { heap.extend(want as usize) };
             true
-        })
+        }
     }
 }
 
@@ -94,7 +96,9 @@ fn map_heap(start: u64, len: u64, frames: &mut PhysFrameAllocator) -> Result<(),
     Ok(())
 }
 
-pub static FRAMES: Mutex<Option<PhysFrameAllocator>> = Mutex::new(None);
+/// Physical frames. Invariant: no heap allocation while this lock is held
+/// (the heap grows by taking it).
+pub static FRAMES: IrqSpinLock<Option<PhysFrameAllocator>> = IrqSpinLock::new(None);
 static PHYS_OFFSET: Once<VirtAddr> = Once::new();
 static KERNEL_L4: Once<PhysFrame> = Once::new();
 

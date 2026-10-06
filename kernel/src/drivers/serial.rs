@@ -2,13 +2,13 @@
 //! here, so a headless QEMU (`-serial stdio`) shows the kernel's output.
 
 use core::fmt;
-use spin::Mutex;
+use crate::sync::IrqSpinLock;
 use x86_64::instructions::interrupts::without_interrupts;
 use x86_64::instructions::port::Port;
 
 const COM1: u16 = 0x3f8;
 
-static LOCK: Mutex<bool> = Mutex::new(false);
+static LOCK: IrqSpinLock<bool> = IrqSpinLock::new(false);
 
 pub fn init() {
     let mut ready = LOCK.lock();

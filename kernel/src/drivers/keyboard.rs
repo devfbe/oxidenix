@@ -3,9 +3,9 @@
 //! into the TTY.
 
 use pc_keyboard::{layouts::De105Key, DecodedKey, HandleControl, KeyCode, Keyboard, ScancodeSet1};
-use spin::Mutex;
+use crate::sync::IrqSpinLock;
 
-static KEYBOARD: Mutex<Keyboard<De105Key, ScancodeSet1>> = Mutex::new(Keyboard::new(
+static KEYBOARD: IrqSpinLock<Keyboard<De105Key, ScancodeSet1>> = IrqSpinLock::new(Keyboard::new(
     ScancodeSet1::new(),
     De105Key,
     HandleControl::MapLettersToUnicode,

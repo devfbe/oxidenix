@@ -10,7 +10,7 @@ use super::{sleep_on, uaccess, wakeup, with_current, Pid};
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
 use alloc::vec::Vec;
-use spin::Mutex;
+use crate::sync::IrqSpinLock;
 use x86_64::instructions::interrupts::without_interrupts;
 
 /// Upper bound for one message in either direction.
@@ -52,8 +52,8 @@ struct Ipc {
     next_generation: u64,
 }
 
-static IPC: Mutex<Ipc> =
-    Mutex::new(Ipc { services: Vec::new(), requests: BTreeMap::new(), next_id: 1, next_generation: 1 });
+static IPC: IrqSpinLock<Ipc> =
+    IrqSpinLock::new(Ipc { services: Vec::new(), requests: BTreeMap::new(), next_id: 1, next_generation: 1 });
 
 /// A service as one particular registration of its server.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -69,7 +69,7 @@ fn request_chan(id: u64) -> usize {
 }
 
 fn lock<R>(f: impl FnOnce(&mut Ipc) -> R) -> R {
-    without_interrupts(|| f(&mut IPC.lock()))
+    f(&mut IPC.lock())
 }
 
 /// ipc_register(name, length, arg): makes the calling (privileged) process

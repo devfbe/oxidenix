@@ -17,6 +17,7 @@ mod memory;
 mod net;
 mod process;
 mod shell;
+pub mod sync;
 
 pub static BOOTLOADER_CONFIG: BootloaderConfig = {
     let mut config = BootloaderConfig::new_default();

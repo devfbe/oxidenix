@@ -4,7 +4,7 @@
 use bootloader_api::info::{FrameBuffer, FrameBufferInfo, PixelFormat};
 use core::fmt;
 use noto_sans_mono_bitmap::{get_raster, get_raster_width, FontWeight, RasterHeight};
-use spin::Mutex;
+use crate::sync::IrqSpinLock;
 use x86_64::instructions::interrupts::without_interrupts;
 
 const FONT_WEIGHT: FontWeight = FontWeight::Regular;
@@ -451,7 +451,7 @@ impl fmt::Write for Console {
     }
 }
 
-pub static CONSOLE: Mutex<Option<Console>> = Mutex::new(None);
+pub static CONSOLE: IrqSpinLock<Option<Console>> = IrqSpinLock::new(None);
 
 pub fn init(fb: &'static mut FrameBuffer) {
     let info = fb.info();

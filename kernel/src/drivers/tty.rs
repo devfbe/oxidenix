@@ -8,7 +8,7 @@ use crate::process::errno::*;
 use crate::process::signal::{SIGINT, SIGQUIT, SIGTSTP};
 use crate::process::{sleep_on, wakeup};
 use heapless::{Deque, Vec};
-use spin::Mutex;
+use crate::sync::IrqSpinLock;
 use x86_64::instructions::interrupts::without_interrupts;
 
 const TTY_CHAN: usize = 2;
@@ -90,7 +90,7 @@ struct Tty {
     signal: Option<u32>,
 }
 
-static TTY: Mutex<Tty> = Mutex::new(Tty {
+static TTY: IrqSpinLock<Tty> = IrqSpinLock::new(Tty {
     termios: Termios::default(),
     line: Vec::new(),
     ready: Deque::new(),
