@@ -25,6 +25,7 @@ pub struct Cpu {
     pub index: usize,
     pub apic_id: UnsafeCell<u8>,
     tables: UnsafeCell<CpuTables>,
+    pub sched: crate::process::sched::CpuSched,
 }
 
 /// Offsets for the assembly entry code.
@@ -44,6 +45,7 @@ impl Cpu {
             index,
             apic_id: UnsafeCell::new(0),
             tables: UnsafeCell::new(CpuTables::new()),
+            sched: crate::process::sched::CpuSched::new(),
         }
     }
 
@@ -51,6 +53,10 @@ impl Cpu {
     #[allow(clippy::mut_from_ref)]
     pub fn tables(&self) -> &mut CpuTables {
         unsafe { &mut *self.tables.get() }
+    }
+
+    pub fn apic_id(&self) -> u8 {
+        unsafe { *self.apic_id.get() }
     }
 
     /// Kernel stack for the next entry from user mode (syscall or interrupt).

@@ -6,7 +6,8 @@
 //! waiting. Messages are copied through the kernel.
 
 use super::errno::*;
-use super::{sleep_on, uaccess, wakeup, with_current, Pid};
+use super::sched::prepare_to_wait;
+use super::{uaccess, wakeup, Pid};
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -75,7 +76,7 @@ fn lock<R>(f: impl FnOnce(&mut Ipc) -> R) -> R {
 /// ipc_register(name, length, arg): makes the calling (privileged) process
 /// the server behind `name`. A dead server's name can be taken over.
 pub fn register(name: u64, len: u64, arg: u64) -> SysResult {
-    if !with_current(|p| p.privileged) {
+    if !super::sched::current().privileged.load(core::sync::atomic::Ordering::Relaxed) {
         return Err(EPERM);
     }
     if len > 64 {
@@ -118,8 +119,10 @@ pub fn receive(buf: u64, len: u64, id_out: u64, timeout_ms: i64) -> SysResult {
 fn receive_loop(buf: u64, len: u64, id_out: u64, deadline: Option<u64>) -> SysResult {
     let me = super::current_pid();
     loop {
+        let wait = prepare_to_wait(super::irq::server_chan(me));
         let fired = super::irq::take_pending(me);
         if fired != 0 {
+            drop(wait);
             uaccess::write(id_out, 0u64)?;
             return Ok(fired as i64);
         }
@@ -135,6 +138,7 @@ fn receive_loop(buf: u64, len: u64, id_out: u64, deadline: Option<u64>) -> SysRe
         })?;
         match next {
             Ok((id, message)) => {
+                drop(wait);
                 if message.len() as u64 > len {
                     fail(id);
                     continue;
@@ -149,8 +153,8 @@ fn receive_loop(buf: u64, len: u64, id_out: u64, deadline: Option<u64>) -> SysRe
                 }
                 match deadline {
                     Some(d) if super::ticks() >= d => return Err(ETIMEDOUT),
-                    Some(d) => super::sleep_on_until(super::irq::server_chan(me), d),
-                    None => sleep_on(super::irq::server_chan(me)),
+                    Some(d) => wait.sleep_until(d),
+                    None => wait.sleep(),
                 }
             }
         }
@@ -269,6 +273,7 @@ fn wait_reply(id: u64) -> Result<Vec<u8>, i64> {
 /// give up the request (returns true; the result is then EINTR).
 fn wait_reply_with(id: u64, abandon: &mut dyn FnMut() -> bool) -> Result<Vec<u8>, i64> {
     loop {
+        let wait = prepare_to_wait(request_chan(id));
         let done = lock(|ipc| match ipc.requests.get(&id).map(|r| r.state) {
             Some(State::Done) => Some(Ok(ipc.requests.remove(&id).expect("present").reply)),
             Some(State::Failed) | None => {
@@ -283,7 +288,7 @@ fn wait_reply_with(id: u64, abandon: &mut dyn FnMut() -> bool) -> Result<Vec<u8>
         if super::signal::interrupted() && abandon() {
             return Err(EINTR);
         }
-        sleep_on(request_chan(id));
+        wait.sleep();
     }
 }
 

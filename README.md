@@ -155,7 +155,9 @@ oxidenix/
 │       │                        exception, timer and keyboard handlers (handlers.rs)
 │       ├── memory/              physical frame allocator with refcounts (frame.rs),
 │       │                        kernel heap and page table access (mod.rs)
-│       ├── process/             scheduler and process lifecycle (mod.rs),
+│       ├── process/             process lifecycle and syscalls on it (mod.rs),
+│       │   ├── task.rs          tasks: owned state, locked info and signals
+│       │   ├── sched.rs         run queues, wait queues, context switch, idle
 │       │   ├── address_space.rs per-process page tables, copy-on-write
 │       │   ├── syscall.rs       syscall entry/return, dispatch table
 │       │   ├── sys_file.rs      file, directory, pipe, tty-ioctl, poll/select
@@ -241,15 +243,29 @@ About 7,467 lines of Rust in the kernel and 2,965 in the servers, their librarie
 
 ### Processes and scheduling
 
+The scheduler is built for several CPUs (`process/sched.rs`, design in
+[docs/design/smp.md](docs/design/smp.md)); there is no big kernel lock.
+
+- **Tasks** (`process/task.rs`): a process is an `Arc<Task>`. What only the process itself
+  touches (address space, descriptors, cwd, FPU state) is owned by the task; relations,
+  name and exit/stop reports (`info`) and signal state with the interval timer (`sig`) have
+  their own locks; the scheduling state is atomic. The process table maps pids to tasks.
 - **One kernel stack per process** (64 KiB). A context switch saves callee-saved registers,
-  the FPU/SSE state (`fxsave`), the FS base (musl's TLS pointer), and switches CR3, `TSS.rsp0`
-  and the syscall stack pointer.
-- **Round-robin scheduling** driven by the local APIC timer at 100 Hz (calibrated against the
-  PIT once at boot). Only user code is preempted. The
-  kernel itself is non-preemptive and runs syscalls with interrupts disabled, which keeps the
-  single-core design free of most locking.
-- **Blocking** uses `sleep_on(channel)` / `wakeup(channel)` (pipes, TTY, timer ticks). Waiting
-  for children has its own state.
+  the FPU/SSE state (`fxsave`), the FS base (musl's TLS pointer), and switches CR3, the TSS
+  stack and I/O bitmap, and the syscall stack in the CPU block.
+- **Per-CPU run queues**, round robin, driven by each CPU's local APIC timer at 100 Hz
+  (calibrated against the PIT once at boot). A woken task goes to an idle CPU if there is
+  one (preferring the CPU it last ran on, woken by an IPI) and an idle CPU steals work from
+  the others. Each CPU has an idle task; idling loads the kernel's page table, so an address
+  space is only ever active on the CPU running its process.
+- **`on_cpu`** marks a task whose kernel stack is still in use; a CPU that picks it waits
+  until its previous CPU finished switching away, and the reaper frees a zombie only then.
+- **Sleeping without lost wakeups**: a blocking path first registers on its wait channel
+  (`prepare_to_wait`), then checks its condition, then sleeps; a per-task wake lock
+  serializes wakeups with the task descheduling itself. Pipes, the TTY, IPC, `wait4`, stops
+  and timed sleeps all use this protocol.
+- The kernel is non-preemptive: only user code is preempted, and syscalls run with
+  interrupts disabled. Locks are `IrqSpinLock`s (fair tickets, interrupts off while held).
 - New processes start by *returning from a syscall*: their kernel stack is pre-filled with a
   register frame that `user_return` consumes. A `fork` child is the parent's frame with
   `rax = 0`.

@@ -4,126 +4,56 @@ pub mod errno;
 pub mod ipc;
 pub mod irq;
 mod loader;
+pub mod sched;
 pub mod signal;
 mod sys_file;
 mod sys_mem;
 mod sys_net;
 pub mod syscall;
+pub mod task;
 pub mod uaccess;
 
 use crate::fs::file::OpenFile;
 use crate::fs;
-use crate::interrupts::gdt;
 use crate::memory;
-use address_space::AddressSpace;
 use alloc::boxed::Box;
-use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::cell::UnsafeCell;
 use core::ops::Range;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::Ordering;
 use errno::*;
+use sched::{current, prepare_to_wait, TABLE};
 use syscall::Frame;
+use task::{Info, KernelStack, State, Task};
 use x86_64::instructions::interrupts;
 use x86_64::registers::control::{Cr3, Cr3Flags};
 use x86_64::registers::model_specific::FsBase;
 use x86_64::VirtAddr;
 
+pub use sched::{prepare_to_sleep, schedule, ticks, wakeup};
+pub use signal::{get_alarm, set_alarm};
+pub use task::Process;
+
 pub type Pid = u64;
 
-const KSTACK_SIZE: usize = 64 * 1024;
-/// Upper bound on processes, so fork bombs fail with EAGAIN.
-const MAX_PROCS: usize = 256;
+const MAX_PROCS: usize = sched::MAX_PROCS;
 const MMAP_TOP: u64 = 0x0000_7000_0000_0000;
 pub const TIMER_HZ: u64 = 100;
 
-static TICKS: AtomicU64 = AtomicU64::new(0);
-const TICK_CHAN: usize = 1;
-
-#[repr(C, align(16))]
-struct KernelStack([u8; KSTACK_SIZE]);
-
-#[repr(C, align(16))]
-struct FpuState([u8; 512]);
-
-impl FpuState {
-    fn initial() -> Box<Self> {
-        let mut s = Box::new(FpuState([0; 512]));
-        s.0[0..2].copy_from_slice(&0x037f_u16.to_le_bytes()); // FCW
-        s.0[24..28].copy_from_slice(&0x1f80_u32.to_le_bytes()); // MXCSR
-        s
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum State {
-    Ready,
-    Running,
-    WaitChild,
-    /// Sleeps until `wakeup` is called with this channel.
-    Sleeping(usize),
-    /// Stopped by a signal until SIGCONT.
-    Stopped,
-    /// Wait status in Linux format (exit code << 8 or signal number).
-    Zombie(i32),
-}
-
 #[derive(Clone)]
-struct FdEntry {
-    file: Arc<OpenFile>,
-    cloexec: bool,
-}
-
-struct Process {
-    pid: Pid,
-    ppid: Pid,
-    pgid: Pid,
-    sid: Pid,
-    name: String,
-    state: State,
-    space: Option<AddressSpace>,
-    kstack: Option<Box<KernelStack>>,
-    kernel_rsp: u64,
-    fs_base: u64,
-    fpu: Box<FpuState>,
-    fds: Vec<Option<FdEntry>>,
-    cwd: String,
-    brk_start: u64,
-    brk_end: u64,
-    mmap_next: u64,
-    signals: signal::Signals,
-    /// Stop/continue event not yet collected by the parent's wait4.
-    report: Option<i32>,
-    /// Servers started by the kernel may register IPC services and ask
-    /// for I/O ports.
-    privileged: bool,
-    /// I/O permission bitmap (0 = allowed) installed in the TSS while
-    /// this process runs.
-    io_bitmap: Option<Box<[u8; gdt::IOMAP_BYTES]>>,
-    /// The server this process runs, with the resources assigned to it.
-    server: Option<Arc<Server>>,
-    /// Timer tick at which a sleep ends on its own (0: none).
-    wake_at: u64,
-    /// ITIMER_REAL: next SIGALRM tick (0: off) and the reload interval.
-    alarm_at: u64,
-    alarm_every: u64,
+pub struct FdEntry {
+    pub file: Arc<OpenFile>,
+    pub cloexec: bool,
 }
 
 impl Process {
-    fn kstack_top(&self) -> Option<u64> {
-        self.kstack
-            .as_ref()
-            .map(|s| s.0.as_ptr() as u64 + KSTACK_SIZE as u64)
-    }
-
-    fn space(&mut self) -> Result<&mut AddressSpace, i64> {
+    pub fn space(&mut self) -> Result<&mut address_space::AddressSpace, i64> {
         self.space.as_mut().ok_or(EINVAL)
     }
 
-    fn file(&self, fd: u64) -> Result<Arc<OpenFile>, i64> {
+    pub fn file(&self, fd: u64) -> Result<Arc<OpenFile>, i64> {
         self.fds
             .get(fd as usize)
             .and_then(|e| e.as_ref())
@@ -131,8 +61,8 @@ impl Process {
             .ok_or(EBADF)
     }
 
-    /// Kleinster freier Deskriptor >= `min`.
-    fn alloc_fd(&mut self, file: Arc<OpenFile>, cloexec: bool, min: usize) -> Result<i64, i64> {
+    /// Lowest free descriptor >= `min`.
+    pub fn alloc_fd(&mut self, file: Arc<OpenFile>, cloexec: bool, min: usize) -> Result<i64, i64> {
         const MAX_FDS: usize = 256;
         let fd = (min..MAX_FDS)
             .find(|&i| self.fds.get(i).is_none_or(|e| e.is_none()))
@@ -145,87 +75,25 @@ impl Process {
     }
 }
 
-struct Scheduler {
-    procs: BTreeMap<Pid, Box<Process>>,
-    ready: VecDeque<Pid>,
-    current: Pid,
-    next_pid: Pid,
+/// Runs `f` on the running process's own state. `f` must not sleep or
+/// switch tasks (closing files is fine: it never sleeps).
+pub fn with_current<R>(f: impl FnOnce(&mut Process) -> R) -> R {
+    interrupts::without_interrupts(|| f(unsafe { current().own() }))
 }
 
-impl Scheduler {
-    fn cur(&mut self) -> &mut Process {
-        let pid = self.current;
-        self.procs.get_mut(&pid).expect("current process missing")
-    }
-
-    fn make_ready(&mut self, pid: Pid) {
-        if let Some(p) = self.procs.get_mut(&pid) {
-            p.state = State::Ready;
-            self.ready.push_back(pid);
-        }
-    }
-}
-
-/// Single-core system: access only with interrupts disabled. A mutex would
-/// not work because no lock may be held across a context switch.
-struct SchedCell(UnsafeCell<Option<Scheduler>>);
-unsafe impl Sync for SchedCell {}
-static SCHED: SchedCell = SchedCell(UnsafeCell::new(None));
-
-fn sched() -> &'static mut Scheduler {
-    debug_assert!(!interrupts::are_enabled());
-    unsafe { (*SCHED.0.get()).as_mut().expect("process::init not called") }
-}
-
-/// Runs `f` on the current process. Must not do anything that re-enters
-/// the scheduler (sleeping, closing files).
-fn with_current<R>(f: impl FnOnce(&mut Process) -> R) -> R {
-    interrupts::without_interrupts(|| f(sched().cur()))
-}
-
+/// Process 0, the kernel monitor, runs on the boot stack of the bootstrap
+/// CPU; each CPU also has an idle task.
 pub fn init() {
     enable_sse();
     syscall::init();
-    let kernel = Process {
-        pid: 0,
-        ppid: 0,
-        pgid: 0,
-        sid: 0,
-        name: "kernel".to_string(),
-        state: State::Running,
-        space: None,
-        kstack: None,
-        kernel_rsp: 0,
-        fs_base: 0,
-        fpu: FpuState::initial(),
-        fds: Vec::new(),
-        cwd: "/".to_string(),
-        brk_start: 0,
-        brk_end: 0,
-        mmap_next: 0,
-        signals: signal::Signals::default(),
-        report: None,
-        privileged: false,
-        io_bitmap: None,
-        server: None,
-        wake_at: 0,
-        alarm_at: 0,
-        alarm_every: 0,
-    };
-    let mut procs = BTreeMap::new();
-    procs.insert(0, Box::new(kernel));
-    unsafe {
-        *SCHED.0.get() = Some(Scheduler {
-            procs,
-            ready: VecDeque::new(),
-            current: 0,
-            next_pid: 1,
-        })
-    };
+    let info = Info { ppid: 0, pgid: 0, sid: 0, name: "kernel".to_string(), exit_status: None, report: None };
+    let kernel = Arc::new(Task::new(0, info, Process::empty(), None, 0));
+    TABLE.lock().tasks.insert(0, kernel.clone());
+    sched::set_initial(kernel, sched::new_idle_task(0));
 }
 
 /// musl uses SSE; without OSFXSR every SSE instruction raises #UD.
-fn enable_sse() {
+pub fn enable_sse() {
     use x86_64::registers::control::{Cr0, Cr0Flags, Cr4, Cr4Flags};
     unsafe {
         Cr0::update(|f| {
@@ -237,47 +105,46 @@ fn enable_sse() {
 }
 
 pub fn current_pid() -> Pid {
-    with_current(|p| p.pid)
+    current().pid
 }
 
 pub fn current_ppid() -> Pid {
-    with_current(|p| p.ppid)
+    current().info.lock().ppid
 }
 
-/// `pid` 0 means the calling process.
-fn with_process<R>(pid: Pid, f: impl FnOnce(&mut Process, Pid) -> R) -> Result<R, i64> {
-    interrupts::without_interrupts(|| {
-        let s = sched();
-        let me = s.current;
-        let target = if pid == 0 { me } else { pid };
-        s.procs.get_mut(&target).map(|p| f(p, me)).ok_or(ESRCH)
-    })
+/// The task with `pid` (0: the caller).
+pub fn task(pid: Pid) -> Option<Arc<Task>> {
+    if pid == 0 {
+        return Some(sched::current_arc());
+    }
+    TABLE.lock().tasks.get(&pid).cloned()
 }
 
 pub fn setpgid(pid: Pid, pgid: Pid) -> SysResult {
-    with_process(pid, |p, me| {
-        if p.pid != me && p.ppid != me {
-            return Err(ESRCH);
-        }
-        p.pgid = if pgid == 0 { p.pid } else { pgid };
-        Ok(0)
-    })?
+    let me = current_pid();
+    let t = task(pid).ok_or(ESRCH)?;
+    let mut info = t.info.lock();
+    if t.pid != me && info.ppid != me {
+        return Err(ESRCH);
+    }
+    info.pgid = if pgid == 0 { t.pid } else { pgid };
+    Ok(0)
 }
 
 pub fn getpgid(pid: Pid) -> SysResult {
-    with_process(pid, |p, _| p.pgid as i64)
+    Ok(task(pid).ok_or(ESRCH)?.info.lock().pgid as i64)
 }
 
 pub fn getsid(pid: Pid) -> SysResult {
-    with_process(pid, |p, _| p.sid as i64)
+    Ok(task(pid).ok_or(ESRCH)?.info.lock().sid as i64)
 }
 
 pub fn setsid() -> SysResult {
-    with_current(|p| {
-        p.sid = p.pid;
-        p.pgid = p.pid;
-        Ok(p.pid as i64)
-    })
+    let me = current();
+    let mut info = me.info.lock();
+    info.sid = me.pid;
+    info.pgid = me.pid;
+    Ok(me.pid as i64)
 }
 
 /// ioperm(from, count, on) for privileged servers: grants or revokes
@@ -285,15 +152,15 @@ pub fn setsid() -> SysResult {
 /// assigned to the server can be granted.
 pub fn ioperm(from: u64, count: u64, on: u64) -> SysResult {
     let end = from.checked_add(count).filter(|&e| e <= 0x10000).ok_or(EINVAL)?;
+    if !current().privileged.load(Ordering::Relaxed) {
+        return Err(EPERM);
+    }
     with_current(|p| {
-        if !p.privileged {
-            return Err(EPERM);
-        }
         let assigned = p.server.as_ref().map_or(&[][..], |s| &s.ports[..]);
         if on != 0 && !assigned.iter().any(|r| r.start <= from && end <= r.end) {
             return Err(EPERM);
         }
-        let bitmap = p.io_bitmap.get_or_insert_with(|| Box::new([0xff; gdt::IOMAP_BYTES]));
+        let bitmap = p.io_bitmap.get_or_insert_with(|| Box::new([0xff; crate::interrupts::gdt::IOMAP_BYTES]));
         for port in from..end {
             let (byte, bit) = ((port / 8) as usize, 1u8 << (port % 8));
             if on != 0 {
@@ -307,189 +174,73 @@ pub fn ioperm(from: u64, count: u64, on: u64) -> SysResult {
     })
 }
 
-/// (pid, parent, name, state, server) of every process, for the monitor.
-pub fn list() -> Vec<(Pid, Pid, String, &'static str, bool)> {
-    interrupts::without_interrupts(|| {
-        sched()
-            .procs
-            .values()
-            .map(|p| {
-                let state = match p.state {
-                    State::Running => "running",
-                    State::Ready => "ready",
-                    State::WaitChild | State::Sleeping(_) => "sleeping",
-                    State::Stopped => "stopped",
-                    State::Zombie(_) => "zombie",
-                };
-                (p.pid, p.ppid, p.name.clone(), state, p.privileged)
-            })
-            .collect()
-    })
+/// (pid, parent, name, state, server, cpu) of every process, for the monitor.
+pub fn list() -> Vec<(Pid, Pid, String, &'static str, bool, usize)> {
+    let tasks: Vec<Arc<Task>> = TABLE.lock().tasks.values().cloned().collect();
+    tasks
+        .iter()
+        .map(|t| {
+            let state = match t.state() {
+                State::Running => "running",
+                State::Runnable => "ready",
+                State::Sleeping => "sleeping",
+                State::Stopped => "stopped",
+                State::Zombie => "zombie",
+            };
+            let info = t.info.lock();
+            (t.pid, info.ppid, info.name.clone(), state, t.privileged.load(Ordering::Relaxed), t.last_cpu.load(Ordering::Relaxed))
+        })
+        .collect()
 }
 
-pub fn ticks() -> u64 {
-    TICKS.load(Ordering::Relaxed)
-}
-
-/// Called from the timer interrupt.
+/// Called from every CPU's timer interrupt.
 pub fn tick() {
-    let now = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
-    wakeup(TICK_CHAN);
-    interrupts::without_interrupts(|| {
-        let s = sched();
-        let due: Vec<Pid> = s
-            .procs
-            .values()
-            .filter(|p| p.wake_at != 0 && p.wake_at <= now && matches!(p.state, State::Sleeping(_)))
-            .map(|p| p.pid)
-            .collect();
-        for pid in due {
-            s.make_ready(pid);
-        }
-        // Expired timers whose signal does not fit here stay expired and
-        // fire on the next tick, so no SIGALRM is ever lost.
-        let mut alarms: heapless::Vec<Pid, 64> = heapless::Vec::new();
-        for p in s.procs.values_mut().filter(|p| p.alarm_at != 0 && p.alarm_at <= now) {
-            if alarms.push(p.pid).is_err() {
-                break;
-            }
-            p.alarm_at = if p.alarm_every != 0 { now.saturating_add(p.alarm_every) } else { 0 };
-        }
-        for pid in alarms {
-            signal::send(pid, signal::SIGALRM);
-        }
-    });
-}
-
-/// setitimer(ITIMER_REAL, new, old) with timer-tick resolution. `new` and
-/// `old` are (interval, value) in microseconds; a value of 0 disarms.
-pub fn set_alarm(value_us: u64, interval_us: u64) -> (u64, u64) {
-    let to_ticks = |us: u64| us.saturating_mul(TIMER_HZ).div_ceil(1_000_000);
-    let to_us = |ticks: u64| ticks.saturating_mul(1_000_000) / TIMER_HZ;
-    interrupts::without_interrupts(|| {
-        let now = ticks();
-        let p = sched().cur();
-        let old = (to_us(p.alarm_at.saturating_sub(now)), to_us(p.alarm_every));
-        p.alarm_at = if value_us == 0 { 0 } else { now.saturating_add(to_ticks(value_us).max(1)) };
-        p.alarm_every = if value_us == 0 { 0 } else { to_ticks(interval_us) };
-        old
-    })
-}
-
-/// The current ITIMER_REAL setting: (remaining, interval) in microseconds.
-pub fn get_alarm() -> (u64, u64) {
-    interrupts::without_interrupts(|| {
-        let now = ticks();
-        let p = sched().cur();
-        let remaining = if p.alarm_at == 0 { 0 } else { p.alarm_at.saturating_sub(now).max(1) };
-        let to_us = |ticks: u64| ticks.saturating_mul(1_000_000) / TIMER_HZ;
-        (to_us(remaining), to_us(p.alarm_every))
-    })
-}
-
-/// Like `sleep_on`, but also wakes up at timer tick `deadline`.
-pub fn sleep_on_until(chan: usize, deadline: u64) {
-    interrupts::without_interrupts(|| {
-        let p = sched().cur();
-        p.state = State::Sleeping(chan);
-        p.wake_at = deadline.max(1);
-        schedule();
-        sched().cur().wake_at = 0;
-    });
+    sched::tick();
 }
 
 /// Sleeps for `n` timer ticks; a signal ends the sleep early with EINTR.
 pub fn sleep_ticks(n: u64) -> Result<(), i64> {
     let deadline = ticks().saturating_add(n);
-    while ticks() < deadline {
-        sleep_on(TICK_CHAN);
+    loop {
+        let wait = prepare_to_sleep();
+        if ticks() >= deadline {
+            return Ok(());
+        }
         if signal::interrupted() {
             return Err(EINTR);
         }
+        wait.sleep_until(deadline);
     }
-    Ok(())
 }
 
 /// pause(2): sleeps until a signal arrives.
 pub fn pause() -> SysResult {
-    const PAUSE_CHAN: usize = 3;
     loop {
+        let wait = prepare_to_sleep();
         if signal::interrupted() {
             return Err(EINTR);
         }
-        sleep_on(PAUSE_CHAN);
+        wait.sleep();
     }
 }
 
-pub fn sleep_on(chan: usize) {
-    interrupts::without_interrupts(|| {
-        sched().cur().state = State::Sleeping(chan);
-        schedule();
-    });
+pub fn yield_now() {
+    schedule();
 }
 
-pub fn wakeup(chan: usize) {
-    interrupts::without_interrupts(|| {
-        let s = sched();
-        let pids: Vec<Pid> = s
-            .procs
-            .values()
-            .filter(|p| p.state == State::Sleeping(chan))
-            .map(|p| p.pid)
-            .collect();
-        for pid in pids {
-            s.make_ready(pid);
-        }
-    });
-}
-
-/// New process that, when first scheduled, enters ring 3 with `frame`
-/// via `user_return`.
-fn new_process(pid: Pid, ppid: Pid, name: String, space: AddressSpace, frame: Frame) -> Result<Box<Process>, i64> {
+/// A new user task with a kernel stack whose first switch enters ring 3
+/// with `frame`.
+fn new_task(pid: Pid, info: Info, own: Process, frame: Frame) -> Result<Arc<Task>, i64> {
     // Kernel stacks are demanded by user space (fork), so they must not
     // eat into the reserve the kernel heap relies on.
-    if !crate::memory::with_frames(|f| f.user_may_take((KSTACK_SIZE / 4096) as u64)) {
+    if !memory::with_frames(|f| f.user_may_take((task::KSTACK_SIZE / 4096) as u64)) {
         return Err(ENOMEM);
     }
-    // try_new_zeroed instead of Box::new: no temporary on the (small) kernel
-    // stack, and running out of memory is an error, not a panic.
+    // try_new_zeroed: no temporary on the (small) kernel stack, and running
+    // out of memory is an error, not a panic.
     let mut kstack = unsafe { Box::<KernelStack>::try_new_zeroed().map_err(|_| ENOMEM)?.assume_init() };
-    let top = kstack.0.as_mut_ptr() as u64 + KSTACK_SIZE as u64;
-    let frame_addr = top - core::mem::size_of::<Frame>() as u64;
-    unsafe {
-        (frame_addr as *mut Frame).write(frame);
-        // Expected by switch_stacks: r15..rbx (6 words) and a return address.
-        ((frame_addr - 8) as *mut u64).write(syscall::user_return as *const () as u64);
-        for i in 1..=6 {
-            ((frame_addr - 8 - i * 8) as *mut u64).write(0);
-        }
-    }
-    Ok(Box::new(Process {
-        pid,
-        ppid,
-        pgid: pid,
-        sid: pid,
-        name,
-        state: State::Ready,
-        space: Some(space),
-        kstack: Some(kstack),
-        kernel_rsp: frame_addr - 56,
-        fs_base: 0,
-        fpu: FpuState::initial(),
-        fds: Vec::new(),
-        cwd: "/".to_string(),
-        brk_start: 0,
-        brk_end: 0,
-        mmap_next: MMAP_TOP,
-        signals: signal::Signals::default(),
-        report: None,
-        privileged: false,
-        io_bitmap: None,
-        server: None,
-        wake_at: 0,
-        alarm_at: 0,
-        alarm_every: 0,
-    }))
+    let rsp = sched::prepare_stack(&mut kstack, Some(frame), true);
+    Arc::try_new(Task::new(pid, info, own, Some(kstack), rsp)).map_err(|_| ENOMEM)
 }
 
 fn basename(path: &str) -> &str {
@@ -666,64 +417,71 @@ pub fn spawn_server(server: &Arc<Server>) -> Result<Pid, i64> {
     spawn_with(server.path, image, Some(server))
 }
 
+/// Takes the next pid, or EAGAIN at the process limit.
+fn reserve_pid() -> Result<Pid, i64> {
+    let mut table = TABLE.lock();
+    if table.tasks.len() >= MAX_PROCS {
+        return Err(EAGAIN);
+    }
+    let pid = table.next_pid;
+    table.next_pid += 1;
+    Ok(pid)
+}
+
 fn spawn_with(path: &str, image: loader::Image, server: Option<&Arc<Server>>) -> Result<Pid, i64> {
     let console = OpenFile::console();
-    interrupts::without_interrupts(|| {
-        let s = sched();
-        if s.procs.len() >= MAX_PROCS {
-            return Err(EAGAIN);
-        }
-        let pid = s.next_pid;
-        s.next_pid += 1;
-        let frame = Frame::user_start(image.entry, image.sp);
-        // Servers belong to the kernel, even when a program's request
-        // (re)started them, so no program can wait for or signal them.
-        let parent = if server.is_some() { 0 } else { s.current };
-        let mut p = new_process(pid, parent, basename(path).to_string(), image.space, frame)?;
-        p.fds = vec![Some(FdEntry { file: console, cloexec: false }); 3];
-        p.brk_start = image.brk;
-        p.brk_end = image.brk;
-        p.privileged = server.is_some();
-        p.server = server.cloned();
-        s.procs.insert(pid, p);
-        s.ready.push_back(pid);
-        if server.is_none() {
-            crate::drivers::tty::set_foreground(pid);
-        }
-        Ok(pid)
-    })
+    let pid = reserve_pid()?;
+    // Servers belong to the kernel, even when a program's request
+    // (re)started them, so no program can wait for or signal them.
+    let parent = if server.is_some() { 0 } else { current_pid() };
+    let name = basename(path).to_string();
+    let info = Info { ppid: parent, pgid: pid, sid: pid, name, exit_status: None, report: None };
+    let mut own = Process::empty();
+    own.space = Some(image.space);
+    own.fds = vec![Some(FdEntry { file: console, cloexec: false }); 3];
+    own.brk_start = image.brk;
+    own.brk_end = image.brk;
+    own.mmap_next = MMAP_TOP;
+    own.server = server.cloned();
+    let t = new_task(pid, info, own, Frame::user_start(image.entry, image.sp))?;
+    t.privileged.store(server.is_some(), Ordering::Relaxed);
+    TABLE.lock().tasks.insert(pid, t.clone());
+    if server.is_none() {
+        crate::drivers::tty::set_foreground(pid);
+    }
+    sched::start(t);
+    Ok(pid)
 }
 
 pub fn fork(frame: &Frame) -> Result<Pid, i64> {
-    let s = sched();
-    if s.procs.len() >= MAX_PROCS {
-        return Err(EAGAIN);
-    }
-    let space = s
-        .cur()
-        .space
-        .as_ref()
-        .ok_or(EINVAL)?
-        .clone_user()
-        .map_err(|_| ENOMEM)?;
-    let mut child_frame = frame.clone();
+    let pid = reserve_pid()?;
+    let me = current();
+    let parent = unsafe { me.own() };
+    let space = parent.space.as_ref().ok_or(EINVAL)?.clone_user().map_err(|_| ENOMEM)?;
+    let mut child_frame = *frame;
     child_frame.rax = 0;
-    let pid = s.next_pid;
-    s.next_pid += 1;
-    let parent = s.cur();
-    let mut child = new_process(pid, parent.pid, parent.name.clone(), space, child_frame)?;
-    child.pgid = parent.pgid;
-    child.sid = parent.sid;
-    child.fds = parent.fds.clone();
-    child.cwd = parent.cwd.clone();
-    child.brk_start = parent.brk_start;
-    child.brk_end = parent.brk_end;
-    child.mmap_next = parent.mmap_next;
-    child.signals = parent.signals.for_child();
-    child.fs_base = FsBase::read().as_u64();
-    unsafe { fxsave(&mut child.fpu) };
-    s.procs.insert(pid, child);
-    s.ready.push_back(pid);
+    let info = {
+        let i = me.info.lock();
+        Info { ppid: me.pid, pgid: i.pgid, sid: i.sid, name: i.name.clone(), exit_status: None, report: None }
+    };
+    let mut fpu = task::FpuState::initial();
+    unsafe { core::arch::asm!("fxsave64 [{}]", in(reg) fpu.0.as_mut_ptr(), options(nostack)) };
+    let own = Process {
+        space: Some(space),
+        fs_base: FsBase::read().as_u64(),
+        fpu,
+        fds: parent.fds.clone(),
+        cwd: parent.cwd.clone(),
+        brk_start: parent.brk_start,
+        brk_end: parent.brk_end,
+        mmap_next: parent.mmap_next,
+        io_bitmap: None,
+        server: None,
+    };
+    let child = new_task(pid, info, own, child_frame)?;
+    *child.sig.lock() = me.sig.lock().for_child();
+    TABLE.lock().tasks.insert(pid, child.clone());
+    sched::start(child);
     Ok(pid)
 }
 
@@ -731,16 +489,17 @@ pub fn exec(frame: &mut Frame, path: &str, args: &[String], envs: &[String]) -> 
     let cwd = with_current(|p| p.cwd.clone());
     let image = load_path(&cwd, path, args, envs)?;
     image.space.activate();
+    let me = current();
+    me.info.lock().name = basename(path).to_string();
+    me.sig.lock().reset_on_exec();
+    // A new program gets no inherited hardware access.
+    me.privileged.store(false, Ordering::Relaxed);
     let closed: Vec<FdEntry> = with_current(|p| {
         // The old address space is freed here; it is no longer active.
         p.space = Some(image.space);
-        p.name = basename(path).to_string();
         p.brk_start = image.brk;
         p.brk_end = image.brk;
         p.mmap_next = MMAP_TOP;
-        p.signals.reset_on_exec();
-        // A new program gets no inherited hardware access.
-        p.privileged = false;
         p.io_bitmap = None;
         p.server = None;
         crate::smp::cpu().tables().set_io_bitmap(None);
@@ -752,35 +511,54 @@ pub fn exec(frame: &mut Frame, path: &str, args: &[String], envs: &[String]) -> 
     });
     drop(closed);
     FsBase::write(VirtAddr::new(0));
-    unsafe { fxrstor(&FpuState::initial()) };
+    let initial = task::FpuState::initial();
+    unsafe { core::arch::asm!("fxrstor64 [{}]", in(reg) initial.0.as_ptr(), options(nostack)) };
     *frame = Frame::user_start(image.entry, image.sp);
     Ok(())
 }
 
+/// Channel a parent sleeps on in wait4.
+fn child_chan(parent: Pid) -> usize {
+    0x5_0000_0000 + parent as usize
+}
+
+/// Wakes a parent blocked in wait4.
+pub fn notify_parent(ppid: Pid) {
+    wakeup(child_chan(ppid));
+}
+
 pub fn exit(status: i32) -> ! {
     interrupts::disable();
+    let me = current();
+    assert!(me.pid != 0, "kernel task must not call exit");
     // Close files first: this may wake pipe readers/writers.
-    let fds = core::mem::take(&mut sched().cur().fds);
+    let fds = core::mem::take(&mut unsafe { me.own() }.fds);
     drop(fds);
-    ipc::on_exit(sched().current);
-    irq::on_exit(sched().current);
-
-    let s = sched();
-    let pid = s.current;
-    assert!(pid != 0, "kernel task must not call exit");
-    for p in s.procs.values_mut() {
-        if p.ppid == pid {
-            p.ppid = 0;
+    ipc::on_exit(me.pid);
+    irq::on_exit(me.pid);
+    unsafe { Cr3::write(memory::kernel_l4(), Cr3Flags::empty()) };
+    unsafe { me.own() }.space = None;
+    unsafe { me.own() }.server = None;
+    // Orphans go to the kernel, which reaps them.
+    {
+        let table = TABLE.lock();
+        for t in table.tasks.values() {
+            let mut info = t.info.lock();
+            if info.ppid == me.pid {
+                info.ppid = 0;
+            }
         }
     }
-    unsafe { Cr3::write(crate::memory::kernel_l4(), Cr3Flags::empty()) };
-    let me = s.cur();
-    me.space = None;
-    me.state = State::Zombie(status);
-    let ppid = me.ppid;
-    if s.procs.get(&ppid).is_some_and(|p| p.state == State::WaitChild) {
-        s.make_ready(ppid);
+    let ppid = {
+        let mut info = me.info.lock();
+        info.exit_status = Some(status);
+        info.ppid
+    };
+    {
+        let _w = me.wake_lock.lock();
+        me.set_state(State::Zombie);
     }
+    notify_parent(ppid);
     signal::send(ppid, signal::SIGCHLD);
     schedule();
     unreachable!("zombie was scheduled again");
@@ -795,46 +573,65 @@ const WCONTINUED: u64 = 8;
 /// or None with WNOHANG if nothing is ready. Stops and continues are
 /// reported with WUNTRACED and WCONTINUED.
 fn wait_child(pid: i64, options: u64) -> Result<Option<(Pid, i32)>, i64> {
+    let me = current();
+    let my_pgid = me.info.lock().pgid;
+    let wanted = |r: i32| {
+        (r == signal::CONTINUED_STATUS && options & WCONTINUED != 0) || (r != signal::CONTINUED_STATUS && options & WUNTRACED != 0)
+    };
     loop {
-        let s = sched();
-        let me = s.current;
-        let my_pgid = s.cur().pgid;
-        let is_target = |p: &Process| {
-            p.ppid == me
-                && p.pid != me
-                && match pid {
-                    p_ if p_ > 0 => p.pid == p_ as Pid,
-                    0 => p.pgid == my_pgid,
-                    -1 => true,
-                    p_ => p.pgid == p_.unsigned_abs(),
+        let wait = prepare_to_wait(child_chan(me.pid));
+        let mut any_child = false;
+        let mut found: Option<(Arc<Task>, i32, bool)> = None;
+        {
+            let table = TABLE.lock();
+            for t in table.tasks.values() {
+                if t.pid == me.pid {
+                    continue;
                 }
-        };
-        if !s.procs.values().any(|p| is_target(p)) {
+                let mut info = t.info.lock();
+                let selected = info.ppid == me.pid
+                    && match pid {
+                        p if p > 0 => t.pid == p as Pid,
+                        0 => info.pgid == my_pgid,
+                        -1 => true,
+                        p => info.pgid == p.unsigned_abs(),
+                    };
+                if !selected {
+                    continue;
+                }
+                any_child = true;
+                if let Some(status) = info.exit_status {
+                    found = Some((t.clone(), status, true));
+                    break;
+                }
+                if let Some(r) = info.report.filter(|&r| wanted(r)) {
+                    info.report = None;
+                    found = Some((t.clone(), r, false));
+                    break;
+                }
+            }
+        }
+        if !any_child {
             return Err(ECHILD);
         }
-        let zombie = s.procs.values().find(|p| is_target(p) && matches!(p.state, State::Zombie(_)));
-        if let Some(z) = zombie {
-            let (pid, State::Zombie(status)) = (z.pid, z.state) else { unreachable!() };
-            s.procs.remove(&pid);
-            return Ok(Some((pid, status)));
-        }
-        let wanted = |r: i32| {
-            (r == signal::CONTINUED_STATUS && options & WCONTINUED != 0)
-                || (r != signal::CONTINUED_STATUS && options & WUNTRACED != 0)
-        };
-        if let Some(p) = s.procs.values_mut().find(|p| is_target(p) && p.report.is_some_and(wanted)) {
-            let status = p.report.take().expect("checked above");
-            return Ok(Some((p.pid, status)));
+        if let Some((child, status, dead)) = found {
+            if dead {
+                TABLE.lock().tasks.remove(&child.pid);
+                // Its CPU may still be switching away from it.
+                while child.on_cpu.load(Ordering::Acquire) {
+                    core::hint::spin_loop();
+                }
+            }
+            return Ok(Some((child.pid, status)));
         }
         if options & WNOHANG != 0 {
             return Ok(None);
         }
-        // Checked after the scans: a finished child wins over a signal.
+        // Checked after the scan: a finished child wins over a signal.
         if signal::interrupted() {
             return Err(EINTR);
         }
-        s.cur().state = State::WaitChild;
-        schedule();
+        wait.sleep();
     }
 }
 
@@ -852,96 +649,12 @@ pub fn wait4(pid: i64, status_ptr: u64, options: u64) -> SysResult {
 
 /// For the kernel shell: blocks until a specific child exits or stops.
 pub fn wait_for(pid: Pid) -> Result<i32, i64> {
-    interrupts::without_interrupts(|| wait_child(pid as i64, WUNTRACED))
-        .map(|r| r.expect("blocking wait always yields a result").1)
+    wait_child(pid as i64, WUNTRACED).map(|r| r.expect("blocking wait always yields a result").1)
 }
 
 /// Reaps zombies whose parent (the kernel) no longer waits for them.
 pub fn reap_orphans() {
-    interrupts::without_interrupts(|| while let Ok(Some(_)) = wait_child(-1, WNOHANG) {});
-}
-
-pub fn yield_now() {
-    interrupts::without_interrupts(schedule);
-}
-
-/// Picks the next runnable process (round robin). Must be called with
-/// interrupts disabled.
-pub fn schedule() {
-    loop {
-        let s = sched();
-        let cur = s.current;
-        if s.cur().state == State::Running {
-            s.make_ready(cur);
-        }
-        if let Some(next) = s.ready.pop_front() {
-            if next == cur {
-                s.cur().state = State::Running;
-            } else {
-                switch_to(next);
-            }
-            return;
-        }
-        // Nothing runnable: wait for an interrupt.
-        interrupts::enable_and_hlt();
-        interrupts::disable();
-    }
-}
-
-fn switch_to(next: Pid) {
-    let s = sched();
-    let prev = s.cur();
-    prev.fs_base = FsBase::read().as_u64();
-    unsafe { fxsave(&mut prev.fpu) };
-    let prev_rsp: *mut u64 = &mut prev.kernel_rsp;
-
-    let n = s.procs.get_mut(&next).expect("next process missing");
-    n.state = State::Running;
-    match &n.space {
-        Some(space) => space.activate(),
-        None => unsafe { Cr3::write(crate::memory::kernel_l4(), Cr3Flags::empty()) },
-    }
-    let cpu = crate::smp::cpu();
-    if let Some(top) = n.kstack_top() {
-        cpu.set_kernel_stack(top);
-    }
-    cpu.tables().set_io_bitmap(n.io_bitmap.as_deref());
-    FsBase::write(VirtAddr::new(n.fs_base));
-    unsafe { fxrstor(&n.fpu) };
-    let next_rsp = n.kernel_rsp;
-    s.current = next;
-    unsafe { switch_stacks(prev_rsp, next_rsp) };
-}
-
-unsafe fn fxsave(area: &mut FpuState) {
-    unsafe { core::arch::asm!("fxsave64 [{}]", in(reg) area.0.as_mut_ptr(), options(nostack)) };
-}
-
-unsafe fn fxrstor(area: &FpuState) {
-    unsafe { core::arch::asm!("fxrstor64 [{}]", in(reg) area.0.as_ptr(), options(nostack)) };
-}
-
-/// Saves the callee-saved registers on the current kernel stack, stores
-/// rsp to `*save` and continues on stack `next`.
-#[unsafe(naked)]
-unsafe extern "sysv64" fn switch_stacks(save: *mut u64, next: u64) {
-    core::arch::naked_asm!(
-        "push rbx",
-        "push rbp",
-        "push r12",
-        "push r13",
-        "push r14",
-        "push r15",
-        "mov [rdi], rsp",
-        "mov rsp, rsi",
-        "pop r15",
-        "pop r14",
-        "pop r13",
-        "pop r12",
-        "pop rbp",
-        "pop rbx",
-        "ret",
-    );
+    while let Ok(Some(_)) = wait_child(-1, WNOHANG) {}
 }
 
 pub enum WaitStatus {

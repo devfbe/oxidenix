@@ -4,9 +4,12 @@
 use super::address_space::USER_END;
 use super::errno::*;
 use super::syscall::Frame;
-use super::{sched, uaccess, Pid, State};
+use super::sched::{self, current, try_wake};
+use super::task::{State, Task};
+use super::{uaccess, Pid, TIMER_HZ};
 use crate::interrupts::gdt;
-use x86_64::instructions::interrupts;
+use alloc::sync::Arc;
+use core::sync::atomic::Ordering;
 
 pub const SIGINT: u32 = 2;
 pub const SIGQUIT: u32 = 3;
@@ -49,6 +52,9 @@ pub struct Signals {
     actions: [SigAction; NSIG as usize],
     pub mask: u64,
     pending: u64,
+    /// ITIMER_REAL: next SIGALRM tick (0: off) and the reload interval.
+    alarm_at: u64,
+    alarm_every: u64,
 }
 
 impl Default for Signals {
@@ -57,6 +63,8 @@ impl Default for Signals {
             actions: [SigAction::default(); NSIG as usize],
             mask: 0,
             pending: 0,
+            alarm_at: 0,
+            alarm_every: 0,
         }
     }
 }
@@ -101,9 +109,9 @@ impl Signals {
         set
     }
 
-    /// Fork keeps actions and mask, but not pending signals.
+    /// Fork keeps actions and mask, but not pending signals or timers.
     pub fn for_child(&self) -> Signals {
-        Signals { pending: 0, ..self.clone() }
+        Signals { pending: 0, alarm_at: 0, alarm_every: 0, ..self.clone() }
     }
 
     /// Exec resets caught signals to their default action.
@@ -120,19 +128,25 @@ impl Signals {
 /// so the read restarts once they are continued in the foreground), or EIO
 /// if they ignore or block it.
 pub fn check_tty_read(foreground: Pid) -> Result<(), i64> {
-    interrupts::without_interrupts(|| {
-        let p = sched().cur();
-        if p.pid == 0 || foreground == 0 || p.pgid == foreground {
-            return Ok(());
-        }
-        let ignored = p.signals.actions[SIGTTIN as usize - 1].handler == SIG_IGN;
-        if ignored || p.signals.mask & bit(SIGTTIN) != 0 {
+    let me = current();
+    let pgid = me.info.lock().pgid;
+    if me.pid == 0 || foreground == 0 || pgid == foreground {
+        return Ok(());
+    }
+    {
+        let sig = me.sig.lock();
+        let ignored = sig.actions[SIGTTIN as usize - 1].handler == SIG_IGN;
+        if ignored || sig.mask & bit(SIGTTIN) != 0 {
             return Err(EIO);
         }
-        let pgid = p.pgid;
-        send_group(pgid, SIGTTIN);
-        Err(EINTR)
-    })
+    }
+    send_group(pgid, SIGTTIN);
+    Err(EINTR)
+}
+
+/// Whether a blocking syscall of the current process should return EINTR.
+pub fn interrupted() -> bool {
+    current().sig.lock().deliverable() != 0
 }
 
 /// Raises `sig` for a fault of the current process (a CPU exception). Such
@@ -140,80 +154,79 @@ pub fn check_tty_read(foreground: Pid) -> Result<(), i64> {
 /// reset to the default (terminate) in that case. Returns whether the
 /// process will die of it (no handler).
 pub fn force(sig: u32) -> bool {
-    interrupts::without_interrupts(|| {
-        let p = sched().cur();
-        let action = &mut p.signals.actions[sig as usize - 1];
-        if p.signals.mask & bit(sig) != 0 || action.handler == SIG_IGN {
-            *action = SigAction::default();
-            p.signals.mask &= !bit(sig);
-        }
-        p.signals.pending |= bit(sig);
+    let mut s = current().sig.lock();
+    let blocked = s.mask & bit(sig) != 0;
+    let action = &mut s.actions[sig as usize - 1];
+    let default = if blocked || action.handler == SIG_IGN {
+        *action = SigAction::default();
+        true
+    } else {
         action.handler == SIG_DFL
-    })
-}
-
-/// Whether a blocking syscall of the current process should return EINTR.
-pub fn interrupted() -> bool {
-    interrupts::without_interrupts(|| sched().cur().signals.deliverable() != 0)
+    };
+    s.mask &= !bit(sig);
+    s.pending |= bit(sig);
+    default
 }
 
 /// Wakes a parent blocked in wait4 and sends it SIGCHLD.
 fn notify_parent(ppid: Pid) {
-    let s = sched();
-    if s.procs.get(&ppid).is_some_and(|p| p.state == State::WaitChild) {
-        s.make_ready(ppid);
-    }
-    post(ppid, SIGCHLD);
+    super::notify_parent(ppid);
+    send(ppid, SIGCHLD);
 }
 
-/// Marks `sig` pending for `pid` and wakes it from an interruptible sleep.
+/// Marks `sig` pending for `t` and wakes it from an interruptible sleep.
 /// SIGCONT resumes a stopped process right away; SIGKILL wakes it to die.
-fn post(pid: Pid, sig: u32) {
-    let s = sched();
-    let Some(p) = s.procs.get_mut(&pid) else { return };
-    if pid == 0 || matches!(p.state, State::Zombie(_)) {
+fn post(t: &Arc<Task>, sig: u32) {
+    if t.pid == 0 || t.state() == State::Zombie {
         return;
     }
-    if sig == SIGCONT {
-        p.signals.pending &= !STOP_SIGNALS;
-        if p.state == State::Stopped {
-            p.report = Some(CONTINUED_STATUS);
-            let ppid = p.ppid;
-            s.make_ready(pid);
-            notify_parent(ppid);
+    let mut continued_parent = None;
+    let (wake, resume) = {
+        let mut s = t.sig.lock();
+        if sig == SIGCONT {
+            s.pending &= !STOP_SIGNALS;
+        } else if is_stop(sig) {
+            s.pending &= !bit(SIGCONT);
         }
-    } else if is_stop(sig) {
-        p.signals.pending &= !bit(SIGCONT);
-    }
-    let Some(p) = s.procs.get_mut(&pid) else { return };
-    p.signals.pending |= bit(sig);
-    let wake = match p.state {
-        State::Sleeping(_) | State::WaitChild => p.signals.deliverable() != 0,
-        State::Stopped => sig == SIGKILL,
-        _ => false,
+        s.pending |= bit(sig);
+        let resume = sig == SIGCONT || sig == SIGKILL;
+        (s.deliverable() != 0, resume)
     };
+    if resume && try_wake(t, State::Stopped) && sig == SIGCONT {
+        let mut info = t.info.lock();
+        info.report = Some(CONTINUED_STATUS);
+        continued_parent = Some(info.ppid);
+    }
     if wake {
-        s.make_ready(pid);
+        try_wake(t, State::Sleeping);
+    }
+    if let Some(ppid) = continued_parent {
+        notify_parent(ppid);
     }
 }
 
 pub fn send(pid: Pid, sig: u32) {
-    interrupts::without_interrupts(|| post(pid, sig));
+    if let Some(t) = sched::TABLE.lock().tasks.get(&pid).cloned() {
+        post(&t, sig);
+    }
 }
 
 /// Sends `sig` to every process in group `pgid`. Called from interrupt
 /// context (Ctrl+C), so it must not allocate.
 pub fn send_group(pgid: Pid, sig: u32) {
-    interrupts::without_interrupts(|| {
-        let mut pids: heapless::Vec<Pid, 256> = heapless::Vec::new();
+    let mut targets: heapless::Vec<Arc<Task>, { sched::MAX_PROCS }> = heapless::Vec::new();
+    {
+        let table = sched::TABLE.lock();
         // Servers never belong to a terminal's job; skip them regardless.
-        for p in sched().procs.values().filter(|p| p.pgid == pgid && p.pid != 0 && !p.privileged) {
-            let _ = pids.push(p.pid);
+        for t in table.tasks.values() {
+            if t.pid != 0 && !t.privileged.load(Ordering::Relaxed) && t.info.lock().pgid == pgid {
+                let _ = targets.push(t.clone());
+            }
         }
-        for pid in pids {
-            post(pid, sig);
-        }
-    })
+    }
+    for t in &targets {
+        post(t, sig);
+    }
 }
 
 /// kill(2). Privileged servers are protected like init on Linux: only the
@@ -224,36 +237,79 @@ pub fn kill(pid: i64, sig: u64) -> SysResult {
         return Err(EINVAL);
     }
     let sig = sig as u32;
-    interrupts::without_interrupts(|| {
-        let s = sched();
-        let me = s.cur();
-        let (my_pid, my_pgid) = (me.pid, me.pgid);
-        if pid > 0 && my_pid != 0 && s.procs.get(&(pid as Pid)).is_some_and(|p| p.privileged) {
+    let me = current();
+    let (my_pid, my_pgid) = (me.pid, me.info.lock().pgid);
+    let mut targets: heapless::Vec<Arc<Task>, { sched::MAX_PROCS }> = heapless::Vec::new();
+    {
+        let table = sched::TABLE.lock();
+        if pid > 0 && my_pid != 0 && table.tasks.get(&(pid as Pid)).is_some_and(|t| t.privileged.load(Ordering::Relaxed)) {
             return Err(EPERM);
         }
-        let targets: alloc::vec::Vec<Pid> = s
-            .procs
-            .values()
-            .filter(|p| p.pid != 0 && !matches!(p.state, State::Zombie(_)))
-            .filter(|p| my_pid == 0 || !p.privileged)
-            .filter(|p| match pid {
-                p_ if p_ > 0 => p.pid == p_ as Pid,
-                0 => p.pgid == my_pgid,
-                -1 => p.pid != 1 && p.pid != my_pid,
-                p_ => p.pgid == p_.unsigned_abs(),
-            })
-            .map(|p| p.pid)
-            .collect();
-        if targets.is_empty() {
-            return Err(ESRCH);
-        }
-        if sig != 0 {
-            for t in targets {
-                post(t, sig);
+        for t in table.tasks.values() {
+            if t.pid == 0 || t.state() == State::Zombie || (my_pid != 0 && t.privileged.load(Ordering::Relaxed)) {
+                continue;
+            }
+            let selected = match pid {
+                p if p > 0 => t.pid == p as Pid,
+                0 => t.info.lock().pgid == my_pgid,
+                -1 => t.pid != 1 && t.pid != my_pid,
+                p => t.info.lock().pgid == p.unsigned_abs(),
+            };
+            if selected {
+                let _ = targets.push(t.clone());
             }
         }
-        Ok(0)
-    })
+    }
+    if targets.is_empty() {
+        return Err(ESRCH);
+    }
+    if sig != 0 {
+        for t in &targets {
+            post(t, sig);
+        }
+    }
+    Ok(0)
+}
+
+/// Sends SIGALRM to every process whose interval timer expired by `now`
+/// and reloads it. Runs in the timer interrupt; never allocates.
+pub fn expire_alarms(now: u64) {
+    let mut due: heapless::Vec<Arc<Task>, { sched::MAX_PROCS }> = heapless::Vec::new();
+    {
+        let table = sched::TABLE.lock();
+        for t in table.tasks.values() {
+            let mut s = t.sig.lock();
+            if s.alarm_at != 0 && s.alarm_at <= now {
+                s.alarm_at = if s.alarm_every != 0 { now.saturating_add(s.alarm_every) } else { 0 };
+                let _ = due.push(t.clone());
+            }
+        }
+    }
+    for t in &due {
+        post(t, SIGALRM);
+    }
+}
+
+/// setitimer(ITIMER_REAL, new, old) with timer-tick resolution. `new` and
+/// `old` are (interval, value) in microseconds; a value of 0 disarms.
+pub fn set_alarm(value_us: u64, interval_us: u64) -> (u64, u64) {
+    let to_ticks = |us: u64| us.saturating_mul(TIMER_HZ).div_ceil(1_000_000);
+    let to_us = |ticks: u64| ticks.saturating_mul(1_000_000) / TIMER_HZ;
+    let now = sched::ticks();
+    let mut s = current().sig.lock();
+    let old = (to_us(s.alarm_at.saturating_sub(now)), to_us(s.alarm_every));
+    s.alarm_at = if value_us == 0 { 0 } else { now.saturating_add(to_ticks(value_us).max(1)) };
+    s.alarm_every = if value_us == 0 { 0 } else { to_ticks(interval_us) };
+    old
+}
+
+/// The current ITIMER_REAL setting: (remaining, interval) in microseconds.
+pub fn get_alarm() -> (u64, u64) {
+    let now = sched::ticks();
+    let s = current().sig.lock();
+    let remaining = if s.alarm_at == 0 { 0 } else { s.alarm_at.saturating_sub(now).max(1) };
+    let to_us = |ticks: u64| ticks.saturating_mul(1_000_000) / TIMER_HZ;
+    (to_us(remaining), to_us(s.alarm_every))
 }
 
 pub fn sigaction(sig: u64, act: u64, oldact: u64) -> SysResult {
@@ -265,18 +321,18 @@ pub fn sigaction(sig: u64, act: u64, oldact: u64) -> SysResult {
     if new.is_some() && bit(sig) & UNBLOCKABLE != 0 {
         return Err(EINVAL);
     }
-    let old = interrupts::without_interrupts(|| {
-        let p = sched().cur();
-        let old = p.signals.actions[sig as usize - 1];
+    let old = {
+        let mut s = current().sig.lock();
+        let old = s.actions[sig as usize - 1];
         if let Some(mut new) = new {
             new.mask &= !UNBLOCKABLE;
-            p.signals.actions[sig as usize - 1] = new;
+            s.actions[sig as usize - 1] = new;
             if new.handler == SIG_IGN || (new.handler == SIG_DFL && default_ignored(sig)) {
-                p.signals.pending &= !bit(sig);
+                s.pending &= !bit(sig);
             }
         }
         old
-    });
+    };
     if oldact != 0 {
         uaccess::write(oldact, old)?;
     }
@@ -288,19 +344,19 @@ pub fn sigprocmask(how: u64, set: u64, oldset: u64) -> SysResult {
     const SIG_UNBLOCK: u64 = 1;
     const SIG_SETMASK: u64 = 2;
     let new: Option<u64> = if set != 0 { Some(uaccess::read(set)?) } else { None };
-    let old = interrupts::without_interrupts(|| {
-        let p = sched().cur();
-        let old = p.signals.mask;
+    let old = {
+        let mut s = current().sig.lock();
+        let old = s.mask;
         if let Some(n) = new {
-            p.signals.mask = match how {
+            s.mask = match how {
                 SIG_BLOCK => old | n,
                 SIG_UNBLOCK => old & !n,
                 SIG_SETMASK => n,
                 _ => return Err(EINVAL),
             } & !UNBLOCKABLE;
         }
-        Ok(old)
-    })?;
+        old
+    };
     if oldset != 0 {
         uaccess::write(oldset, old)?;
     }
@@ -353,16 +409,26 @@ fn rewind(frame: &mut Frame, nr: u64) {
     frame.rip -= 2; // length of the `syscall` instruction
 }
 
-/// Stops the current process until SIGCONT (or SIGKILL) arrives.
+/// Stops the current process until SIGCONT (or SIGKILL) arrives. A
+/// SIGCONT that came in meanwhile cancels the stop: it is checked under the
+/// signal lock, which `post` takes too.
 fn stop(sig: u32) {
-    interrupts::without_interrupts(|| {
-        let p = sched().cur();
-        p.state = State::Stopped;
-        p.report = Some(stopped_status(sig));
-        let ppid = p.ppid;
-        notify_parent(ppid);
-        super::schedule();
-    });
+    let me = current();
+    {
+        let s = me.sig.lock();
+        if s.pending & (bit(SIGCONT) | bit(SIGKILL)) != 0 {
+            return;
+        }
+        let _w = me.wake_lock.lock();
+        me.set_state(State::Stopped);
+    }
+    let ppid = {
+        let mut info = me.info.lock();
+        info.report = Some(stopped_status(sig));
+        info.ppid
+    };
+    notify_parent(ppid);
+    sched::schedule();
 }
 
 /// Handles pending signals before returning to user space: stops the
@@ -375,32 +441,32 @@ pub fn deliver(frame: &mut Frame, syscall: Option<u64>) {
     }
     let mut interrupted = syscall.filter(|&nr| frame.rax == (-EINTR) as u64 && restartable(nr));
     loop {
-        let action = interrupts::without_interrupts(|| {
-            let p = sched().cur();
-            let set = p.signals.deliverable();
+        let action = (|| {
+            let mut s = current().sig.lock();
+            let set = s.deliverable();
             if set == 0 {
                 // Drop signals that are pending but ignored.
-                let ignored = p.signals.pending & !p.signals.mask;
-                p.signals.pending &= !ignored;
+                let ignored = s.pending & !s.mask;
+                s.pending &= !ignored;
                 return None;
             }
             let sig = set.trailing_zeros() + 1;
-            p.signals.pending &= !bit(sig);
-            let action = p.signals.actions[sig as usize - 1];
+            s.pending &= !bit(sig);
+            let action = s.actions[sig as usize - 1];
             if action.handler == SIG_DFL {
                 return Some((sig, action, 0));
             }
-            let old_mask = p.signals.mask;
+            let old_mask = s.mask;
             let mut block = action.mask;
             if action.flags & SA_NODEFER == 0 {
                 block |= bit(sig);
             }
-            p.signals.mask = (p.signals.mask | block) & !UNBLOCKABLE;
+            s.mask = (s.mask | block) & !UNBLOCKABLE;
             if action.flags & SA_RESETHAND != 0 {
-                p.signals.actions[sig as usize - 1] = SigAction::default();
+                s.actions[sig as usize - 1] = SigAction::default();
             }
             Some((sig, action, old_mask))
-        });
+        })();
         let Some((sig, action, old_mask)) = action else {
             // Nothing ran in user space, so the interrupted call can simply go on.
             if let Some(nr) = interrupted {
@@ -469,6 +535,6 @@ pub fn sigreturn(frame: &mut Frame) -> SysResult {
     saved.rflags = (saved.rflags & USER_FLAGS) | 0x202;
     *frame = saved;
     fxrstor(sf.fpu);
-    interrupts::without_interrupts(|| sched().cur().signals.mask = sf.saved_mask & !UNBLOCKABLE);
+    current().sig.lock().mask = sf.saved_mask & !UNBLOCKABLE;
     Ok(frame.rax as i64)
 }

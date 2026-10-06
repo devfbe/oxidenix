@@ -6,7 +6,7 @@
 use super::console;
 use crate::process::errno::*;
 use crate::process::signal::{SIGINT, SIGQUIT, SIGTSTP};
-use crate::process::{sleep_on, wakeup};
+use crate::process::{sched::prepare_to_wait, wakeup};
 use heapless::{Deque, Vec};
 use crate::sync::IrqSpinLock;
 use x86_64::instructions::interrupts::without_interrupts;
@@ -271,8 +271,9 @@ pub fn input(bytes: &[u8]) {
 
 /// Blocking read honoring canonical/raw mode.
 pub fn read(buf: &mut [u8], nonblock: bool) -> Result<usize, i64> {
-    without_interrupts(|| loop {
+    loop {
         crate::process::signal::check_tty_read(foreground())?;
+        let wait = prepare_to_wait(TTY_CHAN);
         if let Some(n) = TTY.lock().try_read(buf) {
             return Ok(n);
         }
@@ -282,8 +283,8 @@ pub fn read(buf: &mut [u8], nonblock: bool) -> Result<usize, i64> {
         if crate::process::signal::interrupted() {
             return Err(EINTR);
         }
-        sleep_on(TTY_CHAN);
-    })
+        wait.sleep();
+    }
 }
 
 pub fn write(buf: &[u8]) -> usize {

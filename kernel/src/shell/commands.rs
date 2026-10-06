@@ -209,9 +209,9 @@ pub fn run_program(args: &[&str]) -> Option<crate::process::WaitStatus> {
 
 
 fn cmd_ps() {
-    crate::printkln!("  PID  PPID  STATE     NAME");
-    for (pid, ppid, name, state, server) in crate::process::list() {
-        crate::printkln!("{:5} {:5}  {:9} {}{}", pid, ppid, state, name, if server { " (server)" } else { "" });
+    crate::printkln!("  PID  PPID  CPU  STATE     NAME");
+    for (pid, ppid, name, state, server, cpu) in crate::process::list() {
+        crate::printkln!("{:5} {:5}  {:3}  {:9} {}{}", pid, ppid, cpu, state, name, if server { " (server)" } else { "" });
     }
 }
 

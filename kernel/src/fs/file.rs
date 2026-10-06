@@ -1,7 +1,7 @@
 use super::{Device, Inode};
 use crate::process::errno::*;
 use crate::process::signal::interrupted;
-use crate::process::{sleep_on, wakeup};
+use crate::process::{sched::prepare_to_wait, wakeup};
 use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -218,6 +218,7 @@ impl OpenFile {
             return Ok(0);
         }
         loop {
+            let wait = prepare_to_wait(pipe.read_chan());
             {
                 let mut q = pipe.buf.lock();
                 if !q.is_empty() {
@@ -242,13 +243,14 @@ impl OpenFile {
             if interrupted() {
                 return Err(EINTR);
             }
-            sleep_on(pipe.read_chan());
+            wait.sleep();
         }
     }
 
     fn write_pipe(&self, pipe: &Arc<Pipe>, buf: &[u8]) -> Result<usize, i64> {
         let mut written = 0;
         while written < buf.len() {
+            let wait = prepare_to_wait(pipe.write_chan());
             if pipe.readers.load(Ordering::Relaxed) == 0 {
                 return if written > 0 { Ok(written) } else { Err(EPIPE) };
             }
@@ -282,7 +284,7 @@ impl OpenFile {
             if interrupted() {
                 return if written > 0 { Ok(written) } else { Err(EINTR) };
             }
-            sleep_on(pipe.write_chan());
+            wait.sleep();
         }
         Ok(written)
     }
