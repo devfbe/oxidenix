@@ -335,7 +335,9 @@ interrupt dispatch; drivers and filesystems move into user-space servers.
   that were in flight during the crash still fail with `EIO`, since they may or may not have
   been carried out. After five restarts the kernel gives up and the mount stays at `EIO`.
   The same holds for netd: the next socket call restarts it, which resets the network card and
-  repeats DHCP; sockets that were open in the old netd fail with `EIO`.
+  repeats DHCP; sockets that were open in the old netd fail with `EIO`. Every registration of a
+  service carries a generation number, and a socket only ever talks to the netd instance that
+  created it, so a stale socket handle can never reach a new connection of another program.
   Restarted servers are children of the kernel, never of the program that triggered them.
   The kernel reads each server program once at boot and restarts it from that copy, so
   replacing `/sbin/diskfs` later cannot smuggle a different program into a privileged process.
@@ -474,6 +476,7 @@ Each of these programs and scripts lives in the root filesystem and runs inside 
 | `kill -9 1` in Bash | user space cannot kill a server (`EPERM`) |
 | `kill diskfs` in the kernel monitor | the next `/data` access restarts the server; open files survive; after five restarts accesses fail with `EIO`; a restart still runs the boot-time program even after `/sbin/diskfs` was overwritten |
 | `kill netd` in the kernel monitor, then `run nettest` | the first socket call restarts netd (new DHCP lease) and every network test passes |
+| a background job holding a socket across `kill netd` | its next write fails with `EIO` instead of reaching a socket of the new netd |
 | `mem` (kernel monitor) | frame and heap accounting, allocator self-test, leak checks after workloads |
 
 During development the AI drove these tests through the QEMU monitor socket (`sendkey`,

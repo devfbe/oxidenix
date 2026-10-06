@@ -25,7 +25,8 @@ struct Reply {
 
 /// One socket in netd. Dropping it (with the last descriptor) closes it.
 pub struct Socket {
-    service: usize,
+    /// The netd instance that owns `handle`; a restarted netd never sees it.
+    netd: ipc::Instance,
     handle: u64,
     pub kind: u64,
 }
@@ -37,15 +38,16 @@ pub fn set_server(server: Arc<Server>) {
     NETD.call_once(|| server);
 }
 
-/// netd's service; a dead netd is restarted (sockets it served are gone).
-fn service() -> Result<usize, i64> {
+/// The running netd; a dead netd is restarted (sockets it served are gone).
+fn netd() -> Result<ipc::Instance, i64> {
     let netd = NETD.get().ok_or(ENETDOWN)?;
-    netd.revive().map(|(service, _)| service).map_err(|_| ENETDOWN)
+    netd.revive().map_err(|_| ENETDOWN)?;
+    ipc::instance(netd.name).ok_or(ENETDOWN)
 }
 
-fn call(service: usize, op: Op, args: [u64; 4], payload: &[u8]) -> Result<Reply, i64> {
+fn call(netd: ipc::Instance, op: Op, args: [u64; 4], payload: &[u8]) -> Result<Reply, i64> {
     let message = netproto::encode_request(op, args, payload);
-    let raw = ipc::call_interruptible(service, message, |id| netproto::encode_request(Op::Cancel, [id, 0, 0, 0], &[]))?;
+    let raw = ipc::call_interruptible(netd, message, |id| netproto::encode_request(Op::Cancel, [id, 0, 0, 0], &[]))?;
     let r = netproto::decode_response(&raw).ok_or(EIO)?;
     if r.status < 0 {
         return Err(-r.status);
@@ -59,13 +61,13 @@ fn flags(nonblocking: bool) -> u64 {
 
 impl Socket {
     pub fn new(kind: u64) -> Result<Socket, i64> {
-        let service = service()?;
-        let handle = call(service, Op::Socket, [kind, 0, 0, 0], &[])?.values[0];
-        Ok(Socket { service, handle, kind })
+        let netd = netd()?;
+        let handle = call(netd, Op::Socket, [kind, 0, 0, 0], &[])?.values[0];
+        Ok(Socket { netd, handle, kind })
     }
 
     fn call(&self, op: Op, args: [u64; 4], payload: &[u8]) -> Result<Reply, i64> {
-        call(self.service, op, args, payload)
+        call(self.netd, op, args, payload)
     }
 
     pub fn bind(&self, at: Endpoint) -> Result<(), i64> {
@@ -78,7 +80,7 @@ impl Socket {
 
     pub fn accept(&self, nonblocking: bool) -> Result<(Socket, Endpoint), i64> {
         let v = self.call(Op::Accept, [self.handle, flags(nonblocking), 0, 0], &[])?.values;
-        let socket = Socket { service: self.service, handle: v[0], kind: self.kind };
+        let socket = Socket { netd: self.netd, handle: v[0], kind: self.kind };
         Ok((socket, Endpoint { addr: v[1] as u32, port: v[2] as u16 }))
     }
 
@@ -151,6 +153,6 @@ impl Socket {
 impl Drop for Socket {
     /// Must not sleep (it runs when a descriptor is dropped), hence `post`.
     fn drop(&mut self) {
-        ipc::post(self.service, netproto::encode_request(Op::Close, [self.handle, 0, 0, 0], &[]));
+        ipc::post_to(self.netd, netproto::encode_request(Op::Close, [self.handle, 0, 0, 0], &[]));
     }
 }

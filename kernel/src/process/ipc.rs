@@ -39,15 +39,28 @@ struct Service {
     arg: u64,
     alive: bool,
     queue: VecDeque<u64>,
+    /// Unique per registration. A restarted server reuses the service
+    /// index, so clients that hold per-server state (socket handles)
+    /// check the generation to never reach the new server with it.
+    generation: u64,
 }
 
 struct Ipc {
     services: Vec<Service>,
     requests: BTreeMap<u64, Request>,
     next_id: u64,
+    next_generation: u64,
 }
 
-static IPC: Mutex<Ipc> = Mutex::new(Ipc { services: Vec::new(), requests: BTreeMap::new(), next_id: 1 });
+static IPC: Mutex<Ipc> =
+    Mutex::new(Ipc { services: Vec::new(), requests: BTreeMap::new(), next_id: 1, next_generation: 1 });
+
+/// A service as one particular registration of its server.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Instance {
+    pub service: usize,
+    pub generation: u64,
+}
 
 // Sleep channels; far away from the small fixed ones and from pipe
 // addresses. A server sleeps on `irq::server_chan(pid)`.
@@ -71,7 +84,9 @@ pub fn register(name: u64, len: u64, arg: u64) -> SysResult {
     let name = String::from_utf8(uaccess::slice(name, len)?.to_vec()).map_err(|_| EINVAL)?;
     let me = super::current_pid();
     lock(|ipc| {
-        let service = Service { name: name.clone(), server: me, arg, alive: true, queue: VecDeque::new() };
+        let generation = ipc.next_generation;
+        ipc.next_generation += 1;
+        let service = Service { name: name.clone(), server: me, arg, alive: true, queue: VecDeque::new(), generation };
         match ipc.services.iter().position(|s| s.name == name) {
             Some(i) if ipc.services[i].alive => Err(EEXIST),
             Some(i) => {
@@ -180,9 +195,10 @@ fn fail(id: u64) {
     wakeup(request_chan(id));
 }
 
-fn enqueue(service: usize, message: Vec<u8>, waits: bool) -> Result<u64, i64> {
+fn enqueue(service: usize, message: Vec<u8>, waits: bool, generation: Option<u64>) -> Result<u64, i64> {
     let (id, server) = lock(|ipc| {
-        if !ipc.services.get(service).is_some_and(|s| s.alive) {
+        let current = ipc.services.get(service).filter(|s| s.alive).ok_or(EIO)?;
+        if generation.is_some_and(|g| g != current.generation) {
             return Err(EIO);
         }
         let id = ipc.next_id;
@@ -201,7 +217,7 @@ pub fn call(service: usize, message: Vec<u8>) -> Result<Vec<u8>, i64> {
     // Enqueueing, checking and sleeping happen with interrupts off, so the
     // reply cannot slip in between the check and the sleep.
     without_interrupts(|| {
-        let id = enqueue(service, message, true)?;
+        let id = enqueue(service, message, true, None)?;
         wait_reply(id)
     })
 }
@@ -210,9 +226,10 @@ pub fn call(service: usize, message: Vec<u8>) -> Result<Vec<u8>, i64> {
 /// wait a long time (a socket waiting for data). A request still queued is
 /// withdrawn; one the server has taken is abandoned (its reply will be
 /// dropped) and the message `cancel(id)` is posted so the server forgets it.
-pub fn call_interruptible(service: usize, message: Vec<u8>, cancel: impl FnOnce(u64) -> Vec<u8>) -> Result<Vec<u8>, i64> {
+pub fn call_interruptible(to: Instance, message: Vec<u8>, cancel: impl FnOnce(u64) -> Vec<u8>) -> Result<Vec<u8>, i64> {
+    let service = to.service;
     without_interrupts(|| {
-        let id = enqueue(service, message, true)?;
+        let id = enqueue(service, message, true, Some(to.generation))?;
         let mut cancel = Some(cancel);
         wait_reply_with(id, &mut || {
             let taken = lock(|ipc| match ipc.requests.get(&id).map(|r| r.state) {
@@ -232,7 +249,7 @@ pub fn call_interruptible(service: usize, message: Vec<u8>, cancel: impl FnOnce(
             match taken {
                 Some(true) => {
                     if let Some(cancel) = cancel.take() {
-                        post(service, cancel(id));
+                        post_to(to, cancel(id));
                     }
                     true
                 }
@@ -273,7 +290,21 @@ fn wait_reply_with(id: u64, abandon: &mut dyn FnMut() -> bool) -> Result<Vec<u8>
 /// Sends `message` without waiting for (or receiving) a reply. Never
 /// sleeps, so it can be used while dropping objects.
 pub fn post(service: usize, message: Vec<u8>) {
-    let _ = enqueue(service, message, false);
+    let _ = enqueue(service, message, false, None);
+}
+
+/// Like `post`, but only to this registration of the server; dropped if
+/// the server was restarted meanwhile.
+pub fn post_to(to: Instance, message: Vec<u8>) {
+    let _ = enqueue(to.service, message, false, Some(to.generation));
+}
+
+/// The current registration behind `name`, if its server is alive.
+pub fn instance(name: &str) -> Option<Instance> {
+    lock(|ipc| {
+        let i = ipc.services.iter().position(|s| s.alive && s.name == name)?;
+        Some(Instance { service: i, generation: ipc.services[i].generation })
+    })
 }
 
 /// Called when a process exits: its services die and every request they
