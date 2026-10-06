@@ -71,6 +71,11 @@ pub fn init_controllers(rsdp: u64, hz: u64) {
 
 pub const KEYBOARD_IRQ: u8 = 1;
 
+/// Loads the shared IDT on another CPU.
+pub fn init_ap() {
+    IDT.load();
+}
+
 // A byte left behind by the BIOS blocks new IRQ1 edges until it is read.
 unsafe fn drain_ps2_output() {
     use x86_64::instructions::port::Port;

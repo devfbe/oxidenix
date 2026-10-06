@@ -53,6 +53,19 @@ impl CpuTables {
         }
     }
 
+    /// Initializes tables in zeroed memory without building them on the
+    /// stack (they are large): TSS (whose I/O map base must point behind
+    /// it), GDT and a closed I/O bitmap; the rest stays zero.
+    ///
+    /// SAFETY: `this` points to zeroed, writable memory for a `CpuTables`.
+    pub unsafe fn init_in_place(this: *mut CpuTables) {
+        unsafe {
+            core::ptr::addr_of_mut!((*this).gdt).write(GlobalDescriptorTable::new());
+            core::ptr::addr_of_mut!((*this).tss.tss).write(TaskStateSegment::new());
+            core::ptr::addr_of_mut!((*this).tss.iomap).cast::<u8>().write_bytes(0xff, IOMAP_BYTES + 1);
+        }
+    }
+
     /// Builds the GDT and TSS and loads them on the calling CPU.
     pub fn load(&'static mut self) {
         let df_top = VirtAddr::from_ptr(&self.double_fault_stack) + DOUBLE_FAULT_STACK as u64;

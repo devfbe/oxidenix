@@ -52,6 +52,8 @@ Its [commit history](#development-history) records every step.
   programs, all unmodified.
 - **Interactive shell** with line editing, history (arrow keys), tab completion, colors, pipes,
   redirections, subshells, command substitution and arithmetic.
+- **Symmetric multiprocessing**: all CPUs (QEMU runs with 4) execute user programs and the
+  kernel in parallel, with fine-grained locks instead of a big kernel lock.
 - **Preemptive multitasking**: round-robin scheduler at 100 Hz, separate address spaces,
   `fork` with **copy-on-write**, `execve`, `wait4`, process groups and sessions.
 - **POSIX signals**: handlers, masks, `kill`, `SIGCHLD`, `EINTR` with automatic syscall restart,
@@ -136,7 +138,7 @@ The window scales when it is resized (`zoom-to-fit`), and Ctrl+Alt+F toggles ful
  │  terminal        TTY line discipline ─ console (framebuffer, ANSI) ─ keyboard       │
  │  CPU             GDT, TSS + I/O bitmap, IDT, local + I/O APIC (ACPI), SSE│          │
  └──────────────────────────────────────────────────────────────────────────▼──────────┘
-           bootloader 0.11 (BIOS), QEMU x86_64, 256 MiB RAM, IDE disk, virtio-net
+      bootloader 0.11 (BIOS), QEMU x86_64, 4 CPUs, 256 MiB RAM, IDE disk, virtio-net
 ```
 
 ### Repository layout
@@ -148,7 +150,7 @@ oxidenix/
 │   ├── build.rs                 turns the logo into raw pixels for the kernel
 │   └── src/
 │       ├── main.rs              entry point, boot configuration, init order
-│       ├── smp.rs               per-CPU blocks (GS base), CPU registry
+│       ├── smp.rs               per-CPU blocks (GS base), CPU start-up trampoline
 │       ├── interrupts/          per-CPU GDT/TSS (gdt.rs), IDT (mod.rs), entry stubs and
 │       │                        the trap dispatcher (entry.rs, handlers.rs), local and I/O APIC
 │       │                        with timer calibration (apic.rs),
@@ -202,7 +204,9 @@ About 7,467 lines of Rust in the kernel and 2,965 in the servers, their librarie
 2. `kernel_main` runs these steps in order: framebuffer console and boot logo → GDT/TSS/IDT
    (interrupts still off) → frame allocator and 16 MiB kernel heap → ACPI tables (MADT), the
    local APIC with its calibrated timer and the I/O APIC (the 8259 PICs are masked) → VFS from the cpio
-   ramdisk and real-time clock → process subsystem (SSE, syscall MSRs, process 0) →
+   ramdisk and real-time clock → process subsystem (SSE, syscall MSRs, process 0) → the other
+   CPUs (INIT and STARTUP IPIs; each runs a real-mode trampoline from a page below 1 MiB into
+   long mode, then sets up its GDT, TSS, GS block, local APIC timer and idle task) →
    **interrupts on**.
 3. The kernel starts the servers: `/sbin/diskfs` asks for its I/O ports, mounts the ext2 disk
    and registers as service `diskfs`; the kernel then mounts it at `/data`. Then the kernel

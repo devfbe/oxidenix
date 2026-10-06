@@ -1,7 +1,7 @@
 # Symmetric multiprocessing in oxidenix
 
-Status: steps 1-4 done (one CPU runs the SMP-safe kernel). This document describes the
-target design; the README describes what is implemented.
+Status: steps 1-5 done; all CPUs run. This document describes the target design; the README
+describes what is implemented.
 
 ## Goals
 

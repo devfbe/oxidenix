@@ -100,12 +100,48 @@ fn map_heap(start: u64, len: u64, frames: &mut PhysFrameAllocator) -> Result<(),
 /// (the heap grows by taking it).
 pub static FRAMES: IrqSpinLock<Option<PhysFrameAllocator>> = IrqSpinLock::new(None);
 static PHYS_OFFSET: Once<VirtAddr> = Once::new();
+/// A page below 1 MiB, reserved at boot for the other CPUs' start-up code.
+static LOW_FRAME: Once<u64> = Once::new();
+
+pub fn low_frame() -> Option<u64> {
+    LOW_FRAME.get().copied()
+}
+
+/// Identity-maps the page at `phys` (below 4 GiB) in the kernel's page
+/// table, so code there keeps running when a CPU turns paging on.
+pub fn identity_map(phys: u64) -> Result<(), &'static str> {
+    let mut guard = FRAMES.lock();
+    let frames = guard.as_mut().ok_or("memory::init not called")?;
+    let offset = phys_offset();
+    let l4: *mut PageTable = (offset + kernel_l4().start_address().as_u64()).as_mut_ptr();
+    let mut mapper = unsafe { OffsetPageTable::new(&mut *l4, offset) };
+    let page = Page::<Size4KiB>::containing_address(VirtAddr::new(phys));
+    let frame = PhysFrame::containing_address(x86_64::PhysAddr::new(phys));
+    let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+    use x86_64::structures::paging::{mapper::MapToError, Translate};
+    match unsafe { mapper.map_to(page, frame, flags, frames) } {
+        Ok(flush) => {
+            flush.flush();
+            Ok(())
+        }
+        Err(MapToError::PageAlreadyMapped(f)) if f == frame => Ok(()),
+        Err(_) => match mapper.translate_addr(VirtAddr::new(phys)) {
+            Some(p) if p.as_u64() == phys => Ok(()),
+            _ => Err("cannot identity-map the start-up page"),
+        },
+    }
+}
 static KERNEL_L4: Once<PhysFrame> = Once::new();
 
 pub fn init(regions: &'static [MemoryRegion], phys_offset: u64) {
     let phys_offset = *PHYS_OFFSET.call_once(|| VirtAddr::new(phys_offset));
     KERNEL_L4.call_once(|| Cr3::read().0);
     let mut frames = PhysFrameAllocator::new(regions, phys_offset);
+    // The first fresh frame is the lowest usable one. Other CPUs start in
+    // real mode, so their start-up code needs a page below 1 MiB.
+    if let Some(low) = frames.allocate_frame().map(|f| f.start_address().as_u64()).filter(|&a| a < 0x10_0000) {
+        LOW_FRAME.call_once(|| low);
+    }
     map_heap(HEAP_START, HEAP_INITIAL, &mut frames).expect("cannot map the initial kernel heap");
     unsafe { HEAP.0.lock().init(HEAP_START as *mut u8, HEAP_INITIAL as usize) };
     frames.enable_refcounts();

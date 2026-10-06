@@ -52,6 +52,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         TEST_MODE.store(true, core::sync::atomic::Ordering::Relaxed);
     }
     process::init();
+    smp::start_aps();
     // Only now: the timer interrupt needs the scheduler.
     x86_64::instructions::interrupts::enable();
     start_servers();
@@ -139,7 +140,9 @@ pub static TEST_MODE: core::sync::atomic::AtomicBool = core::sync::atomic::Atomi
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    printkln!("KERNEL PANIC: {}", info);
+    // Stop the other CPUs first, so the message is the last word.
+    interrupts::apic::ipi::halt_others();
+    printkln!("KERNEL PANIC (CPU {}): {}", smp::cpu().index, info);
     if TEST_MODE.load(core::sync::atomic::Ordering::Relaxed) {
         power_off(1);
     }

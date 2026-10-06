@@ -60,6 +60,8 @@ fn main() {
             "isa-debug-exit,iobase=0xf4,iosize=0x04",
             "-m",
             "256M",
+            "-smp",
+            "4",
             // User-mode networking (10.0.2.0/24, DHCP, DNS at 10.0.2.3) and a
             // TCP echo service at 10.0.2.100:7 for the self-tests.
             "-netdev",

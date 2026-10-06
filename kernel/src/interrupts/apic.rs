@@ -53,9 +53,7 @@ pub fn eoi() {
     lapic_write(EOI, 0);
 }
 
-/// Inter-processor interrupts. They come into use when the other CPUs
-/// start (step 5 in docs/design/smp.md).
-#[allow(dead_code)]
+/// Inter-processor interrupts: start-up, rescheduling and halting.
 pub mod ipi {
     use super::{lapic_read, lapic_write};
 
@@ -80,6 +78,15 @@ pub mod ipi {
 
     pub fn send_vector(apic_id: u8, vector: u8) {
         send(apic_id, vector as u32);
+    }
+
+    /// Stops every other CPU (for a panic). Does nothing before the APIC
+    /// is up.
+    pub fn halt_others() {
+        const ALL_EXCLUDING_SELF: u32 = 0b11 << 18;
+        if super::LAPIC.load(core::sync::atomic::Ordering::Relaxed) != 0 {
+            send(0, ALL_EXCLUDING_SELF | HALT_VECTOR as u32);
+        }
     }
 
     /// INIT, then STARTUP: the target CPU begins in real mode at `page << 12`.
