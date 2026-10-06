@@ -25,6 +25,10 @@ for want in "hello file" "Invalid argument" "No space left on device" "5000"; do
 done
 echo "PASS test.sh checks done"
 
+echo "=== vfork (busybox timeout)"
+timeout 1 sleep 5
+if [ $? -eq 143 ]; then echo "PASS timeout stops a command"; else fail "timeout"; fi
+
 echo "=== server protection"
 if kill -9 1 2>/dev/null; then fail "a server could be killed from user space"; else echo "PASS servers are protected"; fi
 

@@ -193,7 +193,8 @@ extern "sysv64" fn dispatch(f: &mut Frame) {
             Ok(old.div_ceil(1_000_000) as i64)
         }
         38 => setitimer(a0, a1, a2),
-        57 => super::fork(f).map(|pid| pid as i64),
+        // vfork as fork: a copy-on-write child is a valid vfork child.
+        57 | 58 => super::fork(f).map(|pid| pid as i64),
         59 => execve(f, a0, a1, a2),
         60 | 231 => super::exit(((a0 & 0xff) << 8) as i32),
         61 => super::wait4(a0 as i64, a1, a2),
