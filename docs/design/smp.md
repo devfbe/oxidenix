@@ -1,6 +1,7 @@
 # Symmetric multiprocessing in oxidenix
 
-Status: implemented (all six steps). The README describes the details as built.
+Status: implemented (all six steps). The README describes the details as built. Since then,
+syscalls run with interrupts enabled (the kernel stays non-preemptive).
 
 ## Goals
 
@@ -12,7 +13,7 @@ Status: implemented (all six steps). The README describes the details as built.
 
 ## Starting point (single CPU)
 
-The kernel is non-preemptive. Syscalls run with interrupts disabled (`SFMASK` clears IF);
+The kernel was non-preemptive and ran syscalls with interrupts disabled (`SFMASK` clears IF);
 only user code and the idle loop are interrupted. On one CPU this made `without_interrupts`
 a sufficient lock, and "check a condition, then `sleep_on(chan)`" race-free. Neither holds
 on several CPUs, so these are the parts that change.

@@ -63,14 +63,19 @@ pub fn init() {
     Star::write(gdt::user_code(), gdt::user_data(), gdt::kernel_code(), gdt::kernel_data())
         .expect("GDT layout does not match syscall/sysret");
     LStar::write(VirtAddr::new(syscall_entry as *const () as u64));
-    // Clear IF: the kernel is not preemptive, syscalls run without IRQs.
+    // Clear IF on entry; `syscall_entry` enables interrupts once it is on
+    // the kernel stack.
     SFMask::write(RFlags::INTERRUPT_FLAG | RFlags::DIRECTION_FLAG | RFlags::TRAP_FLAG);
     unsafe { Efer::update(|f| *f |= EferFlags::SYSTEM_CALL_EXTENSIONS) };
 }
 
 /// Builds a `Frame` on the kernel stack (iret part first, as an interrupt
-/// would) and dispatches the syscall. Interrupts are off (SFMASK), so
-/// nothing can run between `swapgs` and the switch to the kernel stack.
+/// would) and dispatches the syscall. Interrupts are off on entry (SFMASK),
+/// so nothing runs between `swapgs` and the switch to the kernel stack;
+/// once the frame is saved they are enabled for the syscall itself. The
+/// kernel stays non-preemptive (an interrupt in kernel mode never
+/// schedules), but long syscalls no longer delay timer ticks and device
+/// interrupts on their CPU.
 #[unsafe(naked)]
 unsafe extern "C" fn syscall_entry() {
     core::arch::naked_asm!(
@@ -99,6 +104,7 @@ unsafe extern "C" fn syscall_entry() {
         "push rcx",
         "push rbx",
         "push rax",
+        "sti",
         "mov rdi, rsp",
         "call {dispatch}",
         "jmp {ret}",

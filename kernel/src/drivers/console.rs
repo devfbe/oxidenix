@@ -152,7 +152,19 @@ pub struct Console {
     /// ESC ] P digits collected so far.
     osc: [u8; 7],
     osc_len: usize,
+    /// The palette changed: the next row to redraw (redraws run in pieces,
+    /// see `write_some`).
+    redraw_next: Option<usize>,
+    /// Cells drawn during the current lock hold.
+    work: usize,
 }
+
+/// Cells drawn per lock hold (well under a millisecond on hardware, a few
+/// under emulation): drawing runs with interrupts off, so `write_bytes`
+/// gives the lock and interrupts back whenever this much is done. Nobody
+/// waits long for the console and no timer tick is lost, however much a
+/// program writes.
+const WORK_BUDGET: usize = 64;
 
 impl Console {
     fn put_pixel(&mut self, x: usize, y: usize, (r, g, b): (u8, u8, u8)) {
@@ -167,6 +179,7 @@ impl Console {
     }
 
     fn draw_cell(&mut self, col: usize, row: usize, invert: bool) {
+        self.work += 1;
         let cell = self.cells[row][col];
         let (mut fg, mut bg) = (self.palette[cell.fg as usize], self.palette[cell.bg as usize]);
         if invert {
@@ -480,18 +493,10 @@ impl Console {
     }
 
     fn reset_palette(&mut self) {
-        self.palette = PALETTE;
-        self.redraw();
-    }
-
-    /// Draws every cell again (after a palette change).
-    fn redraw(&mut self) {
-        for r in 0..self.rows {
-            for c in 0..self.cols {
-                self.draw_cell(c, r, false);
-            }
+        if self.palette != PALETTE {
+            self.palette = PALETTE;
+            self.redraw_next = Some(0);
         }
-        self.cursor_drawn = None;
     }
 
     /// ESC ] P n rr gg bb: palette entry n (hex digits) becomes #rrggbb.
@@ -499,8 +504,12 @@ impl Console {
         let hex = |b: u8| (b as char).to_digit(16).unwrap_or(0) as u8;
         let d = self.osc;
         let entry = hex(d[0]) as usize;
-        self.palette[entry] = (hex(d[1]) << 4 | hex(d[2]), hex(d[3]) << 4 | hex(d[4]), hex(d[5]) << 4 | hex(d[6]));
-        self.redraw();
+        let color = (hex(d[1]) << 4 | hex(d[2]), hex(d[3]) << 4 | hex(d[4]), hex(d[5]) << 4 | hex(d[6]));
+        if self.palette[entry] != color {
+            self.palette[entry] = color;
+            // Start over: rows drawn so far may use the old color.
+            self.redraw_next = Some(0);
+        }
     }
 
     fn control(&mut self, b: u8) {
@@ -654,12 +663,39 @@ impl Console {
         }
     }
 
-    pub fn write_bytes(&mut self, bytes: &[u8]) {
+    /// Processes bytes (and a pending redraw) until the work budget of one
+    /// lock hold is spent; returns how many bytes it consumed. Call again
+    /// while bytes or `redraw_pending` remain.
+    pub fn write_some(&mut self, bytes: &[u8]) -> usize {
+        self.work = 0;
         self.hide_cursor();
-        for &b in bytes {
+        let mut used = 0;
+        while self.work < WORK_BUDGET {
+            if let Some(row) = self.redraw_next {
+                for c in 0..self.cols {
+                    self.draw_cell(c, row, false);
+                }
+                self.redraw_next = (row + 1 < self.rows).then_some(row + 1);
+                continue;
+            }
+            let Some(&b) = bytes.get(used) else { break };
             self.byte(b);
+            used += 1;
         }
         self.show_cursor();
+        used
+    }
+
+    pub fn redraw_pending(&self) -> bool {
+        self.redraw_next.is_some()
+    }
+
+    pub fn write_bytes(&mut self, bytes: &[u8]) {
+        let mut rest = bytes;
+        while !rest.is_empty() || self.redraw_pending() {
+            let n = self.write_some(rest);
+            rest = &rest[n..];
+        }
     }
 }
 
@@ -725,6 +761,8 @@ pub fn init(fb: &'static mut FrameBuffer) {
         palette: PALETTE,
         osc: [0; 7],
         osc_len: 0,
+        redraw_next: None,
+        work: 0,
     };
     console.bottom = console.rows - 1;
     console.fb.fill(0);
@@ -754,13 +792,29 @@ pub fn _print(args: fmt::Arguments) {
     });
 }
 
+/// Bytes per serial-port lock hold (it waits for the UART with interrupts
+/// off).
+const SERIAL_CHUNK: usize = 256;
+
+/// Writes to the serial mirror and the screen. The screen is drawn in
+/// budgeted pieces (`Console::write_some`), releasing the lock and
+/// interrupts in between, so other CPUs and interrupt handlers never wait
+/// long for the console.
 pub fn write_bytes(bytes: &[u8]) {
-    super::serial::write_bytes(bytes);
-    without_interrupts(|| {
-        if let Some(c) = CONSOLE.lock().as_mut() {
-            c.write_bytes(bytes);
+    for chunk in bytes.chunks(SERIAL_CHUNK) {
+        super::serial::write_bytes(chunk);
+    }
+    let mut rest = bytes;
+    loop {
+        let (used, pending) = match CONSOLE.lock().as_mut() {
+            Some(c) => (c.write_some(rest), c.redraw_pending()),
+            None => return,
+        };
+        rest = &rest[used..];
+        if rest.is_empty() && !pending {
+            return;
         }
-    });
+    }
 }
 
 /// Takes the bytes the terminal wants to send back (e.g. a cursor position

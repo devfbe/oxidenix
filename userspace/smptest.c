@@ -61,6 +61,12 @@ static double parallel(int n, long rounds) {
     return now() - t0;
 }
 
+static unsigned long long rdtsc(void) {
+    unsigned lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return (unsigned long long)hi << 32 | lo;
+}
+
 static volatile sig_atomic_t got_usr1;
 static void on_usr1(int sig) {
     (void)sig;
@@ -179,6 +185,32 @@ int main(void) {
         usleep(1000);
     }
     check("signals reach a process running on another CPU", signals_ok);
+
+    /* A program flooding the console (palette changes force full redraws)
+     * on the CPU that keeps time must not hold interrupts off long enough
+     * to lose timer ticks: the clock has to keep pace with the TSC. */
+    if (n >= 2) {
+        pin(1);
+        double m0 = now();
+        unsigned long long c0 = rdtsc();
+        usleep(500000);
+        double rate = (rdtsc() - c0) / (now() - m0); /* TSC ticks per second */
+        pid_t flood = fork();
+        if (flood == 0) {
+            pin(0);
+            for (int i = 0;; i++) printf("\033]P1%02x0000\033]P2%02xff00.", i & 0xff, i & 0xff), fflush(stdout);
+        }
+        usleep(200000);
+        m0 = now();
+        c0 = rdtsc();
+        while ((rdtsc() - c0) / rate < 2.0) {
+        }
+        double clock_seconds = now() - m0;
+        kill(flood, SIGKILL);
+        waitpid(flood, NULL, 0);
+        printf("\033]R\nsmptest: clock ran %.2f s during 2.00 s of console flood\n", clock_seconds);
+        check("a console flood loses no timer ticks", clock_seconds > 1.8);
+    }
 
     printf("smptest: %s\n", failures ? "FAILED" : "all passed");
     return failures;

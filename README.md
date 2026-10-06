@@ -279,8 +279,11 @@ The scheduler is built for several CPUs (`process/sched.rs`, design in
   (`prepare_to_wait`), then checks its condition, then sleeps; a per-task wake lock
   serializes wakeups with the task descheduling itself. Pipes, the TTY, IPC, `wait4`, stops
   and timed sleeps all use this protocol.
-- The kernel is non-preemptive: only user code is preempted, and syscalls run with
-  interrupts disabled. Locks are `IrqSpinLock`s (fair tickets, interrupts off while held).
+- The kernel is non-preemptive: only user code is preempted, and an interrupt in kernel mode
+  never schedules. Syscalls nevertheless run with interrupts enabled, so a long syscall does
+  not delay timer ticks or device interrupts on its CPU. Locks are `IrqSpinLock`s (fair
+  tickets, interrupts off while held), and long work under a lock is cut into bounded pieces
+  (the console draws at most 64 cells per lock hold).
 - New processes start by *returning from a syscall*: their kernel stack is pre-filled with a
   register frame that `user_return` consumes. A `fork` child is the parent's frame with
   `rax = 0`.
@@ -541,7 +544,7 @@ Each of these programs and scripts lives in the root filesystem and runs inside 
 | `jobtest` | stop/continue reporting through `wait4`, restart of a stopped `read()`, `SIGKILL` on stopped processes, `SA_RESTART` |
 | `forktest` | `fork`, `execve`, `wait4`, preemptive interleaving of two workers |
 | `proctest` | `prctl` name round-trip, `capget`/`capset` versions and the full capability set, no-new-privs, `PR_SET_PDEATHSIG` delivered to an orphan (via `sigwait`); `/proc` as htop reads it (directory fds with `O_PATH` and `openat`), `/proc/self`, the formats of `stat`, `meminfo`, `loadavg`, `uptime` and `/proc/<pid>/{stat,cmdline,exe}`, `sysinfo`, the CPU list in `/sys`, read-only `/proc` |
-| `smptest` | CPU count and affinity (pinning to every CPU, empty masks), parallel speed-up of CPU-bound processes, `fork`/`exit`/`wait` on every CPU at once, 5000 pipe round trips between two CPUs, signals to a process running on another CPU |
+| `smptest` | CPU count and affinity (pinning to every CPU, empty masks), parallel speed-up of CPU-bound processes, `fork`/`exit`/`wait` on every CPU at once, 5000 pipe round trips between two CPUs, signals to a process running on another CPU, no lost timer ticks while a program floods the console with palette changes on the timekeeping CPU |
 | `nettest` | TCP to an echo service through QEMU, `ECONNREFUSED`, `listen`/`accept` over loopback with a forked client, EOF after the peer closed, non-blocking `accept` and `connect` with `poll` and `SO_ERROR`, `EINTR` in a blocking `recv`, UDP over loopback, raw ICMP echo to the gateway and over loopback, source address for off-subnet destinations, overflowing message vectors, `AF_INET6` rejected |
 | `sh /etc/test.sh` | files, pipes, `cd`, `mkdir`/`touch`/`rm`, rename cycles via symlinks, file quota |
 | `fstest` | descriptor access modes (`EBADF` on read-only/write-only fds), `O_NOFOLLOW` on symlinks, unlinked-but-open files (kept until closed, never shared with new files), ext2 size limits, overflowing `mmap` offsets |
