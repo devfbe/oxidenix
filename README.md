@@ -152,7 +152,7 @@ oxidenix/
 └── userspace/                   C test programs, build script, rootfs and data disk templates
 ```
 
-About 7,500 lines of Rust in the kernel plus a small host-side builder.
+About 6,600 lines of Rust in the kernel plus a small host-side builder.
 
 ### Boot sequence
 
