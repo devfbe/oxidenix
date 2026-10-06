@@ -174,7 +174,7 @@ extern "sysv64" fn dispatch(f: &mut Frame) {
         41 => Err(EAFNOSUPPORT), // socket: there is no network stack
         36 => getitimer(a0, a1),
         37 => {
-            let (old, _) = super::set_alarm(a0.saturating_mul(1_000_000), 0);
+            let (old, _) = super::set_alarm((a0 as u32 as u64).saturating_mul(1_000_000), 0);
             Ok(old.div_ceil(1_000_000) as i64)
         }
         38 => setitimer(a0, a1, a2),
@@ -324,7 +324,7 @@ const ITIMER_REAL: u64 = 0;
 /// struct itimerval: (interval, value) as two timevals, in microseconds.
 fn read_itimerval(addr: u64) -> Result<(u64, u64), i64> {
     let [isec, iusec, vsec, vusec]: [u64; 4] = uaccess::read(addr)?;
-    if iusec >= 1_000_000 || vusec >= 1_000_000 {
+    if iusec >= 1_000_000 || vusec >= 1_000_000 || isec > i64::MAX as u64 || vsec > i64::MAX as u64 {
         return Err(EINVAL);
     }
     let us = |sec: u64, usec: u64| sec.saturating_mul(1_000_000).saturating_add(usec);

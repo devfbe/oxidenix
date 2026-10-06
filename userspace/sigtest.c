@@ -1,4 +1,5 @@
 #include <errno.h>
+#include <limits.h>
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
@@ -132,6 +133,16 @@ int main(void) {
     int count = fpu_signals;
     sleep_ms(100);
     check("a zero itimerval disarms the timer", fpu_signals == count);
+
+    struct itimerval huge = {{LONG_MAX, 999999}, {LONG_MAX, 999999}};
+    int set_huge = setitimer(ITIMER_REAL, &huge, NULL);
+    getitimer(ITIMER_REAL, &cur);
+    setitimer(ITIMER_REAL, &off, NULL);
+    check("huge timer values neither overflow nor fire", set_huge == 0 && cur.it_value.tv_sec > 0 && fpu_signals == count);
+    struct itimerval negative = {{0, 0}, {-1, 0}};
+    check("negative timer values fail with EINVAL", setitimer(ITIMER_REAL, &negative, NULL) == -1 && errno == EINVAL);
+    alarm(UINT_MAX);
+    check("alarm(UINT_MAX) is accepted", alarm(0) > 0);
 
     printf("sigtest: %s\n", failures ? "FAILED" : "all passed");
     return failures;

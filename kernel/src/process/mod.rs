@@ -345,10 +345,14 @@ pub fn tick() {
         for pid in due {
             s.make_ready(pid);
         }
+        // Expired timers whose signal does not fit here stay expired and
+        // fire on the next tick, so no SIGALRM is ever lost.
         let mut alarms: heapless::Vec<Pid, 64> = heapless::Vec::new();
         for p in s.procs.values_mut().filter(|p| p.alarm_at != 0 && p.alarm_at <= now) {
-            p.alarm_at = if p.alarm_every != 0 { now + p.alarm_every } else { 0 };
-            let _ = alarms.push(p.pid);
+            if alarms.push(p.pid).is_err() {
+                break;
+            }
+            p.alarm_at = if p.alarm_every != 0 { now.saturating_add(p.alarm_every) } else { 0 };
         }
         for pid in alarms {
             signal::send(pid, signal::SIGALRM);
@@ -365,7 +369,7 @@ pub fn set_alarm(value_us: u64, interval_us: u64) -> (u64, u64) {
         let now = ticks();
         let p = sched().cur();
         let old = (to_us(p.alarm_at.saturating_sub(now)), to_us(p.alarm_every));
-        p.alarm_at = if value_us == 0 { 0 } else { now + to_ticks(value_us).max(1) };
+        p.alarm_at = if value_us == 0 { 0 } else { now.saturating_add(to_ticks(value_us).max(1)) };
         p.alarm_every = if value_us == 0 { 0 } else { to_ticks(interval_us) };
         old
     })
@@ -377,7 +381,8 @@ pub fn get_alarm() -> (u64, u64) {
         let now = ticks();
         let p = sched().cur();
         let remaining = if p.alarm_at == 0 { 0 } else { p.alarm_at.saturating_sub(now).max(1) };
-        (remaining * 1_000_000 / TIMER_HZ, p.alarm_every * 1_000_000 / TIMER_HZ)
+        let to_us = |ticks: u64| ticks.saturating_mul(1_000_000) / TIMER_HZ;
+        (to_us(remaining), to_us(p.alarm_every))
     })
 }
 
