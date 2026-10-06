@@ -168,6 +168,7 @@ oxidenix/
 │       │   ├── task.rs          tasks: owned state, locked info and signals
 │       │   ├── sched.rs         run queues, wait queues, context switch, idle
 │       │   ├── address_space.rs areas, demand paging, copy-on-write
+│       │   ├── tlb.rs           which CPUs use an address space, TLB shootdowns
 │       │   ├── syscall.rs       syscall entry/return, dispatch table
 │       │   ├── sys_file.rs      file, directory, pipe, tty-ioctl, poll/select
 │       │   ├── sys_mem.rs       brk, mmap, mprotect, mremap
@@ -266,6 +267,13 @@ About 9,200 lines of Rust (without comments and blank lines) in the kernel and 3
 - **Copy-on-write**: `fork` shares all private frames. Writable pages become read-only in both
   processes and are tagged with an OS-available page table bit. A write fault either copies the
   frame or, for the last owner, just restores write access. Shared memory stays shared.
+- **Shared address spaces and TLB shootdowns** (`tlb.rs`): an address space (`Mm`) sits behind a
+  sleeping lock, so a fault that reads a file page can hold it. Each address space records the
+  CPUs that have it loaded; removing, write-protecting or moving mappings sends those CPUs an
+  IPI to drop their stale TLB entries, and the frames are freed only afterwards. One shootdown
+  runs at a time, and a CPU waiting with interrupts off serves requests addressed to it itself,
+  so shooters never deadlock. Unmapping walks only the page tables that exist, so huge sparse
+  reservations cost what is mapped in them.
 - **Out of memory is an error, not a panic**: the kernel heap grows by mapping more frames
   when an allocation fails. User memory (pages, page tables, kernel stacks for `fork`) may not
   take the last 16 MiB of RAM, which stay reserved for the heap. Large allocations that user space

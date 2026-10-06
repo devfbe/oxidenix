@@ -8,7 +8,7 @@
 //!   timer) are shared and locked.
 //! - The scheduling fields are atomics, written under `wake_lock`.
 
-use super::address_space::AddressSpace;
+use super::address_space::Mm;
 use super::signal::Signals;
 use super::{FdEntry, Pid, Server};
 use crate::interrupts::gdt;
@@ -121,11 +121,10 @@ pub struct CpuState {
 
 /// State owned by the task itself (see the module comment).
 pub struct Process {
-    pub space: Option<AddressSpace>,
+    /// The address space (None for kernel tasks and after exit).
+    pub mm: Option<Arc<Mm>>,
     pub fds: Vec<Option<FdEntry>>,
     pub cwd: String,
-    pub brk_start: u64,
-    pub brk_end: u64,
     /// I/O permission bitmap (0 = allowed) installed in the TSS while
     /// this process runs.
     pub io_bitmap: Option<Box<[u8; gdt::IOMAP_BYTES]>>,
@@ -250,11 +249,9 @@ impl Task {
 impl Process {
     pub fn empty() -> Process {
         Process {
-            space: None,
+            mm: None,
             fds: Vec::new(),
             cwd: alloc::string::ToString::to_string("/"),
-            brk_start: 0,
-            brk_end: 0,
             io_bitmap: None,
             server: None,
         }

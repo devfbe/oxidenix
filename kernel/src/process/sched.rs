@@ -29,7 +29,6 @@ use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{fence, AtomicBool, AtomicU64, Ordering};
 use x86_64::instructions::interrupts;
-use x86_64::registers::control::{Cr3, Cr3Flags};
 use x86_64::registers::model_specific::FsBase;
 use x86_64::VirtAddr;
 
@@ -415,12 +414,11 @@ fn context_switch(next: Arc<Task>) {
         saved.fs_base = FsBase::read().as_u64();
         fxsave(&mut saved.fpu);
         let n = next.own();
-        match &n.space {
-            Some(space) => space.activate(),
-            // Idle loops and kernel tasks: no user address space stays loaded,
-            // so an address space is only ever active on the CPU running it.
-            None => Cr3::write(crate::memory::kernel_l4(), Cr3Flags::empty()),
-        }
+        // Idle loops and kernel tasks load the kernel's tables: a CPU has a
+        // user address space loaded only while it runs one of its tasks.
+        // Threads of one process switch without reloading CR3.
+        let from = prev.own().mm.as_ref().map(|m| &*m.tlb);
+        super::tlb::switch(from, n.mm.as_ref().map(|m| &*m.tlb));
         if let Some(top) = next.kstack_top() {
             cpu.set_kernel_stack(top);
         }

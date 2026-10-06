@@ -13,6 +13,7 @@ mod sys_mem;
 mod sys_net;
 pub mod syscall;
 pub mod task;
+pub mod tlb;
 pub mod uaccess;
 
 use crate::fs::file::OpenFile;
@@ -30,7 +31,6 @@ use sched::{current, prepare_to_wait, TABLE};
 use syscall::Frame;
 use task::{Info, KernelStack, State, Task};
 use x86_64::instructions::interrupts;
-use x86_64::registers::control::{Cr3, Cr3Flags};
 use x86_64::registers::model_specific::FsBase;
 use x86_64::VirtAddr;
 
@@ -49,8 +49,9 @@ pub struct FdEntry {
 }
 
 impl Process {
-    pub fn space(&mut self) -> Result<&mut address_space::AddressSpace, i64> {
-        self.space.as_mut().ok_or(EINVAL)
+    /// The address space, or EINVAL for a task without one.
+    pub fn mm(&self) -> Result<Arc<address_space::Mm>, i64> {
+        self.mm.clone().ok_or(EINVAL)
     }
 
     pub fn file(&self, fd: u64) -> Result<Arc<OpenFile>, i64> {
@@ -79,6 +80,11 @@ impl Process {
 /// switch tasks (closing files is fine: it never sleeps).
 pub fn with_current<R>(f: impl FnOnce(&mut Process) -> R) -> R {
     interrupts::without_interrupts(|| f(unsafe { current().own() }))
+}
+
+/// The running task's address space.
+pub fn current_mm() -> Option<Arc<address_space::Mm>> {
+    with_current(|p| p.mm.clone())
 }
 
 /// Process 0, the kernel monitor, runs on the boot stack of the bootstrap
@@ -461,13 +467,14 @@ pub fn dma_map(phys_out: u64) -> SysResult {
         }
     };
     let len = server.dma_pages * 4096;
-    let start = with_current(|p| -> Result<u64, i64> {
-        let floor = p.brk_end;
-        let space = p.space()?;
+    let start = {
+        let mm = with_current(|p| p.mm())?;
+        let mut space = mm.lock();
+        let floor = space.brk_end;
         let start = space.find_free(len, floor).ok_or(ENOMEM)?;
         space.map_phys(start, phys, server.dma_pages, address_space::Prot::RW).map_err(|_| ENOMEM)?;
-        Ok(start)
-    })?;
+        start
+    };
     uaccess::write(phys_out, phys)?;
     Ok(start as i64)
 }
@@ -507,10 +514,8 @@ fn spawn_with(path: &str, image: loader::Image, server: Option<&Arc<Server>>, ar
     info.exe = path.to_string();
     info.mem = Some(image.space.stats.clone());
     let mut own = Process::empty();
-    own.space = Some(image.space);
+    own.mm = Some(address_space::Mm::new(image.space).ok_or(ENOMEM)?);
     own.fds = vec![Some(FdEntry { file: console, cloexec: false }); 3];
-    own.brk_start = image.brk;
-    own.brk_end = image.brk;
     own.server = server.cloned();
     let t = new_task(pid, info, own, Frame::user_start(image.entry, image.sp))?;
     t.privileged.store(server.is_some(), Ordering::Relaxed);
@@ -527,7 +532,7 @@ pub fn fork(frame: &Frame) -> Result<Pid, i64> {
     let pid = slot.pid;
     let me = current();
     let parent = unsafe { me.own() };
-    let space = parent.space.as_ref().ok_or(EINVAL)?.clone_user().map_err(|_| ENOMEM)?;
+    let space = parent.mm()?.lock().clone_user().map_err(|_| ENOMEM)?;
     let mut child_frame = *frame;
     child_frame.rax = 0;
     let info = {
@@ -544,11 +549,9 @@ pub fn fork(frame: &Frame) -> Result<Pid, i64> {
         }
     };
     let own = Process {
-        space: Some(space),
+        mm: Some(address_space::Mm::new(space).ok_or(ENOMEM)?),
         fds: parent.fds.clone(),
         cwd: parent.cwd.clone(),
-        brk_start: parent.brk_start,
-        brk_end: parent.brk_end,
         io_bitmap: None,
         server: None,
     };
@@ -569,33 +572,36 @@ pub fn fork(frame: &Frame) -> Result<Pid, i64> {
 pub fn exec(frame: &mut Frame, path: &str, args: &[String], envs: &[String]) -> Result<(), i64> {
     let cwd = with_current(|p| p.cwd.clone());
     let image = load_path(&cwd, path, args, envs)?;
-    image.space.activate();
+    let mm = address_space::Mm::new(image.space).ok_or(ENOMEM)?;
     let me = current();
     {
         let mut info = me.info.lock();
         info.name = basename(path).to_string();
         info.cmdline = cmdline_of(args);
         info.exe = absolute(&cwd, path);
-        info.mem = Some(image.space.stats.clone());
+        info.mem = Some(mm.stats.clone());
     }
     me.sig.lock().reset_on_exec();
     // A new program gets no inherited hardware access.
     me.privileged.store(false, Ordering::Relaxed);
-    let closed: Vec<FdEntry> = with_current(|p| {
-        // The old address space is freed here; it is no longer active.
-        p.space = Some(image.space);
-        p.brk_start = image.brk;
-        p.brk_end = image.brk;
+    let (closed, old_mm) = with_current(|p| {
+        tlb::switch(p.mm.as_ref().map(|m| &*m.tlb), Some(&mm.tlb));
+        let old_mm = p.mm.replace(mm);
         p.io_bitmap = None;
         p.server = None;
         crate::smp::cpu().tables().set_io_bitmap(None);
-        p.fds
+        let closed: Vec<FdEntry> = p
+            .fds
             .iter_mut()
             .filter(|e| e.as_ref().is_some_and(|e| e.cloexec))
             .filter_map(|e| e.take())
-            .collect()
+            .collect();
+        (closed, old_mm)
     });
     drop(closed);
+    // The old address space is freed here (unless a vfork parent shares
+    // it); no CPU has it loaded for this task any more.
+    drop(old_mm);
     FsBase::write(VirtAddr::new(0));
     let initial = task::FpuState::initial();
     unsafe { core::arch::asm!("fxrstor64 [{}]", in(reg) initial.0.as_ptr(), options(nostack)) };
@@ -622,8 +628,9 @@ pub fn exit(status: i32) -> ! {
     drop(fds);
     ipc::on_exit(me.pid);
     irq::on_exit(me.pid);
-    unsafe { Cr3::write(memory::kernel_l4(), Cr3Flags::empty()) };
-    unsafe { me.own() }.space = None;
+    let mm = unsafe { me.own() }.mm.take();
+    tlb::switch(mm.as_ref().map(|m| &*m.tlb), None);
+    drop(mm);
     unsafe { me.own() }.server = None;
     me.info.lock().mem = None;
     // Orphans go to the kernel, which reaps them; those that asked for it

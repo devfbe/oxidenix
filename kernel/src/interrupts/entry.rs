@@ -83,7 +83,7 @@ stubs!(
     gsi13 = 0x3d, gsi14 = 0x3e, gsi15 = 0x3f, gsi16 = 0x40, gsi17 = 0x41, gsi18 = 0x42,
     gsi19 = 0x43, gsi20 = 0x44, gsi21 = 0x45, gsi22 = 0x46, gsi23 = 0x47,
     // Inter-processor interrupts and the spurious vector.
-    reschedule = 0xf0, halt = 0xf1, spurious = 0xff,
+    reschedule = 0xf0, halt = 0xf1, tlb = 0xf2, spurious = 0xff,
 );
 
 /// Size check for the assembly offsets above.

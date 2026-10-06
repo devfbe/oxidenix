@@ -14,15 +14,21 @@
 //! Page table entries carry two software bits: COW (a shared frame that is
 //! copied on the first write) and PROT_NONE (a frame kept while its area
 //! denies all access).
+//!
+//! The threads of a process share one address space (`Mm`), behind a lock
+//! that may be held while a fault sleeps. Every change that removes,
+//! write-protects or moves a mapping is followed by a TLB shootdown
+//! (`tlb`), and frames are freed only after it.
 
+use super::tlb::{self, Tlb};
 use crate::fs::Inode;
 use crate::memory;
 use crate::memory::frame::UserFrames;
-use crate::sync::IrqSpinLock;
+use crate::sync::{IrqSpinLock, Mutex, MutexGuard};
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
-use x86_64::registers::control::{Cr3, Cr3Flags};
+use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::page_table::PageTableEntry;
 use x86_64::structures::paging::{
     FrameAllocator, FrameDeallocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags, PhysFrame, Size4KiB,
@@ -203,9 +209,79 @@ pub struct Access {
 /// (kernel) half is shared with the kernel address space.
 pub struct AddressSpace {
     l4: PhysFrame,
+    pub tlb: Arc<Tlb>,
     pub stats: Arc<MemStats>,
     /// Areas by start address; they never overlap.
     vmas: BTreeMap<u64, Vma>,
+    /// The heap (brk): from the end of the program to the current break.
+    pub brk_start: u64,
+    pub brk_end: u64,
+}
+
+/// An address space as tasks hold it: shared by the threads of a process
+/// (and by a vfork child until it execs or exits).
+pub struct Mm {
+    /// What a context switch needs, readable without the lock.
+    pub tlb: Arc<Tlb>,
+    pub stats: Arc<MemStats>,
+    space: Mutex<AddressSpace>,
+}
+
+impl Mm {
+    pub fn new(space: AddressSpace) -> Option<Arc<Mm>> {
+        let (tlb, stats) = (space.tlb.clone(), space.stats.clone());
+        Arc::try_new(Mm { tlb, stats, space: Mutex::new(space) }).ok()
+    }
+
+    /// The address space, for changes and faults. Sleeps while another
+    /// thread holds it; never taken in interrupt context or with a spinlock.
+    pub fn lock(&self) -> MutexGuard<'_, AddressSpace> {
+        self.space.lock()
+    }
+}
+
+/// Frames taken out of the page tables, released once no TLB can still
+/// reach them (after a shootdown of the range they came from).
+struct Gather<'a> {
+    tlb: &'a Tlb,
+    frames: heapless::Vec<PhysFrame, 128>,
+    start: u64,
+    end: u64,
+}
+
+impl<'a> Gather<'a> {
+    fn new(tlb: &'a Tlb) -> Self {
+        Gather { tlb, frames: heapless::Vec::new(), start: u64::MAX, end: 0 }
+    }
+
+    fn add(&mut self, va: u64, frame: PhysFrame) {
+        if self.frames.is_full() {
+            self.finish();
+        }
+        let _ = self.frames.push(frame);
+        self.start = self.start.min(va);
+        self.end = self.end.max(va + PAGE);
+    }
+
+    fn finish(&mut self) {
+        if self.frames.is_empty() {
+            return;
+        }
+        tlb::shootdown(self.tlb, self.start, self.end);
+        let frames = core::mem::take(&mut self.frames);
+        memory::with_frames(|f| {
+            for frame in frames {
+                unsafe { f.deallocate_frame(frame) };
+            }
+        });
+        (self.start, self.end) = (u64::MAX, 0);
+    }
+}
+
+impl Drop for Gather<'_> {
+    fn drop(&mut self) {
+        self.finish();
+    }
 }
 
 impl AddressSpace {
@@ -219,8 +295,11 @@ impl AddressSpace {
         for i in 256..512 {
             table[i] = kernel[i].clone();
         }
-        let stats = Arc::try_new(MemStats::default()).ok()?;
-        Some(AddressSpace { l4, stats, vmas: BTreeMap::new() })
+        let (Ok(stats), Ok(tlb)) = (Arc::try_new(MemStats::default()), Arc::try_new(Tlb::new(l4))) else {
+            memory::with_frames(|f| unsafe { f.deallocate_frame(l4) });
+            return None;
+        };
+        Some(AddressSpace { l4, tlb, stats, vmas: BTreeMap::new(), brk_start: 0, brk_end: 0 })
     }
 
     fn mapper(&self) -> OffsetPageTable<'static> {
@@ -229,12 +308,6 @@ impl AddressSpace {
 
     fn active(&self) -> bool {
         Cr3::read().0 == self.l4
-    }
-
-    fn flush(&self, va: u64) {
-        if self.active() {
-            x86_64::instructions::tlb::flush(VirtAddr::new(va));
-        }
     }
 
     // ------------------------------------------------------------ areas
@@ -349,25 +422,16 @@ impl AddressSpace {
 
     /// Frees the frames mapped in [start, end) (the areas stay).
     fn clear_pages(&mut self, start: u64, end: u64) {
-        let l4 = self.l4;
+        let mut gather = Gather::new(&self.tlb);
         let mut freed = 0i64;
-        memory::with_frames(|frames| {
-            for page in user_pages(start, end) {
-                let va = page.start_address().as_u64();
-                if let Some(e) = leaf_entry(l4, va) {
-                    let frame = PhysFrame::containing_address(e.addr());
-                    e.set_unused();
-                    unsafe { frames.deallocate_frame(frame) };
-                    freed += 1;
-                }
-            }
+        for_each_leaf(self.l4, start, end, |va, e| {
+            let frame = PhysFrame::containing_address(e.addr());
+            e.set_unused();
+            gather.add(va, frame);
+            freed += 1;
         });
-        if freed > 0 {
-            count(&self.stats.pages, -freed);
-            if self.active() {
-                x86_64::instructions::tlb::flush_all();
-            }
-        }
+        gather.finish();
+        count(&self.stats.pages, -freed);
     }
 
     /// mprotect: new rights for [start, start+len), which must be fully
@@ -408,9 +472,7 @@ impl AddressSpace {
     fn apply_prot(&mut self, start: u64, end: u64, prot: Prot) {
         let l4 = self.l4;
         memory::with_frames(|frames| {
-            for page in user_pages(start, end) {
-                let va = page.start_address().as_u64();
-                let Some(e) = leaf_entry(l4, va) else { continue };
+            for_each_leaf(l4, start, end, |va, e| {
                 let frame = PhysFrame::containing_address(e.addr());
                 let was_cow = e.flags().contains(COW);
                 let mut flags = prot.flags();
@@ -424,11 +486,10 @@ impl AddressSpace {
                     flags.insert(COW);
                 }
                 e.set_addr(frame.start_address(), flags);
-            }
+            });
         });
-        if self.active() {
-            x86_64::instructions::tlb::flush_all();
-        }
+        // Rights may have shrunk: no CPU may keep the old ones.
+        tlb::shootdown(&self.tlb, start, end);
     }
 
     /// madvise(MADV_DONTNEED): private pages are dropped and read as zero
@@ -518,19 +579,16 @@ impl AddressSpace {
         let mut mapper = self.mapper();
         let parent = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
         memory::with_frames(|frames| {
-            for i in 0..len / PAGE {
-                let Some(e) = leaf_entry(l4, from + i * PAGE) else { continue };
+            for_each_leaf(l4, from, from + len, |va, e| {
                 let (frame, flags) = (PhysFrame::containing_address(e.addr()), e.flags());
                 e.set_unused();
-                let page = Page::<Size4KiB>::containing_address(VirtAddr::new(to + i * PAGE));
+                let page = Page::<Size4KiB>::containing_address(VirtAddr::new(to + (va - from)));
                 let mut user = UserFrames(frames);
                 // The target range was unmapped, so this cannot collide.
                 let _ = unsafe { mapper.map_to_with_table_flags(page, frame, flags, parent, &mut user) }.map(|f| f.ignore());
-            }
+            });
         });
-        if self.active() {
-            x86_64::instructions::tlb::flush_all();
-        }
+        tlb::shootdown(&self.tlb, from, from + len);
     }
 
     // ----------------------------------------------------------- faults
@@ -559,10 +617,10 @@ impl AddressSpace {
                 // Already satisfied (another path faulted it in).
                 return Ok(());
             }
-            // A kept PROT_NONE page whose area allows access again.
+            // A kept PROT_NONE page whose area allows access again (an
+            // entry that was not present is in no TLB).
             let frame: PhysFrame = PhysFrame::containing_address(e.addr());
             e.set_addr(frame.start_address(), v.prot.flags());
-            self.flush(page);
             return Ok(());
         }
         let (frame, writable_ok) = self.new_frame(page, &v)?;
@@ -632,8 +690,8 @@ impl AddressSpace {
         if !mapped {
             return Err(Fault::Oom);
         }
+        // The entry was not present before, so no TLB holds it.
         count(&self.stats.pages, 1);
-        self.flush(page);
         Ok(())
     }
 
@@ -645,10 +703,12 @@ impl AddressSpace {
         let writable = ((flags - COW) | PageTableFlags::WRITABLE) & !PROT_NONE;
         let old = PhysFrame::containing_address(e.addr());
         let shared_area = matches!(v.backing, Backing::Shared { .. });
-        let result = memory::with_frames(|frames| {
+        let copied = memory::with_frames(|frames| {
             if shared_area || frames.refcount(old) <= 1 {
+                // Only rights grow: a stale read-only entry elsewhere just
+                // faults once more and finds the page writable.
                 e.set_flags(writable);
-                return Ok(());
+                return Ok(false);
             }
             let new = UserFrames(frames).allocate_frame().ok_or(Fault::Oom)?;
             unsafe {
@@ -657,13 +717,17 @@ impl AddressSpace {
                     memory::phys_to_virt(new.start_address().as_u64()),
                     PAGE as usize,
                 );
-                e.set_addr(new.start_address(), writable);
-                frames.deallocate_frame(old);
             }
-            Ok(())
-        });
-        self.flush(page);
-        result
+            e.set_addr(new.start_address(), writable);
+            Ok(true)
+        })?;
+        if copied {
+            // Other threads must stop reading the old frame before this
+            // mapping lets go of it.
+            let mut gather = Gather::new(&self.tlb);
+            gather.add(page, old);
+        }
+        Ok(())
     }
 
     /// An access just below a stack extends it (charging the commit).
@@ -778,23 +842,19 @@ impl AddressSpace {
             }
             Ok(())
         });
-        // The parent's pages just lost their write permission.
-        if self.active() {
-            x86_64::instructions::tlb::flush_all();
-        }
+        // The parent's pages just lost their write permission, also for
+        // its other threads.
+        tlb::shootdown(&self.tlb, 0, USER_END);
+        new.brk_start = self.brk_start;
+        new.brk_end = self.brk_end;
         result.map(|_| new)
-    }
-
-    pub fn activate(&self) {
-        unsafe { Cr3::write(self.l4, Cr3Flags::empty()) };
     }
 }
 
 impl Drop for AddressSpace {
     fn drop(&mut self) {
-        if self.active() {
-            unsafe { Cr3::write(memory::kernel_l4(), Cr3Flags::empty()) };
-        }
+        // Every task left it (see `tlb::switch`) before the last reference went.
+        debug_assert!(!self.active(), "dropping the loaded address space");
         let charged: u64 = self.vmas.values().filter(|v| v.charged).map(|v| v.pages()).sum();
         memory::uncommit(charged);
         // Shared objects drop with the areas, after the frames' mappings.
@@ -868,8 +928,38 @@ fn leaf_entry(l4: PhysFrame, va: u64) -> Option<&'static mut PageTableEntry> {
     (!e.is_unused()).then_some(e)
 }
 
-/// The page fault handler's part: satisfies a fault of the running
-/// process at `va`.
+/// Calls `f` for every used level-1 entry (present or kept for PROT_NONE)
+/// in [start, end), skipping whole tables that are not there, so sparse
+/// huge ranges (reservations of gigabytes) cost what is mapped in them.
+fn for_each_leaf(l4: PhysFrame, start: u64, end: u64, mut f: impl FnMut(u64, &'static mut PageTableEntry)) {
+    let mut va = page_down(start);
+    'outer: while va < end {
+        let v = VirtAddr::new(va);
+        let mut frame = l4;
+        for (index, shift) in [(v.p4_index(), 39), (v.p3_index(), 30), (v.p2_index(), 21)] {
+            let e = &table_at(frame)[index];
+            if !e.flags().contains(PageTableFlags::PRESENT) || e.flags().contains(PageTableFlags::HUGE_PAGE) {
+                va = ((va >> shift) + 1) << shift;
+                continue 'outer;
+            }
+            frame = PhysFrame::containing_address(e.addr());
+        }
+        let stop = end.min(((va >> 21) + 1) << 21);
+        while va < stop {
+            let e = &mut table_at(frame)[((va >> 12) & 511) as usize];
+            if !e.is_unused() {
+                f(va, e);
+            }
+            va += PAGE;
+        }
+    }
+}
+
+/// The page fault handler's part: satisfies a fault of the running task
+/// at `va` in its address space. May sleep (the address space is locked,
+/// a file page may be read), so interrupts must be enabled.
 pub fn handle_fault(va: u64, access: Access) -> Result<(), Fault> {
-    super::with_current(|p| p.space.as_mut().ok_or(Fault::Segv).and_then(|s| s.fault(va, access)))
+    let mm = super::current_mm().ok_or(Fault::Segv)?;
+    let mut space = mm.lock();
+    space.fault(va, access)
 }

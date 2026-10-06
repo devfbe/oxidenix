@@ -7,6 +7,7 @@ use super::errno::*;
 use super::loader::page_up;
 use super::with_current;
 use crate::fs::Device;
+use alloc::sync::Arc;
 
 const MAP_PRIVATE: u64 = 0x02;
 const MAP_SHARED_VALIDATE: u64 = 0x03;
@@ -34,30 +35,33 @@ fn aligned(addr: u64) -> bool {
     addr % PAGE == 0
 }
 
+fn mm() -> Result<Arc<address_space::Mm>, i64> {
+    with_current(|p| p.mm())
+}
+
 /// brk(2): the heap is one anonymous area from the end of the program; it
 /// is committed as it grows. Returns the (possibly unchanged) break.
 pub fn brk(addr: u64) -> SysResult {
-    with_current(|p| {
-        if addr < p.brk_start {
-            return Ok(p.brk_end as i64);
+    let mm = mm()?;
+    let mut space = mm.lock();
+    let (brk_start, brk_end) = (space.brk_start, space.brk_end);
+    if addr < brk_start {
+        return Ok(brk_end as i64);
+    }
+    let (old_top, new_top) = (page_up(brk_end), page_up(addr));
+    if new_top > old_top {
+        // The heap may not run into a mapping above it.
+        if space.vma(old_top).is_some() || (old_top..new_top).step_by(PAGE as usize).any(|a| space.vma(a).is_some()) {
+            return Ok(brk_end as i64);
         }
-        let (old_top, new_top) = (page_up(p.brk_end), page_up(addr));
-        let (brk_start, brk_end) = (p.brk_start, p.brk_end);
-        let space = p.space()?;
-        if new_top > old_top {
-            // The heap may not run into a mapping above it.
-            if space.vma(old_top).is_some() || (old_top..new_top).step_by(PAGE as usize).any(|a| space.vma(a).is_some()) {
-                return Ok(brk_end as i64);
-            }
-            if space.map(old_top, new_top - old_top, Prot::RW, Backing::Anon, false).is_err() {
-                return Ok(brk_end as i64);
-            }
-        } else if new_top < old_top && new_top >= page_up(brk_start) {
-            space.unmap(new_top, old_top - new_top);
+        if space.map(old_top, new_top - old_top, Prot::RW, Backing::Anon, false).is_err() {
+            return Ok(brk_end as i64);
         }
-        p.brk_end = addr;
-        Ok(addr as i64)
-    })
+    } else if new_top < old_top && new_top >= page_up(brk_start) {
+        space.unmap(new_top, old_top - new_top);
+    }
+    space.brk_end = addr;
+    Ok(addr as i64)
 }
 
 pub fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64) -> SysResult {
@@ -95,9 +99,10 @@ pub fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64) ->
         }
     };
     let noreserve = flags & MAP_NORESERVE != 0;
-    let start = with_current(|p| -> Result<u64, i64> {
-        let floor = page_up(p.brk_end);
-        let space = p.space()?;
+    let mm = mm()?;
+    let start = {
+        let mut space = mm.lock();
+        let floor = page_up(space.brk_end);
         let fixed = flags & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0;
         let start = if fixed {
             if addr.checked_add(len).is_none_or(|e| e > address_space::USER_END) || addr == 0 {
@@ -120,8 +125,8 @@ pub fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64) ->
             // Best effort, as on Linux.
             let _ = space.populate(start, len, prot.write);
         }
-        Ok(start)
-    })?;
+        start
+    };
     Ok(start as i64)
 }
 
@@ -129,10 +134,8 @@ pub fn munmap(addr: u64, len: u64) -> SysResult {
     if !aligned(addr) || len == 0 || addr.checked_add(len).is_none_or(|e| e > address_space::USER_END) {
         return Err(EINVAL);
     }
-    with_current(|p| {
-        p.space()?.unmap(addr, page_up(len));
-        Ok(0)
-    })
+    mm()?.lock().unmap(addr, page_up(len));
+    Ok(0)
 }
 
 /// mprotect(2): fails with ENOMEM if part of the range is unmapped or if
@@ -144,10 +147,8 @@ pub fn mprotect(addr: u64, len: u64, prot: u64) -> SysResult {
     if len == 0 {
         return Ok(0);
     }
-    with_current(|p| {
-        p.space()?.protect(addr, page_up(len), Prot::from_bits(prot)).map_err(|_| ENOMEM)?;
-        Ok(0)
-    })
+    mm()?.lock().protect(addr, page_up(len), Prot::from_bits(prot)).map_err(|_| ENOMEM)?;
+    Ok(0)
 }
 
 /// mremap(2): grows in place when the space behind is free, else moves
@@ -167,15 +168,14 @@ pub fn mremap(old: u64, old_len: u64, new_len: u64, flags: u64, new_addr: u64) -
             return Err(EINVAL);
         }
     }
-    with_current(|p| {
-        let floor = page_up(p.brk_end);
-        let space = p.space()?;
-        match space.remap(old, old_len, new_len, flags & MREMAP_MAYMOVE != 0, fixed, floor) {
-            Ok(at) => Ok(at as i64),
-            Err(Fault::Oom) => Err(ENOMEM),
-            Err(_) => Err(EFAULT),
-        }
-    })
+    let mm = mm()?;
+    let mut space = mm.lock();
+    let floor = page_up(space.brk_end);
+    match space.remap(old, old_len, new_len, flags & MREMAP_MAYMOVE != 0, fixed, floor) {
+        Ok(at) => Ok(at as i64),
+        Err(Fault::Oom) => Err(ENOMEM),
+        Err(_) => Err(EFAULT),
+    }
 }
 
 /// madvise(2): DONTNEED/FREE drop private pages; other advice is accepted.
@@ -184,7 +184,7 @@ pub fn madvise(addr: u64, len: u64, advice: u64) -> SysResult {
         return Err(EINVAL);
     }
     if matches!(advice, MADV_DONTNEED | MADV_FREE) && len > 0 {
-        with_current(|p| p.space()?.discard(addr, page_up(len)).map_err(errno))?;
+        mm()?.lock().discard(addr, page_up(len)).map_err(errno)?;
     }
     Ok(0)
 }

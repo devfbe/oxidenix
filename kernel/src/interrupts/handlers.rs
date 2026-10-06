@@ -23,6 +23,10 @@ pub extern "sysv64" fn trap(frame: &mut Frame) {
         }
         apic::ipi::RESCHEDULE_VECTOR => apic::eoi(),
         apic::ipi::HALT_VECTOR => halt_forever(),
+        apic::ipi::TLB_VECTOR => {
+            apic::eoi();
+            crate::process::tlb::serve();
+        }
         // Spurious interrupts need no EOI.
         _ => {}
     }
@@ -83,6 +87,11 @@ fn exception(frame: &mut Frame) {
         // not allowed the copy ends early (EFAULT) instead of the kernel.
         let fixup = if frame.from_user() { None } else { crate::process::uaccess::fixup(frame.rip) };
         if frame.from_user() || (fixup.is_some() && addr < USER_END) {
+            // Resolving the fault may sleep (the address space is locked, a
+            // file page may be read); the interrupted code had interrupts on.
+            if frame.rflags & 0x200 != 0 {
+                x86_64::instructions::interrupts::enable();
+            }
             match handle_fault(addr, access) {
                 Ok(()) => return,
                 Err(_) if fixup.is_some() => {

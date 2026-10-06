@@ -103,3 +103,68 @@ impl<T: ?Sized> Drop for IrqSpinLockGuard<'_, T> {
         }
     }
 }
+
+/// A lock whose waiters sleep instead of spinning, for state that is held
+/// across operations that may sleep themselves (an address space while a
+/// page fault reads a file). Never used in interrupt context.
+///
+/// The state follows the classic futex mutex: 0 free, 1 held, 2 held with
+/// (possibly) sleeping waiters, so an uncontended unlock wakes nobody.
+pub struct Mutex<T: ?Sized> {
+    state: AtomicU32,
+    data: UnsafeCell<T>,
+}
+
+unsafe impl<T: ?Sized + Send> Sync for Mutex<T> {}
+unsafe impl<T: ?Sized + Send> Send for Mutex<T> {}
+
+pub struct MutexGuard<'a, T: ?Sized> {
+    lock: &'a Mutex<T>,
+}
+
+impl<T> Mutex<T> {
+    pub const fn new(value: T) -> Self {
+        Mutex { state: AtomicU32::new(0), data: UnsafeCell::new(value) }
+    }
+}
+
+impl<T: ?Sized> Mutex<T> {
+    fn chan(&self) -> usize {
+        self as *const Self as *const u8 as usize
+    }
+
+    pub fn lock(&self) -> MutexGuard<'_, T> {
+        if self.state.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            loop {
+                let wait = crate::process::sched::prepare_to_wait(self.chan());
+                // Taken with state 2: there may be other sleepers to wake.
+                if self.state.swap(2, Ordering::Acquire) == 0 {
+                    break;
+                }
+                wait.sleep();
+            }
+        }
+        MutexGuard { lock: self }
+    }
+}
+
+impl<T: ?Sized> Deref for MutexGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        unsafe { &*self.lock.data.get() }
+    }
+}
+
+impl<T: ?Sized> DerefMut for MutexGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        unsafe { &mut *self.lock.data.get() }
+    }
+}
+
+impl<T: ?Sized> Drop for MutexGuard<'_, T> {
+    fn drop(&mut self) {
+        if self.lock.state.swap(0, Ordering::Release) == 2 {
+            crate::process::sched::wakeup(self.lock.chan());
+        }
+    }
+}

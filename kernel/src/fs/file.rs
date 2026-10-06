@@ -7,7 +7,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-use spin::Mutex;
+use crate::sync::Mutex;
 
 pub const O_ACCMODE: u32 = 0o3;
 pub const O_WRONLY: u32 = 0o1;
@@ -28,7 +28,7 @@ const PIPE_CAPACITY: usize = 64 * 1024;
 const PIPE_RESERVED: usize = 16 * 1024;
 
 pub struct Pipe {
-    buf: Mutex<VecDeque<u8>>,
+    buf: spin::Mutex<VecDeque<u8>>,
     readers: AtomicUsize,
     writers: AtomicUsize,
 }
@@ -61,7 +61,9 @@ pub enum Kind {
     Socket(crate::net::Socket),
 }
 
-/// Open file description; several descriptors may share it (dup, fork).
+/// Open file description; several descriptors may share it (dup, fork,
+/// threads). Its locks sleep: a read holds the offset while the file
+/// server answers.
 pub struct OpenFile {
     pub kind: Kind,
     pub offset: Mutex<u64>,
@@ -93,7 +95,7 @@ impl OpenFile {
     pub fn pipe() -> Result<(Arc<OpenFile>, Arc<OpenFile>), i64> {
         crate::fs::charge(PIPE_RESERVED).map_err(|_| ENFILE)?;
         let pipe = Arc::new(Pipe {
-            buf: Mutex::new(VecDeque::new()),
+            buf: spin::Mutex::new(VecDeque::new()),
             readers: AtomicUsize::new(1),
             writers: AtomicUsize::new(1),
         });

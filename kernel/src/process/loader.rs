@@ -13,8 +13,6 @@ pub struct Image {
     pub space: AddressSpace,
     pub entry: u64,
     pub sp: u64,
-    /// First free address after the highest segment (start of brk).
-    pub brk: u64,
 }
 
 pub fn page_up(x: u64) -> u64 {
@@ -60,7 +58,9 @@ pub fn load(image: &[u8], args: &[String], envs: &[String]) -> Result<Image, i64
         (14, 0),                   // AT_EGID
     ];
     let sp = build_stack(&mut space, args, envs, &auxv).map_err(|_| ENOMEM)?;
-    Ok(Image { space, entry: elf.entry, sp, brk })
+    space.brk_start = brk;
+    space.brk_end = brk;
+    Ok(Image { space, entry: elf.entry, sp })
 }
 
 fn fault_errno(f: Fault) -> i64 {

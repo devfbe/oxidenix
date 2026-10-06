@@ -59,6 +59,7 @@ pub mod ipi {
 
     pub const RESCHEDULE_VECTOR: u8 = 0xf0;
     pub const HALT_VECTOR: u8 = 0xf1;
+    pub const TLB_VECTOR: u8 = 0xf2;
 
     const ICR_LOW: usize = 0x300;
     const ICR_HIGH: usize = 0x310;
@@ -68,12 +69,16 @@ pub mod ipi {
     const ICR_STARTUP: u32 = 0b110 << 8;
 
     /// Sends an interrupt command and waits until the local APIC took it.
+    /// Interrupts stay off meanwhile: a handler sending an IPI between the
+    /// two register writes would change the destination.
     fn send(apic_id: u8, low: u32) {
-        lapic_write(ICR_HIGH, (apic_id as u32) << 24);
-        lapic_write(ICR_LOW, low);
-        while lapic_read(ICR_LOW) & ICR_PENDING != 0 {
-            core::hint::spin_loop();
-        }
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            lapic_write(ICR_HIGH, (apic_id as u32) << 24);
+            lapic_write(ICR_LOW, low);
+            while lapic_read(ICR_LOW) & ICR_PENDING != 0 {
+                core::hint::spin_loop();
+            }
+        })
     }
 
     pub fn send_vector(apic_id: u8, vector: u8) {
