@@ -1,8 +1,8 @@
 //! In-memory filesystem (tmpfs-like), populated from the initramfs at boot.
 
 pub mod cpio;
-pub mod ext2;
 pub mod file;
+pub mod remote;
 
 use crate::process::errno::*;
 use alloc::collections::{BTreeMap, VecDeque};
@@ -151,14 +151,23 @@ pub enum Node {
     File(Data),
     Symlink(String),
     Device(Device),
-    /// An inode on the ext2 data disk; its contents live there.
+    /// An inode served by a user-space filesystem server (diskfs).
     Disk(DiskRef),
 }
 
 #[derive(Clone)]
 pub struct DiskRef {
-    pub fs: Arc<ext2::Ext2>,
+    pub fs: Arc<remote::RemoteFs>,
     pub ino: u32,
+}
+
+pub struct InodeStat {
+    pub mode: u32,
+    pub size: u64,
+    pub nlink: u64,
+    pub atime: u64,
+    pub mtime: u64,
+    pub ctime: u64,
 }
 
 /// What `Inode::create` makes.
@@ -185,7 +194,7 @@ pub struct Inode {
 impl Drop for Inode {
     fn drop(&mut self) {
         release(self.charged);
-        // An unlinked ext2 file is freed once nothing refers to it anymore.
+        // An unlinked remote file is freed once nothing refers to it anymore.
         if let Node::Disk(d) = self.node.get_mut() {
             d.fs.forget(d.ino);
         }
@@ -205,7 +214,8 @@ fn dtype(file_type: u32) -> u8 {
 }
 
 /// The VFS view of an inode. Every operation works for memory inodes and
-/// for ext2 inodes alike; callers never look at `node` directly.
+/// for inodes of user-space filesystem servers alike; callers never look
+/// at `node` directly.
 impl Inode {
     pub fn new(node: Node, perm: u32) -> Result<Arc<Inode>, i64> {
         let charged = INODE_COST
@@ -223,7 +233,7 @@ impl Inode {
     }
 
     /// Disk inodes are cached by their filesystem and charged no quota.
-    pub fn disk(fs: Arc<ext2::Ext2>, ino: u32) -> Arc<Inode> {
+    pub fn disk(fs: Arc<remote::RemoteFs>, ino: u32) -> Arc<Inode> {
         Arc::new(Inode {
             ino: DISK_INO_BASE | ino as u64,
             perm: Mutex::new(0),
@@ -249,7 +259,7 @@ impl Inode {
 
     pub fn mode(&self) -> u32 {
         if let Some(d) = self.disk_ref() {
-            return d.fs.stat(d.ino).map_or(S_IFREG, |i| i.mode() as u32);
+            return d.fs.stat(d.ino).map_or(S_IFREG, |s| s.mode);
         }
         let kind = match &*self.node.lock() {
             Node::Dir(_) => S_IFDIR,
@@ -271,7 +281,7 @@ impl Inode {
 
     pub fn size(&self) -> u64 {
         if let Some(d) = self.disk_ref() {
-            return d.fs.stat(d.ino).map_or(0, |i| i.size());
+            return d.fs.stat(d.ino).map_or(0, |s| s.size);
         }
         match &*self.node.lock() {
             Node::File(d) => d.bytes().len() as u64,
@@ -281,11 +291,23 @@ impl Inode {
         }
     }
 
+    /// Everything stat(2) reports about an inode.
+    pub fn stat(&self) -> Result<InodeStat, i64> {
+        if let Some(d) = self.disk_ref() {
+            // One request instead of three, and errors (e.g. a dead server)
+            // are reported instead of being mistaken for defaults.
+            let s = d.fs.stat(d.ino)?;
+            return Ok(InodeStat { mode: s.mode, size: s.size, nlink: s.links, atime: s.atime, mtime: s.mtime, ctime: s.ctime });
+        }
+        let (nlink, atime, mtime, ctime) = self.stat_extra();
+        Ok(InodeStat { mode: self.mode(), size: self.size(), nlink, atime, mtime, ctime })
+    }
+
     /// (link count, access time, modification time, change time)
     pub fn stat_extra(&self) -> (u64, u64, u64, u64) {
         if let Some(d) = self.disk_ref() {
-            if let Ok(i) = d.fs.stat(d.ino) {
-                return (i.links() as u64, i.atime() as u64, i.mtime() as u64, i.ctime() as u64);
+            if let Ok(s) = d.fs.stat(d.ino) {
+                return (s.links, s.atime, s.mtime, s.ctime);
             }
         }
         let boot = crate::drivers::rtc::now() - crate::process::ticks() / crate::process::TIMER_HZ;
@@ -467,7 +489,7 @@ impl Inode {
     }
 
     /// Filesystem the inode lives on, for statfs.
-    pub fn filesystem(&self) -> Option<Arc<ext2::Ext2>> {
+    pub fn filesystem(&self) -> Option<Arc<remote::RemoteFs>> {
         self.disk_ref().map(|d| d.fs)
     }
 }
@@ -537,23 +559,28 @@ pub fn init(ramdisk: Option<&'static [u8]>) {
         let _ = dev.insert(name, inode);
     }
     mkdir_p(root, "tmp");
+    write_proc_mounts("");
+}
+
+/// Rewrites the static /proc/mounts, which tools like df read.
+fn write_proc_mounts(extra: &str) {
     let mut mounts = String::from("rootfs / tmpfs rw 0 0\n");
-    match ext2::Ext2::mount() {
-        Ok(fs) => {
-            let (bs, blocks, free, _, _) = fs.usage();
-            let _ = root.insert("data", fs.inode(ext2::ROOT_INO));
-            mounts.push_str("/dev/hdb /data ext2 rw 0 0\n");
-            crate::printkln!("[fs] ext2 data disk mounted at /data ({} of {} KiB free)", free * bs / 1024, blocks * bs / 1024);
-        }
-        Err(e) => crate::printkln!("[fs] no data disk mounted: {}", e),
+    mounts.push_str(extra);
+    let proc_dir = mkdir_p(&root(), "proc");
+    let _ = proc_dir.unlink("mounts", false);
+    if let Ok(file) = proc_dir.create("mounts", NewNode::File, 0o444) {
+        let _ = file.write_at(0, mounts.as_bytes());
     }
-    // A static /proc/mounts, which tools like df read.
-    let proc_dir = mkdir_p(root, "proc");
-    let mut data = Data::empty();
-    let _ = data.write_at(0, mounts.as_bytes());
-    if let Ok(inode) = Inode::new(Node::File(data), 0o444) {
-        let _ = proc_dir.insert("mounts", inode);
-    }
+}
+
+/// Mounts the filesystem a server registered under `service` at `/<name>`.
+pub fn mount_remote(service: usize, root_ino: u32, name: &str, device: &str) -> Result<(), i64> {
+    let fs = remote::RemoteFs::new(service);
+    let (bs, blocks, free, _, _) = fs.usage();
+    root().insert(name, fs.inode(root_ino))?;
+    write_proc_mounts(&alloc::format!("{device} /{name} ext2 rw 0 0\n"));
+    crate::printkln!("[fs] /{} mounted from user-space server ({} of {} KiB free)", name, free * bs / 1024, blocks * bs / 1024);
+    Ok(())
 }
 
 /// Creates all missing directories and returns the last one.

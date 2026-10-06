@@ -8,7 +8,6 @@ pub fn dispatch(cmd: &str, args: &Vec<&str, 8>) {
         "halt" => cmd_halt(),
         "info" => cmd_info(),
         "mem" => cmd_mem(),
-        "disk" => cmd_disk(),
         "run" => cmd_run(args),
         "" => {}
         other => crate::printkln!("unknown command: {}", other),
@@ -22,7 +21,6 @@ fn cmd_help() {
     crate::printkln!("  echo <text>   - print text");
     crate::printkln!("  info          - CPU info");
     crate::printkln!("  mem           - memory statistics + self-test");
-    crate::printkln!("  disk          - show the data disk");
     crate::printkln!("  run <prog>    - start a program from /bin");
     crate::printkln!("  halt          - halt the system");
 }
@@ -186,20 +184,3 @@ pub fn run_program(args: &[&str]) {
     crate::process::reap_orphans();
 }
 
-fn cmd_disk() {
-    use crate::drivers::ata;
-    let Some(sectors) = ata::init() else {
-        crate::printkln!("no data disk (primary slave) found");
-        return;
-    };
-    crate::printkln!("data disk: {} sectors ({} MiB)", sectors, sectors / 2048);
-    let mut sb = [0u8; 1024];
-    match ata::read(2, &mut sb) {
-        Ok(()) => {
-            let magic = u16::from_le_bytes([sb[56], sb[57]]);
-            let label = core::str::from_utf8(&sb[120..136]).unwrap_or("?").trim_end_matches('\0');
-            crate::printkln!("superblock magic {:#06x} ({}), label '{}'", magic, if magic == 0xef53 { "ext2" } else { "unknown" }, label);
-        }
-        Err(e) => crate::printkln!("read failed: {:?}", e),
-    }
-}

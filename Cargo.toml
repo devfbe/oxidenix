@@ -1,5 +1,5 @@
 [workspace]
-members = ["kernel", "builder"]
+members = ["kernel", "builder", "crates/fsproto", "crates/ext2fs", "crates/oxrt", "servers/diskfs"]
 resolver = "2"
 
 [profile.dev]

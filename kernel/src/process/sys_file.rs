@@ -143,7 +143,8 @@ fn write_stat(buf: u64, ino: u64, mode: u32, size: u64, extra: (u64, u64, u64, u
 }
 
 fn stat_inode(inode: &Inode, buf: u64) -> SysResult {
-    write_stat(buf, inode.ino, inode.mode(), inode.size(), inode.stat_extra())
+    let s = inode.stat()?;
+    write_stat(buf, inode.ino, s.mode, s.size, (s.nlink, s.atime, s.mtime, s.ctime))
 }
 
 pub fn fstat(fd: u64, buf: u64) -> SysResult {
@@ -548,7 +549,7 @@ pub fn utimensat(dirfd: u64, path: u64, flags: u64) -> SysResult {
     resolve_at(dirfd, &path, flags & AT_SYMLINK_NOFOLLOW == 0).map(|_| 0)
 }
 
-/// statfs/fstatfs: the ext2 disk reports its real usage, everything else
+/// statfs/fstatfs: a server's filesystem reports its real usage, everything else
 /// the in-memory filesystem and its quota.
 fn write_statfs(inode: &Inode, buf: u64) -> SysResult {
     const EXT2_MAGIC: u64 = 0xef53;

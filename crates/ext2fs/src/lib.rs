@@ -4,15 +4,53 @@
 //! Every change goes straight to disk (no cache), and metadata is kept
 //! consistent enough for `e2fsck` on the host to accept the filesystem.
 
-use super::{Inode, NewNode, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG};
-use crate::drivers::{ata, rtc};
-use crate::process::errno::*;
-use alloc::collections::{BTreeMap, BTreeSet};
+#![no_std]
+
+extern crate alloc;
+
 use alloc::string::String;
-use alloc::sync::{Arc, Weak};
 use alloc::vec;
 use alloc::vec::Vec;
-use spin::Mutex;
+
+/// Linux errno values used in results.
+pub mod errno {
+    pub const ENOENT: i64 = 2;
+    pub const EIO: i64 = 5;
+    pub const EEXIST: i64 = 17;
+    pub const ENOTDIR: i64 = 20;
+    pub const EISDIR: i64 = 21;
+    pub const EINVAL: i64 = 22;
+    pub const EFBIG: i64 = 27;
+    pub const ENOSPC: i64 = 28;
+    pub const ENAMETOOLONG: i64 = 36;
+    pub const ENOTEMPTY: i64 = 39;
+    pub const ELOOP: i64 = 40;
+}
+use errno::*;
+
+pub const S_IFMT: u32 = 0o170000;
+pub const S_IFDIR: u32 = 0o040000;
+pub const S_IFREG: u32 = 0o100000;
+pub const S_IFLNK: u32 = 0o120000;
+pub const NAME_MAX: usize = 255;
+const SECTOR_SIZE: usize = 512;
+
+/// The disk and the clock the filesystem lives on.
+pub trait Device {
+    /// Reads whole 512-byte sectors starting at `lba`.
+    fn read(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), ()>;
+    /// Writes whole 512-byte sectors starting at `lba`.
+    fn write(&mut self, lba: u64, buf: &[u8]) -> Result<(), ()>;
+    /// Seconds since the Unix epoch, for timestamps.
+    fn now(&self) -> u32;
+}
+
+/// What `Ext2::create` makes.
+pub enum NewNode {
+    File,
+    Dir,
+    Symlink(String),
+}
 
 pub const ROOT_INO: u32 = 2;
 const MAGIC: u16 = 0xef53;
@@ -26,7 +64,7 @@ const FT_REG: u8 = 1;
 const FT_DIR: u8 = 2;
 const FT_SYMLINK: u8 = 7;
 
-fn io(_: ata::Error) -> i64 {
+fn io(_: ()) -> i64 {
     EIO
 }
 
@@ -86,8 +124,7 @@ impl RawInode {
     pub fn mtime(&self) -> u32 {
         le32(&self.0, 16)
     }
-    fn touch(&mut self, atime: bool, mtime: bool) {
-        let now = rtc::now() as u32;
+    fn touch(&mut self, now: u32, atime: bool, mtime: bool) {
         if atime {
             put32(&mut self.0, 8, now);
         }
@@ -130,7 +167,8 @@ struct Group {
     used_dirs: u16,
 }
 
-struct State {
+struct State<D: Device> {
+    dev: D,
     block_size: usize,
     inode_size: usize,
     inodes_per_group: u32,
@@ -178,31 +216,34 @@ fn write_entry(block: &mut [u8], pos: usize, inode: u32, rec_len: usize, name: &
     block[pos + 8..pos + 8 + name.len()].copy_from_slice(name);
 }
 
-impl State {
+impl<D: Device> State<D> {
     fn sectors_per_block(&self) -> u64 {
-        (self.block_size / ata::SECTOR_SIZE) as u64
+        (self.block_size / SECTOR_SIZE) as u64
     }
 
-    fn read_block(&self, n: u32) -> Result<Vec<u8>, i64> {
+    fn read_block(&mut self, n: u32) -> Result<Vec<u8>, i64> {
         let mut buf = vec![0u8; self.block_size];
-        ata::read(n as u64 * self.sectors_per_block(), &mut buf).map_err(io)?;
+        let lba = n as u64 * self.sectors_per_block();
+        self.dev.read(lba, &mut buf).map_err(io)?;
         Ok(buf)
     }
 
-    fn write_block(&self, n: u32, buf: &[u8]) -> Result<(), i64> {
-        ata::write(n as u64 * self.sectors_per_block(), buf).map_err(io)
+    fn write_block(&mut self, n: u32, buf: &[u8]) -> Result<(), i64> {
+        let lba = n as u64 * self.sectors_per_block();
+        self.dev.write(lba, buf).map_err(io)
     }
 
-    fn write_super(&self) -> Result<(), i64> {
+    fn write_super(&mut self) -> Result<(), i64> {
         let mut sb = [0u8; 1024];
-        ata::read(2, &mut sb).map_err(io)?;
+        self.dev.read(2, &mut sb).map_err(io)?;
         put32(&mut sb, 12, self.free_blocks);
         put32(&mut sb, 16, self.free_inodes);
-        put32(&mut sb, 48, rtc::now() as u32);
-        ata::write(2, &sb).map_err(io)
+        let now = self.dev.now();
+        put32(&mut sb, 48, now);
+        self.dev.write(2, &sb).map_err(io)
     }
 
-    fn write_group(&self, g: usize) -> Result<(), i64> {
+    fn write_group(&mut self, g: usize) -> Result<(), i64> {
         let byte = g * 32;
         let block = self.gdt_block + (byte / self.block_size) as u32;
         let off = byte % self.block_size;
@@ -224,13 +265,13 @@ impl State {
         Ok((group.inode_table + (byte / self.block_size) as u32, byte % self.block_size))
     }
 
-    fn read_inode(&self, ino: u32) -> Result<RawInode, i64> {
+    fn read_inode(&mut self, ino: u32) -> Result<RawInode, i64> {
         let (block, off) = self.inode_location(ino)?;
         let buf = self.read_block(block)?;
         Ok(RawInode(buf[off..off + 128].try_into().unwrap()))
     }
 
-    fn write_inode(&self, ino: u32, inode: &RawInode) -> Result<(), i64> {
+    fn write_inode(&mut self, ino: u32, inode: &RawInode) -> Result<(), i64> {
         let (block, off) = self.inode_location(ino)?;
         let mut buf = self.read_block(block)?;
         buf[off..off + 128].copy_from_slice(&inode.0);
@@ -242,7 +283,7 @@ impl State {
     }
 
     /// Finds and sets a clear bit in a bitmap block; returns its index.
-    fn take_bit(&self, bitmap_block: u32, limit: u32) -> Result<Option<u32>, i64> {
+    fn take_bit(&mut self, bitmap_block: u32, limit: u32) -> Result<Option<u32>, i64> {
         let mut bitmap = self.read_block(bitmap_block)?;
         for bit in 0..limit {
             let (byte, mask) = ((bit / 8) as usize, 1u8 << (bit % 8));
@@ -255,7 +296,7 @@ impl State {
         Ok(None)
     }
 
-    fn clear_bit(&self, bitmap_block: u32, bit: u32) -> Result<(), i64> {
+    fn clear_bit(&mut self, bitmap_block: u32, bit: u32) -> Result<(), i64> {
         let mut bitmap = self.read_block(bitmap_block)?;
         bitmap[(bit / 8) as usize] &= !(1u8 << (bit % 8));
         self.write_block(bitmap_block, &bitmap)
@@ -467,7 +508,7 @@ impl State {
             }
         }
         inode.set_size(len);
-        inode.touch(false, true);
+        inode.touch(self.dev.now(), false, true);
         self.write_inode(ino, inode)
     }
 
@@ -531,7 +572,7 @@ impl State {
         if off + done as u64 > inode.size() {
             inode.set_size(off + done as u64);
         }
-        inode.touch(false, true);
+        inode.touch(self.dev.now(), false, true);
         self.write_inode(ino, &inode)?;
         match result {
             Err(e) if done == 0 => Err(e),
@@ -604,7 +645,7 @@ impl State {
         write_entry(&mut block, 0, ino, self.block_size, name, ftype);
         self.write_block(blk, &block)?;
         inode.set_size((fb + 1) * self.block_size as u64);
-        inode.touch(false, true);
+        inode.touch(self.dev.now(), false, true);
         self.write_inode(dir, &inode)
     }
 
@@ -627,7 +668,7 @@ impl State {
                     None => put32(&mut block, e.pos, 0),
                 }
                 self.write_block(blk, &block)?;
-                inode.touch(false, true);
+                inode.touch(self.dev.now(), false, true);
                 return self.write_inode(dir, &inode);
             }
         }
@@ -655,12 +696,12 @@ impl State {
     fn adjust_links(&mut self, ino: u32, delta: i32) -> Result<(), i64> {
         let mut inode = self.read_inode(ino)?;
         inode.set_links((inode.links() as i32 + delta) as u16);
-        inode.touch(false, false);
+        inode.touch(self.dev.now(), false, false);
         self.write_inode(ino, &inode)
     }
 
     fn create(&mut self, dir: u32, name: &str, kind: &NewNode, perm: u32) -> Result<u32, i64> {
-        if name.len() > super::NAME_MAX {
+        if name.len() > NAME_MAX {
             return Err(ENAMETOOLONG);
         }
         if self.lookup(dir, name).is_ok() {
@@ -679,7 +720,7 @@ impl State {
         let goal = self.group_of(dir);
         let is_dir = matches!(kind, NewNode::Dir);
         let mut inode = RawInode([0; 128]);
-        inode.touch(true, true);
+        inode.touch(self.dev.now(), true, true);
         let ftype = match kind {
             NewNode::File => {
                 inode.set_mode((S_IFREG | perm & 0o7777) as u16);
@@ -732,7 +773,8 @@ impl State {
         let dir = inode.is_dir();
         self.truncate(ino, &mut inode, 0)?;
         inode.set_links(0);
-        put32(&mut inode.0, 20, rtc::now() as u32); // dtime
+        let now = self.dev.now();
+        put32(&mut inode.0, 20, now); // dtime
         self.write_inode(ino, &inode)?;
         self.free_inode(ino, dir)
     }
@@ -756,7 +798,7 @@ impl State {
         } else {
             inode.set_links(inode.links().saturating_sub(1));
         }
-        inode.touch(false, false);
+        inode.touch(self.dev.now(), false, false);
         self.write_inode(ino, &inode)?;
         if inode.links() == 0 {
             self.unlinked.push((ino, inode));
@@ -779,7 +821,7 @@ impl State {
     }
 
     fn rename(&mut self, odir: u32, oname: &str, ndir: u32, nname: &str) -> Result<(), i64> {
-        if nname.len() > super::NAME_MAX {
+        if nname.len() > NAME_MAX {
             return Err(ENAMETOOLONG);
         }
         let ino = self.lookup(odir, oname)?;
@@ -832,19 +874,27 @@ impl State {
     }
 }
 
-pub struct Ext2 {
-    state: Mutex<State>,
-    cache: Mutex<BTreeMap<u32, Weak<Inode>>>,
-    /// Unlinked inodes still open somewhere; freed when the last VFS
-    /// reference goes away, so their numbers cannot be reused meanwhile.
-    orphans: Mutex<BTreeSet<u32>>,
+/// Metadata of one inode.
+#[derive(Clone, Copy)]
+pub struct Stat {
+    pub mode: u32,
+    pub size: u64,
+    pub links: u32,
+    pub atime: u32,
+    pub mtime: u32,
+    pub ctime: u32,
 }
 
-impl Ext2 {
-    pub fn mount() -> Result<Arc<Ext2>, &'static str> {
-        ata::init().ok_or("no data disk")?;
+/// A mounted ext2 filesystem on device `D`. Single-threaded: the owner
+/// serializes access.
+pub struct Ext2<D: Device> {
+    st: State<D>,
+}
+
+impl<D: Device> Ext2<D> {
+    pub fn mount(mut dev: D) -> Result<Self, &'static str> {
         let mut sb = [0u8; 1024];
-        ata::read(2, &mut sb).map_err(|_| "cannot read the superblock")?;
+        dev.read(2, &mut sb).map_err(|_| "cannot read the superblock")?;
         if le16(&sb, 56) != MAGIC {
             return Err("not an ext2 filesystem");
         }
@@ -865,10 +915,15 @@ impl Ext2 {
         let first_data_block = le32(&sb, 20);
         let blocks_count = le32(&sb, 4);
         let blocks_per_group = le32(&sb, 32);
-        let mut state = State {
+        let inodes_per_group = le32(&sb, 40);
+        if blocks_per_group == 0 || inodes_per_group == 0 || blocks_count <= first_data_block {
+            return Err("corrupt superblock");
+        }
+        let mut st = State {
+            dev,
             block_size,
             inode_size,
-            inodes_per_group: le32(&sb, 40),
+            inodes_per_group,
             blocks_per_group,
             first_data_block,
             blocks_count,
@@ -881,11 +936,10 @@ impl Ext2 {
         let count = (blocks_count - first_data_block).div_ceil(blocks_per_group) as usize;
         for g in 0..count {
             let byte = g * 32;
-            let buf = state
-                .read_block(state.gdt_block + (byte / block_size) as u32)
-                .map_err(|_| "cannot read the group descriptors")?;
+            let block = st.gdt_block + (byte / block_size) as u32;
+            let buf = st.read_block(block).map_err(|_| "cannot read the group descriptors")?;
             let o = byte % block_size;
-            state.groups.push(Group {
+            st.groups.push(Group {
                 block_bitmap: le32(&buf, o),
                 inode_bitmap: le32(&buf, o + 4),
                 inode_table: le32(&buf, o + 8),
@@ -894,104 +948,103 @@ impl Ext2 {
                 used_dirs: le16(&buf, o + 16),
             });
         }
-        Ok(Arc::new(Ext2 {
-            state: Mutex::new(state),
-            cache: Mutex::new(BTreeMap::new()),
-            orphans: Mutex::new(BTreeSet::new()),
-        }))
+        Ok(Ext2 { st })
     }
 
-    /// The VFS inode for `ino`; the same disk inode always maps to the same
-    /// `Arc<Inode>` while it is in use.
-    pub fn inode(self: &Arc<Self>, ino: u32) -> Arc<Inode> {
-        let mut cache = self.cache.lock();
-        if let Some(i) = cache.get(&ino).and_then(Weak::upgrade) {
-            return i;
-        }
-        cache.retain(|_, w| w.strong_count() > 0);
-        let inode = Inode::disk(self.clone(), ino);
-        cache.insert(ino, Arc::downgrade(&inode));
-        inode
+    pub fn stat(&mut self, ino: u32) -> Result<Stat, i64> {
+        let i = self.st.read_inode(ino)?;
+        Ok(Stat {
+            mode: i.mode() as u32,
+            size: i.size(),
+            links: i.links() as u32,
+            atime: i.atime(),
+            mtime: i.mtime(),
+            ctime: i.ctime(),
+        })
     }
 
-    pub fn stat(&self, ino: u32) -> Result<RawInode, i64> {
-        self.state.lock().read_inode(ino)
+    pub fn read(&mut self, ino: u32, off: u64, buf: &mut [u8]) -> Result<usize, i64> {
+        self.st.read(ino, off, buf)
     }
-    pub fn read(&self, ino: u32, off: u64, buf: &mut [u8]) -> Result<usize, i64> {
-        self.state.lock().read(ino, off, buf)
+
+    pub fn write(&mut self, ino: u32, off: u64, data: &[u8]) -> Result<usize, i64> {
+        self.st.write(ino, off, data)
     }
-    pub fn write(&self, ino: u32, off: u64, data: &[u8]) -> Result<usize, i64> {
-        self.state.lock().write(ino, off, data)
-    }
-    pub fn truncate(&self, ino: u32, len: u64) -> Result<(), i64> {
-        let mut st = self.state.lock();
-        let mut inode = st.read_inode(ino)?;
+
+    pub fn truncate(&mut self, ino: u32, len: u64) -> Result<(), i64> {
+        let mut inode = self.st.read_inode(ino)?;
         if !inode.is_reg() {
             return Err(EINVAL);
         }
-        if len > st.max_file_size() {
+        if len > self.st.max_file_size() {
             return Err(EFBIG);
         }
-        st.truncate(ino, &mut inode, len)
+        self.st.truncate(ino, &mut inode, len)
     }
 
-    /// Frees inodes that lost their last link, unless an open file still
-    /// refers to them; those become orphans until `forget`.
-    fn settle_unlinked(&self, st: &mut State) -> Result<(), i64> {
-        for (ino, inode) in core::mem::take(&mut st.unlinked) {
-            let open = self.cache.lock().get(&ino).is_some_and(|w| w.strong_count() > 0);
-            if open {
-                self.orphans.lock().insert(ino);
-            } else {
-                st.release(ino, inode)?;
-            }
-        }
-        Ok(())
+    pub fn list(&mut self, dir: u32) -> Result<Vec<(String, u32, u8)>, i64> {
+        self.st.list(dir)
     }
 
-    /// Called when the last VFS reference to `ino` is dropped.
-    pub fn forget(&self, ino: u32) {
-        if self.orphans.lock().remove(&ino) {
-            let mut st = self.state.lock();
-            if let Ok(inode) = st.read_inode(ino) {
-                let _ = st.release(ino, inode);
-            }
+    pub fn lookup(&mut self, dir: u32, name: &str) -> Result<u32, i64> {
+        self.st.lookup(dir, name)
+    }
+
+    pub fn create(&mut self, dir: u32, name: &str, kind: &NewNode, perm: u32) -> Result<u32, i64> {
+        self.st.create(dir, name, kind, perm)
+    }
+
+    /// Inodes that lost their last link during the last operation. If the
+    /// operation failed, nobody else can know about them, so they are freed.
+    fn take_unlinked(&mut self, ok: bool) -> Vec<u32> {
+        let gone: Vec<(u32, RawInode)> = core::mem::take(&mut self.st.unlinked);
+        if ok {
+            return gone.into_iter().map(|(ino, _)| ino).collect();
         }
+        for (ino, inode) in gone {
+            let _ = self.st.release(ino, inode);
+        }
+        Vec::new()
     }
-    pub fn list(&self, dir: u32) -> Result<Vec<(String, u32, u8)>, i64> {
-        self.state.lock().list(dir)
+
+    /// Removes `name`; returns the inodes whose last link went away. They
+    /// stay allocated until `release`, so open files keep working.
+    pub fn unlink(&mut self, dir: u32, name: &str, want_dir: bool) -> Result<Vec<u32>, i64> {
+        let result = self.st.unlink(dir, name, want_dir);
+        let gone = self.take_unlinked(result.is_ok());
+        result.map(|_| gone)
     }
-    pub fn lookup(&self, dir: u32, name: &str) -> Result<u32, i64> {
-        self.state.lock().lookup(dir, name)
+
+    pub fn rename(&mut self, odir: u32, oname: &str, ndir: u32, nname: &str) -> Result<Vec<u32>, i64> {
+        let result = self.st.rename(odir, oname, ndir, nname);
+        let gone = self.take_unlinked(result.is_ok());
+        result.map(|_| gone)
     }
-    pub fn create(&self, dir: u32, name: &str, kind: &NewNode, perm: u32) -> Result<u32, i64> {
-        self.state.lock().create(dir, name, kind, perm)
+
+    /// Frees an inode returned by `unlink` or `rename`, with all its blocks.
+    pub fn release(&mut self, ino: u32) -> Result<(), i64> {
+        let inode = self.st.read_inode(ino)?;
+        if inode.links() != 0 {
+            return Err(EINVAL);
+        }
+        self.st.release(ino, inode)
     }
-    pub fn unlink(&self, dir: u32, name: &str, want_dir: bool) -> Result<(), i64> {
-        let mut st = self.state.lock();
-        let result = st.unlink(dir, name, want_dir);
-        self.settle_unlinked(&mut st)?;
-        result
+
+    pub fn readlink(&mut self, ino: u32) -> Result<String, i64> {
+        self.st.readlink(ino)
     }
-    pub fn rename(&self, odir: u32, oname: &str, ndir: u32, nname: &str) -> Result<(), i64> {
-        let mut st = self.state.lock();
-        let result = st.rename(odir, oname, ndir, nname);
-        self.settle_unlinked(&mut st)?;
-        result
-    }
-    pub fn readlink(&self, ino: u32) -> Result<String, i64> {
-        self.state.lock().readlink(ino)
-    }
-    pub fn set_perm(&self, ino: u32, perm: u32) -> Result<(), i64> {
-        let st = self.state.lock();
-        let mut inode = st.read_inode(ino)?;
+
+    pub fn set_perm(&mut self, ino: u32, perm: u32) -> Result<(), i64> {
+        let mut inode = self.st.read_inode(ino)?;
         inode.set_mode((inode.mode() as u32 & S_IFMT | perm & 0o7777) as u16);
-        inode.touch(false, false);
-        st.write_inode(ino, &inode)
+        let now = self.st.dev.now();
+        inode.touch(now, false, false);
+        self.st.write_inode(ino, &inode)
     }
+
     /// (block size, total blocks, free blocks, total inodes, free inodes)
     pub fn usage(&self) -> (u64, u64, u64, u64, u64) {
-        let st = self.state.lock();
+        let st = &self.st;
         let inodes = st.inodes_per_group as u64 * st.groups.len() as u64;
         (st.block_size as u64, st.blocks_count as u64, st.free_blocks as u64, inodes, st.free_inodes as u64)
     }

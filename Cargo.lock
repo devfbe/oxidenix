@@ -125,6 +125,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "217698eaf96b4a3f0bc4f3662aaa55bdf913cd54d7204591faa790070c6d0853"
 
 [[package]]
+name = "diskfs"
+version = "0.1.0"
+dependencies = [
+ "ext2fs",
+ "fsproto",
+ "oxrt",
+]
+
+[[package]]
 name = "errno"
 version = "0.3.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -133,6 +142,10 @@ dependencies = [
  "libc",
  "windows-sys",
 ]
+
+[[package]]
+name = "ext2fs"
+version = "0.1.0"
 
 [[package]]
 name = "fastrand"
@@ -150,6 +163,10 @@ dependencies = [
  "byteorder",
  "log",
 ]
+
+[[package]]
+name = "fsproto"
+version = "0.1.0"
 
 [[package]]
 name = "funty"
@@ -327,6 +344,7 @@ name = "oxidenix"
 version = "0.1.0"
 dependencies = [
  "bootloader_api",
+ "fsproto",
  "heapless",
  "lazy_static",
  "linked_list_allocator",
@@ -335,6 +353,13 @@ dependencies = [
  "pic8259",
  "spin",
  "x86_64 0.15.5",
+]
+
+[[package]]
+name = "oxrt"
+version = "0.1.0"
+dependencies = [
+ "linked_list_allocator",
 ]
 
 [[package]]

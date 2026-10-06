@@ -1,6 +1,7 @@
 pub mod address_space;
 pub mod elf;
 pub mod errno;
+pub mod ipc;
 mod loader;
 pub mod signal;
 mod sys_file;
@@ -92,6 +93,12 @@ struct Process {
     signals: signal::Signals,
     /// Stop/continue event not yet collected by the parent's wait4.
     report: Option<i32>,
+    /// Servers started by the kernel may register IPC services and ask
+    /// for I/O ports.
+    privileged: bool,
+    /// I/O permission bitmap (0 = allowed) installed in the TSS while
+    /// this process runs.
+    io_bitmap: Option<Box<[u8; gdt::IOMAP_BYTES]>>,
 }
 
 impl Process {
@@ -187,6 +194,8 @@ pub fn init() {
         mmap_next: 0,
         signals: signal::Signals::default(),
         report: None,
+        privileged: false,
+        io_bitmap: None,
     };
     let mut procs = BTreeMap::new();
     procs.insert(0, Box::new(kernel));
@@ -253,6 +262,28 @@ pub fn setsid() -> SysResult {
         p.sid = p.pid;
         p.pgid = p.pid;
         Ok(p.pid as i64)
+    })
+}
+
+/// ioperm(from, count, on) for privileged servers: grants or revokes
+/// access to I/O ports via the TSS bitmap.
+pub fn ioperm(from: u64, count: u64, on: u64) -> SysResult {
+    let end = from.checked_add(count).filter(|&e| e <= 0x10000).ok_or(EINVAL)?;
+    with_current(|p| {
+        if !p.privileged {
+            return Err(EPERM);
+        }
+        let bitmap = p.io_bitmap.get_or_insert_with(|| Box::new([0xff; gdt::IOMAP_BYTES]));
+        for port in from..end {
+            let (byte, bit) = ((port / 8) as usize, 1u8 << (port % 8));
+            if on != 0 {
+                bitmap[byte] &= !bit;
+            } else {
+                bitmap[byte] |= bit;
+            }
+        }
+        gdt::set_io_bitmap(Some(bitmap));
+        Ok(0)
     })
 }
 
@@ -351,6 +382,8 @@ fn new_process(pid: Pid, ppid: Pid, name: String, space: AddressSpace, frame: Fr
         mmap_next: MMAP_TOP,
         signals: signal::Signals::default(),
         report: None,
+        privileged: false,
+        io_bitmap: None,
     }))
 }
 
@@ -369,6 +402,16 @@ fn load_path(cwd: &str, path: &str, args: &[String], envs: &[String]) -> Result<
 /// Starts a program as a child of the kernel shell, with the console as
 /// stdin/stdout/stderr. Names without '/' are looked up in /bin.
 pub fn spawn(name: &str, args: &[&str]) -> Result<Pid, i64> {
+    spawn_with(name, args, false)
+}
+
+/// Starts a privileged server process: it may register IPC services and
+/// request I/O ports, and it does not take over the terminal.
+pub fn spawn_server(path: &str) -> Result<Pid, i64> {
+    spawn_with(path, &[path], true)
+}
+
+fn spawn_with(name: &str, args: &[&str], server: bool) -> Result<Pid, i64> {
     let path = if name.contains('/') { name.to_string() } else { alloc::format!("/bin/{name}") };
     let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
     let envs: Vec<String> = ["PATH=/bin", "HOME=/root", "TERM=linux", "PS1=\\w # "]
@@ -389,9 +432,12 @@ pub fn spawn(name: &str, args: &[&str]) -> Result<Pid, i64> {
         p.fds = vec![Some(FdEntry { file: console, cloexec: false }); 3];
         p.brk_start = image.brk;
         p.brk_end = image.brk;
+        p.privileged = server;
         s.procs.insert(pid, p);
         s.ready.push_back(pid);
-        crate::drivers::tty::set_foreground(pid);
+        if !server {
+            crate::drivers::tty::set_foreground(pid);
+        }
         Ok(pid)
     })
 }
@@ -441,6 +487,10 @@ pub fn exec(frame: &mut Frame, path: &str, args: &[String], envs: &[String]) -> 
         p.brk_end = image.brk;
         p.mmap_next = MMAP_TOP;
         p.signals.reset_on_exec();
+        // A new program gets no inherited hardware access.
+        p.privileged = false;
+        p.io_bitmap = None;
+        gdt::set_io_bitmap(None);
         p.fds
             .iter_mut()
             .filter(|e| e.as_ref().is_some_and(|e| e.cloexec))
@@ -459,6 +509,7 @@ pub fn exit(status: i32) -> ! {
     // Close files first: this may wake pipe readers/writers.
     let fds = core::mem::take(&mut sched().cur().fds);
     drop(fds);
+    ipc::on_exit(sched().current);
 
     let s = sched();
     let pid = s.current;
@@ -600,6 +651,7 @@ fn switch_to(next: Pid) {
         gdt::set_kernel_stack(VirtAddr::new(top));
         syscall::set_kernel_stack(top);
     }
+    gdt::set_io_bitmap(n.io_bitmap.as_deref());
     FsBase::write(VirtAddr::new(n.fs_base));
     unsafe { fxrstor(&n.fpu) };
     let next_rsp = n.kernel_rsp;

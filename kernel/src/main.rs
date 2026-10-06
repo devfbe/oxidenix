@@ -43,7 +43,24 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     process::init();
     // Only now: the timer interrupt needs the scheduler.
     x86_64::instructions::interrupts::enable();
+    start_servers();
     shell::run();
+}
+
+/// Starts the user-space servers and mounts what they provide. Drivers
+/// and filesystems live in these processes, not in the kernel.
+fn start_servers() {
+    match process::spawn_server("/sbin/diskfs") {
+        Ok(pid) => match process::ipc::wait_for("diskfs", 3 * process::TIMER_HZ) {
+            Some((service, root)) => {
+                if let Err(e) = fs::mount_remote(service, root as u32, "data", "/dev/hdb") {
+                    printkln!("[boot] cannot mount /data (errno {})", e);
+                }
+            }
+            None => printkln!("[boot] diskfs (pid {}) did not register; /data is not mounted", pid),
+        },
+        Err(e) => printkln!("[boot] cannot start /sbin/diskfs (errno {})", e),
+    }
 }
 
 #[panic_handler]

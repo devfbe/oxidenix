@@ -5,7 +5,8 @@
 **A Unix-like x86_64 kernel written from scratch in Rust, designed, implemented and debugged by an AI.**
 
 It boots in QEMU and runs an unmodified, statically linked **GNU Bash 5.3** and **BusyBox**
-on top of a Linux-compatible system call interface.
+on top of a Linux-compatible system call interface. It is moving towards a **microkernel**: the
+disk driver and the ext2 filesystem already run as a user-space server.
 
 ![Rust](https://img.shields.io/badge/language-Rust%20(nightly)-orange?logo=rust)
 ![Arch](https://img.shields.io/badge/arch-x86__64-blue)
@@ -57,9 +58,12 @@ Its [commit history](#development-history) records every step.
   in Bash; background jobs reading from the terminal are stopped with `SIGTTIN`.
 - **Filesystem**: an in-memory, tmpfs-like VFS populated from a cpio initramfs, with files,
   directories, symlinks, `/dev/{console,tty,null,zero}`, and quotas against heap exhaustion.
-- **Persistent storage**: an ATA disk driver and a read-write **ext2** implementation. The data
-  disk is mounted at `/data`, survives reboots, and stays consistent enough that `e2fsck` on the
-  host accepts it.
+- **Microkernel-style drivers**: the ATA driver and the read-write **ext2** filesystem run in
+  `diskfs`, an ordinary ring-3 process that talks to the kernel over IPC and reaches the disk
+  through I/O ports the kernel granted it. Killing it fails `/data` accesses with `EIO` and
+  leaves the rest of the system running.
+- **Persistent storage**: the data disk is mounted at `/data`, survives reboots, and stays
+  consistent enough that `e2fsck` on the host accepts it.
 - **Wall-clock time** from the CMOS real-time clock (`date`, file timestamps).
 - **Terminal**: a termios line discipline (canonical and raw mode, echo, erase/kill/word-erase,
   EOF), the ANSI escape sequences BusyBox and readline use, a German keyboard layout and UTF-8.
@@ -106,20 +110,21 @@ The window scales when it is resized (`zoom-to-fit`), and Ctrl+Alt+F toggles ful
 ### Big picture
 
 ```
- ┌───────────────────────────── user space (ring 3) ─────────────────────────────┐
- │   GNU Bash 5.3      BusyBox 1.37      cowtest / sigtest / forktest / hello    │
- │                  statically linked against musl libc                           │
- └──────────────────────────────┬──────────────────────────────▲──────────────────┘
-                     syscall / page fault / IRQ            iretq (+ signal frames)
- ┌──────────────────────────────▼──────────────────────────────┴──────────────────┐
- │  syscall layer   process/syscall.rs ─ sys_file.rs ─ sys_mem.rs ─ signal.rs     │
- │  processes       scheduler, fork/exec/wait, sleep/wakeup channels, pgid/sid     │
- │  memory          frame allocator (refcounted), heap, address spaces, COW       │
- │  VFS             inodes, path resolution, open files, pipes, cpio initramfs     │
- │  terminal        TTY line discipline ─ console (framebuffer, ANSI) ─ keyboard   │
- │  CPU             GDT/TSS, IDT, PIC, PIT, syscall MSRs, SSE                       │
- └─────────────────────────────────────────────────────────────────────────────────┘
-                     bootloader 0.11 (BIOS), QEMU x86_64, 256 MiB RAM
+ ┌──────────────────────────────── user space (ring 3) ────────────────────────────────┐
+ │  GNU Bash 5.3   BusyBox 1.37   test programs     │  diskfs server (Rust, no_std)    │
+ │  statically linked against musl libc             │  ext2 + ATA driver, I/O ports    │
+ └───────────────────────┬────────────────▲─────────┴────────▲──────────────┬──────────┘
+          syscall / fault / IRQ       iretq            IPC receive/reply   in/out
+ ┌───────────────────────▼────────────────┴──────────────────┴──────────────│──────────┐
+ │  syscall layer   process/syscall.rs ─ sys_file.rs ─ sys_mem.rs ─ signal.rs│          │
+ │  IPC             services, synchronous call/receive/reply, async post    │          │
+ │  processes       scheduler, fork/exec/wait, sleep/wakeup, pgid/sid, ioperm          │
+ │  memory          frame allocator (refcounted), heap, address spaces, COW │          │
+ │  VFS             memory inodes, remote inodes (fs/remote.rs), pipes, cpio│          │
+ │  terminal        TTY line discipline ─ console (framebuffer, ANSI) ─ keyboard       │
+ │  CPU             GDT, TSS with I/O permission bitmap, IDT, PIC, PIT, SSE │          │
+ └──────────────────────────────────────────────────────────────────────────▼──────────┘
+                     bootloader 0.11 (BIOS), QEMU x86_64, 256 MiB RAM, IDE disk
 ```
 
 ### Repository layout
@@ -143,16 +148,23 @@ oxidenix/
 │       │   ├── elf.rs           ELF64 parser
 │       │   └── uaccess.rs       checked access to user memory
 │       ├── fs/                  VFS (mod.rs), open files and pipes (file.rs),
-│       │                        initramfs unpacker (cpio.rs), ext2 (ext2.rs)
+│       │                        initramfs unpacker (cpio.rs), IPC client for
+│       │                        filesystem servers (remote.rs)
 │       ├── drivers/             framebuffer console (console.rs), TTY (tty.rs),
-│       │                        PS/2 keyboard (keyboard.rs), ATA disk (ata.rs),
-│       │                        CMOS clock (rtc.rs)
+│       │                        PS/2 keyboard (keyboard.rs), CMOS clock (rtc.rs)
 │       └── shell/               built-in kernel monitor (fallback shell)
+│   (process/ipc.rs            services and message passing)
+├── servers/
+│   └── diskfs/                  user-space ext2 server with its own ATA driver
+├── crates/
+│   ├── ext2fs/                  ext2 as a library over a `Device` trait
+│   ├── fsproto/                 message format between the VFS and filesystem servers
+│   └── oxrt/                    runtime for servers: entry, syscalls, heap, port I/O
 ├── builder/                     host tool: rootfs + cpio + boot image + ext2 data disk + QEMU
 └── userspace/                   C test programs, build script, rootfs and data disk templates
 ```
 
-About 6,600 lines of Rust in the kernel plus a small host-side builder.
+About 6,191 lines of Rust in the kernel and 1,669 in the server, its libraries and runtime, plus a small host-side builder.
 
 ### Boot sequence
 
@@ -161,9 +173,11 @@ About 6,600 lines of Rust in the kernel plus a small host-side builder.
    memory at a dynamic offset, sets up a VESA framebuffer and loads the initramfs as a ramdisk.
 2. `kernel_main` runs these steps in order: framebuffer console → GDT/TSS/IDT and PIC/PIT
    (interrupts still off) → frame allocator and 16 MiB kernel heap → VFS from the cpio
-   ramdisk, real-time clock and ext2 mount → process subsystem (SSE, syscall MSRs, process 0) →
+   ramdisk and real-time clock → process subsystem (SSE, syscall MSRs, process 0) →
    **interrupts on**.
-3. Process 0 (the kernel monitor) spawns `/bin/bash` as the foreground process and waits for
+3. The kernel starts the servers: `/sbin/diskfs` asks for its I/O ports, mounts the ext2 disk
+   and registers as service `diskfs`; the kernel then mounts it at `/data`.
+4. Process 0 (the kernel monitor) spawns `/bin/bash` as the foreground process and waits for
    it. If Bash exits, the monitor takes over the terminal.
 
 ### Memory
@@ -257,11 +271,40 @@ About 6,600 lines of Rust in the kernel plus a small host-side builder.
   and single files are limited to 64 MiB (`EFBIG`). Without this, user programs could exhaust
   the kernel heap.
 
+### Microkernel architecture
+
+oxidenix is being restructured into a microkernel step by step, keeping the Linux syscall
+interface working after every step. The kernel keeps memory management, scheduling, IPC and
+interrupt dispatch; drivers and filesystems move into user-space servers.
+
+- **IPC** (`process/ipc.rs`): a privileged server registers a service name (`ipc_register`),
+  then loops over `ipc_receive` and `ipc_reply` (oxidenix syscalls 1000-1002). The kernel is
+  the client on behalf of user programs: `call` queues a request and sleeps uninterruptibly
+  until the reply; `post` queues a message without waiting, for contexts that must not sleep
+  (releasing an unlinked inode while dropping it). Messages up to 64 KiB are copied through the
+  kernel.
+- **Hardware access without kernel drivers**: servers started by the kernel are *privileged*
+  and may call `ioperm`. The kernel then grants exactly those ports through the TSS I/O
+  permission bitmap, which is installed on every switch to that process. The server cannot
+  touch other ports or disable interrupts (no IOPL 3).
+- **Remote filesystems**: the VFS has a second kind of inode whose operations become
+  `fsproto` requests to a server (`fs/remote.rs`). Reads and writes are split into 32 KiB
+  messages. The kernel still decides when an unlinked inode may be freed, because only it knows
+  whether a file is open.
+- **Fault isolation**: when a server dies, its services are marked dead and every pending or
+  later request fails with `EIO`. Programs see I/O errors on that mount; the kernel and the
+  rest of user space keep running.
+- **Servers in Rust**: `servers/diskfs` is a `no_std` Rust program built for
+  `x86_64-unknown-none` as a static `ET_EXEC` binary, using `crates/oxrt` for its entry point,
+  syscalls, heap and port I/O. It shares no code with the kernel except the message format.
+- Still in the kernel today: the VFS itself, pipes, the TTY, console and keyboard. They are the
+  next candidates for servers.
+
 ### Persistent storage
 
-- **ATA PIO driver** for the second IDE disk (primary bus, slave). It uses LBA28, polls with
-  the controller interrupt disabled, and flushes the write cache after every write.
-- **ext2** (revision 1 with the `filetype` feature, 1/2/4 KiB blocks) supports reading and
+- **ATA PIO driver** in `diskfs` for the second IDE disk (primary bus, slave). It uses LBA28,
+  polls with the controller interrupt disabled, and flushes the write cache after every write.
+- **ext2** (`crates/ext2fs`; revision 1 with the `filetype` feature, 1/2/4 KiB blocks) supports reading and
   writing files through direct, single, double and triple indirect blocks, holes, truncation
   (freeing whole indirect subtrees), directories growing by blocks, fast and block symlinks,
   `rename` across directories (with `..` and link count updates and a cycle check), `rmdir`, and
@@ -270,7 +313,7 @@ About 6,600 lines of Rust in the kernel plus a small host-side builder.
 - Writes are synchronous (no cache), so `sync`/`fsync` have nothing left to do. After a session,
   `e2fsck -fn disk.img` on the host reports a clean filesystem, and `debugfs` can read the files.
 - **VFS integration**: every inode operation (`child`, `list`, `create`, `unlink`, `read_at`,
-  `write_at`, `truncate`, ...) works on memory and ext2 inodes alike. ext2 inodes are cached per
+  `write_at`, `truncate`, ...) works on memory and remote (server-backed) inodes alike. Remote inodes are cached per
   filesystem so that one disk inode always maps to one `Arc<Inode>`. The disk root is mounted
   at `/data`, and `statfs` and a static `/proc/mounts` make `df` work.
 - A file that is deleted while still open stays allocated as an orphan until the last
@@ -314,6 +357,7 @@ Linux x86_64 numbers, grouped by area (about 90 in total):
 | Groups and IDs | `setpgid` `getpgid` `getpgrp` `setsid` `getsid` `getuid` `geteuid` `getgid` `getegid` `getresuid` `getresgid` `setuid` `setgid` |
 | Signals | `rt_sigaction` `rt_sigprocmask` `rt_sigreturn` `kill` `tkill` `tgkill` `pause` `sigaltstack` |
 | Filesystems | `statfs` `fstatfs` `sync` `fsync` `fdatasync` |
+| Servers | `ioperm` (privileged servers only), `ipc_register` (1000), `ipc_receive` (1001), `ipc_reply` (1002) |
 | Time and misc | `nanosleep` `clock_gettime` (`CLOCK_REALTIME` from the RTC) `uname` `getrandom` `socket` (fails with `EAFNOSUPPORT`) |
 
 Everything runs as root. Unknown syscalls print a kernel message and return `ENOSYS`.
@@ -333,6 +377,7 @@ Each of these programs and scripts lives in the root filesystem and runs inside 
 | `fstest` | descriptor access modes (`EBADF` on read-only/write-only fds), `O_NOFOLLOW` on symlinks, unlinked-but-open files (kept until closed, never shared with new files), ext2 size limits, overflowing `mmap` offsets |
 | `sh /etc/disktest.sh` | ext2: 150-file directory, 1.5 MiB file (double indirect), append, truncate, rename, cycles, symlinks, `rm -r`, space accounting |
 | `e2fsck -fn disk.img` (host) | the filesystem written by oxidenix is consistent |
+| `kill -9 <diskfs pid>` | a crashed filesystem server only turns `/data` accesses into `EIO` |
 | `mem` (kernel monitor) | frame and heap accounting, allocator self-test, leak checks after workloads |
 
 During development the AI drove these tests through the QEMU monitor socket (`sendkey`,
@@ -387,6 +432,7 @@ never returns grown memory to the frame allocator, and there are no users or per
 | Out of memory | grow the kernel heap and turn memory exhaustion into errors |
 | Job control | job control with stopped processes and syscall restart |
 | Disk | persistent ext2 data disk on an ATA drive, wall-clock time |
+| Microkernel | move the disk driver and ext2 into a user-space server |
 
 Run `git log` for the full history, including the security fixes between these steps.
 
