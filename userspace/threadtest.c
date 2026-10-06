@@ -330,6 +330,9 @@ int main(void) {
     long r = syscall(SYS_clone, 200UL, 0, 0, 0, 0);
     if (r == 0) _exit(0);
     check("clone refuses an exit signal beyond 64", r == -1 && errno == EINVAL);
+    r = syscall(SYS_clone, (unsigned long)SIGCHLD, 0x8000000000000000UL, 0, 0, 0);
+    if (r == 0) _exit(0);
+    check("clone refuses a stack outside user space", r == -1 && errno == EINVAL);
 
     /* vfork shares memory until exec or exit; posix_spawn uses it. */
     static volatile int shared_by_vfork;

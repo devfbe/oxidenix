@@ -90,6 +90,10 @@ pub fn clone(frame: &Frame, flags: u64, stack: u64, parent_tid: u64, child_tid: 
     if flags & CLONE_SETTLS != 0 && tls >= super::address_space::USER_END {
         return Err(EPERM);
     }
+    // A non-canonical stack pointer would make iretq fault in ring 0.
+    if stack >= super::address_space::USER_END {
+        return Err(EINVAL);
+    }
 
     let slot = sched::reserve_pid()?;
     let tid = slot.pid;
