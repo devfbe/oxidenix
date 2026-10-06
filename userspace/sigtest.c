@@ -1,5 +1,6 @@
 #include <errno.h>
 #include <limits.h>
+#include <setjmp.h>
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
@@ -31,6 +32,26 @@ static double fpu_work(void) {
     double acc = 0.0;
     for (int i = 1; i < 3000000; i++) acc += 1.0 / (double)i;
     return acc;
+}
+
+static sigjmp_buf fault_env;
+static volatile sig_atomic_t got_fpe, got_trap, got_segv;
+
+static void on_fpe(int sig) {
+    got_fpe = sig;
+    siglongjmp(fault_env, 1);
+}
+
+static void on_segv(int sig) {
+    got_segv = sig;
+    siglongjmp(fault_env, 1);
+}
+
+static void on_trap(int sig) { got_trap = sig; }
+
+/* A real idiv by zero: compilers turn 1 / x into a branch without dividing. */
+static void divide_by_zero(void) {
+    __asm__ volatile("xor %%ecx, %%ecx\n\tmov $1, %%eax\n\tcltd\n\tidiv %%ecx" ::: "eax", "ecx", "edx");
 }
 
 static int failures;
@@ -143,6 +164,27 @@ int main(void) {
     check("negative timer values fail with EINVAL", setitimer(ITIMER_REAL, &negative, NULL) == -1 && errno == EINVAL);
     alarm(UINT_MAX);
     check("alarm(UINT_MAX) is accepted", alarm(0) > 0);
+
+    /* CPU exceptions become signals that a handler can catch. */
+    handle(SIGFPE, on_fpe);
+    if (!sigsetjmp(fault_env, 1)) divide_by_zero();
+    check("division by zero raises a catchable SIGFPE", got_fpe == SIGFPE);
+    handle(SIGSEGV, on_segv);
+    if (!sigsetjmp(fault_env, 1)) *(volatile int *)16 = 1;
+    check("a bad pointer raises a catchable SIGSEGV", got_segv == SIGSEGV);
+    handle(SIGTRAP, on_trap);
+    __asm__ volatile("int3");
+    check("int3 raises SIGTRAP and execution continues", got_trap == SIGTRAP);
+    pid_t div = fork();
+    if (div == 0) {
+        signal(SIGFPE, SIG_DFL);
+        divide_by_zero();
+        _exit(0);
+    }
+    int st = 0;
+    while (waitpid(div, &st, 0) < 0 && errno == EINTR) {
+    }
+    check("an uncaught SIGFPE kills the process", WIFSIGNALED(st) && WTERMSIG(st) == SIGFPE);
 
     printf("sigtest: %s\n", failures ? "FAILED" : "all passed");
     return failures;

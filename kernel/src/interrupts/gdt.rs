@@ -1,29 +1,28 @@
-use lazy_static::lazy_static;
+//! Per-CPU GDT and TSS. Every CPU needs its own TSS (kernel stack for
+//! interrupts from ring 3, I/O permission bitmap, double-fault stack) and
+//! therefore its own GDT with a descriptor for it. The segment layout is the
+//! same on every CPU, so the selectors are constants.
+
+use x86_64::instructions::segmentation::{Segment, CS, DS, ES, SS};
+use x86_64::instructions::tables::load_tss;
 use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable, SegmentSelector};
 use x86_64::structures::tss::TaskStateSegment;
-use x86_64::VirtAddr;
+use x86_64::{PrivilegeLevel, VirtAddr};
 
 pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
-/// User selectors for assembly; `init` checks them against the GDT.
+pub const KERNEL_CS: u16 = 0x08;
+pub const KERNEL_SS: u16 = 0x10;
+/// Order is dictated by sysret: user data directly before user code.
 pub const USER_SS: u16 = 0x1b;
 pub const USER_CS: u16 = 0x23;
-
-const STACK_SIZE: usize = 4096 * 5;
-
-#[repr(align(16))]
-struct Stack {
-    _bytes: [u8; STACK_SIZE],
-}
-
-static mut DOUBLE_FAULT_STACK: Stack = Stack { _bytes: [0; STACK_SIZE] };
-static mut RING0_STACK: Stack = Stack { _bytes: [0; STACK_SIZE] };
-
-fn stack_top(stack: *const Stack) -> VirtAddr {
-    VirtAddr::from_ptr(stack) + STACK_SIZE as u64
-}
+const TSS_SELECTOR: u16 = 0x28;
 
 /// Size of the I/O permission bitmap: one bit per port, 0 = allowed.
 pub const IOMAP_BYTES: usize = 8192;
+const DOUBLE_FAULT_STACK: usize = 4096 * 5;
+
+#[repr(C, align(16))]
+struct Stack([u8; DOUBLE_FAULT_STACK]);
 
 /// The TSS with its I/O permission bitmap right behind it (where
 /// `iomap_base` points). The extra byte must stay 0xff.
@@ -33,90 +32,86 @@ struct TssWithIoMap {
     iomap: [u8; IOMAP_BYTES + 1],
 }
 
-// Mutable because rsp0 and the I/O bitmap change on every process switch.
-static mut TSS: TssWithIoMap = TssWithIoMap { tss: TaskStateSegment::new(), iomap: [0xff; IOMAP_BYTES + 1] };
-/// Whether the bitmap currently grants any port (to skip resetting it).
-static mut IOMAP_OPEN: bool = false;
-
-lazy_static! {
-    // Order is dictated by sysret: user data directly before user code.
-    static ref GDT: (GlobalDescriptorTable, Selectors) = {
-        let mut gdt = GlobalDescriptorTable::new();
-        let kernel_code = gdt.append(Descriptor::kernel_code_segment());
-        let kernel_data = gdt.append(Descriptor::kernel_data_segment());
-        let user_data = gdt.append(Descriptor::user_data_segment());
-        let user_code = gdt.append(Descriptor::user_code_segment());
-        let tss_ref: &'static TssWithIoMap = unsafe { &*(&raw const TSS) };
-        let tss = gdt.append(
-            Descriptor::tss_segment_with_iomap(&tss_ref.tss, &tss_ref.iomap).expect("TSS I/O bitmap layout"),
-        );
-        (
-            gdt,
-            Selectors {
-                kernel_code,
-                kernel_data,
-                user_data,
-                user_code,
-                tss,
-            },
-        )
-    };
+/// One CPU's descriptor tables. Lives in that CPU's `Cpu` block, which is
+/// never freed, so the CPU may keep pointing at it.
+#[repr(C)]
+pub struct CpuTables {
+    gdt: GlobalDescriptorTable,
+    tss: TssWithIoMap,
+    /// Whether the bitmap currently grants any port (to skip resetting it).
+    iomap_open: bool,
+    double_fault_stack: Stack,
 }
 
-#[derive(Clone, Copy)]
-pub struct Selectors {
-    pub kernel_code: SegmentSelector,
-    pub kernel_data: SegmentSelector,
-    pub user_data: SegmentSelector,
-    pub user_code: SegmentSelector,
-    tss: SegmentSelector,
-}
-
-pub fn selectors() -> Selectors {
-    GDT.1
-}
-
-pub fn init() {
-    use x86_64::instructions::segmentation::{Segment, CS, DS, ES, SS};
-    use x86_64::instructions::tables::load_tss;
-
-    unsafe {
-        let tss = &mut (*(&raw mut TSS)).tss;
-        tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] =
-            stack_top(&raw const DOUBLE_FAULT_STACK);
-        tss.privilege_stack_table[0] = stack_top(&raw const RING0_STACK);
+impl CpuTables {
+    pub const fn new() -> Self {
+        CpuTables {
+            gdt: GlobalDescriptorTable::new(),
+            tss: TssWithIoMap { tss: TaskStateSegment::new(), iomap: [0xff; IOMAP_BYTES + 1] },
+            iomap_open: false,
+            double_fault_stack: Stack([0; DOUBLE_FAULT_STACK]),
+        }
     }
-    assert_eq!((GDT.1.user_data.0, GDT.1.user_code.0), (USER_SS, USER_CS));
-    GDT.0.load();
-    unsafe {
-        CS::set_reg(GDT.1.kernel_code);
-        SS::set_reg(GDT.1.kernel_data);
-        DS::set_reg(GDT.1.kernel_data);
-        ES::set_reg(GDT.1.kernel_data);
-        load_tss(GDT.1.tss);
+
+    /// Builds the GDT and TSS and loads them on the calling CPU.
+    pub fn load(&'static mut self) {
+        let df_top = VirtAddr::from_ptr(&self.double_fault_stack) + DOUBLE_FAULT_STACK as u64;
+        self.tss.tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = df_top;
+        let tss: &'static TssWithIoMap = unsafe { &*(&raw const self.tss) };
+        let gdt = &mut self.gdt;
+        let selectors = [
+            gdt.append(Descriptor::kernel_code_segment()),
+            gdt.append(Descriptor::kernel_data_segment()),
+            gdt.append(Descriptor::user_data_segment()),
+            gdt.append(Descriptor::user_code_segment()),
+            gdt.append(Descriptor::tss_segment_with_iomap(&tss.tss, &tss.iomap).expect("TSS I/O bitmap layout")),
+        ];
+        assert_eq!(selectors.map(|s| s.0), [KERNEL_CS, KERNEL_SS, USER_SS, USER_CS, TSS_SELECTOR]);
+        let gdt: &'static GlobalDescriptorTable = unsafe { &*(&raw const self.gdt) };
+        gdt.load();
+        unsafe {
+            CS::set_reg(SegmentSelector::new(KERNEL_CS >> 3, PrivilegeLevel::Ring0));
+            SS::set_reg(SegmentSelector::new(KERNEL_SS >> 3, PrivilegeLevel::Ring0));
+            DS::set_reg(SegmentSelector::new(KERNEL_SS >> 3, PrivilegeLevel::Ring0));
+            ES::set_reg(SegmentSelector::new(KERNEL_SS >> 3, PrivilegeLevel::Ring0));
+            load_tss(SegmentSelector::new(TSS_SELECTOR >> 3, PrivilegeLevel::Ring0));
+        }
     }
-}
 
-/// Stack the CPU switches to on interrupts from ring 3.
-pub fn set_kernel_stack(top: VirtAddr) {
-    unsafe { (*(&raw mut TSS)).tss.privilege_stack_table[0] = top };
-}
+    /// Stack the CPU switches to on interrupts from ring 3.
+    pub fn set_kernel_stack(&mut self, top: u64) {
+        self.tss.tss.privilege_stack_table[0] = VirtAddr::new(top);
+    }
 
-/// Installs the I/O permission bitmap of the process about to run; `None`
-/// denies every port.
-pub fn set_io_bitmap(bitmap: Option<&[u8; IOMAP_BYTES]>) {
-    unsafe {
-        let iomap = &mut (*(&raw mut TSS)).iomap;
+    /// Installs the I/O permission bitmap of the process about to run;
+    /// `None` denies every port.
+    pub fn set_io_bitmap(&mut self, bitmap: Option<&[u8; IOMAP_BYTES]>) {
         match bitmap {
             Some(b) => {
-                iomap[..IOMAP_BYTES].copy_from_slice(b);
-                IOMAP_OPEN = true;
+                self.tss.iomap[..IOMAP_BYTES].copy_from_slice(b);
+                self.iomap_open = true;
             }
-            None if IOMAP_OPEN => {
-                iomap[..IOMAP_BYTES].fill(0xff);
-                IOMAP_OPEN = false;
+            None if self.iomap_open => {
+                self.tss.iomap[..IOMAP_BYTES].fill(0xff);
+                self.iomap_open = false;
             }
             None => {}
         }
     }
+}
+
+pub fn kernel_code() -> SegmentSelector {
+    SegmentSelector::new(KERNEL_CS >> 3, PrivilegeLevel::Ring0)
+}
+
+pub fn kernel_data() -> SegmentSelector {
+    SegmentSelector::new(KERNEL_SS >> 3, PrivilegeLevel::Ring0)
+}
+
+pub fn user_code() -> SegmentSelector {
+    SegmentSelector::new(USER_CS >> 3, PrivilegeLevel::Ring3)
+}
+
+pub fn user_data() -> SegmentSelector {
+    SegmentSelector::new(USER_SS >> 3, PrivilegeLevel::Ring3)
 }

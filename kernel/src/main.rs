@@ -17,6 +17,7 @@ mod memory;
 mod net;
 mod process;
 mod shell;
+pub mod smp;
 pub mod sync;
 
 pub static BOOTLOADER_CONFIG: BootloaderConfig = {
@@ -29,6 +30,7 @@ pub static BOOTLOADER_CONFIG: BootloaderConfig = {
 entry_point!(kernel_main, config = &BOOTLOADER_CONFIG);
 
 fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
+    smp::init_bsp();
     drivers::serial::init();
     if let Some(fb) = boot_info.framebuffer.as_mut() {
         drivers::console::init(fb);
@@ -46,6 +48,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     interrupts::init_controllers(rsdp, process::TIMER_HZ);
     drivers::rtc::init();
     fs::init(ramdisk);
+    if fs::resolve("/", "/etc/autorun", true).is_ok() {
+        TEST_MODE.store(true, core::sync::atomic::Ordering::Relaxed);
+    }
     process::init();
     // Only now: the timer interrupt needs the scheduler.
     x86_64::instructions::interrupts::enable();
@@ -128,9 +133,16 @@ pub fn restart() -> ! {
     }
 }
 
+/// Set in test mode (an /etc/autorun exists): a panic then ends QEMU with a
+/// failure instead of hanging until the test's timeout.
+pub static TEST_MODE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     printkln!("KERNEL PANIC: {}", info);
+    if TEST_MODE.load(core::sync::atomic::Ordering::Relaxed) {
+        power_off(1);
+    }
     loop {
         x86_64::instructions::hlt();
     }

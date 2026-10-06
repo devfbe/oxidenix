@@ -1,4 +1,5 @@
 pub mod apic;
+pub mod entry;
 pub mod gdt;
 pub mod handlers;
 
@@ -8,32 +9,50 @@ use x86_64::structures::idt::InterruptDescriptorTable;
 lazy_static! {
     static ref IDT: InterruptDescriptorTable = {
         let mut idt = InterruptDescriptorTable::new();
-        idt.breakpoint.set_handler_fn(handlers::breakpoint_handler);
         unsafe {
             idt.double_fault
                 .set_handler_fn(handlers::double_fault_handler)
                 .set_stack_index(gdt::DOUBLE_FAULT_IST_INDEX);
         }
-        idt.page_fault.set_handler_fn(handlers::page_fault_handler);
-        idt.general_protection_fault
-            .set_handler_fn(handlers::general_protection_handler);
-        idt.invalid_opcode.set_handler_fn(handlers::invalid_opcode_handler);
-        unsafe {
-            idt[apic::TIMER_VECTOR]
-                .set_handler_addr(x86_64::VirtAddr::new(handlers::timer_entry as *const () as u64));
+        idt.non_maskable_interrupt.set_handler_fn(handlers::nmi_handler);
+        for &(vector, stub) in entry::stubs() {
+            let addr = x86_64::VirtAddr::new(stub as usize as u64);
+            // The crate only exposes exceptions through named fields.
+            let options = unsafe {
+                match vector {
+                    0 => idt.divide_error.set_handler_addr(addr),
+                    1 => idt.debug.set_handler_addr(addr),
+                    3 => idt.breakpoint.set_handler_addr(addr),
+                    4 => idt.overflow.set_handler_addr(addr),
+                    5 => idt.bound_range_exceeded.set_handler_addr(addr),
+                    6 => idt.invalid_opcode.set_handler_addr(addr),
+                    7 => idt.device_not_available.set_handler_addr(addr),
+                    10 => idt.invalid_tss.set_handler_addr(addr),
+                    11 => idt.segment_not_present.set_handler_addr(addr),
+                    12 => idt.stack_segment_fault.set_handler_addr(addr),
+                    13 => idt.general_protection_fault.set_handler_addr(addr),
+                    14 => idt.page_fault.set_handler_addr(addr),
+                    16 => idt.x87_floating_point.set_handler_addr(addr),
+                    17 => idt.alignment_check.set_handler_addr(addr),
+                    18 => idt.machine_check.set_handler_addr(addr),
+                    19 => idt.simd_floating_point.set_handler_addr(addr),
+                    20 => idt.virtualization.set_handler_addr(addr),
+                    21 => idt.cp_protection_exception.set_handler_addr(addr),
+                    v => idt[v].set_handler_addr(addr),
+                }
+            };
+            // int3 from user space (debuggers, abort()) must be allowed.
+            if vector == 3 {
+                options.set_privilege_level(x86_64::PrivilegeLevel::Ring3);
+            }
         }
-        for (gsi, &handler) in handlers::GSI_HANDLERS.iter().enumerate() {
-            idt[apic::IRQ_BASE + gsi as u8].set_handler_fn(handler);
-        }
-        idt[apic::SPURIOUS_VECTOR].set_handler_fn(handlers::spurious_handler);
         idt
     };
 }
 
-/// GDT, TSS and IDT of the bootstrap CPU. The interrupt controllers come
+/// Loads the (shared) IDT on the calling CPU. The interrupt controllers come
 /// later (`init_controllers`), once memory and ACPI are available.
 pub fn init() {
-    gdt::init();
     IDT.load();
     unsafe { drain_ps2_output() };
 }

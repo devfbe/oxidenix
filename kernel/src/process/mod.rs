@@ -302,7 +302,7 @@ pub fn ioperm(from: u64, count: u64, on: u64) -> SysResult {
                 bitmap[byte] |= bit;
             }
         }
-        gdt::set_io_bitmap(Some(bitmap));
+        crate::smp::cpu().tables().set_io_bitmap(Some(bitmap));
         Ok(0)
     })
 }
@@ -743,7 +743,7 @@ pub fn exec(frame: &mut Frame, path: &str, args: &[String], envs: &[String]) -> 
         p.privileged = false;
         p.io_bitmap = None;
         p.server = None;
-        gdt::set_io_bitmap(None);
+        crate::smp::cpu().tables().set_io_bitmap(None);
         p.fds
             .iter_mut()
             .filter(|e| e.as_ref().is_some_and(|e| e.cloexec))
@@ -901,11 +901,11 @@ fn switch_to(next: Pid) {
         Some(space) => space.activate(),
         None => unsafe { Cr3::write(crate::memory::kernel_l4(), Cr3Flags::empty()) },
     }
+    let cpu = crate::smp::cpu();
     if let Some(top) = n.kstack_top() {
-        gdt::set_kernel_stack(VirtAddr::new(top));
-        syscall::set_kernel_stack(top);
+        cpu.set_kernel_stack(top);
     }
-    gdt::set_io_bitmap(n.io_bitmap.as_deref());
+    cpu.tables().set_io_bitmap(n.io_bitmap.as_deref());
     FsBase::write(VirtAddr::new(n.fs_base));
     unsafe { fxrstor(&n.fpu) };
     let next_rsp = n.kernel_rsp;

@@ -7,14 +7,10 @@ use x86_64::registers::model_specific::{Efer, EferFlags, FsBase, LStar, SFMask, 
 use x86_64::registers::rflags::RFlags;
 use x86_64::VirtAddr;
 
-#[unsafe(no_mangle)]
-static mut SYSCALL_STACK_TOP: u64 = 0;
-#[unsafe(no_mangle)]
-static mut SYSCALL_USER_RSP: u64 = 0;
-
-/// Complete user register state. The tail (rip..ss) is exactly what the CPU
-/// pushes on an interrupt from ring 3, so syscalls and interrupts share this
-/// layout and both return through `user_return` (iretq).
+/// Complete register state at a kernel entry. The tail (rip..ss) is exactly
+/// what the CPU pushes on an interrupt from ring 3; `vector` and `error`
+/// identify the interrupt or exception (syscalls use `SYSCALL_VECTOR`). All
+/// entries share this layout and return through `user_return` (iretq).
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct Frame {
@@ -33,6 +29,8 @@ pub struct Frame {
     pub r13: u64,
     pub r14: u64,
     pub r15: u64,
+    pub vector: u64,
+    pub error: u64,
     pub rip: u64,
     pub cs: u64,
     pub rflags: u64,
@@ -57,9 +55,12 @@ impl Frame {
     }
 }
 
+/// Marks frames built by `syscall_entry` (not a real interrupt vector).
+pub const SYSCALL_VECTOR: u64 = 0x100;
+
+/// Syscall MSRs of the calling CPU.
 pub fn init() {
-    let s = gdt::selectors();
-    Star::write(s.user_code, s.user_data, s.kernel_code, s.kernel_data)
+    Star::write(gdt::user_code(), gdt::user_data(), gdt::kernel_code(), gdt::kernel_data())
         .expect("GDT layout does not match syscall/sysret");
     LStar::write(VirtAddr::new(syscall_entry as *const () as u64));
     // Clear IF: the kernel is not preemptive, syscalls run without IRQs.
@@ -67,22 +68,22 @@ pub fn init() {
     unsafe { Efer::update(|f| *f |= EferFlags::SYSTEM_CALL_EXTENSIONS) };
 }
 
-pub fn set_kernel_stack(top: u64) {
-    unsafe { SYSCALL_STACK_TOP = top };
-}
-
 /// Builds a `Frame` on the kernel stack (iret part first, as an interrupt
-/// would) and dispatches the syscall.
+/// would) and dispatches the syscall. Interrupts are off (SFMASK), so
+/// nothing can run between `swapgs` and the switch to the kernel stack.
 #[unsafe(naked)]
 unsafe extern "C" fn syscall_entry() {
     core::arch::naked_asm!(
-        "mov [rip + SYSCALL_USER_RSP], rsp",
-        "mov rsp, [rip + SYSCALL_STACK_TOP]",
+        "swapgs",
+        "mov gs:[{user_rsp}], rsp",
+        "mov rsp, gs:[{kernel_stack}]",
         "push {ss}",
-        "push qword ptr [rip + SYSCALL_USER_RSP]",
+        "push qword ptr gs:[{user_rsp}]",
         "push r11",
         "push {cs}",
         "push rcx",
+        "push 0",
+        "push {vector}",
         "push r15",
         "push r14",
         "push r13",
@@ -103,16 +104,25 @@ unsafe extern "C" fn syscall_entry() {
         "jmp {ret}",
         ss = const gdt::USER_SS,
         cs = const gdt::USER_CS,
+        user_rsp = const crate::smp::USER_RSP_OFFSET,
+        kernel_stack = const crate::smp::KERNEL_STACK_OFFSET,
+        vector = const SYSCALL_VECTOR,
         dispatch = sym dispatch,
         ret = sym user_return,
     );
 }
 
 /// Restores the `Frame` at rsp and returns with iretq. Used after syscalls,
-/// after interrupts from ring 3, and as the first entry of new processes.
+/// after interrupts and exceptions, and as the first entry of new
+/// processes. Returning to ring 3 swaps the user's GS base back in.
 #[unsafe(naked)]
 pub unsafe extern "C" fn user_return() {
     core::arch::naked_asm!(
+        "cli",
+        "test byte ptr [rsp + {cs}], 3",
+        "jz 2f",
+        "swapgs",
+        "2:",
         "pop rax",
         "pop rbx",
         "pop rcx",
@@ -128,7 +138,9 @@ pub unsafe extern "C" fn user_return() {
         "pop r13",
         "pop r14",
         "pop r15",
+        "add rsp, 16",
         "iretq",
+        cs = const crate::interrupts::entry::FRAME_CS_OFFSET,
     );
 }
 

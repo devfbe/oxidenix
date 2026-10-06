@@ -10,7 +10,12 @@ use x86_64::instructions::interrupts;
 
 pub const SIGINT: u32 = 2;
 pub const SIGQUIT: u32 = 3;
+pub const SIGILL: u32 = 4;
+pub const SIGTRAP: u32 = 5;
+pub const SIGBUS: u32 = 7;
+pub const SIGFPE: u32 = 8;
 pub const SIGKILL: u32 = 9;
+pub const SIGSEGV: u32 = 11;
 pub const SIGALRM: u32 = 14;
 pub const SIGCHLD: u32 = 17;
 pub const SIGCONT: u32 = 18;
@@ -127,6 +132,23 @@ pub fn check_tty_read(foreground: Pid) -> Result<(), i64> {
         let pgid = p.pgid;
         send_group(pgid, SIGTTIN);
         Err(EINTR)
+    })
+}
+
+/// Raises `sig` for a fault of the current process (a CPU exception). Such
+/// a signal can be neither blocked nor ignored: as on Linux, the action is
+/// reset to the default (terminate) in that case. Returns whether the
+/// process will die of it (no handler).
+pub fn force(sig: u32) -> bool {
+    interrupts::without_interrupts(|| {
+        let p = sched().cur();
+        let action = &mut p.signals.actions[sig as usize - 1];
+        if p.signals.mask & bit(sig) != 0 || action.handler == SIG_IGN {
+            *action = SigAction::default();
+            p.signals.mask &= !bit(sig);
+        }
+        p.signals.pending |= bit(sig);
+        action.handler == SIG_DFL
     })
 }
 

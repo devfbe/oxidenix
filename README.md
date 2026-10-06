@@ -148,7 +148,9 @@ oxidenix/
 │   ├── build.rs                 turns the logo into raw pixels for the kernel
 │   └── src/
 │       ├── main.rs              entry point, boot configuration, init order
-│       ├── interrupts/          GDT/TSS (gdt.rs), IDT (mod.rs), local and I/O APIC
+│       ├── smp.rs               per-CPU blocks (GS base), CPU registry
+│       ├── interrupts/          per-CPU GDT/TSS (gdt.rs), IDT (mod.rs), entry stubs and
+│       │                        the trap dispatcher (entry.rs, handlers.rs), local and I/O APIC
 │       │                        with timer calibration (apic.rs),
 │       │                        exception, timer and keyboard handlers (handlers.rs)
 │       ├── memory/              physical frame allocator with refcounts (frame.rs),
@@ -256,11 +258,20 @@ About 7,467 lines of Rust in the kernel and 2,965 in the servers, their librarie
 
 ### System call path
 
-- `syscall` enters `syscall_entry`, which switches to the process's kernel stack and builds a
-  **20-word frame**: all general-purpose registers plus `rip, cs, rflags, rsp, ss`. That tail is
-  exactly what the CPU pushes on an interrupt from ring 3.
-- The timer interrupt has its own assembly entry that completes the CPU frame to the same layout.
-- Both paths return through `user_return`, which uses **`iretq`** (not `sysret`). A signal can
+- **Per-CPU data**: each CPU has a `Cpu` block (`smp.rs`) with its own GDT, TSS (kernel stack,
+  I/O permission bitmap, double-fault stack) and entry scratch space. In the kernel, the GS base
+  points to it; every entry from ring 3 executes `swapgs` and every return to ring 3 swaps back
+  (the user's GS base is always 0).
+- `syscall` enters `syscall_entry`, which switches to the running task's kernel stack (from the
+  `Cpu` block) and builds a **22-word frame**: all general-purpose registers, the vector and
+  error code, and `rip, cs, rflags, rsp, ss`. That tail is exactly what the CPU pushes on an
+  interrupt from ring 3.
+- **Every interrupt and exception** (except NMI and double fault) enters through a per-vector
+  stub (`interrupts/entry.rs`) that builds the same frame and calls one dispatcher, `trap`. CPU
+  exceptions in user code become signals as on Linux (`SIGSEGV`, `SIGFPE`, `SIGILL`, `SIGBUS`,
+  `SIGTRAP`); they cannot be blocked or ignored, but a handler can catch them. In the kernel
+  they panic with the faulting address. In test mode a panic ends QEMU with a failure.
+- All paths return through `user_return`, which uses **`iretq`** (not `sysret`). A signal can
   therefore interrupt user code at any instruction and `rt_sigreturn` restores every register
   exactly, and the classic `sysret` non-canonical-address problem cannot occur.
 - The dispatch table maps Linux x86_64 syscall numbers to Rust functions returning
@@ -474,7 +485,7 @@ Each of these programs and scripts lives in the root filesystem and runs inside 
 |---|---|
 | `cowtest` | copy-on-write isolation between parent and child, kernel writes into shared pages, 50 forks, shared read-only frames under `brk` |
 | `oomtest` | fork bomb (stops at the process limit), memory exhaustion via `mmap`, 100 full pipes; the kernel survives and memory is reusable |
-| `sigtest` | handlers, killing a busy loop, `SIGCHLD`, `EINTR` on pipe reads, blocked and ignored signals, FPU state across asynchronous handlers, `alarm` and repeating `setitimer` |
+| `sigtest` | handlers, killing a busy loop, `SIGCHLD`, `EINTR` on pipe reads, blocked and ignored signals, FPU state across asynchronous handlers, `alarm` and repeating `setitimer`, catchable `SIGFPE`/`SIGSEGV`/`SIGTRAP` from CPU exceptions, an uncaught `SIGFPE` killing the process |
 | `jobtest` | stop/continue reporting through `wait4`, restart of a stopped `read()`, `SIGKILL` on stopped processes, `SA_RESTART` |
 | `forktest` | `fork`, `execve`, `wait4`, preemptive interleaving of two workers |
 | `nettest` | TCP to an echo service through QEMU, `ECONNREFUSED`, `listen`/`accept` over loopback with a forked client, EOF after the peer closed, non-blocking `accept` and `connect` with `poll` and `SO_ERROR`, `EINTR` in a blocking `recv`, UDP over loopback, raw ICMP echo to the gateway and over loopback, source address for off-subnet destinations, overflowing message vectors, `AF_INET6` rejected |

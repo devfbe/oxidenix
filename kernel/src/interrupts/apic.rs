@@ -230,6 +230,7 @@ pub fn init(hz: u64) -> Result<(), &'static str> {
     }
     disable_pics();
     BSP_APIC_ID.store(id(), Ordering::Relaxed);
+    crate::smp::set_apic_id(id());
     TIMER_COUNT.store(calibrate(hz), Ordering::Relaxed);
     init_local();
     Ok(())
