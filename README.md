@@ -16,7 +16,7 @@ disk driver and the ext2 filesystem already run as a user-space server.
 ![Status](https://img.shields.io/badge/status-research%20project-purple)
 ![License](https://img.shields.io/badge/license-GPL--3.0-blue)
 
-![oxidenix running GNU Bash in QEMU](docs/images/oxidenix-bash.png)
+![oxidenix booting in QEMU and running a few commands in GNU Bash](docs/images/oxidenix-demo.gif)
 
 </div>
 
