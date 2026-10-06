@@ -86,7 +86,11 @@ fn exception(frame: &mut Frame) {
         // fault there is handled like the user's own, and if the access is
         // not allowed the copy ends early (EFAULT) instead of the kernel.
         let fixup = if frame.from_user() { None } else { crate::process::uaccess::fixup(frame.rip) };
-        if frame.from_user() || (fixup.is_some() && addr < USER_END) {
+        if let Some(f) = fixup.as_ref().filter(|f| !f.resolve || addr >= USER_END) {
+            frame.rip = f.to;
+            return;
+        }
+        if frame.from_user() || fixup.is_some() {
             // Resolving the fault may sleep (the address space is locked, a
             // file page may be read); the interrupted code had interrupts on.
             if frame.rflags & 0x200 != 0 {
@@ -95,7 +99,7 @@ fn exception(frame: &mut Frame) {
             match handle_fault(addr, access) {
                 Ok(()) => return,
                 Err(_) if fixup.is_some() => {
-                    frame.rip = fixup.expect("checked");
+                    frame.rip = fixup.expect("checked").to;
                     return;
                 }
                 Err(Fault::Bus) => sig = signal::SIGBUS,

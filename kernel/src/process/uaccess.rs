@@ -18,10 +18,12 @@ use alloc::vec::Vec;
 pub const CHUNK: usize = 64 * 1024;
 
 unsafe extern "C" {
-    /// The instruction in `copy_user` that may fault, and where to resume
-    /// when the fault cannot be satisfied.
+    /// The instructions below that may fault, and where to resume when the
+    /// fault cannot (or must not) be satisfied.
     static uaccess_copy_insn: u8;
     static uaccess_copy_fixup: u8;
+    static uaccess_load32_insn: u8;
+    static uaccess_load32_fixup: u8;
 }
 
 /// Copies `len` bytes and returns how many were *not* copied (0: all).
@@ -42,11 +44,54 @@ unsafe extern "sysv64" fn copy_user(dst: *mut u8, src: *const u8, len: usize) ->
     );
 }
 
-/// Where the page fault handler resumes after a fault at `rip` that it
-/// could not satisfy, if `rip` is a user-memory access of the kernel.
-pub fn fixup(rip: u64) -> Option<u64> {
-    let insn = &raw const uaccess_copy_insn as u64;
-    (rip == insn).then(|| &raw const uaccess_copy_fixup as u64)
+/// Loads a u32 into `*out`; returns 1 (and leaves `out`) on a fault, which
+/// is never resolved (see `read_u32_atomic`).
+#[unsafe(naked)]
+unsafe extern "sysv64" fn load32(src: *const u32, out: *mut u32) -> u64 {
+    core::arch::naked_asm!(
+        ".globl uaccess_load32_insn",
+        "uaccess_load32_insn:",
+        "mov eax, dword ptr [rdi]",
+        "mov dword ptr [rsi], eax",
+        "xor eax, eax",
+        "ret",
+        ".globl uaccess_load32_fixup",
+        "uaccess_load32_fixup:",
+        "mov eax, 1",
+        "ret",
+    );
+}
+
+/// A kernel access to user memory that faulted: where to resume if the
+/// fault is not satisfied, and whether to try (faults in `read_u32_atomic`
+/// are not resolved: it runs with spinlocks held).
+pub struct Fixup {
+    pub to: u64,
+    pub resolve: bool,
+}
+
+/// The fixup for a page fault at `rip`, if `rip` is one of the kernel's
+/// accesses to user memory.
+pub fn fixup(rip: u64) -> Option<Fixup> {
+    if rip == &raw const uaccess_copy_insn as u64 {
+        Some(Fixup { to: &raw const uaccess_copy_fixup as u64, resolve: true })
+    } else if rip == &raw const uaccess_load32_insn as u64 {
+        Some(Fixup { to: &raw const uaccess_load32_fixup as u64, resolve: false })
+    } else {
+        None
+    }
+}
+
+/// Reads an aligned u32 with one load and without resolving page faults,
+/// so it may run with a spinlock held (futexes compare the value under
+/// their bucket lock). None if the page is not readable right now: the
+/// caller drops its locks, faults the page in with `read` and retries.
+pub fn read_u32_atomic(ptr: u64) -> Option<u32> {
+    if ptr % 4 != 0 || range_ok(ptr, 4).is_err() {
+        return None;
+    }
+    let mut v = 0u32;
+    (unsafe { load32(ptr as *const u32, &mut v) } == 0).then_some(v)
 }
 
 fn range_ok(ptr: u64, len: usize) -> Result<(), i64> {

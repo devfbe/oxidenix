@@ -268,6 +268,7 @@ extern "sysv64" fn dispatch(f: &mut Frame) {
         1005 => super::query::proc_query(a0, a1, a2, a3),
         200 => signal::kill(a0 as i64, a1),            // tkill
         234 => signal::kill(a1 as i64, a2),            // tgkill
+        202 => super::futex::futex(a0, a1, a2, a3, a4, a5),
         217 => sys_file::getdents64(a0, a1, a2),
         228 => clock_gettime(a0, a1),
         257 => sys_file::openat(a0, a1, a2, a3),

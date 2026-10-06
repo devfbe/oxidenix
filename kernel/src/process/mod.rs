@@ -1,6 +1,7 @@
 pub mod address_space;
 pub mod elf;
 pub mod errno;
+mod futex;
 pub mod ipc;
 pub mod irq;
 mod loader;

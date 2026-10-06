@@ -109,7 +109,7 @@ The kernel boots straight into Bash. Things to try:
 
 ```sh
 ls -l /bin | head          # BusyBox applets
-cowtest; vmtest; sigtest; jobtest; oomtest; fstest; forktest; nettest; smptest # self-tests
+cowtest; vmtest; futextest; sigtest; jobtest; oomtest; fstest; forktest; nettest; smptest # self-tests
 nproc; cat /proc/cpuinfo   # 4 CPUs; 'cpus' in the kernel monitor shows their load
 wget -O - http://example.com # DNS and HTTP through netd; nslookup and nc work as well
 ping -c 3 1.1.1.1          # raw ICMP sockets; oxidenix answers pings itself, too
@@ -174,6 +174,7 @@ oxidenix/
 │       │   ├── sys_mem.rs       brk, mmap, mprotect, mremap
 │       │   ├── sys_net.rs       socket syscalls (sockaddr_in, msghdr, options)
 │       │   ├── signal.rs        signal state, delivery, sigreturn, kill
+│       │   ├── futex.rs         futex wait queues keyed by address space or shared object
 │       │   ├── loader.rs        ELF loading and the Linux initial stack
 │       │   ├── elf.rs           ELF64 parser
 │       │   ├── ipc.rs           services and message passing
@@ -274,6 +275,11 @@ About 9,200 lines of Rust (without comments and blank lines) in the kernel and 3
   runs at a time, and a CPU waiting with interrupts off serves requests addressed to it itself,
   so shooters never deadlock. Unmapping walks only the page tables that exist, so huge sparse
   reservations cost what is mapped in them.
+- **futex** (`futex.rs`): a futex is keyed by the address space and address, or, in shared
+  memory, by the shared object and offset, so processes meet whatever address they mapped it at.
+  A waiter compares the word under its hash bucket's lock with a load that never resolves page
+  faults (if the page is missing it drops the lock, faults it in and retries), so the check and
+  the enqueue are atomic with respect to a waker.
 - **Out of memory is an error, not a panic**: the kernel heap grows by mapping more frames
   when an allocation fails. User memory (pages, page tables, kernel stacks for `fork`) may not
   take the last 16 MiB of RAM, which stay reserved for the heap. Large allocations that user space
@@ -549,6 +555,7 @@ Linux x86_64 numbers, grouped by area (about 120 in total):
 | CPUs | `sched_getaffinity` `sched_setaffinity` `getcpu` |
 | Processes | `fork` `vfork` (as `fork`) `execve` `exit` `exit_group` `wait4` `getpid` `getppid` `gettid` `set_tid_address` `sched_yield` `arch_prctl` `prlimit64` `getrusage` |
 | Groups and IDs | `setpgid` `getpgid` `getpgrp` `setsid` `getsid` `getuid` `geteuid` `getgid` `getegid` `getresuid` `getresgid` `setuid` `setgid` |
+| Synchronization | `futex` (`WAIT`, `WAKE`, `WAIT_BITSET`, `WAKE_BITSET`, `REQUEUE`, `CMP_REQUEUE`; private and shared, monotonic and realtime timeouts) |
 | Signals | `rt_sigaction` `rt_sigprocmask` `rt_sigreturn` `kill` `tkill` `tgkill` `pause` `sigaltstack` `alarm` `setitimer` `getitimer` (`ITIMER_REAL`, 10 ms resolution) `rt_sigtimedwait` |
 | Process control | `prctl` (name, parent-death signal, dumpable, no-new-privs, capability bounding set) `capget` `capset` (everything runs as root with every capability) |
 | Filesystems | `statfs` `fstatfs` `sync` `fsync` `fdatasync` |
@@ -577,6 +584,7 @@ Each of these programs and scripts lives in the root filesystem and runs inside 
 | `jobtest` | stop/continue reporting through `wait4`, restart of a stopped `read()`, `SIGKILL` on stopped processes, `SA_RESTART` |
 | `forktest` | `fork`, `execve`, `wait4`, preemptive interleaving of two workers |
 | `proctest` | `prctl` name round-trip, `capget`/`capset` versions and the full capability set, no-new-privs, `PR_SET_PDEATHSIG` delivered to an orphan (via `sigwait`); `/proc` as htop reads it (directory fds with `O_PATH` and `openat`), `/proc/self`, the formats of `stat`, `meminfo`, `loadavg`, `uptime` and `/proc/<pid>/{stat,cmdline,exe}`, `sysinfo`, the CPU list in `/sys`, read-only `/proc` |
+| `futextest` | `FUTEX_WAIT` on a changed value (`EAGAIN`), timeouts, `EINVAL`/`EFAULT`, interruption by a signal (`EINTR`), shared futexes across processes, private memory keeping separate keys after `fork`, bitsets, `FUTEX_CMP_REQUEUE` |
 | `vmtest` | demand paging (a 64 MiB mapping costs nothing until touched), `SIGSEGV` on read-only and `PROT_NONE` pages with contents kept, split areas after a partial `munmap`, NX and the JIT pattern (1 GiB `PROT_NONE` reservation, write code, `mprotect` to executable, call it), commit limit and `MAP_NORESERVE`, `mremap` in place and moving, `MADV_DONTNEED`, shared vs. private memory across `fork`, lazy file mappings and `SIGBUS` beyond the end, `MAP_FIXED_NOREPLACE`, stack growth to 4 MiB and overflow beyond 8 MiB |
 | `smptest` | CPU count and affinity (pinning to every CPU, empty masks), parallel speed-up of CPU-bound processes, `fork`/`exit`/`wait` on every CPU at once, 5000 pipe round trips between two CPUs, signals to a process running on another CPU, no lost timer ticks while a program floods the console with palette changes on the timekeeping CPU |
 | `nettest` | TCP to an echo service through QEMU, `ECONNREFUSED`, `listen`/`accept` over loopback with a forked client, EOF after the peer closed, non-blocking `accept` and `connect` with `poll` and `SO_ERROR`, `EINTR` in a blocking `recv`, UDP over loopback, raw ICMP echo to the gateway and over loopback, source address for off-subnet destinations, overflowing message vectors, `AF_INET6` rejected |

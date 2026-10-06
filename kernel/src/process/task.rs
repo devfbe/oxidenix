@@ -152,6 +152,10 @@ pub struct Task {
     pub wake_at: AtomicU64,
     /// Serializes wakeups with the task descheduling itself.
     pub wake_lock: IrqSpinLock<()>,
+    /// futex wait: set by the waker that dequeued it, and the hash bucket
+    /// it waits in (a requeue may move it).
+    pub futex_woken: AtomicBool,
+    pub futex_bucket: AtomicUsize,
     /// Timer ticks spent in user mode and in the kernel, and the tick it
     /// was created at.
     pub utime: AtomicU64,
@@ -188,6 +192,8 @@ impl Task {
             wait_chan: AtomicUsize::new(0),
             wake_at: AtomicU64::new(0),
             wake_lock: IrqSpinLock::new(()),
+            futex_woken: AtomicBool::new(false),
+            futex_bucket: AtomicUsize::new(0),
             utime: AtomicU64::new(0),
             stime: AtomicU64::new(0),
             start_ticks: super::sched::ticks(),
