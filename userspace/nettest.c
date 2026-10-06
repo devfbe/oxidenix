@@ -125,6 +125,16 @@ int main(void) {
     check("poll reports the connection writable, SO_ERROR 0", r == 1 && (p.revents & POLLOUT) && err == 0);
     close(fd);
 
+    /* Off-subnet destinations get the DHCP address as source, never 127.0.0.1. */
+    fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    a = addr("192.0.2.1", 80);
+    connect(fd, (struct sockaddr *)&a, sizeof a);
+    struct sockaddr_in src;
+    socklen_t slen = sizeof src;
+    getsockname(fd, (struct sockaddr *)&src, &slen);
+    check("off-subnet connections come from the DHCP address", src.sin_addr.s_addr == inet_addr("10.0.2.15"));
+    close(fd);
+
     /* A blocking recv is interrupted by a signal. */
     fd = tcp_connect("10.0.2.100", 7);
     struct sigaction sa = {0};

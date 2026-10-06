@@ -83,10 +83,12 @@ fn main(args: Vec<&'static str>) -> i32 {
         service.progress(&mut iface, &mut sockets, now());
         match sockets.get_mut::<dhcpv4::Socket>(dhcp).poll() {
             Some(dhcpv4::Event::Configured(c)) => {
+                // smoltcp sends from the first address unless the destination
+                // shares a subnet with another one, so loopback goes last.
                 iface.update_ip_addrs(|addrs| {
                     addrs.clear();
-                    let _ = addrs.push(IpCidr::Ipv4(LOOPBACK));
                     let _ = addrs.push(IpCidr::Ipv4(c.address));
+                    let _ = addrs.push(IpCidr::Ipv4(LOOPBACK));
                 });
                 nic.address = c.address.address().to_bits();
                 match c.router {
