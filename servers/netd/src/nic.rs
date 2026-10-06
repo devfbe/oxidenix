@@ -36,6 +36,17 @@ fn u32_at(f: &[u8], o: usize) -> u32 {
     u32::from_be_bytes([f[o], f[o + 1], f[o + 2], f[o + 3]])
 }
 
+/// A frame from the wire with a loopback (127.0.0.0/8) source or
+/// destination: never legitimate, and it must not reach services that
+/// listen on 127.0.0.1 (smoltcp treats that as one of its addresses).
+fn is_martian(frame: &[u8]) -> bool {
+    let loopback = |ip: u32| ip >> 24 == 127;
+    match frame.len() >= 42 && u16_at(frame, 12) == ETHERTYPE_ARP {
+        true => loopback(u32_at(frame, 28)) || loopback(u32_at(frame, 38)),
+        false => frame.len() >= 34 && u16_at(frame, 12) == ETHERTYPE_IPV4 && (loopback(u32_at(frame, 26)) || loopback(u32_at(frame, 30))),
+    }
+}
+
 impl Nic {
     pub fn new(card: VirtioNet) -> Nic {
         let mac = card.mac;
@@ -110,7 +121,12 @@ impl Device for Nic {
     fn receive(&mut self, _now: Instant) -> Option<(RxToken, TxToken<'_>)> {
         let frame = match self.looped.pop_front() {
             Some(frame) => frame,
-            None => self.card.receive(|f| f.to_vec())?,
+            None => loop {
+                let frame = self.card.receive(|f| f.to_vec())?;
+                if !is_martian(&frame) {
+                    break frame;
+                }
+            },
         };
         Some((RxToken(frame), TxToken(self)))
     }

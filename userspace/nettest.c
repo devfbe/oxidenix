@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -148,6 +149,22 @@ int main(void) {
           n == 8 && memcmp(buf, "datagram", 8) == 0 && from.sin_addr.s_addr == inet_addr("127.0.0.1"));
     close(rx);
     close(tx);
+
+    /* Lengths chosen to overflow naive arithmetic in the kernel. */
+    int u = socket(AF_INET, SOCK_DGRAM, 0);
+    a = addr("127.0.0.1", 9);
+    struct iovec iov[2] = {{buf, 8}, {buf, (size_t)-4}};
+    struct msghdr m = {0};
+    m.msg_name = &a;
+    m.msg_namelen = sizeof a;
+    m.msg_iov = iov;
+    m.msg_iovlen = 2;
+    check("sendmsg with an overflowing iovec fails cleanly", sendmsg(u, &m, 0) < 0 && errno == EMSGSIZE);
+    iov[1].iov_len = (size_t)-1;
+    check("recvmsg with an overflowing iovec fails cleanly", recvmsg(u, &m, MSG_DONTWAIT) < 0 && errno == EAGAIN);
+    check("sendto with a huge length fails with EFAULT",
+          sendto(u, buf, (size_t)1 << 40, 0, (struct sockaddr *)&a, sizeof a) < 0 && errno == EFAULT);
+    close(u);
 
     check("AF_INET6 sockets are not supported", socket(AF_INET6, SOCK_STREAM, 0) < 0 && errno == EAFNOSUPPORT);
 

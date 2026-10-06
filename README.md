@@ -356,7 +356,9 @@ interrupt dispatch; drivers and filesystems move into user-space servers.
   IPv4, ICMP, TCP, UDP and the DHCP client.
 - **Loopback**: frames to the host's own address or to `127.0.0.0/8` never reach the card;
   netd's device layer feeds them back as received frames and answers ARP for those addresses
-  itself, so a program can talk to a server on the same machine.
+  itself, so a program can talk to a server on the same machine. Frames from the wire that
+  claim a `127.0.0.0/8` address are dropped, so services on `127.0.0.1` are not reachable from
+  the network.
 - **Sockets** (`process/sys_net.rs`, `net.rs`): `socket`, `bind`, `listen`, `accept`/`accept4`,
   `connect`, `send*`/`recv*` (also `sendmsg`/`recvmsg`), `shutdown`, `getsockname`,
   `getpeername` and `getsockopt(SO_ERROR)` for `AF_INET` stream and datagram sockets. A socket is
@@ -366,7 +368,10 @@ interrupt dispatch; drivers and filesystems move into user-space servers.
 - **Blocking without blocking netd**: netd keeps a request that cannot complete yet (accept
   without a connection, recv without data, a connect in progress) and answers it after the
   stack made progress, while it keeps serving other requests. A signal interrupts the waiting
-  program: the kernel abandons the request (`EINTR`) and tells netd to drop it.
+  program: the kernel abandons the request (`EINTR`) and tells netd to drop it. At most 128
+  requests (holding at most 512 KiB of data) wait at a time; beyond that, calls fail with
+  `ENOBUFS` instead of exhausting netd's heap. Data is sent straight from user memory in 32 KiB
+  messages, never copied whole into the kernel.
 - **Configuration**: `/etc/resolv.conf` points to QEMU's DNS proxy (`10.0.2.3`); DHCP gives
   `10.0.2.15/24` with gateway `10.0.2.2`. The self-tests use an echo service that QEMU provides
   at `10.0.2.100:7` (`guestfwd` to `cat` on the host).
@@ -478,7 +483,7 @@ oxidenix is a research kernel and is **not hardened for hostile workloads**. Sti
 went through an automated security review, and these classes of user-triggerable failures were
 fixed:
 
-- arithmetic overflows that panicked the kernel (`nanosleep`, `brk`/`mmap` sizes, `kill(INT_MIN)`, `sigreturn` stack pointer)
+- arithmetic overflows that panicked the kernel (`nanosleep`, `brk`/`mmap` sizes, `kill(INT_MIN)`, `sigreturn` stack pointer, timer values, `sendmsg`/`recvmsg` vector lengths)
 - `iretq` to non-user addresses (signal handlers, ELF entry points, restored contexts), which
   would fault in ring 0
 - kernel heap exhaustion through huge or numerous files, pipes, processes or arguments (quotas,

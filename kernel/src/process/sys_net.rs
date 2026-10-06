@@ -113,8 +113,10 @@ pub fn connect(fd: u64, addr: u64, len: u64) -> SysResult {
 pub fn sendto(fd: u64, buf: u64, len: u64, flags: u64, addr: u64, alen: u64) -> SysResult {
     let f = socket_file(fd)?;
     let to = if addr != 0 { Some(read_addr(addr, alen)?) } else { None };
-    let data = uaccess::slice(buf, len)?.to_vec();
-    let n = sock(&f).send(&data, to, f.nonblocking() || flags & MSG_DONTWAIT != 0)?;
+    // Sent straight from user memory, chunk by chunk: no kernel copy of
+    // an arbitrarily large buffer.
+    let data = uaccess::slice(buf, len)?;
+    let n = sock(&f).send(data, to, f.nonblocking() || flags & MSG_DONTWAIT != 0)?;
     Ok(n as i64)
 }
 
@@ -153,7 +155,7 @@ pub fn sendmsg(fd: u64, msg: u64, flags: u64) -> SysResult {
     let h = read_msghdr(msg)?;
     let mut data = Vec::new();
     for (base, len) in h.iov {
-        if data.len() + len as usize > MAX_MSG {
+        if len > (MAX_MSG - data.len()) as u64 {
             return Err(EMSGSIZE);
         }
         data.extend_from_slice(uaccess::slice(base, len)?);
@@ -166,7 +168,7 @@ pub fn sendmsg(fd: u64, msg: u64, flags: u64) -> SysResult {
 
 pub fn recvmsg(fd: u64, msg: u64, flags: u64) -> SysResult {
     let h = read_msghdr(msg)?;
-    let total = h.iov.iter().map(|&(_, len)| len as usize).sum::<usize>().min(MAX_MSG);
+    let total = h.iov.iter().fold(0u64, |sum, &(_, len)| sum.saturating_add(len)).min(MAX_MSG as u64) as usize;
     let f = socket_file(fd)?;
     let mut data = vec![0u8; total];
     let nonblocking = f.nonblocking() || flags & MSG_DONTWAIT != 0;

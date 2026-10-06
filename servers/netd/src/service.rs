@@ -36,6 +36,10 @@ const TCP_BUFFER: usize = 16 * 1024;
 const UDP_PACKETS: usize = 16;
 const UDP_BUFFER: usize = 16 * 1024;
 const MAX_BACKLOG: usize = 8;
+/// Waiting requests, and the data waiting sends may hold in total, so that
+/// many blocked programs cannot exhaust netd's heap.
+const MAX_PENDING: usize = 128;
+const MAX_PENDING_BYTES: usize = 512 * 1024;
 /// A connection attempt (or unacknowledged data) gives up after this.
 const TCP_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -186,6 +190,10 @@ impl Service {
             Ok(Done(status, values, data)) => Some((status, values, data)),
             Ok(Wait) if Self::nonblocking(op, args) => Some((-EAGAIN, [0; 6], Vec::new())),
             Ok(Wait) => {
+                let held: usize = self.pending.iter().map(|p| p.payload.len()).sum();
+                if self.pending.len() >= MAX_PENDING || held + payload.len() > MAX_PENDING_BYTES {
+                    return Some((-ENOBUFS, [0; 6], Vec::new()));
+                }
                 self.pending.push(Pending { id, op, args, payload: payload.to_vec() });
                 None
             }
