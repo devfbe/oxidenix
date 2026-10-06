@@ -329,11 +329,13 @@ interrupt dispatch; drivers and filesystems move into user-space servers.
   whether a file is open.
 - **Fault isolation**: when a server dies, its services are marked dead and every pending
   request fails with `EIO`; the kernel and the rest of user space keep running.
-- **Self-healing**: the next request to a dead filesystem server starts it again (in the
+- **Self-healing**: the next request to a dead server starts it again (in the
   context of the requesting program, which may sleep) and continues transparently. Inode numbers
   live on disk, so files and directories that were open before the crash stay usable. Requests
   that were in flight during the crash still fail with `EIO`, since they may or may not have
   been carried out. After five restarts the kernel gives up and the mount stays at `EIO`.
+  The same holds for netd: the next socket call restarts it, which resets the network card and
+  repeats DHCP; sockets that were open in the old netd fail with `EIO`.
   Restarted servers are children of the kernel, never of the program that triggered them.
   The kernel reads each server program once at boot and restarts it from that copy, so
   replacing `/sbin/diskfs` later cannot smuggle a different program into a privileged process.
@@ -375,8 +377,10 @@ interrupt dispatch; drivers and filesystems move into user-space servers.
 - **Configuration**: `/etc/resolv.conf` points to QEMU's DNS proxy (`10.0.2.3`); DHCP gives
   `10.0.2.15/24` with gateway `10.0.2.2`. The self-tests use an echo service that QEMU provides
   at `10.0.2.100:7` (`guestfwd` to `cat` on the host).
-- Not yet: IPv6, raw sockets (so no `ping`), `AF_UNIX`, interface configuration from user space
-  (`ifconfig`), and restarting netd after a crash.
+- **Restarts**: a crashed netd is started again by the next socket call (see self-healing). It
+  gets the same DMA area, which it clears before handing it to the freshly reset card.
+- Not yet: IPv6, raw sockets (so no `ping`), `AF_UNIX`, and interface configuration from user
+  space (`ifconfig`).
 
 ### Persistent storage
 
@@ -469,6 +473,7 @@ Each of these programs and scripts lives in the root filesystem and runs inside 
 | `e2fsck -fn disk.img` (host) | the filesystem written by oxidenix is consistent |
 | `kill -9 1` in Bash | user space cannot kill a server (`EPERM`) |
 | `kill diskfs` in the kernel monitor | the next `/data` access restarts the server; open files survive; after five restarts accesses fail with `EIO`; a restart still runs the boot-time program even after `/sbin/diskfs` was overwritten |
+| `kill netd` in the kernel monitor, then `run nettest` | the first socket call restarts netd (new DHCP lease) and every network test passes |
 | `mem` (kernel monitor) | frame and heap accounting, allocator self-test, leak checks after workloads |
 
 During development the AI drove these tests through the QEMU monitor socket (`sendkey`,
@@ -510,7 +515,7 @@ kernel. Its program is fixed at boot (see self-healing), but a bug in it is a ke
 - [x] Unlinked-but-open files kept until closed
 - [ ] Hard links and a block cache
 - [x] Networking: TCP/UDP sockets, DNS, DHCP and loopback through a user-space server (`netd`)
-- [ ] IPv6, raw sockets (`ping`), `AF_UNIX`, `ifconfig`, restarting netd after a crash
+- [ ] IPv6, raw sockets (`ping`), `AF_UNIX`, `ifconfig`
 - [ ] SMP, dynamic linking, real entropy, users and permissions
 
 ## Development history

@@ -63,16 +63,13 @@ fn start_diskfs() {
         Ok(server) => Arc::new(server.ports(0x1f0..0x1f8).ports(0x3f6..0x3f7)),
         Err(e) => return printkln!("[boot] cannot load /sbin/diskfs (errno {})", e),
     };
-    match process::spawn_server(&server) {
-        Ok(pid) => match process::ipc::wait_for(server.name, 3 * process::TIMER_HZ) {
-            Some((service, root)) => {
-                if let Err(e) = fs::mount_remote(server, service, root as u32, "data", "/dev/hdb") {
-                    printkln!("[boot] cannot mount /data (errno {})", e);
-                }
+    match server.start() {
+        Ok((service, root)) => {
+            if let Err(e) = fs::mount_remote(server, service, root as u32, "data", "/dev/hdb") {
+                printkln!("[boot] cannot mount /data (errno {})", e);
             }
-            None => printkln!("[boot] diskfs (pid {}) did not register; /data is not mounted", pid),
-        },
-        Err(e) => printkln!("[boot] cannot start /sbin/diskfs (errno {})", e),
+        }
+        Err(e) => printkln!("[boot] diskfs did not start (errno {}); /data is not mounted", e),
     }
 }
 
@@ -95,18 +92,17 @@ fn start_netd() {
             .dma(NETD_DMA_PAGES)
             .arg(alloc::format!("io={io:#x}"))
             .arg(alloc::format!("iolen={len}"))
-            .arg(alloc::format!("irq={}", nic.irq)),
+            .arg(alloc::format!("irq={}", nic.irq))
+            // netd registers once DHCP is done, or after three seconds.
+            .start_timeout(5 * process::TIMER_HZ),
         Err(e) => return printkln!("[boot] cannot load /sbin/netd (errno {})", e),
     };
-    match process::spawn_server(&Arc::new(server)) {
-        // netd registers once DHCP is done (or has given up for now).
-        Ok(pid) => {
-            if process::ipc::wait_for("net", 5 * process::TIMER_HZ).is_none() {
-                printkln!("[boot] netd (pid {}) did not register; networking is off", pid);
-            }
-        }
-        Err(e) => printkln!("[boot] cannot start /sbin/netd (errno {})", e),
+    let server = Arc::new(server);
+    if let Err(e) = server.start() {
+        printkln!("[boot] netd did not start (errno {}); networking is off", e);
     }
+    // Sockets restart netd through this if it dies.
+    net::set_server(server);
 }
 
 /// Leaves QEMU through its isa-debug-exit device; the exit status of QEMU

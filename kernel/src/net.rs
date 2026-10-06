@@ -3,7 +3,8 @@
 //! network can be interrupted by signals.
 
 use crate::process::errno::*;
-use crate::process::ipc;
+use crate::process::{ipc, Server};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use netproto::{Op, MAX_DATA, NONBLOCK};
 
@@ -29,8 +30,17 @@ pub struct Socket {
     pub kind: u64,
 }
 
+/// netd as started at boot, to restart it after a crash.
+static NETD: spin::Once<Arc<Server>> = spin::Once::new();
+
+pub fn set_server(server: Arc<Server>) {
+    NETD.call_once(|| server);
+}
+
+/// netd's service; a dead netd is restarted (sockets it served are gone).
 fn service() -> Result<usize, i64> {
-    ipc::lookup("net").map(|(service, _)| service).ok_or(ENETDOWN)
+    let netd = NETD.get().ok_or(ENETDOWN)?;
+    netd.revive().map(|(service, _)| service).map_err(|_| ENETDOWN)
 }
 
 fn call(service: usize, op: Op, args: [u64; 4], payload: &[u8]) -> Result<Reply, i64> {

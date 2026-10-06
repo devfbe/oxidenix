@@ -138,6 +138,9 @@ impl VirtioNet {
             if offset > dma_len {
                 return Err("DMA area too small");
             }
+            // A restarted netd gets the DMA area of its predecessor; the
+            // reset device starts with empty rings, so must the memory.
+            unsafe { core::ptr::write_bytes(dma.add(ring), 0, queue_bytes(size)) };
             unsafe { outl(io + QUEUE_PFN, ((phys + ring as u64) / PAGE as u64) as u32) };
             let desc = unsafe { dma.add(ring) };
             Ok(Queue {

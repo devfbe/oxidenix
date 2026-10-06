@@ -522,7 +522,14 @@ pub struct Server {
     dma: spin::Mutex<Option<u64>>,
     /// Extra command line arguments (e.g. the device's resources).
     args: Vec<String>,
+    /// How long a (re)started server may take to register its service.
+    start_ticks: u64,
+    restarts: core::sync::atomic::AtomicU32,
+    restarting: core::sync::atomic::AtomicBool,
 }
+
+/// How often a dead server is restarted before the kernel gives up on it.
+const MAX_RESTARTS: u32 = 5;
 
 impl Server {
     pub fn load(name: &'static str, path: &'static str) -> Result<Server, i64> {
@@ -536,7 +543,52 @@ impl Server {
             image.extend_from_slice(bytes);
             Ok::<_, i64>(image)
         })??;
-        Ok(Server { name, path, image, ports: Vec::new(), irq: None, dma_pages: 0, dma: spin::Mutex::new(None), args: Vec::new() })
+        Ok(Server {
+            name,
+            path,
+            image,
+            ports: Vec::new(),
+            irq: None,
+            dma_pages: 0,
+            dma: spin::Mutex::new(None),
+            args: Vec::new(),
+            start_ticks: 3 * TIMER_HZ,
+            restarts: core::sync::atomic::AtomicU32::new(0),
+            restarting: core::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    /// Starts the server and waits for it to register: (service, argument).
+    pub fn start(self: &Arc<Self>) -> Result<(usize, u64), i64> {
+        spawn_server(self)?;
+        ipc::wait_for(self.name, self.start_ticks).ok_or(EIO)
+    }
+
+    /// The server's service, restarting the server if it died. The first
+    /// caller restarts it, concurrent callers wait for the registration.
+    /// After MAX_RESTARTS restarts the server stays dead (EIO).
+    pub fn revive(self: &Arc<Self>) -> Result<(usize, u64), i64> {
+        if let Some(found) = ipc::lookup(self.name) {
+            return Ok(found);
+        }
+        if self.restarting.swap(true, Ordering::Relaxed) {
+            return ipc::wait_for(self.name, self.start_ticks).ok_or(EIO);
+        }
+        let attempt = self.restarts.fetch_add(1, Ordering::Relaxed) + 1;
+        let result = if attempt > MAX_RESTARTS {
+            Err(EIO)
+        } else {
+            crate::printkln!("[kernel] {} died; restarting it (attempt {} of {})", self.name, attempt, MAX_RESTARTS);
+            self.start()
+        };
+        self.restarting.store(false, Ordering::Relaxed);
+        result
+    }
+
+    /// Time allowed for registration after a (re)start.
+    pub fn start_timeout(mut self, ticks: u64) -> Self {
+        self.start_ticks = ticks;
+        self
     }
 
     pub fn ports(mut self, range: Range<u64>) -> Self {
