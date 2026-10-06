@@ -91,7 +91,7 @@ The kernel boots straight into Bash. Things to try:
 
 ```sh
 ls -l /bin | head          # BusyBox applets
-cowtest; sigtest; jobtest; oomtest; forktest # kernel self-tests in user space
+cowtest; sigtest; jobtest; oomtest; fstest; forktest # kernel self-tests in user space
 sh /etc/test.sh            # filesystem, pipes, quotas, rename semantics
 sh /etc/disktest.sh        # ext2: big files, directories, truncate, rename, symlinks
 echo hello > /data/x       # survives a reboot; df -h shows the disk
@@ -273,6 +273,10 @@ About 6,600 lines of Rust in the kernel plus a small host-side builder.
   `write_at`, `truncate`, ...) works on memory and ext2 inodes alike. ext2 inodes are cached per
   filesystem so that one disk inode always maps to one `Arc<Inode>`. The disk root is mounted
   at `/data`, and `statfs` and a static `/proc/mounts` make `df` work.
+- A file that is deleted while still open stays allocated as an orphan until the last
+  reference is dropped, as on Linux, so its inode number cannot be reused under an open file.
+- Only regular files are read, written, truncated or executed through their data blocks; a
+  fast symlink's block pointers hold text, never block numbers.
 - Directory reads take a snapshot at offset 0, so `rm -r` deleting entries while it reads never
   skips any.
 
@@ -301,7 +305,7 @@ Linux x86_64 numbers, grouped by area (about 90 in total):
 
 | Area | Calls |
 |---|---|
-| Files | `read` `write` `readv` `writev` `open` `openat` `close` `lseek` `sendfile` `ftruncate` `fcntl` `ioctl` `dup` `dup2` `dup3` `pipe` `pipe2` |
+| Files | `read` `write` `pread64` `pwrite64` `readv` `writev` `open` `openat` `close` `lseek` `sendfile` `ftruncate` `fcntl` `ioctl` `dup` `dup2` `dup3` `pipe` `pipe2` |
 | Metadata | `stat` `fstat` `lstat` `newfstatat` `access` `faccessat` `faccessat2` `readlink` `readlinkat` `chmod` `fchmodat` `utimes` `futimesat` `utimensat` `umask` |
 | Directories | `getdents64` `getcwd` `chdir` `fchdir` `mkdir` `mkdirat` `rmdir` `unlink` `unlinkat` `rename` `renameat` `renameat2` `symlink` `symlinkat` |
 | I/O multiplexing | `poll` `ppoll` `select` `pselect6` |
@@ -326,6 +330,7 @@ Each of these programs and scripts lives in the root filesystem and runs inside 
 | `jobtest` | stop/continue reporting through `wait4`, restart of a stopped `read()`, `SIGKILL` on stopped processes, `SA_RESTART` |
 | `forktest` | `fork`, `execve`, `wait4`, preemptive interleaving of two workers |
 | `sh /etc/test.sh` | files, pipes, `cd`, `mkdir`/`touch`/`rm`, rename cycles via symlinks, file quota |
+| `fstest` | `O_NOFOLLOW` on symlinks, unlinked-but-open files (kept until closed, never shared with new files), ext2 size limits, overflowing `mmap` offsets |
 | `sh /etc/disktest.sh` | ext2: 150-file directory, 1.5 MiB file (double indirect), append, truncate, rename, cycles, symlinks, `rm -r`, space accounting |
 | `e2fsck -fn disk.img` (host) | the filesystem written by oxidenix is consistent |
 | `mem` (kernel monitor) | frame and heap accounting, allocator self-test, leak checks after workloads |
@@ -353,9 +358,8 @@ fixed:
 - the `sysret` non-canonical return problem, which the `iretq` return path avoids entirely
 
 Known open issues: `getrandom` and `AT_RANDOM` are not cryptographically secure, the kernel heap
-never returns grown memory to the frame allocator, an ext2 file that is deleted while still open
-is freed immediately, and there are no users or permissions (everything runs as root). The ext2
-driver trusts the on-disk metadata of the image it was given.
+never returns grown memory to the frame allocator, and there are no users or permissions
+(everything runs as root). The ext2 driver trusts the on-disk metadata of the image it was given.
 
 ## Limitations and roadmap
 
@@ -363,7 +367,8 @@ driver trusts the on-disk metadata of the image it was given.
 - [x] `ENOMEM` instead of a kernel panic when memory runs out
 - [x] Job control: stopping (Ctrl+Z), `fg`/`bg`, `SIGCONT`
 - [x] Persistent storage: a disk driver and an on-disk filesystem
-- [ ] Hard links, a block cache, unlinked-but-open files kept until closed
+- [x] Unlinked-but-open files kept until closed
+- [ ] Hard links and a block cache
 - [ ] Networking, SMP, dynamic linking, real entropy, users and permissions
 
 ## Development history
