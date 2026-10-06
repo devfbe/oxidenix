@@ -2,6 +2,7 @@
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/time.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -114,6 +115,23 @@ int main(void) {
     while (waitpid(pinger, NULL, 0) < 0 && errno == EINTR) {
     }
     check("async handlers keep the FPU/SSE state intact", same && fpu_signals > 0);
+
+    fpu_signals = 0;
+    alarm(1);
+    pause();
+    check("alarm() delivers SIGALRM", fpu_signals == 1);
+    check("alarm(0) reports no time left", alarm(0) == 0);
+
+    struct itimerval it = {{0, 20000}, {0, 20000}}, cur;
+    setitimer(ITIMER_REAL, &it, NULL);
+    while (fpu_signals < 4) pause();
+    getitimer(ITIMER_REAL, &cur);
+    check("setitimer repeats with its interval", cur.it_interval.tv_usec == 20000);
+    struct itimerval off = {{0, 0}, {0, 0}};
+    setitimer(ITIMER_REAL, &off, NULL);
+    int count = fpu_signals;
+    sleep_ms(100);
+    check("a zero itimerval disarms the timer", fpu_signals == count);
 
     printf("sigtest: %s\n", failures ? "FAILED" : "all passed");
     return failures;

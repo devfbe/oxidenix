@@ -106,6 +106,9 @@ struct Process {
     server: Option<Arc<Server>>,
     /// Timer tick at which a sleep ends on its own (0: none).
     wake_at: u64,
+    /// ITIMER_REAL: next SIGALRM tick (0: off) and the reload interval.
+    alarm_at: u64,
+    alarm_every: u64,
 }
 
 impl Process {
@@ -205,6 +208,8 @@ pub fn init() {
         io_bitmap: None,
         server: None,
         wake_at: 0,
+        alarm_at: 0,
+        alarm_every: 0,
     };
     let mut procs = BTreeMap::new();
     procs.insert(0, Box::new(kernel));
@@ -340,7 +345,40 @@ pub fn tick() {
         for pid in due {
             s.make_ready(pid);
         }
+        let mut alarms: heapless::Vec<Pid, 64> = heapless::Vec::new();
+        for p in s.procs.values_mut().filter(|p| p.alarm_at != 0 && p.alarm_at <= now) {
+            p.alarm_at = if p.alarm_every != 0 { now + p.alarm_every } else { 0 };
+            let _ = alarms.push(p.pid);
+        }
+        for pid in alarms {
+            signal::send(pid, signal::SIGALRM);
+        }
     });
+}
+
+/// setitimer(ITIMER_REAL, new, old) with timer-tick resolution. `new` and
+/// `old` are (interval, value) in microseconds; a value of 0 disarms.
+pub fn set_alarm(value_us: u64, interval_us: u64) -> (u64, u64) {
+    let to_ticks = |us: u64| us.saturating_mul(TIMER_HZ).div_ceil(1_000_000);
+    let to_us = |ticks: u64| ticks.saturating_mul(1_000_000) / TIMER_HZ;
+    interrupts::without_interrupts(|| {
+        let now = ticks();
+        let p = sched().cur();
+        let old = (to_us(p.alarm_at.saturating_sub(now)), to_us(p.alarm_every));
+        p.alarm_at = if value_us == 0 { 0 } else { now + to_ticks(value_us).max(1) };
+        p.alarm_every = if value_us == 0 { 0 } else { to_ticks(interval_us) };
+        old
+    })
+}
+
+/// The current ITIMER_REAL setting: (remaining, interval) in microseconds.
+pub fn get_alarm() -> (u64, u64) {
+    interrupts::without_interrupts(|| {
+        let now = ticks();
+        let p = sched().cur();
+        let remaining = if p.alarm_at == 0 { 0 } else { p.alarm_at.saturating_sub(now).max(1) };
+        (remaining * 1_000_000 / TIMER_HZ, p.alarm_every * 1_000_000 / TIMER_HZ)
+    })
 }
 
 /// Like `sleep_on`, but also wakes up at timer tick `deadline`.
@@ -443,6 +481,8 @@ fn new_process(pid: Pid, ppid: Pid, name: String, space: AddressSpace, frame: Fr
         io_bitmap: None,
         server: None,
         wake_at: 0,
+        alarm_at: 0,
+        alarm_every: 0,
     }))
 }
 

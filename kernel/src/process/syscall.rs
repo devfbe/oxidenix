@@ -172,6 +172,12 @@ extern "sysv64" fn dispatch(f: &mut Frame) {
         39 | 186 | 218 => Ok(super::current_pid() as i64),
         40 => sys_file::sendfile(a0, a1, a2, a3),
         41 => Err(EAFNOSUPPORT), // socket: there is no network stack
+        36 => getitimer(a0, a1),
+        37 => {
+            let (old, _) = super::set_alarm(a0.saturating_mul(1_000_000), 0);
+            Ok(old.div_ceil(1_000_000) as i64)
+        }
+        38 => setitimer(a0, a1, a2),
         57 => super::fork(f).map(|pid| pid as i64),
         59 => execve(f, a0, a1, a2),
         60 | 231 => super::exit(((a0 & 0xff) << 8) as i32),
@@ -310,6 +316,42 @@ fn clock_gettime(clock: u64, ts: u64) -> SysResult {
         (ticks / hz, (ticks % hz) * (1_000_000_000 / hz))
     };
     uaccess::write(ts, [sec, nsec])?;
+    Ok(0)
+}
+
+const ITIMER_REAL: u64 = 0;
+
+/// struct itimerval: (interval, value) as two timevals, in microseconds.
+fn read_itimerval(addr: u64) -> Result<(u64, u64), i64> {
+    let [isec, iusec, vsec, vusec]: [u64; 4] = uaccess::read(addr)?;
+    if iusec >= 1_000_000 || vusec >= 1_000_000 {
+        return Err(EINVAL);
+    }
+    let us = |sec: u64, usec: u64| sec.saturating_mul(1_000_000).saturating_add(usec);
+    Ok((us(isec, iusec), us(vsec, vusec)))
+}
+
+fn write_itimerval(addr: u64, (value, interval): (u64, u64)) -> Result<(), i64> {
+    if addr == 0 {
+        return Ok(());
+    }
+    uaccess::write(addr, [interval / 1_000_000, interval % 1_000_000, value / 1_000_000, value % 1_000_000])
+}
+
+fn setitimer(which: u64, new: u64, old: u64) -> SysResult {
+    if which != ITIMER_REAL {
+        return Err(EINVAL);
+    }
+    let (interval, value) = if new == 0 { (0, 0) } else { read_itimerval(new)? };
+    write_itimerval(old, super::set_alarm(value, interval))?;
+    Ok(0)
+}
+
+fn getitimer(which: u64, cur: u64) -> SysResult {
+    if which != ITIMER_REAL {
+        return Err(EINVAL);
+    }
+    write_itimerval(cur, super::get_alarm())?;
     Ok(0)
 }
 

@@ -11,6 +11,7 @@ use x86_64::instructions::interrupts;
 pub const SIGINT: u32 = 2;
 pub const SIGQUIT: u32 = 3;
 pub const SIGKILL: u32 = 9;
+pub const SIGALRM: u32 = 14;
 pub const SIGCHLD: u32 = 17;
 pub const SIGCONT: u32 = 18;
 pub const SIGSTOP: u32 = 19;
