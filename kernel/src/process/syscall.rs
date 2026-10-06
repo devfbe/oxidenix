@@ -126,6 +126,7 @@ extern "sysv64" fn dispatch(f: &mut Frame) -> i64 {
         4 => sys_file::newfstatat(cwd, a0, a1, 0),
         5 => sys_file::fstat(a0, a1),
         6 => sys_file::newfstatat(cwd, a0, a1, 0x100),
+        7 => sys_file::poll(a0, a1, a2 as i32 as i64),
         8 => sys_file::lseek(a0, a1 as i64, a2),
         9 => sys_mem::mmap(a0, a1, a2, a3, a4, a5),
         10 => Ok(0), // mprotect: pages keep the protection they were mapped with
@@ -151,6 +152,7 @@ extern "sysv64" fn dispatch(f: &mut Frame) -> i64 {
         59 => execve(f, a0, a1, a2),
         60 | 231 => super::exit(((a0 & 0xff) << 8) as i32),
         61 => super::wait4(a0 as i64, a1, a2),
+        62 => kill(a0 as i64, a1),
         63 => uname(a0),
         72 => sys_file::fcntl(a0, a1, a2),
         77 => sys_file::ftruncate(a0, a1),
@@ -166,9 +168,13 @@ extern "sysv64" fn dispatch(f: &mut Frame) -> i64 {
         90 => sys_file::fchmodat(cwd, a0, a1),
         95 => Ok(0o022), // umask
         102 | 104 | 107 | 108 => Ok(0), // getuid/getgid/geteuid/getegid: everything is root
-        105 | 106 | 109 | 112 => Ok(0), // setuid/setgid/setpgid/setsid
+        105 | 106 => Ok(0), // setuid/setgid
+        109 => super::setpgid(a0, a1),
+        112 => super::setsid(),
         110 => Ok(super::current_ppid() as i64),
-        111 | 121 | 124 => Ok(super::current_pid() as i64), // getpgrp/getpgid/getsid
+        111 => super::getpgid(0),
+        121 => super::getpgid(a0),
+        124 => super::getsid(a0),
         158 => arch_prctl(a0, a1),
         217 => sys_file::getdents64(a0, a1, a2),
         228 => clock_gettime(a1),
@@ -180,6 +186,7 @@ extern "sysv64" fn dispatch(f: &mut Frame) -> i64 {
         266 => sys_file::symlinkat(a0, a1, a2),
         267 => sys_file::readlinkat(a0, a1, a2, a3),
         268 => sys_file::fchmodat(a0, a1, a2),
+        271 => sys_file::ppoll(a0, a1, a2),
         269 | 439 => sys_file::faccessat(a0, a1),
         235 => sys_file::utimensat(cwd, a0, 0),
         261 => sys_file::utimensat(a0, a1, 0),
@@ -194,6 +201,17 @@ extern "sysv64" fn dispatch(f: &mut Frame) -> i64 {
         }
     };
     result.unwrap_or_else(|e| -e)
+}
+
+/// Signals are not implemented yet: only existence checks (signal 0) and
+/// SIGCONT (nothing is ever stopped) succeed.
+fn kill(pid: i64, sig: u64) -> SysResult {
+    const SIGCONT: u64 = 18;
+    match sig {
+        0 | SIGCONT if pid <= 0 || super::exists(pid as u64) => Ok(0),
+        0 | SIGCONT => Err(ESRCH),
+        _ => Err(ENOSYS),
+    }
 }
 
 fn execve(f: &mut Frame, path: u64, argv: u64, envp: u64) -> SysResult {

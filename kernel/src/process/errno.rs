@@ -1,4 +1,5 @@
 pub const ENOENT: i64 = 2;
+pub const ESRCH: i64 = 3;
 pub const E2BIG: i64 = 7;
 pub const ENOEXEC: i64 = 8;
 pub const EBADF: i64 = 9;

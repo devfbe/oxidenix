@@ -37,6 +37,9 @@ fn main() {
             "isa-debug-exit,iobase=0xf4,iosize=0x04",
             "-m",
             "256M",
+            // Scale the guest picture with the window (resize or fullscreen).
+            "-display",
+            "gtk,zoom-to-fit=on",
         ])
         .args(&args[2..])
         .status()

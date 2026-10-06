@@ -18,3 +18,8 @@ runs static musl binaries (BusyBox) via a Linux-compatible syscall ABI.
   (extra arguments after `--` are passed to QEMU).
 - `cargo` lives in `~/.cargo/bin`.
 - QEMU must always run with a visible window; never use `-display none`.
+
+## Workflow
+
+- Commit every finished, tested step without asking and continue directly
+  with the next step.

@@ -276,14 +276,87 @@ pub fn fcntl(fd: u64, cmd: u64, arg: u64) -> SysResult {
 }
 
 pub fn ioctl(fd: u64, request: u64, arg: u64) -> SysResult {
+    use crate::drivers::tty;
+    const TCGETS: u64 = 0x5401;
+    const TCSETS: u64 = 0x5402;
+    const TCSETSW: u64 = 0x5403;
+    const TCSETSF: u64 = 0x5404;
+    const TCSBRK: u64 = 0x5409;
+    const TCXONC: u64 = 0x540a;
+    const TCFLSH: u64 = 0x540b;
+    const TIOCSCTTY: u64 = 0x540e;
+    const TIOCGPGRP: u64 = 0x540f;
+    const TIOCSPGRP: u64 = 0x5410;
     const TIOCGWINSZ: u64 = 0x5413;
-    let f = file(fd)?;
-    if !f.is_console() || request != TIOCGWINSZ {
+    const TIOCSWINSZ: u64 = 0x5414;
+    const FIONREAD: u64 = 0x541b;
+    const TIOCNOTTY: u64 = 0x5422;
+    const TIOCGSID: u64 = 0x5429;
+
+    if !file(fd)?.is_console() {
         return Err(ENOTTY);
     }
-    let (cols, rows) = crate::drivers::console::size();
-    uaccess::write(arg, [rows as u16, cols as u16, 0, 0])?;
+    match request {
+        TCGETS => uaccess::write(arg, tty::termios())?,
+        TCSETS | TCSETSW => tty::set_termios(uaccess::read(arg)?, false),
+        TCSETSF => tty::set_termios(uaccess::read(arg)?, true),
+        TCFLSH if arg != 1 => tty::flush_input(),
+        TCFLSH | TCSBRK | TCXONC | TIOCSCTTY | TIOCNOTTY | TIOCSWINSZ => {}
+        TIOCGPGRP => uaccess::write(arg, tty::foreground() as i32)?,
+        TIOCSPGRP => tty::set_foreground(uaccess::read::<i32>(arg)? as u64),
+        TIOCGSID => uaccess::write(arg, super::getsid(0)? as i32)?,
+        TIOCGWINSZ => {
+            let (cols, rows) = crate::drivers::console::size();
+            uaccess::write(arg, [rows as u16, cols as u16, 0, 0])?;
+        }
+        FIONREAD => uaccess::write(arg, tty::pending() as i32)?,
+        _ => return Err(ENOTTY),
+    }
     Ok(0)
+}
+
+/// poll(2) with a 10 ms granularity: readiness is re-checked every timer tick.
+pub fn poll(fds: u64, nfds: u64, timeout_ms: i64) -> SysResult {
+    const POLLNVAL: i16 = 0x20;
+    if nfds > 256 {
+        return Err(EINVAL);
+    }
+    let deadline = (timeout_ms >= 0).then(|| {
+        let ticks = (timeout_ms as u64).saturating_mul(super::TIMER_HZ).div_ceil(1000);
+        super::ticks().saturating_add(ticks)
+    });
+    loop {
+        let mut ready = 0;
+        for i in 0..nfds {
+            let entry = fds + i * 8;
+            let raw: [u8; 8] = uaccess::read(entry)?;
+            let fd = i32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+            let events = i16::from_le_bytes([raw[4], raw[5]]);
+            let revents = if fd < 0 {
+                0
+            } else {
+                file(fd as u64).map_or(POLLNVAL, |f| f.poll(events))
+            };
+            uaccess::write(entry + 6, revents)?;
+            if revents != 0 {
+                ready += 1;
+            }
+        }
+        if ready > 0 || deadline.is_some_and(|d| super::ticks() >= d) {
+            return Ok(ready);
+        }
+        super::sleep_ticks(1);
+    }
+}
+
+pub fn ppoll(fds: u64, nfds: u64, timeout: u64) -> SysResult {
+    let timeout_ms = if timeout == 0 {
+        -1
+    } else {
+        let [sec, nsec]: [u64; 2] = uaccess::read(timeout)?;
+        sec.saturating_mul(1000).saturating_add(nsec / 1_000_000).min(i64::MAX as u64) as i64
+    };
+    poll(fds, nfds, timeout_ms)
 }
 
 pub fn faccessat(dirfd: u64, path: u64) -> SysResult {
@@ -374,10 +447,15 @@ pub fn renameat(olddirfd: u64, oldpath: u64, newdirfd: u64, newpath: u64) -> Sys
         }
         // Replacing only ever drops a file or an empty directory, never a
         // whole subtree (whose recursive drop could overflow the stack).
-        match (&*existing.node.lock(), node.is_dir()) {
-            (Node::Dir(m), true) if !m.is_empty() => return Err(ENOTEMPTY),
-            (Node::Dir(_), false) => return Err(EISDIR),
-            (_, true) if !existing.is_dir() => return Err(ENOTDIR),
+        // Read both properties first: the inode locks are not reentrant.
+        let existing_dir = match &*existing.node.lock() {
+            Node::Dir(m) => Some(m.is_empty()),
+            _ => None,
+        };
+        match (existing_dir, node.is_dir()) {
+            (Some(false), true) => return Err(ENOTEMPTY),
+            (Some(_), false) => return Err(EISDIR),
+            (None, true) => return Err(ENOTDIR),
             _ => {}
         }
     }

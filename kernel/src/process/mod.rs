@@ -70,6 +70,8 @@ struct FdEntry {
 struct Process {
     pid: Pid,
     ppid: Pid,
+    pgid: Pid,
+    sid: Pid,
     name: String,
     state: State,
     space: Option<AddressSpace>,
@@ -161,6 +163,8 @@ pub fn init() {
     let kernel = Process {
         pid: 0,
         ppid: 0,
+        pgid: 0,
+        sid: 0,
         name: "kernel".to_string(),
         state: State::Running,
         space: None,
@@ -204,6 +208,46 @@ pub fn current_pid() -> Pid {
 
 pub fn current_ppid() -> Pid {
     with_current(|p| p.ppid)
+}
+
+pub fn exists(pid: Pid) -> bool {
+    interrupts::without_interrupts(|| sched().procs.contains_key(&pid))
+}
+
+/// `pid` 0 means the calling process.
+fn with_process<R>(pid: Pid, f: impl FnOnce(&mut Process, Pid) -> R) -> Result<R, i64> {
+    interrupts::without_interrupts(|| {
+        let s = sched();
+        let me = s.current;
+        let target = if pid == 0 { me } else { pid };
+        s.procs.get_mut(&target).map(|p| f(p, me)).ok_or(ESRCH)
+    })
+}
+
+pub fn setpgid(pid: Pid, pgid: Pid) -> SysResult {
+    with_process(pid, |p, me| {
+        if p.pid != me && p.ppid != me {
+            return Err(ESRCH);
+        }
+        p.pgid = if pgid == 0 { p.pid } else { pgid };
+        Ok(0)
+    })?
+}
+
+pub fn getpgid(pid: Pid) -> SysResult {
+    with_process(pid, |p, _| p.pgid as i64)
+}
+
+pub fn getsid(pid: Pid) -> SysResult {
+    with_process(pid, |p, _| p.sid as i64)
+}
+
+pub fn setsid() -> SysResult {
+    with_current(|p| {
+        p.sid = p.pid;
+        p.pgid = p.pid;
+        Ok(p.pid as i64)
+    })
 }
 
 pub fn ticks() -> u64 {
@@ -263,6 +307,8 @@ fn new_process(pid: Pid, ppid: Pid, name: String, space: AddressSpace, frame: Fr
     Box::new(Process {
         pid,
         ppid,
+        pgid: pid,
+        sid: pid,
         name,
         state: State::Ready,
         space: Some(space),
@@ -314,6 +360,7 @@ pub fn spawn(name: &str, args: &[&str]) -> Result<Pid, i64> {
         p.brk_end = image.brk;
         s.procs.insert(pid, p);
         s.ready.push_back(pid);
+        crate::drivers::tty::set_foreground(pid);
         pid
     }))
 }
@@ -333,6 +380,8 @@ pub fn fork(frame: &Frame) -> Result<Pid, i64> {
     s.next_pid += 1;
     let parent = s.cur();
     let mut child = new_process(pid, parent.pid, parent.name.clone(), space, child_frame);
+    child.pgid = parent.pgid;
+    child.sid = parent.sid;
     child.fds = parent.fds.clone();
     child.cwd = parent.cwd.clone();
     child.brk_start = parent.brk_start;

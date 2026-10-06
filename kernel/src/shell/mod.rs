@@ -1,25 +1,16 @@
+//! Kernel monitor: starts /bin/sh at boot and takes over when it exits.
+
 pub mod commands;
 
 use heapless::{String, Vec};
-use lazy_static::lazy_static;
-use pc_keyboard::{layouts, DecodedKey, HandleControl, Keyboard, ScancodeSet1};
-use spin::Mutex;
-
-lazy_static! {
-    static ref KEYBOARD: Mutex<Keyboard<layouts::Us104Key, ScancodeSet1>> =
-        Mutex::new(Keyboard::new(
-            ScancodeSet1::new(),
-            layouts::Us104Key,
-            HandleControl::Ignore,
-        ));
-}
 
 pub fn run() -> ! {
-    crate::printkln!("rust-kernel shell v0.1");
-    crate::printkln!("Type 'help' for help.");
-    crate::printkln!();
+    crate::printkln!("rust-kernel: starting /bin/sh ('exit' returns to the kernel monitor)");
+    commands::run_program(&["sh"]);
 
+    crate::printkln!("rust-kernel monitor. Type 'help' for help, 'run sh' for a shell.");
     loop {
+        crate::drivers::tty::set_foreground(0);
         crate::printk!("> ");
         let line = read_line();
         let (cmd, args) = parse(&line);
@@ -27,38 +18,14 @@ pub fn run() -> ! {
     }
 }
 
+/// Reads one line through the TTY, which handles echo and line editing.
 fn read_line() -> String<256> {
-    let mut buf: String<256> = String::new();
-    loop {
-        x86_64::instructions::hlt();
-
-        while let Some(scancode) = crate::drivers::keyboard::pop_scancode() {
-            let mut kb = KEYBOARD.lock();
-            if let Ok(Some(key_event)) = kb.add_byte(scancode) {
-                if let Some(key) = kb.process_keyevent(key_event) {
-                    drop(kb);
-                    match key {
-                        DecodedKey::Unicode('\n') => {
-                            crate::printkln!();
-                            return buf;
-                        }
-                        DecodedKey::Unicode('\x08') => {
-                            if !buf.is_empty() {
-                                buf.pop();
-                                crate::drivers::console::backspace();
-                            }
-                        }
-                        DecodedKey::Unicode(c) if c.is_ascii() && !c.is_ascii_control() => {
-                            if buf.push(c).is_ok() {
-                                crate::printk!("{}", c);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-    }
+    let mut buf = [0u8; 256];
+    let n = crate::drivers::tty::read(&mut buf, false).unwrap_or(0);
+    let text = core::str::from_utf8(&buf[..n]).unwrap_or("");
+    let mut line = String::new();
+    let _ = line.push_str(text.trim_end_matches('\n'));
+    line
 }
 
 fn parse(line: &str) -> (&str, Vec<&str, 8>) {

@@ -51,7 +51,7 @@ pub extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStac
 pub extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: InterruptStackFrame) {
     let mut port = Port::new(0x60);
     let scancode: u8 = unsafe { port.read() };
-    crate::drivers::keyboard::push_scancode(scancode);
+    crate::drivers::keyboard::handle_scancode(scancode);
 
     unsafe {
         crate::interrupts::PICS

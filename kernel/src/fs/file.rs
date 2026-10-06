@@ -112,6 +112,10 @@ impl OpenFile {
     }
 
     fn read_inode(&self, inode: &Inode, buf: &mut [u8]) -> Result<usize, i64> {
+        // The TTY may sleep, so it must be called without the inode lock.
+        if self.is_console() {
+            return crate::drivers::tty::read(buf, self.nonblocking());
+        }
         match &*inode.node.lock() {
             Node::Dir(_) => Err(EISDIR),
             Node::Symlink(_) => Err(EINVAL),
@@ -120,8 +124,7 @@ impl OpenFile {
                 buf.fill(0);
                 Ok(buf.len())
             }
-            // Keyboard input for processes does not exist yet.
-            Node::Device(Device::Console) => Ok(0),
+            Node::Device(Device::Console) => unreachable!("handled above"),
             Node::File(data) => {
                 let mut off = self.offset.lock();
                 let bytes = data.bytes();
@@ -135,13 +138,13 @@ impl OpenFile {
     }
 
     fn write_inode(&self, inode: &Inode, buf: &[u8]) -> Result<usize, i64> {
+        if self.is_console() {
+            return Ok(crate::drivers::tty::write(buf));
+        }
         match &mut *inode.node.lock() {
             Node::Dir(_) => Err(EISDIR),
             Node::Symlink(_) => Err(EINVAL),
-            Node::Device(Device::Console) => {
-                crate::drivers::console::write_bytes(buf);
-                Ok(buf.len())
-            }
+            Node::Device(Device::Console) => unreachable!("handled above"),
             Node::Device(_) => Ok(buf.len()),
             Node::File(data) => {
                 let mut off = self.offset.lock();
@@ -206,6 +209,37 @@ impl OpenFile {
             sleep_on(pipe.write_chan());
         }
         Ok(written)
+    }
+}
+
+pub const POLLIN: i16 = 0x1;
+pub const POLLOUT: i16 = 0x4;
+pub const POLLERR: i16 = 0x8;
+pub const POLLHUP: i16 = 0x10;
+
+impl OpenFile {
+    /// Ready events among `events` (plus POLLERR/POLLHUP, which are always reported).
+    pub fn poll(&self, events: i16) -> i16 {
+        let ready = match &self.kind {
+            Kind::Inode(_) if self.is_console() => {
+                POLLOUT | if crate::drivers::tty::readable() { POLLIN } else { 0 }
+            }
+            Kind::Inode(_) => POLLIN | POLLOUT,
+            Kind::PipeRead(p) => {
+                let hup = p.writers.load(Ordering::Relaxed) == 0;
+                (if hup || !p.buf.lock().is_empty() { POLLIN } else { 0 }) | if hup { POLLHUP } else { 0 }
+            }
+            Kind::PipeWrite(p) => {
+                if p.readers.load(Ordering::Relaxed) == 0 {
+                    POLLERR
+                } else if p.buf.lock().len() < PIPE_CAPACITY {
+                    POLLOUT
+                } else {
+                    0
+                }
+            }
+        };
+        ready & (events | POLLERR | POLLHUP)
     }
 }
 

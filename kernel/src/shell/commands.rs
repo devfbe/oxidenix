@@ -147,10 +147,17 @@ fn cmd_mem() {
 }
 
 fn cmd_run(args: &Vec<&str, 8>) {
-    let Some(&name) = args.first() else {
+    if args.is_empty() {
         crate::printkln!("usage: run <program> [args...]  (looked up in /bin, e.g. run ls -l /)");
         return;
-    };
+    }
+    run_program(args);
+}
+
+/// Starts `args[0]` (from /bin unless it contains a '/') in the foreground
+/// and waits for it.
+pub fn run_program(args: &[&str]) {
+    let name = args[0];
     let pid = match crate::process::spawn(name, args) {
         Ok(pid) => pid,
         Err(errno) => {
