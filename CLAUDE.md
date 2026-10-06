@@ -22,6 +22,12 @@ An AI research project; see README.md.
   exits QEMU with 1 on success, 3 on failure; CI runs the same on every push.
 - QEMU must always run with a visible window; never use `-display none`.
 
+## Engineering standard
+
+- Always recommend and build the technically excellent solution, not the quickest one:
+  maximum engineering quality. No stopgaps (e.g. a big kernel lock) when the proper design
+  is feasible; say what the excellent solution costs and do it.
+
 ## Workflow
 
 - After every change, review the documentation (README.md, CLAUDE.md, code comments that
