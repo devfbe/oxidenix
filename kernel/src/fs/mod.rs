@@ -7,6 +7,7 @@ use crate::process::errno::*;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use spin::{Mutex, Once};
@@ -108,16 +109,19 @@ impl Drop for Data {
     }
 }
 
-/// Whether `target` is `dir` itself or lies anywhere below it.
+/// Whether `target` is `dir` itself or lies anywhere below it. Iterative,
+/// because user space can nest directories deeper than the kernel stack.
 pub fn contains(dir: &Arc<Inode>, target: &Arc<Inode>) -> bool {
-    if Arc::ptr_eq(dir, target) {
-        return true;
+    let mut stack = vec![dir.clone()];
+    while let Some(d) = stack.pop() {
+        if Arc::ptr_eq(&d, target) {
+            return true;
+        }
+        if let Node::Dir(m) = &*d.node.lock() {
+            stack.extend(m.values().cloned());
+        }
     }
-    let children: Vec<Arc<Inode>> = match &*dir.node.lock() {
-        Node::Dir(m) => m.values().cloned().collect(),
-        _ => return false,
-    };
-    children.iter().any(|c| contains(c, target))
+    false
 }
 
 pub enum Node {
@@ -127,22 +131,41 @@ pub enum Node {
     Device(Device),
 }
 
+/// Heap cost charged per inode, covering the inode, its directory entry and
+/// a name of up to `NAME_MAX` bytes.
+const INODE_COST: usize = 512;
+pub const NAME_MAX: usize = 255;
+
 pub struct Inode {
     pub ino: u64,
     pub perm: Mutex<u32>,
     pub node: Mutex<Node>,
+    charged: usize,
+}
+
+impl Drop for Inode {
+    fn drop(&mut self) {
+        release(self.charged);
+    }
 }
 
 static NEXT_INO: AtomicU64 = AtomicU64::new(1);
 static ROOT: Once<Arc<Inode>> = Once::new();
 
 impl Inode {
-    pub fn new(node: Node, perm: u32) -> Arc<Inode> {
-        Arc::new(Inode {
+    pub fn new(node: Node, perm: u32) -> Result<Arc<Inode>, i64> {
+        let charged = INODE_COST
+            + match &node {
+                Node::Symlink(t) => t.len(),
+                _ => 0,
+            };
+        charge(charged)?;
+        Ok(Arc::new(Inode {
             ino: NEXT_INO.fetch_add(1, Ordering::Relaxed),
             perm: Mutex::new(perm & 0o7777),
             node: Mutex::new(node),
-        })
+            charged,
+        }))
     }
 
     pub fn file_type(&self) -> u32 {
@@ -179,6 +202,9 @@ impl Inode {
     }
 
     pub fn insert(&self, name: &str, inode: Arc<Inode>) -> Result<(), i64> {
+        if name.len() > NAME_MAX {
+            return Err(ENAMETOOLONG);
+        }
         match &mut *self.node.lock() {
             Node::Dir(m) if m.contains_key(name) => Err(EEXIST),
             Node::Dir(m) => {
@@ -195,7 +221,7 @@ pub fn root() -> Arc<Inode> {
 }
 
 pub fn init(ramdisk: Option<&'static [u8]>) {
-    let root = ROOT.call_once(|| Inode::new(Node::Dir(BTreeMap::new()), 0o755));
+    let root = ROOT.call_once(|| Inode::new(Node::Dir(BTreeMap::new()), 0o755).expect("file quota exhausted at boot"));
     if let Some(data) = ramdisk {
         if let Err(e) = cpio::unpack(root, data) {
             crate::printkln!("[fs] corrupt initramfs: {}", e);
@@ -203,7 +229,8 @@ pub fn init(ramdisk: Option<&'static [u8]>) {
     }
     let dev = mkdir_p(root, "dev");
     for (name, d) in [("console", Device::Console), ("tty", Device::Console), ("null", Device::Null), ("zero", Device::Zero)] {
-        let _ = dev.insert(name, Inode::new(Node::Device(d), 0o666));
+        let inode = Inode::new(Node::Device(d), 0o666).expect("file quota exhausted at boot");
+        let _ = dev.insert(name, inode);
     }
     mkdir_p(root, "tmp");
 }
@@ -215,7 +242,7 @@ pub fn mkdir_p(base: &Arc<Inode>, path: &str) -> Arc<Inode> {
         cur = match cur.child(c) {
             Ok(n) => n,
             Err(_) => {
-                let d = Inode::new(Node::Dir(BTreeMap::new()), 0o755);
+                let d = Inode::new(Node::Dir(BTreeMap::new()), 0o755).expect("file quota exhausted at boot");
                 let _ = cur.insert(c, d.clone());
                 d
             }

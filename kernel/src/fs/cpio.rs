@@ -55,6 +55,7 @@ pub fn unpack(root: &Arc<Inode>, data: &'static [u8]) -> Result<(), &'static str
             S_IFLNK => Node::Symlink(core::str::from_utf8(body).map_err(|_| "symlink is not UTF-8")?.to_string()),
             _ => continue,
         };
-        let _ = dir.insert(base, Inode::new(node, mode));
+        let inode = Inode::new(node, mode).map_err(|_| "initramfs exceeds the file quota")?;
+        let _ = dir.insert(base, inode);
     }
 }

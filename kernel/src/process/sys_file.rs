@@ -84,7 +84,7 @@ pub fn openat(dirfd: u64, path: u64, flags: u64, mode: u64) -> SysResult {
         Ok(inode) => inode,
         Err(ENOENT) if flags & O_CREAT != 0 => {
             let (dir, name) = fs::resolve_parent(&base, &path)?;
-            let inode = Inode::new(Node::File(Data::empty()), mode as u32 & !UMASK);
+            let inode = Inode::new(Node::File(Data::empty()), mode as u32 & !UMASK)?;
             dir.insert(&name, inode.clone())?;
             inode
         }
@@ -326,7 +326,7 @@ fn create_at(dirfd: u64, path: u64, node: Node, perm: u32) -> SysResult {
     let path = uaccess::read_cstr(path)?;
     let base = base_dir(dirfd, &path)?;
     let (dir, name) = fs::resolve_parent(&base, &path)?;
-    dir.insert(&name, Inode::new(node, perm))?;
+    dir.insert(&name, Inode::new(node, perm)?)?;
     Ok(0)
 }
 
@@ -368,12 +368,30 @@ pub fn renameat(olddirfd: u64, oldpath: u64, newdirfd: u64, newpath: u64) -> Sys
     if fs::contains(&node, &ndir) {
         return Err(EINVAL);
     }
+    if let Ok(existing) = ndir.child(&nname) {
+        if Arc::ptr_eq(&existing, &node) {
+            return Ok(0);
+        }
+        // Replacing only ever drops a file or an empty directory, never a
+        // whole subtree (whose recursive drop could overflow the stack).
+        match (&*existing.node.lock(), node.is_dir()) {
+            (Node::Dir(m), true) if !m.is_empty() => return Err(ENOTEMPTY),
+            (Node::Dir(_), false) => return Err(EISDIR),
+            (_, true) if !existing.is_dir() => return Err(ENOTDIR),
+            _ => {}
+        }
+    }
+    if nname.len() > fs::NAME_MAX {
+        return Err(ENAMETOOLONG);
+    }
     if let Node::Dir(m) = &mut *odir.node.lock() {
         m.remove(&oname);
     }
-    if let Node::Dir(m) = &mut *ndir.node.lock() {
-        m.insert(nname, node);
-    }
+    let replaced = match &mut *ndir.node.lock() {
+        Node::Dir(m) => m.insert(nname, node),
+        _ => None,
+    };
+    drop(replaced);
     Ok(0)
 }
 
