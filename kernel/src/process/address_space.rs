@@ -51,12 +51,15 @@ impl AddressSpace {
         let last = Page::containing_address(VirtAddr::new(end - 1));
         memory::with_frames(|frames| {
             for page in Page::range_inclusive(first, last) {
-                if mapper.translate_page(page).is_ok() {
+                if let Ok(frame) = mapper.translate_page(page) {
                     let old = leaf_flags(&mapper, page);
                     let mut merged = merge(old, flags);
-                    // A shared copy-on-write page must stay read-only.
-                    if old.contains(COW) {
+                    // A frame shared with another address space must never become
+                    // writable in place; it gets copy-on-write semantics instead.
+                    let shared = old.contains(COW) || frames.refcount(frame) > 1;
+                    if shared && merged.contains(PageTableFlags::WRITABLE) {
                         merged.remove(PageTableFlags::WRITABLE);
+                        merged.insert(COW);
                     }
                     unsafe { mapper.update_flags(page, merged) }
                         .map_err(|_| "update_flags failed")?

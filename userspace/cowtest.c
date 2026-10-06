@@ -1,6 +1,10 @@
+#include <fcntl.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -58,6 +62,24 @@ int main(void) {
         waitpid(p, NULL, 0);
     }
     check("50 forks with writes leave the parent intact", all(heap, SIZE, 'q'));
+
+    // A read-only private file mapping right above brk is shared after
+    // fork; growing brk over it in the child must not make the shared
+    // frame writable.
+    uintptr_t brk_top = (syscall(SYS_brk, 0) + 4095) & ~(uintptr_t)4095;
+    unsigned char *ro = (unsigned char *)(brk_top + 2 * 4096);
+    int fd = open("/etc/motd", O_RDONLY);
+    mmap(ro, 4096, PROT_READ, MAP_PRIVATE | MAP_FIXED, fd, 0);
+    unsigned char first = ro[0];
+    pid_t grower = fork();
+    if (grower == 0) {
+        syscall(SYS_brk, (uintptr_t)ro + 4096);
+        ro[0] = 'X';
+        _exit(ro[0] == 'X' ? 0 : 1);
+    }
+    waitpid(grower, &status, 0);
+    check("child can write after brk covers the mapping", WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    check("shared read-only frame stays unchanged", ro[0] == first && first == 'W');
 
     printf("cowtest: %s\n", failures ? "FAILED" : "all passed");
     return failures;
