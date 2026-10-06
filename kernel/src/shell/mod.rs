@@ -1,14 +1,15 @@
-//! Kernel monitor: starts /bin/sh at boot and takes over when it exits.
+//! Kernel monitor: starts a shell at boot and takes over when it exits.
 
 pub mod commands;
 
 use heapless::{String, Vec};
 
 pub fn run() -> ! {
-    crate::printkln!("rust-kernel: starting /bin/sh ('exit' returns to the kernel monitor)");
-    commands::run_program(&["sh"]);
+    let shell = if crate::fs::resolve("/", "/bin/bash", true).is_ok() { "bash" } else { "sh" };
+    crate::printkln!("rust-kernel: starting /bin/{} ('exit' returns to the kernel monitor)", shell);
+    commands::run_program(&[shell]);
 
-    crate::printkln!("rust-kernel monitor. Type 'help' for help, 'run sh' for a shell.");
+    crate::printkln!("rust-kernel monitor. Type 'help' for help, 'run bash' for a shell.");
     loop {
         crate::drivers::tty::set_foreground(0);
         crate::printk!("> ");

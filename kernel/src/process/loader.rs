@@ -22,6 +22,10 @@ pub fn page_up(x: u64) -> u64 {
 
 pub fn load(image: &[u8], args: &[String], envs: &[String]) -> Result<Image, i64> {
     let elf = Elf::parse(image).map_err(|_| ENOEXEC)?;
+    // iretq to a non-user entry point would fault in ring 0.
+    if elf.entry >= super::address_space::USER_END {
+        return Err(ENOEXEC);
+    }
     let mut space = AddressSpace::new().ok_or(ENOMEM)?;
 
     let mut phdr = None;

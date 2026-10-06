@@ -157,6 +157,7 @@ extern "sysv64" fn dispatch(f: &mut Frame) {
         20 => sys_file::writev(a0, a1, a2),
         21 => sys_file::faccessat(cwd, a0),
         22 => sys_file::pipe2(a0, 0),
+        23 => sys_file::timeout_ms(a4, 1000).and_then(|t| sys_file::select(a0, a1, a2, a3, t)),
         24 => {
             super::yield_now();
             Ok(0)
@@ -167,6 +168,7 @@ extern "sysv64" fn dispatch(f: &mut Frame) {
         35 => nanosleep(a0),
         39 | 186 | 218 => Ok(super::current_pid() as i64),
         40 => sys_file::sendfile(a0, a1, a2, a3),
+        41 => Err(EAFNOSUPPORT), // socket: there is no network stack
         57 => super::fork(f).map(|pid| pid as i64),
         59 => execve(f, a0, a1, a2),
         60 | 231 => super::exit(((a0 & 0xff) << 8) as i32),
@@ -191,6 +193,7 @@ extern "sysv64" fn dispatch(f: &mut Frame) {
         109 => super::setpgid(a0, a1),
         112 => super::setsid(),
         110 => Ok(super::current_ppid() as i64),
+        118 | 120 => getres_ids(a0, a1, a2), // getresuid/getresgid
         111 => super::getpgid(0),
         121 => super::getpgid(a0),
         124 => super::getsid(a0),
@@ -208,6 +211,7 @@ extern "sysv64" fn dispatch(f: &mut Frame) {
         266 => sys_file::symlinkat(a0, a1, a2),
         267 => sys_file::readlinkat(a0, a1, a2, a3),
         268 => sys_file::fchmodat(a0, a1, a2),
+        270 => sys_file::timeout_ms(a4, 1_000_000).and_then(|t| sys_file::select(a0, a1, a2, a3, t)),
         271 => sys_file::ppoll(a0, a1, a2),
         269 | 439 => sys_file::faccessat(a0, a1),
         235 => sys_file::utimensat(cwd, a0, 0),
@@ -224,6 +228,14 @@ extern "sysv64" fn dispatch(f: &mut Frame) {
     };
     f.rax = result.unwrap_or_else(|e| -e) as u64;
     super::signal::deliver(f);
+}
+
+/// Everything runs as root: real, effective and saved IDs are all 0.
+fn getres_ids(r: u64, e: u64, s: u64) -> SysResult {
+    for ptr in [r, e, s] {
+        uaccess::write(ptr, 0u32)?;
+    }
+    Ok(0)
 }
 
 fn execve(f: &mut Frame, path: u64, argv: u64, envp: u64) -> SysResult {

@@ -23,6 +23,7 @@ pub const ENAMETOOLONG: i64 = 36;
 pub const ENOSYS: i64 = 38;
 pub const ENOTEMPTY: i64 = 39;
 pub const ELOOP: i64 = 40;
+pub const EAFNOSUPPORT: i64 = 97;
 
 /// Syscall result: Ok(return value) or Err(positive errno).
 pub type SysResult = Result<i64, i64>;

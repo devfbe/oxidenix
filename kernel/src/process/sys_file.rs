@@ -349,14 +349,69 @@ pub fn poll(fds: u64, nfds: u64, timeout_ms: i64) -> SysResult {
     }
 }
 
-pub fn ppoll(fds: u64, nfds: u64, timeout: u64) -> SysResult {
-    let timeout_ms = if timeout == 0 {
-        -1
-    } else {
-        let [sec, nsec]: [u64; 2] = uaccess::read(timeout)?;
-        sec.saturating_mul(1000).saturating_add(nsec / 1_000_000).min(i64::MAX as u64) as i64
+/// Shared core of select and pselect6: `timeout_ms` < 0 waits forever.
+pub fn select(nfds: u64, readfds: u64, writefds: u64, exceptfds: u64, timeout_ms: i64) -> SysResult {
+    if nfds > 1024 {
+        return Err(EINVAL);
+    }
+    let words = nfds.div_ceil(64);
+    let load = |ptr: u64| -> Result<[u64; 16], i64> {
+        let mut set = [0u64; 16];
+        for (i, w) in set.iter_mut().enumerate().take(words as usize) {
+            if ptr != 0 {
+                *w = uaccess::read(ptr + i as u64 * 8)?;
+            }
+        }
+        Ok(set)
     };
-    poll(fds, nfds, timeout_ms)
+    let (want_r, want_w) = (load(readfds)?, load(writefds)?);
+    let deadline = (timeout_ms >= 0).then(|| {
+        let ticks = (timeout_ms as u64).saturating_mul(super::TIMER_HZ).div_ceil(1000);
+        super::ticks().saturating_add(ticks)
+    });
+    loop {
+        let (mut got_r, mut got_w, mut ready) = ([0u64; 16], [0u64; 16], 0);
+        for fd in 0..nfds {
+            let (w, b) = ((fd / 64) as usize, 1u64 << (fd % 64));
+            if (want_r[w] | want_w[w]) & b == 0 {
+                continue;
+            }
+            let revents = file(fd)?.poll(POLLIN | POLLOUT);
+            if want_r[w] & b != 0 && revents & (POLLIN | POLLHUP | POLLERR) != 0 {
+                got_r[w] |= b;
+                ready += 1;
+            }
+            if want_w[w] & b != 0 && revents & (POLLOUT | POLLERR) != 0 {
+                got_w[w] |= b;
+                ready += 1;
+            }
+        }
+        if ready > 0 || deadline.is_some_and(|d| super::ticks() >= d) {
+            for (ptr, set) in [(readfds, got_r), (writefds, got_w), (exceptfds, [0; 16])] {
+                if ptr != 0 {
+                    for (i, w) in set.iter().enumerate().take(words as usize) {
+                        uaccess::write(ptr + i as u64 * 8, *w)?;
+                    }
+                }
+            }
+            return Ok(ready);
+        }
+        super::sleep_ticks(1)?;
+    }
+}
+
+/// Converts a user timeout {seconds, sub_seconds} to milliseconds; a null
+/// pointer means "wait forever".
+pub fn timeout_ms(ptr: u64, sub_per_ms: u64) -> Result<i64, i64> {
+    if ptr == 0 {
+        return Ok(-1);
+    }
+    let [sec, sub]: [u64; 2] = uaccess::read(ptr)?;
+    Ok(sec.saturating_mul(1000).saturating_add(sub / sub_per_ms).min(i64::MAX as u64) as i64)
+}
+
+pub fn ppoll(fds: u64, nfds: u64, timeout: u64) -> SysResult {
+    poll(fds, nfds, timeout_ms(timeout, 1_000_000)?)
 }
 
 pub fn faccessat(dirfd: u64, path: u64) -> SysResult {

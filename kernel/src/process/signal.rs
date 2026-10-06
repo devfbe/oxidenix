@@ -152,7 +152,7 @@ pub fn kill(pid: i64, sig: u64) -> SysResult {
                 p_ if p_ > 0 => p.pid == p_ as Pid,
                 0 => p.pgid == my_pgid,
                 -1 => p.pid != 1 && p.pid != my_pid,
-                p_ => p.pgid == (-p_) as Pid,
+                p_ => p.pgid == p_.unsigned_abs(),
             })
             .map(|p| p.pid)
             .collect();
@@ -268,8 +268,9 @@ pub fn deliver(frame: &mut Frame) {
     if action.handler == SIG_DFL {
         super::exit(sig as i32);
     }
-    if action.flags & SA_RESTORER == 0 {
-        // Without a restorer the handler could never return.
+    // Without a restorer the handler could never return; a handler outside
+    // user space would make iretq fault in ring 0.
+    if action.flags & SA_RESTORER == 0 || action.handler >= USER_END {
         super::exit(sig as i32);
     }
 
@@ -294,7 +295,7 @@ pub fn deliver(frame: &mut Frame) {
 /// rt_sigreturn: restores the state saved by `deliver`. The handler's `ret`
 /// already popped the restorer address, so rsp points at `saved`.
 pub fn sigreturn(frame: &mut Frame) -> SysResult {
-    let base = frame.rsp - 8;
+    let base = frame.rsp.wrapping_sub(8);
     let sf: SigFrame = match uaccess::read(base) {
         Ok(sf) => sf,
         Err(_) => super::exit(11),
