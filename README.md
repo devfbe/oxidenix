@@ -13,6 +13,7 @@ disk driver and the ext2 filesystem already run as a user-space server.
 ![Boot](https://img.shields.io/badge/boot-BIOS%20via%20bootloader%200.11-lightgrey)
 ![Userland](https://img.shields.io/badge/userland-Bash%205.3%20%2B%20BusyBox-green)
 ![Status](https://img.shields.io/badge/status-research%20project-purple)
+![License](https://img.shields.io/badge/license-GPL--3.0-blue)
 
 ![oxidenix running GNU Bash in QEMU](docs/images/oxidenix-bash.png)
 
@@ -450,4 +451,11 @@ oxidenix builds on excellent open source work: the
 [BusyBox](https://busybox.net/) and [GNU Bash](https://www.gnu.org/software/bash/) as packaged
 by [nixpkgs](https://github.com/NixOS/nixpkgs).
 
-No license has been chosen for this repository yet.
+## License
+
+oxidenix is free software: you can redistribute it and/or modify it under the terms of the
+GNU General Public License, version 3, as published by the Free Software Foundation. See
+[LICENSE](LICENSE) for the full text.
+
+The user-space programs that the build fetches from nixpkgs (GNU Bash, BusyBox, musl) are not
+part of this repository and keep their own licenses.
