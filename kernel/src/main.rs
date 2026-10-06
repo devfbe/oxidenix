@@ -9,6 +9,7 @@ use bootloader_api::{entry_point, BootInfo};
 use core::panic::PanicInfo;
 
 mod drivers;
+mod fs;
 mod interrupts;
 mod memory;
 mod process;
@@ -33,7 +34,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         .into_option()
         .expect("Bootloader hat physischen Speicher nicht gemappt");
     memory::init(&boot_info.memory_regions, phys_offset);
+    let ramdisk = boot_info.ramdisk_addr.into_option().map(|addr| unsafe {
+        core::slice::from_raw_parts(addr as *const u8, boot_info.ramdisk_len as usize)
+    });
+    fs::init(ramdisk);
     process::init();
+    // Erst jetzt: der Timer-Interrupt braucht den Scheduler.
+    x86_64::instructions::interrupts::enable();
     shell::run();
 }
 

@@ -21,7 +21,7 @@ fn cmd_help() {
     crate::printkln!("  echo <text>   - Text ausgeben");
     crate::printkln!("  info          - CPU-Infos");
     crate::printkln!("  mem           - Speicherstatistik + Selbsttest");
-    crate::printkln!("  run <prog>    - Userspace-Programm starten");
+    crate::printkln!("  run <prog>    - Programm aus /bin starten");
     crate::printkln!("  halt          - System anhalten");
 }
 
@@ -148,11 +148,7 @@ fn cmd_mem() {
 
 fn cmd_run(args: &Vec<&str, 8>) {
     let Some(&name) = args.first() else {
-        crate::printk!("Programme:");
-        for (name, _) in crate::process::PROGRAMS {
-            crate::printk!(" {}", name);
-        }
-        crate::printkln!();
+        crate::printkln!("usage: run <programm> [args...]  (sucht in /bin, z.B. run ls -l /)");
         return;
     };
     let pid = match crate::process::spawn(name, args) {

@@ -1,31 +1,39 @@
 pub mod address_space;
 pub mod elf;
+pub mod errno;
+mod loader;
+mod sys_file;
+mod sys_mem;
 pub mod syscall;
+pub mod uaccess;
 
+use crate::fs::file::OpenFile;
+use crate::fs::{self, Node};
 use crate::interrupts::gdt;
 use address_space::AddressSpace;
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::{String, ToString};
+use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
-use elf::{Elf, PF_W, PF_X, PT_LOAD, PT_PHDR};
+use core::sync::atomic::{AtomicU64, Ordering};
+use errno::*;
 use syscall::Frame;
 use x86_64::instructions::interrupts;
+use x86_64::registers::control::{Cr3, Cr3Flags};
 use x86_64::registers::model_specific::FsBase;
-use x86_64::structures::paging::PageTableFlags;
 use x86_64::VirtAddr;
 
 pub type Pid = u64;
 
-const STACK_TOP: u64 = 0x0000_7fff_ffff_f000;
-const STACK_SIZE: u64 = 64 * 1024;
 const KSTACK_SIZE: usize = 64 * 1024;
+const MMAP_TOP: u64 = 0x0000_7000_0000_0000;
+pub const TIMER_HZ: u64 = 100;
 
-pub static PROGRAMS: &[(&str, &[u8])] = &[
-    ("hello", include_bytes!(concat!(env!("OUT_DIR"), "/hello"))),
-    ("forktest", include_bytes!(concat!(env!("OUT_DIR"), "/forktest"))),
-];
+static TICKS: AtomicU64 = AtomicU64::new(0);
+const TICK_CHAN: usize = 1;
 
 #[repr(C, align(16))]
 struct KernelStack([u8; KSTACK_SIZE]);
@@ -47,8 +55,16 @@ enum State {
     Ready,
     Running,
     WaitChild,
+    /// Schlaeft, bis `wakeup` mit diesem Kanal aufgerufen wird.
+    Sleeping(usize),
     /// Wait-Status im Linux-Format (exit code << 8 oder Signalnummer).
     Zombie(i32),
+}
+
+#[derive(Clone)]
+struct FdEntry {
+    file: Arc<OpenFile>,
+    cloexec: bool,
 }
 
 struct Process {
@@ -61,6 +77,11 @@ struct Process {
     kernel_rsp: u64,
     fs_base: u64,
     fpu: Box<FpuState>,
+    fds: Vec<Option<FdEntry>>,
+    cwd: String,
+    brk_start: u64,
+    brk_end: u64,
+    mmap_next: u64,
 }
 
 impl Process {
@@ -68,6 +89,31 @@ impl Process {
         self.kstack
             .as_ref()
             .map(|s| s.0.as_ptr() as u64 + KSTACK_SIZE as u64)
+    }
+
+    fn space(&mut self) -> Result<&mut AddressSpace, i64> {
+        self.space.as_mut().ok_or(EINVAL)
+    }
+
+    fn file(&self, fd: u64) -> Result<Arc<OpenFile>, i64> {
+        self.fds
+            .get(fd as usize)
+            .and_then(|e| e.as_ref())
+            .map(|e| e.file.clone())
+            .ok_or(EBADF)
+    }
+
+    /// Kleinster freier Deskriptor >= `min`.
+    fn alloc_fd(&mut self, file: Arc<OpenFile>, cloexec: bool, min: usize) -> Result<i64, i64> {
+        const MAX_FDS: usize = 256;
+        let fd = (min..MAX_FDS)
+            .find(|&i| self.fds.get(i).is_none_or(|e| e.is_none()))
+            .ok_or(EMFILE)?;
+        if self.fds.len() <= fd {
+            self.fds.resize(fd + 1, None);
+        }
+        self.fds[fd] = Some(FdEntry { file, cloexec });
+        Ok(fd as i64)
     }
 }
 
@@ -103,6 +149,12 @@ fn sched() -> &'static mut Scheduler {
     unsafe { (*SCHED.0.get()).as_mut().expect("process::init fehlt") }
 }
 
+/// Fuehrt `f` auf dem aktuellen Prozess aus. Darf nichts tun, was den
+/// Scheduler erneut betritt (schlafen, Dateien schliessen).
+fn with_current<R>(f: impl FnOnce(&mut Process) -> R) -> R {
+    interrupts::without_interrupts(|| f(sched().cur()))
+}
+
 pub fn init() {
     enable_sse();
     syscall::init();
@@ -116,6 +168,11 @@ pub fn init() {
         kernel_rsp: 0,
         fs_base: 0,
         fpu: FpuState::initial(),
+        fds: Vec::new(),
+        cwd: "/".to_string(),
+        brk_start: 0,
+        brk_end: 0,
+        mmap_next: 0,
     };
     let mut procs = BTreeMap::new();
     procs.insert(0, Box::new(kernel));
@@ -142,11 +199,50 @@ fn enable_sse() {
 }
 
 pub fn current_pid() -> Pid {
-    interrupts::without_interrupts(|| sched().current)
+    with_current(|p| p.pid)
 }
 
 pub fn current_ppid() -> Pid {
-    interrupts::without_interrupts(|| sched().cur().ppid)
+    with_current(|p| p.ppid)
+}
+
+pub fn ticks() -> u64 {
+    TICKS.load(Ordering::Relaxed)
+}
+
+/// Vom Timer-Interrupt aufgerufen.
+pub fn tick() {
+    TICKS.fetch_add(1, Ordering::Relaxed);
+    wakeup(TICK_CHAN);
+}
+
+pub fn sleep_ticks(n: u64) {
+    let deadline = ticks() + n;
+    while ticks() < deadline {
+        sleep_on(TICK_CHAN);
+    }
+}
+
+pub fn sleep_on(chan: usize) {
+    interrupts::without_interrupts(|| {
+        sched().cur().state = State::Sleeping(chan);
+        schedule();
+    });
+}
+
+pub fn wakeup(chan: usize) {
+    interrupts::without_interrupts(|| {
+        let s = sched();
+        let pids: Vec<Pid> = s
+            .procs
+            .values()
+            .filter(|p| p.state == State::Sleeping(chan))
+            .map(|p| p.pid)
+            .collect();
+        for pid in pids {
+            s.make_ready(pid);
+        }
+    });
 }
 
 /// Neuer Prozess, der beim ersten Einplanen ueber `syscall_return` mit
@@ -174,100 +270,48 @@ fn new_process(pid: Pid, ppid: Pid, name: String, space: AddressSpace, frame: Fr
         kernel_rsp: frame_addr - 56,
         fs_base: 0,
         fpu: FpuState::initial(),
+        fds: Vec::new(),
+        cwd: "/".to_string(),
+        brk_start: 0,
+        brk_end: 0,
+        mmap_next: MMAP_TOP,
     })
-}
-
-/// Laedt ein eingebettetes Programm in einen frischen Adressraum.
-fn load_program(name: &str, args: &[&str]) -> Result<(AddressSpace, u64, u64), i64> {
-    let image = PROGRAMS
-        .iter()
-        .find(|(n, _)| *n == name)
-        .ok_or(syscall::ENOENT)?
-        .1;
-    let elf = Elf::parse(image).map_err(|_| syscall::EINVAL)?;
-    let mut space = AddressSpace::new().ok_or(syscall::ENOMEM)?;
-
-    let mut phdr = None;
-    for ph in elf.program_headers() {
-        match ph.kind {
-            PT_LOAD => {
-                let mut flags = PageTableFlags::empty();
-                if ph.flags & PF_W != 0 {
-                    flags |= PageTableFlags::WRITABLE;
-                }
-                if ph.flags & PF_X == 0 {
-                    flags |= PageTableFlags::NO_EXECUTE;
-                }
-                space.map_zeroed(ph.vaddr, ph.memsz, flags).map_err(|_| syscall::ENOMEM)?;
-                let bytes = elf.segment_bytes(&ph).map_err(|_| syscall::EINVAL)?;
-                space.write(ph.vaddr, bytes).map_err(|_| syscall::EINVAL)?;
-                if ph.offset == 0 {
-                    phdr.get_or_insert(ph.vaddr + elf.phoff);
-                }
-            }
-            PT_PHDR => phdr = Some(ph.vaddr),
-            _ => {}
-        }
-    }
-
-    let auxv = [
-        (3, phdr.unwrap_or(0)),    // AT_PHDR
-        (4, elf.phentsize as u64), // AT_PHENT
-        (5, elf.phnum as u64),     // AT_PHNUM
-        (6, 4096),                 // AT_PAGESZ
-        (9, elf.entry),            // AT_ENTRY
-    ];
-    let sp = build_stack(&mut space, args, &auxv).map_err(|_| syscall::ENOMEM)?;
-    Ok((space, elf.entry, sp))
-}
-
-/// Linux-Startstack: argc, argv[], NULL, envp[] (leer), NULL, auxv-Paare, AT_NULL.
-fn build_stack(space: &mut AddressSpace, args: &[&str], auxv: &[(u64, u64)]) -> Result<u64, &'static str> {
-    space.map_zeroed(
-        STACK_TOP - STACK_SIZE,
-        STACK_SIZE,
-        PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE,
-    )?;
-    let mut sp = STACK_TOP;
-    let mut argv = Vec::new();
-    for arg in args {
-        sp -= arg.len() as u64 + 1;
-        space.write(sp, arg.as_bytes())?;
-        argv.push(sp);
-    }
-    sp -= 16;
-    let random = sp;
-    let seed = unsafe { core::arch::x86_64::_rdtsc() };
-    space.write(random, &[seed.to_le_bytes(), seed.rotate_left(29).to_le_bytes()].concat())?;
-
-    let mut words: Vec<u64> = Vec::new();
-    words.push(argv.len() as u64);
-    words.extend(&argv);
-    words.push(0);
-    words.push(0);
-    for &(key, val) in auxv {
-        words.extend([key, val]);
-    }
-    words.extend([25, random, 0, 0]); // AT_RANDOM, AT_NULL
-
-    sp = (sp - words.len() as u64 * 8) & !0xf;
-    let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-    space.write(sp, &bytes)?;
-    Ok(sp)
 }
 
 fn basename(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
-/// Startet ein Programm als Kind des aktuellen Prozesses.
+fn load_path(cwd: &str, path: &str, args: &[String], envs: &[String]) -> Result<loader::Image, i64> {
+    let inode = fs::resolve(cwd, path, true)?;
+    let node = inode.node.lock();
+    match &*node {
+        Node::File(data) => loader::load(data.bytes(), args, envs),
+        Node::Dir(_) => Err(EISDIR),
+        _ => Err(ENOEXEC),
+    }
+}
+
+/// Startet ein Programm als Kind der Kernel-Shell, mit der Konsole als
+/// stdin/stdout/stderr. Namen ohne '/' werden in /bin gesucht.
 pub fn spawn(name: &str, args: &[&str]) -> Result<Pid, i64> {
-    let (space, entry, sp) = load_program(name, args)?;
+    let path = if name.contains('/') { name.to_string() } else { alloc::format!("/bin/{name}") };
+    let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    let envs: Vec<String> = ["PATH=/bin", "HOME=/root", "TERM=linux", "PS1=\\w # "]
+        .iter()
+        .map(|e| e.to_string())
+        .collect();
+    let image = load_path("/", &path, &args, &envs)?;
+    let console = OpenFile::console();
     Ok(interrupts::without_interrupts(|| {
         let s = sched();
         let pid = s.next_pid;
         s.next_pid += 1;
-        let p = new_process(pid, s.current, name.to_string(), space, Frame::user_start(entry, sp));
+        let frame = Frame::user_start(image.entry, image.sp);
+        let mut p = new_process(pid, s.current, basename(&path).to_string(), image.space, frame);
+        p.fds = vec![Some(FdEntry { file: console, cloexec: false }); 3];
+        p.brk_start = image.brk;
+        p.brk_end = image.brk;
         s.procs.insert(pid, p);
         s.ready.push_back(pid);
         pid
@@ -276,19 +320,24 @@ pub fn spawn(name: &str, args: &[&str]) -> Result<Pid, i64> {
 
 pub fn fork(frame: &Frame) -> Result<Pid, i64> {
     let s = sched();
-    let parent = s.cur();
-    let name = parent.name.clone();
-    let space = parent
+    let space = s
+        .cur()
         .space
         .as_ref()
-        .ok_or(syscall::EINVAL)?
+        .ok_or(EINVAL)?
         .clone_user()
-        .map_err(|_| syscall::ENOMEM)?;
+        .map_err(|_| ENOMEM)?;
     let mut child_frame = frame.clone();
     child_frame.rax = 0;
     let pid = s.next_pid;
     s.next_pid += 1;
-    let mut child = new_process(pid, s.current, name, space, child_frame);
+    let parent = s.cur();
+    let mut child = new_process(pid, parent.pid, parent.name.clone(), space, child_frame);
+    child.fds = parent.fds.clone();
+    child.cwd = parent.cwd.clone();
+    child.brk_start = parent.brk_start;
+    child.brk_end = parent.brk_end;
+    child.mmap_next = parent.mmap_next;
     child.fs_base = FsBase::read().as_u64();
     unsafe { fxsave(&mut child.fpu) };
     s.procs.insert(pid, child);
@@ -296,23 +345,36 @@ pub fn fork(frame: &Frame) -> Result<Pid, i64> {
     Ok(pid)
 }
 
-pub fn exec(frame: &mut Frame, path: &str, args: &[String]) -> Result<(), i64> {
-    let name = basename(path);
-    let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    let (space, entry, sp) = load_program(name, &args)?;
-    let p = sched().cur();
-    space.activate();
-    // Alter Adressraum wird hier freigegeben; er ist nicht mehr aktiv.
-    p.space = Some(space);
-    p.name = name.to_string();
+pub fn exec(frame: &mut Frame, path: &str, args: &[String], envs: &[String]) -> Result<(), i64> {
+    let cwd = with_current(|p| p.cwd.clone());
+    let image = load_path(&cwd, path, args, envs)?;
+    image.space.activate();
+    let closed: Vec<FdEntry> = with_current(|p| {
+        // Alter Adressraum wird hier freigegeben; er ist nicht mehr aktiv.
+        p.space = Some(image.space);
+        p.name = basename(path).to_string();
+        p.brk_start = image.brk;
+        p.brk_end = image.brk;
+        p.mmap_next = MMAP_TOP;
+        p.fds
+            .iter_mut()
+            .filter(|e| e.as_ref().is_some_and(|e| e.cloexec))
+            .filter_map(|e| e.take())
+            .collect()
+    });
+    drop(closed);
     FsBase::write(VirtAddr::new(0));
     unsafe { fxrstor(&FpuState::initial()) };
-    *frame = Frame::user_start(entry, sp);
+    *frame = Frame::user_start(image.entry, image.sp);
     Ok(())
 }
 
 pub fn exit(status: i32) -> ! {
     interrupts::disable();
+    // Dateien zuerst schliessen: das kann Leser/Schreiber von Pipes wecken.
+    let fds = core::mem::take(&mut sched().cur().fds);
+    drop(fds);
+
     let s = sched();
     let pid = s.current;
     assert!(pid != 0, "Kernel-Task darf nicht exit aufrufen");
@@ -321,12 +383,7 @@ pub fn exit(status: i32) -> ! {
             p.ppid = 0;
         }
     }
-    unsafe {
-        x86_64::registers::control::Cr3::write(
-            crate::memory::kernel_l4(),
-            x86_64::registers::control::Cr3Flags::empty(),
-        )
-    };
+    unsafe { Cr3::write(crate::memory::kernel_l4(), Cr3Flags::empty()) };
     let me = s.cur();
     me.space = None;
     me.state = State::Zombie(status);
@@ -346,7 +403,7 @@ fn wait_child(target: Option<Pid>, nohang: bool) -> Result<Option<(Pid, i32)>, i
         let me = s.current;
         let is_target = |p: &Process| p.ppid == me && p.pid != me && target.is_none_or(|t| t == p.pid);
         if !s.procs.values().any(|p| is_target(p)) {
-            return Err(syscall::ECHILD);
+            return Err(ECHILD);
         }
         let zombie = s.procs.values().find(|p| is_target(p) && matches!(p.state, State::Zombie(_)));
         if let Some(z) = zombie {
@@ -362,21 +419,17 @@ fn wait_child(target: Option<Pid>, nohang: bool) -> Result<Option<(Pid, i32)>, i
     }
 }
 
-pub fn wait4(pid: i64, status_ptr: u64, options: u64) -> i64 {
+pub fn wait4(pid: i64, status_ptr: u64, options: u64) -> SysResult {
     const WNOHANG: u64 = 1;
     let target = if pid > 0 { Some(pid as Pid) } else { None };
-    match wait_child(target, options & WNOHANG != 0) {
-        Ok(Some((pid, status))) => {
+    match wait_child(target, options & WNOHANG != 0)? {
+        Some((pid, status)) => {
             if status_ptr != 0 {
-                if !address_space::user_range_ok(status_ptr, 4, true) {
-                    return -syscall::EFAULT;
-                }
-                unsafe { (status_ptr as *mut i32).write_unaligned(status) };
+                uaccess::write(status_ptr, status)?;
             }
-            pid as i64
+            Ok(pid as i64)
         }
-        Ok(None) => 0,
-        Err(e) => -e,
+        None => Ok(0),
     }
 }
 
@@ -429,12 +482,7 @@ fn switch_to(next: Pid) {
     n.state = State::Running;
     match &n.space {
         Some(space) => space.activate(),
-        None => unsafe {
-            x86_64::registers::control::Cr3::write(
-                crate::memory::kernel_l4(),
-                x86_64::registers::control::Cr3Flags::empty(),
-            )
-        },
+        None => unsafe { Cr3::write(crate::memory::kernel_l4(), Cr3Flags::empty()) },
     }
     if let Some(top) = n.kstack_top() {
         gdt::set_kernel_stack(VirtAddr::new(top));

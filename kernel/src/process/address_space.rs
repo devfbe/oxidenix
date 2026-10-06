@@ -65,6 +65,22 @@ impl AddressSpace {
         })
     }
 
+    /// Entfernt alle Mappings in [start, start+len) und gibt die Frames frei.
+    pub fn unmap(&mut self, start: u64, len: u64) {
+        let Some(end) = start.checked_add(len).filter(|&e| e <= USER_END && len > 0) else { return };
+        let mut mapper = self.mapper();
+        let first = Page::<Size4KiB>::containing_address(VirtAddr::new(start));
+        let last = Page::containing_address(VirtAddr::new(end - 1));
+        memory::with_frames(|frames| {
+            for page in Page::range_inclusive(first, last) {
+                if let Ok((frame, flush)) = mapper.unmap(page) {
+                    flush.flush();
+                    unsafe { frames.deallocate_frame(frame) };
+                }
+            }
+        });
+    }
+
     /// Schreibt in den Adressraum, ohne ihn aktivieren zu muessen.
     pub fn write(&self, addr: u64, data: &[u8]) -> Result<(), &'static str> {
         let mapper = self.mapper();

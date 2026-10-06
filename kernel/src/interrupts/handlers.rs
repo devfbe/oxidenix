@@ -41,6 +41,7 @@ pub extern "x86-interrupt" fn timer_interrupt_handler(stack_frame: InterruptStac
             .lock()
             .notify_end_of_interrupt(crate::interrupts::InterruptIndex::Timer as u8);
     }
+    crate::process::tick();
     // Der Kernel ist nicht praeemptiv: nur Userspace-Code wird unterbrochen.
     if from_user(&stack_frame) {
         crate::process::schedule();

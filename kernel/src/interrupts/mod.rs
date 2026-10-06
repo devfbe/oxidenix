@@ -50,7 +50,6 @@ pub fn init() {
         init_pit(100);
         drain_ps2_output();
     }
-    x86_64::instructions::interrupts::enable();
 }
 
 // Ein vom BIOS liegengelassenes Byte blockiert neue IRQ1-Flanken, bis es gelesen wird.
