@@ -10,6 +10,7 @@ pub fn dispatch(cmd: &str, args: &Vec<&str, 8>) {
         "mem" => cmd_mem(),
         "run" => cmd_run(args),
         "kill" => cmd_kill(args),
+        "ps" => cmd_ps(),
         "" => {}
         other => crate::printkln!("unknown command: {}", other),
     }
@@ -23,7 +24,8 @@ fn cmd_help() {
     crate::printkln!("  info          - CPU info");
     crate::printkln!("  mem           - memory statistics + self-test");
     crate::printkln!("  run <prog>    - start a program from /bin");
-    crate::printkln!("  kill <pid>    - send SIGKILL (the kernel may also stop servers)");
+    crate::printkln!("  ps            - list processes");
+    crate::printkln!("  kill <pid|name> - send SIGKILL (the kernel may also stop servers)");
     crate::printkln!("  halt          - halt the system");
 }
 
@@ -195,12 +197,26 @@ pub fn run_program(args: &[&str]) -> Option<crate::process::WaitStatus> {
 }
 
 
+fn cmd_ps() {
+    crate::printkln!("  PID  PPID  STATE     NAME");
+    for (pid, ppid, name, state, server) in crate::process::list() {
+        crate::printkln!("{:5} {:5}  {:9} {}{}", pid, ppid, state, name, if server { " (server)" } else { "" });
+    }
+}
+
 fn cmd_kill(args: &Vec<&str, 8>) {
-    let Some(pid) = args.first().and_then(|p| p.parse::<i64>().ok()).filter(|&p| p > 0) else {
-        crate::printkln!("usage: kill <pid>");
+    let Some(&target) = args.first() else {
+        crate::printkln!("usage: kill <pid|name>");
         return;
     };
-    match crate::process::signal::kill(pid, 9) {
+    let pid = target.parse::<u64>().ok().or_else(|| {
+        crate::process::list().into_iter().find(|p| p.2 == target && p.0 != 0).map(|p| p.0)
+    });
+    let Some(pid) = pid.filter(|&p| p > 0) else {
+        crate::printkln!("kill: no such process: {}", target);
+        return;
+    };
+    match crate::process::signal::kill(pid as i64, 9) {
         Ok(_) => crate::printkln!("killed {}", pid),
         Err(errno) => crate::printkln!("kill: errno {}", errno),
     }

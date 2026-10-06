@@ -287,6 +287,26 @@ pub fn ioperm(from: u64, count: u64, on: u64) -> SysResult {
     })
 }
 
+/// (pid, parent, name, state, server) of every process, for the monitor.
+pub fn list() -> Vec<(Pid, Pid, String, &'static str, bool)> {
+    interrupts::without_interrupts(|| {
+        sched()
+            .procs
+            .values()
+            .map(|p| {
+                let state = match p.state {
+                    State::Running => "running",
+                    State::Ready => "ready",
+                    State::WaitChild | State::Sleeping(_) => "sleeping",
+                    State::Stopped => "stopped",
+                    State::Zombie(_) => "zombie",
+                };
+                (p.pid, p.ppid, p.name.clone(), state, p.privileged)
+            })
+            .collect()
+    })
+}
+
 pub fn ticks() -> u64 {
     TICKS.load(Ordering::Relaxed)
 }

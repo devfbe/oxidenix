@@ -102,7 +102,7 @@ sh /etc/test.sh            # filesystem, pipes, quotas, rename semantics
 sh /etc/disktest.sh        # ext2: big files, directories, truncate, rename, symlinks
 echo hello > /data/x       # survives a reboot; df -h shows the disk
 sleep 100                  # then press Ctrl+Z, try jobs / bg / fg, then Ctrl+C
-exit                       # drops to the built-in kernel monitor ('help', 'mem', 'run bash')
+exit                       # drops to the built-in kernel monitor ('help', 'ps', 'mem', 'run bash')
 ```
 
 The window scales when it is resized (`zoom-to-fit`), and Ctrl+Alt+F toggles fullscreen.
@@ -303,7 +303,7 @@ interrupt dispatch; drivers and filesystems move into user-space servers.
   Restarted servers are children of the kernel, never of the program that triggered them.
 - **Protected servers**: like init on Linux, privileged servers ignore signals from user space:
   a direct `kill` fails with `EPERM`, and group, broadcast and terminal signals skip them. Only
-  the kernel can stop them (the monitor's `kill <pid>` does, for testing).
+  the kernel can stop them (the monitor's `kill <pid|name>` does, for testing).
 - **Servers in Rust**: `servers/diskfs` is a `no_std` Rust program built for
   `x86_64-unknown-none` as a static `ET_EXEC` binary, using `crates/oxrt` for its entry point,
   syscalls, heap and port I/O. It shares no code with the kernel except the message format.
@@ -394,7 +394,7 @@ Each of these programs and scripts lives in the root filesystem and runs inside 
 | `sh /etc/disktest.sh` | ext2: 150-file directory, 1.5 MiB file (double indirect), append, truncate, rename, cycles, symlinks, `rm -r`, space accounting |
 | `e2fsck -fn disk.img` (host) | the filesystem written by oxidenix is consistent |
 | `kill -9 1` in Bash | user space cannot kill a server (`EPERM`) |
-| `kill 1` in the kernel monitor | the next `/data` access restarts the server; open files survive; after five restarts accesses fail with `EIO` |
+| `kill diskfs` in the kernel monitor | the next `/data` access restarts the server; open files survive; after five restarts accesses fail with `EIO` |
 | `mem` (kernel monitor) | frame and heap accounting, allocator self-test, leak checks after workloads |
 
 During development the AI drove these tests through the QEMU monitor socket (`sendkey`,
