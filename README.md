@@ -488,8 +488,9 @@ interrupt dispatch; drivers and filesystems move into user-space servers.
   with canonical line editing, raw mode for readline, EOF handling and `FIONREAD`. Its buffers
   have fixed sizes because the keyboard path runs in interrupt context and must not allocate.
 - **Keyboard**: PS/2 scancodes are decoded in the IRQ handler with the German (`De105Key`)
-  layout and translated to terminal bytes: CR, DEL, and VT100 sequences for arrows and editing
-  keys.
+  layout and translated to terminal bytes: CR, DEL, and the Linux console's sequences for
+  arrows, editing keys and F1-F12. The AltGr characters the crate's layout lacks
+  (`{ [ ] } \ ² ³ µ`) are added by the driver.
 
 ### Userland build
 
