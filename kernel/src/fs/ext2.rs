@@ -7,7 +7,7 @@
 use super::{Inode, NewNode, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG};
 use crate::drivers::{ata, rtc};
 use crate::process::errno::*;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec;
@@ -141,6 +141,9 @@ struct State {
     free_inodes: u32,
     gdt_block: u32,
     groups: Vec<Group>,
+    /// Inodes whose last link went away; the Ext2 wrapper decides whether
+    /// to free them now or when the last open reference is dropped.
+    unlinked: Vec<(u32, RawInode)>,
 }
 
 /// One directory entry as found on disk.
@@ -326,6 +329,12 @@ impl State {
         (self.block_size / 4) as u64
     }
 
+    /// Largest size the direct and indirect block pointers can address.
+    fn max_file_size(&self) -> u64 {
+        let p = self.ptrs_per_block();
+        (DIRECT as u64 + p + p * p + p * p * p) * self.block_size as u64
+    }
+
     /// Disk block holding file block `fb`, allocating it (and any indirect
     /// blocks on the way) if `alloc`. Returns 0 for a hole when not allocating.
     fn bmap(&mut self, ino: u32, inode: &mut RawInode, fb: u64, alloc: bool) -> Result<u32, i64> {
@@ -464,6 +473,11 @@ impl State {
 
     fn read(&mut self, ino: u32, off: u64, buf: &mut [u8]) -> Result<usize, i64> {
         let mut inode = self.read_inode(ino)?;
+        // Only regular files have data blocks; a fast symlink's block
+        // pointers hold characters, not block numbers.
+        if !inode.is_reg() {
+            return Err(EINVAL);
+        }
         let size = inode.size();
         if off >= size {
             return Ok(0);
@@ -489,6 +503,12 @@ impl State {
 
     fn write(&mut self, ino: u32, off: u64, data: &[u8]) -> Result<usize, i64> {
         let mut inode = self.read_inode(ino)?;
+        if !inode.is_reg() {
+            return Err(EINVAL);
+        }
+        off.checked_add(data.len() as u64)
+            .filter(|&end| end <= self.max_file_size())
+            .ok_or(EFBIG)?;
         let bs = self.block_size as u64;
         let mut done = 0;
         let mut result = Ok(());
@@ -732,14 +752,16 @@ impl State {
         self.dir_remove(dir, name)?;
         if inode.is_dir() {
             self.adjust_links(dir, -1)?;
-            return self.release(ino, inode);
-        }
-        inode.set_links(inode.links().saturating_sub(1));
-        if inode.links() == 0 {
-            return self.release(ino, inode);
+            inode.set_links(0);
+        } else {
+            inode.set_links(inode.links().saturating_sub(1));
         }
         inode.touch(false, false);
-        self.write_inode(ino, &inode)
+        self.write_inode(ino, &inode)?;
+        if inode.links() == 0 {
+            self.unlinked.push((ino, inode));
+        }
+        Ok(())
     }
 
     /// Whether `ancestor` is `dir` or one of its parents (via "..").
@@ -813,6 +835,9 @@ impl State {
 pub struct Ext2 {
     state: Mutex<State>,
     cache: Mutex<BTreeMap<u32, Weak<Inode>>>,
+    /// Unlinked inodes still open somewhere; freed when the last VFS
+    /// reference goes away, so their numbers cannot be reused meanwhile.
+    orphans: Mutex<BTreeSet<u32>>,
 }
 
 impl Ext2 {
@@ -851,6 +876,7 @@ impl Ext2 {
             free_inodes: le32(&sb, 16),
             gdt_block: first_data_block + 1,
             groups: Vec::new(),
+            unlinked: Vec::new(),
         };
         let count = (blocks_count - first_data_block).div_ceil(blocks_per_group) as usize;
         for g in 0..count {
@@ -868,7 +894,11 @@ impl Ext2 {
                 used_dirs: le16(&buf, o + 16),
             });
         }
-        Ok(Arc::new(Ext2 { state: Mutex::new(state), cache: Mutex::new(BTreeMap::new()) }))
+        Ok(Arc::new(Ext2 {
+            state: Mutex::new(state),
+            cache: Mutex::new(BTreeMap::new()),
+            orphans: Mutex::new(BTreeSet::new()),
+        }))
     }
 
     /// The VFS inode for `ino`; the same disk inode always maps to the same
@@ -896,7 +926,37 @@ impl Ext2 {
     pub fn truncate(&self, ino: u32, len: u64) -> Result<(), i64> {
         let mut st = self.state.lock();
         let mut inode = st.read_inode(ino)?;
+        if !inode.is_reg() {
+            return Err(EINVAL);
+        }
+        if len > st.max_file_size() {
+            return Err(EFBIG);
+        }
         st.truncate(ino, &mut inode, len)
+    }
+
+    /// Frees inodes that lost their last link, unless an open file still
+    /// refers to them; those become orphans until `forget`.
+    fn settle_unlinked(&self, st: &mut State) -> Result<(), i64> {
+        for (ino, inode) in core::mem::take(&mut st.unlinked) {
+            let open = self.cache.lock().get(&ino).is_some_and(|w| w.strong_count() > 0);
+            if open {
+                self.orphans.lock().insert(ino);
+            } else {
+                st.release(ino, inode)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Called when the last VFS reference to `ino` is dropped.
+    pub fn forget(&self, ino: u32) {
+        if self.orphans.lock().remove(&ino) {
+            let mut st = self.state.lock();
+            if let Ok(inode) = st.read_inode(ino) {
+                let _ = st.release(ino, inode);
+            }
+        }
     }
     pub fn list(&self, dir: u32) -> Result<Vec<(String, u32, u8)>, i64> {
         self.state.lock().list(dir)
@@ -908,10 +968,16 @@ impl Ext2 {
         self.state.lock().create(dir, name, kind, perm)
     }
     pub fn unlink(&self, dir: u32, name: &str, want_dir: bool) -> Result<(), i64> {
-        self.state.lock().unlink(dir, name, want_dir)
+        let mut st = self.state.lock();
+        let result = st.unlink(dir, name, want_dir);
+        self.settle_unlinked(&mut st)?;
+        result
     }
     pub fn rename(&self, odir: u32, oname: &str, ndir: u32, nname: &str) -> Result<(), i64> {
-        self.state.lock().rename(odir, oname, ndir, nname)
+        let mut st = self.state.lock();
+        let result = st.rename(odir, oname, ndir, nname);
+        self.settle_unlinked(&mut st)?;
+        result
     }
     pub fn readlink(&self, ino: u32) -> Result<String, i64> {
         self.state.lock().readlink(ino)

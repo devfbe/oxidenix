@@ -48,7 +48,13 @@ unsafe impl GlobalAlloc for GrowingHeap {
 
 impl GrowingHeap {
     fn grow(&self, layout: Layout) -> bool {
-        let want = ((layout.size() + layout.align()) as u64).max(HEAP_GROW_STEP).next_multiple_of(PAGE);
+        let Some(want) = (layout.size() as u64)
+            .checked_add(layout.align() as u64)
+            .map(|w| w.max(HEAP_GROW_STEP))
+            .and_then(|w| w.checked_next_multiple_of(PAGE))
+        else {
+            return false;
+        };
         without_interrupts(|| {
             // try_lock: an allocation made while the frame lock is held must
             // fail instead of deadlocking.
@@ -56,7 +62,8 @@ impl GrowingHeap {
             let Some(frames) = guard.as_mut() else { return false };
             let mut heap = self.0.lock();
             let top = heap.top() as u64;
-            if top + want > HEAP_START + HEAP_MAX || frames.free_frames() < want / PAGE + 8 {
+            let fits = top.checked_add(want).is_some_and(|end| end <= HEAP_START + HEAP_MAX);
+            if !fits || frames.free_frames() < want / PAGE + 8 {
                 return false;
             }
             if map_heap(top, want, frames).is_err() {

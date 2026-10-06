@@ -154,6 +154,8 @@ extern "sysv64" fn dispatch(f: &mut Frame) {
         14 => signal::sigprocmask(a0, a1, a2),
         15 => signal::sigreturn(f),
         16 => sys_file::ioctl(a0, a1, a2),
+        17 => sys_file::pread(a0, a1, a2, a3 as i64),
+        18 => sys_file::pwrite(a0, a1, a2, a3 as i64),
         19 => sys_file::readv(a0, a1, a2),
         20 => sys_file::writev(a0, a1, a2),
         21 => sys_file::faccessat(cwd, a0),

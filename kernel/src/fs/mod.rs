@@ -185,6 +185,10 @@ pub struct Inode {
 impl Drop for Inode {
     fn drop(&mut self) {
         release(self.charged);
+        // An unlinked ext2 file is freed once nothing refers to it anymore.
+        if let Node::Disk(d) = self.node.get_mut() {
+            d.fs.forget(d.ino);
+        }
     }
 }
 
@@ -381,11 +385,18 @@ impl Inode {
         }
     }
 
+    /// Only regular files have contents to read or write.
+    fn require_regular(&self) -> Result<(), i64> {
+        match self.file_type() {
+            S_IFREG => Ok(()),
+            S_IFDIR => Err(EISDIR),
+            _ => Err(EINVAL),
+        }
+    }
+
     pub fn read_at(&self, off: u64, buf: &mut [u8]) -> Result<usize, i64> {
         if let Some(d) = self.disk_ref() {
-            if self.is_dir() {
-                return Err(EISDIR);
-            }
+            self.require_regular()?;
             return d.fs.read(d.ino, off, buf);
         }
         match &*self.node.lock() {
@@ -403,9 +414,7 @@ impl Inode {
 
     pub fn write_at(&self, off: u64, buf: &[u8]) -> Result<usize, i64> {
         if let Some(d) = self.disk_ref() {
-            if self.is_dir() {
-                return Err(EISDIR);
-            }
+            self.require_regular()?;
             return d.fs.write(d.ino, off, buf);
         }
         match &mut *self.node.lock() {
@@ -420,6 +429,7 @@ impl Inode {
 
     pub fn truncate(&self, len: u64) -> Result<(), i64> {
         if let Some(d) = self.disk_ref() {
+            self.require_regular()?;
             return d.fs.truncate(d.ino, len);
         }
         let result = match &mut *self.node.lock() {
@@ -441,7 +451,8 @@ impl Inode {
     /// Calls `f` with the whole file contents (read from disk if needed).
     pub fn with_contents<R>(&self, f: impl FnOnce(&[u8]) -> R) -> Result<R, i64> {
         if self.disk_ref().is_some() {
-            let size = usize::try_from(self.size()).map_err(|_| EFBIG)?;
+            self.require_regular()?;
+            let size = usize::try_from(self.size()).ok().filter(|&s| s <= MAX_FILE_SIZE).ok_or(EFBIG)?;
             let mut buf = Vec::new();
             buf.try_reserve_exact(size).map_err(|_| ENOMEM)?;
             buf.resize(size, 0);

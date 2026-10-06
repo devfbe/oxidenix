@@ -43,6 +43,9 @@ pub fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64) ->
         return Err(EINVAL);
     }
     let len = page_up(len);
+    if offset.checked_add(len).is_none() {
+        return Err(EINVAL);
+    }
     // File contents are copied (MAP_PRIVATE semantics, no write-back).
     let file = if flags & MAP_ANONYMOUS == 0 {
         Some(with_current(|p| p.file(fd))?)

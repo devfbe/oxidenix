@@ -45,6 +45,30 @@ pub fn write(fd: u64, buf: u64, len: u64) -> SysResult {
     Ok(f.write(uaccess::slice(buf, len)?)? as i64)
 }
 
+/// File behind `fd` for positional I/O: pipes and devices have no position.
+fn positional(fd: u64, off: i64) -> Result<Arc<OpenFile>, i64> {
+    if off < 0 {
+        return Err(EINVAL);
+    }
+    let f = file(fd)?;
+    match f.inode() {
+        Some(inode) if inode.device().is_none() => Ok(f),
+        _ => Err(ESPIPE),
+    }
+}
+
+pub fn pread(fd: u64, buf: u64, len: u64, off: i64) -> SysResult {
+    let f = positional(fd, off)?;
+    let inode = f.inode().expect("checked by positional");
+    Ok(inode.read_at(off as u64, uaccess::slice_mut(buf, len)?)? as i64)
+}
+
+pub fn pwrite(fd: u64, buf: u64, len: u64, off: i64) -> SysResult {
+    let f = positional(fd, off)?;
+    let inode = f.inode().expect("checked by positional");
+    Ok(inode.write_at(off as u64, uaccess::slice(buf, len)?)? as i64)
+}
+
 fn iovecs(iov: u64, count: u64) -> Result<Vec<(u64, u64)>, i64> {
     if count > 1024 {
         return Err(EINVAL);
@@ -87,6 +111,10 @@ pub fn openat(dirfd: u64, path: u64, flags: u64, mode: u64) -> SysResult {
         }
         Err(e) => return Err(e),
     };
+    // Opening a symlink itself would hand out its target bytes as a file.
+    if flags & O_NOFOLLOW != 0 && inode.file_type() == fs::S_IFLNK {
+        return Err(ELOOP);
+    }
     let writable = flags & O_ACCMODE != 0;
     if inode.is_dir() && writable {
         return Err(EISDIR);
