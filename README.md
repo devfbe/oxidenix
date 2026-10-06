@@ -134,6 +134,8 @@ The window scales when it is resized (`zoom-to-fit`), and Ctrl+Alt+F toggles ful
 ```
 oxidenix/
 ├── kernel/                      the kernel (no_std, target x86_64-unknown-none)
+│   ├── assets/                  boot logo (logo.svg source, rendered logo.png)
+│   ├── build.rs                 turns the logo into raw pixels for the kernel
 │   └── src/
 │       ├── main.rs              entry point, boot configuration, init order
 │       ├── interrupts/          GDT/TSS (gdt.rs), IDT + PIC + PIT (mod.rs),
@@ -148,14 +150,15 @@ oxidenix/
 │       │   ├── signal.rs        signal state, delivery, sigreturn, kill
 │       │   ├── loader.rs        ELF loading and the Linux initial stack
 │       │   ├── elf.rs           ELF64 parser
+│       │   ├── ipc.rs           services and message passing
 │       │   └── uaccess.rs       checked access to user memory
 │       ├── fs/                  VFS (mod.rs), open files and pipes (file.rs),
 │       │                        initramfs unpacker (cpio.rs), IPC client for
 │       │                        filesystem servers (remote.rs)
 │       ├── drivers/             framebuffer console (console.rs), TTY (tty.rs),
-│       │                        PS/2 keyboard (keyboard.rs), CMOS clock (rtc.rs)
+│       │                        PS/2 keyboard (keyboard.rs), CMOS clock (rtc.rs),
+│       │                        serial port mirror (serial.rs)
 │       └── shell/               built-in kernel monitor (fallback shell)
-│   (process/ipc.rs            services and message passing)
 ├── servers/
 │   └── diskfs/                  user-space ext2 server with its own ATA driver
 ├── crates/
@@ -173,7 +176,7 @@ About 6,191 lines of Rust in the kernel and 1,669 in the server, its libraries a
 1. The **bootloader** (BIOS, `bootloader` 0.11) loads the position-independent kernel ELF into
    the upper half (`dynamic_range_start = 0xffff_8000_0000_0000`). It maps all physical
    memory at a dynamic offset, sets up a VESA framebuffer and loads the initramfs as a ramdisk.
-2. `kernel_main` runs these steps in order: framebuffer console → GDT/TSS/IDT and PIC/PIT
+2. `kernel_main` runs these steps in order: framebuffer console and boot logo → GDT/TSS/IDT and PIC/PIT
    (interrupts still off) → frame allocator and 16 MiB kernel heap → VFS from the cpio
    ramdisk and real-time clock → process subsystem (SSE, syscall MSRs, process 0) →
    **interrupts on**.
@@ -341,6 +344,10 @@ interrupt dispatch; drivers and filesystems move into user-space servers.
 - **Console**: a cell grid on the framebuffer with a 24 px Noto Sans Mono bitmap font, 16 ANSI
   colors, a visible cursor, deferred line wrap, UTF-8 (Latin-1), cursor movement, erase,
   insert/delete characters, SGR attributes and cursor position reports.
+- **Boot logo**: drawn centered above the first boot message. Its source is
+  `kernel/assets/logo.svg`; `kernel/build.rs` decodes the rendered `logo.png` into raw RGB at
+  build time, so the kernel needs no image decoder. Like on Linux, the logo is plain pixels and
+  scrolls away with the text.
 - **TTY**: a termios subset (`TCGETS`/`TCSETS*`, `ICANON`, `ECHO*`, `ISIG`, `ICRNL`, `VMIN`, ...)
   with canonical line editing, raw mode for readline, EOF handling and `FIONREAD`. Its buffers
   have fixed sizes because the keyboard path runs in interrupt context and must not allocate.
