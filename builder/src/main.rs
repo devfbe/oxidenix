@@ -106,6 +106,12 @@ fn main() {
             "256M",
             "-smp",
             "4",
+            // Hardware virtualization where available (about 10x faster,
+            // the boot included); QEMU falls back to emulation otherwise.
+            "-accel",
+            "kvm",
+            "-accel",
+            "tcg",
             // User-mode networking (10.0.2.0/24, DHCP, DNS at 10.0.2.3) and a
             // TCP echo service at 10.0.2.100:7 for the self-tests.
             "-netdev",

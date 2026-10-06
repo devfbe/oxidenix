@@ -86,7 +86,9 @@ Its [commit history](#development-history) records every step.
 ### Requirements
 
 - **Rust nightly** with `rust-src` and `llvm-tools-preview` (pinned in `rust-toolchain.toml`).
-- **QEMU** (`qemu-system-x86_64`).
+- **QEMU** (`qemu-system-x86_64`). With KVM (`/dev/kvm` accessible) the builder runs the
+  guest with hardware virtualization: oxidenix boots in about 2 s; without it QEMU falls back
+  to emulation (about 8 s).
 - **Nix**: the userland is fetched and cross-compiled from nixpkgs
   (`pkgsStatic.stdenv.cc` for musl, `pkgsStatic.busybox`, `pkgsStatic.bash`).
 
