@@ -8,7 +8,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use netproto::{Op, MAX_DATA, NONBLOCK};
 
-pub use netproto::{KIND_TCP, KIND_UDP, PEEK};
+pub use netproto::{KIND_RAW_ICMP, KIND_TCP, KIND_UDP, PEEK};
 
 /// An IPv4 endpoint in host byte order.
 #[derive(Clone, Copy, Default)]
@@ -92,7 +92,7 @@ impl Socket {
     /// `to` is for unconnected UDP sockets.
     pub fn send(&self, data: &[u8], to: Option<Endpoint>, nonblocking: bool) -> Result<usize, i64> {
         let to = to.unwrap_or_default();
-        if self.kind == KIND_UDP {
+        if self.kind != KIND_TCP {
             // A datagram is never split.
             if data.len() > MAX_DATA {
                 return Err(EMSGSIZE);

@@ -64,8 +64,8 @@ Its [commit history](#development-history) records every step.
   `diskfs`, an ordinary ring-3 process that talks to the kernel over IPC and reaches the disk
   through I/O ports the kernel granted it. If it dies, the kernel restarts it on the next access, and
   the rest of the system keeps running.
-- **Networking**: TCP and UDP sockets over IPv4 with DNS, so `wget`, `nc` and `nslookup` from
-  BusyBox reach the Internet through QEMU's user network. The driver for the virtio network
+- **Networking**: TCP, UDP and raw ICMP sockets over IPv4 with DNS, so `wget`, `nc`, `ping` and
+  `nslookup` from BusyBox reach the Internet through QEMU's user network. The driver for the virtio network
   card and the TCP/IP stack (smoltcp) run in `netd`, a user-space server; the interface is
   configured by DHCP, and loopback (`127.0.0.1`) works too.
 - **Persistent storage**: the data disk is mounted at `/data`, survives reboots, and stays
@@ -103,6 +103,7 @@ The kernel boots straight into Bash. Things to try:
 ls -l /bin | head          # BusyBox applets
 cowtest; sigtest; jobtest; oomtest; fstest; forktest; nettest # self-tests in user space
 wget -O - http://example.com # DNS and HTTP through netd; nslookup and nc work as well
+ping -c 3 1.1.1.1          # raw ICMP sockets; oxidenix answers pings itself, too
 sh /etc/test.sh            # filesystem, pipes, quotas, rename semantics
 sh /etc/disktest.sh        # ext2: big files, directories, truncate, rename, symlinks
 echo hello > /data/x       # survives a reboot; df -h shows the disk
@@ -365,7 +366,10 @@ interrupt dispatch; drivers and filesystems move into user-space servers.
   the network.
 - **Sockets** (`process/sys_net.rs`, `net.rs`): `socket`, `bind`, `listen`, `accept`/`accept4`,
   `connect`, `send*`/`recv*` (also `sendmsg`/`recvmsg`), `shutdown`, `getsockname`,
-  `getpeername` and `getsockopt(SO_ERROR)` for `AF_INET` stream and datagram sockets. A socket is
+  `getpeername` and `getsockopt(SO_ERROR)` for `AF_INET` stream and datagram sockets, plus raw
+  ICMP sockets (`SOCK_RAW`, `IPPROTO_ICMP`) for `ping`: the program writes the ICMP message,
+  netd adds the IPv4 header, and reads return whole IPv4 packets, as on Linux. netd answers
+  echo requests itself. A socket is
   an open file, so `read`, `write`, `poll`, `select`, `fcntl(O_NONBLOCK)`, `dup` and `fork`
   work as usual. Every operation is a `netproto` request to netd; closing the last descriptor
   posts `Close` without waiting.
@@ -381,8 +385,8 @@ interrupt dispatch; drivers and filesystems move into user-space servers.
   at `10.0.2.100:7` (`guestfwd` to `cat` on the host).
 - **Restarts**: a crashed netd is started again by the next socket call (see self-healing). It
   gets the same DMA area, which it clears before handing it to the freshly reset card.
-- Not yet: IPv6, raw sockets (so no `ping`), `AF_UNIX`, and interface configuration from user
-  space (`ifconfig`).
+- Not yet: IPv6, other raw protocols, `AF_UNIX`, and interface configuration from user space
+  (`ifconfig`). Times shown by `ping` have the 10 ms resolution of the timer tick.
 
 ### Persistent storage
 
@@ -447,7 +451,7 @@ Linux x86_64 numbers, grouped by area (about 120 in total):
 | Filesystems | `statfs` `fstatfs` `sync` `fsync` `fdatasync` |
 | Servers | `ioperm` (privileged servers only), `ipc_register` (1000), `ipc_receive` (1001, with timeout and interrupt notifications), `ipc_reply` (1002), `irq_enable` (1003), `dma_map` (1004) |
 | Power | `reboot` (power off ends QEMU, restart resets the machine) |
-| Sockets | `socket` `bind` `listen` `accept` `accept4` `connect` `sendto` `recvfrom` `sendmsg` `recvmsg` `shutdown` `getsockname` `getpeername` `setsockopt` (ignored) `getsockopt` (`AF_INET` only) |
+| Sockets | `socket` `bind` `listen` `accept` `accept4` `connect` `sendto` `recvfrom` `sendmsg` `recvmsg` `shutdown` `getsockname` `getpeername` `setsockopt` (ignored) `getsockopt` (`AF_INET` only: TCP, UDP, raw ICMP) |
 | Time and misc | `nanosleep` `clock_gettime` (`CLOCK_REALTIME` from the RTC) `uname` `getrandom` |
 
 Everything runs as root. Unknown syscalls print a kernel message and return `ENOSYS`.
@@ -468,7 +472,7 @@ Each of these programs and scripts lives in the root filesystem and runs inside 
 | `sigtest` | handlers, killing a busy loop, `SIGCHLD`, `EINTR` on pipe reads, blocked and ignored signals, FPU state across asynchronous handlers, `alarm` and repeating `setitimer` |
 | `jobtest` | stop/continue reporting through `wait4`, restart of a stopped `read()`, `SIGKILL` on stopped processes, `SA_RESTART` |
 | `forktest` | `fork`, `execve`, `wait4`, preemptive interleaving of two workers |
-| `nettest` | TCP to an echo service through QEMU, `ECONNREFUSED`, `listen`/`accept` over loopback with a forked client, EOF after the peer closed, non-blocking `accept` and `connect` with `poll` and `SO_ERROR`, `EINTR` in a blocking `recv`, UDP over loopback, `AF_INET6` rejected |
+| `nettest` | TCP to an echo service through QEMU, `ECONNREFUSED`, `listen`/`accept` over loopback with a forked client, EOF after the peer closed, non-blocking `accept` and `connect` with `poll` and `SO_ERROR`, `EINTR` in a blocking `recv`, UDP over loopback, raw ICMP echo to the gateway and over loopback, source address for off-subnet destinations, overflowing message vectors, `AF_INET6` rejected |
 | `sh /etc/test.sh` | files, pipes, `cd`, `mkdir`/`touch`/`rm`, rename cycles via symlinks, file quota |
 | `fstest` | descriptor access modes (`EBADF` on read-only/write-only fds), `O_NOFOLLOW` on symlinks, unlinked-but-open files (kept until closed, never shared with new files), ext2 size limits, overflowing `mmap` offsets |
 | `sh /etc/disktest.sh` | ext2: 150-file directory, 1.5 MiB file (double indirect), append, truncate, rename, cycles, symlinks, `rm -r`, space accounting |
@@ -519,7 +523,8 @@ kernel. Its program is fixed at boot (see self-healing), but a bug in it is a ke
 - [x] Unlinked-but-open files kept until closed
 - [ ] Hard links and a block cache
 - [x] Networking: TCP/UDP sockets, DNS, DHCP and loopback through a user-space server (`netd`)
-- [ ] IPv6, raw sockets (`ping`), `AF_UNIX`, `ifconfig`
+- [x] `ping` (raw ICMP sockets)
+- [ ] IPv6, `AF_UNIX`, `ifconfig`
 - [ ] SMP, dynamic linking, real entropy, users and permissions
 
 ## Development history

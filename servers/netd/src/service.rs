@@ -9,9 +9,10 @@ use alloc::vec;
 use alloc::vec::Vec;
 use netproto::*;
 use smoltcp::iface::{Interface, SocketHandle, SocketSet};
-use smoltcp::socket::{tcp, udp};
+use smoltcp::phy::ChecksumCapabilities;
+use smoltcp::socket::{raw, tcp, udp};
 use smoltcp::time::{Duration, Instant};
-use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, Ipv4Address};
+use smoltcp::wire::{IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol, IpVersion, Ipv4Address, Ipv4Packet, Ipv4Repr};
 
 const EBADF: i64 = 9;
 const EAGAIN: i64 = 11;
@@ -28,6 +29,7 @@ const ETIMEDOUT: i64 = 110;
 const ECONNREFUSED: i64 = 111;
 const EINPROGRESS: i64 = 115;
 const EDESTADDRREQ: i64 = 89;
+const EMSGSIZE: i64 = 90;
 const EINTR: i64 = 4;
 
 /// Upper bound for sockets, so the 4 MiB heap holds all buffers.
@@ -46,7 +48,15 @@ const TCP_TIMEOUT: Duration = Duration::from_secs(20);
 enum Entry {
     Tcp(Tcp),
     Udp(Udp),
+    Raw(Raw),
 }
+
+struct Raw {
+    socket: SocketHandle,
+    peer: Option<Ipv4Address>,
+}
+
+const IPV4_HEADER: usize = 20;
 
 struct Tcp {
     socket: SocketHandle,
@@ -268,6 +278,9 @@ impl Service {
             Some(Entry::Udp(u)) => {
                 sockets.remove(u.socket);
             }
+            Some(Entry::Raw(r)) => {
+                sockets.remove(r.socket);
+            }
             None => {}
         }
     }
@@ -284,6 +297,10 @@ impl Service {
                 if !socket.is_open() {
                     socket.bind(port).map_err(|_| EADDRINUSE)?;
                 }
+                Ok(false)
+            }
+            Entry::Raw(r) => {
+                r.peer = Some(Ipv4Address::from_bits(args[1] as u32));
                 Ok(false)
             }
             Entry::Tcp(t) => {
@@ -337,6 +354,12 @@ impl Service {
                         let tx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; UDP_PACKETS], vec![0; UDP_BUFFER]);
                         Entry::Udp(Udp { socket: sockets.add(udp::Socket::new(rx, tx)), peer: None })
                     }
+                    KIND_RAW_ICMP => {
+                        let rx = raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY; UDP_PACKETS], vec![0; UDP_BUFFER]);
+                        let tx = raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY; UDP_PACKETS], vec![0; UDP_BUFFER]);
+                        let socket = raw::Socket::new(Some(IpVersion::Ipv4), Some(IpProtocol::Icmp), rx, tx);
+                        Entry::Raw(Raw { socket: sockets.add(socket), peer: None })
+                    }
                     _ => return Err(EINVAL),
                 };
                 let h = self.next_handle;
@@ -361,6 +384,8 @@ impl Service {
                         socket.bind(IpListenEndpoint { addr, port }).map_err(|_| EINVAL)?;
                         done(0)
                     }
+                    // A raw socket's address only selects the source; ours is fixed.
+                    Entry::Raw(_) => done(0),
                 }
             }
             Op::Listen => {
@@ -458,6 +483,24 @@ impl Service {
                         Err(udp::SendError::Unaddressable) => Err(ENETUNREACH),
                     }
                 }
+                Entry::Raw(r) => {
+                    let dst = if args[2] != 0 { Ipv4Address::from_bits(args[2] as u32) } else { r.peer.ok_or(EDESTADDRREQ)? };
+                    if payload.len() + IPV4_HEADER > UDP_BUFFER {
+                        return Err(EMSGSIZE);
+                    }
+                    let src = iface.get_source_address_ipv4(&dst).ok_or(ENETUNREACH)?;
+                    let s = sockets.get_mut::<raw::Socket>(r.socket);
+                    if !s.can_send() {
+                        return Ok(Wait);
+                    }
+                    // The application writes the ICMP message; the IP header is ours.
+                    let repr = Ipv4Repr { src_addr: src, dst_addr: dst, next_header: IpProtocol::Icmp, payload_len: payload.len(), hop_limit: 64 };
+                    let mut packet = vec![0u8; IPV4_HEADER + payload.len()];
+                    repr.emit(&mut Ipv4Packet::new_unchecked(&mut packet[..]), &ChecksumCapabilities::default());
+                    packet[IPV4_HEADER..].copy_from_slice(payload);
+                    s.send_slice(&packet).map_err(|_| ENOBUFS)?;
+                    done(payload.len() as i64)
+                }
             },
             Op::Recv => {
                 let max = (args[1] as usize).min(MAX_DATA);
@@ -491,6 +534,19 @@ impl Service {
                             Ok((mut data, from)) => {
                                 data.truncate(max);
                                 Ok(Done(data.len() as i64, [bits(from.addr), from.port as u64, 0, 0, 0, 0], data))
+                            }
+                            Err(_) => Ok(Wait),
+                        }
+                    }
+                    Entry::Raw(r) => {
+                        let s = sockets.get_mut::<raw::Socket>(r.socket);
+                        let packet = if peek { s.peek().map(|d| d.to_vec()) } else { s.recv().map(|d| d.to_vec()) };
+                        match packet {
+                            Ok(mut data) => {
+                                // Whole IPv4 packet, header included, as on Linux.
+                                let from = Ipv4Packet::new_checked(&data[..]).map_or(0, |p| p.src_addr().to_bits() as u64);
+                                data.truncate(max);
+                                Ok(Done(data.len() as i64, [from, 0, 0, 0, 0, 0], data))
                             }
                             Err(_) => Ok(Wait),
                         }
@@ -546,6 +602,15 @@ impl Service {
                             ready |= POLLOUT;
                         }
                     }
+                    Entry::Raw(r) => {
+                        let s = sockets.get::<raw::Socket>(r.socket);
+                        if s.can_recv() {
+                            ready |= POLLIN;
+                        }
+                        if s.can_send() {
+                            ready |= POLLOUT;
+                        }
+                    }
                 }
                 Ok(Done(0, [ready & (args[1] | POLLERR | POLLHUP), 0, 0, 0, 0, 0], Vec::new()))
             }
@@ -572,6 +637,11 @@ impl Service {
                             IpEndpoint::new(addr, l.port)
                         }
                     }
+                    Entry::Raw(r) => match (peer, r.peer) {
+                        (true, Some(p)) => IpEndpoint::new(IpAddress::Ipv4(p), 0),
+                        (true, None) => return Err(ENOTCONN),
+                        (false, _) => IpEndpoint::new(ipv4(0), 0),
+                    },
                 };
                 // An unbound local address reads as the interface address.
                 let addr = match bits(ep.addr) {

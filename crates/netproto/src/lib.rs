@@ -65,6 +65,9 @@ impl Op {
 
 pub const KIND_TCP: u64 = 1;
 pub const KIND_UDP: u64 = 2;
+/// Raw ICMP (SOCK_RAW, IPPROTO_ICMP): sends ICMP messages, receives whole
+/// IPv4 packets carrying ICMP, as Linux does.
+pub const KIND_RAW_ICMP: u64 = 3;
 
 /// Flag: answer EAGAIN instead of waiting.
 pub const NONBLOCK: u64 = 1;

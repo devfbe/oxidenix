@@ -53,6 +53,37 @@ static int read_all(int fd, char *buf, int len) {
 
 static void on_alarm(int sig) { (void)sig; }
 
+/* One ICMP echo request to `ip`; returns 1 if the matching reply arrives
+ * within two seconds (as a whole IPv4 packet, like on Linux). */
+static int icmp_echo(const char *ip) {
+    int fd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    if (fd < 0) return 0;
+    unsigned char req[16] = {8, 0, 0, 0, 0x12, 0x34, 0, 1, 'o', 'x', 'i', 'd', 'e', 'n', 'i', 'x'};
+    unsigned sum = 0;
+    for (int i = 0; i < 16; i += 2) sum += req[i] << 8 | req[i + 1];
+    while (sum >> 16) sum = (sum & 0xffff) + (sum >> 16);
+    sum = ~sum & 0xffff;
+    req[2] = sum >> 8;
+    req[3] = sum & 0xff;
+    struct sockaddr_in a = addr(ip, 0);
+    if (sendto(fd, req, sizeof req, 0, (struct sockaddr *)&a, sizeof a) != sizeof req) {
+        close(fd);
+        return 0;
+    }
+    int found = 0;
+    for (int tries = 0; tries < 8 && !found; tries++) {
+        struct pollfd p = {fd, POLLIN, 0};
+        if (poll(&p, 1, 2000) != 1) break;
+        unsigned char reply[128];
+        int n = recv(fd, reply, sizeof reply, 0);
+        int ihl = (reply[0] & 0xf) * 4;
+        /* Skip our own request when it comes back over loopback. */
+        found = n >= ihl + 16 && reply[9] == 1 && reply[ihl] == 0 && reply[ihl + 4] == 0x12 && reply[ihl + 5] == 0x34;
+    }
+    close(fd);
+    return found;
+}
+
 int main(void) {
     char buf[256];
 
@@ -159,6 +190,9 @@ int main(void) {
           n == 8 && memcmp(buf, "datagram", 8) == 0 && from.sin_addr.s_addr == inet_addr("127.0.0.1"));
     close(rx);
     close(tx);
+
+    check("raw ICMP echo to the gateway gets a reply", icmp_echo("10.0.2.2"));
+    check("raw ICMP echo over loopback gets a reply", icmp_echo("127.0.0.1"));
 
     /* Lengths chosen to overflow naive arithmetic in the kernel. */
     int u = socket(AF_INET, SOCK_DGRAM, 0);

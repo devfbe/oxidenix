@@ -4,7 +4,7 @@
 use super::errno::*;
 use super::{uaccess, with_current};
 use crate::fs::file::{Kind, OpenFile, O_CLOEXEC, O_NONBLOCK, O_RDWR};
-use crate::net::{Endpoint, Socket, KIND_TCP, KIND_UDP};
+use crate::net::{Endpoint, Socket, KIND_RAW_ICMP, KIND_TCP, KIND_UDP};
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -12,6 +12,8 @@ use alloc::vec::Vec;
 const AF_INET: u16 = 2;
 const SOCK_STREAM: u64 = 1;
 const SOCK_DGRAM: u64 = 2;
+const SOCK_RAW: u64 = 3;
+const IPPROTO_ICMP: u64 = 1;
 const SOCK_TYPE_MASK: u64 = 0xf;
 const SOCK_NONBLOCK: u64 = O_NONBLOCK as u64;
 const SOCK_CLOEXEC: u64 = O_CLOEXEC as u64;
@@ -73,13 +75,15 @@ fn write_addr(addr: u64, len_ptr: u64, ep: Endpoint) -> Result<(), i64> {
     uaccess::write(len_ptr, raw.len() as u32)
 }
 
-pub fn socket(domain: u64, ty: u64, _protocol: u64) -> SysResult {
+pub fn socket(domain: u64, ty: u64, protocol: u64) -> SysResult {
     if domain != AF_INET as u64 {
         return Err(EAFNOSUPPORT);
     }
-    let kind = match ty & SOCK_TYPE_MASK {
-        SOCK_STREAM => KIND_TCP,
-        SOCK_DGRAM => KIND_UDP,
+    let kind = match (ty & SOCK_TYPE_MASK, protocol) {
+        (SOCK_STREAM, _) => KIND_TCP,
+        (SOCK_DGRAM, _) => KIND_UDP,
+        // Raw ICMP for ping; everything runs as root, so no privilege check.
+        (SOCK_RAW, IPPROTO_ICMP) => KIND_RAW_ICMP,
         _ => return Err(EPROTONOSUPPORT),
     };
     install(Socket::new(kind)?, ty)
@@ -205,7 +209,11 @@ pub fn getsockopt(fd: u64, level: u64, name: u64, val: u64, len_ptr: u64) -> Sys
     let f = socket_file(fd)?;
     let value: i32 = match (level, name) {
         (SOL_SOCKET, SO_ERROR) => sock(&f).take_error() as i32,
-        (SOL_SOCKET, SO_TYPE) => if sock(&f).kind == KIND_TCP { SOCK_STREAM as i32 } else { SOCK_DGRAM as i32 },
+        (SOL_SOCKET, SO_TYPE) => match sock(&f).kind {
+            KIND_TCP => SOCK_STREAM as i32,
+            KIND_UDP => SOCK_DGRAM as i32,
+            _ => SOCK_RAW as i32,
+        },
         // Everything else reads as off/zero.
         _ => 0,
     };
