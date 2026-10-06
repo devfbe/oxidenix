@@ -24,7 +24,10 @@ An AI research project; see README.md.
 
 ## Workflow
 
-- Commit every finished, tested step without asking and continue directly
-  with the next step.
-- After every commit, push to GitHub (`origin`, account devfbe) without touching the
-  global git config: `git -c credential.helper= -c credential.helper='!gh auth git-credential' push`.
+- After every change, review the documentation (README.md, CLAUDE.md, code comments that
+  describe behavior) and update it in the same commit if it no longer matches.
+- Commit in small steps: one commit per finished logical step, tested before committing.
+- Push every commit to `main` on GitHub (`origin`, account devfbe) on your own, without
+  asking, and without touching the global git config:
+  `git -c credential.helper= -c credential.helper='!gh auth git-credential' push`.
+- Then continue directly with the next step.
