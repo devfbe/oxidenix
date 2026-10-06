@@ -21,11 +21,20 @@ pub const O_NOFOLLOW: u32 = 0o400000;
 pub const O_CLOEXEC: u32 = 0o2000000;
 
 const PIPE_CAPACITY: usize = 64 * 1024;
+/// Buffer space charged when a pipe is created. An empty pipe can therefore
+/// always accept data; only growth beyond it depends on the quota, so a
+/// full quota can slow pipes down but never deadlock a pipeline.
+const PIPE_RESERVED: usize = 16 * 1024;
 
 pub struct Pipe {
     buf: Mutex<VecDeque<u8>>,
     readers: AtomicUsize,
     writers: AtomicUsize,
+}
+
+/// Quota charged for `len` buffered bytes beyond the reservation.
+fn extra(len: usize) -> usize {
+    len.saturating_sub(PIPE_RESERVED)
 }
 
 impl Pipe {
@@ -40,7 +49,7 @@ impl Pipe {
 
 impl Drop for Pipe {
     fn drop(&mut self) {
-        crate::fs::release(self.buf.lock().len());
+        crate::fs::release(PIPE_RESERVED + extra(self.buf.lock().len()));
     }
 }
 
@@ -74,16 +83,17 @@ impl OpenFile {
         OpenFile::new(Kind::Inode(inode), O_RDWR, Some("/dev/console".into()))
     }
 
-    pub fn pipe() -> (Arc<OpenFile>, Arc<OpenFile>) {
+    pub fn pipe() -> Result<(Arc<OpenFile>, Arc<OpenFile>), i64> {
+        crate::fs::charge(PIPE_RESERVED).map_err(|_| ENFILE)?;
         let pipe = Arc::new(Pipe {
             buf: Mutex::new(VecDeque::new()),
             readers: AtomicUsize::new(1),
             writers: AtomicUsize::new(1),
         });
-        (
+        Ok((
             OpenFile::new(Kind::PipeRead(pipe.clone()), 0, None),
             OpenFile::new(Kind::PipeWrite(pipe), O_WRONLY, None),
-        )
+        ))
     }
 
     pub fn inode(&self) -> Option<&Arc<Inode>> {
@@ -175,11 +185,13 @@ impl OpenFile {
                 let mut q = pipe.buf.lock();
                 if !q.is_empty() {
                     let n = buf.len().min(q.len());
+                    let before = extra(q.len());
                     for (dst, src) in buf.iter_mut().zip(q.drain(..n)) {
                         *dst = src;
                     }
+                    let after = extra(q.len());
                     drop(q);
-                    crate::fs::release(n);
+                    crate::fs::release(before - after);
                     wakeup(pipe.write_chan());
                     return Ok(n);
                 }
@@ -207,16 +219,18 @@ impl OpenFile {
             // exhausted (or the heap is), the pipe behaves as if it were full.
             let pushed = {
                 let mut q = pipe.buf.lock();
-                let n = (PIPE_CAPACITY - q.len()).min(buf.len() - written);
-                if n > 0 && crate::fs::charge(n).is_ok() {
-                    if q.try_reserve(n).is_ok() {
-                        q.extend(&buf[written..written + n]);
-                        n
-                    } else {
-                        crate::fs::release(n);
-                        0
-                    }
+                let mut n = (PIPE_CAPACITY - q.len()).min(buf.len() - written);
+                let mut charged = extra(q.len() + n) - extra(q.len());
+                if charged > 0 && crate::fs::charge(charged).is_err() {
+                    // Quota exhausted: only use what the reservation covers.
+                    n = PIPE_RESERVED.saturating_sub(q.len()).min(n);
+                    charged = 0;
+                }
+                if n > 0 && q.try_reserve(n).is_ok() {
+                    q.extend(&buf[written..written + n]);
+                    n
                 } else {
+                    crate::fs::release(charged);
                     0
                 }
             };

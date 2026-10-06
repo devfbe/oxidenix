@@ -9,7 +9,7 @@ use spin::{Mutex, Once};
 use x86_64::instructions::interrupts::without_interrupts;
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::{
-    FrameAllocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags, PhysFrame,
+    FrameAllocator, FrameDeallocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags, PhysFrame,
     Size4KiB,
 };
 use x86_64::VirtAddr;
@@ -76,7 +76,13 @@ fn map_heap(start: u64, len: u64, frames: &mut PhysFrameAllocator) -> Result<(),
     for page in Page::range_inclusive(first, last) {
         let frame = frames.allocate_frame().ok_or(())?;
         // The heap's upper-half tables are shared by every address space.
-        unsafe { mapper.map_to(page, frame, flags, frames) }.map_err(|_| ())?.flush();
+        match unsafe { mapper.map_to(page, frame, flags, frames) } {
+            Ok(flush) => flush.flush(),
+            Err(_) => {
+                unsafe { frames.deallocate_frame(frame) };
+                return Err(());
+            }
+        }
     }
     Ok(())
 }

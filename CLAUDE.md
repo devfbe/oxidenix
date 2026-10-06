@@ -24,4 +24,5 @@ An AI research project; see README.md.
 
 - Commit every finished, tested step without asking and continue directly
   with the next step.
-- After every commit, push to GitHub (`origin`, account devfbe).
+- After every commit, push to GitHub (`origin`, account devfbe) without touching the
+  global git config: `git -c credential.helper= -c credential.helper='!gh auth git-credential' push`.

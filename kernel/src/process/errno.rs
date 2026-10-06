@@ -13,6 +13,7 @@ pub const EEXIST: i64 = 17;
 pub const ENOTDIR: i64 = 20;
 pub const EISDIR: i64 = 21;
 pub const EINVAL: i64 = 22;
+pub const ENFILE: i64 = 23;
 pub const EMFILE: i64 = 24;
 pub const ENOTTY: i64 = 25;
 pub const EFBIG: i64 = 27;

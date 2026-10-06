@@ -208,7 +208,7 @@ pub fn getdents64(fd: u64, buf: u64, len: u64) -> SysResult {
 }
 
 pub fn pipe2(fds: u64, flags: u64) -> SysResult {
-    let (r, w) = OpenFile::pipe();
+    let (r, w) = OpenFile::pipe()?;
     let nonblock = flags as u32 & O_NONBLOCK;
     r.flags.fetch_or(nonblock, Ordering::Relaxed);
     w.flags.fetch_or(nonblock, Ordering::Relaxed);

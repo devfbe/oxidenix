@@ -14,6 +14,15 @@ const PAGE: u64 = 4096;
 /// first write (an OS-available page table bit).
 pub const COW: PageTableFlags = PageTableFlags::BIT_9;
 
+/// Pages covering [start, end) in user space. Unlike `Page::range_inclusive`
+/// this never steps past the last page, which for the top user page would
+/// compute the non-canonical address `USER_END` and panic.
+fn user_pages(start: u64, end: u64) -> impl Iterator<Item = Page<Size4KiB>> {
+    (start & !(PAGE - 1)..end)
+        .step_by(PAGE as usize)
+        .map(|a| Page::containing_address(VirtAddr::new(a)))
+}
+
 /// Own level-4 table: the lower half belongs to the process, the upper
 /// (kernel) half is shared with the kernel address space.
 pub struct AddressSpace {
@@ -48,11 +57,9 @@ impl AddressSpace {
         let flags = flags | PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
         let parent = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
         let mut mapper = self.mapper();
-        let first = Page::<Size4KiB>::containing_address(VirtAddr::new(start));
-        let last = Page::containing_address(VirtAddr::new(end - 1));
         memory::with_frames(|frames| {
             let mut frames = UserFrames(frames);
-            for page in Page::range_inclusive(first, last) {
+            for page in user_pages(start, end) {
                 if let Ok(frame) = mapper.translate_page(page) {
                     let old = leaf_flags(&mapper, page);
                     let mut merged = merge(old, flags);
@@ -70,9 +77,14 @@ impl AddressSpace {
                 }
                 let frame = frames.allocate_frame().ok_or("out of memory")?;
                 unsafe { core::ptr::write_bytes(memory::phys_to_virt(frame.start_address().as_u64()), 0, PAGE as usize) };
-                unsafe { mapper.map_to_with_table_flags(page, frame, flags, parent, &mut frames) }
-                    .map_err(|_| "map_to failed")?
-                    .ignore();
+                match unsafe { mapper.map_to_with_table_flags(page, frame, flags, parent, &mut frames) } {
+                    Ok(flush) => flush.ignore(),
+                    Err(_) => {
+                        // Not mapped, so nothing else will ever free it.
+                        unsafe { frames.0.deallocate_frame(frame) };
+                        return Err("map_to failed");
+                    }
+                }
             }
             Ok(())
         })
@@ -82,10 +94,8 @@ impl AddressSpace {
     pub fn unmap(&mut self, start: u64, len: u64) {
         let Some(end) = start.checked_add(len).filter(|&e| e <= USER_END && len > 0) else { return };
         let mut mapper = self.mapper();
-        let first = Page::<Size4KiB>::containing_address(VirtAddr::new(start));
-        let last = Page::containing_address(VirtAddr::new(end - 1));
         memory::with_frames(|frames| {
-            for page in Page::range_inclusive(first, last) {
+            for page in user_pages(start, end) {
                 if let Ok((frame, flush)) = mapper.unmap(page) {
                     flush.flush();
                     unsafe { frames.deallocate_frame(frame) };
@@ -137,11 +147,12 @@ impl AddressSpace {
                                 leaf.set_flags(flags);
                             }
                             let frame = PhysFrame::containing_address(leaf.addr());
-                            frames.0.share(frame);
                             let page = Page::<Size4KiB>::containing_address(VirtAddr::new(va));
                             unsafe { mapper.map_to_with_table_flags(page, frame, flags, parent, &mut frames) }
                                 .map_err(|_| "map_to failed")?
                                 .ignore();
+                            // Only a successful mapping owns a reference.
+                            frames.0.share(frame);
                         }
                     }
                 }
@@ -285,9 +296,7 @@ pub fn user_range_ok(addr: u64, len: u64, write: bool) -> bool {
     }
     let need = PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
     let mapper = unsafe { memory::active_page_table() };
-    let first = Page::<Size4KiB>::containing_address(VirtAddr::new(addr));
-    let last = Page::containing_address(VirtAddr::new(end - 1));
-    Page::range_inclusive(first, last).all(|p| {
+    user_pages(addr, end).all(|p| {
         let flags = leaf_flags(&mapper, p);
         if !flags.contains(need) {
             return false;
