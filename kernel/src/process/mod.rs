@@ -4,6 +4,7 @@ pub mod errno;
 pub mod ipc;
 pub mod irq;
 mod loader;
+mod prctl;
 pub mod sched;
 pub mod signal;
 mod sys_file;
@@ -85,7 +86,7 @@ pub fn with_current<R>(f: impl FnOnce(&mut Process) -> R) -> R {
 pub fn init() {
     enable_sse();
     syscall::init();
-    let info = Info { ppid: 0, pgid: 0, sid: 0, name: "kernel".to_string(), exit_status: None, report: None };
+    let info = Info::new(0, 0, 0, "kernel".to_string());
     let kernel = Arc::new(Task::new(0, info, Process::empty(), None, 0));
     TABLE.lock().tasks.insert(0, kernel.clone());
     sched::set_initial(kernel, sched::new_idle_task(0));
@@ -476,7 +477,7 @@ fn spawn_with(path: &str, image: loader::Image, server: Option<&Arc<Server>>) ->
     // (re)started them, so no program can wait for or signal them.
     let parent = if server.is_some() { 0 } else { current_pid() };
     let name = basename(path).to_string();
-    let info = Info { ppid: parent, pgid: pid, sid: pid, name, exit_status: None, report: None };
+    let info = Info::new(parent, pid, pid, name);
     let mut own = Process::empty();
     own.space = Some(image.space);
     own.fds = vec![Some(FdEntry { file: console, cloexec: false }); 3];
@@ -504,7 +505,8 @@ pub fn fork(frame: &Frame) -> Result<Pid, i64> {
     child_frame.rax = 0;
     let info = {
         let i = me.info.lock();
-        Info { ppid: me.pid, pgid: i.pgid, sid: i.sid, name: i.name.clone(), exit_status: None, report: None }
+        // The parent-death signal is cleared for the child, as on Linux.
+        Info { dumpable: i.dumpable, no_new_privs: i.no_new_privs, ..Info::new(me.pid, i.pgid, i.sid, i.name.clone()) }
     };
     let mut fpu = task::FpuState::initial();
     unsafe { core::arch::asm!("fxsave64 [{}]", in(reg) fpu.0.as_mut_ptr(), options(nostack)) };
@@ -582,15 +584,23 @@ pub fn exit(status: i32) -> ! {
     unsafe { Cr3::write(memory::kernel_l4(), Cr3Flags::empty()) };
     unsafe { me.own() }.space = None;
     unsafe { me.own() }.server = None;
-    // Orphans go to the kernel, which reaps them.
+    // Orphans go to the kernel, which reaps them; those that asked for it
+    // (PR_SET_PDEATHSIG) get a signal.
+    let mut death_signals: Vec<(Pid, u32)> = Vec::new();
     {
         let table = TABLE.lock();
         for t in table.tasks.values() {
             let mut info = t.info.lock();
             if info.ppid == me.pid {
                 info.ppid = 0;
+                if info.pdeath_sig != 0 {
+                    death_signals.push((t.pid, info.pdeath_sig));
+                }
             }
         }
+    }
+    for (pid, sig) in death_signals {
+        signal::send(pid, sig);
     }
     let ppid = {
         let mut info = me.info.lock();

@@ -55,6 +55,9 @@ pub struct Signals {
     /// ITIMER_REAL: next SIGALRM tick (0: off) and the reload interval.
     alarm_at: u64,
     alarm_every: u64,
+    /// Signals a sigtimedwait is waiting for (they are usually blocked, so
+    /// they would not wake the task otherwise).
+    waiting_for: u64,
 }
 
 impl Default for Signals {
@@ -65,6 +68,7 @@ impl Default for Signals {
             pending: 0,
             alarm_at: 0,
             alarm_every: 0,
+            waiting_for: 0,
         }
     }
 }
@@ -190,7 +194,7 @@ fn post(t: &Arc<Task>, sig: u32) {
         }
         s.pending |= bit(sig);
         let resume = sig == SIGCONT || sig == SIGKILL;
-        (s.deliverable() != 0, resume)
+        (s.deliverable() != 0 || s.waiting_for & bit(sig) != 0, resume)
     };
     if resume && try_wake(t, State::Stopped) && sig == SIGCONT {
         let mut info = t.info.lock();
@@ -313,6 +317,56 @@ pub fn get_alarm() -> (u64, u64) {
     let remaining = if s.alarm_at == 0 { 0 } else { s.alarm_at.saturating_sub(now).max(1) };
     let to_us = |ticks: u64| ticks.saturating_mul(1_000_000) / TIMER_HZ;
     (to_us(remaining), to_us(s.alarm_every))
+}
+
+/// rt_sigtimedwait(set, info, timeout, size): takes the lowest pending
+/// signal of `set` (normally blocked by the caller) without running its
+/// handler; waits for one up to `timeout` (EAGAIN), or forever if null.
+pub fn sigtimedwait(set: u64, info: u64, timeout: u64, size: u64) -> SysResult {
+    if size != 8 {
+        return Err(EINVAL);
+    }
+    let wanted: u64 = uaccess::read::<u64>(set)? & !UNBLOCKABLE;
+    let deadline = if timeout != 0 {
+        let [sec, nsec]: [u64; 2] = uaccess::read(timeout)?;
+        if nsec >= 1_000_000_000 || sec > i64::MAX as u64 {
+            return Err(EINVAL);
+        }
+        let tick_ns = 1_000_000_000 / TIMER_HZ;
+        Some(sched::ticks().saturating_add(sec.saturating_mul(TIMER_HZ)).saturating_add(nsec.div_ceil(tick_ns)))
+    } else {
+        None
+    };
+    let me = current();
+    let result = loop {
+        let wait = sched::prepare_to_sleep();
+        {
+            let mut s = me.sig.lock();
+            let ready = s.pending & wanted;
+            if ready != 0 {
+                let sig = ready.trailing_zeros() + 1;
+                s.pending &= !bit(sig);
+                break Ok(sig);
+            }
+            s.waiting_for = wanted;
+        }
+        if interrupted() {
+            break Err(EINTR);
+        }
+        match deadline {
+            Some(d) if sched::ticks() >= d => break Err(EAGAIN),
+            Some(d) => wait.sleep_until(d),
+            None => wait.sleep(),
+        }
+    };
+    me.sig.lock().waiting_for = 0;
+    let sig = result?;
+    if info != 0 {
+        let mut siginfo = [0u32; 32];
+        siginfo[0] = sig;
+        uaccess::write(info, siginfo)?;
+    }
+    Ok(sig as i64)
 }
 
 pub fn sigaction(sig: u64, act: u64, oldact: u64) -> SysResult {

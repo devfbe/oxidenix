@@ -34,3 +34,9 @@ install -m 755 "$BUSYBOX" "$OUT/busybox"
 for applet in $("$OUT/busybox" --list); do
     [ -e "$OUT/$applet" ] || ln -s busybox "$OUT/$applet"
 done
+
+# htop, with the terminfo entry for the console (TERM=linux).
+HTOP="$(nix-build '<nixpkgs>' -A pkgsStatic.htop --no-out-link)"
+install -m 755 "$HTOP/bin/htop" "$OUT/htop"
+TERMINFO_SRC="$(nix-build '<nixpkgs>' -A pkgsStatic.ncurses --no-out-link)/share/terminfo"
+install -D -m 644 "$TERMINFO_SRC/l/linux" "$ROOT/usr/share/terminfo/l/linux"

@@ -149,10 +149,6 @@ pub fn set_initial(task: Arc<Task>, idle: Arc<Task>) {
 
 // ---------------------------------------------------------------- queues
 
-fn halted(cpu: &Cpu) -> bool {
-    cpu.sched.halted.load(Ordering::SeqCst)
-}
-
 /// Claims a halted CPU for new work: the first enqueuer to clear its flag
 /// wakes it, the next one picks another idle CPU instead of piling on.
 fn claim(cpu: &Cpu) -> bool {

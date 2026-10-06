@@ -75,6 +75,17 @@ pub struct Info {
     pub exit_status: Option<i32>,
     /// Stop/continue event not yet collected by the parent's wait4.
     pub report: Option<i32>,
+    /// prctl state: signal sent when the parent dies (0: none), core
+    /// dumps allowed, no new privileges (kept across fork and exec).
+    pub pdeath_sig: u32,
+    pub dumpable: bool,
+    pub no_new_privs: bool,
+}
+
+impl Info {
+    pub fn new(ppid: super::Pid, pgid: super::Pid, sid: super::Pid, name: String) -> Info {
+        Info { ppid, pgid, sid, name, exit_status: None, report: None, pdeath_sig: 0, dumpable: true, no_new_privs: false }
+    }
 }
 
 /// State owned by the task itself (see the module comment).
@@ -154,7 +165,7 @@ impl Task {
     }
 
     pub fn idle_task(cpu: usize, kstack: Option<Box<KernelStack>>, kernel_rsp: u64) -> Task {
-        let info = Info { ppid: 0, pgid: 0, sid: 0, name: alloc::format!("idle/{cpu}"), exit_status: None, report: None };
+        let info = Info::new(0, 0, 0, alloc::format!("idle/{cpu}"));
         let mut t = Task::new(u64::MAX - cpu as u64, info, Process::empty(), kstack, kernel_rsp);
         t.idle = true;
         t.state = AtomicU8::new(State::Running as u8);
