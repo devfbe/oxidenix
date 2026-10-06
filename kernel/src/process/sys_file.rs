@@ -84,7 +84,7 @@ pub fn openat(dirfd: u64, path: u64, flags: u64, mode: u64) -> SysResult {
         Ok(inode) => inode,
         Err(ENOENT) if flags & O_CREAT != 0 => {
             let (dir, name) = fs::resolve_parent(&base, &path)?;
-            let inode = Inode::new(Node::File(Data::Owned(Vec::new())), mode as u32 & !UMASK);
+            let inode = Inode::new(Node::File(Data::empty()), mode as u32 & !UMASK);
             dir.insert(&name, inode.clone())?;
             inode
         }
@@ -99,7 +99,7 @@ pub fn openat(dirfd: u64, path: u64, flags: u64, mode: u64) -> SysResult {
     }
     if flags & O_TRUNC != 0 && writable {
         if let Node::File(data) = &mut *inode.node.lock() {
-            *data = Data::Owned(Vec::new());
+            *data = Data::empty();
         }
     }
     let abs = fs::join(&fs::normalize(&base, &path));
@@ -365,8 +365,7 @@ pub fn renameat(olddirfd: u64, oldpath: u64, newdirfd: u64, newpath: u64) -> Sys
     let (ndir, nname) = fs::resolve_parent(&nbase, &newpath)?;
     let node = odir.child(&oname)?;
     // Moving a directory below itself would detach it in a reference cycle.
-    let (from, to) = (fs::normalize(&obase, &oldpath), fs::normalize(&nbase, &newpath));
-    if node.is_dir() && to.len() > from.len() && to.starts_with(&from) {
+    if fs::contains(&node, &ndir) {
         return Err(EINVAL);
     }
     if let Node::Dir(m) = &mut *odir.node.lock() {
@@ -398,16 +397,10 @@ pub fn fchmodat(dirfd: u64, path: u64, mode: u64) -> SysResult {
 }
 
 pub fn ftruncate(fd: u64, len: u64) -> SysResult {
-    if len > MAX_FILE_SIZE as u64 {
-        return Err(EFBIG);
-    }
     let f = file(fd)?;
     let inode = f.inode().ok_or(EINVAL)?;
     let result = match &mut *inode.node.lock() {
-        Node::File(data) => {
-            data.make_mut().resize(len as usize, 0);
-            Ok(0)
-        }
+        Node::File(data) => data.resize(usize::try_from(len).map_err(|_| EFBIG)?).map(|_| 0),
         _ => Err(EINVAL),
     };
     result

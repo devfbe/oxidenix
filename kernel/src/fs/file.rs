@@ -20,8 +20,6 @@ pub const O_NOFOLLOW: u32 = 0o400000;
 pub const O_CLOEXEC: u32 = 0o2000000;
 
 const PIPE_CAPACITY: usize = 64 * 1024;
-/// Files live in kernel heap memory; this keeps one file from exhausting it.
-pub const MAX_FILE_SIZE: usize = 64 * 1024 * 1024;
 
 pub struct Pipe {
     buf: Mutex<VecDeque<u8>>,
@@ -146,17 +144,12 @@ impl OpenFile {
             }
             Node::Device(_) => Ok(buf.len()),
             Node::File(data) => {
-                let v = data.make_mut();
                 let mut off = self.offset.lock();
                 if self.flags.load(Ordering::Relaxed) & O_APPEND != 0 {
-                    *off = v.len() as u64;
+                    *off = data.bytes().len() as u64;
                 }
-                let start = *off as usize;
-                let end = start.checked_add(buf.len()).filter(|&e| e <= MAX_FILE_SIZE).ok_or(EFBIG)?;
-                if v.len() < end {
-                    v.resize(end, 0);
-                }
-                v[start..end].copy_from_slice(buf);
+                let start = usize::try_from(*off).map_err(|_| EFBIG)?;
+                data.write_at(start, buf)?;
                 *off += buf.len() as u64;
                 Ok(buf.len())
             }

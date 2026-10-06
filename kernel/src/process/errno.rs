@@ -13,6 +13,7 @@ pub const EINVAL: i64 = 22;
 pub const EMFILE: i64 = 24;
 pub const ENOTTY: i64 = 25;
 pub const EFBIG: i64 = 27;
+pub const ENOSPC: i64 = 28;
 pub const ESPIPE: i64 = 29;
 pub const EPIPE: i64 = 32;
 pub const ERANGE: i64 = 34;

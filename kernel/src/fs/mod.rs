@@ -8,7 +8,7 @@ use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use spin::{Mutex, Once};
 
 pub const S_IFMT: u32 = 0o170000;
@@ -24,6 +24,26 @@ pub enum Device {
     Zero,
 }
 
+pub const MAX_FILE_SIZE: usize = 64 * 1024 * 1024;
+/// File contents live on the kernel heap; this caps all of them together.
+pub const FILE_QUOTA: usize = 8 * 1024 * 1024;
+static FILE_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+fn charge(bytes: usize) -> Result<(), i64> {
+    FILE_BYTES
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+            used.checked_add(bytes).filter(|&n| n <= FILE_QUOTA)
+        })
+        .map(|_| ())
+        .map_err(|_| ENOSPC)
+}
+
+fn release(bytes: usize) {
+    FILE_BYTES.fetch_sub(bytes, Ordering::Relaxed);
+}
+
+/// File contents. Every change of the owned size goes through `resize`,
+/// which charges it against `FILE_QUOTA`.
 pub enum Data {
     /// Unmodified file from the initramfs; copied on first write.
     Static(&'static [u8]),
@@ -31,6 +51,10 @@ pub enum Data {
 }
 
 impl Data {
+    pub fn empty() -> Data {
+        Data::Owned(Vec::new())
+    }
+
     pub fn bytes(&self) -> &[u8] {
         match self {
             Data::Static(b) => b,
@@ -38,15 +62,62 @@ impl Data {
         }
     }
 
-    pub fn make_mut(&mut self) -> &mut Vec<u8> {
-        if let Data::Static(b) = self {
-            *self = Data::Owned(b.to_vec());
-        }
+    fn owned_len(&self) -> usize {
         match self {
-            Data::Owned(v) => v,
-            Data::Static(_) => unreachable!(),
+            Data::Static(_) => 0,
+            Data::Owned(v) => v.len(),
         }
     }
+
+    pub fn resize(&mut self, len: usize) -> Result<(), i64> {
+        if len > MAX_FILE_SIZE {
+            return Err(EFBIG);
+        }
+        let old = self.owned_len();
+        if len > old {
+            charge(len - old)?;
+        }
+        match self {
+            Data::Static(b) => {
+                let mut v = b.to_vec();
+                v.resize(len, 0);
+                *self = Data::Owned(v);
+            }
+            Data::Owned(v) => v.resize(len, 0),
+        }
+        if len < old {
+            release(old - len);
+        }
+        Ok(())
+    }
+
+    pub fn write_at(&mut self, start: usize, buf: &[u8]) -> Result<(), i64> {
+        let end = start.checked_add(buf.len()).ok_or(EFBIG)?;
+        self.resize(end.max(self.bytes().len()))?;
+        match self {
+            Data::Owned(v) => v[start..end].copy_from_slice(buf),
+            Data::Static(_) => unreachable!("resize makes the data owned"),
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Data {
+    fn drop(&mut self) {
+        release(self.owned_len());
+    }
+}
+
+/// Whether `target` is `dir` itself or lies anywhere below it.
+pub fn contains(dir: &Arc<Inode>, target: &Arc<Inode>) -> bool {
+    if Arc::ptr_eq(dir, target) {
+        return true;
+    }
+    let children: Vec<Arc<Inode>> = match &*dir.node.lock() {
+        Node::Dir(m) => m.values().cloned().collect(),
+        _ => return false,
+    };
+    children.iter().any(|c| contains(c, target))
 }
 
 pub enum Node {
