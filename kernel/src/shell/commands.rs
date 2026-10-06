@@ -11,6 +11,7 @@ pub fn dispatch(cmd: &str, args: &Vec<&str, 8>) {
         "run" => cmd_run(args),
         "kill" => cmd_kill(args),
         "ps" => cmd_ps(),
+        "lspci" => cmd_lspci(),
         "" => {}
         other => crate::printkln!("unknown command: {}", other),
     }
@@ -25,8 +26,18 @@ fn cmd_help() {
     crate::printkln!("  mem           - memory statistics + self-test");
     crate::printkln!("  run <prog>    - start a program from /bin");
     crate::printkln!("  ps            - list processes");
+    crate::printkln!("  lspci         - list PCI devices");
     crate::printkln!("  kill <pid|name> - send SIGKILL (the kernel may also stop servers)");
     crate::printkln!("  halt          - halt the system");
+}
+
+fn cmd_lspci() {
+    for d in crate::drivers::pci::scan() {
+        crate::printkln!(
+            "{:02x}:{:02x}.{} {:04x}:{:04x} class {:02x}{:02x} irq {}",
+            d.bus, d.slot, d.func, d.vendor, d.device, d.class, d.subclass, d.irq
+        );
+    }
 }
 
 fn cmd_clear() {

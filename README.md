@@ -64,6 +64,8 @@ Its [commit history](#development-history) records every step.
   `diskfs`, an ordinary ring-3 process that talks to the kernel over IPC and reaches the disk
   through I/O ports the kernel granted it. If it dies, the kernel restarts it on the next access, and
   the rest of the system keeps running.
+- **Networking (in progress)**: `netd` drives a virtio network card from user space, runs the
+  smoltcp TCP/IP stack and configures itself by DHCP. Sockets for user programs are next.
 - **Persistent storage**: the data disk is mounted at `/data`, survives reboots, and stays
   consistent enough that `e2fsck` on the host accepts it.
 - **Wall-clock time** from the CMOS real-time clock (`date`, file timestamps).
@@ -102,7 +104,7 @@ sh /etc/test.sh            # filesystem, pipes, quotas, rename semantics
 sh /etc/disktest.sh        # ext2: big files, directories, truncate, rename, symlinks
 echo hello > /data/x       # survives a reboot; df -h shows the disk
 sleep 100                  # then press Ctrl+Z, try jobs / bg / fg, then Ctrl+C
-exit                       # drops to the built-in kernel monitor ('help', 'ps', 'mem', 'run bash')
+exit                       # drops to the built-in kernel monitor ('help', 'ps', 'lspci', 'mem', 'run bash')
 ```
 
 The window scales when it is resized (`zoom-to-fit`), and Ctrl+Alt+F toggles fullscreen.
@@ -115,18 +117,21 @@ The window scales when it is resized (`zoom-to-fit`), and Ctrl+Alt+F toggles ful
  ┌──────────────────────────────── user space (ring 3) ────────────────────────────────┐
  │  GNU Bash 5.3   BusyBox 1.37   test programs     │  diskfs server (Rust, no_std)    │
  │  statically linked against musl libc             │  ext2 + ATA driver, I/O ports    │
+ │                                                  │  netd server: virtio-net, DMA,   │
+ │                                                  │  IRQs, smoltcp TCP/IP, DHCP      │
  └───────────────────────┬────────────────▲─────────┴────────▲──────────────┬──────────┘
           syscall / fault / IRQ       iretq            IPC receive/reply   in/out
  ┌───────────────────────▼────────────────┴──────────────────┴──────────────│──────────┐
  │  syscall layer   process/syscall.rs ─ sys_file.rs ─ sys_mem.rs ─ signal.rs│          │
  │  IPC             services, synchronous call/receive/reply, async post    │          │
+ │  drivers         PCI scan, IRQ lines and DMA areas handed to servers     │          │
  │  processes       scheduler, fork/exec/wait, sleep/wakeup, pgid/sid, ioperm          │
  │  memory          frame allocator (refcounted), heap, address spaces, COW │          │
  │  VFS             memory inodes, remote inodes (fs/remote.rs), pipes, cpio│          │
  │  terminal        TTY line discipline ─ console (framebuffer, ANSI) ─ keyboard       │
  │  CPU             GDT, TSS with I/O permission bitmap, IDT, PIC, PIT, SSE │          │
  └──────────────────────────────────────────────────────────────────────────▼──────────┘
-                     bootloader 0.11 (BIOS), QEMU x86_64, 256 MiB RAM, IDE disk
+           bootloader 0.11 (BIOS), QEMU x86_64, 256 MiB RAM, IDE disk, virtio-net
 ```
 
 ### Repository layout
@@ -151,16 +156,18 @@ oxidenix/
 │       │   ├── loader.rs        ELF loading and the Linux initial stack
 │       │   ├── elf.rs           ELF64 parser
 │       │   ├── ipc.rs           services and message passing
+│       │   ├── irq.rs           device interrupts for user-space drivers
 │       │   └── uaccess.rs       checked access to user memory
 │       ├── fs/                  VFS (mod.rs), open files and pipes (file.rs),
 │       │                        initramfs unpacker (cpio.rs), IPC client for
 │       │                        filesystem servers (remote.rs)
 │       ├── drivers/             framebuffer console (console.rs), TTY (tty.rs),
 │       │                        PS/2 keyboard (keyboard.rs), CMOS clock (rtc.rs),
-│       │                        serial port mirror (serial.rs)
+│       │                        serial port mirror (serial.rs), PCI scan (pci.rs)
 │       └── shell/               built-in kernel monitor (fallback shell)
 ├── servers/
-│   └── diskfs/                  user-space ext2 server with its own ATA driver
+│   ├── diskfs/                  user-space ext2 server with its own ATA driver
+│   └── netd/                    network server: virtio-net driver, smoltcp, DHCP
 ├── crates/
 │   ├── ext2fs/                  ext2 as a library over a `Device` trait
 │   ├── fsproto/                 message format between the VFS and filesystem servers
@@ -169,7 +176,7 @@ oxidenix/
 └── userspace/                   C test programs, build script, rootfs and data disk templates
 ```
 
-About 6,191 lines of Rust in the kernel and 1,669 in the server, its libraries and runtime, plus a small host-side builder.
+About 6,928 lines of Rust in the kernel and 2,154 in the servers, their libraries and runtime, plus a small host-side builder.
 
 ### Boot sequence
 
@@ -181,7 +188,10 @@ About 6,191 lines of Rust in the kernel and 1,669 in the server, its libraries a
    ramdisk and real-time clock → process subsystem (SSE, syscall MSRs, process 0) →
    **interrupts on**.
 3. The kernel starts the servers: `/sbin/diskfs` asks for its I/O ports, mounts the ext2 disk
-   and registers as service `diskfs`; the kernel then mounts it at `/data`.
+   and registers as service `diskfs`; the kernel then mounts it at `/data`. Then the kernel
+   scans PCI for a virtio network card and starts `/sbin/netd` with its ports, interrupt line
+   and a DMA area; netd registers as service `net` once DHCP has configured the interface
+   (or after three seconds without an answer).
 4. Process 0 (the kernel monitor) spawns `/bin/bash` as the foreground process and waits for
    it. If Bash exits, the monitor takes over the terminal.
 
@@ -290,9 +300,21 @@ interrupt dispatch; drivers and filesystems move into user-space servers.
   kernel.
 - **Hardware access without kernel drivers**: servers started by the kernel are *privileged*
   and may call `ioperm`, but only for the ports the kernel assigned to them (diskfs gets the
-  primary ATA channel, `0x1f0`-`0x1f7` and `0x3f6`; anything else is `EPERM`). Granted ports
-  are set in the TSS I/O permission bitmap, which is installed on every switch to that process.
-  The server cannot touch other ports or disable interrupts (no IOPL 3).
+  primary ATA channel, `0x1f0`-`0x1f7` and `0x3f6`; netd gets the I/O BAR of its network card;
+  anything else is `EPERM`). Granted ports are set in the TSS I/O permission bitmap, which is
+  installed on every switch to that process. The server cannot touch other ports or disable
+  interrupts (no IOPL 3). The kernel itself only scans PCI (`drivers/pci.rs`) and enables I/O
+  decoding and bus mastering for the devices it hands out.
+- **Device interrupts** (`process/irq.rs`): a server may take the interrupt line assigned to it
+  (`irq_enable`, syscall 1003). When the line fires, the kernel masks it, marks it pending and
+  wakes the server; `ipc_receive` reports it as a notification (request id 0, result = mask of
+  lines) before any queued request. The server handles the device and unmasks the line with
+  `irq_enable` again. `ipc_receive` also takes a timeout, which a network stack needs for its
+  timers.
+- **DMA** (`dma_map`, syscall 1004): a server with a DMA budget gets a physically contiguous,
+  zeroed area mapped into its address space, plus its physical address for the device. The
+  area belongs to the server description, not to the process, so a restarted server gets the
+  same memory instead of leaking it while the device may still write to it.
 - **Remote filesystems**: the VFS has a second kind of inode whose operations become
   `fsproto` requests to a server (`fs/remote.rs`). Reads and writes are split into 32 KiB
   messages. The kernel still decides when an unlinked inode may be freed, because only it knows
@@ -310,9 +332,9 @@ interrupt dispatch; drivers and filesystems move into user-space servers.
 - **Protected servers**: like init on Linux, privileged servers ignore signals from user space:
   a direct `kill` fails with `EPERM`, and group, broadcast and terminal signals skip them. Only
   the kernel can stop them (the monitor's `kill <pid|name>` does, for testing).
-- **Servers in Rust**: `servers/diskfs` is a `no_std` Rust program built for
+- **Servers in Rust**: `servers/diskfs` and `servers/netd` are `no_std` Rust programs built for
   `x86_64-unknown-none` as a static `ET_EXEC` binary, using `crates/oxrt` for its entry point,
-  syscalls, heap and port I/O. It shares no code with the kernel except the message format.
+  syscalls, heap and port I/O. They share no code with the kernel except the message format.
 - Still in the kernel today: the VFS itself, pipes, the TTY, console and keyboard. They are the
   next candidates for servers.
 
@@ -377,7 +399,7 @@ Linux x86_64 numbers, grouped by area (about 90 in total):
 | Groups and IDs | `setpgid` `getpgid` `getpgrp` `setsid` `getsid` `getuid` `geteuid` `getgid` `getegid` `getresuid` `getresgid` `setuid` `setgid` |
 | Signals | `rt_sigaction` `rt_sigprocmask` `rt_sigreturn` `kill` `tkill` `tgkill` `pause` `sigaltstack` |
 | Filesystems | `statfs` `fstatfs` `sync` `fsync` `fdatasync` |
-| Servers | `ioperm` (privileged servers only), `ipc_register` (1000), `ipc_receive` (1001), `ipc_reply` (1002) |
+| Servers | `ioperm` (privileged servers only), `ipc_register` (1000), `ipc_receive` (1001, with timeout and interrupt notifications), `ipc_reply` (1002), `irq_enable` (1003), `dma_map` (1004) |
 | Power | `reboot` (power off ends QEMU, restart resets the machine) |
 | Time and misc | `nanosleep` `clock_gettime` (`CLOCK_REALTIME` from the RTC) `uname` `getrandom` `socket` (fails with `EAFNOSUPPORT`) |
 
@@ -442,7 +464,8 @@ never returns grown memory to the frame allocator, and there are no users or per
 - [x] Persistent storage: a disk driver and an on-disk filesystem
 - [x] Unlinked-but-open files kept until closed
 - [ ] Hard links and a block cache
-- [ ] Networking, SMP, dynamic linking, real entropy, users and permissions
+- [ ] Networking: card driver and DHCP done (`netd`); sockets for user programs next
+- [ ] SMP, dynamic linking, real entropy, users and permissions
 
 ## Development history
 

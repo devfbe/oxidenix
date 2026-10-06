@@ -90,6 +90,26 @@ impl AddressSpace {
         })
     }
 
+    /// Maps `pages` existing physical frames starting at `phys` (device DMA
+    /// memory) to `start`. Each mapping holds a reference on its frame.
+    pub fn map_phys(&mut self, start: u64, phys: u64, pages: u64, flags: PageTableFlags) -> Result<(), &'static str> {
+        let end = start.checked_add(pages * PAGE).filter(|&e| e <= USER_END).ok_or("address outside of user space")?;
+        let flags = flags | PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+        let parent = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+        let mut mapper = self.mapper();
+        memory::with_frames(|frames| {
+            for (i, page) in user_pages(start, end).enumerate() {
+                let frame = PhysFrame::containing_address(x86_64::PhysAddr::new(phys + i as u64 * PAGE));
+                let mut user = UserFrames(frames);
+                unsafe { mapper.map_to_with_table_flags(page, frame, flags, parent, &mut user) }
+                    .map_err(|_| "map_to failed")?
+                    .ignore();
+                frames.share(frame);
+            }
+            Ok(())
+        })
+    }
+
     /// Removes all mappings in [start, start+len) and frees their frames.
     pub fn unmap(&mut self, start: u64, len: u64) {
         let Some(end) = start.checked_add(len).filter(|&e| e <= USER_END && len > 0) else { return };

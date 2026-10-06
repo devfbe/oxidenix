@@ -47,7 +47,7 @@ fn main(_args: Vec<&'static str>) -> i32 {
     let mut request = vec![0u8; MAX_MESSAGE];
     let mut response = vec![0u8; MAX_MESSAGE];
     loop {
-        let Ok((id, len)) = oxrt::ipc_receive(&mut request) else { continue };
+        let Ok(oxrt::Event::Request(id, len)) = oxrt::ipc_receive(&mut request, None) else { continue };
         let n = match decode_request(&request[..len]) {
             Some(req) => handle(&mut fs, &req, &mut response),
             None => encode_response(&mut response, -EINVAL, [0; 6], &[]),

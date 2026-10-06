@@ -1,0 +1,16 @@
+[package]
+name = "netd"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+
+[[bin]]
+name = "netd"
+test = false
+bench = false
+
+[dependencies]
+oxrt = { path = "../../crates/oxrt" }
+smoltcp = { version = "0.14", default-features = false, features = [
+    "alloc", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-udp", "socket-dhcpv4",
+] }

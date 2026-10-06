@@ -119,3 +119,18 @@ pub extern "x86-interrupt" fn invalid_opcode_handler(stack_frame: InterruptStack
 fn from_user(frame: &InterruptStackFrame) -> bool {
     frame.code_segment.rpl() == PrivilegeLevel::Ring3
 }
+
+/// Interrupt lines 3-15 belong to user-space drivers (see process::irq).
+macro_rules! device_irqs {
+    ($($name:ident = $line:literal),*) => {
+        $(pub extern "x86-interrupt" fn $name(_stack_frame: InterruptStackFrame) {
+            crate::process::irq::fire($line);
+        })*
+        pub const DEVICE_IRQS: &[(u8, extern "x86-interrupt" fn(InterruptStackFrame))] = &[$(($line, $name)),*];
+    };
+}
+
+device_irqs!(
+    irq3 = 3, irq4 = 4, irq5 = 5, irq6 = 6, irq7 = 7, irq8 = 8, irq9 = 9, irq10 = 10,
+    irq11 = 11, irq12 = 12, irq13 = 13, irq14 = 14, irq15 = 15
+);

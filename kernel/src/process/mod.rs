@@ -2,6 +2,7 @@ pub mod address_space;
 pub mod elf;
 pub mod errno;
 pub mod ipc;
+pub mod irq;
 mod loader;
 pub mod signal;
 mod sys_file;
@@ -12,6 +13,7 @@ pub mod uaccess;
 use crate::fs::file::OpenFile;
 use crate::fs;
 use crate::interrupts::gdt;
+use crate::memory;
 use address_space::AddressSpace;
 use alloc::boxed::Box;
 use alloc::collections::{BTreeMap, VecDeque};
@@ -100,8 +102,10 @@ struct Process {
     /// I/O permission bitmap (0 = allowed) installed in the TSS while
     /// this process runs.
     io_bitmap: Option<Box<[u8; gdt::IOMAP_BYTES]>>,
-    /// I/O port ranges this process may request with ioperm.
-    io_ports: &'static [Range<u64>],
+    /// The server this process runs, with the resources assigned to it.
+    server: Option<Arc<Server>>,
+    /// Timer tick at which a sleep ends on its own (0: none).
+    wake_at: u64,
 }
 
 impl Process {
@@ -199,7 +203,8 @@ pub fn init() {
         report: None,
         privileged: false,
         io_bitmap: None,
-        io_ports: &[],
+        server: None,
+        wake_at: 0,
     };
     let mut procs = BTreeMap::new();
     procs.insert(0, Box::new(kernel));
@@ -278,7 +283,8 @@ pub fn ioperm(from: u64, count: u64, on: u64) -> SysResult {
         if !p.privileged {
             return Err(EPERM);
         }
-        if on != 0 && !p.io_ports.iter().any(|r| r.start <= from && end <= r.end) {
+        let assigned = p.server.as_ref().map_or(&[][..], |s| &s.ports[..]);
+        if on != 0 && !assigned.iter().any(|r| r.start <= from && end <= r.end) {
             return Err(EPERM);
         }
         let bitmap = p.io_bitmap.get_or_insert_with(|| Box::new([0xff; gdt::IOMAP_BYTES]));
@@ -321,8 +327,31 @@ pub fn ticks() -> u64 {
 
 /// Called from the timer interrupt.
 pub fn tick() {
-    TICKS.fetch_add(1, Ordering::Relaxed);
+    let now = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
     wakeup(TICK_CHAN);
+    interrupts::without_interrupts(|| {
+        let s = sched();
+        let due: Vec<Pid> = s
+            .procs
+            .values()
+            .filter(|p| p.wake_at != 0 && p.wake_at <= now && matches!(p.state, State::Sleeping(_)))
+            .map(|p| p.pid)
+            .collect();
+        for pid in due {
+            s.make_ready(pid);
+        }
+    });
+}
+
+/// Like `sleep_on`, but also wakes up at timer tick `deadline`.
+pub fn sleep_on_until(chan: usize, deadline: u64) {
+    interrupts::without_interrupts(|| {
+        let p = sched().cur();
+        p.state = State::Sleeping(chan);
+        p.wake_at = deadline.max(1);
+        schedule();
+        sched().cur().wake_at = 0;
+    });
 }
 
 /// Sleeps for `n` timer ticks; a signal ends the sleep early with EINTR.
@@ -412,7 +441,8 @@ fn new_process(pid: Pid, ppid: Pid, name: String, space: AddressSpace, frame: Fr
         report: None,
         privileged: false,
         io_bitmap: None,
-        io_ports: &[],
+        server: None,
+        wake_at: 0,
     }))
 }
 
@@ -437,11 +467,19 @@ pub struct Server {
     /// was written to `path` since then with the server's privileges.
     image: Vec<u8>,
     /// I/O port ranges (start..end) the server may request with ioperm.
-    ports: &'static [Range<u64>],
+    ports: Vec<Range<u64>>,
+    /// Interrupt line it may enable.
+    irq: Option<u8>,
+    /// Size of its DMA area in pages, and the area once allocated. It
+    /// outlives the process, so a restarted server gets the same memory.
+    dma_pages: u64,
+    dma: spin::Mutex<Option<u64>>,
+    /// Extra command line arguments (e.g. the device's resources).
+    args: Vec<String>,
 }
 
 impl Server {
-    pub fn load(name: &'static str, path: &'static str, ports: &'static [Range<u64>]) -> Result<Arc<Server>, i64> {
+    pub fn load(name: &'static str, path: &'static str) -> Result<Server, i64> {
         let inode = fs::resolve("/", path, true)?;
         if inode.file_type() != fs::S_IFREG {
             return Err(ENOEXEC);
@@ -452,8 +490,60 @@ impl Server {
             image.extend_from_slice(bytes);
             Ok::<_, i64>(image)
         })??;
-        Ok(Arc::new(Server { name, path, image, ports }))
+        Ok(Server { name, path, image, ports: Vec::new(), irq: None, dma_pages: 0, dma: spin::Mutex::new(None), args: Vec::new() })
     }
+
+    pub fn ports(mut self, range: Range<u64>) -> Self {
+        self.ports.push(range);
+        self
+    }
+
+    pub fn irq(mut self, line: u8) -> Self {
+        self.irq = Some(line);
+        self
+    }
+
+    pub fn dma(mut self, pages: u64) -> Self {
+        self.dma_pages = pages;
+        self
+    }
+
+    pub fn arg(mut self, arg: String) -> Self {
+        self.args.push(arg);
+        self
+    }
+}
+
+/// dma_map(&phys): maps the server's DMA area (physically contiguous,
+/// allocated on first use) and returns its address; its physical address
+/// is stored at `phys`.
+pub fn dma_map(phys_out: u64) -> SysResult {
+    let server = with_current(|p| p.server.clone()).ok_or(EPERM)?;
+    if server.dma_pages == 0 {
+        return Err(EPERM);
+    }
+    let phys = {
+        let mut dma = server.dma.lock();
+        match *dma {
+            Some(phys) => phys,
+            None => {
+                let phys = memory::with_frames(|f| f.allocate_contiguous(server.dma_pages)).ok_or(ENOMEM)?;
+                unsafe { core::ptr::write_bytes(memory::phys_to_virt(phys), 0, (server.dma_pages * 4096) as usize) };
+                *dma = Some(phys);
+                phys
+            }
+        }
+    };
+    let len = server.dma_pages * 4096;
+    let start = with_current(|p| -> Result<u64, i64> {
+        p.mmap_next = p.mmap_next.checked_sub(len).filter(|&a| a > p.brk_end).ok_or(ENOMEM)?;
+        let start = p.mmap_next;
+        let flags = x86_64::structures::paging::PageTableFlags::WRITABLE | x86_64::structures::paging::PageTableFlags::NO_EXECUTE;
+        p.space()?.map_phys(start, phys, server.dma_pages, flags).map_err(|_| ENOMEM)?;
+        Ok(start)
+    })?;
+    uaccess::write(phys_out, phys)?;
+    Ok(start as i64)
 }
 
 fn start_env() -> Vec<String> {
@@ -471,12 +561,14 @@ pub fn spawn(name: &str, args: &[&str]) -> Result<Pid, i64> {
 
 /// Starts a privileged server process: it may register IPC services and
 /// request its I/O ports, and it does not take over the terminal.
-pub fn spawn_server(server: &Server) -> Result<Pid, i64> {
-    let image = loader::load(&server.image, &[server.path.to_string()], &start_env())?;
+pub fn spawn_server(server: &Arc<Server>) -> Result<Pid, i64> {
+    let mut args = alloc::vec![server.path.to_string()];
+    args.extend(server.args.iter().cloned());
+    let image = loader::load(&server.image, &args, &start_env())?;
     spawn_with(server.path, image, Some(server))
 }
 
-fn spawn_with(path: &str, image: loader::Image, server: Option<&Server>) -> Result<Pid, i64> {
+fn spawn_with(path: &str, image: loader::Image, server: Option<&Arc<Server>>) -> Result<Pid, i64> {
     let console = OpenFile::console();
     interrupts::without_interrupts(|| {
         let s = sched();
@@ -494,7 +586,7 @@ fn spawn_with(path: &str, image: loader::Image, server: Option<&Server>) -> Resu
         p.brk_start = image.brk;
         p.brk_end = image.brk;
         p.privileged = server.is_some();
-        p.io_ports = server.map_or(&[], |s| s.ports);
+        p.server = server.cloned();
         s.procs.insert(pid, p);
         s.ready.push_back(pid);
         if server.is_none() {
@@ -552,7 +644,7 @@ pub fn exec(frame: &mut Frame, path: &str, args: &[String], envs: &[String]) -> 
         // A new program gets no inherited hardware access.
         p.privileged = false;
         p.io_bitmap = None;
-        p.io_ports = &[];
+        p.server = None;
         gdt::set_io_bitmap(None);
         p.fds
             .iter_mut()
@@ -573,6 +665,7 @@ pub fn exit(status: i32) -> ! {
     let fds = core::mem::take(&mut sched().cur().fds);
     drop(fds);
     ipc::on_exit(sched().current);
+    irq::on_exit(sched().current);
 
     let s = sched();
     let pid = s.current;

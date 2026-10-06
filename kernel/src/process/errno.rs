@@ -30,6 +30,7 @@ pub const ENOSYS: i64 = 38;
 pub const ENOTEMPTY: i64 = 39;
 pub const ELOOP: i64 = 40;
 pub const EAFNOSUPPORT: i64 = 97;
+pub const ETIMEDOUT: i64 = 110;
 
 /// Syscall result: Ok(return value) or Err(positive errno).
 pub type SysResult = Result<i64, i64>;

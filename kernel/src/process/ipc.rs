@@ -49,11 +49,8 @@ struct Ipc {
 
 static IPC: Mutex<Ipc> = Mutex::new(Ipc { services: Vec::new(), requests: BTreeMap::new(), next_id: 1 });
 
-// Sleep channels; far away from the small fixed ones and from pipe addresses.
-fn service_chan(service: usize) -> usize {
-    0x1_0000_0000 + service
-}
-
+// Sleep channels; far away from the small fixed ones and from pipe
+// addresses. A server sleeps on `irq::server_chan(pid)`.
 fn request_chan(id: u64) -> usize {
     0x2_0000_0000 + id as usize
 }
@@ -89,18 +86,34 @@ pub fn register(name: u64, len: u64, arg: u64) -> SysResult {
     })
 }
 
-/// ipc_receive(buffer, length, &id): waits for the next request to one of
-/// the caller's services and returns its length.
-pub fn receive(buf: u64, len: u64, id_out: u64) -> SysResult {
-    without_interrupts(|| receive_loop(buf, len, id_out))
+/// ipc_receive(buffer, length, &id, timeout_ms): waits for the next request
+/// to one of the caller's services and returns its length. A negative
+/// timeout waits forever; when it runs out, the result is ETIMEDOUT.
+///
+/// Interrupts of the caller's device lines come first: they are reported
+/// with request id 0 and the mask of fired lines as the result.
+pub fn receive(buf: u64, len: u64, id_out: u64, timeout_ms: i64) -> SysResult {
+    let deadline = (timeout_ms >= 0).then(|| {
+        let ticks = (timeout_ms as u64).saturating_mul(super::TIMER_HZ).div_ceil(1000);
+        super::ticks().saturating_add(ticks)
+    });
+    without_interrupts(|| receive_loop(buf, len, id_out, deadline))
 }
 
-fn receive_loop(buf: u64, len: u64, id_out: u64) -> SysResult {
+fn receive_loop(buf: u64, len: u64, id_out: u64, deadline: Option<u64>) -> SysResult {
     let me = super::current_pid();
     loop {
+        let fired = super::irq::take_pending(me);
+        if fired != 0 {
+            uaccess::write(id_out, 0u64)?;
+            return Ok(fired as i64);
+        }
         let next = lock(|ipc| {
-            let index = ipc.services.iter().position(|s| s.server == me && s.alive).ok_or(EINVAL)?;
-            let Some(id) = ipc.services[index].queue.pop_front() else { return Ok::<_, i64>(Err(index)) };
+            // Without a service yet, only interrupts and the timeout end the wait.
+            let Some(index) = ipc.services.iter().position(|s| s.server == me && s.alive) else {
+                return Ok::<_, i64>(Err(()));
+            };
+            let Some(id) = ipc.services[index].queue.pop_front() else { return Ok(Err(())) };
             let req = ipc.requests.get_mut(&id).expect("queued request exists");
             req.state = State::Taken;
             Ok(Ok((id, core::mem::take(&mut req.message))))
@@ -115,11 +128,15 @@ fn receive_loop(buf: u64, len: u64, id_out: u64) -> SysResult {
                 uaccess::write(id_out, id)?;
                 return Ok(message.len() as i64);
             }
-            Err(index) => {
+            Err(()) => {
                 if super::signal::interrupted() {
                     return Err(EINTR);
                 }
-                sleep_on(service_chan(index));
+                match deadline {
+                    Some(d) if super::ticks() >= d => return Err(ETIMEDOUT),
+                    Some(d) => super::sleep_on_until(super::irq::server_chan(me), d),
+                    None => sleep_on(super::irq::server_chan(me)),
+                }
             }
         }
     }
@@ -164,7 +181,7 @@ fn fail(id: u64) {
 }
 
 fn enqueue(service: usize, message: Vec<u8>, waits: bool) -> Result<u64, i64> {
-    let id = lock(|ipc| {
+    let (id, server) = lock(|ipc| {
         if !ipc.services.get(service).is_some_and(|s| s.alive) {
             return Err(EIO);
         }
@@ -172,9 +189,9 @@ fn enqueue(service: usize, message: Vec<u8>, waits: bool) -> Result<u64, i64> {
         ipc.next_id += 1;
         ipc.requests.insert(id, Request { service, waits, message, reply: Vec::new(), state: State::Queued });
         ipc.services[service].queue.push_back(id);
-        Ok(id)
+        Ok((id, ipc.services[service].server))
     })?;
-    wakeup(service_chan(service));
+    wakeup(super::irq::server_chan(server));
     Ok(id)
 }
 

@@ -24,6 +24,10 @@ pub mod sys {
     pub const IPC_RECEIVE: u64 = 1001;
     /// (request id, buffer, length)
     pub const IPC_REPLY: u64 = 1002;
+    /// (interrupt line): unmasks the server's device interrupt
+    pub const IRQ_ENABLE: u64 = 1003;
+    /// (&physical address) -> address of the server's DMA area
+    pub const DMA_MAP: u64 = 1004;
 }
 
 /// Raw system call; returns the kernel's result (negative errno on error).
@@ -92,11 +96,47 @@ pub fn ipc_register(name: &str, arg: u64) -> Result<u64, i64> {
     }
 }
 
-/// Waits for the next request; returns (request id, message length).
-pub fn ipc_receive(buf: &mut [u8]) -> Result<(u64, usize), i64> {
+/// What `ipc_receive` returns.
+pub enum Event {
+    /// A request: (request id, message length).
+    Request(u64, usize),
+    /// Device interrupts fired; the bit mask of the lines.
+    Interrupt(u16),
+    /// The timeout ran out.
+    Timeout,
+}
+
+pub const ETIMEDOUT: i64 = 110;
+
+/// Waits for the next request or device interrupt, at most `timeout_ms`
+/// milliseconds (None: forever).
+pub fn ipc_receive(buf: &mut [u8], timeout_ms: Option<u64>) -> Result<Event, i64> {
     let mut id = 0u64;
-    let r = syscall(sys::IPC_RECEIVE, [buf.as_mut_ptr() as u64, buf.len() as u64, &mut id as *mut u64 as u64, 0, 0, 0]);
-    if r < 0 { Err(r) } else { Ok((id, r as usize)) }
+    let timeout = timeout_ms.map_or(u64::MAX, |t| t.min(i64::MAX as u64));
+    let r = syscall(sys::IPC_RECEIVE, [buf.as_mut_ptr() as u64, buf.len() as u64, &mut id as *mut u64 as u64, timeout, 0, 0]);
+    match r {
+        r if r == -ETIMEDOUT => Ok(Event::Timeout),
+        r if r < 0 => Err(r),
+        r if id == 0 => Ok(Event::Interrupt(r as u16)),
+        r => Ok(Event::Request(id, r as usize)),
+    }
+}
+
+/// Unmasks the device interrupt line assigned to this server.
+pub fn irq_enable(line: u8) -> Result<(), i64> {
+    match syscall(sys::IRQ_ENABLE, [line as u64, 0, 0, 0, 0, 0]) {
+        0 => Ok(()),
+        e => Err(e),
+    }
+}
+
+/// Maps the server's DMA area: (address, physical address).
+pub fn dma_map() -> Result<(*mut u8, u64), i64> {
+    let mut phys = 0u64;
+    match syscall(sys::DMA_MAP, [&mut phys as *mut u64 as u64, 0, 0, 0, 0, 0]) {
+        e if e < 0 => Err(e),
+        addr => Ok((addr as *mut u8, phys)),
+    }
 }
 
 pub fn ipc_reply(id: u64, msg: &[u8]) -> Result<(), i64> {
@@ -124,6 +164,14 @@ pub mod port {
     }
     pub unsafe fn outw(port: u16, v: u16) {
         unsafe { asm!("out dx, ax", in("dx") port, in("ax") v, options(nomem, nostack)) };
+    }
+    pub unsafe fn inl(port: u16) -> u32 {
+        let v: u32;
+        unsafe { asm!("in eax, dx", out("eax") v, in("dx") port, options(nomem, nostack)) };
+        v
+    }
+    pub unsafe fn outl(port: u16, v: u32) {
+        unsafe { asm!("out dx, eax", in("dx") port, in("eax") v, options(nomem, nostack)) };
     }
 }
 

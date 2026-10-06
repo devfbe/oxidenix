@@ -97,6 +97,36 @@ impl PhysFrameAllocator {
         self.free_frames() >= KERNEL_RESERVE_FRAMES + n
     }
 
+    /// `n` physically contiguous fresh frames for device DMA, or None. The
+    /// frames carry one reference that is never dropped. Frames skipped at
+    /// a region boundary stay allocated.
+    pub fn allocate_contiguous(&mut self, n: u64) -> Option<u64> {
+        if n == 0 || !self.user_may_take(n) {
+            return None;
+        }
+        let mut start = self.next_fresh()?;
+        let mut len = 1;
+        self.claim(start);
+        while len < n {
+            let addr = self.next_fresh()?;
+            self.claim(addr);
+            if addr == start + len * FRAME_SIZE {
+                len += 1;
+            } else {
+                start = addr;
+                len = 1;
+            }
+        }
+        Some(start)
+    }
+
+    fn claim(&mut self, addr: u64) {
+        self.used_frames += 1;
+        if let Some(r) = self.refs.get_mut((addr / FRAME_SIZE) as usize) {
+            *r = 1;
+        }
+    }
+
     pub fn refcount(&self, frame: PhysFrame) -> u32 {
         self.refs.get(Self::index(frame)).copied().unwrap_or(0)
     }

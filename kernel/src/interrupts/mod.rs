@@ -38,6 +38,9 @@ lazy_static! {
         }
         idt[InterruptIndex::Keyboard as u8]
             .set_handler_fn(handlers::keyboard_interrupt_handler);
+        for &(line, handler) in handlers::DEVICE_IRQS {
+            idt[PIC_1_OFFSET + line].set_handler_fn(handler);
+        }
         idt
     };
 }

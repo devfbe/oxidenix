@@ -209,8 +209,10 @@ extern "sysv64" fn dispatch(f: &mut Frame) {
         169 => reboot(a0, a1, a2),
         173 => super::ioperm(a0, a1, a2),
         1000 => super::ipc::register(a0, a1, a2),
-        1001 => super::ipc::receive(a0, a1, a2),
+        1001 => super::ipc::receive(a0, a1, a2, a3 as i64),
         1002 => super::ipc::reply(a0, a1, a2),
+        1003 => super::irq::enable(a0),
+        1004 => super::dma_map(a0),
         200 => signal::kill(a0 as i64, a1),            // tkill
         234 => signal::kill(a1 as i64, a2),            // tgkill
         217 => sys_file::getdents64(a0, a1, a2),
