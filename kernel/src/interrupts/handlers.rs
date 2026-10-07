@@ -12,10 +12,10 @@ pub extern "sysv64" fn trap(frame: &mut Frame) {
         0..=31 => exception(frame),
         apic::TIMER_VECTOR => {
             apic::eoi();
-            crate::process::tick(frame.from_user());
-            // The kernel is not preemptive: only user code is interrupted.
-            if frame.from_user() {
-                crate::process::schedule();
+            // The kernel is not preemptive: the switch waits for the
+            // return to user space (below, or that of the running syscall).
+            if crate::timer::interrupt(frame.from_user()) {
+                crate::process::sched::set_need_resched();
             }
         }
         v if (apic::IRQ_BASE..apic::IRQ_BASE + apic::GSI_COUNT as u8).contains(&v) => {
@@ -30,8 +30,10 @@ pub extern "sysv64" fn trap(frame: &mut Frame) {
         // Spurious interrupts need no EOI.
         _ => {}
     }
-    // Every return to user space is a chance to deliver pending signals.
+    // Every return to user space is a chance to switch tasks and to
+    // deliver pending signals.
     if frame.from_user() {
+        crate::process::sched::resched_on_return();
         signal::deliver(frame, None);
     }
 }

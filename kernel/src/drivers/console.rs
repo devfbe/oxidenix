@@ -799,7 +799,9 @@ const SERIAL_CHUNK: usize = 256;
 /// Writes to the serial mirror and the screen. The screen is drawn in
 /// budgeted pieces (`Console::write_some`), releasing the lock and
 /// interrupts in between, so other CPUs and interrupt handlers never wait
-/// long for the console.
+/// long for the console. Between pieces a task that is due takes over the
+/// CPU: a write that redraws the whole screen takes long, and the kernel
+/// does not preempt itself.
 pub fn write_bytes(bytes: &[u8]) {
     for chunk in bytes.chunks(SERIAL_CHUNK) {
         super::serial::write_bytes(chunk);
@@ -814,6 +816,7 @@ pub fn write_bytes(bytes: &[u8]) {
         if rest.is_empty() && !pending {
             return;
         }
+        crate::process::sched::cond_resched();
     }
 }
 

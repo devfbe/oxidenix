@@ -354,16 +354,26 @@ pub fn ioctl(fd: u64, request: u64, arg: u64) -> SysResult {
     Ok(0)
 }
 
-/// poll(2) with a 10 ms granularity: readiness is re-checked every timer tick.
-pub fn poll(fds: u64, nfds: u64, timeout_ms: i64) -> SysResult {
+/// Sleeps until the next re-check of readiness (a scheduler tick from now)
+/// or `deadline`, whichever comes first.
+fn wait_for_readiness(deadline: Option<u64>) -> Result<(), i64> {
+    let next = crate::time::now().saturating_add(crate::timer::TICK_NS);
+    super::sleep_until(deadline.map_or(next, |d| d.min(next)))
+}
+
+/// The deadline of a timeout of `ns` nanoseconds (None: wait forever).
+fn deadline_in(ns: Option<u64>) -> Option<u64> {
+    ns.map(|ns| crate::time::now().saturating_add(ns))
+}
+
+/// poll(2): readiness is re-checked every scheduler tick; the timeout
+/// (`None`: none) ends the wait exactly.
+pub fn poll(fds: u64, nfds: u64, timeout: Option<u64>) -> SysResult {
     const POLLNVAL: i16 = 0x20;
     if nfds > 256 {
         return Err(EINVAL);
     }
-    let deadline = (timeout_ms >= 0).then(|| {
-        let ticks = (timeout_ms as u64).saturating_mul(super::TIMER_HZ).div_ceil(1000);
-        super::ticks().saturating_add(ticks)
-    });
+    let deadline = deadline_in(timeout);
     loop {
         let mut ready = 0;
         for i in 0..nfds {
@@ -381,15 +391,15 @@ pub fn poll(fds: u64, nfds: u64, timeout_ms: i64) -> SysResult {
                 ready += 1;
             }
         }
-        if ready > 0 || deadline.is_some_and(|d| super::ticks() >= d) {
+        if ready > 0 || deadline.is_some_and(|d| crate::time::now() >= d) {
             return Ok(ready);
         }
-        super::sleep_ticks(1)?;
+        wait_for_readiness(deadline)?;
     }
 }
 
-/// Shared core of select and pselect6: `timeout_ms` < 0 waits forever.
-pub fn select(nfds: u64, readfds: u64, writefds: u64, exceptfds: u64, timeout_ms: i64) -> SysResult {
+/// Shared core of select and pselect6: a timeout of `None` waits forever.
+pub fn select(nfds: u64, readfds: u64, writefds: u64, exceptfds: u64, timeout: Option<u64>) -> SysResult {
     if nfds > 1024 {
         return Err(EINVAL);
     }
@@ -404,10 +414,7 @@ pub fn select(nfds: u64, readfds: u64, writefds: u64, exceptfds: u64, timeout_ms
         Ok(set)
     };
     let (want_r, want_w) = (load(readfds)?, load(writefds)?);
-    let deadline = (timeout_ms >= 0).then(|| {
-        let ticks = (timeout_ms as u64).saturating_mul(super::TIMER_HZ).div_ceil(1000);
-        super::ticks().saturating_add(ticks)
-    });
+    let deadline = deadline_in(timeout);
     loop {
         let (mut got_r, mut got_w, mut ready) = ([0u64; 16], [0u64; 16], 0);
         for fd in 0..nfds {
@@ -425,7 +432,7 @@ pub fn select(nfds: u64, readfds: u64, writefds: u64, exceptfds: u64, timeout_ms
                 ready += 1;
             }
         }
-        if ready > 0 || deadline.is_some_and(|d| super::ticks() >= d) {
+        if ready > 0 || deadline.is_some_and(|d| crate::time::now() >= d) {
             for (ptr, set) in [(readfds, got_r), (writefds, got_w), (exceptfds, [0; 16])] {
                 if ptr != 0 {
                     for (i, w) in set.iter().enumerate().take(words as usize) {
@@ -435,22 +442,32 @@ pub fn select(nfds: u64, readfds: u64, writefds: u64, exceptfds: u64, timeout_ms
             }
             return Ok(ready);
         }
-        super::sleep_ticks(1)?;
+        wait_for_readiness(deadline)?;
     }
 }
 
-/// Converts a user timeout {seconds, sub_seconds} to milliseconds; a null
-/// pointer means "wait forever".
-pub fn timeout_ms(ptr: u64, sub_per_ms: u64) -> Result<i64, i64> {
+/// A user timeout {seconds, sub-seconds} in nanoseconds, where a second has
+/// `per_second` sub-seconds (a timeval or a timespec); a null pointer
+/// means "wait forever". Negative or unnormalized values are EINVAL.
+pub fn timeout(ptr: u64, per_second: u64) -> Result<Option<u64>, i64> {
     if ptr == 0 {
-        return Ok(-1);
+        return Ok(None);
     }
-    let [sec, sub]: [u64; 2] = uaccess::read(ptr)?;
-    Ok(sec.saturating_mul(1000).saturating_add(sub / sub_per_ms).min(i64::MAX as u64) as i64)
+    let [sec, sub]: [i64; 2] = uaccess::read(ptr)?;
+    if sec < 0 || !(0..per_second as i64).contains(&sub) {
+        return Err(EINVAL);
+    }
+    let ns_per_sub = crate::time::NSEC_PER_SEC / per_second;
+    Ok(Some((sec as u64).saturating_mul(crate::time::NSEC_PER_SEC).saturating_add(sub as u64 * ns_per_sub)))
 }
 
-pub fn ppoll(fds: u64, nfds: u64, timeout: u64) -> SysResult {
-    poll(fds, nfds, timeout_ms(timeout, 1_000_000)?)
+/// poll's timeout in milliseconds (negative: wait forever).
+pub fn poll_timeout(ms: i64) -> Option<u64> {
+    (ms >= 0).then(|| (ms as u64).saturating_mul(1_000_000))
+}
+
+pub fn ppoll(fds: u64, nfds: u64, ts: u64) -> SysResult {
+    poll(fds, nfds, timeout(ts, crate::time::NSEC_PER_SEC)?)
 }
 
 pub fn faccessat(dirfd: u64, path: u64) -> SysResult {

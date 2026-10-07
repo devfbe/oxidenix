@@ -28,6 +28,8 @@ pub struct Cpu {
     pub sched: crate::process::sched::CpuSched,
     /// Added to this CPU's TSC to match the bootstrap CPU's (see `time`).
     pub tsc_offset: AtomicI64,
+    /// Deadlines due on this CPU (see `timer`).
+    pub timers: crate::timer::CpuTimers,
 }
 
 /// Offsets for the assembly entry code.
@@ -49,6 +51,7 @@ impl Cpu {
             tables: UnsafeCell::new(CpuTables::new()),
             sched: crate::process::sched::CpuSched::new(),
             tsc_offset: AtomicI64::new(0),
+            timers: crate::sync::IrqSpinLock::new(crate::timer::Queue::new()),
         }
     }
 
@@ -221,6 +224,7 @@ fn new_block(index: usize) -> &'static mut Cpu {
         core::ptr::addr_of_mut!((*p).index).write(index);
         CpuTables::init_in_place(UnsafeCell::raw_get(core::ptr::addr_of_mut!((*p).tables)));
         core::ptr::addr_of_mut!((*p).sched).write(crate::process::sched::CpuSched::new());
+        core::ptr::addr_of_mut!((*p).timers).write(crate::sync::IrqSpinLock::new(crate::timer::Queue::new()));
         &mut *p
     }
 }
@@ -349,6 +353,7 @@ extern "C" fn ap_entry(block: *mut Cpu) -> ! {
     crate::process::syscall::init();
     crate::interrupts::apic::init_local();
     set_apic_id(crate::interrupts::apic::id());
+    crate::timer::init_cpu();
     let idle = alloc::sync::Arc::new(crate::process::task::Task::idle_task(index, None, 0));
     crate::process::sched::set_initial(idle.clone(), idle);
     crate::process::sched::idle_loop()

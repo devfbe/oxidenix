@@ -109,10 +109,7 @@ pub fn register(name: u64, len: u64, arg: u64) -> SysResult {
 /// Interrupts of the caller's device lines come first: they are reported
 /// with request id 0 and the mask of fired lines as the result.
 pub fn receive(buf: u64, len: u64, id_out: u64, timeout_ms: i64) -> SysResult {
-    let deadline = (timeout_ms >= 0).then(|| {
-        let ticks = (timeout_ms as u64).saturating_mul(super::TIMER_HZ).div_ceil(1000);
-        super::ticks().saturating_add(ticks)
-    });
+    let deadline = (timeout_ms >= 0).then(|| crate::time::now().saturating_add((timeout_ms as u64).saturating_mul(1_000_000)));
     without_interrupts(|| receive_loop(buf, len, id_out, deadline))
 }
 
@@ -154,7 +151,7 @@ fn receive_loop(buf: u64, len: u64, id_out: u64, deadline: Option<u64>) -> SysRe
                     return Err(EINTR);
                 }
                 match deadline {
-                    Some(d) if super::ticks() >= d => return Err(ETIMEDOUT),
+                    Some(d) if crate::time::now() >= d => return Err(ETIMEDOUT),
                     Some(d) => wait.sleep_until(d),
                     None => wait.sleep(),
                 }
@@ -343,16 +340,18 @@ pub fn is_alive(service: usize) -> bool {
     lock(|ipc| ipc.services.get(service).is_some_and(|s| s.alive))
 }
 
-/// Waits up to `ticks` timer ticks for `name` to be registered.
-pub fn wait_for(name: &str, ticks: u64) -> Option<(usize, u64)> {
-    let deadline = super::ticks() + ticks;
+/// Waits up to `timeout` nanoseconds for `name` to be registered, looking
+/// every scheduler tick.
+pub fn wait_for(name: &str, timeout: u64) -> Option<(usize, u64)> {
+    let deadline = crate::time::now().saturating_add(timeout);
     loop {
         if let Some(found) = lookup(name) {
             return Some(found);
         }
-        if super::ticks() >= deadline {
+        let now = crate::time::now();
+        if now >= deadline {
             return None;
         }
-        let _ = super::sleep_ticks(1);
+        let _ = super::sleep_until(now.saturating_add(crate::timer::TICK_NS).min(deadline));
     }
 }

@@ -15,7 +15,7 @@ use super::errno::*;
 use super::syscall::Frame;
 use super::sched::{self, current, try_wake};
 use super::task::{State, Task, ThreadGroup};
-use super::{uaccess, Pid, TIMER_HZ};
+use super::{uaccess, Pid};
 use crate::interrupts::gdt;
 use alloc::sync::Arc;
 use core::sync::atomic::Ordering;
@@ -73,9 +73,13 @@ pub struct GroupSignals {
     actions: [SigAction; NSIG as usize],
     /// Signals sent to the process.
     pending: u64,
-    /// ITIMER_REAL: next SIGALRM tick (0: off) and the reload interval.
+    /// ITIMER_REAL: when the next SIGALRM is due (0: off) and the reload
+    /// interval, in nanoseconds of the monotonic clock.
     alarm_at: u64,
     alarm_every: u64,
+    /// The interval timer expired and its SIGALRM pends: the next period
+    /// is armed when the signal is taken (see `alarm_expired`).
+    alarm_parked: bool,
     /// The stop signal of a group stop in progress (0: none).
     stopping: u32,
     pub exit: GroupExit,
@@ -88,6 +92,7 @@ impl Default for GroupSignals {
             pending: 0,
             alarm_at: 0,
             alarm_every: 0,
+            alarm_parked: false,
             stopping: 0,
             exit: GroupExit::None,
         }
@@ -454,45 +459,101 @@ pub fn tgkill(tgid: Option<i64>, tid: i64, sig: u64) -> SysResult {
     Ok(0)
 }
 
-/// Sends SIGALRM to every process whose interval timer expired by `now`
-/// and reloads it. Runs in the timer interrupt; never allocates.
-pub fn expire_alarms(now: u64) {
-    let mut due: heapless::Vec<Arc<ThreadGroup>, { sched::MAX_PROCS }> = heapless::Vec::new();
+/// The interval timer of `group` armed as `seq` for `deadline` expired
+/// (in the timer interrupt): SIGALRM. A periodic timer is not reloaded
+/// here but parked until its signal is taken (delivered, or returned by
+/// sigtimedwait), as Linux does for POSIX timers: a pending SIGALRM
+/// suppresses further expiries, so however short the interval, the timer
+/// interrupts at most once per signal the process handles and cannot keep
+/// a CPU busy in its interrupt. Periods missed meanwhile are skipped.
+pub fn alarm_expired(group: &Arc<ThreadGroup>, seq: u64, deadline: u64) {
     {
-        let table = sched::TABLE.lock();
-        for g in table.groups.values() {
-            let mut s = g.sig.lock();
-            if s.alarm_at != 0 && s.alarm_at <= now {
-                s.alarm_at = if s.alarm_every != 0 { now.saturating_add(s.alarm_every) } else { 0 };
-                let _ = due.push(g.clone());
-            }
+        let mut s = group.sig.lock();
+        if group.alarm_seq.load(Ordering::Acquire) != seq {
+            // Cancelled or set again meanwhile.
+            return;
+        }
+        crate::timer::disarm_alarm(group);
+        if s.alarm_every == 0 {
+            s.alarm_at = 0;
+        } else {
+            s.alarm_at = deadline;
+            s.alarm_parked = true;
         }
     }
-    for g in &due {
-        post(g, None, SIGALRM);
+    post(group, None, SIGALRM);
+}
+
+/// The first period of an interval timer due at `at` that ends after `now`.
+fn next_period(at: u64, every: u64, now: u64) -> u64 {
+    if at > now {
+        return at;
+    }
+    let periods = (now - at) / every + 1;
+    at.saturating_add(periods.saturating_mul(every))
+}
+
+/// SIGALRM was taken: a parked interval timer runs on with its next
+/// period. The caller holds the group's signal lock (`s`).
+fn alarm_taken(group: &Arc<ThreadGroup>, s: &mut GroupSignals) {
+    if s.alarm_parked {
+        s.alarm_parked = false;
+        s.alarm_at = next_period(s.alarm_at, s.alarm_every, crate::time::now());
+        crate::timer::arm_alarm(group, s.alarm_at);
     }
 }
 
-/// setitimer(ITIMER_REAL, new, old) with timer-tick resolution. `new` and
-/// `old` are (interval, value) in microseconds; a value of 0 disarms.
+/// A parked interval timer whose SIGALRM was dropped as ignored runs on
+/// once someone can take the signal again: a handler is installed, or a
+/// thread waits for it in sigtimedwait.
+fn alarm_unpark_dropped(group: &Arc<ThreadGroup>, s: &mut GroupSignals) {
+    if s.alarm_parked && s.pending & bit(SIGALRM) == 0 {
+        alarm_taken(group, s);
+    }
+}
+
+/// setitimer(ITIMER_REAL, new, old) for the calling process. `new` and the
+/// result are (value, interval) in microseconds; a value of 0 disarms.
 pub fn set_alarm(value_us: u64, interval_us: u64) -> (u64, u64) {
-    let to_ticks = |us: u64| us.saturating_mul(TIMER_HZ).div_ceil(1_000_000);
-    let to_us = |ticks: u64| ticks.saturating_mul(1_000_000) / TIMER_HZ;
-    let now = sched::ticks();
-    let mut s = current().group.sig.lock();
-    let old = (to_us(s.alarm_at.saturating_sub(now)), to_us(s.alarm_every));
-    s.alarm_at = if value_us == 0 { 0 } else { now.saturating_add(to_ticks(value_us).max(1)) };
-    s.alarm_every = if value_us == 0 { 0 } else { to_ticks(interval_us) };
+    let group = current().group.clone();
+    let mut s = group.sig.lock();
+    let old = alarm_left(&s);
+    s.alarm_parked = false;
+    if value_us == 0 {
+        s.alarm_at = 0;
+        s.alarm_every = 0;
+        crate::timer::disarm_alarm(&group);
+    } else {
+        s.alarm_at = crate::time::now().saturating_add(value_us.saturating_mul(1000));
+        s.alarm_every = interval_us.saturating_mul(1000);
+        crate::timer::arm_alarm(&group, s.alarm_at);
+    }
     old
+}
+
+/// Turns off `group`'s interval timer (the process ended).
+pub fn stop_alarm(group: &ThreadGroup) {
+    let mut s = group.sig.lock();
+    s.alarm_at = 0;
+    s.alarm_every = 0;
+    s.alarm_parked = false;
+    crate::timer::disarm_alarm(group);
 }
 
 /// The current ITIMER_REAL setting: (remaining, interval) in microseconds.
 pub fn get_alarm() -> (u64, u64) {
-    let now = sched::ticks();
-    let s = current().group.sig.lock();
-    let remaining = if s.alarm_at == 0 { 0 } else { s.alarm_at.saturating_sub(now).max(1) };
-    let to_us = |ticks: u64| ticks.saturating_mul(1_000_000) / TIMER_HZ;
-    (to_us(remaining), to_us(s.alarm_every))
+    alarm_left(&current().group.sig.lock())
+}
+
+fn alarm_left(s: &GroupSignals) -> (u64, u64) {
+    if s.alarm_at == 0 {
+        return (0, 0);
+    }
+    // A parked timer reports the period it would be in had it run on.
+    let now = crate::time::now();
+    let at = if s.alarm_parked { next_period(s.alarm_at, s.alarm_every, now) } else { s.alarm_at };
+    // An armed timer never reports 0 left, which would mean "off".
+    (at.saturating_sub(now).div_ceil(1000).max(1), s.alarm_every / 1000)
 }
 
 /// rt_sigtimedwait(set, info, timeout, size): takes the lowest pending
@@ -503,17 +564,11 @@ pub fn sigtimedwait(set: u64, info: u64, timeout: u64, size: u64) -> SysResult {
         return Err(EINVAL);
     }
     let wanted: u64 = uaccess::read::<u64>(set)? & !UNBLOCKABLE;
-    let deadline = if timeout != 0 {
-        let [sec, nsec]: [u64; 2] = uaccess::read(timeout)?;
-        if nsec >= 1_000_000_000 || sec > i64::MAX as u64 {
-            return Err(EINVAL);
-        }
-        let tick_ns = 1_000_000_000 / TIMER_HZ;
-        Some(sched::ticks().saturating_add(sec.saturating_mul(TIMER_HZ)).saturating_add(nsec.div_ceil(tick_ns)))
-    } else {
-        None
-    };
+    let deadline = if timeout != 0 { Some(crate::time::now().saturating_add(super::sys_time::read_timespec(timeout)?)) } else { None };
     let me = current();
+    if wanted & bit(SIGALRM) != 0 {
+        alarm_unpark_dropped(&me.group, &mut me.group.sig.lock());
+    }
     let result = loop {
         let wait = sched::prepare_to_sleep();
         {
@@ -527,6 +582,9 @@ pub fn sigtimedwait(set: u64, info: u64, timeout: u64, size: u64) -> SysResult {
                 } else {
                     g.pending &= !bit(sig);
                 }
+                if sig == SIGALRM {
+                    alarm_taken(&me.group, &mut g);
+                }
                 break Ok(sig);
             }
             t.waiting_for = wanted;
@@ -535,7 +593,7 @@ pub fn sigtimedwait(set: u64, info: u64, timeout: u64, size: u64) -> SysResult {
             break Err(EINTR);
         }
         match deadline {
-            Some(d) if sched::ticks() >= d => break Err(EAGAIN),
+            Some(d) if crate::time::now() >= d => break Err(EAGAIN),
             Some(d) => wait.sleep_until(d),
             None => wait.sleep(),
         }
@@ -573,6 +631,8 @@ pub fn sigaction(sig: u64, act: u64, oldact: u64) -> SysResult {
                 for t in info.threads.iter() {
                     t.sig.lock().pending &= !bit(sig);
                 }
+            } else if sig == SIGALRM {
+                alarm_unpark_dropped(group, &mut g);
             }
         }
         old
@@ -738,6 +798,9 @@ pub fn deliver(frame: &mut Frame, syscall: Option<u64>) {
                     t.pending &= !bit(sig);
                 } else {
                     g.pending &= !bit(sig);
+                }
+                if sig == SIGALRM {
+                    alarm_taken(&me.group, &mut g);
                 }
                 let action = g.actions[sig as usize - 1];
                 if action.handler == SIG_DFL && is_stop(sig) {

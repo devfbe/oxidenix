@@ -59,9 +59,9 @@ pub fn init() {
 
 /// Local and I/O APIC; the keyboard interrupt is routed and unmasked, the
 /// other ISA lines are routed but stay masked until a driver enables them.
-pub fn init_controllers(rsdp: u64, hz: u64) {
+pub fn init_controllers(rsdp: u64) {
     crate::drivers::acpi::init(rsdp).expect("ACPI");
-    apic::init(hz).expect("APIC");
+    apic::init().expect("APIC");
     for irq in 1..16 {
         if irq != 2 {
             apic::route_isa(irq, irq != KEYBOARD_IRQ);

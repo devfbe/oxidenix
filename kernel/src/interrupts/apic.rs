@@ -5,7 +5,7 @@
 use crate::drivers::acpi::{self, Override};
 use crate::memory::{self, Caching};
 use crate::sync::IrqSpinLock;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 use x86_64::instructions::port::Port;
 
 /// Vectors: the local timer, the I/O APIC lines (GSI n at IRQ_BASE + n)
@@ -30,11 +30,12 @@ const TIMER_DIVIDE: usize = 0x3e0;
 
 const SVR_ENABLE: u32 = 1 << 8;
 const LVT_MASKED: u32 = 1 << 16;
-const TIMER_PERIODIC: u32 = 1 << 17;
+const TIMER_TSC_DEADLINE: u32 = 0b10 << 17;
+const MSR_TSC_DEADLINE: u32 = 0x6e0;
 
 static LAPIC: AtomicU64 = AtomicU64::new(0);
-/// Local APIC timer counts per scheduler tick (divider 16), measured once.
-static TIMER_COUNT: AtomicU32 = AtomicU32::new(0);
+/// Local APIC timer counts per second (divider 16), measured once.
+static TIMER_HZ: AtomicU64 = AtomicU64::new(0);
 
 fn lapic_read(reg: usize) -> u32 {
     unsafe { core::ptr::read_volatile((LAPIC.load(Ordering::Relaxed) as usize + reg) as *const u32) }
@@ -104,7 +105,8 @@ pub mod ipi {
     }
 }
 
-/// Enables this CPU's local APIC and starts its periodic timer.
+/// Enables this CPU's local APIC; its timer stays off until `timer`
+/// programs it.
 pub fn init_local() {
     lapic_write(TPR, 0);
     lapic_write(LVT_LINT0, LVT_MASKED);
@@ -112,8 +114,29 @@ pub fn init_local() {
     lapic_write(LVT_ERROR, LVT_MASKED);
     lapic_write(SVR, SVR_ENABLE | SPURIOUS_VECTOR as u32);
     lapic_write(TIMER_DIVIDE, 0b0011); // divide by 16
-    lapic_write(LVT_TIMER, TIMER_PERIODIC | TIMER_VECTOR as u32);
-    lapic_write(TIMER_INITIAL, TIMER_COUNT.load(Ordering::Relaxed));
+    lapic_write(LVT_TIMER, LVT_MASKED | TIMER_VECTOR as u32);
+}
+
+/// The local APIC timer's frequency in one-shot mode (counts per second).
+pub fn timer_hz() -> u64 {
+    TIMER_HZ.load(Ordering::Relaxed)
+}
+
+/// Puts this CPU's timer into TSC-deadline or one-shot mode, unmasked.
+pub fn set_timer_mode(tsc_deadline: bool) {
+    lapic_write(LVT_TIMER, if tsc_deadline { TIMER_TSC_DEADLINE } else { 0 } | TIMER_VECTOR as u32);
+    // The mode must be in effect before the deadline MSR is written.
+    unsafe { core::arch::asm!("mfence", options(nostack, preserves_flags)) };
+}
+
+/// TSC-deadline mode: interrupt when this CPU's TSC reaches `tsc`.
+pub fn set_tsc_deadline(tsc: u64) {
+    unsafe { x86_64::registers::model_specific::Msr::new(MSR_TSC_DEADLINE).write(tsc) };
+}
+
+/// One-shot mode: interrupt after `count` timer counts.
+pub fn set_oneshot_count(count: u32) {
+    lapic_write(TIMER_INITIAL, count);
 }
 
 /// Busy-waits about `us` microseconds with PIT channel 2 (no interrupts).
@@ -142,15 +165,15 @@ pub fn pit_delay_us(us: u64) {
     }
 }
 
-/// Measures the local APIC timer against the PIT: counts per tick at `hz`.
-fn calibrate(hz: u64) -> u32 {
+/// Measures the local APIC timer against the PIT: counts per second.
+fn calibrate() -> u64 {
     lapic_write(TIMER_DIVIDE, 0b0011);
     lapic_write(LVT_TIMER, LVT_MASKED);
     lapic_write(TIMER_INITIAL, u32::MAX);
     pit_delay_us(10_000);
     let elapsed = u32::MAX - lapic_read(TIMER_CURRENT);
     lapic_write(TIMER_INITIAL, 0);
-    ((elapsed as u64 * 100 / hz) as u32).max(1)
+    (elapsed as u64 * 100).max(1)
 }
 
 /// The I/O APIC and the ISA overrides.
@@ -226,7 +249,7 @@ static BSP_APIC_ID: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8:
 
 /// Switches the bootstrap CPU from the PICs to the APICs. Every I/O APIC
 /// pin starts masked; `route_isa` opens the ones in use.
-pub fn init(hz: u64) -> Result<(), &'static str> {
+pub fn init() -> Result<(), &'static str> {
     let madt = acpi::madt();
     let lapic = memory::map_physical(madt.local_apic, 4096, Caching::Uncached)?;
     LAPIC.store(lapic.as_u64(), Ordering::Relaxed);
@@ -243,7 +266,7 @@ pub fn init(hz: u64) -> Result<(), &'static str> {
     disable_pics();
     BSP_APIC_ID.store(id(), Ordering::Relaxed);
     crate::smp::set_apic_id(id());
-    TIMER_COUNT.store(calibrate(hz), Ordering::Relaxed);
+    TIMER_HZ.store(calibrate(), Ordering::Relaxed);
     init_local();
     Ok(())
 }

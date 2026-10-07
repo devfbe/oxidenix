@@ -20,6 +20,7 @@ mod shell;
 pub mod smp;
 pub mod sync;
 mod time;
+mod timer;
 
 pub static BOOTLOADER_CONFIG: BootloaderConfig = {
     let mut config = BootloaderConfig::new_default();
@@ -46,8 +47,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
         core::slice::from_raw_parts(addr as *const u8, boot_info.ramdisk_len as usize)
     });
     let rsdp = boot_info.rsdp_addr.into_option().expect("bootloader found no ACPI RSDP");
-    interrupts::init_controllers(rsdp, process::TIMER_HZ);
+    interrupts::init_controllers(rsdp);
     time::init();
+    timer::init(interrupts::apic::timer_hz());
+    timer::init_cpu();
     fs::init(ramdisk);
     if fs::resolve("/", "/etc/autorun", true).is_ok() {
         TEST_MODE.store(true, core::sync::atomic::Ordering::Relaxed);
@@ -125,7 +128,7 @@ fn start_netd() {
             .arg(alloc::format!("iolen={len}"))
             .arg(alloc::format!("irq={}", nic.irq))
             // netd registers once DHCP is done, or after three seconds.
-            .start_timeout(5 * process::TIMER_HZ),
+            .start_timeout(5 * time::NSEC_PER_SEC),
         Err(e) => return printkln!("[boot] cannot load /sbin/netd (errno {})", e),
     };
     let server = Arc::new(server);

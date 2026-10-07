@@ -16,9 +16,9 @@
 
 use super::address_space::{Backing, PAGE};
 use super::errno::*;
-use super::sched::{self, current, current_arc, prepare_to_sleep, try_wake};
+use super::sched::{current, current_arc, prepare_to_sleep, try_wake};
 use super::task::{State, Task};
-use super::{signal, uaccess, TIMER_HZ};
+use super::{signal, uaccess};
 use crate::sync::IrqSpinLock;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -85,26 +85,21 @@ fn key_of(uaddr: u64, private: bool) -> Result<Key, i64> {
     })
 }
 
-/// Deadline in timer ticks for a futex timeout at `ts` (a timespec): an
-/// interval for FUTEX_WAIT, an absolute time (monotonic, or the realtime
-/// clock) for FUTEX_WAIT_BITSET.
+/// Deadline (nanoseconds of the monotonic clock) for a futex timeout at
+/// `ts` (a timespec): an interval for FUTEX_WAIT, an absolute time
+/// (monotonic, or the realtime clock) for FUTEX_WAIT_BITSET.
 fn deadline(ts: u64, absolute: bool, realtime: bool) -> Result<Option<u64>, i64> {
     if ts == 0 {
         return Ok(None);
     }
-    let [sec, nsec]: [u64; 2] = uaccess::read(ts)?;
-    if nsec >= 1_000_000_000 || sec > i64::MAX as u64 {
-        return Err(EINVAL);
-    }
-    let tick_ns = 1_000_000_000 / TIMER_HZ;
-    let to_ticks = |sec: u64, nsec: u64| sec.saturating_mul(TIMER_HZ).saturating_add(nsec.div_ceil(tick_ns));
-    let now = sched::ticks();
+    let t = super::sys_time::read_timespec(ts)?;
+    let now = crate::time::now();
     Ok(Some(if !absolute {
-        now.saturating_add(to_ticks(sec, nsec))
+        now.saturating_add(t)
+    } else if realtime {
+        now.saturating_add(t.saturating_sub(crate::time::realtime()))
     } else {
-        let clock_now = if realtime { crate::time::realtime() } else { crate::time::now() } as u128;
-        let left = (sec as u128 * 1_000_000_000 + nsec as u128).saturating_sub(clock_now);
-        now.saturating_add(to_ticks((left / 1_000_000_000) as u64, (left % 1_000_000_000) as u64))
+        t
     }))
 }
 
@@ -139,7 +134,7 @@ fn wait(uaddr: u64, val: u32, deadline: Option<u64>, bitset: u32, private: bool)
         if me.futex_woken.load(Ordering::Acquire) {
             break Ok(0);
         }
-        if deadline.is_some_and(|d| sched::ticks() >= d) {
+        if deadline.is_some_and(|d| crate::time::now() >= d) {
             break Err(ETIMEDOUT);
         }
         if signal::interrupted() {

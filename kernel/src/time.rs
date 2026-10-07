@@ -46,6 +46,13 @@ pub fn now() -> u64 {
     ((delta as u128 * MULT.load(Ordering::Relaxed) as u128) >> 32) as u64
 }
 
+/// The value this CPU's TSC has at `ns` nanoseconds since boot (for the
+/// local APIC's TSC-deadline timer), rounded up so it is never early.
+pub fn tsc_at(ns: u64) -> u64 {
+    let cycles = ((ns as u128) << 32).div_ceil(MULT.load(Ordering::Relaxed).max(1) as u128) as u64;
+    BOOT_TSC.load(Ordering::Relaxed).wrapping_add(cycles).wrapping_sub(smp::cpu().tsc_offset.load(Ordering::Relaxed) as u64)
+}
+
 /// Nanoseconds since the epoch (CLOCK_REALTIME).
 pub fn realtime() -> u64 {
     WALL_AT_BOOT.load(Ordering::Relaxed).saturating_add(now() as i64).max(0) as u64
@@ -53,7 +60,8 @@ pub fn realtime() -> u64 {
 
 /// Sets the wall clock (clock_settime): the monotonic clock is unaffected.
 pub fn set_realtime(ns: u64) {
-    WALL_AT_BOOT.store((ns as i64).saturating_sub(now() as i64), Ordering::Relaxed);
+    let ns = ns.min(i64::MAX as u64) as i64;
+    WALL_AT_BOOT.store(ns.saturating_sub(now() as i64), Ordering::Relaxed);
 }
 
 /// Wall-clock time of the boot, in seconds since the epoch.

@@ -162,7 +162,7 @@ extern "sysv64" fn dispatch(f: &mut Frame) {
         4 => sys_file::newfstatat(cwd, a0, a1, 0),
         5 => sys_file::fstat(a0, a1),
         6 => sys_file::newfstatat(cwd, a0, a1, 0x100),
-        7 => sys_file::poll(a0, a1, a2 as i32 as i64),
+        7 => sys_file::poll(a0, a1, sys_file::poll_timeout(a2 as i32 as i64)),
         8 => sys_file::lseek(a0, a1 as i64, a2),
         9 => sys_mem::mmap(a0, a1, a2, a3, a4, a5),
         10 => sys_mem::mprotect(a0, a1, a2),
@@ -182,7 +182,7 @@ extern "sysv64" fn dispatch(f: &mut Frame) {
         20 => sys_file::writev(a0, a1, a2),
         21 => sys_file::faccessat(cwd, a0),
         22 => sys_file::pipe2(a0, 0),
-        23 => sys_file::timeout_ms(a4, 1000).and_then(|t| sys_file::select(a0, a1, a2, a3, t)),
+        23 => sys_file::timeout(a4, 1_000_000).and_then(|t| sys_file::select(a0, a1, a2, a3, t)),
         24 => {
             super::yield_now();
             Ok(0)
@@ -190,7 +190,8 @@ extern "sysv64" fn dispatch(f: &mut Frame) {
         32 => sys_file::dup(a0),
         33 => sys_file::dup3(a0, a1, 0, true),
         34 => super::pause(),
-        35 => nanosleep(a0),
+        35 => sys_time::clock_nanosleep(1, 0, a0, a1),
+        230 => sys_time::clock_nanosleep(a0, a1, a2, a3),
         39 => Ok(super::current_pid() as i64),
         186 => Ok(super::current_tid() as i64),
         218 => super::set_tid_address(a0).map(|tid| tid as i64),
@@ -289,7 +290,7 @@ extern "sysv64" fn dispatch(f: &mut Frame) {
         266 => sys_file::symlinkat(a0, a1, a2),
         267 => sys_file::readlinkat(a0, a1, a2, a3),
         268 => sys_file::fchmodat(a0, a1, a2),
-        270 => sys_file::timeout_ms(a4, 1_000_000).and_then(|t| sys_file::select(a0, a1, a2, a3, t)),
+        270 => sys_file::timeout(a4, crate::time::NSEC_PER_SEC).and_then(|t| sys_file::select(a0, a1, a2, a3, t)),
         271 => sys_file::ppoll(a0, a1, a2),
         269 | 439 => sys_file::faccessat(a0, a1),
         235 => sys_file::utimensat(cwd, a0, 0),
@@ -305,6 +306,7 @@ extern "sysv64" fn dispatch(f: &mut Frame) {
         }
     };
     f.rax = result.unwrap_or_else(|e| -e) as u64;
+    super::sched::resched_on_return();
     super::signal::deliver(f, Some(nr));
 }
 
@@ -397,20 +399,6 @@ fn getitimer(which: u64, cur: u64) -> SysResult {
     }
     write_itimerval(cur, super::get_alarm())?;
     Ok(0)
-}
-
-/// Sleeps at least the requested time: whole timer ticks until the clock
-/// says it has passed.
-fn nanosleep(req: u64) -> SysResult {
-    let end = crate::time::now().saturating_add(sys_time::read_timespec(req)?);
-    let tick_ns = crate::time::NSEC_PER_SEC / super::TIMER_HZ;
-    loop {
-        let left = end.saturating_sub(crate::time::now());
-        if left == 0 {
-            return Ok(0);
-        }
-        super::sleep_ticks(left.div_ceil(tick_ns))?;
-    }
 }
 
 fn prlimit(old: u64) -> SysResult {

@@ -1,5 +1,5 @@
-//! Clocks and CPU-time accounting: clock_gettime and its relatives,
-//! getrusage and times.
+//! Clocks, sleeps and CPU-time accounting: clock_gettime and its
+//! relatives, clock_nanosleep, getrusage and times.
 
 use super::errno::*;
 use super::sched::{current, TABLE};
@@ -148,6 +148,36 @@ pub fn clock_settime(id: u64, ts: u64) -> SysResult {
     Ok(0)
 }
 
+/// clock_nanosleep(clock, flags, request, remain), and nanosleep (on the
+/// monotonic clock). An absolute sleep on the wall clock ends at the
+/// monotonic time that corresponds to it when the sleep starts. A
+/// relative sleep cut short by a signal stores the time left.
+pub fn clock_nanosleep(id: u64, flags: u64, req: u64, rem: u64) -> SysResult {
+    const TIMER_ABSTIME: u64 = 1;
+    let realtime = match id as i32 as i64 {
+        CLOCK_REALTIME | CLOCK_REALTIME_ALARM | CLOCK_TAI => true,
+        CLOCK_MONOTONIC | CLOCK_BOOTTIME | CLOCK_BOOTTIME_ALARM => false,
+        CLOCK_THREAD_CPUTIME_ID => return Err(EINVAL),
+        _ => {
+            // Valid clocks without sleeps (CPU time, coarse, raw).
+            clock(id)?;
+            return Err(EOPNOTSUPP);
+        }
+    };
+    let t = read_timespec(req)?;
+    let now = time::now();
+    let deadline = match (flags & TIMER_ABSTIME != 0, realtime) {
+        (false, _) => now.saturating_add(t),
+        (true, false) => t,
+        (true, true) => now.saturating_add(t.saturating_sub(time::realtime())),
+    };
+    super::sleep_until(deadline).map(|_| 0).inspect_err(|_| {
+        if flags & TIMER_ABSTIME == 0 && rem != 0 {
+            let _ = uaccess::write(rem, timespec(deadline.saturating_sub(time::now())));
+        }
+    })
+}
+
 pub fn gettimeofday(tv: u64, tz: u64) -> SysResult {
     if tv != 0 {
         uaccess::write(tv, timeval(time::realtime()))?;
@@ -165,7 +195,7 @@ pub fn settimeofday(tv: u64) -> SysResult {
         if sec < 0 || !(0..1_000_000).contains(&usec) {
             return Err(EINVAL);
         }
-        time::set_realtime((sec as u64).saturating_mul(NSEC_PER_SEC) + usec as u64 * 1000);
+        time::set_realtime((sec as u64).saturating_mul(NSEC_PER_SEC).saturating_add(usec as u64 * 1000));
     }
     Ok(0)
 }

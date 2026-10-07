@@ -116,10 +116,9 @@ impl Drop for PidReservation {
     }
 }
 
-static TICKS: AtomicU64 = AtomicU64::new(0);
-
+/// Scheduler ticks since boot (clock ticks of procfs and `times`).
 pub fn ticks() -> u64 {
-    TICKS.load(Ordering::Relaxed)
+    crate::time::now() / crate::timer::TICK_NS
 }
 
 /// The scheduler's part of a CPU block. `current`, `prev` and `idle` are
@@ -132,6 +131,10 @@ pub struct CpuSched {
     idle: UnsafeCell<Option<Arc<Task>>>,
     /// In the idle loop's `hlt`: new work for it needs an IPI.
     halted: AtomicBool,
+    /// The running task should give up the CPU at its next return to user
+    /// space (its time slice ended, or a task woke up here while the CPU
+    /// was in the kernel, which is not preempted).
+    need_resched: AtomicBool,
     /// Timer ticks spent in user mode, in the kernel and idling, and
     /// context switches.
     pub user_ticks: AtomicU64,
@@ -148,6 +151,7 @@ impl CpuSched {
             prev: UnsafeCell::new(None),
             idle: UnsafeCell::new(None),
             halted: AtomicBool::new(false),
+            need_resched: AtomicBool::new(false),
             user_ticks: AtomicU64::new(0),
             system_ticks: AtomicU64::new(0),
             idle_ticks: AtomicU64::new(0),
@@ -261,6 +265,8 @@ pub fn cpu_stats(cpu: &Cpu) -> CpuStats {
 /// number of runnable tasks over 1, 5 and 15 minutes, in fixed point with
 /// 11 fractional bits, updated every 5 seconds.
 pub const LOAD_SHIFT: u32 = 11;
+const LOAD_INTERVAL: u64 = 5 * crate::time::NSEC_PER_SEC;
+static NEXT_LOAD: AtomicU64 = AtomicU64::new(LOAD_INTERVAL);
 const LOAD_ONE: u64 = 1 << LOAD_SHIFT;
 const LOAD_EXP: [u64; 3] = [1884, 2014, 2037];
 static LOAD: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
@@ -327,9 +333,13 @@ impl Wait {
         schedule();
     }
 
-    /// Sleeps at most until timer tick `deadline`.
+    /// Sleeps at most until `deadline` (nanoseconds since boot). A
+    /// deadline that has passed ends the wait at once.
     pub fn sleep_until(self, deadline: u64) {
-        current().wake_at.store(deadline.max(1), Ordering::Relaxed);
+        if deadline <= crate::time::now() {
+            return;
+        }
+        crate::timer::wake_at(&current_arc(), deadline);
         schedule();
     }
 }
@@ -341,8 +351,8 @@ impl Drop for Wait {
             let _w = me.wake_lock.lock();
             me.set_state(State::Running);
             me.wait_chan.store(0, Ordering::Relaxed);
-            me.wake_at.store(0, Ordering::Relaxed);
         }
+        crate::timer::disarm(me);
         bucket(self.chan).lock().retain(|t| !core::ptr::eq(&**t, me));
     }
 }
@@ -364,7 +374,6 @@ pub fn try_wake(t: &Arc<Task>, from: State) -> bool {
     if t.state() != from {
         return false;
     }
-    t.wake_at.store(0, Ordering::Relaxed);
     if t.on_rq.load(Ordering::Acquire) {
         // Still on its CPU, not descheduled yet: it simply keeps running.
         t.set_state(State::Running);
@@ -393,6 +402,7 @@ pub fn schedule() {
     interrupts::without_interrupts(|| {
         let cpu = smp::cpu();
         let cs = &cpu.sched;
+        cs.need_resched.store(false, Ordering::Relaxed);
         let cur = current();
         {
             let _w = cur.wake_lock.lock();
@@ -421,6 +431,32 @@ pub fn schedule() {
         }
         context_switch(next);
     });
+}
+
+/// Asks this CPU to switch tasks at its next return to user space.
+pub fn set_need_resched() {
+    smp::cpu().sched.need_resched.store(true, Ordering::Relaxed);
+}
+
+/// Every return to user space: switches tasks if one is due. The kernel
+/// is not preemptive, so this is where a task that woke up while the CPU
+/// was busy in the kernel (in a syscall, or with interrupts held off) gets
+/// its turn; without it, the request would be lost until a timer interrupt
+/// happened to land in user mode.
+pub fn resched_on_return() {
+    if smp::cpu().sched.need_resched.load(Ordering::Relaxed) {
+        schedule();
+    }
+}
+
+/// A voluntary preemption point for long kernel work (as Linux's
+/// `cond_resched`): switches tasks if one is due. Only where interrupts
+/// are on, which rules out interrupt handlers and holders of interrupt-safe
+/// locks; callers hold no other spinlock either.
+pub fn cond_resched() {
+    if interrupts::are_enabled() {
+        resched_on_return();
+    }
 }
 
 /// Switches from the current task to `next` (interrupts are off).
@@ -586,9 +622,9 @@ pub extern "C" fn idle_loop() -> ! {
 
 // ---------------------------------------------------------------- timer
 
-/// Called on every CPU's timer interrupt; `user` tells whether it hit user
-/// code. The bootstrap CPU keeps the global time: ticks, sleep deadlines,
-/// interval timers and the load average.
+/// The scheduler tick (see `timer`), every 10 ms on every CPU; `user`
+/// tells whether it hit user code. It samples where time goes; the
+/// bootstrap CPU also updates the load average.
 pub fn tick(user: bool) {
     let cpu = smp::cpu();
     let cur = current();
@@ -604,8 +640,9 @@ pub fn tick(user: bool) {
     if cpu.index != 0 {
         return;
     }
-    let now = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
-    if now % (5 * super::TIMER_HZ) == 0 {
+    let now = crate::time::now();
+    if now >= NEXT_LOAD.load(Ordering::Relaxed) {
+        NEXT_LOAD.store(now + LOAD_INTERVAL, Ordering::Relaxed);
         let runnable = TABLE
             .lock()
             .tasks
@@ -614,18 +651,4 @@ pub fn tick(user: bool) {
             .count();
         update_load(runnable as u64);
     }
-    let mut due: heapless::Vec<Arc<Task>, MAX_PROCS> = heapless::Vec::new();
-    {
-        let table = TABLE.lock();
-        for t in table.tasks.values() {
-            let deadline = t.wake_at.load(Ordering::Relaxed);
-            if deadline != 0 && deadline <= now {
-                let _ = due.push(t.clone());
-            }
-        }
-    }
-    for t in &due {
-        try_wake(t, State::Sleeping);
-    }
-    super::signal::expire_alarms(now);
 }

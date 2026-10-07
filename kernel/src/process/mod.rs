@@ -40,7 +40,7 @@ use x86_64::instructions::interrupts;
 pub use clone::{clone, set_tid_address};
 pub use exec::exec;
 pub use exit::{decode_status, exit_group, exit_thread, notify_parent, reap_orphans, wait4, wait_for, WaitStatus};
-pub use sched::{prepare_to_sleep, schedule, ticks, wakeup};
+pub use sched::{prepare_to_sleep, schedule, wakeup};
 pub use signal::{get_alarm, set_alarm};
 pub use task::Process;
 
@@ -293,17 +293,12 @@ pub fn getcpu(cpu: u64, node: u64) -> SysResult {
     Ok(0)
 }
 
-/// Called from every CPU's timer interrupt.
-pub fn tick(user: bool) {
-    sched::tick(user);
-}
-
-/// Sleeps for `n` timer ticks; a signal ends the sleep early with EINTR.
-pub fn sleep_ticks(n: u64) -> Result<(), i64> {
-    let deadline = ticks().saturating_add(n);
+/// Sleeps until `deadline` (nanoseconds since boot); a signal ends the
+/// sleep early with EINTR.
+pub fn sleep_until(deadline: u64) -> Result<(), i64> {
     loop {
         let wait = prepare_to_sleep();
-        if ticks() >= deadline {
+        if crate::time::now() >= deadline {
             return Ok(());
         }
         if signal::interrupted() {
@@ -393,8 +388,9 @@ pub struct Server {
     dma: spin::Mutex<Option<u64>>,
     /// Extra command line arguments (e.g. the device's resources).
     args: Vec<String>,
-    /// How long a (re)started server may take to register its service.
-    start_ticks: u64,
+    /// How long a (re)started server may take to register its service,
+    /// in nanoseconds.
+    start_timeout: u64,
     restarts: core::sync::atomic::AtomicU32,
     restarting: core::sync::atomic::AtomicBool,
 }
@@ -423,7 +419,7 @@ impl Server {
             dma_pages: 0,
             dma: spin::Mutex::new(None),
             args: Vec::new(),
-            start_ticks: 3 * TIMER_HZ,
+            start_timeout: 3 * crate::time::NSEC_PER_SEC,
             restarts: core::sync::atomic::AtomicU32::new(0),
             restarting: core::sync::atomic::AtomicBool::new(false),
         })
@@ -432,7 +428,7 @@ impl Server {
     /// Starts the server and waits for it to register: (service, argument).
     pub fn start(self: &Arc<Self>) -> Result<(usize, u64), i64> {
         spawn_server(self)?;
-        ipc::wait_for(self.name, self.start_ticks).ok_or(EIO)
+        ipc::wait_for(self.name, self.start_timeout).ok_or(EIO)
     }
 
     /// The server's service, restarting the server if it died. The first
@@ -443,7 +439,7 @@ impl Server {
             return Ok(found);
         }
         if self.restarting.swap(true, Ordering::Relaxed) {
-            return ipc::wait_for(self.name, self.start_ticks).ok_or(EIO);
+            return ipc::wait_for(self.name, self.start_timeout).ok_or(EIO);
         }
         let attempt = self.restarts.fetch_add(1, Ordering::Relaxed) + 1;
         let result = if attempt > MAX_RESTARTS {
@@ -457,8 +453,8 @@ impl Server {
     }
 
     /// Time allowed for registration after a (re)start.
-    pub fn start_timeout(mut self, ticks: u64) -> Self {
-        self.start_ticks = ticks;
+    pub fn start_timeout(mut self, ns: u64) -> Self {
+        self.start_timeout = ns;
         self
     }
 

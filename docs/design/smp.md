@@ -1,7 +1,8 @@
 # Symmetric multiprocessing in oxidenix
 
 Status: implemented (all six steps). The README describes the details as built. Since then,
-syscalls run with interrupts enabled (the kernel stays non-preemptive).
+syscalls run with interrupts enabled (the kernel stays non-preemptive; a switch an interrupt
+asks for happens at the next return to user space, or at a `cond_resched` in long kernel work).
 
 ## Goals
 
@@ -48,8 +49,9 @@ and dispatches by vector.
   the I/O APIC and the interrupt source overrides (IRQ 0 is GSI 2 on QEMU, PCI lines are
   level-triggered).
 - The 8259 PICs are masked. Each CPU uses its local APIC (xAPIC, MMIO mapped uncached), whose
-  timer is calibrated against the PIT once and then drives preemption at 100 Hz per CPU. CPU
-  0's timer also advances the global tick counter.
+  timer is programmed for the next deadline of the CPU's timer queue (`timer.rs`): in
+  TSC-deadline mode where available, else one-shot with a frequency calibrated against the
+  PIT. The scheduler tick (preemption every 10 ms) is one of those deadlines.
 - The I/O APIC routes ISA and PCI interrupts. Device lines handed to user-space drivers are
   masked in their redirection entry when they fire and unmasked by `irq_enable`.
 - Inter-processor interrupts: reschedule (wake an idle CPU), panic (stop all CPUs).

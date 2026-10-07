@@ -122,6 +122,8 @@ fn process_exit(group: &Arc<ThreadGroup>, status: i32) {
     let pid = group.tgid;
     ipc::on_exit(pid);
     irq::on_exit(pid);
+    // A zombie gets no SIGALRM.
+    super::signal::stop_alarm(group);
     // Orphans go to the kernel, which reaps them; those that asked for it
     // (PR_SET_PDEATHSIG) get a signal.
     let mut death_signals: Vec<(Pid, u32)> = Vec::new();

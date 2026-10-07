@@ -150,6 +150,9 @@ pub struct ThreadGroup {
     /// Handlers, pending process signals, the interval timer, and group
     /// stops and exits. Taken before any thread's `sig`.
     pub sig: IrqSpinLock<GroupSignals>,
+    /// Sequence number of the live arming of the interval timer (0: off),
+    /// changed under `sig`.
+    pub alarm_seq: AtomicU64,
 }
 
 impl ThreadGroup {
@@ -160,6 +163,7 @@ impl ThreadGroup {
             start_ticks: super::sched::ticks(),
             info: IrqSpinLock::new(info),
             sig: IrqSpinLock::new(sig),
+            alarm_seq: AtomicU64::new(0),
         })
         .ok()
     }
@@ -314,9 +318,10 @@ pub struct Task {
     pub last_cpu: AtomicUsize,
     /// CPUs it may run on (bit per CPU index), see sched_setaffinity.
     pub affinity: AtomicU64,
-    /// Channel it waits on (0: none) and its deadline in ticks (0: none).
+    /// Channel it waits on (0: none), and the sequence number of the
+    /// timer that ends its sleep (0: none; see `timer`).
     pub wait_chan: AtomicUsize,
-    pub wake_at: AtomicU64,
+    pub timer_seq: AtomicU64,
     /// Serializes wakeups with the task descheduling itself.
     pub wake_lock: IrqSpinLock<()>,
     /// futex wait: set by the waker that dequeued it, and the hash bucket
@@ -362,7 +367,7 @@ impl Task {
             last_cpu: AtomicUsize::new(0),
             affinity: AtomicU64::new(u64::MAX),
             wait_chan: AtomicUsize::new(0),
-            wake_at: AtomicU64::new(0),
+            timer_seq: AtomicU64::new(0),
             wake_lock: IrqSpinLock::new(()),
             futex_woken: AtomicBool::new(false),
             futex_bucket: AtomicUsize::new(0),
