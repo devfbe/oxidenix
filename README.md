@@ -525,7 +525,10 @@ R1 is in place: the mechanism, with every system call passed through.
   move.
 - In phase R1 the server hands every Linux system call back with `legacy_syscall` (1011), which
   runs the kernel's implementation on the registers in the register page (signal frames and
-  `execve` included). Numbers of 1000 and above are not Linux's: the server answers them with
+  `execve` included). Until the server takes over signals (R5), `rt_sigreturn` is such a pass-through
+  call, so a signal's round trip costs more than before (three kernel entries): an interval
+  timer of a microsecond or two whose handler runs every time can now starve its program, as
+  it would on any system where the round trip outlasts the interval. Numbers of 1000 and above are not Linux's: the server answers them with
   `ENOSYS` itself. Faults and exceptions of the program are still the kernel's; an exception in
   the server kills its process with a diagnostic.
 - `fork` and `clone` give the new thread its own server thread in the same instance; `execve`

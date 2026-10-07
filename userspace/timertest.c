@@ -76,6 +76,12 @@ static void sigtimedwait_1ms(void) {
 }
 
 static volatile int alarms;
+static void on_alarm_once(int sig) {
+    (void)sig;
+    struct itimerval stop = {{0, 0}, {0, 0}};
+    setitimer(ITIMER_REAL, &stop, NULL);
+    alarms++;
+}
 static void on_alarm(int sig) {
     (void)sig;
     alarms++;
@@ -193,8 +199,11 @@ int main(void) {
     setitimer(ITIMER_REAL, &fast, NULL);
     busy = spin(50000000);
     check("an ignored 1 us interval timer leaves the program running", busy > base / 5);
+    /* The handler turns the timer off: whether the 1 us timer still
+     * leaves the program any time between signals depends on how long a
+     * signal's round trip takes, which is not what this checks. */
     alarms = 0;
-    sa.sa_handler = on_alarm;
+    sa.sa_handler = on_alarm_once;
     sigaction(SIGALRM, &sa, NULL);
     spin(5000000);
     setitimer(ITIMER_REAL, &off, NULL);
