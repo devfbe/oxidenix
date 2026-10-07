@@ -104,8 +104,8 @@ pub fn exec(frame: &mut Frame, path: &str, args: &[String], envs: &[String]) -> 
     // A new program gets no inherited hardware access.
     me.group.privileged.store(false, Ordering::Relaxed);
     let (closed, old_mm, old_files) = with_current(|p| {
-        // A Linux thread runs this in the server (legacy_syscall).
-        let server = p.linux.as_ref().is_some_and(|l| !l.restricted);
+        // A Linux thread runs this in a legacy call, in the program's view.
+        let server = p.linux.as_ref().is_some_and(|l| l.normal_view());
         tlb::switch(p.mm.as_ref().map(|m| &*m.tlb), Some(&mm.tlb), server);
         let old_mm = p.mm.replace(mm);
         let old_files = match files {

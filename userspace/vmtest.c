@@ -213,6 +213,19 @@ int main(void) {
      * server's own kernel calls. */
     check("the Linux server's memory is out of reach",
           faults((volatile char *)limit, 0) && faults((volatile char *)(limit + 0x4000000000 + 0x9000), 1));
+    /* Nor through the kernel: system calls refuse pointers there (the
+     * thread's register page of the server is at 0x404000009000). */
+    int sfd[2];
+    pipe(sfd);
+    write(sfd[1], "overwrite", 9);
+    errno = 0;
+    long rd = read(sfd[0], (void *)(limit + 0x4000000000 + 0x9000), 9);
+    int read_errno = errno;
+    errno = 0;
+    long wr = write(sfd[1], (void *)limit, 16);
+    check("system calls refuse pointers into the server's memory (EFAULT)", rd == -1 && read_errno == EFAULT && wr == -1 && errno == EFAULT);
+    close(sfd[0]);
+    close(sfd[1]);
     errno = 0;
     long r1 = syscall(1010), r2 = syscall(1011);
     check("the server's kernel calls are ENOSYS for a program", r1 == -1 && r2 == -1 && errno == ENOSYS);

@@ -263,6 +263,9 @@ pub struct LinuxThread {
     state: PhysFrame,
     /// Running the program (true) or the server.
     pub restricted: bool,
+    /// The server waits in `legacy_syscall`: the kernel runs the call in
+    /// the program's view.
+    in_legacy: bool,
     /// The server's registers while the program runs.
     normal: Frame,
 }
@@ -273,12 +276,17 @@ impl LinuxThread {
     /// server's entry, on the thread's server stack).
     pub fn new(instance: Arc<Instance>, program: &Frame) -> Result<(LinuxThread, Frame), i64> {
         let (slot, state) = instance.thread()?;
-        let thread = LinuxThread { instance, slot, state, restricted: false, normal: Frame::default() };
+        let thread = LinuxThread { instance, slot, state, restricted: false, in_legacy: false, normal: Frame::default() };
         save(program, thread.state());
         // At a function's entry the stack is 8 bytes off 16-byte alignment.
         let mut start = Frame::user_start(thread.instance.entry, thread_stack_top(slot) - 8);
         start.rdi = thread_state(slot);
         Ok((thread, start))
+    }
+
+    /// Whether the thread's CPU shows the normal view (the server runs).
+    pub fn normal_view(&self) -> bool {
+        !self.restricted && !self.in_legacy
     }
 
     #[allow(clippy::mut_from_ref)]
@@ -394,15 +402,34 @@ pub fn enter(f: &mut Frame) -> Result<(), i64> {
 /// legacy_syscall() from the server: the kernel's Linux implementation
 /// carries out the system call in `State`, which then holds the result (or
 /// the new program after execve, or a signal frame).
+///
+/// The call runs in the program's view, as it would without the server:
+/// the server's memory is then out of reach of the kernel's Linux code
+/// altogether, not only because every user pointer is checked against
+/// 64 TiB (`uaccess`).
 pub fn legacy() -> Result<(), i64> {
     let state = with_current(|p| p.linux.as_ref().map(|l| *l.state())).ok_or(EPERM)?;
     let mut program = Frame::default();
     load(&state, &mut program)?;
+    set_legacy(true);
     super::syscall::dispatch_linux(&mut program);
+    set_legacy(false);
     with_current(|p| {
         if let Some(l) = p.linux.as_ref() {
             save(&program, l.state());
         }
     });
     Ok(())
+}
+
+/// Enters or leaves a legacy call: the view follows.
+fn set_legacy(on: bool) {
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        with_current(|p| {
+            if let Some(l) = p.linux.as_mut() {
+                l.in_legacy = on;
+            }
+        });
+        switch_view(!on);
+    });
 }
