@@ -23,6 +23,7 @@
 #define TEST_PAGED 1505
 #define TEST_SUPPLIED 1506
 #define TEST_PAGED_STUCK 1507
+#define TEST_PAGED_FAIL 1508
 
 static int failures;
 
@@ -97,6 +98,20 @@ int main(void) {
     waitpid(child, &st, 0);
     alarm(0);
     check("SIGKILL ends a thread waiting for a page", WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL);
+
+    /* A page the pager fails: SIGBUS, and a later access asks again. */
+    char *fl = (char *)0x230000000000;
+    check("the server maps a paged object it fails once", syscall(TEST_PAGED_FAIL, fl) == 0);
+    child = fork();
+    if (child == 0) {
+        (void)*(volatile char *)fl;
+        _exit(0);
+    }
+    alarm(5);
+    waitpid(child, &st, 0);
+    alarm(0);
+    check("a page the pager fails raises SIGBUS", WIFSIGNALED(st) && WTERMSIG(st) == SIGBUS);
+    check("... and a later access asks again and gets it", memcmp(fl, "retry", 5) == 0);
     printf("lxtest: %s\n", failures ? "FAILED" : "all passed");
     return failures != 0;
 }

@@ -95,12 +95,16 @@ pub struct Instance {
     programs: core::sync::atomic::AtomicUsize,
 }
 
+/// Pages wanted from the pager. A request is queued once until the pager
+/// takes it; after that, a thread that still waits (the page did not come,
+/// or failed) asks again.
 struct PagerQueue {
     requests: alloc::collections::VecDeque<(u64, u64)>,
-    /// Requested and not yet supplied (each is asked for once).
-    pending: alloc::collections::BTreeSet<(u64, u64)>,
+    queued: alloc::collections::BTreeSet<(u64, u64)>,
     /// The tree has no program left: the pager's process ends.
     closing: bool,
+    /// The pager's process is gone: no page will come any more.
+    dead: bool,
 }
 
 /// A kernel object the Linux server refers to by handle.
@@ -148,8 +152,9 @@ impl Instance {
             handles: spin::Mutex::new(Handles { next: 1, objects: BTreeMap::new() }),
             pager: spin::Mutex::new(PagerQueue {
                 requests: alloc::collections::VecDeque::new(),
-                pending: alloc::collections::BTreeSet::new(),
+                queued: alloc::collections::BTreeSet::new(),
                 closing: false,
+                dead: false,
             }),
             programs: core::sync::atomic::AtomicUsize::new(0),
         };
@@ -311,6 +316,21 @@ impl Instance {
         (self as *const Instance as usize) | 1
     }
 
+    /// Where threads waiting for the pager's pages sleep.
+    fn answer_chan(&self) -> usize {
+        (self as *const Instance as usize) | 3
+    }
+
+    /// The pager's process ended: what is waited for will not come.
+    fn pager_gone(&self) {
+        let mut q = self.pager.lock();
+        q.dead = true;
+        q.requests.clear();
+        q.queued.clear();
+        drop(q);
+        super::wakeup(self.answer_chan());
+    }
+
     /// An address space of one of the tree's programs appeared.
     pub fn program_added(&self) {
         self.programs.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -336,13 +356,21 @@ impl Instance {
 }
 
 impl crate::fs::cache::Pager for Instance {
-    fn request(&self, key: u64, index: u64) {
+    fn request(&self, key: u64, index: u64) -> bool {
         let mut q = self.pager.lock();
-        if q.pending.insert((key, index)) {
+        if q.dead {
+            return false;
+        }
+        if q.queued.insert((key, index)) {
             q.requests.push_back((key, index));
             drop(q);
             super::wakeup(self.pager_chan());
         }
+        true
+    }
+
+    fn wait_chan(&self) -> usize {
+        self.answer_chan()
     }
 }
 
@@ -415,6 +443,9 @@ impl LinuxThread {
 
 impl Drop for LinuxThread {
     fn drop(&mut self) {
+        if self.pager {
+            self.instance.pager_gone();
+        }
         self.instance.release(self.slot);
     }
 }
@@ -542,16 +573,21 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
         SYS_MO_SUPPLY => {
             let (handle, offset, buf, len) = (a[0], a[1], a[2], a[3]);
             let cache = instance.memory(handle)?;
-            let key = cache.paged_key().ok_or(EINVAL)?;
-            if !page_aligned(offset) || len > PAGE {
+            if cache.paged_key().is_none() || !page_aligned(offset) || len > PAGE {
                 return Err(EINVAL);
             }
             let mut data = [0u8; PAGE as usize];
             super::uaccess::copy_from_server(buf, &mut data[..len as usize])?;
-            let index = offset / PAGE;
-            let inserted = cache.supply(index, &data[..len as usize])?;
-            instance.pager.lock().pending.remove(&(key, index));
-            Ok(inserted as i64)
+            Ok(cache.supply(offset / PAGE, &data[..len as usize])? as i64)
+        }
+        SYS_MO_FAIL => {
+            let (handle, offset) = (a[0], a[1]);
+            let cache = instance.memory(handle)?;
+            if cache.paged_key().is_none() || !page_aligned(offset) {
+                return Err(EINVAL);
+            }
+            cache.fail(offset / PAGE)?;
+            Ok(0)
         }
         SYS_MO_UNMAP => {
             let len = range(a[0], a[1])?;
@@ -683,6 +719,7 @@ fn pager_wait(instance: &Arc<Instance>, out: u64) -> SysResult {
             let wait = super::sched::prepare_to_wait(instance.pager_chan());
             let mut q = instance.pager.lock();
             if let Some(r) = q.requests.pop_front() {
+                q.queued.remove(&r);
                 return Some(Some(r));
             }
             if q.closing {
@@ -700,7 +737,10 @@ fn pager_wait(instance: &Arc<Instance>, out: u64) -> SysResult {
                 };
                 if let Err(e) = super::uaccess::copy_to_server(out, bytes) {
                     // Still wanted: next time.
-                    instance.pager.lock().requests.push_front((key, index));
+                    let mut q = instance.pager.lock();
+                    if q.queued.insert((key, index)) {
+                        q.requests.push_front((key, index));
+                    }
                     return Err(e);
                 }
                 return Ok(0);

@@ -134,6 +134,10 @@ pub const SYS_PAGER_WAIT: u64 = 1020;
 /// object, from `len` bytes at `buf` (the rest zero), unless it is there
 /// already; wakes whoever waits for it.
 pub const SYS_MO_SUPPLY: u64 = 1021;
+/// `mo_fail(handle, offset)`: the pager cannot supply the page at
+/// `offset` (an I/O error): whoever waits for it gets an error (SIGBUS for
+/// a program's access, as on Linux), and a later access asks again.
+pub const SYS_MO_FAIL: u64 = 1022;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug)]
@@ -156,3 +160,6 @@ pub const TEST_SUPPLIED: u64 = 1506;
 /// `(addr)`: a 1-page paged object the pager never supplies, mapped at
 /// `addr` (a thread touching it waits until it is killed).
 pub const TEST_PAGED_STUCK: u64 = 1507;
+/// `(addr)`: a 1-page paged object at `addr` whose first request the
+/// pager fails (mo_fail) and whose second it answers with "retry".
+pub const TEST_PAGED_FAIL: u64 = 1508;

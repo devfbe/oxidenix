@@ -50,7 +50,7 @@ pub extern "C" fn _start(state: *mut State, role: u64) -> ! {
         }
         let s = unsafe { &mut *state };
         match s.rax {
-            TEST_MAP..=TEST_PAGED_STUCK => s.rax = test(s.rax, s.rdi) as u64,
+            TEST_MAP..=TEST_PAGED_FAIL => s.rax = test(s.rax, s.rdi) as u64,
             nr if nr >= FIRST_NON_LINUX => s.rax = -ENOSYS as u64,
             _ => {
                 call0(SYS_LEGACY_SYSCALL);
@@ -64,8 +64,11 @@ static TEST_OBJECT: AtomicU64 = AtomicU64::new(0);
 /// The paged object of TEST_PAGED, and how many pages the pager supplied.
 static TEST_PAGED_OBJECT: AtomicU64 = AtomicU64::new(0);
 static SUPPLIED: AtomicU64 = AtomicU64::new(0);
-/// The key the test's paged object goes by.
+/// The key the test's paged object goes by; +1: never answered; +2:
+/// failed once, then answered.
 const TEST_KEY: u64 = 0x7e57;
+static TEST_FAIL_OBJECT: AtomicU64 = AtomicU64::new(0);
+static FAILED_ONCE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// The pager thread: supplies the pages threads wait for. (So far the only
 /// paged object is the test's; its page n reads "paged n".)
@@ -73,6 +76,16 @@ fn pager() -> ! {
     loop {
         let mut request = PagerRequest::default();
         if syscall(SYS_PAGER_WAIT, [&mut request as *mut PagerRequest as u64, 0, 0, 0, 0, 0]) < 0 {
+            continue;
+        }
+        if request.key == TEST_KEY + 2 {
+            let handle = TEST_FAIL_OBJECT.load(Ordering::Acquire);
+            if !FAILED_ONCE.swap(true, Ordering::Relaxed) {
+                syscall(SYS_MO_FAIL, [handle, request.offset, 0, 0, 0, 0]);
+            } else {
+                let text = b"retry";
+                syscall(SYS_MO_SUPPLY, [handle, request.offset, text.as_ptr() as u64, text.len() as u64, 0, 0]);
+            }
             continue;
         }
         if request.key != TEST_KEY {
@@ -144,6 +157,15 @@ fn test(nr: u64, addr: u64) -> i64 {
             if r < 0 { r } else { 0 }
         }
         TEST_SUPPLIED => SUPPLIED.load(Ordering::Relaxed) as i64,
+        TEST_PAGED_FAIL => {
+            let h = syscall(SYS_MO_CREATE_PAGED, [1, TEST_KEY + 2, 0, 0, 0, 0]);
+            if h < 0 {
+                return h;
+            }
+            TEST_FAIL_OBJECT.store(h as u64, Ordering::Release);
+            let r = syscall(SYS_MO_MAP, [h as u64, addr, PAGE, 0, PROT_READ, MO_SHARED]);
+            if r < 0 { r } else { 0 }
+        }
         TEST_PAGED_STUCK => {
             // A key the pager does not answer.
             let h = syscall(SYS_MO_CREATE_PAGED, [1, TEST_KEY + 1, 0, 0, 0, 0]);

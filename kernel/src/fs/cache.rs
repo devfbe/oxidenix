@@ -94,9 +94,12 @@ pub fn tmpfs_usage() -> (u64, u64) {
 
 /// Supplies the pages of a paged memory object.
 pub trait Pager: Send + Sync {
-    /// Page `index` of the object with `key` is wanted (asked again only
-    /// after it was supplied).
-    fn request(&self, key: u64, index: u64);
+    /// Page `index` of the object with `key` is wanted. False if the pager
+    /// is gone (the page will never come).
+    fn request(&self, key: u64, index: u64) -> bool;
+    /// Where threads waiting for its pages sleep: its answers (pages,
+    /// failures) and its end wake them.
+    fn wait_chan(&self) -> usize;
 }
 
 /// Where pages come from.
@@ -136,6 +139,9 @@ struct State {
     charged: u64,
     /// The page index reclaim continues at.
     cursor: u64,
+    /// Pages of a paged object its pager failed to supply: the waiting
+    /// threads get an error once, a later access asks again.
+    failed: alloc::collections::BTreeSet<u64>,
 }
 
 pub struct PageCache {
@@ -205,7 +211,14 @@ fn free_frames(frames: impl IntoIterator<Item = PhysFrame>) {
 impl PageCache {
     fn new(store: Store, size: u64, image_len: u64) -> Result<Arc<PageCache>, i64> {
         Arc::try_new(PageCache {
-            state: IrqSpinLock::new(State { pages: BTreeMap::new(), size, image_len, charged: 0, cursor: 0 }),
+            state: IrqSpinLock::new(State {
+                pages: BTreeMap::new(),
+                size,
+                image_len,
+                charged: 0,
+                cursor: 0,
+                failed: alloc::collections::BTreeSet::new(),
+            }),
             io: Mutex::new(()),
             store,
             mappers: IrqSpinLock::new(Vec::new()),
@@ -255,12 +268,6 @@ impl PageCache {
         }
     }
 
-    /// Where threads waiting for page `index` sleep (odd: never a pointer
-    /// another channel uses).
-    fn page_chan(&self, index: u64) -> usize {
-        (self as *const PageCache as usize).wrapping_add(index as usize * 8 + 1)
-    }
-
     /// Waits until the pager supplied page `index` (EIO if the pager is
     /// gone, EINTR if the thread is dying: a pager that never answers must
     /// not leave it unkillable).
@@ -268,15 +275,24 @@ impl PageCache {
         let Store::Paged { pager, key } = &self.store else { return Ok(()) };
         loop {
             let done = x86_64::instructions::interrupts::without_interrupts(|| {
-                let wait = crate::process::sched::prepare_to_wait(self.page_chan(index));
-                if self.state.lock().pages.contains_key(&index) {
-                    return Ok(true);
+                let Some(pager) = pager.upgrade() else { return Err(EIO) };
+                // Registered before looking, so an answer cannot slip by.
+                let wait = crate::process::sched::prepare_to_wait(pager.wait_chan());
+                {
+                    let mut st = self.state.lock();
+                    if st.pages.contains_key(&index) {
+                        return Ok(true);
+                    }
+                    if st.failed.remove(&index) {
+                        return Err(EIO);
+                    }
                 }
                 if crate::process::signal::dying() {
                     return Err(EINTR);
                 }
-                let Some(pager) = pager.upgrade() else { return Err(EIO) };
-                pager.request(*key, index);
+                if !pager.request(*key, index) {
+                    return Err(EIO);
+                }
                 drop(pager);
                 wait.sleep();
                 Ok(false)
@@ -290,7 +306,8 @@ impl PageCache {
     /// The pager's answer: page `index` with `data` (the rest zero), if it
     /// is still missing; wakes who waits for it. Whether it was inserted.
     pub fn supply(&self, index: u64, data: &[u8]) -> Result<bool, i64> {
-        if !matches!(self.store, Store::Paged { .. }) || data.len() > PAGE as usize {
+        let Store::Paged { pager, .. } = &self.store else { return Err(EINVAL) };
+        if data.len() > PAGE as usize {
             return Err(EINVAL);
         }
         if index >= page_of(self.size().saturating_add(PAGE - 1)) {
@@ -323,8 +340,29 @@ impl PageCache {
             free_frames([frame]);
             memory::uncommit(1);
         }
-        crate::process::sched::wakeup(self.page_chan(index));
+        if let Some(pager) = pager.upgrade() {
+            crate::process::sched::wakeup(pager.wait_chan());
+        }
         Ok(inserted)
+    }
+
+    /// The pager's answer that page `index` cannot be had: the threads
+    /// waiting for it get an error (a later access asks again).
+    pub fn fail(&self, index: u64) -> Result<(), i64> {
+        let Store::Paged { pager, .. } = &self.store else { return Err(EINVAL) };
+        if index >= page_of(self.size().saturating_add(PAGE - 1)) {
+            return Err(EINVAL);
+        }
+        {
+            let mut st = self.state.lock();
+            if !st.pages.contains_key(&index) {
+                st.failed.insert(index);
+            }
+        }
+        if let Some(pager) = pager.upgrade() {
+            crate::process::sched::wakeup(pager.wait_chan());
+        }
+        Ok(())
     }
 
     /// A private in-memory copy of a file's current contents (a server's
