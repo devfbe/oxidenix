@@ -27,6 +27,7 @@ use super::errno::*;
 use super::address_space::PAGE;
 use super::syscall::Frame;
 use super::with_current;
+use super::errno::SysResult;
 use crate::fs::cache::PageCache;
 use crate::memory::{self, frame::UserFrames};
 use alloc::collections::BTreeMap;
@@ -87,6 +88,19 @@ pub struct Instance {
     slots: spin::Mutex<Slots>,
     /// The kernel objects the server holds, by handle.
     handles: spin::Mutex<Handles>,
+    /// Pages of paged objects that threads wait for, for the pager thread.
+    pager: spin::Mutex<PagerQueue>,
+    /// Address spaces of the tree's programs: when the last goes, so does
+    /// the pager's process.
+    programs: core::sync::atomic::AtomicUsize,
+}
+
+struct PagerQueue {
+    requests: alloc::collections::VecDeque<(u64, u64)>,
+    /// Requested and not yet supplied (each is asked for once).
+    pending: alloc::collections::BTreeSet<(u64, u64)>,
+    /// The tree has no program left: the pager's process ends.
+    closing: bool,
 }
 
 /// A kernel object the Linux server refers to by handle.
@@ -132,6 +146,12 @@ impl Instance {
             entry: 0,
             slots: spin::Mutex::new(Slots { next: 0, free: Vec::new(), states: BTreeMap::new() }),
             handles: spin::Mutex::new(Handles { next: 1, objects: BTreeMap::new() }),
+            pager: spin::Mutex::new(PagerQueue {
+                requests: alloc::collections::VecDeque::new(),
+                pending: alloc::collections::BTreeSet::new(),
+                closing: false,
+            }),
+            programs: core::sync::atomic::AtomicUsize::new(0),
         };
         instance.entry = instance.load(image)?;
         Arc::try_new(instance).map_err(|_| ENOMEM)
@@ -286,8 +306,43 @@ impl Instance {
         }
     }
 
+    /// Where the pager thread waits (odd: never a pointer channel).
+    fn pager_chan(&self) -> usize {
+        (self as *const Instance as usize) | 1
+    }
+
+    /// An address space of one of the tree's programs appeared.
+    pub fn program_added(&self) {
+        self.programs.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// An address space of a program went; with the last one, the pager's
+    /// process ends.
+    pub fn program_gone(&self) {
+        if self.programs.fetch_sub(1, core::sync::atomic::Ordering::AcqRel) == 1 {
+            self.close();
+        }
+    }
+
+    /// Ends the pager's process (no program will ask it for pages).
+    pub fn close(&self) {
+        self.pager.lock().closing = true;
+        super::wakeup(self.pager_chan());
+    }
+
     fn release(&self, n: u64) {
         self.slots.lock().free.push(n);
+    }
+}
+
+impl crate::fs::cache::Pager for Instance {
+    fn request(&self, key: u64, index: u64) {
+        let mut q = self.pager.lock();
+        if q.pending.insert((key, index)) {
+            q.requests.push_back((key, index));
+            drop(q);
+            super::wakeup(self.pager_chan());
+        }
     }
 }
 
@@ -308,6 +363,8 @@ pub struct LinuxThread {
     state: PhysFrame,
     /// Running the program (true) or the server.
     pub restricted: bool,
+    /// The instance's pager thread, which serves no program.
+    pager: bool,
     /// The server waits in `legacy_syscall`: the kernel runs the call in
     /// the program's view.
     in_legacy: bool,
@@ -321,12 +378,28 @@ impl LinuxThread {
     /// server's entry, on the thread's server stack).
     pub fn new(instance: Arc<Instance>, program: &Frame) -> Result<(LinuxThread, Frame), i64> {
         let (slot, state) = instance.thread()?;
-        let thread = LinuxThread { instance, slot, state, restricted: false, in_legacy: false, normal: Frame::default() };
+        let thread = LinuxThread { instance, slot, state, restricted: false, pager: false, in_legacy: false, normal: Frame::default() };
         save(program, thread.state());
-        // At a function's entry the stack is 8 bytes off 16-byte alignment.
-        let mut start = Frame::user_start(thread.instance.entry, thread_stack_top(slot) - 8);
-        start.rdi = thread_state(slot);
+        let start = thread.start(ROLE_PROGRAM);
         Ok((thread, start))
+    }
+
+    /// The pager thread of `instance`, and the frame it starts with.
+    pub fn pager(instance: Arc<Instance>) -> Result<(LinuxThread, Frame), i64> {
+        let (slot, state) = instance.thread()?;
+        let thread = LinuxThread { instance, slot, state, restricted: false, pager: true, in_legacy: false, normal: Frame::default() };
+        let start = thread.start(ROLE_PAGER);
+        Ok((thread, start))
+    }
+
+    /// The server's entry for this thread: on its stack, with its `State`
+    /// and its role.
+    fn start(&self, role: u64) -> Frame {
+        // At a function's entry the stack is 8 bytes off 16-byte alignment.
+        let mut start = Frame::user_start(self.instance.entry, thread_stack_top(self.slot) - 8);
+        start.rdi = thread_state(self.slot);
+        start.rsi = role;
+        start
     }
 
     /// Whether the thread's CPU shows the normal view (the server runs).
@@ -456,6 +529,30 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             mm.lock().map(addr, len, prot, backing, false).map_err(|_| ENOMEM)?;
             Ok(addr as i64)
         }
+        SYS_MO_CREATE_PAGED => {
+            let pages = a[0];
+            if pages == 0 || pages > USER_END / PAGE {
+                return Err(EINVAL);
+            }
+            let pager: alloc::sync::Weak<dyn crate::fs::cache::Pager> = Arc::downgrade(&instance) as _;
+            let object = PageCache::paged(pages, pager, a[1])?;
+            Ok(instance.insert(Object::Memory(object))? as i64)
+        }
+        SYS_PAGER_WAIT => pager_wait(&instance, a[0]),
+        SYS_MO_SUPPLY => {
+            let (handle, offset, buf, len) = (a[0], a[1], a[2], a[3]);
+            let cache = instance.memory(handle)?;
+            let key = cache.paged_key().ok_or(EINVAL)?;
+            if !page_aligned(offset) || len > PAGE {
+                return Err(EINVAL);
+            }
+            let mut data = [0u8; PAGE as usize];
+            super::uaccess::copy_from_server(buf, &mut data[..len as usize])?;
+            let index = offset / PAGE;
+            let inserted = cache.supply(index, &data[..len as usize])?;
+            instance.pager.lock().pending.remove(&(key, index));
+            Ok(inserted as i64)
+        }
         SYS_MO_UNMAP => {
             let len = range(a[0], a[1])?;
             mm()?.lock().unmap(a[0], len);
@@ -524,6 +621,9 @@ pub fn enter(f: &mut Frame) -> Result<(), i64> {
     x86_64::instructions::interrupts::without_interrupts(|| {
         with_current(|p| {
             let l = p.linux.as_mut().expect("a Linux thread");
+            if l.pager {
+                return Err(EPERM);
+            }
             let mut program = Frame::default();
             load(l.state(), &mut program)?;
             l.normal = *f;
@@ -545,7 +645,7 @@ pub fn enter(f: &mut Frame) -> Result<(), i64> {
 /// altogether, not only because every user pointer is checked against
 /// 64 TiB (`uaccess`).
 pub fn legacy() -> Result<(), i64> {
-    let state = with_current(|p| p.linux.as_ref().map(|l| *l.state())).ok_or(EPERM)?;
+    let state = with_current(|p| p.linux.as_ref().filter(|l| !l.pager).map(|l| *l.state())).ok_or(EPERM)?;
     let mut program = Frame::default();
     load(&state, &mut program)?;
     set_legacy(true);
@@ -569,4 +669,44 @@ fn set_legacy(on: bool) {
         });
         switch_view(!on);
     });
+}
+
+/// pager_wait(request): the next page a thread waits for, written to the
+/// server's memory at `out`. The pager's process ends here when the tree
+/// has no program left.
+fn pager_wait(instance: &Arc<Instance>, out: u64) -> SysResult {
+    if !with_current(|p| p.linux.as_ref().is_some_and(|l| l.pager)) {
+        return Err(EPERM);
+    }
+    loop {
+        let next = x86_64::instructions::interrupts::without_interrupts(|| {
+            let wait = super::sched::prepare_to_wait(instance.pager_chan());
+            let mut q = instance.pager.lock();
+            if let Some(r) = q.requests.pop_front() {
+                return Some(Some(r));
+            }
+            if q.closing {
+                return Some(None);
+            }
+            drop(q);
+            wait.sleep();
+            None
+        });
+        match next {
+            Some(Some((key, index))) => {
+                let request = PagerRequest { key, offset: index * PAGE };
+                let bytes = unsafe {
+                    core::slice::from_raw_parts(&request as *const PagerRequest as *const u8, core::mem::size_of::<PagerRequest>())
+                };
+                if let Err(e) = super::uaccess::copy_to_server(out, bytes) {
+                    // Still wanted: next time.
+                    instance.pager.lock().requests.push_front((key, index));
+                    return Err(e);
+                }
+                return Ok(0);
+            }
+            Some(None) => super::exit_group(0),
+            None => {}
+        }
+    }
 }

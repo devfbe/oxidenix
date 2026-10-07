@@ -82,10 +82,13 @@ this (target: p50 ≤ 2500 cycles).
 ### Faults, exceptions and asynchronous events
 
 - **Page faults** in the restricted region that the kernel can resolve from the mapping (a
-  present page of a memory object, copy-on-write, demand-zero) never reach the server. The
-  rest return from `restricted_enter` as `Fault`: the server turns them into `SIGSEGV` or
-  `SIGBUS`, or supplies the missing page of a file (it is the pager of its page cache, below)
-  and enters again.
+  present page of a memory object, copy-on-write, demand-zero) never reach the server. A
+  missing page of a **paged object** is requested from the instance's **pager thread** (a
+  thread of the server in a process of its own, `pager_wait`/`mo_supply`), and the faulting
+  thread sleeps until it is supplied. The request cannot go back to the faulting thread's own
+  server: the fault may come from the kernel copying from a mapping during a system call,
+  where that server is the caller (the Zircon pager model). Faults without a mapping return
+  from `restricted_enter` as `Fault`, and the server turns them into `SIGSEGV` or `SIGBUS`.
 - **CPU exceptions** (`#DE`, `#UD`, `#BP`, ...) return as `Exception`; the server delivers the
   Linux signal. Signal frames are written by the server into the program's memory.
 - **Kick**: another thread (or a timer) that needs this thread's attention — a signal, a stop,
@@ -112,7 +115,7 @@ processes, threads, memory objects and the services it uses.
 |---|---|
 | processes | `process_create() -> (process, space)`; `process_kill`; exit notification on a port |
 | threads | `thread_create(process, state)`, `thread_kick`, `restricted_enter(state)` |
-| memory objects | `mo_create(size)`, `mo_clone_cow(mo)` (for `fork`), `mo_supply(mo, offset, pages)` and fault return for pagers, `mo_physical` for DMA/MMIO (drivers) |
+| memory objects | `mo_create(size)`, `mo_create_paged(size, key)` with `pager_wait` and `mo_supply` for the pager thread, `mo_read`/`mo_write`, `mo_clone_cow(mo)` (for `fork`, R5), `mo_physical` for DMA/MMIO (drivers) |
 | mappings | `map(space, addr, mo, offset, len, prot, flags)`, `unmap`, `protect` in a process's restricted region (the server keeps the Linux VMAs; the kernel keeps page tables) |
 | waiting | `futex_wait(addr, value, deadline)`, `futex_wake`, `clock_get` |
 | IPC | today's services, and shared-memory rings for the I/O paths (separate design) |
@@ -130,8 +133,8 @@ input, PCI and ACPI.
 ### The page cache and the I/O paths
 
 The page cache moves with the VFS into the server. Each cached file is a memory object whose
-pager is the server: a page fault on a mapping of the file comes to the server, which reads the
-page from diskfs into the object (`mo_supply`). `read`/`write` copy between the object and the
+pager is the server: a page fault on a mapping of the file comes to the pager thread, which
+reads the page from diskfs into the object (`mo_supply`). `read`/`write` copy between the object and the
 program directly (one copy, as Linux). The server talks to diskfs and netd through
 shared-memory rings with buffers granted from its memory objects (zero copy, IOMMU-confined
 DMA); that design follows the principles of the I/O audit and is its own document.
@@ -146,8 +149,9 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
    (`legacy_syscall(state)`, which runs the old handler against the restricted context) and
    every fault and exception likewise. Every program from `/init` on runs in restricted mode.
    Measures the cost of the switch (`forwarded_null_syscall`).
-2. **R2 — Memory objects and mappings** as kernel objects (anonymous, copy-on-write clone,
-   pager-backed), behind today's `mmap` handlers, which become their first user.
+2. **R2 — Memory objects and mappings** as kernel objects by handle: anonymous and paged
+   objects with the instance's pager thread, mapping into a program's view (done; the
+   copy-on-write clone follows with `fork` in R5).
 3. **R3 — Files.** The VFS, tmpfs, pipes, the page cache (as pager-backed objects), the remote
    filesystem client, `epoll`/`poll`, descriptors: into the server. The largest phase; it
    brings the rings to diskfs.

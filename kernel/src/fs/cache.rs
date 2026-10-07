@@ -29,6 +29,12 @@
 //! back, and so does the flusher every few seconds and a writer that finds
 //! too many dirty pages.
 //!
+//! The paged store belongs to a pager in user space (the Linux server): a
+//! missing page is requested from it and the thread that needs the page
+//! sleeps until the pager supplies it (`supply`), whether the thread runs a
+//! program or the kernel (copying from a mapping). Supplied pages are
+//! committed and stay until the object goes.
+//!
 //! Lock order: address space (sleeping) → `io` (sleeping) → `state` →
 //! frames. `io` serializes what changes contents or size and talks to the
 //! server (filling pages, `write`, `truncate`); it is never held while an
@@ -86,6 +92,13 @@ pub fn tmpfs_usage() -> (u64, u64) {
     (TMPFS_PAGES.load(Ordering::Relaxed), TMPFS_LIMIT.load(Ordering::Relaxed))
 }
 
+/// Supplies the pages of a paged memory object.
+pub trait Pager: Send + Sync {
+    /// Page `index` of the object with `key` is wanted (asked again only
+    /// after it was supplied).
+    fn request(&self, key: u64, index: u64);
+}
+
 /// Where pages come from.
 enum Store {
     /// The cache is the only copy. `image` is the file's initramfs data;
@@ -94,6 +107,8 @@ enum Store {
     Memory { image: &'static [u8], prepaid: u64 },
     /// Inode `ino` of a filesystem server.
     Remote { fs: Arc<RemoteFs>, ino: u32 },
+    /// A pager in user space, which knows the object by `key`.
+    Paged { pager: Weak<dyn Pager>, key: u64 },
 }
 
 struct Page {
@@ -225,6 +240,89 @@ impl PageCache {
         Ok(cache)
     }
 
+    /// A memory object of `pages` pages whose contents `pager` supplies
+    /// on demand; it knows the object as `key`.
+    pub fn paged(pages: u64, pager: Weak<dyn Pager>, key: u64) -> Result<Arc<PageCache>, i64> {
+        let size = pages.checked_mul(PAGE).filter(|&s| s <= MAX_SIZE).ok_or(EINVAL)?;
+        Self::new(Store::Paged { pager, key }, size, 0)
+    }
+
+    /// The key of a paged object.
+    pub fn paged_key(&self) -> Option<u64> {
+        match self.store {
+            Store::Paged { key, .. } => Some(key),
+            _ => None,
+        }
+    }
+
+    /// Where threads waiting for page `index` sleep (odd: never a pointer
+    /// another channel uses).
+    fn page_chan(&self, index: u64) -> usize {
+        (self as *const PageCache as usize).wrapping_add(index as usize * 8 + 1)
+    }
+
+    /// Waits until the pager supplied page `index` (EIO if the pager is
+    /// gone).
+    fn wait_paged(&self, index: u64) -> Result<(), i64> {
+        let Store::Paged { pager, key } = &self.store else { return Ok(()) };
+        loop {
+            let done = x86_64::instructions::interrupts::without_interrupts(|| {
+                let wait = crate::process::sched::prepare_to_wait(self.page_chan(index));
+                if self.state.lock().pages.contains_key(&index) {
+                    return Ok(true);
+                }
+                let Some(pager) = pager.upgrade() else { return Err(EIO) };
+                pager.request(*key, index);
+                drop(pager);
+                wait.sleep();
+                Ok(false)
+            })?;
+            if done {
+                return Ok(());
+            }
+        }
+    }
+
+    /// The pager's answer: page `index` with `data` (the rest zero), if it
+    /// is still missing; wakes who waits for it. Whether it was inserted.
+    pub fn supply(&self, index: u64, data: &[u8]) -> Result<bool, i64> {
+        if !matches!(self.store, Store::Paged { .. }) || data.len() > PAGE as usize {
+            return Err(EINVAL);
+        }
+        if index >= page_of(self.size().saturating_add(PAGE - 1)) {
+            return Err(EINVAL);
+        }
+        if self.state.lock().pages.contains_key(&index) {
+            return Ok(false);
+        }
+        if !memory::commit(1) {
+            return Err(ENOMEM);
+        }
+        let Some(frame) = new_frame() else {
+            memory::uncommit(1);
+            return Err(ENOMEM);
+        };
+        let page = frame_bytes(frame);
+        page[..data.len()].copy_from_slice(data);
+        page[data.len()..].fill(0);
+        let inserted = {
+            let mut st = self.state.lock();
+            if st.pages.contains_key(&index) {
+                false
+            } else {
+                st.pages.insert(index, Page::new(frame));
+                st.charged += 1;
+                true
+            }
+        };
+        if !inserted {
+            free_frames([frame]);
+            memory::uncommit(1);
+        }
+        crate::process::sched::wakeup(self.page_chan(index));
+        Ok(inserted)
+    }
+
     /// A private in-memory copy of a file's current contents (a server's
     /// program, kept unchanged whatever happens to the file later).
     pub fn copy_of(file: &super::Inode) -> Result<Arc<PageCache>, i64> {
@@ -258,14 +356,14 @@ impl PageCache {
     fn remote_store(&self) -> Option<(&Arc<RemoteFs>, u32)> {
         match &self.store {
             Store::Remote { fs, ino } => Some((fs, *ino)),
-            Store::Memory { .. } => None,
+            Store::Memory { .. } | Store::Paged { .. } => None,
         }
     }
 
     fn prepaid(&self) -> u64 {
         match self.store {
             Store::Memory { prepaid, .. } => prepaid,
-            Store::Remote { .. } => 0,
+            Store::Remote { .. } | Store::Paged { .. } => 0,
         }
     }
 
@@ -273,7 +371,7 @@ impl PageCache {
     fn fill_memory(&self, st: &State, index: u64, out: &mut [u8]) {
         let image = match self.store {
             Store::Memory { image, .. } => image,
-            Store::Remote { .. } => &[],
+            Store::Remote { .. } | Store::Paged { .. } => &[],
         };
         let start = index * PAGE;
         let valid = (st.image_len.min(st.size) as usize).min(image.len());
@@ -382,7 +480,7 @@ impl PageCache {
                             page.referenced = true;
                             out.copy_from_slice(&frame_bytes(page.frame)[in_page..in_page + n]);
                         }
-                        None if self.remote_store().is_none() => {
+                        None if matches!(self.store, Store::Memory { .. }) => {
                             let mut page = [0u8; PAGE as usize];
                             self.fill_memory(&st, index, &mut page);
                             out.copy_from_slice(&page[in_page..in_page + n]);
@@ -399,6 +497,13 @@ impl PageCache {
             let Some((index, end)) = missing else {
                 return Ok(pos.saturating_sub(off) as usize);
             };
+            if let Store::Paged { .. } = self.store {
+                match self.wait_paged(index) {
+                    Ok(()) => continue,
+                    Err(e) if pos == off => return Err(e),
+                    Err(_) => return Ok((pos - off) as usize),
+                }
+            }
             match self.fetch(index) {
                 Ok(()) => {}
                 // No room to cache it: read this page past the cache.
@@ -420,6 +525,10 @@ impl PageCache {
     /// Writes `data` at `off`, growing the file.
     pub fn write(&self, off: u64, data: &[u8]) -> Result<usize, i64> {
         off.checked_add(data.len() as u64).filter(|&e| e <= MAX_SIZE).ok_or(EFBIG)?;
+        // A paged object's pages come from its pager alone (`supply`).
+        if let Store::Paged { .. } = self.store {
+            return Err(EINVAL);
+        }
         let _io = self.io.lock();
         let written = match self.remote_store() {
             // Write-through: the server has the data before the cache.
@@ -542,6 +651,7 @@ impl PageCache {
             Store::Memory { .. } => uncharge_tmpfs(pages),
             Store::Remote { .. } if pages > 0 => memory::cache_uncharge(pages),
             Store::Remote { .. } => {}
+            Store::Paged { .. } => memory::uncommit(pages),
         }
     }
 
@@ -553,9 +663,10 @@ impl PageCache {
             if index >= page_of(self.size().saturating_add(PAGE - 1)) {
                 return Err(Fault::Bus);
             }
-            let made = match self.remote_store() {
-                None => self.create(index),
-                Some(_) => self.fetch(index),
+            let made = match self.store {
+                Store::Memory { .. } => self.create(index),
+                Store::Remote { .. } => self.fetch(index),
+                Store::Paged { .. } => self.wait_paged(index),
             };
             match made {
                 Ok(()) => {}

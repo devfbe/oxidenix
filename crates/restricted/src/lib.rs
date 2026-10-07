@@ -117,3 +117,39 @@ pub const TEST_PROTECT: u64 = 1502;
 pub const TEST_UNMAP: u64 = 1503;
 /// `(addr)`: maps a fresh object at `addr` and returns the kernel's answer.
 pub const TEST_MAP_AT: u64 = 1504;
+
+// Paged memory objects: the server supplies their pages on demand, from a
+// thread of its own (the pager thread), while the thread that needs a page
+// sleeps in the kernel (it may be the kernel itself, copying from a
+// mapping, so the request cannot go to that thread's server).
+
+/// `mo_create_paged(pages, key) -> handle`: a memory object whose pages
+/// the server supplies; requests name it by `key`.
+pub const SYS_MO_CREATE_PAGED: u64 = 1019;
+/// `pager_wait(request) -> 0`: the pager thread waits for the next page
+/// someone needs and gets it as a `PagerRequest`. When the instance's last
+/// program is gone, the pager's process ends here.
+pub const SYS_PAGER_WAIT: u64 = 1020;
+/// `mo_supply(handle, offset, buf, len)`: the page at `offset` of a paged
+/// object, from `len` bytes at `buf` (the rest zero), unless it is there
+/// already; wakes whoever waits for it.
+pub const SYS_MO_SUPPLY: u64 = 1021;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct PagerRequest {
+    pub key: u64,
+    /// Byte offset of the page in the object.
+    pub offset: u64,
+}
+
+/// A server thread starts with its role in `rsi` (and its `State` in
+/// `rdi`): it serves a program's thread, or it is the instance's pager.
+pub const ROLE_PROGRAM: u64 = 0;
+pub const ROLE_PAGER: u64 = 1;
+
+/// `(addr)`: a 4-page paged object mapped shared and readable at `addr`;
+/// page n reads "paged n" (supplied by the pager thread when touched).
+pub const TEST_PAGED: u64 = 1505;
+/// `()`: how many pages the pager supplied so far.
+pub const TEST_SUPPLIED: u64 = 1506;

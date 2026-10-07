@@ -19,6 +19,8 @@
 #define TEST_PROTECT 1502
 #define TEST_UNMAP 1503
 #define TEST_MAP_AT 1504
+#define TEST_PAGED 1505
+#define TEST_SUPPLIED 1506
 
 static int failures;
 
@@ -64,6 +66,18 @@ int main(void) {
     r = syscall(TEST_MAP_AT, at + 1);
     check("an unaligned mapping is refused (EINVAL)", r == -1 && errno == EINVAL);
 
+    /* A paged object: the server's pager thread supplies each page when
+     * it is first needed, by the program or by the kernel. */
+    char *pg = (char *)0x210000000000;
+    long before = syscall(TEST_SUPPLIED);
+    check("the server maps a paged object", syscall(TEST_PAGED, pg) == 0 && syscall(TEST_SUPPLIED) == before);
+    int p[2];
+    char buf[8] = {0};
+    pipe(p);
+    check("the kernel copies from a page the pager supplies (write)", write(p[1], pg + 2 * PG, 7) == 7 && read(p[0], buf, 7) == 7 && memcmp(buf, "paged 2", 7) == 0);
+    check("the program reads pages the pager supplies",
+          memcmp(pg, "paged 0", 7) == 0 && memcmp(pg + 3 * PG, "paged 3", 7) == 0 && memcmp(pg + PG, "paged 1", 7) == 0);
+    check("... each page once", pg[2 * PG] == 'p' && syscall(TEST_SUPPLIED) - before == 4);
     printf("lxtest: %s\n", failures ? "FAILED" : "all passed");
     return failures != 0;
 }

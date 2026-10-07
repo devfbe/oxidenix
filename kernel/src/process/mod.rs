@@ -536,6 +536,30 @@ pub fn spawn_server(server: &Arc<Server>) -> Result<Pid, i64> {
     spawn_with(server.path, image, Some(server), &args)
 }
 
+/// The pager process of a Linux server instance: the server's view alone
+/// (no program), one thread that supplies the pages of the instance's
+/// paged objects. It belongs to the kernel, like the servers, and ends
+/// when the instance's last program is gone.
+fn spawn_pager(instance: &Arc<linux::Instance>) -> Result<Pid, i64> {
+    let slot = sched::reserve_pid()?;
+    let pid = slot.pid;
+    let mut space = address_space::AddressSpace::new().ok_or(ENOMEM)?;
+    space.attach(instance.clone(), false).map_err(|_| ENOMEM)?;
+    let (thread, start) = linux::LinuxThread::pager(instance.clone())?;
+    let mut own = Process::empty();
+    own.mm = Some(address_space::Mm::new(space).ok_or(ENOMEM)?);
+    own.linux = Some(thread);
+    let mut info = Info::new(0, pid, pid, "linux-pager".to_string());
+    info.exe = String::from("/sbin/linux");
+    let group = ThreadGroup::new(pid, info, Default::default()).ok_or(ENOMEM)?;
+    // Protected from signals of programs, as the servers are.
+    group.privileged.store(true, Ordering::Relaxed);
+    let t = new_task(pid, group, "linux-pager".to_string(), own, start)?;
+    slot.insert(t.clone())?;
+    sched::start(t);
+    Ok(pid)
+}
+
 fn spawn_with(path: &str, image: loader::Image, server: Option<&Arc<Server>>, args: &[String]) -> Result<Pid, i64> {
     let console = OpenFile::console();
     let slot = sched::reserve_pid()?;
@@ -555,7 +579,11 @@ fn spawn_with(path: &str, image: loader::Image, server: Option<&Arc<Server>>, ar
         // A new process tree: a new instance of the Linux server, whose
         // first thread starts in the server (ADR 0002).
         let instance = linux::Instance::new()?;
-        space.attach(instance.clone()).map_err(|_| ENOMEM)?;
+        spawn_pager(&instance)?;
+        if let Err(e) = space.attach(instance.clone(), true) {
+            instance.close();
+            return Err(if e == address_space::Fault::Oom { ENOMEM } else { EINVAL });
+        }
         let (thread, start) = linux::LinuxThread::new(instance, &frame)?;
         own.linux = Some(thread);
         frame = start;

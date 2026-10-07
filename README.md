@@ -537,6 +537,13 @@ R1 is in place: the mechanism, with every system call passed through.
   or private into the calling thread's program view, protected and unmapped. Addresses the server
   passes for its own memory must lie in its shared region; mappings must lie below 64 TiB.
   A legacy call runs in the program's view, where the server's memory does not exist.
+- **Paged memory objects**: the server supplies their pages. Each instance has a **pager
+  process** (`linux-pager`: the server's view alone, protected like the servers) whose thread
+  waits for page requests (`pager_wait`) and answers them (`mo_supply`). A thread that needs a
+  missing page, by its own access or by the kernel copying from a mapping, sleeps until the
+  page is there: the request cannot go to that thread's own server, which may be the kernel's
+  caller. Supplied pages are committed and stay until the object goes. The pager's process
+  ends when the tree's last program is gone.
 - Programs can ask their server for test calls (1500 and up, `lxtest`) that exercise this
   interface on the calling process.
 
@@ -785,7 +792,7 @@ Linux x86_64 numbers, grouped by area (about 120 in total):
 | Signals | `rt_sigaction` `rt_sigprocmask` `rt_sigreturn` `rt_sigsuspend` `rt_sigpending` `kill` `tkill` `tgkill` `pause` `sigaltstack` `alarm` `setitimer` `getitimer` (`ITIMER_REAL`) `rt_sigtimedwait` |
 | Process control | `prctl` (name, parent-death signal, dumpable, no-new-privs, capability bounding set) `capget` `capset` (everything runs as root with every capability) |
 | Filesystems | `statfs` `fstatfs` `sync` `fsync` `fdatasync` |
-| Linux server (normal mode only) | `restricted_enter` (1010), `legacy_syscall` (1011), `handle_close` (1012), memory objects: `mo_create` (1013), `mo_map` (1014), `mo_unmap` (1015), `mo_protect` (1016), `mo_read` (1017), `mo_write` (1018) |
+| Linux server (normal mode only) | `restricted_enter` (1010), `legacy_syscall` (1011), `handle_close` (1012), memory objects: `mo_create` (1013), `mo_map` (1014), `mo_unmap` (1015), `mo_protect` (1016), `mo_read` (1017), `mo_write` (1018), paged objects: `mo_create_paged` (1019), `pager_wait` (1020), `mo_supply` (1021) |
 | Servers | `ioperm` (privileged servers only), `ipc_register` (1000), `ipc_receive` (1001, with timeout and interrupt notifications), `ipc_reply` (1002), `irq_enable` (1003), `dma_map` (1004), `proc_query` (1005), `ipc_notify` (1006) |
 | System information | `sysinfo` `uname` (reports `oxidenix`, not Linux) |
 | Power | `reboot` (power off ends QEMU, restart resets the machine) |
@@ -820,7 +827,7 @@ Each of these programs and scripts lives in the root filesystem and runs inside 
 | `eventfdtest` | `eventfd` counting (initial value, adding writes, reset on read), `EFD_SEMAPHORE`, `EFD_NONBLOCK` and `EFD_CLOEXEC`, `EINVAL` for short reads, 2^64-1 and unknown flags, a full counter (`EAGAIN`, poll state), a blocking read woken by another process, `poll` waking within 1 ms of a write |
 | `sigmasktest` | temporary signal masks of `sigsuspend`, `ppoll` and `pselect`: a pending or arriving signal the mask lets through interrupts them and its handler runs with that mask, the caller's mask comes back afterwards, a successful `ppoll` leaves a blocked signal pending (`sigpending`), a mask that blocks a signal holds it off until the call returns, `EINVAL` for a wrong mask size |
 | `epolltest` | `epoll_create1`/`epoll_create` flags and sizes, `EPOLL_CTL_ADD`/`MOD`/`DEL` and their errors (`EEXIST`, `ENOENT`, `EPERM` for regular files, `EINVAL`, `EBADF`), level-triggered, edge-triggered and one-shot reporting, `EPOLLOUT` and `EPOLLERR` on a pipe's write end, interests removed with the file's last descriptor (not before), `maxevents` rotating through ready files, eventfds and UDP sockets in a set, nested instances (`ELOOP` for a loop and for chains longer than five, built at either end) and `poll` on an instance, wake-up within 1 ms of a write, timeouts, `EINTR` and `epoll_pwait`'s mask, `epoll_pwait2` |
-| `lxtest` | the Linux server's kernel interface through its test calls: a memory object it filled, mapped into the program, a program store read back by the server, write protection, unmapping, mappings refused at the server's region and unaligned |
+| `lxtest` | the Linux server's kernel interface through its test calls: a memory object it filled, mapped into the program, a program store read back by the server, write protection, unmapping, mappings refused at the server's region and unaligned; a paged object whose pages the pager thread supplies when the program reads them or the kernel copies from them (`write` from the mapping), each page once |
 | `vmtest` | demand paging (a 64 MiB mapping costs nothing until touched), `SIGSEGV` on read-only and `PROT_NONE` pages with contents kept, split areas after a partial `munmap`, NX and the JIT pattern (1 GiB `PROT_NONE` reservation, write code, `mprotect` to executable, call it), commit limit and `MAP_NORESERVE`, `mremap` in place and moving, `MADV_DONTNEED`, shared vs. private memory across `fork`, lazy file mappings and `SIGBUS` beyond the end, `MAP_FIXED_NOREPLACE`, stack growth to 4 MiB and overflow beyond 8 MiB, nothing mapped at or above 64 TiB (fixed mappings fail, hints and the stack stay below), the Linux server's memory out of the program's reach and its kernel calls `ENOSYS` for a program |
 | `smptest` | CPU count and affinity (pinning to every CPU, empty masks), parallel speed-up of CPU-bound processes, `fork`/`exit`/`wait` on every CPU at once, 5000 pipe round trips between two CPUs, signals to a process running on another CPU, timers on time while a program floods the console with palette changes on the same CPU |
 | `nettest` | TCP to an echo service through QEMU, `ECONNREFUSED`, `listen`/`accept` over loopback with a forked client, EOF after the peer closed, non-blocking `accept` and `connect` with `poll` and `SO_ERROR`, `EINTR` in a blocking `recv`, UDP over loopback, raw ICMP echo to the gateway and over loopback, source address for off-subnet destinations, overflowing message vectors, `AF_INET6` rejected |

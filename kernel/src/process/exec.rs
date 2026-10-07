@@ -76,7 +76,7 @@ pub fn exec(frame: &mut Frame, path: &str, args: &[String], envs: &[String]) -> 
     let mut space = image.space;
     // The new program stays in the process's Linux server instance.
     if let Some(instance) = with_current(|p| p.mm.as_ref().and_then(|m| m.lock().instance().cloned())) {
-        space.attach(instance).map_err(|_| ENOMEM)?;
+        space.attach(instance, true).map_err(|_| ENOMEM)?;
     }
     let mm = Mm::new(space).ok_or(ENOMEM)?;
     // The point of no return: from here on the old program is gone.

@@ -239,6 +239,8 @@ pub struct AddressSpace {
     /// server instance's shared region (slot 128).
     normal: Option<PhysFrame>,
     instance: Option<Arc<super::linux::Instance>>,
+    /// A Linux program's space (counted by its instance).
+    program: bool,
     pub tlb: Arc<Tlb>,
     pub stats: Arc<MemStats>,
     /// Areas by start address; they never overlap.
@@ -345,6 +347,7 @@ impl AddressSpace {
             l4,
             normal: None,
             instance: None,
+            program: false,
             tlb,
             stats,
             vmas: BTreeMap::new(),
@@ -356,8 +359,9 @@ impl AddressSpace {
     }
 
     /// Makes this the address space of a Linux process served by
-    /// `instance`: adds the normal view. Before anyone runs in it.
-    pub fn attach(&mut self, instance: Arc<super::linux::Instance>) -> Result<(), Fault> {
+    /// `instance`: adds the normal view. Before anyone runs in it. A
+    /// `program`'s space counts for the instance (its pager's has none).
+    pub fn attach(&mut self, instance: Arc<super::linux::Instance>, program: bool) -> Result<(), Fault> {
         let normal = memory::with_frames(|f| UserFrames(f).allocate_frame()).ok_or(Fault::Oom)?;
         let (table, mine) = (table_at(normal), table_at(self.l4));
         for i in 0..512 {
@@ -366,6 +370,10 @@ impl AddressSpace {
         table[super::linux::SHARED_SLOT].set_frame(instance.pdpt(), super::linux::table_flags());
         self.normal = Some(normal);
         self.tlb.set_normal(normal);
+        if program {
+            instance.program_added();
+        }
+        self.program = program;
         self.instance = Some(instance);
         Ok(())
     }
@@ -1072,7 +1080,7 @@ impl AddressSpace {
         new.brk_end = self.brk_end;
         new.exe = self.exe.clone();
         if let Some(instance) = &self.instance {
-            new.attach(instance.clone())?;
+            new.attach(instance.clone(), self.program)?;
         }
         // (The child registers with the file caches when it gets its Mm.)
         result.map(|_| new)
@@ -1096,6 +1104,11 @@ impl Drop for AddressSpace {
             }
         });
         drop(vmas);
+        if self.program {
+            if let Some(instance) = &self.instance {
+                instance.program_gone();
+            }
+        }
     }
 }
 

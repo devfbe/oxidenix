@@ -37,16 +37,20 @@ fn call0(nr: u64) -> i64 {
 }
 
 /// Each thread of a Linux program starts here, on its own server stack,
-/// with its `State` (the program's registers) at `state`.
+/// with its `State` (the program's registers) at `state`; so does the
+/// instance's pager thread (`role`).
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(state: *mut State) -> ! {
+pub extern "C" fn _start(state: *mut State, role: u64) -> ! {
+    if role == ROLE_PAGER {
+        pager();
+    }
     loop {
         if call0(SYS_RESTRICTED_ENTER) as u64 != REASON_SYSCALL {
             continue;
         }
         let s = unsafe { &mut *state };
         match s.rax {
-            TEST_MAP..=TEST_MAP_AT => s.rax = test(s.rax, s.rdi) as u64,
+            TEST_MAP..=TEST_SUPPLIED => s.rax = test(s.rax, s.rdi) as u64,
             nr if nr >= FIRST_NON_LINUX => s.rax = -ENOSYS as u64,
             _ => {
                 call0(SYS_LEGACY_SYSCALL);
@@ -57,6 +61,33 @@ pub extern "C" fn _start(state: *mut State) -> ! {
 
 /// The object of the last TEST_MAP (one per instance, as test calls go).
 static TEST_OBJECT: AtomicU64 = AtomicU64::new(0);
+/// The paged object of TEST_PAGED, and how many pages the pager supplied.
+static TEST_PAGED_OBJECT: AtomicU64 = AtomicU64::new(0);
+static SUPPLIED: AtomicU64 = AtomicU64::new(0);
+/// The key the test's paged object goes by.
+const TEST_KEY: u64 = 0x7e57;
+
+/// The pager thread: supplies the pages threads wait for. (So far the only
+/// paged object is the test's; its page n reads "paged n".)
+fn pager() -> ! {
+    loop {
+        let mut request = PagerRequest::default();
+        if syscall(SYS_PAGER_WAIT, [&mut request as *mut PagerRequest as u64, 0, 0, 0, 0, 0]) < 0 {
+            continue;
+        }
+        if request.key != TEST_KEY {
+            continue;
+        }
+        let mut page = [0u8; PAGE as usize];
+        let text = *b"paged 0";
+        page[..text.len()].copy_from_slice(&text);
+        page[text.len() - 1] = b'0' + (request.offset / PAGE) as u8 % 10;
+        let handle = TEST_PAGED_OBJECT.load(Ordering::Acquire);
+        if syscall(SYS_MO_SUPPLY, [handle, request.offset, page.as_ptr() as u64, PAGE, 0, 0]) == 1 {
+            SUPPLIED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
 
 /// The test calls (see `restricted::TEST_*`).
 fn test(nr: u64, addr: u64) -> i64 {
@@ -103,6 +134,16 @@ fn test(nr: u64, addr: u64) -> i64 {
             }
             r
         }
+        TEST_PAGED => {
+            let h = syscall(SYS_MO_CREATE_PAGED, [4, TEST_KEY, 0, 0, 0, 0]);
+            if h < 0 {
+                return h;
+            }
+            TEST_PAGED_OBJECT.store(h as u64, Ordering::Release);
+            let r = syscall(SYS_MO_MAP, [h as u64, addr, 4 * PAGE, 0, PROT_READ, MO_SHARED]);
+            if r < 0 { r } else { 0 }
+        }
+        TEST_SUPPLIED => SUPPLIED.load(Ordering::Relaxed) as i64,
         _ => -ENOSYS,
     }
 }
