@@ -177,6 +177,7 @@ dependencies = [
  "ext2fs",
  "fsproto",
  "oxrt",
+ "virtio",
 ]
 
 [[package]]
@@ -426,6 +427,7 @@ dependencies = [
  "netproto",
  "oxrt",
  "smoltcp",
+ "virtio",
 ]
 
 [[package]]
@@ -773,6 +775,13 @@ dependencies = [
  "getrandom",
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "virtio"
+version = "0.1.0"
+dependencies = [
+ "oxrt",
 ]
 
 [[package]]

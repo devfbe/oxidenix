@@ -3,7 +3,7 @@
 //! back as received frames, and ARP requests for those addresses are
 //! answered here.
 
-use crate::virtio::{self, VirtioNet};
+use crate::virtio_net::{self, VirtioNet};
 use alloc::collections::VecDeque;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -107,7 +107,7 @@ impl phy::RxToken for RxToken {
 
 impl phy::TxToken for TxToken<'_> {
     fn consume<R, F: FnOnce(&mut [u8]) -> R>(self, len: usize, f: F) -> R {
-        let mut frame = vec![0u8; len.min(virtio::MTU)];
+        let mut frame = vec![0u8; len.min(virtio_net::MTU)];
         let result = f(&mut frame);
         self.0.output(frame);
         result
@@ -138,7 +138,7 @@ impl Device for Nic {
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
         caps.medium = Medium::Ethernet;
-        caps.max_transmission_unit = virtio::MTU;
+        caps.max_transmission_unit = virtio_net::MTU;
         caps
     }
 }

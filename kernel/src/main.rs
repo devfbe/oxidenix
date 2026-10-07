@@ -95,15 +95,33 @@ fn start_procfs() {
     }
 }
 
+/// DMA memory for diskfs: its virtqueue and request buffers (see
+/// servers/diskfs/src/blk.rs).
+const DISKFS_DMA_PAGES: u64 = 64;
+
+/// Hands the first virtio block device (legacy interface) to diskfs and
+/// mounts its ext2 filesystem at /data.
 fn start_diskfs() {
-    // The primary ATA channel: command block 0x1f0-0x1f7, control 0x3f6.
+    let Some(disk) = drivers::pci::find(0x1af4, 0x1001) else {
+        return printkln!("[boot] no virtio block device; /data is not mounted");
+    };
+    let Some((io, len)) = disk.io_bar(0) else {
+        return printkln!("[boot] the block device has no I/O ports");
+    };
+    disk.enable_io_and_dma();
     let server = match process::Server::load("diskfs", "/sbin/diskfs") {
-        Ok(server) => Arc::new(server.ports(0x1f0..0x1f8).ports(0x3f6..0x3f7)),
+        Ok(server) => Arc::new(
+            server
+                .ports(io as u64..io as u64 + len as u64)
+                .dma(DISKFS_DMA_PAGES)
+                .arg(alloc::format!("io={io:#x}"))
+                .arg(alloc::format!("iolen={len}")),
+        ),
         Err(e) => return printkln!("[boot] cannot load /sbin/diskfs (errno {})", e),
     };
     match server.start() {
         Ok((service, root)) => {
-            if let Err(e) = fs::mount_remote(server, service, root as u32, "data", "/dev/hdb", "ext2") {
+            if let Err(e) = fs::mount_remote(server, service, root as u32, "data", "/dev/vda", "ext2") {
                 printkln!("[boot] cannot mount /data (errno {})", e);
             }
         }

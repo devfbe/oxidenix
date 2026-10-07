@@ -1,4 +1,4 @@
-//! ext2 on the ATA data disk: revision 1 with the `filetype` feature,
+//! ext2 on the data disk (any `Device`): revision 1 with the `filetype` feature,
 //! 1/2/4 KiB blocks, direct and single/double/triple indirect blocks.
 //!
 //! Every change goes straight to disk (no cache), and metadata is kept

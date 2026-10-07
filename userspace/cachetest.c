@@ -72,7 +72,7 @@ int main(int argc, char **argv) {
     snprintf(path, sizeof path, "%s/cachetest.big", dir);
     snprintf(prog, sizeof prog, "%s/cachetest.prog", dir);
 
-    /* (Writes reach the disk synchronously, at a few 100 KB/s.) */
+    /* (Writes reach the disk synchronously, each followed by a flush.) */
     int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
     for (long off = 0; off < BIG; off += sizeof buf) {
         for (size_t i = 0; i < sizeof buf; i++) buf[i] = pattern(off + i);
@@ -103,6 +103,7 @@ int main(int argc, char **argv) {
     took = read_all(path, BIG);
     printf("    reading it again from the disk: %ld us\n", took);
     check("the file reads correctly afterwards (from the disk)", took >= 0);
+    check("... at more than 2 MB/s", took >= 0 && took < 1000000);
 
     /* Writes reach cached pages, mappings and the disk alike. */
     fd = open(path, O_RDWR);

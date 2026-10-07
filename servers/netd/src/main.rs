@@ -8,7 +8,7 @@ extern crate alloc;
 
 mod nic;
 mod service;
-mod virtio;
+mod virtio_net;
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -18,7 +18,7 @@ use smoltcp::socket::dhcpv4;
 use smoltcp::time::Instant;
 use nic::Nic;
 use smoltcp::wire::{EthernetAddress, IpCidr, Ipv4Address, Ipv4Cidr};
-use virtio::VirtioNet;
+use virtio_net::VirtioNet;
 
 oxrt::entry!(main);
 

@@ -1,12 +1,13 @@
-//! diskfs: the ext2 filesystem server. It drives the ATA disk from user
-//! space and answers the kernel's filesystem requests (see `fsproto`).
+//! diskfs: the ext2 filesystem server. It drives the virtio block device
+//! from user space and answers the kernel's filesystem requests (see
+//! `fsproto`).
 
 #![no_std]
 #![no_main]
 
 extern crate alloc;
 
-mod ata;
+mod blk;
 
 use alloc::string::String;
 use alloc::vec;
@@ -20,17 +21,36 @@ oxrt::entry!(main);
 const EINVAL: i64 = 22;
 const ENOSYS: i64 = 38;
 
-fn main(_args: Vec<&'static str>) -> i32 {
-    // Only the primary bus's command block and its control register.
-    if oxrt::ioperm(0x1f0, 8).and(oxrt::ioperm(0x3f6, 1)).is_err() {
-        println!("diskfs: no permission for the ATA ports");
-        return 1;
+/// Value of `key=...` among the arguments the kernel passed.
+fn arg(args: &[&str], key: &str) -> Option<u64> {
+    let v = args.iter().find_map(|a| a.strip_prefix(key)?.strip_prefix('='))?;
+    match v.strip_prefix("0x") {
+        Some(hex) => u64::from_str_radix(hex, 16).ok(),
+        None => v.parse().ok(),
     }
-    let Some(disk) = ata::Ata::probe() else {
-        println!("diskfs: no data disk (primary slave)");
+}
+
+fn main(args: Vec<&'static str>) -> i32 {
+    let (Some(io), Some(iolen)) = (arg(&args, "io"), arg(&args, "iolen")) else {
+        println!("diskfs: started without a disk (io=, iolen=)");
         return 1;
     };
-    let sectors = disk.sectors();
+    if oxrt::ioperm(io as u16, iolen as u16).is_err() {
+        println!("diskfs: no permission for the disk's I/O ports");
+        return 1;
+    }
+    let Ok((dma, phys)) = oxrt::dma_map() else {
+        println!("diskfs: no DMA memory");
+        return 1;
+    };
+    let disk = match blk::VirtioBlk::new(io as u16, dma, phys) {
+        Ok(disk) => disk,
+        Err(e) => {
+            println!("diskfs: {}", e);
+            return 1;
+        }
+    };
+    let (sectors, read_only) = (disk.sectors(), disk.read_only());
     let mut fs = match Ext2::mount(disk) {
         Ok(fs) => fs,
         Err(e) => {
@@ -42,7 +62,8 @@ fn main(_args: Vec<&'static str>) -> i32 {
         println!("diskfs: cannot register: {}", e);
         return 1;
     }
-    println!("diskfs: serving ext2 from a {} MiB disk (pid {})", sectors / 2048, oxrt::getpid());
+    let mode = if read_only { ", read-only" } else { "" };
+    println!("diskfs: serving ext2 from a {} MiB virtio disk{} (pid {})", sectors / 2048, mode, oxrt::getpid());
 
     let mut request = vec![0u8; MAX_MESSAGE];
     let mut response = vec![0u8; MAX_MESSAGE];
@@ -65,7 +86,7 @@ fn inodes_payload(inodes: &[u32]) -> Vec<u8> {
 }
 
 /// Executes one request and writes the response; returns its length.
-fn handle(fs: &mut Ext2<ata::Ata>, req: &Request, out: &mut [u8]) -> usize {
+fn handle(fs: &mut Ext2<blk::VirtioBlk>, req: &Request, out: &mut [u8]) -> usize {
     let [a0, a1, a2, _] = req.args;
     let ino = a0 as u32;
     let result: Result<(i64, [u64; 6], Vec<u8>), i64> = (|| {

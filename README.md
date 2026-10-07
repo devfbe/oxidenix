@@ -70,9 +70,9 @@ Its [commit history](#development-history) records every step.
   memory, load average).
 - **Filesystem**: an in-memory, tmpfs-like VFS populated from a cpio initramfs, with files,
   directories, symlinks, `/dev/{console,tty,null,zero}`, and quotas against heap exhaustion.
-- **Microkernel-style drivers**: the ATA driver and the read-write **ext2** filesystem run in
-  `diskfs`, an ordinary ring-3 process that talks to the kernel over IPC and reaches the disk
-  through I/O ports the kernel granted it. If it dies, the kernel restarts it on the next access, and
+- **Microkernel-style drivers**: the virtio block driver and the read-write **ext2** filesystem
+  run in `diskfs`, an ordinary ring-3 process that talks to the kernel over IPC and reaches the
+  disk through I/O ports and a DMA area the kernel granted it. If it dies, the kernel restarts it on the next access, and
   the rest of the system keeps running.
 - **Networking**: TCP, UDP and raw ICMP sockets over IPv4 with DNS, so `wget`, `nc`, `ping` and
   `nslookup` from BusyBox reach the Internet through QEMU's user network. The driver for the virtio network
@@ -135,7 +135,7 @@ The window scales when it is resized (`zoom-to-fit`), and Ctrl+Alt+F toggles ful
 ```
  ┌──────────────────────────────── user space (ring 3) ────────────────────────────────┐
  │  GNU Bash 5.3   BusyBox 1.37   test programs     │  diskfs server (Rust, no_std)    │
- │  statically linked against musl libc             │  ext2 + ATA driver, I/O ports    │
+ │  statically linked against musl libc             │  ext2 + virtio-blk, DMA          │
  │                                                  │  netd server: virtio-net, DMA,   │
  │                                                  │  IRQs, smoltcp TCP/IP, sockets   │
  └───────────────────────┬────────────────▲─────────┴────────▲──────────────┬──────────┘
@@ -151,7 +151,7 @@ The window scales when it is resized (`zoom-to-fit`), and Ctrl+Alt+F toggles ful
  │  terminal        TTY line discipline ─ console (framebuffer, ANSI) ─ keyboard       │
  │  CPU             GDT, TSS + I/O bitmap, IDT, local + I/O APIC (ACPI), SSE│          │
  └──────────────────────────────────────────────────────────────────────────▼──────────┘
-      bootloader 0.11 (BIOS), QEMU x86_64, 4 CPUs, 256 MiB RAM, IDE disk, virtio-net
+      bootloader 0.11 (BIOS), QEMU x86_64, 4 CPUs, 256 MiB RAM, IDE boot disk, virtio-blk data disk, virtio-net
 ```
 
 ### Repository layout
@@ -204,16 +204,17 @@ oxidenix/
 │       ├── timer.rs             per-CPU timer queues on the local APIC timer
 │       └── shell/               built-in kernel monitor (fallback shell)
 ├── servers/
-│   ├── diskfs/                  user-space ext2 server with its own ATA driver
+│   ├── diskfs/                  user-space ext2 server with its virtio-blk driver (blk.rs)
 │   ├── procfs/                  /proc and /sys from the kernel's process information
 │   │                            (main.rs: tree and inodes, render.rs: Linux formats)
-│   └── netd/                    network server: virtio-net driver (virtio.rs), loopback
+│   └── netd/                    network server: virtio-net driver (virtio_net.rs), loopback
 │                                (nic.rs), sockets on smoltcp (service.rs), DHCP
 ├── crates/
 │   ├── ext2fs/                  ext2 as a library over a `Device` trait
 │   ├── fsproto/                 message format between the VFS and filesystem servers
 │   ├── netproto/                socket operations between the kernel and netd
 │   ├── procproto/               native process and system information for procfs
+│   ├── virtio/                  virtio legacy PCI transport and virtqueues (diskfs, netd)
 │   └── oxrt/                    runtime for servers: entry, syscalls, heap, port I/O
 ├── builder/                     host tool: rootfs + cpio + boot image + ext2 data disk + QEMU
 └── userspace/                   C test programs, build script, rootfs and data disk templates
@@ -554,7 +555,7 @@ interrupt dispatch; drivers and filesystems move into user-space servers.
   the server's registration, so a restarted server cannot wake its predecessor's waiters.
 - **Hardware access without kernel drivers**: servers started by the kernel are *privileged*
   and may call `ioperm`, but only for the ports the kernel assigned to them (diskfs gets the
-  primary ATA channel, `0x1f0`-`0x1f7` and `0x3f6`; netd gets the I/O BAR of its network card;
+  I/O BAR of its virtio block device, netd the one of its network card;
   anything else is `EPERM`). Granted ports are set in the TSS I/O permission bitmap, which is
   installed on every switch to that process. The server cannot touch other ports or disable
   interrupts (no IOPL 3). The kernel itself only scans PCI (`drivers/pci.rs`) and enables I/O
@@ -648,8 +649,13 @@ interrupt dispatch; drivers and filesystems move into user-space servers.
 
 ### Persistent storage
 
-- **ATA PIO driver** in `diskfs` for the second IDE disk (primary bus, slave). It uses LBA28,
-  polls with the controller interrupt disabled, and flushes the write cache after every write.
+- **virtio-blk driver** in `diskfs` (`blk.rs`, legacy PCI interface on the shared transport in
+  `crates/virtio`) for the data disk. A transfer of up to 128 KiB is one request that the device
+  moves by DMA (a chain of header, data and status descriptors); the driver polls for completion
+  with the device's interrupts off (diskfs serves one request at a time, and PCI interrupt lines
+  may be shared: under QEMU the disk shares one with the network card, while the kernel gives
+  each line to one server). Every write is followed by a
+  flush of the device's write cache.
 - **ext2** (`crates/ext2fs`; revision 1 with the `filetype` feature, 1/2/4 KiB blocks) supports reading and
   writing files through direct, single, double and triple indirect blocks, holes, truncation
   (freeing whole indirect subtrees), directories growing by blocks, fast and block symlinks,
