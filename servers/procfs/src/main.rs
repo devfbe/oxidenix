@@ -168,7 +168,7 @@ pub fn pids() -> Vec<u64> {
 fn exists(node: Node) -> bool {
     match node {
         Node::Global(ino) => {
-            (ROOT..=OSRELEASE).contains(&ino)
+            (ROOT..=COUNTERS).contains(&ino)
                 || (SYSFS_ROOT..=CPU_KERNEL_MAX).contains(&ino)
                 || (CPU_DIR..CPU_DIR + cpus()).contains(&ino)
                 || (CPU_DIR_ONLINE..CPU_DIR_ONLINE + cpus()).contains(&ino)

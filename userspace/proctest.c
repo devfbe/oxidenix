@@ -122,6 +122,12 @@ int main(void) {
     sscanf(strstr(buf, "MemTotal:"), "MemTotal: %ld", &total);
     sscanf(strstr(buf, "MemAvailable:"), "MemAvailable: %ld", &avail);
     check("/proc/meminfo: MemTotal > MemAvailable > 0 (kB)", total > avail && avail > 0);
+    long sys1 = -1, sys2 = -1, allocs = -1;
+    if (slurp("/proc/counters", buf, sizeof buf) > 0 && strstr(buf, "syscalls ")) sys1 = atol(strstr(buf, "syscalls ") + 9);
+    for (int i = 0; i < 10; i++) getppid();
+    if (slurp("/proc/counters", buf, sizeof buf) > 0 && strstr(buf, "syscalls ")) sys2 = atol(strstr(buf, "syscalls ") + 9);
+    if (strstr(buf, "heap_allocs ")) allocs = atol(strstr(buf, "heap_allocs ") + 12);
+    check("/proc/counters counts system calls and allocations", sys1 > 0 && sys2 >= sys1 + 10 && allocs > 0 && strstr(buf, "ipc_calls ") && strstr(buf, "address_space_switches "));
     double l1, l5, l15;
     int running, procs;
     slurp("/proc/loadavg", buf, sizeof buf);
