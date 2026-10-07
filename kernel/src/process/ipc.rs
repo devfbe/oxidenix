@@ -69,6 +69,19 @@ fn request_chan(id: u64) -> usize {
     0x2_0000_0000 + id as usize
 }
 
+/// The channel a server's event `token` wakes (see `notify`), for one
+/// registration of the server: a restarted server cannot wake the
+/// waiters of its predecessor's objects. Different tokens may share a
+/// channel; that only costs a spurious wakeup.
+pub fn event_chan(server: Instance, token: u64) -> usize {
+    (1 << 44) | ((server.generation as usize & 0xfff) << 32) | (token as usize & 0xffff_ffff)
+}
+
+/// The channel woken when this registration's server dies.
+pub fn gone_chan(server: Instance) -> usize {
+    0x20_0000_0000 + server.generation as usize
+}
+
 fn lock<R>(f: impl FnOnce(&mut Ipc) -> R) -> R {
     f(&mut IPC.lock())
 }
@@ -182,6 +195,26 @@ pub fn reply(id: u64, buf: u64, len: u64) -> SysResult {
         Ok(())
     })?;
     wakeup(request_chan(id));
+    Ok(0)
+}
+
+/// ipc_notify(token): a server announces that its object `token` changed
+/// (netd: a socket's readiness), waking whoever waits on it. Only for the
+/// services the caller serves.
+pub fn notify(token: u64) -> SysResult {
+    let me = super::current_pid();
+    let served: Vec<Instance> = lock(|ipc| {
+        (0..ipc.services.len())
+            .filter(|&i| ipc.services[i].alive && ipc.services[i].server == me)
+            .map(|i| Instance { service: i, generation: ipc.services[i].generation })
+            .collect()
+    });
+    if served.is_empty() {
+        return Err(EPERM);
+    }
+    for server in served {
+        wakeup(event_chan(server, token));
+    }
     Ok(0)
 }
 
@@ -314,20 +347,27 @@ pub fn instance(name: &str) -> Option<Instance> {
 /// Called when a process exits: its services die and every request they
 /// had not answered fails with EIO.
 pub fn on_exit(pid: Pid) {
-    let failed: Vec<u64> = lock(|ipc| {
+    let (failed, gone): (Vec<u64>, Vec<Instance>) = lock(|ipc| {
         let dead: Vec<usize> = (0..ipc.services.len()).filter(|&i| ipc.services[i].server == pid && ipc.services[i].alive).collect();
+        let gone = dead.iter().map(|&i| Instance { service: i, generation: ipc.services[i].generation }).collect();
         for &i in &dead {
             ipc.services[i].alive = false;
             ipc.services[i].queue.clear();
         }
-        ipc.requests
+        let failed = ipc
+            .requests
             .iter()
             .filter(|(_, r)| dead.contains(&r.service) && matches!(r.state, State::Queued | State::Taken))
             .map(|(&id, _)| id)
-            .collect()
+            .collect();
+        (failed, gone)
     });
     for id in failed {
         fail(id);
+    }
+    // Polls on its objects (sockets) see the server gone.
+    for server in gone {
+        wakeup(gone_chan(server));
     }
 }
 

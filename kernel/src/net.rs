@@ -130,6 +130,15 @@ impl Socket {
         self.call(Op::Shutdown, [self.handle, how, 0, 0], &[]).map(|_| ())
     }
 
+    /// Where readiness changes are announced: netd notifies the socket's
+    /// handle, and its death wakes everyone (polls then see POLLERR).
+    pub fn poll_source(&self) -> crate::process::poll::PollSource {
+        crate::process::poll::PollSource::Server {
+            event: ipc::event_chan(self.netd, self.handle),
+            gone: ipc::gone_chan(self.netd),
+        }
+    }
+
     /// Ready poll events among `events`; a dead server reports an error.
     pub fn poll(&self, events: i16) -> i16 {
         match self.call(Op::Poll, [self.handle, events as u16 as u64, 0, 0], &[]) {

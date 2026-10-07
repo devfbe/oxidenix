@@ -81,6 +81,7 @@ fn main(args: Vec<&'static str>) -> i32 {
     loop {
         iface.poll(now(), &mut nic, &mut sockets);
         service.progress(&mut iface, &mut sockets, now());
+        service.announce(&sockets);
         match sockets.get_mut::<dhcpv4::Socket>(dhcp).poll() {
             Some(dhcpv4::Event::Configured(c)) => {
                 // smoltcp sends from the first address unless the destination
@@ -151,6 +152,7 @@ fn main(args: Vec<&'static str>) -> i32 {
                     if let Some((status, values, data)) = service.handle(id, op, args, payload, &mut iface, &mut sockets, now()) {
                         service.respond(id, status, values, &data);
                     }
+                    service.announce(&sockets);
                 }
                 _ => service.respond(id, -EINVAL, [0; 6], &[]),
             },

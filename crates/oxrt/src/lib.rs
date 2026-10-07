@@ -30,6 +30,8 @@ pub mod sys {
     pub const DMA_MAP: u64 = 1004;
     /// (op, argument, buffer, length) -> bytes of process/system information
     pub const PROC_QUERY: u64 = 1005;
+    /// (token): wakes whoever waits on the server's object `token`
+    pub const IPC_NOTIFY: u64 = 1006;
 }
 
 /// Raw system call; returns the kernel's result (negative errno on error).
@@ -147,6 +149,15 @@ pub fn dma_map() -> Result<(*mut u8, u64), i64> {
     match syscall(sys::DMA_MAP, [&mut phys as *mut u64 as u64, 0, 0, 0, 0, 0]) {
         e if e < 0 => Err(e),
         addr => Ok((addr as *mut u8, phys)),
+    }
+}
+
+/// Tells the kernel that the object `token` of the calling server changed
+/// (netd: the readiness of the socket with that handle).
+pub fn ipc_notify(token: u64) -> Result<(), i64> {
+    match syscall(sys::IPC_NOTIFY, [token, 0, 0, 0, 0, 0]) {
+        0 => Ok(()),
+        e => Err(e),
     }
 }
 

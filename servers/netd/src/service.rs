@@ -99,6 +99,8 @@ pub struct Service {
     next_handle: u64,
     next_port: u16,
     pending: Vec<Pending>,
+    /// The poll events last seen for each socket (see `announce`).
+    announced: BTreeMap<u64, u64>,
     /// Sockets closed by their owner that still finish their FIN exchange.
     closing: Vec<SocketHandle>,
     pub config: Config,
@@ -134,6 +136,7 @@ impl Service {
             next_handle: 1,
             next_port: 49152,
             pending: Vec::new(),
+            announced: BTreeMap::new(),
             closing: Vec::new(),
             config: Config::default(),
         }
@@ -323,6 +326,79 @@ impl Service {
                 Ok(true)
             }
         }
+    }
+
+    /// The poll events socket `handle` has now (all of them).
+    fn readiness(&self, handle: u64, sockets: &SocketSet<'static>) -> Option<u64> {
+        let mut ready = 0;
+        match self.entries.get(&handle)? {
+            Entry::Tcp(t) => {
+                if let Some(set) = &t.backlog {
+                    let any = set
+                        .iter()
+                        .any(|&h| !matches!(sockets.get::<tcp::Socket>(h).state(), tcp::State::Listen | tcp::State::SynReceived));
+                    if any {
+                        ready |= POLLIN;
+                    }
+                } else {
+                    let s = sockets.get::<tcp::Socket>(t.socket);
+                    let state = s.state();
+                    let opening = matches!(state, tcp::State::SynSent | tcp::State::SynReceived);
+                    if s.can_recv() || (!s.may_recv() && !opening && (t.connected || t.connecting.is_some())) {
+                        ready |= POLLIN;
+                    }
+                    if s.can_send() && !opening {
+                        ready |= POLLOUT;
+                    }
+                    if state == tcp::State::Closed && t.connecting.is_some() {
+                        // A failed connect: writable with an error, as on Linux.
+                        ready |= POLLOUT | POLLERR | POLLHUP;
+                    } else if state == tcp::State::Closed && t.connected {
+                        ready |= POLLHUP;
+                    }
+                }
+                if t.error != 0 {
+                    ready |= POLLERR;
+                }
+            }
+            Entry::Udp(u) => {
+                let s = sockets.get::<udp::Socket>(u.socket);
+                if s.can_recv() {
+                    ready |= POLLIN;
+                }
+                if s.can_send() {
+                    ready |= POLLOUT;
+                }
+            }
+            Entry::Raw(r) => {
+                let s = sockets.get::<raw::Socket>(r.socket);
+                if s.can_recv() {
+                    ready |= POLLIN;
+                }
+                if s.can_send() {
+                    ready |= POLLOUT;
+                }
+            }
+        }
+        Some(ready)
+    }
+
+    /// Tells the kernel about every socket that gained poll events since
+    /// the last call, so that poll, select and epoll waiting on it wake
+    /// up. Called after every step that can change readiness: the stack's
+    /// progress and each request. Losing events needs no notice (waiters
+    /// check again), and the current state is remembered either way.
+    pub fn announce(&mut self, sockets: &SocketSet<'static>) {
+        let handles: Vec<u64> = self.entries.keys().copied().collect();
+        for handle in handles {
+            let now = self.readiness(handle, sockets).unwrap_or(0);
+            let before = self.announced.insert(handle, now).unwrap_or(0);
+            if now & !before != 0 {
+                let _ = oxrt::ipc_notify(handle);
+            }
+        }
+        let entries = &self.entries;
+        self.announced.retain(|h, _| entries.contains_key(h));
     }
 
     fn attempt(
@@ -562,56 +638,7 @@ impl Service {
                 done(0)
             }
             Op::Poll => {
-                let mut ready = 0;
-                match self.entries.get(&handle).ok_or(EBADF)? {
-                    Entry::Tcp(t) => {
-                        if let Some(set) = &t.backlog {
-                            let any = set.iter().any(|&h| {
-                                !matches!(sockets.get::<tcp::Socket>(h).state(), tcp::State::Listen | tcp::State::SynReceived)
-                            });
-                            if any {
-                                ready |= POLLIN;
-                            }
-                        } else {
-                            let s = sockets.get::<tcp::Socket>(t.socket);
-                            let state = s.state();
-                            let opening = matches!(state, tcp::State::SynSent | tcp::State::SynReceived);
-                            if s.can_recv() || (!s.may_recv() && !opening && (t.connected || t.connecting.is_some())) {
-                                ready |= POLLIN;
-                            }
-                            if s.can_send() && !opening {
-                                ready |= POLLOUT;
-                            }
-                            if state == tcp::State::Closed && t.connecting.is_some() {
-                                // A failed connect: writable with an error, as on Linux.
-                                ready |= POLLOUT | POLLERR | POLLHUP;
-                            } else if state == tcp::State::Closed && t.connected {
-                                ready |= POLLHUP;
-                            }
-                        }
-                        if t.error != 0 {
-                            ready |= POLLERR;
-                        }
-                    }
-                    Entry::Udp(u) => {
-                        let s = sockets.get::<udp::Socket>(u.socket);
-                        if s.can_recv() {
-                            ready |= POLLIN;
-                        }
-                        if s.can_send() {
-                            ready |= POLLOUT;
-                        }
-                    }
-                    Entry::Raw(r) => {
-                        let s = sockets.get::<raw::Socket>(r.socket);
-                        if s.can_recv() {
-                            ready |= POLLIN;
-                        }
-                        if s.can_send() {
-                            ready |= POLLOUT;
-                        }
-                    }
-                }
+                let ready = self.readiness(handle, sockets).ok_or(EBADF)?;
                 Ok(Done(0, [ready & (args[1] | POLLERR | POLLHUP), 0, 0, 0, 0, 0], Vec::new()))
             }
             Op::Name => {

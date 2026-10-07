@@ -273,6 +273,7 @@ extern "sysv64" fn dispatch(f: &mut Frame) {
         1003 => super::irq::enable(a0),
         1004 => super::dma_map(a0),
         1005 => super::query::proc_query(a0, a1, a2, a3),
+        1006 => super::ipc::notify(a0),
         200 => signal::tgkill(None, a0 as i64, a1),
         234 => signal::tgkill(Some(a0 as i64), a1 as i64, a2),
         202 => super::futex::futex(a0, a1, a2, a3, a4, a5),

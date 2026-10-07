@@ -31,7 +31,7 @@ use crate::sync::IrqSpinLock;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 const EPOLLERR: u32 = 0x8;
 const EPOLLHUP: u32 = 0x10;
@@ -73,8 +73,6 @@ struct Shared {
     /// A wakeup found the ready list full (it never should): the next
     /// epoll_wait checks every item.
     overflow: AtomicBool,
-    /// Items whose files announce nothing (sockets): checked every time.
-    rechecked: AtomicUsize,
 }
 
 pub struct Item {
@@ -88,7 +86,6 @@ pub struct Item {
     /// On the ready list.
     queued: AtomicBool,
     removed: AtomicBool,
-    recheck: bool,
     registration: spin::Mutex<Option<Registration>>,
 }
 
@@ -165,7 +162,6 @@ impl Epoll {
                 ready: IrqSpinLock::new(VecDeque::new()),
                 queue: WaitQueue::new(),
                 overflow: AtomicBool::new(false),
-                rechecked: AtomicUsize::new(0),
             }),
             file: spin::Mutex::new(Weak::new()),
         })
@@ -202,7 +198,6 @@ impl Epoll {
         if interest.contains_key(&key) {
             return Err(EEXIST);
         }
-        let recheck = matches!(source, PollSource::Recheck);
         let item = Arc::new_cyclic(|me| Item {
             me: me.clone(),
             file: Arc::downgrade(file),
@@ -212,7 +207,6 @@ impl Epoll {
             data: AtomicU64::new(data),
             queued: AtomicBool::new(false),
             removed: AtomicBool::new(false),
-            recheck,
             registration: spin::Mutex::new(None),
         });
         // Room for every item on the ready list, and in the file's list of
@@ -236,9 +230,6 @@ impl Epoll {
             }
         };
         *item.registration.lock() = registration;
-        if recheck {
-            self.shared.rechecked.fetch_add(1, Ordering::Relaxed);
-        }
         interest.insert(key, item.clone());
         drop(interest);
         item.wake_if_ready(file);
@@ -287,9 +278,6 @@ impl Epoll {
         };
         drop(unlisted);
         drop(item.registration.lock().take());
-        if item.recheck {
-            self.shared.rechecked.fetch_sub(1, Ordering::Relaxed);
-        }
     }
 
     fn items(&self) -> Vec<Arc<Item>> {
@@ -298,11 +286,9 @@ impl Epoll {
 
     /// Fills up to `max` events at `out`; returns how many.
     fn collect(&self, out: u64, max: usize) -> Result<usize, i64> {
-        // Items that wakeups cannot put on the list are checked every time.
+        // A wakeup that found no room: check every item.
         if self.shared.overflow.swap(false, Ordering::AcqRel) {
             self.items().iter().for_each(|i| i.enqueue());
-        } else if self.shared.rechecked.load(Ordering::Relaxed) > 0 {
-            self.items().iter().filter(|i| i.recheck).for_each(|i| i.enqueue());
         }
         let mut again = Vec::new();
         let mut n = 0;
@@ -346,15 +332,12 @@ impl Epoll {
     /// instance itself).
     pub fn has_events(&self) -> bool {
         let mut candidates: Vec<Arc<Item>> = self.shared.ready.lock().iter().cloned().collect();
-        if self.shared.rechecked.load(Ordering::Relaxed) > 0 || self.shared.overflow.load(Ordering::Relaxed) {
+        if self.shared.overflow.load(Ordering::Relaxed) {
             candidates = self.items();
         }
         candidates.iter().any(|i| i.file.upgrade().is_some_and(|f| i.check(&f) != 0))
     }
 
-    fn has_recheck(&self) -> bool {
-        self.shared.rechecked.load(Ordering::Relaxed) > 0
-    }
 }
 
 impl Drop for Epoll {
@@ -497,7 +480,6 @@ fn wait(epfd: u64, out: u64, max: u64, timeout: Option<u64>) -> SysResult {
     table.watch_source(&PollSource::Epoll(epoll.clone()))?;
     loop {
         table.rearm();
-        table.set_recheck(epoll.has_recheck());
         let n = epoll.collect(out, max as usize)?;
         if n > 0 || deadline.is_some_and(|d| crate::time::now() >= d) {
             return Ok(n as i64);

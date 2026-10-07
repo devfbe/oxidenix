@@ -9,9 +9,8 @@
 //! checks, the first time it checks that file, and unregisters them all
 //! when the call returns. A wakeup on any of them ends the wait, so poll
 //! returns as soon as a pipe gets data or a key is typed, not at the next
-//! re-check. Files whose readiness lives in a user-space server (sockets)
-//! announce nothing in the kernel; while one is polled, readiness is also
-//! re-checked every scheduler tick.
+//! re-check. Sockets, whose readiness lives in a user-space server, are
+//! announced by that server (`ipc::notify`), and on the server's death.
 //!
 //! The protocol cannot lose a wakeup: `rearm` forgets earlier wakeups
 //! before the files are checked, and `wait` sleeps only if none came
@@ -34,8 +33,9 @@ pub enum PollSource {
     Chan(usize),
     /// On an epoll instance's own queue.
     Epoll(Arc<Epoll>),
-    /// Never, though it changes (sockets): it has to be checked again.
-    Recheck,
+    /// By a server (sockets: netd), on its event channel for the file,
+    /// and on the channel woken when that server dies.
+    Server { event: usize, gone: usize },
 }
 
 /// A waker on a file's wait queue; dropping it takes it off again.
@@ -46,6 +46,7 @@ pub struct Registration {
 
 enum Registered {
     Chan(usize),
+    Chans(usize, usize),
     Epoll(Arc<Epoll>),
 }
 
@@ -54,7 +55,7 @@ impl Registration {
     /// nothing.
     pub fn new(source: &PollSource, waker: Arc<dyn Waker>) -> Result<Option<Registration>, i64> {
         let on = match source {
-            PollSource::Always | PollSource::Recheck => return Ok(None),
+            PollSource::Always => return Ok(None),
             PollSource::Chan(chan) => {
                 queue_of(*chan).add_waker(*chan, waker.clone())?;
                 Registered::Chan(*chan)
@@ -62,6 +63,14 @@ impl Registration {
             PollSource::Epoll(ep) => {
                 ep.queue().add_waker(0, waker.clone())?;
                 Registered::Epoll(ep.clone())
+            }
+            PollSource::Server { event, gone } => {
+                queue_of(*event).add_waker(*event, waker.clone())?;
+                if let Err(e) = queue_of(*gone).add_waker(*gone, waker.clone()) {
+                    queue_of(*event).remove_waker(*event, &waker);
+                    return Err(e);
+                }
+                Registered::Chans(*event, *gone)
             }
         };
         Ok(Some(Registration { on, waker }))
@@ -71,6 +80,7 @@ impl Registration {
         match (&self.on, source) {
             (Registered::Chan(a), PollSource::Chan(b)) => a == b,
             (Registered::Epoll(a), PollSource::Epoll(b)) => Arc::ptr_eq(a, b),
+            (Registered::Chans(a, _), PollSource::Server { event: b, .. }) => a == b,
             _ => false,
         }
     }
@@ -80,6 +90,10 @@ impl Drop for Registration {
     fn drop(&mut self) {
         match &self.on {
             Registered::Chan(chan) => queue_of(*chan).remove_waker(*chan, &self.waker),
+            Registered::Chans(a, b) => {
+                queue_of(*a).remove_waker(*a, &self.waker);
+                queue_of(*b).remove_waker(*b, &self.waker);
+            }
             Registered::Epoll(ep) => ep.queue().remove_waker(0, &self.waker),
         }
     }
@@ -88,13 +102,11 @@ impl Drop for Registration {
 pub struct PollTable {
     waiter: Arc<PollWaiter>,
     registrations: Vec<Registration>,
-    /// A polled file announces nothing: re-check every tick.
-    recheck: bool,
 }
 
 impl PollTable {
     pub fn new() -> PollTable {
-        PollTable { waiter: Arc::new(PollWaiter::new()), registrations: Vec::new(), recheck: false }
+        PollTable { waiter: Arc::new(PollWaiter::new()), registrations: Vec::new() }
     }
 
     /// Listens for changes of `file`'s readiness (once per source).
@@ -103,9 +115,6 @@ impl PollTable {
     }
 
     pub fn watch_source(&mut self, source: &PollSource) -> Result<(), i64> {
-        if matches!(source, PollSource::Recheck) {
-            self.recheck = true;
-        }
         if self.registrations.iter().any(|r| r.is_on(source)) {
             return Ok(());
         }
@@ -114,11 +123,6 @@ impl PollTable {
             self.registrations.push(r);
         }
         Ok(())
-    }
-
-    /// Re-checks every tick even without a file that needs it.
-    pub fn set_recheck(&mut self, recheck: bool) {
-        self.recheck = recheck;
     }
 
     /// Forgets earlier wakeups; call before checking the files.
@@ -136,12 +140,6 @@ impl PollTable {
         if interrupted() {
             return Err(EINTR);
         }
-        let deadline = if self.recheck {
-            let tick = crate::time::now().saturating_add(crate::timer::TICK_NS);
-            Some(deadline.map_or(tick, |d| d.min(tick)))
-        } else {
-            deadline
-        };
         match deadline {
             Some(d) => wait.sleep_until(d),
             None => wait.sleep(),

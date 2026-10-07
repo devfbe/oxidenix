@@ -440,8 +440,8 @@ impl OpenFile {
             Kind::PipeWrite(p) => PollSource::Chan(p.write_chan()),
             Kind::EventFd(e) => PollSource::Chan(e.chan()),
             Kind::Epoll(e) => PollSource::Epoll(e.clone()),
-            // Readiness is the network server's.
-            Kind::Socket(_) => PollSource::Recheck,
+            // netd announces readiness changes.
+            Kind::Socket(s) => s.poll_source(),
         }
     }
 }

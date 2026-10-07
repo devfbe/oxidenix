@@ -362,7 +362,8 @@ The scheduler is built for several CPUs (`process/sched.rs`, design in
   `epoll_wait` put one callback on the queue of every file they check, so a wakeup on any
   of them ends the wait at once instead of at a periodic re-check; a wakeup that comes while
   the files are being checked is noted and not lost. Sockets, whose readiness lives in
-  netd, are re-checked every tick while polled.
+  netd, wait on two channels: one that netd wakes for the socket (`ipc_notify`) and one
+  woken when that netd dies, so a poll sees the error at once.
 - **epoll** (`process/epoll.rs`): every interest is a callback on its file's wait queue that
   puts it on the instance's ready list (without allocating: the list keeps room for every
   item, so this works in interrupt context) and wakes the instance's own queue.
@@ -503,7 +504,9 @@ interrupt dispatch; drivers and filesystems move into user-space servers.
   the client on behalf of user programs: `call` queues a request and sleeps uninterruptibly
   until the reply; `post` queues a message without waiting, for contexts that must not sleep
   (releasing an unlinked inode while dropping it). Messages up to 64 KiB are copied through the
-  kernel.
+  kernel. A server announces that one of its objects changed with `ipc_notify(token)`
+  (syscall 1006), which wakes whoever waits on that object's channel; the channel belongs to
+  the server's registration, so a restarted server cannot wake its predecessor's waiters.
 - **Hardware access without kernel drivers**: servers started by the kernel are *privileged*
   and may call `ioperm`, but only for the ports the kernel assigned to them (diskfs gets the
   primary ATA channel, `0x1f0`-`0x1f7` and `0x3f6`; netd gets the I/O BAR of its network card;
@@ -565,7 +568,10 @@ interrupt dispatch; drivers and filesystems move into user-space servers.
   interrupt line and a 512 KiB DMA area. netd sets up the two virtqueues with 64 fixed 2 KiB
   buffers each, sleeps in `ipc_receive` until a request, a card interrupt or the next timer
   of the TCP/IP stack, and runs [smoltcp](https://github.com/smoltcp-rs/smoltcp) for ARP,
-  IPv4, ICMP, TCP, UDP and the DHCP client.
+  IPv4, ICMP, TCP, UDP and the DHCP client. After every step of the stack and every request
+  it compares each socket's poll events with the last ones and calls `ipc_notify` for every
+  socket that gained some, so `poll`, `select` and `epoll` wake when data, a connection or
+  buffer space arrives.
 - **Loopback**: frames to the host's own address or to `127.0.0.0/8` never reach the card;
   netd's device layer feeds them back as received frames and answers ARP for those addresses
   itself, so a program can talk to a server on the same machine. Frames from the wire that
@@ -667,7 +673,7 @@ Linux x86_64 numbers, grouped by area (about 120 in total):
 | Signals | `rt_sigaction` `rt_sigprocmask` `rt_sigreturn` `rt_sigsuspend` `rt_sigpending` `kill` `tkill` `tgkill` `pause` `sigaltstack` `alarm` `setitimer` `getitimer` (`ITIMER_REAL`) `rt_sigtimedwait` |
 | Process control | `prctl` (name, parent-death signal, dumpable, no-new-privs, capability bounding set) `capget` `capset` (everything runs as root with every capability) |
 | Filesystems | `statfs` `fstatfs` `sync` `fsync` `fdatasync` |
-| Servers | `ioperm` (privileged servers only), `ipc_register` (1000), `ipc_receive` (1001, with timeout and interrupt notifications), `ipc_reply` (1002), `irq_enable` (1003), `dma_map` (1004), `proc_query` (1005) |
+| Servers | `ioperm` (privileged servers only), `ipc_register` (1000), `ipc_receive` (1001, with timeout and interrupt notifications), `ipc_reply` (1002), `irq_enable` (1003), `dma_map` (1004), `proc_query` (1005), `ipc_notify` (1006) |
 | System information | `sysinfo` `uname` (reports `oxidenix`, not Linux) |
 | Power | `reboot` (power off ends QEMU, restart resets the machine) |
 | Sockets | `socket` `bind` `listen` `accept` `accept4` `connect` `sendto` `recvfrom` `sendmsg` `recvmsg` `shutdown` `getsockname` `getpeername` `setsockopt` (ignored) `getsockopt` (`AF_INET` only: TCP, UDP, raw ICMP) |
@@ -697,10 +703,10 @@ Each of these programs and scripts lives in the root filesystem and runs inside 
 | `futextest` | `FUTEX_WAIT` on a changed value (`EAGAIN`), timeouts, `EINVAL`/`EFAULT`, interruption by a signal (`EINTR`), shared futexes across processes, private memory keeping separate keys after `fork`, bitsets, `FUTEX_CMP_REQUEUE` |
 | `timetest` | nanosecond resolution of `CLOCK_MONOTONIC`, no step back on one CPU or between two, `clock_getres`, invalid clocks, `BOOTTIME`, `RAW`, `COARSE`, `gettimeofday` and `time` against `CLOCK_REALTIME`, `clock_settime` moving only the wall clock, thread and process CPU clocks (spinning counts, sleeping does not, `pthread_getcpuclockid`, `clock_getcpuclockid`), `getrusage` for the process, the thread and reaped children, `times` |
 | `timertest` | sleeps and timeouts end when due, not at the next tick, and never early (median and minimum of nine 1–2 ms waits in `nanosleep`, `poll`, `select`, `futex`, `sigtimedwait`), 100 × `usleep(100)`, `clock_nanosleep` absolute (monotonic, past wall-clock times) and on `CLOCK_BOOTTIME`, refusal on CPU clocks, the time left after an interrupted `nanosleep`, a 2 ms `setitimer` interval firing about 50 times in 100 ms, a 1 µs interval timer leaving another process on its CPU its share (and, ignored, its own process), an ignored timer resuming once handled |
-| `polltest` | `poll` and `select` wake within 1 ms of a pipe write (median of nine, the writer on the same or another CPU, next to an idle descriptor), a full pipe polling writable once drained, `POLLHUP` when the last writer closes, `EINTR` in a `poll` waiting on files |
+| `polltest` | `poll` and `select` wake within 1 ms of a pipe write or a datagram over loopback (median of nine, the writer on the same or another CPU, next to an idle descriptor), a full pipe polling writable once drained, `POLLHUP` when the last writer closes, `EINTR` in a `poll` waiting on files |
 | `eventfdtest` | `eventfd` counting (initial value, adding writes, reset on read), `EFD_SEMAPHORE`, `EFD_NONBLOCK` and `EFD_CLOEXEC`, `EINVAL` for short reads, 2^64-1 and unknown flags, a full counter (`EAGAIN`, poll state), a blocking read woken by another process, `poll` waking within 1 ms of a write |
 | `sigmasktest` | temporary signal masks of `sigsuspend`, `ppoll` and `pselect`: a pending or arriving signal the mask lets through interrupts them and its handler runs with that mask, the caller's mask comes back afterwards, a successful `ppoll` leaves a blocked signal pending (`sigpending`), a mask that blocks a signal holds it off until the call returns, `EINVAL` for a wrong mask size |
-| `epolltest` | `epoll_create1`/`epoll_create` flags and sizes, `EPOLL_CTL_ADD`/`MOD`/`DEL` and their errors (`EEXIST`, `ENOENT`, `EPERM` for regular files, `EINVAL`, `EBADF`), level-triggered, edge-triggered and one-shot reporting, `EPOLLOUT` and `EPOLLERR` on a pipe's write end, interests removed with the file's last descriptor (not before), `maxevents` rotating through ready files, eventfds and UDP sockets in a set, nested instances (`ELOOP` for a loop and for chains longer than five, built at either end; wide layers of instances accepted) and `poll` on an instance, wake-up within 1 ms of a write, timeouts, `EINTR` and `epoll_pwait`'s mask, `epoll_pwait2` |
+| `epolltest` | `epoll_create1`/`epoll_create` flags and sizes, `EPOLL_CTL_ADD`/`MOD`/`DEL` and their errors (`EEXIST`, `ENOENT`, `EPERM` for regular files, `EINVAL`, `EBADF`), level-triggered, edge-triggered and one-shot reporting, `EPOLLOUT` and `EPOLLERR` on a pipe's write end, interests removed with the file's last descriptor (not before), `maxevents` rotating through ready files, eventfds and UDP sockets in a set, nested instances (`ELOOP` for a loop and for chains longer than five, built at either end) and `poll` on an instance, wake-up within 1 ms of a write, timeouts, `EINTR` and `epoll_pwait`'s mask, `epoll_pwait2` |
 | `vmtest` | demand paging (a 64 MiB mapping costs nothing until touched), `SIGSEGV` on read-only and `PROT_NONE` pages with contents kept, split areas after a partial `munmap`, NX and the JIT pattern (1 GiB `PROT_NONE` reservation, write code, `mprotect` to executable, call it), commit limit and `MAP_NORESERVE`, `mremap` in place and moving, `MADV_DONTNEED`, shared vs. private memory across `fork`, lazy file mappings and `SIGBUS` beyond the end, `MAP_FIXED_NOREPLACE`, stack growth to 4 MiB and overflow beyond 8 MiB |
 | `smptest` | CPU count and affinity (pinning to every CPU, empty masks), parallel speed-up of CPU-bound processes, `fork`/`exit`/`wait` on every CPU at once, 5000 pipe round trips between two CPUs, signals to a process running on another CPU, timers on time while a program floods the console with palette changes on the same CPU |
 | `nettest` | TCP to an echo service through QEMU, `ECONNREFUSED`, `listen`/`accept` over loopback with a forked client, EOF after the peer closed, non-blocking `accept` and `connect` with `poll` and `SO_ERROR`, `EINTR` in a blocking `recv`, UDP over loopback, raw ICMP echo to the gateway and over loopback, source address for off-subnet destinations, overflowing message vectors, `AF_INET6` rejected |

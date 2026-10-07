@@ -10,7 +10,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <sys/select.h>
+#include <sys/socket.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -81,6 +84,29 @@ static int64_t wake_latency(int how) {
     return ready ? (woke - written) / 1000 : 1000000;
 }
 
+/* The same for a datagram over loopback: readiness that netd announces. */
+static int64_t socket_latency(void) {
+    int rx = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in addr = {.sin_family = AF_INET, .sin_port = htons(47124), .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    bind(rx, (struct sockaddr *)&addr, sizeof addr);
+    pid_t child = fork();
+    if (child == 0) {
+        int tx = socket(AF_INET, SOCK_DGRAM, 0);
+        struct timespec d = {0, 2000000};
+        nanosleep(&d, NULL);
+        int64_t t = now_ns();
+        sendto(tx, &t, sizeof t, 0, (struct sockaddr *)&addr, sizeof addr);
+        _exit(0);
+    }
+    struct pollfd fds[1] = {{rx, POLLIN, 0}};
+    int ready = poll(fds, 1, 5000) == 1 && fds[0].revents == POLLIN;
+    int64_t woke = now_ns(), sent = 0;
+    recv(rx, &sent, sizeof sent, 0);
+    waitpid(child, NULL, 0);
+    close(rx);
+    return ready ? (woke - sent) / 1000 : 1000000;
+}
+
 static int64_t median_latency(int how) {
     int64_t t[9];
     for (int i = 0; i < 9; i++) t[i] = wake_latency(how);
@@ -96,6 +122,12 @@ int main(void) {
     lat = median_latency(SELECT);
     printf("  (select woke %lld us after the write)\n", (long long)lat);
     check("select wakes within 1 ms of a pipe write", lat < 1000);
+
+    int64_t t[9];
+    for (int i = 0; i < 9; i++) t[i] = socket_latency();
+    qsort(t, 9, sizeof t[0], cmp);
+    printf("  (poll woke %lld us after a datagram was sent)\n", (long long)t[4]);
+    check("poll wakes within 1 ms of a datagram", t[4] < 1000);
 
     /* The same with the writer on another CPU. */
     if (cpus >= 2) {
