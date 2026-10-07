@@ -73,7 +73,12 @@ fn de_thread() -> Result<(), i64> {
 pub fn exec(frame: &mut Frame, path: &str, args: &[String], envs: &[String]) -> Result<(), i64> {
     let cwd = with_current(|p| p.cwd());
     let image = load_path(&cwd, path, args, envs)?;
-    let mm = Mm::new(image.space).ok_or(ENOMEM)?;
+    let mut space = image.space;
+    // The new program stays in the process's Linux server instance.
+    if let Some(instance) = with_current(|p| p.mm.as_ref().and_then(|m| m.lock().instance().cloned())) {
+        space.attach(instance).map_err(|_| ENOMEM)?;
+    }
+    let mm = Mm::new(space).ok_or(ENOMEM)?;
     // The point of no return: from here on the old program is gone.
     de_thread()?;
     let me = current();
@@ -99,7 +104,9 @@ pub fn exec(frame: &mut Frame, path: &str, args: &[String], envs: &[String]) -> 
     // A new program gets no inherited hardware access.
     me.group.privileged.store(false, Ordering::Relaxed);
     let (closed, old_mm, old_files) = with_current(|p| {
-        tlb::switch(p.mm.as_ref().map(|m| &*m.tlb), Some(&mm.tlb));
+        // A Linux thread runs this in the server (legacy_syscall).
+        let server = p.linux.as_ref().is_some_and(|l| !l.restricted);
+        tlb::switch(p.mm.as_ref().map(|m| &*m.tlb), Some(&mm.tlb), server);
         let old_mm = p.mm.replace(mm);
         let old_files = match files {
             Some(f) => p.files.replace(f),

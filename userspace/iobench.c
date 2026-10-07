@@ -22,6 +22,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -123,6 +124,22 @@ static void null_syscall(void) {
     }
     per_op("null_syscall", SAMPLES);
     percentiles("null_syscall", t, SAMPLES, "cycles");
+}
+
+/* A system call no kernel knows (1999, ENOSYS): in oxidenix the Linux
+ * server answers it without asking the kernel, so this is the cost of
+ * forwarding a call to the server and back alone (two kernel entries and
+ * two page table switches). */
+static void forwarded_null_syscall(void) {
+    static uint64_t t[SAMPLES];
+    start_counting();
+    for (int i = 0; i < SAMPLES; i++) {
+        uint64_t a = rdtsc();
+        syscall(1999);
+        t[i] = rdtsc() - a;
+    }
+    per_op("forwarded_null_syscall", SAMPLES);
+    percentiles("forwarded_null_syscall", t, SAMPLES, "cycles");
 }
 
 /* fstat of a file on the disk: one IPC round trip to the filesystem
@@ -321,6 +338,7 @@ int main(int argc, char **argv) {
     if (posix_memalign((void **)&buf, 4096, IO_SIZE) != 0) return 1;
     measure_probe();
     null_syscall();
+    forwarded_null_syscall();
     ipc_round_trip();
     block_io();
     tcp_loopback();

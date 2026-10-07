@@ -20,7 +20,8 @@ virtio-net with user networking and the echo service at 10.0.2.100:7.
 
 | name | what |
 |---|---|
-| `null_syscall` | `getppid`, cycles (`rdtsc`), p50/p99 of 20000 |
+| `null_syscall` | `getppid`, cycles (`rdtsc`), p50/p99 of 20000; from phase R1 on forwarded to the Linux server and back to the kernel's implementation |
+| `forwarded_null_syscall` | system call 1999, which the Linux server answers itself (`ENOSYS`): the cost of forwarding alone; cycles, p50/p99 |
 | `fstat_disk` | `fstat` of a file on the disk: one IPC round trip to diskfs with a small request and reply; cycles, p50/p99 |
 | `fstat_tmpfs` | the same in tmpfs (no IPC), for comparison |
 | `seq_write` | 16 MiB in 64 KiB `write`s to a new file, then `fsync`; MB/s |

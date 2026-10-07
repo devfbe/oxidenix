@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -207,6 +208,14 @@ int main(void) {
     check("a hint above 64 TiB maps below it", hinted != MAP_FAILED && (uintptr_t)hinted < limit);
     int local;
     check("the stack lies below 64 TiB", (uintptr_t)&local < limit);
+    /* The Linux server lives there, in this very address space, but only
+     * in its own view: the program cannot read or write it, nor make the
+     * server's own kernel calls. */
+    check("the Linux server's memory is out of reach",
+          faults((volatile char *)limit, 0) && faults((volatile char *)(limit + 0x4000000000 + 0x9000), 1));
+    errno = 0;
+    long r1 = syscall(1010), r2 = syscall(1011);
+    check("the server's kernel calls are ENOSYS for a program", r1 == -1 && r2 == -1 && errno == ENOSYS);
     printf("vmtest: %s\n", failures ? "FAILED" : "all passed");
     return failures;
 }

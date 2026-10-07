@@ -21,6 +21,7 @@ mod sys_time;
 pub mod syscall;
 pub mod task;
 pub mod tlb;
+pub mod linux;
 pub mod uaccess;
 
 use crate::fs::file::OpenFile;
@@ -548,13 +549,24 @@ fn spawn_with(path: &str, image: loader::Image, server: Option<&Arc<Server>>, ar
     info.exe = path.to_string();
     info.mem = Some(image.space.stats.clone());
     let mut own = Process::empty();
-    own.mm = Some(address_space::Mm::new(image.space).ok_or(ENOMEM)?);
+    let mut space = image.space;
+    let mut frame = Frame::user_start(image.entry, image.sp);
+    if server.is_none() {
+        // A new process tree: a new instance of the Linux server, whose
+        // first thread starts in the server (ADR 0002).
+        let instance = linux::Instance::new()?;
+        space.attach(instance.clone()).map_err(|_| ENOMEM)?;
+        let (thread, start) = linux::LinuxThread::new(instance, &frame)?;
+        own.linux = Some(thread);
+        frame = start;
+    }
+    own.mm = Some(address_space::Mm::new(space).ok_or(ENOMEM)?);
     own.files = Some(Files::new(vec![Some(FdEntry { file: console, cloexec: false }); 3]).ok_or(ENOMEM)?);
     own.fs = Some(FsInfo::new("/".to_string()).ok_or(ENOMEM)?);
     own.server = server.cloned();
     let group = ThreadGroup::new(pid, info, Default::default()).ok_or(ENOMEM)?;
     group.privileged.store(server.is_some(), Ordering::Relaxed);
-    let t = new_task(pid, group, name, own, Frame::user_start(image.entry, image.sp))?;
+    let t = new_task(pid, group, name, own, frame)?;
     slot.insert(t.clone())?;
     if server.is_none() {
         crate::drivers::tty::set_foreground(pid);

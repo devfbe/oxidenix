@@ -31,10 +31,12 @@ pub extern "sysv64" fn trap(frame: &mut Frame) {
         _ => {}
     }
     // Every return to user space is a chance to switch tasks and to
-    // deliver pending signals.
+    // deliver pending signals (to a Linux program, not to its server).
     if frame.from_user() {
         crate::process::sched::resched_on_return();
-        signal::deliver(frame, None);
+        if crate::process::linux::mode() != Some(false) {
+            signal::deliver(frame, None);
+        }
     }
 }
 
@@ -78,6 +80,23 @@ fn exception_name(vector: u8) -> &'static str {
 
 fn exception(frame: &mut Frame) {
     let vector = frame.vector as u8;
+    if frame.from_user() && crate::process::linux::mode() == Some(false) {
+        // The Linux server failed: its process cannot go on.
+        crate::printkln!(
+            "[linux] {} in the Linux server (rip {:#x}, address {:#x}, error {:#x}, cr3 {:#x}, rdi {:#x}), process killed",
+            exception_name(vector),
+            frame.rip,
+            if vector == 14 { Cr2::read_raw() } else { 0 },
+            frame.error,
+            x86_64::registers::control::Cr3::read_raw().0.start_address().as_u64(),
+            frame.rdi
+        );
+        if let Some(mm) = crate::process::current_mm() {
+            let (program, normal) = mm.tlb.roots();
+            crate::printkln!("[linux] program view {:#x}, normal view {:#x}", program, normal);
+        }
+        crate::process::exit_group(signal::SIGKILL as i32);
+    }
     let mut sig = exception_signal(vector);
     if vector == 14 {
         use crate::process::address_space::{handle_fault, Access, Fault, USER_END};

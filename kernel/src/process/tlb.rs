@@ -54,8 +54,16 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 /// An address space as the TLB sees it: its top-level table, its unique
 /// id, the generation of its last shootdown and the CPUs that have it
 /// loaded.
+///
+/// A Linux process's address space has a second top-level table, the
+/// normal view (its tables plus the Linux server's shared region, see
+/// `linux`). Both views map the program's memory through the same tables,
+/// so they are one address space here: one generation, one CPU set (a CPU
+/// with either view loaded), and a shootdown flushes whichever is loaded.
+/// Each view has its own PCID slot.
 pub struct Tlb {
     pub l4: PhysFrame,
+    normal: spin::Once<PhysFrame>,
     id: u64,
     generation: AtomicU64,
     cpus: AtomicU64,
@@ -63,11 +71,37 @@ pub struct Tlb {
 
 impl Tlb {
     pub fn new(l4: PhysFrame) -> Tlb {
-        Tlb { l4, id: NEXT_ID.fetch_add(1, Ordering::Relaxed), generation: AtomicU64::new(0), cpus: AtomicU64::new(0) }
+        Tlb {
+            l4,
+            normal: spin::Once::new(),
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            generation: AtomicU64::new(0),
+            cpus: AtomicU64::new(0),
+        }
+    }
+
+    /// Sets the normal view's top-level table (once, before anyone runs in
+    /// the address space).
+    pub fn set_normal(&self, l4: PhysFrame) {
+        self.normal.call_once(|| l4);
+    }
+
+    /// The table of the normal view (`normal`) or of the program's.
+    fn root(&self, normal: bool) -> PhysFrame {
+        match self.normal.get() {
+            Some(&n) if normal => n,
+            _ => self.l4,
+        }
+    }
+
+    /// (program view, normal view) top-level tables, for diagnostics.
+    pub fn roots(&self) -> (u64, u64) {
+        (self.l4.start_address().as_u64(), self.normal.get().map_or(0, |n| n.start_address().as_u64()))
     }
 
     fn active_here(&self) -> bool {
-        Cr3::read().0 == self.l4
+        let cr3 = Cr3::read().0;
+        cr3 == self.l4 || self.normal.get() == Some(&cr3)
     }
 }
 
@@ -149,30 +183,45 @@ fn my_bit() -> u64 {
 }
 
 /// Moves this CPU from address space `from` to `to` (None: the kernel's
-/// own tables). Called with interrupts off.
-pub fn switch(from: Option<&Tlb>, to: Option<&Tlb>) {
+/// own tables), to its normal view if `normal` (and it has one). Called
+/// with interrupts off.
+pub fn switch(from: Option<&Tlb>, to: Option<&Tlb>, normal: bool) {
     if let (Some(a), Some(b)) = (from, to) {
-        if a.l4 == b.l4 {
+        if a.id == b.id {
+            // Threads of one process: only the view may differ.
+            if Cr3::read().0 != b.root(normal) {
+                load(b, normal);
+            }
             return;
         }
     }
-    crate::counters::add(|c| &c.address_space_switches, 1);
     let bit = my_bit();
     match to {
         Some(t) => {
             t.cpus.fetch_or(bit, Ordering::SeqCst);
-            if pcids() {
-                let generation = t.generation.load(Ordering::SeqCst);
-                let (pcid, current) = smp::cpu().asids.assign(t.id, generation);
-                load_cr3(t.l4, pcid, current);
-            } else {
-                load_cr3(t.l4, 0, false);
-            }
+            load(t, normal);
         }
-        None => load_cr3(crate::memory::kernel_l4(), 0, false),
+        None => {
+            crate::counters::add(|c| &c.address_space_switches, 1);
+            load_cr3(crate::memory::kernel_l4(), 0, false)
+        }
     }
     if let Some(f) = from {
         f.cpus.fetch_and(!bit, Ordering::SeqCst);
+    }
+}
+
+/// Loads a view of `t`, which this CPU has joined (`cpus`).
+fn load(t: &Tlb, normal: bool) {
+    crate::counters::add(|c| &c.address_space_switches, 1);
+    let root = t.root(normal);
+    if pcids() {
+        let generation = t.generation.load(Ordering::SeqCst);
+        let view = if root == t.l4 { 0 } else { 1 };
+        let (pcid, current) = smp::cpu().asids.assign(t.id * 2 + view, generation);
+        load_cr3(root, pcid, current);
+    } else {
+        load_cr3(root, 0, false);
     }
 }
 
@@ -201,6 +250,8 @@ fn flush_local(start: u64, end: u64) {
 /// that still have to flush.
 struct Request {
     l4: AtomicU64,
+    /// The normal view's table, if the address space has one (else 0).
+    normal: AtomicU64,
     /// `Tlb::id` of the address space (0 for kernel mappings).
     id: AtomicU64,
     start: AtomicU64,
@@ -209,7 +260,7 @@ struct Request {
 }
 
 static REQUEST: Request =
-    Request { l4: AtomicU64::new(0), id: AtomicU64::new(0), start: AtomicU64::new(0), end: AtomicU64::new(0), pending: AtomicU64::new(0) };
+    Request { l4: AtomicU64::new(0), normal: AtomicU64::new(0), id: AtomicU64::new(0), start: AtomicU64::new(0), end: AtomicU64::new(0), pending: AtomicU64::new(0) };
 static SHOOTER: spin::Mutex<()> = spin::Mutex::new(());
 
 /// `Request::l4` of a flush of kernel mappings, which every CPU does.
@@ -227,7 +278,8 @@ fn serve_here() {
         return;
     }
     let l4 = REQUEST.l4.load(Ordering::Relaxed);
-    if l4 == KERNEL || Cr3::read().0.start_address().as_u64() == l4 {
+    let cr3 = Cr3::read().0.start_address().as_u64();
+    if l4 == KERNEL || cr3 == l4 || cr3 == REQUEST.normal.load(Ordering::Relaxed) {
         flush_local(REQUEST.start.load(Ordering::Relaxed), REQUEST.end.load(Ordering::Relaxed));
     }
     // Kernel mappings are cached under every PCID.
@@ -258,7 +310,8 @@ pub fn shootdown(space: &Tlb, start: u64, end: u64) {
     // or it reads the new generation after it joined.
     fence(Ordering::SeqCst);
     let others = space.cpus.load(Ordering::SeqCst) & !my_bit();
-    request(space.l4.start_address().as_u64(), space.id, others, start, end);
+    let normal = space.normal.get().map_or(0, |n| n.start_address().as_u64());
+    request(space.l4.start_address().as_u64(), normal, space.id, others, start, end);
 }
 
 /// Drops the entries for [start, end) of the kernel's own mappings (shared
@@ -269,12 +322,12 @@ pub fn shootdown_kernel(start: u64, end: u64) {
     x86_64::instructions::interrupts::without_interrupts(|| smp::cpu().asids.invalidate(None));
     fence(Ordering::SeqCst);
     let all = (0..smp::MAX_CPUS).filter(|&i| smp::by_index(i).is_some()).fold(0u64, |m, i| m | 1 << i);
-    request(KERNEL, KERNEL, all & !my_bit(), start, end);
+    request(KERNEL, KERNEL, KERNEL, all & !my_bit(), start, end);
 }
 
 /// Has the CPUs in `targets` flush [start, end) of `l4` (address space
 /// `id`) and waits for them.
-fn request(l4: u64, id: u64, targets: u64, start: u64, end: u64) {
+fn request(l4: u64, normal: u64, id: u64, targets: u64, start: u64, end: u64) {
     let others = targets;
     if others == 0 {
         return;
@@ -287,6 +340,7 @@ fn request(l4: u64, id: u64, targets: u64, start: u64, end: u64) {
         core::hint::spin_loop();
     };
     REQUEST.l4.store(l4, Ordering::Relaxed);
+    REQUEST.normal.store(normal, Ordering::Relaxed);
     REQUEST.id.store(id, Ordering::Relaxed);
     REQUEST.start.store(start, Ordering::Relaxed);
     REQUEST.end.store(end, Ordering::Relaxed);

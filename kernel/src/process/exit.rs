@@ -74,7 +74,7 @@ pub fn exit_thread(status: i32) -> ! {
     drop(server);
     interrupts::disable();
     let mm = unsafe { me.own() }.mm.take();
-    tlb::switch(mm.as_ref().map(|m| &*m.tlb), None);
+    tlb::switch(mm.as_ref().map(|m| &*m.tlb), None, false);
     drop(mm);
     unsafe { me.own() }.io_bitmap = None;
 

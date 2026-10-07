@@ -610,7 +610,9 @@ fn context_switch(next: Arc<Task>) {
         // user address space loaded only while it runs one of its tasks.
         // Threads of one process switch without reloading CR3.
         let from = prev.own().mm.as_ref().map(|m| &*m.tlb);
-        super::tlb::switch(from, n.mm.as_ref().map(|m| &*m.tlb));
+        // A Linux thread in its server sees the normal view.
+        let server = n.linux.as_ref().is_some_and(|l| !l.restricted);
+        super::tlb::switch(from, n.mm.as_ref().map(|m| &*m.tlb), server);
         if let Some(top) = next.kstack_top() {
             cpu.set_kernel_stack(top);
         }

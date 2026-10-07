@@ -209,6 +209,7 @@ oxidenix/
 │       ├── timer.rs             per-CPU timer queues on the local APIC timer
 │       └── shell/               built-in kernel monitor (fallback shell)
 ├── servers/
+│   ├── linux/                   the Linux server (restricted mode; phase R1: pass-through)
 │   ├── diskfs/                  user-space ext2 server with its virtio-blk driver (blk.rs)
 │   ├── procfs/                  /proc and /sys from the kernel's process information
 │   │                            (main.rs: tree and inodes, render.rs: Linux formats)
@@ -220,6 +221,7 @@ oxidenix/
 │   ├── netproto/                socket operations between the kernel and netd
 │   ├── procproto/               native process and system information for procfs
 │   ├── virtio/                  virtio legacy PCI transport and virtqueues (diskfs, netd)
+│   ├── restricted/              restricted mode: shared region layout, register page, kernel calls
 │   └── oxrt/                    runtime for servers: entry, syscalls, heap, port I/O
 ├── builder/                     host tool: rootfs + cpio + boot image + ext2 data disk + QEMU
 └── userspace/                   C test programs, build script, rootfs and data disk templates
@@ -503,6 +505,33 @@ call into a device:
 - The dispatch table maps Linux x86_64 syscall numbers to Rust functions returning
   `Result<i64, errno>`.
 
+### Restricted mode and the Linux server
+
+The kernel is moving its Linux implementation out into a user-space **Linux server**
+(`servers/linux`; `docs/design/linux-server.md`, ADRs 0001-0004 in `docs/decisions/`). Phase
+R1 is in place: the mechanism, with every system call passed through.
+
+- Each process tree started by the kernel (`/init`, the monitor's `run`) gets an **instance**
+  of the server: the server's program and, per thread, a stack and the page with the program's
+  registers, in a **shared region** at 64 TiB (PML4 slot 128) that every process of the tree
+  shares (`process/linux.rs`). A Linux process's address space has two top-level tables over
+  the same lower tables: the program's view (slots 0-127) and the **normal view**, which adds
+  the shared region. Programs never see the server's memory.
+- A thread starts in the server, which calls `restricted_enter` (1010): the kernel keeps the
+  server's registers, loads the program's from the thread's register page and switches to the
+  program's view. The program's `syscall` traps back: its registers go to the register page,
+  the server's return with the reason, and the normal view is loaded. Both switches keep the
+  TLB (PCIDs); the server uses neither the FPU nor the FS/GS bases, so only general registers
+  move.
+- In phase R1 the server hands every Linux system call back with `legacy_syscall` (1011), which
+  runs the kernel's implementation on the registers in the register page (signal frames and
+  `execve` included). Numbers of 1000 and above are not Linux's: the server answers them with
+  `ENOSYS` itself. Faults and exceptions of the program are still the kernel's; an exception in
+  the server kills its process with a diagnostic.
+- `fork` and `clone` give the new thread its own server thread in the same instance; `execve`
+  keeps the process in its instance. Servers such as diskfs are not Linux programs and keep the
+  kernel's interface.
+
 ### Signals
 
 - Per process: 64 actions, the pending set of signals sent to the process, and the interval
@@ -748,6 +777,7 @@ Linux x86_64 numbers, grouped by area (about 120 in total):
 | Signals | `rt_sigaction` `rt_sigprocmask` `rt_sigreturn` `rt_sigsuspend` `rt_sigpending` `kill` `tkill` `tgkill` `pause` `sigaltstack` `alarm` `setitimer` `getitimer` (`ITIMER_REAL`) `rt_sigtimedwait` |
 | Process control | `prctl` (name, parent-death signal, dumpable, no-new-privs, capability bounding set) `capget` `capset` (everything runs as root with every capability) |
 | Filesystems | `statfs` `fstatfs` `sync` `fsync` `fdatasync` |
+| Linux server (normal mode only) | `restricted_enter` (1010), `legacy_syscall` (1011) |
 | Servers | `ioperm` (privileged servers only), `ipc_register` (1000), `ipc_receive` (1001, with timeout and interrupt notifications), `ipc_reply` (1002), `irq_enable` (1003), `dma_map` (1004), `proc_query` (1005), `ipc_notify` (1006) |
 | System information | `sysinfo` `uname` (reports `oxidenix`, not Linux) |
 | Power | `reboot` (power off ends QEMU, restart resets the machine) |
@@ -782,7 +812,7 @@ Each of these programs and scripts lives in the root filesystem and runs inside 
 | `eventfdtest` | `eventfd` counting (initial value, adding writes, reset on read), `EFD_SEMAPHORE`, `EFD_NONBLOCK` and `EFD_CLOEXEC`, `EINVAL` for short reads, 2^64-1 and unknown flags, a full counter (`EAGAIN`, poll state), a blocking read woken by another process, `poll` waking within 1 ms of a write |
 | `sigmasktest` | temporary signal masks of `sigsuspend`, `ppoll` and `pselect`: a pending or arriving signal the mask lets through interrupts them and its handler runs with that mask, the caller's mask comes back afterwards, a successful `ppoll` leaves a blocked signal pending (`sigpending`), a mask that blocks a signal holds it off until the call returns, `EINVAL` for a wrong mask size |
 | `epolltest` | `epoll_create1`/`epoll_create` flags and sizes, `EPOLL_CTL_ADD`/`MOD`/`DEL` and their errors (`EEXIST`, `ENOENT`, `EPERM` for regular files, `EINVAL`, `EBADF`), level-triggered, edge-triggered and one-shot reporting, `EPOLLOUT` and `EPOLLERR` on a pipe's write end, interests removed with the file's last descriptor (not before), `maxevents` rotating through ready files, eventfds and UDP sockets in a set, nested instances (`ELOOP` for a loop and for chains longer than five, built at either end) and `poll` on an instance, wake-up within 1 ms of a write, timeouts, `EINTR` and `epoll_pwait`'s mask, `epoll_pwait2` |
-| `vmtest` | demand paging (a 64 MiB mapping costs nothing until touched), `SIGSEGV` on read-only and `PROT_NONE` pages with contents kept, split areas after a partial `munmap`, NX and the JIT pattern (1 GiB `PROT_NONE` reservation, write code, `mprotect` to executable, call it), commit limit and `MAP_NORESERVE`, `mremap` in place and moving, `MADV_DONTNEED`, shared vs. private memory across `fork`, lazy file mappings and `SIGBUS` beyond the end, `MAP_FIXED_NOREPLACE`, stack growth to 4 MiB and overflow beyond 8 MiB, nothing mapped at or above 64 TiB (fixed mappings fail, hints and the stack stay below) |
+| `vmtest` | demand paging (a 64 MiB mapping costs nothing until touched), `SIGSEGV` on read-only and `PROT_NONE` pages with contents kept, split areas after a partial `munmap`, NX and the JIT pattern (1 GiB `PROT_NONE` reservation, write code, `mprotect` to executable, call it), commit limit and `MAP_NORESERVE`, `mremap` in place and moving, `MADV_DONTNEED`, shared vs. private memory across `fork`, lazy file mappings and `SIGBUS` beyond the end, `MAP_FIXED_NOREPLACE`, stack growth to 4 MiB and overflow beyond 8 MiB, nothing mapped at or above 64 TiB (fixed mappings fail, hints and the stack stay below), the Linux server's memory out of the program's reach and its kernel calls `ENOSYS` for a program |
 | `smptest` | CPU count and affinity (pinning to every CPU, empty masks), parallel speed-up of CPU-bound processes, `fork`/`exit`/`wait` on every CPU at once, 5000 pipe round trips between two CPUs, signals to a process running on another CPU, timers on time while a program floods the console with palette changes on the same CPU |
 | `nettest` | TCP to an echo service through QEMU, `ECONNREFUSED`, `listen`/`accept` over loopback with a forked client, EOF after the peer closed, non-blocking `accept` and `connect` with `poll` and `SO_ERROR`, `EINTR` in a blocking `recv`, UDP over loopback, raw ICMP echo to the gateway and over loopback, source address for off-subnet destinations, overflowing message vectors, `AF_INET6` rejected |
 | `mmaptest` | shared file mappings: stores visible to `read` and `write` visible in the mapping at once, another process's own mapping of the file, the size unchanged by stores; private mappings seeing `write` until they write a page, and never reaching the file; mappings outliving `close` and `unlink`; the zero tail of the last page and `SIGBUS` beyond it; growing and shrinking with `ftruncate` (`SIGBUS` in shared pages and private copies beyond the new end, zeros after growing again); `EACCES` for writable sharing of a read-only descriptor (also via `mprotect`); shared anonymous memory across 8 children; mapping initramfs files |

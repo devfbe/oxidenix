@@ -61,6 +61,8 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // Only now: the timer interrupt needs the scheduler.
     x86_64::instructions::interrupts::enable();
     start_servers();
+    // Linux programs run with the Linux server (restricted mode).
+    process::linux::init();
     shell::run();
 }
 

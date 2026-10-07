@@ -298,6 +298,8 @@ pub struct Process {
     pub clear_child_tid: u64,
     /// A vfork parent sleeps until this is set: the child exec'd or exited.
     pub vfork_done: Option<Arc<AtomicBool>>,
+    /// A thread of a Linux program: its place in restricted mode.
+    pub linux: Option<super::linux::LinuxThread>,
 }
 
 pub struct Task {
@@ -502,6 +504,7 @@ impl Process {
             server: None,
             clear_child_tid: 0,
             vfork_done: None,
+            linux: None,
         }
     }
 }

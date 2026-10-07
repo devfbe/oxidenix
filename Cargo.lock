@@ -349,6 +349,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "linux"
+version = "0.1.0"
+dependencies = [
+ "restricted",
+]
+
+[[package]]
 name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -464,6 +471,7 @@ dependencies = [
  "pic8259",
  "png",
  "procproto",
+ "restricted",
  "spin",
  "x86_64 0.15.5",
 ]
@@ -551,6 +559,10 @@ name = "radium"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc33ff2d4973d518d823d61aa239014831e521c75da58e3df4840d3f47749d09"
+
+[[package]]
+name = "restricted"
+version = "0.1.0"
 
 [[package]]
 name = "rustix"

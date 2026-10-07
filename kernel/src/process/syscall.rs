@@ -152,6 +152,43 @@ pub unsafe extern "C" fn user_return() {
 
 extern "sysv64" fn dispatch(f: &mut Frame) {
     crate::counters::add(|c| &c.syscalls, 1);
+    match super::linux::mode() {
+        // A Linux program's system call goes to its server.
+        Some(true) => {
+            super::linux::trap(f, restricted::REASON_SYSCALL);
+            super::sched::resched_on_return();
+        }
+        // The server's own calls.
+        Some(false) => {
+            let result = match f.rax {
+                restricted::SYS_RESTRICTED_ENTER => super::linux::enter(f).map(|_| None),
+                restricted::SYS_LEGACY_SYSCALL => super::linux::legacy().map(|_| Some(0)),
+                _ => Err(ENOSYS),
+            };
+            match result {
+                // restricted_enter: `f` is the program's now.
+                Ok(None) => {
+                    super::sched::resched_on_return();
+                    signal::deliver(f, None);
+                }
+                Ok(Some(v)) => {
+                    f.rax = v;
+                    super::sched::resched_on_return();
+                }
+                Err(e) => {
+                    f.rax = (-e) as u64;
+                    super::sched::resched_on_return();
+                }
+            }
+        }
+        None => dispatch_linux(f),
+    }
+}
+
+/// The kernel's implementation of Linux's system calls, on the registers in
+/// `f` (a program's own, or those its Linux server hands back, see
+/// `linux::legacy`).
+pub(super) fn dispatch_linux(f: &mut Frame) {
     let nr = f.rax;
     let (a0, a1, a2, a3, a4, a5) = (f.rdi, f.rsi, f.rdx, f.r10, f.r8, f.r9);
     let cwd = AT_FDCWD as u64;

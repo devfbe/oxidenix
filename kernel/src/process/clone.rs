@@ -147,6 +147,17 @@ pub fn clone(frame: &Frame, flags: u64, stack: u64, parent_tid: u64, child_tid: 
     if stack != 0 {
         child_frame.rsp = stack;
     }
+    // A thread of a Linux program starts in its own server thread, which
+    // enters the program with the frame above.
+    let instance = mm.lock().instance().cloned();
+    let linux = match instance {
+        Some(instance) => {
+            let (thread, start) = super::linux::LinuxThread::new(instance, &child_frame)?;
+            child_frame = start;
+            Some(thread)
+        }
+        None => None,
+    };
     let own = Process {
         mm: Some(mm),
         files: Some(files),
@@ -155,6 +166,7 @@ pub fn clone(frame: &Frame, flags: u64, stack: u64, parent_tid: u64, child_tid: 
         server: None,
         clear_child_tid: if flags & CLONE_CHILD_CLEARTID != 0 { child_tid } else { 0 },
         vfork_done: vfork_done.clone(),
+        linux,
     };
     let comm = me.comm.lock().clone();
     let child = new_task(tid, group, comm, own, child_frame)?;

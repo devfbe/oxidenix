@@ -234,6 +234,11 @@ pub struct Access {
 /// (kernel) half is shared with the kernel address space.
 pub struct AddressSpace {
     l4: PhysFrame,
+    /// A Linux process's normal view (`linux`): a second top-level table
+    /// with this one's program slots (0-127, kept equal) and the Linux
+    /// server instance's shared region (slot 128).
+    normal: Option<PhysFrame>,
+    instance: Option<Arc<super::linux::Instance>>,
     pub tlb: Arc<Tlb>,
     pub stats: Arc<MemStats>,
     /// Areas by start address; they never overlap.
@@ -336,7 +341,53 @@ impl AddressSpace {
             memory::with_frames(|f| unsafe { f.deallocate_frame(l4) });
             return None;
         };
-        Some(AddressSpace { l4, tlb, stats, vmas: BTreeMap::new(), brk_start: 0, brk_end: 0, owner: Weak::new(), exe: None })
+        Some(AddressSpace {
+            l4,
+            normal: None,
+            instance: None,
+            tlb,
+            stats,
+            vmas: BTreeMap::new(),
+            brk_start: 0,
+            brk_end: 0,
+            owner: Weak::new(),
+            exe: None,
+        })
+    }
+
+    /// Makes this the address space of a Linux process served by
+    /// `instance`: adds the normal view. Before anyone runs in it.
+    pub fn attach(&mut self, instance: Arc<super::linux::Instance>) -> Result<(), Fault> {
+        let normal = memory::with_frames(|f| UserFrames(f).allocate_frame()).ok_or(Fault::Oom)?;
+        let (table, mine) = (table_at(normal), table_at(self.l4));
+        for i in 0..512 {
+            table[i] = mine[i].clone();
+        }
+        table[super::linux::SHARED_SLOT].set_frame(instance.pdpt(), super::linux::table_flags());
+        self.normal = Some(normal);
+        self.tlb.set_normal(normal);
+        self.instance = Some(instance);
+        Ok(())
+    }
+
+    /// The Linux server instance serving this address space, if any.
+    pub fn instance(&self) -> Option<&Arc<super::linux::Instance>> {
+        self.instance.as_ref()
+    }
+
+    /// Copies the program's top-level entries into the normal view; a new
+    /// one appears when a mapping needs a new third-level table. Entries
+    /// never go away before the address space does.
+    fn sync_views(&self, range: core::ops::Range<u64>) {
+        let Some(normal) = self.normal else { return };
+        let (table, mine) = (table_at(normal), table_at(self.l4));
+        let first = (range.start >> 39) as usize & 511;
+        let last = (range.end.saturating_sub(1) >> 39) as usize & 511;
+        for i in first..=last.min(super::linux::SHARED_SLOT - 1) {
+            if table[i].is_unused() && !mine[i].is_unused() {
+                table[i] = mine[i].clone();
+            }
+        }
     }
 
     fn mapper(&self) -> OffsetPageTable<'static> {
@@ -635,6 +686,7 @@ impl AddressSpace {
                 let _ = unsafe { mapper.map_to_with_table_flags(page, frame, flags, parent, &mut user) }.map(|f| f.ignore());
             });
         });
+        self.sync_views(to..to + len);
         tlb::shootdown(&self.tlb, from, from + len);
     }
 
@@ -740,6 +792,7 @@ impl AddressSpace {
         if !mapped {
             return Err(Fault::Oom);
         }
+        self.sync_views(page..page + PAGE);
         // The entry was not present before, so no TLB holds it.
         self.stats.add_resident(1);
         Ok(())
@@ -1018,6 +1071,9 @@ impl AddressSpace {
         new.brk_start = self.brk_start;
         new.brk_end = self.brk_end;
         new.exe = self.exe.clone();
+        if let Some(instance) = &self.instance {
+            new.attach(instance.clone())?;
+        }
         // (The child registers with the file caches when it gets its Mm.)
         result.map(|_| new)
     }
@@ -1033,6 +1089,11 @@ impl Drop for AddressSpace {
         let vmas = core::mem::take(&mut self.vmas);
         memory::with_frames(|frames| unsafe {
             free_level(frames, self.l4, 4);
+            // The normal view's lower tables are the program's (freed
+            // above) and the instance's (freed with it).
+            if let Some(normal) = self.normal {
+                frames.deallocate_frame(normal);
+            }
         });
         drop(vmas);
     }
@@ -1045,7 +1106,7 @@ fn zeroed_frame() -> Result<PhysFrame, Fault> {
 }
 
 /// Recursively frees all lower-half frames, including the table itself.
-unsafe fn free_level(frames: &mut memory::frame::PhysFrameAllocator, table_frame: PhysFrame, level: u8) {
+pub(super) unsafe fn free_level(frames: &mut memory::frame::PhysFrameAllocator, table_frame: PhysFrame, level: u8) {
     let table = table_at(table_frame);
     let entries = if level == 4 { 0..256 } else { 0..512 };
     for i in entries {
