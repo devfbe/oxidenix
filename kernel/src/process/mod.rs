@@ -107,6 +107,7 @@ pub fn current_files() -> Result<Arc<Files>, i64> {
 /// CPU; each CPU also has an idle task.
 pub fn init() {
     enable_sse();
+    tlb::init_cpu(true);
     syscall::init();
     let group = ThreadGroup::new(0, Info::new(0, 0, 0, "kernel".to_string()), Default::default()).expect("boot");
     let mut own = Process::empty();

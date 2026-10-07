@@ -335,6 +335,11 @@ About 9,200 lines of Rust (without comments and blank lines) in the kernel and 3
   runs at a time, and a CPU waiting with interrupts off serves requests addressed to it itself,
   so shooters never deadlock. Unmapping walks only the page tables that exist, so huge sparse
   reservations cost what is mapped in them.
+- **PCIDs**: with CPUs that have them (QEMU runs with `-cpu max`), a switch between address
+  spaces keeps the TLB: each CPU tags its last six address spaces with process-context ids.
+  Address spaces are known by a unique id (never by their page table's frame, which can be
+  reused), and every shootdown advances the address space's generation, so a CPU that held its
+  entries without having it loaded flushes them when it loads it again.
 - **futex** (`futex.rs`): a futex is keyed by the address space and address, or, in shared
   memory, by the file's page cache and offset, so processes meet whatever address they mapped
   it at.

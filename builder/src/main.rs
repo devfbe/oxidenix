@@ -113,6 +113,10 @@ fn main() {
             // q35 (ICH9) rather than the default i440fx: it can have an IOMMU.
             "-machine",
             "q35",
+            // The host's CPU features under KVM (PCIDs among them), all that
+            // QEMU emulates otherwise.
+            "-cpu",
+            "max",
             "-device",
             "isa-debug-exit,iobase=0xf4,iosize=0x04",
             "-m",

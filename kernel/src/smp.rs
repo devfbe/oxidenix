@@ -32,6 +32,8 @@ pub struct Cpu {
     pub timers: crate::timer::CpuTimers,
     /// Hot-path event counters (see `counters`).
     pub counters: crate::counters::PerCpu,
+    /// Address spaces tagged in this CPU's TLB (see `tlb`).
+    pub asids: crate::process::tlb::AsidCache,
 }
 
 /// Offsets for the assembly entry code.
@@ -55,6 +57,7 @@ impl Cpu {
             tsc_offset: AtomicI64::new(0),
             timers: crate::sync::IrqSpinLock::new(crate::timer::Queue::new()),
             counters: crate::counters::PerCpu::new(),
+            asids: crate::process::tlb::AsidCache::new(),
         }
     }
 
@@ -353,6 +356,7 @@ extern "C" fn ap_entry(block: *mut Cpu) -> ! {
     crate::time::sync_ap(cpu());
     crate::interrupts::init_ap();
     crate::process::enable_sse();
+    crate::process::tlb::init_cpu(false);
     crate::process::syscall::init();
     crate::interrupts::apic::init_local();
     set_apic_id(crate::interrupts::apic::id());
