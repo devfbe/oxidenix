@@ -6,7 +6,7 @@ use super::address_space::{AddressSpace, Backing, Fault, Prot, PAGE, USER_END};
 use super::elf::{Elf, ProgramHeader, PF_W, PF_X, PT_LOAD, PT_PHDR};
 use super::errno::*;
 use crate::fs::cache::PageCache;
-use crate::fs::{DenyWrite, Inode};
+use crate::fs::{DenyWrite, Inode, MappedFile};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
@@ -36,6 +36,7 @@ fn page_down(x: u64) -> u64 {
 /// The program in `cache`. `file` is kept alive by the mappings; `exe`
 /// keeps it from being written while the program runs.
 pub fn load(cache: &Arc<PageCache>, file: Option<Arc<Inode>>, exe: Option<DenyWrite>, args: &[String], envs: &[String]) -> Result<Image, i64> {
+    let file = file.map(|inode| MappedFile::new(inode, false)).transpose()?;
     let size = cache.size();
     let mut head = vec![0u8; size.min(64) as usize];
     cache.read(0, &mut head)?;
@@ -96,7 +97,7 @@ fn fault_errno(f: Fault) -> i64 {
 /// Maps a loadable segment: its file part from the page cache (private,
 /// copy-on-write), the rest of its last file page cleared, and zeroed
 /// anonymous memory up to its memory size (bss).
-fn map_segment(space: &mut AddressSpace, cache: &Arc<PageCache>, file: &Option<Arc<Inode>>, ph: &ProgramHeader, size: u64) -> Result<(), i64> {
+fn map_segment(space: &mut AddressSpace, cache: &Arc<PageCache>, file: &Option<Arc<MappedFile>>, ph: &ProgramHeader, size: u64) -> Result<(), i64> {
     let file_end = ph.offset.checked_add(ph.filesz).filter(|&e| e <= size).ok_or(ENOEXEC)?;
     let mem_end = ph.vaddr.checked_add(ph.memsz).filter(|&e| e <= USER_END).ok_or(ENOEXEC)?;
     // A page maps one file page: offsets and addresses must agree in it.

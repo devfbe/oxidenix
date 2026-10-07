@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/sysinfo.h>
 #include <sys/wait.h>
@@ -108,6 +109,19 @@ int main(int argc, char **argv) {
     check("running a program open for writing fails with ETXTBSY", run("/tmp/bb", t) == 100 + ETXTBSY);
     close(w);
     check("after close it runs again", run("/tmp/bb", t) == 0);
+
+    /* A writable shared mapping keeps the right to write after close. */
+    w = open("/tmp/bb", O_RDWR);
+    char *map = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, w, 0);
+    close(w);
+    check("running a program mapped shared and writable fails (ETXTBSY)", map != MAP_FAILED && run("/tmp/bb", t) == 100 + ETXTBSY);
+    munmap(map, 4096);
+    check("after munmap it runs again", run("/tmp/bb", t) == 0);
+    w = open("/tmp/bb", O_RDONLY);
+    map = mmap(NULL, 4096, PROT_READ, MAP_SHARED, w, 0);
+    close(w);
+    check("... and a read-only shared mapping does not stop it", run("/tmp/bb", t) == 0);
+    munmap(map, 4096);
 
     /* Replace the program's contents: the next run sees the new file. */
     check("overwriting it with another program", copy_file(hello, "/tmp/bb") == 0);

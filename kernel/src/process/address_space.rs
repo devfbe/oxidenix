@@ -28,7 +28,7 @@
 
 use super::tlb::{self, Tlb};
 use crate::fs::cache::PageCache;
-use crate::fs::Inode;
+use crate::fs::MappedFile;
 use crate::memory;
 use crate::memory::frame::UserFrames;
 use crate::sync::{Mutex, MutexGuard};
@@ -113,10 +113,11 @@ pub enum Backing {
     Anon,
     /// Pages of a file's page cache; `offset` is the file offset of
     /// `start`. Shared: stores reach the file; private: copy-on-write.
-    /// `_file` keeps the file alive while it is mapped (None for anonymous
-    /// shared memory); `may_write`: the file was opened for writing, so a
-    /// shared mapping may become writable.
-    File { cache: Arc<PageCache>, offset: u64, shared: bool, may_write: bool, _file: Option<Arc<Inode>> },
+    /// `_file` keeps the file (and the write access of the descriptor it
+    /// was mapped through) while it is mapped (None for anonymous shared
+    /// memory); `may_write`: the file was opened for writing, so a shared
+    /// mapping may become writable.
+    File { cache: Arc<PageCache>, offset: u64, shared: bool, may_write: bool, _file: Option<Arc<MappedFile>> },
     /// Device memory, mapped up front (DMA areas).
     Device,
 }

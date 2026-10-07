@@ -119,6 +119,22 @@ impl Drop for WriteAccess {
     }
 }
 
+/// What a mapping of a file holds: the file (alive while mapped, even
+/// deleted) and, if it was mapped through a descriptor open for writing,
+/// the right to write it, as that descriptor did (so it cannot run as a
+/// program while a mapping may still change it).
+pub struct MappedFile {
+    _inode: Arc<Inode>,
+    _write: Option<WriteAccess>,
+}
+
+impl MappedFile {
+    pub fn new(inode: Arc<Inode>, writable: bool) -> Result<Arc<MappedFile>, i64> {
+        let write = if writable { Some(inode.get_write_access()?) } else { None };
+        Arc::try_new(MappedFile { _inode: inode, _write: write }).map_err(|_| ENOMEM)
+    }
+}
+
 /// Held while a file runs as a program: nobody may write it meanwhile.
 pub struct DenyWrite(Arc<Inode>);
 

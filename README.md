@@ -284,7 +284,9 @@ About 9,200 lines of Rust (without comments and blank lines) in the kernel and 3
   pages are read on first use and every process running a program shares the ones it does not
   write: eight `busybox sleep` take 0.9 MB instead of 10.6 MB. Since the running program's pages
   are the file's pages, a program cannot be opened for writing (or truncated) while it runs, nor
-  run while it is open for writing (`ETXTBSY`), as on Linux. Servers run from a private copy
+  run while it is open for writing (`ETXTBSY`), as on Linux. A mapping made through a descriptor
+  open for writing keeps that right after the descriptor is closed, as on Linux, so a program
+  cannot be changed through a shared mapping while it runs. Servers run from a private copy
   taken at boot, and a program on a filesystem server runs from a copy until such files have a
   page cache too.
 - **Protection**: `mprotect` really changes the rights (including `PROT_NONE`, which keeps the
@@ -730,7 +732,7 @@ Each of these programs and scripts lives in the root filesystem and runs inside 
 | `smptest` | CPU count and affinity (pinning to every CPU, empty masks), parallel speed-up of CPU-bound processes, `fork`/`exit`/`wait` on every CPU at once, 5000 pipe round trips between two CPUs, signals to a process running on another CPU, timers on time while a program floods the console with palette changes on the same CPU |
 | `nettest` | TCP to an echo service through QEMU, `ECONNREFUSED`, `listen`/`accept` over loopback with a forked client, EOF after the peer closed, non-blocking `accept` and `connect` with `poll` and `SO_ERROR`, `EINTR` in a blocking `recv`, UDP over loopback, raw ICMP echo to the gateway and over loopback, source address for off-subnet destinations, overflowing message vectors, `AF_INET6` rejected |
 | `mmaptest` | shared file mappings: stores visible to `read` and `write` visible in the mapping at once, another process's own mapping of the file, the size unchanged by stores; private mappings seeing `write` until they write a page, and never reaching the file; mappings outliving `close` and `unlink`; the zero tail of the last page and `SIGBUS` beyond it; growing and shrinking with `ftruncate` (`SIGBUS` in shared pages and private copies beyond the new end, zeros after growing again); `EACCES` for writable sharing of a read-only descriptor (also via `mprotect`); shared anonymous memory across 8 children; mapping initramfs files |
-| `exectest` | eight runs of one program sharing its pages (less memory than one copy), data and bss of the loaded program, `ETXTBSY` for opening or truncating a running program and for running a program open for writing, a changed program file taking effect on the next run, a running program surviving the deletion of its file |
+| `exectest` | eight runs of one program sharing its pages (less memory than one copy), data and bss of the loaded program, `ETXTBSY` for opening or truncating a running program and for running a program open for writing or mapped through a writable descriptor (not after `munmap`, not for a read-only mapping), a changed program file taking effect on the next run, a running program surviving the deletion of its file |
 | `sh /etc/test.sh` | files, pipes, `cd`, `mkdir`/`touch`/`rm`, rename cycles via symlinks, the tmpfs size limit |
 | `fstest` | descriptor access modes (`EBADF` on read-only/write-only fds), `O_NOFOLLOW` on symlinks, unlinked-but-open files (kept until closed, never shared with new files), ext2 size limits, overflowing `mmap` offsets |
 | `sh /etc/disktest.sh` | ext2: 150-file directory, 1.5 MiB file (double indirect), append, truncate, rename, cycles, symlinks, `rm -r`, space accounting |

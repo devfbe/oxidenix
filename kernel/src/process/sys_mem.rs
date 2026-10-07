@@ -97,7 +97,8 @@ pub fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64) ->
             Some(_) => return Err(ENODEV),
             None => {
                 let cache = inode.cache().map_err(|_| ENODEV)?;
-                Backing::File { cache, offset, shared, may_write: f.writable(), _file: Some(inode) }
+                let file = crate::fs::MappedFile::new(inode, f.writable())?;
+                Backing::File { cache, offset, shared, may_write: f.writable(), _file: Some(file) }
             }
         }
     };
