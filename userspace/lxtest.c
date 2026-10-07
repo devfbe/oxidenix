@@ -5,6 +5,7 @@
  * checks the effect from the program's side. */
 #define _GNU_SOURCE
 #include <errno.h>
+#include <pthread.h>
 #include <setjmp.h>
 #include <signal.h>
 #include <stdint.h>
@@ -24,6 +25,8 @@
 #define TEST_SUPPLIED 1506
 #define TEST_PAGED_STUCK 1507
 #define TEST_PAGED_FAIL 1508
+#define TEST_ALLOC 1509
+#define TEST_LOCKED_ADD 1510
 
 static int failures;
 
@@ -47,6 +50,12 @@ static int faults(volatile char *p, int write) {
         else (void)*p;
     }
     return got == SIGSEGV;
+}
+
+static void *adder(void *arg) {
+    (void)arg;
+    syscall(TEST_LOCKED_ADD, 2000);
+    return NULL;
 }
 
 int main(void) {
@@ -112,6 +121,19 @@ int main(void) {
     alarm(0);
     check("a page the pager fails raises SIGBUS", WIFSIGNALED(st) && WTERMSIG(st) == SIGBUS);
     check("... and a later access asks again and gets it", memcmp(fl, "retry", 5) == 0);
+    /* The server's runtime: its heap, and its mutex across the threads of
+     * the tree's processes (they all run the same server instance). */
+    check("the server's heap: 2000 blocks of many sizes keep their contents", syscall(TEST_ALLOC, 2000) == 0);
+    long start = syscall(TEST_LOCKED_ADD, 0);
+    pid_t kid = fork();
+    pthread_t th[3];
+    for (int i = 0; i < 3; i++) pthread_create(&th[i], NULL, adder, NULL);
+    for (int i = 0; i < 3; i++) pthread_join(th[i], NULL);
+    if (kid == 0) _exit(0);
+    waitpid(kid, &st, 0);
+    long end = syscall(TEST_LOCKED_ADD, 0);
+    printf("    (counter %ld -> %ld)\n", start, end);
+    check("the server's mutex serializes 6 threads in 2 processes", end - start == 6 * 2000);
     printf("lxtest: %s\n", failures ? "FAILED" : "all passed");
     return failures != 0;
 }

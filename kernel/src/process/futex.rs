@@ -7,6 +7,11 @@
 //! it at different addresses meet (and a copy-on-write break of a private
 //! page does not change the key).
 //!
+//! The Linux server's own memory (its shared region, see `linux`) has a
+//! third kind of key: the server instance and the address. That memory is
+//! pinned and in no address space's areas; the kernel reads its words
+//! directly (`server_wait`, `server_wake`).
+//!
 //! Waiters sit in hashed buckets. A waiter compares the futex word under
 //! its bucket lock and enqueues itself before releasing it; a waker changes
 //! the word in user space first and then takes the same lock, so a wakeup
@@ -40,6 +45,8 @@ enum Base {
     Mm(usize),
     /// A shared memory object (by its address).
     Shared(usize),
+    /// A Linux server instance's memory (by the instance's address).
+    Server(usize),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -59,7 +66,7 @@ static BUCKETS_: [IrqSpinLock<Vec<Waiter>>; BUCKETS] = [const { IrqSpinLock::new
 
 fn bucket_of(key: &Key) -> usize {
     let base = match key.base {
-        Base::Mm(a) | Base::Shared(a) => a as u64,
+        Base::Mm(a) | Base::Shared(a) | Base::Server(a) => a as u64,
     };
     let h = (base ^ key.offset.rotate_left(17)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
     (h >> 56) as usize % BUCKETS
@@ -108,12 +115,29 @@ fn wait(uaddr: u64, val: u32, deadline: Option<u64>, bitset: u32, private: bool)
         return Err(EINVAL);
     }
     let key = key_of(uaddr, private)?;
+    // Not readable without a fault: fault it in (not under the bucket's
+    // lock), then try again.
+    wait_on(key, || uaccess::read_u32_atomic(uaddr), || uaccess::read::<u32>(uaddr).map(|_| ()), val, deadline, bitset, true)
+}
+
+/// Waits on `key` while the word is `val`: `peek` reads it without
+/// faulting (None if it cannot), `fault_in` makes it readable. A signal
+/// ends the wait if `interruptible`, a fatal one always.
+fn wait_on(
+    key: Key,
+    peek: impl Fn() -> Option<u32>,
+    fault_in: impl Fn() -> Result<(), i64>,
+    val: u32,
+    deadline: Option<u64>,
+    bitset: u32,
+    interruptible: bool,
+) -> Result<i64, i64> {
     let me = current();
     let index = bucket_of(&key);
     let mut wait = loop {
         let wait = prepare_to_sleep();
         let mut b = BUCKETS_[index].lock();
-        match uaccess::read_u32_atomic(uaddr) {
+        match peek() {
             Some(v) if v != val => return Err(EAGAIN),
             Some(_) => {
                 b.try_reserve(1).map_err(|_| ENOMEM)?;
@@ -123,10 +147,9 @@ fn wait(uaddr: u64, val: u32, deadline: Option<u64>, bitset: u32, private: bool)
                 break wait;
             }
             None => {
-                // Not readable without a fault: fault it in, then retry.
                 drop(b);
                 drop(wait);
-                uaccess::read::<u32>(uaddr)?;
+                fault_in()?;
             }
         }
     };
@@ -137,7 +160,7 @@ fn wait(uaddr: u64, val: u32, deadline: Option<u64>, bitset: u32, private: bool)
         if deadline.is_some_and(|d| crate::time::now() >= d) {
             break Err(ETIMEDOUT);
         }
-        if signal::interrupted() {
+        if if interruptible { signal::interrupted() } else { signal::dying() } {
             break Err(EINTR);
         }
         match deadline {
@@ -261,6 +284,20 @@ fn requeue(uaddr: u64, n_wake: u64, n_move: u64, uaddr2: u64, cmp: Option<u32>, 
 
 /// Wakes one waiter of the (shared-keyed) futex at `uaddr`: the join of a
 /// thread that exits (CLONE_CHILD_CLEARTID).
+/// Waits on the word at `addr` of the Linux server's memory (instance
+/// `instance`), read through `word`, while it holds `val`.
+pub fn server_wait(instance: usize, addr: u64, word: &core::sync::atomic::AtomicU32, val: u32, deadline: Option<u64>, interruptible: bool) -> Result<i64, i64> {
+    let key = Key { base: Base::Server(instance), offset: addr };
+    wait_on(key, || Some(word.load(Ordering::SeqCst)), || Ok(()), val, deadline, FUTEX_BITSET_MATCH_ANY, interruptible)
+}
+
+/// Wakes up to `n` waiters on `addr` of the Linux server's memory.
+pub fn server_wake(instance: usize, addr: u64, n: u64) -> i64 {
+    let key = Key { base: Base::Server(instance), offset: addr };
+    let mut b = BUCKETS_[bucket_of(&key)].lock();
+    wake_in(&mut b, &key, n, FUTEX_BITSET_MATCH_ANY) as i64
+}
+
 pub fn wake_one(uaddr: u64) -> Result<i64, i64> {
     wake(uaddr, 1, FUTEX_BITSET_MATCH_ANY, false)
 }

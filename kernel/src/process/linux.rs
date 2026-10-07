@@ -93,6 +93,9 @@ pub struct Instance {
     /// Address spaces of the tree's programs: when the last goes, so does
     /// the pager's process.
     programs: core::sync::atomic::AtomicUsize,
+    /// The top of the server's heap, and the pages committed for it.
+    heap_end: spin::Mutex<u64>,
+    heap_pages: core::sync::atomic::AtomicU64,
 }
 
 /// Pages wanted from the pager. A request is queued once until the pager
@@ -157,6 +160,8 @@ impl Instance {
                 dead: false,
             }),
             programs: core::sync::atomic::AtomicUsize::new(0),
+            heap_end: spin::Mutex::new(HEAP_BASE),
+            heap_pages: core::sync::atomic::AtomicU64::new(0),
         };
         instance.entry = instance.load(image)?;
         Arc::try_new(instance).map_err(|_| ENOMEM)
@@ -289,6 +294,48 @@ impl Instance {
         Ok(frame)
     }
 
+    /// Grows the server's heap by `len` bytes (rounded up to pages):
+    /// zeroed, committed memory. Returns where it starts.
+    fn grow_heap(&self, len: u64) -> Result<u64, i64> {
+        let len = len.checked_add(PAGE - 1).ok_or(EINVAL)? & !(PAGE - 1);
+        let mut end = self.heap_end.lock();
+        let start = *end;
+        if len == 0 || start.checked_add(len).is_none_or(|e| e > THREADS_BASE) {
+            return Err(ENOMEM);
+        }
+        let pages = len / PAGE;
+        if !memory::commit(pages) {
+            return Err(ENOMEM);
+        }
+        self.heap_pages.fetch_add(pages, core::sync::atomic::Ordering::Relaxed);
+        for addr in (start..start + len).step_by(PAGE as usize) {
+            // Mapped pages stay (the instance frees them); the rest of the
+            // commit is given back below with the failure.
+            if let Err(e) = self.ensure(addr) {
+                *end = addr;
+                let left = (start + len - addr) / PAGE;
+                self.heap_pages.fetch_sub(left, core::sync::atomic::Ordering::Relaxed);
+                memory::uncommit(left);
+                return Err(e);
+            }
+        }
+        *end = start + len;
+        Ok(start)
+    }
+
+    /// The word at `addr` of the server's memory (mapped, 4-aligned).
+    fn word(&self, addr: u64) -> Result<&core::sync::atomic::AtomicU32, i64> {
+        if addr % 4 != 0 || !(SHARED_BASE..SHARED_END).contains(&addr) {
+            return Err(EINVAL);
+        }
+        let mapper = unsafe { OffsetPageTable::new(table_at(self.view), memory::phys_offset()) };
+        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(addr));
+        let frame = mapper.translate_page(page).map_err(|_| EFAULT)?;
+        let phys = frame.start_address().as_u64() + addr % PAGE;
+        // Server memory stays mapped as long as the instance lives.
+        Ok(unsafe { &*(memory::phys_to_virt(phys) as *const core::sync::atomic::AtomicU32) })
+    }
+
     /// A new handle for `object`.
     fn insert(&self, object: Object) -> Result<u64, i64> {
         let mut h = self.handles.lock();
@@ -377,6 +424,7 @@ impl crate::fs::cache::Pager for Instance {
 impl Drop for Instance {
     /// No address space shows the region any more: its frames go.
     fn drop(&mut self) {
+        memory::uncommit(self.heap_pages.load(core::sync::atomic::Ordering::Relaxed));
         memory::with_frames(|frames| unsafe {
             free_level(frames, self.pdpt, 3);
             frames.deallocate_frame(self.view);
@@ -588,6 +636,20 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             }
             cache.fail(offset / PAGE)?;
             Ok(0)
+        }
+        SYS_SHARED_MAP => Ok(instance.grow_heap(a[0])? as i64),
+        SYS_SERVER_FUTEX_WAIT => {
+            let (addr, val, deadline, flags) = (a[0], a[1] as u32, a[2], a[3]);
+            if flags & !FUTEX_INTERRUPTIBLE != 0 {
+                return Err(EINVAL);
+            }
+            let word = instance.word(addr)?;
+            let id = Arc::as_ptr(&instance) as usize;
+            super::futex::server_wait(id, addr, word, val, (deadline != 0).then_some(deadline), flags & FUTEX_INTERRUPTIBLE != 0)
+        }
+        SYS_SERVER_FUTEX_WAKE => {
+            instance.word(a[0])?;
+            Ok(super::futex::server_wake(Arc::as_ptr(&instance) as usize, a[0], a[1]))
         }
         SYS_MO_UNMAP => {
             let len = range(a[0], a[1])?;

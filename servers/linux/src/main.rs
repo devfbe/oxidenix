@@ -10,15 +10,23 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
+mod heap;
+mod sync;
+
 use core::sync::atomic::{AtomicU64, Ordering};
 use restricted::*;
+
+#[global_allocator]
+static HEAP: heap::ServerHeap = heap::ServerHeap::new();
 
 const PAGE: u64 = 4096;
 const ENOSYS: i64 = 38;
 const PROT_READ: u64 = 1;
 const PROT_RW: u64 = 3;
 
-fn syscall(nr: u64, a: [u64; 6]) -> i64 {
+pub(crate) fn syscall(nr: u64, a: [u64; 6]) -> i64 {
     let ret: i64;
     unsafe {
         core::arch::asm!(
@@ -50,7 +58,7 @@ pub extern "C" fn _start(state: *mut State, role: u64) -> ! {
         }
         let s = unsafe { &mut *state };
         match s.rax {
-            TEST_MAP..=TEST_PAGED_FAIL => s.rax = test(s.rax, s.rdi) as u64,
+            TEST_MAP..=TEST_LOCKED_ADD => s.rax = test(s.rax, s.rdi) as u64,
             nr if nr >= FIRST_NON_LINUX => s.rax = -ENOSYS as u64,
             _ => {
                 call0(SYS_LEGACY_SYSCALL);
@@ -100,6 +108,29 @@ fn pager() -> ! {
             SUPPLIED.fetch_add(1, Ordering::Relaxed);
         }
     }
+}
+
+/// TEST_LOCKED_ADD's counter: one for the instance.
+static COUNTER: sync::Mutex<u64> = sync::Mutex::new(0);
+
+/// Allocates `n` blocks of many sizes, fills, checks and frees them (in an
+/// order that leaves holes); 0 if every block kept its contents.
+fn test_alloc(n: u64) -> i32 {
+    use alloc::vec::Vec;
+    let mut blocks: Vec<Vec<u8>> = Vec::new();
+    for i in 0..n as usize {
+        let size = 1 + (i * 7919) % 70_000;
+        let mut v = Vec::with_capacity(size);
+        v.resize(size, (i % 251) as u8);
+        blocks.push(v);
+        if i % 3 == 2 {
+            // Drop every third block early.
+            let gone = blocks.swap_remove(i / 3 % blocks.len());
+            drop(gone);
+        }
+    }
+    let good = blocks.iter().all(|b| b.iter().all(|&x| x == b[0]));
+    if good { 0 } else { -1 }
 }
 
 /// The test calls (see `restricted::TEST_*`).
@@ -165,6 +196,19 @@ fn test(nr: u64, addr: u64) -> i64 {
             TEST_FAIL_OBJECT.store(h as u64, Ordering::Release);
             let r = syscall(SYS_MO_MAP, [h as u64, addr, PAGE, 0, PROT_READ, MO_SHARED]);
             if r < 0 { r } else { 0 }
+        }
+        TEST_ALLOC => test_alloc(addr) as i64,
+        TEST_LOCKED_ADD => {
+            for _ in 0..addr {
+                let mut count = COUNTER.lock();
+                let seen = *count;
+                // A pause inside, so that other threads find the lock taken.
+                for _ in 0..200 {
+                    core::hint::spin_loop();
+                }
+                *count = seen + 1;
+            }
+            *COUNTER.lock() as i64
         }
         TEST_PAGED_STUCK => {
             // A key the pager does not answer.

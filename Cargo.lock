@@ -352,6 +352,7 @@ dependencies = [
 name = "linux"
 version = "0.1.0"
 dependencies = [
+ "linked_list_allocator",
  "restricted",
 ]
 

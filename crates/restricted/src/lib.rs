@@ -12,6 +12,9 @@ pub const SHARED_BASE: u64 = 0x4000_0000_0000;
 pub const SHARED_END: u64 = SHARED_BASE + 0x80_0000_0000;
 /// Where the server's program is linked.
 pub const IMAGE_BASE: u64 = SHARED_BASE;
+/// The server's heap: grows from here (`SYS_SHARED_MAP`) up to the thread
+/// areas.
+pub const HEAP_BASE: u64 = SHARED_BASE + 0x10_0000_0000;
 /// Per-thread areas: a guard page, the server's stack for the thread, and
 /// the page with its `State`.
 pub const THREADS_BASE: u64 = SHARED_BASE + 0x40_0000_0000;
@@ -163,3 +166,26 @@ pub const TEST_PAGED_STUCK: u64 = 1507;
 /// `(addr)`: a 1-page paged object at `addr` whose first request the
 /// pager fails (mo_fail) and whose second it answers with "retry".
 pub const TEST_PAGED_FAIL: u64 = 1508;
+
+// The server's runtime.
+
+/// `shared_map(len) -> addr`: `len` more bytes (rounded to pages) of
+/// zeroed, committed memory at the top of the server's heap, for every
+/// thread of the instance.
+pub const SYS_SHARED_MAP: u64 = 1023;
+/// `server_futex_wait(addr, val, deadline_ns, flags)`: sleeps while the
+/// word at `addr` (the server's memory) holds `val`, until woken, the
+/// deadline (monotonic nanoseconds; 0: none) or, with
+/// `FUTEX_INTERRUPTIBLE`, a signal for the program (EINTR). A dying thread
+/// always stops waiting.
+pub const SYS_SERVER_FUTEX_WAIT: u64 = 1024;
+/// `server_futex_wake(addr, n) -> woken`.
+pub const SYS_SERVER_FUTEX_WAKE: u64 = 1025;
+pub const FUTEX_INTERRUPTIBLE: u64 = 1;
+
+/// `(n)`: the server allocates and frees `n` blocks of many sizes from its
+/// heap, checking their contents; 0 if all were right.
+pub const TEST_ALLOC: u64 = 1509;
+/// `(n)`: adds 1 to a counter of the instance `n` times, each under the
+/// server's mutex with a pause inside; returns the counter afterwards.
+pub const TEST_LOCKED_ADD: u64 = 1510;
