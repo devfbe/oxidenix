@@ -239,6 +239,7 @@ extern "sysv64" fn dispatch(f: &mut Frame) {
         63 => uname(a0),
         72 => sys_file::fcntl(a0, a1, a2),
         74 | 75 | 162 => Ok(0), // fsync/fdatasync/sync: every write already reached the disk
+        76 => sys_file::truncate(a0, a1),
         77 => sys_file::ftruncate(a0, a1),
         79 => sys_file::getcwd(a0, a1),
         80 => sys_file::chdir(a0),

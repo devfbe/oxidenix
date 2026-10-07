@@ -21,6 +21,7 @@ pub const EINVAL: i64 = 22;
 pub const ENFILE: i64 = 23;
 pub const EMFILE: i64 = 24;
 pub const ENOTTY: i64 = 25;
+pub const ETXTBSY: i64 = 26;
 pub const EFBIG: i64 = 27;
 pub const ENOSPC: i64 = 28;
 pub const ESPIPE: i64 = 29;

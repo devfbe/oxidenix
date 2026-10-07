@@ -1,6 +1,6 @@
 # Page cache and file-backed mappings
 
-Status: design, implemented in steps 4a-4d (see the end).
+Status: steps 4a and 4b implemented; 4c and 4d in progress (see the end).
 
 ## Goals
 

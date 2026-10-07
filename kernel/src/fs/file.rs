@@ -97,10 +97,16 @@ pub struct OpenFile {
     pub dir_snapshot: Mutex<Option<Vec<(String, u64, u8)>>>,
     /// The epoll interests in this file, removed when it is closed.
     pub watchers: spin::Mutex<Vec<Weak<epoll::Item>>>,
+    /// A regular file opened for writing holds the right to write it.
+    _write_access: Option<super::WriteAccess>,
 }
 
 impl OpenFile {
     pub fn new(kind: Kind, flags: u32, path: Option<String>) -> Arc<OpenFile> {
+        Self::with_access(kind, flags, path, None)
+    }
+
+    fn with_access(kind: Kind, flags: u32, path: Option<String>, write_access: Option<super::WriteAccess>) -> Arc<OpenFile> {
         Arc::new(OpenFile {
             kind,
             offset: Mutex::new(0),
@@ -108,7 +114,14 @@ impl OpenFile {
             path,
             dir_snapshot: Mutex::new(None),
             watchers: spin::Mutex::new(Vec::new()),
+            _write_access: write_access,
         })
+    }
+
+    /// An open inode; `write_access` for a regular file opened for
+    /// writing (see `Inode::get_write_access`).
+    pub fn inode_file(inode: Arc<Inode>, flags: u32, path: String, write_access: Option<super::WriteAccess>) -> Arc<OpenFile> {
+        Self::with_access(Kind::Inode(inode), flags, Some(path), write_access)
     }
 
     pub fn console() -> Arc<OpenFile> {

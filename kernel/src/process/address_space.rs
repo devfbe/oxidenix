@@ -234,6 +234,8 @@ pub struct AddressSpace {
     /// The `Mm` holding this space, once there is one: file caches record
     /// it to reach the space's mappings of their pages.
     owner: Weak<Mm>,
+    /// The program file it runs, kept from being written meanwhile.
+    pub exe: Option<crate::fs::DenyWrite>,
 }
 
 /// An address space as tasks hold it: shared by the threads of a process
@@ -324,7 +326,7 @@ impl AddressSpace {
             memory::with_frames(|f| unsafe { f.deallocate_frame(l4) });
             return None;
         };
-        Some(AddressSpace { l4, tlb, stats, vmas: BTreeMap::new(), brk_start: 0, brk_end: 0, owner: Weak::new() })
+        Some(AddressSpace { l4, tlb, stats, vmas: BTreeMap::new(), brk_start: 0, brk_end: 0, owner: Weak::new(), exe: None })
     }
 
     fn mapper(&self) -> OffsetPageTable<'static> {
@@ -754,6 +756,34 @@ impl AddressSpace {
         Ok(())
     }
 
+    /// Gives a page of a read-only private area its own frame if it shares
+    /// one (with a fork relative or the file's page cache), keeping its
+    /// rights, so a kernel write cannot reach the others.
+    fn privatize(&mut self, page: u64) -> Result<(), Fault> {
+        let e = leaf_entry(self.l4, page).ok_or(Fault::Segv)?;
+        let old = PhysFrame::containing_address(e.addr());
+        let copied = memory::with_frames(|frames| {
+            if frames.refcount(old) <= 1 {
+                return Ok(false);
+            }
+            let new = UserFrames(frames).allocate_frame().ok_or(Fault::Oom)?;
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    memory::phys_to_virt(old.start_address().as_u64()),
+                    memory::phys_to_virt(new.start_address().as_u64()),
+                    PAGE as usize,
+                );
+            }
+            e.set_addr(new.start_address(), e.flags() - COW);
+            Ok(true)
+        })?;
+        if copied {
+            let mut gather = Gather::new(&self.tlb);
+            gather.add(page, old);
+        }
+        Ok(())
+    }
+
     /// An access just below a stack extends it (charging the commit).
     fn grow_stack(&mut self, page: u64) -> Result<(), Fault> {
         let (&start, stack) = self.vmas.range(page..).next().ok_or(Fault::Segv)?;
@@ -797,8 +827,10 @@ impl AddressSpace {
     }
 
     /// Writes into the address space (faulting pages in), also when it is
-    /// not active, regardless of the areas' rights (the loader fills
-    /// read-only segments). A shared copy-on-write frame is copied first.
+    /// not active, regardless of the areas' rights (the loader clears the
+    /// bss part of a segment's last file page). A frame shared with others
+    /// (copy-on-write, or a file's page cache) is copied first, unless the
+    /// area is shared memory.
     pub fn write(&mut self, addr: u64, data: &[u8]) -> Result<(), Fault> {
         self.write_as(addr, data, false)
     }
@@ -815,10 +847,13 @@ impl AddressSpace {
             let va = addr + done as u64;
             self.fault(va, Access { write: user, exec: false })?;
             let page = page_down(va);
-            if leaf_entry(self.l4, page).is_some_and(|e| e.flags().contains(COW)) {
-                // (break_cow makes the page writable: only for writable areas.)
-                let v = self.vma(page).cloned().filter(|v| v.prot.write).ok_or(Fault::Segv)?;
-                self.break_cow(page, &v)?;
+            let v = self.vma(page).cloned().ok_or(Fault::Segv)?;
+            if v.prot.write {
+                if leaf_entry(self.l4, page).is_some_and(|e| e.flags().contains(COW)) {
+                    self.break_cow(page, &v)?;
+                }
+            } else if !v.backing.shared() {
+                self.privatize(page)?;
             }
             let e = leaf_entry(self.l4, page).ok_or(Fault::Segv)?;
             let phys = e.addr().as_u64() + va % PAGE;
@@ -904,6 +939,7 @@ impl AddressSpace {
         tlb::shootdown(&self.tlb, 0, USER_END);
         new.brk_start = self.brk_start;
         new.brk_end = self.brk_end;
+        new.exe = self.exe.clone();
         // (The child registers with the file caches when it gets its Mm.)
         result.map(|_| new)
     }

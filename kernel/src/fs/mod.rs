@@ -11,7 +11,7 @@ use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use spin::{Mutex, Once};
 
 pub const S_IFMT: u32 = 0o170000;
@@ -27,8 +27,6 @@ pub enum Device {
     Zero,
 }
 
-/// Largest file `with_contents` reads whole into the kernel heap.
-pub const MAX_FILE_SIZE: usize = 64 * 1024 * 1024;
 /// Inodes, symlink targets and pipe buffers live on the kernel heap; this
 /// caps all of them together. (File contents are in the page cache.)
 pub const FILE_QUOTA: usize = 8 * 1024 * 1024;
@@ -106,6 +104,36 @@ pub struct Inode {
     pub perm: Mutex<u32>,
     pub node: Mutex<Node>,
     charged: usize,
+    /// Open descriptors that may write (> 0), or address spaces running
+    /// the file as their program (< 0): the two exclude each other
+    /// (ETXTBSY), since a program's pages are the file's pages.
+    writers: AtomicI64,
+}
+
+/// The right to write a file, held by a descriptor opened for writing.
+pub struct WriteAccess(Arc<Inode>);
+
+impl Drop for WriteAccess {
+    fn drop(&mut self) {
+        self.0.writers.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Held while a file runs as a program: nobody may write it meanwhile.
+pub struct DenyWrite(Arc<Inode>);
+
+impl Clone for DenyWrite {
+    fn clone(&self) -> DenyWrite {
+        // Already denied, so this cannot conflict with a writer.
+        self.0.writers.fetch_sub(1, Ordering::AcqRel);
+        DenyWrite(self.0.clone())
+    }
+}
+
+impl Drop for DenyWrite {
+    fn drop(&mut self) {
+        self.0.writers.fetch_add(1, Ordering::AcqRel);
+    }
 }
 
 impl Drop for Inode {
@@ -146,6 +174,7 @@ impl Inode {
             perm: Mutex::new(perm & 0o7777),
             node: Mutex::new(node),
             charged,
+            writers: AtomicI64::new(0),
         }))
     }
 
@@ -156,6 +185,7 @@ impl Inode {
             perm: Mutex::new(0),
             node: Mutex::new(Node::Disk(DiskRef { fs, ino })),
             charged: 0,
+            writers: AtomicI64::new(0),
         })
     }
 
@@ -376,15 +406,17 @@ impl Inode {
         Ok(())
     }
 
-    /// Calls `f` with the whole file contents (read from disk if needed).
-    pub fn with_contents<R>(&self, f: impl FnOnce(&[u8]) -> R) -> Result<R, i64> {
-        self.require_regular()?;
-        let size = usize::try_from(self.size()).ok().filter(|&s| s <= MAX_FILE_SIZE).ok_or(EFBIG)?;
-        let mut buf = Vec::new();
-        buf.try_reserve_exact(size).map_err(|_| ENOMEM)?;
-        buf.resize(size, 0);
-        let n = self.read_at(0, &mut buf)?;
-        Ok(f(&buf[..n]))
+    /// The right to write this file (ETXTBSY while it runs as a program).
+    pub fn get_write_access(self: &Arc<Self>) -> Result<WriteAccess, i64> {
+        self.writers.try_update(Ordering::AcqRel, Ordering::Acquire, |n| (n >= 0).then_some(n + 1)).map_err(|_| ETXTBSY)?;
+        Ok(WriteAccess(self.clone()))
+    }
+
+    /// Keeps writers away while the file runs as a program (ETXTBSY if
+    /// it is open for writing).
+    pub fn deny_write_access(self: &Arc<Self>) -> Result<DenyWrite, i64> {
+        self.writers.try_update(Ordering::AcqRel, Ordering::Acquire, |n| (n <= 0).then_some(n - 1)).map_err(|_| ETXTBSY)?;
+        Ok(DenyWrite(self.clone()))
     }
 
     /// Filesystem the inode lives on, for statfs.

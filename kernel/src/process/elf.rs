@@ -32,8 +32,38 @@ fn u64_at(d: &[u8], o: usize) -> u64 {
     u64::from_le_bytes(d[o..o + 8].try_into().unwrap())
 }
 
+/// The ELF header alone: where the program header table ends.
+pub struct Header {
+    phoff: u64,
+    phentsize: u16,
+    phnum: u16,
+}
+
+impl Header {
+    /// The end of the program header table in the file (None: overflow).
+    pub fn table_end(&self) -> Option<u64> {
+        self.phoff.checked_add(self.phentsize as u64 * self.phnum as u64)
+    }
+}
+
 impl<'a> Elf<'a> {
+    /// Checks the ELF header (the first 64 bytes).
+    pub fn parse_header(data: &[u8]) -> Result<Header, &'static str> {
+        let elf = Elf::check(data)?;
+        Ok(Header { phoff: elf.phoff, phentsize: elf.phentsize, phnum: elf.phnum })
+    }
+
+    /// The ELF header and the program header table (`data` covers both).
     pub fn parse(data: &'a [u8]) -> Result<Self, &'static str> {
+        let elf = Self::check(data)?;
+        let table_end = elf.phoff.checked_add(elf.phentsize as u64 * elf.phnum as u64).ok_or("corrupt program header table")?;
+        if elf.phentsize < 56 || table_end > data.len() as u64 {
+            return Err("corrupt program header table");
+        }
+        Ok(elf)
+    }
+
+    fn check(data: &'a [u8]) -> Result<Self, &'static str> {
         if data.len() < 64 || &data[0..4] != b"\x7fELF" {
             return Err("not an ELF file");
         }
@@ -46,18 +76,7 @@ impl<'a> Elf<'a> {
         if u16_at(data, 18) != 0x3e {
             return Err("not x86_64");
         }
-        let elf = Elf {
-            data,
-            entry: u64_at(data, 24),
-            phoff: u64_at(data, 32),
-            phentsize: u16_at(data, 54),
-            phnum: u16_at(data, 56),
-        };
-        let table_end = elf.phoff + elf.phentsize as u64 * elf.phnum as u64;
-        if elf.phentsize < 56 || table_end > data.len() as u64 {
-            return Err("corrupt program header table");
-        }
-        Ok(elf)
+        Ok(Elf { data, entry: u64_at(data, 24), phoff: u64_at(data, 32), phentsize: u16_at(data, 54), phnum: u16_at(data, 56) })
     }
 
     pub fn program_headers(&self) -> impl Iterator<Item = ProgramHeader> + '_ {
@@ -73,13 +92,5 @@ impl<'a> Elf<'a> {
                 memsz: u64_at(d, o + 40),
             }
         })
-    }
-
-    pub fn segment_bytes(&self, ph: &ProgramHeader) -> Result<&'a [u8], &'static str> {
-        let end = ph.offset.checked_add(ph.filesz).ok_or("corrupt segment")?;
-        if ph.filesz > ph.memsz || end > self.data.len() as u64 {
-            return Err("segment outside of file");
-        }
-        Ok(&self.data[ph.offset as usize..end as usize])
     }
 }

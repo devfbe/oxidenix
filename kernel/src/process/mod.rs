@@ -369,7 +369,15 @@ fn load_path(cwd: &str, path: &str, args: &[String], envs: &[String]) -> Result<
     if inode.file_type() != fs::S_IFREG {
         return Err(if inode.is_dir() { EISDIR } else { ENOEXEC });
     }
-    inode.with_contents(|bytes| loader::load(bytes, args, envs))?
+    // Not while it is open for writing; nobody may write it while it runs.
+    let exe = inode.deny_write_access()?;
+    let cache = match inode.cache() {
+        Ok(cache) => cache,
+        // A file without a page cache (on a filesystem server) runs from a
+        // private copy.
+        Err(_) => fs::cache::PageCache::copy_of(&inode)?,
+    };
+    loader::load(&cache, Some(inode), Some(exe), args, envs)
 }
 
 /// A user-space server the kernel starts and restarts.
@@ -377,9 +385,9 @@ pub struct Server {
     /// Name of the IPC service it registers.
     pub name: &'static str,
     pub path: &'static str,
-    /// The program, read once at boot: a restart must not run whatever
+    /// The program, copied once at boot: a restart must not run whatever
     /// was written to `path` since then with the server's privileges.
-    image: Vec<u8>,
+    image: Arc<fs::cache::PageCache>,
     /// I/O port ranges (start..end) the server may request with ioperm.
     ports: Vec<Range<u64>>,
     /// Interrupt line it may enable.
@@ -406,12 +414,7 @@ impl Server {
         if inode.file_type() != fs::S_IFREG {
             return Err(ENOEXEC);
         }
-        let image = inode.with_contents(|bytes| {
-            let mut image = Vec::new();
-            image.try_reserve_exact(bytes.len()).map_err(|_| ENOMEM)?;
-            image.extend_from_slice(bytes);
-            Ok::<_, i64>(image)
-        })??;
+        let image = fs::cache::PageCache::copy_of(&inode)?;
         Ok(Server {
             name,
             path,
@@ -532,7 +535,7 @@ pub fn spawn(name: &str, args: &[&str]) -> Result<Pid, i64> {
 pub fn spawn_server(server: &Arc<Server>) -> Result<Pid, i64> {
     let mut args = alloc::vec![server.path.to_string()];
     args.extend(server.args.iter().cloned());
-    let image = loader::load(&server.image, &args, &start_env())?;
+    let image = loader::load(&server.image, None, None, &args, &start_env())?;
     spawn_with(server.path, image, Some(server), &args)
 }
 

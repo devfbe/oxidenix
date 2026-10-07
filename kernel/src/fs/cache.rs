@@ -142,6 +142,27 @@ impl PageCache {
         })
     }
 
+    /// A private in-memory copy of a file's current contents (a server's
+    /// program, kept unchanged whatever happens to the file later).
+    pub fn copy_of(file: &super::Inode) -> Result<Arc<PageCache>, i64> {
+        let size = file.size();
+        let copy = Self::anonymous(size.div_ceil(PAGE)).map_err(|_| ENOMEM)?;
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(64 * 1024).map_err(|_| ENOMEM)?;
+        buf.resize(64 * 1024, 0);
+        let mut off = 0;
+        while off < size {
+            let n = file.read_at(off, &mut buf)?;
+            if n == 0 {
+                break;
+            }
+            copy.write(off, &buf[..n])?;
+            off += n as u64;
+        }
+        copy.truncate(off)?;
+        Ok(copy)
+    }
+
     pub fn size(&self) -> u64 {
         self.state.lock().size
     }

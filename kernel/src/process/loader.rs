@@ -1,13 +1,23 @@
-use super::address_space::{AddressSpace, Backing, Fault, Prot, PAGE};
-use super::elf::{Elf, PF_W, PF_X, PT_LOAD, PT_PHDR};
+//! Loading a static ELF program into a new address space: its segments are
+//! mapped from the file's page cache (demand-paged, private), so every
+//! process running a program shares its unchanged pages.
+
+use super::address_space::{AddressSpace, Backing, Fault, Prot, PAGE, USER_END};
+use super::elf::{Elf, ProgramHeader, PF_W, PF_X, PT_LOAD, PT_PHDR};
 use super::errno::*;
+use crate::fs::cache::PageCache;
+use crate::fs::{DenyWrite, Inode};
 use alloc::string::String;
+use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
 
 const STACK_TOP: u64 = 0x0000_7fff_ffff_f000;
 /// The stack area at start (it holds the arguments); it grows on demand up
 /// to address_space::STACK_LIMIT.
 const STACK_SIZE: u64 = 256 * 1024;
+/// Most bytes of ELF and program headers read (the table is near the start).
+const MAX_HEADERS: u64 = 64 * 1024;
 
 pub struct Image {
     pub space: AddressSpace,
@@ -19,23 +29,36 @@ pub fn page_up(x: u64) -> u64 {
     x.saturating_add(4095) & !4095
 }
 
-pub fn load(image: &[u8], args: &[String], envs: &[String]) -> Result<Image, i64> {
-    let elf = Elf::parse(image).map_err(|_| ENOEXEC)?;
+fn page_down(x: u64) -> u64 {
+    x & !(PAGE - 1)
+}
+
+/// The program in `cache`. `file` is kept alive by the mappings; `exe`
+/// keeps it from being written while the program runs.
+pub fn load(cache: &Arc<PageCache>, file: Option<Arc<Inode>>, exe: Option<DenyWrite>, args: &[String], envs: &[String]) -> Result<Image, i64> {
+    let size = cache.size();
+    let mut head = vec![0u8; size.min(64) as usize];
+    cache.read(0, &mut head)?;
+    let header = Elf::parse_header(&head).map_err(|_| ENOEXEC)?;
+    let table_end = header.table_end().filter(|&e| e <= size.min(MAX_HEADERS)).ok_or(ENOEXEC)?;
+    let mut headers = Vec::new();
+    headers.try_reserve_exact(table_end as usize).map_err(|_| ENOMEM)?;
+    headers.resize(table_end as usize, 0);
+    cache.read(0, &mut headers)?;
+    let elf = Elf::parse(&headers).map_err(|_| ENOEXEC)?;
     // iretq to a non-user entry point would fault in ring 0.
-    if elf.entry >= super::address_space::USER_END {
+    if elf.entry >= USER_END {
         return Err(ENOEXEC);
     }
     let mut space = AddressSpace::new().ok_or(ENOMEM)?;
+    space.exe = exe;
 
     let mut phdr = None;
     let mut brk = 0;
     for ph in elf.program_headers() {
         match ph.kind {
             PT_LOAD => {
-                let prot = Prot { read: true, write: ph.flags & PF_W != 0, exec: ph.flags & PF_X != 0 };
-                map_segment(&mut space, ph.vaddr, ph.memsz, prot)?;
-                let bytes = elf.segment_bytes(&ph).map_err(|_| ENOEXEC)?;
-                space.write(ph.vaddr, bytes).map_err(fault_errno)?;
+                map_segment(&mut space, cache, &file, &ph, size)?;
                 if ph.offset == 0 {
                     phdr.get_or_insert(ph.vaddr + elf.phoff);
                 }
@@ -70,25 +93,86 @@ fn fault_errno(f: Fault) -> i64 {
     }
 }
 
-/// An area for a loadable segment. Segments may share a boundary page; that
-/// page gets the union of their rights.
-fn map_segment(space: &mut AddressSpace, vaddr: u64, memsz: u64, prot: Prot) -> Result<(), i64> {
-    let start = vaddr & !(PAGE - 1);
-    let end = page_up(vaddr.checked_add(memsz).ok_or(ENOEXEC)?);
+/// Maps a loadable segment: its file part from the page cache (private,
+/// copy-on-write), the rest of its last file page cleared, and zeroed
+/// anonymous memory up to its memory size (bss).
+fn map_segment(space: &mut AddressSpace, cache: &Arc<PageCache>, file: &Option<Arc<Inode>>, ph: &ProgramHeader, size: u64) -> Result<(), i64> {
+    let file_end = ph.offset.checked_add(ph.filesz).filter(|&e| e <= size).ok_or(ENOEXEC)?;
+    let mem_end = ph.vaddr.checked_add(ph.memsz).filter(|&e| e <= USER_END).ok_or(ENOEXEC)?;
+    // A page maps one file page: offsets and addresses must agree in it.
+    if ph.filesz > ph.memsz || ph.vaddr % PAGE != ph.offset % PAGE || file_end < ph.offset {
+        return Err(ENOEXEC);
+    }
+    let prot = Prot { read: true, write: ph.flags & PF_W != 0, exec: ph.flags & PF_X != 0 };
+    let data_end = ph.vaddr + ph.filesz;
+    if ph.filesz > 0 {
+        let (start, end) = (page_down(ph.vaddr), page_up(data_end));
+        let delta = page_down(ph.offset) as i128 - start as i128;
+        let mut at = start;
+        while at < end {
+            if space.vma(at).is_some() {
+                // Shared with the previous segment: both rights; its own
+                // bytes unless the page already maps the same file page.
+                let same = space.vma(at).is_some_and(|v| matches!(&v.backing,
+                    Backing::File { cache: c, offset, .. } if Arc::ptr_eq(c, cache) && *offset as i128 - v.start as i128 == delta));
+                union_prot(space, at, prot)?;
+                if !same {
+                    copy_bytes(space, cache, ph, at.max(ph.vaddr), (at + PAGE).min(data_end))?;
+                }
+                at += PAGE;
+                continue;
+            }
+            let next = (at..end).step_by(PAGE as usize).find(|&a| space.vma(a).is_some()).unwrap_or(end);
+            let offset = (at as i128 + delta) as u64;
+            let backing = Backing::File { cache: cache.clone(), offset, shared: false, may_write: false, _file: file.clone() };
+            space.map(at, next - at, prot, backing, false).map_err(fault_errno)?;
+            at = next;
+        }
+        // Bytes after the file part in its last page belong to the bss.
+        if data_end % PAGE != 0 && mem_end > data_end {
+            let zeros = [0u8; PAGE as usize];
+            let stop = page_up(data_end).min(mem_end);
+            space.write(data_end, &zeros[..(stop - data_end) as usize]).map_err(fault_errno)?;
+        }
+    }
+    let bss = if ph.filesz > 0 { page_up(data_end) } else { page_down(ph.vaddr) };
+    if mem_end > bss {
+        map_anon(space, bss, page_up(mem_end), prot)?;
+    }
+    Ok(())
+}
+
+/// Writes the segment's file bytes for [from, to) (a page shared with
+/// another segment that maps different file contents).
+fn copy_bytes(space: &mut AddressSpace, cache: &PageCache, ph: &ProgramHeader, from: u64, to: u64) -> Result<(), i64> {
+    if from >= to {
+        return Ok(());
+    }
+    let mut buf = [0u8; PAGE as usize];
+    let n = (to - from) as usize;
+    cache.read(ph.offset + (from - ph.vaddr), &mut buf[..n])?;
+    space.write(from, &buf[..n]).map_err(fault_errno)
+}
+
+fn union_prot(space: &mut AddressSpace, at: u64, prot: Prot) -> Result<(), i64> {
+    let old = space.vma(at).map(|v| v.prot).unwrap_or_default();
+    let union = Prot { read: old.read || prot.read, write: old.write || prot.write, exec: old.exec || prot.exec };
+    space.protect(at, PAGE, union).map_err(fault_errno)
+}
+
+/// Zeroed memory for [start, end); pages already mapped by a segment get
+/// the union of both rights.
+fn map_anon(space: &mut AddressSpace, start: u64, end: u64, prot: Prot) -> Result<(), i64> {
     let mut at = start;
     while at < end {
-        match space.vma(at).map(|v| (v.prot, v.end)) {
-            Some((old, _)) => {
-                let union = Prot { read: old.read || prot.read, write: old.write || prot.write, exec: old.exec || prot.exec };
-                space.protect(at, PAGE, union).map_err(fault_errno)?;
-                at += PAGE;
-            }
-            None => {
-                let next = (at..end).step_by(PAGE as usize).find(|&a| space.vma(a).is_some()).unwrap_or(end);
-                space.map(at, next - at, prot, Backing::Anon, false).map_err(fault_errno)?;
-                at = next;
-            }
+        if space.vma(at).is_some() {
+            union_prot(space, at, prot)?;
+            at += PAGE;
+            continue;
         }
+        let next = (at..end).step_by(PAGE as usize).find(|&a| space.vma(a).is_some()).unwrap_or(end);
+        space.map(at, next - at, prot, Backing::Anon, false).map_err(fault_errno)?;
+        at = next;
     }
     Ok(())
 }

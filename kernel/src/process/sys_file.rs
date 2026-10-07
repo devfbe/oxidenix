@@ -144,11 +144,13 @@ pub fn openat(dirfd: u64, path: u64, flags: u64, mode: u64) -> SysResult {
     if flags & O_DIRECTORY != 0 && !inode.is_dir() {
         return Err(ENOTDIR);
     }
-    if flags & O_TRUNC != 0 && writable && inode.file_type() == fs::S_IFREG {
+    // Not while the file runs as a program (ETXTBSY).
+    let access = if writable && inode.file_type() == fs::S_IFREG { Some(inode.get_write_access()?) } else { None };
+    if flags & O_TRUNC != 0 && access.is_some() {
         inode.truncate(0)?;
     }
     let abs = fs::join(&fs::normalize(&base, &path));
-    let f = OpenFile::new(Kind::Inode(inode), flags, Some(abs));
+    let f = OpenFile::inode_file(inode, flags, abs, access);
     with_current(|p| p.alloc_fd(f, flags & O_CLOEXEC != 0, 0))
 }
 
@@ -596,6 +598,18 @@ pub fn fchmodat(dirfd: u64, path: u64, mode: u64) -> SysResult {
     let path = uaccess::read_cstr(path)?;
     let (inode, _) = resolve_at(dirfd, &path, true)?;
     inode.set_perm(mode as u32)?;
+    Ok(0)
+}
+
+/// truncate(2): like ftruncate on a descriptor opened for writing.
+pub fn truncate(path: u64, len: u64) -> SysResult {
+    let path = uaccess::read_cstr(path)?;
+    let (inode, _) = resolve_at(AT_FDCWD as u64, &path, true)?;
+    if inode.is_dir() {
+        return Err(EISDIR);
+    }
+    let _access = inode.get_write_access()?;
+    inode.truncate(len)?;
     Ok(0)
 }
 
