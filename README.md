@@ -744,6 +744,9 @@ never returns grown memory to the frame allocator, and there are no users or per
 There is no IOMMU support: a server that drives a bus-mastering device (netd) can make the
 device read or write any physical memory, so such a server is effectively as trusted as the
 kernel. Its program is fixed at boot (see self-healing), but a bug in it is a kernel-level bug.
+A wakeup reaches nested epoll instances along every path that watches the file, as on Linux:
+nesting is limited to chains of five, but a program that builds wide layers of instances
+watching each other multiplies the cost of each wakeup (with interrupts off).
 
 ## Limitations and roadmap
 

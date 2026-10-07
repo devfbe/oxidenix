@@ -190,6 +190,28 @@ int main(void) {
         close(down[i]);
     }
 
+    /* The nesting checks visit each instance once, not every path: under
+     * three fully connected layers of 50 instances, watching the top layer
+     * means 125000 paths but only about 5000 interests below. */
+    enum { WIDTH = 50, LAYERS = 4 };
+    static int layer[LAYERS][WIDTH];
+    int wide_ok = 1;
+    for (int l = LAYERS - 1; l >= 0; l--) {
+        for (int i = 0; i < WIDTH; i++) {
+            layer[l][i] = epoll_create1(0);
+            for (int j = 0; l + 1 < LAYERS && j < WIDTH; j++) wide_ok &= add(layer[l][i], layer[l + 1][j], EPOLLIN, 0) == 0;
+        }
+    }
+    int top = epoll_create1(0);
+    int64_t built = now_ns();
+    for (int i = 0; i < WIDTH; i++) wide_ok &= add(top, layer[0][i], EPOLLIN, 0) == 0;
+    built = (now_ns() - built) / 1000;
+    printf("  (watching %d instances over %d nested layers took %lld us)\n", WIDTH, LAYERS, (long long)built);
+    check("wide nesting is checked in linear time", wide_ok && built < 500000);
+    close(top);
+    for (int l = 0; l < LAYERS; l++)
+        for (int i = 0; i < WIDTH; i++) close(layer[l][i]);
+
     /* A wakeup racing with EPOLL_CTL_DEL on another CPU must not leave
      * the removed interest on the ready list. */
     int race[2];

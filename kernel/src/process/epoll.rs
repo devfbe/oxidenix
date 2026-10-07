@@ -126,6 +126,17 @@ impl Item {
         }
     }
 
+    /// Lists the item and wakes the instance's waiters if `file` has the
+    /// events now (after EPOLL_CTL_ADD or MOD). Its registration is in
+    /// place by then, so a later change wakes it in any case. Only real
+    /// readiness wakes: a wakeup reaches every instance that watches this
+    /// one.
+    fn wake_if_ready(&self, file: &OpenFile) {
+        if self.check(file) != 0 {
+            self.wake();
+        }
+    }
+
     /// The instance this interest belongs to.
     pub fn owner(&self) -> Option<Arc<Epoll>> {
         self.epoll.upgrade()
@@ -229,8 +240,7 @@ impl Epoll {
         }
         interest.insert(key, item.clone());
         drop(interest);
-        // Whether it is ready already, the next epoll_wait finds out.
-        item.wake();
+        item.wake_if_ready(file);
         Ok(())
     }
 
@@ -244,7 +254,7 @@ impl Epoll {
         }
         item.data.store(data, Ordering::Relaxed);
         item.events.store(events, Ordering::Release);
-        item.wake();
+        item.wake_if_ready(file);
         Ok(())
     }
 
@@ -357,39 +367,69 @@ impl Drop for Epoll {
 
 /// The instances in the longest chain that starts at `target` and goes
 /// down through the instances it watches (`target` included). ELOOP if
-/// it reaches `epoll` (a cycle) or gets too long.
+/// it reaches `epoll` (a cycle) or gets too long. Each instance is
+/// visited once (its result is remembered), so the cost is linear in the
+/// interests, however many paths lead to an instance.
 fn levels_below(target: &Arc<Epoll>, epoll: &Epoll) -> Result<usize, i64> {
-    levels_below_from(target, epoll, 1)
+    levels_below_from(target, epoll, 1, &mut BTreeMap::new())
 }
 
-fn levels_below_from(target: &Arc<Epoll>, epoll: &Epoll, depth: usize) -> Result<usize, i64> {
+fn levels_below_from(target: &Arc<Epoll>, epoll: &Epoll, depth: usize, seen: &mut BTreeMap<usize, usize>) -> Result<usize, i64> {
     if core::ptr::eq(Arc::as_ptr(target), epoll) || depth > MAX_NESTING + 1 {
         return Err(ELOOP);
     }
-    let mut levels = 1;
-    for item in target.items() {
-        if let Some(file) = item.file.upgrade() {
-            if let Kind::Epoll(inner) = &file.kind {
-                levels = levels.max(1 + levels_below_from(inner, epoll, depth + 1)?);
-            }
-        }
+    let key = Arc::as_ptr(target) as usize;
+    if let Some(&levels) = seen.get(&key) {
+        return Ok(levels);
     }
+    let mut levels = 1;
+    for inner in watched_instances(target) {
+        levels = levels.max(1 + levels_below_from(&inner, epoll, depth + 1, seen)?);
+    }
+    seen.insert(key, levels);
     Ok(levels)
+}
+
+/// The instances `epoll` watches.
+fn watched_instances(epoll: &Epoll) -> Vec<Arc<Epoll>> {
+    let interest = epoll.interest.lock();
+    interest
+        .values()
+        .filter_map(|i| i.file.upgrade())
+        .filter_map(|f| match &f.kind {
+            Kind::Epoll(inner) => Some(inner.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The instances in the longest chain of instances that watch `epoll`,
 /// one watching the next (`epoll` not included). The checks on every
-/// add keep it within MAX_NESTING.
+/// add keep it within MAX_NESTING; each instance is visited once.
 fn levels_above(epoll: &Epoll) -> usize {
+    levels_above_from(epoll, 0, &mut BTreeMap::new())
+}
+
+fn levels_above_from(epoll: &Epoll, depth: usize, seen: &mut BTreeMap<usize, usize>) -> usize {
+    let key = epoll as *const Epoll as usize;
+    if let Some(&levels) = seen.get(&key) {
+        return levels;
+    }
+    // Bounded by the checks; the cut-off only guards the stack.
+    if depth > MAX_NESTING {
+        return depth;
+    }
     let Some(file) = epoll.file.lock().upgrade() else { return 0 };
     let watchers: Vec<Arc<Item>> = file.watchers.lock().iter().filter_map(Weak::upgrade).collect();
-    watchers
+    let levels = watchers
         .iter()
         .filter(|i| !i.removed.load(Ordering::Acquire))
         .filter_map(|i| i.owner())
-        .map(|owner| 1 + levels_above(&owner))
+        .map(|owner| 1 + levels_above_from(&owner, depth + 1, seen))
         .max()
-        .unwrap_or(0)
+        .unwrap_or(0);
+    seen.insert(key, levels);
+    levels
 }
 
 // ------------------------------------------------------------ syscalls
