@@ -1,6 +1,6 @@
 # The Linux server: system calls in restricted mode
 
-Status: proposed (for review). Decision: ADR 0001.
+Status: accepted; implementation phase R1. Decisions: ADR 0001-0004.
 
 ## Goal
 
@@ -13,8 +13,10 @@ the **Linux server** (`servers/linux`). A Linux program's `syscall` instruction 
 kernel, which hands it to the Linux server on the same thread, without a message and without
 the scheduler (restricted mode, as Fuchsia's starnix).
 
-Non-goals: binary compatibility of the server with Linux kernel modules; several Linux
-instances (the design allows them, the first version has one).
+Each process tree the kernel starts (`/init`, a program run from the kernel monitor) gets its
+own **instance** of the server (ADR 0002): a container with its own VFS and tmpfs, pids,
+pipes and signals; the disk, the network and the console device are shared through the
+servers and the kernel. Non-goal: binary compatibility with Linux kernel modules.
 
 ## Restricted mode
 
@@ -25,7 +27,7 @@ The lower half of the virtual address space (47 bits) is split:
 | range | PML4 slots | contents | visible in |
 |---|---|---|---|
 | `0` – `0x3fff_ffff_ffff` (64 TiB) | 0–127 | the Linux program: the **restricted region**, one per Linux process | both views |
-| `0x4000_0000_0000` – `0x7fff_ffff_ffff` | 128–255 | the Linux server: code, heap, per-thread stacks and state; the **shared region**, the same page tables in every Linux process | normal view only |
+| `0x4000_0000_0000` – `0x7fff_ffff_ffff` | 128–255 | the Linux server: code, heap, per-thread stacks and state; the **shared region**, the same page tables in every process of one instance | normal view only |
 | upper half | 256–511 | the kernel | supervisor only |
 
 Each Linux process has two page table roots that share all lower-level tables: the
@@ -35,9 +37,7 @@ memory; the server runs on the normal root and reaches the program's memory dire
 kernel would. (The kernel keeps slots 0–127 of both roots equal; they change only when a
 new PDPT is created.)
 
-Trade-off: Linux programs get 46 bits of address space instead of 47. Programs that need more
-than 64 TiB, or that hard-code addresses above it, do not run. (Recorded as an ADR on
-acceptance.)
+Trade-off: Linux programs get 46 bits of address space instead of 47 (ADR 0003).
 
 ### Threads and the mode switch
 
@@ -117,7 +117,7 @@ processes, threads, memory objects and the services it uses.
 | waiting | `futex_wait(addr, value, deadline)`, `futex_wake`, `clock_get` |
 | IPC | today's services, and shared-memory rings for the I/O paths (separate design) |
 | devices | interrupts, I/O ports, PCI functions, DMA areas (as today; IOMMU per `iommu.md`) |
-| console | the framebuffer console and keyboard as a device the server's tty layer drives |
+| console | the framebuffer console and keyboard as a device the server's tty layer drives, held by one instance at a time (ADR 0004) |
 
 What leaves the kernel over the migration: `process/syscall.rs`'s dispatch, `sys_*.rs`,
 `signal.rs`, `epoll.rs`, `poll.rs`, `prctl.rs`, `exec.rs`, `loader.rs`, `elf.rs`, `clone.rs`
@@ -160,11 +160,8 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
    kernel implements no system call of Linux. Programs that are not Linux (the servers) keep
    the kernel's own system call interface.
 
-## Open questions for the review
+## Decisions taken in the review
 
-- One Linux server for all Linux processes (a server bug takes down all of them, as a Linux
-  kernel bug would), or one per process tree (container-like isolation, more memory)? The
-  design starts with one and does not preclude more.
-- The 46-bit address space for Linux programs (above).
-- Where the console's tty layer runs: in the Linux server (Linux semantics) with the
-  framebuffer and keyboard as a device, as proposed.
+- One server instance per process tree, not one for all (ADR 0002).
+- 46 bits of address space for Linux programs (ADR 0003).
+- The tty layer runs in the Linux server; the kernel keeps the console as a device (ADR 0004).
