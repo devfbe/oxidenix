@@ -68,7 +68,7 @@ pub fn now() -> u64 {
     ts[0]
 }
 
-/// Milliseconds since boot (monotonic, timer resolution).
+/// Milliseconds since boot (monotonic).
 pub fn uptime_ms() -> u64 {
     const CLOCK_MONOTONIC: u64 = 1;
     let mut ts = [0u64; 2];

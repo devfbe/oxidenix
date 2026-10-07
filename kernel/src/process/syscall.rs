@@ -1,7 +1,7 @@
 use super::address_space::USER_END;
 use super::errno::*;
 use super::sys_file::{self, AT_FDCWD};
-use super::{signal, sys_mem, sys_net, uaccess};
+use super::{signal, sys_mem, sys_net, sys_time, uaccess};
 use crate::interrupts::gdt;
 use x86_64::registers::model_specific::{Efer, EferFlags, FsBase, LStar, SFMask, Star};
 use x86_64::registers::rflags::RFlags;
@@ -248,7 +248,7 @@ extern "sysv64" fn dispatch(f: &mut Frame) {
         89 => sys_file::readlinkat(cwd, a0, a1, a2),
         90 => sys_file::fchmodat(cwd, a0, a1),
         95 => Ok(0o022), // umask
-        98 => uaccess::write(a1, [0u64; 18]).map(|_| 0), // getrusage: no accounting yet
+        98 => sys_time::getrusage(a0, a1),
         102 | 104 | 107 | 108 => Ok(0), // getuid/getgid/geteuid/getegid: everything is root
         105 | 106 => Ok(0), // setuid/setgid
         109 => super::setpgid(a0, a1),
@@ -274,7 +274,13 @@ extern "sysv64" fn dispatch(f: &mut Frame) {
         234 => signal::tgkill(Some(a0 as i64), a1 as i64, a2),
         202 => super::futex::futex(a0, a1, a2, a3, a4, a5),
         217 => sys_file::getdents64(a0, a1, a2),
-        228 => clock_gettime(a0, a1),
+        228 => sys_time::clock_gettime(a0, a1),
+        227 => sys_time::clock_settime(a0, a1),
+        229 => sys_time::clock_getres(a0, a1),
+        96 => sys_time::gettimeofday(a0, a1),
+        164 => sys_time::settimeofday(a0),
+        201 => sys_time::time(a0),
+        100 => sys_time::times(a0),
         257 => sys_file::openat(a0, a1, a2, a3),
         258 => sys_file::mkdirat(a0, a1, a2),
         262 => sys_file::newfstatat(a0, a1, a2, a3),
@@ -357,22 +363,6 @@ fn uname(buf: u64) -> SysResult {
     Ok(0)
 }
 
-/// CLOCK_REALTIME (and its coarse variant) is wall-clock time from the
-/// RTC; all other clocks count from boot.
-fn clock_gettime(clock: u64, ts: u64) -> SysResult {
-    const CLOCK_REALTIME: u64 = 0;
-    const CLOCK_REALTIME_COARSE: u64 = 5;
-    let (sec, nsec) = if matches!(clock, CLOCK_REALTIME | CLOCK_REALTIME_COARSE) {
-        crate::drivers::rtc::now_precise()
-    } else {
-        let ticks = super::ticks();
-        let hz = super::TIMER_HZ;
-        (ticks / hz, (ticks % hz) * (1_000_000_000 / hz))
-    };
-    uaccess::write(ts, [sec, nsec])?;
-    Ok(0)
-}
-
 const ITIMER_REAL: u64 = 0;
 
 /// struct itimerval: (interval, value) as two timevals, in microseconds.
@@ -409,11 +399,18 @@ fn getitimer(which: u64, cur: u64) -> SysResult {
     Ok(0)
 }
 
+/// Sleeps at least the requested time: whole timer ticks until the clock
+/// says it has passed.
 fn nanosleep(req: u64) -> SysResult {
-    let [sec, nsec]: [u64; 2] = uaccess::read(req)?;
-    let tick_ns = 1_000_000_000 / super::TIMER_HZ;
-    super::sleep_ticks(sec.saturating_mul(super::TIMER_HZ).saturating_add(nsec.div_ceil(tick_ns)))?;
-    Ok(0)
+    let end = crate::time::now().saturating_add(sys_time::read_timespec(req)?);
+    let tick_ns = crate::time::NSEC_PER_SEC / super::TIMER_HZ;
+    loop {
+        let left = end.saturating_sub(crate::time::now());
+        if left == 0 {
+            return Ok(0);
+        }
+        super::sleep_ticks(left.div_ceil(tick_ns))?;
+    }
 }
 
 fn prlimit(old: u64) -> SysResult {

@@ -87,8 +87,9 @@ pub fn exit_thread(status: i32) -> ! {
         if me.tid() == group.tgid {
             info.main_status = Some(status);
         }
-        info.dead_utime += me.utime.load(Ordering::Relaxed);
-        info.dead_stime += me.stime.load(Ordering::Relaxed);
+        let (user, system) = me.cputime();
+        info.dead_time.0 += user;
+        info.dead_time.1 += system;
         let last = info.threads.is_empty();
         if last {
             table.zombies += 1;
@@ -175,6 +176,8 @@ fn wait_child(pid: i64, options: u64) -> Result<Option<(Pid, i32)>, i64> {
         let wait = prepare_to_wait(child_chan(my_pid));
         let mut any_child = false;
         let mut found: Option<(Pid, i32, bool)> = None;
+        // CPU time of a reaped child, which moves to the parent's account.
+        let mut reaped_time = (0, 0);
         {
             let mut table = TABLE.lock();
             for g in table.groups.values() {
@@ -195,6 +198,8 @@ fn wait_child(pid: i64, options: u64) -> Result<Option<(Pid, i32)>, i64> {
                 any_child = true;
                 if let Some(status) = info.exit_status {
                     found = Some((g.tgid, status, true));
+                    let (own, children) = (info.cputime(), info.children_time);
+                    reaped_time = (own.0 + children.0, own.1 + children.1);
                     break;
                 }
                 if let Some(r) = info.report.filter(|&r| wanted(r)) {
@@ -206,6 +211,9 @@ fn wait_child(pid: i64, options: u64) -> Result<Option<(Pid, i32)>, i64> {
             if let Some((child, _, true)) = found {
                 table.groups.remove(&child);
                 table.zombies -= 1;
+                let mut info = me.group.info.lock();
+                info.children_time.0 += reaped_time.0;
+                info.children_time.1 += reaped_time.1;
             }
         }
         if !any_child {

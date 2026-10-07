@@ -310,7 +310,7 @@ impl Inode {
                 return (s.links, s.atime, s.mtime, s.ctime);
             }
         }
-        let boot = crate::drivers::rtc::now() - crate::process::ticks() / crate::process::TIMER_HZ;
+        let boot = crate::time::boot_time();
         (if self.is_dir() { 2 } else { 1 }, boot, boot, boot)
     }
 

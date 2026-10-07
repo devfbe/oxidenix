@@ -80,7 +80,9 @@ Its [commit history](#development-history) records every step.
   configured by DHCP, and loopback (`127.0.0.1`) works too.
 - **Persistent storage**: the data disk is mounted at `/data`, survives reboots, and stays
   consistent enough that `e2fsck` on the host accepts it.
-- **Wall-clock time** from the CMOS real-time clock (`date`, file timestamps).
+- **Clocks** with nanosecond resolution from the TSC: every Linux clock, exact CPU time per
+  thread and process (`getrusage`, `times`), and wall-clock time that starts from the CMOS
+  real-time clock and can be set (`date`, file timestamps).
 - **Terminal**: a termios line discipline (canonical and raw mode, echo, erase/kill/word-erase,
   EOF), the ANSI escape sequences BusyBox and readline use, a German keyboard layout and UTF-8.
 - **~120 Linux system calls**, enough for Bash and BusyBox (see [System calls](#system-calls)).
@@ -113,7 +115,7 @@ The kernel boots straight into Bash. Things to try:
 
 ```sh
 ls -l /bin | head          # BusyBox applets
-cowtest; vmtest; futextest; threadtest; sigtest; jobtest; oomtest; fstest; forktest; nettest; smptest # self-tests
+cowtest; vmtest; futextest; threadtest; timetest; sigtest; jobtest; oomtest; fstest; forktest; nettest; smptest # self-tests
 nproc; cat /proc/cpuinfo   # 4 CPUs; 'cpus' in the kernel monitor shows their load
 wget -O - http://example.com # DNS and HTTP through netd; nslookup and nc work as well
 ping -c 3 1.1.1.1          # raw ICMP sockets; oxidenix answers pings itself, too
@@ -196,6 +198,7 @@ oxidenix/
 │       │                        serial port mirror (serial.rs), PCI scan (pci.rs),
 │       │                        ACPI MADT (acpi.rs)
 │       ├── sync.rs              IrqSpinLock: fair, interrupt-safe ticket lock
+│       ├── time.rs              TSC clock source, clock synchronization between CPUs
 │       └── shell/               built-in kernel monitor (fallback shell)
 ├── servers/
 │   ├── diskfs/                  user-space ext2 server with its own ATA driver
@@ -224,10 +227,11 @@ About 9,200 lines of Rust (without comments and blank lines) in the kernel and 3
    memory at a dynamic offset, sets up a VESA framebuffer and loads the initramfs as a ramdisk.
 2. `kernel_main` runs these steps in order: framebuffer console and boot logo → GDT/TSS/IDT
    (interrupts still off) → frame allocator and 16 MiB kernel heap → ACPI tables (MADT), the
-   local APIC with its calibrated timer and the I/O APIC (the 8259 PICs are masked) → VFS from the cpio
-   ramdisk and real-time clock → process subsystem (SSE, syscall MSRs, process 0) → the other
+   local APIC with its calibrated timer and the I/O APIC (the 8259 PICs are masked) → the TSC
+   clock (see Time) → VFS from the cpio ramdisk → process subsystem (SSE, syscall MSRs, process 0) → the other
    CPUs (INIT and STARTUP IPIs; each runs a real-mode trampoline from a page below 1 MiB into
-   long mode, then sets up its GDT, TSS, GS block, local APIC timer and idle task) →
+   long mode, then compares its TSC with the bootstrap CPU's and sets up its GDT, TSS, GS
+   block, local APIC timer and idle task) →
    **interrupts on**.
 3. The kernel starts the servers: `/sbin/diskfs` asks for its I/O ports, mounts the ext2 disk
    and registers as service `diskfs`; the kernel then mounts it at `/data`. Then the kernel
@@ -359,6 +363,31 @@ The scheduler is built for several CPUs (`process/sched.rs`, design in
   `rax = 0`.
 - Process groups, sessions and the terminal's foreground group follow POSIX closely enough for
   Bash and BusyBox job handling.
+
+### Time
+
+`time.rs` keeps time with the TSC, which every CPU reads in a few cycles without a system
+call into a device:
+
+- **Frequency**: from CPUID leaf 0x15 where the CPU states it, else from KVM's paravirtual
+  clock (its published TSC scaling), else measured against the PIT (two intervals, so the
+  fixed cost of starting the PIT cancels out). Nanoseconds since boot are
+  `(tsc - boot_tsc) * mult >> 32`.
+- **Synchronized CPUs**: a starting CPU answers 64 requests from the bootstrap CPU with its
+  counter; the answer belongs to the middle of the request's round trip, as when clocks are
+  compared across a network. A difference larger than the shortest round trip is corrected
+  per CPU, so `CLOCK_MONOTONIC` does not go back when a thread moves to another CPU.
+- **Clocks**: `CLOCK_MONOTONIC` (and `RAW`, `COARSE`, `BOOTTIME`: nothing suspends) counts from
+  boot; `CLOCK_REALTIME` is the RTC's reading at boot plus that, and `clock_settime` moves its
+  starting point. All clocks have a resolution of 1 ns.
+- **CPU time**: each context switch adds the time slice to the task's run time (under a
+  sequence counter, so other CPUs read it consistently); the current slice counts too. The
+  per-thread and per-process CPU clocks (also those of other threads, as
+  `pthread_getcpuclockid` encodes them) read this. Timer ticks that hit user or kernel mode
+  split the exact sum into user and system time, as on Linux. Exited threads add theirs to the
+  process; reaped children add theirs (with their own children's) to the parent, for
+  `RUSAGE_CHILDREN` and `times`.
+- Sleeps and timeouts still count 100 Hz timer ticks.
 
 ### System call path
 
@@ -522,7 +551,7 @@ interrupt dispatch; drivers and filesystems move into user-space servers.
 - **Restarts**: a crashed netd is started again by the next socket call (see self-healing). It
   gets the same DMA area, which it clears before handing it to the freshly reset card.
 - Not yet: IPv6, other raw protocols, `AF_UNIX`, and interface configuration from user space
-  (`ifconfig`). Times shown by `ping` have the 10 ms resolution of the timer tick.
+  (`ifconfig`).
 
 ### Persistent storage
 
@@ -590,7 +619,7 @@ Linux x86_64 numbers, grouped by area (about 120 in total):
 | I/O multiplexing | `poll` `ppoll` `select` `pselect6` |
 | Memory | `brk` `mmap` (private, shared, anonymous, file, `MAP_FIXED[_NOREPLACE]`, `MAP_NORESERVE`, `MAP_POPULATE`) `munmap` `mprotect` `mremap` `madvise` (`DONTNEED`, `FREE`) `msync` `mlock` (no-ops) |
 | CPUs | `sched_getaffinity` `sched_setaffinity` `getcpu` |
-| Processes and threads | `clone` (`CLONE_VM` `FS` `FILES` `SIGHAND` `THREAD` `VFORK` `PARENT` `SETTLS` `PARENT_SETTID` `CHILD_SETTID` `CHILD_CLEARTID`) `fork` `vfork` `execve` `exit` (one thread) `exit_group` `wait4` `getpid` `getppid` `gettid` `set_tid_address` `sched_yield` `arch_prctl` `prlimit64` `getrusage` |
+| Processes and threads | `clone` (`CLONE_VM` `FS` `FILES` `SIGHAND` `THREAD` `VFORK` `PARENT` `SETTLS` `PARENT_SETTID` `CHILD_SETTID` `CHILD_CLEARTID`) `fork` `vfork` `execve` `exit` (one thread) `exit_group` `wait4` `getpid` `getppid` `gettid` `set_tid_address` `sched_yield` `arch_prctl` `prlimit64` |
 | Groups and IDs | `setpgid` `getpgid` `getpgrp` `setsid` `getsid` `getuid` `geteuid` `getgid` `getegid` `getresuid` `getresgid` `setuid` `setgid` |
 | Synchronization | `futex` (`WAIT`, `WAKE`, `WAIT_BITSET`, `WAKE_BITSET`, `REQUEUE`, `CMP_REQUEUE`; private and shared, monotonic and realtime timeouts) |
 | Signals | `rt_sigaction` `rt_sigprocmask` `rt_sigreturn` `kill` `tkill` `tgkill` `pause` `sigaltstack` `alarm` `setitimer` `getitimer` (`ITIMER_REAL`, 10 ms resolution) `rt_sigtimedwait` |
@@ -600,7 +629,8 @@ Linux x86_64 numbers, grouped by area (about 120 in total):
 | System information | `sysinfo` `uname` (reports `oxidenix`, not Linux) |
 | Power | `reboot` (power off ends QEMU, restart resets the machine) |
 | Sockets | `socket` `bind` `listen` `accept` `accept4` `connect` `sendto` `recvfrom` `sendmsg` `recvmsg` `shutdown` `getsockname` `getpeername` `setsockopt` (ignored) `getsockopt` (`AF_INET` only: TCP, UDP, raw ICMP) |
-| Time and misc | `nanosleep` `clock_gettime` (`CLOCK_REALTIME` from the RTC) `getrandom` |
+| Time | `clock_gettime` `clock_getres` `clock_settime` (every Linux clock, including the CPU-time clocks of threads and processes) `gettimeofday` `settimeofday` `time` `times` `getrusage` `nanosleep` |
+| Misc | `getrandom` |
 
 Everything runs as root. Unknown syscalls print a kernel message and return `ENOSYS`.
 
@@ -623,6 +653,7 @@ Each of these programs and scripts lives in the root filesystem and runs inside 
 | `proctest` | `prctl` name round-trip, `capget`/`capset` versions and the full capability set, no-new-privs, `PR_SET_PDEATHSIG` delivered to an orphan (via `sigwait`); `/proc` as htop reads it (directory fds with `O_PATH` and `openat`), `/proc/self`, the formats of `stat`, `meminfo`, `loadavg`, `uptime` and `/proc/<pid>/{stat,cmdline,exe}`, `sysinfo`, the CPU list in `/sys`, read-only `/proc` |
 | `threadtest` | pthreads: create/join, own tids, TLS, 4 threads counting under a mutex, condition variables and timed waits, 300 threads in a row, `Threads:` in `/proc/self/status`, `exit` and fatal signals ending all threads, the process outliving its main thread, group stop and continue, process signals reaching a thread that does not block them, `pthread_kill`, `fork` and `execve` in a thread, real `vfork`, `posix_spawn`, `munmap` and `mprotect` reaching a writer on another CPU (TLB shootdown) |
 | `futextest` | `FUTEX_WAIT` on a changed value (`EAGAIN`), timeouts, `EINVAL`/`EFAULT`, interruption by a signal (`EINTR`), shared futexes across processes, private memory keeping separate keys after `fork`, bitsets, `FUTEX_CMP_REQUEUE` |
+| `timetest` | nanosecond resolution of `CLOCK_MONOTONIC`, no step back on one CPU or between two, `clock_getres`, invalid clocks, `BOOTTIME`, `RAW`, `COARSE`, `gettimeofday` and `time` against `CLOCK_REALTIME`, `clock_settime` moving only the wall clock, thread and process CPU clocks (spinning counts, sleeping does not, `pthread_getcpuclockid`, `clock_getcpuclockid`), `getrusage` for the process, the thread and reaped children, `times` |
 | `vmtest` | demand paging (a 64 MiB mapping costs nothing until touched), `SIGSEGV` on read-only and `PROT_NONE` pages with contents kept, split areas after a partial `munmap`, NX and the JIT pattern (1 GiB `PROT_NONE` reservation, write code, `mprotect` to executable, call it), commit limit and `MAP_NORESERVE`, `mremap` in place and moving, `MADV_DONTNEED`, shared vs. private memory across `fork`, lazy file mappings and `SIGBUS` beyond the end, `MAP_FIXED_NOREPLACE`, stack growth to 4 MiB and overflow beyond 8 MiB |
 | `smptest` | CPU count and affinity (pinning to every CPU, empty masks), parallel speed-up of CPU-bound processes, `fork`/`exit`/`wait` on every CPU at once, 5000 pipe round trips between two CPUs, signals to a process running on another CPU, no lost timer ticks while a program floods the console with palette changes on the timekeeping CPU |
 | `nettest` | TCP to an echo service through QEMU, `ECONNREFUSED`, `listen`/`accept` over loopback with a forked client, EOF after the peer closed, non-blocking `accept` and `connect` with `poll` and `SO_ERROR`, `EINTR` in a blocking `recv`, UDP over loopback, raw ICMP echo to the gateway and over loopback, source address for off-subnet destinations, overflowing message vectors, `AF_INET6` rejected |
@@ -680,7 +711,8 @@ kernel. Its program is fixed at boot (see self-healing), but a bug in it is a ke
 - [ ] IPv6, `AF_UNIX`, `ifconfig`
 - [x] SMP with fine-grained locking, per-CPU run queues and CPU affinity
 - [x] Threads: `clone`, `futex`, TLB shootdowns
-- [ ] `epoll`, `eventfd`, a TSC clock; a page cache with file-backed shared mappings
+- [x] A TSC clock with nanosecond resolution and exact CPU time
+- [ ] `epoll`, `eventfd`, high-resolution timers; a page cache with file-backed shared mappings
 - [ ] Dynamic linking, real entropy, users and permissions
 
 ## Development history

@@ -102,12 +102,19 @@ pub struct Info {
     pub nice: i8,
     /// Live threads, in creation order.
     pub threads: Vec<Arc<Task>>,
-    /// Timer ticks of threads that exited (user, system).
-    pub dead_utime: u64,
-    pub dead_stime: u64,
+    /// CPU time in nanoseconds (user, system) of threads that exited, and
+    /// of reaped children (with their own reaped children).
+    pub dead_time: (u64, u64),
+    pub children_time: (u64, u64),
 }
 
 impl Info {
+    /// (user, system) CPU time in nanoseconds of the whole process: live
+    /// and exited threads, not children.
+    pub fn cputime(&self) -> (u64, u64) {
+        self.threads.iter().map(|t| t.cputime()).fold(self.dead_time, |a, b| (a.0 + b.0, a.1 + b.1))
+    }
+
     pub fn new(ppid: super::Pid, pgid: super::Pid, sid: super::Pid, name: String) -> Info {
         Info {
             ppid,
@@ -126,8 +133,8 @@ impl Info {
             mem: None,
             nice: 0,
             threads: Vec::new(),
-            dead_utime: 0,
-            dead_stime: 0,
+            dead_time: (0, 0),
+            children_time: (0, 0),
         }
     }
 }
@@ -316,9 +323,16 @@ pub struct Task {
     /// it waits in (a requeue may move it).
     pub futex_woken: AtomicBool,
     pub futex_bucket: AtomicUsize,
-    /// Timer ticks spent in user mode and in the kernel.
+    /// Timer ticks that found it in user mode and in the kernel: they
+    /// split its exactly measured run time into user and system time.
     pub utime: AtomicU64,
     pub stime: AtomicU64,
+    /// Run time: nanoseconds of finished time slices, and the start of the
+    /// current one (0 while not running), written by the CPU switching it
+    /// under a sequence counter that readers on other CPUs retry on.
+    run_seq: AtomicU64,
+    run_ns: AtomicU64,
+    run_since: AtomicU64,
     /// Thread name (comm), at most 15 bytes.
     pub comm: IrqSpinLock<String>,
     /// Its signal mask and the signals sent to this thread.
@@ -354,6 +368,9 @@ impl Task {
             futex_bucket: AtomicUsize::new(0),
             utime: AtomicU64::new(0),
             stime: AtomicU64::new(0),
+            run_seq: AtomicU64::new(0),
+            run_ns: AtomicU64::new(0),
+            run_since: AtomicU64::new(0),
             comm: IrqSpinLock::new(comm),
             sig: IrqSpinLock::new(ThreadSignals::default()),
             kernel_rsp: UnsafeCell::new(kernel_rsp),
@@ -401,6 +418,48 @@ impl Task {
 
     pub fn kstack_top(&self) -> Option<u64> {
         self.kstack.as_ref().map(|s| s.top())
+    }
+
+    /// Updates the run time under the sequence counter (only the CPU that
+    /// switches the task calls these, so there is one writer at a time).
+    fn update_run(&self, f: impl FnOnce()) {
+        self.run_seq.fetch_add(1, Ordering::Relaxed);
+        core::sync::atomic::fence(Ordering::Release);
+        f();
+        self.run_seq.fetch_add(1, Ordering::Release);
+    }
+
+    /// A time slice starts at `now` (nanoseconds since boot).
+    pub fn start_running(&self, now: u64) {
+        self.update_run(|| self.run_since.store(now.max(1), Ordering::Relaxed));
+    }
+
+    /// The current time slice ends at `now`.
+    pub fn stop_running(&self, now: u64) {
+        self.update_run(|| {
+            let since = self.run_since.swap(0, Ordering::Relaxed);
+            if since != 0 {
+                self.run_ns.fetch_add(now.saturating_sub(since), Ordering::Relaxed);
+            }
+        });
+    }
+
+    /// Nanoseconds it ran, the current time slice included.
+    pub fn runtime(&self) -> u64 {
+        loop {
+            let seq = self.run_seq.load(Ordering::Acquire);
+            let (run, since) = (self.run_ns.load(Ordering::Relaxed), self.run_since.load(Ordering::Relaxed));
+            core::sync::atomic::fence(Ordering::Acquire);
+            if seq & 1 == 0 && self.run_seq.load(Ordering::Relaxed) == seq {
+                return run + if since != 0 { crate::time::now().saturating_sub(since) } else { 0 };
+            }
+            core::hint::spin_loop();
+        }
+    }
+
+    /// (user, system) CPU time in nanoseconds.
+    pub fn cputime(&self) -> (u64, u64) {
+        crate::time::split(self.runtime(), self.utime.load(Ordering::Relaxed), self.stime.load(Ordering::Relaxed))
     }
 
     /// The task's own state.

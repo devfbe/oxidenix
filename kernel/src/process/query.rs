@@ -12,7 +12,7 @@ use procproto::*;
 
 fn system() -> System {
     let mut s = System { hz: TIMER_HZ, uptime: sched::ticks(), page_size: 4096, ..Default::default() };
-    s.boot_time = crate::drivers::rtc::now().saturating_sub(s.uptime / TIMER_HZ);
+    s.boot_time = crate::time::boot_time();
     for i in 0..MAX_CPUS {
         let Some(cpu) = crate::smp::by_index(i) else { continue };
         let st = sched::cpu_stats(cpu);
@@ -54,15 +54,16 @@ fn process(pid: Pid) -> Result<Process, i64> {
     } else {
         STATE_SLEEPING
     };
-    let sum = |f: fn(&super::task::Task) -> u64| info.threads.iter().map(|t| f(t)).sum::<u64>();
+    let (user_ns, system_ns) = info.cputime();
+    let tick_ns = crate::time::NSEC_PER_SEC / TIMER_HZ;
     let mut p = Process {
         pid,
         ppid: info.ppid,
         pgid: info.pgid,
         sid: info.sid,
         state: state as u64,
-        utime: info.dead_utime + sum(|t| t.utime.load(Ordering::Relaxed)),
-        stime: info.dead_stime + sum(|t| t.stime.load(Ordering::Relaxed)),
+        utime: user_ns / tick_ns,
+        stime: system_ns / tick_ns,
         start: g.start_ticks,
         pages: info.mem.as_ref().map_or(0, |m| m.pages.load(Ordering::Relaxed)),
         virt_pages: info.mem.as_ref().map_or(0, |m| m.virt_pages.load(Ordering::Relaxed)),

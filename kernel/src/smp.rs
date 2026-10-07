@@ -4,7 +4,7 @@
 
 use crate::interrupts::gdt::CpuTables;
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use x86_64::registers::model_specific::{GsBase, KernelGsBase};
 use x86_64::VirtAddr;
 
@@ -26,6 +26,8 @@ pub struct Cpu {
     pub apic_id: UnsafeCell<u8>,
     tables: UnsafeCell<CpuTables>,
     pub sched: crate::process::sched::CpuSched,
+    /// Added to this CPU's TSC to match the bootstrap CPU's (see `time`).
+    pub tsc_offset: AtomicI64,
 }
 
 /// Offsets for the assembly entry code.
@@ -46,6 +48,7 @@ impl Cpu {
             apic_id: UnsafeCell::new(0),
             tables: UnsafeCell::new(CpuTables::new()),
             sched: crate::process::sched::CpuSched::new(),
+            tsc_offset: AtomicI64::new(0),
         }
     }
 
@@ -318,6 +321,10 @@ fn start_all() {
             pit_delay_us(1_000);
         }
         if online() > before {
+            let offset = crate::time::sync_bsp();
+            if offset != 0 {
+                crate::printkln!("[time] CPU {}: TSC off by {} cycles, corrected", index, offset);
+            }
             index += 1;
         } else {
             crate::printkln!("[smp] CPU with APIC id {} did not start", apic_id);
@@ -335,6 +342,8 @@ extern "C" fn ap_entry(block: *mut Cpu) -> ! {
         Cr0::update(|f| f.insert(Cr0Flags::WRITE_PROTECT));
     }
     activate(block);
+    // The bootstrap CPU waits to compare clocks as soon as this one is online.
+    crate::time::sync_ap(cpu());
     crate::interrupts::init_ap();
     crate::process::enable_sse();
     crate::process::syscall::init();

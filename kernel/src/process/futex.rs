@@ -101,14 +101,10 @@ fn deadline(ts: u64, absolute: bool, realtime: bool) -> Result<Option<u64>, i64>
     let now = sched::ticks();
     Ok(Some(if !absolute {
         now.saturating_add(to_ticks(sec, nsec))
-    } else if realtime {
-        let (now_sec, now_nsec) = crate::drivers::rtc::now_precise();
-        let (now_ns, at_ns) = (now_sec as u128 * 1_000_000_000 + now_nsec as u128, sec as u128 * 1_000_000_000 + nsec as u128);
-        let left = at_ns.saturating_sub(now_ns);
-        now.saturating_add(to_ticks((left / 1_000_000_000) as u64, (left % 1_000_000_000) as u64))
     } else {
-        // CLOCK_MONOTONIC counts timer ticks since boot.
-        to_ticks(sec, nsec)
+        let clock_now = if realtime { crate::time::realtime() } else { crate::time::now() } as u128;
+        let left = (sec as u128 * 1_000_000_000 + nsec as u128).saturating_sub(clock_now);
+        now.saturating_add(to_ticks((left / 1_000_000_000) as u64, (left % 1_000_000_000) as u64))
     }))
 }
 

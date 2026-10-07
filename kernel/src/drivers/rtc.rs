@@ -1,10 +1,7 @@
 //! CMOS real-time clock: read once at boot; wall-clock time afterwards is
-//! the boot time plus the timer ticks since then.
+//! kept by `time` (the boot time plus the monotonic clock).
 
-use spin::Once;
 use x86_64::instructions::port::Port;
-
-static BOOT_TIME: Once<u64> = Once::new();
 
 fn cmos(reg: u8) -> u8 {
     unsafe {
@@ -27,7 +24,8 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146097 + doe - 719468
 }
 
-fn read_clock() -> u64 {
+/// The RTC's time in seconds since the Unix epoch.
+pub fn read() -> u64 {
     // Read until two consecutive reads agree, so no update tears the value.
     let read = || {
         while update_in_progress() {}
@@ -52,22 +50,4 @@ fn read_clock() -> u64 {
     let year = 2000 + bcd(year) as i64;
     let days = days_from_civil(year, bcd(month) as i64, bcd(day) as i64);
     (days * 86400 + hour as i64 * 3600 + bcd(min) as i64 * 60 + bcd(sec) as i64) as u64
-}
-
-pub fn init() {
-    BOOT_TIME.call_once(read_clock);
-}
-
-/// Seconds since the Unix epoch.
-pub fn now() -> u64 {
-    let boot = BOOT_TIME.get().copied().unwrap_or(0);
-    boot + crate::process::ticks() / crate::process::TIMER_HZ
-}
-
-/// Wall-clock time as (seconds, nanoseconds).
-pub fn now_precise() -> (u64, u64) {
-    let boot = BOOT_TIME.get().copied().unwrap_or(0);
-    let ticks = crate::process::ticks();
-    let hz = crate::process::TIMER_HZ;
-    (boot + ticks / hz, (ticks % hz) * (1_000_000_000 / hz))
 }

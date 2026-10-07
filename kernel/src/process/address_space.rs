@@ -172,12 +172,20 @@ impl Vma {
     }
 }
 
-/// Mapped (resident) and virtual pages, readable by anyone (procfs) while
-/// only the owning process changes them.
+/// Mapped (resident) and virtual pages, and the most pages ever resident,
+/// readable by anyone (procfs) while only the owning process changes them.
 #[derive(Default)]
 pub struct MemStats {
     pub pages: AtomicU64,
     pub virt_pages: AtomicU64,
+    pub peak_pages: AtomicU64,
+}
+
+impl MemStats {
+    fn add_resident(&self, pages: u64) {
+        let now = self.pages.fetch_add(pages, Ordering::Relaxed) + pages;
+        self.peak_pages.fetch_max(now, Ordering::Relaxed);
+    }
 }
 
 fn count(counter: &AtomicU64, delta: i64) {
@@ -691,7 +699,7 @@ impl AddressSpace {
             return Err(Fault::Oom);
         }
         // The entry was not present before, so no TLB holds it.
-        count(&self.stats.pages, 1);
+        self.stats.add_resident(1);
         Ok(())
     }
 
@@ -852,7 +860,7 @@ impl AddressSpace {
                                 .ignore();
                             // Only a successful mapping owns a reference.
                             frames.0.share(frame);
-                            count(&new.stats.pages, 1);
+                            new.stats.add_resident(1);
                         }
                     }
                 }

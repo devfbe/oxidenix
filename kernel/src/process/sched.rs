@@ -176,6 +176,7 @@ pub fn set_initial(task: Arc<Task>, idle: Arc<Task>) {
     task.on_cpu.store(true, Ordering::Relaxed);
     task.set_state(State::Running);
     task.last_cpu.store(smp::cpu().index, Ordering::Relaxed);
+    task.start_running(crate::time::now());
     unsafe {
         *cs.current.get() = Some(task);
         *cs.idle.get() = Some(idle);
@@ -436,6 +437,9 @@ fn context_switch(next: Arc<Task>) {
     cs.switches.fetch_add(1, Ordering::Relaxed);
 
     let prev = unsafe { (*cs.current.get()).take().expect("no current task") };
+    let now = crate::time::now();
+    prev.stop_running(now);
+    next.start_running(now);
     unsafe {
         let saved = prev.cpu_state();
         saved.fs_base = FsBase::read().as_u64();
