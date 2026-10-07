@@ -151,18 +151,38 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
    Measures the cost of the switch (`forwarded_null_syscall`).
 2. **R2 — Memory objects and mappings** as kernel objects by handle: anonymous and paged
    objects with the instance's pager thread, mapping into a program's view (done; the
-   copy-on-write clone follows with `fork` in R5).
-3. **R3 — Files.** The VFS, tmpfs, pipes, the page cache (as pager-backed objects), the remote
-   filesystem client, `epoll`/`poll`, descriptors: into the server. The largest phase; it
-   brings the rings to diskfs.
-4. **R4 — Sockets** into the server, talking to netd over rings.
-5. **R5 — Processes and signals**: pids, the process tree, `fork`/`exec`/`wait`, signals, job
-   control, ttys, `/proc`'s data. The kernel's process model shrinks to processes and threads
-   as containers.
-6. **R6 — Memory semantics**: `mmap`/`mprotect`/`brk`/`mremap` as server code over mappings.
-7. **R7 — Remove the pass-through.** `legacy_syscall` and the kernel's Linux code go; the
+   copy-on-write clone follows with `fork` in R8).
+3. **R3 — The server's runtime.** What every piece of Linux semantics in the server needs: a
+   heap in the shared region that grows (a kernel call maps more of the region for the
+   instance), locks that work across the tree's processes (futexes on the server's memory,
+   keyed by physical page, since that memory is pinned and outside any address space's
+   areas), and a record per process and thread that the server finds from the trapping thread
+   (the kernel names the process and thread in `State`) and that goes when they end.
+4. **R4 — Memory semantics**: `mmap`, `munmap`, `mprotect`, `mremap`, `madvise`, `msync` and
+   `brk` as server code. The kernel keeps the page tables and areas (mechanism); the server
+   decides placement and flags. Anonymous private memory needs a kernel mapping call of its
+   own (committed when writable, `MAP_NORESERVE`, demand-zero), and a file mapping takes the
+   file's memory object through a bridge from the kernel's descriptor table
+   (`kfile_object(fd)`) while files are still the kernel's.
+5. **R5 — Time and sleeping**: the clocks, `nanosleep`, `clock_nanosleep`, `gettimeofday`,
+   `times` over the kernel's clock and deadline waits (interruptible by signals, which are
+   still the kernel's).
+6. **R6 — Files.** Descriptors, the VFS, tmpfs and the initramfs, pipes, the page cache (as
+   paged objects whose pager is the server), the remote filesystem client with rings to
+   diskfs, `poll`/`select`/`epoll` (over a kernel primitive that waits for the server's events
+   and the kernel's at once), the tty layer (ADR 0004): into the server. The largest phase.
+7. **R7 — Sockets** into the server, talking to netd over rings.
+8. **R8 — Processes and signals**: pids, the process tree, `fork` (with the copy-on-write clone
+   of memory objects), `exec`, `wait`, signals, job control, `/proc`'s data. The kernel's
+   process model shrinks to processes and threads as containers.
+9. **R9 — Remove the pass-through.** `legacy_syscall` and the kernel's Linux code go; the
    kernel implements no system call of Linux. Programs that are not Linux (the servers) keep
    the kernel's own system call interface.
+
+The order changed after R2 (files were R3, memory semantics R6): every piece of Linux
+semantics needs the server's runtime first, and memory semantics is the smallest piece that
+takes Linux code out of the kernel, while files are the largest and touch almost everything
+else.
 
 ## Decisions taken in the review
 

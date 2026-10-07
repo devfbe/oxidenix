@@ -525,7 +525,7 @@ R1 is in place: the mechanism, with every system call passed through.
   move.
 - In phase R1 the server hands every Linux system call back with `legacy_syscall` (1011), which
   runs the kernel's implementation on the registers in the register page (signal frames and
-  `execve` included). Until the server takes over signals (R5), `rt_sigreturn` is such a pass-through
+  `execve` included). Until the server takes over signals (R8), `rt_sigreturn` is such a pass-through
   call, so a signal's round trip costs more than before (three kernel entries): an interval
   timer of a microsecond or two whose handler runs every time can now starve its program, as
   it would on any system where the round trip outlasts the interval. Numbers of 1000 and above are not Linux's: the server answers them with
