@@ -151,6 +151,7 @@ pub unsafe extern "C" fn user_return() {
 }
 
 extern "sysv64" fn dispatch(f: &mut Frame) {
+    crate::counters::add(|c| &c.syscalls, 1);
     let nr = f.rax;
     let (a0, a1, a2, a3, a4, a5) = (f.rdi, f.rsi, f.rdx, f.r10, f.r8, f.r9);
     let cwd = AT_FDCWD as u64;

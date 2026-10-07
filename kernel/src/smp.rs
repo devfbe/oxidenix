@@ -30,6 +30,8 @@ pub struct Cpu {
     pub tsc_offset: AtomicI64,
     /// Deadlines due on this CPU (see `timer`).
     pub timers: crate::timer::CpuTimers,
+    /// Hot-path event counters (see `counters`).
+    pub counters: crate::counters::PerCpu,
 }
 
 /// Offsets for the assembly entry code.
@@ -52,6 +54,7 @@ impl Cpu {
             sched: crate::process::sched::CpuSched::new(),
             tsc_offset: AtomicI64::new(0),
             timers: crate::sync::IrqSpinLock::new(crate::timer::Queue::new()),
+            counters: crate::counters::PerCpu::new(),
         }
     }
 

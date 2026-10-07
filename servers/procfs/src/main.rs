@@ -50,6 +50,7 @@ const PID_MAX: u32 = 12;
 const FILESYSTEMS: u32 = 13;
 const OSTYPE: u32 = 14;
 const OSRELEASE: u32 = 15;
+const COUNTERS: u32 = 16;
 
 /// /sys: devices/system/cpu with online, possible, present, kernel_max and
 /// one directory per CPU (with its `online` file).
@@ -126,6 +127,7 @@ const GLOBAL_FILES: &[(&str, u32)] = &[
     ("version", VERSION),
     ("sys", SYS),
     ("filesystems", FILESYSTEMS),
+    ("counters", COUNTERS),
 ];
 
 const PROCESS_FILES: &[(&str, u32)] = &[
@@ -301,6 +303,7 @@ fn contents(node: Node) -> Result<Vec<u8>, i64> {
     let text = match node {
         Node::Global(STAT) => render::stat(&system()),
         Node::Global(MEMINFO) => render::meminfo(&system()),
+        Node::Global(COUNTERS) => render::counters(&system().counters),
         Node::Global(LOADAVG) => render::loadavg(&system()),
         Node::Global(UPTIME) => render::uptime(&system()),
         Node::Global(CPUINFO) => render::cpuinfo(&system()),

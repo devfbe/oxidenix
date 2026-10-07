@@ -51,10 +51,24 @@ struct Ipc {
     requests: BTreeMap<u64, Request>,
     next_id: u64,
     next_generation: u64,
+    /// Requests sent, and bytes of requests and replies (see `counters`).
+    calls: u64,
+    bytes: u64,
 }
 
-static IPC: IrqSpinLock<Ipc> =
-    IrqSpinLock::new(Ipc { services: Vec::new(), requests: BTreeMap::new(), next_id: 1, next_generation: 1 });
+static IPC: IrqSpinLock<Ipc> = IrqSpinLock::new(Ipc {
+    services: Vec::new(),
+    requests: BTreeMap::new(),
+    next_id: 1,
+    next_generation: 1,
+    calls: 0,
+    bytes: 0,
+});
+
+/// (requests sent, bytes of requests and replies) since boot.
+pub fn counters() -> (u64, u64) {
+    lock(|ipc| (ipc.calls, ipc.bytes))
+}
 
 /// A service as one particular registration of its server.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -185,6 +199,7 @@ pub fn reply(id: u64, buf: u64, len: u64) -> SysResult {
         if req.state != State::Taken || ipc.services[req.service].server != me {
             return Err(EINVAL);
         }
+        ipc.bytes += data.len() as u64;
         if req.waits {
             let req = ipc.requests.get_mut(&id).expect("checked above");
             req.reply = data;
@@ -239,6 +254,8 @@ fn enqueue(service: usize, message: Vec<u8>, waits: bool, generation: Option<u64
         }
         let id = ipc.next_id;
         ipc.next_id += 1;
+        ipc.calls += 1;
+        ipc.bytes += message.len() as u64;
         ipc.requests.insert(id, Request { service, waits, message, reply: Vec::new(), state: State::Queued });
         ipc.services[service].queue.push_back(id);
         Ok((id, ipc.services[service].server))

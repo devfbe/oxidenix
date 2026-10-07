@@ -104,6 +104,7 @@ fn range_ok(ptr: u64, len: usize) -> Result<(), i64> {
 /// Fills `dst` from user memory at `ptr`.
 pub fn copy_from(ptr: u64, dst: &mut [u8]) -> Result<(), i64> {
     range_ok(ptr, dst.len())?;
+    crate::counters::add(|c| &c.user_copy_bytes, dst.len() as u64);
     match unsafe { copy_user(dst.as_mut_ptr(), ptr as *const u8, dst.len()) } {
         0 => Ok(()),
         _ => Err(EFAULT),
@@ -113,6 +114,7 @@ pub fn copy_from(ptr: u64, dst: &mut [u8]) -> Result<(), i64> {
 /// Writes `src` to user memory at `ptr`.
 pub fn copy_to(ptr: u64, src: &[u8]) -> Result<(), i64> {
     range_ok(ptr, src.len())?;
+    crate::counters::add(|c| &c.user_copy_bytes, src.len() as u64);
     match unsafe { copy_user(ptr as *mut u8, src.as_ptr(), src.len()) } {
         0 => Ok(()),
         _ => Err(EFAULT),

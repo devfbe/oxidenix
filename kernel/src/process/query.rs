@@ -41,6 +41,7 @@ fn system() -> System {
     s.shmem = shmem * 4096;
     s.cached = (crate::memory::cached_pages() + shmem) * 4096;
     s.dirty = crate::fs::cache::dirty_pages() * 4096;
+    s.counters = crate::counters::snapshot();
     s
 }
 

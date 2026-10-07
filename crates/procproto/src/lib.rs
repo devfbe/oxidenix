@@ -68,6 +68,23 @@ pub struct System {
     pub shmem: u64,
     /// Cached file pages stored to and not yet written back (bytes).
     pub dirty: u64,
+    pub counters: Counters,
+}
+
+/// Hot-path event counters since boot (for benchmarks; /proc/counters).
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct Counters {
+    pub syscalls: u64,
+    /// IPC requests the kernel sent to servers, and the bytes of the
+    /// requests and replies it copied.
+    pub ipc_calls: u64,
+    pub ipc_bytes: u64,
+    /// Page table root loads (CR3 writes).
+    pub address_space_switches: u64,
+    /// Bytes copied between the kernel and user memory.
+    pub user_copy_bytes: u64,
+    pub heap_allocs: u64,
 }
 
 /// Process states, as the letters of /proc/<pid>/stat.

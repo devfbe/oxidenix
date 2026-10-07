@@ -56,6 +56,7 @@ pub fn switch(from: Option<&Tlb>, to: Option<&Tlb>) {
             return;
         }
     }
+    crate::counters::add(|c| &c.address_space_switches, 1);
     let bit = my_bit();
     match to {
         Some(t) => {

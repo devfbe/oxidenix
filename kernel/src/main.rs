@@ -10,6 +10,7 @@ use bootloader_api::{entry_point, BootInfo};
 use alloc::sync::Arc;
 use core::panic::PanicInfo;
 
+mod counters;
 mod drivers;
 mod fs;
 mod interrupts;

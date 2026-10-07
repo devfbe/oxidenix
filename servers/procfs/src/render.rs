@@ -197,3 +197,20 @@ pub fn pid_status(p: &Process, s: &System) -> String {
         last = s.cpus.saturating_sub(1),
     )
 }
+
+/// /proc/counters (oxidenix's own): hot-path event counters since boot, one
+/// "name value" per line.
+pub fn counters(c: &procproto::Counters) -> String {
+    let mut out = String::new();
+    for (key, value) in [
+        ("syscalls", c.syscalls),
+        ("ipc_calls", c.ipc_calls),
+        ("ipc_bytes", c.ipc_bytes),
+        ("address_space_switches", c.address_space_switches),
+        ("user_copy_bytes", c.user_copy_bytes),
+        ("heap_allocs", c.heap_allocs),
+    ] {
+        out.push_str(&alloc::format!("{} {}\n", key, value));
+    }
+    out
+}

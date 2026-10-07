@@ -50,17 +50,25 @@ fn main() {
 
     // OXIDENIX_TEST=1: boot straight into the self-tests and let their result
     // become QEMU's exit status (1 = success, 3 = failure).
-    let test_mode = std::env::var_os("OXIDENIX_TEST").is_some();
+    // OXIDENIX_BENCH=1: the same, with the benchmarks (/etc/bench.sh,
+    // docs/benchmarks) instead of the tests.
+    let bench_mode = std::env::var_os("OXIDENIX_BENCH").is_some();
+    let test_mode = bench_mode || std::env::var_os("OXIDENIX_TEST").is_some();
     println!("Building root filesystem...");
     build_rootfs(&rootfs).expect("Failed to build root filesystem");
     if test_mode {
-        std::os::unix::fs::symlink("runtests.sh", rootfs.join("etc/autorun")).expect("Failed to link /etc/autorun");
+        let script = if bench_mode { "bench.sh" } else { "runtests.sh" };
+        std::os::unix::fs::symlink(script, rootfs.join("etc/autorun")).expect("Failed to link /etc/autorun");
     }
     let mut cpio = io::BufWriter::new(fs::File::create(&cpio_path).expect("Failed to create cpio"));
     write_cpio(&rootfs, &mut cpio).expect("Failed to write cpio");
     drop(cpio);
 
-    let data_disk = Path::new(env!("CARGO_MANIFEST_DIR")).join("../disk.img");
+    // OXIDENIX_DISK=<path>: another data disk (the benchmarks use a fresh one).
+    let data_disk = match std::env::var_os("OXIDENIX_DISK") {
+        Some(path) => PathBuf::from(path),
+        None => Path::new(env!("CARGO_MANIFEST_DIR")).join("../disk.img"),
+    };
     if !data_disk.exists() {
         println!("Creating persistent ext2 disk {}...", data_disk.display());
         create_data_disk(&data_disk).expect("Failed to create the data disk");

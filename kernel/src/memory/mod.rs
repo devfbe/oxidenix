@@ -32,6 +32,7 @@ static HEAP: GrowingHeap = GrowingHeap(IrqSpinLock::new(Heap::empty()));
 
 unsafe impl GlobalAlloc for GrowingHeap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        crate::counters::HEAP_ALLOCS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         loop {
             if let Ok(p) = self.0.lock().allocate_first_fit(layout) {
                 return p.as_ptr();
