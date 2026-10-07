@@ -110,6 +110,9 @@ pub struct ThreadSignals {
     waiting_for: u64,
     /// A group stop asks this thread to stop.
     stop: bool,
+    /// The mask to put back on the way to user space, after a call that
+    /// waited with a temporary one (see `with_mask`).
+    restore_mask: Option<u64>,
 }
 
 fn bit(sig: u32) -> u64 {
@@ -670,6 +673,81 @@ pub fn sigprocmask(how: u64, set: u64, oldset: u64) -> SysResult {
     Ok(0)
 }
 
+/// Runs `wait` with `mask` (if any) as the thread's signal mask, for the
+/// calls that wait with a temporary one (rt_sigsuspend, ppoll, pselect6,
+/// epoll_pwait). When the wait is interrupted (EINTR), the mask stays
+/// until the signal is delivered, so the handler runs with it and the
+/// caller's own mask comes back with the handler's return; otherwise it
+/// is put back at once, and a signal it held off is delivered only if the
+/// caller's mask lets it through.
+pub fn with_mask<T>(mask: Option<u64>, wait: impl FnOnce() -> Result<T, i64>) -> Result<T, i64> {
+    let Some(mask) = mask else { return wait() };
+    let me = current();
+    let blocked_more = {
+        let mut t = me.sig.lock();
+        let current_mask = t.mask;
+        let own = *t.restore_mask.get_or_insert(current_mask);
+        t.mask = mask & !UNBLOCKABLE;
+        t.mask & !own != 0
+    };
+    if blocked_more {
+        retarget(&me.group);
+    }
+    let result = wait();
+    if !matches!(result, Err(EINTR)) {
+        let restored = {
+            let mut t = me.sig.lock();
+            let temporary = t.mask;
+            t.restore_mask.take().map(|own| {
+                t.mask = own;
+                own & !temporary != 0
+            })
+        };
+        if restored == Some(true) {
+            retarget(&me.group);
+        }
+    }
+    result
+}
+
+/// A user signal mask argument: null is none, any size but 8 is EINVAL.
+pub fn read_mask(ptr: u64, size: u64) -> Result<Option<u64>, i64> {
+    if ptr == 0 {
+        return Ok(None);
+    }
+    if size != 8 {
+        return Err(EINVAL);
+    }
+    Ok(Some(uaccess::read(ptr)?))
+}
+
+/// rt_sigsuspend(mask, size): waits for a signal with `mask`.
+pub fn sigsuspend(mask: u64, size: u64) -> SysResult {
+    let mask = read_mask(mask, size)?.ok_or(EFAULT)?;
+    with_mask(Some(mask), || loop {
+        let wait = sched::prepare_to_sleep();
+        if interrupted() {
+            return Err(EINTR);
+        }
+        wait.sleep();
+    })
+}
+
+/// rt_sigpending(set, size): the signals pending and blocked.
+pub fn sigpending(set: u64, size: u64) -> SysResult {
+    if size != 8 {
+        return Err(EINVAL);
+    }
+    let me = current();
+    let pending = {
+        let g = me.group.sig.lock();
+        let t = me.sig.lock();
+        (t.pending | g.pending) & t.mask
+    };
+    uaccess::write(set, pending)?;
+    Ok(0)
+}
+
 /// What a signal handler finds on its stack, from low to high addresses:
 /// the return address (the restorer), then the saved state for sigreturn
 /// (registers, mask and the FPU/SSE state, which an asynchronous handler
@@ -707,7 +785,9 @@ fn fxrstor(image: [u8; 512]) {
 /// rt_sigreturn, rax holds the restored value of the *earlier* syscall, which
 /// must not be mistaken for an EINTR of rt_sigreturn itself.
 fn restartable(nr: u64) -> bool {
-    !matches!(nr, 7 | 15 | 23 | 34 | 35 | 270 | 271)
+    // poll, rt_sigreturn, select, pause, nanosleep, rt_sigtimedwait,
+    // rt_sigsuspend, clock_nanosleep, pselect6, ppoll: EINTR, as on Linux.
+    !matches!(nr, 7 | 15 | 23 | 34 | 35 | 128 | 130 | 230 | 270 | 271)
 }
 
 /// Makes the interrupted syscall `nr` run again when the frame resumes.
@@ -774,6 +854,9 @@ pub fn deliver(frame: &mut Frame, syscall: Option<u64>) {
     loop {
         enum Next {
             Done,
+            /// The caller's own mask is back after a temporary one: it may
+            /// let other signals through, or need them handed to others.
+            MaskRestored,
             Stop(u32),
             Die(u32),
             Handle(u32, SigAction, u64),
@@ -786,6 +869,9 @@ pub fn deliver(frame: &mut Frame, syscall: Option<u64>) {
             if t.stop && set & bit(SIGKILL) == 0 {
                 t.stop = false;
                 Next::Stop(0)
+            } else if set == 0 && t.restore_mask.is_some() {
+                t.mask = t.restore_mask.take().unwrap_or(t.mask);
+                Next::MaskRestored
             } else if set == 0 {
                 // Drop signals that are pending but ignored.
                 let ignored = (t.pending | g.pending) & !t.mask;
@@ -808,7 +894,8 @@ pub fn deliver(frame: &mut Frame, syscall: Option<u64>) {
                 } else if action.handler == SIG_DFL {
                     Next::Die(sig)
                 } else {
-                    let old_mask = t.mask;
+                    // After the handler, the mask from before a temporary one.
+                    let old_mask = t.restore_mask.take().unwrap_or(t.mask);
                     let mut block = action.mask;
                     if action.flags & SA_NODEFER == 0 {
                         block |= bit(sig);
@@ -829,6 +916,7 @@ pub fn deliver(frame: &mut Frame, syscall: Option<u64>) {
                 }
                 return;
             }
+            Next::MaskRestored => retarget(&current().group),
             Next::Stop(sig) => group_stop(sig),
             Next::Die(sig) => die(sig),
             Next::Handle(sig, action, old_mask) => {

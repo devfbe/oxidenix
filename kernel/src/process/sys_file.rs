@@ -492,8 +492,25 @@ pub fn poll_timeout(ms: i64) -> Option<u64> {
     (ms >= 0).then(|| (ms as u64).saturating_mul(1_000_000))
 }
 
-pub fn ppoll(fds: u64, nfds: u64, ts: u64) -> SysResult {
-    poll(fds, nfds, timeout(ts, crate::time::NSEC_PER_SEC)?)
+/// ppoll(fds, nfds, timeout, sigmask, size): poll with a timespec and a
+/// temporary signal mask.
+pub fn ppoll(fds: u64, nfds: u64, ts: u64, mask: u64, size: u64) -> SysResult {
+    let timeout = timeout(ts, crate::time::NSEC_PER_SEC)?;
+    let mask = super::signal::read_mask(mask, size)?;
+    super::signal::with_mask(mask, || poll(fds, nfds, timeout))
+}
+
+/// pselect6(nfds, read, write, except, timeout, {sigmask, size}).
+pub fn pselect6(nfds: u64, readfds: u64, writefds: u64, exceptfds: u64, ts: u64, sig: u64) -> SysResult {
+    let timeout = timeout(ts, crate::time::NSEC_PER_SEC)?;
+    let mask = match sig {
+        0 => None,
+        _ => {
+            let [ptr, size]: [u64; 2] = uaccess::read(sig)?;
+            super::signal::read_mask(ptr, size)?
+        }
+    };
+    super::signal::with_mask(mask, || select(nfds, readfds, writefds, exceptfds, timeout))
 }
 
 pub fn faccessat(dirfd: u64, path: u64) -> SysResult {
