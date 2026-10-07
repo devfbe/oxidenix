@@ -1,6 +1,6 @@
 # Page cache and file-backed mappings
 
-Status: steps 4a and 4b implemented; 4c and 4d in progress (see the end).
+Status: steps 4a-4c implemented; 4d in progress (see the end).
 
 ## Goals
 
@@ -94,9 +94,15 @@ state (`IrqSpinLock`: pages, size) → frames.
 
 - The size is cached in the page cache (all changes go through the kernel), so cached reads
   need no request.
-- A miss reads up to 32 KiB (one message) of missing pages ahead.
-- `write` sends the data to the server first, then updates the cached pages it covers, under
-  the I/O lock (a concurrent fill cannot insert stale data).
+- A miss reads up to 64 KiB of missing pages ahead.
+- `write` sends the data to the server first, then updates the cached pages it covers and
+  creates those it covers whole (or that lie past the old end), under the I/O lock (a
+  concurrent fill cannot insert stale data).
+- The caches belong to the filesystem client (`RemoteFs`), not to the VFS inode, which goes
+  with its last reference: as on Linux, pages stay cached after `close`. A cache goes when
+  the server frees the inode (its number may be reused) or once reclaim emptied it and nobody
+  uses it.
+- Filesystems whose files are generated on every read (procfs) are not cached.
 - Dirty pages of shared mappings are written back by `msync`, `fsync`/`fdatasync` and `sync`,
   and by a kernel flusher every 5 seconds. Dropping the last reference to a cache with dirty
   pages writes them back first.

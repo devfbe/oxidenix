@@ -97,8 +97,14 @@ pub fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64) ->
             Some(_) => return Err(ENODEV),
             None => {
                 let cache = inode.cache().map_err(|_| ENODEV)?;
+                // Stores into a shared mapping of a remote file would never
+                // reach the disk without write-back.
+                let may_write = f.writable() && !cache.is_remote();
+                if shared && prot.write && !may_write {
+                    return Err(ENODEV);
+                }
                 let file = crate::fs::MappedFile::new(inode, f.writable())?;
-                Backing::File { cache, offset, shared, may_write: f.writable(), _file: Some(file) }
+                Backing::File { cache, offset, shared, may_write, _file: Some(file) }
             }
         }
     };

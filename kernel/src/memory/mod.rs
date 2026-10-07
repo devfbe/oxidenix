@@ -230,29 +230,78 @@ pub fn phys_to_virt(addr: u64) -> *mut u8 {
 }
 
 /// Pages of memory promised to processes (writable private mappings, see
-/// process::address_space), and the most that may be promised: all usable
+/// process::address_space), pages of the file cache that can be dropped
+/// again (fs::cache), and the most both together may be: all usable
 /// frames except the kernel's reserve. Committing up front makes running
-/// out of memory an ENOMEM at mmap/brk/fork time instead of a fault.
-static COMMITTED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// out of memory an ENOMEM at mmap/brk/fork time instead of a fault;
+/// cached pages are reclaimed to make room for a commit.
+struct Account {
+    committed: u64,
+    cached: u64,
+}
+
+static ACCOUNT: IrqSpinLock<Account> = IrqSpinLock::new(Account { committed: 0, cached: 0 });
 static COMMIT_LIMIT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Drops up to the given number of reclaimable cache pages; returns how
+/// many it dropped (set by the file cache).
+static RECLAIM: Once<fn(u64) -> u64> = Once::new();
+
+pub fn set_reclaim(f: fn(u64) -> u64) {
+    RECLAIM.call_once(|| f);
+}
+
+/// Adds `pages` to the committed or (`cache`) the cached pages if both
+/// together stay within the limit, reclaiming cache pages for room. Never
+/// called with a page cache lock held (reclaiming takes them).
+fn charge(pages: u64, cache: bool) -> bool {
+    loop {
+        let over = {
+            let mut a = ACCOUNT.lock();
+            let limit = COMMIT_LIMIT.load(core::sync::atomic::Ordering::Relaxed);
+            let total = a.committed.saturating_add(a.cached).saturating_add(pages);
+            if total <= limit {
+                *(if cache { &mut a.cached } else { &mut a.committed }) += pages;
+                return true;
+            }
+            // Reclaiming can at most empty the cache.
+            if a.committed.saturating_add(pages) > limit || a.cached == 0 {
+                return false;
+            }
+            total - limit
+        };
+        if RECLAIM.get().map_or(0, |reclaim| reclaim(over)) == 0 {
+            return false;
+        }
+    }
+}
 
 /// Promises `pages` pages; false (nothing promised) if over the limit.
 pub fn commit(pages: u64) -> bool {
-    use core::sync::atomic::Ordering;
-    let limit = COMMIT_LIMIT.load(Ordering::Relaxed);
-    COMMITTED
-        .try_update(Ordering::Relaxed, Ordering::Relaxed, |c| c.checked_add(pages).filter(|&n| n <= limit))
-        .is_ok()
+    charge(pages, false)
 }
 
 pub fn uncommit(pages: u64) {
-    COMMITTED.fetch_sub(pages, core::sync::atomic::Ordering::Relaxed);
+    ACCOUNT.lock().committed -= pages;
+}
+
+/// Accounts `pages` new pages of the file cache; false if they would not
+/// fit even after reclaiming others.
+pub fn cache_charge(pages: u64) -> bool {
+    charge(pages, true)
+}
+
+pub fn cache_uncharge(pages: u64) {
+    ACCOUNT.lock().cached -= pages;
 }
 
 /// (committed, limit) in pages.
 pub fn commit_stats() -> (u64, u64) {
-    use core::sync::atomic::Ordering;
-    (COMMITTED.load(Ordering::Relaxed), COMMIT_LIMIT.load(Ordering::Relaxed))
+    (ACCOUNT.lock().committed, COMMIT_LIMIT.load(core::sync::atomic::Ordering::Relaxed))
+}
+
+/// Reclaimable pages of the file cache.
+pub fn cached_pages() -> u64 {
+    ACCOUNT.lock().cached
 }
 
 pub fn with_frames<R>(f: impl FnOnce(&mut PhysFrameAllocator) -> R) -> R {

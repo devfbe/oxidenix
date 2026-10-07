@@ -244,6 +244,9 @@ impl Inode {
 
     pub fn size(&self) -> u64 {
         if let Some(d) = self.disk_ref() {
+            if let Some(c) = d.fs.cached(d.ino) {
+                return c.size();
+            }
             return d.fs.stat(d.ino).map_or(0, |s| s.size);
         }
         match &*self.node.lock() {
@@ -370,6 +373,11 @@ impl Inode {
         }
     }
 
+    /// The server of a file whose contents are not cached (procfs).
+    fn uncached(&self) -> Option<DiskRef> {
+        self.disk_ref().filter(|d| !d.fs.cacheable)
+    }
+
     /// Only regular files have contents to read or write.
     fn require_regular(&self) -> Result<(), i64> {
         match self.file_type() {
@@ -380,7 +388,7 @@ impl Inode {
     }
 
     pub fn read_at(&self, off: u64, buf: &mut [u8]) -> Result<usize, i64> {
-        if let Some(d) = self.disk_ref() {
+        if let Some(d) = self.uncached() {
             self.require_regular()?;
             return d.fs.read(d.ino, off, buf);
         }
@@ -388,7 +396,7 @@ impl Inode {
     }
 
     pub fn write_at(&self, off: u64, buf: &[u8]) -> Result<usize, i64> {
-        if let Some(d) = self.disk_ref() {
+        if let Some(d) = self.uncached() {
             self.require_regular()?;
             return d.fs.write(d.ino, off, buf);
         }
@@ -396,17 +404,21 @@ impl Inode {
     }
 
     pub fn truncate(&self, len: u64) -> Result<(), i64> {
-        if let Some(d) = self.disk_ref() {
+        if let Some(d) = self.uncached() {
             self.require_regular()?;
             return d.fs.truncate(d.ino, len);
         }
         self.cache()?.truncate(len)
     }
 
-    /// The page cache of a regular file (EISDIR, EINVAL for others). The
-    /// inode lock is released before the cache is used: its operations
-    /// may sleep.
+    /// The page cache of a regular file (EISDIR, EINVAL for others). A
+    /// file on a filesystem server gets one from its filesystem (where it
+    /// outlives this inode); ENODEV if that filesystem caches nothing. No inode lock is held while the cache is
+    /// used: its operations may sleep.
     pub fn cache(&self) -> Result<Arc<cache::PageCache>, i64> {
+        if let Some(d) = self.disk_ref() {
+            return d.fs.page_cache(d.ino);
+        }
         match &*self.node.lock() {
             Node::File(c) => Ok(c.clone()),
             Node::Dir(_) => Err(EISDIR),
@@ -548,7 +560,8 @@ pub fn mount_remote(
     device: &str,
     fstype: &str,
 ) -> Result<(), i64> {
-    let fs = remote::RemoteFs::new(service, server);
+    // Only a disk filesystem's files keep their contents between reads.
+    let fs = remote::RemoteFs::new(service, server, fstype == "ext2");
     let root = root();
     if let Ok(old) = root.child(name) {
         for (entry, _, _) in old.list()? {

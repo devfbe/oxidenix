@@ -1,7 +1,10 @@
 //! Client side of a filesystem served by a user-space process (diskfs):
-//! every operation becomes an IPC request in the `fsproto` format.
+//! every operation becomes an IPC request in the `fsproto` format. File
+//! contents of a disk filesystem go through the page caches kept here
+//! (`fs::cache`), which outlive the VFS inodes.
 
-use super::{Inode, NewNode};
+use super::cache::PageCache;
+use super::{Inode, NewNode, S_IFDIR, S_IFMT, S_IFREG};
 use crate::process::errno::*;
 use crate::process::{ipc, Server};
 use alloc::collections::{BTreeMap, BTreeSet};
@@ -31,6 +34,14 @@ pub struct RemoteFs {
     /// Unlinked inodes still open here; released when the last VFS
     /// reference is dropped.
     deferred: Mutex<BTreeSet<u32>>,
+    /// Page caches of regular files. They outlive the VFS inodes (which
+    /// go with the last reference), as Linux keeps inodes and their pages
+    /// after close, until reclaim empties them or the file is released
+    /// (its inode number may then be reused).
+    pages: Mutex<BTreeMap<u32, Arc<PageCache>>>,
+    /// Whether file contents may be cached: true for a disk filesystem,
+    /// false for one whose files are generated on every read (procfs).
+    pub cacheable: bool,
 }
 
 struct Reply {
@@ -40,12 +51,14 @@ struct Reply {
 }
 
 impl RemoteFs {
-    pub fn new(service: usize, server: Arc<Server>) -> Arc<RemoteFs> {
+    pub fn new(service: usize, server: Arc<Server>, cacheable: bool) -> Arc<RemoteFs> {
         Arc::new(RemoteFs {
             service: AtomicUsize::new(service),
             server,
             cache: Mutex::new(BTreeMap::new()),
             deferred: Mutex::new(BTreeSet::new()),
+            pages: Mutex::new(BTreeMap::new()),
+            cacheable,
         })
     }
 
@@ -83,6 +96,35 @@ impl RemoteFs {
         let inode = Inode::disk(self.clone(), ino);
         cache.insert(ino, Arc::downgrade(&inode));
         inode
+    }
+
+    /// The page cache of `ino`, if it has one.
+    pub fn cached(&self, ino: u32) -> Option<Arc<PageCache>> {
+        self.pages.lock().get(&ino).cloned()
+    }
+
+    /// The page cache of regular file `ino` (EISDIR, EINVAL for others),
+    /// made on first use.
+    pub fn page_cache(self: &Arc<Self>, ino: u32) -> Result<Arc<PageCache>, i64> {
+        if !self.cacheable {
+            return Err(ENODEV);
+        }
+        if let Some(c) = self.cached(ino) {
+            return Ok(c);
+        }
+        // One request for the type and the size, outside of any lock.
+        let st = self.stat(ino)?;
+        match st.mode & S_IFMT {
+            S_IFREG => {}
+            S_IFDIR => return Err(EISDIR),
+            _ => return Err(EINVAL),
+        }
+        let made = PageCache::remote(self.clone(), ino, st.size)?;
+        let mut pages = self.pages.lock();
+        // Caches reclaim emptied and nobody uses go now.
+        pages.retain(|_, c| Arc::strong_count(c) > 1 || !c.is_empty());
+        // Another caller may have made one meanwhile: use the first.
+        Ok(pages.entry(ino).or_insert(made).clone())
     }
 
     pub fn stat(&self, ino: u32) -> Result<RemoteStat, i64> {
@@ -177,6 +219,9 @@ impl RemoteFs {
     }
 
     fn release(&self, ino: u32) {
+        // Its number may be reused for another file: forget its pages.
+        let gone = self.pages.lock().remove(&ino);
+        drop(gone);
         ipc::post(self.service.load(Ordering::Relaxed), fsproto::encode_request(Op::Release, 0, [ino as u64, 0, 0, 0], &[]));
     }
 

@@ -287,8 +287,17 @@ About 9,200 lines of Rust (without comments and blank lines) in the kernel and 3
   run while it is open for writing (`ETXTBSY`), as on Linux. A mapping made through a descriptor
   open for writing keeps that right after the descriptor is closed, as on Linux, so a program
   cannot be changed through a shared mapping while it runs. Servers run from a private copy
-  taken at boot, and a program on a filesystem server runs from a copy until such files have a
-  page cache too.
+  taken at boot.
+- **Disk files are cached** (the remote store): a file of a disk filesystem server (`/data`)
+  keeps its pages in the same page cache. A miss reads up to 64 KiB of missing pages in one
+  go; `write` sends the data to the server first (so writes stay synchronous and durable) and
+  then puts it into the cached pages, creating those it covers whole. The cache also keeps the
+  file size, so cached reads need no request at all: reading 2 MiB takes 0.3 ms from the cache
+  and 4.4 s from the disk. As on Linux, a file's pages stay cached after it is closed (the
+  caches belong to the filesystem, not to the short-lived VFS inode) until reclaim takes them
+  or the server frees the inode (whose number may then be reused). procfs generates its files on
+  every read, so they are never cached. Writable shared mappings of disk files are refused
+  (`ENODEV`) until write-back exists.
 - **Protection**: `mprotect` really changes the rights (including `PROT_NONE`, which keeps the
   pages' contents in entries marked by a software bit) and execution is denied by NX unless an
   area is executable, so JIT compilers can write code and then make it executable (W^X).
@@ -296,7 +305,11 @@ About 9,200 lines of Rust (without comments and blank lines) in the kernel and 3
   promised when it is mapped, against all usable RAM except the kernel's reserve. Running out is
   an `ENOMEM` from `mmap`, `brk`, `mprotect`, `mremap` or `fork`, not a killed process.
   `PROT_NONE` and `MAP_NORESERVE` mappings promise nothing until they become writable, so huge
-  reservations (as V8 makes) are cheap. `/proc/meminfo` shows `Committed_AS` and `CommitLimit`.
+  reservations (as V8 makes) are cheap. Cached disk pages count against the same limit but give
+  way: when a commit (or a new cache page) would exceed it, clean cached pages that no mapping
+  uses are dropped first, visiting the files in turn and giving a page used since the last look
+  a second chance. `/proc/meminfo` shows `Committed_AS`, `CommitLimit`, `Cached` (with tmpfs),
+  `Shmem` (tmpfs and shared memory) and a `MemAvailable` that includes the droppable pages.
 - **Copy-on-write**: `fork` shares all private frames. Writable pages become read-only in both
   processes and are tagged with an OS-available page table bit. A write fault either copies the
   frame or, for the last owner, just restores write access. Shared memory stays shared.
@@ -547,7 +560,7 @@ interrupt dispatch; drivers and filesystems move into user-space servers.
   same memory instead of leaking it while the device may still write to it.
 - **Remote filesystems**: the VFS has a second kind of inode whose operations become
   `fsproto` requests to a server (`fs/remote.rs`). Reads and writes are split into 32 KiB
-  messages. The kernel still decides when an unlinked inode may be freed, because only it knows
+  messages; file contents of a disk filesystem go through the page cache. The kernel still decides when an unlinked inode may be freed, because only it knows
   whether a file is open.
 - **Fault isolation**: when a server dies, its services are marked dead and every pending
   request fails with `EIO`; the kernel and the rest of user space keep running.
@@ -632,7 +645,8 @@ interrupt dispatch; drivers and filesystems move into user-space servers.
   `rename` across directories (with `..` and link count updates and a cycle check), `rmdir`, and
   `chmod`. Allocation goes through the block and inode bitmaps, and group descriptors and the
   superblock's free counts are updated on every change.
-- Writes are synchronous (no cache), so `sync`/`fsync` have nothing left to do. After a session,
+- Writes are synchronous (the page cache writes through, diskfs has no block cache), so
+  `sync`/`fsync` have nothing left to do. After a session,
   `e2fsck -fn disk.img` on the host reports a clean filesystem, and `debugfs` can read the files.
 - **VFS integration**: every inode operation (`child`, `list`, `create`, `unlink`, `read_at`,
   `write_at`, `truncate`, ...) works on memory and remote (server-backed) inodes alike. Remote inodes are cached per
@@ -733,6 +747,7 @@ Each of these programs and scripts lives in the root filesystem and runs inside 
 | `nettest` | TCP to an echo service through QEMU, `ECONNREFUSED`, `listen`/`accept` over loopback with a forked client, EOF after the peer closed, non-blocking `accept` and `connect` with `poll` and `SO_ERROR`, `EINTR` in a blocking `recv`, UDP over loopback, raw ICMP echo to the gateway and over loopback, source address for off-subnet destinations, overflowing message vectors, `AF_INET6` rejected |
 | `mmaptest` | shared file mappings: stores visible to `read` and `write` visible in the mapping at once, another process's own mapping of the file, the size unchanged by stores; private mappings seeing `write` until they write a page, and never reaching the file; mappings outliving `close` and `unlink`; the zero tail of the last page and `SIGBUS` beyond it; growing and shrinking with `ftruncate` (`SIGBUS` in shared pages and private copies beyond the new end, zeros after growing again); `EACCES` for writable sharing of a read-only descriptor (also via `mprotect`); shared anonymous memory across 8 children; mapping initramfs files |
 | `exectest` | eight runs of one program sharing its pages (less memory than one copy), data and bss of the loaded program, `ETXTBSY` for opening or truncating a running program and for running a program open for writing or mapped through a writable descriptor (not after `munmap`, not for a read-only mapping), a changed program file taking effect on the next run, a running program surviving the deletion of its file |
+| `cachetest` | the page cache of `/data` files: data read back right after writing (from memory), `Cached` in `/proc/meminfo`, committing all free memory reclaims cached pages (and all of it can be used), the file read again from the disk afterwards, read-only shared and private mappings of a disk file, `pwrite` visible to `pread` and both mappings, private stores staying private, `ftruncate` shrinking and growing (zeros, not old data, in reads and the mapping), a program on the disk running from the cache and `ETXTBSY` while it runs |
 | `sh /etc/test.sh` | files, pipes, `cd`, `mkdir`/`touch`/`rm`, rename cycles via symlinks, the tmpfs size limit |
 | `fstest` | descriptor access modes (`EBADF` on read-only/write-only fds), `O_NOFOLLOW` on symlinks, unlinked-but-open files (kept until closed, never shared with new files), ext2 size limits, overflowing `mmap` offsets |
 | `sh /etc/disktest.sh` | ext2: 150-file directory, 1.5 MiB file (double indirect), append, truncate, rename, cycles, symlinks, `rm -r`, space accounting |

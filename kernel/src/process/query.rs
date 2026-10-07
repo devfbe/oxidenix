@@ -37,6 +37,9 @@ fn system() -> System {
     let (committed, limit) = crate::memory::commit_stats();
     s.committed = committed * 4096;
     s.commit_limit = limit * 4096;
+    let shmem = crate::fs::cache::tmpfs_usage().0;
+    s.shmem = shmem * 4096;
+    s.cached = (crate::memory::cached_pages() + shmem) * 4096;
     s
 }
 

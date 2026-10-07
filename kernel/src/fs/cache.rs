@@ -12,10 +12,21 @@
 //! initramfs image (while that part of the file was never cut off) or is
 //! zero; `read` takes those bytes without creating the page.
 //!
+//! The remote store caches the pages of a file served by a filesystem
+//! server. A miss reads up to 64 KiB of missing pages; `write` goes to the
+//! server first (write-through) and then into the cached pages, which it
+//! also creates for whole pages it covers. The size is kept here: every
+//! change goes through the kernel. Its pages are counted as cached memory
+//! (`memory::cache_charge`), which commits and new cache pages reclaim:
+//! clean pages that no mapping uses, a page used since the last look
+//! getting a second chance.
+//!
 //! Lock order: address space (sleeping) → `io` (sleeping) → `state` →
-//! frames. `io` serializes changes of contents and size (`write`,
-//! `truncate`); it is never held while an address space is locked.
+//! frames. `io` serializes what changes contents or size and talks to the
+//! server (filling pages, `write`, `truncate`); it is never held while an
+//! address space is locked. Cache hits only take `state`.
 
+use super::remote::RemoteFs;
 use crate::memory;
 use crate::memory::frame::UserFrames;
 use crate::process::address_space::{Fault, Mm, PAGE};
@@ -24,20 +35,30 @@ use crate::sync::{IrqSpinLock, Mutex};
 use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use x86_64::structures::paging::{FrameAllocator, FrameDeallocator, PhysFrame};
 
 /// Largest file size (as `off_t` allows).
 pub const MAX_SIZE: u64 = i64::MAX as u64;
+/// Pages a miss reads from a server at once.
+const READAHEAD: u64 = 16;
+/// Pages reclaim looks at per hold of a cache's lock.
+const RECLAIM_BATCH: usize = 256;
 
 /// Pages of tmpfs file contents, and their limit: half of what may be
 /// committed, as Linux's default tmpfs size.
 static TMPFS_PAGES: AtomicU64 = AtomicU64::new(0);
 static TMPFS_LIMIT: AtomicU64 = AtomicU64::new(0);
 
-/// Sets the tmpfs limit from the commit limit (after memory::init).
+/// Caches with a remote store, for reclaim; the next one to look at.
+static REMOTE: IrqSpinLock<Vec<Weak<PageCache>>> = IrqSpinLock::new(Vec::new());
+static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+/// Sets the tmpfs limit from the commit limit (after memory::init) and
+/// lets commits reclaim cached pages.
 pub fn init() {
     TMPFS_LIMIT.store(memory::commit_stats().1 / 2, Ordering::Relaxed);
+    memory::set_reclaim(reclaim);
 }
 
 /// (pages used, page limit) of tmpfs.
@@ -51,15 +72,26 @@ enum Store {
     /// pages below `prepaid` were committed when the cache was created
     /// (anonymous shared memory) and are not charged again.
     Memory { image: &'static [u8], prepaid: u64 },
+    /// Inode `ino` of a filesystem server.
+    Remote { fs: Arc<RemoteFs>, ino: u32 },
+}
+
+struct Page {
+    frame: PhysFrame,
+    /// Used since reclaim last looked at it.
+    referenced: bool,
 }
 
 struct State {
-    pages: BTreeMap<u64, PhysFrame>,
+    pages: BTreeMap<u64, Page>,
     size: u64,
     /// Bytes of `image` still valid as file contents (truncation cuts it).
     image_len: u64,
-    /// Pages charged to commit and tmpfs (memory store, beyond `prepaid`).
+    /// Pages charged: to commit and tmpfs (memory store, beyond
+    /// `prepaid`), or as cached memory (remote store).
     charged: u64,
+    /// The page index reclaim continues at.
+    cursor: u64,
 }
 
 pub struct PageCache {
@@ -70,7 +102,7 @@ pub struct PageCache {
     mappers: IrqSpinLock<Vec<Weak<Mm>>>,
 }
 
-/// A page charged to commit and tmpfs, released on drop unless kept.
+/// A tmpfs page charged to commit and tmpfs, released on drop unless kept.
 struct Charge(bool);
 
 impl Charge {
@@ -94,12 +126,12 @@ impl Charge {
 impl Drop for Charge {
     fn drop(&mut self) {
         if self.0 {
-            uncharge(1);
+            uncharge_tmpfs(1);
         }
     }
 }
 
-fn uncharge(pages: u64) {
+fn uncharge_tmpfs(pages: u64) {
     if pages > 0 {
         TMPFS_PAGES.fetch_sub(pages, Ordering::Relaxed);
         memory::uncommit(pages);
@@ -114,10 +146,22 @@ fn page_of(off: u64) -> u64 {
     off / PAGE
 }
 
+fn new_frame() -> Option<PhysFrame> {
+    memory::with_frames(|f| UserFrames(f).allocate_frame())
+}
+
+fn free_frames(frames: impl IntoIterator<Item = PhysFrame>) {
+    memory::with_frames(|f| {
+        for frame in frames {
+            unsafe { f.deallocate_frame(frame) };
+        }
+    });
+}
+
 impl PageCache {
     fn new(store: Store, size: u64, image_len: u64) -> Result<Arc<PageCache>, i64> {
         Arc::try_new(PageCache {
-            state: IrqSpinLock::new(State { pages: BTreeMap::new(), size, image_len, charged: 0 }),
+            state: IrqSpinLock::new(State { pages: BTreeMap::new(), size, image_len, charged: 0, cursor: 0 }),
             io: Mutex::new(()),
             store,
             mappers: IrqSpinLock::new(Vec::new()),
@@ -142,6 +186,16 @@ impl PageCache {
         })
     }
 
+    /// The cache of inode `ino` of a filesystem server, `size` bytes long.
+    pub fn remote(fs: Arc<RemoteFs>, ino: u32, size: u64) -> Result<Arc<PageCache>, i64> {
+        let cache = Self::new(Store::Remote { fs, ino }, size, 0)?;
+        let mut list = REMOTE.lock();
+        list.retain(|c| c.strong_count() > 0);
+        list.try_reserve(1).map_err(|_| ENOMEM)?;
+        list.push(Arc::downgrade(&cache));
+        Ok(cache)
+    }
+
     /// A private in-memory copy of a file's current contents (a server's
     /// program, kept unchanged whatever happens to the file later).
     pub fn copy_of(file: &super::Inode) -> Result<Arc<PageCache>, i64> {
@@ -163,34 +217,50 @@ impl PageCache {
         Ok(copy)
     }
 
+    /// Whether no page is cached.
+    pub fn is_empty(&self) -> bool {
+        self.state.lock().pages.is_empty()
+    }
+
+    /// Whether the file lives on a filesystem server.
+    pub fn is_remote(&self) -> bool {
+        self.remote_store().is_some()
+    }
+
     pub fn size(&self) -> u64 {
         self.state.lock().size
+    }
+
+    fn remote_store(&self) -> Option<(&Arc<RemoteFs>, u32)> {
+        match &self.store {
+            Store::Remote { fs, ino } => Some((fs, *ino)),
+            Store::Memory { .. } => None,
+        }
     }
 
     fn prepaid(&self) -> u64 {
         match self.store {
             Store::Memory { prepaid, .. } => prepaid,
+            Store::Remote { .. } => 0,
         }
     }
 
-    fn image(&self) -> &'static [u8] {
-        match self.store {
+    /// The initial contents of a missing memory-store page into `out`.
+    fn fill_memory(&self, st: &State, index: u64, out: &mut [u8]) {
+        let image = match self.store {
             Store::Memory { image, .. } => image,
-        }
-    }
-
-    /// The initial contents of a missing page into `out` (a page).
-    fn fill(&self, st: &State, index: u64, out: &mut [u8]) {
+            Store::Remote { .. } => &[],
+        };
         let start = index * PAGE;
-        let valid = (st.image_len.min(st.size) as usize).min(self.image().len());
+        let valid = (st.image_len.min(st.size) as usize).min(image.len());
         let from = (start as usize).min(valid);
         let to = ((start + PAGE) as usize).min(valid);
-        out[..to - from].copy_from_slice(&self.image()[from..to]);
+        out[..to - from].copy_from_slice(&image[from..to]);
         out[to - from..].fill(0);
     }
 
-    /// Creates page `index` if it is missing.
-    fn ensure(&self, index: u64) -> Result<(), i64> {
+    /// Creates page `index` of a memory store if it is missing.
+    fn create(&self, index: u64) -> Result<(), i64> {
         if self.state.lock().pages.contains_key(&index) {
             return Ok(());
         }
@@ -200,9 +270,9 @@ impl PageCache {
         if st.pages.contains_key(&index) {
             return Ok(());
         }
-        let frame = memory::with_frames(|f| UserFrames(f).allocate_frame()).ok_or(ENOMEM)?;
-        self.fill(&st, index, frame_bytes(frame));
-        st.pages.insert(index, frame);
+        let frame = new_frame().ok_or(ENOMEM)?;
+        self.fill_memory(&st, index, frame_bytes(frame));
+        st.pages.insert(index, Page { frame, referenced: true });
         if let Some(c) = charge {
             c.keep();
             st.charged += 1;
@@ -210,51 +280,184 @@ impl PageCache {
         Ok(())
     }
 
-    /// Reads up to `buf.len()` bytes at `off` (fewer at the end of the
-    /// file). Never sleeps.
-    pub fn read(&self, off: u64, buf: &mut [u8]) -> Result<usize, i64> {
-        let st = self.state.lock();
-        let end = off.saturating_add(buf.len() as u64).min(st.size);
-        let mut pos = off;
-        while pos < end {
-            let (index, in_page) = (page_of(pos), (pos % PAGE) as usize);
-            let n = ((PAGE as usize) - in_page).min((end - pos) as usize);
-            let out = &mut buf[(pos - off) as usize..][..n];
-            match st.pages.get(&index) {
-                Some(&frame) => out.copy_from_slice(&frame_bytes(frame)[in_page..in_page + n]),
-                None => {
-                    let mut page = [0u8; PAGE as usize];
-                    self.fill(&st, index, &mut page);
-                    out.copy_from_slice(&page[in_page..in_page + n]);
-                }
-            }
-            pos += n as u64;
+    /// Reads page `index` of a remote store (and missing pages after it)
+    /// from the server, unless it is there by now. ENOMEM if no page could
+    /// be cached.
+    fn fetch(&self, index: u64) -> Result<(), i64> {
+        let (fs, ino) = self.remote_store().expect("remote store");
+        let _io = self.io.lock();
+        let (count, size) = {
+            let st = self.state.lock();
+            let last = page_of(st.size.saturating_add(PAGE - 1));
+            let count = (index..last.min(index + READAHEAD)).take_while(|i| !st.pages.contains_key(i)).count() as u64;
+            (count, st.size)
+        };
+        if count == 0 {
+            return Ok(());
         }
-        Ok(end.saturating_sub(off) as usize)
+        // One page will do if more do not fit.
+        let count = if memory::cache_charge(count) {
+            count
+        } else if count > 1 && memory::cache_charge(1) {
+            1
+        } else {
+            return Err(ENOMEM);
+        };
+        let start = index * PAGE;
+        let bytes = (count * PAGE).min(size - start) as usize;
+        let mut buf = Vec::new();
+        if buf.try_reserve_exact(bytes).is_err() {
+            memory::cache_uncharge(count);
+            return Err(ENOMEM);
+        }
+        buf.resize(bytes, 0);
+        let n = match fs.read(ino, start, &mut buf) {
+            Ok(n) => n,
+            Err(e) => {
+                memory::cache_uncharge(count);
+                return Err(e);
+            }
+        };
+        let mut st = self.state.lock();
+        let mut got = 0;
+        for i in 0..count {
+            let Some(frame) = new_frame() else { break };
+            let page = frame_bytes(frame);
+            let from = ((i * PAGE) as usize).min(n);
+            let to = (((i + 1) * PAGE) as usize).min(n);
+            page[..to - from].copy_from_slice(&buf[from..to]);
+            page[to - from..].fill(0);
+            // Nothing else inserts remote pages without `io`.
+            st.pages.insert(index + i, Page { frame, referenced: true });
+            got += 1;
+        }
+        st.charged += got;
+        drop(st);
+        memory::cache_uncharge(count - got);
+        if got == 0 {
+            return Err(ENOMEM);
+        }
+        Ok(())
+    }
+
+    /// Reads up to `buf.len()` bytes at `off` (fewer at the end of the
+    /// file). Sleeps only to read missing pages of a remote store.
+    pub fn read(&self, off: u64, buf: &mut [u8]) -> Result<usize, i64> {
+        let mut pos = off;
+        loop {
+            let missing = {
+                let mut st = self.state.lock();
+                let end = off.saturating_add(buf.len() as u64).min(st.size);
+                let mut missing = None;
+                while pos < end {
+                    let (index, in_page) = (page_of(pos), (pos % PAGE) as usize);
+                    let n = ((PAGE as usize) - in_page).min((end - pos) as usize);
+                    let out = &mut buf[(pos - off) as usize..][..n];
+                    match st.pages.get_mut(&index) {
+                        Some(page) => {
+                            page.referenced = true;
+                            out.copy_from_slice(&frame_bytes(page.frame)[in_page..in_page + n]);
+                        }
+                        None if self.remote_store().is_none() => {
+                            let mut page = [0u8; PAGE as usize];
+                            self.fill_memory(&st, index, &mut page);
+                            out.copy_from_slice(&page[in_page..in_page + n]);
+                        }
+                        None => {
+                            missing = Some((index, end));
+                            break;
+                        }
+                    }
+                    pos += n as u64;
+                }
+                missing
+            };
+            let Some((index, end)) = missing else {
+                return Ok(pos.saturating_sub(off) as usize);
+            };
+            match self.fetch(index) {
+                Ok(()) => {}
+                // No room to cache it: read this page past the cache.
+                Err(ENOMEM) => {
+                    let (fs, ino) = self.remote_store().expect("remote store");
+                    let stop = ((index + 1) * PAGE).min(end);
+                    let n = fs.read(ino, pos, &mut buf[(pos - off) as usize..(stop - off) as usize])?;
+                    pos += n as u64;
+                    if pos < stop {
+                        return Ok((pos - off) as usize);
+                    }
+                }
+                Err(e) if pos == off => return Err(e),
+                Err(_) => return Ok((pos - off) as usize),
+            }
+        }
     }
 
     /// Writes `data` at `off`, growing the file.
     pub fn write(&self, off: u64, data: &[u8]) -> Result<usize, i64> {
-        let end = off.checked_add(data.len() as u64).filter(|&e| e <= MAX_SIZE).ok_or(EFBIG)?;
+        off.checked_add(data.len() as u64).filter(|&e| e <= MAX_SIZE).ok_or(EFBIG)?;
         let _io = self.io.lock();
+        let written = match self.remote_store() {
+            // Write-through: the server has the data before the cache.
+            Some((fs, ino)) => fs.write(ino, off, data)?,
+            None => data.len(),
+        };
+        let end = off + written as u64;
         let mut pos = off;
         while pos < end {
             let (index, in_page) = (page_of(pos), (pos % PAGE) as usize);
             let n = ((PAGE as usize) - in_page).min((end - pos) as usize);
-            if let Err(e) = self.ensure(index) {
+            let chunk = &data[(pos - off) as usize..][..n];
+            let stored = match self.remote_store() {
+                None => self.create(index).map(|_| true),
+                Some(_) => Ok(self.cache_written(index, in_page, n)),
+            };
+            if let Err(e) = stored {
                 // A short write if some data went in.
                 return if pos == off { Err(e) } else { Ok((pos - off) as usize) };
             }
             let mut st = self.state.lock();
-            let frame = *st.pages.get(&index).expect("created above, kept by io");
             if pos > st.size {
                 Self::grow(&mut st, pos);
             }
-            frame_bytes(frame)[in_page..in_page + n].copy_from_slice(&data[(pos - off) as usize..][..n]);
+            if let Some(page) = st.pages.get(&index) {
+                frame_bytes(page.frame)[in_page..in_page + n].copy_from_slice(chunk);
+            }
             st.size = st.size.max(pos + n as u64);
             pos += n as u64;
         }
-        Ok(data.len())
+        Ok(written)
+    }
+
+    /// For a write of `n` bytes at `in_page` into page `index` of a remote
+    /// store: creates the page (zeroed) if the write covers all of it that
+    /// has data (or it lies past the end), so written data is cached; a
+    /// page that would need reading first is not created. Whether the page
+    /// is cached now.
+    fn cache_written(&self, index: u64, in_page: usize, n: usize) -> bool {
+        let size = {
+            let st = self.state.lock();
+            if st.pages.contains_key(&index) {
+                return true;
+            }
+            st.size
+        };
+        let start = index * PAGE;
+        let old_data_end = size.saturating_sub(start).min(PAGE) as usize;
+        // A page wholly past the old end held only zeros.
+        let covers = start >= size || (in_page == 0 && n >= old_data_end);
+        if !covers || !memory::cache_charge(1) {
+            return false;
+        }
+        let Some(frame) = new_frame() else {
+            memory::cache_uncharge(1);
+            return false;
+        };
+        frame_bytes(frame).fill(0);
+        let mut st = self.state.lock();
+        st.pages.insert(index, Page { frame, referenced: true });
+        st.charged += 1;
+        true
     }
 
     /// Extends the file to `len` (> size): bytes past the old end in its
@@ -262,9 +465,9 @@ impl PageCache {
     fn grow(st: &mut State, len: u64) {
         let tail = st.size % PAGE;
         if tail != 0 {
-            if let Some(&frame) = st.pages.get(&page_of(st.size)) {
+            if let Some(page) = st.pages.get(&page_of(st.size)) {
                 let stop = (PAGE).min(tail + (len - st.size)) as usize;
-                frame_bytes(frame)[tail as usize..stop].fill(0);
+                frame_bytes(page.frame)[tail as usize..stop].fill(0);
             }
         }
         st.size = len;
@@ -279,6 +482,9 @@ impl PageCache {
         }
         let first_gone = {
             let _io = self.io.lock();
+            if let Some((fs, ino)) = self.remote_store() {
+                fs.truncate(ino, len)?;
+            }
             let mut st = self.state.lock();
             if len >= st.size {
                 Self::grow(&mut st, len);
@@ -286,8 +492,8 @@ impl PageCache {
             }
             let first_gone = page_of(len + PAGE - 1);
             if len % PAGE != 0 {
-                if let Some(&frame) = st.pages.get(&page_of(len)) {
-                    frame_bytes(frame)[(len % PAGE) as usize..].fill(0);
+                if let Some(page) = st.pages.get(&page_of(len)) {
+                    frame_bytes(page.frame)[(len % PAGE) as usize..].fill(0);
                 }
             }
             let gone = st.pages.split_off(&first_gone);
@@ -297,38 +503,91 @@ impl PageCache {
             st.size = len;
             st.image_len = st.image_len.min(len);
             drop(st);
-            memory::with_frames(|f| {
-                for frame in gone.into_values() {
-                    unsafe { f.deallocate_frame(frame) };
-                }
-            });
-            uncharge(charged);
+            free_frames(gone.into_values().map(|p| p.frame));
+            self.uncharge(charged);
             first_gone
         };
         self.unmap_from(first_gone);
         Ok(())
     }
 
+    /// Releases the accounting of `pages` dropped pages.
+    fn uncharge(&self, pages: u64) {
+        match self.store {
+            Store::Memory { .. } => uncharge_tmpfs(pages),
+            Store::Remote { .. } if pages > 0 => memory::cache_uncharge(pages),
+            Store::Remote { .. } => {}
+        }
+    }
+
     /// For a fault at page `index` of the file: its frame, with a new
-    /// reference for the mapping (SIGBUS beyond the end of the file).
+    /// reference for the mapping (SIGBUS beyond the end of the file or if
+    /// the page cannot be read).
     pub fn map_page(&self, index: u64) -> Result<PhysFrame, Fault> {
         loop {
             if index >= page_of(self.size().saturating_add(PAGE - 1)) {
                 return Err(Fault::Bus);
             }
-            match self.ensure(index) {
+            let made = match self.remote_store() {
+                None => self.create(index),
+                Some(_) => self.fetch(index),
+            };
+            match made {
                 Ok(()) => {}
                 Err(ENOMEM) => return Err(Fault::Oom),
-                // tmpfs is full: no page to map, as on Linux.
+                // tmpfs is full or the server failed: no page to map, as
+                // on Linux.
                 Err(_) => return Err(Fault::Bus),
             }
-            let st = self.state.lock();
-            // Gone again if a truncation came in between: check the size.
-            if let Some(&frame) = st.pages.get(&index) {
-                memory::with_frames(|f| f.share(frame));
-                return Ok(frame);
+            let mut st = self.state.lock();
+            // Gone again if a truncation or reclaim came in between.
+            if let Some(page) = st.pages.get_mut(&index) {
+                page.referenced = true;
+                memory::with_frames(|f| f.share(page.frame));
+                return Ok(page.frame);
             }
         }
+    }
+
+    /// Drops up to `want` clean pages that only the cache uses, giving a
+    /// page used since the last look a second chance. Returns how many.
+    fn shrink(&self, want: u64) -> u64 {
+        let mut freed = 0;
+        let mut seen = 0;
+        loop {
+            let mut st = self.state.lock();
+            // Two turns around the file: the first may only clear marks.
+            if freed >= want || seen >= 2 * st.pages.len() {
+                break;
+            }
+            let start = st.cursor;
+            let (mut gone, mut frames) = (Vec::new(), Vec::new());
+            if gone.try_reserve(RECLAIM_BATCH).is_err() || frames.try_reserve(RECLAIM_BATCH).is_err() {
+                break;
+            }
+            let mut next = 0;
+            let mut looked = 0;
+            memory::with_frames(|frames| {
+                for (&index, page) in st.pages.range_mut(start..).take(RECLAIM_BATCH) {
+                    looked += 1;
+                    next = index + 1;
+                    if page.referenced {
+                        page.referenced = false;
+                    } else if frames.refcount(page.frame) == 1 && freed + (gone.len() as u64) < want {
+                        gone.push(index);
+                    }
+                }
+            });
+            seen += looked.max(1);
+            st.cursor = if looked < RECLAIM_BATCH { 0 } else { next };
+            frames.extend(gone.iter().filter_map(|i| st.pages.remove(i)).map(|p| p.frame));
+            st.charged -= frames.len() as u64;
+            drop(st);
+            freed += frames.len() as u64;
+            self.uncharge(frames.len() as u64);
+            free_frames(frames);
+        }
+        freed
     }
 
     /// Records that `mm` maps this file, so truncation can reach its page
@@ -360,18 +619,39 @@ impl PageCache {
     }
 }
 
+/// Drops up to `want` reclaimable pages of remote caches, visiting the
+/// caches in turn; returns how many it dropped. Called by `memory` when a
+/// commit or a new cache page needs room, never with a cache lock held.
+fn reclaim(want: u64) -> u64 {
+    let mut freed = 0;
+    let caches = REMOTE.lock().len();
+    for _ in 0..caches {
+        let cache = {
+            let list = REMOTE.lock();
+            if list.is_empty() {
+                break;
+            }
+            list[NEXT.fetch_add(1, Ordering::Relaxed) % list.len()].upgrade()
+        };
+        // (The last reference may go here, outside the list's lock.)
+        if let Some(cache) = cache {
+            freed += cache.shrink(want - freed);
+        }
+        if freed >= want {
+            break;
+        }
+    }
+    freed
+}
+
 impl Drop for PageCache {
     fn drop(&mut self) {
         let (pages, charged) = {
             let mut st = self.state.lock();
             (core::mem::take(&mut st.pages), st.charged)
         };
-        memory::with_frames(|f| {
-            for frame in pages.into_values() {
-                unsafe { f.deallocate_frame(frame) };
-            }
-        });
-        uncharge(charged);
+        free_frames(pages.into_values().map(|p| p.frame));
+        self.uncharge(charged);
         let prepaid = self.prepaid();
         if prepaid > 0 {
             memory::uncommit(prepaid);

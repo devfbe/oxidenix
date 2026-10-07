@@ -62,6 +62,10 @@ pub struct System {
     /// Memory promised to processes and the most that may be (bytes).
     pub committed: u64,
     pub commit_limit: u64,
+    /// File pages in memory (bytes): all of them, and those of tmpfs and
+    /// shared memory (which cannot be dropped).
+    pub cached: u64,
+    pub shmem: u64,
 }
 
 /// Process states, as the letters of /proc/<pid>/stat.

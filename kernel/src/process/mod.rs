@@ -371,12 +371,7 @@ fn load_path(cwd: &str, path: &str, args: &[String], envs: &[String]) -> Result<
     }
     // Not while it is open for writing; nobody may write it while it runs.
     let exe = inode.deny_write_access()?;
-    let cache = match inode.cache() {
-        Ok(cache) => cache,
-        // A file without a page cache (on a filesystem server) runs from a
-        // private copy.
-        Err(_) => fs::cache::PageCache::copy_of(&inode)?,
-    };
+    let cache = inode.cache()?;
     loader::load(&cache, Some(inode), Some(exe), args, envs)
 }
 
