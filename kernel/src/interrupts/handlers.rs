@@ -80,13 +80,15 @@ fn exception_name(vector: u8) -> &'static str {
 
 fn exception(frame: &mut Frame) {
     let vector = frame.vector as u8;
+    // Read now: resolving the fault may sleep, and CR2 changes meanwhile.
+    let fault_addr = if vector == 14 { Cr2::read_raw() } else { 0 };
     if frame.from_user() && crate::process::linux::mode() == Some(false) {
         // The Linux server failed: its process cannot go on.
         crate::printkln!(
             "[linux] {} in the Linux server (rip {:#x}, address {:#x}, error {:#x}, cr3 {:#x}, rdi {:#x}), process killed",
             exception_name(vector),
             frame.rip,
-            if vector == 14 { Cr2::read_raw() } else { 0 },
+            fault_addr,
             frame.error,
             x86_64::registers::control::Cr3::read_raw().0.start_address().as_u64(),
             frame.rdi
@@ -100,7 +102,7 @@ fn exception(frame: &mut Frame) {
     let mut sig = exception_signal(vector);
     if vector == 14 {
         use crate::process::address_space::{handle_fault, Access, Fault, USER_END};
-        let addr = Cr2::read_raw();
+        let addr = fault_addr;
         // Error code: bit 1 = write, bit 4 = instruction fetch.
         let access = Access { write: frame.error & 2 != 0, exec: frame.error & 16 != 0 };
         // The kernel touches user memory only in uaccess's copy routine; a
@@ -139,18 +141,14 @@ fn exception(frame: &mut Frame) {
         if signal::force(sig) {
             // No handler: the process dies, so say why.
             match vector {
-                14 if sig == signal::SIGBUS => crate::printkln!("[kernel] bus error at {:#x} (rip {:#x}), process killed", Cr2::read_raw(), frame.rip),
-                14 => crate::printkln!(
-                    "[kernel] segmentation fault at {:#x} (rip {:#x}), process killed",
-                    Cr2::read_raw(),
-                    frame.rip
-                ),
+                14 if sig == signal::SIGBUS => crate::printkln!("[kernel] bus error at {:#x} (rip {:#x}), process killed", fault_addr, frame.rip),
+                14 => crate::printkln!("[kernel] segmentation fault at {:#x} (rip {:#x}), process killed", fault_addr, frame.rip),
                 _ => crate::printkln!("[kernel] {} (rip {:#x}), process killed", exception_name(vector), frame.rip),
             }
         }
         return;
     }
-    let cr2 = if vector == 14 { Cr2::read_raw() } else { 0 };
+    let cr2 = fault_addr;
     panic!(
         "{} in the kernel (vector {}, error {:#x}) at rip {:#x}, rsp {:#x}, cr2 {:#x}",
         exception_name(vector),
