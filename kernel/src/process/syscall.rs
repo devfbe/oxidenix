@@ -1,7 +1,7 @@
 use super::address_space::USER_END;
 use super::errno::*;
 use super::sys_file::{self, AT_FDCWD};
-use super::{signal, sys_mem, sys_net, sys_time, uaccess};
+use super::{epoll, signal, sys_mem, sys_net, sys_time, uaccess};
 use crate::interrupts::gdt;
 use x86_64::registers::model_specific::{Efer, EferFlags, FsBase, LStar, SFMask, Star};
 use x86_64::registers::rflags::RFlags;
@@ -301,6 +301,12 @@ extern "sysv64" fn dispatch(f: &mut Frame) {
         292 => sys_file::dup3(a0, a1, a2, false),
         293 => sys_file::pipe2(a0, a1),
         284 => sys_file::eventfd2(a0, 0),
+        213 => epoll::epoll_create(a0),
+        291 => epoll::epoll_create1(a0),
+        233 => epoll::epoll_ctl(a0, a1, a2, a3),
+        232 => epoll::epoll_pwait(a0, a1, a2, a3, 0, 0),
+        281 => epoll::epoll_pwait(a0, a1, a2, a3, a4, a5),
+        441 => epoll::epoll_pwait2(a0, a1, a2, a3, a4, a5),
         290 => sys_file::eventfd2(a0, a1),
         302 => prlimit(a3),
         318 => getrandom(a0, a1),

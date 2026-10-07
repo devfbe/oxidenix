@@ -786,8 +786,9 @@ fn fxrstor(image: [u8; 512]) {
 /// must not be mistaken for an EINTR of rt_sigreturn itself.
 fn restartable(nr: u64) -> bool {
     // poll, rt_sigreturn, select, pause, nanosleep, rt_sigtimedwait,
-    // rt_sigsuspend, clock_nanosleep, pselect6, ppoll: EINTR, as on Linux.
-    !matches!(nr, 7 | 15 | 23 | 34 | 35 | 128 | 130 | 230 | 270 | 271)
+    // rt_sigsuspend, clock_nanosleep, the epoll waits, pselect6, ppoll:
+    // EINTR, as on Linux.
+    !matches!(nr, 7 | 15 | 23 | 34 | 35 | 128 | 130 | 230 | 232 | 270 | 271 | 281 | 441)
 }
 
 /// Makes the interrupted syscall `nr` run again when the frame resumes.

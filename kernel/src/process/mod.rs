@@ -10,6 +10,7 @@ pub mod irq;
 mod loader;
 mod prctl;
 pub mod query;
+pub mod epoll;
 pub mod poll;
 pub mod sched;
 pub mod signal;

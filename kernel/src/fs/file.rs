@@ -1,12 +1,13 @@
 use super::{Device, Inode};
 use crate::process::errno::*;
-use crate::process::poll::PollTable;
+use crate::process::epoll::{self, Epoll};
+use crate::process::poll::PollSource;
 use crate::process::signal::interrupted;
 use crate::process::{sched::prepare_to_wait, wakeup};
 use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::vec::Vec;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use crate::sync::Mutex;
 
@@ -78,6 +79,7 @@ pub enum Kind {
     PipeWrite(Arc<Pipe>),
     Socket(crate::net::Socket),
     EventFd(Arc<EventFd>),
+    Epoll(Arc<Epoll>),
 }
 
 /// Open file description; several descriptors may share it (dup, fork,
@@ -93,6 +95,8 @@ pub struct OpenFile {
     /// continues from it, so entries removed meanwhile (rm -r) never shift
     /// the position and skip others.
     pub dir_snapshot: Mutex<Option<Vec<(String, u64, u8)>>>,
+    /// The epoll interests in this file, removed when it is closed.
+    pub watchers: spin::Mutex<Vec<Weak<epoll::Item>>>,
 }
 
 impl OpenFile {
@@ -103,6 +107,7 @@ impl OpenFile {
             flags: AtomicU32::new(flags & !O_CLOEXEC),
             path,
             dir_snapshot: Mutex::new(None),
+            watchers: spin::Mutex::new(Vec::new()),
         })
     }
 
@@ -191,6 +196,7 @@ impl OpenFile {
             Kind::PipeWrite(_) => Err(EBADF),
             Kind::Socket(s) => s.recv(buf, self.nonblocking(), false).map(|(n, _)| n),
             Kind::EventFd(e) => self.read_eventfd(e, buf),
+            Kind::Epoll(_) => Err(EINVAL),
         }
     }
 
@@ -204,6 +210,7 @@ impl OpenFile {
             Kind::PipeRead(_) => Err(EBADF),
             Kind::Socket(s) => s.send(buf, None, self.nonblocking()),
             Kind::EventFd(e) => self.write_eventfd(e, buf),
+            Kind::Epoll(_) => Err(EINVAL),
         }
     }
 
@@ -412,31 +419,42 @@ impl OpenFile {
                 let count = *e.count.lock();
                 (if count > 0 { POLLIN } else { 0 }) | if count < EVENTFD_MAX { POLLOUT } else { 0 }
             }
+            Kind::Epoll(e) => {
+                if e.has_events() {
+                    POLLIN
+                } else {
+                    0
+                }
+            }
         };
         ready & (events | POLLERR | POLLHUP)
     }
 
-    /// Puts `table` on the wait queues that are woken when this file's
-    /// readiness changes.
-    pub fn poll_register(&self, table: &mut PollTable) -> Result<(), i64> {
+    /// Where this file announces changes of its readiness.
+    pub fn poll_source(&self) -> PollSource {
         match &self.kind {
-            Kind::Inode(_) if self.is_console() => table.add(crate::drivers::tty::POLL_CHAN),
+            Kind::Inode(_) if self.is_console() => PollSource::Chan(crate::drivers::tty::POLL_CHAN),
             // Regular files and devices are always ready.
-            Kind::Inode(_) => Ok(()),
-            Kind::PipeRead(p) => table.add(p.read_chan()),
-            Kind::PipeWrite(p) => table.add(p.write_chan()),
-            Kind::EventFd(e) => table.add(e.chan()),
-            // Readiness is the network server's: checked again every tick.
-            Kind::Socket(_) => {
-                table.recheck();
-                Ok(())
-            }
+            Kind::Inode(_) => PollSource::Always,
+            Kind::PipeRead(p) => PollSource::Chan(p.read_chan()),
+            Kind::PipeWrite(p) => PollSource::Chan(p.write_chan()),
+            Kind::EventFd(e) => PollSource::Chan(e.chan()),
+            Kind::Epoll(e) => PollSource::Epoll(e.clone()),
+            // Readiness is the network server's.
+            Kind::Socket(_) => PollSource::Recheck,
         }
     }
 }
 
 impl Drop for OpenFile {
     fn drop(&mut self) {
+        // The epoll instances watching this file forget it.
+        let watchers = core::mem::take(&mut *self.watchers.lock());
+        for item in watchers.iter().filter_map(Weak::upgrade) {
+            if let Some(epoll) = item.owner() {
+                epoll.file_closed(&item);
+            }
+        }
         match &self.kind {
             Kind::PipeRead(p) => {
                 p.readers.fetch_sub(1, Ordering::Relaxed);
@@ -446,7 +464,7 @@ impl Drop for OpenFile {
                 p.writers.fetch_sub(1, Ordering::Relaxed);
                 wakeup(p.read_chan());
             }
-            Kind::Inode(_) | Kind::Socket(_) | Kind::EventFd(_) => {}
+            Kind::Inode(_) | Kind::Socket(_) | Kind::EventFd(_) | Kind::Epoll(_) => {}
         }
     }
 }

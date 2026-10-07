@@ -19,7 +19,7 @@ const S_IFIFO: u32 = 0o010000;
 const S_IFSOCK: u32 = 0o140000;
 const UMASK: u32 = 0o022;
 
-fn file(fd: u64) -> Result<Arc<OpenFile>, i64> {
+pub fn file(fd: u64) -> Result<Arc<OpenFile>, i64> {
     with_current(|p| p.file(fd))
 }
 
@@ -185,7 +185,7 @@ pub fn fstat(fd: u64, buf: u64) -> SysResult {
         Some(inode) => stat_inode(inode, buf),
         None if f.socket().is_some() => write_stat(buf, Arc::as_ptr(&f) as u64, S_IFSOCK | 0o777, 0, (1, 0, 0, 0)),
         // An anonymous inode, as on Linux: no file type.
-        None if matches!(f.kind, Kind::EventFd(_)) => write_stat(buf, Arc::as_ptr(&f) as u64, 0o600, 0, (1, 0, 0, 0)),
+        None if matches!(f.kind, Kind::EventFd(_) | Kind::Epoll(_)) => write_stat(buf, Arc::as_ptr(&f) as u64, 0o600, 0, (1, 0, 0, 0)),
         None => write_stat(buf, Arc::as_ptr(&f) as u64, S_IFIFO | 0o600, 0, (1, 0, 0, 0)),
     }
 }
@@ -396,7 +396,7 @@ pub fn poll(fds: u64, nfds: u64, timeout: Option<u64>) -> SysResult {
                 match file(fd as u64) {
                     Ok(f) => {
                         if first {
-                            f.poll_register(&mut table)?;
+                            table.watch(&f)?;
                         }
                         f.poll(events)
                     }
@@ -445,7 +445,7 @@ pub fn select(nfds: u64, readfds: u64, writefds: u64, exceptfds: u64, timeout: O
             }
             let f = file(fd)?;
             if first {
-                f.poll_register(&mut table)?;
+                table.watch(&f)?;
             }
             let revents = f.poll(POLLIN | POLLOUT);
             if want_r[w] & b != 0 && revents & (POLLIN | POLLHUP | POLLERR) != 0 {

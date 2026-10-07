@@ -115,7 +115,7 @@ The kernel boots straight into Bash. Things to try:
 
 ```sh
 ls -l /bin | head          # BusyBox applets
-cowtest; vmtest; futextest; threadtest; timetest; timertest; polltest; sigtest; jobtest; oomtest; fstest; forktest; nettest; smptest # self-tests
+cowtest; vmtest; futextest; threadtest; timetest; timertest; polltest; epolltest; sigtest; jobtest; oomtest; fstest; forktest; nettest; smptest # self-tests
 nproc; cat /proc/cpuinfo   # 4 CPUs; 'cpus' in the kernel monitor shows their load
 wget -O - http://example.com # DNS and HTTP through netd; nslookup and nc work as well
 ping -c 3 1.1.1.1          # raw ICMP sockets; oxidenix answers pings itself, too
@@ -177,6 +177,7 @@ oxidenix/
 │       │   ├── exit.rs          thread and process exit, wait4
 │       │   ├── sched.rs         run queues, wait queues, context switch, idle
 │       │   ├── poll.rs          waiting on the wait queues of several files (poll, select)
+│       │   ├── epoll.rs         epoll: interest and ready lists, nesting
 │       │   ├── address_space.rs areas, demand paging, copy-on-write
 │       │   ├── tlb.rs           which CPUs use an address space, TLB shootdowns
 │       │   ├── syscall.rs       syscall entry/return, dispatch table
@@ -355,11 +356,22 @@ The scheduler is built for several CPUs (`process/sched.rs`, design in
   (`prepare_to_wait`), then checks its condition, then sleeps; a per-task wake lock
   serializes wakeups with the task descheduling itself. Pipes, the TTY, IPC, `wait4`, stops
   and timed sleeps all use this protocol.
-- **Waiting on several files** (`process/poll.rs`): `poll` and `select` put one waiter on
-  the wait queue of every file they check (a pipe end's, the TTY's), so a wakeup on any of
-  them ends the wait at once instead of at a periodic re-check; a wakeup that comes while
+- **Waiting on several files** (`process/poll.rs`): a file announces readiness changes on a
+  wait queue (a channel of the global queues for pipes, eventfds and the TTY, its own queue
+  for an epoll instance). Wait-queue entries are tasks or callbacks; `poll`, `select` and
+  `epoll_wait` put one callback on the queue of every file they check, so a wakeup on any
+  of them ends the wait at once instead of at a periodic re-check; a wakeup that comes while
   the files are being checked is noted and not lost. Sockets, whose readiness lives in
   netd, are re-checked every tick while polled.
+- **epoll** (`process/epoll.rs`): every interest is a callback on its file's wait queue that
+  puts it on the instance's ready list (without allocating: the list keeps room for every
+  item, so this works in interrupt context) and wakes the instance's own queue.
+  `epoll_wait` asks each listed file for its readiness: level-triggered items that are
+  still ready go back to the end of the list (a full `maxevents` rotates through them),
+  edge-triggered ones wait for the next wakeup, one-shot ones are disabled until
+  `EPOLL_CTL_MOD`. Interests belong to the open file and disappear when its last
+  descriptor closes. Instances may watch each other (and be polled) up to four deep,
+  without cycles (`ELOOP`); regular files are `EPERM`, as on Linux.
 - The kernel is non-preemptive: only user code is preempted, and an interrupt in kernel mode
   never schedules. Syscalls nevertheless run with interrupts enabled, so a long syscall does
   not delay timer ticks or device interrupts on its CPU. An interrupt that ends the time
@@ -646,7 +658,7 @@ Linux x86_64 numbers, grouped by area (about 120 in total):
 | Files | `read` `write` `pread64` `pwrite64` `readv` `writev` `open` `openat` `close` `lseek` `sendfile` `ftruncate` `fcntl` `ioctl` `dup` `dup2` `dup3` `pipe` `pipe2` |
 | Metadata | `stat` `fstat` `lstat` `newfstatat` `access` `faccessat` `faccessat2` `readlink` `readlinkat` `chmod` `fchmodat` `utimes` `futimesat` `utimensat` `umask` |
 | Directories | `getdents64` `getcwd` `chdir` `fchdir` `mkdir` `mkdirat` `rmdir` `unlink` `unlinkat` `rename` `renameat` `renameat2` `symlink` `symlinkat` |
-| I/O multiplexing | `poll` `ppoll` `select` `pselect6` `eventfd` `eventfd2` |
+| I/O multiplexing | `poll` `ppoll` `select` `pselect6` `epoll_create` `epoll_create1` `epoll_ctl` `epoll_wait` `epoll_pwait` `epoll_pwait2` `eventfd` `eventfd2` |
 | Memory | `brk` `mmap` (private, shared, anonymous, file, `MAP_FIXED[_NOREPLACE]`, `MAP_NORESERVE`, `MAP_POPULATE`) `munmap` `mprotect` `mremap` `madvise` (`DONTNEED`, `FREE`) `msync` `mlock` (no-ops) |
 | CPUs | `sched_getaffinity` `sched_setaffinity` `getcpu` |
 | Processes and threads | `clone` (`CLONE_VM` `FS` `FILES` `SIGHAND` `THREAD` `VFORK` `PARENT` `SETTLS` `PARENT_SETTID` `CHILD_SETTID` `CHILD_CLEARTID`) `fork` `vfork` `execve` `exit` (one thread) `exit_group` `wait4` `getpid` `getppid` `gettid` `set_tid_address` `sched_yield` `arch_prctl` `prlimit64` |
@@ -688,6 +700,7 @@ Each of these programs and scripts lives in the root filesystem and runs inside 
 | `polltest` | `poll` and `select` wake within 1 ms of a pipe write (median of nine, the writer on the same or another CPU, next to an idle descriptor), a full pipe polling writable once drained, `POLLHUP` when the last writer closes, `EINTR` in a `poll` waiting on files |
 | `eventfdtest` | `eventfd` counting (initial value, adding writes, reset on read), `EFD_SEMAPHORE`, `EFD_NONBLOCK` and `EFD_CLOEXEC`, `EINVAL` for short reads, 2^64-1 and unknown flags, a full counter (`EAGAIN`, poll state), a blocking read woken by another process, `poll` waking within 1 ms of a write |
 | `sigmasktest` | temporary signal masks of `sigsuspend`, `ppoll` and `pselect`: a pending or arriving signal the mask lets through interrupts them and its handler runs with that mask, the caller's mask comes back afterwards, a successful `ppoll` leaves a blocked signal pending (`sigpending`), a mask that blocks a signal holds it off until the call returns, `EINVAL` for a wrong mask size |
+| `epolltest` | `epoll_create1`/`epoll_create` flags and sizes, `EPOLL_CTL_ADD`/`MOD`/`DEL` and their errors (`EEXIST`, `ENOENT`, `EPERM` for regular files, `EINVAL`, `EBADF`), level-triggered, edge-triggered and one-shot reporting, `EPOLLOUT` and `EPOLLERR` on a pipe's write end, interests removed with the file's last descriptor (not before), `maxevents` rotating through ready files, eventfds and UDP sockets in a set, nested instances (`ELOOP` for a loop) and `poll` on an instance, wake-up within 1 ms of a write, timeouts, `EINTR` and `epoll_pwait`'s mask, `epoll_pwait2` |
 | `vmtest` | demand paging (a 64 MiB mapping costs nothing until touched), `SIGSEGV` on read-only and `PROT_NONE` pages with contents kept, split areas after a partial `munmap`, NX and the JIT pattern (1 GiB `PROT_NONE` reservation, write code, `mprotect` to executable, call it), commit limit and `MAP_NORESERVE`, `mremap` in place and moving, `MADV_DONTNEED`, shared vs. private memory across `fork`, lazy file mappings and `SIGBUS` beyond the end, `MAP_FIXED_NOREPLACE`, stack growth to 4 MiB and overflow beyond 8 MiB |
 | `smptest` | CPU count and affinity (pinning to every CPU, empty masks), parallel speed-up of CPU-bound processes, `fork`/`exit`/`wait` on every CPU at once, 5000 pipe round trips between two CPUs, signals to a process running on another CPU, timers on time while a program floods the console with palette changes on the same CPU |
 | `nettest` | TCP to an echo service through QEMU, `ECONNREFUSED`, `listen`/`accept` over loopback with a forked client, EOF after the peer closed, non-blocking `accept` and `connect` with `poll` and `SO_ERROR`, `EINTR` in a blocking `recv`, UDP over loopback, raw ICMP echo to the gateway and over loopback, source address for off-subnet destinations, overflowing message vectors, `AF_INET6` rejected |
@@ -748,7 +761,8 @@ kernel. Its program is fixed at boot (see self-healing), but a bug in it is a ke
 - [x] A TSC clock with nanosecond resolution and exact CPU time
 - [x] High-resolution timers (TSC-deadline or one-shot local APIC)
 - [x] `eventfd`
-- [ ] `epoll`; a page cache with file-backed shared mappings
+- [x] `epoll`
+- [ ] A page cache with file-backed shared mappings
 - [ ] Dynamic linking, real entropy, users and permissions
 
 ## Development history
