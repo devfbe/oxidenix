@@ -12,7 +12,7 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
-const STACK_TOP: u64 = 0x0000_7fff_ffff_f000;
+const STACK_TOP: u64 = super::address_space::USER_END - 0x1000;
 /// The stack area at start (it holds the arguments); it grows on demand up
 /// to address_space::STACK_LIMIT.
 const STACK_SIZE: u64 = 256 * 1024;

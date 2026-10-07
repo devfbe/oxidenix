@@ -198,6 +198,15 @@ int main(void) {
     waitpid(overflow, &st, 0);
     check("beyond 8 MiB the stack overflows with SIGSEGV", WIFSIGNALED(st) && WTERMSIG(st) == SIGSEGV);
 
+    /* Programs own the lower 64 TiB (46 bits); above lives the Linux
+     * server's shared region, out of their reach. */
+    const uintptr_t limit = (uintptr_t)1 << 46;
+    void *above = mmap((void *)limit, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    check("MAP_FIXED at 64 TiB fails", above == MAP_FAILED);
+    void *hinted = mmap((void *)(limit + 0x100000000), 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    check("a hint above 64 TiB maps below it", hinted != MAP_FAILED && (uintptr_t)hinted < limit);
+    int local;
+    check("the stack lies below 64 TiB", (uintptr_t)&local < limit);
     printf("vmtest: %s\n", failures ? "FAILED" : "all passed");
     return failures;
 }

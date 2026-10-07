@@ -42,7 +42,10 @@ use x86_64::structures::paging::{
 };
 use x86_64::{PhysAddr, VirtAddr};
 
-pub const USER_END: u64 = 0x0000_8000_0000_0000;
+/// End of the memory a program may map: 64 TiB, PML4 slots 0-127. Slots
+/// 128-255 are the Linux server's shared region (docs/design/linux-server.md,
+/// ADR 0003).
+pub const USER_END: u64 = 0x0000_4000_0000_0000;
 pub const PAGE: u64 = 4096;
 /// Marks a read-only mapping of a shared frame that becomes private on the
 /// first write (an OS-available page table bit).
@@ -52,7 +55,7 @@ pub const COW: PageTableFlags = PageTableFlags::BIT_9;
 const PROT_NONE: PageTableFlags = PageTableFlags::BIT_10;
 
 /// Highest address `mmap` hands out; the stack lives above.
-pub const MMAP_TOP: u64 = 0x0000_7000_0000_0000;
+pub const MMAP_TOP: u64 = 0x0000_3000_0000_0000;
 /// How far a stack may grow below its top (RLIMIT_STACK).
 pub const STACK_LIMIT: u64 = 8 * 1024 * 1024;
 
