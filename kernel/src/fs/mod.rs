@@ -1,5 +1,6 @@
 //! In-memory filesystem (tmpfs-like), populated from the initramfs at boot.
 
+pub mod cache;
 pub mod cpio;
 pub mod file;
 pub mod remote;
@@ -26,8 +27,10 @@ pub enum Device {
     Zero,
 }
 
+/// Largest file `with_contents` reads whole into the kernel heap.
 pub const MAX_FILE_SIZE: usize = 64 * 1024 * 1024;
-/// File contents live on the kernel heap; this caps all of them together.
+/// Inodes, symlink targets and pipe buffers live on the kernel heap; this
+/// caps all of them together. (File contents are in the page cache.)
 pub const FILE_QUOTA: usize = 8 * 1024 * 1024;
 static FILE_BYTES: AtomicUsize = AtomicUsize::new(0);
 
@@ -42,93 +45,6 @@ pub fn charge(bytes: usize) -> Result<(), i64> {
 
 pub fn release(bytes: usize) {
     FILE_BYTES.fetch_sub(bytes, Ordering::Relaxed);
-}
-
-/// (bytes charged, quota) of the in-memory filesystem.
-pub fn quota_usage() -> (usize, usize) {
-    (FILE_BYTES.load(Ordering::Relaxed), FILE_QUOTA)
-}
-
-/// File contents. Every change of the owned size goes through `resize`,
-/// which charges it against `FILE_QUOTA`.
-pub enum Data {
-    /// Unmodified file from the initramfs; copied on first write.
-    Static(&'static [u8]),
-    Owned(Vec<u8>),
-}
-
-impl Data {
-    pub fn empty() -> Data {
-        Data::Owned(Vec::new())
-    }
-
-    pub fn bytes(&self) -> &[u8] {
-        match self {
-            Data::Static(b) => b,
-            Data::Owned(v) => v,
-        }
-    }
-
-    fn owned_len(&self) -> usize {
-        match self {
-            Data::Static(_) => 0,
-            Data::Owned(v) => v.len(),
-        }
-    }
-
-    pub fn resize(&mut self, len: usize) -> Result<(), i64> {
-        if len > MAX_FILE_SIZE {
-            return Err(EFBIG);
-        }
-        let old = self.owned_len();
-        if len > old {
-            charge(len - old)?;
-        }
-        // Allocation failures become ENOMEM instead of a kernel panic.
-        let grown = match self {
-            Data::Static(b) => {
-                let mut v = Vec::new();
-                let ok = v.try_reserve_exact(len).is_ok();
-                if ok {
-                    v.extend_from_slice(&b[..b.len().min(len)]);
-                    v.resize(len, 0);
-                    *self = Data::Owned(v);
-                }
-                ok
-            }
-            Data::Owned(v) => {
-                let ok = len <= v.len() || v.try_reserve(len - v.len()).is_ok();
-                if ok {
-                    v.resize(len, 0);
-                }
-                ok
-            }
-        };
-        if !grown {
-            release(len - old);
-            return Err(ENOMEM);
-        }
-        if len < old {
-            release(old - len);
-        }
-        Ok(())
-    }
-
-    pub fn write_at(&mut self, start: usize, buf: &[u8]) -> Result<(), i64> {
-        let end = start.checked_add(buf.len()).ok_or(EFBIG)?;
-        self.resize(end.max(self.bytes().len()))?;
-        match self {
-            Data::Owned(v) => v[start..end].copy_from_slice(buf),
-            Data::Static(_) => unreachable!("resize makes the data owned"),
-        }
-        Ok(())
-    }
-}
-
-impl Drop for Data {
-    fn drop(&mut self) {
-        release(self.owned_len());
-    }
 }
 
 /// Whether `target` is `dir` itself or lies anywhere below it. Iterative,
@@ -148,7 +64,8 @@ pub fn contains(dir: &Arc<Inode>, target: &Arc<Inode>) -> bool {
 
 pub enum Node {
     Dir(BTreeMap<String, Arc<Inode>>),
-    File(Data),
+    /// A tmpfs file: its contents are its page cache.
+    File(Arc<cache::PageCache>),
     Symlink(String),
     Device(Device),
     /// An inode served by a user-space filesystem server (diskfs).
@@ -284,7 +201,7 @@ impl Inode {
             return d.fs.stat(d.ino).map_or(0, |s| s.size);
         }
         match &*self.node.lock() {
-            Node::File(d) => d.bytes().len() as u64,
+            Node::File(c) => c.size(),
             Node::Symlink(t) => t.len() as u64,
             Node::Dir(m) => m.len() as u64,
             Node::Device(_) | Node::Disk(_) => 0,
@@ -366,7 +283,7 @@ impl Inode {
             return Ok(d.fs.inode(ino));
         }
         let node = match kind {
-            NewNode::File => Node::File(Data::empty()),
+            NewNode::File => Node::File(cache::PageCache::memory(&[])?),
             NewNode::Dir => Node::Dir(BTreeMap::new()),
             NewNode::Symlink(t) => Node::Symlink(t),
         };
@@ -421,17 +338,7 @@ impl Inode {
             self.require_regular()?;
             return d.fs.read(d.ino, off, buf);
         }
-        match &*self.node.lock() {
-            Node::File(data) => {
-                let bytes = data.bytes();
-                let start = (off as usize).min(bytes.len());
-                let n = buf.len().min(bytes.len() - start);
-                buf[..n].copy_from_slice(&bytes[start..start + n]);
-                Ok(n)
-            }
-            Node::Dir(_) => Err(EISDIR),
-            _ => Err(EINVAL),
-        }
+        self.cache()?.read(off, buf)
     }
 
     pub fn write_at(&self, off: u64, buf: &[u8]) -> Result<usize, i64> {
@@ -439,14 +346,7 @@ impl Inode {
             self.require_regular()?;
             return d.fs.write(d.ino, off, buf);
         }
-        match &mut *self.node.lock() {
-            Node::File(data) => {
-                data.write_at(usize::try_from(off).map_err(|_| EFBIG)?, buf)?;
-                Ok(buf.len())
-            }
-            Node::Dir(_) => Err(EISDIR),
-            _ => Err(EINVAL),
-        }
+        self.cache()?.write(off, buf)
     }
 
     pub fn truncate(&self, len: u64) -> Result<(), i64> {
@@ -454,12 +354,18 @@ impl Inode {
             self.require_regular()?;
             return d.fs.truncate(d.ino, len);
         }
-        let result = match &mut *self.node.lock() {
-            Node::File(data) => data.resize(usize::try_from(len).map_err(|_| EFBIG)?),
+        self.cache()?.truncate(len)
+    }
+
+    /// The page cache of a regular file (EISDIR, EINVAL for others). The
+    /// inode lock is released before the cache is used: its operations
+    /// may sleep.
+    pub fn cache(&self) -> Result<Arc<cache::PageCache>, i64> {
+        match &*self.node.lock() {
+            Node::File(c) => Ok(c.clone()),
             Node::Dir(_) => Err(EISDIR),
             _ => Err(EINVAL),
-        };
-        result
+        }
     }
 
     pub fn set_perm(&self, perm: u32) -> Result<(), i64> {
@@ -472,20 +378,13 @@ impl Inode {
 
     /// Calls `f` with the whole file contents (read from disk if needed).
     pub fn with_contents<R>(&self, f: impl FnOnce(&[u8]) -> R) -> Result<R, i64> {
-        if self.disk_ref().is_some() {
-            self.require_regular()?;
-            let size = usize::try_from(self.size()).ok().filter(|&s| s <= MAX_FILE_SIZE).ok_or(EFBIG)?;
-            let mut buf = Vec::new();
-            buf.try_reserve_exact(size).map_err(|_| ENOMEM)?;
-            buf.resize(size, 0);
-            let n = self.read_at(0, &mut buf)?;
-            return Ok(f(&buf[..n]));
-        }
-        match &*self.node.lock() {
-            Node::File(data) => Ok(f(data.bytes())),
-            Node::Dir(_) => Err(EISDIR),
-            _ => Err(EINVAL),
-        }
+        self.require_regular()?;
+        let size = usize::try_from(self.size()).ok().filter(|&s| s <= MAX_FILE_SIZE).ok_or(EFBIG)?;
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(size).map_err(|_| ENOMEM)?;
+        buf.resize(size, 0);
+        let n = self.read_at(0, &mut buf)?;
+        Ok(f(&buf[..n]))
     }
 
     /// Filesystem the inode lives on, for statfs.
@@ -547,6 +446,7 @@ pub fn root() -> Arc<Inode> {
 }
 
 pub fn init(ramdisk: Option<&'static [u8]>) {
+    cache::init();
     let root = ROOT.call_once(|| Inode::new(Node::Dir(BTreeMap::new()), 0o755).expect("file quota exhausted at boot"));
     if let Some(data) = ramdisk {
         if let Err(e) = cpio::unpack(root, data) {

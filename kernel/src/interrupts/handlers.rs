@@ -109,7 +109,7 @@ fn exception(frame: &mut Frame) {
                     crate::printkln!("[kernel] out of memory at {:#x}: process killed", addr);
                     crate::process::exit_group(signal::SIGKILL as i32);
                 }
-                Err(Fault::Segv) => {}
+                Err(Fault::Segv | Fault::Access) => {}
             }
         }
     }

@@ -1,6 +1,6 @@
 //! Unpacks a cpio archive in "newc" format into the VFS.
 
-use super::{mkdir_p, Data, Inode, Node, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG};
+use super::{cache::PageCache, mkdir_p, Inode, Node, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG};
 use alloc::string::ToString;
 use alloc::sync::Arc;
 
@@ -51,7 +51,7 @@ pub fn unpack(root: &Arc<Inode>, data: &'static [u8]) -> Result<(), &'static str
                 mkdir_p(&dir, base);
                 continue;
             }
-            S_IFREG => Node::File(Data::Static(body)),
+            S_IFREG => Node::File(PageCache::memory(body).map_err(|_| "out of memory for the initramfs")?),
             S_IFLNK => Node::Symlink(core::str::from_utf8(body).map_err(|_| "symlink is not UTF-8")?.to_string()),
             _ => continue,
         };

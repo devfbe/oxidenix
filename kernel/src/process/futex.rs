@@ -3,7 +3,7 @@
 //!
 //! A futex is identified by a key: for private futexes (and futexes in
 //! private memory) the address space and the address, for futexes in shared
-//! memory the shared object and the offset in it, so that processes mapping
+//! memory (shared mappings) the file's page cache and the offset in the file, so that processes mapping
 //! it at different addresses meet (and a copy-on-write break of a private
 //! page does not change the key).
 //!
@@ -14,7 +14,7 @@
 //! faults (a spinlock is held); if the page is not there, the waiter drops
 //! the lock, faults it in and tries again.
 
-use super::address_space::{Backing, PAGE};
+use super::address_space::Backing;
 use super::errno::*;
 use super::sched::{current, current_arc, prepare_to_sleep, try_wake};
 use super::task::{State, Task};
@@ -78,8 +78,8 @@ fn key_of(uaddr: u64, private: bool) -> Result<Key, i64> {
     let space = mm.lock();
     let v = space.vma(uaddr).ok_or(EFAULT)?;
     Ok(match &v.backing {
-        Backing::Shared { object, index0 } => {
-            Key { base: Base::Shared(Arc::as_ptr(object) as usize), offset: index0 * PAGE + (uaddr - v.start) }
+        Backing::File { cache, offset, shared: true, .. } => {
+            Key { base: Base::Shared(Arc::as_ptr(cache) as usize), offset: offset + (uaddr - v.start) }
         }
         _ => mm_key,
     })

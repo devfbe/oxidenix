@@ -15,18 +15,25 @@
 //! copied on the first write) and PROT_NONE (a frame kept while its area
 //! denies all access).
 //!
+//! File mappings map the frames of the file's page cache (`fs::cache`):
+//! shared ones the cache frame itself, private ones the cache frame
+//! copy-on-write until the first write copies it. Anonymous shared memory
+//! is an unnamed tmpfs file. Each cache knows the address spaces that map
+//! it (`owner`), so truncating a file removes its pages everywhere.
+//!
 //! The threads of a process share one address space (`Mm`), behind a lock
 //! that may be held while a fault sleeps. Every change that removes,
 //! write-protects or moves a mapping is followed by a TLB shootdown
 //! (`tlb`), and frames are freed only after it.
 
 use super::tlb::{self, Tlb};
+use crate::fs::cache::PageCache;
 use crate::fs::Inode;
 use crate::memory;
 use crate::memory::frame::UserFrames;
-use crate::sync::{IrqSpinLock, Mutex, MutexGuard};
+use crate::sync::{Mutex, MutexGuard};
 use alloc::collections::BTreeMap;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicU64, Ordering};
 use x86_64::registers::control::Cr3;
 use x86_64::structures::paging::page_table::PageTableEntry;
@@ -99,39 +106,31 @@ impl Prot {
     }
 }
 
-/// Anonymous memory shared between processes (MAP_SHARED|MAP_ANONYMOUS,
-/// inherited across fork): every mapping sees the same frames.
-pub struct SharedAnon {
-    /// Frames by page index; the object holds one reference on each.
-    frames: IrqSpinLock<BTreeMap<u64, PhysFrame>>,
-    /// Pages committed for the object (released when it goes).
-    committed: u64,
-}
-
-impl Drop for SharedAnon {
-    fn drop(&mut self) {
-        let frames = core::mem::take(&mut *self.frames.lock());
-        memory::with_frames(|f| {
-            for frame in frames.into_values() {
-                unsafe { f.deallocate_frame(frame) };
-            }
-        });
-        memory::uncommit(self.committed);
-    }
-}
-
 /// What backs an area's pages.
 #[derive(Clone)]
 pub enum Backing {
     /// Zero-filled private memory.
     Anon,
-    /// Shared anonymous memory; `index0` is the object page of `start`.
-    Shared { object: Arc<SharedAnon>, index0: u64 },
-    /// A private copy of a file, read page by page on first access;
-    /// `offset` is the file offset of `start`.
-    File { inode: Arc<Inode>, offset: u64 },
+    /// Pages of a file's page cache; `offset` is the file offset of
+    /// `start`. Shared: stores reach the file; private: copy-on-write.
+    /// `_file` keeps the file alive while it is mapped (None for anonymous
+    /// shared memory); `may_write`: the file was opened for writing, so a
+    /// shared mapping may become writable.
+    File { cache: Arc<PageCache>, offset: u64, shared: bool, may_write: bool, _file: Option<Arc<Inode>> },
     /// Device memory, mapped up front (DMA areas).
     Device,
+}
+
+impl Backing {
+    /// Anonymous shared memory of `pages` pages.
+    pub fn shared_anon(pages: u64) -> Result<Backing, Fault> {
+        Ok(Backing::File { cache: PageCache::anonymous(pages)?, offset: 0, shared: true, may_write: true, _file: None })
+    }
+
+    /// Shared memory (or device memory): never copied on write or fork.
+    fn shared(&self) -> bool {
+        matches!(self, Backing::File { shared: true, .. } | Backing::Device)
+    }
 }
 
 #[derive(Clone)]
@@ -158,17 +157,23 @@ impl Vma {
         let shift = from - self.start;
         v.start = from;
         v.end = to;
-        match &mut v.backing {
-            Backing::File { offset, .. } => *offset += shift,
-            Backing::Shared { index0, .. } => *index0 += shift / PAGE,
-            _ => {}
+        if let Backing::File { offset, .. } = &mut v.backing {
+            *offset += shift;
         }
         v
     }
 
     /// Whether this area would need commit when writable.
     fn private(&self) -> bool {
-        matches!(self.backing, Backing::Anon | Backing::File { .. })
+        matches!(self.backing, Backing::Anon | Backing::File { shared: false, .. })
+    }
+
+    /// The cache of a file area and the file page of `start`.
+    fn file(&self) -> Option<(&Arc<PageCache>, u64)> {
+        match &self.backing {
+            Backing::File { cache, offset, .. } => Some((cache, offset / PAGE)),
+            _ => None,
+        }
     }
 }
 
@@ -205,6 +210,8 @@ pub enum Fault {
     Bus,
     /// No frame left.
     Oom,
+    /// The file does not grant the rights asked for (mprotect: EACCES).
+    Access,
 }
 
 #[derive(Clone, Copy)]
@@ -224,6 +231,9 @@ pub struct AddressSpace {
     /// The heap (brk): from the end of the program to the current break.
     pub brk_start: u64,
     pub brk_end: u64,
+    /// The `Mm` holding this space, once there is one: file caches record
+    /// it to reach the space's mappings of their pages.
+    owner: Weak<Mm>,
 }
 
 /// An address space as tasks hold it: shared by the threads of a process
@@ -236,9 +246,16 @@ pub struct Mm {
 }
 
 impl Mm {
+    /// Fails (None) without memory, dropping the space.
     pub fn new(space: AddressSpace) -> Option<Arc<Mm>> {
         let (tlb, stats) = (space.tlb.clone(), space.stats.clone());
-        Arc::try_new(Mm { tlb, stats, space: Mutex::new(space) }).ok()
+        let mm = Arc::try_new(Mm { tlb, stats, space: Mutex::new(space) }).ok()?;
+        let mut space = mm.lock();
+        space.owner = Arc::downgrade(&mm);
+        let files: alloc::vec::Vec<Arc<PageCache>> = space.vmas.values().filter_map(|v| v.file().map(|(c, _)| c.clone())).collect();
+        let registered = files.iter().all(|c| c.register(&space.owner).is_ok());
+        drop(space);
+        registered.then_some(mm)
     }
 
     /// The address space, for changes and faults. Sleeps while another
@@ -307,7 +324,7 @@ impl AddressSpace {
             memory::with_frames(|f| unsafe { f.deallocate_frame(l4) });
             return None;
         };
-        Some(AddressSpace { l4, tlb, stats, vmas: BTreeMap::new(), brk_start: 0, brk_end: 0 })
+        Some(AddressSpace { l4, tlb, stats, vmas: BTreeMap::new(), brk_start: 0, brk_end: 0, owner: Weak::new() })
     }
 
     fn mapper(&self) -> OffsetPageTable<'static> {
@@ -389,6 +406,11 @@ impl AddressSpace {
     pub fn map(&mut self, start: u64, len: u64, prot: Prot, backing: Backing, noreserve: bool) -> Result<(), Fault> {
         let end = start.checked_add(len).filter(|&e| e <= USER_END && len > 0).ok_or(Fault::Segv)?;
         let mut vma = Vma { start, end, prot, backing, charged: false, grows_down: false };
+        if let Some((cache, _)) = vma.file() {
+            if self.owner.strong_count() > 0 {
+                cache.register(&self.owner)?;
+            }
+        }
         if prot.write && vma.private() && !noreserve {
             if !memory::commit(vma.pages()) {
                 return Err(Fault::Oom);
@@ -447,10 +469,13 @@ impl AddressSpace {
     /// writable commits it.
     pub fn protect(&mut self, start: u64, len: u64, prot: Prot) -> Result<(), Fault> {
         let end = start.checked_add(len).filter(|&e| e <= USER_END).ok_or(Fault::Oom)?;
-        // Coverage check first: no change on failure.
+        // Coverage and rights checks first: no change on failure.
         let mut at = start;
         while at < end {
             let v = self.vma(at).ok_or(Fault::Oom)?;
+            if prot.write && matches!(v.backing, Backing::File { shared: true, may_write: false, .. }) {
+                return Err(Fault::Access);
+            }
             at = v.end;
         }
         let needed: u64 = self
@@ -486,7 +511,7 @@ impl AddressSpace {
                 let mut flags = prot.flags();
                 // A frame shared with another mapping never becomes writable
                 // in place (unless the area is shared memory).
-                let shared_area = matches!(self.vma(va).map(|v| &v.backing), Some(Backing::Shared { .. }));
+                let shared_area = self.vma(va).is_some_and(|v| v.backing.shared());
                 if flags.contains(PageTableFlags::WRITABLE) && !shared_area && (was_cow || frames.refcount(frame) > 1) {
                     flags.remove(PageTableFlags::WRITABLE);
                     flags.insert(COW);
@@ -540,9 +565,6 @@ impl AddressSpace {
             ext.end = old_end + grow;
             if let Backing::File { offset, .. } = &mut ext.backing {
                 *offset += PAGE;
-            }
-            if let Backing::Shared { index0, .. } = &mut ext.backing {
-                *index0 += 1;
             }
             self.insert(ext);
             self.merge_around(old_end);
@@ -631,7 +653,7 @@ impl AddressSpace {
             e.set_addr(frame.start_address(), v.prot.flags());
             return Ok(());
         }
-        let (frame, writable_ok) = self.new_frame(page, &v)?;
+        let (frame, writable_ok) = self.new_frame(page, &v, access)?;
         let mut flags = v.prot.flags();
         if !writable_ok && flags.contains(PageTableFlags::WRITABLE) {
             flags.remove(PageTableFlags::WRITABLE);
@@ -640,40 +662,34 @@ impl AddressSpace {
         self.install(page, frame, flags)
     }
 
-    /// A frame with the page's initial contents, and whether it may be
-    /// mapped writable directly.
-    fn new_frame(&mut self, page: u64, v: &Vma) -> Result<(PhysFrame, bool), Fault> {
+    /// A frame with the page's initial contents (holding a reference for
+    /// this mapping), and whether it may be mapped writable directly.
+    fn new_frame(&mut self, page: u64, v: &Vma, access: Access) -> Result<(PhysFrame, bool), Fault> {
         match &v.backing {
             Backing::Anon => Ok((zeroed_frame()?, true)),
             Backing::Device => Err(Fault::Segv),
-            Backing::Shared { object, index0 } => {
-                let index = index0 + (page - v.start) / PAGE;
-                let mut frames = object.frames.lock();
-                let frame = match frames.get(&index) {
-                    Some(&f) => f,
-                    None => {
-                        let f = zeroed_frame()?;
-                        frames.insert(index, f);
-                        f
+            Backing::File { cache, offset, shared, .. } => {
+                // Reading a missing page may sleep (a remote file): only the
+                // address space is locked.
+                let frame = cache.map_page((offset + (page - v.start)) / PAGE)?;
+                if *shared || !access.write {
+                    // A private page stays the cache's until written.
+                    return Ok((frame, *shared));
+                }
+                let copy = memory::with_frames(|f| UserFrames(f).allocate_frame());
+                memory::with_frames(|f| {
+                    if let Some(copy) = copy {
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(
+                                memory::phys_to_virt(frame.start_address().as_u64()),
+                                memory::phys_to_virt(copy.start_address().as_u64()),
+                                PAGE as usize,
+                            );
+                        }
                     }
-                };
-                // The mapping holds its own reference.
-                memory::with_frames(|f| f.share(frame));
-                Ok((frame, true))
-            }
-            Backing::File { inode, offset } => {
-                let file_off = offset + (page - v.start);
-                if file_off >= inode.size() {
-                    return Err(Fault::Bus);
-                }
-                let frame = zeroed_frame()?;
-                let buf = unsafe { core::slice::from_raw_parts_mut(memory::phys_to_virt(frame.start_address().as_u64()), PAGE as usize) };
-                // Reading may sleep (a remote filesystem): no lock is held.
-                if inode.read_at(file_off, buf).is_err() {
-                    memory::with_frames(|f| unsafe { f.deallocate_frame(frame) });
-                    return Err(Fault::Bus);
-                }
-                Ok((frame, true))
+                    unsafe { f.deallocate_frame(frame) };
+                });
+                Ok((copy.ok_or(Fault::Oom)?, true))
             }
         }
     }
@@ -710,7 +726,7 @@ impl AddressSpace {
         let flags = e.flags();
         let writable = ((flags - COW) | PageTableFlags::WRITABLE) & !PROT_NONE;
         let old = PhysFrame::containing_address(e.addr());
-        let shared_area = matches!(v.backing, Backing::Shared { .. });
+        let shared_area = v.backing.shared();
         let copied = memory::with_frames(|frames| {
             if shared_area || frames.refcount(old) <= 1 {
                 // Only rights grow: a stale read-only entry elsewhere just
@@ -813,6 +829,25 @@ impl AddressSpace {
         Ok(())
     }
 
+    /// Removes this space's mappings of `cache`'s pages from `index` on
+    /// (a truncated file), private copies included.
+    pub fn unmap_file(&mut self, cache: &PageCache, index: u64) {
+        let ranges: alloc::vec::Vec<(u64, u64)> = self
+            .vmas
+            .values()
+            .filter_map(|v| {
+                let (c, first) = v.file()?;
+                if !core::ptr::eq(Arc::as_ptr(c), cache) || first + v.pages() <= index {
+                    return None;
+                }
+                Some((v.start + index.saturating_sub(first) * PAGE, v.end))
+            })
+            .collect();
+        for (start, end) in ranges {
+            self.clear_pages(start, end);
+        }
+    }
+
     // -------------------------------------------------------------- fork
 
     /// Copy-on-write clone for fork: both spaces share every private frame
@@ -843,10 +878,7 @@ impl AddressSpace {
                         let l1 = table_at(PhysFrame::containing_address(l2e.addr()));
                         for (i1, leaf) in l1.iter_mut().enumerate().filter(|(_, e)| !e.is_unused()) {
                             let va = (i4 as u64) << 39 | (i3 as u64) << 30 | (i2 as u64) << 21 | (i1 as u64) << 12;
-                            let shared = vmas
-                                .range(..=va)
-                                .next_back()
-                                .is_some_and(|(_, v)| va < v.end && matches!(v.backing, Backing::Shared { .. } | Backing::Device));
+                            let shared = vmas.range(..=va).next_back().is_some_and(|(_, v)| va < v.end && v.backing.shared());
                             let mut flags = leaf.flags();
                             if !shared && flags.contains(PageTableFlags::WRITABLE) {
                                 flags.remove(PageTableFlags::WRITABLE);
@@ -872,6 +904,7 @@ impl AddressSpace {
         tlb::shootdown(&self.tlb, 0, USER_END);
         new.brk_start = self.brk_start;
         new.brk_end = self.brk_end;
+        // (The child registers with the file caches when it gets its Mm.)
         result.map(|_| new)
     }
 }
@@ -889,17 +922,6 @@ impl Drop for AddressSpace {
         });
         drop(vmas);
     }
-}
-
-/// A new shared anonymous memory object of `pages` pages (committed).
-pub fn new_shared(pages: u64) -> Result<Arc<SharedAnon>, Fault> {
-    if !memory::commit(pages) {
-        return Err(Fault::Oom);
-    }
-    Arc::try_new(SharedAnon { frames: IrqSpinLock::new(BTreeMap::new()), committed: pages }).map_err(|_| {
-        memory::uncommit(pages);
-        Fault::Oom
-    })
 }
 
 fn zeroed_frame() -> Result<PhysFrame, Fault> {

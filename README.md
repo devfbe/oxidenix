@@ -185,16 +185,16 @@ oxidenix/
 │       │   ├── sys_mem.rs       brk, mmap, mprotect, mremap
 │       │   ├── sys_net.rs       socket syscalls (sockaddr_in, msghdr, options)
 │       │   ├── signal.rs        signal state, delivery, sigreturn, kill
-│       │   ├── futex.rs         futex wait queues keyed by address space or shared object
+│       │   ├── futex.rs         futex wait queues keyed by address space or page cache
 │       │   ├── loader.rs        ELF loading and the Linux initial stack
 │       │   ├── elf.rs           ELF64 parser
 │       │   ├── ipc.rs           services and message passing
 │       │   ├── irq.rs           device interrupts for user-space drivers
 │       │   └── uaccess.rs       copies to and from user memory
 │       ├── net.rs               socket client: operations become netd requests
-│       ├── fs/                  VFS (mod.rs), open files and pipes (file.rs),
-│       │                        initramfs unpacker (cpio.rs), IPC client for
-│       │                        filesystem servers (remote.rs)
+│       ├── fs/                  VFS (mod.rs), page cache (cache.rs), open files and
+│       │                        pipes (file.rs), initramfs unpacker (cpio.rs), IPC
+│       │                        client for filesystem servers (remote.rs)
 │       ├── drivers/             framebuffer console (console.rs, glyphs.rs), TTY (tty.rs),
 │       │                        PS/2 keyboard (keyboard.rs), CMOS clock (rtc.rs),
 │       │                        serial port mirror (serial.rs), PCI scan (pci.rs),
@@ -263,14 +263,22 @@ About 9,200 lines of Rust (without comments and blank lines) in the kernel and 3
   process, the upper half entries are copied from the kernel's table. Dropping an address space
   walks the lower half and releases every table and frame.
 - **Areas (VMAs)** (`process/address_space.rs`): each address space keeps its areas (start,
-  end, rights, backing) next to its page tables. Backings: zero-filled private memory, shared
-  anonymous memory (one object whose frames every mapping and every `fork` child sees),
-  private file mappings and device memory (DMA). `mmap`, `munmap`, `mprotect` and `mremap` cut
-  and join areas at page granularity.
+  end, rights, backing) next to its page tables. Backings: zero-filled private memory, file
+  pages (shared or private) and device memory (DMA). Anonymous shared memory is an unnamed
+  tmpfs file, so every shared mapping is a file mapping. `mmap`, `munmap`, `mprotect` and
+  `mremap` cut and join areas at page granularity.
 - **Demand paging**: mapping creates an area, not pages. The first access faults; the handler
-  checks the area's rights (else `SIGSEGV`), then maps a zeroed frame, the shared object's
-  frame, or a page read from the file (`SIGBUS` beyond its end). An access just below a stack
-  grows it, up to 8 MiB. Kernel accesses to user memory fault pages in the same way first.
+  checks the area's rights (else `SIGSEGV`), then maps a zeroed frame or the file's page from
+  the page cache (`SIGBUS` beyond the end of the file). An access just below a stack grows it,
+  up to 8 MiB. Kernel accesses to user memory fault pages in the same way first.
+- **Page cache** (`fs/cache.rs`, design in `docs/design/page-cache.md`): the pages of a regular
+  file live in frames that `read`, `write` and every mapping share, so a store through a shared
+  mapping is visible to `read` and to other processes at once, and `write` is visible in their
+  mappings. A private mapping maps the cache's frame copy-on-write and sees the file until it
+  writes a page. Each cache knows which address spaces map it: shrinking a file removes the
+  pages beyond the new end from all of them, private copies included, so later accesses raise
+  `SIGBUS` as on Linux. A shared mapping of a file opened read-only cannot become writable
+  (`EACCES`).
 - **Protection**: `mprotect` really changes the rights (including `PROT_NONE`, which keeps the
   pages' contents in entries marked by a software bit) and execution is denied by NX unless an
   area is executable, so JIT compilers can write code and then make it executable (W^X).
@@ -290,7 +298,8 @@ About 9,200 lines of Rust (without comments and blank lines) in the kernel and 3
   so shooters never deadlock. Unmapping walks only the page tables that exist, so huge sparse
   reservations cost what is mapped in them.
 - **futex** (`futex.rs`): a futex is keyed by the address space and address, or, in shared
-  memory, by the shared object and offset, so processes meet whatever address they mapped it at.
+  memory, by the file's page cache and offset, so processes meet whatever address they mapped
+  it at.
   A waiter compares the word under its hash bucket's lock with a load that never resolves page
   faults (if the page is missing it drops the lock, faults it in and retries), so the check and
   the enqueue are atomic with respect to a waker.
@@ -483,15 +492,17 @@ call into a device:
   symlinks or devices. Path resolution follows symlinks with loop detection and supports the
   `*at` family relative to directory descriptors.
 - **Initramfs**: the builder writes a `newc` cpio archive, and the kernel unpacks it at boot
-  without copying file contents. Files reference the ramdisk until their first write
-  (copy-on-write).
+  without copying file contents. A file's pages are read from the ramdisk until a page is
+  written or mapped; then it gets its own frame in the file's page cache.
+- **tmpfs**: the files in memory keep their contents in their page cache (as Linux's tmpfs).
+  The pages are committed memory, and all of them together may take half of the commit limit
+  (`ENOSPC` beyond, as Linux's default tmpfs size).
 - **Open files** are shared descriptions (`Arc<OpenFile>`) with offset and flags, so `dup`,
   `fork` and close-on-exec behave as on Linux.
 - **eventfd**: a 64-bit counter as a file (reads take it, or 1 of it with `EFD_SEMAPHORE`; writes add and block before it would overflow), on one wait channel that `poll` and `select` listen on too.
 - **Pipes** have a 64 KiB buffer with blocking reads and writes and EOF/`EPIPE` semantics.
-- **Quotas**: file contents and inode metadata are charged against an 8 MiB budget (`ENOSPC`),
-  and single files are limited to 64 MiB (`EFBIG`). Without this, user programs could exhaust
-  the kernel heap.
+- **Quotas**: inodes, symlink targets and pipe buffers live on the kernel heap and are charged
+  against an 8 MiB budget (`ENOSPC`), so user programs cannot exhaust the heap.
 
 ### Microkernel architecture
 
@@ -665,7 +676,7 @@ Linux x86_64 numbers, grouped by area (about 120 in total):
 | Metadata | `stat` `fstat` `lstat` `newfstatat` `access` `faccessat` `faccessat2` `readlink` `readlinkat` `chmod` `fchmodat` `utimes` `futimesat` `utimensat` `umask` |
 | Directories | `getdents64` `getcwd` `chdir` `fchdir` `mkdir` `mkdirat` `rmdir` `unlink` `unlinkat` `rename` `renameat` `renameat2` `symlink` `symlinkat` |
 | I/O multiplexing | `poll` `ppoll` `select` `pselect6` `epoll_create` `epoll_create1` `epoll_ctl` `epoll_wait` `epoll_pwait` `epoll_pwait2` `eventfd` `eventfd2` |
-| Memory | `brk` `mmap` (private, shared, anonymous, file, `MAP_FIXED[_NOREPLACE]`, `MAP_NORESERVE`, `MAP_POPULATE`) `munmap` `mprotect` `mremap` `madvise` (`DONTNEED`, `FREE`) `msync` `mlock` (no-ops) |
+| Memory | `brk` `mmap` (private, shared, anonymous, file through the page cache, `MAP_FIXED[_NOREPLACE]`, `MAP_NORESERVE`, `MAP_POPULATE`) `munmap` `mprotect` `mremap` `madvise` (`DONTNEED`, `FREE`) `msync` `mlock` (no-ops) |
 | CPUs | `sched_getaffinity` `sched_setaffinity` `getcpu` |
 | Processes and threads | `clone` (`CLONE_VM` `FS` `FILES` `SIGHAND` `THREAD` `VFORK` `PARENT` `SETTLS` `PARENT_SETTID` `CHILD_SETTID` `CHILD_CLEARTID`) `fork` `vfork` `execve` `exit` (one thread) `exit_group` `wait4` `getpid` `getppid` `gettid` `set_tid_address` `sched_yield` `arch_prctl` `prlimit64` |
 | Groups and IDs | `setpgid` `getpgid` `getpgrp` `setsid` `getsid` `getuid` `geteuid` `getgid` `getegid` `getresuid` `getresgid` `setuid` `setgid` |
@@ -710,7 +721,8 @@ Each of these programs and scripts lives in the root filesystem and runs inside 
 | `vmtest` | demand paging (a 64 MiB mapping costs nothing until touched), `SIGSEGV` on read-only and `PROT_NONE` pages with contents kept, split areas after a partial `munmap`, NX and the JIT pattern (1 GiB `PROT_NONE` reservation, write code, `mprotect` to executable, call it), commit limit and `MAP_NORESERVE`, `mremap` in place and moving, `MADV_DONTNEED`, shared vs. private memory across `fork`, lazy file mappings and `SIGBUS` beyond the end, `MAP_FIXED_NOREPLACE`, stack growth to 4 MiB and overflow beyond 8 MiB |
 | `smptest` | CPU count and affinity (pinning to every CPU, empty masks), parallel speed-up of CPU-bound processes, `fork`/`exit`/`wait` on every CPU at once, 5000 pipe round trips between two CPUs, signals to a process running on another CPU, timers on time while a program floods the console with palette changes on the same CPU |
 | `nettest` | TCP to an echo service through QEMU, `ECONNREFUSED`, `listen`/`accept` over loopback with a forked client, EOF after the peer closed, non-blocking `accept` and `connect` with `poll` and `SO_ERROR`, `EINTR` in a blocking `recv`, UDP over loopback, raw ICMP echo to the gateway and over loopback, source address for off-subnet destinations, overflowing message vectors, `AF_INET6` rejected |
-| `sh /etc/test.sh` | files, pipes, `cd`, `mkdir`/`touch`/`rm`, rename cycles via symlinks, file quota |
+| `mmaptest` | shared file mappings: stores visible to `read` and `write` visible in the mapping at once, another process's own mapping of the file, the size unchanged by stores; private mappings seeing `write` until they write a page, and never reaching the file; mappings outliving `close` and `unlink`; the zero tail of the last page and `SIGBUS` beyond it; growing and shrinking with `ftruncate` (`SIGBUS` in shared pages and private copies beyond the new end, zeros after growing again); `EACCES` for writable sharing of a read-only descriptor (also via `mprotect`); shared anonymous memory across 8 children; mapping initramfs files |
+| `sh /etc/test.sh` | files, pipes, `cd`, `mkdir`/`touch`/`rm`, rename cycles via symlinks, the tmpfs size limit |
 | `fstest` | descriptor access modes (`EBADF` on read-only/write-only fds), `O_NOFOLLOW` on symlinks, unlinked-but-open files (kept until closed, never shared with new files), ext2 size limits, overflowing `mmap` offsets |
 | `sh /etc/disktest.sh` | ext2: 150-file directory, 1.5 MiB file (double indirect), append, truncate, rename, cycles, symlinks, `rm -r`, space accounting |
 | `e2fsck -fn disk.img` (host) | the filesystem written by oxidenix is consistent |

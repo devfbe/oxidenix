@@ -17,11 +17,11 @@ echo "== moving a directory below itself via a symlink (must fail)"
 mkdir -p /tmp/a/b && ln -s /tmp/a/b /tmp/link && mv /tmp/a /tmp/link/a
 ls /tmp
 rm -r /tmp/a /tmp/link
-echo "== exceeding the file quota (must fail with no space)"
-dd if=/dev/zero of=/tmp/big bs=1048576 count=20
+echo "== filling tmpfs (half of memory; must fail with no space)"
+dd if=/dev/zero of=/tmp/big bs=1048576 count=400
 rm /tmp/big
 dd if=/dev/zero of=/tmp/big bs=1048576 count=2 && ls -l /tmp/big && rm /tmp/big
-echo "== pipes keep working while the file quota is exhausted (must print 5000)"
-dd if=/dev/zero of=/tmp/fill bs=1048576 count=20 2>/dev/null
+echo "== pipes keep working while tmpfs is full (must print 5000)"
+dd if=/dev/zero of=/tmp/fill bs=1048576 count=400 2>/dev/null
 seq 1 5000 | cat | wc -l
 rm /tmp/fill

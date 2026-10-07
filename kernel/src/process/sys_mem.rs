@@ -27,6 +27,7 @@ const MADV_FREE: u64 = 8;
 fn errno(f: Fault) -> i64 {
     match f {
         Fault::Oom => ENOMEM,
+        Fault::Access => EACCES,
         Fault::Segv | Fault::Bus => EINVAL,
     }
 }
@@ -80,22 +81,24 @@ pub fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64) ->
         return Err(ENOMEM);
     }
     let prot = Prot::from_bits(prot);
+    let shared = sharing != MAP_PRIVATE;
+    let anon = |shared: bool| if shared { Backing::shared_anon(len / PAGE).map_err(errno) } else { Ok(Backing::Anon) };
     let backing = if flags & MAP_ANONYMOUS != 0 {
-        if sharing == MAP_PRIVATE { Backing::Anon } else { Backing::Shared { object: address_space::new_shared(len / PAGE).map_err(errno)?, index0: 0 } }
+        anon(shared)?
     } else {
         let f = with_current(|p| p.file(fd))?;
-        if !f.readable() || (sharing != MAP_PRIVATE && prot.write && !f.writable()) {
+        if !f.readable() || (shared && prot.write && !f.writable()) {
             return Err(EACCES);
         }
         let inode = f.inode().ok_or(ENODEV)?.clone();
         match inode.device() {
             // /dev/zero: anonymous memory.
-            Some(Device::Zero) => Backing::Anon,
+            Some(Device::Zero) => anon(shared)?,
             Some(_) => return Err(ENODEV),
-            // Shared writable file mappings are private copies too: there
-            // is no page cache to write them back through yet.
-            None if inode.is_dir() => return Err(ENODEV),
-            None => Backing::File { inode, offset },
+            None => {
+                let cache = inode.cache().map_err(|_| ENODEV)?;
+                Backing::File { cache, offset, shared, may_write: f.writable(), _file: Some(inode) }
+            }
         }
     };
     let noreserve = flags & MAP_NORESERVE != 0;
@@ -139,7 +142,8 @@ pub fn munmap(addr: u64, len: u64) -> SysResult {
 }
 
 /// mprotect(2): fails with ENOMEM if part of the range is unmapped or if
-/// making private memory writable exceeds the commit limit.
+/// making private memory writable exceeds the commit limit, and with
+/// EACCES for a shared mapping of a file not opened for writing.
 pub fn mprotect(addr: u64, len: u64, prot: u64) -> SysResult {
     if !aligned(addr) || prot & !7 != 0 {
         return Err(EINVAL);
@@ -147,7 +151,7 @@ pub fn mprotect(addr: u64, len: u64, prot: u64) -> SysResult {
     if len == 0 {
         return Ok(0);
     }
-    mm()?.lock().protect(addr, page_up(len), Prot::from_bits(prot)).map_err(|_| ENOMEM)?;
+    mm()?.lock().protect(addr, page_up(len), Prot::from_bits(prot)).map_err(|e| if e == Fault::Access { EACCES } else { ENOMEM })?;
     Ok(0)
 }
 

@@ -642,7 +642,7 @@ pub fn utimensat(dirfd: u64, path: u64, flags: u64) -> SysResult {
 }
 
 /// statfs/fstatfs: a server's filesystem reports its real usage, everything else
-/// the in-memory filesystem and its quota.
+/// the in-memory filesystem (tmpfs) and its size limit.
 fn write_statfs(inode: &Inode, buf: u64) -> SysResult {
     const EXT2_MAGIC: u64 = 0xef53;
     const TMPFS_MAGIC: u64 = 0x0102_1994;
@@ -652,8 +652,8 @@ fn write_statfs(inode: &Inode, buf: u64) -> SysResult {
             (EXT2_MAGIC, bs, blocks, free, inodes, free_inodes)
         }
         None => {
-            let (used, quota) = fs::quota_usage();
-            (TMPFS_MAGIC, 4096, quota as u64 / 4096, (quota - used) as u64 / 4096, 0, 0)
+            let (used, limit) = fs::cache::tmpfs_usage();
+            (TMPFS_MAGIC, 4096, limit, limit.saturating_sub(used), 0, 0)
         }
     };
     let words: [u64; 15] = [kind, bsize, blocks, free, free, files, ffree, 0, fs::NAME_MAX as u64, bsize, 0, 0, 0, 0, 0];
