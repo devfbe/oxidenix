@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #define PG 4096
@@ -21,6 +22,7 @@
 #define TEST_MAP_AT 1504
 #define TEST_PAGED 1505
 #define TEST_SUPPLIED 1506
+#define TEST_PAGED_STUCK 1507
 
 static int failures;
 
@@ -78,6 +80,23 @@ int main(void) {
     check("the program reads pages the pager supplies",
           memcmp(pg, "paged 0", 7) == 0 && memcmp(pg + 3 * PG, "paged 3", 7) == 0 && memcmp(pg + PG, "paged 1", 7) == 0);
     check("... each page once", pg[2 * PG] == 'p' && syscall(TEST_SUPPLIED) - before == 4);
+
+    /* A page that never comes: SIGKILL still ends the waiting thread. */
+    pid_t child = fork();
+    if (child == 0) {
+        char *stuck = (char *)0x220000000000;
+        if (syscall(TEST_PAGED_STUCK, stuck) != 0) _exit(1);
+        (void)*(volatile char *)stuck;
+        _exit(2);
+    }
+    usleep(200 * 1000);
+    kill(child, SIGKILL);
+    signal(SIGALRM, SIG_DFL);
+    alarm(5);
+    int st = 0;
+    waitpid(child, &st, 0);
+    alarm(0);
+    check("SIGKILL ends a thread waiting for a page", WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL);
     printf("lxtest: %s\n", failures ? "FAILED" : "all passed");
     return failures != 0;
 }

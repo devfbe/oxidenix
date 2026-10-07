@@ -262,7 +262,8 @@ impl PageCache {
     }
 
     /// Waits until the pager supplied page `index` (EIO if the pager is
-    /// gone).
+    /// gone, EINTR if the thread is dying: a pager that never answers must
+    /// not leave it unkillable).
     fn wait_paged(&self, index: u64) -> Result<(), i64> {
         let Store::Paged { pager, key } = &self.store else { return Ok(()) };
         loop {
@@ -270,6 +271,9 @@ impl PageCache {
                 let wait = crate::process::sched::prepare_to_wait(self.page_chan(index));
                 if self.state.lock().pages.contains_key(&index) {
                     return Ok(true);
+                }
+                if crate::process::signal::dying() {
+                    return Err(EINTR);
                 }
                 let Some(pager) = pager.upgrade() else { return Err(EIO) };
                 pager.request(*key, index);

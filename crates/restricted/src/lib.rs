@@ -153,3 +153,6 @@ pub const ROLE_PAGER: u64 = 1;
 pub const TEST_PAGED: u64 = 1505;
 /// `()`: how many pages the pager supplied so far.
 pub const TEST_SUPPLIED: u64 = 1506;
+/// `(addr)`: a 1-page paged object the pager never supplies, mapped at
+/// `addr` (a thread touching it waits until it is killed).
+pub const TEST_PAGED_STUCK: u64 = 1507;

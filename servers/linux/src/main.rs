@@ -50,7 +50,7 @@ pub extern "C" fn _start(state: *mut State, role: u64) -> ! {
         }
         let s = unsafe { &mut *state };
         match s.rax {
-            TEST_MAP..=TEST_SUPPLIED => s.rax = test(s.rax, s.rdi) as u64,
+            TEST_MAP..=TEST_PAGED_STUCK => s.rax = test(s.rax, s.rdi) as u64,
             nr if nr >= FIRST_NON_LINUX => s.rax = -ENOSYS as u64,
             _ => {
                 call0(SYS_LEGACY_SYSCALL);
@@ -144,6 +144,16 @@ fn test(nr: u64, addr: u64) -> i64 {
             if r < 0 { r } else { 0 }
         }
         TEST_SUPPLIED => SUPPLIED.load(Ordering::Relaxed) as i64,
+        TEST_PAGED_STUCK => {
+            // A key the pager does not answer.
+            let h = syscall(SYS_MO_CREATE_PAGED, [1, TEST_KEY + 1, 0, 0, 0, 0]);
+            if h < 0 {
+                return h;
+            }
+            let r = syscall(SYS_MO_MAP, [h as u64, addr, PAGE, 0, PROT_READ, MO_SHARED]);
+            syscall(SYS_HANDLE_CLOSE, [h as u64, 0, 0, 0, 0, 0]);
+            if r < 0 { r } else { 0 }
+        }
         _ => -ENOSYS,
     }
 }

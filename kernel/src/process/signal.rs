@@ -224,6 +224,12 @@ pub fn killed() -> bool {
     (me.sig.lock().pending | g.pending) & bit(SIGKILL) != 0
 }
 
+/// Whether the current thread is about to die: SIGKILL is pending or its
+/// process is exiting (ends waits that nothing else may interrupt).
+pub fn dying() -> bool {
+    killed() || current().group.sig.lock().exit != GroupExit::None
+}
+
 /// Raises `sig` for a fault of the current thread (a CPU exception). Such
 /// a signal can be neither blocked nor ignored: as on Linux, the action is
 /// reset to the default (terminate) in that case. Returns whether the

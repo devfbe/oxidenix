@@ -119,6 +119,9 @@ fn exception(frame: &mut Frame) {
             }
             match handle_fault(addr, access) {
                 Ok(()) => return,
+                // The wait for the page ended because the thread dies: the
+                // return to user mode carries out SIGKILL or the exit.
+                Err(_) if fixup.is_none() && signal::dying() => return,
                 Err(_) if fixup.is_some() => {
                     frame.rip = fixup.expect("checked").to;
                     return;
