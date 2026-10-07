@@ -177,3 +177,26 @@ batches, by DMA from the page cache pages); `fsync` makes it durable.
 The task's ground rules mention curl and IPv6: neither exists in oxidenix today (BusyBox
 `wget` is the HTTP client; the network stack is IPv4 only). The smoke test uses what exists:
 boot, Bash, `wget` over the network.
+
+## Measured baseline
+
+`scripts/bench.sh` on commit `841f4cf` against a Linux 6.18 guest in the same QEMU
+configuration (`docs/benchmarks/2026-10-07-841f4cf-baseline.md`,
+`docs/benchmarks/2026-10-07-linux-6.18.54.md`; i5-1240P host, KVM):
+
+| benchmark | oxidenix | Linux | |
+|---|---:|---:|---|
+| null system call, p50 | 723 cycles | 1412 cycles | Linux pays for its Spectre/Meltdown mitigations; oxidenix has none |
+| `fstat` of a disk file, p50 (oxidenix: one IPC round trip) | 33071 cycles | 2172 cycles | the IPC round trip costs ~31600 cycles, 45 null system calls |
+| `fstat`, p99 | 165324 cycles | 5251 cycles | |
+| sequential write, 64 KiB + `fsync` | 2.9 MB/s | 162.1 MB/s | 56× slower: a device flush per `write`, and diskfs waits for it by spinning on `sched_yield` (35000 system calls per 64 KiB) |
+| sequential read from the disk (`O_DIRECT`, 64 KiB) | 126.2 MB/s | 211.1 MB/s | |
+| sequential read from the page cache | 3384 MB/s | 3213 MB/s | equal: no IPC on this path |
+| 4 KiB read from the page cache, p50 / p99 | 2366 / 3411 ns | 1954 / 20586 ns | |
+| 4 KiB read from the disk, p50 / p99 | 76 / 394 µs | 117 / 1461 µs | both mostly the device |
+| TCP over loopback | 229 MB/s | 1660 MB/s | 7× slower: 8 IPC round trips, 14 address space switches and 33 kernel allocations per 64 KiB |
+| TCP through the network card (echo) | 20.6 MB/s | 55.1 MB/s | |
+
+The counters confirm the audit: a disk `read` or `write` of 64 KiB is 2 IPC round trips with
+64 KiB through IPC and twice the data through user copies; a cached read has no IPC and
+copies the data once to the user (plus once more inside the kernel).
