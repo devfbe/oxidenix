@@ -20,6 +20,8 @@ An AI research project; see README.md.
 - `cargo` lives in `~/.cargo/bin`.
 - `cd kernel && OXIDENIX_TEST=1 cargo run` runs all self-tests (`/etc/runtests.sh`) and
   exits QEMU with 1 on success, 3 on failure; CI runs the same on every push.
+- `nix-shell -p e2fsprogs --run "cargo test -p ext2fs"` (workspace root) tests the ext2
+  library on the host against a RAM disk; CI runs it too.
 - QEMU must always run with a visible window; never use `-display none`.
 - `cd kernel && OXIDENIX_BUILD_ONLY=1 cargo run` builds the boot image and data disk without
   starting QEMU.

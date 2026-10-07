@@ -1,12 +1,20 @@
 //! ext2 on the data disk (any `Device`): revision 1 with the `filetype` feature,
 //! 1/2/4 KiB blocks, direct and single/double/triple indirect blocks.
 //!
-//! Every change goes straight to disk (no cache), and metadata is kept
-//! consistent enough for `e2fsck` on the host to accept the filesystem.
+//! Metadata goes through a block cache (`cache.rs`); every public operation
+//! commits its changes before it returns (written together, then one
+//! flush), so a completed operation is durable. File data is read and
+//! written straight from and to the device, in runs of contiguous blocks.
+//! Metadata is kept consistent enough for `e2fsck` on the host to accept
+//! the filesystem.
 
 #![no_std]
 
 extern crate alloc;
+
+mod cache;
+
+use cache::BlockCache;
 
 use alloc::string::String;
 use alloc::vec;
@@ -41,6 +49,8 @@ pub trait Device {
     fn read(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), ()>;
     /// Writes whole 512-byte sectors starting at `lba`.
     fn write(&mut self, lba: u64, buf: &[u8]) -> Result<(), ()>;
+    /// Makes everything written so far durable.
+    fn flush(&mut self) -> Result<(), ()>;
     /// Seconds since the Unix epoch, for timestamps.
     fn now(&self) -> u32;
 }
@@ -59,6 +69,9 @@ const RO_COMPAT_SUPPORTED: u32 = 0x1 | 0x2; // sparse_super, large_file
 const DIRECT: usize = 12;
 /// Symlink targets shorter than this live in the block pointers ("fast").
 const FAST_SYMLINK_MAX: usize = 60;
+
+/// Memory for cached metadata blocks.
+const CACHE_BYTES: usize = 1024 * 1024;
 
 const FT_REG: u8 = 1;
 const FT_DIR: u8 = 2;
@@ -179,6 +192,12 @@ struct State<D: Device> {
     free_inodes: u32,
     gdt_block: u32,
     groups: Vec<Group>,
+    cache: BlockCache,
+    /// The superblock as read at mount; the free counts change in it.
+    sb: [u8; 1024],
+    super_dirty: bool,
+    /// Something was written since the last flush.
+    written: bool,
     /// Inodes whose last link went away; the Ext2 wrapper decides whether
     /// to free them now or when the last open reference is dropped.
     unlinked: Vec<(u32, RawInode)>,
@@ -221,26 +240,98 @@ impl<D: Device> State<D> {
         (self.block_size / SECTOR_SIZE) as u64
     }
 
+    fn lba(&self, block: u32) -> u64 {
+        block as u64 * self.sectors_per_block()
+    }
+
+    fn dev_write(&mut self, block: u32, buf: &[u8]) -> Result<(), i64> {
+        self.written = true;
+        self.dev.write(self.lba(block), buf).map_err(io)
+    }
+
+    /// Metadata block `n`, through the cache.
     fn read_block(&mut self, n: u32) -> Result<Vec<u8>, i64> {
+        if let Some(data) = self.cache.get(n) {
+            return Ok(data.to_vec());
+        }
         let mut buf = vec![0u8; self.block_size];
-        let lba = n as u64 * self.sectors_per_block();
-        self.dev.read(lba, &mut buf).map_err(io)?;
+        self.dev.read(self.lba(n), &mut buf).map_err(io)?;
+        self.cache_insert(n, buf.clone(), false)?;
         Ok(buf)
     }
 
+    /// Changes metadata block `n`; it reaches the device at the commit.
     fn write_block(&mut self, n: u32, buf: &[u8]) -> Result<(), i64> {
-        let lba = n as u64 * self.sectors_per_block();
-        self.dev.write(lba, buf).map_err(io)
+        self.cache_insert(n, buf.to_vec(), true)
+    }
+
+    fn cache_insert(&mut self, n: u32, data: Vec<u8>, dirty: bool) -> Result<(), i64> {
+        match self.cache.insert(n, data, dirty) {
+            Some((old, data)) => self.dev_write(old, &data),
+            None => Ok(()),
+        }
     }
 
     fn write_super(&mut self) -> Result<(), i64> {
-        let mut sb = [0u8; 1024];
-        self.dev.read(2, &mut sb).map_err(io)?;
-        put32(&mut sb, 12, self.free_blocks);
-        put32(&mut sb, 16, self.free_inodes);
+        put32(&mut self.sb, 12, self.free_blocks);
+        put32(&mut self.sb, 16, self.free_inodes);
         let now = self.dev.now();
-        put32(&mut sb, 48, now);
-        self.dev.write(2, &sb).map_err(io)
+        put32(&mut self.sb, 48, now);
+        self.super_dirty = true;
+        Ok(())
+    }
+
+    /// Writes the changed metadata (adjacent blocks in one request), then
+    /// flushes the device if anything was written.
+    fn commit(&mut self) -> Result<(), i64> {
+        let dirty = self.cache.take_dirty();
+        let mut i = 0;
+        while i < dirty.len() {
+            let mut j = i + 1;
+            while j < dirty.len() && dirty[j].0 == dirty[j - 1].0 + 1 {
+                j += 1;
+            }
+            let run: Vec<u8> = dirty[i..j].iter().flat_map(|(_, d)| d.iter().copied()).collect();
+            self.dev_write(dirty[i].0, &run)?;
+            i = j;
+        }
+        if self.super_dirty {
+            self.super_dirty = false;
+            self.written = true;
+            self.dev.write(2, &self.sb).map_err(io)?;
+        }
+        if self.written {
+            self.written = false;
+            self.dev.flush().map_err(io)?;
+        }
+        Ok(())
+    }
+
+    /// File data block `n`: the cache's version if it has one (a block
+    /// just allocated, or a tail zeroed by truncation), else the device's.
+    fn data_block(&mut self, n: u32) -> Result<Vec<u8>, i64> {
+        let mut buf = vec![0u8; self.block_size];
+        self.read_data(n, &mut buf)?;
+        Ok(buf)
+    }
+
+    /// Reads the contiguous data blocks from `first` into `buf`.
+    fn read_data(&mut self, first: u32, buf: &mut [u8]) -> Result<(), i64> {
+        self.dev.read(self.lba(first), buf).map_err(io)?;
+        let bs = self.block_size;
+        let count = (buf.len() / bs) as u32;
+        for (n, data) in self.cache.range(first..first + count) {
+            let at = (n - first) as usize * bs;
+            buf[at..at + bs].copy_from_slice(data);
+        }
+        Ok(())
+    }
+
+    /// Writes the contiguous data blocks from `first`; the device's copy
+    /// is now the one that counts.
+    fn write_data(&mut self, first: u32, buf: &[u8]) -> Result<(), i64> {
+        self.cache.remove_range(first..first + (buf.len() / self.block_size) as u32);
+        self.dev_write(first, buf)
     }
 
     fn write_group(&mut self, g: usize) -> Result<(), i64> {
@@ -302,8 +393,9 @@ impl<D: Device> State<D> {
         self.write_block(bitmap_block, &bitmap)
     }
 
-    /// Allocates a zeroed block, preferring group `goal`.
-    fn alloc_block(&mut self, goal: usize) -> Result<u32, i64> {
+    /// Allocates a block, preferring group `goal`; zeroed unless it is for
+    /// file data the caller writes.
+    fn alloc_block(&mut self, goal: usize, zero: bool) -> Result<u32, i64> {
         let n = self.groups.len();
         for g in (goal..n).chain(0..goal) {
             if self.groups[g].free_blocks == 0 {
@@ -317,7 +409,9 @@ impl<D: Device> State<D> {
                 self.write_group(g)?;
                 self.write_super()?;
                 let block = first + bit;
-                self.write_block(block, &vec![0u8; self.block_size])?;
+                if zero {
+                    self.write_block(block, &vec![0u8; self.block_size])?;
+                }
                 return Ok(block);
             }
         }
@@ -325,6 +419,7 @@ impl<D: Device> State<D> {
     }
 
     fn free_block(&mut self, block: u32) -> Result<(), i64> {
+        self.cache.remove(block);
         let rel = block - self.first_data_block;
         let g = (rel / self.blocks_per_group) as usize;
         self.clear_bit(self.groups[g].block_bitmap, rel % self.blocks_per_group)?;
@@ -376,20 +471,36 @@ impl<D: Device> State<D> {
         (DIRECT as u64 + p + p * p + p * p * p) * self.block_size as u64
     }
 
-    /// Disk block holding file block `fb`, allocating it (and any indirect
-    /// blocks on the way) if `alloc`. Returns 0 for a hole when not allocating.
+    /// Disk block holding file block `fb`, allocating it (zeroed, and any
+    /// indirect blocks on the way) if `alloc`. Returns 0 for a hole when not
+    /// allocating.
     fn bmap(&mut self, ino: u32, inode: &mut RawInode, fb: u64, alloc: bool) -> Result<u32, i64> {
+        let leaf = if alloc { Some(true) } else { None };
+        self.map(ino, inode, fb, leaf).map(|(b, _)| b)
+    }
+
+    /// Like `bmap` with allocation, for file data the caller writes: a new
+    /// block is not zeroed. Returns (block, whether it is new).
+    fn bmap_data(&mut self, ino: u32, inode: &mut RawInode, fb: u64) -> Result<(u32, bool), i64> {
+        self.map(ino, inode, fb, Some(false))
+    }
+
+    /// `leaf`: allocate a missing data block (zeroed if `Some(true)`).
+    fn map(&mut self, ino: u32, inode: &mut RawInode, fb: u64, leaf: Option<bool>) -> Result<(u32, bool), i64> {
+        let alloc = leaf.is_some();
+        let zero_leaf = leaf == Some(true);
         let goal = self.group_of(ino);
         let spb = self.sectors_per_block() as i64;
         let p = self.ptrs_per_block();
         if (fb as usize) < DIRECT {
             let mut b = inode.block(fb as usize);
             if b == 0 && alloc {
-                b = self.alloc_block(goal)?;
+                b = self.alloc_block(goal, zero_leaf)?;
                 inode.set_block(fb as usize, b);
                 inode.add_sectors(spb);
+                return Ok((b, true));
             }
-            return Ok(b);
+            return Ok((b, false));
         }
         let mut rel = fb - DIRECT as u64;
         let (root, depth) = if rel < p {
@@ -406,28 +517,31 @@ impl<D: Device> State<D> {
         let mut blk = inode.block(root);
         if blk == 0 {
             if !alloc {
-                return Ok(0);
+                return Ok((0, false));
             }
-            blk = self.alloc_block(goal)?;
+            blk = self.alloc_block(goal, true)?;
             inode.set_block(root, blk);
             inode.add_sectors(spb);
         }
+        let mut new = false;
         for level in (0..depth).rev() {
             let idx = ((rel / p.pow(level)) % p) as usize;
             let mut table = self.read_block(blk)?;
             let mut next = le32(&table, idx * 4);
             if next == 0 {
                 if !alloc {
-                    return Ok(0);
+                    return Ok((0, false));
                 }
-                next = self.alloc_block(goal)?;
+                // Level 0 is the data block itself.
+                next = self.alloc_block(goal, level > 0 || zero_leaf)?;
+                new = level == 0;
                 put32(&mut table, idx * 4, next);
                 self.write_block(blk, &table)?;
                 inode.add_sectors(spb);
             }
             blk = next;
         }
-        Ok(blk)
+        Ok((blk, new))
     }
 
     /// Frees the data blocks with relative index >= `from` below `blk`
@@ -501,9 +615,9 @@ impl<D: Device> State<D> {
             if len % bs != 0 {
                 let blk = self.bmap(ino, inode, len / bs, false)?;
                 if blk != 0 {
-                    let mut buf = self.read_block(blk)?;
+                    let mut buf = self.data_block(blk)?;
                     buf[(len % bs) as usize..].fill(0);
-                    self.write_block(blk, &buf)?;
+                    self.write_data(blk, &buf)?;
                 }
             }
         }
@@ -524,20 +638,43 @@ impl<D: Device> State<D> {
             return Ok(0);
         }
         let n = buf.len().min((size - off) as usize);
-        let bs = self.block_size as u64;
+        let bs = self.block_size;
         let mut done = 0;
         while done < n {
             let pos = off + done as u64;
-            let bo = (pos % bs) as usize;
-            let chunk = (self.block_size - bo).min(n - done);
-            let blk = self.bmap(ino, &mut inode, pos / bs, false)?;
-            if blk == 0 {
-                buf[done..done + chunk].fill(0);
-            } else {
-                let data = self.read_block(blk)?;
-                buf[done..done + chunk].copy_from_slice(&data[bo..bo + chunk]);
+            let fb = pos / bs as u64;
+            let bo = (pos % bs as u64) as usize;
+            if bo != 0 || n - done < bs {
+                // Part of a block.
+                let chunk = (bs - bo).min(n - done);
+                let blk = self.bmap(ino, &mut inode, fb, false)?;
+                if blk == 0 {
+                    buf[done..done + chunk].fill(0);
+                } else {
+                    let data = self.data_block(blk)?;
+                    buf[done..done + chunk].copy_from_slice(&data[bo..bo + chunk]);
+                }
+                done += chunk;
+                continue;
             }
-            done += chunk;
+            // Whole blocks: a run of contiguous ones (or of holes) is one read.
+            let first = self.bmap(ino, &mut inode, fb, false)?;
+            let mut count = 1;
+            while count < (n - done) / bs {
+                let next = self.bmap(ino, &mut inode, fb + count as u64, false)?;
+                let follows = if first == 0 { next == 0 } else { next == first + count as u32 };
+                if !follows {
+                    break;
+                }
+                count += 1;
+            }
+            let run = &mut buf[done..done + count * bs];
+            if first == 0 {
+                run.fill(0);
+            } else {
+                self.read_data(first, run)?;
+            }
+            done += count * bs;
         }
         Ok(n)
     }
@@ -550,24 +687,56 @@ impl<D: Device> State<D> {
         off.checked_add(data.len() as u64)
             .filter(|&end| end <= self.max_file_size())
             .ok_or(EFBIG)?;
-        let bs = self.block_size as u64;
+        let bs = self.block_size;
         let mut done = 0;
         let mut result = Ok(());
+        // A block the last run allocated but did not write (it was not
+        // contiguous): (file block, disk block, new).
+        let mut next_run: Option<(u64, u32, bool)> = None;
         while done < data.len() {
             let pos = off + done as u64;
-            let bo = (pos % bs) as usize;
-            let chunk = (self.block_size - bo).min(data.len() - done);
-            let blk = match self.bmap(ino, &mut inode, pos / bs, true) {
+            let fb = pos / bs as u64;
+            let bo = (pos % bs as u64) as usize;
+            let mapped = match next_run.take() {
+                Some((at, blk, new)) if at == fb => Ok((blk, new)),
+                _ => self.bmap_data(ino, &mut inode, fb),
+            };
+            let (first, new) = match mapped {
                 Ok(b) => b,
                 Err(e) => {
                     result = Err(e);
                     break;
                 }
             };
-            let mut block = if chunk == self.block_size { vec![0u8; self.block_size] } else { self.read_block(blk)? };
-            block[bo..bo + chunk].copy_from_slice(&data[done..done + chunk]);
-            self.write_block(blk, &block)?;
-            done += chunk;
+            if bo != 0 || data.len() - done < bs {
+                // Part of a block: read, change, write back (a new one is zero).
+                let chunk = (bs - bo).min(data.len() - done);
+                let mut block = if new { vec![0u8; bs] } else { self.data_block(first)? };
+                block[bo..bo + chunk].copy_from_slice(&data[done..done + chunk]);
+                self.write_data(first, &block)?;
+                done += chunk;
+                continue;
+            }
+            // Whole blocks: allocate a contiguous run, write it at once.
+            let mut count = 1;
+            while count < (data.len() - done) / bs {
+                match self.bmap_data(ino, &mut inode, fb + count as u64) {
+                    Ok((next, _)) if next == first + count as u32 => count += 1,
+                    Ok((next, new)) => {
+                        next_run = Some((fb + count as u64, next, new));
+                        break;
+                    }
+                    Err(e) => {
+                        result = Err(e);
+                        break;
+                    }
+                }
+            }
+            self.write_data(first, &data[done..done + count * bs])?;
+            done += count * bs;
+            if result.is_err() {
+                break;
+            }
         }
         if off + done as u64 > inode.size() {
             inode.set_size(off + done as u64);
@@ -730,7 +899,7 @@ impl<D: Device> State<D> {
             NewNode::Dir => {
                 inode.set_mode((S_IFDIR | perm & 0o7777) as u16);
                 inode.set_links(2);
-                let blk = self.alloc_block(goal)?;
+                let blk = self.alloc_block(goal, false)?;
                 let mut block = vec![0u8; self.block_size];
                 write_entry(&mut block, 0, ino, 12, b".", FT_DIR);
                 write_entry(&mut block, 12, dir, self.block_size - 12, b"..", FT_DIR);
@@ -749,7 +918,7 @@ impl<D: Device> State<D> {
                     if target.len() > self.block_size {
                         return Err(ENAMETOOLONG);
                     }
-                    let blk = self.alloc_block(goal)?;
+                    let blk = self.alloc_block(goal, false)?;
                     let mut block = vec![0u8; self.block_size];
                     block[..target.len()].copy_from_slice(target.as_bytes());
                     self.write_block(blk, &block)?;
@@ -931,6 +1100,10 @@ impl<D: Device> Ext2<D> {
             free_inodes: le32(&sb, 16),
             gdt_block: first_data_block + 1,
             groups: Vec::new(),
+            cache: BlockCache::new(CACHE_BYTES / block_size),
+            sb,
+            super_dirty: false,
+            written: false,
             unlinked: Vec::new(),
         };
         let count = (blocks_count - first_data_block).div_ceil(blocks_per_group) as usize;
@@ -967,8 +1140,16 @@ impl<D: Device> Ext2<D> {
         self.st.read(ino, off, buf)
     }
 
+    /// Commits what `result`'s operation changed; its error wins.
+    fn commit<T>(&mut self, result: Result<T, i64>) -> Result<T, i64> {
+        let committed = self.st.commit();
+        let value = result?;
+        committed.map(|_| value)
+    }
+
     pub fn write(&mut self, ino: u32, off: u64, data: &[u8]) -> Result<usize, i64> {
-        self.st.write(ino, off, data)
+        let result = self.st.write(ino, off, data);
+        self.commit(result)
     }
 
     pub fn truncate(&mut self, ino: u32, len: u64) -> Result<(), i64> {
@@ -979,7 +1160,8 @@ impl<D: Device> Ext2<D> {
         if len > self.st.max_file_size() {
             return Err(EFBIG);
         }
-        self.st.truncate(ino, &mut inode, len)
+        let result = self.st.truncate(ino, &mut inode, len);
+        self.commit(result)
     }
 
     pub fn list(&mut self, dir: u32) -> Result<Vec<(String, u32, u8)>, i64> {
@@ -991,7 +1173,8 @@ impl<D: Device> Ext2<D> {
     }
 
     pub fn create(&mut self, dir: u32, name: &str, kind: &NewNode, perm: u32) -> Result<u32, i64> {
-        self.st.create(dir, name, kind, perm)
+        let result = self.st.create(dir, name, kind, perm);
+        self.commit(result)
     }
 
     /// Inodes that lost their last link during the last operation. If the
@@ -1012,13 +1195,13 @@ impl<D: Device> Ext2<D> {
     pub fn unlink(&mut self, dir: u32, name: &str, want_dir: bool) -> Result<Vec<u32>, i64> {
         let result = self.st.unlink(dir, name, want_dir);
         let gone = self.take_unlinked(result.is_ok());
-        result.map(|_| gone)
+        self.commit(result.map(|_| gone))
     }
 
     pub fn rename(&mut self, odir: u32, oname: &str, ndir: u32, nname: &str) -> Result<Vec<u32>, i64> {
         let result = self.st.rename(odir, oname, ndir, nname);
         let gone = self.take_unlinked(result.is_ok());
-        result.map(|_| gone)
+        self.commit(result.map(|_| gone))
     }
 
     /// Frees an inode returned by `unlink` or `rename`, with all its blocks.
@@ -1027,7 +1210,8 @@ impl<D: Device> Ext2<D> {
         if inode.links() != 0 {
             return Err(EINVAL);
         }
-        self.st.release(ino, inode)
+        let result = self.st.release(ino, inode);
+        self.commit(result)
     }
 
     pub fn readlink(&mut self, ino: u32) -> Result<String, i64> {
@@ -1039,7 +1223,18 @@ impl<D: Device> Ext2<D> {
         inode.set_mode((inode.mode() as u32 & S_IFMT | perm & 0o7777) as u16);
         let now = self.st.dev.now();
         inode.touch(now, false, false);
-        self.st.write_inode(ino, &inode)
+        let result = self.st.write_inode(ino, &inode);
+        self.commit(result)
+    }
+
+    pub fn device(&self) -> &D {
+        &self.st.dev
+    }
+
+    /// Unmounts the filesystem and returns its device. Every operation
+    /// committed its changes, so there is nothing left to write.
+    pub fn into_device(self) -> D {
+        self.st.dev
     }
 
     /// (block size, total blocks, free blocks, total inodes, free inodes)

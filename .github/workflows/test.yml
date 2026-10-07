@@ -37,6 +37,9 @@ jobs:
             target
           key: cargo-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
 
+      - name: Test the ext2 library on the host
+        run: nix-shell -p e2fsprogs --run "cargo test -p ext2fs"
+
       - name: Boot oxidenix and run the self-tests
         working-directory: kernel
         shell: bash

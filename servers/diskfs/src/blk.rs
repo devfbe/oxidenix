@@ -163,7 +163,6 @@ impl ext2fs::Device for VirtioBlk {
         Ok(())
     }
 
-    /// Writes and makes the data durable (a flush after the write).
     fn write(&mut self, lba: u64, buf: &[u8]) -> Result<(), ()> {
         self.check(lba, buf.len())?;
         if self.read_only {
@@ -175,6 +174,12 @@ impl ext2fs::Device for VirtioBlk {
             self.request(REQ_OUT, sector, chunk.len())?;
             sector += (chunk.len() / SECTOR_SIZE) as u64;
         }
+        Ok(())
+    }
+
+    /// Empties the device's write cache (a device without one writes
+    /// through).
+    fn flush(&mut self) -> Result<(), ()> {
         if self.flush {
             self.request(REQ_FLUSH, 0, 0)?;
         }

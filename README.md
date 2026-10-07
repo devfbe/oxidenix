@@ -654,15 +654,22 @@ interrupt dispatch; drivers and filesystems move into user-space servers.
   moves by DMA (a chain of header, data and status descriptors); the driver polls for completion
   with the device's interrupts off (diskfs serves one request at a time, and PCI interrupt lines
   may be shared: under QEMU the disk shares one with the network card, while the kernel gives
-  each line to one server). Every write is followed by a
-  flush of the device's write cache.
+  each line to one server). A flush empties the device's write cache.
 - **ext2** (`crates/ext2fs`; revision 1 with the `filetype` feature, 1/2/4 KiB blocks) supports reading and
   writing files through direct, single, double and triple indirect blocks, holes, truncation
   (freeing whole indirect subtrees), directories growing by blocks, fast and block symlinks,
   `rename` across directories (with `..` and link count updates and a cycle check), `rmdir`, and
   `chmod`. Allocation goes through the block and inode bitmaps, and group descriptors and the
   superblock's free counts are updated on every change.
-- `write` is synchronous (the page cache writes through, diskfs has no block cache); `sync`,
+- **Block cache** (`crates/ext2fs/src/cache.rs`, 1 MiB, least recently used): metadata blocks
+  (inode tables, bitmaps, group descriptors, directories, indirect blocks) are read once and
+  changed in memory. Every operation commits before it answers: its dirty blocks are written
+  (adjacent ones in one request), then the device is flushed once, so a finished `write` or
+  `create` is durable as before. File data bypasses this cache (the kernel's page cache holds
+  it): whole blocks are read and written straight to the device, a run of contiguous blocks as
+  one request, and new data blocks are not zeroed first when they are written whole. Reading
+  2 MiB from the disk takes about 60 ms (4.4 s with the former ATA PIO driver).
+- `write` is synchronous (the page cache writes through to diskfs, which commits it); `sync`,
   `fsync` and `msync` write back what shared mappings stored. After a session,
   `e2fsck -fn disk.img` on the host reports a clean filesystem, and `debugfs` can read the files.
 - **VFS integration**: every inode operation (`child`, `list`, `create`, `unlink`, `read_at`,
@@ -771,6 +778,7 @@ Each of these programs and scripts lives in the root filesystem and runs inside 
 | `fstest` | descriptor access modes (`EBADF` on read-only/write-only fds), `O_NOFOLLOW` on symlinks, unlinked-but-open files (kept until closed, never shared with new files), ext2 size limits, overflowing `mmap` offsets |
 | `sh /etc/disktest.sh` | ext2: 150-file directory, 1.5 MiB file (double indirect), append, truncate, rename, cycles, symlinks, `rm -r`, space accounting |
 | `e2fsck -fn disk.img` (host) | the filesystem written by oxidenix is consistent |
+| `cargo test -p ext2fs` (host, needs e2fsprogs) | ext2 on a RAM disk that counts requests: 4 MiB read in about one device read per 32 KiB request, one flush per write, nothing written by reads, blocks moving between directories and files, a file larger than the block cache; `e2fsck` after each |
 | `timeout 1 sleep 5` | `vfork` and `SIGTERM` after the time limit (exit status 143) |
 | `kill -9 1` in Bash | user space cannot kill a server (`EPERM`) |
 | `kill diskfs` in the kernel monitor | the next `/data` access restarts the server; open files survive; after five restarts accesses fail with `EIO`; a restart still runs the boot-time program even after `/sbin/diskfs` was overwritten |
@@ -804,7 +812,7 @@ Known open issues: `getrandom` and `AT_RANDOM` are not cryptographically secure,
 call `reboot` or set the wall clock (everything runs as root), the kernel heap
 never returns grown memory to the frame allocator, and there are no users or permissions
 (everything runs as root). The ext2 driver trusts the on-disk metadata of the image it was given.
-There is no IOMMU support: a server that drives a bus-mastering device (netd) can make the
+There is no IOMMU support: a server that drives a bus-mastering device (netd, diskfs) can make the
 device read or write any physical memory, so such a server is effectively as trusted as the
 kernel. Its program is fixed at boot (see self-healing), but a bug in it is a kernel-level bug.
 A wakeup reaches nested epoll instances along every path that watches the file, as on Linux:
@@ -818,7 +826,8 @@ watching each other multiplies the cost of each wakeup (with interrupts off).
 - [x] Job control: stopping (Ctrl+Z), `fg`/`bg`, `SIGCONT`
 - [x] Persistent storage: a disk driver and an on-disk filesystem
 - [x] Unlinked-but-open files kept until closed
-- [ ] Hard links and a block cache
+- [x] A block cache for the filesystem metadata, DMA disk I/O (virtio-blk)
+- [ ] Hard links
 - [x] Networking: TCP/UDP sockets, DNS, DHCP and loopback through a user-space server (`netd`)
 - [x] `ping` (raw ICMP sockets)
 - [ ] IPv6, `AF_UNIX`, `ifconfig`
