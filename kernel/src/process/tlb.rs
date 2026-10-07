@@ -73,7 +73,8 @@ impl Tlb {
 
 /// A CPU's PCID slots: which address space (`Tlb::id`, 0: none) each holds,
 /// and the generation it was flushed at. Only the CPU itself touches it,
-/// with interrupts off.
+/// and only with interrupts off (the shootdown IPI changes it too). A slot
+/// is marked current only by a load of CR3 that flushes its PCID.
 pub struct AsidCache {
     slots: UnsafeCell<[(u64, u64); ASIDS]>,
     next: UnsafeCell<usize>,
@@ -86,6 +87,7 @@ impl AsidCache {
 
     #[allow(clippy::mut_from_ref)]
     fn slots(&self) -> &mut [(u64, u64); ASIDS] {
+        debug_assert!(!x86_64::instructions::interrupts::are_enabled());
         unsafe { &mut *self.slots.get() }
     }
 
@@ -216,6 +218,10 @@ const KERNEL: u64 = 0;
 /// Flushes for the current request if it targets this CPU (from the IPI
 /// handler, and from every wait of the protocol).
 pub fn serve() {
+    x86_64::instructions::interrupts::without_interrupts(serve_here);
+}
+
+fn serve_here() {
     let bit = my_bit();
     if REQUEST.pending.load(Ordering::Acquire) & bit == 0 {
         return;
@@ -240,13 +246,13 @@ pub fn shootdown(space: &Tlb, start: u64, end: u64) {
         return;
     }
     // CPUs that do not have it loaded flush its PCID when they load it.
+    // This CPU too: its slot stays at the old generation even though it
+    // flushes the range now, because the slot can only be marked current
+    // safely by a load that flushes everything (a concurrent shooter may
+    // have advanced the generation for a range this CPU never flushed).
     space.generation.fetch_add(1, Ordering::SeqCst);
     if space.active_here() {
         flush_local(start, end);
-        // This CPU flushed: its PCID entries are current again.
-        if pcids() {
-            smp::cpu().asids.assign(space.id, space.generation.load(Ordering::SeqCst));
-        }
     }
     // Pairs with the fetch_or in `switch`: either that CPU is in the set,
     // or it reads the new generation after it joined.
@@ -260,7 +266,7 @@ pub fn shootdown(space: &Tlb, start: u64, end: u64) {
 /// them global, so a full flush reaches them too.
 pub fn shootdown_kernel(start: u64, end: u64) {
     flush_local(start, end);
-    smp::cpu().asids.invalidate(None);
+    x86_64::instructions::interrupts::without_interrupts(|| smp::cpu().asids.invalidate(None));
     fence(Ordering::SeqCst);
     let all = (0..smp::MAX_CPUS).filter(|&i| smp::by_index(i).is_some()).fold(0u64, |m, i| m | 1 << i);
     request(KERNEL, KERNEL, all & !my_bit(), start, end);
