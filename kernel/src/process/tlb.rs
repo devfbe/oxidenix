@@ -105,31 +105,44 @@ impl Tlb {
     }
 }
 
-/// A CPU's PCID slots: which address space (`Tlb::id`, 0: none) each holds,
-/// and the generation it was flushed at. Only the CPU itself touches it,
+/// What a PCID slot holds: one view of one address space. Never 0 (an
+/// empty slot), since `Tlb::id` starts at 1.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ViewKey(u64);
+
+impl ViewKey {
+    fn new(t: &Tlb, normal_view: bool) -> ViewKey {
+        ViewKey(t.id * 2 + normal_view as u64)
+    }
+
+    const EMPTY: ViewKey = ViewKey(0);
+}
+
+/// A CPU's PCID slots: which view of which address space each holds, and
+/// the generation it was flushed at. Only the CPU itself touches it,
 /// and only with interrupts off (the shootdown IPI changes it too). A slot
 /// is marked current only by a load of CR3 that flushes its PCID.
 pub struct AsidCache {
-    slots: UnsafeCell<[(u64, u64); ASIDS]>,
+    slots: UnsafeCell<[(ViewKey, u64); ASIDS]>,
     next: UnsafeCell<usize>,
 }
 
 impl AsidCache {
     pub const fn new() -> Self {
-        AsidCache { slots: UnsafeCell::new([(0, 0); ASIDS]), next: UnsafeCell::new(0) }
+        AsidCache { slots: UnsafeCell::new([(ViewKey::EMPTY, 0); ASIDS]), next: UnsafeCell::new(0) }
     }
 
     #[allow(clippy::mut_from_ref)]
-    fn slots(&self) -> &mut [(u64, u64); ASIDS] {
+    fn slots(&self) -> &mut [(ViewKey, u64); ASIDS] {
         debug_assert!(!x86_64::instructions::interrupts::are_enabled());
         unsafe { &mut *self.slots.get() }
     }
 
-    /// The PCID for address space `id` at `generation`, and whether its
-    /// entries are current (loadable without a flush).
-    fn assign(&self, id: u64, generation: u64) -> (u16, bool) {
+    /// The PCID for view `key` at `generation`, and whether its entries are
+    /// current (loadable without a flush).
+    fn assign(&self, key: ViewKey, generation: u64) -> (u16, bool) {
         let slots = self.slots();
-        if let Some(i) = slots.iter().position(|s| s.0 == id) {
+        if let Some(i) = slots.iter().position(|s| s.0 == key) {
             let current = slots[i].1 == generation;
             slots[i].1 = generation;
             return (i as u16 + 1, current);
@@ -137,15 +150,15 @@ impl AsidCache {
         let next = unsafe { &mut *self.next.get() };
         let i = *next;
         *next = (i + 1) % ASIDS;
-        slots[i] = (id, generation);
+        slots[i] = (key, generation);
         (i as u16 + 1, false)
     }
 
-    /// Entries of address space `id` (all if None) must be flushed before
-    /// they are used again.
-    fn invalidate(&self, id: Option<u64>) {
-        for s in self.slots().iter_mut().filter(|s| id.is_none_or(|id| s.0 == id)) {
-            *s = (0, 0);
+    /// Every slot's entries must be flushed before they are used again
+    /// (kernel mappings changed; they are cached under every PCID).
+    fn invalidate_all(&self) {
+        for s in self.slots().iter_mut() {
+            *s = (ViewKey::EMPTY, 0);
         }
     }
 }
@@ -217,8 +230,7 @@ fn load(t: &Tlb, normal: bool) {
     let root = t.root(normal);
     if pcids() {
         let generation = t.generation.load(Ordering::SeqCst);
-        let view = if root == t.l4 { 0 } else { 1 };
-        let (pcid, current) = smp::cpu().asids.assign(t.id * 2 + view, generation);
+        let (pcid, current) = smp::cpu().asids.assign(ViewKey::new(t, root != t.l4), generation);
         load_cr3(root, pcid, current);
     } else {
         load_cr3(root, 0, false);
@@ -252,15 +264,13 @@ struct Request {
     l4: AtomicU64,
     /// The normal view's table, if the address space has one (else 0).
     normal: AtomicU64,
-    /// `Tlb::id` of the address space (0 for kernel mappings).
-    id: AtomicU64,
     start: AtomicU64,
     end: AtomicU64,
     pending: AtomicU64,
 }
 
 static REQUEST: Request =
-    Request { l4: AtomicU64::new(0), normal: AtomicU64::new(0), id: AtomicU64::new(0), start: AtomicU64::new(0), end: AtomicU64::new(0), pending: AtomicU64::new(0) };
+    Request { l4: AtomicU64::new(0), normal: AtomicU64::new(0), start: AtomicU64::new(0), end: AtomicU64::new(0), pending: AtomicU64::new(0) };
 static SHOOTER: spin::Mutex<()> = spin::Mutex::new(());
 
 /// `Request::l4` of a flush of kernel mappings, which every CPU does.
@@ -284,7 +294,7 @@ fn serve_here() {
     }
     // Kernel mappings are cached under every PCID.
     if l4 == KERNEL {
-        smp::cpu().asids.invalidate(None);
+        smp::cpu().asids.invalidate_all();
     }
     REQUEST.pending.fetch_and(!bit, Ordering::AcqRel);
 }
@@ -311,7 +321,7 @@ pub fn shootdown(space: &Tlb, start: u64, end: u64) {
     fence(Ordering::SeqCst);
     let others = space.cpus.load(Ordering::SeqCst) & !my_bit();
     let normal = space.normal.get().map_or(0, |n| n.start_address().as_u64());
-    request(space.l4.start_address().as_u64(), normal, space.id, others, start, end);
+    request(space.l4.start_address().as_u64(), normal, others, start, end);
 }
 
 /// Drops the entries for [start, end) of the kernel's own mappings (shared
@@ -319,15 +329,15 @@ pub fn shootdown(space: &Tlb, start: u64, end: u64) {
 /// them global, so a full flush reaches them too.
 pub fn shootdown_kernel(start: u64, end: u64) {
     flush_local(start, end);
-    x86_64::instructions::interrupts::without_interrupts(|| smp::cpu().asids.invalidate(None));
+    x86_64::instructions::interrupts::without_interrupts(|| smp::cpu().asids.invalidate_all());
     fence(Ordering::SeqCst);
     let all = (0..smp::MAX_CPUS).filter(|&i| smp::by_index(i).is_some()).fold(0u64, |m, i| m | 1 << i);
-    request(KERNEL, KERNEL, KERNEL, all & !my_bit(), start, end);
+    request(KERNEL, KERNEL, all & !my_bit(), start, end);
 }
 
-/// Has the CPUs in `targets` flush [start, end) of `l4` (address space
-/// `id`) and waits for them.
-fn request(l4: u64, normal: u64, id: u64, targets: u64, start: u64, end: u64) {
+/// Has the CPUs in `targets` flush [start, end) of the address space
+/// with top-level table `l4` (and normal view `normal`, or 0) and waits.
+fn request(l4: u64, normal: u64, targets: u64, start: u64, end: u64) {
     let others = targets;
     if others == 0 {
         return;
@@ -341,7 +351,6 @@ fn request(l4: u64, normal: u64, id: u64, targets: u64, start: u64, end: u64) {
     };
     REQUEST.l4.store(l4, Ordering::Relaxed);
     REQUEST.normal.store(normal, Ordering::Relaxed);
-    REQUEST.id.store(id, Ordering::Relaxed);
     REQUEST.start.store(start, Ordering::Relaxed);
     REQUEST.end.store(end, Ordering::Relaxed);
     REQUEST.pending.store(others, Ordering::Release);
