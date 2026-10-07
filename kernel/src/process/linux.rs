@@ -24,6 +24,7 @@
 
 use super::address_space::{free_level, USER_END};
 use super::errno::*;
+use super::address_space::PAGE;
 use super::syscall::Frame;
 use super::with_current;
 use crate::fs::cache::PageCache;
@@ -84,6 +85,23 @@ pub struct Instance {
     /// The server's entry point for a new thread.
     entry: u64,
     slots: spin::Mutex<Slots>,
+    /// The kernel objects the server holds, by handle.
+    handles: spin::Mutex<Handles>,
+}
+
+/// A kernel object the Linux server refers to by handle.
+#[derive(Clone)]
+enum Object {
+    /// A memory object (pages that mappings and reads and writes share).
+    Memory(Arc<PageCache>),
+}
+
+/// Most handles one instance may hold.
+const MAX_HANDLES: usize = 64 * 1024;
+
+struct Handles {
+    next: u64,
+    objects: BTreeMap<u64, Object>,
 }
 
 /// Thread areas: mapped once, reused after their thread ended.
@@ -108,8 +126,13 @@ impl Instance {
         };
         table_at(view)[SHARED_SLOT].set_frame(pdpt, table_flags());
         // From here on, dropping the instance frees what was mapped.
-        let mut instance =
-            Instance { view, pdpt, entry: 0, slots: spin::Mutex::new(Slots { next: 0, free: Vec::new(), states: BTreeMap::new() }) };
+        let mut instance = Instance {
+            view,
+            pdpt,
+            entry: 0,
+            slots: spin::Mutex::new(Slots { next: 0, free: Vec::new(), states: BTreeMap::new() }),
+            handles: spin::Mutex::new(Handles { next: 1, objects: BTreeMap::new() }),
+        };
         instance.entry = instance.load(image)?;
         Arc::try_new(instance).map_err(|_| ENOMEM)
     }
@@ -241,6 +264,28 @@ impl Instance {
         Ok(frame)
     }
 
+    /// A new handle for `object`.
+    fn insert(&self, object: Object) -> Result<u64, i64> {
+        let mut h = self.handles.lock();
+        if h.objects.len() >= MAX_HANDLES {
+            return Err(EMFILE);
+        }
+        let handle = h.next;
+        h.next += 1;
+        h.objects.insert(handle, object);
+        Ok(handle)
+    }
+
+    fn object(&self, handle: u64) -> Result<Object, i64> {
+        self.handles.lock().objects.get(&handle).cloned().ok_or(EBADF)
+    }
+
+    fn memory(&self, handle: u64) -> Result<Arc<PageCache>, i64> {
+        match self.object(handle)? {
+            Object::Memory(m) => Ok(m),
+        }
+    }
+
     fn release(&self, n: u64) {
         self.slots.lock().free.push(n);
     }
@@ -355,6 +400,98 @@ fn load(s: &State, f: &mut Frame) -> Result<(), i64> {
 /// whether it runs the program (true) or the server.
 pub fn mode() -> Option<bool> {
     with_current(|p| p.linux.as_ref().map(|l| l.restricted))
+}
+
+/// Whether the calling thread runs its Linux server, with the normal view
+/// loaded (not in a legacy call).
+pub fn in_server() -> bool {
+    with_current(|p| p.linux.as_ref().is_some_and(|l| l.normal_view()))
+}
+
+fn instance() -> Result<Arc<Instance>, i64> {
+    with_current(|p| p.linux.as_ref().map(|l| l.instance.clone())).ok_or(EPERM)
+}
+
+/// The kernel calls of the Linux server beyond entering restricted mode
+/// (see `restricted::SYS_*`). Mappings go into the calling thread's
+/// program view.
+pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
+    use super::address_space::{Backing, Prot};
+    let instance = instance()?;
+    let page_aligned = |x: u64| x % PAGE == 0;
+    // A range of the program's memory: page-aligned, below 64 TiB.
+    let range = |addr: u64, len: u64| -> Result<u64, i64> {
+        let len = len.checked_add(PAGE - 1).ok_or(EINVAL)? & !(PAGE - 1);
+        if !page_aligned(addr) || len == 0 || addr.checked_add(len).is_none_or(|e| e > USER_END) {
+            return Err(EINVAL);
+        }
+        Ok(len)
+    };
+    let prot = |bits: u64| if bits & !7 != 0 { Err(EINVAL) } else { Ok(Prot::from_bits(bits)) };
+    let mm = || super::current_mm().ok_or(EINVAL);
+    match nr {
+        SYS_HANDLE_CLOSE => {
+            instance.handles.lock().objects.remove(&a[0]).map(|_| 0).ok_or(EBADF)
+        }
+        SYS_MO_CREATE => {
+            let pages = a[0];
+            if pages == 0 || pages > USER_END / PAGE {
+                return Err(EINVAL);
+            }
+            let object = PageCache::anonymous(pages).map_err(|_| ENOMEM)?;
+            Ok(instance.insert(Object::Memory(object))? as i64)
+        }
+        SYS_MO_MAP => {
+            let (handle, addr, offset, flags) = (a[0], a[1], a[3], a[5]);
+            let len = range(addr, a[2])?;
+            let prot = prot(a[4])?;
+            if !page_aligned(offset) || flags & !MO_SHARED != 0 {
+                return Err(EINVAL);
+            }
+            let cache = instance.memory(handle)?;
+            offset.checked_add(len).filter(|&e| e <= cache.size()).ok_or(EINVAL)?;
+            let shared = flags & MO_SHARED != 0;
+            let backing = Backing::File { cache, offset, shared, may_write: true, _file: None };
+            let mm = mm()?;
+            mm.lock().map(addr, len, prot, backing, false).map_err(|_| ENOMEM)?;
+            Ok(addr as i64)
+        }
+        SYS_MO_UNMAP => {
+            let len = range(a[0], a[1])?;
+            mm()?.lock().unmap(a[0], len);
+            Ok(0)
+        }
+        SYS_MO_PROTECT => {
+            let len = range(a[0], a[1])?;
+            let prot = prot(a[2])?;
+            mm()?.lock().protect(a[0], len, prot).map_err(|_| ENOMEM)?;
+            Ok(0)
+        }
+        SYS_MO_READ | SYS_MO_WRITE => {
+            let (handle, offset, buf, len) = (a[0], a[1], a[2], a[3]);
+            let cache = instance.memory(handle)?;
+            // Within the object, a page-sized piece at a time.
+            let end = offset.checked_add(len).filter(|&e| e <= cache.size()).ok_or(EINVAL)?;
+            let mut chunk = [0u8; PAGE as usize];
+            let mut done = 0;
+            while offset + done < end {
+                let n = ((end - offset - done) as usize).min(chunk.len());
+                if nr == SYS_MO_READ {
+                    let got = cache.read(offset + done, &mut chunk[..n])?;
+                    super::uaccess::copy_to_server(buf + done, &chunk[..got])?;
+                    if got < n {
+                        return Ok((done + got as u64) as i64);
+                    }
+                } else {
+                    super::uaccess::copy_from_server(buf + done, &mut chunk[..n])?;
+                    cache.write(offset + done, &chunk[..n])?;
+                }
+                done += n as u64;
+            }
+            Ok(done as i64)
+        }
+        _ => Err(ENOSYS),
+    }
 }
 
 /// Loads the view of the current address space for the server or the

@@ -101,6 +101,34 @@ fn range_ok(ptr: u64, len: usize) -> Result<(), i64> {
     }
 }
 
+/// The Linux server's own memory (its shared region), which only its calls
+/// touch, while the normal view is loaded (see `linux`).
+fn server_range_ok(ptr: u64, len: usize) -> Result<(), i64> {
+    use restricted::{SHARED_BASE, SHARED_END};
+    match ptr.checked_add(len as u64) {
+        Some(end) if ptr >= SHARED_BASE && end <= SHARED_END && super::linux::in_server() => Ok(()),
+        _ => Err(EFAULT),
+    }
+}
+
+/// Fills `dst` from the calling Linux server's memory at `ptr`.
+pub fn copy_from_server(ptr: u64, dst: &mut [u8]) -> Result<(), i64> {
+    server_range_ok(ptr, dst.len())?;
+    match unsafe { copy_user(dst.as_mut_ptr(), ptr as *const u8, dst.len()) } {
+        0 => Ok(()),
+        _ => Err(EFAULT),
+    }
+}
+
+/// Writes `src` to the calling Linux server's memory at `ptr`.
+pub fn copy_to_server(ptr: u64, src: &[u8]) -> Result<(), i64> {
+    server_range_ok(ptr, src.len())?;
+    match unsafe { copy_user(ptr as *mut u8, src.as_ptr(), src.len()) } {
+        0 => Ok(()),
+        _ => Err(EFAULT),
+    }
+}
+
 /// Fills `dst` from user memory at `ptr`.
 pub fn copy_from(ptr: u64, dst: &mut [u8]) -> Result<(), i64> {
     range_ok(ptr, dst.len())?;

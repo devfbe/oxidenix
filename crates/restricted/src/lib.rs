@@ -76,3 +76,44 @@ pub const REASON_SYSCALL: u64 = 1;
 /// answers them with ENOSYS without asking the kernel (iobench uses one to
 /// measure a forwarded call alone).
 pub const FIRST_NON_LINUX: u64 = 1000;
+
+// Kernel objects, by handle (one table per server instance, so an object
+// can be used from any thread of the process tree).
+
+/// `handle_close(handle)`.
+pub const SYS_HANDLE_CLOSE: u64 = 1012;
+/// `mo_create(pages) -> handle`: a zero-filled memory object of `pages`
+/// pages (committed memory).
+pub const SYS_MO_CREATE: u64 = 1013;
+/// `mo_map(handle, addr, len, offset, prot, flags) -> addr`: maps `len`
+/// bytes of the object from `offset` at `addr` in the calling thread's
+/// program view (replacing what was there), shared (`MO_SHARED`: stores
+/// reach the object) or private (copy-on-write). `prot`: mmap's PROT_ bits.
+pub const SYS_MO_MAP: u64 = 1014;
+/// `mo_unmap(addr, len)` in the calling thread's program view.
+pub const SYS_MO_UNMAP: u64 = 1015;
+/// `mo_protect(addr, len, prot)` in the calling thread's program view.
+pub const SYS_MO_PROTECT: u64 = 1016;
+/// `mo_read(handle, offset, buf, len) -> bytes`: from the object into the
+/// server's memory.
+pub const SYS_MO_READ: u64 = 1017;
+/// `mo_write(handle, offset, buf, len) -> bytes`: from the server's memory
+/// into the object (within its size).
+pub const SYS_MO_WRITE: u64 = 1018;
+
+pub const MO_SHARED: u64 = 1;
+
+/// Test calls a program can make to its server (lxtest): they exercise the
+/// kernel interface above on the calling process. Each returns 0 or a
+/// negative errno.
+/// `(addr)`: a 3-page object with "linux server" at its second page,
+/// mapped shared and writable at `addr`.
+pub const TEST_MAP: u64 = 1500;
+/// `()`: the first byte of that object.
+pub const TEST_READ: u64 = 1501;
+/// `(addr)`: the mapping made read-only.
+pub const TEST_PROTECT: u64 = 1502;
+/// `(addr)`: the mapping removed and the object's handle closed.
+pub const TEST_UNMAP: u64 = 1503;
+/// `(addr)`: maps a fresh object at `addr` and returns the kernel's answer.
+pub const TEST_MAP_AT: u64 = 1504;
