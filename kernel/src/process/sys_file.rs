@@ -184,6 +184,8 @@ pub fn fstat(fd: u64, buf: u64) -> SysResult {
     match f.inode() {
         Some(inode) => stat_inode(inode, buf),
         None if f.socket().is_some() => write_stat(buf, Arc::as_ptr(&f) as u64, S_IFSOCK | 0o777, 0, (1, 0, 0, 0)),
+        // An anonymous inode, as on Linux: no file type.
+        None if matches!(f.kind, Kind::EventFd(_)) => write_stat(buf, Arc::as_ptr(&f) as u64, 0o600, 0, (1, 0, 0, 0)),
         None => write_stat(buf, Arc::as_ptr(&f) as u64, S_IFIFO | 0o600, 0, (1, 0, 0, 0)),
     }
 }
@@ -269,6 +271,16 @@ pub fn pipe2(fds: u64, flags: u64) -> SysResult {
     })?;
     uaccess::write(fds, [rfd as i32, wfd as i32])?;
     Ok(0)
+}
+
+/// eventfd2(initval, flags), and eventfd (flags 0).
+pub fn eventfd2(initval: u64, flags: u64) -> SysResult {
+    const EFD_SEMAPHORE: u64 = 1;
+    if flags & !(EFD_SEMAPHORE | (O_NONBLOCK | O_CLOEXEC) as u64) != 0 {
+        return Err(EINVAL);
+    }
+    let file = OpenFile::eventfd(initval as u32 as u64, flags & EFD_SEMAPHORE != 0, flags as u32 & O_NONBLOCK);
+    with_current(|p| p.alloc_fd(file, flags as u32 & O_CLOEXEC != 0, 0))
 }
 
 pub fn dup(fd: u64) -> SysResult {

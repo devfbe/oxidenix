@@ -298,6 +298,8 @@ extern "sysv64" fn dispatch(f: &mut Frame) {
         280 => sys_file::utimensat(a0, a1, a3),
         292 => sys_file::dup3(a0, a1, a2, false),
         293 => sys_file::pipe2(a0, a1),
+        284 => sys_file::eventfd2(a0, 0),
+        290 => sys_file::eventfd2(a0, a1),
         302 => prlimit(a3),
         318 => getrandom(a0, a1),
         nr => {

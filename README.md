@@ -470,6 +470,7 @@ call into a device:
   (copy-on-write).
 - **Open files** are shared descriptions (`Arc<OpenFile>`) with offset and flags, so `dup`,
   `fork` and close-on-exec behave as on Linux.
+- **eventfd**: a 64-bit counter as a file (reads take it, or 1 of it with `EFD_SEMAPHORE`; writes add and block before it would overflow), on one wait channel that `poll` and `select` listen on too.
 - **Pipes** have a 64 KiB buffer with blocking reads and writes and EOF/`EPIPE` semantics.
 - **Quotas**: file contents and inode metadata are charged against an 8 MiB budget (`ENOSPC`),
   and single files are limited to 64 MiB (`EFBIG`). Without this, user programs could exhaust
@@ -641,7 +642,7 @@ Linux x86_64 numbers, grouped by area (about 120 in total):
 | Files | `read` `write` `pread64` `pwrite64` `readv` `writev` `open` `openat` `close` `lseek` `sendfile` `ftruncate` `fcntl` `ioctl` `dup` `dup2` `dup3` `pipe` `pipe2` |
 | Metadata | `stat` `fstat` `lstat` `newfstatat` `access` `faccessat` `faccessat2` `readlink` `readlinkat` `chmod` `fchmodat` `utimes` `futimesat` `utimensat` `umask` |
 | Directories | `getdents64` `getcwd` `chdir` `fchdir` `mkdir` `mkdirat` `rmdir` `unlink` `unlinkat` `rename` `renameat` `renameat2` `symlink` `symlinkat` |
-| I/O multiplexing | `poll` `ppoll` `select` `pselect6` |
+| I/O multiplexing | `poll` `ppoll` `select` `pselect6` `eventfd` `eventfd2` |
 | Memory | `brk` `mmap` (private, shared, anonymous, file, `MAP_FIXED[_NOREPLACE]`, `MAP_NORESERVE`, `MAP_POPULATE`) `munmap` `mprotect` `mremap` `madvise` (`DONTNEED`, `FREE`) `msync` `mlock` (no-ops) |
 | CPUs | `sched_getaffinity` `sched_setaffinity` `getcpu` |
 | Processes and threads | `clone` (`CLONE_VM` `FS` `FILES` `SIGHAND` `THREAD` `VFORK` `PARENT` `SETTLS` `PARENT_SETTID` `CHILD_SETTID` `CHILD_CLEARTID`) `fork` `vfork` `execve` `exit` (one thread) `exit_group` `wait4` `getpid` `getppid` `gettid` `set_tid_address` `sched_yield` `arch_prctl` `prlimit64` |
@@ -681,6 +682,7 @@ Each of these programs and scripts lives in the root filesystem and runs inside 
 | `timetest` | nanosecond resolution of `CLOCK_MONOTONIC`, no step back on one CPU or between two, `clock_getres`, invalid clocks, `BOOTTIME`, `RAW`, `COARSE`, `gettimeofday` and `time` against `CLOCK_REALTIME`, `clock_settime` moving only the wall clock, thread and process CPU clocks (spinning counts, sleeping does not, `pthread_getcpuclockid`, `clock_getcpuclockid`), `getrusage` for the process, the thread and reaped children, `times` |
 | `timertest` | sleeps and timeouts end when due, not at the next tick, and never early (median and minimum of nine 1–2 ms waits in `nanosleep`, `poll`, `select`, `futex`, `sigtimedwait`), 100 × `usleep(100)`, `clock_nanosleep` absolute (monotonic, past wall-clock times) and on `CLOCK_BOOTTIME`, refusal on CPU clocks, the time left after an interrupted `nanosleep`, a 2 ms `setitimer` interval firing about 50 times in 100 ms, a 1 µs interval timer leaving another process on its CPU its share (and, ignored, its own process), an ignored timer resuming once handled |
 | `polltest` | `poll` and `select` wake within 1 ms of a pipe write (median of nine, the writer on the same or another CPU, next to an idle descriptor), a full pipe polling writable once drained, `POLLHUP` when the last writer closes, `EINTR` in a `poll` waiting on files |
+| `eventfdtest` | `eventfd` counting (initial value, adding writes, reset on read), `EFD_SEMAPHORE`, `EFD_NONBLOCK` and `EFD_CLOEXEC`, `EINVAL` for short reads, 2^64-1 and unknown flags, a full counter (`EAGAIN`, poll state), a blocking read woken by another process, `poll` waking within 1 ms of a write |
 | `vmtest` | demand paging (a 64 MiB mapping costs nothing until touched), `SIGSEGV` on read-only and `PROT_NONE` pages with contents kept, split areas after a partial `munmap`, NX and the JIT pattern (1 GiB `PROT_NONE` reservation, write code, `mprotect` to executable, call it), commit limit and `MAP_NORESERVE`, `mremap` in place and moving, `MADV_DONTNEED`, shared vs. private memory across `fork`, lazy file mappings and `SIGBUS` beyond the end, `MAP_FIXED_NOREPLACE`, stack growth to 4 MiB and overflow beyond 8 MiB |
 | `smptest` | CPU count and affinity (pinning to every CPU, empty masks), parallel speed-up of CPU-bound processes, `fork`/`exit`/`wait` on every CPU at once, 5000 pipe round trips between two CPUs, signals to a process running on another CPU, timers on time while a program floods the console with palette changes on the same CPU |
 | `nettest` | TCP to an echo service through QEMU, `ECONNREFUSED`, `listen`/`accept` over loopback with a forked client, EOF after the peer closed, non-blocking `accept` and `connect` with `poll` and `SO_ERROR`, `EINTR` in a blocking `recv`, UDP over loopback, raw ICMP echo to the gateway and over loopback, source address for off-subnet destinations, overflowing message vectors, `AF_INET6` rejected |
@@ -740,7 +742,8 @@ kernel. Its program is fixed at boot (see self-healing), but a bug in it is a ke
 - [x] Threads: `clone`, `futex`, TLB shootdowns
 - [x] A TSC clock with nanosecond resolution and exact CPU time
 - [x] High-resolution timers (TSC-deadline or one-shot local APIC)
-- [ ] `epoll`, `eventfd`; a page cache with file-backed shared mappings
+- [x] `eventfd`
+- [ ] `epoll`; a page cache with file-backed shared mappings
 - [ ] Dynamic linking, real entropy, users and permissions
 
 ## Development history

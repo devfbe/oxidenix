@@ -55,11 +55,29 @@ impl Drop for Pipe {
     }
 }
 
+/// An eventfd: a counter that reads take and writes add to. Readers and
+/// writers wait on one channel; every change wakes it.
+pub struct EventFd {
+    count: spin::Mutex<u64>,
+    /// EFD_SEMAPHORE: a read takes 1, not everything.
+    semaphore: bool,
+}
+
+/// The largest count; writing would overflow beyond it.
+const EVENTFD_MAX: u64 = u64::MAX - 1;
+
+impl EventFd {
+    fn chan(self: &Arc<Self>) -> usize {
+        Arc::as_ptr(self) as usize
+    }
+}
+
 pub enum Kind {
     Inode(Arc<Inode>),
     PipeRead(Arc<Pipe>),
     PipeWrite(Arc<Pipe>),
     Socket(crate::net::Socket),
+    EventFd(Arc<EventFd>),
 }
 
 /// Open file description; several descriptors may share it (dup, fork,
@@ -104,6 +122,11 @@ impl OpenFile {
             OpenFile::new(Kind::PipeRead(pipe.clone()), 0, None),
             OpenFile::new(Kind::PipeWrite(pipe), O_WRONLY, None),
         ))
+    }
+
+    pub fn eventfd(initial: u64, semaphore: bool, flags: u32) -> Arc<OpenFile> {
+        let counter = Arc::new(EventFd { count: spin::Mutex::new(initial), semaphore });
+        OpenFile::new(Kind::EventFd(counter), O_RDWR | flags, None)
     }
 
     pub fn inode(&self) -> Option<&Arc<Inode>> {
@@ -167,6 +190,7 @@ impl OpenFile {
             Kind::PipeRead(pipe) => self.read_pipe(pipe, buf),
             Kind::PipeWrite(_) => Err(EBADF),
             Kind::Socket(s) => s.recv(buf, self.nonblocking(), false).map(|(n, _)| n),
+            Kind::EventFd(e) => self.read_eventfd(e, buf),
         }
     }
 
@@ -179,6 +203,7 @@ impl OpenFile {
             Kind::PipeWrite(pipe) => self.write_pipe(pipe, buf),
             Kind::PipeRead(_) => Err(EBADF),
             Kind::Socket(s) => s.send(buf, None, self.nonblocking()),
+            Kind::EventFd(e) => self.write_eventfd(e, buf),
         }
     }
 
@@ -293,6 +318,69 @@ impl OpenFile {
     }
 }
 
+impl OpenFile {
+    /// Takes the count (or 1 of it, as a semaphore) into an 8-byte buffer;
+    /// waits while it is 0.
+    fn read_eventfd(&self, e: &Arc<EventFd>, buf: &mut [u8]) -> Result<usize, i64> {
+        if buf.len() < 8 {
+            return Err(EINVAL);
+        }
+        loop {
+            let wait = prepare_to_wait(e.chan());
+            let taken = {
+                let mut count = e.count.lock();
+                let n = if e.semaphore { (*count).min(1) } else { *count };
+                *count -= n;
+                n
+            };
+            if taken > 0 {
+                drop(wait);
+                wakeup(e.chan());
+                buf[..8].copy_from_slice(&taken.to_ne_bytes());
+                return Ok(8);
+            }
+            if self.nonblocking() {
+                return Err(EAGAIN);
+            }
+            if interrupted() {
+                return Err(EINTR);
+            }
+            wait.sleep();
+        }
+    }
+
+    /// Adds an 8-byte value; waits while the count would exceed its maximum.
+    fn write_eventfd(&self, e: &Arc<EventFd>, buf: &[u8]) -> Result<usize, i64> {
+        let value = u64::from_ne_bytes(buf.get(..8).ok_or(EINVAL)?.try_into().map_err(|_| EINVAL)?);
+        if value == u64::MAX {
+            return Err(EINVAL);
+        }
+        loop {
+            let wait = prepare_to_wait(e.chan());
+            let added = {
+                let mut count = e.count.lock();
+                let fits = EVENTFD_MAX - *count >= value;
+                if fits {
+                    *count += value;
+                }
+                fits
+            };
+            if added {
+                drop(wait);
+                wakeup(e.chan());
+                return Ok(8);
+            }
+            if self.nonblocking() {
+                return Err(EAGAIN);
+            }
+            if interrupted() {
+                return Err(EINTR);
+            }
+            wait.sleep();
+        }
+    }
+}
+
 pub const POLLIN: i16 = 0x1;
 pub const POLLOUT: i16 = 0x4;
 pub const POLLERR: i16 = 0x8;
@@ -320,6 +408,10 @@ impl OpenFile {
                 }
             }
             Kind::Socket(s) => s.poll(events),
+            Kind::EventFd(e) => {
+                let count = *e.count.lock();
+                (if count > 0 { POLLIN } else { 0 }) | if count < EVENTFD_MAX { POLLOUT } else { 0 }
+            }
         };
         ready & (events | POLLERR | POLLHUP)
     }
@@ -333,6 +425,7 @@ impl OpenFile {
             Kind::Inode(_) => Ok(()),
             Kind::PipeRead(p) => table.add(p.read_chan()),
             Kind::PipeWrite(p) => table.add(p.write_chan()),
+            Kind::EventFd(e) => table.add(e.chan()),
             // Readiness is the network server's: checked again every tick.
             Kind::Socket(_) => {
                 table.recheck();
@@ -353,7 +446,7 @@ impl Drop for OpenFile {
                 p.writers.fetch_sub(1, Ordering::Relaxed);
                 wakeup(p.read_chan());
             }
-            Kind::Inode(_) | Kind::Socket(_) => {}
+            Kind::Inode(_) | Kind::Socket(_) | Kind::EventFd(_) => {}
         }
     }
 }
