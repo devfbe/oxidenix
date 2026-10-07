@@ -170,8 +170,9 @@ extern "sysv64" fn dispatch(f: &mut Frame) {
         12 => sys_mem::brk(a0),
         25 => sys_mem::mremap(a0, a1, a2, a3, a4),
         28 => sys_mem::madvise(a0, a1, a2),
-        // msync: no page cache to write back; mlock*: nothing is swapped.
-        26 | 149 | 150 | 151 | 152 => Ok(0),
+        26 => sys_mem::msync(a0, a1, a2),
+        // mlock*: nothing is swapped.
+        149 | 150 | 151 | 152 => Ok(0),
         13 => signal::sigaction(a0, a1, a2),
         14 => signal::sigprocmask(a0, a1, a2),
         127 => signal::sigpending(a0, a1),
@@ -238,7 +239,8 @@ extern "sysv64" fn dispatch(f: &mut Frame) {
         62 => signal::kill(a0 as i64, a1),
         63 => uname(a0),
         72 => sys_file::fcntl(a0, a1, a2),
-        74 | 75 | 162 => Ok(0), // fsync/fdatasync/sync: every write already reached the disk
+        74 | 75 => sys_file::fsync(a0),
+        162 => sys_file::sync(),
         76 => sys_file::truncate(a0, a1),
         77 => sys_file::ftruncate(a0, a1),
         79 => sys_file::getcwd(a0, a1),

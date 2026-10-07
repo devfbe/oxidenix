@@ -395,6 +395,23 @@ impl Inode {
         self.cache()?.read(off, buf)
     }
 
+    /// A read past the page cache (O_DIRECT).
+    pub fn read_direct(&self, off: u64, buf: &mut [u8]) -> Result<usize, i64> {
+        if self.uncached().is_some() {
+            return self.read_at(off, buf);
+        }
+        self.cache()?.read_direct(off, buf)
+    }
+
+    /// Writes this file's dirty pages back (fsync).
+    pub fn sync(&self) -> Result<(), i64> {
+        match self.cache() {
+            Ok(c) => c.writeback(0..u64::MAX),
+            // Nothing cached, nothing to write.
+            Err(_) => Ok(()),
+        }
+    }
+
     pub fn write_at(&self, off: u64, buf: &[u8]) -> Result<usize, i64> {
         if let Some(d) = self.uncached() {
             self.require_regular()?;

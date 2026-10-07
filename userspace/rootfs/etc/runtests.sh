@@ -4,10 +4,13 @@
 failed=0
 fail() { echo "FAIL $1"; failed=$((failed + 1)); }
 
-for t in forktest sigtest jobtest cowtest fstest oomtest nettest smptest proctest vmtest futextest threadtest timetest timertest polltest eventfdtest sigmasktest epolltest mmaptest exectest cachetest; do
+for t in forktest sigtest jobtest cowtest fstest oomtest nettest smptest proctest vmtest futextest threadtest timetest timertest polltest eventfdtest sigmasktest epolltest mmaptest exectest cachetest writebacktest; do
     echo "=== $t"
     if $t; then echo "PASS $t"; else fail "$t"; fi
 done
+
+echo "=== mmaptest /data"
+if mmaptest /data; then echo "PASS mmaptest /data"; else fail "mmaptest /data"; fi
 
 echo "=== disktest"
 out=$(sh /etc/disktest.sh 2>&1)

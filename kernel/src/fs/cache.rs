@@ -21,6 +21,14 @@
 //! clean pages that no mapping uses, a page used since the last look
 //! getting a second chance.
 //!
+//! Shared mappings of a remote file map its pages read-only until the
+//! first store, which marks the page dirty (see `set_dirty`). Write-back
+//! clears the dirty mark, write-protects the page in every mapping, then
+//! writes it: a store in between faults, marks it dirty again and is
+//! written next time, so none is lost. `msync`, `fsync` and `sync` write
+//! back, and so does the flusher every few seconds and a writer that finds
+//! too many dirty pages.
+//!
 //! Lock order: address space (sleeping) → `io` (sleeping) → `state` →
 //! frames. `io` serializes what changes contents or size and talks to the
 //! server (filling pages, `write`, `truncate`); it is never held while an
@@ -44,6 +52,18 @@ pub const MAX_SIZE: u64 = i64::MAX as u64;
 const READAHEAD: u64 = 16;
 /// Pages reclaim looks at per hold of a cache's lock.
 const RECLAIM_BATCH: usize = 256;
+/// Dirty pages written back per round (and at most per message group).
+const WRITEBACK_BATCH: usize = 16;
+/// How often the flusher writes dirty pages back (nanoseconds).
+const FLUSH_INTERVAL: u64 = 5_000_000_000;
+
+/// Dirty pages of all caches.
+static DIRTY: AtomicU64 = AtomicU64::new(0);
+
+/// Dirty pages (for /proc/meminfo).
+pub fn dirty_pages() -> u64 {
+    DIRTY.load(Ordering::Relaxed)
+}
 
 /// Pages of tmpfs file contents, and their limit: half of what may be
 /// committed, as Linux's default tmpfs size.
@@ -80,6 +100,15 @@ struct Page {
     frame: PhysFrame,
     /// Used since reclaim last looked at it.
     referenced: bool,
+    /// Stored to through a shared mapping since it was last written back
+    /// (remote store only).
+    dirty: bool,
+}
+
+impl Page {
+    fn new(frame: PhysFrame) -> Page {
+        Page { frame, referenced: true, dirty: false }
+    }
 }
 
 struct State {
@@ -222,11 +251,6 @@ impl PageCache {
         self.state.lock().pages.is_empty()
     }
 
-    /// Whether the file lives on a filesystem server.
-    pub fn is_remote(&self) -> bool {
-        self.remote_store().is_some()
-    }
-
     pub fn size(&self) -> u64 {
         self.state.lock().size
     }
@@ -272,7 +296,7 @@ impl PageCache {
         }
         let frame = new_frame().ok_or(ENOMEM)?;
         self.fill_memory(&st, index, frame_bytes(frame));
-        st.pages.insert(index, Page { frame, referenced: true });
+        st.pages.insert(index, Page::new(frame));
         if let Some(c) = charge {
             c.keep();
             st.charged += 1;
@@ -328,7 +352,7 @@ impl PageCache {
             page[..to - from].copy_from_slice(&buf[from..to]);
             page[to - from..].fill(0);
             // Nothing else inserts remote pages without `io`.
-            st.pages.insert(index + i, Page { frame, referenced: true });
+            st.pages.insert(index + i, Page::new(frame));
             got += 1;
         }
         st.charged += got;
@@ -455,7 +479,7 @@ impl PageCache {
         };
         frame_bytes(frame).fill(0);
         let mut st = self.state.lock();
-        st.pages.insert(index, Page { frame, referenced: true });
+        st.pages.insert(index, Page::new(frame));
         st.charged += 1;
         true
     }
@@ -497,6 +521,7 @@ impl PageCache {
                 }
             }
             let gone = st.pages.split_off(&first_gone);
+            DIRTY.fetch_sub(gone.values().filter(|p| p.dirty).count() as u64, Ordering::Relaxed);
             let prepaid = self.prepaid();
             let charged = gone.keys().filter(|&&i| i >= prepaid).count() as u64;
             st.charged -= charged;
@@ -573,7 +598,7 @@ impl PageCache {
                     next = index + 1;
                     if page.referenced {
                         page.referenced = false;
-                    } else if frames.refcount(page.frame) == 1 && freed + (gone.len() as u64) < want {
+                    } else if !page.dirty && frames.refcount(page.frame) == 1 && freed + (gone.len() as u64) < want {
                         gone.push(index);
                     }
                 }
@@ -588,6 +613,114 @@ impl PageCache {
             free_frames(frames);
         }
         freed
+    }
+
+    /// Whether a store through a shared mapping must first mark the page
+    /// dirty (a remote store: the page must be written back).
+    pub fn tracks_dirty(&self) -> bool {
+        self.remote_store().is_some()
+    }
+
+    /// Marks page `index` dirty before a shared mapping may store to it;
+    /// false if the page is gone (truncated meanwhile).
+    pub fn set_dirty(&self, index: u64) -> bool {
+        let mut st = self.state.lock();
+        let Some(page) = st.pages.get_mut(&index) else { return false };
+        if !page.dirty {
+            page.dirty = true;
+            DIRTY.fetch_add(1, Ordering::Relaxed);
+        }
+        true
+    }
+
+    /// Writes the dirty pages among `pages` (page indices) back to the
+    /// server. A memory store has nothing to write.
+    pub fn writeback(&self, pages: core::ops::Range<u64>) -> Result<(), i64> {
+        let Some((fs, ino)) = self.remote_store() else { return Ok(()) };
+        let mut from = pages.start;
+        loop {
+            // 1. Take the dirty marks of a batch.
+            let mut batch: heapless::Vec<u64, WRITEBACK_BATCH> = heapless::Vec::new();
+            {
+                let mut st = self.state.lock();
+                for (&index, page) in st.pages.range_mut(from..pages.end) {
+                    if page.dirty {
+                        page.dirty = false;
+                        let _ = batch.push(index);
+                        if batch.is_full() {
+                            break;
+                        }
+                    }
+                }
+            }
+            let Some(&last) = batch.last() else { return Ok(()) };
+            DIRTY.fetch_sub(batch.len() as u64, Ordering::Relaxed);
+            from = last + 1;
+            // 2. Make every mapping fault (and mark them again) on a store.
+            self.write_protect(&batch);
+            // 3. Write them, in runs of consecutive pages.
+            let _io = self.io.lock();
+            let mut buf = Vec::new();
+            if buf.try_reserve_exact(WRITEBACK_BATCH * PAGE as usize).is_err() {
+                self.redirty(&batch);
+                return Err(ENOMEM);
+            }
+            let mut i = 0;
+            while i < batch.len() {
+                let mut j = i + 1;
+                while j < batch.len() && batch[j] == batch[j - 1] + 1 {
+                    j += 1;
+                }
+                let start = batch[i] * PAGE;
+                buf.clear();
+                {
+                    let st = self.state.lock();
+                    for index in &batch[i..j] {
+                        // Gone or cut by a truncation meanwhile: write only
+                        // what is still part of the file.
+                        let Some(page) = st.pages.get(index) else { break };
+                        let len = st.size.saturating_sub(index * PAGE).min(PAGE) as usize;
+                        buf.extend_from_slice(&frame_bytes(page.frame)[..len]);
+                        if len < PAGE as usize {
+                            break;
+                        }
+                    }
+                }
+                if !buf.is_empty() && fs.write(ino, start, &buf).is_err() {
+                    self.redirty(&batch[i..]);
+                    return Err(EIO);
+                }
+                i = j;
+            }
+        }
+    }
+
+    /// An O_DIRECT read: what is on the server, after writing back the
+    /// dirty pages of the range (as Linux does).
+    pub fn read_direct(&self, off: u64, buf: &mut [u8]) -> Result<usize, i64> {
+        let Some((fs, ino)) = self.remote_store() else { return self.read(off, buf) };
+        let end = off.saturating_add(buf.len() as u64);
+        self.writeback(page_of(off)..page_of(end.saturating_add(PAGE - 1)))?;
+        fs.read(ino, off, buf)
+    }
+
+    /// Marks pages dirty again whose write-back failed.
+    fn redirty(&self, pages: &[u64]) {
+        for &index in pages {
+            self.set_dirty(index);
+        }
+    }
+
+    /// Write-protects `pages` in every shared mapping of this file.
+    fn write_protect(&self, pages: &[u64]) {
+        let mut i = self.mappers.lock().len();
+        while i > 0 {
+            i -= 1;
+            let mm = self.mappers.lock().get(i).and_then(Weak::upgrade);
+            if let Some(mm) = mm {
+                mm.lock().write_protect_file(self, pages);
+            }
+        }
     }
 
     /// Records that `mm` maps this file, so truncation can reach its page
@@ -616,6 +749,39 @@ impl PageCache {
                 mm.lock().unmap_file(self, index);
             }
         }
+    }
+}
+
+/// Writes back the dirty pages of every file (sync, the flusher).
+pub fn flush_all() {
+    let mut i = REMOTE.lock().len();
+    while i > 0 {
+        i -= 1;
+        let cache = REMOTE.lock().get(i).and_then(Weak::upgrade);
+        if let Some(cache) = cache {
+            // A failed write keeps its pages dirty for the next round.
+            let _ = cache.writeback(0..u64::MAX);
+        }
+    }
+}
+
+/// The flusher: a kernel thread writing dirty pages back every few
+/// seconds, so stores through shared mappings reach the disk on their own.
+pub fn flusher() -> ! {
+    loop {
+        crate::process::sched::prepare_to_sleep().sleep_until(crate::time::now() + FLUSH_INTERVAL);
+        if dirty_pages() > 0 {
+            flush_all();
+        }
+    }
+}
+
+/// Called after a store made a page dirty, with no lock held: a writer
+/// that finds a fifth of the commit limit dirty writes back itself, so
+/// dirty pages (which reclaim cannot drop) never crowd out memory.
+pub fn balance_dirty() {
+    if dirty_pages() > memory::commit_stats().1 / 5 {
+        flush_all();
     }
 }
 
@@ -650,6 +816,8 @@ impl Drop for PageCache {
             let mut st = self.state.lock();
             (core::mem::take(&mut st.pages), st.charged)
         };
+        // (Only a released file or an empty cache goes: no data is lost.)
+        DIRTY.fetch_sub(pages.values().filter(|p| p.dirty).count() as u64, Ordering::Relaxed);
         free_frames(pages.into_values().map(|p| p.frame));
         self.uncharge(charged);
         let prepaid = self.prepaid();

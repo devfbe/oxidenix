@@ -296,8 +296,17 @@ About 9,200 lines of Rust (without comments and blank lines) in the kernel and 3
   and 4.4 s from the disk. As on Linux, a file's pages stay cached after it is closed (the
   caches belong to the filesystem, not to the short-lived VFS inode) until reclaim takes them
   or the server frees the inode (whose number may then be reused). procfs generates its files on
-  every read, so they are never cached. Writable shared mappings of disk files are refused
-  (`ENODEV`) until write-back exists.
+  every read, so they are never cached.
+- **Write-back of shared mappings**: a shared mapping of a disk file maps its pages read-only
+  until the first store, whose fault marks the page dirty (`Dirty` in `/proc/meminfo`) and
+  makes it writable. Write-back takes the dirty mark, write-protects the page in every address
+  space that maps it, then writes it to the server; a store in between faults, marks the page
+  again and is written next time, so none is lost. `msync(MS_SYNC)`, `fsync`/`fdatasync` and
+  `sync` write back, and so does a kernel thread (the flusher) every 5 seconds, so stores reach
+  the disk on their own, also after `munmap` or the end of the process. A writer that finds a
+  fifth of the commit limit dirty writes back itself, since reclaim cannot drop dirty pages.
+  The kernel writes everything back before it powers off. `O_DIRECT` reads come from the disk
+  after writing back the dirty pages of their range, as on Linux.
 - **Protection**: `mprotect` really changes the rights (including `PROT_NONE`, which keeps the
   pages' contents in entries marked by a software bit) and execution is denied by NX unless an
   area is executable, so JIT compilers can write code and then make it executable (W^X).
@@ -381,6 +390,8 @@ The scheduler is built for several CPUs (`process/sched.rs`, design in
   from the others. Each task has a CPU affinity mask (`sched_setaffinity`, inherited by
   `fork`) that queueing, stealing and migration respect. Each CPU has an idle task; idling loads the kernel's page table, so an address
   space is only ever active on the CPU running its process.
+- **Kernel threads** (`sched::spawn_kernel_thread`) run a kernel function on their own stack,
+  without an address space, signals or a pid; the page cache's flusher is one.
 - **`on_cpu`** marks a task whose kernel stack is still in use; a CPU that picks it waits
   until its previous CPU finished switching away. An exited task's last reference is dropped
   by the next task on that CPU, after the switch, so its stack is freed only then.
@@ -645,8 +656,8 @@ interrupt dispatch; drivers and filesystems move into user-space servers.
   `rename` across directories (with `..` and link count updates and a cycle check), `rmdir`, and
   `chmod`. Allocation goes through the block and inode bitmaps, and group descriptors and the
   superblock's free counts are updated on every change.
-- Writes are synchronous (the page cache writes through, diskfs has no block cache), so
-  `sync`/`fsync` have nothing left to do. After a session,
+- `write` is synchronous (the page cache writes through, diskfs has no block cache); `sync`,
+  `fsync` and `msync` write back what shared mappings stored. After a session,
   `e2fsck -fn disk.img` on the host reports a clean filesystem, and `debugfs` can read the files.
 - **VFS integration**: every inode operation (`child`, `list`, `create`, `unlink`, `read_at`,
   `write_at`, `truncate`, ...) works on memory and remote (server-backed) inodes alike. Remote inodes are cached per
@@ -696,11 +707,11 @@ Linux x86_64 numbers, grouped by area (about 120 in total):
 
 | Area | Calls |
 |---|---|
-| Files | `read` `write` `pread64` `pwrite64` `readv` `writev` `open` `openat` `close` `lseek` `sendfile` `truncate` `ftruncate` `fcntl` `ioctl` `dup` `dup2` `dup3` `pipe` `pipe2` |
+| Files | `read` `write` `pread64` `pwrite64` `readv` `writev` `open` `openat` (also `O_DIRECT`) `close` `lseek` `sendfile` `truncate` `ftruncate` `fcntl` `ioctl` `dup` `dup2` `dup3` `pipe` `pipe2` |
 | Metadata | `stat` `fstat` `lstat` `newfstatat` `access` `faccessat` `faccessat2` `readlink` `readlinkat` `chmod` `fchmodat` `utimes` `futimesat` `utimensat` `umask` |
 | Directories | `getdents64` `getcwd` `chdir` `fchdir` `mkdir` `mkdirat` `rmdir` `unlink` `unlinkat` `rename` `renameat` `renameat2` `symlink` `symlinkat` |
 | I/O multiplexing | `poll` `ppoll` `select` `pselect6` `epoll_create` `epoll_create1` `epoll_ctl` `epoll_wait` `epoll_pwait` `epoll_pwait2` `eventfd` `eventfd2` |
-| Memory | `brk` `mmap` (private, shared, anonymous, file through the page cache, `MAP_FIXED[_NOREPLACE]`, `MAP_NORESERVE`, `MAP_POPULATE`) `munmap` `mprotect` `mremap` `madvise` (`DONTNEED`, `FREE`) `msync` `mlock` (no-ops) |
+| Memory | `brk` `mmap` (private, shared, anonymous, file through the page cache, `MAP_FIXED[_NOREPLACE]`, `MAP_NORESERVE`, `MAP_POPULATE`) `munmap` `mprotect` `mremap` `madvise` (`DONTNEED`, `FREE`) `msync` `mlock` (no-op) |
 | CPUs | `sched_getaffinity` `sched_setaffinity` `getcpu` |
 | Processes and threads | `clone` (`CLONE_VM` `FS` `FILES` `SIGHAND` `THREAD` `VFORK` `PARENT` `SETTLS` `PARENT_SETTID` `CHILD_SETTID` `CHILD_CLEARTID`) `fork` `vfork` `execve` `exit` (one thread) `exit_group` `wait4` `getpid` `getppid` `gettid` `set_tid_address` `sched_yield` `arch_prctl` `prlimit64` |
 | Groups and IDs | `setpgid` `getpgid` `getpgrp` `setsid` `getsid` `getuid` `geteuid` `getgid` `getegid` `getresuid` `getresgid` `setuid` `setgid` |
@@ -748,6 +759,8 @@ Each of these programs and scripts lives in the root filesystem and runs inside 
 | `mmaptest` | shared file mappings: stores visible to `read` and `write` visible in the mapping at once, another process's own mapping of the file, the size unchanged by stores; private mappings seeing `write` until they write a page, and never reaching the file; mappings outliving `close` and `unlink`; the zero tail of the last page and `SIGBUS` beyond it; growing and shrinking with `ftruncate` (`SIGBUS` in shared pages and private copies beyond the new end, zeros after growing again); `EACCES` for writable sharing of a read-only descriptor (also via `mprotect`); shared anonymous memory across 8 children; mapping initramfs files |
 | `exectest` | eight runs of one program sharing its pages (less memory than one copy), data and bss of the loaded program, `ETXTBSY` for opening or truncating a running program and for running a program open for writing or mapped through a writable descriptor (not after `munmap`, not for a read-only mapping), a changed program file taking effect on the next run, a running program surviving the deletion of its file |
 | `cachetest` | the page cache of `/data` files: data read back right after writing (from memory), `Cached` in `/proc/meminfo`, committing all free memory reclaims cached pages (and all of it can be used), the file read again from the disk afterwards, read-only shared and private mappings of a disk file, `pwrite` visible to `pread` and both mappings, private stores staying private, `ftruncate` shrinking and growing (zeros, not old data, in reads and the mapping), a program on the disk running from the cache and `ETXTBSY` while it runs |
+| `writebacktest` | stores through a shared mapping of a `/data` file: reading makes nothing dirty, a store makes its page dirty (`Dirty` in `/proc/meminfo`), `msync`, `fsync` and `fdatasync` write it back (also a page stored to again afterwards), `write` and a store in one page both arrive, the flusher writes a store back on its own after `munmap`, a store of a process that exited, dirty pages surviving reclaim, truncation of a file with dirty pages, 1 MiB of stores; `O_DIRECT` reads as the view of the disk |
+| `mmaptest /data` | all of `mmaptest` on a disk file |
 | `sh /etc/test.sh` | files, pipes, `cd`, `mkdir`/`touch`/`rm`, rename cycles via symlinks, the tmpfs size limit |
 | `fstest` | descriptor access modes (`EBADF` on read-only/write-only fds), `O_NOFOLLOW` on symlinks, unlinked-but-open files (kept until closed, never shared with new files), ext2 size limits, overflowing `mmap` offsets |
 | `sh /etc/disktest.sh` | ext2: 150-file directory, 1.5 MiB file (double indirect), append, truncate, rename, cycles, symlinks, `rm -r`, space accounting |
@@ -809,7 +822,7 @@ watching each other multiplies the cost of each wakeup (with interrupts off).
 - [x] High-resolution timers (TSC-deadline or one-shot local APIC)
 - [x] `eventfd`
 - [x] `epoll`
-- [ ] A page cache with file-backed shared mappings
+- [x] A page cache with file-backed shared mappings (and programs mapped, not copied)
 - [ ] Dynamic linking, real entropy, users and permissions
 
 ## Development history

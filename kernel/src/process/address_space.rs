@@ -132,6 +132,12 @@ impl Backing {
     fn shared(&self) -> bool {
         matches!(self, Backing::File { shared: true, .. } | Backing::Device)
     }
+
+    /// A shared mapping whose stores must mark the page dirty first (a
+    /// file on a disk): its pages are mapped writable only after that.
+    fn tracks_dirty(&self) -> bool {
+        matches!(self, Backing::File { shared: true, cache, .. } if cache.tracks_dirty())
+    }
 }
 
 #[derive(Clone)]
@@ -515,7 +521,12 @@ impl AddressSpace {
                 // A frame shared with another mapping never becomes writable
                 // in place (unless the area is shared memory).
                 let shared_area = self.vma(va).is_some_and(|v| v.backing.shared());
-                if flags.contains(PageTableFlags::WRITABLE) && !shared_area && (was_cow || frames.refcount(frame) > 1) {
+                // A page of a disk file stays read-only until a store marks
+                // it dirty (unless it is already).
+                let tracked = self.vma(va).is_some_and(|v| v.backing.tracks_dirty());
+                let was_writable = e.flags().contains(PageTableFlags::WRITABLE);
+                let must_fault = if shared_area { tracked && !was_writable } else { was_cow || frames.refcount(frame) > 1 };
+                if flags.contains(PageTableFlags::WRITABLE) && must_fault {
                     flags.remove(PageTableFlags::WRITABLE);
                     flags.insert(COW);
                 } else if was_cow && !prot.none() {
@@ -674,7 +685,16 @@ impl AddressSpace {
             Backing::File { cache, offset, shared, .. } => {
                 // Reading a missing page may sleep (a remote file): only the
                 // address space is locked.
-                let frame = cache.map_page((offset + (page - v.start)) / PAGE)?;
+                let index = (offset + (page - v.start)) / PAGE;
+                let frame = cache.map_page(index)?;
+                if *shared && cache.tracks_dirty() {
+                    // Writable only once the store marked it dirty.
+                    if access.write && !cache.set_dirty(index) {
+                        memory::with_frames(|f| unsafe { f.deallocate_frame(frame) });
+                        return Err(Fault::Bus);
+                    }
+                    return Ok((frame, access.write));
+                }
                 if *shared || !access.write {
                     // A private page stays the cache's until written.
                     return Ok((frame, *shared));
@@ -730,6 +750,12 @@ impl AddressSpace {
         let writable = ((flags - COW) | PageTableFlags::WRITABLE) & !PROT_NONE;
         let old = PhysFrame::containing_address(e.addr());
         let shared_area = v.backing.shared();
+        if let (true, Backing::File { cache, offset, .. }) = (v.backing.tracks_dirty(), &v.backing) {
+            // Gone if the file was truncated meanwhile.
+            if !cache.set_dirty((offset + (page - v.start)) / PAGE) {
+                return Err(Fault::Bus);
+            }
+        }
         let copied = memory::with_frames(|frames| {
             if shared_area || frames.refcount(old) <= 1 {
                 // Only rights grow: a stale read-only entry elsewhere just
@@ -881,6 +907,54 @@ impl AddressSpace {
             .collect();
         for (start, end) in ranges {
             self.clear_pages(start, end);
+        }
+    }
+
+    /// The shared file mappings in [start, end) with the file pages they
+    /// cover; None if part of the range is not mapped (msync: ENOMEM).
+    pub fn file_ranges(&self, start: u64, end: u64) -> Option<alloc::vec::Vec<(Arc<PageCache>, core::ops::Range<u64>)>> {
+        let mut out = alloc::vec::Vec::new();
+        let mut at = start;
+        while at < end {
+            let v = self.vma(at)?;
+            if let (true, Some((cache, first))) = (v.backing.shared(), v.file()) {
+                let from = first + (at - v.start) / PAGE;
+                let to = first + (v.end.min(end) - v.start) / PAGE;
+                out.push((cache.clone(), from..to));
+            }
+            at = v.end;
+        }
+        Some(out)
+    }
+
+    /// Write-protects `pages` (file page indices) of `cache` in this
+    /// space's shared mappings of it, so the next store faults and marks
+    /// the page dirty again (write-back).
+    pub fn write_protect_file(&mut self, cache: &PageCache, pages: &[u64]) {
+        let ranges: alloc::vec::Vec<(u64, u64, u64)> = self
+            .vmas
+            .values()
+            .filter(|v| v.backing.shared())
+            .filter_map(|v| {
+                let (c, first) = v.file()?;
+                core::ptr::eq(Arc::as_ptr(c), cache).then_some((v.start, v.end, first))
+            })
+            .collect();
+        for (start, end, first) in ranges {
+            let (mut lo, mut hi) = (u64::MAX, 0);
+            for &index in pages.iter().filter(|&&i| i >= first && i - first < (end - start) / PAGE) {
+                let va = start + (index - first) * PAGE;
+                if let Some(e) = leaf_entry(self.l4, va) {
+                    let flags = e.flags();
+                    if flags.contains(PageTableFlags::WRITABLE) {
+                        e.set_flags((flags - PageTableFlags::WRITABLE) | COW);
+                        (lo, hi) = (lo.min(va), hi.max(va + PAGE));
+                    }
+                }
+            }
+            if lo < hi {
+                tlb::shootdown(&self.tlb, lo, hi);
+            }
         }
     }
 
@@ -1044,6 +1118,11 @@ fn for_each_leaf(l4: PhysFrame, start: u64, end: u64, mut f: impl FnMut(u64, &'s
 /// a file page may be read), so interrupts must be enabled.
 pub fn handle_fault(va: u64, access: Access) -> Result<(), Fault> {
     let mm = super::current_mm().ok_or(Fault::Segv)?;
-    let mut space = mm.lock();
-    space.fault(va, access)
+    let result = mm.lock().fault(va, access);
+    if access.write && result.is_ok() {
+        // The store may have made a page dirty: too many, and this writer
+        // writes back (with no lock held).
+        crate::fs::cache::balance_dirty();
+    }
+    result
 }

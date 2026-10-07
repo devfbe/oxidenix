@@ -695,6 +695,39 @@ unsafe extern "C" fn idle_first_run() {
     );
 }
 
+/// First code of a kernel thread: finish the switch, then run the
+/// function `prepare_kernel_stack` left in rbx, with interrupts on.
+#[unsafe(naked)]
+unsafe extern "C" fn kthread_first_run() {
+    core::arch::naked_asm!("call {finish}", "sti", "call rbx", "ud2", finish = sym finish_switch);
+}
+
+/// Prepares `stack` so that the first switch to it runs `f` (a kernel
+/// thread). Returns the saved rsp.
+pub fn prepare_kernel_stack(stack: &KernelStack, f: fn() -> !) -> u64 {
+    let rsp = prepare_stack(stack, None, false);
+    unsafe {
+        // switch_stacks pops r15, r14, r13, r12, rbp, rbx, then returns.
+        ((rsp + 40) as *mut u64).write(f as usize as u64);
+        ((rsp + 48) as *mut u64).write(kthread_first_run as *const () as u64);
+    }
+    rsp
+}
+
+/// Starts a kernel thread running `f` (no address space, no signals, not
+/// in the process table).
+pub fn spawn_kernel_thread(name: &str, f: fn() -> !) -> Result<(), i64> {
+    static NEXT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    let stack = KernelStack::new(false).ok_or(super::errno::ENOMEM)?;
+    let rsp = prepare_kernel_stack(&stack, f);
+    // Far above any pid, but within 32 bits like pids (the channels made
+    // from a task id, as `private_chan`, add it to a 32-bit base).
+    let id = 0xffff_0000 + NEXT.fetch_add(1, Ordering::Relaxed);
+    let task = Task::kernel_thread(id, name, stack, rsp).ok_or(super::errno::ENOMEM)?;
+    start(task);
+    Ok(())
+}
+
 /// Prepares `stack` so that the first switch to it runs `entry`; `frame`
 /// (if any) is placed at the top for `user_return`. Returns the saved rsp.
 pub fn prepare_stack(stack: &KernelStack, frame: Option<super::syscall::Frame>, user: bool) -> u64 {

@@ -66,6 +66,8 @@ pub struct System {
     /// shared memory (which cannot be dropped).
     pub cached: u64,
     pub shmem: u64,
+    /// Cached file pages stored to and not yet written back (bytes).
+    pub dirty: u64,
 }
 
 /// Process states, as the letters of /proc/<pid>/stat.

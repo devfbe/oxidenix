@@ -11,6 +11,7 @@ pub fn run() -> ! {
         crate::printkln!("[autorun] running /etc/autorun");
         let ok = matches!(commands::run_program(&["sh", "/etc/autorun"]), Some(crate::process::WaitStatus::Exited(0)));
         crate::printkln!("[autorun] {}", if ok { "success" } else { "failure" });
+        crate::fs::cache::flush_all();
         crate::power_off(if ok { 0 } else { 1 });
     }
     let shell = if crate::fs::resolve("/", "/bin/bash", true).is_ok() { "bash" } else { "sh" };

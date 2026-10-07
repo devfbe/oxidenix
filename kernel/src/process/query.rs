@@ -40,6 +40,7 @@ fn system() -> System {
     let shmem = crate::fs::cache::tmpfs_usage().0;
     s.shmem = shmem * 4096;
     s.cached = (crate::memory::cached_pages() + shmem) * 4096;
+    s.dirty = crate::fs::cache::dirty_pages() * 4096;
     s
 }
 

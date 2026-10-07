@@ -97,14 +97,8 @@ pub fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64) ->
             Some(_) => return Err(ENODEV),
             None => {
                 let cache = inode.cache().map_err(|_| ENODEV)?;
-                // Stores into a shared mapping of a remote file would never
-                // reach the disk without write-back.
-                let may_write = f.writable() && !cache.is_remote();
-                if shared && prot.write && !may_write {
-                    return Err(ENODEV);
-                }
                 let file = crate::fs::MappedFile::new(inode, f.writable())?;
-                Backing::File { cache, offset, shared, may_write, _file: Some(file) }
+                Backing::File { cache, offset, shared, may_write: f.writable(), _file: Some(file) }
             }
         }
     };
@@ -187,6 +181,27 @@ pub fn mremap(old: u64, old_len: u64, new_len: u64, flags: u64, new_addr: u64) -
         Err(Fault::Oom) => Err(ENOMEM),
         Err(_) => Err(EFAULT),
     }
+}
+
+/// msync(2): MS_SYNC writes the dirty pages of the shared file mappings in
+/// the range back (MS_ASYNC leaves them to the flusher); ENOMEM if part of
+/// the range is not mapped.
+pub fn msync(addr: u64, len: u64, flags: u64) -> SysResult {
+    const MS_ASYNC: u64 = 1;
+    const MS_INVALIDATE: u64 = 2;
+    const MS_SYNC: u64 = 4;
+    if !aligned(addr) || flags & !(MS_ASYNC | MS_INVALIDATE | MS_SYNC) != 0 || flags & (MS_ASYNC | MS_SYNC) == MS_ASYNC | MS_SYNC {
+        return Err(EINVAL);
+    }
+    let end = addr.checked_add(page_up(len)).filter(|&e| e <= address_space::USER_END).ok_or(ENOMEM)?;
+    let files = mm()?.lock().file_ranges(addr, end).ok_or(ENOMEM)?;
+    // Written back without the address space locked (write-back locks it).
+    if flags & MS_SYNC != 0 {
+        for (cache, pages) in files {
+            cache.writeback(pages).map_err(|_| EIO)?;
+        }
+    }
+    Ok(0)
 }
 
 /// madvise(2): DONTNEED/FREE drop private pages; other advice is accepted.

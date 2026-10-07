@@ -19,6 +19,7 @@ pub const O_EXCL: u32 = 0o200;
 pub const O_TRUNC: u32 = 0o1000;
 pub const O_APPEND: u32 = 0o2000;
 pub const O_NONBLOCK: u32 = 0o4000;
+pub const O_DIRECT: u32 = 0o40000;
 pub const O_DIRECTORY: u32 = 0o200000;
 pub const O_NOFOLLOW: u32 = 0o400000;
 pub const O_CLOEXEC: u32 = 0o2000000;
@@ -172,7 +173,7 @@ impl OpenFile {
             return Err(EBADF);
         }
         match self.inode() {
-            Some(inode) if inode.device().is_none() => inode.read_at(off, buf),
+            Some(inode) if inode.device().is_none() => self.inode_read(inode, off, buf),
             _ => Err(ESPIPE),
         }
     }
@@ -238,10 +239,19 @@ impl OpenFile {
             }
             None => {
                 let mut off = self.offset.lock();
-                let n = inode.read_at(*off, buf)?;
+                let n = self.inode_read(inode, *off, buf)?;
                 *off += n as u64;
                 Ok(n)
             }
+        }
+    }
+
+    /// Reads file contents, past the page cache with O_DIRECT.
+    fn inode_read(&self, inode: &Inode, off: u64, buf: &mut [u8]) -> Result<usize, i64> {
+        if self.flags.load(Ordering::Relaxed) & O_DIRECT != 0 {
+            inode.read_direct(off, buf)
+        } else {
+            inode.read_at(off, buf)
         }
     }
 

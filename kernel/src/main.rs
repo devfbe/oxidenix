@@ -66,6 +66,10 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 /// Starts the user-space servers and mounts what they provide. Drivers
 /// and filesystems live in these processes, not in the kernel.
 fn start_servers() {
+    // Writes stores through shared mappings back to the disk.
+    if let Err(e) = process::sched::spawn_kernel_thread("flusher", fs::cache::flusher) {
+        printkln!("[boot] cannot start the flusher (errno {})", e);
+    }
     start_diskfs();
     start_netd();
     start_procfs();

@@ -601,6 +601,22 @@ pub fn fchmodat(dirfd: u64, path: u64, mode: u64) -> SysResult {
     Ok(0)
 }
 
+/// fsync/fdatasync: writes the file's dirty pages back (write() itself
+/// already reached the disk).
+pub fn fsync(fd: u64) -> SysResult {
+    let f = file(fd)?;
+    if let Some(inode) = f.inode() {
+        inode.sync()?;
+    }
+    Ok(0)
+}
+
+/// sync(2): writes every dirty page back.
+pub fn sync() -> SysResult {
+    fs::cache::flush_all();
+    Ok(0)
+}
+
 /// truncate(2): like ftruncate on a descriptor opened for writing.
 pub fn truncate(path: u64, len: u64) -> SysResult {
     let path = uaccess::read_cstr(path)?;

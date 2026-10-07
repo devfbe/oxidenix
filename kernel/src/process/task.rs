@@ -395,6 +395,12 @@ impl Task {
         t
     }
 
+    /// A kernel thread (see `sched::spawn_kernel_thread`).
+    pub fn kernel_thread(id: u64, name: &str, kstack: KernelStack, kernel_rsp: u64) -> Option<Arc<Task>> {
+        let group = ThreadGroup::new(id, Info::new(0, 0, 0, name.into()), GroupSignals::default())?;
+        Arc::try_new(Task::new(id, group, name.into(), Process::empty(), Some(kstack), kernel_rsp)).ok()
+    }
+
     pub fn tid(&self) -> Pid {
         self.tid.load(Ordering::Relaxed)
     }

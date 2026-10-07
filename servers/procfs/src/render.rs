@@ -53,7 +53,7 @@ pub fn meminfo(s: &System) -> String {
         ("MemTotal", kb(s.mem_total)),
         ("MemFree", kb(s.mem_free)),
         // Cached file pages beyond tmpfs can be dropped when needed.
-        ("MemAvailable", kb(s.mem_free + s.cached - s.shmem)),
+        ("MemAvailable", kb(s.mem_free + s.cached.saturating_sub(s.shmem + s.dirty))),
         ("Buffers", 0),
         ("Cached", kb(s.cached)),
         ("SwapCached", 0),
@@ -61,7 +61,7 @@ pub fn meminfo(s: &System) -> String {
         ("Inactive", 0),
         ("SwapTotal", 0),
         ("SwapFree", 0),
-        ("Dirty", 0),
+        ("Dirty", kb(s.dirty)),
         ("Shmem", kb(s.shmem)),
         ("Slab", kb(s.kernel_heap)),
         ("SReclaimable", 0),

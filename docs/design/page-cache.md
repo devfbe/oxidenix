@@ -1,6 +1,6 @@
 # Page cache and file-backed mappings
 
-Status: steps 4a-4c implemented; 4d in progress (see the end).
+Status: implemented (steps 4a-4d, see the end). The README describes the details as built.
 
 ## Goals
 
@@ -104,10 +104,13 @@ state (`IrqSpinLock`: pages, size) → frames.
   uses it.
 - Filesystems whose files are generated on every read (procfs) are not cached.
 - Dirty pages of shared mappings are written back by `msync`, `fsync`/`fdatasync` and `sync`,
-  and by a kernel flusher every 5 seconds. Dropping the last reference to a cache with dirty
-  pages writes them back first.
-- `O_DIRECT` reads and writes bypass the cache (after writing back dirty pages of the range),
-  which also lets tests see what reached the disk.
+  by a kernel thread (the flusher) every 5 seconds, by a writer that finds a fifth of the
+  commit limit dirty (after its fault, with no lock held), and before the kernel powers off.
+  A cache only goes when its file was released or it is empty, so no dirty page is lost.
+- `O_DIRECT` reads come from the server after writing back the dirty pages of their range (as
+  on Linux); `O_DIRECT` writes are ordinary writes, which reach the disk at once anyway.
+  Tests watch write-back through `Dirty:` in `/proc/meminfo`, since an `O_DIRECT` read would
+  write back by itself.
 
 ## Steps
 
