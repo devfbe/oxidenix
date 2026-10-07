@@ -115,6 +115,8 @@ struct PagerQueue {
 enum Object {
     /// A memory object (pages that mappings and reads and writes share).
     Memory(Arc<PageCache>),
+    /// An open file of the kernel's descriptor table, to map.
+    KernelFile(Arc<crate::fs::file::OpenFile>),
 }
 
 /// Most handles one instance may hold.
@@ -355,6 +357,7 @@ impl Instance {
     fn memory(&self, handle: u64) -> Result<Arc<PageCache>, i64> {
         match self.object(handle)? {
             Object::Memory(m) => Ok(m),
+            Object::KernelFile(_) => Err(EINVAL),
         }
     }
 
@@ -594,20 +597,44 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             Ok(instance.insert(Object::Memory(object))? as i64)
         }
         SYS_MO_MAP => {
+            use super::sys_mem::{anon_backing, file_backing, place_and_map, Placement};
             let (handle, addr, offset, flags) = (a[0], a[1], a[3], a[5]);
-            let len = range(addr, a[2])?;
             let prot = prot(a[4])?;
-            if !page_aligned(offset) || flags & !MO_SHARED != 0 {
+            let all = MO_SHARED | MO_FIXED | MO_NOREPLACE | MO_NORESERVE | MO_POPULATE;
+            if !page_aligned(addr) || !page_aligned(offset) || flags & !all != 0 {
                 return Err(EINVAL);
             }
-            let cache = instance.memory(handle)?;
-            offset.checked_add(len).filter(|&e| e <= cache.size()).ok_or(EINVAL)?;
+            let len = a[2].checked_add(PAGE - 1).ok_or(EINVAL)? & !(PAGE - 1);
+            if len == 0 || len >= USER_END || offset.checked_add(len).is_none() {
+                return Err(EINVAL);
+            }
             let shared = flags & MO_SHARED != 0;
-            let backing = Backing::File { cache, offset, shared, may_write: true, _file: None };
-            let mm = mm()?;
-            mm.lock().map(addr, len, prot, backing, false).map_err(|_| ENOMEM)?;
-            Ok(addr as i64)
+            let backing = match handle {
+                0 if shared => return Err(EINVAL),
+                0 => anon_backing(false, len)?,
+                h => match instance.object(h)? {
+                    Object::Memory(cache) => {
+                        offset.checked_add(len).filter(|&e| e <= cache.size()).ok_or(EINVAL)?;
+                        Backing::File { cache, offset, shared, may_write: true, _file: None }
+                    }
+                    Object::KernelFile(f) => file_backing(&f, shared, prot, len, offset)?,
+                },
+            };
+            let placement = Placement {
+                fixed: flags & (MO_FIXED | MO_NOREPLACE) != 0,
+                no_replace: flags & MO_NOREPLACE != 0,
+                no_reserve: flags & MO_NORESERVE != 0,
+                populate: flags & MO_POPULATE != 0,
+            };
+            place_and_map(addr, len, prot, backing, placement)
         }
+        SYS_KFILE_OBJECT => {
+            let f = with_current(|p| p.file(a[0]))?;
+            Ok(instance.insert(Object::KernelFile(f))? as i64)
+        }
+        SYS_VM_REMAP => super::sys_mem::mremap(a[0], a[1], a[2], a[3], a[4]),
+        SYS_VM_DISCARD => super::sys_mem::madvise(a[0], a[1], 4),
+        SYS_VM_SYNC => super::sys_mem::msync(a[0], a[1], a[2]),
         SYS_MO_CREATE_PAGED => {
             let pages = a[0];
             if pages == 0 || pages > USER_END / PAGE {
@@ -659,7 +686,7 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
         SYS_MO_PROTECT => {
             let len = range(a[0], a[1])?;
             let prot = prot(a[2])?;
-            mm()?.lock().protect(a[0], len, prot).map_err(|_| ENOMEM)?;
+            mm()?.lock().protect(a[0], len, prot).map_err(|e| if e == super::address_space::Fault::Access { EACCES } else { ENOMEM })?;
             Ok(0)
         }
         SYS_MO_READ | SYS_MO_WRITE => {
@@ -746,6 +773,7 @@ pub fn legacy() -> Result<(), i64> {
     let state = with_current(|p| p.linux.as_ref().filter(|l| !l.pager).map(|l| *l.state())).ok_or(EPERM)?;
     let mut program = Frame::default();
     load(&state, &mut program)?;
+    crate::counters::add(|c| &c.legacy_calls, 1);
     set_legacy(true);
     super::syscall::dispatch_linux(&mut program);
     set_legacy(false);

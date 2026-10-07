@@ -204,6 +204,7 @@ pub fn counters(c: &procproto::Counters) -> String {
     let mut out = String::new();
     for (key, value) in [
         ("syscalls", c.syscalls),
+        ("legacy_calls", c.legacy_calls),
         ("ipc_calls", c.ipc_calls),
         ("ipc_bytes", c.ipc_bytes),
         ("address_space_switches", c.address_space_switches),

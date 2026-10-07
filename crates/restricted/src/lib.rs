@@ -89,9 +89,14 @@ pub const SYS_HANDLE_CLOSE: u64 = 1012;
 /// pages (committed memory).
 pub const SYS_MO_CREATE: u64 = 1013;
 /// `mo_map(handle, addr, len, offset, prot, flags) -> addr`: maps `len`
-/// bytes of the object from `offset` at `addr` in the calling thread's
-/// program view (replacing what was there), shared (`MO_SHARED`: stores
-/// reach the object) or private (copy-on-write). `prot`: mmap's PROT_ bits.
+/// bytes of the object from `offset` in the calling thread's program view,
+/// shared (`MO_SHARED`: stores reach the object) or private
+/// (copy-on-write). Handle 0 is anonymous private memory (demand-zero,
+/// committed when writable unless `MO_NORESERVE`). With `MO_FIXED` the
+/// mapping goes at `addr` (replacing what was there, or EEXIST with
+/// `MO_NOREPLACE`); otherwise `addr` is a hint, taken if that range is
+/// free, and the kernel finds a free range. `MO_POPULATE` makes the pages
+/// present now. `prot`: mmap's PROT_ bits.
 pub const SYS_MO_MAP: u64 = 1014;
 /// `mo_unmap(addr, len)` in the calling thread's program view.
 pub const SYS_MO_UNMAP: u64 = 1015;
@@ -105,6 +110,28 @@ pub const SYS_MO_READ: u64 = 1017;
 pub const SYS_MO_WRITE: u64 = 1018;
 
 pub const MO_SHARED: u64 = 1;
+pub const MO_FIXED: u64 = 2;
+pub const MO_NOREPLACE: u64 = 4;
+pub const MO_NORESERVE: u64 = 8;
+pub const MO_POPULATE: u64 = 16;
+
+// Bridges to state the kernel still owns, and address space operations
+// with the contracts of the Linux calls of the same name (phase R4).
+
+/// `vm_remap(old, old_len, new_len, flags, new_addr) -> addr`: mremap's
+/// contract.
+pub const SYS_VM_REMAP: u64 = 1026;
+/// `vm_discard(addr, len)`: drops the pages of private mappings in the
+/// range (zero or the file's again on the next access).
+pub const SYS_VM_DISCARD: u64 = 1027;
+/// `vm_sync(addr, len, flags)`: msync's contract.
+pub const SYS_VM_SYNC: u64 = 1028;
+/// `kfile_object(fd) -> handle`: the open file behind descriptor `fd` of
+/// the calling process (the kernel's descriptor table, until files are the
+/// server's), to map with `mo_map` as mmap maps a file: its page cache,
+/// /dev/zero as anonymous memory; the mapping keeps the file and the
+/// descriptor's write access. EBADF, or ENODEV for what cannot be mapped.
+pub const SYS_KFILE_OBJECT: u64 = 1029;
 
 /// Test calls a program can make to its server (lxtest): they exercise the
 /// kernel interface above on the calling process. Each returns 0 or a

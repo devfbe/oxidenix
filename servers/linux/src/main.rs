@@ -13,6 +13,7 @@
 extern crate alloc;
 
 mod heap;
+mod mm;
 mod sync;
 
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -57,6 +58,10 @@ pub extern "C" fn _start(state: *mut State, role: u64) -> ! {
             continue;
         }
         let s = unsafe { &mut *state };
+        if let Some(result) = mm::handle(s) {
+            s.rax = result as u64;
+            continue;
+        }
         match s.rax {
             TEST_MAP..=TEST_LOCKED_ADD => s.rax = test(s.rax, s.rdi) as u64,
             nr if nr >= FIRST_NON_LINUX => s.rax = -ENOSYS as u64,
@@ -147,7 +152,7 @@ fn test(nr: u64, addr: u64) -> i64 {
             if wrote != text.len() as i64 {
                 return if wrote < 0 { wrote } else { -5 };
             }
-            let mapped = syscall(SYS_MO_MAP, [h as u64, addr, len, 0, PROT_RW, MO_SHARED]);
+            let mapped = syscall(SYS_MO_MAP, [h as u64, addr, len, 0, PROT_RW, MO_SHARED | MO_FIXED]);
             if mapped < 0 {
                 return mapped;
             }
@@ -170,7 +175,7 @@ fn test(nr: u64, addr: u64) -> i64 {
             if h < 0 {
                 return h;
             }
-            let r = syscall(SYS_MO_MAP, [h as u64, addr, PAGE, 0, PROT_RW, MO_SHARED]);
+            let r = syscall(SYS_MO_MAP, [h as u64, addr, PAGE, 0, PROT_RW, MO_SHARED | MO_FIXED]);
             syscall(SYS_HANDLE_CLOSE, [h as u64, 0, 0, 0, 0, 0]);
             if r >= 0 {
                 syscall(SYS_MO_UNMAP, [addr, PAGE, 0, 0, 0, 0]);
@@ -184,7 +189,7 @@ fn test(nr: u64, addr: u64) -> i64 {
                 return h;
             }
             TEST_PAGED_OBJECT.store(h as u64, Ordering::Release);
-            let r = syscall(SYS_MO_MAP, [h as u64, addr, 4 * PAGE, 0, PROT_READ, MO_SHARED]);
+            let r = syscall(SYS_MO_MAP, [h as u64, addr, 4 * PAGE, 0, PROT_READ, MO_SHARED | MO_FIXED]);
             if r < 0 { r } else { 0 }
         }
         TEST_SUPPLIED => SUPPLIED.load(Ordering::Relaxed) as i64,
@@ -194,7 +199,7 @@ fn test(nr: u64, addr: u64) -> i64 {
                 return h;
             }
             TEST_FAIL_OBJECT.store(h as u64, Ordering::Release);
-            let r = syscall(SYS_MO_MAP, [h as u64, addr, PAGE, 0, PROT_READ, MO_SHARED]);
+            let r = syscall(SYS_MO_MAP, [h as u64, addr, PAGE, 0, PROT_READ, MO_SHARED | MO_FIXED]);
             if r < 0 { r } else { 0 }
         }
         TEST_ALLOC => test_alloc(addr) as i64,
@@ -216,7 +221,7 @@ fn test(nr: u64, addr: u64) -> i64 {
             if h < 0 {
                 return h;
             }
-            let r = syscall(SYS_MO_MAP, [h as u64, addr, PAGE, 0, PROT_READ, MO_SHARED]);
+            let r = syscall(SYS_MO_MAP, [h as u64, addr, PAGE, 0, PROT_READ, MO_SHARED | MO_FIXED]);
             syscall(SYS_HANDLE_CLOSE, [h as u64, 0, 0, 0, 0, 0]);
             if r < 0 { r } else { 0 }
         }

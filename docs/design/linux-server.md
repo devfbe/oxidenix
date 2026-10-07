@@ -158,7 +158,7 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
    is pinned and outside any address space's areas). Records per process come with the first
    per-process Linux state the server owns (descriptors, R6), with the kernel's notice when a
    process ends.
-4. **R4 — Memory semantics**: `mmap`, `munmap`, `mprotect`, `mremap`, `madvise`, `msync` and
+4. **R4 — Memory semantics** (done): `mmap`, `munmap`, `mprotect`, `mremap`, `madvise`, `msync` and
    the `mlock` family as server code. The kernel keeps the page tables and areas
    (mechanism); the server validates and decides. `mo_map` grows to anonymous private memory
    (committed when writable, `MAP_NORESERVE`, demand-zero), placement (a hint, or a free

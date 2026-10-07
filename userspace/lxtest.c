@@ -5,6 +5,9 @@
  * checks the effect from the program's side. */
 #define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
+#include <stdlib.h>
+#include <sys/mman.h>
 #include <pthread.h>
 #include <setjmp.h>
 #include <signal.h>
@@ -50,6 +53,16 @@ static int faults(volatile char *p, int write) {
         else (void)*p;
     }
     return got == SIGSEGV;
+}
+
+/* The kernel's count of system calls the server passed back to it. */
+static long legacy_calls(void) {
+    char text[512] = {0};
+    int fd = open("/proc/counters", O_RDONLY);
+    read(fd, text, sizeof text - 1);
+    close(fd);
+    char *p = strstr(text, "legacy_calls ");
+    return p ? atol(p + 13) : -1;
 }
 
 static void *adder(void *arg) {
@@ -134,6 +147,20 @@ int main(void) {
     long end = syscall(TEST_LOCKED_ADD, 0);
     printf("    (counter %ld -> %ld)\n", start, end);
     check("the server's mutex serializes 6 threads in 2 processes", end - start == 6 * 2000);
+    /* Memory semantics are the server's (R4): mmap and friends no longer
+     * pass through to the kernel's Linux implementation. */
+    long idle = legacy_calls();
+    long base = legacy_calls() - idle;
+    long l0 = legacy_calls();
+    for (int i = 0; i < 100; i++) {
+        char *m = mmap(NULL, 3 * PG, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        m[PG] = 1;
+        mprotect(m, PG, PROT_READ);
+        munmap(m, 3 * PG);
+    }
+    long passed = legacy_calls() - l0 - base;
+    printf("    (%ld of 300 memory calls passed through)\n", passed);
+    check("mmap, mprotect and munmap are the server's (no pass-through)", passed == 0);
     printf("lxtest: %s\n", failures ? "FAILED" : "all passed");
     return failures != 0;
 }

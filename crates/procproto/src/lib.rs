@@ -76,6 +76,8 @@ pub struct System {
 #[derive(Clone, Copy, Default, Debug)]
 pub struct Counters {
     pub syscalls: u64,
+    /// Linux system calls the Linux server passed back to the kernel.
+    pub legacy_calls: u64,
     /// IPC requests the kernel sent to servers, and the bytes of the
     /// requests and replies it copied.
     pub ipc_calls: u64,

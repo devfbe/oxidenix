@@ -82,55 +82,89 @@ pub fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64) ->
     }
     let prot = Prot::from_bits(prot);
     let shared = sharing != MAP_PRIVATE;
-    let anon = |shared: bool| if shared { Backing::shared_anon(len / PAGE).map_err(errno) } else { Ok(Backing::Anon) };
     let backing = if flags & MAP_ANONYMOUS != 0 {
-        anon(shared)?
+        anon_backing(shared, len)?
     } else {
         let f = with_current(|p| p.file(fd))?;
-        if !f.readable() || (shared && prot.write && !f.writable()) {
-            return Err(EACCES);
-        }
-        let inode = f.inode().ok_or(ENODEV)?.clone();
-        match inode.device() {
-            // /dev/zero: anonymous memory.
-            Some(Device::Zero) => anon(shared)?,
-            Some(_) => return Err(ENODEV),
-            None => {
-                let cache = inode.cache().map_err(|_| ENODEV)?;
-                let file = crate::fs::MappedFile::new(inode, f.writable())?;
-                Backing::File { cache, offset, shared, may_write: f.writable(), _file: Some(file) }
-            }
-        }
+        file_backing(&f, shared, prot, len, offset)?
     };
-    let noreserve = flags & MAP_NORESERVE != 0;
+    let placement = Placement {
+        fixed: flags & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0,
+        no_replace: flags & MAP_FIXED_NOREPLACE != 0,
+        no_reserve: flags & MAP_NORESERVE != 0,
+        populate: flags & MAP_POPULATE != 0,
+    };
+    place_and_map(addr, len, prot, backing, placement)
+}
+
+/// Anonymous memory of `len` bytes: private (demand-zero) or shared.
+pub(super) fn anon_backing(shared: bool, len: u64) -> Result<Backing, i64> {
+    if shared { Backing::shared_anon(len / PAGE).map_err(errno) } else { Ok(Backing::Anon) }
+}
+
+/// The backing of a mapping of the open file `f` at `offset`: its page
+/// cache (the mapping keeps the file and the descriptor's write access),
+/// /dev/zero as anonymous memory. EACCES for a file not open for reading,
+/// or not for writing under a shared writable mapping; ENODEV for other
+/// devices and files without pages.
+pub(super) fn file_backing(f: &crate::fs::file::OpenFile, shared: bool, prot: Prot, len: u64, offset: u64) -> Result<Backing, i64> {
+    if !f.readable() || (shared && prot.write && !f.writable()) {
+        return Err(EACCES);
+    }
+    let inode = f.inode().ok_or(ENODEV)?.clone();
+    match inode.device() {
+        // /dev/zero: anonymous memory.
+        Some(Device::Zero) => anon_backing(shared, len),
+        Some(_) => Err(ENODEV),
+        None => {
+            let cache = inode.cache().map_err(|_| ENODEV)?;
+            let file = crate::fs::MappedFile::new(inode, f.writable())?;
+            Ok(Backing::File { cache, offset, shared, may_write: f.writable(), _file: Some(file) })
+        }
+    }
+}
+
+/// Where a mapping goes and how.
+#[derive(Clone, Copy, Default)]
+pub(super) struct Placement {
+    /// At `addr` exactly (replacing what is there); else `addr` is a hint.
+    pub fixed: bool,
+    /// Fixed, but EEXIST if anything is mapped there.
+    pub no_replace: bool,
+    /// Writable private memory is not committed (MAP_NORESERVE).
+    pub no_reserve: bool,
+    /// The pages are made present now (best effort, as on Linux).
+    pub populate: bool,
+}
+
+/// Maps `len` bytes with `backing` in the calling process: at `addr` if
+/// fixed, else at the hint if that range is free, else in a free range
+/// below MMAP_TOP and above the heap. Returns where.
+pub(super) fn place_and_map(addr: u64, len: u64, prot: Prot, backing: Backing, how: Placement) -> SysResult {
     let mm = mm()?;
-    let start = {
-        let mut space = mm.lock();
-        let floor = page_up(space.brk_end);
-        let fixed = flags & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0;
-        let start = if fixed {
-            if addr.checked_add(len).is_none_or(|e| e > address_space::USER_END) || addr == 0 {
-                return Err(EINVAL);
-            }
-            if flags & MAP_FIXED_NOREPLACE != 0 && (addr..addr + len).step_by(PAGE as usize).any(|a| space.vma(a).is_some()) {
-                return Err(EEXIST);
-            }
-            addr
-        } else {
-            // A hint is taken if the range is free.
-            let hint_free = addr != 0
-                && addr >= floor
-                && addr.checked_add(len).is_some_and(|e| e <= address_space::MMAP_TOP)
-                && (addr..addr + len).step_by(PAGE as usize).all(|a| space.vma(a).is_none());
-            if hint_free { addr } else { space.find_free(len, floor).ok_or(ENOMEM)? }
-        };
-        space.map(start, len, prot, backing, noreserve).map_err(errno)?;
-        if flags & MAP_POPULATE != 0 && !prot.none() {
-            // Best effort, as on Linux.
-            let _ = space.populate(start, len, prot.write);
+    let mut space = mm.lock();
+    let floor = page_up(space.brk_end);
+    let start = if how.fixed {
+        if addr.checked_add(len).is_none_or(|e| e > address_space::USER_END) || addr == 0 {
+            return Err(EINVAL);
         }
-        start
+        if how.no_replace && (addr..addr + len).step_by(PAGE as usize).any(|a| space.vma(a).is_some()) {
+            return Err(EEXIST);
+        }
+        addr
+    } else {
+        // A hint is taken if the range is free.
+        let hint_free = addr != 0
+            && addr >= floor
+            && addr.checked_add(len).is_some_and(|e| e <= address_space::MMAP_TOP)
+            && (addr..addr + len).step_by(PAGE as usize).all(|a| space.vma(a).is_none());
+        if hint_free { addr } else { space.find_free(len, floor).ok_or(ENOMEM)? }
     };
+    space.map(start, len, prot, backing, how.no_reserve).map_err(errno)?;
+    if how.populate && !prot.none() {
+        // Best effort, as on Linux.
+        let _ = space.populate(start, len, prot.write);
+    }
     Ok(start as i64)
 }
 
