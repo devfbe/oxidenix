@@ -152,18 +152,20 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
 2. **R2 — Memory objects and mappings** as kernel objects by handle: anonymous and paged
    objects with the instance's pager thread, mapping into a program's view (done; the
    copy-on-write clone follows with `fork` in R8).
-3. **R3 — The server's runtime.** What every piece of Linux semantics in the server needs: a
-   heap in the shared region that grows (a kernel call maps more of the region for the
-   instance), locks that work across the tree's processes (futexes on the server's memory,
-   keyed by physical page, since that memory is pinned and outside any address space's
-   areas), and a record per process and thread that the server finds from the trapping thread
-   (the kernel names the process and thread in `State`) and that goes when they end.
+3. **R3 — The server's runtime** (done): a heap in the shared region that grows (a kernel
+   call maps more of the region for the instance) and locks that work across the tree's
+   processes (futexes on the server's memory, keyed by instance and address, since that memory
+   is pinned and outside any address space's areas). Records per process come with the first
+   per-process Linux state the server owns (descriptors, R6), with the kernel's notice when a
+   process ends.
 4. **R4 — Memory semantics**: `mmap`, `munmap`, `mprotect`, `mremap`, `madvise`, `msync` and
-   `brk` as server code. The kernel keeps the page tables and areas (mechanism); the server
-   decides placement and flags. Anonymous private memory needs a kernel mapping call of its
-   own (committed when writable, `MAP_NORESERVE`, demand-zero), and a file mapping takes the
-   file's memory object through a bridge from the kernel's descriptor table
-   (`kfile_object(fd)`) while files are still the kernel's.
+   the `mlock` family as server code. The kernel keeps the page tables and areas
+   (mechanism); the server validates and decides. `mo_map` grows to anonymous private memory
+   (committed when writable, `MAP_NORESERVE`, demand-zero), placement (a hint, or a free
+   range the kernel finds), `MAP_FIXED_NOREPLACE` and population, and a file mapping takes
+   the file through a bridge from the kernel's descriptor table (`kfile_object(fd)`) while
+   files are still the kernel's. `brk` follows with the process model (R8), which owns the
+   break. The kernel's own `mmap` stays for its native servers until R9.
 5. **R5 — Time and sleeping**: the clocks, `nanosleep`, `clock_nanosleep`, `gettimeofday`,
    `times` over the kernel's clock and deadline waits (interruptible by signals, which are
    still the kernel's).
