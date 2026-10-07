@@ -16,6 +16,7 @@ mod cache;
 
 use cache::BlockCache;
 
+use alloc::collections::BTreeSet;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -198,6 +199,10 @@ struct State<D: Device> {
     super_dirty: bool,
     /// Something was written since the last flush.
     written: bool,
+    /// Data blocks allocated without zeroing that were not written yet;
+    /// the commit zeroes those still here before any metadata that points
+    /// to them reaches the device, so no file shows a deleted file's data.
+    fresh: BTreeSet<u32>,
     /// Inodes whose last link went away; the Ext2 wrapper decides whether
     /// to free them now or when the last open reference is dropped.
     unlinked: Vec<(u32, RawInode)>,
@@ -266,10 +271,42 @@ impl<D: Device> State<D> {
     }
 
     fn cache_insert(&mut self, n: u32, data: Vec<u8>, dirty: bool) -> Result<(), i64> {
-        match self.cache.insert(n, data, dirty) {
-            Some((old, data)) => self.dev_write(old, &data),
-            None => Ok(()),
+        let victim = self.cache.victim(n).map(|(old, contents)| (old, contents.map(<[u8]>::to_vec)));
+        if let Some((old, contents)) = victim {
+            if let Some(contents) = contents {
+                // Data before the metadata that may point to it.
+                self.zero_fresh()?;
+                self.dev_write(old, &contents)?;
+            }
+            self.cache.remove(old);
         }
+        self.cache.insert(n, data, dirty);
+        Ok(())
+    }
+
+    /// Writes zeros to the fresh data blocks (see `fresh`).
+    fn zero_fresh(&mut self) -> Result<(), i64> {
+        while let Some(&first) = self.fresh.first() {
+            let mut count = 1;
+            while self.fresh.contains(&(first + count)) {
+                count += 1;
+            }
+            let zeros = vec![0u8; count as usize * self.block_size];
+            self.dev_write(first, &zeros)?;
+            for n in first..first + count {
+                self.fresh.remove(&n);
+            }
+        }
+        Ok(())
+    }
+
+    /// Block pointer `b` read from the disk: 0 (a hole) or a block of the
+    /// filesystem; anything else is corruption.
+    fn check_block(&self, b: u32) -> Result<u32, i64> {
+        if b != 0 && (b < self.first_data_block || b >= self.blocks_count) {
+            return Err(EIO);
+        }
+        Ok(b)
     }
 
     fn write_super(&mut self) -> Result<(), i64> {
@@ -281,10 +318,12 @@ impl<D: Device> State<D> {
         Ok(())
     }
 
-    /// Writes the changed metadata (adjacent blocks in one request), then
-    /// flushes the device if anything was written.
+    /// Zeroes fresh data blocks, writes the changed metadata (adjacent
+    /// blocks in one request), then flushes the device if anything was
+    /// written. What fails stays to be written by the next commit.
     fn commit(&mut self) -> Result<(), i64> {
-        let dirty = self.cache.take_dirty();
+        self.zero_fresh()?;
+        let dirty = self.cache.dirty();
         let mut i = 0;
         while i < dirty.len() {
             let mut j = i + 1;
@@ -293,16 +332,19 @@ impl<D: Device> State<D> {
             }
             let run: Vec<u8> = dirty[i..j].iter().flat_map(|(_, d)| d.iter().copied()).collect();
             self.dev_write(dirty[i].0, &run)?;
+            for (n, _) in &dirty[i..j] {
+                self.cache.mark_clean(*n);
+            }
             i = j;
         }
         if self.super_dirty {
-            self.super_dirty = false;
             self.written = true;
             self.dev.write(2, &self.sb).map_err(io)?;
+            self.super_dirty = false;
         }
         if self.written {
-            self.written = false;
             self.dev.flush().map_err(io)?;
+            self.written = false;
         }
         Ok(())
     }
@@ -330,8 +372,13 @@ impl<D: Device> State<D> {
     /// Writes the contiguous data blocks from `first`; the device's copy
     /// is now the one that counts.
     fn write_data(&mut self, first: u32, buf: &[u8]) -> Result<(), i64> {
-        self.cache.remove_range(first..first + (buf.len() / self.block_size) as u32);
-        self.dev_write(first, buf)
+        let blocks = first..first + (buf.len() / self.block_size) as u32;
+        self.cache.remove_range(blocks.clone());
+        self.dev_write(first, buf)?;
+        for n in blocks {
+            self.fresh.remove(&n);
+        }
+        Ok(())
     }
 
     fn write_group(&mut self, g: usize) -> Result<(), i64> {
@@ -419,7 +466,9 @@ impl<D: Device> State<D> {
     }
 
     fn free_block(&mut self, block: u32) -> Result<(), i64> {
+        self.check_block(block)?;
         self.cache.remove(block);
+        self.fresh.remove(&block);
         let rel = block - self.first_data_block;
         let g = (rel / self.blocks_per_group) as usize;
         self.clear_bit(self.groups[g].block_bitmap, rel % self.blocks_per_group)?;
@@ -493,9 +542,9 @@ impl<D: Device> State<D> {
         let spb = self.sectors_per_block() as i64;
         let p = self.ptrs_per_block();
         if (fb as usize) < DIRECT {
-            let mut b = inode.block(fb as usize);
+            let mut b = self.check_block(inode.block(fb as usize))?;
             if b == 0 && alloc {
-                b = self.alloc_block(goal, zero_leaf)?;
+                b = self.alloc_data(goal, zero_leaf)?;
                 inode.set_block(fb as usize, b);
                 inode.add_sectors(spb);
                 return Ok((b, true));
@@ -514,7 +563,7 @@ impl<D: Device> State<D> {
         } else {
             return Err(EFBIG);
         };
-        let mut blk = inode.block(root);
+        let mut blk = self.check_block(inode.block(root))?;
         if blk == 0 {
             if !alloc {
                 return Ok((0, false));
@@ -527,13 +576,13 @@ impl<D: Device> State<D> {
         for level in (0..depth).rev() {
             let idx = ((rel / p.pow(level)) % p) as usize;
             let mut table = self.read_block(blk)?;
-            let mut next = le32(&table, idx * 4);
+            let mut next = self.check_block(le32(&table, idx * 4))?;
             if next == 0 {
                 if !alloc {
                     return Ok((0, false));
                 }
                 // Level 0 is the data block itself.
-                next = self.alloc_block(goal, level > 0 || zero_leaf)?;
+                next = if level > 0 { self.alloc_block(goal, true)? } else { self.alloc_data(goal, zero_leaf)? };
                 new = level == 0;
                 put32(&mut table, idx * 4, next);
                 self.write_block(blk, &table)?;
@@ -542,6 +591,15 @@ impl<D: Device> State<D> {
             blk = next;
         }
         Ok((blk, new))
+    }
+
+    /// A data block; one not zeroed is fresh until written (see `fresh`).
+    fn alloc_data(&mut self, goal: usize, zero: bool) -> Result<u32, i64> {
+        let b = self.alloc_block(goal, zero)?;
+        if !zero {
+            self.fresh.insert(b);
+        }
+        Ok(b)
     }
 
     /// Frees the data blocks with relative index >= `from` below `blk`
@@ -563,7 +621,7 @@ impl<D: Device> State<D> {
         let mut table = self.read_block(blk)?;
         let (mut changed, mut empty) = (false, true);
         for i in 0..p {
-            let entry = le32(&table, i as usize * 4);
+            let entry = self.check_block(le32(&table, i as usize * 4))?;
             if entry == 0 {
                 continue;
             }
@@ -662,7 +720,7 @@ impl<D: Device> State<D> {
             let mut count = 1;
             while count < (n - done) / bs {
                 let next = self.bmap(ino, &mut inode, fb + count as u64, false)?;
-                let follows = if first == 0 { next == 0 } else { next == first + count as u32 };
+                let follows = if first == 0 { next == 0 } else { next.checked_sub(first) == Some(count as u32) };
                 if !follows {
                     break;
                 }
@@ -711,9 +769,15 @@ impl<D: Device> State<D> {
             if bo != 0 || data.len() - done < bs {
                 // Part of a block: read, change, write back (a new one is zero).
                 let chunk = (bs - bo).min(data.len() - done);
-                let mut block = if new { vec![0u8; bs] } else { self.data_block(first)? };
-                block[bo..bo + chunk].copy_from_slice(&data[done..done + chunk]);
-                self.write_data(first, &block)?;
+                let block = if new { Ok(vec![0u8; bs]) } else { self.data_block(first) };
+                let written = block.and_then(|mut block| {
+                    block[bo..bo + chunk].copy_from_slice(&data[done..done + chunk]);
+                    self.write_data(first, &block)
+                });
+                if let Err(e) = written {
+                    result = Err(e);
+                    break;
+                }
                 done += chunk;
                 continue;
             }
@@ -721,7 +785,7 @@ impl<D: Device> State<D> {
             let mut count = 1;
             while count < (data.len() - done) / bs {
                 match self.bmap_data(ino, &mut inode, fb + count as u64) {
-                    Ok((next, _)) if next == first + count as u32 => count += 1,
+                    Ok((next, _)) if next.checked_sub(first) == Some(count as u32) => count += 1,
                     Ok((next, new)) => {
                         next_run = Some((fb + count as u64, next, new));
                         break;
@@ -732,7 +796,10 @@ impl<D: Device> State<D> {
                     }
                 }
             }
-            self.write_data(first, &data[done..done + count * bs])?;
+            if let Err(e) = self.write_data(first, &data[done..done + count * bs]) {
+                result = Err(e);
+                break;
+            }
             done += count * bs;
             if result.is_err() {
                 break;
@@ -741,6 +808,7 @@ impl<D: Device> State<D> {
         if off + done as u64 > inode.size() {
             inode.set_size(off + done as u64);
         }
+        // Also after an error: the inode records the blocks it got.
         inode.touch(self.dev.now(), false, true);
         self.write_inode(ino, &inode)?;
         match result {
@@ -1104,6 +1172,7 @@ impl<D: Device> Ext2<D> {
             sb,
             super_dirty: false,
             written: false,
+            fresh: BTreeSet::new(),
             unlinked: Vec::new(),
         };
         let count = (blocks_count - first_data_block).div_ceil(blocks_per_group) as usize;
@@ -1125,7 +1194,8 @@ impl<D: Device> Ext2<D> {
     }
 
     pub fn stat(&mut self, ino: u32) -> Result<Stat, i64> {
-        let i = self.st.read_inode(ino)?;
+        let i = self.st.read_inode(ino);
+        let i = self.commit(i)?;
         Ok(Stat {
             mode: i.mode() as u32,
             size: i.size(),
@@ -1137,10 +1207,14 @@ impl<D: Device> Ext2<D> {
     }
 
     pub fn read(&mut self, ino: u32, off: u64, buf: &mut [u8]) -> Result<usize, i64> {
-        self.st.read(ino, off, buf)
+        let result = self.st.read(ino, off, buf);
+        self.commit(result)
     }
 
-    /// Commits what `result`'s operation changed; its error wins.
+    /// Commits what `result`'s operation changed; its error wins. Every
+    /// operation ends here, reading ones too (they change nothing, so it
+    /// costs nothing), so changes a failed commit left are retried with
+    /// the next request.
     fn commit<T>(&mut self, result: Result<T, i64>) -> Result<T, i64> {
         let committed = self.st.commit();
         let value = result?;
@@ -1165,11 +1239,13 @@ impl<D: Device> Ext2<D> {
     }
 
     pub fn list(&mut self, dir: u32) -> Result<Vec<(String, u32, u8)>, i64> {
-        self.st.list(dir)
+        let result = self.st.list(dir);
+        self.commit(result)
     }
 
     pub fn lookup(&mut self, dir: u32, name: &str) -> Result<u32, i64> {
-        self.st.lookup(dir, name)
+        let result = self.st.lookup(dir, name);
+        self.commit(result)
     }
 
     pub fn create(&mut self, dir: u32, name: &str, kind: &NewNode, perm: u32) -> Result<u32, i64> {
@@ -1215,7 +1291,8 @@ impl<D: Device> Ext2<D> {
     }
 
     pub fn readlink(&mut self, ino: u32) -> Result<String, i64> {
-        self.st.readlink(ino)
+        let result = self.st.readlink(ino);
+        self.commit(result)
     }
 
     pub fn set_perm(&mut self, ino: u32, perm: u32) -> Result<(), i64> {
@@ -1231,9 +1308,14 @@ impl<D: Device> Ext2<D> {
         &self.st.dev
     }
 
-    /// Unmounts the filesystem and returns its device. Every operation
-    /// committed its changes, so there is nothing left to write.
-    pub fn into_device(self) -> D {
+    pub fn device_mut(&mut self) -> &mut D {
+        &mut self.st.dev
+    }
+
+    /// Unmounts the filesystem and returns its device, after writing what
+    /// a failed commit left (if the device lets it).
+    pub fn into_device(mut self) -> D {
+        let _ = self.st.commit();
         self.st.dev
     }
 

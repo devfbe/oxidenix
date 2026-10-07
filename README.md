@@ -669,6 +669,11 @@ interrupt dispatch; drivers and filesystems move into user-space servers.
   it): whole blocks are read and written straight to the device, a run of contiguous blocks as
   one request, and new data blocks are not zeroed first when they are written whole. Reading
   2 MiB from the disk takes about 60 ms (4.4 s with the former ATA PIO driver).
+- Failures stay safe: a block stays dirty until it was written, so what a failed commit (or
+  eviction) could not write goes with the next request; a new data block whose write failed is
+  zeroed before any metadata pointing to it reaches the disk, so no file ever shows a deleted
+  file's data; block pointers read from the disk must lie inside the filesystem (`EIO`
+  otherwise).
 - `write` is synchronous (the page cache writes through to diskfs, which commits it); `sync`,
   `fsync` and `msync` write back what shared mappings stored. After a session,
   `e2fsck -fn disk.img` on the host reports a clean filesystem, and `debugfs` can read the files.
@@ -778,7 +783,7 @@ Each of these programs and scripts lives in the root filesystem and runs inside 
 | `fstest` | descriptor access modes (`EBADF` on read-only/write-only fds), `O_NOFOLLOW` on symlinks, unlinked-but-open files (kept until closed, never shared with new files), ext2 size limits, overflowing `mmap` offsets |
 | `sh /etc/disktest.sh` | ext2: 150-file directory, 1.5 MiB file (double indirect), append, truncate, rename, cycles, symlinks, `rm -r`, space accounting |
 | `e2fsck -fn disk.img` (host) | the filesystem written by oxidenix is consistent |
-| `cargo test -p ext2fs` (host, needs e2fsprogs) | ext2 on a RAM disk that counts requests: 4 MiB read in about one device read per 32 KiB request, one flush per write, nothing written by reads, blocks moving between directories and files, a file larger than the block cache; `e2fsck` after each |
+| `cargo test -p ext2fs` (host, needs e2fsprogs) | ext2 on a RAM disk that counts requests and can fail writes: 4 MiB read in about one device read per 32 KiB request, one flush per write, nothing written by reads, blocks moving between directories and files, a file larger than the block cache, corrupt block pointers (`EIO`, no crash), every write of a commit failing in turn (retried, nothing lost), failed data writes never exposing a deleted file's blocks; `e2fsck` after each |
 | `timeout 1 sleep 5` | `vfork` and `SIGTERM` after the time limit (exit status 143) |
 | `kill -9 1` in Bash | user space cannot kill a server (`EPERM`) |
 | `kill diskfs` in the kernel monitor | the next `/data` access restarts the server; open files survive; after five restarts accesses fail with `EIO`; a restart still runs the boot-time program even after `/sbin/diskfs` was overwritten |

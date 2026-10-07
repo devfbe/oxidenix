@@ -1,8 +1,9 @@
 //! The metadata block cache: inode tables, bitmaps, group descriptors,
 //! directories, symlink and indirect blocks. Changes stay in the cache
 //! (dirty) until the operation that made them commits, which writes them
-//! together and flushes once. Least recently used blocks give way when the
-//! cache is full; a dirty one is written first.
+//! together and flushes once; a block stays dirty until it was written, so
+//! a failed commit is retried by the next one. Least recently used blocks
+//! give way when the cache is full; a dirty one is written first.
 //!
 //! File data does not pass through here: the kernel's page cache holds it,
 //! and reads and writes of whole blocks go straight to the device.
@@ -45,22 +46,25 @@ impl BlockCache {
         self.blocks.range(range).map(|(&n, e)| (n, &e.data[..]))
     }
 
-    /// Caches block `n` (replacing what was there). Returns a dirty block
-    /// that had to go to make room, for the caller to write.
-    pub fn insert(&mut self, n: u32, data: Vec<u8>, dirty: bool) -> Option<(u32, Vec<u8>)> {
+    /// The block to evict before another one can be cached, if the cache
+    /// is full: (number, contents if it is dirty and must be written first).
+    pub fn victim(&self, incoming: u32) -> Option<(u32, Option<&[u8]>)> {
+        if self.blocks.len() < self.capacity || self.blocks.contains_key(&incoming) {
+            return None;
+        }
+        let (_, &n) = self.lru.first_key_value()?;
+        let e = &self.blocks[&n];
+        Some((n, e.dirty.then_some(&e.data[..])))
+    }
+
+    /// Caches block `n` (replacing what was there). The caller made room
+    /// (see `victim`).
+    pub fn insert(&mut self, n: u32, data: Vec<u8>, dirty: bool) {
         let dirty = dirty || self.blocks.get(&n).is_some_and(|e| e.dirty);
         self.remove(n);
-        let evicted = if self.blocks.len() >= self.capacity { self.evict() } else { None };
         self.clock += 1;
         self.lru.insert(self.clock, n);
         self.blocks.insert(n, Entry { data, dirty, used: self.clock });
-        evicted
-    }
-
-    fn evict(&mut self) -> Option<(u32, Vec<u8>)> {
-        let (_, n) = self.lru.pop_first()?;
-        let e = self.blocks.remove(&n)?;
-        e.dirty.then_some((n, e.data))
     }
 
     /// Forgets block `n` (freed, or overwritten on the device), dirty or not.
@@ -78,15 +82,16 @@ impl BlockCache {
         }
     }
 
-    /// The dirty blocks in ascending order; they count as clean from now on.
-    pub fn take_dirty(&mut self) -> Vec<(u32, Vec<u8>)> {
-        self.blocks
-            .iter_mut()
-            .filter(|(_, e)| e.dirty)
-            .map(|(&n, e)| {
-                e.dirty = false;
-                (n, e.data.clone())
-            })
-            .collect()
+    /// The dirty blocks in ascending order (they stay dirty until
+    /// `mark_clean`).
+    pub fn dirty(&self) -> Vec<(u32, Vec<u8>)> {
+        self.blocks.iter().filter(|(_, e)| e.dirty).map(|(&n, e)| (n, e.data.clone())).collect()
+    }
+
+    /// Block `n` reached the device.
+    pub fn mark_clean(&mut self, n: u32) {
+        if let Some(e) = self.blocks.get_mut(&n) {
+            e.dirty = false;
+        }
     }
 }

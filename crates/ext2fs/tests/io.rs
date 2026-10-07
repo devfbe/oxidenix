@@ -17,6 +17,36 @@ struct Counts {
 struct RamDisk {
     data: Vec<u8>,
     counts: Counts,
+    /// Writes that fail: the n-th write from now on (0 = the next one) ...
+    fail_at: Option<usize>,
+    /// ... and how many in a row.
+    fail_count: usize,
+}
+
+impl RamDisk {
+    /// Makes `count` writes fail, starting with the `skip`-th from now.
+    fn fail_writes(&mut self, skip: usize, count: usize) {
+        self.fail_at = Some(skip);
+        self.fail_count = count;
+    }
+
+    fn write_fails(&mut self) -> bool {
+        match self.fail_at {
+            Some(0) if self.fail_count > 0 => {
+                self.fail_count -= 1;
+                true
+            }
+            Some(0) => {
+                self.fail_at = None;
+                false
+            }
+            Some(n) => {
+                self.fail_at = Some(n - 1);
+                false
+            }
+            None => false,
+        }
+    }
 }
 
 impl Device for RamDisk {
@@ -28,6 +58,9 @@ impl Device for RamDisk {
     }
 
     fn write(&mut self, lba: u64, buf: &[u8]) -> Result<(), ()> {
+        if self.write_fails() {
+            return Err(());
+        }
         let at = lba as usize * 512;
         self.data.get_mut(at..at + buf.len()).ok_or(())?.copy_from_slice(buf);
         self.counts.writes += 1;
@@ -40,7 +73,7 @@ impl Device for RamDisk {
     }
 
     fn now(&self) -> u32 {
-        1_800_000_000
+        1_700_000_000
     }
 }
 
@@ -63,7 +96,7 @@ fn mkfs(name: &str, kib: usize) -> RamDisk {
     assert!(ok, "mke2fs failed");
     let data = std::fs::read(&path).unwrap();
     std::fs::remove_file(&path).unwrap();
-    RamDisk { data, counts: Counts::default() }
+    RamDisk { data, counts: Counts::default(), fail_at: None, fail_count: 0 }
 }
 
 /// e2fsck -fn on the disk's contents.
@@ -222,4 +255,82 @@ fn a_file_larger_than_the_cache_is_consistent() {
     fsck("large", &disk);
     let mut fs = Ext2::mount(disk).unwrap();
     check_file(&mut fs, ino, 3 * MIB);
+}
+
+/// Byte offset of inode `ino`'s block pointer `i` (1 KiB blocks, one group:
+/// the inode table's block is in the group descriptor at block 2).
+fn block_pointer(disk: &RamDisk, ino: u32, i: usize) -> usize {
+    let gd = 2 * 1024;
+    let table = u32::from_le_bytes(disk.data[gd + 8..gd + 12].try_into().unwrap()) as usize;
+    table * 1024 + (ino as usize - 1) * 128 + 40 + 4 * i
+}
+
+/// A block pointer on the disk beyond the end of the filesystem (or near
+/// the end of the 32-bit range) is an I/O error, never a crash.
+#[test]
+fn block_pointers_out_of_range_are_errors() {
+    for bad in [u32::MAX, u32::MAX - 3, 1 << 30] {
+        let mut fs = Ext2::mount(mkfs("badptr", 2 * 1024)).unwrap();
+        let ino = fs.create(ROOT_INO, "f", &NewNode::File, 0o644).unwrap();
+        write_file(&mut fs, ino, 64 * 1024);
+        let mut disk = take(fs);
+        let direct = block_pointer(&disk, ino, 0);
+        disk.data[direct..direct + 4].copy_from_slice(&bad.to_le_bytes());
+        let single = block_pointer(&disk, ino, 12);
+        disk.data[single..single + 4].copy_from_slice(&bad.to_le_bytes());
+        let mut fs = Ext2::mount(disk).unwrap();
+        let mut buf = vec![0u8; CHUNK];
+        assert_eq!(fs.read(ino, 0, &mut buf), Err(ext2fs::errno::EIO), "direct pointer {:#x}", bad);
+        assert_eq!(fs.read(ino, 16 * 1024, &mut buf), Err(ext2fs::errno::EIO), "indirect pointer {:#x}", bad);
+        assert!(fs.write(ino, 0, &buf).is_err());
+        assert!(fs.write(ino, 20 * 1024, &buf).is_err());
+        assert!(fs.truncate(ino, 0).is_err() || fs.truncate(ino, 0).is_ok());
+    }
+}
+
+/// A commit whose writes fail keeps its changes and writes them with the
+/// next one: once the device works again, nothing is lost.
+#[test]
+fn failed_commits_are_retried() {
+    // Every write of the operation in turn fails, until it has fewer.
+    for skip in 0.. {
+        let mut fs = Ext2::mount(mkfs("retry", 2 * 1024)).unwrap();
+        fs.create(ROOT_INO, "before", &NewNode::File, 0o644).unwrap();
+        fs.device_mut().fail_writes(skip, 1);
+        if fs.create(ROOT_INO, "during", &NewNode::Dir, 0o755).is_ok() {
+            assert!(skip > 2, "an operation that writes only {} times", skip);
+            break;
+        }
+        fs.create(ROOT_INO, "after", &NewNode::File, 0o644).unwrap();
+        let disk = take(fs);
+        fsck("retry", &disk);
+        let mut fs = Ext2::mount(disk).unwrap();
+        let names: Vec<String> = fs.list(ROOT_INO).unwrap().into_iter().map(|(n, _, _)| n).collect();
+        assert!(names.contains(&"before".to_string()) && names.contains(&"after".to_string()), "{:?}", names);
+    }
+}
+
+/// Blocks that held a deleted file's data are never visible through a
+/// file whose write to them failed.
+#[test]
+fn failed_data_writes_never_expose_old_blocks() {
+    for skip in 0..3 {
+        let mut fs = Ext2::mount(mkfs("stale", 2 * 1024)).unwrap();
+        let secret = fs.create(ROOT_INO, "secret", &NewNode::File, 0o644).unwrap();
+        fs.write(secret, 0, &vec![b'S'; 256 * 1024]).unwrap();
+        for ino in fs.unlink(ROOT_INO, "secret", false).unwrap() {
+            fs.release(ino).unwrap();
+        }
+        // A sparse file: everything beyond the direct blocks is a hole.
+        let f = fs.create(ROOT_INO, "f", &NewNode::File, 0o644).unwrap();
+        fs.truncate(f, 256 * 1024).unwrap();
+        fs.device_mut().fail_writes(skip, 1);
+        let _ = fs.write(f, 64 * 1024, &vec![b'n'; 64 * 1024]);
+        let disk = take(fs);
+        fsck("stale", &disk);
+        let mut fs = Ext2::mount(disk).unwrap();
+        let mut buf = vec![0u8; 256 * 1024];
+        let n = fs.read(f, 0, &mut buf).unwrap();
+        assert!(buf[..n].iter().all(|&b| b != b'S'), "old data visible (failed write {})", skip);
+    }
 }
