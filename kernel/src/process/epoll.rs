@@ -52,8 +52,9 @@ const MAX_NESTING: usize = 4;
 const EVENT_SIZE: u64 = 12;
 
 /// Serializes adding an instance to another, so that the loop check and
-/// the insertion are one step.
-static NESTING: spin::Mutex<()> = spin::Mutex::new(());
+/// the insertion are one step. It sleeps: the check walks every instance
+/// below and above, and other CPUs must not spin meanwhile.
+static NESTING: crate::sync::Mutex<()> = crate::sync::Mutex::new(());
 
 pub struct Epoll {
     /// Interests by descriptor number and open file.
@@ -390,12 +391,14 @@ fn levels_below_from(target: &Arc<Epoll>, epoll: &Epoll, depth: usize, seen: &mu
     Ok(levels)
 }
 
-/// The instances `epoll` watches.
+/// The instances `epoll` watches. The files are reached only after the
+/// interest list's lock is released: dropping the last reference to one
+/// (closed meanwhile) takes that lock to forget it.
 fn watched_instances(epoll: &Epoll) -> Vec<Arc<Epoll>> {
-    let interest = epoll.interest.lock();
-    interest
-        .values()
-        .filter_map(|i| i.file.upgrade())
+    let files: Vec<Weak<OpenFile>> = epoll.interest.lock().values().map(|i| i.file.clone()).collect();
+    files
+        .iter()
+        .filter_map(Weak::upgrade)
         .filter_map(|f| match &f.kind {
             Kind::Epoll(inner) => Some(inner.clone()),
             _ => None,
