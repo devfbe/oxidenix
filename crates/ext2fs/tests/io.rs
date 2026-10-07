@@ -334,3 +334,26 @@ fn failed_data_writes_never_expose_old_blocks() {
         assert!(buf[..n].iter().all(|&b| b != b'S'), "old data visible (failed write {})", skip);
     }
 }
+
+/// While a failed commit waits to be retried, reads through the metadata
+/// it left in memory must not show the unwritten blocks' old contents.
+#[test]
+fn reads_after_a_failed_commit_never_expose_old_blocks() {
+    for skip in 0..4 {
+        let mut fs = Ext2::mount(mkfs("pending", 2 * 1024)).unwrap();
+        let secret = fs.create(ROOT_INO, "secret", &NewNode::File, 0o644).unwrap();
+        fs.write(secret, 0, &vec![b'S'; 256 * 1024]).unwrap();
+        for ino in fs.unlink(ROOT_INO, "secret", false).unwrap() {
+            fs.release(ino).unwrap();
+        }
+        let f = fs.create(ROOT_INO, "f", &NewNode::File, 0o644).unwrap();
+        fs.truncate(f, 256 * 1024).unwrap();
+        // The data write and everything after it fail for a while.
+        fs.device_mut().fail_writes(skip, 1000);
+        let _ = fs.write(f, 64 * 1024, &vec![b'n'; 64 * 1024]);
+        // Not even in the buffer of a read that fails (the pending commit).
+        let mut buf = vec![0u8; 256 * 1024];
+        let _ = fs.read(f, 0, &mut buf);
+        assert!(buf.iter().all(|&b| b != b'S'), "old data visible (writes failing from {})", skip);
+    }
+}

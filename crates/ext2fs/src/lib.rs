@@ -366,6 +366,12 @@ impl<D: Device> State<D> {
             let at = (n - first) as usize * bs;
             buf[at..at + bs].copy_from_slice(data);
         }
+        // A fresh block holds a deleted file's data until it is written or
+        // zeroed (a failed commit leaves it so): it reads as zeros.
+        for &n in self.fresh.range(first..first + count) {
+            let at = (n - first) as usize * bs;
+            buf[at..at + bs].fill(0);
+        }
         Ok(())
     }
 
