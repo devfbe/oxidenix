@@ -107,12 +107,17 @@ impl Waker for Item {
 impl Item {
     /// Puts the item on the ready list (once) without waking anyone.
     fn enqueue(&self) {
-        if self.removed.load(Ordering::Acquire) || self.queued.swap(true, Ordering::AcqRel) {
+        if self.queued.swap(true, Ordering::AcqRel) {
             return;
         }
         // Alive: whoever calls this holds a reference.
         let Some(me) = self.me.upgrade() else { return };
         let mut ready = self.shared.ready.lock();
+        // Checked under the list's lock, which `forget` sets it under: a
+        // removed item never gets (back) on the list.
+        if self.removed.load(Ordering::Acquire) {
+            return;
+        }
         if ready.len() < ready.capacity() {
             ready.push_back(me);
         } else {
@@ -263,14 +268,14 @@ impl Epoll {
 
     /// Takes a removed item off its file's queue and the ready list.
     fn forget(&self, item: &Arc<Item>) {
-        item.removed.store(true, Ordering::Release);
-        drop(item.registration.lock().take());
         let unlisted = {
             let mut ready = self.shared.ready.lock();
+            item.removed.store(true, Ordering::Release);
             let i = ready.iter().position(|i| Arc::ptr_eq(i, item));
             i.and_then(|i| ready.remove(i))
         };
         drop(unlisted);
+        drop(item.registration.lock().take());
         if item.recheck {
             self.shared.rechecked.fetch_sub(1, Ordering::Relaxed);
         }

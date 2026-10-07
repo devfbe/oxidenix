@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -188,6 +189,34 @@ int main(void) {
         close(up[i]);
         close(down[i]);
     }
+
+    /* A wakeup racing with EPOLL_CTL_DEL on another CPU must not leave
+     * the removed interest on the ready list. */
+    int race[2];
+    pipe(race);
+    fcntl(race[0], F_SETFL, O_NONBLOCK);
+    pid_t hammer = fork();
+    if (hammer == 0) {
+        cpu_set_t one;
+        CPU_ZERO(&one);
+        CPU_SET(1, &one);
+        sched_setaffinity(0, sizeof one, &one);
+        for (;;) {
+            write(race[1], "x", 1);
+            read(race[0], buf, 1);
+        }
+    }
+    int stale = 0;
+    for (int i = 0; i < 20000 && !stale; i++) {
+        add(ep, race[0], EPOLLIN, 16);
+        epoll_ctl(ep, EPOLL_CTL_DEL, race[0], NULL);
+        stale = peek(ep, NULL) != 0;
+    }
+    kill(hammer, SIGKILL);
+    waitpid(hammer, NULL, 0);
+    close(race[0]);
+    close(race[1]);
+    check("a removed interest is never reported", !stale);
 
     /* epoll_wait sleeps until a write and wakes right after it. */
     pipe(q);
