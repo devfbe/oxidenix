@@ -48,5 +48,6 @@ them from the code.
 
 ## Comparing with Linux
 
-The same `iobench` binary (static musl) runs in a Linux guest with the same QEMU
-configuration, where the counter columns are `-`.
+`scripts/bench.sh --linux` runs the same `iobench` (built static with musl) in a Linux guest
+(`scripts/linux-guest.nix`: the nixpkgs kernel, BusyBox, the virtio and ext2 modules) with the
+same QEMU configuration and a data disk made the same way; the counter columns are `-` there.
