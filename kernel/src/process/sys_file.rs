@@ -1,6 +1,7 @@
 //! File syscalls.
 
 use super::errno::*;
+use super::poll::PollTable;
 use super::{current_files, uaccess, with_current, FdEntry};
 use crate::fs::file::*;
 use crate::fs::{self, Inode, NewNode};
@@ -354,27 +355,23 @@ pub fn ioctl(fd: u64, request: u64, arg: u64) -> SysResult {
     Ok(0)
 }
 
-/// Sleeps until the next re-check of readiness (a scheduler tick from now)
-/// or `deadline`, whichever comes first.
-fn wait_for_readiness(deadline: Option<u64>) -> Result<(), i64> {
-    let next = crate::time::now().saturating_add(crate::timer::TICK_NS);
-    super::sleep_until(deadline.map_or(next, |d| d.min(next)))
-}
-
 /// The deadline of a timeout of `ns` nanoseconds (None: wait forever).
 fn deadline_in(ns: Option<u64>) -> Option<u64> {
     ns.map(|ns| crate::time::now().saturating_add(ns))
 }
 
-/// poll(2): readiness is re-checked every scheduler tick; the timeout
-/// (`None`: none) ends the wait exactly.
+/// poll(2): waits on the wait queues of the polled files (see
+/// `poll::PollTable`); the timeout (`None`: none) ends the wait exactly.
 pub fn poll(fds: u64, nfds: u64, timeout: Option<u64>) -> SysResult {
     const POLLNVAL: i16 = 0x20;
     if nfds > 256 {
         return Err(EINVAL);
     }
     let deadline = deadline_in(timeout);
+    let mut table = PollTable::new();
+    let mut first = true;
     loop {
+        table.rearm();
         let mut ready = 0;
         for i in 0..nfds {
             let entry = fds + i * 8;
@@ -384,7 +381,15 @@ pub fn poll(fds: u64, nfds: u64, timeout: Option<u64>) -> SysResult {
             let revents = if fd < 0 {
                 0
             } else {
-                file(fd as u64).map_or(POLLNVAL, |f| f.poll(events))
+                match file(fd as u64) {
+                    Ok(f) => {
+                        if first {
+                            f.poll_register(&mut table)?;
+                        }
+                        f.poll(events)
+                    }
+                    Err(_) => POLLNVAL,
+                }
             };
             uaccess::write(entry + 6, revents)?;
             if revents != 0 {
@@ -394,7 +399,8 @@ pub fn poll(fds: u64, nfds: u64, timeout: Option<u64>) -> SysResult {
         if ready > 0 || deadline.is_some_and(|d| crate::time::now() >= d) {
             return Ok(ready);
         }
-        wait_for_readiness(deadline)?;
+        first = false;
+        table.wait(deadline)?;
     }
 }
 
@@ -415,14 +421,21 @@ pub fn select(nfds: u64, readfds: u64, writefds: u64, exceptfds: u64, timeout: O
     };
     let (want_r, want_w) = (load(readfds)?, load(writefds)?);
     let deadline = deadline_in(timeout);
+    let mut table = PollTable::new();
+    let mut first = true;
     loop {
+        table.rearm();
         let (mut got_r, mut got_w, mut ready) = ([0u64; 16], [0u64; 16], 0);
         for fd in 0..nfds {
             let (w, b) = ((fd / 64) as usize, 1u64 << (fd % 64));
             if (want_r[w] | want_w[w]) & b == 0 {
                 continue;
             }
-            let revents = file(fd)?.poll(POLLIN | POLLOUT);
+            let f = file(fd)?;
+            if first {
+                f.poll_register(&mut table)?;
+            }
+            let revents = f.poll(POLLIN | POLLOUT);
             if want_r[w] & b != 0 && revents & (POLLIN | POLLHUP | POLLERR) != 0 {
                 got_r[w] |= b;
                 ready += 1;
@@ -442,7 +455,8 @@ pub fn select(nfds: u64, readfds: u64, writefds: u64, exceptfds: u64, timeout: O
             }
             return Ok(ready);
         }
-        wait_for_readiness(deadline)?;
+        first = false;
+        table.wait(deadline)?;
     }
 }
 

@@ -12,6 +12,8 @@ use crate::sync::IrqSpinLock;
 use x86_64::instructions::interrupts::without_interrupts;
 
 const TTY_CHAN: usize = 2;
+/// Woken when input arrives (for poll and select).
+pub const POLL_CHAN: usize = TTY_CHAN;
 const NCCS: usize = 19;
 const BUF_SIZE: usize = 4096;
 

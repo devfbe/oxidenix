@@ -115,7 +115,7 @@ The kernel boots straight into Bash. Things to try:
 
 ```sh
 ls -l /bin | head          # BusyBox applets
-cowtest; vmtest; futextest; threadtest; timetest; timertest; sigtest; jobtest; oomtest; fstest; forktest; nettest; smptest # self-tests
+cowtest; vmtest; futextest; threadtest; timetest; timertest; polltest; sigtest; jobtest; oomtest; fstest; forktest; nettest; smptest # self-tests
 nproc; cat /proc/cpuinfo   # 4 CPUs; 'cpus' in the kernel monitor shows their load
 wget -O - http://example.com # DNS and HTTP through netd; nslookup and nc work as well
 ping -c 3 1.1.1.1          # raw ICMP sockets; oxidenix answers pings itself, too
@@ -176,6 +176,7 @@ oxidenix/
 │       │   ├── exec.rs          execve, ending the other threads first
 │       │   ├── exit.rs          thread and process exit, wait4
 │       │   ├── sched.rs         run queues, wait queues, context switch, idle
+│       │   ├── poll.rs          waiting on the wait queues of several files (poll, select)
 │       │   ├── address_space.rs areas, demand paging, copy-on-write
 │       │   ├── tlb.rs           which CPUs use an address space, TLB shootdowns
 │       │   ├── syscall.rs       syscall entry/return, dispatch table
@@ -354,6 +355,11 @@ The scheduler is built for several CPUs (`process/sched.rs`, design in
   (`prepare_to_wait`), then checks its condition, then sleeps; a per-task wake lock
   serializes wakeups with the task descheduling itself. Pipes, the TTY, IPC, `wait4`, stops
   and timed sleeps all use this protocol.
+- **Waiting on several files** (`process/poll.rs`): `poll` and `select` put one waiter on
+  the wait queue of every file they check (a pipe end's, the TTY's), so a wakeup on any of
+  them ends the wait at once instead of at a periodic re-check; a wakeup that comes while
+  the files are being checked is noted and not lost. Sockets, whose readiness lives in
+  netd, are re-checked every tick while polled.
 - The kernel is non-preemptive: only user code is preempted, and an interrupt in kernel mode
   never schedules. Syscalls nevertheless run with interrupts enabled, so a long syscall does
   not delay timer ticks or device interrupts on its CPU. An interrupt that ends the time
@@ -674,6 +680,7 @@ Each of these programs and scripts lives in the root filesystem and runs inside 
 | `futextest` | `FUTEX_WAIT` on a changed value (`EAGAIN`), timeouts, `EINVAL`/`EFAULT`, interruption by a signal (`EINTR`), shared futexes across processes, private memory keeping separate keys after `fork`, bitsets, `FUTEX_CMP_REQUEUE` |
 | `timetest` | nanosecond resolution of `CLOCK_MONOTONIC`, no step back on one CPU or between two, `clock_getres`, invalid clocks, `BOOTTIME`, `RAW`, `COARSE`, `gettimeofday` and `time` against `CLOCK_REALTIME`, `clock_settime` moving only the wall clock, thread and process CPU clocks (spinning counts, sleeping does not, `pthread_getcpuclockid`, `clock_getcpuclockid`), `getrusage` for the process, the thread and reaped children, `times` |
 | `timertest` | sleeps and timeouts end when due, not at the next tick, and never early (median and minimum of nine 1–2 ms waits in `nanosleep`, `poll`, `select`, `futex`, `sigtimedwait`), 100 × `usleep(100)`, `clock_nanosleep` absolute (monotonic, past wall-clock times) and on `CLOCK_BOOTTIME`, refusal on CPU clocks, the time left after an interrupted `nanosleep`, a 2 ms `setitimer` interval firing about 50 times in 100 ms, a 1 µs interval timer leaving another process on its CPU its share (and, ignored, its own process), an ignored timer resuming once handled |
+| `polltest` | `poll` and `select` wake within 1 ms of a pipe write (median of nine, the writer on the same or another CPU, next to an idle descriptor), a full pipe polling writable once drained, `POLLHUP` when the last writer closes, `EINTR` in a `poll` waiting on files |
 | `vmtest` | demand paging (a 64 MiB mapping costs nothing until touched), `SIGSEGV` on read-only and `PROT_NONE` pages with contents kept, split areas after a partial `munmap`, NX and the JIT pattern (1 GiB `PROT_NONE` reservation, write code, `mprotect` to executable, call it), commit limit and `MAP_NORESERVE`, `mremap` in place and moving, `MADV_DONTNEED`, shared vs. private memory across `fork`, lazy file mappings and `SIGBUS` beyond the end, `MAP_FIXED_NOREPLACE`, stack growth to 4 MiB and overflow beyond 8 MiB |
 | `smptest` | CPU count and affinity (pinning to every CPU, empty masks), parallel speed-up of CPU-bound processes, `fork`/`exit`/`wait` on every CPU at once, 5000 pipe round trips between two CPUs, signals to a process running on another CPU, timers on time while a program floods the console with palette changes on the same CPU |
 | `nettest` | TCP to an echo service through QEMU, `ECONNREFUSED`, `listen`/`accept` over loopback with a forked client, EOF after the peer closed, non-blocking `accept` and `connect` with `poll` and `SO_ERROR`, `EINTR` in a blocking `recv`, UDP over loopback, raw ICMP echo to the gateway and over loopback, source address for off-subnet destinations, overflowing message vectors, `AF_INET6` rejected |

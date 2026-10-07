@@ -1,5 +1,6 @@
 use super::{Device, Inode};
 use crate::process::errno::*;
+use crate::process::poll::PollTable;
 use crate::process::signal::interrupted;
 use crate::process::{sched::prepare_to_wait, wakeup};
 use alloc::collections::VecDeque;
@@ -321,6 +322,23 @@ impl OpenFile {
             Kind::Socket(s) => s.poll(events),
         };
         ready & (events | POLLERR | POLLHUP)
+    }
+
+    /// Puts `table` on the wait queues that are woken when this file's
+    /// readiness changes.
+    pub fn poll_register(&self, table: &mut PollTable) -> Result<(), i64> {
+        match &self.kind {
+            Kind::Inode(_) if self.is_console() => table.add(crate::drivers::tty::POLL_CHAN),
+            // Regular files and devices are always ready.
+            Kind::Inode(_) => Ok(()),
+            Kind::PipeRead(p) => table.add(p.read_chan()),
+            Kind::PipeWrite(p) => table.add(p.write_chan()),
+            // Readiness is the network server's: checked again every tick.
+            Kind::Socket(_) => {
+                table.recheck();
+                Ok(())
+            }
+        }
     }
 }
 
