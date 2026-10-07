@@ -35,7 +35,8 @@ let
     for m in virtio_pci virtio_blk virtio_net ext2 af_packet; do modprobe "$m"; done
     mount -t ext2 /dev/vda /data
     ifconfig lo 127.0.0.1 up
-    udhcpc -i eth0 -q -n -s /udhcpc.sh >/dev/null
+    ifconfig eth0 up
+    udhcpc -i eth0 -q -n -t 10 -s /udhcpc.sh >/dev/null 2>&1
     echo "=== iobench"
     /iobench /data
     sync
