@@ -115,7 +115,7 @@ processes, threads, memory objects and the services it uses.
 |---|---|
 | processes | `process_create() -> (process, space)`; `process_kill`; exit notification on a port |
 | threads | `thread_create(process, state)`, `thread_kick`, `restricted_enter(state)` |
-| memory objects | `mo_create(size)`, `mo_create_paged(size, key)` with `pager_wait` and `mo_supply` for the pager thread, `mo_read`/`mo_write`, `mo_clone_cow(mo)` (for `fork`, R5), `mo_physical` for DMA/MMIO (drivers) |
+| memory objects | `mo_create(size)`, `mo_create_paged(size, key)` with `pager_wait` and `mo_supply` for the pager thread, `mo_read`/`mo_write`, `mo_clone_cow(mo)` (for `fork`, R8), `mo_physical` for DMA/MMIO (drivers) |
 | mappings | `map(space, addr, mo, offset, len, prot, flags)`, `unmap`, `protect` in a process's restricted region (the server keeps the Linux VMAs; the kernel keeps page tables) |
 | waiting | `futex_wait(addr, value, deadline)`, `futex_wake`, `clock_get` |
 | IPC | today's services, and shared-memory rings for the I/O paths (separate design) |
