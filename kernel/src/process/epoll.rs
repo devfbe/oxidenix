@@ -59,6 +59,9 @@ pub struct Epoll {
     /// Interests by descriptor number and open file.
     interest: spin::Mutex<BTreeMap<(i32, usize), Arc<Item>>>,
     shared: Arc<Shared>,
+    /// The open file of this instance, whose watchers are the instances
+    /// that watch this one.
+    file: spin::Mutex<Weak<OpenFile>>,
 }
 
 /// What the items of an instance share with it.
@@ -147,6 +150,7 @@ impl Epoll {
                 overflow: AtomicBool::new(false),
                 rechecked: AtomicUsize::new(0),
             }),
+            file: spin::Mutex::new(Weak::new()),
         })
     }
 
@@ -166,7 +170,12 @@ impl Epoll {
         let _nesting = match &source {
             PollSource::Epoll(target) => {
                 let guard = NESTING.lock();
-                check_nesting(target, self, 1)?;
+                // A chain of watching instances stays short in both
+                // directions: what watches this one, it, and what the
+                // target watches.
+                if levels_above(self) + 1 + levels_below(target, self)? > MAX_NESTING + 1 {
+                    return Err(ELOOP);
+                }
                 Some(guard)
             }
             _ => None,
@@ -341,19 +350,41 @@ impl Drop for Epoll {
     }
 }
 
-/// Whether `epoll` may watch `target`: no cycle, not too deep.
-fn check_nesting(target: &Arc<Epoll>, epoll: &Epoll, depth: usize) -> Result<(), i64> {
-    if core::ptr::eq(Arc::as_ptr(target), epoll) || depth > MAX_NESTING {
+/// The instances in the longest chain that starts at `target` and goes
+/// down through the instances it watches (`target` included). ELOOP if
+/// it reaches `epoll` (a cycle) or gets too long.
+fn levels_below(target: &Arc<Epoll>, epoll: &Epoll) -> Result<usize, i64> {
+    levels_below_from(target, epoll, 1)
+}
+
+fn levels_below_from(target: &Arc<Epoll>, epoll: &Epoll, depth: usize) -> Result<usize, i64> {
+    if core::ptr::eq(Arc::as_ptr(target), epoll) || depth > MAX_NESTING + 1 {
         return Err(ELOOP);
     }
+    let mut levels = 1;
     for item in target.items() {
         if let Some(file) = item.file.upgrade() {
             if let Kind::Epoll(inner) = &file.kind {
-                check_nesting(inner, epoll, depth + 1)?;
+                levels = levels.max(1 + levels_below_from(inner, epoll, depth + 1)?);
             }
         }
     }
-    Ok(())
+    Ok(levels)
+}
+
+/// The instances in the longest chain of instances that watch `epoll`,
+/// one watching the next (`epoll` not included). The checks on every
+/// add keep it within MAX_NESTING.
+fn levels_above(epoll: &Epoll) -> usize {
+    let Some(file) = epoll.file.lock().upgrade() else { return 0 };
+    let watchers: Vec<Arc<Item>> = file.watchers.lock().iter().filter_map(Weak::upgrade).collect();
+    watchers
+        .iter()
+        .filter(|i| !i.removed.load(Ordering::Acquire))
+        .filter_map(|i| i.owner())
+        .map(|owner| 1 + levels_above(&owner))
+        .max()
+        .unwrap_or(0)
 }
 
 // ------------------------------------------------------------ syscalls
@@ -372,7 +403,9 @@ pub fn epoll_create1(flags: u64) -> SysResult {
     if flags & !(O_CLOEXEC as u64) != 0 {
         return Err(EINVAL);
     }
-    let file = OpenFile::new(Kind::Epoll(Epoll::new()), crate::fs::file::O_RDWR, None);
+    let epoll = Epoll::new();
+    let file = OpenFile::new(Kind::Epoll(epoll.clone()), crate::fs::file::O_RDWR, None);
+    *epoll.file.lock() = Arc::downgrade(&file);
     with_current(|p| p.alloc_fd(file, flags != 0, 0))
 }
 

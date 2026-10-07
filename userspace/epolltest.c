@@ -170,6 +170,25 @@ int main(void) {
     close(inner);
     close(outer);
 
+    /* Chains of instances stay short however they are built: adding a
+     * new outermost instance each time, or a new innermost one. */
+    int up[8], down[8], up_fail = 0, down_fail = 0;
+    up[0] = epoll_create1(0);
+    down[0] = epoll_create1(0);
+    for (int i = 1; i < 8; i++) {
+        up[i] = epoll_create1(0);
+        down[i] = epoll_create1(0);
+        if (!up_fail && add(up[i], up[i - 1], EPOLLIN, 0) == -1 && errno == ELOOP) up_fail = i;
+        if (!down_fail && add(down[i - 1], down[i], EPOLLIN, 0) == -1 && errno == ELOOP) down_fail = i;
+    }
+    printf("  (a chain of %d instances is refused, built upwards; %d, downwards)\n", up_fail + 1, down_fail + 1);
+    check("nesting is limited when built upwards", up_fail == 5);
+    check("nesting is limited when built downwards", down_fail == 5);
+    for (int i = 0; i < 8; i++) {
+        close(up[i]);
+        close(down[i]);
+    }
+
     /* epoll_wait sleeps until a write and wakes right after it. */
     pipe(q);
     add(ep, q[0], EPOLLIN, 14);
