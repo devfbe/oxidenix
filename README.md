@@ -151,7 +151,7 @@ The window scales when it is resized (`zoom-to-fit`), and Ctrl+Alt+F toggles ful
  │  terminal        TTY line discipline ─ console (framebuffer, ANSI) ─ keyboard       │
  │  CPU             GDT, TSS + I/O bitmap, IDT, local + I/O APIC (ACPI), SSE│          │
  └──────────────────────────────────────────────────────────────────────────▼──────────┘
-      bootloader 0.11 (BIOS), QEMU x86_64, 4 CPUs, 256 MiB RAM, IDE boot disk, virtio-blk data disk, virtio-net
+      bootloader 0.11 (BIOS), QEMU q35, 4 CPUs, 256 MiB RAM, AHCI boot disk, virtio-blk data disk, virtio-net
 ```
 
 ### Repository layout

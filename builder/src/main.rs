@@ -102,6 +102,9 @@ fn main() {
             &format!("format=raw,file={},if=none,id=data", data_disk.display()),
             "-device",
             "virtio-blk-pci,drive=data,disable-modern=on",
+            // q35 (ICH9) rather than the default i440fx: it can have an IOMMU.
+            "-machine",
+            "q35",
             "-device",
             "isa-debug-exit,iobase=0xf4,iosize=0x04",
             "-m",
