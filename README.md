@@ -111,8 +111,10 @@ This builds the kernel, assembles the root filesystem (C test programs, Bash, Bu
 `userspace/rootfs/`), packs it as a cpio initramfs, creates a UEFI disk image and starts QEMU with the OVMF firmware
 from nixpkgs (`OXIDENIX_OVMF=<dir>` uses another directory holding `OVMF_CODE.fd` and
 `OVMF_VARS.fd`). `OXIDENIX_FIRMWARE=bios` builds a BIOS image and boots it with SeaBIOS instead.
-On the first run it also creates `disk.img`, a 64 MiB ext2 data disk (via `mke2fs` from nixpkgs,
-pre-filled from `userspace/disk/`). This file is kept between runs; delete it for a fresh disk.
+On the first run it also creates `disk.img`, a 2 GiB ext2 data disk (via `mke2fs` from nixpkgs,
+pre-filled from `userspace/disk/`; a sparse file, about 20 MB on the host when new). This file is
+kept between runs; delete it for a fresh disk. A `disk.img` from before the disk grew from 64 MiB
+to 2 GiB stays 64 MiB (the builder points it out): delete it to get the bigger one.
 Extra arguments after `--` are passed to QEMU; `OXIDENIX_BUILD_ONLY=1 cargo run` only builds the images.
 `OXIDENIX_DISK=<path>` uses another data disk image (created if missing).
 

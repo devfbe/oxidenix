@@ -79,6 +79,12 @@ fn main() {
     if !data_disk.exists() {
         println!("Creating persistent ext2 disk {}...", data_disk.display());
         create_data_disk(&data_disk).expect("Failed to create the data disk");
+    } else if fs::metadata(&data_disk).is_ok_and(|m| m.len() < DATA_DISK_BYTES) {
+        println!(
+            "note: {} is smaller than the {} GiB a new data disk has; delete it to get a new one",
+            data_disk.display(),
+            DATA_DISK_BYTES >> 30
+        );
     }
 
     // Most of a debug build is DWARF debug information the kernel never
@@ -241,14 +247,19 @@ fn build_rootfs(root: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// A 64 MiB ext2 filesystem (1 KiB blocks, 128-byte inodes, no extensions the
-/// kernel does not implement), pre-filled from userspace/disk.
+/// The size of a new data disk.
+const DATA_DISK_BYTES: u64 = 2 << 30;
+
+/// A 2 GiB ext2 filesystem (1 KiB blocks, 128-byte inodes, no extensions the
+/// kernel does not implement), pre-filled from userspace/disk. The image is a
+/// sparse file: only the blocks mke2fs writes take space on the host.
 fn create_data_disk(path: &Path) -> io::Result<()> {
     let content = Path::new(env!("CARGO_MANIFEST_DIR")).join("../userspace/disk");
     let mkfs = format!(
-        "unset SOURCE_DATE_EPOCH; mke2fs -q -t ext2 -b 1024 -I 128 -O none,filetype,sparse_super,large_file -L oxidenix -d '{}' -F '{}' 65536",
+        "unset SOURCE_DATE_EPOCH; mke2fs -q -t ext2 -b 1024 -I 128 -O none,filetype,sparse_super,large_file -L oxidenix -d '{}' -F '{}' {}",
         content.display(),
-        path.display()
+        path.display(),
+        DATA_DISK_BYTES / 1024
     );
     let status = Command::new("nix-shell").args(["-p", "e2fsprogs", "--run", &mkfs]).status()?;
     if !status.success() {
