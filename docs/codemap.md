@@ -18,7 +18,7 @@ module comment, and the public types it defines. Where to start for common tasks
 - `kernel/src/drivers/rtc.rs` (43) CMOS real-time clock: read once at boot; wall-clock time afterwards is kept by `time` (the boot time plus the monotonic clock).
 - `kernel/src/drivers/serial.rs` (52) COM1 serial port (output only).
 - `kernel/src/drivers/tty.rs` (297) Terminal line discipline for the console: a termios subset with canonical line editing, echo and raw mode. Types: `Termios`.
-- `kernel/src/fs/cache.rs` (1250) The page cache: the pages of a regular file in physical frames, shared by `read`, `write` and every mapping of the file (see docs/design/page-cache.md). Types: `Pager`, `Backing`, `Dirtied`, `Fill`, `Scan`, `PageCache`.
+- `kernel/src/fs/cache.rs` (1258) The page cache: the pages of a regular file in physical frames, shared by `read`, `write` and every mapping of the file (see docs/design/page-cache.md). Types: `Pager`, `Backing`, `Dirtied`, `Fill`, `Scan`, `PageCache`.
 - `kernel/src/fs/cpio.rs` (53) Unpacks a cpio archive in "newc" format into the VFS.
 - `kernel/src/fs/file.rs` (462) Open files: `OpenFile` (an open file description with offset and flags) over inodes, pipes, eventfds, devices and files whose calls a server implements (`ServerFile`). Types: `Pipe`, `EventFd`, `ServerFiles`, `ServerFile`, `Kind`, `OpenFile`.
 - `kernel/src/fs/mod.rs` (544) In-memory filesystem (tmpfs-like), populated from the initramfs at boot. Types: `Device`, `Node`, `DiskRef`, `InodeStat`, `NewNode`, `Inode`, `WriteAccess`, `MappedFile`, `DenyWrite`.

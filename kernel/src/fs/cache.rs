@@ -312,11 +312,13 @@ struct State {
 /// (`PageCache::register`), for the walks that must reach every mapping of
 /// a page (`PageCache::for_each_mapper`).
 struct Mappers {
-    list: Vec<Weak<Mm>>,
-    /// Walks in progress: while there is one, dead entries stay (dropping
-    /// them would move live ones under a walk, which could skip them), so
-    /// the list only grows at its end.
-    walkers: usize,
+    /// By sequence number, ascending: new entries go at the end, and
+    /// removing dead ones keeps the order. Dead entries are removed by
+    /// every registration and at the end of every walk, so the list holds
+    /// at most the live mappers and those gone since.
+    list: Vec<(u64, Weak<Mm>)>,
+    /// The next registration's sequence number.
+    next: u64,
 }
 
 pub struct PageCache {
@@ -399,7 +401,7 @@ impl PageCache {
             }),
             io: Mutex::new(()),
             store,
-            mappers: IrqSpinLock::new(Mappers { list: Vec::new(), walkers: 0 }),
+            mappers: IrqSpinLock::new(Mappers { list: Vec::new(), next: 0 }),
             hung_up: core::sync::atomic::AtomicBool::new(false),
         })
         .map_err(|_| ENOMEM)
@@ -1545,9 +1547,11 @@ impl PageCache {
     }
 
     /// Records that `mm` maps this file, so truncation and write-back can
-    /// reach its page table entries; at the end of the list, so a walk in
-    /// progress reaches it too (`for_each_mapper`). Kept until the address
-    /// space is gone (then skipped, and dropped by a later registration).
+    /// reach its page table entries; at the end of the list, with the next
+    /// sequence number, so a walk in progress reaches it too
+    /// (`for_each_mapper`). Kept until the address space is gone: then
+    /// skipped, and removed by the next registration or the end of the
+    /// next walk (`Mappers::compact`).
     ///
     /// A fork child registers with the caches of the areas it inherits
     /// under its parent's lock, before it gets copies of the parent's
@@ -1555,14 +1559,14 @@ impl PageCache {
     /// leave the child a stale copy reaches the child after the parent.
     pub fn register(&self, mm: &Weak<Mm>) -> Result<(), Fault> {
         let mut mappers = self.mappers.lock();
-        if mappers.list.iter().any(|m| m.ptr_eq(mm)) {
+        mappers.compact();
+        if mappers.list.iter().any(|(_, m)| m.ptr_eq(mm)) {
             return Ok(());
         }
-        if mappers.walkers == 0 {
-            mappers.list.retain(|m| m.strong_count() > 0);
-        }
         mappers.list.try_reserve(1).map_err(|_| Fault::Oom)?;
-        mappers.list.push(mm.clone());
+        let seq = mappers.next;
+        mappers.next += 1;
+        mappers.list.push((seq, mm.clone()));
         Ok(())
     }
 
@@ -1582,22 +1586,39 @@ impl PageCache {
     /// registered the child before (`Mm::fork`, under the parent's lock), so
     /// the walk visits the child after the parent, once the copy is done
     /// (the child's lock is held for it); if it copied them after the
-    /// visit, they are as current as the parent's. A walk ends once it
-    /// caught up with the registrations.
+    /// visit, they are as current as the parent's.
+    ///
+    /// A walk ends once it caught up with the registrations, so forks in a
+    /// tight loop prolong it (by design: each new child may hold a copy
+    /// the walk must reach; it ends when the forks pause or the walk
+    /// overtakes them). It goes on after the sequence number it visited
+    /// last, not at an index, so dead entries may be removed meanwhile
+    /// (by registrations, by other walks) without making it skip one.
     fn for_each_mapper(&self, mut f: impl FnMut(&Mm)) {
-        self.mappers.lock().walkers += 1;
-        let mut i = 0;
+        let mut last = None;
         loop {
-            // (The space, if this was its last reference, goes outside
-            // the lock.)
-            let entry = self.mappers.lock().list.get(i).map(Weak::upgrade);
-            let Some(mm) = entry else { break };
+            let entry = {
+                let mappers = self.mappers.lock();
+                let i = last.map_or(0, |seq| mappers.list.partition_point(|&(s, _)| s <= seq));
+                mappers.list.get(i).map(|(seq, mm)| (*seq, mm.upgrade()))
+            };
+            let Some((seq, mm)) = entry else { break };
+            last = Some(seq);
+            // (The space, if this was its last reference, goes here,
+            // outside the lock.)
             if let Some(mm) = mm {
                 f(&mm);
             }
-            i += 1;
         }
-        self.mappers.lock().walkers -= 1;
+        self.mappers.lock().compact();
+    }
+}
+
+impl Mappers {
+    /// Drops the entries of address spaces that are gone. Keeps the order
+    /// (and with it, parent before child).
+    fn compact(&mut self) {
+        self.list.retain(|(_, m)| m.strong_count() > 0);
     }
 }
 

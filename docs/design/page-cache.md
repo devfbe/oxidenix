@@ -62,7 +62,9 @@ file in it. This scales with the processes mapping a file, not with all processe
 
 The list is walked one mapper at a time, in the order they registered, with no cache lock held
 while a mapper's address space is locked; mappers that register during a walk are visited too
-(while a walk runs, dead entries stay in place, so the list only grows at its end). `fork`
+(each entry has a sequence number, and a walk goes on after the last one it visited, so dead
+entries can be removed at any time: by every registration and at the end of every walk; forks
+in a tight loop prolong a walk until it overtakes them). `fork`
 registers the child with the caches of every file area it inherits under the parent's lock,
 before the child gets copies of the parent's page table entries (`Mm::fork`, holding the child's
 lock until the copy is done). A truncation or write-back that the copy may have missed visits the
