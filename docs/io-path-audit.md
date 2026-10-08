@@ -186,19 +186,19 @@ baseline (`841f4cf`), with PCIDs and `-cpu max` (`fae8292`), with restricted mod
 host busy, was wrong and is gone; so are the conclusions drawn from it, such as a 26 % faster
 IPC round trip with PCIDs.)
 
-| benchmark | baseline | PCID | R1 | R5 | |
-|---|---:|---:|---:|---:|---|
-| null system call (`getppid`), p50 | 358 | 361 | 1805 | 2238 | cycles; passed through the Linux server since R1 |
-| forwarded system call, p50 | – | – | 1430 | 1461 | cycles; the server answers itself |
-| `fstat` of a disk file (one IPC round trip), p50 | 14429 | 12746 | 14157 | 14355 | cycles |
-| `fstat` in tmpfs, p50 | 652 | 652 | 2133 | 2895 | cycles |
-| sequential write, 64 KiB + `fsync` | 4.3 | 4.3 | 4.4 | 4.3 | MB/s |
-| sequential read from the disk (`O_DIRECT`) | 369 | 417 | 386 | 518 | MB/s |
-| sequential read from the page cache | 8060 | 7789 | 7760 | 7123 | MB/s |
-| 4 KiB read from the page cache, p50 | 968 | 2524 | 2399 | 2505 | ns |
-| 4 KiB read from the disk, p50 | 29.0 | 26.0 | 29.8 | 28.1 | µs |
-| TCP over loopback | 621 | 581 | 576 | 536 | MB/s |
-| TCP through the network card (echo) | 106 | 125 | 120 | 109 | MB/s |
+| benchmark | baseline | PCID | R1 | R5 | | Linux 6.18 |
+|---|---:|---:|---:|---:|---|---:|
+| null system call (`getppid`), p50 | 358 | 361 | 1805 | 2238 | 269 | cycles; passed through the Linux server since R1 |
+| forwarded system call, p50 | – | – | 1430 | 1461 | 228 (ENOSYS) | cycles; the server answers itself |
+| `fstat` of a disk file (one IPC round trip), p50 | 14429 | 12746 | 14157 | 14355 | 409 | cycles |
+| `fstat` in tmpfs, p50 | 652 | 652 | 2133 | 2895 | 438 | cycles |
+| sequential write, 64 KiB + `fsync` | 4.3 | 4.3 | 4.4 | 4.3 | 208 | MB/s |
+| sequential read from the disk (`O_DIRECT`) | 369 | 417 | 386 | 518 | 840 | MB/s |
+| sequential read from the page cache | 8060 | 7789 | 7760 | 7123 | 6098 | MB/s |
+| 4 KiB read from the page cache, p50 | 968 | 2524 | 2399 | 2505 | 1114 | ns |
+| 4 KiB read from the disk, p50 | 29.0 | 26.0 | 29.8 | 28.1 | 18.6 | µs |
+| TCP over loopback | 621 | 581 | 576 | 536 | 5832 | MB/s |
+| TCP through the network card (echo) | 106 | 125 | 120 | 109 | 233 | MB/s |
 
 - The IPC round trip costs about 14000 cycles, 40 null system calls; PCIDs save little of it.
 - Sequential writes stay at 4.3 MB/s: a device flush per `write`, waited for by diskfs
@@ -208,4 +208,4 @@ IPC round trip with PCIDs.)
 - Restricted mode costs a passed-through call about 1450 cycles (three kernel entries instead
   of one) and a forwarded call about 1100; calls the server answers itself (memory, time,
   pipes) pay only the latter, and the pass-through goes away with R9.
-- The comparison with Linux is being measured again with the same CPU model (`-cpu max`).
+- Linux (same QEMU configuration, `-cpu max`; `docs/benchmarks/2026-10-08-linux-6.18.54-quiet.md`): a system call costs it 270 cycles, a stat of a disk file 400 (no server round trip), and its TCP over loopback is 10× and its sequential write 50× faster: the targets for the I/O work after the migration (rings, no flush per write, batching).
