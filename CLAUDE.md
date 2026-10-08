@@ -74,6 +74,8 @@ An AI research project; see README.md.
   asking, and without touching the global git config:
   `git -c credential.helper= -c credential.helper='!gh auth git-credential' push`.
 - Then continue directly with the next step.
+- Check the GitHub Actions runs regularly (`gh run list`), at the latest before starting a new
+  step after pushes; a red run is fixed before new work goes on top.
 - Parallelize with subagents whenever work splits into independent parts (e.g. separate
   subsystems): run them concurrently, each in its own git worktree, and merge their branches
   into `main` after reviewing and testing the result.

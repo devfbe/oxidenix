@@ -1,3 +1,4 @@
 target/
 .superpowers/
 disk.img
+.claude/worktrees/
