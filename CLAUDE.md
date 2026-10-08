@@ -1,6 +1,6 @@
 # oxidenix
 
-Bare-metal x86_64 kernel in Rust (bootloader 0.11, BIOS) that boots in QEMU and
+Bare-metal x86_64 kernel in Rust (bootloader 0.11, UEFI or BIOS) that boots in QEMU and
 runs static musl binaries (Bash, BusyBox) via a Linux-compatible syscall ABI.
 An AI research project; see README.md.
 
@@ -26,6 +26,8 @@ An AI research project; see README.md.
   size-class allocator of the kernel's and the server's heaps, `cargo test --release -p ring`
   the I/O ring's invariants (with threads; release for realistic interleavings).
 - QEMU must always run with a visible window; never use `-display none`.
+- The image boots via UEFI (OVMF from nixpkgs) by default; `OXIDENIX_FIRMWARE=bios` builds and
+  boots a BIOS image instead. CI runs the self-tests with both.
 - `cd kernel && OXIDENIX_BUILD_ONLY=1 cargo run` builds the boot image and data disk without
   starting QEMU.
 
@@ -44,3 +46,6 @@ An AI research project; see README.md.
   asking, and without touching the global git config:
   `git -c credential.helper= -c credential.helper='!gh auth git-credential' push`.
 - Then continue directly with the next step.
+- Parallelize with subagents whenever work splits into independent parts (e.g. separate
+  subsystems): run them concurrently, each in its own git worktree, and merge their branches
+  into `main` after reviewing and testing the result.

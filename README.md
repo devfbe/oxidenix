@@ -11,7 +11,7 @@ disk driver and the ext2 filesystem already run as a user-space server.
 [![test](https://github.com/devfbe/oxidenix/actions/workflows/test.yml/badge.svg)](https://github.com/devfbe/oxidenix/actions/workflows/test.yml)
 ![Rust](https://img.shields.io/badge/language-Rust%20(nightly)-orange?logo=rust)
 ![Arch](https://img.shields.io/badge/arch-x86__64-blue)
-![Boot](https://img.shields.io/badge/boot-BIOS%20via%20bootloader%200.11-lightgrey)
+![Boot](https://img.shields.io/badge/boot-UEFI%20%2B%20BIOS%20via%20bootloader%200.11-lightgrey)
 ![Userland](https://img.shields.io/badge/userland-Bash%205.3%20%2B%20BusyBox-green)
 ![Status](https://img.shields.io/badge/status-research%20project-purple)
 ![License](https://img.shields.io/badge/license-GPL--3.0-blue)
@@ -46,7 +46,7 @@ Its [commit history](#development-history) records every step.
 
 ## What it can do
 
-- **Boots** via BIOS into a 64-bit higher-half kernel with a framebuffer text console.
+- **Boots** via UEFI (OVMF) or BIOS into a 64-bit higher-half kernel with a framebuffer text console.
 - **Runs real Linux binaries**: static musl executables such as GNU Bash 5.3 (with readline),
   BusyBox 1.37 (~400 applets: `ls`, `cat`, `grep`, `sed`, `dd`, `vi`, ...) and its own C test
   programs, all unmodified.
@@ -106,7 +106,9 @@ cargo run
 ```
 
 This builds the kernel, assembles the root filesystem (C test programs, Bash, BusyBox and
-`userspace/rootfs/`), packs it as a cpio initramfs, creates a BIOS disk image and starts QEMU.
+`userspace/rootfs/`), packs it as a cpio initramfs, creates a UEFI disk image and starts QEMU with the OVMF firmware
+from nixpkgs (`OXIDENIX_OVMF=<dir>` uses another directory holding `OVMF_CODE.fd` and
+`OVMF_VARS.fd`). `OXIDENIX_FIRMWARE=bios` builds a BIOS image and boots it with SeaBIOS instead.
 On the first run it also creates `disk.img`, a 64 MiB ext2 data disk (via `mke2fs` from nixpkgs,
 pre-filled from `userspace/disk/`). This file is kept between runs; delete it for a fresh disk.
 Extra arguments after `--` are passed to QEMU; `OXIDENIX_BUILD_ONLY=1 cargo run` only builds the images.
@@ -156,7 +158,7 @@ The window scales when it is resized (`zoom-to-fit`), and Ctrl+Alt+F toggles ful
  │  terminal        TTY line discipline ─ console (framebuffer, ANSI) ─ keyboard       │
  │  CPU             GDT, TSS + I/O bitmap, IDT, local + I/O APIC (ACPI), SSE│          │
  └──────────────────────────────────────────────────────────────────────────▼──────────┘
-      bootloader 0.11 (BIOS), QEMU q35, 4 CPUs, 256 MiB RAM, AHCI boot disk, virtio-blk data disk, virtio-net
+      bootloader 0.11 (UEFI/BIOS), QEMU q35, 4 CPUs, 256 MiB RAM, AHCI boot disk, virtio-blk data disk, virtio-net
 ```
 
 ### Repository layout
@@ -231,11 +233,12 @@ About 9,200 lines of Rust (without comments and blank lines) in the kernel and 3
 
 ### Boot sequence
 
-1. The **bootloader** (BIOS, `bootloader` 0.11) loads the position-independent kernel ELF (the
-   builder hands it a copy without debug information: 1.5 MB instead of 16 MB, since the BIOS
-   reads at about 1 MB/s under emulation) into
+1. The **bootloader** (`bootloader` 0.11, as a UEFI application under OVMF or from the BIOS)
+   loads the position-independent kernel ELF (the builder hands it a copy without debug
+   information: 1.5 MB instead of 16 MB, since the BIOS path reads at about 1 MB/s under
+   emulation) into
    the upper half (`dynamic_range_start = 0xffff_8000_0000_0000`). It maps all physical
-   memory at a dynamic offset, sets up a VESA framebuffer and loads the initramfs as a ramdisk.
+   memory at a dynamic offset, sets up a framebuffer (UEFI GOP or VESA) and loads the initramfs as a ramdisk.
 2. `kernel_main` runs these steps in order: framebuffer console and boot logo → GDT/TSS/IDT
    (interrupts still off) → frame allocator and 16 MiB kernel heap → ACPI tables (MADT), the
    local APIC with its calibrated timer and the I/O APIC (the 8259 PICs are masked) → the TSC

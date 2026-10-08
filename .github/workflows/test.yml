@@ -6,9 +6,15 @@ on:
 
 jobs:
   qemu:
-    name: self-tests in QEMU
+    name: self-tests in QEMU (${{ matrix.firmware }})
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        firmware: [uefi, bios]
+    env:
+      OXIDENIX_FIRMWARE: ${{ matrix.firmware }}
     steps:
       - uses: actions/checkout@v7
 
@@ -38,15 +44,19 @@ jobs:
           key: cargo-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
 
       - name: Test the ext2 library on the host
+        if: matrix.firmware == 'uefi'
         run: nix-shell -p e2fsprogs --run "cargo test -p ext2fs"
 
       - name: Test the Linux server's namespace library on the host
+        if: matrix.firmware == 'uefi'
         run: cargo test -p vfs
 
       - name: Test the size-class allocator on the host
+        if: matrix.firmware == 'uefi'
         run: cargo test -p slab
 
       - name: Test the I/O ring on the host
+        if: matrix.firmware == 'uefi'
         run: cargo test --release -p ring
 
       - name: Boot oxidenix and run the self-tests
@@ -68,5 +78,5 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: qemu-log
+          name: qemu-log-${{ matrix.firmware }}
           path: qemu.log

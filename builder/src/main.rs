@@ -74,17 +74,23 @@ fn main() {
         create_data_disk(&data_disk).expect("Failed to create the data disk");
     }
 
-    // The BIOS bootloader copies the whole ELF through real-mode disk reads
-    // (about 1 MB/s under QEMU), and most of a debug build is DWARF debug
-    // information the kernel never uses. Boot a stripped copy; the full ELF
-    // stays next to it for debuggers.
+    // Most of a debug build is DWARF debug information the kernel never
+    // uses, and the BIOS bootloader copies the whole ELF through real-mode
+    // disk reads (about 1 MB/s under QEMU). Boot a stripped copy; the full
+    // ELF stays next to it for debuggers.
     let boot_kernel = strip_debug_info(kernel_path);
 
-    println!("Building BIOS disk image...");
-    bootloader::BiosBoot::new(&boot_kernel)
-        .set_ramdisk(&cpio_path)
-        .create_disk_image(&img_path)
-        .expect("Failed to create disk image");
+    let firmware = Firmware::from_env();
+    println!("Building {} disk image...", firmware.name());
+    match firmware {
+        Firmware::Uefi => bootloader::UefiBoot::new(&boot_kernel)
+            .set_ramdisk(&cpio_path)
+            .create_disk_image(&img_path),
+        Firmware::Bios => bootloader::BiosBoot::new(&boot_kernel)
+            .set_ramdisk(&cpio_path)
+            .create_disk_image(&img_path),
+    }
+    .expect("Failed to create disk image");
 
     // OXIDENIX_BUILD_ONLY=1: produce the images without starting QEMU.
     if std::env::var_os("OXIDENIX_BUILD_ONLY").is_some() {
@@ -92,8 +98,22 @@ fn main() {
         return;
     }
 
-    println!("Starting QEMU with {}", img_path.display());
+    println!("Starting QEMU ({}) with {}", firmware.name(), img_path.display());
     let mut qemu = Command::new("qemu-system-x86_64");
+    if firmware == Firmware::Uefi {
+        // OVMF: its code read-only, its variable store a fresh copy per run
+        // (the boot is reproducible: no boot entries left from earlier runs).
+        let ovmf = ovmf_dir();
+        let vars = kernel_path.with_extension("ovmf-vars.fd");
+        fs::copy(ovmf.join("OVMF_VARS.fd"), &vars).expect("Failed to copy the OVMF variable store");
+        fs::set_permissions(&vars, fs::Permissions::from_mode(0o644)).expect("Failed to make the OVMF variable store writable");
+        qemu.args([
+            "-drive",
+            &format!("if=pflash,format=raw,readonly=on,file={}", ovmf.join("OVMF_CODE.fd").display()),
+            "-drive",
+            &format!("if=pflash,format=raw,file={}", vars.display()),
+        ]);
+    }
     if test_mode {
         // The serial port carries the kernel's output to stdout. CI has no
         // display; locally the window stays.
@@ -147,6 +167,53 @@ fn main() {
         .expect("Failed to run QEMU");
 
     process::exit(exit_status.code().unwrap_or(0));
+}
+
+/// The firmware the image boots with: `OXIDENIX_FIRMWARE=uefi` (the
+/// default, OVMF under QEMU) or `bios` (SeaBIOS).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Firmware {
+    Uefi,
+    Bios,
+}
+
+impl Firmware {
+    fn from_env() -> Firmware {
+        match std::env::var("OXIDENIX_FIRMWARE").as_deref() {
+            Err(_) | Ok("uefi") => Firmware::Uefi,
+            Ok("bios") => Firmware::Bios,
+            Ok(other) => {
+                eprintln!("OXIDENIX_FIRMWARE={other}: expected uefi or bios");
+                process::exit(2);
+            }
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Firmware::Uefi => "UEFI",
+            Firmware::Bios => "BIOS",
+        }
+    }
+}
+
+/// The directory holding OVMF_CODE.fd and OVMF_VARS.fd: `OXIDENIX_OVMF`,
+/// else nixpkgs' OVMF (built or fetched once, then from the Nix store).
+fn ovmf_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("OXIDENIX_OVMF") {
+        return PathBuf::from(dir);
+    }
+    let out = Command::new("nix-build")
+        .args(["<nixpkgs>", "-A", "OVMF.fd", "--no-out-link"])
+        .stderr(process::Stdio::inherit())
+        .output()
+        .expect("Failed to run nix-build for OVMF (or set OXIDENIX_OVMF)");
+    if !out.status.success() {
+        eprintln!("nix-build OVMF.fd failed; set OXIDENIX_OVMF to a directory with OVMF_CODE.fd and OVMF_VARS.fd");
+        process::exit(2);
+    }
+    let store = String::from_utf8(out.stdout).expect("nix-build printed a non-UTF-8 path");
+    Path::new(store.trim()).join("FV")
 }
 
 fn build_rootfs(root: &Path) -> io::Result<()> {
