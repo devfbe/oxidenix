@@ -132,6 +132,8 @@ const SYS_EVENTFD: u64 = 284;
 const SYS_EVENTFD2: u64 = 290;
 pub const SYS_PREADV: u64 = 295;
 pub const SYS_PWRITEV: u64 = 296;
+const SYS_PREADV2: u64 = 327;
+const SYS_PWRITEV2: u64 = 328;
 pub const SYS_GETDENTS64: u64 = 217;
 pub const SYS_FSTATFS: u64 = 138;
 
@@ -155,9 +157,33 @@ pub fn handle(s: &State) -> Option<i64> {
             let (file, flags) = lookup(a0)?;
             on_file(s.rax, file, flags, a1, a2, a3)
         }
+        SYS_PREADV2 | SYS_PWRITEV2 => {
+            let (file, flags) = lookup(a0)?;
+            rw2(s.rax == SYS_PWRITEV2, file, flags, a1, a2, a3 as i64, s.r9)
+        }
         _ => return None,
     };
     Some(result.unwrap_or_else(|e| -e))
+}
+
+/// preadv2/pwritev2: the vectored call at the file position (offset -1) or
+/// at the offset, with O_APPEND as the flags have it for this call
+/// (`vfs::rw::plan`). The server's files are memory, so RWF_DSYNC/RWF_SYNC
+/// have nothing to wait for.
+fn rw2(write: bool, file: File, flags: u32, iov: u64, count: u64, offset: i64, rwf: u64) -> Result<i64, i64> {
+    let allowed = if write { flags & O_ACCMODE != 0 } else { flags & O_ACCMODE != O_WRONLY };
+    if !allowed {
+        return Err(EBADF);
+    }
+    let plan = vfs::rw::plan(write, offset, rwf, flags & O_APPEND != 0)?;
+    let flags = if plan.append { flags | O_APPEND } else { flags & !O_APPEND };
+    let nr = match (write, plan.at) {
+        (false, None) => SYS_READV,
+        (true, None) => SYS_WRITEV,
+        (false, Some(_)) => SYS_PREADV,
+        (true, Some(_)) => SYS_PWRITEV,
+    };
+    on_file(nr, file, flags, iov, count, plan.at.unwrap_or(0))
 }
 
 fn on_file(nr: u64, file: File, flags: u32, a1: u64, a2: u64, a3: u64) -> Result<i64, i64> {

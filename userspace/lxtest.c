@@ -23,6 +23,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include "rwtest.h"
+
 #define PG 4096
 #define TEST_MAP 1500
 #define TEST_READ 1501
@@ -350,6 +352,16 @@ int main(void) {
     passed = legacy_calls() - l0 - base;
     printf("    (%ld of 100 /tmp file calls passed through)\n", passed);
     check("reads, writes, lseek and fstat of a /tmp file are the server's", passed == 0 && io && sb.st_size == 25 * 4096);
+    rw_flag_checks("/tmp/lxrw", check);
+    l0 = legacy_calls();
+    io = 1;
+    for (int i = 0; i < 25; i++) {
+        io &= rw_pwritev2(tf, "v2", (long)i * 4096, RWF_NOAPPEND) == 2;
+        io &= rw_preadv2(tf, cwd, 2, (long)i * 4096, 0) == 2;
+    }
+    passed = legacy_calls() - l0 - base;
+    printf("    (%ld of 50 preadv2/pwritev2 calls passed through)\n", passed);
+    check("preadv2 and pwritev2 of a /tmp file are the server's", passed == 0 && io);
     check("O_APPEND writes at the end", (fd = open("/tmp/lxfile", O_WRONLY | O_APPEND)) >= 0 && write(fd, "end", 3) == 3 && lseek(tf, 0, SEEK_END) == 25 * 4096 + 3);
     close(fd);
     char *map = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, tf, 0);

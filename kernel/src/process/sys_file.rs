@@ -64,19 +64,32 @@ pub fn write(fd: u64, buf: u64, len: u64) -> SysResult {
 }
 
 pub fn pread(fd: u64, buf: u64, len: u64, off: i64) -> SysResult {
+    // Only preadv2 takes -1 for the file position.
     if off < 0 {
         return Err(EINVAL);
     }
-    let f = file(fd)?;
-    Ok(uaccess::read_to_user(buf, len, true, |chunk, done| f.read_at(off as u64 + done, chunk))? as i64)
+    read_vecs(fd, &[(buf, len)], off, 0)
 }
 
 pub fn pwrite(fd: u64, buf: u64, len: u64, off: i64) -> SysResult {
     if off < 0 {
         return Err(EINVAL);
     }
-    let f = file(fd)?;
-    Ok(uaccess::write_from_user(buf, len, |chunk, done| f.write_at(off as u64 + done, chunk))? as i64)
+    write_vecs(fd, &[(buf, len)], off, 0)
+}
+
+pub fn preadv(fd: u64, iov: u64, count: u64, off: i64) -> SysResult {
+    if off < 0 {
+        return Err(EINVAL);
+    }
+    read_vecs(fd, &iovecs(iov, count)?, off, 0)
+}
+
+pub fn pwritev(fd: u64, iov: u64, count: u64, off: i64) -> SysResult {
+    if off < 0 {
+        return Err(EINVAL);
+    }
+    write_vecs(fd, &iovecs(iov, count)?, off, 0)
 }
 
 fn iovecs(iov: u64, count: u64) -> Result<Vec<(u64, u64)>, i64> {
@@ -86,38 +99,82 @@ fn iovecs(iov: u64, count: u64) -> Result<Vec<(u64, u64)>, i64> {
     (0..count).map(|i| uaccess::read::<(u64, u64)>(iov + i * 16)).collect()
 }
 
-pub fn readv(fd: u64, iov: u64, count: u64) -> SysResult {
-    let f = file(fd)?;
-    let mut total = 0;
-    for (base, len) in iovecs(iov, count)? {
-        let n = match read_file(&f, base, len) {
+/// Moves the buffers one after the other with `one(base, len, done)`
+/// (`done`: bytes moved before this buffer) until one comes up short; an
+/// error after some bytes ends the call with them.
+fn vectored(vecs: &[(u64, u64)], mut one: impl FnMut(u64, u64, u64) -> Result<usize, i64>) -> SysResult {
+    let mut total = 0u64;
+    for &(base, len) in vecs {
+        let n = match one(base, len, total) {
             Ok(n) => n,
             Err(e) if total == 0 => return Err(e),
             Err(_) => break,
         };
-        total += n as i64;
+        total += n as u64;
         if n < len as usize {
             break;
         }
     }
-    Ok(total)
+    Ok(total as i64)
+}
+
+pub fn readv(fd: u64, iov: u64, count: u64) -> SysResult {
+    let f = file(fd)?;
+    vectored(&iovecs(iov, count)?, |base, len, _| read_file(&f, base, len))
 }
 
 pub fn writev(fd: u64, iov: u64, count: u64) -> SysResult {
     let f = file(fd)?;
-    let mut total = 0;
-    for (base, len) in iovecs(iov, count)? {
-        let n = match write_file(&f, base, len) {
-            Ok(n) => n,
-            Err(e) if total == 0 => return Err(e),
-            Err(_) => break,
-        };
-        total += n as i64;
-        if n < len as usize {
-            break;
+    vectored(&iovecs(iov, count)?, |base, len, _| write_file(&f, base, len))
+}
+
+/// preadv2 (and the other reads at an offset): at `off`, or at the file
+/// position for -1 (`vfs::rw::plan`).
+pub fn preadv2(fd: u64, iov: u64, count: u64, off: i64, flags: u64) -> SysResult {
+    read_vecs(fd, &iovecs(iov, count)?, off, flags)
+}
+
+/// pwritev2 (and the other writes at an offset): at `off` or the file
+/// position, appending as O_APPEND and the flags say, durable before it
+/// returns with RWF_DSYNC/RWF_SYNC.
+pub fn pwritev2(fd: u64, iov: u64, count: u64, off: i64, flags: u64) -> SysResult {
+    write_vecs(fd, &iovecs(iov, count)?, off, flags)
+}
+
+fn read_vecs(fd: u64, vecs: &[(u64, u64)], off: i64, flags: u64) -> SysResult {
+    let f = file(fd)?;
+    // Access first, as Linux checks it before the flags.
+    if !f.readable() {
+        return Err(EBADF);
+    }
+    let plan = vfs::rw::plan(false, off, flags, f.appends())?;
+    match plan.at {
+        None => vectored(vecs, |base, len, _| read_file(&f, base, len)),
+        Some(at) => vectored(vecs, |base, len, done| {
+            uaccess::read_to_user(base, len, true, |chunk, within| f.read_at(at + done + within, chunk))
+        }),
+    }
+}
+
+fn write_vecs(fd: u64, vecs: &[(u64, u64)], off: i64, flags: u64) -> SysResult {
+    let f = file(fd)?;
+    if !f.writable() {
+        return Err(EBADF);
+    }
+    let plan = vfs::rw::plan(true, off, flags, f.appends())?;
+    let n = match plan.at {
+        None => vectored(vecs, |base, len, _| uaccess::write_from_user(base, len, |chunk, _| f.write_appending(chunk, plan.append)))?,
+        Some(_) if plan.append => vectored(vecs, |base, len, _| uaccess::write_from_user(base, len, |chunk, _| f.write_end(chunk)))?,
+        Some(at) => vectored(vecs, |base, len, done| {
+            uaccess::write_from_user(base, len, |chunk, within| f.write_at(at + done + within, chunk))
+        })?,
+    };
+    if plan.sync && n > 0 {
+        if let Some(inode) = f.inode() {
+            inode.sync()?;
         }
     }
-    Ok(total)
+    Ok(n)
 }
 
 pub fn openat(dirfd: u64, path: u64, flags: u64, mode: u64) -> SysResult {

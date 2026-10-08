@@ -1,6 +1,7 @@
 //! The pure parts of the Linux server's namespace (docs/design/linux-server.md,
-//! R6c): path arithmetic and the initramfs format. Kept apart from the
-//! server so they can be tested on the host.
+//! R6c): path arithmetic, the initramfs format and where reads and writes go.
+//! Kept apart from the server so they can be tested on the host (the kernel
+//! uses `rw` too, for the files it still serves).
 
 #![no_std]
 
@@ -8,6 +9,7 @@ extern crate alloc;
 
 pub mod cpio;
 pub mod path;
+pub mod rw;
 
 /// File type bits of a mode (stat's st_mode), as Linux has them.
 pub const S_IFMT: u32 = 0o170000;

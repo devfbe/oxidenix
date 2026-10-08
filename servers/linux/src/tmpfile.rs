@@ -79,8 +79,8 @@ pub fn call(nr: u64, f: &TmpOpen, flags: u32, a1: u64, a2: u64, a3: u64) -> Resu
         files::SYS_PREADV => f.read(&files::iovecs(a1, a2)?, signed(a3)?).map(|n| n as i64),
         files::SYS_WRITE => f.write_at_offset(&[(a1, a2)], flags & O_APPEND != 0),
         files::SYS_WRITEV => f.write_at_offset(&files::iovecs(a1, a2)?, flags & O_APPEND != 0),
-        files::SYS_PWRITE64 => f.write(&[(a1, a2)], signed(a3)?).map(|n| n as i64),
-        files::SYS_PWRITEV => f.write(&files::iovecs(a1, a2)?, signed(a3)?).map(|n| n as i64),
+        files::SYS_PWRITE64 => f.write_positional(&[(a1, a2)], signed(a3)?, flags & O_APPEND != 0),
+        files::SYS_PWRITEV => f.write_positional(&files::iovecs(a1, a2)?, signed(a3)?, flags & O_APPEND != 0),
         files::SYS_LSEEK => f.lseek(a1 as i64, a2),
         files::SYS_FSTAT => {
             usercopy::to_program(a1, &f.inode.stat())?;
@@ -160,6 +160,18 @@ impl TmpOpen {
             }
         }
         Ok(done)
+    }
+
+    /// pwrite/pwritev: at `offset`, or with O_APPEND (as on Linux) at the
+    /// end; the description's offset stays.
+    fn write_positional(&self, vecs: &[(u64, u64)], offset: u64, append: bool) -> Result<i64, i64> {
+        let n = if append {
+            let _append = self.inode.append.lock();
+            self.write(vecs, self.inode.size())?
+        } else {
+            self.write(vecs, offset)?
+        };
+        Ok(n as i64)
     }
 
     /// read/readv: at the description's offset, which moves by what was

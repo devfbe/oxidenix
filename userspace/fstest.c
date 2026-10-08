@@ -1,5 +1,6 @@
 /* Filesystem semantics on /data: symlinks and O_NOFOLLOW, unlinked files that stay open,
- * file size limits and the access modes of descriptors. */
+ * file size limits, the access modes of descriptors, and preadv2/pwritev2's flags. */
+#define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -7,6 +8,8 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+#include "rwtest.h"
 
 static int failures;
 
@@ -77,6 +80,9 @@ int main(void) {
     check("the file is unchanged", pread(fd, buf, 8, 0) == 4 && strcmp(buf, "data") == 0);
     close(fd);
     unlink(path);
+
+    snprintf(path, sizeof path, "%s/rw", dir);
+    rw_flag_checks(path, check);
     rmdir(dir);
 
     printf("fstest: %s\n", failures ? "FAILED" : "all passed");

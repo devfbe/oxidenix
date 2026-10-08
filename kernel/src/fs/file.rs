@@ -272,11 +272,34 @@ impl OpenFile {
     }
 
     pub fn write(&self, buf: &[u8]) -> Result<usize, i64> {
+        self.write_appending(buf, self.appends())
+    }
+
+    /// Whether writes go to the end (O_APPEND).
+    pub fn appends(&self) -> bool {
+        self.flags.load(Ordering::Relaxed) & O_APPEND != 0
+    }
+
+    /// Positional write to the end of a regular file (pwrite on an O_APPEND
+    /// descriptor, pwritev2's RWF_APPEND): no offset change.
+    pub fn write_end(&self, buf: &[u8]) -> Result<usize, i64> {
+        if !self.writable() {
+            return Err(EBADF);
+        }
+        match self.inode() {
+            Some(inode) if inode.device().is_none() => inode.write_at(inode.size(), buf),
+            _ => Err(ESPIPE),
+        }
+    }
+
+    /// write at the offset, which moves; to the end first if `append`
+    /// (O_APPEND, or pwritev2's flags at the offset -1).
+    pub fn write_appending(&self, buf: &[u8], append: bool) -> Result<usize, i64> {
         if !self.writable() {
             return Err(EBADF);
         }
         match &self.kind {
-            Kind::Inode(inode) => self.write_inode(inode, buf),
+            Kind::Inode(inode) => self.write_inode(inode, buf, append),
             Kind::PipeWrite(pipe) => self.write_pipe(pipe, buf),
             Kind::PipeRead(_) => Err(EBADF),
             Kind::Socket(s) => s.send(buf, None, self.nonblocking()),
@@ -312,13 +335,13 @@ impl OpenFile {
         }
     }
 
-    fn write_inode(&self, inode: &Inode, buf: &[u8]) -> Result<usize, i64> {
+    fn write_inode(&self, inode: &Inode, buf: &[u8], append: bool) -> Result<usize, i64> {
         match inode.device() {
             Some(Device::Console) => Ok(crate::drivers::tty::write(buf)),
             Some(_) => Ok(buf.len()),
             None => {
                 let mut off = self.offset.lock();
-                if self.flags.load(Ordering::Relaxed) & O_APPEND != 0 {
+                if append {
                     *off = inode.size();
                 }
                 let n = inode.write_at(*off, buf)?;
