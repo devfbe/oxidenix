@@ -192,6 +192,25 @@ int main(void) {
     errno = 0;
     check("a PROT_NONE page is EFAULT for the server's copy", syscall(TEST_USERCOPY, none) == -1 && errno == EFAULT);
     check("the server's copy reaches program memory", syscall(TEST_USERCOPY, fresh + PG) == 0 && memcmp(fresh + PG, "usercopy", 8) == 0);
+
+    /* Pipes are the server's (R6a): reads and writes pass nothing through,
+     * the kernel's table still holds their descriptors. */
+    int q[2];
+    check("pipe2 gives two descriptors", pipe2(q, O_CLOEXEC) == 0 && q[0] >= 0 && q[1] > q[0] && (fcntl(q[0], F_GETFD) & FD_CLOEXEC));
+    l0 = legacy_calls();
+    int same = 1;
+    for (int i = 0; i < 100; i++) {
+        char c = (char)i, d = 0;
+        write(q[1], &c, 1);
+        read(q[0], &d, 1);
+        same &= d == c;
+    }
+    passed = legacy_calls() - l0 - base;
+    printf("    (%ld of 200 pipe calls passed through)\n", passed);
+    check("pipe reads and writes are the server's", passed == 0 && same);
+    close(q[1]);
+    check("... end of file once the writer is closed", read(q[0], buf, 1) == 0);
+    close(q[0]);
     printf("lxtest: %s\n", failures ? "FAILED" : "all passed");
     return failures != 0;
 }

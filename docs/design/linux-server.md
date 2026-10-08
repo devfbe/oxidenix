@@ -182,7 +182,7 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
    call through (`kfd_lookup`) and handles the call itself if the descriptor is one of its
    files; when the last descriptor of a placeholder goes, the kernel tells the instance's
    service thread (the pager thread, whose wait becomes a wait for any event of the instance).
-   - **R6a — Placeholders and pipes**: the mechanism above, and pipes as the first kind
+   - **R6a — Placeholders and pipes** (done): the mechanism above, and pipes as the first kind
      (blocking with interruptible futexes, `O_NONBLOCK`, end of file and `EPIPE`/`SIGPIPE`).
    - **R6b — eventfd.**
    - **R6c — The namespace**: the VFS, tmpfs from the initramfs (an object of the image the

@@ -12,8 +12,10 @@
 
 extern crate alloc;
 
+mod files;
 mod heap;
 mod mm;
+mod pipe;
 mod sync;
 mod time;
 mod usercopy;
@@ -61,7 +63,7 @@ pub extern "C" fn _start(state: *mut State, role: u64) -> ! {
             continue;
         }
         let s = unsafe { &mut *state };
-        if let Some(result) = mm::handle(s).or_else(|| time::handle(s)) {
+        if let Some(result) = mm::handle(s).or_else(|| time::handle(s)).or_else(|| files::handle(s)) {
             s.rax = result as u64;
             continue;
         }
@@ -69,10 +71,21 @@ pub extern "C" fn _start(state: *mut State, role: u64) -> ! {
             TEST_MAP..=TEST_USERCOPY => s.rax = test(s.rax, s.rdi) as u64,
             nr if nr >= FIRST_NON_LINUX => s.rax = -ENOSYS as u64,
             _ => {
-                call0(SYS_LEGACY_SYSCALL);
+                // Server files the call closed for good go at once.
+                let mut closed = [0u64; 16];
+                let n = syscall(SYS_LEGACY_SYSCALL, [closed.as_mut_ptr() as u64, closed.len() as u64, 0, 0, 0, 0]);
+                for &id in closed.iter().take(n.max(0) as usize) {
+                    files::closed(id);
+                }
             }
         }
     }
+}
+
+/// A page request of an `EVENT_PAGE`.
+struct PagerRequest {
+    key: u64,
+    offset: u64,
 }
 
 /// The object of the last TEST_MAP (one per instance, as test calls go).
@@ -86,14 +99,21 @@ const TEST_KEY: u64 = 0x7e57;
 static TEST_FAIL_OBJECT: AtomicU64 = AtomicU64::new(0);
 static FAILED_ONCE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
-/// The pager thread: supplies the pages threads wait for. (So far the only
-/// paged object is the test's; its page n reads "paged n".)
+/// The instance's service thread (the pager thread): supplies the pages
+/// threads wait for, and drops the server's files whose last descriptor
+/// went. (So far the only paged objects are the tests'; page n of the
+/// first reads "paged n".)
 fn pager() -> ! {
     loop {
-        let mut request = PagerRequest::default();
-        if syscall(SYS_PAGER_WAIT, [&mut request as *mut PagerRequest as u64, 0, 0, 0, 0, 0]) < 0 {
+        let mut event = Event::default();
+        if syscall(SYS_EVENT_WAIT, [&mut event as *mut Event as u64, 0, 0, 0, 0, 0]) < 0 {
             continue;
         }
+        if event.kind == EVENT_CLOSED {
+            files::closed(event.a);
+            continue;
+        }
+        let request = PagerRequest { key: event.a, offset: event.b };
         if request.key == TEST_KEY + 2 {
             let handle = TEST_FAIL_OBJECT.load(Ordering::Acquire);
             if !FAILED_ONCE.swap(true, Ordering::Relaxed) {

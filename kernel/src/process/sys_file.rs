@@ -643,6 +643,10 @@ pub fn sendfile(out_fd: u64, in_fd: u64, offset: u64, count: u64) -> SysResult {
         return Err(EINVAL);
     }
     let (out, input) = (file(out_fd)?, file(in_fd)?);
+    // The Linux server's files (it handles sendfile with them itself).
+    if matches!(out.kind, Kind::Server(_)) || matches!(input.kind, Kind::Server(_)) {
+        return Err(EINVAL);
+    }
     let mut buf = vec![0u8; 4096];
     let mut total = 0;
     while total < count {

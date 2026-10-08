@@ -66,10 +66,13 @@ pub struct State {
 /// `restricted_enter()`: runs the program with the registers in the
 /// thread's `State` until it traps; returns the reason (`REASON_*`).
 pub const SYS_RESTRICTED_ENTER: u64 = 1010;
-/// `legacy_syscall()`: has the kernel's own Linux implementation carry out
-/// the system call in `State` (phase R1's pass-through, which goes away as
-/// the server takes the calls over); its result and any signal frame land
-/// in `State`.
+/// `legacy_syscall(closed, cap) -> n`: has the kernel's own Linux
+/// implementation carry out the system call in `State` (phase R1's
+/// pass-through, which goes away as the server takes the calls over); its
+/// result and any signal frame land in `State`. The ids of server files
+/// whose last descriptor the call closed (up to `cap` of them) are stored
+/// at `closed` (u64s in the server's memory) and counted in `n`, for the
+/// server to drop them at once; more go to the service thread as events.
 pub const SYS_LEGACY_SYSCALL: u64 = 1011;
 
 /// The program executed `syscall`; `State::rax` holds its number.
@@ -156,10 +159,12 @@ pub const TEST_MAP_AT: u64 = 1504;
 /// `mo_create_paged(pages, key) -> handle`: a memory object whose pages
 /// the server supplies; requests name it by `key`.
 pub const SYS_MO_CREATE_PAGED: u64 = 1019;
-/// `pager_wait(request) -> 0`: the pager thread waits for the next page
-/// someone needs and gets it as a `PagerRequest`. When the instance's last
-/// program is gone, the pager's process ends here.
-pub const SYS_PAGER_WAIT: u64 = 1020;
+/// `event_wait(event) -> 0`: the instance's service thread (the pager
+/// thread) waits for the next event of the instance and gets it as an
+/// `Event`: a page someone needs, or the last descriptor of one of the
+/// server's files gone. When the instance's last program is gone, the
+/// service thread's process ends here.
+pub const SYS_EVENT_WAIT: u64 = 1020;
 /// `mo_supply(handle, offset, buf, len)`: the page at `offset` of a paged
 /// object, from `len` bytes at `buf` (the rest zero), unless it is there
 /// already; wakes whoever waits for it.
@@ -171,11 +176,16 @@ pub const SYS_MO_FAIL: u64 = 1022;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug)]
-pub struct PagerRequest {
-    pub key: u64,
-    /// Byte offset of the page in the object.
-    pub offset: u64,
+pub struct Event {
+    pub kind: u64,
+    /// `EVENT_PAGE`: the object's key; `EVENT_CLOSED`: the file's id.
+    pub a: u64,
+    /// `EVENT_PAGE`: byte offset of the page in the object.
+    pub b: u64,
 }
+
+pub const EVENT_PAGE: u64 = 1;
+pub const EVENT_CLOSED: u64 = 2;
 
 /// A server thread starts with its role in `rsi` (and its `State` in
 /// `rdi`): it serves a program's thread, or it is the instance's pager.
@@ -243,3 +253,31 @@ pub const SYS_YIELD: u64 = 1032;
 /// `(dst)`: writes the 8 bytes "usercopy" to program memory at `dst` with
 /// the server's copy routine; 0 or -EFAULT.
 pub const TEST_USERCOPY: u64 = 1511;
+
+// The server's files in the kernel's descriptor table (phase R6): until the
+// table is the server's, a file the server implements is a placeholder
+// there, so dup, close, fork, exec's close-on-exec and poll/epoll keep
+// working; the server handles every other operation on it.
+
+/// `kfd_install(id, flags, ready) -> fd`: a new descriptor (the lowest
+/// free one) for the server's file `id`, with open flags `flags`
+/// (O_ACCMODE, O_NONBLOCK, O_APPEND; O_CLOEXEC for the descriptor) and
+/// poll readiness `ready`. When its last descriptor goes, `EVENT_CLOSED`.
+pub const SYS_KFD_INSTALL: u64 = 1034;
+/// `kfd_lookup(fd, flags) -> id`: the server's file behind descriptor
+/// `fd` (0: a file of the kernel's; EBADF), its current open flags stored
+/// at `flags` (a u32 in the server's memory) unless 0.
+pub const SYS_KFD_LOOKUP: u64 = 1035;
+/// `kfd_ready(id, ready)`: the readiness of the server's file `id` for
+/// poll, select and epoll (POLLIN, POLLOUT, POLLERR, POLLHUP); wakes who
+/// waits for it.
+pub const SYS_KFD_READY: u64 = 1036;
+/// `kfd_close(fd)`: closes a descriptor of the calling process.
+pub const SYS_KFD_CLOSE: u64 = 1037;
+/// `kfd_read(fd, buf, len) -> n`: reads a file of the kernel's (at its
+/// offset) into the server's memory, as read(2) would (for sendfile into
+/// the server's files).
+pub const SYS_KFD_READ: u64 = 1038;
+/// `kfd_write(fd, buf, len) -> n`: writes the server's memory to a file of
+/// the kernel's, as write(2) would.
+pub const SYS_KFD_WRITE: u64 = 1039;

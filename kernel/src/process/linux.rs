@@ -91,6 +91,8 @@ pub struct Instance {
     /// The server's copy instruction and where its fault resumes (see
     /// `SYS_SET_USERCOPY`), once set.
     usercopy: spin::Once<(u64, u64)>,
+    /// The placeholders of the server's files, by id, for readiness reports.
+    files: spin::Mutex<BTreeMap<u64, alloc::sync::Weak<crate::fs::file::ServerFile>>>,
     /// Pages of paged objects that threads wait for, for the pager thread.
     pager: spin::Mutex<PagerQueue>,
     /// Address spaces of the tree's programs: when the last goes, so does
@@ -101,11 +103,12 @@ pub struct Instance {
     heap_pages: core::sync::atomic::AtomicU64,
 }
 
-/// Pages wanted from the pager. A request is queued once until the pager
-/// takes it; after that, a thread that still waits (the page did not come,
-/// or failed) asks again.
+/// Events for the instance's service thread (the pager thread): pages
+/// wanted from it, and server files whose last descriptor went. A page
+/// request is queued once until the pager takes it; after that, a thread
+/// that still waits (the page did not come, or failed) asks again.
 struct PagerQueue {
-    requests: alloc::collections::VecDeque<(u64, u64)>,
+    requests: alloc::collections::VecDeque<Event>,
     queued: alloc::collections::BTreeSet<(u64, u64)>,
     /// The tree has no program left: the pager's process ends.
     closing: bool,
@@ -159,6 +162,7 @@ impl Instance {
             slots: spin::Mutex::new(Slots { next: 0, free: Vec::new(), states: BTreeMap::new() }),
             handles: spin::Mutex::new(Handles { next: 1, objects: BTreeMap::new() }),
             usercopy: spin::Once::new(),
+            files: spin::Mutex::new(BTreeMap::new()),
             pager: spin::Mutex::new(PagerQueue {
                 requests: alloc::collections::VecDeque::new(),
                 queued: alloc::collections::BTreeSet::new(),
@@ -416,7 +420,7 @@ impl crate::fs::cache::Pager for Instance {
             return false;
         }
         if q.queued.insert((key, index)) {
-            q.requests.push_back((key, index));
+            q.requests.push_back(Event { kind: EVENT_PAGE, a: key, b: index * PAGE });
             drop(q);
             super::wakeup(self.pager_chan());
         }
@@ -425,6 +429,39 @@ impl crate::fs::cache::Pager for Instance {
 
     fn wait_chan(&self) -> usize {
         self.answer_chan()
+    }
+}
+
+impl crate::fs::file::ServerFiles for Instance {
+    fn closed(&self, id: u64) {
+        self.files.lock().remove(&id);
+        // Closed by this instance's thread in a pass-through call: the
+        // server learns it when the call returns (close is then complete
+        // for the other end, as with the kernel's own pipes).
+        let mine = with_current(|p| match p.linux.as_mut() {
+            Some(l) if l.in_legacy && core::ptr::eq(Arc::as_ptr(&l.instance), self) => {
+                l.closed_now.push(id);
+                true
+            }
+            _ => false,
+        });
+        if !mine {
+            self.queue_closed(id);
+        }
+    }
+}
+
+impl Instance {
+    /// Tells the service thread that the server file `id` lost its last
+    /// descriptor.
+    fn queue_closed(&self, id: u64) {
+        let mut q = self.pager.lock();
+        if q.dead || q.closing {
+            return;
+        }
+        q.requests.push_back(Event { kind: EVENT_CLOSED, a: id, b: 0 });
+        drop(q);
+        super::wakeup(self.pager_chan());
     }
 }
 
@@ -455,6 +492,9 @@ pub struct LinuxThread {
     /// it itself: signal delivery after it restarts it as the kernel's
     /// own handling would (taken by a pass-through, which delivers itself).
     trap_nr: Option<u64>,
+    /// Server files whose last descriptor this thread's pass-through call
+    /// closed: handed to the server when the call returns.
+    closed_now: Vec<u64>,
     /// The server's registers while the program runs.
     normal: Frame,
 }
@@ -466,7 +506,7 @@ impl LinuxThread {
     pub fn new(instance: Arc<Instance>, program: &Frame) -> Result<(LinuxThread, Frame), i64> {
         let (slot, state) = instance.thread()?;
         let thread =
-            LinuxThread { instance, slot, state, restricted: false, pager: false, in_legacy: false, trap_nr: None, normal: Frame::default() };
+            LinuxThread { instance, slot, state, restricted: false, pager: false, in_legacy: false, trap_nr: None, closed_now: Vec::new(), normal: Frame::default() };
         save(program, thread.state());
         let start = thread.start(ROLE_PROGRAM);
         Ok((thread, start))
@@ -476,7 +516,7 @@ impl LinuxThread {
     pub fn pager(instance: Arc<Instance>) -> Result<(LinuxThread, Frame), i64> {
         let (slot, state) = instance.thread()?;
         let thread =
-            LinuxThread { instance, slot, state, restricted: false, pager: true, in_legacy: false, trap_nr: None, normal: Frame::default() };
+            LinuxThread { instance, slot, state, restricted: false, pager: true, in_legacy: false, trap_nr: None, closed_now: Vec::new(), normal: Frame::default() };
         let start = thread.start(ROLE_PAGER);
         Ok((thread, start))
     }
@@ -504,6 +544,10 @@ impl LinuxThread {
 
 impl Drop for LinuxThread {
     fn drop(&mut self) {
+        // Closed in a call that never returned (the thread exited in it).
+        for id in core::mem::take(&mut self.closed_now) {
+            self.instance.queue_closed(id);
+        }
         if self.pager {
             self.instance.pager_gone();
         }
@@ -654,7 +698,51 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             let object = PageCache::paged(pages, pager, a[1])?;
             Ok(instance.insert(Object::Memory(object))? as i64)
         }
-        SYS_PAGER_WAIT => pager_wait(&instance, a[0]),
+        SYS_EVENT_WAIT => event_wait(&instance, a[0]),
+        SYS_KFD_INSTALL => {
+            use crate::fs::file::{OpenFile, ServerFile, Kind, O_ACCMODE, O_APPEND, O_CLOEXEC, O_NONBLOCK};
+            let (id, flags, ready) = (a[0], a[1] as u32, a[2] as i16);
+            if id == 0 || flags & !(O_ACCMODE | O_NONBLOCK | O_APPEND | O_CLOEXEC) != 0 {
+                return Err(EINVAL);
+            }
+            let owner: alloc::sync::Weak<dyn crate::fs::file::ServerFiles> = Arc::downgrade(&instance) as _;
+            let placeholder = ServerFile::new(id, owner, ready);
+            instance.files.lock().insert(id, Arc::downgrade(&placeholder));
+            let file = OpenFile::new(Kind::Server(placeholder), flags, None);
+            with_current(|p| p.alloc_fd(file, flags & O_CLOEXEC != 0, 0))
+        }
+        SYS_KFD_LOOKUP => {
+            let file = with_current(|p| p.file(a[0]))?;
+            let crate::fs::file::Kind::Server(s) = &file.kind else { return Ok(0) };
+            if a[1] != 0 {
+                let flags = file.flags.load(core::sync::atomic::Ordering::Relaxed);
+                super::uaccess::copy_to_server(a[1], &flags.to_le_bytes())?;
+            }
+            Ok(s.id as i64)
+        }
+        SYS_KFD_READY => {
+            let file = instance.files.lock().get(&a[0]).and_then(|w| w.upgrade()).ok_or(ENOENT)?;
+            file.set_ready(a[1] as i16);
+            Ok(0)
+        }
+        SYS_KFD_READ | SYS_KFD_WRITE => {
+            let file = with_current(|p| p.file(a[0]))?;
+            let (buf, len) = (a[1], a[2].min(64 * 1024) as usize);
+            let mut data = alloc::vec![0u8; len];
+            if nr == SYS_KFD_READ {
+                let n = file.read(&mut data)?;
+                super::uaccess::copy_to_server(buf, &data[..n])?;
+                Ok(n as i64)
+            } else {
+                super::uaccess::copy_from_server(buf, &mut data)?;
+                Ok(file.write(&data)? as i64)
+            }
+        }
+        SYS_KFD_CLOSE => {
+            let gone = super::current_files()?.take(a[0]).ok_or(EBADF)?;
+            drop(gone);
+            Ok(0)
+        }
         SYS_MO_SUPPLY => {
             let (handle, offset, buf, len) = (a[0], a[1], a[2], a[3]);
             let cache = instance.memory(handle)?;
@@ -801,15 +889,17 @@ pub fn server_fault(rip: u64) -> Option<u64> {
     (rip == insn).then_some(fixup)
 }
 
-/// legacy_syscall() from the server: the kernel's Linux implementation
-/// carries out the system call in `State`, which then holds the result (or
-/// the new program after execve, or a signal frame).
+/// legacy_syscall(closed, cap) from the server: the kernel's Linux
+/// implementation carries out the system call in `State`, which then holds
+/// the result (or the new program after execve, or a signal frame); the
+/// server files the call closed for good go to `closed` (see
+/// `SYS_LEGACY_SYSCALL`). Returns how many.
 ///
 /// The call runs in the program's view, as it would without the server:
 /// the server's memory is then out of reach of the kernel's Linux code
 /// altogether, not only because every user pointer is checked against
 /// 64 TiB (`uaccess`).
-pub fn legacy() -> Result<(), i64> {
+pub fn legacy(closed: u64, cap: u64) -> Result<u64, i64> {
     let state = with_current(|p| {
         let l = p.linux.as_mut().filter(|l| !l.pager)?;
         // The pass-through delivers signals itself.
@@ -823,12 +913,23 @@ pub fn legacy() -> Result<(), i64> {
     set_legacy(true);
     super::syscall::dispatch_linux(&mut program);
     set_legacy(false);
-    with_current(|p| {
-        if let Some(l) = p.linux.as_ref() {
+    let (ids, instance) = with_current(|p| match p.linux.as_mut() {
+        Some(l) => {
             save(&program, l.state());
+            (core::mem::take(&mut l.closed_now), Some(l.instance.clone()))
         }
+        None => (Vec::new(), None),
     });
-    Ok(())
+    let mut told = 0;
+    for id in ids {
+        let fits = told < cap && super::uaccess::copy_to_server(closed + told * 8, &id.to_le_bytes()).is_ok();
+        if fits {
+            told += 1;
+        } else if let Some(i) = &instance {
+            i.queue_closed(id);
+        }
+    }
+    Ok(told)
 }
 
 /// Enters or leaves a legacy call: the view follows.
@@ -843,10 +944,10 @@ fn set_legacy(on: bool) {
     });
 }
 
-/// pager_wait(request): the next page a thread waits for, written to the
-/// server's memory at `out`. The pager's process ends here when the tree
-/// has no program left.
-fn pager_wait(instance: &Arc<Instance>, out: u64) -> SysResult {
+/// event_wait(event): the instance's next event (a page a thread waits for,
+/// a server file closed), written to the server's memory at `out`. The
+/// service thread's process ends here when the tree has no program left.
+fn event_wait(instance: &Arc<Instance>, out: u64) -> SysResult {
     if !with_current(|p| p.linux.as_ref().is_some_and(|l| l.pager)) {
         return Err(EPERM);
     }
@@ -854,9 +955,11 @@ fn pager_wait(instance: &Arc<Instance>, out: u64) -> SysResult {
         let next = x86_64::instructions::interrupts::without_interrupts(|| {
             let wait = super::sched::prepare_to_wait(instance.pager_chan());
             let mut q = instance.pager.lock();
-            if let Some(r) = q.requests.pop_front() {
-                q.queued.remove(&r);
-                return Some(Some(r));
+            if let Some(e) = q.requests.pop_front() {
+                if e.kind == EVENT_PAGE {
+                    q.queued.remove(&(e.a, e.b / PAGE));
+                }
+                return Some(Some(e));
             }
             if q.closing {
                 return Some(None);
@@ -866,16 +969,14 @@ fn pager_wait(instance: &Arc<Instance>, out: u64) -> SysResult {
             None
         });
         match next {
-            Some(Some((key, index))) => {
-                let request = PagerRequest { key, offset: index * PAGE };
-                let bytes = unsafe {
-                    core::slice::from_raw_parts(&request as *const PagerRequest as *const u8, core::mem::size_of::<PagerRequest>())
-                };
+            Some(Some(event)) => {
+                let bytes =
+                    unsafe { core::slice::from_raw_parts(&event as *const Event as *const u8, core::mem::size_of::<Event>()) };
                 if let Err(e) = super::uaccess::copy_to_server(out, bytes) {
-                    // Still wanted: next time.
+                    // Still due: next time.
                     let mut q = instance.pager.lock();
-                    if q.queued.insert((key, index)) {
-                        q.requests.push_front((key, index));
+                    if event.kind != EVENT_PAGE || q.queued.insert((event.a, event.b / PAGE)) {
+                        q.requests.push_front(event);
                     }
                     return Err(e);
                 }

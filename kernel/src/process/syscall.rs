@@ -171,7 +171,7 @@ extern "sysv64" fn dispatch(f: &mut Frame) {
                     }
                     Err(e) => Err(e),
                 },
-                restricted::SYS_LEGACY_SYSCALL => super::linux::legacy().map(|_| Some(0)),
+                restricted::SYS_LEGACY_SYSCALL => super::linux::legacy(f.rdi, f.rsi).map(Some),
                 nr => super::linux::server_call(nr, [f.rdi, f.rsi, f.rdx, f.r10, f.r8, f.r9]).map(|v| Some(v as u64)),
             };
             match result {

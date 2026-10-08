@@ -74,6 +74,50 @@ impl EventFd {
     }
 }
 
+/// The owner of placeholder files (a Linux server instance): told when
+/// the last descriptor of one goes.
+pub trait ServerFiles: Send + Sync {
+    fn closed(&self, id: u64);
+}
+
+/// A file the Linux server implements, as the kernel's descriptor table
+/// holds it (a placeholder, see docs/design/linux-server.md, R6): the id of
+/// the server's object and the readiness the server reports, for poll,
+/// select and epoll. The server handles every other operation itself.
+pub struct ServerFile {
+    pub id: u64,
+    owner: Weak<dyn ServerFiles>,
+    ready: AtomicU32,
+}
+
+impl ServerFile {
+    pub fn new(id: u64, owner: Weak<dyn ServerFiles>, ready: i16) -> Arc<ServerFile> {
+        Arc::new(ServerFile { id, owner, ready: AtomicU32::new(ready as u16 as u32) })
+    }
+
+    /// The server's readiness report: wakes who polls the file.
+    pub fn set_ready(&self, ready: i16) {
+        self.ready.store(ready as u16 as u32, Ordering::Release);
+        wakeup(self.chan());
+    }
+
+    fn ready(&self) -> i16 {
+        self.ready.load(Ordering::Acquire) as u16 as i16
+    }
+
+    fn chan(&self) -> usize {
+        self as *const ServerFile as usize
+    }
+}
+
+impl Drop for ServerFile {
+    fn drop(&mut self) {
+        if let Some(owner) = self.owner.upgrade() {
+            owner.closed(self.id);
+        }
+    }
+}
+
 pub enum Kind {
     Inode(Arc<Inode>),
     PipeRead(Arc<Pipe>),
@@ -81,6 +125,8 @@ pub enum Kind {
     Socket(crate::net::Socket),
     EventFd(Arc<EventFd>),
     Epoll(Arc<Epoll>),
+    /// A file of the Linux server (a placeholder).
+    Server(Arc<ServerFile>),
 }
 
 /// Open file description; several descriptors may share it (dup, fork,
@@ -210,7 +256,8 @@ impl OpenFile {
             Kind::PipeWrite(_) => Err(EBADF),
             Kind::Socket(s) => s.recv(buf, self.nonblocking(), false).map(|(n, _)| n),
             Kind::EventFd(e) => self.read_eventfd(e, buf),
-            Kind::Epoll(_) => Err(EINVAL),
+            // The server reads its files itself.
+            Kind::Epoll(_) | Kind::Server(_) => Err(EINVAL),
         }
     }
 
@@ -224,7 +271,7 @@ impl OpenFile {
             Kind::PipeRead(_) => Err(EBADF),
             Kind::Socket(s) => s.send(buf, None, self.nonblocking()),
             Kind::EventFd(e) => self.write_eventfd(e, buf),
-            Kind::Epoll(_) => Err(EINVAL),
+            Kind::Epoll(_) | Kind::Server(_) => Err(EINVAL),
         }
     }
 
@@ -449,6 +496,7 @@ impl OpenFile {
                     0
                 }
             }
+            Kind::Server(s) => s.ready(),
         };
         ready & (events | POLLERR | POLLHUP)
     }
@@ -463,6 +511,7 @@ impl OpenFile {
             Kind::PipeWrite(p) => PollSource::Chan(p.write_chan()),
             Kind::EventFd(e) => PollSource::Chan(e.chan()),
             Kind::Epoll(e) => PollSource::Epoll(e.clone()),
+            Kind::Server(s) => PollSource::Chan(s.chan()),
             // netd announces readiness changes.
             Kind::Socket(s) => s.poll_source(),
         }
@@ -487,7 +536,8 @@ impl Drop for OpenFile {
                 p.writers.fetch_sub(1, Ordering::Relaxed);
                 wakeup(p.read_chan());
             }
-            Kind::Inode(_) | Kind::Socket(_) | Kind::EventFd(_) | Kind::Epoll(_) => {}
+            // A server file tells its owner as its last reference goes.
+            Kind::Inode(_) | Kind::Socket(_) | Kind::EventFd(_) | Kind::Epoll(_) | Kind::Server(_) => {}
         }
     }
 }
