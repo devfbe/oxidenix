@@ -20,7 +20,10 @@ An AI research project; see README.md.
 - `cargo` lives in `~/.cargo/bin`; a fresh (background) shell may lack it, so
   `export PATH=$HOME/.cargo/bin:$PATH`, or run commands in the dev shell
   (`nix develop --command ...`, `flake.nix`; direnv loads it via `.envrc`), which has
-  rustup, QEMU, e2fsprogs, Python, gh and jq, `OXIDENIX_OVMF` and the pinned `NIX_PATH`.
+  rustup, QEMU, e2fsprogs, Python, gh and jq, `OXIDENIX_OVMF` and the pinned `NIX_PATH`, and the
+  Linux and POSIX man pages: check Linux semantics with `man 2 <call>` before implementing one.
+- The Rust nightly is pinned by date in `rust-toolchain.toml`; update the date deliberately and
+  run all tests.
 - rust-analyzer (in `rust-toolchain.toml`, used by the LSP) works on the whole workspace
   without extra configuration: prefer it for definitions, references and callers over grep.
 - All Nix packages (musl toolchain, Bash, BusyBox, OVMF, e2fsprogs) come from the nixpkgs pinned

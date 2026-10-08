@@ -25,10 +25,18 @@
           gh
           git
           jq
+          # Linux semantics to check against: `man 2 openat`, `man 7 epoll`.
+          man
+          man-pages
+          man-pages-posix
         ];
 
         # The builder uses this firmware instead of building OVMF itself.
         OXIDENIX_OVMF = "${pkgs.OVMF.fd}/FV";
+
+        # The Linux and POSIX pages have no binaries, so man does not find
+        # them through PATH (the trailing colon keeps the system's pages).
+        MANPATH = "${pkgs.man-pages}/share/man:${pkgs.man-pages-posix}/share/man:";
 
         shellHook = ''
           # Manual Nix calls (nix-shell -p ...) use the same pinned nixpkgs.

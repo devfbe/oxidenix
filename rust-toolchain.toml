@@ -1,3 +1,5 @@
+# A dated nightly, so CI and local builds use the same compiler. To update:
+# change the date, run the self-tests (UEFI and BIOS) and the host tests.
 [toolchain]
-channel = "nightly"
+channel = "nightly-2026-10-05"
 components = ["rust-src", "llvm-tools-preview", "rust-analyzer"]

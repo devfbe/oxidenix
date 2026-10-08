@@ -95,10 +95,12 @@ Its [commit history](#development-history) records every step.
 
 `nix develop` (or [direnv](https://direnv.net/) with the checked-in `.envrc`: `direnv allow` once)
 opens a shell with everything below. Its packages come from the same pinned nixpkgs as the
-builder and CI, plus rustup, QEMU, e2fsprogs, Python, gh and jq. The shell also points
+builder and CI: rustup, QEMU, e2fsprogs, Python, gh and jq, and the Linux and POSIX man pages
+(`man 2 openat`). The shell also points
 `OXIDENIX_OVMF` at the firmware and `NIX_PATH` at the pin. Without it you need:
 
-- **Rust nightly** with `rust-src`, `llvm-tools-preview` and `rust-analyzer` (named in `rust-toolchain.toml`).
+- **Rust nightly**, a dated one pinned in `rust-toolchain.toml` with `rust-src`, `llvm-tools-preview` and
+  `rust-analyzer` (rustup installs it on first use).
 - **QEMU** (`qemu-system-x86_64`). With KVM (`/dev/kvm` accessible) the builder runs the
   guest with hardware virtualization: oxidenix boots in about 2 s; without it QEMU falls back
   to emulation (about 8 s).
