@@ -45,6 +45,10 @@ fn main() {
         eprintln!("Usage: builder <kernel-elf-path> [qemu-args...]");
         process::exit(1);
     }
+    // Every Nix call below (userspace/build.sh, mke2fs, OVMF) takes its
+    // packages from the pinned nixpkgs, as CI does.
+    let pin = Path::new(env!("CARGO_MANIFEST_DIR")).join("../nix/nixpkgs.nix");
+    std::env::set_var("NIX_PATH", format!("nixpkgs={}", pin.canonicalize().expect("nix/nixpkgs.nix is missing").display()));
 
     let kernel_path = Path::new(&args[1]);
     let img_path = kernel_path.with_extension("img");

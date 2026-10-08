@@ -119,11 +119,11 @@ module comment, and the public types it defines. Where to start for common tasks
 
 ## Host builder
 
-- `builder/src/main.rs` (264) The host-side builder (`cargo run` in kernel/ runs it): builds the root filesystem and its cpio initramfs, the data disk and the UEFI or BIOS boot image, then starts QEMU.
+- `builder/src/main.rs` (266) The host-side builder (`cargo run` in kernel/ runs it): builds the root filesystem and its cpio initramfs, the data disk and the UEFI or BIOS boot image, then starts QEMU.
 
 ## User-space programs and tests
 
-- `userspace/build.sh` (35) Builds all userspace/*.c as static musl binaries into $1 (the rootfs's bin directory), adds Bash and BusyBox with its applet symlinks, and the servers/* programs into the sibling sbin directory.
+- `userspace/build.sh` (32) Builds all userspace/*.c as static musl binaries into $1 (the rootfs's bin directory), adds Bash and BusyBox with its applet symlinks, and the servers/* programs into the sibling sbin directory.
 - `userspace/cachetest.c` (114) The page cache of files on a filesystem server (/data): repeated reads come from memory, writes and truncation stay coherent with cached pages and mappings, programs run from the disk, and cached pages give way when...
 - `userspace/cowtest.c` (68) Copy-on-write after fork: parent and child see their own writes to heap and data, brk stays clear of mappings, and shared read-only frames cannot be written.
 - `userspace/epolltest.c` (245) epoll: interest lists with level- and edge-triggered readiness, the event loop interface of libuv and therefore Node.js.
@@ -152,7 +152,8 @@ module comment, and the public types it defines. Where to start for common tasks
 
 ## Scripts
 
-- `scripts/bench.sh` (74) Runs the I/O benchmarks (userspace/iobench.c) in oxidenix under QEMU/KVM with the fixed configuration of the builder (q35, 4 CPUs, 256 MiB, virtio-blk, virtio-net, user networking) on a fresh data disk, and writes...
+- `scripts/bench.sh` (75) Runs the I/O benchmarks (userspace/iobench.c) in oxidenix under QEMU/KVM with the fixed configuration of the builder (q35, 4 CPUs, 256 MiB, virtio-blk, virtio-net, user networking) on a fresh data disk, and writes...
+- `scripts/codemap.py` (157) Generates docs/codemap.md: every source file with its size and the first sentence of its module comment, the public types of each Rust file, the kernel ABI of the Linux server (crates/restricted) with the file that...
 
 ## Root filesystem scripts
 

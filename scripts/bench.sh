@@ -11,6 +11,8 @@
 #                                    scripts/linux-guest.nix)
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# The pinned nixpkgs (nix/nixpkgs.nix), for the Linux guest and the tools.
+export NIX_PATH="nixpkgs=$ROOT/nix/nixpkgs.nix"
 LINUX=""
 if [ "${1:-}" = --linux ]; then
     LINUX=1

@@ -5,6 +5,9 @@
 set -euo pipefail
 OUT="$1"
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# The pinned nixpkgs (nix/nixpkgs.nix): the same musl, Bash and BusyBox
+# locally and in CI.
+export NIX_PATH="nixpkgs=$SRC/../nix/nixpkgs.nix"
 mkdir -p "$OUT"
 CC=x86_64-unknown-linux-musl-cc
 cmds=""
@@ -12,11 +15,7 @@ for f in "$SRC"/*.c; do
     cmds+="$CC -static -O2 -s -o '$OUT/$(basename "$f" .c)' '$f' && "
 done
 cmds+="true"
-if command -v "$CC" >/dev/null; then
-    bash -c "$cmds"
-else
-    nix-shell -p pkgsStatic.stdenv.cc --run "$cmds"
-fi
+nix-shell -p pkgsStatic.stdenv.cc --run "$cmds"
 
 ROOT="$(dirname "$OUT")"
 mkdir -p "$ROOT/sbin"

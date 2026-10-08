@@ -18,6 +18,10 @@ An AI research project; see README.md.
 - `cd kernel && cargo run` builds the rootfs, the disk image and starts QEMU
   (extra arguments after `--` are passed to QEMU).
 - `cargo` lives in `~/.cargo/bin`.
+- All Nix packages (musl toolchain, Bash, BusyBox, OVMF, e2fsprogs) come from the nixpkgs pinned
+  in `nix/nixpkgs.nix`; the builder, `userspace/build.sh`, `scripts/bench.sh` and CI set
+  `NIX_PATH=nixpkgs=nix/nixpkgs.nix`. Use the same for manual Nix calls (the host ext2 test:
+  `NIX_PATH=nixpkgs=$PWD/nix/nixpkgs.nix nix-shell -p e2fsprogs --run ...`).
 - `cd kernel && OXIDENIX_TEST=1 cargo run` runs all self-tests (`/etc/runtests.sh`) and
   exits QEMU with 1 on success, 3 on failure; CI runs the same on every push.
 - `nix-shell -p e2fsprogs --run "cargo test -p ext2fs"` (workspace root) tests the ext2
