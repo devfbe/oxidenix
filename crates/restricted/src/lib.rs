@@ -480,6 +480,9 @@ pub const TEST_CHANNEL: u64 = 1514;
 /// image and metadata, 2 writes, a flush and the file read back
 /// (`/data/ringtest.bin` stays for the caller to read through the kernel
 /// and remove), 3 malformed requests, 4 requests in flight, 5 a grant
-/// revoked under diskfs and a client gone with requests in flight. 0 if
+/// revoked under diskfs and a client gone with requests in flight, 6 holds
+/// across channels, 7 a stalled write with every operation slot busy, 8
+/// requests left waiting for room in the completion ring (the caller
+/// checks that diskfs sleeps), 9 their completions taken. 0 if
 /// every check held, else the negative number of the first that failed.
 pub const TEST_DISKRING: u64 = 1515;

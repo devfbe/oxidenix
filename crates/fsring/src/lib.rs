@@ -24,7 +24,7 @@
 //! | `RENAME` | `object` old directory, buffer = old name, `arg` = [new directory, new name length]; the new name follows the old one | as `UNLINK` (an entry replaced) |
 //! | `TRUNCATE` | `object` inode, `offset` = new size | 0 |
 //! | `READDIR` | `object` directory, `offset` = cursor (0: from the start), buffer for entries | bytes of entries (`dirents`), v0 = next cursor (0: done) |
-//! | `RELEASE` | `object` inode whose last link went | 0: it and its blocks are freed |
+//! | `RELEASE` | `object` inode | 0: the client holds it no more (see "Holds") |
 //! | `READLINK` | `object` symlink, buffer for the target | length of the target |
 //! | `SETPERM` | `object` inode, `arg[0]` = permission bits | 0 |
 //! | `STATFS` | - | 0, `Usage` in v0..v3 |
@@ -46,6 +46,21 @@
 //! disk. Other operations commit their own metadata changes before they
 //! complete, as the IPC protocol does (`fsproto`), and with it what
 //! completed writes changed (also data first).
+//!
+//! **Holds.** A client holds every inode it named in a request or got
+//! back from `LOOKUP`, `CREATE`, `UNLINK` or `RENAME`, until it sends
+//! `RELEASE` for it or its channel goes. An inode whose last link went is
+//! freed (with its blocks) only when no client holds it, the kernel's IPC
+//! client included: one client's `RELEASE` never frees what another still
+//! uses. (A client releases what it no longer caches; until then an
+//! unlinked inode stays allocated.)
+//!
+//! **Room.** The service takes a request only when the completion ring
+//! has room for its completion; a request that waits for room does not
+//! keep the service busy. A client that took completions while requests
+//! of its were still waiting in the submission ring rings the submission
+//! doorbell (`Producer::ring_doorbell`, a no-op unless the service sleeps),
+//! or they wait until its next request.
 //!
 //! **Grants.** The service keeps what it learnt of a grant (its size, the
 //! device addresses of its pages) until `FORGET`: the client sends it

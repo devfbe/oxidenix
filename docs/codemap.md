@@ -71,7 +71,7 @@ module comment, and the public types it defines. Where to start for common tasks
 ## Linux server
 
 - `servers/linux/src/chantest.rs` (309) `TEST_CHANNEL`: the client's side of channels to the test service (servers/ringtest, protocol `ring::selftest`), as the page cache will use them with diskfs: create, connect, grant, move descriptors through the rings...
-- `servers/linux/src/disktest.rs` (414) `TEST_DISKRING`: the client's side of the file protocol (`fsring`) against diskfs, as the page cache will use it in step 4: a channel to diskfs, grants of memory objects, files on /data read and written by DMA into...
+- `servers/linux/src/disktest.rs` (528) `TEST_DISKRING`: the client's side of the file protocol (`fsring`) against diskfs, as the page cache will use it in step 4: a channel to diskfs, grants of memory objects, files on /data read and written by DMA into...
 - `servers/linux/src/eventfd.rs` (98) eventfd (phase R6b): a counter that reads take and writes add to, a file of the server with a placeholder in the kernel's descriptor table. Types: `EventFd`.
 - `servers/linux/src/files.rs` (299) The server's files (phase R6): objects the server implements, each named in the kernel's descriptor table by a placeholder (see `restricted::SYS_KFD_INSTALL`). Types: `File`.
 - `servers/linux/src/heap.rs` (60) The server's heap: one allocator for every thread of the instance, in the shared region, growing by `SYS_SHARED_MAP` when it runs out. Types: `ServerHeap`.
@@ -91,8 +91,8 @@ module comment, and the public types it defines. Where to start for common tasks
 ## Other servers
 
 - `servers/diskfs/src/blk.rs` (268) virtio-blk driver on the shared virtio transport (crates/virtio). Types: `Kind`, `SubmitError`, `VirtioBlk`.
-- `servers/diskfs/src/main.rs` (167) diskfs: the ext2 filesystem server.
-- `servers/diskfs/src/service.rs` (828) The ring service: diskfs's end of the data plane (docs/design/io-rings.md, the file protocol `fsring`). Types: `Service`.
+- `servers/diskfs/src/main.rs` (186) diskfs: the ext2 filesystem server.
+- `servers/diskfs/src/service.rs` (926) The ring service: diskfs's end of the data plane (docs/design/io-rings.md, the file protocol `fsring`). Types: `Service`.
 - `servers/netd/src/main.rs` (151) netd: the network server.
 - `servers/netd/src/nic.rs` (114) smoltcp's view of the network card, with loopback: frames addressed to this host (its own address or 127.0.0.0/8) never reach the wire but come back as received frames, and ARP requests for those addresses are... Types: `Nic`, `RxToken`, `TxToken`.
 - `servers/netd/src/service.rs` (632) The socket service: `netproto` requests from the kernel mapped onto smoltcp sockets. Types: `Config`, `Service`.
@@ -146,7 +146,7 @@ module comment, and the public types it defines. Where to start for common tasks
 - `userspace/hello.c` (4) The smallest program: prints its arguments and exits with 42.
 - `userspace/iobench.c` (285) I/O benchmarks (docs/benchmarks/README.md): IPC round trip latency, sequential block I/O, small synchronous reads, TCP throughput over loopback and over the network card, each with the system calls, IPC round trips,...
 - `userspace/jobtest.c` (70) Job control: stopping and continuing processes (SIGSTOP, SIGTSTP, SIGCONT), waitpid with WUNTRACED and WCONTINUED, and restarting interrupted reads.
-- `userspace/lxtest.c` (344) The Linux server's kernel interface (docs/design/linux-server.md), exercised through the server's test calls (1500 and up, see crates/restricted): the program asks its server to create a memory object, fill it, map...
+- `userspace/lxtest.c` (382) The Linux server's kernel interface (docs/design/linux-server.md), exercised through the server's test calls (1500 and up, see crates/restricted): the program asks its server to create a memory object, fill it, map...
 - `userspace/mmaptest.c` (135) File mappings through the page cache: shared mappings see write() and read() sees stores through them, across processes; private mappings see the file until they write; truncation and the end of the file give SIGBUS;...
 - `userspace/nettest.c` (170) Socket tests: TCP and UDP over loopback and through QEMU's user network (10.0.2.100:7 is an echo service, see builder/src/main.rs).
 - `userspace/oomtest.c` (72) Running out of resources: fork bombs, memory hogs and full pipes fail with errors (EAGAIN, ENOMEM) instead of bringing the kernel down.

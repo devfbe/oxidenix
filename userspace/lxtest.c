@@ -45,6 +45,31 @@
 
 static int failures;
 
+/* CPU time (user + system, in clock ticks) of the process named `name`,
+ * from /proc/<pid>/stat; -1 if there is none. */
+static long proc_ticks(const char *name) {
+    DIR *d = opendir("/proc");
+    struct dirent *e;
+    long ticks = -1;
+    while (d && (e = readdir(d))) {
+        if (e->d_name[0] < '1' || e->d_name[0] > '9') continue;
+        char path[64], buf[512];
+        snprintf(path, sizeof path, "/proc/%s/stat", e->d_name);
+        int fd = open(path, O_RDONLY);
+        if (fd < 0) continue;
+        ssize_t n = read(fd, buf, sizeof buf - 1);
+        close(fd);
+        if (n <= 0) continue;
+        buf[n] = 0;
+        char *p = strchr(buf, '('), *q = strrchr(buf, ')');
+        if (!p || !q || (size_t)(q - p - 1) != strlen(name) || strncmp(p + 1, name, q - p - 1) != 0) continue;
+        unsigned long ut, st;
+        if (sscanf(q + 2, "%*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %lu %lu", &ut, &st) == 2) ticks = (long)(ut + st);
+    }
+    if (d) closedir(d);
+    return ticks;
+}
+
 static void check(const char *name, int ok) {
     printf("%-60s %s\n", name, ok ? "ok" : "FAIL");
     if (!ok) failures++;
@@ -420,12 +445,30 @@ int main(void) {
         "diskfs ring: malformed requests complete with errors",
         "diskfs ring: reads and writes in flight, any order",
         "diskfs ring: revoked grant and a client gone mid-flight",
+        "diskfs ring: an unlinked inode freed only when no client holds it",
+        "diskfs ring: a stalled write with every operation slot busy",
     };
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < 7; i++) {
         errno = 0;
         long r = syscall(TEST_DISKRING, i + 1);
         if (r != 0) printf("    (scenario %d: check %d failed)\n", i + 1, errno);
         check(disk_scenarios[i], r == 0);
+    }
+    /* Requests waiting for room in their completion ring keep diskfs
+     * asleep, not spinning: scenario 8 leaves them, 9 takes them. */
+    {
+        errno = 0;
+        long r = syscall(TEST_DISKRING, 8);
+        if (r != 0) printf("    (scenario 8: check %d failed)\n", errno);
+        long before = proc_ticks("diskfs");
+        usleep(500 * 1000);
+        long spent = proc_ticks("diskfs") - before;
+        if (spent > 5) printf("    (diskfs used %ld ticks in 500 ms)\n", spent);
+        check("diskfs ring: requests waiting for room do not keep diskfs busy", r == 0 && before >= 0 && spent <= 5);
+        errno = 0;
+        r = syscall(TEST_DISKRING, 9);
+        if (r != 0) printf("    (scenario 9: check %d failed)\n", errno);
+        check("diskfs ring: they complete once the client makes room", r == 0);
     }
     /* What the ring wrote (and flushed), read through the kernel's /data
      * (diskfs's IPC protocol): byte i is i % 251. */

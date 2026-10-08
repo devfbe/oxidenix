@@ -22,8 +22,24 @@
 //! **Barriers.** Every other operation, and the kernel's IPC requests, run
 //! when no operation is in flight: taking one stops taking requests (on
 //! every channel) until the operations taken before it completed; then it
-//! runs synchronously. A write waits ("stalls") while another write in
-//! flight covers one of its blocks, or while scratch memory is short.
+//! runs synchronously. Barriers wait in a queue, in the order they were
+//! taken. A write waits ("stalls") while another write in flight covers
+//! one of its blocks, while scratch memory is short, or while every
+//! operation slot is taken; it was taken before every barrier waiting, so
+//! it is retried whatever waits, and if it must go through ext2fs's own
+//! write it goes in front of them.
+//!
+//! **Holds.** diskfs keeps, per channel and for the kernel's IPC client, a
+//! bit per inode the client holds (`fsring`, "Holds"): an inode whose last
+//! link went is freed only when no client holds it, so one client's
+//! `RELEASE` (or the kernel's `Release`) never frees an inode another one
+//! still uses. A channel's holds go with it. The kernel releases only the
+//! inodes it unlinked itself (fsproto has no other release); one a ring
+//! client unlinks while the kernel holds it stays allocated (an orphan,
+//! which e2fsck reports after a shutdown) rather than be freed under the
+//! kernel; the kernel's client goes in step 4. The holds are diskfs's
+//! memory: a restarted diskfs knows the kernel's again only as it names
+//! them.
 //!
 //! **Hostile clients.** Each descriptor is copied out of the ring once and
 //! validated (`fsring::Request::decode`); a grant must exist and hold the
@@ -39,7 +55,10 @@
 //! **Waiting.** While there is work, the service polls the rings and the
 //! device; after `SPIN_BUDGET` polls without progress it sleeps (nothing
 //! in flight: doorbells armed, `ipc_receive`) or yields (device busy; its
-//! interrupts stay off, see `blk`), as NAPI does.
+//! interrupts stay off, see `blk`), as NAPI does. A channel whose requests
+//! wait for room in its completion ring is no work: diskfs sleeps on its
+//! doorbell (`Consumer::prepare_blocked_sleep`), which the client rings
+//! after taking completions (`fsring`, "Room").
 
 use crate::blk::{Kind, SubmitError, VirtioBlk, SECTOR_SIZE};
 use alloc::collections::{BTreeMap, VecDeque};
@@ -49,7 +68,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::AtomicU32;
 use ext2fs::{Ext2, NewNode, Reservation};
 use fsring::errno::*;
-use fsring::{Buf, Completion, Kind as NodeKind, Request};
+use fsring::{op, Buf, Completion, Kind as NodeKind, Request};
 use ring::channel::{Header, Layout, Offer};
 use ring::{Consumer, Desc, Producer, Ring, Wait};
 
@@ -198,6 +217,52 @@ struct Chan {
     /// Completions pushed since the last doorbell.
     rang: bool,
     gone: bool,
+    /// The inodes the client holds (see `Holds`).
+    held: Bitmap,
+}
+
+impl Chan {
+    /// Whether the client has requests (or completions to take) that wait
+    /// only for it to make room in its completion ring: it rings the
+    /// submission doorbell once it did (`fsring`, "Room").
+    fn blocked(&mut self) -> bool {
+        let room = self.completions.room();
+        (!self.unposted.is_empty() && room == 0) || (self.taken + self.unposted.len() >= room && !self.requests.is_empty())
+    }
+
+    /// Whether a request can be taken now.
+    fn ready(&mut self) -> bool {
+        !self.gone && self.stalled.is_none() && self.taken + self.unposted.len() < self.completions.room() && !self.requests.is_empty()
+    }
+}
+
+/// One bit per inode.
+struct Bitmap(Vec<u64>);
+
+impl Bitmap {
+    fn new(inodes: u64) -> Bitmap {
+        Bitmap(vec![0; (inodes / 64 + 1) as usize])
+    }
+
+    fn set(&mut self, ino: u32) {
+        if let Some(w) = self.0.get_mut(ino as usize / 64) {
+            *w |= 1 << (ino % 64);
+        }
+    }
+
+    fn clear(&mut self, ino: u32) {
+        if let Some(w) = self.0.get_mut(ino as usize / 64) {
+            *w &= !(1 << (ino % 64));
+        }
+    }
+
+    fn has(&self, ino: u32) -> bool {
+        self.0.get(ino as usize / 64).is_some_and(|w| w & 1 << (ino % 64) != 0)
+    }
+
+    fn inodes(&self) -> impl Iterator<Item = u32> + '_ {
+        self.0.iter().enumerate().flat_map(|(i, &w)| (0..64).filter(move |b| w & 1 << b != 0).map(move |b| (i * 64 + b) as u32))
+    }
 }
 
 /// One device request of an operation: buffers (device address, length).
@@ -270,9 +335,14 @@ enum Start {
 pub struct Service {
     chans: Vec<Option<Chan>>,
     ops: Vec<Option<Op>>,
-    /// A barrier taken (channel, request), waiting for what was taken
-    /// before it to complete.
-    barrier: Option<(usize, Desc)>,
+    /// Barriers taken (channel, request), each waiting for what was taken
+    /// before it to complete, in order. While one waits, nothing new is
+    /// taken; a stalled write taken before it that turns out to need the
+    /// fallback goes in front (it was taken earlier than every one here).
+    barriers: VecDeque<(usize, Desc)>,
+    /// The inodes the kernel's IPC client has named (see `Holds`).
+    kernel: Bitmap,
+    inodes: u64,
     /// Take no new requests (the kernel's IPC request waits for a drain).
     hold: bool,
     /// The channel the next round starts with.
@@ -282,23 +352,44 @@ pub struct Service {
     scratch: u64,
     sink: u64,
     zeros: u64,
-    /// Bytes per device request: whole pages, so that the device's segment
-    /// limit holds whatever the alignment (see `plan`).
+    /// Bytes per device request (see `plan`), and per data buffer.
     piece: u64,
+    unit: u64,
     max_segment: u64,
 }
 
 impl Service {
-    pub fn new(disk: &VirtioBlk) -> Service {
+    /// The service for `disk` with a filesystem of `inodes` inodes and
+    /// blocks of `block_size`; an error for a device or an image the ring
+    /// path cannot serve.
+    pub fn new(disk: &VirtioBlk, block_size: usize, inodes: u64) -> Result<Service, &'static str> {
         let (_, scratch) = disk.scratch();
         let slots = (crate::blk::SCRATCH_PAGES as u64 * PAGE / BOUNCE) as usize;
-        // A piece of P bytes of a grant spans P / PAGE + 1 pages, plus up
-        // to two pads around them.
-        let piece = ((disk.max_segments() as u64).saturating_sub(4).max(1) * PAGE).min(128 * 1024);
-        Service {
+        if block_size as u64 > PAGE {
+            return Err("blocks larger than a page");
+        }
+        // A data buffer is at most `unit` bytes: a power of two (so that it
+        // divides a page) of whole sectors within the device's limit.
+        let max_segment = disk.max_segment() as u64;
+        let mut unit = PAGE;
+        while unit > max_segment {
+            unit /= 2;
+        }
+        if unit < SECTOR {
+            return Err("the device takes less than a sector per segment");
+        }
+        // A piece of P bytes of a grant is at most P / unit + 1 buffers,
+        // plus a pad before and after it (each under a block, under a page:
+        // PAGE / unit buffers at most).
+        let pads = 2 * (PAGE / unit);
+        let units = (disk.max_segments() as u64).checked_sub(1 + pads).filter(|&n| n > 0).ok_or("the device takes too few segments per request")?;
+        let piece = (units * unit).min(128 * 1024) / unit * unit;
+        Ok(Service {
             chans: (0..MAX_CHANNELS).map(|_| None).collect(),
             ops: (0..MAX_OPS).map(|_| None).collect(),
-            barrier: None,
+            barriers: VecDeque::new(),
+            kernel: Bitmap::new(inodes),
+            inodes,
             hold: false,
             rr: 0,
             bounce: (0..slots).rev().collect(),
@@ -306,8 +397,9 @@ impl Service {
             sink: disk.sink(),
             zeros: disk.zeros(),
             piece,
-            max_segment: disk.max_segment() as u64,
-        }
+            unit,
+            max_segment,
+        })
     }
 
     // ------------------------------------------------------------ channels
@@ -339,6 +431,7 @@ impl Service {
             stalled: None,
             rang: false,
             gone: false,
+            held: Bitmap::new(self.inodes),
         });
         0
     }
@@ -412,18 +505,32 @@ impl Service {
     // ----------------------------------------------------------- the loop
 
     /// Whether anything is to be done without waiting for an event.
+    /// A channel that waits for its client to make room in its completion
+    /// ring is not: the client rings when it did (no spinning on behalf of
+    /// a client that never takes its completions).
     pub fn busy(&mut self) -> bool {
-        if self.ops.iter().any(Option::is_some) || self.barrier.is_some() {
+        if self.ops.iter().any(Option::is_some) || !self.barriers.is_empty() {
             return true;
         }
-        self.chans.iter_mut().flatten().any(|c| c.stalled.is_some() || !c.unposted.is_empty() || c.gone || c.header.state() != 0 || !c.requests.is_empty())
+        self.chans.iter_mut().flatten().any(|c| {
+            c.stalled.is_some() || c.gone || c.header.state() != 0 || (!c.unposted.is_empty() && c.completions.room() > 0) || c.ready()
+        })
     }
 
     /// Announces the sleep in every ring and arms its doorbell: false if
-    /// work came meanwhile (then nothing sleeps).
+    /// work came meanwhile (then nothing sleeps). A ring with requests the
+    /// service cannot take yet (no room for their completions) sleeps too,
+    /// until the client's doorbell.
     pub fn prepare_sleep(&mut self) -> bool {
         for chan in self.chans.iter_mut().flatten() {
-            let Some(tail) = chan.requests.prepare_sleep() else { return false };
+            let tail = if chan.blocked() {
+                chan.requests.prepare_blocked_sleep()
+            } else {
+                match chan.requests.prepare_sleep() {
+                    Some(tail) => tail,
+                    None => return false,
+                }
+            };
             match oxrt::chan_watch(chan.id, tail) {
                 Ok(true) => {}
                 // Moved, or the client is gone: there is work.
@@ -475,7 +582,7 @@ impl Service {
         self.hold = true;
         loop {
             let progress = self.poll(fs);
-            let pending = self.ops.iter().any(Option::is_some) || self.barrier.is_some() || self.chans.iter().flatten().any(|c| c.stalled.is_some());
+            let pending = self.ops.iter().any(Option::is_some) || !self.barriers.is_empty() || self.chans.iter().flatten().any(|c| c.stalled.is_some());
             if !pending {
                 break;
             }
@@ -591,36 +698,28 @@ impl Service {
                 // operations in flight finish (into pinned pages).
                 chan.gone = true;
                 chan.stalled = None;
-                if self.barrier.as_ref().is_some_and(|&(bc, _)| bc == c) {
-                    self.barrier = None;
-                }
+                self.barriers.retain(|&(bc, _)| bc != c);
                 any = true;
             }
             let chan = self.chans[c].as_mut().expect("checked");
             if chan.gone {
                 if !self.ops.iter().flatten().any(|op| op.chan == c) {
-                    let id = chan.id;
-                    self.chans[c] = None;
-                    // Vouches that no device uses its grants any more.
-                    let _ = oxrt::chan_detach(id);
+                    self.close(fs, c);
                     any = true;
                 }
                 continue;
             }
-            if let Some(d) = chan.stalled.take() {
+            // A stalled write was taken before anything now waiting: it is
+            // retried whatever waits, but only with a slot for it.
+            if chan.stalled.is_some() && self.ops.iter().any(Option::is_none) {
+                let d = self.chan(c).stalled.take().expect("checked");
                 any |= self.dispatch(fs, c, d, true);
-                if self.chan(c).stalled.is_some() {
-                    continue;
-                }
             }
             for _ in 0..TAKE_PER_ROUND {
-                if self.hold || self.barrier.is_some() || !self.ops.iter().any(Option::is_none) {
+                if self.hold || !self.barriers.is_empty() || !self.ops.iter().any(Option::is_none) || !self.chan(c).ready() {
                     break;
                 }
                 let chan = self.chan(c);
-                if chan.stalled.is_some() || chan.taken + chan.unposted.len() >= chan.completions.room() {
-                    break;
-                }
                 let Some(d) = chan.requests.pop() else { break };
                 chan.taken += 1;
                 any = true;
@@ -628,12 +727,11 @@ impl Service {
             }
         }
         self.rr = (self.rr + 1) % count;
-        let idle = self.ops.iter().all(Option::is_none) && self.chans.iter().flatten().all(|c| c.stalled.is_none());
-        if idle {
-            if let Some((c, d)) = self.barrier.take() {
-                self.run_barrier(fs, c, &d);
-                any = true;
-            }
+        // Barriers in order, each once everything taken before it is done.
+        while self.ops.iter().all(Option::is_none) && self.chans.iter().flatten().all(|c| c.stalled.is_none()) {
+            let Some((c, d)) = self.barriers.pop_front() else { break };
+            self.run_barrier(fs, c, &d);
+            any = true;
         }
         any
     }
@@ -647,10 +745,17 @@ impl Service {
                 return true;
             }
         };
+        self.hold_named(c, &request);
         if !request.is_data() {
-            self.barrier = Some((c, d));
+            // Taken fresh: nothing else waits (taking stops while one does).
+            self.barriers.push_back((c, d));
             return true;
         }
+        // Started only with a slot to run in (else it waits its turn).
+        let Some(slot) = self.ops.iter().position(Option::is_none) else {
+            self.chan(c).stalled = Some(d);
+            return !retry;
+        };
         let started = match request {
             Request::Read { ino, offset, buf } => self.start_read(fs, c, ino, offset, buf),
             Request::Write { ino, offset, buf } => self.start_write(fs, c, ino, offset, buf),
@@ -660,7 +765,6 @@ impl Service {
             Ok(Start::Running(mut op)) => {
                 op.tag = d.tag;
                 op.op = d.op;
-                let slot = self.ops.iter().position(Option::is_none).expect("a free slot was checked");
                 self.ops[slot] = Some(op);
                 self.advance(fs, slot);
             }
@@ -669,10 +773,65 @@ impl Service {
                 self.chan(c).stalled = Some(d);
                 return !retry;
             }
-            Ok(Start::Fallback) => self.barrier = Some((c, d)),
+            // Taken before every barrier waiting now (see `barriers`).
+            Ok(Start::Fallback) if retry => self.barriers.push_front((c, d)),
+            Ok(Start::Fallback) => self.barriers.push_back((c, d)),
             Err(e) => self.complete(c, d.tag, d.op, -e, [0; 4]),
         }
         true
+    }
+
+    // ------------------------------------------------------------- holds
+
+    /// Records that channel `c` holds the inodes `request` names (see
+    /// `Holds` in the module comment).
+    fn hold_named(&mut self, c: usize, request: &Request) {
+        let chan = self.chan(c);
+        match *request {
+            Request::Read { ino, .. } | Request::Write { ino, .. } | Request::Stat { ino } | Request::Truncate { ino, .. } => chan.held.set(ino),
+            Request::Readlink { ino, .. } | Request::SetPerm { ino, .. } => chan.held.set(ino),
+            Request::Lookup { dir, .. } | Request::Create { dir, .. } | Request::Unlink { dir, .. } | Request::Readdir { dir, .. } => chan.held.set(dir),
+            Request::Rename { from, to, .. } => {
+                chan.held.set(from);
+                chan.held.set(to);
+            }
+            Request::Release { .. } | Request::Flush | Request::Statfs | Request::Forget { .. } => {}
+        }
+    }
+
+    /// Frees `ino` if its last link is gone and no client holds it.
+    fn try_free(&mut self, fs: &mut Fs, ino: u32) {
+        if self.kernel.has(ino) || self.chans.iter().flatten().any(|c| c.held.has(ino)) || fs.check(ino).is_err() {
+            return;
+        }
+        if fs.stat(ino).is_ok_and(|s| s.links == 0) {
+            let _ = fs.release(ino);
+        }
+    }
+
+    /// Channel `c` ends: diskfs lets go of it and its client's inodes.
+    fn close(&mut self, fs: &mut Fs, c: usize) {
+        let chan = self.chans[c].take().expect("a channel in use");
+        // Vouches that no device uses its grants any more.
+        let _ = oxrt::chan_detach(chan.id);
+        for ino in chan.held.inodes() {
+            self.try_free(fs, ino);
+        }
+    }
+
+    /// The kernel's IPC client named `ino` (in a request or a reply): it
+    /// may use it until it releases it.
+    pub fn kernel_holds(&mut self, ino: u32) {
+        self.kernel.set(ino);
+    }
+
+    /// The kernel's IPC client released `ino` (fsproto's `Release`, which
+    /// it sends for the inodes it unlinked once it no longer uses them).
+    pub fn kernel_release(&mut self, fs: &mut Fs, ino: u32) -> Result<(), i64> {
+        fs.check(ino)?;
+        self.kernel.clear(ino);
+        self.try_free(fs, ino);
+        Ok(())
     }
 
     fn post(&mut self) -> bool {
@@ -837,17 +996,21 @@ impl Service {
                 let mut take = (part.len - done).min(room);
                 let addr = match part.src {
                     Src::Sink => {
-                        take = take.min(PAGE);
+                        take = take.min(self.unit);
                         self.sink
                     }
                     Src::Zeros => {
-                        take = take.min(PAGE);
+                        take = take.min(self.unit);
                         self.zeros
                     }
-                    Src::Scratch(a) => a + done,
+                    Src::Scratch(a) => {
+                        take = take.min(self.unit);
+                        a + done
+                    }
                     Src::Grant(at) => {
                         let o = at + done;
-                        take = take.min(PAGE - o % PAGE);
+                        // Within a page (and a unit, which divides it).
+                        take = take.min(self.unit - o % self.unit);
                         self.dma(c, grant, o / PAGE, last_page)? + o % PAGE
                     }
                 };
@@ -873,6 +1036,11 @@ impl Service {
             Ok((status, values)) => (status, values),
             Err(e) => (-e, [0; 4]),
         };
+        // The inode a lookup or create returns, and the one whose last link
+        // an unlink or rename took (the client releases it), are held.
+        if status == 0 && matches!(d.op, op::LOOKUP | op::CREATE | op::UNLINK | op::RENAME) && values[0] != 0 {
+            self.chan(c).held.set(values[0] as u32);
+        }
         self.complete(c, d.tag, d.op, status, values);
     }
 
@@ -944,8 +1112,12 @@ impl Service {
                 fs.truncate(ino, len).map(|_| (0, none))
             }
             Request::Release { ino } => {
+                // The client lets go of it: freed if its last link is gone
+                // and no other client holds it.
                 fs.check(ino)?;
-                fs.release(ino).map(|_| (0, none))
+                self.chan(c).held.clear(ino);
+                self.try_free(fs, ino);
+                Ok((0, none))
             }
             Request::SetPerm { ino, perm } => {
                 fs.check(ino)?;
