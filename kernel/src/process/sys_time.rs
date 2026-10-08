@@ -85,7 +85,7 @@ fn process_cputime(pid: Pid) -> Result<(u64, u64), i64> {
     Ok(info.cputime())
 }
 
-fn read_clock(id: u64) -> Result<u64, i64> {
+pub fn read_clock(id: u64) -> Result<u64, i64> {
     Ok(match clock(id)? {
         Clock::Monotonic => time::now(),
         Clock::Realtime => time::realtime(),

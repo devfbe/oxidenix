@@ -161,16 +161,21 @@ extern "sysv64" fn dispatch(f: &mut Frame) {
         // The server's own calls.
         Some(false) => {
             let result = match f.rax {
-                restricted::SYS_RESTRICTED_ENTER => super::linux::enter(f).map(|_| None),
+                restricted::SYS_RESTRICTED_ENTER => match super::linux::enter(f) {
+                    // `f` is the program's now; a call the server handled
+                    // itself is restarted after a signal as the kernel's would be.
+                    Ok(handled) => {
+                        super::sched::resched_on_return();
+                        signal::deliver(f, handled);
+                        return;
+                    }
+                    Err(e) => Err(e),
+                },
                 restricted::SYS_LEGACY_SYSCALL => super::linux::legacy().map(|_| Some(0)),
                 nr => super::linux::server_call(nr, [f.rdi, f.rsi, f.rdx, f.r10, f.r8, f.r9]).map(|v| Some(v as u64)),
             };
             match result {
-                // restricted_enter: `f` is the program's now.
-                Ok(None) => {
-                    super::sched::resched_on_return();
-                    signal::deliver(f, None);
-                }
+                Ok(None) => unreachable!("restricted_enter returns above"),
                 Ok(Some(v)) => {
                     f.rax = v;
                     super::sched::resched_on_return();

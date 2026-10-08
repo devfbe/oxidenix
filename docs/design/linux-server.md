@@ -166,7 +166,8 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
    the file through a bridge from the kernel's descriptor table (`kfile_object(fd)`) while
    files are still the kernel's. `brk` follows with the process model (R8), which owns the
    break. The kernel's own `mmap` stays for its native servers until R9.
-5. **R5 — Time and sleeping**: the clocks, `nanosleep`, `clock_nanosleep`, `gettimeofday`,
+5. **R5 — Time and sleeping** (done, with the server's direct access to program memory: faults
+   resolved as the program's, a registered fixup for EFAULT): the clocks, `nanosleep`, `clock_nanosleep`, `gettimeofday`,
    `times` over the kernel's clock and deadline waits (interruptible by signals, which are
    still the kernel's).
 6. **R6 — Files.** Descriptors, the VFS, tmpfs and the initramfs, pipes, the page cache (as

@@ -216,3 +216,30 @@ pub const TEST_ALLOC: u64 = 1509;
 /// `(n)`: adds 1 to a counter of the instance `n` times, each under the
 /// server's mutex with a pause inside; returns the counter afterwards.
 pub const TEST_LOCKED_ADD: u64 = 1510;
+
+// Program memory (phase R5): the server reads and writes the program's
+// memory directly in its view. A fault there is resolved as the program's
+// own would be (demand paging, copy-on-write); an access the program may
+// not make resumes at the fixup the server registered, which reports
+// EFAULT. The server must check every program pointer against 64 TiB
+// (`SHARED_BASE`) first: its own memory lies above.
+
+/// `set_usercopy(insn, fixup)`: a fault of the server's instruction at
+/// `insn` (its copy loop) on program memory that cannot be resolved
+/// resumes at `fixup` instead of killing the process. Once per instance.
+pub const SYS_SET_USERCOPY: u64 = 1033;
+
+// Time and sleeping (phase R5).
+
+/// `clock_read(id) -> ns`: the clock with Linux's id `id` (wall clock,
+/// monotonic, CPU-time clocks of this thread, this process or another).
+pub const SYS_CLOCK_READ: u64 = 1030;
+/// `sleep_until(deadline) -> 0`: sleeps until `deadline` (monotonic
+/// nanoseconds), or EINTR when a signal for the program comes.
+pub const SYS_SLEEP_UNTIL: u64 = 1031;
+/// `yield()`: lets other threads run.
+pub const SYS_YIELD: u64 = 1032;
+
+/// `(dst)`: writes the 8 bytes "usercopy" to program memory at `dst` with
+/// the server's copy routine; 0 or -EFAULT.
+pub const TEST_USERCOPY: u64 = 1511;

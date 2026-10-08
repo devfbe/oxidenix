@@ -82,6 +82,26 @@ fn exception(frame: &mut Frame) {
     let vector = frame.vector as u8;
     // Read now: resolving the fault may sleep, and CR2 changes meanwhile.
     let fault_addr = if vector == 14 { Cr2::read_raw() } else { 0 };
+    // A fault of the Linux server on the program's memory (it reads and
+    // writes that directly): resolved as the program's own fault would be,
+    // else its copy routine reports EFAULT.
+    if vector == 14 && frame.from_user() && crate::process::linux::mode() == Some(false) && fault_addr < crate::process::address_space::USER_END {
+        use crate::process::address_space::{handle_fault, Access};
+        let access = Access { write: frame.error & 2 != 0, exec: false };
+        if frame.rflags & 0x200 != 0 {
+            x86_64::instructions::interrupts::enable();
+        }
+        match handle_fault(fault_addr, access) {
+            Ok(()) => return,
+            Err(_) if signal::dying() => return,
+            Err(_) => {
+                if let Some(fixup) = crate::process::linux::server_fault(frame.rip) {
+                    frame.rip = fixup;
+                    return;
+                }
+            }
+        }
+    }
     if frame.from_user() && crate::process::linux::mode() == Some(false) {
         // The Linux server failed: its process cannot go on.
         crate::printkln!(

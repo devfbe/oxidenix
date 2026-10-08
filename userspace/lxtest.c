@@ -8,6 +8,8 @@
 #include <fcntl.h>
 #include <stdlib.h>
 #include <sys/mman.h>
+#include <sys/time.h>
+#include <time.h>
 #include <pthread.h>
 #include <setjmp.h>
 #include <signal.h>
@@ -30,6 +32,7 @@
 #define TEST_PAGED_FAIL 1508
 #define TEST_ALLOC 1509
 #define TEST_LOCKED_ADD 1510
+#define TEST_USERCOPY 1511
 
 static int failures;
 
@@ -161,6 +164,34 @@ int main(void) {
     long passed = legacy_calls() - l0 - base;
     printf("    (%ld of 300 memory calls passed through)\n", passed);
     check("mmap, mprotect and munmap are the server's (no pass-through)", passed == 0);
+
+    /* Time is the server's too (R5), and it writes the program's memory
+     * directly: faults there are the program's, bad addresses EFAULT. */
+    l0 = legacy_calls();
+    struct timespec ts, z = {0, 0};
+    struct timeval tv;
+    for (int i = 0; i < 100; i++) {
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        gettimeofday(&tv, NULL);
+        nanosleep(&z, NULL);
+    }
+    passed = legacy_calls() - l0 - base;
+    check("clock_gettime, gettimeofday and nanosleep are the server's", passed == 0 && ts.tv_sec >= 0 && tv.tv_sec > 1000000000);
+    char *fresh = mmap(NULL, 2 * PG, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    check("the server writes a page the program never touched", clock_gettime(CLOCK_REALTIME, (struct timespec *)(fresh + PG)) == 0 && *(long *)(fresh + PG) > 1000000000);
+    mprotect(fresh, PG, PROT_READ);
+    errno = 0;
+    check("a read-only page is EFAULT, not death", clock_gettime(CLOCK_MONOTONIC, (struct timespec *)fresh) == -1 && errno == EFAULT);
+    errno = 0;
+    check("an unmapped address is EFAULT", clock_gettime(CLOCK_MONOTONIC, (struct timespec *)16) == -1 && errno == EFAULT);
+    errno = 0;
+    check("the server's own memory is EFAULT", clock_gettime(CLOCK_MONOTONIC, (struct timespec *)0x404000009000) == -1 && errno == EFAULT);
+    errno = 0;
+    check("... and across the 64 TiB line", syscall(TEST_USERCOPY, 0x400000000000 - 4) == -1 && errno == EFAULT);
+    char *none = mmap(NULL, PG, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    errno = 0;
+    check("a PROT_NONE page is EFAULT for the server's copy", syscall(TEST_USERCOPY, none) == -1 && errno == EFAULT);
+    check("the server's copy reaches program memory", syscall(TEST_USERCOPY, fresh + PG) == 0 && memcmp(fresh + PG, "usercopy", 8) == 0);
     printf("lxtest: %s\n", failures ? "FAILED" : "all passed");
     return failures != 0;
 }

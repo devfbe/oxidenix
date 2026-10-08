@@ -15,6 +15,8 @@ extern crate alloc;
 mod heap;
 mod mm;
 mod sync;
+mod time;
+mod usercopy;
 
 use core::sync::atomic::{AtomicU64, Ordering};
 use restricted::*;
@@ -50,6 +52,7 @@ fn call0(nr: u64) -> i64 {
 /// instance's pager thread (`role`).
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(state: *mut State, role: u64) -> ! {
+    usercopy::register();
     if role == ROLE_PAGER {
         pager();
     }
@@ -58,12 +61,12 @@ pub extern "C" fn _start(state: *mut State, role: u64) -> ! {
             continue;
         }
         let s = unsafe { &mut *state };
-        if let Some(result) = mm::handle(s) {
+        if let Some(result) = mm::handle(s).or_else(|| time::handle(s)) {
             s.rax = result as u64;
             continue;
         }
         match s.rax {
-            TEST_MAP..=TEST_LOCKED_ADD => s.rax = test(s.rax, s.rdi) as u64,
+            TEST_MAP..=TEST_USERCOPY => s.rax = test(s.rax, s.rdi) as u64,
             nr if nr >= FIRST_NON_LINUX => s.rax = -ENOSYS as u64,
             _ => {
                 call0(SYS_LEGACY_SYSCALL);
@@ -203,6 +206,10 @@ fn test(nr: u64, addr: u64) -> i64 {
             if r < 0 { r } else { 0 }
         }
         TEST_ALLOC => test_alloc(addr) as i64,
+        TEST_USERCOPY => match usercopy::to_program(addr, b"usercopy") {
+            Ok(()) => 0,
+            Err(e) => -e,
+        },
         TEST_LOCKED_ADD => {
             for _ in 0..addr {
                 let mut count = COUNTER.lock();

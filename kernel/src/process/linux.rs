@@ -88,6 +88,9 @@ pub struct Instance {
     slots: spin::Mutex<Slots>,
     /// The kernel objects the server holds, by handle.
     handles: spin::Mutex<Handles>,
+    /// The server's copy instruction and where its fault resumes (see
+    /// `SYS_SET_USERCOPY`), once set.
+    usercopy: spin::Once<(u64, u64)>,
     /// Pages of paged objects that threads wait for, for the pager thread.
     pager: spin::Mutex<PagerQueue>,
     /// Address spaces of the tree's programs: when the last goes, so does
@@ -155,6 +158,7 @@ impl Instance {
             entry: 0,
             slots: spin::Mutex::new(Slots { next: 0, free: Vec::new(), states: BTreeMap::new() }),
             handles: spin::Mutex::new(Handles { next: 1, objects: BTreeMap::new() }),
+            usercopy: spin::Once::new(),
             pager: spin::Mutex::new(PagerQueue {
                 requests: alloc::collections::VecDeque::new(),
                 queued: alloc::collections::BTreeSet::new(),
@@ -447,6 +451,10 @@ pub struct LinuxThread {
     /// The server waits in `legacy_syscall`: the kernel runs the call in
     /// the program's view.
     in_legacy: bool,
+    /// The system call the program trapped with, while the server handles
+    /// it itself: signal delivery after it restarts it as the kernel's
+    /// own handling would (taken by a pass-through, which delivers itself).
+    trap_nr: Option<u64>,
     /// The server's registers while the program runs.
     normal: Frame,
 }
@@ -457,7 +465,8 @@ impl LinuxThread {
     /// server's entry, on the thread's server stack).
     pub fn new(instance: Arc<Instance>, program: &Frame) -> Result<(LinuxThread, Frame), i64> {
         let (slot, state) = instance.thread()?;
-        let thread = LinuxThread { instance, slot, state, restricted: false, pager: false, in_legacy: false, normal: Frame::default() };
+        let thread =
+            LinuxThread { instance, slot, state, restricted: false, pager: false, in_legacy: false, trap_nr: None, normal: Frame::default() };
         save(program, thread.state());
         let start = thread.start(ROLE_PROGRAM);
         Ok((thread, start))
@@ -466,7 +475,8 @@ impl LinuxThread {
     /// The pager thread of `instance`, and the frame it starts with.
     pub fn pager(instance: Arc<Instance>) -> Result<(LinuxThread, Frame), i64> {
         let (slot, state) = instance.thread()?;
-        let thread = LinuxThread { instance, slot, state, restricted: false, pager: true, in_legacy: false, normal: Frame::default() };
+        let thread =
+            LinuxThread { instance, slot, state, restricted: false, pager: true, in_legacy: false, trap_nr: None, normal: Frame::default() };
         let start = thread.start(ROLE_PAGER);
         Ok((thread, start))
     }
@@ -665,6 +675,25 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             Ok(0)
         }
         SYS_SHARED_MAP => Ok(instance.grow_heap(a[0])? as i64),
+        SYS_SET_USERCOPY => {
+            let (insn, fixup) = (a[0], a[1]);
+            let code = IMAGE_BASE..THREADS_BASE;
+            if !code.contains(&insn) || !code.contains(&fixup) {
+                return Err(EINVAL);
+            }
+            let mut set = false;
+            instance.usercopy.call_once(|| {
+                set = true;
+                (insn, fixup)
+            });
+            if set { Ok(0) } else { Err(EBUSY) }
+        }
+        SYS_CLOCK_READ => super::sys_time::read_clock(a[0]).map(|ns| ns as i64),
+        SYS_SLEEP_UNTIL => super::sleep_until(a[0]).map(|_| 0),
+        SYS_YIELD => {
+            super::yield_now();
+            Ok(0)
+        }
         SYS_SERVER_FUTEX_WAIT => {
             let (addr, val, deadline, flags) = (a[0], a[1] as u32, a[2], a[3]);
             if flags & !FUTEX_INTERRUPTIBLE != 0 {
@@ -732,6 +761,7 @@ pub fn trap(f: &mut Frame, reason: u64) {
     x86_64::instructions::interrupts::without_interrupts(|| {
         with_current(|p| {
             let l = p.linux.as_mut().expect("a Linux thread");
+            l.trap_nr = (reason == REASON_SYSCALL).then_some(f.rax);
             save(f, l.state());
             *f = l.normal;
             f.rax = reason;
@@ -741,8 +771,10 @@ pub fn trap(f: &mut Frame, reason: u64) {
     });
 }
 
-/// restricted_enter() from the server (`f`): runs the program.
-pub fn enter(f: &mut Frame) -> Result<(), i64> {
+/// restricted_enter() from the server (`f`): runs the program. Returns
+/// the system call the server just handled itself, if any, for the signal
+/// delivery that follows.
+pub fn enter(f: &mut Frame) -> Result<Option<u64>, i64> {
     x86_64::instructions::interrupts::without_interrupts(|| {
         with_current(|p| {
             let l = p.linux.as_mut().expect("a Linux thread");
@@ -754,11 +786,19 @@ pub fn enter(f: &mut Frame) -> Result<(), i64> {
             l.normal = *f;
             *f = program;
             l.restricted = true;
-            Ok::<_, i64>(())
-        })?;
-        switch_view(false);
-        Ok(())
+            Ok::<_, i64>(l.trap_nr.take())
+        })
+        .inspect(|_| switch_view(false))
     })
+}
+
+/// A page fault of the server at `rip` on program memory at `addr`: the
+/// program's own fault handling resolves it (true), else, if `rip` is the
+/// server's copy instruction, the server resumes at its fixup (`Some`).
+pub fn server_fault(rip: u64) -> Option<u64> {
+    let instance = with_current(|p| p.linux.as_ref().map(|l| l.instance.clone()))?;
+    let &(insn, fixup) = instance.usercopy.get()?;
+    (rip == insn).then_some(fixup)
 }
 
 /// legacy_syscall() from the server: the kernel's Linux implementation
@@ -770,7 +810,13 @@ pub fn enter(f: &mut Frame) -> Result<(), i64> {
 /// altogether, not only because every user pointer is checked against
 /// 64 TiB (`uaccess`).
 pub fn legacy() -> Result<(), i64> {
-    let state = with_current(|p| p.linux.as_ref().filter(|l| !l.pager).map(|l| *l.state())).ok_or(EPERM)?;
+    let state = with_current(|p| {
+        let l = p.linux.as_mut().filter(|l| !l.pager)?;
+        // The pass-through delivers signals itself.
+        l.trap_nr = None;
+        Some(*l.state())
+    })
+    .ok_or(EPERM)?;
     let mut program = Frame::default();
     load(&state, &mut program)?;
     crate::counters::add(|c| &c.legacy_calls, 1);
