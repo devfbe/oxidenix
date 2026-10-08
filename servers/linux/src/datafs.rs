@@ -183,10 +183,12 @@ pub fn client() -> Result<Arc<Client>, i64> {
     }
     let generation = GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
     let c = Arc::new(Client::connect(generation).map_err(|_| EIO)?);
-    *CLIENT.lock() = Some(c.clone());
+    // Before anyone uses the new channel (they wait for RECONNECT): no
+    // request names an inode diskfs may have freed meanwhile.
     if old.is_some() {
         revalidate(&c);
     }
+    *CLIENT.lock() = Some(c.clone());
     Ok(c)
 }
 
@@ -219,14 +221,24 @@ fn live(inode: &DInode) -> Result<(), i64> {
     if inode.stale.load(Ordering::Relaxed) { Err(EIO) } else { Ok(()) }
 }
 
-/// The inode `ino` of type `mode` that a request returned (held now).
+/// The inode `ino` of type `mode` that a request returned (held now). A
+/// stale inode of that number is another file now: it leaves the table
+/// (its users keep it, failing), a new one takes its place.
 fn found(ino: u64, mode: u64) -> Result<Arc<DInode>, i64> {
     let ino = u32::try_from(ino).ok().filter(|&i| i != 0).ok_or(EIO)?;
     let kind = mode as u32 & vfs::S_IFMT;
     let mut t = TABLE.lock();
-    if let Some(i) = t.inodes.get(&ino) {
-        i.used.store(TICK.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
-        return Ok(i.clone());
+    match t.inodes.get(&ino) {
+        Some(i) if !i.stale.load(Ordering::Relaxed) => {
+            i.used.store(TICK.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
+            return Ok(i.clone());
+        }
+        Some(i) => {
+            let key = i.key;
+            t.keys.remove(&key);
+            t.dirty.remove(&ino);
+        }
+        None => {}
     }
     let key = NEXT_KEY.fetch_add(1, Ordering::Relaxed);
     let inode = Arc::new(DInode {
@@ -268,7 +280,7 @@ pub fn root() -> Result<Arc<DInode>, i64> {
 /// The inode by its object's key.
 fn by_key(key: u64) -> Option<Arc<DInode>> {
     let t = TABLE.lock();
-    t.keys.get(&key).and_then(|ino| t.inodes.get(ino)).cloned()
+    t.keys.get(&key).and_then(|ino| t.inodes.get(ino)).filter(|i| i.key == key).cloned()
 }
 
 // ------------------------------------------------------------- names
@@ -627,7 +639,7 @@ pub fn read(inode: &Arc<DInode>, off: u64, buf: u64, len: u64) -> Result<u64, i6
             }
             r if r == -EAGAIN => {
                 let index = (off + done) / PAGE;
-                let want = (off + len).div_ceil(PAGE) - index;
+                let want = off.saturating_add(len).div_ceil(PAGE).saturating_sub(index);
                 match fill(inode, index, want) {
                     // Missing again (reclaimed meanwhile) more than a few
                     // times: memory is too short to cache it.
@@ -652,7 +664,7 @@ pub fn write(inode: &Arc<DInode>, off: u64, buf: u64, len: u64) -> Result<u64, i
     if off >= max && len > 0 {
         return Err(EFBIG);
     }
-    let len = len.min(max - off);
+    let len = len.min(max.saturating_sub(off));
     let mut done = 0u64;
     let mut stuck = 0;
     while done < len {
@@ -670,9 +682,14 @@ pub fn write(inode: &Arc<DInode>, off: u64, buf: u64, len: u64) -> Result<u64, i
                 }
             }
             r if r == -ENOMEM && stuck < 8 => {
-                // No room for a new page: dirty ones go to the disk first.
+                // No room for a new page: dirty ones go to the disk first
+                // (this file's, then everyone's), then reclaim can drop them.
                 stuck += 1;
-                let _ = writeback(inode, 0..u64::MAX);
+                if stuck == 1 {
+                    let _ = writeback(inode, 0..u64::MAX);
+                } else {
+                    write_back_dirty();
+                }
             }
             0 => break,
             e if done == 0 => return Err(-e),
@@ -686,7 +703,7 @@ pub fn write(inode: &Arc<DInode>, off: u64, buf: u64, len: u64) -> Result<u64, i
 /// filled first, then copied by the kernel.
 pub fn read_server(inode: &Arc<DInode>, off: u64, buf: &mut [u8]) -> Result<usize, i64> {
     let object = object(inode)?;
-    let pages = (off + buf.len() as u64).div_ceil(PAGE) - off / PAGE;
+    let pages = off.saturating_add(buf.len() as u64).div_ceil(PAGE) - off / PAGE;
     fill(inode, off / PAGE, pages)?;
     let n = syscall(SYS_MO_READ, [object, off, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0]);
     if n < 0 { Err(-n) } else { Ok(n as usize) }
@@ -926,9 +943,10 @@ pub fn next_deadline() -> u64 {
     TABLE.lock().dirty.values().min().map_or(0, |&since| since + WRITEBACK_AGE)
 }
 
-/// Writes back the dirty files: those dirty for `WRITEBACK_AGE` (all of
-/// them with `all`), oldest first. A file whose pages are all written
-/// leaves the list (a store makes it dirty again: `EVENT_DIRTY`).
+/// The pager writes back the dirty files: those dirty for
+/// `WRITEBACK_AGE` (all of them with `all`), oldest first. A file whose
+/// pages are all written leaves the list (a store makes it dirty again:
+/// `EVENT_DIRTY`, which the pager takes after this).
 pub fn write_dirty(all: bool) {
     let due: Vec<(u32, u64)> = {
         let t = TABLE.lock();
@@ -949,6 +967,18 @@ pub fn write_dirty(all: bool) {
         } else if let Some(since) = t.dirty.get_mut(&ino) {
             // Failed or dirtied again meanwhile: again later.
             *since = now();
+        }
+    }
+}
+
+/// Writes back every dirty file once, leaving the list to the pager (only
+/// it takes files off, so none dirtied meanwhile is lost from it).
+fn write_back_dirty() {
+    let dirty: Vec<u32> = TABLE.lock().dirty.keys().copied().collect();
+    for ino in dirty {
+        let inode = TABLE.lock().inodes.get(&ino).cloned();
+        if let Some(inode) = inode.filter(|i| !i.stale.load(Ordering::Relaxed)) {
+            let _ = writeback(&inode, 0..u64::MAX);
         }
     }
 }
@@ -1101,8 +1131,9 @@ fn evict(ino: u32) {
     let ticket = {
         let _names = NAMES.write();
         let mut t = TABLE.lock();
-        // Used again meanwhile (the table's reference and ours).
-        if Arc::strong_count(&inode) != 2 {
+        // Used again meanwhile (else only the table's reference and ours
+        // are left), or no longer the table's.
+        if Arc::strong_count(&inode) != 2 || !t.inodes.get(&ino).is_some_and(|i| Arc::ptr_eq(i, &inode)) {
             return;
         }
         t.inodes.remove(&ino);

@@ -264,13 +264,20 @@ impl DataOpen {
         Ok(out.len() as i64)
     }
 
-    /// Every entry of the directory ("." and ".." included).
+    /// Every entry of the directory ("." and ".." included), at most
+    /// `MAX_ENTRIES` (more than an ext2 directory holds: diskfs's listing
+    /// is not trusted to end).
     fn list(&self) -> Result<Vec<(u32, u8, Vec<u8>)>, i64> {
+        const MAX_ENTRIES: usize = 1 << 20;
+        const ENOMEM: i64 = 12;
         let mut all = Vec::new();
         let mut cursor = 0;
         loop {
             let (entries, next) = datafs::readdir(&self.inode, cursor)?;
             all.extend(entries);
+            if all.len() > MAX_ENTRIES {
+                return Err(ENOMEM);
+            }
             if next == 0 {
                 return Ok(all);
             }
