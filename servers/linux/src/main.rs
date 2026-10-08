@@ -166,6 +166,10 @@ fn pager() -> ! {
                 datafs::closing();
                 continue;
             }
+            EVENT_MKWRITE => {
+                datafs::mkwrite(event.a, event.b);
+                continue;
+            }
             EVENT_SYNC => {
                 // Another instance's sync(2), or a reboot.
                 datafs::closing();

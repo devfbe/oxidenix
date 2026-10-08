@@ -4,8 +4,9 @@
  * fetches the device's copy), children's stores survive write-back around
  * fork, truncation reaches mappings, many readers
  * and writers at once see consistent data, a file larger than the memory
- * the cache may use is written and read back whole, and a read finds room
- * when dirty pages fill memory. */
+ * the cache may use is written and read back whole, a read finds room
+ * when dirty pages fill memory, and a full disk fails write() itself with
+ * ENOSPC (and a store into a hole with SIGBUS), never the write-back. */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
@@ -76,6 +77,12 @@ static void on_fault(int sig) {
 static int faults(volatile char *p) {
     got = 0;
     if (!sigsetjmp(env, 1)) (void)*p;
+    return got;
+}
+
+static int store_faults(volatile char *p) {
+    got = 0;
+    if (!sigsetjmp(env, 1)) *p = 1;
     return got;
 }
 
@@ -415,6 +422,68 @@ static void read_with_dirty_memory(void) {
     unlink(b);
 }
 
+/* Writes `step`-byte chunks of the pattern at the end of `fd` until write()
+ * fails; its errno. */
+static int fill_with(int fd, long *total, size_t step) {
+    static char chunk[64 * 1024];
+    for (int i = 0; i < 100000; i++) {
+        for (size_t j = 0; j < step; j++) chunk[j] = pattern(*total + j, 3);
+        ssize_t n = write(fd, chunk, step);
+        if (n < 0) return errno;
+        *total += n;
+    }
+    return 0;
+}
+
+/* The disk filled up: write() fails with ENOSPC as soon as the space its
+ * data needs is gone (promised when the data enters the cache, as Linux's
+ * delayed allocation reserves it), everything it accepted reaches the disk,
+ * and a store through a shared mapping into a hole raises SIGBUS. Room
+ * again once the file is gone. */
+static void full_disk(void) {
+    const char *path = "/data/datatest.full", *hole = "/data/datatest.hole";
+    unlink(path);
+    unlink(hole);
+    struct statfs before;
+    statfs("/data", &before);
+    int hfd = open(hole, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    int sized = ftruncate(hfd, 64 * PG) == 0;
+    volatile char *map = mmap(NULL, 64 * PG, PROT_READ | PROT_WRITE, MAP_SHARED, hfd, 0);
+    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    long total = 0;
+    int big = fill_with(fd, &total, 64 * 1024);
+    int small = fill_with(fd, &total, 1024);
+    long limit = (long)before.f_blocks * before.f_bsize;
+    printf("    (%ld bytes until the disk was full)\n", total);
+    check("full disk: write() itself fails with ENOSPC", big == ENOSPC && small == ENOSPC && total > 0 && total < limit);
+    struct statfs full;
+    statfs("/data", &full);
+    check("full disk: statfs counts the promised space as used", full.f_bfree * full.f_bsize < 64 * 1024);
+    check("full disk: what write() accepted is written back (fsync)", fsync(fd) == 0);
+    struct stat st;
+    fstat(fd, &st);
+    char back[PG];
+    long last = (total / PG - 1) * PG;
+    int same = last >= 0 && on_disk(path, last, back, PG) == PG;
+    for (int i = 0; same && i < PG; i++) same = (unsigned char)back[i] == pattern(last + i, 3);
+    check("full disk: the file's size and its last page on the disk", st.st_size == total && same);
+    check("full disk: a store into a hole raises SIGBUS", sized && map != MAP_FAILED && store_faults(map + 10 * PG) == SIGBUS);
+    close(fd);
+    unlink(path);
+    // The space comes back once diskfs freed the file.
+    struct statfs after = {0};
+    for (int i = 0; i < 100; i++) {
+        statfs("/data", &after);
+        if (after.f_bfree * after.f_bsize > 1024 * 1024) break;
+        usleep(20000);
+    }
+    check("full disk: room again once the file is gone", after.f_bfree * after.f_bsize > 1024 * 1024);
+    check("full disk: then the store goes through", map != MAP_FAILED && store_faults(map + 10 * PG) == 0 && msync((void *)map, 64 * PG, MS_SYNC) == 0);
+    if (map != MAP_FAILED) munmap((void *)map, 64 * PG);
+    close(hfd);
+    unlink(hole);
+}
+
 int main(void) {
     struct sigaction sa = {0};
     sa.sa_handler = on_fault;
@@ -430,6 +499,7 @@ int main(void) {
     writers();
     larger_than_cache();
     read_with_dirty_memory();
+    full_disk();
     printf("%s\n", failures ? "datatest: FAILED" : "datatest: all passed");
     return failures != 0;
 }

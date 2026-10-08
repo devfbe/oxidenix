@@ -29,6 +29,11 @@
 //! Stores (writes, shared mappings) mark pages dirty, the object's first
 //! one tells the pager (`Pager::dirty`). A shared mapping maps a page
 //! read-only until the first store, which marks it dirty (`set_dirty`).
+//! A store needs the page's disk space secured up to the file's end
+//! (`Page::backed`, delayed allocation): the server's writes check it
+//! (`Backing`), a mapping's store asks the pager (`Pager::mkwrite`) and
+//! waits for its answer (`backed`), and a file that grows write-protects
+//! the page that held its end (`extended`) so its next store asks too.
 //! Write-back takes runs of dirty pages (`pin_dirty`: their marks cleared,
 //! write-protected in every mapping, pinned for a read-only grant): a
 //! store in between faults, marks the page dirty again and is written next
@@ -113,6 +118,10 @@ pub trait Pager: Send + Sync {
     /// Too many pages are dirty (memory runs short of clean ones): the
     /// pager should write back about `pages` of them.
     fn writeback(&self, pages: u64);
+    /// A store wants page `index` of cached object `key`, which is not
+    /// backed (`Page::backed`): the pager should secure the disk space for
+    /// it and answer (`PageCache::backed`). False if the pager is gone.
+    fn mkwrite(&self, key: u64, index: u64) -> bool;
 }
 
 /// Where pages come from.
@@ -139,12 +148,51 @@ struct Page {
     /// Being filled (cached store, `pin_fill`): not yet the file's data,
     /// so nobody reads, maps or writes it until `filled`.
     pending: bool,
+    /// Cached store: the bytes from the page's start whose disk space is
+    /// secured (the pager promised its blocks, or they exist): the page
+    /// may hold file data there that write-back will surely find room
+    /// for. A store needs it up to the file's end (`Backing`).
+    backed: u16,
+    /// The pager was asked to back it (`Pager::mkwrite`), no answer yet.
+    mkwrite: bool,
 }
 
 impl Page {
     fn new(frame: PhysFrame) -> Page {
-        Page { frame, referenced: true, dirty: false, pins: 0, pending: false }
+        Page { frame, referenced: true, dirty: false, pins: 0, pending: false, backed: 0, mkwrite: false }
     }
+}
+
+/// The bytes of page `index` a store needs backed when the file is `size`
+/// long: those below the end (a store there makes them file data).
+fn backing_need(size: u64, index: u64) -> u64 {
+    size.saturating_sub(index * PAGE).min(PAGE)
+}
+
+/// What a write into a cached object requires of the disk space behind
+/// its pages (`Page::backed`, delayed allocation's reservation).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Backing {
+    /// Nothing (writes the server checks otherwise).
+    Ignore,
+    /// Each page must be backed up to the file's end (as the write leaves
+    /// it): the write stops before a page that is not (ENOSPC if nothing
+    /// was written), and the pager secures the space first.
+    Check,
+    /// As `Check`, after marking the pages it writes backed up to this
+    /// byte (the pager secured the space up to there).
+    Vouched(u64),
+}
+
+/// What `set_dirty` found.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Dirtied {
+    Yes,
+    /// The page is gone (truncated meanwhile), or its pager.
+    Gone,
+    /// It is not backed: the pager was asked (`Pager::mkwrite`); the store
+    /// waits (`wait_page` with `backed`) and tries again.
+    Unbacked,
 }
 
 /// Whether a read or write of a cached object fetches the missing pages it
@@ -420,37 +468,60 @@ impl PageCache {
         }
     }
 
-    /// Waits until the pager supplied page `index` (EIO if the pager is
-    /// gone, EINTR if the thread is dying: a pager that never answers must
-    /// not leave it unkillable).
-    fn wait_paged(&self, index: u64) -> Result<(), i64> {
+    /// Waits until the pager supplied page `index` and, with `backed`, also
+    /// backed it up to the file's end (`Pager::mkwrite`): EIO if it cannot
+    /// (it failed, or is gone), EINTR if the thread is dying (a pager that
+    /// never answers must not leave it unkillable).
+    fn wait_paged(&self, index: u64, backed: bool) -> Result<(), i64> {
         let Some((pager, key)) = self.pager() else { return Ok(()) };
         let seen = self.state.lock().enter_wait(index)?;
+        // What the pager is to be asked for.
+        enum Ask {
+            Nothing,
+            Page,
+            Backing,
+        }
         let result = loop {
             let done = x86_64::instructions::interrupts::without_interrupts(|| {
                 let Some(pager) = pager.upgrade() else { return Err(EIO) };
                 // Registered before looking, so an answer cannot slip by.
                 let wait = crate::process::sched::prepare_to_wait(pager.wait_chan());
-                let pending = {
-                    let st = self.state.lock();
+                let ask = {
+                    let mut st = self.state.lock();
                     if st.failures(index) != seen {
                         return Err(EIO);
                     }
-                    match st.pages.get(&index).map(|p| p.pending) {
-                        Some(false) => return Ok(true),
-                        // Being filled: its answer comes without asking,
-                        // unless the pager is gone meanwhile.
-                        Some(true) if !pager.alive() => return Err(EIO),
-                        Some(true) => true,
+                    let need = backing_need(st.size, index);
+                    let beyond = index >= page_of(st.size.saturating_add(PAGE - 1));
+                    match st.pages.get_mut(&index) {
+                        Some(p) if !p.pending && (!backed || p.backed as u64 >= need) => return Ok(true),
+                        // Being filled or backed: its answer comes without
+                        // asking, unless the pager is gone meanwhile.
+                        Some(p) if (p.pending || p.mkwrite) && !pager.alive() => return Err(EIO),
+                        Some(p) if p.pending || p.mkwrite => Ask::Nothing,
+                        Some(p) => {
+                            p.mkwrite = true;
+                            Ask::Backing
+                        }
                         // Cut off meanwhile: the caller looks again.
-                        None if index >= page_of(st.size.saturating_add(PAGE - 1)) => return Ok(true),
-                        None => false,
+                        None if beyond => return Ok(true),
+                        None => Ask::Page,
                     }
                 };
                 if crate::process::signal::dying() {
+                    if let Ask::Backing = ask {
+                        if let Some(p) = self.state.lock().pages.get_mut(&index) {
+                            p.mkwrite = false;
+                        }
+                    }
                     return Err(EINTR);
                 }
-                if !pending && !pager.request(key, index) {
+                let asked = match ask {
+                    Ask::Nothing => true,
+                    Ask::Page => pager.request(key, index),
+                    Ask::Backing => pager.mkwrite(key, index),
+                };
+                if !asked {
                     return Err(EIO);
                 }
                 drop(pager);
@@ -643,7 +714,7 @@ impl PageCache {
                 return if pos == off { Err(EAGAIN) } else { Ok((pos - off) as usize) };
             }
             // (Only a paged or cached object misses pages.)
-            match self.wait_paged(index) {
+            match self.wait_paged(index, false) {
                 Ok(()) => continue,
                 Err(e) if pos == off => return Err(e),
                 Err(_) => return Ok((pos - off) as usize),
@@ -653,13 +724,14 @@ impl PageCache {
 
     /// Writes `data` at `off`, growing the file.
     pub fn write(&self, off: u64, data: &[u8]) -> Result<usize, i64> {
-        self.write_with(off, data, Fill::Yes)
+        self.write_with(off, data, Fill::Yes, Backing::Ignore)
     }
 
     /// `write`; with `Fill::No` a write into a missing page of a cached
     /// object that needs the page's data first stops there (EAGAIN if
-    /// nothing was written), as `read_with`.
-    pub fn write_with(&self, off: u64, data: &[u8], fill: Fill) -> Result<usize, i64> {
+    /// nothing was written), as `read_with`; `backing` as `Backing` says
+    /// (cached objects only).
+    pub fn write_with(&self, off: u64, data: &[u8], fill: Fill, backing: Backing) -> Result<usize, i64> {
         off.checked_add(data.len() as u64).filter(|&e| e <= MAX_SIZE).ok_or(EFBIG)?;
         // A paged object's pages come from its pager alone (`supply`).
         if let Store::Paged { .. } = self.store {
@@ -667,7 +739,7 @@ impl PageCache {
         }
         if let Store::Cached { limit, .. } = self.store {
             off.checked_add(data.len() as u64).filter(|&e| e <= limit).ok_or(EFBIG)?;
-            return self.write_cached(off, data, fill);
+            return self.write_cached(off, data, fill, backing);
         }
         let _io = self.io.lock();
         let end = off + data.len() as u64;
@@ -695,12 +767,13 @@ impl PageCache {
 
     /// A write into a cached object: each page is made present (created
     /// zeroed where the write covers all of its data, or filled by the
-    /// pager), written and marked dirty.
-    fn write_cached(&self, off: u64, data: &[u8], fill: Fill) -> Result<usize, i64> {
-        let _io = self.io.lock();
+    /// pager), checked for its backing, written and marked dirty.
+    fn write_cached(&self, off: u64, data: &[u8], fill: Fill, backing: Backing) -> Result<usize, i64> {
+        let io = self.io.lock();
         let end = off + data.len() as u64;
         let mut pos = off;
         let mut first_dirty = false;
+        let old_size = self.state.lock().size;
         let result = loop {
             if pos >= end {
                 break Ok(());
@@ -714,11 +787,20 @@ impl PageCache {
                 Wait,
                 Fill,
                 Create,
+                Backing,
             }
             let need = {
                 let mut st = self.state.lock();
                 let size = st.size;
+                // The page's bytes that are file data once written.
+                let wanted = backing_need(size.max(pos + n as u64), index);
+                if let (Backing::Vouched(upto), Some(page)) = (backing, st.pages.get_mut(&index)) {
+                    if !page.pending {
+                        page.backed = page.backed.max(upto.saturating_sub(index * PAGE).min(PAGE) as u16);
+                    }
+                }
                 match st.pages.get_mut(&index) {
+                    Some(page) if !page.pending && backing != Backing::Ignore && (page.backed as u64) < wanted => Need::Backing,
                     Some(page) if !page.pending => {
                         frame_bytes(page.frame)[in_page..in_page + n].copy_from_slice(chunk);
                         page.referenced = true;
@@ -739,7 +821,20 @@ impl PageCache {
                         // The page's bytes that are file data: kept unless the
                         // write starts at the page and covers them all.
                         let data_len = size.saturating_sub(index * PAGE).min(PAGE);
-                        if data_len == 0 || (in_page == 0 && n as u64 >= data_len) { Need::Create } else { Need::Fill }
+                        let whole = data_len == 0 || (in_page == 0 && n as u64 >= data_len);
+                        let vouched = match backing {
+                            Backing::Ignore => true,
+                            Backing::Check => false,
+                            Backing::Vouched(upto) => upto.saturating_sub(index * PAGE).min(PAGE) >= wanted,
+                        };
+                        // (Not made for nothing when it could not be written.)
+                        if whole && !vouched {
+                            Need::Backing
+                        } else if whole {
+                            Need::Create
+                        } else {
+                            Need::Fill
+                        }
                     }
                 }
             };
@@ -748,24 +843,102 @@ impl PageCache {
                     pos += n as u64;
                     continue;
                 }
-                Need::Wait => self.wait_paged(index),
+                Need::Wait => self.wait_paged(index, false),
                 Need::Fill if fill == Fill::No => Err(EAGAIN),
-                Need::Fill => self.wait_paged(index),
+                Need::Fill => self.wait_paged(index, false),
                 Need::Create => self.create_cached(index),
+                Need::Backing => Err(ENOSPC),
             };
             if let Err(e) = made {
                 break Err(e);
             }
         };
+        drop(io);
         if first_dirty {
             self.notify_dirty();
         }
+        self.extended(old_size);
         let done = (pos - off) as usize;
         match result {
             Ok(()) => Ok(done),
             Err(e) if done == 0 => Err(e),
             Err(_) => Ok(done),
         }
+    }
+
+    /// The file grew from `old_size`: the page that held its end may now
+    /// hold file data beyond its backing, which a writable mapping could
+    /// store to unnoticed. It is write-protected, so the next store asks
+    /// for its backing (as Linux's `pagecache_isize_extended`).
+    fn extended(&self, old_size: u64) {
+        if old_size % PAGE == 0 || !self.is_cached() {
+            return;
+        }
+        let index = page_of(old_size);
+        let short = {
+            let st = self.state.lock();
+            st.size > old_size && st.pages.get(&index).is_some_and(|p| (p.backed as u64) < backing_need(st.size, index))
+        };
+        if short {
+            self.write_protect(&[index]);
+        }
+    }
+
+    /// The pager's answer to `Pager::mkwrite` for the pages from byte
+    /// `first` (page-aligned) to `end` (at most `MAX_RUN` pages): backed up
+    /// to `end` (`ok`), or the space could not be had (whoever waits for
+    /// their backing fails: SIGBUS for a store through a mapping, as
+    /// Linux's ENOSPC in `page_mkwrite`). Wakes the waiters.
+    pub fn backed(&self, first: u64, end: u64, ok: bool) -> Result<(), i64> {
+        let Store::Cached { pager, .. } = &self.store else { return Err(EINVAL) };
+        if first % PAGE != 0 || end < first || end - first > MAX_RUN * PAGE {
+            return Err(EINVAL);
+        }
+        // (A failure names at least the page at `first`.)
+        let from = page_of(first);
+        let to = page_of(end.saturating_add(PAGE - 1)).max(from + 1);
+        {
+            let mut st = self.state.lock();
+            for (&index, page) in st.pages.range_mut(from..to) {
+                page.mkwrite = false;
+                if ok {
+                    page.backed = page.backed.max((end - index * PAGE).min(PAGE) as u16);
+                }
+            }
+            if !ok {
+                st.fail_waiters(from, to);
+            }
+        }
+        if let Some(pager) = pager.upgrade() {
+            crate::process::sched::wakeup(pager.wait_chan());
+        }
+        Ok(())
+    }
+
+    /// After the disk server lost the pager's promises (it restarted):
+    /// clears the backing of the pages from `from` on and returns the
+    /// first run of dirty pages among them (at most `MAX_RUN`), whose space
+    /// the pager secures again; None when no page is left. Looks at
+    /// `MAX_SCAN` pages at most (`Scan::Resume`).
+    pub fn unback(&self, from: u64) -> Result<Option<(u64, u64)>, Scan> {
+        if !self.is_cached() {
+            return Err(Scan::Errno(EINVAL));
+        }
+        let mut st = self.state.lock();
+        let mut run: Option<(u64, u64)> = None;
+        for (scanned, (&index, page)) in st.pages.range_mut(from..).enumerate() {
+            match run {
+                None if scanned >= MAX_SCAN => return Err(Scan::Resume(index)),
+                // The next call starts here.
+                Some((s, e)) if !page.dirty || index != e || e - s == MAX_RUN => break,
+                _ => {}
+            }
+            page.backed = 0;
+            if page.dirty {
+                run = Some(run.map_or((index, index + 1), |(s, _)| (s, index + 1)));
+            }
+        }
+        Ok(run)
     }
 
     /// Creates page `index` of a cached object, zeroed, unless it exists by
@@ -829,7 +1002,11 @@ impl PageCache {
             }
             let mut st = self.state.lock();
             if len >= st.size {
+                let old_size = st.size;
                 Self::grow(&mut st, len);
+                drop(st);
+                drop(_io);
+                self.extended(old_size);
                 return Ok(());
             }
             let first_gone = page_of(len + PAGE - 1);
@@ -841,8 +1018,10 @@ impl PageCache {
                 return Err(EBUSY);
             }
             if len % PAGE != 0 {
-                if let Some(page) = st.pages.get(&page_of(len)) {
+                if let Some(page) = st.pages.get_mut(&page_of(len)) {
                     frame_bytes(page.frame)[(len % PAGE) as usize..].fill(0);
+                    // The blocks beyond the end go with the cut.
+                    page.backed = page.backed.min((len % PAGE) as u16);
                 }
             }
             let gone = st.pages.split_off(&first_gone);
@@ -901,7 +1080,7 @@ impl PageCache {
         }
         let made = match self.store {
             Store::Memory { .. } => self.create(index),
-            Store::Paged { .. } | Store::Cached { .. } if wait => self.wait_paged(index),
+            Store::Paged { .. } | Store::Cached { .. } if wait => self.wait_paged(index, false),
             Store::Paged { .. } | Store::Cached { .. } => self.request_page(index),
         };
         match made {
@@ -946,8 +1125,8 @@ impl PageCache {
     /// cannot take it before the fault is tried again; None if it is gone
     /// already, truncated): EIO if it cannot be had, EINTR if the thread
     /// dies.
-    pub fn wait_page(&self, index: u64) -> Result<Option<PhysFrame>, i64> {
-        self.wait_paged(index)?;
+    pub fn wait_page(&self, index: u64, backed: bool) -> Result<Option<PhysFrame>, i64> {
+        self.wait_paged(index, backed)?;
         let st = self.state.lock();
         Ok(st.pages.get(&index).filter(|p| !p.pending).map(|p| {
             memory::with_frames(|f| f.share(p.frame));
@@ -1082,7 +1261,7 @@ impl PageCache {
             if index >= last || st.pages.contains_key(&index) {
                 break;
             }
-            st.pages.insert(index, Page { frame, referenced: true, dirty: false, pins: 1, pending: true });
+            st.pages.insert(index, Page { pins: 1, pending: true, ..Page::new(frame) });
             taken += 1;
         }
         st.charged += taken as u64;
@@ -1300,24 +1479,53 @@ impl PageCache {
         self.is_cached()
     }
 
-    /// Marks page `index` dirty before a shared mapping may store to it;
-    /// false if the page is gone (truncated meanwhile).
-    pub fn set_dirty(&self, index: u64) -> bool {
-        let first = {
-            let mut st = self.state.lock();
-            let Some(page) = st.pages.get_mut(&index).filter(|p| !p.pending) else { return false };
-            if page.dirty {
-                return true;
-            }
-            page.dirty = true;
-            DIRTY.fetch_add(1, Ordering::Relaxed);
-            st.dirty += 1;
-            st.dirty == 1
-        };
-        if first {
-            self.notify_dirty();
+    /// Marks page `index` dirty before a shared mapping may store to it.
+    /// With `backed`, the page must be backed up to the file's end first
+    /// (else the pager is asked: `Dirtied::Unbacked`, and the store waits
+    /// for it); without, a store that cannot wait (the space locked) goes
+    /// ahead, as before delayed allocation.
+    pub fn set_dirty(&self, index: u64, backed: bool) -> Dirtied {
+        let Store::Cached { pager, key, .. } = &self.store else { return Dirtied::Gone };
+        enum Step {
+            Dirty { first: bool },
+            /// Not backed; whether the pager must be asked (it was not yet).
+            Unbacked { ask: bool },
         }
-        true
+        let step = {
+            let mut st = self.state.lock();
+            let size = st.size;
+            let Some(page) = st.pages.get_mut(&index).filter(|p| !p.pending) else { return Dirtied::Gone };
+            if backed && (page.backed as u64) < backing_need(size, index) {
+                let ask = !page.mkwrite;
+                page.mkwrite = true;
+                Step::Unbacked { ask }
+            } else if page.dirty {
+                Step::Dirty { first: false }
+            } else {
+                page.dirty = true;
+                DIRTY.fetch_add(1, Ordering::Relaxed);
+                st.dirty += 1;
+                Step::Dirty { first: st.dirty == 1 }
+            }
+        };
+        match step {
+            Step::Dirty { first } => {
+                if first {
+                    self.notify_dirty();
+                }
+                Dirtied::Yes
+            }
+            Step::Unbacked { ask: false } => Dirtied::Unbacked,
+            Step::Unbacked { ask: true } => {
+                if pager.upgrade().is_some_and(|p| p.mkwrite(*key, index)) {
+                    return Dirtied::Unbacked;
+                }
+                if let Some(page) = self.state.lock().pages.get_mut(&index) {
+                    page.mkwrite = false;
+                }
+                Dirtied::Gone
+            }
+        }
     }
 
     /// Write-protects `pages` in every shared mapping of this file.

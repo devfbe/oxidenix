@@ -27,7 +27,7 @@
 //! (`tlb`), and frames are freed only after it.
 
 use super::tlb::{self, Tlb};
-use crate::fs::cache::PageCache;
+use crate::fs::cache::{Dirtied, PageCache};
 use crate::memory;
 use crate::memory::frame::UserFrames;
 use crate::sync::{Mutex, MutexGuard};
@@ -281,7 +281,7 @@ pub struct AddressSpace {
     pub exe: Option<Hold>,
     /// The page a fault found missing (`Fault::Retry`): the faulting thread
     /// waits for it with the space unlocked.
-    awaited: Option<(Arc<PageCache>, u64)>,
+    awaited: Option<(Arc<PageCache>, u64, bool)>,
 }
 
 /// An address space as tasks hold it: shared by the threads of a process
@@ -768,7 +768,7 @@ impl AddressSpace {
             let flags = e.flags();
             if flags.contains(PageTableFlags::PRESENT) {
                 if access.write && !flags.contains(PageTableFlags::WRITABLE) {
-                    return self.break_cow(page, &v);
+                    return self.break_cow(page, &v, wait);
                 }
                 // Already satisfied (another path faulted it in).
                 return Ok(());
@@ -800,14 +800,25 @@ impl AddressSpace {
                 // without the lock (`fault_or_retry`) unless `wait`.
                 let index = (offset + (page - v.start)) / PAGE;
                 let Some(frame) = cache.try_map_page(index, wait)? else {
-                    self.awaited = Some((cache.clone(), index));
+                    self.awaited = Some((cache.clone(), index, false));
                     return Err(Fault::Retry);
                 };
                 if *shared && cache.tracks_dirty() {
-                    // Writable only once the store marked it dirty.
-                    if access.write && !cache.set_dirty(index) {
-                        memory::with_frames(|f| unsafe { f.deallocate_frame(frame) });
-                        return Err(Fault::Bus);
+                    // Writable only once the store marked it dirty, and
+                    // backed (waited for unlocked: not when `wait`).
+                    if access.write {
+                        match cache.set_dirty(index, !wait) {
+                            Dirtied::Yes => {}
+                            Dirtied::Gone => {
+                                memory::with_frames(|f| unsafe { f.deallocate_frame(frame) });
+                                return Err(Fault::Bus);
+                            }
+                            Dirtied::Unbacked => {
+                                memory::with_frames(|f| unsafe { f.deallocate_frame(frame) });
+                                self.awaited = Some((cache.clone(), index, true));
+                                return Err(Fault::Retry);
+                            }
+                        }
                     }
                     return Ok((frame, access.write));
                 }
@@ -860,17 +871,25 @@ impl AddressSpace {
     }
 
     /// A write to a copy-on-write page: copy it unless this mapping is
-    /// the frame's last user.
-    fn break_cow(&mut self, page: u64, v: &Vma) -> Result<(), Fault> {
+    /// the frame's last user. A shared file page must be backed first
+    /// (`Fault::Retry` with it in `awaited`, unless `wait`: see
+    /// `PageCache::set_dirty`).
+    fn break_cow(&mut self, page: u64, v: &Vma, wait: bool) -> Result<(), Fault> {
         let e = leaf_entry(self.l4, page).ok_or(Fault::Segv)?;
         let flags = e.flags();
         let writable = ((flags - COW) | PageTableFlags::WRITABLE) & !PROT_NONE;
         let old = PhysFrame::containing_address(e.addr());
         let shared_area = v.backing.shared();
         if let (true, Backing::File { cache, offset, .. }) = (v.backing.tracks_dirty(), &v.backing) {
-            // Gone if the file was truncated meanwhile.
-            if !cache.set_dirty((offset + (page - v.start)) / PAGE) {
-                return Err(Fault::Bus);
+            let index = (offset + (page - v.start)) / PAGE;
+            match cache.set_dirty(index, !wait) {
+                Dirtied::Yes => {}
+                // Gone if the file was truncated meanwhile.
+                Dirtied::Gone => return Err(Fault::Bus),
+                Dirtied::Unbacked => {
+                    self.awaited = Some((cache.clone(), index, true));
+                    return Err(Fault::Retry);
+                }
             }
         }
         let copied = memory::with_frames(|frames| {
@@ -1062,7 +1081,7 @@ impl AddressSpace {
             let v = self.vma(page).cloned().ok_or(Fault::Segv)?;
             if v.prot.write {
                 if leaf_entry(self.l4, page).is_some_and(|e| e.flags().contains(COW)) {
-                    self.break_cow(page, &v)?;
+                    self.break_cow(page, &v, true)?;
                 }
             } else if !v.backing.shared() {
                 self.privatize(page)?;
@@ -1352,7 +1371,7 @@ pub fn handle_fault(va: u64, access: Access) -> Result<(), Fault> {
             // The page comes from a pager: waited for with the space
             // unlocked, then the fault is tried again. (A file that keeps
             // changing under the fault ends it after a few tries.)
-            (Err(Fault::Retry), Some((cache, index))) if tries < MAX_FAULT_TRIES => match cache.wait_page(index) {
+            (Err(Fault::Retry), Some((cache, index, backed))) if tries < MAX_FAULT_TRIES => match cache.wait_page(index, backed) {
                 Ok(frame) => held = frame,
                 Err(_) => break Err(Fault::Bus),
             },

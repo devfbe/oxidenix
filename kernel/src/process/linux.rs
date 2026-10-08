@@ -752,6 +752,19 @@ impl crate::fs::cache::Pager for Instance {
         self.queue_event(Event { kind: EVENT_DIRTY, a: key, b: 0 });
     }
 
+    fn mkwrite(&self, key: u64, index: u64) -> bool {
+        {
+            let mut q = self.pager.lock();
+            if q.dead {
+                return false;
+            }
+            // (Once per page until answered: `Page::mkwrite`.)
+            q.requests.push_back(Event { kind: EVENT_MKWRITE, a: key, b: index * PAGE });
+        }
+        super::wakeup(self.pager_chan());
+        true
+    }
+
     fn writeback(&self, pages: u64) {
         {
             let mut q = self.pager.lock();
@@ -1244,10 +1257,16 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
                 _ => return Err(EINVAL),
             };
             let (offset, buf, len) = (a[1], a[2], a[3]);
-            let fill = match nr {
-                SYS_MO_FILE_READ | SYS_MO_FILE_WRITE if a[4] & !MO_NOFILL != 0 => return Err(EINVAL),
-                SYS_MO_FILE_READ | SYS_MO_FILE_WRITE if a[4] & MO_NOFILL != 0 => Fill::No,
-                _ => Fill::Yes,
+            let flags = if matches!(nr, SYS_MO_FILE_READ | SYS_MO_FILE_WRITE) { a[4] } else { 0 };
+            let allowed = if nr == SYS_MO_FILE_WRITE { MO_NOFILL | MO_CHECK_BACKED | MO_BACKED } else { MO_NOFILL };
+            if flags & !allowed != 0 || flags & (MO_CHECK_BACKED | MO_BACKED) == MO_CHECK_BACKED | MO_BACKED {
+                return Err(EINVAL);
+            }
+            let fill = if flags & MO_NOFILL != 0 { Fill::No } else { Fill::Yes };
+            let backing = match flags {
+                f if f & MO_CHECK_BACKED != 0 => crate::fs::cache::Backing::Check,
+                f if f & MO_BACKED != 0 => crate::fs::cache::Backing::Vouched(a[5]),
+                _ => crate::fs::cache::Backing::Ignore,
             };
             match nr {
                 // As the kernel's tmpfs files are read and written.
@@ -1257,7 +1276,7 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
                 }
                 SYS_MO_FILE_WRITE => {
                     offset.checked_add(len).ok_or(EFBIG)?;
-                    let n = super::uaccess::write_from_user(buf, len, |chunk, done| cache.write_with(offset + done, chunk, fill));
+                    let n = super::uaccess::write_from_user(buf, len, |chunk, done| cache.write_with(offset + done, chunk, fill, backing));
                     if cache.is_cached() {
                         // Too many dirty pages: this writer waits a little.
                         crate::fs::cache::balance_dirty();
@@ -1420,6 +1439,38 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             } else {
                 cache.redirty(first, count)?;
             }
+            Ok(0)
+        }
+        SYS_MO_BACKED => {
+            let Object::File(cache, _) = instance.object(a[0])? else { return Err(EINVAL) };
+            cache.backed(a[1], a[2], a[3] != 0)?;
+            Ok(0)
+        }
+        SYS_MO_UNBACK => {
+            let Object::File(cache, _) = instance.object(a[0])? else { return Err(EINVAL) };
+            let (found, run) = match cache.unback(a[1]) {
+                Ok(Some((first, end))) => (1, [first, end]),
+                Ok(None) => (0, [0, 0]),
+                Err(crate::fs::cache::Scan::Errno(e)) => return Err(e),
+                Err(crate::fs::cache::Scan::Resume(at)) => {
+                    let mut info = [0u8; 16];
+                    info[..8].copy_from_slice(&at.to_le_bytes());
+                    super::uaccess::copy_to_server(a[2], &info)?;
+                    return Err(EAGAIN);
+                }
+            };
+            let mut info = [0u8; 16];
+            info[..8].copy_from_slice(&run[0].to_le_bytes());
+            info[8..].copy_from_slice(&run[1].to_le_bytes());
+            super::uaccess::copy_to_server(a[2], &info)?;
+            Ok(found)
+        }
+        SYS_SERVER_LOG => {
+            let len = a[1].min(SERVER_LOG_MAX);
+            let mut text = [0u8; SERVER_LOG_MAX as usize];
+            super::uaccess::copy_from_server(a[0], &mut text[..len as usize])?;
+            let text = core::str::from_utf8(&text[..len as usize]).map_err(|_| EINVAL)?;
+            crate::printkln!("[linux] {}", text.trim_end());
             Ok(0)
         }
         SYS_MO_MAP_SERVER => {

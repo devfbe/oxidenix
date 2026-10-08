@@ -257,6 +257,7 @@ answers the offer only after it served the channel.
 | `RELEASE` | inode | 0: the client holds it no more (see "Holds" below) |
 | `READDIR`, `READLINK` | a result buffer in a writable grant (`READDIR` with a cursor) | bytes, v0 = the next cursor |
 | `FORGET` | a grant | 0 once diskfs let go of it (send before `revoke`: no draining) |
+| `PROMISE` | inode, offset, `arg[0]` = length (at most 1 MiB) | 0 once the blocks a later `WRITE` of the range needs are kept for it; `ENOSPC` |
 
 A completion is (tag, op, status, four values); every field an operation does not use must be
 0 (`EINVAL`), an unknown operation is `ENOSYS`, an unknown or revoked grant `EBADF`, a range
@@ -289,6 +290,14 @@ until the ring operations in flight completed), channel offers and doorbells. Wi
 polls the rings and the device; after `SPIN_BUDGET` (2000) polls without progress it yields
 (device busy: its interrupts stay off, the line being shared with the network card) or arms
 every ring's doorbell (`prepare_sleep`, `chan_watch`) and sleeps in `ipc_receive`.
+
+**Promises.** A client that caches writes promises their blocks before it accepts them
+(`PROMISE`, delayed allocation's reservation; `ext2fs`, "Promises"): the data blocks the range
+lacks and the indirect blocks they need are counted against the free blocks (`ENOSPC` if they do
+not cover them) and no other allocation takes them; the `WRITE` that comes later links them
+and spends the promise. Promising again what the same channel promised costs nothing; a promise
+ends when its blocks are written, truncated away or freed with the file, or when its channel
+goes, and `STATFS` counts promised blocks as used. A `PROMISE` runs at once (no barrier).
 
 **Holds.** A client holds every inode it named or got back from `LOOKUP`, `CREATE`, `UNLINK`
 or `RENAME`, until its `RELEASE` or the end of its channel. An inode whose last link went is
@@ -337,6 +346,20 @@ pages and dirty marks the kernel keeps and whose data the server moves:
   file's size at `out` is the one under the lock that took the dirty marks: a write makes a page
   dirty and the file longer at once, so the run's data ends there (a size read earlier would cut
   off pages a concurrent append dirtied, and lose them).
+- **Disk space (delayed allocation).** A page takes data only once its disk space is secured
+  (*backed*) up to the file's end: the server promised diskfs the blocks (`PROMISE`), or they
+  exist. The kernel keeps, per present page, how many of its bytes are backed. The server's
+  writes say `MO_CHECK_BACKED` (a page not backed ends the write there, `ENOSPC` if it is the
+  first) and, after promising a range, `MO_BACKED` with the byte it is backed to: so `write(2)`
+  fails with `ENOSPC` itself when the disk is full, never the write-back later. A store through
+  a shared mapping into a page not backed sends `EVENT_MKWRITE` (key, offset) and waits with
+  the address space unlocked; `mo_backed(handle, first, end, ok)` (1083) answers (no room:
+  `SIGBUS`, as Linux's `page_mkwrite`). A file that grows write-protects the page that held its
+  end if that page's new file bytes are not backed, so a mapping's next store there asks
+  (Linux's `pagecache_isize_extended`); truncation trims the cut page's backing. A diskfs that
+  restarted lost the promises: `mo_unback(handle, from, out)` (1084) clears the pages' backing
+  and returns the runs of dirty pages, which the server promises again before anyone uses the
+  new channel. A final write-back that fails is logged on the console (`server_log`, 1085).
 - **Memory.** The pages are cached memory (`Cached:`, `memory::cache_charge`): clean ones that
   nothing pins or maps are reclaimed when a commit or a new cache page needs room; pending and
   dirty ones are not. Dirty pages of all caches count in `Dirty:`; above a tenth of the commit

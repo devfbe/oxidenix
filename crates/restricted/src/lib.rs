@@ -219,6 +219,10 @@ pub const EVENT_CLOSING: u64 = 7;
 /// sync of another instance (`SYS_SYNC_OTHERS`) or a reboot waits for it.
 /// One is queued at a time; `a` is the latest ticket it answers.
 pub const EVENT_SYNC: u64 = 8;
+/// A store through a shared mapping wants a page of a cached object whose
+/// disk space is not secured (`a` key, `b` byte offset of the page): the
+/// server promises it and answers with `mo_backed`.
+pub const EVENT_MKWRITE: u64 = 9;
 
 /// A server thread starts with its role in `rsi` (and its `State` in
 /// `rdi`): it serves a program's thread, or it is the instance's pager.
@@ -426,13 +430,20 @@ pub const SYS_MO_HOLD: u64 = 1056;
 /// `MO_NOFILL`, a missing page of a cached object ends the read there
 /// (EAGAIN if it is the first): the server fills it itself.
 pub const SYS_MO_FILE_READ: u64 = 1057;
-/// `mo_file_write(handle, offset, buf, len, flags) -> n`: writes the
+/// `mo_file_write(handle, offset, buf, len, flags, upto) -> n`: writes the
 /// program's memory at `buf` into the file object (growing it; ENOSPC,
 /// EFBIG). With `MO_NOFILL` as for reads: a missing page of a cached
 /// object whose data the write needs (it does not cover the page's data)
-/// ends the write there.
+/// ends the write there. A cached object's pages must have their disk
+/// space secured (backed) up to the file's end before they take data:
+/// with `MO_CHECK_BACKED` a page that is not ends the write there
+/// (`ENOSPC` if it is the first: the server promises the space and writes
+/// again); `MO_BACKED` first marks the pages it writes backed up to byte
+/// `upto` (the space the server promised), then checks the same way.
 pub const SYS_MO_FILE_WRITE: u64 = 1058;
 pub const MO_NOFILL: u64 = 1;
+pub const MO_CHECK_BACKED: u64 = 2;
+pub const MO_BACKED: u64 = 4;
 /// `mo_file_size(handle) -> size`.
 pub const SYS_MO_FILE_SIZE: u64 = 1059;
 /// `mo_truncate(handle, len)`: sets the file object's size (pages beyond
@@ -554,6 +565,24 @@ pub const SYS_SYNC_OTHERS: u64 = 1081;
 /// `sync_done(ticket)`: the service thread wrote back what `EVENT_SYNC`
 /// with that ticket asked for. Service thread only.
 pub const SYS_SYNC_DONE: u64 = 1082;
+/// `mo_backed(handle, first, end, ok)`: the answer to `EVENT_MKWRITE` for
+/// the pages from byte `first` (page-aligned) to `end` (at most 256
+/// pages): backed up to `end` (`ok` 1: the space is promised), or not to
+/// be had (0: a store waiting for it gets SIGBUS, as Linux's ENOSPC in
+/// `page_mkwrite`). Wakes the waiting stores.
+pub const SYS_MO_BACKED: u64 = 1083;
+/// `mo_unback(handle, from, out) -> found`: after diskfs lost the
+/// promises (it restarted), clears the backing of the cached object's
+/// pages from page `from` on and writes the first run of dirty pages among
+/// them to `out` (first page, end page): 1, or 0 when none is left (the
+/// server promises each run again, then goes on from its end). EAGAIN
+/// with the page to go on from in `out[0]` after looking at 1024 pages.
+pub const SYS_MO_UNBACK: u64 = 1084;
+/// `server_log(buf, len)`: prints the server's message (UTF-8, at most
+/// `SERVER_LOG_MAX` bytes) on the kernel's console: what a program cannot
+/// be told any more (a final write-back that failed).
+pub const SYS_SERVER_LOG: u64 = 1085;
+pub const SERVER_LOG_MAX: u64 = 256;
 
 /// `(scenario)`: the server runs a channel scenario against the test
 /// service (servers/ringtest, `ring::selftest`): 1 rings and doorbells, 2

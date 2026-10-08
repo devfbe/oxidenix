@@ -57,6 +57,15 @@
 //! bounded by `MAX_CACHED`; their objects keep pages only until reclaim
 //! takes them.
 //!
+//! **Disk space.** A write secures its pages' blocks before their data
+//! enters the cache (`secure`: diskfs `PROMISE`s them, at most a transfer
+//! at a time; the kernel then takes the data, `MO_BACKED`), so a full disk
+//! fails `write(2)` itself with ENOSPC (a short write if some went in),
+//! never the write-back; a store through a mapping into a page not backed
+//! asks the pager (`EVENT_MKWRITE`, `mkwrite`: SIGBUS without room). After
+//! a diskfs restart the dirty pages are promised again (`repromise`). A
+//! final write-back that fails anyway is logged on the console.
+//!
 //! **Bounded waits.** No loop here waits for ever on diskfs or on other
 //! programs: read and write give up after 8 rounds without progress, a
 //! grant's scan after `MAX_GRANT_CALLS` calls (EIO), a truncation waiting
@@ -100,6 +109,7 @@ pub const EBUSY: i64 = 16;
 pub const EISDIR: i64 = 21;
 pub const EINVAL: i64 = 22;
 pub const EFBIG: i64 = 27;
+pub const ENOSPC: i64 = 28;
 pub const ENAMETOOLONG: i64 = 36;
 
 /// st_dev of /data's files (the disk's major and minor, 254:0).
@@ -190,8 +200,9 @@ static GENERATION: AtomicU64 = AtomicU64::new(0);
 pub const KEY_BASE: u64 = 1 << 32;
 static NEXT_KEY: AtomicU64 = AtomicU64::new(KEY_BASE);
 static TICK: AtomicU64 = AtomicU64::new(0);
-/// The filesystem's largest file (0 until known).
+/// The filesystem's largest file and its block size (0 until known).
 static MAX_FILE: AtomicU64 = AtomicU64::new(0);
+static BLOCK: AtomicU64 = AtomicU64::new(0);
 /// Whether `reap` has work (inodes to check, or too many cached).
 static REAP: AtomicBool = AtomicBool::new(false);
 
@@ -212,9 +223,11 @@ pub fn client() -> Result<Arc<Client>, i64> {
     let generation = GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
     let c = Arc::new(Client::connect(generation).map_err(|_| EIO)?);
     // Before anyone uses the new channel (they wait for RECONNECT): no
-    // request names an inode diskfs may have freed meanwhile.
+    // request names an inode diskfs may have freed meanwhile, and the
+    // dirty pages have their disk space promised again.
     if old.is_some() {
         revalidate(&c);
+        repromise(&c);
     }
     *CLIENT.lock() = Some(c.clone());
     Ok(c)
@@ -235,6 +248,46 @@ fn revalidate(c: &Client) {
             inode.stale.store(true, Ordering::Relaxed);
         }
     }
+}
+
+/// After diskfs came back: its promises went with the old channel. Every
+/// cached file's pages lose their backing; the dirty ones are promised
+/// again (a store to a clean page asks anew).
+fn repromise(c: &Client) {
+    let Ok(bs) = block_size_on(c) else { return };
+    let inodes: Vec<Arc<DInode>> = TABLE.lock().inodes.values().cloned().collect();
+    for inode in inodes.iter().filter(|i| !i.stale.load(Ordering::Relaxed)) {
+        let Some(object) = *inode.object.lock() else { continue };
+        let mut from = 0u64;
+        let mut out = [0u64; 2];
+        loop {
+            // (`from` grows with every answer: the loop ends.)
+            match syscall(SYS_MO_UNBACK, [object, from, out.as_mut_ptr() as u64, 0, 0, 0]) {
+                1 if out[1] > out[0] && out[0] >= from => {
+                    let size = syscall(SYS_MO_FILE_SIZE, [object, 0, 0, 0, 0, 0]).max(0) as u64;
+                    let first = out[0] * PAGE;
+                    let end = (out[1] * PAGE).min(size.div_ceil(bs) * bs).max(first);
+                    match promise_on(c, inode.ino, first, end) {
+                        Ok(()) => {
+                            syscall(SYS_MO_BACKED, [object, first, end, 1, 0, 0]);
+                        }
+                        Err(e) => log(&alloc::format!(
+                            "/data: no room for the cached writes of inode {} after diskfs restarted (errno {}); they may fail",
+                            inode.ino, e
+                        )),
+                    }
+                    from = out[1];
+                }
+                r if r == -EAGAIN && out[0] > from => from = out[0],
+                _ => break,
+            }
+        }
+    }
+}
+
+/// Prints `text` on the kernel's console.
+fn log(text: &str) {
+    syscall(SYS_SERVER_LOG, [text.as_ptr() as u64, text.len() as u64, 0, 0, 0, 0]);
 }
 
 /// A status as a result (a value outside the errno range is EIO).
@@ -489,7 +542,67 @@ fn usage() -> Result<fsring::Usage, i64> {
         return Err(EIO);
     }
     MAX_FILE.store(u.max_file_size, Ordering::Relaxed);
+    BLOCK.store(u.block_size as u64, Ordering::Relaxed);
     Ok(u)
+}
+
+/// The filesystem's block size, asked on `c` if not known yet.
+fn block_size_on(c: &Client) -> Result<u64, i64> {
+    if let b @ 1.. = BLOCK.load(Ordering::Relaxed) {
+        return Ok(b);
+    }
+    let r = c.call(Request::Statfs.encode(0))?;
+    status(&r)?;
+    match fsring::Usage::from_values(&r.values).block_size as u64 {
+        0 => Err(EIO),
+        b => {
+            BLOCK.store(b, Ordering::Relaxed);
+            Ok(b)
+        }
+    }
+}
+
+/// Promises diskfs the blocks a later write-back of bytes `first..end`
+/// of `ino` needs (`fsring` "Promises"), one transfer's worth per request.
+fn promise_on(c: &Client, ino: u32, first: u64, end: u64) -> Result<(), i64> {
+    let mut at = first;
+    while at < end {
+        let len = (end - at).min(fsring::MAX_TRANSFER as u64);
+        status(&c.call(Request::Promise { ino, offset: at, len }.encode(0))?)?;
+        at += len;
+    }
+    Ok(())
+}
+
+/// Secures the disk space for a write of bytes `at..to` of the cached file
+/// (delayed allocation's reservation): its pages from the one `at` lies in,
+/// up to the page `to` lies in but no further than the file's end (as the
+/// write leaves it) rounded up to a block. Where the pages are backed now
+/// (`MO_BACKED`'s `upto`).
+fn secure(inode: &DInode, object: u64, at: u64, to: u64) -> Result<u64, i64> {
+    let c = client()?;
+    let bs = block_size_on(&c)?;
+    let size = syscall(SYS_MO_FILE_SIZE, [object, 0, 0, 0, 0, 0]).max(0) as u64;
+    let first = at & !(PAGE - 1);
+    let end = to.div_ceil(PAGE).saturating_mul(PAGE).min(to.max(size).div_ceil(bs).saturating_mul(bs)).max(at);
+    promise_on(&c, inode.ino, first, end)?;
+    Ok(end)
+}
+
+/// `EVENT_MKWRITE`: a store through a mapping wants page `offset` of the
+/// object `key`: its space is promised up to the file's end, or the store
+/// fails (SIGBUS, as on Linux when `page_mkwrite` finds no room).
+pub fn mkwrite(key: u64, offset: u64) {
+    // An object no inode has any more has no mapping that waits.
+    let Some(inode) = by_key(key) else { return };
+    let Some(object) = *inode.object.lock() else { return };
+    let size = syscall(SYS_MO_FILE_SIZE, [object, 0, 0, 0, 0, 0]).max(0) as u64;
+    let to = (offset + PAGE).min(size).max(offset);
+    let (end, ok) = match live(&inode).and_then(|_| secure(&inode, object, offset, to)) {
+        Ok(end) => (end, true),
+        Err(_) => (offset, false),
+    };
+    syscall(SYS_MO_BACKED, [object, offset, end, ok as u64, 0, 0]);
 }
 
 fn max_file() -> Result<u64, i64> {
@@ -740,12 +853,27 @@ pub fn write(inode: &Arc<DInode>, off: u64, buf: u64, len: u64) -> Result<u64, i
     let len = len.min(max.saturating_sub(off));
     let mut done = 0u64;
     let mut stuck = 0;
+    // Where this write's pages are backed (`secure`), so far.
+    let mut upto = 0u64;
     while done < len {
-        let r = syscall(SYS_MO_FILE_WRITE, [object, off + done, buf + done, len - done, MO_NOFILL, 0]);
+        let at = off + done;
+        let backing = if upto > at { MO_BACKED } else { MO_CHECK_BACKED };
+        let r = syscall(SYS_MO_FILE_WRITE, [object, at, buf + done, len - done, MO_NOFILL | backing, upto]);
         match r {
             r if r > 0 => {
                 done += r as u64;
                 stuck = 0;
+            }
+            r if r == -ENOSPC && stuck < 8 => {
+                // The pages need their disk space first (one transfer's
+                // worth at a time): no room is ENOSPC now, not a failed
+                // write-back later.
+                stuck += 1;
+                let to = (off + len).min((at & !(PAGE - 1)) + fsring::MAX_TRANSFER as u64);
+                match secure(inode, object, at, to) {
+                    Ok(end) => upto = end,
+                    Err(e) => return if done == 0 { Err(e) } else { Ok(done) },
+                }
             }
             r if r == -EAGAIN && stuck < 8 => {
                 // The page needs its data first.
@@ -788,6 +916,15 @@ pub fn write_server(inode: &Arc<DInode>, off: u64, data: &[u8]) -> Result<usize,
     let max = max_file()?;
     if off.saturating_add(data.len() as u64) > max {
         return Err(EFBIG);
+    }
+    // The disk space first, as for write(2) (the pages stay unmarked: a
+    // store there later asks again, and finds it promised).
+    let end = off + data.len() as u64;
+    let mut at = off;
+    while at < end {
+        let to = end.min((at & !(PAGE - 1)) + fsring::MAX_TRANSFER as u64);
+        secure(inode, object, at, to)?;
+        at = to;
     }
     let n = syscall(SYS_MO_WRITE, [object, off, data.as_ptr() as u64, data.len() as u64, 0, 0]);
     if n < 0 { Err(-n) } else { Ok(n as usize) }
@@ -1256,9 +1393,12 @@ fn evict(ino: u32) {
 }
 
 /// `EVENT_CLOSING` (the instance ends) and `EVENT_SYNC`: everything
-/// written back and flushed.
+/// written back and flushed. No program can be told of a failure any
+/// more: the console is.
 pub fn closing() {
-    let _ = sync_all();
+    if let Err(e) = sync_all() {
+        log(&alloc::format!("/data: writing the cache back failed (errno {}); data may be lost", e));
+    }
 }
 
 // ----------------------------------------------------------- self-test
