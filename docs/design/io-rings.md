@@ -342,7 +342,9 @@ pages and dirty marks the kernel keeps and whose data the server moves:
   diskfs to write from by DMA; a write that failed puts them back with `mo_redirty` (1078). A child of
   `fork` gets a dirty-tracked page read-only (its first store marks it): it is not among the
   file's mappers until its address space is complete, so a write-back meanwhile could not
-  write-protect it. The
+  write-protect it. Rights raised without a fault (`mprotect`, a page kept under `PROT_NONE`
+  accessed again) keep a page writable only if it was writable before, so dirty and backed;
+  any other page is mapped read-only and its first store marks it dirty. The
   file's size at `out` is the one under the lock that took the dirty marks: a write makes a page
   dirty and the file longer at once, so the run's data ends there (a size read earlier would cut
   off pages a concurrent append dirtied, and lose them).
@@ -354,7 +356,10 @@ pages and dirty marks the kernel keeps and whose data the server moves:
   fails with `ENOSPC` itself when the disk is full, never the write-back later. A store through
   a shared mapping into a page not backed sends `EVENT_MKWRITE` (key, offset) and waits with
   the address space unlocked; `mo_backed(handle, first, end, ok)` (1083) answers (no room:
-  `SIGBUS`, as Linux's `page_mkwrite`). A file that grows write-protects the page that held its
+  `SIGBUS`, as Linux's `page_mkwrite`; a kernel copy into the mapping, e.g. `read(2)` from a pipe,
+  fails with `EFAULT` or a short count instead). The kernel's own stores into a space no one can
+  lock yet (a fork child's `CLONE_CHILD_SETTID` word) wait for the backing the same way, holding
+  the space. A file that grows write-protects the page that held its
   end if that page's new file bytes are not backed, so a mapping's next store there asks
   (Linux's `pagecache_isize_extended`); truncation trims the cut page's backing. A diskfs that
   restarted lost the promises: `mo_unback(handle, from, out)` (1084) clears the pages' backing

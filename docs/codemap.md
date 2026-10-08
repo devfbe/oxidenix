@@ -33,7 +33,7 @@ module comment, and the public types it defines. Where to start for common tasks
 - `kernel/src/memory/kstack.rs` (124) Kernel stacks. Types: `KernelStack`.
 - `kernel/src/memory/mod.rs` (262) Kernel memory: the frame allocator, the kernel heap (slab size classes over a first-fit heap), mappings of physical memory, and the commit and page-cache accounting. Types: `Caching`, `Stats`.
 - `kernel/src/net.rs` (124) Client side of the network server (netd): every socket operation of a user program becomes a `netproto` request. Types: `Endpoint`, `Socket`.
-- `kernel/src/process/address_space.rs` (1042) A process's virtual memory: its page tables and the areas (VMAs) that say what each address range is. Types: `Prot`, `Backing`, `Vma`, `MemStats`, `Fault`, `Access`, `AddressSpace`, `Mm`.
+- `kernel/src/process/address_space.rs` (1077) A process's virtual memory: its page tables and the areas (VMAs) that say what each address range is. Types: `Prot`, `Backing`, `Vma`, `MemStats`, `Fault`, `Access`, `AddressSpace`, `Mm`.
 - `kernel/src/process/channel.rs` (718) Channels: the kernel's part of the data plane between the Linux server and the device servers (docs/design/io-rings.md, ADR 0005). Types: `Channel`, `Grant`, `DmaDomain`, `ClientEnd`.
 - `kernel/src/process/clone.rs` (186) clone(2), fork and vfork: new threads and processes.
 - `kernel/src/process/elf.rs` (81) Parsing ELF64 headers and program headers of static executables (for `loader`). Types: `Elf`, `ProgramHeader`, `Header`.
@@ -140,7 +140,7 @@ module comment, and the public types it defines. Where to start for common tasks
 - `userspace/build.sh` (32) Builds all userspace/*.c as static musl binaries into $1 (the rootfs's bin directory), adds Bash and BusyBox with its applet symlinks, and the servers/* programs into the sibling sbin directory.
 - `userspace/cachetest.c` (115) The page cache of files on a filesystem server (/data): repeated reads come from memory, writes and truncation stay coherent with cached pages and mappings, programs run from the disk, and cached pages give way when...
 - `userspace/cowtest.c` (68) Copy-on-write after fork: parent and child see their own writes to heap and data, brk stays clear of mappings, and shared read-only frames cannot be written.
-- `userspace/datatest.c` (416) /data in the Linux server (phase R6c.3): its calls never pass through to the kernel, descriptors and mappings of a file share one page cache, write() leaves dirty pages that fsync makes durable (an O_DIRECT read...
+- `userspace/datatest.c` (484) /data in the Linux server (phase R6c.3): its calls never pass through to the kernel, descriptors and mappings of a file share one page cache, write() leaves dirty pages that fsync makes durable (an O_DIRECT read...
 - `userspace/epolltest.c` (245) epoll: interest lists with level- and edge-triggered readiness, the event loop interface of libuv and therefore Node.js.
 - `userspace/eventfdtest.c` (76) eventfd: a 64-bit counter as a file, the wakeup primitive of event loops (libuv wakes its loop through one).
 - `userspace/exectest.c` (105) execve maps programs from the page cache: processes running the same program share its pages, a program file cannot be written while it runs (ETXTBSY) nor run while it is open for writing, and changing a program file...

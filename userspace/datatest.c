@@ -2,15 +2,17 @@
  * the kernel, descriptors and mappings of a file share one page cache,
  * write() leaves dirty pages that fsync makes durable (an O_DIRECT read
  * fetches the device's copy), children's stores survive write-back around
- * fork, truncation reaches mappings, many readers
+ * fork and mprotect, truncation reaches mappings, many readers
  * and writers at once see consistent data, a file larger than the memory
  * the cache may use is written and read back whole, a read finds room
  * when dirty pages fill memory, and a full disk fails write() itself with
- * ENOSPC (and a store into a hole with SIGBUS), never the write-back. */
+ * ENOSPC (and a store into a hole with SIGBUS, a kernel copy into one with
+ * EFAULT), never the write-back. */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <sched.h>
 #include <setjmp.h>
 #include <signal.h>
 #include <stdio.h>
@@ -19,6 +21,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -250,6 +253,58 @@ static void fork_and_writeback(void) {
     unlink(path);
 }
 
+/* Rights raised again by mprotect never let a store skip marking its page
+ * dirty: after PROT_NONE (with a faulting access meanwhile), or PROT_READ
+ * across a write-back, and back to PROT_READ|PROT_WRITE, the first store
+ * faults and dirties the page, so fsync writes it back. */
+static int disk_has(const char *path, off_t off, char c) {
+    char back[PG];
+    off_t page = off / PG * PG;
+    return on_disk(path, page, back, PG) == PG && back[off - page] == c;
+}
+
+static void reprotect(void) {
+    const char *path = "/data/datatest.mprotect";
+    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    char page[2 * PG];
+    memset(page, '.', sizeof page);
+    write(fd, page, sizeof page);
+    fsync(fd);
+    char *m = mmap(NULL, 2 * PG, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (m == MAP_FAILED) {
+        check("mprotect and write-back: mapping", 0);
+        return;
+    }
+    /* A clean page (written back, write-protected) behind PROT_NONE. */
+    m[0] = 'a';
+    m[PG] = 'b';
+    fsync(fd);
+    int ok = mprotect(m, 2 * PG, PROT_NONE) == 0;
+    check("PROT_NONE over a clean shared /data page: accesses fault", ok && faults(m) == SIGSEGV && store_faults(m + PG) == SIGSEGV);
+    ok = mprotect(m, 2 * PG, PROT_READ | PROT_WRITE) == 0;
+    long d0 = meminfo("Dirty:");
+    m[10] = 'N';
+    long d1 = meminfo("Dirty:");
+    check("... back to read-write: the first store dirties the page", ok && m[0] == 'a' && d1 >= d0 + 4);
+    check("... and fsync writes it back", fsync(fd) == 0 && disk_has(path, 10, 'N') && disk_has(path, 0, 'a'));
+    /* A dirty page written back while it is PROT_NONE. */
+    m[20] = 'x';
+    ok = mprotect(m, 2 * PG, PROT_NONE) == 0 && fsync(fd) == 0 && disk_has(path, 20, 'x');
+    ok &= mprotect(m, 2 * PG, PROT_READ | PROT_WRITE) == 0;
+    m[30] = 'y';
+    check("a page written back under PROT_NONE is dirtied by the next store", ok && fsync(fd) == 0 && disk_has(path, 30, 'y'));
+    /* A dirty page made read-only, written back, then writable again. */
+    m[PG + 1] = 'r';
+    ok = mprotect(m + PG, PG, PROT_READ) == 0 && fsync(fd) == 0 && disk_has(path, PG + 1, 'r');
+    ok &= m[PG + 1] == 'r' && store_faults(m + PG + 2) == SIGSEGV;
+    ok &= mprotect(m + PG, PG, PROT_READ | PROT_WRITE) == 0;
+    m[PG + 3] = 'w';
+    check("a page written back under PROT_READ is dirtied by the next store", ok && fsync(fd) == 0 && disk_has(path, PG + 3, 'w'));
+    munmap(m, 2 * PG);
+    close(fd);
+    unlink(path);
+}
+
 /* Readers at once, each over the whole file at its own offsets. */
 #define READERS 8
 #define SHARED_SIZE (4 * MIB)
@@ -468,6 +523,21 @@ static void full_disk(void) {
     for (int i = 0; same && i < PG; i++) same = (unsigned char)back[i] == pattern(last + i, 3);
     check("full disk: the file's size and its last page on the disk", st.st_size == total && same);
     check("full disk: a store into a hole raises SIGBUS", sized && map != MAP_FAILED && store_faults(map + 10 * PG) == SIGBUS);
+    /* The kernel's copies into such a page fail too, and leave it clean:
+     * read() from a pipe (EFAULT or a short count, nothing read), and a
+     * fork child's CLONE_CHILD_SETTID word (clone fails with EFAULT). */
+    int pipefd[2] = {-1, -1};
+    int piped = pipe(pipefd) == 0 && write(pipefd[1], "pipedata", 8) == 8;
+    long dirty0 = meminfo("Dirty:");
+    errno = 0;
+    ssize_t got_n = map != MAP_FAILED ? read(pipefd[0], (char *)map + 20 * PG, 8) : 0;
+    check("full disk: read() from a pipe into a hole fails (EFAULT)", piped && got_n <= 0 && (got_n == 0 || errno == EFAULT));
+    errno = 0;
+    long kid = map != MAP_FAILED ? syscall(SYS_clone, CLONE_CHILD_SETTID | SIGCHLD, 0, NULL, (void *)(map + 30 * PG), 0) : 0;
+    if (kid == 0) _exit(0);
+    if (kid > 0) waitpid((pid_t)kid, NULL, 0);
+    check("full disk: clone's CHILD_SETTID into a hole fails (EFAULT)", kid == -1 && errno == EFAULT);
+    check("... and neither left a dirty page", meminfo("Dirty:") <= dirty0);
     close(fd);
     unlink(path);
     // The space comes back once diskfs freed the file.
@@ -479,6 +549,18 @@ static void full_disk(void) {
     }
     check("full disk: room again once the file is gone", after.f_bfree * after.f_bsize > 1024 * 1024);
     check("full disk: then the store goes through", map != MAP_FAILED && store_faults(map + 10 * PG) == 0 && msync((void *)map, 64 * PG, MS_SYNC) == 0);
+    int again = map != MAP_FAILED && piped && write(pipefd[1], "pipedata", 8) == 8;
+    again &= read(pipefd[0], (char *)map + 20 * PG, 8) == 8 && memcmp((char *)map + 20 * PG, "pipedata", 8) == 0;
+    kid = again ? syscall(SYS_clone, CLONE_CHILD_SETTID | SIGCHLD, 0, NULL, (void *)(map + 30 * PG), 0) : -1;
+    if (kid == 0) _exit(0);
+    if (kid > 0) waitpid((pid_t)kid, NULL, 0);
+    int tid_seen = kid > 0 && *(volatile int *)(map + 30 * PG) == (int)kid;
+    int durable = again && fsync(hfd) == 0 && on_disk(hole, 20 * PG, back, PG) == PG && memcmp(back, "pipedata", 8) == 0;
+    int tid_durable = tid_seen && on_disk(hole, 30 * PG, back, PG) == PG && memcmp(back, &(int){(int)kid}, sizeof(int)) == 0;
+    check("full disk: then read() from a pipe fills the page, on the disk after fsync", durable);
+    check("full disk: then a child's CHILD_SETTID word reaches the file and the disk", tid_durable);
+    close(pipefd[0]);
+    close(pipefd[1]);
     if (map != MAP_FAILED) munmap((void *)map, 64 * PG);
     close(hfd);
     unlink(hole);
@@ -495,6 +577,7 @@ int main(void) {
     durability();
     truncation();
     fork_and_writeback();
+    reprotect();
     readers();
     writers();
     larger_than_cache();

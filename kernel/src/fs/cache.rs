@@ -1482,8 +1482,8 @@ impl PageCache {
     /// Marks page `index` dirty before a shared mapping may store to it.
     /// With `backed`, the page must be backed up to the file's end first
     /// (else the pager is asked: `Dirtied::Unbacked`, and the store waits
-    /// for it); without, a store that cannot wait (the space locked) goes
-    /// ahead, as before delayed allocation.
+    /// for it); without, only the dirty mark is set (for a page whose
+    /// store was backed before: `AddressSpace::store_to_file`).
     pub fn set_dirty(&self, index: u64, backed: bool) -> Dirtied {
         let Store::Cached { pager, key, .. } = &self.store else { return Dirtied::Gone };
         enum Step {
