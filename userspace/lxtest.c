@@ -272,6 +272,8 @@ int main(void) {
     check("FIONCLEX and FIOCLEX set the close-on-exec flag", ioctl(q[0], FIONCLEX) == 0 && !(fcntl(q[0], F_GETFD) & FD_CLOEXEC)
           && ioctl(q[0], FIOCLEX) == 0 && (fcntl(q[0], F_GETFD) & FD_CLOEXEC));
     check("... other ioctls on a pipe are ENOTTY", ioctl(q[0], TCGETS, buf) == -1 && errno == ENOTTY);
+    errno = 0;
+    check("... FIONBIO on a bad descriptor is EBADF (not EFAULT)", ioctl(999, FIONBIO, NULL) == -1 && errno == EBADF);
     close(q[1]);
     check("... end of file once the writer is closed", read(q[0], buf, 1) == 0);
     close(q[0]);

@@ -390,9 +390,10 @@ pub fn fcntl(fd: u64, cmd: u64, arg: u64) -> SysResult {
         F_SETFD => current_files()?.set_cloexec(fd, arg & FD_CLOEXEC != 0).map(|_| 0),
         F_GETFL => Ok(f.flags.load(Ordering::Relaxed) as i64),
         F_SETFL => {
+            // Atomic: another thread may change the same open file's flags
+            // at once (FIONBIO, F_SETFL).
             let changeable = O_APPEND | O_NONBLOCK;
-            let old = f.flags.load(Ordering::Relaxed);
-            f.flags.store(old & !changeable | arg as u32 & changeable, Ordering::Relaxed);
+            let _ = f.flags.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| Some(old & !changeable | arg as u32 & changeable));
             Ok(0)
         }
         _ => Err(EINVAL),
@@ -428,13 +429,19 @@ pub fn ioctl(fd: u64, request: u64, arg: u64) -> SysResult {
     const FIOCLEX: u64 = 0x5451;
     match request {
         FIONBIO => {
-            let on = uaccess::read::<i32>(arg)? != 0;
+            // The descriptor first: a bad one is EBADF whatever `arg` is.
             let f = file(fd)?;
-            let old = f.flags.load(Ordering::Relaxed);
-            f.flags.store(if on { old | O_NONBLOCK } else { old & !O_NONBLOCK }, Ordering::Relaxed);
+            if uaccess::read::<i32>(arg)? != 0 {
+                f.flags.fetch_or(O_NONBLOCK, Ordering::Relaxed);
+            } else {
+                f.flags.fetch_and(!O_NONBLOCK, Ordering::Relaxed);
+            }
             return Ok(0);
         }
-        FIOCLEX | FIONCLEX => return current_files()?.set_cloexec(fd, request == FIOCLEX).map(|_| 0),
+        FIOCLEX | FIONCLEX => {
+            file(fd)?;
+            return current_files()?.set_cloexec(fd, request == FIOCLEX).map(|_| 0);
+        }
         _ => {}
     }
 
