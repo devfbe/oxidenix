@@ -77,9 +77,28 @@ fn start_servers() {
     if let Err(e) = process::sched::spawn_kernel_thread("flusher", fs::cache::flusher) {
         printkln!("[boot] cannot start the flusher (errno {})", e);
     }
+    // Tears down channels whose ends went where the kernel could not sleep.
+    if let Err(e) = process::sched::spawn_kernel_thread("channels", process::channel::worker) {
+        printkln!("[boot] cannot start the channel worker (errno {})", e);
+    }
     start_diskfs();
     start_netd();
     start_procfs();
+    if TEST_MODE.load(core::sync::atomic::Ordering::Relaxed) {
+        start_ringtest();
+    }
+}
+
+/// The self-tests' channel service (servers/ringtest): the far end of the
+/// channels lxtest has the Linux server open (test mode only).
+fn start_ringtest() {
+    let server = match process::Server::load("ringtest", "/sbin/ringtest") {
+        Ok(server) => Arc::new(server),
+        Err(e) => return printkln!("[boot] cannot load /sbin/ringtest (errno {})", e),
+    };
+    if let Err(e) = server.start() {
+        printkln!("[boot] ringtest did not start (errno {})", e);
+    }
 }
 
 /// procfs: the Linux view of processes and the system, built from the

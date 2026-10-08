@@ -40,6 +40,7 @@
 #define TEST_USERCOPY 1511
 #define TEST_FS_VALUE 1512
 #define TEST_FS_RECORDS 1513
+#define TEST_CHANNEL 1514
 
 static int failures;
 
@@ -388,6 +389,24 @@ int main(void) {
     check("/proc and /dev are the kernel's", stat("/proc/counters", &sb) == 0 && sb.st_dev != 0x1a && stat("/dev/null", &sb) == 0 && S_ISCHR(sb.st_mode));
     unlink("/tmp/lxdir/one"); unlink("/tmp/lxdir/two"); rmdir("/tmp/lxdir"); unlink("/tmp/lxfile");
     check("unlinked /tmp files are gone", stat("/tmp/lxdir", &sb) == -1 && stat("/tmp/lxfile", &sb) == -1);
+
+    /* Channels to a device server (I/O rings): the server opens them to
+     * the test service (servers/ringtest) and reports the first check
+     * that failed, if any. */
+    static const char *scenarios[] = {
+        "channels: rings and doorbells between the server and a service",
+        "channels: grants (data, read-only, bounds, pinning, device addresses)",
+        "channels: revoking a grant (and one a device may still reach)",
+        "channels: the client's end goes (grants gone from the service)",
+        "channels: the service dies (the client wakes; it comes back)",
+    };
+    for (int i = 0; i < 5; i++) {
+        /* A failed check n comes back as -n: errno n. */
+        errno = 0;
+        long r = syscall(TEST_CHANNEL, i + 1);
+        if (r != 0) printf("    (scenario %d: check %d failed)\n", i + 1, errno);
+        check(scenarios[i], r == 0);
+    }
     printf("lxtest: %s\n", failures ? "FAILED" : "all passed");
     return failures != 0;
 }

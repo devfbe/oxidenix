@@ -33,13 +33,17 @@ pub const ENAMETOOLONG: i64 = 36;
 pub const ENOSYS: i64 = 38;
 pub const ENOTEMPTY: i64 = 39;
 pub const ELOOP: i64 = 40;
+pub const ENODATA: i64 = 61;
 pub const ENOTSOCK: i64 = 88;
 pub const EMSGSIZE: i64 = 90;
 pub const EPROTONOSUPPORT: i64 = 93;
 pub const EOPNOTSUPP: i64 = 95;
 pub const EAFNOSUPPORT: i64 = 97;
 pub const ENETDOWN: i64 = 100;
+pub const EISCONN: i64 = 106;
+pub const ENOTCONN: i64 = 107;
 pub const ETIMEDOUT: i64 = 110;
+pub const ECONNREFUSED: i64 = 111;
 
 /// Syscall result: Ok(return value) or Err(positive errno).
 pub type SysResult = Result<i64, i64>;

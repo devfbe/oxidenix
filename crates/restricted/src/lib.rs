@@ -10,8 +10,11 @@
 /// stay free for a larger region.)
 pub const SHARED_BASE: u64 = 0x4000_0000_0000;
 pub const SHARED_END: u64 = SHARED_BASE + 0x80_0000_0000;
-/// Where the server's program is linked.
+/// Where the server's program is linked; it must end below `MAPS_BASE`.
 pub const IMAGE_BASE: u64 = SHARED_BASE;
+/// Where the kernel maps memory objects into the region for the server
+/// (channels, `SYS_CHAN_CREATE`), up to `HEAP_BASE`.
+pub const MAPS_BASE: u64 = SHARED_BASE + 0x08_0000_0000;
 /// The server's heap: grows from here (`SYS_SHARED_MAP`) up to the thread
 /// areas.
 pub const HEAP_BASE: u64 = SHARED_BASE + 0x10_0000_0000;
@@ -421,3 +424,53 @@ pub const SYS_MO_FROM_IMAGE: u64 = 1062;
 /// so that whatever was released before (a program that ended and was
 /// reaped) is no longer counted when it answers.
 pub const SYS_EVENT_RELEASES: u64 = 1063;
+
+// Channels to device servers (docs/design/io-rings.md, I/O rings step 2):
+// the data plane is a pair of rings in a channel's memory, which the
+// kernel maps into the server's region and into the service; buffers are
+// pages of the server's memory objects that it grants to the channel. The
+// layout is `ring::channel`. The service's side of these calls is
+// `oxrt::sys::CHAN_ATTACH` and the following.
+
+/// `chan_create(slots, addr) -> handle`: a new channel with `slots` slots
+/// per ring (a power of two, 2..=4096), mapped writable into the server's
+/// region; its address is stored at `addr` (a u64 in the server's memory).
+/// Futex waits and wakes on it (`server_futex_wait`) meet the service's on
+/// its own mapping. Closing the handle (or the instance's end) tears the
+/// channel down: the service sees `CLIENT_GONE`, every grant is revoked.
+pub const SYS_CHAN_CREATE: u64 = 1064;
+/// `chan_connect(handle, name, len) -> 0`: offers the channel to the
+/// service registered as `name` (started again if it died) and waits until
+/// it attached it (0) or refused it (its error, or ECONNREFUSED). EISCONN
+/// if the channel was offered before, EOPNOTSUPP if the service does not
+/// take channels, ENOENT if there is no such service, EIO if it died, EINTR
+/// for a signal while the service has not attached it yet.
+pub const SYS_CHAN_CONNECT: u64 = 1065;
+/// `grant(handle, object, offset, pages, flags) -> grant id`: grants
+/// `pages` pages of a memory object (`mo_create`, `mo_create_paged`, a file
+/// object) from `offset` (page-aligned, within the object) to the
+/// channel's service, writable with `GRANT_WRITE`. The pages are pinned:
+/// present now (a paged object's must have been supplied: ENODATA) and
+/// kept as the object's own until revoked (a truncation over them fails
+/// with EBUSY). The service maps them (`grant_map`) and asks for their
+/// device addresses (`grant_dma`). ENOTCONN before the service attached,
+/// EPIPE once it is gone.
+pub const SYS_GRANT: u64 = 1066;
+pub const GRANT_WRITE: u64 = 1;
+/// `revoke(handle, grant) -> 0 | REVOKE_DRAINING`: takes a grant back. Its
+/// mappings in the service are gone when the call returns. If the service
+/// had device addresses of it that a device may still use (no IOMMU to take
+/// them back), the pages stay pinned until the service lets go of them
+/// (`grant_dma_unmap`) or its device is reset after its death; the call
+/// then returns `REVOKE_DRAINING`. The id is reused only after that. (The
+/// client revokes after the requests on the grant completed: the kernel
+/// keeps memory safe, the protocol keeps data right.)
+pub const SYS_REVOKE: u64 = 1067;
+pub const REVOKE_DRAINING: u64 = 1;
+
+/// `(scenario)`: the server runs a channel scenario against the test
+/// service (servers/ringtest, `ring::selftest`): 1 rings and doorbells, 2
+/// grants and their bounds, 3 revoking, 4 the client's end going, 5 the
+/// service dying. 0 if every check held, else the negative number of the
+/// first that failed.
+pub const TEST_CHANNEL: u64 = 1514;

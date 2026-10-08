@@ -4,6 +4,11 @@
 //! The kernel acts as the client on behalf of user programs: `call` queues
 //! a request and sleeps until the reply arrives; `post` queues one without
 //! waiting. Messages are copied through the kernel.
+//!
+//! Besides the requests of its own protocol, a server registered with
+//! `IPC_CHANNELS` gets control requests from the kernel itself (offers of
+//! data-plane channels, see `channel`): their ids have `CONTROL` set, so no
+//! protocol message can pass for one.
 
 use super::errno::*;
 use super::sched::prepare_to_wait;
@@ -16,6 +21,11 @@ use x86_64::instructions::interrupts::without_interrupts;
 
 /// Upper bound for one message in either direction.
 pub const MAX_MESSAGE: usize = 64 * 1024;
+/// Set in the id of a control request (one of the kernel's own, not of the
+/// service's protocol).
+pub const CONTROL: u64 = 1 << 63;
+/// `ipc_register` flag: the service accepts channel offers.
+pub const IPC_CHANNELS: u64 = 1;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -40,6 +50,8 @@ struct Service {
     arg: u64,
     alive: bool,
     queue: VecDeque<u64>,
+    /// It accepts channel offers (`IPC_CHANNELS`).
+    channels: bool,
     /// Unique per registration. A restarted server reuses the service
     /// index, so clients that hold per-server state (socket handles)
     /// check the generation to never reach the new server with it.
@@ -80,7 +92,7 @@ pub struct Instance {
 // Sleep channels; far away from the small fixed ones and from pipe
 // addresses. A server sleeps on `irq::server_chan(pid)`.
 fn request_chan(id: u64) -> usize {
-    0x2_0000_0000 + id as usize
+    0x2_0000_0000 + (id & !CONTROL) as usize
 }
 
 /// The channel a server's event `token` wakes (see `notify`), for one
@@ -100,21 +112,27 @@ fn lock<R>(f: impl FnOnce(&mut Ipc) -> R) -> R {
     f(&mut IPC.lock())
 }
 
-/// ipc_register(name, length, arg): makes the calling (privileged) process
-/// the server behind `name`. A dead server's name can be taken over.
-pub fn register(name: u64, len: u64, arg: u64) -> SysResult {
+/// ipc_register(name, length, arg, flags): makes the calling (privileged)
+/// process the server behind `name`; `IPC_CHANNELS` in `flags`: it accepts
+/// channel offers. A dead server's name can be taken over.
+///
+/// A server registers once its device is reset and ready: what its
+/// predecessor's device might still have reached (quarantined grants, see
+/// `channel::DmaDomain`) is released here.
+pub fn register(name: u64, len: u64, arg: u64, flags: u64) -> SysResult {
     if !super::sched::current().group.privileged.load(core::sync::atomic::Ordering::Relaxed) {
         return Err(EPERM);
     }
-    if len > 64 {
+    if len > 64 || flags & !IPC_CHANNELS != 0 {
         return Err(EINVAL);
     }
     let name = String::from_utf8(uaccess::read_vec(name, len)?).map_err(|_| EINVAL)?;
     let me = super::current_pid();
-    lock(|ipc| {
+    let registered = lock(|ipc| {
         let generation = ipc.next_generation;
         ipc.next_generation += 1;
-        let service = Service { name: name.clone(), server: me, arg, alive: true, queue: VecDeque::new(), generation };
+        let channels = flags & IPC_CHANNELS != 0;
+        let service = Service { name: name.clone(), server: me, arg, alive: true, queue: VecDeque::new(), channels, generation };
         match ipc.services.iter().position(|s| s.name == name) {
             Some(i) if ipc.services[i].alive => Err(EEXIST),
             Some(i) => {
@@ -126,7 +144,11 @@ pub fn register(name: u64, len: u64, arg: u64) -> SysResult {
                 Ok(ipc.services.len() as i64 - 1)
             }
         }
-    })
+    })?;
+    if let Some(server) = super::with_current(|p| p.server.clone()) {
+        server.domain.device_reset();
+    }
+    Ok(registered)
 }
 
 /// ipc_receive(buffer, length, &id, timeout_ms): waits for the next request
@@ -247,12 +269,19 @@ fn fail(id: u64) {
 }
 
 fn enqueue(service: usize, message: Vec<u8>, waits: bool, generation: Option<u64>) -> Result<u64, i64> {
+    enqueue_as(service, message, waits, generation, false)
+}
+
+fn enqueue_as(service: usize, message: Vec<u8>, waits: bool, generation: Option<u64>, control: bool) -> Result<u64, i64> {
     let (id, server) = lock(|ipc| {
         let current = ipc.services.get(service).filter(|s| s.alive).ok_or(EIO)?;
         if generation.is_some_and(|g| g != current.generation) {
             return Err(EIO);
         }
-        let id = ipc.next_id;
+        if control && !current.channels {
+            return Err(EOPNOTSUPP);
+        }
+        let id = ipc.next_id | if control { CONTROL } else { 0 };
         ipc.next_id += 1;
         ipc.calls += 1;
         ipc.bytes += message.len() as u64;
@@ -312,6 +341,42 @@ pub fn call_interruptible(to: Instance, message: Vec<u8>, cancel: impl FnOnce(u6
             }
         })
     })
+}
+
+/// Sends the control request `message` (a channel offer) to this
+/// registration of a server that accepts them and waits for the reply. A
+/// signal may end the wait: a request still queued is withdrawn; one the
+/// server took is given up only if `give_up()` agrees (then EINTR, and the
+/// reply is dropped).
+pub fn call_control(to: Instance, message: Vec<u8>, give_up: impl Fn() -> bool) -> Result<Vec<u8>, i64> {
+    let service = to.service;
+    without_interrupts(|| {
+        let id = enqueue_as(service, message, true, Some(to.generation), true)?;
+        wait_reply_with(id, &mut || {
+            // In one hold of the lock, so the server cannot take or answer
+            // the request in between. (`give_up` takes only a channel's
+            // lock, which is never held around this one.)
+            lock(|ipc| match ipc.requests.get(&id).map(|r| r.state) {
+                Some(State::Queued) => {
+                    ipc.requests.remove(&id);
+                    if let Some(s) = ipc.services.get_mut(service) {
+                        s.queue.retain(|&q| q != id);
+                    }
+                    true
+                }
+                Some(State::Taken) if give_up() => {
+                    ipc.requests.get_mut(&id).expect("present").waits = false;
+                    true
+                }
+                _ => false,
+            })
+        })
+    })
+}
+
+/// The process serving this registration, while it is alive.
+pub fn server_of(to: Instance) -> Option<Pid> {
+    lock(|ipc| ipc.services.get(to.service).filter(|s| s.alive && s.generation == to.generation).map(|s| s.server))
 }
 
 fn wait_reply(id: u64) -> Result<Vec<u8>, i64> {

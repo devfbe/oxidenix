@@ -1,0 +1,690 @@
+//! Channels: the kernel's part of the data plane between the Linux server
+//! and the device servers (docs/design/io-rings.md, ADR 0005).
+//!
+//! A channel is one memory object holding a submission and a completion
+//! ring (layout: `ring::channel`). The client (a Linux server instance)
+//! creates it, which maps it into the instance's region (`chan_create`),
+//! and offers it to a service (`chan_connect`): the kernel sends the
+//! service a control request (`ipc::call_control`, an `Offer`), the service
+//! maps the channel into its own address space (`chan_attach`) and
+//! answers. From then on both ends move descriptors through the rings
+//! without the kernel; a futex on a ring word is the doorbell (both ends'
+//! futexes are keyed by the object, see `futex`).
+//!
+//! **Grants.** The client grants page ranges of its memory objects to the
+//! channel (`grant`). A grant pins its pages (`PageCache::pin`): they stay
+//! the object's pages, present, never truncated away or reclaimed, and
+//! their frames are referenced by the grant. The service maps a grant
+//! (`grant_map`, read-only unless granted writable; `Backing::Granted`) and
+//! asks for device addresses of it (`grant_dma`, through its server's
+//! `DmaDomain`). `revoke` takes a grant back: its mappings in the service
+//! are gone (with TLB shootdowns) when the call returns, and its device
+//! mappings are removed from the domain. Without an IOMMU the kernel cannot
+//! take a device address back, so a grant the service has device addresses
+//! of stays pinned ("draining") until the service lets go of them
+//! (`grant_dma_unmap`), or, if the service dies, until its device is reset
+//! (its next registration): the pages are never freed while a device may
+//! still reach them.
+//!
+//! **Teardown.** When the client's end goes (its handle closed, or the
+//! instance ended) or the service's (it detached, or its process ended),
+//! the kernel takes back every grant as above, sets the end's bit in the
+//! channel's `state` and hangs the memory up (`PageCache::hang_up`): every
+//! futex wait on it fails from then on and every sleeper wakes, so no end
+//! sleeps forever on a dead peer. Ends do not lose their mapping of the
+//! ring memory itself (it is plain memory, theirs to unmap: the client by
+//! closing its handle, the service by `chan_detach`).
+//!
+//! A peer is hostile: the kernel never reads the rings; it validates every
+//! grant id, offset and length a service passes; a grant id is reused only
+//! once the old grant is fully gone. Teardowns triggered where the kernel
+//! may not sleep (a process's end, the last reference of an instance) are
+//! done by the `channels` kernel thread (`worker`).
+
+use super::address_space::{Backing, Hold, Mm, Prot, PAGE};
+use super::errno::*;
+use super::{ipc, Pid, Server};
+use crate::fs::cache::PageCache;
+use crate::memory;
+use crate::sync::{IrqSpinLock, Mutex};
+use alloc::collections::{BTreeMap, VecDeque};
+use alloc::sync::{Arc, Weak};
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use ring::channel::{Header, Layout, Offer, CLIENT_GONE, SERVICE_GONE, STATE_OFFSET};
+use x86_64::structures::paging::PhysFrame;
+
+/// Most grants a channel holds at once, pages per grant, and pages granted
+/// in all (each pinned page costs the kernel a few bytes).
+const MAX_GRANTS: usize = 4096;
+const MAX_GRANT_PAGES: u64 = 1 << 14;
+const MAX_GRANTED_PAGES: u64 = 1 << 16;
+
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Every channel by id; the attached ones also with their service process
+/// and a reference (an attached channel lives as long as its service end).
+static CHANNELS: IrqSpinLock<BTreeMap<u64, Entry>> = IrqSpinLock::new(BTreeMap::new());
+
+struct Entry {
+    channel: Weak<Channel>,
+    service: Option<(Pid, Arc<Channel>)>,
+}
+
+pub struct Channel {
+    id: u64,
+    layout: Layout,
+    memory: Arc<PageCache>,
+    /// The header page, with a reference of ours (for `state`).
+    header: PhysFrame,
+    inner: IrqSpinLock<Inner>,
+}
+
+struct Inner {
+    /// The service registration the channel was offered to, while the
+    /// offer stands.
+    offered: Option<ipc::Instance>,
+    service: Option<ServiceEnd>,
+    client_gone: bool,
+    service_gone: bool,
+    /// Grants by id: live ones and revoked ones still draining.
+    grants: BTreeMap<u32, Arc<Grant>>,
+    /// Pages of `grants`.
+    pages: u64,
+}
+
+#[derive(Clone)]
+struct ServiceEnd {
+    pid: Pid,
+    mm: Weak<Mm>,
+    server: Arc<Server>,
+}
+
+/// Pages of a memory object granted to a channel's service, pinned while
+/// the grant lives.
+pub struct Grant {
+    object: Arc<PageCache>,
+    /// Page index of the first page in `object`.
+    first: u64,
+    /// The pinned frames (one reference each, the grant's).
+    frames: Vec<PhysFrame>,
+    writable: bool,
+    /// Held (sleeping) across the changes of the service's mappings, so a
+    /// mapping or a device address can never be made after the revoke.
+    state: Mutex<GrantState>,
+}
+
+#[derive(Default)]
+struct GrantState {
+    revoked: bool,
+    /// The service has device addresses of it (`grant_dma`).
+    device: bool,
+}
+
+impl Drop for Grant {
+    fn drop(&mut self) {
+        for (i, &frame) in self.frames.iter().enumerate() {
+            self.object.unpin(self.first + i as u64, frame);
+        }
+    }
+}
+
+impl Grant {
+    fn hold(self: &Arc<Self>) -> Hold {
+        self.clone()
+    }
+
+    fn bytes(&self) -> u64 {
+        self.frames.len() as u64 * PAGE
+    }
+}
+
+/// Where a server's devices reach granted pages: the one place that maps
+/// and unmaps pages for device access. Without an IOMMU a device address
+/// is the physical address and nothing can be taken back; with one
+/// (docs/design/iommu.md) `map` enters the page into the device's domain
+/// and `unmap` removes it (and flushes the IOTLB), confining the device to
+/// the grants. It belongs to the `Server` and outlives its processes, like
+/// the DMA area: grants a dead server's device might still reach wait here
+/// until the device is reset.
+#[derive(Default)]
+pub struct DmaDomain {
+    quarantine: spin::Mutex<Vec<Arc<Grant>>>,
+}
+
+impl DmaDomain {
+    /// The device address of `frame`.
+    fn map(&self, frame: PhysFrame) -> u64 {
+        frame.start_address().as_u64()
+    }
+
+    /// Takes the device addresses of `grant` back; whether its pages are
+    /// out of every device's reach now (never without an IOMMU).
+    fn unmap(&self, _grant: &Grant) -> bool {
+        false
+    }
+
+    /// Keeps `grant` (and its pins) until the device is reset.
+    fn quarantine(&self, grant: Arc<Grant>) {
+        self.quarantine.lock().push(grant);
+    }
+
+    /// The server's device was reset (a new process of the server
+    /// registered): nothing quarantined is reachable any more.
+    pub fn device_reset(&self) {
+        let gone = core::mem::take(&mut *self.quarantine.lock());
+        drop(gone);
+    }
+}
+
+impl Channel {
+    /// A new channel of `slots` slots per ring.
+    pub fn new(slots: u64) -> Result<Arc<Channel>, i64> {
+        let layout = u32::try_from(slots).ok().and_then(Layout::new).ok_or(EINVAL)?;
+        let memory = PageCache::anonymous(layout.pages as u64).map_err(|_| ENOMEM)?;
+        let header = memory.map_page(0).map_err(|_| ENOMEM)?;
+        // Positions start at 0 (the memory is zeroed).
+        unsafe { (memory::phys_to_virt(header.start_address().as_u64()) as *mut Header).write(Header::new(&layout)) };
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let inner = Inner { offered: None, service: None, client_gone: false, service_gone: false, grants: BTreeMap::new(), pages: 0 };
+        // From here on, dropping the channel releases the header page.
+        let channel = Channel { id, layout, memory, header, inner: IrqSpinLock::new(inner) };
+        let channel = Arc::try_new(channel).map_err(|_| ENOMEM)?;
+        CHANNELS.lock().insert(id, Entry { channel: Arc::downgrade(&channel), service: None });
+        Ok(channel)
+    }
+
+    pub fn memory(&self) -> &Arc<PageCache> {
+        &self.memory
+    }
+
+    pub fn pages(&self) -> u64 {
+        self.layout.pages as u64
+    }
+
+    fn state(&self) -> &AtomicU32 {
+        unsafe { &*(memory::phys_to_virt(self.header.start_address().as_u64() + STATE_OFFSET as u64) as *const AtomicU32) }
+    }
+
+    /// Marks an end gone and wakes every sleeper on the channel for good.
+    fn set_gone(&self, bit: u32) {
+        self.state().fetch_or(bit, Ordering::SeqCst);
+        self.memory.hang_up();
+        super::futex::wake_object(&self.memory);
+    }
+
+    // ------------------------------------------------------------ client
+
+    /// Offers the channel to the service registered as `name` and waits
+    /// until it attached it (see `restricted::SYS_CHAN_CONNECT`).
+    pub fn connect(&self, name: &str, client: Pid) -> Result<(), i64> {
+        {
+            let inner = self.inner.lock();
+            if inner.offered.is_some() || inner.service.is_some() || inner.service_gone {
+                return Err(EISCONN);
+            }
+        }
+        let to = match ipc::instance(name) {
+            Some(to) => to,
+            None => {
+                // A server of the kernel's that died is started again.
+                let server = super::server_named(name).ok_or(ENOENT)?;
+                server.revive().map_err(|_| EIO)?;
+                ipc::instance(name).ok_or(EIO)?
+            }
+        };
+        {
+            let mut inner = self.inner.lock();
+            if inner.offered.is_some() || inner.service.is_some() || inner.service_gone {
+                return Err(EISCONN);
+            }
+            inner.offered = Some(to);
+        }
+        let offer = Offer { channel: self.id, slots: self.layout.slots, client }.encode();
+        let mut message = Vec::new();
+        message.try_reserve_exact(offer.len()).map_err(|_| ENOMEM)?;
+        message.extend_from_slice(&offer);
+        // A signal gives the offer up unless the service attached already.
+        let answer = ipc::call_control(to, message, || {
+            let mut inner = self.inner.lock();
+            if inner.service.is_some() {
+                return false;
+            }
+            inner.offered = None;
+            true
+        });
+        let refused = match answer {
+            Ok(reply) => match <[u8; 8]>::try_from(reply.as_slice()).map(i64::from_le_bytes) {
+                Ok(status) if status < 0 && status > -4096 => -status,
+                _ => ECONNREFUSED,
+            },
+            Err(e) => e,
+        };
+        // Attached or not is the kernel's to say, not the answer's.
+        let mut inner = self.inner.lock();
+        if inner.service.is_some() {
+            return Ok(());
+        }
+        inner.offered = None;
+        Err(refused)
+    }
+
+    /// Grants `pages` pages of `object` from byte `offset` to the service
+    /// (see `restricted::SYS_GRANT`); returns the grant's id.
+    pub fn grant(&self, object: &Arc<PageCache>, offset: u64, pages: u64, writable: bool) -> Result<u32, i64> {
+        if offset % PAGE != 0 || pages == 0 || pages > MAX_GRANT_PAGES {
+            return Err(EINVAL);
+        }
+        let first = offset / PAGE;
+        first.checked_add(pages).ok_or(EINVAL)?;
+        // Room first (released below on failure).
+        {
+            let mut inner = self.inner.lock();
+            if inner.service_gone || inner.client_gone {
+                return Err(EPIPE);
+            }
+            if inner.service.is_none() {
+                return Err(ENOTCONN);
+            }
+            if inner.grants.len() >= MAX_GRANTS || inner.pages + pages > MAX_GRANTED_PAGES {
+                return Err(ENOSPC);
+            }
+            inner.pages += pages;
+        }
+        let unreserve = || self.inner.lock().pages -= pages;
+        let mut frames = Vec::new();
+        if frames.try_reserve_exact(pages as usize).is_err() {
+            unreserve();
+            return Err(ENOMEM);
+        }
+        for i in 0..pages {
+            match object.pin(first + i) {
+                Ok(frame) => frames.push(frame),
+                Err(e) => {
+                    for (j, frame) in frames.into_iter().enumerate() {
+                        object.unpin(first + j as u64, frame);
+                    }
+                    unreserve();
+                    return Err(e);
+                }
+            }
+        }
+        let grant = Grant { object: object.clone(), first, frames, writable, state: Mutex::new(GrantState::default()) };
+        let Ok(grant) = Arc::try_new(grant) else {
+            unreserve();
+            return Err(ENOMEM);
+        };
+        let mut inner = self.inner.lock();
+        if inner.service_gone || inner.client_gone {
+            inner.pages -= pages;
+            return Err(EPIPE);
+        }
+        // The lowest free id (from 1): an id comes back only once its
+        // grant is fully gone, after the service let go of it.
+        let mut id = 1u32;
+        for &used in inner.grants.keys() {
+            if used != id {
+                break;
+            }
+            id += 1;
+        }
+        inner.grants.insert(id, grant);
+        Ok(id)
+    }
+
+    /// Takes grant `id` back (see `restricted::SYS_REVOKE`): 0, or
+    /// `REVOKE_DRAINING` if a device may still reach its pages.
+    pub fn revoke(&self, id: u32) -> Result<i64, i64> {
+        let (grant, service) = {
+            let inner = self.inner.lock();
+            if inner.service_gone {
+                return Ok(0);
+            }
+            (inner.grants.get(&id).cloned().ok_or(EINVAL)?, inner.service.clone())
+        };
+        let mut st = grant.state.lock();
+        if st.revoked {
+            // Revoked before, or the service went meanwhile.
+            return if self.inner.lock().service_gone { Ok(0) } else { Err(EINVAL) };
+        }
+        let draining = self.retire(&grant, &mut st, service.as_ref());
+        drop(st);
+        if !draining {
+            self.forget(id, &grant);
+        }
+        Ok(draining as i64)
+    }
+
+    /// Revokes `grant` (its state locked in `st`): the service's mappings
+    /// go, then its device mappings. Whether a device may still reach it.
+    fn retire(&self, grant: &Arc<Grant>, st: &mut GrantState, service: Option<&ServiceEnd>) -> bool {
+        st.revoked = true;
+        let Some(service) = service else { return false };
+        if let Some(mm) = service.mm.upgrade() {
+            mm.lock().unmap_grant(&grant.hold());
+        }
+        st.device && !service.server.domain.unmap(grant)
+    }
+
+    /// Drops `grant` (id `id`) from the channel; its pins go with the last
+    /// reference.
+    fn forget(&self, id: u32, grant: &Arc<Grant>) {
+        let gone = {
+            let mut inner = self.inner.lock();
+            match inner.grants.get(&id) {
+                Some(g) if Arc::ptr_eq(g, grant) => {
+                    inner.pages -= grant.frames.len() as u64;
+                    inner.grants.remove(&id)
+                }
+                _ => None,
+            }
+        };
+        drop(gone);
+    }
+
+    /// The client's end is gone: every grant is revoked (draining ones
+    /// stay until the service lets go), the service sees `CLIENT_GONE`.
+    fn client_gone(&self) {
+        let (grants, service) = {
+            let mut inner = self.inner.lock();
+            if inner.client_gone {
+                return;
+            }
+            inner.client_gone = true;
+            inner.offered = None;
+            (inner.grants.iter().map(|(&id, g)| (id, g.clone())).collect::<Vec<_>>(), inner.service.clone())
+        };
+        for (id, grant) in grants {
+            let mut st = grant.state.lock();
+            let draining = !st.revoked && self.retire(&grant, &mut st, service.as_ref());
+            let keep = draining || (st.revoked && st.device);
+            drop(st);
+            if !keep {
+                self.forget(id, &grant);
+            }
+        }
+        self.set_gone(CLIENT_GONE);
+    }
+
+    // ----------------------------------------------------------- service
+
+    /// The channel `id`, attached to the calling process.
+    fn attached(id: u64) -> Result<(Arc<Channel>, ServiceEnd), i64> {
+        let me = super::current_pid();
+        let channel = CHANNELS.lock().get(&id).and_then(|e| e.service.as_ref().filter(|(pid, _)| *pid == me).map(|(_, c)| c.clone()));
+        let channel = channel.ok_or(ENOENT)?;
+        let service = channel.inner.lock().service.clone().filter(|s| s.pid == me).ok_or(ENOENT)?;
+        Ok((channel, service))
+    }
+
+    /// The service's end is gone (`died`: its process ended): every grant
+    /// is revoked, those a dead service's device may still reach go to its
+    /// server's quarantine; the client sees `SERVICE_GONE`.
+    fn service_gone(&self, died: bool) {
+        let (grants, service) = {
+            let mut inner = self.inner.lock();
+            if inner.service_gone {
+                return;
+            }
+            inner.service_gone = true;
+            inner.offered = None;
+            inner.pages = 0;
+            (core::mem::take(&mut inner.grants), inner.service.take())
+        };
+        let mm = service.as_ref().and_then(|s| s.mm.upgrade());
+        for grant in grants.into_values() {
+            let mut st = grant.state.lock();
+            st.revoked = true;
+            if let Some(mm) = &mm {
+                mm.lock().unmap_grant(&grant.hold());
+            }
+            let device = st.device;
+            drop(st);
+            // A detaching service vouches that its devices are done.
+            if let (true, true, Some(s)) = (died, device, &service) {
+                if !s.server.domain.unmap(&grant) {
+                    s.server.domain.quarantine(grant);
+                }
+            }
+        }
+        if let Some(mm) = &mm {
+            mm.lock().unmap_object(&self.memory);
+        }
+        self.set_gone(SERVICE_GONE);
+        // The registry's reference (the caller holds another one).
+        let reference = CHANNELS.lock().get_mut(&self.id).and_then(|e| e.service.take());
+        drop(reference);
+    }
+}
+
+impl Drop for Channel {
+    fn drop(&mut self) {
+        memory::with_frames(|f| unsafe { x86_64::structures::paging::FrameDeallocator::deallocate_frame(f, self.header) });
+        let mut channels = CHANNELS.lock();
+        if channels.get(&self.id).is_some_and(|e| e.channel.strong_count() == 0) {
+            channels.remove(&self.id);
+        }
+    }
+}
+
+/// The client's end of a channel, as a handle of the Linux server holds it
+/// (`linux::Object::Channel`): when the last reference goes, so does the
+/// end, and the region mapping at `addr`.
+pub struct ClientEnd {
+    pub channel: Arc<Channel>,
+    instance: Weak<super::linux::Instance>,
+    pub addr: u64,
+    /// Torn down already (`close`).
+    closed: bool,
+}
+
+impl ClientEnd {
+    pub fn new(channel: Arc<Channel>, instance: Weak<super::linux::Instance>, addr: u64) -> ClientEnd {
+        ClientEnd { channel, instance, addr, closed: false }
+    }
+
+    /// Tears the end down now (from a call that may sleep), so that when
+    /// `handle_close` returns, the service's mappings of the grants are gone
+    /// and the pins released.
+    pub fn close(mut self) {
+        self.closed = true;
+        client_gone(&self.channel, &self.instance, self.addr);
+    }
+}
+
+impl Drop for ClientEnd {
+    fn drop(&mut self) {
+        if self.closed {
+            return;
+        }
+        // May run where the kernel cannot sleep (the instance's end).
+        defer(Work::ClientGone { channel: self.channel.clone(), instance: core::mem::take(&mut self.instance), addr: self.addr });
+    }
+}
+
+fn client_gone(channel: &Channel, instance: &Weak<super::linux::Instance>, addr: u64) {
+    if let Some(instance) = instance.upgrade() {
+        instance.unmap_object(addr);
+        instance.channel_gone();
+    }
+    channel.client_gone();
+}
+
+// ------------------------------------------------------- the service's calls
+
+/// chan_attach(channel) -> addr: maps a channel offered to the calling
+/// process's service into its address space (read and write).
+pub fn attach(id: u64) -> Result<i64, i64> {
+    let me = super::current_pid();
+    let server = super::with_current(|p| p.server.clone()).ok_or(EPERM)?;
+    let channel = CHANNELS.lock().get(&id).and_then(|e| e.channel.upgrade()).ok_or(ENOENT)?;
+    let to = {
+        let inner = channel.inner.lock();
+        if inner.client_gone {
+            return Err(EPIPE);
+        }
+        if inner.service.is_some() {
+            return Err(EISCONN);
+        }
+        inner.offered.ok_or(ENOENT)?
+    };
+    // Only the service it was offered to.
+    if ipc::server_of(to) != Some(me) {
+        return Err(ENOENT);
+    }
+    let mm = super::current_mm().ok_or(EINVAL)?;
+    let len = channel.layout.bytes() as u64;
+    let addr = {
+        let mut space = mm.lock();
+        let floor = space.brk_end;
+        let start = space.find_free(len, floor).ok_or(ENOMEM)?;
+        let backing = Backing::File { cache: channel.memory.clone(), offset: 0, shared: true, may_write: true, _hold: None };
+        space.map(start, len, Prot::RW, backing, false).map_err(|_| ENOMEM)?;
+        if space.populate(start, len, true).is_err() {
+            space.unmap(start, len);
+            return Err(ENOMEM);
+        }
+        start
+    };
+    let attached = {
+        let mut channels = CHANNELS.lock();
+        let mut inner = channel.inner.lock();
+        if inner.client_gone || inner.service.is_some() || inner.offered != Some(to) {
+            Err(if inner.client_gone { EPIPE } else { ECONNREFUSED })
+        } else {
+            inner.service = Some(ServiceEnd { pid: me, mm: Arc::downgrade(&mm), server });
+            if let Some(entry) = channels.get_mut(&id) {
+                entry.service = Some((me, channel.clone()));
+            }
+            Ok(())
+        }
+    };
+    if let Err(e) = attached {
+        mm.lock().unmap(addr, len);
+        return Err(e);
+    }
+    Ok(addr as i64)
+}
+
+/// chan_detach(channel): the service lets go of the channel: its mappings
+/// of the channel and of every grant go, and the client sees
+/// `SERVICE_GONE`. The service vouches that its devices no longer use the
+/// grants.
+pub fn detach(id: u64) -> Result<i64, i64> {
+    let (channel, _) = Channel::attached(id)?;
+    channel.service_gone(false);
+    Ok(0)
+}
+
+/// The grant `grant` of the attached channel `id`, and the service.
+fn grant_of(id: u64, grant: u64) -> Result<(Arc<Channel>, ServiceEnd, Arc<Grant>), i64> {
+    let (channel, service) = Channel::attached(id)?;
+    let g = u32::try_from(grant).ok().and_then(|g| channel.inner.lock().grants.get(&g).cloned()).ok_or(ENOENT)?;
+    Ok((channel, service, g))
+}
+
+/// grant_map(channel, grant, info) -> addr: maps a grant into the calling
+/// service, read-only unless granted writable; stores (pages, writable) as
+/// two u64s at `info`.
+pub fn grant_map(id: u64, grant: u64, info: u64) -> Result<i64, i64> {
+    let (_, _, g) = grant_of(id, grant)?;
+    super::uaccess::write(info, [g.frames.len() as u64, g.writable as u64])?;
+    let st = g.state.lock();
+    if st.revoked {
+        return Err(ENOENT);
+    }
+    let mm = super::current_mm().ok_or(EINVAL)?;
+    let mut space = mm.lock();
+    let floor = space.brk_end;
+    let start = space.find_free(g.bytes(), floor).ok_or(ENOMEM)?;
+    space.map_granted(start, &g.frames, g.writable, g.hold()).map_err(|_| ENOMEM)?;
+    drop(space);
+    drop(st);
+    Ok(start as i64)
+}
+
+/// grant_dma(channel, grant, offset) -> the device address of the byte at
+/// `offset` of the grant (valid to the end of its page).
+pub fn grant_dma(id: u64, grant: u64, offset: u64) -> Result<i64, i64> {
+    let (_, service, g) = grant_of(id, grant)?;
+    if offset >= g.bytes() {
+        return Err(EINVAL);
+    }
+    let mut st = g.state.lock();
+    if st.revoked {
+        return Err(ENOENT);
+    }
+    st.device = true;
+    let address = service.server.domain.map(g.frames[(offset / PAGE) as usize]) + offset % PAGE;
+    Ok(address as i64)
+}
+
+/// grant_dma_unmap(channel, grant): the service's devices are done with
+/// the grant: its device addresses become invalid, and a revoked grant
+/// that waited for this goes.
+pub fn grant_dma_unmap(id: u64, grant: u64) -> Result<i64, i64> {
+    let (channel, service, g) = grant_of(id, grant)?;
+    let mut st = g.state.lock();
+    st.device = false;
+    service.server.domain.unmap(&g);
+    let revoked = st.revoked;
+    drop(st);
+    if revoked {
+        channel.forget(grant as u32, &g);
+    }
+    Ok(0)
+}
+
+/// The process `pid` ended: the channels it served lose their service.
+/// (Called where the kernel may not sleep: the teardown is deferred.)
+pub fn service_exited(pid: Pid) {
+    let served: Vec<Arc<Channel>> =
+        CHANNELS.lock().values().filter_map(|e| e.service.as_ref().filter(|(p, _)| *p == pid).map(|(_, c)| c.clone())).collect();
+    for channel in served {
+        defer(Work::ServiceGone(channel));
+    }
+}
+
+// ------------------------------------------------------- deferred teardown
+
+enum Work {
+    ClientGone { channel: Arc<Channel>, instance: Weak<super::linux::Instance>, addr: u64 },
+    ServiceGone(Arc<Channel>),
+}
+
+static WORK: IrqSpinLock<VecDeque<Work>> = IrqSpinLock::new(VecDeque::new());
+
+fn work_chan() -> usize {
+    &WORK as *const _ as usize
+}
+
+fn defer(work: Work) {
+    WORK.lock().push_back(work);
+    super::wakeup(work_chan());
+}
+
+/// Does the deferred teardowns now (from a context that may sleep: the
+/// worker, or a call that just dropped a channel and wants it done).
+pub fn run_deferred() {
+    loop {
+        let Some(work) = WORK.lock().pop_front() else { return };
+        match work {
+            Work::ClientGone { channel, instance, addr } => client_gone(&channel, &instance, addr),
+            Work::ServiceGone(channel) => channel.service_gone(true),
+        }
+    }
+}
+
+/// The `channels` kernel thread: does the teardowns deferred from where
+/// the kernel could not sleep.
+pub fn worker() -> ! {
+    loop {
+        let wait = super::sched::prepare_to_wait(work_chan());
+        if WORK.lock().is_empty() {
+            wait.sleep();
+        } else {
+            drop(wait);
+            run_deferred();
+        }
+    }
+}

@@ -128,6 +128,11 @@ pub enum Backing {
     File { cache: Arc<PageCache>, offset: u64, shared: bool, may_write: bool, _hold: Option<Hold> },
     /// Device memory, mapped up front (DMA areas).
     Device,
+    /// Pages granted to a channel's service (`channel`), mapped up front
+    /// and owned by `grant`, which the kernel finds them by when it takes
+    /// them back. Read-only unless `writable`, never executable, never
+    /// moved (mremap) and not inherited by fork.
+    Granted { grant: Hold, writable: bool },
 }
 
 impl Backing {
@@ -138,7 +143,12 @@ impl Backing {
 
     /// Shared memory (or device memory): never copied on write or fork.
     fn shared(&self) -> bool {
-        matches!(self, Backing::File { shared: true, .. } | Backing::Device)
+        matches!(self, Backing::File { shared: true, .. } | Backing::Device | Backing::Granted { .. })
+    }
+
+    /// Whether this is the grant `grant`'s mapping.
+    fn is_grant(&self, grant: &Hold) -> bool {
+        matches!(self, Backing::Granted { grant: g, .. } if core::ptr::addr_eq(Arc::as_ptr(g), Arc::as_ptr(grant)))
     }
 
     /// A shared mapping whose stores must mark the page dirty first (a
@@ -367,6 +377,9 @@ impl AddressSpace {
     /// `instance`: adds the normal view. Before anyone runs in it. A
     /// `program`'s space counts for the instance (its pager's has none).
     pub fn attach(&mut self, instance: Arc<super::linux::Instance>, program: bool) -> Result<(), Fault> {
+        // Known to the instance before anyone can load the view, so its
+        // shootdowns of the region reach this space.
+        instance.add_space(&self.tlb)?;
         let normal = memory::with_frames(|f| UserFrames(f).allocate_frame()).ok_or(Fault::Oom)?;
         let (table, mine) = (table_at(normal), table_at(self.l4));
         for i in 0..512 {
@@ -552,6 +565,11 @@ impl AddressSpace {
             if prot.write && matches!(v.backing, Backing::File { shared: true, may_write: false, .. }) {
                 return Err(Fault::Access);
             }
+            if let Backing::Granted { writable, .. } = v.backing {
+                if (prot.write && !writable) || prot.exec {
+                    return Err(Fault::Access);
+                }
+            }
             at = v.end;
         }
         let needed: u64 = self
@@ -628,7 +646,7 @@ impl AddressSpace {
     pub fn remap(&mut self, old: u64, old_len: u64, new_len: u64, may_move: bool, fixed: Option<u64>, floor: u64) -> Result<u64, Fault> {
         let v = self.vma(old).cloned().ok_or(Fault::Segv)?;
         let old_end = old.checked_add(old_len).ok_or(Fault::Segv)?;
-        if old_end > v.end || matches!(v.backing, Backing::Device) {
+        if old_end > v.end || matches!(v.backing, Backing::Device | Backing::Granted { .. }) {
             return Err(Fault::Segv);
         }
         if new_len <= old_len && fixed.is_none() {
@@ -749,7 +767,7 @@ impl AddressSpace {
     fn new_frame(&mut self, page: u64, v: &Vma, access: Access) -> Result<(PhysFrame, bool), Fault> {
         match &v.backing {
             Backing::Anon => Ok((zeroed_frame()?, true)),
-            Backing::Device => Err(Fault::Segv),
+            Backing::Device | Backing::Granted { .. } => Err(Fault::Segv),
             Backing::File { cache, offset, shared, .. } => {
                 // Reading a missing page may sleep (a remote file): only the
                 // address space is locked.
@@ -922,6 +940,48 @@ impl AddressSpace {
         Ok(())
     }
 
+    /// Maps `frames` (pinned by `grant`) at `start` (see
+    /// `Backing::Granted`); each entry holds a reference on its frame.
+    /// Nothing is mapped on failure.
+    pub fn map_granted(&mut self, start: u64, frames: &[PhysFrame], writable: bool, grant: Hold) -> Result<(), Fault> {
+        let len = frames.len() as u64 * PAGE;
+        if len == 0 || start % PAGE != 0 || start.checked_add(len).is_none_or(|e| e > USER_END) || self.overlaps(start, start + len) {
+            return Err(Fault::Segv);
+        }
+        let prot = Prot { read: true, write: writable, exec: false };
+        self.insert(Vma { start, end: start + len, prot, backing: Backing::Granted { grant, writable }, charged: false, grows_down: false });
+        for (i, &frame) in frames.iter().enumerate() {
+            memory::with_frames(|f| f.share(frame));
+            if let Err(e) = self.install(start + i as u64 * PAGE, frame, prot.flags()) {
+                self.unmap(start, len);
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    /// Removes every mapping of `grant` (`map_granted`).
+    pub fn unmap_grant(&mut self, grant: &Hold) {
+        let ranges: alloc::vec::Vec<(u64, u64)> =
+            self.vmas.values().filter(|v| v.backing.is_grant(grant)).map(|v| (v.start, v.end - v.start)).collect();
+        for (start, len) in ranges {
+            self.unmap(start, len);
+        }
+    }
+
+    /// Removes every mapping of the memory object `cache`.
+    pub fn unmap_object(&mut self, cache: &PageCache) {
+        let ranges: alloc::vec::Vec<(u64, u64)> = self
+            .vmas
+            .values()
+            .filter(|v| v.file().is_some_and(|(c, _)| core::ptr::eq(Arc::as_ptr(c), cache)))
+            .map(|v| (v.start, v.end - v.start))
+            .collect();
+        for (start, len) in ranges {
+            self.unmap(start, len);
+        }
+    }
+
     /// Writes into the address space (faulting pages in), also when it is
     /// not active, regardless of the areas' rights (the loader clears the
     /// bss part of a segment's last file page). A frame shared with others
@@ -1042,8 +1102,9 @@ impl AddressSpace {
             memory::uncommit(charged);
             return Err(Fault::Oom);
         };
-        new.vmas = self.vmas.clone();
-        new.stats.virt_pages.store(self.stats.virt_pages.load(Ordering::Relaxed), Ordering::Relaxed);
+        // Granted pages are the service's alone: a child does not get them.
+        new.vmas = self.vmas.iter().filter(|(_, v)| !matches!(v.backing, Backing::Granted { .. })).map(|(&k, v)| (k, v.clone())).collect();
+        new.stats.virt_pages.store(new.vmas.values().map(|v| v.pages()).sum(), Ordering::Relaxed);
         let mut mapper = new.mapper();
         let parent = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
         let vmas = &self.vmas;
@@ -1057,7 +1118,11 @@ impl AddressSpace {
                         let l1 = table_at(PhysFrame::containing_address(l2e.addr()));
                         for (i1, leaf) in l1.iter_mut().enumerate().filter(|(_, e)| !e.is_unused()) {
                             let va = (i4 as u64) << 39 | (i3 as u64) << 30 | (i2 as u64) << 21 | (i1 as u64) << 12;
-                            let shared = vmas.range(..=va).next_back().is_some_and(|(_, v)| va < v.end && v.backing.shared());
+                            let area = vmas.range(..=va).next_back().map(|(_, v)| v).filter(|v| va < v.end);
+                            if area.is_some_and(|v| matches!(v.backing, Backing::Granted { .. })) {
+                                continue;
+                            }
+                            let shared = area.is_some_and(|v| v.backing.shared());
                             let mut flags = leaf.flags();
                             if !shared && flags.contains(PageTableFlags::WRITABLE) {
                                 flags.remove(PageTableFlags::WRITABLE);

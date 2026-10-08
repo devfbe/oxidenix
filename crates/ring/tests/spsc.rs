@@ -144,3 +144,36 @@ fn the_doorbell_loses_no_wakeup() {
     consumer.join().unwrap();
     assert!(wait.sleeps.load(Ordering::Relaxed) > 0, "the consumer slept at least once");
 }
+
+#[test]
+fn a_sleeper_wakes_when_the_peer_is_gone() {
+    use std::sync::atomic::AtomicBool;
+    let mem = Arc::new(RingMemory::<8>::new());
+    let wait = Arc::new(TestWait { lock: Mutex::new(()), cond: Condvar::new(), sleeps: AtomicUsize::new(0) });
+    let gone = Arc::new(AtomicBool::new(false));
+    let consumer = {
+        let (mem, wait, gone) = (mem.clone(), wait.clone(), gone.clone());
+        thread::spawn(move || {
+            let ring = Ring::new(&mem);
+            let mut c = ring.consumer();
+            let first = c.pop_wait_while(&*wait, || !gone.load(Ordering::SeqCst));
+            let second = c.pop_wait_while(&*wait, || !gone.load(Ordering::SeqCst));
+            (first.map(|d| d.tag), second)
+        })
+    };
+    let ring = Ring::new(&mem);
+    let mut p = ring.producer();
+    assert!(p.push(&desc(7)));
+    p.ring_doorbell(&*wait);
+    while wait.sleeps.load(Ordering::Relaxed) == 0 {
+        thread::yield_now();
+    }
+    // What a channel's teardown does: mark the peer gone, then wake.
+    gone.store(true, Ordering::SeqCst);
+    wait.wake(&AtomicU32::new(0));
+    let (first, second) = consumer.join().unwrap();
+    assert_eq!(first, Some(7));
+    assert_eq!(second, None);
+    // The sleep flag is cleared again.
+    assert_eq!(unsafe { *(Arc::as_ptr(&mem) as *const u8).add(ring::SLEEPING_OFFSET) }, 0);
+}

@@ -10,7 +10,13 @@
 //! The Linux server's own memory (its shared region, see `linux`) has a
 //! third kind of key: the server instance and the address. That memory is
 //! pinned and in no address space's areas; the kernel reads its words
-//! directly (`server_wait`, `server_wake`).
+//! directly (`server_wait`, `server_wake`). A memory object mapped into
+//! that region (a channel, see `channel`) keeps the object's key, so the
+//! server and a service mapping the object meet on it (`object_wait`).
+//!
+//! An object can be hung up (`PageCache::hang_up`, a channel whose peer is
+//! gone): waits on it fail with EPIPE, checked under the bucket lock, and
+//! `wake_object` wakes every waiter on it, so none sleeps on after.
 //!
 //! Waiters sit in hashed buckets. A waiter compares the futex word under
 //! its bucket lock and enqueues itself before releasing it; a waker changes
@@ -21,6 +27,7 @@
 
 use super::address_space::Backing;
 use super::errno::*;
+use crate::fs::cache::PageCache;
 use super::sched::{current, current_arc, prepare_to_sleep, try_wake};
 use super::task::{State, Task};
 use super::{signal, uaccess};
@@ -72,23 +79,24 @@ fn bucket_of(key: &Key) -> usize {
     (h >> 56) as usize % BUCKETS
 }
 
-/// The key of the futex word at `uaddr` for the running task.
-fn key_of(uaddr: u64, private: bool) -> Result<Key, i64> {
+/// The key of the futex word at `uaddr` for the running task, and the
+/// shared object it lies in.
+fn key_of(uaddr: u64, private: bool) -> Result<(Key, Option<Arc<PageCache>>), i64> {
     if uaddr % 4 != 0 {
         return Err(EINVAL);
     }
     let mm = super::current_mm().ok_or(EFAULT)?;
     let mm_key = Key { base: Base::Mm(Arc::as_ptr(&mm) as usize), offset: uaddr };
     if private {
-        return Ok(mm_key);
+        return Ok((mm_key, None));
     }
     let space = mm.lock();
     let v = space.vma(uaddr).ok_or(EFAULT)?;
     Ok(match &v.backing {
         Backing::File { cache, offset, shared: true, .. } => {
-            Key { base: Base::Shared(Arc::as_ptr(cache) as usize), offset: offset + (uaddr - v.start) }
+            (Key { base: Base::Shared(Arc::as_ptr(cache) as usize), offset: offset + (uaddr - v.start) }, Some(cache.clone()))
         }
-        _ => mm_key,
+        _ => (mm_key, None),
     })
 }
 
@@ -114,19 +122,24 @@ fn wait(uaddr: u64, val: u32, deadline: Option<u64>, bitset: u32, private: bool)
     if bitset == 0 {
         return Err(EINVAL);
     }
-    let key = key_of(uaddr, private)?;
+    let (key, object) = key_of(uaddr, private)?;
+    let hung_up = || object.as_ref().is_some_and(|o| o.is_hung_up());
     // Not readable without a fault: fault it in (not under the bucket's
     // lock), then try again.
-    wait_on(key, || uaccess::read_u32_atomic(uaddr), || uaccess::read::<u32>(uaddr).map(|_| ()), val, deadline, bitset, true)
+    wait_on(key, || uaccess::read_u32_atomic(uaddr), || uaccess::read::<u32>(uaddr).map(|_| ()), hung_up, val, deadline, bitset, true)
 }
 
 /// Waits on `key` while the word is `val`: `peek` reads it without
 /// faulting (None if it cannot), `fault_in` makes it readable. A signal
-/// ends the wait if `interruptible`, a fatal one always.
+/// ends the wait if `interruptible`, a fatal one always. EPIPE if
+/// `hung_up` (the word's object was hung up; checked under the bucket
+/// lock, which `wake_object` takes after hanging it up).
+#[allow(clippy::too_many_arguments)]
 fn wait_on(
     key: Key,
     peek: impl Fn() -> Option<u32>,
     fault_in: impl Fn() -> Result<(), i64>,
+    hung_up: impl Fn() -> bool,
     val: u32,
     deadline: Option<u64>,
     bitset: u32,
@@ -137,6 +150,9 @@ fn wait_on(
     let mut wait = loop {
         let wait = prepare_to_sleep();
         let mut b = BUCKETS_[index].lock();
+        if hung_up() {
+            return Err(EPIPE);
+        }
         match peek() {
             Some(v) if v != val => return Err(EAGAIN),
             Some(_) => {
@@ -222,7 +238,7 @@ fn wake(uaddr: u64, n: u64, bitset: u32, private: bool) -> Result<i64, i64> {
     if bitset == 0 {
         return Err(EINVAL);
     }
-    let key = key_of(uaddr, private)?;
+    let (key, _) = key_of(uaddr, private)?;
     let mut b = BUCKETS_[bucket_of(&key)].lock();
     Ok(wake_in(&mut b, &key, n, bitset) as i64)
 }
@@ -230,7 +246,7 @@ fn wake(uaddr: u64, n: u64, bitset: u32, private: bool) -> Result<i64, i64> {
 /// Wakes up to `n_wake` waiters of `uaddr` and moves up to `n_move` more
 /// to `uaddr2`; with `cmp`, only if the word still holds that value.
 fn requeue(uaddr: u64, n_wake: u64, n_move: u64, uaddr2: u64, cmp: Option<u32>, private: bool) -> Result<i64, i64> {
-    let (from, to) = (key_of(uaddr, private)?, key_of(uaddr2, private)?);
+    let (from, to) = (key_of(uaddr, private)?.0, key_of(uaddr2, private)?.0);
     let (i1, i2) = (bucket_of(&from), bucket_of(&to));
     loop {
         // Both buckets, in index order (once if they are the same).
@@ -288,7 +304,49 @@ fn requeue(uaddr: u64, n_wake: u64, n_move: u64, uaddr2: u64, cmp: Option<u32>, 
 /// `instance`), read through `word`, while it holds `val`.
 pub fn server_wait(instance: usize, addr: u64, word: &core::sync::atomic::AtomicU32, val: u32, deadline: Option<u64>, interruptible: bool) -> Result<i64, i64> {
     let key = Key { base: Base::Server(instance), offset: addr };
-    wait_on(key, || Some(word.load(Ordering::SeqCst)), || Ok(()), val, deadline, FUTEX_BITSET_MATCH_ANY, interruptible)
+    wait_on(key, || Some(word.load(Ordering::SeqCst)), || Ok(()), || false, val, deadline, FUTEX_BITSET_MATCH_ANY, interruptible)
+}
+
+/// Waits on the word at `offset` of the memory object `object`, read
+/// through `word` (the object's page, which the caller keeps), while it
+/// holds `val`: the Linux server's wait on an object mapped into its
+/// region, meeting a service's futex on its own mapping of the object.
+pub fn object_wait(
+    object: &Arc<PageCache>,
+    offset: u64,
+    word: &core::sync::atomic::AtomicU32,
+    val: u32,
+    deadline: Option<u64>,
+    interruptible: bool,
+) -> Result<i64, i64> {
+    let key = Key { base: Base::Shared(Arc::as_ptr(object) as usize), offset };
+    let hung_up = || object.is_hung_up();
+    wait_on(key, || Some(word.load(Ordering::SeqCst)), || Ok(()), hung_up, val, deadline, FUTEX_BITSET_MATCH_ANY, interruptible)
+}
+
+/// Wakes up to `n` waiters on the word at `offset` of `object`.
+pub fn object_wake(object: &PageCache, offset: u64, n: u64) -> i64 {
+    let key = Key { base: Base::Shared(object as *const PageCache as usize), offset };
+    let mut b = BUCKETS_[bucket_of(&key)].lock();
+    wake_in(&mut b, &key, n, FUTEX_BITSET_MATCH_ANY) as i64
+}
+
+/// Wakes every waiter on any word of `object` (after `hang_up`).
+pub fn wake_object(object: &PageCache) {
+    let base = Base::Shared(object as *const PageCache as usize);
+    for bucket in BUCKETS_.iter() {
+        let mut b = bucket.lock();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i].key.base == base {
+                let w = b.swap_remove(i);
+                w.task.futex_woken.store(true, Ordering::Release);
+                try_wake(&w.task, State::Sleeping);
+            } else {
+                i += 1;
+            }
+        }
+    }
 }
 
 /// Wakes up to `n` waiters on `addr` of the Linux server's memory.

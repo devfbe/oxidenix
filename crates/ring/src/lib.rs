@@ -201,13 +201,26 @@ impl<const N: usize> Consumer<'_, N> {
 
     /// The next entry, sleeping until there is one.
     pub fn pop_wait(&mut self, w: &impl Wait) -> Desc {
-        let mut flagged = false;
         loop {
-            if let Some(d) = self.pop() {
-                if flagged {
-                    self.mem.sleeping.0.store(0, Ordering::Relaxed);
-                }
+            if let Some(d) = self.pop_wait_while(w, || true) {
                 return d;
+            }
+        }
+    }
+
+    /// The next entry, sleeping until there is one while `live()` holds;
+    /// None once it does not (the peer is gone). `live` is checked each
+    /// time the ring is found empty, before sleeping: whatever ends the
+    /// peer must also end the sleep (a channel's teardown fails the futex
+    /// waits on its memory, see `channel`), so that no end sleeps forever.
+    pub fn pop_wait_while(&mut self, w: &impl Wait, live: impl Fn() -> bool) -> Option<Desc> {
+        let mut flagged = false;
+        let result = loop {
+            if let Some(d) = self.pop() {
+                break Some(d);
+            }
+            if !live() {
+                break None;
             }
             self.mem.sleeping.0.store(1, Ordering::Relaxed);
             flagged = true;
@@ -216,6 +229,29 @@ impl<const N: usize> Consumer<'_, N> {
             if tail == self.head {
                 w.wait(&self.mem.tail.0, tail);
             }
+        };
+        if flagged {
+            self.mem.sleeping.0.store(0, Ordering::Relaxed);
         }
+        result
     }
 }
+
+/// Offsets of the words in a `RingMemory` (for the kernel, which wakes the
+/// sleepers of a channel whose peer died).
+pub const HEAD_OFFSET: usize = 0;
+pub const TAIL_OFFSET: usize = 64;
+pub const SLEEPING_OFFSET: usize = 128;
+/// Bytes of a `RingMemory` before its slots.
+pub const RING_HEADER: usize = 192;
+
+const _: () = {
+    assert!(core::mem::offset_of!(RingMemory<2>, head) == HEAD_OFFSET);
+    assert!(core::mem::offset_of!(RingMemory<2>, tail) == TAIL_OFFSET);
+    assert!(core::mem::offset_of!(RingMemory<2>, sleeping) == SLEEPING_OFFSET);
+    assert!(core::mem::offset_of!(RingMemory<2>, slots) == RING_HEADER);
+    assert!(core::mem::size_of::<RingMemory<8>>() == RING_HEADER + 8 * 64);
+};
+
+pub mod channel;
+pub mod selftest;

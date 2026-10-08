@@ -101,7 +101,24 @@ pub struct Instance {
     /// The top of the server's heap, and the pages committed for it.
     heap_end: spin::Mutex<u64>,
     heap_pages: core::sync::atomic::AtomicU64,
+    /// Memory objects the kernel mapped into the region (channels), by
+    /// address; held while their entries change and shootdowns run.
+    maps: crate::sync::Mutex<BTreeMap<u64, RegionMap>>,
+    /// The address spaces showing the region (their normal view), for the
+    /// shootdowns of `unmap_object`.
+    spaces: spin::Mutex<Vec<Weak<super::tlb::Tlb>>>,
+    /// Channels the instance holds (at most `MAX_CHANNELS`).
+    channels: core::sync::atomic::AtomicUsize,
 }
+
+/// A memory object mapped into the region (`Instance::map_object`).
+struct RegionMap {
+    pages: u64,
+    object: Arc<PageCache>,
+}
+
+/// Most channels one instance may hold.
+const MAX_CHANNELS: usize = 64;
 
 /// Events for the instance's service thread (the pager thread): pages
 /// wanted from it, and server files whose last descriptor went. A page
@@ -129,8 +146,11 @@ pub(super) enum Object {
     Inode(Arc<crate::fs::Inode>),
     /// The contents of a file of the server's (a tmpfs file object), with
     /// the hold this handle carries (`SYS_MO_HOLD`).
-    File(Arc<PageCache>, Option<Arc<Record>>),    /// The initramfs of the boot image, read-only (`SYS_INITRAMFS`).
+    File(Arc<PageCache>, Option<Arc<Record>>),
+    /// The initramfs of the boot image, read-only (`SYS_INITRAMFS`).
     Image(&'static [u8]),
+    /// The client's end of a channel to a device server (`SYS_CHAN_CREATE`).
+    Channel(Arc<super::channel::ClientEnd>),
 }
 
 /// Most handles one instance may hold.
@@ -181,6 +201,9 @@ impl Instance {
             programs: core::sync::atomic::AtomicUsize::new(0),
             heap_end: spin::Mutex::new(HEAP_BASE),
             heap_pages: core::sync::atomic::AtomicU64::new(0),
+            maps: crate::sync::Mutex::new(BTreeMap::new()),
+            spaces: spin::Mutex::new(Vec::new()),
+            channels: core::sync::atomic::AtomicUsize::new(0),
         };
         instance.entry = instance.load(image)?;
         Arc::try_new(instance).map_err(|_| ENOMEM)
@@ -226,7 +249,7 @@ impl Instance {
             for ph in elf.program_headers().filter(|p| p.kind == super::elf::PT_LOAD) {
                 let end = ph.vaddr.checked_add(ph.memsz).ok_or(ENOEXEC)?;
                 let file_end = ph.offset.checked_add(ph.filesz).ok_or(ENOEXEC)?;
-                if ph.vaddr < IMAGE_BASE || end > THREADS_BASE || file_end > size || ph.filesz > ph.memsz {
+                if ph.vaddr < IMAGE_BASE || end > MAPS_BASE || file_end > size || ph.filesz > ph.memsz {
                     return Err(ENOEXEC);
                 }
                 let (w, x) = (ph.flags & super::elf::PF_W != 0, ph.flags & super::elf::PF_X != 0);
@@ -274,7 +297,7 @@ impl Instance {
             memory::with_frames(|f| unsafe { f.deallocate_frame(frame) });
         }
         mapped?;
-        if elf.entry < IMAGE_BASE || elf.entry >= THREADS_BASE {
+        if elf.entry < IMAGE_BASE || elf.entry >= MAPS_BASE {
             return Err(ENOEXEC);
         }
         Ok(elf.entry)
@@ -355,6 +378,117 @@ impl Instance {
         Ok(unsafe { &*(memory::phys_to_virt(phys) as *const core::sync::atomic::AtomicU32) })
     }
 
+    /// An address space whose normal view shows the region appeared.
+    pub fn add_space(&self, tlb: &Arc<super::tlb::Tlb>) -> Result<(), super::address_space::Fault> {
+        let mut spaces = self.spaces.lock();
+        spaces.retain(|t| t.strong_count() > 0);
+        spaces.try_reserve(1).map_err(|_| super::address_space::Fault::Oom)?;
+        spaces.push(Arc::downgrade(tlb));
+        Ok(())
+    }
+
+    /// Maps the first `pages` pages of `object` writable into the region
+    /// (`MAPS_BASE..HEAP_BASE`); returns where. Each entry holds a reference
+    /// on its frame, the region's entry the object.
+    pub(super) fn map_object(&self, object: &Arc<PageCache>, pages: u64) -> Result<u64, i64> {
+        let len = pages.checked_mul(PAGE).filter(|&l| l > 0).ok_or(EINVAL)?;
+        let mut maps = self.maps.lock();
+        // First fit.
+        let mut start = MAPS_BASE;
+        for (&at, m) in maps.iter() {
+            if at - start >= len {
+                break;
+            }
+            start = at + m.pages * PAGE;
+        }
+        if start.checked_add(len).is_none_or(|e| e > HEAP_BASE) {
+            return Err(ENOMEM);
+        }
+        maps.insert(start, RegionMap { pages, object: object.clone() });
+        for i in 0..pages {
+            let mapped = object.map_page(i).map_err(|_| ENOMEM).and_then(|frame| self.map(start + i * PAGE, frame, PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE));
+            if let Err(e) = mapped {
+                self.unmap_pages(start, i);
+                maps.remove(&start);
+                return Err(e);
+            }
+        }
+        Ok(start)
+    }
+
+    /// Removes the object mapped at `addr` by `map_object`.
+    pub(super) fn unmap_object(&self, addr: u64) {
+        let mut maps = self.maps.lock();
+        if let Some(m) = maps.remove(&addr) {
+            // Under the lock: the range is not handed out again before
+            // every TLB dropped it.
+            self.unmap_pages(addr, m.pages);
+        }
+    }
+
+    /// Removes the entries of `pages` pages at `start`, drops them from the
+    /// TLBs of every address space showing the region, then lets go of the
+    /// frames.
+    fn unmap_pages(&self, start: u64, pages: u64) {
+        let mut mapper = unsafe { OffsetPageTable::new(table_at(self.view), memory::phys_offset()) };
+        let mut frames = Vec::new();
+        // Without room to collect the frames, one page at a time.
+        let batch = frames.try_reserve_exact(pages as usize).is_ok();
+        for i in 0..pages {
+            let at = start + i * PAGE;
+            if let Ok((frame, flush)) = mapper.unmap(Page::<Size4KiB>::containing_address(VirtAddr::new(at))) {
+                flush.ignore();
+                if batch {
+                    frames.push(frame);
+                } else {
+                    self.shootdown(at, at + PAGE);
+                    memory::with_frames(|f| unsafe { f.deallocate_frame(frame) });
+                }
+            }
+        }
+        if batch {
+            self.shootdown(start, start + pages * PAGE);
+        }
+        memory::with_frames(|f| {
+            for frame in frames {
+                unsafe { f.deallocate_frame(frame) };
+            }
+        });
+    }
+
+    fn shootdown(&self, start: u64, end: u64) {
+        let spaces: Vec<Arc<super::tlb::Tlb>> = self.spaces.lock().iter().filter_map(Weak::upgrade).collect();
+        for tlb in spaces {
+            super::tlb::shootdown(&tlb, start, end);
+        }
+    }
+
+    /// The object mapped by `map_object` at `addr`, the offset of `addr` in
+    /// it, and the word there (valid while the object is kept).
+    fn object_word(&self, addr: u64) -> Option<(Arc<PageCache>, u64, &core::sync::atomic::AtomicU32)> {
+        if !(MAPS_BASE..HEAP_BASE).contains(&addr) {
+            return None;
+        }
+        let maps = self.maps.lock();
+        let (&start, m) = maps.range(..=addr).next_back()?;
+        if addr >= start + m.pages * PAGE {
+            return None;
+        }
+        // Translated under the lock: the entry is still the object's page.
+        let word = self.word(addr).ok()?;
+        Some((m.object.clone(), addr - start, word))
+    }
+
+    /// Counts a new channel of the instance (EMFILE beyond `MAX_CHANNELS`).
+    pub(super) fn channel_added(&self) -> Result<(), i64> {
+        use core::sync::atomic::Ordering::Relaxed;
+        self.channels.try_update(Relaxed, Relaxed, |n| (n < MAX_CHANNELS).then_some(n + 1)).map(|_| ()).map_err(|_| EMFILE)
+    }
+
+    pub(super) fn channel_gone(&self) {
+        self.channels.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+    }
+
     /// A new handle for `object`.
     pub(super) fn insert(&self, object: Object) -> Result<u64, i64> {
         let mut h = self.handles.lock();
@@ -369,6 +503,13 @@ impl Instance {
 
     pub(super) fn object(&self, handle: u64) -> Result<Object, i64> {
         self.handles.lock().objects.get(&handle).cloned().ok_or(EBADF)
+    }
+
+    fn channel(&self, handle: u64) -> Result<Arc<super::channel::ClientEnd>, i64> {
+        match self.object(handle)? {
+            Object::Channel(c) => Ok(c),
+            _ => Err(EINVAL),
+        }
     }
 
     fn memory(&self, handle: u64) -> Result<Arc<PageCache>, i64> {
@@ -693,7 +834,15 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
     let mm = || super::current_mm().ok_or(EINVAL);
     match nr {
         SYS_HANDLE_CLOSE => {
-            instance.handles.lock().objects.remove(&a[0]).map(|_| 0).ok_or(EBADF)
+            let object = instance.handles.lock().objects.remove(&a[0]).ok_or(EBADF)?;
+            // Released outside the lock. A channel's end goes now, unless a
+            // call of another thread still uses it (then with that call).
+            if let Object::Channel(end) = object {
+                if let Ok(end) = Arc::try_unwrap(end) {
+                    end.close();
+                }
+            }
+            Ok(0)
         }
         SYS_MO_CREATE => {
             let pages = a[0];
@@ -726,7 +875,7 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
                         Backing::File { cache, offset, shared, may_write, _hold: None }
                     }
                     Object::KernelFile(f) => file_backing(&f, shared, prot, len, offset)?,
-                    Object::Inode(_) | Object::Image(_) => return Err(EINVAL),
+                    Object::Inode(_) | Object::Image(_) | Object::Channel(_) => return Err(EINVAL),
                     // As a file's mapping: it may reach beyond the end (SIGBUS
                     // there), and keeps the handle's hold while it exists.
                     Object::File(cache, hold) => {
@@ -940,13 +1089,63 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             if flags & !FUTEX_INTERRUPTIBLE != 0 {
                 return Err(EINVAL);
             }
+            let (deadline, interruptible) = ((deadline != 0).then_some(deadline), flags & FUTEX_INTERRUPTIBLE != 0);
+            // A word of an object mapped into the region has the object's key.
+            if let Some((object, offset, word)) = instance.object_word(addr) {
+                return super::futex::object_wait(&object, offset, word, val, deadline, interruptible);
+            }
             let word = instance.word(addr)?;
             let id = Arc::as_ptr(&instance) as usize;
-            super::futex::server_wait(id, addr, word, val, (deadline != 0).then_some(deadline), flags & FUTEX_INTERRUPTIBLE != 0)
+            super::futex::server_wait(id, addr, word, val, deadline, interruptible)
         }
         SYS_SERVER_FUTEX_WAKE => {
+            if let Some((object, offset, _)) = instance.object_word(a[0]) {
+                return Ok(super::futex::object_wake(&object, offset, a[1]));
+            }
             instance.word(a[0])?;
             Ok(super::futex::server_wake(Arc::as_ptr(&instance) as usize, a[0], a[1]))
+        }
+        SYS_CHAN_CREATE => {
+            instance.channel_added()?;
+            let mapped = super::channel::Channel::new(a[0]).and_then(|c| instance.map_object(c.memory(), c.pages()).map(|addr| (c, addr)));
+            let (channel, addr) = mapped.inspect_err(|_| instance.channel_gone())?;
+            // From here on, dropping the end undoes it all (also when it
+            // cannot be allocated).
+            let end = Arc::try_new(super::channel::ClientEnd::new(channel, Arc::downgrade(&instance), addr)).map_err(|_| {
+                super::channel::run_deferred();
+                ENOMEM
+            })?;
+            let handle = instance.insert(Object::Channel(end)).inspect_err(|_| super::channel::run_deferred())?;
+            if let Err(e) = super::uaccess::copy_to_server(a[1], &addr.to_le_bytes()) {
+                let end = instance.handles.lock().objects.remove(&handle);
+                drop(end);
+                super::channel::run_deferred();
+                return Err(e);
+            }
+            Ok(handle as i64)
+        }
+        SYS_CHAN_CONNECT => {
+            let end = instance.channel(a[0])?;
+            if a[2] > 64 {
+                return Err(EINVAL);
+            }
+            let mut name = [0u8; 64];
+            super::uaccess::copy_from_server(a[1], &mut name[..a[2] as usize])?;
+            let name = core::str::from_utf8(&name[..a[2] as usize]).map_err(|_| EINVAL)?;
+            end.channel.connect(name, super::current_pid())?;
+            Ok(0)
+        }
+        SYS_GRANT => {
+            let end = instance.channel(a[0])?;
+            let object = instance.memory(a[1])?;
+            if a[4] & !GRANT_WRITE != 0 {
+                return Err(EINVAL);
+            }
+            Ok(end.channel.grant(&object, a[2], a[3], a[4] & GRANT_WRITE != 0)? as i64)
+        }
+        SYS_REVOKE => {
+            let end = instance.channel(a[0])?;
+            end.channel.revoke(u32::try_from(a[1]).map_err(|_| EINVAL)?)
         }
         SYS_MO_UNMAP => {
             let len = range(a[0], a[1])?;

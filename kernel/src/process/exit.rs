@@ -122,6 +122,8 @@ fn process_exit(group: &Arc<ThreadGroup>, status: i32) {
     let pid = group.tgid;
     ipc::on_exit(pid);
     irq::on_exit(pid);
+    // Channels it served lose their service (and their clients learn it).
+    super::channel::service_exited(pid);
     // A zombie gets no SIGALRM.
     super::signal::stop_alarm(group);
     // Orphans go to the kernel, which reaps them; those that asked for it

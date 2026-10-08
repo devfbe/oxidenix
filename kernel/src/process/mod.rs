@@ -3,6 +3,7 @@
 //! IPC, restricted mode and the system calls.
 
 pub mod address_space;
+pub mod channel;
 pub mod clone;
 pub mod elf;
 pub mod errno;
@@ -410,6 +411,17 @@ pub struct Server {
     start_timeout: u64,
     restarts: core::sync::atomic::AtomicU32,
     restarting: core::sync::atomic::AtomicBool,
+    /// Where its devices reach the pages granted to it (channels).
+    pub domain: channel::DmaDomain,
+}
+
+/// The servers the kernel started, by name: a channel to a dead one
+/// starts it again (`server_named`).
+static SERVERS: spin::Mutex<Vec<Arc<Server>>> = spin::Mutex::new(Vec::new());
+
+/// The server the kernel started under the IPC name `name`.
+pub fn server_named(name: &str) -> Option<Arc<Server>> {
+    SERVERS.lock().iter().find(|s| s.name == name).cloned()
 }
 
 /// How often a dead server is restarted before the kernel gives up on it.
@@ -434,11 +446,18 @@ impl Server {
             start_timeout: 3 * crate::time::NSEC_PER_SEC,
             restarts: core::sync::atomic::AtomicU32::new(0),
             restarting: core::sync::atomic::AtomicBool::new(false),
+            domain: channel::DmaDomain::default(),
         })
     }
 
     /// Starts the server and waits for it to register: (service, argument).
     pub fn start(self: &Arc<Self>) -> Result<(usize, u64), i64> {
+        {
+            let mut servers = SERVERS.lock();
+            if !servers.iter().any(|s| Arc::ptr_eq(s, self)) {
+                servers.push(self.clone());
+            }
+        }
         spawn_server(self)?;
         ipc::wait_for(self.name, self.start_timeout).ok_or(EIO)
     }
