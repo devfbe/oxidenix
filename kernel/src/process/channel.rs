@@ -47,7 +47,7 @@ use super::{ipc, Pid, Server};
 use crate::fs::cache::PageCache;
 use crate::memory;
 use crate::sync::{IrqSpinLock, Mutex};
-use alloc::collections::{BTreeMap, VecDeque};
+use alloc::boxed::Box;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -62,13 +62,29 @@ const MAX_GRANTED_PAGES: u64 = 1 << 16;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
-/// Every channel by id; the attached ones also with their service process
-/// and a reference (an attached channel lives as long as its service end).
-static CHANNELS: IrqSpinLock<BTreeMap<u64, Entry>> = IrqSpinLock::new(BTreeMap::new());
+/// Every channel, by id (ascending: ids only grow); the attached ones also
+/// with their service. Grown fallibly: nothing here allocates under the
+/// lock where failing would panic.
+static CHANNELS: IrqSpinLock<Vec<Entry>> = IrqSpinLock::new(Vec::new());
 
 struct Entry {
+    id: u64,
     channel: Weak<Channel>,
-    service: Option<(Pid, Arc<Channel>)>,
+    service: Option<Registered>,
+}
+
+/// An attached channel's service: an attached channel lives as long as
+/// its service end.
+struct Registered {
+    pid: Pid,
+    channel: Arc<Channel>,
+    /// The teardown to queue when the process ends or executes a new
+    /// program (made at attach: queuing it then allocates nothing).
+    exit: Option<Box<WorkNode>>,
+}
+
+fn entry(channels: &mut [Entry], id: u64) -> Option<&mut Entry> {
+    channels.binary_search_by_key(&id, |e| e.id).ok().map(|i| &mut channels[i])
 }
 
 pub struct Channel {
@@ -159,6 +175,8 @@ pub struct Grant {
     /// Held (sleeping) across the changes of the service's mappings, so a
     /// mapping or a device address can never be made after the revoke.
     state: Mutex<GrantState>,
+    /// The next grant in its domain's quarantine.
+    quarantined: spin::Mutex<Option<Arc<Grant>>>,
 }
 
 #[derive(Default)]
@@ -196,7 +214,8 @@ impl Grant {
 /// until the device is reset.
 #[derive(Default)]
 pub struct DmaDomain {
-    quarantine: spin::Mutex<Vec<Arc<Grant>>>,
+    /// A list through `Grant::quarantined`: entering one never allocates.
+    quarantine: spin::Mutex<Option<Arc<Grant>>>,
 }
 
 impl DmaDomain {
@@ -215,14 +234,20 @@ impl DmaDomain {
 
     /// Keeps `grant` (and its pins) until the device is reset.
     fn quarantine(&self, grant: Arc<Grant>) {
-        self.quarantine.lock().push(grant);
+        let mut head = self.quarantine.lock();
+        *grant.quarantined.lock() = head.take();
+        *head = Some(grant);
     }
 
     /// The server's device was reset (a new process of the server
     /// registered): nothing quarantined is reachable any more.
     pub fn device_reset(&self) {
-        let gone = core::mem::take(&mut *self.quarantine.lock());
-        drop(gone);
+        let mut next = self.quarantine.lock().take();
+        // One at a time (a recursive drop of a long list could overflow
+        // the stack); each takes its pins along.
+        while let Some(grant) = next {
+            next = grant.quarantined.lock().take();
+        }
     }
 }
 
@@ -239,7 +264,10 @@ impl Channel {
         // From here on, dropping the channel releases the header page.
         let channel = Channel { id, layout, memory, header, inner: IrqSpinLock::new(inner) };
         let channel = Arc::try_new(channel).map_err(|_| ENOMEM)?;
-        CHANNELS.lock().insert(id, Entry { channel: Arc::downgrade(&channel), service: None });
+        let mut channels = CHANNELS.lock();
+        channels.try_reserve(1).map_err(|_| ENOMEM)?;
+        channels.push(Entry { id, channel: Arc::downgrade(&channel), service: None });
+        drop(channels);
         Ok(channel)
     }
 
@@ -385,7 +413,14 @@ impl Channel {
                 }
             }
         }
-        let grant = Grant { object: object.clone(), first, frames, writable, state: Mutex::new(GrantState::default()) };
+        let grant = Grant {
+            object: object.clone(),
+            first,
+            frames,
+            writable,
+            state: Mutex::new(GrantState::default()),
+            quarantined: spin::Mutex::new(None),
+        };
         let Ok(grant) = Arc::try_new(grant) else {
             unreserve();
             return Err(ENOMEM);
@@ -479,7 +514,7 @@ impl Channel {
     /// process is no longer the service.
     fn attached(id: u64) -> Result<(Arc<Channel>, ServiceEnd), i64> {
         let mm = super::current_mm().ok_or(ENOENT)?;
-        let channel = CHANNELS.lock().get(&id).and_then(|e| e.service.as_ref().map(|(_, c)| c.clone()));
+        let channel = entry(&mut CHANNELS.lock(), id).and_then(|e| e.service.as_ref().map(|r| r.channel.clone()));
         let channel = channel.ok_or(ENOENT)?;
         let service = channel.inner.lock().service.clone().filter(|s| core::ptr::eq(s.mm.as_ptr(), Arc::as_ptr(&mm))).ok_or(ENOENT)?;
         Ok((channel, service))
@@ -516,13 +551,14 @@ impl Channel {
                     s.server.domain.quarantine(grant);
                 }
             }
+            // (Otherwise the pins go with the grant's last reference.)
         }
         if let Some(mm) = &mm {
             mm.lock().unmap_object(&self.memory);
         }
         self.set_gone(SERVICE_GONE);
         // The registry's reference (the caller holds another one).
-        let reference = CHANNELS.lock().get_mut(&self.id).and_then(|e| e.service.take());
+        let reference = entry(&mut CHANNELS.lock(), self.id).and_then(|e| e.service.take());
         drop(reference);
     }
 }
@@ -531,8 +567,10 @@ impl Drop for Channel {
     fn drop(&mut self) {
         memory::with_frames(|f| unsafe { x86_64::structures::paging::FrameDeallocator::deallocate_frame(f, self.header) });
         let mut channels = CHANNELS.lock();
-        if channels.get(&self.id).is_some_and(|e| e.channel.strong_count() == 0) {
-            channels.remove(&self.id);
+        if let Ok(i) = channels.binary_search_by_key(&self.id, |e| e.id) {
+            if channels[i].channel.strong_count() == 0 {
+                channels.remove(i);
+            }
         }
     }
 }
@@ -542,33 +580,41 @@ impl Drop for Channel {
 /// end, and the region mapping at `addr`.
 pub struct ClientEnd {
     pub channel: Arc<Channel>,
-    instance: Weak<super::linux::Instance>,
-    pub addr: u64,
-    /// Torn down already (`close`).
-    closed: bool,
+    /// Its teardown (`Work::ClientGone`), made with the end: the drop may
+    /// run where the kernel can neither sleep nor fail an allocation (the
+    /// instance's end), so it only queues this. None once torn down.
+    teardown: Option<Box<WorkNode>>,
 }
 
 impl ClientEnd {
-    pub fn new(channel: Arc<Channel>, instance: Weak<super::linux::Instance>, addr: u64) -> ClientEnd {
-        ClientEnd { channel, instance, addr, closed: false }
+    /// The end of `channel` mapped at `addr` of `instance`'s region; if it
+    /// cannot be made, the channel's client end goes now.
+    pub fn new(channel: Arc<Channel>, instance: Weak<super::linux::Instance>, addr: u64) -> Result<ClientEnd, i64> {
+        let work = Work::ClientGone { channel: channel.clone(), instance, addr };
+        match Box::<WorkNode>::try_new_uninit() {
+            Ok(node) => Ok(ClientEnd { channel, teardown: Some(Box::write(node, WorkNode { work, next: None })) }),
+            Err(_) => {
+                work.run();
+                Err(ENOMEM)
+            }
+        }
     }
 
     /// Tears the end down now (from a call that may sleep), so that when
     /// `handle_close` returns, the service's mappings of the grants are gone
     /// and the pins released.
     pub fn close(mut self) {
-        self.closed = true;
-        client_gone(&self.channel, &self.instance, self.addr);
+        if let Some(node) = self.teardown.take() {
+            node.work.run();
+        }
     }
 }
 
 impl Drop for ClientEnd {
     fn drop(&mut self) {
-        if self.closed {
-            return;
+        if let Some(node) = self.teardown.take() {
+            defer(node);
         }
-        // May run where the kernel cannot sleep (the instance's end).
-        defer(Work::ClientGone { channel: self.channel.clone(), instance: core::mem::take(&mut self.instance), addr: self.addr });
     }
 }
 
@@ -587,7 +633,7 @@ fn client_gone(channel: &Channel, instance: &Weak<super::linux::Instance>, addr:
 pub fn attach(id: u64) -> Result<i64, i64> {
     let me = super::current_pid();
     let server = super::with_current(|p| p.server.clone()).ok_or(EPERM)?;
-    let channel = CHANNELS.lock().get(&id).and_then(|e| e.channel.upgrade()).ok_or(ENOENT)?;
+    let channel = entry(&mut CHANNELS.lock(), id).and_then(|e| e.channel.upgrade()).ok_or(ENOENT)?;
     let to = {
         let inner = channel.inner.lock();
         if inner.client_gone {
@@ -603,6 +649,7 @@ pub fn attach(id: u64) -> Result<i64, i64> {
         return Err(ENOENT);
     }
     let mm = super::current_mm().ok_or(EINVAL)?;
+    let exit = Box::try_new(WorkNode { work: Work::ServiceGone(Arc::downgrade(&channel)), next: None }).map_err(|_| ENOMEM)?;
     let len = channel.layout.bytes() as u64;
     let addr = {
         let mut space = mm.lock();
@@ -623,8 +670,8 @@ pub fn attach(id: u64) -> Result<i64, i64> {
             Err(if inner.client_gone { EPIPE } else { ECONNREFUSED })
         } else {
             inner.service = Some(ServiceEnd { mm: Arc::downgrade(&mm), server });
-            if let Some(entry) = channels.get_mut(&id) {
-                entry.service = Some((me, channel.clone()));
+            if let Some(entry) = entry(&mut channels, id) {
+                entry.service = Some(Registered { pid: me, channel: channel.clone(), exit: Some(exit) });
             }
             Ok(inner.offer_request)
         }
@@ -716,10 +763,11 @@ pub fn grant_dma_unmap(id: u64, grant: u64) -> Result<i64, i64> {
 /// channels it served lose their service. (Called where the kernel may
 /// not sleep: the teardown is deferred.)
 pub fn service_exited(pid: Pid) {
-    let served: Vec<Arc<Channel>> =
-        CHANNELS.lock().values().filter_map(|e| e.service.as_ref().filter(|(p, _)| *p == pid).map(|(_, c)| c.clone())).collect();
-    for channel in served {
-        defer(Work::ServiceGone(channel));
+    let mut channels = CHANNELS.lock();
+    for e in channels.iter_mut() {
+        if let Some(node) = e.service.as_mut().filter(|r| r.pid == pid).and_then(|r| r.exit.take()) {
+            defer(node);
+        }
     }
 }
 
@@ -727,17 +775,42 @@ pub fn service_exited(pid: Pid) {
 
 enum Work {
     ClientGone { channel: Arc<Channel>, instance: Weak<super::linux::Instance>, addr: u64 },
-    ServiceGone(Arc<Channel>),
+    /// (The registry keeps the channel until this ran.)
+    ServiceGone(Weak<Channel>),
 }
 
-static WORK: IrqSpinLock<VecDeque<Work>> = IrqSpinLock::new(VecDeque::new());
+impl Work {
+    fn run(&self) {
+        match self {
+            Work::ClientGone { channel, instance, addr } => client_gone(channel, instance, *addr),
+            Work::ServiceGone(channel) => {
+                if let Some(channel) = channel.upgrade() {
+                    channel.service_gone(true);
+                }
+            }
+        }
+    }
+}
+
+/// A teardown, allocated in advance by whoever may need it queued.
+struct WorkNode {
+    work: Work,
+    next: Option<Box<WorkNode>>,
+}
+
+/// The queued teardowns (a list of their nodes: queuing never allocates).
+static WORK: IrqSpinLock<Option<Box<WorkNode>>> = IrqSpinLock::new(None);
 
 fn work_chan() -> usize {
     &WORK as *const _ as usize
 }
 
-fn defer(work: Work) {
-    WORK.lock().push_back(work);
+fn defer(mut node: Box<WorkNode>) {
+    {
+        let mut head = WORK.lock();
+        node.next = head.take();
+        *head = Some(node);
+    }
     super::wakeup(work_chan());
 }
 
@@ -745,11 +818,13 @@ fn defer(work: Work) {
 /// worker, or a call that just dropped a channel and wants it done).
 pub fn run_deferred() {
     loop {
-        let Some(work) = WORK.lock().pop_front() else { return };
-        match work {
-            Work::ClientGone { channel, instance, addr } => client_gone(&channel, &instance, addr),
-            Work::ServiceGone(channel) => channel.service_gone(true),
-        }
+        let node = {
+            let mut head = WORK.lock();
+            let Some(mut node) = head.take() else { return };
+            *head = node.next.take();
+            node
+        };
+        node.work.run();
     }
 }
 
@@ -758,7 +833,7 @@ pub fn run_deferred() {
 pub fn worker() -> ! {
     loop {
         let wait = super::sched::prepare_to_wait(work_chan());
-        if WORK.lock().is_empty() {
+        if WORK.lock().is_none() {
             wait.sleep();
         } else {
             drop(wait);

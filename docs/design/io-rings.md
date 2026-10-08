@@ -162,6 +162,17 @@ the object's page cache: a pinned page stays the object's page (a truncation ove
 have been supplied (`ENODATA`: its pager may be the caller). Remote (disk) caches are not
 grantable. Step 4 grants pages before they are supplied, for diskfs to read into.
 
+What a pin costs and how long it lasts: the kernel keeps 8 bytes per pinned page in the grant
+(its frame) and a counter in the page; the pages themselves stay charged to their object. The
+limits per channel (4096 grants, 65536 pages, 64 channels per instance) bound that. A draining
+grant (below) is pinned until the service lets go, and a quarantined one until the service's
+server registers again: a crashed service whose server is not restarted, or a service that
+never calls `grant_dma_unmap`, keeps the client's pages pinned (their objects alive and
+untruncatable over them) for as long as that lasts. That is the price of never freeing memory
+a device may still write without an IOMMU; with one, revocation is immediate. The kernel's
+teardown paths allocate nothing (a teardown's work is allocated with the end it tears down, a
+quarantine is a list through the grants), so running out of memory never stops a teardown.
+
 **Revoke.** The grant's mappings in the service are gone (TLB shootdowns included) when
 `revoke` returns, and its device mappings are taken out of the service's `DmaDomain` (the one
 place that maps pages for devices). Without an IOMMU a device address cannot be taken back: a

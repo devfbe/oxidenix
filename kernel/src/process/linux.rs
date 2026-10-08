@@ -1114,9 +1114,10 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             instance.channel_added()?;
             let mapped = super::channel::Channel::new(a[0]).and_then(|c| instance.map_object(c.memory(), c.pages()).map(|addr| (c, addr)));
             let (channel, addr) = mapped.inspect_err(|_| instance.channel_gone())?;
-            // From here on, dropping the end undoes it all (also when it
-            // cannot be allocated).
-            let end = Arc::try_new(super::channel::ClientEnd::new(channel, Arc::downgrade(&instance), addr)).map_err(|_| {
+            // (Undone already if the end cannot be made.)
+            let end = super::channel::ClientEnd::new(channel, Arc::downgrade(&instance), addr)?;
+            // From here on, dropping the end undoes it all.
+            let end = Arc::try_new(end).map_err(|_| {
                 super::channel::run_deferred();
                 ENOMEM
             })?;
