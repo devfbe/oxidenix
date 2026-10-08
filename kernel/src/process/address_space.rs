@@ -133,6 +133,13 @@ pub enum Backing {
     /// them back. Read-only unless `writable`, never executable, never
     /// moved (mremap) and not inherited by fork.
     Granted { grant: Hold, writable: bool },
+    /// What a revoked grant leaves in the service (`unmap_grant`): an
+    /// inaccessible reservation of its range, so that the service's copies
+    /// to the address it knew fault (and fail, `channel::set_copy_fixup`)
+    /// instead of reaching whatever else the range could be given to. No
+    /// access can be added (mprotect), nothing is mapped over it until the
+    /// service unmaps it (munmap), fork does not inherit it.
+    Revoked { channel: u64 },
 }
 
 impl Backing {
@@ -143,7 +150,7 @@ impl Backing {
 
     /// Shared memory (or device memory): never copied on write or fork.
     fn shared(&self) -> bool {
-        matches!(self, Backing::File { shared: true, .. } | Backing::Device | Backing::Granted { .. })
+        matches!(self, Backing::File { shared: true, .. } | Backing::Device | Backing::Granted { .. } | Backing::Revoked { .. })
     }
 
     /// Whether this is the grant `grant`'s mapping.
@@ -570,6 +577,9 @@ impl AddressSpace {
                     return Err(Fault::Access);
                 }
             }
+            if matches!(v.backing, Backing::Revoked { .. }) && (prot.read || prot.write || prot.exec) {
+                return Err(Fault::Access);
+            }
             at = v.end;
         }
         let needed: u64 = self
@@ -646,7 +656,7 @@ impl AddressSpace {
     pub fn remap(&mut self, old: u64, old_len: u64, new_len: u64, may_move: bool, fixed: Option<u64>, floor: u64) -> Result<u64, Fault> {
         let v = self.vma(old).cloned().ok_or(Fault::Segv)?;
         let old_end = old.checked_add(old_len).ok_or(Fault::Segv)?;
-        if old_end > v.end || matches!(v.backing, Backing::Device | Backing::Granted { .. }) {
+        if old_end > v.end || matches!(v.backing, Backing::Device | Backing::Granted { .. } | Backing::Revoked { .. }) {
             return Err(Fault::Segv);
         }
         if new_len <= old_len && fixed.is_none() {
@@ -767,7 +777,7 @@ impl AddressSpace {
     fn new_frame(&mut self, page: u64, v: &Vma, access: Access) -> Result<(PhysFrame, bool), Fault> {
         match &v.backing {
             Backing::Anon => Ok((zeroed_frame()?, true)),
-            Backing::Device | Backing::Granted { .. } => Err(Fault::Segv),
+            Backing::Device | Backing::Granted { .. } | Backing::Revoked { .. } => Err(Fault::Segv),
             Backing::File { cache, offset, shared, .. } => {
                 // Reading a missing page may sleep (a remote file): only the
                 // address space is locked.
@@ -960,10 +970,29 @@ impl AddressSpace {
         Ok(())
     }
 
-    /// Removes every mapping of `grant` (`map_granted`).
-    pub fn unmap_grant(&mut self, grant: &Hold) {
+    /// Removes every mapping of `grant` (`map_granted`) of channel
+    /// `channel`; each range stays reserved and inaccessible
+    /// (`Backing::Revoked`) until the service unmaps it or its end of the
+    /// channel goes (`unmap_revoked`).
+    pub fn unmap_grant(&mut self, grant: &Hold, channel: u64) {
         let ranges: alloc::vec::Vec<(u64, u64)> =
             self.vmas.values().filter(|v| v.backing.is_grant(grant)).map(|v| (v.start, v.end - v.start)).collect();
+        for (start, len) in ranges {
+            self.unmap(start, len);
+            let none = Prot { read: false, write: false, exec: false };
+            self.insert(Vma { start, end: start + len, prot: none, backing: Backing::Revoked { channel }, charged: false, grows_down: false });
+        }
+    }
+
+    /// Frees what the revoked grants of `channel` left (`unmap_grant`):
+    /// the service's end of the channel is gone, and with it what it knew.
+    pub fn unmap_revoked(&mut self, channel: u64) {
+        let ranges: alloc::vec::Vec<(u64, u64)> = self
+            .vmas
+            .values()
+            .filter(|v| matches!(v.backing, Backing::Revoked { channel: c } if c == channel))
+            .map(|v| (v.start, v.end - v.start))
+            .collect();
         for (start, len) in ranges {
             self.unmap(start, len);
         }
@@ -1103,7 +1132,7 @@ impl AddressSpace {
             return Err(Fault::Oom);
         };
         // Granted pages are the service's alone: a child does not get them.
-        new.vmas = self.vmas.iter().filter(|(_, v)| !matches!(v.backing, Backing::Granted { .. })).map(|(&k, v)| (k, v.clone())).collect();
+        new.vmas = self.vmas.iter().filter(|(_, v)| !matches!(v.backing, Backing::Granted { .. } | Backing::Revoked { .. })).map(|(&k, v)| (k, v.clone())).collect();
         new.stats.virt_pages.store(new.vmas.values().map(|v| v.pages()).sum(), Ordering::Relaxed);
         let mut mapper = new.mapper();
         let parent = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;

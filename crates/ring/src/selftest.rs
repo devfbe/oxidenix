@@ -25,8 +25,10 @@ pub const PROBE_READ_ONLY: u16 = 4;
 pub const DMA: u16 = 5;
 /// The service lets go of the grant's device addresses.
 pub const DMA_UNMAP: u16 = 6;
-/// 0 if the grant is gone from the service: it cannot be mapped (ENOENT)
-/// and its earlier mapping is gone (mprotect: ENOMEM).
+/// 0 if the grant is gone from the service: it cannot be mapped (ENOENT),
+/// and its earlier mapping is an inaccessible reservation (mprotect cannot
+/// make it readable: EACCES) that nothing else gets until the service
+/// unmaps it (then mprotect: ENOMEM).
 pub const CHECK_GONE: u16 = 7;
 /// Stores into the (read-only) grant: the service dies of it.
 pub const CRASH: u16 = 8;

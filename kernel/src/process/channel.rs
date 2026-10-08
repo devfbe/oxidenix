@@ -493,7 +493,9 @@ impl Channel {
         st.revoked = true;
         let Some(service) = service else { return false };
         if let Some(mm) = service.mm.upgrade() {
-            mm.lock().unmap_grant(&grant.hold());
+            // The range stays reserved: the service may still copy to the
+            // address it knew, which must fault, not reach a new mapping.
+            mm.lock().unmap_grant(&grant.hold(), self.id);
         }
         st.device && !service.server.domain.unmap(grant)
     }
@@ -577,7 +579,7 @@ impl Channel {
             let mut st = grant.state.lock();
             st.revoked = true;
             if let Some(mm) = &mm {
-                mm.lock().unmap_grant(&grant.hold());
+                mm.lock().unmap_grant(&grant.hold(), self.id);
             }
             let device = st.device;
             drop(st);
@@ -590,7 +592,9 @@ impl Channel {
             // (Otherwise the pins go with the grant's last reference.)
         }
         if let Some(mm) = &mm {
-            mm.lock().unmap_object(&self.memory);
+            let mut space = mm.lock();
+            space.unmap_object(&self.memory);
+            space.unmap_revoked(self.id);
         }
         self.set_gone(SERVICE_GONE);
         drop(registered);
@@ -799,8 +803,9 @@ pub fn grant_dma_pages(id: u64, grant: u64, first: u64, count: u64, out: u64) ->
     if count == 0 || count > MAX_DMA_PAGES || first.checked_add(count).is_none_or(|end| end > g.frames.len() as u64) {
         return Err(EINVAL);
     }
-    let mut addresses: Vec<u64> = Vec::new();
-    addresses.try_reserve_exact(count as usize).map_err(|_| ENOMEM)?;
+    // The addresses as the caller's u64s, in one buffer allocated fallibly.
+    let mut bytes: Vec<u8> = Vec::new();
+    bytes.try_reserve_exact(count as usize * 8).map_err(|_| ENOMEM)?;
     {
         let mut st = g.state.lock();
         if st.revoked {
@@ -808,10 +813,9 @@ pub fn grant_dma_pages(id: u64, grant: u64, first: u64, count: u64, out: u64) ->
         }
         st.device = true;
         for &frame in &g.frames[first as usize..(first + count) as usize] {
-            addresses.push(service.server.domain.map(frame, g.writable));
+            bytes.extend_from_slice(&service.server.domain.map(frame, g.writable).to_le_bytes());
         }
     }
-    let bytes: Vec<u8> = addresses.iter().flat_map(|a| a.to_le_bytes()).collect();
     super::uaccess::copy_to(out, &bytes)?;
     Ok(0)
 }
@@ -853,7 +857,15 @@ pub fn grant_dma_unmap(id: u64, grant: u64) -> Result<i64, i64> {
 /// a CPU copy into or out of it may fault; a fault of the instruction at
 /// `insn` that cannot be resolved resumes at `fixup` (the routine reports
 /// the failure) instead of killing the service. Once per program (EBUSY
-/// after); servers only.
+/// after); servers only. The fixup hides every unresolved fault of that
+/// instruction, whatever the address: a service's own bug there (a wild
+/// pointer into its copy routine) becomes a failed copy, not a crash, so
+/// the routine must be used only for copies whose failure it reports. A
+/// revoked grant's range stays reserved and inaccessible until the service
+/// unmaps it (`Backing::Revoked`), so the fault is certain: the address
+/// never reaches another mapping meanwhile. The registration is the
+/// task's: a thread the server creates has none (servers are single-
+/// threaded; one that is not registers again from each thread).
 pub fn set_copy_fixup(insn: u64, fixup: u64) -> Result<i64, i64> {
     use super::address_space::USER_END;
     if insn >= USER_END || fixup >= USER_END {

@@ -33,8 +33,8 @@ module comment, and the public types it defines. Where to start for common tasks
 - `kernel/src/memory/kstack.rs` (124) Kernel stacks. Types: `KernelStack`.
 - `kernel/src/memory/mod.rs` (262) Kernel memory: the frame allocator, the kernel heap (slab size classes over a first-fit heap), mappings of physical memory, and the commit and page-cache accounting. Types: `Caching`, `Stats`.
 - `kernel/src/net.rs` (124) Client side of the network server (netd): every socket operation of a user program becomes a `netproto` request. Types: `Endpoint`, `Socket`.
-- `kernel/src/process/address_space.rs` (971) A process's virtual memory: its page tables and the areas (VMAs) that say what each address range is. Types: `Prot`, `Backing`, `Vma`, `MemStats`, `Fault`, `Access`, `AddressSpace`, `Mm`.
-- `kernel/src/process/channel.rs` (672) Channels: the kernel's part of the data plane between the Linux server and the device servers (docs/design/io-rings.md, ADR 0005). Types: `Channel`, `Grant`, `DmaDomain`, `ClientEnd`.
+- `kernel/src/process/address_space.rs` (988) A process's virtual memory: its page tables and the areas (VMAs) that say what each address range is. Types: `Prot`, `Backing`, `Vma`, `MemStats`, `Fault`, `Access`, `AddressSpace`, `Mm`.
+- `kernel/src/process/channel.rs` (673) Channels: the kernel's part of the data plane between the Linux server and the device servers (docs/design/io-rings.md, ADR 0005). Types: `Channel`, `Grant`, `DmaDomain`, `ClientEnd`.
 - `kernel/src/process/clone.rs` (186) clone(2), fork and vfork: new threads and processes.
 - `kernel/src/process/elf.rs` (81) Parsing ELF64 headers and program headers of static executables (for `loader`). Types: `Elf`, `ProgramHeader`, `Header`.
 - `kernel/src/process/epoll.rs` (380) epoll: an interest list of open files and a ready list, the event loop interface of libuv (and so of Node.js). Types: `Epoll`, `Item`.
@@ -99,7 +99,7 @@ module comment, and the public types it defines. Where to start for common tasks
 - `servers/netd/src/virtio_net.rs` (91) virtio-net driver on the shared virtio transport (crates/virtio). Types: `VirtioNet`.
 - `servers/procfs/src/main.rs` (346) procfs: Linux's /proc, served from user space.
 - `servers/procfs/src/render.rs` (189) The text formats of Linux's /proc files.
-- `servers/ringtest/src/main.rs` (236) ringtest: the far end of the self-tests' channels (test mode only).
+- `servers/ringtest/src/main.rs` (243) ringtest: the far end of the self-tests' channels (test mode only).
 
 ## Libraries
 
