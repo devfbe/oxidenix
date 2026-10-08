@@ -64,6 +64,10 @@ jobs:
         if: matrix.firmware == 'uefi'
         run: cargo test --release -p ring
 
+      - name: Test the file protocol over the rings on the host
+        if: matrix.firmware == 'uefi'
+        run: cargo test -p fsring
+
       - name: Boot oxidenix and run the self-tests
         working-directory: kernel
         shell: bash

@@ -28,7 +28,8 @@ An AI research project; see README.md.
   library on the host against a RAM disk; CI runs it too. `cargo test -p vfs` tests the pure
   parts of the Linux server's namespace (paths, cpio) on the host, `cargo test -p slab` the
   size-class allocator of the kernel's and the server's heaps, `cargo test --release -p ring`
-  the I/O ring's invariants (with threads; release for realistic interleavings).
+  the I/O ring's invariants (with threads; release for realistic interleavings), `cargo test
+  -p fsring` the file protocol's encodings and validation (Linux server <-> diskfs).
 - QEMU must always run with a visible window; never use `-display none`.
 - The image boots via UEFI (OVMF from nixpkgs) by default; `OXIDENIX_FIRMWARE=bios` builds and
   boots a BIOS image instead. CI runs the self-tests with both.

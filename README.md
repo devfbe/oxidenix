@@ -226,6 +226,7 @@ oxidenix/
 │   ├── virtio/                  virtio legacy PCI transport and virtqueues (diskfs, netd)
 │   ├── restricted/              restricted mode: shared region layout, register page, kernel calls
 │   ├── ring/                    SPSC descriptor rings and the channel layout (I/O rings)
+│   ├── fsring/                  the file protocol over the rings (Linux server <-> diskfs)
 │   └── oxrt/                    runtime for servers: entry, syscalls, heap, port I/O
 ├── builder/                     host tool: rootfs + cpio + boot image + ext2 data disk + QEMU
 └── userspace/                   C test programs, build script, rootfs and data disk templates
@@ -932,6 +933,7 @@ Each of these programs and scripts lives in the root filesystem and runs inside 
 | `sh /etc/disktest.sh` | ext2: 150-file directory, 1.5 MiB file (double indirect), append, truncate, rename, cycles, symlinks, `rm -r`, space accounting |
 | `e2fsck -fn disk.img` (host) | the filesystem written by oxidenix is consistent |
 | `cargo test -p ext2fs` (host, needs e2fsprogs) | ext2 on a RAM disk that counts requests and can fail writes: 4 MiB read in about one device read per 32 KiB request, one flush per write, nothing written by reads, blocks moving between directories and files, a file larger than the block cache, corrupt block pointers (`EIO`, no crash), every write of a commit failing in turn (retried, nothing lost), failed data writes never exposing a deleted file's blocks; `e2fsck` after each |
+| `cargo test -p fsring` (host) | the file protocol: every request survives encode and decode, `ENOSYS` for unknown operations, `EINVAL` for any field an operation does not use, transfers, names and targets bounded (`EINVAL`, `ENAMETOOLONG`), names without `/` or NUL, completions, stat, usage and directory entries round-trip |
 | `timeout 1 sleep 5` | `vfork` and `SIGTERM` after the time limit (exit status 143) |
 | `kill -9 1` in Bash | user space cannot kill a server (`EPERM`) |
 | `kill diskfs` in the kernel monitor | the next `/data` access restarts the server; open files survive; after five restarts accesses fail with `EIO`; a restart still runs the boot-time program even after `/sbin/diskfs` was overwritten |
