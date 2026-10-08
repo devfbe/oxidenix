@@ -145,6 +145,53 @@ fn the_doorbell_loses_no_wakeup() {
     assert!(wait.sleeps.load(Ordering::Relaxed) > 0, "the consumer slept at least once");
 }
 
+/// An event loop's sleep (`prepare_sleep`, sleeping elsewhere, `awake`)
+/// loses no wakeup either: the loop sleeps on the tail word only while it
+/// holds the value `prepare_sleep` returned, as a futex (or the kernel's
+/// doorbell watch) compares it.
+#[test]
+fn an_event_loop_sleep_loses_no_wakeup() {
+    const N: u64 = 50_000;
+    let mem = Arc::new(RingMemory::<16>::new());
+    let wait = Arc::new(TestWait { lock: Mutex::new(()), cond: Condvar::new(), sleeps: AtomicUsize::new(0) });
+    let consumer = {
+        let (mem, wait) = (mem.clone(), wait.clone());
+        thread::spawn(move || {
+            let ring = Ring::new(&mem);
+            let mut c = ring.consumer();
+            let tail = |m: &RingMemory<16>| unsafe { &*(m as *const RingMemory<16> as *const u8).add(ring::TAIL_OFFSET).cast::<AtomicU32>() };
+            let mut next = 0;
+            while next < N {
+                if let Some(d) = c.pop() {
+                    assert_eq!(d.tag, next);
+                    next += 1;
+                    continue;
+                }
+                if !c.is_empty() {
+                    continue;
+                }
+                if let Some(value) = c.prepare_sleep() {
+                    wait.wait(tail(&mem), value);
+                }
+                c.awake();
+            }
+        })
+    };
+    let ring = Ring::new(&mem);
+    let mut p = ring.producer();
+    for i in 0..N {
+        while !p.push(&desc(i)) {
+            std::hint::spin_loop();
+        }
+        p.ring_doorbell(&*wait);
+        if i % 1000 == 0 {
+            thread::yield_now();
+        }
+    }
+    consumer.join().unwrap();
+    assert!(wait.sleeps.load(Ordering::Relaxed) > 0, "the consumer slept at least once");
+}
+
 #[test]
 fn a_sleeper_wakes_when_the_peer_is_gone() {
     use std::sync::atomic::AtomicBool;

@@ -142,6 +142,9 @@ rings are read and write. The positions start at 0.
 | `grant_map(channel, id, &info) -> addr` (1070) | maps a grant: read-only unless granted writable (`mprotect` cannot add write or execute), not inherited by `fork`, not movable by `mremap`; `info` gets (pages, writable) |
 | `grant_dma(channel, id, offset) -> device address` (1071) | of the byte at `offset` (`EINVAL` beyond the grant), valid to the end of its page |
 | `grant_dma_unmap(channel, id)` (1072) | the service's devices are done with the grant |
+| `chan_watch(channel, value)` (1073) | arms the service's doorbell watch on the submission ring: if its `tail` still holds `value` (else `EAGAIN`), the client's next doorbell or its end going makes `ipc_receive` return `Event::Doorbell` (step 3) |
+| `set_copy_fixup(insn, fixup)` (1074) | a fault of the program's copy instruction on granted memory resumes at `fixup` instead of killing it (`oxrt::copy`, step 3) |
+| `grant_dma_pages(channel, id, first, count, &out)` (1075) | `grant_dma` for up to 512 pages in one call (step 3) |
 
 **Attach.** The Linux server has no IPC of its own (only the kernel is an IPC client), so the
 kernel carries the offer: `chan_connect` sends the service a control request, typed by its id
@@ -154,7 +157,13 @@ fatal one always) gives the offer up, and a later `chan_attach` fails.
 
 **Doorbells.** The ring words are futex words. The service's futex on its shared mapping and
 the server's `server_futex_wait` on its region mapping are both keyed by the channel's memory
-object and the offset, so they meet.
+object and the offset, so they meet. A service whose event loop waits for several things at
+once (IPC requests, offers, several channels: diskfs) sleeps in `ipc_receive` instead: it
+announces the sleep in each ring (`Consumer::prepare_sleep`, invariant 4) and arms a watch on
+each submission `tail` (`chan_watch`), a one-shot waiter in the futex bucket that a wake turns
+into a pending doorbell of the service's server and a wakeup of its `ipc_receive`. The watch
+compares the word under the bucket lock like a wait, so no wakeup is lost; one per word and
+process (arming it twice keeps one), gone with the wake or the channel's hang-up.
 
 **Pinning.** A grant takes each page's frame with a reference of its own and a pin count in
 the object's page cache: a pinned page stays the object's page (a truncation over it fails with
@@ -212,7 +221,10 @@ request (as the Linux server's copies into program memory do, `set_usercopy`), o
 runs CPU copies only on grants whose requests the client has not completed. A well-behaved
 client revokes only after the requests on a grant completed, so the fault path only meets a
 broken or hostile client; the service must survive it and fail the request (`EIO`/`EFAULT`),
-nothing more. (servers/ringtest touches grants directly: its client is the test.)
+nothing more. (servers/ringtest touches grants directly: its client is the test.) The fault
+handler is `set_copy_fixup`: a service registers its copy instruction (`oxrt::copy`, one `rep
+movsb`), and a page fault there that the kernel cannot resolve resumes at the fixup, which
+reports the copy as failed, as the Linux server's `set_usercopy` does for program memory.
 
 **Tests.** `lxtest` has the Linux server run seven scenarios (`TEST_CHANNEL`) against
 `servers/ringtest`, a service started in test mode only (`ring::selftest`): rings and doorbells
@@ -224,6 +236,58 @@ service sleeps; the service dying while the client waits, and coming back for th
 the service executing a new program, which reaches no grant; a service that attaches but
 answers the offer only after it served the channel.
 `cargo test --release -p ring` covers the layout, the offer encoding and `pop_wait_while`.
+
+### The file protocol (step 3)
+
+`crates/fsring` (the encodings, the one validator, host tests); diskfs's side is
+`servers/diskfs/src/service.rs`, the test client `servers/linux/src/disktest.rs`
+(`TEST_DISKRING`). A client connects a channel of `fsring::SLOTS` (128) slots to the service
+`diskfs`, grants pages of its memory objects and sends descriptors:
+
+| op | request | completion |
+|----|---------|------------|
+| `READ` / `WRITE` | inode, file offset, a grant range (at most 1 MiB; `READ` needs a writable grant) | bytes (a read is short at the end of the file), v0 = file size |
+| `FLUSH` | - | 0: every write completed before it is durable |
+| `STAT`, `STATFS` | inode / - | 0, the values packed in v0..v3 (`fsring::Stat`, `Usage`) |
+| `LOOKUP`, `CREATE`, `UNLINK`, `RENAME` | directory, names in a grant (a symlink's target or the new name right after the first name) | v0 = the inode found or made, or the one whose last link went |
+| `TRUNCATE`, `SETPERM`, `RELEASE` | inode and the new size / permissions | 0 |
+| `READDIR`, `READLINK` | a result buffer in a writable grant (`READDIR` with a cursor) | bytes, v0 = the next cursor |
+| `FORGET` | a grant | 0 once diskfs let go of it (send before `revoke`: no draining) |
+
+A completion is (tag, op, status, four values); every field an operation does not use must be
+0 (`EINVAL`), an unknown operation is `ENOSYS`, an unknown or revoked grant `EBADF`, a range
+beyond its grant `EINVAL`, an inode not in use `ENOENT`, a copy into a grant revoked under
+diskfs `EFAULT` (`set_copy_fixup`).
+
+**Ordering and durability.** Reads and writes run concurrently (at most 32 in flight in
+diskfs, the device reordering them); a write waits for writes in flight on the same blocks.
+Everything else is a barrier: it starts when every request taken before it (any channel)
+completed. A completed `WRITE` is visible to every later request, also through the kernel's
+IPC path, and durable after a `FLUSH`: write-back. diskfs reserves the blocks of a write in
+memory (in no bitmap or inode), writes the data by DMA, then links them; a `FLUSH` (and any
+commit) flushes the device before metadata reaches it and again after, so a crash never
+leaves a pointer to a block whose data did not reach the disk (ext2fs, "Ordering").
+
+**What moves the data.** The device, by DMA between the disk and the granted pages, at their
+device addresses (`grant_dma_pages`, cached per channel): no copy for any read and for any
+write of whole sectors. Sector bytes a read does not want go to a sink page; a write padded
+to whole blocks (a new block) takes zeros from a zero page. The CPU copies only: zeros into
+the holes of a read; one or two sectors read from the disk into scratch memory for a write
+that starts or ends inside an existing block's sector (the device then writes them from there
+and the grant); names and small results (`READDIR`, `READLINK`); and, after a failed commit
+left a block's data in ext2fs's cache, the whole request through ext2fs's own read or write.
+With 1 KiB ext2 blocks a 4 KiB page is four blocks, contiguous or not: a run of contiguous
+blocks is one device request, otherwise several, all still DMA.
+
+**Waiting.** diskfs has one thread: `ipc_receive` brings the kernel's IPC requests (which wait
+until the ring operations in flight completed), channel offers and doorbells. With work it
+polls the rings and the device; after `SPIN_BUDGET` (2000) polls without progress it yields
+(device busy: its interrupts stay off, the line being shared with the network card) or arms
+every ring's doorbell (`prepare_sleep`, `chan_watch`) and sleeps in `ipc_receive`.
+
+**Limits.** 16 channels, 1024 grants a channel diskfs keeps (`FORGET` lets go), no more
+requests taken from a channel than its completion ring has room for, a client gone: its
+operations in flight finish into the pinned pages, then diskfs detaches.
 
 ## Paths built on it
 
@@ -245,7 +309,23 @@ answers the offer only after it served the channel.
 diskfs and netd poll their rings and devices while they have work, then arm the device
 interrupt and the ring doorbell and sleep (NAPI's pattern). The Linux server waits for
 completions on the completion ring's futex the same way. The spin budget before sleeping is a
-tuning knob measured with `iobench`.
+tuning knob measured with `iobench` (diskfs: `service::SPIN_BUDGET`). diskfs keeps the disk's
+interrupt off for now (its line is shared with the network card, and the kernel gives a line
+to one server): with requests in flight it polls the device and yields between rounds.
+
+**Tests of step 3.** `lxtest` runs five scenarios against diskfs (`TEST_DISKRING`): the disk
+image's README read by DMA from an unaligned file offset into an unaligned grant offset,
+`STAT`, `READDIR` with and without a cursor, `STATFS`, a symlink made, read (`ERANGE` for a
+short buffer) and removed; writes aligned, unaligned within existing blocks, within one sector
+and past the end leaving a hole, a `FLUSH`, the file read back against a model, truncated
+shorter and longer, renamed, permissions changed; malformed requests (`ENOSYS`, stray flags
+and arguments, `EBADF`, ranges beyond a grant, over 1 MiB, `EACCES` for a read-only grant,
+`ENOENT` for inodes not in use, `EINVAL`, `ENAMETOOLONG`, `ENOTDIR`, `EEXIST`) with the channel
+working afterwards; 24 writes and then 24 reads in flight, completions matched by tag; a grant
+revoked under diskfs (`REVOKE_DRAINING`, then `EFAULT` for a copy into it, diskfs alive,
+`FORGET` freeing the id, `FORGET` before `revoke` not draining) and a client closing its
+channel with 16 reads in flight (diskfs serves the next one). The file the second scenario
+leaves is read through the kernel's `/data` (the IPC protocol) and removed there.
 
 ## Steps
 
@@ -255,7 +335,11 @@ tuning knob measured with `iobench`.
    doorbells already work (futexes on shared memory objects). Done: see "The kernel's
    interface" above.
 3. diskfs: the ring protocol beside the IPC one (the kernel's `RemoteFs` stays the IPC client
-   until R6c.3 ends), virtio-blk with requests in flight and DMA into granted pages.
+   until R6c.3 ends), virtio-blk with requests in flight and DMA into granted pages. Done: see
+   "The file protocol" above. Until step 4 both protocols serve one filesystem without
+   coherence between their clients' caches (a ring client's changes reach the kernel's page
+   cache only for files the kernel had not cached), and an inode unlinked on one side may be
+   released on the other while still open there.
 4. The Linux server: `/data` through its page cache over the ring; the bridge to the kernel's
    `/data` goes. Benchmarks: sequential and random reads and writes, `fstat`, against the
    numbers in the audit and Linux.

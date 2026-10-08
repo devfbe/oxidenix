@@ -320,6 +320,10 @@ pub struct Process {
     pub vfork_done: Option<Arc<AtomicBool>>,
     /// A thread of a Linux program: its place in restricted mode.
     pub linux: Option<super::linux::LinuxThread>,
+    /// A service's copy routine on granted memory (`channel::set_copy_fixup`):
+    /// a fault of the instruction at `.0` that cannot be resolved resumes at
+    /// `.1`. Reset by exec.
+    pub copy_fixup: Option<(u64, u64)>,
 }
 
 pub struct Task {
@@ -525,6 +529,7 @@ impl Process {
             clear_child_tid: 0,
             vfork_done: None,
             linux: None,
+            copy_fixup: None,
         }
     }
 }

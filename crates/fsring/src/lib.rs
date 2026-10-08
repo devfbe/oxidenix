@@ -1,0 +1,483 @@
+//! The file protocol of the data plane: the requests the Linux server (the
+//! client) sends diskfs (the service) through a channel's submission ring,
+//! and their completions (docs/design/io-rings.md, "The file protocol").
+//!
+//! A request is a `ring::Desc`: `op`, the client's `tag` (echoed by the
+//! completion), the inode in `object`, and a buffer, a range of a grant
+//! (`grant`, `buf_off`, `len`). File data travels in granted pages only:
+//! diskfs's device moves it between the disk and the grant by DMA. Names
+//! and results that do not fit a completion travel in a grant too. Every
+//! field an operation does not use must be 0, and `flags` is 0: anything
+//! else completes with EINVAL (`Request::decode` is the one place that
+//! says what is valid). A completion carries the tag, the operation, a
+//! status (a value >= 0 or a negative errno) and four values.
+//!
+//! | op | request | completion |
+//! |----|---------|------------|
+//! | `READ` | `object` inode, `offset`, buffer (a writable grant) | bytes read (short at the end of the file), v0 = file size |
+//! | `WRITE` | `object` inode, `offset`, buffer | bytes written (all of them), v0 = file size |
+//! | `FLUSH` | - | 0 once every write completed before it is durable |
+//! | `STAT` | `object` inode | 0, `Stat` in v0..v3 |
+//! | `LOOKUP` | `object` directory, buffer = name | v0 = inode |
+//! | `CREATE` | `object` directory, buffer = name, `arg` = [kind, permissions, target length]; a symlink's target follows the name in the grant | v0 = new inode |
+//! | `UNLINK` | `object` directory, buffer = name, `arg[0]` = 1 for a directory | v0 = inode whose last link went (0: none) |
+//! | `RENAME` | `object` old directory, buffer = old name, `arg` = [new directory, new name length]; the new name follows the old one | as `UNLINK` (an entry replaced) |
+//! | `TRUNCATE` | `object` inode, `offset` = new size | 0 |
+//! | `READDIR` | `object` directory, `offset` = cursor (0: from the start), buffer for entries | bytes of entries (`dirents`), v0 = next cursor (0: done) |
+//! | `RELEASE` | `object` inode whose last link went | 0: it and its blocks are freed |
+//! | `READLINK` | `object` symlink, buffer for the target | length of the target |
+//! | `SETPERM` | `object` inode, `arg[0]` = permission bits | 0 |
+//! | `STATFS` | - | 0, `Usage` in v0..v3 |
+//! | `FORGET` | `grant` | 0 once no request on the grant is in flight and the service let go of it |
+//!
+//! **Ordering.** Reads and writes run concurrently and complete in any
+//! order (the device reorders them); a write waits only for writes in
+//! flight on the same blocks of the same file. Every other operation is a
+//! barrier: it starts once every request taken before it (on any channel)
+//! completed, and none taken after it starts before it completed.
+//!
+//! **Durability.** A completed `WRITE` is visible to every later request
+//! (on any channel, and to the kernel's IPC clients); it is durable only
+//! after a later `FLUSH` completed: write-back, as Linux's page cache
+//! (`fsync` is `FLUSH`). A `FLUSH` writes the data to the device and
+//! empties the device's cache before the metadata that points to it (the
+//! block maps, sizes, bitmaps) is written, then empties the cache again:
+//! after a crash, a file never shows blocks whose data did not reach the
+//! disk. Other operations commit their own metadata changes before they
+//! complete, as the IPC protocol does (`fsproto`), and with it what
+//! completed writes changed (also data first).
+//!
+//! **Grants.** The service keeps what it learnt of a grant (its size, the
+//! device addresses of its pages) until `FORGET`: the client sends it
+//! before it revokes the grant, so that the revoke never waits for the
+//! service (`restricted::SYS_REVOKE`, `REVOKE_DRAINING`).
+
+#![no_std]
+
+pub use ring::Desc;
+
+/// The service's IPC name, and the slots per ring of its channels.
+pub const SERVICE: &str = "diskfs";
+pub const SLOTS: u32 = 128;
+/// The most bytes one `READ` or `WRITE` moves (split larger transfers).
+pub const MAX_TRANSFER: u32 = 1 << 20;
+/// The longest name, and the longest symlink target.
+pub const NAME_MAX: u32 = 255;
+pub const TARGET_MAX: u32 = 4095;
+
+pub mod op {
+    pub const READ: u16 = 1;
+    pub const WRITE: u16 = 2;
+    pub const FLUSH: u16 = 3;
+    pub const STAT: u16 = 4;
+    pub const LOOKUP: u16 = 5;
+    pub const CREATE: u16 = 6;
+    pub const UNLINK: u16 = 7;
+    pub const RENAME: u16 = 8;
+    pub const TRUNCATE: u16 = 9;
+    pub const READDIR: u16 = 10;
+    pub const RELEASE: u16 = 11;
+    pub const READLINK: u16 = 12;
+    pub const SETPERM: u16 = 13;
+    pub const STATFS: u16 = 14;
+    pub const FORGET: u16 = 15;
+}
+
+/// The errors the protocol itself gives (others come from the filesystem).
+pub mod errno {
+    pub const ENOENT: i64 = 2;
+    pub const EIO: i64 = 5;
+    /// An unknown or revoked grant.
+    pub const EBADF: i64 = 9;
+    pub const ENOMEM: i64 = 12;
+    /// A result buffer in a read-only grant.
+    pub const EACCES: i64 = 13;
+    /// The grant was revoked while the service copied to or from it.
+    pub const EFAULT: i64 = 14;
+    pub const EINVAL: i64 = 22;
+    pub const ENOSPC: i64 = 28;
+    pub const ERANGE: i64 = 34;
+    pub const ENAMETOOLONG: i64 = 36;
+    pub const ENOSYS: i64 = 38;
+}
+use errno::*;
+
+/// What `CREATE` makes (`arg[0]`).
+pub const KIND_FILE: u64 = 1;
+pub const KIND_DIR: u64 = 2;
+pub const KIND_SYMLINK: u64 = 3;
+
+/// Entry types in `READDIR` results (ext2's).
+pub const TYPE_FILE: u8 = 1;
+pub const TYPE_DIR: u8 = 2;
+pub const TYPE_SYMLINK: u8 = 7;
+
+/// A byte range of a grant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Buf {
+    pub grant: u32,
+    pub offset: u32,
+    pub len: u32,
+}
+
+impl Buf {
+    /// The byte after the range, in the grant.
+    pub fn end(&self) -> u64 {
+        self.offset as u64 + self.len as u64
+    }
+
+    /// The range right after this one, `len` bytes long, in the same grant.
+    fn after(&self, len: u64) -> Result<Buf, i64> {
+        let offset = u32::try_from(self.end()).map_err(|_| EINVAL)?;
+        let len = u32::try_from(len).map_err(|_| EINVAL)?;
+        Ok(Buf { grant: self.grant, offset, len })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    File,
+    Dir,
+    /// The target is in the grant, right after the name.
+    Symlink(Buf),
+}
+
+/// A request, validated (`decode`) or to be sent (`encode`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Request {
+    Read { ino: u32, offset: u64, buf: Buf },
+    Write { ino: u32, offset: u64, buf: Buf },
+    Flush,
+    Stat { ino: u32 },
+    Lookup { dir: u32, name: Buf },
+    Create { dir: u32, name: Buf, kind: Kind, perm: u32 },
+    Unlink { dir: u32, name: Buf, is_dir: bool },
+    Rename { from: u32, name: Buf, to: u32, new_name: Buf },
+    Truncate { ino: u32, len: u64 },
+    Readdir { dir: u32, cursor: u64, buf: Buf },
+    Release { ino: u32 },
+    Readlink { ino: u32, buf: Buf },
+    SetPerm { ino: u32, perm: u32 },
+    Statfs,
+    Forget { grant: u32 },
+}
+
+/// The fields of a `Desc` an operation reads, for the check that the
+/// others are 0.
+struct Used {
+    object: bool,
+    offset: bool,
+    buf: bool,
+    grant: bool,
+    args: usize,
+}
+
+const NONE: Used = Used { object: false, offset: false, buf: false, grant: false, args: 0 };
+
+fn ino(object: u64) -> Result<u32, i64> {
+    u32::try_from(object).map_err(|_| EINVAL)
+}
+
+fn name_len(len: u64) -> Result<u64, i64> {
+    match len {
+        0 => Err(EINVAL),
+        n if n > NAME_MAX as u64 => Err(ENAMETOOLONG),
+        n => Ok(n),
+    }
+}
+
+fn perm(arg: u64) -> Result<u32, i64> {
+    if arg > 0o7777 {
+        return Err(EINVAL);
+    }
+    Ok(arg as u32)
+}
+
+impl Request {
+    /// Validates a request copied out of the ring (copied once: `d` is the
+    /// service's own). A negative errno to complete it with if it is
+    /// malformed: ENOSYS for an unknown operation, EINVAL for a field out
+    /// of range or set where the operation takes none, ENAMETOOLONG for a
+    /// name or target over the limit. (What the service checks itself: the
+    /// grant exists and holds the buffer, the inode exists.)
+    pub fn decode(d: &Desc) -> Result<Request, i64> {
+        let buf = Buf { grant: d.grant, offset: d.buf_off, len: d.len };
+        let (request, used) = match d.op {
+            op::READ | op::WRITE => {
+                if d.len > MAX_TRANSFER || d.offset.checked_add(d.len as u64).is_none() {
+                    return Err(EINVAL);
+                }
+                let (ino, offset) = (ino(d.object)?, d.offset);
+                let r = if d.op == op::READ { Request::Read { ino, offset, buf } } else { Request::Write { ino, offset, buf } };
+                (r, Used { object: true, offset: true, buf: true, ..NONE })
+            }
+            op::FLUSH => (Request::Flush, NONE),
+            op::STATFS => (Request::Statfs, NONE),
+            op::STAT => (Request::Stat { ino: ino(d.object)? }, Used { object: true, ..NONE }),
+            op::RELEASE => (Request::Release { ino: ino(d.object)? }, Used { object: true, ..NONE }),
+            op::LOOKUP => {
+                name_len(d.len as u64)?;
+                (Request::Lookup { dir: ino(d.object)?, name: buf }, Used { object: true, buf: true, ..NONE })
+            }
+            op::CREATE => {
+                name_len(d.len as u64)?;
+                let target = d.arg[2];
+                let kind = match d.arg[0] {
+                    KIND_FILE if target == 0 => Kind::File,
+                    KIND_DIR if target == 0 => Kind::Dir,
+                    KIND_SYMLINK if target == 0 => return Err(EINVAL),
+                    KIND_SYMLINK if target > TARGET_MAX as u64 => return Err(ENAMETOOLONG),
+                    KIND_SYMLINK => Kind::Symlink(buf.after(target)?),
+                    _ => return Err(EINVAL),
+                };
+                let r = Request::Create { dir: ino(d.object)?, name: buf, kind, perm: perm(d.arg[1])? };
+                (r, Used { object: true, buf: true, args: 3, ..NONE })
+            }
+            op::UNLINK => {
+                name_len(d.len as u64)?;
+                let is_dir = match d.arg[0] {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(EINVAL),
+                };
+                (Request::Unlink { dir: ino(d.object)?, name: buf, is_dir }, Used { object: true, buf: true, args: 1, ..NONE })
+            }
+            op::RENAME => {
+                name_len(d.len as u64)?;
+                let new_name = buf.after(name_len(d.arg[1])?)?;
+                let r = Request::Rename { from: ino(d.object)?, name: buf, to: ino(d.arg[0])?, new_name };
+                (r, Used { object: true, buf: true, args: 2, ..NONE })
+            }
+            op::TRUNCATE => (Request::Truncate { ino: ino(d.object)?, len: d.offset }, Used { object: true, offset: true, ..NONE }),
+            op::READDIR => {
+                if d.len == 0 || d.len > MAX_TRANSFER {
+                    return Err(EINVAL);
+                }
+                (Request::Readdir { dir: ino(d.object)?, cursor: d.offset, buf }, Used { object: true, offset: true, buf: true, ..NONE })
+            }
+            op::READLINK => {
+                if d.len == 0 || d.len > MAX_TRANSFER {
+                    return Err(EINVAL);
+                }
+                (Request::Readlink { ino: ino(d.object)?, buf }, Used { object: true, buf: true, ..NONE })
+            }
+            op::SETPERM => (Request::SetPerm { ino: ino(d.object)?, perm: perm(d.arg[0])? }, Used { object: true, args: 1, ..NONE }),
+            op::FORGET => (Request::Forget { grant: d.grant }, Used { grant: true, ..NONE }),
+            _ => return Err(ENOSYS),
+        };
+        let unused = d.flags != 0
+            || (!used.object && d.object != 0)
+            || (!used.offset && d.offset != 0)
+            || (!used.buf && !used.grant && d.grant != 0)
+            || (!used.buf && (d.buf_off != 0 || d.len != 0))
+            || d.arg[used.args..].iter().any(|&a| a != 0);
+        if unused {
+            return Err(EINVAL);
+        }
+        Ok(request)
+    }
+
+    /// The request as a descriptor with tag `tag`.
+    pub fn encode(&self, tag: u64) -> Desc {
+        let mut d = Desc { op: self.op(), tag, ..Desc::default() };
+        let set_buf = |d: &mut Desc, b: &Buf| {
+            d.grant = b.grant;
+            d.buf_off = b.offset;
+            d.len = b.len;
+        };
+        match *self {
+            Request::Read { ino, offset, buf } | Request::Write { ino, offset, buf } => {
+                d.object = ino as u64;
+                d.offset = offset;
+                set_buf(&mut d, &buf);
+            }
+            Request::Flush | Request::Statfs => {}
+            Request::Stat { ino } | Request::Release { ino } => d.object = ino as u64,
+            Request::Lookup { dir, name } => {
+                d.object = dir as u64;
+                set_buf(&mut d, &name);
+            }
+            Request::Create { dir, name, kind, perm } => {
+                d.object = dir as u64;
+                set_buf(&mut d, &name);
+                d.arg = match kind {
+                    Kind::File => [KIND_FILE, perm as u64, 0],
+                    Kind::Dir => [KIND_DIR, perm as u64, 0],
+                    Kind::Symlink(target) => [KIND_SYMLINK, perm as u64, target.len as u64],
+                };
+            }
+            Request::Unlink { dir, name, is_dir } => {
+                d.object = dir as u64;
+                set_buf(&mut d, &name);
+                d.arg[0] = is_dir as u64;
+            }
+            Request::Rename { from, name, to, new_name } => {
+                d.object = from as u64;
+                set_buf(&mut d, &name);
+                d.arg = [to as u64, new_name.len as u64, 0];
+            }
+            Request::Truncate { ino, len } => {
+                d.object = ino as u64;
+                d.offset = len;
+            }
+            Request::Readdir { dir, cursor, buf } => {
+                d.object = dir as u64;
+                d.offset = cursor;
+                set_buf(&mut d, &buf);
+            }
+            Request::Readlink { ino, buf } => {
+                d.object = ino as u64;
+                set_buf(&mut d, &buf);
+            }
+            Request::SetPerm { ino, perm } => {
+                d.object = ino as u64;
+                d.arg[0] = perm as u64;
+            }
+            Request::Forget { grant } => d.grant = grant,
+        }
+        d
+    }
+
+    pub fn op(&self) -> u16 {
+        match self {
+            Request::Read { .. } => op::READ,
+            Request::Write { .. } => op::WRITE,
+            Request::Flush => op::FLUSH,
+            Request::Stat { .. } => op::STAT,
+            Request::Lookup { .. } => op::LOOKUP,
+            Request::Create { .. } => op::CREATE,
+            Request::Unlink { .. } => op::UNLINK,
+            Request::Rename { .. } => op::RENAME,
+            Request::Truncate { .. } => op::TRUNCATE,
+            Request::Readdir { .. } => op::READDIR,
+            Request::Release { .. } => op::RELEASE,
+            Request::Readlink { .. } => op::READLINK,
+            Request::SetPerm { .. } => op::SETPERM,
+            Request::Statfs => op::STATFS,
+            Request::Forget { .. } => op::FORGET,
+        }
+    }
+
+    /// Whether it runs concurrently with others (see "Ordering").
+    pub fn is_data(&self) -> bool {
+        matches!(self, Request::Read { .. } | Request::Write { .. })
+    }
+}
+
+/// Checks a name copied out of a grant: UTF-8 (ext2fs takes `str`),
+/// without '/' or NUL.
+pub fn check_name(bytes: &[u8]) -> Result<&str, i64> {
+    let name = core::str::from_utf8(bytes).map_err(|_| EINVAL)?;
+    if name.is_empty() || name.bytes().any(|b| b == b'/' || b == 0) {
+        return Err(EINVAL);
+    }
+    Ok(name)
+}
+
+/// Checks a symlink target copied out of a grant: UTF-8, without NUL.
+pub fn check_target(bytes: &[u8]) -> Result<&str, i64> {
+    let target = core::str::from_utf8(bytes).map_err(|_| EINVAL)?;
+    if target.is_empty() || target.bytes().any(|b| b == 0) {
+        return Err(EINVAL);
+    }
+    Ok(target)
+}
+
+/// A completion: the request's tag and operation, the status, values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct Completion {
+    pub tag: u64,
+    pub op: u16,
+    pub status: i64,
+    pub values: [u64; 4],
+}
+
+impl Completion {
+    /// As a descriptor: `arg` = [status, v0, v1], `offset` = v2, `object`
+    /// = v3.
+    pub fn to_desc(&self) -> Desc {
+        let [v0, v1, v2, v3] = self.values;
+        Desc { op: self.op, tag: self.tag, arg: [self.status as u64, v0, v1], offset: v2, object: v3, ..Desc::default() }
+    }
+
+    pub fn from_desc(d: &Desc) -> Completion {
+        Completion { tag: d.tag, op: d.op, status: d.arg[0] as i64, values: [d.arg[1], d.arg[2], d.offset, d.object] }
+    }
+}
+
+/// `STAT`'s result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct Stat {
+    pub mode: u32,
+    pub links: u32,
+    pub size: u64,
+    pub atime: u32,
+    pub mtime: u32,
+    pub ctime: u32,
+}
+
+impl Stat {
+    /// v0 = mode | links << 32, v1 = size, v2 = atime | mtime << 32,
+    /// v3 = ctime.
+    pub fn to_values(&self) -> [u64; 4] {
+        [self.mode as u64 | (self.links as u64) << 32, self.size, self.atime as u64 | (self.mtime as u64) << 32, self.ctime as u64]
+    }
+
+    pub fn from_values(v: &[u64; 4]) -> Stat {
+        Stat { mode: v[0] as u32, links: (v[0] >> 32) as u32, size: v[1], atime: v[2] as u32, mtime: (v[2] >> 32) as u32, ctime: v[3] as u32 }
+    }
+}
+
+/// `STATFS`'s result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct Usage {
+    pub block_size: u32,
+    pub blocks: u32,
+    pub free_blocks: u32,
+    pub inodes: u32,
+    pub free_inodes: u32,
+}
+
+impl Usage {
+    /// v0 = block size, v1 = blocks | free blocks << 32, v2 = inodes |
+    /// free inodes << 32.
+    pub fn to_values(&self) -> [u64; 4] {
+        [self.block_size as u64, self.blocks as u64 | (self.free_blocks as u64) << 32, self.inodes as u64 | (self.free_inodes as u64) << 32, 0]
+    }
+
+    pub fn from_values(v: &[u64; 4]) -> Usage {
+        Usage { block_size: v[0] as u32, blocks: v[1] as u32, free_blocks: (v[1] >> 32) as u32, inodes: v[2] as u32, free_inodes: (v[2] >> 32) as u32 }
+    }
+}
+
+/// Bytes of a `READDIR` entry's header: u32 inode, u8 type, u8 name length
+/// (little-endian), then the name.
+pub const DIRENT_HEADER: usize = 6;
+
+/// Writes an entry at the start of `out`; its length, or None if it does
+/// not fit (or the name is longer than `NAME_MAX`).
+pub fn put_dirent(out: &mut [u8], ino: u32, kind: u8, name: &[u8]) -> Option<usize> {
+    let len = DIRENT_HEADER + name.len();
+    if name.len() > NAME_MAX as usize || out.len() < len {
+        return None;
+    }
+    out[..4].copy_from_slice(&ino.to_le_bytes());
+    out[4] = kind;
+    out[5] = name.len() as u8;
+    out[DIRENT_HEADER..len].copy_from_slice(name);
+    Some(len)
+}
+
+/// The entries of a `READDIR` result: (inode, type, name). Stops at the
+/// first incomplete one.
+pub fn dirents(mut p: &[u8]) -> impl Iterator<Item = (u32, u8, &[u8])> {
+    core::iter::from_fn(move || {
+        if p.len() < DIRENT_HEADER {
+            return None;
+        }
+        let (ino, kind, len) = (u32::from_le_bytes([p[0], p[1], p[2], p[3]]), p[4], p[5] as usize);
+        let name = p.get(DIRENT_HEADER..DIRENT_HEADER + len)?;
+        p = &p[DIRENT_HEADER + len..];
+        Some((ino, kind, name))
+    })
+}

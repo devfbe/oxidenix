@@ -106,6 +106,9 @@ pub struct Channel {
     memory: Arc<PageCache>,
     /// The header page, with a reference of ours (for `state`).
     header: PhysFrame,
+    /// The submission ring's first page, with a reference of ours (for its
+    /// `tail`, the word a service's doorbell watch compares: `watch`).
+    doorbell: PhysFrame,
     inner: IrqSpinLock<Inner>,
 }
 
@@ -270,12 +273,19 @@ impl Channel {
         let layout = u32::try_from(slots).ok().and_then(Layout::new).ok_or(EINVAL)?;
         let memory = PageCache::anonymous(layout.pages as u64).map_err(|_| ENOMEM)?;
         let header = memory.map_page(0).map_err(|_| ENOMEM)?;
+        let doorbell = match memory.map_page((layout.submission / PAGE as usize) as u64) {
+            Ok(frame) => frame,
+            Err(_) => {
+                memory::with_frames(|f| unsafe { x86_64::structures::paging::FrameDeallocator::deallocate_frame(f, header) });
+                return Err(ENOMEM);
+            }
+        };
         // Positions start at 0 (the memory is zeroed).
         unsafe { (memory::phys_to_virt(header.start_address().as_u64()) as *mut Header).write(Header::new(&layout)) };
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let inner = Inner { offered: None, service: None, offer_request: None, client_gone: false, service_gone: false, grants: Grants::default(), reserved: 0, pages: 0 };
-        // From here on, dropping the channel releases the header page.
-        let channel = Channel { id, layout, memory, header, inner: IrqSpinLock::new(inner) };
+        // From here on, dropping the channel releases both pages.
+        let channel = Channel { id, layout, memory, header, doorbell, inner: IrqSpinLock::new(inner) };
         let channel = Arc::try_new(channel).map_err(|_| ENOMEM)?;
         let mut channels = CHANNELS.lock();
         channels.try_reserve(1).map_err(|_| ENOMEM)?;
@@ -290,6 +300,13 @@ impl Channel {
 
     pub fn pages(&self) -> u64 {
         self.layout.pages as u64
+    }
+
+    /// The submission ring's `tail` (the client rings the service's
+    /// doorbell with a futex wake on it).
+    fn submission_tail(&self) -> &AtomicU32 {
+        let at = self.doorbell.start_address().as_u64() + (self.layout.submission % PAGE as usize + ring::TAIL_OFFSET) as u64;
+        unsafe { &*(memory::phys_to_virt(at) as *const AtomicU32) }
     }
 
     fn state(&self) -> &AtomicU32 {
@@ -582,7 +599,10 @@ impl Channel {
 
 impl Drop for Channel {
     fn drop(&mut self) {
-        memory::with_frames(|f| unsafe { x86_64::structures::paging::FrameDeallocator::deallocate_frame(f, self.header) });
+        memory::with_frames(|f| unsafe {
+            x86_64::structures::paging::FrameDeallocator::deallocate_frame(f, self.header);
+            x86_64::structures::paging::FrameDeallocator::deallocate_frame(f, self.doorbell);
+        });
         let mut channels = CHANNELS.lock();
         if let Ok(i) = channels.binary_search_by_key(&self.id, |e| e.id) {
             if channels[i].channel.strong_count() == 0 {
@@ -767,6 +787,50 @@ pub fn grant_dma(id: u64, grant: u64, offset: u64) -> Result<i64, i64> {
     Ok(address as i64)
 }
 
+/// Most device addresses one `grant_dma_pages` call returns.
+const MAX_DMA_PAGES: u64 = 512;
+
+/// grant_dma_pages(channel, grant, first, count, out): the device
+/// addresses of `count` pages of the grant from page `first`, stored as
+/// u64s at `out` (each valid for its whole page): `grant_dma` for a range,
+/// in one call.
+pub fn grant_dma_pages(id: u64, grant: u64, first: u64, count: u64, out: u64) -> Result<i64, i64> {
+    let (_, service, g) = grant_of(id, grant)?;
+    if count == 0 || count > MAX_DMA_PAGES || first.checked_add(count).is_none_or(|end| end > g.frames.len() as u64) {
+        return Err(EINVAL);
+    }
+    let mut addresses: Vec<u64> = Vec::new();
+    addresses.try_reserve_exact(count as usize).map_err(|_| ENOMEM)?;
+    {
+        let mut st = g.state.lock();
+        if st.revoked {
+            return Err(ENOENT);
+        }
+        st.device = true;
+        for &frame in &g.frames[first as usize..(first + count) as usize] {
+            addresses.push(service.server.domain.map(frame, g.writable));
+        }
+    }
+    let bytes: Vec<u8> = addresses.iter().flat_map(|a| a.to_le_bytes()).collect();
+    super::uaccess::copy_to(out, &bytes)?;
+    Ok(0)
+}
+
+/// chan_watch(channel, value): arms the calling service's doorbell watch
+/// on the channel's submission ring: if its `tail` still holds `value`,
+/// the client's next doorbell (a futex wake on it), or the client's end
+/// going, makes the service's `ipc_receive` return `ipc::DOORBELL`. For a
+/// service whose event loop sleeps in `ipc_receive` (it announced the
+/// sleep in the ring first, `ring::Consumer::prepare_sleep`). EAGAIN if
+/// the tail moved, EPIPE once the client is gone. One-shot; arming it
+/// again before it rang changes nothing.
+pub fn watch(id: u64, value: u64) -> Result<i64, i64> {
+    let (channel, service) = Channel::attached(id)?;
+    let value = u32::try_from(value).map_err(|_| EINVAL)?;
+    let offset = (channel.layout.submission + ring::TAIL_OFFSET) as u64;
+    super::futex::object_watch(&channel.memory, offset, channel.submission_tail(), value, &service.server.doorbell, super::current_pid())
+}
+
 /// grant_dma_unmap(channel, grant): the service's devices are done with
 /// the grant: its device addresses become invalid, and a revoked grant
 /// that waited for this goes.
@@ -781,6 +845,36 @@ pub fn grant_dma_unmap(id: u64, grant: u64) -> Result<i64, i64> {
         channel.forget(grant as u32, &g);
     }
     Ok(0)
+}
+
+/// set_copy_fixup(insn, fixup): the calling server's copy routine on
+/// granted memory. A revoke takes a grant from the service at once (see
+/// docs/design/io-rings.md, "The service's contract for grant memory"), so
+/// a CPU copy into or out of it may fault; a fault of the instruction at
+/// `insn` that cannot be resolved resumes at `fixup` (the routine reports
+/// the failure) instead of killing the service. Once per program (EBUSY
+/// after); servers only.
+pub fn set_copy_fixup(insn: u64, fixup: u64) -> Result<i64, i64> {
+    use super::address_space::USER_END;
+    if insn >= USER_END || fixup >= USER_END {
+        return Err(EINVAL);
+    }
+    super::with_current(|p| {
+        if p.server.is_none() {
+            return Err(EPERM);
+        }
+        if p.copy_fixup.is_some() {
+            return Err(EBUSY);
+        }
+        p.copy_fixup = Some((insn, fixup));
+        Ok(0)
+    })
+}
+
+/// Where a fault of the current task's instruction at `rip` resumes, if it
+/// is the copy routine `set_copy_fixup` registered.
+pub fn copy_fixup(rip: u64) -> Option<u64> {
+    super::with_current(|p| p.copy_fixup.filter(|&(insn, _)| insn == rip).map(|(_, fixup)| fixup))
 }
 
 /// The process `pid` ended, or executed a new program (whose devices are

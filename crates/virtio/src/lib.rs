@@ -110,14 +110,22 @@ impl Device {
         // even if the driver only fills `max` entries.
         let (ring, phys) = dma.alloc(queue_bytes(size), PAGE)?;
         unsafe { outl(self.io + QUEUE_PFN, (phys / PAGE as u64) as u32) };
-        Ok(Queue {
+        let usable = size.min(max);
+        let mut queue = Queue {
             size,
-            usable: size.min(max),
+            usable,
             desc: ring,
             avail: unsafe { ring.add(16 * size) },
             used: unsafe { ring.add(align(16 * size + 6 + 2 * size, PAGE)) },
             last_used: 0,
-        })
+            free_head: 0,
+            free: usable,
+        };
+        // The free list for `add_chain`, through the descriptors' `next`.
+        for i in 0..usable {
+            queue.set_desc(i, 0, 0, 0, (i + 1 < usable).then_some(i as u16 + 1));
+        }
+        Ok(queue)
     }
 
     /// Tells the device the driver is ready.
@@ -149,6 +157,11 @@ impl Device {
 }
 
 /// One split virtqueue in the legacy memory layout.
+///
+/// A driver either manages the descriptors itself (`set_desc`, then
+/// `push_avail`: netd's fixed buffers) or takes chains from the queue's
+/// free list (`add_chain`, and `free_chain` once the device returned
+/// them: diskfs, with several requests in flight); not both.
 pub struct Queue {
     size: usize,
     /// Entries the driver uses (descriptor indexes below this).
@@ -158,6 +171,19 @@ pub struct Queue {
     used: *mut u8,
     /// Next entry of the used ring to look at.
     last_used: u16,
+    /// The free descriptors, a list through their `next` fields, and how
+    /// many there are.
+    free_head: u16,
+    free: usize,
+}
+
+/// A buffer of a chain (`Queue::add_chain`): `len` bytes at the device
+/// address `addr`, which the device writes if `device_writes`.
+#[derive(Clone, Copy, Debug)]
+pub struct Buffer {
+    pub addr: u64,
+    pub len: u32,
+    pub device_writes: bool,
 }
 
 impl Queue {
@@ -220,6 +246,57 @@ impl Queue {
             let len = read_volatile(e.add(4) as *const u32) as usize;
             Some((id, len))
         }
+    }
+
+    /// Free descriptors (for `add_chain`).
+    pub fn free_descriptors(&self) -> usize {
+        self.free
+    }
+
+    fn desc_next(&self, i: usize) -> (u16, u16) {
+        let d = unsafe { self.desc.add(16 * i) };
+        unsafe { (read_volatile(d.add(12) as *const u16), read_volatile(d.add(14) as *const u16)) }
+    }
+
+    /// Takes `bufs.len()` descriptors from the free list, chains them over
+    /// `bufs` and hands the chain to the device (the caller then notifies
+    /// it); returns its head, which `pop_used` reports when the device is
+    /// done. None if too few descriptors are free.
+    pub fn add_chain(&mut self, bufs: &[Buffer]) -> Option<usize> {
+        if bufs.is_empty() || bufs.len() > self.free {
+            return None;
+        }
+        let head = self.free_head as usize;
+        let mut i = head;
+        for (n, b) in bufs.iter().enumerate() {
+            let (_, next) = self.desc_next(i);
+            let last = n + 1 == bufs.len();
+            let flags = if b.device_writes { DESC_F_WRITE } else { 0 };
+            self.set_desc(i, b.addr, b.len, flags, (!last).then_some(next));
+            if last {
+                self.free_head = next;
+            }
+            i = next as usize;
+        }
+        self.free -= bufs.len();
+        self.push_avail(head);
+        Some(head)
+    }
+
+    /// Returns the chain from `head` (from `pop_used`) to the free list.
+    pub fn free_chain(&mut self, head: usize) {
+        let mut i = head;
+        loop {
+            self.free += 1;
+            let (flags, next) = self.desc_next(i);
+            if flags & DESC_F_NEXT == 0 {
+                // The chain's tail points to the old free list.
+                self.set_desc(i, 0, 0, 0, Some(self.free_head));
+                break;
+            }
+            i = next as usize;
+        }
+        self.free_head = head as u16;
     }
 
     /// Whether the device finished a chain `pop_used` has not returned.

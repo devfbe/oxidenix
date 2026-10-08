@@ -250,6 +250,31 @@ fn handle(channel: u64, base: *mut u8, d: &Desc, mapped: &mut Vec<Mapped>) -> i6
             }
             Ok(0)
         }
+        WATCH => {
+            let layout = Layout::new(SLOTS as u32).expect("a valid slot count");
+            let tail = unsafe { &*(base.add(layout.submission + ring::TAIL_OFFSET) as *const AtomicU32) };
+            let other = unsafe { &*(base.add(layout.submission + ring::SLEEPING_OFFSET) as *const AtomicU32) };
+            let value = tail.load(Ordering::Acquire);
+            for _ in 0..2 {
+                if oxrt::chan_watch(channel, value) != Ok(true) {
+                    return Ok(1);
+                }
+            }
+            // FUTEX_REQUEUE (shared): wake none, move all to another word.
+            const FUTEX_REQUEUE: u64 = 3;
+            let moved = oxrt::syscall(oxrt::sys::FUTEX, [tail as *const _ as u64, FUTEX_REQUEUE, 0, i32::MAX as u64, other as *const _ as u64, 0]);
+            if moved != 0 {
+                return Ok(2);
+            }
+            if oxrt::futex_wake(tail, i32::MAX as u32) != Ok(1) {
+                return Ok(3);
+            }
+            let mut buf = [0u8; 64];
+            match oxrt::ipc_receive(&mut buf, Some(1000)) {
+                Ok(oxrt::Event::Doorbell) => Ok(0),
+                _ => Ok(4),
+            }
+        }
         ANSWER_LATE => {
             LATE.store(1, Ordering::Relaxed);
             Ok(0)

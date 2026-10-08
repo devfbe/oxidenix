@@ -413,6 +413,10 @@ pub struct Server {
     restarting: core::sync::atomic::AtomicBool,
     /// Where its devices reach the pages granted to it (channels).
     pub domain: channel::DmaDomain,
+    /// A doorbell it watches rang (`channel::watch`): its `ipc_receive`
+    /// reports it. (A restarted process may see its predecessor's: a
+    /// spurious wakeup, nothing more.)
+    pub doorbell: Arc<core::sync::atomic::AtomicBool>,
 }
 
 /// The servers the kernel started, by name: a channel to a dead one
@@ -447,6 +451,7 @@ impl Server {
             restarts: core::sync::atomic::AtomicU32::new(0),
             restarting: core::sync::atomic::AtomicBool::new(false),
             domain: channel::DmaDomain::default(),
+            doorbell: Arc::new(core::sync::atomic::AtomicBool::new(false)),
         })
     }
 

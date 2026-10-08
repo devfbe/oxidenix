@@ -175,6 +175,7 @@ pub fn clone(frame: &Frame, flags: u64, stack: u64, parent_tid: u64, child_tid: 
         clear_child_tid: if flags & CLONE_CHILD_CLEARTID != 0 { child_tid } else { 0 },
         vfork_done: vfork_done.clone(),
         linux,
+        copy_fixup: None,
     };
     let comm = me.comm.lock().clone();
     let child = new_task(tid, group, comm, own, child_frame)?;

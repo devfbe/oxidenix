@@ -176,7 +176,9 @@ version = "0.1.0"
 dependencies = [
  "ext2fs",
  "fsproto",
+ "fsring",
  "oxrt",
+ "ring",
  "virtio",
 ]
 
@@ -234,6 +236,13 @@ dependencies = [
 [[package]]
 name = "fsproto"
 version = "0.1.0"
+
+[[package]]
+name = "fsring"
+version = "0.1.0"
+dependencies = [
+ "ring",
+]
 
 [[package]]
 name = "funty"
@@ -352,6 +361,7 @@ dependencies = [
 name = "linux"
 version = "0.1.0"
 dependencies = [
+ "fsring",
  "linked_list_allocator",
  "restricted",
  "ring",

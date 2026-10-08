@@ -26,7 +26,7 @@ module comment, and the public types it defines. Where to start for common tasks
 - `kernel/src/interrupts/apic.rs` (210) Local APIC (one per CPU: timer, end of interrupt, inter-processor interrupts) and I/O APIC (routes device interrupts to CPUs).
 - `kernel/src/interrupts/entry.rs` (66) Uniform entry for every interrupt and exception (except NMI and double fault): a per-vector stub pushes the vector (and a dummy error code where the CPU pushes none), the common path saves all registers into a...
 - `kernel/src/interrupts/gdt.rs` (92) Per-CPU GDT and TSS. Types: `CpuTables`.
-- `kernel/src/interrupts/handlers.rs` (177) Interrupt and exception handlers: every vector from `entry::common_entry` lands in `trap`, which dispatches CPU exceptions (page faults, signals for user faults), device interrupts and inter-processor interrupts.
+- `kernel/src/interrupts/handlers.rs` (183) Interrupt and exception handlers: every vector from `entry::common_entry` lands in `trap`, which dispatches CPU exceptions (page faults, signals for user faults), device interrupts and inter-processor interrupts.
 - `kernel/src/interrupts/mod.rs` (72) Interrupt setup: the IDT, the interrupt controllers (local and I/O APIC from ACPI, the 8259 PICs masked) and the per-CPU setup of the other CPUs.
 - `kernel/src/main.rs` (175) The kernel's entry point: `kernel_main` takes the boot information from the bootloader (UEFI or BIOS) and brings up the console, interrupts, memory, ACPI, time, the VFS, processes, the other CPUs and the servers,...
 - `kernel/src/memory/frame.rs` (148) The physical frame allocator: fresh frames from the bootloader's usable regions, freed ones on an intrusive free list, with reference counts for shared and copy-on-write frames. Types: `PhysFrameAllocator`, `UserFrames`.
@@ -34,20 +34,20 @@ module comment, and the public types it defines. Where to start for common tasks
 - `kernel/src/memory/mod.rs` (262) Kernel memory: the frame allocator, the kernel heap (slab size classes over a first-fit heap), mappings of physical memory, and the commit and page-cache accounting. Types: `Caching`, `Stats`.
 - `kernel/src/net.rs` (124) Client side of the network server (netd): every socket operation of a user program becomes a `netproto` request. Types: `Endpoint`, `Socket`.
 - `kernel/src/process/address_space.rs` (971) A process's virtual memory: its page tables and the areas (VMAs) that say what each address range is. Types: `Prot`, `Backing`, `Vma`, `MemStats`, `Fault`, `Access`, `AddressSpace`, `Mm`.
-- `kernel/src/process/channel.rs` (610) Channels: the kernel's part of the data plane between the Linux server and the device servers (docs/design/io-rings.md, ADR 0005). Types: `Channel`, `Grant`, `DmaDomain`, `ClientEnd`.
-- `kernel/src/process/clone.rs` (185) clone(2), fork and vfork: new threads and processes.
+- `kernel/src/process/channel.rs` (672) Channels: the kernel's part of the data plane between the Linux server and the device servers (docs/design/io-rings.md, ADR 0005). Types: `Channel`, `Grant`, `DmaDomain`, `ClientEnd`.
+- `kernel/src/process/clone.rs` (186) clone(2), fork and vfork: new threads and processes.
 - `kernel/src/process/elf.rs` (81) Parsing ELF64 headers and program headers of static executables (for `loader`). Types: `Elf`, `ProgramHeader`, `Header`.
 - `kernel/src/process/epoll.rs` (380) epoll: an interest list of open files and a ready list, the event loop interface of libuv (and so of Node.js). Types: `Epoll`, `Item`.
 - `kernel/src/process/errno.rs` (45) Linux error numbers, as system calls return them (negated).
-- `kernel/src/process/exec.rs` (118) execve(2): replaces the program of the calling process.
+- `kernel/src/process/exec.rs` (119) execve(2): replaces the program of the calling process.
 - `kernel/src/process/exit.rs` (223) Ending threads and processes, and waiting for children. Types: `WaitStatus`.
-- `kernel/src/process/futex.rs` (293) futex(2): sleeping on a user-space word, the base of every pthread mutex, condition variable and join.
-- `kernel/src/process/ipc.rs` (376) Synchronous message passing between the kernel and user-space servers. Types: `Instance`.
+- `kernel/src/process/futex.rs` (336) futex(2): sleeping on a user-space word, the base of every pthread mutex, condition variable and join.
+- `kernel/src/process/ipc.rs` (383) Synchronous message passing between the kernel and user-space servers. Types: `Instance`.
 - `kernel/src/process/irq.rs` (52) Device interrupts for user-space drivers.
 - `kernel/src/process/linux.rs` (1091) Restricted mode: a Linux program and the Linux server on one thread (docs/design/linux-server.md; the interface is `crates/restricted`). Types: `Instance`, `Object`, `ExecTarget`, `Record`, `LinuxThread`.
 - `kernel/src/process/linux_inode.rs` (168) The kernel's tree for the Linux server, through handles on its inodes (phase R6c.2b, `restricted::SYS_INODE_*`): the server resolves paths and implements the calls that take one; the kernel's filesystems (tmpfs, the...
 - `kernel/src/process/loader.rs` (176) Loading a static ELF program into a new address space: its segments are mapped from the file's page cache (demand-paged, private), so every process running a program shares its unchanged pages. Types: `Image`.
-- `kernel/src/process/mod.rs` (496) Processes and threads: the process table, the current task, descriptor tables, process groups and sessions, CPU affinity; the submodules hold scheduling, fork/exec/exit, signals, IPC, restricted mode and the system... Types: `FdEntry`, `Server`.
+- `kernel/src/process/mod.rs` (498) Processes and threads: the process table, the current task, descriptor tables, process groups and sessions, CPU affinity; the submodules hold scheduling, fork/exec/exit, signals, IPC, restricted mode and the system... Types: `FdEntry`, `Server`.
 - `kernel/src/process/poll.rs` (105) Waiting for any of several files at once (poll, select, epoll_wait). Types: `PollSource`, `Registration`, `PollTable`.
 - `kernel/src/process/prctl.rs` (120) prctl, capget and capset.
 - `kernel/src/process/query.rs` (126) proc_query (syscall 1005): the kernel's native process and system information for the procfs server (records in `procproto`).
@@ -57,8 +57,8 @@ module comment, and the public types it defines. Where to start for common tasks
 - `kernel/src/process/sys_mem.rs` (198) Memory syscalls: brk, mmap, munmap, mprotect, mremap, madvise and the ones that need no work here (msync, mlock). Types: `Placement`.
 - `kernel/src/process/sys_net.rs` (196) Socket system calls (IPv4 TCP and UDP).
 - `kernel/src/process/sys_time.rs` (201) Clocks, sleeps and CPU-time accounting: clock_gettime and its relatives, clock_nanosleep, getrusage and times.
-- `kernel/src/process/syscall.rs` (433) The system call entry: the register `Frame` of every kernel entry, the `syscall` MSR setup, and the dispatch of Linux and native system call numbers to their handlers. Types: `Frame`.
-- `kernel/src/process/task.rs` (354) Tasks and thread groups. Types: `FpuState`, `State`, `Info`, `ThreadGroup`, `CpuState`, `Files`, `FsInfo`, `Process`, `Task`.
+- `kernel/src/process/syscall.rs` (436) The system call entry: the register `Frame` of every kernel entry, the `syscall` MSR setup, and the dispatch of Linux and native system call numbers to their handlers. Types: `Frame`.
+- `kernel/src/process/task.rs` (356) Tasks and thread groups. Types: `FpuState`, `State`, `Info`, `ThreadGroup`, `CpuState`, `Files`, `FsInfo`, `Process`, `Task`.
 - `kernel/src/process/tlb.rs` (234) TLB coherence: which CPUs use an address space, and shootdowns. Types: `Tlb`, `AsidCache`.
 - `kernel/src/process/uaccess.rs` (221) Access to the current process's user memory. Types: `Fixup`.
 - `kernel/src/shell/commands.rs` (226) The commands of the kernel's built-in fallback shell (help, mem, run, kill, ...).
@@ -70,12 +70,13 @@ module comment, and the public types it defines. Where to start for common tasks
 
 ## Linux server
 
-- `servers/linux/src/chantest.rs` (308) `TEST_CHANNEL`: the client's side of channels to the test service (servers/ringtest, protocol `ring::selftest`), as the page cache will use them with diskfs: create, connect, grant, move descriptors through the rings...
+- `servers/linux/src/chantest.rs` (309) `TEST_CHANNEL`: the client's side of channels to the test service (servers/ringtest, protocol `ring::selftest`), as the page cache will use them with diskfs: create, connect, grant, move descriptors through the rings...
+- `servers/linux/src/disktest.rs` (414) `TEST_DISKRING`: the client's side of the file protocol (`fsring`) against diskfs, as the page cache will use it in step 4: a channel to diskfs, grants of memory objects, files on /data read and written by DMA into...
 - `servers/linux/src/eventfd.rs` (98) eventfd (phase R6b): a counter that reads take and writes add to, a file of the server with a placeholder in the kernel's descriptor table. Types: `EventFd`.
 - `servers/linux/src/files.rs` (299) The server's files (phase R6): objects the server implements, each named in the kernel's descriptor table by a placeholder (see `restricted::SYS_KFD_INSTALL`). Types: `File`.
 - `servers/linux/src/heap.rs` (60) The server's heap: one allocator for every thread of the instance, in the shared region, growing by `SYS_SHARED_MAP` when it runs out. Types: `ServerHeap`.
 - `servers/linux/src/initramfs.rs` (65) The instance's root tmpfs from the boot image's initramfs (phase R6c.2c): the server reads the archive's headers and names from the kernel's image object (`SYS_INITRAMFS`) and makes each regular file a file object...
-- `servers/linux/src/main.rs` (234) The Linux server (docs/design/linux-server.md).
+- `servers/linux/src/main.rs` (236) The Linux server (docs/design/linux-server.md).
 - `servers/linux/src/mm.rs` (131) Memory system calls (phase R4): Linux's semantics of mmap, munmap, mprotect, mremap, madvise, msync and the mlock family, over the kernel's mapping calls.
 - `servers/linux/src/namespace.rs` (219) The server's namespace (phase R6c.2): mounts and path resolution. Types: `KInode`, `Node`, `Resolved`.
 - `servers/linux/src/paths.rs` (316) The system calls that take a path (phase R6c.2b), and the working directory and umask, which live in the caller's record (`records`).
@@ -89,30 +90,33 @@ module comment, and the public types it defines. Where to start for common tasks
 
 ## Other servers
 
-- `servers/diskfs/src/blk.rs` (151) virtio-blk driver on the shared virtio transport (crates/virtio). Types: `VirtioBlk`.
-- `servers/diskfs/src/main.rs` (148) diskfs: the ext2 filesystem server.
+- `servers/diskfs/src/blk.rs` (268) virtio-blk driver on the shared virtio transport (crates/virtio). Types: `Kind`, `SubmitError`, `VirtioBlk`.
+- `servers/diskfs/src/main.rs` (167) diskfs: the ext2 filesystem server.
+- `servers/diskfs/src/service.rs` (828) The ring service: diskfs's end of the data plane (docs/design/io-rings.md, the file protocol `fsring`). Types: `Service`.
 - `servers/netd/src/main.rs` (151) netd: the network server.
 - `servers/netd/src/nic.rs` (114) smoltcp's view of the network card, with loopback: frames addressed to this host (its own address or 127.0.0.0/8) never reach the wire but come back as received frames, and ARP requests for those addresses are... Types: `Nic`, `RxToken`, `TxToken`.
 - `servers/netd/src/service.rs` (632) The socket service: `netproto` requests from the kernel mapped onto smoltcp sockets. Types: `Config`, `Service`.
 - `servers/netd/src/virtio_net.rs` (91) virtio-net driver on the shared virtio transport (crates/virtio). Types: `VirtioNet`.
 - `servers/procfs/src/main.rs` (346) procfs: Linux's /proc, served from user space.
 - `servers/procfs/src/render.rs` (189) The text formats of Linux's /proc files.
-- `servers/ringtest/src/main.rs` (212) ringtest: the far end of the self-tests' channels (test mode only).
+- `servers/ringtest/src/main.rs` (236) ringtest: the far end of the self-tests' channels (test mode only).
 
 ## Libraries
 
-- `crates/ext2fs/src/cache.rs` (63) The metadata block cache: inode tables, bitmaps, group descriptors, directories, symlink and indirect blocks. Types: `BlockCache`.
-- `crates/ext2fs/src/lib.rs` (1146) ext2 on the data disk (any `Device`): revision 1 with the `filetype` feature, 1/2/4 KiB blocks, direct and single/double/triple indirect blocks. Types: `Device`, `NewNode`, `RawInode`, `Stat`, `Ext2`.
-- `crates/ext2fs/tests/io.rs` (284) ext2fs on a RAM disk that counts device requests: large reads and writes take few requests, every operation flushes once, and the filesystem stays consistent for e2fsck.
+- `crates/ext2fs/src/cache.rs` (72) The metadata block cache: inode tables, bitmaps, group descriptors, directories, symlink and indirect blocks. Types: `BlockCache`.
+- `crates/ext2fs/src/lib.rs` (1464) ext2 on the data disk (any `Device`): revision 1 with the `filetype` feature, 1/2/4 KiB blocks, direct and single/double/triple indirect blocks. Types: `Device`, `NewNode`, `RawInode`, `Extent`, `Run`, `Reservation`, `Stat`, `Ext2`.
+- `crates/ext2fs/tests/io.rs` (529) ext2fs on a RAM disk that counts device requests: large reads and writes take few requests, a write flushes twice (data, then metadata), and the filesystem stays consistent for e2fsck; on the ring path, reserved...
 - `crates/fsproto/src/lib.rs` (108) Message format between the kernel's VFS and filesystem servers. Types: `Op`, `Request`, `Response`.
+- `crates/fsring/src/lib.rs` (346) The file protocol of the data plane: the requests the Linux server (the client) sends diskfs (the service) through a channel's submission ring, and their completions (docs/design/io-rings.md, "The file protocol"). Types: `Buf`, `Kind`, `Request`, `Completion`, `Stat`, `Usage`.
+- `crates/fsring/tests/protocol.rs` (144) The file protocol's encodings: every request survives encode and decode, malformed descriptors are refused with the right errno (unknown operations, stray fields, lengths and names out of range), and the completion,...
 - `crates/netproto/src/lib.rs` (56) Message format between the kernel's socket layer and the network server (netd). Types: `Op`, `Request`.
-- `crates/oxrt/src/lib.rs` (242) Minimal runtime for oxidenix servers: entry point, raw system calls (Linux ABI plus the oxidenix IPC calls), a heap, printing and port I/O. Types: `Event`, `Stdout`.
+- `crates/oxrt/src/lib.rs` (294) Minimal runtime for oxidenix servers: entry point, raw system calls (Linux ABI plus the oxidenix IPC calls), a heap, printing and port I/O. Types: `Event`, `Stdout`.
 - `crates/procproto/src/lib.rs` (76) The kernel's native process and system information (syscall 1005, `proc_query`), from which the procfs server builds Linux's /proc. Types: `CpuTimes`, `System`, `Counters`, `Process`.
-- `crates/restricted/src/lib.rs` (140) The interface between the kernel and the Linux server for restricted mode (docs/design/linux-server.md): the layout of the server's shared region, the per-thread register block, and the kernel calls the server makes... Types: `State`, `Event`, `Walk`.
+- `crates/restricted/src/lib.rs` (141) The interface between the kernel and the Linux server for restricted mode (docs/design/linux-server.md): the layout of the server's shared region, the per-thread register block, and the kernel calls the server makes... Types: `State`, `Event`, `Walk`.
 - `crates/ring/src/channel.rs` (116) A channel: the memory object both ends of a data-plane connection map (docs/design/io-rings.md). Types: `Layout`, `Header`, `Offer`.
-- `crates/ring/src/lib.rs` (157) Single-producer single-consumer rings of fixed-size descriptors in shared memory: the data plane between the Linux server and the device servers (docs/design/io-rings.md, ADR 0005). Types: `Desc`, `RingMemory`, `Wait`, `Ring`, `Producer`, `Consumer`.
-- `crates/ring/src/selftest.rs` (16) The protocol of the self-tests' channel service (servers/ringtest), which the Linux server's test calls (`restricted::TEST_CHANNEL`) drive.
-- `crates/ring/tests/spsc.rs` (150) The ring's invariants (docs/design/io-rings.md): FIFO order, a full ring refuses, positions wrap modulo 2^32, a consumer on another thread sees every entry's contents, and the doorbell protocol loses no wakeup.
+- `crates/ring/src/lib.rs` (180) Single-producer single-consumer rings of fixed-size descriptors in shared memory: the data plane between the Linux server and the device servers (docs/design/io-rings.md, ADR 0005). Types: `Desc`, `RingMemory`, `Wait`, `Ring`, `Producer`, `Consumer`.
+- `crates/ring/src/selftest.rs` (17) The protocol of the self-tests' channel service (servers/ringtest), which the Linux server's test calls (`restricted::TEST_CHANNEL`) drive.
+- `crates/ring/tests/spsc.rs` (191) The ring's invariants (docs/design/io-rings.md): FIFO order, a full ring refuses, positions wrap modulo 2^32, a consumer on another thread sees every entry's contents, and the doorbell protocol loses no wakeup.
 - `crates/slab/src/lib.rs` (58) Size classes for small allocations: objects of up to 2 KiB come from slabs (4 KiB, aligned to 4 KiB) cut into equal slots, and a class's free slots form an intrusive list, so allocating and freeing one is O(1). Types: `FreeList`.
 - `crates/slab/tests/classes.rs` (95) Size classes and free lists of the slab allocator.
 - `crates/vfs/src/cpio.rs` (80) The initramfs: a cpio archive in "newc" format. Types: `Header`, `Entry`, `Entries`.
@@ -122,7 +126,7 @@ module comment, and the public types it defines. Where to start for common tasks
 - `crates/vfs/tests/cpio.rs` (64) Parsing newc cpio archives (the initramfs format).
 - `crates/vfs/tests/path.rs` (44) Lexical path normalization, as the Linux server resolves paths.
 - `crates/vfs/tests/rw.rs` (43) Where positional and vectored reads and writes go: preadv2/pwritev2's flags against the descriptor's O_APPEND, as Linux decides them.
-- `crates/virtio/src/lib.rs` (158) The virtio legacy PCI transport (all registers in I/O space) and split virtqueues, for the user-space drivers (netd: network, diskfs: block). Types: `Dma`, `Device`, `Queue`.
+- `crates/virtio/src/lib.rs` (212) The virtio legacy PCI transport (all registers in I/O space) and split virtqueues, for the user-space drivers (netd: network, diskfs: block). Types: `Dma`, `Device`, `Queue`, `Buffer`.
 
 ## Host builder
 
@@ -142,7 +146,7 @@ module comment, and the public types it defines. Where to start for common tasks
 - `userspace/hello.c` (4) The smallest program: prints its arguments and exits with 42.
 - `userspace/iobench.c` (285) I/O benchmarks (docs/benchmarks/README.md): IPC round trip latency, sequential block I/O, small synchronous reads, TCP throughput over loopback and over the network card, each with the system calls, IPC round trips,...
 - `userspace/jobtest.c` (70) Job control: stopping and continuing processes (SIGSTOP, SIGTSTP, SIGCONT), waitpid with WUNTRACED and WCONTINUED, and restarting interrupted reads.
-- `userspace/lxtest.c` (321) The Linux server's kernel interface (docs/design/linux-server.md), exercised through the server's test calls (1500 and up, see crates/restricted): the program asks its server to create a memory object, fill it, map...
+- `userspace/lxtest.c` (344) The Linux server's kernel interface (docs/design/linux-server.md), exercised through the server's test calls (1500 and up, see crates/restricted): the program asks its server to create a memory object, fill it, map...
 - `userspace/mmaptest.c` (135) File mappings through the page cache: shared mappings see write() and read() sees stores through them, across processes; private mappings see the file until they write; truncation and the end of the file give SIGBUS;...
 - `userspace/nettest.c` (170) Socket tests: TCP and UDP over loopback and through QEMU's user network (10.0.2.100:7 is an echo service, see builder/src/main.rs).
 - `userspace/oomtest.c` (72) Running out of resources: fork bombs, memory hogs and full pipes fail with errors (EAGAIN, ENOMEM) instead of bringing the kernel down.

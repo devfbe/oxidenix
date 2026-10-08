@@ -1,6 +1,12 @@
 //! diskfs: the ext2 filesystem server. It drives the virtio block device
 //! from user space and answers the kernel's filesystem requests (see
-//! `fsproto`).
+//! `fsproto`), and serves the file protocol over the rings of the
+//! channels clients offer it (`service`, `fsring`).
+//!
+//! One thread, one event loop: `ipc_receive` brings the kernel's requests,
+//! channel offers and doorbells; the ring service polls its rings and the
+//! device while there is work and sleeps there when there is none. A
+//! kernel request runs once the ring operations in flight completed.
 
 #![no_std]
 #![no_main]
@@ -8,6 +14,7 @@
 extern crate alloc;
 
 mod blk;
+mod service;
 
 use alloc::string::String;
 use alloc::vec;
@@ -51,6 +58,7 @@ fn main(args: Vec<&'static str>) -> i32 {
         }
     };
     let (sectors, read_only) = (disk.sectors(), disk.read_only());
+    let mut rings = service::Service::new(&disk);
     let mut fs = match Ext2::mount(disk) {
         Ok(fs) => fs,
         Err(e) => {
@@ -58,7 +66,13 @@ fn main(args: Vec<&'static str>) -> i32 {
             return 1;
         }
     };
-    if let Err(e) = oxrt::ipc_register("diskfs", ext2fs::ROOT_INO as u64) {
+    // Copies to and from grants fail instead of killing diskfs when a
+    // client revokes one meanwhile.
+    if let Err(e) = oxrt::copy::register() {
+        println!("diskfs: cannot register the copy fixup: {}", e);
+        return 1;
+    }
+    if let Err(e) = oxrt::ipc_register_with(fsring::SERVICE, ext2fs::ROOT_INO as u64, oxrt::IPC_CHANNELS) {
         println!("diskfs: cannot register: {}", e);
         return 1;
     }
@@ -68,12 +82,26 @@ fn main(args: Vec<&'static str>) -> i32 {
     let mut request = vec![0u8; MAX_MESSAGE];
     let mut response = vec![0u8; MAX_MESSAGE];
     loop {
-        let Ok(oxrt::Event::Request(id, len)) = oxrt::ipc_receive(&mut request, None) else { continue };
-        let n = match decode_request(&request[..len]) {
-            Some(req) => handle(&mut fs, &req, &mut response),
-            None => encode_response(&mut response, -EINVAL, [0; 6], &[]),
-        };
-        let _ = oxrt::ipc_reply(id, &response[..n]);
+        // Sleep only with nothing to do and every doorbell armed.
+        let sleep = !rings.busy() && rings.prepare_sleep();
+        let event = oxrt::ipc_receive(&mut request, if sleep { None } else { Some(0) });
+        rings.awake();
+        match event {
+            Ok(oxrt::Event::Request(id, len)) => {
+                rings.drain(&mut fs);
+                let n = match decode_request(&request[..len]) {
+                    Some(req) => handle(&mut fs, &req, &mut response),
+                    None => encode_response(&mut response, -EINVAL, [0; 6], &[]),
+                };
+                let _ = oxrt::ipc_reply(id, &response[..n]);
+            }
+            Ok(oxrt::Event::Control(id, len)) => {
+                let status = rings.offer(&request[..len]);
+                let _ = oxrt::ipc_reply(id, &status.to_le_bytes());
+            }
+            _ => {}
+        }
+        rings.run(&mut fs);
     }
 }
 

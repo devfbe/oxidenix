@@ -2,11 +2,26 @@
 //! 1/2/4 KiB blocks, direct and single/double/triple indirect blocks.
 //!
 //! Metadata goes through a block cache (`cache.rs`); every public operation
-//! commits its changes before it returns (written together, then one
+//! commits its changes before it returns (written together, then a
 //! flush), so a completed operation is durable. File data is read and
 //! written straight from and to the device, in runs of contiguous blocks.
 //! Metadata is kept consistent enough for `e2fsck` on the host to accept
 //! the filesystem.
+//!
+//! **Ordering.** Whatever metadata may point to reaches the disk first:
+//! file data, zeroed fresh blocks and the contents of newly allocated
+//! metadata blocks (indirect, directory, symlink blocks) are written and
+//! flushed before any metadata is written, by a commit or a cache eviction
+//! (`State::barrier`). A crash at any moment, whatever the device's cache
+//! wrote back of what came after its last flush, therefore never leaves a
+//! pointer to a block that still holds a deleted file's data (tested by
+//! replaying every write and flush with arbitrary losses). A write thus
+//! costs two flushes: data, then metadata.
+//!
+//! The ring path (`read_map`, `reserve`, `link`, `sync`) is the exception
+//! to the commit per operation: there the caller moves file data between
+//! the device and its client's pages itself, several requests at once,
+//! and makes it durable with `sync` (write-back), under the same ordering.
 
 #![no_std]
 
@@ -25,6 +40,7 @@ use alloc::vec::Vec;
 pub mod errno {
     pub const ENOENT: i64 = 2;
     pub const EIO: i64 = 5;
+    pub const EAGAIN: i64 = 11;
     pub const EEXIST: i64 = 17;
     pub const ENOTDIR: i64 = 20;
     pub const EISDIR: i64 = 21;
@@ -206,6 +222,20 @@ struct State<D: Device> {
     /// Inodes whose last link went away; the Ext2 wrapper decides whether
     /// to free them now or when the last open reference is dropped.
     unlinked: Vec<(u32, RawInode)>,
+    /// Data blocks reserved for writes in flight (`Ext2::reserve`): in no
+    /// bitmap and no inode yet, but no allocation takes them.
+    reserved: BTreeSet<u32>,
+    /// Blocks allocated for metadata (indirect, directory and symlink
+    /// blocks) whose contents have not reached the device yet. Like file
+    /// data, they are written and flushed before any metadata that may
+    /// point to them (`barrier`): after a crash, no pointer leads to a
+    /// block that still holds what a deleted file left there.
+    new_meta: BTreeSet<u32>,
+    /// Blocks were written that metadata may point to (file data, zeroed
+    /// fresh blocks, new metadata blocks, and the data of the caller's own
+    /// writes that `Ext2::link` records) and the device has not been
+    /// flushed since: it is, before any metadata reaches the device.
+    unflushed: bool,
 }
 
 /// One directory entry as found on disk.
@@ -276,7 +306,14 @@ impl<D: Device> State<D> {
             if let Some(contents) = contents {
                 // Data before the metadata that may point to it.
                 self.zero_fresh()?;
-                self.dev_write(old, &contents)?;
+                if self.new_meta.remove(&old) {
+                    // A new block's contents: what points to it waits.
+                    self.dev_write(old, &contents)?;
+                    self.unflushed = true;
+                } else {
+                    self.barrier()?;
+                    self.dev_write(old, &contents)?;
+                }
             }
             self.cache.remove(old);
         }
@@ -293,6 +330,7 @@ impl<D: Device> State<D> {
             }
             let zeros = vec![0u8; count as usize * self.block_size];
             self.dev_write(first, &zeros)?;
+            self.unflushed = true;
             for n in first..first + count {
                 self.fresh.remove(&n);
             }
@@ -318,11 +356,42 @@ impl<D: Device> State<D> {
         Ok(())
     }
 
+    /// Makes what metadata may point to durable before metadata is written:
+    /// the new metadata blocks' contents (see `new_meta`), then a flush if
+    /// anything such was written (see `unflushed`).
+    fn barrier(&mut self) -> Result<(), i64> {
+        let blocks: Vec<u32> = self.new_meta.iter().copied().collect();
+        for n in blocks {
+            // A block allocated but not filled yet (its allocation's own
+            // metadata updates may land here) stays new until it is.
+            if !self.cache.contains(n) {
+                continue;
+            }
+            if self.cache.is_dirty(n) {
+                let contents = self.cache.range(n..n + 1).next().map(|(_, d)| d.to_vec()).unwrap_or_default();
+                self.dev_write(n, &contents)?;
+                self.cache.mark_clean(n);
+                self.unflushed = true;
+            }
+            self.new_meta.remove(&n);
+        }
+        if self.unflushed {
+            self.dev.flush().map_err(io)?;
+            self.unflushed = false;
+        }
+        Ok(())
+    }
+
     /// Zeroes fresh data blocks, writes the changed metadata (adjacent
     /// blocks in one request), then flushes the device if anything was
-    /// written. What fails stays to be written by the next commit.
+    /// written. The data and new blocks the metadata points to are flushed
+    /// before it (`barrier`). What fails stays to be written by the next
+    /// commit.
     fn commit(&mut self) -> Result<(), i64> {
         self.zero_fresh()?;
+        if self.super_dirty || self.cache.has_dirty() {
+            self.barrier()?;
+        }
         let dirty = self.cache.dirty();
         let mut i = 0;
         while i < dirty.len() {
@@ -381,6 +450,7 @@ impl<D: Device> State<D> {
         let blocks = first..first + (buf.len() / self.block_size) as u32;
         self.cache.remove_range(blocks.clone());
         self.dev_write(first, buf)?;
+        self.unflushed = true;
         for n in blocks {
             self.fresh.remove(&n);
         }
@@ -403,9 +473,10 @@ impl<D: Device> State<D> {
     }
 
     fn inode_location(&self, ino: u32) -> Result<(u32, usize), i64> {
-        let g = ((ino - 1) / self.inodes_per_group) as usize;
+        let index = ino.checked_sub(1).ok_or(EIO)?;
+        let g = (index / self.inodes_per_group) as usize;
         let group = self.groups.get(g).ok_or(EIO)?;
-        let byte = ((ino - 1) % self.inodes_per_group) as usize * self.inode_size;
+        let byte = (index % self.inodes_per_group) as usize * self.inode_size;
         Ok((group.inode_table + (byte / self.block_size) as u32, byte % self.block_size))
     }
 
@@ -426,18 +497,36 @@ impl<D: Device> State<D> {
         ((ino - 1) / self.inodes_per_group) as usize
     }
 
-    /// Finds and sets a clear bit in a bitmap block; returns its index.
-    fn take_bit(&mut self, bitmap_block: u32, limit: u32) -> Result<Option<u32>, i64> {
-        let mut bitmap = self.read_block(bitmap_block)?;
-        for bit in 0..limit {
+    /// A clear bit of a bitmap block below `limit`, searched from `start`
+    /// on (wrapping around). For a block bitmap, `first` is the group's
+    /// first block: bits of reserved blocks count as taken.
+    fn find_bit(&mut self, bitmap_block: u32, limit: u32, start: u32, first: Option<u32>) -> Result<Option<u32>, i64> {
+        let bitmap = self.read_block(bitmap_block)?;
+        let start = if start < limit { start } else { 0 };
+        for bit in (start..limit).chain(0..start) {
             let (byte, mask) = ((bit / 8) as usize, 1u8 << (bit % 8));
-            if bitmap[byte] & mask == 0 {
-                bitmap[byte] |= mask;
-                self.write_block(bitmap_block, &bitmap)?;
+            if bitmap[byte] & mask == 0 && !first.is_some_and(|f| self.reserved.contains(&(f + bit))) {
                 return Ok(Some(bit));
             }
         }
         Ok(None)
+    }
+
+    /// Sets bit `bit` of a bitmap block.
+    fn set_bit(&mut self, bitmap_block: u32, bit: u32) -> Result<(), i64> {
+        let mut bitmap = self.read_block(bitmap_block)?;
+        bitmap[(bit / 8) as usize] |= 1u8 << (bit % 8);
+        self.write_block(bitmap_block, &bitmap)
+    }
+
+    /// Finds and sets a clear bit in a bitmap block (see `find_bit`);
+    /// returns its index.
+    fn take_bit(&mut self, bitmap_block: u32, limit: u32, first: Option<u32>) -> Result<Option<u32>, i64> {
+        let bit = self.find_bit(bitmap_block, limit, 0, first)?;
+        if let Some(bit) = bit {
+            self.set_bit(bitmap_block, bit)?;
+        }
+        Ok(bit)
     }
 
     fn clear_bit(&mut self, bitmap_block: u32, bit: u32) -> Result<(), i64> {
@@ -456,12 +545,14 @@ impl<D: Device> State<D> {
             }
             let first = self.first_data_block + g as u32 * self.blocks_per_group;
             let limit = self.blocks_per_group.min(self.blocks_count - first);
-            if let Some(bit) = self.take_bit(self.groups[g].block_bitmap, limit)? {
+            if let Some(bit) = self.take_bit(self.groups[g].block_bitmap, limit, Some(first))? {
                 self.groups[g].free_blocks -= 1;
                 self.free_blocks -= 1;
                 self.write_group(g)?;
                 self.write_super()?;
                 let block = first + bit;
+                // Metadata unless `alloc_data` makes it a fresh data block.
+                self.new_meta.insert(block);
                 if zero {
                     self.write_block(block, &vec![0u8; self.block_size])?;
                 }
@@ -475,6 +566,7 @@ impl<D: Device> State<D> {
         self.check_block(block)?;
         self.cache.remove(block);
         self.fresh.remove(&block);
+        self.new_meta.remove(&block);
         let rel = block - self.first_data_block;
         let g = (rel / self.blocks_per_group) as usize;
         self.clear_bit(self.groups[g].block_bitmap, rel % self.blocks_per_group)?;
@@ -490,7 +582,7 @@ impl<D: Device> State<D> {
             if self.groups[g].free_inodes == 0 {
                 continue;
             }
-            if let Some(bit) = self.take_bit(self.groups[g].inode_bitmap, self.inodes_per_group)? {
+            if let Some(bit) = self.take_bit(self.groups[g].inode_bitmap, self.inodes_per_group, None)? {
                 self.groups[g].free_inodes -= 1;
                 if dir {
                     self.groups[g].used_dirs += 1;
@@ -603,6 +695,7 @@ impl<D: Device> State<D> {
     fn alloc_data(&mut self, goal: usize, zero: bool) -> Result<u32, i64> {
         let b = self.alloc_block(goal, zero)?;
         if !zero {
+            self.new_meta.remove(&b);
             self.fresh.insert(b);
         }
         Ok(b)
@@ -1115,6 +1208,299 @@ impl<D: Device> State<D> {
         };
         String::from_utf8(bytes).map_err(|_| EIO)
     }
+
+    // ------------------------------------- the ring path (see `Ext2::reserve`)
+
+    /// Inode `ino` if it is in use: in range, allocated (it has a mode) and
+    /// not freed (no deletion time; an unlinked inode still open is in
+    /// use). ENOENT otherwise.
+    fn live_inode(&mut self, ino: u32) -> Result<RawInode, i64> {
+        let count = self.inodes_per_group as u64 * self.groups.len() as u64;
+        if ino == 0 || ino as u64 > count {
+            return Err(ENOENT);
+        }
+        let inode = self.read_inode(ino)?;
+        if inode.mode() == 0 || le32(&inode.0, 20) != 0 {
+            return Err(ENOENT);
+        }
+        Ok(inode)
+    }
+
+    /// Where the pointer to the data block of file block `fb` lives; with
+    /// `alloc`, missing indirect blocks on the way are allocated (zeroed)
+    /// and linked. None if one is missing and not `alloc`.
+    fn leaf_slot(&mut self, ino: u32, inode: &mut RawInode, fb: u64, alloc: bool) -> Result<Option<Slot>, i64> {
+        if (fb as usize) < DIRECT {
+            return Ok(Some(Slot::Inode(fb as usize)));
+        }
+        let goal = self.group_of(ino);
+        let spb = self.sectors_per_block() as i64;
+        let p = self.ptrs_per_block();
+        let mut rel = fb - DIRECT as u64;
+        let (root, depth) = if rel < p {
+            (DIRECT, 1)
+        } else if rel - p < p * p {
+            rel -= p;
+            (DIRECT + 1, 2)
+        } else if rel - p - p * p < p * p * p {
+            rel -= p + p * p;
+            (DIRECT + 2, 3)
+        } else {
+            return Err(EFBIG);
+        };
+        let mut blk = self.check_block(inode.block(root))?;
+        if blk == 0 {
+            if !alloc {
+                return Ok(None);
+            }
+            blk = self.alloc_block(goal, true)?;
+            inode.set_block(root, blk);
+            inode.add_sectors(spb);
+        }
+        // Down to the table that points to data blocks (level 0).
+        for level in (1..depth).rev() {
+            let idx = ((rel / p.pow(level)) % p) as usize;
+            let mut table = self.read_block(blk)?;
+            let mut next = self.check_block(le32(&table, idx * 4))?;
+            if next == 0 {
+                if !alloc {
+                    return Ok(None);
+                }
+                next = self.alloc_block(goal, true)?;
+                put32(&mut table, idx * 4, next);
+                self.write_block(blk, &table)?;
+                inode.add_sectors(spb);
+            }
+            blk = next;
+        }
+        Ok(Some(Slot::Table(blk, (rel % p) as usize)))
+    }
+
+    fn slot_get(&mut self, inode: &RawInode, slot: Slot) -> Result<u32, i64> {
+        match slot {
+            Slot::Inode(i) => self.check_block(inode.block(i)),
+            Slot::Table(t, i) => {
+                let table = self.read_block(t)?;
+                self.check_block(le32(&table, i * 4))
+            }
+        }
+    }
+
+    fn slot_set(&mut self, inode: &mut RawInode, slot: Slot, block: u32) -> Result<(), i64> {
+        match slot {
+            Slot::Inode(i) => {
+                inode.set_block(i, block);
+                Ok(())
+            }
+            Slot::Table(t, i) => {
+                let mut table = self.read_block(t)?;
+                put32(&mut table, i * 4, block);
+                self.write_block(t, &table)
+            }
+        }
+    }
+
+    /// Reserves a free data block (see `reserved`): the one after `after`
+    /// if that is free (runs stay contiguous), else the first free one from
+    /// group `goal` on.
+    fn reserve_block(&mut self, goal: usize, after: Option<u32>) -> Result<u32, i64> {
+        let (fdb, bpg) = (self.first_data_block, self.blocks_per_group);
+        let next = after.and_then(|b| b.checked_add(1)).filter(|&b| b >= fdb && b < self.blocks_count);
+        let (goal, start) = match next {
+            Some(b) => (((b - fdb) / bpg) as usize, (b - fdb) % bpg),
+            None => (goal.min(self.groups.len() - 1), 0),
+        };
+        let n = self.groups.len();
+        for (i, g) in (goal..n).chain(0..goal).enumerate() {
+            if self.groups[g].free_blocks == 0 {
+                continue;
+            }
+            let first = fdb + g as u32 * bpg;
+            let limit = bpg.min(self.blocks_count - first);
+            let from = if i == 0 { start } else { 0 };
+            if let Some(bit) = self.find_bit(self.groups[g].block_bitmap, limit, from, Some(first))? {
+                self.reserved.insert(first + bit);
+                return Ok(first + bit);
+            }
+        }
+        Err(ENOSPC)
+    }
+
+    /// Takes reserved block `block` into its group's bitmap and counts.
+    fn mark_used(&mut self, block: u32) -> Result<(), i64> {
+        let rel = block - self.first_data_block;
+        let g = (rel / self.blocks_per_group) as usize;
+        self.set_bit(self.groups[g].block_bitmap, rel % self.blocks_per_group)?;
+        self.groups[g].free_blocks = self.groups[g].free_blocks.saturating_sub(1);
+        self.free_blocks = self.free_blocks.saturating_sub(1);
+        self.write_group(g)?;
+        self.write_super()
+    }
+
+    fn read_map(&mut self, ino: u32, off: u64, len: u64) -> Result<(u64, Vec<Extent>), i64> {
+        let mut inode = self.live_inode(ino)?;
+        if !inode.is_reg() {
+            return Err(EINVAL);
+        }
+        let size = inode.size();
+        let end = off.saturating_add(len).min(size);
+        let bs = self.block_size as u64;
+        let mut out: Vec<Extent> = Vec::new();
+        let mut pos = off;
+        while pos < end {
+            let in_block = pos % bs;
+            let chunk = (bs - in_block).min(end - pos);
+            let blk = self.bmap(ino, &mut inode, pos / bs, false)?;
+            // A fresh block (a failed commit's) reads as zeros, a cached
+            // one may be newer than the device's: the caller copies.
+            if blk != 0 && (self.fresh.contains(&blk) || self.cache.contains(blk)) {
+                return Err(EAGAIN);
+            }
+            let disk = (blk != 0).then(|| blk as u64 * bs + in_block);
+            match out.last_mut() {
+                Some(e) if e.disk.is_none() && disk.is_none() => e.len += chunk,
+                Some(e) if e.disk.is_some() && e.disk.map(|d| d + e.len) == disk => e.len += chunk,
+                _ => out.push(Extent { disk, len: chunk }),
+            }
+            pos += chunk;
+        }
+        Ok((size, out))
+    }
+
+    /// The data block for file block `fb` of a write: (block, new).
+    fn reserve_one(&mut self, ino: u32, inode: &mut RawInode, fb: u64, after: Option<u32>) -> Result<(u32, bool), i64> {
+        let slot = self.leaf_slot(ino, inode, fb, true)?.ok_or(EIO)?;
+        match self.slot_get(inode, slot)? {
+            0 => Ok((self.reserve_block(self.group_of(ino), after)?, true)),
+            // As in `read_map`: the device must hold the block's current data.
+            b if self.fresh.contains(&b) || self.cache.contains(b) => Err(EAGAIN),
+            b => Ok((b, false)),
+        }
+    }
+
+    fn reserve(&mut self, ino: u32, off: u64, len: u64) -> Result<Reservation, i64> {
+        let mut inode = self.live_inode(ino)?;
+        if !inode.is_reg() {
+            return Err(EINVAL);
+        }
+        let end = off.checked_add(len).filter(|&end| end <= self.max_file_size()).ok_or(EFBIG)?;
+        let mut r = Reservation { ino, runs: Vec::new() };
+        if len == 0 {
+            return Ok(r);
+        }
+        let bs = self.block_size as u64;
+        let mut result = Ok(());
+        let mut last_new = None;
+        for fb in off / bs..=(end - 1) / bs {
+            let (block, new) = match self.reserve_one(ino, &mut inode, fb, last_new) {
+                Ok(b) => b,
+                Err(e) => {
+                    result = Err(e);
+                    break;
+                }
+            };
+            if new {
+                last_new = Some(block);
+            }
+            match r.runs.last_mut() {
+                Some(run) if run.new == new && run.block.checked_add(run.count) == Some(block) => run.count += 1,
+                _ => r.runs.push(Run { file_block: fb, block, count: 1, new }),
+            }
+        }
+        // The inode keeps the indirect blocks it got, also after an error.
+        let written = self.write_inode(ino, &inode);
+        if let Err(e) = result.and(written) {
+            self.unreserve(&r);
+            return Err(e);
+        }
+        Ok(r)
+    }
+
+    fn unreserve(&mut self, r: &Reservation) {
+        for run in r.runs.iter().filter(|run| run.new) {
+            for b in run.block..run.block + run.count {
+                self.reserved.remove(&b);
+            }
+        }
+    }
+
+    /// Links reserved block `block` as file block `fb`.
+    fn link_block(&mut self, ino: u32, inode: &mut RawInode, fb: u64, block: u32) -> Result<(), i64> {
+        let slot = self.leaf_slot(ino, inode, fb, false)?.ok_or(EIO)?;
+        if self.slot_get(inode, slot)? != 0 {
+            // Linked meanwhile (writes to a block are serialized, so this
+            // never happens): ours stays free.
+            return Ok(());
+        }
+        self.mark_used(block)?;
+        self.slot_set(inode, slot, block)?;
+        inode.add_sectors(self.sectors_per_block() as i64);
+        Ok(())
+    }
+
+    fn link(&mut self, r: &Reservation, end: u64) -> Result<u64, i64> {
+        // The data went to the device outside this filesystem: from here on
+        // it is flushed before any metadata reaches the device (see
+        // `unflushed`), also a block an eviction writes while the pointers
+        // below are set.
+        self.unflushed = true;
+        let mut inode = match self.live_inode(r.ino) {
+            Ok(inode) => inode,
+            Err(e) => {
+                self.unreserve(r);
+                return Err(e);
+            }
+        };
+        let mut result = Ok(());
+        for run in r.runs.iter().filter(|run| run.new) {
+            for i in 0..run.count {
+                let block = run.block + i;
+                if self.reserved.remove(&block) && result.is_ok() {
+                    result = self.link_block(r.ino, &mut inode, run.file_block + i as u64, block);
+                }
+            }
+        }
+        if result.is_ok() && end > inode.size() {
+            inode.set_size(end);
+        }
+        inode.touch(self.dev.now(), false, true);
+        self.write_inode(r.ino, &inode)?;
+        result.map(|_| inode.size())
+    }
+}
+
+/// Where a pointer to a data block lives: the inode's block array, or a
+/// slot of an indirect block (block, index).
+#[derive(Clone, Copy)]
+enum Slot {
+    Inode(usize),
+    Table(u32, usize),
+}
+
+/// A stretch of a file's bytes (`Ext2::read_map`): `len` bytes from byte
+/// `disk` of the device, or a hole (None), which reads as zeros.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Extent {
+    pub disk: Option<u64>,
+    pub len: u64,
+}
+
+/// `count` contiguous data blocks from `block` on the device, which hold
+/// the file blocks from `file_block` on; `new` ones are reserved for the
+/// write and linked by `Ext2::link`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Run {
+    pub file_block: u64,
+    pub block: u32,
+    pub count: u32,
+    pub new: bool,
+}
+
+/// The blocks a write goes to (`Ext2::reserve`).
+#[derive(Debug, Default)]
+pub struct Reservation {
+    pub ino: u32,
+    pub runs: Vec<Run>,
 }
 
 /// Metadata of one inode.
@@ -1135,7 +1521,13 @@ pub struct Ext2<D: Device> {
 }
 
 impl<D: Device> Ext2<D> {
-    pub fn mount(mut dev: D) -> Result<Self, &'static str> {
+    pub fn mount(dev: D) -> Result<Self, &'static str> {
+        Self::mount_with_cache(dev, CACHE_BYTES)
+    }
+
+    /// `mount` with a metadata cache of `cache_bytes` (the tests make it
+    /// small, so that blocks are evicted all the time).
+    pub fn mount_with_cache(mut dev: D, cache_bytes: usize) -> Result<Self, &'static str> {
         let mut sb = [0u8; 1024];
         dev.read(2, &mut sb).map_err(|_| "cannot read the superblock")?;
         if le16(&sb, 56) != MAGIC {
@@ -1174,12 +1566,15 @@ impl<D: Device> Ext2<D> {
             free_inodes: le32(&sb, 16),
             gdt_block: first_data_block + 1,
             groups: Vec::new(),
-            cache: BlockCache::new(CACHE_BYTES / block_size),
+            cache: BlockCache::new(cache_bytes / block_size),
             sb,
             super_dirty: false,
             written: false,
             fresh: BTreeSet::new(),
             unlinked: Vec::new(),
+            reserved: BTreeSet::new(),
+            new_meta: BTreeSet::new(),
+            unflushed: false,
         };
         let count = (blocks_count - first_data_block).div_ceil(blocks_per_group) as usize;
         for g in 0..count {
@@ -1330,5 +1725,64 @@ impl<D: Device> Ext2<D> {
         let st = &self.st;
         let inodes = st.inodes_per_group as u64 * st.groups.len() as u64;
         (st.block_size as u64, st.blocks_count as u64, st.free_blocks as u64, inodes, st.free_inodes as u64)
+    }
+
+    pub fn block_size(&self) -> usize {
+        self.st.block_size
+    }
+
+    // The ring path (diskfs's data plane, docs/design/io-rings.md): the
+    // caller moves file data between the device and its client's pages
+    // itself, with several requests in flight; these calls say where the
+    // data lies and record what the writes did. They do not commit: the
+    // metadata they change reaches the device with the next commit (`sync`,
+    // or any other operation), after the data (see `State::unflushed`).
+
+    /// ENOENT unless inode `ino` is in use (allocated and not freed).
+    pub fn check(&mut self, ino: u32) -> Result<(), i64> {
+        self.st.live_inode(ino).map(|_| ())
+    }
+
+    /// Where the bytes `off..off + len` of regular file `ino` lie (clipped
+    /// to its size): (file size, extents). EAGAIN if a block's current
+    /// data is not (only) on the device (a block cached or fresh after a
+    /// failed commit, which `read` handles): the caller reads through
+    /// `read` then.
+    pub fn read_map(&mut self, ino: u32, off: u64, len: u64) -> Result<(u64, Vec<Extent>), i64> {
+        self.st.read_map(ino, off, len)
+    }
+
+    /// The blocks a write of `off..off + len` to regular file `ino` goes
+    /// to: the file's blocks where it has them, and blocks reserved for
+    /// it in its holes (with the indirect blocks to point to them, which
+    /// are allocated and linked now). The caller writes the data to the
+    /// device, then `link`s the reservation (or `unreserve`s it if the
+    /// write failed); a reserved block is in no bitmap and no inode until
+    /// then, so a crash before leaves the filesystem as it was. A new
+    /// block must be written whole (zeros where the write has no data).
+    /// Writes to the same blocks must not overlap in time (the caller
+    /// serializes them), nor may a truncation or release of the file come
+    /// in between. EAGAIN as for `read_map`: the caller writes through
+    /// `write` then.
+    pub fn reserve(&mut self, ino: u32, off: u64, len: u64) -> Result<Reservation, i64> {
+        self.st.reserve(ino, off, len)
+    }
+
+    /// Links the reserved blocks of a write whose data is on the device,
+    /// and makes the file at least `end` bytes long; its new size.
+    pub fn link(&mut self, r: &Reservation, end: u64) -> Result<u64, i64> {
+        self.st.link(r, end)
+    }
+
+    /// Gives the reserved blocks of a write that failed back.
+    pub fn unreserve(&mut self, r: &Reservation) {
+        self.st.unreserve(r)
+    }
+
+    /// Makes every linked write durable: its data first (a device flush),
+    /// then the metadata (a commit, flushed).
+    pub fn sync(&mut self) -> Result<(), i64> {
+        let barrier = self.st.barrier();
+        self.commit(barrier)
     }
 }

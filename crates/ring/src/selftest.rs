@@ -48,3 +48,8 @@ pub const ANSWER_LATE: u16 = 12;
 /// cannot make it writable, the kernel cannot be made to store into it),
 /// so it cannot forge the kernel's `state`.
 pub const HEADER_READ_ONLY: u16 = 13;
+/// 0 if the doorbell watches (`chan_watch`) on the submission ring's tail
+/// stay bounded: arming twice keeps one, a requeue moves none of them,
+/// one wake of the word wakes exactly one, and it turns into a doorbell
+/// event of the service's `ipc_receive`.
+pub const WATCH: u16 = 14;

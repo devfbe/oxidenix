@@ -235,6 +235,42 @@ impl<const N: usize> Consumer<'_, N> {
         }
         result
     }
+
+    /// For a consumer that sleeps elsewhere (an event loop waiting for
+    /// several rings and other events at once): announces the sleep as
+    /// invariant 4 says (`sleeping = 1`, fence, `tail` again) and returns
+    /// the tail value to sleep on, or None if entries came meanwhile (then
+    /// it has woken already, `sleeping` is cleared). The caller sleeps only
+    /// while the tail word still holds that value (a futex compares it) and
+    /// calls `awake` once it runs again.
+    pub fn prepare_sleep(&mut self) -> Option<u32> {
+        if self.head != self.tail || self.mem.tail.0.load(Ordering::Acquire) != self.head {
+            return None;
+        }
+        self.mem.sleeping.0.store(1, Ordering::Relaxed);
+        fence(Ordering::SeqCst);
+        let tail = self.mem.tail.0.load(Ordering::Relaxed);
+        if tail != self.head {
+            self.awake();
+            return None;
+        }
+        Some(tail)
+    }
+
+    /// Ends a sleep announced by `prepare_sleep`: producers stop ringing
+    /// the doorbell (the consumer polls while it is awake).
+    pub fn awake(&mut self) {
+        self.mem.sleeping.0.store(0, Ordering::Relaxed);
+    }
+
+    /// Whether the ring holds an entry (without taking it).
+    pub fn is_empty(&mut self) -> bool {
+        if self.head != self.tail {
+            return false;
+        }
+        self.tail = self.mem.tail.0.load(Ordering::Acquire);
+        self.head == self.tail
+    }
 }
 
 /// Offsets of the words in a `RingMemory` (for the kernel, which wakes the

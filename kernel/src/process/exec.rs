@@ -127,6 +127,7 @@ pub fn exec(frame: &mut Frame, path: &str, args: &[String], envs: &[String]) -> 
         };
         p.io_bitmap = None;
         p.server = None;
+        p.copy_fixup = None;
         p.clear_child_tid = 0;
         crate::smp::cpu().tables().set_io_bitmap(None);
         let closed: Vec<FdEntry> = p.files.as_ref().map(|f| f.take_cloexec()).unwrap_or_default();

@@ -161,6 +161,14 @@ fn exception(frame: &mut Frame) {
             }
         }
     }
+    // A service's copy on granted memory that a revoke took away (see
+    // `channel::set_copy_fixup`): the copy fails, not the service.
+    if vector == 14 && frame.from_user() {
+        if let Some(fixup) = crate::process::channel::copy_fixup(frame.rip) {
+            frame.rip = fixup;
+            return;
+        }
+    }
     if frame.from_user() && vector != 18 {
         if signal::force(sig) {
             // No handler: the process dies, so say why.
