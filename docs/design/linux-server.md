@@ -133,11 +133,13 @@ input, PCI and ACPI.
 ### The page cache and the I/O paths
 
 The page cache moves with the VFS into the server. Each cached file is a memory object whose
-pager is the server: a page fault on a mapping of the file comes to the pager thread, which
-reads the page from diskfs into the object (`mo_supply`). `read`/`write` copy between the object and the
-program directly (one copy, as Linux). The server talks to diskfs and netd through
-shared-memory rings with buffers granted from its memory objects (zero copy, IOMMU-confined
-DMA); that design follows the principles of the I/O audit and is its own document.
+pager is the server (a cached object, done in R6c.3): a page fault on a mapping of the file
+comes to the pager thread, which has diskfs read the page by DMA straight into the object's
+granted page (`GRANT_FILL`, `mo_filled`; no `mo_supply` copy). `read`/`write` copy between the
+object and the program directly (one copy, as Linux). The server talks to diskfs and netd
+through shared-memory rings with buffers granted from its memory objects (zero copy,
+IOMMU-confined DMA); that design follows the principles of the I/O audit and is its own
+document (`io-rings.md`).
 
 ## Migration
 

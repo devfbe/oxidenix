@@ -34,5 +34,5 @@ an IOMMU can confine them later without an interface change.
   it; the kernel must revoke a grant only after the service acknowledged it (no DMA into a page
   after its revocation).
 - Memory ordering becomes part of the ABI; the ring crate documents and tests it.
-- Two protocols coexist while the kernel's `RemoteFs` still serves the kernel's own `/data`
-  view (until R6c.3 ends).
+- Two protocols coexisted while the kernel's `RemoteFs` still served the kernel's own `/data`
+  view (until R6c.3 ended; diskfs speaks only the ring protocol since).
