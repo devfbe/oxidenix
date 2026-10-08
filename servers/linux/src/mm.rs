@@ -6,6 +6,7 @@
 use restricted::*;
 
 const PAGE: u64 = 4096;
+const PROT_WRITE: u64 = 2;
 /// The end of the program's memory (ADR 0003).
 const USER_END: u64 = SHARED_BASE;
 
@@ -92,9 +93,19 @@ fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64) -> i64
         mo_flags |= MO_POPULATE;
     }
     // The object to map: none (anonymous private memory), a new one
-    // (anonymous shared memory), or the descriptor's file.
+    // (anonymous shared memory), or the descriptor's file: one of the
+    // server's (its file object), or one of the kernel's.
     let handle = if flags & MAP_ANONYMOUS == 0 {
-        crate::syscall(SYS_KFILE_OBJECT, [fd, 0, 0, 0, 0, 0])
+        match crate::files::map_object(fd, shared, prot & PROT_WRITE != 0) {
+            Some(Ok((h, read_only))) => {
+                if read_only {
+                    mo_flags |= MO_READONLY;
+                }
+                h as i64
+            }
+            Some(Err(e)) => -e,
+            None => crate::syscall(SYS_KFILE_OBJECT, [fd, 0, 0, 0, 0, 0]),
+        }
     } else if shared {
         crate::syscall(SYS_MO_CREATE, [len / PAGE, 0, 0, 0, 0, 0])
     } else {

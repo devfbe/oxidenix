@@ -1,16 +1,23 @@
-//! The server's namespace (phase R6c.2b): path resolution.
+//! The server's namespace (phase R6c.2): mounts and path resolution.
 //!
-//! The tree is, for now, the kernel's, reached through handles on its
-//! inodes (`restricted::SYS_INODE_*`); the server resolves every path
-//! itself: "." and ".." by name, before symlinks are looked at (as the
-//! kernel's VFS did: "/a/link/.." is "/a"), and each symlink by reading it
-//! and starting over from the root with its target in front of the rest
-//! (at most 16, else ELOOP). One kernel call walks as many names as it can
-//! and stops after a symlink, so a path without symlinks costs one call.
+//! A mount puts a filesystem at a path: the server's tmpfs (`tmpfs`), or a
+//! directory of the kernel's tree, reached through handles on its inodes
+//! (`restricted::SYS_INODE_*`), until the server's own filesystems serve
+//! them. Mounts are found by name, as everything here: ".." is resolved
+//! lexically before symlinks are looked at (as the kernel's VFS did:
+//! "/a/link/.." is "/a"), so the longest mount whose path begins a
+//! normalized path is the filesystem that path lies in. Each symlink is
+//! read and resolution starts over from the root with its target in front
+//! of the rest (at most 16, else ELOOP). In the kernel's tree one call
+//! walks as many names as it can and stops after a symlink, so a path
+//! without symlinks costs one call; the tmpfs is walked in the server.
 
+use crate::sync::Mutex;
 use crate::syscall;
+use crate::tmpfs;
 use alloc::collections::VecDeque;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use restricted::*;
@@ -18,7 +25,9 @@ use vfs::path::{join, normalize};
 
 pub const ENOENT: i64 = 2;
 pub const EEXIST: i64 = 17;
+pub const EXDEV: i64 = 18;
 pub const ENOTDIR: i64 = 20;
+pub const EBUSY: i64 = 16;
 pub const ELOOP: i64 = 40;
 
 const MAX_LINKS: u32 = 16;
@@ -36,14 +45,13 @@ impl KInode {
         if r < 0 { Err(-r) } else { Ok(KInode(r as u64)) }
     }
 
-    /// Its `struct stat`.
-    pub fn stat(&self) -> Result<[u8; 144], i64> {
+    fn stat(&self) -> Result<[u8; 144], i64> {
         let mut st = [0u8; 144];
         check(syscall(SYS_INODE_STAT, [self.0, st.as_mut_ptr() as u64, 0, 0, 0, 0]))?;
         Ok(st)
     }
 
-    pub fn readlink(&self) -> Result<String, i64> {
+    fn readlink(&self) -> Result<String, i64> {
         let mut buf = alloc::vec![0u8; 4096];
         let n = check(syscall(SYS_INODE_READLINK, [self.0, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0, 0]))?;
         buf.truncate(n as usize);
@@ -65,9 +73,79 @@ pub fn mode_of(st: &[u8; 144]) -> u32 {
     u32::from_le_bytes([st[24], st[25], st[26], st[27]])
 }
 
+/// An inode of either filesystem.
+pub enum Node {
+    Kernel(KInode),
+    Tmp(Arc<tmpfs::Inode>),
+}
+
+impl Node {
+    pub fn stat(&self) -> Result<[u8; 144], i64> {
+        match self {
+            Node::Kernel(k) => k.stat(),
+            Node::Tmp(t) => Ok(t.stat()),
+        }
+    }
+
+    pub fn readlink(&self) -> Result<String, i64> {
+        match self {
+            Node::Kernel(k) => k.readlink(),
+            Node::Tmp(t) => t.readlink(),
+        }
+    }
+}
+
+/// What a mount puts at its path.
+enum Fs {
+    /// The kernel's tree at this path (names below its root).
+    Kernel(Vec<String>),
+    Tmpfs(Arc<tmpfs::Inode>),
+}
+
+struct Mount {
+    at: Vec<String>,
+    fs: Fs,
+}
+
+/// The mount table: the kernel's tree at the root, the server's tmpfs at
+/// /tmp (the instance's own, empty at its start).
+static MOUNTS: Mutex<Vec<Mount>> = Mutex::new(Vec::new());
+
+fn with_mounts<R>(f: impl FnOnce(&Vec<Mount>) -> R) -> R {
+    let mut m = MOUNTS.lock();
+    if m.is_empty() {
+        m.push(Mount { at: Vec::new(), fs: Fs::Kernel(Vec::new()) });
+        m.push(Mount { at: alloc::vec![String::from("tmp")], fs: Fs::Tmpfs(tmpfs::new_root()) });
+    }
+    f(&m)
+}
+
+/// The mount `comps` lies in: its filesystem and how many of `comps` name
+/// the mount point.
+fn mount_of(comps: &[String]) -> (Fs, usize) {
+    with_mounts(|mounts| {
+        let m = mounts
+            .iter()
+            .filter(|m| comps.len() >= m.at.len() && comps[..m.at.len()] == m.at[..])
+            .max_by_key(|m| m.at.len())
+            .expect("the root is mounted");
+        let fs = match &m.fs {
+            Fs::Kernel(base) => Fs::Kernel(base.clone()),
+            Fs::Tmpfs(root) => Fs::Tmpfs(root.clone()),
+        };
+        (fs, m.at.len())
+    })
+}
+
+/// Whether `comps` is a mount point (other than the root): it cannot be
+/// removed, renamed or replaced.
+pub fn is_mount_point(comps: &[String]) -> bool {
+    !comps.is_empty() && with_mounts(|mounts| mounts.iter().any(|m| m.at[..] == comps[..]))
+}
+
 /// The handle on the kernel's root, taken once for the instance and never
 /// closed.
-fn root() -> u64 {
+pub fn kernel_root() -> u64 {
     static ROOT: AtomicU64 = AtomicU64::new(0);
     let h = ROOT.load(Ordering::Acquire);
     if h != 0 {
@@ -91,9 +169,58 @@ fn root() -> u64 {
 /// (normalized, symlinks not replaced: what the descriptor and the working
 /// directory remember).
 pub struct Resolved {
-    pub inode: KInode,
+    pub node: Node,
     pub mode: u32,
     pub path: Vec<String>,
+}
+
+/// One step of a walk in one filesystem: where it ended, or the symlink it
+/// stopped at after `n` of the names.
+enum Step {
+    Done(Node, u32),
+    Link(Node, usize),
+}
+
+/// Walks `names` in the kernel's tree below `base`.
+fn walk_kernel(base: &[String], names: &[String]) -> Result<Step, i64> {
+    let mut rel = String::new();
+    for c in base.iter().chain(names) {
+        if !rel.is_empty() {
+            rel.push('/');
+        }
+        rel.push_str(c);
+    }
+    let mut walk = Walk::default();
+    let inode = KInode::from_result(syscall(
+        SYS_INODE_WALK,
+        [kernel_root(), rel.as_ptr() as u64, rel.len() as u64, &mut walk as *mut Walk as u64, 0, 0],
+    ))?;
+    let walked = if rel.is_empty() { 0 } else { rel[..walk.consumed as usize].split('/').count() };
+    let in_names = walked.saturating_sub(base.len());
+    if walk.mode & vfs::S_IFMT == vfs::S_IFLNK && in_names > 0 {
+        return Ok(Step::Link(Node::Kernel(inode), in_names));
+    }
+    if in_names != names.len() {
+        // A walk stops early only at a symlink (one in the mount's own
+        // path is the kernel's business: refuse it).
+        return Err(ENOENT);
+    }
+    Ok(Step::Done(Node::Kernel(inode), walk.mode))
+}
+
+/// Walks `names` in the tmpfs from `root`; `follow`: also at the last name.
+fn walk_tmpfs(root: &Arc<tmpfs::Inode>, names: &[String], follow: bool) -> Result<Step, i64> {
+    let mut cur = root.clone();
+    for (i, name) in names.iter().enumerate() {
+        let child = cur.lookup(name)?;
+        let mode = child.mode();
+        if mode & vfs::S_IFMT == vfs::S_IFLNK && (follow || i + 1 < names.len()) {
+            return Ok(Step::Link(Node::Tmp(child), i + 1));
+        }
+        cur = child;
+    }
+    let mode = cur.mode();
+    Ok(Step::Done(Node::Tmp(cur), mode))
 }
 
 /// Resolves `path` relative to the absolute directory `base`; `follow`:
@@ -106,42 +233,44 @@ pub fn resolve(base: &str, path: &str, follow: bool) -> Result<Resolved, i64> {
     let mut comps: VecDeque<String> = given.clone().into();
     let mut links = 0;
     loop {
-        let rel = comps.iter().map(String::as_str).collect::<Vec<_>>().join("/");
-        let mut walk = Walk::default();
-        let inode = KInode::from_result(syscall(
-            SYS_INODE_WALK,
-            [root(), rel.as_ptr() as u64, rel.len() as u64, &mut walk as *mut Walk as u64, 0, 0],
-        ))?;
-        let is_link = walk.mode & vfs::S_IFMT == vfs::S_IFLNK;
-        // Names walked, up to and with the symlink it stopped at.
-        let walked = if rel.is_empty() { 0 } else { rel[..walk.consumed as usize].split('/').count() };
-        let last = walked == comps.len();
-        if !is_link || (last && !follow) {
-            if !last {
-                // A walk stops early only at a symlink.
-                return Err(ENOENT);
-            }
-            return Ok(Resolved { inode, mode: walk.mode, path: given });
+        let all: Vec<String> = comps.iter().cloned().collect();
+        let (fs, at) = mount_of(&all);
+        let names = &all[at..];
+        let step = match &fs {
+            Fs::Kernel(base) => walk_kernel(base, names)?,
+            Fs::Tmpfs(root) => walk_tmpfs(root, names, follow)?,
+        };
+        let (link, walked) = match step {
+            Step::Done(node, mode) => return Ok(Resolved { node, mode, path: given }),
+            Step::Link(node, n) => (node, at + n),
+        };
+        // The kernel's walk stops at any symlink: the last one is followed
+        // only when asked for.
+        if walked == all.len() && !follow {
+            let mode = mode_of(&link.stat()?);
+            return Ok(Resolved { node: link, mode, path: given });
         }
         links += 1;
         if links > MAX_LINKS {
             return Err(ELOOP);
         }
-        let target = inode.readlink()?;
-        let before: Vec<String> = comps.iter().take(walked - 1).cloned().collect();
-        let mut next: VecDeque<String> = normalize(&join(&before), &target).into();
-        next.extend(comps.drain(walked..));
+        let target = link.readlink()?;
+        let mut next: VecDeque<String> = normalize(&join(&all[..walked - 1]), &target).into();
+        next.extend(all[walked..].iter().cloned());
         comps = next;
     }
 }
 
 /// The directory a new name goes into and the name (EEXIST for the root,
-/// which has none).
+/// which has none; EBUSY for a mount point).
 pub fn resolve_parent(base: &str, path: &str) -> Result<(Resolved, String), i64> {
     if path.is_empty() {
         return Err(ENOENT);
     }
     let mut comps = normalize(base, path);
+    if is_mount_point(&comps) {
+        return Err(EBUSY);
+    }
     let name = comps.pop().ok_or(EEXIST)?;
     let parent = resolve("/", &join(&comps), true)?;
     if parent.mode & vfs::S_IFMT != vfs::S_IFDIR {

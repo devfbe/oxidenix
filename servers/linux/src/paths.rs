@@ -1,15 +1,20 @@
 //! The system calls that take a path (phase R6c.2b), and the working
 //! directory and umask, which live in the caller's record (`records`).
 //!
-//! The semantics are the kernel's VFS's, which they replace: no permission
-//! checks (one user), timestamps not stored, and a descriptor's or the
-//! working directory's path is the one it was opened by (normalized,
-//! symlinks not replaced). New: umask(2) is real.
+//! Each call resolves its path in the server's namespace (`namespace`) and
+//! acts on the inode it reaches: one of the server's tmpfs, or one of the
+//! kernel's tree through its handle. The semantics are the kernel's VFS's,
+//! which they replace: no permission checks (one user), timestamps not
+//! stored, and a descriptor's or the working directory's path is the one
+//! it was opened by (normalized, symlinks not replaced). New: umask(2) is
+//! real.
 
 use crate::files;
-use crate::namespace::{check, mode_of, resolve, resolve_parent, KInode, Resolved, ENOENT, ENOTDIR};
+use crate::namespace::{check, mode_of, resolve, resolve_parent, KInode, Node, Resolved, EBUSY, ENOENT, ENOTDIR, EXDEV};
 use crate::records;
 use crate::syscall;
+use crate::tmpfile;
+use crate::tmpfs;
 use crate::usercopy::{self, read_cstr};
 use alloc::string::String;
 use restricted::*;
@@ -66,7 +71,7 @@ const CWD: u64 = AT_FDCWD as i64 as u64;
 /// The result of a path call in `s`, or None to pass it through (execve
 /// once its program is resolved, and the calls on a descriptor alone).
 pub fn handle(s: &State) -> Option<i64> {
-    let (a0, a1, a2, a3, a4) = (s.rdi, s.rsi, s.rdx, s.r10, s.r8);
+    let (a0, a1, a2, a3) = (s.rdi, s.rsi, s.rdx, s.r10);
     let result = match s.rax {
         SYS_OPEN => openat(CWD, a0, a1 as u32, a2 as u32),
         SYS_OPENAT => openat(a0, a1, a2 as u32, a3 as u32),
@@ -74,25 +79,22 @@ pub fn handle(s: &State) -> Option<i64> {
         SYS_LSTAT => fstatat(CWD, a0, a1, AT_SYMLINK_NOFOLLOW),
         SYS_NEWFSTATAT => {
             if a3 & AT_EMPTY_PATH != 0 && path_is_empty(a1) {
-                // fstat of the descriptor: not a path call.
-                return None;
+                // fstat of the descriptor itself.
+                return match files::tmp_of(a0) {
+                    Some(f) => Some(usercopy::to_program(a2, &f.inode.stat()).map(|_| 0).unwrap_or_else(|e| -e)),
+                    None => None,
+                };
             }
             fstatat(a0, a1, a2, a3)
         }
         SYS_ACCESS => at(CWD, a0, true).map(|_| 0),
         SYS_FACCESSAT | SYS_FACCESSAT2 => at(a0, a1, true).map(|_| 0),
-        SYS_EXECVE => match at(CWD, a0, true) {
-            Ok(r) => {
-                let path = join(&r.path);
-                let set = syscall(SYS_EXEC_TARGET, [r.inode.handle(), path.as_ptr() as u64, path.len() as u64, 0, 0, 0]);
-                if set < 0 {
-                    return Some(set);
-                }
-                return None;
-            }
+        SYS_EXECVE => match exec_target(a0) {
+            // Passes through with its program resolved.
+            Ok(()) => return None,
             Err(e) => Err(e),
         },
-        SYS_TRUNCATE => at(CWD, a0, true).and_then(|r| check(syscall(SYS_INODE_TRUNCATE, [r.inode.handle(), a1, 0, 0, 0, 0]))),
+        SYS_TRUNCATE => at(CWD, a0, true).and_then(|r| truncate(&r.node, a1)),
         SYS_GETCWD => getcwd(a0, a1),
         SYS_CHDIR => chdir(a0),
         SYS_FCHDIR => fchdir(a0),
@@ -115,10 +117,8 @@ pub fn handle(s: &State) -> Option<i64> {
         SYS_UTIMES => at(CWD, a0, true).map(|_| 0),
         SYS_FUTIMESAT if a1 != 0 => at(a0, a1, true).map(|_| 0),
         SYS_UTIMENSAT if a1 != 0 => at(a0, a1, a3 & AT_SYMLINK_NOFOLLOW == 0).map(|_| 0),
-        _ => {
-            let _ = a4;
-            return None;
-        }
+        SYS_UTIMENSAT | SYS_FUTIMESAT if files::tmp_of(a0).is_some() => Ok(0),
+        _ => return None,
     };
     Some(result.unwrap_or_else(|e| -e))
 }
@@ -132,12 +132,15 @@ fn base_dir(dirfd: u64, path: &str) -> Result<String, i64> {
     if path.starts_with('/') || dirfd as i32 == AT_FDCWD {
         return Ok(records::current().state.lock().cwd.clone());
     }
-    Ok(fd_inode(dirfd)?.1)
+    Ok(fd_node(dirfd)?.1)
 }
 
-/// The inode behind a descriptor of the kernel's, and its path (ENOTDIR
-/// for the server's own files, which have no path).
-fn fd_inode(fd: u64) -> Result<(KInode, String), i64> {
+/// The inode behind a descriptor and the path it was opened by (ENOTDIR
+/// for one without: pipes, sockets, the terminal).
+fn fd_node(fd: u64) -> Result<(Node, String), i64> {
+    if let Some(f) = files::tmp_of(fd) {
+        return Ok((Node::Tmp(f.inode.clone()), f.path.clone()));
+    }
     if files::is_server_file(fd) {
         return Err(ENOTDIR);
     }
@@ -148,7 +151,7 @@ fn fd_inode(fd: u64) -> Result<(KInode, String), i64> {
         [fd, buf.as_mut_ptr() as u64, buf.len() as u64, &mut len as *mut u64 as u64, 0, 0],
     ))?;
     buf.truncate(len as usize);
-    Ok((inode, String::from_utf8(buf).map_err(|_| ENOENT)?))
+    Ok((Node::Kernel(inode), String::from_utf8(buf).map_err(|_| ENOENT)?))
 }
 
 /// Resolves the program's path at `addr` relative to `dirfd`.
@@ -173,6 +176,41 @@ fn umask(new: u32) -> u32 {
     core::mem::replace(&mut st.umask, new & 0o777)
 }
 
+const NEW_FILE: u64 = INODE_FILE;
+const NEW_DIR: u64 = INODE_DIR;
+
+/// A new file or directory `name` in the directory `dir`.
+fn create(dir: &Node, name: &str, kind: u64, perm: u32) -> Result<Node, i64> {
+    match dir {
+        Node::Kernel(d) => KInode::from_result(syscall(
+            SYS_INODE_CREATE,
+            [d.handle(), name.as_ptr() as u64, name.len() as u64, kind, perm as u64, 0],
+        ))
+        .map(Node::Kernel),
+        Node::Tmp(d) => d.create(name, kind == NEW_DIR, perm).map(Node::Tmp),
+    }
+}
+
+/// The program `execve` runs: resolved here, handed to the kernel's loader
+/// (with the right to run it, for a tmpfs file).
+fn exec_target(addr: u64) -> Result<(), i64> {
+    let r = at(CWD, addr, true)?;
+    let path = join(&r.path);
+    match &r.node {
+        Node::Kernel(k) => {
+            check(syscall(SYS_EXEC_TARGET, [k.handle(), path.as_ptr() as u64, path.len() as u64, 0, 0, 0]))?;
+        }
+        Node::Tmp(t) => {
+            let held = tmpfile::exec_hold(t)?;
+            let set = syscall(SYS_EXEC_TARGET, [held, path.as_ptr() as u64, path.len() as u64, 0, 0, 0]);
+            // The target keeps the hold now (or it goes, if refused).
+            syscall(SYS_HANDLE_CLOSE, [held, 0, 0, 0, 0, 0]);
+            check(set)?;
+        }
+    }
+    Ok(())
+}
+
 fn openat(dirfd: u64, addr: u64, flags: u32, mode: u32) -> Result<i64, i64> {
     let path = read_cstr(addr)?;
     let base = base_dir(dirfd, &path)?;
@@ -186,12 +224,11 @@ fn openat(dirfd: u64, addr: u64, flags: u32, mode: u32) -> Result<i64, i64> {
             Ok(_) if flags & O_CREAT != 0 && flags & O_EXCL != 0 => return Err(EEXIST),
             Ok(r) => break r,
             Err(ENOENT) if flags & O_CREAT != 0 => {
-                let (dir, name) = resolve_parent(&base, &path)?;
+                let (dir, name) = resolve_parent(&base, &path).map_err(|e| if e == EBUSY { EEXIST } else { e })?;
                 let perm = mode & !umask_now() & 0o7777;
-                let created = syscall(SYS_INODE_CREATE, [dir.inode.handle(), name.as_ptr() as u64, name.len() as u64, INODE_FILE, perm as u64, 0]);
-                match KInode::from_result(created) {
-                    Ok(inode) => {
-                        break Resolved { inode, mode: vfs::S_IFREG | perm, path: vfs::path::normalize(&base, &path) };
+                match create(&dir.node, &name, NEW_FILE, perm) {
+                    Ok(node) => {
+                        break Resolved { node, mode: vfs::S_IFREG | perm, path: vfs::path::normalize(&base, &path) };
                     }
                     Err(EEXIST) if flags & O_EXCL == 0 && !retried => {
                         retried = true;
@@ -208,12 +245,15 @@ fn openat(dirfd: u64, addr: u64, flags: u32, mode: u32) -> Result<i64, i64> {
         return Err(ELOOP);
     }
     let abs = join(&resolved.path);
-    check(syscall(SYS_INODE_OPEN, [resolved.inode.handle(), flags as u64, abs.as_ptr() as u64, abs.len() as u64, 0, 0]))
+    match resolved.node {
+        Node::Kernel(k) => check(syscall(SYS_INODE_OPEN, [k.handle(), flags as u64, abs.as_ptr() as u64, abs.len() as u64, 0, 0])),
+        Node::Tmp(t) => tmpfile::open(t, flags, abs),
+    }
 }
 
 fn fstatat(dirfd: u64, addr: u64, buf: u64, flags: u64) -> Result<i64, i64> {
     let r = at(dirfd, addr, flags & AT_SYMLINK_NOFOLLOW == 0)?;
-    usercopy::to_program(buf, &r.inode.stat()?)?;
+    usercopy::to_program(buf, &r.node.stat()?)?;
     Ok(0)
 }
 
@@ -238,8 +278,8 @@ fn chdir(addr: u64) -> Result<i64, i64> {
 }
 
 fn fchdir(fd: u64) -> Result<i64, i64> {
-    let (inode, path) = fd_inode(fd)?;
-    if mode_of(&inode.stat()?) & vfs::S_IFMT != vfs::S_IFDIR {
+    let (node, path) = fd_node(fd)?;
+    if mode_of(&node.stat()?) & vfs::S_IFMT != vfs::S_IFDIR {
         return Err(ENOTDIR);
     }
     records::current().state.lock().cwd = path;
@@ -249,37 +289,49 @@ fn fchdir(fd: u64) -> Result<i64, i64> {
 fn renameat(odirfd: u64, oaddr: u64, ndirfd: u64, naddr: u64) -> Result<i64, i64> {
     let (odir, oname) = parent_at(odirfd, oaddr)?;
     let (ndir, nname) = parent_at(ndirfd, naddr)?;
-    check(syscall(
-        SYS_INODE_RENAME,
-        [odir.inode.handle(), oname.as_ptr() as u64, oname.len() as u64, ndir.inode.handle(), nname.as_ptr() as u64, nname.len() as u64],
-    ))
+    match (&odir.node, &ndir.node) {
+        (Node::Kernel(o), Node::Kernel(n)) => check(syscall(
+            SYS_INODE_RENAME,
+            [o.handle(), oname.as_ptr() as u64, oname.len() as u64, n.handle(), nname.as_ptr() as u64, nname.len() as u64],
+        )),
+        (Node::Tmp(o), Node::Tmp(n)) => tmpfs::rename(o, &oname, n, &nname).map(|_| 0),
+        _ => Err(EXDEV),
+    }
 }
 
 fn mkdirat(dirfd: u64, addr: u64, mode: u32) -> Result<i64, i64> {
-    let (dir, name) = parent_at(dirfd, addr)?;
+    // A mount point exists.
+    let (dir, name) = parent_at(dirfd, addr).map_err(|e| if e == EBUSY { EEXIST } else { e })?;
     let perm = mode & !umask_now() & 0o7777;
-    let created = syscall(SYS_INODE_CREATE, [dir.inode.handle(), name.as_ptr() as u64, name.len() as u64, INODE_DIR, perm as u64, 0]);
-    KInode::from_result(created).map(|_| 0)
+    create(&dir.node, &name, NEW_DIR, perm).map(|_| 0)
 }
 
 fn unlinkat(dirfd: u64, addr: u64, flags: u64) -> Result<i64, i64> {
     let (dir, name) = parent_at(dirfd, addr)?;
-    let dir_only = (flags & AT_REMOVEDIR != 0) as u64;
-    check(syscall(SYS_INODE_UNLINK, [dir.inode.handle(), name.as_ptr() as u64, name.len() as u64, dir_only, 0, 0]))
+    let dir_only = flags & AT_REMOVEDIR != 0;
+    match &dir.node {
+        Node::Kernel(d) => {
+            check(syscall(SYS_INODE_UNLINK, [d.handle(), name.as_ptr() as u64, name.len() as u64, dir_only as u64, 0, 0]))
+        }
+        Node::Tmp(d) => d.unlink(&name, dir_only).map(|_| 0),
+    }
 }
 
 fn symlinkat(target: u64, dirfd: u64, addr: u64) -> Result<i64, i64> {
     let target = read_cstr(target)?;
-    let (dir, name) = parent_at(dirfd, addr)?;
-    check(syscall(
-        SYS_INODE_SYMLINK,
-        [dir.inode.handle(), name.as_ptr() as u64, name.len() as u64, target.as_ptr() as u64, target.len() as u64, 0],
-    ))
+    let (dir, name) = parent_at(dirfd, addr).map_err(|e| if e == EBUSY { EEXIST } else { e })?;
+    match &dir.node {
+        Node::Kernel(d) => check(syscall(
+            SYS_INODE_SYMLINK,
+            [d.handle(), name.as_ptr() as u64, name.len() as u64, target.as_ptr() as u64, target.len() as u64, 0],
+        )),
+        Node::Tmp(d) => d.symlink(&name, target).map(|_| 0),
+    }
 }
 
 fn readlinkat(dirfd: u64, addr: u64, buf: u64, size: u64) -> Result<i64, i64> {
     let r = at(dirfd, addr, false)?;
-    let target = r.inode.readlink()?;
+    let target = r.node.readlink()?;
     let n = target.len().min(size as usize);
     usercopy::to_program(buf, &target.as_bytes()[..n])?;
     Ok(n as i64)
@@ -287,13 +339,39 @@ fn readlinkat(dirfd: u64, addr: u64, buf: u64, size: u64) -> Result<i64, i64> {
 
 fn chmodat(dirfd: u64, addr: u64, mode: u64) -> Result<i64, i64> {
     let r = at(dirfd, addr, true)?;
-    check(syscall(SYS_INODE_CHMOD, [r.inode.handle(), mode, 0, 0, 0, 0]))
+    match &r.node {
+        Node::Kernel(k) => check(syscall(SYS_INODE_CHMOD, [k.handle(), mode, 0, 0, 0, 0])),
+        Node::Tmp(t) => {
+            t.set_perm(mode as u32);
+            Ok(0)
+        }
+    }
+}
+
+/// truncate(2): with the right to write, as through a writable descriptor.
+fn truncate(node: &Node, len: u64) -> Result<i64, i64> {
+    match node {
+        Node::Kernel(k) => check(syscall(SYS_INODE_TRUNCATE, [k.handle(), len, 0, 0, 0, 0])),
+        Node::Tmp(t) => {
+            let object = t.object()?;
+            t.get_write()?;
+            let r = check(syscall(SYS_MO_TRUNCATE, [object, len, 0, 0, 0, 0]));
+            t.put_write();
+            r
+        }
+    }
 }
 
 fn statfs(addr: u64, buf: u64) -> Result<i64, i64> {
     let r = at(CWD, addr, true)?;
-    let mut words = [0u8; 120];
-    check(syscall(SYS_INODE_STATFS, [r.inode.handle(), words.as_mut_ptr() as u64, 0, 0, 0, 0]))?;
-    usercopy::to_program(buf, &words)?;
-    Ok(0)
+    match &r.node {
+        Node::Kernel(k) => {
+            let mut words = [0u8; 120];
+            check(syscall(SYS_INODE_STATFS, [k.handle(), words.as_mut_ptr() as u64, 0, 0, 0, 0]))?;
+            usercopy::to_program(buf, &words)?;
+            Ok(0)
+        }
+        Node::Tmp(_) => tmpfile::statfs(buf),
+    }
 }
+

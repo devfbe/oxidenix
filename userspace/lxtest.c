@@ -10,6 +10,7 @@
 #include <sys/eventfd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <dirent.h>
 #include <sys/time.h>
 #include <time.h>
 #include <pthread.h>
@@ -330,6 +331,47 @@ int main(void) {
     unlink("lx/g"); unlink("lx/l"); unlink("lx/d"); unlink("lx/loop1"); unlink("lx/loop2");
     check("unlink and rmdir", rmdir("lx") == 0 && stat("lx", &sb) == -1 && errno == ENOENT);
     chdir("/");
+
+    /* /tmp is the server's own tmpfs (R6c.2c): its files are file objects
+     * the server reads, writes and maps without the kernel's VFS. */
+    int tf = open("/tmp/lxfile", O_CREAT | O_RDWR | O_TRUNC, 0644);
+    check("a /tmp file is the server's (its own device)", tf >= 0 && fstat(tf, &sb) == 0 && sb.st_dev == 0x1a && S_ISREG(sb.st_mode));
+    char block[4096];
+    memset(block, 'z', sizeof block);
+    l0 = legacy_calls();
+    int io = 1;
+    for (int i = 0; i < 25; i++) {
+        io &= pwrite(tf, block, sizeof block, (off_t)i * 4096) == 4096;
+        io &= pread(tf, cwd, 8, (off_t)i * 4096 + 100) == 8 && cwd[0] == 'z';
+        io &= lseek(tf, 0, SEEK_END) == 25 * 4096 || i < 24;
+        io &= fstat(tf, &sb) == 0;
+    }
+    passed = legacy_calls() - l0 - base;
+    printf("    (%ld of 100 /tmp file calls passed through)\n", passed);
+    check("reads, writes, lseek and fstat of a /tmp file are the server's", passed == 0 && io && sb.st_size == 25 * 4096);
+    check("O_APPEND writes at the end", (fd = open("/tmp/lxfile", O_WRONLY | O_APPEND)) >= 0 && write(fd, "end", 3) == 3 && lseek(tf, 0, SEEK_END) == 25 * 4096 + 3);
+    close(fd);
+    char *map = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, tf, 0);
+    if (map != MAP_FAILED) map[0] = 'M';
+    check("a shared mapping of a /tmp file writes the file", map != MAP_FAILED && pread(tf, cwd, 1, 0) == 1 && cwd[0] == 'M');
+    if (map != MAP_FAILED) munmap(map, 4096);
+    check("ftruncate", ftruncate(tf, 10) == 0 && fstat(tf, &sb) == 0 && sb.st_size == 10);
+    close(tf);
+    mkdir("/tmp/lxdir", 0755);
+    close(open("/tmp/lxdir/one", O_CREAT | O_WRONLY, 0644));
+    close(open("/tmp/lxdir/two", O_CREAT | O_WRONLY, 0644));
+    DIR *d = opendir("/tmp/lxdir");
+    int names = 0;
+    struct dirent *e;
+    while (d && (e = readdir(d))) names += strcmp(e->d_name, "one") == 0 || strcmp(e->d_name, "two") == 0;
+    if (d) closedir(d);
+    check("readdir of a /tmp directory", names == 2);
+    errno = 0;
+    check("rename between /tmp and the rest is EXDEV", rename("/tmp/lxfile", "/lxfile") == -1 && errno == EXDEV);
+    errno = 0;
+    check("removing the mount point /tmp is EBUSY", rmdir("/tmp") == -1 && errno == EBUSY);
+    unlink("/tmp/lxdir/one"); unlink("/tmp/lxdir/two"); rmdir("/tmp/lxdir"); unlink("/tmp/lxfile");
+    check("unlinked /tmp files are gone", stat("/tmp/lxdir", &sb) == -1 && stat("/tmp/lxfile", &sb) == -1);
     printf("lxtest: %s\n", failures ? "FAILED" : "all passed");
     return failures != 0;
 }

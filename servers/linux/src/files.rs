@@ -9,6 +9,7 @@
 //! for one of the kernel's it returns None and the call passes through.
 
 use crate::eventfd::EventFd;
+use crate::tmpfile::{self, TmpOpen};
 use crate::pipe::{self, Dst, PipeEnd, Src};
 use crate::sync::Mutex;
 use crate::syscall;
@@ -22,11 +23,13 @@ pub const EINVAL: i64 = 22;
 pub const ESPIPE: i64 = 29;
 pub const ENOTTY: i64 = 25;
 pub const EFAULT: i64 = 14;
+pub const ENOTDIR: i64 = 20;
 
 pub const O_ACCMODE: u32 = 0o3;
 pub const O_WRONLY: u32 = 0o1;
 pub const O_RDWR: u32 = 0o2;
 pub const O_NONBLOCK: u32 = 0o4000;
+pub const O_APPEND: u32 = 0o2000;
 pub const O_CLOEXEC: u32 = 0o2000000;
 const O_DIRECT: u32 = 0o40000;
 
@@ -35,6 +38,8 @@ const O_DIRECT: u32 = 0o40000;
 pub enum File {
     Pipe(Arc<PipeEnd>),
     EventFd(Arc<EventFd>),
+    /// An open file of the server's tmpfs.
+    Tmp(Arc<TmpOpen>),
 }
 
 static FILES: Mutex<BTreeMap<u64, File>> = Mutex::new(BTreeMap::new());
@@ -67,7 +72,8 @@ pub fn closed(id: u64) {
     if let Some(File::Pipe(end)) = gone {
         end.close();
     }
-    // An eventfd simply goes.
+    // An eventfd or a tmpfs file simply goes (the latter returning its
+    // write access).
 }
 
 /// Whether descriptor `fd` names one of the server's files.
@@ -75,9 +81,28 @@ pub fn is_server_file(fd: u64) -> bool {
     lookup(fd).is_some()
 }
 
+/// The open tmpfs file behind descriptor `fd`, if it is one.
+pub fn tmp_of(fd: u64) -> Option<Arc<TmpOpen>> {
+    match lookup(fd)? {
+        (File::Tmp(f), _) => Some(f),
+        _ => None,
+    }
+}
+
+/// For mmap of descriptor `fd`: None for a file of the kernel's (mapped
+/// through `kfile_object`); else the object to map (a handle to close once
+/// mapped) and whether the mapping stays read-only, or why not.
+pub fn map_object(fd: u64, shared: bool, prot_write: bool) -> Option<Result<(u64, bool), i64>> {
+    const ENODEV: i64 = 19;
+    Some(match lookup(fd)? {
+        (File::Tmp(f), flags) => f.map_object(flags, shared, prot_write),
+        _ => Err(ENODEV),
+    })
+}
+
 /// The server's file behind descriptor `fd` and its open flags, or None
 /// for a file of the kernel's (or a bad descriptor: the kernel answers).
-fn lookup(fd: u64) -> Option<(File, u32)> {
+pub fn lookup(fd: u64) -> Option<(File, u32)> {
     let mut flags = 0u32;
     let id = syscall(SYS_KFD_LOOKUP, [fd, &mut flags as *mut u32 as u64, 0, 0, 0, 0]);
     if id <= 0 {
@@ -86,29 +111,31 @@ fn lookup(fd: u64) -> Option<(File, u32)> {
     FILES.lock().get(&(id as u64)).cloned().map(|f| (f, flags))
 }
 
-const SYS_READ: u64 = 0;
-const SYS_WRITE: u64 = 1;
-const SYS_FSTAT: u64 = 5;
-const SYS_LSEEK: u64 = 8;
-const SYS_IOCTL: u64 = 16;
+pub const SYS_READ: u64 = 0;
+pub const SYS_WRITE: u64 = 1;
+pub const SYS_FSTAT: u64 = 5;
+pub const SYS_LSEEK: u64 = 8;
+pub const SYS_IOCTL: u64 = 16;
 const SYS_SENDFILE: u64 = 40;
-const SYS_PREAD64: u64 = 17;
-const SYS_PWRITE64: u64 = 18;
-const SYS_READV: u64 = 19;
-const SYS_WRITEV: u64 = 20;
+pub const SYS_PREAD64: u64 = 17;
+pub const SYS_PWRITE64: u64 = 18;
+pub const SYS_READV: u64 = 19;
+pub const SYS_WRITEV: u64 = 20;
 const SYS_PIPE: u64 = 22;
-const SYS_FSYNC: u64 = 74;
-const SYS_FDATASYNC: u64 = 75;
-const SYS_FTRUNCATE: u64 = 77;
+pub const SYS_FSYNC: u64 = 74;
+pub const SYS_FDATASYNC: u64 = 75;
+pub const SYS_FTRUNCATE: u64 = 77;
 const SYS_PIPE2: u64 = 293;
 const SYS_EVENTFD: u64 = 284;
 const SYS_EVENTFD2: u64 = 290;
-const SYS_PREADV: u64 = 295;
-const SYS_PWRITEV: u64 = 296;
+pub const SYS_PREADV: u64 = 295;
+pub const SYS_PWRITEV: u64 = 296;
+pub const SYS_GETDENTS64: u64 = 217;
+pub const SYS_FSTATFS: u64 = 138;
 
 /// The result of a file system call in `s` the server handles, or None.
 pub fn handle(s: &State) -> Option<i64> {
-    let (a0, a1, a2) = (s.rdi, s.rsi, s.rdx);
+    let (a0, a1, a2, a3) = (s.rdi, s.rsi, s.rdx, s.r10);
     let result = match s.rax {
         SYS_PIPE => pipe2(a0, 0),
         SYS_EVENTFD => eventfd2(a0, 0),
@@ -122,19 +149,20 @@ pub fn handle(s: &State) -> Option<i64> {
         }
         SYS_PIPE2 => pipe2(a0, a1),
         SYS_READ | SYS_WRITE | SYS_READV | SYS_WRITEV | SYS_FSTAT | SYS_LSEEK | SYS_IOCTL | SYS_PREAD64 | SYS_PWRITE64
-        | SYS_PREADV | SYS_PWRITEV | SYS_FSYNC | SYS_FDATASYNC | SYS_FTRUNCATE => {
+        | SYS_PREADV | SYS_PWRITEV | SYS_FSYNC | SYS_FDATASYNC | SYS_FTRUNCATE | SYS_GETDENTS64 | SYS_FSTATFS => {
             let (file, flags) = lookup(a0)?;
-            on_file(s.rax, file, flags, a1, a2)
+            on_file(s.rax, file, flags, a1, a2, a3)
         }
         _ => return None,
     };
     Some(result.unwrap_or_else(|e| -e))
 }
 
-fn on_file(nr: u64, file: File, flags: u32, a1: u64, a2: u64) -> Result<i64, i64> {
+fn on_file(nr: u64, file: File, flags: u32, a1: u64, a2: u64, a3: u64) -> Result<i64, i64> {
     let end = match file {
         File::Pipe(end) => end,
         File::EventFd(e) => return on_eventfd(nr, &e, flags, a1, a2),
+        File::Tmp(f) => return tmpfile::call(nr, &f, flags, a1, a2, a3),
     };
     let readable = flags & O_ACCMODE != O_WRONLY;
     let writable = flags & O_ACCMODE != 0;
@@ -156,12 +184,13 @@ fn on_file(nr: u64, file: File, flags: u32, a1: u64, a2: u64) -> Result<i64, i64
         SYS_FSTAT => end.fstat(a1),
         SYS_LSEEK | SYS_PREAD64 | SYS_PWRITE64 | SYS_PREADV | SYS_PWRITEV => Err(ESPIPE),
         SYS_IOCTL => Err(ENOTTY),
+        SYS_GETDENTS64 => Err(ENOTDIR),
         _ => Err(EINVAL),
     }
 }
 
 /// An iovec array of the program: (base, length) pairs.
-fn iovecs(iov: u64, count: u64) -> Result<alloc::vec::Vec<(u64, u64)>, i64> {
+pub fn iovecs(iov: u64, count: u64) -> Result<alloc::vec::Vec<(u64, u64)>, i64> {
     if count > 1024 {
         return Err(EINVAL);
     }
@@ -205,9 +234,14 @@ fn sendfile(out_fd: u64, out: Option<(File, u32)>, in_fd: u64, input: Option<(Fi
     if offset != 0 {
         return Err(EINVAL);
     }
-    // An eventfd moves 8-byte values, not data.
+    // An eventfd moves 8-byte values, not data; a directory none.
     if matches!(out, Some((File::EventFd(_), _))) || matches!(input, Some((File::EventFd(_), _))) {
         return Err(EINVAL);
+    }
+    if let Some((File::Tmp(f), _)) = &out {
+        if f.inode.is_dir() {
+            return Err(EINVAL);
+        }
     }
     if let Some((_, flags)) = &out {
         if flags & O_ACCMODE == 0 {
@@ -226,6 +260,7 @@ fn sendfile(out_fd: u64, out: Option<(File, u32)>, in_fd: u64, input: Option<(Fi
         let n = match &input {
             Some((File::Pipe(end), flags)) => end.read(Dst::Server(&mut buf[..want]), flags & O_NONBLOCK != 0),
             Some((File::EventFd(_), _)) => Err(EINVAL),
+            Some((File::Tmp(f), _)) => f.read_server(&mut buf[..want]).map(|n| n as i64),
             None => match syscall(SYS_KFD_READ, [in_fd, buf.as_mut_ptr() as u64, want as u64, 0, 0, 0]) {
                 r if r < 0 => Err(-r),
                 r => Ok(r),
@@ -242,6 +277,7 @@ fn sendfile(out_fd: u64, out: Option<(File, u32)>, in_fd: u64, input: Option<(Fi
         let wrote = match &out {
             Some((File::Pipe(end), flags)) => end.write(Src::Server(&buf[..n]), flags & O_NONBLOCK != 0),
             Some((File::EventFd(_), _)) => Err(EINVAL),
+            Some((File::Tmp(f), flags)) => f.write_server(&buf[..n], flags & O_APPEND != 0).map(|n| n as i64),
             None => match syscall(SYS_KFD_WRITE, [out_fd, buf.as_ptr() as u64, n as u64, 0, 0, 0]) {
                 r if r < 0 => Err(-r),
                 r => Ok(r),

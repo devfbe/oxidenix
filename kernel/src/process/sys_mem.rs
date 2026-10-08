@@ -119,7 +119,7 @@ pub(super) fn file_backing(f: &crate::fs::file::OpenFile, shared: bool, prot: Pr
         None => {
             let cache = inode.cache().map_err(|_| ENODEV)?;
             let file = crate::fs::MappedFile::new(inode, f.writable())?;
-            Ok(Backing::File { cache, offset, shared, may_write: f.writable(), _file: Some(file) })
+            Ok(Backing::File { cache, offset, shared, may_write: f.writable(), _hold: Some(file) })
         }
     }
 }

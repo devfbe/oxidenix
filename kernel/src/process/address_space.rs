@@ -28,7 +28,6 @@
 
 use super::tlb::{self, Tlb};
 use crate::fs::cache::PageCache;
-use crate::fs::MappedFile;
 use crate::memory;
 use crate::memory::frame::UserFrames;
 use crate::sync::{Mutex, MutexGuard};
@@ -109,6 +108,11 @@ impl Prot {
     }
 }
 
+/// Something kept alive while a mapping or a running program uses a file,
+/// and let go when that ends: a kernel file and its write access, the
+/// right to run it unwritten, or a record of the Linux server's.
+pub type Hold = Arc<dyn Send + Sync>;
+
 /// What backs an area's pages.
 #[derive(Clone)]
 pub enum Backing {
@@ -116,11 +120,12 @@ pub enum Backing {
     Anon,
     /// Pages of a file's page cache; `offset` is the file offset of
     /// `start`. Shared: stores reach the file; private: copy-on-write.
-    /// `_file` keeps the file (and the write access of the descriptor it
-    /// was mapped through) while it is mapped (None for anonymous shared
+    /// `_hold` is kept while it is mapped: the file and the write access of
+    /// the descriptor it was mapped through (`MappedFile`), or the Linux
+    /// server's notice for its own files (None for anonymous shared
     /// memory); `may_write`: the file was opened for writing, so a shared
     /// mapping may become writable.
-    File { cache: Arc<PageCache>, offset: u64, shared: bool, may_write: bool, _file: Option<Arc<MappedFile>> },
+    File { cache: Arc<PageCache>, offset: u64, shared: bool, may_write: bool, _hold: Option<Hold> },
     /// Device memory, mapped up front (DMA areas).
     Device,
 }
@@ -128,7 +133,7 @@ pub enum Backing {
 impl Backing {
     /// Anonymous shared memory of `pages` pages.
     pub fn shared_anon(pages: u64) -> Result<Backing, Fault> {
-        Ok(Backing::File { cache: PageCache::anonymous(pages)?, offset: 0, shared: true, may_write: true, _file: None })
+        Ok(Backing::File { cache: PageCache::anonymous(pages)?, offset: 0, shared: true, may_write: true, _hold: None })
     }
 
     /// Shared memory (or device memory): never copied on write or fork.
@@ -252,7 +257,7 @@ pub struct AddressSpace {
     /// it to reach the space's mappings of their pages.
     owner: Weak<Mm>,
     /// The program file it runs, kept from being written meanwhile.
-    pub exe: Option<crate::fs::DenyWrite>,
+    pub exe: Option<Hold>,
 }
 
 /// An address space as tasks hold it: shared by the threads of a process

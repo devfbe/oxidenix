@@ -378,7 +378,9 @@ fn load_inode(inode: Arc<fs::Inode>, args: &[String], envs: &[String]) -> Result
     // Not while it is open for writing; nobody may write it while it runs.
     let exe = inode.deny_write_access()?;
     let cache = inode.cache()?;
-    loader::load(&cache, Some(inode), Some(exe), args, envs)
+    let file: address_space::Hold = fs::MappedFile::new(inode, false)?;
+    let exe: address_space::Hold = Arc::try_new(exe).map_err(|_| ENOMEM)?;
+    loader::load(&cache, Some(file), Some(exe), args, envs)
 }
 
 /// A user-space server the kernel starts and restarts.

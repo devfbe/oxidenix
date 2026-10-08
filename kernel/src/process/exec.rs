@@ -74,7 +74,13 @@ pub fn exec(frame: &mut Frame, path: &str, args: &[String], envs: &[String]) -> 
     // A Linux program's path was resolved by its server.
     let target = with_current(|p| p.linux.as_mut().and_then(|l| l.exec_target.take()));
     let (image, exe) = match target {
-        Some((inode, abs)) => (load_inode(inode, args, envs)?, abs),
+        Some((super::linux::ExecTarget::Inode(inode), abs)) => (load_inode(inode, args, envs)?, abs),
+        // A file of the server's: the hold keeps it unwritten (the server's
+        // ETXTBSY) while the program runs.
+        Some((super::linux::ExecTarget::File(cache, hold), abs)) => {
+            let hold: Option<super::address_space::Hold> = hold.map(|h| h as _);
+            (super::loader::load(&cache, None, hold, args, envs)?, abs)
+        }
         None => {
             let cwd = with_current(|p| p.cwd());
             (load_path(&cwd, path, args, envs)?, absolute(&cwd, path))

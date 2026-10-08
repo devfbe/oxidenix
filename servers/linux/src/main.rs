@@ -22,6 +22,8 @@ mod pipe;
 mod records;
 mod sync;
 mod time;
+mod tmpfile;
+mod tmpfs;
 mod usercopy;
 
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -105,8 +107,8 @@ static TEST_FAIL_OBJECT: AtomicU64 = AtomicU64::new(0);
 static FAILED_ONCE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// The instance's service thread (the pager thread): supplies the pages
-/// threads wait for, drops the server's files whose last descriptor went
-/// and the records the kernel released. (So far the only paged objects are the tests'; page n of the
+/// threads wait for, drops the server's files whose last descriptor went,
+/// and takes back the records and holds the kernel released. (So far the only paged objects are the tests'; page n of the
 /// first reads "paged n".)
 fn pager() -> ! {
     loop {
@@ -119,7 +121,12 @@ fn pager() -> ! {
             continue;
         }
         if event.kind == EVENT_RELEASE {
-            records::released(event.a);
+            // Bit 0 tells a tmpfs file's hold from a record.
+            if event.a & 1 == 1 {
+                tmpfs::released(event.a);
+            } else {
+                records::released(event.a);
+            }
             continue;
         }
         let request = PagerRequest { key: event.a, offset: event.b };

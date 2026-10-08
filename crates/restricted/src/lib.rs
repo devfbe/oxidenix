@@ -117,6 +117,9 @@ pub const MO_FIXED: u64 = 2;
 pub const MO_NOREPLACE: u64 = 4;
 pub const MO_NORESERVE: u64 = 8;
 pub const MO_POPULATE: u64 = 16;
+/// A shared mapping that may never become writable (a file object mapped
+/// through a descriptor not open for writing: mprotect gives EACCES).
+pub const MO_READONLY: u64 = 32;
 
 // Bridges to state the kernel still owns, and address space operations
 // with the contracts of the Linux calls of the same name (phase R4).
@@ -354,8 +357,9 @@ pub const SYS_INODE_STATFS: u64 = 1052;
 /// at `path` (at most `cap` bytes) and the path's length at `len` (a u64).
 pub const SYS_KFD_INODE: u64 = 1053;
 /// `exec_target(handle, path, len)`: the program the thread's next
-/// pass-through execve runs, resolved by the server, with its absolute
-/// path; dropped when that call returns.
+/// pass-through execve runs, resolved by the server (an inode of the
+/// kernel's, or a file object: a held one keeps its hold while the program
+/// runs), with its absolute path; dropped when that call returns.
 pub const SYS_EXEC_TARGET: u64 = 1054;
 
 pub const INODE_FILE: u64 = 0;
@@ -370,3 +374,30 @@ pub struct Walk {
     pub mode: u32,
     pub _pad: u32,
 }
+
+// File objects (phase R6c.2c): the contents of the server's tmpfs files,
+// memory objects that grow and shrink like a file, charged to the tmpfs
+// limit as the kernel's tmpfs files are.
+
+/// `mo_create_file() -> handle`: a new, empty file object. `mo_read` and
+/// `mo_write` work on it as on a file (a read ends at its end, a write
+/// grows it).
+pub const SYS_MO_CREATE_FILE: u64 = 1055;
+/// `mo_hold(handle, word) -> handle`: another handle on the same file
+/// object that carries a hold: whatever keeps it (a mapping made through
+/// it, a program run from it) keeps the hold, and when the last holder is
+/// gone the server gets `EVENT_RELEASE` with `word` (once; also if no one
+/// ever took it; a refused call hands nothing over). For the server's
+/// write access and ETXTBSY. With `word` 0: another handle without a hold.
+pub const SYS_MO_HOLD: u64 = 1056;
+/// `mo_file_read(handle, offset, buf, len) -> n`: reads from the file
+/// object into the program's memory at `buf` (up to its end).
+pub const SYS_MO_FILE_READ: u64 = 1057;
+/// `mo_file_write(handle, offset, buf, len) -> n`: writes the program's
+/// memory at `buf` into the file object (growing it; ENOSPC, EFBIG).
+pub const SYS_MO_FILE_WRITE: u64 = 1058;
+/// `mo_file_size(handle) -> size`.
+pub const SYS_MO_FILE_SIZE: u64 = 1059;
+/// `mo_truncate(handle, len)`: sets the file object's size (pages beyond
+/// it go, also from mappings).
+pub const SYS_MO_TRUNCATE: u64 = 1060;

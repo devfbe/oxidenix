@@ -11,7 +11,7 @@
 //! stops after the first symlink it reaches.
 
 use super::errno::*;
-use super::linux::{Instance, Object};
+use super::linux::{ExecTarget, Instance, Object};
 use super::uaccess::{copy_from_server, copy_to_server};
 use super::with_current;
 use crate::fs::{self, Inode, NewNode};
@@ -174,11 +174,16 @@ pub fn call(instance: &Arc<Instance>, nr: u64, a: [u64; 6]) -> SysResult {
             give(instance, i)
         }
         SYS_EXEC_TARGET => {
-            let (i, path) = (inode(instance, a[0])?, string(a[1], a[2])?);
+            let target = match instance.object(a[0])? {
+                Object::Inode(i) => ExecTarget::Inode(i),
+                Object::File(cache, hold) => ExecTarget::File(cache, hold),
+                _ => return Err(EINVAL),
+            };
+            let path = string(a[1], a[2])?;
             if !path.starts_with('/') {
                 return Err(EINVAL);
             }
-            with_current(|p| p.linux.as_mut().map(|l| l.exec_target = Some((i, path)))).ok_or(EPERM)?;
+            with_current(|p| p.linux.as_mut().map(|l| l.exec_target = Some((target, path)))).ok_or(EPERM)?;
             Ok(0)
         }
         _ => Err(ENOSYS),

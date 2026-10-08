@@ -125,6 +125,9 @@ pub(super) enum Object {
     KernelFile(Arc<crate::fs::file::OpenFile>),
     /// An inode of the kernel's tree (`super::linux_inode`).
     Inode(Arc<crate::fs::Inode>),
+    /// The contents of a file of the server's (a tmpfs file object), with
+    /// the hold this handle carries (`SYS_MO_HOLD`).
+    File(Arc<PageCache>, Option<Arc<Record>>),
 }
 
 /// Most handles one instance may hold.
@@ -366,7 +369,7 @@ impl Instance {
 
     fn memory(&self, handle: u64) -> Result<Arc<PageCache>, i64> {
         match self.object(handle)? {
-            Object::Memory(m) => Ok(m),
+            Object::Memory(m) | Object::File(m, _) => Ok(m),
             _ => Err(EINVAL),
         }
     }
@@ -473,6 +476,14 @@ impl Instance {
     }
 }
 
+/// A program the server resolved for an execve.
+pub enum ExecTarget {
+    /// An inode of the kernel's tree.
+    Inode(Arc<crate::fs::Inode>),
+    /// A file object of the server's and the hold the program keeps.
+    File(Arc<PageCache>, Option<Arc<Record>>),
+}
+
 /// A record of the server's (`SYS_FS_RECORD`) held by a kernel object: the
 /// server learns when the last holder is gone (`EVENT_RELEASE`).
 pub struct Record {
@@ -529,7 +540,7 @@ pub struct LinuxThread {
     pub fs_child: Option<Record>,
     /// The program the thread's next pass-through execve runs, as the
     /// server resolved it, with its absolute path (`SYS_EXEC_TARGET`).
-    pub exec_target: Option<(Arc<crate::fs::Inode>, alloc::string::String)>,
+    pub exec_target: Option<(ExecTarget, alloc::string::String)>,
     /// The server's registers while the program runs.
     normal: Frame,
 }
@@ -689,7 +700,8 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             use super::sys_mem::{anon_backing, file_backing, place_and_map, Placement};
             let (handle, addr, offset, flags) = (a[0], a[1], a[3], a[5]);
             let prot = prot(a[4])?;
-            let all = MO_SHARED | MO_FIXED | MO_NOREPLACE | MO_NORESERVE | MO_POPULATE;
+            let all = MO_SHARED | MO_FIXED | MO_NOREPLACE | MO_NORESERVE | MO_POPULATE | MO_READONLY;
+            let may_write = flags & MO_READONLY == 0;
             if !page_aligned(addr) || !page_aligned(offset) || flags & !all != 0 {
                 return Err(EINVAL);
             }
@@ -704,10 +716,16 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
                 h => match instance.object(h)? {
                     Object::Memory(cache) => {
                         offset.checked_add(len).filter(|&e| e <= cache.size()).ok_or(EINVAL)?;
-                        Backing::File { cache, offset, shared, may_write: true, _file: None }
+                        Backing::File { cache, offset, shared, may_write, _hold: None }
                     }
                     Object::KernelFile(f) => file_backing(&f, shared, prot, len, offset)?,
                     Object::Inode(_) => return Err(EINVAL),
+                    // As a file's mapping: it may reach beyond the end (SIGBUS
+                    // there), and keeps the handle's hold while it exists.
+                    Object::File(cache, hold) => {
+                        let hold: Option<super::address_space::Hold> = hold.map(|h| h as _);
+                        Backing::File { cache, offset, shared, may_write, _hold: hold }
+                    }
                 },
             };
             let placement = Placement {
@@ -800,6 +818,54 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
         }
         SYS_SHARED_MAP => Ok(instance.grow_heap(a[0])? as i64),
         SYS_INODE_ROOT..=SYS_EXEC_TARGET => super::linux_inode::call(&instance, nr, a),
+        SYS_MO_CREATE_FILE => {
+            let cache = PageCache::memory(&[])?;
+            Ok(instance.insert(Object::File(cache, None))? as i64)
+        }
+        SYS_MO_HOLD => {
+            let cache = match instance.object(a[0])? {
+                Object::File(cache, _) => cache,
+                _ => return Err(EINVAL),
+            };
+            let record = match a[1] {
+                0 => None,
+                word => Some(Arc::try_new(Record { instance: Arc::downgrade(&instance), word }).map_err(|_| ENOMEM)?),
+            };
+            match instance.insert(Object::File(cache, record.clone())) {
+                Ok(h) => Ok(h as i64),
+                Err(e) => {
+                    // Refused: nothing was handed over, so no release.
+                    if let Some(mut r) = record.and_then(|r| Arc::try_unwrap(r).ok()) {
+                        r.instance = Weak::new();
+                    }
+                    Err(e)
+                }
+            }
+        }
+        SYS_MO_FILE_READ | SYS_MO_FILE_WRITE | SYS_MO_FILE_SIZE | SYS_MO_TRUNCATE => {
+            let cache = match instance.object(a[0])? {
+                Object::File(cache, _) => cache,
+                _ => return Err(EINVAL),
+            };
+            let (offset, buf, len) = (a[1], a[2], a[3]);
+            match nr {
+                // As the kernel's tmpfs files are read and written.
+                SYS_MO_FILE_READ => {
+                    let n = super::uaccess::read_to_user(buf, len, true, |chunk, done| cache.read(offset + done, chunk))?;
+                    Ok(n as i64)
+                }
+                SYS_MO_FILE_WRITE => {
+                    offset.checked_add(len).ok_or(EFBIG)?;
+                    let n = super::uaccess::write_from_user(buf, len, |chunk, done| cache.write(offset + done, chunk))?;
+                    Ok(n as i64)
+                }
+                SYS_MO_FILE_SIZE => Ok(cache.size() as i64),
+                _ => {
+                    cache.truncate(offset)?;
+                    Ok(0)
+                }
+            }
+        }
         SYS_FS_RECORD => {
             let (op, word) = (a[0], a[1]);
             let record = || (word != 0).then(|| Record { instance: Arc::downgrade(&instance), word });
@@ -871,9 +937,15 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
         }
         SYS_MO_READ | SYS_MO_WRITE => {
             let (handle, offset, buf, len) = (a[0], a[1], a[2], a[3]);
+            let object = instance.object(handle)?;
             let cache = instance.memory(handle)?;
-            // Within the object, a page-sized piece at a time.
-            let end = offset.checked_add(len).filter(|&e| e <= cache.size()).ok_or(EINVAL)?;
+            // Within the object (a file object: a read up to its end, a
+            // write as far as it goes), a page-sized piece at a time.
+            let end = match object {
+                Object::File(..) if nr == SYS_MO_READ => offset.checked_add(len).ok_or(EINVAL)?.min(cache.size().max(offset)),
+                Object::File(..) => offset.checked_add(len).ok_or(EFBIG)?,
+                _ => offset.checked_add(len).filter(|&e| e <= cache.size()).ok_or(EINVAL)?,
+            };
             let mut chunk = [0u8; PAGE as usize];
             let mut done = 0;
             while offset + done < end {
@@ -886,7 +958,14 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
                     }
                 } else {
                     super::uaccess::copy_from_server(buf + done, &mut chunk[..n])?;
-                    cache.write(offset + done, &chunk[..n])?;
+                    // A file object that cannot grow further (ENOSPC):
+                    // what was written counts.
+                    match cache.write(offset + done, &chunk[..n]) {
+                        Ok(w) if w < n => return Ok((done + w as u64) as i64),
+                        Ok(_) => {}
+                        Err(e) if done == 0 => return Err(e),
+                        Err(_) => return Ok(done as i64),
+                    }
                 }
                 done += n as u64;
             }
