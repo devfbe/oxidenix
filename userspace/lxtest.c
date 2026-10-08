@@ -42,6 +42,7 @@
 #define TEST_FS_RECORDS 1513
 #define TEST_CHANNEL 1514
 #define TEST_DISKRING 1515
+#define TEST_CACHED 1516
 
 static int failures;
 
@@ -481,6 +482,17 @@ int main(void) {
         if (fd >= 0) close(fd);
         check("diskfs ring: a ring write read through /data", same);
         check("diskfs ring: its file removed through /data", unlink("/data/ringtest.bin") == 0);
+    }
+    /* The kernel's interface of the server's page cache. */
+    static const char *cached_scenarios[] = {
+        "page cache: a failed fill beyond the end leaves no trace",
+        "page cache: a long write-back scan goes on where the kernel says",
+    };
+    for (int i = 0; i < 2; i++) {
+        errno = 0;
+        long r = syscall(TEST_CACHED, i + 1);
+        if (r != 0) printf("    (scenario %d: check %d failed)\n", i + 1, errno);
+        check(cached_scenarios[i], r == 0);
     }
     printf("lxtest: %s\n", failures ? "FAILED" : "all passed");
     return failures != 0;

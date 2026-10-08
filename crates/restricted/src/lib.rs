@@ -494,7 +494,9 @@ pub const GRANT_FILL: u64 = 2;
 /// or `GRANT_DIRTY`, `out` (the sixth argument) gets the run's first page,
 /// its length in pages and the file's size when it was taken (three
 /// u64s): a run of dirty pages holds data up to that size (a write makes
-/// a page dirty and the file longer at once).
+/// a page dirty and the file longer at once). One call looks at a bounded
+/// number of present pages: EAGAIN with the page to go on from at `out`
+/// if it found no run among them.
 pub const GRANT_DIRTY: u64 = 4;
 /// `revoke(handle, grant) -> 0 | REVOKE_DRAINING`: takes a grant back. Its
 /// mappings in the service are gone when the call returns. If the service
@@ -524,9 +526,9 @@ pub const REVOKE_DRAINING: u64 = 1;
 pub const SYS_MO_CREATE_CACHED: u64 = 1076;
 /// `mo_filled(handle, offset, pages, ok)`: the pending pages among `pages`
 /// (at most 256) from `offset` hold the file's data now (`ok` 1), or could
-/// not be read (0: they go, and so do the missing ones: whoever waits for
-/// them gets an error, SIGBUS for a mapping, and a later access asks
-/// again). Wakes the waiters.
+/// not be read (0: they go, and whoever waits for them or for missing pages
+/// of the range now gets an error, SIGBUS for a mapping; nothing is kept
+/// for later accesses, which ask again). Wakes the waiters.
 pub const SYS_MO_FILLED: u64 = 1077;
 /// `mo_redirty(handle, offset, pages)`: marks the present pages among
 /// `pages` from `offset` dirty again (their write-back failed).
@@ -556,3 +558,11 @@ pub const TEST_CHANNEL: u64 = 1514;
 /// checks that diskfs sleeps), 9 their completions taken. 0 if
 /// every check held, else the negative number of the first that failed.
 pub const TEST_DISKRING: u64 = 1515;
+/// `(scenario)`: the server checks the kernel's interface of its page cache
+/// (`SYS_MO_CREATE_CACHED`) on a file of /data: 1 a failed fill beyond the
+/// end of the file or over 256 pages leaves no trace (the file grown later
+/// reads as zeros), 2 a write-back grant over more pages than one call
+/// looks at goes on where the kernel says (`EAGAIN`) and finds the dirty
+/// page at the end. 0 if every check held, else the negative number of the
+/// first that failed.
+pub const TEST_CACHED: u64 = 1516;

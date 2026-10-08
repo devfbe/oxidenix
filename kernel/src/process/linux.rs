@@ -595,13 +595,15 @@ impl Instance {
         (self as *const Instance as usize) | 3
     }
 
-    /// The pager's process ended: what is waited for will not come.
+    /// The pager's process ended: what is waited for will not come (its
+    /// pending pages go, so nobody waits for them either).
     fn pager_gone(&self) {
         let mut q = self.pager.lock();
         q.dead = true;
         q.requests.clear();
         q.queued.clear();
         drop(q);
+        crate::fs::cache::pager_gone(self as *const Instance as *const ());
         super::wakeup(self.answer_chan());
     }
 
@@ -645,6 +647,10 @@ impl crate::fs::cache::Pager for Instance {
 
     fn wait_chan(&self) -> usize {
         self.answer_chan()
+    }
+
+    fn alive(&self) -> bool {
+        !self.pager.lock().dead
     }
 
     fn dirty(&self, key: u64) {
@@ -1256,7 +1262,17 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
                 // A cached object's pages: to fill (into a writable grant)
                 // or to write back (read-only).
                 mode @ (GRANT_FILL | GRANT_DIRTY) if (mode == GRANT_FILL) == writable => {
-                    let (id, first, count, size) = end.channel.grant_run(&object, a[2], a[3], mode == GRANT_FILL, writable)?;
+                    let (id, first, count, size) = match end.channel.grant_run(&object, a[2], a[3], mode == GRANT_FILL, writable) {
+                        Ok(run) => run,
+                        Err(crate::fs::cache::Scan::Errno(e)) => return Err(e),
+                        Err(crate::fs::cache::Scan::Resume(at)) => {
+                            // Not found yet: the caller asks again from `at`.
+                            let mut info = [0u8; 24];
+                            info[..8].copy_from_slice(&at.to_le_bytes());
+                            super::uaccess::copy_to_server(a[5], &info)?;
+                            return Err(EAGAIN);
+                        }
+                    };
                     let mut info = [0u8; 24];
                     info[..8].copy_from_slice(&first.to_le_bytes());
                     info[8..16].copy_from_slice(&count.to_le_bytes());

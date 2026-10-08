@@ -1185,6 +1185,15 @@ impl AddressSpace {
                                 flags.insert(COW);
                                 leaf.set_flags(flags);
                             }
+                            // A page whose stores must mark it dirty is the
+                            // child's read-only (its own first store faults
+                            // and marks it): the child is not among the
+                            // file's mappers yet, so a write-back meanwhile
+                            // could not write-protect it.
+                            if shared && area.is_some_and(|v| v.backing.tracks_dirty()) && flags.contains(PageTableFlags::WRITABLE) {
+                                flags.remove(PageTableFlags::WRITABLE);
+                                flags.insert(COW);
+                            }
                             let frame = PhysFrame::containing_address(leaf.addr());
                             let page = Page::<Size4KiB>::containing_address(VirtAddr::new(va));
                             unsafe { mapper.map_to_with_table_flags(page, frame, flags, parent, &mut frames) }
@@ -1316,27 +1325,38 @@ fn for_each_leaf(l4: PhysFrame, start: u64, end: u64, mut f: impl FnMut(u64, &'s
     }
 }
 
+/// How often a fault waits for a pager's page and tries again.
+const MAX_FAULT_TRIES: u32 = 16;
+
 /// The page fault handler's part: satisfies a fault of the running task
 /// at `va` in its address space. May sleep (the address space is locked,
 /// a file page may be read), so interrupts must be enabled.
 pub fn handle_fault(va: u64, access: Access) -> Result<(), Fault> {
     let mm = super::current_mm().ok_or(Fault::Segv)?;
+    // The page waited for, with a reference of ours until the fault was
+    // tried again: reclaim cannot take it in between, so the next try
+    // finds it (unless the mapping or the file changed meanwhile).
+    let mut held: Option<PhysFrame> = None;
+    let mut tries = 0;
     let result = loop {
         let (result, awaited) = {
             let mut space = mm.lock();
             let result = space.fault_or_retry(va, access, false);
             (result, space.awaited.take())
         };
+        if let Some(frame) = held.take() {
+            PageCache::put_frame(frame);
+        }
+        tries += 1;
         match (result, awaited) {
             // The page comes from a pager: waited for with the space
-            // unlocked, then the fault is tried again (the mapping may have
-            // changed meanwhile).
-            (Err(Fault::Retry), Some((cache, index))) => {
-                if cache.wait_page(index).is_err() {
-                    break Err(Fault::Bus);
-                }
-            }
-            (Err(Fault::Retry), None) => break Err(Fault::Bus),
+            // unlocked, then the fault is tried again. (A file that keeps
+            // changing under the fault ends it after a few tries.)
+            (Err(Fault::Retry), Some((cache, index))) if tries < MAX_FAULT_TRIES => match cache.wait_page(index) {
+                Ok(frame) => held = frame,
+                Err(_) => break Err(Fault::Bus),
+            },
+            (Err(Fault::Retry), _) => break Err(Fault::Bus),
             (result, _) => break result,
         }
     };

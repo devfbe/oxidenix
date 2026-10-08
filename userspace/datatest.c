@@ -1,7 +1,8 @@
 /* /data in the Linux server (phase R6c.3): its calls never pass through to
  * the kernel, descriptors and mappings of a file share one page cache,
  * write() leaves dirty pages that fsync makes durable (an O_DIRECT read
- * fetches the device's copy), truncation reaches mappings, many readers
+ * fetches the device's copy), children's stores survive write-back around
+ * fork, truncation reaches mappings, many readers
  * and writers at once see consistent data, and a file larger than the
  * memory the cache may use is written and read back whole. */
 #define _GNU_SOURCE
@@ -188,6 +189,59 @@ static void truncation(void) {
     unlink(path);
 }
 
+/* A child's store into a shared mapping it inherited reaches the disk,
+ * whatever write-back ran around the fork (a thread keeps writing the
+ * file back meanwhile): the child's copy of a page whose stores must mark
+ * it dirty is read-only until its first store. */
+static volatile int syncing;
+static int sync_fd;
+
+static void *syncer(void *arg) {
+    (void)arg;
+    while (syncing) fdatasync(sync_fd);
+    return NULL;
+}
+
+static void fork_and_writeback(void) {
+    const char *path = "/data/datatest.fork";
+    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    char page[PG];
+    memset(page, '.', sizeof page);
+    write(fd, page, sizeof page);
+    fsync(fd);
+    char *m = mmap(NULL, PG, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (m == MAP_FAILED) {
+        check("fork and write-back: mapping", 0);
+        return;
+    }
+    sync_fd = fd;
+    syncing = 1;
+    pthread_t t;
+    pthread_create(&t, NULL, syncer, NULL);
+    int good = 1;
+    for (int i = 0; i < 100 && good; i++) {
+        m[0] = (char)('a' + i % 26);
+        pid_t kid = fork();
+        if (kid == 0) {
+            m[100 + i] = (char)('A' + i % 26);
+            _exit(0);
+        }
+        int status;
+        waitpid(kid, &status, 0);
+        good &= WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    }
+    syncing = 0;
+    pthread_join(t, NULL);
+    good &= fsync(fd) == 0;
+    char back[PG];
+    good &= on_disk(path, 0, back, PG) == PG;
+    for (int i = 0; good && i < 100; i++) good &= back[100 + i] == (char)('A' + i % 26);
+    check("children's stores reach the disk with write-back around fork", good);
+    munmap(m, PG);
+    close(fd);
+    unlink(path);
+}
+
 /* Readers at once, each over the whole file at its own offsets. */
 #define READERS 8
 #define SHARED_SIZE (4 * MIB)
@@ -326,6 +380,7 @@ int main(void) {
     sharing();
     durability();
     truncation();
+    fork_and_writeback();
     readers();
     writers();
     larger_than_cache();

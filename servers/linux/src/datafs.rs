@@ -549,6 +549,24 @@ fn window(inode: &DInode, index: u64, want: u64) -> u64 {
     w
 }
 
+/// Grants the first run of missing (`GRANT_FILL`) or dirty (`GRANT_DIRTY`)
+/// pages in `at..end` (the run at `out`): its grant, ENOENT if there is
+/// none. The kernel looks at a bounded number of pages per call and says
+/// where to go on (EAGAIN).
+fn grant_run(c: &Client, object: u64, mut at: u64, end: u64, flags: u64, out: &mut [u64; 3]) -> Result<u64, i64> {
+    loop {
+        if at >= end {
+            return Err(ENOENT);
+        }
+        match syscall(SYS_GRANT, [c.handle(), object, at * PAGE, end - at, flags, out.as_mut_ptr() as u64]) {
+            g if g > 0 => return Ok(g as u64),
+            g if g == -EAGAIN && out[0] > at => at = out[0],
+            g if g < 0 && g != -EAGAIN => return Err(-g),
+            _ => return Err(EIO),
+        }
+    }
+}
+
 /// What a request of a fill or a write-back is about.
 enum Io {
     Fill { grant: u32, first: u64, count: u64 },
@@ -577,13 +595,15 @@ pub fn fill(inode: &Arc<DInode>, index: u64, want: u64) -> Result<bool, i64> {
                 return Next::Later;
             }
             let at = cursor.get();
-            let g = syscall(SYS_GRANT, [c.handle(), object, at * PAGE, end - at, GRANT_WRITE | GRANT_FILL, out.as_mut_ptr() as u64]);
-            if g <= 0 {
-                if g != -ENOENT && !any.get() {
-                    failed.set(Some(if g < 0 { -g } else { EIO }));
+            let g = match grant_run(&c, object, at, end, GRANT_WRITE | GRANT_FILL, &mut out) {
+                Ok(g) => g,
+                Err(e) => {
+                    if e != ENOENT && !any.get() {
+                        failed.set(Some(e));
+                    }
+                    return Next::Done;
                 }
-                return Next::Done;
-            }
+            };
             let (first, count) = (out[0], out[1]);
             if first < at || count == 0 || count > MAX_RUN {
                 // Never what the kernel answers; no loop if it did.
@@ -743,13 +763,15 @@ pub fn writeback(inode: &Arc<DInode>, pages: core::ops::Range<u64>) -> Result<u6
             if pinned.get() >= PINNED {
                 return Next::Later;
             }
-            let g = syscall(SYS_GRANT, [c.handle(), object, at * PAGE, pages.end - at, GRANT_DIRTY, out.as_mut_ptr() as u64]);
-            if g <= 0 {
-                if g != -ENOENT {
-                    failed.set(Some(if g < 0 { -g } else { EIO }));
+            let g = match grant_run(&c, object, at, pages.end, GRANT_DIRTY, &mut out) {
+                Ok(g) => g,
+                Err(e) => {
+                    if e != ENOENT {
+                        failed.set(Some(e));
+                    }
+                    return Next::Done;
                 }
-                return Next::Done;
-            }
+            };
             let (first, count, size) = (out[0], out[1], out[2]);
             if first < at || count == 0 || count > MAX_RUN {
                 failed.set(Some(EIO));
@@ -1151,4 +1173,66 @@ fn evict(ino: u32) {
 /// `EVENT_CLOSING`: the instance ends: everything written back and flushed.
 pub fn closing() {
     let _ = sync_all();
+}
+
+// ----------------------------------------------------------- self-test
+
+/// `TEST_CACHED` (see `restricted::TEST_CACHED`).
+pub fn test(scenario: u64) -> i64 {
+    macro_rules! check {
+        ($n:expr, $cond:expr) => {
+            if !$cond {
+                return -$n;
+            }
+        };
+    }
+    const EINVAL: i64 = 22;
+    let Ok(root) = root() else { return -1 };
+    let name = "lxtest.cached";
+    let _ = unlink(&root, name, false);
+    let Ok(inode) = create(&root, name, New::File, 0o644) else { return -2 };
+    let Ok(object) = object(&inode) else { return -3 };
+    let result = (|| {
+        match scenario {
+            1 => {
+                // Two pages, then failures past the end and over 256 pages.
+                let data = alloc::vec![7u8; 2 * PAGE as usize];
+                check!(10, syscall(SYS_MO_WRITE, [object, 0, data.as_ptr() as u64, data.len() as u64, 0, 0]) == data.len() as i64);
+                check!(11, syscall(SYS_MO_FILLED, [object, 0, 300, 0, 0, 0]) == -EINVAL);
+                check!(12, syscall(SYS_MO_FILLED, [object, 100 * PAGE, 256, 0, 0, 0]) == 0);
+                check!(13, syscall(SYS_MO_FILLED, [object, u64::MAX & !(PAGE - 1), 1, 0, 0, 0]) == 0);
+                // Grown: the pages that "failed" beyond the old end are holes.
+                check!(14, truncate(&inode, 200 * PAGE).is_ok());
+                let mut back = alloc::vec![1u8; 64];
+                check!(15, syscall(SYS_MO_READ, [object, 100 * PAGE, back.as_mut_ptr() as u64, 64, 0, 0]) == 64);
+                check!(16, back.iter().all(|&b| b == 0));
+                0
+            }
+            2 => {
+                // 1200 clean pages, then the last one dirty.
+                let data = alloc::vec![9u8; 64 * PAGE as usize];
+                for i in 0..19 {
+                    check!(20, syscall(SYS_MO_WRITE, [object, i * 64 * PAGE, data.as_ptr() as u64, data.len() as u64, 0, 0]) == data.len() as i64);
+                }
+                check!(21, fsync(&inode).is_ok());
+                check!(22, syscall(SYS_MO_WRITE, [object, 1199 * PAGE, data.as_ptr() as u64, 10, 0, 0]) == 10);
+                let Ok(c) = client() else { return -23 };
+                let mut out = [0u64; 3];
+                let first = syscall(SYS_GRANT, [c.handle(), object, 0, 1 << 20, GRANT_DIRTY, out.as_mut_ptr() as u64]);
+                check!(24, first == -EAGAIN && out[0] > 0 && out[0] < 1199);
+                let g = grant_run(&c, object, 0, 1 << 20, GRANT_DIRTY, &mut out);
+                check!(25, g.is_ok() && out[0] == 1199 && out[1] == 1);
+                if let Ok(g) = g {
+                    syscall(SYS_REVOKE, [c.handle(), g, 0, 0, 0, 0]);
+                    syscall(SYS_MO_REDIRTY, [object, 1199 * PAGE, 1, 0, 0, 0]);
+                }
+                check!(26, fsync(&inode).is_ok());
+                0
+            }
+            _ => -1000,
+        }
+    })();
+    drop(inode);
+    let _ = unlink(&root, name, false);
+    result
 }

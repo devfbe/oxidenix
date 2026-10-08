@@ -433,13 +433,14 @@ impl Channel {
     /// (dirty ones, `pin_dirty`) among the `pages` from byte `offset` (see
     /// `restricted::GRANT_FILL`): the grant's id, the run's first page, its
     /// length and the file's size then.
-    pub fn grant_run(&self, object: &Arc<PageCache>, offset: u64, pages: u64, fill: bool, writable: bool) -> Result<(u32, u64, u64, u64), i64> {
+    pub fn grant_run(&self, object: &Arc<PageCache>, offset: u64, pages: u64, fill: bool, writable: bool) -> Result<(u32, u64, u64, u64), crate::fs::cache::Scan> {
+        use crate::fs::cache::Scan;
         if offset % PAGE != 0 || pages == 0 {
-            return Err(EINVAL);
+            return Err(Scan::Errno(EINVAL));
         }
         let window = pages;
         let pages = pages.min(crate::fs::cache::MAX_RUN);
-        self.reserve(pages)?;
+        self.reserve(pages).map_err(Scan::Errno)?;
         let pinned = if fill { object.pin_fill(offset / PAGE, window) } else { object.pin_dirty(offset / PAGE, window) };
         let (first, frames, size) = match pinned {
             Ok(run) => run,
@@ -457,7 +458,7 @@ impl Channel {
                 // Nobody will fill or write them: pending pages go again,
                 // dirty ones are dirty again.
                 let _ = if fill { object.filled(first, count, false) } else { object.redirty(first, count) };
-                Err(e)
+                Err(Scan::Errno(e))
             }
         }
     }
