@@ -344,34 +344,55 @@ pub fn call_interruptible(to: Instance, message: Vec<u8>, cancel: impl FnOnce(u6
 }
 
 /// Sends the control request `message` (a channel offer) to this
-/// registration of a server that accepts them and waits for the reply. A
-/// signal may end the wait: a request still queued is withdrawn; one the
-/// server took is given up only if `give_up()` agrees (then EINTR, and the
-/// reply is dropped).
-pub fn call_control(to: Instance, message: Vec<u8>, give_up: impl Fn() -> bool) -> Result<Vec<u8>, i64> {
-    let service = to.service;
-    without_interrupts(|| {
-        let id = enqueue_as(service, message, true, Some(to.generation), true)?;
-        wait_reply_with(id, &mut || {
-            // In one hold of the lock, so the server cannot take or answer
-            // the request in between. (`give_up` takes only a channel's
-            // lock, which is never held around this one.)
-            lock(|ipc| match ipc.requests.get(&id).map(|r| r.state) {
-                Some(State::Queued) => {
-                    ipc.requests.remove(&id);
-                    if let Some(s) = ipc.services.get_mut(service) {
-                        s.queue.retain(|&q| q != id);
-                    }
-                    true
-                }
-                Some(State::Taken) if give_up() => {
-                    ipc.requests.get_mut(&id).expect("present").waits = false;
-                    true
-                }
-                _ => false,
-            })
-        })
+/// registration of a server that accepts them; returns its id. The caller
+/// waits on `reply_chan(id)`, takes the answer with `take_reply` and
+/// gives the request up with `abandon` (it decides itself when it is done:
+/// a channel's connect is complete once the service attached, answered or
+/// not).
+pub fn send_control(to: Instance, message: Vec<u8>) -> Result<u64, i64> {
+    enqueue_as(to.service, message, true, Some(to.generation), true)
+}
+
+/// Where the sender of request `id` waits: its answer, its failure and
+/// whatever else the sender waits for (`wake`) wake it there.
+pub fn reply_chan(id: u64) -> usize {
+    request_chan(id)
+}
+
+/// Wakes whoever waits on `reply_chan(id)`.
+pub fn wake(id: u64) {
+    wakeup(request_chan(id));
+}
+
+/// The answer to request `id` if it came (EIO if the server failed it or
+/// died); the request is then gone.
+pub fn take_reply(id: u64) -> Option<Result<Vec<u8>, i64>> {
+    lock(|ipc| match ipc.requests.get(&id).map(|r| r.state) {
+        Some(State::Done) => Some(Ok(ipc.requests.remove(&id).expect("present").reply)),
+        Some(State::Failed) | None => {
+            ipc.requests.remove(&id);
+            Some(Err(EIO))
+        }
+        _ => None,
     })
+}
+
+/// Gives request `id` up: withdrawn if still queued, its answer dropped if
+/// the server took it.
+pub fn abandon(id: u64) {
+    lock(|ipc| match ipc.requests.get(&id).map(|r| (r.state, r.service)) {
+        Some((State::Queued, service)) => {
+            ipc.requests.remove(&id);
+            if let Some(s) = ipc.services.get_mut(service) {
+                s.queue.retain(|&q| q != id);
+            }
+        }
+        Some((State::Taken, _)) => ipc.requests.get_mut(&id).expect("present").waits = false,
+        Some(_) => {
+            ipc.requests.remove(&id);
+        }
+        None => {}
+    });
 }
 
 /// The process serving this registration, while it is alive.

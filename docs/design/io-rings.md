@@ -148,7 +148,9 @@ kernel carries the offer: `chan_connect` sends the service a control request, ty
 (no protocol message can pass for one) and only to services registered with `IPC_CHANNELS`.
 Whether the channel is attached is the kernel's to say, not the service's answer: a service
 that attaches and answers an error still has the channel, and one that answers 0 without
-attaching has not.
+attaching has not. So `chan_connect` returns as soon as the service attached, answered or not
+(a service that attaches and never answers cannot hold the client); before that, a signal (a
+fatal one always) gives the offer up, and a later `chan_attach` fails.
 
 **Doorbells.** The ring words are futex words. The service's futex on its shared mapping and
 the server's `server_futex_wait` on its region mapping are both keyed by the channel's memory

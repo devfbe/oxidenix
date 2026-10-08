@@ -169,6 +169,7 @@ pub fn run(scenario: u64) -> i64 {
         4 => client_end(),
         5 => service_death(),
         6 => service_exec(),
+        7 => attached_without_answer(),
         _ => Err(1000),
     };
     match result {
@@ -340,6 +341,17 @@ fn service_death() -> Result<(), i64> {
     let mut c = Client::open().map_err(|_| 98)?;
     check!(99, c.status(ECHO, 0, 0, 0, 1) == 2);
     close(obj);
+    Ok(())
+}
+
+/// The service attaches a channel but answers the offer only after it
+/// served it: the connect is complete once the service attached.
+fn attached_without_answer() -> Result<(), i64> {
+    let mut c = Client::open().map_err(|_| 120)?;
+    check!(121, c.status(ANSWER_LATE, 0, 0, 0, 0) == 0);
+    drop(c);
+    let mut c = Client::open().map_err(|_| 122)?;
+    check!(123, c.status(ECHO, 0, 0, 0, 5) == 6);
     Ok(())
 }
 

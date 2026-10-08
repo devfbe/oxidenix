@@ -85,6 +85,8 @@ struct Inner {
     /// offer stands.
     offered: Option<ipc::Instance>,
     service: Option<ServiceEnd>,
+    /// The request carrying the offer, while `connect` waits for it.
+    offer_request: Option<u64>,
     client_gone: bool,
     service_gone: bool,
     /// Grants by id: live ones and revoked ones still draining.
@@ -233,7 +235,7 @@ impl Channel {
         // Positions start at 0 (the memory is zeroed).
         unsafe { (memory::phys_to_virt(header.start_address().as_u64()) as *mut Header).write(Header::new(&layout)) };
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        let inner = Inner { offered: None, service: None, client_gone: false, service_gone: false, grants: Grants::default(), reserved: 0, pages: 0 };
+        let inner = Inner { offered: None, service: None, offer_request: None, client_gone: false, service_gone: false, grants: Grants::default(), reserved: 0, pages: 0 };
         // From here on, dropping the channel releases the header page.
         let channel = Channel { id, layout, memory, header, inner: IrqSpinLock::new(inner) };
         let channel = Arc::try_new(channel).map_err(|_| ENOMEM)?;
@@ -289,26 +291,47 @@ impl Channel {
         }
         let offer = Offer { channel: self.id, slots: self.layout.slots, client }.encode();
         let mut message = Vec::new();
-        message.try_reserve_exact(offer.len()).map_err(|_| ENOMEM)?;
-        message.extend_from_slice(&offer);
-        // A signal gives the offer up unless the service attached already.
-        let answer = ipc::call_control(to, message, || {
-            let mut inner = self.inner.lock();
-            if inner.service.is_some() {
-                return false;
-            }
-            inner.offered = None;
-            true
+        let sent = message.try_reserve_exact(offer.len()).map_err(|_| ENOMEM).and_then(|_| {
+            message.extend_from_slice(&offer);
+            ipc::send_control(to, message)
         });
+        let id = match sent {
+            Ok(id) => id,
+            Err(e) => {
+                self.inner.lock().offered = None;
+                return Err(e);
+            }
+        };
+        self.inner.lock().offer_request = Some(id);
+        // Done once the service attached (it need not have answered),
+        // answered, or died; a signal (always a fatal one) gives the offer
+        // up unless the service attached.
+        let answer = loop {
+            let wait = super::sched::prepare_to_wait(ipc::reply_chan(id));
+            if self.inner.lock().service.is_some() {
+                break None;
+            }
+            if let Some(answer) = ipc::take_reply(id) {
+                break Some(answer);
+            }
+            if super::signal::interrupted() || super::signal::dying() {
+                break Some(Err(EINTR));
+            }
+            wait.sleep();
+        };
+        ipc::abandon(id);
         let refused = match answer {
-            Ok(reply) => match <[u8; 8]>::try_from(reply.as_slice()).map(i64::from_le_bytes) {
+            None => 0,
+            Some(Ok(reply)) => match <[u8; 8]>::try_from(reply.as_slice()).map(i64::from_le_bytes) {
                 Ok(status) if status < 0 && status > -4096 => -status,
                 _ => ECONNREFUSED,
             },
-            Err(e) => e,
+            Some(Err(e)) => e,
         };
-        // Attached or not is the kernel's to say, not the answer's.
+        // Attached or not is the kernel's to say, not the answer's: from
+        // here on, the offer is decided either way.
         let mut inner = self.inner.lock();
+        inner.offer_request = None;
         if inner.service.is_some() {
             return Ok(());
         }
@@ -603,12 +626,17 @@ pub fn attach(id: u64) -> Result<i64, i64> {
             if let Some(entry) = channels.get_mut(&id) {
                 entry.service = Some((me, channel.clone()));
             }
-            Ok(())
+            Ok(inner.offer_request)
         }
     };
-    if let Err(e) = attached {
-        mm.lock().unmap(addr, len);
-        return Err(e);
+    match attached {
+        // The connect waiting for it is complete.
+        Ok(Some(request)) => ipc::wake(request),
+        Ok(None) => {}
+        Err(e) => {
+            mm.lock().unmap(addr, len);
+            return Err(e);
+        }
     }
     Ok(addr as i64)
 }

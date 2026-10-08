@@ -41,3 +41,6 @@ pub const SLEEPS: u16 = 10;
 /// may work: an exec ends the service's end of its channels.
 pub const EXEC: u16 = 11;
 pub const AFTER_EXEC: u8 = 0x99;
+/// The service answers the next offer only after it served that channel
+/// (it attaches at once): attaching alone must complete the connect.
+pub const ANSWER_LATE: u16 = 12;

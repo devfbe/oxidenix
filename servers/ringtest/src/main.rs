@@ -34,6 +34,8 @@ const PROT_EXEC: u64 = 4;
 /// theirs removed (`CLEAN_ENDS`), and sleeps on a doorbell (`SLEEPS`).
 static CLEAN: AtomicI64 = AtomicI64::new(0);
 static SLEPT: AtomicU32 = AtomicU32::new(0);
+/// `ANSWER_LATE`: the next offer is answered after its channel ends.
+static LATE: AtomicU32 = AtomicU32::new(0);
 
 /// The doorbell: a futex on the ring word, shared with the client.
 struct Futex;
@@ -110,9 +112,16 @@ fn main(args: Vec<&'static str>) -> i32 {
             None => Err(-EINVAL),
         };
         let status = attached.as_ref().map_or_else(|&e| e, |_| 0);
-        let _ = oxrt::ipc_reply(id, &status.to_le_bytes());
+        let late = attached.is_ok() && LATE.swap(0, Ordering::Relaxed) != 0;
+        if !late {
+            let _ = oxrt::ipc_reply(id, &status.to_le_bytes());
+        }
         if let Ok((channel, base)) = attached {
             serve(channel, base);
+        }
+        if late {
+            // Nobody waits for it any more.
+            let _ = oxrt::ipc_reply(id, &status.to_le_bytes());
         }
     }
 }
@@ -231,6 +240,10 @@ fn handle(channel: u64, d: &Desc, mapped: &mut Vec<Mapped>) -> i64 {
             Ok(exec_self(&["ringtest", "after-exec", &channel, &grant]))
         }
         SLEEPS => Ok(SLEPT.load(Ordering::Relaxed) as i64),
+        ANSWER_LATE => {
+            LATE.store(1, Ordering::Relaxed);
+            Ok(0)
+        }
         _ => Err(-EINVAL),
     })();
     result.unwrap_or_else(|e| e)
