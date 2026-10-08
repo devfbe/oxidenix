@@ -192,6 +192,32 @@ fn an_event_loop_sleep_loses_no_wakeup() {
     assert!(wait.sleeps.load(Ordering::Relaxed) > 0, "the consumer slept at least once");
 }
 
+/// A consumer that sleeps with entries it cannot take yet is woken by the
+/// producer's doorbell alone, without a new entry.
+#[test]
+fn a_blocked_sleep_wakes_on_a_doorbell_without_an_entry() {
+    let mem = RingMemory::<4>::new();
+    let ring = Ring::new(&mem);
+    let (mut p, mut c) = (ring.producer(), ring.consumer());
+    assert!(p.push(&desc(1)));
+    struct Count(AtomicUsize);
+    impl Wait for Count {
+        fn wait(&self, _: &AtomicU32, _: u32) {}
+        fn wake(&self, _: &AtomicU32) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    let w = Count(AtomicUsize::new(0));
+    let tail = c.prepare_blocked_sleep();
+    assert_eq!(tail, 1, "the tail as it is, entries in the ring");
+    p.ring_doorbell(&w);
+    assert_eq!(w.0.load(Ordering::Relaxed), 1, "rung without a new entry");
+    c.awake();
+    p.ring_doorbell(&w);
+    assert_eq!(w.0.load(Ordering::Relaxed), 1, "awake: no wake");
+    assert_eq!(c.pop().map(|d| d.tag), Some(1));
+}
+
 #[test]
 fn a_sleeper_wakes_when_the_peer_is_gone() {
     use std::sync::atomic::AtomicBool;

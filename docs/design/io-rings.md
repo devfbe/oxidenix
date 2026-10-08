@@ -183,7 +183,10 @@ teardown paths allocate nothing (a teardown's work is allocated with the end it 
 quarantine is a list through the grants), so running out of memory never stops a teardown.
 
 **Revoke.** The grant's mappings in the service are gone (TLB shootdowns included) when
-`revoke` returns, and its device mappings are taken out of the service's `DmaDomain` (the one
+`revoke` returns; their ranges stay reserved and inaccessible (`Backing::Revoked`: no access
+can be added, nothing else is mapped there) until the service unmaps them or its end of the
+channel goes, so a service copy to the address it knew faults and fails rather than reaching
+another grant or the service's own memory. Its device mappings are taken out of the service's `DmaDomain` (the one
 place that maps pages for devices). Without an IOMMU a device address cannot be taken back: a
 grant the service has device addresses of stays pinned, its id taken, until the service calls
 `grant_dma_unmap` (`revoke` returns `REVOKE_DRAINING`). Data integrity is the protocol's: the
@@ -250,7 +253,8 @@ answers the offer only after it served the channel.
 | `FLUSH` | - | 0: every write completed before it is durable |
 | `STAT`, `STATFS` | inode / - | 0, the values packed in v0..v3 (`fsring::Stat`, `Usage`) |
 | `LOOKUP`, `CREATE`, `UNLINK`, `RENAME` | directory, names in a grant (a symlink's target or the new name right after the first name) | v0 = the inode found or made, or the one whose last link went |
-| `TRUNCATE`, `SETPERM`, `RELEASE` | inode and the new size / permissions | 0 |
+| `TRUNCATE`, `SETPERM` | inode and the new size / permissions | 0 |
+| `RELEASE` | inode | 0: the client holds it no more (see "Holds" below) |
 | `READDIR`, `READLINK` | a result buffer in a writable grant (`READDIR` with a cursor) | bytes, v0 = the next cursor |
 | `FORGET` | a grant | 0 once diskfs let go of it (send before `revoke`: no draining) |
 
@@ -285,9 +289,23 @@ polls the rings and the device; after `SPIN_BUDGET` (2000) polls without progres
 (device busy: its interrupts stay off, the line being shared with the network card) or arms
 every ring's doorbell (`prepare_sleep`, `chan_watch`) and sleeps in `ipc_receive`.
 
+**Holds.** A client holds every inode it named or got back from `LOOKUP`, `CREATE`, `UNLINK`
+or `RENAME`, until its `RELEASE` or the end of its channel; the kernel's IPC client holds what
+it named until its `Release` (which it sends only for the inodes it unlinked). An inode whose
+last link went is freed when no client holds it, so one client never frees what another
+uses; one a ring client unlinks while the kernel holds it stays allocated (an orphan for
+e2fsck) until step 4 removes the kernel's client.
+
+**Room.** A request waits in the submission ring while its channel's completion ring has no
+room for its completion; diskfs then sleeps on that ring's doorbell instead of polling, and a
+client that took completions while requests of its waited rings it.
+
 **Limits.** 16 channels, 1024 grants a channel diskfs keeps (`FORGET` lets go), no more
-requests taken from a channel than its completion ring has room for, a client gone: its
-operations in flight finish into the pinned pages, then diskfs detaches.
+requests taken from a channel than its completion ring has room for, 32 operations in flight
+(a write waiting for a slot stalls), a client gone: its operations in flight finish into the
+pinned pages, then diskfs detaches and its holds go. A device whose segments are under a
+sector, or that takes too few per request for a page and its pads, or an image with blocks
+over a page, is refused at start.
 
 ## Paths built on it
 
@@ -313,7 +331,7 @@ tuning knob measured with `iobench` (diskfs: `service::SPIN_BUDGET`). diskfs kee
 interrupt off for now (its line is shared with the network card, and the kernel gives a line
 to one server): with requests in flight it polls the device and yields between rounds.
 
-**Tests of step 3.** `lxtest` runs five scenarios against diskfs (`TEST_DISKRING`): the disk
+**Tests of step 3.** `lxtest` runs nine scenarios against diskfs (`TEST_DISKRING`): the disk
 image's README read by DMA from an unaligned file offset into an unaligned grant offset,
 `STAT`, `READDIR` with and without a cursor, `STATFS`, a symlink made, read (`ERANGE` for a
 short buffer) and removed; writes aligned, unaligned within existing blocks, within one sector
@@ -324,8 +342,15 @@ and arguments, `EBADF`, ranges beyond a grant, over 1 MiB, `EACCES` for a read-o
 working afterwards; 24 writes and then 24 reads in flight, completions matched by tag; a grant
 revoked under diskfs (`REVOKE_DRAINING`, then `EFAULT` for a copy into it, diskfs alive,
 `FORGET` freeing the id, `FORGET` before `revoke` not draining) and a client closing its
-channel with 16 reads in flight (diskfs serves the next one). The file the second scenario
-leaves is read through the kernel's `/data` (the IPC protocol) and removed there.
+channel with 16 reads in flight (diskfs serves the next one); the range of a revoked grant
+given to no other grant (a copy to it `EFAULT`, the next grant untouched); an unlinked inode
+one channel released still working for another that holds it, freed when that one releases
+it or goes; a write stalled behind an overlapping one while another channel's long reads keep
+the operation slots busy; requests waiting for room in their completion ring with diskfs using
+no CPU meanwhile (its ticks in `/proc` over 500 ms), all completing once the client makes room.
+The file the second scenario leaves is read through the kernel's `/data` (the IPC protocol)
+and removed there. ringtest's `CHECK_GONE` checks the reservation a revoke leaves (`EACCES`
+for `mprotect`, `ENOMEM` once the service unmapped it).
 
 ## Steps
 

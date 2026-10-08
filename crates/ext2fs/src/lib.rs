@@ -231,6 +231,11 @@ struct State<D: Device> {
     /// point to them (`barrier`): after a crash, no pointer leads to a
     /// block that still holds what a deleted file left there.
     new_meta: BTreeSet<u32>,
+    /// Blocks freed since the last successful commit: the metadata on the
+    /// disk may still point to them, so no allocation takes them before a
+    /// commit wrote the change (else a crash shows the new owner's data in
+    /// the old file).
+    freed: BTreeSet<u32>,
     /// Blocks were written that metadata may point to (file data, zeroed
     /// fresh blocks, new metadata blocks, and the data of the caller's own
     /// writes that `Ext2::link` records) and the device has not been
@@ -415,6 +420,8 @@ impl<D: Device> State<D> {
             self.dev.flush().map_err(io)?;
             self.written = false;
         }
+        // The bitmaps on the disk now say what the cache says.
+        self.freed.clear();
         Ok(())
     }
 
@@ -505,7 +512,8 @@ impl<D: Device> State<D> {
         let start = if start < limit { start } else { 0 };
         for bit in (start..limit).chain(0..start) {
             let (byte, mask) = ((bit / 8) as usize, 1u8 << (bit % 8));
-            if bitmap[byte] & mask == 0 && !first.is_some_and(|f| self.reserved.contains(&(f + bit))) {
+            let taken = first.is_some_and(|f| self.reserved.contains(&(f + bit)) || self.freed.contains(&(f + bit)));
+            if bitmap[byte] & mask == 0 && !taken {
                 return Ok(Some(bit));
             }
         }
@@ -567,6 +575,8 @@ impl<D: Device> State<D> {
         self.cache.remove(block);
         self.fresh.remove(&block);
         self.new_meta.remove(&block);
+        // Still pointed to on the disk until the next commit: not reused before.
+        self.freed.insert(block);
         let rel = block - self.first_data_block;
         let g = (rel / self.blocks_per_group) as usize;
         self.clear_bit(self.groups[g].block_bitmap, rel % self.blocks_per_group)?;
@@ -784,7 +794,7 @@ impl<D: Device> State<D> {
     }
 
     fn read(&mut self, ino: u32, off: u64, buf: &mut [u8]) -> Result<usize, i64> {
-        let mut inode = self.read_inode(ino)?;
+        let mut inode = self.live_inode(ino)?;
         // Only regular files have data blocks; a fast symlink's block
         // pointers hold characters, not block numbers.
         if !inode.is_reg() {
@@ -837,7 +847,7 @@ impl<D: Device> State<D> {
     }
 
     fn write(&mut self, ino: u32, off: u64, data: &[u8]) -> Result<usize, i64> {
-        let mut inode = self.read_inode(ino)?;
+        let mut inode = self.live_inode(ino)?;
         if !inode.is_reg() {
             return Err(EINVAL);
         }
@@ -1551,8 +1561,15 @@ impl<D: Device> Ext2<D> {
         let blocks_count = le32(&sb, 4);
         let blocks_per_group = le32(&sb, 32);
         let inodes_per_group = le32(&sb, 40);
+        // A group's bitmaps are one block each: its sizes must fit one, and
+        // an inode must fit a block (or the bitmap and table arithmetic
+        // would index past them).
+        let bits = 8 * block_size as u32;
         if blocks_per_group == 0 || inodes_per_group == 0 || blocks_count <= first_data_block {
             return Err("corrupt superblock");
+        }
+        if blocks_per_group > bits || inodes_per_group > bits || inode_size > block_size || !inode_size.is_power_of_two() {
+            return Err("corrupt superblock: group or inode sizes do not fit a block");
         }
         let mut st = State {
             dev,
@@ -1574,6 +1591,7 @@ impl<D: Device> Ext2<D> {
             unlinked: Vec::new(),
             reserved: BTreeSet::new(),
             new_meta: BTreeSet::new(),
+            freed: BTreeSet::new(),
             unflushed: false,
         };
         let count = (blocks_count - first_data_block).div_ceil(blocks_per_group) as usize;
@@ -1628,7 +1646,7 @@ impl<D: Device> Ext2<D> {
     }
 
     pub fn truncate(&mut self, ino: u32, len: u64) -> Result<(), i64> {
-        let mut inode = self.st.read_inode(ino)?;
+        let mut inode = self.st.live_inode(ino)?;
         if !inode.is_reg() {
             return Err(EINVAL);
         }
@@ -1683,7 +1701,7 @@ impl<D: Device> Ext2<D> {
 
     /// Frees an inode returned by `unlink` or `rename`, with all its blocks.
     pub fn release(&mut self, ino: u32) -> Result<(), i64> {
-        let inode = self.st.read_inode(ino)?;
+        let inode = self.st.live_inode(ino)?;
         if inode.links() != 0 {
             return Err(EINVAL);
         }
@@ -1697,7 +1715,7 @@ impl<D: Device> Ext2<D> {
     }
 
     pub fn set_perm(&mut self, ino: u32, perm: u32) -> Result<(), i64> {
-        let mut inode = self.st.read_inode(ino)?;
+        let mut inode = self.st.live_inode(ino)?;
         inode.set_mode((inode.mode() as u32 & S_IFMT | perm & 0o7777) as u16);
         let now = self.st.dev.now();
         inode.touch(now, false, false);

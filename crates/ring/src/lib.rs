@@ -257,6 +257,19 @@ impl<const N: usize> Consumer<'_, N> {
         Some(tail)
     }
 
+    /// Announces a sleep with entries in the ring that the consumer cannot
+    /// take now (it waits for something else first, as a service for room
+    /// in its completion ring): `sleeping = 1`, fence, and the tail value
+    /// to sleep on. The producer's next doorbell wakes it whether or not
+    /// it added an entry (a futex wake on `tail`); the protocol on top
+    /// says when a producer rings for that (`fsring`: after it consumed
+    /// completions while requests were waiting).
+    pub fn prepare_blocked_sleep(&mut self) -> u32 {
+        self.mem.sleeping.0.store(1, Ordering::Relaxed);
+        fence(Ordering::SeqCst);
+        self.mem.tail.0.load(Ordering::Relaxed)
+    }
+
     /// Ends a sleep announced by `prepare_sleep`: producers stop ringing
     /// the doorbell (the consumer polls while it is awake).
     pub fn awake(&mut self) {

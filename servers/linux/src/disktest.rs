@@ -136,7 +136,14 @@ impl Client {
         let deadline = now() + TIMEOUT;
         let header = self.header;
         match self.completions.pop_wait_while(&Doorbell { deadline }, || header.state() == 0 && now() < deadline) {
-            Some(c) => Ok(Completion::from_desc(&c)),
+            Some(c) => {
+                // Room for a completion: requests still waiting for it
+                // may be taken now (fsring, "Room").
+                if self.requests.room() < N {
+                    self.requests.ring_doorbell(&Doorbell { deadline: 0 });
+                }
+                Ok(Completion::from_desc(&c))
+            }
             None if header.state() != 0 => Err(-(EPROTO)),
             None => Err(-ETIMEDOUT),
         }
@@ -242,6 +249,10 @@ pub fn run(scenario: u64) -> i64 {
         3 => errors(),
         4 => in_flight(),
         5 => revoked_and_gone(),
+        6 => holds(),
+        7 => stalls_with_full_slots(),
+        8 => block_on_room(),
+        9 => unblock(),
         _ => Err(1000),
     };
     match result {
@@ -485,6 +496,19 @@ fn revoked_and_gone() -> Result<(), i64> {
     // Its mapping in diskfs is gone: a copy into it fails, diskfs lives.
     check!(137, c.status(Request::Readdir { dir: ROOT, cursor: 0, buf: buf(g, 0, 100) }) == -EFAULT);
     check!(138, c.status(Request::Stat { ino }) == 0);
+    // The range the revoked grant had in diskfs goes to no other grant
+    // (it stays reserved until FORGET): a copy to the stale grant faults
+    // and leaves the next grant diskfs maps untouched.
+    let other = Object::new(2).map_err(|_| 150)?;
+    other.write(0, &[0xee; 2 * PAGE as usize]);
+    let g2 = c.grant(&other, true);
+    check!(151, g2 > 0 && g2 != g as i64);
+    check!(152, c.status(Request::Read { ino, offset: 0, buf: buf(g2 as u32, 0, 100) }) == 100);
+    check!(153, c.status(Request::Readdir { dir: ROOT, cursor: 0, buf: buf(g, 0, 2 * PAGE as usize) }) == -EFAULT);
+    let after = other.read(0, 2 * PAGE as usize);
+    check!(154, after[..100] == README[..100] && after[100..].iter().all(|&b| b == 0xee));
+    check!(155, c.status(Request::Forget { grant: g2 as u32 }) == 0);
+    check!(156, c.revoke(g2 as u32) == 0);
     // FORGET lets go: the id comes back for the next grant.
     check!(139, c.status(Request::Forget { grant: g }) == 0);
     let again = c.grant(&data, true);
@@ -504,5 +528,125 @@ fn revoked_and_gone() -> Result<(), i64> {
     // diskfs serves the next channel.
     let mut c = Client::open().map_err(|_| 147)?;
     check!(148, c.status(Request::Stat { ino }) == 0);
+    Ok(())
+}
+
+fn pause_ms(ms: u64) {
+    syscall(SYS_SLEEP_UNTIL, [now() + ms * 1_000_000, 0, 0, 0, 0, 0]);
+}
+
+/// An unlinked inode is freed only when no client holds it: one client's
+/// RELEASE leaves another one's file working, and a channel's holds go
+/// with it.
+fn holds() -> Result<(), i64> {
+    let mut a = Client::open().map_err(|_| 160)?;
+    let na = Names::new(&a).map_err(|_| 161)?;
+    let mut b = Client::open().map_err(|_| 162)?;
+    let nb = Names::new(&b).map_err(|_| 163)?;
+    let x = create(&mut a, &na, b"ringtest.held").map_err(|_| 164)?;
+    let src = Object::new(1).map_err(|_| 165)?;
+    src.write(0, b"hello");
+    let ga = a.grant(&src, false);
+    check!(166, ga > 0 && a.status(Request::Write { ino: x, offset: 0, buf: buf(ga as u32, 0, 5) }) == 5);
+    check!(167, lookup(&mut b, &nb, ROOT, b"ringtest.held") == Ok(x));
+    // a unlinks it and lets go; b still has it.
+    let (n, _) = na.put(b"ringtest.held", b"");
+    let r = a.call(Request::Unlink { dir: ROOT, name: n, is_dir: false }).map_err(|_| 168)?;
+    check!(169, r.status == 0 && r.values[0] == x as u64);
+    check!(170, a.status(Request::Release { ino: x }) == 0);
+    let dst = Object::new(1).map_err(|_| 171)?;
+    let gb = b.grant(&dst, true);
+    check!(172, gb > 0);
+    check!(173, b.status(Request::Write { ino: x, offset: 5, buf: buf(gb as u32, 0, 3) }) == 3);
+    check!(174, b.status(Request::Read { ino: x, offset: 0, buf: buf(gb as u32, 0, 100) }) == 8);
+    check!(175, dst.read(0, 5) == b"hello");
+    // b lets go: now it is freed.
+    check!(176, b.status(Request::Release { ino: x }) == 0);
+    check!(177, a.status(Request::Stat { ino: x }) == -ENOENT);
+    // A channel that goes lets go of what it held. (Naming an inode holds
+    // it: the checks below look from channels of their own, which go.)
+    let y = create(&mut a, &na, b"ringtest.held").map_err(|_| 178)?;
+    let stat = |ino: u32| Client::open().map(|mut d| d.status(Request::Stat { ino })).unwrap_or(-1);
+    {
+        let mut c = Client::open().map_err(|_| 179)?;
+        let nc = Names::new(&c).map_err(|_| 180)?;
+        check!(181, lookup(&mut c, &nc, ROOT, b"ringtest.held") == Ok(y));
+        remove(&mut a, &na, b"ringtest.held").map_err(|_| 182)?;
+        check!(183, stat(y) == 0);
+    }
+    let deadline = now() + TIMEOUT;
+    while stat(y) != -ENOENT {
+        check!(184, now() < deadline);
+        pause_ms(10);
+    }
+    Ok(())
+}
+
+/// A write that waits for an overlapping one while another channel keeps
+/// every operation slot busy: diskfs starts it when a slot is free (it
+/// never assumes one).
+fn stalls_with_full_slots() -> Result<(), i64> {
+    const READS: usize = 100;
+    let mut a = Client::open().map_err(|_| 190)?;
+    let na = Names::new(&a).map_err(|_| 191)?;
+    let mut b = Client::open().map_err(|_| 192)?;
+    let nb = Names::new(&b).map_err(|_| 193)?;
+    let f = create(&mut a, &na, b"ringtest.stall").map_err(|_| 194)?;
+    let src = Object::new(128).map_err(|_| 195)?;
+    let ga = a.grant(&src, false);
+    check!(196, ga > 0);
+    // Long reads (of the file the writes go to) keep the slots busy.
+    const LONG: usize = 256 * 1024;
+    check!(197, a.status(Request::Write { ino: f, offset: 0, buf: buf(ga as u32, 0, 128 * PAGE as usize) }) == 128 * PAGE as i64);
+    check!(198, lookup(&mut b, &nb, ROOT, b"ringtest.stall") == Ok(f));
+    let dst = Object::new((LONG as u64) / PAGE).map_err(|_| 199)?;
+    let gb = b.grant(&dst, true);
+    check!(207, gb > 0);
+    let reads: Vec<Desc> = (0..READS).map(|i| Request::Read { ino: f, offset: (i % 2 * LONG) as u64, buf: buf(gb as u32, 0, LONG) }.encode(0)).collect();
+    let writes = [
+        Request::Write { ino: f, offset: 0, buf: buf(ga as u32, 0, 128 * PAGE as usize) }.encode(0),
+        Request::Write { ino: f, offset: 0, buf: buf(ga as u32, 0, PAGE as usize) }.encode(0),
+    ];
+    for _ in 0..8 {
+        b.send(&reads).map_err(|_| 200)?;
+        a.send(&writes).map_err(|_| 201)?;
+        for _ in 0..READS {
+            check!(202, b.next().map(|r| r.status) == Ok(LONG as i64));
+        }
+        let (w1, w2) = (a.next().map_err(|_| 203)?, a.next().map_err(|_| 204)?);
+        check!(205, w1.status > 0 && w2.status > 0);
+    }
+    remove(&mut a, &na, b"ringtest.stall").map_err(|_| 206)?;
+    Ok(())
+}
+
+/// The channel scenario 8 leaves for scenario 9: requests waiting for room
+/// in its completion ring.
+static BLOCKED: crate::sync::Mutex<Option<(Client, u32, Vec<u64>)>> = crate::sync::Mutex::new(None);
+
+/// Fills the completion ring and leaves as many requests waiting for room
+/// (lxtest then checks that diskfs does not spin meanwhile).
+fn block_on_room() -> Result<(), i64> {
+    let mut c = Client::open().map_err(|_| 210)?;
+    let names = Names::new(&c).map_err(|_| 211)?;
+    let ino = lookup(&mut c, &names, ROOT, b"README.txt").map_err(|_| 212)?;
+    let stats: Vec<Desc> = (0..N).map(|_| Request::Stat { ino }.encode(0)).collect();
+    let mut tags = c.send(&stats).map_err(|_| 213)?;
+    // Long enough for diskfs to complete them all.
+    pause_ms(200);
+    check!(214, !c.completions.is_empty());
+    tags.extend(c.send(&stats).map_err(|_| 215)?);
+    *BLOCKED.lock() = Some((c, ino, tags));
+    Ok(())
+}
+
+/// Takes the completions of scenario 8 (ringing the doorbell as it makes
+/// room): every request completes.
+fn unblock() -> Result<(), i64> {
+    let Some((mut c, _, tags)) = BLOCKED.lock().take() else { return Err(220) };
+    for &tag in &tags {
+        let r = c.next().map_err(|_| 221)?;
+        check!(222, r.tag == tag && r.status == 0);
+    }
     Ok(())
 }

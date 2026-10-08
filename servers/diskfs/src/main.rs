@@ -58,11 +58,18 @@ fn main(args: Vec<&'static str>) -> i32 {
         }
     };
     let (sectors, read_only) = (disk.sectors(), disk.read_only());
-    let mut rings = service::Service::new(&disk);
     let mut fs = match Ext2::mount(disk) {
         Ok(fs) => fs,
         Err(e) => {
             println!("diskfs: cannot mount: {}", e);
+            return 1;
+        }
+    };
+    let inodes = fs.usage().3;
+    let mut rings = match service::Service::new(fs.device(), fs.block_size(), inodes) {
+        Ok(rings) => rings,
+        Err(e) => {
+            println!("diskfs: cannot serve this disk: {}", e);
             return 1;
         }
     };
@@ -90,7 +97,7 @@ fn main(args: Vec<&'static str>) -> i32 {
             Ok(oxrt::Event::Request(id, len)) => {
                 rings.drain(&mut fs);
                 let n = match decode_request(&request[..len]) {
-                    Some(req) => handle(&mut fs, &req, &mut response),
+                    Some(req) => handle(&mut fs, &mut rings, &req, &mut response),
                     None => encode_response(&mut response, -EINVAL, [0; 6], &[]),
                 };
                 let _ = oxrt::ipc_reply(id, &response[..n]);
@@ -114,9 +121,24 @@ fn inodes_payload(inodes: &[u32]) -> Vec<u8> {
 }
 
 /// Executes one request and writes the response; returns its length.
-fn handle(fs: &mut Ext2<blk::VirtioBlk>, req: &Request, out: &mut [u8]) -> usize {
+///
+/// The kernel holds every inode it names or is told of (see `service`,
+/// "Holds") until it releases it: it does so for the inodes it unlinked,
+/// once it no longer uses them. An inode a ring client unlinks while the
+/// kernel holds it therefore stays allocated (an orphan for e2fsck after
+/// the next shutdown) rather than being freed under the kernel; the
+/// kernel's client goes in step 4 of docs/design/io-rings.md.
+fn handle(fs: &mut Ext2<blk::VirtioBlk>, rings: &mut service::Service, req: &Request, out: &mut [u8]) -> usize {
     let [a0, a1, a2, _] = req.args;
     let ino = a0 as u32;
+    match req.op {
+        Some(Op::Usage | Op::Release) | None => {}
+        Some(Op::Rename) => {
+            rings.kernel_holds(ino);
+            rings.kernel_holds(a1 as u32);
+        }
+        Some(_) => rings.kernel_holds(ino),
+    }
     let result: Result<(i64, [u64; 6], Vec<u8>), i64> = (|| {
         let op = req.op.ok_or(-ENOSYS)?;
         let ok = |status: i64| Ok((status, [0; 6], Vec::new()));
@@ -150,6 +172,7 @@ fn handle(fs: &mut Ext2<blk::VirtioBlk>, req: &Request, out: &mut [u8]) -> usize
             }
             Op::Lookup => {
                 let child = fs.lookup(ino, name(req.payload)?).map_err(|e| -e)?;
+                rings.kernel_holds(child);
                 Ok((0, [child as u64, 0, 0, 0, 0, 0], Vec::new()))
             }
             Op::Create => {
@@ -164,19 +187,23 @@ fn handle(fs: &mut Ext2<blk::VirtioBlk>, req: &Request, out: &mut [u8]) -> usize
                     _ => return Err(-EINVAL),
                 };
                 let child = fs.create(ino, name(n)?, &kind, a2 as u32).map_err(|e| -e)?;
+                rings.kernel_holds(child);
                 Ok((0, [child as u64, 0, 0, 0, 0, 0], Vec::new()))
             }
             Op::Unlink => {
                 let gone = fs.unlink(ino, name(req.payload)?, a1 != 0).map_err(|e| -e)?;
+                gone.iter().for_each(|&i| rings.kernel_holds(i));
                 Ok((0, [0; 6], inodes_payload(&gone)))
             }
             Op::Rename => {
                 let split = (a2 as usize).min(req.payload.len());
                 let (old, new) = req.payload.split_at(split);
                 let gone = fs.rename(ino, name(old)?, a1 as u32, name(new)?).map_err(|e| -e)?;
+                gone.iter().for_each(|&i| rings.kernel_holds(i));
                 Ok((0, [0; 6], inodes_payload(&gone)))
             }
-            Op::Release => fs.release(ino).map_err(|e| -e).and_then(|_| ok(0)),
+            // Freed once no ring client holds it either.
+            Op::Release => rings.kernel_release(fs, ino).map_err(|e| -e).and_then(|_| ok(0)),
             Op::Readlink => {
                 let target = fs.readlink(ino).map_err(|e| -e)?;
                 Ok((0, [0; 6], target.into_bytes()))

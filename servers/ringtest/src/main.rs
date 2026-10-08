@@ -153,9 +153,11 @@ fn serve(channel: u64, base: *mut u8) {
     let _ = oxrt::chan_detach(channel);
 }
 
-/// Whether nothing is mapped at `addr` any more.
+/// Whether the grant mapped at `addr` is out of reach: its range is the
+/// inaccessible reservation a revoke leaves (no access can be added:
+/// EACCES), or nothing at all (ENOMEM).
 fn gone(addr: *mut u8) -> bool {
-    oxrt::mprotect(addr, PAGE as usize, PROT_READ) == Err(-ENOMEM)
+    matches!(oxrt::mprotect(addr, PAGE as usize, PROT_READ), Err(e) if e == -ENOMEM || e == -EACCES)
 }
 
 /// The grant `grant`, mapped (once).
@@ -224,7 +226,15 @@ fn handle(channel: u64, base: *mut u8, d: &Desc, mapped: &mut Vec<Mapped>) -> i6
             if oxrt::grant_map(channel, d.grant).err() != Some(-ENOENT) {
                 return Ok(1);
             }
-            Ok(if gone(m.addr) { 0 } else { 2 })
+            let len = m.len as usize;
+            if oxrt::mprotect(m.addr, len, PROT_READ) != Err(-EACCES) {
+                return Ok(2);
+            }
+            // The reservation goes only when the service unmaps it.
+            if oxrt::munmap(m.addr, len).is_err() || oxrt::mprotect(m.addr, len, PROT_READ) != Err(-ENOMEM) {
+                return Ok(3);
+            }
+            Ok(0)
         }
         CRASH => {
             let i = map(channel, d.grant, mapped)?;
