@@ -701,17 +701,18 @@ pub fn write_server(inode: &Arc<DInode>, off: u64, data: &[u8]) -> Result<usize,
 }
 
 /// Writes back the dirty pages of `inode` among `pages` (page indices):
-/// runs of them granted, written by DMA, many in flight. EIO if a write
-/// failed (its pages are dirty again).
-pub fn writeback(inode: &Arc<DInode>, pages: core::ops::Range<u64>) -> Result<(), i64> {
-    let Some(object) = *inode.object.lock() else { return Ok(()) };
+/// runs of them granted, written by DMA, many in flight. How many pages it
+/// wrote; the error of a write that failed (its pages are dirty again:
+/// ENOSPC for a full disk, EIO).
+pub fn writeback(inode: &Arc<DInode>, pages: core::ops::Range<u64>) -> Result<u64, i64> {
+    let Some(object) = *inode.object.lock() else { return Ok(0) };
     if inode.stale.load(Ordering::Relaxed) {
         return Err(EIO);
     }
     let _wb = inode.wb.lock();
     let c = client()?;
     let size = syscall(SYS_MO_FILE_SIZE, [object, 0, 0, 0, 0, 0]).max(0) as u64;
-    let (cursor, pinned, wrote, failed) = (Cell::new(pages.start), Cell::new(0u64), Cell::new(false), Cell::new(None));
+    let (cursor, pinned, wrote, failed) = (Cell::new(pages.start), Cell::new(0u64), Cell::new(0u64), Cell::new(None));
     let mut out = [0u64; 2];
     fsclient::run(
         &c,
@@ -748,10 +749,11 @@ pub fn writeback(inode: &Arc<DInode>, pages: core::ops::Range<u64>) -> Result<()
         |io, r| match io {
             Io::Write { grant, first, count, len } => {
                 if r.status == len as i64 {
-                    wrote.set(true);
+                    wrote.set(wrote.get() + count);
                 } else {
                     syscall(SYS_MO_REDIRTY, [object, first * PAGE, count, 0, 0, 0]);
-                    failed.set(Some(EIO));
+                    // diskfs's reason (a full disk), or EIO.
+                    failed.set(Some(status(&r).err().unwrap_or(EIO)));
                 }
                 Some((Request::Forget { grant }.encode(0), Io::Forget { grant, pages: count }))
             }
@@ -763,12 +765,12 @@ pub fn writeback(inode: &Arc<DInode>, pages: core::ops::Range<u64>) -> Result<()
             Io::Fill { .. } => None,
         },
     );
-    if wrote.get() {
+    if wrote.get() > 0 {
         inode.unflushed.store(c.generation, Ordering::Release);
     }
     match failed.get() {
         Some(e) => Err(e),
-        None => Ok(()),
+        None => Ok(wrote.get()),
     }
 }
 
@@ -941,39 +943,20 @@ pub fn write_dirty(all: bool) {
 }
 
 /// Writes `inode` back until a pass finds nothing dirty (a few passes at
-/// most): whether it is clean.
+/// most: a store during a pass may dirty a page it had passed): whether it
+/// is clean.
 fn clean_after_writeback(inode: &Arc<DInode>) -> bool {
-    let Some(object) = *inode.object.lock() else { return true };
     if inode.stale.load(Ordering::Relaxed) {
         return true;
     }
     for _ in 0..4 {
-        if writeback(inode, 0..u64::MAX).is_err() {
-            return false;
-        }
-        // A store during the pass may have dirtied a page it had passed.
-        if !has_dirty(object) {
-            return true;
+        match writeback(inode, 0..u64::MAX) {
+            Ok(0) => return true,
+            Ok(_) => {}
+            Err(_) => return false,
         }
     }
     false
-}
-
-/// Whether the object has a dirty page: a write-back grant of the whole
-/// file finds one (which is made dirty again).
-fn has_dirty(object: u64) -> bool {
-    let Ok(c) = client() else { return true };
-    let mut out = [0u64; 2];
-    let g = syscall(SYS_GRANT, [c.handle(), object, 0, u64::MAX / PAGE, GRANT_DIRTY, out.as_mut_ptr() as u64]);
-    if g == -ENOENT {
-        return false;
-    }
-    if g > 0 {
-        // diskfs never saw it: revoked at once, and the pages dirty again.
-        syscall(SYS_REVOKE, [c.handle(), g as u64, 0, 0, 0, 0]);
-        syscall(SYS_MO_REDIRTY, [object, out[0] * PAGE, out[1], 0, 0, 0]);
-    }
-    true
 }
 
 // --------------------------------------------- holds and write access

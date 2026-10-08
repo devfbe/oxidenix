@@ -17,7 +17,7 @@ use crate::syscall;
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicU32, Ordering};
-use restricted::{SYS_SERVER_FUTEX_WAIT, SYS_SERVER_FUTEX_WAKE};
+use restricted::{SYS_SERVER_FUTEX_WAIT, SYS_SERVER_FUTEX_WAKE, SYS_YIELD};
 
 pub struct Mutex<T> {
     state: AtomicU32,
@@ -129,7 +129,11 @@ impl RwLock {
 
     fn sleep(&self, seen: u32) {
         let addr = &self.changed as *const AtomicU32 as u64;
-        syscall(SYS_SERVER_FUTEX_WAIT, [addr, seen as u64, 0, 0, 0, 0]);
+        const EINTR: i64 = 4;
+        // A dying thread cannot sleep: it yields while it waits.
+        if syscall(SYS_SERVER_FUTEX_WAIT, [addr, seen as u64, 0, 0, 0, 0]) == -EINTR {
+            syscall(SYS_YIELD, [0; 6]);
+        }
     }
 
     fn advance(&self) {

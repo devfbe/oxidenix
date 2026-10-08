@@ -57,10 +57,13 @@ pub const EINTR: i64 = 4;
 pub const EIO: i64 = 5;
 pub const EPIPE: i64 = 32;
 
-/// A slot's states.
+/// A slot's states. A completion moves it from BUSY to DONE through
+/// COMPLETING, which only one completer gets (the reaper, or a submitter
+/// whose request could not be sent).
 const FREE: u32 = 0;
 const BUSY: u32 = 1;
-const DONE: u32 = 2;
+const COMPLETING: u32 = 2;
+const DONE: u32 = 3;
 
 /// Sleeps while `word` holds `value` (a server futex: on a ring word the
 /// channel's object, else the server's own memory). A thread being killed
@@ -101,12 +104,12 @@ struct Slot {
     op: AtomicU32,
     /// Uses so far: the tag's upper part.
     uses: AtomicU64,
-    /// Written by the reaper before `state` becomes DONE.
+    /// Written by the completer (COMPLETING) before `state` becomes DONE.
     result: UnsafeCell<Completion>,
 }
 
-// `result` is written by the reaper only while the slot is BUSY and read
-// by its owner only once it is DONE (Release/Acquire on `state`).
+// `result` is written only by whoever moved the slot to COMPLETING and read
+// by its owner only once it is DONE (SeqCst on `state`).
 unsafe impl Sync for Slot {}
 
 /// A request in flight: whoever submitted it must `wait` for it.
@@ -338,6 +341,9 @@ impl Client {
 
     fn complete(&self, i: usize, c: Completion) {
         let s = &self.slots[i];
+        if s.state.compare_exchange(BUSY, COMPLETING, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+            return;
+        }
         unsafe { *s.result.get() = c };
         s.state.store(DONE, Ordering::SeqCst);
         s.word.fetch_add(1, Ordering::SeqCst);
