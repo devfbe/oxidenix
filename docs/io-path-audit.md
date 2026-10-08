@@ -204,6 +204,13 @@ IPC round trip with PCIDs.)
   the same `iobench`, files `*-r6c2b.md` and `*-pre-r6c2b.md`): `stat` of a four-name path in
   tmpfs, p50, 7132 → 5742 cycles; one kernel walk per path instead of the pass-through, and
   kernel heap allocations per call 18 → 1.
+- The root as the server's tmpfs (R6c.2c, `1634a7c`, run twice): `fstat` in tmpfs 2982 → 2231
+  and `stat` of a path 5742 → 4349 cycles, but `fstat` of a disk file rose 15386 → 18051 with
+  the same work counted: each instance's unpacking left the kernel's first-fit heap fragmented,
+  and every allocation searched longer. Size classes for both heaps (`crates/slab`,
+  `2589c94`) took it to 14983 (and TCP over loopback 525 → 619 MB/s).
+- The null system call (a pass-through) measures either about 2270 or about 2670 cycles from
+  one boot to the next, with nothing changed in between; the cause is open.
 - The IPC round trip costs about 14000 cycles, 40 null system calls; PCIDs save little of it.
 - Sequential writes stay at 4.3 MB/s: a device flush per `write`, waited for by diskfs
   spinning on `sched_yield`.
