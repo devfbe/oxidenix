@@ -156,14 +156,20 @@ pub fn register(name: u64, len: u64, arg: u64, flags: u64) -> SysResult {
 /// timeout waits forever; when it runs out, the result is ETIMEDOUT.
 ///
 /// Interrupts of the caller's device lines come first: they are reported
-/// with request id 0 and the mask of fired lines as the result.
+/// with request id 0 and the mask of fired lines as the result. Then a
+/// doorbell the caller watches (`channel::watch`): request id 0 and the
+/// result `DOORBELL`.
 pub fn receive(buf: u64, len: u64, id_out: u64, timeout_ms: i64) -> SysResult {
     let deadline = (timeout_ms >= 0).then(|| crate::time::now().saturating_add((timeout_ms as u64).saturating_mul(1_000_000)));
     without_interrupts(|| receive_loop(buf, len, id_out, deadline))
 }
 
+/// `ipc_receive`'s result (with request id 0) for a doorbell that rang.
+pub const DOORBELL: i64 = 1 << 16;
+
 fn receive_loop(buf: u64, len: u64, id_out: u64, deadline: Option<u64>) -> SysResult {
     let me = super::current_pid();
+    let server = super::with_current(|p| p.server.clone());
     loop {
         let wait = prepare_to_wait(super::irq::server_chan(me));
         let fired = super::irq::take_pending(me);
@@ -171,6 +177,11 @@ fn receive_loop(buf: u64, len: u64, id_out: u64, deadline: Option<u64>) -> SysRe
             drop(wait);
             uaccess::write(id_out, 0u64)?;
             return Ok(fired as i64);
+        }
+        if server.as_ref().is_some_and(|s| s.doorbell.swap(false, core::sync::atomic::Ordering::Acquire)) {
+            drop(wait);
+            uaccess::write(id_out, 0u64)?;
+            return Ok(DOORBELL);
         }
         let next = lock(|ipc| {
             // Without a service yet, only interrupts and the timeout end the wait.

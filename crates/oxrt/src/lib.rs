@@ -58,6 +58,21 @@ pub mod sys {
     pub const GRANT_DMA: u64 = 1071;
     /// (channel, grant): the service's devices are done with the grant.
     pub const GRANT_DMA_UNMAP: u64 = 1072;
+    /// (channel, value): arms the service's doorbell watch on the
+    /// channel's submission ring: if its `tail` still holds `value`, the
+    /// client's next doorbell (or its end going) makes `ipc_receive`
+    /// return `Event::Doorbell`. One-shot; EAGAIN if the tail moved, EPIPE
+    /// once the client is gone. (The service announced the sleep in the
+    /// ring first: `ring::Consumer::prepare_sleep`.)
+    pub const CHAN_WATCH: u64 = 1073;
+    /// (insn, fixup): a fault of this program's instruction at `insn` (its
+    /// copy routine on granted memory, `copy::copy`) that cannot be
+    /// resolved resumes at `fixup` instead of killing it. Once per program.
+    pub const SET_COPY_FIXUP: u64 = 1074;
+    /// (channel, grant, first page, count, &addresses): the device
+    /// addresses of `count` (at most 512) pages of a grant, stored as u64s;
+    /// `GRANT_DMA` for a range.
+    pub const GRANT_DMA_PAGES: u64 = 1075;
 }
 
 /// `ipc_register` flag: the service accepts channel offers.
@@ -146,11 +161,17 @@ pub enum Event {
     Control(u64, usize),
     /// Device interrupts fired; the bit mask of the lines.
     Interrupt(u16),
+    /// A doorbell the service watches rang (`chan_watch`): which one is for
+    /// the service to find out (it polls its rings).
+    Doorbell,
     /// The timeout ran out.
     Timeout,
 }
 
 pub const ETIMEDOUT: i64 = 110;
+pub const EAGAIN: i64 = 11;
+/// `ipc_receive`'s result (with request id 0) for a doorbell.
+const DOORBELL: i64 = 1 << 16;
 
 /// Waits for the next request or device interrupt, at most `timeout_ms`
 /// milliseconds (None: forever).
@@ -161,6 +182,7 @@ pub fn ipc_receive(buf: &mut [u8], timeout_ms: Option<u64>) -> Result<Event, i64
     match r {
         r if r == -ETIMEDOUT => Ok(Event::Timeout),
         r if r < 0 => Err(r),
+        DOORBELL if id == 0 => Ok(Event::Doorbell),
         r if id == 0 => Ok(Event::Interrupt(r as u16)),
         r if id & IPC_CONTROL != 0 => Ok(Event::Control(id, r as usize)),
         r => Ok(Event::Request(id, r as usize)),
@@ -236,6 +258,73 @@ pub fn grant_dma(channel: u64, grant: u32, offset: u64) -> Result<u64, i64> {
 
 pub fn grant_dma_unmap(channel: u64, grant: u32) -> Result<(), i64> {
     result(syscall(sys::GRANT_DMA_UNMAP, [channel, grant as u64, 0, 0, 0, 0])).map(|_| ())
+}
+
+/// The device addresses of the pages `first..first + out.len()` of grant
+/// `grant` (at most 512 at once).
+pub fn grant_dma_pages(channel: u64, grant: u32, first: u64, out: &mut [u64]) -> Result<(), i64> {
+    result(syscall(sys::GRANT_DMA_PAGES, [channel, grant as u64, first, out.len() as u64, out.as_mut_ptr() as u64, 0])).map(|_| ())
+}
+
+/// Arms the doorbell watch of `channel` if its submission `tail` still
+/// holds `value`: Ok(true) when armed, Ok(false) when the tail moved (do
+/// not sleep: there is work).
+pub fn chan_watch(channel: u64, value: u32) -> Result<bool, i64> {
+    match syscall(sys::CHAN_WATCH, [channel, value as u64, 0, 0, 0, 0]) {
+        0 => Ok(true),
+        e if e == -EAGAIN => Ok(false),
+        e => Err(e),
+    }
+}
+
+/// Copies to and from granted memory that a revoke may take away at any
+/// moment (docs/design/io-rings.md, "The service's contract for grant
+/// memory"): a fault of the copy is resolved by the kernel resuming at the
+/// fixup (`sys::SET_COPY_FIXUP`), and the copy fails instead of the
+/// service.
+pub mod copy {
+    use super::{syscall, sys};
+
+    unsafe extern "C" {
+        static oxrt_copy_insn: u8;
+        static oxrt_copy_fixup: u8;
+    }
+
+    /// Copies `len` bytes; returns how many were not copied (0: all).
+    #[unsafe(naked)]
+    unsafe extern "C" fn copy_bytes(dst: *mut u8, src: *const u8, len: usize) -> usize {
+        core::arch::naked_asm!(
+            "mov rcx, rdx",
+            ".global oxrt_copy_insn",
+            "oxrt_copy_insn:",
+            "rep movsb",
+            "xor eax, eax",
+            "ret",
+            ".global oxrt_copy_fixup",
+            "oxrt_copy_fixup:",
+            "mov rax, rcx",
+            "ret",
+        );
+    }
+
+    /// Tells the kernel where the copy may fault (once, at start).
+    pub fn register() -> Result<(), i64> {
+        let (insn, fixup) = (&raw const oxrt_copy_insn as u64, &raw const oxrt_copy_fixup as u64);
+        match syscall(sys::SET_COPY_FIXUP, [insn, fixup, 0, 0, 0, 0]) {
+            0 => Ok(()),
+            e => Err(e),
+        }
+    }
+
+    /// Copies `len` bytes from `src` to `dst`, either of which may be
+    /// granted memory; false if it faulted (part may have been copied).
+    ///
+    /// # Safety
+    /// Whatever of the two ranges is not granted memory must be valid for
+    /// the access; granted ranges must lie within the grant's mapping.
+    pub unsafe fn copy(dst: *mut u8, src: *const u8, len: usize) -> bool {
+        unsafe { copy_bytes(dst, src, len) == 0 }
+    }
 }
 
 /// mprotect(2).

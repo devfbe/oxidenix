@@ -142,6 +142,9 @@ rings are read and write. The positions start at 0.
 | `grant_map(channel, id, &info) -> addr` (1070) | maps a grant: read-only unless granted writable (`mprotect` cannot add write or execute), not inherited by `fork`, not movable by `mremap`; `info` gets (pages, writable) |
 | `grant_dma(channel, id, offset) -> device address` (1071) | of the byte at `offset` (`EINVAL` beyond the grant), valid to the end of its page |
 | `grant_dma_unmap(channel, id)` (1072) | the service's devices are done with the grant |
+| `chan_watch(channel, value)` (1073) | arms the service's doorbell watch on the submission ring: if its `tail` still holds `value` (else `EAGAIN`), the client's next doorbell or its end going makes `ipc_receive` return `Event::Doorbell` (step 3) |
+| `set_copy_fixup(insn, fixup)` (1074) | a fault of the program's copy instruction on granted memory resumes at `fixup` instead of killing it (`oxrt::copy`, step 3) |
+| `grant_dma_pages(channel, id, first, count, &out)` (1075) | `grant_dma` for up to 512 pages in one call (step 3) |
 
 **Attach.** The Linux server has no IPC of its own (only the kernel is an IPC client), so the
 kernel carries the offer: `chan_connect` sends the service a control request, typed by its id
@@ -154,7 +157,13 @@ fatal one always) gives the offer up, and a later `chan_attach` fails.
 
 **Doorbells.** The ring words are futex words. The service's futex on its shared mapping and
 the server's `server_futex_wait` on its region mapping are both keyed by the channel's memory
-object and the offset, so they meet.
+object and the offset, so they meet. A service whose event loop waits for several things at
+once (IPC requests, offers, several channels: diskfs) sleeps in `ipc_receive` instead: it
+announces the sleep in each ring (`Consumer::prepare_sleep`, invariant 4) and arms a watch on
+each submission `tail` (`chan_watch`), a one-shot waiter in the futex bucket that a wake turns
+into a pending doorbell of the service's server and a wakeup of its `ipc_receive`. The watch
+compares the word under the bucket lock like a wait, so no wakeup is lost; one per word and
+process (arming it twice keeps one), gone with the wake or the channel's hang-up.
 
 **Pinning.** A grant takes each page's frame with a reference of its own and a pin count in
 the object's page cache: a pinned page stays the object's page (a truncation over it fails with
@@ -212,7 +221,10 @@ request (as the Linux server's copies into program memory do, `set_usercopy`), o
 runs CPU copies only on grants whose requests the client has not completed. A well-behaved
 client revokes only after the requests on a grant completed, so the fault path only meets a
 broken or hostile client; the service must survive it and fail the request (`EIO`/`EFAULT`),
-nothing more. (servers/ringtest touches grants directly: its client is the test.)
+nothing more. (servers/ringtest touches grants directly: its client is the test.) The fault
+handler is `set_copy_fixup`: a service registers its copy instruction (`oxrt::copy`, one `rep
+movsb`), and a page fault there that the kernel cannot resolve resumes at the fixup, which
+reports the copy as failed, as the Linux server's `set_usercopy` does for program memory.
 
 **Tests.** `lxtest` has the Linux server run seven scenarios (`TEST_CHANNEL`) against
 `servers/ringtest`, a service started in test mode only (`ring::selftest`): rings and doorbells

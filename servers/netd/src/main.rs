@@ -160,7 +160,8 @@ fn main(args: Vec<&'static str>) -> i32 {
             Ok(oxrt::Event::Control(id, _)) => {
                 let _ = oxrt::ipc_reply(id, &(-95i64).to_le_bytes());
             }
-            Ok(oxrt::Event::Timeout) | Err(_) => {}
+            // Watches no doorbells: none ring.
+            Ok(oxrt::Event::Timeout | oxrt::Event::Doorbell) | Err(_) => {}
         }
     }
 }

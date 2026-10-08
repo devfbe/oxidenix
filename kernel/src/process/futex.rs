@@ -18,6 +18,12 @@
 //! gone): waits on it fail with EPIPE, checked under the bucket lock, and
 //! `wake_object` wakes every waiter on it, so none sleeps on after.
 //!
+//! Besides tasks, a bucket holds doorbell watches (`object_watch`): a
+//! service's event loop sleeps in `ipc_receive`, not on one word, so a
+//! wake of a watched word marks the service's doorbell pending and wakes
+//! its `ipc_receive` instead of a task. A watch is one-shot, compares the
+//! word like a wait, and goes with the wake (or the object's hang-up).
+//!
 //! Waiters sit in hashed buckets. A waiter compares the futex word under
 //! its bucket lock and enqueues itself before releasing it; a waker changes
 //! the word in user space first and then takes the same lock, so a wakeup
@@ -30,7 +36,7 @@ use super::errno::*;
 use crate::fs::cache::PageCache;
 use super::sched::{current, current_arc, prepare_to_sleep, try_wake};
 use super::task::{State, Task};
-use super::{signal, uaccess};
+use super::{signal, uaccess, Pid, Server};
 use crate::sync::IrqSpinLock;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -64,8 +70,34 @@ struct Key {
 
 struct Waiter {
     key: Key,
-    task: Arc<Task>,
+    sleeper: Sleeper,
     bitset: u32,
+}
+
+enum Sleeper {
+    Task(Arc<Task>),
+    /// A doorbell watch of the server's process `Pid` (`object_watch`).
+    Watch(Arc<Server>, Pid),
+}
+
+impl Waiter {
+    fn is_task(&self, t: &Task) -> bool {
+        matches!(&self.sleeper, Sleeper::Task(w) if core::ptr::eq(&**w, t))
+    }
+
+    /// Wakes the task, or rings the watching service's doorbell.
+    fn wake(self) {
+        match self.sleeper {
+            Sleeper::Task(task) => {
+                task.futex_woken.store(true, Ordering::Release);
+                try_wake(&task, State::Sleeping);
+            }
+            Sleeper::Watch(server, pid) => {
+                server.doorbell.store(true, Ordering::Release);
+                super::wakeup(super::irq::server_chan(pid));
+            }
+        }
+    }
 }
 
 const BUCKETS: usize = 256;
@@ -159,7 +191,7 @@ fn wait_on(
                 b.try_reserve(1).map_err(|_| ENOMEM)?;
                 me.futex_woken.store(false, Ordering::Relaxed);
                 me.futex_bucket.store(index, Ordering::Relaxed);
-                b.push(Waiter { key, task: current_arc(), bitset });
+                b.push(Waiter { key, sleeper: Sleeper::Task(current_arc()), bitset });
                 break wait;
             }
             None => {
@@ -209,7 +241,7 @@ fn unqueue(me: &Task) -> bool {
         if me.futex_woken.load(Ordering::Acquire) {
             return false;
         }
-        if let Some(i) = b.iter().position(|w| core::ptr::eq(&*w.task, me)) {
+        if let Some(i) = b.iter().position(|w| w.is_task(me)) {
             b.swap_remove(i);
             return true;
         }
@@ -223,9 +255,7 @@ fn wake_in(b: &mut Vec<Waiter>, key: &Key, n: u64, bitset: u32) -> u64 {
     let mut i = 0;
     while i < b.len() && woken < n {
         if b[i].key == *key && b[i].bitset & bitset != 0 {
-            let w = b.remove(i);
-            w.task.futex_woken.store(true, Ordering::Release);
-            try_wake(&w.task, State::Sleeping);
+            b.remove(i).wake();
             woken += 1;
         } else {
             i += 1;
@@ -288,7 +318,9 @@ fn requeue(uaddr: u64, n_wake: u64, n_move: u64, uaddr2: u64, cmp: Option<u32>, 
                 None => i += 1,
                 Some(d) => {
                     let w = src.remove(i);
-                    w.task.futex_bucket.store(i2, Ordering::Release);
+                    if let Sleeper::Task(task) = &w.sleeper {
+                        task.futex_bucket.store(i2, Ordering::Release);
+                    }
                     d.push(w);
                 }
             }
@@ -324,6 +356,37 @@ pub fn object_wait(
     wait_on(key, || Some(word.load(Ordering::SeqCst)), || Ok(()), hung_up, val, deadline, FUTEX_BITSET_MATCH_ANY, interruptible)
 }
 
+/// Arms a doorbell watch of the server `server`'s process `pid` on the
+/// word at `offset` of `object` (read through `word`, the object's page,
+/// which the caller keeps), if it holds `val`: the next wake of the word
+/// (or the object's hang-up) sets `server.doorbell` and wakes the process's
+/// `ipc_receive`. EAGAIN if the word holds another value, EPIPE if the
+/// object was hung up. A watch that process armed on the word before is
+/// kept, not doubled: a service cannot pile them up.
+pub fn object_watch(
+    object: &Arc<PageCache>,
+    offset: u64,
+    word: &core::sync::atomic::AtomicU32,
+    val: u32,
+    server: Arc<Server>,
+    pid: Pid,
+) -> Result<i64, i64> {
+    let key = Key { base: Base::Shared(Arc::as_ptr(object) as usize), offset };
+    let mut b = BUCKETS_[bucket_of(&key)].lock();
+    if object.is_hung_up() {
+        return Err(EPIPE);
+    }
+    if word.load(Ordering::SeqCst) != val {
+        return Err(EAGAIN);
+    }
+    let armed = |w: &Waiter| w.key == key && matches!(&w.sleeper, Sleeper::Watch(s, p) if Arc::ptr_eq(s, &server) && *p == pid);
+    if !b.iter().any(armed) {
+        b.try_reserve(1).map_err(|_| ENOMEM)?;
+        b.push(Waiter { key, sleeper: Sleeper::Watch(server, pid), bitset: FUTEX_BITSET_MATCH_ANY });
+    }
+    Ok(0)
+}
+
 /// Wakes up to `n` waiters on the word at `offset` of `object`.
 pub fn object_wake(object: &PageCache, offset: u64, n: u64) -> i64 {
     let key = Key { base: Base::Shared(object as *const PageCache as usize), offset };
@@ -339,9 +402,7 @@ pub fn wake_object(object: &PageCache) {
         let mut i = 0;
         while i < b.len() {
             if b[i].key.base == base {
-                let w = b.swap_remove(i);
-                w.task.futex_woken.store(true, Ordering::Release);
-                try_wake(&w.task, State::Sleeping);
+                b.swap_remove(i).wake();
             } else {
                 i += 1;
             }

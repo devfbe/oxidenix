@@ -634,7 +634,11 @@ moved memory, time, pipes, eventfd, paths and the root tmpfs into the server.
   IOMMU). `revoke` removes the service's mappings at once; a grant a device may still reach
   stays pinned until the service lets go of it. When either end goes, every grant is taken
   back, the other end's sleepers wake (futex waits on the channel fail with `EPIPE`) and its
-  `state` word says which end is gone. `servers/ringtest` is the test service.
+  `state` word says which end is gone. `servers/ringtest` is the test service. A service
+  whose event loop sleeps in `ipc_receive` arms doorbell watches on its submission rings
+  (`chan_watch`: a client's doorbell becomes an `ipc_receive` event), its CPU copies into
+  grants survive a revoke (`set_copy_fixup`: the fault fails the copy, not the service), and
+  `grant_dma_pages` hands out the device addresses of a page range in one call.
 - Programs can ask their server for test calls (1500 and up, `lxtest`) that exercise this
   interface on the calling process.
 
