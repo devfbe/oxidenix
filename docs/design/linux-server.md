@@ -213,7 +213,7 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
        instance has its own copy (a process tree is a container); pages of a program two
        trees run are not shared between them.
      - **c3**: the server as the client of diskfs and procfs, with its page cache and
-       write-back.
+       write-back, over shared-memory rings with granted buffers (`io-rings.md`, ADR 0005).
    - **R6d — The terminal** (ADR 0004): the console as a device of the server, the line
      discipline and job control's terminal side in the server.
    - **R6e — The descriptor table, `poll`, `select` and `epoll`** move with the sockets (R7),
