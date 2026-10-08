@@ -164,7 +164,7 @@ fn cmd_mem() {
         after.heap_used / 1024,
         (after.heap_used + after.heap_free) / 1024
     );
-    let ok = |b: bool| if b { "ok" } else { "FEHLER" };
+    let ok = |b: bool| if b { "ok" } else { "FAIL" };
     crate::printkln!(
         "Test: heap alloc {} (peak {} KiB), heap free {}, frame reuse {}, frames balanced {}",
         ok(heap_ok),

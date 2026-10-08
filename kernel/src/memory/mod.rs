@@ -24,15 +24,45 @@ const HEAP_GROW_STEP: u64 = 1024 * 1024;
 const PAGE: u64 = 4096;
 
 /// Kernel heap that grows by mapping more frames when an allocation fails,
-/// so it is bounded by physical memory instead of a fixed size.
+/// so it is bounded by physical memory instead of a fixed size. Objects of
+/// up to 2 KiB come from slabs of size classes (`slab`: O(1), a lock per
+/// class), whose pages the heap supplies; larger ones from the heap itself
+/// (first fit, one lock).
 struct GrowingHeap(IrqSpinLock<Heap>);
 
 #[global_allocator]
 static HEAP: GrowingHeap = GrowingHeap(IrqSpinLock::new(Heap::empty()));
 
+/// Free slots of each size class.
+static SLABS: [IrqSpinLock<slab::FreeList>; slab::CLASSES] = [const { IrqSpinLock::new(slab::FreeList::new()) }; slab::CLASSES];
+
 unsafe impl GlobalAlloc for GrowingHeap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         crate::counters::HEAP_ALLOCS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let Some(c) = slab::class(&layout) else { return self.alloc_large(layout) };
+        if let Some(p) = SLABS[c].lock().pop() {
+            return p.as_ptr();
+        }
+        // A new slab for the class (no lock held meanwhile: the heap may
+        // grow, and another CPU may fill the list first; both are fine).
+        let Some(page) = NonNull::new(self.alloc_large(slab::slab_layout())) else { return null_mut() };
+        let mut list = SLABS[c].lock();
+        unsafe { list.add_slab(page, c) };
+        list.pop().map_or(null_mut(), |p| p.as_ptr())
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        let ptr = unsafe { NonNull::new_unchecked(ptr) };
+        match slab::class(&layout) {
+            Some(c) => unsafe { SLABS[c].lock().push(ptr) },
+            None => unsafe { self.0.lock().deallocate(ptr, layout) },
+        }
+    }
+}
+
+impl GrowingHeap {
+    /// From the heap itself, growing it as needed.
+    fn alloc_large(&self, layout: Layout) -> *mut u8 {
         loop {
             if let Ok(p) = self.0.lock().allocate_first_fit(layout) {
                 return p.as_ptr();
@@ -43,12 +73,6 @@ unsafe impl GlobalAlloc for GrowingHeap {
         }
     }
 
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { self.0.lock().deallocate(NonNull::new_unchecked(ptr), layout) };
-    }
-}
-
-impl GrowingHeap {
     fn grow(&self, layout: Layout) -> bool {
         let Some(want) = (layout.size() as u64)
             .checked_add(layout.align() as u64)
@@ -321,11 +345,13 @@ pub fn stats() -> Stats {
         .lock()
         .as_ref()
         .map_or((0, 0), |f| (f.total_frames, f.used_frames));
+    // Free slab slots are free memory, though the heap counts their slabs.
+    let slack: usize = (0..slab::CLASSES).map(|c| SLABS[c].lock().len() * slab::class_size(c)).sum();
     let heap = HEAP.0.lock();
     Stats {
         total_frames,
         used_frames,
-        heap_used: heap.used(),
-        heap_free: heap.free(),
+        heap_used: heap.used() - slack,
+        heap_free: heap.free() + slack,
     }
 }

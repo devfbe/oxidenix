@@ -1,5 +1,8 @@
 //! The server's heap: one allocator for every thread of the instance, in
-//! the shared region, growing by `SYS_SHARED_MAP` when it runs out.
+//! the shared region, growing by `SYS_SHARED_MAP` when it runs out. Objects
+//! of up to 2 KiB come from slabs of size classes (`slab`: O(1), a mutex
+//! per class), whose pages the heap supplies; larger ones from the heap
+//! itself (first fit).
 
 use crate::sync::Mutex;
 use crate::syscall;
@@ -26,8 +29,33 @@ fn more(at_least: usize) -> Option<(usize, usize)> {
     (start > 0).then_some((start as usize, len))
 }
 
+/// Free slots of each size class.
+static SLABS: [Mutex<slab::FreeList>; slab::CLASSES] = [const { Mutex::new(slab::FreeList::new()) }; slab::CLASSES];
+
 unsafe impl GlobalAlloc for ServerHeap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let Some(c) = slab::class(&layout) else { return self.alloc_large(layout) };
+        if let Some(p) = SLABS[c].lock().pop() {
+            return p.as_ptr();
+        }
+        let Some(page) = NonNull::new(self.alloc_large(slab::slab_layout())) else { return null_mut() };
+        let mut list = SLABS[c].lock();
+        unsafe { list.add_slab(page, c) };
+        list.pop().map_or(null_mut(), |p| p.as_ptr())
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        let ptr = unsafe { NonNull::new_unchecked(ptr) };
+        match slab::class(&layout) {
+            Some(c) => unsafe { SLABS[c].lock().push(ptr) },
+            None => unsafe { self.0.lock().0.deallocate(ptr, layout) },
+        }
+    }
+}
+
+impl ServerHeap {
+    /// From the heap itself, growing it as needed.
+    fn alloc_large(&self, layout: Layout) -> *mut u8 {
         let mut guard = self.0.lock();
         let (heap, started) = &mut *guard;
         loop {
@@ -53,7 +81,4 @@ unsafe impl GlobalAlloc for ServerHeap {
         }
     }
 
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { self.0.lock().0.deallocate(NonNull::new_unchecked(ptr), layout) };
-    }
 }

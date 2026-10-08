@@ -262,7 +262,7 @@ dependencies = [
  "futures-core",
  "futures-task",
  "pin-project-lite",
- "slab",
+ "slab 0.4.12",
 ]
 
 [[package]]
@@ -354,6 +354,7 @@ version = "0.1.0"
 dependencies = [
  "linked_list_allocator",
  "restricted",
+ "slab 0.1.0",
  "vfs",
 ]
 
@@ -474,6 +475,7 @@ dependencies = [
  "png",
  "procproto",
  "restricted",
+ "slab 0.1.0",
  "spin",
  "x86_64 0.15.5",
 ]
@@ -648,6 +650,10 @@ name = "simd-adler32"
 version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
+
+[[package]]
+name = "slab"
+version = "0.1.0"
 
 [[package]]
 name = "slab"
