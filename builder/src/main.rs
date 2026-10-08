@@ -76,15 +76,25 @@ fn main() {
     write_cpio(&rootfs, &mut cpio).expect("Failed to write cpio");
     drop(cpio);
 
-    // OXIDENIX_DISK=<path>: another data disk (the benchmarks use a fresh one).
+    // The data disk: OXIDENIX_DISK=<path> (created if missing; the
+    // benchmarks use a fresh one); in test mode a fresh small one of its own
+    // on every run (target/test-disk.img), so the tests (which fill the disk
+    // to the last block) neither touch the persistent disk.img nor depend on
+    // what earlier runs left; else the persistent disk.img.
+    let self_tests = std::env::var_os("OXIDENIX_TEST").is_some() && autorun.is_none() && !bench_mode;
     let data_disk = match std::env::var_os("OXIDENIX_DISK") {
         Some(path) => PathBuf::from(path),
+        None if self_tests => Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/test-disk.img"),
         None => Path::new(env!("CARGO_MANIFEST_DIR")).join("../disk.img"),
     };
-    if !data_disk.exists() {
+    if self_tests && std::env::var_os("OXIDENIX_DISK").is_none() {
+        let _ = fs::remove_file(&data_disk);
+        println!("Creating the test disk {}...", data_disk.display());
+        create_data_disk(&data_disk, TEST_DISK_BYTES).expect("Failed to create the test disk");
+    } else if !data_disk.exists() {
         println!("Creating persistent ext2 disk {}...", data_disk.display());
-        create_data_disk(&data_disk).expect("Failed to create the data disk");
-    } else if fs::metadata(&data_disk).is_ok_and(|m| m.len() < DATA_DISK_BYTES) {
+        create_data_disk(&data_disk, DATA_DISK_BYTES).expect("Failed to create the data disk");
+    } else if std::env::var_os("OXIDENIX_DISK").is_none() && fs::metadata(&data_disk).is_ok_and(|m| m.len() < DATA_DISK_BYTES) {
         println!(
             "note: {} is smaller than the {} GiB a new data disk has; delete it to get a new one",
             data_disk.display(),
@@ -258,19 +268,22 @@ fn build_rootfs(root: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// The size of a new data disk.
+/// The size of a new persistent data disk.
 const DATA_DISK_BYTES: u64 = 2 << 30;
+/// The size of the self-tests' disk: small, so that filling it is quick.
+const TEST_DISK_BYTES: u64 = 64 << 20;
 
-/// A 2 GiB ext2 filesystem (1 KiB blocks, 128-byte inodes, no extensions the
-/// kernel does not implement), pre-filled from userspace/disk. The image is a
-/// sparse file: only the blocks mke2fs writes take space on the host.
-fn create_data_disk(path: &Path) -> io::Result<()> {
+/// An ext2 filesystem of `bytes` (1 KiB blocks, 128-byte inodes, no
+/// extensions the kernel does not implement), pre-filled from userspace/disk.
+/// The image is a sparse file: only the blocks mke2fs writes take space on
+/// the host.
+fn create_data_disk(path: &Path, bytes: u64) -> io::Result<()> {
     let content = Path::new(env!("CARGO_MANIFEST_DIR")).join("../userspace/disk");
     let mkfs = format!(
         "unset SOURCE_DATE_EPOCH; mke2fs -q -t ext2 -b 1024 -I 128 -O none,filetype,sparse_super,large_file -L oxidenix -d '{}' -F '{}' {}",
         content.display(),
         path.display(),
-        DATA_DISK_BYTES / 1024
+        bytes / 1024
     );
     let status = Command::new("nix-shell").args(["-p", "e2fsprogs", "--run", &mkfs]).status()?;
     if !status.success() {

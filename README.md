@@ -119,7 +119,9 @@ pre-filled from `userspace/disk/`; a sparse file, about 20 MB on the host when n
 kept between runs; delete it for a fresh disk. A `disk.img` from before the disk grew from 64 MiB
 to 2 GiB stays 64 MiB (the builder points it out): delete it to get the bigger one.
 Extra arguments after `--` are passed to QEMU; `OXIDENIX_BUILD_ONLY=1 cargo run` only builds the images.
-`OXIDENIX_DISK=<path>` uses another data disk image (created if missing).
+`OXIDENIX_DISK=<path>` uses another data disk image (created if missing). Test mode
+(`OXIDENIX_TEST=1`) never touches `disk.img`: it boots with a fresh 64 MiB disk of its own,
+`target/test-disk.img`, made anew on every run.
 
 `OXIDENIX_NODE=1 cargo run` also puts Node.js on the data disk as `/data/bin/node`: a fully
 static musl build (`userspace/node/default.nix`, no npm; its header says which of Node's checks
@@ -964,8 +966,10 @@ Everything runs as root. Unknown syscalls print a kernel message and return `ENO
 
 `OXIDENIX_TEST=1 cargo run` (in `kernel/`) boots straight into `/etc/runtests.sh`, which runs
 every self-test below. The kernel mirrors its console to the serial port and powers off when
-the script ends; QEMU's exit status is 1 if everything passed and 3 otherwise. GitHub Actions
-does exactly this on every push (without a display), then checks the ext2 image with `e2fsck`.
+the script ends; QEMU's exit status is 1 if everything passed and 3 otherwise. The tests run on
+a fresh 64 MiB data disk of their own (`target/test-disk.img`, made anew on every run; the
+full-disk tests fill it to the last block), never on the persistent `disk.img`. GitHub Actions
+does exactly this on every push (without a display), then checks the test disk with `e2fsck`.
 
 Each of these programs and scripts lives in the root filesystem and runs inside oxidenix:
 
@@ -999,7 +1003,7 @@ Each of these programs and scripts lives in the root filesystem and runs inside 
 | `sh /etc/test.sh` | files, pipes, `cd`, `mkdir`/`touch`/`rm`, rename cycles via symlinks, the tmpfs size limit |
 | `fstest` | descriptor access modes (`EBADF` on read-only/write-only fds), `O_NOFOLLOW` on symlinks, unlinked-but-open files (kept until closed, never shared with new files), ext2 size limits, overflowing `mmap` offsets; `preadv2`/`pwritev2` and their flags (also in `lxtest` on `/tmp`): the offset -1 as the file position, a positional write to an `O_APPEND` descriptor appending as on Linux, `RWF_APPEND`/`RWF_NOAPPEND`, `EOPNOTSUPP`/`EINVAL` for unsupported or contradicting flags, `ESPIPE` on pipes (`userspace/rwtest.h`) |
 | `sh /etc/disktest.sh` | ext2: 150-file directory, 1.5 MiB file (double indirect), append, truncate, rename, cycles, symlinks, `rm -r`, space accounting |
-| `e2fsck -fn disk.img` (host) | the filesystem written by oxidenix is consistent |
+| `e2fsck -fn target/test-disk.img` (host, after a test run) | the filesystem the tests wrote is consistent |
 | `cargo test -p ext2fs` (host, needs e2fsprogs) | ext2 on a RAM disk that counts requests and can fail writes: 4 MiB read in about one device read per 32 KiB request, two flushes per write (data, then metadata), nothing written by reads, blocks moving between directories and files, a file larger than the block cache, corrupt block pointers (`EIO`, no crash), every write of a commit failing in turn (retried, nothing lost), failed data writes never exposing a deleted file's blocks; the ring path: writes into reserved blocks read back through both paths, extents clipped at the end with holes, reserved blocks out of every bitmap and inode until linked (`e2fsck` clean meanwhile, other allocations never take them), `sync` flushing the data before the metadata, `ENOENT` for inodes not in use; crashes: every write and flush of IPC and ring operations replayed up to a crash in each flush epoch, with arbitrary losses of what came after the last flush and a two-block metadata cache evicting all the time, never showing a deleted file's data in a file, directory or symlink; blocks freed before a failed commit not reused (ring or IPC) until a commit succeeds; freed inodes refusing reads, writes, truncation, permission changes (`ENOENT`); superblocks whose group or inode sizes do not fit a block refused at mount; blocks in flight for a promise counted once (the rest of the disk stays promisable, also after the promise ends); freed blocks kept as ranges (unit test); `e2fsck` after each |
 | `cargo test -p fsring` (host) | the file protocol: every request survives encode and decode, `ENOSYS` for unknown operations, `EINVAL` for any field an operation does not use, transfers, names and targets bounded (`EINVAL`, `ENAMETOOLONG`), names without `/` or NUL, completions, stat, usage and directory entries round-trip |
 | `timeout 1 sleep 5` | `vfork` and `SIGTERM` after the time limit (exit status 143) |
