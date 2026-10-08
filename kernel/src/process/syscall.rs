@@ -285,7 +285,7 @@ pub(super) fn dispatch_linux(f: &mut Frame) {
         59 => execve(f, a0, a1, a2),
         60 => super::exit_thread(((a0 & 0xff) << 8) as i32),
         231 => super::exit_group(((a0 & 0xff) << 8) as i32),
-        61 => super::wait4(a0 as i64, a1, a2),
+        61 => super::wait4(a0 as i64, a1, a2, a3),
         62 => signal::kill(a0 as i64, a1),
         63 => uname(a0),
         72 => sys_file::fcntl(a0, a1, a2),

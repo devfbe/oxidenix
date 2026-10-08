@@ -222,16 +222,24 @@ pub fn getrusage(who: u64, usage: u64) -> SysResult {
             (info.cputime(), info.mem.as_ref().map_or(0, |m| m.peak_pages.load(core::sync::atomic::Ordering::Relaxed)))
         }
         RUSAGE_THREAD => (me.cputime(), 0),
-        RUSAGE_CHILDREN => (me.group.info.lock().children_time, 0),
+        RUSAGE_CHILDREN => {
+            let info = me.group.info.lock();
+            (info.children_time, info.children_peak)
+        }
         _ => return Err(EINVAL),
     };
+    write_rusage(usage, (user, system), pages)?;
+    Ok(0)
+}
+
+/// Writes a struct rusage: CPU time (user, system) in nanoseconds and the
+/// most pages resident (ru_maxrss, in KiB); the other fields are zero.
+pub fn write_rusage(addr: u64, (user, system): (u64, u64), peak_pages: u64) -> Result<(), i64> {
     let mut out = [0u64; 18];
     out[..2].copy_from_slice(&timeval(user));
     out[2..4].copy_from_slice(&timeval(system));
-    // ru_maxrss, in KiB.
-    out[4] = pages * 4;
-    uaccess::write(usage, out)?;
-    Ok(0)
+    out[4] = peak_pages * 4;
+    uaccess::write(addr, out)
 }
 
 /// times(buf): CPU times in clock ticks; returns the ticks since boot.

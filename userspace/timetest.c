@@ -180,6 +180,30 @@ int main(void) {
     check("times() counts the reaped child", after.tms_cutime + after.tms_cstime >= hz / 10);
     check("getrusage(RUSAGE_CHILDREN) counts it", getrusage(RUSAGE_CHILDREN, &ru) == 0 && tv_us(ru.ru_utime) + tv_us(ru.ru_stime) >= 120000);
 
+    /* wait4's rusage: the reaped child's own CPU time and peak memory (what
+     * busybox's time reports; it read zeros), with its reaped children. */
+    child = fork();
+    if (child == 0) {
+        pid_t grandchild = fork();
+        if (grandchild == 0) {
+            spin_ms(100);
+            _exit(0);
+        }
+        waitpid(grandchild, NULL, 0);
+        static char touched[4 << 20];
+        memset(touched, 1, sizeof touched);
+        spin_ms(100);
+        _exit(0);
+    }
+    struct rusage cu;
+    memset(&cu, 0, sizeof cu);
+    int st = -1;
+    pid_t got = wait4(child, &st, 0, &cu);
+    int64_t child_us = tv_us(cu.ru_utime) + tv_us(cu.ru_stime);
+    printf("    (wait4: %lld us of CPU, maxrss %ld KiB)\n", (long long)child_us, cu.ru_maxrss);
+    check("wait4's rusage has the child's and its children's CPU time", got == child && WIFEXITED(st) && child_us >= 160000 && child_us < 5000000);
+    check("... and its peak memory (4 MiB touched)", cu.ru_maxrss >= 4096);
+
     printf("timetest: %s\n", failures ? "FAILED" : "all passed");
     return failures != 0;
 }
