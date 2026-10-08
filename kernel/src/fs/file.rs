@@ -97,6 +97,11 @@ impl ServerFile {
         Arc::new(ServerFile { id, owner, ready: AtomicU32::new(ready as u16 as u32), always })
     }
 
+    /// Whether `owner` (an instance of the Linux server) made this file.
+    pub fn owned_by(&self, owner: *const ()) -> bool {
+        self.owner.as_ptr() as *const () == owner
+    }
+
     /// The server's readiness report: wakes who polls the file.
     pub fn set_ready(&self, ready: i16) {
         self.ready.store(ready as u16 as u32, Ordering::Release);

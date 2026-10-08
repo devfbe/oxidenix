@@ -769,6 +769,11 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
         SYS_KFD_LOOKUP => {
             let file = with_current(|p| p.file(a[0]))?;
             let crate::fs::file::Kind::Server(s) = &file.kind else { return Ok(0) };
+            // Another instance's file (a descriptor that crossed trees)
+            // must never be taken for one of this instance's ids.
+            if !s.owned_by(Arc::as_ptr(&instance) as *const ()) {
+                return Err(EBADF);
+            }
             if a[1] != 0 {
                 let flags = file.flags.load(core::sync::atomic::Ordering::Relaxed);
                 super::uaccess::copy_to_server(a[1], &flags.to_le_bytes())?;

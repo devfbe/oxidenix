@@ -276,7 +276,8 @@ pub const TEST_USERCOPY: u64 = 1511;
 pub const SYS_KFD_INSTALL: u64 = 1034;
 pub const KFD_ALWAYS_READY: u64 = 1;
 /// `kfd_lookup(fd, flags) -> id`: the server's file behind descriptor
-/// `fd` (0: a file of the kernel's; EBADF), its current open flags stored
+/// `fd` (0: a file of the kernel's; EBADF, also for another instance's
+/// file), its current open flags stored
 /// at `flags` (a u32 in the server's memory) unless 0.
 pub const SYS_KFD_LOOKUP: u64 = 1035;
 /// `kfd_ready(id, ready)`: the readiness of the server's file `id` for
