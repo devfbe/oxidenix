@@ -407,7 +407,7 @@ int main(void) {
     if (d) closedir(d);
     check("readdir of a /tmp directory", names == 2);
     errno = 0;
-    check("rename between the server's tmpfs and the kernel's /data is EXDEV", rename("/tmp/lxfile", "/data/lxfile") == -1 && errno == EXDEV);
+    check("rename between the server's tmpfs and /data is EXDEV", rename("/tmp/lxfile", "/data/lxfile") == -1 && errno == EXDEV);
     errno = 0;
     check("removing the mount point /proc is EBUSY", rmdir("/proc") == -1 && errno == EBUSY);
     check("the root and its programs are the server's tmpfs (from the initramfs)",
@@ -470,8 +470,8 @@ int main(void) {
         if (r != 0) printf("    (scenario 9: check %d failed)\n", errno);
         check("diskfs ring: they complete once the client makes room", r == 0);
     }
-    /* What the ring wrote (and flushed), read through the kernel's /data
-     * (diskfs's IPC protocol): byte i is i % 251. */
+    /* What the ring wrote (and flushed), read through /data (the server's
+     * page cache, over its own channel): byte i is i % 251. */
     {
         int fd = open("/data/ringtest.bin", O_RDONLY);
         static unsigned char ring_buf[70000];
@@ -479,8 +479,8 @@ int main(void) {
         int same = n == (ssize_t)sizeof ring_buf;
         for (ssize_t i = 0; same && i < n; i++) same = ring_buf[i] == (unsigned char)(i % 251);
         if (fd >= 0) close(fd);
-        check("diskfs ring: a ring write read through the kernel's /data", same);
-        check("diskfs ring: its file removed through the kernel", unlink("/data/ringtest.bin") == 0);
+        check("diskfs ring: a ring write read through /data", same);
+        check("diskfs ring: its file removed through /data", unlink("/data/ringtest.bin") == 0);
     }
     printf("lxtest: %s\n", failures ? "FAILED" : "all passed");
     return failures != 0;

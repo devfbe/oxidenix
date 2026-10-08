@@ -51,7 +51,7 @@ pub fn handle(s: &State) -> Option<i64> {
         SYS_MUNMAP => munmap(a0, a1),
         SYS_MPROTECT => mprotect(a0, a1, a2),
         SYS_MREMAP => crate::syscall(SYS_VM_REMAP, [a0, a1, a2, a3, a4, 0]),
-        SYS_MSYNC => crate::syscall(SYS_VM_SYNC, [a0, a1, a2, 0, 0, 0]),
+        SYS_MSYNC => msync(a0, a1, a2),
         SYS_MADVISE => madvise(a0, a1, a2),
         // Nothing is ever swapped out.
         SYS_MLOCK..=SYS_MUNLOCKALL | SYS_MLOCK2 => 0,
@@ -145,6 +145,30 @@ fn mprotect(addr: u64, len: u64, prot: u64) -> i64 {
         return -ENOMEM;
     }
     crate::syscall(SYS_MO_PROTECT, [addr, len, prot, 0, 0, 0])
+}
+
+/// msync: the kernel checks the range and writes back its own files; the
+/// /data files mapped shared in it are written back here (MS_SYNC).
+fn msync(addr: u64, len: u64, flags: u64) -> i64 {
+    // (key, first page, end page) of each /data file in the range.
+    let mut found = [[0u64; 3]; 16];
+    let n = crate::syscall(SYS_VM_SYNC, [addr, len, flags, found.as_mut_ptr() as u64, found.len() as u64, 0]);
+    if n <= 0 {
+        return n;
+    }
+    let mut result = 0;
+    for &[key, first, end] in found.iter().take(n as usize) {
+        if let Err(e) = crate::datafs::msync(key, first, end) {
+            result = -e;
+        }
+    }
+    // More mappings than fit: the rest written back with everything else.
+    if n as usize > found.len() {
+        if let Err(e) = crate::datafs::sync_all() {
+            result = -e;
+        }
+    }
+    result
 }
 
 /// DONTNEED and FREE drop private pages; other advice is accepted.

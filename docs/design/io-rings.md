@@ -252,7 +252,7 @@ answers the offer only after it served the channel.
 | `READ` / `WRITE` | inode, file offset, a grant range (at most 1 MiB; `READ` needs a writable grant) | bytes (a read is short at the end of the file), v0 = file size |
 | `FLUSH` | - | 0: every write completed before it is durable |
 | `STAT`, `STATFS` | inode / - | 0, the values packed in v0..v3 (`fsring::Stat`, `Usage`) |
-| `LOOKUP`, `CREATE`, `UNLINK`, `RENAME` | directory, names in a grant (a symlink's target or the new name right after the first name) | v0 = the inode found or made, or the one whose last link went |
+| `LOOKUP`, `CREATE`, `UNLINK`, `RENAME` | directory, names in a grant (a symlink's target or the new name right after the first name) | v0 = the inode found or made (v1 = its mode), or the one whose last link went |
 | `TRUNCATE`, `SETPERM` | inode and the new size / permissions | 0 |
 | `RELEASE` | inode | 0: the client holds it no more (see "Holds" below) |
 | `READDIR`, `READLINK` | a result buffer in a writable grant (`READDIR` with a cursor) | bytes, v0 = the next cursor |
@@ -266,7 +266,8 @@ diskfs `EFAULT` (`set_copy_fixup`).
 **Ordering and durability.** Reads and writes run concurrently (at most 32 in flight in
 diskfs, the device reordering them); a write waits for writes in flight on the same blocks.
 Everything else is a barrier: it starts when every request taken before it (any channel)
-completed. A completed `WRITE` is visible to every later request, also through the kernel's
+completed (except a `FORGET` of a grant no request in flight uses, which completes at once: the
+client sends one after every fill and write-back of its page cache). A completed `WRITE` is visible to every later request, also through the kernel's
 IPC path, and durable after a `FLUSH`: write-back. diskfs reserves the blocks of a write in
 memory (in no bitmap or inode), writes the data by DMA, then links them; a `FLUSH` (and any
 commit) flushes the device before metadata reaches it and again after, so a crash never
@@ -348,16 +349,41 @@ pages and dirty marks the kernel keeps and whose data the server moves:
 
 ## Paths built on it
 
-- **Files on `/data` (R6c.3)**: the Linux server's page cache holds paged objects, one per open
-  file, whose pager is the server. A miss: the pager thread grants the missing page (and the
-  read-ahead window) and submits `Read(ino, offset)`; diskfs maps file blocks and has the
-  virtio queue DMA into the pages; the completion makes the pages present (`mo_supply` without
-  data: the page already holds it). Writes dirty pages in the cache; write-back submits `Write`
-  descriptors over granted dirty pages in batches, and `fsync` waits for their completions and
-  a `Flush`. Durability per `write(2)` (audit finding 8) ends: as Linux, only `fsync`/`O_SYNC`
-  wait for the device.
-- **Metadata** (lookup, create, unlink, rename, stat, readdir) goes through the same ring with
-  a small buffer for names and results; it is not hot enough to need more.
+- **Files on `/data` (R6c.3, done: step 4)**: `servers/linux/src/datafs.rs` over
+  `fsclient.rs`; open files in `datafile.rs`. The server's page cache holds one cached object per
+  file it uses (shared by its descriptors, mappings and programs; see "The page cache's kernel
+  interface"). A miss in `read(2)` (`MO_NOFILL`: the kernel reports it) is filled by the reading
+  thread itself, a fault's by the pager thread (`EVENT_PAGE`): a run of missing pages from the
+  window is granted and read by diskfs straight into them (DMA), then declared filled; the
+  window starts at 64 KiB and doubles to 1 MiB (one `READ`) while the file is read in order.
+  `write(2)` copies into cache pages (filling first a page whose data it does not cover) and
+  marks them dirty; write-back grants runs of dirty pages and sends `WRITE`s from them (up to
+  16 MiB pinned per write-back, many requests in flight), `fsync`/`fdatasync`/`msync`/`sync`,
+  `O_SYNC`, `O_DSYNC` and `RWF_(D)SYNC` wait for them and a `FLUSH`. The pager writes a file
+  back five seconds after it got dirty (`EVENT_DIRTY`, `EVENT_TIMER`), everything when the
+  kernel asks (`EVENT_WRITEBACK`) and when the instance ends (`EVENT_CLOSING`). Durability per
+  `write(2)` (audit finding 8) ended: as on Linux, only those calls wait for the device.
+  `O_DIRECT` reads write their range back, then read from the disk into the scratch buffer.
+  Every fill and write-back sends `FORGET` before it revokes its grant (no drain; diskfs runs a
+  `FORGET` of an idle grant at once, without a barrier).
+- **The ring client** (`fsclient.rs`): one channel per instance shared by every thread. A
+  request in flight has one of `SLOTS` slots (its tag names it), so neither ring ever overflows;
+  one waiting thread at a time takes completions and hands them to their slots, waking their
+  owners, and hands the job over when its own request completed. A thread holding slots never
+  waits for another (`run` completes its oldest first), so slots always come free. Completions
+  whose tag or operation does not match a slot in flight are dropped; every status and value is
+  checked before use (a READ's bytes, a READDIR's entries, a READLINK's length). A dying diskfs
+  fails the requests in flight with `EIO`; the next request connects a new channel (diskfs is
+  started again), the inodes in use are named again to hold them (an unlinked one is stale:
+  `EIO`), dirty pages whose write failed are written on the new channel, and a write that
+  completed but was not flushed before diskfs died makes the next `fsync` of its file report
+  `EIO`.
+- **Metadata** (lookup, create, unlink, rename, stat, readdir, readlink) goes through the same
+  ring with names and results in a scratch buffer granted once (64 pages, mapped into the
+  server's region). The server holds every inode it uses (`DInode`, one per inode number) and
+  `RELEASE`s it when it lets go: an unlinked one once nothing uses it (its blocks are free when
+  `unlink` or the last `close` returns), the least recently used beyond 512 cached ones. A
+  release never overtakes a lookup of the same inode (a reader-writer lock orders them).
 - **Sockets (R7)**: per socket a receive and a send buffer, granted to netd; TCP segments are
   copied once (NIC buffer ↔ socket buffer), as Linux does without zero-copy sockets.
 
@@ -387,8 +413,8 @@ one channel released still working for another that holds it, freed when that on
 it or goes; a write stalled behind an overlapping one while another channel's long reads keep
 the operation slots busy; requests waiting for room in their completion ring with diskfs using
 no CPU meanwhile (its ticks in `/proc` over 500 ms), all completing once the client makes room.
-The file the second scenario leaves is read through the kernel's `/data` (the IPC protocol)
-and removed there. ringtest's `CHECK_GONE` checks the reservation a revoke leaves (`EACCES`
+The file the second scenario leaves is read through `/data` (the server's page cache, over its
+own channel) and removed there. ringtest's `CHECK_GONE` checks the reservation a revoke leaves (`EACCES`
 for `mprotect`, `ENOMEM` once the service unmapped it).
 
 ## Steps

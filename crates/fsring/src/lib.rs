@@ -18,8 +18,8 @@
 //! | `WRITE` | `object` inode, `offset`, buffer | bytes written (all of them), v0 = file size |
 //! | `FLUSH` | - | 0 once every write completed before it is durable |
 //! | `STAT` | `object` inode | 0, `Stat` in v0..v3 |
-//! | `LOOKUP` | `object` directory, buffer = name | v0 = inode |
-//! | `CREATE` | `object` directory, buffer = name, `arg` = [kind, permissions, target length]; a symlink's target follows the name in the grant | v0 = new inode |
+//! | `LOOKUP` | `object` directory, buffer = name | v0 = inode, v1 = its mode |
+//! | `CREATE` | `object` directory, buffer = name, `arg` = [kind, permissions, target length]; a symlink's target follows the name in the grant | v0 = new inode, v1 = its mode |
 //! | `UNLINK` | `object` directory, buffer = name, `arg[0]` = 1 for a directory | v0 = inode whose last link went (0: none) |
 //! | `RENAME` | `object` old directory, buffer = old name, `arg` = [new directory, new name length]; the new name follows the old one | as `UNLINK` (an entry replaced) |
 //! | `TRUNCATE` | `object` inode, `offset` = new size | 0 |
@@ -34,7 +34,8 @@
 //! order (the device reorders them); a write waits only for writes in
 //! flight on the same blocks of the same file. Every other operation is a
 //! barrier: it starts once every request taken before it (on any channel)
-//! completed, and none taken after it starts before it completed.
+//! completed, and none taken after it starts before it completed; except
+//! `FORGET` of a grant no request in flight uses, which completes at once.
 //!
 //! **Durability.** A completed `WRITE` is visible to every later request
 //! (on any channel, and to the kernel's IPC clients); it is durable only

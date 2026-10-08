@@ -27,7 +27,9 @@
 //! one of its blocks, while scratch memory is short, or while every
 //! operation slot is taken; it was taken before every barrier waiting, so
 //! it is retried whatever waits, and if it must go through ext2fs's own
-//! write it goes in front of them.
+//! write it goes in front of them. A `FORGET` of a grant no operation
+//! uses (the client sends it once the requests on the grant completed)
+//! runs at once, without stopping anything: it touches no file.
 //!
 //! **Holds.** diskfs keeps, per channel and for the kernel's IPC client, a
 //! bit per inode the client holds (`fsring`, "Holds"): an inode whose last
@@ -311,6 +313,8 @@ struct Op {
     chan: usize,
     tag: u64,
     op: u16,
+    /// The grant it moves data from or to.
+    grant: u32,
     /// The device requests of the current stage, how many were submitted,
     /// how many are still in flight; a write's data requests wait in
     /// `later` while the sectors it keeps are read.
@@ -746,6 +750,18 @@ impl Service {
             }
         };
         self.hold_named(c, &request);
+        // A grant no operation uses is let go at once: no barrier (the
+        // client sends FORGET after the requests on it completed).
+        if let Request::Forget { grant } = request {
+            let busy = self.ops.iter().flatten().any(|op| op.chan == c && op.grant == grant)
+                || self.chan(c).stalled.is_some_and(|s| s.grant == grant)
+                || self.barriers.iter().any(|&(bc, ref b)| bc == c && b.grant == grant);
+            if !busy {
+                self.forget(c, grant);
+                self.complete(c, d.tag, d.op, 0, [0; 4]);
+                return true;
+            }
+        }
         if !request.is_data() {
             // Taken fresh: nothing else waits (taking stops while one does).
             self.barriers.push_back((c, d));
@@ -855,8 +871,8 @@ impl Service {
 
     // ---------------------------------------------------- reads and writes
 
-    fn op(&self, c: usize, work: Work, reqs: Vec<DevReq>, later: Vec<DevReq>) -> Start {
-        Start::Running(Op { chan: c, tag: 0, op: 0, reqs, next: 0, outstanding: 0, later, error: None, work })
+    fn op(&self, c: usize, grant: u32, work: Work, reqs: Vec<DevReq>, later: Vec<DevReq>) -> Start {
+        Start::Running(Op { chan: c, tag: 0, op: 0, grant, reqs, next: 0, outstanding: 0, later, error: None, work })
     }
 
     fn start_read(&mut self, fs: &mut Fs, c: usize, ino: u32, offset: u64, buf: Buf) -> Result<Start, i64> {
@@ -889,7 +905,7 @@ impl Service {
             at += e.len;
             bytes += e.len;
         }
-        Ok(self.op(c, Work::Read { bytes, size }, reqs, Vec::new()))
+        Ok(self.op(c, buf.grant, Work::Read { bytes, size }, reqs, Vec::new()))
     }
 
     fn start_write(&mut self, fs: &mut Fs, c: usize, ino: u32, offset: u64, buf: Buf) -> Result<Start, i64> {
@@ -971,7 +987,7 @@ impl Service {
             (b, _) => b,
         };
         let work = Work::Write { ino, blocks, reservation, end, len, bounce };
-        Ok(if reads.is_empty() { self.op(c, work, writes, Vec::new()) } else { self.op(c, work, reads, writes) })
+        Ok(if reads.is_empty() { self.op(c, buf.grant, work, writes, Vec::new()) } else { self.op(c, buf.grant, work, reads, writes) })
     }
 
     /// Cuts the device range from byte `start` (sector-aligned), made of
@@ -1085,7 +1101,8 @@ impl Service {
             Request::Lookup { dir, name } => {
                 fs.check(dir)?;
                 let name = self.name(c, &name)?;
-                Ok((0, [fs.lookup(dir, &name)? as u64, 0, 0, 0]))
+                let ino = fs.lookup(dir, &name)?;
+                Ok((0, [ino as u64, fs.stat(ino)?.mode as u64, 0, 0]))
             }
             Request::Create { dir, name, kind, perm } => {
                 Self::live_dir(fs, dir)?;
@@ -1099,7 +1116,8 @@ impl Service {
                         NewNode::Symlink(String::from(fsring::check_target(&bytes)?))
                     }
                 };
-                Ok((0, [fs.create(dir, &name, &node, perm)? as u64, 0, 0, 0]))
+                let ino = fs.create(dir, &name, &node, perm)?;
+                Ok((0, [ino as u64, fs.stat(ino)?.mode as u64, 0, 0]))
             }
             Request::Unlink { dir, name, is_dir } => {
                 fs.check(dir)?;

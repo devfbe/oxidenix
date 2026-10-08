@@ -1158,27 +1158,35 @@ impl PageCache {
         Ok((start, frames))
     }
 
-    /// The pager's answer for `count` pages from `first` it filled
-    /// (`pin_fill`): with `ok` they hold the file's data now, else they go
-    /// (whoever waits for them gets EIO, a later access asks again). Pages
-    /// of the range that are not pending are left alone. Wakes the
-    /// waiters.
+    /// The pager's answer for `count` pages from `first` (at most
+    /// `MAX_RUN`) it filled (`pin_fill`): with `ok` they hold the file's
+    /// data now, else the pending ones go and the missing ones fail too
+    /// (whoever waits for them gets EIO, a later access asks again; so a
+    /// pager that cannot even start a fill answers). Present pages are
+    /// left alone. Wakes the waiters.
     pub fn filled(&self, first: u64, count: u64, ok: bool) -> Result<(), i64> {
         let Store::Cached { pager, .. } = &self.store else { return Err(EINVAL) };
-        first.checked_add(count).ok_or(EINVAL)?;
+        if count > MAX_RUN {
+            return Err(EINVAL);
+        }
+        let end = first.checked_add(count).ok_or(EINVAL)?;
         let mut gone = Vec::new();
         {
             let mut st = self.state.lock();
-            let indices: Vec<u64> = st.pages.range(first..first + count).filter(|(_, p)| p.pending).map(|(&i, _)| i).collect();
-            for index in indices {
-                if ok {
-                    if let Some(page) = st.pages.get_mut(&index) {
-                        page.pending = false;
+            let st = &mut *st;
+            for index in first..end {
+                match st.pages.get_mut(&index) {
+                    Some(page) if page.pending && ok => page.pending = false,
+                    Some(page) if page.pending => {
+                        // A pin keeps its own reference (`unpin`).
+                        gone.push(page.frame);
+                        st.pages.remove(&index);
+                        st.failed.insert(index);
                     }
-                } else if let Some(page) = st.pages.remove(&index) {
-                    // A pin keeps its own reference (`unpin`).
-                    gone.push(page.frame);
-                    st.failed.insert(index);
+                    None if !ok => {
+                        st.failed.insert(index);
+                    }
+                    _ => {}
                 }
             }
             st.charged -= gone.len() as u64;

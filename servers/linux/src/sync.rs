@@ -69,3 +69,100 @@ impl<T> Drop for MutexGuard<'_, T> {
         }
     }
 }
+
+/// A reader-writer lock without data: any number of readers or one writer.
+/// Its state is a `Mutex`'s (readers, writer, writers waiting); a waiter
+/// sleeps on `changed`, which every unlock that may let someone in
+/// advances (read under the state lock before sleeping, so no wakeup is
+/// lost). Once a writer waits, new readers wait too.
+pub struct RwLock {
+    state: Mutex<RwState>,
+    changed: AtomicU32,
+}
+
+struct RwState {
+    readers: u32,
+    writer: bool,
+    writers_waiting: u32,
+}
+
+impl RwLock {
+    pub const fn new() -> Self {
+        RwLock { state: Mutex::new(RwState { readers: 0, writer: false, writers_waiting: 0 }), changed: AtomicU32::new(0) }
+    }
+
+    pub fn read(&self) -> ReadGuard<'_> {
+        loop {
+            let seen = {
+                let mut st = self.state.lock();
+                if !st.writer && st.writers_waiting == 0 {
+                    st.readers += 1;
+                    return ReadGuard { lock: self };
+                }
+                self.changed.load(Ordering::Acquire)
+            };
+            self.sleep(seen);
+        }
+    }
+
+    pub fn write(&self) -> WriteGuard<'_> {
+        let mut waiting = false;
+        loop {
+            let seen = {
+                let mut st = self.state.lock();
+                if !st.writer && st.readers == 0 {
+                    st.writer = true;
+                    if waiting {
+                        st.writers_waiting -= 1;
+                    }
+                    return WriteGuard { lock: self };
+                }
+                if !waiting {
+                    st.writers_waiting += 1;
+                    waiting = true;
+                }
+                self.changed.load(Ordering::Acquire)
+            };
+            self.sleep(seen);
+        }
+    }
+
+    fn sleep(&self, seen: u32) {
+        let addr = &self.changed as *const AtomicU32 as u64;
+        syscall(SYS_SERVER_FUTEX_WAIT, [addr, seen as u64, 0, 0, 0, 0]);
+    }
+
+    fn advance(&self) {
+        self.changed.fetch_add(1, Ordering::Release);
+        let addr = &self.changed as *const AtomicU32 as u64;
+        syscall(SYS_SERVER_FUTEX_WAKE, [addr, u32::MAX as u64, 0, 0, 0, 0]);
+    }
+}
+
+pub struct ReadGuard<'a> {
+    lock: &'a RwLock,
+}
+
+impl Drop for ReadGuard<'_> {
+    fn drop(&mut self) {
+        let wake = {
+            let mut st = self.lock.state.lock();
+            st.readers -= 1;
+            st.readers == 0 && st.writers_waiting > 0
+        };
+        if wake {
+            self.lock.advance();
+        }
+    }
+}
+
+pub struct WriteGuard<'a> {
+    lock: &'a RwLock,
+}
+
+impl Drop for WriteGuard<'_> {
+    fn drop(&mut self) {
+        self.lock.state.lock().writer = false;
+        self.lock.advance();
+    }
+}

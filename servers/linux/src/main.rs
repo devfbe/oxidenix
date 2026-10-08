@@ -13,9 +13,12 @@
 extern crate alloc;
 
 mod chantest;
+mod datafile;
+mod datafs;
 mod disktest;
 mod eventfd;
 mod files;
+mod fsclient;
 mod heap;
 mod initramfs;
 mod mm;
@@ -74,6 +77,9 @@ pub extern "C" fn _start(state: *mut State, role: u64) -> ! {
         let s = unsafe { &mut *state };
         if let Some(result) = mm::handle(s).or_else(|| time::handle(s)).or_else(|| files::handle(s)).or_else(|| paths::handle(s)) {
             s.rax = result as u64;
+            // /data inodes the call let go of go now, before it returns
+            // (an unlink's blocks are free when it returns).
+            datafs::reap();
             continue;
         }
         match s.rax {
@@ -87,6 +93,7 @@ pub extern "C" fn _start(state: *mut State, role: u64) -> ! {
                 for &id in closed.iter().take(n.max(0) as usize) {
                     files::closed(id);
                 }
+                datafs::reap();
             }
         }
     }
@@ -110,30 +117,63 @@ static TEST_FAIL_OBJECT: AtomicU64 = AtomicU64::new(0);
 static FAILED_ONCE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// The instance's service thread (the pager thread): supplies the pages
-/// threads wait for, drops the server's files whose last descriptor went,
-/// and takes back the records and holds the kernel released. (So far the only paged objects are the tests'; page n of the
-/// first reads "paged n".)
+/// threads wait for (/data's from the disk, `datafs`; the tests' paged
+/// objects: page n of the first reads "paged n"), writes /data's dirty
+/// files back (when they have been dirty a while, when the kernel asks,
+/// when the instance ends), drops the server's files whose last
+/// descriptor went, and takes back the records and holds the kernel
+/// released.
 fn pager() -> ! {
     loop {
+        datafs::reap();
         let mut event = Event::default();
-        if syscall(SYS_EVENT_WAIT, [&mut event as *mut Event as u64, 0, 0, 0, 0, 0]) < 0 {
+        let deadline = datafs::next_deadline();
+        if syscall(SYS_EVENT_WAIT, [&mut event as *mut Event as u64, deadline, 0, 0, 0, 0]) < 0 {
             continue;
         }
-        if event.kind == EVENT_CLOSED {
-            files::closed(event.a);
-            continue;
-        }
-        if event.kind == EVENT_RELEASE {
-            // Bit 0 tells a tmpfs file's hold from a record.
-            if event.a & 1 == 1 {
-                tmpfs::released(event.a);
-            } else {
-                records::released(event.a);
+        match event.kind {
+            EVENT_CLOSED => {
+                files::closed(event.a);
+                continue;
             }
-            tmpfs::release_handled();
-            continue;
+            EVENT_RELEASE => {
+                // Bit 0 tells a tmpfs file's hold, bit 1 a /data file's, from
+                // a record.
+                if event.a & 1 == 1 {
+                    tmpfs::released(event.a);
+                } else if event.a & datafs::HOLD_TAG != 0 {
+                    datafs::released(event.a);
+                } else {
+                    records::released(event.a);
+                }
+                tmpfs::release_handled();
+                continue;
+            }
+            EVENT_DIRTY => {
+                datafs::dirtied(event.a);
+                continue;
+            }
+            EVENT_TIMER => {
+                datafs::write_dirty(false);
+                continue;
+            }
+            EVENT_WRITEBACK => {
+                // Memory is short of clean pages: everything dirty goes.
+                datafs::write_dirty(true);
+                continue;
+            }
+            EVENT_CLOSING => {
+                datafs::closing();
+                continue;
+            }
+            _ => {}
         }
         let request = PagerRequest { key: event.a, offset: event.b };
+        if request.key >= datafs::KEY_BASE {
+            // A /data file's page.
+            datafs::page(request.key, request.offset);
+            continue;
+        }
         if request.key == TEST_KEY + 2 {
             let handle = TEST_FAIL_OBJECT.load(Ordering::Acquire);
             if !FAILED_ONCE.swap(true, Ordering::Relaxed) {

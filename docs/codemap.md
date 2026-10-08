@@ -18,7 +18,7 @@ module comment, and the public types it defines. Where to start for common tasks
 - `kernel/src/drivers/rtc.rs` (43) CMOS real-time clock: read once at boot; wall-clock time afterwards is kept by `time` (the boot time plus the monotonic clock).
 - `kernel/src/drivers/serial.rs` (52) COM1 serial port (output only).
 - `kernel/src/drivers/tty.rs` (297) Terminal line discipline for the console: a termios subset with canonical line editing, echo and raw mode. Types: `Termios`.
-- `kernel/src/fs/cache.rs` (1193) The page cache: the pages of a regular file in physical frames, shared by `read`, `write` and every mapping of the file (see docs/design/page-cache.md). Types: `Pager`, `Fill`, `PageCache`.
+- `kernel/src/fs/cache.rs` (1200) The page cache: the pages of a regular file in physical frames, shared by `read`, `write` and every mapping of the file (see docs/design/page-cache.md). Types: `Pager`, `Fill`, `PageCache`.
 - `kernel/src/fs/cpio.rs` (53) Unpacks a cpio archive in "newc" format into the VFS.
 - `kernel/src/fs/file.rs` (467) Open files: `OpenFile` (an open file description with offset and flags) over inodes, pipes, eventfds, devices and files whose calls a server implements (`ServerFile`). Types: `Pipe`, `EventFd`, `ServerFiles`, `ServerFile`, `Kind`, `OpenFile`.
 - `kernel/src/fs/mod.rs` (567) In-memory filesystem (tmpfs-like), populated from the initramfs at boot. Types: `Device`, `Node`, `DiskRef`, `InodeStat`, `NewNode`, `Inode`, `WriteAccess`, `MappedFile`, `DenyWrite`.
@@ -73,16 +73,16 @@ module comment, and the public types it defines. Where to start for common tasks
 - `servers/linux/src/chantest.rs` (309) `TEST_CHANNEL`: the client's side of channels to the test service (servers/ringtest, protocol `ring::selftest`), as the page cache will use them with diskfs: create, connect, grant, move descriptors through the rings...
 - `servers/linux/src/disktest.rs` (528) `TEST_DISKRING`: the client's side of the file protocol (`fsring`) against diskfs, as the page cache will use it in step 4: a channel to diskfs, grants of memory objects, files on /data read and written by DMA into...
 - `servers/linux/src/eventfd.rs` (98) eventfd (phase R6b): a counter that reads take and writes add to, a file of the server with a placeholder in the kernel's descriptor table. Types: `EventFd`.
-- `servers/linux/src/files.rs` (299) The server's files (phase R6): objects the server implements, each named in the kernel's descriptor table by a placeholder (see `restricted::SYS_KFD_INSTALL`). Types: `File`.
+- `servers/linux/src/files.rs` (325) The server's files (phase R6): objects the server implements, each named in the kernel's descriptor table by a placeholder (see `restricted::SYS_KFD_INSTALL`). Types: `File`.
 - `servers/linux/src/heap.rs` (60) The server's heap: one allocator for every thread of the instance, in the shared region, growing by `SYS_SHARED_MAP` when it runs out. Types: `ServerHeap`.
 - `servers/linux/src/initramfs.rs` (65) The instance's root tmpfs from the boot image's initramfs (phase R6c.2c): the server reads the archive's headers and names from the kernel's image object (`SYS_INITRAMFS`) and makes each regular file a file object...
-- `servers/linux/src/main.rs` (236) The Linux server (docs/design/linux-server.md).
-- `servers/linux/src/mm.rs` (131) Memory system calls (phase R4): Linux's semantics of mmap, munmap, mprotect, mremap, madvise, msync and the mlock family, over the kernel's mapping calls.
-- `servers/linux/src/namespace.rs` (219) The server's namespace (phase R6c.2): mounts and path resolution. Types: `KInode`, `Node`, `Resolved`.
-- `servers/linux/src/paths.rs` (316) The system calls that take a path (phase R6c.2b), and the working directory and umask, which live in the caller's record (`records`).
+- `servers/linux/src/main.rs` (268) The Linux server (docs/design/linux-server.md).
+- `servers/linux/src/mm.rs` (150) Memory system calls (phase R4): Linux's semantics of mmap, munmap, mprotect, mremap, madvise, msync and the mlock family, over the kernel's mapping calls.
+- `servers/linux/src/namespace.rs` (244) The server's namespace (phase R6c.2): mounts and path resolution. Types: `KInode`, `Node`, `Resolved`.
+- `servers/linux/src/paths.rs` (347) The system calls that take a path (phase R6c.2b), and the working directory and umask, which live in the caller's record (`records`).
 - `servers/linux/src/pipe.rs` (236) Pipes (phase R6a): a 64 KiB buffer shared by a read end and a write end, each a file of the server with a placeholder in the kernel's descriptor table. Types: `Dst`, `Src`, `Shared`, `PipeEnd`.
 - `servers/linux/src/records.rs` (75) Records per working-directory context: the cwd and umask of the processes that share them (phase R6c). Types: `FsState`, `FsContext`.
-- `servers/linux/src/sync.rs` (47) A mutex for the server's data, shared by every thread of the instance (all the tree's processes run the server in the same shared region). Types: `Mutex`, `MutexGuard`.
+- `servers/linux/src/sync.rs` (128) A mutex for the server's data, shared by every thread of the instance (all the tree's processes run the server in the same shared region). Types: `Mutex`, `MutexGuard`, `RwLock`, `ReadGuard`, `WriteGuard`.
 - `servers/linux/src/time.rs` (102) Clocks and sleeping (phase R5): clock_gettime, clock_getres, gettimeofday, time, nanosleep, clock_nanosleep and sched_yield, over the kernel's clock and deadline sleep.
 - `servers/linux/src/tmpfile.rs` (239) Open files of the server's tmpfs (phase R6c.2c): a placeholder in the kernel's descriptor table names one (an open file description: offset, directory snapshot, write access); the calls on it are the server's. Types: `TmpOpen`.
 - `servers/linux/src/tmpfs.rs` (380) The server's tmpfs (phase R6c.2c): directories, files and symlinks in the server's memory; a file's contents are a file object of the kernel's (`SYS_MO_CREATE_FILE`), read, written and mapped without the kernel's... Types: `Object`, `Kind`, `State`, `Inode`.
@@ -92,7 +92,7 @@ module comment, and the public types it defines. Where to start for common tasks
 
 - `servers/diskfs/src/blk.rs` (268) virtio-blk driver on the shared virtio transport (crates/virtio). Types: `Kind`, `SubmitError`, `VirtioBlk`.
 - `servers/diskfs/src/main.rs` (186) diskfs: the ext2 filesystem server.
-- `servers/diskfs/src/service.rs` (933) The ring service: diskfs's end of the data plane (docs/design/io-rings.md, the file protocol `fsring`). Types: `Service`.
+- `servers/diskfs/src/service.rs` (946) The ring service: diskfs's end of the data plane (docs/design/io-rings.md, the file protocol `fsring`). Types: `Service`.
 - `servers/netd/src/main.rs` (151) netd: the network server.
 - `servers/netd/src/nic.rs` (114) smoltcp's view of the network card, with loopback: frames addressed to this host (its own address or 127.0.0.0/8) never reach the wire but come back as received frames, and ARP requests for those addresses are... Types: `Nic`, `RxToken`, `TxToken`.
 - `servers/netd/src/service.rs` (632) The socket service: `netproto` requests from the kernel mapped onto smoltcp sockets. Types: `Config`, `Service`.
@@ -135,7 +135,7 @@ module comment, and the public types it defines. Where to start for common tasks
 ## User-space programs and tests
 
 - `userspace/build.sh` (32) Builds all userspace/*.c as static musl binaries into $1 (the rootfs's bin directory), adds Bash and BusyBox with its applet symlinks, and the servers/* programs into the sibling sbin directory.
-- `userspace/cachetest.c` (114) The page cache of files on a filesystem server (/data): repeated reads come from memory, writes and truncation stay coherent with cached pages and mappings, programs run from the disk, and cached pages give way when...
+- `userspace/cachetest.c` (115) The page cache of files on a filesystem server (/data): repeated reads come from memory, writes and truncation stay coherent with cached pages and mappings, programs run from the disk, and cached pages give way when...
 - `userspace/cowtest.c` (68) Copy-on-write after fork: parent and child see their own writes to heap and data, brk stays clear of mappings, and shared read-only frames cannot be written.
 - `userspace/epolltest.c` (245) epoll: interest lists with level- and edge-triggered readiness, the event loop interface of libuv and therefore Node.js.
 - `userspace/eventfdtest.c` (76) eventfd: a 64-bit counter as a file, the wakeup primitive of event loops (libuv wakes its loop through one).
@@ -160,7 +160,7 @@ module comment, and the public types it defines. Where to start for common tasks
 - `userspace/timertest.c` (157) High-resolution timers: sleeps and timeouts end when they are due, not at the next 10 ms timer tick, and never early.
 - `userspace/timetest.c` (142) Clocks: nanosecond resolution, monotonic across CPUs, the CPU-time clocks of threads and processes, wall-clock time and its setting, and the accounting behind getrusage and times.
 - `userspace/vmtest.c` (176) Virtual memory: demand paging, protection, remapping, sharing, stacks, commit accounting, and the patterns JIT compilers rely on.
-- `userspace/writebacktest.c` (115) Write-back of shared writable mappings of disk files: stores make pages dirty (Dirty: in /proc/meminfo), msync, fsync and the flusher write them (Dirty: back to 0), also after the mapping is gone; they survive...
+- `userspace/writebacktest.c` (116) Write-back of shared writable mappings of disk files: stores make pages dirty (Dirty: in /proc/meminfo), msync, fsync and the flusher write them (Dirty: back to 0), also after the mapping is gone; they survive...
 
 ## Scripts
 

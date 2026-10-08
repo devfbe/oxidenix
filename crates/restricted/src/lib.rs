@@ -521,9 +521,10 @@ pub const REVOKE_DRAINING: u64 = 1;
 /// memory is short.
 pub const SYS_MO_CREATE_CACHED: u64 = 1076;
 /// `mo_filled(handle, offset, pages, ok)`: the pending pages among `pages`
-/// from `offset` hold the file's data now (`ok` 1), or could not be read
-/// (0: they go, whoever waits for them gets an error, SIGBUS for a
-/// mapping, and a later access asks again). Wakes the waiters.
+/// (at most 256) from `offset` hold the file's data now (`ok` 1), or could
+/// not be read (0: they go, and so do the missing ones: whoever waits for
+/// them gets an error, SIGBUS for a mapping, and a later access asks
+/// again). Wakes the waiters.
 pub const SYS_MO_FILLED: u64 = 1077;
 /// `mo_redirty(handle, offset, pages)`: marks the present pages among
 /// `pages` from `offset` dirty again (their write-back failed).
@@ -545,8 +546,8 @@ pub const TEST_CHANNEL: u64 = 1514;
 /// `(scenario)`: the server runs a scenario of the file protocol
 /// (`fsring`) against diskfs over a channel: 1 reading a file of the disk
 /// image and metadata, 2 writes, a flush and the file read back
-/// (`/data/ringtest.bin` stays for the caller to read through the kernel
-/// and remove), 3 malformed requests, 4 requests in flight, 5 a grant
+/// (`/data/ringtest.bin` stays for the caller to read through /data and
+/// remove), 3 malformed requests, 4 requests in flight, 5 a grant
 /// revoked under diskfs and a client gone with requests in flight, 6 holds
 /// across channels, 7 a stalled write with every operation slot busy, 8
 /// requests left waiting for room in the completion ring (the caller

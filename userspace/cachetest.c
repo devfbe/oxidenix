@@ -72,12 +72,14 @@ int main(int argc, char **argv) {
     snprintf(path, sizeof path, "%s/cachetest.big", dir);
     snprintf(prog, sizeof prog, "%s/cachetest.prog", dir);
 
-    /* (Writes reach the disk synchronously, each followed by a flush.) */
+    /* Writes stay in the page cache (write-back, as on Linux) until fsync
+     * makes them durable; then the pages are clean: reclaim may drop them. */
     int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
     for (long off = 0; off < BIG; off += sizeof buf) {
         for (size_t i = 0; i < sizeof buf; i++) buf[i] = pattern(off + i);
         write(fd, buf, sizeof buf);
     }
+    check("fsync writes the file back", fsync(fd) == 0);
     close(fd);
 
     long took = read_all(path, BIG);

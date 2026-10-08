@@ -1,18 +1,20 @@
 //! The server's namespace (phase R6c.2): mounts and path resolution.
 //!
 //! A mount puts a filesystem at a path: the server's tmpfs (`tmpfs`) at
-//! the root, or a directory of the kernel's tree (/dev, /proc, /sys,
-//! /data), reached through handles on its inodes
-//! (`restricted::SYS_INODE_*`), until the server's own filesystems serve
-//! them. Mounts are found by name, as everything here: ".." is resolved
+//! the root, diskfs's disk at /data (`datafs`, over the rings), or a
+//! directory of the kernel's tree (/dev, /proc, /sys), reached through
+//! handles on its inodes (`restricted::SYS_INODE_*`), until the server's
+//! own filesystems serve them. Mounts are found by name, as everything here: ".." is resolved
 //! lexically before symlinks are looked at (as the kernel's VFS did:
 //! "/a/link/.." is "/a"), so the longest mount whose path begins a
 //! normalized path is the filesystem that path lies in. Each symlink is
 //! read and resolution starts over from the root with its target in front
 //! of the rest (at most 16, else ELOOP). In the kernel's tree one call
 //! walks as many names as it can and stops after a symlink, so a path
-//! without symlinks costs one call; the tmpfs is walked in the server.
+//! without symlinks costs one call; the tmpfs is walked in the server,
+//! /data one `LOOKUP` per name.
 
+use crate::datafs::{self, DInode};
 use crate::sync::Mutex;
 use crate::syscall;
 use crate::tmpfs;
@@ -74,10 +76,11 @@ pub fn mode_of(st: &[u8; 144]) -> u32 {
     u32::from_le_bytes([st[24], st[25], st[26], st[27]])
 }
 
-/// An inode of either filesystem.
+/// An inode of any of the filesystems.
 pub enum Node {
     Kernel(KInode),
     Tmp(Arc<tmpfs::Inode>),
+    Data(Arc<DInode>),
 }
 
 impl Node {
@@ -85,6 +88,7 @@ impl Node {
         match self {
             Node::Kernel(k) => k.stat(),
             Node::Tmp(t) => Ok(t.stat()),
+            Node::Data(d) => datafs::stat(d),
         }
     }
 
@@ -92,6 +96,7 @@ impl Node {
         match self {
             Node::Kernel(k) => k.readlink(),
             Node::Tmp(t) => t.readlink(),
+            Node::Data(d) => datafs::readlink(d),
         }
     }
 }
@@ -101,6 +106,8 @@ enum Fs {
     /// The kernel's tree at this path (names below its root).
     Kernel(Vec<String>),
     Tmpfs(Arc<tmpfs::Inode>),
+    /// diskfs's disk.
+    Data,
 }
 
 struct Mount {
@@ -109,12 +116,14 @@ struct Mount {
 }
 
 /// The directories of the kernel's tree the namespace shows: the devices,
-/// procfs and sysfs, and diskfs's disk, until the server serves them.
-const KERNEL_MOUNTS: [&str; 4] = ["dev", "proc", "sys", "data"];
+/// procfs and sysfs, until the server serves them.
+const KERNEL_MOUNTS: [&str; 3] = ["dev", "proc", "sys"];
+/// Where diskfs's disk is mounted.
+const DATA_MOUNT: &str = "data";
 
 /// The mount table: the instance's own tmpfs at the root, unpacked from
-/// the initramfs when the instance first resolves a path, and the kernel's
-/// directories above.
+/// the initramfs when the instance first resolves a path, /data, and the
+/// kernel's directories above.
 static MOUNTS: Mutex<Vec<Mount>> = Mutex::new(Vec::new());
 
 fn with_mounts<R>(f: impl FnOnce(&Vec<Mount>) -> R) -> R {
@@ -130,6 +139,8 @@ fn with_mounts<R>(f: impl FnOnce(&Vec<Mount>) -> R) -> R {
             let _ = root.subdir(name, 0o755);
             m.push(Mount { at: alloc::vec![String::from(name)], fs: Fs::Kernel(alloc::vec![String::from(name)]) });
         }
+        let _ = root.subdir(DATA_MOUNT, 0o755);
+        m.push(Mount { at: alloc::vec![String::from(DATA_MOUNT)], fs: Fs::Data });
     }
     f(&m)
 }
@@ -146,6 +157,7 @@ fn mount_of(comps: &[String]) -> (Fs, usize) {
         let fs = match &m.fs {
             Fs::Kernel(base) => Fs::Kernel(base.clone()),
             Fs::Tmpfs(root) => Fs::Tmpfs(root.clone()),
+            Fs::Data => Fs::Data,
         };
         (fs, m.at.len())
     })
@@ -179,7 +191,8 @@ pub fn kernel_root() -> u64 {
     }
 }
 
-/// A resolved path: its inode, its mode, and its absolute path as given
+/// A resolved path: its inode, its mode (of a /data inode: its type
+/// only), and its absolute path as given
 /// (normalized, symlinks not replaced: what the descriptor and the working
 /// directory remember).
 pub struct Resolved {
@@ -237,6 +250,25 @@ fn walk_tmpfs(root: &Arc<tmpfs::Inode>, names: &[String], follow: bool) -> Resul
     Ok(Step::Done(Node::Tmp(cur), mode))
 }
 
+/// Walks `names` in /data from its root; `follow`: also at the last name.
+fn walk_data(names: &[String], follow: bool) -> Result<Step, i64> {
+    let mut cur = datafs::root()?;
+    for (i, name) in names.iter().enumerate() {
+        if cur.kind != vfs::S_IFDIR {
+            return Err(ENOTDIR);
+        }
+        let child = datafs::lookup(&cur, name)?;
+        if child.kind == vfs::S_IFLNK && (follow || i + 1 < names.len()) {
+            return Ok(Step::Link(Node::Data(child), i + 1));
+        }
+        cur = child;
+    }
+    // Its type (what resolution's callers look at): no STAT for the
+    // permissions.
+    let mode = cur.kind | 0o777;
+    Ok(Step::Done(Node::Data(cur), mode))
+}
+
 /// Resolves `path` relative to the absolute directory `base`; `follow`:
 /// a symlink as the last name is followed.
 pub fn resolve(base: &str, path: &str, follow: bool) -> Result<Resolved, i64> {
@@ -253,6 +285,7 @@ pub fn resolve(base: &str, path: &str, follow: bool) -> Result<Resolved, i64> {
         let step = match &fs {
             Fs::Kernel(base) => walk_kernel(base, names)?,
             Fs::Tmpfs(root) => walk_tmpfs(root, names, follow)?,
+            Fs::Data => walk_data(names, follow)?,
         };
         let (link, walked) = match step {
             Step::Done(node, mode) => return Ok(Resolved { node, mode, path: given }),

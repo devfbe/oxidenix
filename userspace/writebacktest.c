@@ -54,6 +54,8 @@ static long dirty_kb(void) {
     return meminfo("Dirty:");
 }
 
+/* A file of `pages` pages, page i filled with 'a' + i, written back
+ * (write() leaves dirty pages, as on Linux: fsync writes them). */
 static void make_file(int pages) {
     int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
     char buf[PG];
@@ -61,6 +63,7 @@ static void make_file(int pages) {
         memset(buf, 'a' + i, PG);
         write(fd, buf, PG);
     }
+    fsync(fd);
     close(fd);
 }
 
@@ -70,7 +73,7 @@ int main(int argc, char **argv) {
     if (posix_memalign((void **)&direct_buf, PG, PG) != 0) return 1;
 
     make_file(4);
-    check("O_DIRECT reads what write() put on the disk", on_disk(0) == 'a' && on_disk(3 * PG + 9) == 'd');
+    check("O_DIRECT reads what write() and fsync put on the disk", on_disk(0) == 'a' && on_disk(3 * PG + 9) == 'd');
 
     int fd = open(path, O_RDWR);
     char *m = mmap(NULL, 4 * PG, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
@@ -89,7 +92,7 @@ int main(int argc, char **argv) {
     /* A store and a write() in the same page both arrive. */
     m[10] = 'M';
     pwrite(fd, "W", 1, 20);
-    check("write() goes to the disk at once", on_disk(20) == 'W');
+    check("an O_DIRECT read writes back what write() left first", on_disk(20) == 'W');
     msync(m, PG, MS_SYNC);
     check("... and a store in the same page arrives too", on_disk(10) == 'M' && on_disk(20) == 'W');
 

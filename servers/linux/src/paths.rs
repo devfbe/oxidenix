@@ -2,13 +2,15 @@
 //! directory and umask, which live in the caller's record (`records`).
 //!
 //! Each call resolves its path in the server's namespace (`namespace`) and
-//! acts on the inode it reaches: one of the server's tmpfs, or one of the
-//! kernel's tree through its handle. The semantics are the kernel's VFS's,
+//! acts on the inode it reaches: one of the server's tmpfs, one of /data
+//! (`datafs`), or one of the kernel's tree through its handle. The semantics are the kernel's VFS's,
 //! which they replace: no permission checks (one user), timestamps not
 //! stored, and a descriptor's or the working directory's path is the one
 //! it was opened by (normalized, symlinks not replaced). New: umask(2) is
 //! real.
 
+use crate::datafile;
+use crate::datafs;
 use crate::files;
 use crate::namespace::{check, mode_of, resolve, resolve_parent, KInode, Node, Resolved, EBUSY, ENOENT, ENOTDIR, EXDEV};
 use crate::records;
@@ -80,10 +82,10 @@ pub fn handle(s: &State) -> Option<i64> {
         SYS_NEWFSTATAT => {
             if a3 & AT_EMPTY_PATH != 0 && path_is_empty(a1) {
                 // fstat of the descriptor itself.
-                return match files::tmp_of(a0) {
-                    Some(f) => Some(usercopy::to_program(a2, &f.inode.stat()).map(|_| 0).unwrap_or_else(|e| -e)),
-                    None => None,
-                };
+                if let Some(f) = files::tmp_of(a0) {
+                    return Some(usercopy::to_program(a2, &f.inode.stat()).map(|_| 0).unwrap_or_else(|e| -e));
+                }
+                return files::data_of(a0).map(|f| datafs::stat(&f.inode).and_then(|st| usercopy::to_program(a2, &st)).map(|_| 0).unwrap_or_else(|e| -e));
             }
             fstatat(a0, a1, a2, a3)
         }
@@ -117,7 +119,7 @@ pub fn handle(s: &State) -> Option<i64> {
         SYS_UTIMES => at(CWD, a0, true).map(|_| 0),
         SYS_FUTIMESAT if a1 != 0 => at(a0, a1, true).map(|_| 0),
         SYS_UTIMENSAT if a1 != 0 => at(a0, a1, a3 & AT_SYMLINK_NOFOLLOW == 0).map(|_| 0),
-        SYS_UTIMENSAT | SYS_FUTIMESAT if files::tmp_of(a0).is_some() => Ok(0),
+        SYS_UTIMENSAT | SYS_FUTIMESAT if files::tmp_of(a0).is_some() || files::data_of(a0).is_some() => Ok(0),
         _ => return None,
     };
     Some(result.unwrap_or_else(|e| -e))
@@ -140,6 +142,9 @@ fn base_dir(dirfd: u64, path: &str) -> Result<String, i64> {
 fn fd_node(fd: u64) -> Result<(Node, String), i64> {
     if let Some(f) = files::tmp_of(fd) {
         return Ok((Node::Tmp(f.inode.clone()), f.path.clone()));
+    }
+    if let Some(f) = files::data_of(fd) {
+        return Ok((Node::Data(f.inode.clone()), f.path.clone()));
     }
     if files::is_server_file(fd) {
         return Err(ENOTDIR);
@@ -188,6 +193,10 @@ fn create(dir: &Node, name: &str, kind: u64, perm: u32) -> Result<Node, i64> {
         ))
         .map(Node::Kernel),
         Node::Tmp(d) => d.create(name, kind == NEW_DIR, perm).map(Node::Tmp),
+        Node::Data(d) => {
+            let new = if kind == NEW_DIR { datafs::New::Dir } else { datafs::New::File };
+            datafs::create(d, name, new, perm).map(Node::Data)
+        }
     }
 }
 
@@ -200,8 +209,12 @@ fn exec_target(addr: u64) -> Result<(), i64> {
         Node::Kernel(k) => {
             check(syscall(SYS_EXEC_TARGET, [k.handle(), path.as_ptr() as u64, path.len() as u64, 0, 0, 0]))?;
         }
-        Node::Tmp(t) => {
-            let held = tmpfile::exec_hold(t)?;
+        Node::Tmp(_) | Node::Data(_) => {
+            let held = match &r.node {
+                Node::Tmp(t) => tmpfile::exec_hold(t)?,
+                Node::Data(d) => datafile::exec_hold(d)?,
+                Node::Kernel(_) => unreachable!("matched above"),
+            };
             let set = syscall(SYS_EXEC_TARGET, [held, path.as_ptr() as u64, path.len() as u64, 0, 0, 0]);
             // The target keeps the hold now (or it goes, if refused).
             syscall(SYS_HANDLE_CLOSE, [held, 0, 0, 0, 0, 0]);
@@ -248,6 +261,7 @@ fn openat(dirfd: u64, addr: u64, flags: u32, mode: u32) -> Result<i64, i64> {
     match resolved.node {
         Node::Kernel(k) => check(syscall(SYS_INODE_OPEN, [k.handle(), flags as u64, abs.as_ptr() as u64, abs.len() as u64, 0, 0])),
         Node::Tmp(t) => tmpfile::open(t, flags, abs),
+        Node::Data(d) => datafile::open(d, flags, abs),
     }
 }
 
@@ -295,6 +309,7 @@ fn renameat(odirfd: u64, oaddr: u64, ndirfd: u64, naddr: u64) -> Result<i64, i64
             [o.handle(), oname.as_ptr() as u64, oname.len() as u64, n.handle(), nname.as_ptr() as u64, nname.len() as u64],
         )),
         (Node::Tmp(o), Node::Tmp(n)) => tmpfs::rename(o, &oname, n, &nname).map(|_| 0),
+        (Node::Data(o), Node::Data(n)) => datafs::rename(o, &oname, n, &nname).map(|_| 0),
         _ => Err(EXDEV),
     }
 }
@@ -314,6 +329,7 @@ fn unlinkat(dirfd: u64, addr: u64, flags: u64) -> Result<i64, i64> {
             check(syscall(SYS_INODE_UNLINK, [d.handle(), name.as_ptr() as u64, name.len() as u64, dir_only as u64, 0, 0]))
         }
         Node::Tmp(d) => d.unlink(&name, dir_only).map(|_| 0),
+        Node::Data(d) => datafs::unlink(d, &name, dir_only).map(|_| 0),
     }
 }
 
@@ -326,6 +342,7 @@ fn symlinkat(target: u64, dirfd: u64, addr: u64) -> Result<i64, i64> {
             [d.handle(), name.as_ptr() as u64, name.len() as u64, target.as_ptr() as u64, target.len() as u64, 0],
         )),
         Node::Tmp(d) => d.symlink(&name, target).map(|_| 0),
+        Node::Data(d) => datafs::create(d, &name, datafs::New::Symlink(&target), 0o777).map(|_| 0),
     }
 }
 
@@ -345,6 +362,7 @@ fn chmodat(dirfd: u64, addr: u64, mode: u64) -> Result<i64, i64> {
             t.set_perm(mode as u32);
             Ok(0)
         }
+        Node::Data(d) => datafs::chmod(d, mode as u32).map(|_| 0),
     }
 }
 
@@ -357,6 +375,15 @@ fn truncate(node: &Node, len: u64) -> Result<i64, i64> {
             t.get_write()?;
             let r = check(syscall(SYS_MO_TRUNCATE, [object, len, 0, 0, 0, 0]));
             t.put_write();
+            r
+        }
+        Node::Data(d) => {
+            if d.kind == vfs::S_IFDIR {
+                return Err(datafs::EISDIR);
+            }
+            datafs::get_write(d)?;
+            let r = datafs::truncate(d, len).map(|_| 0);
+            datafs::put_write(d);
             r
         }
     }
@@ -372,6 +399,10 @@ fn statfs(addr: u64, buf: u64) -> Result<i64, i64> {
             Ok(0)
         }
         Node::Tmp(_) => tmpfile::statfs(buf),
+        Node::Data(_) => {
+            usercopy::to_program(buf, &datafs::statfs()?)?;
+            Ok(0)
+        }
     }
 }
 
