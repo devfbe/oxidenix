@@ -121,11 +121,13 @@ struct Page {
     /// Stored to through a shared mapping since it was last written back
     /// (remote store only).
     dirty: bool,
+    /// Grants pinning it (`pin`): while any, the page stays this object's.
+    pins: u32,
 }
 
 impl Page {
     fn new(frame: PhysFrame) -> Page {
-        Page { frame, referenced: true, dirty: false }
+        Page { frame, referenced: true, dirty: false, pins: 0 }
     }
 }
 
@@ -142,9 +144,6 @@ struct State {
     /// Pages of a paged object its pager failed to supply: the waiting
     /// threads get an error once, a later access asks again.
     failed: alloc::collections::BTreeSet<u64>,
-    /// Pinned pages (granted to a channel's service, see `pin`), with
-    /// their pin counts: they stay this object's pages until unpinned.
-    pins: BTreeMap<u64, u32>,
 }
 
 pub struct PageCache {
@@ -223,7 +222,6 @@ impl PageCache {
                 charged: 0,
                 cursor: 0,
                 failed: alloc::collections::BTreeSet::new(),
-                pins: BTreeMap::new(),
             }),
             io: Mutex::new(()),
             store,
@@ -674,7 +672,7 @@ impl PageCache {
             }
             let first_gone = page_of(len + PAGE - 1);
             // A granted page stays the object's until it is revoked.
-            if st.pins.range(first_gone..).next().is_some() {
+            if st.pages.range(first_gone..).any(|(_, p)| p.pins > 0) {
                 return Err(EBUSY);
             }
             if len % PAGE != 0 {
@@ -757,11 +755,24 @@ impl PageCache {
                 Store::Remote { .. } => return Err(EINVAL),
             }
             let mut st = self.state.lock();
-            match st.pages.get(&index) {
+            // Truncated between the check above and the creation: the
+            // page made past the end goes again (no page lives there).
+            if index >= page_of(st.size.saturating_add(PAGE - 1)) {
+                let past = st.pages.remove(&index).filter(|p| p.pins == 0);
+                if let Some(page) = past {
+                    let charged = (index >= self.prepaid()) as u64;
+                    st.charged -= charged;
+                    drop(st);
+                    free_frames([page.frame]);
+                    self.uncharge(charged);
+                }
+                return Err(EINVAL);
+            }
+            match st.pages.get_mut(&index) {
                 Some(page) => {
                     let frame = page.frame;
                     memory::with_frames(|f| f.share(frame));
-                    *st.pins.entry(index).or_insert(0) += 1;
+                    page.pins += 1;
                     return Ok(frame);
                 }
                 None if matches!(self.store, Store::Paged { .. }) => return Err(ENODATA),
@@ -775,12 +786,9 @@ impl PageCache {
     pub fn unpin(&self, index: u64, frame: PhysFrame) {
         {
             let mut st = self.state.lock();
-            match st.pins.get_mut(&index) {
-                Some(n) if *n > 1 => *n -= 1,
-                Some(_) => {
-                    st.pins.remove(&index);
-                }
-                None => debug_assert!(false, "unpinning a page that is not pinned"),
+            match st.pages.get_mut(&index) {
+                Some(page) if page.frame == frame && page.pins > 0 => page.pins -= 1,
+                _ => debug_assert!(false, "unpinning a page that is not pinned"),
             }
         }
         free_frames([frame]);
