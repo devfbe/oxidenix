@@ -206,7 +206,8 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
        serves `/data`, `/proc`, `/sys` and `/dev` until c3 and R6d.
      - **c2c — tmpfs in the server** (done): the server's own tmpfs, with files as file objects
        (read, write, `mmap` and exec without the kernel's VFS; ETXTBSY through holds the kernel
-       reports when let go). First mounted at `/tmp`, with the kernel's tree at the root;
+       reports when let go; a thread about to answer ETXTBSY first waits for the releases
+       reported until then, `SYS_EVENT_RELEASES`). First mounted at `/tmp`, with the kernel's tree at the root;
        then (done) the root became the server's tmpfs, unpacked from the initramfs (an object
        of the boot image, its members file objects over its bytes), and the kernel's tree
        stays mounted for what it still serves (`/dev`, `/proc`, `/sys`, `/data`). Each

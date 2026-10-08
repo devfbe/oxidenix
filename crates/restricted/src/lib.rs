@@ -415,3 +415,9 @@ pub const SYS_INITRAMFS: u64 = 1061;
 /// contents start as `len` bytes of the image at `offset` (no copy until a
 /// page is needed; writes stay the object's).
 pub const SYS_MO_FROM_IMAGE: u64 = 1062;
+/// `event_releases() -> n`: how many `EVENT_RELEASE` events the kernel has
+/// queued for the instance so far. A server thread that finds a hold still
+/// counted (ETXTBSY) waits until its service thread has handled that many,
+/// so that whatever was released before (a program that ended and was
+/// reaped) is no longer counted when it answers.
+pub const SYS_EVENT_RELEASES: u64 = 1063;

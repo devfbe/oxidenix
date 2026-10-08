@@ -110,6 +110,8 @@ pub struct Instance {
 struct PagerQueue {
     requests: alloc::collections::VecDeque<Event>,
     queued: alloc::collections::BTreeSet<(u64, u64)>,
+    /// `EVENT_RELEASE` events queued so far (`SYS_EVENT_RELEASES`).
+    releases: u64,
     /// The tree has no program left: the pager's process ends.
     closing: bool,
     /// The pager's process is gone: no page will come any more.
@@ -172,6 +174,7 @@ impl Instance {
             pager: spin::Mutex::new(PagerQueue {
                 requests: alloc::collections::VecDeque::new(),
                 queued: alloc::collections::BTreeSet::new(),
+                releases: 0,
                 closing: false,
                 dead: false,
             }),
@@ -471,6 +474,9 @@ impl Instance {
         if q.dead || q.closing {
             return;
         }
+        if event.kind == EVENT_RELEASE {
+            q.releases += 1;
+        }
         q.requests.push_back(event);
         drop(q);
         super::wakeup(self.pager_chan());
@@ -754,6 +760,7 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             Ok(instance.insert(Object::Memory(object))? as i64)
         }
         SYS_EVENT_WAIT => event_wait(&instance, a[0]),
+        SYS_EVENT_RELEASES => Ok(instance.pager.lock().releases as i64),
         SYS_KFD_INSTALL => {
             use crate::fs::file::{OpenFile, ServerFile, Kind, O_ACCMODE, O_APPEND, O_CLOEXEC, O_NONBLOCK};
             let (id, flags, ready, kind) = (a[0], a[1] as u32, a[2] as i16, a[3]);

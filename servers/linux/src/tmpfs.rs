@@ -18,7 +18,11 @@
 //! programs running from the file (< 0); the two exclude each other. A
 //! mapping and a running program hold their count through a hold on the
 //! file object (`SYS_MO_HOLD`): the kernel reports when the last holder is
-//! gone (`EVENT_RELEASE` with the hold's word, tagged with bit 0).
+//! gone (`EVENT_RELEASE` with the hold's word, tagged with bit 0). The
+//! service thread handles that event a little later; so a thread that
+//! finds the count in the way first waits for every release the kernel
+//! reported until then (`settle`): once a program has ended and was
+//! reaped, its file can be written, as on Linux.
 
 use crate::namespace::{check, ENOENT, ENOTDIR};
 use crate::sync::Mutex;
@@ -28,7 +32,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use restricted::*;
 
 pub const EEXIST: i64 = 17;
@@ -257,12 +261,14 @@ impl Inode {
 
     /// The right to write the file (ETXTBSY while a program runs from it).
     pub fn get_write(&self) -> Result<(), i64> {
-        let mut st = self.state.lock();
-        if st.writers < 0 {
-            return Err(ETXTBSY);
-        }
-        st.writers += 1;
-        Ok(())
+        settled(|| {
+            let mut st = self.state.lock();
+            if st.writers < 0 {
+                return Err(ETXTBSY);
+            }
+            st.writers += 1;
+            Ok(())
+        })
     }
 
     pub fn put_write(&self) {
@@ -271,12 +277,14 @@ impl Inode {
 
     /// The right to run the file (ETXTBSY while open for writing).
     fn deny_write(&self) -> Result<(), i64> {
-        let mut st = self.state.lock();
-        if st.writers > 0 {
-            return Err(ETXTBSY);
-        }
-        st.writers -= 1;
-        Ok(())
+        settled(|| {
+            let mut st = self.state.lock();
+            if st.writers > 0 {
+                return Err(ETXTBSY);
+            }
+            st.writers -= 1;
+            Ok(())
+        })
     }
 
     fn allow_write(&self) {
@@ -310,6 +318,41 @@ struct Hold {
 pub fn released(word: u64) {
     let hold = unsafe { Box::from_raw((word & !1) as *mut Hold) };
     if hold.run { hold.inode.allow_write() } else { hold.inode.put_write() }
+}
+
+/// How many `EVENT_RELEASE` events the service thread has handled (records'
+/// too), modulo 2^32; a futex word for `settle`.
+static RELEASES_HANDLED: AtomicU32 = AtomicU32::new(0);
+
+/// The service thread handled an `EVENT_RELEASE`.
+pub fn release_handled() {
+    RELEASES_HANDLED.fetch_add(1, Ordering::Release);
+    syscall(SYS_SERVER_FUTEX_WAKE, [&RELEASES_HANDLED as *const AtomicU32 as u64, u32::MAX as u64, 0, 0, 0, 0]);
+}
+
+/// Waits until the service thread has handled every release the kernel has
+/// queued so far.
+fn settle() {
+    let target = syscall(SYS_EVENT_RELEASES, [0; 6]) as u32;
+    loop {
+        let done = RELEASES_HANDLED.load(Ordering::Acquire);
+        if done.wrapping_sub(target) as i32 >= 0 {
+            return;
+        }
+        syscall(SYS_SERVER_FUTEX_WAIT, [&RELEASES_HANDLED as *const AtomicU32 as u64, done as u64, 0, 0, 0, 0]);
+    }
+}
+
+/// `try_once`, and if it finds the file busy (ETXTBSY), once more after the
+/// releases reported until then are in.
+fn settled(try_once: impl Fn() -> Result<(), i64>) -> Result<(), i64> {
+    match try_once() {
+        Err(ETXTBSY) => {
+            settle();
+            try_once()
+        }
+        r => r,
+    }
 }
 
 /// Renames `odir/oname` to `ndir/nname` (both in this tmpfs), replacing a

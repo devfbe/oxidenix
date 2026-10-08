@@ -128,6 +128,7 @@ fn pager() -> ! {
             } else {
                 records::released(event.a);
             }
+            tmpfs::release_handled();
             continue;
         }
         let request = PagerRequest { key: event.a, offset: event.b };

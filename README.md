@@ -614,7 +614,8 @@ moved memory, time, pipes, eventfd, paths and the root tmpfs into the server.
   `fstatfs`, `sendfile`, `mmap`) the server answers. ETXTBSY works as in the kernel's VFS: a
   shared mapping through a writable descriptor and a program run from the file each keep a
   **hold** on the file object (`mo_hold`), and the kernel tells the server when the last holder
-  is gone. The tree has a lock per inode and, for renames and removals, a lock of its own (as
+  is gone. Before answering ETXTBSY the server waits until it has taken in every release the
+  kernel reported so far, so a program that ended and was reaped no longer keeps its file busy. The tree has a lock per inode and, for renames and removals, a lock of its own (as
   Linux's rename mutex), under which alone two inode locks are ever held. Files there report
   device `0x1a`; renames between it and the kernel's mounts fail with `EXDEV`, and the mount
   points with `EBUSY`. Its regular files and directories are always ready for `poll` and
@@ -855,7 +856,7 @@ Linux x86_64 numbers, grouped by area (about 120 in total):
 
 | Area | Calls |
 |---|---|
-| Files | `read` `write` `pread64` `pwrite64` `readv` `writev` `open` `openat` (also `O_DIRECT`) `close` `lseek` `sendfile` `truncate` `ftruncate` `fcntl` `ioctl` `dup` `dup2` `dup3` `pipe` `pipe2` |
+| Files | `read` `write` `pread64` `pwrite64` `readv` `writev` `preadv` `pwritev` `preadv2` `pwritev2` `open` `openat` (also `O_DIRECT`) `close` `lseek` `sendfile` `truncate` `ftruncate` `fcntl` `ioctl` `dup` `dup2` `dup3` `pipe` `pipe2` |
 | Metadata | `stat` `fstat` `lstat` `newfstatat` `access` `faccessat` `faccessat2` `readlink` `readlinkat` `chmod` `fchmodat` `utimes` `futimesat` `utimensat` `umask` |
 | Directories | `getdents64` `getcwd` `chdir` `fchdir` `mkdir` `mkdirat` `rmdir` `unlink` `unlinkat` `rename` `renameat` `renameat2` `symlink` `symlinkat` |
 | I/O multiplexing | `poll` `ppoll` `select` `pselect6` `epoll_create` `epoll_create1` `epoll_ctl` `epoll_wait` `epoll_pwait` `epoll_pwait2` `eventfd` `eventfd2` |
@@ -913,7 +914,7 @@ Each of these programs and scripts lives in the root filesystem and runs inside 
 | `mmaptest /data` | all of `mmaptest` on a disk file |
 | `bash -c` (in `runtests.sh`) | Bash itself: functions, arrays, arithmetic, `[[ ]]`, a pipe into `grep`, a here-document into a `/tmp` file read back, a subshell's `cd`, command substitution |
 | `sh /etc/test.sh` | files, pipes, `cd`, `mkdir`/`touch`/`rm`, rename cycles via symlinks, the tmpfs size limit |
-| `fstest` | descriptor access modes (`EBADF` on read-only/write-only fds), `O_NOFOLLOW` on symlinks, unlinked-but-open files (kept until closed, never shared with new files), ext2 size limits, overflowing `mmap` offsets |
+| `fstest` | descriptor access modes (`EBADF` on read-only/write-only fds), `O_NOFOLLOW` on symlinks, unlinked-but-open files (kept until closed, never shared with new files), ext2 size limits, overflowing `mmap` offsets; `preadv2`/`pwritev2` and their flags (also in `lxtest` on `/tmp`): the offset -1 as the file position, a positional write to an `O_APPEND` descriptor appending as on Linux, `RWF_APPEND`/`RWF_NOAPPEND`, `EOPNOTSUPP`/`EINVAL` for unsupported or contradicting flags, `ESPIPE` on pipes (`userspace/rwtest.h`) |
 | `sh /etc/disktest.sh` | ext2: 150-file directory, 1.5 MiB file (double indirect), append, truncate, rename, cycles, symlinks, `rm -r`, space accounting |
 | `e2fsck -fn disk.img` (host) | the filesystem written by oxidenix is consistent |
 | `cargo test -p ext2fs` (host, needs e2fsprogs) | ext2 on a RAM disk that counts requests and can fail writes: 4 MiB read in about one device read per 32 KiB request, one flush per write, nothing written by reads, blocks moving between directories and files, a file larger than the block cache, corrupt block pointers (`EIO`, no crash), every write of a commit failing in turn (retried, nothing lost), failed data writes never exposing a deleted file's blocks; `e2fsck` after each |
