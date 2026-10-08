@@ -6,11 +6,13 @@
  * and writers at once see consistent data, a file larger than the memory
  * the cache may use is written and read back whole, a read finds room
  * when dirty pages fill memory, and a full disk fails write() itself with
- * ENOSPC (and a store into a hole with SIGBUS), never the write-back. */
+ * ENOSPC (and a store into a hole with SIGBUS, a kernel copy into one with
+ * EFAULT), never the write-back. */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <sched.h>
 #include <setjmp.h>
 #include <signal.h>
 #include <stdio.h>
@@ -19,6 +21,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -520,6 +523,21 @@ static void full_disk(void) {
     for (int i = 0; same && i < PG; i++) same = (unsigned char)back[i] == pattern(last + i, 3);
     check("full disk: the file's size and its last page on the disk", st.st_size == total && same);
     check("full disk: a store into a hole raises SIGBUS", sized && map != MAP_FAILED && store_faults(map + 10 * PG) == SIGBUS);
+    /* The kernel's copies into such a page fail too, and leave it clean:
+     * read() from a pipe (EFAULT or a short count, nothing read), and a
+     * fork child's CLONE_CHILD_SETTID word (clone fails with EFAULT). */
+    int pipefd[2] = {-1, -1};
+    int piped = pipe(pipefd) == 0 && write(pipefd[1], "pipedata", 8) == 8;
+    long dirty0 = meminfo("Dirty:");
+    errno = 0;
+    ssize_t got_n = map != MAP_FAILED ? read(pipefd[0], (char *)map + 20 * PG, 8) : 0;
+    check("full disk: read() from a pipe into a hole fails (EFAULT)", piped && got_n <= 0 && (got_n == 0 || errno == EFAULT));
+    errno = 0;
+    long kid = map != MAP_FAILED ? syscall(SYS_clone, CLONE_CHILD_SETTID | SIGCHLD, 0, NULL, (void *)(map + 30 * PG), 0) : 0;
+    if (kid == 0) _exit(0);
+    if (kid > 0) waitpid((pid_t)kid, NULL, 0);
+    check("full disk: clone's CHILD_SETTID into a hole fails (EFAULT)", kid == -1 && errno == EFAULT);
+    check("... and neither left a dirty page", meminfo("Dirty:") <= dirty0);
     close(fd);
     unlink(path);
     // The space comes back once diskfs freed the file.
@@ -531,6 +549,18 @@ static void full_disk(void) {
     }
     check("full disk: room again once the file is gone", after.f_bfree * after.f_bsize > 1024 * 1024);
     check("full disk: then the store goes through", map != MAP_FAILED && store_faults(map + 10 * PG) == 0 && msync((void *)map, 64 * PG, MS_SYNC) == 0);
+    int again = map != MAP_FAILED && piped && write(pipefd[1], "pipedata", 8) == 8;
+    again &= read(pipefd[0], (char *)map + 20 * PG, 8) == 8 && memcmp((char *)map + 20 * PG, "pipedata", 8) == 0;
+    kid = again ? syscall(SYS_clone, CLONE_CHILD_SETTID | SIGCHLD, 0, NULL, (void *)(map + 30 * PG), 0) : -1;
+    if (kid == 0) _exit(0);
+    if (kid > 0) waitpid((pid_t)kid, NULL, 0);
+    int tid_seen = kid > 0 && *(volatile int *)(map + 30 * PG) == (int)kid;
+    int durable = again && fsync(hfd) == 0 && on_disk(hole, 20 * PG, back, PG) == PG && memcmp(back, "pipedata", 8) == 0;
+    int tid_durable = tid_seen && on_disk(hole, 30 * PG, back, PG) == PG && memcmp(back, &(int){(int)kid}, sizeof(int)) == 0;
+    check("full disk: then read() from a pipe fills the page, on the disk after fsync", durable);
+    check("full disk: then a child's CHILD_SETTID word reaches the file and the disk", tid_durable);
+    close(pipefd[0]);
+    close(pipefd[1]);
     if (map != MAP_FAILED) munmap((void *)map, 64 * PG);
     close(hfd);
     unlink(hole);

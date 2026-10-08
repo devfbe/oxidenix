@@ -728,7 +728,9 @@ impl AddressSpace {
 
     /// Satisfies an access to `va`: maps a frame on first use, copies a
     /// copy-on-write page on a write, grows a stack. Works on any address
-    /// space (the loader fills spaces that are not active yet).
+    /// space (the loader fills spaces that are not active yet). Waits for a
+    /// pager's page or backing with the space held, so only for a space
+    /// no one else can lock yet (`handle_fault` waits with it unlocked).
     pub fn fault(&mut self, va: u64, access: Access) -> Result<(), Fault> {
         self.fault_or_retry(va, access, true)
     }
@@ -798,19 +800,11 @@ impl AddressSpace {
                 };
                 if *shared && cache.tracks_dirty() {
                     // Writable only once the store marked it dirty, and
-                    // backed (waited for unlocked: not when `wait`).
+                    // backed (`dirty_backed`).
                     if access.write {
-                        match cache.set_dirty(index, !wait) {
-                            Dirtied::Yes => {}
-                            Dirtied::Gone => {
-                                memory::with_frames(|f| unsafe { f.deallocate_frame(frame) });
-                                return Err(Fault::Bus);
-                            }
-                            Dirtied::Unbacked => {
-                                memory::with_frames(|f| unsafe { f.deallocate_frame(frame) });
-                                self.awaited = Some((cache.clone(), index, true));
-                                return Err(Fault::Retry);
-                            }
+                        if let Err(e) = self.dirty_backed(cache, index, wait) {
+                            memory::with_frames(|f| unsafe { f.deallocate_frame(frame) });
+                            return Err(e);
                         }
                     }
                     return Ok((frame, access.write));
@@ -864,9 +858,8 @@ impl AddressSpace {
     }
 
     /// A write to a copy-on-write page: copy it unless this mapping is
-    /// the frame's last user. A shared file page must be backed first
-    /// (`Fault::Retry` with it in `awaited`, unless `wait`: see
-    /// `PageCache::set_dirty`).
+    /// the frame's last user. A shared file page must be backed and marked
+    /// dirty first (`dirty_backed`).
     fn break_cow(&mut self, page: u64, v: &Vma, wait: bool) -> Result<(), Fault> {
         let e = leaf_entry(self.l4, page).ok_or(Fault::Segv)?;
         let flags = e.flags();
@@ -902,21 +895,69 @@ impl AddressSpace {
     }
 
     /// Before a store to `page` of a shared disk-file mapping: marks the
-    /// page dirty, backed first unless `wait` (`Fault::Retry` with it in
-    /// `awaited`: see `PageCache::set_dirty`). Nothing for other areas.
+    /// page dirty once it is backed (`dirty_backed`). Nothing for other
+    /// areas.
     fn mark_dirty(&mut self, page: u64, v: &Vma, wait: bool) -> Result<(), Fault> {
         if let (true, Backing::File { cache, offset, .. }) = (v.backing.tracks_dirty(), &v.backing) {
-            let index = (offset + (page - v.start)) / PAGE;
-            match cache.set_dirty(index, !wait) {
-                Dirtied::Yes => {}
-                // Gone if the file was truncated meanwhile.
+            self.dirty_backed(cache, (offset + (page - v.start)) / PAGE, wait)?;
+        }
+        Ok(())
+    }
+
+    /// Marks page `index` of a disk file's cache dirty for a store, once it
+    /// is backed up to the file's end (`PageCache::set_dirty`), so a full
+    /// disk fails the store (SIGBUS, or EFAULT for a kernel copy, as
+    /// Linux's `page_mkwrite`) and never the write-back. A page that is not
+    /// backed yet is asked of the pager; without `wait` the caller waits
+    /// for it with the space unlocked (`Fault::Retry`, the page in
+    /// `awaited`); with `wait` (a space no one else can lock yet: the
+    /// loader's, a fork child's copy) it is waited for here, killably and
+    /// as often as a fault tries. Bus if the file was truncated, the disk
+    /// is full or the pager failed.
+    fn dirty_backed(&mut self, cache: &Arc<PageCache>, index: u64, wait: bool) -> Result<(), Fault> {
+        for _ in 0..MAX_FAULT_TRIES {
+            match cache.set_dirty(index, true) {
+                Dirtied::Yes => return Ok(()),
                 Dirtied::Gone => return Err(Fault::Bus),
-                Dirtied::Unbacked => {
+                Dirtied::Unbacked if !wait => {
                     self.awaited = Some((cache.clone(), index, true));
                     return Err(Fault::Retry);
                 }
+                Dirtied::Unbacked => match cache.wait_page(index, true) {
+                    Ok(frame) => frame.into_iter().for_each(PageCache::put_frame),
+                    Err(_) => return Err(Fault::Bus),
+                },
             }
         }
+        Err(Fault::Bus)
+    }
+
+    /// A kernel store of `data` at `va` (within one page) into a shared
+    /// mapping of a disk file, as a user store if `user`. Unlike a user
+    /// store, it leaves the page's entry as it is: the space may be no
+    /// file's mapper yet (a fork child's copy), so write-back could not
+    /// write-protect an entry made writable here. The data goes into the
+    /// cache frame once the page is backed (`dirty_backed`), and the page
+    /// is marked dirty again after the copy, so a write-back that cleaned
+    /// it while the copy ran is followed by another.
+    fn store_to_file(&mut self, va: u64, data: &[u8], user: bool) -> Result<(), Fault> {
+        let page = page_down(va);
+        let v = self.vma(page).cloned().ok_or(Fault::Segv)?;
+        let Backing::File { cache, offset, .. } = &v.backing else { return Err(Fault::Segv) };
+        if user && !v.prot.write {
+            return Err(Fault::Segv);
+        }
+        let index = (offset + (page - v.start)) / PAGE;
+        self.fault(va, Access { write: false, exec: false })?;
+        self.dirty_backed(cache, index, true)?;
+        // The cache's frame (the entry's may be stale if the page was
+        // reclaimed or cut meanwhile: this space is no mapper yet).
+        let frame = cache.try_map_page(index, true)?.ok_or(Fault::Bus)?;
+        unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), memory::phys_to_virt(frame.start_address().as_u64() + va % PAGE), data.len()) };
+        PageCache::put_frame(frame);
+        // Already backed: only the dirty mark (Gone: truncated meanwhile,
+        // the data went with the page, as a store's would).
+        let _ = cache.set_dirty(index, false);
         Ok(())
     }
 
@@ -1062,7 +1103,10 @@ impl AddressSpace {
     /// not active, regardless of the areas' rights (the loader clears the
     /// bss part of a segment's last file page). A frame shared with others
     /// (copy-on-write, or a file's page cache) is copied first, unless the
-    /// area is shared memory; a disk file's page is then marked dirty.
+    /// area is shared memory; a disk file's page is backed and marked
+    /// dirty (`store_to_file`). The space must be one no one else can lock
+    /// yet (the loader's, a fork child's copy): a page or its backing is
+    /// waited for here.
     pub fn write(&mut self, addr: u64, data: &[u8]) -> Result<(), Fault> {
         self.write_as(addr, data, false)
     }
@@ -1077,8 +1121,14 @@ impl AddressSpace {
         let mut done = 0;
         while done < data.len() {
             let va = addr + done as u64;
-            self.fault(va, Access { write: user, exec: false })?;
             let page = page_down(va);
+            let chunk = ((PAGE - va % PAGE) as usize).min(data.len() - done);
+            if self.vma(page).is_some_and(|v| v.backing.tracks_dirty()) {
+                self.store_to_file(va, &data[done..done + chunk], user)?;
+                done += chunk;
+                continue;
+            }
+            self.fault(va, Access { write: user, exec: false })?;
             let v = self.vma(page).cloned().ok_or(Fault::Segv)?;
             if v.prot.write {
                 if leaf_entry(self.l4, page).is_some_and(|e| e.flags().contains(COW)) {
@@ -1086,14 +1136,9 @@ impl AddressSpace {
                 }
             } else if !v.backing.shared() {
                 self.privatize(page)?;
-            } else {
-                // A store into a read-only shared mapping still reaches
-                // the file: a disk file's page must be marked dirty.
-                self.mark_dirty(page, &v, true)?;
             }
             let e = leaf_entry(self.l4, page).ok_or(Fault::Segv)?;
             let phys = e.addr().as_u64() + va % PAGE;
-            let chunk = ((PAGE - va % PAGE) as usize).min(data.len() - done);
             unsafe { core::ptr::copy_nonoverlapping(data[done..].as_ptr(), memory::phys_to_virt(phys), chunk) };
             done += chunk;
         }

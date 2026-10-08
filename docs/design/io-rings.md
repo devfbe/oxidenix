@@ -356,7 +356,10 @@ pages and dirty marks the kernel keeps and whose data the server moves:
   fails with `ENOSPC` itself when the disk is full, never the write-back later. A store through
   a shared mapping into a page not backed sends `EVENT_MKWRITE` (key, offset) and waits with
   the address space unlocked; `mo_backed(handle, first, end, ok)` (1083) answers (no room:
-  `SIGBUS`, as Linux's `page_mkwrite`). A file that grows write-protects the page that held its
+  `SIGBUS`, as Linux's `page_mkwrite`; a kernel copy into the mapping, e.g. `read(2)` from a pipe,
+  fails with `EFAULT` or a short count instead). The kernel's own stores into a space no one can
+  lock yet (a fork child's `CLONE_CHILD_SETTID` word) wait for the backing the same way, holding
+  the space. A file that grows write-protects the page that held its
   end if that page's new file bytes are not backed, so a mapping's next store there asks
   (Linux's `pagecache_isize_extended`); truncation trims the cut page's backing. A diskfs that
   restarted lost the promises: `mo_unback(handle, from, out)` (1084) clears the pages' backing
