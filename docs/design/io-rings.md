@@ -307,6 +307,45 @@ pinned pages, then diskfs detaches and its holds go. A device whose segments are
 sector, or that takes too few per request for a page and its pads, or an image with blocks
 over a page, is refused at start.
 
+### The page cache's kernel interface (step 4)
+
+The Linux server's page cache of a disk file is a **cached object**
+(`mo_create_cached(size, key, limit)`, 1076; `kernel/src/fs/cache.rs`, the cached store): a
+file object (reads, writes, mappings, programs use it like a tmpfs file object) whose size,
+pages and dirty marks the kernel keeps and whose data the server moves:
+
+- **Fill.** A missing page is asked for with `EVENT_PAGE` (a fault, or the kernel reading the
+  object) or reported missing to the server's own reads and writes (`MO_NOFILL`: the call stops
+  there, `EAGAIN` if nothing was done). The server grants the first run of missing pages of a
+  window (`grant(.., GRANT_WRITE | GRANT_FILL, out)`: at most 256, the run's first page and
+  length at `out`): they become **pending**, zeroed frames pinned for the grant that nobody reads,
+  maps or writes. diskfs reads into them by DMA; `mo_filled(handle, offset, pages, ok)` (1077)
+  makes them the file's pages or drops them (their waiters get `EIO`, a mapping `SIGBUS`, a later
+  access asks again) and wakes the waiters. No copy: the page the program maps is the page the
+  device wrote.
+- **Write-back.** Writes and stores through shared mappings mark pages dirty (a mapping's page
+  is writable only once dirty, as for the kernel's own disk files); an object's first dirty page
+  sends `EVENT_DIRTY` (key). `grant(.., GRANT_DIRTY, out)` takes the first run of dirty pages of
+  a window: clean from then on, write-protected in every mapping (a store marks them dirty again),
+  pinned read-only for diskfs to write from by DMA; a write that failed puts them back with
+  `mo_redirty` (1078).
+- **Memory.** The pages are cached memory (`Cached:`, `memory::cache_charge`): clean ones that
+  nothing pins or maps are reclaimed when a commit or a new cache page needs room; pending and
+  dirty ones are not. Dirty pages of all caches count in `Dirty:`; above a tenth of the commit
+  limit, or when reclaim finds them in its way, the pagers get `EVENT_WRITEBACK` (one queued at a
+  time), and above a fifth a thread that stores waits up to a second for them (Linux's dirty
+  ratios; never the pager, which does the writing). `event_wait` takes a deadline (`EVENT_TIMER`,
+  for the server's periodic write-back) and delivers `EVENT_CLOSING` once when the instance's
+  last program is gone, for its final write-back.
+- **Faults wait unlocked.** A fault that needs a page from a pager asks for it and waits with
+  the address space unlocked, then tries again (`Fault::Retry`; `MAP_POPULATE` only asks): the
+  pager's write-back write-protects mappings, which locks address spaces, so no thread may wait
+  for the pager while holding one.
+- **msync.** `vm_sync(addr, len, flags, out, cap)` reports the cached objects mapped shared in
+  the range (key, first and end page) for the server to write back with `MS_SYNC`.
+- `mo_map_server(handle, pages)` / `mo_unmap_server(addr)` (1079, 1080) map a plain memory
+  object into the server's region: the scratch buffer it grants diskfs for names and results.
+
 ## Paths built on it
 
 - **Files on `/data` (R6c.3)**: the Linux server's page cache holds paged objects, one per open

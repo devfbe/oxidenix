@@ -115,6 +115,9 @@ pub struct Instance {
 struct RegionMap {
     pages: u64,
     object: Arc<PageCache>,
+    /// Mapped at the server's request (`SYS_MO_MAP_SERVER`), which may
+    /// unmap it; the others (channels) go with their kernel object.
+    server: bool,
 }
 
 /// Most channels one instance may hold.
@@ -129,8 +132,13 @@ struct PagerQueue {
     queued: alloc::collections::BTreeSet<(u64, u64)>,
     /// `EVENT_RELEASE` events queued so far (`SYS_EVENT_RELEASES`).
     releases: u64,
-    /// The tree has no program left: the pager's process ends.
+    /// The tree has no program left: the pager gets `EVENT_CLOSING`, then
+    /// its process ends.
     closing: bool,
+    /// `EVENT_CLOSING` was delivered.
+    closing_told: bool,
+    /// An `EVENT_WRITEBACK` is queued (one at a time).
+    writeback_queued: bool,
     /// The pager's process is gone: no page will come any more.
     dead: bool,
 }
@@ -196,6 +204,8 @@ impl Instance {
                 queued: alloc::collections::BTreeSet::new(),
                 releases: 0,
                 closing: false,
+                closing_told: false,
+                writeback_queued: false,
                 dead: false,
             }),
             programs: core::sync::atomic::AtomicUsize::new(0),
@@ -403,6 +413,10 @@ impl Instance {
     /// the rest writable; returns where. Each entry holds a reference on
     /// its frame, the region's entry the object.
     pub(super) fn map_object(&self, object: &Arc<PageCache>, pages: u64, read_only: u64) -> Result<u64, i64> {
+        self.map_region(object, pages, read_only, false)
+    }
+
+    fn map_region(&self, object: &Arc<PageCache>, pages: u64, read_only: u64, server: bool) -> Result<u64, i64> {
         let len = pages.checked_mul(PAGE).filter(|&l| l > 0).ok_or(EINVAL)?;
         let mut maps = self.maps.lock();
         // First fit.
@@ -416,7 +430,7 @@ impl Instance {
         if start.checked_add(len).is_none_or(|e| e > HEAP_BASE) {
             return Err(ENOMEM);
         }
-        maps.insert(start, RegionMap { pages, object: object.clone() });
+        maps.insert(start, RegionMap { pages, object: object.clone(), server });
         for i in 0..pages {
             let flags = if i < read_only { PageTableFlags::NO_EXECUTE } else { PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE };
             let mapped = object.map_page(i).map_err(|_| ENOMEM).and_then(|frame| self.map(start + i * PAGE, frame, flags));
@@ -437,6 +451,18 @@ impl Instance {
             // every TLB dropped it.
             self.unmap_pages(addr, m.pages);
         }
+    }
+
+    /// `SYS_MO_UNMAP_SERVER`: removes an object the server mapped itself
+    /// (EINVAL for anything else at `addr`).
+    fn unmap_server_object(&self, addr: u64) -> Result<(), i64> {
+        let mut maps = self.maps.lock();
+        if !maps.get(&addr).is_some_and(|m| m.server) {
+            return Err(EINVAL);
+        }
+        let m = maps.remove(&addr).expect("checked");
+        self.unmap_pages(addr, m.pages);
+        Ok(())
     }
 
     /// Removes the entries of `pages` pages at `start`, drops them from the
@@ -593,6 +619,22 @@ impl crate::fs::cache::Pager for Instance {
 
     fn wait_chan(&self) -> usize {
         self.answer_chan()
+    }
+
+    fn dirty(&self, key: u64) {
+        self.queue_event(Event { kind: EVENT_DIRTY, a: key, b: 0 });
+    }
+
+    fn writeback(&self, pages: u64) {
+        {
+            let mut q = self.pager.lock();
+            if q.dead || q.closing || q.writeback_queued {
+                return;
+            }
+            q.writeback_queued = true;
+            q.requests.push_back(Event { kind: EVENT_WRITEBACK, a: pages, b: 0 });
+        }
+        super::wakeup(self.pager_chan());
     }
 }
 
@@ -825,6 +867,11 @@ pub fn in_server() -> bool {
     with_current(|p| p.linux.as_ref().is_some_and(|l| l.normal_view()))
 }
 
+/// Whether the calling thread is a Linux server instance's pager thread.
+pub fn is_pager() -> bool {
+    with_current(|p| p.linux.as_ref().is_some_and(|l| l.pager))
+}
+
 fn instance() -> Result<Arc<Instance>, i64> {
     with_current(|p| p.linux.as_ref().map(|l| l.instance.clone())).ok_or(EPERM)
 }
@@ -912,7 +959,7 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
         }
         SYS_VM_REMAP => super::sys_mem::mremap(a[0], a[1], a[2], a[3], a[4]),
         SYS_VM_DISCARD => super::sys_mem::madvise(a[0], a[1], 4),
-        SYS_VM_SYNC => super::sys_mem::msync(a[0], a[1], a[2]),
+        SYS_VM_SYNC => super::sys_mem::msync_server(a[0], a[1], a[2], a[3], a[4]),
         SYS_MO_CREATE_PAGED => {
             let pages = a[0];
             if pages == 0 || pages > USER_END / PAGE {
@@ -922,7 +969,7 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             let object = PageCache::paged(pages, pager, a[1])?;
             Ok(instance.insert(Object::Memory(object))? as i64)
         }
-        SYS_EVENT_WAIT => event_wait(&instance, a[0]),
+        SYS_EVENT_WAIT => event_wait(&instance, a[0], a[1]),
         SYS_EVENT_RELEASES => Ok(instance.pager.lock().releases as i64),
         SYS_KFD_INSTALL => {
             use crate::fs::file::{OpenFile, ServerFile, Kind, O_ACCMODE, O_APPEND, O_CLOEXEC, O_NONBLOCK};
@@ -1030,21 +1077,31 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             }
         }
         SYS_MO_FILE_READ | SYS_MO_FILE_WRITE | SYS_MO_FILE_SIZE | SYS_MO_TRUNCATE => {
+            use crate::fs::cache::Fill;
             let cache = match instance.object(a[0])? {
                 Object::File(cache, _) => cache,
                 _ => return Err(EINVAL),
             };
             let (offset, buf, len) = (a[1], a[2], a[3]);
+            let fill = match nr {
+                SYS_MO_FILE_READ | SYS_MO_FILE_WRITE if a[4] & !MO_NOFILL != 0 => return Err(EINVAL),
+                SYS_MO_FILE_READ | SYS_MO_FILE_WRITE if a[4] & MO_NOFILL != 0 => Fill::No,
+                _ => Fill::Yes,
+            };
             match nr {
                 // As the kernel's tmpfs files are read and written.
                 SYS_MO_FILE_READ => {
-                    let n = super::uaccess::read_to_user(buf, len, true, |chunk, done| cache.read(offset + done, chunk))?;
+                    let n = super::uaccess::read_to_user(buf, len, true, |chunk, done| cache.read_with(offset + done, chunk, fill))?;
                     Ok(n as i64)
                 }
                 SYS_MO_FILE_WRITE => {
                     offset.checked_add(len).ok_or(EFBIG)?;
-                    let n = super::uaccess::write_from_user(buf, len, |chunk, done| cache.write(offset + done, chunk))?;
-                    Ok(n as i64)
+                    let n = super::uaccess::write_from_user(buf, len, |chunk, done| cache.write_with(offset + done, chunk, fill));
+                    if cache.is_cached() {
+                        // Too many dirty pages: this writer waits a little.
+                        crate::fs::cache::balance_dirty();
+                    }
+                    Ok(n? as i64)
                 }
                 SYS_MO_FILE_SIZE => Ok(cache.size() as i64),
                 _ => {
@@ -1153,11 +1210,55 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
         SYS_GRANT => {
             let end = instance.channel(a[0])?;
             let object = instance.memory(a[1])?;
-            if a[4] & !GRANT_WRITE != 0 {
+            let (flags, writable) = (a[4], a[4] & GRANT_WRITE != 0);
+            match flags & !GRANT_WRITE {
+                0 => Ok(end.channel.grant(&object, a[2], a[3], writable)? as i64),
+                // A cached object's pages: to fill (into a writable grant)
+                // or to write back (read-only).
+                mode @ (GRANT_FILL | GRANT_DIRTY) if (mode == GRANT_FILL) == writable => {
+                    let (id, first, count) = end.channel.grant_run(&object, a[2], a[3], mode == GRANT_FILL, writable)?;
+                    let mut info = [0u8; 16];
+                    info[..8].copy_from_slice(&first.to_le_bytes());
+                    info[8..].copy_from_slice(&count.to_le_bytes());
+                    if let Err(e) = super::uaccess::copy_to_server(a[5], &info) {
+                        // The caller cannot know the run: it goes again.
+                        let _ = end.channel.revoke(id);
+                        let _ = if mode == GRANT_FILL { object.filled(first, count, false) } else { object.redirty(first, count) };
+                        return Err(e);
+                    }
+                    Ok(id as i64)
+                }
+                _ => Err(EINVAL),
+            }
+        }
+        SYS_MO_CREATE_CACHED => {
+            let (size, key, limit) = (a[0], a[1], a[2]);
+            let pager: alloc::sync::Weak<dyn crate::fs::cache::Pager> = Arc::downgrade(&instance) as _;
+            let cache = PageCache::cached(size, limit, pager, key)?;
+            Ok(instance.insert(Object::File(cache, None))? as i64)
+        }
+        SYS_MO_FILLED | SYS_MO_REDIRTY => {
+            let Object::File(cache, _) = instance.object(a[0])? else { return Err(EINVAL) };
+            if !page_aligned(a[1]) {
                 return Err(EINVAL);
             }
-            Ok(end.channel.grant(&object, a[2], a[3], a[4] & GRANT_WRITE != 0)? as i64)
+            let (first, count) = (a[1] / PAGE, a[2]);
+            if nr == SYS_MO_FILLED {
+                cache.filled(first, count, a[3] != 0)?;
+            } else {
+                cache.redirty(first, count)?;
+            }
+            Ok(0)
         }
+        SYS_MO_MAP_SERVER => {
+            // Plain memory only (its pages are made present now).
+            let Object::Memory(object) = instance.object(a[0])? else { return Err(EINVAL) };
+            if object.paged_key().is_some() || a[1] == 0 || a[1].checked_mul(PAGE).is_none_or(|l| l > object.size()) {
+                return Err(EINVAL);
+            }
+            Ok(instance.map_region(&object, a[1], 0, true)? as i64)
+        }
+        SYS_MO_UNMAP_SERVER => instance.unmap_server_object(a[0]).map(|_| 0),
         SYS_REVOKE => {
             let end = instance.channel(a[0])?;
             end.channel.revoke(u32::try_from(a[1]).map_err(|_| EINVAL)?)
@@ -1206,6 +1307,9 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
                     super::uaccess::copy_from_server(buf + done, &mut chunk[..n])?;
                     // A file object that cannot grow further (ENOSPC):
                     // what was written counts.
+                    if cache.is_cached() && done > 0 && done % (64 * PAGE) == 0 {
+                        crate::fs::cache::balance_dirty();
+                    }
                     match cache.write(offset + done, &chunk[..n]) {
                         Ok(w) if w < n => return Ok((done + w as u64) as i64),
                         Ok(_) => {}
@@ -1335,11 +1439,13 @@ fn set_legacy(on: bool) {
     });
 }
 
-/// event_wait(event): the instance's next event (a page a thread waits for,
-/// a server file closed), written to the server's memory at `out`. The
-/// service thread's process ends here when the tree has no program left.
-fn event_wait(instance: &Arc<Instance>, out: u64) -> SysResult {
-    if !with_current(|p| p.linux.as_ref().is_some_and(|l| l.pager)) {
+/// event_wait(event, deadline): the instance's next event (a page a
+/// thread waits for, a server file closed, ...), written to the server's
+/// memory at `out`; `EVENT_TIMER` once `deadline` (0: none) passed. When
+/// the tree has no program left: `EVENT_CLOSING` once, then the service
+/// thread's process ends here.
+fn event_wait(instance: &Arc<Instance>, out: u64, deadline: u64) -> SysResult {
+    if !is_pager() {
         return Err(EPERM);
     }
     loop {
@@ -1347,16 +1453,31 @@ fn event_wait(instance: &Arc<Instance>, out: u64) -> SysResult {
             let wait = super::sched::prepare_to_wait(instance.pager_chan());
             let mut q = instance.pager.lock();
             if let Some(e) = q.requests.pop_front() {
-                if e.kind == EVENT_PAGE {
-                    q.queued.remove(&(e.a, e.b / PAGE));
+                match e.kind {
+                    EVENT_PAGE => {
+                        q.queued.remove(&(e.a, e.b / PAGE));
+                    }
+                    EVENT_WRITEBACK => q.writeback_queued = false,
+                    _ => {}
                 }
                 return Some(Some(e));
             }
             if q.closing {
-                return Some(None);
+                if q.closing_told {
+                    return Some(None);
+                }
+                q.closing_told = true;
+                return Some(Some(Event { kind: EVENT_CLOSING, a: 0, b: 0 }));
             }
             drop(q);
-            wait.sleep();
+            if deadline != 0 {
+                if crate::time::now() >= deadline {
+                    return Some(Some(Event { kind: EVENT_TIMER, a: 0, b: 0 }));
+                }
+                wait.sleep_until(deadline);
+            } else {
+                wait.sleep();
+            }
             None
         });
         match next {
@@ -1366,8 +1487,17 @@ fn event_wait(instance: &Arc<Instance>, out: u64) -> SysResult {
                 if let Err(e) = super::uaccess::copy_to_server(out, bytes) {
                     // Still due: next time.
                     let mut q = instance.pager.lock();
-                    if event.kind != EVENT_PAGE || q.queued.insert((event.a, event.b / PAGE)) {
-                        q.requests.push_front(event);
+                    match event.kind {
+                        EVENT_PAGE if !q.queued.insert((event.a, event.b / PAGE)) => {}
+                        EVENT_TIMER => {}
+                        EVENT_CLOSING => q.closing_told = false,
+                        EVENT_WRITEBACK if q.writeback_queued => {}
+                        _ => {
+                            if event.kind == EVENT_WRITEBACK {
+                                q.writeback_queued = true;
+                            }
+                            q.requests.push_front(event)
+                        }
                     }
                     return Err(e);
                 }

@@ -1072,7 +1072,14 @@ impl Service {
             }
             Request::Statfs => {
                 let (bs, blocks, free, inodes, free_inodes) = fs.usage();
-                let u = fsring::Usage { block_size: bs as u32, blocks: blocks as u32, free_blocks: free as u32, inodes: inodes as u32, free_inodes: free_inodes as u32 };
+                let u = fsring::Usage {
+                    block_size: bs as u32,
+                    blocks: blocks as u32,
+                    free_blocks: free as u32,
+                    inodes: inodes as u32,
+                    free_inodes: free_inodes as u32,
+                    max_file_size: fs.max_file_size(),
+                };
                 Ok((0, u.to_values()))
             }
             Request::Lookup { dir, name } => {

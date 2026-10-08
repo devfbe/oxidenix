@@ -1749,6 +1749,11 @@ impl<D: Device> Ext2<D> {
         self.st.block_size
     }
 
+    /// The largest file this filesystem can hold (EFBIG beyond).
+    pub fn max_file_size(&self) -> u64 {
+        self.st.max_file_size()
+    }
+
     // The ring path (diskfs's data plane, docs/design/io-rings.md): the
     // caller moves file data between the device and its client's pages
     // itself, with several requests in flight; these calls say where the

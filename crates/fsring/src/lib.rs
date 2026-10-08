@@ -27,7 +27,7 @@
 //! | `RELEASE` | `object` inode | 0: the client holds it no more (see "Holds") |
 //! | `READLINK` | `object` symlink, buffer for the target | length of the target |
 //! | `SETPERM` | `object` inode, `arg[0]` = permission bits | 0 |
-//! | `STATFS` | - | 0, `Usage` in v0..v3 |
+//! | `STATFS` | - | 0, `Usage` in v0..v3 (sizes, counts, the largest file) |
 //! | `FORGET` | `grant` | 0 once no request on the grant is in flight and the service let go of it |
 //!
 //! **Ordering.** Reads and writes run concurrently and complete in any
@@ -451,17 +451,26 @@ pub struct Usage {
     pub free_blocks: u32,
     pub inodes: u32,
     pub free_inodes: u32,
+    /// The largest file the filesystem can hold (EFBIG beyond).
+    pub max_file_size: u64,
 }
 
 impl Usage {
     /// v0 = block size, v1 = blocks | free blocks << 32, v2 = inodes |
-    /// free inodes << 32.
+    /// free inodes << 32, v3 = the largest file size.
     pub fn to_values(&self) -> [u64; 4] {
-        [self.block_size as u64, self.blocks as u64 | (self.free_blocks as u64) << 32, self.inodes as u64 | (self.free_inodes as u64) << 32, 0]
+        [self.block_size as u64, self.blocks as u64 | (self.free_blocks as u64) << 32, self.inodes as u64 | (self.free_inodes as u64) << 32, self.max_file_size]
     }
 
     pub fn from_values(v: &[u64; 4]) -> Usage {
-        Usage { block_size: v[0] as u32, blocks: v[1] as u32, free_blocks: (v[1] >> 32) as u32, inodes: v[2] as u32, free_inodes: (v[2] >> 32) as u32 }
+        Usage {
+            block_size: v[0] as u32,
+            blocks: v[1] as u32,
+            free_blocks: (v[1] >> 32) as u32,
+            inodes: v[2] as u32,
+            free_inodes: (v[2] >> 32) as u32,
+            max_file_size: v[3],
+        }
     }
 }
 

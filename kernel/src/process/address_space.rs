@@ -244,6 +244,10 @@ pub enum Fault {
     Oom,
     /// The file does not grant the rights asked for (mprotect: EACCES).
     Access,
+    /// The page must come from a pager first (`AddressSpace::awaited`):
+    /// the fault is tried again once it is there. Only `handle_fault` and
+    /// `populate` ask for this.
+    Retry,
 }
 
 #[derive(Clone, Copy)]
@@ -275,6 +279,9 @@ pub struct AddressSpace {
     owner: Weak<Mm>,
     /// The program file it runs, kept from being written meanwhile.
     pub exe: Option<Hold>,
+    /// The page a fault found missing (`Fault::Retry`): the faulting thread
+    /// waits for it with the space unlocked.
+    awaited: Option<(Arc<PageCache>, u64)>,
 }
 
 /// An address space as tasks hold it: shared by the threads of a process
@@ -377,6 +384,7 @@ impl AddressSpace {
             brk_end: 0,
             owner: Weak::new(),
             exe: None,
+            awaited: None,
         })
     }
 
@@ -737,6 +745,14 @@ impl AddressSpace {
     /// copy-on-write page on a write, grows a stack. Works on any address
     /// space (the loader fills spaces that are not active yet).
     pub fn fault(&mut self, va: u64, access: Access) -> Result<(), Fault> {
+        self.fault_or_retry(va, access, true)
+    }
+
+    /// `fault`; without `wait`, a page that must come from a pager first is
+    /// asked for and `Fault::Retry` returned (the page in `awaited`), so the
+    /// caller can wait with the space unlocked: a pager may need to lock
+    /// it meanwhile (write-back write-protects every mapping of a file).
+    fn fault_or_retry(&mut self, va: u64, access: Access, wait: bool) -> Result<(), Fault> {
         if va >= USER_END {
             return Err(Fault::Segv);
         }
@@ -763,7 +779,7 @@ impl AddressSpace {
             e.set_addr(frame.start_address(), v.prot.flags());
             return Ok(());
         }
-        let (frame, writable_ok) = self.new_frame(page, &v, access)?;
+        let (frame, writable_ok) = self.new_frame(page, &v, access, wait)?;
         let mut flags = v.prot.flags();
         if !writable_ok && flags.contains(PageTableFlags::WRITABLE) {
             flags.remove(PageTableFlags::WRITABLE);
@@ -774,15 +790,19 @@ impl AddressSpace {
 
     /// A frame with the page's initial contents (holding a reference for
     /// this mapping), and whether it may be mapped writable directly.
-    fn new_frame(&mut self, page: u64, v: &Vma, access: Access) -> Result<(PhysFrame, bool), Fault> {
+    fn new_frame(&mut self, page: u64, v: &Vma, access: Access, wait: bool) -> Result<(PhysFrame, bool), Fault> {
         match &v.backing {
             Backing::Anon => Ok((zeroed_frame()?, true)),
             Backing::Device | Backing::Granted { .. } | Backing::Revoked { .. } => Err(Fault::Segv),
             Backing::File { cache, offset, shared, .. } => {
                 // Reading a missing page may sleep (a remote file): only the
-                // address space is locked.
+                // address space is locked. A pager's page is waited for
+                // without the lock (`fault_or_retry`) unless `wait`.
                 let index = (offset + (page - v.start)) / PAGE;
-                let frame = cache.map_page(index)?;
+                let Some(frame) = cache.try_map_page(index, wait)? else {
+                    self.awaited = Some((cache.clone(), index));
+                    return Err(Fault::Retry);
+                };
                 if *shared && cache.tracks_dirty() {
                     // Writable only once the store marked it dirty.
                     if access.write && !cache.set_dirty(index) {
@@ -926,9 +946,16 @@ impl AddressSpace {
     }
 
     /// Faults in every page of [start, start+len) (MAP_POPULATE, loader).
+    /// A page that must come from a pager is asked for, not waited for (the
+    /// space is locked, and the pager may need it): best effort, as
+    /// MAP_POPULATE is on Linux.
     pub fn populate(&mut self, start: u64, len: u64, write: bool) -> Result<(), Fault> {
         for page in user_pages(start, start.saturating_add(len)) {
-            self.fault(page.start_address().as_u64(), Access { write, exec: false })?;
+            match self.fault_or_retry(page.start_address().as_u64(), Access { write, exec: false }, false) {
+                Ok(()) => {}
+                Err(Fault::Retry) => self.awaited = None,
+                Err(e) => return Err(e),
+            }
         }
         Ok(())
     }
@@ -1294,7 +1321,25 @@ fn for_each_leaf(l4: PhysFrame, start: u64, end: u64, mut f: impl FnMut(u64, &'s
 /// a file page may be read), so interrupts must be enabled.
 pub fn handle_fault(va: u64, access: Access) -> Result<(), Fault> {
     let mm = super::current_mm().ok_or(Fault::Segv)?;
-    let result = mm.lock().fault(va, access);
+    let result = loop {
+        let (result, awaited) = {
+            let mut space = mm.lock();
+            let result = space.fault_or_retry(va, access, false);
+            (result, space.awaited.take())
+        };
+        match (result, awaited) {
+            // The page comes from a pager: waited for with the space
+            // unlocked, then the fault is tried again (the mapping may have
+            // changed meanwhile).
+            (Err(Fault::Retry), Some((cache, index))) => {
+                if cache.wait_page(index).is_err() {
+                    break Err(Fault::Bus);
+                }
+            }
+            (Err(Fault::Retry), None) => break Err(Fault::Bus),
+            (result, _) => break result,
+        }
+    };
     if access.write && result.is_ok() {
         // The store may have made a page dirty: too many, and this writer
         // writes back (with no lock held).

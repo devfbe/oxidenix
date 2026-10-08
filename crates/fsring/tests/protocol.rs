@@ -156,7 +156,7 @@ fn completions_stats_and_usage_round_trip() {
     assert_eq!(Completion::from_desc(&c.to_desc()), c);
     let s = Stat { mode: 0o100644, links: 3, size: 1 << 40, atime: 1, mtime: u32::MAX, ctime: 7 };
     assert_eq!(Stat::from_values(&s.to_values()), s);
-    let u = Usage { block_size: 1024, blocks: 65536, free_blocks: 100, inodes: 16384, free_inodes: u32::MAX };
+    let u = Usage { block_size: 1024, blocks: 65536, free_blocks: 100, inodes: 16384, free_inodes: u32::MAX, max_file_size: 16 << 30 };
     assert_eq!(Usage::from_values(&u.to_values()), u);
 }
 
