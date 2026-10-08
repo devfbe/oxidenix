@@ -17,7 +17,12 @@ An AI research project; see README.md.
   the workspace root lacks the kernel's `build-std`/target config.
 - `cd kernel && cargo run` builds the rootfs, the disk image and starts QEMU
   (extra arguments after `--` are passed to QEMU).
-- `cargo` lives in `~/.cargo/bin`.
+- `cargo` lives in `~/.cargo/bin`; a fresh (background) shell may lack it, so
+  `export PATH=$HOME/.cargo/bin:$PATH`, or run commands in the dev shell
+  (`nix develop --command ...`, `flake.nix`; direnv loads it via `.envrc`), which has
+  rustup, QEMU, e2fsprogs, Python, gh and jq, `OXIDENIX_OVMF` and the pinned `NIX_PATH`.
+- rust-analyzer (in `rust-toolchain.toml`, used by the LSP) works on the whole workspace
+  without extra configuration: prefer it for definitions, references and callers over grep.
 - All Nix packages (musl toolchain, Bash, BusyBox, OVMF, e2fsprogs) come from the nixpkgs pinned
   in `nix/nixpkgs.nix`; the builder, `userspace/build.sh`, `scripts/bench.sh` and CI set
   `NIX_PATH=nixpkgs=nix/nixpkgs.nix`. Use the same for manual Nix calls (the host ext2 test:
@@ -79,6 +84,9 @@ An AI research project; see README.md.
 - Then continue directly with the next step.
 - Check the GitHub Actions runs regularly (`gh run list`), at the latest before starting a new
   step after pushes; a red run is fixed before new work goes on top.
+- Edit with the Edit tool, not with ad-hoc Python or sed scripts (a replacement that misses
+  must fail loudly). After an edit, check the affected crate first (`cargo check` in it, or
+  the LSP's diagnostics); run the QEMU suites once that is clean.
 - Parallelize with subagents whenever work splits into independent parts (e.g. separate
   subsystems): run them concurrently, each in its own git worktree, and merge their branches
   into `main` after reviewing and testing the result.
