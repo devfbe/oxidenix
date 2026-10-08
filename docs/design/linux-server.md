@@ -191,6 +191,24 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
      `mmap` of the server's files, and `execve`, which resolves the program in the server's
      namespace and hands the kernel's loader its memory object (until R8 moves the loader).
      The kernel keeps a read-only view of the initramfs for what it starts at boot.
+     In steps:
+     - **c1** (done): `crates/vfs`, the pure parts (path arithmetic, the cpio format), tested
+       on the host.
+     - **c2a — Records** (done): the server's state per working-directory context (cwd,
+       umask). Until R8 the kernel's clone decides who shares a working directory
+       (`CLONE_FS`); each such context of the kernel's carries the server's record
+       (`fs_record`), a clone that makes a new one gets a copy the server made before the call
+       passed through, and the kernel reports a record whose context ended (`EVENT_RELEASE`).
+     - **c2b — Path calls in the server**: resolution, the working directory and every call
+       that takes a path move into the server, over a mount table whose filesystems are, at
+       first, the kernel's tree, reached through handles on its inodes (lookup, create,
+       unlink, rename, readlink, stat, open into a descriptor, exec). The same bridge later
+       serves `/data`, `/proc`, `/sys` and `/dev` until c3 and R6d.
+     - **c2c — tmpfs in the server**: the root becomes the server's own tmpfs, unpacked from
+       the initramfs, with files as memory objects (read, write, `mmap` and exec without the
+       kernel's VFS); the kernel's tree stays mounted for what it still serves.
+     - **c3**: the server as the client of diskfs and procfs, with its page cache and
+       write-back.
    - **R6d — The terminal** (ADR 0004): the console as a device of the server, the line
      discipline and job control's terminal side in the server.
    - **R6e — The descriptor table, `poll`, `select` and `epoll`** move with the sockets (R7),

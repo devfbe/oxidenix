@@ -31,7 +31,7 @@ use super::errno::SysResult;
 use crate::fs::cache::PageCache;
 use crate::memory::{self, frame::UserFrames};
 use alloc::collections::BTreeMap;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use restricted::*;
 use x86_64::structures::paging::{FrameAllocator, FrameDeallocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags, PhysFrame, Size4KiB};
@@ -455,13 +455,40 @@ impl Instance {
     /// Tells the service thread that the server file `id` lost its last
     /// descriptor.
     fn queue_closed(&self, id: u64) {
+        self.queue_event(Event { kind: EVENT_CLOSED, a: id, b: 0 });
+    }
+
+    /// Queues an event for the service thread (none once it is gone or
+    /// going: nobody would take it).
+    fn queue_event(&self, event: Event) {
         let mut q = self.pager.lock();
         if q.dead || q.closing {
             return;
         }
-        q.requests.push_back(Event { kind: EVENT_CLOSED, a: id, b: 0 });
+        q.requests.push_back(event);
         drop(q);
         super::wakeup(self.pager_chan());
+    }
+}
+
+/// A record of the server's (`SYS_FS_RECORD`) held by a kernel object: the
+/// server learns when the last holder is gone (`EVENT_RELEASE`).
+pub struct Record {
+    instance: Weak<Instance>,
+    word: u64,
+}
+
+impl Record {
+    pub fn word(&self) -> u64 {
+        self.word
+    }
+}
+
+impl Drop for Record {
+    fn drop(&mut self) {
+        if let Some(instance) = self.instance.upgrade() {
+            instance.queue_event(Event { kind: EVENT_RELEASE, a: self.word, b: 0 });
+        }
     }
 }
 
@@ -495,6 +522,9 @@ pub struct LinuxThread {
     /// Server files whose last descriptor this thread's pass-through call
     /// closed: handed to the server when the call returns.
     closed_now: Vec<u64>,
+    /// The record for the working-directory context the thread's next
+    /// pass-through clone creates (`FS_CHILD`).
+    pub fs_child: Option<Record>,
     /// The server's registers while the program runs.
     normal: Frame,
 }
@@ -506,7 +536,7 @@ impl LinuxThread {
     pub fn new(instance: Arc<Instance>, program: &Frame) -> Result<(LinuxThread, Frame), i64> {
         let (slot, state) = instance.thread()?;
         let thread =
-            LinuxThread { instance, slot, state, restricted: false, pager: false, in_legacy: false, trap_nr: None, closed_now: Vec::new(), normal: Frame::default() };
+            LinuxThread { instance, slot, state, restricted: false, pager: false, in_legacy: false, trap_nr: None, closed_now: Vec::new(), fs_child: None, normal: Frame::default() };
         save(program, thread.state());
         let start = thread.start(ROLE_PROGRAM);
         Ok((thread, start))
@@ -516,7 +546,7 @@ impl LinuxThread {
     pub fn pager(instance: Arc<Instance>) -> Result<(LinuxThread, Frame), i64> {
         let (slot, state) = instance.thread()?;
         let thread =
-            LinuxThread { instance, slot, state, restricted: false, pager: true, in_legacy: false, trap_nr: None, closed_now: Vec::new(), normal: Frame::default() };
+            LinuxThread { instance, slot, state, restricted: false, pager: true, in_legacy: false, trap_nr: None, closed_now: Vec::new(), fs_child: None, normal: Frame::default() };
         let start = thread.start(ROLE_PAGER);
         Ok((thread, start))
     }
@@ -763,6 +793,19 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             Ok(0)
         }
         SYS_SHARED_MAP => Ok(instance.grow_heap(a[0])? as i64),
+        SYS_FS_RECORD => {
+            let (op, word) = (a[0], a[1]);
+            let record = || (word != 0).then(|| Record { instance: Arc::downgrade(&instance), word });
+            let old = match op {
+                FS_GET => return Ok(with_current(|p| p.fs.as_ref().map_or(0, |f| f.record_word())) as i64),
+                FS_SET => with_current(|p| p.fs.as_ref().map(|f| f.set_record(record()))).ok_or(EINVAL)?,
+                FS_CHILD => with_current(|p| p.linux.as_mut().and_then(|l| core::mem::replace(&mut l.fs_child, record()))),
+                _ => return Err(EINVAL),
+            };
+            // Released outside the task's lock.
+            drop(old);
+            Ok(0)
+        }
         SYS_SET_USERCOPY => {
             let (insn, fixup) = (a[0], a[1]);
             let code = IMAGE_BASE..THREADS_BASE;
@@ -913,13 +956,15 @@ pub fn legacy(closed: u64, cap: u64) -> Result<u64, i64> {
     set_legacy(true);
     super::syscall::dispatch_linux(&mut program);
     set_legacy(false);
-    let (ids, instance) = with_current(|p| match p.linux.as_mut() {
+    let (ids, instance, unused) = with_current(|p| match p.linux.as_mut() {
         Some(l) => {
             save(&program, l.state());
-            (core::mem::take(&mut l.closed_now), Some(l.instance.clone()))
+            (core::mem::take(&mut l.closed_now), Some(l.instance.clone()), l.fs_child.take())
         }
-        None => (Vec::new(), None),
+        None => (Vec::new(), None, None),
     });
+    // A child's record no clone took goes back to the server.
+    drop(unused);
     let mut told = 0;
     for id in ids {
         let fits = told < cap && super::uaccess::copy_to_server(closed + told * 8, &id.to_le_bytes()).is_ok();

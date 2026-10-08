@@ -113,7 +113,12 @@ pub fn clone(frame: &Frame, flags: u64, stack: u64, parent_tid: u64, child_tid: 
     let files = if flags & CLONE_FILES != 0 { parent.files()?.clone() } else { parent.files()?.duplicate().ok_or(ENOMEM)? };
     let fs = match (&parent.fs, flags & CLONE_FS != 0) {
         (Some(f), true) => f.clone(),
-        (Some(f), false) => FsInfo::new(f.cwd()).ok_or(ENOMEM)?,
+        (Some(f), false) => {
+            let fs = FsInfo::new(f.cwd()).ok_or(ENOMEM)?;
+            // The Linux server's record for the new context, if it gave one.
+            fs.set_record(parent.linux.as_mut().and_then(|l| l.fs_child.take()));
+            fs
+        }
         (None, _) => FsInfo::new(alloc::string::String::from("/")).ok_or(ENOMEM)?,
     };
     let vfork_done = if flags & CLONE_VFORK != 0 { Some(Arc::try_new(AtomicBool::new(false)).map_err(|_| ENOMEM)?) } else { None };

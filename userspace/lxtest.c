@@ -34,6 +34,8 @@
 #define TEST_ALLOC 1509
 #define TEST_LOCKED_ADD 1510
 #define TEST_USERCOPY 1511
+#define TEST_FS_VALUE 1512
+#define TEST_FS_RECORDS 1513
 
 static int failures;
 
@@ -73,6 +75,24 @@ static void *adder(void *arg) {
     (void)arg;
     syscall(TEST_LOCKED_ADD, 2000);
     return NULL;
+}
+
+static void *set_eleven(void *arg) {
+    (void)arg;
+    syscall(TEST_FS_VALUE, 11);
+    return NULL;
+}
+
+/* The count of the server's records once releases stopped arriving. */
+static long settled_records(void) {
+    long last = syscall(TEST_FS_RECORDS);
+    for (int i = 0; i < 20; i++) {
+        usleep(50 * 1000);
+        long now = syscall(TEST_FS_RECORDS);
+        if (now == last) break;
+        last = now;
+    }
+    return last;
 }
 
 int main(void) {
@@ -228,6 +248,31 @@ int main(void) {
     errno = 0;
     check("... an empty one is EAGAIN when non-blocking", read(efd, &v, 8) == -1 && errno == EAGAIN);
     close(efd);
+
+    /* Records per working-directory context (R6c): a fork gets a copy of
+     * its parent's, a thread shares its process's, and the kernel releases
+     * the record of a context that ended. */
+    syscall(TEST_FS_VALUE, 7);
+    pid_t c = fork();
+    if (c == 0) {
+        long seen = syscall(TEST_FS_VALUE, 0);
+        syscall(TEST_FS_VALUE, 9);
+        _exit(seen == 7 ? 0 : 1);
+    }
+    waitpid(c, &st, 0);
+    check("a forked child gets a copy of its parent's record", WIFEXITED(st) && WEXITSTATUS(st) == 0 && syscall(TEST_FS_VALUE, 0) == 7);
+    pthread_t t;
+    pthread_create(&t, NULL, set_eleven, NULL);
+    pthread_join(t, NULL);
+    check("a thread shares its process's record", syscall(TEST_FS_VALUE, 0) == 11);
+    long recs = settled_records();
+    for (int i = 0; i < 10; i++) {
+        if ((c = fork()) == 0) _exit(0);
+        waitpid(c, &st, 0);
+    }
+    long after = settled_records();
+    printf("    (records %ld -> %ld after 10 forks)\n", recs, after);
+    check("the kernel releases the records of ended processes", after <= recs);
     printf("lxtest: %s\n", failures ? "FAILED" : "all passed");
     return failures != 0;
 }

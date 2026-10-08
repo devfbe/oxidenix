@@ -178,7 +178,8 @@ pub const SYS_MO_FAIL: u64 = 1022;
 #[derive(Clone, Copy, Default, Debug)]
 pub struct Event {
     pub kind: u64,
-    /// `EVENT_PAGE`: the object's key; `EVENT_CLOSED`: the file's id.
+    /// `EVENT_PAGE`: the object's key; `EVENT_CLOSED`: the file's id;
+    /// `EVENT_RELEASE`: the record.
     pub a: u64,
     /// `EVENT_PAGE`: byte offset of the page in the object.
     pub b: u64,
@@ -186,6 +187,9 @@ pub struct Event {
 
 pub const EVENT_PAGE: u64 = 1;
 pub const EVENT_CLOSED: u64 = 2;
+/// A record of the server's (`SYS_FS_RECORD`) lost its last holder: `a` is
+/// the record.
+pub const EVENT_RELEASE: u64 = 3;
 
 /// A server thread starts with its role in `rsi` (and its `State` in
 /// `rdi`): it serves a program's thread, or it is the instance's pager.
@@ -281,3 +285,25 @@ pub const SYS_KFD_READ: u64 = 1038;
 /// `kfd_write(fd, buf, len) -> n`: writes the server's memory to a file of
 /// the kernel's, as write(2) would.
 pub const SYS_KFD_WRITE: u64 = 1039;
+
+// Records per working-directory context (phase R6c): until the process
+// model is the server's (R8), the kernel's clone decides which processes
+// share a working directory (CLONE_FS), and each such context of the
+// kernel's carries a word of the server's, its record (cwd, umask).
+
+/// `fs_record(op, word)`: `FS_GET` returns the record of the calling
+/// thread's context (0: none yet); `FS_SET` makes `word` its record;
+/// `FS_CHILD` gives `word` to the next context this thread's pass-through
+/// call creates (a clone without CLONE_FS). Every record handed over comes
+/// back exactly once as `EVENT_RELEASE`: when its context ends, when it is
+/// replaced, or, a child's record no clone took, when the call returns.
+pub const SYS_FS_RECORD: u64 = 1040;
+pub const FS_GET: u64 = 0;
+pub const FS_SET: u64 = 1;
+pub const FS_CHILD: u64 = 2;
+
+/// `(value)`: sets the test value of the caller's record (0: leaves it);
+/// returns it.
+pub const TEST_FS_VALUE: u64 = 1512;
+/// `()`: how many records the instance holds.
+pub const TEST_FS_RECORDS: u64 = 1513;

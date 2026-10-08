@@ -17,6 +17,7 @@ mod files;
 mod heap;
 mod mm;
 mod pipe;
+mod records;
 mod sync;
 mod time;
 mod usercopy;
@@ -69,9 +70,10 @@ pub extern "C" fn _start(state: *mut State, role: u64) -> ! {
             continue;
         }
         match s.rax {
-            TEST_MAP..=TEST_USERCOPY => s.rax = test(s.rax, s.rdi) as u64,
+            TEST_MAP..=TEST_FS_RECORDS => s.rax = test(s.rax, s.rdi) as u64,
             nr if nr >= FIRST_NON_LINUX => s.rax = -ENOSYS as u64,
             _ => {
+                records::before_pass_through(s);
                 // Server files the call closed for good go at once.
                 let mut closed = [0u64; 16];
                 let n = syscall(SYS_LEGACY_SYSCALL, [closed.as_mut_ptr() as u64, closed.len() as u64, 0, 0, 0, 0]);
@@ -101,8 +103,8 @@ static TEST_FAIL_OBJECT: AtomicU64 = AtomicU64::new(0);
 static FAILED_ONCE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// The instance's service thread (the pager thread): supplies the pages
-/// threads wait for, and drops the server's files whose last descriptor
-/// went. (So far the only paged objects are the tests'; page n of the
+/// threads wait for, drops the server's files whose last descriptor went
+/// and the records the kernel released. (So far the only paged objects are the tests'; page n of the
 /// first reads "paged n".)
 fn pager() -> ! {
     loop {
@@ -112,6 +114,10 @@ fn pager() -> ! {
         }
         if event.kind == EVENT_CLOSED {
             files::closed(event.a);
+            continue;
+        }
+        if event.kind == EVENT_RELEASE {
+            records::released(event.a);
             continue;
         }
         let request = PagerRequest { key: event.a, offset: event.b };
@@ -227,6 +233,8 @@ fn test(nr: u64, addr: u64) -> i64 {
             if r < 0 { r } else { 0 }
         }
         TEST_ALLOC => test_alloc(addr) as i64,
+        TEST_FS_VALUE => records::test_value(addr),
+        TEST_FS_RECORDS => records::live(),
         TEST_USERCOPY => match usercopy::to_program(addr, b"usercopy") {
             Ok(()) => 0,
             Err(e) => -e,

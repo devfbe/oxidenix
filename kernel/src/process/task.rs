@@ -264,11 +264,23 @@ impl Files {
 /// Working directory, shared by the tasks cloned with CLONE_FS.
 pub struct FsInfo {
     cwd: IrqSpinLock<String>,
+    /// The Linux server's record for this context (`restricted::SYS_FS_RECORD`).
+    record: IrqSpinLock<Option<super::linux::Record>>,
 }
 
 impl FsInfo {
     pub fn new(cwd: String) -> Option<Arc<FsInfo>> {
-        Arc::try_new(FsInfo { cwd: IrqSpinLock::new(cwd) }).ok()
+        Arc::try_new(FsInfo { cwd: IrqSpinLock::new(cwd), record: IrqSpinLock::new(None) }).ok()
+    }
+
+    pub fn record_word(&self) -> u64 {
+        self.record.lock().as_ref().map_or(0, |r| r.word())
+    }
+
+    /// Replaces the server's record; returns the old one (to be dropped
+    /// without the lock).
+    pub fn set_record(&self, record: Option<super::linux::Record>) -> Option<super::linux::Record> {
+        core::mem::replace(&mut *self.record.lock(), record)
     }
 
     pub fn cwd(&self) -> String {
