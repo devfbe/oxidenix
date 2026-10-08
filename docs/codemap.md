@@ -33,7 +33,7 @@ module comment, and the public types it defines. Where to start for common tasks
 - `kernel/src/memory/kstack.rs` (124) Kernel stacks. Types: `KernelStack`.
 - `kernel/src/memory/mod.rs` (262) Kernel memory: the frame allocator, the kernel heap (slab size classes over a first-fit heap), mappings of physical memory, and the commit and page-cache accounting. Types: `Caching`, `Stats`.
 - `kernel/src/net.rs` (124) Client side of the network server (netd): every socket operation of a user program becomes a `netproto` request. Types: `Endpoint`, `Socket`.
-- `kernel/src/process/address_space.rs` (1097) A process's virtual memory: its page tables and the areas (VMAs) that say what each address range is. Types: `Prot`, `Backing`, `Vma`, `MemStats`, `Fault`, `Access`, `AddressSpace`, `Mm`.
+- `kernel/src/process/address_space.rs` (1160) A process's virtual memory: its page tables and the areas (VMAs) that say what each address range is. Types: `Prot`, `Backing`, `Vma`, `MemStats`, `Fault`, `Access`, `AddressSpace`, `Mm`.
 - `kernel/src/process/channel.rs` (718) Channels: the kernel's part of the data plane between the Linux server and the device servers (docs/design/io-rings.md, ADR 0005). Types: `Channel`, `Grant`, `DmaDomain`, `ClientEnd`.
 - `kernel/src/process/clone.rs` (186) clone(2), fork and vfork: new threads and processes.
 - `kernel/src/process/elf.rs` (81) Parsing ELF64 headers and program headers of static executables (for `loader`). Types: `Elf`, `ProgramHeader`, `Header`.
@@ -155,7 +155,7 @@ module comment, and the public types it defines. Where to start for common tasks
 - `userspace/lxtest.c` (402) The Linux server's kernel interface (docs/design/linux-server.md), exercised through the server's test calls (1500 and up, see crates/restricted): the program asks its server to create a memory object, fill it, map...
 - `userspace/mmaptest.c` (135) File mappings through the page cache: shared mappings see write() and read() sees stores through them, across processes; private mappings see the file until they write; truncation and the end of the file give SIGBUS;...
 - `userspace/nettest.c` (170) Socket tests: TCP and UDP over loopback and through QEMU's user network (10.0.2.100:7 is an echo service, see builder/src/main.rs).
-- `userspace/oomtest.c` (72) Running out of resources: fork bombs, memory hogs and full pipes fail with errors (EAGAIN, ENOMEM) instead of bringing the kernel down.
+- `userspace/oomtest.c` (126) Running out of resources: fork bombs, memory hogs and full pipes fail with errors (EAGAIN, ENOMEM) instead of bringing the kernel down, and a process touching uncommitted (MAP_NORESERVE) memory beyond the commit...
 - `userspace/polltest.c` (158) poll and select wake up when a descriptor becomes ready, not at the next scheduler tick: the waiter sits on the wait queues of the files it polls.
 - `userspace/proctest.c` (133) Process information: prctl, capabilities and (later) /proc.
 - `userspace/rwtest.h` (50) Positional and vectored reads and writes with preadv2/pwritev2's flags, on a file at `path` (fstest runs them on /data, the kernel's files; lxtest on /tmp, the Linux server's): the offset -1 means the file position,...

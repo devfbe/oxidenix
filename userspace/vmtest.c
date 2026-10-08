@@ -124,12 +124,12 @@ int main(void) {
     if (rwx) {
         range[123 * MIB] = 7;
         check("... and its pages work", range[123 * MIB] == 7 && range[0] == 0);
-        /* A fork copies the area uncommitted too: it would not fit. */
+        /* A fork commits only the touched page again: the area would not fit. */
         pid_t child = fork();
         if (child == 0) _exit(range[123 * MIB] == 7 ? 0 : 1);
         int status = -1;
         if (child > 0) waitpid(child, &status, 0);
-        check("... and a fork with it succeeds (nothing charged)", child > 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        check("... and a fork with it succeeds (only touched pages count)", child > 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0);
     }
     if (range != MAP_FAILED) munmap(range, 4096 * MIB);
     range = mmap(NULL, 4096 * MIB, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
