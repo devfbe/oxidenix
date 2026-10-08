@@ -679,3 +679,76 @@ fn a_crash_never_exposes_freed_blocks() {
     // And without a crash, all is there and consistent.
     fsck("crash", &disk);
 }
+
+// ------------------------------------------------------- review follow-ups
+
+/// A superblock whose group sizes do not fit a bitmap block (or whose
+/// inodes are larger than a block) is refused at mount, not a panic later.
+#[test]
+fn impossible_group_sizes_are_refused_at_mount() {
+    let good = mkfs("sizes", 2 * 1024);
+    for (offset, value) in [(32usize, 8 * 1024 + 1u32), (40, 8 * 1024 + 1), (32, 0)] {
+        let mut disk = RamDisk { data: good.data.clone(), counts: Counts::default(), fail_at: None, fail_count: 0, log: None };
+        disk.data[1024 + offset..1024 + offset + 4].copy_from_slice(&value.to_le_bytes());
+        assert!(Ext2::mount(disk).is_err(), "superblock field {offset} = {value}");
+    }
+    let mut disk = RamDisk { data: good.data.clone(), counts: Counts::default(), fail_at: None, fail_count: 0, log: None };
+    disk.data[1024 + 88..1024 + 90].copy_from_slice(&2048u16.to_le_bytes());
+    assert!(Ext2::mount(disk).is_err(), "inodes larger than a block");
+    assert!(Ext2::mount(good).is_ok());
+}
+
+/// The blocks of `ino` (from its extents).
+fn blocks_of(fs: &mut Ext2<RamDisk>, ino: u32, len: u64) -> Vec<u32> {
+    let (_, extents) = fs.read_map(ino, 0, len).unwrap();
+    extents.iter().filter_map(|e| e.disk.map(|d| (d / 1024) as u32..((d + e.len) / 1024) as u32)).flatten().collect()
+}
+
+/// Blocks freed by an operation whose commit failed are still pointed to
+/// on the disk: no allocation (ring reservations, IPC writes) takes them
+/// until a commit succeeded, so a crash never shows another file's data
+/// in the old file.
+#[test]
+fn blocks_freed_before_a_failed_commit_are_not_reused() {
+    let mut fs = Ext2::mount(mkfs("freed", 2 * 1024)).unwrap();
+    let a = fs.create(ROOT_INO, "a", &NewNode::File, 0o644).unwrap();
+    write_file(&mut fs, a, 64 * 1024);
+    let old = blocks_of(&mut fs, a, 64 * 1024);
+    assert_eq!(old.len(), 64);
+    let b = fs.create(ROOT_INO, "b", &NewNode::File, 0o644).unwrap();
+    let c = fs.create(ROOT_INO, "c", &NewNode::File, 0o644).unwrap();
+    fs.device_mut().fail_writes(0, 1000);
+    assert!(fs.truncate(a, 0).is_err());
+    fs.device_mut().fail_at = None;
+    // No commit has succeeded since: the freed blocks stay untouched.
+    let r = fs.reserve(b, 0, 64 * 1024).unwrap();
+    let taken: Vec<u32> = r.runs.iter().flat_map(|run| run.block..run.block + run.count).collect();
+    assert!(taken.iter().all(|blk| !old.contains(blk)), "a reservation took a block freed before the failed commit");
+    fs.unreserve(&r);
+    // The IPC path: its allocation comes before its own commit.
+    fs.write(c, 0, &[7u8; 16 * 1024]).unwrap();
+    let got = blocks_of(&mut fs, c, 16 * 1024);
+    assert!(got.iter().all(|blk| !old.contains(blk)), "a write took a block freed before the failed commit");
+    fsck("freed", &take(fs));
+}
+
+/// An inode that was freed takes no more reads or writes from the IPC
+/// path either (a client that still names it gets ENOENT, nothing is
+/// allocated to a free inode).
+#[test]
+fn freed_inodes_take_no_operations() {
+    let mut fs = Ext2::mount(mkfs("freedino", 2 * 1024)).unwrap();
+    let f = fs.create(ROOT_INO, "f", &NewNode::File, 0o644).unwrap();
+    fs.write(f, 0, b"data").unwrap();
+    for ino in fs.unlink(ROOT_INO, "f", false).unwrap() {
+        fs.release(ino).unwrap();
+    }
+    let enoent = Err(ext2fs::errno::ENOENT);
+    assert_eq!(fs.write(f, 0, b"more").map(|_| ()), enoent);
+    let mut buf = [0u8; 4];
+    assert_eq!(fs.read(f, 0, &mut buf).map(|_| ()), enoent);
+    assert_eq!(fs.truncate(f, 100), enoent);
+    assert_eq!(fs.set_perm(f, 0o600), enoent);
+    assert_eq!(fs.release(f), enoent);
+    fsck("freedino", &take(fs));
+}
