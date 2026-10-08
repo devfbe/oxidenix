@@ -137,6 +137,12 @@ pub fn openat(dirfd: u64, path: u64, flags: u64, mode: u64) -> SysResult {
     if flags & O_NOFOLLOW != 0 && inode.file_type() == fs::S_IFLNK {
         return Err(ELOOP);
     }
+    open_inode(inode, flags, fs::join(&fs::normalize(&base, &path)))
+}
+
+/// A descriptor for a resolved inode, as open(2) makes it: `abs` is its
+/// absolute path (also for the Linux server's `inode_open`).
+pub fn open_inode(inode: Arc<Inode>, flags: u32, abs: String) -> SysResult {
     let writable = flags & O_ACCMODE != 0;
     if inode.is_dir() && writable {
         return Err(EISDIR);
@@ -149,7 +155,6 @@ pub fn openat(dirfd: u64, path: u64, flags: u64, mode: u64) -> SysResult {
     if flags & O_TRUNC != 0 && access.is_some() {
         inode.truncate(0)?;
     }
-    let abs = fs::join(&fs::normalize(&base, &path));
     let f = OpenFile::inode_file(inode, flags, abs, access);
     with_current(|p| p.alloc_fd(f, flags & O_CLOEXEC != 0, 0))
 }
@@ -161,6 +166,12 @@ pub fn close(fd: u64) -> SysResult {
 }
 
 fn write_stat(buf: u64, ino: u64, mode: u32, size: u64, extra: (u64, u64, u64, u64)) -> SysResult {
+    uaccess::write(buf, stat_bytes(ino, mode, size, extra))?;
+    Ok(0)
+}
+
+/// A `struct stat` as Linux lays it out.
+fn stat_bytes(ino: u64, mode: u32, size: u64, extra: (u64, u64, u64, u64)) -> [u8; 144] {
     let (nlink, atime, mtime, ctime) = extra;
     let mut st = [0u8; 144];
     st[8..16].copy_from_slice(&ino.to_le_bytes());
@@ -172,13 +183,18 @@ fn write_stat(buf: u64, ino: u64, mode: u32, size: u64, extra: (u64, u64, u64, u
     st[48..56].copy_from_slice(&size.to_le_bytes());
     st[56..64].copy_from_slice(&4096u64.to_le_bytes()); // blksize
     st[64..72].copy_from_slice(&size.div_ceil(512).to_le_bytes()); // blocks
-    uaccess::write(buf, st)?;
-    Ok(0)
+    st
+}
+
+/// An inode's `struct stat`.
+pub fn inode_stat(inode: &Inode) -> Result<[u8; 144], i64> {
+    let s = inode.stat()?;
+    Ok(stat_bytes(inode.ino, s.mode, s.size, (s.nlink, s.atime, s.mtime, s.ctime)))
 }
 
 fn stat_inode(inode: &Inode, buf: u64) -> SysResult {
-    let s = inode.stat()?;
-    write_stat(buf, inode.ino, s.mode, s.size, (s.nlink, s.atime, s.mtime, s.ctime))
+    uaccess::write(buf, inode_stat(inode)?)?;
+    Ok(0)
 }
 
 pub fn fstat(fd: u64, buf: u64) -> SysResult {
@@ -678,6 +694,12 @@ pub fn utimensat(dirfd: u64, path: u64, flags: u64) -> SysResult {
 /// statfs/fstatfs: a server's filesystem reports its real usage, everything else
 /// the in-memory filesystem (tmpfs) and its size limit.
 fn write_statfs(inode: &Inode, buf: u64) -> SysResult {
+    uaccess::write(buf, statfs_words(inode))?;
+    Ok(0)
+}
+
+/// The `struct statfs` of an inode's filesystem.
+pub fn statfs_words(inode: &Inode) -> [u64; 15] {
     const EXT2_MAGIC: u64 = 0xef53;
     const TMPFS_MAGIC: u64 = 0x0102_1994;
     let (kind, bsize, blocks, free, files, ffree) = match inode.filesystem() {
@@ -690,9 +712,7 @@ fn write_statfs(inode: &Inode, buf: u64) -> SysResult {
             (TMPFS_MAGIC, 4096, limit, limit.saturating_sub(used), 0, 0)
         }
     };
-    let words: [u64; 15] = [kind, bsize, blocks, free, free, files, ffree, 0, fs::NAME_MAX as u64, bsize, 0, 0, 0, 0, 0];
-    uaccess::write(buf, words)?;
-    Ok(0)
+    [kind, bsize, blocks, free, free, files, ffree, 0, fs::NAME_MAX as u64, bsize, 0, 0, 0, 0, 0]
 }
 
 pub fn statfs(path: u64, buf: u64) -> SysResult {

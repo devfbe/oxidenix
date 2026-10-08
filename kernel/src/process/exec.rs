@@ -12,7 +12,7 @@ use super::sched::{current, prepare_to_wait, TABLE};
 use super::signal::{self, GroupExit};
 use super::syscall::Frame;
 use super::task;
-use super::{absolute, basename, clone, cmdline_of, load_path, tlb, with_current, FdEntry, Pid};
+use super::{absolute, basename, clone, cmdline_of, load_inode, load_path, tlb, with_current, FdEntry, Pid};
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
@@ -71,8 +71,15 @@ fn de_thread() -> Result<(), i64> {
 }
 
 pub fn exec(frame: &mut Frame, path: &str, args: &[String], envs: &[String]) -> Result<(), i64> {
-    let cwd = with_current(|p| p.cwd());
-    let image = load_path(&cwd, path, args, envs)?;
+    // A Linux program's path was resolved by its server.
+    let target = with_current(|p| p.linux.as_mut().and_then(|l| l.exec_target.take()));
+    let (image, exe) = match target {
+        Some((inode, abs)) => (load_inode(inode, args, envs)?, abs),
+        None => {
+            let cwd = with_current(|p| p.cwd());
+            (load_path(&cwd, path, args, envs)?, absolute(&cwd, path))
+        }
+    };
     let mut space = image.space;
     // The new program stays in the process's Linux server instance.
     if let Some(instance) = with_current(|p| p.mm.as_ref().and_then(|m| m.lock().instance().cloned())) {
@@ -96,7 +103,7 @@ pub fn exec(frame: &mut Frame, path: &str, args: &[String], envs: &[String]) -> 
         let mut info = me.group.info.lock();
         info.name = basename(path).to_string();
         info.cmdline = cmdline_of(args);
-        info.exe = absolute(&cwd, path);
+        info.exe = exe;
         info.mem = Some(mm.stats.clone());
     }
     *me.comm.lock() = basename(path).chars().take(15).collect();

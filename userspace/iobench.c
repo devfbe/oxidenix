@@ -171,7 +171,23 @@ static void ipc_round_trip(void) {
     per_op("fstat_tmpfs", SAMPLES);
     percentiles("fstat_tmpfs", t, SAMPLES, "cycles");
     close(tfd);
-    unlink("/tmp/iobench.stat");
+
+    /* stat by path: resolution (four names, in the Linux server since
+     * R6c.2b) plus the attributes. */
+    mkdir("/tmp/iobench.d", 0755);
+    mkdir("/tmp/iobench.d/a", 0755);
+    rename("/tmp/iobench.stat", "/tmp/iobench.d/a/f");
+    start_counting();
+    for (int i = 0; i < SAMPLES; i++) {
+        uint64_t a = rdtsc();
+        stat("/tmp/iobench.d/a/f", &st);
+        t[i] = rdtsc() - a;
+    }
+    per_op("stat_path_tmpfs", SAMPLES);
+    percentiles("stat_path_tmpfs", t, SAMPLES, "cycles");
+    unlink("/tmp/iobench.d/a/f");
+    rmdir("/tmp/iobench.d/a");
+    rmdir("/tmp/iobench.d");
 }
 
 /* ------------------------------------------------------------- block */

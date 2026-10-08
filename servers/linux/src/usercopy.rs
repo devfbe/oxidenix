@@ -82,3 +82,24 @@ pub fn read<T: Copy + Default>(addr: u64) -> Result<T, i64> {
     from_program(addr, bytes)?;
     Ok(value)
 }
+
+/// A NUL-terminated string of the program's (a path: at most 4096 bytes
+/// with the NUL, else ENAMETOOLONG). Read a page piece at a time, so that
+/// an unmapped page after the string's end does not matter.
+pub fn read_cstr(addr: u64) -> Result<alloc::string::String, i64> {
+    const MAX: usize = 4096;
+    const ENAMETOOLONG: i64 = 36;
+    let mut bytes = alloc::vec::Vec::new();
+    let mut chunk = [0u8; 256];
+    while bytes.len() < MAX {
+        let at = addr.checked_add(bytes.len() as u64).ok_or(EFAULT)?;
+        let n = chunk.len().min(4096 - (at % 4096) as usize).min(MAX - bytes.len());
+        from_program(at, &mut chunk[..n])?;
+        if let Some(end) = chunk[..n].iter().position(|&b| b == 0) {
+            bytes.extend_from_slice(&chunk[..end]);
+            return alloc::string::String::from_utf8(bytes).map_err(|_| EFAULT);
+        }
+        bytes.extend_from_slice(&chunk[..n]);
+    }
+    Err(ENAMETOOLONG)
+}

@@ -118,11 +118,13 @@ struct PagerQueue {
 
 /// A kernel object the Linux server refers to by handle.
 #[derive(Clone)]
-enum Object {
+pub(super) enum Object {
     /// A memory object (pages that mappings and reads and writes share).
     Memory(Arc<PageCache>),
     /// An open file of the kernel's descriptor table, to map.
     KernelFile(Arc<crate::fs::file::OpenFile>),
+    /// An inode of the kernel's tree (`super::linux_inode`).
+    Inode(Arc<crate::fs::Inode>),
 }
 
 /// Most handles one instance may hold.
@@ -347,7 +349,7 @@ impl Instance {
     }
 
     /// A new handle for `object`.
-    fn insert(&self, object: Object) -> Result<u64, i64> {
+    pub(super) fn insert(&self, object: Object) -> Result<u64, i64> {
         let mut h = self.handles.lock();
         if h.objects.len() >= MAX_HANDLES {
             return Err(EMFILE);
@@ -358,14 +360,14 @@ impl Instance {
         Ok(handle)
     }
 
-    fn object(&self, handle: u64) -> Result<Object, i64> {
+    pub(super) fn object(&self, handle: u64) -> Result<Object, i64> {
         self.handles.lock().objects.get(&handle).cloned().ok_or(EBADF)
     }
 
     fn memory(&self, handle: u64) -> Result<Arc<PageCache>, i64> {
         match self.object(handle)? {
             Object::Memory(m) => Ok(m),
-            Object::KernelFile(_) => Err(EINVAL),
+            _ => Err(EINVAL),
         }
     }
 
@@ -525,6 +527,9 @@ pub struct LinuxThread {
     /// The record for the working-directory context the thread's next
     /// pass-through clone creates (`FS_CHILD`).
     pub fs_child: Option<Record>,
+    /// The program the thread's next pass-through execve runs, as the
+    /// server resolved it, with its absolute path (`SYS_EXEC_TARGET`).
+    pub exec_target: Option<(Arc<crate::fs::Inode>, alloc::string::String)>,
     /// The server's registers while the program runs.
     normal: Frame,
 }
@@ -536,7 +541,7 @@ impl LinuxThread {
     pub fn new(instance: Arc<Instance>, program: &Frame) -> Result<(LinuxThread, Frame), i64> {
         let (slot, state) = instance.thread()?;
         let thread =
-            LinuxThread { instance, slot, state, restricted: false, pager: false, in_legacy: false, trap_nr: None, closed_now: Vec::new(), fs_child: None, normal: Frame::default() };
+            LinuxThread { instance, slot, state, restricted: false, pager: false, in_legacy: false, trap_nr: None, closed_now: Vec::new(), fs_child: None, exec_target: None, normal: Frame::default() };
         save(program, thread.state());
         let start = thread.start(ROLE_PROGRAM);
         Ok((thread, start))
@@ -546,7 +551,7 @@ impl LinuxThread {
     pub fn pager(instance: Arc<Instance>) -> Result<(LinuxThread, Frame), i64> {
         let (slot, state) = instance.thread()?;
         let thread =
-            LinuxThread { instance, slot, state, restricted: false, pager: true, in_legacy: false, trap_nr: None, closed_now: Vec::new(), fs_child: None, normal: Frame::default() };
+            LinuxThread { instance, slot, state, restricted: false, pager: true, in_legacy: false, trap_nr: None, closed_now: Vec::new(), fs_child: None, exec_target: None, normal: Frame::default() };
         let start = thread.start(ROLE_PAGER);
         Ok((thread, start))
     }
@@ -702,6 +707,7 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
                         Backing::File { cache, offset, shared, may_write: true, _file: None }
                     }
                     Object::KernelFile(f) => file_backing(&f, shared, prot, len, offset)?,
+                    Object::Inode(_) => return Err(EINVAL),
                 },
             };
             let placement = Placement {
@@ -793,6 +799,7 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             Ok(0)
         }
         SYS_SHARED_MAP => Ok(instance.grow_heap(a[0])? as i64),
+        SYS_INODE_ROOT..=SYS_EXEC_TARGET => super::linux_inode::call(&instance, nr, a),
         SYS_FS_RECORD => {
             let (op, word) = (a[0], a[1]);
             let record = || (word != 0).then(|| Record { instance: Arc::downgrade(&instance), word });
@@ -972,6 +979,7 @@ pub fn legacy(closed: u64, cap: u64) -> Result<u64, i64> {
     let (ids, instance, unused) = with_current(|p| match p.linux.as_mut() {
         Some(l) => {
             save(&program, l.state());
+            l.exec_target = None;
             (core::mem::take(&mut l.closed_now), Some(l.instance.clone()), l.fs_child.take())
         }
         None => (Vec::new(), None, None),

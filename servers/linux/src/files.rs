@@ -70,6 +70,11 @@ pub fn closed(id: u64) {
     // An eventfd simply goes.
 }
 
+/// Whether descriptor `fd` names one of the server's files.
+pub fn is_server_file(fd: u64) -> bool {
+    lookup(fd).is_some()
+}
+
 /// The server's file behind descriptor `fd` and its open flags, or None
 /// for a file of the kernel's (or a bad descriptor: the kernel answers).
 fn lookup(fd: u64) -> Option<(File, u32)> {

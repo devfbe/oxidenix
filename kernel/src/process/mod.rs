@@ -22,6 +22,7 @@ pub mod syscall;
 pub mod task;
 pub mod tlb;
 pub mod linux;
+mod linux_inode;
 pub mod uaccess;
 
 use crate::fs::file::OpenFile;
@@ -367,7 +368,10 @@ fn basename(path: &str) -> &str {
 }
 
 fn load_path(cwd: &str, path: &str, args: &[String], envs: &[String]) -> Result<loader::Image, i64> {
-    let inode = fs::resolve(cwd, path, true)?;
+    load_inode(fs::resolve(cwd, path, true)?, args, envs)
+}
+
+fn load_inode(inode: Arc<fs::Inode>, args: &[String], envs: &[String]) -> Result<loader::Image, i64> {
     if inode.file_type() != fs::S_IFREG {
         return Err(if inode.is_dir() { EISDIR } else { ENOEXEC });
     }

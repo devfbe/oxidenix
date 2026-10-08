@@ -310,3 +310,63 @@ pub const FS_CHILD: u64 = 2;
 pub const TEST_FS_VALUE: u64 = 1512;
 /// `()`: how many records the instance holds.
 pub const TEST_FS_RECORDS: u64 = 1513;
+
+// The kernel's tree through handles (phase R6c.2b): until the server's own
+// filesystems serve them, the server resolves paths in the kernel's tree
+// through handles on its inodes. Names and paths are (pointer, length) in
+// the server's memory, at most 4096 bytes; paths here are relative,
+// without "." and "..", and walked name by name.
+
+/// `inode_root() -> handle`: the root of the kernel's tree.
+pub const SYS_INODE_ROOT: u64 = 1041;
+/// `inode_walk(dir, path, len, out) -> handle`: walks the names of `path`
+/// from `dir`. It stops after the first symlink it reaches (to be read by
+/// the server) or at the end, and stores a `Walk` at `out`. ENOENT or
+/// ENOTDIR for a name that is missing or below a file.
+pub const SYS_INODE_WALK: u64 = 1042;
+/// `inode_stat(handle, buf)`: the inode's `struct stat` (144 bytes).
+pub const SYS_INODE_STAT: u64 = 1043;
+/// `inode_readlink(handle, buf, cap) -> n`: a symlink's target.
+pub const SYS_INODE_READLINK: u64 = 1044;
+/// `inode_create(dir, name, len, kind, perm) -> handle`: a new file
+/// (`INODE_FILE`) or directory (`INODE_DIR`); EEXIST if the name is taken.
+pub const SYS_INODE_CREATE: u64 = 1045;
+/// `inode_symlink(dir, name, len, target, target_len)`.
+pub const SYS_INODE_SYMLINK: u64 = 1046;
+/// `inode_unlink(dir, name, len, dir_only)`: removes a name (rmdir with
+/// `dir_only`).
+pub const SYS_INODE_UNLINK: u64 = 1047;
+/// `inode_rename(odir, oname, olen, ndir, nname, nlen)`.
+pub const SYS_INODE_RENAME: u64 = 1048;
+/// `inode_chmod(handle, perm)`.
+pub const SYS_INODE_CHMOD: u64 = 1049;
+/// `inode_truncate(handle, len)`: as truncate(2) (ETXTBSY while it runs).
+pub const SYS_INODE_TRUNCATE: u64 = 1050;
+/// `inode_open(handle, flags, path, len) -> fd`: a descriptor of the
+/// calling process for the inode, as open(2) would make it once the path
+/// is resolved (O_ACCMODE, O_TRUNC, O_APPEND, O_NONBLOCK, O_DIRECTORY,
+/// O_CLOEXEC; EISDIR, ENOTDIR, ETXTBSY); `path` is its absolute path.
+pub const SYS_INODE_OPEN: u64 = 1051;
+/// `inode_statfs(handle, buf)`: its filesystem's `struct statfs`.
+pub const SYS_INODE_STATFS: u64 = 1052;
+/// `kfd_inode(fd, path, cap, len) -> handle`: the inode behind a kernel
+/// descriptor (ENOTDIR for one without, EBADF), its absolute path stored
+/// at `path` (at most `cap` bytes) and the path's length at `len` (a u64).
+pub const SYS_KFD_INODE: u64 = 1053;
+/// `exec_target(handle, path, len)`: the program the thread's next
+/// pass-through execve runs, resolved by the server, with its absolute
+/// path; dropped when that call returns.
+pub const SYS_EXEC_TARGET: u64 = 1054;
+
+pub const INODE_FILE: u64 = 0;
+pub const INODE_DIR: u64 = 1;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct Walk {
+    /// Bytes of the path walked (through the symlink, if it stopped at one).
+    pub consumed: u64,
+    /// The mode of the inode reached (S_IFLNK: a symlink).
+    pub mode: u32,
+    pub _pad: u32,
+}

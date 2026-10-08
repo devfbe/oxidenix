@@ -16,6 +16,8 @@ mod eventfd;
 mod files;
 mod heap;
 mod mm;
+mod namespace;
+mod paths;
 mod pipe;
 mod records;
 mod sync;
@@ -65,7 +67,7 @@ pub extern "C" fn _start(state: *mut State, role: u64) -> ! {
             continue;
         }
         let s = unsafe { &mut *state };
-        if let Some(result) = mm::handle(s).or_else(|| time::handle(s)).or_else(|| files::handle(s)) {
+        if let Some(result) = mm::handle(s).or_else(|| time::handle(s)).or_else(|| files::handle(s)).or_else(|| paths::handle(s)) {
             s.rax = result as u64;
             continue;
         }

@@ -199,7 +199,7 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
        (`CLONE_FS`); each such context of the kernel's carries the server's record
        (`fs_record`), a clone that makes a new one gets a copy the server made before the call
        passed through, and the kernel reports a record whose context ended (`EVENT_RELEASE`).
-     - **c2b — Path calls in the server**: resolution, the working directory and every call
+     - **c2b — Path calls in the server** (done): resolution, the working directory and every call
        that takes a path move into the server, over a mount table whose filesystems are, at
        first, the kernel's tree, reached through handles on its inodes (lookup, create,
        unlink, rename, readlink, stat, open into a descriptor, exec). The same bridge later

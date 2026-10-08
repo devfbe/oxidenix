@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <sys/eventfd.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <time.h>
 #include <pthread.h>
@@ -273,6 +274,58 @@ int main(void) {
     long after = settled_records();
     printf("    (records %ld -> %ld after 10 forks)\n", recs, after);
     check("the kernel releases the records of ended processes", after <= recs);
+
+    /* Paths are the server's (R6c.2b): resolution, the working directory
+     * and umask live in it; the kernel's tree answers through handles. */
+    struct stat sb;
+    char cwd[256];
+    l0 = legacy_calls();
+    int found = 1;
+    for (int i = 0; i < 50; i++) {
+        found &= stat("/etc/runtests.sh", &sb) == 0 && access("/bin", F_OK) == 0 && getcwd(cwd, sizeof cwd) != NULL;
+    }
+    passed = legacy_calls() - l0 - base;
+    printf("    (%ld of 150 path calls passed through)\n", passed);
+    check("stat, access and getcwd are the server's", passed == 0 && found && S_ISREG(sb.st_mode));
+    check("stat of the root", stat("/", &sb) == 0 && S_ISDIR(sb.st_mode) && stat("/..", &sb) == 0 && S_ISDIR(sb.st_mode));
+    mkdir("/tmp/lx", 0777);
+    check("chdir and getcwd", chdir("/tmp/lx") == 0 && getcwd(cwd, sizeof cwd) && strcmp(cwd, "/tmp/lx") == 0);
+    mode_t old_mask = umask(077);
+    int fd = open("f", O_CREAT | O_WRONLY | O_TRUNC, 0666);
+    check("umask applies to a new file (0666 & ~077)", fd >= 0 && write(fd, "abc", 3) == 3 && stat("f", &sb) == 0 && (sb.st_mode & 0777) == 0600 && sb.st_size == 3);
+    close(fd);
+    check("umask returns the old mask", umask(old_mask) == 077);
+    errno = 0;
+    check("O_EXCL on an existing file is EEXIST", open("f", O_CREAT | O_EXCL | O_WRONLY, 0666) == -1 && errno == EEXIST);
+    char link[64] = {0};
+    check("symlink and readlink", symlink("f", "l") == 0 && readlink("l", link, sizeof link) == 1 && link[0] == 'f');
+    check("stat follows a symlink, lstat does not", stat("l", &sb) == 0 && S_ISREG(sb.st_mode) && lstat("l", &sb) == 0 && S_ISLNK(sb.st_mode));
+    errno = 0;
+    check("O_NOFOLLOW on a symlink is ELOOP", open("l", O_RDONLY | O_NOFOLLOW) == -1 && errno == ELOOP);
+    symlink("loop2", "/tmp/lx/loop1");
+    symlink("loop1", "/tmp/lx/loop2");
+    errno = 0;
+    check("a symlink loop is ELOOP", stat("/tmp/lx/loop1", &sb) == -1 && errno == ELOOP);
+    check("a path through a symlinked directory", symlink("/tmp/lx", "d") == 0 && stat("d/d/d/f", &sb) == 0 && S_ISREG(sb.st_mode));
+    int dfd = open("/tmp", O_RDONLY | O_DIRECTORY);
+    check("openat relative to a directory descriptor", dfd >= 0 && fstatat(dfd, "lx/f", &sb, 0) == 0 && sb.st_size == 3);
+    check("rename", rename("f", "g") == 0 && stat("g", &sb) == 0 && stat("f", &sb) == -1);
+    c = fork();
+    if (c == 0) {
+        int ok = getcwd(cwd, sizeof cwd) && strcmp(cwd, "/tmp/lx") == 0;
+        chdir("/");
+        _exit(ok ? 0 : 1);
+    }
+    waitpid(c, &st, 0);
+    check("a child inherits the working directory, its chdir stays its own",
+          WIFEXITED(st) && WEXITSTATUS(st) == 0 && getcwd(cwd, sizeof cwd) && strcmp(cwd, "/tmp/lx") == 0);
+    check("fchdir", fchdir(dfd) == 0 && getcwd(cwd, sizeof cwd) && strcmp(cwd, "/tmp") == 0);
+    close(dfd);
+    errno = 0;
+    check("rmdir of a non-empty directory fails", rmdir("lx") == -1 && errno == ENOTEMPTY);
+    unlink("lx/g"); unlink("lx/l"); unlink("lx/d"); unlink("lx/loop1"); unlink("lx/loop2");
+    check("unlink and rmdir", rmdir("lx") == 0 && stat("lx", &sb) == -1 && errno == ENOENT);
+    chdir("/");
     printf("lxtest: %s\n", failures ? "FAILED" : "all passed");
     return failures != 0;
 }
