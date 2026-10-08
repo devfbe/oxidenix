@@ -181,7 +181,7 @@ no longer in the path: requests go through the shared-memory rings of a channel 
 
 - A **page cache hit** (`read`): the server's handler, one kernel call that copies from the
   cache page to the program (`SYS_MO_FILE_READ`): one copy, no server round trip.
-- A **miss**: the reading thread grants the run of missing pages (with read-ahead up to 1 MiB)
+- A **miss**: the reading thread grants the run of missing pages (with read-ahead up to 4 MiB)
   and sends one `READ`; diskfs maps the blocks and the device writes the pages by DMA. Zero
   CPU copies of the data before the copy to the program (findings 1, 2); many requests in flight
   at once, 32 in diskfs, the device reordering them (findings 6, 7).

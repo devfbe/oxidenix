@@ -353,7 +353,8 @@ pages and dirty marks the kernel keeps and whose data the server moves:
   interface"). A miss in `read(2)` (`MO_NOFILL`: the kernel reports it) is filled by the reading
   thread itself, a fault's by the pager thread (`EVENT_PAGE`): a run of missing pages from the
   window is granted and read by diskfs straight into them (DMA), then declared filled; the
-  window starts at 64 KiB and doubles to 1 MiB (one `READ`) while the file is read in order.
+  window starts at 64 KiB and doubles to 4 MiB (four 1 MiB `READ`s in flight) while the file is
+  read in order.
   `write(2)` copies into cache pages (filling first a page whose data it does not cover) and
   marks them dirty; write-back grants runs of dirty pages and sends `WRITE`s from them (up to
   16 MiB pinned per write-back, many requests in flight), `fsync`/`fdatasync`/`msync`/`sync`,

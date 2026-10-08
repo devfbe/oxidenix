@@ -29,8 +29,9 @@
 //! kernel reading the object) asks the pager thread (`EVENT_PAGE`). A fill
 //! grants a run of missing pages (`GRANT_FILL`) and has diskfs read into
 //! them by DMA: the pages programs map are the pages the device wrote.
-//! Read-ahead: a fill takes `READAHEAD` pages, doubling up to `MAX_RUN`
-//! (1 MiB, one `READ`) while the file is read in order.
+//! Read-ahead: a fill takes `READAHEAD` pages, doubling up to `MAX_WINDOW`
+//! (4 MiB: four `READ`s of `MAX_RUN`, 1 MiB, in flight at once) while the
+//! file is read in order.
 //!
 //! **Write-back.** Writes and stores make pages dirty; the data reaches the
 //! disk when they are written back: by fsync, fdatasync, sync, msync
@@ -90,8 +91,10 @@ pub const DEV: u64 = 0xfe00;
 const ROOT_INO: u32 = 2;
 /// Unused inodes kept (beyond them the least recently used go).
 const MAX_CACHED: usize = 512;
-/// Pages a fill reads at least, and at most (one `READ`).
+/// Pages a fill reads at least, and at most; pages of one `READ` (the
+/// kernel's longest run, `fsring::MAX_TRANSFER`).
 const READAHEAD: u64 = 16;
+const MAX_WINDOW: u64 = 1024;
 const MAX_RUN: u64 = 256;
 /// Pages one fill or write-back keeps granted (pinned) at once.
 const PINNED: u64 = 4096;
@@ -528,8 +531,8 @@ pub fn size(inode: &Arc<DInode>) -> Result<u64, i64> {
 fn window(inode: &DInode, index: u64, want: u64) -> u64 {
     let mut ra = inode.readahead.lock();
     let (next, last) = *ra;
-    let w = if index == next { (last * 2).clamp(READAHEAD, MAX_RUN) } else { READAHEAD };
-    let w = w.max(want).min(MAX_RUN);
+    let w = if index == next { (last * 2).clamp(READAHEAD, MAX_WINDOW) } else { READAHEAD };
+    let w = w.max(want).min(MAX_WINDOW);
     *ra = (index + w, w);
     w
 }
@@ -832,13 +835,20 @@ pub fn sync_all() -> Result<(), i64> {
 /// EFBIG), then the cache (its pages beyond go, also from mappings).
 pub fn truncate(inode: &Arc<DInode>, len: u64) -> Result<(), i64> {
     live(inode)?;
-    let object = object(inode)?;
+    match inode.kind {
+        vfs::S_IFREG => {}
+        vfs::S_IFDIR => return Err(EISDIR),
+        _ => return Err(EINVAL),
+    }
     if len > max_file()? {
         return Err(EFBIG);
     }
     let _wb = inode.wb.lock();
     let c = client()?;
     status(&c.call(Request::Truncate { ino: inode.ino, len }.encode(0))?)?;
+    // A file with nothing cached is done (its object, made later, starts
+    // from diskfs's size).
+    let Some(object) = *inode.object.lock() else { return Ok(()) };
     loop {
         // Fills in flight pin pages: wait for them, then try again.
         let seen = inode.filled.load(Ordering::Acquire);

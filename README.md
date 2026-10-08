@@ -657,7 +657,7 @@ moved memory, time, pipes, eventfd, paths and the root tmpfs into the server.
   `sync`, `syncfs`, `msync`) is the server's, none passes through to the kernel. Each regular
   file the server uses has one cached object for all its descriptors, mappings and programs. A
   read that meets a missing page fills it itself, a fault through the pager thread: a run of
-  missing pages (read-ahead from 64 KiB up to 1 MiB while the file is read in order) is granted
+  missing pages (read-ahead from 64 KiB up to 4 MiB while the file is read in order) is granted
   to diskfs, whose device writes them by DMA, and declared filled. `write` copies into the cache
   and marks pages dirty; write-back grants runs of dirty pages and sends `WRITE`s from them by
   DMA, many in flight: `fsync`, `fdatasync`, `msync(MS_SYNC)`, `sync`, `O_SYNC`, `O_DSYNC` and
