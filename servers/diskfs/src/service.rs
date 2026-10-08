@@ -29,7 +29,9 @@
 //! it is retried whatever waits, and if it must go through ext2fs's own
 //! write it goes in front of them. A `FORGET` of a grant no operation
 //! uses (the client sends it once the requests on the grant completed)
-//! runs at once, without stopping anything: it touches no file.
+//! runs at once, without stopping anything: it touches no file; so does a
+//! `PROMISE` (ext2fs's promises, owned by the channel: they end with it).
+//! A write in flight spends its promise when it links its blocks.
 //!
 //! **Holds.** diskfs keeps, per channel, a bit per inode the client holds
 //! (`fsring`, "Holds"): an inode whose last link went is freed only when
@@ -734,6 +736,12 @@ impl Service {
                 return true;
             }
         }
+        if let Request::Promise { .. } = request {
+            // Touches no file: at once.
+            let status = self.execute(fs, c, request).map_or_else(|e| -e, |(s, _)| s);
+            self.complete(c, d.tag, d.op, status, [0; 4]);
+            return true;
+        }
         if !request.is_data() {
             // Taken fresh: nothing else waits (taking stops while one does).
             self.barriers.push_back((c, d));
@@ -777,7 +785,7 @@ impl Service {
         let chan = self.chan(c);
         match *request {
             Request::Read { ino, .. } | Request::Write { ino, .. } | Request::Stat { ino } | Request::Truncate { ino, .. } => chan.held.set(ino),
-            Request::Readlink { ino, .. } | Request::SetPerm { ino, .. } => chan.held.set(ino),
+            Request::Readlink { ino, .. } | Request::SetPerm { ino, .. } | Request::Promise { ino, .. } => chan.held.set(ino),
             Request::Lookup { dir, .. } | Request::Create { dir, .. } | Request::Unlink { dir, .. } | Request::Readdir { dir, .. } => chan.held.set(dir),
             Request::Rename { from, to, .. } => {
                 chan.held.set(from);
@@ -802,6 +810,7 @@ impl Service {
         let chan = self.chans[c].take().expect("a channel in use");
         // Vouches that no device uses its grants any more.
         let _ = oxrt::chan_detach(chan.id);
+        fs.forget_promises(chan.id);
         for ino in chan.held.inodes() {
             self.try_free(fs, ino);
         }
@@ -1146,6 +1155,12 @@ impl Service {
             Request::Forget { grant } => {
                 self.forget(c, grant);
                 Ok((0, none))
+            }
+            // (Run at once by `dispatch`; never a barrier.)
+            Request::Promise { ino, offset, len } => {
+                let owner = self.chan(c).id;
+                fs.check(ino)?;
+                fs.promise(owner, ino, offset, len).map(|_| (0, none))
             }
             // Through ext2fs's own paths, with a bounce copy (see `Start::Fallback`).
             Request::Read { ino, offset, buf } => {

@@ -29,6 +29,7 @@
 //! | `SETPERM` | `object` inode, `arg[0]` = permission bits | 0 |
 //! | `STATFS` | - | 0, `Usage` in v0..v3 (sizes, counts, the largest file) |
 //! | `FORGET` | `grant` | 0 once no request on the grant is in flight and the service let go of it |
+//! | `PROMISE` | `object` inode, `offset`, `arg[0]` = length (at most `MAX_TRANSFER`) | 0 once the blocks a later `WRITE` of the range needs are kept for it (see "Promises"); ENOSPC |
 //!
 //! **Ordering.** Reads and writes run concurrently and complete in any
 //! order (the device reorders them); a write waits only for writes in
@@ -62,6 +63,17 @@
 //! of its were still waiting in the submission ring rings the submission
 //! doorbell (`Producer::ring_doorbell`, a no-op unless the service sleeps),
 //! or they wait until its next request.
+//!
+//! **Promises.** A client that caches writes promises the range before it
+//! accepts a write into its cache (`PROMISE`, as delayed allocation
+//! reserves blocks): the service counts the data blocks the file lacks
+//! there and the indirect blocks they need against its free blocks
+//! (ENOSPC if they do not cover them), and no other allocation takes them
+//! until the `WRITE` that comes later does. Promising again what the same
+//! channel promised costs nothing. A promise ends when its blocks are
+//! written, truncated away or freed with the file, or when the channel
+//! goes; `STATFS` counts promised blocks as used. A `PROMISE` runs at
+//! once, like `FORGET`: it touches no file.
 //!
 //! **Grants.** The service keeps what it learnt of a grant (its size, the
 //! device addresses of its pages) until `FORGET`: the client sends it
@@ -97,6 +109,7 @@ pub mod op {
     pub const SETPERM: u16 = 13;
     pub const STATFS: u16 = 14;
     pub const FORGET: u16 = 15;
+    pub const PROMISE: u16 = 16;
 }
 
 /// The errors the protocol itself gives (others come from the filesystem).
@@ -176,6 +189,7 @@ pub enum Request {
     SetPerm { ino: u32, perm: u32 },
     Statfs,
     Forget { grant: u32 },
+    Promise { ino: u32, offset: u64, len: u64 },
 }
 
 /// The fields of a `Desc` an operation reads, for the check that the
@@ -279,6 +293,13 @@ impl Request {
             }
             op::SETPERM => (Request::SetPerm { ino: ino(d.object)?, perm: perm(d.arg[0])? }, Used { object: true, args: 1, ..NONE }),
             op::FORGET => (Request::Forget { grant: d.grant }, Used { grant: true, ..NONE }),
+            op::PROMISE => {
+                let len = d.arg[0];
+                if len > MAX_TRANSFER as u64 || d.offset.checked_add(len).is_none() {
+                    return Err(EINVAL);
+                }
+                (Request::Promise { ino: ino(d.object)?, offset: d.offset, len }, Used { object: true, offset: true, args: 1, ..NONE })
+            }
             _ => return Err(ENOSYS),
         };
         let unused = d.flags != 0
@@ -350,6 +371,11 @@ impl Request {
                 d.arg[0] = perm as u64;
             }
             Request::Forget { grant } => d.grant = grant,
+            Request::Promise { ino, offset, len } => {
+                d.object = ino as u64;
+                d.offset = offset;
+                d.arg[0] = len;
+            }
         }
         d
     }
@@ -371,6 +397,7 @@ impl Request {
             Request::SetPerm { .. } => op::SETPERM,
             Request::Statfs => op::STATFS,
             Request::Forget { .. } => op::FORGET,
+            Request::Promise { .. } => op::PROMISE,
         }
     }
 

@@ -22,6 +22,17 @@
 //! to the commit per operation: there the caller moves file data between
 //! the device and its client's pages itself, several requests at once,
 //! and makes it durable with `sync` (write-back), under the same ordering.
+//!
+//! **Promises.** A client that caches writes (write-back) promises their
+//! blocks first (`promise`, delayed allocation's reservation): the data
+//! blocks the range lacks and the indirect blocks they will need are
+//! counted against the free blocks, so the write that comes later finds
+//! room, and `write(2)` can fail with ENOSPC up front instead of the
+//! write-back later. Allocations a promise does not cover never take the
+//! promised blocks; one it covers spends its promise. A promise ends when
+//! its blocks are allocated, truncated away or freed with the file, or
+//! when its owner goes (`forget_promises`); free space reported by `usage`
+//! excludes it.
 
 #![no_std]
 
@@ -31,7 +42,7 @@ mod cache;
 
 use cache::BlockCache;
 
-use alloc::collections::BTreeSet;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -249,6 +260,91 @@ struct State<D: Device> {
     /// writes that `Ext2::link` records) and the device has not been
     /// flushed since: it is, before any metadata reaches the device.
     unflushed: bool,
+    /// Blocks promised to writes to come (`Ext2::promise`), by inode and
+    /// owner, and their total.
+    promises: BTreeMap<u32, BTreeMap<u64, Promise>>,
+    promised: u64,
+    /// An allocation spends a promise (`spend`): it may take promised
+    /// blocks.
+    spending: bool,
+}
+
+/// An indirect block of a file by its place in the file's tree: the
+/// inode's block slot it hangs from (12, 13, 14), its height (1: it points
+/// to data blocks) and its index among the tables of that height.
+type TableId = (u8, u8, u64);
+
+/// What one owner promised for one file (`Ext2::promise`).
+#[derive(Default)]
+struct Promise {
+    /// File blocks the file has no block for yet, as ranges start -> end.
+    blocks: BTreeMap<u64, u64>,
+    count: u64,
+    /// Indirect blocks those need that the file does not have yet.
+    tables: BTreeSet<TableId>,
+}
+
+impl Promise {
+    fn has(&self, fb: u64) -> bool {
+        self.blocks.range(..=fb).next_back().is_some_and(|(_, &end)| fb < end)
+    }
+
+    /// Adds file block `fb` (not in it yet).
+    fn add(&mut self, fb: u64) {
+        let mut start = fb;
+        let mut end = fb + 1;
+        if let Some((&s, &e)) = self.blocks.range(..fb).next_back() {
+            if e == fb {
+                start = s;
+            }
+        }
+        if let Some(&e) = self.blocks.get(&(fb + 1)) {
+            self.blocks.remove(&(fb + 1));
+            end = e;
+        }
+        self.blocks.insert(start, end);
+        self.count += 1;
+    }
+
+    /// Removes file block `fb`; whether it was in it.
+    fn remove(&mut self, fb: u64) -> bool {
+        let Some((&s, &e)) = self.blocks.range(..=fb).next_back() else { return false };
+        if fb >= e {
+            return false;
+        }
+        self.blocks.remove(&s);
+        if s < fb {
+            self.blocks.insert(s, fb);
+        }
+        if fb + 1 < e {
+            self.blocks.insert(fb + 1, e);
+        }
+        self.count -= 1;
+        true
+    }
+
+    /// Removes the file blocks from `keep` on; how many there were.
+    fn remove_from(&mut self, keep: u64) -> u64 {
+        let mut gone = 0;
+        if let Some((&s, &e)) = self.blocks.range(..keep).next_back() {
+            if e > keep {
+                self.blocks.insert(s, keep);
+                gone += e - keep;
+            }
+        }
+        let tail: Vec<(u64, u64)> = self.blocks.range(keep..).map(|(&s, &e)| (s, e)).collect();
+        for (s, e) in tail {
+            self.blocks.remove(&s);
+            gone += e - s;
+        }
+        self.count -= gone;
+        gone
+    }
+
+    /// Blocks it holds back.
+    fn total(&self) -> u64 {
+        self.count + self.tables.len() as u64
+    }
 }
 
 /// One directory entry as found on disk.
@@ -551,9 +647,167 @@ impl<D: Device> State<D> {
         self.write_block(bitmap_block, &bitmap)
     }
 
+    /// Free blocks no promise and no write in flight holds.
+    fn avail(&self) -> u64 {
+        (self.free_blocks as u64).saturating_sub(self.reserved.len() as u64 + self.promised)
+    }
+
+    /// Runs an allocation that spends a promise if `promised` (it may take
+    /// the promised blocks then; others only take what `avail` counts).
+    fn spend<T>(&mut self, promised: bool, f: impl FnOnce(&mut Self) -> Result<T, i64>) -> Result<T, i64> {
+        let before = self.spending;
+        self.spending = promised;
+        let result = f(self);
+        self.spending = before;
+        result
+    }
+
+    fn data_promised(&self, ino: u32, fb: u64) -> bool {
+        self.promises.get(&ino).is_some_and(|m| m.values().any(|p| p.has(fb)))
+    }
+
+    fn table_promised(&self, ino: u32, id: TableId) -> bool {
+        self.promises.get(&ino).is_some_and(|m| m.values().any(|p| p.tables.contains(&id)))
+    }
+
+    /// Drops the promises of `ino` that hold nothing any more.
+    fn tidy_promises(&mut self, ino: u32) {
+        if let Some(m) = self.promises.get_mut(&ino) {
+            m.retain(|_, p| p.count > 0);
+            if m.is_empty() {
+                self.promises.remove(&ino);
+            }
+        }
+        self.promised = self.promises.values().flat_map(|m| m.values()).map(Promise::total).sum();
+    }
+
+    /// File block `fb` of `ino` got its block: promises of it are kept.
+    fn data_allocated(&mut self, ino: u32, fb: u64) {
+        let Some(m) = self.promises.get_mut(&ino) else { return };
+        let mut any = false;
+        for p in m.values_mut() {
+            any |= p.remove(fb);
+        }
+        if any {
+            self.tidy_promises(ino);
+        }
+    }
+
+    /// Indirect block `id` of `ino` was allocated: promises of it are kept.
+    fn table_allocated(&mut self, ino: u32, id: TableId) {
+        let Some(m) = self.promises.get_mut(&ino) else { return };
+        let mut any = false;
+        for p in m.values_mut() {
+            any |= p.tables.remove(&id);
+        }
+        if any {
+            self.tidy_promises(ino);
+        }
+    }
+
+    /// The first file block an indirect block covers.
+    fn table_start(&self, id: TableId) -> u64 {
+        let p = self.ptrs_per_block();
+        let base = match id.0 as usize {
+            r if r == DIRECT => DIRECT as u64,
+            r if r == DIRECT + 1 => DIRECT as u64 + p,
+            _ => DIRECT as u64 + p + p * p,
+        };
+        base + id.2 * p.pow(id.1 as u32)
+    }
+
+    /// `ino` was cut to `keep` blocks: promises beyond go.
+    fn unpromise_from(&mut self, ino: u32, keep: u64) {
+        let Some(mut m) = self.promises.remove(&ino) else { return };
+        for p in m.values_mut() {
+            p.remove_from(keep);
+            p.tables.retain(|&id| self.table_start(id) < keep);
+        }
+        self.promises.insert(ino, m);
+        self.tidy_promises(ino);
+    }
+
+    /// Whether file block `fb` has a data block, and the indirect blocks
+    /// missing on its way (top first).
+    fn probe(&mut self, inode: &RawInode, fb: u64) -> Result<(bool, Vec<TableId>), i64> {
+        if (fb as usize) < DIRECT {
+            return Ok((self.check_block(inode.block(fb as usize))? != 0, Vec::new()));
+        }
+        let p = self.ptrs_per_block();
+        let mut rel = fb - DIRECT as u64;
+        let (root, depth) = if rel < p {
+            (DIRECT, 1)
+        } else if rel - p < p * p {
+            rel -= p;
+            (DIRECT + 1, 2)
+        } else if rel - p - p * p < p * p * p {
+            rel -= p + p * p;
+            (DIRECT + 2, 3)
+        } else {
+            return Err(EFBIG);
+        };
+        let mut missing = Vec::new();
+        let mut blk = self.check_block(inode.block(root))?;
+        for h in (1..=depth).rev() {
+            if blk == 0 {
+                missing.push((root as u8, h as u8, rel / p.pow(h)));
+                continue;
+            }
+            let table = self.read_block(blk)?;
+            blk = self.check_block(le32(&table, ((rel / p.pow(h - 1)) % p) as usize * 4))?;
+        }
+        Ok((blk != 0, missing))
+    }
+
+    fn promise(&mut self, owner: u64, ino: u32, off: u64, len: u64) -> Result<(), i64> {
+        let inode = self.live_inode(ino)?;
+        if !inode.is_reg() {
+            return Err(EINVAL);
+        }
+        if len == 0 {
+            return Ok(());
+        }
+        let end = off.checked_add(len).filter(|&end| end <= self.max_file_size()).ok_or(EFBIG)?;
+        let bs = self.block_size as u64;
+        let mut data = Vec::new();
+        let mut tables = BTreeSet::new();
+        for fb in off / bs..=(end - 1) / bs {
+            let mine = self.promises.get(&ino).and_then(|m| m.get(&owner));
+            if mine.is_some_and(|p| p.has(fb)) {
+                continue;
+            }
+            let (allocated, missing) = self.probe(&inode, fb)?;
+            if allocated {
+                continue;
+            }
+            let mine = self.promises.get(&ino).and_then(|m| m.get(&owner));
+            for id in missing {
+                if !mine.is_some_and(|p| p.tables.contains(&id)) {
+                    tables.insert(id);
+                }
+            }
+            data.try_reserve(1).map_err(|_| ENOSPC)?;
+            data.push(fb);
+        }
+        if (data.len() + tables.len()) as u64 > self.avail() {
+            return Err(ENOSPC);
+        }
+        let p = self.promises.entry(ino).or_default().entry(owner).or_default();
+        for fb in data {
+            p.add(fb);
+        }
+        p.tables.extend(tables);
+        self.tidy_promises(ino);
+        Ok(())
+    }
+
     /// Allocates a block, preferring group `goal`; zeroed unless it is for
-    /// file data the caller writes.
+    /// file data the caller writes. Only free blocks no promise holds,
+    /// unless the allocation spends one (`spend`).
     fn alloc_block(&mut self, goal: usize, zero: bool) -> Result<u32, i64> {
+        if !self.spending && self.avail() == 0 {
+            return Err(ENOSPC);
+        }
         let n = self.groups.len();
         for g in (goal..n).chain(0..goal) {
             if self.groups[g].free_blocks == 0 {
@@ -660,7 +914,9 @@ impl<D: Device> State<D> {
         if (fb as usize) < DIRECT {
             let mut b = self.check_block(inode.block(fb as usize))?;
             if b == 0 && alloc {
-                b = self.alloc_data(goal, zero_leaf)?;
+                let promised = self.data_promised(ino, fb);
+                b = self.spend(promised, |s| s.alloc_data(goal, zero_leaf))?;
+                self.data_allocated(ino, fb);
                 inode.set_block(fb as usize, b);
                 inode.add_sectors(spb);
                 return Ok((b, true));
@@ -684,7 +940,7 @@ impl<D: Device> State<D> {
             if !alloc {
                 return Ok((0, false));
             }
-            blk = self.alloc_block(goal, true)?;
+            blk = self.alloc_table(ino, (root as u8, depth as u8, 0), goal)?;
             inode.set_block(root, blk);
             inode.add_sectors(spb);
         }
@@ -698,7 +954,14 @@ impl<D: Device> State<D> {
                     return Ok((0, false));
                 }
                 // Level 0 is the data block itself.
-                next = if level > 0 { self.alloc_block(goal, true)? } else { self.alloc_data(goal, zero_leaf)? };
+                next = if level > 0 {
+                    self.alloc_table(ino, (root as u8, level as u8, rel / p.pow(level)), goal)?
+                } else {
+                    let promised = self.data_promised(ino, fb);
+                    let b = self.spend(promised, |s| s.alloc_data(goal, zero_leaf))?;
+                    self.data_allocated(ino, fb);
+                    b
+                };
                 new = level == 0;
                 put32(&mut table, idx * 4, next);
                 self.write_block(blk, &table)?;
@@ -707,6 +970,15 @@ impl<D: Device> State<D> {
             blk = next;
         }
         Ok((blk, new))
+    }
+
+    /// Indirect block `id` of `ino` (zeroed), spending its promise if
+    /// there is one.
+    fn alloc_table(&mut self, ino: u32, id: TableId, goal: usize) -> Result<u32, i64> {
+        let promised = self.table_promised(ino, id);
+        let b = self.spend(promised, |s| s.alloc_block(goal, true))?;
+        self.table_allocated(ino, id);
+        Ok(b)
     }
 
     /// A data block; one not zeroed is fresh until written (see `fresh`).
@@ -796,6 +1068,8 @@ impl<D: Device> State<D> {
                 }
             }
         }
+        // Promised blocks beyond go with them.
+        self.unpromise_from(ino, len.div_ceil(bs));
         inode.set_size(len);
         inode.touch(self.dev.now(), false, true);
         self.write_inode(ino, inode)
@@ -1274,7 +1548,7 @@ impl<D: Device> State<D> {
             if !alloc {
                 return Ok(None);
             }
-            blk = self.alloc_block(goal, true)?;
+            blk = self.alloc_table(ino, (root as u8, depth as u8, 0), goal)?;
             inode.set_block(root, blk);
             inode.add_sectors(spb);
         }
@@ -1287,7 +1561,7 @@ impl<D: Device> State<D> {
                 if !alloc {
                     return Ok(None);
                 }
-                next = self.alloc_block(goal, true)?;
+                next = self.alloc_table(ino, (root as u8, level as u8, rel / p.pow(level)), goal)?;
                 put32(&mut table, idx * 4, next);
                 self.write_block(blk, &table)?;
                 inode.add_sectors(spb);
@@ -1325,6 +1599,9 @@ impl<D: Device> State<D> {
     /// if that is free (runs stay contiguous), else the first free one from
     /// group `goal` on.
     fn reserve_block(&mut self, goal: usize, after: Option<u32>) -> Result<u32, i64> {
+        if !self.spending && self.avail() == 0 {
+            return Err(ENOSPC);
+        }
         let (fdb, bpg) = (self.first_data_block, self.blocks_per_group);
         let next = after.and_then(|b| b.checked_add(1)).filter(|&b| b >= fdb && b < self.blocks_count);
         let (goal, start) = match next {
@@ -1392,7 +1669,13 @@ impl<D: Device> State<D> {
     fn reserve_one(&mut self, ino: u32, inode: &mut RawInode, fb: u64, after: Option<u32>) -> Result<(u32, bool), i64> {
         let slot = self.leaf_slot(ino, inode, fb, true)?.ok_or(EIO)?;
         match self.slot_get(inode, slot)? {
-            0 => Ok((self.reserve_block(self.group_of(ino), after)?, true)),
+            0 => {
+                // Spends its promise when linked (`link_block`): a write
+                // that fails keeps it.
+                let promised = self.data_promised(ino, fb);
+                let goal = self.group_of(ino);
+                Ok((self.spend(promised, |s| s.reserve_block(goal, after))?, true))
+            }
             // As in `read_map`: the device must hold the block's current data.
             b if self.fresh.contains(&b) || self.cache.contains(b) => Err(EAGAIN),
             b => Ok((b, false)),
@@ -1454,6 +1737,7 @@ impl<D: Device> State<D> {
             return Ok(());
         }
         self.mark_used(block)?;
+        self.data_allocated(ino, fb);
         self.slot_set(inode, slot, block)?;
         inode.add_sectors(self.sectors_per_block() as i64);
         Ok(())
@@ -1603,6 +1887,9 @@ impl<D: Device> Ext2<D> {
             fresh: BTreeSet::new(),
             unlinked: Vec::new(),
             reserved: BTreeSet::new(),
+            promises: BTreeMap::new(),
+            promised: 0,
+            spending: false,
             new_meta: BTreeSet::new(),
             freed: BTreeSet::new(),
             unflushed: false,
@@ -1752,11 +2039,38 @@ impl<D: Device> Ext2<D> {
         self.st.dev
     }
 
-    /// (block size, total blocks, free blocks, total inodes, free inodes)
+    /// (block size, total blocks, free blocks, total inodes, free inodes);
+    /// promised blocks do not count as free.
     pub fn usage(&self) -> (u64, u64, u64, u64, u64) {
         let st = &self.st;
         let inodes = st.inodes_per_group as u64 * st.groups.len() as u64;
-        (st.block_size as u64, st.blocks_count as u64, st.free_blocks as u64, inodes, st.free_inodes as u64)
+        let free = (st.free_blocks as u64).saturating_sub(st.promised);
+        (st.block_size as u64, st.blocks_count as u64, free, inodes, st.free_inodes as u64)
+    }
+
+    /// Promises the blocks a later write of `off..off + len` to regular
+    /// file `ino` needs (see "Promises"), for `owner` (the caller's name
+    /// for whoever caches the write): the data blocks the file lacks there
+    /// and the indirect blocks they need, unless `owner` promised them
+    /// already. ENOSPC (and nothing promised) if the free blocks less
+    /// those promised and in flight do not cover them.
+    pub fn promise(&mut self, owner: u64, ino: u32, off: u64, len: u64) -> Result<(), i64> {
+        self.st.promise(owner, ino, off, len)
+    }
+
+    /// `owner` goes: its promises end.
+    pub fn forget_promises(&mut self, owner: u64) {
+        let st = &mut self.st;
+        for m in st.promises.values_mut() {
+            m.remove(&owner);
+        }
+        st.promises.retain(|_, m| !m.is_empty());
+        st.promised = st.promises.values().flat_map(|m| m.values()).map(Promise::total).sum();
+    }
+
+    /// Blocks promised now.
+    pub fn promised(&self) -> u64 {
+        self.st.promised
     }
 
     pub fn block_size(&self) -> usize {
@@ -1802,7 +2116,15 @@ impl<D: Device> Ext2<D> {
     /// in between. EAGAIN as for `read_map`: the caller writes through
     /// `write` then.
     pub fn reserve(&mut self, ino: u32, off: u64, len: u64) -> Result<Reservation, i64> {
-        self.st.reserve(ino, off, len)
+        match self.st.reserve(ino, off, len) {
+            // Blocks freed since the last commit are taken only after one:
+            // commit, and try again.
+            Err(ENOSPC) if !self.st.freed.is_empty() => {
+                self.st.commit()?;
+                self.st.reserve(ino, off, len)
+            }
+            r => r,
+        }
     }
 
     /// Links the reserved blocks of a write whose data is on the device,

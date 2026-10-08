@@ -3,7 +3,7 @@
 //! filesystem stays consistent for e2fsck; on the ring path, reserved
 //! blocks stay out of the metadata until linked and `sync` flushes data
 //! before metadata; a crash at any point never exposes a deleted file's
-//! blocks. Needs mke2fs and e2fsck (e2fsprogs) in PATH:
+//! blocks; promised blocks are kept for the writes that promised them. Needs mke2fs and e2fsck (e2fsprogs) in PATH:
 //! `nix-shell -p e2fsprogs --run "cargo test -p ext2fs"`.
 
 use ext2fs::{Device, Ext2, NewNode, ROOT_INO};
@@ -767,4 +767,104 @@ fn a_reused_inode_number_has_a_new_generation() {
     assert_eq!(g, f, "the freed number is taken again");
     assert_ne!(fs.stat(g).unwrap().generation, old);
     fsck("generation", &take(fs));
+}
+
+/// Free blocks no promise holds (`usage` reports them).
+fn free(fs: &Ext2<RamDisk>) -> u64 {
+    fs.usage().2
+}
+
+/// Fills the disk with file `name` until fewer than `leave` blocks are
+/// free; its inode.
+fn fill_to(fs: &mut Ext2<RamDisk>, name: &str, leave: u64) -> u32 {
+    let f = fs.create(ROOT_INO, name, &NewNode::File, 0o644).unwrap();
+    let mut off = 0u64;
+    while free(fs) >= leave + 16 {
+        let n = ((free(fs) - leave) / 2).clamp(1, 256) * 1024;
+        fs.write(f, off, &vec![1u8; n as usize]).unwrap();
+        off += n;
+    }
+    f
+}
+
+/// A promise counts the data blocks a range lacks and the indirect blocks
+/// they need, once per owner; what it covers is written even when the
+/// disk is otherwise full, and what it does not cover cannot take its
+/// blocks.
+#[test]
+fn promised_blocks_are_kept_for_their_write() {
+    let mut fs = Ext2::mount(mkfs("promise", 4 * 1024)).unwrap();
+    let a = fs.create(ROOT_INO, "a", &NewNode::File, 0o644).unwrap();
+    let before = free(&fs);
+    // 12 direct blocks, then 20 behind the single indirect block.
+    fs.promise(1, a, 0, 32 * 1024).unwrap();
+    assert_eq!(fs.promised(), 32 + 1);
+    assert_eq!(before - free(&fs), 33);
+    // Again by the same owner: nothing more; by another: counted again.
+    fs.promise(1, a, 4096, 8192).unwrap();
+    assert_eq!(fs.promised(), 33);
+    fs.promise(2, a, 0, 4096).unwrap();
+    assert_eq!(fs.promised(), 37);
+    fs.forget_promises(2);
+    assert_eq!(fs.promised(), 33);
+    // Everything else fills the disk: allocations not promised fail.
+    let _filler = fill_to(&mut fs, "filler", 0);
+    let b = fs.create(ROOT_INO, "b", &NewNode::File, 0o644).unwrap();
+    let mut left = 0;
+    while fs.write(b, left * 1024, &[2u8; 1024]).is_ok() {
+        left += 1;
+    }
+    assert_eq!(fs.write(b, left * 1024, &[2u8; 1024]), Err(28));
+    assert_eq!(fs.promise(3, b, left * 1024, 1024), Err(28));
+    assert_eq!(fs.promised(), 33);
+    // The promised write goes through: half the ring way, half the other.
+    ring_write(&mut fs, a, 0, &[3u8; 16 * 1024]);
+    // (The indirect block came with blocks 12 to 15.)
+    assert_eq!(fs.promised(), 16);
+    fs.write(a, 16 * 1024, &[3u8; 16 * 1024]).unwrap();
+    assert_eq!(fs.promised(), 0);
+    fs.sync().unwrap();
+    let mut buf = vec![0u8; 32 * 1024];
+    assert_eq!(fs.read(a, 0, &mut buf).unwrap(), 32 * 1024);
+    assert!(buf.iter().all(|&x| x == 3));
+    fsck("promise", &take(fs));
+}
+
+/// A promise the free blocks do not cover fails whole; truncation, the
+/// file's release and the owner's end give promised blocks back.
+#[test]
+fn promises_end_with_truncation_release_and_owner() {
+    let mut fs = Ext2::mount(mkfs("promise-end", 4 * 1024)).unwrap();
+    let a = fs.create(ROOT_INO, "a", &NewNode::File, 0o644).unwrap();
+    let total = free(&fs);
+    assert_eq!(fs.promise(1, a, 0, (total + 1) * 1024), Err(28));
+    assert_eq!(fs.promised(), 0);
+    // A file with a hole: only the hole is promised.
+    fs.write(a, 0, &[1u8; 4096]).unwrap();
+    fs.truncate(a, 64 * 1024).unwrap();
+    fs.promise(1, a, 0, 8192).unwrap();
+    assert_eq!(fs.promised(), 4);
+    // Shrinking drops what lies beyond; growing keeps what lies within.
+    fs.promise(1, a, 8192, 56 * 1024).unwrap();
+    assert_eq!(fs.promised(), 60 + 1);
+    // (Blocks 4 to 15 stay, and the indirect block 12 to 15 need.)
+    fs.truncate(a, 16 * 1024).unwrap();
+    assert_eq!(fs.promised(), 13);
+    fs.truncate(a, 32 * 1024).unwrap();
+    assert_eq!(fs.promised(), 13);
+    // Gone with the file.
+    for ino in fs.unlink(ROOT_INO, "a", false).unwrap() {
+        fs.release(ino).unwrap();
+    }
+    assert_eq!(fs.promised(), 0);
+    // And with its owner.
+    let b = fs.create(ROOT_INO, "b", &NewNode::File, 0o644).unwrap();
+    fs.promise(7, b, 0, 300 * 1024).unwrap();
+    // 300 data blocks; the single indirect one; the double indirect one
+    // with one table below it.
+    assert_eq!(fs.promised(), 300 + 1 + 2);
+    fs.forget_promises(7);
+    assert_eq!(fs.promised(), 0);
+    assert_eq!(free(&fs), total);
+    fsck("promise-end", &take(fs));
 }

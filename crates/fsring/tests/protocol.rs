@@ -1,6 +1,6 @@
 //! The file protocol's encodings: every request survives encode and decode,
 //! malformed descriptors are refused with the right errno (unknown
-//! operations, stray fields, lengths and names out of range), and the
+//! operations, stray fields, lengths, promises and names out of range), and the
 //! completion, stat, usage and directory entry encodings round-trip.
 
 use fsring::errno::*;
@@ -29,6 +29,7 @@ fn every_request() -> Vec<Request> {
         Request::SetPerm { ino: 12, perm: 0o600 },
         Request::Statfs,
         Request::Forget { grant: 4095 },
+        Request::Promise { ino: 12, offset: 1 << 40, len: MAX_TRANSFER as u64 },
     ]
 }
 
@@ -51,7 +52,7 @@ fn only_reads_and_writes_are_concurrent() {
 
 #[test]
 fn unknown_operations_are_refused() {
-    for op in [0, 16, 99, u16::MAX] {
+    for op in [0, 17, 99, u16::MAX] {
         let d = Desc { op, ..Desc::default() };
         assert_eq!(Request::decode(&d), Err(ENOSYS));
     }
@@ -85,9 +86,14 @@ fn a_field_the_operation_does_not_use_must_be_zero() {
                 variants.push(d);
             }
         }
-        if let Request::Forget { .. } = r {
+        if let Request::Forget { .. } | Request::Promise { .. } = r {
             let mut d = good;
             d.len = 1;
+            variants.push(d);
+        }
+        if let Request::Promise { .. } = r {
+            let mut d = good;
+            d.arg[1] = 1;
             variants.push(d);
         }
         for d in variants {
@@ -106,6 +112,11 @@ fn transfers_are_bounded() {
     // An inode is 32 bits.
     let d = Desc { op: op::STAT, object: 1 << 32, ..Desc::default() };
     assert_eq!(Request::decode(&d), Err(EINVAL));
+    // A promise covers at most one transfer.
+    let promise = |offset: u64, len: u64| Request::decode(&Desc { op: op::PROMISE, object: 12, offset, arg: [len, 0, 0], ..Desc::default() });
+    assert!(promise(0, MAX_TRANSFER as u64).is_ok());
+    assert_eq!(promise(0, MAX_TRANSFER as u64 + 1), Err(EINVAL));
+    assert_eq!(promise(u64::MAX, 1), Err(EINVAL));
     // Result buffers are not empty.
     let d = Desc { op: op::READDIR, object: 2, grant: 1, ..Desc::default() };
     assert_eq!(Request::decode(&d), Err(EINVAL));
