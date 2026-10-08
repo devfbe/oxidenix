@@ -9,7 +9,11 @@
 //! Writable private memory is committed when it is mapped, against a
 //! system-wide limit (`memory::commit`), so running out of memory is an
 //! ENOMEM from `mmap`, `brk`, `mprotect` or `fork`, not a killed process.
-//! `PROT_NONE` and `MAP_NORESERVE` areas commit nothing until made writable.
+//! `PROT_NONE` areas commit nothing until made writable; `MAP_NORESERVE`
+//! areas never do, as on Linux (JITs such as V8 reserve a large code range
+//! that way and make all of it writable and executable at once): their
+//! pages are taken on first touch, and if memory runs out then, the process
+//! is killed (Linux's OOM killer would pick one, too).
 //!
 //! Page table entries carry two software bits: COW (a shared frame that is
 //! copied on the first write) and PROT_NONE (a frame kept while its area
@@ -173,6 +177,9 @@ pub struct Vma {
     pub backing: Backing,
     /// Its length is committed (writable private memory).
     pub charged: bool,
+    /// Mapped with MAP_NORESERVE: never committed, not even when
+    /// `mprotect` makes it writable (Linux's VM_NORESERVE).
+    pub noreserve: bool,
     /// A stack: accesses just below it grow it, up to STACK_LIMIT.
     pub grows_down: bool,
 }
@@ -524,6 +531,7 @@ impl AddressSpace {
             a.end == b.start
                 && a.prot == b.prot
                 && a.charged == b.charged
+                && a.noreserve == b.noreserve
                 && a.grows_down == b.grows_down
                 && matches!((&a.backing, &b.backing), (Backing::Anon, Backing::Anon))
         };
@@ -564,7 +572,7 @@ impl AddressSpace {
     /// `noreserve`; on failure nothing changes (ENOMEM).
     pub fn map(&mut self, start: u64, len: u64, prot: Prot, backing: Backing, noreserve: bool) -> Result<(), Fault> {
         let end = start.checked_add(len).filter(|&e| e <= USER_END && len > 0).ok_or(Fault::Segv)?;
-        let mut vma = Vma { start, end, prot, backing, charged: false, grows_down: false };
+        let mut vma = Vma { start, end, prot, backing, charged: false, noreserve, grows_down: false };
         if let Some((cache, _)) = vma.file() {
             if self.owner.strong_count() > 0 {
                 cache.register(&self.owner)?;
@@ -648,7 +656,7 @@ impl AddressSpace {
         let needed: u64 = self
             .vmas
             .range(..end)
-            .filter(|(_, v)| v.end > start && v.private() && !v.charged && prot.write)
+            .filter(|(_, v)| v.end > start && v.private() && !v.charged && !v.noreserve && prot.write)
             .map(|(_, v)| (v.end.min(end) - v.start.max(start)) / PAGE)
             .sum();
         if needed > 0 && !memory::commit(needed) {
@@ -660,7 +668,7 @@ impl AddressSpace {
         for s in keys {
             let v = self.vmas.get_mut(&s).expect("listed above");
             v.prot = prot;
-            if prot.write && v.private() && !v.charged {
+            if prot.write && v.private() && !v.charged && !v.noreserve {
                 v.charged = true;
             }
         }
@@ -1088,7 +1096,7 @@ impl AddressSpace {
             return Err(Fault::Segv);
         }
         self.unmap(start, len);
-        self.insert(Vma { start, end: start + len, prot, backing: Backing::Device, charged: false, grows_down: false });
+        self.insert(Vma { start, end: start + len, prot, backing: Backing::Device, charged: false, noreserve: false, grows_down: false });
         for i in 0..pages {
             let frame = PhysFrame::containing_address(PhysAddr::new(phys + i * PAGE));
             memory::with_frames(|f| f.share(frame));
@@ -1106,7 +1114,7 @@ impl AddressSpace {
             return Err(Fault::Segv);
         }
         let prot = Prot { read: true, write: writable, exec: false };
-        self.insert(Vma { start, end: start + len, prot, backing: Backing::Granted { grant, writable }, charged: false, grows_down: false });
+        self.insert(Vma { start, end: start + len, prot, backing: Backing::Granted { grant, writable }, charged: false, noreserve: false, grows_down: false });
         for (i, &frame) in frames.iter().enumerate() {
             memory::with_frames(|f| f.share(frame));
             if let Err(e) = self.install(start + i as u64 * PAGE, frame, prot.flags()) {
@@ -1127,7 +1135,7 @@ impl AddressSpace {
         for (start, len) in ranges {
             self.unmap(start, len);
             let none = Prot { read: false, write: false, exec: false };
-            self.insert(Vma { start, end: start + len, prot: none, backing: Backing::Revoked { channel }, charged: false, grows_down: false });
+            self.insert(Vma { start, end: start + len, prot: none, backing: Backing::Revoked { channel }, charged: false, noreserve: false, grows_down: false });
         }
     }
 

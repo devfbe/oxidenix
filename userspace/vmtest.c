@@ -115,6 +115,28 @@ int main(void) {
     check("W^X: write, mprotect to exec, call returns 42", fn() == 42);
     munmap(jit, 1024 * MIB);
 
+    /* V8's code range: a MAP_NORESERVE reservation larger than memory, all
+     * of it made writable and executable at once. As on Linux, it stays
+     * uncommitted; without MAP_NORESERVE the same mprotect is refused. */
+    char *range = mmap(NULL, 4096 * MIB, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    int rwx = range != MAP_FAILED && mprotect(range, 4096 * MIB, PROT_READ | PROT_WRITE | PROT_EXEC) == 0;
+    check("mprotect of a 4 GiB MAP_NORESERVE reservation to RWX succeeds", rwx);
+    if (rwx) {
+        range[123 * MIB] = 7;
+        check("... and its pages work", range[123 * MIB] == 7 && range[0] == 0);
+        /* A fork copies the area uncommitted too: it would not fit. */
+        pid_t child = fork();
+        if (child == 0) _exit(range[123 * MIB] == 7 ? 0 : 1);
+        int status = -1;
+        if (child > 0) waitpid(child, &status, 0);
+        check("... and a fork with it succeeds (nothing charged)", child > 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    }
+    if (range != MAP_FAILED) munmap(range, 4096 * MIB);
+    range = mmap(NULL, 4096 * MIB, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    check("... but needs commit without MAP_NORESERVE (ENOMEM)",
+          range != MAP_FAILED && mprotect(range, 4096 * MIB, PROT_READ | PROT_WRITE) == -1 && errno == ENOMEM);
+    if (range != MAP_FAILED) munmap(range, 4096 * MIB);
+
     /* Commit accounting: more writable memory than exists is refused. */
     void *huge = mmap(NULL, 64L * 1024 * MIB, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     check("64 GiB writable mmap fails with ENOMEM", huge == MAP_FAILED && errno == ENOMEM);
