@@ -57,6 +57,67 @@ static int depth(int n) {
     return n == 0 ? frame[0] : depth(n - 1) + frame[0];
 }
 
+static long committed_kb(void) {
+    char text[4096] = {0};
+    int fd = open("/proc/meminfo", O_RDONLY);
+    read(fd, text, sizeof text - 1);
+    close(fd);
+    char *p = strstr(text, "Committed_AS:");
+    return p ? strtol(p + 13, NULL, 10) : -1;
+}
+
+/* Touches every 4th page of [p, p + len) (a store). */
+static void touch(volatile char *p, long len) {
+    for (long i = 0; i < len; i += 4 * 4096) p[i] = 1;
+}
+
+/* Memory committed page by page at first touch (MAP_NORESERVE, read-only
+ * private areas) goes back exactly once, whatever happens to the pages:
+ * partial munmap, MADV_DONTNEED, mremap shrinking and moving, mprotect
+ * committing the whole area, fork with copy-on-write in both processes,
+ * exec and exit. Many rounds leave Committed_AS where it was. */
+static void commit_cycles(void) {
+    long before = 0;
+    /* Five rounds warm up: the process's own stack and buffers grow a
+     * few pages once, then stay. */
+    for (int round = 0; round < 45; round++) {
+        if (round == 5) before = committed_kb();
+        long len = 4 * MIB;
+        char *a = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if (a == MAP_FAILED) break;
+        touch(a, len);
+        munmap(a + MIB, MIB / 2);                 /* a hole: the area splits */
+        madvise(a, MIB / 2, MADV_DONTNEED);       /* pages dropped */
+        touch(a, MIB / 2);                        /* and touched again */
+        char *b = mremap(a + 2 * MIB, 2 * MIB, MIB, 0);              /* shrink */
+        char *c = mremap(b, MIB, 3 * MIB, MREMAP_MAYMOVE);             /* grow, maybe move */
+        if (c != MAP_FAILED) touch(c, 3 * MIB);
+        pid_t kid = fork();
+        if (kid == 0) {
+            touch(a, MIB);                        /* copy-on-write in the child */
+            if (round % 2) execl("/bin/true", "true", (char *)NULL);
+            _exit(0);
+        }
+        touch(a, MIB);                            /* and in the parent */
+        waitpid(kid, NULL, 0);
+        munmap(a, MIB);
+        munmap(a + MIB + MIB / 2, MIB / 2);
+        if (c != MAP_FAILED) munmap(c, 3 * MIB);
+        /* A read-only private area: pages read in are committed one by
+         * one, then mprotect commits the area as a whole. */
+        volatile char *r = mmap(NULL, MIB, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        long sum = 0;
+        for (long i = 0; i < MIB; i += 4096) sum += r[i];
+        mprotect((void *)r, MIB / 2, PROT_READ | PROT_WRITE);
+        touch(r, MIB / 2);
+        munmap((void *)r, MIB);
+        (void)sum;
+    }
+    long after = committed_kb();
+    printf("    (Committed_AS %ld kB before, %ld kB after 40 rounds)\n", before, after);
+    check("memory committed page by page goes back exactly once", after == before);
+}
+
 int main(void) {
     struct sigaction sa = {0};
     sa.sa_handler = on_fault;
@@ -132,6 +193,7 @@ int main(void) {
         check("... and a fork with it succeeds (only touched pages count)", child > 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0);
     }
     if (range != MAP_FAILED) munmap(range, 4096 * MIB);
+    commit_cycles();
     range = mmap(NULL, 4096 * MIB, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     check("... but needs commit without MAP_NORESERVE (ENOMEM)",
           range != MAP_FAILED && mprotect(range, 4096 * MIB, PROT_READ | PROT_WRITE) == -1 && errno == ENOMEM);

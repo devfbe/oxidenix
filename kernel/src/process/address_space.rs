@@ -804,6 +804,7 @@ impl AddressSpace {
     /// Moves the page table entries of [from, from+len) to `to`.
     fn move_pages(&mut self, from: u64, to: u64, len: u64) {
         let l4 = self.l4;
+        let mut lost_charged = 0;
         let mut mapper = self.mapper();
         let parent = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
         memory::with_frames(|frames| {
@@ -812,10 +813,19 @@ impl AddressSpace {
                 e.set_unused();
                 let page = Page::<Size4KiB>::containing_address(VirtAddr::new(to + (va - from)));
                 let mut user = UserFrames(frames);
-                // The target range was unmapped, so this cannot collide.
-                let _ = unsafe { mapper.map_to_with_table_flags(page, frame, flags, parent, &mut user) }.map(|f| f.ignore());
+                // The target range was unmapped, so this cannot collide;
+                // without a frame for a page table the page goes, and with
+                // it its reference and its own commit.
+                match unsafe { mapper.map_to_with_table_flags(page, frame, flags, parent, &mut user) } {
+                    Ok(f) => f.ignore(),
+                    Err(_) => {
+                        unsafe { user.0.deallocate_frame(frame) };
+                        lost_charged += flags.contains(CHARGED) as u64;
+                    }
+                }
             });
         });
+        memory::uncommit(lost_charged);
         self.sync_views(to..to + len);
         tlb::shootdown(&self.tlb, from, from + len);
     }
@@ -994,12 +1004,7 @@ impl AddressSpace {
                 e.set_flags(writable);
                 return Ok(false);
             }
-            let Some(new) = UserFrames(frames).allocate_frame() else {
-                if charge {
-                    memory::uncommit(1);
-                }
-                return Err(Fault::Oom);
-            };
+            let new = UserFrames(frames).allocate_frame().ok_or(Fault::Oom)?;
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     memory::phys_to_virt(old.start_address().as_u64()),
@@ -1009,7 +1014,13 @@ impl AddressSpace {
             }
             e.set_addr(new.start_address(), writable);
             Ok(true)
-        })?;
+        });
+        // (The commit's bookkeeping happens outside the frame allocator's
+        // lock: a commit may reclaim cache pages, which takes it.)
+        if copied.is_err() && charge {
+            memory::uncommit(1);
+        }
+        let copied = copied?;
         if copied {
             // Other threads must stop reading the old frame before this
             // mapping lets go of it.
@@ -1100,21 +1111,23 @@ impl AddressSpace {
     fn privatize(&mut self, page: u64) -> Result<(), Fault> {
         let e = leaf_entry(self.l4, page).ok_or(Fault::Segv)?;
         let old = PhysFrame::containing_address(e.addr());
-        let charge = self.vma(page).is_some_and(|v| v.per_page()) && !e.flags().contains(CHARGED);
+        // A copy of its own is committed first if its area is committed page
+        // by page, outside the frame allocator's lock: a commit may reclaim
+        // cache pages, which frees frames under that lock.
+        let shared = memory::with_frames(|frames| frames.refcount(old) > 1);
+        let charge = shared && self.vma(page).is_some_and(|v| v.per_page()) && !e.flags().contains(CHARGED);
+        if charge && !memory::commit(1) {
+            return Err(Fault::Oom);
+        }
         let copied = memory::with_frames(|frames| {
             if frames.refcount(old) <= 1 {
+                // Its own meanwhile: kept, with the commit made for it.
+                if charge {
+                    e.set_flags(e.flags() | CHARGED);
+                }
                 return Ok(false);
             }
-            // A copy of its own: committed if its area is page by page.
-            if charge && !memory::commit(1) {
-                return Err(Fault::Oom);
-            }
-            let Some(new) = UserFrames(frames).allocate_frame() else {
-                if charge {
-                    memory::uncommit(1);
-                }
-                return Err(Fault::Oom);
-            };
+            let new = UserFrames(frames).allocate_frame().ok_or(Fault::Oom)?;
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     memory::phys_to_virt(old.start_address().as_u64()),
@@ -1125,7 +1138,11 @@ impl AddressSpace {
             let flags = if charge { (e.flags() - COW) | CHARGED } else { e.flags() - COW };
             e.set_addr(new.start_address(), flags);
             Ok(true)
-        })?;
+        });
+        if copied.is_err() && charge {
+            memory::uncommit(1);
+        }
+        let copied = copied?;
         if copied {
             let mut gather = Gather::new(&self.tlb);
             gather.add(page, old);
@@ -1374,10 +1391,12 @@ impl AddressSpace {
         // The areas committed as a whole, and the pages committed one by
         // one (the child's entries keep the CHARGED bit: they may diverge).
         let mut charged: u64 = parent.vmas.values().filter(|v| v.charged).map(|v| v.pages()).sum();
+        let mut page_charged = 0;
         for_each_leaf(parent.l4, 0, USER_END, |va, e| {
             let granted = parent.vma(va).is_some_and(|v| matches!(v.backing, Backing::Granted { .. }));
-            charged += (!granted && e.flags().contains(CHARGED)) as u64;
+            page_charged += (!granted && e.flags().contains(CHARGED)) as u64;
         });
+        charged += page_charged;
         if !memory::commit(charged) {
             return Err(Fault::Oom);
         }
@@ -1400,6 +1419,9 @@ impl AddressSpace {
         let mut mapper = self.mapper();
         let table_flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
         let (vmas, stats) = (&parent.vmas, &self.stats);
+        // The CHARGED entries the child got: a partial copy (Oom) gives back
+        // the commit of those it did not (its space releases the others).
+        let mut copied_charged = 0;
         let result = memory::with_frames(|frames| {
             let mut frames = UserFrames(frames);
             let l4 = table_at(parent.l4);
@@ -1428,6 +1450,7 @@ impl AddressSpace {
                             // Only a successful mapping owns a reference.
                             frames.0.share(frame);
                             stats.add_resident(1);
+                            copied_charged += flags.contains(CHARGED) as u64;
                         }
                     }
                 }
@@ -1437,6 +1460,9 @@ impl AddressSpace {
         // The parent's pages just lost their write permission, also for
         // its other threads.
         tlb::shootdown(&parent.tlb, 0, USER_END);
+        if result.is_err() {
+            memory::uncommit(page_charged - copied_charged);
+        }
         result?;
         self.brk_start = parent.brk_start;
         self.brk_end = parent.brk_end;
