@@ -174,6 +174,28 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
    paged objects whose pager is the server), the remote filesystem client with rings to
    diskfs, `poll`/`select`/`epoll` (over a kernel primitive that waits for the server's events
    and the kernel's at once), the tty layer (ADR 0004): into the server. The largest phase.
+   R6 goes in steps, each green, by kind of file. Until the last one, the descriptor *table*
+   stays the kernel's, and a file the server implements is a **placeholder** in it (an open
+   file that names the server's object): `dup`, `close`, `fcntl`'s descriptor flags, `fork`'s
+   copy and `exec`'s close-on-exec then work unchanged, and `poll`/`epoll` see the readiness
+   the server reports for it (`kfd_ready`). The server looks up a descriptor before it passes a
+   call through (`kfd_lookup`) and handles the call itself if the descriptor is one of its
+   files; when the last descriptor of a placeholder goes, the kernel tells the instance's
+   service thread (the pager thread, whose wait becomes a wait for any event of the instance).
+   - **R6a — Placeholders and pipes**: the mechanism above, and pipes as the first kind
+     (blocking with interruptible futexes, `O_NONBLOCK`, end of file and `EPIPE`/`SIGPIPE`).
+   - **R6b — eventfd.**
+   - **R6c — The namespace**: the VFS, tmpfs from the initramfs (an object of the image the
+     kernel keeps), the mounts of the filesystem servers (`/data`, `/proc`, `/sys`) with the
+     server as their client, the page cache as the server's paged objects, every path call,
+     `mmap` of the server's files, and `execve`, which resolves the program in the server's
+     namespace and hands the kernel's loader its memory object (until R8 moves the loader).
+     The kernel keeps a read-only view of the initramfs for what it starts at boot.
+   - **R6d — The terminal** (ADR 0004): the console as a device of the server, the line
+     discipline and job control's terminal side in the server.
+   - **R6e — The descriptor table, `poll`, `select` and `epoll`** move with the sockets (R7),
+     the last kind the kernel implements, over a kernel wait for the server's events and the
+     netd's at once.
 7. **R7 — Sockets** into the server, talking to netd over rings.
 8. **R8 — Processes and signals**: pids, the process tree, `fork` (with the copy-on-write clone
    of memory objects), `exec`, `wait`, signals, job control, `/proc`'s data. The kernel's
