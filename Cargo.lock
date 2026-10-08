@@ -791,6 +791,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "vfs"
+version = "0.1.0"
+
+[[package]]
 name = "virtio"
 version = "0.1.0"
 dependencies = [

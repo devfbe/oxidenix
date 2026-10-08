@@ -40,6 +40,9 @@ jobs:
       - name: Test the ext2 library on the host
         run: nix-shell -p e2fsprogs --run "cargo test -p ext2fs"
 
+      - name: Test the Linux server's namespace library on the host
+        run: cargo test -p vfs
+
       - name: Boot oxidenix and run the self-tests
         working-directory: kernel
         shell: bash
