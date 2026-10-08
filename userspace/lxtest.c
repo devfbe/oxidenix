@@ -487,8 +487,9 @@ int main(void) {
     static const char *cached_scenarios[] = {
         "page cache: a failed fill beyond the end leaves no trace",
         "page cache: a long write-back scan goes on where the kernel says",
+        "page cache: a truncation does not wait for ever for a pinned page",
     };
-    for (int i = 0; i < 2; i++) {
+    for (int i = 0; i < 3; i++) {
         errno = 0;
         long r = syscall(TEST_CACHED, i + 1);
         if (r != 0) printf("    (scenario %d: check %d failed)\n", i + 1, errno);

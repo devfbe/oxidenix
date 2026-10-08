@@ -563,6 +563,7 @@ pub const TEST_DISKRING: u64 = 1515;
 /// end of the file or over 256 pages leaves no trace (the file grown later
 /// reads as zeros), 2 a write-back grant over more pages than one call
 /// looks at goes on where the kernel says (`EAGAIN`) and finds the dirty
-/// page at the end. 0 if every check held, else the negative number of the
+/// page at the end, 3 a truncation waiting for a page pinned by a grant
+/// that is never let go of gives up with `EBUSY` after its wait. 0 if every check held, else the negative number of the
 /// first that failed.
 pub const TEST_CACHED: u64 = 1516;

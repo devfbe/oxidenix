@@ -380,8 +380,11 @@ pages and dirty marks the kernel keeps and whose data the server moves:
   owners, and hands the job over when its own request completed. A thread holding slots never
   waits for another (`run` completes its oldest first), so slots always come free. Completions
   whose tag or operation does not match a slot in flight are dropped; every status and value is
-  checked before use (a READ's bytes, a READDIR's entries, a READLINK's length). A dying diskfs
-  fails the requests in flight with `EIO`; the next request connects a new channel (diskfs is
+  checked before use (a READ's bytes, a READDIR's entries, a READLINK's length). A dying diskfs,
+  or one that leaves a request unanswered for `REQUEST_TIMEOUT` (60 s), fails the requests in
+  flight with `EIO`; no wait of the server on diskfs or on other programs is unbounded (fills
+  that write back for memory, grant scans and truncations waiting for pinned pages are capped
+  too); the next request connects a new channel (diskfs is
   started again), the inodes in use are named again to hold them before anyone uses the new
   channel (an unlinked one, one that is gone, and one whose number now has another type or
   ext2 generation are stale: `EIO`; `STAT` reports the generation), dirty pages whose write failed are written on the new channel, and a write that

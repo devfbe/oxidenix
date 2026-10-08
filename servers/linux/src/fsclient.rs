@@ -24,9 +24,12 @@
 //!
 //! **A hostile or dead diskfs.** A completion whose tag names no slot in
 //! flight, or whose operation is not the slot's, is dropped. When diskfs
-//! goes (the channel's `state`), every request in flight fails with EIO and
-//! the client is dead: `datafs` makes a new one (diskfs is started again).
-//! Callers check every status and value they use (`datafs`).
+//! goes (the channel's `state`), or a request is not answered within
+//! `REQUEST_TIMEOUT` (a disk request takes milliseconds: diskfs hangs or
+//! withholds), every request in flight fails with EIO and the client is
+//! dead: `datafs` makes a new one (diskfs is started again if it died). So
+//! no wait for diskfs is unbounded. Callers check every status and value
+//! they use (`datafs`).
 //!
 //! **Scratch.** Names, directory entries, link targets and O_DIRECT reads
 //! travel in a scratch buffer: a memory object mapped into the server's
@@ -53,6 +56,10 @@ pub const PAGE: u64 = 4096;
 /// Pages of the scratch buffer.
 pub const SCRATCH_PAGES: u64 = 64;
 
+/// How long a request may stay unanswered before the client gives diskfs
+/// up (generous: an emulated disk under load is slow, not this slow).
+const REQUEST_TIMEOUT: u64 = 60_000_000_000;
+
 pub const EINTR: i64 = 4;
 pub const EIO: i64 = 5;
 pub const EPIPE: i64 = 32;
@@ -75,6 +82,10 @@ fn futex_wait(word: &AtomicU32, value: u32) {
     }
 }
 
+fn now() -> u64 {
+    syscall(SYS_CLOCK_READ, [1, 0, 0, 0, 0, 0]).max(0) as u64
+}
+
 fn futex_wake(word: &AtomicU32, n: u64) {
     syscall(SYS_SERVER_FUTEX_WAKE, [word as *const AtomicU32 as u64, n, 0, 0, 0, 0]);
 }
@@ -84,6 +95,22 @@ struct Doorbell;
 impl Wait for Doorbell {
     fn wait(&self, word: &AtomicU32, value: u32) {
         futex_wait(word, value);
+    }
+
+    fn wake(&self, word: &AtomicU32) {
+        futex_wake(word, 1);
+    }
+}
+
+/// The completion ring's doorbell, slept on until `deadline` at most.
+struct TimedDoorbell(u64);
+
+impl Wait for TimedDoorbell {
+    fn wait(&self, word: &AtomicU32, value: u32) {
+        let r = syscall(SYS_SERVER_FUTEX_WAIT, [word as *const AtomicU32 as u64, value as u64, self.0, 0, 0, 0]);
+        if r == -EINTR {
+            syscall(SYS_YIELD, [0; 6]);
+        }
     }
 
     fn wake(&self, word: &AtomicU32) {
@@ -104,6 +131,8 @@ struct Slot {
     op: AtomicU32,
     /// Uses so far: the tag's upper part.
     uses: AtomicU64,
+    /// When the request was sent (its deadline is `REQUEST_TIMEOUT` later).
+    since: AtomicU64,
     /// Written by the completer (COMPLETING) before `state` becomes DONE.
     result: UnsafeCell<Completion>,
 }
@@ -179,6 +208,7 @@ impl Client {
                 tag: AtomicU64::new(0),
                 op: AtomicU32::new(0),
                 uses: AtomicU64::new(0),
+                since: AtomicU64::new(0),
                 result: UnsafeCell::new(Completion::default()),
             })
             .collect();
@@ -235,7 +265,13 @@ impl Client {
             return Err(EPIPE);
         }
         let Some(i) = self.acquire(block) else { return Ok(None) };
+        if self.is_dead() {
+            // Died while this thread waited for the slot.
+            self.release(i);
+            return Err(EPIPE);
+        }
         let s = &self.slots[i];
+        s.since.store(now(), Ordering::Relaxed);
         let uses = s.uses.fetch_add(1, Ordering::Relaxed) + 1;
         d.tag = uses << 8 | i as u64;
         s.tag.store(d.tag, Ordering::Relaxed);
@@ -288,10 +324,13 @@ impl Client {
         Ok(self.wait(t))
     }
 
-    /// Takes completions (as the reaper) until slot `i`'s arrived.
+    /// Takes completions (as the reaper) until slot `i`'s arrived, or its
+    /// deadline passed (then diskfs is given up).
     fn reap_until(&self, i: usize) {
         let completions = unsafe { &mut *self.completions.get() };
         let header = self.header;
+        let deadline = self.slots[i].since.load(Ordering::Relaxed).saturating_add(REQUEST_TIMEOUT);
+        let live = || header.state() == 0 && !self.dead.load(Ordering::Acquire) && now() < deadline;
         loop {
             let mut took = false;
             while let Some(d) = completions.pop() {
@@ -308,7 +347,13 @@ impl Client {
             if self.slots[i].state.load(Ordering::Acquire) == DONE {
                 return;
             }
-            match completions.pop_wait_while(&Doorbell, || header.state() == 0) {
+            if !live() {
+                // (Checked here too: a flood of forged completions must not
+                // keep the reaper from its deadline.)
+                self.fail_all();
+                return;
+            }
+            match completions.pop_wait_while(&TimedDoorbell(deadline), live) {
                 Some(d) => self.deliver(&d),
                 None => {
                     self.fail_all();
@@ -352,7 +397,7 @@ impl Client {
         }
     }
 
-    /// diskfs is gone: every request in flight fails.
+    /// diskfs is gone, or hangs: every request in flight fails.
     fn fail_all(&self) {
         self.dead.store(true, Ordering::Release);
         for (i, s) in self.slots.iter().enumerate() {

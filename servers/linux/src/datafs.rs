@@ -51,9 +51,18 @@
 //! commit limit, writers wait above a fifth), pinned ones by `PINNED` per
 //! fill or write-back in flight. A fill that finds no memory for a page
 //! writes the dirty files back (reclaim can drop their pages then) and
-//! tries again; it fails (ENOMEM) only when nothing is left to write.
-//! Unused inodes are bounded by `MAX_CACHED`; their objects keep pages
-//! only until reclaim takes them.
+//! tries again, `FILL_ROUNDS` times at most (programs that keep dirtying
+//! pages could otherwise keep it writing for ever); it fails (ENOMEM) when
+//! nothing is left to write or the rounds are used up. Unused inodes are
+//! bounded by `MAX_CACHED`; their objects keep pages only until reclaim
+//! takes them.
+//!
+//! **Bounded waits.** No loop here waits for ever on diskfs or on other
+//! programs: read and write give up after 8 rounds without progress, a
+//! grant's scan after `MAX_GRANT_CALLS` calls (EIO), a truncation waiting
+//! for pinned pages after `TRUNCATE_WAIT` (EBUSY), and every request to
+//! diskfs after `fsclient`'s `REQUEST_TIMEOUT` (EIO; the channel is given
+//! up).
 //!
 //! **diskfs restarts.** A new channel is made (`client`); every request in
 //! flight on the old one failed (a fill: EIO for its waiters, SIGBUS for a
@@ -106,6 +115,12 @@ const MAX_WINDOW: u64 = 1024;
 const MAX_RUN: u64 = 256;
 /// Pages one fill or write-back keeps granted (pinned) at once.
 const PINNED: u64 = 4096;
+/// Rounds of a fill that writes back for memory (`fill`), calls of one
+/// grant's scan (`grant_run`), and how long a truncation waits for pinned
+/// pages (`cache_truncate`).
+const FILL_ROUNDS: u32 = 4;
+const MAX_GRANT_CALLS: u32 = 1 << 16;
+const TRUNCATE_WAIT: u64 = 10_000_000_000;
 /// How long a file stays dirty before the pager writes it back.
 const WRITEBACK_AGE: u64 = 5_000_000_000;
 
@@ -575,7 +590,9 @@ fn window(inode: &DInode, index: u64, want: u64) -> u64 {
 /// none. The kernel looks at a bounded number of pages per call and says
 /// where to go on (EAGAIN).
 fn grant_run(c: &Client, object: u64, mut at: u64, end: u64, flags: u64, out: &mut [u64; 3]) -> Result<u64, i64> {
-    loop {
+    // Each call moves on (the kernel's answer is checked); a file's pages
+    // are fewer than this many calls look at.
+    for _ in 0..MAX_GRANT_CALLS {
         if at >= end {
             return Err(ENOENT);
         }
@@ -586,6 +603,7 @@ fn grant_run(c: &Client, object: u64, mut at: u64, end: u64, flags: u64, out: &m
             _ => return Err(EIO),
         }
     }
+    Err(EIO)
 }
 
 /// What a request of a fill or a write-back is about.
@@ -601,12 +619,15 @@ enum Io {
 /// dirty pages are written back first (reclaim may drop them then); only
 /// when none is left to write it fails (ENOMEM).
 pub fn fill(inode: &Arc<DInode>, index: u64, want: u64) -> Result<bool, i64> {
-    loop {
+    // A few rounds: programs that keep dirtying pages could otherwise keep
+    // a fill writing back for ever.
+    for _ in 0..FILL_ROUNDS {
         match fill_once(inode, index, want) {
             Err(ENOMEM) if write_back_dirty() > 0 => {}
             r => return r,
         }
     }
+    Err(ENOMEM)
 }
 
 fn fill_once(inode: &Arc<DInode>, index: u64, want: u64) -> Result<bool, i64> {
@@ -923,19 +944,38 @@ pub fn truncate(inode: &Arc<DInode>, len: u64) -> Result<(), i64> {
     }
     let _wb = inode.wb.lock();
     let c = client()?;
-    status(&c.call(Request::Truncate { ino: inode.ino, len }.encode(0))?)?;
-    // A file with nothing cached is done (its object, made later, starts
-    // from diskfs's size).
-    let Some(object) = *inode.object.lock() else { return Ok(()) };
+    // A file with nothing cached: diskfs's size is all (its object, made
+    // later, starts from it).
+    let Some(object) = *inode.object.lock() else {
+        return status(&c.call(Request::Truncate { ino: inode.ino, len }.encode(0))?).map(|_| ());
+    };
+    // Growing: diskfs first (it refuses what it cannot hold), then the
+    // cache. Shrinking: the cache first, which may have to wait for fills
+    // in flight (they pin pages); diskfs only once the cache could.
+    let size = syscall(SYS_MO_FILE_SIZE, [object, 0, 0, 0, 0, 0]).max(0) as u64;
+    if len >= size {
+        status(&c.call(Request::Truncate { ino: inode.ino, len }.encode(0))?)?;
+        return cache_truncate(inode, object, len, TRUNCATE_WAIT);
+    }
+    cache_truncate(inode, object, len, TRUNCATE_WAIT)?;
+    status(&c.call(Request::Truncate { ino: inode.ino, len }.encode(0))?).map(|_| ())
+}
+
+/// Truncates the cached object, waiting for the fills that pin its pages
+/// (at most `wait` ns: pins that do not go, a grant diskfs never lets go
+/// of, end it with EBUSY).
+fn cache_truncate(inode: &DInode, object: u64, len: u64, wait: u64) -> Result<(), i64> {
+    let deadline = now() + wait;
     loop {
-        // Fills in flight pin pages: wait for them, then try again.
         let seen = inode.filled.load(Ordering::Acquire);
         match syscall(SYS_MO_TRUNCATE, [object, len, 0, 0, 0, 0]) {
+            r if r == -EBUSY && now() >= deadline => return Err(EBUSY),
             r if r == -EBUSY && inode.fills.load(Ordering::Acquire) > 0 => {
-                syscall(SYS_SERVER_FUTEX_WAIT, [&inode.filled as *const AtomicU32 as u64, seen as u64, 0, 0, 0, 0]);
+                syscall(SYS_SERVER_FUTEX_WAIT, [&inode.filled as *const AtomicU32 as u64, seen as u64, deadline, 0, 0, 0]);
             }
             r if r == -EBUSY => {
-                syscall(SYS_YIELD, [0; 6]);
+                // Pinned by a grant still draining: a little later.
+                syscall(SYS_SLEEP_UNTIL, [(now() + 1_000_000).min(deadline), 0, 0, 0, 0, 0]);
             }
             r if r < 0 => return Err(-r),
             _ => return Ok(()),
@@ -1271,6 +1311,25 @@ pub fn test(scenario: u64) -> i64 {
                     syscall(SYS_MO_REDIRTY, [object, 1199 * PAGE, 1, 0, 0, 0]);
                 }
                 check!(26, fsync(&inode).is_ok());
+                0
+            }
+            3 => {
+                // A page pinned by a grant that is never let go of: the
+                // truncation gives up (EBUSY) instead of waiting for ever.
+                let data = alloc::vec![5u8; PAGE as usize];
+                check!(30, syscall(SYS_MO_WRITE, [object, 0, data.as_ptr() as u64, data.len() as u64, 0, 0]) == data.len() as i64);
+                let Ok(c) = client() else { return -31 };
+                let mut out = [0u64; 3];
+                let Ok(g) = grant_run(&c, object, 0, 1, GRANT_DIRTY, &mut out) else { return -32 };
+                let start = now();
+                let r = cache_truncate(&inode, object, 0, 50_000_000);
+                let waited = now() - start;
+                syscall(SYS_REVOKE, [c.handle(), g, 0, 0, 0, 0]);
+                syscall(SYS_MO_REDIRTY, [object, 0, 1, 0, 0, 0]);
+                check!(33, r == Err(EBUSY));
+                check!(34, (50_000_000..5_000_000_000).contains(&waited));
+                // Let go of: it truncates.
+                check!(35, truncate(&inode, 0).is_ok());
                 0
             }
             _ => -1000,
