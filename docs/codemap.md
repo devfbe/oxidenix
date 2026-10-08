@@ -50,7 +50,7 @@ module comment, and the public types it defines. Where to start for common tasks
 - `kernel/src/process/mod.rs` (498) Processes and threads: the process table, the current task, descriptor tables, process groups and sessions, CPU affinity; the submodules hold scheduling, fork/exec/exit, signals, IPC, restricted mode and the system... Types: `FdEntry`, `Server`.
 - `kernel/src/process/poll.rs` (105) Waiting for any of several files at once (poll, select, epoll_wait). Types: `PollSource`, `Registration`, `PollTable`.
 - `kernel/src/process/prctl.rs` (120) prctl, capget and capset.
-- `kernel/src/process/query.rs` (126) proc_query (syscall 1005): the kernel's native process and system information for the procfs server (records in `procproto`).
+- `kernel/src/process/query.rs` (130) proc_query (syscall 1005): the kernel's native process and system information for the procfs server (records in `procproto`).
 - `kernel/src/process/sched.rs` (567) The SMP scheduler: per-CPU run queues, wait queues, context switches. Types: `Table`, `PidReservation`, `CpuSched`, `CpuStats`, `WaitQueue`, `Waker`, `PollWaiter`, `Wait`.
 - `kernel/src/process/signal.rs` (774) POSIX signals for processes with threads, following Linux. Types: `SigAction`, `GroupExit`, `GroupSignals`, `ThreadSignals`.
 - `kernel/src/process/sys_file.rs` (667) File syscalls.
@@ -79,12 +79,13 @@ module comment, and the public types it defines. Where to start for common tasks
 - `servers/linux/src/fsclient.rs` (410) The server's end of the file protocol (`fsring`, docs/design/io-rings.md) to diskfs: one channel for the instance, shared by every thread of the tree's processes and by the pager thread. Types: `Ticket`, `Client`, `Scratch`, `Next`.
 - `servers/linux/src/heap.rs` (60) The server's heap: one allocator for every thread of the instance, in the shared region, growing by `SYS_SHARED_MAP` when it runs out. Types: `ServerHeap`.
 - `servers/linux/src/initramfs.rs` (65) The instance's root tmpfs from the boot image's initramfs (phase R6c.2c): the server reads the archive's headers and names from the kernel's image object (`SYS_INITRAMFS`) and makes each regular file a file object...
-- `servers/linux/src/main.rs` (278) The Linux server (docs/design/linux-server.md).
+- `servers/linux/src/main.rs` (279) The Linux server (docs/design/linux-server.md).
 - `servers/linux/src/mm.rs` (150) Memory system calls (phase R4): Linux's semantics of mmap, munmap, mprotect, mremap, madvise, msync and the mlock family, over the kernel's mapping calls.
 - `servers/linux/src/namespace.rs` (244) The server's namespace (phase R6c.2): mounts and path resolution. Types: `KInode`, `Node`, `Resolved`.
 - `servers/linux/src/paths.rs` (347) The system calls that take a path (phase R6c.2b), and the working directory and umask, which live in the caller's record (`records`).
 - `servers/linux/src/pipe.rs` (236) Pipes (phase R6a): a 64 KiB buffer shared by a read end and a write end, each a file of the server with a placeholder in the kernel's descriptor table. Types: `Dst`, `Src`, `Shared`, `PipeEnd`.
 - `servers/linux/src/records.rs` (75) Records per working-directory context: the cwd and umask of the processes that share them (phase R6c). Types: `FsState`, `FsContext`.
+- `servers/linux/src/sched.rs` (44) Scheduling policy: sched_getscheduler and sched_getparam.
 - `servers/linux/src/sync.rs` (131) A mutex for the server's data, shared by every thread of the instance (all the tree's processes run the server in the same shared region). Types: `Mutex`, `MutexGuard`, `RwLock`, `ReadGuard`, `WriteGuard`.
 - `servers/linux/src/time.rs` (102) Clocks and sleeping (phase R5): clock_gettime, clock_getres, gettimeofday, time, nanosleep, clock_nanosleep and sched_yield, over the kernel's clock and deadline sleep.
 - `servers/linux/src/tmpfile.rs` (239) Open files of the server's tmpfs (phase R6c.2c): a placeholder in the kernel's descriptor table names one (an open file description: offset, directory snapshot, write access); the calls on it are the server's. Types: `TmpOpen`.
@@ -160,7 +161,7 @@ module comment, and the public types it defines. Where to start for common tasks
 - `userspace/rwtest.h` (50) Positional and vectored reads and writes with preadv2/pwritev2's flags, on a file at `path` (fstest runs them on /data, the kernel's files; lxtest on /tmp, the Linux server's): the offset -1 means the file position,...
 - `userspace/sigmasktest.c` (102) Calls that wait with a temporary signal mask (sigsuspend, ppoll, pselect): the mask applies while they wait and to a handler that interrupts them; afterwards the caller's own mask is back.
 - `userspace/sigtest.c` (152) Signals: handlers, masks and pending signals, interrupted reads, timers (alarm, setitimer), faults turned into catchable signals, and the FPU state kept across handlers.
-- `userspace/smptest.c` (164) SMP tests: CPU count and affinity, real parallel speed-up, fork/exit and cross-CPU wakeups (pipes, signals) under load on every CPU.
+- `userspace/smptest.c` (187) SMP tests: CPU count, affinity and scheduling policy, real parallel speed-up, fork/exit and cross-CPU wakeups (pipes, signals) under load on every CPU.
 - `userspace/threadtest.c` (300) Threads: pthreads on clone/futex, shared memory and descriptors, TLS, thread and process signals, group exit, fork and exec from threads, vfork and posix_spawn, and TLB coherence (munmap and mprotect while another...
 - `userspace/timertest.c` (157) High-resolution timers: sleeps and timeouts end when they are due, not at the next 10 ms timer tick, and never early.
 - `userspace/timetest.c` (142) Clocks: nanosecond resolution, monotonic across CPUs, the CPU-time clocks of threads and processes, wall-clock time and its setting, and the accounting behind getrusage and times.

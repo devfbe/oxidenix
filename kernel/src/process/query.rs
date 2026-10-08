@@ -45,8 +45,16 @@ fn system() -> System {
     s
 }
 
+/// The process `pid` names: a process id, or the id of one of its threads
+/// (Linux's /proc has a directory for every thread id, though it lists
+/// only processes; the Linux server checks thread ids that way).
+fn group(pid: Pid) -> Result<alloc::sync::Arc<super::task::ThreadGroup>, i64> {
+    let table = TABLE.lock();
+    table.groups.get(&pid).cloned().or_else(|| table.tasks.get(&pid).map(|t| t.group.clone())).ok_or(ESRCH)
+}
+
 fn process(pid: Pid) -> Result<Process, i64> {
-    let g = TABLE.lock().groups.get(&pid).cloned().ok_or(ESRCH)?;
+    let g = group(pid)?;
     let info = g.info.lock();
     // The process's state is its main thread's (or the first live one's):
     // running if any thread runs.
@@ -90,7 +98,7 @@ fn process(pid: Pid) -> Result<Process, i64> {
 }
 
 fn text_of(pid: Pid, f: impl FnOnce(&super::task::Info) -> Vec<u8>) -> Result<Vec<u8>, i64> {
-    let g = TABLE.lock().groups.get(&pid).cloned().ok_or(ESRCH)?;
+    let g = group(pid)?;
     let info = g.info.lock();
     Ok(f(&info))
 }
