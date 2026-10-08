@@ -868,3 +868,58 @@ fn promises_end_with_truncation_release_and_owner() {
     assert_eq!(free(&fs), total);
     fsck("promise-end", &take(fs));
 }
+
+/// A write in flight for promised blocks (reserved, not linked yet) holds
+/// them once: the promise still counts them until the write links them, so
+/// the rest of the disk stays promisable to the last block. (Write-back of
+/// a big file keeps megabytes in flight; counted twice, they made write()
+/// fail with ENOSPC early.)
+#[test]
+fn blocks_in_flight_for_a_promise_count_once() {
+    let mut fs = Ext2::mount(mkfs("promise-flight", 4 * 1024)).unwrap();
+    let a = fs.create(ROOT_INO, "a", &NewNode::File, 0o644).unwrap();
+    fs.promise(1, a, 0, 64 * 1024).unwrap();
+    let promised = free(&fs);
+    let r = fs.reserve(a, 0, 64 * 1024).unwrap();
+    assert_eq!(free(&fs), promised);
+    // Everything else can be promised to another file, block by block.
+    let b = fs.create(ROOT_INO, "b", &NewNode::File, 0o644).unwrap();
+    let mut fb = 0;
+    while fs.promise(2, b, fb * 1024, 1024).is_ok() {
+        fb += 1;
+    }
+    assert!(free(&fs) <= 2, "{} blocks left unpromisable", free(&fs));
+    // The write in flight lands; so do the other owner's.
+    dma_write(&mut fs, &r, 0, &[4u8; 64 * 1024]);
+    fs.link(&r, 64 * 1024).unwrap();
+    fs.write(b, 0, &vec![5u8; fb as usize * 1024]).unwrap();
+    assert_eq!(fs.promised(), 0);
+    fs.sync().unwrap();
+    // A promise that ends while its blocks are in flight leaves them
+    // counted as reserved.
+    let c = fs.create(ROOT_INO, "c", &NewNode::File, 0o644).unwrap();
+    for ino in fs.unlink(ROOT_INO, "b", false).unwrap() {
+        fs.release(ino).unwrap();
+    }
+    fs.sync().unwrap();
+    let before = free(&fs);
+    fs.promise(3, c, 0, 8 * 1024).unwrap();
+    let r = fs.reserve(c, 0, 8 * 1024).unwrap();
+    assert_eq!(free(&fs), before - 8);
+    fs.forget_promises(3);
+    assert_eq!(fs.promised(), 0);
+    let mut d = 0;
+    let e = fs.create(ROOT_INO, "e", &NewNode::File, 0o644).unwrap();
+    while fs.promise(4, e, d * 1024, 1024).is_ok() {
+        d += 1;
+    }
+    fs.forget_promises(4);
+    // Only the 8 blocks in flight were kept from the promises (and the
+    // indirect blocks of e's: one single, one double with its tables).
+    let tables = |n: u64| (n > 12) as u64 + if n > 268 { 1 + (n - 268).div_ceil(256) } else { 0 };
+    let used = d + tables(d) + 8;
+    assert!(used <= before && used + 2 >= before, "{d} promised of {before}");
+    fs.unreserve(&r);
+    assert_eq!(free(&fs), before);
+    fsck("promise-flight", &take(fs));
+}
