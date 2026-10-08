@@ -696,17 +696,6 @@ impl<D: Device> State<D> {
             }
         }
         self.promised = self.promises.values().flat_map(|m| m.values()).map(Promise::total).sum();
-        // A promise that went (truncation, its owner's end) no longer
-        // counts the blocks in flight for it: they count as reserved.
-        let gone: Vec<(u32, u64)> = self
-            .reserved_promised
-            .range((ino, 0)..=(ino, u64::MAX))
-            .map(|(&k, _)| k)
-            .filter(|&(i, fb)| !self.data_promised(i, fb))
-            .collect();
-        for k in gone {
-            self.reserved_promised.remove(&k);
-        }
     }
 
     /// File block `fb` of `ino` got its block: promises of it are kept.
@@ -753,6 +742,18 @@ impl<D: Device> State<D> {
         }
         self.promises.insert(ino, m);
         self.tidy_promises(ino);
+        // Blocks in flight for what went count as reserved now (only a
+        // promise's end leaves such blocks: a link takes its block out of
+        // `reserved_promised` before it spends the promise).
+        let gone: Vec<(u32, u64)> = self
+            .reserved_promised
+            .range((ino, keep)..=(ino, u64::MAX))
+            .map(|(&k, _)| k)
+            .filter(|&(i, fb)| !self.data_promised(i, fb))
+            .collect();
+        for k in gone {
+            self.reserved_promised.remove(&k);
+        }
     }
 
     /// Whether file block `fb` has a data block, and the indirect blocks
