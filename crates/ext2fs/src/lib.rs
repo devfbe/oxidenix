@@ -2,17 +2,26 @@
 //! 1/2/4 KiB blocks, direct and single/double/triple indirect blocks.
 //!
 //! Metadata goes through a block cache (`cache.rs`); every public operation
-//! commits its changes before it returns (written together, then one
+//! commits its changes before it returns (written together, then a
 //! flush), so a completed operation is durable. File data is read and
 //! written straight from and to the device, in runs of contiguous blocks.
 //! Metadata is kept consistent enough for `e2fsck` on the host to accept
 //! the filesystem.
 //!
-//! The ring path (`read_map`, `reserve`, `link`, `sync`) is the exception:
-//! there the caller moves file data between the device and its client's
-//! pages itself, several requests at once, and makes it durable with
-//! `sync` (write-back); data reaches the disk before the metadata that
-//! points to it.
+//! **Ordering.** Whatever metadata may point to reaches the disk first:
+//! file data, zeroed fresh blocks and the contents of newly allocated
+//! metadata blocks (indirect, directory, symlink blocks) are written and
+//! flushed before any metadata is written, by a commit or a cache eviction
+//! (`State::barrier`). A crash at any moment, whatever the device's cache
+//! wrote back of what came after its last flush, therefore never leaves a
+//! pointer to a block that still holds a deleted file's data (tested by
+//! replaying every write and flush with arbitrary losses). A write thus
+//! costs two flushes: data, then metadata.
+//!
+//! The ring path (`read_map`, `reserve`, `link`, `sync`) is the exception
+//! to the commit per operation: there the caller moves file data between
+//! the device and its client's pages itself, several requests at once,
+//! and makes it durable with `sync` (write-back), under the same ordering.
 
 #![no_std]
 
@@ -216,10 +225,16 @@ struct State<D: Device> {
     /// Data blocks reserved for writes in flight (`Ext2::reserve`): in no
     /// bitmap and no inode yet, but no allocation takes them.
     reserved: BTreeSet<u32>,
-    /// Data the caller's writes put on the device (`Ext2::link`) may still
-    /// sit in the device's cache only: it is flushed before any metadata
-    /// reaches the device, so no metadata points to blocks whose data may
-    /// be lost in a crash.
+    /// Blocks allocated for metadata (indirect, directory and symlink
+    /// blocks) whose contents have not reached the device yet. Like file
+    /// data, they are written and flushed before any metadata that may
+    /// point to them (`barrier`): after a crash, no pointer leads to a
+    /// block that still holds what a deleted file left there.
+    new_meta: BTreeSet<u32>,
+    /// Blocks were written that metadata may point to (file data, zeroed
+    /// fresh blocks, new metadata blocks, and the data of the caller's own
+    /// writes that `Ext2::link` records) and the device has not been
+    /// flushed since: it is, before any metadata reaches the device.
     unflushed: bool,
 }
 
@@ -291,8 +306,14 @@ impl<D: Device> State<D> {
             if let Some(contents) = contents {
                 // Data before the metadata that may point to it.
                 self.zero_fresh()?;
-                self.data_barrier()?;
-                self.dev_write(old, &contents)?;
+                if self.new_meta.remove(&old) {
+                    // A new block's contents: what points to it waits.
+                    self.dev_write(old, &contents)?;
+                    self.unflushed = true;
+                } else {
+                    self.barrier()?;
+                    self.dev_write(old, &contents)?;
+                }
             }
             self.cache.remove(old);
         }
@@ -309,6 +330,7 @@ impl<D: Device> State<D> {
             }
             let zeros = vec![0u8; count as usize * self.block_size];
             self.dev_write(first, &zeros)?;
+            self.unflushed = true;
             for n in first..first + count {
                 self.fresh.remove(&n);
             }
@@ -334,9 +356,25 @@ impl<D: Device> State<D> {
         Ok(())
     }
 
-    /// Makes the data of linked writes durable (see `unflushed`) before
-    /// metadata is written.
-    fn data_barrier(&mut self) -> Result<(), i64> {
+    /// Makes what metadata may point to durable before metadata is written:
+    /// the new metadata blocks' contents (see `new_meta`), then a flush if
+    /// anything such was written (see `unflushed`).
+    fn barrier(&mut self) -> Result<(), i64> {
+        let blocks: Vec<u32> = self.new_meta.iter().copied().collect();
+        for n in blocks {
+            // A block allocated but not filled yet (its allocation's own
+            // metadata updates may land here) stays new until it is.
+            if !self.cache.contains(n) {
+                continue;
+            }
+            if self.cache.is_dirty(n) {
+                let contents = self.cache.range(n..n + 1).next().map(|(_, d)| d.to_vec()).unwrap_or_default();
+                self.dev_write(n, &contents)?;
+                self.cache.mark_clean(n);
+                self.unflushed = true;
+            }
+            self.new_meta.remove(&n);
+        }
         if self.unflushed {
             self.dev.flush().map_err(io)?;
             self.unflushed = false;
@@ -346,13 +384,15 @@ impl<D: Device> State<D> {
 
     /// Zeroes fresh data blocks, writes the changed metadata (adjacent
     /// blocks in one request), then flushes the device if anything was
-    /// written. What fails stays to be written by the next commit.
+    /// written. The data and new blocks the metadata points to are flushed
+    /// before it (`barrier`). What fails stays to be written by the next
+    /// commit.
     fn commit(&mut self) -> Result<(), i64> {
         self.zero_fresh()?;
-        let dirty = self.cache.dirty();
-        if !dirty.is_empty() || self.super_dirty {
-            self.data_barrier()?;
+        if self.super_dirty || self.cache.has_dirty() {
+            self.barrier()?;
         }
+        let dirty = self.cache.dirty();
         let mut i = 0;
         while i < dirty.len() {
             let mut j = i + 1;
@@ -410,6 +450,7 @@ impl<D: Device> State<D> {
         let blocks = first..first + (buf.len() / self.block_size) as u32;
         self.cache.remove_range(blocks.clone());
         self.dev_write(first, buf)?;
+        self.unflushed = true;
         for n in blocks {
             self.fresh.remove(&n);
         }
@@ -510,6 +551,8 @@ impl<D: Device> State<D> {
                 self.write_group(g)?;
                 self.write_super()?;
                 let block = first + bit;
+                // Metadata unless `alloc_data` makes it a fresh data block.
+                self.new_meta.insert(block);
                 if zero {
                     self.write_block(block, &vec![0u8; self.block_size])?;
                 }
@@ -523,6 +566,7 @@ impl<D: Device> State<D> {
         self.check_block(block)?;
         self.cache.remove(block);
         self.fresh.remove(&block);
+        self.new_meta.remove(&block);
         let rel = block - self.first_data_block;
         let g = (rel / self.blocks_per_group) as usize;
         self.clear_bit(self.groups[g].block_bitmap, rel % self.blocks_per_group)?;
@@ -651,6 +695,7 @@ impl<D: Device> State<D> {
     fn alloc_data(&mut self, goal: usize, zero: bool) -> Result<u32, i64> {
         let b = self.alloc_block(goal, zero)?;
         if !zero {
+            self.new_meta.remove(&b);
             self.fresh.insert(b);
         }
         Ok(b)
@@ -1394,6 +1439,11 @@ impl<D: Device> State<D> {
     }
 
     fn link(&mut self, r: &Reservation, end: u64) -> Result<u64, i64> {
+        // The data went to the device outside this filesystem: from here on
+        // it is flushed before any metadata reaches the device (see
+        // `unflushed`), also a block an eviction writes while the pointers
+        // below are set.
+        self.unflushed = true;
         let mut inode = match self.live_inode(r.ino) {
             Ok(inode) => inode,
             Err(e) => {
@@ -1414,9 +1464,6 @@ impl<D: Device> State<D> {
             inode.set_size(end);
         }
         inode.touch(self.dev.now(), false, true);
-        // The data went to the device outside this filesystem (or it
-        // would not be linked): flushed before the metadata, see `unflushed`.
-        self.unflushed = true;
         self.write_inode(r.ino, &inode)?;
         result.map(|_| inode.size())
     }
@@ -1474,7 +1521,13 @@ pub struct Ext2<D: Device> {
 }
 
 impl<D: Device> Ext2<D> {
-    pub fn mount(mut dev: D) -> Result<Self, &'static str> {
+    pub fn mount(dev: D) -> Result<Self, &'static str> {
+        Self::mount_with_cache(dev, CACHE_BYTES)
+    }
+
+    /// `mount` with a metadata cache of `cache_bytes` (the tests make it
+    /// small, so that blocks are evicted all the time).
+    pub fn mount_with_cache(mut dev: D, cache_bytes: usize) -> Result<Self, &'static str> {
         let mut sb = [0u8; 1024];
         dev.read(2, &mut sb).map_err(|_| "cannot read the superblock")?;
         if le16(&sb, 56) != MAGIC {
@@ -1513,13 +1566,14 @@ impl<D: Device> Ext2<D> {
             free_inodes: le32(&sb, 16),
             gdt_block: first_data_block + 1,
             groups: Vec::new(),
-            cache: BlockCache::new(CACHE_BYTES / block_size),
+            cache: BlockCache::new(cache_bytes / block_size),
             sb,
             super_dirty: false,
             written: false,
             fresh: BTreeSet::new(),
             unlinked: Vec::new(),
             reserved: BTreeSet::new(),
+            new_meta: BTreeSet::new(),
             unflushed: false,
         };
         let count = (blocks_count - first_data_block).div_ceil(blocks_per_group) as usize;
@@ -1728,7 +1782,7 @@ impl<D: Device> Ext2<D> {
     /// Makes every linked write durable: its data first (a device flush),
     /// then the metadata (a commit, flushed).
     pub fn sync(&mut self) -> Result<(), i64> {
-        let barrier = self.st.data_barrier();
+        let barrier = self.st.barrier();
         self.commit(barrier)
     }
 }

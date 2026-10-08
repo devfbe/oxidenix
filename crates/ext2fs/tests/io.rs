@@ -1,7 +1,9 @@
 //! ext2fs on a RAM disk that counts device requests: large reads and writes
-//! take few requests, every operation flushes once, and the filesystem
-//! stays consistent for e2fsck; on the ring path, reserved blocks stay out
-//! of the metadata until linked and `sync` flushes data before metadata. Needs mke2fs and e2fsck (e2fsprogs) in PATH:
+//! take few requests, a write flushes twice (data, then metadata), and the
+//! filesystem stays consistent for e2fsck; on the ring path, reserved
+//! blocks stay out of the metadata until linked and `sync` flushes data
+//! before metadata; a crash at any point never exposes a deleted file's
+//! blocks. Needs mke2fs and e2fsck (e2fsprogs) in PATH:
 //! `nix-shell -p e2fsprogs --run "cargo test -p ext2fs"`.
 
 use ext2fs::{Device, Ext2, NewNode, ROOT_INO};
@@ -22,6 +24,15 @@ struct RamDisk {
     fail_at: Option<usize>,
     /// ... and how many in a row.
     fail_count: usize,
+    /// Every write and flush from some point on, for crash images.
+    log: Option<Vec<Event>>,
+}
+
+/// A device request, as the crash tests replay them.
+#[derive(Clone)]
+enum Event {
+    Write(usize, Vec<u8>),
+    Flush,
 }
 
 impl RamDisk {
@@ -65,11 +76,17 @@ impl Device for RamDisk {
         let at = lba as usize * 512;
         self.data.get_mut(at..at + buf.len()).ok_or(())?.copy_from_slice(buf);
         self.counts.writes += 1;
+        if let Some(log) = &mut self.log {
+            log.push(Event::Write(at, buf.to_vec()));
+        }
         Ok(())
     }
 
     fn flush(&mut self) -> Result<(), ()> {
         self.counts.flushes += 1;
+        if let Some(log) = &mut self.log {
+            log.push(Event::Flush);
+        }
         Ok(())
     }
 
@@ -97,7 +114,7 @@ fn mkfs(name: &str, kib: usize) -> RamDisk {
     assert!(ok, "mke2fs failed");
     let data = std::fs::read(&path).unwrap();
     std::fs::remove_file(&path).unwrap();
-    RamDisk { data, counts: Counts::default(), fail_at: None, fail_count: 0 }
+    RamDisk { data, counts: Counts::default(), fail_at: None, fail_count: 0, log: None }
 }
 
 /// e2fsck -fn on the disk's contents.
@@ -158,14 +175,16 @@ fn large_reads_take_few_requests() {
 }
 
 #[test]
-fn large_writes_take_few_requests_and_one_flush() {
+fn large_writes_take_few_requests_and_two_flushes() {
     let mut fs = Ext2::mount(mkfs("writes", 16 * 1024)).unwrap();
     let ino = fs.create(ROOT_INO, "big", &NewNode::File, 0o644).unwrap();
     let before = fs.device().counts.clone();
     write_file(&mut fs, ino, MIB);
     let after = fs.device().counts.clone();
     let requests = 32;
-    assert_eq!(after.flushes - before.flushes, requests, "one flush per write");
+    // One for the data (before the metadata that points to it), one for
+    // the metadata.
+    assert_eq!(after.flushes - before.flushes, 2 * requests, "two flushes per write");
     // Per request: the data, the inode, the bitmap, the group descriptor,
     // the superblock and the indirect blocks it touched.
     assert!(after.writes - before.writes <= requests * 8, "{} device writes for 1 MiB", after.writes - before.writes);
@@ -529,4 +548,134 @@ fn the_ring_path_takes_only_inodes_in_use() {
     assert_eq!(fs.check(ino), enoent);
     assert_eq!(fs.reserve(ino, 0, 1).map(|_| ()), enoent);
     fsck("live", &take(fs));
+}
+
+// ------------------------------------------------------------------ crashes
+
+/// The disk after a crash in flush epoch `epoch` of `log` (from `base`):
+/// every write before that epoch's start reached the disk (flushes ended
+/// the epochs before), of the epoch's own writes an arbitrary subset (the
+/// device's cache may write them back in any order), chosen by `seed`.
+fn crash_image(base: &[u8], log: &[Event], epoch: usize, seed: u64) -> Vec<u8> {
+    let mut data = base.to_vec();
+    let mut rng = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    let mut current = 0;
+    for e in log {
+        match e {
+            Event::Flush => {
+                current += 1;
+                if current > epoch {
+                    break;
+                }
+            }
+            Event::Write(at, bytes) => {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                // Seed 0: none of the epoch's writes, 1: all of them.
+                let keep = current < epoch || seed == 1 || (seed > 1 && rng >> 63 == 1);
+                if keep {
+                    data[*at..*at + bytes.len()].copy_from_slice(bytes);
+                }
+            }
+        }
+    }
+    data
+}
+
+/// Mounts a crash image and reads every file and directory it can reach:
+/// none may show the secret's bytes (`S`), which only freed blocks hold.
+/// Errors are allowed (ext2 has no journal: a crash may leave an
+/// inconsistency for e2fsck), stale data is not.
+fn assert_no_secret(image: Vec<u8>, what: &str) {
+    let disk = RamDisk { data: image, counts: Counts::default(), fail_at: None, fail_count: 0, log: None };
+    let Ok(mut fs) = Ext2::mount(disk) else { return };
+    let mut dirs = vec![ROOT_INO];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(dir) = dirs.pop() {
+        if !seen.insert(dir) || seen.len() > 1000 {
+            continue;
+        }
+        let Ok(entries) = fs.list(dir) else { continue };
+        for (name, ino, kind) in entries {
+            assert!(!name.contains("SSSS"), "{what}: a directory shows freed data");
+            match kind {
+                2 if name != "." && name != ".." => dirs.push(ino),
+                1 => {
+                    let mut buf = vec![0u8; 2 * MIB];
+                    if let Ok(n) = fs.read(ino, 0, &mut buf) {
+                        assert!(!buf[..n].contains(&b'S'), "{what}: {name} shows freed data");
+                    }
+                }
+                7 => {
+                    if let Ok(target) = fs.readlink(ino) {
+                        assert!(!target.contains('S'), "{what}: symlink {name} shows freed data");
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// A crash at any point, with the device's cache writing back any subset
+/// of what came since the last flush, never makes a file, directory or
+/// symlink show what a deleted file left in its blocks: data and new
+/// metadata blocks are flushed before the metadata that points to them,
+/// on the IPC path and the ring path alike, also when a small cache
+/// evicts dirty blocks in the middle of an operation.
+#[test]
+fn a_crash_never_exposes_freed_blocks() {
+    let mut fs = Ext2::mount(mkfs("crash", 4 * 1024)).unwrap();
+    let secret = fs.create(ROOT_INO, "secret", &NewNode::File, 0o644).unwrap();
+    fs.write(secret, 0, &vec![b'S'; 2 * MIB]).unwrap();
+    for ino in fs.unlink(ROOT_INO, "secret", false).unwrap() {
+        fs.release(ino).unwrap();
+    }
+    let mut disk = take(fs);
+    let base = disk.data.clone();
+    disk.log = Some(Vec::new());
+    // 2 blocks of cache: dirty blocks are evicted all the time, also in
+    // the middle of linking a write.
+    let mut fs = Ext2::mount_with_cache(disk, 2 * 1024).unwrap();
+    // The IPC path: a file with indirect blocks, a directory with entries
+    // in several blocks, a symlink with a block of its own.
+    let a = fs.create(ROOT_INO, "a", &NewNode::File, 0o644).unwrap();
+    for off in (0..300 * 1024).step_by(32 * 1024) {
+        fs.write(a, off, &[b'n'; 32 * 1024]).unwrap();
+    }
+    let d = fs.create(ROOT_INO, "d", &NewNode::Dir, 0o755).unwrap();
+    for i in 0..40 {
+        fs.create(d, &format!("a-long-file-name-of-some-length-{i:03}"), &NewNode::File, 0o644).unwrap();
+    }
+    fs.create(ROOT_INO, "l", &NewNode::Symlink("t".repeat(200)), 0).unwrap();
+    // The ring path: reserved blocks written, linked, other operations
+    // committing in between, then synced; a hole left in the middle.
+    // Direct blocks only first: no new indirect block whose barrier would
+    // flush the data by the way.
+    let b = fs.create(ROOT_INO, "b", &NewNode::File, 0o644).unwrap();
+    for (i, (off, len)) in [(0u64, 10 * 1024u64), (0, 200 * 1024), (300 * 1024, 100 * 1024), (100 * 1024 + 7, 5000)].into_iter().enumerate() {
+        let r = fs.reserve(b, off, len).unwrap();
+        dma_write(&mut fs, &r, off, &vec![b'r'; len as usize]);
+        fs.link(&r, off + len).unwrap();
+        fs.create(d, &format!("x{i}"), &NewNode::File, 0o644).unwrap();
+    }
+    fs.sync().unwrap();
+    // Into a hole under an indirect block already on the disk: linking
+    // changes it (no new block's barrier flushes by the way), and the tiny
+    // cache evicts it in the middle of the link.
+    let r = fs.reserve(b, 210 * 1024, 20 * 1024).unwrap();
+    assert!(r.runs.iter().all(|run| run.new));
+    dma_write(&mut fs, &r, 210 * 1024, &[b'r'; 20 * 1024]);
+    fs.link(&r, 230 * 1024).unwrap();
+    fs.create(d, "last", &NewNode::File, 0o644).unwrap();
+    let mut disk = take(fs);
+    let log = disk.log.take().unwrap();
+    let epochs = log.iter().filter(|e| matches!(e, Event::Flush)).count();
+    assert!(epochs > 50, "{epochs} flushes");
+    for epoch in 0..=epochs {
+        for seed in 0..32 {
+            assert_no_secret(crash_image(&base, &log, epoch, seed), &format!("crash in epoch {epoch} (seed {seed})"));
+        }
+    }
+    // And without a crash, all is there and consistent.
+    fsck("crash", &disk);
 }

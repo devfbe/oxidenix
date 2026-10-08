@@ -1,7 +1,8 @@
 //! The metadata block cache: inode tables, bitmaps, group descriptors,
 //! directories, symlink and indirect blocks. Changes stay in the cache
 //! (dirty) until the operation that made them commits, which writes them
-//! together and flushes once; a block stays dirty until it was written, so
+//! together and flushes (after what they point to, see the crate's
+//! "Ordering"); a block stays dirty until it was written, so
 //! a failed commit is retried by the next one. Least recently used blocks
 //! give way when the cache is full; a dirty one is written first.
 //!
@@ -45,6 +46,16 @@ impl BlockCache {
     /// Whether block `n` is cached.
     pub fn contains(&self, n: u32) -> bool {
         self.blocks.contains_key(&n)
+    }
+
+    /// Whether block `n` is cached and changed since it was last written.
+    pub fn is_dirty(&self, n: u32) -> bool {
+        self.blocks.get(&n).is_some_and(|e| e.dirty)
+    }
+
+    /// Whether any block is dirty.
+    pub fn has_dirty(&self) -> bool {
+        self.blocks.values().any(|e| e.dirty)
     }
 
     /// Cached blocks in `range`, without marking them used.

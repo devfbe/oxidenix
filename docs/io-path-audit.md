@@ -140,7 +140,7 @@ one flush. After the server answered, the kernel copies the data into the cached
 | IPC round trips | 2 |
 | address space switches | 4 |
 | virtio requests | about 12 (per 32 KiB: 1-2 data runs, 3-4 metadata runs, superblock, flush), each synchronous |
-| device flushes | 2 (one per IPC: each `write` call is durable when it returns) |
+| device flushes | 2 (one per IPC: each `write` call is durable when it returns); 4 since I/O rings step 3, which flushes the data before the metadata that points to it (crash safety, see `crates/ext2fs`, "Ordering") |
 | CPU copies of the data | **6**: user → kernel buffer → request `Vec` → diskfs buffer → DMA bounce buffer; plus kernel buffer → page cache |
 | heap allocations | the IPC's, plus one cloned metadata block per `bmap` and per metadata change |
 
