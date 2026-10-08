@@ -187,11 +187,12 @@ pub fn pid_status(p: &Process, s: &System) -> String {
     let kb = p.pages * 4;
     let virt_kb = p.virt_pages * 4;
     format!(
-        "Name:\t{name}\nUmask:\t0022\nState:\t{state}\nTgid:\t{pid}\nNgid:\t0\nPid:\t{pid}\nPPid:\t{ppid}\nTracerPid:\t0\n\
+        "Name:\t{name}\nUmask:\t0022\nState:\t{state}\nTgid:\t{tgid}\nNgid:\t0\nPid:\t{pid}\nPPid:\t{ppid}\nTracerPid:\t0\n\
          Uid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nFDSize:\t256\nGroups:\t\nVmPeak:\t{virt_kb:>8} kB\nVmSize:\t{virt_kb:>8} kB\n\
          VmRSS:\t{kb:>8} kB\nRssAnon:\t{kb:>8} kB\nVmSwap:\t       0 kB\nThreads:\t{threads}\nCpus_allowed_list:\t0-{last}\n",
         name = name(p),
         pid = p.pid,
+        tgid = p.tgid,
         ppid = p.ppid,
         threads = p.threads,
         last = s.cpus.saturating_sub(1),

@@ -71,6 +71,7 @@ fn process(pid: Pid) -> Result<Process, i64> {
     let tick_ns = crate::time::NSEC_PER_SEC / TIMER_HZ;
     let mut p = Process {
         pid,
+        tgid: g.tgid,
         ppid: info.ppid,
         pgid: info.pgid,
         sid: info.sid,

@@ -11,6 +11,7 @@
 #include <sys/sysinfo.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
+#include <pthread.h>
 #include <unistd.h>
 
 static int failures;
@@ -38,6 +39,36 @@ static int count_fields(const char *s) {
 static void check(const char *name, int ok) {
     printf("%-52s %s\n", name, ok ? "ok" : "FAIL");
     if (!ok) failures++;
+}
+
+/* A thread that says its id and waits until a byte arrives. */
+static int tid_pipe[2], park_pipe[2];
+static void *say_tid(void *arg) {
+    long tid = syscall(SYS_gettid);
+    write(tid_pipe[1], &tid, sizeof tid);
+    char c;
+    read(park_pipe[0], &c, 1);
+    return arg;
+}
+
+/* /proc/<tid> of a thread that is not the main one: its own Pid, the
+ * process's Tgid (as Linux, which lists processes only). */
+static void thread_dir(void) {
+    pipe(tid_pipe);
+    pipe(park_pipe);
+    pthread_t t;
+    pthread_create(&t, NULL, say_tid, NULL);
+    long tid = 0;
+    read(tid_pipe[0], &tid, sizeof tid);
+    char path[64], buf[2048], want_pid[32], want_tgid[32];
+    snprintf(path, sizeof path, "/proc/%ld/status", tid);
+    snprintf(want_pid, sizeof want_pid, "\nPid:\t%ld\n", tid);
+    snprintf(want_tgid, sizeof want_tgid, "\nTgid:\t%d\n", getpid());
+    int got = slurp(path, buf, sizeof buf);
+    check("/proc/<tid> of a thread: its Pid, the process's Tgid",
+          tid != getpid() && got > 0 && strstr(buf, want_pid) && strstr(buf, want_tgid));
+    write(park_pipe[1], "x", 1);
+    pthread_join(t, NULL);
 }
 
 int main(void) {
@@ -156,6 +187,7 @@ int main(void) {
     check("/sys/devices/system/cpu has a cpuN per CPU", dirs == ncpu);
     check("/proc is read-only", open("/proc/stat", O_WRONLY) < 0 || write(open("/proc/stat", O_WRONLY), "x", 1) < 0);
 
+    thread_dir();
     printf("proctest: %s\n", failures ? "FAILED" : "all passed");
     return failures;
 }
