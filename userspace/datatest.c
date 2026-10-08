@@ -2,7 +2,7 @@
  * the kernel, descriptors and mappings of a file share one page cache,
  * write() leaves dirty pages that fsync makes durable (an O_DIRECT read
  * fetches the device's copy), children's stores survive write-back around
- * fork, truncation reaches mappings, many readers
+ * fork and mprotect, truncation reaches mappings, many readers
  * and writers at once see consistent data, a file larger than the memory
  * the cache may use is written and read back whole, a read finds room
  * when dirty pages fill memory, and a full disk fails write() itself with
@@ -246,6 +246,58 @@ static void fork_and_writeback(void) {
     for (int i = 0; good && i < 100; i++) good &= back[100 + i] == (char)('A' + i % 26);
     check("children's stores reach the disk with write-back around fork", good);
     munmap(m, PG);
+    close(fd);
+    unlink(path);
+}
+
+/* Rights raised again by mprotect never let a store skip marking its page
+ * dirty: after PROT_NONE (with a faulting access meanwhile), or PROT_READ
+ * across a write-back, and back to PROT_READ|PROT_WRITE, the first store
+ * faults and dirties the page, so fsync writes it back. */
+static int disk_has(const char *path, off_t off, char c) {
+    char back[PG];
+    off_t page = off / PG * PG;
+    return on_disk(path, page, back, PG) == PG && back[off - page] == c;
+}
+
+static void reprotect(void) {
+    const char *path = "/data/datatest.mprotect";
+    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    char page[2 * PG];
+    memset(page, '.', sizeof page);
+    write(fd, page, sizeof page);
+    fsync(fd);
+    char *m = mmap(NULL, 2 * PG, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (m == MAP_FAILED) {
+        check("mprotect and write-back: mapping", 0);
+        return;
+    }
+    /* A clean page (written back, write-protected) behind PROT_NONE. */
+    m[0] = 'a';
+    m[PG] = 'b';
+    fsync(fd);
+    int ok = mprotect(m, 2 * PG, PROT_NONE) == 0;
+    check("PROT_NONE over a clean shared /data page: accesses fault", ok && faults(m) == SIGSEGV && store_faults(m + PG) == SIGSEGV);
+    ok = mprotect(m, 2 * PG, PROT_READ | PROT_WRITE) == 0;
+    long d0 = meminfo("Dirty:");
+    m[10] = 'N';
+    long d1 = meminfo("Dirty:");
+    check("... back to read-write: the first store dirties the page", ok && m[0] == 'a' && d1 >= d0 + 4);
+    check("... and fsync writes it back", fsync(fd) == 0 && disk_has(path, 10, 'N') && disk_has(path, 0, 'a'));
+    /* A dirty page written back while it is PROT_NONE. */
+    m[20] = 'x';
+    ok = mprotect(m, 2 * PG, PROT_NONE) == 0 && fsync(fd) == 0 && disk_has(path, 20, 'x');
+    ok &= mprotect(m, 2 * PG, PROT_READ | PROT_WRITE) == 0;
+    m[30] = 'y';
+    check("a page written back under PROT_NONE is dirtied by the next store", ok && fsync(fd) == 0 && disk_has(path, 30, 'y'));
+    /* A dirty page made read-only, written back, then writable again. */
+    m[PG + 1] = 'r';
+    ok = mprotect(m + PG, PG, PROT_READ) == 0 && fsync(fd) == 0 && disk_has(path, PG + 1, 'r');
+    ok &= m[PG + 1] == 'r' && store_faults(m + PG + 2) == SIGSEGV;
+    ok &= mprotect(m + PG, PG, PROT_READ | PROT_WRITE) == 0;
+    m[PG + 3] = 'w';
+    check("a page written back under PROT_READ is dirtied by the next store", ok && fsync(fd) == 0 && disk_has(path, PG + 3, 'w'));
+    munmap(m, 2 * PG);
     close(fd);
     unlink(path);
 }
@@ -495,6 +547,7 @@ int main(void) {
     durability();
     truncation();
     fork_and_writeback();
+    reprotect();
     readers();
     writers();
     larger_than_cache();

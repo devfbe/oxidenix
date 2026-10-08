@@ -619,23 +619,8 @@ impl AddressSpace {
         memory::with_frames(|frames| {
             for_each_leaf(l4, start, end, |va, e| {
                 let frame = PhysFrame::containing_address(e.addr());
-                let was_cow = e.flags().contains(COW);
-                let mut flags = prot.flags();
-                // A frame shared with another mapping never becomes writable
-                // in place (unless the area is shared memory).
-                let shared_area = self.vma(va).is_some_and(|v| v.backing.shared());
-                // A page of a disk file stays read-only until a store marks
-                // it dirty (unless it is already).
-                let tracked = self.vma(va).is_some_and(|v| v.backing.tracks_dirty());
-                let was_writable = e.flags().contains(PageTableFlags::WRITABLE);
-                let must_fault = if shared_area { tracked && !was_writable } else { was_cow || frames.refcount(frame) > 1 };
-                if flags.contains(PageTableFlags::WRITABLE) && must_fault {
-                    flags.remove(PageTableFlags::WRITABLE);
-                    flags.insert(COW);
-                } else if was_cow && !prot.none() {
-                    flags.insert(COW);
-                }
-                e.set_addr(frame.start_address(), flags);
+                let backing = self.vma(va).map(|v| &v.backing);
+                e.set_addr(frame.start_address(), leaf_flags(backing, prot, e.flags(), frames.refcount(frame)));
             });
         });
         // Rights may have shrunk: no CPU may keep the old ones.
@@ -774,9 +759,17 @@ impl AddressSpace {
                 return Ok(());
             }
             // A kept PROT_NONE page whose area allows access again (an
-            // entry that was not present is in no TLB).
+            // entry that was not present is in no TLB). It gets the
+            // entry mprotect would give it (`leaf_flags`): a shared frame
+            // or a clean page of a disk file is mapped read-only, so a
+            // store goes on as a write fault on a present page.
             let frame: PhysFrame = PhysFrame::containing_address(e.addr());
-            e.set_addr(frame.start_address(), v.prot.flags());
+            let refs = memory::with_frames(|frames| frames.refcount(frame));
+            let flags = leaf_flags(Some(&v.backing), v.prot, flags, refs);
+            e.set_addr(frame.start_address(), flags);
+            if access.write && !flags.contains(PageTableFlags::WRITABLE) {
+                return self.break_cow(page, &v, wait);
+            }
             return Ok(());
         }
         let (frame, writable_ok) = self.new_frame(page, &v, access, wait)?;
@@ -880,18 +873,7 @@ impl AddressSpace {
         let writable = ((flags - COW) | PageTableFlags::WRITABLE) & !PROT_NONE;
         let old = PhysFrame::containing_address(e.addr());
         let shared_area = v.backing.shared();
-        if let (true, Backing::File { cache, offset, .. }) = (v.backing.tracks_dirty(), &v.backing) {
-            let index = (offset + (page - v.start)) / PAGE;
-            match cache.set_dirty(index, !wait) {
-                Dirtied::Yes => {}
-                // Gone if the file was truncated meanwhile.
-                Dirtied::Gone => return Err(Fault::Bus),
-                Dirtied::Unbacked => {
-                    self.awaited = Some((cache.clone(), index, true));
-                    return Err(Fault::Retry);
-                }
-            }
-        }
+        self.mark_dirty(page, v, wait)?;
         let copied = memory::with_frames(|frames| {
             if shared_area || frames.refcount(old) <= 1 {
                 // Only rights grow: a stale read-only entry elsewhere just
@@ -915,6 +897,25 @@ impl AddressSpace {
             // mapping lets go of it.
             let mut gather = Gather::new(&self.tlb);
             gather.add(page, old);
+        }
+        Ok(())
+    }
+
+    /// Before a store to `page` of a shared disk-file mapping: marks the
+    /// page dirty, backed first unless `wait` (`Fault::Retry` with it in
+    /// `awaited`: see `PageCache::set_dirty`). Nothing for other areas.
+    fn mark_dirty(&mut self, page: u64, v: &Vma, wait: bool) -> Result<(), Fault> {
+        if let (true, Backing::File { cache, offset, .. }) = (v.backing.tracks_dirty(), &v.backing) {
+            let index = (offset + (page - v.start)) / PAGE;
+            match cache.set_dirty(index, !wait) {
+                Dirtied::Yes => {}
+                // Gone if the file was truncated meanwhile.
+                Dirtied::Gone => return Err(Fault::Bus),
+                Dirtied::Unbacked => {
+                    self.awaited = Some((cache.clone(), index, true));
+                    return Err(Fault::Retry);
+                }
+            }
         }
         Ok(())
     }
@@ -1061,7 +1062,7 @@ impl AddressSpace {
     /// not active, regardless of the areas' rights (the loader clears the
     /// bss part of a segment's last file page). A frame shared with others
     /// (copy-on-write, or a file's page cache) is copied first, unless the
-    /// area is shared memory.
+    /// area is shared memory; a disk file's page is then marked dirty.
     pub fn write(&mut self, addr: u64, data: &[u8]) -> Result<(), Fault> {
         self.write_as(addr, data, false)
     }
@@ -1085,6 +1086,10 @@ impl AddressSpace {
                 }
             } else if !v.backing.shared() {
                 self.privatize(page)?;
+            } else {
+                // A store into a read-only shared mapping still reaches
+                // the file: a disk file's page must be marked dirty.
+                self.mark_dirty(page, &v, true)?;
             }
             let e = leaf_entry(self.l4, page).ok_or(Fault::Segv)?;
             let phys = e.addr().as_u64() + va % PAGE;
@@ -1342,6 +1347,40 @@ fn for_each_leaf(l4: PhysFrame, start: u64, end: u64, mut f: impl FnMut(u64, &'s
             va += PAGE;
         }
     }
+}
+
+/// The leaf flags for an area's page under `prot`, replacing an entry
+/// with flags `old` (present, or kept for PROT_NONE) whose frame has
+/// `refs` references; `backing` is the area's (None: outside any area).
+///
+/// The one rule for every entry whose rights grow without a fault
+/// (mprotect, a PROT_NONE page accessed again): it becomes writable in
+/// place only if no store may need to see it first.
+/// - Private memory: not if the frame is shared (copy-on-write, a fork
+///   relative or the file's page cache) or marked COW.
+/// - A shared mapping of a disk file (`Backing::tracks_dirty`): only if
+///   the entry was writable already, which means the page is dirty and
+///   backed (write-back and an extending truncate write-protect every
+///   mapping of a page they clean or leave unbacked). Anything else, a
+///   PROT_NONE or read-only entry above all, is mapped read-only and COW,
+///   so the first store faults (`break_cow`), marks the page dirty and
+///   has it backed (`PageCache::set_dirty`); else write-back would skip
+///   the stored data.
+/// - Other shared memory: writable as the area allows.
+fn leaf_flags(backing: Option<&Backing>, prot: Prot, old: PageTableFlags, refs: u32) -> PageTableFlags {
+    let mut flags = prot.flags();
+    let was_cow = old.contains(COW);
+    let must_fault = match backing {
+        Some(b) if b.shared() => b.tracks_dirty() && !old.contains(PageTableFlags::WRITABLE),
+        _ => was_cow || refs > 1,
+    };
+    if flags.contains(PageTableFlags::WRITABLE) && must_fault {
+        flags.remove(PageTableFlags::WRITABLE);
+        flags.insert(COW);
+    } else if was_cow && !prot.none() {
+        flags.insert(COW);
+    }
+    flags
 }
 
 /// How often a fault waits for a pager's page and tries again.

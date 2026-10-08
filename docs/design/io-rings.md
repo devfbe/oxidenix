@@ -342,7 +342,9 @@ pages and dirty marks the kernel keeps and whose data the server moves:
   diskfs to write from by DMA; a write that failed puts them back with `mo_redirty` (1078). A child of
   `fork` gets a dirty-tracked page read-only (its first store marks it): it is not among the
   file's mappers until its address space is complete, so a write-back meanwhile could not
-  write-protect it. The
+  write-protect it. Rights raised without a fault (`mprotect`, a page kept under `PROT_NONE`
+  accessed again) keep a page writable only if it was writable before, so dirty and backed;
+  any other page is mapped read-only and its first store marks it dirty. The
   file's size at `out` is the one under the lock that took the dirty marks: a write makes a page
   dirty and the file longer at once, so the run's data ends there (a size read earlier would cut
   off pages a concurrent append dirtied, and lose them).
