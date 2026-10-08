@@ -34,7 +34,7 @@ if [ -n "$LINUX" ]; then
     KVERSION="$(basename "$(dirname "$KERNEL")" | sed 's/^[a-z0-9]*-linux-//')"
     echo "Benchmarking Linux $KVERSION..."
     set +e
-    timeout 1800 qemu-system-x86_64 -machine q35 -m 256M -smp 4 -accel kvm -accel tcg \
+    timeout 1800 qemu-system-x86_64 -machine q35 -cpu max -m 256M -smp 4 -accel kvm -accel tcg \
         -kernel "$KERNEL" -initrd "$GUEST/initrd" -append "console=ttyS0 quiet panic=-1" \
         -drive "format=raw,file=$WORK/disk.img,if=none,id=data" -device virtio-blk-pci,drive=data,disable-modern=on \
         -netdev user,id=net0,guestfwd=tcp:10.0.2.100:7-cmd:cat -device virtio-net-pci,netdev=net0,disable-modern=on \

@@ -180,23 +180,32 @@ boot, Bash, `wget` over the network.
 
 ## Measured baseline
 
-`scripts/bench.sh` on commit `841f4cf` against a Linux 6.18 guest in the same QEMU
-configuration (`docs/benchmarks/2026-10-07-841f4cf-baseline.md`,
-`docs/benchmarks/2026-10-07-linux-6.18.54.md`; i5-1240P host, KVM):
+`scripts/bench.sh` on an idle host (i5-1240P, KVM), files `docs/benchmarks/*-quiet.md`: the
+baseline (`841f4cf`), with PCIDs and `-cpu max` (`fae8292`), with restricted mode (R1,
+`241a4d5`) and after R5 (`dbf09c9`). (A first set of numbers, taken while a compiler kept the
+host busy, was wrong and is gone; so are the conclusions drawn from it, such as a 26 % faster
+IPC round trip with PCIDs.)
 
-| benchmark | oxidenix | Linux | |
-|---|---:|---:|---|
-| null system call, p50 | 723 cycles | 1412 cycles | Linux pays for its Spectre/Meltdown mitigations; oxidenix has none |
-| `fstat` of a disk file, p50 (oxidenix: one IPC round trip) | 33071 cycles | 2172 cycles | the IPC round trip costs ~31600 cycles, 45 null system calls |
-| `fstat`, p99 | 165324 cycles | 5251 cycles | |
-| sequential write, 64 KiB + `fsync` | 2.9 MB/s | 162.1 MB/s | 56× slower: a device flush per `write`, and diskfs waits for it by spinning on `sched_yield` (35000 system calls per 64 KiB) |
-| sequential read from the disk (`O_DIRECT`, 64 KiB) | 126.2 MB/s | 211.1 MB/s | |
-| sequential read from the page cache | 3384 MB/s | 3213 MB/s | equal: no IPC on this path |
-| 4 KiB read from the page cache, p50 / p99 | 2366 / 3411 ns | 1954 / 20586 ns | |
-| 4 KiB read from the disk, p50 / p99 | 76 / 394 µs | 117 / 1461 µs | both mostly the device |
-| TCP over loopback | 229 MB/s | 1660 MB/s | 7× slower: 8 IPC round trips, 14 address space switches and 33 kernel allocations per 64 KiB |
-| TCP through the network card (echo) | 20.6 MB/s | 55.1 MB/s | |
+| benchmark | baseline | PCID | R1 | R5 | |
+|---|---:|---:|---:|---:|---|
+| null system call (`getppid`), p50 | 358 | 361 | 1805 | 2238 | cycles; passed through the Linux server since R1 |
+| forwarded system call, p50 | – | – | 1430 | 1461 | cycles; the server answers itself |
+| `fstat` of a disk file (one IPC round trip), p50 | 14429 | 12746 | 14157 | 14355 | cycles |
+| `fstat` in tmpfs, p50 | 652 | 652 | 2133 | 2895 | cycles |
+| sequential write, 64 KiB + `fsync` | 4.3 | 4.3 | 4.4 | 4.3 | MB/s |
+| sequential read from the disk (`O_DIRECT`) | 369 | 417 | 386 | 518 | MB/s |
+| sequential read from the page cache | 8060 | 7789 | 7760 | 7123 | MB/s |
+| 4 KiB read from the page cache, p50 | 968 | 2524 | 2399 | 2505 | ns |
+| 4 KiB read from the disk, p50 | 29.0 | 26.0 | 29.8 | 28.1 | µs |
+| TCP over loopback | 621 | 581 | 576 | 536 | MB/s |
+| TCP through the network card (echo) | 106 | 125 | 120 | 109 | MB/s |
 
-The counters confirm the audit: a disk `read` or `write` of 64 KiB is 2 IPC round trips with
-64 KiB through IPC and twice the data through user copies; a cached read has no IPC and
-copies the data once to the user (plus once more inside the kernel).
+- The IPC round trip costs about 14000 cycles, 40 null system calls; PCIDs save little of it.
+- Sequential writes stay at 4.3 MB/s: a device flush per `write`, waited for by diskfs
+  spinning on `sched_yield`.
+- The 4 KiB cached read became 2.5× slower with the PCID commit, which also switched QEMU to
+  `-cpu max`; this is open (see `docs/benchmarks/README.md`).
+- Restricted mode costs a passed-through call about 1450 cycles (three kernel entries instead
+  of one) and a forwarded call about 1100; calls the server answers itself (memory, time,
+  pipes) pay only the latter, and the pass-through goes away with R9.
+- The comparison with Linux is being measured again with the same CPU model (`-cpu max`).

@@ -52,3 +52,9 @@ them from the code.
 `scripts/bench.sh --linux` runs the same `iobench` (built static with musl) in a Linux guest
 (`scripts/linux-guest.nix`: the nixpkgs kernel, BusyBox, the virtio and ext2 modules) with the
 same QEMU configuration and a data disk made the same way; the counter columns are `-` there.
+
+## Validity
+
+The host must be idle while a benchmark runs. Runs of 2026-10-07 (and the first one of phase
+R1) were taken while a compiler kept every host CPU busy and are deleted; every stage up to
+R5 was measured again on an idle host on 2026-10-08 (the files ending in `-quiet`).
