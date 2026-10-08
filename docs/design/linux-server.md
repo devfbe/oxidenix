@@ -133,11 +133,13 @@ input, PCI and ACPI.
 ### The page cache and the I/O paths
 
 The page cache moves with the VFS into the server. Each cached file is a memory object whose
-pager is the server: a page fault on a mapping of the file comes to the pager thread, which
-reads the page from diskfs into the object (`mo_supply`). `read`/`write` copy between the object and the
-program directly (one copy, as Linux). The server talks to diskfs and netd through
-shared-memory rings with buffers granted from its memory objects (zero copy, IOMMU-confined
-DMA); that design follows the principles of the I/O audit and is its own document.
+pager is the server (a cached object, done in R6c.3): a page fault on a mapping of the file
+comes to the pager thread, which has diskfs read the page by DMA straight into the object's
+granted page (`GRANT_FILL`, `mo_filled`; no `mo_supply` copy). `read`/`write` copy between the
+object and the program directly (one copy, as Linux). The server talks to diskfs and netd
+through shared-memory rings with buffers granted from its memory objects (zero copy,
+IOMMU-confined DMA); that design follows the principles of the I/O audit and is its own
+document (`io-rings.md`).
 
 ## Migration
 
@@ -202,19 +204,27 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
      - **c2b — Path calls in the server** (done): resolution, the working directory and every call
        that takes a path move into the server, over a mount table whose filesystems are, at
        first, the kernel's tree, reached through handles on its inodes (lookup, create,
-       unlink, rename, readlink, stat, open into a descriptor, exec). The same bridge later
-       serves `/data`, `/proc`, `/sys` and `/dev` until c3 and R6d.
+       unlink, rename, readlink, stat, open into a descriptor, exec). The same bridge served
+       `/data` until c3 and still serves `/proc`, `/sys` and `/dev` until I/O rings step 5 and
+       R6d.
      - **c2c — tmpfs in the server** (done): the server's own tmpfs, with files as file objects
        (read, write, `mmap` and exec without the kernel's VFS; ETXTBSY through holds the kernel
        reports when let go; a thread about to answer ETXTBSY first waits for the releases
        reported until then, `SYS_EVENT_RELEASES`). First mounted at `/tmp`, with the kernel's tree at the root;
        then (done) the root became the server's tmpfs, unpacked from the initramfs (an object
        of the boot image, its members file objects over its bytes), and the kernel's tree
-       stays mounted for what it still serves (`/dev`, `/proc`, `/sys`, `/data`). Each
+       stays mounted for what it still serves (`/dev`, `/proc`, `/sys`; `/data` until c3). Each
        instance has its own copy (a process tree is a container); pages of a program two
        trees run are not shared between them.
-     - **c3**: the server as the client of diskfs and procfs, with its page cache and
-       write-back, over shared-memory rings with granted buffers (`io-rings.md`, ADR 0005).
+     - **c3 — `/data` in the server** (done; I/O rings step 4, `io-rings.md`, ADR 0005): the
+       server is diskfs's client over shared-memory rings with granted buffers
+       (`servers/linux/src/datafs.rs`, `fsclient.rs`, `datafile.rs`), with its own page cache:
+       one cached object of the kernel's per file (`SYS_MO_CREATE_CACHED`), filled and written
+       back by DMA into and out of granted pages, write-back instead of write-through. The
+       kernel's `/data` (its remote store, write-through, flusher, `O_DIRECT` path and diskfs's
+       IPC protocol) is gone; the kernel only starts diskfs and, before it powers off, waits
+       until the instances wrote their caches back. procfs over the rings follows (I/O rings
+       step 5).
    - **R6d — The terminal** (ADR 0004): the console as a device of the server, the line
      discipline and job control's terminal side in the server.
    - **R6e — The descriptor table, `poll`, `select` and `epoll`** move with the sockets (R7),

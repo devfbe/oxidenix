@@ -175,7 +175,6 @@ name = "diskfs"
 version = "0.1.0"
 dependencies = [
  "ext2fs",
- "fsproto",
  "fsring",
  "oxrt",
  "ring",

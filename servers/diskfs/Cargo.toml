@@ -13,6 +13,5 @@ bench = false
 oxrt = { path = "../../crates/oxrt" }
 virtio = { path = "../../crates/virtio" }
 ext2fs = { path = "../../crates/ext2fs" }
-fsproto = { path = "../../crates/fsproto" }
 ring = { path = "../../crates/ring" }
 fsring = { path = "../../crates/fsring" }

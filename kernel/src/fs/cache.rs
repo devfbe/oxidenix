@@ -12,35 +12,43 @@
 //! initramfs image (while that part of the file was never cut off) or is
 //! zero; `read` takes those bytes without creating the page.
 //!
-//! The remote store caches the pages of a file served by a filesystem
-//! server. A miss reads up to 64 KiB of missing pages; `write` goes to the
-//! server first (write-through) and then into the cached pages, which it
-//! also creates for whole pages it covers. The size is kept here: every
-//! change goes through the kernel. Its pages are counted as cached memory
-//! (`memory::cache_charge`), which commits and new cache pages reclaim:
-//! clean pages that no mapping uses, a page used since the last look
-//! getting a second chance.
-//!
-//! Shared mappings of a remote file map its pages read-only until the
-//! first store, which marks the page dirty (see `set_dirty`). Write-back
-//! clears the dirty mark, write-protects the page in every mapping, then
-//! writes it: a store in between faults, marks it dirty again and is
-//! written next time, so none is lost. `msync`, `fsync` and `sync` write
-//! back, and so does the flusher every few seconds and a writer that finds
-//! too many dirty pages.
-//!
 //! The paged store belongs to a pager in user space (the Linux server): a
 //! missing page is requested from it and the thread that needs the page
 //! sleeps until the pager supplies it (`supply`), whether the thread runs a
 //! program or the kernel (copying from a mapping). Supplied pages are
 //! committed and stay until the object goes.
 //!
+//! The cached store is a file the Linux server caches (its page cache of
+//! a disk file, `restricted::SYS_MO_CREATE_CACHED`): the file's size, its
+//! pages and which of them are dirty are kept here, the data comes from
+//! and goes to the disk through the server. A missing page is requested
+//! from the pager (or, for the server's own reads and writes, reported
+//! missing: `Fill::No`); the pager makes it *pending* (`pin_fill`: a zeroed
+//! frame, pinned for a grant, which no reader sees), has the disk server
+//! read into it by DMA and then declares it filled or failed (`filled`).
+//! Stores (writes, shared mappings) mark pages dirty, the object's first
+//! one tells the pager (`Pager::dirty`). A shared mapping maps a page
+//! read-only until the first store, which marks it dirty (`set_dirty`).
+//! A store needs the page's disk space secured up to the file's end
+//! (`Page::backed`, delayed allocation): the server's writes check it
+//! (`Backing`), a mapping's store asks the pager (`Pager::mkwrite`) and
+//! waits for its answer (`backed`), and a file that grows write-protects
+//! the page that held its end (`extended`) so its next store asks too.
+//! Write-back takes runs of dirty pages (`pin_dirty`: their marks cleared,
+//! write-protected in every mapping, pinned for a read-only grant): a
+//! store in between faults, marks the page dirty again and is written next
+//! time, so none is lost; `redirty` puts back what a failed write took.
+//! Its pages are counted as cached memory (`memory::cache_charge`), which
+//! commits and new cache pages reclaim: clean pages that nothing pins or
+//! maps, a page used since the last look getting a second chance. Dirty
+//! ones the reclaim cannot drop make it ask the pagers to write back
+//! (`Pager::writeback`), and so do too many dirty pages (`balance_dirty`).
+//!
 //! Lock order: address space (sleeping) → `io` (sleeping) → `state` →
-//! frames. `io` serializes what changes contents or size and talks to the
-//! server (filling pages, `write`, `truncate`); it is never held while an
-//! address space is locked. Cache hits only take `state`.
+//! frames. `io` serializes what changes contents or size (`write`,
+//! `truncate`); it is never held while an address space is locked. Cache
+//! hits only take `state`.
 
-use super::remote::RemoteFs;
 use crate::memory;
 use crate::memory::frame::UserFrames;
 use crate::process::address_space::{Fault, Mm, PAGE};
@@ -54,14 +62,8 @@ use x86_64::structures::paging::{FrameAllocator, FrameDeallocator, PhysFrame};
 
 /// Largest file size (as `off_t` allows).
 pub const MAX_SIZE: u64 = i64::MAX as u64;
-/// Pages a miss reads from a server at once.
-const READAHEAD: u64 = 16;
 /// Pages reclaim looks at per hold of a cache's lock.
 const RECLAIM_BATCH: usize = 256;
-/// Dirty pages written back per round (and at most per message group).
-const WRITEBACK_BATCH: usize = 16;
-/// How often the flusher writes dirty pages back (nanoseconds).
-const FLUSH_INTERVAL: u64 = 5_000_000_000;
 
 /// Dirty pages of all caches.
 static DIRTY: AtomicU64 = AtomicU64::new(0);
@@ -71,13 +73,22 @@ pub fn dirty_pages() -> u64 {
     DIRTY.load(Ordering::Relaxed)
 }
 
+/// Dirty pages written back or dropped so far (a shutdown waits longer
+/// while this moves).
+static CLEANED: AtomicU64 = AtomicU64::new(0);
+
+pub fn cleaned_pages() -> u64 {
+    CLEANED.load(Ordering::Relaxed)
+}
+
 /// Pages of tmpfs file contents, and their limit: half of what may be
 /// committed, as Linux's default tmpfs size.
 static TMPFS_PAGES: AtomicU64 = AtomicU64::new(0);
 static TMPFS_LIMIT: AtomicU64 = AtomicU64::new(0);
 
-/// Caches with a remote store, for reclaim; the next one to look at.
-static REMOTE: IrqSpinLock<Vec<Weak<PageCache>>> = IrqSpinLock::new(Vec::new());
+/// Caches with a cached store (reclaimable pages), for reclaim; the next
+/// one to look at.
+static CACHES: IrqSpinLock<Vec<Weak<PageCache>>> = IrqSpinLock::new(Vec::new());
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
 /// Sets the tmpfs limit from the commit limit (after memory::init) and
@@ -100,6 +111,17 @@ pub trait Pager: Send + Sync {
     /// Where threads waiting for its pages sleep: its answers (pages,
     /// failures) and its end wake them.
     fn wait_chan(&self) -> usize;
+    /// Whether the pager can still answer (its thread lives).
+    fn alive(&self) -> bool;
+    /// The cached object `key` got its first dirty page.
+    fn dirty(&self, key: u64);
+    /// Too many pages are dirty (memory runs short of clean ones): the
+    /// pager should write back about `pages` of them.
+    fn writeback(&self, pages: u64);
+    /// A store wants page `index` of cached object `key`, which is not
+    /// backed (`Page::backed`): the pager should secure the disk space for
+    /// it and answer (`PageCache::backed`). False if the pager is gone.
+    fn mkwrite(&self, key: u64, index: u64) -> bool;
 }
 
 /// Where pages come from.
@@ -108,26 +130,161 @@ enum Store {
     /// pages below `prepaid` were committed when the cache was created
     /// (anonymous shared memory) and are not charged again.
     Memory { image: &'static [u8], prepaid: u64 },
-    /// Inode `ino` of a filesystem server.
-    Remote { fs: Arc<RemoteFs>, ino: u32 },
     /// A pager in user space, which knows the object by `key`.
     Paged { pager: Weak<dyn Pager>, key: u64 },
+    /// A file the pager caches (see the module comment), known to it as
+    /// `key`, which may grow to `limit` bytes.
+    Cached { pager: Weak<dyn Pager>, key: u64, limit: u64 },
 }
 
 struct Page {
     frame: PhysFrame,
     /// Used since reclaim last looked at it.
     referenced: bool,
-    /// Stored to through a shared mapping since it was last written back
-    /// (remote store only).
+    /// Stored to since it was last written back (cached store).
     dirty: bool,
     /// Grants pinning it (`pin`): while any, the page stays this object's.
     pins: u32,
+    /// Being filled (cached store, `pin_fill`): not yet the file's data,
+    /// so nobody reads, maps or writes it until `filled`.
+    pending: bool,
+    /// Cached store: the bytes from the page's start whose disk space is
+    /// secured (the pager promised its blocks, or they exist): the page
+    /// may hold file data there that write-back will surely find room
+    /// for. A store needs it up to the file's end (`Backing`).
+    backed: u16,
+    /// The pager was asked to back it (`Pager::mkwrite`), no answer yet.
+    mkwrite: bool,
 }
 
 impl Page {
     fn new(frame: PhysFrame) -> Page {
-        Page { frame, referenced: true, dirty: false, pins: 0 }
+        Page { frame, referenced: true, dirty: false, pins: 0, pending: false, backed: 0, mkwrite: false }
+    }
+}
+
+/// The bytes of page `index` a store needs backed when the file is `size`
+/// long: those below the end (a store there makes them file data).
+fn backing_need(size: u64, index: u64) -> u64 {
+    size.saturating_sub(index * PAGE).min(PAGE)
+}
+
+/// What a write into a cached object requires of the disk space behind
+/// its pages (`Page::backed`, delayed allocation's reservation).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Backing {
+    /// Nothing (writes the server checks otherwise).
+    Ignore,
+    /// Each page must be backed up to the file's end (as the write leaves
+    /// it): the write stops before a page that is not (ENOSPC if nothing
+    /// was written), and the pager secures the space first.
+    Check,
+    /// As `Check`, after marking the pages it writes backed up to this
+    /// byte (the pager secured the space up to there).
+    Vouched(u64),
+}
+
+/// What `set_dirty` found.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Dirtied {
+    Yes,
+    /// The page is gone (truncated meanwhile), or its pager.
+    Gone,
+    /// It is not backed: the pager was asked (`Pager::mkwrite`); the store
+    /// waits (`wait_page` with `backed`) and tries again.
+    Unbacked,
+}
+
+/// Whether a read or write of a cached object fetches the missing pages it
+/// meets (through the pager) or stops at the first one (the server, which
+/// fills them itself).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Fill {
+    Yes,
+    No,
+}
+
+/// Most pages one `pin_fill` or `pin_dirty` takes (a run of a file's pages
+/// for one read or write of the disk server: `fsring::MAX_TRANSFER`).
+pub const MAX_RUN: u64 = 256;
+
+/// The dirty pages of every cache, in pages of the commit limit: above
+/// `1 / BACKGROUND` the pagers are asked to write back, above `1 / HARD` a
+/// thread that stores waits for them (as Linux's dirty ratios).
+const BACKGROUND: u64 = 10;
+const HARD: u64 = 5;
+/// The longest a storing thread waits for write-back at once.
+const THROTTLE: u64 = 1_000_000_000;
+
+/// Where threads throttled by `balance_dirty` wait.
+fn dirty_chan() -> usize {
+    &DIRTY as *const AtomicU64 as usize
+}
+
+/// `pages` dirty pages were written back or dropped: throttled writers may
+/// go on.
+fn undirty(pages: u64) {
+    if pages == 0 {
+        return;
+    }
+    CLEANED.fetch_add(pages, Ordering::Relaxed);
+    let before = DIRTY.fetch_sub(pages, Ordering::Relaxed);
+    let hard = memory::commit_stats().1 / HARD;
+    if before > hard && before - pages <= hard {
+        crate::process::sched::wakeup(dirty_chan());
+    }
+}
+
+/// Threads waiting at one page of a paged or cached object (`State::waits`).
+struct Waiters {
+    index: u64,
+    count: u32,
+    /// Failed answers for the page (counted while anyone waits).
+    failures: u32,
+}
+
+/// Most present pages one `pin_fill` or `pin_dirty` looks at (with
+/// interrupts off): beyond, it says where to go on (`Scan::Resume`).
+const MAX_SCAN: usize = 1024;
+
+/// Why a run could not be pinned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scan {
+    Errno(i64),
+    /// The scan stopped (`MAX_SCAN`) before a run: ask again from this page.
+    Resume(u64),
+}
+
+impl State {
+    /// Counts a waiter of page `index`; the failures it has seen.
+    fn enter_wait(&mut self, index: u64) -> Result<u32, i64> {
+        if let Some(w) = self.waits.iter_mut().find(|w| w.index == index) {
+            w.count += 1;
+            return Ok(w.failures);
+        }
+        self.waits.try_reserve(1).map_err(|_| ENOMEM)?;
+        self.waits.push(Waiters { index, count: 1, failures: 0 });
+        Ok(0)
+    }
+
+    fn leave_wait(&mut self, index: u64) {
+        if let Some(i) = self.waits.iter().position(|w| w.index == index) {
+            self.waits[i].count -= 1;
+            if self.waits[i].count == 0 {
+                self.waits.swap_remove(i);
+            }
+        }
+    }
+
+    fn failures(&self, index: u64) -> u32 {
+        self.waits.iter().find(|w| w.index == index).map_or(0, |w| w.failures)
+    }
+
+    /// The pager could not supply pages `first..end`: whoever waits fails.
+    fn fail_waiters(&mut self, first: u64, end: u64) {
+        for w in self.waits.iter_mut().filter(|w| (first..end).contains(&w.index)) {
+            w.failures = w.failures.wrapping_add(1);
+        }
     }
 }
 
@@ -137,13 +294,18 @@ struct State {
     /// Bytes of `image` still valid as file contents (truncation cuts it).
     image_len: u64,
     /// Pages charged: to commit and tmpfs (memory store, beyond
-    /// `prepaid`), or as cached memory (remote store).
+    /// `prepaid`), to commit (paged store) or as cached memory (cached
+    /// store).
     charged: u64,
     /// The page index reclaim continues at.
     cursor: u64,
-    /// Pages of a paged object its pager failed to supply: the waiting
-    /// threads get an error once, a later access asks again.
-    failed: alloc::collections::BTreeSet<u64>,
+    /// Pages of a paged or cached object threads wait for, with the
+    /// failed answers since: a waiter fails if one came while it waited (a
+    /// later access asks again). Bounded by the threads waiting: a pager's
+    /// failure is recorded only where someone waits.
+    waits: Vec<Waiters>,
+    /// Dirty pages (cached store).
+    dirty: u64,
 }
 
 pub struct PageCache {
@@ -221,7 +383,8 @@ impl PageCache {
                 image_len,
                 charged: 0,
                 cursor: 0,
-                failed: alloc::collections::BTreeSet::new(),
+                waits: Vec::new(),
+                dirty: 0,
             }),
             io: Mutex::new(()),
             store,
@@ -248,14 +411,46 @@ impl PageCache {
         })
     }
 
-    /// The cache of inode `ino` of a filesystem server, `size` bytes long.
-    pub fn remote(fs: Arc<RemoteFs>, ino: u32, size: u64) -> Result<Arc<PageCache>, i64> {
-        let cache = Self::new(Store::Remote { fs, ino }, size, 0)?;
-        let mut list = REMOTE.lock();
+    /// Enters a cache whose pages reclaim may drop into its list.
+    fn reclaimable(cache: &Arc<PageCache>) -> Result<(), i64> {
+        let mut list = CACHES.lock();
         list.retain(|c| c.strong_count() > 0);
         list.try_reserve(1).map_err(|_| ENOMEM)?;
-        list.push(Arc::downgrade(&cache));
+        list.push(Arc::downgrade(cache));
+        Ok(())
+    }
+
+    /// A file of `size` bytes (at most `limit`) that `pager` caches and
+    /// knows as `key` (see the module comment).
+    pub fn cached(size: u64, limit: u64, pager: Weak<dyn Pager>, key: u64) -> Result<Arc<PageCache>, i64> {
+        let limit = limit.min(MAX_SIZE);
+        if size > limit {
+            return Err(EFBIG);
+        }
+        let cache = Self::new(Store::Cached { pager, key, limit }, size, 0)?;
+        Self::reclaimable(&cache)?;
         Ok(cache)
+    }
+
+    /// A cached object's key.
+    pub fn cached_key(&self) -> Option<u64> {
+        match self.store {
+            Store::Cached { key, .. } => Some(key),
+            _ => None,
+        }
+    }
+
+    /// Whether this is a cached store's object.
+    pub fn is_cached(&self) -> bool {
+        matches!(self.store, Store::Cached { .. })
+    }
+
+    /// The pager of a paged or cached object, and its key.
+    fn pager(&self) -> Option<(&Weak<dyn Pager>, u64)> {
+        match &self.store {
+            Store::Paged { pager, key } | Store::Cached { pager, key, .. } => Some((pager, *key)),
+            Store::Memory { .. } => None,
+        }
     }
 
     /// A memory object of `pages` pages whose contents `pager` supplies
@@ -273,39 +468,74 @@ impl PageCache {
         }
     }
 
-    /// Waits until the pager supplied page `index` (EIO if the pager is
-    /// gone, EINTR if the thread is dying: a pager that never answers must
-    /// not leave it unkillable).
-    fn wait_paged(&self, index: u64) -> Result<(), i64> {
-        let Store::Paged { pager, key } = &self.store else { return Ok(()) };
-        loop {
+    /// Waits until the pager supplied page `index` and, with `backed`, also
+    /// backed it up to the file's end (`Pager::mkwrite`): EIO if it cannot
+    /// (it failed, or is gone), EINTR if the thread is dying (a pager that
+    /// never answers must not leave it unkillable).
+    fn wait_paged(&self, index: u64, backed: bool) -> Result<(), i64> {
+        let Some((pager, key)) = self.pager() else { return Ok(()) };
+        let seen = self.state.lock().enter_wait(index)?;
+        // What the pager is to be asked for.
+        enum Ask {
+            Nothing,
+            Page,
+            Backing,
+        }
+        let result = loop {
             let done = x86_64::instructions::interrupts::without_interrupts(|| {
                 let Some(pager) = pager.upgrade() else { return Err(EIO) };
                 // Registered before looking, so an answer cannot slip by.
                 let wait = crate::process::sched::prepare_to_wait(pager.wait_chan());
-                {
+                let ask = {
                     let mut st = self.state.lock();
-                    if st.pages.contains_key(&index) {
-                        return Ok(true);
-                    }
-                    if st.failed.remove(&index) {
+                    if st.failures(index) != seen {
                         return Err(EIO);
                     }
-                }
+                    let need = backing_need(st.size, index);
+                    let beyond = index >= page_of(st.size.saturating_add(PAGE - 1));
+                    match st.pages.get_mut(&index) {
+                        Some(p) if !p.pending && (!backed || p.backed as u64 >= need) => return Ok(true),
+                        // Being filled or backed: its answer comes without
+                        // asking, unless the pager is gone meanwhile.
+                        Some(p) if (p.pending || p.mkwrite) && !pager.alive() => return Err(EIO),
+                        Some(p) if p.pending || p.mkwrite => Ask::Nothing,
+                        Some(p) => {
+                            p.mkwrite = true;
+                            Ask::Backing
+                        }
+                        // Cut off meanwhile: the caller looks again.
+                        None if beyond => return Ok(true),
+                        None => Ask::Page,
+                    }
+                };
                 if crate::process::signal::dying() {
+                    if let Ask::Backing = ask {
+                        if let Some(p) = self.state.lock().pages.get_mut(&index) {
+                            p.mkwrite = false;
+                        }
+                    }
                     return Err(EINTR);
                 }
-                if !pager.request(*key, index) {
+                let asked = match ask {
+                    Ask::Nothing => true,
+                    Ask::Page => pager.request(key, index),
+                    Ask::Backing => pager.mkwrite(key, index),
+                };
+                if !asked {
                     return Err(EIO);
                 }
                 drop(pager);
                 wait.sleep();
                 Ok(false)
-            })?;
-            if done {
-                return Ok(());
+            });
+            match done {
+                Ok(false) => {}
+                Ok(true) => break Ok(()),
+                Err(e) => break Err(e),
             }
-        }
+        };
+        self.state.lock().leave_wait(index);
+        result
     }
 
     /// The pager's answer: page `index` with `data` (the rest zero), if it
@@ -361,7 +591,7 @@ impl PageCache {
         {
             let mut st = self.state.lock();
             if !st.pages.contains_key(&index) {
-                st.failed.insert(index);
+                st.fail_waiters(index, index + 1);
             }
         }
         if let Some(pager) = pager.upgrade() {
@@ -391,26 +621,14 @@ impl PageCache {
         Ok(copy)
     }
 
-    /// Whether no page is cached.
-    pub fn is_empty(&self) -> bool {
-        self.state.lock().pages.is_empty()
-    }
-
     pub fn size(&self) -> u64 {
         self.state.lock().size
-    }
-
-    fn remote_store(&self) -> Option<(&Arc<RemoteFs>, u32)> {
-        match &self.store {
-            Store::Remote { fs, ino } => Some((fs, *ino)),
-            Store::Memory { .. } | Store::Paged { .. } => None,
-        }
     }
 
     fn prepaid(&self) -> u64 {
         match self.store {
             Store::Memory { prepaid, .. } => prepaid,
-            Store::Remote { .. } | Store::Paged { .. } => 0,
+            Store::Paged { .. } | Store::Cached { .. } => 0,
         }
     }
 
@@ -418,7 +636,7 @@ impl PageCache {
     fn fill_memory(&self, st: &State, index: u64, out: &mut [u8]) {
         let image = match self.store {
             Store::Memory { image, .. } => image,
-            Store::Remote { .. } | Store::Paged { .. } => &[],
+            Store::Paged { .. } | Store::Cached { .. } => &[],
         };
         let start = index * PAGE;
         let valid = (st.image_len.min(st.size) as usize).min(image.len());
@@ -449,69 +667,17 @@ impl PageCache {
         Ok(())
     }
 
-    /// Reads page `index` of a remote store (and missing pages after it)
-    /// from the server, unless it is there by now. ENOMEM if no page could
-    /// be cached.
-    fn fetch(&self, index: u64) -> Result<(), i64> {
-        let (fs, ino) = self.remote_store().expect("remote store");
-        let _io = self.io.lock();
-        let (count, size) = {
-            let st = self.state.lock();
-            let last = page_of(st.size.saturating_add(PAGE - 1));
-            let count = (index..last.min(index + READAHEAD)).take_while(|i| !st.pages.contains_key(i)).count() as u64;
-            (count, st.size)
-        };
-        if count == 0 {
-            return Ok(());
-        }
-        // One page will do if more do not fit.
-        let count = if memory::cache_charge(count) {
-            count
-        } else if count > 1 && memory::cache_charge(1) {
-            1
-        } else {
-            return Err(ENOMEM);
-        };
-        let start = index * PAGE;
-        let bytes = (count * PAGE).min(size - start) as usize;
-        let mut buf = Vec::new();
-        if buf.try_reserve_exact(bytes).is_err() {
-            memory::cache_uncharge(count);
-            return Err(ENOMEM);
-        }
-        buf.resize(bytes, 0);
-        let n = match fs.read(ino, start, &mut buf) {
-            Ok(n) => n,
-            Err(e) => {
-                memory::cache_uncharge(count);
-                return Err(e);
-            }
-        };
-        let mut st = self.state.lock();
-        let mut got = 0;
-        for i in 0..count {
-            let Some(frame) = new_frame() else { break };
-            let page = frame_bytes(frame);
-            let from = ((i * PAGE) as usize).min(n);
-            let to = (((i + 1) * PAGE) as usize).min(n);
-            page[..to - from].copy_from_slice(&buf[from..to]);
-            page[to - from..].fill(0);
-            // Nothing else inserts remote pages without `io`.
-            st.pages.insert(index + i, Page::new(frame));
-            got += 1;
-        }
-        st.charged += got;
-        drop(st);
-        memory::cache_uncharge(count - got);
-        if got == 0 {
-            return Err(ENOMEM);
-        }
-        Ok(())
+    /// Reads up to `buf.len()` bytes at `off` (fewer at the end of the
+    /// file). Sleeps only to wait for the pages of a paged or cached
+    /// object.
+    pub fn read(&self, off: u64, buf: &mut [u8]) -> Result<usize, i64> {
+        self.read_with(off, buf, Fill::Yes)
     }
 
-    /// Reads up to `buf.len()` bytes at `off` (fewer at the end of the
-    /// file). Sleeps only to read missing pages of a remote store.
-    pub fn read(&self, off: u64, buf: &mut [u8]) -> Result<usize, i64> {
+    /// `read`, which with `Fill::No` stops at the first missing page of a
+    /// cached object (EAGAIN if that is the first one) instead of asking
+    /// its pager; it still waits for a page being filled.
+    pub fn read_with(&self, off: u64, buf: &mut [u8], fill: Fill) -> Result<usize, i64> {
         let mut pos = off;
         loop {
             let missing = {
@@ -523,7 +689,7 @@ impl PageCache {
                     let n = ((PAGE as usize) - in_page).min((end - pos) as usize);
                     let out = &mut buf[(pos - off) as usize..][..n];
                     match st.pages.get_mut(&index) {
-                        Some(page) => {
+                        Some(page) if !page.pending => {
                             page.referenced = true;
                             out.copy_from_slice(&frame_bytes(page.frame)[in_page..in_page + n]);
                         }
@@ -532,8 +698,8 @@ impl PageCache {
                             self.fill_memory(&st, index, &mut page);
                             out.copy_from_slice(&page[in_page..in_page + n]);
                         }
-                        None => {
-                            missing = Some((index, end));
+                        page => {
+                            missing = Some((index, page.is_some()));
                             break;
                         }
                     }
@@ -541,28 +707,15 @@ impl PageCache {
                 }
                 missing
             };
-            let Some((index, end)) = missing else {
+            let Some((index, pending)) = missing else {
                 return Ok(pos.saturating_sub(off) as usize);
             };
-            if let Store::Paged { .. } = self.store {
-                match self.wait_paged(index) {
-                    Ok(()) => continue,
-                    Err(e) if pos == off => return Err(e),
-                    Err(_) => return Ok((pos - off) as usize),
-                }
+            if fill == Fill::No && !pending && self.is_cached() {
+                return if pos == off { Err(EAGAIN) } else { Ok((pos - off) as usize) };
             }
-            match self.fetch(index) {
-                Ok(()) => {}
-                // No room to cache it: read this page past the cache.
-                Err(ENOMEM) => {
-                    let (fs, ino) = self.remote_store().expect("remote store");
-                    let stop = ((index + 1) * PAGE).min(end);
-                    let n = fs.read(ino, pos, &mut buf[(pos - off) as usize..(stop - off) as usize])?;
-                    pos += n as u64;
-                    if pos < stop {
-                        return Ok((pos - off) as usize);
-                    }
-                }
+            // (Only a paged or cached object misses pages.)
+            match self.wait_paged(index, false) {
+                Ok(()) => continue,
                 Err(e) if pos == off => return Err(e),
                 Err(_) => return Ok((pos - off) as usize),
             }
@@ -571,28 +724,31 @@ impl PageCache {
 
     /// Writes `data` at `off`, growing the file.
     pub fn write(&self, off: u64, data: &[u8]) -> Result<usize, i64> {
+        self.write_with(off, data, Fill::Yes, Backing::Ignore)
+    }
+
+    /// `write`; with `Fill::No` a write into a missing page of a cached
+    /// object that needs the page's data first stops there (EAGAIN if
+    /// nothing was written), as `read_with`; `backing` as `Backing` says
+    /// (cached objects only).
+    pub fn write_with(&self, off: u64, data: &[u8], fill: Fill, backing: Backing) -> Result<usize, i64> {
         off.checked_add(data.len() as u64).filter(|&e| e <= MAX_SIZE).ok_or(EFBIG)?;
         // A paged object's pages come from its pager alone (`supply`).
         if let Store::Paged { .. } = self.store {
             return Err(EINVAL);
         }
+        if let Store::Cached { limit, .. } = self.store {
+            off.checked_add(data.len() as u64).filter(|&e| e <= limit).ok_or(EFBIG)?;
+            return self.write_cached(off, data, fill, backing);
+        }
         let _io = self.io.lock();
-        let written = match self.remote_store() {
-            // Write-through: the server has the data before the cache.
-            Some((fs, ino)) => fs.write(ino, off, data)?,
-            None => data.len(),
-        };
-        let end = off + written as u64;
+        let end = off + data.len() as u64;
         let mut pos = off;
         while pos < end {
             let (index, in_page) = (page_of(pos), (pos % PAGE) as usize);
             let n = ((PAGE as usize) - in_page).min((end - pos) as usize);
             let chunk = &data[(pos - off) as usize..][..n];
-            let stored = match self.remote_store() {
-                None => self.create(index).map(|_| true),
-                Some(_) => Ok(self.cache_written(index, in_page, n)),
-            };
-            if let Err(e) = stored {
+            if let Err(e) = self.create(index) {
                 // A short write if some data went in.
                 return if pos == off { Err(e) } else { Ok((pos - off) as usize) };
             }
@@ -606,38 +762,215 @@ impl PageCache {
             st.size = st.size.max(pos + n as u64);
             pos += n as u64;
         }
-        Ok(written)
+        Ok(data.len())
     }
 
-    /// For a write of `n` bytes at `in_page` into page `index` of a remote
-    /// store: creates the page (zeroed) if the write covers all of it that
-    /// has data (or it lies past the end), so written data is cached; a
-    /// page that would need reading first is not created. Whether the page
-    /// is cached now.
-    fn cache_written(&self, index: u64, in_page: usize, n: usize) -> bool {
-        let size = {
-            let st = self.state.lock();
-            if st.pages.contains_key(&index) {
-                return true;
+    /// A write into a cached object: each page is made present (created
+    /// zeroed where the write covers all of its data, or filled by the
+    /// pager), checked for its backing, written and marked dirty.
+    fn write_cached(&self, off: u64, data: &[u8], fill: Fill, backing: Backing) -> Result<usize, i64> {
+        let io = self.io.lock();
+        let end = off + data.len() as u64;
+        let mut pos = off;
+        let mut first_dirty = false;
+        let old_size = self.state.lock().size;
+        let result = loop {
+            if pos >= end {
+                break Ok(());
             }
-            st.size
+            let (index, in_page) = (page_of(pos), (pos % PAGE) as usize);
+            let n = ((PAGE as usize) - in_page).min((end - pos) as usize);
+            let chunk = &data[(pos - off) as usize..][..n];
+            // What the page needs before it can be written.
+            enum Need {
+                Nothing,
+                Wait,
+                Fill,
+                Create,
+                Backing,
+            }
+            let need = {
+                let mut st = self.state.lock();
+                let size = st.size;
+                // The page's bytes that are file data once written.
+                let wanted = backing_need(size.max(pos + n as u64), index);
+                if let (Backing::Vouched(upto), Some(page)) = (backing, st.pages.get_mut(&index)) {
+                    if !page.pending {
+                        page.backed = page.backed.max(upto.saturating_sub(index * PAGE).min(PAGE) as u16);
+                    }
+                }
+                match st.pages.get_mut(&index) {
+                    Some(page) if !page.pending && backing != Backing::Ignore && (page.backed as u64) < wanted => Need::Backing,
+                    Some(page) if !page.pending => {
+                        frame_bytes(page.frame)[in_page..in_page + n].copy_from_slice(chunk);
+                        page.referenced = true;
+                        if !page.dirty {
+                            page.dirty = true;
+                            st.dirty += 1;
+                            first_dirty |= st.dirty == 1;
+                            DIRTY.fetch_add(1, Ordering::Relaxed);
+                        }
+                        if pos > size {
+                            Self::grow(&mut st, pos);
+                        }
+                        st.size = st.size.max(pos + n as u64);
+                        Need::Nothing
+                    }
+                    Some(_) => Need::Wait,
+                    None => {
+                        // The page's bytes that are file data: kept unless the
+                        // write starts at the page and covers them all.
+                        let data_len = size.saturating_sub(index * PAGE).min(PAGE);
+                        let whole = data_len == 0 || (in_page == 0 && n as u64 >= data_len);
+                        let vouched = match backing {
+                            Backing::Ignore => true,
+                            Backing::Check => false,
+                            Backing::Vouched(upto) => upto.saturating_sub(index * PAGE).min(PAGE) >= wanted,
+                        };
+                        // (Not made for nothing when it could not be written.)
+                        if whole && !vouched {
+                            Need::Backing
+                        } else if whole {
+                            Need::Create
+                        } else {
+                            Need::Fill
+                        }
+                    }
+                }
+            };
+            let made = match need {
+                Need::Nothing => {
+                    pos += n as u64;
+                    continue;
+                }
+                Need::Wait => self.wait_paged(index, false),
+                Need::Fill if fill == Fill::No => Err(EAGAIN),
+                Need::Fill => self.wait_paged(index, false),
+                Need::Create => self.create_cached(index),
+                Need::Backing => Err(ENOSPC),
+            };
+            if let Err(e) = made {
+                break Err(e);
+            }
         };
-        let start = index * PAGE;
-        let old_data_end = size.saturating_sub(start).min(PAGE) as usize;
-        // A page wholly past the old end held only zeros.
-        let covers = start >= size || (in_page == 0 && n >= old_data_end);
-        if !covers || !memory::cache_charge(1) {
-            return false;
+        drop(io);
+        if first_dirty {
+            self.notify_dirty();
+        }
+        self.extended(old_size);
+        let done = (pos - off) as usize;
+        match result {
+            Ok(()) => Ok(done),
+            Err(e) if done == 0 => Err(e),
+            Err(_) => Ok(done),
+        }
+    }
+
+    /// The file grew from `old_size`: the page that held its end may now
+    /// hold file data beyond its backing, which a writable mapping could
+    /// store to unnoticed. It is write-protected, so the next store asks
+    /// for its backing (as Linux's `pagecache_isize_extended`).
+    fn extended(&self, old_size: u64) {
+        if old_size % PAGE == 0 || !self.is_cached() {
+            return;
+        }
+        let index = page_of(old_size);
+        let short = {
+            let st = self.state.lock();
+            st.size > old_size && st.pages.get(&index).is_some_and(|p| (p.backed as u64) < backing_need(st.size, index))
+        };
+        if short {
+            self.write_protect(&[index]);
+        }
+    }
+
+    /// The pager's answer to `Pager::mkwrite` for the pages from byte
+    /// `first` (page-aligned) to `end` (at most `MAX_RUN` pages): backed up
+    /// to `end` (`ok`), or the space could not be had (whoever waits for
+    /// their backing fails: SIGBUS for a store through a mapping, as
+    /// Linux's ENOSPC in `page_mkwrite`). Wakes the waiters.
+    pub fn backed(&self, first: u64, end: u64, ok: bool) -> Result<(), i64> {
+        let Store::Cached { pager, .. } = &self.store else { return Err(EINVAL) };
+        if first % PAGE != 0 || end < first || end - first > MAX_RUN * PAGE {
+            return Err(EINVAL);
+        }
+        // (A failure names at least the page at `first`.)
+        let from = page_of(first);
+        let to = page_of(end.saturating_add(PAGE - 1)).max(from + 1);
+        {
+            let mut st = self.state.lock();
+            for (&index, page) in st.pages.range_mut(from..to) {
+                page.mkwrite = false;
+                if ok {
+                    page.backed = page.backed.max((end - index * PAGE).min(PAGE) as u16);
+                }
+            }
+            if !ok {
+                st.fail_waiters(from, to);
+            }
+        }
+        if let Some(pager) = pager.upgrade() {
+            crate::process::sched::wakeup(pager.wait_chan());
+        }
+        Ok(())
+    }
+
+    /// After the disk server lost the pager's promises (it restarted):
+    /// clears the backing of the pages from `from` on and returns the
+    /// first run of dirty pages among them (at most `MAX_RUN`), whose space
+    /// the pager secures again; None when no page is left. Looks at
+    /// `MAX_SCAN` pages at most (`Scan::Resume`).
+    pub fn unback(&self, from: u64) -> Result<Option<(u64, u64)>, Scan> {
+        if !self.is_cached() {
+            return Err(Scan::Errno(EINVAL));
+        }
+        let mut st = self.state.lock();
+        let mut run: Option<(u64, u64)> = None;
+        for (scanned, (&index, page)) in st.pages.range_mut(from..).enumerate() {
+            match run {
+                None if scanned >= MAX_SCAN => return Err(Scan::Resume(index)),
+                // The next call starts here.
+                Some((s, e)) if !page.dirty || index != e || e - s == MAX_RUN => break,
+                _ => {}
+            }
+            page.backed = 0;
+            if page.dirty {
+                run = Some(run.map_or((index, index + 1), |(s, _)| (s, index + 1)));
+            }
+        }
+        Ok(run)
+    }
+
+    /// Creates page `index` of a cached object, zeroed, unless it exists by
+    /// now (the caller writes it next).
+    fn create_cached(&self, index: u64) -> Result<(), i64> {
+        if !memory::cache_charge(1) {
+            return Err(ENOMEM);
         }
         let Some(frame) = new_frame() else {
             memory::cache_uncharge(1);
-            return false;
+            return Err(ENOMEM);
         };
         frame_bytes(frame).fill(0);
         let mut st = self.state.lock();
+        if st.pages.contains_key(&index) {
+            drop(st);
+            free_frames([frame]);
+            memory::cache_uncharge(1);
+            return Ok(());
+        }
         st.pages.insert(index, Page::new(frame));
         st.charged += 1;
-        true
+        Ok(())
+    }
+
+    /// Tells the pager that this object has a dirty page now (its first).
+    fn notify_dirty(&self) {
+        if let Store::Cached { pager, key, .. } = &self.store {
+            if let Some(pager) = pager.upgrade() {
+                pager.dirty(*key);
+            }
+        }
     }
 
     /// Extends the file to `len` (> size): bytes past the old end in its
@@ -662,37 +995,56 @@ impl PageCache {
         }
         let first_gone = {
             let _io = self.io.lock();
-            if let Some((fs, ino)) = self.remote_store() {
-                fs.truncate(ino, len)?;
+            if let Store::Cached { limit, .. } = self.store {
+                if len > limit {
+                    return Err(EFBIG);
+                }
             }
             let mut st = self.state.lock();
             if len >= st.size {
+                let old_size = st.size;
                 Self::grow(&mut st, len);
+                drop(st);
+                drop(_io);
+                self.extended(old_size);
                 return Ok(());
             }
             let first_gone = page_of(len + PAGE - 1);
-            // A granted page stays the object's until it is revoked.
-            if st.pages.range(first_gone..).any(|(_, p)| p.pins > 0) {
+            // A granted page stays the object's until it is revoked, and a
+            // page being filled gets its data only then (its cut-off tail
+            // could not stay zero).
+            let partial_pending = len % PAGE != 0 && st.pages.get(&page_of(len)).is_some_and(|p| p.pending);
+            if partial_pending || st.pages.range(first_gone..).any(|(_, p)| p.pins > 0) {
                 return Err(EBUSY);
             }
             if len % PAGE != 0 {
-                if let Some(page) = st.pages.get(&page_of(len)) {
+                if let Some(page) = st.pages.get_mut(&page_of(len)) {
                     frame_bytes(page.frame)[(len % PAGE) as usize..].fill(0);
+                    // The blocks beyond the end go with the cut.
+                    page.backed = page.backed.min((len % PAGE) as u16);
                 }
             }
             let gone = st.pages.split_off(&first_gone);
-            DIRTY.fetch_sub(gone.values().filter(|p| p.dirty).count() as u64, Ordering::Relaxed);
+            let dirty = gone.values().filter(|p| p.dirty).count() as u64;
+            st.dirty -= dirty.min(st.dirty);
             let prepaid = self.prepaid();
             let charged = gone.keys().filter(|&&i| i >= prepaid).count() as u64;
             st.charged -= charged;
             st.size = len;
             st.image_len = st.image_len.min(len);
             drop(st);
+            undirty(dirty);
             free_frames(gone.into_values().map(|p| p.frame));
             self.uncharge(charged);
             first_gone
         };
         self.unmap_from(first_gone);
+        // Waiters for pages beyond the end look again (and fail there).
+        if let Some((pager, _)) = self.pager() {
+            if let Some(pager) = pager.upgrade() {
+                crate::process::sched::wakeup(pager.wait_chan());
+            }
+        }
         Ok(())
     }
 
@@ -700,8 +1052,8 @@ impl PageCache {
     fn uncharge(&self, pages: u64) {
         match self.store {
             Store::Memory { .. } => uncharge_tmpfs(pages),
-            Store::Remote { .. } if pages > 0 => memory::cache_uncharge(pages),
-            Store::Remote { .. } => {}
+            Store::Cached { .. } if pages > 0 => memory::cache_uncharge(pages),
+            Store::Cached { .. } => {}
             Store::Paged { .. } => memory::uncommit(pages),
         }
     }
@@ -711,29 +1063,80 @@ impl PageCache {
     /// the page cannot be read).
     pub fn map_page(&self, index: u64) -> Result<PhysFrame, Fault> {
         loop {
-            if index >= page_of(self.size().saturating_add(PAGE - 1)) {
-                return Err(Fault::Bus);
-            }
-            let made = match self.store {
-                Store::Memory { .. } => self.create(index),
-                Store::Remote { .. } => self.fetch(index),
-                Store::Paged { .. } => self.wait_paged(index),
-            };
-            match made {
-                Ok(()) => {}
-                Err(ENOMEM) => return Err(Fault::Oom),
-                // tmpfs is full or the server failed: no page to map, as
-                // on Linux.
-                Err(_) => return Err(Fault::Bus),
-            }
-            let mut st = self.state.lock();
-            // Gone again if a truncation or reclaim came in between.
-            if let Some(page) = st.pages.get_mut(&index) {
-                page.referenced = true;
-                memory::with_frames(|f| f.share(page.frame));
-                return Ok(page.frame);
+            if let Some(frame) = self.try_map_page(index, true)? {
+                return Ok(frame);
             }
         }
+    }
+
+    /// `map_page`, which without `wait` does not wait for the page of a
+    /// paged or cached object that is missing (it asks the pager for it)
+    /// or being filled: None, and the caller waits with `wait_page` once
+    /// it holds no lock the pager may need (the address space's), then
+    /// tries again.
+    pub fn try_map_page(&self, index: u64, wait: bool) -> Result<Option<PhysFrame>, Fault> {
+        if index >= page_of(self.size().saturating_add(PAGE - 1)) {
+            return Err(Fault::Bus);
+        }
+        let made = match self.store {
+            Store::Memory { .. } => self.create(index),
+            Store::Paged { .. } | Store::Cached { .. } if wait => self.wait_paged(index, false),
+            Store::Paged { .. } | Store::Cached { .. } => self.request_page(index),
+        };
+        match made {
+            Ok(()) => {}
+            Err(ENOMEM) => return Err(Fault::Oom),
+            // tmpfs is full or the server failed: no page to map, as on
+            // Linux.
+            Err(_) => return Err(Fault::Bus),
+        }
+        let mut st = self.state.lock();
+        // Missing again if a truncation or reclaim came in between (or not
+        // there yet: the caller waits).
+        match st.pages.get_mut(&index) {
+            Some(page) if !page.pending => {
+                page.referenced = true;
+                memory::with_frames(|f| f.share(page.frame));
+                Ok(Some(page.frame))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Asks the pager for page `index` unless it is there or being filled
+    /// (EIO if the pager is gone). A failure of the fill is seen by the
+    /// wait that follows (`wait_page`), which asks again if it came before
+    /// the wait began.
+    fn request_page(&self, index: u64) -> Result<(), i64> {
+        let Some((pager, key)) = self.pager() else { return Ok(()) };
+        {
+            if self.state.lock().pages.contains_key(&index) {
+                return Ok(());
+            }
+        }
+        match pager.upgrade() {
+            Some(pager) if pager.request(key, index) => Ok(()),
+            _ => Err(EIO),
+        }
+    }
+
+    /// Waits until page `index` of a paged or cached object is there (see
+    /// `try_map_page`) and returns its frame with a reference (so reclaim
+    /// cannot take it before the fault is tried again; None if it is gone
+    /// already, truncated): EIO if it cannot be had, EINTR if the thread
+    /// dies.
+    pub fn wait_page(&self, index: u64, backed: bool) -> Result<Option<PhysFrame>, i64> {
+        self.wait_paged(index, backed)?;
+        let st = self.state.lock();
+        Ok(st.pages.get(&index).filter(|p| !p.pending).map(|p| {
+            memory::with_frames(|f| f.share(p.frame));
+            p.frame
+        }))
+    }
+
+    /// Lets go of the reference `wait_page` gave.
+    pub fn put_frame(frame: PhysFrame) {
+        free_frames([frame]);
     }
 
     /// Pins page `index` for a grant (`process::channel`): makes it present
@@ -742,8 +1145,9 @@ impl PageCache {
     /// returns its frame with a reference for the grant. While pinned, the
     /// page stays this object's: truncation fails with EBUSY, reclaim
     /// skips it (its frame is shared), so the frame a service or device
-    /// reaches is always the object's page. A remote store's pages are not
-    /// grantable (EINVAL): their stores must go through dirty tracking.
+    /// reaches is always the object's page. A cached object's pages are
+    /// granted only to be filled or written back (`pin_fill`, `pin_dirty`:
+    /// EINVAL here).
     pub fn pin(&self, index: u64) -> Result<PhysFrame, i64> {
         loop {
             if index >= page_of(self.size().saturating_add(PAGE - 1)) {
@@ -752,7 +1156,7 @@ impl PageCache {
             match self.store {
                 Store::Memory { .. } => self.create(index)?,
                 Store::Paged { .. } => {}
-                Store::Remote { .. } => return Err(EINVAL),
+                Store::Cached { .. } => return Err(EINVAL),
             }
             let mut st = self.state.lock();
             // Truncated between the check above and the creation: the
@@ -782,16 +1186,239 @@ impl PageCache {
         }
     }
 
-    /// Ends a pin of `pin` (with the frame it returned).
+    /// Ends a pin of `pin`, `pin_fill` or `pin_dirty` (with the frame it
+    /// returned). A failed fill's page may be gone already (`filled`): then
+    /// only the pin's reference goes.
     pub fn unpin(&self, index: u64, frame: PhysFrame) {
         {
             let mut st = self.state.lock();
             match st.pages.get_mut(&index) {
                 Some(page) if page.frame == frame && page.pins > 0 => page.pins -= 1,
-                _ => debug_assert!(false, "unpinning a page that is not pinned"),
+                _ => debug_assert!(self.is_cached(), "unpinning a page that is not pinned"),
             }
         }
         free_frames([frame]);
+    }
+
+    /// For a grant to fill a cached object: the first run of missing pages
+    /// in the `window` pages from `first` (within the file; the run at most
+    /// `MAX_RUN` long), made pending (zeroed frames nobody reads until `filled`)
+    /// and pinned. Returns the run's first page, its frames (each with a
+    /// reference for the grant) and the file's size; ENOENT if no page of
+    /// the window is missing, ENOMEM if not even one page can be cached.
+    pub fn pin_fill(&self, first: u64, window: u64) -> Result<(u64, Vec<PhysFrame>, u64), Scan> {
+        if !self.is_cached() {
+            return Err(Scan::Errno(EINVAL));
+        }
+        // The first gap among the present pages of the window (walking
+        // them, at most `MAX_SCAN`), and the run of missing pages there.
+        let find = |st: &State| {
+            let end = first.saturating_add(window).min(page_of(st.size.saturating_add(PAGE - 1)));
+            let mut start = first;
+            for (scanned, (&index, _)) in st.pages.range(first..end).enumerate() {
+                if index != start {
+                    break;
+                }
+                if scanned >= MAX_SCAN {
+                    return Err(Scan::Resume(start));
+                }
+                start += 1;
+            }
+            if start >= end {
+                return Err(Scan::Errno(ENOENT));
+            }
+            let stop = end.min(start + MAX_RUN);
+            let stop = st.pages.range(start..stop).next().map_or(stop, |(&i, _)| i);
+            Ok((start, stop - start))
+        };
+        let (start, count) = find(&self.state.lock())?;
+        // Charged first (reclaiming may take cache locks); one page will do
+        // if more do not fit.
+        let count = if memory::cache_charge(count) {
+            count
+        } else if count > 1 && memory::cache_charge(1) {
+            1
+        } else {
+            return Err(Scan::Errno(ENOMEM));
+        };
+        let mut frames = Vec::new();
+        if frames.try_reserve_exact(count as usize).is_err() {
+            memory::cache_uncharge(count);
+            return Err(Scan::Errno(ENOMEM));
+        }
+        for _ in 0..count {
+            let Some(frame) = new_frame() else { break };
+            frame_bytes(frame).fill(0);
+            frames.push(frame);
+        }
+        // The run as it is now: a page may have come or the file shrunk.
+        let mut st = self.state.lock();
+        let size = st.size;
+        let last = page_of(st.size.saturating_add(PAGE - 1));
+        let mut taken = 0;
+        for (i, &frame) in frames.iter().enumerate() {
+            let index = start + i as u64;
+            if index >= last || st.pages.contains_key(&index) {
+                break;
+            }
+            st.pages.insert(index, Page { pins: 1, pending: true, ..Page::new(frame) });
+            taken += 1;
+        }
+        st.charged += taken as u64;
+        drop(st);
+        let no_frame = frames.is_empty();
+        let spare = frames.split_off(taken);
+        let unused = count - taken as u64;
+        free_frames(spare);
+        if unused > 0 {
+            memory::cache_uncharge(unused);
+        }
+        if taken == 0 {
+            // No frame to be had, or the pages came meanwhile.
+            return Err(Scan::Errno(if no_frame { ENOMEM } else { ENOENT }));
+        }
+        // The grant's references.
+        memory::with_frames(|f| frames.iter().for_each(|&frame| f.share(frame)));
+        Ok((start, frames, size))
+    }
+
+    /// The pager's answer for `count` pages from `first` (at most
+    /// `MAX_RUN`) it filled (`pin_fill`): with `ok` they hold the file's
+    /// data now, else the pending ones go and the missing ones fail too
+    /// (whoever waits for them gets EIO, a later access asks again; so a
+    /// pager that cannot even start a fill answers). Present pages are
+    /// left alone. Wakes the waiters.
+    pub fn filled(&self, first: u64, count: u64, ok: bool) -> Result<(), i64> {
+        let Store::Cached { pager, .. } = &self.store else { return Err(EINVAL) };
+        if count > MAX_RUN {
+            return Err(EINVAL);
+        }
+        let end = first.checked_add(count).ok_or(EINVAL)?;
+        let mut gone = Vec::new();
+        {
+            let mut st = self.state.lock();
+            let st = &mut *st;
+            // Only pages of the file: none lives beyond, nobody waits there.
+            let end = end.min(page_of(st.size.saturating_add(PAGE - 1)));
+            let pending: Vec<u64> = st.pages.range(first..end.max(first)).filter(|(_, p)| p.pending).map(|(&i, _)| i).collect();
+            for index in pending {
+                if ok {
+                    if let Some(page) = st.pages.get_mut(&index) {
+                        page.pending = false;
+                    }
+                } else if let Some(page) = st.pages.remove(&index) {
+                    // A pin keeps its own reference (`unpin`).
+                    gone.push(page.frame);
+                }
+            }
+            if !ok {
+                // Missing pages fail only for whoever waits for them now.
+                st.fail_waiters(first, end);
+            }
+            st.charged -= gone.len() as u64;
+        }
+        self.uncharge(gone.len() as u64);
+        free_frames(gone);
+        if let Some(pager) = pager.upgrade() {
+            crate::process::sched::wakeup(pager.wait_chan());
+        }
+        Ok(())
+    }
+
+    /// For write-back of a cached object: the first run of dirty pages in
+    /// the `window` pages from `first` (at most `MAX_RUN` long), clean now,
+    /// write-protected in every mapping (a store there marks them dirty
+    /// again) and pinned. Returns the run's first page, its frames with a
+    /// reference each for the grant, and the file's size then (their data
+    /// ends there: a write extends the size as it dirties a page, so a
+    /// size read before the run could cut off data); ENOENT if none is
+    /// dirty.
+    pub fn pin_dirty(&self, first: u64, window: u64) -> Result<(u64, Vec<PhysFrame>, u64), Scan> {
+        if !self.is_cached() {
+            return Err(Scan::Errno(EINVAL));
+        }
+        let end = first.saturating_add(window);
+        let mut frames = Vec::new();
+        frames.try_reserve_exact(window.min(MAX_RUN) as usize).map_err(|_| Scan::Errno(ENOMEM))?;
+        let (start, size) = {
+            let mut st = self.state.lock();
+            if st.dirty == 0 {
+                return Err(Scan::Errno(ENOENT));
+            }
+            let size = st.size;
+            let mut start = None;
+            for (scanned, (&index, page)) in st.pages.range_mut(first..end).enumerate() {
+                match start {
+                    None if scanned >= MAX_SCAN => return Err(Scan::Resume(index)),
+                    None if !page.dirty => continue,
+                    None => start = Some(index),
+                    Some(s) if !page.dirty || index != s + frames.len() as u64 || frames.len() as u64 == MAX_RUN => break,
+                    Some(_) => {}
+                }
+                page.dirty = false;
+                page.pins += 1;
+                frames.push(page.frame);
+            }
+            let Some(start) = start else { return Err(Scan::Errno(ENOENT)) };
+            st.dirty -= (frames.len() as u64).min(st.dirty);
+            (start, size)
+        };
+        undirty(frames.len() as u64);
+        memory::with_frames(|f| frames.iter().for_each(|&frame| f.share(frame)));
+        let pages: Vec<u64> = (start..start + frames.len() as u64).collect();
+        self.write_protect(&pages);
+        Ok((start, frames, size))
+    }
+
+    /// The pager is gone (its thread ended): its pending pages will never
+    /// be filled. They go, and whoever waits for them fails.
+    fn abandon_pending(&self) {
+        let mut gone = Vec::new();
+        {
+            let mut st = self.state.lock();
+            let pending: Vec<u64> = st.pages.iter().filter(|(_, p)| p.pending).map(|(&i, _)| i).collect();
+            for index in pending {
+                if let Some(page) = st.pages.remove(&index) {
+                    gone.push(page.frame);
+                }
+                st.fail_waiters(index, index + 1);
+            }
+            st.charged -= gone.len() as u64;
+        }
+        self.uncharge(gone.len() as u64);
+        free_frames(gone);
+    }
+
+    /// Marks the present pages among `count` from `first` dirty again (a
+    /// write-back that failed).
+    pub fn redirty(&self, first: u64, count: u64) -> Result<(), i64> {
+        if !self.is_cached() {
+            return Err(EINVAL);
+        }
+        first.checked_add(count).ok_or(EINVAL)?;
+        let first_dirty = {
+            let mut st = self.state.lock();
+            let mut marked = 0;
+            for (_, page) in st.pages.range_mut(first..first + count) {
+                if !page.dirty && !page.pending {
+                    page.dirty = true;
+                    marked += 1;
+                }
+            }
+            let was = st.dirty;
+            st.dirty += marked;
+            DIRTY.fetch_add(marked, Ordering::Relaxed);
+            was == 0 && marked > 0
+        };
+        if first_dirty {
+            self.notify_dirty();
+        }
+        Ok(())
+    }
+
+    /// Dirty pages of this object (cached store).
+    pub fn dirty_pages(&self) -> u64 {
+        self.state.lock().dirty
     }
 
     /// Ends futex waits on this object for good: waiters wake (the caller
@@ -829,7 +1456,7 @@ impl PageCache {
                     next = index + 1;
                     if page.referenced {
                         page.referenced = false;
-                    } else if !page.dirty && frames.refcount(page.frame) == 1 && freed + (gone.len() as u64) < want {
+                    } else if !page.dirty && !page.pending && frames.refcount(page.frame) == 1 && freed + (gone.len() as u64) < want {
                         gone.push(index);
                     }
                 }
@@ -847,98 +1474,57 @@ impl PageCache {
     }
 
     /// Whether a store through a shared mapping must first mark the page
-    /// dirty (a remote store: the page must be written back).
+    /// dirty (a cached object: the page must be written back).
     pub fn tracks_dirty(&self) -> bool {
-        self.remote_store().is_some()
+        self.is_cached()
     }
 
-    /// Marks page `index` dirty before a shared mapping may store to it;
-    /// false if the page is gone (truncated meanwhile).
-    pub fn set_dirty(&self, index: u64) -> bool {
-        let mut st = self.state.lock();
-        let Some(page) = st.pages.get_mut(&index) else { return false };
-        if !page.dirty {
-            page.dirty = true;
-            DIRTY.fetch_add(1, Ordering::Relaxed);
+    /// Marks page `index` dirty before a shared mapping may store to it.
+    /// With `backed`, the page must be backed up to the file's end first
+    /// (else the pager is asked: `Dirtied::Unbacked`, and the store waits
+    /// for it); without, a store that cannot wait (the space locked) goes
+    /// ahead, as before delayed allocation.
+    pub fn set_dirty(&self, index: u64, backed: bool) -> Dirtied {
+        let Store::Cached { pager, key, .. } = &self.store else { return Dirtied::Gone };
+        enum Step {
+            Dirty { first: bool },
+            /// Not backed; whether the pager must be asked (it was not yet).
+            Unbacked { ask: bool },
         }
-        true
-    }
-
-    /// Writes the dirty pages among `pages` (page indices) back to the
-    /// server. A memory store has nothing to write.
-    pub fn writeback(&self, pages: core::ops::Range<u64>) -> Result<(), i64> {
-        let Some((fs, ino)) = self.remote_store() else { return Ok(()) };
-        let mut from = pages.start;
-        loop {
-            // 1. Take the dirty marks of a batch.
-            let mut batch: heapless::Vec<u64, WRITEBACK_BATCH> = heapless::Vec::new();
-            {
-                let mut st = self.state.lock();
-                for (&index, page) in st.pages.range_mut(from..pages.end) {
-                    if page.dirty {
-                        page.dirty = false;
-                        let _ = batch.push(index);
-                        if batch.is_full() {
-                            break;
-                        }
-                    }
-                }
+        let step = {
+            let mut st = self.state.lock();
+            let size = st.size;
+            let Some(page) = st.pages.get_mut(&index).filter(|p| !p.pending) else { return Dirtied::Gone };
+            if backed && (page.backed as u64) < backing_need(size, index) {
+                let ask = !page.mkwrite;
+                page.mkwrite = true;
+                Step::Unbacked { ask }
+            } else if page.dirty {
+                Step::Dirty { first: false }
+            } else {
+                page.dirty = true;
+                DIRTY.fetch_add(1, Ordering::Relaxed);
+                st.dirty += 1;
+                Step::Dirty { first: st.dirty == 1 }
             }
-            let Some(&last) = batch.last() else { return Ok(()) };
-            DIRTY.fetch_sub(batch.len() as u64, Ordering::Relaxed);
-            from = last + 1;
-            // 2. Make every mapping fault (and mark them again) on a store.
-            self.write_protect(&batch);
-            // 3. Write them, in runs of consecutive pages.
-            let _io = self.io.lock();
-            let mut buf = Vec::new();
-            if buf.try_reserve_exact(WRITEBACK_BATCH * PAGE as usize).is_err() {
-                self.redirty(&batch);
-                return Err(ENOMEM);
+        };
+        match step {
+            Step::Dirty { first } => {
+                if first {
+                    self.notify_dirty();
+                }
+                Dirtied::Yes
             }
-            let mut i = 0;
-            while i < batch.len() {
-                let mut j = i + 1;
-                while j < batch.len() && batch[j] == batch[j - 1] + 1 {
-                    j += 1;
+            Step::Unbacked { ask: false } => Dirtied::Unbacked,
+            Step::Unbacked { ask: true } => {
+                if pager.upgrade().is_some_and(|p| p.mkwrite(*key, index)) {
+                    return Dirtied::Unbacked;
                 }
-                let start = batch[i] * PAGE;
-                buf.clear();
-                {
-                    let st = self.state.lock();
-                    for index in &batch[i..j] {
-                        // Gone or cut by a truncation meanwhile: write only
-                        // what is still part of the file.
-                        let Some(page) = st.pages.get(index) else { break };
-                        let len = st.size.saturating_sub(index * PAGE).min(PAGE) as usize;
-                        buf.extend_from_slice(&frame_bytes(page.frame)[..len]);
-                        if len < PAGE as usize {
-                            break;
-                        }
-                    }
+                if let Some(page) = self.state.lock().pages.get_mut(&index) {
+                    page.mkwrite = false;
                 }
-                if !buf.is_empty() && fs.write(ino, start, &buf).is_err() {
-                    self.redirty(&batch[i..]);
-                    return Err(EIO);
-                }
-                i = j;
+                Dirtied::Gone
             }
-        }
-    }
-
-    /// An O_DIRECT read: what is on the server, after writing back the
-    /// dirty pages of the range (as Linux does).
-    pub fn read_direct(&self, off: u64, buf: &mut [u8]) -> Result<usize, i64> {
-        let Some((fs, ino)) = self.remote_store() else { return self.read(off, buf) };
-        let end = off.saturating_add(buf.len() as u64);
-        self.writeback(page_of(off)..page_of(end.saturating_add(PAGE - 1)))?;
-        fs.read(ino, off, buf)
-    }
-
-    /// Marks pages dirty again whose write-back failed.
-    fn redirty(&self, pages: &[u64]) {
-        for &index in pages {
-            self.set_dirty(index);
         }
     }
 
@@ -983,48 +1569,75 @@ impl PageCache {
     }
 }
 
-/// Writes back the dirty pages of every file (sync, the flusher).
-pub fn flush_all() {
-    let mut i = REMOTE.lock().len();
+/// Called after a store made a page dirty, with no lock held, so dirty
+/// pages (which reclaim cannot drop) never crowd out memory: above a tenth
+/// of the commit limit the pagers of the cached objects are asked to
+/// write back; above a fifth the storing thread waits for them (up to
+/// `THROTTLE` at a time; never a pager's own thread, which does the
+/// writing).
+pub fn balance_dirty() {
+    let limit = memory::commit_stats().1;
+    let (background, hard) = (limit / BACKGROUND, limit / HARD);
+    if dirty_pages() <= background {
+        return;
+    }
+    ask_pagers(dirty_pages().saturating_sub(background));
+    if dirty_pages() <= hard || crate::process::linux::is_pager() {
+        return;
+    }
+    let deadline = crate::time::now() + THROTTLE;
+    loop {
+        let wait = crate::process::sched::prepare_to_wait(dirty_chan());
+        if dirty_pages() <= hard || crate::time::now() >= deadline || crate::process::signal::dying() {
+            break;
+        }
+        wait.sleep_until(deadline);
+    }
+}
+
+/// The pager at `pager` (its data pointer) is gone: the pending pages of
+/// its cached objects will never be filled (their waiters fail).
+pub fn pager_gone(pager: *const ()) {
+    let mut i = CACHES.lock().len();
     while i > 0 {
         i -= 1;
-        let cache = REMOTE.lock().get(i).and_then(Weak::upgrade);
+        let cache = CACHES.lock().get(i).and_then(Weak::upgrade);
         if let Some(cache) = cache {
-            // A failed write keeps its pages dirty for the next round.
-            let _ = cache.writeback(0..u64::MAX);
+            if let Store::Cached { pager: p, .. } = &cache.store {
+                if p.as_ptr() as *const () == pager {
+                    cache.abandon_pending();
+                }
+            }
         }
     }
 }
 
-/// The flusher: a kernel thread writing dirty pages back every few
-/// seconds, so stores through shared mappings reach the disk on their own.
-pub fn flusher() -> ! {
-    loop {
-        crate::process::sched::prepare_to_sleep().sleep_until(crate::time::now() + FLUSH_INTERVAL);
-        if dirty_pages() > 0 {
-            flush_all();
+/// Asks the pagers whose cached objects have dirty pages to write back
+/// about `pages` of them (each pager queues one request at a time).
+fn ask_pagers(pages: u64) {
+    let mut i = CACHES.lock().len();
+    while i > 0 {
+        i -= 1;
+        let cache = CACHES.lock().get(i).and_then(Weak::upgrade);
+        if let Some(cache) = cache {
+            if let (Store::Cached { pager, .. }, true) = (&cache.store, cache.dirty_pages() > 0) {
+                if let Some(pager) = pager.upgrade() {
+                    pager.writeback(pages);
+                }
+            }
         }
     }
 }
 
-/// Called after a store made a page dirty, with no lock held: a writer
-/// that finds a fifth of the commit limit dirty writes back itself, so
-/// dirty pages (which reclaim cannot drop) never crowd out memory.
-pub fn balance_dirty() {
-    if dirty_pages() > memory::commit_stats().1 / 5 {
-        flush_all();
-    }
-}
-
-/// Drops up to `want` reclaimable pages of remote caches, visiting the
+/// Drops up to `want` reclaimable pages of cached objects, visiting the
 /// caches in turn; returns how many it dropped. Called by `memory` when a
 /// commit or a new cache page needs room, never with a cache lock held.
 fn reclaim(want: u64) -> u64 {
     let mut freed = 0;
-    let caches = REMOTE.lock().len();
+    let caches = CACHES.lock().len();
     for _ in 0..caches {
         let cache = {
-            let list = REMOTE.lock();
+            let list = CACHES.lock();
             if list.is_empty() {
                 break;
             }
@@ -1038,6 +1651,11 @@ fn reclaim(want: u64) -> u64 {
             break;
         }
     }
+    // Dirty pages stand in the way: the pagers write them back (they can
+    // be dropped then; this request fails or makes do with less).
+    if freed < want && dirty_pages() > 0 {
+        ask_pagers(want - freed);
+    }
     freed
 }
 
@@ -1047,8 +1665,12 @@ impl Drop for PageCache {
             let mut st = self.state.lock();
             (core::mem::take(&mut st.pages), st.charged)
         };
-        // (Only a released file or an empty cache goes: no data is lost.)
-        DIRTY.fetch_sub(pages.values().filter(|p| p.dirty).count() as u64, Ordering::Relaxed);
+        // Dirty pages go with the object: the Linux server writes a file
+        // back before it lets go of its object (`datafs::evict`, at the
+        // instance's end), or does not want the data (an unlinked file);
+        // what an instance that died without writing back left is lost, as
+        // on a crash.
+        undirty(pages.values().filter(|p| p.dirty).count() as u64);
         free_frames(pages.into_values().map(|p| p.frame));
         self.uncharge(charged);
         let prepaid = self.prepaid();

@@ -344,8 +344,8 @@ fn settle() {
 }
 
 /// `try_once`, and if it finds the file busy (ETXTBSY), once more after the
-/// releases reported until then are in.
-fn settled(try_once: impl Fn() -> Result<(), i64>) -> Result<(), i64> {
+/// releases reported until then are in (also for /data's files).
+pub(crate) fn settled(try_once: impl Fn() -> Result<(), i64>) -> Result<(), i64> {
     match try_once() {
         Err(ETXTBSY) => {
             settle();

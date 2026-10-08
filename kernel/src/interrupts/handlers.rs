@@ -152,7 +152,7 @@ fn exception(frame: &mut Frame) {
                     frame.rip = fixup.expect("checked").to;
                     return;
                 }
-                Err(Fault::Bus) => sig = signal::SIGBUS,
+                Err(Fault::Bus | Fault::Retry) => sig = signal::SIGBUS,
                 Err(Fault::Oom) => {
                     crate::printkln!("[kernel] out of memory at {:#x}: process killed", addr);
                     crate::process::exit_group(signal::SIGKILL as i32);

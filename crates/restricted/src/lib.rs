@@ -133,7 +133,11 @@ pub const SYS_VM_REMAP: u64 = 1026;
 /// `vm_discard(addr, len)`: drops the pages of private mappings in the
 /// range (zero or the file's again on the next access).
 pub const SYS_VM_DISCARD: u64 = 1027;
-/// `vm_sync(addr, len, flags)`: msync's contract.
+/// `vm_sync(addr, len, flags, out, cap) -> n`: msync's contract for the
+/// kernel's files. With MS_SYNC, the shared mappings of cached objects
+/// (`SYS_MO_CREATE_CACHED`) in the range are the server's to write back:
+/// `n` of them, the first `cap` stored at `out` as (key, first page, end
+/// page) triples of u64s.
 pub const SYS_VM_SYNC: u64 = 1028;
 /// `kfile_object(fd) -> handle`: the open file behind descriptor `fd` of
 /// the calling process (the kernel's descriptor table, until files are the
@@ -165,11 +169,14 @@ pub const TEST_MAP_AT: u64 = 1504;
 /// `mo_create_paged(pages, key) -> handle`: a memory object whose pages
 /// the server supplies; requests name it by `key`.
 pub const SYS_MO_CREATE_PAGED: u64 = 1019;
-/// `event_wait(event) -> 0`: the instance's service thread (the pager
-/// thread) waits for the next event of the instance and gets it as an
-/// `Event`: a page someone needs, or the last descriptor of one of the
-/// server's files gone. When the instance's last program is gone, the
-/// service thread's process ends here.
+/// `event_wait(event, deadline) -> 0`: the instance's service thread (the
+/// pager thread) waits for the next event of the instance and gets it as
+/// an `Event`: a page someone needs, the last descriptor of one of the
+/// server's files gone, a hold released, a cached object's first dirty
+/// page, a request to write back; `EVENT_TIMER` once `deadline`
+/// (monotonic nanoseconds; 0: none) passed without one. When the
+/// instance's last program is gone it gets `EVENT_CLOSING` once (to write
+/// its caches back), and the next wait ends the service thread's process.
 pub const SYS_EVENT_WAIT: u64 = 1020;
 /// `mo_supply(handle, offset, buf, len)`: the page at `offset` of a paged
 /// object, from `len` bytes at `buf` (the rest zero), unless it is there
@@ -196,6 +203,26 @@ pub const EVENT_CLOSED: u64 = 2;
 /// A record of the server's (`SYS_FS_RECORD`) lost its last holder: `a` is
 /// the record.
 pub const EVENT_RELEASE: u64 = 3;
+/// A cached object (`SYS_MO_CREATE_CACHED`) got its first dirty page: `a`
+/// is its key. (Again once all were written back and one is dirtied.)
+pub const EVENT_DIRTY: u64 = 4;
+/// Dirty pages crowd out memory (reclaim cannot drop them, or more than a
+/// tenth of the commit limit is dirty): write back about `a` pages. One is
+/// queued at a time.
+pub const EVENT_WRITEBACK: u64 = 5;
+/// `event_wait`'s deadline passed.
+pub const EVENT_TIMER: u64 = 6;
+/// The instance's last program is gone: the service thread writes its
+/// caches back; its next `event_wait` ends its process.
+pub const EVENT_CLOSING: u64 = 7;
+/// Write every cache back and flush (as sync(2)), then `sync_done(a)`: a
+/// sync of another instance (`SYS_SYNC_OTHERS`) or a reboot waits for it.
+/// One is queued at a time; `a` is the latest ticket it answers.
+pub const EVENT_SYNC: u64 = 8;
+/// A store through a shared mapping wants a page of a cached object whose
+/// disk space is not secured (`a` key, `b` byte offset of the page): the
+/// server promises it and answers with `mo_backed`.
+pub const EVENT_MKWRITE: u64 = 9;
 
 /// A server thread starts with its role in `rsi` (and its `State` in
 /// `rdi`): it serves a program's thread, or it is the instance's pager.
@@ -398,12 +425,25 @@ pub const SYS_MO_CREATE_FILE: u64 = 1055;
 /// ever took it; a refused call hands nothing over). For the server's
 /// write access and ETXTBSY. With `word` 0: another handle without a hold.
 pub const SYS_MO_HOLD: u64 = 1056;
-/// `mo_file_read(handle, offset, buf, len) -> n`: reads from the file
-/// object into the program's memory at `buf` (up to its end).
+/// `mo_file_read(handle, offset, buf, len, flags) -> n`: reads from the
+/// file object into the program's memory at `buf` (up to its end). With
+/// `MO_NOFILL`, a missing page of a cached object ends the read there
+/// (EAGAIN if it is the first): the server fills it itself.
 pub const SYS_MO_FILE_READ: u64 = 1057;
-/// `mo_file_write(handle, offset, buf, len) -> n`: writes the program's
-/// memory at `buf` into the file object (growing it; ENOSPC, EFBIG).
+/// `mo_file_write(handle, offset, buf, len, flags, upto) -> n`: writes the
+/// program's memory at `buf` into the file object (growing it; ENOSPC,
+/// EFBIG). With `MO_NOFILL` as for reads: a missing page of a cached
+/// object whose data the write needs (it does not cover the page's data)
+/// ends the write there. A cached object's pages must have their disk
+/// space secured (backed) up to the file's end before they take data:
+/// with `MO_CHECK_BACKED` a page that is not ends the write there
+/// (`ENOSPC` if it is the first: the server promises the space and writes
+/// again); `MO_BACKED` first marks the pages it writes backed up to byte
+/// `upto` (the space the server promised), then checks the same way.
 pub const SYS_MO_FILE_WRITE: u64 = 1058;
+pub const MO_NOFILL: u64 = 1;
+pub const MO_CHECK_BACKED: u64 = 2;
+pub const MO_BACKED: u64 = 4;
 /// `mo_file_size(handle) -> size`.
 pub const SYS_MO_FILE_SIZE: u64 = 1059;
 /// `mo_truncate(handle, len)`: sets the file object's size (pages beyond
@@ -457,6 +497,22 @@ pub const SYS_CHAN_CONNECT: u64 = 1065;
 /// EPIPE once it is gone.
 pub const SYS_GRANT: u64 = 1066;
 pub const GRANT_WRITE: u64 = 1;
+/// Grant a cached object's pages to be filled (with `GRANT_WRITE`): the
+/// first run of missing pages among `pages` from `offset` (the run at most
+/// 256 long), made pending: zeroed frames nobody sees until `mo_filled`.
+/// ENOENT if none of them is missing.
+pub const GRANT_FILL: u64 = 2;
+/// Grant a cached object's pages to be written back (read-only): the
+/// first run of dirty pages among `pages` from `offset` (at most 256),
+/// clean from now on and write-protected in every mapping (a store marks
+/// them dirty again). ENOENT if none of them is dirty. With `GRANT_FILL`
+/// or `GRANT_DIRTY`, `out` (the sixth argument) gets the run's first page,
+/// its length in pages and the file's size when it was taken (three
+/// u64s): a run of dirty pages holds data up to that size (a write makes
+/// a page dirty and the file longer at once). One call looks at a bounded
+/// number of present pages: EAGAIN with the page to go on from at `out`
+/// if it found no run among them.
+pub const GRANT_DIRTY: u64 = 4;
 /// `revoke(handle, grant) -> 0 | REVOKE_DRAINING`: takes a grant back. Its
 /// mappings in the service are gone when the call returns. If the service
 /// had device addresses of it that a device may still use (no IOMMU to take
@@ -468,6 +524,66 @@ pub const GRANT_WRITE: u64 = 1;
 pub const SYS_REVOKE: u64 = 1067;
 pub const REVOKE_DRAINING: u64 = 1;
 
+// The server's page cache of disk files (I/O rings step 4, phase R6c.3):
+// one cached object per file the server uses, filled and written back by
+// the server over its channel to the disk server.
+
+/// `mo_create_cached(size, key, limit) -> handle`: a file object for the
+/// server's cache of a file of `size` bytes that may grow to `limit` (the
+/// filesystem's largest file: EFBIG beyond). Reads, writes (`mo_file_*`,
+/// `mo_read`/`mo_write`), mappings and programs use it as a file object;
+/// a missing page is asked for with `EVENT_PAGE` (`key`), and the server
+/// fills it by DMA into the pages it grants (`GRANT_FILL`, `mo_filled`).
+/// Stores (writes, shared mappings) mark pages dirty (`EVENT_DIRTY`); the
+/// server writes them back (`GRANT_DIRTY`, `mo_redirty`). Its pages are
+/// cached memory: clean ones nothing pins or maps are reclaimed when
+/// memory is short.
+pub const SYS_MO_CREATE_CACHED: u64 = 1076;
+/// `mo_filled(handle, offset, pages, ok)`: the pending pages among `pages`
+/// (at most 256) from `offset` hold the file's data now (`ok` 1), or could
+/// not be read (0: they go, and whoever waits for them or for missing pages
+/// of the range now gets an error, SIGBUS for a mapping; nothing is kept
+/// for later accesses, which ask again). Wakes the waiters.
+pub const SYS_MO_FILLED: u64 = 1077;
+/// `mo_redirty(handle, offset, pages)`: marks the present pages among
+/// `pages` from `offset` dirty again (their write-back failed).
+pub const SYS_MO_REDIRTY: u64 = 1078;
+/// `mo_map_server(handle, pages) -> addr`: maps the first `pages` pages of
+/// a memory object (`mo_create`) into the server's region, read and write,
+/// for every thread of the instance (as buffers it grants and reads
+/// itself). `mo_unmap_server(addr)` removes it.
+pub const SYS_MO_MAP_SERVER: u64 = 1079;
+pub const SYS_MO_UNMAP_SERVER: u64 = 1080;
+/// `sync_others(ticket)`: sync(2) across instances (/data's page cache is
+/// per instance). With 0 it asks every other instance's service thread to
+/// write its caches back (`EVENT_SYNC`) and returns a ticket (> 0); with a
+/// ticket it waits until each instance asked then has answered it
+/// (`sync_done`) or its service thread is gone, or the caller is killed.
+/// Not from the service thread (EPERM: two instances' service threads
+/// would wait for each other).
+pub const SYS_SYNC_OTHERS: u64 = 1081;
+/// `sync_done(ticket)`: the service thread wrote back what `EVENT_SYNC`
+/// with that ticket asked for. Service thread only.
+pub const SYS_SYNC_DONE: u64 = 1082;
+/// `mo_backed(handle, first, end, ok)`: the answer to `EVENT_MKWRITE` for
+/// the pages from byte `first` (page-aligned) to `end` (at most 256
+/// pages): backed up to `end` (`ok` 1: the space is promised), or not to
+/// be had (0: a store waiting for it gets SIGBUS, as Linux's ENOSPC in
+/// `page_mkwrite`). Wakes the waiting stores.
+pub const SYS_MO_BACKED: u64 = 1083;
+/// `mo_unback(handle, from, out) -> found`: after diskfs lost the
+/// promises (it restarted), clears the backing of the cached object's
+/// pages from page `from` on and writes the first run of dirty pages among
+/// them to `out` (first page, end page): 1, or 0 when none is left (the
+/// server promises each run again, then goes on from its end). EAGAIN
+/// with the page to go on from in `out[0]` after looking at 1024 pages.
+pub const SYS_MO_UNBACK: u64 = 1084;
+/// `server_log(buf, len)`: prints the server's message (UTF-8, at most
+/// `SERVER_LOG_MAX` bytes) on the kernel's console: what a program cannot
+/// be told any more (a final write-back that failed).
+pub const SYS_SERVER_LOG: u64 = 1085;
+pub const SERVER_LOG_MAX: u64 = 256;
+
 /// `(scenario)`: the server runs a channel scenario against the test
 /// service (servers/ringtest, `ring::selftest`): 1 rings and doorbells, 2
 /// grants and their bounds, 3 revoking, 4 the client's end going, 5 the
@@ -478,11 +594,22 @@ pub const TEST_CHANNEL: u64 = 1514;
 /// `(scenario)`: the server runs a scenario of the file protocol
 /// (`fsring`) against diskfs over a channel: 1 reading a file of the disk
 /// image and metadata, 2 writes, a flush and the file read back
-/// (`/data/ringtest.bin` stays for the caller to read through the kernel
-/// and remove), 3 malformed requests, 4 requests in flight, 5 a grant
+/// (`/data/ringtest.bin` stays for the caller to read through /data and
+/// remove), 3 malformed requests, 4 requests in flight, 5 a grant
 /// revoked under diskfs and a client gone with requests in flight, 6 holds
 /// across channels, 7 a stalled write with every operation slot busy, 8
 /// requests left waiting for room in the completion ring (the caller
 /// checks that diskfs sleeps), 9 their completions taken. 0 if
 /// every check held, else the negative number of the first that failed.
 pub const TEST_DISKRING: u64 = 1515;
+/// `(scenario)`: the server checks the kernel's interface of its page cache
+/// (`SYS_MO_CREATE_CACHED`) on a file of /data: 1 a failed fill beyond the
+/// end of the file or over 256 pages leaves no trace (the file grown later
+/// reads as zeros), 2 a write-back grant over more pages than one call
+/// looks at goes on where the kernel says (`EAGAIN`) and finds the dirty
+/// page at the end, 3 a truncation waiting for a page pinned by a grant
+/// that is never let go of gives up with `EBUSY` after its wait, 4
+/// `sync_others` hands out growing tickets and returns at once with no
+/// other instance, and `sync_done` is the service thread's only. 0 if every check held, else the negative number of the
+/// first that failed.
+pub const TEST_CACHED: u64 = 1516;

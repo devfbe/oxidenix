@@ -8,6 +8,7 @@
 //! pipe2): for a descriptor of one of the server's files it answers itself,
 //! for one of the kernel's it returns None and the call passes through.
 
+use crate::datafile::{self, DataOpen};
 use crate::eventfd::EventFd;
 use crate::tmpfile::{self, TmpOpen};
 use crate::pipe::{self, Dst, PipeEnd, Src};
@@ -40,6 +41,8 @@ pub enum File {
     EventFd(Arc<EventFd>),
     /// An open file of the server's tmpfs.
     Tmp(Arc<TmpOpen>),
+    /// An open file of /data.
+    Data(Arc<DataOpen>),
 }
 
 static FILES: Mutex<BTreeMap<u64, File>> = Mutex::new(BTreeMap::new());
@@ -53,7 +56,7 @@ pub fn new_id() -> u64 {
 /// one). On failure the file is forgotten again.
 pub fn install(id: u64, file: File, flags: u32, ready: i16) -> Result<i64, i64> {
     // Regular files and directories are always ready.
-    let kind = if matches!(file, File::Tmp(_)) { KFD_ALWAYS_READY } else { 0 };
+    let kind = if matches!(file, File::Tmp(_) | File::Data(_)) { KFD_ALWAYS_READY } else { 0 };
     FILES.lock().insert(id, file);
     let fd = syscall(SYS_KFD_INSTALL, [id, flags as u64, ready as u16 as u64, kind, 0, 0]);
     if fd < 0 {
@@ -74,8 +77,9 @@ pub fn closed(id: u64) {
     if let Some(File::Pipe(end)) = gone {
         end.close();
     }
-    // An eventfd or a tmpfs file simply goes (the latter returning its
-    // write access).
+    // An eventfd or a tmpfs or /data file simply goes (the latter two
+    // returning their write access; an unlinked /data file's inode goes at
+    // the next `datafs::reap`).
 }
 
 /// Whether descriptor `fd` names one of the server's files.
@@ -91,6 +95,14 @@ pub fn tmp_of(fd: u64) -> Option<Arc<TmpOpen>> {
     }
 }
 
+/// The open /data file behind descriptor `fd`, if it is one.
+pub fn data_of(fd: u64) -> Option<Arc<DataOpen>> {
+    match lookup(fd)? {
+        (File::Data(f), _) => Some(f),
+        _ => None,
+    }
+}
+
 /// For mmap of descriptor `fd`: None for a file of the kernel's (mapped
 /// through `kfile_object`); else the object to map (a handle to close once
 /// mapped) and whether the mapping stays read-only, or why not.
@@ -98,6 +110,7 @@ pub fn map_object(fd: u64, shared: bool, prot_write: bool) -> Option<Result<(u64
     const ENODEV: i64 = 19;
     Some(match lookup(fd)? {
         (File::Tmp(f), flags) => f.map_object(flags, shared, prot_write),
+        (File::Data(f), flags) => f.map_object(flags, shared, prot_write),
         _ => Err(ENODEV),
     })
 }
@@ -132,6 +145,8 @@ const SYS_EVENTFD: u64 = 284;
 const SYS_EVENTFD2: u64 = 290;
 pub const SYS_PREADV: u64 = 295;
 pub const SYS_PWRITEV: u64 = 296;
+const SYS_SYNC: u64 = 162;
+const SYS_SYNCFS: u64 = 306;
 const SYS_PREADV2: u64 = 327;
 const SYS_PWRITEV2: u64 = 328;
 pub const SYS_GETDENTS64: u64 = 217;
@@ -152,6 +167,14 @@ pub fn handle(s: &State) -> Option<i64> {
             sendfile(a0, out, a1, input, a2, s.r10)
         }
         SYS_PIPE2 => pipe2(a0, a1),
+        // The kernel's files have nothing to write back: /data's do, in
+        // every instance's page cache.
+        SYS_SYNC => sync_everywhere().map(|_| 0),
+        SYS_SYNCFS => match lookup(a0) {
+            Some((File::Data(_), _)) => sync_everywhere().map(|_| 0),
+            Some(_) => Ok(0),
+            None => return None,
+        },
         SYS_READ | SYS_WRITE | SYS_READV | SYS_WRITEV | SYS_FSTAT | SYS_LSEEK | SYS_IOCTL | SYS_PREAD64 | SYS_PWRITE64
         | SYS_PREADV | SYS_PWRITEV | SYS_FSYNC | SYS_FDATASYNC | SYS_FTRUNCATE | SYS_GETDENTS64 | SYS_FSTATFS => {
             let (file, flags) = lookup(a0)?;
@@ -168,8 +191,8 @@ pub fn handle(s: &State) -> Option<i64> {
 
 /// preadv2/pwritev2: the vectored call at the file position (offset -1) or
 /// at the offset, with O_APPEND as the flags have it for this call
-/// (`vfs::rw::plan`). The server's files are memory, so RWF_DSYNC/RWF_SYNC
-/// have nothing to wait for.
+/// (`vfs::rw::plan`). RWF_DSYNC/RWF_SYNC make a /data write durable before
+/// it returns (the other files are memory: nothing to wait for).
 fn rw2(write: bool, file: File, flags: u32, iov: u64, count: u64, offset: i64, rwf: u64) -> Result<i64, i64> {
     let allowed = if write { flags & O_ACCMODE != 0 } else { flags & O_ACCMODE != O_WRONLY };
     if !allowed {
@@ -177,6 +200,7 @@ fn rw2(write: bool, file: File, flags: u32, iov: u64, count: u64, offset: i64, r
     }
     let plan = vfs::rw::plan(write, offset, rwf, flags & O_APPEND != 0)?;
     let flags = if plan.append { flags | O_APPEND } else { flags & !O_APPEND };
+    let flags = if plan.sync { flags | datafile::O_DSYNC } else { flags };
     let nr = match (write, plan.at) {
         (false, None) => SYS_READV,
         (true, None) => SYS_WRITEV,
@@ -191,6 +215,7 @@ fn on_file(nr: u64, file: File, flags: u32, a1: u64, a2: u64, a3: u64) -> Result
         File::Pipe(end) => end,
         File::EventFd(e) => return on_eventfd(nr, &e, flags, a1, a2),
         File::Tmp(f) => return tmpfile::call(nr, &f, flags, a1, a2, a3),
+        File::Data(f) => return datafile::call(nr, &f, flags, a1, a2, a3),
     };
     let readable = flags & O_ACCMODE != O_WRONLY;
     let writable = flags & O_ACCMODE != 0;
@@ -271,6 +296,11 @@ fn sendfile(out_fd: u64, out: Option<(File, u32)>, in_fd: u64, input: Option<(Fi
             return Err(EINVAL);
         }
     }
+    if let Some((File::Data(f), _)) = &out {
+        if f.inode.kind == vfs::S_IFDIR {
+            return Err(EINVAL);
+        }
+    }
     if let Some((_, flags)) = &out {
         if flags & O_ACCMODE == 0 {
             return Err(EBADF);
@@ -289,6 +319,7 @@ fn sendfile(out_fd: u64, out: Option<(File, u32)>, in_fd: u64, input: Option<(Fi
             Some((File::Pipe(end), flags)) => end.read(Dst::Server(&mut buf[..want]), flags & O_NONBLOCK != 0),
             Some((File::EventFd(_), _)) => Err(EINVAL),
             Some((File::Tmp(f), _)) => f.read_server(&mut buf[..want]).map(|n| n as i64),
+            Some((File::Data(f), _)) => f.read_server(&mut buf[..want]).map(|n| n as i64),
             None => match syscall(SYS_KFD_READ, [in_fd, buf.as_mut_ptr() as u64, want as u64, 0, 0, 0]) {
                 r if r < 0 => Err(-r),
                 r => Ok(r),
@@ -306,6 +337,7 @@ fn sendfile(out_fd: u64, out: Option<(File, u32)>, in_fd: u64, input: Option<(Fi
             Some((File::Pipe(end), flags)) => end.write(Src::Server(&buf[..n]), flags & O_NONBLOCK != 0),
             Some((File::EventFd(_), _)) => Err(EINVAL),
             Some((File::Tmp(f), flags)) => f.write_server(&buf[..n], flags & O_APPEND != 0).map(|n| n as i64),
+            Some((File::Data(f), flags)) => f.write_server(&buf[..n], flags & O_APPEND != 0).map(|n| n as i64),
             None => match syscall(SYS_KFD_WRITE, [out_fd, buf.as_ptr() as u64, n as u64, 0, 0, 0]) {
                 r if r < 0 => Err(-r),
                 r => Ok(r),
@@ -357,4 +389,16 @@ fn eventfd2(initval: u64, flags: u64) -> Result<i64, i64> {
     let e = Arc::new(EventFd::new(initval as u32 as u64, flags & EFD_SEMAPHORE != 0));
     let open = O_RDWR | (flags as u32 & (O_NONBLOCK | O_CLOEXEC));
     install(e.id(), File::EventFd(e.clone()), open, e.ready())
+}
+
+/// sync(2) of /data: this instance's caches and, at the same time, every
+/// other instance's (each has its own page cache of the disk); returns
+/// once all are written back and flushed. The error is this instance's.
+fn sync_everywhere() -> Result<(), i64> {
+    let ticket = crate::syscall(SYS_SYNC_OTHERS, [0; 6]);
+    let result = crate::datafs::sync_all();
+    if ticket > 0 {
+        crate::syscall(SYS_SYNC_OTHERS, [ticket as u64, 0, 0, 0, 0, 0]);
+    }
+    result
 }

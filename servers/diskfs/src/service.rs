@@ -19,27 +19,26 @@
 //! links its new blocks once its data is on the device; it is durable
 //! after a `FLUSH` (see `fsring`, "Durability").
 //!
-//! **Barriers.** Every other operation, and the kernel's IPC requests, run
-//! when no operation is in flight: taking one stops taking requests (on
+//! **Barriers.** Every other operation runs when no operation is in
+//! flight: taking one stops taking requests (on
 //! every channel) until the operations taken before it completed; then it
 //! runs synchronously. Barriers wait in a queue, in the order they were
 //! taken. A write waits ("stalls") while another write in flight covers
 //! one of its blocks, while scratch memory is short, or while every
 //! operation slot is taken; it was taken before every barrier waiting, so
 //! it is retried whatever waits, and if it must go through ext2fs's own
-//! write it goes in front of them.
+//! write it goes in front of them. A `FORGET` of a grant no operation
+//! uses (the client sends it once the requests on the grant completed)
+//! runs at once, without stopping anything: it touches no file; so does a
+//! `PROMISE` (ext2fs's promises, owned by the channel: they end with it).
+//! A write in flight spends its promise when it links its blocks.
 //!
-//! **Holds.** diskfs keeps, per channel and for the kernel's IPC client, a
-//! bit per inode the client holds (`fsring`, "Holds"): an inode whose last
-//! link went is freed only when no client holds it, so one client's
-//! `RELEASE` (or the kernel's `Release`) never frees an inode another one
-//! still uses. A channel's holds go with it. The kernel releases only the
-//! inodes it unlinked itself (fsproto has no other release); one a ring
-//! client unlinks while the kernel holds it stays allocated (an orphan,
-//! which e2fsck reports after a shutdown) rather than be freed under the
-//! kernel; the kernel's client goes in step 4. The holds are diskfs's
-//! memory: a restarted diskfs knows the kernel's again only as it names
-//! them.
+//! **Holds.** diskfs keeps, per channel, a bit per inode the client holds
+//! (`fsring`, "Holds"): an inode whose last link went is freed only when
+//! no client holds it, so one client's `RELEASE` never frees an inode
+//! another one still uses. A channel's holds go with it. The holds are
+//! diskfs's memory: a restarted diskfs knows a client's again only as it
+//! names them.
 //!
 //! **Hostile clients.** Each descriptor is copied out of the ring once and
 //! validated (`fsring::Request::decode`); a grant must exist and hold the
@@ -311,6 +310,8 @@ struct Op {
     chan: usize,
     tag: u64,
     op: u16,
+    /// The grant it moves data from or to.
+    grant: u32,
     /// The device requests of the current stage, how many were submitted,
     /// how many are still in flight; a write's data requests wait in
     /// `later` while the sectors it keeps are read.
@@ -340,11 +341,7 @@ pub struct Service {
     /// taken; a stalled write taken before it that turns out to need the
     /// fallback goes in front (it was taken earlier than every one here).
     barriers: VecDeque<(usize, Desc)>,
-    /// The inodes the kernel's IPC client has named (see `Holds`).
-    kernel: Bitmap,
     inodes: u64,
-    /// Take no new requests (the kernel's IPC request waits for a drain).
-    hold: bool,
     /// The channel the next round starts with.
     rr: usize,
     /// Free scratch slots, and the scratch memory's device address.
@@ -388,9 +385,7 @@ impl Service {
             chans: (0..MAX_CHANNELS).map(|_| None).collect(),
             ops: (0..MAX_OPS).map(|_| None).collect(),
             barriers: VecDeque::new(),
-            kernel: Bitmap::new(inodes),
             inodes,
-            hold: false,
             rr: 0,
             bounce: (0..slots).rev().collect(),
             scratch,
@@ -576,23 +571,6 @@ impl Service {
         }
     }
 
-    /// Completes everything taken (the kernel's IPC request runs then),
-    /// taking nothing new.
-    pub fn drain(&mut self, fs: &mut Fs) {
-        self.hold = true;
-        loop {
-            let progress = self.poll(fs);
-            let pending = self.ops.iter().any(Option::is_some) || !self.barriers.is_empty() || self.chans.iter().flatten().any(|c| c.stalled.is_some());
-            if !pending {
-                break;
-            }
-            if !progress && fs.device().in_flight() > 0 {
-                fs.device_mut().wait_any();
-            }
-        }
-        self.hold = false;
-    }
-
     /// One round: completions from the device, requests to it, requests
     /// from the rings, completions into them. Whether anything happened.
     fn poll(&mut self, fs: &mut Fs) -> bool {
@@ -716,7 +694,7 @@ impl Service {
                 any |= self.dispatch(fs, c, d, true);
             }
             for _ in 0..TAKE_PER_ROUND {
-                if self.hold || !self.barriers.is_empty() || !self.ops.iter().any(Option::is_none) || !self.chan(c).ready() {
+                if !self.barriers.is_empty() || !self.ops.iter().any(Option::is_none) || !self.chan(c).ready() {
                     break;
                 }
                 let chan = self.chan(c);
@@ -746,6 +724,24 @@ impl Service {
             }
         };
         self.hold_named(c, &request);
+        // A grant no operation uses is let go at once: no barrier (the
+        // client sends FORGET after the requests on it completed).
+        if let Request::Forget { grant } = request {
+            let busy = self.ops.iter().flatten().any(|op| op.chan == c && op.grant == grant)
+                || self.chan(c).stalled.is_some_and(|s| s.grant == grant)
+                || self.barriers.iter().any(|&(bc, ref b)| bc == c && b.grant == grant);
+            if !busy {
+                self.forget(c, grant);
+                self.complete(c, d.tag, d.op, 0, [0; 4]);
+                return true;
+            }
+        }
+        if let Request::Promise { .. } = request {
+            // Touches no file: at once.
+            let status = self.execute(fs, c, request).map_or_else(|e| -e, |(s, _)| s);
+            self.complete(c, d.tag, d.op, status, [0; 4]);
+            return true;
+        }
         if !request.is_data() {
             // Taken fresh: nothing else waits (taking stops while one does).
             self.barriers.push_back((c, d));
@@ -789,7 +785,7 @@ impl Service {
         let chan = self.chan(c);
         match *request {
             Request::Read { ino, .. } | Request::Write { ino, .. } | Request::Stat { ino } | Request::Truncate { ino, .. } => chan.held.set(ino),
-            Request::Readlink { ino, .. } | Request::SetPerm { ino, .. } => chan.held.set(ino),
+            Request::Readlink { ino, .. } | Request::SetPerm { ino, .. } | Request::Promise { ino, .. } => chan.held.set(ino),
             Request::Lookup { dir, .. } | Request::Create { dir, .. } | Request::Unlink { dir, .. } | Request::Readdir { dir, .. } => chan.held.set(dir),
             Request::Rename { from, to, .. } => {
                 chan.held.set(from);
@@ -801,7 +797,7 @@ impl Service {
 
     /// Frees `ino` if its last link is gone and no client holds it.
     fn try_free(&mut self, fs: &mut Fs, ino: u32) {
-        if self.kernel.has(ino) || self.chans.iter().flatten().any(|c| c.held.has(ino)) || fs.check(ino).is_err() {
+        if self.chans.iter().flatten().any(|c| c.held.has(ino)) || fs.check(ino).is_err() {
             return;
         }
         if fs.stat(ino).is_ok_and(|s| s.links == 0) {
@@ -814,24 +810,10 @@ impl Service {
         let chan = self.chans[c].take().expect("a channel in use");
         // Vouches that no device uses its grants any more.
         let _ = oxrt::chan_detach(chan.id);
+        fs.forget_promises(chan.id);
         for ino in chan.held.inodes() {
             self.try_free(fs, ino);
         }
-    }
-
-    /// The kernel's IPC client named `ino` (in a request or a reply): it
-    /// may use it until it releases it.
-    pub fn kernel_holds(&mut self, ino: u32) {
-        self.kernel.set(ino);
-    }
-
-    /// The kernel's IPC client released `ino` (fsproto's `Release`, which
-    /// it sends for the inodes it unlinked once it no longer uses them).
-    pub fn kernel_release(&mut self, fs: &mut Fs, ino: u32) -> Result<(), i64> {
-        fs.check(ino)?;
-        self.kernel.clear(ino);
-        self.try_free(fs, ino);
-        Ok(())
     }
 
     fn post(&mut self) -> bool {
@@ -855,8 +837,8 @@ impl Service {
 
     // ---------------------------------------------------- reads and writes
 
-    fn op(&self, c: usize, work: Work, reqs: Vec<DevReq>, later: Vec<DevReq>) -> Start {
-        Start::Running(Op { chan: c, tag: 0, op: 0, reqs, next: 0, outstanding: 0, later, error: None, work })
+    fn op(&self, c: usize, grant: u32, work: Work, reqs: Vec<DevReq>, later: Vec<DevReq>) -> Start {
+        Start::Running(Op { chan: c, tag: 0, op: 0, grant, reqs, next: 0, outstanding: 0, later, error: None, work })
     }
 
     fn start_read(&mut self, fs: &mut Fs, c: usize, ino: u32, offset: u64, buf: Buf) -> Result<Start, i64> {
@@ -889,7 +871,7 @@ impl Service {
             at += e.len;
             bytes += e.len;
         }
-        Ok(self.op(c, Work::Read { bytes, size }, reqs, Vec::new()))
+        Ok(self.op(c, buf.grant, Work::Read { bytes, size }, reqs, Vec::new()))
     }
 
     fn start_write(&mut self, fs: &mut Fs, c: usize, ino: u32, offset: u64, buf: Buf) -> Result<Start, i64> {
@@ -971,7 +953,7 @@ impl Service {
             (b, _) => b,
         };
         let work = Work::Write { ino, blocks, reservation, end, len, bounce };
-        Ok(if reads.is_empty() { self.op(c, work, writes, Vec::new()) } else { self.op(c, work, reads, writes) })
+        Ok(if reads.is_empty() { self.op(c, buf.grant, work, writes, Vec::new()) } else { self.op(c, buf.grant, work, reads, writes) })
     }
 
     /// Cuts the device range from byte `start` (sector-aligned), made of
@@ -1067,18 +1049,27 @@ impl Service {
             Request::Stat { ino } => {
                 fs.check(ino)?;
                 let s = fs.stat(ino)?;
-                let stat = fsring::Stat { mode: s.mode, links: s.links, size: s.size, atime: s.atime, mtime: s.mtime, ctime: s.ctime };
+                let stat = fsring::Stat { mode: s.mode, links: s.links, size: s.size, atime: s.atime, mtime: s.mtime, ctime: s.ctime, generation: s.generation };
                 Ok((0, stat.to_values()))
             }
             Request::Statfs => {
                 let (bs, blocks, free, inodes, free_inodes) = fs.usage();
-                let u = fsring::Usage { block_size: bs as u32, blocks: blocks as u32, free_blocks: free as u32, inodes: inodes as u32, free_inodes: free_inodes as u32 };
+                let u = fsring::Usage {
+                    block_size: bs as u32,
+                    blocks: blocks as u32,
+                    free_blocks: free as u32,
+                    inodes: inodes as u32,
+                    free_inodes: free_inodes as u32,
+                    max_file_size: fs.max_file_size(),
+                };
                 Ok((0, u.to_values()))
             }
             Request::Lookup { dir, name } => {
                 fs.check(dir)?;
                 let name = self.name(c, &name)?;
-                Ok((0, [fs.lookup(dir, &name)? as u64, 0, 0, 0]))
+                let ino = fs.lookup(dir, &name)?;
+                let s = fs.stat(ino)?;
+                Ok((0, [ino as u64, s.mode as u64, s.generation as u64, 0]))
             }
             Request::Create { dir, name, kind, perm } => {
                 Self::live_dir(fs, dir)?;
@@ -1092,7 +1083,9 @@ impl Service {
                         NewNode::Symlink(String::from(fsring::check_target(&bytes)?))
                     }
                 };
-                Ok((0, [fs.create(dir, &name, &node, perm)? as u64, 0, 0, 0]))
+                let ino = fs.create(dir, &name, &node, perm)?;
+                let s = fs.stat(ino)?;
+                Ok((0, [ino as u64, s.mode as u64, s.generation as u64, 0]))
             }
             Request::Unlink { dir, name, is_dir } => {
                 fs.check(dir)?;
@@ -1162,6 +1155,12 @@ impl Service {
             Request::Forget { grant } => {
                 self.forget(c, grant);
                 Ok((0, none))
+            }
+            // (Run at once by `dispatch`; never a barrier.)
+            Request::Promise { ino, offset, len } => {
+                let owner = self.chan(c).id;
+                fs.check(ino)?;
+                fs.promise(owner, ino, offset, len).map(|_| (0, none))
             }
             // Through ext2fs's own paths, with a bounce copy (see `Start::Fallback`).
             Request::Read { ino, offset, buf } => {

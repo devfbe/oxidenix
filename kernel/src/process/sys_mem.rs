@@ -28,7 +28,7 @@ fn errno(f: Fault) -> i64 {
     match f {
         Fault::Oom => ENOMEM,
         Fault::Access => EACCES,
-        Fault::Segv | Fault::Bus => EINVAL,
+        Fault::Segv | Fault::Bus | Fault::Retry => EINVAL,
     }
 }
 
@@ -217,10 +217,19 @@ pub fn mremap(old: u64, old_len: u64, new_len: u64, flags: u64, new_addr: u64) -
     }
 }
 
-/// msync(2): MS_SYNC writes the dirty pages of the shared file mappings in
-/// the range back (MS_ASYNC leaves them to the flusher); ENOMEM if part of
-/// the range is not mapped.
+/// msync(2): the flags and the range checked (ENOMEM if part of it is not
+/// mapped); the kernel's own files are memory or generated, nothing to
+/// write back.
 pub fn msync(addr: u64, len: u64, flags: u64) -> SysResult {
+    msync_server(addr, len, flags, 0, 0)
+}
+
+/// msync for the Linux server (`restricted::SYS_VM_SYNC`): as `msync`; the
+/// shared mappings of cached objects (the server's page cache of disk
+/// files) in the range are the server's to write back with MS_SYNC: how
+/// many there are, the first `cap` stored at `out` as (key, first page,
+/// end page).
+pub fn msync_server(addr: u64, len: u64, flags: u64, out: u64, cap: u64) -> SysResult {
     const MS_ASYNC: u64 = 1;
     const MS_INVALIDATE: u64 = 2;
     const MS_SYNC: u64 = 4;
@@ -229,13 +238,21 @@ pub fn msync(addr: u64, len: u64, flags: u64) -> SysResult {
     }
     let end = addr.checked_add(page_up(len)).filter(|&e| e <= address_space::USER_END).ok_or(ENOMEM)?;
     let files = mm()?.lock().file_ranges(addr, end).ok_or(ENOMEM)?;
-    // Written back without the address space locked (write-back locks it).
-    if flags & MS_SYNC != 0 {
-        for (cache, pages) in files {
-            cache.writeback(pages).map_err(|_| EIO)?;
+    if flags & MS_SYNC == 0 {
+        return Ok(0);
+    }
+    let mut cached = 0u64;
+    for (cache, pages) in files {
+        if let Some(key) = cache.cached_key() {
+            if cached < cap {
+                let words = [key, pages.start, pages.end];
+                let bytes: alloc::vec::Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+                super::uaccess::copy_to_server(out + cached * 24, &bytes)?;
+            }
+            cached += 1;
         }
     }
-    Ok(0)
+    Ok(cached as i64)
 }
 
 /// madvise(2): DONTNEED/FREE drop private pages; other advice is accepted.

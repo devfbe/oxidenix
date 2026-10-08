@@ -73,10 +73,6 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
 /// Starts the user-space servers and mounts what they provide. Drivers
 /// and filesystems live in these processes, not in the kernel.
 fn start_servers() {
-    // Writes stores through shared mappings back to the disk.
-    if let Err(e) = process::sched::spawn_kernel_thread("flusher", fs::cache::flusher) {
-        printkln!("[boot] cannot start the flusher (errno {})", e);
-    }
     // Tears down channels whose ends went where the kernel could not sleep.
     if let Err(e) = process::sched::spawn_kernel_thread("channels", process::channel::worker) {
         printkln!("[boot] cannot start the channel worker (errno {})", e);
@@ -125,8 +121,9 @@ fn start_procfs() {
 /// servers/diskfs/src/blk.rs).
 const DISKFS_DMA_PAGES: u64 = 64;
 
-/// Hands the first virtio block device (legacy interface) to diskfs and
-/// mounts its ext2 filesystem at /data.
+/// Hands the first virtio block device (legacy interface) to diskfs, which
+/// serves its ext2 filesystem to the Linux server instances over the I/O
+/// rings (each mounts it at /data).
 fn start_diskfs() {
     let Some(disk) = drivers::pci::find(0x1af4, 0x1001) else {
         return printkln!("[boot] no virtio block device; /data is not mounted");
@@ -146,12 +143,8 @@ fn start_diskfs() {
         Err(e) => return printkln!("[boot] cannot load /sbin/diskfs (errno {})", e),
     };
     match server.start() {
-        Ok((service, root)) => {
-            if let Err(e) = fs::mount_remote(server, service, root as u32, "data", "/dev/vda", "ext2") {
-                printkln!("[boot] cannot mount /data (errno {})", e);
-            }
-        }
-        Err(e) => printkln!("[boot] diskfs did not start (errno {}); /data is not mounted", e),
+        Ok(_) => fs::record_mount("/dev/vda", "/data", "ext2"),
+        Err(e) => printkln!("[boot] diskfs did not start (errno {}); /data is not served", e),
     }
 }
 

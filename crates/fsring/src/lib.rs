@@ -18,8 +18,8 @@
 //! | `WRITE` | `object` inode, `offset`, buffer | bytes written (all of them), v0 = file size |
 //! | `FLUSH` | - | 0 once every write completed before it is durable |
 //! | `STAT` | `object` inode | 0, `Stat` in v0..v3 |
-//! | `LOOKUP` | `object` directory, buffer = name | v0 = inode |
-//! | `CREATE` | `object` directory, buffer = name, `arg` = [kind, permissions, target length]; a symlink's target follows the name in the grant | v0 = new inode |
+//! | `LOOKUP` | `object` directory, buffer = name | v0 = inode, v1 = its mode, v2 = its generation |
+//! | `CREATE` | `object` directory, buffer = name, `arg` = [kind, permissions, target length]; a symlink's target follows the name in the grant | v0 = new inode, v1 = its mode, v2 = its generation |
 //! | `UNLINK` | `object` directory, buffer = name, `arg[0]` = 1 for a directory | v0 = inode whose last link went (0: none) |
 //! | `RENAME` | `object` old directory, buffer = old name, `arg` = [new directory, new name length]; the new name follows the old one | as `UNLINK` (an entry replaced) |
 //! | `TRUNCATE` | `object` inode, `offset` = new size | 0 |
@@ -27,14 +27,16 @@
 //! | `RELEASE` | `object` inode | 0: the client holds it no more (see "Holds") |
 //! | `READLINK` | `object` symlink, buffer for the target | length of the target |
 //! | `SETPERM` | `object` inode, `arg[0]` = permission bits | 0 |
-//! | `STATFS` | - | 0, `Usage` in v0..v3 |
+//! | `STATFS` | - | 0, `Usage` in v0..v3 (sizes, counts, the largest file) |
 //! | `FORGET` | `grant` | 0 once no request on the grant is in flight and the service let go of it |
+//! | `PROMISE` | `object` inode, `offset`, `arg[0]` = length (at most `MAX_TRANSFER`) | 0 once the blocks a later `WRITE` of the range needs are kept for it (see "Promises"); ENOSPC |
 //!
 //! **Ordering.** Reads and writes run concurrently and complete in any
 //! order (the device reorders them); a write waits only for writes in
 //! flight on the same blocks of the same file. Every other operation is a
 //! barrier: it starts once every request taken before it (on any channel)
-//! completed, and none taken after it starts before it completed.
+//! completed, and none taken after it starts before it completed; except
+//! `FORGET` of a grant no request in flight uses, which completes at once.
 //!
 //! **Durability.** A completed `WRITE` is visible to every later request
 //! (on any channel, and to the kernel's IPC clients); it is durable only
@@ -61,6 +63,17 @@
 //! of its were still waiting in the submission ring rings the submission
 //! doorbell (`Producer::ring_doorbell`, a no-op unless the service sleeps),
 //! or they wait until its next request.
+//!
+//! **Promises.** A client that caches writes promises the range before it
+//! accepts a write into its cache (`PROMISE`, as delayed allocation
+//! reserves blocks): the service counts the data blocks the file lacks
+//! there and the indirect blocks they need against its free blocks
+//! (ENOSPC if they do not cover them), and no other allocation takes them
+//! until the `WRITE` that comes later does. Promising again what the same
+//! channel promised costs nothing. A promise ends when its blocks are
+//! written, truncated away or freed with the file, or when the channel
+//! goes; `STATFS` counts promised blocks as used. A `PROMISE` runs at
+//! once, like `FORGET`: it touches no file.
 //!
 //! **Grants.** The service keeps what it learnt of a grant (its size, the
 //! device addresses of its pages) until `FORGET`: the client sends it
@@ -96,6 +109,7 @@ pub mod op {
     pub const SETPERM: u16 = 13;
     pub const STATFS: u16 = 14;
     pub const FORGET: u16 = 15;
+    pub const PROMISE: u16 = 16;
 }
 
 /// The errors the protocol itself gives (others come from the filesystem).
@@ -175,6 +189,7 @@ pub enum Request {
     SetPerm { ino: u32, perm: u32 },
     Statfs,
     Forget { grant: u32 },
+    Promise { ino: u32, offset: u64, len: u64 },
 }
 
 /// The fields of a `Desc` an operation reads, for the check that the
@@ -278,6 +293,13 @@ impl Request {
             }
             op::SETPERM => (Request::SetPerm { ino: ino(d.object)?, perm: perm(d.arg[0])? }, Used { object: true, args: 1, ..NONE }),
             op::FORGET => (Request::Forget { grant: d.grant }, Used { grant: true, ..NONE }),
+            op::PROMISE => {
+                let len = d.arg[0];
+                if len > MAX_TRANSFER as u64 || d.offset.checked_add(len).is_none() {
+                    return Err(EINVAL);
+                }
+                (Request::Promise { ino: ino(d.object)?, offset: d.offset, len }, Used { object: true, offset: true, args: 1, ..NONE })
+            }
             _ => return Err(ENOSYS),
         };
         let unused = d.flags != 0
@@ -349,6 +371,11 @@ impl Request {
                 d.arg[0] = perm as u64;
             }
             Request::Forget { grant } => d.grant = grant,
+            Request::Promise { ino, offset, len } => {
+                d.object = ino as u64;
+                d.offset = offset;
+                d.arg[0] = len;
+            }
         }
         d
     }
@@ -370,6 +397,7 @@ impl Request {
             Request::SetPerm { .. } => op::SETPERM,
             Request::Statfs => op::STATFS,
             Request::Forget { .. } => op::FORGET,
+            Request::Promise { .. } => op::PROMISE,
         }
     }
 
@@ -429,17 +457,34 @@ pub struct Stat {
     pub atime: u32,
     pub mtime: u32,
     pub ctime: u32,
+    /// Changes whenever the inode number is given to a new file (ext2's
+    /// i_generation): a client that held an inode before a restart of the
+    /// service tells it from a new file of that number.
+    pub generation: u32,
 }
 
 impl Stat {
     /// v0 = mode | links << 32, v1 = size, v2 = atime | mtime << 32,
-    /// v3 = ctime.
+    /// v3 = ctime | generation << 32.
     pub fn to_values(&self) -> [u64; 4] {
-        [self.mode as u64 | (self.links as u64) << 32, self.size, self.atime as u64 | (self.mtime as u64) << 32, self.ctime as u64]
+        [
+            self.mode as u64 | (self.links as u64) << 32,
+            self.size,
+            self.atime as u64 | (self.mtime as u64) << 32,
+            self.ctime as u64 | (self.generation as u64) << 32,
+        ]
     }
 
     pub fn from_values(v: &[u64; 4]) -> Stat {
-        Stat { mode: v[0] as u32, links: (v[0] >> 32) as u32, size: v[1], atime: v[2] as u32, mtime: (v[2] >> 32) as u32, ctime: v[3] as u32 }
+        Stat {
+            mode: v[0] as u32,
+            links: (v[0] >> 32) as u32,
+            size: v[1],
+            atime: v[2] as u32,
+            mtime: (v[2] >> 32) as u32,
+            ctime: v[3] as u32,
+            generation: (v[3] >> 32) as u32,
+        }
     }
 }
 
@@ -451,17 +496,26 @@ pub struct Usage {
     pub free_blocks: u32,
     pub inodes: u32,
     pub free_inodes: u32,
+    /// The largest file the filesystem can hold (EFBIG beyond).
+    pub max_file_size: u64,
 }
 
 impl Usage {
     /// v0 = block size, v1 = blocks | free blocks << 32, v2 = inodes |
-    /// free inodes << 32.
+    /// free inodes << 32, v3 = the largest file size.
     pub fn to_values(&self) -> [u64; 4] {
-        [self.block_size as u64, self.blocks as u64 | (self.free_blocks as u64) << 32, self.inodes as u64 | (self.free_inodes as u64) << 32, 0]
+        [self.block_size as u64, self.blocks as u64 | (self.free_blocks as u64) << 32, self.inodes as u64 | (self.free_inodes as u64) << 32, self.max_file_size]
     }
 
     pub fn from_values(v: &[u64; 4]) -> Usage {
-        Usage { block_size: v[0] as u32, blocks: v[1] as u32, free_blocks: (v[1] >> 32) as u32, inodes: v[2] as u32, free_inodes: (v[2] >> 32) as u32 }
+        Usage {
+            block_size: v[0] as u32,
+            blocks: v[1] as u32,
+            free_blocks: (v[1] >> 32) as u32,
+            inodes: v[2] as u32,
+            free_inodes: (v[2] >> 32) as u32,
+            max_file_size: v[3],
+        }
     }
 }
 

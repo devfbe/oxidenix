@@ -42,6 +42,7 @@
 #define TEST_FS_RECORDS 1513
 #define TEST_CHANNEL 1514
 #define TEST_DISKRING 1515
+#define TEST_CACHED 1516
 
 static int failures;
 
@@ -407,7 +408,7 @@ int main(void) {
     if (d) closedir(d);
     check("readdir of a /tmp directory", names == 2);
     errno = 0;
-    check("rename between the server's tmpfs and the kernel's /data is EXDEV", rename("/tmp/lxfile", "/data/lxfile") == -1 && errno == EXDEV);
+    check("rename between the server's tmpfs and /data is EXDEV", rename("/tmp/lxfile", "/data/lxfile") == -1 && errno == EXDEV);
     errno = 0;
     check("removing the mount point /proc is EBUSY", rmdir("/proc") == -1 && errno == EBUSY);
     check("the root and its programs are the server's tmpfs (from the initramfs)",
@@ -470,8 +471,8 @@ int main(void) {
         if (r != 0) printf("    (scenario 9: check %d failed)\n", errno);
         check("diskfs ring: they complete once the client makes room", r == 0);
     }
-    /* What the ring wrote (and flushed), read through the kernel's /data
-     * (diskfs's IPC protocol): byte i is i % 251. */
+    /* What the ring wrote (and flushed), read through /data (the server's
+     * page cache, over its own channel): byte i is i % 251. */
     {
         int fd = open("/data/ringtest.bin", O_RDONLY);
         static unsigned char ring_buf[70000];
@@ -479,8 +480,21 @@ int main(void) {
         int same = n == (ssize_t)sizeof ring_buf;
         for (ssize_t i = 0; same && i < n; i++) same = ring_buf[i] == (unsigned char)(i % 251);
         if (fd >= 0) close(fd);
-        check("diskfs ring: a ring write read through the kernel's /data", same);
-        check("diskfs ring: its file removed through the kernel", unlink("/data/ringtest.bin") == 0);
+        check("diskfs ring: a ring write read through /data", same);
+        check("diskfs ring: its file removed through /data", unlink("/data/ringtest.bin") == 0);
+    }
+    /* The kernel's interface of the server's page cache. */
+    static const char *cached_scenarios[] = {
+        "page cache: a failed fill beyond the end leaves no trace",
+        "page cache: a long write-back scan goes on where the kernel says",
+        "page cache: a truncation does not wait for ever for a pinned page",
+        "page cache: a sync across instances hands out tickets and waits",
+    };
+    for (int i = 0; i < 4; i++) {
+        errno = 0;
+        long r = syscall(TEST_CACHED, i + 1);
+        if (r != 0) printf("    (scenario %d: check %d failed)\n", i + 1, errno);
+        check(cached_scenarios[i], r == 0);
     }
     printf("lxtest: %s\n", failures ? "FAILED" : "all passed");
     return failures != 0;

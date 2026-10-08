@@ -26,9 +26,9 @@ const ENOSPC_RING: i64 = 28;
 const EEXIST: i64 = 17;
 /// The data disk's README (userspace/disk), which the test reads back.
 const README: &[u8] = include_bytes!("../../../userspace/disk/README.txt");
-/// The file the test leaves for lxtest, which reads it through the
-/// kernel's /data (the IPC path) and removes it: `CROSS_LEN` bytes, byte
-/// `i` being `i % 251`.
+/// The file the test leaves for lxtest, which reads it through /data (the
+/// server's page cache, another channel) and removes it: `CROSS_LEN` bytes,
+/// byte `i` being `i % 251`.
 const CROSS: &[u8] = b"ringtest.bin";
 const CROSS_LEN: usize = 70_000;
 
@@ -379,7 +379,7 @@ fn writing() -> Result<(), i64> {
     let st = Stat::from_values(&c.call(Request::Stat { ino }).map_err(|_| 57)?.values);
     check!(58, st.mode & 0o7777 == 0o600);
     remove(&mut c, &names, b"ringtest.moved").map_err(|_| 59)?;
-    // The file lxtest reads through the kernel's /data.
+    // The file lxtest reads through /data.
     let ino = create(&mut c, &names, CROSS).map_err(|_| 60)?;
     let cross: Vec<u8> = (0..CROSS_LEN).map(|i| pattern(i, 0)).collect();
     src.write(0, &cross);

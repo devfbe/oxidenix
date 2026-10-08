@@ -66,7 +66,7 @@ pub enum Node {
     File(Arc<cache::PageCache>),
     Symlink(String),
     Device(Device),
-    /// An inode served by a user-space filesystem server (diskfs).
+    /// An inode served by a user-space filesystem server (procfs).
     Disk(DiskRef),
 }
 
@@ -155,10 +155,6 @@ impl Drop for DenyWrite {
 impl Drop for Inode {
     fn drop(&mut self) {
         release(self.charged);
-        // An unlinked remote file is freed once nothing refers to it anymore.
-        if let Node::Disk(d) = self.node.get_mut() {
-            d.fs.forget(d.ino);
-        }
     }
 }
 
@@ -244,9 +240,6 @@ impl Inode {
 
     pub fn size(&self) -> u64 {
         if let Some(d) = self.disk_ref() {
-            if let Some(c) = d.fs.cached(d.ino) {
-                return c.size();
-            }
             return d.fs.stat(d.ino).map_or(0, |s| s.size);
         }
         match &*self.node.lock() {
@@ -373,10 +366,6 @@ impl Inode {
         }
     }
 
-    /// The server of a file whose contents are not cached (procfs).
-    fn uncached(&self) -> Option<DiskRef> {
-        self.disk_ref().filter(|d| !d.fs.cacheable)
-    }
 
     /// Only regular files have contents to read or write.
     fn require_regular(&self) -> Result<(), i64> {
@@ -388,32 +377,15 @@ impl Inode {
     }
 
     pub fn read_at(&self, off: u64, buf: &mut [u8]) -> Result<usize, i64> {
-        if let Some(d) = self.uncached() {
+        if let Some(d) = self.disk_ref() {
             self.require_regular()?;
             return d.fs.read(d.ino, off, buf);
         }
         self.cache()?.read(off, buf)
     }
 
-    /// A read past the page cache (O_DIRECT).
-    pub fn read_direct(&self, off: u64, buf: &mut [u8]) -> Result<usize, i64> {
-        if self.uncached().is_some() {
-            return self.read_at(off, buf);
-        }
-        self.cache()?.read_direct(off, buf)
-    }
-
-    /// Writes this file's dirty pages back (fsync).
-    pub fn sync(&self) -> Result<(), i64> {
-        match self.cache() {
-            Ok(c) => c.writeback(0..u64::MAX),
-            // Nothing cached, nothing to write.
-            Err(_) => Ok(()),
-        }
-    }
-
     pub fn write_at(&self, off: u64, buf: &[u8]) -> Result<usize, i64> {
-        if let Some(d) = self.uncached() {
+        if let Some(d) = self.disk_ref() {
             self.require_regular()?;
             return d.fs.write(d.ino, off, buf);
         }
@@ -421,20 +393,20 @@ impl Inode {
     }
 
     pub fn truncate(&self, len: u64) -> Result<(), i64> {
-        if let Some(d) = self.uncached() {
+        if let Some(d) = self.disk_ref() {
             self.require_regular()?;
             return d.fs.truncate(d.ino, len);
         }
         self.cache()?.truncate(len)
     }
 
-    /// The page cache of a regular file (EISDIR, EINVAL for others). A
-    /// file on a filesystem server gets one from its filesystem (where it
-    /// outlives this inode); ENODEV if that filesystem caches nothing. No inode lock is held while the cache is
-    /// used: its operations may sleep.
+    /// The page cache of a regular file (EISDIR, EINVAL for others; ENODEV
+    /// for a file of a filesystem server: generated on every read, it has
+    /// none). No inode lock is held while the cache is used: its
+    /// operations may sleep.
     pub fn cache(&self) -> Result<Arc<cache::PageCache>, i64> {
-        if let Some(d) = self.disk_ref() {
-            return d.fs.page_cache(d.ino);
+        if self.disk_ref().is_some() {
+            return Err(ENODEV);
         }
         match &*self.node.lock() {
             Node::File(c) => Ok(c.clone()),
@@ -588,8 +560,7 @@ pub fn mount_remote(
     device: &str,
     fstype: &str,
 ) -> Result<(), i64> {
-    // Only a disk filesystem's files keep their contents between reads.
-    let fs = remote::RemoteFs::new(service, server, fstype == "ext2");
+    let fs = remote::RemoteFs::new(service, server);
     let root = root();
     if let Ok(old) = root.child(name) {
         for (entry, _, _) in old.list()? {
@@ -603,14 +574,16 @@ pub fn mount_remote(
     if name == "proc" {
         PROC_SERVED.store(true, Ordering::Relaxed);
     }
-    write_proc_mounts(&alloc::format!("{device} /{name} {fstype} rw 0 0\n"));
-    if fstype == "ext2" {
-        let (bs, blocks, free, _, _) = fs.usage();
-        crate::printkln!("[fs] /{} mounted from user-space server ({} of {} KiB free)", name, free * bs / 1024, blocks * bs / 1024);
-    } else {
-        crate::printkln!("[fs] /{} mounted from user-space server ({})", name, fstype);
-    }
+    record_mount(device, &alloc::format!("/{name}"), fstype);
+    crate::printkln!("[fs] /{} mounted from user-space server ({})", name, fstype);
     Ok(())
+}
+
+/// Lists a mount in /proc/mounts: the kernel's own, and diskfs's disk,
+/// which every Linux server instance mounts at /data (until procfs is the
+/// server's, /proc/mounts is the kernel's list).
+pub fn record_mount(device: &str, at: &str, fstype: &str) {
+    write_proc_mounts(&alloc::format!("{device} {at} {fstype} rw 0 0\n"));
 }
 
 /// Whether a procfs server provides /proc (then no static files are written).

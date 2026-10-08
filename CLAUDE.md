@@ -50,11 +50,13 @@ An AI research project; see README.md.
     (ABI constants, documented), `kernel/src/process/linux.rs`, `linux_inode.rs`;
     design in `docs/design/linux-server.md`.
   - The Linux server: `servers/linux/src/main.rs` (dispatch order mm → time → files → paths →
-    pass-through), `namespace.rs`/`paths.rs` (paths, mounts), `tmpfs.rs`/`tmpfile.rs` (root fs).
+    pass-through), `namespace.rs`/`paths.rs` (paths, mounts), `tmpfs.rs`/`tmpfile.rs` (root fs),
+    `datafs.rs`/`datafile.rs`/`fsclient.rs` (`/data` and its page cache over the I/O rings).
   - Memory: `kernel/src/memory/`, `kernel/src/process/address_space.rs`, page cache
     `kernel/src/fs/cache.rs`.
-  - Other servers and their protocols: `servers/diskfs` + `crates/fsproto` + `crates/ext2fs`,
-    `servers/netd` + `crates/netproto`, `servers/procfs` + `crates/procproto`; I/O rings
+  - Other servers and their protocols: `servers/diskfs` + `crates/fsring` + `crates/ext2fs`,
+    `servers/netd` + `crates/netproto`, `servers/procfs` + `crates/procproto` + `crates/fsproto`
+    (the kernel's `RemoteFs`); I/O rings
     `crates/ring`, `docs/design/io-rings.md`.
   - Tests: C programs in `userspace/*.c` (built by `userspace/build.sh`), run by the list in
     `userspace/rootfs/etc/runtests.sh`; benchmarks `userspace/iobench.c`, `scripts/bench.sh`,

@@ -407,28 +407,10 @@ impl Channel {
         first.checked_add(pages).ok_or(EINVAL)?;
         // A slot and the pages first, released below on failure (and only
         // by this call: a teardown meanwhile leaves them alone).
-        {
-            let mut inner = self.inner.lock();
-            if inner.service_gone || inner.client_gone {
-                return Err(EPIPE);
-            }
-            if inner.service.is_none() {
-                return Err(ENOTCONN);
-            }
-            if inner.grants.live + inner.reserved >= MAX_GRANTS || inner.pages + pages > MAX_GRANTED_PAGES {
-                return Err(ENOSPC);
-            }
-            inner.reserved += 1;
-            inner.pages += pages;
-        }
-        let unreserve = || {
-            let mut inner = self.inner.lock();
-            inner.reserved -= 1;
-            inner.pages -= pages;
-        };
+        self.reserve(pages)?;
         let mut frames = Vec::new();
         if frames.try_reserve_exact(pages as usize).is_err() {
-            unreserve();
+            self.unreserve(pages);
             return Err(ENOMEM);
         }
         for i in 0..pages {
@@ -438,11 +420,78 @@ impl Channel {
                     for (j, frame) in frames.into_iter().enumerate() {
                         object.unpin(first + j as u64, frame);
                     }
-                    unreserve();
+                    self.unreserve(pages);
                     return Err(e);
                 }
             }
         }
+        self.enter(object, first, frames, writable, pages)
+    }
+
+    /// Grants a run of a cached object's pages to be filled (`fill`:
+    /// missing ones, made pending, `PageCache::pin_fill`) or written back
+    /// (dirty ones, `pin_dirty`) among the `pages` from byte `offset` (see
+    /// `restricted::GRANT_FILL`): the grant's id, the run's first page, its
+    /// length and the file's size then.
+    pub fn grant_run(&self, object: &Arc<PageCache>, offset: u64, pages: u64, fill: bool, writable: bool) -> Result<(u32, u64, u64, u64), crate::fs::cache::Scan> {
+        use crate::fs::cache::Scan;
+        if offset % PAGE != 0 || pages == 0 {
+            return Err(Scan::Errno(EINVAL));
+        }
+        let window = pages;
+        let pages = pages.min(crate::fs::cache::MAX_RUN);
+        self.reserve(pages).map_err(Scan::Errno)?;
+        let pinned = if fill { object.pin_fill(offset / PAGE, window) } else { object.pin_dirty(offset / PAGE, window) };
+        let (first, frames, size) = match pinned {
+            Ok(run) => run,
+            Err(e) => {
+                self.unreserve(pages);
+                return Err(e);
+            }
+        };
+        let count = frames.len() as u64;
+        // Only what the run took stays reserved.
+        self.inner.lock().pages -= pages - count;
+        match self.enter(object, first, frames, writable, count) {
+            Ok(id) => Ok((id, first, count, size)),
+            Err(e) => {
+                // Nobody will fill or write them: pending pages go again,
+                // dirty ones are dirty again.
+                let _ = if fill { object.filled(first, count, false) } else { object.redirty(first, count) };
+                Err(Scan::Errno(e))
+            }
+        }
+    }
+
+    /// Reserves a grant's slot and `pages` pages (EPIPE once an end is
+    /// gone, ENOTCONN before the service attached, ENOSPC beyond the
+    /// limits); `unreserve` and `enter` give them back.
+    fn reserve(&self, pages: u64) -> Result<(), i64> {
+        let mut inner = self.inner.lock();
+        if inner.service_gone || inner.client_gone {
+            return Err(EPIPE);
+        }
+        if inner.service.is_none() {
+            return Err(ENOTCONN);
+        }
+        if inner.grants.live + inner.reserved >= MAX_GRANTS || inner.pages + pages > MAX_GRANTED_PAGES {
+            return Err(ENOSPC);
+        }
+        inner.reserved += 1;
+        inner.pages += pages;
+        Ok(())
+    }
+
+    fn unreserve(&self, pages: u64) {
+        let mut inner = self.inner.lock();
+        inner.reserved -= 1;
+        inner.pages -= pages;
+    }
+
+    /// Makes the pinned `frames` (pages from `first` of `object`) a grant
+    /// under the slot and `pages` pages reserved for it; on failure they
+    /// are unpinned and the reservation goes.
+    fn enter(&self, object: &Arc<PageCache>, first: u64, frames: Vec<PhysFrame>, writable: bool, pages: u64) -> Result<u32, i64> {
         let grant = Grant {
             object: object.clone(),
             first,
@@ -451,8 +500,11 @@ impl Channel {
             state: Mutex::new(GrantState::default()),
             quarantined: spin::Mutex::new(None),
         };
+        // (Dropping the grant unpins its frames.)
         let Ok(grant) = Arc::try_new(grant) else {
-            unreserve();
+            let mut inner = self.inner.lock();
+            inner.reserved -= 1;
+            inner.pages -= pages;
             return Err(ENOMEM);
         };
         let mut inner = self.inner.lock();
@@ -956,6 +1008,22 @@ pub fn run_deferred() {
             node
         };
         node.work.run();
+    }
+}
+
+/// Waits until no channel is left (every client's end went and each
+/// service let go of its channels: diskfs released what the clients held),
+/// at most until `deadline`: for a shutdown. Whether none is.
+pub fn settle(deadline: u64) -> bool {
+    loop {
+        run_deferred();
+        if CHANNELS.lock().iter().all(|e| e.channel.strong_count() == 0) {
+            return true;
+        }
+        if crate::time::now() >= deadline {
+            return false;
+        }
+        super::sched::prepare_to_sleep().sleep_until(crate::time::now() + 10_000_000);
     }
 }
 
