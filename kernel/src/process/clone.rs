@@ -103,12 +103,12 @@ pub fn clone(frame: &Frame, flags: u64, stack: u64, parent_tid: u64, child_tid: 
     let mm = if flags & CLONE_VM != 0 {
         parent.mm()?
     } else {
-        let mut space = parent.mm()?.lock().clone_user().map_err(|_| ENOMEM)?;
+        let mm = Mm::fork(&parent.mm()?.lock()).map_err(|_| ENOMEM)?;
         if flags & CLONE_CHILD_SETTID != 0 {
-            // Written into the child's copy only.
-            space.write_user(child_tid, &(tid as u32).to_le_bytes()).map_err(|_| EFAULT)?;
+            // Written into the child's copy only (with the parent unlocked).
+            mm.write_user(child_tid, &(tid as u32).to_le_bytes()).map_err(|_| EFAULT)?;
         }
-        Mm::new(space).ok_or(ENOMEM)?
+        mm
     };
     let files = if flags & CLONE_FILES != 0 { parent.files()?.clone() } else { parent.files()?.duplicate().ok_or(ENOMEM)? };
     let fs = match (&parent.fs, flags & CLONE_FS != 0) {

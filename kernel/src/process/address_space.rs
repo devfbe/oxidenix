@@ -2,7 +2,7 @@
 //! say what each address range is.
 //!
 //! Memory is demand-paged: `mmap`, `brk` and the stack only create areas;
-//! a page gets a frame on its first access (`fault`), which also performs
+//! a page gets a frame on its first access (`handle_fault`), which also performs
 //! copy-on-write and grows stacks downwards. Faults of the kernel's own
 //! accesses to user memory (`uaccess`) are handled the same way.
 //!
@@ -310,6 +310,61 @@ impl Mm {
     /// thread holds it; never taken in interrupt context or with a spinlock.
     pub fn lock(&self) -> MutexGuard<'_, AddressSpace> {
         self.space.lock()
+    }
+
+    /// fork: a new address space with a copy-on-write copy of `parent`
+    /// (locked by the caller), see `AddressSpace::copy_from`. The child is
+    /// an `Mm` before it gets anything, so that it is among the mappers of
+    /// every file it maps before it gets copies of the parent's entries
+    /// (lock order: parent, then child, then a cache's list of mappers).
+    pub fn fork(parent: &AddressSpace) -> Result<Arc<Mm>, Fault> {
+        let child = Mm::new(AddressSpace::new().ok_or(Fault::Oom)?).ok_or(Fault::Oom)?;
+        // On failure the child goes; caches skip (and later drop) its
+        // registrations, which no longer reach an address space.
+        child.lock().copy_from(parent)?;
+        Ok(child)
+    }
+
+    /// Writes `data` at `addr` as a user write would (the area must be
+    /// writable), from a thread that may not run in this space (fork's
+    /// CLONE_CHILD_SETTID into the child). A page or its backing from a
+    /// pager is waited for with the space unlocked, as a fault does.
+    pub fn write_user(&self, addr: u64, data: &[u8]) -> Result<(), Fault> {
+        self.retrying(|space| space.write_as(addr, data, true, false))
+    }
+
+    /// Runs `op` on the locked space until it no longer asks for a page
+    /// (`Fault::Retry`, the page in `awaited`), which is waited for with
+    /// the space unlocked: a pager may need to lock it meanwhile
+    /// (write-back write-protects every mapping of a file). `op` must be
+    /// fine to run again from the start.
+    fn retrying(&self, mut op: impl FnMut(&mut AddressSpace) -> Result<(), Fault>) -> Result<(), Fault> {
+        // The page waited for, with a reference of ours until `op` was
+        // tried again: reclaim cannot take it in between, so the next try
+        // finds it (unless the mapping or the file changed meanwhile).
+        let mut held: Option<PhysFrame> = None;
+        let mut tries = 0;
+        loop {
+            let (result, awaited) = {
+                let mut space = self.lock();
+                let result = op(&mut space);
+                (result, space.awaited.take())
+            };
+            if let Some(frame) = held.take() {
+                PageCache::put_frame(frame);
+            }
+            tries += 1;
+            match (result, awaited) {
+                // (A file that keeps changing under it ends it after a few
+                // tries.)
+                (Err(Fault::Retry), Some((cache, index, backed))) if tries < MAX_FAULT_TRIES => match cache.wait_page(index, backed) {
+                    Ok(frame) => held = frame,
+                    Err(_) => return Err(Fault::Bus),
+                },
+                (Err(Fault::Retry), _) => return Err(Fault::Bus),
+                (result, _) => return result,
+            }
+        }
     }
 }
 
@@ -728,17 +783,13 @@ impl AddressSpace {
 
     /// Satisfies an access to `va`: maps a frame on first use, copies a
     /// copy-on-write page on a write, grows a stack. Works on any address
-    /// space (the loader fills spaces that are not active yet). Waits for a
-    /// pager's page or backing with the space held, so only for a space
-    /// no one else can lock yet (`handle_fault` waits with it unlocked).
-    pub fn fault(&mut self, va: u64, access: Access) -> Result<(), Fault> {
-        self.fault_or_retry(va, access, true)
-    }
-
-    /// `fault`; without `wait`, a page that must come from a pager first is
-    /// asked for and `Fault::Retry` returned (the page in `awaited`), so the
-    /// caller can wait with the space unlocked: a pager may need to lock
-    /// it meanwhile (write-back write-protects every mapping of a file).
+    /// space (the loader fills spaces that are not active yet). With
+    /// `wait`, waits for a pager's page or backing with the space held, so
+    /// only for a space no one else can lock yet (the loader's); without,
+    /// such a page is asked for and `Fault::Retry` returned (the page in
+    /// `awaited`), so the caller can wait with the space unlocked
+    /// (`Mm::retrying`): a pager may need to lock it meanwhile (write-back
+    /// write-protects every mapping of a file).
     fn fault_or_retry(&mut self, va: u64, access: Access, wait: bool) -> Result<(), Fault> {
         if va >= USER_END {
             return Err(Fault::Segv);
@@ -911,7 +962,7 @@ impl AddressSpace {
     /// backed yet is asked of the pager; without `wait` the caller waits
     /// for it with the space unlocked (`Fault::Retry`, the page in
     /// `awaited`); with `wait` (a space no one else can lock yet: the
-    /// loader's, a fork child's copy) it is waited for here, killably and
+    /// loader's) it is waited for here, killably and
     /// as often as a fault tries. Bus if the file was truncated, the disk
     /// is full or the pager failed.
     fn dirty_backed(&mut self, cache: &Arc<PageCache>, index: u64, wait: bool) -> Result<(), Fault> {
@@ -933,14 +984,15 @@ impl AddressSpace {
     }
 
     /// A kernel store of `data` at `va` (within one page) into a shared
-    /// mapping of a disk file, as a user store if `user`. Unlike a user
-    /// store, it leaves the page's entry as it is: the space may be no
-    /// file's mapper yet (a fork child's copy), so write-back could not
-    /// write-protect an entry made writable here. The data goes into the
-    /// cache frame once the page is backed (`dirty_backed`), and the page
-    /// is marked dirty again after the copy, so a write-back that cleaned
-    /// it while the copy ran is followed by another.
-    fn store_to_file(&mut self, va: u64, data: &[u8], user: bool) -> Result<(), Fault> {
+    /// mapping of a disk file, as a user store if `user`; `wait` as for a
+    /// fault (`fault_or_retry`). Unlike a user store, it leaves the page's
+    /// entry as it is: the space may be no file's mapper yet (the
+    /// loader's), so write-back could not write-protect an entry made
+    /// writable here. The data goes into the cache frame once the page is
+    /// backed (`dirty_backed`), and the page is marked dirty again after
+    /// the copy, so a write-back that cleaned it while the copy ran is
+    /// followed by another.
+    fn store_to_file(&mut self, va: u64, data: &[u8], user: bool, wait: bool) -> Result<(), Fault> {
         let page = page_down(va);
         let v = self.vma(page).cloned().ok_or(Fault::Segv)?;
         let Backing::File { cache, offset, .. } = &v.backing else { return Err(Fault::Segv) };
@@ -948,11 +1000,18 @@ impl AddressSpace {
             return Err(Fault::Segv);
         }
         let index = (offset + (page - v.start)) / PAGE;
-        self.fault(va, Access { write: false, exec: false })?;
-        self.dirty_backed(cache, index, true)?;
+        self.fault_or_retry(va, Access { write: false, exec: false }, wait)?;
+        self.dirty_backed(cache, index, wait)?;
         // The cache's frame (the entry's may be stale if the page was
-        // reclaimed or cut meanwhile: this space is no mapper yet).
-        let frame = cache.try_map_page(index, true)?.ok_or(Fault::Bus)?;
+        // reclaimed or cut meanwhile in a space that is no mapper yet).
+        let frame = match cache.try_map_page(index, wait)? {
+            Some(frame) => frame,
+            None if !wait => {
+                self.awaited = Some((cache.clone(), index, false));
+                return Err(Fault::Retry);
+            }
+            None => return Err(Fault::Bus),
+        };
         unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), memory::phys_to_virt(frame.start_address().as_u64() + va % PAGE), data.len()) };
         PageCache::put_frame(frame);
         // Already backed: only the dirty mark (Gone: truncated meanwhile,
@@ -1105,34 +1164,32 @@ impl AddressSpace {
     /// (copy-on-write, or a file's page cache) is copied first, unless the
     /// area is shared memory; a disk file's page is backed and marked
     /// dirty (`store_to_file`). The space must be one no one else can lock
-    /// yet (the loader's, a fork child's copy): a page or its backing is
-    /// waited for here.
+    /// yet (the loader's): a page or its backing is waited for here.
+    /// (`Mm::write_user` writes into a space others can reach.)
     pub fn write(&mut self, addr: u64, data: &[u8]) -> Result<(), Fault> {
-        self.write_as(addr, data, false)
+        self.write_as(addr, data, false, true)
     }
 
-    /// Writes into the address space as a user write would (the area must
-    /// be writable), also when it is not active (a fork child's copy).
-    pub fn write_user(&mut self, addr: u64, data: &[u8]) -> Result<(), Fault> {
-        self.write_as(addr, data, true)
-    }
-
-    fn write_as(&mut self, addr: u64, data: &[u8], user: bool) -> Result<(), Fault> {
+    /// `write`, as a user write if `user` (the area must be writable);
+    /// `wait` as for a fault (`fault_or_retry`). Without it the caller
+    /// waits and runs it again from the start (writing the same data
+    /// twice changes nothing).
+    fn write_as(&mut self, addr: u64, data: &[u8], user: bool, wait: bool) -> Result<(), Fault> {
         let mut done = 0;
         while done < data.len() {
             let va = addr + done as u64;
             let page = page_down(va);
             let chunk = ((PAGE - va % PAGE) as usize).min(data.len() - done);
             if self.vma(page).is_some_and(|v| v.backing.tracks_dirty()) {
-                self.store_to_file(va, &data[done..done + chunk], user)?;
+                self.store_to_file(va, &data[done..done + chunk], user, wait)?;
                 done += chunk;
                 continue;
             }
-            self.fault(va, Access { write: user, exec: false })?;
+            self.fault_or_retry(va, Access { write: user, exec: false }, wait)?;
             let v = self.vma(page).cloned().ok_or(Fault::Segv)?;
             if v.prot.write {
                 if leaf_entry(self.l4, page).is_some_and(|e| e.flags().contains(COW)) {
-                    self.break_cow(page, &v, true)?;
+                    self.break_cow(page, &v, wait)?;
                 }
             } else if !v.backing.shared() {
                 self.privatize(page)?;
@@ -1214,29 +1271,47 @@ impl AddressSpace {
 
     // -------------------------------------------------------------- fork
 
-    /// Copy-on-write clone for fork: both spaces share every private frame
-    /// (writable pages become read-only COW pages in both); shared memory
-    /// stays shared. The child's writable private memory is committed again
-    /// (it may diverge), so fork can fail with ENOMEM.
-    pub fn clone_user(&self) -> Result<AddressSpace, Fault> {
-        let charged: u64 = self.vmas.values().filter(|v| v.charged).map(|v| v.pages()).sum();
+    /// fork's copy of `parent` into this new, empty space (`Mm::fork`, which
+    /// holds both locks): both share every private frame (writable pages
+    /// become read-only COW pages in both); shared memory stays shared,
+    /// with the parent's rights. The child's writable private memory is
+    /// committed again (it may diverge), so fork can fail with ENOMEM; a
+    /// partial copy goes with the space.
+    ///
+    /// The child becomes a mapper of every file it inherits an area of
+    /// before it gets any entry: a truncation or write-back that the copy
+    /// could precede then reaches the child's copy as it reaches the
+    /// parent's (see `PageCache::for_each_mapper`). So the child's copy of
+    /// a writable entry of a dirty disk-file page stays writable: a
+    /// write-back write-protects it like the parent's.
+    fn copy_from(&mut self, parent: &AddressSpace) -> Result<(), Fault> {
+        debug_assert!(self.vmas.is_empty() && self.owner.strong_count() > 0);
+        let charged: u64 = parent.vmas.values().filter(|v| v.charged).map(|v| v.pages()).sum();
         if !memory::commit(charged) {
             return Err(Fault::Oom);
         }
-        let Some(mut new) = AddressSpace::new() else {
-            memory::uncommit(charged);
-            return Err(Fault::Oom);
-        };
         // Granted pages are the service's alone: a child does not get them.
-        new.vmas = self.vmas.iter().filter(|(_, v)| !matches!(v.backing, Backing::Granted { .. } | Backing::Revoked { .. })).map(|(&k, v)| (k, v.clone())).collect();
-        new.stats.virt_pages.store(new.vmas.values().map(|v| v.pages()).sum(), Ordering::Relaxed);
-        let mut mapper = new.mapper();
-        let parent = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
-        let vmas = &self.vmas;
-        // Return errors only outside of with_frames: dropping `new` needs the lock.
+        let vmas: BTreeMap<u64, Vma> = parent
+            .vmas
+            .iter()
+            .filter(|(_, v)| !matches!(v.backing, Backing::Granted { .. } | Backing::Revoked { .. }))
+            .map(|(&k, v)| (k, v.clone()))
+            .collect();
+        for (cache, _) in vmas.values().filter_map(Vma::file) {
+            if let Err(e) = cache.register(&self.owner) {
+                memory::uncommit(charged);
+                return Err(e);
+            }
+        }
+        // From here on the areas' commit is released with the space.
+        self.vmas = vmas;
+        self.stats.virt_pages.store(self.vmas.values().map(|v| v.pages()).sum(), Ordering::Relaxed);
+        let mut mapper = self.mapper();
+        let table_flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+        let (vmas, stats) = (&parent.vmas, &self.stats);
         let result = memory::with_frames(|frames| {
             let mut frames = UserFrames(frames);
-            let l4 = table_at(self.l4);
+            let l4 = table_at(parent.l4);
             for i4 in 0..256 {
                 for (i3, l3e) in children(&l4[i4]) {
                     for (i2, l2e) in children(l3e) {
@@ -1254,23 +1329,14 @@ impl AddressSpace {
                                 flags.insert(COW);
                                 leaf.set_flags(flags);
                             }
-                            // A page whose stores must mark it dirty is the
-                            // child's read-only (its own first store faults
-                            // and marks it): the child is not among the
-                            // file's mappers yet, so a write-back meanwhile
-                            // could not write-protect it.
-                            if shared && area.is_some_and(|v| v.backing.tracks_dirty()) && flags.contains(PageTableFlags::WRITABLE) {
-                                flags.remove(PageTableFlags::WRITABLE);
-                                flags.insert(COW);
-                            }
                             let frame = PhysFrame::containing_address(leaf.addr());
                             let page = Page::<Size4KiB>::containing_address(VirtAddr::new(va));
-                            unsafe { mapper.map_to_with_table_flags(page, frame, flags, parent, &mut frames) }
+                            unsafe { mapper.map_to_with_table_flags(page, frame, flags, table_flags, &mut frames) }
                                 .map_err(|_| Fault::Oom)?
                                 .ignore();
                             // Only a successful mapping owns a reference.
                             frames.0.share(frame);
-                            new.stats.add_resident(1);
+                            stats.add_resident(1);
                         }
                     }
                 }
@@ -1279,15 +1345,15 @@ impl AddressSpace {
         });
         // The parent's pages just lost their write permission, also for
         // its other threads.
-        tlb::shootdown(&self.tlb, 0, USER_END);
-        new.brk_start = self.brk_start;
-        new.brk_end = self.brk_end;
-        new.exe = self.exe.clone();
-        if let Some(instance) = &self.instance {
-            new.attach(instance.clone(), self.program)?;
+        tlb::shootdown(&parent.tlb, 0, USER_END);
+        result?;
+        self.brk_start = parent.brk_start;
+        self.brk_end = parent.brk_end;
+        self.exe = parent.exe.clone();
+        if let Some(instance) = &parent.instance {
+            self.attach(instance.clone(), parent.program)?;
         }
-        // (The child registers with the file caches when it gets its Mm.)
-        result.map(|_| new)
+        Ok(())
     }
 }
 
@@ -1436,33 +1502,9 @@ const MAX_FAULT_TRIES: u32 = 16;
 /// a file page may be read), so interrupts must be enabled.
 pub fn handle_fault(va: u64, access: Access) -> Result<(), Fault> {
     let mm = super::current_mm().ok_or(Fault::Segv)?;
-    // The page waited for, with a reference of ours until the fault was
-    // tried again: reclaim cannot take it in between, so the next try
-    // finds it (unless the mapping or the file changed meanwhile).
-    let mut held: Option<PhysFrame> = None;
-    let mut tries = 0;
-    let result = loop {
-        let (result, awaited) = {
-            let mut space = mm.lock();
-            let result = space.fault_or_retry(va, access, false);
-            (result, space.awaited.take())
-        };
-        if let Some(frame) = held.take() {
-            PageCache::put_frame(frame);
-        }
-        tries += 1;
-        match (result, awaited) {
-            // The page comes from a pager: waited for with the space
-            // unlocked, then the fault is tried again. (A file that keeps
-            // changing under the fault ends it after a few tries.)
-            (Err(Fault::Retry), Some((cache, index, backed))) if tries < MAX_FAULT_TRIES => match cache.wait_page(index, backed) {
-                Ok(frame) => held = frame,
-                Err(_) => break Err(Fault::Bus),
-            },
-            (Err(Fault::Retry), _) => break Err(Fault::Bus),
-            (result, _) => break result,
-        }
-    };
+    // A page from a pager is waited for with the space unlocked, then the
+    // fault is tried again.
+    let result = mm.retrying(|space| space.fault_or_retry(va, access, false));
     if access.write && result.is_ok() {
         // The store may have made a page dirty: too many, and this writer
         // writes back (with no lock held).

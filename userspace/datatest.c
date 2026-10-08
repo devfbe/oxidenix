@@ -2,7 +2,8 @@
  * the kernel, descriptors and mappings of a file share one page cache,
  * write() leaves dirty pages that fsync makes durable (an O_DIRECT read
  * fetches the device's copy), children's stores survive write-back around
- * fork and mprotect, truncation reaches mappings, many readers
+ * fork and mprotect, truncation reaches mappings (a fork child's copy
+ * too, also when the two race), many readers
  * and writers at once see consistent data, a file larger than the memory
  * the cache may use is written and read back whole, a read finds room
  * when dirty pages fill memory, and a full disk fails write() itself with
@@ -202,8 +203,9 @@ static void truncation(void) {
 
 /* A child's store into a shared mapping it inherited reaches the disk,
  * whatever write-back ran around the fork (a thread keeps writing the
- * file back meanwhile): the child's copy of a page whose stores must mark
- * it dirty is read-only until its first store. */
+ * file back meanwhile): the child is among the file's mappers before it
+ * gets copies of the parent's entries, so write-back write-protects the
+ * child's copy of a page as it does the parent's. */
 static volatile int syncing;
 static int sync_fd;
 
@@ -250,6 +252,80 @@ static void fork_and_writeback(void) {
     check("children's stores reach the disk with write-back around fork", good);
     munmap(m, PG);
     close(fd);
+    unlink(path);
+}
+
+/* A fork racing a truncation of a file the parent maps shared: the child's
+ * copy of the mapping is reached by the truncation like the parent's, so
+ * once ftruncate returned the child's accesses beyond the new end raise
+ * SIGBUS, never show the cut pages' old data. A thread truncates while the
+ * main thread forks, at a delay that sweeps across the fork. */
+#define FT_PAGES 8
+#define FT_ROUNDS 400
+static volatile int *ft_flags; /* [0]: go, [1]: truncated (shared with children) */
+static int ft_fd;
+static volatile int ft_delay, ft_stop;
+
+static void *ft_truncator(void *arg) {
+    (void)arg;
+    for (;;) {
+        while (!__atomic_load_n(&ft_flags[0], __ATOMIC_ACQUIRE))
+            if (ft_stop) return NULL;
+        for (volatile int i = 0; i < ft_delay; i++) {
+        }
+        ftruncate(ft_fd, PG);
+        __atomic_store_n(&ft_flags[0], 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&ft_flags[1], 1, __ATOMIC_RELEASE);
+    }
+}
+
+static void fork_and_truncate(void) {
+    const char *path = "/data/datatest.forktrunc";
+    ft_fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    ft_flags = mmap(NULL, PG, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    char *m = mmap(NULL, FT_PAGES * PG, PROT_READ | PROT_WRITE, MAP_SHARED, ft_fd, 0);
+    if (ft_fd < 0 || m == MAP_FAILED || ft_flags == MAP_FAILED) {
+        check("fork and truncation: mapping", 0);
+        return;
+    }
+    pthread_t t;
+    ft_stop = 0;
+    pthread_create(&t, NULL, ft_truncator, NULL);
+    int good = 1, stale = 0, forks = 0;
+    for (int round = 0; round < FT_ROUNDS && good; round++) {
+        good &= ftruncate(ft_fd, FT_PAGES * PG) == 0;
+        for (int p = 1; p < FT_PAGES; p++) m[p * PG] = 'X';
+        ft_flags[1] = 0;
+        ft_delay = (round * 97) % 20000;
+        __atomic_store_n(&ft_flags[0], 1, __ATOMIC_RELEASE);
+        pid_t kid = fork();
+        if (kid == 0) {
+            while (!__atomic_load_n(&ft_flags[1], __ATOMIC_ACQUIRE)) {
+            }
+            int old = 0;
+            for (int p = 1; p < FT_PAGES; p++)
+                if (faults(m + p * PG) != SIGBUS) old++;
+            _exit(old ? 1 : 0);
+        }
+        if (kid < 0) {
+            good = 0;
+            break;
+        }
+        forks++;
+        int status;
+        waitpid(kid, &status, 0);
+        good &= WIFEXITED(status);
+        if (WIFEXITED(status) && WEXITSTATUS(status) != 0) stale++;
+        while (!__atomic_load_n(&ft_flags[1], __ATOMIC_ACQUIRE)) {
+        }
+    }
+    ft_stop = 1;
+    pthread_join(t, NULL);
+    printf("    (%d forks racing a truncation, %d children saw cut pages)\n", forks, stale);
+    check("a fork racing a truncation: the child's cut pages raise SIGBUS", good && stale == 0);
+    munmap(m, FT_PAGES * PG);
+    munmap((void *)ft_flags, PG);
+    close(ft_fd);
     unlink(path);
 }
 
@@ -577,6 +653,7 @@ int main(void) {
     durability();
     truncation();
     fork_and_writeback();
+    fork_and_truncate();
     reprotect();
     readers();
     writers();
