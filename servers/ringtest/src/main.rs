@@ -136,7 +136,7 @@ fn serve(channel: u64, base: *mut u8) {
     let (mut requests, mut completions) = (sub.consumer(), comp.producer());
     let mut mapped: Vec<Mapped> = Vec::new();
     while let Some(d) = requests.pop_wait_while(&Futex, || header.state() == 0) {
-        let status = handle(channel, &d, &mut mapped);
+        let status = handle(channel, base, &d, &mut mapped);
         let reply = Desc { tag: d.tag, arg: [status as u64, 0, 0], ..Desc::default() };
         while !completions.push(&reply) {
             if header.state() != 0 {
@@ -177,7 +177,7 @@ fn range(m: &Mapped, d: &Desc) -> Result<*mut u8, i64> {
     Ok(unsafe { m.addr.add(d.buf_off as usize) })
 }
 
-fn handle(channel: u64, d: &Desc, mapped: &mut Vec<Mapped>) -> i64 {
+fn handle(channel: u64, base: *mut u8, d: &Desc, mapped: &mut Vec<Mapped>) -> i64 {
     let result: Result<i64, i64> = (|| match d.op {
         ECHO => Ok(d.arg[0] as i64 + 1),
         READ => {
@@ -240,6 +240,16 @@ fn handle(channel: u64, d: &Desc, mapped: &mut Vec<Mapped>) -> i64 {
             Ok(exec_self(&["ringtest", "after-exec", &channel, &grant]))
         }
         SLEEPS => Ok(SLEPT.load(Ordering::Relaxed) as i64),
+        HEADER_READ_ONLY => {
+            if oxrt::mprotect(base, PAGE as usize, PROT_READ | PROT_WRITE) != Err(-EACCES) {
+                return Ok(1);
+            }
+            const CLOCK_MONOTONIC: u64 = 1;
+            if oxrt::syscall(oxrt::sys::CLOCK_GETTIME, [CLOCK_MONOTONIC, base as u64, 0, 0, 0, 0]) != -EFAULT {
+                return Ok(2);
+            }
+            Ok(0)
+        }
         ANSWER_LATE => {
             LATE.store(1, Ordering::Relaxed);
             Ok(0)

@@ -12,8 +12,8 @@
 //!
 //! Each ring starts on a page of its own. The layout is a function of the
 //! slot count alone (`Layout::new`), which each end knows from its own
-//! system call: neither end needs to trust the header, which the other end
-//! can write.
+//! system call. The header page is mapped read-only into both ends (only
+//! the kernel writes it), the rings read and write.
 //!
 //! `state` is set by the kernel when an end is gone (`CLIENT_GONE`,
 //! `SERVICE_GONE`); from then on every futex wait on the channel's memory
@@ -69,8 +69,8 @@ impl Layout {
 }
 
 /// The header at offset 0. The kernel writes it once at creation (and
-/// `state` when an end goes); the ends may read it for diagnostics, but
-/// use their own `Layout`.
+/// `state` when an end goes); both ends map it read-only. They may read it
+/// for diagnostics, but use their own `Layout`.
 #[repr(C, align(64))]
 pub struct Header {
     pub magic: u32,
@@ -80,8 +80,8 @@ pub struct Header {
     pub submission: u32,
     pub completion: u32,
     _pad: [u32; 10],
-    /// `CLIENT_GONE` | `SERVICE_GONE`: written by the kernel only (an end
-    /// that writes it fools no one but itself).
+    /// `CLIENT_GONE` | `SERVICE_GONE`: written by the kernel only (no end
+    /// can forge it: the page is read-only to both).
     pub state: AtomicU32,
 }
 

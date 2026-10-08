@@ -629,7 +629,8 @@ fn client_gone(channel: &Channel, instance: &Weak<super::linux::Instance>, addr:
 // ------------------------------------------------------- the service's calls
 
 /// chan_attach(channel) -> addr: maps a channel offered to the calling
-/// process's service into its address space (read and write).
+/// process's service into its address space: the header page read-only
+/// (only the kernel writes `state`), the rings read and write.
 pub fn attach(id: u64) -> Result<i64, i64> {
     let me = super::current_pid();
     let server = super::with_current(|p| p.server.clone()).ok_or(EPERM)?;
@@ -655,9 +656,16 @@ pub fn attach(id: u64) -> Result<i64, i64> {
         let mut space = mm.lock();
         let floor = space.brk_end;
         let start = space.find_free(len, floor).ok_or(ENOMEM)?;
-        let backing = Backing::File { cache: channel.memory.clone(), offset: 0, shared: true, may_write: true, _hold: None };
-        space.map(start, len, Prot::RW, backing, false).map_err(|_| ENOMEM)?;
-        if space.populate(start, len, true).is_err() {
+        // The header (the kernel's `state`) read-only, the rings writable.
+        let header = Backing::File { cache: channel.memory.clone(), offset: 0, shared: true, may_write: false, _hold: None };
+        let rings = Backing::File { cache: channel.memory.clone(), offset: PAGE, shared: true, may_write: true, _hold: None };
+        let read = Prot { read: true, write: false, exec: false };
+        let mapped = space
+            .map(start, PAGE, read, header, false)
+            .and_then(|_| space.map(start + PAGE, len - PAGE, Prot::RW, rings, false))
+            .and_then(|_| space.populate(start, PAGE, false))
+            .and_then(|_| space.populate(start + PAGE, len - PAGE, true));
+        if mapped.is_err() {
             space.unmap(start, len);
             return Err(ENOMEM);
         }

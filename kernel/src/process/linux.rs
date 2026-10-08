@@ -395,10 +395,11 @@ impl Instance {
         Ok(())
     }
 
-    /// Maps the first `pages` pages of `object` writable into the region
-    /// (`MAPS_BASE..HEAP_BASE`); returns where. Each entry holds a reference
-    /// on its frame, the region's entry the object.
-    pub(super) fn map_object(&self, object: &Arc<PageCache>, pages: u64) -> Result<u64, i64> {
+    /// Maps the first `pages` pages of `object` into the region
+    /// (`MAPS_BASE..HEAP_BASE`), the first `read_only` of them read-only,
+    /// the rest writable; returns where. Each entry holds a reference on
+    /// its frame, the region's entry the object.
+    pub(super) fn map_object(&self, object: &Arc<PageCache>, pages: u64, read_only: u64) -> Result<u64, i64> {
         let len = pages.checked_mul(PAGE).filter(|&l| l > 0).ok_or(EINVAL)?;
         let mut maps = self.maps.lock();
         // First fit.
@@ -414,7 +415,8 @@ impl Instance {
         }
         maps.insert(start, RegionMap { pages, object: object.clone() });
         for i in 0..pages {
-            let mapped = object.map_page(i).map_err(|_| ENOMEM).and_then(|frame| self.map(start + i * PAGE, frame, PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE));
+            let flags = if i < read_only { PageTableFlags::NO_EXECUTE } else { PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE };
+            let mapped = object.map_page(i).map_err(|_| ENOMEM).and_then(|frame| self.map(start + i * PAGE, frame, flags));
             if let Err(e) = mapped {
                 self.unmap_pages(start, i);
                 maps.remove(&start);
@@ -1112,7 +1114,7 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
         }
         SYS_CHAN_CREATE => {
             instance.channel_added()?;
-            let mapped = super::channel::Channel::new(a[0]).and_then(|c| instance.map_object(c.memory(), c.pages()).map(|addr| (c, addr)));
+            let mapped = super::channel::Channel::new(a[0]).and_then(|c| instance.map_object(c.memory(), c.pages(), 1).map(|addr| (c, addr)));
             let (channel, addr) = mapped.inspect_err(|_| instance.channel_gone())?;
             // (Undone already if the end cannot be made.)
             let end = super::channel::ClientEnd::new(channel, Arc::downgrade(&instance), addr)?;

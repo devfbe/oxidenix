@@ -44,3 +44,7 @@ pub const AFTER_EXEC: u8 = 0x99;
 /// The service answers the next offer only after it served that channel
 /// (it attaches at once): attaching alone must complete the connect.
 pub const ANSWER_LATE: u16 = 12;
+/// 0 if the channel's header page is read-only for the service (mprotect
+/// cannot make it writable, the kernel cannot be made to store into it),
+/// so it cannot forge the kernel's `state`.
+pub const HEADER_READ_ONLY: u16 = 13;
