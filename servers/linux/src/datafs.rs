@@ -49,17 +49,23 @@
 //! reclaimed when memory is short, dirty ones are bounded by the kernel's
 //! dirty limits (the pager is asked to write back above a tenth of the
 //! commit limit, writers wait above a fifth), pinned ones by `PINNED` per
-//! fill or write-back in flight. Unused inodes are bounded by
-//! `MAX_CACHED`; their objects keep pages only until reclaim takes them.
+//! fill or write-back in flight. A fill that finds no memory for a page
+//! writes the dirty files back (reclaim can drop their pages then) and
+//! tries again; it fails (ENOMEM) only when nothing is left to write.
+//! Unused inodes are bounded by `MAX_CACHED`; their objects keep pages
+//! only until reclaim takes them.
 //!
 //! **diskfs restarts.** A new channel is made (`client`); every request in
 //! flight on the old one failed (a fill: EIO for its waiters, SIGBUS for a
 //! mapping; a write-back: its pages are dirty again and written on the new
-//! channel). The inodes in use are named again (STAT) to hold them in the
-//! new diskfs; an unlinked one, which diskfs freed when the channel went,
-//! and one that is gone or changed are stale: every call on them fails
-//! with EIO. Writes that completed but were not flushed before diskfs died
-//! may be lost: the next fsync of their file reports EIO once.
+//! channel). Before anyone uses the new channel, the inodes in use are
+//! named again (STAT) to hold them in the new diskfs; an unlinked one,
+//! which diskfs freed when the channel went, and one that is gone or
+//! changed are stale: every call on them fails with EIO, page requests of
+//! their objects included (`keys` keeps every live inode). A lookup that
+//! finds a stale inode's number again gets a new `DInode`. Writes that
+//! completed but were not flushed before diskfs died may be lost: the next
+//! fsync of their file, or the next sync, reports EIO once.
 
 use crate::fsclient::{self, Client, Next, PAGE};
 use crate::sync::{Mutex, RwLock};
@@ -145,7 +151,10 @@ impl Drop for DInode {
 
 struct Table {
     inodes: BTreeMap<u32, Arc<DInode>>,
-    keys: BTreeMap<u64, u32>,
+    /// Every live inode by its object's key, also one replaced in
+    /// `inodes` (stale) that users still hold: its object's page requests
+    /// must be answered (failed) too.
+    keys: BTreeMap<u64, alloc::sync::Weak<DInode>>,
     /// Inodes to look at for release (unlinked ones a user let go of).
     check: Vec<u32>,
     /// Dirty files (`EVENT_DIRTY`), by inode: since when.
@@ -233,9 +242,8 @@ fn found(ino: u64, mode: u64) -> Result<Arc<DInode>, i64> {
             i.used.store(TICK.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
             return Ok(i.clone());
         }
-        Some(i) => {
-            let key = i.key;
-            t.keys.remove(&key);
+        Some(_) => {
+            // (Its key stays: its users may still fault on its object.)
             t.dirty.remove(&ino);
         }
         None => {}
@@ -258,7 +266,10 @@ fn found(ino: u64, mode: u64) -> Result<Arc<DInode>, i64> {
         used: AtomicU64::new(TICK.fetch_add(1, Ordering::Relaxed)),
     });
     t.inodes.insert(ino, inode.clone());
-    t.keys.insert(key, ino);
+    if t.keys.len() > 2 * t.inodes.len() + 64 {
+        t.keys.retain(|_, w| w.strong_count() > 0);
+    }
+    t.keys.insert(key, Arc::downgrade(&inode));
     if t.inodes.len() > MAX_CACHED {
         REAP.store(true, Ordering::Relaxed);
     }
@@ -280,7 +291,7 @@ pub fn root() -> Result<Arc<DInode>, i64> {
 /// The inode by its object's key.
 fn by_key(key: u64) -> Option<Arc<DInode>> {
     let t = TABLE.lock();
-    t.keys.get(&key).and_then(|ino| t.inodes.get(ino)).filter(|i| i.key == key).cloned()
+    t.keys.get(&key).and_then(alloc::sync::Weak::upgrade)
 }
 
 // ------------------------------------------------------------- names
@@ -576,8 +587,19 @@ enum Io {
 
 /// Fills the missing pages of the window from page `index` (read-ahead
 /// included): runs of them granted, read by DMA, declared filled. Whether
-/// any page was missing; EIO if a read failed.
+/// any page was missing; EIO if a read failed. Without memory for a page,
+/// dirty pages are written back first (reclaim may drop them then); only
+/// when none is left to write it fails (ENOMEM).
 pub fn fill(inode: &Arc<DInode>, index: u64, want: u64) -> Result<bool, i64> {
+    loop {
+        match fill_once(inode, index, want) {
+            Err(ENOMEM) if write_back_dirty() > 0 => {}
+            r => return r,
+        }
+    }
+}
+
+fn fill_once(inode: &Arc<DInode>, index: u64, want: u64) -> Result<bool, i64> {
     live(inode)?;
     let object = object(inode)?;
     let c = client()?;
@@ -862,10 +884,16 @@ pub fn sync_all() -> Result<(), i64> {
             }
         }
     }
-    if CLIENT.lock().is_some() {
+    let client = CLIENT.lock().clone();
+    if let Some(c) = client {
         flush(None)?;
+        // Writes completed on a connection to a diskfs that died before
+        // they were flushed may be lost: reported, as fsync does.
         for inode in &inodes {
-            inode.unflushed.store(0, Ordering::Relaxed);
+            let gen = inode.unflushed.swap(0, Ordering::AcqRel);
+            if gen != 0 && gen != c.generation {
+                result = Err(EIO);
+            }
         }
     }
     result
@@ -945,6 +973,9 @@ pub fn read_direct(inode: &Arc<DInode>, off: u64, buf: u64, len: u64) -> Result<
 /// (a fault on a mapping, or the kernel reading it): filled, or failed.
 pub fn page(key: u64, offset: u64) {
     let index = offset / PAGE;
+    // Every object's inode is in `keys` while it lives (its handle is the
+    // inode's, and whatever maps or runs the object holds the inode): an
+    // unknown key has no object left, so nobody waits for it.
     let Some(inode) = by_key(key) else { return };
     if let Err(_) = fill(&inode, index, 1) {
         // Whoever waits gets EIO (a mapping SIGBUS).
@@ -956,7 +987,8 @@ pub fn page(key: u64, offset: u64) {
 
 /// `EVENT_DIRTY`: the file `key` has dirty pages now.
 pub fn dirtied(key: u64) {
-    let Some(inode) = by_key(key) else { return };
+    // (A stale inode's pages cannot be written: nothing to list.)
+    let Some(inode) = by_key(key).filter(|i| !i.stale.load(Ordering::Relaxed)) else { return };
     TABLE.lock().dirty.entry(inode.ino).or_insert_with(now);
 }
 
@@ -995,14 +1027,16 @@ pub fn write_dirty(all: bool) {
 
 /// Writes back every dirty file once, leaving the list to the pager (only
 /// it takes files off, so none dirtied meanwhile is lost from it).
-fn write_back_dirty() {
+fn write_back_dirty() -> u64 {
     let dirty: Vec<u32> = TABLE.lock().dirty.keys().copied().collect();
+    let mut wrote = 0;
     for ino in dirty {
         let inode = TABLE.lock().inodes.get(&ino).cloned();
         if let Some(inode) = inode.filter(|i| !i.stale.load(Ordering::Relaxed)) {
-            let _ = writeback(&inode, 0..u64::MAX);
+            wrote += writeback(&inode, 0..u64::MAX).unwrap_or(0);
         }
     }
+    wrote
 }
 
 /// Writes `inode` back until a pass finds nothing dirty (a few passes at
@@ -1159,7 +1193,7 @@ fn evict(ino: u32) {
             return;
         }
         t.inodes.remove(&ino);
-        t.keys.remove(&inode.key);
+
         t.dirty.remove(&ino);
         drop(t);
         c.as_ref().and_then(|c| c.submit(Request::Release { ino }.encode(0), true).ok().flatten())

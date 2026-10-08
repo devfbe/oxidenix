@@ -3,8 +3,9 @@
  * write() leaves dirty pages that fsync makes durable (an O_DIRECT read
  * fetches the device's copy), children's stores survive write-back around
  * fork, truncation reaches mappings, many readers
- * and writers at once see consistent data, and a file larger than the
- * memory the cache may use is written and read back whole. */
+ * and writers at once see consistent data, a file larger than the memory
+ * the cache may use is written and read back whole, and a read finds room
+ * when dirty pages fill memory. */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
@@ -370,6 +371,50 @@ static void larger_than_cache(void) {
     unlink(path);
 }
 
+/* A read that needs memory the cache's dirty pages hold: they are written
+ * back to make room, the read does not fail. */
+static void read_with_dirty_memory(void) {
+    const char *a = "/data/datatest.dirty", *b = "/data/datatest.clean";
+    static char chunk[64 * 1024];
+    int fb = open(b, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    for (long off = 0; off < 4 * MIB; off += sizeof chunk) {
+        for (size_t i = 0; i < sizeof chunk; i++) chunk[i] = (char)pattern(off + i, 6);
+        write(fb, chunk, sizeof chunk);
+    }
+    fsync(fb);
+    close(fb);
+    long room = (meminfo("CommitLimit:") - meminfo("Committed_AS:")) * 1024 - 3 * MIB;
+    char *all = mmap(NULL, room, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (all == MAP_FAILED) {
+        check("a read with memory full of dirty pages (commit)", 0);
+        return;
+    }
+    for (long off = 0; off < room; off += PG) all[off] = 1;
+    /* Most of the rest dirty through a mapping, then unmapped: dirty pages
+     * nothing maps, which reclaim cannot drop until they are written. */
+    int fa = open(a, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    ftruncate(fa, 5 * MIB / 2);
+    char *m = mmap(NULL, 5 * MIB / 2, PROT_READ | PROT_WRITE, MAP_SHARED, fa, 0);
+    if (m != MAP_FAILED) {
+        for (long off = 0; off < 5 * MIB / 2; off += PG) m[off] = 'd';
+        munmap(m, 5 * MIB / 2);
+    }
+    fb = open(b, O_RDONLY);
+    int good = fb >= 0;
+    for (long off = 0; good && off < 4 * MIB; off += sizeof chunk) {
+        ssize_t n = read(fb, chunk, sizeof chunk);
+        good &= n == (ssize_t)sizeof chunk;
+        for (size_t i = 0; good && i < sizeof chunk; i += 101) good &= (unsigned char)chunk[i] == pattern(off + i, 6);
+        if (!good) printf("    (at %ld: read %zd, errno %d)\n", off, n, errno);
+    }
+    check("a read with memory full of dirty pages", good);
+    munmap(all, room);
+    close(fa);
+    close(fb);
+    unlink(a);
+    unlink(b);
+}
+
 int main(void) {
     struct sigaction sa = {0};
     sa.sa_handler = on_fault;
@@ -384,6 +429,7 @@ int main(void) {
     readers();
     writers();
     larger_than_cache();
+    read_with_dirty_memory();
     printf("%s\n", failures ? "datatest: FAILED" : "datatest: all passed");
     return failures != 0;
 }
