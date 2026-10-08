@@ -65,6 +65,19 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 /// Every channel, by id (ascending: ids only grow); the attached ones also
 /// with their service. Grown fallibly: nothing here allocates under the
 /// lock where failing would panic.
+///
+/// Invariant: `Entry::service` is `Some` exactly while the channel's
+/// `Inner::service` is, and is the same service (`attach` makes both,
+/// `service_gone` ends both). Both change only with this lock held and,
+/// inside it, the channel's `inner` lock (always in that order); whoever
+/// reads both (`attached`) holds both, so it never sees one without the
+/// other. An entry goes only with its channel (`Channel::drop`), which
+/// cannot happen while it is attached (the entry's `Registered` holds it).
+///
+/// An attached channel lives until its service detaches, dies or executes
+/// a new program, even when its client is gone: it is the service's to let
+/// go (it sees `CLIENT_GONE`); what it then holds is the ring memory and
+/// the grants still draining, bounded by its server's lifetime.
 static CHANNELS: IrqSpinLock<Vec<Entry>> = IrqSpinLock::new(Vec::new());
 
 struct Entry {
@@ -514,17 +527,22 @@ impl Channel {
     /// process is no longer the service.
     fn attached(id: u64) -> Result<(Arc<Channel>, ServiceEnd), i64> {
         let mm = super::current_mm().ok_or(ENOENT)?;
-        let channel = entry(&mut CHANNELS.lock(), id).and_then(|e| e.service.as_ref().map(|r| r.channel.clone()));
-        let channel = channel.ok_or(ENOENT)?;
-        let service = channel.inner.lock().service.clone().filter(|s| core::ptr::eq(s.mm.as_ptr(), Arc::as_ptr(&mm))).ok_or(ENOENT)?;
-        Ok((channel, service))
+        let mut channels = CHANNELS.lock();
+        let channel = entry(&mut channels, id).and_then(|e| e.service.as_ref().map(|r| r.channel.clone())).ok_or(ENOENT)?;
+        let service = channel.inner.lock().service.clone().filter(|s| core::ptr::eq(s.mm.as_ptr(), Arc::as_ptr(&mm)));
+        drop(channels);
+        Ok((channel, service.ok_or(ENOENT)?))
     }
 
     /// The service's end is gone (`died`: its process ended): every grant
     /// is revoked, those a dead service's device may still reach go to its
     /// server's quarantine; the client sees `SERVICE_GONE`.
     fn service_gone(&self, died: bool) {
-        let (grants, service) = {
+        // The service ends in the registry and in the channel at once (see
+        // `CHANNELS`); the registry's reference is dropped at the end (the
+        // caller holds another one).
+        let (grants, service, registered) = {
+            let mut channels = CHANNELS.lock();
             let mut inner = self.inner.lock();
             if inner.service_gone {
                 return;
@@ -534,7 +552,8 @@ impl Channel {
             let grants = core::mem::take(&mut inner.grants);
             // Exactly their pages: grants being made release their own.
             inner.pages -= grants.iter().map(|(_, g)| g.frames.len() as u64).sum::<u64>();
-            (grants, inner.service.take())
+            let registered = entry(&mut channels, self.id).and_then(|e| e.service.take());
+            (grants, inner.service.take(), registered)
         };
         let mm = service.as_ref().and_then(|s| s.mm.upgrade());
         for grant in grants.slots.into_iter().flatten() {
@@ -557,9 +576,7 @@ impl Channel {
             mm.lock().unmap_object(&self.memory);
         }
         self.set_gone(SERVICE_GONE);
-        // The registry's reference (the caller holds another one).
-        let reference = entry(&mut CHANNELS.lock(), self.id).and_then(|e| e.service.take());
-        drop(reference);
+        drop(registered);
     }
 }
 
