@@ -200,6 +200,10 @@ IPC round trip with PCIDs.)
 | TCP over loopback | 621 | 581 | 576 | 536 | 5832 | MB/s |
 | TCP through the network card (echo) | 106 | 125 | 120 | 109 | 233 | MB/s |
 
+- Path resolution in the Linux server (R6c.2b, `150f8f1` against the commit before it with
+  the same `iobench`, files `*-r6c2b.md` and `*-pre-r6c2b.md`): `stat` of a four-name path in
+  tmpfs, p50, 7132 → 5742 cycles; one kernel walk per path instead of the pass-through, and
+  kernel heap allocations per call 18 → 1.
 - The IPC round trip costs about 14000 cycles, 40 null system calls; PCIDs save little of it.
 - Sequential writes stay at 4.3 MB/s: a device flush per `write`, waited for by diskfs
   spinning on `sched_yield`.

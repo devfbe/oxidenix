@@ -177,6 +177,10 @@ fn openat(dirfd: u64, addr: u64, flags: u32, mode: u32) -> Result<i64, i64> {
     let path = read_cstr(addr)?;
     let base = base_dir(dirfd, &path)?;
     let nofollow = flags & O_NOFOLLOW != 0;
+    // A name created by someone else between our lookup and our create is
+    // opened instead, once: a name that exists but does not resolve (a
+    // dangling symlink) stays EEXIST, as with the kernel's VFS.
+    let mut retried = false;
     let resolved = loop {
         match resolve(&base, &path, !nofollow) {
             Ok(_) if flags & O_CREAT != 0 && flags & O_EXCL != 0 => return Err(EEXIST),
@@ -189,8 +193,10 @@ fn openat(dirfd: u64, addr: u64, flags: u32, mode: u32) -> Result<i64, i64> {
                     Ok(inode) => {
                         break Resolved { inode, mode: vfs::S_IFREG | perm, path: vfs::path::normalize(&base, &path) };
                     }
-                    // Created meanwhile by someone else: open that one.
-                    Err(EEXIST) if flags & O_EXCL == 0 => continue,
+                    Err(EEXIST) if flags & O_EXCL == 0 && !retried => {
+                        retried = true;
+                        continue;
+                    }
                     Err(e) => return Err(e),
                 }
             }

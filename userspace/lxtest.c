@@ -302,6 +302,10 @@ int main(void) {
     check("stat follows a symlink, lstat does not", stat("l", &sb) == 0 && S_ISREG(sb.st_mode) && lstat("l", &sb) == 0 && S_ISLNK(sb.st_mode));
     errno = 0;
     check("O_NOFOLLOW on a symlink is ELOOP", open("l", O_RDONLY | O_NOFOLLOW) == -1 && errno == ELOOP);
+    symlink("nowhere", "dangling");
+    errno = 0;
+    check("O_CREAT through a dangling symlink fails (no endless retry)", open("dangling", O_CREAT | O_WRONLY, 0666) == -1 && errno == EEXIST);
+    unlink("dangling");
     symlink("loop2", "/tmp/lx/loop1");
     symlink("loop1", "/tmp/lx/loop2");
     errno = 0;
