@@ -229,7 +229,10 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
      discipline and job control's terminal side in the server.
    - **R6e — The descriptor table, `poll`, `select` and `epoll`** move with the sockets (R7),
      the last kind the kernel implements, over a kernel wait for the server's events and the
-     netd's at once.
+     netd's at once. Until then the descriptor's own requests pass through to the kernel,
+     which holds the flags and the close-on-exec bit: `fcntl` and the generic ioctls
+     `FIONBIO`, `FIOCLEX` and `FIONCLEX` (the server passes them through for its own files,
+     too); they move with the table.
 7. **R7 — Sockets** into the server, talking to netd over rings.
 8. **R8 — Processes and signals**: pids, the process tree, `fork` (with the copy-on-write clone
    of memory objects), `exec`, `wait`, signals, job control, `/proc`'s data. The kernel's

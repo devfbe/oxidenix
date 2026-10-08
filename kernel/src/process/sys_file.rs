@@ -417,6 +417,27 @@ pub fn ioctl(fd: u64, request: u64, arg: u64) -> SysResult {
     const TIOCNOTTY: u64 = 0x5422;
     const TIOCGSID: u64 = 0x5429;
 
+    // The requests on the descriptor rather than the file, which every
+    // descriptor takes (Linux's do_vfs_ioctl), the Linux server's files too
+    // (it passes them through): libuv makes pipes and sockets non-blocking
+    // with FIONBIO. Here only because the descriptor table is still the
+    // kernel's; they move into the Linux server with it (R6e,
+    // docs/design/linux-server.md).
+    const FIONBIO: u64 = 0x5421;
+    const FIONCLEX: u64 = 0x5450;
+    const FIOCLEX: u64 = 0x5451;
+    match request {
+        FIONBIO => {
+            let on = uaccess::read::<i32>(arg)? != 0;
+            let f = file(fd)?;
+            let old = f.flags.load(Ordering::Relaxed);
+            f.flags.store(if on { old | O_NONBLOCK } else { old & !O_NONBLOCK }, Ordering::Relaxed);
+            return Ok(0);
+        }
+        FIOCLEX | FIONCLEX => return current_files()?.set_cloexec(fd, request == FIOCLEX).map(|_| 0),
+        _ => {}
+    }
+
     if !file(fd)?.is_console() {
         return Err(ENOTTY);
     }
