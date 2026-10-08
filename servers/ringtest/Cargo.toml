@@ -1,0 +1,14 @@
+[package]
+name = "ringtest"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+
+[[bin]]
+name = "ringtest"
+test = false
+bench = false
+
+[dependencies]
+oxrt = { path = "../../crates/oxrt" }
+ring = { path = "../../crates/ring" }

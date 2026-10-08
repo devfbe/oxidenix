@@ -156,6 +156,10 @@ fn main(args: Vec<&'static str>) -> i32 {
                 }
                 _ => service.respond(id, -EINVAL, [0; 6], &[]),
             },
+            // Not registered for channels: none are offered.
+            Ok(oxrt::Event::Control(id, _)) => {
+                let _ = oxrt::ipc_reply(id, &(-95i64).to_le_bytes());
+            }
             Ok(oxrt::Event::Timeout) | Err(_) => {}
         }
     }

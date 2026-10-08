@@ -12,6 +12,7 @@
 
 extern crate alloc;
 
+mod chantest;
 mod eventfd;
 mod files;
 mod heap;
@@ -75,7 +76,7 @@ pub extern "C" fn _start(state: *mut State, role: u64) -> ! {
             continue;
         }
         match s.rax {
-            TEST_MAP..=TEST_FS_RECORDS => s.rax = test(s.rax, s.rdi) as u64,
+            TEST_MAP..=TEST_CHANNEL => s.rax = test(s.rax, s.rdi) as u64,
             nr if nr >= FIRST_NON_LINUX => s.rax = -ENOSYS as u64,
             _ => {
                 records::before_pass_through(s);
@@ -243,6 +244,7 @@ fn test(nr: u64, addr: u64) -> i64 {
             if r < 0 { r } else { 0 }
         }
         TEST_ALLOC => test_alloc(addr) as i64,
+        TEST_CHANNEL => chantest::run(addr),
         TEST_FS_VALUE => records::test_value(addr),
         TEST_FS_RECORDS => records::live(),
         TEST_USERCOPY => match usercopy::to_program(addr, b"usercopy") {

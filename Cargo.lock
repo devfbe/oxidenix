@@ -354,6 +354,7 @@ version = "0.1.0"
 dependencies = [
  "linked_list_allocator",
  "restricted",
+ "ring",
  "slab 0.1.0",
  "vfs",
 ]
@@ -475,6 +476,7 @@ dependencies = [
  "png",
  "procproto",
  "restricted",
+ "ring",
  "slab 0.1.0",
  "spin",
  "x86_64 0.15.5",
@@ -571,6 +573,14 @@ version = "0.1.0"
 [[package]]
 name = "ring"
 version = "0.1.0"
+
+[[package]]
+name = "ringtest"
+version = "0.1.0"
+dependencies = [
+ "oxrt",
+ "ring",
+]
 
 [[package]]
 name = "rustix"

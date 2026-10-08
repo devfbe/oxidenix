@@ -105,9 +105,95 @@ ring complete in any order (the device may reorder); the tag matches them up.
    revoke completes once the service has no request in flight on the grant (it acknowledges
    through the completion ring), so no device writes a page after it was revoked.
 3. When either end dies, the kernel tears the channel down: the client's in-flight requests
-   fail (`EIO`), its grants are revoked (device mappings first), the service's mapping goes.
+   fail (`EIO`), its grants are revoked (device mappings first), the service's mappings of them
+   go, and the survivor wakes and sees the end gone.
    A restarted service gets new channels; clients reattach and resubmit (idempotent reads,
    writes are re-sent by the page cache's write-back).
+
+### The kernel's interface (step 2)
+
+`kernel/src/process/channel.rs`; the layout both ends map is `crates/ring` (`ring::channel`).
+
+**Layout.** A channel of `slots` slots per ring (a power of two, 2-4096) is one zeroed,
+committed memory object: a header page (magic, version, slots, the rings' offsets, and on its
+own cache line the `state` word), then the submission ring and the completion ring, each a
+`RingMemory<slots>` starting on a page of its own. The layout is a function of `slots` alone
+(`Layout::new`); an end never needs to trust the header, which the other end can write. The
+positions start at 0.
+
+**Client calls** (the Linux server, `crates/restricted`):
+
+| Call | |
+|------|---|
+| `chan_create(slots, &addr) -> handle` (1064) | the channel, mapped writable into the server's region (`MAPS_BASE`..`HEAP_BASE`, a range the kernel maps memory objects into for the server); at most 64 per instance |
+| `chan_connect(handle, name, len)` (1065) | offers it to the service `name` (a dead server of the kernel's is started again) and waits until it attached or refused; `EISCONN`, `ENOENT`, `EOPNOTSUPP` for a service that takes no channels, `EIO` if it died, `EINTR` for a signal before it attached |
+| `grant(handle, object, offset, pages, flags) -> id` (1066) | pins `pages` pages of a memory or file object (`GRANT_WRITE`: writable); `ENOTCONN` before the service attached, `EPIPE` after it went; at most 4096 grants and 65536 pages per channel |
+| `revoke(handle, id) -> 0 \| REVOKE_DRAINING` (1067) | see below |
+| `handle_close(handle)` | the client's end goes (also when the instance ends) |
+
+**Service calls** (`oxrt::sys`, for the kernel's servers):
+
+| Call | |
+|------|---|
+| `ipc_register(name, len, arg, IPC_CHANNELS)` (1000) | the service accepts channel offers |
+| `ipc_receive` | an offer comes as a control request (id with bit 63 set, `oxrt::Event::Control`) whose payload is a `ring::channel::Offer` (channel id, slots, client pid); the service answers with an 8-byte status |
+| `chan_attach(channel) -> addr` (1068) | maps an offered channel (only the service it was offered to, only once) |
+| `chan_detach(channel)` (1069) | lets go of it: the service's mappings of the channel and of its grants go, and the service vouches that no device uses the grants any more |
+| `grant_map(channel, id, &info) -> addr` (1070) | maps a grant: read-only unless granted writable (`mprotect` cannot add write or execute), not inherited by `fork`, not movable by `mremap`; `info` gets (pages, writable) |
+| `grant_dma(channel, id, offset) -> device address` (1071) | of the byte at `offset` (`EINVAL` beyond the grant), valid to the end of its page |
+| `grant_dma_unmap(channel, id)` (1072) | the service's devices are done with the grant |
+
+**Attach.** The Linux server has no IPC of its own (only the kernel is an IPC client), so the
+kernel carries the offer: `chan_connect` sends the service a control request, typed by its id
+(no protocol message can pass for one) and only to services registered with `IPC_CHANNELS`.
+Whether the channel is attached is the kernel's to say, not the service's answer: a service
+that attaches and answers an error still has the channel, and one that answers 0 without
+attaching has not.
+
+**Doorbells.** The ring words are futex words. The service's futex on its shared mapping and
+the server's `server_futex_wait` on its region mapping are both keyed by the channel's memory
+object and the offset, so they meet.
+
+**Pinning.** A grant takes each page's frame with a reference of its own and a pin count in
+the object's page cache: a pinned page stays the object's page (a truncation over it fails with
+`EBUSY`, reclaim skips it). Pages are made present when granted; a paged object's page must
+have been supplied (`ENODATA`: its pager may be the caller). Remote (disk) caches are not
+grantable. Step 4 grants pages before they are supplied, for diskfs to read into.
+
+**Revoke.** The grant's mappings in the service are gone (TLB shootdowns included) when
+`revoke` returns, and its device mappings are taken out of the service's `DmaDomain` (the one
+place that maps pages for devices). Without an IOMMU a device address cannot be taken back: a
+grant the service has device addresses of stays pinned, its id taken, until the service calls
+`grant_dma_unmap` (`revoke` returns `REVOKE_DRAINING`). Data integrity is the protocol's: the
+client revokes after the requests on the grant completed. The kernel only guarantees that no
+memory a device or the service can still reach is freed or reused.
+
+**Teardown.** When the client's end goes (its handle closed, or the instance ended) every grant
+is revoked as above; when the service's end goes (`chan_detach`, or its process ended) every
+grant is released, except that grants a dead service's device may still reach wait in its
+server's `DmaDomain` until the server's next process registers (a server resets its device
+before it registers). Either way the kernel sets the end's bit in `state` (`CLIENT_GONE`,
+`SERVICE_GONE`) and hangs the channel's memory up: from then on every futex wait on it fails
+with `EPIPE` (checked under the futex bucket lock) and every sleeper on it is woken, so an end
+sleeping on a doorbell always wakes (`Consumer::pop_wait_while` stops once `state` is set). An
+end's mapping of the ring memory itself stays until it closes its handle or detaches. In-flight
+requests are the client's to fail. Teardowns triggered where the kernel may not sleep (a
+process's end, an instance's last reference) run on the `channels` kernel thread; closing the
+handle tears down synchronously.
+
+**Hostile peers.** The kernel never reads the rings. Every grant id, offset and length a service
+passes is checked against the grant; a grant's id is reused only after the grant is fully gone,
+and a service's mapping of a grant can never be made after its revoke (a per-grant lock orders
+the two).
+
+**Tests.** `lxtest` has the Linux server run five scenarios (`TEST_CHANNEL`) against
+`servers/ringtest`, a service started in test mode only (`ring::selftest`): rings and doorbells
+in both directions, connect errors; grants (data both ways, read-only enforced by mprotect, by
+the kernel's own stores and, fatally, by a CPU store; the kernel's bounds; device addresses;
+pinning against truncation; unsupplied pages); revoking (the mapping gone, a draining grant
+pinned and its id held until `grant_dma_unmap`, ids reused); the client's end going while the
+service sleeps; the service dying while the client waits, and coming back for the next channel.
+`cargo test --release -p ring` covers the layout, the offer encoding and `pop_wait_while`.
 
 ## Paths built on it
 
@@ -136,7 +222,8 @@ tuning knob measured with `iobench`.
 1. `crates/ring`: the SPSC ring and descriptors, host-tested (single- and two-thread tests of
    the invariants, including wrap-around and the sleep/wake protocol under contention).
 2. Kernel: channel objects, grants with pinning, `grant_dma`, teardown on death; shared futex
-   doorbells already work (futexes on shared memory objects).
+   doorbells already work (futexes on shared memory objects). Done: see "The kernel's
+   interface" above.
 3. diskfs: the ring protocol beside the IPC one (the kernel's `RemoteFs` stays the IPC client
    until R6c.3 ends), virtio-blk with requests in flight and DMA into granted pages.
 4. The Linux server: `/data` through its page cache over the ring; the bridge to the kernel's

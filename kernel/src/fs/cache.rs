@@ -142,6 +142,9 @@ struct State {
     /// Pages of a paged object its pager failed to supply: the waiting
     /// threads get an error once, a later access asks again.
     failed: alloc::collections::BTreeSet<u64>,
+    /// Pinned pages (granted to a channel's service, see `pin`), with
+    /// their pin counts: they stay this object's pages until unpinned.
+    pins: BTreeMap<u64, u32>,
 }
 
 pub struct PageCache {
@@ -150,6 +153,8 @@ pub struct PageCache {
     store: Store,
     /// Address spaces that map this file (see `register`).
     mappers: IrqSpinLock<Vec<Weak<Mm>>>,
+    /// Set once by `hang_up`: futex waits on this object fail (EPIPE).
+    hung_up: core::sync::atomic::AtomicBool,
 }
 
 /// A tmpfs page charged to commit and tmpfs, released on drop unless kept.
@@ -218,10 +223,12 @@ impl PageCache {
                 charged: 0,
                 cursor: 0,
                 failed: alloc::collections::BTreeSet::new(),
+                pins: BTreeMap::new(),
             }),
             io: Mutex::new(()),
             store,
             mappers: IrqSpinLock::new(Vec::new()),
+            hung_up: core::sync::atomic::AtomicBool::new(false),
         })
         .map_err(|_| ENOMEM)
     }
@@ -666,6 +673,10 @@ impl PageCache {
                 return Ok(());
             }
             let first_gone = page_of(len + PAGE - 1);
+            // A granted page stays the object's until it is revoked.
+            if st.pins.range(first_gone..).next().is_some() {
+                return Err(EBUSY);
+            }
             if len % PAGE != 0 {
                 if let Some(page) = st.pages.get(&page_of(len)) {
                     frame_bytes(page.frame)[(len % PAGE) as usize..].fill(0);
@@ -725,6 +736,65 @@ impl PageCache {
                 return Ok(page.frame);
             }
         }
+    }
+
+    /// Pins page `index` for a grant (`process::channel`): makes it present
+    /// (a memory store creates it; a paged object's page must have been
+    /// supplied: ENODATA otherwise, since its pager may be the caller) and
+    /// returns its frame with a reference for the grant. While pinned, the
+    /// page stays this object's: truncation fails with EBUSY, reclaim
+    /// skips it (its frame is shared), so the frame a service or device
+    /// reaches is always the object's page. A remote store's pages are not
+    /// grantable (EINVAL): their stores must go through dirty tracking.
+    pub fn pin(&self, index: u64) -> Result<PhysFrame, i64> {
+        loop {
+            if index >= page_of(self.size().saturating_add(PAGE - 1)) {
+                return Err(EINVAL);
+            }
+            match self.store {
+                Store::Memory { .. } => self.create(index)?,
+                Store::Paged { .. } => {}
+                Store::Remote { .. } => return Err(EINVAL),
+            }
+            let mut st = self.state.lock();
+            match st.pages.get(&index) {
+                Some(page) => {
+                    let frame = page.frame;
+                    memory::with_frames(|f| f.share(frame));
+                    *st.pins.entry(index).or_insert(0) += 1;
+                    return Ok(frame);
+                }
+                None if matches!(self.store, Store::Paged { .. }) => return Err(ENODATA),
+                // Truncated again in between: try once more.
+                None => {}
+            }
+        }
+    }
+
+    /// Ends a pin of `pin` (with the frame it returned).
+    pub fn unpin(&self, index: u64, frame: PhysFrame) {
+        {
+            let mut st = self.state.lock();
+            match st.pins.get_mut(&index) {
+                Some(n) if *n > 1 => *n -= 1,
+                Some(_) => {
+                    st.pins.remove(&index);
+                }
+                None => debug_assert!(false, "unpinning a page that is not pinned"),
+            }
+        }
+        free_frames([frame]);
+    }
+
+    /// Ends futex waits on this object for good: waiters wake (the caller
+    /// wakes them, `futex::wake_object`) and new waits fail with EPIPE. For
+    /// a channel whose peer is gone.
+    pub fn hang_up(&self) {
+        self.hung_up.store(true, Ordering::SeqCst);
+    }
+
+    pub fn is_hung_up(&self) -> bool {
+        self.hung_up.load(Ordering::SeqCst)
     }
 
     /// Drops up to `want` clean pages that only the cache uses, giving a

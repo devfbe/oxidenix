@@ -1,0 +1,201 @@
+//! ringtest: the far end of the self-tests' channels (test mode only). It
+//! accepts channel offers and serves one channel at a time over its rings
+//! (`ring::selftest`), as a device server will: descriptors are copied out
+//! of the ring once and validated, buffers are grants it maps, device
+//! addresses come from `grant_dma`. It checks from the service's side what
+//! the kernel promises: read-only grants stay read-only, revoked and torn
+//! down grants are gone from its memory.
+
+#![no_std]
+#![no_main]
+
+extern crate alloc;
+
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicI64, AtomicU32, Ordering};
+use oxrt::println;
+use ring::channel::{Header, Layout, Offer};
+use ring::selftest::*;
+use ring::{Desc, Ring, Wait};
+
+oxrt::entry!(main);
+
+const EINVAL: i64 = 22;
+const EACCES: i64 = 13;
+const ENOENT: i64 = 2;
+const ENOMEM: i64 = 12;
+const EFAULT: i64 = 14;
+const PAGE: u64 = 4096;
+const PROT_READ: u64 = 1;
+const PROT_WRITE: u64 = 2;
+const PROT_EXEC: u64 = 4;
+
+/// Channels that ended with their client gone and every grant mapping of
+/// theirs removed (`CLEAN_ENDS`), and sleeps on a doorbell (`SLEEPS`).
+static CLEAN: AtomicI64 = AtomicI64::new(0);
+static SLEPT: AtomicU32 = AtomicU32::new(0);
+
+/// The doorbell: a futex on the ring word, shared with the client.
+struct Futex;
+
+impl Wait for Futex {
+    fn wait(&self, word: &AtomicU32, value: u32) {
+        SLEPT.fetch_add(1, Ordering::Relaxed);
+        // EPIPE once the client is gone: the caller looks at the state.
+        let _ = oxrt::futex_wait(word, value, None);
+    }
+
+    fn wake(&self, word: &AtomicU32) {
+        let _ = oxrt::futex_wake(word, 1);
+    }
+}
+
+/// A grant as mapped here.
+struct Mapped {
+    grant: u32,
+    addr: *mut u8,
+    len: u64,
+    writable: bool,
+}
+
+fn main(_args: Vec<&'static str>) -> i32 {
+    if let Err(e) = oxrt::ipc_register_with(SERVICE, 0, oxrt::IPC_CHANNELS) {
+        println!("ringtest: cannot register: {}", e);
+        return 1;
+    }
+    let mut message = [0u8; 64];
+    loop {
+        let (id, len) = match oxrt::ipc_receive(&mut message, None) {
+            Ok(oxrt::Event::Control(id, len)) => (id, len),
+            Ok(oxrt::Event::Request(id, _)) => {
+                let _ = oxrt::ipc_reply(id, &(-EINVAL).to_le_bytes());
+                continue;
+            }
+            _ => continue,
+        };
+        let offer = Offer::decode(&message[..len]).filter(|o| o.slots as usize == SLOTS);
+        let attached = match offer {
+            Some(o) => oxrt::chan_attach(o.channel).map(|base| (o.channel, base)),
+            None => Err(-EINVAL),
+        };
+        let status = attached.as_ref().map_or_else(|&e| e, |_| 0);
+        let _ = oxrt::ipc_reply(id, &status.to_le_bytes());
+        if let Ok((channel, base)) = attached {
+            serve(channel, base);
+        }
+    }
+}
+
+/// Serves `channel` (mapped at `base`) until its client is gone.
+fn serve(channel: u64, base: *mut u8) {
+    let layout = Layout::new(SLOTS as u32).expect("a valid slot count");
+    // The channel stays mapped until chan_detach below.
+    let (sub, comp) = unsafe { (layout.ring::<SLOTS>(base, layout.submission), layout.ring::<SLOTS>(base, layout.completion)) };
+    let header = unsafe { Header::at(base) };
+    let (sub, comp) = (Ring::new(sub), Ring::new(comp));
+    let (mut requests, mut completions) = (sub.consumer(), comp.producer());
+    let mut mapped: Vec<Mapped> = Vec::new();
+    while let Some(d) = requests.pop_wait_while(&Futex, || header.state() == 0) {
+        let status = handle(channel, &d, &mut mapped);
+        let reply = Desc { tag: d.tag, arg: [status as u64, 0, 0], ..Desc::default() };
+        while !completions.push(&reply) {
+            if header.state() != 0 {
+                break;
+            }
+            oxrt::sched_yield();
+        }
+        completions.ring_doorbell(&Futex);
+    }
+    // The client is gone: the kernel must have taken every grant back.
+    if mapped.iter().all(|m| gone(m.addr)) {
+        CLEAN.fetch_add(1, Ordering::Relaxed);
+    }
+    let _ = oxrt::chan_detach(channel);
+}
+
+/// Whether nothing is mapped at `addr` any more.
+fn gone(addr: *mut u8) -> bool {
+    oxrt::mprotect(addr, PAGE as usize, PROT_READ) == Err(-ENOMEM)
+}
+
+/// The grant `grant`, mapped (once).
+fn map(channel: u64, grant: u32, mapped: &mut Vec<Mapped>) -> Result<usize, i64> {
+    if let Some(i) = mapped.iter().position(|m| m.grant == grant) {
+        return Ok(i);
+    }
+    let (addr, pages, writable) = oxrt::grant_map(channel, grant)?;
+    mapped.push(Mapped { grant, addr, len: pages * PAGE, writable });
+    Ok(mapped.len() - 1)
+}
+
+/// The range of `d` within its grant (EINVAL beyond it).
+fn range(m: &Mapped, d: &Desc) -> Result<*mut u8, i64> {
+    let end = (d.buf_off as u64).checked_add(d.len as u64).ok_or(-EINVAL)?;
+    if end > m.len {
+        return Err(-EINVAL);
+    }
+    Ok(unsafe { m.addr.add(d.buf_off as usize) })
+}
+
+fn handle(channel: u64, d: &Desc, mapped: &mut Vec<Mapped>) -> i64 {
+    let result: Result<i64, i64> = (|| match d.op {
+        ECHO => Ok(d.arg[0] as i64 + 1),
+        READ => {
+            let i = map(channel, d.grant, mapped)?;
+            let m = &mapped[i];
+            let p = range(m, d)?;
+            Ok((0..d.len as usize).map(|i| unsafe { p.add(i).read_volatile() } as i64).sum())
+        }
+        WRITE => {
+            let i = map(channel, d.grant, mapped)?;
+            let m = &mapped[i];
+            if !m.writable {
+                return Err(-EACCES);
+            }
+            let p = range(m, d)?;
+            for i in 0..d.len as usize {
+                unsafe { p.add(i).write_volatile(d.arg[0] as u8) };
+            }
+            Ok(d.len as i64)
+        }
+        PROBE_READ_ONLY => {
+            let i = map(channel, d.grant, mapped)?;
+            let m = &mapped[i];
+            let len = m.len as usize;
+            if oxrt::mprotect(m.addr, len, PROT_READ | PROT_WRITE) != Err(-EACCES) {
+                return Ok(1);
+            }
+            if oxrt::mprotect(m.addr, len, PROT_READ | PROT_EXEC) != Err(-EACCES) {
+                return Ok(2);
+            }
+            // The kernel stores a timespec there for us: it must refuse.
+            const CLOCK_MONOTONIC: u64 = 1;
+            if oxrt::syscall(oxrt::sys::CLOCK_GETTIME, [CLOCK_MONOTONIC, m.addr as u64, 0, 0, 0, 0]) != -EFAULT {
+                return Ok(3);
+            }
+            let _ = unsafe { m.addr.read_volatile() };
+            Ok(0)
+        }
+        DMA => oxrt::grant_dma(channel, d.grant, d.buf_off as u64).map(|a| a as i64),
+        DMA_UNMAP => oxrt::grant_dma_unmap(channel, d.grant).map(|_| 0),
+        CHECK_GONE => {
+            let Some(i) = mapped.iter().position(|m| m.grant == d.grant) else { return Err(-EINVAL) };
+            let m = mapped.swap_remove(i);
+            if oxrt::grant_map(channel, d.grant).err() != Some(-ENOENT) {
+                return Ok(1);
+            }
+            Ok(if gone(m.addr) { 0 } else { 2 })
+        }
+        CRASH => {
+            let i = map(channel, d.grant, mapped)?;
+            let m = &mapped[i];
+            unsafe { m.addr.write_volatile(0x42) };
+            // Not reached: the store is the service's end.
+            Ok(-1)
+        }
+        CLEAN_ENDS => Ok(CLEAN.load(Ordering::Relaxed)),
+        SLEEPS => Ok(SLEPT.load(Ordering::Relaxed) as i64),
+        _ => Err(-EINVAL),
+    })();
+    result.unwrap_or_else(|e| e)
+}

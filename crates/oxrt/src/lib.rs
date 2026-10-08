@@ -13,12 +13,15 @@ use linked_list_allocator::LockedHeap;
 pub mod sys {
     pub const WRITE: u64 = 1;
     pub const MMAP: u64 = 9;
+    pub const MPROTECT: u64 = 10;
+    pub const FUTEX: u64 = 202;
     pub const SCHED_YIELD: u64 = 24;
     pub const GETPID: u64 = 39;
     pub const EXIT_GROUP: u64 = 231;
     pub const IOPERM: u64 = 173;
     pub const CLOCK_GETTIME: u64 = 228;
-    /// (name, name length, argument) -> service id
+    /// (name, name length, argument, flags) -> service id; flags:
+    /// `IPC_CHANNELS` (the service accepts channel offers)
     pub const IPC_REGISTER: u64 = 1000;
     /// (buffer, buffer length, &request id) -> message length
     pub const IPC_RECEIVE: u64 = 1001;
@@ -32,7 +35,35 @@ pub mod sys {
     pub const PROC_QUERY: u64 = 1005;
     /// (token): wakes whoever waits on the server's object `token`
     pub const IPC_NOTIFY: u64 = 1006;
+
+    // The service's end of a channel (docs/design/io-rings.md; the client's
+    // calls are `restricted::SYS_CHAN_CREATE` and the following).
+
+    /// (channel) -> address: maps a channel offered to this service (an
+    /// `Offer` in a control request) into its memory, read and write; ENOENT
+    /// if it was not offered to it, EPIPE if the client is gone.
+    pub const CHAN_ATTACH: u64 = 1068;
+    /// (channel): lets go of the channel: the mappings of it and of its
+    /// grants go, the client sees `SERVICE_GONE`; vouches that no device
+    /// uses its grants any more.
+    pub const CHAN_DETACH: u64 = 1069;
+    /// (channel, grant, &info) -> address: maps a grant of the channel's
+    /// client (read-only unless granted writable; never executable, not
+    /// inherited by fork, gone when revoked); stores (pages, writable) as
+    /// two u64s at `info`. ENOENT for an unknown or revoked grant.
+    pub const GRANT_MAP: u64 = 1070;
+    /// (channel, grant, offset) -> device address of the byte at `offset`
+    /// of the grant (valid to the end of its page); EINVAL beyond the
+    /// grant. A revoked grant stays pinned until `GRANT_DMA_UNMAP`.
+    pub const GRANT_DMA: u64 = 1071;
+    /// (channel, grant): the service's devices are done with the grant.
+    pub const GRANT_DMA_UNMAP: u64 = 1072;
 }
+
+/// `ipc_register` flag: the service accepts channel offers.
+pub const IPC_CHANNELS: u64 = 1;
+/// Set in the id of a control request (from the kernel itself).
+pub const IPC_CONTROL: u64 = 1 << 63;
 
 /// Raw system call; returns the kernel's result (negative errno on error).
 pub fn syscall(nr: u64, a: [u64; 6]) -> i64 {
@@ -94,7 +125,12 @@ pub fn ioperm(from: u16, count: u16) -> Result<(), i64> {
 /// Registers this process as the server behind `name`; `arg` is passed to
 /// the kernel (for filesystems: the root inode).
 pub fn ipc_register(name: &str, arg: u64) -> Result<u64, i64> {
-    match syscall(sys::IPC_REGISTER, [name.as_ptr() as u64, name.len() as u64, arg, 0, 0, 0]) {
+    ipc_register_with(name, arg, 0)
+}
+
+/// `ipc_register` with flags (`IPC_CHANNELS`).
+pub fn ipc_register_with(name: &str, arg: u64, flags: u64) -> Result<u64, i64> {
+    match syscall(sys::IPC_REGISTER, [name.as_ptr() as u64, name.len() as u64, arg, flags, 0, 0]) {
         e if e < 0 => Err(e),
         id => Ok(id as u64),
     }
@@ -104,6 +140,10 @@ pub fn ipc_register(name: &str, arg: u64) -> Result<u64, i64> {
 pub enum Event {
     /// A request: (request id, message length).
     Request(u64, usize),
+    /// A control request of the kernel's (a channel offer, see
+    /// `ring::channel::Offer`), only to services registered with
+    /// `IPC_CHANNELS`: (request id, message length).
+    Control(u64, usize),
     /// Device interrupts fired; the bit mask of the lines.
     Interrupt(u16),
     /// The timeout ran out.
@@ -122,6 +162,7 @@ pub fn ipc_receive(buf: &mut [u8], timeout_ms: Option<u64>) -> Result<Event, i64
         r if r == -ETIMEDOUT => Ok(Event::Timeout),
         r if r < 0 => Err(r),
         r if id == 0 => Ok(Event::Interrupt(r as u16)),
+        r if id & IPC_CONTROL != 0 => Ok(Event::Control(id, r as usize)),
         r => Ok(Event::Request(id, r as usize)),
     }
 }
@@ -166,6 +207,55 @@ pub fn ipc_reply(id: u64, msg: &[u8]) -> Result<(), i64> {
         0 => Ok(()),
         e => Err(e),
     }
+}
+
+fn result(r: i64) -> Result<u64, i64> {
+    if r < 0 { Err(r) } else { Ok(r as u64) }
+}
+
+/// Maps the offered channel `channel`; returns its address.
+pub fn chan_attach(channel: u64) -> Result<*mut u8, i64> {
+    result(syscall(sys::CHAN_ATTACH, [channel, 0, 0, 0, 0, 0])).map(|a| a as *mut u8)
+}
+
+pub fn chan_detach(channel: u64) -> Result<(), i64> {
+    result(syscall(sys::CHAN_DETACH, [channel, 0, 0, 0, 0, 0])).map(|_| ())
+}
+
+/// Maps grant `grant` of `channel`: (address, pages, writable).
+pub fn grant_map(channel: u64, grant: u32) -> Result<(*mut u8, u64, bool), i64> {
+    let mut info = [0u64; 2];
+    let addr = result(syscall(sys::GRANT_MAP, [channel, grant as u64, info.as_mut_ptr() as u64, 0, 0, 0]))?;
+    Ok((addr as *mut u8, info[0], info[1] != 0))
+}
+
+/// The device address of byte `offset` of grant `grant`.
+pub fn grant_dma(channel: u64, grant: u32, offset: u64) -> Result<u64, i64> {
+    result(syscall(sys::GRANT_DMA, [channel, grant as u64, offset, 0, 0, 0]))
+}
+
+pub fn grant_dma_unmap(channel: u64, grant: u32) -> Result<(), i64> {
+    result(syscall(sys::GRANT_DMA_UNMAP, [channel, grant as u64, 0, 0, 0, 0])).map(|_| ())
+}
+
+/// mprotect(2).
+pub fn mprotect(addr: *const u8, len: usize, prot: u64) -> Result<(), i64> {
+    result(syscall(sys::MPROTECT, [addr as u64, len as u64, prot, 0, 0, 0])).map(|_| ())
+}
+
+/// futex(2) FUTEX_WAIT on a shared word (not private: the word may be in
+/// memory shared with another process, a channel): sleeps while `*word ==
+/// value`, at most `timeout_ms` (None: no limit). EPIPE once the word's
+/// object was hung up (a channel whose peer is gone).
+pub fn futex_wait(word: &core::sync::atomic::AtomicU32, value: u32, timeout_ms: Option<u64>) -> Result<(), i64> {
+    let ts = timeout_ms.map(|ms| [ms / 1000, (ms % 1000) * 1_000_000]);
+    let ts_ptr = ts.as_ref().map_or(0, |t| t.as_ptr() as u64);
+    result(syscall(sys::FUTEX, [word as *const _ as u64, 0, value as u64, ts_ptr, 0, 0])).map(|_| ())
+}
+
+/// futex(2) FUTEX_WAKE on a shared word: wakes up to `n` waiters.
+pub fn futex_wake(word: &core::sync::atomic::AtomicU32, n: u32) -> Result<u64, i64> {
+    result(syscall(sys::FUTEX, [word as *const _ as u64, 1, n as u64, 0, 0, 0]))
 }
 
 pub mod port {
