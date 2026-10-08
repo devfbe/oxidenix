@@ -23,7 +23,8 @@ An AI research project; see README.md.
 - `nix-shell -p e2fsprogs --run "cargo test -p ext2fs"` (workspace root) tests the ext2
   library on the host against a RAM disk; CI runs it too. `cargo test -p vfs` tests the pure
   parts of the Linux server's namespace (paths, cpio) on the host, `cargo test -p slab` the
-  size-class allocator of the kernel's and the server's heaps.
+  size-class allocator of the kernel's and the server's heaps, `cargo test --release -p ring`
+  the I/O ring's invariants (with threads; release for realistic interleavings).
 - QEMU must always run with a visible window; never use `-display none`.
 - `cd kernel && OXIDENIX_BUILD_ONLY=1 cargo run` builds the boot image and data disk without
   starting QEMU.

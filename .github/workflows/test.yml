@@ -46,6 +46,9 @@ jobs:
       - name: Test the size-class allocator on the host
         run: cargo test -p slab
 
+      - name: Test the I/O ring on the host
+        run: cargo test --release -p ring
+
       - name: Boot oxidenix and run the self-tests
         working-directory: kernel
         shell: bash

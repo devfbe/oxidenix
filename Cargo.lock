@@ -569,6 +569,10 @@ name = "restricted"
 version = "0.1.0"
 
 [[package]]
+name = "ring"
+version = "0.1.0"
+
+[[package]]
 name = "rustix"
 version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

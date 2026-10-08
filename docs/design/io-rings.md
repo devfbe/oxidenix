@@ -69,12 +69,12 @@ Invariants (each checked by the ring's tests):
 3. **Recycling**: the consumer reads a slot, then stores `head + 1` with `Release`. The producer
    loads `head` with `Acquire` before writing a slot at or beyond the old `head + N`, so the
    consumer's read happened before the overwrite.
-4. **No lost wakeup**: a consumer that finds the ring empty stores `sleeping = 1` (`SeqCst`),
-   loads `tail` again (`SeqCst`), and sleeps on the futex only if it is still unchanged. A
-   producer stores `tail` (`Release`), then loads `sleeping` (`SeqCst` fence before it); if set,
-   it clears it and wakes. Either the consumer's second load sees the new tail, or the
-   producer's load sees `sleeping`; both cannot miss (the store-load pairs are ordered by the
-   fences).
+4. **No lost wakeup**: only the consumer writes `sleeping`. Finding the ring empty, it stores
+   `sleeping = 1`, fences (`SeqCst`), loads `tail` again and sleeps on the futex only if it is
+   unchanged; it clears `sleeping` once it has an entry. A producer stores `tail` (`Release`),
+   fences (`SeqCst`) and loads `sleeping`; if set, it wakes. Either the consumer's second load
+   sees the new tail, or the producer's load sees `sleeping`. (A producer that cleared the
+   flag could erase the one of the consumer's next sleep: the ring's tests caught exactly that.)
 5. A malformed descriptor (bad grant, offset beyond the grant, unknown operation) completes with
    an error; it never touches memory outside the grants. The service validates every field it
    reads from shared memory once (copies the descriptor out first: no double fetch).
