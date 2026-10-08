@@ -63,14 +63,22 @@ int main(void) {
     sigaction(SIGSEGV, &sa, NULL);
     sigaction(SIGBUS, &sa, NULL);
 
-    /* Demand paging: a big mapping costs nothing until it is touched. */
+    /* Demand paging: a big mapping costs nothing until it is touched. This program's own
+     * text, data and stack are demand-paged too, so the first call of resident() and mmap()
+     * faults in the pages of their code (sscanf and the rest of stdio) after the reading was
+     * taken; how many depends on libc's layout. Run both once beforehand so that between the
+     * readings only the mapping and the two touches can change the count. */
+    resident();
+    munmap(mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0), 4096);
     long before = resident();
     char *big = mmap(NULL, 64 * MIB, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     long after_map = resident();
     big[0] = 1;
     big[32 * MIB] = 2;
     long after_touch = resident();
-    check("64 MiB mmap is not resident until touched", big != MAP_FAILED && after_map - before < 4 && after_touch - after_map == 2);
+    int lazy = big != MAP_FAILED && after_map == before && after_touch - after_map == 2;
+    check("64 MiB mmap is not resident until touched", lazy);
+    if (!lazy) printf("  (resident pages: %ld before, %ld mapped, %ld touched)\n", before, after_map, after_touch);
     check("untouched pages read as zero", big[48 * MIB] == 0 && big[1] == 0);
     munmap(big, 64 * MIB);
 
