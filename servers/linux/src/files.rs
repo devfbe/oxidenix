@@ -167,10 +167,11 @@ pub fn handle(s: &State) -> Option<i64> {
             sendfile(a0, out, a1, input, a2, s.r10)
         }
         SYS_PIPE2 => pipe2(a0, a1),
-        // The kernel's files have nothing to write back: /data's do.
-        SYS_SYNC => crate::datafs::sync_all().map(|_| 0),
+        // The kernel's files have nothing to write back: /data's do, in
+        // every instance's page cache.
+        SYS_SYNC => sync_everywhere().map(|_| 0),
         SYS_SYNCFS => match lookup(a0) {
-            Some((File::Data(_), _)) => crate::datafs::sync_all().map(|_| 0),
+            Some((File::Data(_), _)) => sync_everywhere().map(|_| 0),
             Some(_) => Ok(0),
             None => return None,
         },
@@ -388,4 +389,16 @@ fn eventfd2(initval: u64, flags: u64) -> Result<i64, i64> {
     let e = Arc::new(EventFd::new(initval as u32 as u64, flags & EFD_SEMAPHORE != 0));
     let open = O_RDWR | (flags as u32 & (O_NONBLOCK | O_CLOEXEC));
     install(e.id(), File::EventFd(e.clone()), open, e.ready())
+}
+
+/// sync(2) of /data: this instance's caches and, at the same time, every
+/// other instance's (each has its own page cache of the disk); returns
+/// once all are written back and flushed. The error is this instance's.
+fn sync_everywhere() -> Result<(), i64> {
+    let ticket = crate::syscall(SYS_SYNC_OTHERS, [0; 6]);
+    let result = crate::datafs::sync_all();
+    if ticket > 0 {
+        crate::syscall(SYS_SYNC_OTHERS, [ticket as u64, 0, 0, 0, 0, 0]);
+    }
+    result
 }

@@ -930,8 +930,9 @@ pub fn sync_all() -> Result<(), i64> {
     result
 }
 
-/// truncate(2), ftruncate: diskfs first (it refuses what it cannot hold,
-/// EFBIG), then the cache (its pages beyond go, also from mappings).
+/// truncate(2), ftruncate: growing, diskfs first (it refuses what it
+/// cannot hold, EFBIG), then the cache; shrinking, the cache first (its
+/// pages beyond go, also from mappings), then diskfs.
 pub fn truncate(inode: &Arc<DInode>, len: u64) -> Result<(), i64> {
     live(inode)?;
     match inode.kind {
@@ -1254,7 +1255,8 @@ fn evict(ino: u32) {
     // The object goes with the inode (its last handle).
 }
 
-/// `EVENT_CLOSING`: the instance ends: everything written back and flushed.
+/// `EVENT_CLOSING` (the instance ends) and `EVENT_SYNC`: everything
+/// written back and flushed.
 pub fn closing() {
     let _ = sync_all();
 }
@@ -1330,6 +1332,19 @@ pub fn test(scenario: u64) -> i64 {
                 check!(34, (50_000_000..5_000_000_000).contains(&waited));
                 // Let go of: it truncates.
                 check!(35, truncate(&inode, 0).is_ok());
+                0
+            }
+            4 => {
+                // A sync across instances: a ticket, waited for (no other
+                // instance runs in the tests: at once); only the service
+                // thread answers one.
+                let ticket = syscall(SYS_SYNC_OTHERS, [0; 6]);
+                check!(40, ticket > 0);
+                let start = now();
+                check!(41, syscall(SYS_SYNC_OTHERS, [ticket as u64, 0, 0, 0, 0, 0]) == 0);
+                check!(42, now() - start < 1_000_000_000);
+                check!(43, syscall(SYS_SYNC_OTHERS, [0; 6]) > ticket);
+                check!(44, syscall(SYS_SYNC_DONE, [ticket as u64, 0, 0, 0, 0, 0]) == -1);
                 0
             }
             _ => -1000,

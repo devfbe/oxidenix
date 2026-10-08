@@ -393,10 +393,20 @@ fn reboot(magic: u64, magic2: u64, cmd: u64) -> SysResult {
     if magic != MAGIC || !MAGIC2.contains(&magic2) {
         return Err(EINVAL);
     }
+    if ![POWER_OFF, HALT, RESTART].contains(&cmd) {
+        return Err(EINVAL);
+    }
+    // Every Linux server instance writes its caches back and flushes them
+    // first (the caller's too: its pager is another thread), at most
+    // `SYNC_WAIT` (each request to diskfs is bounded on its own).
+    const SYNC_WAIT: u64 = 60 * crate::time::NSEC_PER_SEC;
+    let ticket = super::linux::sync_start(None);
+    if !super::linux::sync_wait(ticket, None, crate::time::now() + SYNC_WAIT) {
+        crate::printkln!("[kernel] reboot: a Linux server did not write its caches back");
+    }
     match cmd {
-        POWER_OFF | HALT => crate::power_off(0),
         RESTART => crate::restart(),
-        _ => Err(EINVAL),
+        _ => crate::power_off(0),
     }
 }
 

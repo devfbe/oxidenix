@@ -345,6 +345,14 @@ pages and dirty marks the kernel keeps and whose data the server moves:
   ratios; never the pager, which does the writing). `event_wait` takes a deadline (`EVENT_TIMER`,
   for the server's periodic write-back) and delivers `EVENT_CLOSING` once when the instance's
   last program is gone, for its final write-back.
+- **Syncs across instances.** Each instance caches /data on its own, so `sync(2)` and `syncfs`
+  ask every other instance too: `sync_others(0)` (1081) queues `EVENT_SYNC` for each other
+  instance's pager and returns a ticket, the caller writes its own caches back meanwhile, and
+  `sync_others(ticket)` waits until each asked pager wrote back and flushed and answered
+  `sync_done(ticket)` (1082), or is gone. `reboot(2)` does the same for every instance (60 s at
+  most) before the machine goes; the shutdown after the last program (`shell::settle`) too,
+  then waits for the instances to end, as long as pages are still being written back or
+  instances ending (ten seconds without progress, five minutes at most).
 - **Faults wait unlocked.** A fault that needs a page from a pager asks for it and waits with
   the address space unlocked, then tries again (`Fault::Retry`; `MAP_POPULATE` only asks): the
   pager's write-back write-protects mappings, which locks address spaces, so no thread may wait

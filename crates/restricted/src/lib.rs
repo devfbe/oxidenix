@@ -215,6 +215,10 @@ pub const EVENT_TIMER: u64 = 6;
 /// The instance's last program is gone: the service thread writes its
 /// caches back; its next `event_wait` ends its process.
 pub const EVENT_CLOSING: u64 = 7;
+/// Write every cache back and flush (as sync(2)), then `sync_done(a)`: a
+/// sync of another instance (`SYS_SYNC_OTHERS`) or a reboot waits for it.
+/// One is queued at a time; `a` is the latest ticket it answers.
+pub const EVENT_SYNC: u64 = 8;
 
 /// A server thread starts with its role in `rsi` (and its `State` in
 /// `rdi`): it serves a program's thread, or it is the instance's pager.
@@ -539,6 +543,17 @@ pub const SYS_MO_REDIRTY: u64 = 1078;
 /// itself). `mo_unmap_server(addr)` removes it.
 pub const SYS_MO_MAP_SERVER: u64 = 1079;
 pub const SYS_MO_UNMAP_SERVER: u64 = 1080;
+/// `sync_others(ticket)`: sync(2) across instances (/data's page cache is
+/// per instance). With 0 it asks every other instance's service thread to
+/// write its caches back (`EVENT_SYNC`) and returns a ticket (> 0); with a
+/// ticket it waits until each instance asked then has answered it
+/// (`sync_done`) or its service thread is gone, or the caller is killed.
+/// Not from the service thread (EPERM: two instances' service threads
+/// would wait for each other).
+pub const SYS_SYNC_OTHERS: u64 = 1081;
+/// `sync_done(ticket)`: the service thread wrote back what `EVENT_SYNC`
+/// with that ticket asked for. Service thread only.
+pub const SYS_SYNC_DONE: u64 = 1082;
 
 /// `(scenario)`: the server runs a channel scenario against the test
 /// service (servers/ringtest, `ring::selftest`): 1 rings and doorbells, 2
@@ -564,6 +579,8 @@ pub const TEST_DISKRING: u64 = 1515;
 /// reads as zeros), 2 a write-back grant over more pages than one call
 /// looks at goes on where the kernel says (`EAGAIN`) and finds the dirty
 /// page at the end, 3 a truncation waiting for a page pinned by a grant
-/// that is never let go of gives up with `EBUSY` after its wait. 0 if every check held, else the negative number of the
+/// that is never let go of gives up with `EBUSY` after its wait, 4
+/// `sync_others` hands out growing tickets and returns at once with no
+/// other instance, and `sync_done` is the service thread's only. 0 if every check held, else the negative number of the
 /// first that failed.
 pub const TEST_CACHED: u64 = 1516;

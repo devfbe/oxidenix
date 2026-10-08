@@ -30,23 +30,49 @@ pub fn run() -> ! {
     }
 }
 
-/// Before the machine goes off: the Linux server instances end (each writes
-/// its caches back to the disk), then their channels (diskfs commits what
-/// they held), each wait at most a few seconds.
+/// Before the machine goes off: every Linux server instance is asked to
+/// write its caches back (one whose programs still run, too) and the
+/// instances end (each writes back once more), then their channels go
+/// (diskfs commits what they held). Each wait lasts `SETTLE` without
+/// progress (pages written back, instances ended) and `SETTLE_MAX` at
+/// most: a big write-back is not cut short, a hung one does not hold the
+/// shutdown for ever.
 pub fn settle() {
-    let deadline = crate::time::now() + 10 * crate::time::NSEC_PER_SEC;
-    // (The pagers' processes end last, as the kernel's children: reaped
-    // here, their instances go.)
-    let ended = loop {
-        crate::process::reap_orphans();
-        let soon = (crate::time::now() + 50_000_000).min(deadline);
-        if crate::process::linux::settle(soon) {
-            break true;
-        }
-        if crate::time::now() >= deadline {
-            break false;
+    use crate::time::{now, NSEC_PER_SEC};
+    const SETTLE: u64 = 10 * NSEC_PER_SEC;
+    const SETTLE_MAX: u64 = 300 * NSEC_PER_SEC;
+    let limit = now() + SETTLE_MAX;
+    let progress = || (crate::fs::cache::cleaned_pages(), crate::process::linux::live());
+    // Runs `step(until)` until it reports done; whether it did in time.
+    let wait = |step: &mut dyn FnMut(u64) -> bool| {
+        let mut seen = progress();
+        let mut deadline = (now() + SETTLE).min(limit);
+        loop {
+            let soon = (now() + 50_000_000).min(deadline);
+            if step(soon) {
+                return true;
+            }
+            let p = progress();
+            if p != seen {
+                seen = p;
+                deadline = (now() + SETTLE).min(limit);
+            }
+            if now() >= deadline {
+                return false;
+            }
         }
     };
+    let ticket = crate::process::linux::sync_start(None);
+    if !wait(&mut |until| crate::process::linux::sync_wait(ticket, None, until)) {
+        crate::printkln!("[kernel] a Linux server instance did not write its caches back");
+    }
+    // (The pagers' processes end last, as the kernel's children: reaped
+    // here, their instances go.)
+    let ended = wait(&mut |until| {
+        crate::process::reap_orphans();
+        crate::process::linux::settle(until)
+    });
+    let deadline = now() + SETTLE;
     if !ended {
         crate::printkln!("[kernel] a Linux server instance did not end; its caches may not be written back. Still there:");
         for (pid, _, name, state, server, _, _) in crate::process::list() {

@@ -62,6 +62,62 @@ fn live_chan() -> usize {
     &LIVE as *const _ as usize
 }
 
+/// Instances alive (a shutdown waits for them to end).
+pub fn live() -> usize {
+    LIVE.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// Every instance made (gone ones are pruned when a new one comes), for
+/// syncs across instances.
+static INSTANCES: spin::Mutex<Vec<alloc::sync::Weak<Instance>>> = spin::Mutex::new(Vec::new());
+/// The last sync ticket handed out (`sync_start`).
+static SYNC_TICKET: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Where `sync_wait` sleeps: woken by `sync_done` and by a pager's end.
+fn sync_chan() -> usize {
+    &SYNC_TICKET as *const _ as usize
+}
+
+/// The instances alive, but `except`.
+fn instances(except: Option<&Instance>) -> Vec<Arc<Instance>> {
+    let all = INSTANCES.lock();
+    all.iter()
+        .filter_map(|w| w.upgrade())
+        .filter(|i| !except.is_some_and(|e| core::ptr::eq(Arc::as_ptr(i), e)))
+        .collect()
+}
+
+/// Asks every instance's pager but `except`'s to write its caches back
+/// and flush (`EVENT_SYNC`); the ticket to wait for (`sync_wait`).
+pub fn sync_start(except: Option<&Instance>) -> u64 {
+    let ticket = SYNC_TICKET.fetch_add(1, core::sync::atomic::Ordering::AcqRel) + 1;
+    for instance in instances(except) {
+        instance.ask_sync(ticket);
+    }
+    ticket
+}
+
+/// Waits until every instance but `except` that `ticket` asked has
+/// answered (or its pager is gone), at most until `deadline` (0: none), or
+/// until the caller is being killed. Whether all did.
+pub fn sync_wait(ticket: u64, except: Option<&Instance>, deadline: u64) -> bool {
+    let asked = instances(except);
+    loop {
+        let wait = super::sched::prepare_to_wait(sync_chan());
+        if asked.iter().all(|i| i.synced(ticket)) {
+            return true;
+        }
+        if super::signal::dying() || (deadline != 0 && crate::time::now() >= deadline) {
+            return false;
+        }
+        if deadline != 0 {
+            wait.sleep_until(deadline);
+        } else {
+            wait.sleep();
+        }
+    }
+}
+
 /// Waits until every instance of the Linux server is gone (each wrote its
 /// caches back and closed its channels: its pager handled `EVENT_CLOSING`
 /// last), at most until `deadline`: for a shutdown, after the last program
@@ -163,6 +219,11 @@ struct PagerQueue {
     closing_told: bool,
     /// An `EVENT_WRITEBACK` is queued (one at a time).
     writeback_queued: bool,
+    /// An `EVENT_SYNC` is queued (one at a time), for tickets up to
+    /// `sync_wanted`; the pager answered those up to `sync_done`.
+    sync_queued: bool,
+    sync_wanted: u64,
+    sync_done: u64,
     /// The pager's process is gone: no page will come any more.
     dead: bool,
 }
@@ -230,6 +291,9 @@ impl Instance {
                 closing: false,
                 closing_told: false,
                 writeback_queued: false,
+                sync_queued: false,
+                sync_wanted: 0,
+                sync_done: 0,
                 dead: false,
             }),
             programs: core::sync::atomic::AtomicUsize::new(0),
@@ -242,7 +306,37 @@ impl Instance {
         instance.entry = instance.load(image)?;
         // Counted from here on (its drop uncounts it).
         LIVE.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
-        Arc::try_new(instance).map_err(|_| ENOMEM)
+        let instance = Arc::try_new(instance).map_err(|_| ENOMEM)?;
+        let mut all = INSTANCES.lock();
+        all.retain(|w| w.strong_count() > 0);
+        all.try_reserve(1).map_err(|_| ENOMEM)?;
+        all.push(Arc::downgrade(&instance));
+        drop(all);
+        Ok(instance)
+    }
+
+    /// Asks the pager for `EVENT_SYNC` (ticket `ticket`).
+    fn ask_sync(&self, ticket: u64) {
+        {
+            let mut q = self.pager.lock();
+            if q.dead {
+                return;
+            }
+            q.sync_wanted = q.sync_wanted.max(ticket);
+            if q.sync_queued {
+                return;
+            }
+            q.sync_queued = true;
+            q.requests.push_back(Event { kind: EVENT_SYNC, a: 0, b: 0 });
+        }
+        super::wakeup(self.pager_chan());
+    }
+
+    /// Whether the pager answered `ticket` (or was never asked for it, or
+    /// is gone).
+    fn synced(&self, ticket: u64) -> bool {
+        let q = self.pager.lock();
+        q.dead || q.sync_done >= ticket || q.sync_wanted < ticket
     }
 
     pub fn pdpt(&self) -> PhysFrame {
@@ -605,6 +699,7 @@ impl Instance {
         drop(q);
         crate::fs::cache::pager_gone(self as *const Instance as *const ());
         super::wakeup(self.answer_chan());
+        super::wakeup(sync_chan());
     }
 
     /// An address space of one of the tree's programs appeared.
@@ -1017,6 +1112,26 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             }
         },
         SYS_EVENT_RELEASES => Ok(instance.pager.lock().releases as i64),
+        SYS_SYNC_OTHERS => {
+            if is_pager() {
+                return Err(EPERM);
+            }
+            if a[0] == 0 {
+                return Ok(sync_start(Some(&instance)) as i64);
+            }
+            sync_wait(a[0], Some(&instance), 0);
+            Ok(0)
+        }
+        SYS_SYNC_DONE => {
+            if !is_pager() {
+                return Err(EPERM);
+            }
+            let mut q = instance.pager.lock();
+            q.sync_done = q.sync_done.max(a[0].min(q.sync_wanted));
+            drop(q);
+            super::wakeup(sync_chan());
+            Ok(0)
+        }
         SYS_KFD_INSTALL => {
             use crate::fs::file::{OpenFile, ServerFile, Kind, O_ACCMODE, O_APPEND, O_CLOEXEC, O_NONBLOCK};
             let (id, flags, ready, kind) = (a[0], a[1] as u32, a[2] as i16, a[3]);
@@ -1509,12 +1624,17 @@ fn event_wait(instance: &Arc<Instance>, out: u64, deadline: u64) -> Option<SysRe
         let next = x86_64::instructions::interrupts::without_interrupts(|| {
             let wait = super::sched::prepare_to_wait(instance.pager_chan());
             let mut q = instance.pager.lock();
-            if let Some(e) = q.requests.pop_front() {
+            if let Some(mut e) = q.requests.pop_front() {
                 match e.kind {
                     EVENT_PAGE => {
                         q.queued.remove(&(e.a, e.b / PAGE));
                     }
                     EVENT_WRITEBACK => q.writeback_queued = false,
+                    EVENT_SYNC => {
+                        // Answers every ticket asked so far.
+                        q.sync_queued = false;
+                        e.a = q.sync_wanted;
+                    }
                     _ => {}
                 }
                 return Some(Some(e));
@@ -1549,9 +1669,12 @@ fn event_wait(instance: &Arc<Instance>, out: u64, deadline: u64) -> Option<SysRe
                         EVENT_TIMER => {}
                         EVENT_CLOSING => q.closing_told = false,
                         EVENT_WRITEBACK if q.writeback_queued => {}
+                        EVENT_SYNC if q.sync_queued => {}
                         _ => {
-                            if event.kind == EVENT_WRITEBACK {
-                                q.writeback_queued = true;
+                            match event.kind {
+                                EVENT_WRITEBACK => q.writeback_queued = true,
+                                EVENT_SYNC => q.sync_queued = true,
+                                _ => {}
                             }
                             q.requests.push_front(event)
                         }

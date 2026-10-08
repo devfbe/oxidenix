@@ -68,6 +68,14 @@ pub fn dirty_pages() -> u64 {
     DIRTY.load(Ordering::Relaxed)
 }
 
+/// Dirty pages written back or dropped so far (a shutdown waits longer
+/// while this moves).
+static CLEANED: AtomicU64 = AtomicU64::new(0);
+
+pub fn cleaned_pages() -> u64 {
+    CLEANED.load(Ordering::Relaxed)
+}
+
 /// Pages of tmpfs file contents, and their limit: half of what may be
 /// committed, as Linux's default tmpfs size.
 static TMPFS_PAGES: AtomicU64 = AtomicU64::new(0);
@@ -171,6 +179,7 @@ fn undirty(pages: u64) {
     if pages == 0 {
         return;
     }
+    CLEANED.fetch_add(pages, Ordering::Relaxed);
     let before = DIRTY.fetch_sub(pages, Ordering::Relaxed);
     let hard = memory::commit_stats().1 / HARD;
     if before > hard && before - pages <= hard {

@@ -166,6 +166,12 @@ fn pager() -> ! {
                 datafs::closing();
                 continue;
             }
+            EVENT_SYNC => {
+                // Another instance's sync(2), or a reboot.
+                datafs::closing();
+                syscall(SYS_SYNC_DONE, [event.a, 0, 0, 0, 0, 0]);
+                continue;
+            }
             _ => {}
         }
         let request = PagerRequest { key: event.a, offset: event.b };
