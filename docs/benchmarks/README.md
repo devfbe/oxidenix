@@ -28,6 +28,8 @@ virtio-net with user networking and the echo service at 10.0.2.100:7.
 | `seq_read_disk` | the file with `O_DIRECT` in 64 KiB `pread`s (past the page cache, from the server); MB/s |
 | `seq_read_cached` | the file from the page cache in 64 KiB `pread`s; MB/s |
 | `read_4k_cached` | 2000 random 4 KiB `pread`s from the page cache; ns, p50/p99 |
+| `pread_4k_cached` | random 4 KiB `pread`s from the page cache alone, in cycles (no clock calls around each) |
+| `clock_gettime` | `clock_gettime(CLOCK_MONOTONIC)` alone, cycles |
 | `read_4k_disk` | the same with `O_DIRECT`; ns, p50/p99 |
 | `tcp_loopback` | 32 MiB in 64 KiB `write`s over 127.0.0.1 to a forked receiver; MB/s |
 | `tcp_network_echo` | 4 MiB through the network card to QEMU's echo service and back (sent while a forked reader drains the echo); MB/s. Bound by QEMU's user networking and the `cat` behind the echo service as much as by the guest |
@@ -58,3 +60,13 @@ same QEMU configuration and a data disk made the same way; the counter columns a
 The host must be idle while a benchmark runs. Runs of 2026-10-07 (and the first one of phase
 R1) were taken while a compiler kept every host CPU busy and are deleted; every stage up to
 R5 was measured again on an idle host on 2026-10-08 (the files ending in `-quiet`).
+
+## Open: PCIDs and small cached reads
+
+Turning PCIDs on (commit `fae8292`, before restricted mode) made random 4 KiB reads from the
+page cache 2.5× slower (968 → 2524 ns p50), while null system calls, `fstat`, sequential
+reads and the cost per kernel entry stayed the same; the same commit with PCIDs left off
+measures 1022 ns, and `-cpu max` alone changes nothing (978 ns at the baseline). The direct
+map of physical memory uses 2 MiB pages, so direct-map TLB misses do not explain it. Since
+R1, the figure is dominated by forwarding instead (pread 3932 cycles, `clock_gettime` 1770,
+p50, at `92bb179`; without PCIDs 5689 and 2573).

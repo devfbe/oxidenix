@@ -228,6 +228,24 @@ static void block_io(void) {
     }
     per_op("read_4k_cached", N);
     percentiles("read_4k_cached", lat, N, "ns");
+
+    /* The same in cycles, without the clock calls around it, and the clock
+     * call alone. */
+    static uint64_t cyc[N];
+    for (int i = 0; i < N; i++) {
+        off_t off = (rand_r(&seed) % (FILE_SIZE / 4096)) * 4096;
+        uint64_t a = rdtsc();
+        pread(fd, buf, 4096, off);
+        cyc[i] = rdtsc() - a;
+    }
+    percentiles("pread_4k_cached", cyc, N, "cycles");
+    struct timespec ts;
+    for (int i = 0; i < N; i++) {
+        uint64_t a = rdtsc();
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        cyc[i] = rdtsc() - a;
+    }
+    percentiles("clock_gettime", cyc, N, "cycles");
     close(fd);
 
     fd = open(path, O_RDONLY | O_DIRECT);
