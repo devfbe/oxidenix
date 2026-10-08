@@ -52,8 +52,10 @@ pub fn new_id() -> u64 {
 /// Registers `file` under `id` and gives it a descriptor (the lowest free
 /// one). On failure the file is forgotten again.
 pub fn install(id: u64, file: File, flags: u32, ready: i16) -> Result<i64, i64> {
+    // Regular files and directories are always ready.
+    let kind = if matches!(file, File::Tmp(_)) { KFD_ALWAYS_READY } else { 0 };
     FILES.lock().insert(id, file);
-    let fd = syscall(SYS_KFD_INSTALL, [id, flags as u64, ready as u16 as u64, 0, 0, 0]);
+    let fd = syscall(SYS_KFD_INSTALL, [id, flags as u64, ready as u16 as u64, kind, 0, 0]);
     if fd < 0 {
         FILES.lock().remove(&id);
         return Err(-fd);

@@ -522,8 +522,19 @@ pub fn root() -> Arc<Inode> {
     ROOT.get().expect("fs::init not called").clone()
 }
 
+/// The initramfs the kernel booted with.
+static INITRAMFS: Once<&'static [u8]> = Once::new();
+
+/// The boot image's initramfs, for the Linux server (`SYS_INITRAMFS`).
+pub fn initramfs() -> Option<&'static [u8]> {
+    INITRAMFS.get().copied()
+}
+
 pub fn init(ramdisk: Option<&'static [u8]>) {
     cache::init();
+    if let Some(data) = ramdisk {
+        INITRAMFS.call_once(|| data);
+    }
     let root = ROOT.call_once(|| Inode::new(Node::Dir(BTreeMap::new()), 0o755).expect("file quota exhausted at boot"));
     if let Some(data) = ramdisk {
         if let Err(e) = cpio::unpack(root, data) {

@@ -88,11 +88,13 @@ pub struct ServerFile {
     pub id: u64,
     owner: Weak<dyn ServerFiles>,
     ready: AtomicU32,
+    /// Always ready (a regular file or a directory of the server's).
+    always: bool,
 }
 
 impl ServerFile {
-    pub fn new(id: u64, owner: Weak<dyn ServerFiles>, ready: i16) -> Arc<ServerFile> {
-        Arc::new(ServerFile { id, owner, ready: AtomicU32::new(ready as u16 as u32) })
+    pub fn new(id: u64, owner: Weak<dyn ServerFiles>, ready: i16, always: bool) -> Arc<ServerFile> {
+        Arc::new(ServerFile { id, owner, ready: AtomicU32::new(ready as u16 as u32), always })
     }
 
     /// The server's readiness report: wakes who polls the file.
@@ -511,6 +513,7 @@ impl OpenFile {
             Kind::PipeWrite(p) => PollSource::Chan(p.write_chan()),
             Kind::EventFd(e) => PollSource::Chan(e.chan()),
             Kind::Epoll(e) => PollSource::Epoll(e.clone()),
+            Kind::Server(s) if s.always => PollSource::Always,
             Kind::Server(s) => PollSource::Chan(s.chan()),
             // netd announces readiness changes.
             Kind::Socket(s) => s.poll_source(),

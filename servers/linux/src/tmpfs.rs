@@ -188,6 +188,26 @@ impl Inode {
         Ok(inode)
     }
 
+    /// A new file `name` whose contents are the file object `handle` (the
+    /// file takes it over, also on failure).
+    pub fn insert_object(&self, name: &str, handle: u64, perm: u32) -> Result<(), i64> {
+        let object = Object(handle);
+        check_name(name)?;
+        self.insert(name, Inode::new(Kind::File(object), perm & 0o7777))
+    }
+
+    /// The directory `name`, made if missing.
+    pub fn subdir(&self, name: &str, perm: u32) -> Result<Arc<Inode>, i64> {
+        match self.lookup(name) {
+            Ok(d) if d.is_dir() => Ok(d),
+            Ok(_) => Err(ENOTDIR),
+            Err(_) => match self.create(name, true, perm) {
+                Err(EEXIST) => self.lookup(name),
+                other => other,
+            },
+        }
+    }
+
     pub fn symlink(&self, name: &str, target: String) -> Result<(), i64> {
         check_name(name)?;
         self.insert(name, Inode::new(Kind::Symlink(target), 0o777))

@@ -1,7 +1,8 @@
 //! The server's namespace (phase R6c.2): mounts and path resolution.
 //!
-//! A mount puts a filesystem at a path: the server's tmpfs (`tmpfs`), or a
-//! directory of the kernel's tree, reached through handles on its inodes
+//! A mount puts a filesystem at a path: the server's tmpfs (`tmpfs`) at
+//! the root, or a directory of the kernel's tree (/dev, /proc, /sys,
+//! /data), reached through handles on its inodes
 //! (`restricted::SYS_INODE_*`), until the server's own filesystems serve
 //! them. Mounts are found by name, as everything here: ".." is resolved
 //! lexically before symlinks are looked at (as the kernel's VFS did:
@@ -107,15 +108,28 @@ struct Mount {
     fs: Fs,
 }
 
-/// The mount table: the kernel's tree at the root, the server's tmpfs at
-/// /tmp (the instance's own, empty at its start).
+/// The directories of the kernel's tree the namespace shows: the devices,
+/// procfs and sysfs, and diskfs's disk, until the server serves them.
+const KERNEL_MOUNTS: [&str; 4] = ["dev", "proc", "sys", "data"];
+
+/// The mount table: the instance's own tmpfs at the root, unpacked from
+/// the initramfs when the instance first resolves a path, and the kernel's
+/// directories above.
 static MOUNTS: Mutex<Vec<Mount>> = Mutex::new(Vec::new());
 
 fn with_mounts<R>(f: impl FnOnce(&Vec<Mount>) -> R) -> R {
     let mut m = MOUNTS.lock();
     if m.is_empty() {
-        m.push(Mount { at: Vec::new(), fs: Fs::Kernel(Vec::new()) });
-        m.push(Mount { at: alloc::vec![String::from("tmp")], fs: Fs::Tmpfs(tmpfs::new_root()) });
+        let root = tmpfs::new_root();
+        root.set_perm(0o755);
+        crate::initramfs::unpack(&root);
+        let _ = root.subdir("tmp", 0o1777);
+        m.push(Mount { at: Vec::new(), fs: Fs::Tmpfs(root.clone()) });
+        for name in KERNEL_MOUNTS {
+            // The mount point, so that the root lists it.
+            let _ = root.subdir(name, 0o755);
+            m.push(Mount { at: alloc::vec![String::from(name)], fs: Fs::Kernel(alloc::vec![String::from(name)]) });
+        }
     }
     f(&m)
 }

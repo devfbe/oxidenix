@@ -17,6 +17,32 @@ out=$(sh /etc/disktest.sh 2>&1)
 echo "$out"
 if echo "$out" | grep -q FAIL || [ "$(echo "$out" | grep -c ': ok')" -ne 15 ]; then fail disktest; else echo "PASS disktest"; fi
 
+echo "=== bash"
+out=$(bash -c '
+    cd /
+    f() { echo "f:$1"; }
+    a=(x y z); n=$(( ${#a[@]} * 7 ))
+    f "${a[1]}"; echo "n=$n"
+    [[ "abc" == a* ]] && echo glob
+    printf "%s\n" one two three | grep -c o
+    cat <<END > /tmp/bash.$$
+here $n
+END
+    read -r line < /tmp/bash.$$; echo "$line"; rm /tmp/bash.$$
+    (cd /etc && pwd); pwd
+    echo "$(basename /bin/sh)"
+' 2>&1)
+echo "$out"
+want="f:y
+n=21
+glob
+2
+here 21
+/etc
+/
+sh"
+if [ "$out" = "$want" ]; then echo "PASS bash"; else fail bash; fi
+
 echo "=== test.sh"
 out=$(sh /etc/test.sh 2>&1)
 echo "$out"

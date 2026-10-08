@@ -127,7 +127,8 @@ pub(super) enum Object {
     Inode(Arc<crate::fs::Inode>),
     /// The contents of a file of the server's (a tmpfs file object), with
     /// the hold this handle carries (`SYS_MO_HOLD`).
-    File(Arc<PageCache>, Option<Arc<Record>>),
+    File(Arc<PageCache>, Option<Arc<Record>>),    /// The initramfs of the boot image, read-only (`SYS_INITRAMFS`).
+    Image(&'static [u8]),
 }
 
 /// Most handles one instance may hold.
@@ -719,7 +720,7 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
                         Backing::File { cache, offset, shared, may_write, _hold: None }
                     }
                     Object::KernelFile(f) => file_backing(&f, shared, prot, len, offset)?,
-                    Object::Inode(_) => return Err(EINVAL),
+                    Object::Inode(_) | Object::Image(_) => return Err(EINVAL),
                     // As a file's mapping: it may reach beyond the end (SIGBUS
                     // there), and keeps the handle's hold while it exists.
                     Object::File(cache, hold) => {
@@ -755,12 +756,12 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
         SYS_EVENT_WAIT => event_wait(&instance, a[0]),
         SYS_KFD_INSTALL => {
             use crate::fs::file::{OpenFile, ServerFile, Kind, O_ACCMODE, O_APPEND, O_CLOEXEC, O_NONBLOCK};
-            let (id, flags, ready) = (a[0], a[1] as u32, a[2] as i16);
-            if id == 0 || flags & !(O_ACCMODE | O_NONBLOCK | O_APPEND | O_CLOEXEC) != 0 {
+            let (id, flags, ready, kind) = (a[0], a[1] as u32, a[2] as i16, a[3]);
+            if id == 0 || flags & !(O_ACCMODE | O_NONBLOCK | O_APPEND | O_CLOEXEC) != 0 || kind & !KFD_ALWAYS_READY != 0 {
                 return Err(EINVAL);
             }
             let owner: alloc::sync::Weak<dyn crate::fs::file::ServerFiles> = Arc::downgrade(&instance) as _;
-            let placeholder = ServerFile::new(id, owner, ready);
+            let placeholder = ServerFile::new(id, owner, ready, kind == KFD_ALWAYS_READY);
             instance.files.lock().insert(id, Arc::downgrade(&placeholder));
             let file = OpenFile::new(Kind::Server(placeholder), flags, None);
             with_current(|p| p.alloc_fd(file, flags & O_CLOEXEC != 0, 0))
@@ -818,6 +819,17 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
         }
         SYS_SHARED_MAP => Ok(instance.grow_heap(a[0])? as i64),
         SYS_INODE_ROOT..=SYS_EXEC_TARGET => super::linux_inode::call(&instance, nr, a),
+        SYS_INITRAMFS => {
+            let image = crate::fs::initramfs().ok_or(ENOENT)?;
+            super::uaccess::copy_to_server(a[0], &(image.len() as u64).to_le_bytes())?;
+            Ok(instance.insert(Object::Image(image))? as i64)
+        }
+        SYS_MO_FROM_IMAGE => {
+            let Object::Image(image) = instance.object(a[0])? else { return Err(EINVAL) };
+            let end = a[1].checked_add(a[2]).filter(|&e| e <= image.len() as u64).ok_or(EINVAL)?;
+            let cache = PageCache::memory(&image[a[1] as usize..end as usize])?;
+            Ok(instance.insert(Object::File(cache, None))? as i64)
+        }
         SYS_MO_CREATE_FILE => {
             let cache = PageCache::memory(&[])?;
             Ok(instance.insert(Object::File(cache, None))? as i64)
@@ -938,6 +950,14 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
         SYS_MO_READ | SYS_MO_WRITE => {
             let (handle, offset, buf, len) = (a[0], a[1], a[2], a[3]);
             let object = instance.object(handle)?;
+            if let Object::Image(image) = object {
+                if nr == SYS_MO_WRITE {
+                    return Err(EACCES);
+                }
+                let end = offset.checked_add(len).filter(|&e| e <= image.len() as u64).ok_or(EINVAL)?;
+                super::uaccess::copy_to_server(buf, &image[offset as usize..end as usize])?;
+                return Ok(len as i64);
+            }
             let cache = instance.memory(handle)?;
             // Within the object (a file object: a read up to its end, a
             // write as far as it goes), a page-sized piece at a time.

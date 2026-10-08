@@ -266,11 +266,15 @@ pub const TEST_USERCOPY: u64 = 1511;
 // there, so dup, close, fork, exec's close-on-exec and poll/epoll keep
 // working; the server handles every other operation on it.
 
-/// `kfd_install(id, flags, ready) -> fd`: a new descriptor (the lowest
-/// free one) for the server's file `id`, with open flags `flags`
+/// `kfd_install(id, flags, ready, kind) -> fd`: a new descriptor (the
+/// lowest free one) for the server's file `id`, with open flags `flags`
 /// (O_ACCMODE, O_NONBLOCK, O_APPEND; O_CLOEXEC for the descriptor) and
-/// poll readiness `ready`. When its last descriptor goes, `EVENT_CLOSED`.
+/// poll readiness `ready`; `kind` `KFD_ALWAYS_READY` for a file that is
+/// always ready (a regular file or a directory: epoll refuses it with
+/// EPERM, as Linux does), else 0. When its last descriptor goes,
+/// `EVENT_CLOSED`.
 pub const SYS_KFD_INSTALL: u64 = 1034;
+pub const KFD_ALWAYS_READY: u64 = 1;
 /// `kfd_lookup(fd, flags) -> id`: the server's file behind descriptor
 /// `fd` (0: a file of the kernel's; EBADF), its current open flags stored
 /// at `flags` (a u32 in the server's memory) unless 0.
@@ -401,3 +405,12 @@ pub const SYS_MO_FILE_SIZE: u64 = 1059;
 /// `mo_truncate(handle, len)`: sets the file object's size (pages beyond
 /// it go, also from mappings).
 pub const SYS_MO_TRUNCATE: u64 = 1060;
+
+/// `initramfs(size) -> handle`: the boot image's initramfs (a cpio
+/// archive), read-only; its length stored at `size` (a u64). `mo_read`
+/// reads it. ENOENT if the kernel booted without one.
+pub const SYS_INITRAMFS: u64 = 1061;
+/// `mo_from_image(image, offset, len) -> handle`: a new file object whose
+/// contents start as `len` bytes of the image at `offset` (no copy until a
+/// page is needed; writes stay the object's).
+pub const SYS_MO_FROM_IMAGE: u64 = 1062;

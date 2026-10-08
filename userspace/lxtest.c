@@ -332,10 +332,11 @@ int main(void) {
     check("unlink and rmdir", rmdir("lx") == 0 && stat("lx", &sb) == -1 && errno == ENOENT);
     chdir("/");
 
-    /* /tmp is the server's own tmpfs (R6c.2c): its files are file objects
-     * the server reads, writes and maps without the kernel's VFS. */
+    /* The root is the server's own tmpfs (R6c.2c), unpacked from the
+     * initramfs: its files are file objects the server reads, writes and
+     * maps without the kernel's VFS. */
     int tf = open("/tmp/lxfile", O_CREAT | O_RDWR | O_TRUNC, 0644);
-    check("a /tmp file is the server's (its own device)", tf >= 0 && fstat(tf, &sb) == 0 && sb.st_dev == 0x1a && S_ISREG(sb.st_mode));
+    check("a /tmp file is the server's tmpfs (its own device)", tf >= 0 && fstat(tf, &sb) == 0 && sb.st_dev == 0x1a && S_ISREG(sb.st_mode));
     char block[4096];
     memset(block, 'z', sizeof block);
     l0 = legacy_calls();
@@ -367,9 +368,12 @@ int main(void) {
     if (d) closedir(d);
     check("readdir of a /tmp directory", names == 2);
     errno = 0;
-    check("rename between /tmp and the rest is EXDEV", rename("/tmp/lxfile", "/lxfile") == -1 && errno == EXDEV);
+    check("rename between the server's tmpfs and the kernel's /data is EXDEV", rename("/tmp/lxfile", "/data/lxfile") == -1 && errno == EXDEV);
     errno = 0;
-    check("removing the mount point /tmp is EBUSY", rmdir("/tmp") == -1 && errno == EBUSY);
+    check("removing the mount point /proc is EBUSY", rmdir("/proc") == -1 && errno == EBUSY);
+    check("the root and its programs are the server's tmpfs (from the initramfs)",
+          stat("/", &sb) == 0 && sb.st_dev == 0x1a && stat("/bin/busybox", &sb) == 0 && sb.st_dev == 0x1a && S_ISREG(sb.st_mode));
+    check("/proc and /dev are the kernel's", stat("/proc/counters", &sb) == 0 && sb.st_dev != 0x1a && stat("/dev/null", &sb) == 0 && S_ISCHR(sb.st_mode));
     unlink("/tmp/lxdir/one"); unlink("/tmp/lxdir/two"); rmdir("/tmp/lxdir"); unlink("/tmp/lxfile");
     check("unlinked /tmp files are gone", stat("/tmp/lxdir", &sb) == -1 && stat("/tmp/lxfile", &sb) == -1);
     printf("lxtest: %s\n", failures ? "FAILED" : "all passed");

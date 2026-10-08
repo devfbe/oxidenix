@@ -204,12 +204,14 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
        first, the kernel's tree, reached through handles on its inodes (lookup, create,
        unlink, rename, readlink, stat, open into a descriptor, exec). The same bridge later
        serves `/data`, `/proc`, `/sys` and `/dev` until c3 and R6d.
-     - **c2c — tmpfs in the server**: the server's own tmpfs, with files as file objects
+     - **c2c — tmpfs in the server** (done): the server's own tmpfs, with files as file objects
        (read, write, `mmap` and exec without the kernel's VFS; ETXTBSY through holds the kernel
-       reports when let go). First (done) mounted at `/tmp`, with the kernel's tree at the root;
-       then the root becomes the server's tmpfs, unpacked from the initramfs (an object of the
-       boot image), and the kernel's tree stays mounted for what it still serves (`/dev`,
-       `/proc`, `/data`).
+       reports when let go). First mounted at `/tmp`, with the kernel's tree at the root;
+       then (done) the root became the server's tmpfs, unpacked from the initramfs (an object
+       of the boot image, its members file objects over its bytes), and the kernel's tree
+       stays mounted for what it still serves (`/dev`, `/proc`, `/sys`, `/data`). Each
+       instance has its own copy (a process tree is a container); pages of a program two
+       trees run are not shared between them.
      - **c3**: the server as the client of diskfs and procfs, with its page cache and
        write-back.
    - **R6d — The terminal** (ADR 0004): the console as a device of the server, the line

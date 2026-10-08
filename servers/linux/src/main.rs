@@ -15,6 +15,7 @@ extern crate alloc;
 mod eventfd;
 mod files;
 mod heap;
+mod initramfs;
 mod mm;
 mod namespace;
 mod paths;
