@@ -71,7 +71,7 @@ fn cmd_echo(args: &Vec<&str, 8>) {
 
 fn cmd_halt() {
     crate::printkln!("Bye!");
-    crate::fs::cache::flush_all();
+    super::settle();
     // isa-debug-exit: write to port 0xf4 exits QEMU with code 2*val+1
     use x86_64::instructions::port::Port;
     unsafe {

@@ -2,8 +2,8 @@
 //!
 //! A server registers under a name, then loops over `receive` and `reply`.
 //! The kernel acts as the client on behalf of user programs: `call` queues
-//! a request and sleeps until the reply arrives; `post` queues one without
-//! waiting. Messages are copied through the kernel.
+//! a request and sleeps until the reply arrives; `post_to` queues one
+//! without waiting. Messages are copied through the kernel.
 //!
 //! Besides the requests of its own protocol, a server registered with
 //! `IPC_CHANNELS` gets control requests from the kernel itself (offers of
@@ -438,14 +438,9 @@ fn wait_reply_with(id: u64, abandon: &mut dyn FnMut() -> bool) -> Result<Vec<u8>
     }
 }
 
-/// Sends `message` without waiting for (or receiving) a reply. Never
-/// sleeps, so it can be used while dropping objects.
-pub fn post(service: usize, message: Vec<u8>) {
-    let _ = enqueue(service, message, false, None);
-}
-
-/// Like `post`, but only to this registration of the server; dropped if
-/// the server was restarted meanwhile.
+/// Sends `message` without waiting for (or receiving) a reply, only to
+/// this registration of the server (dropped if the server was restarted
+/// meanwhile). Never sleeps, so it can be used while dropping objects.
 pub fn post_to(to: Instance, message: Vec<u8>) {
     let _ = enqueue(to.service, message, false, Some(to.generation));
 }

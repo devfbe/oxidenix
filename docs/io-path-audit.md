@@ -2,7 +2,8 @@
 
 State of commit `34bdbc5` (2026-10-07), before any I/O refactoring. The counts come from
 reading the code path by path; the instrumented counters of the benchmark step (see
-`docs/benchmarks/`) are to confirm them.
+`docs/benchmarks/`) are to confirm them. Since R6c.3 the paths of files on `/data` are no
+longer these: see "Files on `/data` since R6c.3" at the end.
 
 ## How a Linux system call reaches a server
 
@@ -171,6 +172,27 @@ batches, by DMA from the page cache pages); `fsync` makes it durable.
 10. **Kernel entries** are not the bottleneck yet (the copies and switches are), but each
     round trip costs the server two system calls, and there are no mitigations (KPTI,
     IBRS) in this kernel that would make them more expensive than plain `syscall`/`sysret`.
+
+## Files on `/data` since R6c.3
+
+The Linux server is `/data`'s client (`servers/linux/src/datafs.rs`) and the kernel's VFS is
+no longer in the path: requests go through the shared-memory rings of a channel to diskfs
+(`docs/design/io-rings.md`, ADR 0005), data through granted pages of the server's page cache.
+
+- A **page cache hit** (`read`): the server's handler, one kernel call that copies from the
+  cache page to the program (`SYS_MO_FILE_READ`): one copy, no server round trip.
+- A **miss**: the reading thread grants the run of missing pages (with read-ahead up to 1 MiB)
+  and sends one `READ`; diskfs maps the blocks and the device writes the pages by DMA. Zero
+  CPU copies of the data before the copy to the program (findings 1, 2); many requests in flight
+  at once, 32 in diskfs, the device reordering them (findings 6, 7).
+- A **write** copies into cache pages (one copy) and returns; write-back sends `WRITE`s from
+  granted dirty pages, the device reading them by DMA, many in flight; only `fsync`, `O_SYNC`
+  and their kin wait for the device and a `FLUSH` (finding 8).
+- Metadata (`LOOKUP`, `STAT`, ...) is one ring request each, names and results in a granted
+  scratch buffer: no IPC, no global lock (findings 3, 4), no address space switch when diskfs
+  is polling (finding 5).
+- Not yet: the IOMMU (finding 9; the grants are the interface it will confine), and procfs and
+  the sockets still go through IPC (I/O rings steps 5, R7).
 
 ## Not in the system
 

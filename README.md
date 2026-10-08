@@ -79,7 +79,9 @@ Its [commit history](#development-history) records every step.
   card and the TCP/IP stack (smoltcp) run in `netd`, a user-space server; the interface is
   configured by DHCP, and loopback (`127.0.0.1`) works too.
 - **Persistent storage**: the data disk is mounted at `/data`, survives reboots, and stays
-  consistent enough that `e2fsck` on the host accepts it.
+  consistent enough that `e2fsck` on the host accepts it. The Linux server serves it from its
+  own page cache, which the disk server fills and writes back by DMA through shared-memory
+  rings (write-back, as on Linux: `fsync` makes data durable).
 - **Clocks** with nanosecond resolution from the TSC: every Linux clock, exact CPU time per
   thread and process (`getrusage`, `times`), and wall-clock time that starts from the CMOS
   real-time clock and can be set (`date`, file timestamps).
@@ -251,7 +253,8 @@ About 9,200 lines of Rust (without comments and blank lines) in the kernel and 3
    block, local APIC timer and idle task) →
    **interrupts on**.
 3. The kernel starts the servers: `/sbin/diskfs` asks for its I/O ports, mounts the ext2 disk
-   and registers as service `diskfs`; the kernel then mounts it at `/data`. Then the kernel
+   and registers as service `diskfs` for channels (each Linux server instance connects one and
+   mounts the disk at `/data`). Then the kernel
    scans PCI for a virtio network card and starts `/sbin/netd` with its ports, interrupt line
    and a DMA area; netd registers as service `net` once DHCP has configured the interface
    (or after three seconds without an answer). Last, `/sbin/procfs` provides `/proc` and
@@ -303,25 +306,19 @@ About 9,200 lines of Rust (without comments and blank lines) in the kernel and 3
   open for writing keeps that right after the descriptor is closed, as on Linux, so a program
   cannot be changed through a shared mapping while it runs. Servers run from a private copy
   taken at boot.
-- **Disk files are cached** (the remote store): a file of a disk filesystem server (`/data`)
-  keeps its pages in the same page cache. A miss reads up to 64 KiB of missing pages in one
-  go; `write` sends the data to the server first (so writes stay synchronous and durable) and
-  then puts it into the cached pages, creating those it covers whole. The cache also keeps the
-  file size, so cached reads need no request at all: reading 2 MiB takes 0.3 ms from the cache
-  and 4.4 s from the disk. As on Linux, a file's pages stay cached after it is closed (the
-  caches belong to the filesystem, not to the short-lived VFS inode) until reclaim takes them
-  or the server frees the inode (whose number may then be reused). procfs generates its files on
-  every read, so they are never cached.
-- **Write-back of shared mappings**: a shared mapping of a disk file maps its pages read-only
-  until the first store, whose fault marks the page dirty (`Dirty` in `/proc/meminfo`) and
-  makes it writable. Write-back takes the dirty mark, write-protects the page in every address
-  space that maps it, then writes it to the server; a store in between faults, marks the page
-  again and is written next time, so none is lost. `msync(MS_SYNC)`, `fsync`/`fdatasync` and
-  `sync` write back, and so does a kernel thread (the flusher) every 5 seconds, so stores reach
-  the disk on their own, also after `munmap` or the end of the process. A writer that finds a
-  fifth of the commit limit dirty writes back itself, since reclaim cannot drop dirty pages.
-  The kernel writes everything back before it powers off. `O_DIRECT` reads come from the disk
-  after writing back the dirty pages of their range, as on Linux.
+- **Disk files are cached** (the cached store): a file on `/data` is a *cached object* of the
+  Linux server's page cache (below, `/data` in the server): the kernel keeps its pages, its
+  size and which pages are dirty, the server fills and writes them back through diskfs. As on
+  Linux, a file's pages stay cached after it is closed, until reclaim takes them. procfs
+  generates its files on every read, so they are never cached.
+- **Dirty pages**: a write or a store marks a cached page dirty (`Dirty` in `/proc/meminfo`);
+  a shared mapping maps a page read-only until the first store, whose fault marks it dirty and
+  makes it writable. Write-back takes the dirty marks of a run of pages, write-protects them in
+  every address space that maps them, then has them written; a store in between faults, marks
+  the page again and is written next time, so none is lost. Reclaim cannot drop dirty pages:
+  above a tenth of the commit limit (or when reclaim finds them in its way) the server is asked
+  to write back, above a fifth a storing thread waits for it. A fault that needs a page from
+  the server waits for it with the address space unlocked.
 - **Protection**: `mprotect` really changes the rights (including `PROT_NONE`, which keeps the
   pages' contents in entries marked by a software bit) and execution is denied by NX unless an
   area is executable, so JIT compilers can write code and then make it executable (W^X).
@@ -411,7 +408,7 @@ The scheduler is built for several CPUs (`process/sched.rs`, design in
   `fork`) that queueing, stealing and migration respect. Each CPU has an idle task; idling loads the kernel's page table, so an address
   space is only ever active on the CPU running its process.
 - **Kernel threads** (`sched::spawn_kernel_thread`) run a kernel function on their own stack,
-  without an address space, signals or a pid; the page cache's flusher is one.
+  without an address space, signals or a pid; the channels' teardown worker is one.
 - **`on_cpu`** marks a task whose kernel stack is still in use; a CPU that picks it waits
   until its previous CPU finished switching away. An exited task's last reference is dropped
   by the next task on that CPU, after the switch, so its stack is freed only then.
@@ -606,8 +603,8 @@ moved memory, time, pipes, eventfd, paths and the root tmpfs into the server.
   initramfs into a tmpfs of its own when it first resolves a path (`initramfs`: the archive as
   a read-only object; `mo_from_image`: a file object over a member's bytes, copied only page
   by page when needed and written privately). The kernel's tree stays mounted where it still
-  serves: `/dev`, `/proc`, `/sys` and `/data` (the namespace finds mounts by name, the longest
-  first). The kernel keeps its own view of the initramfs for what it starts itself (the
+  serves: `/dev`, `/proc` and `/sys` (the namespace finds mounts by name, the longest first);
+  `/data` is the server's own (below). The kernel keeps its own view of the initramfs for what it starts itself (the
   servers, `/init`); a program a tree runs comes from the tree's tmpfs. Its directories
   and symlinks live in the server; a file's contents are a **file object** of the kernel's
   (`mo_create_file`), a memory object that grows and shrinks like a file, charged to the same
@@ -640,19 +637,40 @@ moved memory, time, pipes, eventfd, paths and the root tmpfs into the server.
   grants survive a revoke (`set_copy_fixup`: the fault fails the copy, not the service), and
   `grant_dma_pages` hands out the device addresses of a page range in one call.
 - **diskfs's ring service** (I/O rings step 3, `crates/fsring`, `servers/diskfs/src/service.rs`):
-  beside the kernel's IPC protocol, diskfs takes channels and serves the file protocol over
-  them: reads and writes of files (up to 32 in flight, the device moving the data by DMA
+  diskfs takes channels and serves the file protocol over them (its only protocol): reads and writes of files (up to 32 in flight, the device moving the data by DMA
   straight between the disk and the client's granted pages; the CPU only zero-fills holes and
   reads a partial sector before a write that does not cover it), lookup, create, unlink,
-  rename, truncate, readdir, readlink, stat, statfs, flush and grant release. Writes are
+  rename, truncate, readdir, readlink, stat, statfs, flush and grant release (`FORGET`, at once
+  for a grant no request uses). Writes are
   write-back: blocks reserved in memory, linked once the data is on the device, durable with a
   `FLUSH` that writes data before metadata. Every descriptor is copied out once and validated,
   malformed ones complete with an error, a grant revoked under diskfs fails the request (its
   copies run behind the kernel's copy fixup), resources are bounded per channel. One thread:
   polling while busy, doorbells into `ipc_receive` while idle (also while a client's requests
-  wait for room in its completion ring). An unlinked inode is freed only when no client (ring
-  channel or the kernel's IPC client) holds it any more. The Linux server's page cache
-  becomes its client in step 4; until then only the self-tests are.
+  wait for room in its completion ring). An unlinked inode is freed only when no channel holds
+  it any more.
+- **`/data` in the server** (phase R6c.3, I/O rings step 4, `servers/linux/src/datafs.rs`,
+  `fsclient.rs`, `datafile.rs`): the Linux server is diskfs's client over one channel per
+  instance. Paths on `/data` are resolved with `LOOKUP`s, every path call and every call on an
+  open file (`read`, `write` and their vectored and positioned forms, `lseek`, `fstat`,
+  `ftruncate`, `fsync`, `fdatasync`, `getdents64`, `fstatfs`, `sendfile`, `mmap`, `execve`,
+  `sync`, `syncfs`, `msync`) is the server's, none passes through to the kernel. Each regular
+  file the server uses has one cached object for all its descriptors, mappings and programs. A
+  read that meets a missing page fills it itself, a fault through the pager thread: a run of
+  missing pages (read-ahead from 64 KiB up to 1 MiB while the file is read in order) is granted
+  to diskfs, whose device writes them by DMA, and declared filled. `write` copies into the cache
+  and marks pages dirty; write-back grants runs of dirty pages and sends `WRITE`s from them by
+  DMA, many in flight: `fsync`, `fdatasync`, `msync(MS_SYNC)`, `sync`, `O_SYNC`, `O_DSYNC` and
+  `RWF_(D)SYNC` wait for it and a `FLUSH`; the pager writes a file back five seconds after it got
+  dirty, everything when the kernel asks for room and when the instance ends (the kernel waits
+  for that before it powers off). `O_DIRECT` reads write their range back and read from the
+  disk. Requests share the channel's slots (as many as the rings hold), one waiting thread at a
+  time takes completions and hands them out; every completion is checked against what was
+  asked. The server holds the inodes it uses in diskfs and releases them when it lets go: an
+  unlinked one once nothing uses it (its blocks are free when `unlink` or the last `close`
+  returns), the least recently used beyond 512. If diskfs dies, the next request connects a new
+  channel (diskfs is started again); in-flight reads fail with `EIO`, failed write-backs are
+  written again, inodes in use are held again (an unlinked one becomes stale: `EIO`).
 - Programs can ask their server for test calls (1500 and up, `lxtest`) that exercise this
   interface on the calling process.
 
@@ -735,16 +753,16 @@ interrupt dispatch; drivers and filesystems move into user-space servers.
   area belongs to the server description, not to the process, so a restarted server gets the
   same memory instead of leaking it while the device may still write to it.
 - **Remote filesystems**: the VFS has a second kind of inode whose operations become
-  `fsproto` requests to a server (`fs/remote.rs`). Reads and writes are split into 32 KiB
-  messages; file contents of a disk filesystem go through the page cache. The kernel still decides when an unlinked inode may be freed, because only it knows
-  whether a file is open.
+  `fsproto` requests to a server (`fs/remote.rs`): procfs's `/proc` and `/sys`, generated on
+  every read and never cached. (The disk is the Linux server's, over the I/O rings.)
 - **Fault isolation**: when a server dies, its services are marked dead and every pending
   request fails with `EIO`; the kernel and the rest of user space keep running.
 - **Self-healing**: the next request to a dead server starts it again (in the
   context of the requesting program, which may sleep) and continues transparently. Inode numbers
   live on disk, so files and directories that were open before the crash stay usable. Requests
   that were in flight during the crash still fail with `EIO`, since they may or may not have
-  been carried out. After five restarts the kernel gives up and the mount stays at `EIO`.
+  been carried out. After five restarts the kernel gives up and the service stays at `EIO`.
+  diskfs is restarted when a Linux server instance connects a new channel after it died.
   The same holds for netd: the next socket call restarts it, which resets the network card and
   repeats DHCP; sockets that were open in the old netd fail with `EIO`. Every registration of a
   service carries a generation number, and a socket only ever talks to the netd instance that
@@ -832,8 +850,8 @@ interrupt dispatch; drivers and filesystems move into user-space servers.
   (inode tables, bitmaps, group descriptors, directories, indirect blocks) are read once and
   changed in memory. Every operation commits before it answers: its dirty blocks are written
   (adjacent ones in one request), then the device is flushed once, so a finished `write` or
-  `create` is durable as before. File data bypasses this cache (the kernel's page cache holds
-  it): whole blocks are read and written straight to the device, a run of contiguous blocks as
+  `create` is durable as before. File data bypasses this cache (the Linux server's page cache
+  holds it): whole blocks are read and written straight to the device, a run of contiguous blocks as
   one request, and new data blocks are not zeroed first when they are written whole. Reading
   2 MiB from the disk takes about 60 ms (4.4 s with the former ATA PIO driver).
 - Failures stay safe: a block stays dirty until it was written, so what a failed commit (or
@@ -841,15 +859,17 @@ interrupt dispatch; drivers and filesystems move into user-space servers.
   zeroed before any metadata pointing to it reaches the disk, so no file ever shows a deleted
   file's data; block pointers read from the disk must lie inside the filesystem (`EIO`
   otherwise).
-- `write` is synchronous (the page cache writes through to diskfs, which commits it); `sync`,
-  `fsync` and `msync` write back what shared mappings stored. After a session,
-  `e2fsck -fn disk.img` on the host reports a clean filesystem, and `debugfs` can read the files.
-- **VFS integration**: every inode operation (`child`, `list`, `create`, `unlink`, `read_at`,
-  `write_at`, `truncate`, ...) works on memory and remote (server-backed) inodes alike. Remote inodes are cached per
-  filesystem so that one disk inode always maps to one `Arc<Inode>`. The disk root is mounted
-  at `/data`, and `statfs` and a static `/proc/mounts` make `df` work.
+- `write` leaves dirty pages in the Linux server's page cache; `fsync`, `sync`, `msync` and the
+  server's write-back write them, a `FLUSH` makes them durable. Before the machine powers off,
+  the kernel waits until every instance wrote its caches back and diskfs closed their channels.
+  After a session, `e2fsck -fn disk.img` on the host reports a clean filesystem, and `debugfs`
+  can read the files.
+- **Integration**: `/data` is a mount of every Linux server instance's namespace; one disk inode
+  is one `DInode` of the server's. `statfs` and the kernel's static `/proc/mounts` (which lists
+  the disk at `/data`) make `df` work.
 - A file that is deleted while still open stays allocated as an orphan until the last
-  reference is dropped, as on Linux, so its inode number cannot be reused under an open file.
+  reference is dropped, as on Linux (the server holds it in diskfs), so its inode number cannot
+  be reused under an open file.
 - Only regular files are read, written, truncated or executed through their data blocks; a
   fast symlink's block pointers hold text, never block numbers.
 - Directory reads take a snapshot at offset 0, so `rm -r` deleting entries while it reads never
@@ -939,15 +959,16 @@ Each of these programs and scripts lives in the root filesystem and runs inside 
 | `eventfdtest` | `eventfd` counting (initial value, adding writes, reset on read), `EFD_SEMAPHORE`, `EFD_NONBLOCK` and `EFD_CLOEXEC`, `EINVAL` for short reads, 2^64-1 and unknown flags, a full counter (`EAGAIN`, poll state), a blocking read woken by another process, `poll` waking within 1 ms of a write |
 | `sigmasktest` | temporary signal masks of `sigsuspend`, `ppoll` and `pselect`: a pending or arriving signal the mask lets through interrupts them and its handler runs with that mask, the caller's mask comes back afterwards, a successful `ppoll` leaves a blocked signal pending (`sigpending`), a mask that blocks a signal holds it off until the call returns, `EINVAL` for a wrong mask size |
 | `epolltest` | `epoll_create1`/`epoll_create` flags and sizes, `EPOLL_CTL_ADD`/`MOD`/`DEL` and their errors (`EEXIST`, `ENOENT`, `EPERM` for regular files, `EINVAL`, `EBADF`), level-triggered, edge-triggered and one-shot reporting, `EPOLLOUT` and `EPOLLERR` on a pipe's write end, interests removed with the file's last descriptor (not before), `maxevents` rotating through ready files, eventfds and UDP sockets in a set, nested instances (`ELOOP` for a loop and for chains longer than five, built at either end) and `poll` on an instance, wake-up within 1 ms of a write, timeouts, `EINTR` and `epoll_pwait`'s mask, `epoll_pwait2` |
-| `lxtest` | the Linux server's kernel interface through its test calls: a memory object it filled, mapped into the program, a program store read back by the server, write protection, unmapping, mappings refused at the server's region and unaligned; a paged object whose pages the pager thread supplies when the program reads them or the kernel copies from them (`write` from the mapping), each page once; `SIGKILL` ending a thread that waits for a page the pager never supplies; a page the pager fails raising `SIGBUS` and a later access getting it; the server's heap with 2000 blocks of many sizes and its mutex serializing six threads in two processes; `mmap`, `mprotect` and `munmap` handled by the server without a call passed through (`legacy_calls`), and `clock_gettime`, `gettimeofday` and `nanosleep` likewise; the server writing a page the program never touched, and `EFAULT` (not death) for read-only, `PROT_NONE` and unmapped program memory, for the server's own memory and across the 64 TiB line; pipe reads and writes without a call passed through, end of file after the writer closes; eventfd likewise, `EAGAIN` when empty and non-blocking; the server's records: a forked child's copy, a thread's shared one, released when processes end; path calls without a call passed through: `chdir`/`getcwd`, `umask` on a new file, `O_EXCL`, symlinks (`readlink`, `stat` vs. `lstat`, `O_NOFOLLOW`, a loop's `ELOOP`, a symlinked directory in a path), `openat` relative to a directory descriptor, `rename`, a child's own working directory, `fchdir`, `rmdir`, `O_CREAT` through a dangling symlink; `/tmp` as the server's tmpfs: its own device, reads, writes, `lseek` and `fstat` without a call passed through, `O_APPEND`, a shared mapping writing the file, `ftruncate`, `readdir`, `EXDEV` and `EBUSY` at the mounts, the root and `/bin/busybox` from the server's tmpfs, `/proc` and `/dev` the kernel's; channels to the test service `ringtest`: requests and completions through the rings with both ends sleeping on futex doorbells, a service's doorbell watch kept once when armed twice, never moved by a requeue, woken once and arriving as an `ipc_receive` event, connect errors (`EISCONN`, `ENOENT`, `EOPNOTSUPP`, `ENOTCONN`), grant data both ways, a read-only grant the service can neither `mprotect` writable or executable nor have the kernel store into, the kernel's grant bounds, device addresses only within a grant, `EBUSY` for truncating a granted page, `ENODATA` for an unsupplied paged page, a revoked grant gone from the service (its range reserved and inaccessible until the service unmaps it), a draining grant pinned with its id held until the service lets go, the client's end closing while the service sleeps (its grant mappings gone, pins released), the service dying of a store into a read-only grant while the client waits (the client wakes with `EPIPE`, the page unchanged, the service restarted for the next channel), the service executing a new program that can then neither map the grant nor get a device address of it; the file protocol against diskfs (`TEST_DISKRING`): the disk image's README read by DMA at unaligned offsets, stat, readdir with a cursor, statfs, a symlink; aligned, unaligned, one-sector and past-the-end writes, a flush, the file read back against a model, truncate, rename, permissions; malformed requests completing with `ENOSYS`, `EINVAL`, `EBADF`, `EACCES`, `ENOENT`, `ENAMETOOLONG`, `ENOTDIR`, `EEXIST`; 24 writes and 24 reads in flight; a grant revoked under diskfs (`EFAULT`, diskfs alive, `FORGET`); a client closing with reads in flight; a revoked grant's range given to no other grant; an unlinked inode freed only when no channel holds it; a write stalled behind another with every operation slot busy; requests waiting for completion room leaving diskfs idle (its CPU ticks in `/proc`) and completing once there is room; the ring's file read and removed through the kernel's `/data` |
+| `lxtest` | the Linux server's kernel interface through its test calls: a memory object it filled, mapped into the program, a program store read back by the server, write protection, unmapping, mappings refused at the server's region and unaligned; a paged object whose pages the pager thread supplies when the program reads them or the kernel copies from them (`write` from the mapping), each page once; `SIGKILL` ending a thread that waits for a page the pager never supplies; a page the pager fails raising `SIGBUS` and a later access getting it; the server's heap with 2000 blocks of many sizes and its mutex serializing six threads in two processes; `mmap`, `mprotect` and `munmap` handled by the server without a call passed through (`legacy_calls`), and `clock_gettime`, `gettimeofday` and `nanosleep` likewise; the server writing a page the program never touched, and `EFAULT` (not death) for read-only, `PROT_NONE` and unmapped program memory, for the server's own memory and across the 64 TiB line; pipe reads and writes without a call passed through, end of file after the writer closes; eventfd likewise, `EAGAIN` when empty and non-blocking; the server's records: a forked child's copy, a thread's shared one, released when processes end; path calls without a call passed through: `chdir`/`getcwd`, `umask` on a new file, `O_EXCL`, symlinks (`readlink`, `stat` vs. `lstat`, `O_NOFOLLOW`, a loop's `ELOOP`, a symlinked directory in a path), `openat` relative to a directory descriptor, `rename`, a child's own working directory, `fchdir`, `rmdir`, `O_CREAT` through a dangling symlink; `/tmp` as the server's tmpfs: its own device, reads, writes, `lseek` and `fstat` without a call passed through, `O_APPEND`, a shared mapping writing the file, `ftruncate`, `readdir`, `EXDEV` and `EBUSY` at the mounts, the root and `/bin/busybox` from the server's tmpfs, `/proc` and `/dev` the kernel's; channels to the test service `ringtest`: requests and completions through the rings with both ends sleeping on futex doorbells, a service's doorbell watch kept once when armed twice, never moved by a requeue, woken once and arriving as an `ipc_receive` event, connect errors (`EISCONN`, `ENOENT`, `EOPNOTSUPP`, `ENOTCONN`), grant data both ways, a read-only grant the service can neither `mprotect` writable or executable nor have the kernel store into, the kernel's grant bounds, device addresses only within a grant, `EBUSY` for truncating a granted page, `ENODATA` for an unsupplied paged page, a revoked grant gone from the service (its range reserved and inaccessible until the service unmaps it), a draining grant pinned with its id held until the service lets go, the client's end closing while the service sleeps (its grant mappings gone, pins released), the service dying of a store into a read-only grant while the client waits (the client wakes with `EPIPE`, the page unchanged, the service restarted for the next channel), the service executing a new program that can then neither map the grant nor get a device address of it; the file protocol against diskfs (`TEST_DISKRING`): the disk image's README read by DMA at unaligned offsets, stat, readdir with a cursor, statfs, a symlink; aligned, unaligned, one-sector and past-the-end writes, a flush, the file read back against a model, truncate, rename, permissions; malformed requests completing with `ENOSYS`, `EINVAL`, `EBADF`, `EACCES`, `ENOENT`, `ENAMETOOLONG`, `ENOTDIR`, `EEXIST`; 24 writes and 24 reads in flight; a grant revoked under diskfs (`EFAULT`, diskfs alive, `FORGET`); a client closing with reads in flight; a revoked grant's range given to no other grant; an unlinked inode freed only when no channel holds it; a write stalled behind another with every operation slot busy; requests waiting for completion room leaving diskfs idle (its CPU ticks in `/proc`) and completing once there is room; the ring's file read and removed through `/data` (the server's page cache, another channel) |
 | `vmtest` | demand paging (a 64 MiB mapping costs nothing until touched), `SIGSEGV` on read-only and `PROT_NONE` pages with contents kept, split areas after a partial `munmap`, NX and the JIT pattern (1 GiB `PROT_NONE` reservation, write code, `mprotect` to executable, call it), commit limit and `MAP_NORESERVE`, `mremap` in place and moving, `MADV_DONTNEED`, shared vs. private memory across `fork`, lazy file mappings and `SIGBUS` beyond the end, `MAP_FIXED_NOREPLACE`, stack growth to 4 MiB and overflow beyond 8 MiB, nothing mapped at or above 64 TiB (fixed mappings fail, hints and the stack stay below), the Linux server's memory out of the program's reach and its kernel calls `ENOSYS` for a program |
 | `smptest` | CPU count and affinity (pinning to every CPU, empty masks), parallel speed-up of CPU-bound processes, `fork`/`exit`/`wait` on every CPU at once, 5000 pipe round trips between two CPUs, signals to a process running on another CPU, timers on time while a program floods the console with palette changes on the same CPU |
 | `nettest` | TCP to an echo service through QEMU, `ECONNREFUSED`, `listen`/`accept` over loopback with a forked client, EOF after the peer closed, non-blocking `accept` and `connect` with `poll` and `SO_ERROR`, `EINTR` in a blocking `recv`, UDP over loopback, raw ICMP echo to the gateway and over loopback, source address for off-subnet destinations, overflowing message vectors, `AF_INET6` rejected |
 | `mmaptest` | shared file mappings: stores visible to `read` and `write` visible in the mapping at once, another process's own mapping of the file, the size unchanged by stores; private mappings seeing `write` until they write a page, and never reaching the file; mappings outliving `close` and `unlink`; the zero tail of the last page and `SIGBUS` beyond it; growing and shrinking with `ftruncate` (`SIGBUS` in shared pages and private copies beyond the new end, zeros after growing again); `EACCES` for writable sharing of a read-only descriptor (also via `mprotect`); shared anonymous memory across 8 children; mapping initramfs files |
 | `exectest` | eight runs of one program sharing its pages (less memory than one copy), data and bss of the loaded program, `ETXTBSY` for opening or truncating a running program and for running a program open for writing or mapped through a writable descriptor (not after `munmap`, not for a read-only mapping), a changed program file taking effect on the next run, a running program surviving the deletion of its file |
-| `cachetest` | the page cache of `/data` files: data read back right after writing (from memory), `Cached` in `/proc/meminfo`, committing all free memory reclaims cached pages (and all of it can be used), the file read again from the disk afterwards, read-only shared and private mappings of a disk file, `pwrite` visible to `pread` and both mappings, private stores staying private, `ftruncate` shrinking and growing (zeros, not old data, in reads and the mapping), a program on the disk running from the cache and `ETXTBSY` while it runs |
-| `writebacktest` | stores through a shared mapping of a `/data` file: reading makes nothing dirty, a store makes its page dirty (`Dirty` in `/proc/meminfo`), `msync`, `fsync` and `fdatasync` write it back (also a page stored to again afterwards), `write` and a store in one page both arrive, the flusher writes a store back on its own after `munmap`, a store of a process that exited, dirty pages surviving reclaim, truncation of a file with dirty pages, 1 MiB of stores; `O_DIRECT` reads as the view of the disk |
+| `cachetest` | the page cache of `/data` files: data read back right after writing and `fsync` (from memory), `Cached` in `/proc/meminfo`, committing all free memory reclaims cached pages (and all of it can be used), the file read again from the disk afterwards, read-only shared and private mappings of a disk file, `pwrite` visible to `pread` and both mappings, private stores staying private, `ftruncate` shrinking and growing (zeros, not old data, in reads and the mapping), a program on the disk running from the cache and `ETXTBSY` while it runs |
+| `writebacktest` | stores through a shared mapping of a `/data` file: reading makes nothing dirty, a store makes its page dirty (`Dirty` in `/proc/meminfo`), `msync`, `fsync` and `fdatasync` write it back (also a page stored to again afterwards), `write` and a store in one page both arrive, the server's write-back takes a store to the disk on its own after `munmap`, a store of a process that exited, dirty pages surviving reclaim, truncation of a file with dirty pages, 1 MiB of stores; `O_DIRECT` reads as the view of the disk |
 | `mmaptest /data` | all of `mmaptest` on a disk file |
+| `datatest` | `/data` in the Linux server: reads, writes, `lseek`, `stat`, `fsync` without a call passed through (`legacy_calls`), its own device and ext2's `statfs`; two descriptors, a mapping and another process's mapping sharing one page cache; `write` leaving dirty pages, `fsync` writing them (`Dirty` back, the data on the device: `O_DIRECT`), an `O_SYNC` write clean when it returns, a write past the end and its hole, `sync`; truncation with dirty mapped pages (`SIGBUS` beyond, the tail zero, the size on the device); 8 processes reading one uncached file at random offsets at once; 4 threads writing parts of one file; a 32 MiB file written and read back with 12 MiB left to cache it |
 | `bash -c` (in `runtests.sh`) | Bash itself: functions, arrays, arithmetic, `[[ ]]`, a pipe into `grep`, a here-document into a `/tmp` file read back, a subshell's `cd`, command substitution |
 | `sh /etc/test.sh` | files, pipes, `cd`, `mkdir`/`touch`/`rm`, rename cycles via symlinks, the tmpfs size limit |
 | `fstest` | descriptor access modes (`EBADF` on read-only/write-only fds), `O_NOFOLLOW` on symlinks, unlinked-but-open files (kept until closed, never shared with new files), ext2 size limits, overflowing `mmap` offsets; `preadv2`/`pwritev2` and their flags (also in `lxtest` on `/tmp`): the offset -1 as the file position, a positional write to an `O_APPEND` descriptor appending as on Linux, `RWF_APPEND`/`RWF_NOAPPEND`, `EOPNOTSUPP`/`EINVAL` for unsupported or contradicting flags, `ESPIPE` on pipes (`userspace/rwtest.h`) |
@@ -957,7 +978,7 @@ Each of these programs and scripts lives in the root filesystem and runs inside 
 | `cargo test -p fsring` (host) | the file protocol: every request survives encode and decode, `ENOSYS` for unknown operations, `EINVAL` for any field an operation does not use, transfers, names and targets bounded (`EINVAL`, `ENAMETOOLONG`), names without `/` or NUL, completions, stat, usage and directory entries round-trip |
 | `timeout 1 sleep 5` | `vfork` and `SIGTERM` after the time limit (exit status 143) |
 | `kill -9 1` in Bash | user space cannot kill a server (`EPERM`) |
-| `kill diskfs` in the kernel monitor | the next `/data` access restarts the server; open files survive; after five restarts accesses fail with `EIO`; a restart still runs the boot-time program even after `/sbin/diskfs` was overwritten |
+| `kill diskfs` in the kernel monitor | the next `/data` access connects a new channel, which restarts the server; open files survive (an unlinked one fails with `EIO`), dirty pages whose write-back failed are written again; after five restarts accesses fail with `EIO`; a restart still runs the boot-time program even after `/sbin/diskfs` was overwritten |
 | `kill netd` in the kernel monitor, then `run nettest` | the first socket call restarts netd (new DHCP lease) and every network test passes |
 | a background job holding a socket across `kill netd` | its next write fails with `EIO` instead of reaching a socket of the new netd |
 | `mem` (kernel monitor) | frame and heap accounting, allocator self-test, leak checks after workloads |

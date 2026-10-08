@@ -1,13 +1,13 @@
-//! Client side of a filesystem served by a user-space process (diskfs):
-//! every operation becomes an IPC request in the `fsproto` format. File
-//! contents of a disk filesystem go through the page caches kept here
-//! (`fs::cache`), which outlive the VFS inodes.
+//! Client side of a filesystem served by a user-space process (procfs's
+//! /proc and /sys): every operation becomes an IPC request in the
+//! `fsproto` format. Its files are generated on every read, so nothing is
+//! cached. (diskfs's disk is the Linux server's: `servers/linux`'s
+//! `datafs`, over the I/O rings.)
 
-use super::cache::PageCache;
-use super::{Inode, NewNode, S_IFDIR, S_IFMT, S_IFREG};
+use super::{Inode, NewNode};
 use crate::process::errno::*;
 use crate::process::{ipc, Server};
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -31,17 +31,6 @@ pub struct RemoteFs {
     /// The server behind the service, restarted after a crash.
     server: Arc<Server>,
     cache: Mutex<BTreeMap<u32, Weak<Inode>>>,
-    /// Unlinked inodes still open here; released when the last VFS
-    /// reference is dropped.
-    deferred: Mutex<BTreeSet<u32>>,
-    /// Page caches of regular files. They outlive the VFS inodes (which
-    /// go with the last reference), as Linux keeps inodes and their pages
-    /// after close, until reclaim empties them or the file is released
-    /// (its inode number may then be reused).
-    pages: Mutex<BTreeMap<u32, Arc<PageCache>>>,
-    /// Whether file contents may be cached: true for a disk filesystem,
-    /// false for one whose files are generated on every read (procfs).
-    pub cacheable: bool,
 }
 
 struct Reply {
@@ -51,15 +40,8 @@ struct Reply {
 }
 
 impl RemoteFs {
-    pub fn new(service: usize, server: Arc<Server>, cacheable: bool) -> Arc<RemoteFs> {
-        Arc::new(RemoteFs {
-            service: AtomicUsize::new(service),
-            server,
-            cache: Mutex::new(BTreeMap::new()),
-            deferred: Mutex::new(BTreeSet::new()),
-            pages: Mutex::new(BTreeMap::new()),
-            cacheable,
-        })
+    pub fn new(service: usize, server: Arc<Server>) -> Arc<RemoteFs> {
+        Arc::new(RemoteFs { service: AtomicUsize::new(service), server, cache: Mutex::new(BTreeMap::new()) })
     }
 
     /// Brings a dead server back. Inode numbers live on disk, so every
@@ -96,35 +78,6 @@ impl RemoteFs {
         let inode = Inode::disk(self.clone(), ino);
         cache.insert(ino, Arc::downgrade(&inode));
         inode
-    }
-
-    /// The page cache of `ino`, if it has one.
-    pub fn cached(&self, ino: u32) -> Option<Arc<PageCache>> {
-        self.pages.lock().get(&ino).cloned()
-    }
-
-    /// The page cache of regular file `ino` (EISDIR, EINVAL for others),
-    /// made on first use.
-    pub fn page_cache(self: &Arc<Self>, ino: u32) -> Result<Arc<PageCache>, i64> {
-        if !self.cacheable {
-            return Err(ENODEV);
-        }
-        if let Some(c) = self.cached(ino) {
-            return Ok(c);
-        }
-        // One request for the type and the size, outside of any lock.
-        let st = self.stat(ino)?;
-        match st.mode & S_IFMT {
-            S_IFREG => {}
-            S_IFDIR => return Err(EISDIR),
-            _ => return Err(EINVAL),
-        }
-        let made = PageCache::remote(self.clone(), ino, st.size)?;
-        let mut pages = self.pages.lock();
-        // Caches reclaim emptied and nobody uses go now.
-        pages.retain(|_, c| Arc::strong_count(c) > 1 || !c.is_empty());
-        // Another caller may have made one meanwhile: use the first.
-        Ok(pages.entry(ino).or_insert(made).clone())
     }
 
     pub fn stat(&self, ino: u32) -> Result<RemoteStat, i64> {
@@ -204,39 +157,15 @@ impl RemoteFs {
         Ok(self.call(Op::Create, [dir as u64, kind, perm as u64, 0], &payload)?.values[0] as u32)
     }
 
-    /// Inodes whose last link went away are released now, or deferred
-    /// until the last open reference is dropped (see `forget`).
-    fn settle(&self, gone: &[u8]) {
-        for chunk in gone.chunks_exact(4) {
-            let ino = u32::from_le_bytes(chunk.try_into().unwrap());
-            let open = self.cache.lock().get(&ino).is_some_and(|w| w.strong_count() > 0);
-            if open {
-                self.deferred.lock().insert(ino);
-            } else {
-                self.release(ino);
-            }
-        }
-    }
-
-    fn release(&self, ino: u32) {
-        // Its number may be reused for another file: forget its pages.
-        let gone = self.pages.lock().remove(&ino);
-        drop(gone);
-        ipc::post(self.service.load(Ordering::Relaxed), fsproto::encode_request(Op::Release, 0, [ino as u64, 0, 0, 0], &[]));
-    }
-
+    /// (procfs refuses: its tree is read-only.)
     pub fn unlink(&self, dir: u32, name: &str, want_dir: bool) -> Result<(), i64> {
-        let r = self.call(Op::Unlink, [dir as u64, want_dir as u64, 0, 0], name.as_bytes())?;
-        self.settle(&r.payload);
-        Ok(())
+        self.call(Op::Unlink, [dir as u64, want_dir as u64, 0, 0], name.as_bytes()).map(|_| ())
     }
 
     pub fn rename(&self, odir: u32, oname: &str, ndir: u32, nname: &str) -> Result<(), i64> {
         let mut payload = Vec::from(oname.as_bytes());
         payload.extend_from_slice(nname.as_bytes());
-        let r = self.call(Op::Rename, [odir as u64, ndir as u64, oname.len() as u64, 0], &payload)?;
-        self.settle(&r.payload);
-        Ok(())
+        self.call(Op::Rename, [odir as u64, ndir as u64, oname.len() as u64, 0], &payload).map(|_| ())
     }
 
     pub fn readlink(&self, ino: u32) -> Result<String, i64> {
@@ -253,14 +182,6 @@ impl RemoteFs {
         match self.call(Op::Usage, [0; 4], &[]) {
             Ok(r) => (r.values[0], r.values[1], r.values[2], r.values[3], r.values[4]),
             Err(_) => (1024, 0, 0, 0, 0),
-        }
-    }
-
-    /// Called when the last VFS reference to `ino` is dropped. Must not
-    /// sleep, hence `post`.
-    pub fn forget(&self, ino: u32) {
-        if self.deferred.lock().remove(&ino) {
-            self.release(ino);
         }
     }
 }

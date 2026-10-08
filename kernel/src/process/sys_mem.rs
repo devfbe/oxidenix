@@ -217,17 +217,18 @@ pub fn mremap(old: u64, old_len: u64, new_len: u64, flags: u64, new_addr: u64) -
     }
 }
 
-/// msync(2): MS_SYNC writes the dirty pages of the shared file mappings in
-/// the range back (MS_ASYNC leaves them to the flusher); ENOMEM if part of
-/// the range is not mapped.
+/// msync(2): the flags and the range checked (ENOMEM if part of it is not
+/// mapped); the kernel's own files are memory or generated, nothing to
+/// write back.
 pub fn msync(addr: u64, len: u64, flags: u64) -> SysResult {
     msync_server(addr, len, flags, 0, 0)
 }
 
 /// msync for the Linux server (`restricted::SYS_VM_SYNC`): as `msync`; the
-/// shared mappings of cached objects (the server's page cache) in the
-/// range are the server's to write back with MS_SYNC: how many there are,
-/// the first `cap` stored at `out` as (key, first page, end page).
+/// shared mappings of cached objects (the server's page cache of disk
+/// files) in the range are the server's to write back with MS_SYNC: how
+/// many there are, the first `cap` stored at `out` as (key, first page,
+/// end page).
 pub fn msync_server(addr: u64, len: u64, flags: u64, out: u64, cap: u64) -> SysResult {
     const MS_ASYNC: u64 = 1;
     const MS_INVALIDATE: u64 = 2;
@@ -240,19 +241,15 @@ pub fn msync_server(addr: u64, len: u64, flags: u64, out: u64, cap: u64) -> SysR
     if flags & MS_SYNC == 0 {
         return Ok(0);
     }
-    // Written back without the address space locked (write-back locks it).
     let mut cached = 0u64;
     for (cache, pages) in files {
-        match cache.cached_key() {
-            Some(key) => {
-                if cached < cap {
-                    let words = [key, pages.start, pages.end];
-                    let bytes: alloc::vec::Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-                    super::uaccess::copy_to_server(out + cached * 24, &bytes)?;
-                }
-                cached += 1;
+        if let Some(key) = cache.cached_key() {
+            if cached < cap {
+                let words = [key, pages.start, pages.end];
+                let bytes: alloc::vec::Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+                super::uaccess::copy_to_server(out + cached * 24, &bytes)?;
             }
-            None => cache.writeback(pages).map_err(|_| EIO)?,
+            cached += 1;
         }
     }
     Ok(cached as i64)

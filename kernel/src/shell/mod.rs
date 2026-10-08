@@ -11,7 +11,7 @@ pub fn run() -> ! {
         crate::printkln!("[autorun] running /etc/autorun");
         let ok = matches!(commands::run_program(&["sh", "/etc/autorun"]), Some(crate::process::WaitStatus::Exited(0)));
         crate::printkln!("[autorun] {}", if ok { "success" } else { "failure" });
-        crate::fs::cache::flush_all();
+        settle();
         crate::power_off(if ok { 0 } else { 1 });
     }
     let shell = if crate::fs::resolve("/", "/bin/bash", true).is_ok() { "bash" } else { "sh" };
@@ -27,6 +27,36 @@ pub fn run() -> ! {
         let line = read_line();
         let (cmd, args) = parse(&line);
         commands::dispatch(cmd, &args);
+    }
+}
+
+/// Before the machine goes off: the Linux server instances end (each writes
+/// its caches back to the disk), then their channels (diskfs commits what
+/// they held), each wait at most a few seconds.
+pub fn settle() {
+    let deadline = crate::time::now() + 10 * crate::time::NSEC_PER_SEC;
+    // (The pagers' processes end last, as the kernel's children: reaped
+    // here, their instances go.)
+    let ended = loop {
+        crate::process::reap_orphans();
+        let soon = (crate::time::now() + 50_000_000).min(deadline);
+        if crate::process::linux::settle(soon) {
+            break true;
+        }
+        if crate::time::now() >= deadline {
+            break false;
+        }
+    };
+    if !ended {
+        crate::printkln!("[kernel] a Linux server instance did not end; its caches may not be written back. Still there:");
+        for (pid, _, name, state, server, _, _) in crate::process::list() {
+            if !server || name == "linux-pager" {
+                crate::printkln!("  {} {} ({})", pid, name, state);
+            }
+        }
+    }
+    if !crate::process::channel::settle(deadline) {
+        crate::printkln!("[kernel] a channel did not close");
     }
 }
 

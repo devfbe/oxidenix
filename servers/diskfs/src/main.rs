@@ -1,12 +1,11 @@
 //! diskfs: the ext2 filesystem server. It drives the virtio block device
-//! from user space and answers the kernel's filesystem requests (see
-//! `fsproto`), and serves the file protocol over the rings of the
-//! channels clients offer it (`service`, `fsring`).
+//! from user space and serves the file protocol over the rings of the
+//! channels clients (the Linux server instances) offer it (`service`,
+//! `fsring`).
 //!
-//! One thread, one event loop: `ipc_receive` brings the kernel's requests,
-//! channel offers and doorbells; the ring service polls its rings and the
-//! device while there is work and sleeps there when there is none. A
-//! kernel request runs once the ring operations in flight completed.
+//! One thread, one event loop: `ipc_receive` brings channel offers and
+//! doorbells; the ring service polls its rings and the device while there
+//! is work and sleeps there when there is none.
 
 #![no_std]
 #![no_main]
@@ -16,17 +15,17 @@ extern crate alloc;
 mod blk;
 mod service;
 
-use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
-use ext2fs::{Ext2, NewNode};
-use fsproto::*;
+use ext2fs::Ext2;
 use oxrt::println;
 
 oxrt::entry!(main);
 
-const EINVAL: i64 = 22;
 const ENOSYS: i64 = 38;
+/// The only messages diskfs takes are the kernel's channel offers (a
+/// longer one fails in the kernel).
+const MAX_MESSAGE: usize = ring::channel::OFFER_BYTES;
 
 /// Value of `key=...` among the arguments the kernel passed.
 fn arg(args: &[&str], key: &str) -> Option<u64> {
@@ -87,20 +86,15 @@ fn main(args: Vec<&'static str>) -> i32 {
     println!("diskfs: serving ext2 from a {} MiB virtio disk{} (pid {})", sectors / 2048, mode, oxrt::getpid());
 
     let mut request = vec![0u8; MAX_MESSAGE];
-    let mut response = vec![0u8; MAX_MESSAGE];
     loop {
         // Sleep only with nothing to do and every doorbell armed.
         let sleep = !rings.busy() && rings.prepare_sleep();
         let event = oxrt::ipc_receive(&mut request, if sleep { None } else { Some(0) });
         rings.awake();
         match event {
-            Ok(oxrt::Event::Request(id, len)) => {
-                rings.drain(&mut fs);
-                let n = match decode_request(&request[..len]) {
-                    Some(req) => handle(&mut fs, &mut rings, &req, &mut response),
-                    None => encode_response(&mut response, -EINVAL, [0; 6], &[]),
-                };
-                let _ = oxrt::ipc_reply(id, &response[..n]);
+            // No protocol besides the rings.
+            Ok(oxrt::Event::Request(id, _)) => {
+                let _ = oxrt::ipc_reply(id, &(-ENOSYS).to_le_bytes());
             }
             Ok(oxrt::Event::Control(id, len)) => {
                 let status = rings.offer(&request[..len]);
@@ -109,114 +103,5 @@ fn main(args: Vec<&'static str>) -> i32 {
             _ => {}
         }
         rings.run(&mut fs);
-    }
-}
-
-fn name(bytes: &[u8]) -> Result<&str, i64> {
-    core::str::from_utf8(bytes).map_err(|_| -EINVAL)
-}
-
-fn inodes_payload(inodes: &[u32]) -> Vec<u8> {
-    inodes.iter().flat_map(|i| i.to_le_bytes()).collect()
-}
-
-/// Executes one request and writes the response; returns its length.
-///
-/// The kernel holds every inode it names or is told of (see `service`,
-/// "Holds") until it releases it: it does so for the inodes it unlinked,
-/// once it no longer uses them. An inode a ring client unlinks while the
-/// kernel holds it therefore stays allocated (an orphan for e2fsck after
-/// the next shutdown) rather than being freed under the kernel; the
-/// kernel's client goes in step 4 of docs/design/io-rings.md.
-fn handle(fs: &mut Ext2<blk::VirtioBlk>, rings: &mut service::Service, req: &Request, out: &mut [u8]) -> usize {
-    let [a0, a1, a2, _] = req.args;
-    let ino = a0 as u32;
-    match req.op {
-        Some(Op::Usage | Op::Release) | None => {}
-        Some(Op::Rename) => {
-            rings.kernel_holds(ino);
-            rings.kernel_holds(a1 as u32);
-        }
-        Some(_) => rings.kernel_holds(ino),
-    }
-    let result: Result<(i64, [u64; 6], Vec<u8>), i64> = (|| {
-        let op = req.op.ok_or(-ENOSYS)?;
-        let ok = |status: i64| Ok((status, [0; 6], Vec::new()));
-        match op {
-            Op::Stat => {
-                let s = fs.stat(ino).map_err(|e| -e)?;
-                let v = [s.mode as u64, s.size, s.links as u64, s.atime as u64, s.mtime as u64, s.ctime as u64];
-                Ok((0, v, Vec::new()))
-            }
-            Op::Read => {
-                let mut buf = vec![0u8; (a2 as usize).min(MAX_DATA)];
-                let n = fs.read(ino, a1, &mut buf).map_err(|e| -e)?;
-                buf.truncate(n);
-                Ok((n as i64, [0; 6], buf))
-            }
-            Op::Write => ok(fs.write(ino, a1, req.payload).map_err(|e| -e)? as i64),
-            Op::Truncate => fs.truncate(ino, a1).map_err(|e| -e).and_then(|_| ok(0)),
-            Op::List => {
-                let entries = fs.list(ino).map_err(|e| -e)?;
-                let mut payload = Vec::new();
-                let mut next = a1 as usize;
-                for (n, i, t) in entries.iter().skip(next) {
-                    if payload.len() + 6 + n.len() > MAX_DATA {
-                        break;
-                    }
-                    push_entry(&mut payload, *i, *t, n.as_bytes());
-                    next += 1;
-                }
-                let cursor = if next >= entries.len() { 0 } else { next as u64 };
-                Ok((0, [cursor, 0, 0, 0, 0, 0], payload))
-            }
-            Op::Lookup => {
-                let child = fs.lookup(ino, name(req.payload)?).map_err(|e| -e)?;
-                rings.kernel_holds(child);
-                Ok((0, [child as u64, 0, 0, 0, 0, 0], Vec::new()))
-            }
-            Op::Create => {
-                let (n, target) = match req.payload.iter().position(|&b| b == 0) {
-                    Some(p) => (&req.payload[..p], &req.payload[p + 1..]),
-                    None => (req.payload, &[][..]),
-                };
-                let kind = match a1 {
-                    KIND_FILE => NewNode::File,
-                    KIND_DIR => NewNode::Dir,
-                    KIND_SYMLINK => NewNode::Symlink(String::from(name(target)?)),
-                    _ => return Err(-EINVAL),
-                };
-                let child = fs.create(ino, name(n)?, &kind, a2 as u32).map_err(|e| -e)?;
-                rings.kernel_holds(child);
-                Ok((0, [child as u64, 0, 0, 0, 0, 0], Vec::new()))
-            }
-            Op::Unlink => {
-                let gone = fs.unlink(ino, name(req.payload)?, a1 != 0).map_err(|e| -e)?;
-                gone.iter().for_each(|&i| rings.kernel_holds(i));
-                Ok((0, [0; 6], inodes_payload(&gone)))
-            }
-            Op::Rename => {
-                let split = (a2 as usize).min(req.payload.len());
-                let (old, new) = req.payload.split_at(split);
-                let gone = fs.rename(ino, name(old)?, a1 as u32, name(new)?).map_err(|e| -e)?;
-                gone.iter().for_each(|&i| rings.kernel_holds(i));
-                Ok((0, [0; 6], inodes_payload(&gone)))
-            }
-            // Freed once no ring client holds it either.
-            Op::Release => rings.kernel_release(fs, ino).map_err(|e| -e).and_then(|_| ok(0)),
-            Op::Readlink => {
-                let target = fs.readlink(ino).map_err(|e| -e)?;
-                Ok((0, [0; 6], target.into_bytes()))
-            }
-            Op::SetPerm => fs.set_perm(ino, a1 as u32).map_err(|e| -e).and_then(|_| ok(0)),
-            Op::Usage => {
-                let (bs, blocks, free, inodes, free_inodes) = fs.usage();
-                Ok((0, [bs, blocks, free, inodes, free_inodes, 0], Vec::new()))
-            }
-        }
-    })();
-    match result {
-        Ok((status, values, payload)) => encode_response(out, status, values, &payload),
-        Err(e) => encode_response(out, e, [0; 6], &[]),
     }
 }

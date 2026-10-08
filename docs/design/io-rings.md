@@ -1,8 +1,8 @@
 # I/O rings: the data plane between the Linux server and the device servers
 
-Status: accepted (ADR 0005). Implements principles 1-7 of the I/O audit
-(`docs/io-path-audit.md`) for the paths the Linux server takes over in R6c.3 (files on
-`/data`), R7 (sockets) and later.
+Status: accepted (ADR 0005); steps 1-4 done (files on `/data` go through the rings since
+R6c.3). Implements principles 1-7 of the I/O audit (`docs/io-path-audit.md`) for the paths the
+Linux server takes over in R6c.3 (files on `/data`), R7 (sockets) and later.
 
 ## Problem
 
@@ -291,11 +291,9 @@ polls the rings and the device; after `SPIN_BUDGET` (2000) polls without progres
 every ring's doorbell (`prepare_sleep`, `chan_watch`) and sleeps in `ipc_receive`.
 
 **Holds.** A client holds every inode it named or got back from `LOOKUP`, `CREATE`, `UNLINK`
-or `RENAME`, until its `RELEASE` or the end of its channel; the kernel's IPC client holds what
-it named until its `Release` (which it sends only for the inodes it unlinked). An inode whose
-last link went is freed when no client holds it, so one client never frees what another
-uses; one a ring client unlinks while the kernel holds it stays allocated (an orphan for
-e2fsck) until step 4 removes the kernel's client.
+or `RENAME`, until its `RELEASE` or the end of its channel. An inode whose last link went is
+freed when no client holds it, so one client never frees what another uses. (Until step 4 the
+kernel's IPC client held inodes too; it is gone.)
 
 **Room.** A request waits in the submission ring while its channel's completion ring has no
 room for its completion; diskfs then sleeps on that ring's doorbell instead of polling, and a
@@ -424,13 +422,16 @@ for `mprotect`, `ENOMEM` once the service unmapped it).
 2. Kernel: channel objects, grants with pinning, `grant_dma`, teardown on death; shared futex
    doorbells already work (futexes on shared memory objects). Done: see "The kernel's
    interface" above.
-3. diskfs: the ring protocol beside the IPC one (the kernel's `RemoteFs` stays the IPC client
-   until R6c.3 ends), virtio-blk with requests in flight and DMA into granted pages. Done: see
-   "The file protocol" above. Until step 4 both protocols serve one filesystem without
-   coherence between their clients' caches (a ring client's changes reach the kernel's page
-   cache only for files the kernel had not cached), and an inode unlinked on one side may be
-   released on the other while still open there.
+3. diskfs: the ring protocol beside the IPC one, virtio-blk with requests in flight and DMA
+   into granted pages. Done: see "The file protocol" above.
 4. The Linux server: `/data` through its page cache over the ring; the bridge to the kernel's
-   `/data` goes. Benchmarks: sequential and random reads and writes, `fstat`, against the
-   numbers in the audit and Linux.
+   `/data` goes. Done: see "The page cache's kernel interface" and "Paths built on it". The
+   kernel's remote store, its flusher and diskfs's IPC protocol are gone (procfs keeps the
+   kernel's `RemoteFs` until step 5). Each instance caches `/data` on its own: two process trees
+   writing one file see each other's changes only through the disk (after write-back), for
+   pages the other has not cached, as two machines sharing a disk without a lock manager would.
+   Benchmarks: sequential and random reads and writes, `fstat`, against the numbers in the
+   audit and Linux (`datatest` checks the semantics: no pass-through, shared pages, write-back
+   and durability, truncation, concurrent readers and writers, a file larger than the memory
+   left for the cache).
 5. The same for procfs (metadata only) and, in R7, netd.

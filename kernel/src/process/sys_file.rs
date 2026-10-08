@@ -169,11 +169,8 @@ fn write_vecs(fd: u64, vecs: &[(u64, u64)], off: i64, flags: u64) -> SysResult {
             uaccess::write_from_user(base, len, |chunk, within| f.write_at(at + done + within, chunk))
         })?,
     };
-    if plan.sync && n > 0 {
-        if let Some(inode) = f.inode() {
-            inode.sync()?;
-        }
-    }
+    // (RWF_DSYNC, RWF_SYNC: the kernel's files are memory or generated,
+    // nothing to wait for.)
     Ok(n)
 }
 
@@ -674,19 +671,16 @@ pub fn fchmodat(dirfd: u64, path: u64, mode: u64) -> SysResult {
     Ok(0)
 }
 
-/// fsync/fdatasync: writes the file's dirty pages back (write() itself
-/// already reached the disk).
+/// fsync/fdatasync: the kernel's files are memory or generated (disk
+/// files are the Linux server's): nothing to write back.
 pub fn fsync(fd: u64) -> SysResult {
-    let f = file(fd)?;
-    if let Some(inode) = f.inode() {
-        inode.sync()?;
-    }
+    file(fd)?;
     Ok(0)
 }
 
-/// sync(2): writes every dirty page back.
+/// sync(2): nothing of the kernel's to write back (the Linux server
+/// writes its disk files back itself).
 pub fn sync() -> SysResult {
-    fs::cache::flush_all();
     Ok(0)
 }
 

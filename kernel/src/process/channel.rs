@@ -1010,6 +1010,22 @@ pub fn run_deferred() {
     }
 }
 
+/// Waits until no channel is left (every client's end went and each
+/// service let go of its channels: diskfs released what the clients held),
+/// at most until `deadline`: for a shutdown. Whether none is.
+pub fn settle(deadline: u64) -> bool {
+    loop {
+        run_deferred();
+        if CHANNELS.lock().iter().all(|e| e.channel.strong_count() == 0) {
+            return true;
+        }
+        if crate::time::now() >= deadline {
+            return false;
+        }
+        super::sched::prepare_to_sleep().sleep_until(crate::time::now() + 10_000_000);
+    }
+}
+
 /// The `channels` kernel thread: does the teardowns deferred from where
 /// the kernel could not sleep.
 pub fn worker() -> ! {

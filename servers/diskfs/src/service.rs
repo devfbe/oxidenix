@@ -19,8 +19,8 @@
 //! links its new blocks once its data is on the device; it is durable
 //! after a `FLUSH` (see `fsring`, "Durability").
 //!
-//! **Barriers.** Every other operation, and the kernel's IPC requests, run
-//! when no operation is in flight: taking one stops taking requests (on
+//! **Barriers.** Every other operation runs when no operation is in
+//! flight: taking one stops taking requests (on
 //! every channel) until the operations taken before it completed; then it
 //! runs synchronously. Barriers wait in a queue, in the order they were
 //! taken. A write waits ("stalls") while another write in flight covers
@@ -31,17 +31,12 @@
 //! uses (the client sends it once the requests on the grant completed)
 //! runs at once, without stopping anything: it touches no file.
 //!
-//! **Holds.** diskfs keeps, per channel and for the kernel's IPC client, a
-//! bit per inode the client holds (`fsring`, "Holds"): an inode whose last
-//! link went is freed only when no client holds it, so one client's
-//! `RELEASE` (or the kernel's `Release`) never frees an inode another one
-//! still uses. A channel's holds go with it. The kernel releases only the
-//! inodes it unlinked itself (fsproto has no other release); one a ring
-//! client unlinks while the kernel holds it stays allocated (an orphan,
-//! which e2fsck reports after a shutdown) rather than be freed under the
-//! kernel; the kernel's client goes in step 4. The holds are diskfs's
-//! memory: a restarted diskfs knows the kernel's again only as it names
-//! them.
+//! **Holds.** diskfs keeps, per channel, a bit per inode the client holds
+//! (`fsring`, "Holds"): an inode whose last link went is freed only when
+//! no client holds it, so one client's `RELEASE` never frees an inode
+//! another one still uses. A channel's holds go with it. The holds are
+//! diskfs's memory: a restarted diskfs knows a client's again only as it
+//! names them.
 //!
 //! **Hostile clients.** Each descriptor is copied out of the ring once and
 //! validated (`fsring::Request::decode`); a grant must exist and hold the
@@ -344,11 +339,7 @@ pub struct Service {
     /// taken; a stalled write taken before it that turns out to need the
     /// fallback goes in front (it was taken earlier than every one here).
     barriers: VecDeque<(usize, Desc)>,
-    /// The inodes the kernel's IPC client has named (see `Holds`).
-    kernel: Bitmap,
     inodes: u64,
-    /// Take no new requests (the kernel's IPC request waits for a drain).
-    hold: bool,
     /// The channel the next round starts with.
     rr: usize,
     /// Free scratch slots, and the scratch memory's device address.
@@ -392,9 +383,7 @@ impl Service {
             chans: (0..MAX_CHANNELS).map(|_| None).collect(),
             ops: (0..MAX_OPS).map(|_| None).collect(),
             barriers: VecDeque::new(),
-            kernel: Bitmap::new(inodes),
             inodes,
-            hold: false,
             rr: 0,
             bounce: (0..slots).rev().collect(),
             scratch,
@@ -580,23 +569,6 @@ impl Service {
         }
     }
 
-    /// Completes everything taken (the kernel's IPC request runs then),
-    /// taking nothing new.
-    pub fn drain(&mut self, fs: &mut Fs) {
-        self.hold = true;
-        loop {
-            let progress = self.poll(fs);
-            let pending = self.ops.iter().any(Option::is_some) || !self.barriers.is_empty() || self.chans.iter().flatten().any(|c| c.stalled.is_some());
-            if !pending {
-                break;
-            }
-            if !progress && fs.device().in_flight() > 0 {
-                fs.device_mut().wait_any();
-            }
-        }
-        self.hold = false;
-    }
-
     /// One round: completions from the device, requests to it, requests
     /// from the rings, completions into them. Whether anything happened.
     fn poll(&mut self, fs: &mut Fs) -> bool {
@@ -720,7 +692,7 @@ impl Service {
                 any |= self.dispatch(fs, c, d, true);
             }
             for _ in 0..TAKE_PER_ROUND {
-                if self.hold || !self.barriers.is_empty() || !self.ops.iter().any(Option::is_none) || !self.chan(c).ready() {
+                if !self.barriers.is_empty() || !self.ops.iter().any(Option::is_none) || !self.chan(c).ready() {
                     break;
                 }
                 let chan = self.chan(c);
@@ -817,7 +789,7 @@ impl Service {
 
     /// Frees `ino` if its last link is gone and no client holds it.
     fn try_free(&mut self, fs: &mut Fs, ino: u32) {
-        if self.kernel.has(ino) || self.chans.iter().flatten().any(|c| c.held.has(ino)) || fs.check(ino).is_err() {
+        if self.chans.iter().flatten().any(|c| c.held.has(ino)) || fs.check(ino).is_err() {
             return;
         }
         if fs.stat(ino).is_ok_and(|s| s.links == 0) {
@@ -833,21 +805,6 @@ impl Service {
         for ino in chan.held.inodes() {
             self.try_free(fs, ino);
         }
-    }
-
-    /// The kernel's IPC client named `ino` (in a request or a reply): it
-    /// may use it until it releases it.
-    pub fn kernel_holds(&mut self, ino: u32) {
-        self.kernel.set(ino);
-    }
-
-    /// The kernel's IPC client released `ino` (fsproto's `Release`, which
-    /// it sends for the inodes it unlinked once it no longer uses them).
-    pub fn kernel_release(&mut self, fs: &mut Fs, ino: u32) -> Result<(), i64> {
-        fs.check(ino)?;
-        self.kernel.clear(ino);
-        self.try_free(fs, ino);
-        Ok(())
     }
 
     fn post(&mut self) -> bool {

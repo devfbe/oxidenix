@@ -55,6 +55,30 @@ const MAX_IMAGE: u64 = 16 * 1024 * 1024;
 
 static IMAGE: spin::Once<Arc<PageCache>> = spin::Once::new();
 
+/// Instances alive (their memory and objects not yet gone), for `settle`.
+static LIVE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+fn live_chan() -> usize {
+    &LIVE as *const _ as usize
+}
+
+/// Waits until every instance of the Linux server is gone (each wrote its
+/// caches back and closed its channels: its pager handled `EVENT_CLOSING`
+/// last), at most until `deadline`: for a shutdown, after the last program
+/// ended. Whether they are.
+pub fn settle(deadline: u64) -> bool {
+    loop {
+        let wait = super::sched::prepare_to_wait(live_chan());
+        if LIVE.load(core::sync::atomic::Ordering::Acquire) == 0 {
+            return true;
+        }
+        if crate::time::now() >= deadline {
+            return false;
+        }
+        wait.sleep_until(deadline);
+    }
+}
+
 /// Reads the Linux server's program (at boot, once the root filesystem is
 /// there).
 pub fn init() {
@@ -216,6 +240,8 @@ impl Instance {
             channels: core::sync::atomic::AtomicUsize::new(0),
         };
         instance.entry = instance.load(image)?;
+        // Counted from here on (its drop uncounts it).
+        LIVE.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
         Arc::try_new(instance).map_err(|_| ENOMEM)
     }
 
@@ -717,6 +743,10 @@ impl Drop for Instance {
             free_level(frames, self.pdpt, 3);
             frames.deallocate_frame(self.view);
         });
+        if self.entry != 0 {
+            LIVE.fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
+            super::wakeup(live_chan());
+        }
     }
 }
 
@@ -969,7 +999,17 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             let object = PageCache::paged(pages, pager, a[1])?;
             Ok(instance.insert(Object::Memory(object))? as i64)
         }
-        SYS_EVENT_WAIT => event_wait(&instance, a[0], a[1]),
+        SYS_EVENT_WAIT => match event_wait(&instance, a[0], a[1]) {
+            Some(result) => result,
+            None => {
+                // The tree has no program left: the pager's process ends.
+                // No reference of this call may stay behind on its stack
+                // (exit_group does not return): the instance goes with its
+                // last holder.
+                drop(instance);
+                super::exit_group(0)
+            }
+        },
         SYS_EVENT_RELEASES => Ok(instance.pager.lock().releases as i64),
         SYS_KFD_INSTALL => {
             use crate::fs::file::{OpenFile, ServerFile, Kind, O_ACCMODE, O_APPEND, O_CLOEXEC, O_NONBLOCK};
@@ -1442,11 +1482,11 @@ fn set_legacy(on: bool) {
 /// event_wait(event, deadline): the instance's next event (a page a
 /// thread waits for, a server file closed, ...), written to the server's
 /// memory at `out`; `EVENT_TIMER` once `deadline` (0: none) passed. When
-/// the tree has no program left: `EVENT_CLOSING` once, then the service
-/// thread's process ends here.
-fn event_wait(instance: &Arc<Instance>, out: u64, deadline: u64) -> SysResult {
+/// the tree has no program left: `EVENT_CLOSING` once, then None (the
+/// service thread's process ends).
+fn event_wait(instance: &Arc<Instance>, out: u64, deadline: u64) -> Option<SysResult> {
     if !is_pager() {
-        return Err(EPERM);
+        return Some(Err(EPERM));
     }
     loop {
         let next = x86_64::instructions::interrupts::without_interrupts(|| {
@@ -1499,11 +1539,11 @@ fn event_wait(instance: &Arc<Instance>, out: u64, deadline: u64) -> SysResult {
                             q.requests.push_front(event)
                         }
                     }
-                    return Err(e);
+                    return Some(Err(e));
                 }
-                return Ok(0);
+                return Some(Ok(0));
             }
-            Some(None) => super::exit_group(0),
+            Some(None) => return None,
             None => {}
         }
     }
