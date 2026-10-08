@@ -49,7 +49,10 @@ Its [commit history](#development-history) records every step.
 - **Boots** via UEFI (OVMF) or BIOS into a 64-bit higher-half kernel with a framebuffer text console.
 - **Runs real Linux binaries**: static musl executables such as GNU Bash 5.3 (with readline),
   BusyBox 1.37 (~400 applets: `ls`, `cat`, `grep`, `sed`, `dd`, `vi`, ...) and its own C test
-  programs, all unmodified.
+  programs, all unmodified. **Node.js 24** (a static musl build, opt-in on the data disk, see
+  [Build and run](#build-and-run)) runs scripts with V8's JIT, timers, files, worker threads,
+  HTTP over loopback, DNS and WebAssembly; child processes with pipes do not work yet (no
+  Unix domain sockets).
 - **Interactive shell** with line editing, history (arrow keys), tab completion, colors, pipes,
   redirections, subshells, command substitution and arithmetic.
 - **Symmetric multiprocessing**: all CPUs (QEMU runs with 4) execute user programs and the
@@ -117,6 +120,21 @@ kept between runs; delete it for a fresh disk. A `disk.img` from before the disk
 to 2 GiB stays 64 MiB (the builder points it out): delete it to get the bigger one.
 Extra arguments after `--` are passed to QEMU; `OXIDENIX_BUILD_ONLY=1 cargo run` only builds the images.
 `OXIDENIX_DISK=<path>` uses another data disk image (created if missing).
+
+`OXIDENIX_NODE=1 cargo run` also puts Node.js on the data disk as `/data/bin/node`: a fully
+static musl build (`userspace/node/default.nix`, no npm; its header says which of Node's checks
+are off and why). The first build compiles V8 and runs Node's test suites (about an hour on 12
+cores); later runs take it from the Nix store (`target/node` keeps it from garbage collection).
+`OXIDENIX_NODE=<path>` installs another static node binary instead. The builder writes it into
+the existing disk image with `debugfs` (replacing an older version, leaving the rest of the disk
+as it is). Normal runs and CI never build or need Node.
+
+`OXIDENIX_AUTORUN=<script> cargo run` boots like test mode into a shell script of the host's
+(copied to `/etc/autorun`): its output and the kernel log go to stdout, its exit status ends
+QEMU (1 = 0, 3 = otherwise). For trying a program, for example
+`OXIDENIX_NODE=1 OXIDENIX_AUTORUN=run-node.sh cargo run > serial.log` with
+`/data/bin/node -e 'console.log(1+1)'` in `run-node.sh`; the kernel logs the calls it does not
+implement ("syscall N not implemented").
 
 `scripts/bench.sh` runs the I/O benchmarks (`iobench`) on a fresh disk and records the results
 with the commit in `docs/benchmarks/` (see its README); `/proc/counters` counts system calls, IPC
@@ -1040,6 +1058,9 @@ watching each other multiplies the cost of each wakeup (with interrupts off).
 - [x] `eventfd`
 - [x] `epoll`
 - [x] A page cache with file-backed shared mappings (and programs mapped, not copied)
+- [x] Node.js: `node -e 'console.log(1+1)'`, files, timers, workers, HTTP, DNS, WebAssembly
+- [ ] Node.js: child processes with pipes (`AF_UNIX` socketpairs), `os.networkInterfaces()`
+  (netlink), `statx` and `io_uring` (libuv falls back to `stat` and epoll)
 - [ ] Dynamic linking, real entropy, users and permissions
 
 ## Development history

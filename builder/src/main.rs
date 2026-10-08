@@ -59,11 +59,16 @@ fn main() {
     // become QEMU's exit status (1 = success, 3 = failure).
     // OXIDENIX_BENCH=1: the same, with the benchmarks (/etc/bench.sh,
     // docs/benchmarks) instead of the tests.
+    // OXIDENIX_AUTORUN=<host file>: the same with that shell script (say, a
+    // program under development and the calls it makes in the kernel log).
     let bench_mode = std::env::var_os("OXIDENIX_BENCH").is_some();
-    let test_mode = bench_mode || std::env::var_os("OXIDENIX_TEST").is_some();
+    let autorun = std::env::var_os("OXIDENIX_AUTORUN").map(PathBuf::from);
+    let test_mode = bench_mode || autorun.is_some() || std::env::var_os("OXIDENIX_TEST").is_some();
     println!("Building root filesystem...");
     build_rootfs(&rootfs).expect("Failed to build root filesystem");
-    if test_mode {
+    if let Some(script) = &autorun {
+        fs::copy(script, rootfs.join("etc/autorun")).expect("Failed to copy OXIDENIX_AUTORUN to /etc/autorun");
+    } else if test_mode {
         let script = if bench_mode { "bench.sh" } else { "runtests.sh" };
         std::os::unix::fs::symlink(script, rootfs.join("etc/autorun")).expect("Failed to link /etc/autorun");
     }
@@ -85,6 +90,12 @@ fn main() {
             data_disk.display(),
             DATA_DISK_BYTES >> 30
         );
+    }
+    // OXIDENIX_NODE=1 (or the path of a static node binary): Node.js on the
+    // data disk as /bin/node (/data/bin/node in oxidenix).
+    if let Some(node) = node_binary() {
+        println!("Installing {} as /bin/node on {}...", node.display(), data_disk.display());
+        install_on_disk(&data_disk, &node, "bin/node").expect("Failed to put node on the data disk");
     }
 
     // Most of a debug build is DWARF debug information the kernel never
@@ -265,6 +276,70 @@ fn create_data_disk(path: &Path) -> io::Result<()> {
     if !status.success() {
         let _ = fs::remove_file(path);
         return Err(io::Error::other("mke2fs failed"));
+    }
+    Ok(())
+}
+
+/// The Node.js binary `OXIDENIX_NODE` asks for: `1` builds userspace/node
+/// (a static musl Node.js; the first build compiles V8 and takes an hour or more,
+/// later ones come from the Nix store, kept from garbage collection by the
+/// link target/node), any other value is the path of a static node binary.
+/// None without the variable: normal runs and CI never need Node.
+fn node_binary() -> Option<PathBuf> {
+    let value = std::env::var_os("OXIDENIX_NODE").filter(|v| !v.is_empty())?;
+    if value != "1" {
+        return Some(PathBuf::from(value));
+    }
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let link = root.join("target/node");
+    println!("Building Node.js (userspace/node)...");
+    let status = Command::new("nix-build")
+        .arg(root.join("userspace/node/default.nix"))
+        .arg("-o")
+        .arg(&link)
+        .status()
+        .expect("Failed to run nix-build for Node.js");
+    if !status.success() {
+        eprintln!("nix-build userspace/node failed");
+        process::exit(2);
+    }
+    Some(link.join("bin/node"))
+}
+
+/// Puts the host file `src` on the ext2 image `disk` as `dest` (relative to
+/// its root, in an existing or new directory), mode 0755 and owned by root,
+/// replacing an older version. debugfs edits the image in place, so the rest
+/// of the persistent disk stays as it is.
+fn install_on_disk(disk: &Path, src: &Path, dest: &str) -> io::Result<()> {
+    let size = fs::metadata(src)?.len();
+    let mut script = String::new();
+    // debugfs goes on after a failing command: the directories that exist
+    // already and a missing old version are no errors here.
+    let mut dir = String::new();
+    for part in dest.split('/').take(dest.matches('/').count()) {
+        dir = format!("{dir}/{part}");
+        script += &format!("mkdir {dir}\n");
+    }
+    script += &format!("rm /{dest}\nwrite \"{}\" /{dest}\n", src.display());
+    script += &format!("sif /{dest} mode 0100755\nsif /{dest} uid 0\nsif /{dest} gid 0\n");
+    let cmds = disk.with_extension("debugfs");
+    fs::write(&cmds, script)?;
+    let run = |args: &str| {
+        Command::new("nix-shell")
+            .args(["-p", "e2fsprogs", "--run", &format!("unset SOURCE_DATE_EPOCH; debugfs {args} '{}'", disk.display())])
+            .env("DEBUGFS_PAGER", "__none__")
+            .output()
+    };
+    let out = run(&format!("-w -f '{}'", cmds.display()));
+    let _ = fs::remove_file(&cmds);
+    let out = out?;
+    // debugfs's exit status does not tell whether its commands worked: the
+    // file must now be there, as large as its source.
+    let stat = run(&format!("-R 'stat /{dest}'"))?;
+    let expected = format!("Size: {size}\n");
+    if !out.status.success() || !String::from_utf8_lossy(&stat.stdout).contains(&expected) {
+        let log = String::from_utf8_lossy(&out.stderr);
+        return Err(io::Error::other(format!("/{dest} is not on the disk after debugfs:\n{log}")));
     }
     Ok(())
 }
