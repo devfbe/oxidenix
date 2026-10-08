@@ -88,9 +88,55 @@ struct Inner {
     client_gone: bool,
     service_gone: bool,
     /// Grants by id: live ones and revoked ones still draining.
-    grants: BTreeMap<u32, Arc<Grant>>,
-    /// Pages of `grants`.
+    grants: Grants,
+    /// Grants being made (`grant` reserves a slot before it pins).
+    reserved: usize,
+    /// Pages of `grants` and of the grants being made, each released only
+    /// by whoever took it.
     pages: u64,
+}
+
+/// Grants by id (from 1), in a table of slots: an id is the lowest free
+/// one, and comes back only once its grant is fully gone.
+#[derive(Default)]
+struct Grants {
+    slots: Vec<Option<Arc<Grant>>>,
+    live: usize,
+}
+
+impl Grants {
+    fn get(&self, id: u32) -> Option<&Arc<Grant>> {
+        self.slots.get((id as usize).checked_sub(1)?)?.as_ref()
+    }
+
+    /// Enters `grant` under the lowest free id (ENOMEM without room).
+    fn insert(&mut self, grant: Arc<Grant>) -> Result<u32, i64> {
+        let index = match self.slots.iter().position(Option::is_none) {
+            Some(i) => i,
+            None => {
+                self.slots.try_reserve(1).map_err(|_| ENOMEM)?;
+                self.slots.push(None);
+                self.slots.len() - 1
+            }
+        };
+        self.slots[index] = Some(grant);
+        self.live += 1;
+        Ok(index as u32 + 1)
+    }
+
+    /// Takes grant `id` out if it is `grant`.
+    fn remove(&mut self, id: u32, grant: &Arc<Grant>) -> Option<Arc<Grant>> {
+        let slot = self.slots.get_mut((id as usize).checked_sub(1)?)?;
+        if !slot.as_ref().is_some_and(|g| Arc::ptr_eq(g, grant)) {
+            return None;
+        }
+        self.live -= 1;
+        slot.take()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (u32, &Arc<Grant>)> {
+        self.slots.iter().enumerate().filter_map(|(i, g)| g.as_ref().map(|g| (i as u32 + 1, g)))
+    }
 }
 
 #[derive(Clone)]
@@ -153,8 +199,10 @@ pub struct DmaDomain {
 }
 
 impl DmaDomain {
-    /// The device address of `frame`.
-    fn map(&self, frame: PhysFrame) -> u64 {
+    /// The device address of `frame`, which the device may write if
+    /// `writable` (with an IOMMU: the domain's entry is read-only
+    /// otherwise; without one the device can do anything).
+    fn map(&self, frame: PhysFrame, _writable: bool) -> u64 {
         frame.start_address().as_u64()
     }
 
@@ -186,7 +234,7 @@ impl Channel {
         // Positions start at 0 (the memory is zeroed).
         unsafe { (memory::phys_to_virt(header.start_address().as_u64()) as *mut Header).write(Header::new(&layout)) };
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        let inner = Inner { offered: None, service: None, client_gone: false, service_gone: false, grants: BTreeMap::new(), pages: 0 };
+        let inner = Inner { offered: None, service: None, client_gone: false, service_gone: false, grants: Grants::default(), reserved: 0, pages: 0 };
         // From here on, dropping the channel releases the header page.
         let channel = Channel { id, layout, memory, header, inner: IrqSpinLock::new(inner) };
         let channel = Arc::try_new(channel).map_err(|_| ENOMEM)?;
@@ -277,7 +325,8 @@ impl Channel {
         }
         let first = offset / PAGE;
         first.checked_add(pages).ok_or(EINVAL)?;
-        // Room first (released below on failure).
+        // A slot and the pages first, released below on failure (and only
+        // by this call: a teardown meanwhile leaves them alone).
         {
             let mut inner = self.inner.lock();
             if inner.service_gone || inner.client_gone {
@@ -286,12 +335,17 @@ impl Channel {
             if inner.service.is_none() {
                 return Err(ENOTCONN);
             }
-            if inner.grants.len() >= MAX_GRANTS || inner.pages + pages > MAX_GRANTED_PAGES {
+            if inner.grants.live + inner.reserved >= MAX_GRANTS || inner.pages + pages > MAX_GRANTED_PAGES {
                 return Err(ENOSPC);
             }
+            inner.reserved += 1;
             inner.pages += pages;
         }
-        let unreserve = || self.inner.lock().pages -= pages;
+        let unreserve = || {
+            let mut inner = self.inner.lock();
+            inner.reserved -= 1;
+            inner.pages -= pages;
+        };
         let mut frames = Vec::new();
         if frames.try_reserve_exact(pages as usize).is_err() {
             unreserve();
@@ -315,21 +369,12 @@ impl Channel {
             return Err(ENOMEM);
         };
         let mut inner = self.inner.lock();
-        if inner.service_gone || inner.client_gone {
+        inner.reserved -= 1;
+        let entered = if inner.service_gone || inner.client_gone { Err(EPIPE) } else { inner.grants.insert(grant) };
+        if entered.is_err() {
             inner.pages -= pages;
-            return Err(EPIPE);
         }
-        // The lowest free id (from 1): an id comes back only once its
-        // grant is fully gone, after the service let go of it.
-        let mut id = 1u32;
-        for &used in inner.grants.keys() {
-            if used != id {
-                break;
-            }
-            id += 1;
-        }
-        inner.grants.insert(id, grant);
-        Ok(id)
+        entered
     }
 
     /// Takes grant `id` back (see `restricted::SYS_REVOKE`): 0, or
@@ -340,7 +385,7 @@ impl Channel {
             if inner.service_gone {
                 return Ok(0);
             }
-            (inner.grants.get(&id).cloned().ok_or(EINVAL)?, inner.service.clone())
+            (inner.grants.get(id).cloned().ok_or(EINVAL)?, inner.service.clone())
         };
         let mut st = grant.state.lock();
         if st.revoked {
@@ -371,13 +416,11 @@ impl Channel {
     fn forget(&self, id: u32, grant: &Arc<Grant>) {
         let gone = {
             let mut inner = self.inner.lock();
-            match inner.grants.get(&id) {
-                Some(g) if Arc::ptr_eq(g, grant) => {
-                    inner.pages -= grant.frames.len() as u64;
-                    inner.grants.remove(&id)
-                }
-                _ => None,
+            let gone = inner.grants.remove(id, grant);
+            if gone.is_some() {
+                inner.pages -= grant.frames.len() as u64;
             }
+            gone
         };
         drop(gone);
     }
@@ -392,7 +435,7 @@ impl Channel {
             }
             inner.client_gone = true;
             inner.offered = None;
-            (inner.grants.iter().map(|(&id, g)| (id, g.clone())).collect::<Vec<_>>(), inner.service.clone())
+            (inner.grants.iter().map(|(id, g)| (id, g.clone())).collect::<Vec<_>>(), inner.service.clone())
         };
         for (id, grant) in grants {
             let mut st = grant.state.lock();
@@ -428,11 +471,13 @@ impl Channel {
             }
             inner.service_gone = true;
             inner.offered = None;
-            inner.pages = 0;
-            (core::mem::take(&mut inner.grants), inner.service.take())
+            let grants = core::mem::take(&mut inner.grants);
+            // Exactly their pages: grants being made release their own.
+            inner.pages -= grants.iter().map(|(_, g)| g.frames.len() as u64).sum::<u64>();
+            (grants, inner.service.take())
         };
         let mm = service.as_ref().and_then(|s| s.mm.upgrade());
-        for grant in grants.into_values() {
+        for grant in grants.slots.into_iter().flatten() {
             let mut st = grant.state.lock();
             st.revoked = true;
             if let Some(mm) = &mm {
@@ -579,7 +624,7 @@ pub fn detach(id: u64) -> Result<i64, i64> {
 /// The grant `grant` of the attached channel `id`, and the service.
 fn grant_of(id: u64, grant: u64) -> Result<(Arc<Channel>, ServiceEnd, Arc<Grant>), i64> {
     let (channel, service) = Channel::attached(id)?;
-    let g = u32::try_from(grant).ok().and_then(|g| channel.inner.lock().grants.get(&g).cloned()).ok_or(ENOENT)?;
+    let g = u32::try_from(grant).ok().and_then(|g| channel.inner.lock().grants.get(g).cloned()).ok_or(ENOENT)?;
     Ok((channel, service, g))
 }
 
@@ -615,7 +660,7 @@ pub fn grant_dma(id: u64, grant: u64, offset: u64) -> Result<i64, i64> {
         return Err(ENOENT);
     }
     st.device = true;
-    let address = service.server.domain.map(g.frames[(offset / PAGE) as usize]) + offset % PAGE;
+    let address = service.server.domain.map(g.frames[(offset / PAGE) as usize], g.writable) + offset % PAGE;
     Ok(address as i64)
 }
 
