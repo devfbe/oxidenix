@@ -277,10 +277,18 @@ impl FsInfo {
         self.record.lock().as_ref().map_or(0, |r| r.word())
     }
 
-    /// Replaces the server's record; returns the old one (to be dropped
-    /// without the lock).
-    pub fn set_record(&self, record: Option<super::linux::Record>) -> Option<super::linux::Record> {
-        core::mem::replace(&mut *self.record.lock(), record)
+    /// Gives a new context the server's record (at its creation, or once
+    /// for a context the kernel made without one). Never replaces one: the
+    /// server's threads use their context's record without holding a
+    /// reference of their own (see `restricted::SYS_FS_RECORD`). Returns the
+    /// record back if the context has one (to be dropped without the lock).
+    pub fn set_record(&self, record: super::linux::Record) -> Result<(), super::linux::Record> {
+        let mut slot = self.record.lock();
+        if slot.is_some() {
+            return Err(record);
+        }
+        *slot = Some(record);
+        Ok(())
     }
 
     pub fn cwd(&self) -> String {

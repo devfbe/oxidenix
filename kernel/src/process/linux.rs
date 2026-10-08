@@ -796,15 +796,28 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
         SYS_FS_RECORD => {
             let (op, word) = (a[0], a[1]);
             let record = || (word != 0).then(|| Record { instance: Arc::downgrade(&instance), word });
-            let old = match op {
-                FS_GET => return Ok(with_current(|p| p.fs.as_ref().map_or(0, |f| f.record_word())) as i64),
-                FS_SET => with_current(|p| p.fs.as_ref().map(|f| f.set_record(record()))).ok_or(EINVAL)?,
-                FS_CHILD => with_current(|p| p.linux.as_mut().and_then(|l| core::mem::replace(&mut l.fs_child, record()))),
-                _ => return Err(EINVAL),
-            };
-            // Released outside the task's lock.
-            drop(old);
-            Ok(0)
+            match op {
+                FS_GET => Ok(with_current(|p| p.fs.as_ref().map_or(0, |f| f.record_word())) as i64),
+                FS_SET => {
+                    if word == 0 {
+                        return Err(EINVAL);
+                    }
+                    let fs = with_current(|p| p.fs.clone()).ok_or(EINVAL)?;
+                    // A refused record was never handed over: no release.
+                    let mut refused = fs.set_record(Record { instance: Arc::downgrade(&instance), word }).err();
+                    if let Some(r) = refused.as_mut() {
+                        r.instance = Weak::new();
+                    }
+                    if refused.is_some() { Err(EEXIST) } else { Ok(0) }
+                }
+                FS_CHILD => {
+                    let old = with_current(|p| p.linux.as_mut().and_then(|l| core::mem::replace(&mut l.fs_child, record())));
+                    // Released outside the task's lock.
+                    drop(old);
+                    Ok(0)
+                }
+                _ => Err(EINVAL),
+            }
         }
         SYS_SET_USERCOPY => {
             let (insn, fixup) = (a[0], a[1]);

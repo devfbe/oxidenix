@@ -292,11 +292,14 @@ pub const SYS_KFD_WRITE: u64 = 1039;
 // kernel's carries a word of the server's, its record (cwd, umask).
 
 /// `fs_record(op, word)`: `FS_GET` returns the record of the calling
-/// thread's context (0: none yet); `FS_SET` makes `word` its record;
+/// thread's context (0: none yet); `FS_SET` makes `word` its record if it
+/// has none (EEXIST otherwise: a record is never replaced while its context
+/// lives, so a thread may use its own without further synchronization);
 /// `FS_CHILD` gives `word` to the next context this thread's pass-through
 /// call creates (a clone without CLONE_FS). Every record handed over comes
-/// back exactly once as `EVENT_RELEASE`: when its context ends, when it is
-/// replaced, or, a child's record no clone took, when the call returns.
+/// back exactly once as `EVENT_RELEASE`: when its context ends, or, a
+/// child's record no clone took, when the call returns. (A refused
+/// `FS_SET` hands nothing over.)
 pub const SYS_FS_RECORD: u64 = 1040;
 pub const FS_GET: u64 = 0;
 pub const FS_SET: u64 = 1;

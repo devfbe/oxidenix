@@ -6,9 +6,11 @@
 //! context of the kernel's carries a word of the server's: a pointer to its
 //! `FsContext` (`SYS_FS_RECORD`). The kernel's context holds one strong
 //! reference, given with `Arc::into_raw` and taken back when the kernel
-//! reports `EVENT_RELEASE`; the kernel releases it only once no thread runs
-//! in the context any more (or the call that was to create it returned
-//! without doing so), so a thread's own record is alive while it runs.
+//! reports `EVENT_RELEASE`. The kernel never replaces a context's record
+//! and releases it only once no thread runs in the context any more (or
+//! the call that was to create it returned without doing so), so a
+//! thread's own record is alive while it runs: reading the word and then
+//! taking a reference of our own cannot race with its release.
 //!
 //! A clone that makes a new context (fork, vfork, clone without CLONE_FS)
 //! gets a copy of the caller's record, made before the call passes through:
@@ -61,8 +63,17 @@ pub fn current() -> Arc<FsContext> {
         }
     }
     let context = Arc::new(FsContext { state: Mutex::new(FsState { cwd: String::from("/"), umask: 0o022, test: 0 }) });
-    syscall(SYS_FS_RECORD, [FS_SET, give(context.clone()), 0, 0, 0, 0]);
-    context
+    let word = give(context.clone());
+    const EEXIST: i64 = 17;
+    match syscall(SYS_FS_RECORD, [FS_SET, word, 0, 0, 0, 0]) {
+        0 => context,
+        e => {
+            // Not handed over after all.
+            released(word);
+            // Another thread of the context was first: take that one.
+            if e == -EEXIST { current() } else { context }
+        }
+    }
 }
 
 /// Before a system call passes through: a clone that makes a new context

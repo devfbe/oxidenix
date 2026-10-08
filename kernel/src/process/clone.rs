@@ -116,7 +116,10 @@ pub fn clone(frame: &Frame, flags: u64, stack: u64, parent_tid: u64, child_tid: 
         (Some(f), false) => {
             let fs = FsInfo::new(f.cwd()).ok_or(ENOMEM)?;
             // The Linux server's record for the new context, if it gave one.
-            fs.set_record(parent.linux.as_mut().and_then(|l| l.fs_child.take()));
+            if let Some(record) = parent.linux.as_mut().and_then(|l| l.fs_child.take()) {
+                // A new context has none yet.
+                let _ = fs.set_record(record);
+            }
             fs
         }
         (None, _) => FsInfo::new(alloc::string::String::from("/")).ok_or(ENOMEM)?,
