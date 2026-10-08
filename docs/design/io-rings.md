@@ -340,9 +340,9 @@ pages and dirty marks the kernel keeps and whose data the server moves:
   `grant(.., GRANT_DIRTY, out)` takes the first run of dirty pages of a window: clean from then
   on, write-protected in every mapping (a store marks them dirty again), pinned read-only for
   diskfs to write from by DMA; a write that failed puts them back with `mo_redirty` (1078). A child of
-  `fork` gets a dirty-tracked page read-only (its first store marks it): it is not among the
-  file's mappers until its address space is complete, so a write-back meanwhile could not
-  write-protect it. Rights raised without a fault (`mprotect`, a page kept under `PROT_NONE`
+  `fork` is among the file's mappers before it gets copies of its parent's entries, so a
+  write-back (or truncation) racing the fork reaches the child's copy as it reaches the
+  parent's (`docs/design/page-cache.md`, reverse map). Rights raised without a fault (`mprotect`, a page kept under `PROT_NONE`
   accessed again) keep a page writable only if it was writable before, so dirty and backed;
   any other page is mapped read-only and its first store marks it dirty. The
   file's size at `out` is the one under the lock that took the dirty marks: a write makes a page

@@ -60,6 +60,17 @@ table entries that map a cache page. Each cache keeps the address spaces that ma
 is set up). To act on a page it locks each mapper's address space and finds the areas of this
 file in it. This scales with the processes mapping a file, not with all processes.
 
+The list is walked one mapper at a time, in the order they registered, with no cache lock held
+while a mapper's address space is locked; mappers that register during a walk are visited too
+(while a walk runs, dead entries stay in place, so the list only grows at its end). `fork`
+registers the child with the caches of every file area it inherits under the parent's lock,
+before the child gets copies of the parent's page table entries (`Mm::fork`, holding the child's
+lock until the copy is done). A truncation or write-back that the copy may have missed visits the
+parent only after the copy (it needs the parent's lock) and then the child (registered later),
+so the child's stale copy is cut or write-protected as the parent's is; one that visited the
+parent before the copy left nothing stale to copy. The child of a fork therefore keeps a
+writable entry of a dirty disk-file page writable, as its parent has it.
+
 - **Truncation** (shrinking): drops the cache pages beyond the new end, zeroes the tail of the
   last page, then removes every mapping of the dropped range, private copies included (later
   accesses are `SIGBUS`, as on Linux).
@@ -69,8 +80,10 @@ file in it. This scales with the processes mapping a file, not with all processe
 
 ### Locks
 
-Order (outer to inner): address space (`Mm`, sleeping) → cache I/O lock (sleeping) → cache
-state (`IrqSpinLock`: pages, size) → frames.
+Order (outer to inner): address space (`Mm`, sleeping; a fork holds the parent's, then the
+child's) → cache I/O lock (sleeping) → cache state (`IrqSpinLock`: pages, size) → frames. A
+cache's list of mappers (`IrqSpinLock`) is innermost too: registration takes it under an address
+space, and the walks (truncation, write-back) drop it before they lock a mapper.
 
 - The **I/O lock** serializes what changes contents or size: `write` and truncation. It is
   never held while an address space is locked, so a fault (address space → I/O) cannot deadlock

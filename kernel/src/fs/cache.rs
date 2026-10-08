@@ -308,12 +308,23 @@ struct State {
     dirty: u64,
 }
 
+/// The address spaces that map an object, in the order they registered
+/// (`PageCache::register`), for the walks that must reach every mapping of
+/// a page (`PageCache::for_each_mapper`).
+struct Mappers {
+    list: Vec<Weak<Mm>>,
+    /// Walks in progress: while there is one, dead entries stay (dropping
+    /// them would move live ones under a walk, which could skip them), so
+    /// the list only grows at its end.
+    walkers: usize,
+}
+
 pub struct PageCache {
     state: IrqSpinLock<State>,
     io: Mutex<()>,
     store: Store,
     /// Address spaces that map this file (see `register`).
-    mappers: IrqSpinLock<Vec<Weak<Mm>>>,
+    mappers: IrqSpinLock<Mappers>,
     /// Set once by `hang_up`: futex waits on this object fail (EPIPE).
     hung_up: core::sync::atomic::AtomicBool,
 }
@@ -388,7 +399,7 @@ impl PageCache {
             }),
             io: Mutex::new(()),
             store,
-            mappers: IrqSpinLock::new(Vec::new()),
+            mappers: IrqSpinLock::new(Mappers { list: Vec::new(), walkers: 0 }),
             hung_up: core::sync::atomic::AtomicBool::new(false),
         })
         .map_err(|_| ENOMEM)
@@ -1530,42 +1541,63 @@ impl PageCache {
 
     /// Write-protects `pages` in every shared mapping of this file.
     fn write_protect(&self, pages: &[u64]) {
-        let mut i = self.mappers.lock().len();
-        while i > 0 {
-            i -= 1;
-            let mm = self.mappers.lock().get(i).and_then(Weak::upgrade);
-            if let Some(mm) = mm {
-                mm.lock().write_protect_file(self, pages);
-            }
-        }
+        self.for_each_mapper(|mm| mm.lock().write_protect_file(self, pages));
     }
 
-    /// Records that `mm` maps this file, so truncation can reach its page
-    /// table entries. Kept until the address space is gone.
+    /// Records that `mm` maps this file, so truncation and write-back can
+    /// reach its page table entries; at the end of the list, so a walk in
+    /// progress reaches it too (`for_each_mapper`). Kept until the address
+    /// space is gone (then skipped, and dropped by a later registration).
+    ///
+    /// A fork child registers with the caches of the areas it inherits
+    /// under its parent's lock, before it gets copies of the parent's
+    /// entries (`Mm::fork`): after the parent, so every walk that could
+    /// leave the child a stale copy reaches the child after the parent.
     pub fn register(&self, mm: &Weak<Mm>) -> Result<(), Fault> {
         let mut mappers = self.mappers.lock();
-        if mappers.iter().any(|m| m.ptr_eq(mm)) {
+        if mappers.list.iter().any(|m| m.ptr_eq(mm)) {
             return Ok(());
         }
-        mappers.retain(|m| m.strong_count() > 0);
-        mappers.try_reserve(1).map_err(|_| Fault::Oom)?;
-        mappers.push(mm.clone());
+        if mappers.walkers == 0 {
+            mappers.list.retain(|m| m.strong_count() > 0);
+        }
+        mappers.list.try_reserve(1).map_err(|_| Fault::Oom)?;
+        mappers.list.push(mm.clone());
         Ok(())
     }
 
     /// Removes the pages from `index` on from every mapping of this file.
-    /// Walks the list downwards without copying it: `register` only
-    /// appends and drops dead entries, which moves live ones down, so an
-    /// entry may be visited twice (harmless) but none is skipped.
     fn unmap_from(&self, index: u64) {
-        let mut i = self.mappers.lock().len();
-        while i > 0 {
-            i -= 1;
-            let mm = self.mappers.lock().get(i).and_then(Weak::upgrade);
+        self.for_each_mapper(|mm| mm.lock().unmap_file(self, index));
+    }
+
+    /// Calls `f` for each address space that maps this file, one at a time
+    /// with no lock of the cache held (`f` locks the space), in the order
+    /// they registered, those that register meanwhile included.
+    ///
+    /// That is what makes a change to the cache (a truncation, a write-back
+    /// cleaning pages) reach a fork child's copy of its parent's entries:
+    /// the walk starts after the change and visits the parent under the
+    /// parent's lock. If the fork copied the entries before that visit, it
+    /// registered the child before (`Mm::fork`, under the parent's lock), so
+    /// the walk visits the child after the parent, once the copy is done
+    /// (the child's lock is held for it); if it copied them after the
+    /// visit, they are as current as the parent's. A walk ends once it
+    /// caught up with the registrations.
+    fn for_each_mapper(&self, mut f: impl FnMut(&Mm)) {
+        self.mappers.lock().walkers += 1;
+        let mut i = 0;
+        loop {
+            // (The space, if this was its last reference, goes outside
+            // the lock.)
+            let entry = self.mappers.lock().list.get(i).map(Weak::upgrade);
+            let Some(mm) = entry else { break };
             if let Some(mm) = mm {
-                mm.lock().unmap_file(self, index);
+                f(&mm);
             }
+            i += 1;
         }
+        self.mappers.lock().walkers -= 1;
     }
 }
 
