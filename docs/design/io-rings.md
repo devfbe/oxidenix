@@ -251,8 +251,8 @@ answers the offer only after it served the channel.
 |----|---------|------------|
 | `READ` / `WRITE` | inode, file offset, a grant range (at most 1 MiB; `READ` needs a writable grant) | bytes (a read is short at the end of the file), v0 = file size |
 | `FLUSH` | - | 0: every write completed before it is durable |
-| `STAT`, `STATFS` | inode / - | 0, the values packed in v0..v3 (`fsring::Stat`, `Usage`) |
-| `LOOKUP`, `CREATE`, `UNLINK`, `RENAME` | directory, names in a grant (a symlink's target or the new name right after the first name) | v0 = the inode found or made (v1 = its mode), or the one whose last link went |
+| `STAT`, `STATFS` | inode / - | 0, the values packed in v0..v3 (`fsring::Stat` with the inode's generation, `Usage`) |
+| `LOOKUP`, `CREATE`, `UNLINK`, `RENAME` | directory, names in a grant (a symlink's target or the new name right after the first name) | v0 = the inode found or made (v1 = its mode, v2 = its generation), or the one whose last link went |
 | `TRUNCATE`, `SETPERM` | inode and the new size / permissions | 0 |
 | `RELEASE` | inode | 0: the client holds it no more (see "Holds" below) |
 | `READDIR`, `READLINK` | a result buffer in a writable grant (`READDIR` with a cursor) | bytes, v0 = the next cursor |
@@ -382,8 +382,9 @@ pages and dirty marks the kernel keeps and whose data the server moves:
   whose tag or operation does not match a slot in flight are dropped; every status and value is
   checked before use (a READ's bytes, a READDIR's entries, a READLINK's length). A dying diskfs
   fails the requests in flight with `EIO`; the next request connects a new channel (diskfs is
-  started again), the inodes in use are named again to hold them (an unlinked one is stale:
-  `EIO`), dirty pages whose write failed are written on the new channel, and a write that
+  started again), the inodes in use are named again to hold them before anyone uses the new
+  channel (an unlinked one, one that is gone, and one whose number now has another type or
+  ext2 generation are stale: `EIO`; `STAT` reports the generation), dirty pages whose write failed are written on the new channel, and a write that
   completed but was not flushed before diskfs died makes the next `fsync` of its file report
   `EIO`.
 - **Metadata** (lookup, create, unlink, rename, stat, readdir, readlink) goes through the same

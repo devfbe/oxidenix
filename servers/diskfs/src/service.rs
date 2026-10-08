@@ -1040,7 +1040,7 @@ impl Service {
             Request::Stat { ino } => {
                 fs.check(ino)?;
                 let s = fs.stat(ino)?;
-                let stat = fsring::Stat { mode: s.mode, links: s.links, size: s.size, atime: s.atime, mtime: s.mtime, ctime: s.ctime };
+                let stat = fsring::Stat { mode: s.mode, links: s.links, size: s.size, atime: s.atime, mtime: s.mtime, ctime: s.ctime, generation: s.generation };
                 Ok((0, stat.to_values()))
             }
             Request::Statfs => {
@@ -1059,7 +1059,8 @@ impl Service {
                 fs.check(dir)?;
                 let name = self.name(c, &name)?;
                 let ino = fs.lookup(dir, &name)?;
-                Ok((0, [ino as u64, fs.stat(ino)?.mode as u64, 0, 0]))
+                let s = fs.stat(ino)?;
+                Ok((0, [ino as u64, s.mode as u64, s.generation as u64, 0]))
             }
             Request::Create { dir, name, kind, perm } => {
                 Self::live_dir(fs, dir)?;
@@ -1074,7 +1075,8 @@ impl Service {
                     }
                 };
                 let ino = fs.create(dir, &name, &node, perm)?;
-                Ok((0, [ino as u64, fs.stat(ino)?.mode as u64, 0, 0]))
+                let s = fs.stat(ino)?;
+                Ok((0, [ino as u64, s.mode as u64, s.generation as u64, 0]))
             }
             Request::Unlink { dir, name, is_dir } => {
                 fs.check(dir)?;

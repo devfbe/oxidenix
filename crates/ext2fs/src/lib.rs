@@ -166,6 +166,14 @@ impl RawInode {
     pub fn links(&self) -> u16 {
         le16(&self.0, 26)
     }
+    /// i_generation: a new one each time the inode number is given to a
+    /// new file.
+    pub fn generation(&self) -> u32 {
+        le32(&self.0, 100)
+    }
+    fn set_generation(&mut self, v: u32) {
+        put32(&mut self.0, 100, v)
+    }
     fn set_links(&mut self, v: u16) {
         put16(&mut self.0, 26, v)
     }
@@ -1065,7 +1073,10 @@ impl<D: Device> State<D> {
     fn init_inode(&mut self, dir: u32, ino: u32, name: &str, kind: &NewNode, perm: u32) -> Result<(), i64> {
         let goal = self.group_of(dir);
         let is_dir = matches!(kind, NewNode::Dir);
+        // The number's next generation (a freed inode keeps its last).
+        let generation = self.read_inode(ino).map(|old| old.generation()).unwrap_or(0).wrapping_add(1);
         let mut inode = RawInode([0; 128]);
+        inode.set_generation(generation);
         inode.touch(self.dev.now(), true, true);
         let ftype = match kind {
             NewNode::File => {
@@ -1522,6 +1533,8 @@ pub struct Stat {
     pub atime: u32,
     pub mtime: u32,
     pub ctime: u32,
+    /// i_generation (a new one for each new file of the number).
+    pub generation: u32,
 }
 
 /// A mounted ext2 filesystem on device `D`. Single-threaded: the owner
@@ -1622,6 +1635,7 @@ impl<D: Device> Ext2<D> {
             atime: i.atime(),
             mtime: i.mtime(),
             ctime: i.ctime(),
+            generation: i.generation(),
         })
     }
 

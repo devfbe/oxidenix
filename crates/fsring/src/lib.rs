@@ -18,8 +18,8 @@
 //! | `WRITE` | `object` inode, `offset`, buffer | bytes written (all of them), v0 = file size |
 //! | `FLUSH` | - | 0 once every write completed before it is durable |
 //! | `STAT` | `object` inode | 0, `Stat` in v0..v3 |
-//! | `LOOKUP` | `object` directory, buffer = name | v0 = inode, v1 = its mode |
-//! | `CREATE` | `object` directory, buffer = name, `arg` = [kind, permissions, target length]; a symlink's target follows the name in the grant | v0 = new inode, v1 = its mode |
+//! | `LOOKUP` | `object` directory, buffer = name | v0 = inode, v1 = its mode, v2 = its generation |
+//! | `CREATE` | `object` directory, buffer = name, `arg` = [kind, permissions, target length]; a symlink's target follows the name in the grant | v0 = new inode, v1 = its mode, v2 = its generation |
 //! | `UNLINK` | `object` directory, buffer = name, `arg[0]` = 1 for a directory | v0 = inode whose last link went (0: none) |
 //! | `RENAME` | `object` old directory, buffer = old name, `arg` = [new directory, new name length]; the new name follows the old one | as `UNLINK` (an entry replaced) |
 //! | `TRUNCATE` | `object` inode, `offset` = new size | 0 |
@@ -430,17 +430,34 @@ pub struct Stat {
     pub atime: u32,
     pub mtime: u32,
     pub ctime: u32,
+    /// Changes whenever the inode number is given to a new file (ext2's
+    /// i_generation): a client that held an inode before a restart of the
+    /// service tells it from a new file of that number.
+    pub generation: u32,
 }
 
 impl Stat {
     /// v0 = mode | links << 32, v1 = size, v2 = atime | mtime << 32,
-    /// v3 = ctime.
+    /// v3 = ctime | generation << 32.
     pub fn to_values(&self) -> [u64; 4] {
-        [self.mode as u64 | (self.links as u64) << 32, self.size, self.atime as u64 | (self.mtime as u64) << 32, self.ctime as u64]
+        [
+            self.mode as u64 | (self.links as u64) << 32,
+            self.size,
+            self.atime as u64 | (self.mtime as u64) << 32,
+            self.ctime as u64 | (self.generation as u64) << 32,
+        ]
     }
 
     pub fn from_values(v: &[u64; 4]) -> Stat {
-        Stat { mode: v[0] as u32, links: (v[0] >> 32) as u32, size: v[1], atime: v[2] as u32, mtime: (v[2] >> 32) as u32, ctime: v[3] as u32 }
+        Stat {
+            mode: v[0] as u32,
+            links: (v[0] >> 32) as u32,
+            size: v[1],
+            atime: v[2] as u32,
+            mtime: (v[2] >> 32) as u32,
+            ctime: v[3] as u32,
+            generation: (v[3] >> 32) as u32,
+        }
     }
 }
 

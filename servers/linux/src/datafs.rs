@@ -60,10 +60,12 @@
 //! mapping; a write-back: its pages are dirty again and written on the new
 //! channel). Before anyone uses the new channel, the inodes in use are
 //! named again (STAT) to hold them in the new diskfs; an unlinked one,
-//! which diskfs freed when the channel went, and one that is gone or
-//! changed are stale: every call on them fails with EIO, page requests of
+//! which diskfs freed when the channel went, and one that is gone or whose
+//! number now has another type or ext2 generation (another file) are
+//! stale: every call on them fails with EIO, page requests of
 //! their objects included (`keys` keeps every live inode). A lookup that
-//! finds a stale inode's number again gets a new `DInode`. Writes that
+//! finds a stale inode's number again, or one of another generation,
+//! gets a new `DInode`. Writes that
 //! completed but were not flushed before diskfs died may be lost: the next
 //! fsync of their file, or the next sync, reports EIO once.
 
@@ -114,6 +116,8 @@ pub struct DInode {
     pub ino: u32,
     /// The file's type (`S_IFMT` bits), which never changes.
     pub kind: u32,
+    /// Its i_generation: another file of the number has another one.
+    generation: u32,
     /// The cached object's key (`EVENT_PAGE`, `EVENT_DIRTY`).
     key: u64,
     /// The cached object, once there is one (regular files).
@@ -211,7 +215,8 @@ fn revalidate(c: &Client) {
             continue;
         }
         let same = c.call(Request::Stat { ino: inode.ino }.encode(0)).ok().filter(|r| r.status == 0).map(|r| fsring::Stat::from_values(&r.values));
-        if !same.is_some_and(|s| s.mode & vfs::S_IFMT == inode.kind) {
+        // Gone, or its number given to another file meanwhile.
+        if !same.is_some_and(|s| s.mode & vfs::S_IFMT == inode.kind && s.generation == inode.generation) {
             inode.stale.store(true, Ordering::Relaxed);
         }
     }
@@ -230,20 +235,23 @@ fn live(inode: &DInode) -> Result<(), i64> {
     if inode.stale.load(Ordering::Relaxed) { Err(EIO) } else { Ok(()) }
 }
 
-/// The inode `ino` of type `mode` that a request returned (held now). A
-/// stale inode of that number is another file now: it leaves the table
-/// (its users keep it, failing), a new one takes its place.
-fn found(ino: u64, mode: u64) -> Result<Arc<DInode>, i64> {
+/// The inode `ino` of type `mode` and generation `generation` that a
+/// request returned (held now). A stale inode of that number, or one of
+/// another generation, is another file now: it leaves the table (its users
+/// keep it, failing), a new one takes its place.
+fn found(ino: u64, mode: u64, generation: u64) -> Result<Arc<DInode>, i64> {
     let ino = u32::try_from(ino).ok().filter(|&i| i != 0).ok_or(EIO)?;
     let kind = mode as u32 & vfs::S_IFMT;
+    let generation = generation as u32;
     let mut t = TABLE.lock();
     match t.inodes.get(&ino) {
-        Some(i) if !i.stale.load(Ordering::Relaxed) => {
+        Some(i) if !i.stale.load(Ordering::Relaxed) && i.generation == generation => {
             i.used.store(TICK.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
             return Ok(i.clone());
         }
-        Some(_) => {
+        Some(i) => {
             // (Its key stays: its users may still fault on its object.)
+            i.stale.store(true, Ordering::Relaxed);
             t.dirty.remove(&ino);
         }
         None => {}
@@ -252,6 +260,7 @@ fn found(ino: u64, mode: u64) -> Result<Arc<DInode>, i64> {
     let inode = Arc::new(DInode {
         ino,
         kind,
+        generation,
         key,
         object: Mutex::new(None),
         writers: Mutex::new(0),
@@ -285,7 +294,8 @@ pub fn root() -> Result<Arc<DInode>, i64> {
     let _names = NAMES.read();
     let r = c.call(Request::Stat { ino: ROOT_INO }.encode(0))?;
     status(&r)?;
-    found(ROOT_INO as u64, fsring::Stat::from_values(&r.values).mode as u64)
+    let s = fsring::Stat::from_values(&r.values);
+    found(ROOT_INO as u64, s.mode as u64, s.generation as u64)
 }
 
 /// The inode by its object's key.
@@ -312,7 +322,7 @@ pub fn lookup(dir: &Arc<DInode>, name: &str) -> Result<Arc<DInode>, i64> {
     let _names = NAMES.read();
     let r = c.call(Request::Lookup { dir: dir.ino, name: scratch.buf(0, name.len() as u64) }.encode(0))?;
     status(&r)?;
-    found(r.values[0], r.values[1])
+    found(r.values[0], r.values[1], r.values[2])
 }
 
 /// What `create` makes.
@@ -343,7 +353,7 @@ pub fn create(dir: &Arc<DInode>, name: &str, new: New, perm: u32) -> Result<Arc<
     let _names = NAMES.read();
     let r = c.call(Request::Create { dir: dir.ino, name: scratch.buf(0, n), kind, perm: perm & 0o7777 }.encode(0))?;
     status(&r)?;
-    found(r.values[0], r.values[1])
+    found(r.values[0], r.values[1], r.values[2])
 }
 
 pub fn unlink(dir: &Arc<DInode>, name: &str, dir_only: bool) -> Result<(), i64> {

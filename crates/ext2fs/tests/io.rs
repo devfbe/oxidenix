@@ -752,3 +752,19 @@ fn freed_inodes_take_no_operations() {
     assert_eq!(fs.release(f), enoent);
     fsck("freedino", &take(fs));
 }
+
+/// An inode number given to a new file gets a new generation: a client
+/// that held the old file tells them apart.
+#[test]
+fn a_reused_inode_number_has_a_new_generation() {
+    let mut fs = Ext2::mount(mkfs("generation", 2 * 1024)).unwrap();
+    let f = fs.create(ROOT_INO, "f", &NewNode::File, 0o644).unwrap();
+    let old = fs.stat(f).unwrap().generation;
+    for ino in fs.unlink(ROOT_INO, "f", false).unwrap() {
+        fs.release(ino).unwrap();
+    }
+    let g = fs.create(ROOT_INO, "g", &NewNode::File, 0o644).unwrap();
+    assert_eq!(g, f, "the freed number is taken again");
+    assert_ne!(fs.stat(g).unwrap().generation, old);
+    fsck("generation", &take(fs));
+}
