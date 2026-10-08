@@ -1,6 +1,6 @@
 # ADR 0005: Shared-memory rings with granted buffers for the data plane
 
-Date: 2026-10-08. Status: proposed.
+Date: 2026-10-08. Status: accepted.
 
 ## Context
 

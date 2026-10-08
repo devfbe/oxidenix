@@ -1,6 +1,6 @@
 # I/O rings: the data plane between the Linux server and the device servers
 
-Status: proposed (ADR 0005). Implements principles 1-7 of the I/O audit
+Status: accepted (ADR 0005). Implements principles 1-7 of the I/O audit
 (`docs/io-path-audit.md`) for the paths the Linux server takes over in R6c.3 (files on
 `/data`), R7 (sockets) and later.
 
