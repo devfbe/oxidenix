@@ -280,7 +280,7 @@ impl Request {
     /// The request as a descriptor with tag `tag`.
     pub fn encode(&self, tag: u64) -> Desc {
         let mut d = Desc { op: self.op(), tag, ..Desc::default() };
-        let mut set_buf = |d: &mut Desc, b: &Buf| {
+        let set_buf = |d: &mut Desc, b: &Buf| {
             d.grant = b.grant;
             d.buf_off = b.offset;
             d.len = b.len;

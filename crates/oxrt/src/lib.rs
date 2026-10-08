@@ -14,6 +14,7 @@ pub mod sys {
     pub const WRITE: u64 = 1;
     pub const MMAP: u64 = 9;
     pub const MPROTECT: u64 = 10;
+    pub const MUNMAP: u64 = 11;
     pub const FUTEX: u64 = 202;
     pub const SCHED_YIELD: u64 = 24;
     pub const GETPID: u64 = 39;
@@ -325,6 +326,11 @@ pub mod copy {
     pub unsafe fn copy(dst: *mut u8, src: *const u8, len: usize) -> bool {
         unsafe { copy_bytes(dst, src, len) == 0 }
     }
+}
+
+/// munmap(2).
+pub fn munmap(addr: *const u8, len: usize) -> Result<(), i64> {
+    result(syscall(sys::MUNMAP, [addr as u64, len as u64, 0, 0, 0, 0])).map(|_| ())
 }
 
 /// mprotect(2).

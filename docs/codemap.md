@@ -71,11 +71,12 @@ module comment, and the public types it defines. Where to start for common tasks
 ## Linux server
 
 - `servers/linux/src/chantest.rs` (309) `TEST_CHANNEL`: the client's side of channels to the test service (servers/ringtest, protocol `ring::selftest`), as the page cache will use them with diskfs: create, connect, grant, move descriptors through the rings...
+- `servers/linux/src/disktest.rs` (414) `TEST_DISKRING`: the client's side of the file protocol (`fsring`) against diskfs, as the page cache will use it in step 4: a channel to diskfs, grants of memory objects, files on /data read and written by DMA into...
 - `servers/linux/src/eventfd.rs` (98) eventfd (phase R6b): a counter that reads take and writes add to, a file of the server with a placeholder in the kernel's descriptor table. Types: `EventFd`.
 - `servers/linux/src/files.rs` (299) The server's files (phase R6): objects the server implements, each named in the kernel's descriptor table by a placeholder (see `restricted::SYS_KFD_INSTALL`). Types: `File`.
 - `servers/linux/src/heap.rs` (60) The server's heap: one allocator for every thread of the instance, in the shared region, growing by `SYS_SHARED_MAP` when it runs out. Types: `ServerHeap`.
 - `servers/linux/src/initramfs.rs` (65) The instance's root tmpfs from the boot image's initramfs (phase R6c.2c): the server reads the archive's headers and names from the kernel's image object (`SYS_INITRAMFS`) and makes each regular file a file object...
-- `servers/linux/src/main.rs` (234) The Linux server (docs/design/linux-server.md).
+- `servers/linux/src/main.rs` (236) The Linux server (docs/design/linux-server.md).
 - `servers/linux/src/mm.rs` (131) Memory system calls (phase R4): Linux's semantics of mmap, munmap, mprotect, mremap, madvise, msync and the mlock family, over the kernel's mapping calls.
 - `servers/linux/src/namespace.rs` (219) The server's namespace (phase R6c.2): mounts and path resolution. Types: `KInode`, `Node`, `Resolved`.
 - `servers/linux/src/paths.rs` (316) The system calls that take a path (phase R6c.2b), and the working directory and umask, which live in the caller's record (`records`).
@@ -90,7 +91,8 @@ module comment, and the public types it defines. Where to start for common tasks
 ## Other servers
 
 - `servers/diskfs/src/blk.rs` (268) virtio-blk driver on the shared virtio transport (crates/virtio). Types: `Kind`, `SubmitError`, `VirtioBlk`.
-- `servers/diskfs/src/main.rs` (148) diskfs: the ext2 filesystem server.
+- `servers/diskfs/src/main.rs` (167) diskfs: the ext2 filesystem server.
+- `servers/diskfs/src/service.rs` (828) The ring service: diskfs's end of the data plane (docs/design/io-rings.md, the file protocol `fsring`). Types: `Service`.
 - `servers/netd/src/main.rs` (151) netd: the network server.
 - `servers/netd/src/nic.rs` (114) smoltcp's view of the network card, with loopback: frames addressed to this host (its own address or 127.0.0.0/8) never reach the wire but come back as received frames, and ARP requests for those addresses are... Types: `Nic`, `RxToken`, `TxToken`.
 - `servers/netd/src/service.rs` (632) The socket service: `netproto` requests from the kernel mapped onto smoltcp sockets. Types: `Config`, `Service`.
@@ -108,9 +110,9 @@ module comment, and the public types it defines. Where to start for common tasks
 - `crates/fsring/src/lib.rs` (346) The file protocol of the data plane: the requests the Linux server (the client) sends diskfs (the service) through a channel's submission ring, and their completions (docs/design/io-rings.md, "The file protocol"). Types: `Buf`, `Kind`, `Request`, `Completion`, `Stat`, `Usage`.
 - `crates/fsring/tests/protocol.rs` (144) The file protocol's encodings: every request survives encode and decode, malformed descriptors are refused with the right errno (unknown operations, stray fields, lengths and names out of range), and the completion,...
 - `crates/netproto/src/lib.rs` (56) Message format between the kernel's socket layer and the network server (netd). Types: `Op`, `Request`.
-- `crates/oxrt/src/lib.rs` (290) Minimal runtime for oxidenix servers: entry point, raw system calls (Linux ABI plus the oxidenix IPC calls), a heap, printing and port I/O. Types: `Event`, `Stdout`.
+- `crates/oxrt/src/lib.rs` (294) Minimal runtime for oxidenix servers: entry point, raw system calls (Linux ABI plus the oxidenix IPC calls), a heap, printing and port I/O. Types: `Event`, `Stdout`.
 - `crates/procproto/src/lib.rs` (76) The kernel's native process and system information (syscall 1005, `proc_query`), from which the procfs server builds Linux's /proc. Types: `CpuTimes`, `System`, `Counters`, `Process`.
-- `crates/restricted/src/lib.rs` (140) The interface between the kernel and the Linux server for restricted mode (docs/design/linux-server.md): the layout of the server's shared region, the per-thread register block, and the kernel calls the server makes... Types: `State`, `Event`, `Walk`.
+- `crates/restricted/src/lib.rs` (141) The interface between the kernel and the Linux server for restricted mode (docs/design/linux-server.md): the layout of the server's shared region, the per-thread register block, and the kernel calls the server makes... Types: `State`, `Event`, `Walk`.
 - `crates/ring/src/channel.rs` (116) A channel: the memory object both ends of a data-plane connection map (docs/design/io-rings.md). Types: `Layout`, `Header`, `Offer`.
 - `crates/ring/src/lib.rs` (180) Single-producer single-consumer rings of fixed-size descriptors in shared memory: the data plane between the Linux server and the device servers (docs/design/io-rings.md, ADR 0005). Types: `Desc`, `RingMemory`, `Wait`, `Ring`, `Producer`, `Consumer`.
 - `crates/ring/src/selftest.rs` (17) The protocol of the self-tests' channel service (servers/ringtest), which the Linux server's test calls (`restricted::TEST_CHANNEL`) drive.
@@ -144,7 +146,7 @@ module comment, and the public types it defines. Where to start for common tasks
 - `userspace/hello.c` (4) The smallest program: prints its arguments and exits with 42.
 - `userspace/iobench.c` (285) I/O benchmarks (docs/benchmarks/README.md): IPC round trip latency, sequential block I/O, small synchronous reads, TCP throughput over loopback and over the network card, each with the system calls, IPC round trips,...
 - `userspace/jobtest.c` (70) Job control: stopping and continuing processes (SIGSTOP, SIGTSTP, SIGCONT), waitpid with WUNTRACED and WCONTINUED, and restarting interrupted reads.
-- `userspace/lxtest.c` (321) The Linux server's kernel interface (docs/design/linux-server.md), exercised through the server's test calls (1500 and up, see crates/restricted): the program asks its server to create a memory object, fill it, map...
+- `userspace/lxtest.c` (344) The Linux server's kernel interface (docs/design/linux-server.md), exercised through the server's test calls (1500 and up, see crates/restricted): the program asks its server to create a memory object, fill it, map...
 - `userspace/mmaptest.c` (135) File mappings through the page cache: shared mappings see write() and read() sees stores through them, across processes; private mappings see the file until they write; truncation and the end of the file give SIGBUS;...
 - `userspace/nettest.c` (170) Socket tests: TCP and UDP over loopback and through QEMU's user network (10.0.2.100:7 is an echo service, see builder/src/main.rs).
 - `userspace/oomtest.c` (72) Running out of resources: fork bombs, memory hogs and full pipes fail with errors (EAGAIN, ENOMEM) instead of bringing the kernel down.

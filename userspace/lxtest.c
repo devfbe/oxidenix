@@ -41,6 +41,7 @@
 #define TEST_FS_VALUE 1512
 #define TEST_FS_RECORDS 1513
 #define TEST_CHANNEL 1514
+#define TEST_DISKRING 1515
 
 static int failures;
 
@@ -408,6 +409,35 @@ int main(void) {
         long r = syscall(TEST_CHANNEL, i + 1);
         if (r != 0) printf("    (scenario %d: check %d failed)\n", i + 1, errno);
         check(scenarios[i], r == 0);
+    }
+
+    /* The file protocol over a channel to diskfs (I/O rings step 3): the
+     * server reads and writes /data by DMA into and out of its granted
+     * pages and reports the first check that failed, if any. */
+    static const char *disk_scenarios[] = {
+        "diskfs ring: a disk file read by DMA into a grant, metadata",
+        "diskfs ring: writes, flush, read back, truncate, rename",
+        "diskfs ring: malformed requests complete with errors",
+        "diskfs ring: reads and writes in flight, any order",
+        "diskfs ring: revoked grant and a client gone mid-flight",
+    };
+    for (int i = 0; i < 5; i++) {
+        errno = 0;
+        long r = syscall(TEST_DISKRING, i + 1);
+        if (r != 0) printf("    (scenario %d: check %d failed)\n", i + 1, errno);
+        check(disk_scenarios[i], r == 0);
+    }
+    /* What the ring wrote (and flushed), read through the kernel's /data
+     * (diskfs's IPC protocol): byte i is i % 251. */
+    {
+        int fd = open("/data/ringtest.bin", O_RDONLY);
+        static unsigned char ring_buf[70000];
+        ssize_t n = fd >= 0 ? read(fd, ring_buf, sizeof ring_buf) : -1;
+        int same = n == (ssize_t)sizeof ring_buf;
+        for (ssize_t i = 0; same && i < n; i++) same = ring_buf[i] == (unsigned char)(i % 251);
+        if (fd >= 0) close(fd);
+        check("diskfs ring: a ring write read through the kernel's /data", same);
+        check("diskfs ring: its file removed through the kernel", unlink("/data/ringtest.bin") == 0);
     }
     printf("lxtest: %s\n", failures ? "FAILED" : "all passed");
     return failures != 0;
