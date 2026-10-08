@@ -362,8 +362,20 @@ impl Instance {
         Ok(start)
     }
 
-    /// The word at `addr` of the server's memory (mapped, 4-aligned).
+    /// The word at `addr` of the server's own memory (mapped, 4-aligned),
+    /// which stays mapped as long as the instance lives. Not in the range
+    /// of the objects mapped into the region (`object_word`): those come
+    /// and go.
     fn word(&self, addr: u64) -> Result<&core::sync::atomic::AtomicU32, i64> {
+        if (MAPS_BASE..HEAP_BASE).contains(&addr) {
+            return Err(EFAULT);
+        }
+        self.translate_word(addr)
+    }
+
+    /// The word at `addr` of the region, mapped or not; the caller keeps
+    /// what is mapped there.
+    fn translate_word(&self, addr: u64) -> Result<&core::sync::atomic::AtomicU32, i64> {
         if addr % 4 != 0 || !(SHARED_BASE..SHARED_END).contains(&addr) {
             return Err(EINVAL);
         }
@@ -371,7 +383,6 @@ impl Instance {
         let page = Page::<Size4KiB>::containing_address(VirtAddr::new(addr));
         let frame = mapper.translate_page(page).map_err(|_| EFAULT)?;
         let phys = frame.start_address().as_u64() + addr % PAGE;
-        // Server memory stays mapped as long as the instance lives.
         Ok(unsafe { &*(memory::phys_to_virt(phys) as *const core::sync::atomic::AtomicU32) })
     }
 
@@ -471,8 +482,9 @@ impl Instance {
         if addr >= start + m.pages * PAGE {
             return None;
         }
-        // Translated under the lock: the entry is still the object's page.
-        let word = self.word(addr).ok()?;
+        // Translated under the lock: the entry is still the object's page,
+        // which the object (returned with it) keeps.
+        let word = self.translate_word(addr).ok()?;
         Some((m.object.clone(), addr - start, word))
     }
 
