@@ -800,11 +800,14 @@ interrupt dispatch; drivers and filesystems move into user-space servers.
 ### Persistent storage
 
 - **virtio-blk driver** in `diskfs` (`blk.rs`, legacy PCI interface on the shared transport in
-  `crates/virtio`) for the data disk. A transfer of up to 128 KiB is one request that the device
-  moves by DMA (a chain of header, data and status descriptors); the driver polls for completion
-  with the device's interrupts off (diskfs serves one request at a time, and PCI interrupt lines
-  may be shared: under QEMU the disk shares one with the network card, while the kernel gives
-  each line to one server). A flush empties the device's write cache.
+  `crates/virtio`) for the data disk. Several requests are in flight at once, each a chain of
+  header, data buffers (scatter-gather: the DMA area, or a ring client's granted pages) and
+  status taken from the queue's free list; the device finishes them in any order. The
+  filesystem's own synchronous I/O goes through a 128 KiB bounce buffer as one more request,
+  keeping the others' completions for the ring service. The driver polls for completion with
+  the device's interrupts off (PCI interrupt lines may be shared: under QEMU the disk shares one
+  with the network card, while the kernel gives each line to one server). A flush empties the
+  device's write cache.
 - **ext2** (`crates/ext2fs`; revision 1 with the `filetype` feature, 1/2/4 KiB blocks) supports reading and
   writing files through direct, single, double and triple indirect blocks, holes, truncation
   (freeing whole indirect subtrees), directories growing by blocks, fast and block symlinks,

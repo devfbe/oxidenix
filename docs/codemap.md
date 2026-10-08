@@ -89,7 +89,7 @@ module comment, and the public types it defines. Where to start for common tasks
 
 ## Other servers
 
-- `servers/diskfs/src/blk.rs` (151) virtio-blk driver on the shared virtio transport (crates/virtio). Types: `VirtioBlk`.
+- `servers/diskfs/src/blk.rs` (268) virtio-blk driver on the shared virtio transport (crates/virtio). Types: `Kind`, `SubmitError`, `VirtioBlk`.
 - `servers/diskfs/src/main.rs` (148) diskfs: the ext2 filesystem server.
 - `servers/netd/src/main.rs` (151) netd: the network server.
 - `servers/netd/src/nic.rs` (114) smoltcp's view of the network card, with loopback: frames addressed to this host (its own address or 127.0.0.0/8) never reach the wire but come back as received frames, and ARP requests for those addresses are... Types: `Nic`, `RxToken`, `TxToken`.
@@ -124,7 +124,7 @@ module comment, and the public types it defines. Where to start for common tasks
 - `crates/vfs/tests/cpio.rs` (64) Parsing newc cpio archives (the initramfs format).
 - `crates/vfs/tests/path.rs` (44) Lexical path normalization, as the Linux server resolves paths.
 - `crates/vfs/tests/rw.rs` (43) Where positional and vectored reads and writes go: preadv2/pwritev2's flags against the descriptor's O_APPEND, as Linux decides them.
-- `crates/virtio/src/lib.rs` (158) The virtio legacy PCI transport (all registers in I/O space) and split virtqueues, for the user-space drivers (netd: network, diskfs: block). Types: `Dma`, `Device`, `Queue`.
+- `crates/virtio/src/lib.rs` (212) The virtio legacy PCI transport (all registers in I/O space) and split virtqueues, for the user-space drivers (netd: network, diskfs: block). Types: `Dma`, `Device`, `Queue`, `Buffer`.
 
 ## Host builder
 
