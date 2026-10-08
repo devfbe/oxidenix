@@ -184,7 +184,7 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
    service thread (the pager thread, whose wait becomes a wait for any event of the instance).
    - **R6a — Placeholders and pipes** (done): the mechanism above, and pipes as the first kind
      (blocking with interruptible futexes, `O_NONBLOCK`, end of file and `EPIPE`/`SIGPIPE`).
-   - **R6b — eventfd.**
+   - **R6b — eventfd** (done).
    - **R6c — The namespace**: the VFS, tmpfs from the initramfs (an object of the image the
      kernel keeps), the mounts of the filesystem servers (`/data`, `/proc`, `/sys`) with the
      server as their client, the page cache as the server's paged objects, every path call,

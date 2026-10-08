@@ -8,6 +8,7 @@
 //! pipe2): for a descriptor of one of the server's files it answers itself,
 //! for one of the kernel's it returns None and the call passes through.
 
+use crate::eventfd::EventFd;
 use crate::pipe::{self, Dst, PipeEnd, Src};
 use crate::sync::Mutex;
 use crate::syscall;
@@ -24,6 +25,7 @@ pub const EFAULT: i64 = 14;
 
 pub const O_ACCMODE: u32 = 0o3;
 pub const O_WRONLY: u32 = 0o1;
+pub const O_RDWR: u32 = 0o2;
 pub const O_NONBLOCK: u32 = 0o4000;
 pub const O_CLOEXEC: u32 = 0o2000000;
 const O_DIRECT: u32 = 0o40000;
@@ -32,6 +34,7 @@ const O_DIRECT: u32 = 0o40000;
 #[derive(Clone)]
 pub enum File {
     Pipe(Arc<PipeEnd>),
+    EventFd(Arc<EventFd>),
 }
 
 static FILES: Mutex<BTreeMap<u64, File>> = Mutex::new(BTreeMap::new());
@@ -64,6 +67,7 @@ pub fn closed(id: u64) {
     if let Some(File::Pipe(end)) = gone {
         end.close();
     }
+    // An eventfd simply goes.
 }
 
 /// The server's file behind descriptor `fd` and its open flags, or None
@@ -92,6 +96,8 @@ const SYS_FSYNC: u64 = 74;
 const SYS_FDATASYNC: u64 = 75;
 const SYS_FTRUNCATE: u64 = 77;
 const SYS_PIPE2: u64 = 293;
+const SYS_EVENTFD: u64 = 284;
+const SYS_EVENTFD2: u64 = 290;
 const SYS_PREADV: u64 = 295;
 const SYS_PWRITEV: u64 = 296;
 
@@ -100,6 +106,8 @@ pub fn handle(s: &State) -> Option<i64> {
     let (a0, a1, a2) = (s.rdi, s.rsi, s.rdx);
     let result = match s.rax {
         SYS_PIPE => pipe2(a0, 0),
+        SYS_EVENTFD => eventfd2(a0, 0),
+        SYS_EVENTFD2 => eventfd2(a0, a1),
         SYS_SENDFILE => {
             let (out, input) = (lookup(a0), lookup(a1));
             if out.is_none() && input.is_none() {
@@ -119,7 +127,10 @@ pub fn handle(s: &State) -> Option<i64> {
 }
 
 fn on_file(nr: u64, file: File, flags: u32, a1: u64, a2: u64) -> Result<i64, i64> {
-    let File::Pipe(end) = file;
+    let end = match file {
+        File::Pipe(end) => end,
+        File::EventFd(e) => return on_eventfd(nr, &e, flags, a1, a2),
+    };
     let readable = flags & O_ACCMODE != O_WRONLY;
     let writable = flags & O_ACCMODE != 0;
     let nonblock = flags & O_NONBLOCK != 0;
@@ -189,6 +200,10 @@ fn sendfile(out_fd: u64, out: Option<(File, u32)>, in_fd: u64, input: Option<(Fi
     if offset != 0 {
         return Err(EINVAL);
     }
+    // An eventfd moves 8-byte values, not data.
+    if matches!(out, Some((File::EventFd(_), _))) || matches!(input, Some((File::EventFd(_), _))) {
+        return Err(EINVAL);
+    }
     if let Some((_, flags)) = &out {
         if flags & O_ACCMODE == 0 {
             return Err(EBADF);
@@ -205,6 +220,7 @@ fn sendfile(out_fd: u64, out: Option<(File, u32)>, in_fd: u64, input: Option<(Fi
         let want = (count - total).min(buf.len() as u64) as usize;
         let n = match &input {
             Some((File::Pipe(end), flags)) => end.read(Dst::Server(&mut buf[..want]), flags & O_NONBLOCK != 0),
+            Some((File::EventFd(_), _)) => Err(EINVAL),
             None => match syscall(SYS_KFD_READ, [in_fd, buf.as_mut_ptr() as u64, want as u64, 0, 0, 0]) {
                 r if r < 0 => Err(-r),
                 r => Ok(r),
@@ -220,6 +236,7 @@ fn sendfile(out_fd: u64, out: Option<(File, u32)>, in_fd: u64, input: Option<(Fi
         }
         let wrote = match &out {
             Some((File::Pipe(end), flags)) => end.write(Src::Server(&buf[..n]), flags & O_NONBLOCK != 0),
+            Some((File::EventFd(_), _)) => Err(EINVAL),
             None => match syscall(SYS_KFD_WRITE, [out_fd, buf.as_ptr() as u64, n as u64, 0, 0, 0]) {
                 r if r < 0 => Err(-r),
                 r => Ok(r),
@@ -235,4 +252,40 @@ fn sendfile(out_fd: u64, out: Option<(File, u32)>, in_fd: u64, input: Option<(Fi
         }
     }
     Ok(total as i64)
+}
+
+fn on_eventfd(nr: u64, e: &EventFd, flags: u32, a1: u64, a2: u64) -> Result<i64, i64> {
+    let nonblock = flags & O_NONBLOCK != 0;
+    match nr {
+        SYS_READ => e.read(a1, a2, nonblock),
+        SYS_WRITE => e.write(a1, a2, nonblock),
+        // One value per buffer, as reads and writes one after the other.
+        SYS_READV | SYS_WRITEV => {
+            let mut done = 0;
+            for (base, len) in iovecs(a1, a2)? {
+                let r = if nr == SYS_READV { e.read(base, len, nonblock) } else { e.write(base, len, nonblock) };
+                match r {
+                    Ok(n) => done += n,
+                    Err(err) if done == 0 => return Err(err),
+                    Err(_) => break,
+                }
+            }
+            Ok(done)
+        }
+        SYS_FSTAT => e.fstat(a1),
+        SYS_LSEEK | SYS_PREAD64 | SYS_PWRITE64 | SYS_PREADV | SYS_PWRITEV => Err(ESPIPE),
+        SYS_IOCTL => Err(ENOTTY),
+        _ => Err(EINVAL),
+    }
+}
+
+/// eventfd2(initval, flags): a counter starting at `initval` (32 bits).
+fn eventfd2(initval: u64, flags: u64) -> Result<i64, i64> {
+    const EFD_SEMAPHORE: u64 = 1;
+    if flags & !(EFD_SEMAPHORE | (O_NONBLOCK | O_CLOEXEC) as u64) != 0 {
+        return Err(EINVAL);
+    }
+    let e = Arc::new(EventFd::new(initval as u32 as u64, flags & EFD_SEMAPHORE != 0));
+    let open = O_RDWR | (flags as u32 & (O_NONBLOCK | O_CLOEXEC));
+    install(e.id(), File::EventFd(e.clone()), open, e.ready())
 }

@@ -12,6 +12,7 @@
 
 extern crate alloc;
 
+mod eventfd;
 mod files;
 mod heap;
 mod mm;

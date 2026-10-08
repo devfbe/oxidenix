@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
+#include <sys/eventfd.h>
 #include <sys/mman.h>
 #include <sys/time.h>
 #include <time.h>
@@ -211,6 +212,22 @@ int main(void) {
     close(q[1]);
     check("... end of file once the writer is closed", read(q[0], buf, 1) == 0);
     close(q[0]);
+
+    /* eventfd too (R6b). */
+    int efd = eventfd(5, EFD_NONBLOCK);
+    uint64_t v = 0;
+    l0 = legacy_calls();
+    int counted = 1;
+    for (int i = 0; i < 50; i++) {
+        uint64_t one = 1;
+        write(efd, &one, 8);
+        counted &= read(efd, &v, 8) == 8;
+    }
+    passed = legacy_calls() - l0 - base;
+    check("eventfd reads and writes are the server's", passed == 0 && counted && v == 1);
+    errno = 0;
+    check("... an empty one is EAGAIN when non-blocking", read(efd, &v, 8) == -1 && errno == EAGAIN);
+    close(efd);
     printf("lxtest: %s\n", failures ? "FAILED" : "all passed");
     return failures != 0;
 }
