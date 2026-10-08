@@ -431,9 +431,9 @@ impl Channel {
     /// Grants a run of a cached object's pages to be filled (`fill`:
     /// missing ones, made pending, `PageCache::pin_fill`) or written back
     /// (dirty ones, `pin_dirty`) among the `pages` from byte `offset` (see
-    /// `restricted::GRANT_FILL`): the grant's id, the run's first page and
-    /// its length.
-    pub fn grant_run(&self, object: &Arc<PageCache>, offset: u64, pages: u64, fill: bool, writable: bool) -> Result<(u32, u64, u64), i64> {
+    /// `restricted::GRANT_FILL`): the grant's id, the run's first page, its
+    /// length and the file's size then.
+    pub fn grant_run(&self, object: &Arc<PageCache>, offset: u64, pages: u64, fill: bool, writable: bool) -> Result<(u32, u64, u64, u64), i64> {
         if offset % PAGE != 0 || pages == 0 {
             return Err(EINVAL);
         }
@@ -441,7 +441,7 @@ impl Channel {
         let pages = pages.min(crate::fs::cache::MAX_RUN);
         self.reserve(pages)?;
         let pinned = if fill { object.pin_fill(offset / PAGE, window) } else { object.pin_dirty(offset / PAGE, window) };
-        let (first, frames) = match pinned {
+        let (first, frames, size) = match pinned {
             Ok(run) => run,
             Err(e) => {
                 self.unreserve(pages);
@@ -452,7 +452,7 @@ impl Channel {
         // Only what the run took stays reserved.
         self.inner.lock().pages -= pages - count;
         match self.enter(object, first, frames, writable, count) {
-            Ok(id) => Ok((id, first, count)),
+            Ok(id) => Ok((id, first, count, size)),
             Err(e) => {
                 // Nobody will fill or write them: pending pages go again,
                 // dirty ones are dirty again.

@@ -554,7 +554,7 @@ pub fn fill(inode: &Arc<DInode>, index: u64, want: u64) -> Result<bool, i64> {
     let end = index.saturating_add(window(inode, index, want));
     inode.fills.fetch_add(1, Ordering::AcqRel);
     let (cursor, pinned, any, failed) = (Cell::new(index), Cell::new(0u64), Cell::new(false), Cell::new(None));
-    let mut out = [0u64; 2];
+    let mut out = [0u64; 3];
     fsclient::run(
         &c,
         || {
@@ -714,9 +714,8 @@ pub fn writeback(inode: &Arc<DInode>, pages: core::ops::Range<u64>) -> Result<u6
     }
     let _wb = inode.wb.lock();
     let c = client()?;
-    let size = syscall(SYS_MO_FILE_SIZE, [object, 0, 0, 0, 0, 0]).max(0) as u64;
     let (cursor, pinned, wrote, failed) = (Cell::new(pages.start), Cell::new(0u64), Cell::new(0u64), Cell::new(None));
-    let mut out = [0u64; 2];
+    let mut out = [0u64; 3];
     fsclient::run(
         &c,
         || {
@@ -734,14 +733,16 @@ pub fn writeback(inode: &Arc<DInode>, pages: core::ops::Range<u64>) -> Result<u6
                 }
                 return Next::Done;
             }
-            let (first, count) = (out[0], out[1]);
+            let (first, count, size) = (out[0], out[1], out[2]);
             if first < at || count == 0 || count > MAX_RUN {
                 failed.set(Some(EIO));
                 return Next::Done;
             }
             cursor.set(first + count);
             pinned.set(pinned.get() + count);
-            // The last page only as far as the file goes.
+            // The last page only as far as the file went when the run was
+            // taken (its data ends there; writes since make pages dirty
+            // again).
             let len = (count * PAGE).min(size.saturating_sub(first * PAGE));
             if len == 0 {
                 return Next::Request(Request::Forget { grant: g as u32 }.encode(0), Io::Forget { grant: g as u32, pages: count });

@@ -18,7 +18,7 @@ module comment, and the public types it defines. Where to start for common tasks
 - `kernel/src/drivers/rtc.rs` (43) CMOS real-time clock: read once at boot; wall-clock time afterwards is kept by `time` (the boot time plus the monotonic clock).
 - `kernel/src/drivers/serial.rs` (52) COM1 serial port (output only).
 - `kernel/src/drivers/tty.rs` (297) Terminal line discipline for the console: a termios subset with canonical line editing, echo and raw mode. Types: `Termios`.
-- `kernel/src/fs/cache.rs` (991) The page cache: the pages of a regular file in physical frames, shared by `read`, `write` and every mapping of the file (see docs/design/page-cache.md). Types: `Pager`, `Fill`, `PageCache`.
+- `kernel/src/fs/cache.rs` (994) The page cache: the pages of a regular file in physical frames, shared by `read`, `write` and every mapping of the file (see docs/design/page-cache.md). Types: `Pager`, `Fill`, `PageCache`.
 - `kernel/src/fs/cpio.rs` (53) Unpacks a cpio archive in "newc" format into the VFS.
 - `kernel/src/fs/file.rs` (462) Open files: `OpenFile` (an open file description with offset and flags) over inodes, pipes, eventfds, devices and files whose calls a server implements (`ServerFile`). Types: `Pipe`, `EventFd`, `ServerFiles`, `ServerFile`, `Kind`, `OpenFile`.
 - `kernel/src/fs/mod.rs` (544) In-memory filesystem (tmpfs-like), populated from the initramfs at boot. Types: `Device`, `Node`, `DiskRef`, `InodeStat`, `NewNode`, `Inode`, `WriteAccess`, `MappedFile`, `DenyWrite`.
@@ -44,7 +44,7 @@ module comment, and the public types it defines. Where to start for common tasks
 - `kernel/src/process/futex.rs` (336) futex(2): sleeping on a user-space word, the base of every pthread mutex, condition variable and join.
 - `kernel/src/process/ipc.rs` (380) Synchronous message passing between the kernel and user-space servers. Types: `Instance`.
 - `kernel/src/process/irq.rs` (52) Device interrupts for user-space drivers.
-- `kernel/src/process/linux.rs` (1228) Restricted mode: a Linux program and the Linux server on one thread (docs/design/linux-server.md; the interface is `crates/restricted`). Types: `Instance`, `Object`, `ExecTarget`, `Record`, `LinuxThread`.
+- `kernel/src/process/linux.rs` (1229) Restricted mode: a Linux program and the Linux server on one thread (docs/design/linux-server.md; the interface is `crates/restricted`). Types: `Instance`, `Object`, `ExecTarget`, `Record`, `LinuxThread`.
 - `kernel/src/process/linux_inode.rs` (168) The kernel's tree for the Linux server, through handles on its inodes (phase R6c.2b, `restricted::SYS_INODE_*`): the server resolves paths and implements the calls that take one; the kernel's filesystems (tmpfs, the...
 - `kernel/src/process/loader.rs` (176) Loading a static ELF program into a new address space: its segments are mapped from the file's page cache (demand-paged, private), so every process running a program shares its unchanged pages. Types: `Image`.
 - `kernel/src/process/mod.rs` (498) Processes and threads: the process table, the current task, descriptor tables, process groups and sessions, CPU affinity; the submodules hold scheduling, fork/exec/exit, signals, IPC, restricted mode and the system... Types: `FdEntry`, `Server`.
@@ -72,7 +72,7 @@ module comment, and the public types it defines. Where to start for common tasks
 
 - `servers/linux/src/chantest.rs` (309) `TEST_CHANNEL`: the client's side of channels to the test service (servers/ringtest, protocol `ring::selftest`), as the page cache will use them with diskfs: create, connect, grant, move descriptors through the rings...
 - `servers/linux/src/datafile.rs` (268) Open files of /data (phase R6c.3): a placeholder in the kernel's descriptor table names one (an open file description: offset, the directory cursor, write access, O_DIRECT and O_SYNC); the calls on it are the... Types: `DataOpen`.
-- `servers/linux/src/datafs.rs` (860) /data in the server (phase R6c.3, I/O rings step 4): diskfs's ext2 filesystem through the file protocol (`fsring`, over `fsclient`'s channel), with the server's own page cache. Types: `DInode`, `New`, `HoldKind`.
+- `servers/linux/src/datafs.rs` (859) /data in the server (phase R6c.3, I/O rings step 4): diskfs's ext2 filesystem through the file protocol (`fsring`, over `fsclient`'s channel), with the server's own page cache. Types: `DInode`, `New`, `HoldKind`.
 - `servers/linux/src/disktest.rs` (528) `TEST_DISKRING`: the client's side of the file protocol (`fsring`) against diskfs, as the page cache will use it in step 4: a channel to diskfs, grants of memory objects, files on /data read and written by DMA into...
 - `servers/linux/src/eventfd.rs` (98) eventfd (phase R6b): a counter that reads take and writes add to, a file of the server with a placeholder in the kernel's descriptor table. Types: `EventFd`.
 - `servers/linux/src/files.rs` (325) The server's files (phase R6): objects the server implements, each named in the kernel's descriptor table by a placeholder (see `restricted::SYS_KFD_INSTALL`). Types: `File`.
@@ -140,7 +140,7 @@ module comment, and the public types it defines. Where to start for common tasks
 - `userspace/build.sh` (32) Builds all userspace/*.c as static musl binaries into $1 (the rootfs's bin directory), adds Bash and BusyBox with its applet symlinks, and the servers/* programs into the sibling sbin directory.
 - `userspace/cachetest.c` (115) The page cache of files on a filesystem server (/data): repeated reads come from memory, writes and truncation stay coherent with cached pages and mappings, programs run from the disk, and cached pages give way when...
 - `userspace/cowtest.c` (68) Copy-on-write after fork: parent and child see their own writes to heap and data, brk stays clear of mappings, and shared read-only frames cannot be written.
-- `userspace/datatest.c` (261) /data in the Linux server (phase R6c.3): its calls never pass through to the kernel, descriptors and mappings of a file share one page cache, write() leaves dirty pages that fsync makes durable (an O_DIRECT read...
+- `userspace/datatest.c` (272) /data in the Linux server (phase R6c.3): its calls never pass through to the kernel, descriptors and mappings of a file share one page cache, write() leaves dirty pages that fsync makes durable (an O_DIRECT read...
 - `userspace/epolltest.c` (245) epoll: interest lists with level- and edge-triggered readiness, the event loop interface of libuv and therefore Node.js.
 - `userspace/eventfdtest.c` (76) eventfd: a 64-bit counter as a file, the wakeup primitive of event loops (libuv wakes its loop through one).
 - `userspace/exectest.c` (105) execve maps programs from the page cache: processes running the same program share its pages, a program file cannot be written while it runs (ETXTBSY) nor run while it is open for writing, and changing a program file...
@@ -190,10 +190,10 @@ kernel that handle them.
 | 1012 | `SYS_HANDLE_CLOSE` | kernel/src/process/linux.rs:927 |
 | 1013 | `SYS_MO_CREATE` | kernel/src/process/linux.rs:938 |
 | 1014 | `SYS_MO_MAP` | kernel/src/process/linux.rs:946 |
-| 1015 | `SYS_MO_UNMAP` | kernel/src/process/linux.rs:1306 |
-| 1016 | `SYS_MO_PROTECT` | kernel/src/process/linux.rs:1311 |
-| 1017 | `SYS_MO_READ` | kernel/src/process/linux.rs:1317, kernel/src/process/linux.rs:1332 |
-| 1018 | `SYS_MO_WRITE` | kernel/src/process/linux.rs:1317 |
+| 1015 | `SYS_MO_UNMAP` | kernel/src/process/linux.rs:1307 |
+| 1016 | `SYS_MO_PROTECT` | kernel/src/process/linux.rs:1312 |
+| 1017 | `SYS_MO_READ` | kernel/src/process/linux.rs:1318, kernel/src/process/linux.rs:1333 |
+| 1018 | `SYS_MO_WRITE` | kernel/src/process/linux.rs:1318 |
 | 1019 | `SYS_MO_CREATE_PAGED` | kernel/src/process/linux.rs:993 |
 | 1020 | `SYS_EVENT_WAIT` | kernel/src/process/linux.rs:1002 |
 | 1021 | `SYS_MO_SUPPLY` | kernel/src/process/linux.rs:1063 |
@@ -242,12 +242,12 @@ kernel that handle them.
 | 1064 | `SYS_CHAN_CREATE` | kernel/src/process/linux.rs:1219 |
 | 1065 | `SYS_CHAN_CONNECT` | kernel/src/process/linux.rs:1239 |
 | 1066 | `SYS_GRANT` | kernel/src/process/linux.rs:1250 |
-| 1067 | `SYS_REVOKE` | kernel/src/process/linux.rs:1302 |
-| 1076 | `SYS_MO_CREATE_CACHED` | kernel/src/process/linux.rs:1274 |
-| 1077 | `SYS_MO_FILLED` | kernel/src/process/linux.rs:1280 |
-| 1078 | `SYS_MO_REDIRTY` | kernel/src/process/linux.rs:1280 |
-| 1079 | `SYS_MO_MAP_SERVER` | kernel/src/process/linux.rs:1293 |
-| 1080 | `SYS_MO_UNMAP_SERVER` | kernel/src/process/linux.rs:1301 |
+| 1067 | `SYS_REVOKE` | kernel/src/process/linux.rs:1303 |
+| 1076 | `SYS_MO_CREATE_CACHED` | kernel/src/process/linux.rs:1275 |
+| 1077 | `SYS_MO_FILLED` | kernel/src/process/linux.rs:1281 |
+| 1078 | `SYS_MO_REDIRTY` | kernel/src/process/linux.rs:1281 |
+| 1079 | `SYS_MO_MAP_SERVER` | kernel/src/process/linux.rs:1294 |
+| 1080 | `SYS_MO_UNMAP_SERVER` | kernel/src/process/linux.rs:1302 |
 
 ## Documents
 

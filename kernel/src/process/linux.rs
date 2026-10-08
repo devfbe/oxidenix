@@ -1256,10 +1256,11 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
                 // A cached object's pages: to fill (into a writable grant)
                 // or to write back (read-only).
                 mode @ (GRANT_FILL | GRANT_DIRTY) if (mode == GRANT_FILL) == writable => {
-                    let (id, first, count) = end.channel.grant_run(&object, a[2], a[3], mode == GRANT_FILL, writable)?;
-                    let mut info = [0u8; 16];
+                    let (id, first, count, size) = end.channel.grant_run(&object, a[2], a[3], mode == GRANT_FILL, writable)?;
+                    let mut info = [0u8; 24];
                     info[..8].copy_from_slice(&first.to_le_bytes());
-                    info[8..].copy_from_slice(&count.to_le_bytes());
+                    info[8..16].copy_from_slice(&count.to_le_bytes());
+                    info[16..].copy_from_slice(&size.to_le_bytes());
                     if let Err(e) = super::uaccess::copy_to_server(a[5], &info) {
                         // The caller cannot know the run: it goes again.
                         let _ = end.channel.revoke(id);

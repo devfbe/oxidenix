@@ -295,8 +295,19 @@ static void larger_than_cache(void) {
     check("writing a 32 MiB file with 12 MiB to cache it", good);
     good = lseek(fd, 0, SEEK_SET) == 0;
     for (long off = 0; good && off < LARGE; off += sizeof chunk) {
-        good &= read(fd, chunk, sizeof chunk) == (ssize_t)sizeof chunk;
+        ssize_t n = read(fd, chunk, sizeof chunk);
+        good &= n == (ssize_t)sizeof chunk;
         for (size_t i = 0; good && i < sizeof chunk; i += 89) good &= (unsigned char)chunk[i] == pattern(off + i, 5);
+        if (!good) {
+            printf("    (at %ld: read %zd, errno %d)\n", off, n, errno);
+            for (size_t i = 0; i < sizeof chunk; i++)
+                if ((unsigned char)chunk[i] != pattern(off + i, 5)) {
+                    char d[PG];
+                    ssize_t m = on_disk(path, (off + i) & ~(long)(PG - 1), d, PG);
+                    printf("    (first bad byte at %ld: %d, want %d; on disk %d (read %zd))\n", off + (long)i, (unsigned char)chunk[i], pattern(off + i, 5), (unsigned char)d[(off + i) % PG], m);
+                    break;
+                }
+        }
     }
     check("... and reading it back whole", good);
     printf("    (Cached: %ld kB, Dirty: %ld kB)\n", meminfo("Cached:"), meminfo("Dirty:"));

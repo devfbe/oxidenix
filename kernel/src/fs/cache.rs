@@ -933,10 +933,10 @@ impl PageCache {
     /// For a grant to fill a cached object: the first run of missing pages
     /// in the `window` pages from `first` (within the file; the run at most
     /// `MAX_RUN` long), made pending (zeroed frames nobody reads until `filled`)
-    /// and pinned. Returns the run's first page and its frames, each with
-    /// a reference for the grant; ENOENT if no page of the window is
-    /// missing, ENOMEM if not even one page can be cached.
-    pub fn pin_fill(&self, first: u64, window: u64) -> Result<(u64, Vec<PhysFrame>), i64> {
+    /// and pinned. Returns the run's first page, its frames (each with a
+    /// reference for the grant) and the file's size; ENOENT if no page of
+    /// the window is missing, ENOMEM if not even one page can be cached.
+    pub fn pin_fill(&self, first: u64, window: u64) -> Result<(u64, Vec<PhysFrame>, u64), i64> {
         if !self.is_cached() {
             return Err(EINVAL);
         }
@@ -969,6 +969,7 @@ impl PageCache {
         }
         // The run as it is now: a page may have come or the file shrunk.
         let mut st = self.state.lock();
+        let size = st.size;
         let last = page_of(st.size.saturating_add(PAGE - 1));
         let mut taken = 0;
         for (i, &frame) in frames.iter().enumerate() {
@@ -982,6 +983,7 @@ impl PageCache {
         }
         st.charged += taken as u64;
         drop(st);
+        let no_frame = frames.is_empty();
         let spare = frames.split_off(taken);
         let unused = count - taken as u64;
         free_frames(spare);
@@ -989,11 +991,12 @@ impl PageCache {
             memory::cache_uncharge(unused);
         }
         if taken == 0 {
-            return Err(ENOENT);
+            // No frame to be had, or the pages came meanwhile.
+            return Err(if no_frame { ENOMEM } else { ENOENT });
         }
         // The grant's references.
         memory::with_frames(|f| frames.iter().for_each(|&frame| f.share(frame)));
-        Ok((start, frames))
+        Ok((start, frames, size))
     }
 
     /// The pager's answer for `count` pages from `first` (at most
@@ -1040,17 +1043,21 @@ impl PageCache {
     /// For write-back of a cached object: the first run of dirty pages in
     /// the `window` pages from `first` (at most `MAX_RUN` long), clean now,
     /// write-protected in every mapping (a store there marks them dirty
-    /// again) and pinned. Returns the run's first page and its frames with
-    /// a reference each for the grant; ENOENT if none is dirty.
-    pub fn pin_dirty(&self, first: u64, window: u64) -> Result<(u64, Vec<PhysFrame>), i64> {
+    /// again) and pinned. Returns the run's first page, its frames with a
+    /// reference each for the grant, and the file's size then (their data
+    /// ends there: a write extends the size as it dirties a page, so a
+    /// size read before the run could cut off data); ENOENT if none is
+    /// dirty.
+    pub fn pin_dirty(&self, first: u64, window: u64) -> Result<(u64, Vec<PhysFrame>, u64), i64> {
         if !self.is_cached() {
             return Err(EINVAL);
         }
         let end = first.saturating_add(window);
         let mut frames = Vec::new();
         frames.try_reserve_exact(window.min(MAX_RUN) as usize).map_err(|_| ENOMEM)?;
-        let start = {
+        let (start, size) = {
             let mut st = self.state.lock();
+            let size = st.size;
             let mut start = None;
             for (&index, page) in st.pages.range_mut(first..end) {
                 match start {
@@ -1065,13 +1072,13 @@ impl PageCache {
             }
             let Some(start) = start else { return Err(ENOENT) };
             st.dirty -= (frames.len() as u64).min(st.dirty);
-            start
+            (start, size)
         };
         undirty(frames.len() as u64);
         memory::with_frames(|f| frames.iter().for_each(|&frame| f.share(frame)));
         let pages: Vec<u64> = (start..start + frames.len() as u64).collect();
         self.write_protect(&pages);
-        Ok((start, frames))
+        Ok((start, frames, size))
     }
 
     /// Marks the present pages among `count` from `first` dirty again (a

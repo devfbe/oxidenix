@@ -491,8 +491,10 @@ pub const GRANT_FILL: u64 = 2;
 /// first run of dirty pages among `pages` from `offset` (at most 256),
 /// clean from now on and write-protected in every mapping (a store marks
 /// them dirty again). ENOENT if none of them is dirty. With `GRANT_FILL`
-/// or `GRANT_DIRTY`, `out` (the sixth argument) gets the run's first page
-/// and its length in pages (two u64s).
+/// or `GRANT_DIRTY`, `out` (the sixth argument) gets the run's first page,
+/// its length in pages and the file's size when it was taken (three
+/// u64s): a run of dirty pages holds data up to that size (a write makes
+/// a page dirty and the file longer at once).
 pub const GRANT_DIRTY: u64 = 4;
 /// `revoke(handle, grant) -> 0 | REVOKE_DRAINING`: takes a grant back. Its
 /// mappings in the service are gone when the call returns. If the service
