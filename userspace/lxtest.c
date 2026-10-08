@@ -399,8 +399,10 @@ int main(void) {
         "channels: revoking a grant (and one a device may still reach)",
         "channels: the client's end goes (grants gone from the service)",
         "channels: the service dies (the client wakes; it comes back)",
+        "channels: the service execs (its new program reaches no grant)",
+        "channels: a connect is done when the service attached (no answer yet)",
     };
-    for (int i = 0; i < 5; i++) {
+    for (int i = 0; i < 7; i++) {
         /* A failed check n comes back as -n: errno n. */
         errno = 0;
         long r = syscall(TEST_CHANNEL, i + 1);

@@ -35,3 +35,16 @@ pub const CRASH: u16 = 8;
 pub const CLEAN_ENDS: u16 = 9;
 /// How often the service slept on the submission ring's doorbell.
 pub const SLEEPS: u16 = 10;
+/// The service executes itself again (`/sbin/ringtest after-exec`), and
+/// the new program tries to reach the grant: it maps it and stores
+/// `AFTER_EXEC` at its first byte, and asks for a device address. Neither
+/// may work: an exec ends the service's end of its channels.
+pub const EXEC: u16 = 11;
+pub const AFTER_EXEC: u8 = 0x99;
+/// The service answers the next offer only after it served that channel
+/// (it attaches at once): attaching alone must complete the connect.
+pub const ANSWER_LATE: u16 = 12;
+/// 0 if the channel's header page is read-only for the service (mprotect
+/// cannot make it writable, the kernel cannot be made to store into it),
+/// so it cannot forge the kernel's `state`.
+pub const HEADER_READ_ONLY: u16 = 13;

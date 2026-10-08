@@ -365,8 +365,20 @@ impl Instance {
         Ok(start)
     }
 
-    /// The word at `addr` of the server's memory (mapped, 4-aligned).
+    /// The word at `addr` of the server's own memory (mapped, 4-aligned),
+    /// which stays mapped as long as the instance lives. Not in the range
+    /// of the objects mapped into the region (`object_word`): those come
+    /// and go.
     fn word(&self, addr: u64) -> Result<&core::sync::atomic::AtomicU32, i64> {
+        if (MAPS_BASE..HEAP_BASE).contains(&addr) {
+            return Err(EFAULT);
+        }
+        self.translate_word(addr)
+    }
+
+    /// The word at `addr` of the region, mapped or not; the caller keeps
+    /// what is mapped there.
+    fn translate_word(&self, addr: u64) -> Result<&core::sync::atomic::AtomicU32, i64> {
         if addr % 4 != 0 || !(SHARED_BASE..SHARED_END).contains(&addr) {
             return Err(EINVAL);
         }
@@ -374,7 +386,6 @@ impl Instance {
         let page = Page::<Size4KiB>::containing_address(VirtAddr::new(addr));
         let frame = mapper.translate_page(page).map_err(|_| EFAULT)?;
         let phys = frame.start_address().as_u64() + addr % PAGE;
-        // Server memory stays mapped as long as the instance lives.
         Ok(unsafe { &*(memory::phys_to_virt(phys) as *const core::sync::atomic::AtomicU32) })
     }
 
@@ -387,10 +398,11 @@ impl Instance {
         Ok(())
     }
 
-    /// Maps the first `pages` pages of `object` writable into the region
-    /// (`MAPS_BASE..HEAP_BASE`); returns where. Each entry holds a reference
-    /// on its frame, the region's entry the object.
-    pub(super) fn map_object(&self, object: &Arc<PageCache>, pages: u64) -> Result<u64, i64> {
+    /// Maps the first `pages` pages of `object` into the region
+    /// (`MAPS_BASE..HEAP_BASE`), the first `read_only` of them read-only,
+    /// the rest writable; returns where. Each entry holds a reference on
+    /// its frame, the region's entry the object.
+    pub(super) fn map_object(&self, object: &Arc<PageCache>, pages: u64, read_only: u64) -> Result<u64, i64> {
         let len = pages.checked_mul(PAGE).filter(|&l| l > 0).ok_or(EINVAL)?;
         let mut maps = self.maps.lock();
         // First fit.
@@ -406,7 +418,8 @@ impl Instance {
         }
         maps.insert(start, RegionMap { pages, object: object.clone() });
         for i in 0..pages {
-            let mapped = object.map_page(i).map_err(|_| ENOMEM).and_then(|frame| self.map(start + i * PAGE, frame, PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE));
+            let flags = if i < read_only { PageTableFlags::NO_EXECUTE } else { PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE };
+            let mapped = object.map_page(i).map_err(|_| ENOMEM).and_then(|frame| self.map(start + i * PAGE, frame, flags));
             if let Err(e) = mapped {
                 self.unmap_pages(start, i);
                 maps.remove(&start);
@@ -474,8 +487,9 @@ impl Instance {
         if addr >= start + m.pages * PAGE {
             return None;
         }
-        // Translated under the lock: the entry is still the object's page.
-        let word = self.word(addr).ok()?;
+        // Translated under the lock: the entry is still the object's page,
+        // which the object (returned with it) keeps.
+        let word = self.translate_word(addr).ok()?;
         Some((m.object.clone(), addr - start, word))
     }
 
@@ -1107,11 +1121,12 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
         }
         SYS_CHAN_CREATE => {
             instance.channel_added()?;
-            let mapped = super::channel::Channel::new(a[0]).and_then(|c| instance.map_object(c.memory(), c.pages()).map(|addr| (c, addr)));
+            let mapped = super::channel::Channel::new(a[0]).and_then(|c| instance.map_object(c.memory(), c.pages(), 1).map(|addr| (c, addr)));
             let (channel, addr) = mapped.inspect_err(|_| instance.channel_gone())?;
-            // From here on, dropping the end undoes it all (also when it
-            // cannot be allocated).
-            let end = Arc::try_new(super::channel::ClientEnd::new(channel, Arc::downgrade(&instance), addr)).map_err(|_| {
+            // (Undone already if the end cannot be made.)
+            let end = super::channel::ClientEnd::new(channel, Arc::downgrade(&instance), addr)?;
+            // From here on, dropping the end undoes it all.
+            let end = Arc::try_new(end).map_err(|_| {
                 super::channel::run_deferred();
                 ENOMEM
             })?;

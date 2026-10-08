@@ -433,8 +433,8 @@ pub const SYS_EVENT_RELEASES: u64 = 1063;
 // `oxrt::sys::CHAN_ATTACH` and the following.
 
 /// `chan_create(slots, addr) -> handle`: a new channel with `slots` slots
-/// per ring (a power of two, 2..=4096), mapped writable into the server's
-/// region; its address is stored at `addr` (a u64 in the server's memory).
+/// per ring (a power of two, 2..=4096), mapped into the server's region
+/// (the header page read-only, the rings writable); its address is stored at `addr` (a u64 in the server's memory).
 /// Futex waits and wakes on it (`server_futex_wait`) meet the service's on
 /// its own mapping. Closing the handle (or the instance's end) tears the
 /// channel down: the service sees `CLIENT_GONE`, every grant is revoked.
@@ -471,6 +471,7 @@ pub const REVOKE_DRAINING: u64 = 1;
 /// `(scenario)`: the server runs a channel scenario against the test
 /// service (servers/ringtest, `ring::selftest`): 1 rings and doorbells, 2
 /// grants and their bounds, 3 revoking, 4 the client's end going, 5 the
-/// service dying. 0 if every check held, else the negative number of the
-/// first that failed.
+/// service dying, 6 the service executing a new program, 7 a service that
+/// attaches but answers late. 0 if every
+/// check held, else the negative number of the first that failed.
 pub const TEST_CHANNEL: u64 = 1514;

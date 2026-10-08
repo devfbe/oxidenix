@@ -118,14 +118,14 @@ ring complete in any order (the device may reorder); the tag matches them up.
 committed memory object: a header page (magic, version, slots, the rings' offsets, and on its
 own cache line the `state` word), then the submission ring and the completion ring, each a
 `RingMemory<slots>` starting on a page of its own. The layout is a function of `slots` alone
-(`Layout::new`); an end never needs to trust the header, which the other end can write. The
-positions start at 0.
+(`Layout::new`). Both ends map the header page read-only, so neither can forge `state`; the
+rings are read and write. The positions start at 0.
 
 **Client calls** (the Linux server, `crates/restricted`):
 
 | Call | |
 |------|---|
-| `chan_create(slots, &addr) -> handle` (1064) | the channel, mapped writable into the server's region (`MAPS_BASE`..`HEAP_BASE`, a range the kernel maps memory objects into for the server); at most 64 per instance |
+| `chan_create(slots, &addr) -> handle` (1064) | the channel, mapped into the server's region (header read-only) (`MAPS_BASE`..`HEAP_BASE`, a range the kernel maps memory objects into for the server); at most 64 per instance |
 | `chan_connect(handle, name, len)` (1065) | offers it to the service `name` (a dead server of the kernel's is started again) and waits until it attached or refused; `EISCONN`, `ENOENT`, `EOPNOTSUPP` for a service that takes no channels, `EIO` if it died, `EINTR` for a signal before it attached |
 | `grant(handle, object, offset, pages, flags) -> id` (1066) | pins `pages` pages of a memory or file object (`GRANT_WRITE`: writable); `ENOTCONN` before the service attached, `EPIPE` after it went; at most 4096 grants and 65536 pages per channel |
 | `revoke(handle, id) -> 0 \| REVOKE_DRAINING` (1067) | see below |
@@ -148,7 +148,9 @@ kernel carries the offer: `chan_connect` sends the service a control request, ty
 (no protocol message can pass for one) and only to services registered with `IPC_CHANNELS`.
 Whether the channel is attached is the kernel's to say, not the service's answer: a service
 that attaches and answers an error still has the channel, and one that answers 0 without
-attaching has not.
+attaching has not. So `chan_connect` returns as soon as the service attached, answered or not
+(a service that attaches and never answers cannot hold the client); before that, a signal (a
+fatal one always) gives the offer up, and a later `chan_attach` fails.
 
 **Doorbells.** The ring words are futex words. The service's futex on its shared mapping and
 the server's `server_futex_wait` on its region mapping are both keyed by the channel's memory
@@ -160,6 +162,17 @@ the object's page cache: a pinned page stays the object's page (a truncation ove
 have been supplied (`ENODATA`: its pager may be the caller). Remote (disk) caches are not
 grantable. Step 4 grants pages before they are supplied, for diskfs to read into.
 
+What a pin costs and how long it lasts: the kernel keeps 8 bytes per pinned page in the grant
+(its frame) and a counter in the page; the pages themselves stay charged to their object. The
+limits per channel (4096 grants, 65536 pages, 64 channels per instance) bound that. A draining
+grant (below) is pinned until the service lets go, and a quarantined one until the service's
+server registers again: a crashed service whose server is not restarted, or a service that
+never calls `grant_dma_unmap`, keeps the client's pages pinned (their objects alive and
+untruncatable over them) for as long as that lasts. That is the price of never freeing memory
+a device may still write without an IOMMU; with one, revocation is immediate. The kernel's
+teardown paths allocate nothing (a teardown's work is allocated with the end it tears down, a
+quarantine is a list through the grants), so running out of memory never stops a teardown.
+
 **Revoke.** The grant's mappings in the service are gone (TLB shootdowns included) when
 `revoke` returns, and its device mappings are taken out of the service's `DmaDomain` (the one
 place that maps pages for devices). Without an IOMMU a device address cannot be taken back: a
@@ -169,7 +182,8 @@ client revokes after the requests on the grant completed. The kernel only guaran
 memory a device or the service can still reach is freed or reused.
 
 **Teardown.** When the client's end goes (its handle closed, or the instance ended) every grant
-is revoked as above; when the service's end goes (`chan_detach`, or its process ended) every
+is revoked as above; when the service's end goes (`chan_detach`, or its process ended or executed a new program:
+the service is its address space, not its process id) every
 grant is released, except that grants a dead service's device may still reach wait in its
 server's `DmaDomain` until the server's next process registers (a server resets its device
 before it registers). Either way the kernel sets the end's bit in `state` (`CLIENT_GONE`,
@@ -184,15 +198,31 @@ handle tears down synchronously.
 **Hostile peers.** The kernel never reads the rings. Every grant id, offset and length a service
 passes is checked against the grant; a grant's id is reused only after the grant is fully gone,
 and a service's mapping of a grant can never be made after its revoke (a per-grant lock orders
-the two).
+the two). The service is its address space: after an `execve` the new program is not the
+service.
 
-**Tests.** `lxtest` has the Linux server run five scenarios (`TEST_CHANNEL`) against
+**The service's contract for grant memory.** A revoke removes the service's mapping at once,
+whatever the service is doing: the client may revoke (or its end may go) while the service
+still works on a request, and a CPU access to a revoked grant then faults (`SIGSEGV`). The
+kernel does not wait for the service, since a service that never acknowledged would otherwise
+keep the client's memory hostage. So a service reaches grant memory either by DMA (its device
+addresses stay valid until `grant_dma_unmap`, the draining above) or with a copy that survives a
+fault: the CPU copy sits behind a fault handler that turns the fault into an error for that
+request (as the Linux server's copies into program memory do, `set_usercopy`), or the service
+runs CPU copies only on grants whose requests the client has not completed. A well-behaved
+client revokes only after the requests on a grant completed, so the fault path only meets a
+broken or hostile client; the service must survive it and fail the request (`EIO`/`EFAULT`),
+nothing more. (servers/ringtest touches grants directly: its client is the test.)
+
+**Tests.** `lxtest` has the Linux server run seven scenarios (`TEST_CHANNEL`) against
 `servers/ringtest`, a service started in test mode only (`ring::selftest`): rings and doorbells
-in both directions, connect errors; grants (data both ways, read-only enforced by mprotect, by
+in both directions, connect errors, the header read-only to the service; grants (data both ways, read-only enforced by mprotect, by
 the kernel's own stores and, fatally, by a CPU store; the kernel's bounds; device addresses;
 pinning against truncation; unsupplied pages); revoking (the mapping gone, a draining grant
 pinned and its id held until `grant_dma_unmap`, ids reused); the client's end going while the
-service sleeps; the service dying while the client waits, and coming back for the next channel.
+service sleeps; the service dying while the client waits, and coming back for the next channel;
+the service executing a new program, which reaches no grant; a service that attaches but
+answers the offer only after it served the channel.
 `cargo test --release -p ring` covers the layout, the offer encoding and `pop_wait_while`.
 
 ## Paths built on it

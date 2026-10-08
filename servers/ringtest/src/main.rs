@@ -34,6 +34,8 @@ const PROT_EXEC: u64 = 4;
 /// theirs removed (`CLEAN_ENDS`), and sleeps on a doorbell (`SLEEPS`).
 static CLEAN: AtomicI64 = AtomicI64::new(0);
 static SLEPT: AtomicU32 = AtomicU32::new(0);
+/// `ANSWER_LATE`: the next offer is answered after its channel ends.
+static LATE: AtomicU32 = AtomicU32::new(0);
 
 /// The doorbell: a futex on the ring word, shared with the client.
 struct Futex;
@@ -58,7 +60,38 @@ struct Mapped {
     writable: bool,
 }
 
-fn main(_args: Vec<&'static str>) -> i32 {
+/// Value of `key=...` among the arguments.
+fn arg(args: &[&str], key: &str) -> Option<u64> {
+    args.iter().find_map(|a| a.strip_prefix(key)?.strip_prefix('=')?.parse().ok())
+}
+
+/// The program after `EXEC`: tries to reach the grant of the channel the
+/// process served before, then ends (the kernel starts the service again
+/// for the next channel).
+fn after_exec(args: &[&str]) -> i32 {
+    let (Some(channel), Some(grant)) = (arg(args, "channel"), arg(args, "grant")) else { return 2 };
+    if let Ok((addr, _, true)) = oxrt::grant_map(channel, grant as u32) {
+        unsafe { addr.write_volatile(AFTER_EXEC) };
+    }
+    let _ = oxrt::grant_dma(channel, grant as u32, 0);
+    0
+}
+
+/// execve(2) of this program with `args`.
+fn exec_self(args: &[&str]) -> i64 {
+    const EXECVE: u64 = 59;
+    let path = b"/sbin/ringtest\0";
+    let strings: Vec<Vec<u8>> = args.iter().map(|a| a.bytes().chain(core::iter::once(0)).collect()).collect();
+    let mut argv: Vec<u64> = strings.iter().map(|s| s.as_ptr() as u64).collect();
+    argv.push(0);
+    let envp = [0u64];
+    oxrt::syscall(EXECVE, [path.as_ptr() as u64, argv.as_ptr() as u64, envp.as_ptr() as u64, 0, 0, 0])
+}
+
+fn main(args: Vec<&'static str>) -> i32 {
+    if args.contains(&"after-exec") {
+        return after_exec(&args);
+    }
     if let Err(e) = oxrt::ipc_register_with(SERVICE, 0, oxrt::IPC_CHANNELS) {
         println!("ringtest: cannot register: {}", e);
         return 1;
@@ -79,9 +112,16 @@ fn main(_args: Vec<&'static str>) -> i32 {
             None => Err(-EINVAL),
         };
         let status = attached.as_ref().map_or_else(|&e| e, |_| 0);
-        let _ = oxrt::ipc_reply(id, &status.to_le_bytes());
+        let late = attached.is_ok() && LATE.swap(0, Ordering::Relaxed) != 0;
+        if !late {
+            let _ = oxrt::ipc_reply(id, &status.to_le_bytes());
+        }
         if let Ok((channel, base)) = attached {
             serve(channel, base);
+        }
+        if late {
+            // Nobody waits for it any more.
+            let _ = oxrt::ipc_reply(id, &status.to_le_bytes());
         }
     }
 }
@@ -96,7 +136,7 @@ fn serve(channel: u64, base: *mut u8) {
     let (mut requests, mut completions) = (sub.consumer(), comp.producer());
     let mut mapped: Vec<Mapped> = Vec::new();
     while let Some(d) = requests.pop_wait_while(&Futex, || header.state() == 0) {
-        let status = handle(channel, &d, &mut mapped);
+        let status = handle(channel, base, &d, &mut mapped);
         let reply = Desc { tag: d.tag, arg: [status as u64, 0, 0], ..Desc::default() };
         while !completions.push(&reply) {
             if header.state() != 0 {
@@ -137,7 +177,7 @@ fn range(m: &Mapped, d: &Desc) -> Result<*mut u8, i64> {
     Ok(unsafe { m.addr.add(d.buf_off as usize) })
 }
 
-fn handle(channel: u64, d: &Desc, mapped: &mut Vec<Mapped>) -> i64 {
+fn handle(channel: u64, base: *mut u8, d: &Desc, mapped: &mut Vec<Mapped>) -> i64 {
     let result: Result<i64, i64> = (|| match d.op {
         ECHO => Ok(d.arg[0] as i64 + 1),
         READ => {
@@ -194,7 +234,26 @@ fn handle(channel: u64, d: &Desc, mapped: &mut Vec<Mapped>) -> i64 {
             Ok(-1)
         }
         CLEAN_ENDS => Ok(CLEAN.load(Ordering::Relaxed)),
+        EXEC => {
+            let channel = alloc::format!("channel={}", channel);
+            let grant = alloc::format!("grant={}", d.grant);
+            Ok(exec_self(&["ringtest", "after-exec", &channel, &grant]))
+        }
         SLEEPS => Ok(SLEPT.load(Ordering::Relaxed) as i64),
+        HEADER_READ_ONLY => {
+            if oxrt::mprotect(base, PAGE as usize, PROT_READ | PROT_WRITE) != Err(-EACCES) {
+                return Ok(1);
+            }
+            const CLOCK_MONOTONIC: u64 = 1;
+            if oxrt::syscall(oxrt::sys::CLOCK_GETTIME, [CLOCK_MONOTONIC, base as u64, 0, 0, 0, 0]) != -EFAULT {
+                return Ok(2);
+            }
+            Ok(0)
+        }
+        ANSWER_LATE => {
+            LATE.store(1, Ordering::Relaxed);
+            Ok(0)
+        }
         _ => Err(-EINVAL),
     })();
     result.unwrap_or_else(|e| e)

@@ -137,6 +137,9 @@ pub fn exec(frame: &mut Frame, path: &str, args: &[String], envs: &[String]) -> 
     // The old address space is freed here (unless a vfork parent shares
     // it); no CPU has it loaded for this task any more.
     drop(old_mm);
+    // The channels the old program served lose their service: the new
+    // program must not reach their grants.
+    super::channel::service_exited(me.tgid());
     clone::release_vfork();
     FsBase::write(VirtAddr::new(0));
     let initial = task::FpuState::initial();
