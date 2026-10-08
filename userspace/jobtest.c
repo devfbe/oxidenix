@@ -1,3 +1,5 @@
+/* Job control: stopping and continuing processes (SIGSTOP, SIGTSTP, SIGCONT), waitpid with
+ * WUNTRACED and WCONTINUED, and restarting interrupted reads. */
 #include <errno.h>
 #include <signal.h>
 #include <stdio.h>

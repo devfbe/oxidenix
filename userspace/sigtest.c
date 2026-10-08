@@ -1,3 +1,5 @@
+/* Signals: handlers, masks and pending signals, interrupted reads, timers (alarm,
+ * setitimer), faults turned into catchable signals, and the FPU state kept across handlers. */
 #include <errno.h>
 #include <limits.h>
 #include <setjmp.h>

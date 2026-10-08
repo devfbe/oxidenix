@@ -1,3 +1,6 @@
+//! The system call entry: the register `Frame` of every kernel entry, the `syscall` MSR setup,
+//! and the dispatch of Linux and native system call numbers to their handlers.
+
 use super::address_space::USER_END;
 use super::errno::*;
 use super::sys_file::{self, AT_FDCWD};

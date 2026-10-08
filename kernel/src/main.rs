@@ -1,3 +1,7 @@
+//! The kernel's entry point: `kernel_main` takes the boot information from the bootloader
+//! (UEFI or BIOS) and brings up the console, interrupts, memory, ACPI, time, the VFS, processes,
+//! the other CPUs and the servers, then starts the first program.
+
 #![no_std]
 #![no_main]
 #![feature(abi_x86_interrupt)]

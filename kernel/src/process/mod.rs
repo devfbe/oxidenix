@@ -1,3 +1,7 @@
+//! Processes and threads: the process table, the current task, descriptor tables, process
+//! groups and sessions, CPU affinity; the submodules hold scheduling, fork/exec/exit, signals,
+//! IPC, restricted mode and the system calls.
+
 pub mod address_space;
 pub mod clone;
 pub mod elf;

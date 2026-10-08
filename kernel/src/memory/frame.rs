@@ -1,3 +1,6 @@
+//! The physical frame allocator: fresh frames from the bootloader's usable regions, freed ones
+//! on an intrusive free list, with reference counts for shared and copy-on-write frames.
+
 use alloc::vec;
 use alloc::vec::Vec;
 use bootloader_api::info::{MemoryRegion, MemoryRegionKind};

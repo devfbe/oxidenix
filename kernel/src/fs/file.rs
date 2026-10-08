@@ -1,3 +1,6 @@
+//! Open files: `OpenFile` (an open file description with offset and flags) over inodes, pipes,
+//! eventfds, devices and files whose calls a server implements (`ServerFile`).
+
 use super::{Device, Inode};
 use crate::process::errno::*;
 use crate::process::epoll::{self, Epoll};

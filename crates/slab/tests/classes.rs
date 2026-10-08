@@ -1,3 +1,5 @@
+//! Size classes and free lists of the slab allocator.
+
 use slab::{class, class_size, FreeList, CLASSES, SLAB_SIZE};
 use std::alloc::{alloc, dealloc, Layout};
 use std::collections::HashSet;

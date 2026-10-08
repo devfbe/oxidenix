@@ -43,6 +43,10 @@ jobs:
             target
           key: cargo-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
 
+      - name: Check that the code map is current
+        if: matrix.firmware == 'uefi'
+        run: python3 scripts/codemap.py --check
+
       - name: Test the ext2 library on the host
         if: matrix.firmware == 'uefi'
         run: nix-shell -p e2fsprogs --run "cargo test -p ext2fs"

@@ -31,6 +31,30 @@ An AI research project; see README.md.
 - `cd kernel && OXIDENIX_BUILD_ONLY=1 cargo run` builds the boot image and data disk without
   starting QEMU.
 
+## Finding code
+
+- `docs/codemap.md` lists every source file with a one-sentence summary and its public types,
+  the Linux server's kernel ABI (call number → handling match arm) and all documents. Read it
+  before searching the tree. It is generated: run `python3 scripts/codemap.py` after adding,
+  removing or re-documenting files (CI fails if it is stale); every source file starts with a
+  module comment (`//!` or `/* */`) whose first sentence says what the file is for.
+- Entry points by topic:
+  - Boot: `builder/src/main.rs` (images, QEMU), `kernel/src/main.rs` (`kernel_main`).
+  - System calls: `kernel/src/process/syscall.rs` (entry, dispatch), `sys_*.rs` beside it.
+  - Restricted mode and the Linux server's kernel interface: `crates/restricted/src/lib.rs`
+    (ABI constants, documented), `kernel/src/process/linux.rs`, `linux_inode.rs`;
+    design in `docs/design/linux-server.md`.
+  - The Linux server: `servers/linux/src/main.rs` (dispatch order mm → time → files → paths →
+    pass-through), `namespace.rs`/`paths.rs` (paths, mounts), `tmpfs.rs`/`tmpfile.rs` (root fs).
+  - Memory: `kernel/src/memory/`, `kernel/src/process/address_space.rs`, page cache
+    `kernel/src/fs/cache.rs`.
+  - Other servers and their protocols: `servers/diskfs` + `crates/fsproto` + `crates/ext2fs`,
+    `servers/netd` + `crates/netproto`, `servers/procfs` + `crates/procproto`; I/O rings
+    `crates/ring`, `docs/design/io-rings.md`.
+  - Tests: C programs in `userspace/*.c` (built by `userspace/build.sh`), run by the list in
+    `userspace/rootfs/etc/runtests.sh`; benchmarks `userspace/iobench.c`, `scripts/bench.sh`,
+    `docs/benchmarks/README.md`. Decisions: `docs/decisions/`.
+
 ## Engineering standard
 
 - Always recommend and build the technically excellent solution, not the quickest one:

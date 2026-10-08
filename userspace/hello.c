@@ -1,3 +1,4 @@
+/* The smallest program: prints its arguments and exits with 42. */
 #include <stdio.h>
 
 int main(int argc, char **argv) {

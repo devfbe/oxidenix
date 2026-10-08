@@ -1,3 +1,6 @@
+//! Interrupt setup: the IDT, the interrupt controllers (local and I/O APIC from ACPI, the 8259
+//! PICs masked) and the per-CPU setup of the other CPUs.
+
 pub mod apic;
 pub mod entry;
 pub mod gdt;

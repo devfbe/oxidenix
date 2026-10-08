@@ -1,3 +1,5 @@
+//! Lexical path normalization, as the Linux server resolves paths.
+
 use vfs::cpio;
 use vfs::path::{join, normalize};
 

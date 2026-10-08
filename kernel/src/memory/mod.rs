@@ -1,3 +1,6 @@
+//! Kernel memory: the frame allocator, the kernel heap (slab size classes over a first-fit heap),
+//! mappings of physical memory, and the commit and page-cache accounting.
+
 pub mod frame;
 pub mod kstack;
 

@@ -1,3 +1,5 @@
+//! Linux error numbers, as system calls return them (negated).
+
 pub const EPERM: i64 = 1;
 pub const ENOENT: i64 = 2;
 pub const ESRCH: i64 = 3;

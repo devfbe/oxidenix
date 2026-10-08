@@ -1,3 +1,4 @@
+# A quick manual tour of the shell: files, pipes and a few commands.
 echo "== ls /"
 ls /
 echo "== cat /etc/motd"

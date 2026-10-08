@@ -1,3 +1,5 @@
+/* Running out of resources: fork bombs, memory hogs and full pipes fail with errors
+ * (EAGAIN, ENOMEM) instead of bringing the kernel down. */
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>

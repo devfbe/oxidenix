@@ -1,3 +1,5 @@
+/* fork, exec of a child program, and wait with exit statuses of children running
+ * concurrently. */
 #include <stdio.h>
 #include <sys/wait.h>
 #include <unistd.h>

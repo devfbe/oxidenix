@@ -1,3 +1,5 @@
+//! The commands of the kernel's built-in fallback shell (help, mem, run, kill, ...).
+
 use heapless::Vec;
 
 pub fn dispatch(cmd: &str, args: &Vec<&str, 8>) {

@@ -1,3 +1,5 @@
+/* Filesystem semantics on /data: symlinks and O_NOFOLLOW, unlinked files that stay open,
+ * file size limits and the access modes of descriptors. */
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>

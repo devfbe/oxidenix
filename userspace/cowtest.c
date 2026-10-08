@@ -1,3 +1,5 @@
+/* Copy-on-write after fork: parent and child see their own writes to heap and data, brk
+ * stays clear of mappings, and shared read-only frames cannot be written. */
 #include <fcntl.h>
 #include <stdint.h>
 #include <signal.h>

@@ -1,3 +1,5 @@
+//! Parsing newc cpio archives (the initramfs format).
+
 use vfs::cpio::{entries, header, member_path, HEADER_LEN, TRAILER};
 
 /// One newc member: header, name with NUL, padding, data, padding.

@@ -1,3 +1,6 @@
+//! The host-side builder (`cargo run` in kernel/ runs it): builds the root filesystem and its
+//! cpio initramfs, the data disk and the UEFI or BIOS boot image, then starts QEMU.
+
 use std::fs;
 use std::io::{self, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};

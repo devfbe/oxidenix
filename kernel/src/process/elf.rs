@@ -1,3 +1,5 @@
+//! Parsing ELF64 headers and program headers of static executables (for `loader`).
+
 pub const PT_LOAD: u32 = 1;
 pub const PT_PHDR: u32 = 6;
 pub const PF_X: u32 = 1;

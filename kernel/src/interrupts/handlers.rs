@@ -1,3 +1,7 @@
+//! Interrupt and exception handlers: every vector from `entry::common_entry` lands in `trap`,
+//! which dispatches CPU exceptions (page faults, signals for user faults), device interrupts and
+//! inter-processor interrupts.
+
 use super::apic;
 use crate::process::signal;
 use crate::process::syscall::Frame;
