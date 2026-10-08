@@ -828,7 +828,7 @@ pub fn watch(id: u64, value: u64) -> Result<i64, i64> {
     let (channel, service) = Channel::attached(id)?;
     let value = u32::try_from(value).map_err(|_| EINVAL)?;
     let offset = (channel.layout.submission + ring::TAIL_OFFSET) as u64;
-    super::futex::object_watch(&channel.memory, offset, channel.submission_tail(), value, service.server.clone(), super::current_pid())
+    super::futex::object_watch(&channel.memory, offset, channel.submission_tail(), value, &service.server.doorbell, super::current_pid())
 }
 
 /// grant_dma_unmap(channel, grant): the service's devices are done with

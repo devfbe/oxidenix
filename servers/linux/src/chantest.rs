@@ -191,6 +191,7 @@ fn rings() -> Result<(), i64> {
     }
     check!(3, c.status(SLEEPS, 0, 0, 0, 0) > 0);
     check!(12, c.status(HEADER_READ_ONLY, 0, 0, 0, 0) == 0);
+    check!(13, c.status(WATCH, 0, 0, 0, 0) == 0);
     check!(4, c.connect(SERVICE) == -EISCONN);
     let d = Client::create().map_err(|_| 5)?;
     check!(6, d.connect("nosuchservice") == -ENOENT);

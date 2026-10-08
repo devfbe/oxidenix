@@ -41,7 +41,7 @@ module comment, and the public types it defines. Where to start for common tasks
 - `kernel/src/process/errno.rs` (45) Linux error numbers, as system calls return them (negated).
 - `kernel/src/process/exec.rs` (119) execve(2): replaces the program of the calling process.
 - `kernel/src/process/exit.rs` (223) Ending threads and processes, and waiting for children. Types: `WaitStatus`.
-- `kernel/src/process/futex.rs` (335) futex(2): sleeping on a user-space word, the base of every pthread mutex, condition variable and join.
+- `kernel/src/process/futex.rs` (336) futex(2): sleeping on a user-space word, the base of every pthread mutex, condition variable and join.
 - `kernel/src/process/ipc.rs` (383) Synchronous message passing between the kernel and user-space servers. Types: `Instance`.
 - `kernel/src/process/irq.rs` (52) Device interrupts for user-space drivers.
 - `kernel/src/process/linux.rs` (1091) Restricted mode: a Linux program and the Linux server on one thread (docs/design/linux-server.md; the interface is `crates/restricted`). Types: `Instance`, `Object`, `ExecTarget`, `Record`, `LinuxThread`.
@@ -70,7 +70,7 @@ module comment, and the public types it defines. Where to start for common tasks
 
 ## Linux server
 
-- `servers/linux/src/chantest.rs` (308) `TEST_CHANNEL`: the client's side of channels to the test service (servers/ringtest, protocol `ring::selftest`), as the page cache will use them with diskfs: create, connect, grant, move descriptors through the rings...
+- `servers/linux/src/chantest.rs` (309) `TEST_CHANNEL`: the client's side of channels to the test service (servers/ringtest, protocol `ring::selftest`), as the page cache will use them with diskfs: create, connect, grant, move descriptors through the rings...
 - `servers/linux/src/eventfd.rs` (98) eventfd (phase R6b): a counter that reads take and writes add to, a file of the server with a placeholder in the kernel's descriptor table. Types: `EventFd`.
 - `servers/linux/src/files.rs` (299) The server's files (phase R6): objects the server implements, each named in the kernel's descriptor table by a placeholder (see `restricted::SYS_KFD_INSTALL`). Types: `File`.
 - `servers/linux/src/heap.rs` (60) The server's heap: one allocator for every thread of the instance, in the shared region, growing by `SYS_SHARED_MAP` when it runs out. Types: `ServerHeap`.
@@ -97,7 +97,7 @@ module comment, and the public types it defines. Where to start for common tasks
 - `servers/netd/src/virtio_net.rs` (91) virtio-net driver on the shared virtio transport (crates/virtio). Types: `VirtioNet`.
 - `servers/procfs/src/main.rs` (346) procfs: Linux's /proc, served from user space.
 - `servers/procfs/src/render.rs` (189) The text formats of Linux's /proc files.
-- `servers/ringtest/src/main.rs` (212) ringtest: the far end of the self-tests' channels (test mode only).
+- `servers/ringtest/src/main.rs` (236) ringtest: the far end of the self-tests' channels (test mode only).
 
 ## Libraries
 
@@ -113,7 +113,7 @@ module comment, and the public types it defines. Where to start for common tasks
 - `crates/restricted/src/lib.rs` (140) The interface between the kernel and the Linux server for restricted mode (docs/design/linux-server.md): the layout of the server's shared region, the per-thread register block, and the kernel calls the server makes... Types: `State`, `Event`, `Walk`.
 - `crates/ring/src/channel.rs` (116) A channel: the memory object both ends of a data-plane connection map (docs/design/io-rings.md). Types: `Layout`, `Header`, `Offer`.
 - `crates/ring/src/lib.rs` (180) Single-producer single-consumer rings of fixed-size descriptors in shared memory: the data plane between the Linux server and the device servers (docs/design/io-rings.md, ADR 0005). Types: `Desc`, `RingMemory`, `Wait`, `Ring`, `Producer`, `Consumer`.
-- `crates/ring/src/selftest.rs` (16) The protocol of the self-tests' channel service (servers/ringtest), which the Linux server's test calls (`restricted::TEST_CHANNEL`) drive.
+- `crates/ring/src/selftest.rs` (17) The protocol of the self-tests' channel service (servers/ringtest), which the Linux server's test calls (`restricted::TEST_CHANNEL`) drive.
 - `crates/ring/tests/spsc.rs` (191) The ring's invariants (docs/design/io-rings.md): FIFO order, a full ring refuses, positions wrap modulo 2^32, a consumer on another thread sees every entry's contents, and the doorbell protocol loses no wakeup.
 - `crates/slab/src/lib.rs` (58) Size classes for small allocations: objects of up to 2 KiB come from slabs (4 KiB, aligned to 4 KiB) cut into equal slots, and a class's free slots form an intrusive list, so allocating and freeing one is O(1). Types: `FreeList`.
 - `crates/slab/tests/classes.rs` (95) Size classes and free lists of the slab allocator.

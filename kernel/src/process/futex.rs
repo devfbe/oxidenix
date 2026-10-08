@@ -36,11 +36,11 @@ use super::errno::*;
 use crate::fs::cache::PageCache;
 use super::sched::{current, current_arc, prepare_to_sleep, try_wake};
 use super::task::{State, Task};
-use super::{signal, uaccess, Pid, Server};
+use super::{signal, uaccess, Pid};
 use crate::sync::IrqSpinLock;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 const FUTEX_WAIT: u64 = 0;
 const FUTEX_WAKE: u64 = 1;
@@ -76,8 +76,10 @@ struct Waiter {
 
 enum Sleeper {
     Task(Arc<Task>),
-    /// A doorbell watch of the server's process `Pid` (`object_watch`).
-    Watch(Arc<Server>, Pid),
+    /// A doorbell watch of a server's process `Pid` (`object_watch`): its
+    /// server's doorbell flag (only the flag: dropping it under the bucket
+    /// lock frees nothing else).
+    Watch(Arc<AtomicBool>, Pid),
 }
 
 impl Waiter {
@@ -92,8 +94,8 @@ impl Waiter {
                 task.futex_woken.store(true, Ordering::Release);
                 try_wake(&task, State::Sleeping);
             }
-            Sleeper::Watch(server, pid) => {
-                server.doorbell.store(true, Ordering::Release);
+            Sleeper::Watch(doorbell, pid) => {
+                doorbell.store(true, Ordering::Release);
                 super::wakeup(super::irq::server_chan(pid));
             }
         }
@@ -299,8 +301,12 @@ fn requeue(uaddr: u64, n_wake: u64, n_move: u64, uaddr2: u64, cmp: Option<u32>, 
             Some(s) if i1 < i2 => (&mut *first, Some(&mut **s)),
             Some(s) => (&mut **s, Some(&mut *first)),
         };
-        // Room first, so that nothing fails halfway.
-        let matching = src.iter().filter(|w| w.key == from).count() as u64;
+        // Room first, so that nothing fails halfway. Only tasks move: a
+        // doorbell watch stays on its channel's word, whose hang-up is
+        // what removes it for good (moved elsewhere, it would outlive the
+        // channel and escape `object_watch`'s one-per-word rule).
+        let moves = |w: &Waiter| w.key == from && matches!(w.sleeper, Sleeper::Task(_));
+        let matching = src.iter().filter(|w| moves(w)).count() as u64;
         let movable = matching.saturating_sub(n_wake).min(n_move);
         if let Some(d) = dst.as_mut() {
             d.try_reserve(movable as usize).map_err(|_| ENOMEM)?;
@@ -309,7 +315,7 @@ fn requeue(uaddr: u64, n_wake: u64, n_move: u64, uaddr2: u64, cmp: Option<u32>, 
         let mut moved = 0;
         let mut i = 0;
         while i < src.len() && moved < movable {
-            if src[i].key != from {
+            if !moves(&src[i]) {
                 i += 1;
                 continue;
             }
@@ -356,19 +362,24 @@ pub fn object_wait(
     wait_on(key, || Some(word.load(Ordering::SeqCst)), || Ok(()), hung_up, val, deadline, FUTEX_BITSET_MATCH_ANY, interruptible)
 }
 
-/// Arms a doorbell watch of the server `server`'s process `pid` on the
-/// word at `offset` of `object` (read through `word`, the object's page,
-/// which the caller keeps), if it holds `val`: the next wake of the word
-/// (or the object's hang-up) sets `server.doorbell` and wakes the process's
-/// `ipc_receive`. EAGAIN if the word holds another value, EPIPE if the
-/// object was hung up. A watch that process armed on the word before is
-/// kept, not doubled: a service cannot pile them up.
+/// Arms a doorbell watch of the server process `pid` on the word at
+/// `offset` of `object` (read through `word`, the object's page, which the
+/// caller keeps), if it holds `val`: the next wake of the word (or the
+/// object's hang-up) sets `doorbell` (its server's) and wakes the
+/// process's `ipc_receive`. EAGAIN if the word holds another value, EPIPE
+/// if the object was hung up. A watch that process armed on the word
+/// before is kept, not doubled, and requeues leave watches where they are:
+/// at most one per word and process exists, and it goes with the wake or
+/// the object's hang-up (`wake_object`), which every teardown of a
+/// channel does before its memory can go. So the watches a service holds
+/// are bounded by the channel words it may watch (`channel::watch`: one
+/// per channel attached to it).
 pub fn object_watch(
     object: &Arc<PageCache>,
     offset: u64,
     word: &core::sync::atomic::AtomicU32,
     val: u32,
-    server: Arc<Server>,
+    doorbell: &Arc<AtomicBool>,
     pid: Pid,
 ) -> Result<i64, i64> {
     let key = Key { base: Base::Shared(Arc::as_ptr(object) as usize), offset };
@@ -379,10 +390,10 @@ pub fn object_watch(
     if word.load(Ordering::SeqCst) != val {
         return Err(EAGAIN);
     }
-    let armed = |w: &Waiter| w.key == key && matches!(&w.sleeper, Sleeper::Watch(s, p) if Arc::ptr_eq(s, &server) && *p == pid);
+    let armed = |w: &Waiter| w.key == key && matches!(&w.sleeper, Sleeper::Watch(_, p) if *p == pid);
     if !b.iter().any(armed) {
         b.try_reserve(1).map_err(|_| ENOMEM)?;
-        b.push(Waiter { key, sleeper: Sleeper::Watch(server, pid), bitset: FUTEX_BITSET_MATCH_ANY });
+        b.push(Waiter { key, sleeper: Sleeper::Watch(doorbell.clone(), pid), bitset: FUTEX_BITSET_MATCH_ANY });
     }
     Ok(0)
 }
@@ -394,7 +405,10 @@ pub fn object_wake(object: &PageCache, offset: u64, n: u64) -> i64 {
     wake_in(&mut b, &key, n, FUTEX_BITSET_MATCH_ANY) as i64
 }
 
-/// Wakes every waiter on any word of `object` (after `hang_up`).
+/// Wakes every waiter on any word of `object` (after `hang_up`). It looks
+/// through every bucket: O(buckets + waiters), each waiter a sleeping task
+/// or one watch per attached channel, so no caller can inflate it beyond
+/// what it is charged for; a channel runs it at most once per end.
 pub fn wake_object(object: &PageCache) {
     let base = Base::Shared(object as *const PageCache as usize);
     for bucket in BUCKETS_.iter() {
