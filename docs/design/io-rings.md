@@ -169,7 +169,8 @@ client revokes after the requests on the grant completed. The kernel only guaran
 memory a device or the service can still reach is freed or reused.
 
 **Teardown.** When the client's end goes (its handle closed, or the instance ended) every grant
-is revoked as above; when the service's end goes (`chan_detach`, or its process ended) every
+is revoked as above; when the service's end goes (`chan_detach`, or its process ended or executed a new program:
+the service is its address space, not its process id) every
 grant is released, except that grants a dead service's device may still reach wait in its
 server's `DmaDomain` until the server's next process registers (a server resets its device
 before it registers). Either way the kernel sets the end's bit in `state` (`CLIENT_GONE`,

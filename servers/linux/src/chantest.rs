@@ -168,6 +168,7 @@ pub fn run(scenario: u64) -> i64 {
         3 => revoking(),
         4 => client_end(),
         5 => service_death(),
+        6 => service_exec(),
         _ => Err(1000),
     };
     match result {
@@ -338,6 +339,28 @@ fn service_death() -> Result<(), i64> {
     drop(c);
     let mut c = Client::open().map_err(|_| 98)?;
     check!(99, c.status(ECHO, 0, 0, 0, 1) == 2);
+    close(obj);
+    Ok(())
+}
+
+/// The service executes a new program: that ends its end of the channel
+/// (the client wakes), and the new program can neither map the grant nor
+/// get a device address of it.
+fn service_exec() -> Result<(), i64> {
+    let obj = object(1, |_| b'k').map_err(|_| 110)?;
+    let mut c = Client::open().map_err(|_| 111)?;
+    let g = c.grant(obj, 0, 1, GRANT_WRITE);
+    check!(112, g > 0 && c.status(READ, g, 0, 1, 0) == b'k' as i64);
+    check!(113, c.call(EXEC, g, 0, 0, 0) == Err(-EPIPE));
+    // Time for the new program to try (and end).
+    pause_ms(300);
+    let mut byte = [0u8; 1];
+    syscall(SYS_MO_READ, [obj, 0, byte.as_mut_ptr() as u64, 1, 0, 0]);
+    check!(114, byte[0] == b'k');
+    check!(115, c.revoke(g) == 0);
+    drop(c);
+    let mut c = Client::open().map_err(|_| 116)?;
+    check!(117, c.status(ECHO, 0, 0, 0, 1) == 2);
     close(obj);
     Ok(())
 }

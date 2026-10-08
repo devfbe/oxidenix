@@ -465,6 +465,6 @@ pub const REVOKE_DRAINING: u64 = 1;
 /// `(scenario)`: the server runs a channel scenario against the test
 /// service (servers/ringtest, `ring::selftest`): 1 rings and doorbells, 2
 /// grants and their bounds, 3 revoking, 4 the client's end going, 5 the
-/// service dying. 0 if every check held, else the negative number of the
-/// first that failed.
+/// service dying, 6 the service executing a new program. 0 if every
+/// check held, else the negative number of the first that failed.
 pub const TEST_CHANNEL: u64 = 1514;

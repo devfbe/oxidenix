@@ -141,7 +141,6 @@ impl Grants {
 
 #[derive(Clone)]
 struct ServiceEnd {
-    pid: Pid,
     mm: Weak<Mm>,
     server: Arc<Server>,
 }
@@ -452,11 +451,14 @@ impl Channel {
     // ----------------------------------------------------------- service
 
     /// The channel `id`, attached to the calling process.
+    /// The service is its address space, not its process id: after an
+    /// exec (which ends the service's end, see `service_exited`) the same
+    /// process is no longer the service.
     fn attached(id: u64) -> Result<(Arc<Channel>, ServiceEnd), i64> {
-        let me = super::current_pid();
-        let channel = CHANNELS.lock().get(&id).and_then(|e| e.service.as_ref().filter(|(pid, _)| *pid == me).map(|(_, c)| c.clone()));
+        let mm = super::current_mm().ok_or(ENOENT)?;
+        let channel = CHANNELS.lock().get(&id).and_then(|e| e.service.as_ref().map(|(_, c)| c.clone()));
         let channel = channel.ok_or(ENOENT)?;
-        let service = channel.inner.lock().service.clone().filter(|s| s.pid == me).ok_or(ENOENT)?;
+        let service = channel.inner.lock().service.clone().filter(|s| core::ptr::eq(s.mm.as_ptr(), Arc::as_ptr(&mm))).ok_or(ENOENT)?;
         Ok((channel, service))
     }
 
@@ -597,7 +599,7 @@ pub fn attach(id: u64) -> Result<i64, i64> {
         if inner.client_gone || inner.service.is_some() || inner.offered != Some(to) {
             Err(if inner.client_gone { EPIPE } else { ECONNREFUSED })
         } else {
-            inner.service = Some(ServiceEnd { pid: me, mm: Arc::downgrade(&mm), server });
+            inner.service = Some(ServiceEnd { mm: Arc::downgrade(&mm), server });
             if let Some(entry) = channels.get_mut(&id) {
                 entry.service = Some((me, channel.clone()));
             }
@@ -632,13 +634,14 @@ fn grant_of(id: u64, grant: u64) -> Result<(Arc<Channel>, ServiceEnd, Arc<Grant>
 /// service, read-only unless granted writable; stores (pages, writable) as
 /// two u64s at `info`.
 pub fn grant_map(id: u64, grant: u64, info: u64) -> Result<i64, i64> {
-    let (_, _, g) = grant_of(id, grant)?;
+    let (_, service, g) = grant_of(id, grant)?;
     super::uaccess::write(info, [g.frames.len() as u64, g.writable as u64])?;
     let st = g.state.lock();
     if st.revoked {
         return Err(ENOENT);
     }
-    let mm = super::current_mm().ok_or(EINVAL)?;
+    // The service's address space, which revoke and teardown reach.
+    let mm = service.mm.upgrade().ok_or(ENOENT)?;
     let mut space = mm.lock();
     let floor = space.brk_end;
     let start = space.find_free(g.bytes(), floor).ok_or(ENOMEM)?;
@@ -680,8 +683,10 @@ pub fn grant_dma_unmap(id: u64, grant: u64) -> Result<i64, i64> {
     Ok(0)
 }
 
-/// The process `pid` ended: the channels it served lose their service.
-/// (Called where the kernel may not sleep: the teardown is deferred.)
+/// The process `pid` ended, or executed a new program (whose devices are
+/// the old program's: their grants are treated as after a death): the
+/// channels it served lose their service. (Called where the kernel may
+/// not sleep: the teardown is deferred.)
 pub fn service_exited(pid: Pid) {
     let served: Vec<Arc<Channel>> =
         CHANNELS.lock().values().filter_map(|e| e.service.as_ref().filter(|(p, _)| *p == pid).map(|(_, c)| c.clone())).collect();

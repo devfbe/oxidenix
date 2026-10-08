@@ -35,3 +35,9 @@ pub const CRASH: u16 = 8;
 pub const CLEAN_ENDS: u16 = 9;
 /// How often the service slept on the submission ring's doorbell.
 pub const SLEEPS: u16 = 10;
+/// The service executes itself again (`/sbin/ringtest after-exec`), and
+/// the new program tries to reach the grant: it maps it and stores
+/// `AFTER_EXEC` at its first byte, and asks for a device address. Neither
+/// may work: an exec ends the service's end of its channels.
+pub const EXEC: u16 = 11;
+pub const AFTER_EXEC: u8 = 0x99;

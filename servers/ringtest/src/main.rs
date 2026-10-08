@@ -58,7 +58,38 @@ struct Mapped {
     writable: bool,
 }
 
-fn main(_args: Vec<&'static str>) -> i32 {
+/// Value of `key=...` among the arguments.
+fn arg(args: &[&str], key: &str) -> Option<u64> {
+    args.iter().find_map(|a| a.strip_prefix(key)?.strip_prefix('=')?.parse().ok())
+}
+
+/// The program after `EXEC`: tries to reach the grant of the channel the
+/// process served before, then ends (the kernel starts the service again
+/// for the next channel).
+fn after_exec(args: &[&str]) -> i32 {
+    let (Some(channel), Some(grant)) = (arg(args, "channel"), arg(args, "grant")) else { return 2 };
+    if let Ok((addr, _, true)) = oxrt::grant_map(channel, grant as u32) {
+        unsafe { addr.write_volatile(AFTER_EXEC) };
+    }
+    let _ = oxrt::grant_dma(channel, grant as u32, 0);
+    0
+}
+
+/// execve(2) of this program with `args`.
+fn exec_self(args: &[&str]) -> i64 {
+    const EXECVE: u64 = 59;
+    let path = b"/sbin/ringtest\0";
+    let strings: Vec<Vec<u8>> = args.iter().map(|a| a.bytes().chain(core::iter::once(0)).collect()).collect();
+    let mut argv: Vec<u64> = strings.iter().map(|s| s.as_ptr() as u64).collect();
+    argv.push(0);
+    let envp = [0u64];
+    oxrt::syscall(EXECVE, [path.as_ptr() as u64, argv.as_ptr() as u64, envp.as_ptr() as u64, 0, 0, 0])
+}
+
+fn main(args: Vec<&'static str>) -> i32 {
+    if args.contains(&"after-exec") {
+        return after_exec(&args);
+    }
     if let Err(e) = oxrt::ipc_register_with(SERVICE, 0, oxrt::IPC_CHANNELS) {
         println!("ringtest: cannot register: {}", e);
         return 1;
@@ -194,6 +225,11 @@ fn handle(channel: u64, d: &Desc, mapped: &mut Vec<Mapped>) -> i64 {
             Ok(-1)
         }
         CLEAN_ENDS => Ok(CLEAN.load(Ordering::Relaxed)),
+        EXEC => {
+            let channel = alloc::format!("channel={}", channel);
+            let grant = alloc::format!("grant={}", d.grant);
+            Ok(exec_self(&["ringtest", "after-exec", &channel, &grant]))
+        }
         SLEEPS => Ok(SLEPT.load(Ordering::Relaxed) as i64),
         _ => Err(-EINVAL),
     })();
