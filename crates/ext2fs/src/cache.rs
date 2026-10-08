@@ -6,7 +6,8 @@
 //! give way when the cache is full; a dirty one is written first.
 //!
 //! File data does not pass through here: the kernel's page cache holds it,
-//! and reads and writes of whole blocks go straight to the device.
+//! and reads and writes of whole blocks go straight to the device (or, on
+//! diskfs's ring path, between the device and the client's pages).
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -39,6 +40,11 @@ impl BlockCache {
         e.used = self.clock;
         self.lru.insert(self.clock, n);
         Some(&e.data)
+    }
+
+    /// Whether block `n` is cached.
+    pub fn contains(&self, n: u32) -> bool {
+        self.blocks.contains_key(&n)
     }
 
     /// Cached blocks in `range`, without marking them used.

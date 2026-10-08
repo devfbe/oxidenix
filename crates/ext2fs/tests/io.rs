@@ -1,6 +1,7 @@
 //! ext2fs on a RAM disk that counts device requests: large reads and writes
 //! take few requests, every operation flushes once, and the filesystem
-//! stays consistent for e2fsck. Needs mke2fs and e2fsck (e2fsprogs) in PATH:
+//! stays consistent for e2fsck; on the ring path, reserved blocks stay out
+//! of the metadata until linked and `sync` flushes data before metadata. Needs mke2fs and e2fsck (e2fsprogs) in PATH:
 //! `nix-shell -p e2fsprogs --run "cargo test -p ext2fs"`.
 
 use ext2fs::{Device, Ext2, NewNode, ROOT_INO};
@@ -356,4 +357,176 @@ fn reads_after_a_failed_commit_never_expose_old_blocks() {
         let _ = fs.read(f, 0, &mut buf);
         assert!(buf.iter().all(|&b| b != b'S'), "old data visible (writes failing from {})", skip);
     }
+}
+
+// ------------------------------------------------------------- the ring path
+
+/// What diskfs's device does for a write on the ring path: the data of
+/// `off..off + data.len()` straight into the reserved blocks (a new block
+/// whole, zeros where the write has none).
+fn dma_write(fs: &mut Ext2<RamDisk>, r: &ext2fs::Reservation, off: u64, data: &[u8]) {
+    let bs = fs.block_size() as u64;
+    for run in &r.runs {
+        for i in 0..run.count as u64 {
+            let fb = run.file_block + i;
+            let disk = (run.block as u64 + i) * bs;
+            let mut block = vec![0u8; bs as usize];
+            if !run.new {
+                block.copy_from_slice(&fs.device().data[disk as usize..(disk + bs) as usize]);
+            }
+            for (j, b) in block.iter_mut().enumerate() {
+                let pos = fb * bs + j as u64;
+                if pos >= off && pos < off + data.len() as u64 {
+                    *b = data[(pos - off) as usize];
+                }
+            }
+            fs.device_mut().write(disk / 512, &block).unwrap();
+        }
+    }
+}
+
+/// The bytes `read_map` says lie at `off..off + len`, read from the disk.
+fn dma_read(fs: &mut Ext2<RamDisk>, ino: u32, off: u64, len: u64) -> (u64, Vec<u8>) {
+    let (size, extents) = fs.read_map(ino, off, len).unwrap();
+    let mut out = Vec::new();
+    for e in extents {
+        match e.disk {
+            Some(d) => out.extend_from_slice(&fs.device().data[d as usize..(d + e.len) as usize]),
+            None => out.extend(std::iter::repeat_n(0, e.len as usize)),
+        }
+    }
+    (size, out)
+}
+
+fn ring_write(fs: &mut Ext2<RamDisk>, ino: u32, off: u64, data: &[u8]) -> u64 {
+    let r = fs.reserve(ino, off, data.len() as u64).unwrap();
+    dma_write(fs, &r, off, data);
+    fs.link(&r, off + data.len() as u64).unwrap()
+}
+
+#[test]
+fn ring_writes_land_in_reserved_blocks_and_read_back() {
+    let mut fs = Ext2::mount(mkfs("ring", 4 * 1024)).unwrap();
+    let ino = fs.create(ROOT_INO, "f", &NewNode::File, 0o644).unwrap();
+    let data: Vec<u8> = (0..300 * 1024).map(pattern).collect();
+    // Whole blocks, into a file without any: all new, mostly contiguous
+    // (one run per indirect block in between).
+    let r = fs.reserve(ino, 0, data.len() as u64).unwrap();
+    assert!(r.runs.iter().all(|run| run.new) && r.runs.len() <= 4, "{:?}", r.runs);
+    assert_eq!(r.runs.iter().map(|run| run.count).sum::<u32>(), 300);
+    dma_write(&mut fs, &r, 0, &data);
+    assert_eq!(fs.link(&r, data.len() as u64).unwrap(), data.len() as u64);
+    // Overwrites in place, unaligned, and past the end (a new block).
+    let r = fs.reserve(ino, 1000, 3000).unwrap();
+    assert!(r.runs.iter().all(|run| !run.new));
+    dma_write(&mut fs, &r, 1000, &[0xaa; 3000]);
+    fs.link(&r, 4000).unwrap();
+    assert_eq!(ring_write(&mut fs, ino, 400 * 1024 + 10, b"tail"), 400 * 1024 + 14);
+    let mut want = data.clone();
+    want[1000..4000].fill(0xaa);
+    want.resize(400 * 1024 + 10, 0);
+    want.extend_from_slice(b"tail");
+    // Both read paths see it: the ring's extents and the IPC path's read.
+    let (size, got) = dma_read(&mut fs, ino, 0, 1 << 20);
+    assert_eq!(size, want.len() as u64);
+    assert!(got == want, "ring read differs");
+    let mut buf = vec![0u8; want.len()];
+    assert_eq!(fs.read(ino, 0, &mut buf).unwrap(), want.len());
+    assert!(buf == want, "read differs");
+    fs.sync().unwrap();
+    fsck("ring", &take(fs));
+}
+
+#[test]
+fn read_maps_clip_at_the_end_and_report_holes() {
+    let mut fs = Ext2::mount(mkfs("map", 2 * 1024)).unwrap();
+    let ino = fs.create(ROOT_INO, "f", &NewNode::File, 0o644).unwrap();
+    fs.write(ino, 0, &[1u8; 1024]).unwrap();
+    fs.write(ino, 5 * 1024, &[2u8; 1000]).unwrap();
+    let (size, extents) = fs.read_map(ino, 100, 1 << 20).unwrap();
+    assert_eq!(size, 6120);
+    let lens: Vec<(bool, u64)> = extents.iter().map(|e| (e.disk.is_some(), e.len)).collect();
+    assert_eq!(lens, vec![(true, 924), (false, 4096), (true, 1000)]);
+    assert_eq!(fs.read_map(ino, 6120, 10).unwrap().1, vec![]);
+    assert_eq!(fs.read_map(ino, 1 << 40, 10).unwrap().1, vec![]);
+    let (_, bytes) = dma_read(&mut fs, ino, 1020, 8);
+    assert_eq!(bytes, [1, 1, 1, 1, 0, 0, 0, 0]);
+    assert_eq!(fs.read_map(ROOT_INO, 0, 10), Err(ext2fs::errno::EINVAL));
+}
+
+/// A reserved block is in no bitmap and no inode: commits meanwhile leave
+/// a consistent filesystem, other allocations do not take it, and giving
+/// it back leaves no trace.
+#[test]
+fn reserved_blocks_stay_out_of_the_metadata_until_linked() {
+    let mut fs = Ext2::mount(mkfs("reserved", 4 * 1024)).unwrap();
+    let a = fs.create(ROOT_INO, "a", &NewNode::File, 0o644).unwrap();
+    let b = fs.create(ROOT_INO, "b", &NewNode::File, 0o644).unwrap();
+    let free = fs.usage().2;
+    let r = fs.reserve(a, 0, 64 * 1024).unwrap();
+    // Another file allocates (and commits) while the reservation stands.
+    write_file(&mut fs, b, 64 * 1024);
+    let reserved: Vec<u32> = r.runs.iter().flat_map(|run| run.block..run.block + run.count).collect();
+    let (_, extents) = fs.read_map(b, 0, 64 * 1024).unwrap();
+    for e in extents {
+        let first = (e.disk.unwrap() / 1024) as u32;
+        assert!(reserved.iter().all(|&blk| blk < first || blk >= first + (e.len / 1024) as u32), "b got a reserved block");
+    }
+    // On the disk now: the bitmap without the reserved blocks.
+    fsck("reserved-mid", fs.device());
+    dma_write(&mut fs, &r, 0, &[7u8; 64 * 1024]);
+    fs.link(&r, 64 * 1024).unwrap();
+    // A reservation given back.
+    let r = fs.reserve(a, 64 * 1024, 16 * 1024).unwrap();
+    fs.unreserve(&r);
+    fs.sync().unwrap();
+    // 64 + 64 data blocks and an indirect block each (and the one the
+    // given-back reservation made for a, which stays linked: it is valid).
+    assert!(free - fs.usage().2 <= 128 + 3, "{} blocks used", free - fs.usage().2);
+    check_file(&mut fs, b, 64 * 1024);
+    let mut buf = vec![0u8; 64 * 1024];
+    assert_eq!(fs.read(a, 0, &mut buf).unwrap(), 64 * 1024);
+    assert!(buf.iter().all(|&x| x == 7));
+    assert_eq!(fs.stat(a).unwrap().size, 64 * 1024);
+    fsck("reserved", &take(fs));
+}
+
+#[test]
+fn sync_flushes_the_data_before_the_metadata() {
+    let mut fs = Ext2::mount(mkfs("order", 2 * 1024)).unwrap();
+    let ino = fs.create(ROOT_INO, "f", &NewNode::File, 0o644).unwrap();
+    let r = fs.reserve(ino, 0, 4096).unwrap();
+    dma_write(&mut fs, &r, 0, &[3u8; 4096]);
+    fs.link(&r, 4096).unwrap();
+    let before = fs.device().counts.clone();
+    fs.sync().unwrap();
+    let after = fs.device().counts.clone();
+    // A flush for the data, the metadata, a flush for it.
+    assert_eq!(after.flushes - before.flushes, 2);
+    assert!(after.writes > before.writes);
+    // Nothing left: the next sync writes nothing.
+    fs.sync().unwrap();
+    assert_eq!(fs.device().counts.flushes, after.flushes);
+    fsck("order", &take(fs));
+}
+
+#[test]
+fn the_ring_path_takes_only_inodes_in_use() {
+    let mut fs = Ext2::mount(mkfs("live", 2 * 1024)).unwrap();
+    let ino = fs.create(ROOT_INO, "f", &NewNode::File, 0o644).unwrap();
+    let enoent = Err(ext2fs::errno::ENOENT);
+    for dead in [0, ino + 1, u32::MAX, 100_000] {
+        assert_eq!(fs.check(dead), enoent, "{dead}");
+        assert_eq!(fs.read_map(dead, 0, 1).map(|_| ()), enoent);
+        assert_eq!(fs.reserve(dead, 0, 1).map(|_| ()), enoent);
+    }
+    assert_eq!(fs.check(ino), Ok(()));
+    // Unlinked but not released: still in use (an open file).
+    let gone = fs.unlink(ROOT_INO, "f", false).unwrap();
+    assert_eq!(gone, vec![ino]);
+    assert_eq!(fs.check(ino), Ok(()));
+    fs.release(ino).unwrap();
+    assert_eq!(fs.check(ino), enoent);
+    assert_eq!(fs.reserve(ino, 0, 1).map(|_| ()), enoent);
+    fsck("live", &take(fs));
 }

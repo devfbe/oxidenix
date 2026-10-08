@@ -101,9 +101,9 @@ module comment, and the public types it defines. Where to start for common tasks
 
 ## Libraries
 
-- `crates/ext2fs/src/cache.rs` (63) The metadata block cache: inode tables, bitmaps, group descriptors, directories, symlink and indirect blocks. Types: `BlockCache`.
-- `crates/ext2fs/src/lib.rs` (1146) ext2 on the data disk (any `Device`): revision 1 with the `filetype` feature, 1/2/4 KiB blocks, direct and single/double/triple indirect blocks. Types: `Device`, `NewNode`, `RawInode`, `Stat`, `Ext2`.
-- `crates/ext2fs/tests/io.rs` (284) ext2fs on a RAM disk that counts device requests: large reads and writes take few requests, every operation flushes once, and the filesystem stays consistent for e2fsck.
+- `crates/ext2fs/src/cache.rs` (66) The metadata block cache: inode tables, bitmaps, group descriptors, directories, symlink and indirect blocks. Types: `BlockCache`.
+- `crates/ext2fs/src/lib.rs` (1436) ext2 on the data disk (any `Device`): revision 1 with the `filetype` feature, 1/2/4 KiB blocks, direct and single/double/triple indirect blocks. Types: `Device`, `NewNode`, `RawInode`, `Extent`, `Run`, `Reservation`, `Stat`, `Ext2`.
+- `crates/ext2fs/tests/io.rs` (421) ext2fs on a RAM disk that counts device requests: large reads and writes take few requests, every operation flushes once, and the filesystem stays consistent for e2fsck; on the ring path, reserved blocks stay out of...
 - `crates/fsproto/src/lib.rs` (108) Message format between the kernel's VFS and filesystem servers. Types: `Op`, `Request`, `Response`.
 - `crates/fsring/src/lib.rs` (346) The file protocol of the data plane: the requests the Linux server (the client) sends diskfs (the service) through a channel's submission ring, and their completions (docs/design/io-rings.md, "The file protocol"). Types: `Buf`, `Kind`, `Request`, `Completion`, `Stat`, `Usage`.
 - `crates/fsring/tests/protocol.rs` (144) The file protocol's encodings: every request survives encode and decode, malformed descriptors are refused with the right errno (unknown operations, stray fields, lengths and names out of range), and the completion,...
