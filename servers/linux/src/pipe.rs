@@ -1,6 +1,8 @@
 //! Pipes (phase R6a): a 64 KiB buffer shared by a read end and a write
 //! end, each a file of the server with a placeholder in the kernel's
-//! descriptor table.
+//! descriptor table. Opening /proc/<pid>/fd/N of one adds an end (`reopen`,
+//! as Linux's fifo_open): a pipe has readers and writers, it reads end of
+//! file once no writer is left and fails writes once no reader is.
 //!
 //! Waiting: every change of a pipe (data in or out, an end closed) bumps
 //! its sequence word and wakes its waiters; a reader or writer that cannot
@@ -24,6 +26,7 @@ use crate::unix::Sink;
 use crate::usercopy;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 use restricted::*;
 
@@ -56,12 +59,21 @@ const POLLHUP: i16 = 0x10;
 
 struct Inner {
     buf: VecDeque<u8>,
-    /// Whether each end is still open (both are until their placeholder's
-    /// last descriptor goes).
-    reader: bool,
-    writer: bool,
-    /// The readiness last reported for each end (read, write).
-    reported: [i16; 2],
+    /// Open ends that read and that write (each counted until its
+    /// placeholder's last descriptor goes; a pipe reopened through
+    /// /proc/<pid>/fd gets more).
+    readers: u32,
+    writers: u32,
+    /// Every open end: its placeholder, its roles and the readiness last
+    /// reported for it.
+    ends: Vec<Reported>,
+}
+
+struct Reported {
+    id: u64,
+    reads: bool,
+    writes: bool,
+    ready: i16,
 }
 
 pub struct Shared {
@@ -71,60 +83,95 @@ pub struct Shared {
     rlock: Mutex<()>,
     /// Bumped on every change; waiters sleep on it.
     seq: AtomicU32,
-    ids: [u64; 2],
+    /// Its inode number (fstat, /proc/<pid>/fd's "pipe:[ino]"): every end's.
+    ino: u64,
 }
 
+/// An end: an open file description of the pipe that reads or writes (or
+/// both: one reopened O_RDWR).
 pub struct PipeEnd {
     shared: Arc<Shared>,
-    write: bool,
+    id: u64,
+    reads: bool,
+    writes: bool,
 }
 
 /// A new pipe: (read end, write end).
 pub fn new() -> (Arc<PipeEnd>, Arc<PipeEnd>) {
+    let (rid, wid) = (files::new_id(), files::new_id());
+    let ends = alloc::vec![Reported { id: rid, reads: true, writes: false, ready: 0 }, Reported { id: wid, reads: false, writes: true, ready: POLLOUT }];
     let shared = Arc::new(Shared {
-        inner: Mutex::new(Inner { buf: VecDeque::new(), reader: true, writer: true, reported: [0, POLLOUT] }),
+        inner: Mutex::new(Inner { buf: VecDeque::new(), readers: 1, writers: 1, ends }),
         rlock: Mutex::new(()),
         seq: AtomicU32::new(0),
-        ids: [files::new_id(), files::new_id()],
+        ino: rid,
     });
-    (Arc::new(PipeEnd { shared: shared.clone(), write: false }), Arc::new(PipeEnd { shared, write: true }))
+    (Arc::new(PipeEnd { shared: shared.clone(), id: rid, reads: true, writes: false }), Arc::new(PipeEnd { shared, id: wid, reads: false, writes: true }))
+}
+
+/// Another end of `end`'s pipe, as open(2) of /proc/<pid>/fd/N makes one
+/// (Linux's fifo_open of a pipe: no waiting for a partner): reading for
+/// O_RDONLY, writing for O_WRONLY, both for O_RDWR. The caller installs it
+/// under its `id` (and `close`s it if that fails).
+pub fn reopen(end: &PipeEnd, flags: u32) -> Arc<PipeEnd> {
+    let mode = flags & files::O_ACCMODE;
+    let (reads, writes) = (mode != files::O_WRONLY, mode != 0);
+    let id = files::new_id();
+    let shared = end.shared.clone();
+    {
+        let mut inner = shared.inner.lock();
+        inner.readers += reads as u32;
+        inner.writers += writes as u32;
+        let ready = inner.readiness(reads, writes);
+        inner.ends.push(Reported { id, reads, writes, ready });
+        // A pipe that had no reader or no writer has one now.
+        shared.changed(&mut inner, false, false);
+    }
+    Arc::new(PipeEnd { shared, id, reads, writes })
 }
 
 impl Inner {
-    /// (read end, write end) readiness.
-    fn readiness(&self) -> [i16; 2] {
-        let read = if !self.writer {
-            POLLIN | POLLHUP
-        } else if !self.buf.is_empty() {
-            POLLIN
-        } else {
-            0
-        };
-        let write = if !self.reader {
-            POLLERR
-        } else if self.buf.len() < CAPACITY {
-            POLLOUT
-        } else {
-            0
-        };
-        [read, write]
+    /// The readiness of an end that reads and/or writes.
+    fn readiness(&self, reads: bool, writes: bool) -> i16 {
+        let mut ready = 0;
+        if reads {
+            ready |= if self.writers == 0 {
+                POLLIN | POLLHUP
+            } else if !self.buf.is_empty() {
+                POLLIN
+            } else {
+                0
+            };
+        }
+        if writes {
+            ready |= if self.readers == 0 {
+                POLLERR
+            } else if self.buf.len() < CAPACITY {
+                POLLOUT
+            } else {
+                0
+            };
+        }
+        ready
     }
 }
 
 impl Shared {
     /// After a change (lock held): wake the waiters, report what changed.
-    /// New data is an event for the read end even if its readiness stays
-    /// (an edge for EPOLLET), freed room one for the write end.
+    /// New data is an event for the ends that read even if their readiness
+    /// stays (an edge for EPOLLET), freed room one for those that write.
     fn changed(&self, inner: &mut Inner, data_in: bool, room_out: bool) {
         self.seq.fetch_add(1, Ordering::Release);
         let word = &self.seq as *const AtomicU32 as u64;
         syscall(SYS_SERVER_FUTEX_WAKE, [word, i32::MAX as u64, 0, 0, 0, 0]);
-        let now = inner.readiness();
-        let event = [data_in, room_out];
-        for end in 0..2 {
-            if now[end] != inner.reported[end] || event[end] {
-                inner.reported[end] = now[end];
-                files::ready(self.ids[end], now[end]);
+        for i in 0..inner.ends.len() {
+            let (reads, writes) = (inner.ends[i].reads, inner.ends[i].writes);
+            let now = inner.readiness(reads, writes);
+            let event = (data_in && reads) || (room_out && writes);
+            let end = &mut inner.ends[i];
+            if now != end.ready || event {
+                end.ready = now;
+                files::ready(end.id, now);
             }
         }
     }
@@ -141,21 +188,24 @@ impl Shared {
 
 impl PipeEnd {
     pub fn id(&self) -> u64 {
-        self.shared.ids[self.write as usize]
+        self.id
+    }
+
+    /// The pipe's inode number.
+    pub fn ino(&self) -> u64 {
+        self.shared.ino
     }
 
     pub fn readiness(&self) -> i16 {
-        self.shared.inner.lock().readiness()[self.write as usize]
+        self.shared.inner.lock().readiness(self.reads, self.writes)
     }
 
     /// The end's placeholder is gone.
     pub fn close(&self) {
         let mut inner = self.shared.inner.lock();
-        if self.write {
-            inner.writer = false;
-        } else {
-            inner.reader = false;
-        }
+        inner.readers -= self.reads as u32;
+        inner.writers -= self.writes as u32;
+        inner.ends.retain(|e| e.id != self.id);
         self.shared.changed(&mut inner, false, false);
     }
 
@@ -180,7 +230,7 @@ impl PipeEnd {
                     drop(reader);
                     return r;
                 }
-                if !inner.writer {
+                if inner.writers == 0 {
                     return Ok(0);
                 }
                 seen = self.shared.seq.load(Ordering::Acquire);
@@ -265,7 +315,7 @@ impl PipeEnd {
                     let seen;
                     {
                         let mut inner = self.shared.inner.lock();
-                        if !inner.reader {
+                        if inner.readers == 0 {
                             drop(inner);
                             const SIGPIPE: u64 = 13;
                             syscall(SYS_SIGNAL_THREAD, [SIGPIPE, 0, 0, 0, 0, 0]);
@@ -309,7 +359,7 @@ impl PipeEnd {
     pub fn stat(&self) -> [u8; 144] {
         const S_IFIFO: u32 = 0o010000;
         let mut st = [0u8; 144];
-        st[8..16].copy_from_slice(&self.id().to_le_bytes());
+        st[8..16].copy_from_slice(&self.ino().to_le_bytes());
         st[16..24].copy_from_slice(&1u64.to_le_bytes());
         st[24..28].copy_from_slice(&(S_IFIFO | 0o600).to_le_bytes());
         st[56..64].copy_from_slice(&4096u64.to_le_bytes());
