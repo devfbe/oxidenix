@@ -80,9 +80,42 @@ pub enum Kind {
     Device(u64),
 }
 
+mod content {
+    use super::{Inode, Kind};
+    use alloc::collections::BTreeMap;
+    use alloc::string::String;
+    use alloc::sync::Arc;
+
+    /// An inode's `Kind`, whose variant never changes once made: the
+    /// inode's file type (`Inode::file_type`), read without its lock,
+    /// is taken from it at creation. Only a directory's map can be
+    /// changed in place; nothing can replace the kind (the field is
+    /// private to this module).
+    pub struct Content(Kind);
+
+    impl Content {
+        pub fn new(kind: Kind) -> Content {
+            Content(kind)
+        }
+
+        pub fn get(&self) -> &Kind {
+            &self.0
+        }
+
+        /// A directory's map, to change (None for any other kind).
+        pub fn dir_mut(&mut self) -> Option<&mut BTreeMap<String, Arc<Inode>>> {
+            match &mut self.0 {
+                Kind::Dir(m) => Some(m),
+                _ => None,
+            }
+        }
+    }
+}
+
 pub struct State {
     pub perm: u32,
-    pub kind: Kind,
+    /// Its kind and contents (the variant is fixed: `content::Content`).
+    kind: content::Content,
     /// A directory whose names only the server makes and removes (devpts):
     /// creating a name there is EACCES, removing or renaming one EPERM, as
     /// Linux's devpts (no create, unlink or rename operations).
@@ -101,6 +134,10 @@ pub struct State {
 
 pub struct Inode {
     pub ino: u64,
+    /// Its file type (`S_IFMT` bits), fixed at creation: known without the
+    /// lock (a path walk asks each name's). It stays right because the
+    /// kind's variant cannot change (`content::Content`).
+    file_type: u32,
     pub state: Mutex<State>,
     /// Taken by O_APPEND writes: finding the end and writing there is one
     /// step for every appender.
@@ -121,8 +158,15 @@ pub fn new_root() -> Arc<Inode> {
 
 impl Inode {
     fn new(kind: Kind, perm: u32) -> Arc<Inode> {
-        let state = State { perm, kind, sealed: false, times: Times::new(now()), writers: 0, removed: false, link: None };
-        Arc::new(Inode { ino: NEXT_INO.fetch_add(1, Ordering::Relaxed), state: Mutex::new(state), append: Mutex::new(()), opens: AtomicUsize::new(0) })
+        let file_type = kind_bits(&kind);
+        let state = State { perm, kind: content::Content::new(kind), sealed: false, times: Times::new(now()), writers: 0, removed: false, link: None };
+        Arc::new(Inode {
+            ino: NEXT_INO.fetch_add(1, Ordering::Relaxed),
+            file_type,
+            state: Mutex::new(state),
+            append: Mutex::new(()),
+            opens: AtomicUsize::new(0),
+        })
     }
 
     /// The directory it is in and its name there (None: removed, or the
@@ -137,65 +181,62 @@ impl Inode {
     }
 
     pub fn mode(&self) -> u32 {
-        let st = self.state.lock();
-        kind_bits(&st.kind) | st.perm
+        self.file_type | self.state.lock().perm
+    }
+
+    /// Its file type (`S_IFMT` bits).
+    pub fn file_type(&self) -> u32 {
+        self.file_type
     }
 
     pub fn is_dir(&self) -> bool {
-        matches!(self.state.lock().kind, Kind::Dir(_))
+        self.file_type == vfs::S_IFDIR
     }
 
     /// The file object's handle (EISDIR for a directory, EINVAL else).
     pub fn object(&self) -> Result<u64, i64> {
-        match &self.state.lock().kind {
+        match self.state.lock().kind.get() {
             Kind::File(o) => Ok(o.handle()),
             Kind::Dir(_) => Err(EISDIR),
             Kind::Symlink(_) | Kind::Socket | Kind::Device(_) => Err(EINVAL),
         }
     }
 
-    /// A device's number (None: not a device).
-    pub fn rdev(&self) -> Option<u64> {
-        match self.state.lock().kind {
-            Kind::Device(rdev) => Some(rdev),
-            _ => None,
-        }
-    }
-
     pub fn lookup(&self, name: &str) -> Result<Arc<Inode>, i64> {
-        match &self.state.lock().kind {
+        match self.state.lock().kind.get() {
             Kind::Dir(m) => m.get(name).cloned().ok_or(ENOENT),
             _ => Err(ENOTDIR),
         }
     }
 
     pub fn readlink(&self) -> Result<String, i64> {
-        match &self.state.lock().kind {
+        match self.state.lock().kind.get() {
             Kind::Symlink(t) => Ok(t.clone()),
             _ => Err(EINVAL),
         }
     }
 
     pub fn size(&self) -> u64 {
-        match &self.state.lock().kind {
-            Kind::File(o) => syscall(SYS_MO_FILE_SIZE, [o.handle(), 0, 0, 0, 0, 0]).max(0) as u64,
-            Kind::Symlink(t) => t.len() as u64,
-            Kind::Dir(m) => m.len() as u64,
-            Kind::Socket | Kind::Device(_) => 0,
-        }
+        stat_size(self.state.lock().kind.get())
     }
 
-    /// Its status: every field of `struct stat`, and the birth time.
+    /// Its status: every field of `struct stat`, and the birth time (one
+    /// snapshot, under one lock).
     pub fn status(&self) -> Stat {
-        let mode = self.mode();
-        let size = self.size();
-        let times = self.state.lock().times;
+        let (perm, size, times, rdev) = {
+            let st = self.state.lock();
+            let rdev = match st.kind.get() {
+                Kind::Device(rdev) => *rdev,
+                _ => 0,
+            };
+            (st.perm, stat_size(st.kind.get()), st.times, rdev)
+        };
         Stat {
             dev: DEV,
             ino: self.ino,
-            nlink: if mode & vfs::S_IFMT == vfs::S_IFDIR { 2 } else { 1 },
-            mode,
-            rdev: self.rdev().unwrap_or(0),
+            nlink: if self.file_type == vfs::S_IFDIR { 2 } else { 1 },
+            mode: self.file_type | perm,
+            rdev,
             size,
             blksize: 4096,
             blocks: size.div_ceil(512),
@@ -236,14 +277,14 @@ impl Inode {
     /// Directory entries (name, inode number, dirent type), "." and ".."
     /// first.
     pub fn list(&self) -> Result<Vec<(String, u64, u8)>, i64> {
-        let children: Vec<(String, Arc<Inode>)> = match &self.state.lock().kind {
+        let children: Vec<(String, Arc<Inode>)> = match self.state.lock().kind.get() {
             Kind::Dir(m) => m.iter().map(|(n, c)| (n.clone(), c.clone())).collect(),
             _ => return Err(ENOTDIR),
         };
         let mut out = Vec::with_capacity(children.len() + 2);
         out.push((String::from("."), self.ino, 4));
         out.push((String::from(".."), self.ino, 4));
-        out.extend(children.into_iter().map(|(n, c)| (n, c.ino, dtype(c.mode()))));
+        out.extend(children.into_iter().map(|(n, c)| (n, c.ino, dtype(c.file_type()))));
         Ok(out)
     }
 
@@ -313,7 +354,7 @@ impl Inode {
     pub fn remove_device(&self, name: &str) {
         let _nesting = RENAME.lock();
         let mut st = self.state.lock();
-        let Kind::Dir(m) = &mut st.kind else { return };
+        let Some(m) = st.kind.dir_mut() else { return };
         let Some(child) = m.remove(name) else { return };
         let now = now();
         {
@@ -341,14 +382,14 @@ impl Inode {
         if st.sealed && !server {
             return Err(EACCES);
         }
-        match &mut st.kind {
-            Kind::Dir(m) if m.contains_key(name) => Err(EEXIST),
-            Kind::Dir(m) => {
+        match st.kind.dir_mut() {
+            Some(m) if m.contains_key(name) => Err(EEXIST),
+            Some(m) => {
                 m.insert(String::from(name), inode);
                 st.times.modified(now());
                 Ok(())
             }
-            _ => Err(ENOTDIR),
+            None => Err(ENOTDIR),
         }
     }
 
@@ -362,10 +403,10 @@ impl Inode {
         if st.sealed {
             return Err(EPERM);
         }
-        let Kind::Dir(m) = &mut st.kind else { return Err(ENOTDIR) };
+        let Some(m) = st.kind.dir_mut() else { return Err(ENOTDIR) };
         let child = m.get(name).ok_or(ENOENT)?.clone();
         let mut cst = child.state.lock();
-        let child_dir = match &cst.kind {
+        let child_dir = match cst.kind.get() {
             Kind::Dir(c) => Some(c.is_empty()),
             _ => None,
         };
@@ -533,10 +574,7 @@ pub fn rename(odir: &Arc<Inode>, oname: &str, ndir: &Arc<Inode>, nname: &str) ->
 }
 
 fn dir_map(st: &mut State) -> Result<&mut BTreeMap<String, Arc<Inode>>, i64> {
-    match &mut st.kind {
-        Kind::Dir(m) => Ok(m),
-        _ => Err(ENOTDIR),
-    }
+    st.kind.dir_mut().ok_or(ENOTDIR)
 }
 
 /// The move itself, under both directories' locks: `om` is the old
@@ -569,7 +607,7 @@ fn move_entry(
             return Err(if node_dir { ENOTEMPTY } else { EISDIR });
         }
         let mut est = existing.state.lock();
-        let existing_dir = match &est.kind {
+        let existing_dir = match est.kind.get() {
             Kind::Dir(m) => Some(m.is_empty()),
             _ => None,
         };
@@ -600,7 +638,7 @@ fn contains(dir: &Arc<Inode>, target: &Arc<Inode>) -> bool {
         if Arc::ptr_eq(&d, target) {
             return true;
         }
-        if let Kind::Dir(m) = &d.state.lock().kind {
+        if let Kind::Dir(m) = d.state.lock().kind.get() {
             stack.extend(m.values().cloned());
         }
     }
@@ -615,6 +653,16 @@ fn check_name(name: &str) -> Result<(), i64> {
         return Err(EINVAL);
     }
     Ok(())
+}
+
+/// The size `struct stat` reports for an inode of `kind`.
+fn stat_size(kind: &Kind) -> u64 {
+    match kind {
+        Kind::File(o) => syscall(SYS_MO_FILE_SIZE, [o.handle(), 0, 0, 0, 0, 0]).max(0) as u64,
+        Kind::Symlink(t) => t.len() as u64,
+        Kind::Dir(m) => m.len() as u64,
+        Kind::Socket | Kind::Device(_) => 0,
+    }
 }
 
 fn kind_bits(kind: &Kind) -> u32 {

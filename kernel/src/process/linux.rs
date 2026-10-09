@@ -1051,6 +1051,8 @@ impl Drop for LinuxThread {
         for file in core::mem::take(&mut self.pinned) {
             crate::fs::file::release(file);
         }
+        // The slot goes back only now, with the task that owns this
+        // thread (`Task::server_locks` points into its State page).
         self.instance.release(self.slot);
     }
 }
