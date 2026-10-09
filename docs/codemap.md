@@ -291,6 +291,7 @@ kernel that handle them.
 - `docs/benchmarks/2026-10-08-dbf09c9-r5-quiet.md` Benchmark dbf09c9 (r5-quiet)
 - `docs/benchmarks/2026-10-08-fae8292-pcid-quiet.md` Benchmark fae8292 (pcid-quiet)
 - `docs/benchmarks/2026-10-08-linux-6.18.54-quiet.md` Benchmark Linux 6.18.54 (comparison, oxidenix at 92bb179) (quiet)
+- `docs/benchmarks/2026-10-09-802b396-quiet.md` Benchmark 802b396 (quiet)
 - `docs/benchmarks/README.md` Benchmarks
 - `docs/decisions/0001-linux-abi-in-a-user-space-server.md` ADR 0001: The Linux ABI moves out of the kernel, into a server in restricted mode
 - `docs/decisions/0002-one-linux-server-per-process-tree.md` ADR 0002: One Linux server instance per process tree
