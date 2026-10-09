@@ -13,6 +13,7 @@
 
 extern crate alloc;
 
+pub mod admission;
 pub mod render;
 
 /// What `proc_query(op, arg, buf, len)` returns in `buf`:

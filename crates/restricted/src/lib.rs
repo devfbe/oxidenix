@@ -774,9 +774,10 @@ pub const SIGNAL_PENDING: u64 = 4;
 /// (`procproto`: `QUERY_SYSTEM`, `QUERY_PIDS`, `QUERY_PROCESS`,
 /// `QUERY_CMDLINE`, `QUERY_EXE`, `QUERY_THREADS`), into the server's
 /// memory; ERANGE if the answer does not fit (the lists of ids take what
-/// fits), ESRCH for no such process. It sees every process of the kernel,
-/// as Linux's /proc does in the initial pid namespace; with R8 the server
-/// answers from its own process table.
+/// fits), ESRCH for no such process. It sees the processes of the caller's
+/// instance only (as a pid namespace would): another tree's, the kernel's
+/// servers' and the kernel's own are ESRCH and not listed. With R8 the
+/// server answers from its own process table.
 pub const SYS_PROC_INFO: u64 = 1116;
 /// `kfd_list(from, buf, cap) -> n`: the calling process's open descriptors
 /// from `from` on, in ascending order, as up to `cap` u32s at `buf`; the
@@ -804,6 +805,12 @@ pub const TEST_CHANNEL: u64 = 1514;
 /// checks that diskfs sleeps), 9 their completions taken. 0 if
 /// every check held, else the negative number of the first that failed.
 pub const TEST_DISKRING: u64 = 1515;
+/// `(name, len) -> ms`: the CPU time (user and system, in milliseconds) of
+/// the running process of the kernel's server `name` (ESRCH if none), in
+/// test mode only (ENOSYS otherwise); a program's call with a C string
+/// `name` is the server's to pass on. The self-tests measure a server's
+/// idleness with it: /proc shows only the caller's instance's processes.
+pub const TEST_SERVER_TICKS: u64 = 1518;
 /// `(scenario)`: the server checks the kernel's interface of its page cache
 /// (`SYS_MO_CREATE_CACHED`) on a file of /data: 1 a failed fill beyond the
 /// end of the file or over 256 pages leaves no trace (the file grown later

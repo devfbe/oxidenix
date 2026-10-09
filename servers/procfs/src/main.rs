@@ -17,6 +17,13 @@
 //! One thread, one event loop, as diskfs's: `ipc_receive` brings channel
 //! offers and doorbells; every request is answered at once (nothing here
 //! waits), a channel's only while its completion ring has room.
+//!
+//! procfs serves every instance, so what one can make it hold is bounded
+//! and charged before it is taken (`procproto::admission`): channels per
+//! instance (the kernel's word for the instance, in the offer), mapped
+//! grants per channel, the memory of one answer. And it serves no
+//! instance's processes: the kernel gives it the system-wide record only
+//! (`proc_query`), each instance's /proc/<pid> is its own server's.
 
 #![no_std]
 #![no_main]
@@ -32,6 +39,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::AtomicU32;
 use fsring::errno::*;
 use fsring::{Buf, Completion, Request, Stat, Usage};
+use procproto::admission::{Channels, Grants, MAX_CHANNELS, MAX_RESULT};
 use ring::channel::{Header, Layout, Offer};
 use ring::{Consumer, Producer, Ring, Wait};
 
@@ -40,11 +48,6 @@ oxrt::entry!(main);
 const N: usize = fsring::SLOTS as usize;
 const PAGE: u64 = 4096;
 const EROFS: i64 = 30;
-/// Channels attached at once (one per Linux server instance; a client
-/// whose channel goes makes a new one).
-const MAX_CHANNELS: usize = 64;
-/// Grants of a channel procfs keeps mapped (`FORGET` lets go).
-const MAX_GRANTS: usize = 64;
 /// Requests taken from one channel per round, for fairness.
 const TAKE_PER_ROUND: usize = 16;
 /// Rounds without a request before the loop sleeps: a client reading
@@ -80,23 +83,30 @@ struct Chan {
     requests: Consumer<'static, N>,
     completions: Producer<'static, N>,
     grants: BTreeMap<u32, Grant>,
+    /// What its mapped grants take of procfs (`admission`).
+    budget: Grants,
 }
 
 struct Service {
+    /// Indexed by the slots `admission` gives out.
     chans: Vec<Option<Chan>>,
+    slots: Channels,
     rr: usize,
 }
 
 impl Chan {
-    /// The grant `id`, mapped now if it is new.
+    /// The grant `id`, mapped now if it is new (within the channel's
+    /// budget: a grant beyond it is unmapped again, ENOMEM).
     fn grant(&mut self, id: u32) -> Result<Grant, i64> {
         if let Some(g) = self.grants.get(&id) {
             return Ok(*g);
         }
-        if self.grants.len() >= MAX_GRANTS {
-            return Err(ENOMEM);
-        }
+        self.budget.may_map()?;
         let (addr, pages, writable) = oxrt::grant_map(self.id, id).map_err(|e| if e == -ENOENT { EBADF } else { -e })?;
+        if let Err(e) = self.budget.charge(pages) {
+            let _ = oxrt::munmap(addr, (pages * PAGE) as usize);
+            return Err(e);
+        }
         let g = Grant { addr, pages, writable };
         self.grants.insert(id, g);
         Ok(g)
@@ -105,6 +115,7 @@ impl Chan {
     fn forget(&mut self, id: u32) {
         if let Some(g) = self.grants.remove(&id) {
             let _ = oxrt::munmap(g.addr, (g.pages * PAGE) as usize);
+            self.budget.uncharge(g.pages);
         }
     }
 
@@ -166,7 +177,9 @@ impl Chan {
             }
             Request::Readdir { dir, cursor, buf } => {
                 let all = tree::entries(dir)?;
-                let mut out = vec![0u8; buf.len as usize];
+                // At most MAX_RESULT bytes of procfs's memory, whatever the
+                // buffer (the listing goes on at the cursor).
+                let mut out = vec![0u8; (buf.len as usize).min(MAX_RESULT)];
                 let (mut used, mut next) = (0, cursor as usize);
                 while let Some((name, ino, kind)) = all.get(next) {
                     match fsring::put_dirent(&mut out[used..], *ino, *kind, name.as_bytes()) {
@@ -234,10 +247,18 @@ impl Service {
         if offer.slots != fsring::SLOTS || offer.shared != 0 {
             return -EINVAL;
         }
-        let Some(slot) = self.chans.iter().position(Option::is_none) else { return -ENOSPC };
+        // Charged before anything is taken: the instance's share of the
+        // channels (the kernel's word for which instance it is).
+        let slot = match self.slots.admit(offer.instance) {
+            Ok(slot) => slot,
+            Err(e) => return -e,
+        };
         let base = match oxrt::chan_attach(offer.channel) {
             Ok(base) => base,
-            Err(e) => return e,
+            Err(e) => {
+                self.slots.release(slot);
+                return e;
+            }
         };
         let layout = Layout::new(fsring::SLOTS).expect("a valid slot count");
         // Mapped until chan_detach, which comes after the Chan is dropped.
@@ -248,6 +269,7 @@ impl Service {
             requests: Ring::new(sub).consumer(),
             completions: Ring::new(comp).producer(),
             grants: BTreeMap::new(),
+            budget: Grants::default(),
         });
         0
     }
@@ -266,6 +288,7 @@ impl Service {
                     let _ = oxrt::munmap(g.addr, (g.pages * PAGE) as usize);
                 }
                 let _ = oxrt::chan_detach(chan.id);
+                self.slots.release(c);
                 any = true;
                 continue;
             }
@@ -334,7 +357,7 @@ fn main(_args: Vec<&'static str>) -> i32 {
         oxrt::println!("procfs: cannot register: {}", e);
         return 1;
     }
-    let mut service = Service { chans: (0..MAX_CHANNELS).map(|_| None).collect(), rr: 0 };
+    let mut service = Service { chans: (0..MAX_CHANNELS).map(|_| None).collect(), slots: Channels::default(), rr: 0 };
     let mut message = vec![0u8; MAX_MESSAGE];
     loop {
         let sleep = service.prepare_sleep();
