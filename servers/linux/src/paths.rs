@@ -25,6 +25,8 @@ use restricted::*;
 use vfs::path::join;
 use vfs::stat::SetTime;
 
+const EPERM: i64 = 1;
+const EACCES: i64 = 13;
 const EEXIST: i64 = 17;
 const ERANGE: i64 = 34;
 const ELOOP: i64 = 40;
@@ -179,6 +181,9 @@ fn fd_node_of(fd: u64) -> Result<(Node, String, bool), i64> {
     if let Some(f) = files::data_of(fd) {
         return Ok((Node::Data(f.inode.clone()), f.path.clone(), false));
     }
+    if let Some(f) = files::proc_of(fd) {
+        return Ok((Node::Proc(f.node.clone()), f.path.clone(), false));
+    }
     // Terminals, null and zero, O_PATH: the node they were opened by.
     if let Some(o) = files::origin_of(fd) {
         return Ok((o.node()?, o.path, o.o_path));
@@ -234,6 +239,10 @@ fn create(dir: &Node, name: &str, kind: u64, perm: u32) -> Result<Node, i64> {
             let new = if kind == NEW_DIR { datafs::New::Dir } else { datafs::New::File };
             datafs::create(d, name, new, perm).map(Node::Data)
         }
+        // /proc and /sys make no names (Linux: no create, EACCES; no
+        // mkdir, EPERM).
+        Node::Proc(p) if crate::procfs::lookup(p, name).is_ok() => Err(EEXIST),
+        Node::Proc(_) => Err(if kind == NEW_DIR { EPERM } else { EACCES }),
     }
 }
 
@@ -250,13 +259,15 @@ fn exec_target(addr: u64) -> Result<(), i64> {
             let held = match &r.node {
                 Node::Tmp(t) => tmpfile::exec_hold(t)?,
                 Node::Data(d) => datafile::exec_hold(d)?,
-                Node::Kernel(_) => unreachable!("matched above"),
+                Node::Kernel(_) | Node::Proc(_) => unreachable!("matched around"),
             };
             let set = syscall(SYS_EXEC_TARGET, [held, path.as_ptr() as u64, path.len() as u64, 0, 0, 0]);
             // The target keeps the hold now (or it goes, if refused).
             syscall(SYS_HANDLE_CLOSE, [held, 0, 0, 0, 0, 0]);
             check(set)?;
         }
+        // Nothing of /proc and /sys may run (no file is executable).
+        Node::Proc(_) => return Err(EACCES),
     }
     Ok(())
 }
@@ -301,8 +312,11 @@ fn openat(dirfd: u64, addr: u64, flags: u32, mode: u32) -> Result<i64, i64> {
             Err(e) => return Err(e),
         }
     };
-    // Opening a symlink itself would hand out its target bytes as a file.
-    if nofollow && resolved.mode & vfs::S_IFMT == vfs::S_IFLNK {
+    // Opening a symlink itself would hand out its target bytes as a file:
+    // one named with O_NOFOLLOW, or one a magic link led to (an O_PATH
+    // descriptor of a symlink, /proc/self/fd/N), is ELOOP (O_PATH alone
+    // names it, above).
+    if resolved.mode & vfs::S_IFMT == vfs::S_IFLNK {
         return Err(ELOOP);
     }
     let abs = join(&resolved.path);
@@ -336,6 +350,7 @@ fn openat(dirfd: u64, addr: u64, flags: u32, mode: u32) -> Result<i64, i64> {
         Node::Kernel(k) => check(syscall(SYS_INODE_OPEN, [k.handle(), flags as u64, abs.as_ptr() as u64, abs.len() as u64, 0, 0])),
         Node::Tmp(t) => tmpfile::open(t, flags, abs),
         Node::Data(d) => datafile::open(d, flags, abs),
+        Node::Proc(p) => crate::procfile::open(p, flags, abs),
     }
 }
 
@@ -439,6 +454,12 @@ fn renameat(odirfd: u64, oaddr: u64, ndirfd: u64, naddr: u64) -> Result<i64, i64
             let moved = m.and_then(datafs::cached).map(|i| (inotify::Key::data(&i), i.kind == vfs::S_IFDIR));
             (moved, gone.map(Gone::Data))
         }
+        // Nothing of /proc and /sys can be renamed (Linux: EPERM), within
+        // one of them; across them it is another filesystem.
+        (Node::Proc(o), Node::Proc(n)) if crate::procfs::same_fs(o, n) => {
+            crate::procfs::lookup(o, &oname)?;
+            return Err(EPERM);
+        }
         _ => return Err(EXDEV),
     };
     if let Some((key, is_dir)) = moved {
@@ -526,6 +547,11 @@ fn unlinkat(dirfd: u64, addr: u64, flags: u64) -> Result<i64, i64> {
         }
         Node::Tmp(d) => Some(Gone::Tmp(d.unlink(&name, dir_only)?)),
         Node::Data(d) => datafs::unlink(d, &name, dir_only)?.map(Gone::Data),
+        // Nothing of /proc and /sys can be removed (Linux: EPERM).
+        Node::Proc(d) => {
+            crate::procfs::lookup(d, &name)?;
+            return Err(EPERM);
+        }
     };
     // As Linux: the link count's IN_ATTRIB, the name's IN_DELETE, then
     // IN_DELETE_SELF once the inode goes.
@@ -551,6 +577,8 @@ fn symlinkat(target: u64, dirfd: u64, addr: u64) -> Result<i64, i64> {
         )),
         Node::Tmp(d) => d.symlink(&name, target).map(|_| 0),
         Node::Data(d) => datafs::create(d, &name, datafs::New::Symlink(&target), 0o777).map(|_| 0),
+        Node::Proc(d) if crate::procfs::lookup(d, &name).is_ok() => Err(EEXIST),
+        Node::Proc(_) => Err(EPERM),
     }?;
     inotify::child(&dir.node, inotify::IN_CREATE, &name, false);
     Ok(0)
@@ -588,6 +616,9 @@ fn chmodat(dirfd: u64, addr: u64, mode: u64) -> Result<i64, i64> {
 fn chmod_node(node: &Node, mode: u64) -> Result<i64, i64> {
     match node {
         Node::Kernel(k) => check(syscall(SYS_INODE_CHMOD, [k.handle(), mode, 0, 0, 0, 0])),
+        // The modes of /proc's and /sys's files are what they are (Linux's
+        // proc_setattr: EPERM).
+        Node::Proc(_) => Err(EPERM),
         Node::Tmp(t) => {
             t.set_perm(mode as u32);
             Ok(0)
@@ -661,14 +692,14 @@ fn fchmodat2(dirfd: u64, addr: u64, mode: u64, flags: u64) -> Result<i64, i64> {
     chmod_target(Some((r.node, join(&r.path))), mode)
 }
 
-/// Sets the times of a target. The kernel's tree (/dev, /proc, /sys)
-/// keeps no times that change: the server keeps them
-/// (`namespace::set_kernel_times`). An anonymous inode's (a pipe's, a
+/// Sets the times of a target. The kernel's tree (/dev), /proc and /sys
+/// keep no times that change: the server keeps them
+/// (`namespace::set_pseudo_times`). An anonymous inode's (a pipe's, a
 /// socket's) are not kept: nothing to do.
 fn set_times(target: Option<(Node, String)>, atime: SetTime, mtime: SetTime) -> Result<i64, i64> {
     let Some((node, path)) = target else { return Ok(0) };
     match &node {
-        Node::Kernel(_) => crate::namespace::set_kernel_times(&node.stat()?, atime, mtime),
+        Node::Kernel(_) | Node::Proc(_) => crate::namespace::set_pseudo_times(&node.stat()?, atime, mtime),
         Node::Tmp(t) => t.set_times(atime, mtime),
         Node::Data(d) => datafs::set_times(d, atime, mtime)?,
     }
@@ -778,6 +809,9 @@ fn truncate(node: &Node, len: u64) -> Result<i64, i64> {
             datafs::put_write(d);
             r
         }
+        // As open for writing: /proc's and /sys's files are read-only.
+        Node::Proc(p) if crate::procfs::is_dir(p) => Err(datafs::EISDIR),
+        Node::Proc(_) => Err(EACCES),
     }
 }
 
@@ -797,6 +831,10 @@ pub fn statfs_node(node: &Node, buf: u64) -> Result<i64, i64> {
         Node::Tmp(_) => tmpfile::statfs(buf),
         Node::Data(_) => {
             usercopy::to_program(buf, &datafs::statfs()?)?;
+            Ok(0)
+        }
+        Node::Proc(p) => {
+            usercopy::to_program(buf, &crate::procfs::statfs(p))?;
             Ok(0)
         }
     }

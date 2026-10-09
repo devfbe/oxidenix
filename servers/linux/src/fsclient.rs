@@ -1,29 +1,31 @@
 //! The server's end of the file protocol (`fsring`, docs/design/io-rings.md)
-//! to diskfs: one channel for the instance, shared by every thread of the
-//! tree's processes and by the pager thread. Its slots, the reaper and the
-//! handling of a hostile or dead diskfs are `ringclient`'s: a dead client
-//! (diskfs gone, or a request unanswered for a minute) fails its requests
-//! with EIO, and `datafs` makes a new one (diskfs is started again if it
+//! to a filesystem service: diskfs for /data (`datafs`), procfs for /proc's
+//! system-wide files and /sys (`procfs`). One channel per service for the
+//! instance, shared by every thread of the tree's processes (and, for
+//! diskfs, by the pager thread). Its slots, the reaper and the handling of
+//! a hostile or dead service are `ringclient`'s: a dead client (the service
+//! gone, or a request unanswered for a minute) fails its requests with
+//! EIO, and its owner makes a new one (the service is started again if it
 //! died).
 //!
-//! **Scratch.** Names, directory entries, link targets and O_DIRECT reads
-//! travel in a scratch buffer: a memory object mapped into the server's
-//! region (`SYS_MO_MAP_SERVER`) and granted to diskfs once, handed out in
-//! page runs (`scratch`).
+//! **Scratch.** Names, directory entries, link targets, generated file
+//! contents and O_DIRECT reads travel in a scratch buffer: a memory object
+//! mapped into the server's region (`SYS_MO_MAP_SERVER`) and granted to the
+//! service once, handed out in page runs (`scratch`).
 
 use crate::ringclient::{self, futex_wait, futex_wake, RingClient};
 use crate::sync::Mutex;
 use crate::syscall;
 use core::ops::Deref;
 use core::sync::atomic::{AtomicU32, Ordering};
-use fsring::{Buf, Completion, SERVICE};
+use fsring::{Buf, Completion};
 use restricted::*;
 
 pub use crate::ringclient::Next;
 
 const N: usize = fsring::SLOTS as usize;
 pub const PAGE: u64 = 4096;
-/// Pages of the scratch buffer.
+/// The most pages a scratch buffer has (one bit each in a u64).
 pub const SCRATCH_PAGES: u64 = 64;
 
 pub const EIO: i64 = ringclient::EIO;
@@ -49,32 +51,43 @@ struct ScratchArea {
     object: u64,
     addr: u64,
     grant: u32,
+    pages: u64,
     /// One bit per page in use.
     used: Mutex<u64>,
     freed: AtomicU32,
 }
 
+/// The bits of `pages` pages from bit 0.
+fn mask(pages: u64) -> u64 {
+    if pages >= 64 { u64::MAX } else { (1u64 << pages) - 1 }
+}
+
 impl Client {
-    /// A new channel to diskfs (started again if it died), connected, with
-    /// its scratch buffer mapped and granted.
-    pub fn connect(generation: u64) -> Result<Client, i64> {
-        let ring = RingClient::connect(SERVICE, 0)?;
-        let scratch = ScratchArea::new(ring.handle())?;
+    /// A new channel to `service` (started again if it died), connected,
+    /// with a scratch buffer of `scratch_pages` pages (at most
+    /// `SCRATCH_PAGES`) mapped and granted.
+    pub fn connect(service: &str, generation: u64, scratch_pages: u64) -> Result<Client, i64> {
+        let ring = RingClient::connect(service, 0)?;
+        let scratch = ScratchArea::new(ring.handle(), scratch_pages.clamp(1, SCRATCH_PAGES))?;
         Ok(Client { ring, generation, scratch })
     }
 
-    /// `pages` pages of the scratch buffer (at most `SCRATCH_PAGES`), waiting
+    /// The scratch buffer's size in pages.
+    pub fn scratch_pages(&self) -> u64 {
+        self.scratch.pages
+    }
+
+    /// `pages` pages of the scratch buffer (at most all of them), waiting
     /// until they are free.
     pub fn scratch(&self, pages: u64) -> Scratch<'_> {
-        let pages = pages.clamp(1, SCRATCH_PAGES);
-        let mask = if pages == 64 { u64::MAX } else { (1u64 << pages) - 1 };
         let area = &self.scratch;
+        let pages = pages.clamp(1, area.pages);
         loop {
             let seen = area.freed.load(Ordering::Acquire);
             {
                 let mut used = area.used.lock();
-                if let Some(first) = (0..=SCRATCH_PAGES - pages).find(|&f| *used & (mask << f) == 0) {
-                    *used |= mask << first;
+                if let Some(first) = (0..=area.pages - pages).find(|&f| *used & (mask(pages) << f) == 0) {
+                    *used |= mask(pages) << first;
                     return Scratch { client: self, first, pages };
                 }
             }
@@ -84,24 +97,24 @@ impl Client {
 }
 
 impl ScratchArea {
-    fn new(channel: u64) -> Result<ScratchArea, i64> {
-        let object = syscall(SYS_MO_CREATE, [SCRATCH_PAGES, 0, 0, 0, 0, 0]);
+    fn new(channel: u64, pages: u64) -> Result<ScratchArea, i64> {
+        let object = syscall(SYS_MO_CREATE, [pages, 0, 0, 0, 0, 0]);
         if object < 0 {
             return Err(-object);
         }
         let object = object as u64;
-        let addr = syscall(SYS_MO_MAP_SERVER, [object, SCRATCH_PAGES, 0, 0, 0, 0]);
+        let addr = syscall(SYS_MO_MAP_SERVER, [object, pages, 0, 0, 0, 0]);
         if addr < 0 {
             syscall(SYS_HANDLE_CLOSE, [object, 0, 0, 0, 0, 0]);
             return Err(-addr);
         }
-        let grant = syscall(SYS_GRANT, [channel, object, 0, SCRATCH_PAGES, GRANT_WRITE, 0]);
+        let grant = syscall(SYS_GRANT, [channel, object, 0, pages, GRANT_WRITE, 0]);
         if grant <= 0 {
             syscall(SYS_MO_UNMAP_SERVER, [addr as u64, 0, 0, 0, 0, 0]);
             syscall(SYS_HANDLE_CLOSE, [object, 0, 0, 0, 0, 0]);
             return Err(if grant < 0 { -grant } else { EIO });
         }
-        Ok(ScratchArea { object, addr: addr as u64, grant: grant as u32, used: Mutex::new(0), freed: AtomicU32::new(0) })
+        Ok(ScratchArea { object, addr: addr as u64, grant: grant as u32, pages, used: Mutex::new(0), freed: AtomicU32::new(0) })
     }
 }
 
@@ -112,9 +125,9 @@ impl Drop for ScratchArea {
     }
 }
 
-/// Pages of the scratch buffer, free again when dropped. diskfs may write
-/// them at any time while it has the grant: what is read back is copied
-/// out once and checked.
+/// Pages of the scratch buffer, free again when dropped. The service may
+/// write them at any time while it has the grant: what is read back is
+/// copied out once and checked.
 pub struct Scratch<'a> {
     client: &'a Client,
     first: u64,
@@ -154,14 +167,13 @@ impl Scratch<'_> {
 impl Drop for Scratch<'_> {
     fn drop(&mut self) {
         let area = &self.client.scratch;
-        let mask = if self.pages == 64 { u64::MAX } else { (1u64 << self.pages) - 1 };
-        *area.used.lock() &= !(mask << self.first);
+        *area.used.lock() &= !(mask(self.pages) << self.first);
         area.freed.fetch_add(1, Ordering::Release);
         futex_wake(&area.freed, u32::MAX as u64);
     }
 }
 
-/// `ringclient::run` on diskfs's channel.
+/// `ringclient::run` on a file service's channel.
 pub fn run<T>(client: &Client, next: impl FnMut() -> Next<T>, done: impl FnMut(T, Completion) -> Option<(ring::Desc, T)>) {
     ringclient::run(&client.ring, next, done)
 }

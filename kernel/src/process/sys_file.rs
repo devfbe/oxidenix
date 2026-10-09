@@ -754,28 +754,19 @@ pub fn utimensat(dirfd: u64, path: u64, flags: u64) -> SysResult {
     resolve_at(dirfd, &path, flags & AT_SYMLINK_NOFOLLOW == 0).map(|_| 0)
 }
 
-/// statfs/fstatfs: a server's filesystem reports its real usage, everything else
-/// the in-memory filesystem (tmpfs) and its size limit.
+/// statfs/fstatfs: the in-memory filesystem (tmpfs) and its size limit.
 fn write_statfs(inode: &Inode, buf: u64) -> SysResult {
     uaccess::write(buf, statfs_words(inode))?;
     Ok(0)
 }
 
-/// The `struct statfs` of an inode's filesystem.
-pub fn statfs_words(inode: &Inode) -> [u64; 15] {
-    const EXT2_MAGIC: u64 = 0xef53;
+/// The `struct statfs` of an inode's filesystem: the kernel has one, its
+/// tmpfs (the Linux server's tmpfs files are charged to the same limit).
+pub fn statfs_words(_inode: &Inode) -> [u64; 15] {
     const TMPFS_MAGIC: u64 = 0x0102_1994;
-    let (kind, bsize, blocks, free, files, ffree) = match inode.filesystem() {
-        Some(fs) => {
-            let (bs, blocks, free, inodes, free_inodes) = fs.usage();
-            (EXT2_MAGIC, bs, blocks, free, inodes, free_inodes)
-        }
-        None => {
-            let (used, limit) = fs::cache::tmpfs_usage();
-            (TMPFS_MAGIC, 4096, limit, limit.saturating_sub(used), 0, 0)
-        }
-    };
-    [kind, bsize, blocks, free, free, files, ffree, 0, fs::NAME_MAX as u64, bsize, 0, 0, 0, 0, 0]
+    let (used, limit) = fs::cache::tmpfs_usage();
+    let (bsize, blocks, free) = (4096, limit, limit.saturating_sub(used));
+    [TMPFS_MAGIC, bsize, blocks, free, free, 0, 0, 0, fs::NAME_MAX as u64, bsize, 0, 0, 0, 0, 0]
 }
 
 pub fn statfs(path: u64, buf: u64) -> SysResult {

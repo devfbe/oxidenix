@@ -321,7 +321,7 @@ pub(super) fn dispatch_linux(f: &mut Frame) {
         // The service's end of a channel (see `channel`, oxrt::sys).
         1068 => super::channel::attach(a0),
         1069 => super::channel::detach(a0),
-        1070 => super::channel::grant_map(a0, a1, a2),
+        1070 => super::channel::grant_map(a0, a1, a2, a3),
         1071 => super::channel::grant_dma(a0, a1, a2),
         1072 => super::channel::grant_dma_unmap(a0, a1),
         1073 => super::channel::watch(a0, a1),

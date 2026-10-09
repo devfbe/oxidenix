@@ -1,9 +1,12 @@
-//! In-memory filesystem (tmpfs-like), populated from the initramfs at boot.
+//! In-memory filesystem (tmpfs-like), populated from the initramfs at boot:
+//! the kernel's tree, of which the Linux server's namespace still mounts
+//! `/dev` (the server's own filesystems serve everything else: its tmpfs,
+//! `/data` from diskfs and `/proc` and `/sys` from procfs over the I/O
+//! rings).
 
 pub mod cache;
 pub mod cpio;
 pub mod file;
-pub mod remote;
 
 use crate::process::errno::*;
 use alloc::collections::{BTreeMap, VecDeque};
@@ -86,14 +89,6 @@ pub enum Node {
     File(Arc<cache::PageCache>),
     Symlink(String),
     Device(Device),
-    /// An inode served by a user-space filesystem server (procfs).
-    Disk(DiskRef),
-}
-
-#[derive(Clone)]
-pub struct DiskRef {
-    pub fs: Arc<remote::RemoteFs>,
-    pub ino: u32,
 }
 
 pub struct InodeStat {
@@ -118,8 +113,6 @@ pub enum NewNode {
 /// a name of up to `NAME_MAX` bytes.
 const INODE_COST: usize = 512;
 pub const NAME_MAX: usize = 255;
-/// Disk inode numbers are offset so they never collide with memory inodes.
-const DISK_INO_BASE: u64 = 1 << 32;
 
 pub struct Inode {
     pub ino: u64,
@@ -192,9 +185,7 @@ fn dtype(file_type: u32) -> u8 {
     }
 }
 
-/// The VFS view of an inode. Every operation works for memory inodes and
-/// for inodes of user-space filesystem servers alike; callers never look
-/// at `node` directly.
+/// The VFS view of an inode; callers never look at `node` directly.
 impl Inode {
     pub fn new(node: Node, perm: u32) -> Result<Arc<Inode>, i64> {
         let charged = INODE_COST
@@ -212,25 +203,6 @@ impl Inode {
         }))
     }
 
-    /// Disk inodes are cached by their filesystem and charged no quota.
-    pub fn disk(fs: Arc<remote::RemoteFs>, ino: u32) -> Arc<Inode> {
-        Arc::new(Inode {
-            ino: DISK_INO_BASE | ino as u64,
-            perm: Mutex::new(0),
-            node: Mutex::new(Node::Disk(DiskRef { fs, ino })),
-            charged: 0,
-            writers: AtomicI64::new(0),
-        })
-    }
-
-    /// A copy of the disk reference, so no inode lock is held during I/O.
-    fn disk_ref(&self) -> Option<DiskRef> {
-        match &*self.node.lock() {
-            Node::Disk(d) => Some(d.clone()),
-            _ => None,
-        }
-    }
-
     pub fn device(&self) -> Option<Device> {
         match &*self.node.lock() {
             Node::Device(d) => Some(*d),
@@ -239,15 +211,11 @@ impl Inode {
     }
 
     pub fn mode(&self) -> u32 {
-        if let Some(d) = self.disk_ref() {
-            return d.fs.stat(d.ino).map_or(S_IFREG, |s| s.mode);
-        }
         let kind = match &*self.node.lock() {
             Node::Dir(_) => S_IFDIR,
             Node::File(_) => S_IFREG,
             Node::Symlink(_) => S_IFLNK,
             Node::Device(_) => S_IFCHR,
-            Node::Disk(_) => unreachable!("handled above"),
         };
         kind | *self.perm.lock()
     }
@@ -261,25 +229,16 @@ impl Inode {
     }
 
     pub fn size(&self) -> u64 {
-        if let Some(d) = self.disk_ref() {
-            return d.fs.stat(d.ino).map_or(0, |s| s.size);
-        }
         match &*self.node.lock() {
             Node::File(c) => c.size(),
             Node::Symlink(t) => t.len() as u64,
             Node::Dir(m) => m.len() as u64,
-            Node::Device(_) | Node::Disk(_) => 0,
+            Node::Device(_) => 0,
         }
     }
 
     /// Everything stat(2) reports about an inode.
     pub fn stat(&self) -> Result<InodeStat, i64> {
-        if let Some(d) = self.disk_ref() {
-            // One request instead of three, and errors (e.g. a dead server)
-            // are reported instead of being mistaken for defaults.
-            let s = d.fs.stat(d.ino)?;
-            return Ok(InodeStat { mode: s.mode, rdev: 0, size: s.size, nlink: s.links, atime: s.atime, mtime: s.mtime, ctime: s.ctime });
-        }
         let (nlink, atime, mtime, ctime) = self.stat_extra();
         let rdev = self.device().map_or(0, |d| d.rdev());
         Ok(InodeStat { mode: self.mode(), rdev, size: self.size(), nlink, atime, mtime, ctime })
@@ -287,20 +246,11 @@ impl Inode {
 
     /// (link count, access time, modification time, change time)
     pub fn stat_extra(&self) -> (u64, u64, u64, u64) {
-        if let Some(d) = self.disk_ref() {
-            if let Ok(s) = d.fs.stat(d.ino) {
-                return (s.links, s.atime, s.mtime, s.ctime);
-            }
-        }
         let boot = crate::time::boot_time();
         (if self.is_dir() { 2 } else { 1 }, boot, boot, boot)
     }
 
     pub fn child(&self, name: &str) -> Result<Arc<Inode>, i64> {
-        if let Some(d) = self.disk_ref() {
-            let ino = d.fs.lookup(d.ino, name)?;
-            return Ok(d.fs.inode(ino));
-        }
         match &*self.node.lock() {
             Node::Dir(m) => m.get(name).cloned().ok_or(ENOENT),
             _ => Err(ENOTDIR),
@@ -309,15 +259,6 @@ impl Inode {
 
     /// Directory entries as (name, inode number, dirent type), including "." and "..".
     pub fn list(&self) -> Result<Vec<(String, u64, u8)>, i64> {
-        if let Some(d) = self.disk_ref() {
-            let ft = |t: u8| match t {
-                2 => 4,
-                7 => 10,
-                1 => 8,
-                _ => 0,
-            };
-            return Ok(d.fs.list(d.ino)?.into_iter().map(|(n, i, t)| (n, DISK_INO_BASE | i as u64, ft(t))).collect());
-        }
         let children: Vec<(String, Arc<Inode>)> = match &*self.node.lock() {
             Node::Dir(m) => m.iter().map(|(n, c)| (n.clone(), c.clone())).collect(),
             _ => return Err(ENOTDIR),
@@ -343,10 +284,6 @@ impl Inode {
     }
 
     pub fn create(&self, name: &str, kind: NewNode, perm: u32) -> Result<Arc<Inode>, i64> {
-        if let Some(d) = self.disk_ref() {
-            let ino = d.fs.create(d.ino, name, &kind, perm)?;
-            return Ok(d.fs.inode(ino));
-        }
         let node = match kind {
             NewNode::File => Node::File(cache::PageCache::memory(&[])?),
             NewNode::Dir => Node::Dir(BTreeMap::new()),
@@ -359,13 +296,7 @@ impl Inode {
 
     /// Removes `name`; `dir` selects rmdir semantics.
     pub fn unlink(&self, name: &str, dir: bool) -> Result<(), i64> {
-        if let Some(d) = self.disk_ref() {
-            return d.fs.unlink(d.ino, name, dir);
-        }
         let child = self.child(name)?;
-        if child.disk_ref().is_some() {
-            return Err(EBUSY); // a mount point
-        }
         match (&*child.node.lock(), dir) {
             (Node::Dir(m), true) if !m.is_empty() => return Err(ENOTEMPTY),
             (Node::Dir(_), true) => {}
@@ -380,57 +311,28 @@ impl Inode {
     }
 
     pub fn readlink(&self) -> Result<String, i64> {
-        if let Some(d) = self.disk_ref() {
-            return d.fs.readlink(d.ino);
-        }
         match &*self.node.lock() {
             Node::Symlink(t) => Ok(t.clone()),
             _ => Err(EINVAL),
         }
     }
 
-
-    /// Only regular files have contents to read or write.
-    fn require_regular(&self) -> Result<(), i64> {
-        match self.file_type() {
-            S_IFREG => Ok(()),
-            S_IFDIR => Err(EISDIR),
-            _ => Err(EINVAL),
-        }
-    }
-
     pub fn read_at(&self, off: u64, buf: &mut [u8]) -> Result<usize, i64> {
-        if let Some(d) = self.disk_ref() {
-            self.require_regular()?;
-            return d.fs.read(d.ino, off, buf);
-        }
         self.cache()?.read(off, buf)
     }
 
     pub fn write_at(&self, off: u64, buf: &[u8]) -> Result<usize, i64> {
-        if let Some(d) = self.disk_ref() {
-            self.require_regular()?;
-            return d.fs.write(d.ino, off, buf);
-        }
         self.cache()?.write(off, buf)
     }
 
     pub fn truncate(&self, len: u64) -> Result<(), i64> {
-        if let Some(d) = self.disk_ref() {
-            self.require_regular()?;
-            return d.fs.truncate(d.ino, len);
-        }
         self.cache()?.truncate(len)
     }
 
-    /// The page cache of a regular file (EISDIR, EINVAL for others; ENODEV
-    /// for a file of a filesystem server: generated on every read, it has
-    /// none). No inode lock is held while the cache is used: its
-    /// operations may sleep.
+    /// The page cache of a regular file (EISDIR, EINVAL for others). No
+    /// inode lock is held while the cache is used: its operations may
+    /// sleep.
     pub fn cache(&self) -> Result<Arc<cache::PageCache>, i64> {
-        if self.disk_ref().is_some() {
-            return Err(ENODEV);
-        }
         match &*self.node.lock() {
             Node::File(c) => Ok(c.clone()),
             Node::Dir(_) => Err(EISDIR),
@@ -439,9 +341,6 @@ impl Inode {
     }
 
     pub fn set_perm(&self, perm: u32) -> Result<(), i64> {
-        if let Some(d) = self.disk_ref() {
-            return d.fs.set_perm(d.ino, perm);
-        }
         *self.perm.lock() = perm & 0o7777;
         Ok(())
     }
@@ -458,27 +357,14 @@ impl Inode {
         self.writers.try_update(Ordering::AcqRel, Ordering::Acquire, |n| (n <= 0).then_some(n - 1)).map_err(|_| ETXTBSY)?;
         Ok(DenyWrite(self.clone()))
     }
-
-    /// Filesystem the inode lives on, for statfs.
-    pub fn filesystem(&self) -> Option<Arc<remote::RemoteFs>> {
-        self.disk_ref().map(|d| d.fs)
-    }
 }
 
-/// Moves `oname` in `odir` to `nname` in `ndir` (same filesystem only).
+/// Moves `oname` in `odir` to `nname` in `ndir`.
 pub fn rename(odir: &Arc<Inode>, oname: &str, ndir: &Arc<Inode>, nname: &str) -> Result<(), i64> {
     if nname.len() > NAME_MAX {
         return Err(ENAMETOOLONG);
     }
-    match (odir.disk_ref(), ndir.disk_ref()) {
-        (Some(a), Some(b)) if Arc::ptr_eq(&a.fs, &b.fs) => return a.fs.rename(a.ino, oname, b.ino, nname),
-        (None, None) => {}
-        _ => return Err(EXDEV),
-    }
     let node = odir.child(oname)?;
-    if node.disk_ref().is_some() {
-        return Err(EBUSY);
-    }
     // Moving a directory below itself would detach it in a reference cycle.
     if contains(&node, ndir) {
         return Err(EINVAL);
@@ -490,7 +376,6 @@ pub fn rename(odir: &Arc<Inode>, oname: &str, ndir: &Arc<Inode>, nname: &str) ->
         // Read both properties first: the inode locks are not reentrant.
         let existing_dir = match &*existing.node.lock() {
             Node::Dir(m) => Some(m.is_empty()),
-            Node::Disk(_) => return Err(EBUSY),
             _ => None,
         };
         // Replacing only ever drops a file or an empty directory, never a
@@ -550,77 +435,14 @@ pub fn init(ramdisk: Option<&'static [u8]>) {
         let inode = Inode::new(Node::Device(d), perm).expect("file quota exhausted at boot");
         let _ = dev.insert(name, inode);
     }
+    // The descriptors' names (as udev makes them): links into the Linux
+    // server's /proc.
+    for (name, target) in [("fd", "/proc/self/fd"), ("stdin", "/proc/self/fd/0"), ("stdout", "/proc/self/fd/1"), ("stderr", "/proc/self/fd/2")] {
+        let _ = dev.create(name, NewNode::Symlink(target.to_string()), 0o777);
+    }
     mkdir_p(&dev, "pts");
     mkdir_p(root, "tmp");
-    write_proc_mounts("");
 }
-
-/// Rewrites the static /proc/mounts, which tools like df read.
-/// The mount table in /proc/mounts format.
-static MOUNTS: spin::Mutex<String> = spin::Mutex::new(String::new());
-
-pub fn mounts() -> String {
-    let m = MOUNTS.lock();
-    alloc::format!("rootfs / tmpfs rw 0 0\n{}", *m)
-}
-
-/// Records a mount; /proc/mounts stays a static file until procfs serves it.
-fn write_proc_mounts(extra: &str) {
-    MOUNTS.lock().push_str(extra);
-    write_proc("mounts", &mounts());
-}
-
-/// (Re)writes the static, read-only file /proc/<name>, as long as no
-/// procfs server provides /proc.
-pub fn write_proc(name: &str, content: &str) {
-    if PROC_SERVED.load(Ordering::Relaxed) {
-        return;
-    }
-    let proc_dir = mkdir_p(&root(), "proc");
-    let _ = proc_dir.unlink(name, false);
-    if let Ok(file) = proc_dir.create(name, NewNode::File, 0o444) {
-        let _ = file.write_at(0, content.as_bytes());
-    }
-}
-
-/// Mounts the filesystem a server registered under `service` at `/<name>`,
-/// replacing what is there (the static /proc of the boot, for procfs).
-pub fn mount_remote(
-    server: Arc<crate::process::Server>,
-    service: usize,
-    root_ino: u32,
-    name: &str,
-    device: &str,
-    fstype: &str,
-) -> Result<(), i64> {
-    let fs = remote::RemoteFs::new(service, server);
-    let root = root();
-    if let Ok(old) = root.child(name) {
-        for (entry, _, _) in old.list()? {
-            if entry != "." && entry != ".." {
-                old.unlink(&entry, false)?;
-            }
-        }
-        root.unlink(name, true)?;
-    }
-    root.insert(name, fs.inode(root_ino))?;
-    if name == "proc" {
-        PROC_SERVED.store(true, Ordering::Relaxed);
-    }
-    record_mount(device, &alloc::format!("/{name}"), fstype);
-    crate::printkln!("[fs] /{} mounted from user-space server ({})", name, fstype);
-    Ok(())
-}
-
-/// Lists a mount in /proc/mounts: the kernel's own, and diskfs's disk,
-/// which every Linux server instance mounts at /data (until procfs is the
-/// server's, /proc/mounts is the kernel's list).
-pub fn record_mount(device: &str, at: &str, fstype: &str) {
-    write_proc_mounts(&alloc::format!("{device} {at} {fstype} rw 0 0\n"));
-}
-
-/// Whether a procfs server provides /proc (then no static files are written).
-static PROC_SERVED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Creates all missing directories and returns the last one.
 pub fn mkdir_p(base: &Arc<Inode>, path: &str) -> Arc<Inode> {

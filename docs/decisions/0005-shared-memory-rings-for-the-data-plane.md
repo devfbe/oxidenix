@@ -35,4 +35,6 @@ an IOMMU can confine them later without an interface change.
   after its revocation).
 - Memory ordering becomes part of the ABI; the ring crate documents and tests it.
 - Two protocols coexisted while the kernel's `RemoteFs` still served the kernel's own `/data`
-  view (until R6c.3 ended; diskfs speaks only the ring protocol since).
+  view (until R6c.3 ended; diskfs speaks only the ring protocol since) and procfs's `/proc`
+  and `/sys` (until I/O rings step 5; procfs speaks the same file protocol since, and the
+  kernel's IPC carries only the control plane's channel offers).

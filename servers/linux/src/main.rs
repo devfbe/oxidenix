@@ -35,6 +35,8 @@ mod netlink;
 mod pathfile;
 mod paths;
 mod pipe;
+mod procfile;
+mod procfs;
 mod pty;
 mod records;
 mod ringclient;
@@ -116,6 +118,13 @@ pub extern "C" fn _start(state: *mut State, role: u64) -> ! {
         }
         match s.rax {
             TEST_MAP..=TEST_CACHED => s.rax = test(s.rax, s.rdi) as u64,
+            // The kernel's to answer, with the name in the server's memory.
+            TEST_SERVER_TICKS => {
+                s.rax = match usercopy::read_cstr(s.rdi) {
+                    Ok(name) => syscall(TEST_SERVER_TICKS, [name.as_ptr() as u64, name.len() as u64, 0, 0, 0, 0]),
+                    Err(e) => -e,
+                } as u64;
+            }
             TEST_PASS_THROUGH => {
                 const SYS_GETPID: u64 = 39;
                 s.rax = SYS_GETPID;

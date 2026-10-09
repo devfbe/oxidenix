@@ -65,6 +65,11 @@ pub fn set_realtime(ns: u64) {
 }
 
 /// Wall-clock time of the boot, in seconds since the epoch.
+/// The TSC's frequency in Hz (what /proc/cpuinfo's `cpu MHz` shows).
+pub fn tsc_hz() -> u64 {
+    TSC_HZ.load(Ordering::Relaxed)
+}
+
 pub fn boot_time() -> u64 {
     WALL_AT_BOOT.load(Ordering::Relaxed).max(0) as u64 / NSEC_PER_SEC
 }

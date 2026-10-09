@@ -43,8 +43,9 @@ An AI research project; see README.md.
   test -p netlink` rtnetlink's messages (the Linux server's netlink sockets), `cargo test
   --release -p netring` the socket protocol (Linux server <-> netd: encodings, validation, the
   shared area's wake protocols with threads), `cargo test -p ldisc` the line discipline of the
-  Linux server's terminals, `cargo test -p csprng` the kernel's random generator (ChaCha20) and
-  the keyed hash (SipHash) against their test vectors,
+  Linux server's terminals, `cargo test -p procproto` the text formats of `/proc` (procfs's
+  and the Linux server's) and what procfs gives each client, `cargo test -p csprng` the
+  kernel's random generator (ChaCha20) and the keyed hash (SipHash) against their test vectors,
   `cargo test --manifest-path third_party/smoltcp/Cargo.toml --lib`
   netd's smoltcp (vendored with patches, its own workspace; the patches are listed in its
   `Cargo.toml` and marked `oxidenix:`).
@@ -81,14 +82,14 @@ An AI research project; see README.md.
     `unix.rs`/`sockcalls.rs`/`scm.rs` (`AF_UNIX` sockets, descriptor passing),
     `inet.rs`/`inetcalls.rs`/`netclient.rs` (internet sockets over the channel to netd, the net
     thread), `netdev.rs`/`netlink.rs` + `crates/netlink` (interfaces, `NETLINK_ROUTE`),
-    `inotify.rs`.
+    `procfs.rs`/`procfile.rs` (`/proc` and `/sys`: procfs's files over the rings, the
+    per-process part and the magic links), `inotify.rs`.
   - Node.js: `userspace/node` (build, smoke tests `tests/*.test.mjs`, runner `run-node.sh`).
   - Memory: `kernel/src/memory/`, `kernel/src/process/address_space.rs`, page cache
     `kernel/src/fs/cache.rs`.
   - Other servers and their protocols: `servers/diskfs` + `crates/fsring` + `crates/ext2fs`,
-    `servers/netd` + `crates/netring`, `servers/procfs` + `crates/procproto` + `crates/fsproto`
-    (the kernel's `RemoteFs`); I/O rings
-    `crates/ring`, `docs/design/io-rings.md`.
+    `servers/netd` + `crates/netring`, `servers/procfs` + `crates/procproto` (+ `crates/fsring`,
+    the same file protocol, read-only); I/O rings `crates/ring`, `docs/design/io-rings.md`.
   - Tests: C programs in `userspace/*.c` (built by `userspace/build.sh`), run by the list in
     `userspace/rootfs/etc/runtests.sh`; benchmarks `userspace/iobench.c`, `scripts/bench.sh`,
     `docs/benchmarks/README.md`. Decisions: `docs/decisions/`.
