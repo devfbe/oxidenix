@@ -1492,7 +1492,6 @@ pub fn query(op: u64, arg: u64, cap: usize) -> Result<Vec<u8>, i64> {
                 threads: p.threads.len() as u64,
                 cpu: tinfo.cpu,
                 flags: 0,
-                legacy_calls: info.legacy_calls,
                 peak_pages: info.peak_pages,
                 virt_peak: info.virt_pages,
                 sig_pending: th.map_or(0, |th| th.sig.pending.set),

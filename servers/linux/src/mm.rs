@@ -95,16 +95,13 @@ fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, mut offset: u64) ->
         mo_flags |= MO_POPULATE;
     }
     // The object to map: none (anonymous private memory), a new one
-    // (anonymous shared memory), or the descriptor's file: one of the
-    // server's (its file object), or one of the kernel's.
+    // (anonymous shared memory), or the descriptor's file's object.
     let mapping = if flags & MAP_ANONYMOUS == 0 {
         crate::files::map_object(fd, shared, prot & PROT_WRITE != 0)
     } else {
         Ok(crate::files::Mapping::Anonymous { read_only: false })
     };
-    // The handle to map, and whether it is this call's to close (the
-    // kernel's open file's is its description's, kept until it is mapped).
-    let mut kernel_file = None;
+    // The handle to map, and whether it is this call's to close.
     let (handle, own) = match mapping {
         Ok(crate::files::Mapping::Object(h, read_only)) => {
             if read_only {
@@ -113,11 +110,6 @@ fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, mut offset: u64) ->
             (h as i64, true)
         }
         Err(e) => (-e, false),
-        Ok(crate::files::Mapping::Kernel(k)) => {
-            let h = k.handle() as i64;
-            kernel_file = Some(k);
-            (h, false)
-        }
         // Anonymous memory (also zero's): the offset means nothing.
         Ok(crate::files::Mapping::Anonymous { read_only }) if shared => {
             offset = 0;
@@ -139,7 +131,6 @@ fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, mut offset: u64) ->
         // The mapping holds the object now.
         crate::syscall(SYS_HANDLE_CLOSE, [handle as u64, 0, 0, 0, 0, 0]);
     }
-    drop(kernel_file);
     mapped
 }
 

@@ -86,7 +86,6 @@ pub enum PidFile {
     Comm,
     Exe,
     Task,
-    Counters,
     Mounts,
     Fd,
     Cwd,
@@ -101,7 +100,6 @@ const PID_FILES: &[(&str, PidFile)] = &[
     ("comm", PidFile::Comm),
     ("exe", PidFile::Exe),
     ("task", PidFile::Task),
-    ("counters", PidFile::Counters),
     ("mounts", PidFile::Mounts),
     ("fd", PidFile::Fd),
     ("cwd", PidFile::Cwd),
@@ -323,6 +321,11 @@ fn process(pid: u64) -> Result<Process, i64> {
 }
 
 /// The kernel's tick rate, page size and CPUs (fixed after boot).
+/// The kernel's record of the system now (`SYS_SYSTEM_INFO`).
+pub fn system() -> Option<System> {
+    proc_info(QUERY_SYSTEM, 0, core::mem::size_of::<System>()).ok().and_then(|b| from_bytes::<System>(&b))
+}
+
 fn machine() -> Machine {
     static HZ: AtomicU64 = AtomicU64::new(0);
     static PAGE_SIZE: AtomicU64 = AtomicU64::new(0);
@@ -600,7 +603,6 @@ fn describe(f: &FileRef) -> Result<String, i64> {
         File::Tmp(t) => Ok(if t.inode.removed() { format!("{} (deleted)", t.path) } else { t.path.clone() }),
         File::Data(d) => Ok(if d.inode.unlinked() { format!("{} (deleted)", d.path) } else { d.path.clone() }),
         File::Proc(p) => Ok(p.path.clone()),
-        File::Kernel(k) => Ok(k.path.clone()),
         File::Pipe(end) => Ok(format!("pipe:[{}]", end.ino())),
         File::Socket(_) | File::Inet(_) | File::Netlink(_) => Ok(format!("socket:[{}]", ino(files::stat_file(&f.file)))),
         File::EventFd(_) => anon("[eventfd]"),
@@ -627,7 +629,6 @@ pub fn follow(node: &ProcNode) -> Result<Option<Follow>, i64> {
         File::Tmp(t) => Follow { mode: t.inode.mode(), node: Node::Tmp(t.inode.clone()), path: Some(t.path.clone()) },
         File::Data(d) => Follow { mode: d.inode.kind | 0o777, node: Node::Data(d.inode.clone()), path: Some(d.path.clone()) },
         File::Proc(p) => Follow { mode: mode(&p.node), node: Node::Proc(p.node.clone()), path: Some(p.path.clone()) },
-        File::Kernel(k) => Follow { node: Node::Kernel(k.inode()?), mode: namespace::mode_of(&k.stat()?), path: Some(k.path.clone()) },
         file @ (File::Pipe(_) | File::Socket(_) | File::Inet(_) | File::Netlink(_) | File::EventFd(_) | File::Inotify(_) | File::Epoll(_)) => open(file.clone())?,
         File::Tty(_) | File::PtyMaster(_) | File::Dev(_) | File::Path(_) => {
             let o = files::origin_of_file(&f).ok_or(ENOENT)?;
@@ -657,7 +658,6 @@ pub fn contents(node: &ProcNode) -> Result<Vec<u8>, i64> {
         PidFile::Status => fmt::pid_status(&p, &machine(), &linux(&p)),
         PidFile::Cmdline => return text(QUERY_CMDLINE, id),
         PidFile::Comm => format!("{}\n", fmt::name(&p)),
-        PidFile::Counters => fmt::pid_counters(&p),
         PidFile::Mounts => namespace::mounts_text(),
         PidFile::Dir | PidFile::Task | PidFile::Fd => return Err(EISDIR),
         PidFile::Exe | PidFile::Cwd | PidFile::Root => return Err(EINVAL),

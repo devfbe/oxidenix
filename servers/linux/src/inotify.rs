@@ -14,8 +14,8 @@
 //! ends by inotify_rm_watch, IN_ONESHOT, the instance's last descriptor,
 //! or when its inode goes: IN_DELETE_SELF once its last link went and its
 //! last open file description closed, as Linux sends it when the inode is
-//! evicted. The kernel's files (/dev, /proc, /sys) can be watched but
-//! report nothing, as most of Linux's pseudo files; changes another
+//! evicted. The pseudo files (/proc, /sys) can be watched but report
+//! nothing, as most of Linux's; changes another
 //! instance makes on /data are not seen (its calls are its own server's).
 //!
 //! As Linux: an event equal to the last one queued and not read yet is
@@ -95,7 +95,7 @@ pub enum Key {
     /// Every /data inode of this number (`deleted` only: one this instance
     /// removed and no longer has, so its generation is unknown here).
     DataAny(u32),
-    /// A pseudo file's (the kernel's /dev, /proc, /sys) by device and
+    /// A pseudo file's (/proc, /sys) by device and
     /// inode number: watched, without events (as Linux's procfs sends
     /// none for contents that change by themselves).
     Pseudo(u64, u64),
@@ -104,7 +104,7 @@ pub enum Key {
 impl Key {
     pub fn of(node: &Node) -> Option<Key> {
         match node {
-            Node::Kernel(_) | Node::Proc(_) => {
+            Node::Proc(_) => {
                 let st = node.status().ok()?;
                 Some(Key::Pseudo(st.dev, st.ino))
             }
@@ -440,7 +440,7 @@ pub fn node_event(node: &Node, mask: u32) {
     match node {
         Node::Tmp(t) => tmp_event(t, mask),
         Node::Data(d) => data_event(d, mask),
-        Node::Kernel(_) | Node::Proc(_) => {}
+        Node::Proc(_) => {}
     }
 }
 

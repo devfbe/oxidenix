@@ -295,14 +295,9 @@ struct Region {
 
 impl Region {
     fn new(len: usize) -> Result<Region, i64> {
-        const PROT_RW: u64 = 3;
-        const MAP_PRIVATE_ANON: u64 = 0x22;
         let mapped = len.max(1).next_multiple_of(PAGE as usize);
-        let addr = oxrt::syscall(oxrt::sys::MMAP, [0, mapped as u64, PROT_RW, MAP_PRIVATE_ANON, u64::MAX, 0]);
-        if addr < 0 {
-            return Err(ENOBUFS);
-        }
-        Ok(Region { addr: addr as *mut u8, len, mapped })
+        let addr = oxrt::alloc_pages(mapped).map_err(|_| ENOBUFS)?;
+        Ok(Region { addr, len, mapped })
     }
 
     fn bytes(&self) -> &[u8] {

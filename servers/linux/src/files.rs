@@ -1,8 +1,7 @@
 //! The server's open files (phase R6, the descriptor table since R6e): an
 //! open file description (`Description`) is a file the server implements
 //! (`File`: a pipe end, a socket, an open file of tmpfs or /data, a
-//! terminal, an epoll instance, ...) or an open file of the kernel's it
-//! holds by handle (`kfile`), with its status flags. Descriptors of the
+//! terminal, an epoll instance, ...) with its status flags. Descriptors of the
 //! calling process's table (`fdtable`) refer to descriptions (`FileRef`),
 //! as do descriptors in flight (`scm`) and calls that use one: a
 //! description goes, and its file closes, with its last reference (Linux's
@@ -18,7 +17,6 @@ use crate::datafile::{self, DataOpen};
 use crate::eventfd::EventFd;
 use crate::fdtable;
 use crate::inotify::{self, Inotify};
-use crate::kfile::KernelFile;
 use crate::netlink::{self, NetlinkSocket};
 use crate::pipe::{self, Dst, PipeEnd, Src};
 use crate::tmpfile::{self, TmpOpen};
@@ -82,20 +80,17 @@ pub enum File {
     Epoll(Arc<crate::epoll::Epoll>),
     /// An open file of /proc or /sys.
     Proc(Arc<crate::procfile::ProcOpen>),
-    /// An open file of the kernel's (its tree, /dev: null, zero, the
-    /// directory), by handle.
-    Kernel(Arc<KernelFile>),
 }
 
 impl File {
     /// Always ready for poll, whatever happens (a regular file or a
-    /// directory, null and zero, the kernel's files, /proc and /sys): epoll
+    /// directory, null and zero, /proc and /sys): epoll
     /// refuses it with EPERM, as Linux does for a file without a poll
     /// method. Decided per kind of file: a file of one of these kinds that
     /// had readiness of its own (a pollable /proc file, as Linux's
     /// /proc/self/mounts) would need it decided per node, and a watch.
     pub fn always_ready(&self) -> bool {
-        matches!(self, File::Tmp(_) | File::Data(_) | File::Dev(_) | File::Kernel(_) | File::Proc(_))
+        matches!(self, File::Tmp(_) | File::Data(_) | File::Dev(_) | File::Proc(_))
     }
 }
 
@@ -120,7 +115,7 @@ impl Description {
 
     /// F_SETFL and FIONBIO: the flags in `changeable` take `value`'s
     /// (atomically: another thread may change the same description's at
-    /// once). The kernel's files get them too, for their own operations.
+    /// once).
     pub fn set_flags(&self, changeable: u32, value: u32) {
         let mut old = self.flags.load(Ordering::Relaxed);
         loop {
@@ -129,9 +124,6 @@ impl Description {
                 Ok(_) => break,
                 Err(seen) => old = seen,
             }
-        }
-        if let File::Kernel(k) = &self.file {
-            k.set_flags(self.flags());
         }
     }
 
@@ -159,7 +151,7 @@ impl Description {
                 }
             }
             File::Path(_) => POLLNVAL,
-            File::Tmp(_) | File::Data(_) | File::Dev(_) | File::Kernel(_) | File::Proc(_) => ALWAYS_READY,
+            File::Tmp(_) | File::Data(_) | File::Dev(_) | File::Proc(_) => ALWAYS_READY,
         }
     }
 }
@@ -409,7 +401,6 @@ pub fn stat_file(file: &File) -> Result<vfs::stat::Stat, i64> {
         File::Dev(d) => d.origin.stat()?,
         File::Path(p) => p.origin.stat()?,
         File::Epoll(e) => e.stat(),
-        File::Kernel(k) => k.stat()?,
         File::Proc(p) => crate::procfs::stat(&p.node)?,
     };
     Ok(vfs::stat::Stat::from_bytes(&bytes))
@@ -427,9 +418,6 @@ pub fn map_object(fd: u64, shared: bool, prot_write: bool) -> Result<Mapping, i6
         File::Tmp(t) => object(t.map_object(flags, shared, prot_write)),
         File::Data(d) => object(d.map_object(flags, shared, prot_write)),
         File::Dev(d) => crate::devices::map(d, flags, shared, prot_write),
-        // The kernel maps its own file (by the handle the description
-        // keeps): its page cache, or its zero as anonymous memory.
-        File::Kernel(k) => Ok(Mapping::Kernel(k.clone())),
         File::Path(_) => Err(EBADF),
         _ => Err(ENODEV),
     }
@@ -443,9 +431,6 @@ pub enum Mapping {
     /// Anonymous memory, as for MAP_ANONYMOUS (zero's mappings); `read_only`: a shared
     /// mapping that may never become writable.
     Anonymous { read_only: bool },
-    /// An open file of the kernel's: its handle maps it (the description
-    /// keeps the handle; the mapping keeps the file).
-    Kernel(Arc<KernelFile>),
 }
 
 pub const SYS_READ: u64 = 0;
@@ -512,8 +497,8 @@ pub fn handle(s: &State) -> Option<i64> {
             },
             Err(_) => return None,
         },
-        // The kernel's files have nothing to write back: /data's do, in
-        // every instance's page cache.
+        // Only /data's files have something to write back, in every
+        // instance's page cache.
         SYS_SYNC => sync_everywhere().map(|_| 0),
         SYS_SYNCFS => lookup(a0).and_then(|f| match &f.file {
             File::Data(_) => sync_everywhere().map(|_| 0),
@@ -546,10 +531,6 @@ fn rw2(write: bool, file: &File, flags: u32, iov: u64, count: u64, offset: i64, 
     if !allowed {
         return Err(EBADF);
     }
-    // The kernel's files take the call as it is.
-    if let File::Kernel(k) = file {
-        return k.call(if write { SYS_PWRITEV2 } else { SYS_PREADV2 }, [iov, count, offset as u64, rwf]);
-    }
     let plan = vfs::rw::plan(write, offset, rwf, flags & O_APPEND != 0)?;
     let flags = if plan.append { flags | O_APPEND } else { flags & !O_APPEND };
     let flags = if plan.sync { flags | datafile::O_DSYNC } else { flags };
@@ -577,7 +558,6 @@ fn on_file(nr: u64, file: &File, flags: u32, a1: u64, a2: u64, a3: u64) -> Resul
         File::Dev(d) => return crate::devices::call(nr, d, flags, a1, a2),
         File::Path(p) => return crate::pathfile::call(nr, p, a1),
         File::Epoll(e) => return crate::epoll::on_file(nr, e, a1),
-        File::Kernel(k) => return k.on_file(nr, a1, a2, a3),
         File::Proc(p) => return crate::procfile::call(nr, p, flags, a1, a2, a3),
     };
     let readable = flags & O_ACCMODE != O_WRONLY;
@@ -689,7 +669,6 @@ fn sendfile(out_fd: u64, in_fd: u64, offset: u64, count: u64) -> Result<i64, i64
             File::Tty(t) => t.tty.read(t, crate::unix::Sink::Server { buf: &mut buf[..want], at: 0 }, in_flags & O_NONBLOCK != 0),
             File::PtyMaster(m) => m.read(crate::unix::Sink::Server { buf: &mut buf[..want], at: 0 }, in_flags & O_NONBLOCK != 0),
             File::Dev(d) => crate::devices::read(d, crate::unix::Sink::Server { buf: &mut buf[..want], at: 0 }),
-            File::Kernel(k) => k.read_server(&mut buf[..want]),
             File::Proc(f) => f.read_server(&mut buf[..want]).map(|n| n as i64),
             File::EventFd(_) | File::Netlink(_) | File::Inotify(_) | File::Epoll(_) | File::Path(_) => Err(EINVAL),
         };
@@ -710,7 +689,6 @@ fn sendfile(out_fd: u64, in_fd: u64, offset: u64, count: u64) -> Result<i64, i64
             File::Tty(t) => t.tty.write(t, crate::unix::Source::Server { buf: &buf[..n], at: 0 }, out_flags & O_NONBLOCK != 0),
             File::PtyMaster(m) => m.write(crate::unix::Source::Server { buf: &buf[..n], at: 0 }, out_flags & O_NONBLOCK != 0),
             File::Dev(_) => Ok(n as i64),
-            File::Kernel(k) => k.write_server(&buf[..n]),
             File::Path(_) | File::Proc(_) => Err(EBADF),
             File::EventFd(_) | File::Netlink(_) | File::Inotify(_) | File::Epoll(_) => Err(EINVAL),
         };
@@ -798,22 +776,14 @@ impl Regular {
 
 /// The file behind `fd` for copy_file_range, with its open flags: EBADF
 /// for no descriptor, EISDIR for a directory, EINVAL for a file that is
-/// not regular, EXDEV for one of the kernel's (another filesystem).
+/// not regular.
 fn regular(fd: u64) -> Result<(Regular, u32), i64> {
     const EISDIR: i64 = 21;
-    const EXDEV: i64 = 18;
     let f = lookup(fd)?;
     let flags = f.flags();
     let kind = match &f.file {
         File::Tmp(t) => t.inode.file_type(),
         File::Data(d) => d.inode.kind,
-        File::Kernel(_) => {
-            return Err(match stat_of(fd)?.mode & vfs::S_IFMT {
-                vfs::S_IFREG => EXDEV,
-                vfs::S_IFDIR => EISDIR,
-                _ => EINVAL,
-            });
-        }
         _ => return Err(EINVAL),
     };
     match (kind, &f.file) {

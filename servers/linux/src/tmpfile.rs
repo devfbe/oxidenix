@@ -2,8 +2,7 @@
 //! description of the server's names (offset, directory snapshot, write
 //! access); the calls on it are the server's.
 //! Reads and writes move bytes between the file object and the program's
-//! memory in the kernel (`SYS_MO_FILE_READ`/`WRITE`), as the kernel's tmpfs
-//! files did.
+//! memory in the kernel (`SYS_MO_FILE_READ`/`WRITE`).
 
 use crate::files::{self, File, EBADF, EINVAL, O_ACCMODE, O_WRONLY};
 use crate::inotify;
@@ -124,12 +123,22 @@ fn signed(offset: u64) -> Result<u64, i64> {
     if (offset as i64) < 0 { Err(EINVAL) } else { Ok(offset) }
 }
 
-/// A tmpfs `struct statfs` (the kernel's tmpfs numbers: both are charged
-/// to the same limit) at the program's `buf`.
+/// A tmpfs `struct statfs` at the program's `buf`: the pages every
+/// instance's tmpfs files take and their limit (`SYS_FILE_PAGES`: they are
+/// charged to one limit, half of what may be committed, as Linux's tmpfs).
 pub fn statfs(buf: u64) -> Result<i64, i64> {
-    let mut words = [0u8; 120];
-    check(syscall(SYS_INODE_STATFS, [crate::namespace::kernel_root(), words.as_mut_ptr() as u64, 0, 0, 0, 0]))?;
-    usercopy::to_program(buf, &words)?;
+    const TMPFS_MAGIC: u64 = 0x0102_1994;
+    const NAME_MAX: u64 = 255;
+    let mut pages = [0u64; 2];
+    check(syscall(SYS_FILE_PAGES, [pages.as_mut_ptr() as u64, 0, 0, 0, 0, 0]))?;
+    let [used, limit] = pages;
+    let free = limit.saturating_sub(used);
+    let words: [u64; 15] = [TMPFS_MAGIC, 4096, limit, free, free, 0, 0, 0, NAME_MAX, 4096, 0, 0, 0, 0, 0];
+    let mut bytes = [0u8; 120];
+    for (chunk, w) in bytes.chunks_exact_mut(8).zip(words) {
+        chunk.copy_from_slice(&w.to_le_bytes());
+    }
+    usercopy::to_program(buf, &bytes)?;
     Ok(0)
 }
 

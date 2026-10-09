@@ -382,11 +382,10 @@ static void kernel_files(void) {
     check("O_APPEND changes on it", fcntl(f, F_SETFL, O_APPEND) == 0 && (fcntl(f, F_GETFL) & O_APPEND));
     close(d);
     close(f);
-    /* The kernel's /dev: open files of the kernel's the server holds by
-     * handle. */
+    /* /dev: the server's devtmpfs (R9; the kernel's tree before). */
     int dir = open("/dev", O_RDONLY | O_DIRECTORY);
     char cwd[64];
-    check("fchdir to a directory of the kernel's", dir >= 0 && fchdir(dir) == 0 && getcwd(cwd, sizeof cwd) && strcmp(cwd, "/dev") == 0);
+    check("fchdir to /dev", dir >= 0 && fchdir(dir) == 0 && getcwd(cwd, sizeof cwd) && strcmp(cwd, "/dev") == 0);
     check("openat relative to it", (f = openat(dir, "zero", O_RDONLY)) >= 0 && read(f, buf, 5) == 5 && buf[4] == 0);
     close(f);
     chdir("/");
@@ -396,7 +395,7 @@ static void kernel_files(void) {
     close(dir);
     f = open("/dev/null", O_RDONLY);
     pf = (struct pollfd){f, POLLIN, 0};
-    check("the kernel's /dev/null is always ready", poll(&pf, 1, 0) == 1 && pf.revents == POLLIN);
+    check("/dev/null is always ready", poll(&pf, 1, 0) == 1 && pf.revents == POLLIN);
     ep = epoll_create1(0);
     check("epoll refuses it (EPERM)", epoll_ctl(ep, EPOLL_CTL_ADD, f, &ev) == -1 && errno == EPERM);
     close(ep);
@@ -407,11 +406,11 @@ static void kernel_files(void) {
     close(f);
     int z = open("/dev/zero", O_RDONLY);
     char *m = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, z, 0);
-    check("mmap of the kernel's /dev/zero", m != MAP_FAILED && m[100] == 0);
+    check("mmap of /dev/zero", m != MAP_FAILED && m[100] == 0);
     munmap(m, 4096);
     close(z);
     int null = open("/dev/null", O_WRONLY);
-    check("writes to the kernel's /dev/null", write(null, buf, 10) == 10);
+    check("writes to /dev/null", write(null, buf, 10) == 10);
     close(null);
 }
 

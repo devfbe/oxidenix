@@ -366,8 +366,8 @@ impl Channel {
         };
         self.inner.lock().offer_request = Some(id);
         // Done once the service attached (it need not have answered),
-        // answered, or died; a signal (always a fatal one) gives the offer
-        // up unless the service attached.
+        // answered, or died; the caller's end (its kick, or its death)
+        // gives the offer up unless the service attached.
         let answer = loop {
             let wait = super::sched::prepare_to_wait(ipc::reply_chan(id));
             if self.inner.lock().service.is_some() {
@@ -376,7 +376,7 @@ impl Channel {
             if let Some(answer) = ipc::take_reply(id) {
                 break Some(answer);
             }
-            if super::signal::interrupted() || super::signal::dying() {
+            if super::kill::interrupted() || super::kill::dying() {
                 break Some(Err(EINTR));
             }
             wait.sleep();

@@ -17,8 +17,8 @@
 //! with `MAP_NORESERVE` and make all of it writable and executable at
 //! once; only what they touch counts. When the commit fails at a touch, the
 //! toucher is killed, never a process whose memory was committed (a copy
-//! by the kernel or the Linux server ends at its fixup and the process gets
-//! SIGKILL, see the page fault handler).
+//! by the kernel or the Linux server ends at its fixup and the process is
+//! killed, see the page fault handler).
 //!
 //! Page table entries carry three software bits: COW (a shared frame that
 //! is copied on the first write), PROT_NONE (a frame kept while its area
@@ -313,7 +313,7 @@ pub struct AddressSpace {
 }
 
 /// An address space as tasks hold it: shared by the threads of a process
-/// (and by a vfork child until it execs or exits).
+/// (and by a Linux program's vfork child until it execs or exits).
 pub struct Mm {
     /// What a context switch needs, readable without the lock.
     pub tlb: Arc<Tlb>,
@@ -351,14 +351,6 @@ impl Mm {
         // registrations, which no longer reach an address space.
         child.lock().copy_from(parent)?;
         Ok(child)
-    }
-
-    /// Writes `data` at `addr` as a user write would (the area must be
-    /// writable), from a thread that may not run in this space (fork's
-    /// CLONE_CHILD_SETTID into the child). A page or its backing from a
-    /// pager is waited for with the space unlocked, as a fault does.
-    pub fn write_user(&self, addr: u64, data: &[u8]) -> Result<(), Fault> {
-        self.retrying(|space| space.write_as(addr, data, true, false))
     }
 
     /// Runs `op` on the locked space until it no longer asks for a page

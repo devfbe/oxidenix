@@ -46,6 +46,22 @@ static void sleep_ms(int ms) {
     }
 }
 
+/* Waits (at most 10 s) until process `pid` sleeps ('S' in /proc/<pid>/stat): a child
+ * that was to block in a call has reached it, however slowly it got there. */
+static void wait_sleeping(pid_t pid) {
+    char path[64], text[256];
+    snprintf(path, sizeof path, "/proc/%d/stat", (int)pid);
+    for (int i = 0; i < 2000; i++) {
+        int fd = open(path, O_RDONLY);
+        ssize_t n = fd >= 0 ? read(fd, text, sizeof text - 1) : -1;
+        if (fd >= 0) close(fd);
+        text[n > 0 ? n : 0] = 0;
+        char *paren = strrchr(text, ')');
+        if (paren && paren[1] == ' ' && paren[2] == 'S') return;
+        sleep_ms(5);
+    }
+}
+
 /* A new pair: the master's descriptor; the slave's path at `path`. */
 static int new_pty(char *path, size_t len) {
     int m = posix_openpt(O_RDWR | O_NOCTTY);
@@ -573,7 +589,7 @@ static void opath(void) {
     chdir(cwd);
     close(dir);
     int n = open("/dev/null", O_PATH);
-    check("O_PATH on the kernel's /dev/null: its node, EBADF to write",
+    check("O_PATH on /dev/null: its node, EBADF to write",
           n >= 0 && fstat(n, &st) == 0 && S_ISCHR(st.st_mode) && major(st.st_rdev) == 1 && write(n, "x", 1) == -1 && errno == EBADF);
     close(n);
     int ln = open("/tmp/opath/link", O_PATH | O_NOFOLLOW);
@@ -654,7 +670,7 @@ static void turn_abandon(void) {
         alarm(20);
         _exit(write(s, big, sizeof big) == (ssize_t)sizeof big ? 0 : 1);
     }
-    sleep_ms(100);
+    wait_sleeping(holder);
     pid_t killed = fork();
     if (killed == 0) {
         write(s, "b", 1);
@@ -668,7 +684,10 @@ static void turn_abandon(void) {
         sigaction(SIGUSR1, &sa, NULL);
         _exit(write(s, "c", 1) == -1 && errno == EINTR ? 0 : 1);
     }
-    sleep_ms(100);
+    /* Both wait for the turn before they are killed and interrupted (a fixed pause lost
+     * the race under load: a signal before the write leaves nothing to interrupt). */
+    wait_sleeping(killed);
+    wait_sleeping(interrupted);
     kill(killed, SIGKILL);
     waitpid(killed, NULL, 0);
     kill(interrupted, SIGUSR1);

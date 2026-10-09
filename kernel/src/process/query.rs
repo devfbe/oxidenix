@@ -50,25 +50,6 @@ fn system() -> System {
     s
 }
 
-/// sysinfo(2): uptime, load and memory in the layout of `struct sysinfo`.
-pub fn sysinfo(buf: u64) -> SysResult {
-    const SI_LOAD_SHIFT: u32 = 16;
-    let s = system();
-    let mut out = [0u8; 112];
-    let put = |out: &mut [u8; 112], at: usize, v: u64| out[at..at + 8].copy_from_slice(&v.to_le_bytes());
-    put(&mut out, 0, s.uptime / TIMER_HZ);
-    for i in 0..3 {
-        put(&mut out, 8 + i * 8, s.load[i] << (SI_LOAD_SHIFT - sched::LOAD_SHIFT));
-    }
-    put(&mut out, 32, s.mem_total);
-    put(&mut out, 40, s.mem_free);
-    out[80..82].copy_from_slice(&(s.processes.min(u16::MAX as u64) as u16).to_le_bytes());
-    // mem_unit: the sizes above are in bytes.
-    out[104..108].copy_from_slice(&1u32.to_le_bytes());
-    uaccess::write(buf, out)?;
-    Ok(0)
-}
-
 /// The answer to `op` for a buffer of `len` bytes: the system-wide record
 /// (`QUERY_SYSTEM`; the processes' records are their Linux server's since
 /// R8); ERANGE if it does not fit.

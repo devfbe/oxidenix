@@ -199,7 +199,7 @@ fn receive_loop(buf: u64, len: u64, id_out: u64, deadline: Option<u64>) -> SysRe
                 return Ok(message.len() as i64);
             }
             Err(()) => {
-                if super::signal::interrupted() {
+                if super::kill::interrupted() {
                     return Err(EINTR);
                 }
                 match deadline {

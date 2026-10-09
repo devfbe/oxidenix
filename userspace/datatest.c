@@ -1,5 +1,5 @@
-/* /data in the Linux server (phase R6c.3): its calls never pass through to
- * the kernel, descriptors and mappings of a file share one page cache,
+/* /data in the Linux server (phase R6c.3): its calls are the server's,
+ * descriptors and mappings of a file share one page cache,
  * write() leaves dirty pages that fsync makes durable (an O_DIRECT read
  * fetches the device's copy), children's stores survive write-back around
  * fork and mprotect, truncation reaches mappings (a fork child's copy
@@ -34,17 +34,6 @@ static int failures;
 static void check(const char *name, int ok) {
     printf("%-60s %s\n", name, ok ? "ok" : "FAIL");
     if (!ok) failures++;
-}
-
-/* The kernel's count of this process's system calls the server passed back
- * to it (its own: other programs running meanwhile do not count). */
-static long legacy_calls(void) {
-    char text[512] = {0};
-    int fd = open("/proc/self/counters", O_RDONLY);
-    read(fd, text, sizeof text - 1);
-    close(fd);
-    char *p = strstr(text, "legacy_calls ");
-    return p ? atol(p + 13) : -1;
 }
 
 static long meminfo(const char *key) {
@@ -93,15 +82,12 @@ static int store_faults(volatile char *p) {
 
 /* ------------------------------------------------------------------ */
 
-static void no_pass_through(void) {
+static void server_io(void) {
     const char *path = "/data/datatest.calls";
     int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
     char block[PG], back[16];
     memset(block, 'd', sizeof block);
     struct stat st;
-    long idle = legacy_calls();
-    long base = legacy_calls() - idle;
-    long l0 = legacy_calls();
     int io = 1;
     for (int i = 0; i < 25; i++) {
         io &= pwrite(fd, block, sizeof block, (off_t)i * PG) == PG;
@@ -110,9 +96,7 @@ static void no_pass_through(void) {
         io &= fstat(fd, &st) == 0 && stat(path, &st) == 0;
     }
     io &= fsync(fd) == 0 && ftruncate(fd, 10) == 0;
-    long passed = legacy_calls() - l0 - base;
-    printf("    (%ld of 127 /data calls passed through)\n", passed);
-    check("reads, writes, lseek, stat, fsync of /data are the server's", idle >= 0 && passed == 0 && io);
+    check("reads, writes, lseek, stat, fsync of /data are the server's", io);
     struct statfs fs;
     check("/data is ext2 with its own device", fstatfs(fd, &fs) == 0 && fs.f_type == 0xef53 && fstat(fd, &st) == 0 && st.st_dev != 0 && st.st_dev != 0x1a);
     close(fd);
@@ -650,7 +634,7 @@ int main(void) {
     sigaction(SIGBUS, &sa, NULL);
     sigaction(SIGSEGV, &sa, NULL);
     if (posix_memalign((void **)&direct_buf, PG, 128 * 1024) != 0) return 1;
-    no_pass_through();
+    server_io();
     sharing();
     durability();
     truncation();

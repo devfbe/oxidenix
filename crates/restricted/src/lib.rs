@@ -97,13 +97,9 @@ pub struct State {
 /// table: before its parent learns of the end) and exits it
 /// (`thread_exit`); a dying thread that enters again exits here.
 pub const SYS_RESTRICTED_ENTER: u64 = 1010;
-/// `legacy_syscall()`: has the kernel's own Linux implementation carry out
-/// the system call in `State` (phase R1's pass-through, which goes away as
-/// the server takes the calls over); its result lands in `State` (signals
-/// are the server's: a wait the call makes ends with EINTR when the thread
-/// is kicked). No call that takes a descriptor passes through any more
-/// (R6e), nor one about processes or signals (R8). Returns 0.
-pub const SYS_LEGACY_SYSCALL: u64 = 1011;
+// 1011 was `legacy_syscall`, phase R1's pass-through: the kernel's own Linux
+// implementation carried out the call in `State`. Since R9 the kernel
+// implements no Linux system call; the server answers every one.
 
 /// The program executed `syscall`; `State::rax` holds its number.
 pub const REASON_SYSCALL: u64 = 1;
@@ -126,8 +122,9 @@ pub const FAULT_PROTECTION: u64 = 2;
 pub const FAULT_BUS: u64 = 3;
 
 /// System call numbers at and above this are not Linux's: the server
-/// answers them with ENOSYS without asking the kernel (iobench uses one to
-/// measure a forwarded call alone).
+/// answers a program's with ENOSYS (iobench uses one to measure a
+/// forwarded call alone), as it does every Linux call it does not
+/// implement.
 pub const FIRST_NON_LINUX: u64 = 1000;
 
 // Kernel objects, by handle (one table per server instance, so an object
@@ -180,15 +177,15 @@ pub const SYS_VM_REMAP: u64 = 1026;
 /// `vm_discard(addr, len)`: drops the pages of private mappings in the
 /// range (zero or the file's again on the next access).
 pub const SYS_VM_DISCARD: u64 = 1027;
-/// `vm_sync(addr, len, flags, out, cap) -> n`: msync's contract for the
-/// kernel's files. With MS_SYNC, the shared mappings of cached objects
+/// `vm_sync(addr, len, flags, out, cap) -> n`: msync's contract (flags and
+/// range checked). With MS_SYNC, the shared mappings of cached objects
 /// (`SYS_MO_CREATE_CACHED`) in the range are the server's to write back:
 /// `n` of them, the first `cap` stored at `out` as (key, first page, end
 /// page) triples of u64s.
 pub const SYS_VM_SYNC: u64 = 1028;
 // 1029 was `kfile_object`, a handle on an open file of the kernel's
-// descriptor table: the table is the server's since R6e, and an open file of
-// the kernel's comes as a handle from `inode_open` (`SYS_KFILE_CALL`).
+// descriptor table: the table is the server's since R6e (and the kernel has
+// no files for Linux programs since R9).
 
 /// Test calls a program can make to its server (lxtest): they exercise the
 /// kernel interface above on the calling process. Each returns 0 or a
@@ -355,10 +352,17 @@ pub const SYS_SET_USERCOPY: u64 = 1033;
 
 // Time and sleeping (phase R5).
 
-/// `clock_read(id) -> ns`: the clock with Linux's id `id` (wall clock,
-/// monotonic, the CPU-time clocks of the calling thread and its process;
-/// another's are the server's, by `proc_info` and `thread_info`: EINVAL).
+/// `clock_read(id) -> ns`: the kernel's clock `id` (`CLOCK_*`): the wall
+/// clock (nanoseconds since the epoch), the monotonic clock (since boot),
+/// the CPU time of the calling thread's process and of the thread; EINVAL
+/// for another id. (Linux's clock ids are the server's: their aliases map
+/// to these, another process's or thread's CPU clock comes from
+/// `proc_info` and `thread_info`.)
 pub const SYS_CLOCK_READ: u64 = 1030;
+pub const CLOCK_WALL: u64 = 0;
+pub const CLOCK_MONO: u64 = 1;
+pub const CLOCK_PROCESS_CPU: u64 = 2;
+pub const CLOCK_THREAD_CPU: u64 = 3;
 /// `sleep_until(deadline) -> 0`: sleeps until `deadline` (monotonic
 /// nanoseconds), or EINTR when the thread is kicked (`thread_kick`).
 pub const SYS_SLEEP_UNTIL: u64 = 1031;
@@ -373,8 +377,7 @@ pub const TEST_USERCOPY: u64 = 1511;
 // descriptor table (`kfd_install`, `kfd_lookup`, `kfd_ready`, `kfd_close`,
 // `kfd_read`, `kfd_write`; phase R6): since R6e the descriptor table, poll,
 // select and epoll are the server's (docs/design/linux-server.md, "The
-// descriptor table"), and the kernel's files a Linux program uses are open
-// file descriptions the server holds by handle (`SYS_KFILE_CALL`).
+// descriptor table").
 
 // Records per working-directory context (phase R6c): the cwd and umask of
 // the threads that share them (CLONE_FS). Since R8 the server's thread
@@ -387,65 +390,16 @@ pub const TEST_FS_VALUE: u64 = 1512;
 /// records some thread still holds (released ones are forgotten).
 pub const TEST_FS_RECORDS: u64 = 1513;
 
-// The kernel's tree through handles (phase R6c.2b): until the server's own
-// filesystems serve them, the server resolves paths in the kernel's tree
-// through handles on its inodes. Names and paths are (pointer, length) in
-// the server's memory, at most 4096 bytes; paths here are relative,
-// without "." and "..", and walked name by name.
-
-/// `inode_root() -> handle`: the root of the kernel's tree.
-pub const SYS_INODE_ROOT: u64 = 1041;
-/// `inode_walk(dir, path, len, out) -> handle`: walks the names of `path`
-/// from `dir`. It stops after the first symlink it reaches (to be read by
-/// the server) or at the end, and stores a `Walk` at `out`. ENOENT or
-/// ENOTDIR for a name that is missing or below a file.
-pub const SYS_INODE_WALK: u64 = 1042;
-/// `inode_stat(handle, buf)`: the inode's `struct stat` (144 bytes).
-pub const SYS_INODE_STAT: u64 = 1043;
-/// `inode_readlink(handle, buf, cap) -> n`: a symlink's target.
-pub const SYS_INODE_READLINK: u64 = 1044;
-/// `inode_create(dir, name, len, kind, perm) -> handle`: a new file
-/// (`INODE_FILE`) or directory (`INODE_DIR`); EEXIST if the name is taken.
-pub const SYS_INODE_CREATE: u64 = 1045;
-/// `inode_symlink(dir, name, len, target, target_len)`.
-pub const SYS_INODE_SYMLINK: u64 = 1046;
-/// `inode_unlink(dir, name, len, dir_only)`: removes a name (rmdir with
-/// `dir_only`).
-pub const SYS_INODE_UNLINK: u64 = 1047;
-/// `inode_rename(odir, oname, olen, ndir, nname, nlen)`.
-pub const SYS_INODE_RENAME: u64 = 1048;
-/// `inode_chmod(handle, perm)`.
-pub const SYS_INODE_CHMOD: u64 = 1049;
-/// `inode_truncate(handle, len)`: as truncate(2) (ETXTBSY while it runs).
-pub const SYS_INODE_TRUNCATE: u64 = 1050;
-/// `inode_open(handle, flags, path, len) -> file`: a handle on a new open
-/// file description of the kernel's for the inode, as open(2) would make it
-/// once the path is resolved (O_ACCMODE, O_TRUNC, O_APPEND, O_NONBLOCK,
-/// O_DIRECTORY; EISDIR, ENOTDIR, ETXTBSY; ENXIO for a device the server
-/// drives); `path` is its absolute path. The server's descriptor table holds
-/// the handle (`SYS_KFILE_CALL`); closing it lets the description go.
-pub const SYS_INODE_OPEN: u64 = 1051;
-/// `inode_statfs(handle, buf)`: its filesystem's `struct statfs`.
-pub const SYS_INODE_STATFS: u64 = 1052;
-// 1053 was `kfd_inode`: `SYS_KFILE_INODE` takes the handle instead.
-// 1054 was `exec_target`: execve is the server's since R8 (`exec_space`).
-
-pub const INODE_FILE: u64 = 0;
-pub const INODE_DIR: u64 = 1;
-
-#[repr(C)]
-#[derive(Clone, Copy, Default, Debug)]
-pub struct Walk {
-    /// Bytes of the path walked (through the symlink, if it stopped at one).
-    pub consumed: u64,
-    /// The mode of the inode reached (S_IFLNK: a symlink).
-    pub mode: u32,
-    pub _pad: u32,
-}
+// 1041-1052 were the kernel's tree through handles on its inodes (phase
+// R6c.2b: `inode_root`, `inode_walk`, `inode_stat`, `inode_readlink`,
+// `inode_create`, `inode_symlink`, `inode_unlink`, `inode_rename`,
+// `inode_chmod`, `inode_truncate`, `inode_open`, `inode_statfs`), last for
+// its /dev: since R9 /dev is the server's own tmpfs and the kernel has no
+// tree. 1053 was `kfd_inode`, 1054 `exec_target`.
 
 // File objects (phase R6c.2c): the contents of the server's tmpfs files,
-// memory objects that grow and shrink like a file, charged to the tmpfs
-// limit as the kernel's tmpfs files are.
+// memory objects that grow and shrink like a file, charged to one limit
+// (half of what may be committed, as Linux's tmpfs; `SYS_FILE_PAGES`).
 
 /// `mo_create_file() -> handle`: a new, empty file object. `mo_read` and
 /// `mo_write` work on it as on a file (a read ends at its end, a write
@@ -616,11 +570,12 @@ pub const SYS_MO_BACKED: u64 = 1083;
 pub const SYS_MO_UNBACK: u64 = 1084;
 /// `server_log(buf, len)`: prints the server's message (UTF-8, at most
 /// `SERVER_LOG_MAX` bytes) on the kernel's console: what a program cannot
-/// be told any more (a final write-back that failed).
+/// be told any more (a final write-back that failed), and the Linux calls
+/// the server does not implement.
 pub const SYS_SERVER_LOG: u64 = 1085;
 pub const SERVER_LOG_MAX: u64 = 256;
 // 1090 was `thread_exists`: thread ids are the server's since R8.
-// 1093 was `kfd_stat`: `SYS_KFILE_CALL` with SYS_FSTAT since R6e.
+// 1093 was `kfd_stat`.
 // 1094 was `net_links`, the kernel's relay of netd's interface records:
 // the server asks netd itself since R7b (`netring`'s `LINKS`).
 /// `thread_nice(key, set, nice) -> nice + 20`: the nice value (-20..=19,
@@ -760,6 +715,51 @@ pub const SYS_VM_FLOOR: u64 = 1153;
 /// into the server's memory (execve's AT_RANDOM).
 pub const SYS_RANDOM: u64 = 1154;
 
+// The last mechanisms the kernel's Linux code used to provide (R9): the
+// server implements the Linux calls over them (futex, arch_prctl,
+// clock_settime and settimeofday, reboot).
+
+/// `futex_wait(addr, val, deadline, bitset, flags) -> 0`: sleeps while the
+/// u32 at `addr` (the program's memory, below 64 TiB; a native server's
+/// own) holds `val`, until a `futex_wake` of the word whose bitset shares a
+/// bit with `bitset` (nonzero), the deadline (monotonic nanoseconds; 0:
+/// none; ETIMEDOUT) or a kick (EINTR, see `thread_kick`); EAGAIN at once
+/// if the word holds another value, EINVAL if `addr` is not 4-aligned,
+/// EFAULT if it cannot be read. The word's key is the address space and the
+/// address, or, with a shared mapping of a memory object there and without
+/// `FUTEX_PRIVATE`, the object and the offset (so processes mapping it meet).
+pub const SYS_FUTEX_WAIT: u64 = 1160;
+/// `futex_wake(addr, n, bitset, flags) -> woken`: wakes at most `n` waiters
+/// of the word at `addr` whose bitset shares a bit with `bitset`.
+pub const SYS_FUTEX_WAKE: u64 = 1161;
+/// `futex_requeue(addr, n_wake, n_move, addr2, val, flags) -> n`: wakes at
+/// most `n_wake` waiters of `addr` and moves at most `n_move` more to wait
+/// on `addr2`; with `FUTEX_CMP` only if the word at `addr` still holds
+/// `val` (EAGAIN otherwise). Returns how many were woken and moved.
+pub const SYS_FUTEX_REQUEUE: u64 = 1162;
+/// The word is private to the address space (Linux's FUTEX_PRIVATE_FLAG).
+pub const FUTEX_PRIVATE: u64 = 1;
+/// `futex_requeue` compares the word first (FUTEX_CMP_REQUEUE).
+pub const FUTEX_CMP: u64 = 2;
+/// `thread_fs(set, base) -> old`: the calling thread's program's FS base
+/// (its thread pointer), which stays in the CPU while the server runs:
+/// returns it, and with `set` 1 replaces it by `base` (below 64 TiB, else
+/// EINVAL). For arch_prctl.
+pub const SYS_THREAD_FS: u64 = 1163;
+/// `clock_set(ns)`: sets the wall clock (CLOCK_REALTIME) to `ns`
+/// nanoseconds since the epoch, for every process of the machine.
+pub const SYS_CLOCK_SET: u64 = 1164;
+/// `power(how) -> !`: every instance of the Linux server writes its caches
+/// back (at most a minute), then the machine powers off (`POWER_OFF`) or
+/// restarts (`POWER_RESTART`). EINVAL for another `how`.
+pub const SYS_POWER: u64 = 1165;
+pub const POWER_OFF: u64 = 0;
+pub const POWER_RESTART: u64 = 1;
+/// `file_pages(out)`: the pages the contents of file objects (every
+/// instance's tmpfs files: `mo_create_file`, `mo_from_image`) take and
+/// their limit, two u64s at `out` in the server's memory (tmpfs's statfs).
+pub const SYS_FILE_PAGES: u64 = 1166;
+
 /// What `proc_info` tells about a process.
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug)]
@@ -779,8 +779,6 @@ pub struct ProcInfo {
     /// The wait status of a process the kernel killed (out of memory, the
     /// monitor's `kill`, a failed server), else 0.
     pub killed: u64,
-    /// Its Linux system calls the server passed back to the kernel.
-    pub legacy_calls: u64,
     /// The kernel's id of it (for its monitor and messages).
     pub kernel_pid: u64,
 }
@@ -806,24 +804,9 @@ pub struct ThreadInfo {
 // epoll; which threads share one is the server's thread table's (R8; 1130
 // was `files_record`, the kernel's record of it until then).
 
-/// `kfile_call(file, nr, a, b, c, d) -> result`: Linux's call `nr` on the
-/// kernel's open file description behind handle `file` (`inode_open`),
-/// with the arguments that follow the descriptor: read, write, pread64,
-/// pwrite64, readv, writev, preadv, pwritev, preadv2 and pwritev2 (`d`:
-/// the RWF flags), lseek, getdents64, ioctl, fsync, fdatasync, ftruncate,
-/// and fcntl's F_SETFL (O_APPEND and O_NONBLOCK: the server keeps the
-/// description's status flags and mirrors them here for the file's own
-/// operations). Buffers are the program's, except: fstat and fstatfs write
-/// their struct into the server's memory, and read and write with
-/// `KFILE_SERVER_BUFFER` in `nr` move the server's memory (sendfile through
-/// the server, at most 64 KiB). These files (regular files and directories
-/// of the kernel's tree, its /dev: null and zero) are always ready:
-/// there is nothing to wait for.
-pub const SYS_KFILE_CALL: u64 = 1131;
-pub const KFILE_SERVER_BUFFER: u64 = 1 << 32;
-/// `kfile_inode(file) -> handle`: the inode the kernel's open file
-/// description behind `file` was opened by (for *at calls and fchdir).
-pub const SYS_KFILE_INODE: u64 = 1132;
+// 1131 and 1132 were `kfile_call` and `kfile_inode`, the calls on an open
+// file of the kernel's tree the server held by handle (its /dev): gone with
+// the tree (R9).
 
 /// `server_wait(words, n, deadline, flags) -> 0`: sleeps until one of the
 /// `n` (1..=`WAIT_MAX`) words described at `words` (pairs of u64: the
@@ -894,10 +877,7 @@ pub const TEST_SERVER_TICKS: u64 = 1518;
 /// other instance, and `sync_done` is the service thread's only. 0 if every check held, else the negative number of the
 /// first that failed.
 pub const TEST_CACHED: u64 = 1516;
-/// `()`: the server passes a `sched_yield` through to the kernel in its
-/// place and returns its result (0): a call that always counts as passed
-/// through (`legacy_calls`), whatever the server comes to handle itself.
-pub const TEST_PASS_THROUGH: u64 = 1517;
+// 1517 was `TEST_PASS_THROUGH`: nothing passes through since R9.
 /// `(ino)`: the pager fails the next backing the kernel asks of it
 /// (`EVENT_MKWRITE`) for the /data file with inode number `ino`, as a full
 /// disk would (`mo_backed` not ok), and answers later ones as usual: the
