@@ -46,6 +46,26 @@ static void sleep_ms(int ms) {
     }
 }
 
+/* Waits (up to 5 s) until process `pid` sleeps (/proc/<pid>/stat's state 'S'): a child that
+ * goes straight into a blocking call is blocked in it then, however loaded the machine. */
+static void wait_sleeping(pid_t pid) {
+    char path[64];
+    snprintf(path, sizeof path, "/proc/%d/stat", pid);
+    for (int i = 0; i < 500; i++) {
+        FILE *f = fopen(path, "r");
+        char state = 0;
+        if (f) {
+            int got = fscanf(f, "%*d (%*[^)]) %c", &state);
+            fclose(f);
+            if (got == 1 && state == 'S') {
+                sleep_ms(20);
+                return;
+            }
+        }
+        sleep_ms(10);
+    }
+}
+
 /* A new pair: the master's descriptor; the slave's path at `path`. */
 static int new_pty(char *path, size_t len) {
     int m = posix_openpt(O_RDWR | O_NOCTTY);
@@ -654,12 +674,13 @@ static void turn_abandon(void) {
         alarm(20);
         _exit(write(s, big, sizeof big) == (ssize_t)sizeof big ? 0 : 1);
     }
-    sleep_ms(100);
+    wait_sleeping(holder);
     pid_t killed = fork();
     if (killed == 0) {
         write(s, "b", 1);
         _exit(0);
     }
+    wait_sleeping(killed);
     pid_t interrupted = fork();
     if (interrupted == 0) {
         alarm(20);
@@ -668,7 +689,8 @@ static void turn_abandon(void) {
         sigaction(SIGUSR1, &sa, NULL);
         _exit(write(s, "c", 1) == -1 && errno == EINTR ? 0 : 1);
     }
-    sleep_ms(100);
+    /* (Both waiters are in their write's turn wait before the signals come.) */
+    wait_sleeping(interrupted);
     kill(killed, SIGKILL);
     waitpid(killed, NULL, 0);
     kill(interrupted, SIGUSR1);
@@ -685,11 +707,12 @@ static void turn_abandon(void) {
     }
     pid_t last = fork();
     if (last == 0) {
-        alarm(2);
+        alarm(10);
         _exit(write(s, "z", 1) == 1 ? 0 : 1);
     }
     int lstatus = 0;
     waitpid(last, &lstatus, 0);
+    printf("ttytest: turn waiters: interrupted %#x, holder %#x, last %#x\n", istatus, hstatus, lstatus);
     check("a killed and an interrupted turn waiter give their tickets up",
           WIFEXITED(istatus) && WEXITSTATUS(istatus) == 0 && WIFEXITED(hstatus) && WEXITSTATUS(hstatus) == 0 &&
               WIFEXITED(lstatus) && WEXITSTATUS(lstatus) == 0);
