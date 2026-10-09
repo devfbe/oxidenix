@@ -219,7 +219,9 @@ pub fn getrusage(who: u64, usage: u64) -> SysResult {
     let ((user, system), pages) = match who as i32 as i64 {
         RUSAGE_SELF => {
             let info = me.group.info.lock();
-            (info.cputime(), info.mem.as_ref().map_or(0, |m| m.peak_pages.load(core::sync::atomic::Ordering::Relaxed)))
+            // (With the programs it ran before an exec.)
+            let live = info.mem.as_ref().map_or(0, |m| m.peak_pages.load(core::sync::atomic::Ordering::Relaxed));
+            (info.cputime(), live.max(info.peak_pages))
         }
         RUSAGE_THREAD => (me.cputime(), 0),
         RUSAGE_CHILDREN => {

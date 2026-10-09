@@ -203,6 +203,17 @@ int main(void) {
     printf("    (wait4: %lld us of CPU, maxrss %ld KiB)\n", (long long)child_us, cu.ru_maxrss);
     check("wait4's rusage has the child's and its children's CPU time", got == child && WIFEXITED(st) && child_us >= 160000 && child_us < 5000000);
     check("... and its peak memory (4 MiB touched)", cu.ru_maxrss >= 4096);
+    /* The peak survives exec: a child that touched 4 MiB, then ran a small program. */
+    child = fork();
+    if (child == 0) {
+        static char before_exec[4 << 20];
+        memset(before_exec, 1, sizeof before_exec);
+        execl("/bin/true", "true", (char *)NULL);
+        _exit(1);
+    }
+    memset(&cu, 0, sizeof cu);
+    got = wait4(child, &st, 0, &cu);
+    check("... kept across exec", got == child && WIFEXITED(st) && WEXITSTATUS(st) == 0 && cu.ru_maxrss >= 4096);
 
     printf("timetest: %s\n", failures ? "FAILED" : "all passed");
     return failures != 0;
