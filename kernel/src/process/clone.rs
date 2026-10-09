@@ -110,7 +110,18 @@ pub fn clone(frame: &Frame, flags: u64, stack: u64, parent_tid: u64, child_tid: 
         }
         mm
     };
-    let files = if flags & CLONE_FILES != 0 { parent.files()?.clone() } else { parent.files()?.duplicate().ok_or(ENOMEM)? };
+    let files = if flags & CLONE_FILES != 0 {
+        parent.files()?.clone()
+    } else {
+        let files = parent.files()?.duplicate().ok_or(ENOMEM)?;
+        // The Linux server's record for the new table (its copy of the
+        // caller's descriptors), if it gave one.
+        if let Some(record) = parent.linux.as_mut().and_then(|l| l.files_child.take()) {
+            // A new table has none yet.
+            let _ = files.set_record(record);
+        }
+        files
+    };
     let fs = match (&parent.fs, flags & CLONE_FS != 0) {
         (Some(f), true) => f.clone(),
         (Some(f), false) => {

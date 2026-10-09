@@ -98,38 +98,46 @@ fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, mut offset: u64) ->
     let mapping = if flags & MAP_ANONYMOUS == 0 {
         crate::files::map_object(fd, shared, prot & PROT_WRITE != 0)
     } else {
-        Some(Ok(crate::files::Mapping::Anonymous { read_only: false }))
+        Ok(crate::files::Mapping::Anonymous { read_only: false })
     };
-    let handle = match mapping {
-        Some(Ok(crate::files::Mapping::Object(h, read_only))) => {
+    // The handle to map, and whether it is this call's to close (the
+    // kernel's open file's is its description's, kept until it is mapped).
+    let mut kernel_file = None;
+    let (handle, own) = match mapping {
+        Ok(crate::files::Mapping::Object(h, read_only)) => {
             if read_only {
                 mo_flags |= MO_READONLY;
             }
-            h as i64
+            (h as i64, true)
         }
-        Some(Err(e)) => -e,
-        None => crate::syscall(SYS_KFILE_OBJECT, [fd, 0, 0, 0, 0, 0]),
+        Err(e) => (-e, false),
+        Ok(crate::files::Mapping::Kernel(k)) => {
+            let h = k.handle() as i64;
+            kernel_file = Some(k);
+            (h, false)
+        }
         // Anonymous memory (also zero's): the offset means nothing.
-        Some(Ok(crate::files::Mapping::Anonymous { read_only })) if shared => {
+        Ok(crate::files::Mapping::Anonymous { read_only }) if shared => {
             offset = 0;
             if read_only {
                 mo_flags |= MO_READONLY;
             }
-            crate::syscall(SYS_MO_CREATE, [len / PAGE, 0, 0, 0, 0, 0])
+            (crate::syscall(SYS_MO_CREATE, [len / PAGE, 0, 0, 0, 0, 0]), true)
         }
-        Some(Ok(crate::files::Mapping::Anonymous { .. })) => {
+        Ok(crate::files::Mapping::Anonymous { .. }) => {
             offset = 0;
-            0
+            (0, false)
         }
     };
     if handle < 0 {
         return handle;
     }
     let mapped = crate::syscall(SYS_MO_MAP, [handle as u64, addr, len, offset, prot, mo_flags]);
-    if handle > 0 {
+    if own && handle > 0 {
         // The mapping holds the object now.
         crate::syscall(SYS_HANDLE_CLOSE, [handle as u64, 0, 0, 0, 0, 0]);
     }
+    drop(kernel_file);
     mapped
 }
 

@@ -1,6 +1,6 @@
 # The Linux server: system calls in restricted mode
 
-Status: accepted; phase R1 implemented (the shared region uses PML4 slot 128, 512 GiB). Decisions: ADR 0001-0004, 0008 (sockets).
+Status: accepted; phase R1 implemented (the shared region uses PML4 slot 128, 512 GiB). Decisions: ADR 0001-0004, 0007 (terminals), 0008 (sockets), 0009 (the descriptor table).
 
 ## Goal
 
@@ -117,13 +117,14 @@ processes, threads, memory objects and the services it uses.
 | threads | `thread_create(process, state)`, `thread_kick`, `restricted_enter(state)` |
 | memory objects | `mo_create(size)`, `mo_create_paged(size, key)` with `pager_wait` and `mo_supply` for the pager thread, `mo_read`/`mo_write`, `mo_clone_cow(mo)` (for `fork`, R8), `mo_physical` for DMA/MMIO (drivers) |
 | mappings | `map(space, addr, mo, offset, len, prot, flags)`, `unmap`, `protect` in a process's restricted region (the server keeps the Linux VMAs; the kernel keeps page tables) |
-| waiting | `futex_wait(addr, value, deadline)`, `futex_wake`, `clock_get` |
+| waiting | `futex_wait(addr, value, deadline)`, `futex_wake`, `clock_get`; `server_wait` for any of several words, with a temporary signal mask (poll, select, epoll; R6e) |
+| descriptor tables | until R8 the kernel's clone decides who shares one: the server's record of each (`files_record`, as `fs_record`); the kernel's own open files by handle (`inode_open`, `kfile_call`; R6e) |
 | IPC | today's services, and shared-memory rings for the I/O paths (separate design) |
 | devices | interrupts, I/O ports, PCI functions, DMA areas (as today; IOMMU per `iommu.md`) |
 | console | the framebuffer console and keyboard as a raw device the server's tty layer drives, held by one instance at a time (ADR 0004; `console_read`, `console_write`, `console_info`, `EVENT_CONSOLE`; R6d) |
 
 What leaves the kernel over the migration: `process/syscall.rs`'s dispatch, `sys_*.rs`,
-`signal.rs`, `epoll.rs`, `poll.rs`, `prctl.rs`, `exec.rs`, `loader.rs`, `elf.rs`, `clone.rs`
+`signal.rs`, `epoll.rs` and `poll.rs` (gone with R6e), `prctl.rs`, `exec.rs`, `loader.rs`, `elf.rs`, `clone.rs`
 and `exit.rs` (as Linux semantics), `fs/` (VFS, tmpfs, page cache, remote filesystems, cpio),
 `net.rs`, `drivers/tty.rs`, procfs's data source. What stays: `address_space.rs` (as memory
 objects and mappings), `sched.rs`, `task.rs` (threads), `futex.rs`, `ipc.rs`, `irq.rs`,
@@ -182,9 +183,10 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
    the `mlock` family as server code. The kernel keeps the page tables and areas
    (mechanism); the server validates and decides. `mo_map` grows to anonymous private memory
    (committed when writable, `MAP_NORESERVE`, demand-zero), placement (a hint, or a free
-   range the kernel finds), `MAP_FIXED_NOREPLACE` and population, and a file mapping takes
+   range the kernel finds), `MAP_FIXED_NOREPLACE` and population, and a file mapping took
    the file through a bridge from the kernel's descriptor table (`kfile_object(fd)`) while
-   files are still the kernel's. `brk` follows with the process model (R8), which owns the
+   files were the kernel's (since R6e it maps the handle of the kernel's open file that the
+   server's descriptor table holds). `brk` follows with the process model (R8), which owns the
    break. The kernel's own `mmap` stays for its native servers until R9.
 5. **R5 — Time and sleeping** (done, with the server's direct access to program memory: faults
    resolved as the program's, a registered fixup for EFAULT): the clocks, `nanosleep`, `clock_nanosleep`, `gettimeofday`,
@@ -194,14 +196,15 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
    paged objects whose pager is the server), the remote filesystem client with rings to
    diskfs, `poll`/`select`/`epoll` (over a kernel primitive that waits for the server's events
    and the kernel's at once), the tty layer (ADR 0004): into the server. The largest phase.
-   R6 goes in steps, each green, by kind of file. Until the last one, the descriptor *table*
-   stays the kernel's, and a file the server implements is a **placeholder** in it (an open
-   file that names the server's object): `dup`, `close`, `fcntl`'s descriptor flags, `fork`'s
-   copy and `exec`'s close-on-exec then work unchanged, and `poll`/`epoll` see the readiness
-   the server reports for it (`kfd_ready`). The server looks up a descriptor before it passes a
-   call through (`kfd_lookup`) and handles the call itself if the descriptor is one of its
-   files; when the last descriptor of a placeholder goes, the kernel tells the instance's
-   service thread (the pager thread, whose wait becomes a wait for any event of the instance).
+   R6 goes in steps, each green, by kind of file. Until the last one (R6e), the descriptor
+   *table* stayed the kernel's, and a file the server implements was a **placeholder** in it
+   (an open file that named the server's object): `dup`, `close`, `fcntl`'s descriptor flags,
+   `fork`'s copy and `exec`'s close-on-exec worked unchanged, and `poll`/`epoll` saw the
+   readiness the server reported for it (`kfd_ready`). The server looked up a descriptor
+   before it passed a call through (`kfd_lookup`) and handled the call itself if the
+   descriptor was one of its files; when the last descriptor of a placeholder went, the kernel
+   told the instance's service thread (the pager thread, whose wait became a wait for any
+   event of the instance). R6e removed all of that.
    - **R6a — Placeholders and pipes** (done): the mechanism above, and pipes as the first kind
      (blocking with interruptible futexes, `O_NONBLOCK`, end of file and `EPIPE`/`SIGPIPE`).
    - **R6b — eventfd** (done).
@@ -246,15 +249,13 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
    - **R6d — The terminal** (done; ADR 0004, ADR 0007): the console as a device of the server, the
      line discipline and job control's terminal side in the server, and pseudo-terminals.
      See "The terminal" below.
-   - **R6e — The descriptor table, `poll`, `select` and `epoll`** move with the sockets (R7),
-     the last kind the kernel implements, over a kernel wait for the server's events and the
-     netd's at once. Until then the descriptor's own requests pass through to the kernel,
-     which holds the flags and the close-on-exec bit: `fcntl` and the generic ioctls
-     `FIONBIO`, `FIOCLEX` and `FIONCLEX` (the server passes them through for its own files,
-     too); they move with the table.
+   - **R6e — The descriptor table, `poll`, `select` and `epoll`** (done; ADR 0009): the
+     table is the server's, per process, and the placeholders turn around: the kernel's files
+     a program uses are open file descriptions the server holds by handle. See "The
+     descriptor table" below.
 7. **R7 — Sockets** into the server, talking to netd over rings.
    - **R7a — `AF_UNIX`** (done; `servers/linux/src/unix.rs`, `sockcalls.rs`, `scm.rs`):
-     stream, datagram and seqpacket sockets are files of the server, placeholders as pipes
+     stream, datagram and seqpacket sockets are files of the server, as pipes
      are; `socket` and `socketpair` of the family come to the server (since R7b every socket
      call does), and so does every socket call on one of its descriptors. Names are socket inodes of the server's tmpfs and
      of `/data` (ext2's socket type, `fsring`'s `KIND_SOCKET`), found by inode, or names of
@@ -267,48 +268,42 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
      `MSG_TRUNC`, `MSG_CTRUNC`, autobind, `SO_PASSCRED`/`SCM_CREDENTIALS` and `SO_PEERCRED`
      (the ids from `thread_ids`, 1103), timeouts.
 
-     **Passing descriptors** (`SCM_RIGHTS`) while the descriptor table is still the kernel's:
-     a descriptor in flight is a handle on its open file description (`kfile_object`, 1029,
-     which takes any descriptor: a file of the kernel's, a socket of netd's or a placeholder
-     of the server's), kept by the message in the receiver's queue; the receiver gets a new
-     descriptor for the same description (`kfd_install_file`, 1100: shared offset and status
-     flags, close-on-exec with `MSG_CMSG_CLOEXEC`), and the handle goes. The handle keeps
-     the description alive after the sender closed its descriptor, and a message dropped
-     unread closes its handles (a placeholder's last reference gone is reported as its last
-     descriptor closed). The kernel needs no notion of sockets for this. Sockets that only
-     messages in flight keep (a socket in its own queue, a cycle of them) are found by a
-     collector as Linux's `unix_gc`: a socket in flight whose description has no reference
-     but its handles in flight (`kfile_info`, 1101) is a candidate, candidates referred to
-     from outside the candidates' queues and what they refer to are reachable, the rest have
-     their queues emptied. A call that uses one of the server's files keeps it referenced
-     until it returns (`kfd_lookup` pins it, as Linux's `fdget`), so a socket a call works on
-     is never a candidate, and another thread's close does not end a blocked receive or
-     accept; a lock the collector takes exclusively (making, installing and letting go of
-     descriptors in flight take it shared) keeps its view still while it runs. Handles of
-     descriptors in flight are marked (`KFILE_INFLIGHT`): when a descriptor of such a
-     placeholder goes (by close, exit or exec) or a call that pinned one ends, and what is
-     left are only its handles in flight, the kernel queues `EVENT_INFLIGHT` (after the
-     reference is gone, so the collector sees it gone), and the collector runs on the
-     instance's **worker** thread (`ROLE_WORKER`: a second thread of the pager's process
-     that serves neither a program nor a page). Never on the pager: the collector waits for
-     sockets' locks, and nothing may wait for the pager while it holds one; for the same
-     reason no server lock the pager takes is held while program memory is copied (a fault
-     there may need a page the pager brings): a receive copies with only its socket's (or
-     pipe's) receive lock held. The collector also runs on a sender's thread before it is
-     refused with `ETOOMANYREFS`: at most 16 Ki descriptors are in flight per user and in
-     the instance (a quarter of its handle table, which files and mappings need too), so
-     forks gain nothing.
+     **Passing descriptors** (`SCM_RIGHTS`): a descriptor in flight is a reference to its
+     open file description (`scm::Passed`; until R6e a handle on the kernel's open file,
+     `kfile_object` with `KFILE_INFLIGHT`, installed by `kfd_install_file`), whatever the
+     file is, kept by the message in the receiver's queue and counted in the description's
+     `inflight`; the receiver gets a new descriptor for the same description (shared offset
+     and status flags, close-on-exec with `MSG_CMSG_CLOEXEC`), and the reference goes. It
+     keeps the description alive after the sender closed its descriptor, and a message
+     dropped unread lets go of its references (a description whose last one that was
+     closes). Sockets that only messages in flight keep (a socket in its own queue, a cycle
+     of them) are found by a collector as Linux's `unix_gc`: a socket in flight whose
+     description has no reference but those in flight (its strong count against
+     `inflight`) is a candidate, candidates referred to from outside the candidates' queues
+     and what they refer to are reachable, the rest have their queues emptied. A call that
+     uses a description holds a reference until it returns (Linux's `fdget`), so a socket a
+     call works on is never a candidate, and another thread's close does not end a blocked
+     receive or accept; a lock the collector takes exclusively (making, installing and
+     letting go of descriptors in flight take it shared) keeps its view still while it runs.
+     When a reference to a description in flight goes (a descriptor closed, by close, exit or
+     exec, or a call that used one ended), the collector is asked for after the reference is
+     gone, so that it sees it gone; it runs on the instance's **worker** thread
+     (`ROLE_WORKER`: a second thread of the pager's process that serves neither a program nor
+     a page). Never on the pager: the collector waits for sockets' locks, and nothing may
+     wait for the pager while it holds one; for the same reason no server lock the pager
+     takes is held while program memory is copied (a fault there may need a page the pager
+     brings): a receive copies with only its socket's (or pipe's) receive lock held. The
+     collector also runs on a sender's thread before it is refused with `ETOOMANYREFS`: at
+     most 16 Ki descriptors are in flight per user and in the instance, so forks gain
+     nothing.
      `SCM_CREDENTIALS` may name only a process of the caller's tree (`thread_exists` with
-     `THREAD_IN_INSTANCE`). When the descriptor table moves into the server (R6e), the
-     handles become references in the server's own table and these calls go.
+     `THREAD_IN_INSTANCE`).
    - **Netlink** (`NETLINK_ROUTE`): the server's files too (`netlink.rs`, messages in
      `crates/netlink`), answered from netd's description of its interfaces (`netring`'s
-     `Link` records, asked for over the instance's channel to netd since R7b), as the kernel
-     answers `fstat` of its own descriptors for the server's `statx` (`kfd_stat`, 1093) until
-     the descriptor table moves (R6e).
+     `Link` records, asked for over the instance's channel to netd since R7b).
    - **R7b — Internet sockets** (ADR 0008; `servers/linux/src/inet.rs`, `inetcalls.rs`,
      `netclient.rs`, the protocol `crates/netring`, netd's `servers/netd/src/service.rs`):
-     `AF_INET` TCP, UDP and raw ICMP sockets are files of the server, placeholders as
+     `AF_INET` TCP, UDP and raw ICMP sockets are files of the server, as
      `AF_UNIX` ones are; every socket call comes to the server (`AF_INET6` and the families
      nobody implements are `EAFNOSUPPORT` there), and the kernel's socket layer and its IPC
      protocol to netd are gone: the kernel only starts netd (and restarts it, ADR 0006).
@@ -360,16 +355,17 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
      for a connect), and a signal never leaves anything half done in netd (an interrupted
      connect goes on: `EALREADY` while it runs, as Linux).
 
-     **Readiness** for `poll`, `select` and `epoll` (still the kernel's until R6e) is
-     reported as for every placeholder (`kfd_ready`), computed by the server from the
+     **Readiness** for `poll`, `select` and `epoll` is computed by the server from the
      control block as Linux's `tcp_poll` and `udp_poll` do (with `POLLRDHUP`, `SO_RCVLOWAT`,
-     `POLLHUP` for a socket never connected, `POLLERR` with a pending error). A call that
-     changes it reports it (a read that empties the ring); what netd changes reaches the
-     instance's **net thread** (`ROLE_NET`, a third service thread of the pager's process):
-     netd sets the socket's bit in the client bitmap and wakes the thread if it sleeps (one
-     wake per netd round), the thread reports each marked socket's readiness, and an edge
-     for new data or room (`EPOLLET`). A blocked call does not wait for the net thread:
-     netd wakes it directly.
+     `POLLHUP` for a socket never connected, `POLLERR` with a pending error) and reported as
+     for every file of the server (`files::ready`). A call that changes it reports it (a
+     read that empties the ring); what netd changes reaches the instance's **net thread**
+     (`ROLE_NET`, a third service thread of the pager's process): netd sets the socket's bit
+     in the client bitmap and wakes the thread if it sleeps (one wake per netd round), the
+     thread reports each marked socket's readiness, and an edge for new data or room
+     (`EPOLLET`). A blocked call does not wait for the net thread: netd wakes it directly,
+     and so it wakes a poll or select on the socket (they wait on the control block's word
+     too, R6e).
 
      **Semantics** (Linux's, `man 7 tcp`, `udp`, `ip`, `socket`): `bind` checks the address
      is local (`EADDRNOTAVAIL`) and the port, and `listen` checks the port again (Linux's
@@ -532,8 +528,8 @@ input waits (a pty master's write) or is dropped (the keyboard).
 A terminal is a line discipline, its job control state (session, foreground group, window
 size), its hangup generation, the readiness it reported to each of its open file
 descriptions, and a driver: the console (`console.rs`) or a pseudo-terminal's slave
-(`pty.rs`). Each open of a terminal is an open file description of the server's (a
-placeholder in the kernel's descriptor table, as pipes are).
+(`pty.rs`). Each open of a terminal is an open file description of the server's, as a
+pipe's end is.
 
 - **Reading** (`n_tty_read`'s rules): canonical reads end at a line's end (an `VEOF` at the
   start of a line reads 0); noncanonical reads follow `VMIN`/`VTIME` (with `VTIME` an
@@ -601,10 +597,11 @@ placeholder in the kernel's descriptor table, as pipes are).
   are kept (O_CREAT creates nothing, the access mode is ignored), O_NOFOLLOW names a symlink
   itself; fstat and fstatfs describe the node (live), it serves as the directory of *at calls
   and with AT_EMPTY_PATH as their target, fchdir takes a directory; reads, writes, ioctls,
-  mmap, getdents and fchmod, fchown, futimens are EBADF. Its placeholder in the kernel's
-  table carries O_PATH: F_GETFL shows it, only dup, close and fcntl's F_DUPFD, F_GETFD,
-  F_SETFD and F_GETFL take it there; poll gives POLLNVAL, select, epoll, ioctl and F_SETFL
-  EBADF; inotify and socket calls on one are EBADF. As a directory of *at calls it must be a
+  mmap, getdents and fchmod, fchown, futimens are EBADF. Its description's status flags
+  carry O_PATH: F_GETFL shows it, only dup, close and fcntl's F_DUPFD, F_GETFD, F_SETFD and
+  F_GETFL take it of the descriptor table's calls (Linux's fdget_raw), and SCM_RIGHTS passes
+  it; poll gives POLLNVAL, select, epoll, ioctl and F_SETFL EBADF; inotify and socket calls
+  on one are EBADF. As a directory of *at calls it must be a
   directory (ENOTDIR: an O_NOFOLLOW symlink's path is not followed); `readlinkat` with an
   empty path reads the symlink it names. It keeps its node (a /data inode unlinked meanwhile
   goes with its blocks when the last descriptor closes, as an open file's). Not done yet:
@@ -645,6 +642,115 @@ output only), so the console
 driver's input path is checked interactively (bash, busybox, htop); its output path carries
 the whole test suite's output.
 
+## The descriptor table (R6e)
+
+Before R6e the descriptor table was the kernel's: the server's files were placeholders in it,
+and poll, select and epoll were the kernel's, over the readiness the server reported. With
+R6e the table, poll, select and epoll are the server's (`fdtable.rs`, `poll.rs`, `epoll.rs`);
+the kernel keeps descriptor tables for its native servers only. Decisions in ADR 0009.
+
+### Tables, descriptions and references
+
+- **An open file description** (`files::Description`) is a file of the server's (`File`: a
+  pipe end, a socket, an open file of tmpfs or /data, a terminal, an epoll instance, ...) or
+  one of the kernel's it holds by handle (below), with its status flags (the access mode,
+  O_APPEND, O_NONBLOCK, ...; O_PATH for one that names a node only), its watch list
+  (readiness, below) and its references in flight. Descriptors refer to it
+  (`files::FileRef`), and so do a call that uses it (Linux's fdget: another thread's close
+  never takes a description from under a call) and a descriptor in flight. With its last
+  reference the file closes (Linux's fput), on the thread that let go of it: the closing
+  thread for close(2), the service thread when a process's table ends, the worker for a
+  message the collector dropped (an internet socket's close then goes through the net
+  thread, which may wait for netd).
+- **The table** (`fdtable::FilesContext`) holds the descriptors (a description and the
+  close-on-exec bit), the lowest free slot, and RLIMIT_NOFILE (4096 by default, at most
+  2^20, Linux's fs.nr_open). Its calls: close, close_range (with `CLOSE_RANGE_CLOEXEC` and
+  `CLOSE_RANGE_UNSHARE`), dup, dup2, dup3, fcntl's `F_DUPFD`, `F_DUPFD_CLOEXEC`, `F_GETFD`,
+  `F_SETFD`, `F_GETFL` and `F_SETFL` (O_APPEND, O_NONBLOCK), the ioctls `FIONBIO`, `FIOCLEX`
+  and `FIONCLEX`, and RLIMIT_NOFILE of prlimit64, getrlimit and setrlimit (the caller's: the
+  limit is kept with its table until the process model is the server's). No lock of a table
+  is held while program memory is copied or a description is let go of.
+- **Which processes share a table** is decided by the kernel's clone until R8 (CLONE_FILES),
+  as for working directories (`fs_record`): each table of the kernel's (which holds no
+  descriptor of a Linux program) carries the server's record of its table
+  (`SYS_FILES_RECORD`). A clone without CLONE_FILES (fork, vfork) gets a copy the server makes
+  before the call passes through (`FS_CHILD`); execve gets the copy without the close-on-exec
+  descriptors, made when the call starts (Linux's unshare_files) and installed by the kernel
+  at its point of no return (a failed execve gives it back); a process's exit, or its execve,
+  ends its old table when the last process using it is done with it: the kernel hands the
+  record back (`EVENT_RELEASE`), and the service thread lets the table go, which closes its
+  descriptors. A thread remembers its table's record in the server's words of its State page
+  (`SERVER_THREAD_OFFSET`, `thread.rs`) after the first lookup, until it executes a program
+  or unshares its table: a descriptor's lookup is a lock and a reference count, no kernel
+  call. The interface the process model will call (R8): `FilesContext::fork`,
+  `FilesContext::for_exec`, and letting the table go at exit.
+
+### The kernel's files
+
+What remains of the kernel's files for a Linux program are the inodes of the kernel's tree
+(/proc and /sys through the kernel's remote filesystem, the kernel's /dev nodes null and
+zero): the inverse of the placeholders. `inode_open` returns a handle on the kernel's open
+file description (no descriptor), which the server's description holds (`kfile.rs`); its calls
+are the kernel's with the program's buffers (`kfile_call`: read, write, the positional and
+vectored forms, lseek, getdents64, ioctl, fsync, ftruncate; fstat and fstatfs into the
+server's memory), mmap maps the handle, and *at calls and fchdir reach its inode
+(`kfile_inode`). The description's status flags are the server's; the kernel's file gets
+O_APPEND and O_NONBLOCK too, for its own operations. These files are always ready (as
+Linux's regular files: epoll refuses them with EPERM), so poll, select and epoll need nothing
+from the kernel for them.
+
+### Readiness and waiting
+
+- **Watches**: each description has a watch list (`poll::Watch`, Linux's wait queue for
+  poll), which pollers and epoll interests subscribe to. Every file reports each change of
+  its readiness, and each event that is an edge for EPOLLET (new data, room), under its own
+  lock (`files::ready`, by the description's id, as it reported to the kernel before): the
+  report wakes the subscribed pollers and queues the subscribed epoll interests. Reports
+  find the watch in a sharded table, and not at all while nothing in the instance is
+  subscribed (a pipe's report costs a load then). Readiness itself is asked of each file
+  when it is checked (`Description::poll_mask`, Linux's poll methods), never taken from the
+  reports.
+- **poll, ppoll, select, pselect6** subscribe to every description they look at, check, and
+  sleep on their own word (which the reports advance and wake) until a report, the deadline
+  or a signal; on an internet socket they also wait on the control block's word that netd
+  wakes, so they do not wait for the net thread to pass netd's change on. The kernel's
+  primitive is one call for any of several words (`server_wait`: up to 64 words of the
+  server's memory or of an object mapped there, a deadline, and a temporary signal mask
+  with the saved-mask semantics of sigsuspend for ppoll, pselect6 and epoll_pwait).
+- **Signals**: interrupted with nothing ready, poll answers `ERESTART_RESTARTBLOCK` (the
+  kernel restarts it as restart_syscall, which the server answers with the deadline it kept
+  in the thread's words, unless a handler ran: then EINTR), ppoll, select and pselect6
+  `ERESTARTNOHAND` (restarted unless a handler ran, with the time left, which they write
+  back first, Linux's poll_select_finish), epoll_wait EINTR. The kernel's signal delivery
+  maps these codes (`restricted::ERESTARTSYS` and the others), as Linux's does.
+
+### epoll
+
+An instance (`epoll.rs`) is a description with an interest list, keyed by (descriptor
+number, description) as Linux's, and a ready list. An interest is subscribed to its
+description's watch: a report queues it (if it asks for the events reported) and wakes one
+waiter of the instance, and reports the instance itself (to a poll on it, and to the
+instances that watch it: nesting, at most 4 deep and without cycles, ELOOP). epoll_wait takes
+interests off the ready list and asks each file for its readiness now: a level-triggered one
+that is still ready goes back to the end of the list after delivery (so a full `maxevents`
+rotates through them), an edge-triggered one waits for the next report, a one-shot one is
+disabled until `EPOLL_CTL_MOD`. `EPOLLEXCLUSIVE` interests in one file wake their instances
+one at a time (up to the first that had a waiter), as Linux's exclusive wakeup. A waiter that
+leaves without taking the events (a signal, the deadline) passes the wake on. Interests
+belong to the description: they go when it goes (its last reference), whatever descriptor
+numbers still name it, and they hold no reference to it. No lock of an instance is held while
+events are copied to the program.
+
+### What went
+
+The placeholders (`ServerFile`, `kfd_install`, `kfd_lookup` and its pins, `kfd_ready`,
+`kfd_close`, `kfd_read`, `kfd_write`, `kfd_stat`, `kfd_inode`), the bridges for descriptors in
+flight (`kfile_object`, `KFILE_INFLIGHT`, `kfd_install_file`, `kfile_info`, `EVENT_INFLIGHT`),
+`EVENT_CLOSED` and `legacy_syscall`'s list of closed files, and the kernel's epoll, poll and
+select with the wait queues' callbacks. Calls on descriptors no longer pass through to the
+kernel; the kernel's descriptor tables, open files, pipes and eventfds stay for its native
+servers until R9.
+
 ## Decisions taken in the review
 
 - One server instance per process tree, not one for all (ADR 0002).
@@ -654,3 +760,6 @@ the whole test suite's output.
   terminal per session until R8, pseudo-terminals in the server (ADR 0007).
 - Internet sockets keep their state in control blocks in the channel's shared area, their data
   in byte rings in granted memory, and netd answers every request at once (ADR 0008).
+- The descriptor table is the server's, shared as the kernel's clone decides until R8
+  (records), the kernel's files are held by handle, readiness goes through the server's
+  watch lists over one kernel wait for any of several words (ADR 0009).

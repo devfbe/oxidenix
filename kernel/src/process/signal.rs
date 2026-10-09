@@ -804,9 +804,45 @@ fn fxrstor(image: [u8; 512]) {
 /// must not be mistaken for an EINTR of rt_sigreturn itself.
 fn restartable(nr: u64) -> bool {
     // poll, rt_sigreturn, select, pause, nanosleep, rt_sigtimedwait,
-    // rt_sigsuspend, clock_nanosleep, the epoll waits, pselect6, ppoll:
-    // EINTR, as on Linux.
-    !matches!(nr, 7 | 15 | 23 | 34 | 35 | 128 | 130 | 230 | 232 | 270 | 271 | 281 | 441)
+    // restart_syscall, rt_sigsuspend, clock_nanosleep, the epoll waits,
+    // pselect6, ppoll: EINTR, as on Linux (the Linux server's poll and select
+    // restart themselves where Linux does, with the restart codes).
+    !matches!(nr, 7 | 15 | 23 | 34 | 35 | 128 | 130 | 219 | 230 | 232 | 270 | 271 | 281 | 441)
+}
+
+/// How a call that returns one of the restart codes (only the Linux
+/// server's calls do, `restricted::ERESTARTSYS` and the others) goes on
+/// after signal delivery.
+#[derive(Clone, Copy, PartialEq)]
+enum Restart {
+    /// EINTR the kernel's `restartable` call returned, or ERESTARTSYS:
+    /// again unless a handler without SA_RESTART runs.
+    Unless,
+    /// ERESTARTNOINTR: always again.
+    Always,
+    /// ERESTARTNOHAND: again unless a handler runs.
+    NoHandler,
+    /// ERESTART_RESTARTBLOCK: as `NoHandler`, by restart_syscall.
+    Block,
+}
+
+/// The restart a call's result in `rax` asks for (the server's codes, or
+/// the kernel's EINTR for a restartable call), if any.
+fn restart_of(rax: u64, nr: u64) -> Option<Restart> {
+    match -(rax as i64) {
+        restricted::ERESTARTSYS => Some(Restart::Unless),
+        restricted::ERESTARTNOINTR => Some(Restart::Always),
+        restricted::ERESTARTNOHAND => Some(Restart::NoHandler),
+        restricted::ERESTART_RESTARTBLOCK => Some(Restart::Block),
+        EINTR if restartable(nr) => Some(Restart::Unless),
+        _ => None,
+    }
+}
+
+/// Makes the interrupted syscall `nr` run again when the frame resumes
+/// (or restart_syscall for `Restart::Block`).
+fn restart(frame: &mut Frame, nr: u64, how: Restart) {
+    rewind(frame, if how == Restart::Block { restricted::SYS_RESTART_SYSCALL } else { nr });
 }
 
 /// Makes the interrupted syscall `nr` run again when the frame resumes.
@@ -864,12 +900,15 @@ fn die(sig: u32) -> ! {
 /// Handles pending signals before returning to user space: stops the
 /// process, terminates it, or redirects `frame` to a handler. `syscall` is
 /// the number of the syscall that is returning, if any, so that calls
-/// interrupted with EINTR can be restarted.
+/// interrupted with EINTR (or a restart code of the Linux server's) can be
+/// restarted. A restart code never reaches the program: without a signal
+/// to act on the call simply runs again, with a handler it is EINTR unless
+/// it restarts.
 pub fn deliver(frame: &mut Frame, syscall: Option<u64>) {
     if !frame.from_user() {
         return;
     }
-    let mut interrupted = syscall.filter(|&nr| frame.rax == (-EINTR) as u64 && restartable(nr));
+    let mut interrupted = syscall.and_then(|nr| restart_of(frame.rax, nr).map(|how| (nr, how)));
     loop {
         enum Next {
             Done,
@@ -930,8 +969,8 @@ pub fn deliver(frame: &mut Frame, syscall: Option<u64>) {
         match next {
             Next::Done => {
                 // Nothing ran in user space, so the interrupted call can simply go on.
-                if let Some(nr) = interrupted {
-                    rewind(frame, nr);
+                if let Some((nr, how)) = interrupted {
+                    restart(frame, nr, how);
                 }
                 return;
             }
@@ -939,9 +978,16 @@ pub fn deliver(frame: &mut Frame, syscall: Option<u64>) {
             Next::Stop(sig) => group_stop(sig),
             Next::Die(sig) => die(sig),
             Next::Handle(sig, action, old_mask) => {
-                if let Some(nr) = interrupted.take() {
-                    if action.flags & SA_RESTART != 0 {
-                        rewind(frame, nr);
+                if let Some((nr, how)) = interrupted.take() {
+                    let again = match how {
+                        Restart::Always => true,
+                        Restart::Unless => action.flags & SA_RESTART != 0,
+                        Restart::NoHandler | Restart::Block => false,
+                    };
+                    if again {
+                        restart(frame, nr, how);
+                    } else {
+                        frame.rax = (-EINTR) as u64;
                     }
                 }
                 return push_handler_frame(frame, sig, action, old_mask);

@@ -1,16 +1,16 @@
 //! Open files: `OpenFile` (an open file description with offset and flags) over inodes, pipes,
-//! eventfds, devices and files whose calls a server implements (`ServerFile`).
+//! eventfds and devices. A Linux program's descriptors are its Linux server's (phase R6e):
+//! the open inodes of the kernel's tree it uses are open files the server holds by handle
+//! (`restricted::SYS_KFILE_CALL`); the kernel's own descriptor tables serve the native servers.
 
 use super::{Device, Inode};
 use crate::process::errno::*;
-use crate::process::epoll::{self, Epoll};
-use crate::process::poll::PollSource;
 use crate::process::signal::interrupted;
 use crate::process::{sched::prepare_to_wait, wakeup};
 use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::vec::Vec;
-use alloc::sync::{Arc, Weak};
+use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use crate::sync::Mutex;
 
@@ -25,9 +25,6 @@ pub const O_NONBLOCK: u32 = 0o4000;
 pub const O_DIRECTORY: u32 = 0o200000;
 pub const O_NOFOLLOW: u32 = 0o400000;
 pub const O_CLOEXEC: u32 = 0o2000000;
-/// A descriptor that only names a node (the Linux server's placeholders of O_PATH
-/// opens): only dup, close and fcntl's F_DUPFD, F_GETFD, F_SETFD and F_GETFL take it.
-pub const O_PATH: u32 = 0o10000000;
 
 const PIPE_CAPACITY: usize = 64 * 1024;
 /// Buffer space charged when a pipe is created. An empty pipe can therefore
@@ -79,76 +76,11 @@ impl EventFd {
     }
 }
 
-/// The owner of placeholder files (a Linux server instance): told when
-/// the last descriptor of one goes.
-pub trait ServerFiles: Send + Sync {
-    fn closed(&self, id: u64);
-    /// A descriptor or pin of a placeholder with references in flight
-    /// went: sockets may have become reachable only from messages in
-    /// flight (the server's collector looks).
-    fn in_flight_reference_gone(&self);
-}
-
-/// A file the Linux server implements, as the kernel's descriptor table
-/// holds it (a placeholder, see docs/design/linux-server.md, R6): the id of
-/// the server's object and the readiness the server reports, for poll,
-/// select and epoll. The server handles every other operation itself.
-pub struct ServerFile {
-    pub id: u64,
-    owner: Weak<dyn ServerFiles>,
-    ready: AtomicU32,
-    /// Always ready (a regular file or a directory of the server's).
-    always: bool,
-}
-
-impl ServerFile {
-    pub fn new(id: u64, owner: Weak<dyn ServerFiles>, ready: i16, always: bool) -> Arc<ServerFile> {
-        Arc::new(ServerFile { id, owner, ready: AtomicU32::new(ready as u16 as u32), always })
-    }
-
-    /// Whether `owner` (an instance of the Linux server) made this file.
-    pub fn owned_by(&self, owner: *const ()) -> bool {
-        self.owner.as_ptr() as *const () == owner
-    }
-
-    /// See `ServerFiles::in_flight_reference_gone`.
-    fn in_flight_reference_gone(&self) {
-        if let Some(owner) = self.owner.upgrade() {
-            owner.in_flight_reference_gone();
-        }
-    }
-
-    /// The server's readiness report: wakes who polls the file.
-    pub fn set_ready(&self, ready: i16) {
-        self.ready.store(ready as u16 as u32, Ordering::Release);
-        wakeup(self.chan());
-    }
-
-    fn ready(&self) -> i16 {
-        self.ready.load(Ordering::Acquire) as u16 as i16
-    }
-
-    fn chan(&self) -> usize {
-        self as *const ServerFile as usize
-    }
-}
-
-impl Drop for ServerFile {
-    fn drop(&mut self) {
-        if let Some(owner) = self.owner.upgrade() {
-            owner.closed(self.id);
-        }
-    }
-}
-
 pub enum Kind {
     Inode(Arc<Inode>),
     PipeRead(Arc<Pipe>),
     PipeWrite(Arc<Pipe>),
     EventFd(Arc<EventFd>),
-    Epoll(Arc<Epoll>),
-    /// A file of the Linux server (a placeholder).
-    Server(Arc<ServerFile>),
 }
 
 /// Open file description; several descriptors may share it (dup, fork,
@@ -164,50 +96,15 @@ pub struct OpenFile {
     /// continues from it, so entries removed meanwhile (rm -r) never shift
     /// the position and skip others.
     pub dir_snapshot: Mutex<Option<Vec<(String, u64, u8)>>>,
-    /// The epoll interests in this file, removed when it is closed.
-    pub watchers: spin::Mutex<Vec<Weak<epoll::Item>>>,
     /// A regular file opened for writing holds the right to write it.
     _write_access: Option<super::WriteAccess>,
-    /// The Linux server's handles on it that are descriptors in flight
-    /// (`restricted::KFILE_INFLIGHT`).
-    pub in_flight: AtomicUsize,
-    /// References being let go of through `release` right now.
-    releasing: AtomicUsize,
     /// Its number, the inode number fstat reports for a file without an
-    /// inode (a socket, a pipe, an epoll instance): opaque, never an
-    /// address of the kernel's.
+    /// inode (a pipe, an eventfd): opaque, never an address of the kernel's.
     pub number: u64,
 }
 
 /// The next `OpenFile::number`.
 static NEXT_NUMBER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
-
-/// Lets go of a descriptor's (or a pin's) reference to `file`. If it is
-/// one of the Linux server's placeholders with descriptors in flight and,
-/// with the reference gone, nothing but those keeps it (a candidate for the
-/// server's collector, as Linux's unix_gc looks for files whose only
-/// references are in flight), its owner is told: after the reference went,
-/// so that the collector sees it gone. References other `release`s are
-/// letting go of count as gone (`releasing`), so of concurrent ones at
-/// least one tells; one told for nothing costs a collection.
-pub fn release(file: Arc<OpenFile>) {
-    if file.in_flight.load(Ordering::Acquire) == 0 || !matches!(file.kind, Kind::Server(_)) {
-        return;
-    }
-    file.releasing.fetch_add(1, Ordering::AcqRel);
-    let weak = Arc::downgrade(&file);
-    drop(file);
-    // Gone altogether: its owner hears of it as closed.
-    let Some(file) = weak.upgrade() else { return };
-    let others = Arc::strong_count(&file).saturating_sub(file.releasing.load(Ordering::Acquire));
-    let candidate = others <= file.in_flight.load(Ordering::Acquire);
-    file.releasing.fetch_sub(1, Ordering::AcqRel);
-    if candidate {
-        if let Kind::Server(s) = &file.kind {
-            s.in_flight_reference_gone();
-        }
-    }
-}
 
 impl OpenFile {
     pub fn new(kind: Kind, flags: u32, path: Option<String>) -> Arc<OpenFile> {
@@ -221,10 +118,7 @@ impl OpenFile {
             flags: AtomicU32::new(flags & !O_CLOEXEC),
             path,
             dir_snapshot: Mutex::new(None),
-            watchers: spin::Mutex::new(Vec::new()),
             _write_access: write_access,
-            in_flight: AtomicUsize::new(0),
-            releasing: AtomicUsize::new(0),
             number: NEXT_NUMBER.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
         })
     }
@@ -266,11 +160,6 @@ impl OpenFile {
             Kind::Inode(i) => Some(i),
             _ => None,
         }
-    }
-
-    /// An O_PATH descriptor's (see `O_PATH`).
-    pub fn is_path(&self) -> bool {
-        self.flags.load(Ordering::Relaxed) & O_PATH != 0
     }
 
     pub fn readable(&self) -> bool {
@@ -316,8 +205,6 @@ impl OpenFile {
             Kind::PipeRead(pipe) => self.read_pipe(pipe, buf),
             Kind::PipeWrite(_) => Err(EBADF),
             Kind::EventFd(e) => self.read_eventfd(e, buf),
-            // The server reads its files itself.
-            Kind::Epoll(_) | Kind::Server(_) => Err(EINVAL),
         }
     }
 
@@ -353,7 +240,6 @@ impl OpenFile {
             Kind::PipeWrite(pipe) => self.write_pipe(pipe, buf),
             Kind::PipeRead(_) => Err(EBADF),
             Kind::EventFd(e) => self.write_eventfd(e, buf),
-            Kind::Epoll(_) | Kind::Server(_) => Err(EINVAL),
         }
     }
 
@@ -542,69 +428,8 @@ impl OpenFile {
     }
 }
 
-pub const POLLIN: i16 = 0x1;
-pub const POLLOUT: i16 = 0x4;
-pub const POLLERR: i16 = 0x8;
-pub const POLLHUP: i16 = 0x10;
-
-impl OpenFile {
-    /// Ready events among `events` (plus POLLERR/POLLHUP, which are always reported).
-    pub fn poll(&self, events: i16) -> i16 {
-        let ready = match &self.kind {
-            Kind::Inode(_) => POLLIN | POLLOUT,
-            Kind::PipeRead(p) => {
-                let hup = p.writers.load(Ordering::Relaxed) == 0;
-                (if hup || !p.buf.lock().is_empty() { POLLIN } else { 0 }) | if hup { POLLHUP } else { 0 }
-            }
-            Kind::PipeWrite(p) => {
-                if p.readers.load(Ordering::Relaxed) == 0 {
-                    POLLERR
-                } else if p.buf.lock().len() < PIPE_CAPACITY {
-                    POLLOUT
-                } else {
-                    0
-                }
-            }
-            Kind::EventFd(e) => {
-                let count = *e.count.lock();
-                (if count > 0 { POLLIN } else { 0 }) | if count < EVENTFD_MAX { POLLOUT } else { 0 }
-            }
-            Kind::Epoll(e) => {
-                if e.has_events() {
-                    POLLIN
-                } else {
-                    0
-                }
-            }
-            Kind::Server(s) => s.ready(),
-        };
-        ready & (events | POLLERR | POLLHUP)
-    }
-
-    /// Where this file announces changes of its readiness.
-    pub fn poll_source(&self) -> PollSource {
-        match &self.kind {
-            // Regular files and devices are always ready.
-            Kind::Inode(_) => PollSource::Always,
-            Kind::PipeRead(p) => PollSource::Chan(p.read_chan()),
-            Kind::PipeWrite(p) => PollSource::Chan(p.write_chan()),
-            Kind::EventFd(e) => PollSource::Chan(e.chan()),
-            Kind::Epoll(e) => PollSource::Epoll(e.clone()),
-            Kind::Server(s) if s.always => PollSource::Always,
-            Kind::Server(s) => PollSource::Chan(s.chan()),
-        }
-    }
-}
-
 impl Drop for OpenFile {
     fn drop(&mut self) {
-        // The epoll instances watching this file forget it.
-        let watchers = core::mem::take(&mut *self.watchers.lock());
-        for item in watchers.iter().filter_map(Weak::upgrade) {
-            if let Some(epoll) = item.owner() {
-                epoll.file_closed(&item);
-            }
-        }
         match &self.kind {
             Kind::PipeRead(p) => {
                 p.readers.fetch_sub(1, Ordering::Relaxed);
@@ -614,8 +439,7 @@ impl Drop for OpenFile {
                 p.writers.fetch_sub(1, Ordering::Relaxed);
                 wakeup(p.read_chan());
             }
-            // A server file tells its owner as its last reference goes.
-            Kind::Inode(_) | Kind::EventFd(_) | Kind::Epoll(_) | Kind::Server(_) => {}
+            Kind::Inode(_) | Kind::EventFd(_) => {}
         }
     }
 }

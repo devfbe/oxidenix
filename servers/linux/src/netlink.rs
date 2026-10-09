@@ -1,5 +1,5 @@
 //! Netlink sockets (netlink(7)), protocol NETLINK_ROUTE: files of the
-//! server with a placeholder in the kernel's descriptor table, as pipes.
+//! server, as pipes.
 //! What a program sends to the kernel's end (port 0) is answered here
 //! (`netlink::answer`, rtnetlink(7)) from the interfaces netd describes
 //! (`netdev`); the answers wait in the socket's queue for recv.
@@ -153,7 +153,7 @@ pub fn socket(ty: u64, protocol: u64) -> Result<i64, i64> {
     };
     let socket = Arc::new(NetlinkSocket { id: files::new_id(), ty: kind, state: Mutex::new(state), seq: AtomicU32::new(0) });
     let flags = O_RDWR | (ty & (SOCK_NONBLOCK | SOCK_CLOEXEC)) as u32;
-    files::install(socket.id, File::Netlink(socket.clone()), flags, POLLOUT)
+    files::install(socket.id, File::Netlink(socket.clone()), flags)
 }
 
 /// A `struct sockaddr_nl` of the program's: (port id, groups).
@@ -199,6 +199,11 @@ fn read_msghdr(msg: u64) -> Result<MsgHdr, i64> {
 }
 
 impl NetlinkSocket {
+    /// Its readiness for poll and epoll now.
+    pub fn readiness_now(&self) -> i16 {
+        Self::readiness(&self.state.lock())
+    }
+
     fn readiness(st: &State) -> i16 {
         let mut r = POLLOUT;
         if !st.queue.is_empty() {

@@ -1,6 +1,5 @@
 //! Pipes (phase R6a): a 64 KiB buffer shared by a read end and a write
-//! end, each a file of the server with a placeholder in the kernel's
-//! descriptor table.
+//! end, each a file of the server (an open file description of its own).
 //!
 //! Waiting: every change of a pipe (data in or out, an end closed) bumps
 //! its sequence word and wakes its waiters; a reader or writer that cannot
@@ -56,8 +55,8 @@ const POLLHUP: i16 = 0x10;
 
 struct Inner {
     buf: VecDeque<u8>,
-    /// Whether each end is still open (both are until their placeholder's
-    /// last descriptor goes).
+    /// Whether each end is still open (both are until their description's
+    /// last reference goes).
     reader: bool,
     writer: bool,
     /// The readiness last reported for each end (read, write).
@@ -148,7 +147,7 @@ impl PipeEnd {
         self.shared.inner.lock().readiness()[self.write as usize]
     }
 
-    /// The end's placeholder is gone.
+    /// The end's description is gone.
     pub fn close(&self) {
         let mut inner = self.shared.inner.lock();
         if self.write {

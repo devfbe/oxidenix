@@ -198,9 +198,13 @@ pub struct CpuState {
 
 /// A descriptor table, shared by the tasks cloned with CLONE_FILES.
 /// Descriptors are taken out under the lock and dropped after it: closing
-/// a file may wake others or talk to a server.
+/// a file may wake others or talk to a server. A Linux program's table
+/// holds no descriptors (they are its server's): only the server's record
+/// of its own table (`restricted::SYS_FILES_RECORD`), which goes back to the
+/// server with this table.
 pub struct Files {
     fds: IrqSpinLock<Vec<Option<FdEntry>>>,
+    record: IrqSpinLock<Option<super::linux::Record>>,
 }
 
 /// Most descriptors a process may have open: RLIMIT_NOFILE, which
@@ -210,10 +214,27 @@ pub const MAX_FDS: usize = 4096;
 
 impl Files {
     pub fn new(fds: Vec<Option<FdEntry>>) -> Option<Arc<Files>> {
-        Arc::try_new(Files { fds: IrqSpinLock::new(fds) }).ok()
+        Arc::try_new(Files { fds: IrqSpinLock::new(fds), record: IrqSpinLock::new(None) }).ok()
     }
 
-    /// A copy for a new process (fork), or for exec of a shared table.
+    pub fn record_word(&self) -> u64 {
+        self.record.lock().as_ref().map_or(0, |r| r.word())
+    }
+
+    /// Gives a new table the server's record (at its creation, or once for
+    /// a table the kernel made without one); never replaces one (see
+    /// `FsInfo::set_record`). Returns the record back if the table has one.
+    pub fn set_record(&self, record: super::linux::Record) -> Result<(), super::linux::Record> {
+        let mut slot = self.record.lock();
+        if slot.is_some() {
+            return Err(record);
+        }
+        *slot = Some(record);
+        Ok(())
+    }
+
+    /// A copy for a new process (fork), or for exec of a shared table
+    /// (without a record: the caller gives it the server's, if any).
     pub fn duplicate(&self) -> Option<Arc<Files>> {
         // Memory is reserved outside the lock, for the table's length as it
         // was; if it grew meanwhile, again.

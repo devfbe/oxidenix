@@ -21,8 +21,6 @@ use restricted::*;
 const EBADF: i64 = 9;
 const EFAULT: i64 = 14;
 const EACCES: i64 = 13;
-const POLLIN: i16 = 0x1;
-const POLLOUT: i16 = 0x4;
 /// The most one read or write moves (Linux's MAX_RW_COUNT).
 pub const MAX_RW_COUNT: u64 = 0x7fff_f000;
 
@@ -41,9 +39,8 @@ pub struct DevOpen {
 /// Opens the node `origin` as `kind`.
 pub fn open(kind: Kind, flags: u32, origin: Origin) -> Result<i64, i64> {
     let kept = flags & (O_ACCMODE | O_NONBLOCK | O_CLOEXEC);
-    let id = files::new_id();
-    // Always ready (`files::install`: epoll refuses it with EPERM, as Linux's).
-    files::install(id, File::Dev(Arc::new(DevOpen { kind, origin })), kept, POLLIN | POLLOUT)
+    // Always ready (`File::always_ready`: epoll refuses it with EPERM, as Linux's).
+    files::install(files::new_id(), File::Dev(Arc::new(DevOpen { kind, origin })), kept)
 }
 
 /// Whether `[addr, addr + len)` lies in the program's memory (Linux's access_ok).

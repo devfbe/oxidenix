@@ -183,17 +183,11 @@ fn fd_node_of(fd: u64) -> Result<(Node, String, bool), i64> {
     if let Some(o) = files::origin_of(fd) {
         return Ok((o.node()?, o.path, o.o_path));
     }
-    if files::is_server_file(fd) {
-        return Err(ENOTDIR);
+    // An open file of the kernel's tree: its inode; any other file has none.
+    match &files::lookup_raw(fd)?.file {
+        files::File::Kernel(k) => Ok((Node::Kernel(k.inode()?), k.path.clone(), false)),
+        _ => Err(ENOTDIR),
     }
-    let mut buf = alloc::vec![0u8; 4096];
-    let mut len = 0u64;
-    let inode = KInode::from_result(syscall(
-        SYS_KFD_INODE,
-        [fd, buf.as_mut_ptr() as u64, buf.len() as u64, &mut len as *mut u64 as u64, 0, 0],
-    ))?;
-    buf.truncate(len as usize);
-    Ok((Node::Kernel(inode), String::from_utf8(buf).map_err(|_| ENOENT)?, false))
 }
 
 /// Resolves the program's path at `addr` relative to `dirfd`.
@@ -333,7 +327,10 @@ fn openat(dirfd: u64, addr: u64, flags: u32, mode: u32) -> Result<i64, i64> {
         }
     }
     match resolved.node {
-        Node::Kernel(k) => check(syscall(SYS_INODE_OPEN, [k.handle(), flags as u64, abs.as_ptr() as u64, abs.len() as u64, 0, 0])),
+        Node::Kernel(k) => {
+            let handle = check(syscall(SYS_INODE_OPEN, [k.handle(), flags as u64, abs.as_ptr() as u64, abs.len() as u64, 0, 0]))?;
+            crate::kfile::install(handle as u64, flags, abs)
+        }
         Node::Tmp(t) => tmpfile::open(t, flags, abs),
         Node::Data(d) => datafile::open(d, flags, abs),
     }

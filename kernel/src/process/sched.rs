@@ -1,9 +1,8 @@
 //! The SMP scheduler: per-CPU run queues, wait queues, context switches.
 //!
 //! Lock order (outer to inner): process table → group info → group
-//! signals → thread signals → wait queue → (an epoll instance's ready list
-//! and queue, see `epoll.rs`) → task wake_lock → run queue. The heap and
-//! the frame allocator are leaves.
+//! signals → thread signals → wait queue → task wake_lock → run queue. The
+//! heap and the frame allocator are leaves.
 //!
 //! Sleeping uses the classic protocol that cannot lose a wakeup:
 //!
@@ -18,10 +17,8 @@
 //!
 //! A wakeup that finds the task still on its CPU (not yet descheduled) only
 //! sets it Running again; `schedule` then keeps it. Otherwise it is queued.
-//!
-//! Wait queues also hold callbacks: the waiters of poll, select and
-//! epoll_wait, which listen on several files at once (see `poll.rs`), and
-//! epoll interests (see `epoll.rs`).
+//! (poll, select and epoll are the Linux server's, over its futexes: see
+//! `futex::server_waitv`.)
 
 use super::task::{KernelStack, State, Task, ThreadGroup};
 use super::Pid;
@@ -609,34 +606,15 @@ fn has_work(cpu: &Cpu) -> bool {
 // ---------------------------------------------------------- wait queues
 
 /// A wait queue: who waits on which channel. The global queues below are
-/// shared by all channels that hash to them; an epoll instance has a queue
-/// of its own.
+/// shared by all channels that hash to them.
 pub struct WaitQueue {
     waiters: IrqSpinLock<Vec<Waiter>>,
 }
 
+/// A task in `prepare_to_wait`, woken if it still waits on the channel.
 struct Waiter {
     chan: usize,
-    sleeper: Sleeper,
-}
-
-enum Sleeper {
-    /// A task in `prepare_to_wait`, woken if it still waits on the channel.
-    Task(Arc<Task>),
-    /// Something that listens on several channels: a poll, select or
-    /// epoll_wait, or an epoll instance's interest in a file.
-    Callback(Arc<dyn Waker>),
-}
-
-/// What a wakeup calls for a `Callback` waiter. It runs with the queue's
-/// lock held, possibly in interrupt context: it must not sleep, allocate,
-/// take a global wait queue's lock or drop the last reference to anything.
-pub trait Waker: Send + Sync {
-    fn wake(&self);
-}
-
-fn same_waker(a: &Arc<dyn Waker>, b: &Arc<dyn Waker>) -> bool {
-    core::ptr::eq(Arc::as_ptr(a) as *const (), Arc::as_ptr(b) as *const ())
+    task: Arc<Task>,
 }
 
 impl WaitQueue {
@@ -644,36 +622,12 @@ impl WaitQueue {
         WaitQueue { waiters: IrqSpinLock::new(Vec::new()) }
     }
 
-    /// Wakes the tasks and callbacks waiting on `chan`.
+    /// Wakes the tasks waiting on `chan`.
     pub fn wake(&self, chan: usize) {
         let q = self.waiters.lock();
         for w in q.iter().filter(|w| w.chan == chan) {
-            match &w.sleeper {
-                Sleeper::Task(t) => {
-                    wake_if(t, |t| t.wait_chan.load(Ordering::Relaxed) == chan);
-                }
-                Sleeper::Callback(c) => c.wake(),
-            }
+            wake_if(&w.task, |t| t.wait_chan.load(Ordering::Relaxed) == chan);
         }
-    }
-
-    /// Calls `waker` on every wakeup of `chan` until `remove_waker`.
-    pub fn add_waker(&self, chan: usize, waker: Arc<dyn Waker>) -> Result<(), i64> {
-        let mut q = self.waiters.lock();
-        q.try_reserve(1).map_err(|_| super::errno::ENOMEM)?;
-        q.push(Waiter { chan, sleeper: Sleeper::Callback(waker) });
-        Ok(())
-    }
-
-    /// Removes `waker` from `chan`. Its reference is dropped after the lock.
-    pub fn remove_waker(&self, chan: usize, waker: &Arc<dyn Waker>) {
-        let removed = {
-            let mut q = self.waiters.lock();
-            q.iter()
-                .position(|w| w.chan == chan && matches!(&w.sleeper, Sleeper::Callback(c) if same_waker(c, waker)))
-                .map(|i| q.swap_remove(i))
-        };
-        drop(removed);
     }
 }
 
@@ -684,44 +638,6 @@ static WAITQ: [WaitQueue; BUCKETS] = [const { WaitQueue::new() }; BUCKETS];
 pub fn queue_of(chan: usize) -> &'static WaitQueue {
     let h = chan ^ (chan >> 7) ^ (chan >> 17) ^ (chan >> 33);
     &WAITQ[h % BUCKETS]
-}
-
-/// The part of a poll, select or epoll_wait that sits on the wait queues
-/// of the files it polls (see `poll::PollTable`): a wakeup on any of them
-/// notes the event and wakes the task if it is asleep in the poll.
-pub struct PollWaiter {
-    task: Arc<Task>,
-    /// The channel the task sleeps on while it polls (its private one).
-    sleep_chan: usize,
-    /// A wakeup came since `rearm`.
-    woken: AtomicBool,
-}
-
-impl PollWaiter {
-    /// A waiter for the running task.
-    pub fn new() -> PollWaiter {
-        PollWaiter { task: current_arc(), sleep_chan: private_chan(current().tid()), woken: AtomicBool::new(false) }
-    }
-
-    /// Forgets earlier wakeups; called before readiness is checked.
-    pub fn rearm(&self) {
-        self.woken.store(false, Ordering::Relaxed);
-        fence(Ordering::SeqCst);
-    }
-
-    /// Whether a wakeup came since `rearm`.
-    pub fn woken(&self) -> bool {
-        self.woken.load(Ordering::Acquire)
-    }
-}
-
-impl Waker for PollWaiter {
-    fn wake(&self) {
-        self.woken.store(true, Ordering::Release);
-        // Only the poll's own sleep: the task may also be asleep in the
-        // middle of checking a file (a socket asks its server).
-        wake_if(&self.task, |t| t.wait_chan.load(Ordering::Relaxed) == self.sleep_chan);
-    }
 }
 
 /// A prepared sleep on a channel; see the module comment. Dropping it ends
@@ -739,8 +655,8 @@ fn private_chan(pid: Pid) -> usize {
 pub fn prepare_to_wait(chan: usize) -> Wait {
     let me = current_arc();
     let mut q = queue_of(chan).waiters.lock();
-    if !q.iter().any(|w| w.chan == chan && matches!(&w.sleeper, Sleeper::Task(t) if Arc::ptr_eq(t, &me))) {
-        q.push(Waiter { chan, sleeper: Sleeper::Task(me.clone()) });
+    if !q.iter().any(|w| w.chan == chan && Arc::ptr_eq(&w.task, &me)) {
+        q.push(Waiter { chan, task: me.clone() });
     }
     let _w = me.wake_lock.lock();
     me.wait_chan.store(chan, Ordering::Relaxed);
@@ -781,11 +697,11 @@ impl Drop for Wait {
         }
         crate::timer::disarm(me);
         let chan = self.chan;
-        queue_of(chan).waiters.lock().retain(|w| !(w.chan == chan && matches!(&w.sleeper, Sleeper::Task(t) if core::ptr::eq(&**t, me))));
+        queue_of(chan).waiters.lock().retain(|w| !(w.chan == chan && core::ptr::eq(&*w.task, me)));
     }
 }
 
-/// Wakes every task sleeping on `chan` and every poll listening on it.
+/// Wakes every task sleeping on `chan`.
 /// Safe in interrupt context.
 pub fn wakeup(chan: usize) {
     queue_of(chan).wake(chan);

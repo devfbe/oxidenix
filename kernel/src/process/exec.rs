@@ -95,15 +95,36 @@ pub fn exec(frame: &mut Frame, path: &str, args: &[String], envs: &[String]) -> 
     // The point of no return: from here on the old program is gone.
     de_thread()?;
     let me = current();
-    // A descriptor table still shared (CLONE_FILES without CLONE_THREAD)
-    // becomes the process's own, as it is once the other threads are gone.
-    let shared = with_current(|p| p.files.as_ref().filter(|f| alloc::sync::Arc::strong_count(f) > 1).cloned());
-    let files = match shared {
-        Some(f) => match f.duplicate() {
-            Some(copy) => Some(copy),
-            None => super::exit_group(signal::SIGKILL as i32),
+    // A Linux program's descriptors are its server's: the table the server
+    // gave for the new program (its copy without the close-on-exec
+    // descriptors, `SYS_FILES_RECORD`) takes the old one's place. A
+    // descriptor table of the kernel's still shared (CLONE_FILES without
+    // CLONE_THREAD) becomes the process's own, as it is once the other
+    // threads are gone.
+    let linux_files = with_current(|p| p.linux.as_mut().and_then(|l| l.files_child.take()));
+    let files = match linux_files {
+        Some(record) => match super::task::Files::new(Vec::new()) {
+            Some(files) => {
+                // A new table has none yet.
+                let _ = files.set_record(record);
+                Some(files)
+            }
+            None => {
+                // Back to the server (exit_group does not return).
+                drop(record);
+                super::exit_group(signal::SIGKILL as i32)
+            }
         },
-        None => None,
+        None => {
+            let shared = with_current(|p| p.files.as_ref().filter(|f| alloc::sync::Arc::strong_count(f) > 1).cloned());
+            match shared {
+                Some(f) => match f.duplicate() {
+                    Some(copy) => Some(copy),
+                    None => super::exit_group(signal::SIGKILL as i32),
+                },
+                None => None,
+            }
+        }
     };
     {
         let mut info = me.group.info.lock();

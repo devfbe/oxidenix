@@ -5,9 +5,9 @@
 //! fstatfs describe the node (live), the descriptor serves as the directory of *at calls
 //! and with AT_EMPTY_PATH as their target, fchdir takes a directory; reads, writes,
 //! ioctls, mmap and the f* calls that change the node (fchmod, fchown, futimens) are
-//! EBADF. In the kernel's descriptor table the placeholder carries O_PATH: only dup,
-//! close and fcntl's F_DUPFD, F_GETFD, F_SETFD and F_GETFL take it there (F_GETFL shows
-//! O_PATH), poll gives POLLNVAL, select and epoll EBADF.
+//! EBADF. Its description's status flags carry O_PATH: of the descriptor table's calls only
+//! dup, close and fcntl's F_DUPFD, F_GETFD, F_SETFD and F_GETFL take it (F_GETFL shows
+//! O_PATH), SCM_RIGHTS passes it, poll gives POLLNVAL, select and epoll EBADF.
 
 use crate::files::{self, File, O_CLOEXEC};
 use crate::namespace::Origin;
@@ -26,7 +26,7 @@ pub struct PathOpen {
 /// An O_PATH descriptor for `origin` (`flags` as open(2) had them).
 pub fn open(flags: u32, origin: Origin) -> Result<i64, i64> {
     let kept = flags & (O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-    files::install(files::new_id(), File::Path(Arc::new(PathOpen { origin })), kept | O_PATH, 0)
+    files::install(files::new_id(), File::Path(Arc::new(PathOpen { origin })), kept | O_PATH)
 }
 
 /// The calls on one that reach the server.

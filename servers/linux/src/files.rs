@@ -1,27 +1,30 @@
-//! The server's files (phase R6): objects the server implements, each
-//! named in the kernel's descriptor table by a placeholder (see
-//! `restricted::SYS_KFD_INSTALL`). The table here maps the placeholder's id
-//! to the object; an object goes when the kernel reports its placeholder's
-//! last descriptor closed (`EVENT_CLOSED`, to the service thread).
+//! The server's open files (phase R6, the descriptor table since R6e): an
+//! open file description (`Description`) is a file the server implements
+//! (`File`: a pipe end, a socket, an open file of tmpfs or /data, a
+//! terminal, an epoll instance, ...) or an open file of the kernel's it
+//! holds by handle (`kfile`), with its status flags. Descriptors of the
+//! calling process's table (`fdtable`) refer to descriptions (`FileRef`),
+//! as do descriptors in flight (`scm`) and calls that use one: a
+//! description goes, and its file closes, with its last reference (Linux's
+//! fput), on whatever thread lets go of that.
 //!
 //! `handle` takes the system calls on descriptors and creates files (pipe,
 //! pipe2, eventfd, netlink sockets; terminals are opened by their device
-//! numbers, `tty::open_device`): for a descriptor of one of the
-//! server's files it answers itself, for one of the kernel's it returns
-//! None and the call passes through (except the requests the server
-//! answers for any descriptor: the netdevice ioctls on sockets).
+//! numbers, `tty::open_device`); the descriptor table's own calls (dup,
+//! close, fcntl, ...) are `fdtable`'s, poll and select `poll`'s, epoll
+//! `epoll`'s. Readiness changes reach them through `ready`.
 
 use crate::datafile::{self, DataOpen};
 use crate::eventfd::EventFd;
+use crate::fdtable;
 use crate::inotify::{self, Inotify};
+use crate::kfile::KernelFile;
 use crate::netlink::{self, NetlinkSocket};
-use crate::tmpfile::{self, TmpOpen};
 use crate::pipe::{self, Dst, PipeEnd, Src};
-use crate::sync::Mutex;
-use crate::syscall;
-use alloc::collections::BTreeMap;
+use crate::tmpfile::{self, TmpOpen};
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::mem::ManuallyDrop;
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use restricted::*;
 
 pub const EBADF: i64 = 9;
@@ -37,9 +40,20 @@ pub const O_RDWR: u32 = 0o2;
 pub const O_NONBLOCK: u32 = 0o4000;
 pub const O_APPEND: u32 = 0o2000;
 pub const O_CLOEXEC: u32 = 0o2000000;
+pub const O_PATH: u32 = 0o10000000;
 const O_DIRECT: u32 = 0o40000;
 
-/// What a placeholder names.
+pub const POLLIN: i16 = 0x1;
+pub const POLLOUT: i16 = 0x4;
+pub const POLLERR: i16 = 0x8;
+pub const POLLHUP: i16 = 0x10;
+pub const POLLNVAL: i16 = 0x20;
+pub const POLLRDNORM: i16 = 0x40;
+pub const POLLWRNORM: i16 = 0x100;
+/// What a file that is always ready reports (Linux's DEFAULT_POLLMASK).
+pub const ALWAYS_READY: i16 = POLLIN | POLLOUT | POLLRDNORM | POLLWRNORM;
+
+/// What an open file description is.
 #[derive(Clone)]
 pub enum File {
     Pipe(Arc<PipeEnd>),
@@ -64,100 +78,237 @@ pub enum File {
     Dev(Arc<crate::devices::DevOpen>),
     /// An O_PATH descriptor (of any node).
     Path(Arc<crate::pathfile::PathOpen>),
+    /// An epoll instance.
+    Epoll(Arc<crate::epoll::Epoll>),
+    /// An open file of the kernel's (its tree: /proc, /sys, the kernel's
+    /// null and zero), by handle.
+    Kernel(Arc<KernelFile>),
 }
 
-/// What mmap of one of the server's files maps.
-pub enum Mapping {
-    /// A memory object (a handle to close once mapped), and whether the mapping stays
-    /// read-only.
-    Object(u64, bool),
-    /// Anonymous memory, as for MAP_ANONYMOUS (zero's mappings); `read_only`: a shared
-    /// mapping that may never become writable.
-    Anonymous { read_only: bool },
+impl File {
+    /// Always ready for poll, whatever happens (a regular file or a
+    /// directory, null and zero, the kernel's files): epoll refuses it with
+    /// EPERM, as Linux does for a file without a poll method.
+    pub fn always_ready(&self) -> bool {
+        matches!(self, File::Tmp(_) | File::Data(_) | File::Dev(_) | File::Kernel(_))
+    }
 }
 
-static FILES: Mutex<BTreeMap<u64, File>> = Mutex::new(BTreeMap::new());
+/// An open file description: the file, its status flags (the access mode,
+/// O_APPEND, O_NONBLOCK, ...; O_PATH for one that only names a node), and
+/// its watchers (`poll::Watch`: pollers and epoll interests).
+pub struct Description {
+    pub id: u64,
+    pub file: File,
+    flags: AtomicU32,
+    pub watch: Arc<crate::poll::Watch>,
+    /// References in flight (SCM_RIGHTS messages, `scm::Passed`): the
+    /// collector of sockets in flight compares them with all references.
+    pub inflight: AtomicUsize,
+}
+
+impl Description {
+    pub fn flags(&self) -> u32 {
+        self.flags.load(Ordering::Relaxed)
+    }
+
+    /// F_SETFL and FIONBIO: the flags in `changeable` take `value`'s
+    /// (atomically: another thread may change the same description's at
+    /// once). The kernel's files get them too, for their own operations.
+    pub fn set_flags(&self, changeable: u32, value: u32) {
+        let mut old = self.flags.load(Ordering::Relaxed);
+        loop {
+            let new = old & !changeable | value & changeable;
+            match self.flags.compare_exchange_weak(old, new, Ordering::Relaxed, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(seen) => old = seen,
+            }
+        }
+        if let File::Kernel(k) = &self.file {
+            k.set_flags(self.flags());
+        }
+    }
+
+    pub fn is_path(&self) -> bool {
+        self.flags() & O_PATH != 0
+    }
+
+    /// Its readiness for poll, select and epoll now (each file computes its
+    /// own, as Linux's poll methods do).
+    pub fn poll_mask(&self) -> i16 {
+        match &self.file {
+            File::Pipe(end) => end.readiness(),
+            File::EventFd(e) => e.ready(),
+            File::Netlink(n) => n.readiness_now(),
+            File::Inotify(i) => i.readiness_now(),
+            File::Socket(s) => s.readiness_now(),
+            File::Inet(s) => s.readiness_now(),
+            File::Tty(t) => t.readiness_now(),
+            File::PtyMaster(m) => m.readiness_now(),
+            File::Epoll(e) => {
+                if e.has_events() {
+                    POLLIN | POLLRDNORM
+                } else {
+                    0
+                }
+            }
+            File::Path(_) => POLLNVAL,
+            File::Tmp(_) | File::Data(_) | File::Dev(_) | File::Kernel(_) => ALWAYS_READY,
+        }
+    }
+}
+
+impl Drop for Description {
+    /// The last reference went: the file closes (on the thread that let go
+    /// of it: a close(2), the service thread for an exit, the worker for a
+    /// message the collector dropped).
+    fn drop(&mut self) {
+        crate::poll::forget(self.id, &self.watch);
+        let service = crate::thread::is_service();
+        match &self.file {
+            File::Pipe(end) => end.close(),
+            File::Socket(sock) => {
+                sock.release();
+                // It may have been the last way into sockets in flight.
+                if crate::scm::sockets_in_flight() {
+                    crate::scm::request();
+                }
+            }
+            // Closed in netd before close(2) returns (its port is free then,
+            // as on Linux); by the net thread for a service thread, which
+            // may not wait for netd.
+            File::Inet(sock) => sock.release(!service),
+            File::Tty(open) => open.tty.closed(open),
+            File::PtyMaster(m) => crate::pty::master_closed(m),
+            File::Epoll(e) => e.closed(),
+            // An eventfd or a tmpfs or /data file simply goes (the latter two
+            // returning their write access; an unlinked /data file's inode
+            // goes at the next `datafs::reap`); a file of the kernel's closes
+            // its handle.
+            _ => {}
+        }
+    }
+}
+
+/// A reference to an open file description: what a descriptor, a call
+/// using it and a descriptor in flight hold. Letting go of one of a
+/// description in flight may leave nothing but its references in flight:
+/// the collector of sockets in flight looks then (as Linux's unix_gc looks
+/// when a file's references are all in flight).
+pub struct FileRef(ManuallyDrop<Arc<Description>>);
+
+impl FileRef {
+    pub fn new(description: Arc<Description>) -> FileRef {
+        FileRef(ManuallyDrop::new(description))
+    }
+
+    pub fn arc(&self) -> &Arc<Description> {
+        &self.0
+    }
+
+    /// The reference itself (a descriptor in flight takes it over).
+    pub fn into_arc(self) -> Arc<Description> {
+        let mut me = ManuallyDrop::new(self);
+        unsafe { ManuallyDrop::take(&mut me.0) }
+    }
+
+    /// The same description (for keys: epoll's interests).
+    pub fn ptr(&self) -> usize {
+        Arc::as_ptr(&self.0) as usize
+    }
+}
+
+impl Clone for FileRef {
+    fn clone(&self) -> FileRef {
+        FileRef::new(Arc::clone(&self.0))
+    }
+}
+
+impl core::ops::Deref for FileRef {
+    type Target = Description;
+    fn deref(&self) -> &Description {
+        &self.0
+    }
+}
+
+impl Drop for FileRef {
+    fn drop(&mut self) {
+        // Taken once, here.
+        let description = unsafe { ManuallyDrop::take(&mut self.0) };
+        let in_flight = description.inflight.load(Ordering::Acquire) > 0;
+        drop(description);
+        // After the reference is gone, so that the collector sees it gone.
+        if in_flight {
+            crate::scm::request();
+        }
+    }
+}
+
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// Whether a signal (or a stop) waits for the calling thread (Linux's signal_pending):
 /// a long call that does not wait returns what it did so far, or EINTR (restarted as
 /// Linux's ERESTARTSYS) if nothing yet.
 pub fn signal_pending() -> bool {
-    syscall(SYS_SIGNAL_STATE, [0; 6]) as u64 & SIGNAL_PENDING != 0
+    crate::syscall(SYS_SIGNAL_STATE, [0; 6]) as u64 & SIGNAL_PENDING != 0
 }
 
 pub fn new_id() -> u64 {
     NEXT_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Registers `file` under `id` and gives it a descriptor (the lowest free
-/// one). On failure the file is forgotten again.
-pub fn install(id: u64, file: File, flags: u32, ready: i16) -> Result<i64, i64> {
-    // Regular files, directories and null and zero are always ready.
-    let kind = if matches!(file, File::Tmp(_) | File::Data(_) | File::Dev(_)) { KFD_ALWAYS_READY } else { 0 };
-    FILES.lock().insert(id, file);
-    let fd = syscall(SYS_KFD_INSTALL, [id, flags as u64, ready as u16 as u64, kind, 0, 0]);
-    if fd < 0 {
-        FILES.lock().remove(&id);
-        return Err(-fd);
-    }
-    Ok(fd)
+/// A new open file description of `file` (status flags `flags`; O_CLOEXEC
+/// is the descriptor's), known for readiness reports as `id`, and a
+/// descriptor for it in the calling process's table (the lowest free one).
+/// If no descriptor can be had, nothing was made: the file is the caller's
+/// to undo (no close happens for it).
+pub fn install(id: u64, file: File, flags: u32) -> Result<i64, i64> {
+    fdtable::current().install_new(|| description(id, file, flags & !O_CLOEXEC), flags & O_CLOEXEC != 0)
 }
 
-/// Reports file `id`'s readiness for poll, select and epoll.
+/// A new open file description (see `install`), not yet in any table.
+pub fn description(id: u64, file: File, flags: u32) -> FileRef {
+    let watch = crate::poll::Watch::new(id);
+    FileRef::new(Arc::new(Description { id, file, flags: AtomicU32::new(flags), watch, inflight: AtomicUsize::new(0) }))
+}
+
+/// File `id` changed its readiness (now `ready`), or had an event that
+/// counts as an edge for EPOLLET (new data, room): its pollers and epoll
+/// interests hear of it. Each file reports under its own lock, so reports
+/// keep their order.
 pub fn ready(id: u64, ready: i16) {
-    syscall(SYS_KFD_READY, [id, ready as u16 as u64, 0, 0, 0, 0]);
+    crate::poll::report(id, ready);
 }
 
-/// The kernel closed the placeholder's last descriptor: the object goes.
-/// `service`: the instance's pager learnt it (a process's exit, a
-/// descriptor in flight let go), which may not wait for netd; else the
-/// thread whose close(2) it was, before the call returns.
-pub fn closed(id: u64, service: bool) {
-    let gone = FILES.lock().remove(&id);
-    match gone {
-        Some(File::Pipe(end)) => end.close(),
-        Some(File::Socket(sock)) => {
-            sock.release();
-            // It may have been the last way into sockets in flight.
-            if crate::scm::sockets_in_flight() {
-                crate::scm::request();
-            }
-        }
-        // Closed in netd before close(2) returns (its port is free then,
-        // as on Linux); by the net thread for the pager.
-        Some(File::Inet(sock)) => sock.release(!service),
-        Some(File::Tty(open)) => open.tty.closed(&open),
-        Some(File::PtyMaster(m)) => crate::pty::master_closed(&m),
-        _ => {}
+/// The description behind descriptor `fd` (EBADF), O_PATH ones too (for
+/// what takes them: Linux's fdget_raw).
+pub fn lookup_raw(fd: u64) -> Result<FileRef, i64> {
+    fdtable::current().get(fd)
+}
+
+/// The description behind descriptor `fd` for an operation on its file:
+/// EBADF also for an O_PATH descriptor, which names a node only (Linux's
+/// fdget).
+pub fn lookup(fd: u64) -> Result<FileRef, i64> {
+    let f = lookup_raw(fd)?;
+    if f.is_path() {
+        return Err(EBADF);
     }
-    // An eventfd or a tmpfs or /data file simply goes (the latter two
-    // returning their write access; an unlinked /data file's inode goes at
-    // the next `datafs::reap`).
-}
-
-/// The server's file `id`, if it lives.
-pub fn get(id: u64) -> Option<File> {
-    FILES.lock().get(&id).cloned()
-}
-
-/// Whether descriptor `fd` names one of the server's files.
-pub fn is_server_file(fd: u64) -> bool {
-    lookup(fd).is_some()
+    Ok(f)
 }
 
 /// The open tmpfs file behind descriptor `fd`, if it is one.
 pub fn tmp_of(fd: u64) -> Option<Arc<TmpOpen>> {
-    match lookup(fd)? {
-        (File::Tmp(f), _) => Some(f),
+    match &lookup_raw(fd).ok()?.file {
+        File::Tmp(f) => Some(f.clone()),
         _ => None,
     }
 }
 
 /// The open /data file behind descriptor `fd`, if it is one.
 pub fn data_of(fd: u64) -> Option<Arc<DataOpen>> {
-    match lookup(fd)? {
-        (File::Data(f), _) => Some(f),
+    match &lookup_raw(fd).ok()?.file {
+        File::Data(f) => Some(f.clone()),
         _ => None,
     }
 }
@@ -191,7 +342,7 @@ impl OriginOf {
 }
 
 pub fn origin_of(fd: u64) -> Option<OriginOf> {
-    let (file, _) = lookup(fd)?;
+    let file = lookup_raw(fd).ok()?.file.clone();
     let o_path = match &file {
         File::Tty(_) | File::PtyMaster(_) | File::Dev(_) => false,
         File::Path(_) => true,
@@ -204,73 +355,59 @@ pub fn origin_of(fd: u64) -> Option<OriginOf> {
     Some(found)
 }
 
-/// The status of descriptor `fd`, one of the server's files or of the
-/// kernel's (EBADF for neither).
+/// The status of descriptor `fd` (EBADF for none).
 pub fn stat_of(fd: u64) -> Result<vfs::stat::Stat, i64> {
-    let bytes = match lookup(fd) {
-        Some((File::Pipe(end), _)) => end.stat(),
-        Some((File::EventFd(e), _)) => e.stat(),
-        Some((File::Tmp(f), _)) => return Ok(f.inode.status()),
-        Some((File::Data(f), _)) => crate::datafs::stat(&f.inode)?,
-        Some((File::Netlink(n), _)) => n.stat(),
-        Some((File::Inotify(i), _)) => i.stat(),
-        Some((File::Socket(s), _)) => crate::sockcalls::stat(&s),
-        Some((File::Inet(s), _)) => crate::inetcalls::stat(&s),
-        Some((File::Tty(t), _)) => t.origin.stat()?,
-        Some((File::PtyMaster(m), _)) => m.origin.stat()?,
-        Some((File::Dev(d), _)) => d.origin.stat()?,
-        Some((File::Path(p), _)) => p.origin.stat()?,
-        None => kernel_stat(fd)?,
+    let f = lookup_raw(fd)?;
+    let bytes = match &f.file {
+        File::Pipe(end) => end.stat(),
+        File::EventFd(e) => e.stat(),
+        File::Tmp(t) => return Ok(t.inode.status()),
+        File::Data(d) => crate::datafs::stat(&d.inode)?,
+        File::Netlink(n) => n.stat(),
+        File::Inotify(i) => i.stat(),
+        File::Socket(s) => crate::sockcalls::stat(s),
+        File::Inet(s) => crate::inetcalls::stat(s),
+        File::Tty(t) => t.origin.stat()?,
+        File::PtyMaster(m) => m.origin.stat()?,
+        File::Dev(d) => d.origin.stat()?,
+        File::Path(p) => p.origin.stat()?,
+        File::Epoll(e) => e.stat(),
+        File::Kernel(k) => k.stat()?,
     };
     Ok(vfs::stat::Stat::from_bytes(&bytes))
 }
 
-/// The `struct stat` of descriptor `fd`, one of the kernel's files (EBADF
-/// for none), with the times the server keeps for it.
-fn kernel_stat(fd: u64) -> Result<[u8; 144], i64> {
-    let mut st = [0u8; 144];
-    match syscall(SYS_KFD_STAT, [fd, st.as_mut_ptr() as u64, 0, 0, 0, 0]) {
-        r if r < 0 => Err(-r),
-        _ => {
-            crate::namespace::kernel_times(&mut st);
-            Ok(st)
-        }
-    }
-}
-
-/// For mmap of descriptor `fd`: None for a file of the kernel's (mapped
-/// through `kfile_object`); else the object to map (a handle to close once
-/// mapped) and whether the mapping stays read-only, or why not.
-pub fn map_object(fd: u64, shared: bool, prot_write: bool) -> Option<Result<Mapping, i64>> {
+/// For mmap of descriptor `fd`: the object to map (a handle to close once
+/// mapped, unless `Mapping::Kernel`) and whether the mapping stays
+/// read-only, or why not.
+pub fn map_object(fd: u64, shared: bool, prot_write: bool) -> Result<Mapping, i64> {
     const ENODEV: i64 = 19;
     let object = |r: Result<(u64, bool), i64>| r.map(|(h, ro)| Mapping::Object(h, ro));
-    Some(match lookup(fd)? {
-        (File::Tmp(f), flags) => object(f.map_object(flags, shared, prot_write)),
-        (File::Data(f), flags) => object(f.map_object(flags, shared, prot_write)),
-        (File::Dev(d), flags) => crate::devices::map(&d, flags, shared, prot_write),
-        (File::Path(_), _) => Err(EBADF),
+    let f = lookup_raw(fd)?;
+    let flags = f.flags();
+    match &f.file {
+        File::Tmp(t) => object(t.map_object(flags, shared, prot_write)),
+        File::Data(d) => object(d.map_object(flags, shared, prot_write)),
+        File::Dev(d) => crate::devices::map(d, flags, shared, prot_write),
+        // The kernel maps its own file (by the handle the description
+        // keeps): its page cache, or its zero as anonymous memory.
+        File::Kernel(k) => Ok(Mapping::Kernel(k.clone())),
+        File::Path(_) => Err(EBADF),
         _ => Err(ENODEV),
-    })
+    }
 }
 
-/// The server's file behind descriptor `fd` and its open flags, or None
-/// for a file of the kernel's (or a bad descriptor: the kernel answers).
-pub fn lookup(fd: u64) -> Option<(File, u32)> {
-    lookup_checked(fd).ok().flatten()
-}
-
-/// `lookup` for calls the kernel cannot answer: EBADF for a bad
-/// descriptor, None for a file of the kernel's.
-pub fn lookup_checked(fd: u64) -> Result<Option<(File, u32)>, i64> {
-    let mut flags = 0u32;
-    let id = syscall(SYS_KFD_LOOKUP, [fd, &mut flags as *mut u32 as u64, 0, 0, 0, 0]);
-    if id < 0 {
-        return Err(-id);
-    }
-    if id == 0 {
-        return Ok(None);
-    }
-    Ok(FILES.lock().get(&(id as u64)).cloned().map(|f| (f, flags)))
+/// What mmap of one of the server's files maps.
+pub enum Mapping {
+    /// A memory object (a handle to close once mapped), and whether the mapping stays
+    /// read-only.
+    Object(u64, bool),
+    /// Anonymous memory, as for MAP_ANONYMOUS (zero's mappings); `read_only`: a shared
+    /// mapping that may never become writable.
+    Anonymous { read_only: bool },
+    /// An open file of the kernel's: its handle maps it (the description
+    /// keeps the handle; the mapping keeps the file).
+    Kernel(Arc<KernelFile>),
 }
 
 pub const SYS_READ: u64 = 0;
@@ -308,13 +445,7 @@ pub fn handle(s: &State) -> Option<i64> {
         SYS_PIPE => pipe2(a0, 0),
         SYS_EVENTFD => eventfd2(a0, 0),
         SYS_EVENTFD2 => eventfd2(a0, a1),
-        SYS_SENDFILE => {
-            let (out, input) = (lookup(a0), lookup(a1));
-            if out.is_none() && input.is_none() {
-                return None;
-            }
-            sendfile(a0, out, a1, input, a2, s.r10)
-        }
+        SYS_SENDFILE => sendfile(a0, a1, a2, s.r10),
         SYS_PIPE2 => pipe2(a0, a1),
         SYS_COPY_FILE_RANGE => copy_file_range(a0, a1, a2, a3, s.r8, s.r9),
         SYS_SOCKET if a0 == netlink::AF_NETLINK => netlink::socket(a1, a2),
@@ -334,39 +465,35 @@ pub fn handle(s: &State) -> Option<i64> {
         | netlink::SYS_GETPEERNAME
         | netlink::SYS_SETSOCKOPT
         | netlink::SYS_GETSOCKOPT
-        | netlink::SYS_ACCEPT4 => match lookup(a0)? {
-            (File::Netlink(n), flags) => netlink::call(s.rax, &n, flags, [a0, a1, a2, a3, s.r8, s.r9]),
-            // AF_UNIX sockets and the answer for files that are none:
-            // `sockcalls`.
-            _ => return None,
+        | netlink::SYS_ACCEPT4 => match lookup(a0) {
+            Ok(f) => match &f.file {
+                File::Netlink(n) => netlink::call(s.rax, n, f.flags(), [a0, a1, a2, a3, s.r8, s.r9]),
+                // AF_UNIX and internet sockets and the answer for files that
+                // are none: `sockcalls`.
+                _ => return None,
+            },
+            Err(_) => return None,
         },
         // The kernel's files have nothing to write back: /data's do, in
         // every instance's page cache.
         SYS_SYNC => sync_everywhere().map(|_| 0),
-        SYS_SYNCFS => match lookup(a0) {
-            Some((File::Data(_), _)) => sync_everywhere().map(|_| 0),
-            Some(_) => Ok(0),
-            None => return None,
-        },
-        // The kernel's descriptor table holds the descriptor's flags and
-        // close-on-exec bit: the requests on those (FIONBIO, FIONCLEX,
-        // FIOCLEX) go there for the server's files, too. A pass-through
-        // until the descriptor table moves into the server (R6e).
-        SYS_IOCTL if matches!(a1, 0x5421 | 0x5450 | 0x5451) => return None,
-        // The interface requests every socket takes, the kernel's too.
+        SYS_SYNCFS => lookup(a0).and_then(|f| match &f.file {
+            File::Data(_) => sync_everywhere().map(|_| 0),
+            _ => Ok(0),
+        }),
+        // The interface requests every socket takes.
         SYS_IOCTL if crate::netdev::is_request(a1) => crate::netdev::ioctl(a0, a1, a2),
         SYS_READ | SYS_WRITE | SYS_READV | SYS_WRITEV | SYS_FSTAT | SYS_LSEEK | SYS_IOCTL | SYS_PREAD64 | SYS_PWRITE64
-        | SYS_PREADV | SYS_PWRITEV | SYS_FSYNC | SYS_FDATASYNC | SYS_FTRUNCATE | SYS_GETDENTS64 | SYS_FSTATFS => match lookup(a0) {
-            Some((file, flags)) => on_file(s.rax, file, flags, a1, a2, a3),
-            // fstat of one of the kernel's files: its answer, with the
-            // times the server keeps for it (`namespace::set_kernel_times`).
-            None if s.rax == SYS_FSTAT => kernel_stat(a0).and_then(|st| crate::usercopy::to_program(a1, &st)).map(|_| 0),
-            None => return None,
-        },
-        SYS_PREADV2 | SYS_PWRITEV2 => {
-            let (file, flags) = lookup(a0)?;
-            rw2(s.rax == SYS_PWRITEV2, file, flags, a1, a2, a3 as i64, s.r9)
+        | SYS_PREADV | SYS_PWRITEV | SYS_FSYNC | SYS_FDATASYNC | SYS_FTRUNCATE | SYS_GETDENTS64 | SYS_FSTATFS => {
+            // fstat and fstatfs take an O_PATH descriptor (they describe its
+            // node); the requests on the descriptor itself are `fdtable`'s.
+            let f = if matches!(s.rax, SYS_FSTAT | SYS_FSTATFS) { lookup_raw(a0) } else { lookup(a0) };
+            match f {
+                Ok(f) => on_file(s.rax, &f.file, f.flags(), a1, a2, a3),
+                Err(e) => Err(e),
+            }
         }
+        SYS_PREADV2 | SYS_PWRITEV2 => lookup(a0).and_then(|f| rw2(s.rax == SYS_PWRITEV2, &f.file, f.flags(), a1, a2, a3 as i64, s.r9)),
         _ => return None,
     };
     Some(result.unwrap_or_else(|e| -e))
@@ -376,10 +503,14 @@ pub fn handle(s: &State) -> Option<i64> {
 /// at the offset, with O_APPEND as the flags have it for this call
 /// (`vfs::rw::plan`). RWF_DSYNC/RWF_SYNC make a /data write durable before
 /// it returns (the other files are memory: nothing to wait for).
-fn rw2(write: bool, file: File, flags: u32, iov: u64, count: u64, offset: i64, rwf: u64) -> Result<i64, i64> {
+fn rw2(write: bool, file: &File, flags: u32, iov: u64, count: u64, offset: i64, rwf: u64) -> Result<i64, i64> {
     let allowed = if write { flags & O_ACCMODE != 0 } else { flags & O_ACCMODE != O_WRONLY };
     if !allowed {
         return Err(EBADF);
+    }
+    // The kernel's files take the call as it is.
+    if let File::Kernel(k) = file {
+        return k.call(if write { SYS_PWRITEV2 } else { SYS_PREADV2 }, [iov, count, offset as u64, rwf]);
     }
     let plan = vfs::rw::plan(write, offset, rwf, flags & O_APPEND != 0)?;
     let flags = if plan.append { flags | O_APPEND } else { flags & !O_APPEND };
@@ -393,20 +524,22 @@ fn rw2(write: bool, file: File, flags: u32, iov: u64, count: u64, offset: i64, r
     on_file(nr, file, flags, iov, count, plan.at.unwrap_or(0))
 }
 
-fn on_file(nr: u64, file: File, flags: u32, a1: u64, a2: u64, a3: u64) -> Result<i64, i64> {
+fn on_file(nr: u64, file: &File, flags: u32, a1: u64, a2: u64, a3: u64) -> Result<i64, i64> {
     let end = match file {
         File::Pipe(end) => end,
-        File::EventFd(e) => return on_eventfd(nr, &e, flags, a1, a2),
-        File::Tmp(f) => return tmpfile::call(nr, &f, flags, a1, a2, a3),
-        File::Data(f) => return datafile::call(nr, &f, flags, a1, a2, a3),
-        File::Netlink(n) => return netlink::call(nr, &n, flags, [0, a1, a2, a3, 0, 0]),
-        File::Inotify(i) => return inotify::call(nr, &i, flags, a1, a2),
-        File::Socket(s) => return crate::sockcalls::on_file(nr, &s, flags, a1, a2),
-        File::Inet(s) => return crate::inetcalls::on_file(nr, &s, flags, a1, a2),
-        File::Tty(t) => return crate::tty::call(nr, &t, flags, a1, a2),
-        File::PtyMaster(m) => return crate::pty::call(nr, &m, flags, a1, a2),
-        File::Dev(d) => return crate::devices::call(nr, &d, flags, a1, a2),
-        File::Path(p) => return crate::pathfile::call(nr, &p, a1),
+        File::EventFd(e) => return on_eventfd(nr, e, flags, a1, a2),
+        File::Tmp(f) => return tmpfile::call(nr, f, flags, a1, a2, a3),
+        File::Data(f) => return datafile::call(nr, f, flags, a1, a2, a3),
+        File::Netlink(n) => return netlink::call(nr, n, flags, [0, a1, a2, a3, 0, 0]),
+        File::Inotify(i) => return inotify::call(nr, i, flags, a1, a2),
+        File::Socket(s) => return crate::sockcalls::on_file(nr, s, flags, a1, a2),
+        File::Inet(s) => return crate::inetcalls::on_file(nr, s, flags, a1, a2),
+        File::Tty(t) => return crate::tty::call(nr, t, flags, a1, a2),
+        File::PtyMaster(m) => return crate::pty::call(nr, m, flags, a1, a2),
+        File::Dev(d) => return crate::devices::call(nr, d, flags, a1, a2),
+        File::Path(p) => return crate::pathfile::call(nr, p, a1),
+        File::Epoll(e) => return crate::epoll::on_file(nr, e, a1),
+        File::Kernel(k) => return k.on_file(nr, a1, a2, a3),
     };
     let readable = flags & O_ACCMODE != O_WRONLY;
     let writable = flags & O_ACCMODE != 0;
@@ -460,81 +593,65 @@ fn pipe2(fds: u64, flags: u64) -> Result<i64, i64> {
     let (read_end, write_end) = pipe::new();
     let (rid, wid) = (read_end.id(), write_end.id());
     let common = flags & (O_CLOEXEC | O_NONBLOCK);
-    let rfd = install(rid, File::Pipe(read_end.clone()), common, read_end.readiness())?;
-    let wfd = match install(wid, File::Pipe(write_end.clone()), common | O_WRONLY, write_end.readiness()) {
+    let table = fdtable::current();
+    let rfd = install(rid, File::Pipe(read_end.clone()), common)?;
+    let wfd = match install(wid, File::Pipe(write_end.clone()), common | O_WRONLY) {
         Ok(fd) => fd,
         Err(e) => {
-            syscall(SYS_KFD_CLOSE, [rfd as u64, 0, 0, 0, 0, 0]);
+            drop(table.take(rfd as u64));
             return Err(e);
         }
     };
     if let Err(e) = crate::usercopy::write(fds, &[rfd as i32, wfd as i32]) {
-        syscall(SYS_KFD_CLOSE, [rfd as u64, 0, 0, 0, 0, 0]);
-        syscall(SYS_KFD_CLOSE, [wfd as u64, 0, 0, 0, 0, 0]);
+        drop(table.take(rfd as u64));
+        drop(table.take(wfd as u64));
         return Err(e);
     }
     Ok(0)
 }
 
-/// sendfile(out, in, offset, count) with a server file at either end (the
-/// kernel does it between its own files): chunks through the server's
-/// memory, returning after a short read, as Linux and the kernel do.
-fn sendfile(out_fd: u64, out: Option<(File, u32)>, in_fd: u64, input: Option<(File, u32)>, offset: u64, count: u64) -> Result<i64, i64> {
-    // An O_PATH descriptor is no file to move data through.
-    let path = |f: &Option<(File, u32)>| matches!(f, Some((File::Path(_), _)));
-    if path(&out) || path(&input) {
-        return Err(EBADF);
-    }
+/// sendfile(out, in, offset, count), through the server's memory: chunks,
+/// returning after a short read, as Linux does.
+fn sendfile(out_fd: u64, in_fd: u64, offset: u64, count: u64) -> Result<i64, i64> {
+    let (out, input) = (lookup(out_fd)?, lookup(in_fd)?);
     if offset != 0 {
         return Err(EINVAL);
     }
     // An eventfd moves 8-byte values, not data; a directory none; a
-    // netlink socket datagrams.
-    let unfit = |f: &Option<(File, u32)>| matches!(f, Some((File::EventFd(_) | File::Netlink(_) | File::Inotify(_), _)));
-    if unfit(&out) || unfit(&input) {
+    // netlink socket datagrams; an epoll instance nothing.
+    let unfit = |f: &File| matches!(f, File::EventFd(_) | File::Netlink(_) | File::Inotify(_) | File::Epoll(_));
+    if unfit(&out.file) || unfit(&input.file) {
         return Err(EINVAL);
     }
-    if let Some((File::Tmp(f), _)) = &out {
+    if let File::Tmp(f) = &out.file {
         if f.inode.is_dir() {
             return Err(EINVAL);
         }
     }
-    if let Some((File::Data(f), _)) = &out {
+    if let File::Data(f) = &out.file {
         if f.inode.kind == vfs::S_IFDIR {
             return Err(EINVAL);
         }
     }
-    if let Some((_, flags)) = &out {
-        if flags & O_ACCMODE == 0 {
-            return Err(EBADF);
-        }
+    if out.flags() & O_ACCMODE == 0 || input.flags() & O_ACCMODE == O_WRONLY {
+        return Err(EBADF);
     }
-    if let Some((_, flags)) = &input {
-        if flags & O_ACCMODE == O_WRONLY {
-            return Err(EBADF);
-        }
-    }
+    let (in_flags, out_flags) = (input.flags(), out.flags());
     let mut buf = alloc::vec![0u8; 4096];
     let mut total = 0u64;
     while total < count {
         let want = (count - total).min(buf.len() as u64) as usize;
-        let n = match &input {
-            Some((File::Pipe(end), flags)) => end.read(Dst::Server(&mut buf[..want]), flags & O_NONBLOCK != 0),
-            Some((File::EventFd(_) | File::Netlink(_) | File::Inotify(_), _)) => Err(EINVAL),
-            Some((File::Tmp(f), _)) => f.read_server(&mut buf[..want]).map(|n| n as i64),
-            Some((File::Data(f), _)) => f.read_server(&mut buf[..want]).map(|n| n as i64),
-            Some((File::Socket(s), flags)) => crate::sockcalls::read_server(s, *flags, &mut buf[..want]),
-            Some((File::Inet(s), flags)) => crate::inetcalls::read_server(s, *flags, &mut buf[..want]),
-            Some((File::Tty(t), flags)) => {
-                t.tty.read(t, crate::unix::Sink::Server { buf: &mut buf[..want], at: 0 }, flags & O_NONBLOCK != 0)
-            }
-            Some((File::PtyMaster(m), flags)) => m.read(crate::unix::Sink::Server { buf: &mut buf[..want], at: 0 }, flags & O_NONBLOCK != 0),
-            Some((File::Path(_), _)) => Err(EBADF),
-            Some((File::Dev(d), _)) => crate::devices::read(d, crate::unix::Sink::Server { buf: &mut buf[..want], at: 0 }),
-            None => match syscall(SYS_KFD_READ, [in_fd, buf.as_mut_ptr() as u64, want as u64, 0, 0, 0]) {
-                r if r < 0 => Err(-r),
-                r => Ok(r),
-            },
+        let n = match &input.file {
+            File::Pipe(end) => end.read(Dst::Server(&mut buf[..want]), in_flags & O_NONBLOCK != 0),
+            File::Tmp(f) => f.read_server(&mut buf[..want]).map(|n| n as i64),
+            File::Data(f) => f.read_server(&mut buf[..want]).map(|n| n as i64),
+            File::Socket(s) => crate::sockcalls::read_server(s, in_flags, &mut buf[..want]),
+            File::Inet(s) => crate::inetcalls::read_server(s, in_flags, &mut buf[..want]),
+            File::Tty(t) => t.tty.read(t, crate::unix::Sink::Server { buf: &mut buf[..want], at: 0 }, in_flags & O_NONBLOCK != 0),
+            File::PtyMaster(m) => m.read(crate::unix::Sink::Server { buf: &mut buf[..want], at: 0 }, in_flags & O_NONBLOCK != 0),
+            File::Dev(d) => crate::devices::read(d, crate::unix::Sink::Server { buf: &mut buf[..want], at: 0 }),
+            File::Kernel(k) => k.read_server(&mut buf[..want]),
+            File::EventFd(_) | File::Netlink(_) | File::Inotify(_) | File::Epoll(_) | File::Path(_) => Err(EINVAL),
         };
         let n = match n {
             Ok(n) => n as usize,
@@ -544,21 +661,17 @@ fn sendfile(out_fd: u64, out: Option<(File, u32)>, in_fd: u64, input: Option<(Fi
         if n == 0 {
             break;
         }
-        let wrote = match &out {
-            Some((File::Pipe(end), flags)) => end.write(Src::Server(&buf[..n]), flags & O_NONBLOCK != 0),
-            Some((File::EventFd(_) | File::Netlink(_) | File::Inotify(_), _)) => Err(EINVAL),
-            Some((File::Tmp(f), flags)) => f.write_server(&buf[..n], flags & O_APPEND != 0).map(|n| n as i64),
-            Some((File::Data(f), flags)) => f.write_server(&buf[..n], flags & O_APPEND != 0).map(|n| n as i64),
-            Some((File::Socket(s), flags)) => crate::sockcalls::write_server(s, *flags, &buf[..n]),
-            Some((File::Inet(s), flags)) => crate::inetcalls::write_server(s, *flags, &buf[..n]),
-            Some((File::Tty(t), flags)) => t.tty.write(t, crate::unix::Source::Server { buf: &buf[..n], at: 0 }, flags & O_NONBLOCK != 0),
-            Some((File::PtyMaster(m), flags)) => m.write(crate::unix::Source::Server { buf: &buf[..n], at: 0 }, flags & O_NONBLOCK != 0),
-            Some((File::Path(_), _)) => Err(EBADF),
-            Some((File::Dev(_), _)) => Ok(n as i64),
-            None => match syscall(SYS_KFD_WRITE, [out_fd, buf.as_ptr() as u64, n as u64, 0, 0, 0]) {
-                r if r < 0 => Err(-r),
-                r => Ok(r),
-            },
+        let wrote = match &out.file {
+            File::Pipe(end) => end.write(Src::Server(&buf[..n]), out_flags & O_NONBLOCK != 0),
+            File::Tmp(f) => f.write_server(&buf[..n], out_flags & O_APPEND != 0).map(|n| n as i64),
+            File::Data(f) => f.write_server(&buf[..n], out_flags & O_APPEND != 0).map(|n| n as i64),
+            File::Socket(s) => crate::sockcalls::write_server(s, out_flags, &buf[..n]),
+            File::Inet(s) => crate::inetcalls::write_server(s, out_flags, &buf[..n]),
+            File::Tty(t) => t.tty.write(t, crate::unix::Source::Server { buf: &buf[..n], at: 0 }, out_flags & O_NONBLOCK != 0),
+            File::PtyMaster(m) => m.write(crate::unix::Source::Server { buf: &buf[..n], at: 0 }, out_flags & O_NONBLOCK != 0),
+            File::Dev(_) => Ok(n as i64),
+            File::Kernel(k) => k.write_server(&buf[..n]),
+            File::EventFd(_) | File::Netlink(_) | File::Inotify(_) | File::Epoll(_) | File::Path(_) => Err(EINVAL),
         };
         match wrote {
             Ok(_) => total += n as u64,
@@ -640,7 +753,6 @@ impl Regular {
             _ => (false, false),
         }
     }
-
 }
 
 /// The file behind `fd` for copy_file_range, with its open flags: EBADF
@@ -649,24 +761,24 @@ impl Regular {
 fn regular(fd: u64) -> Result<(Regular, u32), i64> {
     const EISDIR: i64 = 21;
     const EXDEV: i64 = 18;
-    let Some((file, flags)) = lookup(fd) else {
-        let st = stat_of(fd)?;
-        return Err(match st.mode & vfs::S_IFMT {
-            vfs::S_IFREG => EXDEV,
-            vfs::S_IFDIR => EISDIR,
-            _ => EINVAL,
-        });
-    };
-    let kind = match &file {
-        File::Path(_) => return Err(EBADF),
-        File::Tmp(f) => f.inode.file_type(),
-        File::Data(f) => f.inode.kind,
+    let f = lookup(fd)?;
+    let flags = f.flags();
+    let kind = match &f.file {
+        File::Tmp(t) => t.inode.file_type(),
+        File::Data(d) => d.inode.kind,
+        File::Kernel(_) => {
+            return Err(match stat_of(fd)?.mode & vfs::S_IFMT {
+                vfs::S_IFREG => EXDEV,
+                vfs::S_IFDIR => EISDIR,
+                _ => EINVAL,
+            });
+        }
         _ => return Err(EINVAL),
     };
-    match (kind, file) {
+    match (kind, &f.file) {
         (vfs::S_IFDIR, _) => Err(EISDIR),
-        (vfs::S_IFREG, File::Tmp(f)) => Ok((Regular::Tmp(f), flags)),
-        (vfs::S_IFREG, File::Data(f)) => Ok((Regular::Data(f), flags)),
+        (vfs::S_IFREG, File::Tmp(t)) => Ok((Regular::Tmp(t.clone()), flags)),
+        (vfs::S_IFREG, File::Data(d)) => Ok((Regular::Data(d.clone()), flags)),
         _ => Err(EINVAL),
     }
 }
@@ -757,7 +869,7 @@ fn eventfd2(initval: u64, flags: u64) -> Result<i64, i64> {
     }
     let e = Arc::new(EventFd::new(initval as u32 as u64, flags & EFD_SEMAPHORE != 0));
     let open = O_RDWR | (flags as u32 & (O_NONBLOCK | O_CLOEXEC));
-    install(e.id(), File::EventFd(e.clone()), open, e.ready())
+    install(e.id(), File::EventFd(e.clone()), open)
 }
 
 /// sync(2) of /data: this instance's caches and, at the same time, every

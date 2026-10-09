@@ -120,15 +120,15 @@ pub fn socket(ty: u64, protocol: u64) -> Result<i64, i64> {
     install(&InetSock::create(kind)?, ty)
 }
 
-/// A new placeholder for `sock`: its descriptor (open flags `flags`). If
-/// none can be made, the socket goes.
+/// A new open file description for `sock` and its descriptor (open flags
+/// `flags`). If none can be made, the socket goes.
 fn install(sock: &Arc<InetSock>, flags: u64) -> Result<i64, i64> {
     let id = files::new_id();
     sock.set_id(id);
     let open = O_RDWR | (flags as u32 & (O_NONBLOCK | O_CLOEXEC));
-    match files::install(id, File::Inet(sock.clone()), open, sock.readiness_now()) {
+    match files::install(id, File::Inet(sock.clone()), open) {
         Ok(fd) => {
-            // What changed before the placeholder existed.
+            // What changed before the description existed.
             sock.report_now();
             Ok(fd)
         }

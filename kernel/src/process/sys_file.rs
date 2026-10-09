@@ -1,7 +1,9 @@
-//! File syscalls.
+//! File syscalls: on the kernel's descriptor tables (the native servers'), and
+//! on an open file the Linux server holds by handle (`file_call`, its
+//! `restricted::SYS_KFILE_CALL`: the inodes of the kernel's tree a Linux program
+//! opened; its descriptor table is the server's since R6e).
 
 use super::errno::*;
-use super::poll::PollTable;
 use super::{current_files, uaccess, with_current, FdEntry};
 use crate::fs::file::*;
 use crate::fs::{self, Inode, NewNode};
@@ -18,16 +20,50 @@ const AT_EMPTY_PATH: u64 = 0x1000;
 const S_IFIFO: u32 = 0o010000;
 const UMASK: u32 = 0o022;
 
-/// The open file behind `fd` for an operation on the file: EBADF for an `O_PATH`
-/// descriptor (the Linux server's), which only names a node (Linux's fdget).
+/// The open file behind `fd`.
 pub fn file(fd: u64) -> Result<Arc<OpenFile>, i64> {
-    with_current(|p| p.file(fd)).and_then(|f| if f.is_path() { Err(EBADF) } else { Ok(f) })
+    with_current(|p| p.file(fd))
 }
 
-/// The open file behind `fd`, an `O_PATH` descriptor too: for what takes one (dup,
-/// fcntl's F_DUPFD, F_GETFD, F_SETFD, F_GETFL; Linux's fdget_raw).
-pub fn file_raw(fd: u64) -> Result<Arc<OpenFile>, i64> {
-    with_current(|p| p.file(fd))
+/// Linux's call `nr` on the open file `f`, with the arguments that follow
+/// the descriptor (`restricted::SYS_KFILE_CALL`; fstat and fstatfs, which
+/// answer into the server's memory, are the caller's).
+pub fn file_call(f: &Arc<OpenFile>, nr: u64, a: [u64; 4]) -> SysResult {
+    const F_SETFL: u64 = 4;
+    match nr {
+        0 => Ok(read_file(f, a[0], a[1])? as i64),
+        1 => Ok(write_file(f, a[0], a[1])? as i64),
+        17 if (a[2] as i64) < 0 => Err(EINVAL),
+        17 => read_vecs(f, &[(a[0], a[1])], a[2] as i64, 0),
+        18 if (a[2] as i64) < 0 => Err(EINVAL),
+        18 => write_vecs(f, &[(a[0], a[1])], a[2] as i64, 0),
+        19 => vectored(&iovecs(a[0], a[1])?, |base, len, _| read_file(f, base, len)),
+        20 => vectored(&iovecs(a[0], a[1])?, |base, len, _| write_file(f, base, len)),
+        295 if (a[2] as i64) < 0 => Err(EINVAL),
+        295 => read_vecs(f, &iovecs(a[0], a[1])?, a[2] as i64, 0),
+        296 if (a[2] as i64) < 0 => Err(EINVAL),
+        296 => write_vecs(f, &iovecs(a[0], a[1])?, a[2] as i64, 0),
+        327 => read_vecs(f, &iovecs(a[0], a[1])?, a[2] as i64, a[3]),
+        328 => write_vecs(f, &iovecs(a[0], a[1])?, a[2] as i64, a[3]),
+        8 => lseek_file(f, a[0] as i64, a[1]),
+        217 => getdents_file(f, a[0], a[1]),
+        // The kernel's files take no requests of their own.
+        16 => Err(ENOTTY),
+        74 | 75 => Ok(0),
+        77 => ftruncate_file(f, a[0]),
+        72 if a[0] == F_SETFL => {
+            set_status_flags(f, a[1] as u32);
+            Ok(0)
+        }
+        _ => Err(EINVAL),
+    }
+}
+
+/// F_SETFL: O_APPEND and O_NONBLOCK change, atomically (another thread may
+/// change the same open file's flags at once).
+fn set_status_flags(f: &OpenFile, flags: u32) {
+    let changeable = O_APPEND | O_NONBLOCK;
+    let _ = f.flags.try_update(Ordering::Relaxed, Ordering::Relaxed, |old| Some(old & !changeable | flags & changeable));
 }
 
 /// Directory against which a relative path of an *at syscall is resolved.
@@ -74,28 +110,28 @@ pub fn pread(fd: u64, buf: u64, len: u64, off: i64) -> SysResult {
     if off < 0 {
         return Err(EINVAL);
     }
-    read_vecs(fd, &[(buf, len)], off, 0)
+    read_vecs(&file(fd)?, &[(buf, len)], off, 0)
 }
 
 pub fn pwrite(fd: u64, buf: u64, len: u64, off: i64) -> SysResult {
     if off < 0 {
         return Err(EINVAL);
     }
-    write_vecs(fd, &[(buf, len)], off, 0)
+    write_vecs(&file(fd)?, &[(buf, len)], off, 0)
 }
 
 pub fn preadv(fd: u64, iov: u64, count: u64, off: i64) -> SysResult {
     if off < 0 {
         return Err(EINVAL);
     }
-    read_vecs(fd, &iovecs(iov, count)?, off, 0)
+    read_vecs(&file(fd)?, &iovecs(iov, count)?, off, 0)
 }
 
 pub fn pwritev(fd: u64, iov: u64, count: u64, off: i64) -> SysResult {
     if off < 0 {
         return Err(EINVAL);
     }
-    write_vecs(fd, &iovecs(iov, count)?, off, 0)
+    write_vecs(&file(fd)?, &iovecs(iov, count)?, off, 0)
 }
 
 fn iovecs(iov: u64, count: u64) -> Result<Vec<(u64, u64)>, i64> {
@@ -137,33 +173,31 @@ pub fn writev(fd: u64, iov: u64, count: u64) -> SysResult {
 /// preadv2 (and the other reads at an offset): at `off`, or at the file
 /// position for -1 (`vfs::rw::plan`).
 pub fn preadv2(fd: u64, iov: u64, count: u64, off: i64, flags: u64) -> SysResult {
-    read_vecs(fd, &iovecs(iov, count)?, off, flags)
+    read_vecs(&file(fd)?, &iovecs(iov, count)?, off, flags)
 }
 
 /// pwritev2 (and the other writes at an offset): at `off` or the file
 /// position, appending as O_APPEND and the flags say, durable before it
 /// returns with RWF_DSYNC/RWF_SYNC.
 pub fn pwritev2(fd: u64, iov: u64, count: u64, off: i64, flags: u64) -> SysResult {
-    write_vecs(fd, &iovecs(iov, count)?, off, flags)
+    write_vecs(&file(fd)?, &iovecs(iov, count)?, off, flags)
 }
 
-fn read_vecs(fd: u64, vecs: &[(u64, u64)], off: i64, flags: u64) -> SysResult {
-    let f = file(fd)?;
+fn read_vecs(f: &Arc<OpenFile>, vecs: &[(u64, u64)], off: i64, flags: u64) -> SysResult {
     // Access first, as Linux checks it before the flags.
     if !f.readable() {
         return Err(EBADF);
     }
     let plan = vfs::rw::plan(false, off, flags, f.appends())?;
     match plan.at {
-        None => vectored(vecs, |base, len, _| read_file(&f, base, len)),
+        None => vectored(vecs, |base, len, _| read_file(f, base, len)),
         Some(at) => vectored(vecs, |base, len, done| {
             uaccess::read_to_user(base, len, true, |chunk, within| f.read_at(at + done + within, chunk))
         }),
     }
 }
 
-fn write_vecs(fd: u64, vecs: &[(u64, u64)], off: i64, flags: u64) -> SysResult {
-    let f = file(fd)?;
+fn write_vecs(f: &Arc<OpenFile>, vecs: &[(u64, u64)], off: i64, flags: u64) -> SysResult {
     if !f.writable() {
         return Err(EBADF);
     }
@@ -201,8 +235,15 @@ pub fn openat(dirfd: u64, path: u64, flags: u64, mode: u64) -> SysResult {
 }
 
 /// A descriptor for a resolved inode, as open(2) makes it: `abs` is its
-/// absolute path (also for the Linux server's `inode_open`).
+/// absolute path.
 pub fn open_inode(inode: Arc<Inode>, flags: u32, abs: String) -> SysResult {
+    let f = open_inode_file(inode, flags, abs)?;
+    with_current(|p| p.alloc_fd(f, flags & O_CLOEXEC != 0, 0))
+}
+
+/// An open file description of a resolved inode, as open(2) makes it
+/// (also for the Linux server's `inode_open`): `abs` is its absolute path.
+pub fn open_inode_file(inode: Arc<Inode>, flags: u32, abs: String) -> Result<Arc<OpenFile>, i64> {
     // The Linux server's devices (its terminals) are its to open (with
     // O_PATH too: it opens device nodes alone itself).
     if matches!(inode.device(), Some(fs::Device::Server(..))) {
@@ -220,8 +261,7 @@ pub fn open_inode(inode: Arc<Inode>, flags: u32, abs: String) -> SysResult {
     if flags & O_TRUNC != 0 && access.is_some() {
         inode.truncate(0)?;
     }
-    let f = OpenFile::inode_file(inode, flags, abs, access);
-    with_current(|p| p.alloc_fd(f, flags & O_CLOEXEC != 0, 0))
+    Ok(OpenFile::inode_file(inode, flags, abs, access))
 }
 
 pub fn close(fd: u64) -> SysResult {
@@ -265,12 +305,16 @@ pub fn fstat(fd: u64, buf: u64) -> SysResult {
 
 /// The `struct stat` of descriptor `fd` (fstat's answer).
 pub fn fstat_bytes(fd: u64) -> Result<[u8; 144], i64> {
-    let f = file(fd)?;
+    file_stat(&*file(fd)?)
+}
+
+/// The `struct stat` of the open file `f`.
+pub fn file_stat(f: &OpenFile) -> Result<[u8; 144], i64> {
     let anon = |mode: u32| Ok(stat_bytes(f.number, mode, 0, 0, (1, 0, 0, 0)));
     match f.inode() {
         Some(inode) => inode_stat(inode),
         // An anonymous inode, as on Linux: no file type.
-        None if matches!(f.kind, Kind::EventFd(_) | Kind::Epoll(_)) => anon(0o600),
+        None if matches!(f.kind, Kind::EventFd(_)) => anon(0o600),
         None => anon(S_IFIFO | 0o600),
     }
 }
@@ -285,7 +329,10 @@ pub fn newfstatat(dirfd: u64, path: u64, buf: u64, flags: u64) -> SysResult {
 }
 
 pub fn lseek(fd: u64, offset: i64, whence: u64) -> SysResult {
-    let f = file(fd)?;
+    lseek_file(&*file(fd)?, offset, whence)
+}
+
+fn lseek_file(f: &OpenFile, offset: i64, whence: u64) -> SysResult {
     let inode = f.inode().ok_or(ESPIPE)?;
     if inode.device() == Some(fs::Device::Console) {
         return Err(ESPIPE);
@@ -303,7 +350,10 @@ pub fn lseek(fd: u64, offset: i64, whence: u64) -> SysResult {
 }
 
 pub fn getdents64(fd: u64, buf: u64, len: u64) -> SysResult {
-    let f = file(fd)?;
+    getdents_file(&*file(fd)?, buf, len)
+}
+
+fn getdents_file(f: &OpenFile, buf: u64, len: u64) -> SysResult {
     let inode = f.inode().ok_or(ENOTDIR)?;
     let mut snapshot = f.dir_snapshot.lock();
     let off = f.offset.lock();
@@ -369,12 +419,12 @@ pub fn eventfd2(initval: u64, flags: u64) -> SysResult {
 }
 
 pub fn dup(fd: u64) -> SysResult {
-    let f = file_raw(fd)?;
+    let f = file(fd)?;
     with_current(|p| p.alloc_fd(f, false, 0))
 }
 
 pub fn dup3(old: u64, new: u64, flags: u64, allow_same: bool) -> SysResult {
-    let f = file_raw(old)?;
+    let f = file(old)?;
     if old == new {
         return if allow_same { Ok(new as i64) } else { Err(EINVAL) };
     }
@@ -396,37 +446,24 @@ pub fn fcntl(fd: u64, cmd: u64, arg: u64) -> SysResult {
     const F_SETFL: u64 = 4;
     const F_DUPFD_CLOEXEC: u64 = 1030;
     const FD_CLOEXEC: u64 = 1;
-    let f = file_raw(fd)?;
-    // An O_PATH descriptor takes only these (Linux's fdget_raw in fcntl).
-    if f.is_path() && !matches!(cmd, F_DUPFD | F_DUPFD_CLOEXEC | F_GETFD | F_SETFD | F_GETFL) {
-        return Err(EBADF);
-    }
+    let f = file(fd)?;
     match cmd {
         F_DUPFD | F_DUPFD_CLOEXEC => with_current(|p| p.alloc_fd(f, cmd == F_DUPFD_CLOEXEC, arg as usize)),
         F_GETFD => Ok(if current_files()?.cloexec(fd)? { FD_CLOEXEC as i64 } else { 0 }),
         F_SETFD => current_files()?.set_cloexec(fd, arg & FD_CLOEXEC != 0).map(|_| 0),
         F_GETFL => Ok(f.flags.load(Ordering::Relaxed) as i64),
         F_SETFL => {
-            // Atomic: another thread may change the same open file's flags
-            // at once (FIONBIO, F_SETFL).
-            let changeable = O_APPEND | O_NONBLOCK;
-            let _ = f.flags.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| Some(old & !changeable | arg as u32 & changeable));
+            set_status_flags(&f, arg as u32);
             Ok(0)
         }
         _ => Err(EINVAL),
     }
 }
 
-/// ioctl(2) on the kernel's files: only the requests on the descriptor. The
-/// terminals are the Linux server's (R6d); the kernel's files take no
-/// requests of their own (ENOTTY).
+/// ioctl(2) on the kernel's files: only the requests on the descriptor
+/// (Linux's do_vfs_ioctl); the kernel's files take no requests of their own
+/// (ENOTTY).
 pub fn ioctl(fd: u64, request: u64, arg: u64) -> SysResult {
-    // The requests on the descriptor rather than the file, which every
-    // descriptor takes (Linux's do_vfs_ioctl), the Linux server's files too
-    // (it passes them through): libuv makes pipes and sockets non-blocking
-    // with FIONBIO. Here only because the descriptor table is still the
-    // kernel's; they move into the Linux server with it (R6e,
-    // docs/design/linux-server.md).
     const FIONBIO: u64 = 0x5421;
     const FIONCLEX: u64 = 0x5450;
     const FIOCLEX: u64 = 0x5451;
@@ -449,152 +486,6 @@ pub fn ioctl(fd: u64, request: u64, arg: u64) -> SysResult {
     }
     file(fd)?;
     Err(ENOTTY)
-}
-
-/// The deadline of a timeout of `ns` nanoseconds (None: wait forever).
-fn deadline_in(ns: Option<u64>) -> Option<u64> {
-    ns.map(|ns| crate::time::now().saturating_add(ns))
-}
-
-/// poll(2): waits on the wait queues of the polled files (see
-/// `poll::PollTable`); the timeout (`None`: none) ends the wait exactly.
-pub fn poll(fds: u64, nfds: u64, timeout: Option<u64>) -> SysResult {
-    const POLLNVAL: i16 = 0x20;
-    if nfds > 256 {
-        return Err(EINVAL);
-    }
-    let deadline = deadline_in(timeout);
-    let mut table = PollTable::new();
-    let mut first = true;
-    loop {
-        table.rearm();
-        let mut ready = 0;
-        for i in 0..nfds {
-            let entry = fds + i * 8;
-            let raw: [u8; 8] = uaccess::read(entry)?;
-            let fd = i32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
-            let events = i16::from_le_bytes([raw[4], raw[5]]);
-            let revents = if fd < 0 {
-                0
-            } else {
-                match file(fd as u64) {
-                    Ok(f) => {
-                        if first {
-                            table.watch(&f)?;
-                        }
-                        f.poll(events)
-                    }
-                    Err(_) => POLLNVAL,
-                }
-            };
-            uaccess::write(entry + 6, revents)?;
-            if revents != 0 {
-                ready += 1;
-            }
-        }
-        if ready > 0 || deadline.is_some_and(|d| crate::time::now() >= d) {
-            return Ok(ready);
-        }
-        first = false;
-        table.wait(deadline)?;
-    }
-}
-
-/// Shared core of select and pselect6: a timeout of `None` waits forever.
-pub fn select(nfds: u64, readfds: u64, writefds: u64, exceptfds: u64, timeout: Option<u64>) -> SysResult {
-    if nfds > 1024 {
-        return Err(EINVAL);
-    }
-    let words = nfds.div_ceil(64);
-    let load = |ptr: u64| -> Result<[u64; 16], i64> {
-        let mut set = [0u64; 16];
-        for (i, w) in set.iter_mut().enumerate().take(words as usize) {
-            if ptr != 0 {
-                *w = uaccess::read(ptr + i as u64 * 8)?;
-            }
-        }
-        Ok(set)
-    };
-    let (want_r, want_w) = (load(readfds)?, load(writefds)?);
-    let deadline = deadline_in(timeout);
-    let mut table = PollTable::new();
-    let mut first = true;
-    loop {
-        table.rearm();
-        let (mut got_r, mut got_w, mut ready) = ([0u64; 16], [0u64; 16], 0);
-        for fd in 0..nfds {
-            let (w, b) = ((fd / 64) as usize, 1u64 << (fd % 64));
-            if (want_r[w] | want_w[w]) & b == 0 {
-                continue;
-            }
-            let f = file(fd)?;
-            if first {
-                table.watch(&f)?;
-            }
-            let revents = f.poll(POLLIN | POLLOUT);
-            if want_r[w] & b != 0 && revents & (POLLIN | POLLHUP | POLLERR) != 0 {
-                got_r[w] |= b;
-                ready += 1;
-            }
-            if want_w[w] & b != 0 && revents & (POLLOUT | POLLERR) != 0 {
-                got_w[w] |= b;
-                ready += 1;
-            }
-        }
-        if ready > 0 || deadline.is_some_and(|d| crate::time::now() >= d) {
-            for (ptr, set) in [(readfds, got_r), (writefds, got_w), (exceptfds, [0; 16])] {
-                if ptr != 0 {
-                    for (i, w) in set.iter().enumerate().take(words as usize) {
-                        uaccess::write(ptr + i as u64 * 8, *w)?;
-                    }
-                }
-            }
-            return Ok(ready);
-        }
-        first = false;
-        table.wait(deadline)?;
-    }
-}
-
-/// A user timeout {seconds, sub-seconds} in nanoseconds, where a second has
-/// `per_second` sub-seconds (a timeval or a timespec); a null pointer
-/// means "wait forever". Negative or unnormalized values are EINVAL.
-pub fn timeout(ptr: u64, per_second: u64) -> Result<Option<u64>, i64> {
-    if ptr == 0 {
-        return Ok(None);
-    }
-    let [sec, sub]: [i64; 2] = uaccess::read(ptr)?;
-    if sec < 0 || !(0..per_second as i64).contains(&sub) {
-        return Err(EINVAL);
-    }
-    let ns_per_sub = crate::time::NSEC_PER_SEC / per_second;
-    Ok(Some((sec as u64).saturating_mul(crate::time::NSEC_PER_SEC).saturating_add(sub as u64 * ns_per_sub)))
-}
-
-/// poll's timeout in milliseconds (negative: wait forever).
-pub fn poll_timeout(ms: i64) -> Option<u64> {
-    (ms >= 0).then(|| (ms as u64).saturating_mul(1_000_000))
-}
-
-/// ppoll(fds, nfds, timeout, sigmask, size): poll with a timespec and a
-/// temporary signal mask.
-pub fn ppoll(fds: u64, nfds: u64, ts: u64, mask: u64, size: u64) -> SysResult {
-    let timeout = timeout(ts, crate::time::NSEC_PER_SEC)?;
-    let mask = super::signal::read_mask(mask, size)?;
-    super::signal::with_mask(mask, || poll(fds, nfds, timeout))
-}
-
-/// pselect6(nfds, read, write, except, timeout, {sigmask, size}).
-pub fn pselect6(nfds: u64, readfds: u64, writefds: u64, exceptfds: u64, ts: u64, sig: u64) -> SysResult {
-    let timeout = timeout(ts, crate::time::NSEC_PER_SEC)?;
-    let mask = match sig {
-        0 => None,
-        _ => {
-            let [ptr, size]: [u64; 2] = uaccess::read(sig)?;
-            super::signal::read_mask(ptr, size)?
-        }
-    };
-    super::signal::with_mask(mask, || select(nfds, readfds, writefds, exceptfds, timeout))
 }
 
 pub fn faccessat(dirfd: u64, path: u64) -> SysResult {
@@ -709,7 +600,10 @@ pub fn truncate(path: u64, len: u64) -> SysResult {
 }
 
 pub fn ftruncate(fd: u64, len: u64) -> SysResult {
-    let f = file(fd)?;
+    ftruncate_file(&*file(fd)?, len)
+}
+
+fn ftruncate_file(f: &OpenFile, len: u64) -> SysResult {
     if !f.writable() {
         return Err(EINVAL);
     }
@@ -722,10 +616,6 @@ pub fn sendfile(out_fd: u64, in_fd: u64, offset: u64, count: u64) -> SysResult {
         return Err(EINVAL);
     }
     let (out, input) = (file(out_fd)?, file(in_fd)?);
-    // The Linux server's files (it handles sendfile with them itself).
-    if matches!(out.kind, Kind::Server(_)) || matches!(input.kind, Kind::Server(_)) {
-        return Err(EINVAL);
-    }
     let mut buf = vec![0u8; 4096];
     let mut total = 0;
     while total < count {

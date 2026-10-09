@@ -72,8 +72,11 @@ An AI research project; see README.md.
   - Restricted mode and the Linux server's kernel interface: `crates/restricted/src/lib.rs`
     (ABI constants, documented), `kernel/src/process/linux.rs`, `linux_inode.rs`;
     design in `docs/design/linux-server.md`.
-  - The Linux server: `servers/linux/src/main.rs` (dispatch order mm → time → files → paths →
-    sched → sockets → pass-through), `namespace.rs`/`paths.rs` (paths, mounts),
+  - The Linux server: `servers/linux/src/main.rs` (dispatch order mm → time → fdtable → files →
+    poll → epoll → paths → sched → ids → sockets → pass-through), `fdtable.rs`/`files.rs`
+    (the descriptor table, open file descriptions), `poll.rs`/`epoll.rs` (watch lists, poll,
+    select, epoll), `kfile.rs` (the kernel's open files by handle), `thread.rs` (per-thread
+    words), `namespace.rs`/`paths.rs` (paths, mounts),
     `tmpfs.rs`/`tmpfile.rs` (root fs), `datafs.rs`/`datafile.rs`/`fsclient.rs` (`/data` and its
     page cache over the I/O rings), `ringclient.rs` (a channel's slots and reaper),
     `unix.rs`/`sockcalls.rs`/`scm.rs` (`AF_UNIX` sockets, descriptor passing),

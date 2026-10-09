@@ -44,6 +44,11 @@ pub const fn thread_state(n: u64) -> u64 {
 /// out the slot to a new thread and reads it only while that thread's task
 /// lives (the slot is free again only once the task is freed).
 pub const SERVER_LOCKS_OFFSET: u64 = 2048;
+/// The server's own words in a thread's State page, from here to the page's
+/// end (1 KiB): the kernel never reads or writes them; the server sets them
+/// up when the thread starts (its role, the descriptor table it uses, a
+/// restartable call's state).
+pub const SERVER_THREAD_OFFSET: u64 = 3072;
 
 /// The Linux program's registers while the server handles one of its
 /// traps: the kernel writes them when the program traps and reads them
@@ -79,14 +84,27 @@ pub struct State {
 /// `restricted_enter()`: runs the program with the registers in the
 /// thread's `State` until it traps; returns the reason (`REASON_*`).
 pub const SYS_RESTRICTED_ENTER: u64 = 1010;
-/// `legacy_syscall(closed, cap) -> n`: has the kernel's own Linux
-/// implementation carry out the system call in `State` (phase R1's
-/// pass-through, which goes away as the server takes the calls over); its
-/// result and any signal frame land in `State`. The ids of server files
-/// whose last descriptor the call closed (up to `cap` of them) are stored
-/// at `closed` (u64s in the server's memory) and counted in `n`, for the
-/// server to drop them at once; more go to the service thread as events.
+/// `legacy_syscall()`: has the kernel's own Linux implementation carry out
+/// the system call in `State` (phase R1's pass-through, which goes away as
+/// the server takes the calls over); its result and any signal frame land
+/// in `State`. No call that takes a descriptor passes through any more
+/// (R6e): the descriptor table is the server's.
 pub const SYS_LEGACY_SYSCALL: u64 = 1011;
+
+/// Codes a call the server handles may return (as Linux's kernel-internal
+/// ones), which the kernel's signal delivery turns into the program's
+/// answer: `ERESTARTSYS` restarts the call unless a handler without
+/// SA_RESTART ran (then EINTR), `ERESTARTNOINTR` always restarts it,
+/// `ERESTARTNOHAND` restarts it unless a handler ran (poll, select: then
+/// EINTR), `ERESTART_RESTARTBLOCK` likewise, but by `restart_syscall` (219),
+/// which the server answers from the state it kept (poll's deadline). They
+/// never reach the program.
+pub const ERESTARTSYS: i64 = 512;
+pub const ERESTARTNOINTR: i64 = 513;
+pub const ERESTARTNOHAND: i64 = 514;
+pub const ERESTART_RESTARTBLOCK: i64 = 516;
+/// restart_syscall(2), what `ERESTART_RESTARTBLOCK` restarts with.
+pub const SYS_RESTART_SYSCALL: u64 = 219;
 
 /// The program executed `syscall`; `State::rax` holds its number.
 pub const REASON_SYSCALL: u64 = 1;
@@ -149,21 +167,9 @@ pub const SYS_VM_DISCARD: u64 = 1027;
 /// `n` of them, the first `cap` stored at `out` as (key, first page, end
 /// page) triples of u64s.
 pub const SYS_VM_SYNC: u64 = 1028;
-/// `kfile_object(fd, flags) -> handle`: the open file behind descriptor `fd` of
-/// the calling process (the kernel's descriptor table, until files are the
-/// server's), to map with `mo_map` as mmap maps a file: its page cache,
-/// /dev/zero as anonymous memory; the mapping keeps the file and the
-/// descriptor's write access. EBADF, or ENODEV for what cannot be mapped.
-/// The handle is also how a descriptor travels between processes
-/// (`SYS_KFD_INSTALL_FILE`): it keeps the open file description, whatever
-/// it is (a file of the kernel's or a placeholder of the server's), alive
-/// while it is in flight. With `KFILE_INFLIGHT` the handle is such a
-/// descriptor in flight (it cannot be mapped): while one of a placeholder
-/// is, a descriptor of it that goes or the end of a call that looked it up
-/// (`kfd_lookup`) queues `EVENT_INFLIGHT` when nothing but such handles is
-/// left.
-pub const SYS_KFILE_OBJECT: u64 = 1029;
-pub const KFILE_INFLIGHT: u64 = 1;
+// 1029 was `kfile_object`, a handle on an open file of the kernel's
+// descriptor table: the table is the server's since R6e, and an open file of
+// the kernel's comes as a handle from `inode_open` (`SYS_KFILE_CALL`).
 
 /// Test calls a program can make to its server (lxtest): they exercise the
 /// kernel interface above on the calling process. Each returns 0 or a
@@ -190,9 +196,8 @@ pub const TEST_MAP_AT: u64 = 1504;
 pub const SYS_MO_CREATE_PAGED: u64 = 1019;
 /// `event_wait(event, deadline) -> 0`: the instance's service thread (the
 /// pager thread) waits for the next event of the instance and gets it as
-/// an `Event`: a page someone needs, the last descriptor of one of the
-/// server's files gone, a hold released, a cached object's first dirty
-/// page, a request to write back; `EVENT_TIMER` once `deadline`
+/// an `Event`: a page someone needs, a record or hold released, a cached
+/// object's first dirty page, a request to write back; `EVENT_TIMER` once `deadline`
 /// (monotonic nanoseconds; 0: none) passed without one. When the
 /// instance's last program is gone it gets `EVENT_CLOSING` once (to write
 /// its caches back), and the next wait ends the service thread's process.
@@ -210,17 +215,17 @@ pub const SYS_MO_FAIL: u64 = 1022;
 #[derive(Clone, Copy, Default, Debug)]
 pub struct Event {
     pub kind: u64,
-    /// `EVENT_PAGE`: the object's key; `EVENT_CLOSED`: the file's id;
-    /// `EVENT_RELEASE`: the record.
+    /// `EVENT_PAGE`: the object's key; `EVENT_RELEASE`: the record.
     pub a: u64,
     /// `EVENT_PAGE`: byte offset of the page in the object.
     pub b: u64,
 }
 
 pub const EVENT_PAGE: u64 = 1;
-pub const EVENT_CLOSED: u64 = 2;
-/// A record of the server's (`SYS_FS_RECORD`) lost its last holder: `a` is
-/// the record.
+// 2 was `EVENT_CLOSED` (a placeholder's last descriptor gone) and 10
+// `EVENT_INFLIGHT`: the descriptor table is the server's since R6e.
+/// A record of the server's (`SYS_FS_RECORD`, `SYS_FILES_RECORD`, a hold
+/// of `SYS_MO_HOLD`) lost its last holder: `a` is the record.
 pub const EVENT_RELEASE: u64 = 3;
 /// A cached object (`SYS_MO_CREATE_CACHED`) got its first dirty page: `a`
 /// is its key. (Again once all were written back and one is dirtied.)
@@ -242,11 +247,6 @@ pub const EVENT_SYNC: u64 = 8;
 /// disk space is not secured (`a` key, `b` byte offset of the page): the
 /// server promises it and answers with `mo_backed`.
 pub const EVENT_MKWRITE: u64 = 9;
-/// One of the server's files with descriptors in flight (`KFILE_INFLIGHT`)
-/// lost a reference and has nothing but those left (told after the
-/// reference is gone): sockets may be left that only messages in flight
-/// keep, for the server's collector to find. One is queued at a time.
-pub const EVENT_INFLIGHT: u64 = 10;
 /// Input came to the console the instance holds: the service thread takes
 /// it (`console_read` until it returns 0). Queued once until taken.
 pub const EVENT_CONSOLE: u64 = 20;
@@ -337,44 +337,12 @@ pub const SYS_YIELD: u64 = 1032;
 /// the server's copy routine; 0 or -EFAULT.
 pub const TEST_USERCOPY: u64 = 1511;
 
-// The server's files in the kernel's descriptor table (phase R6): until the
-// table is the server's, a file the server implements is a placeholder
-// there, so dup, close, fork, exec's close-on-exec and poll/epoll keep
-// working; the server handles every other operation on it.
-
-/// `kfd_install(id, flags, ready, kind) -> fd`: a new descriptor (the
-/// lowest free one) for the server's file `id`, with open flags `flags`
-/// (O_ACCMODE, O_NONBLOCK, O_APPEND; O_CLOEXEC for the descriptor) and
-/// poll readiness `ready`; `kind` `KFD_ALWAYS_READY` for a file that is
-/// always ready (a regular file or a directory: epoll refuses it with
-/// EPERM, as Linux does), else 0. When its last descriptor goes,
-/// `EVENT_CLOSED`. With O_PATH (and only O_DIRECTORY, O_NOFOLLOW, O_CLOEXEC
-/// besides) the descriptor only names a node: F_GETFL shows those flags, and
-/// the kernel takes it only for dup, close and fcntl's F_DUPFD, F_GETFD,
-/// F_SETFD and F_GETFL (poll: POLLNVAL; select, epoll, ioctl, F_SETFL: EBADF).
-pub const SYS_KFD_INSTALL: u64 = 1034;
-pub const KFD_ALWAYS_READY: u64 = 1;
-/// `kfd_lookup(fd, flags) -> id`: the server's file behind descriptor
-/// `fd` (0: a file of the kernel's; EBADF, also for another instance's
-/// file), its current open flags stored
-/// at `flags` (a u32 in the server's memory) unless 0. The file found is
-/// pinned until the thread enters the program again (as Linux's fdget
-/// holds a file for a call): another thread's close of the descriptor
-/// does not end it under the call. ENOMEM if the pin cannot be kept.
-pub const SYS_KFD_LOOKUP: u64 = 1035;
-/// `kfd_ready(id, ready)`: the readiness of the server's file `id` for
-/// poll, select and epoll (POLLIN, POLLOUT, POLLERR, POLLHUP); wakes who
-/// waits for it.
-pub const SYS_KFD_READY: u64 = 1036;
-/// `kfd_close(fd)`: closes a descriptor of the calling process.
-pub const SYS_KFD_CLOSE: u64 = 1037;
-/// `kfd_read(fd, buf, len) -> n`: reads a file of the kernel's (at its
-/// offset) into the server's memory, as read(2) would (for sendfile into
-/// the server's files).
-pub const SYS_KFD_READ: u64 = 1038;
-/// `kfd_write(fd, buf, len) -> n`: writes the server's memory to a file of
-/// the kernel's, as write(2) would.
-pub const SYS_KFD_WRITE: u64 = 1039;
+// 1034-1039 were the placeholders of the server's files in the kernel's
+// descriptor table (`kfd_install`, `kfd_lookup`, `kfd_ready`, `kfd_close`,
+// `kfd_read`, `kfd_write`; phase R6): since R6e the descriptor table, poll,
+// select and epoll are the server's (docs/design/linux-server.md, "The
+// descriptor table"), and the kernel's files a Linux program uses are open
+// file descriptions the server holds by handle (`SYS_KFILE_CALL`).
 
 // Records per working-directory context (phase R6c): until the process
 // model is the server's (R8), the kernel's clone decides which processes
@@ -433,17 +401,16 @@ pub const SYS_INODE_RENAME: u64 = 1048;
 pub const SYS_INODE_CHMOD: u64 = 1049;
 /// `inode_truncate(handle, len)`: as truncate(2) (ETXTBSY while it runs).
 pub const SYS_INODE_TRUNCATE: u64 = 1050;
-/// `inode_open(handle, flags, path, len) -> fd`: a descriptor of the
-/// calling process for the inode, as open(2) would make it once the path
-/// is resolved (O_ACCMODE, O_TRUNC, O_APPEND, O_NONBLOCK, O_DIRECTORY,
-/// O_CLOEXEC; EISDIR, ENOTDIR, ETXTBSY); `path` is its absolute path.
+/// `inode_open(handle, flags, path, len) -> file`: a handle on a new open
+/// file description of the kernel's for the inode, as open(2) would make it
+/// once the path is resolved (O_ACCMODE, O_TRUNC, O_APPEND, O_NONBLOCK,
+/// O_DIRECTORY; EISDIR, ENOTDIR, ETXTBSY; ENXIO for a device the server
+/// drives); `path` is its absolute path. The server's descriptor table holds
+/// the handle (`SYS_KFILE_CALL`); closing it lets the description go.
 pub const SYS_INODE_OPEN: u64 = 1051;
 /// `inode_statfs(handle, buf)`: its filesystem's `struct statfs`.
 pub const SYS_INODE_STATFS: u64 = 1052;
-/// `kfd_inode(fd, path, cap, len) -> handle`: the inode behind a kernel
-/// descriptor (ENOTDIR for one without, EBADF), its absolute path stored
-/// at `path` (at most `cap` bytes) and the path's length at `len` (a u64).
-pub const SYS_KFD_INODE: u64 = 1053;
+// 1053 was `kfd_inode`: `SYS_KFILE_INODE` takes the handle instead.
 /// `exec_target(handle, path, len)`: the program the thread's next
 /// pass-through execve runs, resolved by the server (an inode of the
 /// kernel's, or a file object: a held one keeps its hold while the program
@@ -649,12 +616,7 @@ pub const SERVER_LOG_MAX: u64 = 256;
 /// id `pid` belongs to the caller's instance (a pid a socket's credentials
 /// may name, SCM_CREDENTIALS).
 pub const SYS_THREAD_EXISTS: u64 = 1090;
-/// `kfd_stat(fd, buf) -> 0`: the `struct stat` (144 bytes) of one of the
-/// kernel's descriptors (EBADF for another), also of one without an inode
-/// (a socket, an epoll instance), at `buf`: fstat as the kernel answers it,
-/// for the server's calls that describe a descriptor in another format
-/// (statx). It goes with the descriptor table (R6e).
-pub const SYS_KFD_STAT: u64 = 1093;
+// 1093 was `kfd_stat`: `SYS_KFILE_CALL` with SYS_FSTAT since R6e.
 // 1094 was `net_links`, the kernel's relay of netd's interface records:
 // the server asks netd itself since R7b (`netring`'s `LINKS`).
 /// `thread_nice(scope, id, set, nice) -> lowest nice + 20`: the nice
@@ -674,27 +636,12 @@ pub const NICE_PGROUP: u64 = 1;
 pub const NICE_ALL: u64 = 2;
 pub const THREAD_IN_INSTANCE: u64 = 1;
 
-// Descriptors passed between processes (SCM_RIGHTS over the server's
-// AF_UNIX sockets, phase R7a), and the bits of the kernel's process model
-// sockets need until it is the server's (R6e moves the descriptor table,
-// R8 processes and signals): a passed descriptor is a `kfile_object` handle
-// on its open file description while it is in flight; the receiver gets a
-// descriptor of its own for the same description.
+// The bits of the kernel's process model sockets need until it is the
+// server's (R8). (1100 `kfd_install_file` and 1101 `kfile_info` were how
+// descriptors travelled with SCM_RIGHTS while the descriptor table was the
+// kernel's: since R6e a descriptor in flight is a reference in the server's
+// own memory.)
 
-/// `kfd_install_file(handle, flags) -> fd`: a new descriptor (the lowest
-/// free one) of the calling process for the open file description behind a
-/// `kfile_object` handle, shared with its other descriptors (offset, status
-/// flags), close-on-exec with `O_CLOEXEC` (the only flag). The handle stays
-/// the server's. EMFILE when the table is full.
-pub const SYS_KFD_INSTALL_FILE: u64 = 1100;
-/// `kfile_info(handle, out)`: about the open file description behind a
-/// `kfile_object` handle, two u64s at `out`: how many references it has
-/// now (descriptors in every process, the server's handles, this one
-/// included, and calls that use it at the moment), and the id of the
-/// server's file it is a placeholder of (0: a file of the kernel's). The
-/// server's collector of descriptors in flight finds sockets that only
-/// messages in flight keep alive with it.
-pub const SYS_KFILE_INFO: u64 = 1101;
 /// `signal_thread(sig)`: raises `sig` for the calling thread as a signal
 /// of its own action (SIGPIPE for a write to a connection whose reader is
 /// gone); delivered when the call returns to the program, after its result.
@@ -762,6 +709,63 @@ pub const SYS_SIGNAL_STATE: u64 = 1115;
 pub const SIGNAL_IGNORED: u64 = 1;
 pub const SIGNAL_BLOCKED: u64 = 2;
 pub const SIGNAL_PENDING: u64 = 4;
+
+// The descriptor table (phase R6e, docs/design/linux-server.md "The
+// descriptor table"): the server's, per process, with poll, select and
+// epoll. Until the process model is the server's (R8), the kernel's clone
+// decides which processes share a table (CLONE_FILES), and each such table
+// of the kernel's (which holds no descriptor of a Linux program) carries a
+// word of the server's, its record, as working-directory contexts do
+// (`SYS_FS_RECORD`).
+
+/// `files_record(op, word)`: `fs_record` for the calling thread's
+/// descriptor table: `FS_GET`, `FS_SET`, and `FS_CHILD`, the record of the
+/// table the thread's next pass-through call makes: a clone without
+/// CLONE_FILES, or execve, which gives the process that table at its point
+/// of no return (the server's copy without the close-on-exec descriptors,
+/// made when the call starts, as Linux's unshare_files). `FILES_UNSHARE`
+/// gives the calling thread a table of its own with record `word` at once
+/// (close_range's CLOSE_RANGE_UNSHARE). Every record handed over comes back
+/// exactly once as `EVENT_RELEASE`: when its table ends (the last process
+/// using it exited or executed another program), or, a child's record no
+/// call took, when the call returns.
+pub const SYS_FILES_RECORD: u64 = 1130;
+pub const FILES_UNSHARE: u64 = 3;
+
+/// `kfile_call(file, nr, a, b, c, d) -> result`: Linux's call `nr` on the
+/// kernel's open file description behind handle `file` (`inode_open`),
+/// with the arguments that follow the descriptor: read, write, pread64,
+/// pwrite64, readv, writev, preadv, pwritev, preadv2 and pwritev2 (`d`:
+/// the RWF flags), lseek, getdents64, ioctl, fsync, fdatasync, ftruncate,
+/// and fcntl's F_SETFL (O_APPEND and O_NONBLOCK: the server keeps the
+/// description's status flags and mirrors them here for the file's own
+/// operations). Buffers are the program's, except: fstat and fstatfs write
+/// their struct into the server's memory, and read and write with
+/// `KFILE_SERVER_BUFFER` in `nr` move the server's memory (sendfile through
+/// the server, at most 64 KiB). These files (regular files and directories
+/// of the kernel's tree, /proc and /sys, null and zero) are always ready:
+/// there is nothing to wait for.
+pub const SYS_KFILE_CALL: u64 = 1131;
+pub const KFILE_SERVER_BUFFER: u64 = 1 << 32;
+/// `kfile_inode(file) -> handle`: the inode the kernel's open file
+/// description behind `file` was opened by (for *at calls and fchdir).
+pub const SYS_KFILE_INODE: u64 = 1132;
+
+/// `server_wait(words, n, deadline, flags, mask) -> 0`: sleeps until one of
+/// the `n` (1..=`WAIT_MAX`) words described at `words` (pairs of u64: the
+/// address of a word in the server's memory, or in an object mapped there
+/// such as a channel's shared area, and the value it is expected to hold)
+/// is woken (`server_futex_wake`, or a service's wake of the object's word),
+/// until the deadline (monotonic nanoseconds; 0: none) passes (ETIMEDOUT)
+/// or, with `FUTEX_INTERRUPTIBLE`, a signal for the program comes (EINTR);
+/// EAGAIN at once if a word holds another value. With `mask` (not 0: the
+/// address of a u64 signal set in the server's memory) the thread's signal
+/// mask is that set while it waits, and if the wait ends with EINTR it stays
+/// until the signal is delivered (the handler runs with it, the caller's own
+/// mask comes back with the handler's return; Linux's saved sigmask), as
+/// ppoll, pselect6 and epoll_pwait want.
+pub const SYS_SERVER_WAIT: u64 = 1133;
+pub const WAIT_MAX: u64 = 64;
 
 /// `(scenario)`: the server runs a channel scenario against the test
 /// service (servers/ringtest, `ring::selftest`): 1 rings and doorbells, 2

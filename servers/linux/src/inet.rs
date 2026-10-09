@@ -1,6 +1,6 @@
 //! Internet sockets (phase R7b, ADR 0008): TCP, UDP and raw ICMP sockets
-//! of the server, each a file with a placeholder in the kernel's
-//! descriptor table, as AF_UNIX ones are; netd runs the protocols. This is
+//! of the server, each a file of its own, as AF_UNIX ones are; netd runs
+//! the protocols. This is
 //! the sockets' semantics (Linux's, `man 7 tcp`, `udp`, `ip`, `socket`);
 //! `inetcalls` is their system calls (addresses, message headers,
 //! options), `netclient` the channel to netd.
@@ -124,7 +124,7 @@ pub struct InetSock {
     pub kind: Kind,
     pub net: Arc<Net>,
     pub index: u32,
-    /// Its placeholder's id.
+    /// Its open file description's id.
     id: AtomicU64,
     rings: Mutex<Option<Rings>>,
     rlock: Mutex<()>,
@@ -240,7 +240,7 @@ impl InetSock {
         self.id.load(SeqCst)
     }
 
-    /// Its placeholder's id, once it has one (`report_now` then).
+    /// Its description's id, once it has one (`report_now` then).
     pub fn set_id(&self, id: u64) {
         self.id.store(id, SeqCst);
     }
@@ -366,7 +366,7 @@ impl InetSock {
         }
     }
 
-    /// Reports the readiness as it is (a new placeholder).
+    /// Reports the readiness as it is (a new description).
     pub fn report_now(&self) {
         let mut l = self.st.lock();
         let now = self.readiness(&mut l);
@@ -376,6 +376,24 @@ impl InetSock {
 
     pub fn readiness_now(&self) -> i16 {
         self.readiness(&mut self.st.lock())
+    }
+
+    /// For poll and select: counts the caller among the waiters netd wakes
+    /// on the control block's `seq` (`unwatch_ctl` takes it back), so that
+    /// they hear of netd's changes directly, not through the net thread.
+    pub fn watch_ctl(&self) {
+        self.ctl().client.waiters.fetch_add(1, SeqCst);
+    }
+
+    pub fn unwatch_ctl(&self) {
+        self.ctl().client.waiters.fetch_sub(1, SeqCst);
+    }
+
+    /// The control block's `seq`: its address and its value now (read
+    /// before the readiness is looked at).
+    pub fn ctl_word(&self) -> (u64, u32) {
+        let word = &self.ctl().netd.seq;
+        (word as *const core::sync::atomic::AtomicU32 as u64, word.load(SeqCst))
     }
 
     /// The net thread: netd changed the socket (or the channel died).
@@ -969,7 +987,7 @@ impl InetSock {
         self.net.status(Request::SetOpt { sock: self.index, opt: option, value }).map(|_| ())
     }
 
-    /// The placeholder's last descriptor went: the socket closes in netd
+    /// The description's last reference went: the socket closes in netd
     /// (a reset if data it received is unread, or SO_LINGER with a zero
     /// time), `now` before this returns (its port is free then), else by
     /// the net thread (the caller may not wait for netd: the pager).

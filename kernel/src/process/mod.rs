@@ -15,8 +15,6 @@ pub mod irq;
 mod loader;
 mod prctl;
 pub mod query;
-pub mod epoll;
-pub mod poll;
 pub mod sched;
 pub mod signal;
 mod sys_file;
@@ -56,33 +54,21 @@ pub type Pid = u64;
 
 pub const TIMER_HZ: u64 = 100;
 
+/// A descriptor of the kernel's tables (the native servers'; a Linux
+/// program's descriptors are its server's).
+#[derive(Clone)]
 pub struct FdEntry {
-    /// Let go of through `fs::file::release` (see `Drop`).
-    file: core::mem::ManuallyDrop<Arc<OpenFile>>,
+    file: Arc<OpenFile>,
     pub cloexec: bool,
 }
 
 impl FdEntry {
     pub fn new(file: Arc<OpenFile>, cloexec: bool) -> FdEntry {
-        FdEntry { file: core::mem::ManuallyDrop::new(file), cloexec }
+        FdEntry { file, cloexec }
     }
 
     pub fn file(&self) -> &Arc<OpenFile> {
         &self.file
-    }
-}
-
-impl Clone for FdEntry {
-    fn clone(&self) -> FdEntry {
-        FdEntry::new(self.file().clone(), self.cloexec)
-    }
-}
-
-impl Drop for FdEntry {
-    fn drop(&mut self) {
-        // Taken once, here.
-        let file = unsafe { core::mem::ManuallyDrop::take(&mut self.file) };
-        crate::fs::file::release(file);
     }
 }
 

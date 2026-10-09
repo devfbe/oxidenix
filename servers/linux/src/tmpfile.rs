@@ -1,6 +1,6 @@
-//! Open files of the server's tmpfs (phase R6c.2c): a placeholder in the
-//! kernel's descriptor table names one (an open file description: offset,
-//! directory snapshot, write access); the calls on it are the server's.
+//! Open files of the server's tmpfs (phase R6c.2c): what an open file
+//! description of the server's names (offset, directory snapshot, write
+//! access); the calls on it are the server's.
 //! Reads and writes move bytes between the file object and the program's
 //! memory in the kernel (`SYS_MO_FILE_READ`/`WRITE`), as the kernel's tmpfs
 //! files did.
@@ -20,8 +20,6 @@ use restricted::*;
 const O_TRUNC: u32 = 0o1000;
 const O_APPEND: u32 = 0o2000;
 const O_DIRECTORY: u32 = 0o200000;
-const POLLIN: i16 = 0x1;
-const POLLOUT: i16 = 0x4;
 
 pub struct TmpOpen {
     pub inode: Arc<Inode>,
@@ -81,7 +79,7 @@ pub fn open(inode: Arc<Inode>, flags: u32, path: String) -> Result<i64, i64> {
     }
     open.notify(inotify::IN_OPEN);
     let kept = flags & (O_ACCMODE | files::O_NONBLOCK | O_APPEND | files::O_CLOEXEC);
-    files::install(files::new_id(), File::Tmp(open), kept, POLLIN | POLLOUT)
+    files::install(files::new_id(), File::Tmp(open), kept)
 }
 
 /// The calls on an open tmpfs file (`a1`..`a3`: the call's arguments after

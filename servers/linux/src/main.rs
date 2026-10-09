@@ -1,7 +1,9 @@
 //! The Linux server (docs/design/linux-server.md). It runs on the threads
 //! of the Linux programs it serves, in their address spaces' normal view,
-//! and handles what the programs trap into: in phase R1 it hands every
-//! system call back to the kernel's own Linux implementation.
+//! and handles what the programs trap into: memory, time, descriptors and
+//! files, paths, sockets; what it does not handle yet (processes and
+//! signals, until R8) it hands back to the kernel's own Linux
+//! implementation.
 //!
 //! Invariants the kernel relies on: no FPU/SSE (the target has none) and
 //! no FS or GS base, so the program's FPU registers and TLS pointer stay in
@@ -18,7 +20,9 @@ mod datafile;
 mod datafs;
 mod devices;
 mod disktest;
+mod epoll;
 mod eventfd;
+mod fdtable;
 mod files;
 mod fsclient;
 mod heap;
@@ -27,6 +31,7 @@ mod inet;
 mod inetcalls;
 mod initramfs;
 mod inotify;
+mod kfile;
 mod mm;
 mod namespace;
 mod netclient;
@@ -35,6 +40,7 @@ mod netlink;
 mod pathfile;
 mod paths;
 mod pipe;
+mod poll;
 mod pty;
 mod records;
 mod ringclient;
@@ -42,6 +48,7 @@ mod sched;
 mod scm;
 mod sockcalls;
 mod sync;
+mod thread;
 mod time;
 mod tmpfile;
 mod tmpfs;
@@ -88,6 +95,7 @@ fn call0(nr: u64) -> i64 {
 /// instance's pager thread (`role`).
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(state: *mut State, role: u64) -> ! {
+    thread::start(role);
     usercopy::register();
     if role == ROLE_PAGER {
         pager();
@@ -107,7 +115,17 @@ pub extern "C" fn _start(state: *mut State, role: u64) -> ! {
             continue;
         }
         let s = unsafe { &mut *state };
-        if let Some(result) = mm::handle(s).or_else(|| time::handle(s)).or_else(|| files::handle(s)).or_else(|| paths::handle(s)).or_else(|| sched::handle(s)).or_else(|| ids::handle(s)).or_else(|| sockcalls::handle(s)) {
+        if let Some(result) = mm::handle(s)
+            .or_else(|| time::handle(s))
+            .or_else(|| fdtable::handle(s))
+            .or_else(|| files::handle(s))
+            .or_else(|| poll::handle(s))
+            .or_else(|| epoll::handle(s))
+            .or_else(|| paths::handle(s))
+            .or_else(|| sched::handle(s))
+            .or_else(|| ids::handle(s))
+            .or_else(|| sockcalls::handle(s))
+        {
             s.rax = result as u64;
             // /data inodes the call let go of go now, before it returns
             // (an unlink's blocks are free when it returns).
@@ -132,15 +150,18 @@ pub extern "C" fn _start(state: *mut State, role: u64) -> ! {
     }
 }
 
-/// Passes the program's call through to the kernel's Linux implementation.
-fn pass_through(s: &State) {
-    records::before_pass_through(s);
-    // Server files the call closed for good go at once.
-    let mut closed = [0u64; 16];
-    let n = syscall(SYS_LEGACY_SYSCALL, [closed.as_mut_ptr() as u64, closed.len() as u64, 0, 0, 0, 0]);
-    for &id in closed.iter().take(n.max(0) as usize) {
-        files::closed(id, false);
+/// Passes the program's call through to the kernel's Linux implementation:
+/// a clone or execve with the records of what it makes (the working
+/// directory's, the descriptor table's).
+fn pass_through(s: &mut State) {
+    let nr = s.rax;
+    if let Err(e) = fdtable::before_pass_through(s) {
+        s.rax = (-e) as u64;
+        return;
     }
+    records::before_pass_through(s);
+    syscall(SYS_LEGACY_SYSCALL, [0; 6]);
+    fdtable::after_pass_through(nr);
     datafs::reap();
 }
 
@@ -173,9 +194,8 @@ static FAIL_OBJECTS: sync::Mutex<BTreeMap<u64, (u64, bool)>> = sync::Mutex::new(
 /// threads wait for (/data's from the disk, `datafs`; the tests' paged
 /// objects: page n of the first reads "paged n"), writes /data's dirty
 /// files back (when they have been dirty a while, when the kernel asks,
-/// when the instance ends), drops the server's files whose last
-/// descriptor went, and takes back the records and holds the kernel
-/// released.
+/// when the instance ends), and takes back the records and holds the
+/// kernel released (a descriptor table's: its descriptors close).
 fn pager() -> ! {
     loop {
         datafs::reap();
@@ -185,17 +205,17 @@ fn pager() -> ! {
             continue;
         }
         match event.kind {
-            EVENT_CLOSED => {
-                files::closed(event.a, true);
-                continue;
-            }
             EVENT_RELEASE => {
-                // Bit 0 tells a tmpfs file's hold, bit 1 a /data file's, from
-                // a record.
+                // Bit 0 tells a tmpfs file's hold, bit 1 a /data file's, bit 2
+                // a descriptor table (whose descriptors close now: a process
+                // exited or executed a program), from a working directory's
+                // record.
                 if event.a & 1 == 1 {
                     tmpfs::released(event.a);
                 } else if event.a & datafs::HOLD_TAG != 0 {
                     datafs::released(event.a);
+                } else if event.a & fdtable::FILES_TAG != 0 {
+                    fdtable::released(event.a);
                 } else {
                     records::released(event.a);
                 }
@@ -220,15 +240,6 @@ fn pager() -> ! {
                 // netd (their closes hand it over) before the instance goes.
                 netclient::settle();
                 datafs::closing();
-                continue;
-            }
-            EVENT_INFLIGHT => {
-                // A socket in flight lost its last way in but messages (a
-                // descriptor closed, by close, exit or exec, or a call that
-                // used one ended): the worker collects. Never here: the
-                // collector waits for sockets' locks, and a thread holding
-                // one may wait for a page this thread brings.
-                scm::request();
                 continue;
             }
             EVENT_MKWRITE => {
