@@ -62,6 +62,33 @@ The host must be idle while a benchmark runs. Runs of 2026-10-07 (and the first 
 R1) were taken while a compiler kept every host CPU busy and are deleted; every stage up to
 R5 was measured again on an idle host on 2026-10-08 (the files ending in `-quiet`).
 
+## I/O rings step 4: `/data` from the Linux server's page cache
+
+`2026-10-09-802b396-quiet.md` against `2026-10-08-2589c94-slab.md` (before step 4) and Linux
+(`2026-10-08-linux-6.18.54-quiet.md`). It also includes the fair scheduler, AF_UNIX, and the
+leak fixes:
+
+| benchmark | before | now | Linux |
+|---|---:|---:|---:|
+| `seq_write` (MB/s) | 4.1 | 137.7 | 208.1 |
+| `seq_read_disk` (MB/s) | 586.5 | 615.3 | 839.5 |
+| `seq_read_cached` (MB/s) | 7131.1 | 8309.8 | 6097.8 |
+| `read_4k_cached` p50 (ns) | 2680 | 2503 | 1114 |
+| `read_4k_disk` p50 (ns) | 28348 | 26356 | 18627 |
+| `fstat_disk` p50 (cycles) | 14983 | 14072 | 409 |
+| `stat_path_tmpfs` p50 (cycles) | 4436 | 5143 | - |
+| `tcp_loopback` (MB/s) | 619.4 | 647.1 | 5831.5 |
+
+What this shows:
+
+- **Sequential writes are 33× faster.** Writes now go into the server's page cache, with
+  ext2 blocks promised up front, instead of each `write` waiting for diskfs.
+- **`fstat` on `/data` costs no IPC any more** (0 IPC calls per operation). It still costs
+  10 system calls per operation, the forwarding. That is where the remaining gap to Linux
+  is, not the disk path.
+- **Path resolution in tmpfs got 16 % slower** (4436 → 5143 cycles). This is not
+  investigated yet. A candidate is the server lock bookkeeping for the scheduler boost.
+
 ## Open: PCIDs and small cached reads
 
 Turning PCIDs on (commit `fae8292`, before restricted mode) made random 4 KiB reads from the
