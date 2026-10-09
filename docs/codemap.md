@@ -75,8 +75,8 @@ module comment, and the public types it defines. Where to start for common tasks
 - `servers/linux/src/epoll.rs` (511) epoll (phase R6e): an interest list of open file descriptions and a ready list, the event loop interface of libuv (and so of Node.js), as Linux's fs/eventpoll.c has it. Types: `Epoll`, `Item`.
 - `servers/linux/src/eventfd.rs` (101) eventfd (phase R6b): a counter that reads take and writes add to, a file of the server (an open file description of its table's, `files`). Types: `EventFd`.
 - `servers/linux/src/exec.rs` (611) execve and execveat (phase R8, ADR 0010): the ELF loader is the server's.
-- `servers/linux/src/fdtable.rs` (354) The descriptor table (phase R6e, docs/design/linux-server.md "The descriptor table"): per process, the server's. Types: `FilesContext`.
-- `servers/linux/src/files.rs` (704) The server's open files (phase R6, the descriptor table since R6e): an open file description (`Description`) is a file the server implements (`File`: a pipe end, a socket, an open file of tmpfs or /data, a terminal,... Types: `File`, `Description`, `FileRef`, `OriginOf`, `Mapping`.
+- `servers/linux/src/fdtable.rs` (355) The descriptor table (phase R6e, docs/design/linux-server.md "The descriptor table"): per process, the server's. Types: `FilesContext`.
+- `servers/linux/src/files.rs` (714) The server's open files (phase R6, the descriptor table since R6e): an open file description (`Description`) is a file the server implements (`File`: a pipe end, a socket, an open file of tmpfs or /data, a terminal,... Types: `File`, `Description`, `FileRef`, `OriginOf`, `Mapping`.
 - `servers/linux/src/fsclient.rs` (122) The server's end of the file protocol (`fsring`, docs/design/io-rings.md) to a filesystem service: diskfs for /data (`datafs`), procfs for /proc's system-wide files and /sys (`procfs`). Types: `Client`, `Scratch`.
 - `servers/linux/src/heap.rs` (67) The server's heap: one allocator for every thread of the instance, in the shared region, growing by `SYS_SHARED_MAP` when it runs out. Types: `ServerHeap`.
 - `servers/linux/src/ids.rs` (286) Credentials and process attributes (phase R8): the user and group ids, supplementary groups, capabilities, prctl, the resource usage calls (getrusage, times) and the calls that name a thread or process for the kernel...
@@ -95,7 +95,7 @@ module comment, and the public types it defines. Where to start for common tasks
 - `servers/linux/src/pathfile.rs` (22) O_PATH descriptors (open(2) with O_PATH; phase R6d, for any node of the namespace): the descriptor names a node and opens nothing, no driver, no file. Types: `PathOpen`.
 - `servers/linux/src/paths.rs` (668) The system calls that take a path (phase R6c.2b), and the working directory and umask, which live in the caller's record (`records`).
 - `servers/linux/src/pipe.rs` (308) Pipes (phase R6a): a 64 KiB buffer shared by a read end and a write end, each a file of the server (an open file description of its own). Types: `Dst`, `Src`, `Shared`, `PipeEnd`, `Pipe`.
-- `servers/linux/src/poll.rs` (443) Readiness and waiting for many files at once (phase R6e): the watch lists of the server's open file descriptions, poll, ppoll, select, pselect6 (epoll is `epoll`'s; restart_syscall `signal`'s). Types: `Waiter`, `Sub`, `Watch`.
+- `servers/linux/src/poll.rs` (440) Readiness and waiting for many files at once (phase R6e): the watch lists of the server's open file descriptions, poll, ppoll, select, pselect6 (epoll is `epoll`'s; restart_syscall `signal`'s). Types: `Waiter`, `Sub`, `Watch`.
 - `servers/linux/src/process.rs` (1173) Processes (phase R8, docs/design/linux-server.md "Processes and signals", ADR 0010): the instance's pid namespace, the process tree, sessions and process groups, fork, vfork, clone and clone3, exit and exit_group,... Types: `Words`, `Usage`, `Report`, `Brk`, `Proc`, `Thread`, `Table`, `Birth`, `After`.
 - `servers/linux/src/procfile.rs` (177) Open files of /proc and /sys (I/O rings step 5): what an open file description of the server's names (the node, its offset and a snapshot of its contents); the calls on it are the server's (`procfs` makes the contents). Types: `ProcOpen`.
 - `servers/linux/src/procfs.rs` (531) /proc and /sys in the server (I/O rings step 5, docs/design/linux-server.md "/proc and /sys"). Types: `PidFile`, `ProcNode`, `Opened`, `Follow`.
@@ -328,9 +328,14 @@ kernel that handle them.
 - `docs/benchmarks/2026-10-08-fae8292-pcid-quiet.md` Benchmark fae8292 (pcid-quiet)
 - `docs/benchmarks/2026-10-08-linux-6.18.54-quiet.md` Benchmark Linux 6.18.54 (comparison, oxidenix at 92bb179) (quiet)
 - `docs/benchmarks/2026-10-09-1337e20-statpath.md` Benchmark 1337e20 (statpath)
+- `docs/benchmarks/2026-10-09-1b5f908-r6e-ab.md` Benchmark 1b5f908 (r6e-ab)
+- `docs/benchmarks/2026-10-09-1b5f908-r6e-ab2.md` Benchmark 1b5f908 (r6e-ab2)
 - `docs/benchmarks/2026-10-09-27a096a-r6e.md` Benchmark 27a096a (r6e)
 - `docs/benchmarks/2026-10-09-29b0502-r7b-rereview.md` Benchmark 29b0502 (r7b-rereview)
 - `docs/benchmarks/2026-10-09-40aac17-r7b-review.md` Benchmark 40aac17 (r7b-review)
+- `docs/benchmarks/2026-10-09-5fce3fc-base-ab.md` Benchmark 5fce3fc (base-ab)
+- `docs/benchmarks/2026-10-09-5fce3fc-base-ab2.md` Benchmark 5fce3fc (base-ab2)
+- `docs/benchmarks/2026-10-09-6cb21ce-r8.md` Benchmark 6cb21ce (r8)
 - `docs/benchmarks/2026-10-09-714815d-r7b-final.md` Benchmark 714815d (r7b-final)
 - `docs/benchmarks/2026-10-09-802b396-quiet.md` Benchmark 802b396 (quiet)
 - `docs/benchmarks/2026-10-09-bdf16a2-pre-procfs-rings.md` Benchmark bdf16a2 (pre-procfs-rings)
@@ -348,6 +353,8 @@ kernel that handle them.
 - `docs/decisions/0010-processes-and-signals-in-the-linux-server.md` ADR 0010: Processes and signals in the Linux server: containers, kicks, frames by the server
 - `docs/design/io-rings.md` I/O rings: the data plane between the Linux server and the device servers
 - `docs/design/iommu.md` DMA isolation with an IOMMU
+- `docs/design/linux-server.md` The Linux server: system calls in restricted mode
+- `docs/design/linux-server.md` The Linux server: system calls in restricted mode
 - `docs/design/linux-server.md` The Linux server: system calls in restricted mode
 - `docs/design/page-cache.md` Page cache and file-backed mappings
 - `docs/design/smp.md` Symmetric multiprocessing in oxidenix

@@ -543,9 +543,10 @@ fn epoll_create1(flags: u64) -> Result<i64, i64> {
     }
     let id = files::new_id();
     let ep = Epoll::new(id);
-    let fd = files::install(id, File::Epoll(ep.clone()), O_RDWR | flags as u32)?;
-    *ep.watch.lock() = poll::watch_of(id).as_ref().map_or(Weak::new(), Arc::downgrade);
-    Ok(fd)
+    // Its own watch before anything can report it.
+    let watch = Watch::new(id);
+    *ep.watch.lock() = Arc::downgrade(&watch);
+    files::install_watched(id, File::Epoll(ep), O_RDWR | flags as u32, Some(watch))
 }
 
 fn epoll_ctl(epfd: u64, op: u64, fd: u64, event: u64) -> Result<i64, i64> {

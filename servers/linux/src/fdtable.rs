@@ -235,12 +235,15 @@ pub fn release_ended() {
 /// thread waits until the worker let go of every table handed to it, so
 /// that what their sockets still had to send reaches netd first.
 pub fn settle() {
+    // At most 5 s (as `netclient::settle`): a worker stuck on a socket's
+    // lock must not keep the instance from ending.
+    let deadline = crate::ringclient::now() + 5_000_000_000;
     loop {
         let done = RELEASED.load(Ordering::Acquire);
-        if done == HANDED.load(Ordering::Acquire) {
+        if done == HANDED.load(Ordering::Acquire) || crate::ringclient::now() >= deadline {
             return;
         }
-        syscall(SYS_SERVER_FUTEX_WAIT, [&RELEASED as *const AtomicU32 as u64, done as u64, 0, 0, 0, 0]);
+        syscall(SYS_SERVER_FUTEX_WAIT, [&RELEASED as *const AtomicU32 as u64, done as u64, deadline, 0, 0, 0]);
     }
 }
 

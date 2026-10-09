@@ -157,24 +157,28 @@ sequence numbers, half-open connections with small buffers, TIME-WAIT kept in sm
 
 ## R6e: the descriptor table in the Linux server
 
-`2026-10-09-27a096a-r6e.md` against `2026-10-09-714815d-r7b-final.md`: no kernel call for a
-descriptor's lookup (`kfd_lookup` and its pin), a readiness change (`kfd_ready`) or dup,
-close and fcntl any more.
+An A/B in the same dev shell (`nix develop`: QEMU 11.1.1, KVM), two runs each, alternating:
+`2026-10-09-5fce3fc-base-ab.md` and `-base-ab2.md` (main before R6e) against
+`2026-10-09-1b5f908-r6e-ab.md` and `-r6e-ab2.md`. (`2026-10-09-27a096a-r6e.md`, the first R6e
+run, used QEMU 11.1.1 against a base measured with 10.2.4: not comparable.) No kernel call is
+left for a descriptor's lookup (`kfd_lookup` and its pin), a readiness change (`kfd_ready`),
+dup, close or fcntl:
 
-| per operation | before | now |
+| system calls per operation | before | R6e |
 |---|---:|---:|
-| `fstat_tmpfs` system calls | 5 | 3 |
-| `fstat_tmpfs` p50 (cycles) | 2940 | 1941 |
-| `fstat_disk` system calls | 10 | 8 |
-| `read_4k_cached` system calls | 10 | 9 |
-| `seq_read_cached_64k` system calls | 4.02 | 3.02 |
-| `tcp_loopback_64k` system calls | 33.96 | 22.11 |
-| `tcp_network_echo_64k` system calls | 153.05 | 39.09 |
-| kernel heap allocations per `fstat` | 1 | 0 |
+| `fstat_tmpfs` | 4 | 3 |
+| `fstat_disk` | 9 | 8 |
+| `read_4k_cached`, `read_4k_disk` | 10, 17 | 9, 16 |
+| `seq_read_cached_64k` | 4.04 | 3.04 |
+| `proc_self_stat_pread`, `proc_meminfo_pread` | 6, 12 | 5, 11 |
+| `proc_self_stat_open_read_close` | 17 | 14 |
+| `tcp_loopback_64k` | 27.5, 28.8 | 21.1, 20.9 |
 
-What `fstat_disk` keeps is /data's own (its status asked of diskfs over the ring), no
-bridge. `tcp_network_echo` rose to 213 MB/s (from 180); `tcp_loopback` (1131 MB/s against
-1241) is within this host's spread for it.
+`fstat_tmpfs` p50 2402 and 2820 cycles before, 2322 and 1978 with R6e; `proc_self_stat_open_read_close`
+p50 23412 and 17832 against 17509 and 15139. What `fstat_disk` keeps is /data's own (its status
+asked of diskfs over the ring). The throughputs and `tcp_network_echo_64k`'s system calls (which
+count waits, 100 and 139 before, 165 and 98 with R6e) stay within this host's spread between
+runs of the same commit.
 
 ## Open: PCIDs and small cached reads
 
