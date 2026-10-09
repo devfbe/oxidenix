@@ -90,6 +90,7 @@ static void basics(void) {
     close(d);
     check("dup2 onto itself returns it", dup2(p[0], p[0]) == p[0]);
     check("dup3 onto itself is EINVAL", dup3(p[0], p[0], 0) == -1 && errno == EINVAL);
+    check("... also for a closed descriptor (before EBADF)", dup3(500, 500, 0) == -1 && errno == EINVAL);
     check("dup3 with a flag but O_CLOEXEC is EINVAL", dup3(p[0], 20, O_NONBLOCK) == -1 && errno == EINVAL);
     check("dup2 of a closed descriptor is EBADF", dup2(500, 20) == -1 && errno == EBADF);
     check("dup2 replaces an open descriptor", dup2(p[1], 20) == 20 && dup2(p[0], 20) == 20);

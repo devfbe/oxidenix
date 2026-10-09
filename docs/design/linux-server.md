@@ -600,7 +600,7 @@ pipe's end is.
   mmap, getdents and fchmod, fchown, futimens are EBADF. Its description's status flags
   carry O_PATH: F_GETFL shows it, only dup, close and fcntl's F_DUPFD, F_GETFD, F_SETFD and
   F_GETFL take it of the descriptor table's calls (Linux's fdget_raw), and SCM_RIGHTS passes
-  it; poll gives POLLNVAL, select, epoll, ioctl and F_SETFL EBADF; inotify and socket calls
+  it; poll gives POLLNVAL, select never finds it ready, epoll, ioctl and F_SETFL give EBADF; inotify and socket calls
   on one are EBADF. As a directory of *at calls it must be a
   directory (ENOTDIR: an O_NOFOLLOW symlink's path is not followed); `readlinkat` with an
   empty path reads the symlink it names. It keeps its node (a /data inode unlinked meanwhile
@@ -666,7 +666,7 @@ the kernel keeps descriptor tables for its native servers only. Decisions in ADR
   close-on-exec bit), the lowest free slot, and RLIMIT_NOFILE (4096 by default, at most
   2^20, Linux's fs.nr_open). Its calls: close, close_range (with `CLOSE_RANGE_CLOEXEC` and
   `CLOSE_RANGE_UNSHARE`), dup, dup2, dup3, fcntl's `F_DUPFD`, `F_DUPFD_CLOEXEC`, `F_GETFD`,
-  `F_SETFD`, `F_GETFL` and `F_SETFL` (O_APPEND, O_NONBLOCK), the ioctls `FIONBIO`, `FIOCLEX`
+  `F_SETFD`, `F_GETFL` and `F_SETFL` (O_APPEND, O_NONBLOCK; O_DIRECT, O_NOATIME and O_ASYNC are ignored), the ioctls `FIONBIO`, `FIOCLEX`
   and `FIONCLEX`, and RLIMIT_NOFILE of prlimit64, getrlimit and setrlimit (the caller's: the
   limit is kept with its table until the process model is the server's). No lock of a table
   is held while program memory is copied or a description is let go of.
@@ -721,7 +721,12 @@ from the kernel for them.
   wakes, so they do not wait for the net thread to pass netd's change on. The kernel's
   primitive is one call for any of several words (`server_wait`: up to 64 words of the
   server's memory or of an object mapped there, a deadline, and a temporary signal mask
-  with the saved-mask semantics of sigsuspend for ppoll, pselect6 and epoll_pwait).
+  with the saved-mask semantics of sigsuspend for ppoll, pselect6 and epoll_pwait; an
+  epoll_pwait that returns events after all puts the caller's mask back without delivering
+  what only the temporary one let through, `restore_sigmask`, Linux's
+  restore_saved_sigmask_unless). A poller announces that it sleeps, so a report makes the
+  kernel call that wakes it only then, and an epoll instance reports its own readiness only
+  while something watches it; a description that is always ready has no watch at all.
 - **Signals**: interrupted with nothing ready, poll answers `ERESTART_RESTARTBLOCK` (the
   kernel restarts it as restart_syscall, which the server answers with the deadline it kept
   in the thread's words, unless a handler ran: then EINTR), ppoll, select and pselect6

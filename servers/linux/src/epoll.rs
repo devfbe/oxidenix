@@ -78,6 +78,15 @@ const MAX_NESTING: usize = 4;
 /// Size of a `struct epoll_event` (packed on x86-64).
 const EVENT_SIZE: u64 = 12;
 
+/// An event taken off the ready list for delivery: its events and data,
+/// the item, and the item's flags before (a one-shot one is disabled).
+struct Taken {
+    events: u32,
+    data: u64,
+    item: Arc<Item>,
+    flags: u32,
+}
+
 /// Serializes adding an instance to another, so that the loop check and
 /// the insertion are one step.
 static NESTING: Mutex<()> = Mutex::new(());
@@ -92,6 +101,10 @@ pub struct Epoll {
     seq: AtomicU32,
     /// Threads in epoll_wait on it.
     waiters: AtomicU32,
+    /// Its description's watch (set once it has one): the instance reports
+    /// its own readiness there directly, and only while something watches
+    /// it (a poll on it, an instance that watches it).
+    watch: Mutex<Weak<Watch>>,
 }
 
 struct Ready {
@@ -103,6 +116,8 @@ struct Ready {
 
 /// An interest of an instance in a description.
 pub struct Item {
+    /// Its key in the instance's interest list.
+    key: (i32, usize),
     file: Weak<Description>,
     /// The description's watch, which the item is subscribed to.
     watch: Arc<Watch>,
@@ -139,8 +154,10 @@ impl Item {
         ep.enqueue(self);
         let woke = ep.wake();
         // The instance itself became readable: for a poll on it and the
-        // instances that watch it.
-        files::ready(ep.id, POLLIN_NOW);
+        // instances that watch it, if any.
+        if let Some(own) = ep.own_watch().filter(|w| w.watched()) {
+            own.notify(POLLIN_NOW);
+        }
         wanted & EPOLLEXCLUSIVE != 0 && woke
     }
 
@@ -159,8 +176,11 @@ impl Item {
         let Some(ep) = self.epoll.upgrade() else { return };
         let removed = {
             let mut interest = ep.interest.lock();
-            let key = interest.iter().find(|(_, i)| Arc::ptr_eq(i, self)).map(|(k, _)| *k);
-            key.and_then(|k| interest.remove(&k))
+            // Its own entry only (a later interest may have the key now).
+            match interest.get(&self.key) {
+                Some(i) if Arc::ptr_eq(i, self) => interest.remove(&self.key),
+                _ => None,
+            }
         };
         if removed.is_some() {
             ep.unlist(self);
@@ -178,7 +198,13 @@ impl Epoll {
             ready: Mutex::new(Ready { list: VecDeque::new(), overflow: false }),
             seq: AtomicU32::new(0),
             waiters: AtomicU32::new(0),
+            watch: Mutex::new(Weak::new()),
         })
+    }
+
+    /// Its description's watch.
+    fn own_watch(&self) -> Option<Arc<Watch>> {
+        self.watch.lock().upgrade()
     }
 
     /// Puts the item on the ready list (once).
@@ -270,9 +296,12 @@ impl Epoll {
         if interest.contains_key(&key) {
             return Err(EEXIST);
         }
+        // (Files that are always ready have no watch: EPERM before.)
+        let watch = target.watch.clone().ok_or(EPERM)?;
         let item = Arc::new(Item {
+            key,
             file: Arc::downgrade(target.arc()),
-            watch: target.watch.clone(),
+            watch: watch.clone(),
             epoll: Arc::downgrade(self),
             events: AtomicU32::new(events),
             data: AtomicU64::new(data),
@@ -286,7 +315,7 @@ impl Epoll {
             let room = (interest.len() + 1).saturating_sub(ready.list.len());
             ready.list.try_reserve(room).map_err(|_| ENOMEM)?;
         }
-        target.watch.subscribe(Sub::Item(item.clone()))?;
+        watch.subscribe(Sub::Item(item.clone()))?;
         interest.insert(key, item.clone());
         drop(interest);
         Epoll::wake_if_ready(&item, target);
@@ -317,7 +346,7 @@ impl Epoll {
     /// Takes up to `max` events off the ready list: (events, data, item).
     /// One-shot items are disabled; the caller puts level-triggered ones
     /// back once it delivered them (`settle`).
-    fn collect(&self, max: usize) -> Vec<(u32, u64, Arc<Item>)> {
+    fn collect(&self, max: usize) -> Vec<Taken> {
         // A report that found no room: check every item.
         let overflow = core::mem::replace(&mut self.ready.lock().overflow, false);
         if overflow {
@@ -349,18 +378,24 @@ impl Epoll {
             if flags & EPOLLONESHOT != 0 {
                 item.events.store(flags & FLAGS, SeqCst);
             }
-            out.push((events, item.data.load(SeqCst), item));
+            out.push(Taken { events, data: item.data.load(SeqCst), item, flags });
         }
         out
     }
 
     /// After delivery: the level-triggered items that were reported stay
-    /// ready, at the end of the list; those not delivered (a fault) go back.
-    fn settle(&self, taken: Vec<(u32, u64, Arc<Item>)>, delivered: usize) {
-        for (i, (_, _, item)) in taken.into_iter().enumerate() {
-            let flags = item.events.load(SeqCst);
-            if i >= delivered || flags & (EPOLLET | EPOLLONESHOT) == 0 {
-                self.enqueue(&item);
+    /// ready, at the end of the list; those not delivered (a fault) go back,
+    /// a one-shot one armed again (unless EPOLL_CTL_MOD changed it
+    /// meanwhile).
+    fn settle(&self, taken: Vec<Taken>, delivered: usize) {
+        for (i, t) in taken.into_iter().enumerate() {
+            if i >= delivered {
+                if t.flags & EPOLLONESHOT != 0 {
+                    let _ = t.item.events.compare_exchange(t.flags & FLAGS, t.flags, SeqCst, SeqCst);
+                }
+                self.enqueue(&t.item);
+            } else if t.flags & (EPOLLET | EPOLLONESHOT) == 0 {
+                self.enqueue(&t.item);
             }
         }
     }
@@ -371,7 +406,7 @@ impl Epoll {
         let taken = self.collect(max);
         let mut delivered = 0;
         let mut fault = false;
-        for (events, data, _) in &taken {
+        for Taken { events, data, .. } in &taken {
             let mut record = [0u8; EVENT_SIZE as usize];
             record[..4].copy_from_slice(&events.to_ne_bytes());
             record[4..].copy_from_slice(&data.to_ne_bytes());
@@ -465,7 +500,7 @@ fn levels_above_from(epoll: &Epoll, depth: usize, seen: &mut BTreeMap<usize, usi
     if depth > MAX_NESTING {
         return depth;
     }
-    let Some(watch) = poll::watch_of(epoll.id) else { return 0 };
+    let Some(watch) = epoll.own_watch() else { return 0 };
     let owners: Vec<Arc<Epoll>> = watch
         .subscribers()
         .into_iter()
@@ -507,7 +542,10 @@ fn epoll_create1(flags: u64) -> Result<i64, i64> {
         return Err(EINVAL);
     }
     let id = files::new_id();
-    files::install(id, File::Epoll(Epoll::new(id)), O_RDWR | flags as u32)
+    let ep = Epoll::new(id);
+    let fd = files::install(id, File::Epoll(ep.clone()), O_RDWR | flags as u32)?;
+    *ep.watch.lock() = poll::watch_of(id).as_ref().map_or(Weak::new(), Arc::downgrade);
+    Ok(fd)
 }
 
 fn epoll_ctl(epfd: u64, op: u64, fd: u64, event: u64) -> Result<i64, i64> {
@@ -576,10 +614,16 @@ fn wait(epfd: u64, out: u64, max: u64, deadline: Option<u64>, mask: Option<u64>)
             Err(ETIMEDOUT) => timed_out = true,
             Err(e) => {
                 // Events that came with the signal go first (Linux's
-                // ep_poll looks before it gives up).
-                let n = ep.transfer(out, max as usize)?;
-                if n > 0 {
-                    return Ok(n as i64);
+                // ep_poll looks before it gives up). Then the call does not
+                // end with EINTR: the caller's own mask comes back without
+                // the signal only the temporary mask let through
+                // (restore_saved_sigmask_unless).
+                let r = ep.transfer(out, max as usize);
+                if !matches!(r, Ok(0)) {
+                    if mask.is_some() {
+                        syscall(SYS_RESTORE_SIGMASK, [0; 6]);
+                    }
+                    return r.map(|n| n as i64);
                 }
                 ep.pass_on();
                 return Err(e);

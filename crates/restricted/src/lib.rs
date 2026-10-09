@@ -774,6 +774,12 @@ pub const SYS_KFILE_INODE: u64 = 1132;
 /// ppoll, pselect6 and epoll_pwait want.
 pub const SYS_SERVER_WAIT: u64 = 1133;
 pub const WAIT_MAX: u64 = 64;
+/// `restore_sigmask()`: if a temporary signal mask of `server_wait` is
+/// still in place (it was interrupted), the caller's own mask comes back now,
+/// without delivering the signal the temporary one let through (Linux's
+/// restore_saved_sigmask): for a call that returns what it found after all
+/// (epoll_pwait with events), not EINTR.
+pub const SYS_RESTORE_SIGMASK: u64 = 1134;
 
 /// `(scenario)`: the server runs a channel scenario against the test
 /// service (servers/ringtest, `ring::selftest`): 1 rings and doorbells, 2

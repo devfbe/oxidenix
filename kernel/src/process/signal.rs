@@ -728,6 +728,24 @@ pub fn with_mask<T>(mask: Option<u64>, wait: impl FnOnce() -> Result<T, i64>) ->
     result
 }
 
+/// Puts the caller's own mask back if a temporary one (`with_mask`, kept
+/// after EINTR) is still in place, without delivering what it let through
+/// (Linux's restore_saved_sigmask).
+pub fn restore_saved_mask() {
+    let me = current();
+    let restored = {
+        let mut t = me.sig.lock();
+        let temporary = t.mask;
+        t.restore_mask.take().map(|own| {
+            t.mask = own;
+            own & !temporary != 0
+        })
+    };
+    if restored == Some(true) {
+        retarget(&me.group);
+    }
+}
+
 /// A user signal mask argument: null is none, any size but 8 is EINVAL.
 pub fn read_mask(ptr: u64, size: u64) -> Result<Option<u64>, i64> {
     if ptr == 0 {

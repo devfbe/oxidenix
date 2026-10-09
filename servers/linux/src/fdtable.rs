@@ -5,7 +5,9 @@
 //! descriptors as such are here: close, close_range, dup, dup2, dup3,
 //! fcntl's F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_SETFD, F_GETFL and
 //! F_SETFL, the ioctls FIONBIO, FIOCLEX and FIONCLEX, and prlimit's
-//! RLIMIT_NOFILE.
+//! RLIMIT_NOFILE. F_SETFL changes O_APPEND and O_NONBLOCK; of the rest of
+//! Linux's SETFL_MASK it ignores O_DIRECT (kept as opened), O_NOATIME (no
+//! access times are kept apart) and O_ASYNC (no SIGIO), as the kernel did.
 //!
 //! **Which table.** Until the process model is the server's (R8), the
 //! kernel's clone decides which processes share a table (CLONE_FILES), and
@@ -462,13 +464,14 @@ fn dup(fd: u64) -> Result<i64, i64> {
 
 /// dup2 (`dup2`: the same descriptor is fine) and dup3 (O_CLOEXEC only).
 fn dup3(old: u64, new: u64, flags: u64, dup2: bool) -> Result<i64, i64> {
-    if !dup2 && flags & !(O_CLOEXEC as u64) != 0 {
+    // dup3's own checks come first (Linux's ksys_dup3).
+    if !dup2 && (flags & !(O_CLOEXEC as u64) != 0 || old == new) {
         return Err(EINVAL);
     }
     let context = current();
     let file = context.get(old)?;
     if old == new {
-        return if dup2 { Ok(new as i64) } else { Err(EINVAL) };
+        return Ok(new as i64);
     }
     let replaced = {
         let mut t = context.table.lock();

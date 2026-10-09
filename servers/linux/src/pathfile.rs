@@ -7,7 +7,8 @@
 //! ioctls, mmap and the f* calls that change the node (fchmod, fchown, futimens) are
 //! EBADF. Its description's status flags carry O_PATH: of the descriptor table's calls only
 //! dup, close and fcntl's F_DUPFD, F_GETFD, F_SETFD and F_GETFL take it (F_GETFL shows
-//! O_PATH), SCM_RIGHTS passes it, poll gives POLLNVAL, select and epoll EBADF.
+//! O_PATH), SCM_RIGHTS passes it, poll gives POLLNVAL, select never finds it ready, epoll
+//! gives EBADF.
 
 use crate::files::{self, File, O_CLOEXEC};
 use crate::namespace::Origin;

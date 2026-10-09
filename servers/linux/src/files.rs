@@ -101,7 +101,8 @@ pub struct Description {
     pub id: u64,
     pub file: File,
     flags: AtomicU32,
-    pub watch: Arc<crate::poll::Watch>,
+    /// None for a file that is always ready (nothing to watch).
+    pub watch: Option<Arc<crate::poll::Watch>>,
     /// References in flight (SCM_RIGHTS messages, `scm::Passed`): the
     /// collector of sockets in flight compares them with all references.
     pub inflight: AtomicUsize,
@@ -163,7 +164,9 @@ impl Drop for Description {
     /// of it: a close(2), the service thread for an exit, the worker for a
     /// message the collector dropped).
     fn drop(&mut self) {
-        crate::poll::forget(self.id, &self.watch);
+        if let Some(watch) = &self.watch {
+            crate::poll::forget(self.id, watch);
+        }
         let service = crate::thread::is_service();
         match &self.file {
             File::Pipe(end) => end.close(),
@@ -268,7 +271,7 @@ pub fn install(id: u64, file: File, flags: u32) -> Result<i64, i64> {
 
 /// A new open file description (see `install`), not yet in any table.
 pub fn description(id: u64, file: File, flags: u32) -> FileRef {
-    let watch = crate::poll::Watch::new(id);
+    let watch = (!file.always_ready()).then(|| crate::poll::Watch::new(id));
     FileRef::new(Arc::new(Description { id, file, flags: AtomicU32::new(flags), watch, inflight: AtomicUsize::new(0) }))
 }
 

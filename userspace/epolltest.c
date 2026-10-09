@@ -16,6 +16,7 @@
 #include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/eventfd.h>
+#include <sys/mman.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -52,7 +53,12 @@ static int peek(int ep, struct epoll_event *ev) {
     return n;
 }
 
-static void on_usr1(int sig) { (void)sig; }
+static volatile sig_atomic_t usr1_handled;
+
+static void on_usr1(int sig) {
+    (void)sig;
+    usr1_handled++;
+}
 
 static void sleep_ms(long ms) {
     struct timespec d = {ms / 1000, (ms % 1000) * 1000000};
@@ -213,6 +219,54 @@ static void more(int ep) {
     write(p[1], "z", 1);
     check("epoll_wait into memory it cannot write is EFAULT, the event kept",
           epoll_wait(ep, (struct epoll_event *)8, 1, 0) == -1 && errno == EFAULT && peek(ep, &ev) == 1 && ev.data.u64 == 23);
+    epoll_ctl(ep, EPOLL_CTL_DEL, p[0], NULL);
+    read(p[0], &c, 1);
+
+    /* Two one-shot events, room for one before a page the program cannot
+     * write: the one not delivered stays armed. */
+    int e1 = eventfd(1, 0), e2 = eventfd(1, 0);
+    add(ep, e1, EPOLLIN | EPOLLONESHOT, 31);
+    add(ep, e2, EPOLLIN | EPOLLONESHOT, 32);
+    char *pages = mmap(NULL, 8192, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    mprotect(pages + 4096, 4096, PROT_NONE);
+    struct epoll_event *edge = (struct epoll_event *)(pages + 4096 - sizeof(struct epoll_event));
+    int first = epoll_wait(ep, edge, 2, 0);
+    uint64_t got = first == 1 ? edge[0].data.u64 : 0;
+    struct epoll_event rest[2];
+    int second = epoll_wait(ep, rest, 2, 0);
+    check("a one-shot event not delivered (a fault) stays armed",
+          first == 1 && second == 1 && (got == 31 || got == 32) && rest[0].data.u64 == 63 - got && peek(ep, NULL) == 0);
+    munmap(pages, 8192);
+    close(e1);
+    close(e2);
+
+    /* Events and a signal only epoll_pwait's mask lets through, at once:
+     * the events are returned, and the signal stays pending for the
+     * caller's own mask (no handler runs: Linux's
+     * restore_saved_sigmask_unless). */
+    sigset_t block, open_all, pending;
+    sigemptyset(&block);
+    sigaddset(&block, SIGUSR1);
+    sigemptyset(&open_all);
+    sigprocmask(SIG_BLOCK, &block, NULL);
+    add(ep, p[0], EPOLLIN, 24);
+    usr1_handled = 0;
+    pid_t parent = getpid();
+    child = fork();
+    if (child == 0) {
+        sleep_ms(50);
+        write(p[1], "s", 1);
+        kill(parent, SIGUSR1);
+        _exit(0);
+    }
+    int n = epoll_pwait(ep, &ev, 1, 2000, &open_all);
+    int handled = usr1_handled;
+    waitpid(child, NULL, 0);
+    sigpending(&pending);
+    check("events with a signal its mask let through: the events, no handler",
+          n == 1 && ev.data.u64 == 24 && handled == 0 && sigismember(&pending, SIGUSR1));
+    sigprocmask(SIG_UNBLOCK, &block, NULL);
+    check("... the signal comes once the caller's mask lets it", usr1_handled == 1);
     epoll_ctl(ep, EPOLL_CTL_DEL, p[0], NULL);
     close(p[0]);
     close(p[1]);

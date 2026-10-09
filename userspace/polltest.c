@@ -4,7 +4,8 @@
  * words netd wakes for sockets). Signals end them as on Linux: EINTR
  * after a handler, even under SA_RESTART; a stop and a continue do not end
  * them (restarted with the time left, which select and ppoll write back);
- * descriptors that are not open are POLLNVAL for poll, EBADF for select. */
+ * descriptors that are not open are POLLNVAL for poll, EBADF for select
+ * (an O_PATH one: POLLNVAL, never ready for select). */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
@@ -271,8 +272,18 @@ int main(void) {
     check("poll: an O_PATH descriptor is POLLNVAL", poll(nv, 1, 0) == 1 && nv[0].revents == POLLNVAL);
     FD_ZERO(&rs);
     FD_SET(opath, &rs);
-    check("select: an O_PATH descriptor is EBADF", select(opath + 1, &rs, NULL, NULL, &tv0) == -1 && errno == EBADF);
+    check("select: an O_PATH descriptor is never ready", select(opath + 1, &rs, NULL, NULL, &tv0) == 0);
     close(opath);
+    close(p[1]);
+
+    /* select takes microseconds beyond a second as seconds (Linux). */
+    pipe(p);
+    write(p[1], "x", 1);
+    FD_ZERO(&rs);
+    FD_SET(p[0], &rs);
+    struct timeval long_usec = {0, 1500000};
+    check("select: tv_usec beyond a second is no EINVAL", syscall(SYS_select, p[0] + 1, &rs, NULL, NULL, &long_usec) == 1);
+    close(p[0]);
     close(p[1]);
 
     /* select writes back the time left (as Linux; musl's wrapper hides it,

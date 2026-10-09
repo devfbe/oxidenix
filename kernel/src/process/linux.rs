@@ -1311,6 +1311,13 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             let interruptible = flags & FUTEX_INTERRUPTIBLE != 0;
             super::signal::with_mask(mask, || super::futex::server_waitv(&words, deadline, interruptible))
         }
+        SYS_RESTORE_SIGMASK => {
+            if is_pager() {
+                return Err(EPERM);
+            }
+            super::signal::restore_saved_mask();
+            Ok(0)
+        }
         SYS_MO_SUPPLY => {
             let (handle, offset, buf, len) = (a[0], a[1], a[2], a[3]);
             let cache = instance.memory(handle)?;

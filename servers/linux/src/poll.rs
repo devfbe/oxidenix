@@ -67,16 +67,23 @@ const EX_SET: i16 = POLLPRI;
 /// A thread waiting in poll or select: reports advance and wake its word.
 pub struct Waiter {
     word: AtomicU32,
+    /// Set while the poller sleeps (or is about to): only then does a report
+    /// make the kernel call that wakes it. The poller sets it after it read
+    /// the word, a report reads it after it advanced the word: either the
+    /// report sees it set, or the poller's wait finds the word moved.
+    sleeping: AtomicU32,
 }
 
 impl Waiter {
     fn new() -> Arc<Waiter> {
-        Arc::new(Waiter { word: AtomicU32::new(0) })
+        Arc::new(Waiter { word: AtomicU32::new(0), sleeping: AtomicU32::new(0) })
     }
 
     fn wake(&self) {
         self.word.fetch_add(1, SeqCst);
-        syscall(SYS_SERVER_FUTEX_WAKE, [&self.word as *const AtomicU32 as u64, 1, 0, 0, 0, 0]);
+        if self.sleeping.load(SeqCst) != 0 {
+            syscall(SYS_SERVER_FUTEX_WAKE, [&self.word as *const AtomicU32 as u64, 1, 0, 0, 0, 0]);
+        }
     }
 }
 
@@ -90,6 +97,9 @@ pub enum Sub {
 /// An open file description's watch list (see the module comment).
 pub struct Watch {
     subs: Mutex<Vec<Sub>>,
+    /// How many there are (read without the lock: an epoll instance
+    /// reports itself only while something watches it).
+    count: AtomicUsize,
 }
 
 /// Watches with subscribers, anywhere in the instance.
@@ -106,7 +116,7 @@ fn shard(id: u64) -> &'static Mutex<BTreeMap<u64, Weak<Watch>>> {
 impl Watch {
     /// The watch of a new description `id`.
     pub fn new(id: u64) -> Arc<Watch> {
-        let watch = Arc::new(Watch { subs: Mutex::new(Vec::new()) });
+        let watch = Arc::new(Watch { subs: Mutex::new(Vec::new()), count: AtomicUsize::new(0) });
         shard(id).lock().insert(id, Arc::downgrade(&watch));
         watch
     }
@@ -118,6 +128,7 @@ impl Watch {
             WATCHED.fetch_add(1, SeqCst);
         }
         subs.push(sub);
+        self.count.store(subs.len(), SeqCst);
         Ok(())
     }
 
@@ -125,17 +136,23 @@ impl Watch {
         let removed = {
             let mut subs = self.subs.lock();
             let i = subs.iter().position(|s| same(s, gone));
-            let removed = i.map(|i| subs.swap_remove(i));
+            let removed = i.map(|i| subs.remove(i));
             if removed.is_some() && subs.is_empty() {
                 WATCHED.fetch_sub(1, SeqCst);
             }
+            self.count.store(subs.len(), SeqCst);
             removed
         };
         // Its last reference may go here, after the lock.
         drop(removed);
     }
 
-    /// Whether anybody listens (a poller's or epoll's waiters).
+    /// Whether anybody listens.
+    pub fn watched(&self) -> bool {
+        self.count.load(SeqCst) != 0
+    }
+
+    /// Who listens (a poller's or epoll's waiters).
     pub fn subscribers(&self) -> Vec<Sub> {
         self.subs.lock().clone()
     }
@@ -144,7 +161,7 @@ impl Watch {
     /// (`ready`) are queued, all those without EPOLLEXCLUSIVE, the exclusive
     /// ones in order up to the first that woke a waiter of its instance
     /// (Linux's exclusive wakeup).
-    fn notify(&self, ready: i16) {
+    pub fn notify(&self, ready: i16) {
         let subs = self.subs.lock();
         for s in subs.iter() {
             match s {
@@ -202,6 +219,7 @@ pub fn forget(id: u64, watch: &Arc<Watch>) {
         if had && subs.is_empty() {
             WATCHED.fetch_sub(1, SeqCst);
         }
+        watch.count.store(subs.len(), SeqCst);
         items
     };
     for item in items {
@@ -214,7 +232,9 @@ pub type Word = (u64, u32);
 
 /// Waits until one of `words` is woken (`SYS_SERVER_WAIT`), the deadline
 /// (monotonic ns) or a signal, with `mask` as the signal mask while it
-/// waits: Ok when woken or a word moved, ETIMEDOUT, EINTR.
+/// waits: Ok when woken or a word moved, ETIMEDOUT, EINTR, EPIPE for a word
+/// of an object that was hung up (netd died: such words wake nobody any
+/// more, the caller stops waiting on them).
 pub fn wait(words: &[Word], deadline: Option<u64>, mask: Option<u64>) -> Result<(), i64> {
     let list: Vec<[u64; 2]> = words.iter().take(WAIT_MAX as usize).map(|&(a, v)| [a, v as u64]).collect();
     let mask_word = mask.unwrap_or(0);
@@ -223,9 +243,7 @@ pub fn wait(words: &[Word], deadline: Option<u64>, mask: Option<u64>) -> Result<
     match r {
         r if r == -EINTR => Err(EINTR),
         r if r == -ETIMEDOUT => Err(ETIMEDOUT),
-        // A word moved, or a channel's object was hung up (netd died: the
-        // socket reports an error now).
-        r if r >= 0 || r == -EAGAIN || r == -EPIPE => Ok(()),
+        r if r >= 0 || r == -EAGAIN => Ok(()),
         r => Err(-r),
     }
 }
@@ -237,18 +255,19 @@ pub fn now() -> u64 {
 }
 
 /// A timeout in a timespec (a timeval with `micro`) at `ptr`, as a deadline;
-/// None for a null pointer (forever). EINVAL for a negative or unnormalized
-/// one.
+/// None for a null pointer (forever). EINVAL for a negative one, or a
+/// timespec's nanoseconds beyond a second; a timeval's microseconds beyond
+/// a second count as seconds (Linux's select).
 fn deadline_of(ptr: u64, micro: bool) -> Result<Option<u64>, i64> {
     if ptr == 0 {
         return Ok(None);
     }
     let [sec, sub]: [i64; 2] = usercopy::read(ptr)?;
     let per = if micro { 1_000_000 } else { 1_000_000_000 };
-    if sec < 0 || !(0..per).contains(&sub) {
+    if sec < 0 || sub < 0 || (!micro && sub >= per) {
         return Err(EINVAL);
     }
-    let ns = (sec as u64).saturating_mul(1_000_000_000).saturating_add(sub as u64 * (1_000_000_000 / per as u64));
+    let ns = (sec as u64).saturating_mul(1_000_000_000).saturating_add((sub as u64).saturating_mul(1_000_000_000 / per as u64));
     Ok(Some(now().saturating_add(ns)))
 }
 
@@ -286,11 +305,12 @@ impl Listening {
     }
 
     fn listen(&mut self, f: &FileRef) -> Result<(), i64> {
-        if f.file.always_ready() || f.is_path() || self.files.iter().any(|g| g.ptr() == f.ptr()) {
+        let Some(watch) = f.watch.as_ref().filter(|_| !f.is_path()) else { return Ok(()) };
+        if self.files.iter().any(|g| g.ptr() == f.ptr()) {
             return Ok(());
         }
         self.files.try_reserve(1).map_err(|_| ENOMEM)?;
-        f.watch.subscribe(Sub::Waiter(self.waiter.clone()))?;
+        watch.subscribe(Sub::Waiter(self.waiter.clone()))?;
         self.files.push(f.clone());
         if let files::File::Inet(s) = &f.file {
             if self.inet.len() + 1 < WAIT_MAX as usize && self.inet.try_reserve(1).is_ok() {
@@ -299,6 +319,23 @@ impl Listening {
             }
         }
         Ok(())
+    }
+
+    /// A channel's words were hung up: netd's directly woken words go (the
+    /// net thread still reports the sockets through their watches).
+    fn without_direct(&mut self) {
+        for s in self.inet.drain(..) {
+            s.unwatch_ctl();
+        }
+    }
+
+    /// Sleeps on `words` (read before readiness was checked; see `wait`),
+    /// announced to the reports (`Waiter::sleeping`).
+    fn sleep(&self, words: &[Word], deadline: Option<u64>, mask: Option<u64>) -> Result<(), i64> {
+        self.waiter.sleeping.store(1, SeqCst);
+        let r = wait(words, deadline, mask);
+        self.waiter.sleeping.store(0, SeqCst);
+        r
     }
 
     /// The words to wait on, read before readiness is checked.
@@ -316,7 +353,9 @@ impl Drop for Listening {
     fn drop(&mut self) {
         let me = Sub::Waiter(self.waiter.clone());
         for f in &self.files {
-            f.watch.unsubscribe(&me);
+            if let Some(watch) = &f.watch {
+                watch.unsubscribe(&me);
+            }
         }
         for s in &self.inet {
             s.unwatch_ctl();
@@ -369,9 +408,10 @@ fn do_poll(entries: &mut [PollFd], deadline: Option<u64>, mask: Option<u64>) -> 
         if ready > 0 || timed_out {
             return Ok(ready);
         }
-        match wait(&words, deadline, mask) {
+        match listening.sleep(&words, deadline, mask) {
             Ok(()) => {}
             Err(ETIMEDOUT) => timed_out = true,
+            Err(EPIPE) => listening.without_direct(),
             Err(e) => return Err(e),
         }
     }
@@ -466,11 +506,12 @@ fn do_select(nfds: u64, sets: [u64; 3], deadline: Option<u64>, mask: Option<u64>
         let (w, b) = ((fd / 64) as usize, 1u64 << (fd % 64));
         (0..3).fold(0, |m, k| m | if want[k][w] & b != 0 { 1 << k } else { 0 })
     };
-    // Every descriptor asked about must be open (and no O_PATH one).
+    // Every descriptor asked about must be open (Linux's max_select_fd);
+    // an O_PATH one is, but never ready (its fdget finds no file).
     let mut listening = Listening::new();
     for fd in 0..nfds {
         if wanted(fd) != 0 {
-            let f = files::lookup(fd)?;
+            let f = files::lookup_raw(fd)?;
             listening.listen(&f)?;
         }
     }
@@ -505,9 +546,10 @@ fn do_select(nfds: u64, sets: [u64; 3], deadline: Option<u64>, mask: Option<u64>
             }
             return Ok(ready);
         }
-        match wait(&words_now, deadline, mask) {
+        match listening.sleep(&words_now, deadline, mask) {
             Ok(()) => {}
             Err(ETIMEDOUT) => timed_out = true,
+            Err(EPIPE) => listening.without_direct(),
             Err(EINTR) => return Err(ERESTARTNOHAND),
             Err(e) => return Err(e),
         }
