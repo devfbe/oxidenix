@@ -1,6 +1,9 @@
 //! The file protocol of the data plane: the requests the Linux server (the
 //! client) sends diskfs (the service) through a channel's submission ring,
 //! and their completions (docs/design/io-rings.md, "The file protocol").
+//! procfs speaks it too, read-only and without holds, for /proc's
+//! system-wide files and /sys (`procproto::SERVICE`; io-rings.md, "procfs
+//! over the rings"); what follows is diskfs's side where they differ.
 //!
 //! A request is a `ring::Desc`: `op`, the client's `tag` (echoed by the
 //! completion), the inode in `object`, and a buffer, a range of a grant
@@ -40,22 +43,21 @@
 //! `FORGET` of a grant no request in flight uses, which completes at once.
 //!
 //! **Durability.** A completed `WRITE` is visible to every later request
-//! (on any channel, and to the kernel's IPC clients); it is durable only
+//! (on any channel); it is durable only
 //! after a later `FLUSH` completed: write-back, as Linux's page cache
 //! (`fsync` is `FLUSH`). A `FLUSH` writes the data to the device and
 //! empties the device's cache before the metadata that points to it (the
 //! block maps, sizes, bitmaps) is written, then empties the cache again:
 //! after a crash, a file never shows blocks whose data did not reach the
 //! disk. Other operations commit their own metadata changes before they
-//! complete, as the IPC protocol does (`fsproto`), and with it what
-//! completed writes changed (also data first).
+//! complete, and with it what completed writes changed (also data
+//! first).
 //!
 //! **Holds.** A client holds every inode it named in a request or got
 //! back from `LOOKUP`, `CREATE`, `UNLINK` or `RENAME`, until it sends
 //! `RELEASE` for it or its channel goes. An inode whose last link went is
-//! freed (with its blocks) only when no client holds it, the kernel's IPC
-//! client included: one client's `RELEASE` never frees what another still
-//! uses. (A client releases what it no longer caches; until then an
+//! freed (with its blocks) only when no client holds it: one client's
+//! `RELEASE` never frees what another still uses. (A client releases what it no longer caches; until then an
 //! unlinked inode stays allocated.)
 //!
 //! **Room.** The service takes a request only when the completion ring
