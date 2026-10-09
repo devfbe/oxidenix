@@ -30,9 +30,13 @@
 //! and hold the area; positions the client publishes are checked against
 //! the ring's size (a violation resets the socket, which reports EIO); a
 //! copy from or to a grant revoked meanwhile fails that socket the same
-//! way, never netd. Resources are bounded: `MAX_CHANNELS` channels,
-//! `MAX_GRANTS` grants each, the bytes of smoltcp's buffers (`BUDGET`), no
-//! more requests taken than the completion ring has room for.
+//! way, never netd. Resources are bounded in all and per instance (the
+//! kernel's offer names the instance; `netring::Budget`, charged before
+//! anything is allocated): `MAX_CHANNELS` channels and two per instance,
+//! `MAX_GRANTS` grants a channel, the bytes of smoltcp's buffers and of
+//! closed connections' leftovers (`BUDGET`, three quarters of it per
+//! instance), TIME-WAIT records (`MAX_LINGERING`, a quarter per instance),
+//! no more requests taken than the completion ring has room for.
 
 use alloc::collections::BTreeMap;
 use alloc::vec;
@@ -40,8 +44,8 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering::SeqCst};
 use netring::errno::*;
 use netring::{
-    fill, opt, pieces, state, tcp_port_conflict, udp_port_conflict, Area, Buf, Completion, Ctl, Endpoint, Kind, Link, PortClaim, PortHolder, Record, Request, SharedArea,
-    RECORD_HEADER,
+    fill, opt, pieces, state, tcp_port_conflict, udp_port_conflict, Area, Budget, Buf, Completion, Ctl, Endpoint, Kind, Link, PortClaim, PortHolder, Record, Request,
+    SharedArea, RECORD_HEADER,
 };
 use ring::channel::{Header, Layout, Offer};
 use ring::{Consumer, Producer, Ring, Wait};
@@ -69,7 +73,14 @@ const RAW_BUFFER: usize = 16 * 1024;
 /// sized for them, see main).
 pub const BUDGET: usize = 24 << 20;
 /// What one channel (an instance) may take of it.
-const CHANNEL_BUDGET: usize = BUDGET * 3 / 4;
+const INSTANCE_BUDGET: usize = BUDGET * 3 / 4;
+/// Ports in TIME-WAIT kept at once, and for one instance: half the
+/// ephemeral range at most, so connects of others always find a port.
+const MAX_LINGERING: usize = 8192;
+const INSTANCE_LINGERING: usize = 2048;
+/// Channels of one instance (one, and a new one while netd still tears
+/// down the old after its client gave it up).
+const INSTANCE_CHANNELS: usize = 2;
 const MAX_BACKLOG: usize = 8;
 /// The largest UDP payload (an IPv4 packet of 65535 bytes).
 const MAX_UDP: usize = 65507;
@@ -225,13 +236,16 @@ struct Closing {
     sent: usize,
     local: Option<IpListenEndpoint>,
     reuse: bool,
-    /// The channel it belonged to.
+    /// The instance it belonged to.
     owner: u64,
     cost: usize,
 }
 
 struct Chan {
     id: u64,
+    /// The instance that connected it (`Offer::instance`): what the
+    /// channel takes is charged to it, its ports are its.
+    owner: u64,
     header: &'static Header,
     area: &'static SharedArea,
     requests: Consumer<'static, N>,
@@ -242,9 +256,6 @@ struct Chan {
     rang: bool,
     /// Sockets marked for the net thread this round.
     marked: bool,
-    /// The bytes of the budget its sockets hold (`CHANNEL_BUDGET`), also
-    /// the closing ones.
-    used: usize,
 }
 
 /// Network configuration (DHCP's).
@@ -264,8 +275,12 @@ pub struct Service {
     /// smoltcp socket and its buffers went).
     lingering: Vec<(PortHolder, Instant)>,
     next_port: u16,
-    /// smoltcp buffer bytes in use.
-    used: usize,
+    /// What the instances hold, each within its share: the bytes of
+    /// smoltcp's socket buffers (and of closed connections' leftovers),
+    /// records of ports in TIME-WAIT, channels.
+    bytes: Budget,
+    lingering_records: Budget,
+    channels: Budget,
     /// A datagram on its way out.
     scratch: Vec<u8>,
     pub config: Config,
@@ -310,7 +325,9 @@ impl Service {
             closing: Vec::new(),
             lingering: Vec::new(),
             next_port: FIRST_EPHEMERAL,
-            used: 0,
+            bytes: Budget::new(BUDGET, INSTANCE_BUDGET),
+            lingering_records: Budget::new(MAX_LINGERING, INSTANCE_LINGERING),
+            channels: Budget::new(MAX_CHANNELS, INSTANCE_CHANNELS),
             scratch: vec![0; MAX_UDP.max(RAW_BUFFER)],
             config: Config::default(),
         }
@@ -327,14 +344,23 @@ impl Service {
         }
         let layout = want.expect("a valid layout");
         let Some(slot) = self.chans.iter().position(Option::is_none) else { return -ENOSPC };
+        // An instance gets a few channels (a new one after its old died),
+        // never the slots of others.
+        if self.channels.charge(offer.instance, 1).is_err() {
+            return -ENOSPC;
+        }
         let base = match oxrt::chan_attach(offer.channel) {
             Ok(base) => base,
-            Err(e) => return e,
+            Err(e) => {
+                self.channels.uncharge(offer.instance, 1);
+                return e;
+            }
         };
         // Mapped until chan_detach, which comes after the Chan is dropped.
         let (sub, comp) = unsafe { (layout.ring::<N>(base, layout.submission), layout.ring::<N>(base, layout.completion)) };
         self.chans[slot] = Some(Chan {
             id: offer.channel,
+            owner: offer.instance,
             header: unsafe { Header::at(base) },
             area: unsafe { SharedArea::at(base.add(layout.shared)) },
             requests: Ring::new(sub).consumer(),
@@ -343,7 +369,6 @@ impl Service {
             socks: BTreeMap::new(),
             rang: false,
             marked: false,
-            used: 0,
         });
         0
     }
@@ -424,12 +449,13 @@ impl Service {
         let mut chan = self.chans[c].take().expect("in use");
         for (_, s) in core::mem::take(&mut chan.socks) {
             // The rings went with the grants: nothing more of theirs.
-            self.release(chan.id, s, false, Vec::new(), sockets);
+            self.release(chan.owner, s, false, Vec::new(), sockets);
         }
         for (_, g) in core::mem::take(&mut chan.grants) {
             let _ = oxrt::munmap(g.addr, g.bytes as usize);
         }
         let _ = oxrt::chan_detach(chan.id);
+        self.channels.uncharge(chan.owner, 1);
     }
 
     fn chan(&mut self, c: usize) -> &mut Chan {
@@ -503,32 +529,26 @@ impl Service {
         sockets.add(socket)
     }
 
-    /// The bytes of the budget channel `c` may still take: what is left of
-    /// netd's, at most what is left of the channel's share (no instance can
-    /// take all of netd's memory from the others).
+    /// The bytes channel `c`'s instance may still take: what is left of
+    /// netd's, at most what is left of the instance's share (whatever
+    /// number of channels it has: no instance can take all of netd's memory
+    /// from the others).
     fn room(&mut self, c: usize) -> usize {
-        let global = BUDGET - self.used;
-        global.min(CHANNEL_BUDGET - self.chan(c).used)
+        let owner = self.chan(c).owner;
+        self.bytes.room(owner)
     }
 
-    /// Takes `cost` bytes of the budget for channel `c` (ENOBUFS if they
-    /// are not there).
+    /// Takes `cost` bytes for channel `c`'s instance before anything is
+    /// allocated (ENOBUFS if they are not there).
     fn charge(&mut self, c: usize, cost: usize) -> Result<(), i64> {
-        if cost > self.room(c) {
-            return Err(ENOBUFS);
-        }
-        self.used += cost;
-        self.chan(c).used += cost;
-        Ok(())
+        let owner = self.chan(c).owner;
+        self.bytes.charge(owner, cost)
     }
 
-    /// Gives `cost` bytes back, charged to the channel `owner` (gone
-    /// already, perhaps).
+    /// Gives `cost` bytes back to the instance `owner` (whose channels may
+    /// be gone already).
     fn uncharge(&mut self, owner: u64, cost: usize) {
-        self.used -= cost;
-        if let Some(chan) = self.chans.iter_mut().flatten().find(|ch| ch.id == owner) {
-            chan.used -= cost;
-        }
+        self.bytes.uncharge(owner, cost);
     }
 
     /// Enters a new socket under index `sock` of channel `c`: its control
@@ -616,7 +636,7 @@ impl Service {
                 };
                 if let Some((local, reuse, listening, connected)) = held {
                     let addr = local.addr.map(bits);
-                    out.push(PortHolder { owner: chan.id, port: local.port, addr, reuse, listening, connected, closing: false });
+                    out.push(PortHolder { owner: chan.owner, port: local.port, addr, reuse, listening, connected, closing: false });
                 }
             }
         }
@@ -636,7 +656,7 @@ impl Service {
     /// (None: any) with `reuse` (netring's rules: Linux's, and never a port
     /// another instance serves).
     fn conflict(&self, tcp: bool, c: usize, sock: u32, port: u16, addr: Option<IpAddress>, reuse: bool, sockets: &SocketSet<'static>) -> bool {
-        let owner = self.chans[c].as_ref().expect("in use").id;
+        let owner = self.chans[c].as_ref().expect("in use").owner;
         let claim = PortClaim { owner, port, addr: addr.map(bits), reuse };
         let rule = if tcp { tcp_port_conflict } else { udp_port_conflict };
         self.holders(tcp, sockets, Some((c, sock))).iter().any(|h| rule(&claim, h))
@@ -967,7 +987,7 @@ impl Service {
     fn close(&mut self, c: usize, sock: u32, abort: bool, sockets: &mut SocketSet<'static>) -> Reply {
         let room = self.room(c);
         let chan = self.chan(c);
-        let owner = chan.id;
+        let owner = chan.owner;
         let mut s = chan.socks.remove(&sock).ok_or(EBADF)?;
         // What the send ring still holds goes before the FIN, in netd's
         // memory: within the budget (the client chooses its rings' size),
@@ -1160,16 +1180,24 @@ impl Service {
         let mut progress = false;
         let mut freed = Vec::new();
         let now = crate::now();
-        let lingering = &mut self.lingering;
-        lingering.retain(|&(_, until)| now < until);
+        let (lingering, records) = (&mut self.lingering, &mut self.lingering_records);
+        lingering.retain(|&(h, until)| {
+            if now < until {
+                return true;
+            }
+            records.uncharge(h.owner, 1);
+            false
+        });
         self.closing.retain_mut(|cl| {
             let socket = sockets.get_mut::<tcp::Socket>(cl.handle);
             if socket.state() == tcp::State::TimeWait {
                 // Both FINs went: what is left is the port, for TIME-WAIT
-                // (Linux keeps it as a small record too). The buffers go
-                // now; a segment of the old connection that still comes
-                // is answered with a reset instead of an ACK.
-                if let Some(local) = cl.local {
+                // (Linux keeps it as a small record too), within the
+                // instance's share of records (beyond it the port is free
+                // at once). The buffers go now; a segment of the old
+                // connection that still comes is answered with a reset
+                // instead of an ACK.
+                if let Some(local) = cl.local.filter(|_| records.charge(cl.owner, 1).is_ok()) {
                     let holder = PortHolder { owner: cl.owner, port: local.port, addr: local.addr.map(bits), reuse: cl.reuse, listening: false, connected: false, closing: true };
                     lingering.push((holder, now + TIME_WAIT));
                 }

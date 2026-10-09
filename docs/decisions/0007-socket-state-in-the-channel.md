@@ -53,8 +53,9 @@ Alternatives considered:
   every change without any thread of the program in the server.
 - **One netd for all instances**, ports global in its stack; a channel names only its own
   control blocks, and port sharing (`SO_REUSEADDR`) never lets one instance take a port
-  another one serves (`netring`'s port rules, tested on the host); each instance may hold at
-  most three quarters of netd's socket memory.
+  another one serves (`netring`'s port rules, tested on the host); netd accounts per instance
+  (the kernel's offer names it), whatever number of channels it opens: at most two channels,
+  three quarters of netd's socket memory, a quarter of the TIME-WAIT records.
 
 ## Consequences
 

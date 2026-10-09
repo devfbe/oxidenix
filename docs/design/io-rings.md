@@ -137,7 +137,7 @@ rings and the shared area are read and write. The positions start at 0.
 | Call | |
 |------|---|
 | `ipc_register(name, len, arg, IPC_CHANNELS)` (1000) | the service accepts channel offers |
-| `ipc_receive` | an offer comes as a control request (id with bit 63 set, `oxrt::Event::Control`) whose payload is a `ring::channel::Offer` (channel id, slots, shared pages, client pid); the service answers with an 8-byte status |
+| `ipc_receive` | an offer comes as a control request (id with bit 63 set, `oxrt::Event::Control`) whose payload is a `ring::channel::Offer` (channel id, slots, shared pages, client pid, the client's instance, by which a service accounts what all of an instance's channels take); the service answers with an 8-byte status |
 | `chan_attach(channel) -> addr` (1068) | maps an offered channel (only the service it was offered to, only once) |
 | `chan_detach(channel)` (1069) | lets go of it: the service's mappings of the channel and of its grants go, and the service vouches that no device uses the grants any more |
 | `grant_map(channel, id, &info) -> addr` (1070) | maps a grant: read-only unless granted writable (`mprotect` cannot add write or execute), not inherited by `fork`, not movable by `mremap`; `info` gets (pages, writable) |

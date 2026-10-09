@@ -68,6 +68,8 @@
 
 #![no_std]
 
+extern crate alloc;
+
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering::SeqCst};
 pub use ring::{Completion, Desc, Wait};
 
@@ -716,8 +718,63 @@ impl Request {
     }
 }
 
+/// A resource netd shares among the instances (bytes of socket buffers,
+/// records of ports in TIME-WAIT, channels): at most `limit` in all and at
+/// most `share` for one instance, whatever number of channels it opened,
+/// so no instance can starve the others. Charged before anything is
+/// allocated, given back to the instance that was charged.
+#[derive(Debug, Default)]
+pub struct Budget {
+    limit: usize,
+    share: usize,
+    used: usize,
+    /// What each instance holds (instances holding nothing are not kept).
+    by_owner: alloc::collections::BTreeMap<u64, usize>,
+}
+
+impl Budget {
+    pub const fn new(limit: usize, share: usize) -> Budget {
+        Budget { limit, share, used: 0, by_owner: alloc::collections::BTreeMap::new() }
+    }
+
+    /// What `owner` may still take.
+    pub fn room(&self, owner: u64) -> usize {
+        let held = self.held(owner);
+        (self.limit - self.used).min(self.share.saturating_sub(held))
+    }
+
+    pub fn held(&self, owner: u64) -> usize {
+        self.by_owner.get(&owner).copied().unwrap_or(0)
+    }
+
+    pub fn used(&self) -> usize {
+        self.used
+    }
+
+    /// Takes `n` for `owner`, or ENOBUFS (nothing taken).
+    pub fn charge(&mut self, owner: u64, n: usize) -> Result<(), i64> {
+        if n > self.room(owner) {
+            return Err(ENOBUFS);
+        }
+        self.used += n;
+        *self.by_owner.entry(owner).or_insert(0) += n;
+        Ok(())
+    }
+
+    /// Gives `n` back from `owner` (never more than it holds).
+    pub fn uncharge(&mut self, owner: u64, n: usize) {
+        let Some(held) = self.by_owner.get_mut(&owner) else { return };
+        let n = n.min(*held);
+        *held -= n;
+        self.used -= n;
+        if *held == 0 {
+            self.by_owner.remove(&owner);
+        }
+    }
+}
+
 /// A socket that holds a port, as netd's port rules see it. `owner` is
-/// the channel (the instance) it belongs to.
+/// the instance it belongs to (`ring::channel::Offer::instance`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PortHolder {
     pub owner: u64,

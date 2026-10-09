@@ -157,6 +157,11 @@ pub struct Offer {
     /// The process (pid) whose server instance connects, for the service's
     /// diagnostics.
     pub client: u64,
+    /// The Linux server instance that connects (never 0), as the kernel
+    /// knows it: a service accounts what it gives the instance's channels
+    /// together (an instance may connect several), and tells instances
+    /// apart (netd's ports).
+    pub instance: u64,
 }
 
 impl Offer {
@@ -167,7 +172,7 @@ impl Offer {
 }
 
 pub const OFFER_MAGIC: u32 = u32::from_le_bytes(*b"OFFR");
-pub const OFFER_BYTES: usize = 32;
+pub const OFFER_BYTES: usize = 40;
 
 impl Offer {
     pub fn encode(&self) -> [u8; OFFER_BYTES] {
@@ -178,6 +183,7 @@ impl Offer {
         b[16..20].copy_from_slice(&self.slots.to_le_bytes());
         b[20..24].copy_from_slice(&self.shared.to_le_bytes());
         b[24..32].copy_from_slice(&self.client.to_le_bytes());
+        b[32..40].copy_from_slice(&self.instance.to_le_bytes());
         b
     }
 
@@ -188,7 +194,10 @@ impl Offer {
         if u32_at(0) != OFFER_MAGIC || u32_at(4) != VERSION {
             return None;
         }
-        let offer = Offer { channel: u64_at(8), slots: u32_at(16), shared: u32_at(20), client: u64_at(24) };
+        let offer = Offer { channel: u64_at(8), slots: u32_at(16), shared: u32_at(20), client: u64_at(24), instance: u64_at(32) };
+        if offer.instance == 0 {
+            return None;
+        }
         offer.layout().map(|_| offer)
     }
 }
@@ -225,7 +234,8 @@ mod tests {
 
     #[test]
     fn offers_round_trip_and_reject_garbage() {
-        let o = Offer { channel: 0x1234_5678_9abc, slots: 64, shared: 0, client: 7 };
+        let o = Offer { channel: 0x1234_5678_9abc, slots: 64, shared: 0, client: 7, instance: 3 };
+        assert_eq!(Offer::decode(&Offer { instance: 0, ..o }.encode()), None);
         assert_eq!(Offer::decode(&o.encode()), Some(o));
         let with_area = Offer { shared: 33, ..o };
         assert_eq!(Offer::decode(&with_area.encode()), Some(with_area));

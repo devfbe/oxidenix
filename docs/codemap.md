@@ -108,7 +108,7 @@ module comment, and the public types it defines. Where to start for common tasks
 - `servers/diskfs/src/service.rs` (937) The ring service: diskfs's end of the data plane (docs/design/io-rings.md, the file protocol `fsring`). Types: `Service`.
 - `servers/netd/src/main.rs` (172) netd: the network server.
 - `servers/netd/src/nic.rs` (114) smoltcp's view of the network card, with loopback: frames addressed to this host (its own address or 127.0.0.0/8) never reach the wire but come back as received frames, and ARP requests for those addresses are... Types: `Nic`, `RxToken`, `TxToken`.
-- `servers/netd/src/service.rs` (1188) The socket service: netd's end of the instances' channels (phase R7b, ADR 0007, the protocol `netring`), mapped onto smoltcp's sockets. Types: `Config`, `Service`.
+- `servers/netd/src/service.rs` (1201) The socket service: netd's end of the instances' channels (phase R7b, ADR 0007, the protocol `netring`), mapped onto smoltcp's sockets. Types: `Config`, `Service`.
 - `servers/netd/src/virtio_net.rs` (91) virtio-net driver on the shared virtio transport (crates/virtio). Types: `VirtioNet`.
 - `servers/procfs/src/main.rs` (349) procfs: Linux's /proc, served from user space.
 - `servers/procfs/src/render.rs` (193) The text formats of Linux's /proc files.
@@ -124,12 +124,12 @@ module comment, and the public types it defines. Where to start for common tasks
 - `crates/fsring/src/lib.rs` (406) The file protocol of the data plane: the requests the Linux server (the client) sends diskfs (the service) through a channel's submission ring, and their completions (docs/design/io-rings.md, "The file protocol"). Types: `Buf`, `Kind`, `Request`, `Stat`, `Usage`.
 - `crates/fsring/tests/protocol.rs` (165) The file protocol's encodings: every request survives encode and decode, malformed descriptors are refused with the right errno (unknown operations, stray fields, lengths, promises and names out of range), and the...
 - `crates/netlink/src/lib.rs` (512) NETLINK_ROUTE's messages (netlink(7), rtnetlink(7)): the requests a program sends to the kernel's end of a netlink socket and the answers, for the Linux server's netlink sockets; kept apart from the server so they... Types: `Ipv4`, `Interface`, `Dump`, `Reply`.
-- `crates/netring/src/lib.rs` (574) The socket protocol of the data plane (phase R7b, ADR 0007): what the Linux server (the client) and netd (the service) share over a channel (`ring::channel`) for the instance's internet sockets. Types: `Kind`, `Line`, `Bitmap`, `ArenaHeader`, `NetdLine`, `ClientLine`, `Ctl`, `SharedArea`, `Area`, `Buf`, `Endpoint`, `Request`, `PortHolder`, `PortClaim`, `Record`, `Link`.
-- `crates/netring/tests/protocol.rs` (361) The socket protocol's encodings and its shared memory: every request survives encode and decode, malformed descriptors are refused with the right errno (unknown operations, stray fields, areas, endpoints and sockets...
+- `crates/netring/src/lib.rs` (611) The socket protocol of the data plane (phase R7b, ADR 0007): what the Linux server (the client) and netd (the service) share over a channel (`ring::channel`) for the instance's internet sockets. Types: `Kind`, `Line`, `Bitmap`, `ArenaHeader`, `NetdLine`, `ClientLine`, `Ctl`, `SharedArea`, `Area`, `Buf`, `Endpoint`, `Request`, `Budget`, `PortHolder`, `PortClaim`, `Record`, `Link`.
+- `crates/netring/tests/protocol.rs` (382) The socket protocol's encodings and its shared memory: every request survives encode and decode, malformed descriptors are refused with the right errno (unknown operations, stray fields, areas, endpoints and sockets...
 - `crates/oxrt/src/lib.rs` (290) Minimal runtime for oxidenix servers: entry point, raw system calls (Linux ABI plus the oxidenix IPC calls), a heap, printing and port I/O. Types: `Event`, `Stdout`.
 - `crates/procproto/src/lib.rs` (78) The kernel's native process and system information (syscall 1005, `proc_query`), from which the procfs server builds Linux's /proc. Types: `CpuTimes`, `System`, `Counters`, `Process`.
 - `crates/restricted/src/lib.rs` (181) The interface between the kernel and the Linux server for restricted mode (docs/design/linux-server.md): the layout of the server's shared region, the per-thread register block, and the kernel calls the server makes... Types: `State`, `Event`, `Walk`.
-- `crates/ring/src/channel.rs` (145) A channel: the memory object both ends of a data-plane connection map (docs/design/io-rings.md). Types: `Layout`, `Header`, `Offer`.
+- `crates/ring/src/channel.rs` (151) A channel: the memory object both ends of a data-plane connection map (docs/design/io-rings.md). Types: `Layout`, `Header`, `Offer`.
 - `crates/ring/src/lib.rs` (205) Single-producer single-consumer rings of fixed-size descriptors in shared memory: the data plane between the Linux server and the device servers (docs/design/io-rings.md, ADR 0005). Types: `Desc`, `Completion`, `RingMemory`, `Wait`, `Ring`, `Producer`, `Consumer`.
 - `crates/ring/src/selftest.rs` (18) The protocol of the self-tests' channel service (servers/ringtest), which the Linux server's test calls (`restricted::TEST_CHANNEL`) drive.
 - `crates/ring/tests/spsc.rs` (213) The ring's invariants (docs/design/io-rings.md): FIFO order, a full ring refuses, positions wrap modulo 2^32, a consumer on another thread sees every entry's contents, and the doorbell protocol loses no wakeup.
@@ -294,6 +294,7 @@ kernel that handle them.
 - `docs/benchmarks/2026-10-08-fae8292-pcid-quiet.md` Benchmark fae8292 (pcid-quiet)
 - `docs/benchmarks/2026-10-08-linux-6.18.54-quiet.md` Benchmark Linux 6.18.54 (comparison, oxidenix at 92bb179) (quiet)
 - `docs/benchmarks/2026-10-09-802b396-quiet.md` Benchmark 802b396 (quiet)
+- `docs/benchmarks/2026-10-09-e21f6ae-r7b.md` Benchmark e21f6ae (r7b)
 - `docs/benchmarks/README.md` Benchmarks
 - `docs/decisions/0001-linux-abi-in-a-user-space-server.md` ADR 0001: The Linux ABI moves out of the kernel, into a server in restricted mode
 - `docs/decisions/0002-one-linux-server-per-process-tree.md` ADR 0002: One Linux server instance per process tree

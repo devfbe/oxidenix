@@ -393,11 +393,16 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
      traffic from one: another instance's bound or listening TCP socket conflicts whatever
      both opted in to (its connections and TIME-WAIT ports follow Linux's rule), and a UDP
      port is shared by `SO_REUSEADDR` only within an instance (`netring::udp_port_conflict`;
-     both rules are tested on the host). An instance may hold at most three quarters of
-     netd's socket memory (`ENOBUFS` beyond), so no instance starves the others; what a closed
-     connection's send ring still held is kept within that budget (else the connection is
-     reset), and a connection in TIME-WAIT keeps only a record of its port (its buffers go;
-     a late segment of it is answered with a reset). Raw ICMP sockets see every ICMP packet
+     both rules are tested on the host). netd knows each channel's instance from the
+     kernel's offer (`Offer::instance`, which no client can forge) and accounts per instance,
+     whatever number of channels it opens (`netring::Budget`, charged before anything is
+     allocated, given back to the instance charged): at most two channels, three quarters
+     of netd's socket memory (smoltcp's buffers of its sockets, listeners' backlogs,
+     accepted connections, closing connections and what their send rings still held;
+     `ENOBUFS` beyond, a reset for a close whose leftovers do not fit), and a quarter of the
+     records of ports in TIME-WAIT (half of the ephemeral range in all), so no instance
+     starves the others. A connection in TIME-WAIT keeps only that record (its buffers go; a
+     late segment of it is answered with a reset). Raw ICMP sockets see every ICMP packet
      of the host, as on Linux (everyone is root): one instance's ICMP traffic shows in
      another's raw sockets. Each round it takes requests (no more than the completion ring
      has room for), the service bitmaps, polls the card and smoltcp, moves data between

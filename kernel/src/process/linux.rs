@@ -1484,7 +1484,7 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             let mut name = [0u8; 64];
             super::uaccess::copy_from_server(a[1], &mut name[..a[2] as usize])?;
             let name = core::str::from_utf8(&name[..a[2] as usize]).map_err(|_| EINVAL)?;
-            end.channel.connect(name, super::current_pid())?;
+            end.channel.connect(name, super::current_pid(), instance.id)?;
             Ok(0)
         }
         SYS_GRANT => {

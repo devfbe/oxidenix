@@ -326,8 +326,9 @@ impl Channel {
     // ------------------------------------------------------------ client
 
     /// Offers the channel to the service registered as `name` and waits
-    /// until it attached it (see `restricted::SYS_CHAN_CONNECT`).
-    pub fn connect(&self, name: &str, client: Pid) -> Result<(), i64> {
+    /// until it attached it (see `restricted::SYS_CHAN_CONNECT`), for the
+    /// process `client` of the Linux server instance `instance`.
+    pub fn connect(&self, name: &str, client: Pid, instance: u64) -> Result<(), i64> {
         {
             let inner = self.inner.lock();
             if inner.offered.is_some() || inner.service.is_some() || inner.service_gone {
@@ -350,7 +351,7 @@ impl Channel {
             }
             inner.offered = Some(to);
         }
-        let offer = Offer { channel: self.id, slots: self.layout.slots, shared: self.layout.shared_pages as u32, client }.encode();
+        let offer = Offer { channel: self.id, slots: self.layout.slots, shared: self.layout.shared_pages as u32, client, instance }.encode();
         let mut message = Vec::new();
         let sent = message.try_reserve_exact(offer.len()).map_err(|_| ENOMEM).and_then(|_| {
             message.extend_from_slice(&offer);

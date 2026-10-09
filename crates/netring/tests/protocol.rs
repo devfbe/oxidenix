@@ -225,6 +225,33 @@ fn no_instance_takes_a_port_another_one_serves() {
     assert!(!udp_port_conflict(&claim(2, LO, true), &holder(1, Some(0x0a00_020f), true)));
 }
 
+#[test]
+fn budgets_bound_each_instance_and_all() {
+    let mut b = Budget::new(100, 60);
+    // One instance gets its share, not more, however it asks (many
+    // channels of it are the same owner).
+    assert_eq!(b.charge(1, 40), Ok(()));
+    assert_eq!(b.charge(1, 30), Err(ENOBUFS));
+    assert_eq!(b.held(1), 40, "a refused charge takes nothing");
+    assert_eq!(b.charge(1, 20), Ok(()));
+    assert_eq!(b.room(1), 0);
+    // Another instance gets what is left of the whole.
+    assert_eq!(b.room(2), 40);
+    assert_eq!(b.charge(2, 41), Err(ENOBUFS));
+    assert_eq!(b.charge(2, 40), Ok(()));
+    assert_eq!(b.charge(3, 1), Err(ENOBUFS));
+    // Given back to the instance charged, never more than it holds.
+    b.uncharge(1, 1000);
+    assert_eq!((b.held(1), b.used()), (0, 40));
+    b.uncharge(4, 10);
+    assert_eq!(b.used(), 40);
+    assert_eq!(b.charge(3, 60), Ok(()));
+    assert_eq!(b.room(1), 0, "the whole is used up");
+    b.uncharge(2, 40);
+    b.uncharge(3, 60);
+    assert_eq!((b.used(), b.room(5)), (0, 60));
+}
+
 /// A shared area in host memory, page-aligned.
 fn shared_area() -> &'static SharedArea {
     let layout = std::alloc::Layout::from_size_align(SHARED_PAGES as usize * PAGE, PAGE).unwrap();
