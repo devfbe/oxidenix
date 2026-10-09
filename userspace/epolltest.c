@@ -1,5 +1,7 @@
-/* epoll: interest lists with level- and edge-triggered readiness, the
- * event loop interface of libuv and therefore Node.js. */
+/* epoll (the Linux server's, phase R6e): interest lists with level- and
+ * edge-triggered readiness, the event loop interface of libuv and
+ * therefore Node.js; EPOLLEXCLUSIVE, nesting, instances shared by fork and
+ * passed with SCM_RIGHTS. */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
@@ -51,6 +53,170 @@ static int peek(int ep, struct epoll_event *ev) {
 }
 
 static void on_usr1(int sig) { (void)sig; }
+
+static void sleep_ms(long ms) {
+    struct timespec d = {ms / 1000, (ms % 1000) * 1000000};
+    nanosleep(&d, NULL);
+}
+
+/* Two processes wait in epoll_wait, each on an instance of its own that
+ * watches one eventfd (with `exclusive`: EPOLLEXCLUSIVE); one write. How
+ * many of them woke? */
+static int woken_by_one_write(int exclusive) {
+    int efd = eventfd(0, EFD_NONBLOCK);
+    int rep[2];
+    pipe(rep);
+    pid_t kids[2];
+    for (int i = 0; i < 2; i++) {
+        kids[i] = fork();
+        if (kids[i] == 0) {
+            int e = epoll_create1(0);
+            add(e, efd, EPOLLIN | (exclusive ? EPOLLEXCLUSIVE : 0), 0);
+            struct epoll_event ev;
+            int n = epoll_wait(e, &ev, 1, 500);
+            char c = n == 1 ? 'w' : 't';
+            write(rep[1], &c, 1);
+            _exit(0);
+        }
+    }
+    sleep_ms(150);
+    uint64_t one = 1;
+    write(efd, &one, sizeof one);
+    for (int i = 0; i < 2; i++) waitpid(kids[i], NULL, 0);
+    char got[2] = {0, 0};
+    read(rep[0], got, 2);
+    close(rep[0]);
+    close(rep[1]);
+    close(efd);
+    return (got[0] == 'w') + (got[1] == 'w');
+}
+
+static int send_fd(int sock, int fd) {
+    char byte = 'F';
+    struct iovec iov = {&byte, 1};
+    char control[CMSG_SPACE(sizeof(int))];
+    memset(control, 0, sizeof control);
+    struct msghdr msg = {.msg_iov = &iov, .msg_iovlen = 1, .msg_control = control, .msg_controllen = sizeof control};
+    struct cmsghdr *c = CMSG_FIRSTHDR(&msg);
+    c->cmsg_level = SOL_SOCKET;
+    c->cmsg_type = SCM_RIGHTS;
+    c->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(c), &fd, sizeof fd);
+    return sendmsg(sock, &msg, 0) == 1 ? 0 : -1;
+}
+
+static int recv_fd(int sock) {
+    char byte;
+    struct iovec iov = {&byte, 1};
+    char control[CMSG_SPACE(sizeof(int))];
+    struct msghdr msg = {.msg_iov = &iov, .msg_iovlen = 1, .msg_control = control, .msg_controllen = sizeof control};
+    if (recvmsg(sock, &msg, 0) != 1) return -1;
+    struct cmsghdr *c = CMSG_FIRSTHDR(&msg);
+    if (!c || c->cmsg_type != SCM_RIGHTS) return -1;
+    int fd;
+    memcpy(&fd, CMSG_DATA(c), sizeof fd);
+    return fd;
+}
+
+/* The epoll semantics R6e brought into the Linux server beyond the
+ * basics: EPOLLEXCLUSIVE, instances shared by fork and passed with
+ * SCM_RIGHTS, interests that belong to the description, files that take
+ * no interest. */
+static void more(int ep) {
+    struct epoll_event ev;
+    int p[2];
+    pipe(p);
+    int e = eventfd(0, 0);
+    check("EPOLLEXCLUSIVE with EPOLLONESHOT is EINVAL", add(ep, e, EPOLLIN | EPOLLEXCLUSIVE | EPOLLONESHOT, 0) == -1 && errno == EINVAL);
+    int other = epoll_create1(0);
+    check("EPOLLEXCLUSIVE on an epoll instance is EINVAL", add(ep, other, EPOLLIN | EPOLLEXCLUSIVE, 0) == -1 && errno == EINVAL);
+    check("EPOLLEXCLUSIVE is taken", add(ep, e, EPOLLIN | EPOLLEXCLUSIVE, 17) == 0);
+    check("an exclusive interest cannot be modified", mod(ep, e, EPOLLIN, 17) == -1 && errno == EINVAL);
+    check("EPOLL_CTL_MOD cannot make one exclusive", add(ep, p[0], EPOLLIN, 18) == 0 && mod(ep, p[0], EPOLLIN | EPOLLEXCLUSIVE, 18) == -1 && errno == EINVAL);
+    uint64_t one = 1;
+    write(e, &one, sizeof one);
+    check("an exclusive interest reports", peek(ep, &ev) == 1 && ev.data.u64 == 17);
+    epoll_ctl(ep, EPOLL_CTL_DEL, e, NULL);
+    epoll_ctl(ep, EPOLL_CTL_DEL, p[0], NULL);
+    close(e);
+    close(other);
+    int ex = woken_by_one_write(1), all = woken_by_one_write(0);
+    printf("  (one write woke %d of two exclusive waiters, %d of two others)\n", ex, all);
+    check("EPOLLEXCLUSIVE: one write wakes one of two waiting instances", ex == 1);
+    check("without it, both", all == 2);
+
+    /* An instance is a description: a forked child shares it, and an
+     * interest added after the fork reaches the child's epoll_wait. */
+    int shared = epoll_create1(0);
+    pid_t child = fork();
+    if (child == 0) {
+        int n = epoll_wait(shared, &ev, 1, 2000);
+        _exit(n == 1 && ev.data.u64 == 19 ? 0 : 1);
+    }
+    sleep_ms(50);
+    add(shared, p[0], EPOLLIN, 19);
+    write(p[1], "x", 1);
+    int status;
+    waitpid(child, &status, 0);
+    check("a forked child shares the instance (interests added later)", WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    char c;
+    read(p[0], &c, 1);
+    close(shared);
+
+    /* An instance passed with SCM_RIGHTS: the receiver waits on it, the
+     * sender's descriptor closed. */
+    int sv[2];
+    socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+    int passed = epoll_create1(0);
+    add(passed, p[0], EPOLLIN, 20);
+    child = fork();
+    if (child == 0) {
+        int got = recv_fd(sv[1]);
+        int n = got >= 0 ? epoll_wait(got, &ev, 1, 2000) : -1;
+        _exit(n == 1 && ev.data.u64 == 20 ? 0 : 1);
+    }
+    check("an epoll instance is passed with SCM_RIGHTS", send_fd(sv[0], passed) == 0);
+    close(passed);
+    sleep_ms(50);
+    write(p[1], "y", 1);
+    waitpid(child, &status, 0);
+    check("... and the receiver waits on it after the sender closed it", WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    read(p[0], &c, 1);
+    close(sv[0]);
+    close(sv[1]);
+
+    /* An interest belongs to (descriptor number, description): the same
+     * number for another description is another interest. */
+    int q[2];
+    pipe(q);
+    int num = dup(q[0]);
+    check("an interest by number and description", add(ep, num, EPOLLIN, 21) == 0);
+    dup2(p[0], num);
+    check("the number names another description now: a new interest", add(ep, num, EPOLLIN, 22) == 0);
+    write(q[1], "q", 1);
+    check("the first interest lives with its description", peek(ep, &ev) == 1 && ev.data.u64 == 21);
+    close(q[0]);
+    close(q[1]);
+    check("... and goes with it", peek(ep, NULL) == 0);
+    epoll_ctl(ep, EPOLL_CTL_DEL, num, NULL);
+    close(num);
+
+    /* Files without readiness of their own. */
+    int proc = open("/proc/self/stat", O_RDONLY);
+    check("a file of the kernel's (/proc) is EPERM", add(ep, proc, EPOLLIN, 0) == -1 && errno == EPERM);
+    close(proc);
+    int opath = open("/tmp", O_PATH);
+    check("an O_PATH descriptor is EBADF", add(ep, opath, EPOLLIN, 0) == -1 && errno == EBADF);
+    check("epoll_wait on an O_PATH descriptor is EBADF", epoll_wait(opath, &ev, 1, 0) == -1 && errno == EBADF);
+    close(opath);
+    add(ep, p[0], EPOLLIN, 23);
+    write(p[1], "z", 1);
+    check("epoll_wait into memory it cannot write is EFAULT, the event kept",
+          epoll_wait(ep, (struct epoll_event *)8, 1, 0) == -1 && errno == EFAULT && peek(ep, &ev) == 1 && ev.data.u64 == 23);
+    epoll_ctl(ep, EPOLL_CTL_DEL, p[0], NULL);
+    close(p[0]);
+    close(p[1]);
+}
 
 int main(void) {
     int ep = epoll_create1(EPOLL_CLOEXEC);
@@ -302,6 +468,9 @@ int main(void) {
     n = syscall(SYS_epoll_pwait2, ep, &ev, 1, &ten_ms, NULL, 8);
     waited = (now_ns() - t0) / 1000;
     check("epoll_pwait2 takes a timespec timeout", n == 0 && waited >= 10000 && waited < 20000);
+    sigprocmask(SIG_UNBLOCK, &block, NULL);
+
+    more(ep);
 
     printf("epolltest: %s\n", failures ? "FAILED" : "all passed");
     return failures != 0;

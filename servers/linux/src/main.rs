@@ -155,6 +155,12 @@ pub extern "C" fn _start(state: *mut State, role: u64) -> ! {
 /// directory's, the descriptor table's).
 fn pass_through(s: &mut State) {
     let nr = s.rax;
+    // A handler that ran returns here: nothing is left to restart
+    // (Linux's rt_sigreturn resets the restart block).
+    const SYS_RT_SIGRETURN: u64 = 15;
+    if nr == SYS_RT_SIGRETURN {
+        thread::set_restart([thread::RESTART_NONE, 0, 0, 0]);
+    }
     if let Err(e) = fdtable::before_pass_through(s) {
         s.rax = (-e) as u64;
         return;
