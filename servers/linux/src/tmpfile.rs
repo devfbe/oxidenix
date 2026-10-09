@@ -55,7 +55,7 @@ impl Drop for TmpOpen {
 pub fn open(inode: Arc<Inode>, flags: u32, path: String) -> Result<i64, i64> {
     const ENXIO: i64 = 6;
     // A socket is connected to, not opened.
-    if inode.mode() & vfs::S_IFMT == vfs::S_IFSOCK {
+    if inode.file_type() == vfs::S_IFSOCK {
         return Err(ENXIO);
     }
     let writable = flags & O_ACCMODE != 0;
@@ -66,7 +66,7 @@ pub fn open(inode: Arc<Inode>, flags: u32, path: String) -> Result<i64, i64> {
     if flags & O_DIRECTORY != 0 && !dir {
         return Err(ENOTDIR);
     }
-    let regular = inode.mode() & vfs::S_IFMT == vfs::S_IFREG;
+    let regular = inode.file_type() == vfs::S_IFREG;
     // Not while it runs as a program (ETXTBSY).
     let write = writable && regular;
     if write {
@@ -345,7 +345,7 @@ impl TmpOpen {
         if !readable || (shared && prot_write && !writable) {
             return Err(EACCES);
         }
-        if self.inode.mode() & vfs::S_IFMT != vfs::S_IFREG {
+        if self.inode.file_type() != vfs::S_IFREG {
             return Err(ENODEV);
         }
         if shared && writable {
@@ -359,7 +359,7 @@ impl TmpOpen {
 
 /// The right to run a tmpfs file: a held handle for `exec_target`.
 pub fn exec_hold(inode: &Arc<Inode>) -> Result<u64, i64> {
-    if inode.mode() & vfs::S_IFMT != vfs::S_IFREG {
+    if inode.file_type() != vfs::S_IFREG {
         const ENOEXEC: i64 = 8;
         return Err(if inode.is_dir() { EISDIR } else { ENOEXEC });
     }

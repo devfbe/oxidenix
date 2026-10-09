@@ -91,6 +91,9 @@ pub struct State {
 
 pub struct Inode {
     pub ino: u64,
+    /// Its file type (`S_IFMT` bits), fixed at creation: known without the
+    /// lock (a path walk asks each name's).
+    file_type: u32,
     pub state: Mutex<State>,
     /// Taken by O_APPEND writes: finding the end and writing there is one
     /// step for every appender.
@@ -111,8 +114,15 @@ pub fn new_root() -> Arc<Inode> {
 
 impl Inode {
     fn new(kind: Kind, perm: u32) -> Arc<Inode> {
+        let file_type = kind_bits(&kind);
         let state = State { perm, kind, times: Times::new(now()), writers: 0, removed: false, link: None };
-        Arc::new(Inode { ino: NEXT_INO.fetch_add(1, Ordering::Relaxed), state: Mutex::new(state), append: Mutex::new(()), opens: AtomicUsize::new(0) })
+        Arc::new(Inode {
+            ino: NEXT_INO.fetch_add(1, Ordering::Relaxed),
+            file_type,
+            state: Mutex::new(state),
+            append: Mutex::new(()),
+            opens: AtomicUsize::new(0),
+        })
     }
 
     /// The directory it is in and its name there (None: removed, or the
@@ -127,12 +137,16 @@ impl Inode {
     }
 
     pub fn mode(&self) -> u32 {
-        let st = self.state.lock();
-        kind_bits(&st.kind) | st.perm
+        self.file_type | self.state.lock().perm
+    }
+
+    /// Its file type (`S_IFMT` bits).
+    pub fn file_type(&self) -> u32 {
+        self.file_type
     }
 
     pub fn is_dir(&self) -> bool {
-        matches!(self.state.lock().kind, Kind::Dir(_))
+        self.file_type == vfs::S_IFDIR
     }
 
     /// The file object's handle (EISDIR for a directory, EINVAL else).
@@ -159,24 +173,21 @@ impl Inode {
     }
 
     pub fn size(&self) -> u64 {
-        match &self.state.lock().kind {
-            Kind::File(o) => syscall(SYS_MO_FILE_SIZE, [o.handle(), 0, 0, 0, 0, 0]).max(0) as u64,
-            Kind::Symlink(t) => t.len() as u64,
-            Kind::Dir(m) => m.len() as u64,
-            Kind::Socket => 0,
-        }
+        stat_size(&self.state.lock().kind)
     }
 
-    /// Its status: every field of `struct stat`, and the birth time.
+    /// Its status: every field of `struct stat`, and the birth time (one
+    /// snapshot, under one lock).
     pub fn status(&self) -> Stat {
-        let mode = self.mode();
-        let size = self.size();
-        let times = self.state.lock().times;
+        let (perm, size, times) = {
+            let st = self.state.lock();
+            (st.perm, stat_size(&st.kind), st.times)
+        };
         Stat {
             dev: DEV,
             ino: self.ino,
-            nlink: if mode & vfs::S_IFMT == vfs::S_IFDIR { 2 } else { 1 },
-            mode,
+            nlink: if self.file_type == vfs::S_IFDIR { 2 } else { 1 },
+            mode: self.file_type | perm,
             size,
             blksize: 4096,
             blocks: size.div_ceil(512),
@@ -224,7 +235,7 @@ impl Inode {
         let mut out = Vec::with_capacity(children.len() + 2);
         out.push((String::from("."), self.ino, 4));
         out.push((String::from(".."), self.ino, 4));
-        out.extend(children.into_iter().map(|(n, c)| (n, c.ino, dtype(c.mode()))));
+        out.extend(children.into_iter().map(|(n, c)| (n, c.ino, dtype(c.file_type()))));
         Ok(out)
     }
 
@@ -549,6 +560,16 @@ fn check_name(name: &str) -> Result<(), i64> {
         return Err(EINVAL);
     }
     Ok(())
+}
+
+/// The size `struct stat` reports for an inode of `kind`.
+fn stat_size(kind: &Kind) -> u64 {
+    match kind {
+        Kind::File(o) => syscall(SYS_MO_FILE_SIZE, [o.handle(), 0, 0, 0, 0, 0]).max(0) as u64,
+        Kind::Symlink(t) => t.len() as u64,
+        Kind::Dir(m) => m.len() as u64,
+        Kind::Socket => 0,
+    }
 }
 
 fn kind_bits(kind: &Kind) -> u32 {

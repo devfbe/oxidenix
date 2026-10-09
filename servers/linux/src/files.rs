@@ -137,18 +137,22 @@ pub fn stat_of(fd: u64) -> Result<vfs::stat::Stat, i64> {
         Some((File::Netlink(n), _)) => n.stat(),
         Some((File::Inotify(i), _)) => i.stat(),
         Some((File::Socket(s), _)) => crate::sockcalls::stat(&s),
-        None => {
-            let mut st = [0u8; 144];
-            match syscall(SYS_KFD_STAT, [fd, st.as_mut_ptr() as u64, 0, 0, 0, 0]) {
-                r if r < 0 => return Err(-r),
-                _ => {
-                    crate::namespace::kernel_times(&mut st);
-                    st
-                }
-            }
-        }
+        None => kernel_stat(fd)?,
     };
     Ok(vfs::stat::Stat::from_bytes(&bytes))
+}
+
+/// The `struct stat` of descriptor `fd`, one of the kernel's files (EBADF
+/// for none), with the times the server keeps for it.
+fn kernel_stat(fd: u64) -> Result<[u8; 144], i64> {
+    let mut st = [0u8; 144];
+    match syscall(SYS_KFD_STAT, [fd, st.as_mut_ptr() as u64, 0, 0, 0, 0]) {
+        r if r < 0 => Err(-r),
+        _ => {
+            crate::namespace::kernel_times(&mut st);
+            Ok(st)
+        }
+    }
 }
 
 /// For mmap of descriptor `fd`: None for a file of the kernel's (mapped
@@ -256,14 +260,14 @@ pub fn handle(s: &State) -> Option<i64> {
         SYS_IOCTL if matches!(a1, 0x5421 | 0x5450 | 0x5451) => return None,
         // The interface requests every socket takes, the kernel's too.
         SYS_IOCTL if crate::netdev::is_request(a1) => crate::netdev::ioctl(a0, a1, a2),
-        // fstat of one of the kernel's files: its answer, with the times
-        // the server keeps for it (`namespace::set_kernel_times`).
-        SYS_FSTAT if lookup(a0).is_none() => stat_of(a0).and_then(|st| crate::usercopy::to_program(a1, &st.to_bytes())).map(|_| 0),
         SYS_READ | SYS_WRITE | SYS_READV | SYS_WRITEV | SYS_FSTAT | SYS_LSEEK | SYS_IOCTL | SYS_PREAD64 | SYS_PWRITE64
-        | SYS_PREADV | SYS_PWRITEV | SYS_FSYNC | SYS_FDATASYNC | SYS_FTRUNCATE | SYS_GETDENTS64 | SYS_FSTATFS => {
-            let (file, flags) = lookup(a0)?;
-            on_file(s.rax, file, flags, a1, a2, a3)
-        }
+        | SYS_PREADV | SYS_PWRITEV | SYS_FSYNC | SYS_FDATASYNC | SYS_FTRUNCATE | SYS_GETDENTS64 | SYS_FSTATFS => match lookup(a0) {
+            Some((file, flags)) => on_file(s.rax, file, flags, a1, a2, a3),
+            // fstat of one of the kernel's files: its answer, with the
+            // times the server keeps for it (`namespace::set_kernel_times`).
+            None if s.rax == SYS_FSTAT => kernel_stat(a0).and_then(|st| crate::usercopy::to_program(a1, &st)).map(|_| 0),
+            None => return None,
+        },
         SYS_PREADV2 | SYS_PWRITEV2 => {
             let (file, flags) = lookup(a0)?;
             rw2(s.rax == SYS_PWRITEV2, file, flags, a1, a2, a3 as i64, s.r9)
@@ -532,7 +536,7 @@ fn regular(fd: u64) -> Result<(Regular, u32), i64> {
         });
     };
     let kind = match &file {
-        File::Tmp(f) => f.inode.mode() & vfs::S_IFMT,
+        File::Tmp(f) => f.inode.file_type(),
         File::Data(f) => f.inode.kind,
         _ => return Err(EINVAL),
     };
