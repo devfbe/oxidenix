@@ -50,8 +50,9 @@
 //! (up to `TCP_MAX`) while they are what limits the transfer: the receive
 //! buffer when the peer fills half of it or more between two rounds and
 //! the client keeps up, the send buffer when the network took half of it
-//! and the client's ring holds more than it takes. Under pressure (half
-//! of `BUDGET` in use, as Linux's tcp_mem) connections start with
+//! and the client's ring holds more than it takes. Under pressure (less
+//! than `PRESSURE_ROOM` of room left for the instance, as Linux's
+//! tcp_mem, but per instance) its connections start with
 //! `TCP_MIN`, grow no further than the first sizes, and one idle for
 //! `TRIM_AFTER` gives its empty send buffer back (`trim`; its receive
 //! buffer only as far as the window it announced allows: the right edge
@@ -106,8 +107,9 @@ const DEFAULT_TTL: u8 = 64;
 /// The bytes of smoltcp's socket buffers (and leftovers) netd keeps at
 /// most, in mappings of their own (`Region`).
 const BUDGET: usize = 32 << 20;
-/// Beyond this much of it, memory is under pressure (`pressure`).
-const PRESSURE: usize = BUDGET / 2;
+/// With less room than this left for an instance, its memory is under
+/// pressure (`pressure`).
+const PRESSURE_ROOM: usize = BUDGET / 8;
 /// Under pressure, a connection idle this long gives its buffers back
 /// (`trim`).
 const TRIM_AFTER: Duration = Duration::from_millis(500);
@@ -655,15 +657,15 @@ impl Service {
             port_scratch: [0; 256],
             tcp_owners: Vec::with_capacity(MAX_SMOLTCP),
             udp_owners: Vec::with_capacity(MAX_SMOLTCP),
-            bytes: Budget::new(BUDGET, BUDGET / RESERVED_INSTANCES, BUDGET),
-            socks: Budget::new(MAX_SMOLTCP, MAX_SMOLTCP / RESERVED_INSTANCES, MAX_SMOLTCP),
-            orphans: Budget::new(MAX_ORPHANS, MAX_ORPHANS / RESERVED_INSTANCES, MAX_ORPHANS),
+            bytes: Budget::new(BUDGET, BUDGET / RESERVED_INSTANCES, BUDGET).for_instances(MAX_CHANNELS),
+            socks: Budget::new(MAX_SMOLTCP, MAX_SMOLTCP / RESERVED_INSTANCES, MAX_SMOLTCP).for_instances(MAX_CHANNELS),
+            orphans: Budget::new(MAX_ORPHANS, MAX_ORPHANS / RESERVED_INSTANCES, MAX_ORPHANS).for_instances(MAX_CHANNELS),
             channels: Budget::new(MAX_CHANNELS, 0, INSTANCE_CHANNELS),
             mem: BTreeMap::new(),
             wants: Vec::new(),
             echo: EchoIds::default(),
             half_open: BTreeMap::new(),
-            half_open_budget: Budget::new(MAX_HALF_OPEN, MAX_HALF_OPEN / RESERVED_INSTANCES, MAX_HALF_OPEN / 2),
+            half_open_budget: Budget::new(MAX_HALF_OPEN, MAX_HALF_OPEN / RESERVED_INSTANCES, MAX_HALF_OPEN / 2).for_instances(MAX_CHANNELS),
             brief: false,
             scratch: vec![0; MAX_UDP.max(RAW_BUFFER)],
             config: Config::default(),
@@ -1773,9 +1775,10 @@ impl Service {
         let mut progress = self.finish_closing(sockets);
         let mut wants = core::mem::take(&mut self.wants);
         let icmp = self.icmp_ports(sockets).then_some(IcmpOwners { echo: &self.echo, tcp: &self.tcp_owners, udp: &self.udp_owners });
-        let mut round = Round { now: crate::now(), trimming: pressure(&self.bytes), owner: 0, icmp };
+        let mut round = Round { now: crate::now(), trimming: false, owner: 0, icmp };
         for chan in self.chans.iter_mut().flatten() {
             round.owner = chan.owner;
+            round.trimming = pressure(&self.bytes, chan.owner);
             for (&i, s) in chan.socks.iter_mut() {
                 let ctl = chan.area.ctl(i as usize).expect("an index below MAX_SOCKETS");
                 let rings = Self::rings(&chan.grants, s.area);
@@ -1901,7 +1904,7 @@ impl Service {
                 tcp::State::SynReceived => {}
                 _ if sk.send_capacity() == 0 => {
                     // Completed: its first sizes.
-                    let rx = first_size(bytes, Way::Rx);
+                    let rx = first_size(bytes, owner, Way::Rx);
                     if sk.recv_capacity() < rx {
                         resize(mem, bytes, h, Way::Rx, rx, sockets);
                     }
@@ -2413,18 +2416,24 @@ fn place_record(tail: &mut u32, wait: &mut bool, ctl: &Ctl, r: &Rings, len: u32,
     Ok(Placed::Yes)
 }
 
-/// Whether netd's buffer memory is under pressure (as Linux's tcp_mem):
-/// connections then start with `TCP_MIN`, grow no further than their
+/// Whether instance `owner`'s buffer memory is under pressure (as Linux's
+/// tcp_mem, but per instance: little of what it may take is left):
+/// its connections then start with `TCP_MIN`, grow no further than their
 /// first sizes, and idle ones give their buffers back (`trim`).
-fn pressure(bytes: &Budget) -> bool {
-    bytes.used() >= PRESSURE
+fn pressure(bytes: &Budget, owner: u64) -> bool {
+    bytes.room(owner) < PRESSURE_ROOM
+}
+
+/// The instance socket `h`'s memory is charged to.
+fn owner_of(mem: &BTreeMap<SocketHandle, Mem>, h: SocketHandle) -> u64 {
+    mem.get(&h).map_or(0, |m| m.owner)
 }
 
 /// A TCP buffer's first size: Linux's (`TCP_RX_INIT`, `TCP_TX_INIT`), or
-/// `TCP_MIN` under pressure.
-fn first_size(bytes: &Budget, way: Way) -> usize {
+/// `TCP_MIN` under its instance's pressure.
+fn first_size(bytes: &Budget, owner: u64, way: Way) -> usize {
     match way {
-        _ if pressure(bytes) => TCP_MIN,
+        _ if pressure(bytes, owner) => TCP_MIN,
         Way::Rx => TCP_RX_INIT,
         Way::Tx => TCP_TX_INIT,
     }
@@ -2439,12 +2448,13 @@ fn capacity(socket: &tcp::Socket, way: Way) -> usize {
 /// first size), up to `TCP_MAX`, under pressure up to Linux's first sizes.
 fn grow(mem: &mut BTreeMap<SocketHandle, Mem>, bytes: &mut Budget, h: SocketHandle, way: Way, sockets: &mut SocketSet<'static>) -> bool {
     let old = capacity(sockets.get::<tcp::Socket>(h), way);
+    let owner = owner_of(mem, h);
     let most = match way {
-        _ if !pressure(bytes) => TCP_MAX,
+        _ if !pressure(bytes, owner) => TCP_MAX,
         Way::Rx => TCP_RX_INIT,
         Way::Tx => TCP_TX_INIT,
     };
-    let new = if old == 0 { first_size(bytes, way) } else { (old * 2).min(most) };
+    let new = if old == 0 { first_size(bytes, owner, way) } else { (old * 2).min(most) };
     new > old && resize(mem, bytes, h, way, new, sockets)
 }
 
@@ -2455,7 +2465,7 @@ fn equip(mem: &mut BTreeMap<SocketHandle, Mem>, bytes: &mut Budget, h: SocketHan
         if capacity(sockets.get::<tcp::Socket>(h), way) > 0 {
             continue;
         }
-        let mut size = first_size(bytes, way);
+        let mut size = first_size(bytes, owner_of(mem, h), way);
         while !resize(mem, bytes, h, way, size, sockets) {
             if size <= TCP_MIN {
                 return Err(ENOBUFS);

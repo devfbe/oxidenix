@@ -94,7 +94,8 @@ time) and so may anything on the network.
   nobody.
 - **What an instance can deny another**: nothing below a reserve. Every shared resource
   (buffer memory, smoltcp sockets with those in TIME-WAIT, orphans, half-open connections) is a
-  `netring::Budget` with a cap per instance and a reserve kept for every instance with a
+  `netring::Budget` with a cap per instance and a reserve kept for every instance that has (or
+  may still get: 64 at once) a
   channel; channels are capped per instance and an idle one gives its slot up; the
   ephemeral range is wider than what one instance can hold (its share of smoltcp sockets). A flood from the network against one instance's listener spends that
   instance's share of half-open connections.

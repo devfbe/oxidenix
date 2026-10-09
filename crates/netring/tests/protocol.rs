@@ -697,6 +697,30 @@ fn echo_ids_keep_instances_apart() {
     assert!(ids.is_empty());
 }
 
+/// The reserves of instances that are still to come are kept too: one
+/// that connects late finds its reserve whatever the early ones took.
+#[test]
+fn reserves_wait_for_instances_still_to_come() {
+    let mut b = Budget::new(100, 10, 100).for_instances(4);
+    b.activate(1);
+    // Alone, it leaves the three others still to come their reserves.
+    assert_eq!(b.room(1), 70);
+    while b.charge(1, 1).is_ok() {}
+    assert_eq!(b.held(1), 70);
+    // Each newcomer finds its reserve, however late it comes.
+    for owner in 2..=4 {
+        b.activate(owner);
+        assert_eq!(b.room(owner), 10, "instance {owner}");
+        assert_eq!(b.charge(owner, 10), Ok(()));
+        assert_eq!(b.charge(owner, 1), Err(ENOBUFS));
+    }
+    // One that leaves gives its place to the next to come.
+    b.uncharge(4, 10);
+    b.deactivate(4);
+    b.activate(5);
+    assert_eq!(b.room(5), 10);
+}
+
 /// Giving back more than an instance holds is a lost count: debug builds
 /// stop there (release builds give back what it holds).
 #[test]
