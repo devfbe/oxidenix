@@ -51,6 +51,8 @@
 #define TEST_PASS_THROUGH 1517
 #define TEST_SERVER_TICKS 1518
 #define TEST_MKWRITE_FAIL 1519
+#define TEST_SERVER_FAIL 1520
+#define TEST_SLEEP_LOCKED 1521
 
 static int failures;
 
@@ -194,7 +196,42 @@ static void priority_inversion(void) {
     check("a nice 19 lock holder next to a nice -20 loop does not hold others up", worst < 0.2);
 }
 
+/* `lxtest serverfail` (on its own, by autorun: it ends the whole tree): the server fails
+ * on this thread while it holds a plain lock and a sleeping one, which other processes of
+ * the tree wait for (and a /data file is being written meanwhile). The instance breaks:
+ * every process is killed, every lock wait ends, the service threads wind down, and the
+ * tree ends (no hang: the run ends, the kernel says why). */
+static int server_fail(void) {
+    pid_t plain = fork();
+    if (plain == 0) {
+        for (;;) syscall(TEST_LOCKED_ADD, 1000);
+    }
+    pid_t sleeping = fork();
+    if (sleeping == 0) {
+        for (;;) syscall(TEST_SLEEP_LOCKED, 1000000);
+    }
+    pid_t writer = fork();
+    if (writer == 0) {
+        int f = open("/data/serverfail.tmp", O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        char block[4096];
+        memset(block, 'w', sizeof block);
+        for (;;) {
+            pwrite(f, block, sizeof block, 0);
+            fsync(f);
+        }
+    }
+    usleep(300 * 1000);
+    printf("lxtest serverfail: failing the server now\n");
+    fflush(stdout);
+    syscall(TEST_SERVER_FAIL);
+    printf("lxtest serverfail: still here (wrong)\n");
+    return 1;
+}
+
 int main(int argc, char **argv) {
+    if (argc > 1 && strcmp(argv[1], "serverfail") == 0) {
+        return server_fail();
+    }
     if (argc > 1 && strcmp(argv[1], "crashloop") == 0) {
         /* The test service dies at every use: the kernel restarts it with
          * a growing backoff, takes it down after six young deaths in a

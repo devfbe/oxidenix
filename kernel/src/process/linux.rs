@@ -1195,6 +1195,12 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
     if nr == SYS_THREAD_EXIT {
         // Before anything of this call is on the stack: it does not return.
         if is_pager() {
+            // A service thread ends only with its instance, or when the
+            // instance broke and a lock it waits for is lost (`break_instance`):
+            // then the service threads' process ends, and the instance with it.
+            if instance_broken() {
+                super::exit_group(super::signal::SIGKILL as i32);
+            }
             return Err(EPERM);
         }
         let status = a[0] as i32;
@@ -1535,6 +1541,7 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
                 0 => Ends::Dying,
                 FUTEX_INTERRUPTIBLE => Ends::Interrupted,
                 FUTEX_LOCK => Ends::Lock,
+                FUTEX_SLEEPLOCK => Ends::SleepLock,
                 _ => return Err(EINVAL),
             };
             let deadline = (deadline != 0).then_some(deadline);

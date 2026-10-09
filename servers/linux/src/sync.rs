@@ -82,7 +82,8 @@ const EINTR: i64 = 4;
 
 /// A lock's wait ended without the lock (`FUTEX_LOCK`'s EINTR): the instance broke, a holder
 /// failed with the lock and the server's state is lost. The thread ends here (the instance
-/// ends with it; nothing of the server's state is worth unwinding).
+/// ends with it; nothing of the server's state is worth unwinding). A service thread's
+/// `thread_exit` ends the service threads' process then, and with it the instance.
 #[cold]
 fn broken() -> ! {
     syscall(restricted::SYS_THREAD_EXIT, [9, 0, 0, 0, 0, 0]);
@@ -147,7 +148,8 @@ impl<T> Drop for MutexGuard<'_, T> {
 
 /// A sleeping lock with data, held across waits for other parties and copies of program
 /// memory (Linux's mutex_lock_killable): its wait ends with EINTR when the waiting thread
-/// dies, and the caller unwinds (`?`). Not counted among the thread's held locks: a holder
+/// dies or the instance broke (its holder may be the failed thread; the service threads
+/// then give up what they wanted it for), and the caller unwinds (`?`). Not counted among the thread's held locks: a holder
 /// is not priority-boosted (it may hold it for as long as a page or a service takes).
 pub struct SleepMutex<T> {
     state: AtomicU32,
@@ -167,7 +169,7 @@ impl<T> SleepMutex<T> {
         if self.state.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_err() {
             while self.state.swap(2, Ordering::Acquire) != 0 {
                 let addr = &self.state as *const AtomicU32 as u64;
-                if syscall(SYS_SERVER_FUTEX_WAIT, [addr, 2, 0, 0, 0, 0]) == -EINTR {
+                if syscall(SYS_SERVER_FUTEX_WAIT, [addr, 2, 0, restricted::FUTEX_SLEEPLOCK, 0, 0]) == -EINTR {
                     // (Others may still wait: the word stays 2, so the holder wakes one.)
                     return Err(EINTR);
                 }
@@ -277,7 +279,7 @@ impl RwCore {
 
     fn sleep(&self, seen: u32, killable: bool) -> Result<(), i64> {
         let addr = &self.changed as *const AtomicU32 as u64;
-        let flags = if killable { 0 } else { FUTEX_LOCK };
+        let flags = if killable { restricted::FUTEX_SLEEPLOCK } else { FUTEX_LOCK };
         if syscall(SYS_SERVER_FUTEX_WAIT, [addr, seen as u64, 0, flags, 0, 0]) == -EINTR {
             if !killable {
                 broken();

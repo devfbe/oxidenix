@@ -183,6 +183,9 @@ pub enum Ends {
     Interrupted,
     /// Only the thread's death.
     Dying,
+    /// The thread's death, or its instance's breaking (a sleeping lock of the
+    /// Linux server's, `restricted::FUTEX_SLEEPLOCK`).
+    SleepLock,
     /// A lock of the Linux server's in its own memory
     /// (`restricted::FUTEX_LOCK`), held for bounded work only (as a kernel's
     /// spinlock or a mutex that is not killable), which a dying thread's
@@ -198,6 +201,7 @@ impl Ends {
         match self {
             Ends::Interrupted => signal::interrupted(),
             Ends::Dying => signal::dying(),
+            Ends::SleepLock => signal::dying() || super::linux::instance_broken(),
             Ends::Lock => super::linux::instance_broken(),
         }
     }
