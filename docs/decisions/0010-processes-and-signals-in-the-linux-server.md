@@ -28,9 +28,13 @@ shape of the kernel's interface:
    posted after the server's last look still stops the program before it runs, and every
    wait after a kick ends. The kernel knows no signal numbers, masks or actions; posting a
    signal is server state under one lock plus a kick of the thread that takes it.
-   `thread_kill(key)` marks a thread dying (every wait ends) and it exits at its next
-   `restricted_enter`, where the server never holds a lock. Thread exits come to the service
-   thread as `EVENT_THREAD_EXIT` after the thread's references are gone.
+   `thread_kill(key)` marks a thread dying (every wait ends); its next `restricted_enter`,
+   where the server never holds a lock, returns `REASON_EXIT` once, and the server ends the
+   thread with `thread_exit` after letting go of its descriptor table (a parent must see the
+   child's descriptors closed before its end, Linux's `exit_files` before `exit_notify`); a
+   dying thread that enters again is ended by the kernel. Thread exits come to the service
+   thread as `EVENT_THREAD_EXIT`; a table a thread the kernel ended alone still held goes on
+   the worker, which ends the process only after it.
    *Alternatives:* signal numbers in the kernel (a pending set the server reads): the kernel
    would keep Linux semantics (masks decide which thread to wake); an upcall that pushes a
    frame from the kernel: the frame's layout and the restart rules are Linux's, and the
@@ -94,5 +98,7 @@ taken) are the server's.
 - A signal costs a kick (a kernel call, and an IPI for a running thread) and the server's
   frame building; `fork` two calls (`proc_create`, `thread_create`); `exec` the server's
   loader with a few mapping calls. `iobench` measures fork, exec and wait.
+- Real-time signals are queued up to 4096 per instance: as Linux's RLIMIT_SIGPENDING per
+  user, since everyone in a tree is root.
 - Not done: pidfds (`CLONE_PIDFD`, `P_PIDFD`), POSIX timers (`timer_create`),
   `ITIMER_VIRTUAL`/`ITIMER_PROF`, core files, ptrace, a vDSO.

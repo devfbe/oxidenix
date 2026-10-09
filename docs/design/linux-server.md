@@ -481,7 +481,7 @@ memory counts. Decisions in ADR 0010.
 | `proc_create(flags) -> handle` | a new, empty process of the instance: its address space a copy-on-write clone of the caller's (`PROC_FORK`) or the caller's own (`PROC_SHARE_VM`); its descriptor table a copy of the caller's or, with `PROC_SHARE_FILES`, the caller's (the table's part goes to the server with R6e) |
 | `thread_create(process, state, flags, tls, ctid, cookie) -> key` | a thread in a new process (handle) or in the caller's (0): its program starts with the registers at `state`, the caller's FPU registers and FS base (or `tls`), `ctid` as its `CLONE_CHILD_CLEARTID` word; its server starts with `cookie` and its key |
 | `thread_kick(key)` | the thread looks at its signals (below) |
-| `thread_kill(key)` | the thread dies: its waits end, it exits at its next `restricted_enter` |
+| `thread_kill(key)` | the thread dies: its waits end, its next `restricted_enter` returns `REASON_EXIT` (the server ends it), the one after ends it |
 | `thread_exit(status, flags)` | the caller ends; with `EXIT_GROUP` its process (`exit_group`: the others are killed) |
 | `exec_space(exe, name, len)` | the point of no return of `execve`: the caller's process gets a new, empty address space (attached to the instance, `exe`'s hold kept while it runs), the FPU state and FS base reset, `CLONE_CHILD_CLEARTID` done for the old one, close-on-exec descriptors closed (the table's part goes with R6e) |
 | `proc_info(handle, out)`, `thread_info(key, out)` | CPU time, memory, state, start, last CPU, nice, the kernel's own end of a process it killed (out of memory, the monitor's `kill`) |
@@ -504,19 +504,29 @@ kernel) ends it with EINTR. The flag stays set until the thread enters restricte
 clears it). So no signal is lost between the server's last look and the program running, and
 every wait after a kick ends at once, as Linux's `signal_pending`. A thread the server or the
 kernel kills is marked dying: every wait ends, also the uninterruptible ones (the server's
-locks yield instead), and the thread exits at its next `restricted_enter`, the one point where
-the server holds no lock of its own.
+locks yield instead; a copy of the server's whose page wait ends so takes its fixup, EFAULT),
+and its next `restricted_enter`, the one point where the server holds no lock of its own,
+returns `REASON_EXIT`: the server ends the thread there (`process::exit`, on a stack that
+holds nothing more), letting go of its descriptor table first. A dying thread that enters
+again is ended by the kernel itself. A dying caller makes no thread (`thread_create`: EINTR),
+and the kernel's Linux code refuses the process and signal calls a server might pass through.
 
 **Faults and exceptions** the kernel cannot resolve (no mapping, a protection violation, a
 read beyond a file's end, `#DE`, `#UD`, `#BP`, `#GP`, `#XM`, ...) return from
-`restricted_enter` with `REASON_FAULT` or `REASON_EXCEPTION`; `State` carries the vector, the
+`restricted_enter` with `REASON_EXCEPTION`; `State` carries the vector, the
 error code and the address, and the server raises the signal with Linux's `siginfo`
 (`SEGV_MAPERR`/`SEGV_ACCERR`, `BUS_ADRERR`, `FPE_INTDIV`, `ILL_ILLOPN`, `TRAP_BRKPT`, ...).
 
 **Thread exits** reach the service thread as `EVENT_THREAD_EXIT` (its key) once the thread is
-gone: its references to the address space and the descriptor table are dropped, so a parent
-that sees its child dead sees its pipes closed (Linux's `exit_files` before `exit_notify`).
-The room for the event is reserved when the thread is created: it is never lost.
+gone. A thread the server ended let go of its descriptor table itself; one the kernel ended
+alone (a server that did not take `REASON_EXIT`) still has it in its record: the worker lets
+go of it and only then ends the process if that was its last thread, so in every case a
+parent that sees its child dead sees its pipes closed and its ports free (Linux's
+`exit_files` before `exit_notify`). The room for the event and for that hand-over is
+reserved when the thread is created: neither is lost, and the service thread never closes a
+file. Pending signals go with a thread's record and a zombie's (the instance's count of
+queued real-time signals with them). Keys are never reused: a thread area out of
+generations is retired.
 
 **The first process of a tree** (the monitor's `run`, autorun): the kernel makes the process
 with an empty address space attached to a new instance and its first thread in `ROLE_INIT`,
@@ -565,14 +575,20 @@ shares the record, `CLONE_SIGHAND` the actions (also between processes, with `CL
 The server resolves the program (`execveat` too, with `AT_EMPTY_PATH`), checks it (a regular
 file with an execute bit: EACCES; not open for writing: ETXTBSY), follows `#!` lines (four
 deep, ELOOP), reads the ELF headers through its file object (ENOEXEC), copies the arguments
-and environment (E2BIG beyond `MAX_ARG_STRLEN` or 2 MiB), and only then reaches the point of
-no return: the process's other threads are killed and waited for (a thread that is not the
+and environment (E2BIG beyond `MAX_ARG_STRLEN` or 2 MiB; one flat buffer each, charged
+against a bound for the instance's execs at once, ENOMEM beyond it), checks the layout (an
+`ET_EXEC` image not below 64 KiB, an `ET_DYN` one below its base, both below the stack's
+8 MiB; an interpreter must be `ET_DYN`: ENOEXEC), and only then reaches the point of
+no return: the process's other threads are killed and waited for (a clone under way
+rechecks under the lock and fails with EAGAIN; a thread that is not the
 leader takes the leader's pid), `exec_space` swaps the address space, and the server maps
 the segments (`ET_EXEC` where they say, `ET_DYN` at a fixed base, with its `PT_INTERP`
 interpreter beside it), zeroes the tail of the last file page, maps the bss and a stack that
 grows down (`MO_GROWSDOWN`), writes the strings (arguments, then environment, back to back),
 `AT_RANDOM`, the platform name, the vectors and the auxiliary vector, and starts the program.
-A failure after the point of no return kills the process with SIGSEGV, as on Linux. Handlers
+A failure after the point of no return kills the process with SIGSEGV, as on Linux (SIGKILL
+if it was killed meanwhile), once the call returned and let go of everything it held
+(`local::exit_pending`, carried out by the thread's loop). Handlers
 go back to their default (ignored signals stay ignored), the alternate stack goes, the mask
 and pending signals stay; a vfork parent goes on.
 
