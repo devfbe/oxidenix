@@ -524,6 +524,66 @@ static void read_rules(void) {
     close(m);
 }
 
+static void on_usr1(int sig) { (void)sig; }
+
+/* Waiters for a terminal's write turn that die or are interrupted give their tickets
+ * up: a writer blocks holding the turn (the master's buffer full), a second waits and is
+ * killed, a third waits and a handler interrupts it (EINTR), and once the first is done a
+ * fourth writer gets the turn at once (a ticket left behind would block it for ever). */
+static void turn_abandon(void) {
+    char path[64];
+    static char big[200 * 1024];
+    memset(big, 'a', sizeof big);
+    int m = new_pty(path, sizeof path);
+    int s = open(path, O_RDWR | O_NOCTTY);
+    pid_t holder = fork();
+    if (holder == 0) {
+        alarm(20);
+        _exit(write(s, big, sizeof big) == (ssize_t)sizeof big ? 0 : 1);
+    }
+    sleep_ms(100);
+    pid_t killed = fork();
+    if (killed == 0) {
+        write(s, "b", 1);
+        _exit(0);
+    }
+    pid_t interrupted = fork();
+    if (interrupted == 0) {
+        alarm(20);
+        struct sigaction sa = {0};
+        sa.sa_handler = on_usr1;
+        sigaction(SIGUSR1, &sa, NULL);
+        _exit(write(s, "c", 1) == -1 && errno == EINTR ? 0 : 1);
+    }
+    sleep_ms(100);
+    kill(killed, SIGKILL);
+    waitpid(killed, NULL, 0);
+    kill(interrupted, SIGUSR1);
+    int istatus = 0;
+    waitpid(interrupted, &istatus, 0);
+    /* Drain until the holder's write is done. */
+    char buf[4096];
+    fcntl(m, F_SETFL, O_NONBLOCK);
+    int hstatus = 0;
+    for (int i = 0; i < 2000 && waitpid(holder, &hstatus, WNOHANG) == 0; i++) {
+        while (read(m, buf, sizeof buf) > 0) {
+        }
+        sleep_ms(5);
+    }
+    pid_t last = fork();
+    if (last == 0) {
+        alarm(2);
+        _exit(write(s, "z", 1) == 1 ? 0 : 1);
+    }
+    int lstatus = 0;
+    waitpid(last, &lstatus, 0);
+    check("a killed and an interrupted turn waiter give their tickets up",
+          WIFEXITED(istatus) && WEXITSTATUS(istatus) == 0 && WIFEXITED(hstatus) && WEXITSTATUS(hstatus) == 0 &&
+              WIFEXITED(lstatus) && WEXITSTATUS(lstatus) == 0);
+    close(s);
+    close(m);
+}
+
 static void report_hup(int sig) {
     (void)sig;
     write(3, "H", 1);
@@ -784,6 +844,7 @@ int main(void) {
     pty_bounds();
     read_rules();
     orphans();
+    turn_abandon();
     job_control();
     printf("ttytest: %s\n", failures ? "FAILED" : "all passed");
     return failures != 0;
