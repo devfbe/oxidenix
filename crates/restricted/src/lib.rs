@@ -346,7 +346,8 @@ pub const FS_CHILD: u64 = 2;
 /// `(value)`: sets the test value of the caller's record (0: leaves it);
 /// returns it.
 pub const TEST_FS_VALUE: u64 = 1512;
-/// `()`: how many records the instance holds.
+/// `(watch)`: nonzero: watches the caller's record; 0: how many watched
+/// records the kernel still holds (released ones are forgotten).
 pub const TEST_FS_RECORDS: u64 = 1513;
 
 // The kernel's tree through handles (phase R6c.2b): until the server's own
@@ -595,8 +596,9 @@ pub const SYS_THREAD_EXISTS: u64 = 1090;
 /// service (servers/ringtest, `ring::selftest`): 1 rings and doorbells, 2
 /// grants and their bounds, 3 revoking, 4 the client's end going, 5 the
 /// service dying, 6 the service executing a new program, 7 a service that
-/// attaches but answers late. 0 if every
-/// check held, else the negative number of the first that failed.
+/// attaches but answers late, 8 a service in a crash loop (the kernel's
+/// restart backoff, the service down, then up after the cooldown). 0 if
+/// every check held, else the negative number of the first that failed.
 pub const TEST_CHANNEL: u64 = 1514;
 /// `(scenario)`: the server runs a scenario of the file protocol
 /// (`fsring`) against diskfs over a channel: 1 reading a file of the disk
@@ -620,3 +622,7 @@ pub const TEST_DISKRING: u64 = 1515;
 /// other instance, and `sync_done` is the service thread's only. 0 if every check held, else the negative number of the
 /// first that failed.
 pub const TEST_CACHED: u64 = 1516;
+/// `()`: the server passes a `getpid` through to the kernel in its place
+/// and returns its result: a call that always counts as passed through
+/// (`legacy_calls`), whatever the server comes to handle itself.
+pub const TEST_PASS_THROUGH: u64 = 1517;

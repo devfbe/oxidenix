@@ -160,6 +160,11 @@ pub struct ThreadGroup {
     /// Sequence number of the live arming of the interval timer (0: off),
     /// changed under `sig`.
     pub alarm_seq: AtomicU64,
+    /// Linux system calls of this process the Linux server passed back to
+    /// the kernel (`linux::legacy`): the process's share of the counter in
+    /// `/proc/counters`, which `/proc/<pid>/counters` shows, so that a
+    /// program can count its own calls whatever else runs.
+    pub legacy_calls: AtomicU64,
 }
 
 impl ThreadGroup {
@@ -171,6 +176,7 @@ impl ThreadGroup {
             info: IrqSpinLock::new(info),
             sig: IrqSpinLock::new(sig),
             alarm_seq: AtomicU64::new(0),
+            legacy_calls: AtomicU64::new(0),
         })
         .ok()
     }
