@@ -1848,8 +1848,6 @@ pub fn kick_task(t: &Arc<super::task::Task>) {
     super::signal::kick(t);
 }
 
-/// Kills a Linux program's thread: marked dying and kicked, it exits at its
-/// next `restricted_enter`.
 /// Whether the calling thread's instance is broken (`break_instance`).
 pub fn instance_broken() -> bool {
     with_current(|p| p.linux.as_ref().is_some_and(|l| l.instance.broken.load(core::sync::atomic::Ordering::Acquire)))
@@ -1874,6 +1872,8 @@ pub fn break_instance() {
     super::futex::shake_server(Arc::as_ptr(&instance) as usize);
 }
 
+/// Kills a Linux program's thread: marked dying and kicked, it exits at its
+/// next `restricted_enter`.
 pub fn kill_task(t: &Arc<super::task::Task>) {
     t.killed.store(true, core::sync::atomic::Ordering::SeqCst);
     kick_task(t);
