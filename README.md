@@ -242,7 +242,6 @@ oxidenix/
 │       │   ├── syscall.rs       syscall entry/return, dispatch table
 │       │   ├── sys_file.rs      file, directory, pipe, tty-ioctl, poll/select
 │       │   ├── sys_mem.rs       brk, mmap, mprotect, mremap
-│       │   ├── sys_net.rs       socket syscalls (sockaddr_in, msghdr, options)
 │       │   ├── signal.rs        signal state, delivery, sigreturn, kill
 │       │   ├── futex.rs         futex wait queues keyed by address space or page cache
 │       │   ├── loader.rs        ELF segments mapped from the page cache, the Linux initial stack
@@ -250,7 +249,6 @@ oxidenix/
 │       │   ├── ipc.rs           services and message passing
 │       │   ├── irq.rs           device interrupts for user-space drivers
 │       │   └── uaccess.rs       copies to and from user memory
-│       ├── net.rs               socket client: operations become netd requests
 │       ├── fs/                  VFS (mod.rs), page cache (cache.rs), open files and
 │       │                        pipes (file.rs), initramfs unpacker (cpio.rs), IPC
 │       │                        client for filesystem servers (remote.rs)
@@ -264,17 +262,19 @@ oxidenix/
 │       └── shell/               built-in kernel monitor (fallback shell)
 ├── servers/
 │   ├── linux/                   the Linux server (restricted mode; memory, time, pipes, eventfd, paths, tmpfs, /data, AF_UNIX,
-│   │                            netlink, inotify)
+│   │                            internet sockets over the channel to netd, netlink, inotify)
 │   ├── diskfs/                  user-space ext2 server with its virtio-blk driver (blk.rs)
 │   ├── procfs/                  /proc and /sys from the kernel's process information
 │   │                            (main.rs: tree and inodes, render.rs: Linux formats)
 │   ├── netd/                    network server: virtio-net driver (virtio_net.rs), loopback
-│   │                            (nic.rs), sockets on smoltcp (service.rs), DHCP
+│   │                            (nic.rs), the instances' sockets on smoltcp over their
+│   │                            channels (service.rs), DHCP
 │   └── ringtest/                the self-tests' channel service (test mode only)
 ├── crates/
 │   ├── ext2fs/                  ext2 as a library over a `Device` trait
 │   ├── fsproto/                 message format between the VFS and filesystem servers
-│   ├── netproto/                socket operations between the kernel and netd, its interface records
+│   ├── netring/                 the socket protocol over a channel (Linux server <-> netd): requests,
+│   │                            control blocks in the shared area, byte rings, interface records
 │   ├── netlink/                 rtnetlink's messages (the Linux server's NETLINK_ROUTE sockets)
 │   ├── procproto/               native process and system information for procfs
 │   ├── virtio/                  virtio legacy PCI transport and virtqueues (diskfs, netd)
@@ -491,13 +491,13 @@ The scheduler is built for several CPUs (`process/sched.rs`, design in
   serializes wakeups with the task descheduling itself. Pipes, the TTY, IPC, `wait4`, stops
   and timed sleeps all use this protocol.
 - **Waiting on several files** (`process/poll.rs`): a file announces readiness changes on a
-  wait queue (a channel of the global queues for pipes, eventfds and the TTY, its own queue
-  for an epoll instance). Wait-queue entries are tasks or callbacks; `poll`, `select` and
-  `epoll_wait` put one callback on the queue of every file they check, so a wakeup on any
-  of them ends the wait at once instead of at a periodic re-check; a wakeup that comes while
-  the files are being checked is noted and not lost. Sockets, whose readiness lives in
-  netd, wait on two channels: one that netd wakes for the socket (`ipc_notify`) and one
-  woken when that netd dies, so a poll sees the error at once.
+  wait queue (a channel of the global queues for pipes, eventfds, the TTY and the Linux
+  server's files, its own queue for an epoll instance). Wait-queue entries are tasks or
+  callbacks; `poll`, `select` and `epoll_wait` put one callback on the queue of every file
+  they check, so a wakeup on any of them ends the wait at once instead of at a periodic
+  re-check; a wakeup that comes while the files are being checked is noted and not lost. The
+  server's files (sockets among them) wake their channel when the server reports their
+  readiness (`kfd_ready`).
 - **epoll** (`process/epoll.rs`): every interest is a callback on its file's wait queue that
   puts it on the instance's ready list (without allocating: the list keeps room for every
   item, so this works in interrupt context) and wakes the instance's own queue.
@@ -849,11 +849,10 @@ interrupt dispatch; drivers and filesystems move into user-space servers.
 - **IPC** (`process/ipc.rs`): a privileged server registers a service name (`ipc_register`),
   then loops over `ipc_receive` and `ipc_reply` (oxidenix syscalls 1000-1002). The kernel is
   the client on behalf of user programs: `call` queues a request and sleeps uninterruptibly
-  until the reply; `post` queues a message without waiting, for contexts that must not sleep
-  (releasing an unlinked inode while dropping it). Messages up to 64 KiB are copied through the
-  kernel. A server announces that one of its objects changed with `ipc_notify(token)`
-  (syscall 1006), which wakes whoever waits on that object's channel; the channel belongs to
-  the server's registration, so a restarted server cannot wake its predecessor's waiters.
+  until the reply. Messages up to 64 KiB are copied through the kernel. Only procfs still
+  serves such requests (the kernel's `/proc`); diskfs and netd serve the Linux server
+  instances over channels (shared-memory rings, `process/channel.rs`), whose offers are the
+  kernel's control requests.
 - **Hardware access without kernel drivers**: servers started by the kernel are *privileged*
   and may call `ioperm`, but only for the ports the kernel assigned to them (diskfs gets the
   I/O BAR of its virtio block device, netd the one of its network card;
@@ -918,42 +917,52 @@ interrupt dispatch; drivers and filesystems move into user-space servers.
 - **netd** (`servers/netd`) owns the network card. The kernel finds it on PCI (a virtio-net
   card in legacy mode, whose registers are all I/O ports) and hands netd its ports, its
   interrupt line and a 512 KiB DMA area. netd sets up the two virtqueues with 64 fixed 2 KiB
-  buffers each, sleeps in `ipc_receive` until a request, a card interrupt or the next timer
-  of the TCP/IP stack, and runs [smoltcp](https://github.com/smoltcp-rs/smoltcp) for ARP,
-  IPv4, ICMP, TCP, UDP and the DHCP client. After every step of the stack and every request
-  it compares each socket's poll events with the last ones and calls `ipc_notify` for every
-  socket that gained some, so `poll`, `select` and `epoll` wake when data, a connection or
-  buffer space arrives.
+  buffers each and runs [smoltcp](https://github.com/smoltcp-rs/smoltcp) for ARP, IPv4,
+  ICMP, TCP, UDP and the DHCP client. It serves the Linux server instances' sockets over the
+  channels they offer it (one per instance, `servers/netd/src/service.rs`, the protocol
+  `crates/netring`): each round it takes their requests, polls the card and the stack, moves
+  the sockets' bytes between smoltcp and the instances' rings, and publishes what changed in
+  the sockets' control blocks; while rounds make progress it polls, after a spin without any
+  it arms the card's interrupt and every channel's doorbell and sleeps in `ipc_receive` (an
+  offer, a doorbell, an interrupt or the stack's next timer wakes it).
 - **Loopback**: frames to the host's own address or to `127.0.0.0/8` never reach the card;
   netd's device layer feeds them back as received frames and answers ARP for those addresses
   itself, so a program can talk to a server on the same machine. Frames from the wire that
   claim a `127.0.0.0/8` address are dropped, so services on `127.0.0.1` are not reachable from
   the network.
-- **Sockets** (`process/sys_net.rs`, `net.rs`): `socket`, `bind`, `listen`, `accept`/`accept4`,
-  `connect`, `send*`/`recv*` (also `sendmsg`/`recvmsg`), `shutdown`, `getsockname`,
-  `getpeername` and `getsockopt(SO_ERROR)` for `AF_INET` stream and datagram sockets, plus raw
-  ICMP sockets (`SOCK_RAW`, `IPPROTO_ICMP`) for `ping`: the program writes the ICMP message,
-  netd adds the IPv4 header, and reads return whole IPv4 packets, as on Linux. netd answers
-  echo requests itself. A socket is
-  an open file, so `read`, `write`, `poll`, `select`, `fcntl(O_NONBLOCK)`, `dup` and `fork`
-  work as usual. Every operation is a `netproto` request to netd; closing the last descriptor
-  posts `Close` without waiting.
-- **Blocking without blocking netd**: netd keeps a request that cannot complete yet (accept
-  without a connection, recv without data, a connect in progress) and answers it after the
-  stack made progress, while it keeps serving other requests. A signal interrupts the waiting
-  program: the kernel abandons the request (`EINTR`) and tells netd to drop it. At most 128
-  requests (holding at most 512 KiB of data) wait at a time; beyond that, calls fail with
-  `ENOBUFS` instead of exhausting netd's heap. Data is sent straight from user memory in 32 KiB
-  messages, never copied whole into the kernel.
+- **Sockets** are the Linux server's (phase R7b, ADR 0007; `servers/linux/src/inet.rs`,
+  `inetcalls.rs`, `netclient.rs`): `AF_INET` stream and datagram sockets, plus raw ICMP
+  sockets (`SOCK_RAW`, `IPPROTO_ICMP`) for `ping` (the program writes the ICMP message, netd
+  adds the IPv4 header, reads return whole IPv4 packets, as on Linux; netd answers echo
+  requests itself). Every socket call is the server's, with Linux's semantics: `bind`
+  (`EADDRNOTAVAIL`, `EADDRINUSE` with `SO_REUSEADDR`'s rule), `listen`, `accept`/`accept4`,
+  `connect` (`EINPROGRESS`, `EALREADY`, `SO_ERROR`), `send*`/`recv*` with `MSG_PEEK`,
+  `MSG_DONTWAIT`, `MSG_WAITALL`, `MSG_TRUNC` and `MSG_NOSIGNAL` (`EPIPE` raises `SIGPIPE`),
+  `shutdown` (half-close), `SO_RCVTIMEO`/`SO_SNDTIMEO`, `SO_RCVLOWAT`, `TCP_NODELAY` (Nagle's
+  algorithm is on by default), `SO_KEEPALIVE`, `IP_TTL`, `SO_LINGER` with a zero time (a reset),
+  `FIONREAD`, `SIOCOUTQ`; `AF_INET6` and other families are `EAFNOSUPPORT`. A socket is a
+  placeholder in the kernel's descriptor table, so `read`, `write`, `poll`, `select`, `epoll`,
+  `fcntl(O_NONBLOCK)`, `dup`, `fork` and descriptor passing work as usual.
+- **The channel** to netd (one per instance) has a shared area with a control block per
+  socket (netd's state bits, positions, errors and accept backlog; the server's positions);
+  a socket's bytes travel in a receive and a send ring of 64 KiB in the server's buffer pool
+  (memory granted to netd in 2 MiB pieces): the server copies between the program and the
+  rings, netd between the rings and smoltcp, so TCP needs no request and no system call in the
+  steady state, only a doorbell for a side that sleeps. Requests (socket, bind, connect,
+  accept, datagram sends, close, ...) are answered at once; all waiting is the server's, on
+  the control block's event counter, which netd wakes directly. The instance's net thread
+  reports the readiness netd changed to the kernel's `poll` and `epoll`. Closing hands what
+  the send ring still holds to netd, which sends it before the FIN even after the program (or
+  the whole instance) is gone; data that arrives for a closed connection resets it.
 - **Configuration**: `/etc/resolv.conf` points to QEMU's DNS proxy (`10.0.2.3`); DHCP gives
   `10.0.2.15/24` with gateway `10.0.2.2`. The self-tests use an echo service that QEMU provides
   at `10.0.2.100:7` (`guestfwd` to `cat` on the host).
-- **Restarts**: a crashed netd is started again by the next socket call (see self-healing). It
-  gets the same DMA area, which it clears before handing it to the freshly reset card.
+- **Restarts**: a crashed netd is started again by the next socket (see self-healing): the
+  sockets of the old channel fail (`ECONNRESET`, `POLLERR`), the next one makes a new channel.
+  netd gets the same DMA area, which it clears before handing it to the freshly reset card.
 - **Interfaces** (the Linux server's `netdev.rs`, `netlink.rs`): netd describes its interfaces
-  (`netproto::Op::Links`: the loopback and the card, with MAC, MTU, state and the DHCP
-  address), the kernel relays that to the Linux server (`net_links`, until the server talks to
-  netd itself with R7), and the server names them as Linux does (`lo`, `eth0`). It answers
+  (`LINKS` over the channel, `netring::Link`: the loopback and the card, with MAC, MTU, state
+  and the DHCP address), and the server names them as Linux does (`lo`, `eth0`). It answers
   `NETLINK_ROUTE` sockets of its own: `RTM_GETLINK` (dumped, or one interface by index or name)
   and `RTM_GETADDR` dumps with `NLM_F_MULTI`, `NLMSG_DONE`, the request's sequence number and
   the socket's port id, acknowledgements (`NLM_F_ACK`, `NETLINK_CAP_ACK`), `EOPNOTSUPP` for other
@@ -1064,8 +1073,8 @@ Linux x86_64 numbers, grouped by area (about 120 in total):
 | Signals | `rt_sigaction` `rt_sigprocmask` `rt_sigreturn` `rt_sigsuspend` `rt_sigpending` `kill` `tkill` `tgkill` `pause` `sigaltstack` `alarm` `setitimer` `getitimer` (`ITIMER_REAL`) `rt_sigtimedwait` |
 | Process control | `prctl` (name, parent-death signal, dumpable, no-new-privs, capability bounding set) `capget` `capset` (everything runs as root with every capability) |
 | Filesystems | `statfs` `fstatfs` `sync` `syncfs` (every process tree's page cache of `/data`) `fsync` `fdatasync` |
-| Linux server (normal mode only) | `restricted_enter` (1010), `legacy_syscall` (1011), `handle_close` (1012), memory objects: `mo_create` (1013), `mo_map` (1014), `mo_unmap` (1015), `mo_protect` (1016), `mo_read` (1017), `mo_write` (1018), paged objects: `mo_create_paged` (1019), `pager_wait` (1020), `mo_supply` (1021), `mo_fail` (1022), runtime: `shared_map` (1023), `server_futex_wait` (1024), `server_futex_wake` (1025), address space: `vm_remap` (1026), `vm_discard` (1027), `vm_sync` (1028), bridge: `kfile_object` (1029), time: `clock_read` (1030), `sleep_until` (1031), `yield` (1032), `set_usercopy` (1033), placeholders: `kfd_install` (1034), `kfd_lookup` (1035), `kfd_ready` (1036), `kfd_close` (1037), `kfd_read` (1038), `kfd_write` (1039), records: `fs_record` (1040), the kernel's tree: `inode_root` (1041), `inode_walk` (1042), `inode_stat` (1043), `inode_readlink` (1044), `inode_create` (1045), `inode_symlink` (1046), `inode_unlink` (1047), `inode_rename` (1048), `inode_chmod` (1049), `inode_truncate` (1050), `inode_open` (1051), `inode_statfs` (1052), `kfd_inode` (1053), `exec_target` (1054), file objects: `mo_create_file` (1055), `mo_hold` (1056), `mo_file_read` (1057), `mo_file_write` (1058), `mo_file_size` (1059), `mo_truncate` (1060), `initramfs` (1061), `mo_from_image` (1062), bridges until the descriptor table and the sockets move: `kfd_stat` (1093), `net_links` (1094), nice values until the process model moves: `thread_nice` (1095); the full list is in `docs/codemap.md` |
-| Servers | `ioperm` (privileged servers only), `ipc_register` (1000), `ipc_receive` (1001, with timeout and interrupt notifications), `ipc_reply` (1002), `irq_enable` (1003), `dma_map` (1004), `proc_query` (1005), `ipc_notify` (1006) |
+| Linux server (normal mode only) | `restricted_enter` (1010), `legacy_syscall` (1011), `handle_close` (1012), memory objects: `mo_create` (1013), `mo_map` (1014), `mo_unmap` (1015), `mo_protect` (1016), `mo_read` (1017), `mo_write` (1018), paged objects: `mo_create_paged` (1019), `pager_wait` (1020), `mo_supply` (1021), `mo_fail` (1022), runtime: `shared_map` (1023), `server_futex_wait` (1024), `server_futex_wake` (1025), address space: `vm_remap` (1026), `vm_discard` (1027), `vm_sync` (1028), bridge: `kfile_object` (1029), time: `clock_read` (1030), `sleep_until` (1031), `yield` (1032), `set_usercopy` (1033), placeholders: `kfd_install` (1034), `kfd_lookup` (1035), `kfd_ready` (1036), `kfd_close` (1037), `kfd_read` (1038), `kfd_write` (1039), records: `fs_record` (1040), the kernel's tree: `inode_root` (1041), `inode_walk` (1042), `inode_stat` (1043), `inode_readlink` (1044), `inode_create` (1045), `inode_symlink` (1046), `inode_unlink` (1047), `inode_rename` (1048), `inode_chmod` (1049), `inode_truncate` (1050), `inode_open` (1051), `inode_statfs` (1052), `kfd_inode` (1053), `exec_target` (1054), file objects: `mo_create_file` (1055), `mo_hold` (1056), `mo_file_read` (1057), `mo_file_write` (1058), `mo_file_size` (1059), `mo_truncate` (1060), `initramfs` (1061), `mo_from_image` (1062), a bridge until the descriptor table moves: `kfd_stat` (1093), nice values until the process model moves: `thread_nice` (1095); the full list is in `docs/codemap.md` |
+| Servers | `ioperm` (privileged servers only), `ipc_register` (1000), `ipc_receive` (1001, with timeout and interrupt notifications), `ipc_reply` (1002), `irq_enable` (1003), `dma_map` (1004), `proc_query` (1005), and the service's end of channels (1068-1075, `oxrt::sys`) |
 | System information | `sysinfo` `uname` (reports `oxidenix`, not Linux) |
 | Power | `reboot` (power off ends QEMU, restart resets the machine; every process tree's page cache is written back first) |
 | Sockets | `socket` `bind` `listen` `accept` `accept4` `connect` `sendto` `recvfrom` `sendmsg` `recvmsg` `shutdown` `getsockname` `getpeername` `setsockopt` (ignored) `getsockopt` (`AF_INET`: TCP, UDP, raw ICMP); `AF_NETLINK` with `NETLINK_ROUTE` (the Linux server's: `RTM_GETLINK`, `RTM_GETADDR`); the interface requests of netdevice(7) on any socket (`SIOCGIFCONF`, `SIOCGIFINDEX`, `SIOCGIFNAME`, `SIOCGIFFLAGS`, `SIOCGIFADDR`, `SIOCGIFNETMASK`, `SIOCGIFBRDADDR`, `SIOCGIFHWADDR`, `SIOCGIFMTU`) |
@@ -1111,7 +1120,7 @@ Each of these programs and scripts lives in the root filesystem and runs inside 
 | `inotifytest` | inotify on tmpfs and `/data`: a directory's watch seeing create, merged modifies, attrib, mkdir, a move's two events with one cookie, delete; a file's own modify, close-write, open, access, close-nowrite; its removal (attrib, delete, delete-self, ignored); `IN_ONESHOT`, `IN_ONLYDIR` (`ENOTDIR`), `IN_MASK_CREATE` (`EEXIST`), `rm_watch` (`IN_IGNORED`, then `EINVAL`); `FIONREAD`, `EINVAL` for a buffer too small, names padded to 16 bytes, poll and a blocking read woken by another thread, `EINVAL`/`EBADF` for other descriptors; a file removed while open (`IN_DELETE_SELF` at its last close); the limits: 128 instances (`EMFILE`), 8192 watches (`ENOSPC`), 16384 events then one `IN_Q_OVERFLOW`; one watch for a kernel file named twice |
 | `vmtest` | demand paging (a 64 MiB mapping costs nothing until touched), `SIGSEGV` on read-only and `PROT_NONE` pages with contents kept, split areas after a partial `munmap`, NX and the JIT pattern (1 GiB `PROT_NONE` reservation, write code, `mprotect` to executable, call it), commit limit and `MAP_NORESERVE` (also a 4 GiB reservation made writable and executable at once, as V8's code range, and forked counting only its touched pages, while the same without it is `ENOMEM`; 40 rounds of partial `munmap`, `MADV_DONTNEED`, `mremap`, `mprotect`, `fork` with copy-on-write on both sides and `exec` leave `Committed_AS` unchanged; a read-only area read in completely becomes writable with nothing left to commit), `mremap` in place and moving, `MADV_DONTNEED`, shared vs. private memory across `fork`, lazy file mappings and `SIGBUS` beyond the end, `MAP_FIXED_NOREPLACE`, stack growth to 4 MiB and overflow beyond 8 MiB, nothing mapped at or above 64 TiB (fixed mappings fail, hints and the stack stay below), the Linux server's memory out of the program's reach and its kernel calls `ENOSYS` for a program |
 | `smptest` | CPU count and affinity (pinning to every CPU, empty masks), the scheduling policy (`SCHED_OTHER`, priority 0, for the caller and another thread, `ESRCH`, `EINVAL`), parallel speed-up of CPU-bound processes, `fork`/`exit`/`wait` on every CPU at once, 5000 pipe round trips between two CPUs, signals to a process running on another CPU, timers on time while a program floods the console with palette changes on the same CPU; nice values: `getpriority`/`setpriority` (clamped, inherited by a child, in `/proc/<pid>/stat`, `PRIO_PGRP`, `PRIO_USER`, `ESRCH`, `EINVAL`), and the CPU shares they give two processes pinned to one CPU (nice 19 against 0 a small one, -5 about three times 0's) while a sleeper elsewhere still wakes; nice -1 against 0, a process outside the tree `ESRCH`, the lateness of a sleeper next to a nice -20 loop on its CPU; a loop that ran alone for seconds sharing at once with a second one |
-| `nettest` | TCP to an echo service through QEMU, `ECONNREFUSED`, `listen`/`accept` over loopback with a forked client, EOF after the peer closed, non-blocking `accept` and `connect` with `poll` and `SO_ERROR`, `EINTR` in a blocking `recv`, UDP over loopback, raw ICMP echo to the gateway and over loopback, source address for off-subnet destinations, overflowing message vectors, `AF_INET6` rejected; `EADDRINUSE` for a listener's port (also the wildcard address, with `SO_REUSEADDR`), `bind` to port 0 taking a port at once, `EINVAL` for binding twice |
+| `nettest` | TCP to an echo service through QEMU, `ECONNREFUSED`, `listen`/`accept` over loopback with a forked client, EOF after the peer closed, non-blocking `accept` and `connect` with `poll` and `SO_ERROR`, `EINTR` in a blocking `recv`, UDP over loopback, raw ICMP echo to the gateway and over loopback, source address for off-subnet destinations, overflowing message vectors (`EINVAL` for a negative iovec length, `EMSGSIZE` for a datagram over 65507 bytes), `AF_INET6` rejected; `EADDRINUSE` for a listener's port (also the wildcard address, with `SO_REUSEADDR`), `bind` to port 0 taking a port at once, `EINVAL` for binding twice; the server's sockets (R7b): 8 MiB through a loopback connection in pieces of many sizes, checked byte by byte in another process; `MSG_DONTWAIT`, `FIONREAD`, `MSG_PEEK`, `MSG_WAITALL` across two writes; `SO_RCVTIMEO` (`EAGAIN` after the time, read back), `SO_SNDTIMEO` (a send to a reader that never reads returns what went, then `EAGAIN`), `SIOCOUTQ`; half-close with `SHUT_WR` (end of file and `POLLRDHUP` for the peer, the other way still open, `EPIPE` and `SIGPIPE` for a write after it); a peer that closed: writes end in `EPIPE` with one `SIGPIPE`, none with `MSG_NOSIGNAL`, `POLLHUP`; a refused nonblocking connect (`SO_ERROR` `ECONNREFUSED`, once); `TCP_NODELAY` off by default and settable, `SO_KEEPALIVE`, `SO_TYPE`/`SO_PROTOCOL`/`SO_DOMAIN`, `ENOPROTOOPT`, `ENOTCONN` for `getpeername` and `recv` unconnected; `accept4`'s flags; an accepted connection's port (`EADDRINUSE` without `SO_REUSEADDR`, a new listener with it); of two sockets sharing a port by `SO_REUSEADDR` only one listens (`EADDRINUSE` for the other's `listen`); a UDP port shared only with `SO_REUSEADDR` on both; `EPOLLET` edges per arrival; `EINTR` in a blocking `accept`; UDP `MSG_TRUNC` and `FIONREAD`, a connected UDP socket (`getpeername`, `send`, `AF_UNSPEC` disconnecting: `EDESTADDRREQ`); `socketpair(AF_INET)` is `EOPNOTSUPP` |
 | `mmaptest` | shared file mappings: stores visible to `read` and `write` visible in the mapping at once, another process's own mapping of the file, the size unchanged by stores; private mappings seeing `write` until they write a page, and never reaching the file; mappings outliving `close` and `unlink`; the zero tail of the last page and `SIGBUS` beyond it; growing and shrinking with `ftruncate` (`SIGBUS` in shared pages and private copies beyond the new end, zeros after growing again); `EACCES` for writable sharing of a read-only descriptor (also via `mprotect`); shared anonymous memory across 8 children; mapping initramfs files |
 | `exectest` | eight runs of one program sharing its pages (less memory than one copy), data and bss of the loaded program, `ETXTBSY` for opening or truncating a running program and for running a program open for writing or mapped through a writable descriptor (not after `munmap`, not for a read-only mapping), a changed program file taking effect on the next run, a running program surviving the deletion of its file; arguments and environment laid out as Linux does (back to back, in order) |
 | `cachetest` | the page cache of `/data` files: data read back right after writing and `fsync` (from memory), `Cached` in `/proc/meminfo`, committing all free memory reclaims cached pages (and all of it can be used), the file read again from the disk afterwards, read-only shared and private mappings of a disk file, `pwrite` visible to `pread` and both mappings, private stores staying private, `ftruncate` shrinking and growing (zeros, not old data, in reads and the mapping), a program on the disk running from the cache and `ETXTBSY` while it runs |
@@ -1126,13 +1135,13 @@ Each of these programs and scripts lives in the root filesystem and runs inside 
 | `cargo test -p ext2fs` (host, needs e2fsprogs) | ext2 on a RAM disk that counts requests and can fail writes: 4 MiB read in about one device read per 32 KiB request, two flushes per write (data, then metadata), nothing written by reads, blocks moving between directories and files, a file larger than the block cache, corrupt block pointers (`EIO`, no crash), every write of a commit failing in turn (retried, nothing lost), failed data writes never exposing a deleted file's blocks; the ring path: writes into reserved blocks read back through both paths, extents clipped at the end with holes, reserved blocks out of every bitmap and inode until linked (`e2fsck` clean meanwhile, other allocations never take them), `sync` flushing the data before the metadata, `ENOENT` for inodes not in use; crashes: every write and flush of IPC and ring operations replayed up to a crash in each flush epoch, with arbitrary losses of what came after the last flush and a two-block metadata cache evicting all the time, never showing a deleted file's data in a file, directory or symlink; blocks freed before a failed commit not reused (ring or IPC) until a commit succeeds; freed inodes refusing reads, writes, truncation, permission changes (`ENOENT`); superblocks whose group or inode sizes do not fit a block refused at mount; blocks in flight for a promise counted once (the rest of the disk stays promisable, also after the promise ends; 128 reservations of 64 blocks in flight, half linked, half cut off by a truncation); freed blocks kept as ranges (unit test); socket inodes (a socket's mode and directory entry type, kept by a rename, freed by an unlink); `e2fsck` after each |
 | `cargo test -p fsring` (host) | the file protocol: every request survives encode and decode (socket inodes too), `ENOSYS` for unknown operations, `EINVAL` for any field an operation does not use, transfers, names and targets bounded (`EINVAL`, `ENAMETOOLONG`), names without `/` or NUL, completions, stat, usage and directory entries round-trip; `SETTIMES` takes the chosen times in 32 bits only |
 | `cargo test -p netlink` (host) | rtnetlink's answers: link and address dumps (`NLM_F_MULTI`, `NLMSG_DONE`, sequence numbers and port ids, the attributes getifaddrs reads), one link by index or by name with its acknowledgement, `ENODEV`, `EINVAL` for a short request, `EOPNOTSUPP` for other requests (capped with `NETLINK_CAP_ACK`), no answer for control messages and non-requests, a malformed length ending the datagram, two requests in one datagram, dumps split into page-sized datagrams; dumps produced a datagram at a time, one dump at a time (`EBUSY`), answers stopped at the room left |
-| `cargo test -p netproto` (host) | netd's interface records survive encode and decode |
+| `cargo test --release -p netring` (host) | the socket protocol between the Linux server and netd: every request survives encode and decode, `ENOSYS` for unknown operations, `EINVAL` for stray fields, malformed areas (two power-of-two rings on a page), sockets, endpoints and values out of range; the shared area's layout; ring arithmetic across the wrap; datagram records and interface records round-trip; netd's port rules (Linux's `SO_REUSEADDR` rule within an instance, never a port another instance serves, UDP reuse within an instance only); 4 MiB streamed through a ring between two threads (the reader sleeping on the control block, the writer waiting for room) and 100000 marks handed to a sleeping net thread, with no wakeup lost |
 | `cargo test -p vfs` (host) | paths and cpio; `struct stat` round-trips, every `struct statx` field and `stx_mask` (with and without a birth time), device numbers, statx's checks of flags and mask |
 | `timeout 1 sleep 5` | `vfork` and `SIGTERM` after the time limit (exit status 143) |
 | `kill -9 1` in Bash | user space cannot kill a server (`EPERM`) |
 | `kill diskfs` in the kernel monitor | the next `/data` access connects a new channel, which restarts the server; open files survive (an unlinked one fails with `EIO`), dirty pages whose write-back failed are written again; a diskfs in a crash loop is down for a while (`EIO`) and then tried again (ADR 0006); a restart still runs the boot-time program even after `/sbin/diskfs` was overwritten |
 | `kill netd` in the kernel monitor, then `run nettest` | the first socket call restarts netd (new DHCP lease) and every network test passes |
-| a background job holding a socket across `kill netd` | its next write fails with `EIO` instead of reaching a socket of the new netd |
+| a background job holding a socket across `kill netd` | its next write fails (`ECONNRESET`, then `EPIPE`) instead of reaching a socket of the new netd: its channel died with the old one |
 | `mem` (kernel monitor) | frame and heap accounting, allocator self-test, leak checks after workloads |
 
 During development the AI drove these tests through the QEMU monitor socket (`sendkey`,

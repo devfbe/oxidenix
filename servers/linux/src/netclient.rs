@@ -16,7 +16,8 @@
 //! **The net thread** (`ROLE_NET`, a service thread of the pager's
 //! process) takes the sockets netd marked (the client bitmap) and reports
 //! their readiness (`inet::InetSock::netd_changed`), and closes the
-//! sockets whose last descriptor went: `CLOSE` to netd, then their control
+//! sockets whose last descriptor the pager saw go (a close(2) closes its
+//! socket itself, `Net::close_now`): `CLOSE` to netd, then their control
 //! block and area are free. It sleeps on the shared area's doorbell, which
 //! netd rings when it marked a socket and the thread announced its sleep,
 //! and the server when it queued a close. When the channel dies (netd
@@ -325,18 +326,24 @@ impl Net {
         }
     }
 
+    /// Closes socket `index` in netd now and frees its control block and
+    /// rings.
+    pub fn close_now(&self, index: u32, rings: Option<Rings>, abort: bool) {
+        if !self.is_dead() {
+            let _ = self.call(Request::Close { sock: index, abort });
+        }
+        if let Some(r) = rings {
+            self.put_rings(r);
+        }
+        self.put_index(index);
+    }
+
     /// The net thread: closes what was queued; true if there was any.
     fn close_queued(&self) -> bool {
         let queued = core::mem::take(&mut *self.closing.lock());
         let any = !queued.is_empty();
         for c in queued {
-            if !self.is_dead() {
-                let _ = self.call(Request::Close { sock: c.index, abort: c.abort });
-            }
-            if let Some(r) = c.rings {
-                self.put_rings(r);
-            }
-            self.put_index(c.index);
+            self.close_now(c.index, c.rings, c.abort);
             CLOSES.fetch_sub(1, Ordering::SeqCst);
             futex_wake(&CLOSES, u32::MAX as u64);
         }

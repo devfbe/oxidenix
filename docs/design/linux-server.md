@@ -252,9 +252,8 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
 7. **R7 — Sockets** into the server, talking to netd over rings.
    - **R7a — `AF_UNIX`** (done; `servers/linux/src/unix.rs`, `sockcalls.rs`, `scm.rs`):
      stream, datagram and seqpacket sockets are files of the server, placeholders as pipes
-     are; `socket` and `socketpair` of the family come to the server (the others pass
-     through: `AF_INET` stays the kernel's and netd's until the rest of R7), and so does every
-     socket call on one of its descriptors. Names are socket inodes of the server's tmpfs and
+     are; `socket` and `socketpair` of the family come to the server (since R7b every socket
+     call does), and so does every socket call on one of its descriptors. Names are socket inodes of the server's tmpfs and
      of `/data` (ext2's socket type, `fsring`'s `KIND_SOCKET`), found by inode, or names of
      the instance's abstract namespace. Linux's semantics as `net/unix/af_unix.c` has them:
      messages charged to their sender until read (`SO_SNDBUF`, poll's quarter rule),
@@ -370,23 +369,37 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
      netd wakes it directly.
 
      **Semantics** (Linux's, `man 7 tcp`, `udp`, `ip`, `socket`): `bind` checks the address
-     is local (`EADDRNOTAVAIL`) and the port: a socket bound to it on an overlapping address
-     conflicts unless both have `SO_REUSEADDR` and neither listens (`EADDRINUSE`); port 0
-     takes an ephemeral port; connections inherit their listener's. `EPIPE` with `SIGPIPE`
+     is local (`EADDRNOTAVAIL`) and the port, and `listen` checks the port again (Linux's
+     `inet_csk_bind_conflict`, `netring::tcp_port_conflict`): a socket on an overlapping
+     address conflicts unless both have `SO_REUSEADDR` and it does not listen
+     (`EADDRINUSE`), so of two sockets sharing a port only one may listen; port 0 takes an
+     ephemeral port; connections inherit their listener's. `EPIPE` with `SIGPIPE`
      (unless `MSG_NOSIGNAL`) once the connection cannot send, after a pending error
      (`ECONNRESET`) is reported once; `MSG_PEEK`, `MSG_WAITALL`, `MSG_TRUNC` (datagrams),
      `SO_ERROR` (taking the pending error: a nonblocking connect's outcome), `shutdown`
      (`SHUT_WR` sends `FIN` after what is queued), `TCP_NODELAY` (Nagle's algorithm is on
      by default, as Linux), `SO_KEEPALIVE`, `IP_TTL`, `FIONREAD`, `SIOCOUTQ`, `SO_LINGER`
      with a zero time (close sends `RST`), and close with unread data sends `RST`.
-     **Closing** never waits in the closing thread: the net thread sends `CLOSE`; netd then
-     copies what the send ring still holds into its own memory and sends it before its
-     `FIN`, so data written before an exit reaches the peer even after the instance ended
-     (the pager waits for the net thread's closes before it lets the instance go).
+     **Closing**: `close(2)` sends `CLOSE` before it returns, so the port is free then, as
+     on Linux; what the pager learns (a process's exit closing its descriptors) it hands to
+     the net thread, never waiting for netd itself. netd then copies what the send ring
+     still holds into its own memory and sends it before its `FIN`, so data written before
+     an exit reaches the peer even after the instance ended (the pager waits for the net
+     thread's closes before it lets the instance go).
 
      **netd** serves every instance's channel from one TCP/IP stack: ports are global, and
      a channel names only its own sockets (its control blocks), so one instance can neither
-     see nor touch another's. Each round it takes requests (no more than the completion ring
+     see nor touch another's. Port sharing never crosses instances where it could take
+     traffic from one: another instance's bound or listening TCP socket conflicts whatever
+     both opted in to (its connections and TIME-WAIT ports follow Linux's rule), and a UDP
+     port is shared by `SO_REUSEADDR` only within an instance (`netring::udp_port_conflict`;
+     both rules are tested on the host). An instance may hold at most three quarters of
+     netd's socket memory (`ENOBUFS` beyond), so no instance starves the others; what a closed
+     connection's send ring still held is kept within that budget (else the connection is
+     reset), and a connection in TIME-WAIT keeps only a record of its port (its buffers go;
+     a late segment of it is answered with a reset). Raw ICMP sockets see every ICMP packet
+     of the host, as on Linux (everyone is root): one instance's ICMP traffic shows in
+     another's raw sockets. Each round it takes requests (no more than the completion ring
      has room for), the service bitmaps, polls the card and smoltcp, moves data between
      smoltcp and the rings of the sockets that can move some, and publishes what changed;
      it sleeps (doorbells armed, `ipc_receive` with smoltcp's next deadline) after a spin

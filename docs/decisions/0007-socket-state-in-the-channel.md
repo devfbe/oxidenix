@@ -52,7 +52,9 @@ Alternatives considered:
   turns the bitmap netd marks into `kfd_ready` reports, so the kernel's `poll` and `epoll` see
   every change without any thread of the program in the server.
 - **One netd for all instances**, ports global in its stack; a channel names only its own
-  control blocks.
+  control blocks, and port sharing (`SO_REUSEADDR`) never lets one instance take a port
+  another one serves (`netring`'s port rules, tested on the host); each instance may hold at
+  most three quarters of netd's socket memory.
 
 ## Consequences
 

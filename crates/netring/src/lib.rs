@@ -716,6 +716,61 @@ impl Request {
     }
 }
 
+/// A socket that holds a port, as netd's port rules see it. `owner` is
+/// the channel (the instance) it belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PortHolder {
+    pub owner: u64,
+    pub port: u16,
+    /// Its address (None: any).
+    pub addr: Option<u32>,
+    pub reuse: bool,
+    pub listening: bool,
+    /// A connection (connected or accepted): matched by both endpoints,
+    /// it never receives what is meant for a new socket.
+    pub connected: bool,
+    /// Its owner closed it; it only finishes (TIME-WAIT).
+    pub closing: bool,
+}
+
+/// A claim of a port: a bind, or a listen of a bound socket.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PortClaim {
+    pub owner: u64,
+    pub port: u16,
+    pub addr: Option<u32>,
+    pub reuse: bool,
+}
+
+fn overlaps(a: Option<u32>, b: Option<u32>) -> bool {
+    a.is_none() || b.is_none() || a == b
+}
+
+/// Whether a TCP claim conflicts with a holder (EADDRINUSE). Linux's rule
+/// (inet_csk_bind_conflict): a socket on an overlapping address conflicts
+/// unless both allow reuse (SO_REUSEADDR) and it does not listen; netd
+/// checks it at bind and again at listen. Across instances it is stricter:
+/// another instance's socket that is bound or listening (neither a
+/// connection nor closing) is never shared, so one instance can never take
+/// over a port another one serves.
+pub fn tcp_port_conflict(claim: &PortClaim, other: &PortHolder) -> bool {
+    if claim.port != other.port || !overlaps(claim.addr, other.addr) {
+        return false;
+    }
+    if claim.owner != other.owner && !other.connected && !other.closing {
+        return true;
+    }
+    !(claim.reuse && other.reuse && !other.listening)
+}
+
+/// Whether a UDP claim conflicts with a holder: a socket on an overlapping
+/// address conflicts unless both allow reuse and both are the same
+/// instance's (a datagram goes to one of them: never to another
+/// instance's).
+pub fn udp_port_conflict(claim: &PortClaim, other: &PortHolder) -> bool {
+    claim.port == other.port && overlaps(claim.addr, other.addr) && !(claim.reuse && other.reuse && claim.owner == other.owner)
+}
+
 /// The pieces of the ring range [`pos`, `pos + len`) in a ring of `size`
 /// bytes (a power of two): (offset in the ring, length) before the wrap
 /// and after it (the second empty unless it wraps). `len` is at most

@@ -88,20 +88,24 @@ static int64_t wake_latency(int how) {
 static int64_t socket_latency(void) {
     int rx = socket(AF_INET, SOCK_DGRAM, 0);
     struct sockaddr_in addr = {.sin_family = AF_INET, .sin_port = htons(47124), .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
-    bind(rx, (struct sockaddr *)&addr, sizeof addr);
+    if (bind(rx, (struct sockaddr *)&addr, sizeof addr) < 0) printf("  (socket or bind: %s)\n", strerror(errno));
     pid_t child = fork();
     if (child == 0) {
         int tx = socket(AF_INET, SOCK_DGRAM, 0);
         struct timespec d = {0, 2000000};
         nanosleep(&d, NULL);
         int64_t t = now_ns();
-        sendto(tx, &t, sizeof t, 0, (struct sockaddr *)&addr, sizeof addr);
+        if (sendto(tx, &t, sizeof t, 0, (struct sockaddr *)&addr, sizeof addr) != sizeof t) {
+            printf("  (sendto: %s)\n", strerror(errno));
+            _exit(1);
+        }
         _exit(0);
     }
     struct pollfd fds[1] = {{rx, POLLIN, 0}};
     int ready = poll(fds, 1, 5000) == 1 && fds[0].revents == POLLIN;
     int64_t woke = now_ns(), sent = 0;
-    recv(rx, &sent, sizeof sent, 0);
+    // Never waiting for a datagram that did not come.
+    recv(rx, &sent, sizeof sent, ready ? 0 : MSG_DONTWAIT);
     waitpid(child, NULL, 0);
     close(rx);
     return ready ? (woke - sent) / 1000 : 1000000;

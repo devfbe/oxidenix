@@ -170,6 +170,61 @@ fn links_round_trip() {
     assert_eq!(back, links);
 }
 
+fn holder(owner: u64, addr: Option<u32>, reuse: bool) -> PortHolder {
+    PortHolder { owner, port: 8080, addr, reuse, listening: false, connected: false, closing: false }
+}
+
+fn claim(owner: u64, addr: Option<u32>, reuse: bool) -> PortClaim {
+    PortClaim { owner, port: 8080, addr, reuse }
+}
+
+const LO: Option<u32> = Some(0x7f00_0001);
+
+#[test]
+fn tcp_ports_follow_linux_within_an_instance() {
+    // Bound sockets: shared only if both allow reuse.
+    assert!(tcp_port_conflict(&claim(1, LO, false), &holder(1, LO, false)));
+    assert!(tcp_port_conflict(&claim(1, LO, true), &holder(1, LO, false)));
+    assert!(tcp_port_conflict(&claim(1, LO, false), &holder(1, LO, true)));
+    assert!(!tcp_port_conflict(&claim(1, LO, true), &holder(1, LO, true)));
+    // A listener is never shared: the second of two reusing sockets that
+    // listens conflicts (the re-check at listen).
+    let listener = PortHolder { listening: true, ..holder(1, LO, true) };
+    assert!(tcp_port_conflict(&claim(1, LO, true), &listener));
+    // The wildcard overlaps every address; distinct addresses do not.
+    assert!(tcp_port_conflict(&claim(1, None, false), &holder(1, LO, false)));
+    assert!(tcp_port_conflict(&claim(1, LO, false), &holder(1, None, false)));
+    assert!(!tcp_port_conflict(&claim(1, LO, false), &holder(1, Some(0x0a00_020f), false)));
+    // Another port: nothing.
+    assert!(!tcp_port_conflict(&PortClaim { port: 8081, ..claim(1, LO, false) }, &holder(1, LO, false)));
+    // Connections and closing ones (TIME-WAIT) give way to reuse only.
+    let conn = PortHolder { connected: true, ..holder(1, LO, true) };
+    assert!(!tcp_port_conflict(&claim(1, LO, true), &conn));
+    assert!(tcp_port_conflict(&claim(1, LO, false), &conn));
+    let closing = PortHolder { closing: true, ..holder(1, LO, true) };
+    assert!(!tcp_port_conflict(&claim(1, LO, true), &closing));
+    assert!(tcp_port_conflict(&claim(1, LO, false), &closing));
+}
+
+#[test]
+fn no_instance_takes_a_port_another_one_serves() {
+    // Another instance's bound or listening socket: a conflict whatever
+    // both opted in to.
+    assert!(tcp_port_conflict(&claim(2, LO, true), &holder(1, LO, true)));
+    assert!(tcp_port_conflict(&claim(2, LO, true), &PortHolder { listening: true, ..holder(1, LO, true) }));
+    assert!(tcp_port_conflict(&claim(2, None, true), &holder(1, LO, true)));
+    // Its connections and closing sockets only by Linux's rule.
+    assert!(!tcp_port_conflict(&claim(2, LO, true), &PortHolder { connected: true, ..holder(1, LO, true) }));
+    assert!(!tcp_port_conflict(&claim(2, LO, true), &PortHolder { closing: true, ..holder(1, LO, true) }));
+    assert!(tcp_port_conflict(&claim(2, LO, false), &PortHolder { closing: true, ..holder(1, LO, true) }));
+    // UDP: reuse within an instance only.
+    assert!(!udp_port_conflict(&claim(1, LO, true), &holder(1, LO, true)));
+    assert!(udp_port_conflict(&claim(1, LO, false), &holder(1, LO, true)));
+    assert!(udp_port_conflict(&claim(2, LO, true), &holder(1, LO, true)));
+    assert!(udp_port_conflict(&claim(2, None, true), &holder(1, LO, true)));
+    assert!(!udp_port_conflict(&claim(2, LO, true), &holder(1, Some(0x0a00_020f), true)));
+}
+
 /// A shared area in host memory, page-aligned.
 fn shared_area() -> &'static SharedArea {
     let layout = std::alloc::Layout::from_size_align(SHARED_PAGES as usize * PAGE, PAGE).unwrap();

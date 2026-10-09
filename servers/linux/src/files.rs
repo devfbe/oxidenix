@@ -84,7 +84,10 @@ pub fn ready(id: u64, ready: i16) {
 }
 
 /// The kernel closed the placeholder's last descriptor: the object goes.
-pub fn closed(id: u64) {
+/// `service`: the instance's pager learnt it (a process's exit, a
+/// descriptor in flight let go), which may not wait for netd; else the
+/// thread whose close(2) it was, before the call returns.
+pub fn closed(id: u64, service: bool) {
     let gone = FILES.lock().remove(&id);
     match gone {
         Some(File::Pipe(end)) => end.close(),
@@ -95,8 +98,9 @@ pub fn closed(id: u64) {
                 crate::scm::request();
             }
         }
-        // The net thread closes it in netd.
-        Some(File::Inet(sock)) => sock.release(),
+        // Closed in netd before close(2) returns (its port is free then,
+        // as on Linux); by the net thread for the pager.
+        Some(File::Inet(sock)) => sock.release(!service),
         _ => {}
     }
     // An eventfd or a tmpfs or /data file simply goes (the latter two

@@ -945,15 +945,20 @@ impl InetSock {
         self.net.status(Request::SetOpt { sock: self.index, opt: option, value }).map(|_| ())
     }
 
-    /// The placeholder's last descriptor went: the net thread closes it
-    /// in netd (a reset if data it received is unread, or SO_LINGER with
-    /// a zero time).
-    pub fn release(&self) {
+    /// The placeholder's last descriptor went: the socket closes in netd
+    /// (a reset if data it received is unread, or SO_LINGER with a zero
+    /// time), `now` before this returns (its port is free then), else by
+    /// the net thread (the caller may not wait for netd: the pager).
+    pub fn release(&self, now: bool) {
         let snap = self.snap();
         let rings = self.rings.lock().take();
         let unread = rings.is_some_and(|r| self.kind == Kind::Tcp && self.available(&snap, &r).unwrap_or(0) > 0);
         let abort = unread || self.st.lock().opts.linger == Some(0);
-        self.net.queue_close(self.index, rings, abort);
+        if now {
+            self.net.close_now(self.index, rings, abort);
+        } else {
+            self.net.queue_close(self.index, rings, abort);
+        }
     }
 }
 

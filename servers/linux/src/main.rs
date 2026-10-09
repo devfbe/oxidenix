@@ -130,7 +130,7 @@ fn pass_through(s: &State) {
     let mut closed = [0u64; 16];
     let n = syscall(SYS_LEGACY_SYSCALL, [closed.as_mut_ptr() as u64, closed.len() as u64, 0, 0, 0, 0]);
     for &id in closed.iter().take(n.max(0) as usize) {
-        files::closed(id);
+        files::closed(id, false);
     }
     datafs::reap();
 }
@@ -177,7 +177,7 @@ fn pager() -> ! {
         }
         match event.kind {
             EVENT_CLOSED => {
-                files::closed(event.a);
+                files::closed(event.a, true);
                 continue;
             }
             EVENT_RELEASE => {

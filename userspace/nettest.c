@@ -1,16 +1,26 @@
 /* Socket tests: TCP and UDP over loopback and through QEMU's user network
- * (10.0.2.100:7 is an echo service, see builder/src/main.rs). */
+ * (10.0.2.100:7 is an echo service, see builder/src/main.rs), with the
+ * Linux semantics of the server's internet sockets (R7b): bulk data
+ * intact, MSG_PEEK, MSG_DONTWAIT, MSG_WAITALL, MSG_TRUNC, timeouts,
+ * half-close, EPIPE and SIGPIPE, SO_ERROR, SO_REUSEADDR, options, epoll's
+ * edges. */
+#define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/sockios.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/epoll.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 static int failures;
@@ -52,6 +62,317 @@ static int read_all(int fd, char *buf, int len) {
 }
 
 static void on_alarm(int sig) { (void)sig; }
+
+static volatile int sigpipes;
+static void on_sigpipe(int sig) {
+    (void)sig;
+    sigpipes++;
+}
+
+static long now_ms(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec * 1000 + t.tv_nsec / 1000000;
+}
+
+/* A listener on a free loopback port (SO_REUSEADDR if `reuse`). */
+static int listener(int *port, int reuse) {
+    int l = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a = addr("127.0.0.1", *port);
+    setsockopt(l, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof reuse);
+    if (bind(l, (struct sockaddr *)&a, sizeof a) < 0 || listen(l, 4) < 0) {
+        close(l);
+        return -1;
+    }
+    socklen_t len = sizeof a;
+    getsockname(l, (struct sockaddr *)&a, &len);
+    *port = ntohs(a.sin_port);
+    return l;
+}
+
+/* A connected TCP pair over loopback: fds[0] connected, fds[1] accepted. */
+static int tcp_pair(int fds[2]) {
+    int port = 0, l = listener(&port, 0);
+    if (l < 0) return -1;
+    fds[0] = tcp_connect("127.0.0.1", port);
+    fds[1] = fds[0] >= 0 ? accept(l, NULL, NULL) : -1;
+    close(l);
+    return fds[0] >= 0 && fds[1] >= 0 ? 0 : -1;
+}
+
+/* Byte `i` of the bulk transfer's pattern. */
+static unsigned char pattern(unsigned long i) { return (unsigned char)(i * 131 + (i >> 12)); }
+
+/* Linux's semantics of the server's TCP sockets (R7b). */
+static void stream_semantics(void) {
+    int p[2];
+    char buf[256];
+
+    /* 8 MiB in pieces of many sizes through a loopback connection, the
+     * reader in another process checking every byte. */
+    check("a TCP pair over loopback", tcp_pair(p) == 0);
+    pid_t reader = fork();
+    if (reader == 0) {
+        close(p[0]);
+        static unsigned char in[70000];
+        unsigned long got = 0, total = 8UL << 20;
+        while (got < total) {
+            int n = read(p[1], in, 1 + (got % sizeof in));
+            if (n <= 0) _exit(1);
+            for (int k = 0; k < n; k++)
+                if (in[k] != pattern(got + k)) _exit(2);
+            got += n;
+        }
+        _exit(read(p[1], in, 1) == 0 ? 0 : 3);
+    }
+    close(p[1]);
+    static unsigned char out[100000];
+    unsigned long sent = 0, total = 8UL << 20;
+    int ok = 1;
+    while (sent < total && ok) {
+        unsigned long n = 1 + (sent * 7919) % sizeof out;
+        if (n > total - sent) n = total - sent;
+        for (unsigned long k = 0; k < n; k++) out[k] = pattern(sent + k);
+        ok = write(p[0], out, n) == (long)n;
+        sent += n;
+    }
+    close(p[0]);
+    int st = -1;
+    waitpid(reader, &st, 0);
+    check("8 MiB arrive intact, in order, then end of file", ok && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+
+    /* MSG_PEEK, MSG_DONTWAIT, FIONREAD, MSG_WAITALL. */
+    tcp_pair(p);
+    check("an empty connection: MSG_DONTWAIT is EAGAIN", recv(p[1], buf, 1, MSG_DONTWAIT) == -1 && errno == EAGAIN);
+    write(p[0], "peekaboo", 8);
+    struct pollfd pf = {p[1], POLLIN, 0};
+    poll(&pf, 1, 2000);
+    int avail = -1;
+    ioctl(p[1], FIONREAD, &avail);
+    check("FIONREAD counts the bytes waiting", avail == 8);
+    check("MSG_PEEK leaves the data", recv(p[1], buf, 4, MSG_PEEK) == 4 && memcmp(buf, "peek", 4) == 0);
+    check("... for the next read", recv(p[1], buf, 8, MSG_WAITALL) == 8 && memcmp(buf, "peekaboo", 8) == 0);
+    pid_t writer = fork();
+    if (writer == 0) {
+        write(p[0], "abc", 3);
+        usleep(100000);
+        write(p[0], "def", 3);
+        _exit(0);
+    }
+    check("MSG_WAITALL waits for all of it", recv(p[1], buf, 6, MSG_WAITALL) == 6 && memcmp(buf, "abcdef", 6) == 0);
+    waitpid(writer, NULL, 0);
+
+    /* Timeouts. */
+    struct timeval tv = {0, 150000};
+    setsockopt(p[1], SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    long t0 = now_ms();
+    int r = recv(p[1], buf, 1, 0);
+    long waited = now_ms() - t0;
+    check("SO_RCVTIMEO: a receive gives up with EAGAIN", r == -1 && errno == EAGAIN && waited >= 140 && waited < 2000);
+    struct timeval got_tv;
+    socklen_t tl = sizeof got_tv;
+    check("... and getsockopt reads it back", getsockopt(p[1], SOL_SOCKET, SO_RCVTIMEO, &got_tv, &tl) == 0 && got_tv.tv_usec == 150000);
+    tv.tv_usec = 200000;
+    setsockopt(p[0], SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+    static char big[8 << 20];
+    long n = write(p[0], big, sizeof big);
+    check("SO_SNDTIMEO: a send to a reader that never reads stops with what went", n > 0 && n < (long)sizeof big);
+    t0 = now_ms();
+    n = write(p[0], big, sizeof big);
+    waited = now_ms() - t0;
+    check("... then with EAGAIN after the time", n == -1 && errno == EAGAIN && waited >= 190);
+    int out_q = -1;
+    ioctl(p[0], SIOCOUTQ, &out_q);
+    check("SIOCOUTQ counts what waits to go", out_q > 0);
+    close(p[0]);
+    close(p[1]);
+
+    /* Half-close: SHUT_WR sends end of file, the other way stays open. */
+    tcp_pair(p);
+    write(p[0], "last", 4);
+    check("shutdown(SHUT_WR)", shutdown(p[0], SHUT_WR) == 0);
+    check("the peer reads the data, then end of file", recv(p[1], buf, 4, MSG_WAITALL) == 4 && read(p[1], buf, 1) == 0);
+    pf = (struct pollfd){p[1], POLLIN | POLLRDHUP, 0};
+    check("... and polls POLLRDHUP", poll(&pf, 1, 1000) == 1 && (pf.revents & POLLRDHUP));
+    check("the other way still carries data", write(p[1], "back", 4) == 4 && recv(p[0], buf, 4, MSG_WAITALL) == 4 && memcmp(buf, "back", 4) == 0);
+    struct sigaction sa = {0};
+    sa.sa_handler = on_sigpipe;
+    sigaction(SIGPIPE, &sa, NULL);
+    sigpipes = 0;
+    check("writing after SHUT_WR is EPIPE with SIGPIPE", write(p[0], "x", 1) == -1 && errno == EPIPE && sigpipes == 1);
+    close(p[0]);
+    close(p[1]);
+
+    /* A peer that closed: its stack resets what comes, the writer gets
+     * EPIPE (an ECONNRESET first, at most), SIGPIPE unless MSG_NOSIGNAL. */
+    tcp_pair(p);
+    close(p[1]);
+    usleep(50000);
+    sigpipes = 0;
+    int epipe = 0, other = 0;
+    for (int i = 0; i < 20 && !epipe; i++) {
+        if (write(p[0], "x", 1) == -1) {
+            if (errno == EPIPE) epipe = 1;
+            else if (errno != ECONNRESET) other = 1;
+        }
+        usleep(20000);
+    }
+    check("writing to a closed peer ends in EPIPE", epipe && !other);
+    check("... with SIGPIPE", sigpipes == 1);
+    check("MSG_NOSIGNAL: EPIPE without the signal", send(p[0], "x", 1, MSG_NOSIGNAL) == -1 && errno == EPIPE && sigpipes == 1);
+    pf = (struct pollfd){p[0], POLLOUT, 0};
+    check("... and the socket polls POLLHUP", poll(&pf, 1, 0) == 1 && (pf.revents & POLLHUP));
+    close(p[0]);
+    signal(SIGPIPE, SIG_DFL);
+
+    /* A refused nonblocking connect: the error is SO_ERROR's, once. */
+    int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    struct sockaddr_in a = addr("127.0.0.1", 1);
+    r = connect(fd, (struct sockaddr *)&a, sizeof a);
+    check("nonblocking connect to a closed port: EINPROGRESS", r == -1 && (errno == EINPROGRESS || errno == ECONNREFUSED));
+    pf = (struct pollfd){fd, POLLOUT, 0};
+    poll(&pf, 1, 2000);
+    int err = -1;
+    socklen_t el = sizeof err;
+    getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el);
+    check("... SO_ERROR is ECONNREFUSED", err == ECONNREFUSED && (pf.revents & POLLERR));
+    getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el);
+    check("... and 0 when read again", err == 0);
+    close(fd);
+
+    /* Options. */
+    fd = socket(AF_INET, SOCK_STREAM, 0);
+    int v = -1;
+    socklen_t vl = sizeof v;
+    check("TCP_NODELAY is off by default (Nagle's algorithm)", getsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &v, &vl) == 0 && v == 0);
+    int one = 1;
+    check("TCP_NODELAY can be set and read back",
+          setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one) == 0 && getsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &v, &vl) == 0 && v == 1);
+    check("SO_KEEPALIVE can be set and read back",
+          setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof one) == 0 && getsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &v, &vl) == 0 && v == 1);
+    check("SO_TYPE, SO_PROTOCOL, SO_DOMAIN",
+          getsockopt(fd, SOL_SOCKET, SO_TYPE, &v, &vl) == 0 && v == SOCK_STREAM && getsockopt(fd, SOL_SOCKET, SO_PROTOCOL, &v, &vl) == 0 &&
+              v == IPPROTO_TCP && getsockopt(fd, SOL_SOCKET, SO_DOMAIN, &v, &vl) == 0 && v == AF_INET);
+    check("an unknown option is ENOPROTOOPT", setsockopt(fd, IPPROTO_TCP, 9999, &one, sizeof one) == -1 && errno == ENOPROTOOPT);
+    struct sockaddr_in peer;
+    socklen_t pl = sizeof peer;
+    check("getpeername of an unconnected socket is ENOTCONN", getpeername(fd, (struct sockaddr *)&peer, &pl) == -1 && errno == ENOTCONN);
+    check("recv on an unconnected socket is ENOTCONN", recv(fd, buf, 1, 0) == -1 && errno == ENOTCONN);
+    close(fd);
+
+    /* SO_REUSEADDR: an accepted connection keeps its port; without the
+     * option nobody may bind it, with it a new listener may. */
+    int port = 0, l = listener(&port, 1);
+    int c = tcp_connect("127.0.0.1", port);
+    int s = accept4(l, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
+    check("accept4 gives SOCK_NONBLOCK and SOCK_CLOEXEC", s >= 0 && (fcntl(s, F_GETFL) & O_NONBLOCK) && (fcntl(s, F_GETFD) & FD_CLOEXEC));
+    close(l);
+    int b1 = socket(AF_INET, SOCK_STREAM, 0);
+    a = addr("127.0.0.1", port);
+    check("a connection's port: bind without SO_REUSEADDR is EADDRINUSE", bind(b1, (struct sockaddr *)&a, sizeof a) == -1 && errno == EADDRINUSE);
+    int b2 = socket(AF_INET, SOCK_STREAM, 0);
+    setsockopt(b2, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    check("... with it, bind and listen work", bind(b2, (struct sockaddr *)&a, sizeof a) == 0 && listen(b2, 1) == 0);
+    close(b1);
+    close(b2);
+    /* Two sockets sharing a port by SO_REUSEADDR: only one may listen (the
+     * port is claimed again at listen, as Linux does). */
+    port = 0;
+    l = listener(&port, 1);
+    close(l);
+    int r1 = socket(AF_INET, SOCK_STREAM, 0), r2 = socket(AF_INET, SOCK_STREAM, 0);
+    setsockopt(r1, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    setsockopt(r2, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    a = addr("127.0.0.1", 0);
+    bind(r1, (struct sockaddr *)&a, sizeof a);
+    socklen_t alen = sizeof a;
+    getsockname(r1, (struct sockaddr *)&a, &alen);
+    check("two SO_REUSEADDR sockets bind one port", bind(r2, (struct sockaddr *)&a, sizeof a) == 0);
+    check("... the first listens, the second's listen is EADDRINUSE", listen(r1, 1) == 0 && listen(r2, 1) == -1 && errno == EADDRINUSE);
+    close(r1);
+    close(r2);
+    close(c);
+    close(s);
+
+    /* Edge-triggered epoll: an event for each arrival of data. */
+    tcp_pair(p);
+    int ep = epoll_create1(0);
+    struct epoll_event ev = {.events = EPOLLIN | EPOLLET, .data.fd = p[1]};
+    epoll_ctl(ep, EPOLL_CTL_ADD, p[1], &ev);
+    write(p[0], "1", 1);
+    int first = epoll_wait(ep, &ev, 1, 2000);
+    int again = epoll_wait(ep, &ev, 1, 100);
+    write(p[0], "2", 1);
+    int second = epoll_wait(ep, &ev, 1, 2000);
+    check("EPOLLET: an edge per arrival, none without", first == 1 && again == 0 && second == 1);
+    close(ep);
+
+    /* A blocking accept is interrupted by a signal. */
+    port = 0;
+    l = listener(&port, 0);
+    struct sigaction al = {0};
+    al.sa_handler = on_alarm;
+    sigaction(SIGALRM, &al, NULL);
+    alarm(1);
+    check("accept without a connection is interrupted with EINTR", accept(l, NULL, NULL) == -1 && errno == EINTR);
+    close(l);
+    close(p[0]);
+    close(p[1]);
+}
+
+/* UDP: truncation, connected sockets. */
+static void datagram_semantics(void) {
+    char buf[128];
+    int rx = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in a = addr("127.0.0.1", 0);
+    bind(rx, (struct sockaddr *)&a, sizeof a);
+    socklen_t len = sizeof a;
+    getsockname(rx, (struct sockaddr *)&a, &len);
+    int tx = socket(AF_INET, SOCK_DGRAM, 0);
+    char hundred[100];
+    memset(hundred, 'u', sizeof hundred);
+    sendto(tx, hundred, 100, 0, (struct sockaddr *)&a, sizeof a);
+    sendto(tx, hundred, 100, 0, (struct sockaddr *)&a, sizeof a);
+    struct iovec iov = {buf, 10};
+    struct msghdr m = {0};
+    m.msg_iov = &iov;
+    m.msg_iovlen = 1;
+    int avail = -1;
+    struct pollfd pf = {rx, POLLIN, 0};
+    poll(&pf, 1, 2000);
+    ioctl(rx, FIONREAD, &avail);
+    check("UDP FIONREAD is the next datagram's length", avail == 100);
+    long n = recvmsg(rx, &m, MSG_TRUNC);
+    check("MSG_TRUNC returns the datagram's whole length", n == 100 && (m.msg_flags & MSG_TRUNC));
+    m.msg_flags = 0;
+    n = recvmsg(rx, &m, 0);
+    check("... without it, what fit, flagged MSG_TRUNC", n == 10 && (m.msg_flags & MSG_TRUNC));
+    check("connect a UDP socket", connect(tx, (struct sockaddr *)&a, sizeof a) == 0);
+    struct sockaddr_in peer;
+    socklen_t pl = sizeof peer;
+    check("... getpeername tells the peer", getpeername(tx, (struct sockaddr *)&peer, &pl) == 0 && peer.sin_port == a.sin_port);
+    check("... send needs no address", send(tx, "c", 1, 0) == 1 && recv(rx, buf, sizeof buf, 0) == 1 && buf[0] == 'c');
+    struct sockaddr unspec = {.sa_family = AF_UNSPEC};
+    check("AF_UNSPEC disconnects it", connect(tx, &unspec, sizeof unspec) == 0 && send(tx, "c", 1, 0) == -1 && errno == EDESTADDRREQ);
+    check("socketpair of AF_INET is EOPNOTSUPP", socketpair(AF_INET, SOCK_STREAM, 0, (int[2]){0, 0}) == -1 && errno == EOPNOTSUPP);
+    /* A UDP port: shared only by sockets that both allow reuse. */
+    int u1 = socket(AF_INET, SOCK_DGRAM, 0), u2 = socket(AF_INET, SOCK_DGRAM, 0), u3 = socket(AF_INET, SOCK_DGRAM, 0);
+    int one = 1;
+    setsockopt(u1, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    setsockopt(u3, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    struct sockaddr_in ua = addr("127.0.0.1", 0);
+    bind(u1, (struct sockaddr *)&ua, sizeof ua);
+    socklen_t ul = sizeof ua;
+    getsockname(u1, (struct sockaddr *)&ua, &ul);
+    check("a UDP port without SO_REUSEADDR: EADDRINUSE", bind(u2, (struct sockaddr *)&ua, sizeof ua) == -1 && errno == EADDRINUSE);
+    check("... with it on both: bound", bind(u3, (struct sockaddr *)&ua, sizeof ua) == 0);
+    close(u1);
+    close(u3);
+    check("a closed socket's port is free when close returns", bind(u2, (struct sockaddr *)&ua, sizeof ua) == 0);
+    close(u2);
+    close(rx);
+    close(tx);
+}
 
 /* One ICMP echo request to `ip`; returns 1 if the matching reply arrives
  * within two seconds (as a whole IPv4 packet, like on Linux). */
@@ -230,6 +551,9 @@ int main(void) {
     close(u);
 
     check("AF_INET6 sockets are not supported", socket(AF_INET6, SOCK_STREAM, 0) < 0 && errno == EAFNOSUPPORT);
+
+    stream_semantics();
+    datagram_semantics();
 
     printf("nettest: %s\n", failures ? "FAILED" : "all passed");
     return failures;
