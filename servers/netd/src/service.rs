@@ -50,8 +50,9 @@
 //! (up to `TCP_MAX`) while they are what limits the transfer: the receive
 //! buffer when the peer fills half of it or more between two rounds and
 //! the client keeps up, the send buffer when the network took half of it
-//! and the client's ring holds more than it takes. Under pressure (half
-//! of `BUDGET` in use, as Linux's tcp_mem) connections start with
+//! and the client's ring holds more than it takes. Under pressure (less
+//! than `PRESSURE_ROOM` of room left for the instance, as Linux's
+//! tcp_mem, but per instance) its connections start with
 //! `TCP_MIN`, grow no further than the first sizes, and one idle for
 //! `TRIM_AFTER` gives its empty send buffer back (`trim`; its receive
 //! buffer only as far as the window it announced allows: the right edge
@@ -106,8 +107,9 @@ const DEFAULT_TTL: u8 = 64;
 /// The bytes of smoltcp's socket buffers (and leftovers) netd keeps at
 /// most, in mappings of their own (`Region`).
 const BUDGET: usize = 32 << 20;
-/// Beyond this much of it, memory is under pressure (`pressure`).
-const PRESSURE: usize = BUDGET / 2;
+/// With less room than this left for an instance, its memory is under
+/// pressure (`pressure`).
+const PRESSURE_ROOM: usize = BUDGET / 8;
 /// Under pressure, a connection idle this long gives its buffers back
 /// (`trim`).
 const TRIM_AFTER: Duration = Duration::from_millis(500);
@@ -162,9 +164,12 @@ const CHANNEL_IDLE: Duration = Duration::from_secs(10);
 /// statics.
 static ISN_KEY: [core::sync::atomic::AtomicU64; 2] = [const { core::sync::atomic::AtomicU64::new(0) }; 2];
 static PORT_KEY: [core::sync::atomic::AtomicU64; 2] = [const { core::sync::atomic::AtomicU64::new(0) }; 2];
+static PORT_TABLE_KEY: [core::sync::atomic::AtomicU64; 2] = [const { core::sync::atomic::AtomicU64::new(0) }; 2];
+/// The counters of RFC 6056's fourth algorithm (`Service::ephemeral`).
+const PORT_TABLE: usize = 1024;
 
 pub fn init_secrets() {
-    for key in [&ISN_KEY, &PORT_KEY] {
+    for key in [&ISN_KEY, &PORT_KEY, &PORT_TABLE_KEY] {
         let mut b = [0u8; 16];
         oxrt::getrandom(&mut b);
         key[0].store(u64::from_le_bytes(b[..8].try_into().expect("8 bytes")), SeqCst);
@@ -196,7 +201,9 @@ pub fn isn(local: IpEndpoint, remote: IpEndpoint, now: Instant) -> u32 {
 /// A B-tree map of `entries` entries of `entry` bytes, at worst (nodes
 /// half full, and their headers).
 const fn btree(entries: usize, entry: usize) -> usize {
-    entries * (2 * entry + 16) + 4096
+    // Leaves at least 45 % full (B = 6: 5 of 11 entries) and the internal
+    // nodes above them (a sixth more), with their headers and edges.
+    entries * (entry * 9 / 4 + 32) + entries / 5 * 96 + 4096
 }
 
 /// What netd's heap holds at most, from the limits (every one of them is a
@@ -224,11 +231,17 @@ pub const HEAP_WORST: usize = {
     let owners = 2 * MAX_SMOLTCP * size_of::<(u16, u64)>();
     // Echo identifiers: `netring::ECHO_PER_OWNER` for each instance with a
     // channel, in two maps; the budgets' owners.
-    let echo = 2 * btree(netring::ECHO_PER_OWNER * MAX_CHANNELS, 32) + 5 * btree(MAX_CHANNELS, 32);
+    let echo = 2 * btree(netring::ECHO_PER_OWNER * MAX_CHANNELS, 32);
+    // The budgets' instances: each holds something or has a channel, so
+    // no more than sockets and channels (gone instances included).
+    let budgets = 5 * btree(MAX_SMOLTCP + MAX_CHANNELS, 32);
+    // The listeners' backlogs (no more handles than sockets: shrunk to
+    // what they hold), a round's sockets that finished closing.
+    let lists = 2 * MAX_SMOLTCP * size_of::<SocketHandle>() + MAX_CHANNELS * 64;
     // Frames: the loopback queue (twice `MAX_LOOPED` at most), one received,
     // the datagram scratch, a LINKS answer.
     let frames = (2 * 64 + 1) * (crate::virtio_net::MTU + 32) + if MAX_UDP > RAW_BUFFER { MAX_UDP } else { RAW_BUFFER } + 4096;
-    set + datagram + chans + closing + per_socket + owners + echo + frames
+    set + datagram + chans + closing + per_socket + owners + echo + budgets + lists + frames
 };
 
 /// netd's heap: the worst case with a quarter more for the allocator's
@@ -574,9 +587,9 @@ pub struct Service {
     closing: Vec<Closing>,
     /// netd's random numbers (seeded from the kernel's generator).
     rng: csprng::ChaCha,
-    /// RFC 6056's counter (`ephemeral`), and the ports in use as it finds
-    /// them (one bit per ephemeral port).
-    port_counter: u32,
+    /// RFC 6056's table of counters (`ephemeral`), and the ports in use as
+    /// it finds them (one bit per ephemeral port).
+    port_table: [u32; PORT_TABLE],
     port_scratch: [u64; 256],
     /// Who holds which port, for routing ICMP errors (`icmp_ports`; made
     /// room for at the start).
@@ -651,19 +664,19 @@ impl Service {
                 oxrt::getrandom(&mut seed);
                 csprng::ChaCha::new(seed)
             },
-            port_counter: 0,
+            port_table: [0; PORT_TABLE],
             port_scratch: [0; 256],
             tcp_owners: Vec::with_capacity(MAX_SMOLTCP),
             udp_owners: Vec::with_capacity(MAX_SMOLTCP),
-            bytes: Budget::new(BUDGET, BUDGET / RESERVED_INSTANCES, BUDGET),
-            socks: Budget::new(MAX_SMOLTCP, MAX_SMOLTCP / RESERVED_INSTANCES, MAX_SMOLTCP),
-            orphans: Budget::new(MAX_ORPHANS, MAX_ORPHANS / RESERVED_INSTANCES, MAX_ORPHANS),
+            bytes: Budget::new(BUDGET, BUDGET / RESERVED_INSTANCES, BUDGET).for_instances(MAX_CHANNELS),
+            socks: Budget::new(MAX_SMOLTCP, MAX_SMOLTCP / RESERVED_INSTANCES, MAX_SMOLTCP).for_instances(MAX_CHANNELS),
+            orphans: Budget::new(MAX_ORPHANS, MAX_ORPHANS / RESERVED_INSTANCES, MAX_ORPHANS).for_instances(MAX_CHANNELS),
             channels: Budget::new(MAX_CHANNELS, 0, INSTANCE_CHANNELS),
             mem: BTreeMap::new(),
             wants: Vec::new(),
             echo: EchoIds::default(),
             half_open: BTreeMap::new(),
-            half_open_budget: Budget::new(MAX_HALF_OPEN, MAX_HALF_OPEN / RESERVED_INSTANCES, MAX_HALF_OPEN / 2),
+            half_open_budget: Budget::new(MAX_HALF_OPEN, MAX_HALF_OPEN / RESERVED_INSTANCES, MAX_HALF_OPEN / 2).for_instances(MAX_CHANNELS),
             brief: false,
             scratch: vec![0; MAX_UDP.max(RAW_BUFFER)],
             config: Config::default(),
@@ -861,6 +874,11 @@ impl Service {
             // Its echo identifiers are free again.
             self.echo.forget(chan.owner);
         }
+    }
+
+    /// The instance of channel `c`.
+    fn owner(&self, c: usize) -> u64 {
+        self.chans[c].as_ref().expect("a channel in use").owner
     }
 
     fn chan(&mut self, c: usize) -> &mut Chan {
@@ -1173,16 +1191,18 @@ impl Service {
         conflict
     }
 
-    /// A free ephemeral port: held by no TCP socket, or bound by no UDP one.
-    /// For a connection to `remote`, RFC 6056's third algorithm: a keyed
-    /// hash of the destination (`PORT_KEY`, secret) gives where the search
-    /// starts and a counter moves it on, so ports are unpredictable to
-    /// anyone (on the network or in another instance) and successive
-    /// connections to one destination do not reuse a port soon; for a bind
-    /// to port 0 (no destination yet), a random start (its first
+    /// A free ephemeral port for instance `owner`: held by no TCP socket,
+    /// or bound by no UDP one. For a connection to `remote`, RFC 6056's
+    /// fourth algorithm: a keyed hash of the destination (`PORT_KEY`)
+    /// gives where the search starts, and a counter moves it on, one of a
+    /// table chosen by a second keyed hash (`PORT_TABLE_KEY`) of the
+    /// instance and the destination, so ports are unpredictable to anyone,
+    /// successive connections to one destination do not reuse a port soon,
+    /// and no counter tells one instance about another's connections; for
+    /// a bind to port 0 (no destination yet), a random start (its first
     /// algorithm). The ports in use are marked in a bitmap kept for this
     /// (no allocation).
-    fn ephemeral(&mut self, tcp: bool, remote: Option<IpEndpoint>, sockets: &SocketSet<'static>) -> Result<u16, i64> {
+    fn ephemeral(&mut self, owner: u64, tcp: bool, remote: Option<IpEndpoint>, sockets: &SocketSet<'static>) -> Result<u16, i64> {
         let mut used = core::mem::replace(&mut self.port_scratch, [0; 256]);
         used.fill(0);
         self.for_each_holder(tcp, sockets, None, |h| {
@@ -1193,12 +1213,7 @@ impl Service {
         const RANGE: u32 = (u16::MAX - FIRST_EPHEMERAL) as u32 + 1;
         let start = match remote {
             Some(r) => {
-                let mut data = [0u8; 7];
-                data[..4].copy_from_slice(&bits(r.addr).to_be_bytes());
-                data[4..6].copy_from_slice(&r.port.to_be_bytes());
-                data[6] = tcp as u8;
-                self.port_counter = self.port_counter.wrapping_add(1);
-                (csprng::siphash(&secret(&PORT_KEY), &data) as u32).wrapping_add(self.port_counter)
+                netring::port_start(&secret(&PORT_KEY), &secret(&PORT_TABLE_KEY), &mut self.port_table, owner, bits(r.addr), r.port, tcp)
             }
             None => self.rng.u64() as u32,
         };
@@ -1221,7 +1236,7 @@ impl Service {
             Proto::Raw { .. } => return done(0),
         };
         let port = match at.port {
-            0 => self.ephemeral(is_tcp, None, sockets)?,
+            0 => self.ephemeral(self.owner(c), is_tcp, None, sockets)?,
             p if self.conflict(is_tcp, c, sock, p, addr, reuse, sockets) => return Err(EADDRINUSE),
             p => p,
         };
@@ -1261,7 +1276,7 @@ impl Service {
                 return Err(EADDRINUSE);
             }
         }
-        let port = if bound.is_none() { Some(self.ephemeral(true, None, sockets)?) } else { None };
+        let port = if bound.is_none() { Some(self.ephemeral(self.owner(c), true, None, sockets)?) } else { None };
         // The backlog's sockets beside the socket's own, as many as the
         // budget allows (a smaller backlog if it is short). They cost only
         // their place until a connection arrives.
@@ -1276,6 +1291,9 @@ impl Service {
                 Err(_) => break,
             }
         }
+        // (No more room than its sockets: the heap's worst case counts
+        // handles, not what was asked for.)
+        set.shrink_to_fit();
         let Proto::Tcp(t) = &mut self.sock(c, sock)?.proto else { unreachable!("checked above") };
         if let Some(port) = port {
             t.local = Some(IpListenEndpoint { addr: None, port });
@@ -1345,7 +1363,7 @@ impl Service {
                         l
                     }
                     // (An ephemeral port is held by no TCP socket at all.)
-                    None => IpListenEndpoint { addr: None, port: self.ephemeral(true, Some(remote), sockets)? },
+                    None => IpListenEndpoint { addr: None, port: self.ephemeral(self.owner(c), true, Some(remote), sockets)? },
                 };
                 // Its buffers come now (the SYN announces the window).
                 self.equip(handle, sockets)?;
@@ -1380,7 +1398,7 @@ impl Service {
                     return Err(EINVAL);
                 }
                 if peer.is_some() && !sockets.get::<udp::Socket>(handle).is_open() {
-                    let port = self.ephemeral(false, peer, sockets)?;
+                    let port = self.ephemeral(self.owner(c), false, peer, sockets)?;
                     sockets.get_mut::<udp::Socket>(handle).bind(port).map_err(|_| EADDRINUSE)?;
                 }
                 if let Proto::Udp { peer: p, .. } = &mut self.sock(c, sock)?.proto {
@@ -1501,7 +1519,7 @@ impl Service {
                 return Err(ENETUNREACH);
             }
             if !sockets.get::<udp::Socket>(handle).is_open() {
-                let port = self.ephemeral(false, Some(dest), sockets)?;
+                let port = self.ephemeral(self.owner(c), false, Some(dest), sockets)?;
                 sockets.get_mut::<udp::Socket>(handle).bind(port).map_err(|_| EADDRINUSE)?;
             }
             let socket = sockets.get_mut::<udp::Socket>(handle);
@@ -1773,9 +1791,10 @@ impl Service {
         let mut progress = self.finish_closing(sockets);
         let mut wants = core::mem::take(&mut self.wants);
         let icmp = self.icmp_ports(sockets).then_some(IcmpOwners { echo: &self.echo, tcp: &self.tcp_owners, udp: &self.udp_owners });
-        let mut round = Round { now: crate::now(), trimming: pressure(&self.bytes), owner: 0, icmp };
+        let mut round = Round { now: crate::now(), trimming: false, owner: 0, icmp };
         for chan in self.chans.iter_mut().flatten() {
             round.owner = chan.owner;
+            round.trimming = pressure(&self.bytes, chan.owner);
             for (&i, s) in chan.socks.iter_mut() {
                 let ctl = chan.area.ctl(i as usize).expect("an index below MAX_SOCKETS");
                 let rings = Self::rings(&chan.grants, s.area);
@@ -1901,7 +1920,7 @@ impl Service {
                 tcp::State::SynReceived => {}
                 _ if sk.send_capacity() == 0 => {
                     // Completed: its first sizes.
-                    let rx = first_size(bytes, Way::Rx);
+                    let rx = first_size(bytes, owner, Way::Rx);
                     if sk.recv_capacity() < rx {
                         resize(mem, bytes, h, Way::Rx, rx, sockets);
                     }
@@ -1944,12 +1963,15 @@ impl Service {
                 // sends again (RFC 9293): a peer that keeps sending FINs
                 // would keep it forever. It goes after `TIME_WAIT_MAX` in
                 // all, silently (out of smoltcp: nothing more is sent).
+                // A connection of an instance with no room for another
+                // socket skips TIME-WAIT as it enters it (closed at once, as
+                // Linux beyond tcp_max_tw_buckets): TIME-WAIT never keeps
+                // it from opening connections. Those already in TIME-WAIT
+                // stay (`recycle_time_wait` takes the oldest when one is
+                // needed).
+                let entering = cl.time_wait.is_none();
                 let since = *cl.time_wait.get_or_insert(now);
-                // An instance with no room for another socket skips
-                // TIME-WAIT (closed at once, as Linux beyond
-                // tcp_max_tw_buckets): TIME-WAIT never keeps it from
-                // opening connections.
-                if now >= since + TIME_WAIT_MAX || socks.room(cl.owner) == 0 {
+                if now >= since + TIME_WAIT_MAX || (entering && socks.room(cl.owner) == 0) {
                     done.push(cl.handle);
                     progress = true;
                     return false;
@@ -2413,18 +2435,24 @@ fn place_record(tail: &mut u32, wait: &mut bool, ctl: &Ctl, r: &Rings, len: u32,
     Ok(Placed::Yes)
 }
 
-/// Whether netd's buffer memory is under pressure (as Linux's tcp_mem):
-/// connections then start with `TCP_MIN`, grow no further than their
+/// Whether instance `owner`'s buffer memory is under pressure (as Linux's
+/// tcp_mem, but per instance: little of what it may take is left):
+/// its connections then start with `TCP_MIN`, grow no further than their
 /// first sizes, and idle ones give their buffers back (`trim`).
-fn pressure(bytes: &Budget) -> bool {
-    bytes.used() >= PRESSURE
+fn pressure(bytes: &Budget, owner: u64) -> bool {
+    bytes.room(owner) < PRESSURE_ROOM
+}
+
+/// The instance socket `h`'s memory is charged to.
+fn owner_of(mem: &BTreeMap<SocketHandle, Mem>, h: SocketHandle) -> u64 {
+    mem.get(&h).map_or(0, |m| m.owner)
 }
 
 /// A TCP buffer's first size: Linux's (`TCP_RX_INIT`, `TCP_TX_INIT`), or
-/// `TCP_MIN` under pressure.
-fn first_size(bytes: &Budget, way: Way) -> usize {
+/// `TCP_MIN` under its instance's pressure.
+fn first_size(bytes: &Budget, owner: u64, way: Way) -> usize {
     match way {
-        _ if pressure(bytes) => TCP_MIN,
+        _ if pressure(bytes, owner) => TCP_MIN,
         Way::Rx => TCP_RX_INIT,
         Way::Tx => TCP_TX_INIT,
     }
@@ -2439,12 +2467,13 @@ fn capacity(socket: &tcp::Socket, way: Way) -> usize {
 /// first size), up to `TCP_MAX`, under pressure up to Linux's first sizes.
 fn grow(mem: &mut BTreeMap<SocketHandle, Mem>, bytes: &mut Budget, h: SocketHandle, way: Way, sockets: &mut SocketSet<'static>) -> bool {
     let old = capacity(sockets.get::<tcp::Socket>(h), way);
+    let owner = owner_of(mem, h);
     let most = match way {
-        _ if !pressure(bytes) => TCP_MAX,
+        _ if !pressure(bytes, owner) => TCP_MAX,
         Way::Rx => TCP_RX_INIT,
         Way::Tx => TCP_TX_INIT,
     };
-    let new = if old == 0 { first_size(bytes, way) } else { (old * 2).min(most) };
+    let new = if old == 0 { first_size(bytes, owner, way) } else { (old * 2).min(most) };
     new > old && resize(mem, bytes, h, way, new, sockets)
 }
 
@@ -2455,7 +2484,7 @@ fn equip(mem: &mut BTreeMap<SocketHandle, Mem>, bytes: &mut Budget, h: SocketHan
         if capacity(sockets.get::<tcp::Socket>(h), way) > 0 {
             continue;
         }
-        let mut size = first_size(bytes, way);
+        let mut size = first_size(bytes, owner_of(mem, h), way);
         while !resize(mem, bytes, h, way, size, sockets) {
             if size <= TCP_MIN {
                 return Err(ENOBUFS);

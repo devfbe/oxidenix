@@ -468,6 +468,7 @@ version = "0.1.0"
 name = "netring"
 version = "0.1.0"
 dependencies = [
+ "csprng",
  "ring",
 ]
 

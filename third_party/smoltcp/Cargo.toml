@@ -11,6 +11,10 @@
 #   (ETIMEDOUT) rather than by a reset.
 # - `Interface::set_isn_generator`: TCP's initial sequence numbers from a function of the
 #   4-tuple and the time (netd's RFC 6528 ones) instead of the interface's PRNG.
+# - A new connection's SYN beyond what a TIME-WAIT connection of its 4-tuple received ends
+#   that TIME-WAIT, so a listener takes it (RFC 9293 3.10.7.4, RFC 6191).
+# - A reset in SYN-RECEIVED leaves a fresh listener (`reset`, as `listen` does), not one
+#   that keeps the refused connection's window and receive state.
 # - The window a SYN announced is remembered in scaled units like every other segment's
 #   (a fix: else a receive buffer that grows before the first data is never announced).
 # Its own workspace, so that its tests run on the host:

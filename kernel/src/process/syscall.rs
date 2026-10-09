@@ -499,7 +499,9 @@ fn prlimit(resource: u64, old: u64) -> SysResult {
 /// unknown flags, and GRND_INSECURE with GRND_RANDOM, are EINVAL. The
 /// bytes are made in pieces with the generator's lock released before
 /// each copy to the program (a fault may sleep); a fault after some bytes
-/// returns how many were copied.
+/// returns how many were copied. Between pieces a long request lets other
+/// tasks run and ends early with what it made for a signal (Linux checks
+/// after each 256 bytes too; the first piece always comes).
 fn getrandom(buf: u64, len: u64, flags: u64) -> SysResult {
     const GRND_NONBLOCK: u64 = 1;
     const GRND_RANDOM: u64 = 2;
@@ -512,6 +514,15 @@ fn getrandom(buf: u64, len: u64, flags: u64) -> SysResult {
     let mut done = 0u64;
     let mut piece = [0u8; 256];
     while done < len {
+        if done > 0 {
+            // A long request lets others run, and ends early for a signal
+            // (as Linux beyond 256 bytes: what was made so far, or EINTR).
+            super::sched::cond_resched();
+            if super::signal::interrupted() {
+                piece.fill(0);
+                return Ok(done as i64);
+            }
+        }
         let n = (len - done).min(piece.len() as u64) as usize;
         crate::random::fill(&mut piece[..n]);
         if let Err(e) = uaccess::copy_to(buf + done, &piece[..n]) {
