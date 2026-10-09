@@ -169,6 +169,35 @@ pub struct OpenFile {
     /// The Linux server's handles on it that are descriptors in flight
     /// (`restricted::KFILE_INFLIGHT`).
     pub in_flight: AtomicUsize,
+    /// References being let go of through `release` right now.
+    releasing: AtomicUsize,
+}
+
+/// Lets go of a descriptor's (or a pin's) reference to `file`. If it is
+/// one of the Linux server's placeholders with descriptors in flight and,
+/// with the reference gone, nothing but those keeps it (a candidate for the
+/// server's collector, as Linux's unix_gc looks for files whose only
+/// references are in flight), its owner is told: after the reference went,
+/// so that the collector sees it gone. References other `release`s are
+/// letting go of count as gone (`releasing`), so of concurrent ones at
+/// least one tells; one told for nothing costs a collection.
+pub fn release(file: Arc<OpenFile>) {
+    if file.in_flight.load(Ordering::Acquire) == 0 || !matches!(file.kind, Kind::Server(_)) {
+        return;
+    }
+    file.releasing.fetch_add(1, Ordering::AcqRel);
+    let weak = Arc::downgrade(&file);
+    drop(file);
+    // Gone altogether: its owner hears of it as closed.
+    let Some(file) = weak.upgrade() else { return };
+    let others = Arc::strong_count(&file).saturating_sub(file.releasing.load(Ordering::Acquire));
+    let candidate = others <= file.in_flight.load(Ordering::Acquire);
+    file.releasing.fetch_sub(1, Ordering::AcqRel);
+    if candidate {
+        if let Kind::Server(s) = &file.kind {
+            s.in_flight_reference_gone();
+        }
+    }
 }
 
 impl OpenFile {
@@ -186,22 +215,12 @@ impl OpenFile {
             watchers: spin::Mutex::new(Vec::new()),
             _write_access: write_access,
             in_flight: AtomicUsize::new(0),
+            releasing: AtomicUsize::new(0),
         })
     }
 
     /// An open inode; `write_access` for a regular file opened for
     /// writing (see `Inode::get_write_access`).
-    /// A descriptor (or the server's pin) of it is going: if it is one of
-    /// the server's placeholders with references in flight, the server is
-    /// told.
-    pub fn reference_gone(&self) {
-        if self.in_flight.load(Ordering::Acquire) > 0 {
-            if let Kind::Server(s) = &self.kind {
-                s.in_flight_reference_gone();
-            }
-        }
-    }
-
     pub fn inode_file(inode: Arc<Inode>, flags: u32, path: String, write_access: Option<super::WriteAccess>) -> Arc<OpenFile> {
         Self::with_access(Kind::Inode(inode), flags, Some(path), write_access)
     }

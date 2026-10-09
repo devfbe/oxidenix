@@ -82,7 +82,7 @@ pub fn closed(id: u64) {
             sock.release();
             // It may have been the last way into sockets in flight.
             if crate::scm::sockets_in_flight() {
-                crate::scm::collect();
+                crate::scm::request();
             }
         }
         _ => {}

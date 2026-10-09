@@ -24,10 +24,24 @@
 //! their queues are emptied, which closes the handles and with them the
 //! sockets.
 //!
-//! The collector runs when the kernel reports a reference to a socket in
-//! flight gone (`EVENT_INFLIGHT`: a descriptor closed, also by exit or
-//! exec, or a call that pinned it ended), when a socket closes, and before
-//! a sender is refused for having too many descriptors in flight.
+//! The collector runs on the instance's worker thread (`worker`), asked by
+//! `request`: when the kernel reports that a socket in flight has no
+//! reference left but its handles in flight (`EVENT_INFLIGHT`: a
+//! descriptor closed, also by exit or exec, or a call that pinned it ended;
+//! as Linux's unix_gc looks when a file's references are all in flight),
+//! and when a socket closes; requests that come while it runs make one
+//! more run. Never on the pager: the collector waits for sockets' locks,
+//! and the pager must stay free to bring the pages whose faults a holder of
+//! such a lock may wait for. It also runs on the sender's own thread before
+//! a sender is refused for too many descriptors in flight.
+//!
+//! Bounds: descriptors in flight are handles in the instance's table
+//! (`restricted`'s 64 Ki, which mappings and files need too). At most
+//! `MAX_INFLIGHT` are in flight in the instance, and each user may have at
+//! most `MAX_PER_USER` (Linux's per-user too_many_unix_fds; everyone is
+//! root here, so that is the instance's bound again). A user's charge goes
+//! with the descriptor, whoever then holds it, so neither forks nor pid
+//! reuse change it.
 //!
 //! Consistency: what the collector looks at holds still while it runs.
 //! `GC` is a reader-writer lock: making a descriptor in flight, installing
@@ -48,33 +62,60 @@ use crate::unix::{Cred, Sock};
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU32, Ordering};
 use restricted::*;
 
 const ETOOMANYREFS: i64 = 109;
 
-/// Most descriptors one process may have in flight (Linux bounds a user's
-/// by RLIMIT_NOFILE); the instance's handle table bounds them all.
-const MAX_PER_SENDER: usize = 16 * 1024;
+/// Most descriptors in flight in the instance: a quarter of its handle
+/// table, the rest is for everything else.
+const MAX_INFLIGHT: usize = 16 * 1024;
+/// Most descriptors one user may have in flight.
+const MAX_PER_USER: usize = 16 * 1024;
 
 /// A descriptor in flight.
 pub struct Passed {
     handle: u64,
     /// The server's socket it is, if it is one (for the collector).
     sock: Option<Arc<Sock>>,
-    /// The process charged for it.
-    sender: u32,
+    /// The user charged for it.
+    user: u32,
 }
 
 /// The sockets in flight: for each (by its file id), the socket and the
-/// handles of the descriptors in flight that name it; and how many each
-/// process has in flight.
+/// handles of the descriptors in flight that name it; how many descriptors
+/// are in flight, and how many of each user.
 struct Inflight {
     sockets: BTreeMap<u64, (Arc<Sock>, BTreeSet<u64>)>,
-    senders: BTreeMap<u32, usize>,
+    total: usize,
+    users: BTreeMap<u32, usize>,
 }
 
 static GC: RwLock = RwLock::new();
-static INFLIGHT: Mutex<Inflight> = Mutex::new(Inflight { sockets: BTreeMap::new(), senders: BTreeMap::new() });
+static INFLIGHT: Mutex<Inflight> = Mutex::new(Inflight { sockets: BTreeMap::new(), total: 0, users: BTreeMap::new() });
+
+/// Collections asked for and done (futex words of the worker).
+static REQUESTED: AtomicU32 = AtomicU32::new(0);
+
+/// Asks the worker to collect (it coalesces requests).
+pub fn request() {
+    REQUESTED.fetch_add(1, Ordering::Release);
+    syscall(SYS_SERVER_FUTEX_WAKE, [&REQUESTED as *const AtomicU32 as u64, 1, 0, 0, 0, 0]);
+}
+
+/// The worker thread: collects whenever asked.
+pub fn worker() -> ! {
+    let mut done = 0;
+    loop {
+        let asked = REQUESTED.load(Ordering::Acquire);
+        if asked != done {
+            done = asked;
+            collect();
+            continue;
+        }
+        syscall(SYS_SERVER_FUTEX_WAIT, [&REQUESTED as *const AtomicU32 as u64, asked as u64, 0, 0, 0, 0]);
+    }
+}
 
 /// Holds the collector off (see the module comment): for MSG_PEEK's
 /// copies, which are installed under a socket's lock.
@@ -82,46 +123,48 @@ pub fn hold() -> ReadGuard<'static> {
     GC.read()
 }
 
-/// Charges one more descriptor in flight to `sender`, unless it has its
-/// limit; false then.
-fn charge(sender: u32) -> bool {
+/// Charges one more descriptor in flight to `user` and the instance,
+/// unless either is at its bound; false then.
+fn charge(user: u32) -> bool {
     let mut gc = INFLIGHT.lock();
-    let n = gc.senders.entry(sender).or_insert(0);
-    if *n >= MAX_PER_SENDER {
+    if gc.total >= MAX_INFLIGHT || gc.users.get(&user).is_some_and(|&n| n >= MAX_PER_USER) {
         return false;
     }
-    *n += 1;
+    gc.total += 1;
+    *gc.users.entry(user).or_insert(0) += 1;
     true
 }
 
-fn uncharge(gc: &mut Inflight, sender: u32) {
-    if let Some(n) = gc.senders.get_mut(&sender) {
+fn uncharge(gc: &mut Inflight, user: u32) {
+    gc.total -= 1;
+    if let Some(n) = gc.users.get_mut(&user) {
         *n -= 1;
         if *n == 0 {
-            gc.senders.remove(&sender);
+            gc.users.remove(&user);
         }
     }
 }
 
 impl Passed {
     /// Descriptor `fd` of the calling process, to send (EBADF; ETOOMANYREFS
-    /// when the caller has too many in flight even after collecting).
+    /// when too many are in flight even after collecting).
     pub fn take(fd: i32) -> Result<Passed, i64> {
         if fd < 0 {
             return Err(files::EBADF);
         }
-        let sender = Cred::current().pid;
-        if !charge(sender) {
-            // Linux's wait_for_unix_gc: garbage may hold them.
+        let user = Cred::current().uid;
+        if !charge(user) {
+            // Linux's wait_for_unix_gc: garbage may hold them. (On this
+            // thread, which brings no pages.)
             collect();
-            if !charge(sender) {
+            if !charge(user) {
                 return Err(ETOOMANYREFS);
             }
         }
         let _gc = GC.read();
         let handle = syscall(SYS_KFILE_OBJECT, [fd as u64, KFILE_INFLIGHT, 0, 0, 0, 0]);
         if handle < 0 {
-            uncharge(&mut INFLIGHT.lock(), sender);
+            uncharge(&mut INFLIGHT.lock(), user);
             return Err(-handle);
         }
         let handle = handle as u64;
@@ -135,7 +178,7 @@ impl Passed {
         if let Some(s) = &sock {
             INFLIGHT.lock().sockets.entry(id).or_insert_with(|| (s.clone(), BTreeSet::new())).1.insert(handle);
         }
-        Ok(Passed { handle, sock, sender })
+        Ok(Passed { handle, sock, user })
     }
 
     /// A descriptor of the calling process for it (close-on-exec with
@@ -174,7 +217,7 @@ impl Drop for Passed {
                 }
             }
         }
-        uncharge(&mut gc, self.sender);
+        uncharge(&mut gc, self.user);
         drop(gc);
         syscall(SYS_HANDLE_CLOSE, [self.handle, 0, 0, 0, 0, 0]);
     }

@@ -910,8 +910,11 @@ pub struct LinuxThread {
     state: PhysFrame,
     /// Running the program (true) or the server.
     pub restricted: bool,
-    /// The instance's pager thread, which serves no program.
+    /// A service thread of the instance (the pager or the worker), which
+    /// serves no program.
     pager: bool,
+    /// The pager, which takes the instance's events.
+    events: bool,
     /// The server waits in `legacy_syscall`: the kernel runs the call in
     /// the program's view.
     in_legacy: bool,
@@ -944,9 +947,20 @@ impl LinuxThread {
     pub fn new(instance: Arc<Instance>, program: &Frame) -> Result<(LinuxThread, Frame), i64> {
         let (slot, state) = instance.thread()?;
         let thread =
-            LinuxThread { instance, slot, state, restricted: false, pager: false, in_legacy: false, trap_nr: None, closed_now: Vec::new(), pinned: Vec::new(), fs_child: None, exec_target: None, normal: Frame::default() };
+            LinuxThread { instance, slot, state, restricted: false, pager: false, events: false, in_legacy: false, trap_nr: None, closed_now: Vec::new(), pinned: Vec::new(), fs_child: None, exec_target: None, normal: Frame::default() };
         save(program, thread.state());
         let start = thread.start(ROLE_PROGRAM);
+        Ok((thread, start))
+    }
+
+    /// The worker thread of `instance` (a second service thread, in the
+    /// pager's process, that serves no program and no page: the server's
+    /// collector of sockets in flight runs there), and its frame.
+    pub fn worker(instance: Arc<Instance>) -> Result<(LinuxThread, Frame), i64> {
+        let (slot, state) = instance.thread()?;
+        let thread =
+            LinuxThread { instance, slot, state, restricted: false, pager: true, events: false, in_legacy: false, trap_nr: None, closed_now: Vec::new(), pinned: Vec::new(), fs_child: None, exec_target: None, normal: Frame::default() };
+        let start = thread.start(ROLE_WORKER);
         Ok((thread, start))
     }
 
@@ -954,7 +968,7 @@ impl LinuxThread {
     pub fn pager(instance: Arc<Instance>) -> Result<(LinuxThread, Frame), i64> {
         let (slot, state) = instance.thread()?;
         let thread =
-            LinuxThread { instance, slot, state, restricted: false, pager: true, in_legacy: false, trap_nr: None, closed_now: Vec::new(), pinned: Vec::new(), fs_child: None, exec_target: None, normal: Frame::default() };
+            LinuxThread { instance, slot, state, restricted: false, pager: true, events: true, in_legacy: false, trap_nr: None, closed_now: Vec::new(), pinned: Vec::new(), fs_child: None, exec_target: None, normal: Frame::default() };
         let start = thread.start(ROLE_PAGER);
         Ok((thread, start))
     }
@@ -986,8 +1000,12 @@ impl Drop for LinuxThread {
         for id in core::mem::take(&mut self.closed_now) {
             self.instance.queue_closed(id);
         }
-        if self.pager {
+        if self.events {
             self.instance.pager_gone();
+        }
+        // Pins of a call that never returned.
+        for file in core::mem::take(&mut self.pinned) {
+            crate::fs::file::release(file);
         }
         self.instance.release(self.slot);
     }
@@ -1058,6 +1076,11 @@ pub fn in_server() -> bool {
 /// Whether the calling thread is a Linux server instance's pager thread.
 pub fn is_pager() -> bool {
     with_current(|p| p.linux.as_ref().is_some_and(|l| l.pager))
+}
+
+/// Whether the caller is the instance's pager, which takes its events.
+fn owns_events() -> bool {
+    with_current(|p| p.linux.as_ref().is_some_and(|l| l.events))
 }
 
 fn instance() -> Result<Arc<Instance>, i64> {
@@ -1184,7 +1207,7 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             Ok(0)
         }
         SYS_SYNC_DONE => {
-            if !is_pager() {
+            if !owns_events() {
                 return Err(EPERM);
             }
             let mut q = instance.pager.lock();
@@ -1218,16 +1241,17 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
                 super::uaccess::copy_to_server(a[1], &flags.to_le_bytes())?;
             }
             let id = s.id as i64;
-            // Pinned for the rest of the call (not the service thread's,
-            // which serves no call).
+            // Pinned for the rest of the call (not a service thread's,
+            // which serves no call). A pin that cannot be kept fails the
+            // lookup: an unpinned file could go under the call.
             with_current(|p| match p.linux.as_mut() {
                 Some(l) if !l.pager => {
-                    if l.pinned.try_reserve(1).is_ok() {
-                        l.pinned.push(file.clone());
-                    }
+                    l.pinned.try_reserve(1).map_err(|_| ENOMEM)?;
+                    l.pinned.push(file.clone());
+                    Ok::<(), i64>(())
                 }
-                _ => {}
-            });
+                _ => Ok(()),
+            })?;
             Ok(id)
         }
         SYS_KFD_READY => {
@@ -1723,7 +1747,7 @@ pub fn enter(f: &mut Frame) -> Result<Option<u64>, i64> {
     .map(|(handled, pinned)| {
         // The call is done with its files.
         for file in pinned {
-            file.reference_gone();
+            crate::fs::file::release(file);
         }
         handled
     })
@@ -1802,7 +1826,7 @@ fn set_legacy(on: bool) {
 /// the tree has no program left: `EVENT_CLOSING` once, then None (the
 /// service thread's process ends).
 fn event_wait(instance: &Arc<Instance>, out: u64, deadline: u64) -> Option<SysResult> {
-    if !is_pager() {
+    if !owns_events() {
         return Some(Err(EPERM));
     }
     loop {

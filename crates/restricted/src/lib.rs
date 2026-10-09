@@ -149,8 +149,9 @@ pub const SYS_VM_SYNC: u64 = 1028;
 /// it is (a file of the kernel's or a placeholder of the server's), alive
 /// while it is in flight. With `KFILE_INFLIGHT` the handle is such a
 /// descriptor in flight (it cannot be mapped): while one of a placeholder
-/// is, every descriptor of it that goes and the end of every call that
-/// looked it up (`kfd_lookup`) queue `EVENT_INFLIGHT`.
+/// is, a descriptor of it that goes or the end of a call that looked it up
+/// (`kfd_lookup`) queues `EVENT_INFLIGHT` when nothing but such handles is
+/// left.
 pub const SYS_KFILE_OBJECT: u64 = 1029;
 pub const KFILE_INFLIGHT: u64 = 1;
 
@@ -231,16 +232,21 @@ pub const EVENT_SYNC: u64 = 8;
 /// disk space is not secured (`a` key, `b` byte offset of the page): the
 /// server promises it and answers with `mo_backed`.
 pub const EVENT_MKWRITE: u64 = 9;
-/// A reference to one of the server's files with descriptors in flight
-/// (`KFILE_INFLIGHT`) went: sockets may be left that only messages in
-/// flight keep, for the server's collector to find. One is queued at a
-/// time.
+/// One of the server's files with descriptors in flight (`KFILE_INFLIGHT`)
+/// lost a reference and has nothing but those left (told after the
+/// reference is gone): sockets may be left that only messages in flight
+/// keep, for the server's collector to find. One is queued at a time.
 pub const EVENT_INFLIGHT: u64 = 10;
 
 /// A server thread starts with its role in `rsi` (and its `State` in
-/// `rdi`): it serves a program's thread, or it is the instance's pager.
+/// `rdi`): it serves a program's thread, or it is the instance's pager, or
+/// its worker: a second thread of the pager's process that serves neither
+/// a program nor a page (it may wait for locks a thread copying to or
+/// from program memory holds, which the pager never may), and ends with
+/// the pager's process.
 pub const ROLE_PROGRAM: u64 = 0;
 pub const ROLE_PAGER: u64 = 1;
+pub const ROLE_WORKER: u64 = 2;
 
 /// `(addr)`: a 4-page paged object mapped shared and readable at `addr`;
 /// page n reads "paged n" (supplied by the pager thread when touched).
@@ -324,7 +330,7 @@ pub const KFD_ALWAYS_READY: u64 = 1;
 /// at `flags` (a u32 in the server's memory) unless 0. The file found is
 /// pinned until the thread enters the program again (as Linux's fdget
 /// holds a file for a call): another thread's close of the descriptor
-/// does not end it under the call.
+/// does not end it under the call. ENOMEM if the pin cannot be kept.
 pub const SYS_KFD_LOOKUP: u64 = 1035;
 /// `kfd_ready(id, ready)`: the readiness of the server's file `id` for
 /// poll, select and epoll (POLLIN, POLLOUT, POLLERR, POLLHUP); wakes who

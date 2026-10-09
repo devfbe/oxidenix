@@ -74,6 +74,9 @@ pub extern "C" fn _start(state: *mut State, role: u64) -> ! {
     if role == ROLE_PAGER {
         pager();
     }
+    if role == ROLE_WORKER {
+        scm::worker();
+    }
     loop {
         if call0(SYS_RESTRICTED_ENTER) as u64 != REASON_SYSCALL {
             continue;
@@ -171,9 +174,12 @@ fn pager() -> ! {
                 continue;
             }
             EVENT_INFLIGHT => {
-                // A way into sockets in flight went (a descriptor closed,
-                // by close, exit or exec, or a call that used one ended).
-                scm::collect();
+                // A socket in flight lost its last way in but messages (a
+                // descriptor closed, by close, exit or exec, or a call that
+                // used one ended): the worker collects. Never here: the
+                // collector waits for sockets' locks, and a thread holding
+                // one may wait for a page this thread brings.
+                scm::request();
                 continue;
             }
             EVENT_MKWRITE => {

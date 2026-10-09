@@ -214,7 +214,7 @@ impl Files {
     }
 
     pub fn get(&self, fd: u64) -> Result<Arc<OpenFile>, i64> {
-        self.fds.lock().get(fd as usize).and_then(|e| e.as_ref()).map(|e| e.file.clone()).ok_or(super::errno::EBADF)
+        self.fds.lock().get(fd as usize).and_then(|e| e.as_ref()).map(|e| e.file().clone()).ok_or(super::errno::EBADF)
     }
 
     /// Installs `file` at the lowest free descriptor >= `min`.
@@ -226,7 +226,7 @@ impl Files {
             fds.try_reserve(more).map_err(|_| super::errno::ENOMEM)?;
             fds.resize(fd + 1, None);
         }
-        fds[fd] = Some(FdEntry { file, cloexec });
+        fds[fd] = Some(FdEntry::new(file, cloexec));
         Ok(fd as i64)
     }
 

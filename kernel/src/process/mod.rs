@@ -57,15 +57,33 @@ pub type Pid = u64;
 
 pub const TIMER_HZ: u64 = 100;
 
-#[derive(Clone)]
 pub struct FdEntry {
-    pub file: Arc<OpenFile>,
+    /// Let go of through `fs::file::release` (see `Drop`).
+    file: core::mem::ManuallyDrop<Arc<OpenFile>>,
     pub cloexec: bool,
+}
+
+impl FdEntry {
+    pub fn new(file: Arc<OpenFile>, cloexec: bool) -> FdEntry {
+        FdEntry { file: core::mem::ManuallyDrop::new(file), cloexec }
+    }
+
+    pub fn file(&self) -> &Arc<OpenFile> {
+        &self.file
+    }
+}
+
+impl Clone for FdEntry {
+    fn clone(&self) -> FdEntry {
+        FdEntry::new(self.file().clone(), self.cloexec)
+    }
 }
 
 impl Drop for FdEntry {
     fn drop(&mut self) {
-        self.file.reference_gone();
+        // Taken once, here.
+        let file = unsafe { core::mem::ManuallyDrop::take(&mut self.file) };
+        crate::fs::file::release(file);
     }
 }
 
@@ -594,9 +612,19 @@ fn spawn_pager(instance: &Arc<linux::Instance>) -> Result<Pid, i64> {
     let group = ThreadGroup::new(pid, info, Default::default()).ok_or(ENOMEM)?;
     // Protected from signals of programs, as the servers are.
     group.privileged.store(true, Ordering::Relaxed);
-    let t = new_task(pid, group, "linux-pager".to_string(), own, start)?;
+    let mm = own.mm.clone();
+    let t = new_task(pid, group.clone(), "linux-pager".to_string(), own, start)?;
     slot.insert(t.clone())?;
     sched::start(t);
+    // The worker: a thread of the pager's process (it ends with it).
+    let wslot = sched::reserve_pid()?;
+    let (thread, start) = linux::LinuxThread::worker(instance.clone())?;
+    let mut own = Process::empty();
+    own.mm = mm;
+    own.linux = Some(thread);
+    let w = new_task(wslot.pid, group, "linux-worker".to_string(), own, start)?;
+    wslot.insert(w.clone())?;
+    sched::start(w);
     Ok(pid)
 }
 
@@ -631,7 +659,7 @@ fn spawn_with(path: &str, image: loader::Image, server: Option<&Arc<Server>>, ar
         frame = start;
     }
     own.mm = Some(address_space::Mm::new(space).ok_or(ENOMEM)?);
-    own.files = Some(Files::new(vec![Some(FdEntry { file: console, cloexec: false }); 3]).ok_or(ENOMEM)?);
+    own.files = Some(Files::new(vec![Some(FdEntry::new(console, false)); 3]).ok_or(ENOMEM)?);
     own.fs = Some(FsInfo::new("/".to_string()).ok_or(ENOMEM)?);
     own.server = server.cloned();
     let group = ThreadGroup::new(pid, info, Default::default()).ok_or(ENOMEM)?;

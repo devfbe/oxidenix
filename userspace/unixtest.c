@@ -19,6 +19,7 @@
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -808,6 +809,159 @@ static void ancillary_edges(void) {
     close(sv[1]);
 }
 
+/* Sends `n` (up to 253) copies of descriptor `fd` with one byte. */
+static int send_copies(int sock, int fd, int n) {
+    int fds[253];
+    for (int i = 0; i < n; i++) fds[i] = fd;
+    char byte = 'F';
+    struct iovec iov = {&byte, 1};
+    char control[CMSG_SPACE(sizeof fds)];
+    struct msghdr msg = {0};
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control;
+    msg.msg_controllen = CMSG_SPACE(sizeof(int) * n);
+    struct cmsghdr *c = CMSG_FIRSTHDR(&msg);
+    c->cmsg_level = SOL_SOCKET;
+    c->cmsg_type = SCM_RIGHTS;
+    c->cmsg_len = CMSG_LEN(sizeof(int) * n);
+    memcpy(CMSG_DATA(c), fds, sizeof(int) * n);
+    return sendmsg(sock, &msg, 0) == 1 ? 0 : -errno;
+}
+
+static volatile int stop_cycles;
+
+static void *cycles_thread(void *arg) {
+    (void)arg;
+    while (!stop_cycles) {
+        int x[2];
+        socketpair(AF_UNIX, SOCK_STREAM, 0, x);
+        send_fds(x[0], &x[1], 1);
+        send_fds(x[1], &x[0], 1);
+        close(x[0]);
+        close(x[1]);
+    }
+    return NULL;
+}
+
+/* Receives into pages of a /data file's mapping that are not in memory
+ * yet (the pager brings each), while sockets close under the receiver
+ * (the pager shuts their peers down) and the collector runs: no server
+ * lock may be held across such a copy. */
+static void paging_under_locks(void) {
+    const size_t pages = 1024, len = pages * 4096;
+    int f = open("/data/unixtest.map", O_CREAT | O_RDWR | O_TRUNC, 0644);
+    int ok = f >= 0 && ftruncate(f, len) == 0;
+    /* Private: each page is read in by the pager, then copied; nothing is
+     * left to write back. */
+    char *map = ok ? mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE, f, 0) : MAP_FAILED;
+    ok = ok && map != MAP_FAILED;
+    pthread_t g;
+    stop_cycles = 0;
+    pthread_create(&g, NULL, cycles_thread, NULL);
+    static char msg[4096];
+    memset(msg, 'm', sizeof msg);
+    size_t page = 0;
+    for (int round = 0; round < 300 && ok; round++) {
+        /* A datagram with a descriptor, peeked and then received. */
+        int d[2], p[2];
+        socketpair(AF_UNIX, SOCK_DGRAM, 0, d);
+        pipe(p);
+        send_fds(d[0], &p[1], 1);
+        char control[CMSG_SPACE(sizeof(int))];
+        for (int peek = 1; peek >= 0; peek--) {
+            struct iovec iov = {map + page++ * 4096, 1};
+            struct msghdr m = {0};
+            m.msg_iov = &iov;
+            m.msg_iovlen = 1;
+            m.msg_control = control;
+            m.msg_controllen = sizeof control;
+            ok &= recvmsg(d[1], &m, peek ? MSG_PEEK : 0) == 1;
+            struct cmsghdr *c = CMSG_FIRSTHDR(&m);
+            if (c) {
+                int got;
+                memcpy(&got, CMSG_DATA(c), sizeof got);
+                close(got);
+            }
+        }
+        close(d[0]);
+        close(d[1]);
+        close(p[0]);
+        close(p[1]);
+        /* A stream whose writer (another process) goes while the
+         * receiver copies. */
+        int s[2];
+        socketpair(AF_UNIX, SOCK_STREAM, 0, s);
+        pid_t child = fork();
+        if (child == 0) {
+            close(s[1]);
+            write(s[0], msg, sizeof msg);
+            usleep(round % 5 * 50);
+            _exit(0);
+        }
+        close(s[0]);
+        char *at = map + page++ * 4096;
+        ssize_t n, total = 0;
+        while ((n = read(s[1], at + total, 4096 - total)) > 0) total += n;
+        ok &= total == 4096 && at[0] == 'm' && at[4095] == 'm';
+        close(s[1]);
+        waitpid(child, NULL, 0);
+    }
+    stop_cycles = 1;
+    pthread_join(g, NULL);
+    if (map != MAP_FAILED) munmap(map, len);
+    if (f >= 0) close(f);
+    unlink("/data/unixtest.map");
+    check("copies into pages the pager brings, sockets closing, collecting", ok);
+}
+
+/* Descriptors in flight cannot take the instance's handle table, however
+ * many processes try: five each put as many in flight as they may and
+ * keep them; together they stay within the instance's bound, and the
+ * parent can still map files (which needs handles). */
+static void inflight_bound(void) {
+    int report[2], go[2];
+    pipe(report);
+    pipe(go);
+    pid_t kids[5];
+    for (int k = 0; k < 5; k++) {
+        kids[k] = fork();
+        if (kids[k] == 0) {
+            close(report[0]);
+            close(go[1]);
+            int s[2];
+            socketpair(AF_UNIX, SOCK_STREAM, 0, s);
+            int sent = 0;
+            for (int m = 0; m < 80 && send_copies(s[1], s[0], 253) == 0; m++) sent += 253;
+            write(report[1], &sent, sizeof sent);
+            char c;
+            read(go[0], &c, 1);
+            _exit(0);
+        }
+    }
+    close(report[1]);
+    close(go[0]);
+    long total = 0;
+    int sent;
+    for (int k = 0; k < 5; k++)
+        if (read(report[0], &sent, sizeof sent) == sizeof sent) total += sent;
+    int f = open("/tmp/unixtest.bound", O_CREAT | O_RDWR | O_TRUNC, 0644);
+    ftruncate(f, 4096);
+    char *m = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, f, 0);
+    int mapped = m != MAP_FAILED;
+    if (mapped) {
+        m[0] = 'b';
+        munmap(m, 4096);
+    }
+    close(f);
+    unlink("/tmp/unixtest.bound");
+    close(go[1]);
+    for (int k = 0; k < 5; k++) waitpid(kids[k], NULL, 0);
+    close(report[0]);
+    check("descriptors in flight stay within the instance's bound", total > 0 && total <= 16 * 1024);
+    check("... and files can still be mapped meanwhile", mapped);
+}
+
 int main(void) {
     stream_pair();
     nonblocking();
@@ -820,6 +974,8 @@ int main(void) {
     exit_leaves_cycles();
     dgram_pollout();
     ancillary_edges();
+    paging_under_locks();
+    inflight_bound();
     printf("%s\n", failures ? "unixtest: FAILURES" : "unixtest: all ok");
     return failures ? 1 : 0;
 }

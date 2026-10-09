@@ -35,6 +35,15 @@
 //! before any socket's (MSG_PEEK installs descriptors under a socket's
 //! lock). Messages (whose drop uncharges their sender and may close
 //! descriptors in flight) are dropped only once no socket lock is held.
+//! No server lock is held while program memory is copied, except a
+//! socket's receive lock, which no service thread takes: a copy may fault
+//! on a page the pager must bring (an mmap of /data), and the pager takes
+//! sockets' locks (closing them). A receive plans its message under the
+//! state lock, copies it with only the receive lock held (receives are
+//! serialized, so the message stays at the front unless its socket is
+//! emptied, which it then finds by the message's id), and takes what the
+//! copy took under the state lock again. A send copies into the server's
+//! memory before it takes a lock.
 //!
 //! A call on a socket keeps it open while it lasts (`kfd_lookup` pins the
 //! file until the call returns): another thread's close does not end a
@@ -184,9 +193,33 @@ pub fn find(key: &Key) -> Option<Arc<Sock>> {
     BINDINGS.lock().get(key).and_then(|w| w.upgrade())
 }
 
+/// A receive's next message: what it copies with no lock held.
+struct Plan {
+    id: u64,
+    data: Arc<Vec<u8>>,
+    off: usize,
+    /// It carries descriptors.
+    fds: bool,
+    /// Its credentials, when the receiver asked for them.
+    cred: Option<Cred>,
+    from: Option<Arc<Name>>,
+}
+
+enum Next {
+    Piece(Plan),
+    /// Nothing yet: sleep while the sequence word holds this.
+    Wait(u32),
+}
+
+/// Ids of messages (unique in the instance): a receive finds its message
+/// again by it after the copy.
+static NEXT_MSG: AtomicU64 = AtomicU64::new(1);
+
 /// A queued message (see the module comment).
 pub struct Msg {
-    data: Vec<u8>,
+    id: u64,
+    /// Shared with a receive copying it out.
+    data: Arc<Vec<u8>>,
     /// Bytes of a stream piece read already.
     off: usize,
     fds: Vec<Passed>,
@@ -272,6 +305,10 @@ pub struct Sock {
     /// Datagram senders whose writability waits for room in its queue (a
     /// leaf lock).
     waiters: Mutex<Vec<Weak<Sock>>>,
+    /// Receives, one at a time: held across the copy to the program's
+    /// memory (which may wait for the pager), where the state lock is not.
+    /// Never taken by a service thread.
+    rlock: Mutex<()>,
     inner: Mutex<Inner>,
 }
 
@@ -464,6 +501,7 @@ impl Sock {
             qlen: AtomicUsize::new(0),
             peer_addr: AtomicUsize::new(0),
             waiters: Mutex::new(Vec::new()),
+            rlock: Mutex::new(()),
             inner: Mutex::new(Inner {
                 state: State::Unconnected,
                 connecting: false,
@@ -1057,7 +1095,7 @@ impl Sock {
             }
             let charge = n + OVERHEAD;
             self.charge(charge, sndbuf);
-            let msg = Msg { data, off: 0, fds: core::mem::take(&mut fds), cred, from: name.clone(), sender: self.clone(), charge };
+            let msg = Msg { id: NEXT_MSG.fetch_add(1, Ordering::Relaxed), data: Arc::new(data), off: 0, fds: core::mem::take(&mut fds), cred, from: name.clone(), sender: self.clone(), charge };
             let refused = {
                 let mut p = peer.inner.lock();
                 if p.dead || p.shut & RCV != 0 {
@@ -1115,7 +1153,7 @@ impl Sock {
         let charge = n + OVERHEAD;
         self.charge(charge, sndbuf);
         let name = self.name();
-        let mut msg = Some(Msg { data, off: 0, fds, cred, from: name, sender: self.clone(), charge });
+        let mut msg = Some(Msg { id: NEXT_MSG.fetch_add(1, Ordering::Relaxed), data: Arc::new(data), off: 0, fds, cred, from: name, sender: self.clone(), charge });
         loop {
             let seen;
             {
@@ -1174,62 +1212,118 @@ impl Sock {
     }
 
     fn recv_stream(&self, dst: &mut Sink, o: RecvOpts) -> Result<Received, i64> {
-        let (peek, waitall, nonblock) = (o.peek, o.waitall, o.nonblock);
         let want = dst.room();
-        let target = if waitall { want } else { want.min(1) };
+        let target = if o.waitall { want } else { want.min(1) };
         let mut out = Received { copied: 0, len: 0, trunc: false, fds: Fds::Taken(Vec::new()), cred: None, from: None };
         let mut gone: Vec<Msg> = Vec::new();
         let deadline = deadline(self.inner.lock().rcvtimeo);
         let mut result = Ok(());
-        'outer: loop {
-            let seen;
-            {
-                // Peeked descriptors are installed under the socket's lock:
-                // the collector is held off first (see `scm`).
-                let gc = peek.then(crate::scm::hold);
+        // MSG_PEEK goes through the queue: the last piece peeked.
+        let mut peeked: Option<u64> = None;
+        let mut reader = Some(self.rlock.lock());
+        loop {
+            // The next piece, or why there is none (under the lock).
+            let next = {
                 let mut i = self.inner.lock();
                 if i.state != State::Connected {
                     result = Err(EINVAL);
                     break;
                 }
-                if i.queue.is_empty() || (peek && out.copied > 0) {
-                    if out.copied >= target || want == 0 {
-                        break;
+                let piece = match peeked {
+                    Some(id) => i.queue.iter().skip_while(|m| m.id != id).nth(1),
+                    None => i.queue.front(),
+                };
+                match piece {
+                    Some(m) if want > 0 && dst.room() > 0 => {
+                        // Never glue pieces of different writers.
+                        if i.passcred && out.cred.is_some_and(|c| c != m.cred) {
+                            break;
+                        }
+                        Next::Piece(Plan { id: m.id, data: m.data.clone(), off: m.off, fds: !m.fds.is_empty(), cred: i.passcred.then_some(m.cred), from: m.from.clone() })
                     }
-                    if i.err != 0 {
-                        result = Err(core::mem::take(&mut i.err));
-                        self.changed(&mut i, false);
-                        break;
+                    _ => {
+                        if out.copied >= target || want == 0 || dst.room() == 0 || (o.peek && out.copied > 0) {
+                            break;
+                        }
+                        if i.err != 0 {
+                            result = Err(core::mem::take(&mut i.err));
+                            self.changed(&mut i, false);
+                            break;
+                        }
+                        if i.shut & RCV != 0 {
+                            break;
+                        }
+                        if o.nonblock {
+                            result = Err(EAGAIN);
+                            break;
+                        }
+                        Next::Wait(self.seq.load(Ordering::Acquire))
                     }
-                    if i.shut & RCV != 0 {
-                        break;
-                    }
-                    if nonblock {
-                        result = Err(EAGAIN);
-                        break;
-                    }
-                    seen = self.seq.load(Ordering::Acquire);
-                } else {
-                    let (took_fds, fault) = self.take_pieces(&mut i, dst, &mut out, &mut gone, gc.as_ref(), &o);
-                    if let Some(e) = fault {
+                }
+            };
+            let plan = match next {
+                Next::Piece(plan) => plan,
+                Next::Wait(seen) => {
+                    // Not holding the other readers off while it sleeps.
+                    reader = None;
+                    if let Err(e) = self.wait(seen, deadline) {
                         if out.copied == 0 {
                             result = Err(e);
                         }
                         break;
                     }
-                    if took_fds || out.copied >= target || dst.room() == 0 || peek {
-                        break;
+                    reader = Some(self.rlock.lock());
+                    continue;
+                }
+            };
+            // The copy, with no lock held: a fault may wait for the pager.
+            let n = match dst.put(&plan.data[plan.off..]) {
+                Ok(n) => n,
+                Err(e) => {
+                    if out.copied == 0 {
+                        result = Err(e);
                     }
-                    continue 'outer;
+                    break;
+                }
+            };
+            if out.cred.is_none() {
+                out.cred = plan.cred;
+            }
+            if out.from.is_none() {
+                out.from = plan.from.clone();
+            }
+            // What the copy took leaves the queue (MSG_PEEK: the
+            // descriptors are copied), unless the piece went meanwhile (its
+            // socket emptied by the collector): its bytes were read.
+            {
+                let gc = (o.peek && plan.fds).then(crate::scm::hold);
+                let mut i = self.inner.lock();
+                if o.peek {
+                    peeked = Some(plan.id);
+                    if let (Some(gc), Some(m)) = (&gc, i.queue.iter().find(|m| m.id == plan.id)) {
+                        out.fds = peek_fds(&m.fds, gc, &o);
+                    }
+                } else if i.queue.front().is_some_and(|m| m.id == plan.id) {
+                    let m = i.queue.front_mut().expect("checked");
+                    m.off += n;
+                    if plan.fds {
+                        out.fds = Fds::Taken(core::mem::take(&mut m.fds));
+                    }
+                    let done = m.left() == 0;
+                    i.bytes -= n;
+                    if done {
+                        gone.extend(i.queue.pop_front());
+                    }
+                    self.qlen.store(i.queue.len(), Ordering::Release);
+                    self.changed(&mut i, false);
                 }
             }
-            if let Err(e) = self.wait(seen, deadline) {
-                if out.copied == 0 {
-                    result = Err(e);
-                }
+            out.copied += n;
+            if plan.fds || n < plan.data.len() - plan.off {
                 break;
             }
         }
+        drop(reader);
         drop(gone);
         out.len = out.copied;
         if out.copied > 0 {
@@ -1239,118 +1333,72 @@ impl Sock {
         result.map(|_| out)
     }
 
-    /// Reads queued stream pieces into `dst` (lock held) from the front:
-    /// across pieces until `dst` is full, but not across pieces of
-    /// different credentials when they are passed, and not beyond one that
-    /// carried descriptors. Pieces read up go to `gone`. Returns whether
-    /// descriptors came, and the error of a fault.
-    fn take_pieces(&self, i: &mut Inner, dst: &mut Sink, out: &mut Received, gone: &mut Vec<Msg>, gc: Option<&crate::sync::ReadGuard>, o: &RecvOpts) -> (bool, Option<i64>) {
-        let peek = o.peek;
-        let passcred = i.passcred;
-        let mut took_fds = false;
-        let mut fault = None;
-        let mut at = 0;
-        let mut consumed = 0;
-        while at < i.queue.len() && dst.room() > 0 {
-            let msg = &mut i.queue[at];
-            if passcred {
-                match out.cred {
-                    // Never glue pieces of different writers.
-                    Some(c) if c != msg.cred => break,
-                    Some(_) => {}
-                    None => out.cred = Some(msg.cred),
-                }
-            }
-            if out.from.is_none() {
-                out.from = msg.from.clone();
-            }
-            let n = match dst.put(&msg.data[msg.off..]) {
-                Ok(n) => n,
-                Err(e) => {
-                    fault = Some(e);
-                    break;
-                }
-            };
-            out.copied += n;
-            if !msg.fds.is_empty() {
-                took_fds = true;
-                out.fds = match gc {
-                    Some(gc) if peek => peek_fds(&msg.fds, gc, o),
-                    _ => Fds::Taken(core::mem::take(&mut msg.fds)),
-                };
-            }
-            if peek {
-                at += 1;
-            } else {
-                msg.off += n;
-                consumed += n;
-                if msg.left() == 0 {
-                    gone.extend(i.queue.pop_front());
-                }
-            }
-            if took_fds || n == 0 {
-                break;
-            }
-        }
-        if consumed > 0 || !gone.is_empty() {
-            i.bytes -= consumed;
-            self.qlen.store(i.queue.len(), Ordering::Release);
-            self.changed(i, false);
-        }
-        (took_fds, fault)
-    }
-
     fn recv_dgram(&self, dst: &mut Sink, o: RecvOpts) -> Result<Received, i64> {
         let deadline = deadline(self.inner.lock().rcvtimeo);
+        let mut reader = Some(self.rlock.lock());
         loop {
-            let seen;
-            {
-                // As in `recv_stream`.
-                let gc = o.peek.then(crate::scm::hold);
+            let next = {
                 let mut i = self.inner.lock();
                 if self.ty == SEQPACKET && i.state != State::Connected {
                     return Err(ENOTCONN);
                 }
-                let passcred = i.passcred;
-                if let Some(msg) = i.queue.front_mut() {
-                    let len = msg.data.len();
-                    let copied = if len == 0 { 0 } else { dst.put(&msg.data)? };
-                    let mut out = Received {
-                        copied,
-                        len,
-                        trunc: copied < len,
-                        fds: Fds::Taken(Vec::new()),
-                        cred: passcred.then_some(msg.cred),
-                        from: msg.from.clone(),
-                    };
-                    if let Some(gc) = &gc {
-                        out.fds = peek_fds(&msg.fds, gc, &o);
-                        return Ok(out);
+                if let Some(m) = i.queue.front() {
+                    Next::Piece(Plan { id: m.id, data: m.data.clone(), off: 0, fds: !m.fds.is_empty(), cred: i.passcred.then_some(m.cred), from: m.from.clone() })
+                } else {
+                    if i.err != 0 {
+                        let e = core::mem::take(&mut i.err);
+                        self.changed(&mut i, false);
+                        return Err(e);
                     }
-                    out.fds = Fds::Taken(core::mem::take(&mut msg.fds));
-                    let gone = i.queue.pop_front();
+                    if i.shut & RCV != 0 {
+                        return Ok(Received { copied: 0, len: 0, trunc: false, fds: Fds::Taken(Vec::new()), cred: None, from: None });
+                    }
+                    if o.nonblock {
+                        return Err(EAGAIN);
+                    }
+                    Next::Wait(self.seq.load(Ordering::Acquire))
+                }
+            };
+            let plan = match next {
+                Next::Piece(plan) => plan,
+                Next::Wait(seen) => {
+                    // Not holding the other readers off while it sleeps.
+                    drop(reader.take());
+                    self.wait(seen, deadline)?;
+                    reader = Some(self.rlock.lock());
+                    continue;
+                }
+            };
+            let len = plan.data.len();
+            // The copy, with no lock held (an error leaves the datagram).
+            let copied = if len == 0 { 0 } else { dst.put(&plan.data)? };
+            let mut out = Received { copied, len, trunc: copied < len, fds: Fds::Taken(Vec::new()), cred: plan.cred, from: plan.from.clone() };
+            let gone = {
+                let gc = (o.peek && plan.fds).then(crate::scm::hold);
+                let mut i = self.inner.lock();
+                if o.peek {
+                    if let (Some(gc), Some(m)) = (&gc, i.queue.iter().find(|m| m.id == plan.id)) {
+                        out.fds = peek_fds(&m.fds, gc, &o);
+                    }
+                    None
+                } else if i.queue.front().is_some_and(|m| m.id == plan.id) {
+                    let mut m = i.queue.pop_front().expect("checked");
+                    out.fds = Fds::Taken(core::mem::take(&mut m.fds));
                     i.bytes -= len;
                     self.qlen.store(i.queue.len(), Ordering::Release);
                     self.changed(&mut i, false);
-                    drop(i);
-                    drop(gone);
-                    self.wake_waiters();
-                    return Ok(out);
+                    Some(m)
+                } else {
+                    // It went meanwhile (the socket emptied): read anyway.
+                    None
                 }
-                if i.err != 0 {
-                    let e = core::mem::take(&mut i.err);
-                    self.changed(&mut i, false);
-                    return Err(e);
-                }
-                if i.shut & RCV != 0 {
-                    return Ok(Received { copied: 0, len: 0, trunc: false, fds: Fds::Taken(Vec::new()), cred: None, from: None });
-                }
-                if o.nonblock {
-                    return Err(EAGAIN);
-                }
-                seen = self.seq.load(Ordering::Acquire);
+            };
+            drop(reader);
+            if !o.peek {
+                drop(gone);
+                self.wake_waiters();
             }
-            self.wait(seen, deadline)?;
+            return Ok(out);
         }
     }
 

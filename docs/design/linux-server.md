@@ -267,10 +267,19 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
      is never a candidate, and another thread's close does not end a blocked receive or
      accept; a lock the collector takes exclusively (making, installing and letting go of
      descriptors in flight take it shared) keeps its view still while it runs. Handles of
-     descriptors in flight are marked (`KFILE_INFLIGHT`): every descriptor of such a
-     placeholder that goes (by close, exit or exec) and every call that pinned one ending
-     queues `EVENT_INFLIGHT`, and the collector runs; it also runs before a sender with too
-     many descriptors in flight (16 Ki per process) is refused with `ETOOMANYREFS`.
+     descriptors in flight are marked (`KFILE_INFLIGHT`): when a descriptor of such a
+     placeholder goes (by close, exit or exec) or a call that pinned one ends, and what is
+     left are only its handles in flight, the kernel queues `EVENT_INFLIGHT` (after the
+     reference is gone, so the collector sees it gone), and the collector runs on the
+     instance's **worker** thread (`ROLE_WORKER`: a second thread of the pager's process
+     that serves neither a program nor a page). Never on the pager: the collector waits for
+     sockets' locks, and nothing may wait for the pager while it holds one; for the same
+     reason no server lock the pager takes is held while program memory is copied (a fault
+     there may need a page the pager brings): a receive copies with only its socket's (or
+     pipe's) receive lock held. The collector also runs on a sender's thread before it is
+     refused with `ETOOMANYREFS`: at most 16 Ki descriptors are in flight per user and in
+     the instance (a quarter of its handle table, which files and mappings need too), so
+     forks gain nothing.
      `SCM_CREDENTIALS` may name only a process of the caller's tree (`thread_exists` with
      `THREAD_IN_INSTANCE`). When the descriptor table moves into the server (R6e), the
      handles become references in the server's own table and these calls go.

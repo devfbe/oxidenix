@@ -9,6 +9,9 @@
 //! program ends the wait with EINTR, and the call restarts as the kernel's
 //! own pipes would). Readiness for poll, select and epoll is reported to
 //! the kernel under the same lock, so reports never arrive out of order.
+//! That lock is never held while program memory is copied (a fault there
+//! may wait for the pager, which closes pipes): readers copy out of a
+//! chunk taken under it, one reader at a time (`drain`).
 //!
 //! As on Linux: a write without readers raises SIGPIPE for the writer
 //! (`SYS_SIGNAL_THREAD`) and fails with EPIPE (unless some of it was
@@ -17,6 +20,7 @@
 use crate::files::{self, EFAULT};
 use crate::sync::Mutex;
 use crate::syscall;
+use crate::unix::Sink;
 use crate::usercopy;
 use alloc::collections::VecDeque;
 use alloc::sync::Arc;
@@ -62,6 +66,9 @@ struct Inner {
 
 pub struct Shared {
     inner: Mutex<Inner>,
+    /// Reads, one at a time: held across the copy to the program, where
+    /// `inner` is not (see `drain`). Never taken by a service thread.
+    rlock: Mutex<()>,
     /// Bumped on every change; waiters sleep on it.
     seq: AtomicU32,
     ids: [u64; 2],
@@ -76,6 +83,7 @@ pub struct PipeEnd {
 pub fn new() -> (Arc<PipeEnd>, Arc<PipeEnd>) {
     let shared = Arc::new(Shared {
         inner: Mutex::new(Inner { buf: VecDeque::new(), reader: true, writer: true, reported: [0, POLLOUT] }),
+        rlock: Mutex::new(()),
         seq: AtomicU32::new(0),
         ids: [files::new_id(), files::new_id()],
     });
@@ -153,22 +161,24 @@ impl PipeEnd {
 
     /// Reads into `dst`: what is there, waiting while the pipe is empty and
     /// has a writer.
-    pub fn read(&self, mut dst: Dst, nonblock: bool) -> Result<i64, i64> {
-        let want: u64 = match &dst {
-            Dst::Program(vecs) => vecs.iter().map(|v| v.1).sum(),
-            Dst::Server(buf) => buf.len() as u64,
+    pub fn read(&self, dst: Dst, nonblock: bool) -> Result<i64, i64> {
+        let mut sink = match dst {
+            Dst::Program(vecs) => Sink::program(vecs),
+            Dst::Server(buf) => Sink::Server { buf, at: 0 },
         };
-        if want == 0 {
+        if sink.room() == 0 {
             return Ok(0);
         }
+        let mut reader = Some(self.shared.rlock.lock());
         loop {
             let seen;
             {
-                let mut inner = self.shared.inner.lock();
+                let inner = self.shared.inner.lock();
                 if !inner.buf.is_empty() {
-                    let done = copy_out(&mut inner, &mut dst)?;
-                    self.shared.changed(&mut inner, false, done > 0);
-                    return Ok(done as i64);
+                    drop(inner);
+                    let r = self.drain(&mut sink);
+                    drop(reader);
+                    return r;
                 }
                 if !inner.writer {
                     return Ok(0);
@@ -178,8 +188,49 @@ impl PipeEnd {
             if nonblock {
                 return Err(EAGAIN);
             }
+            // Not holding the other readers off while it sleeps.
+            drop(reader.take());
             self.shared.wait(seen)?;
+            reader = Some(self.shared.rlock.lock());
         }
+    }
+
+    /// Moves buffered bytes to `sink` (the reader's lock held), a chunk at
+    /// a time: copied out under the pipe's lock into the server's memory,
+    /// to the program with no lock held (a fault may wait for the pager,
+    /// which closes pipes), and only what reached it leaves the pipe.
+    /// Readers are serialized, so the bytes stay at the front meanwhile.
+    fn drain(&self, sink: &mut Sink) -> Result<i64, i64> {
+        let mut chunk = [0u8; CHUNK];
+        let mut done = 0;
+        loop {
+            let n = {
+                let inner = self.shared.inner.lock();
+                let n = inner.buf.len().min(CHUNK).min(sink.room());
+                for (d, s) in chunk[..n].iter_mut().zip(inner.buf.iter()) {
+                    *d = *s;
+                }
+                n
+            };
+            if n == 0 {
+                break;
+            }
+            let k = match sink.put(&chunk[..n]) {
+                Ok(k) => k,
+                Err(e) if done == 0 => return Err(e),
+                Err(_) => break,
+            };
+            {
+                let mut inner = self.shared.inner.lock();
+                inner.buf.drain(..k);
+                self.shared.changed(&mut inner, false, k > 0);
+            }
+            done += k;
+            if k < n {
+                break;
+            }
+        }
+        Ok(done as i64)
     }
 
     /// Writes all of `src`, waiting for room (with O_NONBLOCK what fits).
@@ -258,43 +309,5 @@ impl PipeEnd {
         st[24..28].copy_from_slice(&(S_IFIFO | 0o600).to_le_bytes());
         st[56..64].copy_from_slice(&4096u64.to_le_bytes());
         usercopy::to_program(buf, &st).map(|_| 0).map_err(|_| EFAULT)
-    }
-}
-
-/// Moves buffered bytes to `dst` (lock held); only what reached it leaves
-/// the pipe. A chunk never crosses a page of the program's buffer, so a
-/// hole there ends the read exactly where it begins.
-fn copy_out(inner: &mut Inner, dst: &mut Dst) -> Result<usize, i64> {
-    match dst {
-        Dst::Server(buf) => {
-            let n = buf.len().min(inner.buf.len());
-            for (d, s) in buf[..n].iter_mut().zip(inner.buf.drain(..n)) {
-                *d = s;
-            }
-            Ok(n)
-        }
-        Dst::Program(vecs) => {
-            let mut done = 0;
-            let mut chunk = [0u8; CHUNK];
-            for &(base, len) in vecs.iter() {
-                let mut at = 0;
-                while at < len {
-                    if inner.buf.is_empty() {
-                        return Ok(done);
-                    }
-                    let n = (len - at).min(CHUNK as u64).min(PAGE - (base + at) % PAGE).min(inner.buf.len() as u64) as usize;
-                    for (d, s) in chunk[..n].iter_mut().zip(inner.buf.iter()) {
-                        *d = *s;
-                    }
-                    if let Err(e) = usercopy::to_program(base + at, &chunk[..n]) {
-                        return if done > 0 { Ok(done) } else { Err(e) };
-                    }
-                    inner.buf.drain(..n);
-                    at += n as u64;
-                    done += n;
-                }
-            }
-            Ok(done)
-        }
     }
 }
