@@ -312,8 +312,11 @@ fn openat(dirfd: u64, addr: u64, flags: u32, mode: u32) -> Result<i64, i64> {
             Err(e) => return Err(e),
         }
     };
-    // Opening a symlink itself would hand out its target bytes as a file.
-    if nofollow && resolved.mode & vfs::S_IFMT == vfs::S_IFLNK {
+    // Opening a symlink itself would hand out its target bytes as a file:
+    // one named with O_NOFOLLOW, or one a magic link led to (an O_PATH
+    // descriptor of a symlink, /proc/self/fd/N), is ELOOP (O_PATH alone
+    // names it, above).
+    if resolved.mode & vfs::S_IFMT == vfs::S_IFLNK {
         return Err(ELOOP);
     }
     let abs = join(&resolved.path);
