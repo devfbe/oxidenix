@@ -271,7 +271,13 @@ pub fn pgrp_stopped(instance: u64, pgid: Pid) -> bool {
     let table = TABLE.lock();
     table.groups.values().filter(|g| in_instance(g, instance)).any(|g| {
         let info = g.info.lock();
-        info.pgid == pgid && info.exit_status.is_none() && info.threads.iter().any(|t| t.state() == State::Stopped)
+        if info.pgid != pgid || info.exit_status.is_some() {
+            return false;
+        }
+        // The predicate SIGCONT uses (`signal::post`): a group stop under way counts
+        // (lock order: the process's info, then its signal state).
+        let stopping = g.sig.lock().stopping();
+        stopping || info.threads.iter().any(|t| t.state() == State::Stopped)
     })
 }
 

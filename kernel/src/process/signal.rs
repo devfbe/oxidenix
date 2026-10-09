@@ -139,6 +139,11 @@ pub fn stopped_status(sig: u32) -> i32 {
 }
 
 impl GroupSignals {
+    /// Whether a group stop is under way (or done): what SIGCONT counts as stopped.
+    pub fn stopping(&self) -> bool {
+        self.stopping != 0
+    }
+
     fn ignored(&self, sig: u32) -> bool {
         let handler = self.actions[sig as usize - 1].handler;
         handler == SIG_IGN || (handler == SIG_DFL && default_ignored(sig))

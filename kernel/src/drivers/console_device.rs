@@ -68,6 +68,8 @@ pub fn set_holder(id: u64, chan: usize) -> u64 {
     let _change = CHANGE.lock();
     HOLDER_CHAN.store(chan, Ordering::Release);
     let old = HOLDER.swap(id, Ordering::AcqRel);
+    // Echoes of the previous holder's input are not the new one's.
+    ECHO.lock().clear();
     if !INPUT.lock().is_empty() {
         PENDING.store(true, Ordering::Release);
         wakeup(if chan != 0 { chan } else { MONITOR_CHAN });
@@ -81,6 +83,7 @@ pub fn release(id: u64) {
     if HOLDER.load(Ordering::Acquire) == id {
         HOLDER_CHAN.store(0, Ordering::Release);
         HOLDER.store(0, Ordering::Release);
+        ECHO.lock().clear();
         wakeup(MONITOR_CHAN);
     }
 }
@@ -222,10 +225,15 @@ pub fn flush_echo() {
 
 /// Queues an echo for the console without ever waiting; what does not fit is dropped.
 /// Returns how much was taken.
-pub fn echo(bytes: &[u8]) -> usize {
+pub fn echo(holder: u64, bytes: &[u8]) -> Result<usize, i64> {
     let mut n = 0;
     {
         let mut q = ECHO.lock();
+        // Checked under the queue's lock: a change of the holder (which empties the
+        // queue after it changed the holder) never finds the old holder's echo after.
+        if HOLDER.load(Ordering::Acquire) != holder {
+            return Err(crate::process::errno::EIO);
+        }
         for &b in bytes {
             if q.push_back(b).is_err() {
                 break;
@@ -234,7 +242,7 @@ pub fn echo(bytes: &[u8]) -> usize {
         }
     }
     flush_echo();
-    n
+    Ok(n)
 }
 
 /// The monitor's blocking read of one byte, while it holds the device.

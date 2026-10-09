@@ -1693,12 +1693,9 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             let mut buf = [0u8; 512];
             if a[2] & CONSOLE_ECHO != 0 {
                 // Never waits (the service thread's echoes).
-                if console_device::holder() != instance.id {
-                    return Err(EIO);
-                }
                 let n = a[1].min(buf.len() as u64) as usize;
                 super::uaccess::copy_from_server(a[0], &mut buf[..n])?;
-                return Ok(console_device::echo(&buf[..n]) as i64);
+                return console_device::echo(instance.id, &buf[..n]).map(|n| n as i64);
             }
             let mut done = 0u64;
             let result = {
