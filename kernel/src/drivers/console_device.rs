@@ -69,10 +69,10 @@ static HOLDER_GEN: AtomicU64 = AtomicU64::new(0);
 pub fn set_holder(id: u64, chan: usize) -> u64 {
     let _change = CHANGE.lock();
     HOLDER_CHAN.store(chan, Ordering::Release);
-    let old = HOLDER.swap(id, Ordering::AcqRel);
     // Echoes of the previous holder's input are not the new one's: those queued go,
-    // and a batch a writer took out already is dropped when it sees the generation.
-    forget_echoes();
+    // and a batch a writer took out already is dropped when it sees the generation
+    // (the holder and the generation change together, under the queue's lock).
+    let old = change_holder(id);
     // Writers of the old holder waiting for a turn give up (EIO).
     wakeup(TURN_CHAN);
     if !INPUT.lock().is_empty() {
@@ -87,8 +87,7 @@ pub fn release(id: u64) {
     let _change = CHANGE.lock();
     if HOLDER.load(Ordering::Acquire) == id {
         HOLDER_CHAN.store(0, Ordering::Release);
-        HOLDER.store(0, Ordering::Release);
-        forget_echoes();
+        change_holder(0);
         wakeup(TURN_CHAN);
         wakeup(MONITOR_CHAN);
     }
@@ -112,13 +111,14 @@ pub fn read(out: &mut [u8]) -> usize {
     n
 }
 
-/// The writers' turns (`writer`): held across a whole write of the holder's, so one
-/// write's bytes are not interleaved with another's. A sleeping lock of the kernel's
-/// (its holder may be preempted between the console's budgeted pieces like any thread;
-/// a lock of the server's would give it the weight of a lock holder for the whole
-/// write), first come first served (a writer that writes again at once queues behind
-/// the others: a flood starves nobody), and a waiter a signal interrupts gives up its
-/// turn (`abandoned`, skipped when it comes).
+/// The writers' turns (`writer`): held within one `console_write` call, across the
+/// write of the bytes the kernel copied before (never across a copy), so one write's
+/// bytes are not interleaved with another's. A sleeping lock of the kernel's (its holder
+/// may be preempted between the console's budgeted pieces like any thread), first come
+/// first served (a writer that writes again at once queues behind the others: a flood
+/// starves nobody). No signal ends a wait for it; a dying thread's wait ends, and so do
+/// the waits of an instance that stopped holding the device: their tickets are given up
+/// (`abandoned`, skipped when they come).
 struct Turns {
     next: u64,
     serving: u64,
@@ -239,18 +239,23 @@ fn out(bytes: &[u8]) {
 
 /// The holder changed: its echoes go, those queued and (by the generation, advanced
 /// under the queue's lock with them) a batch a writer has taken out already.
-fn forget_echoes() {
+/// Makes `id` the holder and forgets the old holder's echoes: the holder, the generation
+/// and the queue change together, under the queue's lock. The old holder.
+fn change_holder(id: u64) -> u64 {
     let mut q = ECHO.lock();
+    let old = HOLDER.swap(id, Ordering::AcqRel);
     HOLDER_GEN.fetch_add(1, Ordering::AcqRel);
     q.clear();
+    old
 }
 
-/// Writes the queued echoes (the writer's turn held). A batch is written only if the
-/// holder it was taken for still holds the device.
+/// Writes the queued echoes (the writer's turn held). A batch is taken with the holder
+/// and generation it was queued under (one snapshot, under the queue's lock) and written
+/// only if both still hold when it goes out.
 fn drain_echo() {
     let mut buf = [0u8; 256];
     loop {
-        let (n, gen) = {
+        let (n, gen, holder) = {
             let mut q = ECHO.lock();
             let mut n = 0;
             while n < buf.len() {
@@ -258,12 +263,12 @@ fn drain_echo() {
                 buf[n] = b;
                 n += 1;
             }
-            (n, HOLDER_GEN.load(Ordering::Acquire))
+            (n, HOLDER_GEN.load(Ordering::Acquire), HOLDER.load(Ordering::Acquire))
         };
         if n == 0 {
             return;
         }
-        if HOLDER_GEN.load(Ordering::Acquire) == gen {
+        if HOLDER_GEN.load(Ordering::Acquire) == gen && HOLDER.load(Ordering::Acquire) == holder {
             out(&buf[..n]);
         }
     }
