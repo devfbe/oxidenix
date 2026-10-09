@@ -524,6 +524,69 @@ static void read_rules(void) {
     close(m);
 }
 
+/* O_PATH descriptors (the server's, of any node) and the node behind a terminal's
+ * descriptor: fstat is live, fchmod changes the node. */
+static void opath(void) {
+    mkdir("/tmp/opath", 0755);
+    int f = open("/tmp/opath/file", O_RDWR | O_CREAT | O_TRUNC, 0644);
+    write(f, "data", 4);
+    close(f);
+    symlink("file", "/tmp/opath/link");
+    check("O_PATH|O_CREAT creates nothing (ENOENT)", open("/tmp/opath/none", O_PATH | O_CREAT | O_RDWR, 0644) == -1 && errno == ENOENT);
+    int p = open("/tmp/opath/file", O_PATH | O_RDWR);
+    char b[8];
+    struct stat st;
+    check("O_PATH: F_GETFL shows O_PATH, the access mode is gone",
+          p >= 0 && (fcntl(p, F_GETFL) & O_PATH) && (fcntl(p, F_GETFL) & 3) == 0);
+    check("O_PATH: reads and writes are EBADF", read(p, b, 1) == -1 && errno == EBADF && write(p, "x", 1) == -1 && errno == EBADF);
+    check("O_PATH: fstat and fstatfs work", fstat(p, &st) == 0 && S_ISREG(st.st_mode) && st.st_size == 4);
+    chmod("/tmp/opath/file", 0600);
+    check("O_PATH: fstat is live (a chmod by path shows)", fstat(p, &st) == 0 && (st.st_mode & 0777) == 0600);
+    /* The system calls themselves (musl's fchmod goes on through /proc/self/fd). */
+    check("O_PATH: fchmod and futimens are EBADF", syscall(91, p, 0644) == -1 && errno == EBADF &&
+                                                   syscall(280, p, NULL, NULL, 0) == -1 && errno == EBADF);
+    check("O_PATH: fchownat with AT_EMPTY_PATH works", fchownat(p, "", 0, 0, AT_EMPTY_PATH) == 0);
+    int one = 1;
+    check("O_PATH: ioctl(FIONBIO), F_SETFL are EBADF", ioctl(p, FIONBIO, &one) == -1 && errno == EBADF && fcntl(p, F_SETFL, O_NONBLOCK) == -1 && errno == EBADF);
+    struct pollfd pf = {p, POLLIN, 0};
+    check("O_PATH: poll says POLLNVAL", poll(&pf, 1, 0) == 1 && (pf.revents & POLLNVAL));
+    int d = dup(p);
+    check("O_PATH: dup keeps it O_PATH", d >= 0 && (fcntl(d, F_GETFL) & O_PATH));
+    close(d);
+    close(p);
+    int l = open("/tmp/opath/link", O_PATH | O_NOFOLLOW);
+    check("O_PATH|O_NOFOLLOW names the symlink itself", l >= 0 && fstat(l, &st) == 0 && S_ISLNK(st.st_mode));
+    close(l);
+    int dir = open("/tmp/opath", O_PATH | O_DIRECTORY);
+    int in = openat(dir, "file", O_RDONLY);
+    check("O_PATH directory: openat relative to it works", in >= 0 && read(in, b, 4) == 4);
+    close(in);
+    char dbuf[256];
+    check("O_PATH directory: getdents64 is EBADF", syscall(217, dir, dbuf, sizeof dbuf) == -1 && errno == EBADF);
+    char cwd[64];
+    getcwd(cwd, sizeof cwd);
+    check("O_PATH directory: fchdir works", fchdir(dir) == 0 && access("file", F_OK) == 0);
+    chdir(cwd);
+    close(dir);
+    int n = open("/dev/null", O_PATH);
+    check("O_PATH on the kernel's /dev/null: its node, EBADF to write",
+          n >= 0 && fstat(n, &st) == 0 && S_ISCHR(st.st_mode) && major(st.st_rdev) == 1 && write(n, "x", 1) == -1 && errno == EBADF);
+    close(n);
+    unlink("/tmp/opath/link");
+    unlink("/tmp/opath/file");
+    rmdir("/tmp/opath");
+
+    /* A terminal's descriptor and its node. */
+    char path[64];
+    int m = new_pty(path, sizeof path);
+    int s = open(path, O_RDWR | O_NOCTTY);
+    chmod(path, 0600);
+    check("a terminal's fstat is its node's, live", fstat(s, &st) == 0 && (st.st_mode & 0777) == 0600);
+    check("fchmod on a terminal changes its node", fchmod(s, 0620) == 0 && stat(path, &st) == 0 && (st.st_mode & 0777) == 0620);
+    close(s);
+    close(m);
+}
+
 static void on_usr1(int sig) { (void)sig; }
 
 /* Waiters for a terminal's write turn that die or are interrupted give their tickets
@@ -845,6 +908,7 @@ int main(void) {
     read_rules();
     orphans();
     turn_abandon();
+    opath();
     job_control();
     printf("ttytest: %s\n", failures ? "FAILED" : "all passed");
     return failures != 0;

@@ -454,11 +454,23 @@ placeholder in the kernel's descriptor table, as pipes are).
   Linux: (5,0) `/dev/tty` (the caller's controlling terminal, ENXIO without one), (5,1)
   `/dev/console`, (5,2) `/dev/ptmx`, (136,n) `/dev/pts/n` are the server's, whatever
   filesystem holds the node; (1,3) and (1,5) are null and zero: the kernel's for its own
-  nodes, the server's (`devices.rs`, with the node's own status; zero maps anonymous memory)
-  for nodes of its filesystems; any other number has no driver (ENXIO). `O_PATH` opens any
-  device node alone, never its driver, as Linux's: the server's node-only file with the
-  node's status, the access mode ignored, reads, writes and ioctls EBADF. `O_DIRECTORY` is
-  ENOTDIR. The kernel's `/dev` gives its nodes their numbers (`st_rdev`).
+  nodes, the server's (`devices.rs`) for nodes of its filesystems (zero maps anonymous
+  memory, EACCES as Linux's for a descriptor not open for reading or a shared writable
+  mapping of one not open for writing, read-only for good then; reads fill the whole count
+  unless a signal comes; counts and buffers checked as Linux's `rw_verify_area` and
+  `import_iovec`); any other number has no driver (ENXIO). `O_DIRECTORY` is ENOTDIR. The
+  server's terminal, null and zero descriptors keep the node they were opened by (`Origin`):
+  fstat is the node's, live, and fchmod, fchown and futimens change it. The kernel's `/dev`
+  gives its nodes their numbers (`st_rdev`).
+- **O_PATH** (`pathfile.rs`, any node of the namespace): the descriptor names the node and
+  opens nothing, no driver, no file, as Linux's: only O_DIRECTORY, O_NOFOLLOW and O_CLOEXEC
+  are kept (O_CREAT creates nothing, the access mode is ignored), O_NOFOLLOW names a symlink
+  itself; fstat and fstatfs describe the node (live), it serves as the directory of *at calls
+  and with AT_EMPTY_PATH as their target, fchdir takes a directory; reads, writes, ioctls,
+  mmap, getdents and fchmod, fchown, futimens are EBADF. Its placeholder in the kernel's
+  table carries O_PATH: F_GETFL shows it, only dup, close and fcntl's F_DUPFD, F_GETFD,
+  F_SETFD and F_GETFL take it there; poll gives POLLNVAL, select, epoll, ioctl and F_SETFL
+  EBADF.
 - **ioctls**: `TCGETS`/`TCSETS`/`TCSETSW`/`TCSETSF` and the `termios2` forms, `TCSBRK`,
   `TCSBRKP`, `TCXONC`, `TCFLSH`, `TIOCGWINSZ`/`TIOCSWINSZ`, `TIOCGPGRP`/`TIOCSPGRP`,
   `TIOCGSID`, `TIOCSCTTY`, `TIOCNOTTY`, `TIOCSTI` (everyone is root), `FIONREAD`,
