@@ -183,10 +183,12 @@ pub enum Ends {
     Interrupted,
     /// Only the thread's death.
     Dying,
-    /// Nothing more: a lock of the Linux server's in its own memory
+    /// A lock of the Linux server's in its own memory
     /// (`restricted::FUTEX_LOCK`), held for bounded work only (as a kernel's
     /// spinlock or a mutex that is not killable), which a dying thread's
-    /// server still takes to end the thread.
+    /// server still takes to end the thread: only the instance's breaking
+    /// (a holder that failed with it, `linux::break_instance`) ends it. No
+    /// state of the thread's changes how it waits.
     Lock,
 }
 
@@ -196,7 +198,23 @@ impl Ends {
         match self {
             Ends::Interrupted => signal::interrupted(),
             Ends::Dying => signal::dying(),
-            Ends::Lock => false,
+            Ends::Lock => super::linux::instance_broken(),
+        }
+    }
+}
+
+/// Wakes every task waiting on a word of Linux server instance `instance`'s
+/// memory (without counting it woken: each looks again whether its wait
+/// ends, `linux::break_instance`).
+pub fn shake_server(instance: usize) {
+    for bucket in BUCKETS_.iter() {
+        let b = bucket.lock();
+        for w in b.iter() {
+            if let (Base::Server(i), Sleeper::Task(t)) = (w.key.base, &w.sleeper) {
+                if i == instance {
+                    try_wake(t, State::Sleeping);
+                }
+            }
         }
     }
 }

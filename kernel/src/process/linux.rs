@@ -195,6 +195,9 @@ pub struct Instance {
     tasks: spin::Mutex<BTreeMap<u64, (u32, Weak<super::task::Task>)>>,
     /// The command line the tree's first process runs (`SYS_INIT_ARGS`).
     init_args: spin::Mutex<Vec<u8>>,
+    /// A thread of the server failed holding its locks (`break_instance`):
+    /// the server's state is lost, its lock waits end (`FUTEX_LOCK`).
+    broken: core::sync::atomic::AtomicBool,
 }
 
 /// A memory object mapped into the region (`Instance::map_object`).
@@ -343,6 +346,7 @@ impl Instance {
             channels: core::sync::atomic::AtomicUsize::new(0),
             tasks: spin::Mutex::new(BTreeMap::new()),
             init_args: spin::Mutex::new(Vec::new()),
+            broken: core::sync::atomic::AtomicBool::new(false),
         };
         instance.entry = instance.load(image)?;
         // Counted from here on (its drop uncounts it).
@@ -1846,6 +1850,30 @@ pub fn kick_task(t: &Arc<super::task::Task>) {
 
 /// Kills a Linux program's thread: marked dying and kicked, it exits at its
 /// next `restricted_enter`.
+/// Whether the calling thread's instance is broken (`break_instance`).
+pub fn instance_broken() -> bool {
+    with_current(|p| p.linux.as_ref().is_some_and(|l| l.instance.broken.load(core::sync::atomic::Ordering::Acquire)))
+}
+
+/// The calling thread's server failed while it held some of the server's
+/// locks: they are never let go of, and the server's state they guard is
+/// lost. The instance ends: every program thread is killed, and every wait
+/// for one of the server's locks (`FUTEX_LOCK`, which nothing else ends)
+/// ends with EINTR, on which the server ends the waiting thread. So no
+/// thread of the instance waits for good on a lock a dead holder kept.
+pub fn break_instance() {
+    let Some(instance) = with_current(|p| p.linux.as_ref().map(|l| l.instance.clone())) else { return };
+    if instance.broken.swap(true, core::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    crate::printkln!("[linux] the server failed holding its locks: instance {} ends", instance.id);
+    let tasks: Vec<Arc<super::task::Task>> = instance.tasks.lock().values().filter_map(|(_, t)| t.upgrade()).collect();
+    for t in &tasks {
+        kill_task(t);
+    }
+    super::futex::shake_server(Arc::as_ptr(&instance) as usize);
+}
+
 pub fn kill_task(t: &Arc<super::task::Task>) {
     t.killed.store(true, core::sync::atomic::Ordering::SeqCst);
     kick_task(t);

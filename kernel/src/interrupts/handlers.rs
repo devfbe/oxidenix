@@ -148,6 +148,10 @@ fn exception(frame: &mut Frame) {
             let (program, normal) = mm.tlb.roots();
             crate::printkln!("[linux] program view {:#x}, normal view {:#x}", program, normal);
         }
+        // Its locks are lost with it: the instance ends.
+        if crate::process::sched::current_server_locks() > 0 {
+            crate::process::linux::break_instance();
+        }
         signal::kernel_kill_current();
     }
     let mut sig = exception_signal(vector);

@@ -80,6 +80,15 @@ fn unhold() {
 
 const EINTR: i64 = 4;
 
+/// A lock's wait ended without the lock (`FUTEX_LOCK`'s EINTR): the instance broke, a holder
+/// failed with the lock and the server's state is lost. The thread ends here (the instance
+/// ends with it; nothing of the server's state is worth unwinding).
+#[cold]
+fn broken() -> ! {
+    syscall(restricted::SYS_THREAD_EXIT, [9, 0, 0, 0, 0, 0]);
+    unreachable!("thread_exit returned")
+}
+
 pub struct Mutex<T> {
     state: AtomicU32,
     data: UnsafeCell<T>,
@@ -98,8 +107,10 @@ impl<T> Mutex<T> {
         if self.state.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_err() {
             while self.state.swap(2, Ordering::Acquire) != 0 {
                 let addr = &self.state as *const AtomicU32 as u64;
-                // (Ends only when woken: bounded work holds it.)
-                syscall(SYS_SERVER_FUTEX_WAIT, [addr, 2, 0, FUTEX_LOCK, 0, 0]);
+                // (Ends only when woken, bounded work holds it; or the instance broke.)
+                if syscall(SYS_SERVER_FUTEX_WAIT, [addr, 2, 0, FUTEX_LOCK, 0, 0]) == -EINTR {
+                    broken();
+                }
             }
         }
         hold();
@@ -262,7 +273,10 @@ impl RwCore {
     fn sleep(&self, seen: u32, killable: bool) -> Result<(), i64> {
         let addr = &self.changed as *const AtomicU32 as u64;
         let flags = if killable { 0 } else { FUTEX_LOCK };
-        if syscall(SYS_SERVER_FUTEX_WAIT, [addr, seen as u64, 0, flags, 0, 0]) == -EINTR && killable {
+        if syscall(SYS_SERVER_FUTEX_WAIT, [addr, seen as u64, 0, flags, 0, 0]) == -EINTR {
+            if !killable {
+                broken();
+            }
             return Err(EINTR);
         }
         Ok(())
