@@ -69,9 +69,9 @@ pub const TCP_BUFFER: usize = 64 * 1024;
 const UDP_BUFFER: usize = 64 * 1024;
 const UDP_PACKETS: usize = 16;
 const RAW_BUFFER: usize = 16 * 1024;
-/// The bytes of smoltcp's socket buffers netd keeps at most (its heap is
-/// sized for them, see main).
-pub const BUDGET: usize = 24 << 20;
+/// The bytes of smoltcp's socket buffers (and leftovers) netd keeps at
+/// most, in mappings of their own (`Region`).
+const BUDGET: usize = 24 << 20;
 /// What one channel (an instance) may take of it.
 const INSTANCE_BUDGET: usize = BUDGET * 3 / 4;
 /// Ports in TIME-WAIT kept at once, and for one instance: half the

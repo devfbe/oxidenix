@@ -66,7 +66,8 @@ Alternatives considered:
   rings) and a third service thread per instance; it loses its socket layer, the poll source of
   server-announced files (`ipc_notify`) and the netd relay of interface records.
 - Memory: 128 KiB of the server's pool per connected socket (in 2 MiB grants), smoltcp's
-  buffers in netd (its heap grows to hold them), 33 pages of shared area per instance.
+  buffers in netd (128 KiB per TCP socket, a mapping of their own that goes with the socket;
+  at most 24 MiB in all), 33 pages of shared area per instance.
 - The control block's layout and its memory ordering become part of the ABI between the server
   and netd (`crates/netring`, tested on the host).
 - `SO_LINGER` with a timeout does not block `close` (the close reaches the server after the
