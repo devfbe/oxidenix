@@ -80,6 +80,12 @@ static void check(const char *name, int ok) {
 static sigjmp_buf env;
 static volatile int got;
 
+static volatile int sigpipes;
+static void on_sigpipe(int sig) {
+    (void)sig;
+    sigpipes++;
+}
+
 static void on_fault(int sig) {
     got = sig;
     siglongjmp(env, 1);
@@ -277,6 +283,14 @@ int main(void) {
     close(q[1]);
     check("... end of file once the writer is closed", read(q[0], buf, 1) == 0);
     close(q[0]);
+    pipe(q);
+    close(q[0]);
+    sigpipes = 0;
+    signal(SIGPIPE, on_sigpipe);
+    errno = 0;
+    check("... a write without readers: EPIPE and SIGPIPE", write(q[1], "x", 1) == -1 && errno == EPIPE && sigpipes == 1);
+    signal(SIGPIPE, SIG_DFL);
+    close(q[1]);
 
     /* eventfd too (R6b). */
     int efd = eventfd(5, EFD_NONBLOCK);

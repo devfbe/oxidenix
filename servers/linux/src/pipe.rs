@@ -10,8 +10,9 @@
 //! own pipes would). Readiness for poll, select and epoll is reported to
 //! the kernel under the same lock, so reports never arrive out of order.
 //!
-//! As the kernel's pipes did: a write without readers fails with EPIPE (no
-//! SIGPIPE), a read without writers returns 0, O_NONBLOCK gives EAGAIN.
+//! As on Linux: a write without readers raises SIGPIPE for the writer
+//! (`SYS_SIGNAL_THREAD`) and fails with EPIPE (unless some of it was
+//! written), a read without writers returns 0, O_NONBLOCK gives EAGAIN.
 
 use crate::files::{self, EFAULT};
 use crate::sync::Mutex;
@@ -214,6 +215,9 @@ impl PipeEnd {
                     {
                         let mut inner = self.shared.inner.lock();
                         if !inner.reader {
+                            drop(inner);
+                            const SIGPIPE: u64 = 13;
+                            syscall(SYS_SIGNAL_THREAD, [SIGPIPE, 0, 0, 0, 0, 0]);
                             return if written > 0 { Ok(written as i64) } else { Err(EPIPE) };
                         }
                         let room = CAPACITY.saturating_sub(inner.buf.len()).min(n - pushed);

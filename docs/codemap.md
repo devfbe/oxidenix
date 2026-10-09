@@ -83,7 +83,7 @@ module comment, and the public types it defines. Where to start for common tasks
 - `servers/linux/src/mm.rs` (150) Memory system calls (phase R4): Linux's semantics of mmap, munmap, mprotect, mremap, madvise, msync and the mlock family, over the kernel's mapping calls.
 - `servers/linux/src/namespace.rs` (244) The server's namespace (phase R6c.2): mounts and path resolution. Types: `KInode`, `Node`, `Resolved`.
 - `servers/linux/src/paths.rs` (347) The system calls that take a path (phase R6c.2b), and the working directory and umask, which live in the caller's record (`records`).
-- `servers/linux/src/pipe.rs` (236) Pipes (phase R6a): a 64 KiB buffer shared by a read end and a write end, each a file of the server with a placeholder in the kernel's descriptor table. Types: `Dst`, `Src`, `Shared`, `PipeEnd`.
+- `servers/linux/src/pipe.rs` (239) Pipes (phase R6a): a 64 KiB buffer shared by a read end and a write end, each a file of the server with a placeholder in the kernel's descriptor table. Types: `Dst`, `Src`, `Shared`, `PipeEnd`.
 - `servers/linux/src/records.rs` (75) Records per working-directory context: the cwd and umask of the processes that share them (phase R6c). Types: `FsState`, `FsContext`.
 - `servers/linux/src/sched.rs` (36) Scheduling policy: sched_getscheduler and sched_getparam.
 - `servers/linux/src/scm.rs` (124) Descriptors in flight (SCM_RIGHTS over AF_UNIX sockets, phase R7a): a descriptor a message carries is a handle on its open file description (`SYS_KFILE_OBJECT`), whatever the file is (one of the kernel's, or a... Types: `Passed`.
@@ -92,7 +92,7 @@ module comment, and the public types it defines. Where to start for common tasks
 - `servers/linux/src/time.rs` (102) Clocks and sleeping (phase R5): clock_gettime, clock_getres, gettimeofday, time, nanosleep, clock_nanosleep and sched_yield, over the kernel's clock and deadline sleep.
 - `servers/linux/src/tmpfile.rs` (243) Open files of the server's tmpfs (phase R6c.2c): a placeholder in the kernel's descriptor table names one (an open file description: offset, directory snapshot, write access); the calls on it are the server's. Types: `TmpOpen`.
 - `servers/linux/src/tmpfs.rs` (390) The server's tmpfs (phase R6c.2c): directories, files, symlinks and socket inodes (AF_UNIX names, `unix`) in the server's memory; a file's contents are a file object of the kernel's (`SYS_MO_CREATE_FILE`), read,... Types: `Object`, `Kind`, `State`, `Inode`.
-- `servers/linux/src/unix.rs` (1134) AF_UNIX sockets (phase R7a): stream, datagram and sequenced-packet sockets of the server, each a file with a placeholder in the kernel's descriptor table, as pipes are. Types: `Cred`, `Name`, `Key`, `Msg`, `Sock`, `Received`, `Fds`, `Sink`, `Source`, `Busy`.
+- `servers/linux/src/unix.rs` (1133) AF_UNIX sockets (phase R7a): stream, datagram and sequenced-packet sockets of the server, each a file with a placeholder in the kernel's descriptor table, as pipes are. Types: `Cred`, `Name`, `Key`, `Msg`, `Sock`, `Received`, `Fds`, `Sink`, `Source`, `Busy`.
 - `servers/linux/src/usercopy.rs` (73) Copies between the server's memory and the program's (which the server sees in its view of the address space).
 
 ## Other servers
@@ -155,7 +155,7 @@ module comment, and the public types it defines. Where to start for common tasks
 - `userspace/hello.c` (4) The smallest program: prints its arguments and exits with 42.
 - `userspace/iobench.c` (285) I/O benchmarks (docs/benchmarks/README.md): IPC round trip latency, sequential block I/O, small synchronous reads, TCP throughput over loopback and over the network card, each with the system calls, IPC round trips,...
 - `userspace/jobtest.c` (70) Job control: stopping and continuing processes (SIGSTOP, SIGTSTP, SIGCONT), waitpid with WUNTRACED and WCONTINUED, and restarting interrupted reads.
-- `userspace/lxtest.c` (404) The Linux server's kernel interface (docs/design/linux-server.md), exercised through the server's test calls (1500 and up, see crates/restricted): the program asks its server to create a memory object, fill it, map...
+- `userspace/lxtest.c` (417) The Linux server's kernel interface (docs/design/linux-server.md), exercised through the server's test calls (1500 and up, see crates/restricted): the program asks its server to create a memory object, fill it, map...
 - `userspace/mmaptest.c` (135) File mappings through the page cache: shared mappings see write() and read() sees stores through them, across processes; private mappings see the file until they write; truncation and the end of the file give SIGBUS;...
 - `userspace/nettest.c` (170) Socket tests: TCP and UDP over loopback and through QEMU's user network (10.0.2.100:7 is an echo service, see builder/src/main.rs).
 - `userspace/oomtest.c` (144) Running out of resources: fork bombs, memory hogs and full pipes fail with errors (EAGAIN, ENOMEM) instead of bringing the kernel down, and a process touching uncommitted (MAP_NORESERVE) memory beyond the commit...
