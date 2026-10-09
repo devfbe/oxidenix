@@ -236,7 +236,10 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
 7. **R7 — Sockets** into the server, talking to netd over rings.
 8. **R8 — Processes and signals**: pids, the process tree, `fork` (with the copy-on-write clone
    of memory objects), `exec`, `wait`, signals, job control, `/proc`'s data. The kernel's
-   process model shrinks to processes and threads as containers.
+   process model shrinks to processes and threads as containers. `thread_exists` (1090), with
+   which the server checks the target of `sched_getscheduler`/`sched_getparam` today and which
+   sees every task of the kernel (other instances' and the servers' threads too), goes then:
+   the server answers from its own table, scoped to its instance.
 9. **R9 — Remove the pass-through.** `legacy_syscall` and the kernel's Linux code go; the
    kernel implements no system call of Linux. Programs that are not Linux (the servers) keep
    the kernel's own system call interface.

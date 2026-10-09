@@ -586,6 +586,9 @@ pub const SERVER_LOG_MAX: u64 = 256;
 /// `thread_exists(tid) -> 0`: ESRCH unless a thread with id `tid` (not 0)
 /// exists. Thread ids are the kernel's until the process model is the
 /// server's (R8); the scheduling-policy calls check their target with it.
+/// It sees every task of the kernel, other instances' and the servers'
+/// threads included (as /proc does today); with R8 the server answers
+/// from its own process table, scoped to its instance, and this goes.
 pub const SYS_THREAD_EXISTS: u64 = 1090;
 
 /// `(scenario)`: the server runs a channel scenario against the test
