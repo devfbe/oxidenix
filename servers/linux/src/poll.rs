@@ -201,11 +201,6 @@ pub fn report(id: u64, ready: i16) {
     }
 }
 
-/// The watch of description `id`, while it lives.
-pub fn watch_of(id: u64) -> Option<Arc<Watch>> {
-    shard(id).lock().get(&id).and_then(Weak::upgrade)
-}
-
 /// Description `id` went: its watch is no longer found, and the epoll
 /// interests in it go (as Linux's eventpoll_release: interests belong to
 /// the description).

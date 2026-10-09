@@ -89,8 +89,11 @@ pub enum File {
 
 impl File {
     /// Always ready for poll, whatever happens (a regular file or a
-    /// directory, null and zero, the kernel's files): epoll refuses it with
-    /// EPERM, as Linux does for a file without a poll method.
+    /// directory, null and zero, the kernel's files, /proc and /sys): epoll
+    /// refuses it with EPERM, as Linux does for a file without a poll
+    /// method. Decided per kind of file: a file of one of these kinds that
+    /// had readiness of its own (a pollable /proc file, as Linux's
+    /// /proc/self/mounts) would need it decided per node, and a watch.
     pub fn always_ready(&self) -> bool {
         matches!(self, File::Tmp(_) | File::Data(_) | File::Dev(_) | File::Kernel(_) | File::Proc(_))
     }
@@ -268,13 +271,25 @@ pub fn new_id() -> u64 {
 /// If no descriptor can be had, nothing was made: the file is the caller's
 /// to undo (no close happens for it).
 pub fn install(id: u64, file: File, flags: u32) -> Result<i64, i64> {
-    fdtable::current().install_new(|| description(id, file, flags & !O_CLOEXEC), flags & O_CLOEXEC != 0)
+    let watch = (!file.always_ready()).then(|| crate::poll::Watch::new(id));
+    install_watched(id, file, flags, watch)
 }
 
-/// A new open file description (see `install`), not yet in any table.
-pub fn description(id: u64, file: File, flags: u32) -> FileRef {
-    let watch = (!file.always_ready()).then(|| crate::poll::Watch::new(id));
-    FileRef::new(Arc::new(Description { id, file, flags: AtomicU32::new(flags), watch, inflight: AtomicUsize::new(0) }))
+/// `install` with the description's watch made by the caller (an epoll
+/// instance knows its own before it is installed). Without a descriptor
+/// the watch goes again.
+pub fn install_watched(id: u64, file: File, flags: u32, watch: Option<Arc<crate::poll::Watch>>) -> Result<i64, i64> {
+    let kept = watch.clone();
+    let r = fdtable::current().install_new(
+        || FileRef::new(Arc::new(Description { id, file, flags: AtomicU32::new(flags & !O_CLOEXEC), watch, inflight: AtomicUsize::new(0) })),
+        flags & O_CLOEXEC != 0,
+    );
+    if r.is_err() {
+        if let Some(w) = &kept {
+            crate::poll::forget(id, w);
+        }
+    }
+    r
 }
 
 /// File `id` changed its readiness (now `ready`), or had an event that
