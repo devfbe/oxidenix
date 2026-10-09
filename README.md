@@ -354,7 +354,9 @@ About 9,200 lines of Rust (without comments and blank lines) in the kernel and 3
   machine has) that way and makes all of it writable and executable at once. Their pages (and
   those of other areas not committed as a whole) are committed one by one when they get a
   frame of their own (a software bit in the page table entry says so until the page goes); if
-  that fails, the process touching it is killed, never one whose memory was committed. Cached
+  that fails, the process touching it is killed (also when a copy of the kernel or the Linux
+  server touches it for the process: the copy ends, then SIGKILL), never one whose memory was
+  committed. Cached
   disk pages count against the same limit but give way: when a commit (or a new cache page) would exceed it, clean cached pages that no mapping
   uses are dropped first, visiting the files in turn and giving a page used since the last look
   a second chance. `/proc/meminfo` shows `Committed_AS`, `CommitLimit`, `Cached` (with tmpfs),
@@ -980,7 +982,7 @@ Each of these programs and scripts lives in the root filesystem and runs inside 
 | Test | Covers |
 |---|---|
 | `cowtest` | copy-on-write isolation between parent and child, kernel writes into shared pages, 50 forks, shared read-only frames stay unchanged, `brk` does not grow over a mapping |
-| `oomtest` | fork bomb (stops at the process limit), memory exhaustion via `mmap`, 100 full pipes; the kernel survives and memory is reusable; a process touching `MAP_NORESERVE` memory beyond the commit limit is killed while one with committed memory touches all of it |
+| `oomtest` | fork bomb (stops at the process limit), memory exhaustion via `mmap`, 100 full pipes; the kernel survives and memory is reusable; a process touching `MAP_NORESERVE` memory beyond the commit limit is killed while one with committed memory touches all of it; a `read()` into an untouched `MAP_NORESERVE` buffer with nothing left to commit kills the reader too (not `EFAULT`) |
 | `sigtest` | handlers, killing a busy loop, `SIGCHLD`, `EINTR` on pipe reads, blocked and ignored signals, FPU state across asynchronous handlers, `alarm` and repeating `setitimer`, catchable `SIGFPE`/`SIGSEGV`/`SIGTRAP` from CPU exceptions, an uncaught `SIGFPE` killing the process |
 | `jobtest` | stop/continue reporting through `wait4`, restart of a stopped `read()`, `SIGKILL` on stopped processes, `SA_RESTART` |
 | `forktest` | `fork`, `execve`, `wait4`, preemptive interleaving of two workers |

@@ -16,7 +16,9 @@
 //! CHARGED bit until it goes. JITs such as V8 reserve a large code range
 //! with `MAP_NORESERVE` and make all of it writable and executable at
 //! once; only what they touch counts. When the commit fails at a touch, the
-//! toucher is killed, never a process whose memory was committed.
+//! toucher is killed, never a process whose memory was committed (a copy
+//! by the kernel or the Linux server ends at its fixup and the process gets
+//! SIGKILL, see the page fault handler).
 //!
 //! Page table entries carry three software bits: COW (a shared frame that
 //! is copied on the first write), PROT_NONE (a frame kept while its area

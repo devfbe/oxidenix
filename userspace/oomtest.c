@@ -128,6 +128,28 @@ static void noreserve_toucher(void) {
     close(held[0]);
 }
 
+/* The same at a copy into such memory: read() from a pipe into an
+ * untouched MAP_NORESERVE buffer when nothing is left to commit kills the
+ * reader (as its own touch would), rather than failing with EFAULT. */
+static void noreserve_copy(void) {
+    pid_t kid = fork();
+    if (kid == 0) {
+        int p[2];
+        pipe(p);
+        write(p[1], "sixteen bytes!!!", 16);
+        char *buf = mmap(NULL, MIB, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        /* Commit everything that is left, down to the last page. */
+        for (long chunk = 64 * MIB; chunk >= 4096; chunk /= 2)
+            while (mmap(NULL, chunk, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) != MAP_FAILED) {}
+        ssize_t n = read(p[0], buf, 16);
+        _exit(n == 16 ? 4 : 3);
+    }
+    int st = 0;
+    waitpid(kid, &st, 0);
+    printf("noreserve copy: child status %#x\n", st);
+    check("a copy into uncommitted memory beyond the limit kills", WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL);
+}
+
 static void pipe_flood(void) {
     static int fds[200][2];
     static char block[4096];
@@ -151,6 +173,7 @@ int main(void) {
     fork_bomb();
     memory_hog();
     noreserve_toucher();
+    noreserve_copy();
     pipe_flood();
     printf("oomtest: %s\n", failures ? "FAILED" : "all passed");
     return failures;

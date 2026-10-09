@@ -82,6 +82,17 @@ fn exception_name(vector: u8) -> &'static str {
     }
 }
 
+/// Memory ran out at a copy's touch of user memory (the kernel's uaccess
+/// or the Linux server's copy routine): the process dies of SIGKILL, as of
+/// a touch of its own, but by a signal, so the copy still ends at its
+/// fixup and the call unwinds (locks and references the kernel or the
+/// server hold are given back) before the kill takes effect on the way
+/// back to user mode.
+fn oom_kill(addr: u64) {
+    crate::printkln!("[kernel] out of memory at {:#x} (in a copy): process killed", addr);
+    signal::send(crate::process::current_pid(), signal::SIGKILL);
+}
+
 fn exception(frame: &mut Frame) {
     let vector = frame.vector as u8;
     // Read now: resolving the fault may sleep, and CR2 changes meanwhile.
@@ -98,7 +109,10 @@ fn exception(frame: &mut Frame) {
         match handle_fault(fault_addr, access) {
             Ok(()) => return,
             Err(_) if signal::dying() => return,
-            Err(_) => {
+            Err(e) => {
+                if e == crate::process::address_space::Fault::Oom {
+                    oom_kill(fault_addr);
+                }
                 if let Some(fixup) = crate::process::linux::server_fault(frame.rip) {
                     frame.rip = fixup;
                     return;
@@ -148,7 +162,10 @@ fn exception(frame: &mut Frame) {
                 // The wait for the page ended because the thread dies: the
                 // return to user mode carries out SIGKILL or the exit.
                 Err(_) if fixup.is_none() && signal::dying() => return,
-                Err(_) if fixup.is_some() => {
+                Err(e) if fixup.is_some() => {
+                    if e == Fault::Oom {
+                        oom_kill(addr);
+                    }
                     frame.rip = fixup.expect("checked").to;
                     return;
                 }
