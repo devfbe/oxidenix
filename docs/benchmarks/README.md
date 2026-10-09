@@ -91,20 +91,20 @@ What this shows:
 
 ## R7b: internet sockets in the Linux server
 
-`2026-10-09-e21f6ae-r7b.md` against `2026-10-09-802b396-quiet.md`. The host was **not idle**
-(other QEMU guests and compilers ran, load about 3.5 on 16 threads): the socket figures below
-are what changed by far the most; the others moved within the noise of such a host
-(`seq_read_cached` halved, which nothing in this change touches) and must be measured again
-on an idle host.
+`2026-10-09-714815d-r7b-final.md` against `2026-10-09-802b396-quiet.md`. The host was not
+entirely idle (load about 1.4 on 16 threads: another guest), but the figures this change does
+not touch came out as before (`seq_read_cached` 8372 MB/s, `null_syscall` p50 2361 cycles).
 
 | benchmark | before | now | Linux |
 |---|---:|---:|---:|
-| `tcp_loopback` (MB/s) | 647.1 | 1156.7 | 5831.5 |
-| `tcp_network_echo` (MB/s) | 112.2 | 176.7 | - |
+| `tcp_loopback` (MB/s) | 647.1 | 1240.6 | 5831.5 |
+| `tcp_network_echo` (MB/s) | 112.2 | 180.2 | - |
 
-Per 64 KiB written over loopback: 31.9 system calls instead of 112.1, no IPC call instead of 8
-(and 120 bytes copied by the kernel instead of 313217): the data moves between the program,
-the server's rings and netd without the kernel, and no request per `send` or `recv`.
+Per 64 KiB written over loopback: 34 system calls instead of 112, no IPC call instead of 8 (and
+129 bytes copied by the kernel instead of 313217): the data moves between the program, the
+server's rings and netd without the kernel, and no request per `send` or `recv`. What is left
+of the gap to Linux is netd's per-segment work (smoltcp over an emulated Ethernet loopback with
+1500-byte frames) and the two copies in netd (rings ↔ smoltcp).
 
 ## Open: PCIDs and small cached reads
 
