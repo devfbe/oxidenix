@@ -417,7 +417,7 @@ pub fn client() -> Result<Arc<Client>, i64> {
         return Ok(c.clone());
     }
     let generation = GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
-    let c = Arc::new(Client::connect(generation).map_err(|_| EIO)?);
+    let c = Arc::new(Client::connect(fsring::SERVICE, generation, fsclient::SCRATCH_PAGES).map_err(|_| EIO)?);
     // Before anyone uses the new channel (they wait for RECONNECT): no
     // request names an inode diskfs may have freed meanwhile, and the
     // dirty pages have their disk space promised again.
