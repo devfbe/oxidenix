@@ -878,16 +878,18 @@ interrupt dispatch; drivers and filesystems move into user-space servers.
   zeroed area mapped into its address space, plus its physical address for the device. The
   area belongs to the server description, not to the process, so a restarted server gets the
   same memory instead of leaking it while the device may still write to it.
-- **Remote filesystems**: the VFS has a second kind of inode whose operations become
-  `fsproto` requests to a server (`fs/remote.rs`): procfs's `/proc` and `/sys`, generated on
-  every read and never cached. (The disk is the Linux server's, over the I/O rings.)
+- **Filesystem servers over the rings**: the kernel is no filesystem client. diskfs (`/data`)
+  and procfs (`/proc`'s system-wide files and `/sys`) serve each Linux server instance over a
+  channel of the I/O rings in the file protocol (`fsring`); the kernel only hands out the
+  channels (its IPC carries their offers, nothing else) and starts the servers.
 - **Fault isolation**: when a server dies, its services are marked dead and every pending
   request fails with `EIO`; the kernel and the rest of user space keep running.
-- **Self-healing**: the next request to a dead server starts it again (in the
-  context of the requesting program, which may sleep) and continues transparently. Inode numbers
-  live on disk, so files and directories that were open before the crash stay usable. Requests
-  that were in flight during the crash still fail with `EIO`, since they may or may not have
-  been carried out. The restart policy (ADR 0006) stops crash loops without giving a service
+- **Self-healing**: a Linux server instance whose channel's service died connects a new
+  channel, which starts the server again (in the context of the requesting program, which may
+  sleep), and goes on: diskfs's inode numbers live on disk (the instance names the inodes it
+  uses again, stale ones fail with `EIO`), procfs's name what a file is, so files and
+  directories that were open before the crash stay usable. Requests that were in flight during
+  the crash still fail with `EIO`, since they may or may not have been carried out. The restart policy (ADR 0006) stops crash loops without giving a service
   up for good: a server that lived half a second is restarted at once; after young deaths in
   a row it is restarted with a backoff (0.1 s, doubling); after a sixth young death in a row,
   or more than 20 restarts in a minute, the service is down (`EIO` at once) for 5 s (doubling
