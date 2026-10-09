@@ -84,6 +84,10 @@ jobs:
         if: matrix.firmware == 'uefi'
         run: cargo test -p procproto
 
+      - name: Test the random generator and keyed hash against their vectors on the host
+        if: matrix.firmware == 'uefi'
+        run: cargo test -p csprng
+
       - name: Test netd's patched smoltcp on the host
         if: matrix.firmware == 'uefi'
         run: cargo test --manifest-path third_party/smoltcp/Cargo.toml --lib

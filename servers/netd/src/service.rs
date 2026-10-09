@@ -35,9 +35,10 @@
 //! anything is allocated, with a reserve kept for every instance that has
 //! a channel): `MAX_CHANNELS` channels and two per instance, `MAX_GRANTS`
 //! grants a channel, smoltcp sockets (`MAX_SMOLTCP`), the bytes of their
-//! buffers and of closed connections' leftovers (`BUDGET`), TIME-WAIT
-//! records (`MAX_LINGERING`), connections closed but not finished
-//! (`MAX_ORPHANS`), no more requests taken than the completion ring has
+//! buffers and of closed connections' leftovers (`BUDGET`), connections
+//! closed but not finished (`MAX_ORPHANS`; one in TIME-WAIT keeps only its
+//! smoltcp socket, without buffers), half-open connections
+//! (`MAX_HALF_OPEN`), no more requests taken than the completion ring has
 //! room for.
 //!
 //! **Memory follows use**, as Linux autotunes its socket buffers: a TCP
@@ -52,9 +53,9 @@
 //! and the client's ring holds more than it takes. Under pressure (half
 //! of `BUDGET` in use, as Linux's tcp_mem) connections start with
 //! `TCP_MIN`, grow no further than the first sizes, and one idle for
-//! `TRIM_AFTER` gives its empty buffers back (`trim`: the send buffer
-//! entirely, the receive buffer down to `TCP_MIN`), so idle connections
-//! cost little, as on Linux, where they hold no buffers. The window scale
+//! `TRIM_AFTER` gives its empty send buffer back (`trim`; its receive
+//! buffer only as far as the window it announced allows: the right edge
+//! never moves left), so idle connections cost less. The window scale
 //! announced in the SYN is that of `TCP_MAX` (smoltcp's
 //! `set_rx_capacity_max`), so a grown buffer opens the window.
 
@@ -116,10 +117,6 @@ const RESERVED_INSTANCES: usize = 2 * MAX_CHANNELS;
 /// smoltcp sockets at once (each takes its place in smoltcp's socket set,
 /// on netd's heap, made room for at the start).
 pub const MAX_SMOLTCP: usize = 4096;
-/// Ports in TIME-WAIT kept at once, and for one instance: half the
-/// ephemeral range at most, so connects of others always find a port.
-const MAX_LINGERING: usize = 8192;
-const INSTANCE_LINGERING: usize = 2048;
 /// Connections closed but not finished (sending leftovers, FIN-WAIT,
 /// LAST-ACK, CLOSING): beyond this a close resets the connection, as
 /// Linux's tcp_max_orphans.
@@ -150,13 +147,93 @@ const TCP_TIMEOUT: Duration = Duration::from_secs(924);
 /// window, a peer that stopped acknowledging) after this (tcp_orphan_retries:
 /// Linux gives up on an orphan after about 8 retries).
 const FIN_TIMEOUT: Duration = Duration::from_secs(60);
+/// The longest a connection stays in TIME-WAIT, whatever the peer sends
+/// (smoltcp's own TIME-WAIT is 10 s, started again by every FIN).
+const TIME_WAIT_MAX: Duration = Duration::from_secs(60);
 const ORPHAN_TIMEOUT: Duration = Duration::from_secs(100);
 const FIRST_EPHEMERAL: u16 = 49152;
-/// How long a closed connection's port stays taken (smoltcp's TIME-WAIT).
-const TIME_WAIT: Duration = Duration::from_secs(10);
 /// A channel without sockets and requests for this long gives its slot
 /// to another instance's if all are taken.
 const CHANNEL_IDLE: Duration = Duration::from_secs(10);
+
+/// The secrets of TCP's initial sequence numbers (RFC 6528) and of the
+/// ephemeral ports (RFC 6056), from the kernel's generator at the start
+/// (`init_secrets`); smoltcp's ISN hook is a plain function, so they are
+/// statics.
+static ISN_KEY: [core::sync::atomic::AtomicU64; 2] = [const { core::sync::atomic::AtomicU64::new(0) }; 2];
+static PORT_KEY: [core::sync::atomic::AtomicU64; 2] = [const { core::sync::atomic::AtomicU64::new(0) }; 2];
+
+pub fn init_secrets() {
+    for key in [&ISN_KEY, &PORT_KEY] {
+        let mut b = [0u8; 16];
+        oxrt::getrandom(&mut b);
+        key[0].store(u64::from_le_bytes(b[..8].try_into().expect("8 bytes")), SeqCst);
+        key[1].store(u64::from_le_bytes(b[8..].try_into().expect("8 bytes")), SeqCst);
+    }
+}
+
+fn secret(key: &[core::sync::atomic::AtomicU64; 2]) -> [u8; 16] {
+    let mut k = [0u8; 16];
+    k[..8].copy_from_slice(&key[0].load(SeqCst).to_le_bytes());
+    k[8..].copy_from_slice(&key[1].load(SeqCst).to_le_bytes());
+    k
+}
+
+/// TCP's initial sequence number for a connection from `local` to
+/// `remote` (RFC 6528): a clock ticking every 4 microseconds plus a keyed
+/// hash (SipHash, `ISN_KEY`) of the 4-tuple, so nobody can predict it, and
+/// a new connection of the same 4-tuple starts beyond the old one.
+pub fn isn(local: IpEndpoint, remote: IpEndpoint, now: Instant) -> u32 {
+    let mut data = [0u8; 12];
+    data[..4].copy_from_slice(&bits(local.addr).to_be_bytes());
+    data[4..6].copy_from_slice(&local.port.to_be_bytes());
+    data[6..10].copy_from_slice(&bits(remote.addr).to_be_bytes());
+    data[10..].copy_from_slice(&remote.port.to_be_bytes());
+    let clock = (now.total_micros() / 4) as u32;
+    clock.wrapping_add(csprng::siphash(&secret(&ISN_KEY), &data) as u32)
+}
+
+/// A B-tree map of `entries` entries of `entry` bytes, at worst (nodes
+/// half full, and their headers).
+const fn btree(entries: usize, entry: usize) -> usize {
+    entries * (2 * entry + 16) + 4096
+}
+
+/// What netd's heap holds at most, from the limits (every one of them is a
+/// budget or a constant): smoltcp's socket set and the service's tables at
+/// their largest, the frames in flight, the requests' temporaries.
+/// smoltcp's buffers and closed connections' leftovers are not on the heap
+/// (`Region`).
+pub const HEAP_WORST: usize = {
+    use core::mem::size_of;
+    // Every socket in the set, made room for at the start.
+    let set = (MAX_SMOLTCP + 1) * size_of::<smoltcp::iface::SocketStorage<'static>>();
+    // A datagram socket's packet metadata (16 each way); their buffers
+    // (2 x 16 KiB at least) bound their number by `BUDGET`.
+    let meta = 2 * UDP_PACKETS * if size_of::<udp::PacketMetadata>() > size_of::<raw::PacketMetadata>() { size_of::<udp::PacketMetadata>() } else { size_of::<raw::PacketMetadata>() };
+    let datagram = BUDGET / (2 * RAW_BUFFER) * meta;
+    // The channels: their sockets (no more than smoltcp's), grants, and
+    // themselves.
+    let chans = MAX_CHANNELS * size_of::<Option<Chan>>() + btree(MAX_SMOLTCP, size_of::<(u32, Sock)>()) + MAX_CHANNELS * btree(MAX_GRANTS, size_of::<(u32, Grant)>());
+    // Closing connections (each holds a smoltcp socket) and TIME-WAIT
+    // records, made room for at the start.
+    let closing = MAX_SMOLTCP * size_of::<Closing>();
+    // Per smoltcp socket: its memory, a half-open place, wants to grow.
+    let per_socket = btree(MAX_SMOLTCP, size_of::<(SocketHandle, Mem)>()) + btree(MAX_HALF_OPEN, 16) + 2 * MAX_SMOLTCP * size_of::<(SocketHandle, Want)>();
+    // The ports' holders for ICMP routing, made room for at the start.
+    let owners = 2 * MAX_SMOLTCP * size_of::<(u16, u64)>();
+    // Echo identifiers: `netring::ECHO_PER_OWNER` for each instance with a
+    // channel, in two maps; the budgets' owners.
+    let echo = 2 * btree(netring::ECHO_PER_OWNER * MAX_CHANNELS, 32) + 5 * btree(MAX_CHANNELS, 32);
+    // Frames: the loopback queue (twice `MAX_LOOPED` at most), one received,
+    // the datagram scratch, a LINKS answer.
+    let frames = (2 * 64 + 1) * (crate::virtio_net::MTU + 32) + if MAX_UDP > RAW_BUFFER { MAX_UDP } else { RAW_BUFFER } + 4096;
+    set + datagram + chans + closing + per_socket + owners + echo + frames
+};
+
+/// netd's heap: the worst case with a quarter more for the allocator's
+/// fragmentation and a MiB for smoltcp's own and everything small.
+pub const HEAP: usize = (HEAP_WORST + HEAP_WORST / 4 + (1 << 20)).next_multiple_of(1 << 20);
 
 /// A futex wake of one sleeper (a ring's doorbell: the client's reaper).
 struct WakeOne;
@@ -430,12 +507,17 @@ struct Closing {
     /// (`FIN_TIMEOUT`, `ORPHAN_TIMEOUT`).
     mark: (tcp::State, usize),
     since: Instant,
+    /// It entered TIME-WAIT then (`TIME_WAIT_MAX`).
+    time_wait: Option<Instant>,
 }
 
 impl Closing {
-    /// When it is reset unless it makes progress (None: it is reset
-    /// already).
+    /// When it is reset unless it makes progress, or (in TIME-WAIT) when it
+    /// goes at the latest; None: it is being reset.
     fn deadline(&self) -> Option<Instant> {
+        if let Some(t) = self.time_wait {
+            return Some(t + TIME_WAIT_MAX);
+        }
         match self.mark.0 {
             _ if !self.orphan => None,
             tcp::State::FinWait2 => Some(self.since + FIN_TIMEOUT),
@@ -450,15 +532,6 @@ impl Closing {
         }
         self.sent = 0;
     }
-}
-
-/// A connection in TIME-WAIT, as netd keeps it: its port (for the port
-/// rules) and its endpoints (no new connection takes its 4-tuple), until
-/// `until`.
-struct Lingering {
-    holder: PortHolder,
-    tuple: Option<(IpEndpoint, IpEndpoint)>,
-    until: Instant,
 }
 
 struct Chan {
@@ -478,6 +551,11 @@ struct Chan {
     marked: bool,
     /// When it last had a request (`evict_idle`).
     used: Instant,
+    /// This round it marked sockets for netd; it had requests or data
+    /// moved; rounds in a row it marked for nothing (`prepare_sleep`).
+    marks: bool,
+    busy: bool,
+    futile: u32,
 }
 
 /// Network configuration (DHCP's).
@@ -492,18 +570,24 @@ pub struct Config {
 
 pub struct Service {
     chans: Vec<Option<Chan>>,
+    /// Closed connections finishing, being reset, or in TIME-WAIT.
     closing: Vec<Closing>,
-    /// Closed connections in TIME-WAIT: only their port and endpoints, until
-    /// then (their smoltcp socket and its buffers went).
-    lingering: Vec<Lingering>,
-    /// The state of `random`.
-    rng: u64,
+    /// netd's random numbers (seeded from the kernel's generator).
+    rng: csprng::ChaCha,
+    /// RFC 6056's counter (`ephemeral`), and the ports in use as it finds
+    /// them (one bit per ephemeral port).
+    port_counter: u32,
+    port_scratch: [u64; 256],
+    /// Who holds which port, for routing ICMP errors (`icmp_ports`; made
+    /// room for at the start).
+    tcp_owners: Vec<(u16, u64)>,
+    udp_owners: Vec<(u16, u64)>,
     /// What the instances hold, each within its share: the bytes of
     /// smoltcp's socket buffers (and of closed connections' leftovers),
-    /// smoltcp sockets, records of ports in TIME-WAIT, channels.
+    /// smoltcp sockets (connections in TIME-WAIT among them), orphans,
+    /// half-open connections, channels.
     bytes: Budget,
     socks: Budget,
-    lingering_records: Budget,
     orphans: Budget,
     channels: Budget,
     /// The memory of each smoltcp socket (its buffers).
@@ -517,11 +601,7 @@ pub struct Service {
     /// instance whose listener they came to, and those places.
     half_open: BTreeMap<SocketHandle, u64>,
     half_open_budget: Budget,
-    /// Marks were taken this round; rounds in a row that took marks and
-    /// had nothing to do; the sleep being prepared is a brief one
-    /// (`prepare_sleep`).
-    marked: bool,
-    futile: u32,
+    /// The sleep being prepared is a brief one (`prepare_sleep`).
     brief: bool,
     /// A datagram on its way out.
     scratch: Vec<u8>,
@@ -564,12 +644,19 @@ impl Service {
     pub fn new() -> Service {
         Service {
             chans: (0..MAX_CHANNELS).map(|_| None).collect(),
-            closing: Vec::new(),
-            lingering: Vec::new(),
-            rng: unsafe { core::arch::x86_64::_rdtsc() } ^ 0x9e37_79b9_7f4a_7c15,
+            // Made room for at the start (`HEAP`): their budgets bound them.
+            closing: Vec::with_capacity(MAX_SMOLTCP),
+            rng: {
+                let mut seed = [0u8; 32];
+                oxrt::getrandom(&mut seed);
+                csprng::ChaCha::new(seed)
+            },
+            port_counter: 0,
+            port_scratch: [0; 256],
+            tcp_owners: Vec::with_capacity(MAX_SMOLTCP),
+            udp_owners: Vec::with_capacity(MAX_SMOLTCP),
             bytes: Budget::new(BUDGET, BUDGET / RESERVED_INSTANCES, BUDGET),
             socks: Budget::new(MAX_SMOLTCP, MAX_SMOLTCP / RESERVED_INSTANCES, MAX_SMOLTCP),
-            lingering_records: Budget::new(MAX_LINGERING, MAX_LINGERING / RESERVED_INSTANCES, INSTANCE_LINGERING),
             orphans: Budget::new(MAX_ORPHANS, MAX_ORPHANS / RESERVED_INSTANCES, MAX_ORPHANS),
             channels: Budget::new(MAX_CHANNELS, 0, INSTANCE_CHANNELS),
             mem: BTreeMap::new(),
@@ -577,8 +664,6 @@ impl Service {
             echo: EchoIds::default(),
             half_open: BTreeMap::new(),
             half_open_budget: Budget::new(MAX_HALF_OPEN, MAX_HALF_OPEN / RESERVED_INSTANCES, MAX_HALF_OPEN / 2),
-            marked: false,
-            futile: 0,
             brief: false,
             scratch: vec![0; MAX_UDP.max(RAW_BUFFER)],
             config: Config::default(),
@@ -614,7 +699,7 @@ impl Service {
                 return e;
             }
         };
-        for b in [&mut self.bytes, &mut self.socks, &mut self.lingering_records, &mut self.orphans, &mut self.half_open_budget] {
+        for b in [&mut self.bytes, &mut self.socks, &mut self.orphans, &mut self.half_open_budget] {
             b.activate(offer.instance);
         }
         // Mapped until chan_detach, which comes after the Chan is dropped.
@@ -631,6 +716,9 @@ impl Service {
             rang: false,
             marked: false,
             used: crate::now(),
+            marks: false,
+            busy: false,
+            futile: 0,
         });
         0
     }
@@ -650,14 +738,16 @@ impl Service {
 
     /// Announces the sleep in every channel and arms its doorbell: false if
     /// work came meanwhile (then nothing sleeps).
-    /// Marks that kept coming without anything to do for `FUTILE_ROUNDS`
-    /// rounds (a client marking for nothing, or in a loop) no longer keep
-    /// netd awake: it sleeps, but at most `BRIEF_SLEEP_MS` (`sleep_cap`),
-    /// so a mark that did mean work is still seen soon.
+    /// A channel whose marks kept coming without anything to do for
+    /// `FUTILE_ROUNDS` rounds (a client marking for nothing, or in a loop)
+    /// no longer keeps netd awake with them: it sleeps, but at most
+    /// `BRIEF_SLEEP_MS` (`sleep_cap`), so a mark that did mean work is
+    /// still seen soon. Counted per channel: another's work does not make
+    /// it count again.
     pub fn prepare_sleep(&mut self) -> bool {
         self.brief = false;
-        let futile = self.futile >= FUTILE_ROUNDS;
         for chan in self.chans.iter_mut().flatten() {
+            let futile = chan.futile >= FUTILE_ROUNDS;
             let Some(tail) = chan.requests.prepare_sleep() else { return false };
             if chan.header.state() != 0 {
                 return false;
@@ -685,11 +775,14 @@ impl Service {
 
     /// The end of a round: whether it took marks without anything to do
     /// (`prepare_sleep`). `progress`: the round's requests, frames and data.
-    pub fn round_end(&mut self, progress: bool) {
-        if core::mem::take(&mut self.marked) && !progress {
-            self.futile = self.futile.saturating_add(1);
-        } else if progress {
-            self.futile = 0;
+    pub fn round_end(&mut self) {
+        for chan in self.chans.iter_mut().flatten() {
+            let (marked, busy) = (core::mem::take(&mut chan.marks), core::mem::take(&mut chan.busy));
+            if busy {
+                chan.futile = 0;
+            } else if marked {
+                chan.futile = chan.futile.saturating_add(1);
+            }
         }
     }
 
@@ -712,7 +805,7 @@ impl Service {
             }
             // The marks only say "look": every socket is pumped each round.
             // (Not progress by themselves: a client could mark forever.)
-            self.marked |= chan.area.header.take_service(|_| {});
+            chan.marks |= chan.area.header.take_service(|_| {});
             for _ in 0..TAKE_PER_ROUND {
                 let chan = self.chan(c);
                 if chan.completions.room() == 0 {
@@ -720,6 +813,7 @@ impl Service {
                 }
                 let Some(d) = chan.requests.pop() else { break };
                 chan.used = crate::now();
+                chan.busy = true;
                 progress = true;
                 let (status, values) = match Request::decode(&d) {
                     Ok(r) => self.handle(c, r, iface, sockets).unwrap_or_else(|e| (-e, [0; 4])),
@@ -760,7 +854,7 @@ impl Service {
         }
         let _ = oxrt::chan_detach(chan.id);
         self.channels.uncharge(chan.owner, 1);
-        for b in [&mut self.bytes, &mut self.socks, &mut self.lingering_records, &mut self.orphans, &mut self.half_open_budget] {
+        for b in [&mut self.bytes, &mut self.socks, &mut self.orphans, &mut self.half_open_budget] {
             b.deactivate(chan.owner);
         }
         if self.channels.held(chan.owner) == 0 {
@@ -841,7 +935,19 @@ impl Service {
         F: FnOnce(&'static mut [u8], &'static mut [u8], &mut SocketSet<'static>) -> SocketHandle,
     {
         let bytes = mapped(rx) + mapped(tx);
-        self.socks.charge(owner, 1)?;
+        // Its share or the whole is used up: its own oldest connection in
+        // TIME-WAIT makes room, else the oldest of anyone's (TIME-WAIT never
+        // refuses an instance service, as Linux drops TIME-WAIT beyond
+        // tcp_max_tw_buckets).
+        let mut charged = self.socks.charge(owner, 1);
+        if charged.is_err() && self.recycle_time_wait(Some(owner), sockets) {
+            charged = self.socks.charge(owner, 1);
+        }
+        // (Others' only help while the owner is below its own cap.)
+        while charged.is_err() && self.socks.held(owner) < MAX_SMOLTCP && self.recycle_time_wait(None, sockets) {
+            charged = self.socks.charge(owner, 1);
+        }
+        charged?;
         if let Err(e) = self.bytes.charge(owner, bytes) {
             self.socks.uncharge(owner, 1);
             return Err(e);
@@ -855,6 +961,24 @@ impl Service {
         let h = make(rx_buffer, tx_buffer, sockets);
         self.mem.insert(h, Mem { owner, rx, tx });
         Ok(h)
+    }
+
+    /// Ends the oldest connection in TIME-WAIT of `owner` (None: of any
+    /// instance), silently (it leaves smoltcp: nothing is sent); false if
+    /// there is none.
+    fn recycle_time_wait(&mut self, owner: Option<u64>, sockets: &mut SocketSet<'static>) -> bool {
+        let now = crate::now();
+        let oldest = self
+            .closing
+            .iter()
+            .enumerate()
+            .filter(|(_, cl)| owner.is_none_or(|o| cl.owner == o) && sockets.get::<tcp::Socket>(cl.handle).state() == tcp::State::TimeWait)
+            .min_by_key(|(_, cl)| cl.time_wait.unwrap_or(now))
+            .map(|(i, _)| i);
+        let Some(i) = oldest else { return false };
+        let cl = self.closing.swap_remove(i);
+        self.drop_socket(sockets, cl.handle);
+        true
     }
 
     /// A new TCP socket for `owner`, without buffers until it connects or
@@ -984,10 +1108,10 @@ impl Service {
         }
     }
 
-    /// The sockets that hold a port (TCP or UDP ones), of every channel and
-    /// the closing ones; `except` (channel, socket) is left out.
-    fn holders(&self, tcp: bool, sockets: &SocketSet<'static>, except: Option<(usize, u32)>) -> Vec<PortHolder> {
-        let mut out = Vec::new();
+    /// Calls `f` for every socket that holds a port (TCP or UDP ones), of
+    /// every channel and the closing and TIME-WAIT ones; `except` (channel,
+    /// socket) is left out. (A visit, not a list: netd's heap holds no copy.)
+    fn for_each_holder(&self, tcp: bool, sockets: &SocketSet<'static>, except: Option<(usize, u32)>, mut f: impl FnMut(PortHolder)) {
         for (c, chan) in self.chans.iter().enumerate() {
             let Some(chan) = chan else { continue };
             for (&i, s) in &chan.socks {
@@ -1004,7 +1128,7 @@ impl Service {
                 };
                 if let Some((local, reuse, listening, connected)) = held {
                     let addr = local.addr.map(bits);
-                    out.push(PortHolder { owner: chan.owner, port: local.port, addr, reuse, listening, connected, closing: false });
+                    f(PortHolder { owner: chan.owner, port: local.port, addr, reuse, listening, connected, closing: false });
                 }
             }
         }
@@ -1012,12 +1136,10 @@ impl Service {
             for cl in &self.closing {
                 if let Some(local) = cl.local {
                     let addr = local.addr.map(bits);
-                    out.push(PortHolder { owner: cl.owner, port: local.port, addr, reuse: cl.reuse, listening: false, connected: false, closing: true });
+                    f(PortHolder { owner: cl.owner, port: local.port, addr, reuse: cl.reuse, listening: false, connected: false, closing: true });
                 }
             }
-            out.extend(self.lingering.iter().map(|l| l.holder));
         }
-        out
     }
 
     /// Whether instance `owner` has a TCP connection from `local` to
@@ -1033,8 +1155,7 @@ impl Service {
         let live = socks().any(|s| matches!(&s.proto, Proto::Tcp(t) if t.backlog.is_none() && same(t.handle)));
         let listening = socks().any(|s| matches!(&s.proto, Proto::Tcp(Tcp { backlog: Some(set), .. }) if set.iter().any(|&h| same(h))));
         let closing = self.closing.iter().any(|cl| cl.owner == owner && same(cl.handle));
-        let lingering = self.lingering.iter().any(|l| l.holder.owner == owner && l.tuple == Some((local, remote)));
-        live || listening || closing || lingering
+        live || listening || closing
     }
 
     /// Whether socket `sock` of channel `c` may claim `port` on `addr`
@@ -1044,35 +1165,43 @@ impl Service {
         let owner = self.chans[c].as_ref().expect("in use").owner;
         let claim = PortClaim { owner, port, addr: addr.map(bits), reuse };
         let rule = if tcp { tcp_port_conflict } else { udp_port_conflict };
-        self.holders(tcp, sockets, Some((c, sock))).iter().any(|h| rule(&claim, h))
+        let mut conflict = false;
+        self.for_each_holder(tcp, sockets, Some((c, sock)), |h| conflict |= rule(&claim, &h));
+        conflict
     }
 
     /// A free ephemeral port: held by no TCP socket, or bound by no UDP one.
-    /// RFC 6056's first algorithm: a random start, then the next free one,
-    /// so that nobody on the network (or another instance) can guess the
-    /// ports a host's connections will use.
-    fn ephemeral(&mut self, tcp: bool, sockets: &SocketSet<'static>) -> Result<u16, i64> {
-        let held: alloc::collections::BTreeSet<u16> = self.holders(tcp, sockets, None).iter().map(|h| h.port).collect();
-        let range = (u16::MAX - FIRST_EPHEMERAL) as u64 + 1;
-        let start = (self.random() % range) as u16;
-        for k in 0..range as u16 {
-            let port = FIRST_EPHEMERAL + start.wrapping_add(k) % range as u16;
-            if !held.contains(&port) {
-                return Ok(port);
+    /// For a connection to `remote`, RFC 6056's third algorithm: a keyed
+    /// hash of the destination (`PORT_KEY`, secret) gives where the search
+    /// starts and a counter moves it on, so ports are unpredictable to
+    /// anyone (on the network or in another instance) and successive
+    /// connections to one destination do not reuse a port soon; for a bind
+    /// to port 0 (no destination yet), a random start (its first
+    /// algorithm). The ports in use are marked in a bitmap kept for this
+    /// (no allocation).
+    fn ephemeral(&mut self, tcp: bool, remote: Option<IpEndpoint>, sockets: &SocketSet<'static>) -> Result<u16, i64> {
+        let mut used = core::mem::replace(&mut self.port_scratch, [0; 256]);
+        used.fill(0);
+        self.for_each_holder(tcp, sockets, None, |h| {
+            if let Some(i) = h.port.checked_sub(FIRST_EPHEMERAL) {
+                used[i as usize / 64] |= 1 << (i % 64);
             }
-        }
-        Err(EADDRINUSE)
-    }
-
-    /// A random number: xorshift64* over a state that the time stamp
-    /// counter stirs at every draw (netd has no other source of entropy).
-    fn random(&mut self) -> u64 {
-        let mut x = self.rng ^ unsafe { core::arch::x86_64::_rdtsc() }.rotate_left(29);
-        x ^= x >> 12;
-        x ^= x << 25;
-        x ^= x >> 27;
-        self.rng = x;
-        x.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        });
+        const RANGE: u32 = (u16::MAX - FIRST_EPHEMERAL) as u32 + 1;
+        let start = match remote {
+            Some(r) => {
+                let mut data = [0u8; 7];
+                data[..4].copy_from_slice(&bits(r.addr).to_be_bytes());
+                data[4..6].copy_from_slice(&r.port.to_be_bytes());
+                data[6] = tcp as u8;
+                self.port_counter = self.port_counter.wrapping_add(1);
+                (csprng::siphash(&secret(&PORT_KEY), &data) as u32).wrapping_add(self.port_counter)
+            }
+            None => self.rng.u64() as u32,
+        };
+        let found = (0..RANGE).map(|k| start.wrapping_add(k) % RANGE).find(|&i| used[i as usize / 64] & (1 << (i % 64)) == 0);
+        self.port_scratch = used;
+        found.map(|i| FIRST_EPHEMERAL + i as u16).ok_or(EADDRINUSE)
     }
 
     fn bind(&mut self, c: usize, sock: u32, at: Endpoint, reuse: bool, sockets: &mut SocketSet<'static>) -> Reply {
@@ -1089,7 +1218,7 @@ impl Service {
             Proto::Raw { .. } => return done(0),
         };
         let port = match at.port {
-            0 => self.ephemeral(is_tcp, sockets)?,
+            0 => self.ephemeral(is_tcp, None, sockets)?,
             p if self.conflict(is_tcp, c, sock, p, addr, reuse, sockets) => return Err(EADDRINUSE),
             p => p,
         };
@@ -1129,7 +1258,7 @@ impl Service {
                 return Err(EADDRINUSE);
             }
         }
-        let port = if bound.is_none() { Some(self.ephemeral(true, sockets)?) } else { None };
+        let port = if bound.is_none() { Some(self.ephemeral(true, None, sockets)?) } else { None };
         // The backlog's sockets beside the socket's own, as many as the
         // budget allows (a smaller backlog if it is short). They cost only
         // their place until a connection arrives.
@@ -1213,7 +1342,7 @@ impl Service {
                         l
                     }
                     // (An ephemeral port is held by no TCP socket at all.)
-                    None => IpListenEndpoint { addr: None, port: self.ephemeral(true, sockets)? },
+                    None => IpListenEndpoint { addr: None, port: self.ephemeral(true, Some(remote), sockets)? },
                 };
                 // Its buffers come now (the SYN announces the window).
                 self.equip(handle, sockets)?;
@@ -1248,7 +1377,7 @@ impl Service {
                     return Err(EINVAL);
                 }
                 if peer.is_some() && !sockets.get::<udp::Socket>(handle).is_open() {
-                    let port = self.ephemeral(false, sockets)?;
+                    let port = self.ephemeral(false, peer, sockets)?;
                     sockets.get_mut::<udp::Socket>(handle).bind(port).map_err(|_| EADDRINUSE)?;
                 }
                 if let Proto::Udp { peer: p, .. } = &mut self.sock(c, sock)?.proto {
@@ -1369,7 +1498,7 @@ impl Service {
                 return Err(ENETUNREACH);
             }
             if !sockets.get::<udp::Socket>(handle).is_open() {
-                let port = self.ephemeral(false, sockets)?;
+                let port = self.ephemeral(false, Some(dest), sockets)?;
                 sockets.get_mut::<udp::Socket>(handle).bind(port).map_err(|_| EADDRINUSE)?;
             }
             let socket = sockets.get_mut::<udp::Socket>(handle);
@@ -1413,7 +1542,7 @@ impl Service {
                 let id = u16::from_be_bytes([packet[IPV4_HEADER + 4], packet[IPV4_HEADER + 5]]);
                 let owner = self.chans[c].as_ref().expect("in use").owner;
                 let wire = self.echo.outgoing(owner, id, oxrt::uptime_ms());
-                netring::set_echo_id(packet, IPV4_HEADER + 4, IPV4_HEADER, wire);
+                netring::set_echo_id(packet, IPV4_HEADER + 4, IPV4_HEADER, None, wire);
             }
             socket.send_slice(packet).map_err(|_| EAGAIN)?;
             done(len as i64)
@@ -1437,7 +1566,7 @@ impl Service {
                     if h != own {
                         let owner = self.chan(c).owner;
                         // (Its reset goes out before it goes.)
-                        self.closing.push(Closing { handle: h, leftover: None, sent: 0, local: None, reuse: true, owner, orphan: false, mark: (tcp::State::Closed, 0), since: crate::now() });
+                        self.closing.push(Closing { handle: h, leftover: None, sent: 0, local: None, reuse: true, owner, orphan: false, mark: (tcp::State::Closed, 0), since: crate::now(), time_wait: None });
                     }
                 }
                 self.show(c, sock);
@@ -1529,7 +1658,7 @@ impl Service {
                     }
                     let (local, reuse) = if listener { (None, true) } else { (t.local, t.reuse) };
                     let mark = (socket.state(), socket.send_queue());
-                    self.closing.push(Closing { handle: h, leftover: rest, sent: 0, local, reuse, owner, orphan, mark, since: now });
+                    self.closing.push(Closing { handle: h, leftover: rest, sent: 0, local, reuse, owner, orphan, mark, since: now, time_wait: None });
                 }
             }
             Proto::Udp { handle, .. } | Proto::Raw { handle, .. } => {
@@ -1640,7 +1769,7 @@ impl Service {
     pub fn pump(&mut self, sockets: &mut SocketSet<'static>) -> bool {
         let mut progress = self.finish_closing(sockets);
         let mut wants = core::mem::take(&mut self.wants);
-        let icmp = self.icmp_ports(sockets).map(|(tcp, udp)| IcmpOwners { echo: &self.echo, tcp, udp });
+        let icmp = self.icmp_ports(sockets).then_some(IcmpOwners { echo: &self.echo, tcp: &self.tcp_owners, udp: &self.udp_owners });
         let mut round = Round { now: crate::now(), trimming: pressure(&self.bytes), owner: 0, icmp };
         for chan in self.chans.iter_mut().flatten() {
             round.owner = chan.owner;
@@ -1651,7 +1780,10 @@ impl Service {
                 // broken as a failed copy.
                 let pumped = if s.area.is_some() && rings.is_none() { Err(()) } else { pump_one(s, ctl, rings, sockets, &round, &mut wants) };
                 match pumped {
-                    Ok(moved) => progress |= moved,
+                    Ok(moved) => {
+                        progress |= moved;
+                        chan.busy |= moved;
+                    }
                     Err(()) => {
                         // The client broke the protocol or took the grant
                         // away: the socket is reset and reports EIO. A
@@ -1678,6 +1810,7 @@ impl Service {
                 if publish(s, ctl) {
                     chan.area.header.mark_client(i as usize);
                     chan.marked = true;
+                    chan.busy = true;
                     progress = true;
                 }
             }
@@ -1696,14 +1829,20 @@ impl Service {
     /// Who holds each TCP and UDP port, for the ICMP errors about them, if
     /// a raw socket has messages to take (rare: it is worked out only
     /// then; the echo identifiers are `self.echo`).
-    fn icmp_ports(&self, sockets: &SocketSet<'static>) -> Option<(BTreeMap<u16, u64>, BTreeMap<u16, u64>)> {
+    fn icmp_ports(&mut self, sockets: &SocketSet<'static>) -> bool {
         let pending = self.chans.iter().flatten().flat_map(|c| c.socks.values()).any(|s| matches!(&s.proto, Proto::Raw { handle, .. } if sockets.get::<raw::Socket>(*handle).can_recv()));
         if !pending {
-            return None;
+            return false;
         }
-        let tcp = self.holders(true, sockets, None).iter().map(|h| (h.port, h.owner)).collect();
-        let udp = self.holders(false, sockets, None).iter().map(|h| (h.port, h.owner)).collect();
-        Some((tcp, udp))
+        for tcp in [true, false] {
+            // (Made room for at the start: no allocation here.)
+            let mut owners = core::mem::take(if tcp { &mut self.tcp_owners } else { &mut self.udp_owners });
+            owners.clear();
+            self.for_each_holder(tcp, sockets, None, |h| owners.push((h.port, h.owner)));
+            owners.sort_unstable();
+            *(if tcp { &mut self.tcp_owners } else { &mut self.udp_owners }) = owners;
+        }
+        true
     }
 
     /// Gives the connections that arrived at listeners since smoltcp last
@@ -1733,6 +1872,14 @@ impl Service {
         for (owner, h) in slots().flatten() {
             let sk = sockets.get::<tcp::Socket>(h);
             match sk.state() {
+                // A connection that went before it was accepted (reset,
+                // timed out) left its socket listening again: its buffers
+                // go, so the next one is counted as half-open again (and a
+                // peer cannot pin buffers by connecting and resetting).
+                tcp::State::Listen if sk.recv_capacity() > 0 || sk.send_capacity() > 0 => {
+                    resize(mem, bytes, h, Way::Rx, 0, sockets);
+                    resize(mem, bytes, h, Way::Tx, 0, sockets);
+                }
                 tcp::State::Listen | tcp::State::Closed => {}
                 tcp::State::SynReceived if sk.recv_capacity() == 0 => {
                     // A place among the half-open connections, within the
@@ -1770,31 +1917,39 @@ impl Service {
         let mut progress = false;
         let mut done = Vec::new();
         let now = crate::now();
-        let Service { lingering, lingering_records: records, closing, mem, bytes, orphans, .. } = self;
-        lingering.retain(|l| {
-            if now < l.until {
-                return true;
-            }
-            records.uncharge(l.holder.owner, 1);
-            false
-        });
+        let Service { closing, mem, bytes, orphans, .. } = self;
         closing.retain_mut(|cl| {
             let socket = sockets.get_mut::<tcp::Socket>(cl.handle);
             let st = socket.state();
-            if st == tcp::State::TimeWait || st == tcp::State::Closed {
-                if st == tcp::State::TimeWait {
-                    // Both FINs went: what is left is the port, for
-                    // TIME-WAIT (Linux keeps it as a small record too),
-                    // within the instance's share of records (beyond it the
-                    // port is free at once). The buffers go now; a segment
-                    // of the old connection that still comes is answered
-                    // with a reset instead of an ACK.
-                    if let Some(local) = cl.local.filter(|_| records.charge(cl.owner, 1).is_ok()) {
-                        let holder = PortHolder { owner: cl.owner, port: local.port, addr: local.addr.map(bits), reuse: cl.reuse, listening: false, connected: false, closing: true };
-                        let tuple = socket.local_endpoint().zip(socket.remote_endpoint());
-                        lingering.push(Lingering { holder, tuple, until: now + TIME_WAIT });
-                    }
+            if st == tcp::State::TimeWait {
+                // Both FINs went: the connection stays in TIME-WAIT, as on
+                // Linux, until smoltcp's timer ends it (Closed): its port
+                // and 4-tuple stay taken, and a retransmitted FIN of the
+                // peer gets its ACK. Its buffers go now (nothing more can
+                // come or go); it holds only its place in smoltcp, within
+                // its instance's share of sockets.
+                if socket.recv_capacity() > 0 || socket.send_capacity() > 0 {
+                    resize(mem, bytes, cl.handle, Way::Rx, 0, sockets);
+                    resize(mem, bytes, cl.handle, Way::Tx, 0, sockets);
                 }
+                cl.drop_leftover(bytes);
+                // No longer an orphan (nothing to finish).
+                if core::mem::take(&mut cl.orphan) {
+                    orphans.uncharge(cl.owner, 1);
+                }
+                // smoltcp starts its timer again for every FIN the peer
+                // sends again (RFC 9293): a peer that keeps sending FINs
+                // would keep it forever. It goes after `TIME_WAIT_MAX` in
+                // all, silently (out of smoltcp: nothing more is sent).
+                let since = *cl.time_wait.get_or_insert(now);
+                if now >= since + TIME_WAIT_MAX {
+                    done.push(cl.handle);
+                    progress = true;
+                    return false;
+                }
+                return true;
+            }
+            if st == tcp::State::Closed {
                 // (A reset made below goes out with the next poll, before
                 // the socket goes: Closed is looked at first.)
                 cl.drop_leftover(bytes);
@@ -1859,9 +2014,7 @@ impl Service {
     /// When netd must look at its sockets again although nothing happens
     /// (an orphan's or a TIME-WAIT record's time is up).
     pub fn deadline(&self) -> Option<Instant> {
-        let orphans = self.closing.iter().filter_map(Closing::deadline);
-        let records = self.lingering.iter().map(|l| l.until);
-        orphans.chain(records).min()
+        self.closing.iter().filter_map(Closing::deadline).min()
     }
 }
 
@@ -2114,9 +2267,9 @@ fn pump_one(s: &mut Sock, ctl: &Ctl, rings: Option<Rings>, sockets: &mut SocketS
                         match view {
                             // The instance's own echo identifier, not the
                             // one netd put on the wire.
-                            View::Echo { at, message, id } => {
+                            View::Echo { at, message, inner, id } => {
                                 let mut mine = data.to_vec();
-                                netring::set_echo_id(&mut mine, at, message, id);
+                                netring::set_echo_id(&mut mine, at, message, inner, id);
                                 Rings::write(r.rx, r.size, pos, &mine)
                             }
                             _ => Rings::write(r.rx, r.size, pos, data),
@@ -2162,10 +2315,10 @@ struct IcmpOwners<'a> {
     /// The echo identifiers on the wire (netd gives each instance's
     /// requests their own: `netring::EchoIds`).
     echo: &'a EchoIds,
-    /// Who holds each TCP and UDP port (one instance at most: ports are
-    /// never shared across instances).
-    tcp: BTreeMap<u16, u64>,
-    udp: BTreeMap<u16, u64>,
+    /// Who holds each TCP and UDP port, sorted (one instance at most:
+    /// ports are never shared across instances).
+    tcp: &'a [(u16, u64)],
+    udp: &'a [(u16, u64)],
 }
 
 /// What an instance sees of an ICMP message.
@@ -2174,7 +2327,7 @@ enum View {
     Whole,
     /// It with the echo identifier at byte `at` (in the message at byte
     /// `message`) put back to the instance's own.
-    Echo { at: usize, message: usize, id: u16 },
+    Echo { at: usize, message: usize, inner: Option<usize>, id: u16 },
     Nothing,
 }
 
@@ -2188,19 +2341,25 @@ impl IcmpOwners<'_> {
     fn view(&self, packet: &[u8], owner: u64) -> View {
         let Some(key) = netring::icmp_key(packet) else { return View::Whole };
         let holder = match key {
-            netring::IcmpKey::Echo { id, request, at, message } => {
+            netring::IcmpKey::Echo { id, request, at, message, inner } => {
                 return match self.echo.incoming(id) {
-                    Some((o, local)) if o == owner => View::Echo { at, message, id: local },
+                    Some((o, local)) if o == owner => View::Echo { at, message, inner, id: local },
                     Some(_) => View::Nothing,
                     None if request => View::Whole,
                     None => View::Nothing,
                 };
             }
-            netring::IcmpKey::Tcp(port) => self.tcp.get(&port),
-            netring::IcmpKey::Udp(port) => self.udp.get(&port),
+            netring::IcmpKey::Tcp(port) => holder_of(self.tcp, port),
+            netring::IcmpKey::Udp(port) => holder_of(self.udp, port),
         };
-        if holder == Some(&owner) { View::Whole } else { View::Nothing }
+        if holder == Some(owner) { View::Whole } else { View::Nothing }
     }
+}
+
+/// The instance in `owners` (sorted by port) holding `port`.
+fn holder_of(owners: &[(u16, u64)], port: u16) -> Option<u64> {
+    let i = owners.partition_point(|&(p, _)| p < port);
+    owners.get(i).filter(|&&(p, _)| p == port).map(|&(_, o)| o)
 }
 
 enum Placed {
@@ -2302,8 +2461,10 @@ fn equip(mem: &mut BTreeMap<SocketHandle, Mem>, bytes: &mut Budget, h: SocketHan
 
 /// An idle connection's buffers go back under pressure: the send buffer
 /// entirely (it comes back with the next write, `grow`), the receive
-/// buffer down to `TCP_MIN` (the window shrinks: see smoltcp's
-/// `replace_rx_buffer`). Only empty buffers shrink; true if one did.
+/// buffer down to `TCP_MIN` only as far as the window announced so far
+/// allows (its right edge never moves left: smoltcp's `replace_rx_buffer`
+/// refuses, so in practice only a connection whose window closed gives
+/// it back). Only empty buffers shrink; true if one did.
 fn trim(mem: &mut BTreeMap<SocketHandle, Mem>, bytes: &mut Budget, h: SocketHandle, sockets: &mut SocketSet<'static>) -> bool {
     let socket = sockets.get::<tcp::Socket>(h);
     let (rx, tx) = (socket.recv_capacity() > TCP_MIN, socket.send_capacity() > 0);

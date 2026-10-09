@@ -140,6 +140,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "csprng"
+version = "0.1.0"
+
+[[package]]
 name = "defmt"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -448,6 +452,7 @@ dependencies = [
 name = "netd"
 version = "0.1.0"
 dependencies = [
+ "csprng",
  "netring",
  "oxrt",
  "ring",
@@ -483,6 +488,7 @@ name = "oxidenix"
 version = "0.1.0"
 dependencies = [
  "bootloader_api",
+ "csprng",
  "heapless",
  "lazy_static",
  "linked_list_allocator",

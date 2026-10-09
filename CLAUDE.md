@@ -44,7 +44,9 @@ An AI research project; see README.md.
   --release -p netring` the socket protocol (Linux server <-> netd: encodings, validation, the
   shared area's wake protocols with threads), `cargo test -p ldisc` the line discipline of the
   Linux server's terminals, `cargo test -p procproto` the text formats of `/proc` (procfs's
-  and the Linux server's), `cargo test --manifest-path third_party/smoltcp/Cargo.toml --lib`
+  and the Linux server's) and what procfs gives each client, `cargo test -p csprng` the
+  kernel's random generator (ChaCha20) and the keyed hash (SipHash) against their test vectors,
+  `cargo test --manifest-path third_party/smoltcp/Cargo.toml --lib`
   netd's smoltcp (vendored with patches, its own workspace; the patches are listed in its
   `Cargo.toml` and marked `oxidenix:`).
 - QEMU must always run with a visible window; never use `-display none`.
