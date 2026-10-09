@@ -354,7 +354,9 @@ device. Decisions in ADR 0007.
   instance's page faults wait for it): its echoes (`console_write` with `CONSOLE_ECHO`) go
   into a bounded queue (4 KiB, the rest dropped, as Linux's echo buffer) that the writer
   holding the turn drains between its pieces, or the echoing thread when nobody holds it.
-  The signals of ^C, ^\ and ^Z are sent before the echo. The console's answers to queries are
+  The signals of ^C, ^\ and ^Z are sent before the echo. A change of the holder empties the
+  queue (an echo checks the holder under the queue's lock): one holder's echoes never reach
+  the next one's screen. The console's answers to queries are
   taken in the lock hold that made them (each costs budget, so one hold's always fit): they
   become input for the holder's own writes only, the kernel's text gets none.
 - **The monitor** (the kernel's fallback shell) edits its command line on the raw device
@@ -402,7 +404,9 @@ placeholder in the kernel's descriptor table, as pipes are).
   asked at every pass, as Linux's. A read takes the read turn for the whole call (Linux's
   `atomic_read_lock`: a line or a `VMIN` batch is never split between readers); turns are
   interruptible waits on the terminal's change counter, not server locks, since they are held
-  across waits for input. Bytes are peeked under the terminal's lock, copied to the program
+  across waits for input, and first come first served (tickets; one given up by a signal is
+  skipped), so a caller that comes back at once queues behind the others instead of barging
+  in before the woken waiter runs. Bytes are peeked under the terminal's lock, copied to the program
   with only the reader lock (`rlock`) held, and consumed after (a flush in between is seen by
   an epoch). That lock is safe across the copy, where a fault may wait for the pager: only
   programs' reads and settings changes take it, never the pager.
@@ -411,7 +415,9 @@ placeholder in the kernel's descriptor table, as pipes are).
   output processing happens under the terminal's lock into the server's memory, a pty's
   output goes to its master's buffer under it, the console's to the device after it. No lock
   of `sync` is held across the console's write (a flooding writer would get a lock holder's
-  priority for the whole write and starve its CPU's other threads). Output stopped by
+  priority for the whole write and starve its CPU's other threads); the columns that output
+  leaves count once it went out (a signal while it waits for the console's turn writes
+  nothing, and the restarted write processes it once). Output stopped by
   `VSTOP` (or `tcflow`) waits for `VSTART`. Echoes take neither turn.
 - **Job control** (Linux's `tty_check_change`): a process of a background group reading its
   controlling terminal gets SIGTTIN for its group and the call restarts after it (EIO if it
@@ -439,10 +445,12 @@ placeholder in the kernel's descriptor table, as pipes are).
 - **Devices by number**: a character device node names its driver by its device number, as on
   Linux: (5,0) `/dev/tty` (the caller's controlling terminal, ENXIO without one), (5,1)
   `/dev/console`, (5,2) `/dev/ptmx`, (136,n) `/dev/pts/n` are the server's, whatever
-  filesystem holds the node; (1,3) and (1,5) are the kernel's null and zero (a node of the
-  server's opens the kernel's), any other number has no driver (ENXIO). `O_PATH` opens the
-  node without its driver, `O_DIRECTORY` is ENOTDIR. The kernel's `/dev` gives its nodes their
-  numbers (`st_rdev`).
+  filesystem holds the node; (1,3) and (1,5) are null and zero: the kernel's for its own
+  nodes, the server's (`devices.rs`, with the node's own status; zero maps anonymous memory)
+  for nodes of its filesystems; any other number has no driver (ENXIO). `O_PATH` opens any
+  device node alone, never its driver, as Linux's: the server's node-only file with the
+  node's status, the access mode ignored, reads, writes and ioctls EBADF. `O_DIRECTORY` is
+  ENOTDIR. The kernel's `/dev` gives its nodes their numbers (`st_rdev`).
 - **ioctls**: `TCGETS`/`TCSETS`/`TCSETSW`/`TCSETSF` and the `termios2` forms, `TCSBRK`,
   `TCSBRKP`, `TCXONC`, `TCFLSH`, `TIOCGWINSZ`/`TIOCSWINSZ`, `TIOCGPGRP`/`TIOCSPGRP`,
   `TIOCGSID`, `TIOCSCTTY`, `TIOCNOTTY`, `TIOCSTI` (everyone is root), `FIONREAD`,
