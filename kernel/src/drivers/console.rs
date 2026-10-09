@@ -514,15 +514,15 @@ impl Console {
 
     fn control(&mut self, b: u8) {
         match b {
-            b'\n' => {
-                self.col = 0;
+            // A line feed keeps the column, as on a VT (and Linux's console
+            // without LNM): CR LF is the writer's (the terminal's ONLCR).
+            b'\n' | 0x0b | 0x0c => {
                 self.wrap_pending = false;
                 self.line_feed();
             }
             b'\r' => self.move_to(0, self.row),
             0x08 => self.move_to(self.col.min(self.cols - 1).saturating_sub(1), self.row),
             b'\t' => self.move_to((self.col / 8 + 1) * 8, self.row),
-            0x0b | 0x0c => self.line_feed(),
             // Shift out / shift in: G1 / G0.
             0x0e => self.shift_out = true,
             0x0f => self.shift_out = false,
@@ -714,9 +714,18 @@ impl fmt::Write for Cursor<'_> {
     }
 }
 
-impl fmt::Write for Console {
+/// The kernel's own text to a byte sink: a newline is a carriage return and a
+/// line feed (the devices take bytes as they are; this is the kernel's ONLCR).
+struct Text<F: FnMut(&[u8])>(F);
+
+impl<F: FnMut(&[u8])> fmt::Write for Text<F> {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        self.write_bytes(s.as_bytes());
+        for (i, part) in s.split('\n').enumerate() {
+            if i > 0 {
+                (self.0)(b"\r\n");
+            }
+            (self.0)(part.as_bytes());
+        }
         Ok(())
     }
 }
@@ -784,12 +793,23 @@ macro_rules! printkln {
 
 pub fn _print(args: fmt::Arguments) {
     use core::fmt::Write;
-    super::serial::write_fmt(args);
+    let _ = Text(super::serial::write_bytes).write_fmt(args);
     without_interrupts(|| {
         if let Some(c) = CONSOLE.lock().as_mut() {
-            let _ = c.write_fmt(args);
+            let _ = Text(|b: &[u8]| c.write_bytes(b)).write_fmt(args);
         }
     });
+}
+
+/// Writes text of the kernel's (the monitor's echo, the native servers' output):
+/// newlines become CR LF.
+pub fn write_text(bytes: &[u8]) {
+    for (i, part) in bytes.split(|&b| b == b'\n').enumerate() {
+        if i > 0 {
+            write_bytes(b"\r\n");
+        }
+        write_bytes(part);
+    }
 }
 
 /// Bytes per serial-port lock hold (it waits for the UART with interrupts

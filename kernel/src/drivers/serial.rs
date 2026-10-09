@@ -1,7 +1,6 @@
 //! COM1 serial port (output only). Everything the console prints is mirrored
 //! here, so a headless QEMU (`-serial stdio`) shows the kernel's output.
 
-use core::fmt;
 use crate::sync::IrqSpinLock;
 use x86_64::instructions::interrupts::without_interrupts;
 use x86_64::instructions::port::Port;
@@ -41,24 +40,10 @@ pub fn write_bytes(bytes: &[u8]) {
         if !*ready {
             return;
         }
+        // As they are: line ends are the writer's (the terminal's ONLCR, the
+        // kernel's own messages add their carriage returns).
         for &b in bytes {
-            if b == b'\n' {
-                put(b'\r');
-            }
             put(b);
         }
     });
-}
-
-struct Writer;
-
-impl fmt::Write for Writer {
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        write_bytes(s.as_bytes());
-        Ok(())
-    }
-}
-
-pub fn write_fmt(args: fmt::Arguments) {
-    let _ = fmt::Write::write_fmt(&mut Writer, args);
 }

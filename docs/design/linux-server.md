@@ -241,7 +241,7 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
        IPC protocol) is gone; the kernel only starts diskfs and, before it powers off, waits
        until the instances wrote their caches back. procfs over the rings follows (I/O rings
        step 5).
-   - **R6d — The terminal** (ADR 0004, ADR 0007): the console as a device of the server, the
+   - **R6d — The terminal** (done; ADR 0004, ADR 0007): the console as a device of the server, the
      line discipline and job control's terminal side in the server, and pseudo-terminals.
      See "The terminal" below.
    - **R6e — The descriptor table, `poll`, `select` and `epoll`** move with the sockets (R7),
@@ -385,10 +385,12 @@ placeholder in the kernel's descriptor table, as pipes are).
   inter-byte timer once a byte came, or the whole read's timeout with `VMIN` 0), the waits
   are interruptible server futex waits with a deadline. Readers go one at a time; bytes are
   copied to the program with no lock held and consumed after (as pipes).
-- **Writing**: output processing under the terminal's lock into the server's memory, then to
-  the driver under its write lock (which the service thread also takes for echoes; nobody
-  holding it waits for the pager, and it is never held while program memory is copied).
-  Output stopped by `VSTOP` (or `tcflow`) waits for `VSTART`.
+- **Writing**: output processing under the terminal's lock into the server's memory; a pty's
+  output goes to its master's buffer under it, the console's to the device after it. No lock
+  of the server is held across the console's write (a flooding writer would hold a lock
+  holder's priority for the whole write and starve its CPU's other threads); the kernel keeps
+  one write's bytes together (a sleeping lock of its own). Output stopped by `VSTOP` (or
+  `tcflow`) waits for `VSTART`.
 - **Job control** (Linux's `tty_check_change`): a process of a background group reading its
   controlling terminal gets SIGTTIN for its group and the call restarts after it (EIO if it
   ignores or blocks SIGTTIN or its group is orphaned); writing with `TOSTOP`, and

@@ -278,6 +278,19 @@ fn openat(dirfd: u64, addr: u64, flags: u32, mode: u32) -> Result<i64, i64> {
     if nofollow && resolved.mode & vfs::S_IFMT == vfs::S_IFLNK {
         return Err(ELOOP);
     }
+    // A character device node names its driver by its number, wherever the
+    // node is: the terminals are the server's (`tty`), the kernel's other
+    // devices (null, zero) its own; a node of the server's tmpfs with another
+    // number has no driver.
+    if resolved.mode & vfs::S_IFMT == vfs::S_IFCHR {
+        let st = resolved.node.stat()?;
+        if let Some(r) = crate::tty::open_device(vfs::stat::Stat::from_bytes(&st).rdev, flags, st) {
+            return r;
+        }
+        if !matches!(resolved.node, Node::Kernel(_)) {
+            return Err(crate::tty::ENXIO);
+        }
+    }
     let abs = join(&resolved.path);
     match resolved.node {
         Node::Kernel(k) => check(syscall(SYS_INODE_OPEN, [k.handle(), flags as u64, abs.as_ptr() as u64, abs.len() as u64, 0, 0])),

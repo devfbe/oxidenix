@@ -72,6 +72,9 @@ pub fn exit_thread(status: i32) -> ! {
     drop(files);
     drop(fs);
     drop(server);
+    // The Linux server instance of a program's thread, to tell it if this
+    // ends a session leader's process (below).
+    let instance = with_current(|p| p.linux.as_ref().and_then(|l| l.program_instance()));
     interrupts::disable();
     let mm = unsafe { me.own() }.mm.take();
     tlb::switch(mm.as_ref().map(|m| &*m.tlb), None, false);
@@ -100,6 +103,13 @@ pub fn exit_thread(status: i32) -> ! {
     };
     // An exec in another thread waits for this one to be gone.
     wakeup(group_chan(group.tgid));
+    // A session leader's process ended: its server dissociates the
+    // session's controlling terminal (Linux's disassociate_ctty).
+    if let Some(instance) = instance {
+        if last && group.info.lock().sid == group.tgid {
+            instance.session_ended(group.tgid);
+        }
+    }
     if last {
         let main_status = group.info.lock().main_status;
         let status = match group.sig.lock().exit {

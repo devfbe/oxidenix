@@ -5,7 +5,8 @@
 //! last descriptor closed (`EVENT_CLOSED`, to the service thread).
 //!
 //! `handle` takes the system calls on descriptors and creates files (pipe,
-//! pipe2, eventfd, netlink sockets): for a descriptor of one of the
+//! pipe2, eventfd, netlink sockets; terminals are opened by their device
+//! numbers, `tty::open_device`): for a descriptor of one of the
 //! server's files it answers itself, for one of the kernel's it returns
 //! None and the call passes through (except the requests the server
 //! answers for any descriptor: the netdevice ioctls on sockets).
@@ -53,6 +54,10 @@ pub enum File {
     Inotify(Arc<Inotify>),
     /// An AF_UNIX socket.
     Socket(Arc<crate::unix::Sock>),
+    /// An open terminal (the console, a pty's slave).
+    Tty(Arc<crate::tty::TtyOpen>),
+    /// A pty's master.
+    PtyMaster(Arc<crate::pty::PtyMaster>),
 }
 
 static FILES: Mutex<BTreeMap<u64, File>> = Mutex::new(BTreeMap::new());
@@ -93,6 +98,8 @@ pub fn closed(id: u64) {
                 crate::scm::request();
             }
         }
+        Some(File::Tty(open)) => open.tty.closed(&open),
+        Some(File::PtyMaster(m)) => crate::pty::master_closed(&m),
         _ => {}
     }
     // An eventfd or a tmpfs or /data file simply goes (the latter two
@@ -137,6 +144,8 @@ pub fn stat_of(fd: u64) -> Result<vfs::stat::Stat, i64> {
         Some((File::Netlink(n), _)) => n.stat(),
         Some((File::Inotify(i), _)) => i.stat(),
         Some((File::Socket(s), _)) => crate::sockcalls::stat(&s),
+        Some((File::Tty(t), _)) => t.stat,
+        Some((File::PtyMaster(m), _)) => m.stat,
         None => {
             let mut st = [0u8; 144];
             match syscall(SYS_KFD_STAT, [fd, st.as_mut_ptr() as u64, 0, 0, 0, 0]) {
@@ -303,6 +312,8 @@ fn on_file(nr: u64, file: File, flags: u32, a1: u64, a2: u64, a3: u64) -> Result
         File::Netlink(n) => return netlink::call(nr, &n, flags, [0, a1, a2, a3, 0, 0]),
         File::Inotify(i) => return inotify::call(nr, &i, flags, a1, a2),
         File::Socket(s) => return crate::sockcalls::on_file(nr, &s, flags, a1, a2),
+        File::Tty(t) => return crate::tty::call(nr, &t, flags, a1, a2),
+        File::PtyMaster(m) => return crate::pty::call(nr, &m, flags, a1, a2),
     };
     let readable = flags & O_ACCMODE != O_WRONLY;
     let writable = flags & O_ACCMODE != 0;
@@ -410,6 +421,10 @@ fn sendfile(out_fd: u64, out: Option<(File, u32)>, in_fd: u64, input: Option<(Fi
             Some((File::Tmp(f), _)) => f.read_server(&mut buf[..want]).map(|n| n as i64),
             Some((File::Data(f), _)) => f.read_server(&mut buf[..want]).map(|n| n as i64),
             Some((File::Socket(s), flags)) => crate::sockcalls::read_server(s, *flags, &mut buf[..want]),
+            Some((File::Tty(t), flags)) => {
+                t.tty.read(t, crate::unix::Sink::Server { buf: &mut buf[..want], at: 0 }, flags & O_NONBLOCK != 0)
+            }
+            Some((File::PtyMaster(m), flags)) => m.read(crate::unix::Sink::Server { buf: &mut buf[..want], at: 0 }, flags & O_NONBLOCK != 0),
             None => match syscall(SYS_KFD_READ, [in_fd, buf.as_mut_ptr() as u64, want as u64, 0, 0, 0]) {
                 r if r < 0 => Err(-r),
                 r => Ok(r),
@@ -429,6 +444,8 @@ fn sendfile(out_fd: u64, out: Option<(File, u32)>, in_fd: u64, input: Option<(Fi
             Some((File::Tmp(f), flags)) => f.write_server(&buf[..n], flags & O_APPEND != 0).map(|n| n as i64),
             Some((File::Data(f), flags)) => f.write_server(&buf[..n], flags & O_APPEND != 0).map(|n| n as i64),
             Some((File::Socket(s), flags)) => crate::sockcalls::write_server(s, *flags, &buf[..n]),
+            Some((File::Tty(t), flags)) => t.tty.write(t, crate::unix::Source::Server { buf: &buf[..n], at: 0 }, flags & O_NONBLOCK != 0),
+            Some((File::PtyMaster(m), flags)) => m.write(crate::unix::Source::Server { buf: &buf[..n], at: 0 }, flags & O_NONBLOCK != 0),
             None => match syscall(SYS_KFD_WRITE, [out_fd, buf.as_ptr() as u64, n as u64, 0, 0, 0]) {
                 r if r < 0 => Err(-r),
                 r => Ok(r),

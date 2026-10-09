@@ -1,6 +1,7 @@
 //! PS/2 keyboard: decodes scancodes in interrupt context and feeds the
-//! resulting bytes (UTF-8 text, control characters, VT100 key sequences)
-//! into the TTY.
+//! resulting bytes (UTF-8 text, control characters, the Linux console's key
+//! sequences) into the console device, whose holder's line discipline
+//! interprets them.
 
 use pc_keyboard::{layouts::De105Key, DecodedKey, HandleControl, KeyCode, KeyState, Keyboard, ScancodeSet1};
 use crate::sync::IrqSpinLock;
@@ -84,5 +85,5 @@ pub fn handle_scancode(scancode: u8) {
         },
         None => return,
     };
-    super::tty::input(bytes);
+    super::console_device::input(bytes);
 }

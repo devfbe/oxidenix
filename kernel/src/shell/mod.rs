@@ -21,8 +21,6 @@ pub fn run() -> ! {
 
     crate::printkln!("oxidenix monitor. Type 'help' for help, 'run bash' for a shell.");
     loop {
-        crate::drivers::tty::set_foreground(0);
-        crate::drivers::tty::reset();
         crate::printk!("> ");
         let line = read_line();
         let (cmd, args) = parse(&line);
@@ -86,13 +84,48 @@ pub fn settle() {
     }
 }
 
-/// Reads one line through the TTY, which handles echo and line editing.
+/// Reads one command line from the console device, which the monitor holds
+/// between programs: echo, Backspace (a whole UTF-8 character), Ctrl+U and
+/// Enter. The monitor is not Linux: no termios, no signals.
 fn read_line() -> String<256> {
-    let mut buf = [0u8; 256];
-    let n = crate::drivers::tty::read(&mut buf, false).unwrap_or(0);
-    let text = core::str::from_utf8(&buf[..n]).unwrap_or("");
+    use crate::drivers::{console, console_device};
+    let mut buf: Vec<u8, 255> = Vec::new();
+    loop {
+        match console_device::monitor_read() {
+            b'\r' | b'\n' => {
+                console::write_bytes(b"\r\n");
+                break;
+            }
+            0x7f | 0x08 => {
+                if buf.is_empty() {
+                    continue;
+                }
+                while buf.pop().is_some_and(|b| b & 0xc0 == 0x80) {}
+                console::write_bytes(b"\x08 \x08");
+            }
+            0x15 => {
+                while let Some(b) = buf.pop() {
+                    if b & 0xc0 != 0x80 {
+                        console::write_bytes(b"\x08 \x08");
+                    }
+                }
+            }
+            // Other control characters and escape sequences (arrow keys) are
+            // ignored; their bytes after the escape are printable, so the
+            // sequence's rest is dropped up to its final byte.
+            0x1b => {
+                while !matches!(console_device::monitor_read(), b'A'..=b'Z' | b'a'..=b'z' | b'~') {}
+            }
+            b if b < 0x20 => {}
+            b => {
+                if buf.push(b).is_ok() {
+                    console::write_bytes(&[b]);
+                }
+            }
+        }
+    }
     let mut line = String::new();
-    let _ = line.push_str(text.trim_end_matches('\n'));
+    let _ = line.push_str(core::str::from_utf8(&buf).unwrap_or(""));
     line
 }
 

@@ -365,6 +365,7 @@ name = "linux"
 version = "0.1.0"
 dependencies = [
  "fsring",
+ "ldisc",
  "linked_list_allocator",
  "netlink",
  "netproto",
