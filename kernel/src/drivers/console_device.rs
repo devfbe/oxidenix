@@ -61,6 +61,8 @@ pub fn holder() -> u64 {
 
 /// Serializes changes of the holder (the interrupt only reads it).
 static CHANGE: spin::Mutex<()> = spin::Mutex::new(());
+/// Advanced at every change of the holder (see `drain_echo`).
+static HOLDER_GEN: AtomicU64 = AtomicU64::new(0);
 
 /// Makes `id` (0: the monitor) the holder, whose service thread waits on `chan`;
 /// returns the previous holder. Input already there is the new holder's.
@@ -68,8 +70,9 @@ pub fn set_holder(id: u64, chan: usize) -> u64 {
     let _change = CHANGE.lock();
     HOLDER_CHAN.store(chan, Ordering::Release);
     let old = HOLDER.swap(id, Ordering::AcqRel);
-    // Echoes of the previous holder's input are not the new one's.
-    ECHO.lock().clear();
+    // Echoes of the previous holder's input are not the new one's: those queued go,
+    // and a batch a writer took out already is dropped when it sees the generation.
+    forget_echoes();
     if !INPUT.lock().is_empty() {
         PENDING.store(true, Ordering::Release);
         wakeup(if chan != 0 { chan } else { MONITOR_CHAN });
@@ -83,7 +86,7 @@ pub fn release(id: u64) {
     if HOLDER.load(Ordering::Acquire) == id {
         HOLDER_CHAN.store(0, Ordering::Release);
         HOLDER.store(0, Ordering::Release);
-        ECHO.lock().clear();
+        forget_echoes();
         wakeup(MONITOR_CHAN);
     }
 }
@@ -193,11 +196,20 @@ fn out(bytes: &[u8]) {
     console::write_with_replies(bytes, &mut |reply| input(reply));
 }
 
-/// Writes the queued echoes (the writer's turn held).
+/// The holder changed: its echoes go, those queued and (by the generation, advanced
+/// under the queue's lock with them) a batch a writer has taken out already.
+fn forget_echoes() {
+    let mut q = ECHO.lock();
+    HOLDER_GEN.fetch_add(1, Ordering::AcqRel);
+    q.clear();
+}
+
+/// Writes the queued echoes (the writer's turn held). A batch is written only if the
+/// holder it was taken for still holds the device.
 fn drain_echo() {
     let mut buf = [0u8; 256];
     loop {
-        let n = {
+        let (n, gen) = {
             let mut q = ECHO.lock();
             let mut n = 0;
             while n < buf.len() {
@@ -205,12 +217,14 @@ fn drain_echo() {
                 buf[n] = b;
                 n += 1;
             }
-            n
+            (n, HOLDER_GEN.load(Ordering::Acquire))
         };
         if n == 0 {
             return;
         }
-        out(&buf[..n]);
+        if HOLDER_GEN.load(Ordering::Acquire) == gen {
+            out(&buf[..n]);
+        }
     }
 }
 
