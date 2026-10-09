@@ -399,13 +399,29 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
      both rules are tested on the host). netd knows each channel's instance from the
      kernel's offer (`Offer::instance`, which no client can forge) and accounts per instance,
      whatever number of channels it opens (`netring::Budget`, charged before anything is
-     allocated, given back to the instance charged): at most two channels, three quarters
-     of netd's socket memory (smoltcp's buffers of its sockets, listeners' backlogs,
-     accepted connections, closing connections and what their send rings still held;
-     `ENOBUFS` beyond, a reset for a close whose leftovers do not fit), and a quarter of the
-     records of ports in TIME-WAIT (half of the ephemeral range in all), so no instance
-     starves the others. A connection in TIME-WAIT keeps only that record (its buffers go; a
-     late segment of it is answered with a reset). Raw ICMP sockets see every ICMP packet
+     allocated, given back to the instance charged, tested on the host): every resource
+     (netd's socket memory: smoltcp's buffers and closing connections' leftovers; smoltcp
+     sockets; orphans; records of ports in TIME-WAIT) has a limit in all and keeps a
+     reserve for every instance with a channel, which others never cut into; beyond the
+     reserves it goes to whoever asks first (one instance alone may use nearly all of it,
+     n instances can each count on their reserve). `ENOBUFS` beyond (and a reset for a
+     close whose leftovers do not fit); at most two channels an instance, and a channel
+     without sockets and requests for 10 s gives its slot to another instance's when all
+     64 are taken (its client makes a new channel when it wants one).
+     **Memory follows use**, as Linux autotunes its buffers: a TCP socket has no buffers
+     until it connects or a connection arrives (a listener's backlog of up to 128 costs
+     only the sockets' places); then Linux's first sizes (64 KiB to receive, 16 KiB to
+     send; given before the SYN-ACK goes, so it offers a window), which double up to 1 MiB
+     while they limit the transfer (smoltcp, vendored, has patches to grow buffers and to
+     announce the window scale of the largest). Under pressure (half of netd's 32 MiB in
+     use, as Linux's tcp_mem) connections start and stay small and idle ones give their
+     buffers back, so hundreds of connections fit (nettest opens 600). Closed connections
+     that finish in order (orphans, at most 4096) are reset after 60 s in FIN-WAIT-2
+     (tcp_fin_timeout) or 100 s without progress (a zero window, a peer that stopped
+     acknowledging); a connection attempt gives up after 127 s, unacknowledged data after
+     924 s (Linux's SYN and data retries), reported as `ETIMEDOUT`. A connection in
+     TIME-WAIT keeps only its port's record (its buffers go; a late segment of it is
+     answered with a reset). Raw ICMP sockets see every ICMP packet
      of the host, as on Linux (everyone is root): one instance's ICMP traffic shows in
      another's raw sockets. Each round it takes requests (no more than the completion ring
      has room for), the service bitmaps, polls the card and smoltcp, moves data between

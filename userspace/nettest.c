@@ -389,6 +389,64 @@ static void datagram_semantics(void) {
     close(tx);
 }
 
+/* Hundreds of connections at once, as a server's clients or a package
+ * manager's downloads make: a listener's backlog takes a burst of connects
+ * nobody accepted yet (beyond the old limit of 8), and every connection
+ * carries data both ways. netd's memory follows use (connections start
+ * small), so this fits. */
+#define PAIRS 300
+#define BURST 100
+static void many_sockets(void) {
+    static int c[PAIRS], s[PAIRS];
+    int port = 0;
+    int l = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a = addr("127.0.0.1", 0);
+    socklen_t alen = sizeof a;
+    int ok = bind(l, (struct sockaddr *)&a, sizeof a) == 0 && listen(l, 128) == 0 && getsockname(l, (struct sockaddr *)&a, &alen) == 0;
+    port = ntohs(a.sin_port);
+    /* A burst of connects before the first accept: each completes (the
+     * backlog holds them). */
+    int connected = 0;
+    for (int i = 0; ok && i < BURST; i++) {
+        c[i] = tcp_connect("127.0.0.1", port);
+        connected += c[i] >= 0;
+    }
+    check("a burst of 100 connects completes before any accept", ok && connected == BURST);
+    int accepted = 0;
+    for (int i = 0; i < BURST; i++) {
+        s[i] = accept(l, NULL, NULL);
+        accepted += s[i] >= 0;
+    }
+    check("... and all of them are accepted", accepted == BURST);
+    for (int i = BURST; i < PAIRS; i++) {
+        c[i] = tcp_connect("127.0.0.1", port);
+        s[i] = c[i] >= 0 ? accept(l, NULL, NULL) : -1;
+        if (c[i] < 0 || s[i] < 0) {
+            printf("  connection %d: %s\n", i, strerror(errno));
+            ok = 0;
+            break;
+        }
+    }
+    check("600 TCP sockets open at once", ok);
+    /* Every connection both ways: a request, then a larger answer. */
+    static char big[16384], got[16384];
+    for (unsigned k = 0; k < sizeof big; k++) big[k] = (char)(k * 7);
+    int good = 0;
+    for (int i = 0; ok && i < PAIRS; i++) {
+        char req[8];
+        snprintf(req, sizeof req, "q%05d", i);
+        if (write(c[i], req, 6) != 6 || read_all(s[i], got, 6) != 6 || memcmp(got, req, 6) != 0) continue;
+        if (write(s[i], big, sizeof big) != (long)sizeof big || read_all(c[i], got, sizeof got) != (int)sizeof got) continue;
+        good += memcmp(got, big, sizeof big) == 0;
+    }
+    check("... each carries data both ways", good == PAIRS);
+    for (int i = 0; i < PAIRS; i++) {
+        if (c[i] >= 0) close(c[i]);
+        if (s[i] >= 0) close(s[i]);
+    }
+    close(l);
+}
+
 /* One ICMP echo request to `ip`; returns 1 if the matching reply arrives
  * within two seconds (as a whole IPv4 packet, like on Linux). */
 static int icmp_echo(const char *ip) {
@@ -603,6 +661,7 @@ int main(void) {
 
     stream_semantics();
     datagram_semantics();
+    many_sockets();
 
     printf("nettest: %s\n", failures ? "FAILED" : "all passed");
     return failures;

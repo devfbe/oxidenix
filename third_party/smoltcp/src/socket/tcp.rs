@@ -666,29 +666,32 @@ impl<'a> Socket<'a> {
     }
 
     /// oxidenix: moves the receive buffer, with what it holds (out-of-order
-    /// segments too), into `storage`, which must be at least as large;
-    /// returns the old storage. A larger buffer opens the window (announced
-    /// once it grew enough, `window_to_update`).
+    /// segments too), into `storage` and returns the old storage. A larger
+    /// buffer opens the window (announced once it grew enough,
+    /// `window_to_update`). A smaller one takes only an empty buffer with no
+    /// out-of-order data (else `storage` is given back as the error); the
+    /// window then shrinks, which RFC 9293 discourages: the caller does it
+    /// only for an idle connection, whose peer has nothing in flight.
     ///
     /// # Panics
-    /// If `storage` is smaller than the current buffer, or larger than
-    /// 1 GiB.
-    pub fn replace_rx_buffer<S>(&mut self, storage: S) -> ManagedSlice<'a, u8>
+    /// If `storage` is larger than 1 GiB.
+    pub fn replace_rx_buffer<S>(&mut self, storage: S) -> Result<ManagedSlice<'a, u8>, ManagedSlice<'a, u8>>
     where
         S: Into<ManagedSlice<'a, u8>>,
     {
         let storage = storage.into();
         assert!(storage.len() <= 1 << 30, "receiving buffer too large, cannot exceed 1 GiB");
+        if storage.len() < self.rx_buffer.capacity() && !self.assembler.is_empty() {
+            return Err(storage);
+        }
         self.rx_buffer.replace_storage(storage)
     }
 
     /// oxidenix: moves the transmit buffer, with what it holds (sent and
-    /// unacknowledged, and unsent), into `storage`, which must be at least
-    /// as large; returns the old storage.
-    ///
-    /// # Panics
-    /// If `storage` is smaller than the current buffer.
-    pub fn replace_tx_buffer<S>(&mut self, storage: S) -> ManagedSlice<'a, u8>
+    /// unacknowledged, and unsent), into `storage` and returns the old
+    /// storage. A smaller one takes only an empty buffer (else `storage` is
+    /// given back as the error).
+    pub fn replace_tx_buffer<S>(&mut self, storage: S) -> Result<ManagedSlice<'a, u8>, ManagedSlice<'a, u8>>
     where
         S: Into<ManagedSlice<'a, u8>>,
     {
@@ -9981,7 +9984,7 @@ mod test {
             }]
         );
         // Given a buffer, it announces the window at once.
-        s.replace_rx_buffer(vec![0; 4096]);
+        s.replace_rx_buffer(vec![0; 4096]).unwrap();
         recv!(
             s,
             [TcpRepr {
@@ -10035,7 +10038,9 @@ mod test {
                 ..RECV_TEMPL
             })
         );
-        let old = s.replace_rx_buffer(vec![0; 64]);
+        // Not smaller while it holds data, or with a hole.
+        assert!(s.replace_rx_buffer(vec![0; 4]).is_err());
+        let old = s.replace_rx_buffer(vec![0; 64]).unwrap();
         assert_eq!(old.len(), 8);
         // The hole filled: everything is in order, acknowledged at once
         // with the grown window.
@@ -10069,7 +10074,9 @@ mod test {
             payload:    &b"abcdef"[..],
             ..RECV_TEMPL
         }));
-        s.replace_tx_buffer(vec![0; 16]);
+        // Not smaller while data is unacknowledged.
+        assert!(s.replace_tx_buffer(vec![0; 2]).is_err());
+        s.replace_tx_buffer(vec![0; 16]).unwrap();
         assert_eq!(s.send_slice(b"ghij"), Ok(4));
         // The ACK of "abc" takes them from the grown buffer.
         send!(
@@ -10085,6 +10092,66 @@ mod test {
             seq_number: LOCAL_SEQ + 1 + 3,
             ack_number: Some(REMOTE_SEQ + 1),
             payload:    &b"defghij"[..],
+            ..RECV_TEMPL
+        }));
+    }
+
+    #[test]
+    fn test_oxidenix_idle_buffers_shrink() {
+        let mut s = socket_established_with_buffer_sizes(64, 64);
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"abcdef"[..],
+                ..SEND_TEMPL
+            }
+        );
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 6),
+                window_len: 58,
+                ..RECV_TEMPL
+            }]
+        );
+        assert!(s.replace_rx_buffer(vec![0; 16]).is_err(), "it holds data");
+        let mut data = [0; 6];
+        assert_eq!(s.recv_slice(&mut data), Ok(6));
+        assert_eq!(s.replace_rx_buffer(vec![0; 16]).ok().map(|b| b.len()), Some(64));
+        // The next segment that fits is taken, and the window is the new one.
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 6,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"gh"[..],
+                ..SEND_TEMPL
+            }
+        );
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 8),
+                window_len: 14,
+                ..RECV_TEMPL
+            }]
+        );
+        assert_eq!(s.recv_slice(&mut data), Ok(2));
+        // The send buffer: none at all while idle, and a new one to send.
+        assert_eq!(s.replace_tx_buffer(vec![]).ok().map(|b| b.len()), Some(64));
+        assert_eq!(s.send_slice(b"x"), Ok(0));
+        s.replace_tx_buffer(vec![0; 8]).unwrap();
+        assert_eq!(s.send_slice(b"xyz"), Ok(3));
+        recv!(s, time 0, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1 + 8),
+            payload:    &b"xyz"[..],
+            // "gh" was read: the whole new receive buffer.
+            window_len: 16,
             ..RECV_TEMPL
         }));
     }

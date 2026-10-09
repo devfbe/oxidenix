@@ -2,8 +2,8 @@
 # README and license unchanged; examples, benchmarks and the integration test left out),
 # patched for netd. Every change is marked `oxidenix:` in the source:
 # - `RingBuffer::replace_storage`, `tcp::Socket::replace_rx_buffer`/`replace_tx_buffer`:
-#   a connection's buffers grow while it lives (netd sizes them by demand, as Linux
-#   autotunes its socket buffers).
+#   a connection's buffers grow while it lives, and empty ones shrink (netd sizes them by
+#   demand, as Linux autotunes its socket buffers).
 # - `tcp::Socket::set_rx_capacity_max`: the window scale a connection announces is
 #   computed from the largest receive buffer it may grow to, not from the first one.
 # - `tcp::Socket::timed_out`: whether the connection ended by its timeout (ETIMEDOUT)

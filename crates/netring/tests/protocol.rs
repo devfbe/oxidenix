@@ -245,9 +245,11 @@ fn no_instance_takes_a_port_another_one_serves() {
 
 #[test]
 fn budgets_bound_each_instance_and_all() {
-    let mut b = Budget::new(100, 60);
-    // One instance gets its share, not more, however it asks (many
-    // channels of it are the same owner).
+    let mut b = Budget::new(100, 10, 60);
+    // One instance gets its cap, not more, however it asks (many channels
+    // of it are the same owner).
+    b.activate(1);
+    b.activate(1);
     assert_eq!(b.charge(1, 40), Ok(()));
     assert_eq!(b.charge(1, 30), Err(ENOBUFS));
     assert_eq!(b.held(1), 40, "a refused charge takes nothing");
@@ -263,11 +265,49 @@ fn budgets_bound_each_instance_and_all() {
     assert_eq!((b.held(1), b.used()), (0, 40));
     b.uncharge(4, 10);
     assert_eq!(b.used(), 40);
-    assert_eq!(b.charge(3, 60), Ok(()));
-    assert_eq!(b.room(1), 0, "the whole is used up");
+    // Instance 1 (active) keeps its reserve: 3 gets the rest.
+    assert_eq!(b.room(3), 50);
+    assert_eq!(b.charge(3, 50), Ok(()));
+    assert_eq!(b.room(1), 10, "an active instance's reserve stays free");
     b.uncharge(2, 40);
     b.uncharge(3, 60);
+    b.deactivate(1);
+    b.deactivate(1);
     assert_eq!((b.used(), b.room(5)), (0, 60));
+}
+
+#[test]
+fn budgets_reserve_a_share_for_every_active_instance() {
+    let mut b = Budget::new(100, 20, 100);
+    // Alone, an instance may take everything.
+    b.activate(1);
+    assert_eq!(b.room(1), 100);
+    assert_eq!(b.charge(1, 70), Ok(()));
+    // A second instance comes: its reserve is kept from the first.
+    b.activate(2);
+    assert_eq!(b.room(1), 10);
+    assert_eq!(b.charge(1, 11), Err(ENOBUFS));
+    assert_eq!(b.charge(1, 10), Ok(()));
+    assert_eq!(b.room(2), 20);
+    // What it takes within its reserve is its own; beyond it, it competes.
+    assert_eq!(b.charge(2, 15), Ok(()));
+    assert_eq!(b.room(1), 0);
+    assert_eq!(b.room(2), 5);
+    // A third: nothing is left for its reserve, it gets what comes free
+    // first (the reserves of others stay theirs).
+    b.activate(3);
+    assert_eq!(b.room(3), 0);
+    b.uncharge(1, 30);
+    assert_eq!(b.room(3), 30, "the 35 free minus 2's unused reserve");
+    assert_eq!(b.room(1), 10, "the 35 free minus 2's and 3's unused reserves");
+    // An instance that leaves takes its reserve along.
+    b.deactivate(2);
+    assert_eq!(b.room(3), 35);
+    b.uncharge(2, 15);
+    b.deactivate(3);
+    b.uncharge(1, 50);
+    b.deactivate(1);
+    assert_eq!((b.used(), b.room(9)), (0, 100));
 }
 
 /// A shared area in host memory, page-aligned.

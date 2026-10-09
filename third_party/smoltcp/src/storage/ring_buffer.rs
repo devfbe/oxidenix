@@ -45,28 +45,31 @@ impl<'a, T: 'a> RingBuffer<'a, T> {
         }
     }
 
-    /// oxidenix: moves the buffer into `storage`, at least as large as the
-    /// current one, and returns the old storage. All of the old storage is
+    /// oxidenix: moves the buffer into `storage` and returns the old
+    /// storage. Into storage at least as large, all of the old storage is
     /// copied, the unallocated part too (a TCP receive buffer keeps
-    /// out-of-order data there), in the order it follows the read position;
-    /// offsets relative to the read position stay valid.
-    ///
-    /// # Panics
-    /// If `storage` is smaller than the current storage.
-    pub fn replace_storage<S>(&mut self, storage: S) -> ManagedSlice<'a, T>
+    /// out-of-order data there), in the order it follows the read position,
+    /// so offsets relative to the read position stay valid. Smaller storage
+    /// takes only an empty buffer (nothing is copied: the caller knows that
+    /// nothing in the unallocated part matters); otherwise it is given back
+    /// as the error.
+    pub fn replace_storage<S>(&mut self, storage: S) -> Result<ManagedSlice<'a, T>, ManagedSlice<'a, T>>
     where
         S: Into<ManagedSlice<'a, T>>,
         T: Copy,
     {
         let mut storage = storage.into();
         let capacity = self.capacity();
-        assert!(storage.len() >= capacity, "a ring buffer only grows");
-        let first = capacity - self.read_at;
-        storage[..first].copy_from_slice(&self.storage[self.read_at..]);
-        storage[first..capacity].copy_from_slice(&self.storage[..self.read_at]);
+        if storage.len() >= capacity {
+            let first = capacity - self.read_at;
+            storage[..first].copy_from_slice(&self.storage[self.read_at..]);
+            storage[first..capacity].copy_from_slice(&self.storage[..self.read_at]);
+        } else if !self.is_empty() {
+            return Err(storage);
+        }
         self.read_at = 0;
         core::mem::swap(&mut self.storage, &mut storage);
-        storage
+        Ok(storage)
     }
 
     /// Clear the ring buffer.
@@ -836,7 +839,9 @@ mod test {
         assert_eq!(ring.enqueue_slice(b"ghij"), 4);
         // Allocated "efghij" wraps; "xy" beyond it, unallocated.
         assert_eq!(ring.write_unallocated(0, b"xy"), 2);
-        let old = ring.replace_storage(vec![b'-'; 16]);
+        // Not into smaller storage while it holds data.
+        assert_eq!(ring.replace_storage(vec![b'-'; 4]).map_err(|s| s.len()).err(), Some(4));
+        let old = ring.replace_storage(vec![b'-'; 16]).unwrap();
         assert_eq!(old.len(), 8);
         assert_eq!(ring.capacity(), 16);
         assert_eq!(ring.len(), 6);
@@ -850,16 +855,28 @@ mod test {
     }
 
     #[test]
-    #[should_panic]
-    fn test_buffer_replace_storage_never_shrinks() {
+    fn test_buffer_replace_storage_shrinks_when_empty() {
         let mut ring = RingBuffer::new(vec![0u8; 8]);
-        ring.replace_storage(vec![0u8; 4]);
+        assert_eq!(ring.enqueue_slice(b"abcdef"), 6);
+        let mut out = [0; 6];
+        assert_eq!(ring.dequeue_slice(&mut out), 6);
+        assert_eq!(ring.replace_storage(vec![0u8; 4]).ok().map(|s| s.len()), Some(8));
+        assert_eq!(ring.capacity(), 4);
+        assert_eq!(ring.enqueue_slice(b"wxyz!"), 4);
+        let mut out = [0; 4];
+        assert_eq!(ring.dequeue_slice(&mut out), 4);
+        assert_eq!(&out, b"wxyz");
+        // Down to nothing, and up again.
+        assert!(ring.replace_storage(vec![]).is_ok());
+        assert_eq!(ring.window(), 0);
+        assert!(ring.replace_storage(vec![0u8; 2]).is_ok());
+        assert_eq!(ring.enqueue_slice(b"ab"), 2);
     }
 
     #[test]
     fn test_buffer_replace_empty_storage() {
         let mut ring: RingBuffer<u8> = RingBuffer::new(vec![]);
-        ring.replace_storage(vec![0; 4]);
+        ring.replace_storage(vec![0; 4]).unwrap();
         assert_eq!(ring.enqueue_slice(b"abcd"), 4);
         assert_eq!(ring.len(), 4);
     }

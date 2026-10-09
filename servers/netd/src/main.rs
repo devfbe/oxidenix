@@ -23,21 +23,43 @@ use alloc::vec;
 use alloc::vec::Vec;
 use nic::Nic;
 use oxrt::println;
-use smoltcp::iface::{Config, Interface, PollResult, SocketSet};
+use smoltcp::iface::{Config, Interface, PollIngressSingleResult, PollResult, SocketSet};
 use smoltcp::socket::dhcpv4;
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, IpCidr, Ipv4Address, Ipv4Cidr};
 use virtio_net::VirtioNet;
 
-/// The heap: the sockets themselves, frames in flight, the channels'
-/// bookkeeping. smoltcp's socket buffers are not in it: each socket's are
-/// memory of their own, gone with the socket (`service::Region`).
-const HEAP: usize = 8 << 20;
+/// The heap: the sockets themselves (smoltcp's socket set, made for
+/// `service::MAX_SMOLTCP` at once, about 1.8 MiB), frames in flight, the
+/// channels' bookkeeping. smoltcp's socket buffers are not in it: each is
+/// memory of its own, gone with the socket (`service::Region`).
+const HEAP: usize = 4 << 20;
 
 oxrt::entry!(main, heap = HEAP);
 
 fn now() -> Instant {
     Instant::from_millis(oxrt::uptime_ms() as i64)
+}
+
+/// smoltcp's poll, with the connections that arrived given their buffers
+/// between taking the frames and sending (`Service::arrivals`): their
+/// SYN-ACK offers a window. True if a socket's state may have changed.
+fn poll(iface: &mut Interface, nic: &mut Nic, sockets: &mut SocketSet<'static>, service: &mut service::Service) -> bool {
+    let t = now();
+    let mut changed = false;
+    iface.poll_maintenance(t);
+    loop {
+        match iface.poll_ingress_single(t, nic, sockets) {
+            PollIngressSingleResult::None => break,
+            PollIngressSingleResult::PacketProcessed => {}
+            PollIngressSingleResult::SocketStateChanged => changed = true,
+        }
+    }
+    service.arrivals(sockets);
+    while iface.poll_egress(t, nic, sockets) == PollResult::SocketStateChanged {
+        changed = true;
+    }
+    changed
 }
 
 /// Value of `key=...` among the arguments the kernel passed.
@@ -96,7 +118,9 @@ fn main(args: Vec<&'static str>) -> i32 {
     iface.update_ip_addrs(|addrs| {
         let _ = addrs.push(IpCidr::Ipv4(LOOPBACK));
     });
-    let mut sockets = SocketSet::new(vec![]);
+    // Room for every socket the service may make (and DHCP's) from the
+    // start: the set never moves to a larger allocation.
+    let mut sockets = SocketSet::new(Vec::with_capacity(service::MAX_SMOLTCP + 1));
     let dhcp = sockets.add(dhcpv4::Socket::new());
     // The kernel waits for the registration, so boot messages stay in
     // order: register once DHCP is done, or after DHCP_WAIT_MS without it.
@@ -112,7 +136,7 @@ fn main(args: Vec<&'static str>) -> i32 {
     let mut busy = 0u32;
     loop {
         let mut progress = service.serve(&mut iface, &mut sockets);
-        progress |= iface.poll(now(), &mut nic, &mut sockets) == PollResult::SocketStateChanged;
+        progress |= poll(&mut iface, &mut nic, &mut sockets, &mut service);
         progress |= service.pump(&mut sockets);
         match sockets.get_mut::<dhcpv4::Socket>(dhcp).poll() {
             Some(dhcpv4::Event::Configured(c)) => {
@@ -185,6 +209,12 @@ fn main(args: Vec<&'static str>) -> i32 {
             service.prepare_sleep()
         };
         let mut timeout = iface.poll_delay(now(), &sockets).map(|d| d.total_millis());
+        // The service's own timers: orphans that make no progress, the end
+        // of TIME-WAIT.
+        if let Some(at) = service.deadline() {
+            let left = (at - now().min(at)).total_millis();
+            timeout = Some(timeout.map_or(left, |t| t.min(left)));
+        }
         if !registered {
             let left = register_at.saturating_sub(oxrt::uptime_ms());
             timeout = Some(timeout.map_or(left, |t| t.min(left)));
@@ -197,7 +227,7 @@ fn main(args: Vec<&'static str>) -> i32 {
                 let _ = oxrt::irq_enable(irq);
             }
             Ok(oxrt::Event::Control(id, len)) => {
-                let status = service.offer(&message[..len]);
+                let status = service.offer(&message[..len], &mut sockets);
                 let _ = oxrt::ipc_reply(id, &status.to_le_bytes());
             }
             // No protocol besides the rings.

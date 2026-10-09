@@ -743,32 +743,86 @@ impl Request {
 }
 
 /// A resource netd shares among the instances (bytes of socket buffers,
-/// records of ports in TIME-WAIT, channels): at most `limit` in all and at
-/// most `share` for one instance, whatever number of channels it opened,
-/// so no instance can starve the others. Charged before anything is
-/// allocated, given back to the instance that was charged.
+/// smoltcp sockets, records of ports in TIME-WAIT, channels): at most
+/// `limit` in all. Each *active* instance (one with a channel to netd) is
+/// guaranteed `reserve` of it: what others take never cuts into what an
+/// active instance holds below its reserve. Beyond the reserves the
+/// resource goes to whoever asks first, so one instance alone may use
+/// nearly all of it, and n active instances can each count on `reserve`
+/// whatever the others do (the fair share scales with the number of
+/// active instances; `limit` must cover the reserves of as many as there
+/// can be channels). `cap` bounds what one instance holds, whatever
+/// number of channels it opened. Charged before anything is allocated,
+/// given back to the instance that was charged.
 #[derive(Debug, Default)]
 pub struct Budget {
     limit: usize,
-    share: usize,
+    reserve: usize,
+    cap: usize,
     used: usize,
-    /// What each instance holds (instances holding nothing are not kept).
-    by_owner: alloc::collections::BTreeMap<u64, usize>,
+    /// The reserves of active instances not yet used: what nobody else may
+    /// take.
+    reserved: usize,
+    /// What each instance holds and how often it is active (instances
+    /// neither holding anything nor active are not kept).
+    owners: alloc::collections::BTreeMap<u64, Owner>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct Owner {
+    held: usize,
+    active: u32,
+}
+
+impl Owner {
+    /// What of `reserve` this owner has not used yet (none if inactive).
+    fn unused(&self, reserve: usize) -> usize {
+        if self.active > 0 { reserve.saturating_sub(self.held) } else { 0 }
+    }
 }
 
 impl Budget {
-    pub const fn new(limit: usize, share: usize) -> Budget {
-        Budget { limit, share, used: 0, by_owner: alloc::collections::BTreeMap::new() }
+    pub const fn new(limit: usize, reserve: usize, cap: usize) -> Budget {
+        Budget { limit, reserve, cap, used: 0, reserved: 0, owners: alloc::collections::BTreeMap::new() }
     }
 
-    /// What `owner` may still take.
+    fn owner(&self, owner: u64) -> Owner {
+        self.owners.get(&owner).copied().unwrap_or_default()
+    }
+
+    /// Changes `owner`'s entry by `f`, keeping `reserved` right.
+    fn update(&mut self, owner: u64, f: impl FnOnce(&mut Owner)) {
+        let mut o = self.owner(owner);
+        self.reserved -= o.unused(self.reserve);
+        f(&mut o);
+        self.reserved += o.unused(self.reserve);
+        if o.held == 0 && o.active == 0 {
+            self.owners.remove(&owner);
+        } else {
+            self.owners.insert(owner, o);
+        }
+    }
+
+    /// `owner` got a channel: its reserve is kept for it from now on.
+    pub fn activate(&mut self, owner: u64) {
+        self.update(owner, |o| o.active += 1);
+    }
+
+    /// `owner` gave up a channel (its reserve goes with its last).
+    pub fn deactivate(&mut self, owner: u64) {
+        self.update(owner, |o| o.active = o.active.saturating_sub(1));
+    }
+
+    /// What `owner` may still take: what is free beyond the others'
+    /// unused reserves, within its cap.
     pub fn room(&self, owner: u64) -> usize {
-        let held = self.held(owner);
-        (self.limit - self.used).min(self.share.saturating_sub(held))
+        let o = self.owner(owner);
+        let others = self.reserved - o.unused(self.reserve);
+        self.limit.saturating_sub(self.used + others).min(self.cap.saturating_sub(o.held))
     }
 
     pub fn held(&self, owner: u64) -> usize {
-        self.by_owner.get(&owner).copied().unwrap_or(0)
+        self.owner(owner).held
     }
 
     pub fn used(&self) -> usize {
@@ -781,19 +835,15 @@ impl Budget {
             return Err(ENOBUFS);
         }
         self.used += n;
-        *self.by_owner.entry(owner).or_insert(0) += n;
+        self.update(owner, |o| o.held += n);
         Ok(())
     }
 
     /// Gives `n` back from `owner` (never more than it holds).
     pub fn uncharge(&mut self, owner: u64, n: usize) {
-        let Some(held) = self.by_owner.get_mut(&owner) else { return };
-        let n = n.min(*held);
-        *held -= n;
+        let n = n.min(self.held(owner));
         self.used -= n;
-        if *held == 0 {
-            self.by_owner.remove(&owner);
-        }
+        self.update(owner, |o| o.held -= n);
     }
 }
 

@@ -55,7 +55,12 @@ Alternatives considered:
   control blocks, and port sharing (`SO_REUSEADDR`) never lets one instance take a port
   another one serves (`netring`'s port rules, tested on the host); netd accounts per instance
   (the kernel's offer names it), whatever number of channels it opens: at most two channels,
-  three quarters of netd's socket memory, a quarter of the TIME-WAIT records.
+  and of every other resource a reserve kept for each instance with a channel, the rest to
+  whoever asks first.
+- **netd's memory follows use**: smoltcp (vendored with small patches) lets a connection's
+  buffers grow from Linux's first sizes while they limit the transfer, and under pressure
+  connections stay small and idle ones give their buffers back, so an idle connection costs
+  little, as on Linux.
 
 ## Consequences
 
@@ -66,8 +71,11 @@ Alternatives considered:
   rings) and a third service thread per instance; it loses its socket layer, the poll source of
   server-announced files (`ipc_notify`) and the netd relay of interface records.
 - Memory: 128 KiB of the server's pool per connected socket (in 2 MiB grants), smoltcp's
-  buffers in netd (128 KiB per TCP socket, a mapping of their own that goes with the socket;
-  at most 24 MiB in all), 33 pages of shared area per instance.
+  buffers in netd (80 KiB for a new connection, up to 2 MiB under load, 4 KiB when idle under
+  pressure; mappings of their own that go with the socket; at most 32 MiB in all), 33 pages
+  of shared area per instance.
+- netd carries a vendored smoltcp (`third_party/smoltcp`, its patches listed in its
+  `Cargo.toml` and tested with smoltcp's own tests).
 - The control block's layout and its memory ordering become part of the ABI between the server
   and netd (`crates/netring`, tested on the host).
 - `SO_LINGER` with a timeout does not block `close` (the close reaches the server after the

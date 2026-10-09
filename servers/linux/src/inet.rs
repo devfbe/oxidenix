@@ -198,9 +198,18 @@ impl InetSock {
         })
     }
 
-    /// A new socket of `kind` in netd.
+    /// A new socket of `kind` in netd. A channel that died meanwhile (netd
+    /// went, or let an idle channel go to make room for another
+    /// instance's) is made again, once.
     pub fn create(kind: Kind) -> Result<Arc<InetSock>, i64> {
         let net = netclient::net()?;
+        match Self::create_on(kind, &net) {
+            Err(_) if net.is_dead() => Self::create_on(kind, &netclient::net()?),
+            r => r,
+        }
+    }
+
+    fn create_on(kind: Kind, net: &Arc<netclient::Net>) -> Result<Arc<InetSock>, i64> {
         let index = net.take_index()?;
         let rings = if kind.datagrams() {
             match net.take_rings() {
