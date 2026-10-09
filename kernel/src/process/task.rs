@@ -391,6 +391,11 @@ pub struct Task {
     /// The address of the Linux server's count of the locks it holds on
     /// this thread (`restricted::SERVER_LOCKS_OFFSET` in its State page),
     /// 0 for a task that is no Linux thread: the scheduler boosts a holder.
+    /// Valid for the task's whole life: the word's slot is the task's own
+    /// `LinuxThread`'s (`own.linux`, set before the task first runs and
+    /// never taken or replaced), which gives the slot back only when it is
+    /// dropped, with this task; so no reader of this field can see another
+    /// thread's count in a reused slot.
     pub server_locks: AtomicU64,
     /// Channel it waits on (0: none), and the sequence number of the
     /// timer that ends its sleep (0: none; see `timer`).
