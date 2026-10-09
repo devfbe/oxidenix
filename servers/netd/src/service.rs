@@ -64,7 +64,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering::SeqCst};
 use netring::errno::*;
 use netring::{
-    fill, opt, pieces, state, tcp_port_conflict, udp_port_conflict, Area, Budget, Buf, Completion, Ctl, Endpoint, Kind, Link, PortClaim, PortHolder, Record, Request,
+    fill, opt, pieces, state, tcp_port_conflict, udp_port_conflict, Area, Budget, Buf, Completion, Ctl, EchoIds, Endpoint, Kind, Link, PortClaim, PortHolder, Record, Request,
     SharedArea, RECORD_HEADER,
 };
 use ring::channel::{Header, Layout, Offer};
@@ -98,8 +98,6 @@ const RAW_BUFFER: usize = 16 * 1024;
 /// A raw socket's hop limit until IP_TTL sets one (Linux's
 /// net.ipv4.ip_default_ttl).
 const DEFAULT_TTL: u8 = 64;
-/// The echo identifiers a raw socket remembers (the last it sent).
-const ECHO_IDS: usize = 16;
 /// The bytes of smoltcp's socket buffers (and leftovers) netd keeps at
 /// most, in mappings of their own (`Region`).
 const BUDGET: usize = 32 << 20;
@@ -128,6 +126,9 @@ const INSTANCE_CHANNELS: usize = 2;
 /// The most connections one listener queues (Linux's net.core.somaxconn
 /// before 5.4).
 const MAX_BACKLOG: usize = 128;
+/// Half-open connections (SYN-RECEIVED) at once, of all listeners
+/// (Linux's tcp_max_syn_backlog): each holds a `TCP_MIN` buffer.
+const MAX_HALF_OPEN: usize = 256;
 /// The largest UDP payload (an IPv4 packet of 65535 bytes).
 const MAX_UDP: usize = 65507;
 const IPV4_HEADER: usize = 20;
@@ -362,10 +363,8 @@ impl Opts {
 enum Proto {
     Tcp(Tcp),
     Udp { handle: SocketHandle, peer: Option<IpEndpoint>, reuse: bool },
-    /// `ttl`: the hop limit of the packets the socket sends (IP_TTL);
-    /// `ids`: the identifiers of the echo requests it sent last (their
-    /// replies are its instance's, `IcmpOwners`).
-    Raw { handle: SocketHandle, peer: Option<Ipv4Address>, ttl: u8, ids: Vec<u16> },
+    /// `ttl`: the hop limit of the packets the socket sends (IP_TTL).
+    Raw { handle: SocketHandle, peer: Option<Ipv4Address>, ttl: u8 },
 }
 
 /// What netd publishes of a socket, as it last did.
@@ -507,6 +506,8 @@ pub struct Service {
     /// The TCP buffers that limit their transfer this round, to grow
     /// (kept for its capacity).
     wants: Vec<(SocketHandle, Want)>,
+    /// The echo identifiers of the instances' raw sockets on the wire.
+    echo: EchoIds,
     /// A datagram on its way out.
     scratch: Vec<u8>,
     pub config: Config,
@@ -558,6 +559,7 @@ impl Service {
             channels: Budget::new(MAX_CHANNELS, 0, INSTANCE_CHANNELS),
             mem: BTreeMap::new(),
             wants: Vec::new(),
+            echo: EchoIds::default(),
             scratch: vec![0; MAX_UDP.max(RAW_BUFFER)],
             config: Config::default(),
         }
@@ -712,6 +714,10 @@ impl Service {
         self.channels.uncharge(chan.owner, 1);
         for b in [&mut self.bytes, &mut self.socks, &mut self.lingering_records, &mut self.orphans] {
             b.deactivate(chan.owner);
+        }
+        if self.channels.held(chan.owner) == 0 {
+            // Its echo identifiers are free again.
+            self.echo.forget(chan.owner);
         }
     }
 
@@ -909,7 +915,7 @@ impl Service {
                 Sock::new(Proto::Tcp(t), None, 0)
             }
             Kind::Udp => Sock::new(Proto::Udp { handle, peer: None, reuse: false }, area, state::SEND_OPEN | state::WRITABLE),
-            Kind::RawIcmp => Sock::new(Proto::Raw { handle, peer: None, ttl: DEFAULT_TTL, ids: Vec::new() }, area, state::SEND_OPEN | state::WRITABLE),
+            Kind::RawIcmp => Sock::new(Proto::Raw { handle, peer: None, ttl: DEFAULT_TTL }, area, state::SEND_OPEN | state::WRITABLE),
         };
         self.enter(c, sock, s);
         done(0)
@@ -1328,20 +1334,16 @@ impl Service {
             if !socket.can_send() {
                 return Err(EAGAIN);
             }
-            socket.send_slice(packet).map_err(|_| EAGAIN)?;
-            // An echo request: its replies are this instance's.
-            let message = &self.scratch[IPV4_HEADER..IPV4_HEADER + len];
-            if len >= 8 && message[0] == 8 {
-                let id = u16::from_be_bytes([message[4], message[5]]);
-                if let Proto::Raw { ids, .. } = &mut self.sock(c, sock)?.proto {
-                    if !ids.contains(&id) {
-                        if ids.len() == ECHO_IDS {
-                            ids.remove(0);
-                        }
-                        ids.push(id);
-                    }
-                }
+            // An echo request goes with an identifier of the instance's
+            // own on the wire (its replies come back to it alone, with its
+            // identifier put back: `IcmpOwners::view`).
+            if len >= 8 && packet[IPV4_HEADER] == 8 {
+                let id = u16::from_be_bytes([packet[IPV4_HEADER + 4], packet[IPV4_HEADER + 5]]);
+                let owner = self.chans[c].as_ref().expect("in use").owner;
+                let wire = self.echo.outgoing(owner, id, oxrt::uptime_ms());
+                netring::set_echo_id(packet, IPV4_HEADER + 4, IPV4_HEADER, wire);
             }
+            socket.send_slice(packet).map_err(|_| EAGAIN)?;
             done(len as i64)
         }
     }
@@ -1545,7 +1547,8 @@ impl Service {
     pub fn pump(&mut self, sockets: &mut SocketSet<'static>) -> bool {
         let mut progress = self.finish_closing(sockets);
         let mut wants = core::mem::take(&mut self.wants);
-        let mut round = Round { now: crate::now(), trimming: pressure(&self.bytes), owner: 0, icmp: self.icmp_owners(sockets) };
+        let icmp = self.icmp_ports(sockets).map(|(tcp, udp)| IcmpOwners { echo: &self.echo, tcp, udp });
+        let mut round = Round { now: crate::now(), trimming: pressure(&self.bytes), owner: 0, icmp };
         for chan in self.chans.iter_mut().flatten() {
             round.owner = chan.owner;
             for (&i, s) in chan.socks.iter_mut() {
@@ -1585,44 +1588,64 @@ impl Service {
         progress
     }
 
-    /// Whose ICMP messages are whose, if a raw socket has any to take
-    /// (rare: it is worked out only then).
-    fn icmp_owners(&self, sockets: &SocketSet<'static>) -> Option<IcmpOwners> {
-        let raw = || self.chans.iter().flatten().flat_map(|c| c.socks.values().map(move |s| (c.owner, s)));
-        let pending = raw().any(|(_, s)| matches!(&s.proto, Proto::Raw { handle, .. } if sockets.get::<raw::Socket>(*handle).can_recv()));
+    /// Who holds each TCP and UDP port, for the ICMP errors about them, if
+    /// a raw socket has messages to take (rare: it is worked out only
+    /// then; the echo identifiers are `self.echo`).
+    fn icmp_ports(&self, sockets: &SocketSet<'static>) -> Option<(BTreeMap<u16, u64>, BTreeMap<u16, u64>)> {
+        let pending = self.chans.iter().flatten().flat_map(|c| c.socks.values()).any(|s| matches!(&s.proto, Proto::Raw { handle, .. } if sockets.get::<raw::Socket>(*handle).can_recv()));
         if !pending {
             return None;
         }
-        let mut o = IcmpOwners::default();
-        for (owner, s) in raw() {
-            if let Proto::Raw { ids, .. } = &s.proto {
-                o.echo.extend(ids.iter().map(|&id| (id, owner)));
-            }
-        }
-        o.tcp.extend(self.holders(true, sockets, None).iter().map(|h| (h.port, h.owner)));
-        o.udp.extend(self.holders(false, sockets, None).iter().map(|h| (h.port, h.owner)));
-        Some(o)
+        let tcp = self.holders(true, sockets, None).iter().map(|h| (h.port, h.owner)).collect();
+        let udp = self.holders(false, sockets, None).iter().map(|h| (h.port, h.owner)).collect();
+        Some((tcp, udp))
     }
 
     /// Gives the connections that arrived at listeners since smoltcp last
-    /// sent their first buffers, so that their SYN-ACK offers a window
-    /// (called between smoltcp's taking frames and its sending). A
-    /// connection the budget has no room for is refused with a reset (its
-    /// socket listens again once the reset went).
+    /// sent buffers (called between smoltcp's taking frames and its
+    /// sending). A half-open connection (SYN-RECEIVED) gets only a small
+    /// receive buffer, so that its SYN-ACK offers a window, and nothing to
+    /// send: what anyone on the network can make by sending SYNs stays
+    /// small, and at most `MAX_HALF_OPEN` exist at once (beyond, a SYN is
+    /// answered with a reset, as Linux drops one past tcp_max_syn_backlog).
+    /// A connection the peer completed gets its first sizes (the window
+    /// opens with the next segment). One the budget has no room for is
+    /// refused with a reset (its socket listens again once the reset went).
     pub fn arrivals(&mut self, sockets: &mut SocketSet<'static>) {
         let Service { chans, mem, bytes, .. } = self;
-        for chan in chans.iter().flatten() {
-            for s in chan.socks.values() {
-                let Proto::Tcp(Tcp { backlog: Some(set), .. }) = &s.proto else { continue };
-                for &h in set {
-                    let sk = sockets.get::<tcp::Socket>(h);
-                    if matches!(sk.state(), tcp::State::Listen | tcp::State::Closed) || sk.recv_capacity() > 0 && sk.send_capacity() > 0 {
-                        continue;
+        let slots = || chans.iter().flatten().flat_map(|c| c.socks.values()).filter_map(|s| match &s.proto {
+            Proto::Tcp(Tcp { backlog: Some(set), .. }) => Some(set.iter().copied()),
+            _ => None,
+        });
+        let half_open = |h: SocketHandle| {
+            let sk = sockets.get::<tcp::Socket>(h);
+            sk.state() == tcp::State::SynReceived && sk.recv_capacity() > 0
+        };
+        let mut open = slots().flatten().filter(|&h| half_open(h)).count();
+        for h in slots().flatten() {
+            let sk = sockets.get::<tcp::Socket>(h);
+            match sk.state() {
+                tcp::State::Listen | tcp::State::Closed => {}
+                tcp::State::SynReceived if sk.recv_capacity() == 0 => {
+                    let ok = open < MAX_HALF_OPEN && resize(mem, bytes, h, Way::Rx, TCP_MIN, sockets);
+                    if ok {
+                        open += 1;
+                    } else {
+                        sockets.get_mut::<tcp::Socket>(h).abort();
+                    }
+                }
+                tcp::State::SynReceived => {}
+                _ if sk.send_capacity() == 0 => {
+                    // Completed: its first sizes.
+                    let rx = first_size(bytes, Way::Rx);
+                    if sk.recv_capacity() < rx {
+                        resize(mem, bytes, h, Way::Rx, rx, sockets);
                     }
                     if equip(mem, bytes, h, sockets).is_err() {
                         sockets.get_mut::<tcp::Socket>(h).abort();
                     }
                 }
+                _ => {}
             }
         }
     }
@@ -1949,20 +1972,20 @@ fn pump_one(s: &mut Sock, ctl: &Ctl, rings: Option<Rings>, sockets: &mut SocketS
             let mut moved = false;
             if let Some(r) = rings {
                 loop {
-                    let (len, from) = match socket.peek() {
+                    let (len, from, view) = match socket.peek() {
                         Ok(data) => {
                             let from = Ipv4Packet::new_checked(data).map_or(0, |p| p.src_addr().to_bits());
                             // A connected socket takes its peer's packets
                             // only (as on Linux), and an instance sees no
                             // other instance's ICMP traffic.
-                            let theirs = icmp.and_then(|i| i.owner(data)).is_some_and(|o| o != owner);
-                            if peer.is_some_and(|p| p.to_bits() != from) || theirs {
+                            let view = icmp.map_or(View::Whole, |i| i.view(data, owner));
+                            if peer.is_some_and(|p| p.to_bits() != from) || matches!(view, View::Nothing) {
                                 let _ = socket.recv();
                                 continue;
                             }
                             // Whole IPv4 packets, header included, as on
                             // Linux.
-                            (data.len() as u32, from)
+                            (data.len() as u32, from, view)
                         }
                         Err(_) => {
                             *rx_wait = false;
@@ -1971,7 +1994,16 @@ fn pump_one(s: &mut Sock, ctl: &Ctl, rings: Option<Rings>, sockets: &mut SocketS
                     };
                     match place_record(rx_tail, rx_wait, ctl, &r, len, Endpoint { addr: from, port: 0 }, |pos| {
                         let data = socket.peek().expect("peeked above");
-                        Rings::write(r.rx, r.size, pos, data)
+                        match view {
+                            // The instance's own echo identifier, not the
+                            // one netd put on the wire.
+                            View::Echo { at, message, id } => {
+                                let mut mine = data.to_vec();
+                                netring::set_echo_id(&mut mine, at, message, id);
+                                Rings::write(r.rx, r.size, pos, &mine)
+                            }
+                            _ => Rings::write(r.rx, r.size, pos, data),
+                        }
                     })? {
                         Placed::Yes => {
                             let _ = socket.recv();
@@ -1994,56 +2026,60 @@ fn pump_one(s: &mut Sock, ctl: &Ctl, rings: Option<Rings>, sockets: &mut SocketS
 }
 
 /// What `pump_one` needs to know of the round.
-struct Round {
+struct Round<'a> {
     now: Instant,
     /// Memory is under pressure: idle connections give their buffers back.
     trimming: bool,
     /// The instance of the channel pumped.
     owner: u64,
     /// Whose ICMP messages are whose (made when a raw socket has some).
-    icmp: Option<IcmpOwners>,
+    icmp: Option<IcmpOwners<'a>>,
 }
 
-/// Which instance an ICMP message is for, so that none sees another's:
-/// echo requests and replies by the identifier its raw sockets sent,
-/// errors by the TCP or UDP port (or echo identifier) of the packet they
-/// quote. Messages of no instance's (requests from other hosts, say) are
-/// everyone's, as on Linux.
-#[derive(Default)]
-struct IcmpOwners {
-    echo: BTreeMap<u16, u64>,
+/// Which instance an ICMP message is for, so that none sees another's
+/// (`IcmpOwners::view`).
+struct IcmpOwners<'a> {
+    /// The echo identifiers on the wire (netd gives each instance's
+    /// requests their own: `netring::EchoIds`).
+    echo: &'a EchoIds,
+    /// Who holds each TCP and UDP port (one instance at most: ports are
+    /// never shared across instances).
     tcp: BTreeMap<u16, u64>,
     udp: BTreeMap<u16, u64>,
 }
 
-impl IcmpOwners {
-    /// The instance whose `packet` (an IPv4 packet carrying ICMP) is.
-    fn owner(&self, packet: &[u8]) -> Option<u64> {
-        let ip = Ipv4Packet::new_checked(packet).ok()?;
-        let icmp = ip.payload();
-        if icmp.len() < 8 {
-            return None;
-        }
-        let echo_id = |m: &[u8]| (m.len() >= 8 && (m[0] == 0 || m[0] == 8)).then(|| u16::from_be_bytes([m[4], m[5]]));
-        match icmp[0] {
-            0 | 8 => self.echo.get(&echo_id(icmp)?).copied(),
-            // Destination unreachable, source quench, redirect, time
-            // exceeded, parameter problem: the IP header and the first 8
-            // bytes of the packet that caused it follow.
-            3 | 4 | 5 | 11 | 12 => {
-                let quoted = &icmp[8..];
-                let ihl = (*quoted.first()? as usize & 0xf) * 4;
-                let l4 = quoted.get(ihl..)?;
-                let port = || Some(u16::from_be_bytes([*l4.first()?, *l4.get(1)?]));
-                match *quoted.get(9)? {
-                    1 => self.echo.get(&echo_id(l4)?).copied(),
-                    6 => self.tcp.get(&port()?).copied(),
-                    17 => self.udp.get(&port()?).copied(),
-                    _ => None,
-                }
+/// What an instance sees of an ICMP message.
+enum View {
+    /// It as it came.
+    Whole,
+    /// It with the echo identifier at byte `at` (in the message at byte
+    /// `message`) put back to the instance's own.
+    Echo { at: usize, message: usize, id: u16 },
+    Nothing,
+}
+
+impl IcmpOwners<'_> {
+    /// What instance `owner` sees of `packet` (an IPv4 packet carrying
+    /// ICMP, from the network: `netring::icmp_key` checks every length):
+    /// echo replies and errors about echo requests only if it sent the
+    /// request (with its own identifier back), errors about TCP or UDP
+    /// packets only if it holds their port, echo requests of other hosts
+    /// and other messages whole, as on Linux.
+    fn view(&self, packet: &[u8], owner: u64) -> View {
+        let Some(key) = netring::icmp_key(packet) else { return View::Whole };
+        let holder = match key {
+            netring::IcmpKey::Echo { id, request, at, message } => {
+                return match self.echo.incoming(id) {
+                    Some((o, local)) if o == owner => View::Echo { at, message, id: local },
+                    Some(_) => View::Nothing,
+                    None if request => View::Whole,
+                    None => View::Nothing,
+                };
             }
-            _ => None,
-        }
+            netring::IcmpKey::Tcp(port) => self.tcp.get(&port),
+            netring::IcmpKey::Udp(port) => self.udp.get(&port),
+        };
+        if holder == Some(&owner) { View::Whole } else { View::Nothing }
     }
 }
 

@@ -6,8 +6,10 @@
 #   demand, as Linux autotunes its socket buffers).
 # - `tcp::Socket::set_rx_capacity_max`: the window scale a connection announces is
 #   computed from the largest receive buffer it may grow to, not from the first one.
-# - `tcp::Socket::timed_out`: whether the connection ended by its timeout (ETIMEDOUT)
-#   rather than by a reset.
+# - `tcp::Socket::ended_by_timeout`: whether the connection ended by its timeout
+#   (ETIMEDOUT) rather than by a reset.
+# - The window a SYN announced is remembered in scaled units like every other segment's
+#   (a fix: else a receive buffer that grows before the first data is never announced).
 # Its own workspace, so that its tests run on the host:
 # `cargo test --manifest-path third_party/smoltcp/Cargo.toml --lib`.
 [workspace]

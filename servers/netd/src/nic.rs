@@ -61,8 +61,11 @@ impl Nic {
         !self.looped.is_empty() || self.card.has_received()
     }
 
+    /// Queues a frame for the loopback path. `transmit` hands out a token
+    /// only while there is room; a reply smoltcp makes while it takes a
+    /// frame (an ACK, a reset) may go beyond, up to twice as many.
     fn loop_back(&mut self, frame: Vec<u8>) {
-        if self.looped.len() < MAX_LOOPED {
+        if self.looped.len() < 2 * MAX_LOOPED {
             self.looped.push_back(frame);
         }
     }
@@ -131,8 +134,13 @@ impl Device for Nic {
         Some((RxToken(frame), TxToken(self)))
     }
 
+    /// Room for a frame on both paths (the loopback queue and the card's),
+    /// or none: smoltcp then keeps its segments and sends them in a later
+    /// round, instead of their being dropped (a TCP window larger than the
+    /// queues, as grown buffers give, would otherwise lose frames and
+    /// wait for a retransmission).
     fn transmit(&mut self, _now: Instant) -> Option<TxToken<'_>> {
-        Some(TxToken(self))
+        (self.looped.len() < MAX_LOOPED && self.card.can_send()).then_some(TxToken(self))
     }
 
     fn capabilities(&self) -> DeviceCapabilities {

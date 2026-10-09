@@ -881,17 +881,15 @@ fn overlaps(a: Option<u32>, b: Option<u32>) -> bool {
 /// (inet_csk_bind_conflict): a socket on an overlapping address conflicts
 /// unless both allow reuse (SO_REUSEADDR) and it does not listen; netd
 /// checks it at bind and again at listen. Across instances it is stricter:
-/// another instance's socket that is bound or listening (neither a
-/// connection nor closing) is never shared, so one instance can never take
-/// over a port another one serves.
+/// a port another instance holds in any way (bound, listening, a
+/// connection, closing or in TIME-WAIT) is never shared, so one instance
+/// can neither take over a port another one serves nor learn, by a
+/// connect's 4-tuple check, whom another instance talked to from it.
 pub fn tcp_port_conflict(claim: &PortClaim, other: &PortHolder) -> bool {
     if claim.port != other.port || !overlaps(claim.addr, other.addr) {
         return false;
     }
-    if claim.owner != other.owner && !other.connected && !other.closing {
-        return true;
-    }
-    !(claim.reuse && other.reuse && !other.listening)
+    claim.owner != other.owner || !(claim.reuse && other.reuse && !other.listening)
 }
 
 /// Whether a UDP claim conflicts with a holder: a socket on an overlapping
@@ -911,6 +909,187 @@ pub fn pieces(pos: u32, len: u32, size: u32) -> [(u32, u32); 2] {
     let len = len.min(size);
     let first = len.min(size - at);
     [(at, first), (0, len - first)]
+}
+
+/// What an ICMP message belongs to, so that netd shows it only to the
+/// instance that owns that (`icmp_key`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IcmpKey {
+    /// An echo request (`request`) or reply with identifier `id`, or an
+    /// error about an echo request: the identifier lies at byte `at` of
+    /// the packet, in the ICMP message at byte `message` (whose checksum
+    /// covers it: `set_echo_id`).
+    Echo { id: u16, request: bool, at: usize, message: usize },
+    /// An error about a TCP or UDP packet from this (local) port.
+    Tcp(u16),
+    Udp(u16),
+}
+
+/// Replaces the echo identifier at byte `at` of `packet` with `id`, and
+/// updates the checksum of the ICMP message at byte `message` to match
+/// (RFC 1624's incremental update). Out-of-range offsets change nothing.
+pub fn set_echo_id(packet: &mut [u8], at: usize, message: usize, id: u16) {
+    if at.checked_add(2).is_none_or(|end| end > packet.len()) || message.checked_add(4).is_none_or(|end| end > packet.len()) {
+        return;
+    }
+    let old = u16::from_be_bytes([packet[at], packet[at + 1]]);
+    packet[at..at + 2].copy_from_slice(&id.to_be_bytes());
+    let sum = u16::from_be_bytes([packet[message + 2], packet[message + 3]]);
+    // HC' = ~(~HC + ~m + m'), in ones' complement.
+    let mut s = (!sum) as u32 + (!old) as u32 + id as u32;
+    while s >> 16 != 0 {
+        s = (s & 0xffff) + (s >> 16);
+    }
+    packet[message + 2..message + 4].copy_from_slice(&(!(s as u16)).to_be_bytes());
+}
+
+/// The echo identifiers netd puts on the wire: every instance's echo
+/// requests get identifiers of their own (`outgoing`), so that a reply
+/// (or an error about a request) goes to the instance that sent the
+/// request, with the identifier it chose (`incoming`), and no instance can
+/// receive another's by choosing the same identifier. An instance keeps
+/// at most `ECHO_PER_OWNER` (its least recently used goes first); one
+/// unused for `ECHO_IDLE_MS` goes.
+#[derive(Debug, Default)]
+pub struct EchoIds {
+    by_wire: alloc::collections::BTreeMap<u16, EchoId>,
+    by_owner: alloc::collections::BTreeMap<(u64, u16), u16>,
+    next: u16,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EchoId {
+    owner: u64,
+    local: u16,
+    used: u64,
+}
+
+pub const ECHO_PER_OWNER: usize = 64;
+pub const ECHO_IDLE_MS: u64 = 60_000;
+
+impl EchoIds {
+    /// The identifier on the wire for `owner`'s echo request with
+    /// identifier `local`, at `now` (milliseconds): the one it had, else
+    /// `local` itself if nobody uses it, else a free one.
+    pub fn outgoing(&mut self, owner: u64, local: u16, now: u64) -> u16 {
+        if let Some(&wire) = self.by_owner.get(&(owner, local)) {
+            if let Some(e) = self.by_wire.get_mut(&wire) {
+                e.used = now;
+            }
+            return wire;
+        }
+        self.expire(now);
+        let mine: alloc::vec::Vec<(u64, u16)> = self.by_wire.iter().filter(|(_, e)| e.owner == owner).map(|(&w, e)| (e.used, w)).collect();
+        if mine.len() >= ECHO_PER_OWNER {
+            if let Some(&(_, oldest)) = mine.iter().min() {
+                self.remove(oldest);
+            }
+        }
+        let wire = if self.by_wire.contains_key(&local) {
+            // 65536 identifiers, at most ECHO_PER_OWNER for each of the
+            // instances with a channel: one is free.
+            let mut w = self.next;
+            while self.by_wire.contains_key(&w) {
+                w = w.wrapping_add(1);
+            }
+            self.next = w.wrapping_add(1);
+            w
+        } else {
+            local
+        };
+        self.by_wire.insert(wire, EchoId { owner, local, used: now });
+        self.by_owner.insert((owner, local), wire);
+        wire
+    }
+
+    /// Whose identifier `wire` is: the instance and its own identifier.
+    pub fn incoming(&self, wire: u16) -> Option<(u64, u16)> {
+        self.by_wire.get(&wire).map(|e| (e.owner, e.local))
+    }
+
+    /// Identifiers unused since `ECHO_IDLE_MS` go.
+    pub fn expire(&mut self, now: u64) {
+        let old: alloc::vec::Vec<u16> = self.by_wire.iter().filter(|(_, e)| now.saturating_sub(e.used) >= ECHO_IDLE_MS).map(|(&w, _)| w).collect();
+        for w in old {
+            self.remove(w);
+        }
+    }
+
+    /// An instance that went: its identifiers go.
+    pub fn forget(&mut self, owner: u64) {
+        let gone: alloc::vec::Vec<u16> = self.by_wire.iter().filter(|(_, e)| e.owner == owner).map(|(&w, _)| w).collect();
+        for w in gone {
+            self.remove(w);
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.by_wire.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.by_wire.is_empty()
+    }
+
+    fn remove(&mut self, wire: u16) {
+        if let Some(e) = self.by_wire.remove(&wire) {
+            self.by_owner.remove(&(e.owner, e.local));
+        }
+    }
+}
+
+/// The key of `packet`, an IPv4 packet as a raw socket receives it
+/// (header included); None if it belongs to nobody in particular or is
+/// malformed. Errors (destination unreachable, source quench, redirect,
+/// time exceeded, parameter problem) quote the IP header and the first 8
+/// bytes of the packet that caused them. Every length is checked: the
+/// packet comes from the network.
+pub fn icmp_key(packet: &[u8]) -> Option<IcmpKey> {
+    /// The payload of an IPv4 header at the start of `p` (`whole`: the
+    /// packet's total length must fit, as for a packet received; a quoted
+    /// one is cut short).
+    fn ipv4_payload(p: &[u8], whole: bool) -> Option<(u8, usize, &[u8])> {
+        let first = *p.first()?;
+        let ihl = (first as usize & 0xf) * 4;
+        if first >> 4 != 4 || ihl < 20 || p.len() < ihl {
+            return None;
+        }
+        let end = if whole {
+            let total = u16::from_be_bytes([p[2], p[3]]) as usize;
+            if total < ihl || total > p.len() {
+                return None;
+            }
+            total
+        } else {
+            p.len()
+        };
+        Some((p[9], ihl, &p[ihl..end]))
+    }
+    // An echo request or reply: its identifier (at byte 4).
+    fn echo_id(m: &[u8], request: Option<bool>) -> Option<u16> {
+        let fits = m.len() >= 8 && request.is_none_or(|r| m[0] == if r { 8 } else { 0 });
+        (fits && (m[0] == 0 || m[0] == 8)).then(|| u16::from_be_bytes([m[4], m[5]]))
+    }
+    let (proto, message, icmp) = ipv4_payload(packet, true)?;
+    if proto != 1 || icmp.len() < 8 {
+        return None;
+    }
+    match icmp[0] {
+        0 | 8 => echo_id(icmp, None).map(|id| IcmpKey::Echo { id, request: icmp[0] == 8, at: message + 4, message }),
+        3 | 4 | 5 | 11 | 12 => {
+            let (proto, ihl, l4) = ipv4_payload(&icmp[8..], false)?;
+            let port = || Some(u16::from_be_bytes([*l4.first()?, *l4.get(1)?]));
+            match proto {
+                // (Only an error about a request of ours is about our
+                // identifier.)
+                1 => echo_id(l4, Some(true)).map(|id| IcmpKey::Echo { id, request: false, at: message + 8 + ihl + 4, message }),
+                6 => port().map(IcmpKey::Tcp),
+                17 => port().map(IcmpKey::Udp),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 /// How many bytes a ring holds between a consumer and a producer

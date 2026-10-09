@@ -231,10 +231,15 @@ fn no_instance_takes_a_port_another_one_serves() {
     assert!(tcp_port_conflict(&claim(2, LO, true), &holder(1, LO, true)));
     assert!(tcp_port_conflict(&claim(2, LO, true), &PortHolder { listening: true, ..holder(1, LO, true) }));
     assert!(tcp_port_conflict(&claim(2, None, true), &holder(1, LO, true)));
-    // Its connections and closing sockets only by Linux's rule.
-    assert!(!tcp_port_conflict(&claim(2, LO, true), &PortHolder { connected: true, ..holder(1, LO, true) }));
-    assert!(!tcp_port_conflict(&claim(2, LO, true), &PortHolder { closing: true, ..holder(1, LO, true) }));
+    // Its connections and closing sockets (TIME-WAIT) too: sharing them
+    // would let the other instance learn, by the 4-tuple check of a
+    // connect, whom it talked to (and Linux's rule still holds within an
+    // instance, `tcp_ports_follow_linux_within_an_instance`).
+    assert!(tcp_port_conflict(&claim(2, LO, true), &PortHolder { connected: true, ..holder(1, LO, true) }));
+    assert!(tcp_port_conflict(&claim(2, LO, true), &PortHolder { closing: true, ..holder(1, LO, true) }));
     assert!(tcp_port_conflict(&claim(2, LO, false), &PortHolder { closing: true, ..holder(1, LO, true) }));
+    assert!(!tcp_port_conflict(&claim(1, LO, true), &PortHolder { closing: true, ..holder(1, LO, true) }));
+    assert!(!tcp_port_conflict(&claim(2, LO, true), &PortHolder { closing: true, ..holder(1, Some(0x0a00_020f), true) }));
     // UDP: reuse within an instance only.
     assert!(!udp_port_conflict(&claim(1, LO, true), &holder(1, LO, true)));
     assert!(udp_port_conflict(&claim(1, LO, false), &holder(1, LO, true)));
@@ -522,4 +527,142 @@ fn the_net_thread_sees_every_mark() {
     thread.join().unwrap();
     assert_eq!(taken.load(Ordering::SeqCst), ROUNDS);
     assert_eq!(futex.timeouts.load(Ordering::Relaxed), 0, "a wakeup was lost");
+}
+
+/// An IPv4 header (20 bytes) for `payload` of protocol `proto`.
+fn ipv4(proto: u8, payload: &[u8]) -> Vec<u8> {
+    let total = (20 + payload.len()) as u16;
+    let mut p = vec![0x45, 0, (total >> 8) as u8, total as u8, 0, 0, 0, 0, 64, proto, 0, 0, 127, 0, 0, 1, 127, 0, 0, 1];
+    p.extend_from_slice(payload);
+    p
+}
+
+#[test]
+fn icmp_messages_are_told_apart() {
+    // Echo request and reply: their identifier.
+    let echo = ipv4(1, &[8, 0, 0, 0, 0x12, 0x34, 0, 1, b'x']);
+    assert_eq!(icmp_key(&echo), Some(IcmpKey::Echo { id: 0x1234, request: true, at: 24, message: 20 }));
+    let reply = ipv4(1, &[0, 0, 0, 0, 0xab, 0xcd, 0, 1]);
+    assert_eq!(icmp_key(&reply), Some(IcmpKey::Echo { id: 0xabcd, request: false, at: 24, message: 20 }));
+    // Errors: the quoted packet's source port or echo identifier.
+    let quoted_udp = ipv4(17, &[0x30, 0x39, 0, 53, 0, 8, 0, 0]);
+    let unreachable = ipv4(1, &[[3, 3, 0, 0, 0, 0, 0, 0].as_slice(), &quoted_udp].concat());
+    assert_eq!(icmp_key(&unreachable), Some(IcmpKey::Udp(12345)));
+    let quoted_tcp = ipv4(6, &[0xc0, 0x00, 0, 80, 0, 0, 0, 1]);
+    let exceeded = ipv4(1, &[[11, 0, 0, 0, 0, 0, 0, 0].as_slice(), &quoted_tcp].concat());
+    assert_eq!(icmp_key(&exceeded), Some(IcmpKey::Tcp(0xc000)));
+    let quoted_echo = ipv4(1, &[8, 0, 0, 0, 0x55, 0x66, 0, 1]);
+    let about_echo = ipv4(1, &[[3, 1, 0, 0, 0, 0, 0, 0].as_slice(), &quoted_echo].concat());
+    assert_eq!(icmp_key(&about_echo), Some(IcmpKey::Echo { id: 0x5566, request: false, at: 20 + 8 + 20 + 4, message: 20 }));
+    // An error about a reply is about nobody's identifier.
+    let quoted_reply = ipv4(1, &[0, 0, 0, 0, 0x55, 0x66, 0, 1]);
+    assert_eq!(icmp_key(&ipv4(1, &[[3, 1, 0, 0, 0, 0, 0, 0].as_slice(), &quoted_reply].concat())), None);
+    // Nobody's: other types, other protocols.
+    assert_eq!(icmp_key(&ipv4(1, &[13, 0, 0, 0, 0, 0, 0, 0])), None);
+    assert_eq!(icmp_key(&ipv4(17, &[8, 0, 0, 0, 1, 2, 0, 1])), None);
+}
+
+#[test]
+fn malformed_icmp_never_panics() {
+    // Every truncation and many changed bytes of well-formed messages,
+    // and headers that lie about their lengths: an answer, never a panic
+    // (the packets come from the network).
+    let quoted = ipv4(17, &[0x30, 0x39, 0, 53, 0, 8, 0, 0]);
+    let samples = [
+        ipv4(1, &[8, 0, 0, 0, 0x12, 0x34, 0, 1]),
+        ipv4(1, &[[3, 3, 0, 0, 0, 0, 0, 0].as_slice(), &quoted].concat()),
+        ipv4(1, &[[3, 3, 0, 0, 0, 0, 0, 0].as_slice(), &quoted[..21]].concat()),
+    ];
+    for p in &samples {
+        for at in 0..p.len() {
+            for v in [0u8, 0x0f, 0x40, 0x4f, 0x80, 0xff] {
+                let mut q = p.clone();
+                q[at] = v;
+                for len in 0..=q.len() {
+                    let _ = icmp_key(&q[..len]);
+                }
+            }
+        }
+    }
+    // A total length beyond the packet, a header length beyond it.
+    let mut long = ipv4(1, &[8, 0, 0, 0, 1, 2, 0, 1]);
+    long[3] = 200;
+    assert_eq!(icmp_key(&long), None);
+    let mut wide = ipv4(1, &[8, 0, 0, 0, 1, 2, 0, 1]);
+    wide[0] = 0x4f;
+    assert_eq!(icmp_key(&wide), None);
+    // set_echo_id with offsets beyond the packet changes nothing.
+    let mut p = ipv4(1, &[8, 0, 0, 0, 1, 2, 0, 1]);
+    let before = p.clone();
+    let len = p.len();
+    set_echo_id(&mut p, len - 1, 20, 7);
+    set_echo_id(&mut p, 24, len - 3, 7);
+    set_echo_id(&mut p, usize::MAX, usize::MAX, 7);
+    assert_eq!(p, before);
+}
+
+/// The ones' complement checksum of `m`.
+fn checksum(m: &[u8]) -> u16 {
+    let mut s: u32 = m.chunks(2).map(|c| u16::from_be_bytes([c[0], *c.get(1).unwrap_or(&0)]) as u32).sum();
+    while s >> 16 != 0 {
+        s = (s & 0xffff) + (s >> 16);
+    }
+    !(s as u16)
+}
+
+#[test]
+fn echo_ids_are_rewritten_with_their_checksum() {
+    let mut message = vec![8, 0, 0, 0, 0x12, 0x34, 0, 7, b'p', b'i', b'n', b'g'];
+    let sum = checksum(&message);
+    message[2..4].copy_from_slice(&sum.to_be_bytes());
+    let mut packet = ipv4(1, &message);
+    for id in [0u16, 1, 0x1234, 0xfffe, 0xffff, 0x8000] {
+        set_echo_id(&mut packet, 24, 20, id);
+        assert_eq!(u16::from_be_bytes([packet[24], packet[25]]), id);
+        assert_eq!(checksum(&packet[20..]), 0, "the message's checksum stays right for {id:#x}");
+    }
+    // In an error, the quoted request's identifier, under the error's
+    // checksum.
+    let mut error = [[3u8, 1, 0, 0, 0, 0, 0, 0].as_slice(), &ipv4(1, &message)].concat();
+    let sum = checksum(&error);
+    error[2..4].copy_from_slice(&sum.to_be_bytes());
+    let mut packet = ipv4(1, &error);
+    let Some(IcmpKey::Echo { at, message, .. }) = icmp_key(&packet) else { panic!("an error about a request") };
+    set_echo_id(&mut packet, at, message, 0x4242);
+    assert_eq!(icmp_key(&packet).map(|k| matches!(k, IcmpKey::Echo { id: 0x4242, .. })), Some(true));
+    assert_eq!(checksum(&packet[20..]), 0);
+}
+
+#[test]
+fn echo_ids_keep_instances_apart() {
+    let mut ids = EchoIds::default();
+    // The first to use an identifier keeps it on the wire; another
+    // instance choosing the same gets another, and replies go back to
+    // each with its own.
+    let a = ids.outgoing(1, 0x1234, 0);
+    let b = ids.outgoing(2, 0x1234, 0);
+    assert_eq!(a, 0x1234);
+    assert_ne!(b, a);
+    assert_eq!(ids.incoming(a), Some((1, 0x1234)));
+    assert_eq!(ids.incoming(b), Some((2, 0x1234)));
+    // The same request again: the same identifier.
+    assert_eq!(ids.outgoing(2, 0x1234, 10), b);
+    // Nobody's: nothing.
+    assert_eq!(ids.incoming(0x9999), None);
+    // Unused for ECHO_IDLE_MS: gone (b was used at 10).
+    ids.expire(ECHO_IDLE_MS);
+    assert_eq!(ids.incoming(a), None);
+    assert_eq!(ids.incoming(b), Some((2, 0x1234)));
+    // An instance keeps at most ECHO_PER_OWNER, the oldest goes first.
+    for i in 0..ECHO_PER_OWNER as u16 + 5 {
+        ids.outgoing(3, 0x100 + i, 100 + i as u64);
+    }
+    assert_eq!(ids.len(), ECHO_PER_OWNER + 1);
+    assert_eq!(ids.incoming(0x100), None);
+    assert_eq!(ids.incoming(0x100 + ECHO_PER_OWNER as u16 + 4), Some((3, 0x100 + ECHO_PER_OWNER as u16 + 4)));
+    // Another instance's identifiers are not evicted by it.
+    assert_eq!(ids.incoming(b), Some((2, 0x1234)));
+    ids.forget(3);
+    ids.forget(2);
+    assert!(ids.is_empty());
 }

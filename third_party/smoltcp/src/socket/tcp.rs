@@ -2902,7 +2902,19 @@ impl<'a> Socket<'a> {
             .remote_last_seq
             .max(repr.seq_number + repr.segment_len());
         self.remote_last_ack = repr.ack_number;
-        self.remote_last_win = repr.window_len;
+        // oxidenix: a SYN's window is not scaled; kept in scaled units like
+        // every other segment's (`last_scaled_window` shifts it), else a
+        // receive buffer that grows before the first segment of data looks
+        // announced already and the window update never goes. A SYN that
+        // announced as much as it can (65535) counts as having announced
+        // the whole window, as before.
+        self.remote_last_win = if repr.control == TcpControl::Syn && repr.window_len < u16::MAX {
+            (repr.window_len as usize >> self.remote_win_shift) as u16
+        } else if repr.control == TcpControl::Syn {
+            self.scaled_window()
+        } else {
+            repr.window_len
+        };
 
         if repr.segment_len() > 0 {
             self.rtte
@@ -9994,6 +10006,57 @@ mod test {
                 max_seg_size: Some(BASE_MSS),
                 window_scale: Some(5),
                 window_len: 4096,
+                ..RECV_TEMPL
+            }]
+        );
+    }
+
+    #[test]
+    fn test_oxidenix_grown_buffer_after_syn_is_announced() {
+        let mut s = socket_with_buffer_sizes(64, 4096);
+        s.set_rx_capacity_max(1 << 20);
+        s.listen(LISTEN_END).unwrap();
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: None,
+                window_scale: Some(0),
+                ..SEND_TEMPL
+            }
+        );
+        recv!(
+            s,
+            [TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: LOCAL_SEQ,
+                ack_number: Some(REMOTE_SEQ + 1),
+                max_seg_size: Some(BASE_MSS),
+                window_scale: Some(5),
+                window_len: 4096,
+                ..RECV_TEMPL
+            }]
+        );
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                window_scale: None,
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::Established);
+        // The buffer grows before any data came: the larger window goes
+        // out at once (scaled: 65536 >> 5).
+        s.replace_rx_buffer(vec![0; 65536]).unwrap();
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1),
+                window_len: 2048,
                 ..RECV_TEMPL
             }]
         );

@@ -421,9 +421,19 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
      acknowledging); a connection attempt gives up after 127 s, unacknowledged data after
      924 s (Linux's SYN and data retries), reported as `ETIMEDOUT`. A connection in
      TIME-WAIT keeps only its port's record (its buffers go; a late segment of it is
-     answered with a reset). Raw ICMP sockets see every ICMP packet
-     of the host, as on Linux (everyone is root): one instance's ICMP traffic shows in
-     another's raw sockets. Each round it takes requests (no more than the completion ring
+     answered with a reset). Ports are never shared across instances (TCP: bound,
+     listening, connected, closing or in TIME-WAIT; UDP: bound), and a connect never takes a
+     live, closing or TIME-WAIT 4-tuple (`EADDRNOTAVAIL`). Raw ICMP sockets see the host's
+     ICMP packets as on Linux, but no instance sees another's: netd gives each instance's
+     echo requests identifiers of their own on the wire (`netring::EchoIds`, the checksum
+     updated) and hands replies, and errors about the requests, to that instance alone with
+     its identifier put back; errors about TCP or UDP packets go to the instance holding the
+     quoted port; requests of other hosts and other messages to all (`netring::icmp_key`
+     parses them, every length checked, tested on the host). A connected UDP or raw socket
+     takes its peer's datagrams only. At most 256 connections are half-open (SYN-RECEIVED)
+     at once, each with a 4 KiB receive buffer and nothing to send until the peer completes
+     the handshake; the loopback and the card push back on smoltcp (no token while their
+     queues are full) instead of dropping frames. Each round it takes requests (no more than the completion ring
      has room for), the service bitmaps, polls the card and smoltcp, moves data between
      smoltcp and the rings of the sockets that can move some, and publishes what changed;
      it sleeps (doorbells armed, `ipc_receive` with smoltcp's next deadline) after a spin
