@@ -583,6 +583,10 @@ pub const SYS_MO_UNBACK: u64 = 1084;
 /// be told any more (a final write-back that failed).
 pub const SYS_SERVER_LOG: u64 = 1085;
 pub const SERVER_LOG_MAX: u64 = 256;
+/// `thread_exists(tid) -> 0`: ESRCH unless a thread with id `tid` (not 0)
+/// exists. Thread ids are the kernel's until the process model is the
+/// server's (R8); the scheduling-policy calls check their target with it.
+pub const SYS_THREAD_EXISTS: u64 = 1090;
 
 /// `(scenario)`: the server runs a channel scenario against the test
 /// service (servers/ringtest, `ring::selftest`): 1 rings and doorbells, 2

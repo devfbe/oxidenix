@@ -4,13 +4,9 @@
 //! pthread_getschedparam asks both (V8 does at startup).
 //!
 //! Until the process model is the server's (R8) the thread ids are the
-//! kernel's: a thread is known to exist when its /proc directory does in
-//! the kernel's tree (procfs resolves the id of any thread, as Linux's
-//! /proc does, though it lists processes only).
+//! kernel's: the kernel says whether one exists (`SYS_THREAD_EXISTS`).
 
-use crate::namespace::{kernel_root, KInode};
 use crate::syscall;
-use alloc::format;
 use restricted::*;
 
 const EINVAL: i64 = 22;
@@ -50,15 +46,8 @@ fn target(tid: u64) -> Result<(), i64> {
     if tid == 0 {
         return Ok(());
     }
-    let path = format!("proc/{tid}");
-    let mut walk = Walk::default();
-    let found = KInode::from_result(syscall(
-        SYS_INODE_WALK,
-        [kernel_root(), path.as_ptr() as u64, path.len() as u64, &mut walk as *mut Walk as u64, 0, 0],
-    ));
-    // The handle goes at once; only whether the walk got there counts.
-    match found {
-        Ok(_) if walk.consumed as usize == path.len() => Ok(()),
+    match syscall(SYS_THREAD_EXISTS, [tid as u64, 0, 0, 0, 0, 0]) {
+        0 => Ok(()),
         _ => Err(ESRCH),
     }
 }

@@ -47,7 +47,7 @@ fn system() -> System {
 
 /// The process `pid` names: a process id, or the id of one of its threads
 /// (Linux's /proc has a directory for every thread id, though it lists
-/// only processes; the Linux server checks thread ids that way).
+/// only processes).
 fn group(pid: Pid) -> Result<alloc::sync::Arc<super::task::ThreadGroup>, i64> {
     let table = TABLE.lock();
     table.groups.get(&pid).cloned().or_else(|| table.tasks.get(&pid).map(|t| t.group.clone())).ok_or(ESRCH)

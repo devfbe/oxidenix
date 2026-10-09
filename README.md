@@ -603,9 +603,9 @@ moved memory, time, pipes, eventfd, paths and the root tmpfs into the server.
   `copy_to_user` does. The server checks every program pointer against 64 TiB first. The
   clocks, `nanosleep`, `clock_nanosleep`, `gettimeofday`, `time` and `sched_yield` are the
   server's now, over the kernel's `clock_read`, `sleep_until` and `yield`, and so are
-  `sched_getscheduler` and `sched_getparam` (one policy, `SCHED_OTHER` with priority 0; a
-  thread id is checked by its `/proc` directory in the kernel's tree, which procfs resolves for
-  every thread). A call the server
+  `sched_getscheduler` and `sched_getparam` (one policy, `SCHED_OTHER` with priority 0; the
+  kernel says whether a thread id exists, `thread_exists`, 1090, until the process model is the
+  server's). A call the server
   handles itself is restarted after a signal exactly as the kernel's own handling would (the
   kernel remembers the trapped call for the delivery that follows `restricted_enter`).
 - **Pipes are the server's** (phase R6a), the first kind of file it implements. Until the
