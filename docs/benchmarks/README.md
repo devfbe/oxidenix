@@ -86,8 +86,41 @@ What this shows:
 - **`fstat` on `/data` costs no IPC any more** (0 IPC calls per operation). It still costs
   10 system calls per operation, the forwarding. That is where the remaining gap to Linux
   is, not the disk path.
-- **Path resolution in tmpfs got 16 % slower** (4436 → 5143 cycles). This is not
-  investigated yet. A candidate is the server lock bookkeeping for the scheduler boost.
+- **Path resolution in tmpfs got 16 % slower** (4436 → 5143 cycles). Fixed since; see the
+  next section.
+
+## Path resolution: the server's lock bookkeeping
+
+`2026-10-09-1337e20-statpath.md` against `2026-10-09-802b396-quiet.md` (host load about 1:
+other builds ran).
+
+The cause of the regression above was the priority-inversion boost of the fair scheduler
+(`769bad4`): each server lock counted itself in the thread's State page with `fetch_add`
+and `fetch_sub`, two locked instructions per lock. A `stat` of a four-name tmpfs path took
+48 server locks (most of them the heap's slab locks), `fstat` of a tmpfs file 5. Bisected
+over the merges (only the merge with the fair scheduler moved `stat_path_tmpfs` relative
+to `forwarded_null_syscall`), then measured in one boot with the server switching between
+variants every round (paired medians of 41 rounds): no count at all saved 743 cycles per
+`stat`, a count by plain load and store 689, the size of the regression.
+
+The fix (`b223846`): only the thread itself writes its count (the kernel zeroes it before
+handing out the slot and only reads it after), so a relaxed load and store count exactly,
+with compiler fences keeping the count around the critical section. A second step
+(`1337e20`) took locks and copies off the path: `resolve` no longer copies the components
+twice per walk, a tmpfs inode's file type is fixed and read without its lock, `status`
+takes one lock instead of three, and `fstat` looks the descriptor up once (it was twice: a
+kernel call less, also for `/data`). Now 22 locks per `stat`, 2 per `fstat`.
+
+| benchmark | 802b396 | 1337e20 |
+|---|---:|---:|
+| `stat_path_tmpfs` p50 (cycles) | 5143 | 3386 |
+| `stat_path_tmpfs` p99 (cycles) | 6824 | 3509 |
+| `fstat_tmpfs` p50 (cycles) | 2927 | 2385 |
+| `fstat_disk` p50 (cycles) | 14072 | 13919 |
+| `fstat_disk` system calls per operation | 10 | 9 |
+
+Interleaved runs on the same host (A B C A B C): `1e89b0e` (before) 5188 and 5241 cycles,
+`b223846` (the count fixed) 4467 and 4734, `1337e20` 3384 and 3545.
 
 ## Open: PCIDs and small cached reads
 

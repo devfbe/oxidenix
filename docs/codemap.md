@@ -75,7 +75,7 @@ module comment, and the public types it defines. Where to start for common tasks
 - `servers/linux/src/datafs.rs` (1280) /data in the server (phase R6c.3, I/O rings step 4): diskfs's ext2 filesystem through the file protocol (`fsring`, over `fsclient`'s channel), with the server's own page cache. Types: `DInode`, `New`, `HoldKind`.
 - `servers/linux/src/disktest.rs` (530) `TEST_DISKRING`: the client's side of the file protocol (`fsring`) against diskfs, as the page cache will use it in step 4: a channel to diskfs, grants of memory objects, files on /data read and written by DMA into...
 - `servers/linux/src/eventfd.rs` (101) eventfd (phase R6b): a counter that reads take and writes add to, a file of the server with a placeholder in the kernel's descriptor table. Types: `EventFd`.
-- `servers/linux/src/files.rs` (529) The server's files (phase R6): objects the server implements, each named in the kernel's descriptor table by a placeholder (see `restricted::SYS_KFD_INSTALL`). Types: `File`.
+- `servers/linux/src/files.rs` (530) The server's files (phase R6): objects the server implements, each named in the kernel's descriptor table by a placeholder (see `restricted::SYS_KFD_INSTALL`). Types: `File`.
 - `servers/linux/src/fsclient.rs` (410) The server's end of the file protocol (`fsring`, docs/design/io-rings.md) to diskfs: one channel for the instance, shared by every thread of the tree's processes and by the pager thread. Types: `Ticket`, `Client`, `Scratch`, `Next`.
 - `servers/linux/src/heap.rs` (67) The server's heap: one allocator for every thread of the instance, in the shared region, growing by `SYS_SHARED_MAP` when it runs out. Types: `ServerHeap`.
 - `servers/linux/src/ids.rs` (23) Supplementary groups: getgroups and setgroups.
@@ -83,7 +83,7 @@ module comment, and the public types it defines. Where to start for common tasks
 - `servers/linux/src/inotify.rs` (413) inotify(7): watches on the files of the server's filesystems (tmpfs and /data) and the queue of their events, a file of the server with a placeholder in the kernel's descriptor table, as eventfd. Types: `Key`, `Inotify`.
 - `servers/linux/src/main.rs` (312) The Linux server (docs/design/linux-server.md).
 - `servers/linux/src/mm.rs` (150) Memory system calls (phase R4): Linux's semantics of mmap, munmap, mprotect, mremap, madvise, msync and the mlock family, over the kernel's mapping calls.
-- `servers/linux/src/namespace.rs` (287) The server's namespace (phase R6c.2): mounts and path resolution. Types: `KInode`, `Node`, `Resolved`.
+- `servers/linux/src/namespace.rs` (286) The server's namespace (phase R6c.2): mounts and path resolution. Types: `KInode`, `Node`, `Resolved`.
 - `servers/linux/src/netdev.rs` (154) The network interfaces as Linux programs see them: netd's description (`SYS_NET_LINKS`, `netproto::Link`) with Linux's names and flags, for rtnetlink (`netlink`) and for the interface requests every socket takes...
 - `servers/linux/src/netlink.rs` (532) Netlink sockets (netlink(7)), protocol NETLINK_ROUTE: files of the server with a placeholder in the kernel's descriptor table, as pipes. Types: `NetlinkSocket`.
 - `servers/linux/src/paths.rs` (592) The system calls that take a path (phase R6c.2b), and the working directory and umask, which live in the caller's record (`records`).
@@ -92,10 +92,10 @@ module comment, and the public types it defines. Where to start for common tasks
 - `servers/linux/src/sched.rs` (62) Scheduling policy: sched_getscheduler and sched_getparam, getpriority and setpriority.
 - `servers/linux/src/scm.rs` (174) Descriptors in flight (SCM_RIGHTS over AF_UNIX sockets, phase R7a): a descriptor a message carries is a handle on its open file description (`SYS_KFILE_OBJECT` with `KFILE_INFLIGHT`), whatever the file is (one of the... Types: `Passed`.
 - `servers/linux/src/sockcalls.rs` (705) The system calls of AF_UNIX sockets (phase R7a): socket and socketpair for the AF_UNIX family (the others pass through to the kernel), and every call on a descriptor of one of the server's sockets: addresses...
-- `servers/linux/src/sync.rs` (143) A mutex for the server's data, shared by every thread of the instance (all the tree's processes run the server in the same shared region). Types: `Mutex`, `MutexGuard`, `RwLock`, `ReadGuard`, `WriteGuard`.
+- `servers/linux/src/sync.rs` (153) A mutex for the server's data, shared by every thread of the instance (all the tree's processes run the server in the same shared region). Types: `Mutex`, `MutexGuard`, `RwLock`, `ReadGuard`, `WriteGuard`.
 - `servers/linux/src/time.rs` (106) Clocks and sleeping (phase R5): clock_gettime, clock_getres, gettimeofday, time, nanosleep, clock_nanosleep and sched_yield, over the kernel's clock and deadline sleep.
 - `servers/linux/src/tmpfile.rs` (290) Open files of the server's tmpfs (phase R6c.2c): a placeholder in the kernel's descriptor table names one (an open file description: offset, directory snapshot, write access); the calls on it are the server's. Types: `TmpOpen`.
-- `servers/linux/src/tmpfs.rs` (424) The server's tmpfs (phase R6c.2c): directories, files, symlinks and socket inodes (AF_UNIX names, `unix`) in the server's memory; a file's contents are a file object of the kernel's (`SYS_MO_CREATE_FILE`), read,... Types: `Object`, `Kind`, `State`, `Inode`.
+- `servers/linux/src/tmpfs.rs` (438) The server's tmpfs (phase R6c.2c): directories, files, symlinks and socket inodes (AF_UNIX names, `unix`) in the server's memory; a file's contents are a file object of the kernel's (`SYS_MO_CREATE_FILE`), read,... Types: `Object`, `Kind`, `State`, `Inode`.
 - `servers/linux/src/unix.rs` (1158) AF_UNIX sockets (phase R7a): stream, datagram and sequenced-packet sockets of the server, each a file with a placeholder in the kernel's descriptor table, as pipes are. Types: `Cred`, `Name`, `Key`, `Msg`, `Sock`, `Received`, `Fds`, `RecvOpts`, `Sink`, `Source`.
 - `servers/linux/src/usercopy.rs` (73) Copies between the server's memory and the program's (which the server sees in its view of the address space).
 
