@@ -29,7 +29,6 @@ const EEXIST: i64 = 17;
 const ERANGE: i64 = 34;
 const ELOOP: i64 = 40;
 const EINVAL: i64 = 22;
-const EPERM: i64 = 1;
 const EFAULT: i64 = 14;
 const EOPNOTSUPP: i64 = 95;
 
@@ -584,12 +583,13 @@ fn fchmodat2(dirfd: u64, addr: u64, mode: u64, flags: u64) -> Result<i64, i64> {
 }
 
 /// Sets the times of a target. The kernel's tree (/dev, /proc, /sys)
-/// keeps no times that could change: EPERM. An anonymous inode's (a
-/// pipe's, a socket's) are not kept: nothing to do.
+/// keeps no times that change: the server keeps them
+/// (`namespace::set_kernel_times`). An anonymous inode's (a pipe's, a
+/// socket's) are not kept: nothing to do.
 fn set_times(target: Option<(Node, String)>, atime: SetTime, mtime: SetTime) -> Result<i64, i64> {
     let Some((node, path)) = target else { return Ok(0) };
     match &node {
-        Node::Kernel(_) => return Err(EPERM),
+        Node::Kernel(_) => crate::namespace::set_kernel_times(&node.stat()?, atime, mtime),
         Node::Tmp(t) => t.set_times(atime, mtime),
         Node::Data(d) => datafs::set_times(d, atime, mtime)?,
     }

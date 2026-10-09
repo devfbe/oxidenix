@@ -138,8 +138,16 @@ int main(void) {
     unlink(path);
     check("/data reports none (ext2)", syscall(SYS_statx, AT_FDCWD, "/data", 0, STATX_BTIME, &x) == 0 && !(x.stx_mask & STATX_BTIME));
 
-    errno = 0;
-    check("the kernel's files keep no times (EPERM)", utimensat(AT_FDCWD, "/dev/null", NULL, 0) == -1 && errno == EPERM);
+    /* The kernel's files (/dev, /proc) take times too, as on Linux. */
+    struct stat ds;
+    struct timespec dev_times[2] = {{1111111111, 0}, {1234567890, 0}};
+    check("touch /dev/null works (utimensat of a kernel file)", utimensat(AT_FDCWD, "/dev/null", NULL, 0) == 0);
+    int dn = open("/dev/null", O_RDONLY);
+    check("a time set on /dev/null reads back (stat and fstat)", utimensat(AT_FDCWD, "/dev/null", dev_times, 0) == 0 && stat("/dev/null", &ds) == 0 &&
+                                                                      ds.st_mtim.tv_sec == 1234567890 && ds.st_atim.tv_sec == 1111111111 &&
+                                                                      fstat(dn, &ds) == 0 && ds.st_mtim.tv_sec == 1234567890);
+    close(dn);
+    check("... and on a /proc file", utimensat(AT_FDCWD, "/proc/uptime", dev_times, 0) == 0 && stat("/proc/uptime", &ds) == 0 && ds.st_mtim.tv_sec == 1234567890);
 
     /* Supplementary groups: none (root, started by init). */
     gid_t groups[4];
