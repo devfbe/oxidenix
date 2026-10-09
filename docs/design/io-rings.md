@@ -491,9 +491,8 @@ the files through the kernel's inode bridge); both are gone, with the kernel's s
   scoped by the kernel to that instance.
 - **What the server makes itself.** Each process's part of `/proc` (`/proc/<pid>`, `self`,
   `thread-self`, `mounts`) is the Linux server's (`procfs.rs`), merged into procfs's root
-  listing: it knows its processes (with R8; until then from the kernel's records,
-  `SYS_PROC_INFO`), its descriptors (the kernel's table until R6e, `SYS_KFD_LIST`) and its
-  mounts. See `docs/design/linux-server.md`, "/proc and /sys".
+  listing: it knows its processes (its own process table since R8), their descriptors (its
+  own tables since R6e) and its mounts. See `docs/design/linux-server.md`, "/proc and /sys".
 
 **Cost.** A `/proc/meminfo` read is one request on the ring (`READ`) against two IPC round
 trips before (a `STAT` for the file type, then the `READ`); a process's own file

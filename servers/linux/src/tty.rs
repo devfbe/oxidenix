@@ -2,8 +2,7 @@
 //! discipline (`ldisc`), the job control state of a terminal (the session it controls,
 //! its foreground process group, its window size), its hangups, and its driver: the
 //! console (`console`) or a pseudo-terminal's slave (`pty`). Each open of a terminal is an
-//! open file description of the server's (`TtyOpen`, a placeholder in the kernel's
-//! descriptor table, as pipes are).
+//! open file description of the server's (`TtyOpen`), as a pipe's end is.
 //!
 //! Locks: `inner` holds the state and is never held across a copy to or from program
 //! memory, nor across a wait or the console's write. A read or a write takes its turn
@@ -23,9 +22,9 @@
 //! a deadline for VTIME), and reports the readiness of the terminal's open file
 //! descriptions to the kernel under `inner`, so reports never arrive out of order.
 //!
-//! Process groups and sessions are the kernel's until R8: the server asks for them
-//! (`ids`), sends the terminal's signals through the kernel (`signal`) and learns of a
-//! session leader's end (`session_ended`). A process's controlling terminal is the one
+//! Process groups and sessions are the server's process table's (`process`, R8): the
+//! terminal asks it for them (`ids`), sends its signals through it (`signal`) and learns of
+//! a session leader's end (`session_ended`). A process's controlling terminal is the one
 //! whose session is the process's (ADR 0007).
 
 use crate::files::{self, File, EFAULT, EINVAL, ENOTTY, O_ACCMODE, O_CLOEXEC, O_NONBLOCK};
@@ -129,7 +128,7 @@ pub struct PtyState {
     /// The slave's last description went (Linux's TTY_OTHER_CLOSED of the master): the
     /// master reads EIO once `out` is empty.
     pub slave_closed: bool,
-    /// The master's placeholder, and the readiness last reported for it.
+    /// The master's open file description, and the readiness last reported for it.
     pub master_id: u64,
     pub master_reported: i16,
 }
@@ -150,7 +149,7 @@ pub struct Inner {
     turns: [TurnQueue; 4],
     /// Echoes made while output was stopped.
     held_echo: Vec<u8>,
-    /// The open file descriptions' placeholders: their generation and the readiness last
+    /// The open file descriptions (by id): their generation and the readiness last
     /// reported.
     opens: BTreeMap<u64, (u32, i16)>,
     pub pty: Option<PtyState>,
@@ -228,7 +227,16 @@ pub struct TtyOpen {
     pub origin: Origin,
 }
 
-/// A process's ids, as the kernel answers `proc_ids`.
+impl TtyOpen {
+    /// Its readiness for poll and epoll now (all of them once its terminal
+    /// was hung up).
+    pub fn readiness_now(&self) -> i16 {
+        let inner = self.tty.inner.lock();
+        self.tty.readiness(&inner, self.gen)
+    }
+}
+
+/// A process's ids (`process`).
 #[derive(Clone, Copy, Debug)]
 pub struct Ids {
     pub pid: u64,
@@ -237,20 +245,47 @@ pub struct Ids {
     pub orphaned: bool,
 }
 
+/// `ids`: `id` names a process group (one of its live members is asked about).
+pub const IDS_PGRP: u64 = 1;
+/// `ids`: also whether the group is orphaned.
+pub const IDS_ORPHANED: u64 = 2;
+
 /// The ids of process `id` (0: the caller), or with `IDS_PGRP` of a process of group `id`;
-/// with `IDS_ORPHANED` also whether its group is orphaned.
+/// with `IDS_ORPHANED` also whether its group is orphaned. ESRCH for none.
 pub fn ids(id: u64, flags: u64) -> Result<Ids, i64> {
-    let mut out = [0u64; 4];
-    let r = syscall(SYS_PROC_IDS, [id, flags, out.as_mut_ptr() as u64, 0, 0, 0]);
-    if r < 0 {
-        return Err(-r);
-    }
-    Ok(Ids { pid: out[0], pgid: out[1], sid: out[2], orphaned: out[3] & IDS_ORPHANED != 0 })
+    const ESRCH: i64 = 3;
+    let (pid, pgid, sid) = if flags & IDS_PGRP != 0 {
+        let sid = crate::process::pgrp_session(id as u32).ok_or(ESRCH)?;
+        (0, id as u32, sid)
+    } else {
+        crate::process::ids_of(id as u32).ok_or(ESRCH)?
+    };
+    let orphaned = flags & IDS_ORPHANED != 0 && crate::process::pgrp_orphaned(pgid);
+    Ok(Ids { pid: pid as u64, pgid: pgid as u64, sid: sid as u64, orphaned })
 }
 
-/// Sends `sig` to process `id` (`SIGNAL_PROCESS`) or process group `id` (`SIGNAL_PGRP`).
-fn signal(scope: u64, id: u64, sig: u64) {
-    syscall(SYS_SIGNAL_GROUP, [scope, id, sig, 0, 0, 0]);
+/// Whom `signal` sends to: a process group, or a session's leader (while it still leads
+/// it).
+#[derive(Clone, Copy)]
+enum Scope {
+    Pgrp,
+    Leader,
+}
+use Scope::{Leader as SIGNAL_LEADER, Pgrp as SIGNAL_PGRP};
+
+/// Sends `sig` from the terminal (SI_KERNEL) to process group `id` or the leader of
+/// session `id`.
+fn signal(scope: Scope, id: u64, sig: u64) {
+    match scope {
+        Scope::Pgrp => {
+            crate::signal::send_pgrp(id as u32, sig as u32);
+        }
+        Scope::Leader => {
+            if crate::process::ids_of(id as u32).is_some_and(|(pid, _, sid)| pid as u64 == id && sid as u64 == id) {
+                crate::signal::send_process(id as u32, sig as u32);
+            }
+        }
+    }
 }
 
 fn now() -> u64 {
@@ -306,7 +341,7 @@ pub fn open_device(rdev: u64, flags: u32, origin: Origin) -> Option<Result<i64, 
 /// `tty_open_proc_set_tty`).
 pub fn open(tty: &Arc<Tty>, flags: u32, origin: Origin, ctty: bool) -> Result<i64, i64> {
     let id = files::new_id();
-    let (open, ready, was_closed) = {
+    let (open, was_closed) = {
         let mut inner = tty.inner.lock();
         let gen = inner.gen;
         let ready = tty.readiness(&inner, gen);
@@ -317,9 +352,9 @@ pub fn open(tty: &Arc<Tty>, flags: u32, origin: Origin, ctty: bool) -> Result<i6
             was_closed = core::mem::replace(&mut p.slave_closed, false);
         }
         tty.changed(&mut inner, false, false);
-        (Arc::new(TtyOpen { tty: tty.clone(), gen, id, origin }), ready, was_closed)
+        (Arc::new(TtyOpen { tty: tty.clone(), gen, id, origin }), was_closed)
     };
-    let fd = match files::install(id, File::Tty(open.clone()), flags & (O_ACCMODE | O_NONBLOCK | O_CLOEXEC), ready) {
+    let fd = match files::install(id, File::Tty(open.clone()), flags & (O_ACCMODE | O_NONBLOCK | O_CLOEXEC)) {
         Ok(fd) => fd,
         Err(e) => {
             // Never opened: the slave is as it was (a slave never opened is not
@@ -348,7 +383,7 @@ pub fn open(tty: &Arc<Tty>, flags: u32, origin: Origin, ctty: bool) -> Result<i6
     Ok(fd)
 }
 
-/// A session leader's process ended (`EVENT_SESSION_END`): its controlling terminal is
+/// A session leader's process ended (`process`): its controlling terminal is
 /// dissociated (Linux's `disassociate_ctty(1)`): the console is hung up, a pty's
 /// foreground group gets SIGHUP.
 pub fn session_ended(sid: u64) {
@@ -495,8 +530,8 @@ impl Tty {
         if me.sid != session || me.pgid == fg {
             return Ok(());
         }
-        let state = syscall(SYS_SIGNAL_STATE, [sig, 0, 0, 0, 0, 0]);
-        if state > 0 && state as u64 & (SIGNAL_IGNORED | SIGNAL_BLOCKED) != 0 {
+        let (ignored, blocked) = crate::signal::ignored_or_blocked(sig as u32);
+        if ignored || blocked {
             return if sig == SIGTTIN { Err(EIO) } else { Ok(()) };
         }
         if ids(0, IDS_ORPHANED)?.orphaned {

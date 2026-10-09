@@ -123,12 +123,12 @@ pub fn setup_stdio() {
         Ok(fd) => fd as u64,
         Err(_) => return,
     };
-    let handle = syscall(SYS_KFILE_OBJECT, [fd, 0, 0, 0, 0, 0]);
-    if handle > 0 {
+    // 1 and 2: the same description.
+    let table = crate::fdtable::current();
+    if let Ok(file) = table.get(fd) {
         for _ in 0..2 {
-            syscall(SYS_KFD_INSTALL_FILE, [handle as u64, 0, 0, 0, 0, 0]);
+            let _ = table.install(file.clone(), false, 0);
         }
-        syscall(SYS_HANDLE_CLOSE, [handle as u64, 0, 0, 0, 0, 0]);
     }
     if let Ok(me) = tty::ids(0, 0) {
         let mut inner = t.inner.lock();

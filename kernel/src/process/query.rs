@@ -1,13 +1,14 @@
 //! proc_query (syscall 1005): the kernel's native process and system
-//! information for the procfs server (records in `procproto`), and the same
-//! for the Linux server (`restricted::SYS_PROC_INFO`), whose /proc/<pid>
-//! shows the processes until R8 makes them its own. Only privileged
-//! servers and the Linux server may ask; they decide what programs see.
+//! information for the procfs server (records in `procproto`): the
+//! system-wide record only, for it and for the Linux server
+//! (`restricted::SYS_SYSTEM_INFO`), whose /proc/<pid> comes from its own
+//! process table (R8). Only privileged servers and the Linux server may
+//! ask; they decide what programs see.
 
 use super::errno::*;
 use super::sched::{self, TABLE};
 use super::task::State;
-use super::{uaccess, Pid, TIMER_HZ};
+use super::{uaccess, TIMER_HZ};
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 use procproto::*;
@@ -49,86 +50,6 @@ fn system() -> System {
     s
 }
 
-/// The process `pid` names (a process id, or the id of one of its threads:
-/// Linux's /proc has a directory for every thread id, though it lists only
-/// processes), if it is one of Linux server instance `instance`'s: ESRCH
-/// for any other (another tree's, a server's, the kernel's), so no instance
-/// learns about another's processes. The check is on the group whose
-/// record is then read, so a pid reused meanwhile cannot slip through.
-fn group(pid: Pid, instance: u64) -> Result<alloc::sync::Arc<super::task::ThreadGroup>, i64> {
-    let table = TABLE.lock();
-    let g = table.groups.get(&pid).cloned().or_else(|| table.tasks.get(&pid).map(|t| t.group.clone())).ok_or(ESRCH)?;
-    if !super::in_instance(&g, instance) {
-        return Err(ESRCH);
-    }
-    Ok(g)
-}
-
-fn process(pid: Pid, instance: u64) -> Result<Process, i64> {
-    let g = group(pid, instance)?;
-    let info = g.info.lock();
-    // The process's state is its main thread's (or the first live one's):
-    // running if any thread runs.
-    let state = if info.threads.is_empty() {
-        STATE_ZOMBIE
-    } else if info.threads.iter().any(|t| matches!(t.state(), State::Running | State::Runnable)) {
-        STATE_RUNNING
-    } else if info.threads.iter().all(|t| t.state() == State::Stopped) {
-        STATE_STOPPED
-    } else {
-        STATE_SLEEPING
-    };
-    let (user_ns, system_ns) = info.cputime();
-    let tick_ns = crate::time::NSEC_PER_SEC / TIMER_HZ;
-    let mut p = Process {
-        pid,
-        tgid: g.tgid,
-        ppid: info.ppid,
-        pgid: info.pgid,
-        sid: info.sid,
-        state: state as u64,
-        utime: user_ns / tick_ns,
-        stime: system_ns / tick_ns,
-        start: g.start_ticks,
-        pages: info.mem.as_ref().map_or(0, |m| m.pages.load(Ordering::Relaxed)),
-        virt_pages: info.mem.as_ref().map_or(0, |m| m.virt_pages.load(Ordering::Relaxed)),
-        // The main thread's (nice values are per thread).
-        nice: info.threads.first().map_or(0, |t| t.nice.load(Ordering::Relaxed)) as i64,
-        threads: info.threads.len() as u64,
-        cpu: info.threads.first().map_or(0, |t| t.last_cpu.load(Ordering::Relaxed)) as u64,
-        flags: 0,
-        legacy_calls: g.legacy_calls.load(Ordering::Relaxed),
-        peak_pages: info.mem.as_ref().map_or(0, |m| m.peak_pages.load(Ordering::Relaxed)),
-        virt_peak: info.mem.as_ref().map_or(0, |m| m.virt_peak.load(Ordering::Relaxed)),
-        name: [0; 16],
-        ..Default::default()
-    };
-    // The thread asked for (a thread's id), or the main thread; its signal
-    // state is read once `info` is let go of (no lock order between them).
-    let thread = info.threads.iter().find(|t| t.tid() == pid).or(info.threads.first()).cloned();
-    if g.privileged.load(Ordering::Relaxed) {
-        p.flags |= FLAG_SERVER;
-    }
-    if pid == 0 {
-        p.flags |= FLAG_KERNEL;
-    }
-    let n = info.name.len().min(15);
-    p.name[..n].copy_from_slice(&info.name.as_bytes()[..n]);
-    drop(info);
-    if let Some(t) = thread {
-        let s = t.sig.lock();
-        (p.sig_pending, p.sig_blocked) = (s.pending(), s.mask);
-    }
-    (p.sig_shared, p.sig_ignored, p.sig_caught) = g.sig.lock().summary();
-    Ok(p)
-}
-
-fn text_of(pid: Pid, instance: u64, f: impl FnOnce(&super::task::Info) -> Vec<u8>) -> Result<Vec<u8>, i64> {
-    let g = group(pid, instance)?;
-    let info = g.info.lock();
-    Ok(f(&info))
-}
-
 /// sysinfo(2): uptime, load and memory in the layout of `struct sysinfo`.
 pub fn sysinfo(buf: u64) -> SysResult {
     const SI_LOAD_SHIFT: u32 = 16;
@@ -148,29 +69,14 @@ pub fn sysinfo(buf: u64) -> SysResult {
     Ok(0)
 }
 
-/// The answer to `op` about `arg` for a buffer of `len` bytes, for Linux
-/// server instance `instance`: system-wide figures, and the processes of
-/// that instance only (ESRCH for any other); ERANGE if it does not fit
-/// (except the lists of ids, which take what fits).
-fn answer(op: u64, arg: u64, len: u64, instance: u64) -> Result<Vec<u8>, i64> {
-    let fit = (len / 8) as usize;
-    let ids = |ids: &mut dyn Iterator<Item = u64>| -> Vec<u8> { ids.take(fit).flat_map(|p| p.to_le_bytes()).collect() };
-    let bytes: Vec<u8> = match op {
-        QUERY_SYSTEM => as_bytes(&system()).to_vec(),
-        QUERY_PIDS => {
-            let pids: Vec<u64> = TABLE.lock().groups.iter().filter(|(_, g)| super::in_instance(g, instance)).map(|(&p, _)| p).collect();
-            ids(&mut pids.into_iter())
-        }
-        QUERY_PROCESS => as_bytes(&process(arg, instance)?).to_vec(),
-        QUERY_CMDLINE => text_of(arg, instance, |i| i.cmdline.clone())?,
-        QUERY_EXE => text_of(arg, instance, |i| i.exe.as_bytes().to_vec())?,
-        QUERY_THREADS => {
-            let g = group(arg, instance)?;
-            let tids: Vec<u64> = g.info.lock().threads.iter().map(|t| t.tid()).collect();
-            ids(&mut tids.into_iter())
-        }
-        _ => return Err(EINVAL),
-    };
+/// The answer to `op` for a buffer of `len` bytes: the system-wide record
+/// (`QUERY_SYSTEM`; the processes' records are their Linux server's since
+/// R8); ERANGE if it does not fit.
+fn answer(op: u64, len: u64) -> Result<Vec<u8>, i64> {
+    if op != QUERY_SYSTEM {
+        return Err(EINVAL);
+    }
+    let bytes = as_bytes(&system()).to_vec();
     if bytes.len() as u64 > len {
         return Err(ERANGE);
     }
@@ -187,18 +93,16 @@ pub fn proc_query(op: u64, arg: u64, buf: u64, len: u64) -> SysResult {
     if !sched::current().group.privileged.load(Ordering::Relaxed) || op != QUERY_SYSTEM {
         return Err(EPERM);
     }
-    // No process is any server's (`in_instance` takes no instance 0's).
-    let bytes = answer(op, arg, len, 0)?;
+    let _ = arg;
+    let bytes = answer(op, len)?;
     uaccess::copy_to(buf, &bytes)?;
     Ok(bytes.len() as i64)
 }
 
-/// `restricted::SYS_PROC_INFO`: proc_query for the Linux server instance
-/// `instance` (the caller's, the kernel's to say), into its own memory: the
-/// records of its /proc/<pid>, its own processes only, until the process
-/// model is the server's (R8).
-pub fn server_query(instance: u64, op: u64, arg: u64, buf: u64, len: u64) -> SysResult {
-    let bytes = answer(op, arg, len, instance)?;
+/// `restricted::SYS_SYSTEM_INFO`: the system's record for a Linux server,
+/// into its own memory.
+pub fn server_query(op: u64, buf: u64, len: u64) -> SysResult {
+    let bytes = answer(op, len)?;
     uaccess::copy_to_server(buf, &bytes)?;
     Ok(bytes.len() as i64)
 }

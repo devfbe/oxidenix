@@ -48,7 +48,6 @@ const EPROTONOSUPPORT: i64 = 93;
 const ESOCKTNOSUPPORT: i64 = 94;
 const ESRCH: i64 = 3;
 
-const SIGPIPE: u64 = 13;
 
 const SOCK_TYPE_MASK: u64 = 0xf;
 const SOCK_RAW: u32 = 3;
@@ -120,17 +119,21 @@ pub fn handle(s: &State) -> Option<i64> {
         SYS_SOCKETPAIR => Err(EAFNOSUPPORT),
         SYS_CONNECT | SYS_ACCEPT | SYS_SENDTO | SYS_RECVFROM | SYS_SENDMSG | SYS_RECVMSG | SYS_SHUTDOWN | SYS_BIND | SYS_LISTEN
         | SYS_GETSOCKNAME | SYS_GETPEERNAME | SYS_SETSOCKOPT | SYS_GETSOCKOPT | SYS_ACCEPT4 | SYS_RECVMMSG | SYS_SENDMMSG => {
-            let (sock, flags) = match files::lookup_checked(a0) {
+            // (An O_PATH descriptor is no file: EBADF, Linux's fdget. The
+            // description stays referenced while the call uses it.)
+            let file = match files::lookup(a0) {
                 Err(e) => return Some(-e),
-                Ok(Some((File::Socket(sock), flags))) => (sock, flags),
-                Ok(Some((File::Inet(sock), flags))) => {
-                    let r = crate::inetcalls::call(s.rax, &sock, flags, [a0, a1, a2, a3, a4, a5]);
+                Ok(f) => f,
+            };
+            let flags = file.flags();
+            let sock = match &file.file {
+                File::Socket(sock) => sock.clone(),
+                File::Inet(sock) => {
+                    let r = crate::inetcalls::call(s.rax, sock, flags, [a0, a1, a2, a3, a4, a5]);
                     return Some(r.unwrap_or_else(|e| -e));
                 }
-                // An O_PATH descriptor is no file (Linux's fdget fails).
-                Ok(Some((File::Path(_), _))) => return Some(-files::EBADF),
                 // Another file, of the server's or of the kernel's.
-                Ok(_) => return Some(-crate::unix::ENOTSOCK),
+                _ => return Some(-crate::unix::ENOTSOCK),
             };
             match s.rax {
                 SYS_CONNECT => connect(&sock, flags, a1, a2),
@@ -156,13 +159,14 @@ pub fn handle(s: &State) -> Option<i64> {
     Some(result.unwrap_or_else(|e| -e))
 }
 
-/// A new placeholder for `sock`: its descriptor (open flags `flags`).
+/// A new open file description for `sock` and its descriptor (open flags
+/// `flags`).
 fn install(sock: &Arc<Sock>, flags: u64) -> Result<i64, i64> {
     let id = files::new_id();
     sock.set_id(id);
     let open = O_RDWR | (flags as u32 & (O_NONBLOCK | O_CLOEXEC));
-    let fd = files::install(id, File::Socket(sock.clone()), open, sock.readiness_now())?;
-    // What changed before the placeholder existed.
+    let fd = files::install(id, File::Socket(sock.clone()), open)?;
+    // What changed before the description existed.
     sock.report_now();
     Ok(fd)
 }
@@ -201,17 +205,18 @@ fn socketpair(ty: u64, protocol: u64, sv: u64) -> Result<i64, i64> {
             return Err(e);
         }
     };
+    let table = crate::fdtable::current();
     let fb = match install(&b, ty) {
         Ok(fd) => fd,
         Err(e) => {
-            syscall(SYS_KFD_CLOSE, [fa as u64, 0, 0, 0, 0, 0]);
+            drop(table.take(fa as u64));
             b.release();
             return Err(e);
         }
     };
     if let Err(e) = usercopy::write(sv, &[fa as i32, fb as i32]) {
-        syscall(SYS_KFD_CLOSE, [fa as u64, 0, 0, 0, 0, 0]);
-        syscall(SYS_KFD_CLOSE, [fb as u64, 0, 0, 0, 0, 0]);
+        drop(table.take(fa as u64));
+        drop(table.take(fb as u64));
         return Err(e);
     }
     Ok(0)
@@ -443,7 +448,7 @@ fn parse_control(control: u64, len: u64) -> Result<(Vec<Passed>, Cred), i64> {
                     // claimed, but the process must exist in this tree
                     // (another tree's are none of its business).
                     if given.pid != cred.pid
-                        && (given.pid == 0 || syscall(SYS_THREAD_EXISTS, [given.pid as u64, THREAD_IN_INSTANCE, 0, 0, 0, 0]) < 0)
+                        && (given.pid == 0 || !crate::process::exists(given.pid))
                     {
                         return Err(ESRCH);
                     }
@@ -477,7 +482,7 @@ fn send_common(sock: &Arc<Sock>, fflags: u32, name: Option<Vec<u8>>, src: &mut S
     let (fds, cred) = parse_control(control.0, control.1)?;
     let r = sock.send(src, to, fds, cred, nonblock);
     if r == Err(EPIPE) && sock.ty == STREAM && flags & MSG_NOSIGNAL == 0 {
-        syscall(SYS_SIGNAL_THREAD, [SIGPIPE, 0, 0, 0, 0, 0]);
+        crate::signal::raise_thread(crate::signal::SIGPIPE);
     }
     r
 }
@@ -610,7 +615,7 @@ fn put_fds(control: u64, cap: usize, used: &mut usize, flags: &mut u32, fds: Fds
                 if installed.len() < fit {
                     installed.push(fd);
                 } else {
-                    syscall(SYS_KFD_CLOSE, [fd as u64, 0, 0, 0, 0, 0]);
+                    drop(crate::fdtable::current().take(fd as u64));
                 }
             }
         }

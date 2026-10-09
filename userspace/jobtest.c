@@ -37,6 +37,11 @@ static pid_t reader(int fds[2]) {
 int main(void) {
     int status;
 
+    /* A job of its own, as a shell with job control runs one: its parent (the shell) ties
+     * the group to the session. Run by a non-interactive pid 1 shell, the shell's group would
+     * be orphaned, and Linux discards the terminal's stop signals in an orphaned group. */
+    setpgid(0, 0);
+
     pid_t p = fork();
     if (p == 0) {
         raise(SIGSTOP);
@@ -85,6 +90,52 @@ int main(void) {
     write(fds[1], "x", 1);
     waitpid(p, &status, 0);
     check("SA_RESTART handler resumes the read()", WIFEXITED(status) && WEXITSTATUS(status) == 0);
+
+    /* In a group no parent ties to its session (a new session's), SIGTSTP is discarded:
+     * nobody could continue it. SIGSTOP still stops. */
+    p = fork();
+    if (p == 0) {
+        setsid();
+        raise(SIGTSTP);
+        raise(SIGSTOP);
+        _exit(7);
+    }
+    waitpid(p, &status, WUNTRACED);
+    check("SIGTSTP is discarded in an orphaned group, SIGSTOP not", WIFSTOPPED(status) && WSTOPSIG(status) == SIGSTOP);
+    kill(p, SIGCONT);
+    waitpid(p, &status, 0);
+    check("... and it goes on after SIGCONT", WIFEXITED(status) && WEXITSTATUS(status) == 7);
+
+    /* A process group left orphaned with a stopped member gets SIGHUP and SIGCONT (Linux's
+     * kill_orphaned_pgrp). In a session of its own: a leader, a child leading a group whose
+     * member stops; when that child ends, nobody in the session ties the group to it any
+     * more (the stopped member's new parent is pid 1, in another session). The member
+     * ignores SIGHUP, so it goes on and says so. */
+    int report[2];
+    pipe(report);
+    p = fork();
+    if (p == 0) {
+        setsid();
+        pid_t c1 = fork();
+        if (c1 == 0) {
+            setpgid(0, 0);
+            pid_t r = fork();
+            if (r == 0) {
+                signal(SIGHUP, SIG_IGN);
+                raise(SIGSTOP);
+                write(report[1], "r", 1);
+                _exit(8);
+            }
+            waitpid(r, &status, WUNTRACED);
+            _exit(0);
+        }
+        waitpid(c1, &status, 0);
+        alarm(5);
+        char c = 0;
+        _exit(read(report[0], &c, 1) == 1 && c == 'r' ? 0 : 1);
+    }
+    waitpid(p, &status, 0);
+    check("an orphaned group's stopped member is continued", WIFEXITED(status) && WEXITSTATUS(status) == 0);
 
     printf("jobtest: %s\n", failures ? "FAILED" : "all passed");
     return failures;

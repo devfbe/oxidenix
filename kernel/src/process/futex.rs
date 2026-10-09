@@ -264,12 +264,25 @@ fn unqueue(me: &Task) -> bool {
     }
 }
 
+/// Whether a waiter is a task some other wake already woke: a word of a
+/// `server_waitv` whose task left through another word (it removes such
+/// entries itself as it returns). A task's own entries are otherwise never
+/// in a bucket once it was woken: the flag is cleared before it enqueues.
+fn stale(w: &Waiter) -> bool {
+    matches!(&w.sleeper, Sleeper::Task(t) if t.futex_woken.load(Ordering::Acquire))
+}
+
 /// Wakes waiters of `bucket` with `key` (and a bitset bit in common), at
-/// most `n`; returns how many.
+/// most `n`; returns how many. Stale entries of a vectored wait go without
+/// counting, so they never take a wake another waiter needs.
 fn wake_in(b: &mut Vec<Waiter>, key: &Key, n: u64, bitset: u32) -> u64 {
     let mut woken = 0;
     let mut i = 0;
     while i < b.len() && woken < n {
+        if b[i].key == *key && stale(&b[i]) {
+            b.remove(i);
+            continue;
+        }
         if b[i].key == *key && b[i].bitset & bitset != 0 {
             b.remove(i).wake();
             woken += 1;
@@ -359,6 +372,97 @@ fn requeue(uaddr: u64, n_wake: u64, n_move: u64, uaddr2: u64, cmp: Option<u32>, 
 pub fn server_wait(instance: usize, addr: u64, word: &core::sync::atomic::AtomicU32, val: u32, deadline: Option<u64>, interruptible: bool) -> Result<i64, i64> {
     let key = Key { base: Base::Server(instance), offset: addr };
     wait_on(key, || Some(word.load(Ordering::SeqCst)), || Ok(()), || false, val, deadline, FUTEX_BITSET_MATCH_ANY, interruptible)
+}
+
+/// One word of a `server_waitv`: where it is (the Linux server's memory, or
+/// an object mapped into it, which the entry keeps), and the value the
+/// caller expects it to hold.
+pub struct WaitWord<'a> {
+    key: Key,
+    word: &'a core::sync::atomic::AtomicU32,
+    val: u32,
+    object: Option<Arc<PageCache>>,
+}
+
+impl<'a> WaitWord<'a> {
+    /// The word at `addr` of instance `instance`'s memory, read through `word`.
+    pub fn server(instance: usize, addr: u64, word: &'a core::sync::atomic::AtomicU32, val: u32) -> WaitWord<'a> {
+        WaitWord { key: Key { base: Base::Server(instance), offset: addr }, word, val, object: None }
+    }
+
+    /// The word at `offset` of `object` (mapped into the server's region),
+    /// read through `word` (the object's page, which `object` keeps).
+    pub fn object(object: Arc<PageCache>, offset: u64, word: &'a core::sync::atomic::AtomicU32, val: u32) -> WaitWord<'a> {
+        let key = Key { base: Base::Shared(Arc::as_ptr(&object) as usize), offset };
+        WaitWord { key, word, val, object: Some(object) }
+    }
+}
+
+/// Waits until any of `words` is woken, while each holds its value (EAGAIN
+/// at once if one does not), until `deadline` or, if `interruptible`, a
+/// signal (a fatal one always): the Linux server's wait for any of several
+/// events (`restricted::SYS_SERVER_WAIT`: poll, select and epoll_wait wait
+/// on their own word and on the words netd wakes). EPIPE if a word's object
+/// was hung up.
+///
+/// The task sits in the bucket of every word at once. The first wake takes
+/// its entry there and marks the task woken; the others are stale from then
+/// on: a wake that meets one drops it without counting it (`wake_in`), and
+/// the task removes what is left before it returns.
+pub fn server_waitv(words: &[WaitWord], deadline: Option<u64>, interruptible: bool) -> Result<i64, i64> {
+    let me = current();
+    let mut wait = prepare_to_sleep();
+    me.futex_woken.store(false, Ordering::Release);
+    let mut queued = 0;
+    let mut early = None;
+    for w in words {
+        let mut b = BUCKETS_[bucket_of(&w.key)].lock();
+        if w.object.as_ref().is_some_and(|o| o.is_hung_up()) {
+            early = Some(EPIPE);
+            break;
+        }
+        if w.word.load(Ordering::SeqCst) != w.val {
+            early = Some(EAGAIN);
+            break;
+        }
+        if b.try_reserve(1).is_err() {
+            early = Some(ENOMEM);
+            break;
+        }
+        b.push(Waiter { key: w.key, sleeper: Sleeper::Task(current_arc()), bitset: FUTEX_BITSET_MATCH_ANY });
+        queued += 1;
+    }
+    let result = match early {
+        Some(e) => Err(e),
+        None => loop {
+            if me.futex_woken.load(Ordering::Acquire) {
+                break Ok(0);
+            }
+            if deadline.is_some_and(|d| crate::time::now() >= d) {
+                break Err(ETIMEDOUT);
+            }
+            if if interruptible { signal::interrupted() } else { signal::dying() } {
+                break Err(EINTR);
+            }
+            match deadline {
+                Some(d) => wait.sleep_until(d),
+                None => wait.sleep(),
+            }
+            wait = prepare_to_sleep();
+        },
+    };
+    drop(wait);
+    // Leave every bucket the task is still in.
+    for w in &words[..queued] {
+        let mut b = BUCKETS_[bucket_of(&w.key)].lock();
+        b.retain(|x| !(x.key == w.key && x.is_task(me)));
+        tidy(&mut b);
+    }
+    // A wake that came before the wait gave up wins (its word changed).
+    match result {
+        Err(ETIMEDOUT | EINTR) if me.futex_woken.load(Ordering::Acquire) => Ok(0),
+        r => r,
+    }
 }
 
 /// Waits on the word at `offset` of the memory object `object`, read

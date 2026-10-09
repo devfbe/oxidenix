@@ -1,6 +1,6 @@
 //! Memory system calls (phase R4): Linux's semantics of mmap, munmap,
-//! mprotect, mremap, madvise, msync and the mlock family, over the kernel's
-//! mapping calls. The kernel keeps the page tables and the areas; this is
+//! mprotect, mremap, madvise, msync and the mlock family, and brk (with the
+//! process model, R8), over the kernel's mapping calls. The kernel keeps the page tables and the areas; this is
 //! where the arguments are checked and turned into mappings.
 
 use restricted::*;
@@ -26,6 +26,7 @@ const MADV_DONTNEED: u64 = 4;
 const MADV_FREE: u64 = 8;
 
 const SYS_MMAP: u64 = 9;
+const SYS_BRK: u64 = 12;
 const SYS_MPROTECT: u64 = 10;
 const SYS_MUNMAP: u64 = 11;
 const SYS_MREMAP: u64 = 25;
@@ -47,6 +48,7 @@ fn aligned(x: u64) -> bool {
 pub fn handle(s: &State) -> Option<i64> {
     let (a0, a1, a2, a3, a4, a5) = (s.rdi, s.rsi, s.rdx, s.r10, s.r8, s.r9);
     Some(match s.rax {
+        SYS_BRK => brk(a0),
         SYS_MMAP => mmap(a0, a1, a2, a3, a4, a5),
         SYS_MUNMAP => munmap(a0, a1),
         SYS_MPROTECT => mprotect(a0, a1, a2),
@@ -98,39 +100,71 @@ fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, mut offset: u64) ->
     let mapping = if flags & MAP_ANONYMOUS == 0 {
         crate::files::map_object(fd, shared, prot & PROT_WRITE != 0)
     } else {
-        Some(Ok(crate::files::Mapping::Anonymous { read_only: false }))
+        Ok(crate::files::Mapping::Anonymous { read_only: false })
     };
-    let handle = match mapping {
-        Some(Ok(crate::files::Mapping::Object(h, read_only))) => {
+    // The handle to map, and whether it is this call's to close (the
+    // kernel's open file's is its description's, kept until it is mapped).
+    let mut kernel_file = None;
+    let (handle, own) = match mapping {
+        Ok(crate::files::Mapping::Object(h, read_only)) => {
             if read_only {
                 mo_flags |= MO_READONLY;
             }
-            h as i64
+            (h as i64, true)
         }
-        Some(Err(e)) => -e,
-        None => crate::syscall(SYS_KFILE_OBJECT, [fd, 0, 0, 0, 0, 0]),
+        Err(e) => (-e, false),
+        Ok(crate::files::Mapping::Kernel(k)) => {
+            let h = k.handle() as i64;
+            kernel_file = Some(k);
+            (h, false)
+        }
         // Anonymous memory (also zero's): the offset means nothing.
-        Some(Ok(crate::files::Mapping::Anonymous { read_only })) if shared => {
+        Ok(crate::files::Mapping::Anonymous { read_only }) if shared => {
             offset = 0;
             if read_only {
                 mo_flags |= MO_READONLY;
             }
-            crate::syscall(SYS_MO_CREATE, [len / PAGE, 0, 0, 0, 0, 0])
+            (crate::syscall(SYS_MO_CREATE, [len / PAGE, 0, 0, 0, 0, 0]), true)
         }
-        Some(Ok(crate::files::Mapping::Anonymous { .. })) => {
+        Ok(crate::files::Mapping::Anonymous { .. }) => {
             offset = 0;
-            0
+            (0, false)
         }
     };
     if handle < 0 {
         return handle;
     }
     let mapped = crate::syscall(SYS_MO_MAP, [handle as u64, addr, len, offset, prot, mo_flags]);
-    if handle > 0 {
+    if own && handle > 0 {
         // The mapping holds the object now.
         crate::syscall(SYS_HANDLE_CLOSE, [handle as u64, 0, 0, 0, 0, 0]);
     }
+    drop(kernel_file);
     mapped
+}
+
+/// brk(addr) (phase R8, the process model's): the heap is anonymous memory from the end of
+/// the program (the break exec set) to the break, committed as it grows. It may not run
+/// into a mapping above it (then the break stays). The kernel places mappings above the
+/// break (`SYS_VM_FLOOR`). Returns the (possibly unchanged) break.
+fn brk(addr: u64) -> i64 {
+    let Some(brk) = crate::process::brk_of(crate::local::pid()) else { return 0 };
+    let mut b = brk.lock();
+    if addr < b.start || addr > USER_END {
+        return b.end as i64;
+    }
+    let (Some(old_top), Some(new_top)) = (page_up(b.end), page_up(addr)) else { return b.end as i64 };
+    if new_top > old_top {
+        let r = crate::syscall(SYS_MO_MAP, [0, old_top, new_top - old_top, 0, 3, MO_FIXED | MO_NOREPLACE]);
+        if r < 0 {
+            return b.end as i64;
+        }
+    } else if new_top < old_top {
+        crate::syscall(SYS_MO_UNMAP, [new_top, old_top - new_top, 0, 0, 0, 0]);
+    }
+    b.end = addr;
+    crate::syscall(SYS_VM_FLOOR, [new_top, 0, 0, 0, 0, 0]);
+    addr as i64
 }
 
 fn munmap(addr: u64, len: u64) -> i64 {

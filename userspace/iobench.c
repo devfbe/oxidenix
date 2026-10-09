@@ -142,6 +142,61 @@ static void forwarded_null_syscall(void) {
     percentiles("forwarded_null_syscall", t, SAMPLES, "cycles");
 }
 
+/* Processes: fork and wait of a child that exits at once, fork, exec of a
+ * small static program and wait, and a signal sent to the caller and handled
+ * (kill, the handler's frame, rt_sigreturn). Microseconds per operation. */
+#define PROC_SAMPLES 200
+#define SIGNAL_SAMPLES 5000
+
+static volatile sig_atomic_t handled;
+static void on_usr1(int sig) {
+    (void)sig;
+    handled++;
+}
+
+static void processes(void) {
+    static uint64_t t[PROC_SAMPLES];
+    start_counting();
+    for (int i = 0; i < PROC_SAMPLES; i++) {
+        double a = now();
+        pid_t p = fork();
+        if (p == 0) _exit(0);
+        waitpid(p, NULL, 0);
+        t[i] = (uint64_t)((now() - a) * 1e6);
+    }
+    per_op("fork_wait", PROC_SAMPLES);
+    percentiles("fork_wait", t, PROC_SAMPLES, "us");
+    start_counting();
+    for (int i = 0; i < PROC_SAMPLES; i++) {
+        double a = now();
+        pid_t p = fork();
+        if (p == 0) {
+            /* (Its greeting goes nowhere.) */
+            int null = open("/dev/null", O_WRONLY);
+            dup2(null, 1);
+            char *args[] = {"hello", NULL};
+            execv("/bin/hello", args);
+            _exit(127);
+        }
+        waitpid(p, NULL, 0);
+        t[i] = (uint64_t)((now() - a) * 1e6);
+    }
+    per_op("fork_exec_wait", PROC_SAMPLES);
+    percentiles("fork_exec_wait", t, PROC_SAMPLES, "us");
+    static uint64_t s[SIGNAL_SAMPLES];
+    signal(SIGUSR1, on_usr1);
+    pid_t me = getpid();
+    start_counting();
+    for (int i = 0; i < SIGNAL_SAMPLES; i++) {
+        uint64_t a = rdtsc();
+        kill(me, SIGUSR1);
+        s[i] = rdtsc() - a;
+    }
+    per_op("signal_handled", SIGNAL_SAMPLES);
+    percentiles("signal_handled", s, SIGNAL_SAMPLES, "cycles");
+    signal(SIGUSR1, SIG_DFL);
+}
+
 /* fstat of a file on the disk: one IPC round trip to the filesystem
  * server (a small request and reply), against fstat of a tmpfs file. */
 static void ipc_round_trip(void) {
@@ -411,6 +466,7 @@ int main(int argc, char **argv) {
     measure_probe();
     null_syscall();
     forwarded_null_syscall();
+    processes();
     ipc_round_trip();
     proc_reads();
     block_io();

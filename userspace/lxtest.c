@@ -353,10 +353,9 @@ int main(int argc, char **argv) {
      * pass through to the kernel's Linux implementation. */
     long idle = legacy_calls();
     long base = legacy_calls() - idle;
-    pid_t me = getpid();
     long c0 = legacy_calls();
     int own = 1;
-    for (int i = 0; i < 5; i++) own &= syscall(TEST_PASS_THROUGH) == me;
+    for (int i = 0; i < 5; i++) own &= syscall(TEST_PASS_THROUGH) == 0;
     long on_purpose = legacy_calls() - c0 - base;
     printf("    (5 calls passed through on purpose counted as %ld)\n", on_purpose);
     check("/proc/self/counters counts the process's own passed-through calls", idle >= 0 && own && on_purpose == 5);

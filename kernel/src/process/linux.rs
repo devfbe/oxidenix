@@ -174,8 +174,6 @@ pub struct Instance {
     /// The server's copy instruction and where its fault resumes (see
     /// `SYS_SET_USERCOPY`), once set.
     usercopy: spin::Once<(u64, u64)>,
-    /// The placeholders of the server's files, by id, for readiness reports.
-    files: spin::Mutex<BTreeMap<u64, alloc::sync::Weak<crate::fs::file::ServerFile>>>,
     /// Pages of paged objects that threads wait for, for the pager thread.
     pager: spin::Mutex<PagerQueue>,
     /// Address spaces of the tree's programs: when the last goes, so does
@@ -192,6 +190,11 @@ pub struct Instance {
     spaces: spin::Mutex<Vec<Weak<super::tlb::Tlb>>>,
     /// Channels the instance holds (at most `MAX_CHANNELS`).
     channels: core::sync::atomic::AtomicUsize,
+    /// The tasks of the programs' threads by thread area, with the area's
+    /// generation: what a key (`slot | gen << 32`) names.
+    tasks: spin::Mutex<BTreeMap<u64, (u32, Weak<super::task::Task>)>>,
+    /// The command line the tree's first process runs (`SYS_INIT_ARGS`).
+    init_args: spin::Mutex<Vec<u8>>,
 }
 
 /// A memory object mapped into the region (`Instance::map_object`).
@@ -207,10 +210,10 @@ struct RegionMap {
 const MAX_CHANNELS: usize = 64;
 
 /// Events for the instance's service thread (the pager thread): pages
-/// wanted from it, and server files whose last descriptor went. A page
-/// request is queued once until the pager takes it; a thread that still
-/// waits asks again only once its request was answered or overtaken (the
-/// page came and went, or was cut off: `PageWait`).
+/// wanted from it, holds released, write-back. A page request is queued
+/// once until the pager takes it; a thread that still waits asks again only
+/// once its request was answered or overtaken (the page came and went, or
+/// was cut off: `PageWait`).
 struct PagerQueue {
     requests: alloc::collections::VecDeque<Event>,
     queued: alloc::collections::BTreeSet<(u64, u64)>,
@@ -230,8 +233,12 @@ struct PagerQueue {
     sync_done: u64,
     /// The pager's process is gone: no page will come any more.
     dead: bool,
-    /// An `EVENT_INFLIGHT` is queued (one at a time).
-    inflight_queued: bool,
+    /// Keys of the programs' threads that are gone, for `EVENT_THREAD_EXIT`.
+    /// Its capacity covers every thread announced and not yet reported
+    /// (`announced`), reserved before a thread starts, so a push never
+    /// allocates and no exit is lost.
+    exits: alloc::collections::VecDeque<u64>,
+    announced: usize,
 }
 
 /// A kernel object the Linux server refers to by handle.
@@ -239,11 +246,10 @@ struct PagerQueue {
 pub(super) enum Object {
     /// A memory object (pages that mappings and reads and writes share).
     Memory(Arc<PageCache>),
-    /// An open file of the kernel's descriptor table, to map.
+    /// An open file description of the kernel's (`SYS_INODE_OPEN`), which
+    /// the server's descriptor table holds: its calls are
+    /// `SYS_KFILE_CALL`'s, `mo_map` maps it.
     KernelFile(Arc<crate::fs::file::OpenFile>),
-    /// An open file description in flight (`KFILE_INFLIGHT`): counted in
-    /// its `in_flight` while the handle lives.
-    InFlight(Arc<InFlight>),
     /// An inode of the kernel's tree (`super::linux_inode`).
     Inode(Arc<crate::fs::Inode>),
     /// The contents of a file of the server's (a tmpfs file object), with
@@ -253,23 +259,26 @@ pub(super) enum Object {
     Image(&'static [u8]),
     /// The client's end of a channel to a device server (`SYS_CHAN_CREATE`).
     Channel(Arc<super::channel::ClientEnd>),
+    /// A process of the instance (`SYS_PROC_SELF`, `SYS_PROC_CREATE`).
+    Process(Arc<Container>),
 }
 
-/// A reference to an open file description that is a descriptor in
-/// flight.
-pub(super) struct InFlight(Arc<crate::fs::file::OpenFile>);
-
-impl InFlight {
-    fn new(file: Arc<crate::fs::file::OpenFile>) -> InFlight {
-        file.in_flight.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
-        InFlight(file)
-    }
+/// A process as the Linux server holds it: the kernel's thread group, and
+/// until its first thread is made (`SYS_THREAD_CREATE`), what that thread
+/// gets. The handle keeps the group (its CPU time and memory counts) after
+/// the process ended, until the server reaped it.
+pub struct Container {
+    pub group: Arc<super::task::ThreadGroup>,
+    fresh: spin::Mutex<Option<Fresh>>,
 }
 
-impl Drop for InFlight {
-    fn drop(&mut self) {
-        self.0.in_flight.fetch_sub(1, core::sync::atomic::Ordering::AcqRel);
-    }
+/// The address space and working directory of a process without a thread
+/// yet, and the id its first thread takes. (A Linux program has no
+/// descriptor table of the kernel's: its descriptors are its server's.)
+struct Fresh {
+    mm: Arc<super::address_space::Mm>,
+    fs: Arc<super::task::FsInfo>,
+    pid: super::sched::PidReservation,
 }
 
 /// Most handles one instance may hold.
@@ -284,8 +293,9 @@ struct Handles {
 struct Slots {
     next: u64,
     free: Vec<u64>,
-    /// The `State` page of each area, for the kernel to reach directly.
-    states: BTreeMap<u64, PhysFrame>,
+    /// The `State` page of each area, for the kernel to reach directly, and
+    /// the area's generation (one more for each thread it serves).
+    states: BTreeMap<u64, (PhysFrame, u32)>,
 }
 
 impl Instance {
@@ -311,7 +321,6 @@ impl Instance {
             slots: spin::Mutex::new(Slots { next: 0, free: Vec::new(), states: BTreeMap::new() }),
             handles: spin::Mutex::new(Handles { next: 1, objects: BTreeMap::new() }),
             usercopy: spin::Once::new(),
-            files: spin::Mutex::new(BTreeMap::new()),
             pager: spin::Mutex::new(PagerQueue {
                 requests: alloc::collections::VecDeque::new(),
                 queued: alloc::collections::BTreeSet::new(),
@@ -323,7 +332,8 @@ impl Instance {
                 sync_wanted: 0,
                 sync_done: 0,
                 dead: false,
-                inflight_queued: false,
+                exits: alloc::collections::VecDeque::new(),
+                announced: 0,
             }),
             programs: core::sync::atomic::AtomicUsize::new(0),
             heap_end: spin::Mutex::new(HEAP_BASE),
@@ -331,6 +341,8 @@ impl Instance {
             maps: crate::sync::Mutex::new(BTreeMap::new()),
             spaces: spin::Mutex::new(Vec::new()),
             channels: core::sync::atomic::AtomicUsize::new(0),
+            tasks: spin::Mutex::new(BTreeMap::new()),
+            init_args: spin::Mutex::new(Vec::new()),
         };
         instance.entry = instance.load(image)?;
         // Counted from here on (its drop uncounts it).
@@ -462,11 +474,19 @@ impl Instance {
         Ok(elf.entry)
     }
 
-    /// A thread area: (its number, its `State` page).
-    fn thread(&self) -> Result<(u64, PhysFrame), i64> {
+    /// A thread area: (its number, its `State` page, its key: the number
+    /// and the area's new generation).
+    fn thread(&self) -> Result<(u64, PhysFrame, u64), i64> {
         let mut slots = self.slots.lock();
-        if let Some(n) = slots.free.pop() {
-            return Ok((n, slots.states[&n]));
+        while let Some(n) = slots.free.pop() {
+            let (state, gen) = slots.states.get_mut(&n).expect("a free area was mapped");
+            // (31 bits: a key is a positive return value.) An area whose generations are
+            // used up is retired, so that no key is ever named twice.
+            if *gen == 0x7fff_ffff {
+                continue;
+            }
+            *gen += 1;
+            return Ok((n, *state, n | (*gen as u64) << 32));
         }
         let n = slots.next;
         if n >= MAX_THREADS {
@@ -479,8 +499,69 @@ impl Instance {
         }
         let state = self.ensure(thread_state(n))?;
         slots.next = n + 1;
-        slots.states.insert(n, state);
-        Ok((n, state))
+        slots.states.insert(n, (state, 1));
+        Ok((n, state, n | 1 << 32))
+    }
+
+    /// The live task of the thread `key` (of a program of this instance).
+    fn task_of(&self, key: u64) -> Option<Arc<super::task::Task>> {
+        let tasks = self.tasks.lock();
+        let (gen, task) = tasks.get(&(key & 0xffff_ffff))?;
+        if *gen as u64 != key >> 32 {
+            return None;
+        }
+        task.upgrade().filter(|t| t.state() != super::task::State::Dead)
+    }
+
+    /// Makes room for the exit of one more program thread, which then counts
+    /// as announced (its `LinuxThread` reports its end).
+    fn announce(&self) -> Result<(), i64> {
+        let mut q = self.pager.lock();
+        let want = q.announced + 1;
+        if q.exits.capacity() < want {
+            let more = want - q.exits.len();
+            q.exits.try_reserve(more).map_err(|_| ENOMEM)?;
+        }
+        q.announced = want;
+        Ok(())
+    }
+
+    /// A program's thread `key` is gone: `EVENT_THREAD_EXIT` for the
+    /// service thread (room was reserved by `announce`).
+    fn thread_gone(&self, key: u64) {
+        {
+            let mut tasks = self.tasks.lock();
+            if tasks.get(&(key & 0xffff_ffff)).is_some_and(|(gen, _)| *gen as u64 == key >> 32) {
+                tasks.remove(&(key & 0xffff_ffff));
+            }
+        }
+        let mut q = self.pager.lock();
+        if q.dead || q.closing {
+            q.announced -= 1;
+            return;
+        }
+        // (Within the capacity `announce` reserved: no allocation.)
+        q.exits.push_back(key);
+        drop(q);
+        super::wakeup(self.pager_chan());
+    }
+
+    /// Keeps the command line of the tree's first process (`SYS_INIT_ARGS`).
+    pub fn set_init_args(&self, path: &str, args: &[alloc::string::String], envs: &[alloc::string::String]) -> Result<(), i64> {
+        let len = path.len() + 1 + args.iter().chain(envs).map(|s| s.len() + 1).sum::<usize>() + 2;
+        let mut out = Vec::new();
+        out.try_reserve_exact(len).map_err(|_| ENOMEM)?;
+        out.extend_from_slice(path.as_bytes());
+        out.push(0);
+        for list in [args, envs] {
+            for s in list {
+                out.extend_from_slice(s.as_bytes());
+                out.push(0);
+            }
+            out.push(0);
+        }
+        *self.init_args.lock() = out;
+        Ok(())
     }
 
     /// The frame of the data page at `addr`, mapped (zeroed) if missing.
@@ -810,43 +891,7 @@ impl crate::fs::cache::Pager for Instance {
     }
 }
 
-impl crate::fs::file::ServerFiles for Instance {
-    fn closed(&self, id: u64) {
-        self.files.lock().remove(&id);
-        // Closed by this instance's thread in a pass-through call: the
-        // server learns it when the call returns (close is then complete
-        // for the other end, as with the kernel's own pipes).
-        let mine = with_current(|p| match p.linux.as_mut() {
-            Some(l) if l.in_legacy && core::ptr::eq(Arc::as_ptr(&l.instance), self) => {
-                l.closed_now.push(id);
-                true
-            }
-            _ => false,
-        });
-        if !mine {
-            self.queue_closed(id);
-        }
-    }
-
-    fn in_flight_reference_gone(&self) {
-        let mut q = self.pager.lock();
-        if q.dead || q.closing || q.inflight_queued {
-            return;
-        }
-        q.inflight_queued = true;
-        q.requests.push_back(Event { kind: EVENT_INFLIGHT, a: 0, b: 0 });
-        drop(q);
-        super::wakeup(self.pager_chan());
-    }
-}
-
 impl Instance {
-    /// Tells the service thread that the server file `id` lost its last
-    /// descriptor.
-    fn queue_closed(&self, id: u64) {
-        self.queue_event(Event { kind: EVENT_CLOSED, a: id, b: 0 });
-    }
-
     /// Queues an event for the service thread (none once it is gone or
     /// going: nobody would take it).
     fn queue_event(&self, event: Event) {
@@ -863,25 +908,12 @@ impl Instance {
     }
 }
 
-/// A program the server resolved for an execve.
-pub enum ExecTarget {
-    /// An inode of the kernel's tree.
-    Inode(Arc<crate::fs::Inode>),
-    /// A file object of the server's and the hold the program keeps.
-    File(Arc<PageCache>, Option<Arc<Record>>),
-}
-
-/// A record of the server's (`SYS_FS_RECORD`) held by a kernel object: the
-/// server learns when the last holder is gone (`EVENT_RELEASE`).
+/// A hold of the server's (`SYS_MO_HOLD`) kept by kernel objects (mappings,
+/// a running program): the server learns when the last holder is gone
+/// (`EVENT_RELEASE`).
 pub struct Record {
     instance: Weak<Instance>,
     word: u64,
-}
-
-impl Record {
-    pub fn word(&self) -> u64 {
-        self.word
-    }
 }
 
 impl Drop for Record {
@@ -902,15 +934,6 @@ pub fn console_grant(instance: Option<&Arc<Instance>>) {
         if let Some(previous) = instances(None).into_iter().find(|i| i.id == old) {
             previous.queue_event(Event { kind: EVENT_CONSOLE_LOST, a: 0, b: 0 });
         }
-    }
-}
-
-impl Instance {
-    /// The process of a session's leader (`sid`) of this instance ended: its
-    /// server dissociates the session's controlling terminal (until the
-    /// process model is the server's, R8).
-    pub fn session_ended(&self, sid: u64) {
-        self.queue_event(Event { kind: EVENT_SESSION_END, a: sid, b: 0 });
     }
 }
 
@@ -949,20 +972,14 @@ pub struct LinuxThread {
     /// it itself: signal delivery after it restarts it as the kernel's
     /// own handling would (taken by a pass-through, which delivers itself).
     trap_nr: Option<u64>,
-    /// Server files whose last descriptor this thread's pass-through call
-    /// closed: handed to the server when the call returns.
-    closed_now: Vec<u64>,
-    /// The server's files its `kfd_lookup`s found during the system call
-    /// it handles: kept until it enters the program again (Linux's fdget),
-    /// so that another thread's close cannot take a file from under a call
-    /// that uses it.
-    pinned: Vec<Arc<crate::fs::file::OpenFile>>,
-    /// The record for the working-directory context the thread's next
-    /// pass-through clone creates (`FS_CHILD`).
-    pub fs_child: Option<Record>,
-    /// The program the thread's next pass-through execve runs, as the
-    /// server resolved it, with its absolute path (`SYS_EXEC_TARGET`).
-    pub exec_target: Option<(ExecTarget, alloc::string::String)>,
+    /// The thread's key (`slot | generation << 32`).
+    key: u64,
+    /// A program's thread whose end the service thread learns
+    /// (`EVENT_THREAD_EXIT`): set once it was listed and started.
+    announced: bool,
+    /// The dying thread was told so (`REASON_EXIT`): it exits at its next
+    /// `restricted_enter` if its server did not end it.
+    exit_told: bool,
     /// The server's registers while the program runs.
     normal: Frame,
 }
@@ -970,18 +987,51 @@ pub struct LinuxThread {
 impl LinuxThread {
     /// A thread of `instance` whose program starts with the registers of
     /// `program`; returns it and the frame the thread starts with (the
-    /// server's entry, on the thread's server stack). `role`: `ROLE_PROGRAM`,
-    /// or `ROLE_INIT` for the first thread of a new tree.
-    pub fn new(instance: Arc<Instance>, program: &Frame, role: u64) -> Result<(LinuxThread, Frame), i64> {
-        let (slot, state) = instance.thread()?;
+    /// server's entry, on the thread's server stack, with `cookie` and the
+    /// thread's key). `role`: `ROLE_PROGRAM`, or `ROLE_INIT` for the first
+    /// thread of a new tree.
+    pub fn new(instance: Arc<Instance>, program: &Frame, role: u64, cookie: u64) -> Result<(LinuxThread, Frame), i64> {
+        let (slot, state, key) = instance.thread()?;
         // A slot's count of server locks starts at 0 (a thread that died
         // holding some left it).
         unsafe { *((memory::phys_to_virt(state.start_address().as_u64()) as u64 + SERVER_LOCKS_OFFSET) as *mut u32) = 0 };
-        let thread =
-            LinuxThread { instance, slot, state, restricted: false, pager: false, events: false, in_legacy: false, trap_nr: None, closed_now: Vec::new(), pinned: Vec::new(), fs_child: None, exec_target: None, normal: Frame::default() };
+        let thread = LinuxThread::bare(instance, slot, state, key, false, false);
         save(program, thread.state());
-        let start = thread.start(role);
+        let mut start = thread.start(role);
+        start.rdx = cookie;
+        start.rcx = key;
         Ok((thread, start))
+    }
+
+    fn bare(instance: Arc<Instance>, slot: u64, state: PhysFrame, key: u64, pager: bool, events: bool) -> LinuxThread {
+        LinuxThread {
+            instance,
+            slot,
+            state,
+            restricted: false,
+            pager,
+            events,
+            in_legacy: false,
+            trap_nr: None,
+            key,
+            announced: false,
+            exit_told: false,
+            normal: Frame::default(),
+        }
+    }
+
+    /// The thread's key.
+    pub fn key(&self) -> u64 {
+        self.key
+    }
+
+    /// The thread is listed and about to start: the service thread will
+    /// learn its end (room for the event reserved now).
+    pub fn announce(&mut self, task: &Arc<super::task::Task>) -> Result<(), i64> {
+        self.instance.announce()?;
+        self.instance.tasks.lock().insert(self.slot, ((self.key >> 32) as u32, Arc::downgrade(task)));
+        self.announced = true;
+        Ok(())
     }
 
     /// A further service thread of `instance` in the pager's process, that
@@ -990,24 +1040,22 @@ impl LinuxThread {
     /// its internet sockets' readiness and closing are handled), and its
     /// frame.
     pub fn service(instance: Arc<Instance>, role: u64) -> Result<(LinuxThread, Frame), i64> {
-        let (slot, state) = instance.thread()?;
+        let (slot, state, key) = instance.thread()?;
         // A slot's count of server locks starts at 0 (a thread that died
         // holding some left it).
         unsafe { *((memory::phys_to_virt(state.start_address().as_u64()) as u64 + SERVER_LOCKS_OFFSET) as *mut u32) = 0 };
-        let thread =
-            LinuxThread { instance, slot, state, restricted: false, pager: true, events: false, in_legacy: false, trap_nr: None, closed_now: Vec::new(), pinned: Vec::new(), fs_child: None, exec_target: None, normal: Frame::default() };
+        let thread = LinuxThread::bare(instance, slot, state, key, true, false);
         let start = thread.start(role);
         Ok((thread, start))
     }
 
     /// The pager thread of `instance`, and the frame it starts with.
     pub fn pager(instance: Arc<Instance>) -> Result<(LinuxThread, Frame), i64> {
-        let (slot, state) = instance.thread()?;
+        let (slot, state, key) = instance.thread()?;
         // A slot's count of server locks starts at 0 (a thread that died
         // holding some left it).
         unsafe { *((memory::phys_to_virt(state.start_address().as_u64()) as u64 + SERVER_LOCKS_OFFSET) as *mut u32) = 0 };
-        let thread =
-            LinuxThread { instance, slot, state, restricted: false, pager: true, events: true, in_legacy: false, trap_nr: None, closed_now: Vec::new(), pinned: Vec::new(), fs_child: None, exec_target: None, normal: Frame::default() };
+        let thread = LinuxThread::bare(instance, slot, state, key, true, true);
         let start = thread.start(ROLE_PAGER);
         Ok((thread, start))
     }
@@ -1020,11 +1068,6 @@ impl LinuxThread {
         start.rdi = thread_state(self.slot);
         start.rsi = role;
         start
-    }
-
-    /// The instance of a program's thread (None for a service thread's).
-    pub fn program_instance(&self) -> Option<Arc<Instance>> {
-        (!self.pager).then(|| self.instance.clone())
     }
 
     /// Whether the thread's CPU shows the normal view (the server runs).
@@ -1046,20 +1089,17 @@ impl LinuxThread {
 
 impl Drop for LinuxThread {
     fn drop(&mut self) {
-        // Closed in a call that never returned (the thread exited in it).
-        for id in core::mem::take(&mut self.closed_now) {
-            self.instance.queue_closed(id);
-        }
         if self.events {
             self.instance.pager_gone();
         }
-        // Pins of a call that never returned.
-        for file in core::mem::take(&mut self.pinned) {
-            crate::fs::file::release(file);
-        }
         // The slot goes back only now, with the task that owns this
-        // thread (`Task::server_locks` points into its State page).
+        // thread (`Task::server_locks` points into its State page); the
+        // service thread learns the end after (the task's reference to the
+        // address space went when it exited).
         self.instance.release(self.slot);
+        if self.announced {
+            self.instance.thread_gone(self.key);
+        }
     }
 }
 
@@ -1083,6 +1123,10 @@ fn save(f: &Frame, s: &mut State) {
         rip: f.rip,
         rflags: f.rflags,
         rsp: f.rsp,
+        trap_vector: 0,
+        trap_error: 0,
+        trap_addr: 0,
+        trap_kind: 0,
     };
 }
 
@@ -1144,6 +1188,18 @@ fn instance() -> Result<Arc<Instance>, i64> {
 /// program view.
 pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
     use super::address_space::{Backing, Prot};
+    if nr == SYS_THREAD_EXIT {
+        // Before anything of this call is on the stack: it does not return.
+        if is_pager() {
+            return Err(EPERM);
+        }
+        let status = a[0] as i32;
+        match a[1] {
+            0 => super::exit_thread(status),
+            EXIT_GROUP => super::exit_group(status),
+            _ => return Err(EINVAL),
+        }
+    }
     let instance = instance()?;
     let page_aligned = |x: u64| x % PAGE == 0;
     // A range of the program's memory: page-aligned, below 64 TiB.
@@ -1185,7 +1241,7 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             use super::sys_mem::{anon_backing, file_backing, place_and_map, Placement};
             let (handle, addr, offset, flags) = (a[0], a[1], a[3], a[5]);
             let prot = prot(a[4])?;
-            let all = MO_SHARED | MO_FIXED | MO_NOREPLACE | MO_NORESERVE | MO_POPULATE | MO_READONLY;
+            let all = MO_SHARED | MO_FIXED | MO_NOREPLACE | MO_NORESERVE | MO_POPULATE | MO_READONLY | MO_GROWSDOWN;
             let may_write = flags & MO_READONLY == 0;
             if !page_aligned(addr) || !page_aligned(offset) || flags & !all != 0 {
                 return Err(EINVAL);
@@ -1193,6 +1249,16 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             let len = a[2].checked_add(PAGE - 1).ok_or(EINVAL)? & !(PAGE - 1);
             if len == 0 || len >= USER_END || offset.checked_add(len).is_none() {
                 return Err(EINVAL);
+            }
+            if flags & MO_GROWSDOWN != 0 {
+                // A stack: anonymous, private, readable and writable, where
+                // the server puts it.
+                if handle != 0 || flags != MO_GROWSDOWN | MO_FIXED || a[4] != 3 {
+                    return Err(EINVAL);
+                }
+                let top = addr.checked_add(len).filter(|&e| e <= USER_END && addr != 0).ok_or(EINVAL)?;
+                mm()?.lock().map_stack(top, len).map_err(|_| ENOMEM)?;
+                return Ok(addr as i64);
             }
             let shared = flags & MO_SHARED != 0;
             let backing = match handle {
@@ -1204,7 +1270,7 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
                         Backing::File { cache, offset, shared, may_write, _hold: None }
                     }
                     Object::KernelFile(f) => file_backing(&f, shared, prot, len, offset)?,
-                    Object::Inode(_) | Object::Image(_) | Object::Channel(_) | Object::InFlight(_) => return Err(EINVAL),
+                    Object::Inode(_) | Object::Image(_) | Object::Channel(_) | Object::Process(_) => return Err(EINVAL),
                     // As a file's mapping: it may reach beyond the end (SIGBUS
                     // there), and keeps the handle's hold while it exists.
                     Object::File(cache, hold) => {
@@ -1220,14 +1286,6 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
                 populate: flags & MO_POPULATE != 0,
             };
             place_and_map(addr, len, prot, backing, placement)
-        }
-        SYS_KFILE_OBJECT => {
-            if a[1] & !KFILE_INFLIGHT != 0 {
-                return Err(EINVAL);
-            }
-            let f = with_current(|p| p.file(a[0]))?;
-            let object = if a[1] & KFILE_INFLIGHT != 0 { Object::InFlight(Arc::new(InFlight::new(f))) } else { Object::KernelFile(f) };
-            Ok(instance.insert(object)? as i64)
         }
         SYS_VM_REMAP => super::sys_mem::mremap(a[0], a[1], a[2], a[3], a[4]),
         SYS_VM_DISCARD => super::sys_mem::madvise(a[0], a[1], 4),
@@ -1273,68 +1331,71 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             super::wakeup(sync_chan());
             Ok(0)
         }
-        SYS_KFD_INSTALL => {
-            use crate::fs::file::{OpenFile, ServerFile, Kind, O_ACCMODE, O_APPEND, O_CLOEXEC, O_DIRECTORY, O_NOFOLLOW, O_NONBLOCK, O_PATH};
-            let (id, flags, ready, kind) = (a[0], a[1] as u32, a[2] as i16, a[3]);
-            // An O_PATH descriptor keeps what Linux's does (F_GETFL shows it).
-            let allowed = if flags & O_PATH != 0 { O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC } else { O_ACCMODE | O_NONBLOCK | O_APPEND | O_CLOEXEC };
-            if id == 0 || flags & !allowed != 0 || kind & !KFD_ALWAYS_READY != 0 {
+        SYS_KFILE_CALL => {
+            let Object::KernelFile(f) = instance.object(a[0])? else { return Err(EINVAL) };
+            const SYS_READ: u64 = 0;
+            const SYS_WRITE: u64 = 1;
+            const SYS_FSTAT: u64 = 5;
+            const SYS_FSTATFS: u64 = 138;
+            match a[1] {
+                // Into the server's memory: it adds what it keeps (times).
+                SYS_FSTAT => {
+                    super::uaccess::copy_to_server(a[2], &super::sys_file::file_stat(&f)?)?;
+                    Ok(0)
+                }
+                SYS_FSTATFS => {
+                    let words = super::sys_file::statfs_words(f.inode().ok_or(EINVAL)?);
+                    let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+                    super::uaccess::copy_to_server(a[2], &bytes)?;
+                    Ok(0)
+                }
+                nr if nr & KFILE_SERVER_BUFFER != 0 => {
+                    let (buf, len) = (a[2], a[3].min(64 * 1024) as usize);
+                    let mut data = Vec::new();
+                    data.try_reserve_exact(len).map_err(|_| ENOMEM)?;
+                    data.resize(len, 0);
+                    match nr & !KFILE_SERVER_BUFFER {
+                        SYS_READ => {
+                            let n = f.read(&mut data)?;
+                            super::uaccess::copy_to_server(buf, &data[..n])?;
+                            Ok(n as i64)
+                        }
+                        SYS_WRITE => {
+                            super::uaccess::copy_from_server(buf, &mut data)?;
+                            Ok(f.write(&data)? as i64)
+                        }
+                        _ => Err(EINVAL),
+                    }
+                }
+                nr => super::sys_file::file_call(&f, nr, [a[2], a[3], a[4], a[5]]),
+            }
+        }
+        SYS_KFILE_INODE => {
+            let Object::KernelFile(f) = instance.object(a[0])? else { return Err(EINVAL) };
+            let inode = f.inode().cloned().ok_or(ENOTDIR)?;
+            Ok(instance.insert(Object::Inode(inode))? as i64)
+        }
+        SYS_SERVER_WAIT => {
+            let (list, n, deadline, flags) = (a[0], a[1], a[2], a[3]);
+            if n == 0 || n > WAIT_MAX || flags & !FUTEX_INTERRUPTIBLE != 0 {
                 return Err(EINVAL);
             }
-            let owner: alloc::sync::Weak<dyn crate::fs::file::ServerFiles> = Arc::downgrade(&instance) as _;
-            let placeholder = ServerFile::new(id, owner, ready, kind == KFD_ALWAYS_READY);
-            instance.files.lock().insert(id, Arc::downgrade(&placeholder));
-            let file = OpenFile::new(Kind::Server(placeholder), flags, None);
-            with_current(|p| p.alloc_fd(file, flags & O_CLOEXEC != 0, 0))
-        }
-        SYS_KFD_LOOKUP => {
-            let file = with_current(|p| p.file(a[0]))?;
-            let crate::fs::file::Kind::Server(s) = &file.kind else { return Ok(0) };
-            // Another instance's file (a descriptor that crossed trees)
-            // must never be taken for one of this instance's ids.
-            if !s.owned_by(Arc::as_ptr(&instance) as *const ()) {
-                return Err(EBADF);
+            let mut raw = [0u8; 16 * WAIT_MAX as usize];
+            super::uaccess::copy_from_server(list, &mut raw[..16 * n as usize])?;
+            let mut words = Vec::new();
+            words.try_reserve_exact(n as usize).map_err(|_| ENOMEM)?;
+            for pair in raw[..16 * n as usize].chunks_exact(16) {
+                let addr = u64::from_le_bytes(pair[..8].try_into().unwrap_or_default());
+                let val = u64::from_le_bytes(pair[8..].try_into().unwrap_or_default()) as u32;
+                // A word of an object mapped into the region has the object's key.
+                words.push(match instance.object_word(addr) {
+                    Some((object, offset, word)) => super::futex::WaitWord::object(object, offset, word, val),
+                    None => super::futex::WaitWord::server(Arc::as_ptr(&instance) as usize, addr, instance.word(addr)?, val),
+                });
             }
-            if a[1] != 0 {
-                let flags = file.flags.load(core::sync::atomic::Ordering::Relaxed);
-                super::uaccess::copy_to_server(a[1], &flags.to_le_bytes())?;
-            }
-            let id = s.id as i64;
-            // Pinned for the rest of the call (not a service thread's,
-            // which serves no call). A pin that cannot be kept fails the
-            // lookup: an unpinned file could go under the call.
-            with_current(|p| match p.linux.as_mut() {
-                Some(l) if !l.pager => {
-                    l.pinned.try_reserve(1).map_err(|_| ENOMEM)?;
-                    l.pinned.push(file.clone());
-                    Ok::<(), i64>(())
-                }
-                _ => Ok(()),
-            })?;
-            Ok(id)
-        }
-        SYS_KFD_READY => {
-            let file = instance.files.lock().get(&a[0]).and_then(|w| w.upgrade()).ok_or(ENOENT)?;
-            file.set_ready(a[1] as i16);
-            Ok(0)
-        }
-        SYS_KFD_READ | SYS_KFD_WRITE => {
-            let file = with_current(|p| p.file(a[0]))?;
-            let (buf, len) = (a[1], a[2].min(64 * 1024) as usize);
-            let mut data = alloc::vec![0u8; len];
-            if nr == SYS_KFD_READ {
-                let n = file.read(&mut data)?;
-                super::uaccess::copy_to_server(buf, &data[..n])?;
-                Ok(n as i64)
-            } else {
-                super::uaccess::copy_from_server(buf, &mut data)?;
-                Ok(file.write(&data)? as i64)
-            }
-        }
-        SYS_KFD_CLOSE => {
-            let gone = super::current_files()?.take(a[0]).ok_or(EBADF)?;
-            drop(gone);
-            Ok(0)
+            let deadline = (deadline != 0).then_some(deadline);
+            let interruptible = flags & FUTEX_INTERRUPTIBLE != 0;
+            super::futex::server_waitv(&words, deadline, interruptible)
         }
         SYS_MO_SUPPLY => {
             let (handle, offset, buf, len) = (a[0], a[1], a[2], a[3]);
@@ -1356,7 +1417,7 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             Ok(0)
         }
         SYS_SHARED_MAP => Ok(instance.grow_heap(a[0])? as i64),
-        SYS_INODE_ROOT..=SYS_EXEC_TARGET => super::linux_inode::call(&instance, nr, a),
+        SYS_INODE_ROOT..=SYS_INODE_STATFS => super::linux_inode::call(&instance, nr, a),
         SYS_INITRAMFS => {
             let image = crate::fs::initramfs().ok_or(ENOENT)?;
             super::uaccess::copy_to_server(a[0], &(image.len() as u64).to_le_bytes())?;
@@ -1432,32 +1493,7 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
                 }
             }
         }
-        SYS_FS_RECORD => {
-            let (op, word) = (a[0], a[1]);
-            let record = || (word != 0).then(|| Record { instance: Arc::downgrade(&instance), word });
-            match op {
-                FS_GET => Ok(with_current(|p| p.fs.as_ref().map_or(0, |f| f.record_word())) as i64),
-                FS_SET => {
-                    if word == 0 {
-                        return Err(EINVAL);
-                    }
-                    let fs = with_current(|p| p.fs.clone()).ok_or(EINVAL)?;
-                    // A refused record was never handed over: no release.
-                    let mut refused = fs.set_record(Record { instance: Arc::downgrade(&instance), word }).err();
-                    if let Some(r) = refused.as_mut() {
-                        r.instance = Weak::new();
-                    }
-                    if refused.is_some() { Err(EEXIST) } else { Ok(0) }
-                }
-                FS_CHILD => {
-                    let old = with_current(|p| p.linux.as_mut().and_then(|l| core::mem::replace(&mut l.fs_child, record())));
-                    // Released outside the task's lock.
-                    drop(old);
-                    Ok(0)
-                }
-                _ => Err(EINVAL),
-            }
-        }
+        SYS_PROC_SELF..=SYS_RANDOM => process_call(&instance, nr, a),
         SYS_SET_USERCOPY => {
             let (insn, fixup) = (a[0], a[1]);
             let code = IMAGE_BASE..THREADS_BASE;
@@ -1471,7 +1507,7 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             });
             if set { Ok(0) } else { Err(EBUSY) }
         }
-        SYS_CLOCK_READ => super::sys_time::read_clock(a[0]).map(|ns| ns as i64),
+        SYS_CLOCK_READ => super::sys_time::read_own_clock(a[0]).map(|ns| ns as i64),
         SYS_SLEEP_UNTIL => super::sleep_until(a[0]).map(|_| 0),
         SYS_YIELD => {
             super::yield_now();
@@ -1607,79 +1643,13 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             super::uaccess::copy_to_server(a[2], &info)?;
             Ok(found)
         }
-        SYS_THREAD_EXISTS => {
-            if a[1] & !THREAD_IN_INSTANCE != 0 {
-                return Err(EINVAL);
+        SYS_THREAD_NICE => {
+            let t = thread_by_key(&instance, a[0])?;
+            let old = t.nice.load(core::sync::atomic::Ordering::Relaxed);
+            if a[1] != 0 {
+                t.nice.store((a[2] as i64).clamp(-20, 19) as i8, core::sync::atomic::Ordering::Relaxed);
             }
-            if a[1] & THREAD_IN_INSTANCE != 0 {
-                // A process of this instance's tree.
-                let ok = a[0] != 0 && super::group(a[0]).is_some_and(|g| g.instance.load(core::sync::atomic::Ordering::Acquire) == instance.id);
-                return if ok { Ok(0) } else { Err(ESRCH) };
-            }
-            if a[0] == 0 || super::task(a[0]).is_none() {
-                return Err(ESRCH);
-            }
-            Ok(0)
-        }
-        SYS_THREAD_NICE => super::thread_nice(instance.id, a[0], a[1], a[2] != 0, a[3] as i64),
-        SYS_KFD_STAT => {
-            let st = super::sys_file::fstat_bytes(a[0])?;
-            super::uaccess::copy_to_server(a[1], &st)?;
-            Ok(0)
-        }
-        SYS_KFD_INSTALL_FILE => {
-            use crate::fs::file::O_CLOEXEC;
-            let flags = a[1] as u32;
-            if is_pager() {
-                return Err(EPERM);
-            }
-            if a[1] > u32::MAX as u64 || flags & !O_CLOEXEC != 0 {
-                return Err(EINVAL);
-            }
-            let file = match instance.object(a[0])? {
-                Object::KernelFile(f) => f,
-                Object::InFlight(f) => f.0.clone(),
-                _ => return Err(EINVAL),
-            };
-            with_current(|p| p.alloc_fd(file, flags & O_CLOEXEC != 0, 0))
-        }
-        SYS_KFILE_INFO => {
-            let (file, extra) = match instance.object(a[0])? {
-                // Less the clone `object` just made.
-                Object::KernelFile(f) => (f, 1),
-                // The handle's reference is the `InFlight`'s; this clone is
-                // the extra one.
-                Object::InFlight(f) => (f.0.clone(), 1),
-                _ => return Err(EINVAL),
-            };
-            let refs = Arc::strong_count(&file) as u64 - extra;
-            let id = match &file.kind {
-                crate::fs::file::Kind::Server(s) if s.owned_by(Arc::as_ptr(&instance) as *const ()) => s.id,
-                _ => 0,
-            };
-            drop(file);
-            let mut out = [0u8; 16];
-            out[..8].copy_from_slice(&refs.to_le_bytes());
-            out[8..].copy_from_slice(&id.to_le_bytes());
-            super::uaccess::copy_to_server(a[1], &out)?;
-            Ok(0)
-        }
-        SYS_SIGNAL_THREAD => {
-            if is_pager() {
-                return Err(EPERM);
-            }
-            if a[0] == 0 || a[0] > 64 {
-                return Err(EINVAL);
-            }
-            super::signal::tgkill(Some(super::current_pid() as i64), super::current_tid() as i64, a[0])
-        }
-        SYS_THREAD_IDS => {
-            let mut ids = [0u8; 32];
-            ids[..8].copy_from_slice(&(super::current_pid() as u64).to_le_bytes());
-            ids[8..16].copy_from_slice(&(super::current_tid() as u64).to_le_bytes());
-            // uid and gid: everyone is root.
-            super::uaccess::copy_to_server(a[0], &ids)?;
-            Ok(0)
+            Ok(old as i64 + 20)
         }
         SYS_CONSOLE_READ => {
             use crate::drivers::console_device;
@@ -1727,54 +1697,13 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             super::uaccess::copy_to_server(a[0], &out)?;
             Ok(0)
         }
-        SYS_PROC_IDS => {
-            let (id, flags) = (a[0], a[1]);
-            if flags & !(IDS_PGRP | IDS_ORPHANED) != 0 || (flags & IDS_PGRP != 0 && id == 0) {
+        SYS_SYSTEM_INFO => {
+            // The system's records only: the processes are the server's (R8).
+            if a[0] != procproto::QUERY_SYSTEM {
                 return Err(EINVAL);
             }
-            let (pid, pgid, sid) = super::proc_ids(instance.id, id, flags & IDS_PGRP != 0).ok_or(ESRCH)?;
-            let orphaned = flags & IDS_ORPHANED != 0 && super::pgrp_orphaned(instance.id, pgid);
-            let mut out = [0u8; 32];
-            out[..8].copy_from_slice(&pid.to_le_bytes());
-            out[8..16].copy_from_slice(&pgid.to_le_bytes());
-            out[16..24].copy_from_slice(&sid.to_le_bytes());
-            out[24..].copy_from_slice(&(if orphaned { IDS_ORPHANED } else { 0 }).to_le_bytes());
-            super::uaccess::copy_to_server(a[2], &out)?;
-            Ok(0)
+            super::query::server_query(a[0], a[2], a[3])
         }
-        SYS_SIGNAL_GROUP => {
-            let (scope, id, sig) = (a[0], a[1], a[2]);
-            if sig == 0 || sig > super::signal::NSIG as u64 || id == 0 {
-                return Err(EINVAL);
-            }
-            match scope {
-                SIGNAL_PROCESS => {
-                    // The process the instance check found, not the pid looked up
-                    // again (it could be another process's by then).
-                    let group = super::group(id).filter(|g| super::in_instance(g, instance.id)).ok_or(ESRCH)?;
-                    super::signal::send_to(&group, sig as u32);
-                    Ok(0)
-                }
-                SIGNAL_LEADER => {
-                    // Only while it still leads session `id` (checked on the
-                    // process it signals).
-                    let group = super::group(id)
-                        .filter(|g| super::in_instance(g, instance.id) && g.tgid == id && g.info.lock().sid == id)
-                        .ok_or(ESRCH)?;
-                    super::signal::send_to(&group, sig as u32);
-                    Ok(0)
-                }
-                SIGNAL_PGRP => {
-                    if super::signal::send_pgrp_in(instance.id, id, sig as u32) {
-                        Ok(0)
-                    } else {
-                        Err(ESRCH)
-                    }
-                }
-                _ => Err(EINVAL),
-            }
-        }
-        SYS_PROC_INFO => super::query::server_query(instance.id, a[0], a[1], a[2], a[3]),
         TEST_SERVER_TICKS => {
             if !crate::TEST_MODE.load(core::sync::atomic::Ordering::Relaxed) {
                 return Err(ENOSYS);
@@ -1789,23 +1718,6 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             Ok(((user + system) / 1_000_000) as i64)
         }
         SYS_TEST_MODE => Ok(crate::TEST_MODE.load(core::sync::atomic::Ordering::Relaxed) as i64),
-        SYS_KFD_LIST => {
-            let (from, buf, cap) = (a[0], a[1], a[2]);
-            if cap > KFD_LIST_MAX {
-                return Err(EINVAL);
-            }
-            let mut fds = [0u32; KFD_LIST_MAX as usize];
-            let n = with_current(|p| p.files().map(|f| f.open_from(from, &mut fds[..cap as usize])))?;
-            let bytes: Vec<u8> = fds[..n].iter().flat_map(|fd| fd.to_le_bytes()).collect();
-            super::uaccess::copy_to_server(buf, &bytes)?;
-            Ok(n as i64)
-        }
-        SYS_SIGNAL_STATE => {
-            if is_pager() {
-                return Err(EPERM);
-            }
-            Ok(super::signal::state(a[0] as u32) as i64)
-        }
         SYS_SERVER_LOG => {
             let len = a[1].min(SERVER_LOG_MAX);
             let mut text = [0u8; SERVER_LOG_MAX as usize];
@@ -1889,6 +1801,329 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
     }
 }
 
+/// The thread `key` of `instance`'s programs (0: the caller).
+fn thread_by_key(instance: &Instance, key: u64) -> Result<Arc<super::task::Task>, i64> {
+    if key == 0 {
+        return Ok(super::sched::current_arc());
+    }
+    instance.task_of(key).ok_or(ESRCH)
+}
+
+/// The process behind the handle `handle`.
+fn container(instance: &Instance, handle: u64) -> Result<Arc<Container>, i64> {
+    match instance.object(handle)? {
+        Object::Process(c) => Ok(c),
+        _ => Err(EINVAL),
+    }
+}
+
+/// Kicks a Linux program's thread (`SYS_THREAD_KICK`): its waits end, its
+/// program stops at once (see `restricted::SYS_THREAD_KICK`).
+pub fn kick_task(t: &Arc<super::task::Task>) {
+    t.kicked.store(true, core::sync::atomic::Ordering::SeqCst);
+    super::signal::kick(t);
+}
+
+/// Kills a Linux program's thread: marked dying and kicked, it exits at its
+/// next `restricted_enter`.
+pub fn kill_task(t: &Arc<super::task::Task>) {
+    t.killed.store(true, core::sync::atomic::Ordering::SeqCst);
+    kick_task(t);
+}
+
+/// Whether the calling thread of a Linux program was kicked or must die:
+/// its interruptible waits end (`signal::interrupted`).
+pub fn kicked() -> bool {
+    let me = super::sched::current();
+    me.kicked.load(core::sync::atomic::Ordering::SeqCst) || dying()
+}
+
+/// Whether the calling thread of a Linux program must die: it was killed,
+/// or its process is ending (`exit_group`, the kernel's kill).
+pub fn dying() -> bool {
+    let me = super::sched::current();
+    me.killed.load(core::sync::atomic::Ordering::SeqCst) || me.group.sig.lock().exit != super::signal::GroupExit::None
+}
+
+/// Whether the calling thread serves a program (not a service thread, not a
+/// native task): its signals are its server's.
+pub fn serves_program() -> bool {
+    with_current(|p| p.linux.as_ref().is_some_and(|l| !l.pager))
+}
+
+/// The calls on processes and threads (phase R8, `SYS_PROC_SELF` to
+/// `SYS_VM_FLOOR`; `SYS_THREAD_EXIT` is `server_call`'s).
+fn process_call(instance: &Arc<Instance>, nr: u64, a: [u64; 6]) -> SysResult {
+    use core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
+    // Service threads serve no program: they may only look at threads and
+    // processes, and kick or kill them.
+    let service = matches!(nr, SYS_THREAD_KICK | SYS_THREAD_KILL | SYS_PROC_INFO | SYS_THREAD_INFO | SYS_THREAD_AFFINITY | SYS_THREAD_NAME);
+    if is_pager() && !service {
+        return Err(EPERM);
+    }
+    match nr {
+        SYS_PROC_SELF => {
+            let group = super::sched::current().group.clone();
+            let c = Arc::try_new(Container { group, fresh: spin::Mutex::new(None) }).map_err(|_| ENOMEM)?;
+            Ok(instance.insert(Object::Process(c))? as i64)
+        }
+        SYS_PROC_CREATE => {
+            use super::task::{FsInfo, Info, ThreadGroup};
+            let flags = a[0];
+            let vm = flags & (PROC_FORK | PROC_SHARE_VM);
+            if flags & !(PROC_FORK | PROC_SHARE_VM) != 0 || (vm != PROC_FORK && vm != PROC_SHARE_VM) {
+                return Err(EINVAL);
+            }
+            let pid = super::sched::reserve_pid()?;
+            let mm = with_current(|p| p.mm.clone()).ok_or(EINVAL)?;
+            let mm = if vm == PROC_SHARE_VM { mm } else { super::address_space::Mm::fork(&mm.lock()).map_err(|_| ENOMEM)? };
+            let fs = FsInfo::new(alloc::string::String::from("/")).ok_or(ENOMEM)?;
+            let name = super::sched::current().group.info.lock().name.clone();
+            let mut info = Info::new(0, 0, 0, name);
+            info.mem = Some(mm.stats.clone());
+            let group = ThreadGroup::new(pid.pid, info, Default::default()).ok_or(ENOMEM)?;
+            group.instance.store(instance.id, Release);
+            group.server_reaps.store(true, Relaxed);
+            let c = Arc::try_new(Container { group, fresh: spin::Mutex::new(Some(Fresh { mm, fs, pid })) }).map_err(|_| ENOMEM)?;
+            Ok(instance.insert(Object::Process(c))? as i64)
+        }
+        SYS_THREAD_CREATE => thread_create(instance, a),
+        SYS_THREAD_KICK => {
+            kick_task(&thread_by_key(instance, a[0])?);
+            Ok(0)
+        }
+        SYS_THREAD_KILL => {
+            if a[0] == 0 {
+                return Err(EINVAL);
+            }
+            kill_task(&thread_by_key(instance, a[0])?);
+            Ok(0)
+        }
+        SYS_EXEC_SPACE => exec_space(instance, a[0], a[1], a[2]),
+        SYS_PROC_INFO => {
+            let group = if a[0] == 0 { super::sched::current().group.clone() } else { container(instance, a[0])?.group.clone() };
+            let mut out = ProcInfo { start_ticks: group.start_ticks, kernel_pid: group.tgid, ..Default::default() };
+            {
+                let info = group.info.lock();
+                (out.user_ns, out.system_ns) = info.cputime();
+                if let Some(mem) = &info.mem {
+                    out.pages = mem.pages.load(Relaxed);
+                    out.virt_pages = mem.virt_pages.load(Relaxed);
+                    out.peak_pages = mem.peak_pages.load(Relaxed);
+                }
+                out.peak_pages = out.peak_pages.max(info.peak_pages);
+                out.threads = info.threads.len() as u64;
+                out.running = info.threads.iter().filter(|t| matches!(t.state(), super::task::State::Running | super::task::State::Runnable)).count() as u64;
+            }
+            out.killed = group.killed_by_kernel.load(Acquire);
+            out.legacy_calls = group.legacy_calls.load(Relaxed);
+            super::uaccess::copy_to_server(a[1], as_bytes(&out))?;
+            Ok(0)
+        }
+        SYS_THREAD_INFO => {
+            let t = thread_by_key(instance, a[0])?;
+            let (user_ns, system_ns) = t.cputime();
+            let out = ThreadInfo {
+                user_ns,
+                system_ns,
+                run_ns: t.runtime(),
+                nice: t.nice.load(Relaxed) as i64,
+                cpu: t.last_cpu.load(Relaxed) as u64,
+                running: matches!(t.state(), super::task::State::Running | super::task::State::Runnable) as u64,
+                kernel_tid: t.tid(),
+            };
+            super::uaccess::copy_to_server(a[1], as_bytes(&out))?;
+            Ok(0)
+        }
+        SYS_THREAD_AFFINITY => {
+            let t = thread_by_key(instance, a[0])?;
+            let online = super::online_mask();
+            let old = t.affinity.load(Relaxed) & online;
+            if a[1] != 0 {
+                let wanted = a[2] & online;
+                if wanted == 0 {
+                    return Err(EINVAL);
+                }
+                t.affinity.store(wanted, Relaxed);
+                if core::ptr::eq(&*t, super::sched::current()) && !t.may_run_on(crate::smp::cpu().index) {
+                    super::schedule();
+                }
+            }
+            Ok(old as i64)
+        }
+        SYS_THREAD_CLEARTID => {
+            if a[0] >= USER_END {
+                return Err(EFAULT);
+            }
+            with_current(|p| p.clear_child_tid = a[0]);
+            Ok(0)
+        }
+        SYS_THREAD_NAME => {
+            let t = thread_by_key(instance, a[0])?;
+            let mut buf = [0u8; 15];
+            let n = (a[2] as usize).min(buf.len());
+            super::uaccess::copy_from_server(a[1], &mut buf[..n])?;
+            let name = alloc::string::String::from_utf8_lossy(&buf[..n]).into_owned();
+            *t.comm.lock() = name;
+            Ok(0)
+        }
+        SYS_INIT_ARGS => {
+            let args = instance.init_args.lock().clone();
+            if args.len() as u64 > a[1] {
+                return Err(ERANGE);
+            }
+            super::uaccess::copy_to_server(a[0], &args)?;
+            Ok(args.len() as i64)
+        }
+        SYS_VM_FLOOR => {
+            if a[0] > USER_END {
+                return Err(EINVAL);
+            }
+            super::current_mm().ok_or(EINVAL)?.lock().brk_end = a[0];
+            Ok(0)
+        }
+        SYS_RANDOM => {
+            let mut bytes = [0u8; 256];
+            let n = (a[1] as usize).min(bytes.len());
+            crate::random::fill(&mut bytes[..n]);
+            super::uaccess::copy_to_server(a[0], &bytes[..n])?;
+            Ok(n as i64)
+        }
+        _ => Err(ENOSYS),
+    }
+}
+
+/// The bytes of a plain record.
+fn as_bytes<T: Copy>(v: &T) -> &[u8] {
+    unsafe { core::slice::from_raw_parts(v as *const T as *const u8, core::mem::size_of::<T>()) }
+}
+
+/// `SYS_THREAD_CREATE`: a thread in a new process (its first) or in the
+/// caller's.
+fn thread_create(instance: &Arc<Instance>, a: [u64; 6]) -> SysResult {
+    use core::sync::atomic::Ordering::Relaxed;
+    use x86_64::registers::model_specific::FsBase;
+    let (process, state, flags, tls, ctid, cookie) = (a[0], a[1], a[2], a[3], a[4], a[5]);
+    if flags & !THREAD_SETTLS != 0 {
+        return Err(EINVAL);
+    }
+    if flags & THREAD_SETTLS != 0 && tls >= USER_END {
+        return Err(EPERM);
+    }
+    if ctid >= USER_END {
+        return Err(EFAULT);
+    }
+    // A dying caller makes no thread (Linux's copy_process with a fatal
+    // signal pending): it would escape the kill that ends the caller's
+    // process or the exec that ends its other threads.
+    if dying() {
+        return Err(EINTR);
+    }
+    let mut regs = State::default();
+    let bytes = unsafe { core::slice::from_raw_parts_mut(&mut regs as *mut State as *mut u8, core::mem::size_of::<State>()) };
+    super::uaccess::copy_from_server(state, bytes)?;
+    let mut program = Frame::default();
+    load(&regs, &mut program)?;
+    let me = super::sched::current();
+    let (group, mm, fs, pid) = if process == 0 {
+        let (mm, fs) = with_current(|p| (p.mm.clone(), p.fs.clone()));
+        (me.group.clone(), mm.ok_or(EINVAL)?, fs.ok_or(EINVAL)?, super::sched::reserve_pid()?)
+    } else {
+        let c = container(instance, process)?;
+        let fresh = c.fresh.lock().take().ok_or(EBUSY)?;
+        (c.group.clone(), fresh.mm, fresh.fs, fresh.pid)
+    };
+    let (linux, start) = LinuxThread::new(instance.clone(), &program, ROLE_PROGRAM, cookie)?;
+    let key = linux.key();
+    let own = super::Process {
+        mm: Some(mm),
+        files: None,
+        fs: Some(fs),
+        io_bitmap: None,
+        server: None,
+        clear_child_tid: ctid,
+        vfork_done: None,
+        linux: Some(linux),
+        copy_fixup: None,
+    };
+    let comm = me.comm.lock().clone();
+    let child = super::new_task(pid.pid, group, comm, own, start)?;
+    // The program resumes with the caller's FPU registers (the server
+    // touches none) and TLS pointer, or the new one.
+    unsafe {
+        let cpu = child.cpu_state();
+        cpu.fs_base = if flags & THREAD_SETTLS != 0 { tls } else { FsBase::read().as_u64() };
+        core::arch::asm!("fxsave64 [{}]", in(reg) cpu.fpu.0.as_mut_ptr(), options(nostack));
+    }
+    child.affinity.store(me.affinity.load(Relaxed), Relaxed);
+    child.nice.store(me.nice.load(Relaxed), Relaxed);
+    // Before it can run: its end will be reported. (Should listing it fail,
+    // its end is reported all the same, for a key the server never saw.)
+    unsafe { child.own() }.linux.as_mut().expect("set above").announce(&child)?;
+    pid.insert(child.clone())?;
+    super::sched::start(child);
+    Ok(key as i64)
+}
+
+/// `SYS_EXEC_SPACE`: execve's point of no return (see
+/// `restricted::SYS_EXEC_SPACE`).
+fn exec_space(instance: &Arc<Instance>, exe: u64, name: u64, len: u64) -> SysResult {
+    use super::address_space::{AddressSpace, Hold, Mm};
+    use core::sync::atomic::Ordering::Relaxed;
+    use x86_64::registers::model_specific::FsBase;
+    let me = super::sched::current();
+    if me.group.info.lock().threads.len() != 1 {
+        return Err(EBUSY);
+    }
+    let hold: Option<Hold> = match exe {
+        0 => None,
+        h => match instance.object(h)? {
+            Object::File(_, hold) => hold.map(|h| h as Hold),
+            _ => return Err(EINVAL),
+        },
+    };
+    let mut buf = [0u8; 15];
+    let n = (len as usize).min(buf.len());
+    super::uaccess::copy_from_server(name, &mut buf[..n])?;
+    let name = alloc::string::String::from_utf8_lossy(&buf[..n]).into_owned();
+    let mut space = AddressSpace::new().ok_or(ENOMEM)?;
+    space.exe = hold;
+    space.attach(instance.clone(), true).map_err(|_| ENOMEM)?;
+    let mm = Mm::new(space).ok_or(ENOMEM)?;
+    let comm = name.clone();
+    // The point of no return: from here on the old program is gone. Its
+    // CLONE_CHILD_CLEARTID word is cleared and woken as at an exit (Linux's
+    // exec_mm_release).
+    let ctid = with_current(|p| core::mem::take(&mut p.clear_child_tid));
+    if ctid != 0 && super::uaccess::write(ctid, 0u32).is_ok() {
+        let _ = super::futex::wake_one(ctid);
+    }
+    {
+        let mut info = me.group.info.lock();
+        let old_name = core::mem::replace(&mut info.name, name);
+        if let Some(old) = info.mem.replace(mm.stats.clone()) {
+            info.peak_pages = info.peak_pages.max(old.peak_pages.load(Relaxed));
+        }
+        drop(info);
+        drop(old_name);
+    }
+    let old_comm = core::mem::replace(&mut *me.comm.lock(), comm);
+    drop(old_comm);
+    let old_mm = with_current(|p| {
+        // The server runs (the normal view): the new space's normal view
+        // shows the same region.
+        super::tlb::switch(p.mm.as_ref().map(|m| &*m.tlb), Some(&mm.tlb), true);
+        p.copy_fixup = None;
+        p.mm.replace(mm)
+    });
+    // The old address space goes here (unless a vfork parent shares it).
+    drop(old_mm);
+    FsBase::write(x86_64::VirtAddr::new(0));
+    let initial = super::task::FpuState::initial();
+    unsafe { core::arch::asm!("fxrstor64 [{}]", in(reg) initial.0.as_ptr(), options(nostack)) };
+    Ok(0)
+}
+
 /// Loads the view of the current address space for the server or the
 /// program.
 fn switch_view(normal: bool) {
@@ -1902,11 +2137,24 @@ fn switch_view(normal: bool) {
 /// The program trapped (`f` holds its registers): back to the server, with
 /// `reason`.
 pub fn trap(f: &mut Frame, reason: u64) {
+    trap_with(f, reason, [0; 4]);
+}
+
+/// The program raised an exception the kernel does not resolve: back to
+/// the server with `REASON_EXCEPTION` and what happened (vector, error
+/// code, address, `FAULT_*` of a page fault).
+pub fn trap_exception(f: &mut Frame, vector: u64, error: u64, addr: u64, kind: u64) {
+    trap_with(f, REASON_EXCEPTION, [vector, error, addr, kind]);
+}
+
+fn trap_with(f: &mut Frame, reason: u64, detail: [u64; 4]) {
     x86_64::instructions::interrupts::without_interrupts(|| {
         with_current(|p| {
             let l = p.linux.as_mut().expect("a Linux thread");
             l.trap_nr = (reason == REASON_SYSCALL).then_some(f.rax);
-            save(f, l.state());
+            let state = l.state();
+            save(f, state);
+            [state.trap_vector, state.trap_error, state.trap_addr, state.trap_kind] = detail;
             *f = l.normal;
             f.rax = reason;
             l.restricted = false;
@@ -1915,31 +2163,49 @@ pub fn trap(f: &mut Frame, reason: u64) {
     });
 }
 
-/// restricted_enter() from the server (`f`): runs the program. Returns
-/// the system call the server just handled itself, if any, for the signal
-/// delivery that follows.
-pub fn enter(f: &mut Frame) -> Result<Option<u64>, i64> {
+/// Whether the calling thread is a Linux program's whose program runs (an
+/// interrupt from it) and that was kicked or must die: it goes back to its
+/// server (`REASON_KICK`) on the way out of the interrupt.
+pub fn kick_pending() -> bool {
+    mode() == Some(true) && kicked()
+}
+
+/// restricted_enter() from the server (`f`): runs the program, unless the
+/// thread must die (`REASON_EXIT` once; then it exits here, where its
+/// server holds no lock) or was kicked (`REASON_KICK` at once, the flag
+/// cleared).
+pub fn enter(f: &mut Frame) -> Result<(), i64> {
+    if with_current(|p| p.linux.as_ref().is_some_and(|l| l.pager)) {
+        return Err(EPERM);
+    }
+    if dying() {
+        // Once to the server, which lets go of what the thread holds and
+        // exits it on a clean stack; a second time (a server that did not)
+        // the kernel ends the thread itself.
+        let told = with_current(|p| p.linux.as_mut().map(|l| core::mem::replace(&mut l.exit_told, true)));
+        if told == Some(false) {
+            f.rax = REASON_EXIT;
+            return Ok(());
+        }
+        super::exit_thread(super::signal::SIGKILL as i32);
+    }
+    let me = super::sched::current();
+    if me.kicked.swap(false, core::sync::atomic::Ordering::SeqCst) {
+        f.rax = REASON_KICK;
+        return Ok(());
+    }
     x86_64::instructions::interrupts::without_interrupts(|| {
         with_current(|p| {
             let l = p.linux.as_mut().expect("a Linux thread");
-            if l.pager {
-                return Err(EPERM);
-            }
             let mut program = Frame::default();
             load(l.state(), &mut program)?;
             l.normal = *f;
             *f = program;
             l.restricted = true;
-            Ok::<_, i64>((l.trap_nr.take(), core::mem::take(&mut l.pinned)))
+            l.trap_nr = None;
+            Ok::<_, i64>(())
         })
         .inspect(|_| switch_view(false))
-    })
-    .map(|(handled, pinned)| {
-        // The call is done with its files.
-        for file in pinned {
-            crate::fs::file::release(file);
-        }
-        handled
     })
 }
 
@@ -1952,21 +2218,17 @@ pub fn server_fault(rip: u64) -> Option<u64> {
     (rip == insn).then_some(fixup)
 }
 
-/// legacy_syscall(closed, cap) from the server: the kernel's Linux
-/// implementation carries out the system call in `State`, which then holds
-/// the result (or the new program after execve, or a signal frame); the
-/// server files the call closed for good go to `closed` (see
-/// `SYS_LEGACY_SYSCALL`). Returns how many.
+/// legacy_syscall() from the server: the kernel's Linux implementation
+/// carries out the system call in `State`, which then holds the result (or
+/// the new program after execve, or a signal frame).
 ///
 /// The call runs in the program's view, as it would without the server:
 /// the server's memory is then out of reach of the kernel's Linux code
 /// altogether, not only because every user pointer is checked against
 /// 64 TiB (`uaccess`).
-pub fn legacy(closed: u64, cap: u64) -> Result<u64, i64> {
+pub fn legacy() -> Result<u64, i64> {
     let state = with_current(|p| {
         let l = p.linux.as_mut().filter(|l| !l.pager)?;
-        // The pass-through delivers signals itself.
-        l.trap_nr = None;
         Some(*l.state())
     })
     .ok_or(EPERM)?;
@@ -1974,29 +2236,30 @@ pub fn legacy(closed: u64, cap: u64) -> Result<u64, i64> {
     load(&state, &mut program)?;
     crate::counters::add(|c| &c.legacy_calls, 1);
     super::sched::current().group.legacy_calls.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    // Processes and signals are the server's (R8): the kernel's Linux code
+    // must not create, end, exec, wait for or signal a Linux program's
+    // processes behind the server's tables, whatever a server passes on.
+    const SERVERS_OWN: &[u64] = &[
+        13, 14, 15, 34, 36, 37, 38, 56, 57, 58, 59, 60, 61, 62, 109, 112, 127, 128, 129, 130, 131, 200, 218, 219, 231, 234, 247, 297, 322, 435,
+    ];
+    if SERVERS_OWN.contains(&program.rax) {
+        program.rax = (-ENOSYS) as u64;
+        with_current(|p| {
+            if let Some(l) = p.linux.as_mut() {
+                save(&program, l.state());
+            }
+        });
+        return Ok(0);
+    }
     set_legacy(true);
     super::syscall::dispatch_linux(&mut program);
     set_legacy(false);
-    let (ids, instance, unused) = with_current(|p| match p.linux.as_mut() {
-        Some(l) => {
+    with_current(|p| {
+        if let Some(l) = p.linux.as_mut() {
             save(&program, l.state());
-            l.exec_target = None;
-            (core::mem::take(&mut l.closed_now), Some(l.instance.clone()), l.fs_child.take())
         }
-        None => (Vec::new(), None, None),
     });
-    // A child's record no clone took goes back to the server.
-    drop(unused);
-    let mut told = 0;
-    for id in ids {
-        let fits = told < cap && super::uaccess::copy_to_server(closed + told * 8, &id.to_le_bytes()).is_ok();
-        if fits {
-            told += 1;
-        } else if let Some(i) = &instance {
-            i.queue_closed(id);
-        }
-    }
-    Ok(told)
+    Ok(0)
 }
 
 /// Enters or leaves a legacy call: the view follows.
@@ -2024,13 +2287,16 @@ fn event_wait(instance: &Arc<Instance>, out: u64, deadline: u64) -> Option<SysRe
         let next = x86_64::instructions::interrupts::without_interrupts(|| {
             let wait = super::sched::prepare_to_wait(instance.pager_chan());
             let mut q = instance.pager.lock();
+            if let Some(key) = q.exits.pop_front() {
+                q.announced -= 1;
+                return Some(Some(Event { kind: EVENT_THREAD_EXIT, a: key, b: 0 }));
+            }
             if let Some(mut e) = q.requests.pop_front() {
                 match e.kind {
                     EVENT_PAGE => {
                         q.queued.remove(&(e.a, e.b / PAGE));
                     }
                     EVENT_WRITEBACK => q.writeback_queued = false,
-                    EVENT_INFLIGHT => q.inflight_queued = false,
                     EVENT_SYNC => {
                         // Answers every ticket asked so far.
                         q.sync_queued = false;
@@ -2071,6 +2337,11 @@ fn event_wait(instance: &Arc<Instance>, out: u64, deadline: u64) -> Option<SysRe
                     // Still due: next time.
                     let mut q = instance.pager.lock();
                     match event.kind {
+                        EVENT_THREAD_EXIT => {
+                            // (Into the room it came from.)
+                            q.announced += 1;
+                            q.exits.push_front(event.a);
+                        }
                         EVENT_PAGE if !q.queued.insert((event.a, event.b / PAGE)) => {}
                         EVENT_TIMER => {}
                         EVENT_CLOSING => q.closing_told = false,

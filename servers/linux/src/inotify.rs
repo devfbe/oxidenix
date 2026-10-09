@@ -1,6 +1,6 @@
 //! inotify(7): watches on the files of the server's filesystems (tmpfs and
-//! /data) and the queue of their events, a file of the server with a
-//! placeholder in the kernel's descriptor table, as eventfd. libuv (and so
+//! /data) and the queue of their events, a file of the server, as eventfd.
+//! libuv (and so
 //! Node.js's fs.watch) watches directories with it.
 //!
 //! Watches are keyed by inode (`Key`: tmpfs's inode numbers are never
@@ -29,7 +29,7 @@
 //! pager, which reports closes here).
 
 use crate::datafs::DInode;
-use crate::files::{self, File, EBADF, EFAULT, EINVAL, O_NONBLOCK, O_RDWR};
+use crate::files::{self, File, EFAULT, EINVAL, O_NONBLOCK, O_RDWR};
 use crate::namespace::Node;
 use crate::sync::Mutex;
 use crate::syscall;
@@ -197,10 +197,15 @@ pub fn init(flags: u64) -> Result<i64, i64> {
     let state = State { watches: BTreeMap::new(), next_wd: 1, queue: VecDeque::new(), overflowed: false, reported: 0 };
     let i = Arc::new(Inotify { id: files::new_id(), state: Mutex::new(state), seq: AtomicU32::new(0) });
     // (Dropping `i` on failure gives the instance back.)
-    files::install(i.id, File::Inotify(i.clone()), O_RDWR | flags as u32, 0)
+    files::install(i.id, File::Inotify(i.clone()), O_RDWR | flags as u32)
 }
 
 impl Inotify {
+    /// Its readiness for poll and epoll now: readable with events queued.
+    pub fn readiness_now(&self) -> i16 {
+        if self.state.lock().queue.is_empty() { 0 } else { POLLIN }
+    }
+
     /// inotify_add_watch on the resolved `node` (a directory if `is_dir`).
     pub fn add_watch(self: &Arc<Self>, node: &Node, is_dir: bool, mask: u32) -> Result<i64, i64> {
         if mask & !WATCH_BITS != 0 || mask & IN_ALL_EVENTS == 0 {
@@ -525,18 +530,10 @@ pub fn call(nr: u64, i: &Inotify, flags: u32, a1: u64, a2: u64) -> Result<i64, i
 
 /// inotify_rm_watch(fd, wd) and inotify_add_watch's descriptor check.
 pub fn instance(fd: u64) -> Result<Arc<Inotify>, i64> {
-    match files::lookup(fd) {
-        Some((File::Inotify(i), _)) => Ok(i),
-        // An O_PATH descriptor is no file (Linux's fdget fails).
-        Some((File::Path(_), _)) => Err(EBADF),
+    // (An O_PATH descriptor is no file: EBADF, Linux's fdget.)
+    match &files::lookup(fd)?.file {
+        File::Inotify(i) => Ok(i.clone()),
         // Another file (also one of the kernel's): not an inotify instance.
-        Some(_) => Err(EINVAL),
-        None => {
-            let mut st = [0u8; 144];
-            match syscall(SYS_KFD_STAT, [fd, st.as_mut_ptr() as u64, 0, 0, 0, 0]) {
-                r if r == -EBADF => Err(EBADF),
-                _ => Err(EINVAL),
-            }
-        }
+        _ => Err(EINVAL),
     }
 }

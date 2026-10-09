@@ -1,6 +1,6 @@
 //! Pipes (phase R6a): a 64 KiB buffer shared by a read end and a write
-//! end, each a file of the server with a placeholder in the kernel's
-//! descriptor table. Opening /proc/<pid>/fd/N of one adds an end (`reopen`,
+//! end, each a file of the server (an open file description of its own).
+//! Opening /proc/<pid>/fd/N of one adds an end (`reopen`,
 //! as Linux's fifo_open): a pipe has readers and writers, it reads end of
 //! file once no writer is left and fails writes once no reader is.
 //!
@@ -16,7 +16,7 @@
 //! chunk taken under it, one reader at a time (`drain`).
 //!
 //! As on Linux: a write without readers raises SIGPIPE for the writer
-//! (`SYS_SIGNAL_THREAD`) and fails with EPIPE (unless some of it was
+//! (`signal::raise_thread`) and fails with EPIPE (unless some of it was
 //! written), a read without writers returns 0, O_NONBLOCK gives EAGAIN.
 
 use crate::files::{self, EFAULT};
@@ -60,11 +60,11 @@ const POLLHUP: i16 = 0x10;
 struct Inner {
     buf: VecDeque<u8>,
     /// Open ends that read and that write (each counted until its
-    /// placeholder's last descriptor goes; a pipe reopened through
+    /// description's last reference goes; a pipe reopened through
     /// /proc/<pid>/fd gets more).
     readers: u32,
     writers: u32,
-    /// Every open end: its placeholder, its roles and the readiness last
+    /// Every open end: its description's id, its roles and the readiness last
     /// reported for it.
     ends: Vec<Reported>,
 }
@@ -74,7 +74,7 @@ struct Reported {
     reads: bool,
     writes: bool,
     ready: i16,
-    /// Its placeholder exists: the kernel takes reports for it. An end
+    /// Its description exists: its watch takes reports. An end
     /// `reopen` made gets them once installed (`PipeEnd::installed`).
     installed: bool,
 }
@@ -127,8 +127,8 @@ impl Pipe {
     /// (Linux's fifo_open of a pipe: no waiting for a partner): reading for
     /// O_RDONLY, writing for O_WRONLY, both for O_RDWR. The caller installs
     /// it under its `id`, then calls `installed` (or `close` if installing
-    /// failed): the kernel takes readiness reports for the end only once
-    /// its placeholder exists, so the end gets them from then on, and its
+    /// failed): the end's watch takes readiness reports only once its
+    /// description exists, so the end gets them from then on, and its
     /// readiness is reported again then (a change between the two is not
     /// lost).
     pub fn reopen(&self, flags: u32) -> Arc<PipeEnd> {
@@ -224,9 +224,9 @@ impl PipeEnd {
         self.shared.inner.lock().readiness(self.reads, self.writes)
     }
 
-    /// The end's placeholder is installed (`reopen`): it gets reports from
+    /// The end's description is installed (`reopen`): it gets reports from
     /// now on, and its readiness now (as an event: data may have come
-    /// while the kernel did not know the end yet).
+    /// before its watch existed).
     pub fn installed(&self) {
         let mut inner = self.shared.inner.lock();
         let now = inner.readiness(self.reads, self.writes);
@@ -237,7 +237,7 @@ impl PipeEnd {
         }
     }
 
-    /// The end's placeholder is gone.
+    /// The end's description is gone.
     pub fn close(&self) {
         let mut inner = self.shared.inner.lock();
         inner.readers -= self.reads as u32;
@@ -354,8 +354,7 @@ impl PipeEnd {
                         let mut inner = self.shared.inner.lock();
                         if inner.readers == 0 {
                             drop(inner);
-                            const SIGPIPE: u64 = 13;
-                            syscall(SYS_SIGNAL_THREAD, [SIGPIPE, 0, 0, 0, 0, 0]);
+                            crate::signal::raise_thread(crate::signal::SIGPIPE);
                             return if written > 0 { Ok(written as i64) } else { Err(EPIPE) };
                         }
                         let room = CAPACITY.saturating_sub(inner.buf.len()).min(n - pushed);

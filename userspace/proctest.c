@@ -14,6 +14,7 @@
 #include <sys/inotify.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
 #include <sys/sysinfo.h>
@@ -293,10 +294,46 @@ static void descriptors(void) {
     waitpid(kid, &status, 0);
     close(prog);
     check("fexecve runs a program through /proc/self/fd", WIFEXITED(status) && WEXITSTATUS(status) == 42);
+}
 
-    pid_t other = getppid();
-    snprintf(path, sizeof path, "/proc/%d/fd", other);
-    check("another process's descriptors: EACCES", opendir(path) == NULL && errno == EACCES);
+/* Another process's descriptors: listed and described (everyone is root),
+ * and its RLIMIT_NOFILE. */
+static void other_descriptors(void) {
+    char path[64];
+    int p[2];
+    if (pipe(p) != 0) {
+        check("pipe", 0);
+        return;
+    }
+    pid_t kid = fork();
+    if (kid == 0) {
+        close(p[1]);
+        char c;
+        _exit(read(p[0], &c, 1) == 0 ? 0 : 1);
+    }
+    snprintf(path, sizeof path, "/proc/%d/fd/%d", kid, p[0]);
+    char target[64] = {0};
+    ssize_t n = readlink(path, target, sizeof target - 1);
+    check("another process's descriptor reads as its pipe", n > 0 && strncmp(target, "pipe:[", 6) == 0);
+    snprintf(path, sizeof path, "/proc/%d/fd", kid);
+    DIR *d = opendir(path);
+    int seen = 0;
+    for (struct dirent *e; d && (e = readdir(d));) {
+        if (e->d_name[0] != '.' && atoi(e->d_name) == p[0]) {
+            seen = 1;
+        }
+    }
+    if (d) {
+        closedir(d);
+    }
+    check("another process's descriptors are listed", seen);
+    struct rlimit rl = {0};
+    check("prlimit of another process's RLIMIT_NOFILE", syscall(SYS_prlimit64, kid, RLIMIT_NOFILE, NULL, &rl) == 0 && rl.rlim_cur == 4096);
+    close(p[0]);
+    close(p[1]);
+    int status = 0;
+    waitpid(kid, &status, 0);
+    check("the other process saw its pipe's end", WIFEXITED(status) && WEXITSTATUS(status) == 0);
 }
 
 int main(void) {
@@ -365,7 +402,30 @@ int main(void) {
         if (pfd >= 0) close(pfd);
     }
     if (proc) closedir(proc);
-    check("/proc/<pid>/stat via openat on an O_PATH dir fd", consistent && seen >= 3 && found_self);
+    /* (The tree's own processes only: its pid 1 and this one at least.) */
+    check("/proc/<pid>/stat via openat on an O_PATH dir fd", consistent && seen >= 2 && found_self);
+
+    /* The pids are the tree's own namespace: its init is pid 1 with no parent in it, and a
+     * process's parent in /proc is getppid's. */
+    {
+        char sbuf[512] = {0};
+        int fd = open("/proc/1/stat", O_RDONLY);
+        int ok1 = fd >= 0 && read(fd, sbuf, sizeof sbuf - 1) > 0;
+        if (fd >= 0) close(fd);
+        char *rp = strrchr(sbuf, ')');
+        int ppid1 = -1;
+        if (rp) sscanf(rp + 2, "%*c %d", &ppid1);
+        char ppath[64];
+        snprintf(ppath, sizeof ppath, "/proc/%d/stat", getpid());
+        memset(sbuf, 0, sizeof sbuf);
+        fd = open(ppath, O_RDONLY);
+        int ok2 = fd >= 0 && read(fd, sbuf, sizeof sbuf - 1) > 0;
+        if (fd >= 0) close(fd);
+        rp = strrchr(sbuf, ')');
+        int myppid = -1;
+        if (rp) sscanf(rp + 2, "%*c %d", &myppid);
+        check("/proc/1 is the tree's init, /proc/self's parent getppid's", ok1 && ok2 && ppid1 == 0 && myppid == getppid());
+    }
     char link[32] = {0};
     readlink("/proc/self", link, sizeof link - 1);
     check("/proc/self points to the caller", atoi(link) == getpid());
@@ -418,6 +478,7 @@ int main(void) {
     thread_dir();
     the_servers_part();
     descriptors();
+    other_descriptors();
     printf("proctest: %s\n", failures ? "FAILED" : "all passed");
     return failures;
 }

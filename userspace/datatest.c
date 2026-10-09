@@ -600,9 +600,10 @@ static void full_disk(void) {
     for (int i = 0; same && i < PG; i++) same = (unsigned char)back[i] == pattern(last + i, 3);
     check("full disk: the file's size and its last page on the disk", st.st_size == total && same);
     check("full disk: a store into a hole raises SIGBUS", sized && map != MAP_FAILED && store_faults(map + 10 * PG) == SIGBUS);
-    /* The kernel's copies into such a page fail too, and leave it clean:
-     * read() from a pipe (EFAULT or a short count, nothing read), and a
-     * fork child's CLONE_CHILD_SETTID word (clone fails with EFAULT). */
+    /* Copies into such a page fail too, and leave it clean: read() from a
+     * pipe (EFAULT or a short count, nothing read), and a fork child's
+     * CLONE_CHILD_SETTID word (the child writes it before its first
+     * instruction; a failure is ignored, as Linux's schedule_tail does). */
     int pipefd[2] = {-1, -1};
     int piped = pipe(pipefd) == 0 && write(pipefd[1], "pipedata", 8) == 8;
     long dirty0 = meminfo("Dirty:");
@@ -613,7 +614,7 @@ static void full_disk(void) {
     long kid = map != MAP_FAILED ? syscall(SYS_clone, CLONE_CHILD_SETTID | SIGCHLD, 0, NULL, (void *)(map + 30 * PG), 0) : 0;
     if (kid == 0) _exit(0);
     if (kid > 0) waitpid((pid_t)kid, NULL, 0);
-    check("full disk: clone's CHILD_SETTID into a hole fails (EFAULT)", kid == -1 && errno == EFAULT);
+    check("full disk: clone's CHILD_SETTID into a hole is dropped, the child runs", kid > 0);
     check("... and neither left a dirty page", meminfo("Dirty:") <= dirty0);
     close(fd);
     unlink(path);

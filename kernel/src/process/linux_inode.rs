@@ -11,9 +11,8 @@
 //! stops after the first symlink it reaches.
 
 use super::errno::*;
-use super::linux::{ExecTarget, Instance, Object};
+use super::linux::{Instance, Object};
 use super::uaccess::{copy_from_server, copy_to_server};
-use super::with_current;
 use crate::fs::{self, Inode, NewNode};
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -67,7 +66,7 @@ fn give(instance: &Instance, inode: Arc<Inode>) -> SysResult {
     Ok(instance.insert(Object::Inode(inode))? as i64)
 }
 
-/// The `SYS_INODE_*` calls, `SYS_KFD_INODE` and `SYS_EXEC_TARGET`.
+/// The `SYS_INODE_*` calls.
 pub fn call(instance: &Arc<Instance>, nr: u64, a: [u64; 6]) -> SysResult {
     match nr {
         SYS_INODE_ROOT => give(instance, fs::root()),
@@ -153,37 +152,13 @@ pub fn call(instance: &Arc<Instance>, nr: u64, a: [u64; 6]) -> SysResult {
             if !path.starts_with('/') {
                 return Err(EINVAL);
             }
-            super::sys_file::open_inode(i, flags, path)
+            let file = super::sys_file::open_inode_file(i, flags, path)?;
+            Ok(instance.insert(Object::KernelFile(file))? as i64)
         }
         SYS_INODE_STATFS => {
             let words = super::sys_file::statfs_words(&*inode(instance, a[0])?);
             let bytes: alloc::vec::Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
             copy_to_server(a[1], &bytes)?;
-            Ok(0)
-        }
-        SYS_KFD_INODE => {
-            let (fd, buf, cap, len_out) = (a[0], a[1], a[2], a[3]);
-            let f = with_current(|p| p.file(fd))?;
-            let i = f.inode().cloned().ok_or(ENOTDIR)?;
-            let path = f.path.clone().ok_or(ENOTDIR)?;
-            if path.len() as u64 > cap {
-                return Err(ENAMETOOLONG);
-            }
-            copy_to_server(buf, path.as_bytes())?;
-            copy_to_server(len_out, &(path.len() as u64).to_le_bytes())?;
-            give(instance, i)
-        }
-        SYS_EXEC_TARGET => {
-            let target = match instance.object(a[0])? {
-                Object::Inode(i) => ExecTarget::Inode(i),
-                Object::File(cache, hold) => ExecTarget::File(cache, hold),
-                _ => return Err(EINVAL),
-            };
-            let path = string(a[1], a[2])?;
-            if !path.starts_with('/') {
-                return Err(EINVAL);
-            }
-            with_current(|p| p.linux.as_mut().map(|l| l.exec_target = Some((target, path)))).ok_or(EPERM)?;
             Ok(0)
         }
         _ => Err(ENOSYS),

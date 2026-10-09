@@ -36,6 +36,9 @@ virtio-net with user networking and the echo service at 10.0.2.100:7.
 | `clock_gettime` | `clock_gettime(CLOCK_MONOTONIC)` alone, cycles |
 | `read_4k_disk` | the same with `O_DIRECT`; ns, p50/p99 |
 | `tcp_loopback` | 32 MiB in 64 KiB `write`s over 127.0.0.1 to a forked receiver; MB/s |
+| `fork_wait` | `fork` of the benchmark (a small process), the child's `_exit(0)` and the parent's `waitpid`; µs, p50/p99 |
+| `fork_exec_wait` | the same with the child running `/bin/hello` (stdout to `/dev/null`): fork, execve with its ELF loading (the Linux server's since R8), exit and wait; µs, p50/p99 |
+| `signal_handled` | `kill` of the caller itself with `SIGUSR1` and a handler that counts: posting, the frame, the handler and `rt_sigreturn`; cycles, p50/p99 |
 | `tcp_network_echo` | 4 MiB through the network card to QEMU's echo service and back (sent while a forked reader drains the echo); MB/s. Bound by QEMU's user networking and the `cat` behind the echo service as much as by the guest |
 
 For each benchmark a `counters` line gives the counts **per operation** (per call, or per
@@ -151,6 +154,31 @@ and, against QEMU's user network, a one-second stall (its TCP waits for a larger
 After the second review (`2026-10-09-29b0502-r7b-rereview.md`: real randomness, RFC 6528
 sequence numbers, half-open connections with small buffers, TIME-WAIT kept in smoltcp):
 `tcp_loopback` 1192 MB/s, `tcp_network_echo` 176 MB/s (host load about 3.7).
+
+## R6e: the descriptor table in the Linux server
+
+An A/B in the same dev shell (`nix develop`: QEMU 11.1.1, KVM), two runs each, alternating:
+`2026-10-09-5fce3fc-base-ab.md` and `-base-ab2.md` (main before R6e) against
+`2026-10-09-1b5f908-r6e-ab.md` and `-r6e-ab2.md`. (`2026-10-09-27a096a-r6e.md`, the first R6e
+run, used QEMU 11.1.1 against a base measured with 10.2.4: not comparable.) No kernel call is
+left for a descriptor's lookup (`kfd_lookup` and its pin), a readiness change (`kfd_ready`),
+dup, close or fcntl:
+
+| system calls per operation | before | R6e |
+|---|---:|---:|
+| `fstat_tmpfs` | 4 | 3 |
+| `fstat_disk` | 9 | 8 |
+| `read_4k_cached`, `read_4k_disk` | 10, 17 | 9, 16 |
+| `seq_read_cached_64k` | 4.04 | 3.04 |
+| `proc_self_stat_pread`, `proc_meminfo_pread` | 6, 12 | 5, 11 |
+| `proc_self_stat_open_read_close` | 17 | 14 |
+| `tcp_loopback_64k` | 27.5, 28.8 | 21.1, 20.9 |
+
+`fstat_tmpfs` p50 2402 and 2820 cycles before, 2322 and 1978 with R6e; `proc_self_stat_open_read_close`
+p50 23412 and 17832 against 17509 and 15139. What `fstat_disk` keeps is /data's own (its status
+asked of diskfs over the ring). The throughputs and `tcp_network_echo_64k`'s system calls (which
+count waits, 100 and 139 before, 165 and 98 with R6e) stay within this host's spread between
+runs of the same commit.
 
 ## Open: PCIDs and small cached reads
 

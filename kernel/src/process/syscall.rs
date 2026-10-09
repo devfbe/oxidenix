@@ -4,7 +4,7 @@
 use super::address_space::USER_END;
 use super::errno::*;
 use super::sys_file::{self, AT_FDCWD};
-use super::{epoll, signal, sys_mem, sys_time, uaccess};
+use super::{signal, sys_mem, sys_time, uaccess};
 use crate::interrupts::gdt;
 use x86_64::registers::model_specific::{Efer, EferFlags, FsBase, LStar, SFMask, Star};
 use x86_64::registers::rflags::RFlags;
@@ -165,16 +165,15 @@ extern "sysv64" fn dispatch(f: &mut Frame) {
         Some(false) => {
             let result = match f.rax {
                 restricted::SYS_RESTRICTED_ENTER => match super::linux::enter(f) {
-                    // `f` is the program's now; a call the server handled
-                    // itself is restarted after a signal as the kernel's would be.
-                    Ok(handled) => {
+                    // `f` is the program's now (or the server's with
+                    // `REASON_KICK`): signals are the server's.
+                    Ok(()) => {
                         super::sched::resched_on_return();
-                        signal::deliver(f, handled);
                         return;
                     }
                     Err(e) => Err(e),
                 },
-                restricted::SYS_LEGACY_SYSCALL => super::linux::legacy(f.rdi, f.rsi).map(Some),
+                restricted::SYS_LEGACY_SYSCALL => super::linux::legacy().map(Some),
                 nr => super::linux::server_call(nr, [f.rdi, f.rsi, f.rdx, f.r10, f.r8, f.r9]).map(|v| Some(v as u64)),
             };
             // A service thread (the worker; the pager ends its process
@@ -214,7 +213,6 @@ pub(super) fn dispatch_linux(f: &mut Frame) {
         4 => sys_file::newfstatat(cwd, a0, a1, 0),
         5 => sys_file::fstat(a0, a1),
         6 => sys_file::newfstatat(cwd, a0, a1, 0x100),
-        7 => sys_file::poll(a0, a1, sys_file::poll_timeout(a2 as i32 as i64)),
         8 => sys_file::lseek(a0, a1 as i64, a2),
         9 => sys_mem::mmap(a0, a1, a2, a3, a4, a5),
         10 => sys_mem::mprotect(a0, a1, a2),
@@ -241,7 +239,6 @@ pub(super) fn dispatch_linux(f: &mut Frame) {
         328 => sys_file::pwritev2(a0, a1, a2, a3 as i64, a5),
         21 => sys_file::faccessat(cwd, a0),
         22 => sys_file::pipe2(a0, 0),
-        23 => sys_file::timeout(a4, 1_000_000).and_then(|t| sys_file::select(a0, a1, a2, a3, t)),
         24 => {
             super::yield_now();
             Ok(0)
@@ -346,8 +343,6 @@ pub(super) fn dispatch_linux(f: &mut Frame) {
         266 => sys_file::symlinkat(a0, a1, a2),
         267 => sys_file::readlinkat(a0, a1, a2, a3),
         268 => sys_file::fchmodat(a0, a1, a2),
-        270 => sys_file::pselect6(a0, a1, a2, a3, a4, a5),
-        271 => sys_file::ppoll(a0, a1, a2, a3, a4),
         269 | 439 => sys_file::faccessat(a0, a1),
         235 => sys_file::utimensat(cwd, a0, 0),
         261 => sys_file::utimensat(a0, a1, 0),
@@ -355,12 +350,8 @@ pub(super) fn dispatch_linux(f: &mut Frame) {
         292 => sys_file::dup3(a0, a1, a2, false),
         293 => sys_file::pipe2(a0, a1),
         284 => sys_file::eventfd2(a0, 0),
-        213 => epoll::epoll_create(a0),
-        291 => epoll::epoll_create1(a0),
-        233 => epoll::epoll_ctl(a0, a1, a2, a3),
-        232 => epoll::epoll_pwait(a0, a1, a2, a3, 0, 0),
-        281 => epoll::epoll_pwait(a0, a1, a2, a3, a4, a5),
-        441 => epoll::epoll_pwait2(a0, a1, a2, a3, a4, a5),
+        // poll, select and epoll (7, 23, 213, 232, 233, 270, 271, 281, 291,
+        // 441) are the Linux server's (R6e): none reaches the kernel.
         290 => sys_file::eventfd2(a0, a1),
         302 => prlimit(a1, a3),
         318 => getrandom(a0, a1, a2),
@@ -371,7 +362,10 @@ pub(super) fn dispatch_linux(f: &mut Frame) {
     };
     f.rax = result.unwrap_or_else(|e| -e) as u64;
     super::sched::resched_on_return();
-    super::signal::deliver(f, Some(nr));
+    // A Linux program's call passed through: its server delivers signals.
+    if super::linux::mode().is_none() {
+        super::signal::deliver(f, Some(nr));
+    }
 }
 
 /// reboot(2): power off (QEMU exits) or restart the machine.

@@ -35,11 +35,14 @@ pub extern "sysv64" fn trap(frame: &mut Frame) {
         _ => {}
     }
     // Every return to user space is a chance to switch tasks and to
-    // deliver pending signals (to a Linux program, not to its server).
+    // deliver pending signals: a native task's here; a Linux program that
+    // was kicked goes back to its server, which delivers its signals.
     if frame.from_user() {
         crate::process::sched::resched_on_return();
-        if crate::process::linux::mode() != Some(false) {
-            signal::deliver(frame, None);
+        match crate::process::linux::mode() {
+            None => signal::deliver(frame, None),
+            Some(true) if crate::process::linux::kick_pending() => crate::process::linux::trap(frame, restricted::REASON_KICK),
+            Some(_) => {}
         }
     }
 }
@@ -90,7 +93,7 @@ fn exception_name(vector: u8) -> &'static str {
 /// back to user mode.
 fn oom_kill(addr: u64) {
     crate::printkln!("[kernel] out of memory at {:#x} (in a copy): process killed", addr);
-    signal::send(crate::process::current_pid(), signal::SIGKILL);
+    signal::send_to(&crate::process::sched::current().group.clone(), signal::SIGKILL);
 }
 
 fn exception(frame: &mut Frame) {
@@ -106,9 +109,12 @@ fn exception(frame: &mut Frame) {
         if frame.rflags & 0x200 != 0 {
             x86_64::instructions::interrupts::enable();
         }
+        // A copy whose wait for the page ended because the thread dies takes
+        // its fixup too (EFAULT): returning would run the copy again, and the
+        // page never comes. The server then unwinds and the thread exits at
+        // its next `restricted_enter`.
         match handle_fault(fault_addr, access) {
             Ok(()) => return,
-            Err(_) if signal::dying() => return,
             Err(e) => {
                 if e == crate::process::address_space::Fault::Oom {
                     oom_kill(fault_addr);
@@ -135,9 +141,11 @@ fn exception(frame: &mut Frame) {
             let (program, normal) = mm.tlb.roots();
             crate::printkln!("[linux] program view {:#x}, normal view {:#x}", program, normal);
         }
-        crate::process::exit_group(signal::SIGKILL as i32);
+        signal::kernel_kill_current();
     }
     let mut sig = exception_signal(vector);
+    // A page fault's kind, for a Linux program's server (`FAULT_*`).
+    let mut kind = 0;
     if vector == 14 {
         use crate::process::address_space::{handle_fault, Access, Fault, USER_END};
         let addr = fault_addr;
@@ -169,12 +177,16 @@ fn exception(frame: &mut Frame) {
                     frame.rip = fixup.expect("checked").to;
                     return;
                 }
-                Err(Fault::Bus | Fault::Retry) => sig = signal::SIGBUS,
+                Err(Fault::Bus | Fault::Retry) => {
+                    sig = signal::SIGBUS;
+                    kind = restricted::FAULT_BUS;
+                }
                 Err(Fault::Oom) => {
                     crate::printkln!("[kernel] out of memory at {:#x}: process killed", addr);
-                    crate::process::exit_group(signal::SIGKILL as i32);
+                    signal::kernel_kill_current();
                 }
-                Err(Fault::Segv | Fault::Access) => {}
+                Err(Fault::Segv) => kind = restricted::FAULT_UNMAPPED,
+                Err(Fault::Access) => kind = restricted::FAULT_PROTECTION,
             }
         }
     }
@@ -185,6 +197,11 @@ fn exception(frame: &mut Frame) {
             frame.rip = fixup;
             return;
         }
+    }
+    // A Linux program's exception is its server's to turn into a signal.
+    if frame.from_user() && vector != 18 && crate::process::linux::mode() == Some(true) {
+        crate::process::linux::trap_exception(frame, vector as u64, frame.error, fault_addr, kind);
+        return;
     }
     if frame.from_user() && vector != 18 {
         if signal::force(sig) {

@@ -23,7 +23,6 @@ use alloc::string::ToString;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use ldisc::Termios;
-use restricted::*;
 
 const ENOSPC: i64 = 28;
 const EFAULT: i64 = 14;
@@ -97,15 +96,14 @@ pub fn open_master(flags: u32, origin: Origin) -> Result<i64, i64> {
     };
     let node = devpts().insert_device(&index.to_string(), vfs::stat::dev_make(SLAVE_MAJOR, index), 0o620);
     let master = Arc::new(PtyMaster { tty: tty.clone(), index, origin });
-    let ready = {
+    {
         let mut inner = tty.inner.lock();
         let ready = Tty::master_readiness(&inner);
         if let Some(p) = inner.pty.as_mut() {
             p.master_reported = ready;
         }
-        ready
-    };
-    let fd = node.and_then(|_| files::install(id, File::PtyMaster(master.clone()), flags & (O_ACCMODE | O_NONBLOCK | O_CLOEXEC), ready));
+    }
+    let fd = node.and_then(|_| files::install(id, File::PtyMaster(master.clone()), flags & (O_ACCMODE | O_NONBLOCK | O_CLOEXEC)));
     match fd {
         Ok(fd) => Ok(fd),
         Err(e) => {
@@ -146,6 +144,11 @@ pub fn master_closed(m: &PtyMaster) {
 }
 
 impl PtyMaster {
+    /// Its readiness for poll and epoll now.
+    pub fn readiness_now(&self) -> i16 {
+        crate::tty::Tty::master_readiness(&self.tty.inner.lock())
+    }
+
     /// read(2): the slave's output, what is there; EIO once the slave's last descriptor
     /// went and nothing is left.
     pub fn read(&self, mut sink: Sink, nonblock: bool) -> Result<i64, i64> {
@@ -245,7 +248,7 @@ impl PtyMaster {
                     return Err(EINVAL);
                 }
                 if let Some(fg) = self.tty.inner.lock().pgrp {
-                    crate::syscall(SYS_SIGNAL_GROUP, [SIGNAL_PGRP, fg, sig, 0, 0, 0]);
+                    crate::signal::send_pgrp(fg as u32, sig as u32);
                 }
                 Ok(0)
             }

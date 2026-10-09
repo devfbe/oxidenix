@@ -1,5 +1,5 @@
 //! eventfd (phase R6b): a counter that reads take and writes add to, a
-//! file of the server with a placeholder in the kernel's descriptor table.
+//! file of the server (an open file description of its table's, `files`).
 //! Waiting and readiness reports work as for pipes (see `pipe`): a
 //! sequence word bumped on every change, an interruptible futex, reports
 //! under the counter's lock.

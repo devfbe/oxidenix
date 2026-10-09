@@ -11,6 +11,7 @@ const NSEC_PER_SEC: u64 = 1_000_000_000;
 
 const EINVAL: i64 = 22;
 const EINTR: i64 = 4;
+const EFAULT: i64 = 14;
 const EOPNOTSUPP: i64 = 95;
 
 const CLOCK_REALTIME: i64 = 0;
@@ -52,7 +53,43 @@ pub fn handle(s: &State) -> Option<i64> {
     Some(result.unwrap_or_else(|e| -e))
 }
 
+/// The clock `id`: the kernel's, but the CPU clock of another process or thread, whose
+/// id is the instance's (Linux's encoding: `!pid << 3`, bit 2 a thread, the low two bits
+/// what is counted). A thread's clock is only its own process's threads' (Linux's
+/// lookup_task).
 fn clock(id: u64) -> Result<u64, i64> {
+    let signed = id as i32 as i64;
+    if signed < 0 {
+        let pid = !(signed >> 3) as u32;
+        if pid != 0 {
+            let what = signed & 3;
+            if what == 3 {
+                return Err(EINVAL);
+            }
+            let (user, system, run) = if signed & 4 != 0 {
+                if crate::process::PROCS.lock().threads.get(&pid).is_none_or(|t| t.pid != crate::local::pid()) {
+                    return Err(EINVAL);
+                }
+                let key = crate::process::key_of(pid).ok_or(EINVAL)?;
+                let mut info = ThreadInfo::default();
+                if syscall(SYS_THREAD_INFO, [key, &mut info as *mut ThreadInfo as u64, 0, 0, 0, 0]) < 0 {
+                    return Err(EINVAL);
+                }
+                (info.user_ns, info.system_ns, info.run_ns)
+            } else {
+                let handle = crate::process::handle_of(pid).ok_or(EINVAL)?;
+                let mut info = ProcInfo::default();
+                syscall(SYS_PROC_INFO, [handle, &mut info as *mut ProcInfo as u64, 0, 0, 0, 0]);
+                (info.user_ns, info.system_ns, info.user_ns + info.system_ns)
+            };
+            // CPUCLOCK_PROF, CPUCLOCK_VIRT, CPUCLOCK_SCHED.
+            return Ok(match what {
+                0 => user + system,
+                1 => user,
+                _ => run,
+            });
+        }
+    }
     let ns = syscall(SYS_CLOCK_READ, [id, 0, 0, 0, 0, 0]);
     if ns < 0 { Err(-ns) } else { Ok(ns as u64) }
 }
@@ -127,10 +164,32 @@ fn clock_nanosleep(id: u64, flags: u64, req: u64, rem: u64) -> Result<i64, i64> 
         (true, false) => t,
         (true, true) => now.saturating_add(t.saturating_sub(clock(CLOCK_REALTIME as u64)?)),
     };
+    if flags & TIMER_ABSTIME != 0 {
+        // Interrupted, it restarts as it is (ERESTARTNOHAND).
+        let slept = syscall(SYS_SLEEP_UNTIL, [deadline, 0, 0, 0, 0, 0]);
+        return match slept {
+            s if s == -EINTR => Err(crate::signal::ERESTARTNOHAND),
+            s if s < 0 => Err(-s),
+            _ => Ok(0),
+        };
+    }
+    sleep_rest(crate::signal::RestartBlock::Sleep { deadline, rem })
+}
+
+/// A relative sleep to `block.deadline`: cut short by a signal it stores the time left at
+/// `block.rem` and keeps the rest for restart_syscall (ERESTART_RESTARTBLOCK: it goes on
+/// to the same deadline if no handler runs).
+pub fn sleep_rest(block: crate::signal::RestartBlock) -> Result<i64, i64> {
+    let crate::signal::RestartBlock::Sleep { deadline, rem } = block else { return Err(EINTR) };
     let slept = syscall(SYS_SLEEP_UNTIL, [deadline, 0, 0, 0, 0, 0]);
-    if slept == -EINTR && flags & TIMER_ABSTIME == 0 && rem != 0 {
-        let left = deadline.saturating_sub(clock(CLOCK_MONOTONIC as u64)?);
-        let _ = usercopy::write(rem, &timespec(left));
+    if slept == -EINTR {
+        if rem != 0 {
+            let left = deadline.saturating_sub(clock(CLOCK_MONOTONIC as u64)?);
+            // As Linux's nanosleep_copyout.
+            usercopy::write(rem, &timespec(left)).map_err(|_| EFAULT)?;
+        }
+        crate::signal::save_block(block);
+        return Err(crate::signal::ERESTART_RESTARTBLOCK);
     }
     if slept < 0 { Err(-slept) } else { Ok(0) }
 }

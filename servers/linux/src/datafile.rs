@@ -1,7 +1,7 @@
-//! Open files of /data (phase R6c.3): a placeholder in the kernel's
-//! descriptor table names one (an open file description: offset, the
-//! directory cursor, write access, O_DIRECT and O_SYNC); the calls on it
-//! are the server's (`datafs`), as for the server's tmpfs files.
+//! Open files of /data (phase R6c.3): what an open file description of the
+//! server's names (offset, the directory cursor, write access, O_DIRECT and
+//! O_SYNC); the calls on it are the server's (`datafs`), as for the
+//! server's tmpfs files.
 
 use crate::datafs::{self, DInode, HoldKind, EISDIR};
 use crate::files::{self, File, EBADF, EINVAL, O_ACCMODE, O_WRONLY};
@@ -19,8 +19,6 @@ pub const O_DSYNC: u32 = 0o10000;
 const O_DIRECT: u32 = 0o40000;
 const O_DIRECTORY: u32 = 0o200000;
 const O_SYNC: u32 = 0o4010000;
-const POLLIN: i16 = 0x1;
-const POLLOUT: i16 = 0x4;
 
 pub struct DataOpen {
     pub inode: Arc<DInode>,
@@ -92,7 +90,7 @@ pub fn open(inode: Arc<DInode>, flags: u32, path: String) -> Result<i64, i64> {
     }
     open.notify(inotify::IN_OPEN);
     let kept = flags & (O_ACCMODE | files::O_NONBLOCK | O_APPEND | files::O_CLOEXEC);
-    files::install(files::new_id(), File::Data(open), kept, POLLIN | POLLOUT)
+    files::install(files::new_id(), File::Data(open), kept)
 }
 
 /// The calls on an open /data file (`a1`..`a3`: the call's arguments after

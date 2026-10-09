@@ -494,11 +494,6 @@ impl AddressSpace {
         Ok(())
     }
 
-    /// The Linux server instance serving this address space, if any.
-    pub fn instance(&self) -> Option<&Arc<super::linux::Instance>> {
-        self.instance.as_ref()
-    }
-
     /// Copies the program's top-level entries into the normal view; a new
     /// one appears when a mapping needs a new third-level table. Entries
     /// never go away before the address space does.
@@ -868,8 +863,10 @@ impl AddressSpace {
             self.grow_stack(page)?;
         }
         let v = self.vma(page).cloned().ok_or(Fault::Segv)?;
+        // A mapping that does not allow the access (SEGV_ACCERR, where no
+        // mapping is SEGV_MAPERR).
         if v.prot.none() || (access.write && !v.prot.write) || (access.exec && !v.prot.exec) {
-            return Err(Fault::Segv);
+            return Err(Fault::Access);
         }
         if let Some(e) = leaf_entry(self.l4, page) {
             let flags = e.flags();

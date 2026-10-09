@@ -1,4 +1,6 @@
-//! clone(2), fork and vfork: new threads and processes.
+//! clone(2), fork and vfork: new threads and processes of the kernel's
+//! native servers (a Linux program's are its server's since R8:
+//! `linux`'s `SYS_PROC_CREATE` and `SYS_THREAD_CREATE`).
 //!
 //! What the new task shares with its creator follows the flags, as on
 //! Linux: the address space (CLONE_VM), the descriptor table (CLONE_FILES),
@@ -71,6 +73,11 @@ pub fn vfork(frame: &Frame) -> Result<Pid, i64> {
 /// clone(flags, stack, parent_tid, child_tid, tls).
 pub fn clone(frame: &Frame, flags: u64, stack: u64, parent_tid: u64, child_tid: u64, tls: u64) -> Result<Pid, i64> {
     let _ = CLONE_PIDFD;
+    // A Linux program's processes and threads are its server's
+    // (`SYS_PROC_CREATE`, `SYS_THREAD_CREATE`).
+    if super::linux::mode().is_some() {
+        return Err(ENOSYS);
+    }
     if flags & !SUPPORTED != 0 {
         return Err(EINVAL);
     }
@@ -110,18 +117,14 @@ pub fn clone(frame: &Frame, flags: u64, stack: u64, parent_tid: u64, child_tid: 
         }
         mm
     };
-    let files = if flags & CLONE_FILES != 0 { parent.files()?.clone() } else { parent.files()?.duplicate().ok_or(ENOMEM)? };
+    let files = if flags & CLONE_FILES != 0 {
+        parent.files()?.clone()
+    } else {
+        parent.files()?.duplicate().ok_or(ENOMEM)?
+    };
     let fs = match (&parent.fs, flags & CLONE_FS != 0) {
         (Some(f), true) => f.clone(),
-        (Some(f), false) => {
-            let fs = FsInfo::new(f.cwd()).ok_or(ENOMEM)?;
-            // The Linux server's record for the new context, if it gave one.
-            if let Some(record) = parent.linux.as_mut().and_then(|l| l.fs_child.take()) {
-                // A new context has none yet.
-                let _ = fs.set_record(record);
-            }
-            fs
-        }
+        (Some(f), false) => FsInfo::new(f.cwd()).ok_or(ENOMEM)?,
         (None, _) => FsInfo::new(alloc::string::String::from("/")).ok_or(ENOMEM)?,
     };
     let vfork_done = if flags & CLONE_VFORK != 0 { Some(Arc::try_new(AtomicBool::new(false)).map_err(|_| ENOMEM)?) } else { None };
@@ -154,18 +157,6 @@ pub fn clone(frame: &Frame, flags: u64, stack: u64, parent_tid: u64, child_tid: 
     if stack != 0 {
         child_frame.rsp = stack;
     }
-    // A thread of a Linux program starts in its own server thread, which
-    // enters the program with the frame above.
-    let instance = mm.lock().instance().cloned();
-    let linux = match instance {
-        Some(instance) => {
-            group.instance.store(instance.id, core::sync::atomic::Ordering::Release);
-            let (thread, start) = super::linux::LinuxThread::new(instance, &child_frame, restricted::ROLE_PROGRAM)?;
-            child_frame = start;
-            Some(thread)
-        }
-        None => None,
-    };
     let own = Process {
         mm: Some(mm),
         files: Some(files),
@@ -174,7 +165,7 @@ pub fn clone(frame: &Frame, flags: u64, stack: u64, parent_tid: u64, child_tid: 
         server: None,
         clear_child_tid: if flags & CLONE_CHILD_CLEARTID != 0 { child_tid } else { 0 },
         vfork_done: vfork_done.clone(),
-        linux,
+        linux: None,
         // Per task, not inherited: see `channel::set_copy_fixup`.
         copy_fixup: None,
     };

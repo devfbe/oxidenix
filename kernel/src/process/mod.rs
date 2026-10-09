@@ -15,8 +15,6 @@ pub mod irq;
 mod loader;
 mod prctl;
 pub mod query;
-pub mod epoll;
-pub mod poll;
 pub mod sched;
 pub mod signal;
 mod sys_file;
@@ -56,33 +54,21 @@ pub type Pid = u64;
 
 pub const TIMER_HZ: u64 = 100;
 
+/// A descriptor of the kernel's tables (the native servers'; a Linux
+/// program's descriptors are its server's).
+#[derive(Clone)]
 pub struct FdEntry {
-    /// Let go of through `fs::file::release` (see `Drop`).
-    file: core::mem::ManuallyDrop<Arc<OpenFile>>,
+    file: Arc<OpenFile>,
     pub cloexec: bool,
 }
 
 impl FdEntry {
     pub fn new(file: Arc<OpenFile>, cloexec: bool) -> FdEntry {
-        FdEntry { file: core::mem::ManuallyDrop::new(file), cloexec }
+        FdEntry { file, cloexec }
     }
 
     pub fn file(&self) -> &Arc<OpenFile> {
         &self.file
-    }
-}
-
-impl Clone for FdEntry {
-    fn clone(&self) -> FdEntry {
-        FdEntry::new(self.file().clone(), self.cloexec)
-    }
-}
-
-impl Drop for FdEntry {
-    fn drop(&mut self) {
-        // Taken once, here.
-        let file = unsafe { core::mem::ManuallyDrop::take(&mut self.file) };
-        crate::fs::file::release(file);
     }
 }
 
@@ -216,70 +202,6 @@ pub fn getsid(pid: Pid) -> SysResult {
     Ok(group(pid).ok_or(ESRCH)?.info.lock().sid as i64)
 }
 
-/// Whether `g` is a program of Linux server instance `instance`.
-pub(super) fn in_instance(g: &ThreadGroup, instance: u64) -> bool {
-    g.tgid != 0 && !g.privileged.load(Ordering::Relaxed) && g.instance.load(Ordering::Acquire) == instance
-}
-
-/// The process id, process group and session of process `id` (0: the
-/// caller), or with `pgrp` of a process of group `id`, in Linux server
-/// instance `instance` (a zombie counts until reaped, as on Linux): the
-/// terminals' job control in the server, until the process model is its
-/// own (R8, `restricted::SYS_PROC_IDS`).
-pub fn proc_ids(instance: u64, id: Pid, pgrp: bool) -> Option<(Pid, Pid, Pid)> {
-    let g = if pgrp {
-        let table = TABLE.lock();
-        table.groups.values().find(|g| in_instance(g, instance) && g.info.lock().pgid == id).cloned()?
-    } else {
-        group(id).filter(|g| in_instance(g, instance))?
-    };
-    let info = g.info.lock();
-    Some((g.tgid, info.pgid, info.sid))
-}
-
-/// Whether process group `pgid` of instance `instance` is orphaned (POSIX):
-/// no live member has a parent in another group of the same session. The
-/// kernel, parent of the trees it starts, is not a parent here (Linux's
-/// init is not either).
-pub fn pgrp_orphaned(instance: u64, pgid: Pid) -> bool {
-    let table = TABLE.lock();
-    for g in table.groups.values().filter(|g| in_instance(g, instance)) {
-        let (ppid, sid) = {
-            let info = g.info.lock();
-            if info.pgid != pgid || info.exit_status.is_some() {
-                continue;
-            }
-            (info.ppid, info.sid)
-        };
-        if ppid == 0 {
-            continue;
-        }
-        if let Some(parent) = table.groups.get(&ppid) {
-            let p = parent.info.lock();
-            if p.exit_status.is_none() && p.pgid != pgid && p.sid == sid {
-                return false;
-            }
-        }
-    }
-    true
-}
-
-/// Whether a live member of process group `pgid` of instance `instance` is stopped
-/// (Linux's `has_stopped_jobs`).
-pub fn pgrp_stopped(instance: u64, pgid: Pid) -> bool {
-    let table = TABLE.lock();
-    table.groups.values().filter(|g| in_instance(g, instance)).any(|g| {
-        let info = g.info.lock();
-        if info.pgid != pgid || info.exit_status.is_some() {
-            return false;
-        }
-        // The predicate SIGCONT uses (`signal::post`): a group stop under way counts
-        // (lock order: the process's info, then its signal state).
-        let stopping = g.sig.lock().stopping();
-        stopping || info.threads.iter().any(|t| t.state() == State::Stopped)
-    })
-}
-
 pub fn setsid() -> SysResult {
     let g = &current().group;
     let mut info = g.info.lock();
@@ -376,44 +298,6 @@ pub fn sched_setaffinity(pid: Pid, size: u64, mask: u64) -> SysResult {
         schedule();
     }
     Ok(0)
-}
-
-/// The Linux server's `SYS_THREAD_NICE`, for the instance `instance`: the
-/// nice values of a thread, a process group or every thread of the
-/// instance (only its own: ESRCH for another's); with `set`, they all get
-/// `nice`. The lowest nice value among them before, plus 20.
-pub fn thread_nice(instance: u64, scope: u64, id: u64, set: bool, nice: i64) -> SysResult {
-    use restricted::{NICE_ALL, NICE_PGROUP, NICE_THREAD};
-    let nice = nice.clamp(-20, 19) as i8;
-    let mine = |t: &Task| t.group.instance.load(Ordering::Acquire) == instance;
-    let targets: Vec<Arc<Task>> = match scope {
-        NICE_THREAD => {
-            let t = if id == 0 { sched::current_arc() } else { task(id as Pid).ok_or(ESRCH)? };
-            if !mine(&t) {
-                return Err(ESRCH);
-            }
-            alloc::vec![t]
-        }
-        NICE_PGROUP | NICE_ALL => {
-            let pgid = if id == 0 { current().group.info.lock().pgid } else { id as Pid };
-            let table = sched::TABLE.lock();
-            table
-                .tasks
-                .values()
-                .filter(|t| mine(t))
-                .filter(|t| scope == NICE_ALL || t.group.info.lock().pgid == pgid)
-                .cloned()
-                .collect()
-        }
-        _ => return Err(EINVAL),
-    };
-    let lowest = targets.iter().map(|t| t.nice.load(Ordering::Relaxed)).min().ok_or(ESRCH)?;
-    if set {
-        for t in &targets {
-            t.nice.store(nice, Ordering::Relaxed);
-        }
-    }
-    Ok(lowest as i64 + 20)
 }
 
 /// getcpu(&cpu, &node, cache): the CPU the caller runs on; one NUMA node.
@@ -860,13 +744,51 @@ fn start_env() -> Vec<String> {
     ["PATH=/bin", "HOME=/root", "TERM=linux", "PS1=\\w # "].iter().map(|e| e.to_string()).collect()
 }
 
-/// Starts a program as a child of the kernel shell, with the console as
-/// stdin/stdout/stderr. Names without '/' are looked up in /bin.
+/// Starts a program as a child of the kernel shell: a new process tree,
+/// with its own instance of the Linux server (ADR 0002), the console
+/// granted to it (ADR 0007). Names without '/' are looked up in /bin. The
+/// server runs the program (ADR 0010): the process starts with an empty
+/// address space and its first thread in the server (`ROLE_INIT`), which
+/// makes it pid 1 of the tree, gives it standard input, output and error
+/// on the console and execs the program; if that fails, it exits with 127.
 pub fn spawn(name: &str, args: &[&str]) -> Result<Pid, i64> {
     let path = if name.contains('/') { name.to_string() } else { alloc::format!("/bin/{name}") };
     let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
-    let image = load_path("/", &path, &args, &start_env())?;
-    spawn_with(&path, image, None, &args)
+    let slot = sched::reserve_pid()?;
+    let pid = slot.pid;
+    let instance = linux::Instance::new()?;
+    instance.set_init_args(&path, &args, &start_env())?;
+    spawn_pager(&instance)?;
+    let task = (|| {
+        let mut space = address_space::AddressSpace::new().ok_or(ENOMEM)?;
+        space.attach(instance.clone(), true).map_err(|e| if e == address_space::Fault::Oom { ENOMEM } else { EINVAL })?;
+        let (thread, start) = linux::LinuxThread::new(instance.clone(), &Frame::user_start(0, 0), restricted::ROLE_INIT, 0)?;
+        let name = basename(&path).to_string();
+        let mut info = Info::new(current_pid(), pid, pid, name.clone());
+        info.exe = path.clone();
+        info.mem = Some(space.stats.clone());
+        let mut own = Process::empty();
+        own.mm = Some(address_space::Mm::new(space).ok_or(ENOMEM)?);
+        own.fs = Some(FsInfo::new("/".to_string()).ok_or(ENOMEM)?);
+        own.linux = Some(thread);
+        let group = ThreadGroup::new(pid, info, Default::default()).ok_or(ENOMEM)?;
+        group.instance.store(instance.id, Ordering::Release);
+        let t = new_task(pid, group, name, own, start)?;
+        unsafe { t.own() }.linux.as_mut().expect("set above").announce(&t)?;
+        Ok::<_, i64>(t)
+    })();
+    let t = match task.and_then(|t| slot.insert(t.clone()).map(|_| t)) {
+        Ok(t) => t,
+        Err(e) => {
+            // No program will run: the pager's process ends.
+            instance.close();
+            return Err(e);
+        }
+    };
+    // The tree the kernel starts gets the console (ADR 0007).
+    linux::console_grant(Some(&instance));
+    sched::start(t);
+    Ok(pid)
 }
 
 /// Starts a privileged server process: it may register IPC services and
@@ -875,7 +797,7 @@ pub fn spawn_server(server: &Arc<Server>) -> Result<Pid, i64> {
     let mut args = alloc::vec![server.path.to_string()];
     args.extend(server.args.iter().cloned());
     let image = loader::load(&server.image, None, None, &args, &start_env())?;
-    spawn_with(server.path, image, Some(server), &args)
+    spawn_with(server.path, image, server, &args)
 }
 
 /// The pager process of a Linux server instance: the server's view alone
@@ -901,9 +823,9 @@ fn spawn_pager(instance: &Arc<linux::Instance>) -> Result<Pid, i64> {
     let t = new_task(pid, group.clone(), "linux-pager".to_string(), own, start)?;
     slot.insert(t.clone())?;
     sched::start(t);
-    // The worker and the net thread: threads of the pager's process (they
-    // end with it).
-    for (role, name) in [(restricted::ROLE_WORKER, "linux-worker"), (restricted::ROLE_NET, "linux-net")] {
+    // The worker, the net thread and the timer thread: threads of the
+    // pager's process (they end with it).
+    for (role, name) in [(restricted::ROLE_WORKER, "linux-worker"), (restricted::ROLE_NET, "linux-net"), (restricted::ROLE_TIMER, "linux-timer")] {
         let wslot = sched::reserve_pid()?;
         let (thread, start) = linux::LinuxThread::service(instance.clone(), role)?;
         let mut own = Process::empty();
@@ -916,54 +838,29 @@ fn spawn_pager(instance: &Arc<linux::Instance>) -> Result<Pid, i64> {
     Ok(pid)
 }
 
-fn spawn_with(path: &str, image: loader::Image, server: Option<&Arc<Server>>, args: &[String]) -> Result<Pid, i64> {
+/// Starts the native server `server` from its loaded `image`.
+fn spawn_with(path: &str, image: loader::Image, server: &Arc<Server>, args: &[String]) -> Result<Pid, i64> {
     let slot = sched::reserve_pid()?;
     let pid = slot.pid;
     // Servers belong to the kernel, even when a program's request
     // (re)started them, so no program can wait for or signal them.
-    let parent = if server.is_some() { 0 } else { current_pid() };
     let name = basename(path).to_string();
-    let mut info = Info::new(parent, pid, pid, name.clone());
+    let mut info = Info::new(0, pid, pid, name.clone());
     info.cmdline = cmdline_of(args);
     info.exe = path.to_string();
     info.mem = Some(image.space.stats.clone());
     let mut own = Process::empty();
-    let mut space = image.space;
-    let mut frame = Frame::user_start(image.entry, image.sp);
-    let mut instance = None;
-    if server.is_none() {
-        // A new process tree: a new instance of the Linux server, whose
-        // first thread starts in the server (ADR 0002), which gives it its
-        // standard descriptors on the console (`ROLE_INIT`).
-        let new = linux::Instance::new()?;
-        spawn_pager(&new)?;
-        if let Err(e) = space.attach(new.clone(), true) {
-            new.close();
-            return Err(if e == address_space::Fault::Oom { ENOMEM } else { EINVAL });
-        }
-        let (thread, start) = linux::LinuxThread::new(new.clone(), &frame, restricted::ROLE_INIT)?;
-        own.linux = Some(thread);
-        frame = start;
-        instance = Some(new);
-    }
-    let instance_id = instance.as_ref().map_or(0, |i| i.id);
-    own.mm = Some(address_space::Mm::new(space).ok_or(ENOMEM)?);
-    // A native server writes to the kernel's console; a Linux program's
-    // descriptors are its server's.
-    let stdio = if server.is_some() { vec![Some(FdEntry::new(OpenFile::console(), false)); 3] } else { Vec::new() };
-    own.files = Some(Files::new(stdio).ok_or(ENOMEM)?);
+    let frame = Frame::user_start(image.entry, image.sp);
+    own.mm = Some(address_space::Mm::new(image.space).ok_or(ENOMEM)?);
+    // A native server writes to the kernel's console.
+    own.files = Some(Files::new(vec![Some(FdEntry::new(OpenFile::console(), false)); 3]).ok_or(ENOMEM)?);
     own.fs = Some(FsInfo::new("/".to_string()).ok_or(ENOMEM)?);
-    own.server = server.cloned();
+    own.server = Some(server.clone());
     let group = ThreadGroup::new(pid, info, Default::default()).ok_or(ENOMEM)?;
-    group.privileged.store(server.is_some(), Ordering::Relaxed);
-    group.instance.store(instance_id, Ordering::Release);
+    group.privileged.store(true, Ordering::Relaxed);
     let t = new_task(pid, group, name, own, frame)?;
     slot.insert(t.clone())?;
-    // The tree the kernel starts gets the console (ADR 0007).
-    if let Some(instance) = &instance {
-        linux::console_grant(Some(instance));
-    }
-    if let Some(server) = server {
+    {
         // Before it runs, so its registration and exit find it.
         let mut lives = server.lives.lock();
         lives.pid = Some(pid);

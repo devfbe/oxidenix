@@ -49,3 +49,9 @@ leader exits. Programs that drive the console with `\n` in raw mode (ncurses wit
 `TERM=linux` moves down with `cud1=^J`) now get a line feed, not a new line. Packet mode,
 the console's VT ioctls and serial input are not done; serial input would be a second input
 source of the same device.
+
+## Update (R8, ADR 0010)
+
+The transitional calls went with R8: the terminal asks the server's process table for
+process groups, sessions and orphaned groups, sends its signals through the server's signal
+code, and learns of a session leader's end from the process model.
