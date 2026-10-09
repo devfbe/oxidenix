@@ -70,6 +70,13 @@ static void on_once(int sig) {
     depth--;
 }
 
+static void on_set_rax(int sig, siginfo_t *si, void *ucv) {
+    (void)sig;
+    (void)si;
+    ucontext_t *uc = ucv;
+    uc->uc_mcontext.gregs[REG_RAX] = -514;
+}
+
 static sigjmp_buf env;
 
 static void on_segv(int sig, siginfo_t *si, void *uc) {
@@ -215,6 +222,36 @@ int main(void) {
     int st = 0;
     waitpid(p, &st, 0);
     check("a frame that cannot be written: SIGSEGV", WIFSIGNALED(st) && WTERMSIG(st) == SIGSEGV);
+
+    /* A handler may set the interrupted context's rax to anything, also to one of the
+     * kernel's restart codes (-512..-516): rt_sigreturn restores it as it is (the call
+     * returns it), never restarts anything. Also a run of real-time signals queued and
+     * left at exit gives the instance's queue back (pending signals of an ended thread or
+     * process do not stay counted). */
+    sa.sa_sigaction = on_set_rax;
+    sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGUSR2, &sa, NULL);
+    long r = syscall(SYS_kill, getpid(), SIGUSR2);
+    check("rt_sigreturn restores a restart code in rax untouched", r == -1 && errno == 514);
+    int queued_ok = 1;
+    for (int round = 0; round < 3 && queued_ok; round++) {
+        pid_t q = fork();
+        if (q == 0) {
+            sigset_t all;
+            sigfillset(&all);
+            sigprocmask(SIG_BLOCK, &all, NULL);
+            /* 3000 queued, then exit with them pending. */
+            for (int i = 0; i < 3000; i++) {
+                union sigval w = {.sival_int = i};
+                if (sigqueue(getpid(), SIGRTMIN + 3, w) != 0) _exit(1);
+            }
+            _exit(0);
+        }
+        int qs = 0;
+        waitpid(q, &qs, 0);
+        queued_ok = WIFEXITED(qs) && WEXITSTATUS(qs) == 0;
+    }
+    check("queued real-time signals of an ended process are given back", queued_ok);
 
     printf("sigframetest: %s\n", failures ? "FAILED" : "all passed");
     return failures;

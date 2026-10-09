@@ -229,8 +229,9 @@ impl Queue {
         info
     }
 
-    /// Drops every pending signal of `mask`.
-    fn flush(&mut self, mask: u64, rt_queued: &mut usize) {
+    /// Drops every pending signal of `mask` (`!0`: all, as a thread's or process's end does,
+    /// so the instance's count of queued real-time signals drops with them).
+    pub fn flush(&mut self, mask: u64, rt_queued: &mut usize) {
         if self.set & mask == 0 {
             return;
         }
@@ -675,7 +676,9 @@ pub fn deliver(s: &mut State, call: Option<(u64, i64)>) {
     if let Some((nr, result)) = call {
         let mut t = PROCS.lock();
         let Some(th) = t.threads.get_mut(&tid) else { return };
-        th.sig.interrupted = restart_of(nr, result).map(|how| (nr, how));
+        // rt_sigreturn's "result" is the restored rax of the interrupted context, never a
+        // code of its own: nothing to restart.
+        th.sig.interrupted = if nr == SYS_RT_SIGRETURN { None } else { restart_of(nr, result).map(|how| (nr, how)) };
         // What restart_syscall would go on with lasts only until the next call (a handler's
         // rt_sigreturn included, as Linux's).
         if !matches!(th.sig.interrupted, Some((_, Restart::Block))) {
@@ -967,13 +970,29 @@ fn fxsave() -> FxArea {
     area
 }
 
-/// Loads an FPU image (from the program: MXCSR's reserved bits are cleared first, they
-/// would fault).
-fn fxrstor(mut area: FxArea) {
+/// The CPU's MXCSR_MASK (the bits MXCSR may have), from an fxsave image of its own: never
+/// the program's word in a frame, which could claim reserved bits.
+fn mxcsr_mask() -> u32 {
+    static MASK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    let known = MASK.load(Ordering::Relaxed);
+    if known != 0 {
+        return known;
+    }
+    let mut area = FxArea([0; 512]);
+    unsafe { core::arch::asm!("fxsave64 [{}]", in(reg) area.0.as_mut_ptr(), options(nostack)) };
+    // 0: a CPU that does not say has the default mask.
     let mask = match u32::from_le_bytes(area.0[28..32].try_into().expect("4 bytes")) {
         0 => 0xffbf,
         m => m,
     };
+    MASK.store(mask, Ordering::Relaxed);
+    mask
+}
+
+/// Loads an FPU image (from the program: MXCSR's reserved bits are cleared first, they
+/// would fault).
+fn fxrstor(mut area: FxArea) {
+    let mask = mxcsr_mask();
     let mxcsr = u32::from_le_bytes(area.0[24..28].try_into().expect("4 bytes")) & mask & 0xffff;
     area.0[24..28].copy_from_slice(&mxcsr.to_le_bytes());
     unsafe { core::arch::asm!("fxrstor64 [{}]", in(reg) area.0.as_ptr(), options(nostack)) };
