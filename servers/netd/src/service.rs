@@ -195,6 +195,48 @@ pub fn isn(local: IpEndpoint, remote: IpEndpoint, now: Instant) -> u32 {
     clock.wrapping_add(csprng::siphash(&secret(&ISN_KEY), &data) as u32)
 }
 
+/// A B-tree map of `entries` entries of `entry` bytes, at worst (nodes
+/// half full, and their headers).
+const fn btree(entries: usize, entry: usize) -> usize {
+    entries * (2 * entry + 16) + 4096
+}
+
+/// What netd's heap holds at most, from the limits (every one of them is a
+/// budget or a constant): smoltcp's socket set and the service's tables at
+/// their largest, the frames in flight, the requests' temporaries.
+/// smoltcp's buffers and closed connections' leftovers are not on the heap
+/// (`Region`).
+pub const HEAP_WORST: usize = {
+    use core::mem::size_of;
+    // Every socket in the set, made room for at the start.
+    let set = (MAX_SMOLTCP + 1) * size_of::<smoltcp::iface::SocketStorage<'static>>();
+    // A datagram socket's packet metadata (16 each way); their buffers
+    // (2 x 16 KiB at least) bound their number by `BUDGET`.
+    let meta = 2 * UDP_PACKETS * if size_of::<udp::PacketMetadata>() > size_of::<raw::PacketMetadata>() { size_of::<udp::PacketMetadata>() } else { size_of::<raw::PacketMetadata>() };
+    let datagram = BUDGET / (2 * RAW_BUFFER) * meta;
+    // The channels: their sockets (no more than smoltcp's), grants, and
+    // themselves.
+    let chans = MAX_CHANNELS * size_of::<Option<Chan>>() + btree(MAX_SMOLTCP, size_of::<(u32, Sock)>()) + MAX_CHANNELS * btree(MAX_GRANTS, size_of::<(u32, Grant)>());
+    // Closing connections (each holds a smoltcp socket) and TIME-WAIT
+    // records, made room for at the start.
+    let closing = MAX_SMOLTCP * size_of::<Closing>() + MAX_LINGERING * size_of::<Lingering>();
+    // Per smoltcp socket: its memory, a half-open place, wants to grow.
+    let per_socket = btree(MAX_SMOLTCP, size_of::<(SocketHandle, Mem)>()) + btree(MAX_HALF_OPEN, 16) + 2 * MAX_SMOLTCP * size_of::<(SocketHandle, Want)>();
+    // The ports' holders for ICMP routing, made room for at the start.
+    let owners = (2 * MAX_SMOLTCP + MAX_LINGERING) * size_of::<(u16, u64)>();
+    // Echo identifiers: `netring::ECHO_PER_OWNER` for each instance with a
+    // channel, in two maps; the budgets' owners.
+    let echo = 2 * btree(netring::ECHO_PER_OWNER * MAX_CHANNELS, 32) + 5 * btree(MAX_CHANNELS, 32);
+    // Frames: the loopback queue (twice `MAX_LOOPED` at most), one received,
+    // the datagram scratch, a LINKS answer.
+    let frames = (2 * 64 + 1) * (crate::virtio_net::MTU + 32) + if MAX_UDP > RAW_BUFFER { MAX_UDP } else { RAW_BUFFER } + 4096;
+    set + datagram + chans + closing + per_socket + owners + echo + frames
+};
+
+/// netd's heap: the worst case with a quarter more for the allocator's
+/// fragmentation and a MiB for smoltcp's own and everything small.
+pub const HEAP: usize = (HEAP_WORST + HEAP_WORST / 4 + (1 << 20)).next_multiple_of(1 << 20);
+
 /// A futex wake of one sleeper (a ring's doorbell: the client's reaper).
 struct WakeOne;
 
@@ -610,8 +652,9 @@ impl Service {
     pub fn new() -> Service {
         Service {
             chans: (0..MAX_CHANNELS).map(|_| None).collect(),
-            closing: Vec::new(),
-            lingering: Vec::new(),
+            // Made room for at the start (`HEAP`): their budgets bound them.
+            closing: Vec::with_capacity(MAX_SMOLTCP),
+            lingering: Vec::with_capacity(MAX_LINGERING),
             rng: {
                 let mut seed = [0u8; 32];
                 oxrt::getrandom(&mut seed);

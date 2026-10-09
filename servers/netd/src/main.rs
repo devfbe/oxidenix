@@ -29,11 +29,13 @@ use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, IpCidr, Ipv4Address, Ipv4Cidr};
 use virtio_net::VirtioNet;
 
-/// The heap: the sockets themselves (smoltcp's socket set, made for
-/// `service::MAX_SMOLTCP` at once, about 1.8 MiB), frames in flight, the
-/// channels' bookkeeping. smoltcp's socket buffers are not in it: each is
-/// memory of its own, gone with the socket (`service::Region`).
-const HEAP: usize = 4 << 20;
+/// The heap, sized from the worst case of everything on it
+/// (`service::HEAP_WORST`: smoltcp's socket set for `service::MAX_SMOLTCP`
+/// sockets, the service's tables at their limits, frames in flight).
+/// smoltcp's socket buffers are not in it: each is memory of its own, gone
+/// with the socket (`service::Region`).
+const HEAP: usize = service::HEAP;
+const _: () = assert!(HEAP >= service::HEAP_WORST, "netd's heap holds its worst case");
 
 oxrt::entry!(main, heap = HEAP);
 
@@ -133,8 +135,7 @@ fn main(args: Vec<&'static str>) -> i32 {
     // order: register once DHCP is done, or after DHCP_WAIT_MS without it.
     let register_at = oxrt::uptime_ms() + DHCP_WAIT_MS;
     let mut registered = false;
-    let mut service = service::Service::new();
-    service.config.mac = mac.0;
+    let mut service = service::Service::new();    service.config.mac = mac.0;
 
     // The only messages netd takes are the kernel's channel offers (a
     // longer one fails in the kernel).
