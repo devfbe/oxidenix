@@ -36,7 +36,10 @@ enum State {
 
 struct Request {
     service: usize,
-    /// Whether a client sleeps until the reply (otherwise it is discarded).
+    /// Whether its sender still waits for the answer: true for every
+    /// request (all are channel offers, `send_control`) until the sender
+    /// gives it up (`abandon`) after the service took it; the answer is
+    /// then dropped when it comes.
     waits: bool,
     message: Vec<u8>,
     reply: Vec<u8>,
@@ -62,7 +65,9 @@ struct Ipc {
     requests: BTreeMap<u64, Request>,
     next_id: u64,
     next_generation: u64,
-    /// Requests sent, and bytes of requests and replies (see `counters`).
+    /// Requests sent (channel offers: the data plane's requests are the
+    /// rings', never counted here), and bytes of requests and replies (see
+    /// `counters`).
     calls: u64,
     bytes: u64,
 }

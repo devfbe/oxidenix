@@ -141,7 +141,7 @@ rings and the shared area are read and write. The positions start at 0.
 | `ipc_receive` | an offer comes as a control request (id with bit 63 set, `oxrt::Event::Control`) whose payload is a `ring::channel::Offer` (channel id, slots, shared pages, client pid, the client's instance, by which a service accounts what all of an instance's channels take); the service answers with an 8-byte status |
 | `chan_attach(channel) -> addr` (1068) | maps an offered channel (only the service it was offered to, only once) |
 | `chan_detach(channel)` (1069) | lets go of it: the service's mappings of the channel and of its grants go, and the service vouches that no device uses the grants any more |
-| `grant_map(channel, id, &info) -> addr` (1070) | maps a grant: read-only unless granted writable (`mprotect` cannot add write or execute), not inherited by `fork`, not movable by `mremap`; `info` gets (pages, writable) |
+| `grant_map(channel, id, &info, max_pages) -> addr` (1070) | maps a grant: read-only unless granted writable (`mprotect` cannot add write or execute), not inherited by `fork`, not movable by `mremap`; `info` gets (pages, writable); a grant of more than `max_pages` pages (0: any) is refused with `E2BIG` before anything is mapped (`info` stored), so a service bounds what a client makes it map |
 | `grant_dma(channel, id, offset) -> device address` (1071) | of the byte at `offset` (`EINVAL` beyond the grant), valid to the end of its page |
 | `grant_dma_unmap(channel, id)` (1072) | the service's devices are done with the grant |
 | `chan_watch(channel, value)` (1073) | arms the service's doorbell watch on the submission ring: if its `tail` still holds `value` (else `EAGAIN`), the client's next doorbell or its end going makes `ipc_receive` return `Event::Doorbell` (step 3) |
@@ -474,8 +474,10 @@ the files through the kernel's inode bridge); both are gone, with the kernel's s
 - **No instance takes what the others need** (`procproto::admission`, host-tested): procfs
   charges before it takes. At most 2 channels per instance (the instance is the kernel's word
   in the offer) of 64 in all, so one instance leaves the others 62; at most 16 grants and 256
-  pages mapped per channel (a grant beyond is unmapped again, `ENOMEM`; the server grants one
-  scratch buffer of 16 pages); the memory of one answer at most 64 KiB whatever buffer a
+  pages mapped per channel (`grant_map` with the room left as `max_pages`: a larger grant is
+  refused before anything is mapped, `ENOMEM` for the request, and one larger than the whole
+  budget is remembered as refused until `FORGET`, so naming it again costs no kernel call; the
+  server grants one scratch buffer of 16 pages); the memory of one answer at most 64 KiB whatever buffer a
   request names (a listing goes on at its cursor); requests bounded by the rings and taken
   round-robin, a few per channel per round. Nothing else outlives a request: procfs keeps no
   snapshots (the server's open files do, in the instance's own memory).

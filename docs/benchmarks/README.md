@@ -45,7 +45,7 @@ the kernel and the servers:
 | counter | counted where |
 |---|---|
 | `syscalls` | every system call entry (`process/syscall.rs`), servers' included |
-| `ipc_calls`, `ipc_bytes` | requests the kernel sends to servers, and the bytes of requests and replies it copies (`process/ipc.rs`) |
+| `ipc_calls`, `ipc_bytes` | requests the kernel sends to servers, and the bytes of requests and replies it copies (`process/ipc.rs`): since I/O rings step 5 only channel offers, so 0 per operation for everything on the rings |
 | `address_space_switches` | page table root loads (`process/tlb.rs`) |
 | `user_copy_bytes` | bytes copied between kernel and user memory (`process/uaccess.rs`) |
 | `heap_allocs` | kernel heap allocations |

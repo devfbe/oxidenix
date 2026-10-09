@@ -707,15 +707,27 @@ no lock held but the description's offset, which the pager never takes.
 not read it: resolution goes to the open file itself (`procfs::follow`, Linux's
 `proc_fd_link`), as the last name its node (a tmpfs or `/data` inode, also unlinked; a
 terminal's, null's or an `O_PATH` descriptor's node, a file of the kernel's `/dev`), with
-names after it through the path the file was opened by. A file without a node (a pipe, a
-socket, an eventfd, inotify, epoll) is `ProcNode::Open`: its status is the file's, and
-opening it opens the file again where Linux does: a pipe gets a new end (`pipe::reopen`,
-reading, writing or both, as `fifo_open` of a pipe; bash's process substitution through
-`/dev/fd/N` uses it), everything else is ENXIO. `/dev/fd`, `/dev/stdin`, `/dev/stdout` and
+names after it through the path the file was opened by (a limit of the namespace, which
+resolves by path: Linux goes on from the directory itself, so a directory renamed or
+removed since its descriptor was opened differs; the descriptor's own node is reached only
+as the last name). A resolved symlink is opened only with `O_PATH` (ELOOP otherwise: an
+`O_PATH|O_NOFOLLOW` descriptor's symlink reached through `/proc/self/fd/N`). A file without a node (a pipe, a
+socket, an eventfd, inotify, epoll) is `ProcNode::Open`, which keeps nothing of the file
+alive that its last close should end (an `O_PATH` descriptor of it may outlive every real
+one): a pipe as the pipe itself, without an end, anything else as its status when it was
+reached. Opening it opens the file again where Linux does: a pipe gets a new end
+reading, writing or both, as `fifo_open` of a pipe, its readiness reported once its
+placeholder is installed; bash's process substitution through `/dev/fd/N` uses it),
+everything else is ENXIO. `/dev/fd`, `/dev/stdin`, `/dev/stdout` and
 `/dev/stderr` are links into `/proc/self/fd` (in the kernel's `/dev`, as udev makes them).
 Until the descriptor table and the process model are the server's, only a process's own
 `fd`, `cwd` and `root` are shown: another process's are EACCES (Linux's answer for another
-user's), its `fd` directory unopenable (mode 0500). `exe` is an ordinary link to the
+user's), its `fd` directory unopenable (mode 0500). "Own" is the caller's process (any of
+its threads' ids names it), and what `fd` lists is the calling thread's descriptor table in
+the kernel: the process's, unless a thread made its own with `clone` without
+`CLONE_FILES` (then `/proc/<pid>/fd` shows the caller's table, not the main thread's, as
+`/proc/thread-self/fd` would on Linux). A child after `fork` sees its own copy. R6e (the
+table in the server) and R8 (the process model) make this exact. `exe` is an ordinary link to the
 program's path.
 
 **The kernel** keeps no part of `/proc`: its static `/proc` of the early boot, its mount
