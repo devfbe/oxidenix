@@ -4,10 +4,27 @@
 failed=0
 fail() { echo "FAIL $1"; failed=$((failed + 1)); }
 
-for t in forktest sigtest jobtest cowtest fstest oomtest nettest smptest proctest vmtest futextest threadtest timetest timertest polltest eventfdtest sigmasktest epolltest mmaptest exectest cachetest writebacktest datatest lxtest libuvtest metatest inotifytest; do
+for t in forktest sigtest jobtest cowtest fstest oomtest nettest smptest proctest vmtest futextest threadtest timetest timertest polltest eventfdtest sigmasktest epolltest unixtest mmaptest exectest cachetest writebacktest datatest lxtest libuvtest metatest inotifytest; do
     echo "=== $t"
     if $t; then echo "PASS $t"; else fail "$t"; fi
 done
+
+# lxtest again, three times, its output into a pipe and beside a program
+# whose calls the server passes through to the kernel (reading /proc): its
+# checks hold in any run and whatever else runs.
+echo "=== lxtest x3 beside a busy reader"
+(while :; do cat /proc/counters /proc/self/stat > /dev/null; done) &
+busy=$!
+runs=0
+for i in 1 2 3; do
+    if lxtest | tee /tmp/lxtest.out | grep -v ' ok$'; [ "$(tail -n 1 /tmp/lxtest.out)" = "lxtest: all passed" ]; then
+        runs=$((runs + 1))
+    fi
+done
+kill $busy
+wait $busy 2>/dev/null
+rm -f /tmp/lxtest.out
+if [ $runs -eq 3 ]; then echo "PASS lxtest x3"; else fail "lxtest x3 ($runs of 3 passed)"; fi
 
 echo "=== mmaptest /data"
 if mmaptest /data; then echo "PASS mmaptest /data"; else fail "mmaptest /data"; fi
@@ -63,6 +80,11 @@ if [ "$(uname -s)" = oxidenix ]; then echo "PASS uname names the system oxidenix
 
 echo "=== server protection"
 if kill -9 1 2>/dev/null; then fail "a server could be killed from user space"; else echo "PASS servers are protected"; fi
+
+# The restart policy (ADR 0006) on the test service (ringtest), dying at
+# every use.
+echo "=== lxtest crashloop"
+if lxtest crashloop; then echo "PASS lxtest crashloop"; else fail "lxtest crashloop"; fi
 
 echo "=== summary: $failed failed"
 [ "$failed" -eq 0 ]

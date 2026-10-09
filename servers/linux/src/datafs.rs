@@ -510,6 +510,8 @@ pub enum New<'a> {
     File,
     Dir,
     Symlink(&'a str),
+    /// A socket's name (bind(2)).
+    Socket,
 }
 
 pub fn create(dir: &Arc<DInode>, name: &str, new: New, perm: u32) -> Result<Arc<DInode>, i64> {
@@ -522,6 +524,7 @@ pub fn create(dir: &Arc<DInode>, name: &str, new: New, perm: u32) -> Result<Arc<
     let kind = match new {
         New::File => Kind::File,
         New::Dir => Kind::Dir,
+        New::Socket => Kind::Socket,
         New::Symlink(target) => {
             if target.len() > fsring::TARGET_MAX as usize {
                 return Err(ENAMETOOLONG);
@@ -760,6 +763,7 @@ pub fn readdir(dir: &Arc<DInode>, cursor: u64) -> Result<(Vec<(u32, u8, Vec<u8>)
                 fsring::TYPE_DIR => 4,
                 fsring::TYPE_FILE => 8,
                 fsring::TYPE_SYMLINK => 10,
+                fsring::TYPE_SOCKET => 12,
                 _ => 0,
             };
             (ino, dtype, Vec::from(name))

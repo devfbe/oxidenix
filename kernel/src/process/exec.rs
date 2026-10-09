@@ -119,7 +119,7 @@ pub fn exec(frame: &mut Frame, path: &str, args: &[String], envs: &[String]) -> 
     me.group.sig.lock().reset_on_exec();
     // A new program gets no inherited hardware access.
     me.group.privileged.store(false, Ordering::Relaxed);
-    let (closed, old_mm, old_files) = with_current(|p| {
+    let (closed, old_mm, old_files, was_server) = with_current(|p| {
         // A Linux thread runs this in a legacy call, in the program's view.
         let server = p.linux.as_ref().is_some_and(|l| l.normal_view());
         tlb::switch(p.mm.as_ref().map(|m| &*m.tlb), Some(&mm.tlb), server);
@@ -129,13 +129,23 @@ pub fn exec(frame: &mut Frame, path: &str, args: &[String], envs: &[String]) -> 
             None => None,
         };
         p.io_bitmap = None;
-        p.server = None;
+        let was_server = p.server.take().is_some();
         p.copy_fixup = None;
         p.clear_child_tid = 0;
         crate::smp::cpu().tables().set_io_bitmap(None);
         let closed: Vec<FdEntry> = p.files.as_ref().map(|f| f.take_cloexec()).unwrap_or_default();
-        (closed, old_mm, old_files)
+        (closed, old_mm, old_files, was_server)
     });
+    if was_server {
+        // The server's program is gone: for the kernel that is its
+        // incarnation's end (the restart policy, ADR 0006), its services
+        // die (the new program gets none of their requests) and so do its
+        // interrupt lines, as when it exits.
+        let pid = me.tgid();
+        super::server_exited(pid);
+        super::ipc::on_exit(pid);
+        super::irq::on_exit(pid);
+    }
     drop(closed);
     drop(old_files);
     // The old address space is freed here (unless a vfork parent shares

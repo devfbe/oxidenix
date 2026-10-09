@@ -70,6 +70,7 @@ pub const S_IFMT: u32 = 0o170000;
 pub const S_IFDIR: u32 = 0o040000;
 pub const S_IFREG: u32 = 0o100000;
 pub const S_IFLNK: u32 = 0o120000;
+pub const S_IFSOCK: u32 = 0o140000;
 pub const NAME_MAX: usize = 255;
 const SECTOR_SIZE: usize = 512;
 
@@ -90,6 +91,9 @@ pub enum NewNode {
     File,
     Dir,
     Symlink(String),
+    /// A socket's name (bind(2) of an AF_UNIX socket): an inode without
+    /// data.
+    Socket,
 }
 
 pub const ROOT_INO: u32 = 2;
@@ -105,6 +109,7 @@ const CACHE_BYTES: usize = 1024 * 1024;
 
 const FT_REG: u8 = 1;
 const FT_DIR: u8 = 2;
+const FT_SOCK: u8 = 6;
 const FT_SYMLINK: u8 = 7;
 
 fn io(_: ()) -> i64 {
@@ -1429,6 +1434,11 @@ impl<D: Device> State<D> {
                 inode.set_size(target.len() as u64);
                 FT_SYMLINK
             }
+            NewNode::Socket => {
+                inode.set_mode((S_IFSOCK | perm & 0o7777) as u16);
+                inode.set_links(1);
+                FT_SOCK
+            }
         };
         self.write_inode(ino, &inode)?;
         self.dir_add(dir, name, ino, ftype)?;
@@ -1511,12 +1521,11 @@ impl<D: Device> State<D> {
             }
             self.unlink(ndir, nname, ex.is_dir())?;
         }
-        let ftype = if inode.is_dir() {
-            FT_DIR
-        } else if inode.mode() as u32 & S_IFMT == S_IFLNK {
-            FT_SYMLINK
-        } else {
-            FT_REG
+        let ftype = match inode.mode() as u32 & S_IFMT {
+            S_IFDIR => FT_DIR,
+            S_IFLNK => FT_SYMLINK,
+            S_IFSOCK => FT_SOCK,
+            _ => FT_REG,
         };
         self.dir_add(ndir, nname, ino, ftype)?;
         self.dir_remove(odir, oname)?;

@@ -159,6 +159,7 @@ pub fn clone(frame: &Frame, flags: u64, stack: u64, parent_tid: u64, child_tid: 
     let instance = mm.lock().instance().cloned();
     let linux = match instance {
         Some(instance) => {
+            group.instance.store(instance.id, core::sync::atomic::Ordering::Release);
             let (thread, start) = super::linux::LinuxThread::new(instance, &child_frame)?;
             child_frame = start;
             Some(thread)

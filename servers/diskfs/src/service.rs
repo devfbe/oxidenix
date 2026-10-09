@@ -1077,6 +1077,7 @@ impl Service {
                 let node = match kind {
                     NodeKind::File => NewNode::File,
                     NodeKind::Dir => NewNode::Dir,
+                    NodeKind::Socket => NewNode::Socket,
                     NodeKind::Symlink(target) => {
                         let g = self.grant(c, target.grant)?;
                         let bytes = g.copy_in(&target)?;

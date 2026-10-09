@@ -233,12 +233,61 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
      which holds the flags and the close-on-exec bit: `fcntl` and the generic ioctls
      `FIONBIO`, `FIOCLEX` and `FIONCLEX` (the server passes them through for its own files,
      too); they move with the table.
-7. **R7 — Sockets** into the server, talking to netd over rings. The first family is there
-   already: `NETLINK_ROUTE` sockets are the server's files (`netlink.rs`, messages in
-   `crates/netlink`), answered from netd's description of its interfaces (`netproto`'s
-   `Links`), which the kernel relays meanwhile (`net_links`, 1094), as it answers `fstat` of
-   its own descriptors for the server's `statx` (`kfd_stat`, 1093) until the descriptor table
-   moves (R6e). Both bridges go then.
+7. **R7 — Sockets** into the server, talking to netd over rings.
+   - **R7a — `AF_UNIX`** (done; `servers/linux/src/unix.rs`, `sockcalls.rs`, `scm.rs`):
+     stream, datagram and seqpacket sockets are files of the server, placeholders as pipes
+     are; `socket` and `socketpair` of the family come to the server (the others pass
+     through: `AF_INET` stays the kernel's and netd's until the rest of R7), and so does every
+     socket call on one of its descriptors. Names are socket inodes of the server's tmpfs and
+     of `/data` (ext2's socket type, `fsring`'s `KIND_SOCKET`), found by inode, or names of
+     the instance's abstract namespace. Linux's semantics as `net/unix/af_unix.c` has them:
+     messages charged to their sender until read (`SO_SNDBUF`, poll's quarter rule),
+     datagram queues holding back senders that are not their peer, connections made at once
+     and queued on the listener (backlog, `EAGAIN`), a closed end shutting the other down
+     with `ECONNRESET` for unread data, `EPIPE` with `SIGPIPE` unless `MSG_NOSIGNAL`
+     (`signal_thread`, 1102: signals are the kernel's until R8), `MSG_PEEK`, `MSG_WAITALL`,
+     `MSG_TRUNC`, `MSG_CTRUNC`, autobind, `SO_PASSCRED`/`SCM_CREDENTIALS` and `SO_PEERCRED`
+     (the ids from `thread_ids`, 1103), timeouts.
+
+     **Passing descriptors** (`SCM_RIGHTS`) while the descriptor table is still the kernel's:
+     a descriptor in flight is a handle on its open file description (`kfile_object`, 1029,
+     which takes any descriptor: a file of the kernel's, a socket of netd's or a placeholder
+     of the server's), kept by the message in the receiver's queue; the receiver gets a new
+     descriptor for the same description (`kfd_install_file`, 1100: shared offset and status
+     flags, close-on-exec with `MSG_CMSG_CLOEXEC`), and the handle goes. The handle keeps
+     the description alive after the sender closed its descriptor, and a message dropped
+     unread closes its handles (a placeholder's last reference gone is reported as its last
+     descriptor closed). The kernel needs no notion of sockets for this. Sockets that only
+     messages in flight keep (a socket in its own queue, a cycle of them) are found by a
+     collector as Linux's `unix_gc`: a socket in flight whose description has no reference
+     but its handles in flight (`kfile_info`, 1101) is a candidate, candidates referred to
+     from outside the candidates' queues and what they refer to are reachable, the rest have
+     their queues emptied. A call that uses one of the server's files keeps it referenced
+     until it returns (`kfd_lookup` pins it, as Linux's `fdget`), so a socket a call works on
+     is never a candidate, and another thread's close does not end a blocked receive or
+     accept; a lock the collector takes exclusively (making, installing and letting go of
+     descriptors in flight take it shared) keeps its view still while it runs. Handles of
+     descriptors in flight are marked (`KFILE_INFLIGHT`): when a descriptor of such a
+     placeholder goes (by close, exit or exec) or a call that pinned one ends, and what is
+     left are only its handles in flight, the kernel queues `EVENT_INFLIGHT` (after the
+     reference is gone, so the collector sees it gone), and the collector runs on the
+     instance's **worker** thread (`ROLE_WORKER`: a second thread of the pager's process
+     that serves neither a program nor a page). Never on the pager: the collector waits for
+     sockets' locks, and nothing may wait for the pager while it holds one; for the same
+     reason no server lock the pager takes is held while program memory is copied (a fault
+     there may need a page the pager brings): a receive copies with only its socket's (or
+     pipe's) receive lock held. The collector also runs on a sender's thread before it is
+     refused with `ETOOMANYREFS`: at most 16 Ki descriptors are in flight per user and in
+     the instance (a quarter of its handle table, which files and mappings need too), so
+     forks gain nothing.
+     `SCM_CREDENTIALS` may name only a process of the caller's tree (`thread_exists` with
+     `THREAD_IN_INSTANCE`). When the descriptor table moves into the server (R6e), the
+     handles become references in the server's own table and these calls go.
+   - **Netlink** (`NETLINK_ROUTE`): the server's files too (`netlink.rs`, messages in
+     `crates/netlink`), answered from netd's description of its interfaces (`netproto`'s
+     `Links`), which the kernel relays meanwhile (`net_links`, 1094), as it answers `fstat`
+     of its own descriptors for the server's `statx` (`kfd_stat`, 1093) until the descriptor
+     table moves (R6e). Both bridges go then.
 8. **R8 — Processes and signals**: pids, the process tree, `fork` (with the copy-on-write clone
    of memory objects), `exec`, `wait`, signals, job control, `/proc`'s data. The kernel's
    process model shrinks to processes and threads as containers. `thread_exists` (1090), with

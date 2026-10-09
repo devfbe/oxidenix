@@ -142,10 +142,13 @@ use errno::*;
 pub const KIND_FILE: u64 = 1;
 pub const KIND_DIR: u64 = 2;
 pub const KIND_SYMLINK: u64 = 3;
+/// A socket's name: an inode without data.
+pub const KIND_SOCKET: u64 = 4;
 
 /// Entry types in `READDIR` results (ext2's).
 pub const TYPE_FILE: u8 = 1;
 pub const TYPE_DIR: u8 = 2;
+pub const TYPE_SOCKET: u8 = 6;
 pub const TYPE_SYMLINK: u8 = 7;
 
 /// A byte range of a grant.
@@ -176,6 +179,7 @@ pub enum Kind {
     Dir,
     /// The target is in the grant, right after the name.
     Symlink(Buf),
+    Socket,
 }
 
 /// A request, validated (`decode`) or to be sent (`encode`).
@@ -265,6 +269,7 @@ impl Request {
                 let kind = match d.arg[0] {
                     KIND_FILE if target == 0 => Kind::File,
                     KIND_DIR if target == 0 => Kind::Dir,
+                    KIND_SOCKET if target == 0 => Kind::Socket,
                     KIND_SYMLINK if target == 0 => return Err(EINVAL),
                     KIND_SYMLINK if target > TARGET_MAX as u64 => return Err(ENAMETOOLONG),
                     KIND_SYMLINK => Kind::Symlink(buf.after(target)?),
@@ -370,6 +375,7 @@ impl Request {
                 d.arg = match kind {
                     Kind::File => [KIND_FILE, perm as u64, 0],
                     Kind::Dir => [KIND_DIR, perm as u64, 0],
+                    Kind::Socket => [KIND_SOCKET, perm as u64, 0],
                     Kind::Symlink(target) => [KIND_SYMLINK, perm as u64, target.len as u64],
                 };
             }

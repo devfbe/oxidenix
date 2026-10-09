@@ -19,6 +19,7 @@ fn every_request() -> Vec<Request> {
         Request::Lookup { dir: 2, name: buf(4, 100, NAME_MAX) },
         Request::Create { dir: 2, name: buf(4, 0, 5), kind: Kind::File, perm: 0o644 },
         Request::Create { dir: 2, name: buf(4, 0, 5), kind: Kind::Dir, perm: 0o7777 },
+        Request::Create { dir: 2, name: buf(4, 0, 5), kind: Kind::Socket, perm: 0o755 },
         Request::Create { dir: 2, name: buf(4, 10, 5), kind: Kind::Symlink(buf(4, 15, TARGET_MAX)), perm: 0 },
         Request::Unlink { dir: 2, name: buf(4, 0, 3), is_dir: true },
         Request::Rename { from: 2, name: buf(4, 0, 3), to: 11, new_name: buf(4, 3, 9) },
@@ -147,8 +148,9 @@ fn names_and_targets_are_bounded() {
     // The target follows the name: it must stay addressable in the grant.
     let d = Desc { op: op::CREATE, object: 2, grant: 1, buf_off: u32::MAX - 1, len: 3, arg: [KIND_SYMLINK, 0, 1], ..Desc::default() };
     assert_eq!(Request::decode(&d), Err(EINVAL));
-    // A file or directory has no target; kinds and permissions are known.
-    for arg in [[KIND_FILE, 0, 1], [KIND_DIR, 0, 1], [0, 0, 0], [4, 0, 0], [KIND_FILE, 0o10000, 0]] {
+    // A file, directory or socket has no target; kinds and permissions
+    // are known.
+    for arg in [[KIND_FILE, 0, 1], [KIND_DIR, 0, 1], [KIND_SOCKET, 0, 1], [0, 0, 0], [5, 0, 0], [KIND_FILE, 0o10000, 0]] {
         let d = Desc { op: op::CREATE, object: 2, grant: 1, len: 3, arg, ..Desc::default() };
         assert_eq!(Request::decode(&d), Err(EINVAL), "{arg:?}");
     }

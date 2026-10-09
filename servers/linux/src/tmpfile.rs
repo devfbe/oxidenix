@@ -45,6 +45,11 @@ impl Drop for TmpOpen {
 
 /// open(2) of a resolved tmpfs inode: a descriptor of the calling process.
 pub fn open(inode: Arc<Inode>, flags: u32, path: String) -> Result<i64, i64> {
+    const ENXIO: i64 = 6;
+    // A socket is connected to, not opened.
+    if inode.mode() & vfs::S_IFMT == vfs::S_IFSOCK {
+        return Err(ENXIO);
+    }
     let writable = flags & O_ACCMODE != 0;
     let dir = inode.is_dir();
     if dir && writable {

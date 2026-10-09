@@ -86,6 +86,7 @@ fn process(pid: Pid) -> Result<Process, i64> {
         threads: info.threads.len() as u64,
         cpu: info.threads.first().map_or(0, |t| t.last_cpu.load(Ordering::Relaxed)) as u64,
         flags: 0,
+        legacy_calls: g.legacy_calls.load(Ordering::Relaxed),
         name: [0; 16],
     };
     if g.privileged.load(Ordering::Relaxed) {

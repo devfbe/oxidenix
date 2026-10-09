@@ -6,9 +6,11 @@
 //!
 //! The crate holds no lock and allocates nothing itself: the caller keeps
 //! one `FreeList` per class behind its own lock (the kernel's interrupt-safe
-//! spinlocks, the Linux server's futex mutex), takes slabs from its backing
-//! allocator, which also serves larger objects, and never gives slabs back
-//! (a slab's slots stay its class's).
+//! spinlocks, the Linux server's futex mutex) and takes slabs from its
+//! backing allocator, which also serves larger objects. Slabs whose slots
+//! are all free go back to it with `reclaim` (before it grows), so a
+//! workload that once needed many objects of one size does not keep that
+//! memory from all others.
 //!
 //! Slots are aligned to their size (a power of two dividing the slab), so a
 //! class serves every layout whose size and alignment fit it.
@@ -102,6 +104,105 @@ impl FreeList {
         for i in (0..SLAB_SIZE / size).rev() {
             unsafe { self.push(NonNull::new_unchecked(slab.as_ptr().add(i * size))) };
         }
+    }
+
+    /// Gives back the slabs of class `c` whose slots are all free: each is
+    /// taken off the list and handed to `give` (for the backing allocator).
+    /// Returns how many. The list is sorted by address first (a merge sort
+    /// of the links, in place: nothing is allocated), so a slab's free slots
+    /// lie together; O(n log n) in the free slots, for when the backing
+    /// allocator would otherwise have to grow. What stays is in address
+    /// order.
+    pub fn reclaim(&mut self, c: usize, mut give: impl FnMut(NonNull<u8>)) -> usize {
+        let per = SLAB_SIZE / class_size(c);
+        self.head = unsafe { sort(self.head) };
+        let slab_of = |n: NonNull<Node>| n.as_ptr() as usize & !(SLAB_SIZE - 1);
+        let mut given = 0;
+        // `link` is where the run being looked at hangs: the list's head or
+        // the last kept node's `next`.
+        let mut link: *mut Option<NonNull<Node>> = &mut self.head;
+        unsafe {
+            while let Some(first) = *link {
+                let slab = slab_of(first);
+                let mut count = 1;
+                let mut last = first;
+                while let Some(next) = last.as_ref().next.filter(|&n| slab_of(n) == slab) {
+                    count += 1;
+                    last = next;
+                }
+                let after = last.as_ref().next;
+                if count == per {
+                    *link = after;
+                    self.len -= per;
+                    give(NonNull::new_unchecked(slab as *mut u8));
+                    given += 1;
+                } else {
+                    link = &mut (*last.as_ptr()).next;
+                }
+            }
+        }
+        given
+    }
+}
+
+/// Sorts a list by address (Simon Tatham's bottom-up merge sort of a
+/// singly linked list: no recursion, no allocation).
+///
+/// # Safety
+/// Every node on the list is a free slot of the caller's list.
+unsafe fn sort(mut list: Option<NonNull<Node>>) -> Option<NonNull<Node>> {
+    let mut width = 1usize;
+    loop {
+        let mut p = list;
+        list = None;
+        let mut tail: Option<NonNull<Node>> = None;
+        let mut merges = 0;
+        while let Some(start) = p {
+            merges += 1;
+            // Two runs of up to `width` nodes: from `p` and from `q`.
+            let mut q = Some(start);
+            let mut psize = 0;
+            while psize < width {
+                psize += 1;
+                q = q.and_then(|n| unsafe { n.as_ref().next });
+                if q.is_none() {
+                    break;
+                }
+            }
+            let mut qsize = width;
+            let mut p_at = Some(start);
+            while psize > 0 || (qsize > 0 && q.is_some()) {
+                let take_p = match (psize > 0, qsize > 0 && q.is_some()) {
+                    (true, false) => true,
+                    (false, _) => false,
+                    (true, true) => p_at.map(|n| n.as_ptr() as usize) <= q.map(|n| n.as_ptr() as usize),
+                };
+                let e = if take_p {
+                    let e = p_at.expect("counted");
+                    p_at = unsafe { e.as_ref().next };
+                    psize -= 1;
+                    e
+                } else {
+                    let e = q.expect("checked");
+                    q = unsafe { e.as_ref().next };
+                    qsize -= 1;
+                    e
+                };
+                match tail {
+                    Some(t) => unsafe { (*t.as_ptr()).next = Some(e) },
+                    None => list = Some(e),
+                }
+                tail = Some(e);
+            }
+            p = q;
+        }
+        if let Some(t) = tail {
+            unsafe { (*t.as_ptr()).next = None };
+        }
+        if merges <= 1 {
+            return list;
+        }
+        width *= 2;
     }
 }
 

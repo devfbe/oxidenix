@@ -31,12 +31,16 @@ mod paths;
 mod pipe;
 mod records;
 mod sched;
+mod scm;
+mod sockcalls;
 mod sync;
 mod time;
 mod tmpfile;
 mod tmpfs;
+mod unix;
 mod usercopy;
 
+use alloc::collections::BTreeMap;
 use core::sync::atomic::{AtomicU64, Ordering};
 use restricted::*;
 
@@ -44,6 +48,7 @@ use restricted::*;
 static HEAP: heap::ServerHeap = heap::ServerHeap::new();
 
 const PAGE: u64 = 4096;
+const ENOSPC: i64 = 28;
 const ENOSYS: i64 = 38;
 const PROT_READ: u64 = 1;
 const PROT_RW: u64 = 3;
@@ -78,12 +83,15 @@ pub extern "C" fn _start(state: *mut State, role: u64) -> ! {
     if role == ROLE_PAGER {
         pager();
     }
+    if role == ROLE_WORKER {
+        scm::worker();
+    }
     loop {
         if call0(SYS_RESTRICTED_ENTER) as u64 != REASON_SYSCALL {
             continue;
         }
         let s = unsafe { &mut *state };
-        if let Some(result) = mm::handle(s).or_else(|| time::handle(s)).or_else(|| files::handle(s)).or_else(|| paths::handle(s)).or_else(|| sched::handle(s)).or_else(|| ids::handle(s)) {
+        if let Some(result) = mm::handle(s).or_else(|| time::handle(s)).or_else(|| files::handle(s)).or_else(|| paths::handle(s)).or_else(|| sched::handle(s)).or_else(|| ids::handle(s)).or_else(|| sockcalls::handle(s)) {
             s.rax = result as u64;
             // /data inodes the call let go of go now, before it returns
             // (an unlink's blocks are free when it returns).
@@ -92,24 +100,32 @@ pub extern "C" fn _start(state: *mut State, role: u64) -> ! {
         }
         match s.rax {
             TEST_MAP..=TEST_CACHED => s.rax = test(s.rax, s.rdi) as u64,
-            nr if nr >= FIRST_NON_LINUX => s.rax = -ENOSYS as u64,
+            TEST_PASS_THROUGH => {
+                const SYS_GETPID: u64 = 39;
+                s.rax = SYS_GETPID;
+                pass_through(s);
+            }
             // Not offered, as by a Linux built without io_uring: libuv (and
             // so Node.js) probes io_uring_setup at start and uses epoll
             // instead. Answered here, so the kernel does not log them as
             // unknown calls.
             SYS_IO_URING_SETUP | SYS_IO_URING_ENTER | SYS_IO_URING_REGISTER => s.rax = -ENOSYS as u64,
-            _ => {
-                records::before_pass_through(s);
-                // Server files the call closed for good go at once.
-                let mut closed = [0u64; 16];
-                let n = syscall(SYS_LEGACY_SYSCALL, [closed.as_mut_ptr() as u64, closed.len() as u64, 0, 0, 0, 0]);
-                for &id in closed.iter().take(n.max(0) as usize) {
-                    files::closed(id);
-                }
-                datafs::reap();
-            }
+            nr if nr >= FIRST_NON_LINUX => s.rax = -ENOSYS as u64,
+            _ => pass_through(s),
         }
     }
+}
+
+/// Passes the program's call through to the kernel's Linux implementation.
+fn pass_through(s: &State) {
+    records::before_pass_through(s);
+    // Server files the call closed for good go at once.
+    let mut closed = [0u64; 16];
+    let n = syscall(SYS_LEGACY_SYSCALL, [closed.as_mut_ptr() as u64, closed.len() as u64, 0, 0, 0, 0]);
+    for &id in closed.iter().take(n.max(0) as usize) {
+        files::closed(id);
+    }
+    datafs::reap();
 }
 
 /// A page request of an `EVENT_PAGE`.
@@ -123,11 +139,19 @@ static TEST_OBJECT: AtomicU64 = AtomicU64::new(0);
 /// The paged object of TEST_PAGED, and how many pages the pager supplied.
 static TEST_PAGED_OBJECT: AtomicU64 = AtomicU64::new(0);
 static SUPPLIED: AtomicU64 = AtomicU64::new(0);
-/// The key the test's paged object goes by; +1: never answered; +2:
-/// failed once, then answered.
+/// The key the test's paged object goes by; +1: never answered.
 const TEST_KEY: u64 = 0x7e57;
-static TEST_FAIL_OBJECT: AtomicU64 = AtomicU64::new(0);
-static FAILED_ONCE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+/// The keys of TEST_PAGED_FAIL's objects, one of its own each, from here
+/// up (below `datafs::KEY_BASE`).
+const FAIL_KEY_BASE: u64 = 1 << 31;
+static NEXT_FAIL_KEY: AtomicU64 = AtomicU64::new(FAIL_KEY_BASE);
+/// TEST_PAGED_FAIL's objects by key: the handle, and whether the pager
+/// failed the object's first request yet. Each object fails once (every
+/// run of the test, not only the instance's first), and a request is
+/// answered from its own object. They stay for the instance (a page each,
+/// and only the tests make them), so no handle is ever closed and reused
+/// under a request in flight.
+static FAIL_OBJECTS: sync::Mutex<BTreeMap<u64, (u64, bool)>> = sync::Mutex::new(BTreeMap::new());
 
 /// The instance's service thread (the pager thread): supplies the pages
 /// threads wait for (/data's from the disk, `datafs`; the tests' paged
@@ -179,6 +203,15 @@ fn pager() -> ! {
                 datafs::closing();
                 continue;
             }
+            EVENT_INFLIGHT => {
+                // A socket in flight lost its last way in but messages (a
+                // descriptor closed, by close, exit or exec, or a call that
+                // used one ended): the worker collects. Never here: the
+                // collector waits for sockets' locks, and a thread holding
+                // one may wait for a page this thread brings.
+                scm::request();
+                continue;
+            }
             EVENT_MKWRITE => {
                 datafs::mkwrite(event.a, event.b);
                 continue;
@@ -197,9 +230,11 @@ fn pager() -> ! {
             datafs::page(request.key, request.offset);
             continue;
         }
-        if request.key == TEST_KEY + 2 {
-            let handle = TEST_FAIL_OBJECT.load(Ordering::Acquire);
-            if !FAILED_ONCE.swap(true, Ordering::Relaxed) {
+        if (FAIL_KEY_BASE..datafs::KEY_BASE).contains(&request.key) {
+            let Some((handle, failed)) = FAIL_OBJECTS.lock().get_mut(&request.key).map(|o| (o.0, core::mem::replace(&mut o.1, true))) else {
+                continue;
+            };
+            if !failed {
                 syscall(SYS_MO_FAIL, [handle, request.offset, 0, 0, 0, 0]);
             } else {
                 let text = b"retry";
@@ -300,11 +335,16 @@ fn test(nr: u64, addr: u64) -> i64 {
         }
         TEST_SUPPLIED => SUPPLIED.load(Ordering::Relaxed) as i64,
         TEST_PAGED_FAIL => {
-            let h = syscall(SYS_MO_CREATE_PAGED, [1, TEST_KEY + 2, 0, 0, 0, 0]);
+            let key = NEXT_FAIL_KEY.fetch_add(1, Ordering::Relaxed);
+            if key >= datafs::KEY_BASE {
+                return -ENOSPC;
+            }
+            let h = syscall(SYS_MO_CREATE_PAGED, [1, key, 0, 0, 0, 0]);
             if h < 0 {
                 return h;
             }
-            TEST_FAIL_OBJECT.store(h as u64, Ordering::Release);
+            // Known before it is mapped, so before any request for it.
+            FAIL_OBJECTS.lock().insert(key, (h as u64, false));
             let r = syscall(SYS_MO_MAP, [h as u64, addr, PAGE, 0, PROT_READ, MO_SHARED | MO_FIXED]);
             if r < 0 { r } else { 0 }
         }
@@ -313,7 +353,7 @@ fn test(nr: u64, addr: u64) -> i64 {
         TEST_DISKRING => disktest::run(addr),
         TEST_CACHED => datafs::test(addr),
         TEST_FS_VALUE => records::test_value(addr),
-        TEST_FS_RECORDS => records::live(),
+        TEST_FS_RECORDS => records::test_records(addr != 0),
         TEST_USERCOPY => match usercopy::to_program(addr, b"usercopy") {
             Ok(()) => 0,
             Err(e) => -e,

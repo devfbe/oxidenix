@@ -157,6 +157,15 @@ pub struct ThreadGroup {
     /// Sequence number of the live arming of the interval timer (0: off),
     /// changed under `sig`.
     pub alarm_seq: AtomicU64,
+    /// The id of the Linux server instance whose tree the process belongs
+    /// to (`linux::Instance::id`; 0: none, a server of the kernel's or the
+    /// instance's pager). Set when its first thread is made.
+    pub instance: AtomicU64,
+    /// Linux system calls of this process the Linux server passed back to
+    /// the kernel (`linux::legacy`): the process's share of the counter in
+    /// `/proc/counters`, which `/proc/<pid>/counters` shows, so that a
+    /// program can count its own calls whatever else runs.
+    pub legacy_calls: AtomicU64,
 }
 
 impl ThreadGroup {
@@ -168,6 +177,8 @@ impl ThreadGroup {
             info: IrqSpinLock::new(info),
             sig: IrqSpinLock::new(sig),
             alarm_seq: AtomicU64::new(0),
+            instance: AtomicU64::new(0),
+            legacy_calls: AtomicU64::new(0),
         })
         .ok()
     }
@@ -217,7 +228,7 @@ impl Files {
     }
 
     pub fn get(&self, fd: u64) -> Result<Arc<OpenFile>, i64> {
-        self.fds.lock().get(fd as usize).and_then(|e| e.as_ref()).map(|e| e.file.clone()).ok_or(super::errno::EBADF)
+        self.fds.lock().get(fd as usize).and_then(|e| e.as_ref()).map(|e| e.file().clone()).ok_or(super::errno::EBADF)
     }
 
     /// Installs `file` at the lowest free descriptor >= `min`.
@@ -229,7 +240,7 @@ impl Files {
             fds.try_reserve(more).map_err(|_| super::errno::ENOMEM)?;
             fds.resize(fd + 1, None);
         }
-        fds[fd] = Some(FdEntry { file, cloexec });
+        fds[fd] = Some(FdEntry::new(file, cloexec));
         Ok(fd as i64)
     }
 

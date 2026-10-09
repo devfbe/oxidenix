@@ -106,3 +106,85 @@ fn many_allocations_and_frees_keep_contents() {
         unsafe { dealloc(page.as_ptr(), Layout::from_size_align(SLAB_SIZE, SLAB_SIZE).unwrap()) };
     }
 }
+
+/// A workload that once needed many slots of a class must not keep their
+/// slabs from everything else for good: `reclaim` gives back exactly the
+/// slabs whose slots are all free, whatever order they were freed in, and
+/// the list stays usable.
+#[test]
+fn reclaim_gives_back_slabs_whose_slots_are_all_free() {
+    for c in 0..CLASSES {
+        let per = SLAB_SIZE / class_size(c);
+        let pages: Vec<NonNull<u8>> = (0..6).map(|_| slab_page()).collect();
+        let mut list = FreeList::new();
+        for &p in &pages {
+            unsafe { list.add_slab(p, c) };
+        }
+        let mut taken: Vec<NonNull<u8>> = std::iter::from_fn(|| list.pop()).collect();
+        assert_eq!(taken.len(), 6 * per);
+        // Free them in a scrambled order, except one slot of slab 1 and
+        // one of slab 4.
+        let keep: Vec<usize> = [1usize, 4].iter().map(|&s| pages[s].as_ptr() as usize).collect();
+        let mut kept = Vec::new();
+        let mut i = 0usize;
+        while !taken.is_empty() {
+            i = (i * 7919 + 13) % taken.len();
+            let p = taken.swap_remove(i);
+            let slab = p.as_ptr() as usize & !(SLAB_SIZE - 1);
+            if keep.contains(&slab) && !kept.iter().any(|k: &NonNull<u8>| k.as_ptr() as usize & !(SLAB_SIZE - 1) == slab) {
+                kept.push(p);
+                continue;
+            }
+            unsafe { list.push(p) };
+        }
+        let mut given = Vec::new();
+        let n = list.reclaim(c, |s| given.push(s.as_ptr() as usize));
+        given.sort();
+        let mut want: Vec<usize> = [0usize, 2, 3, 5].iter().map(|&s| pages[s].as_ptr() as usize).collect();
+        want.sort();
+        assert_eq!((n, given), (4, want), "class {}", class_size(c));
+        // What is left: the two slabs in use, less their kept slots.
+        assert_eq!(list.len(), 2 * per - 2);
+        let mut left = HashSet::new();
+        while let Some(p) = list.pop() {
+            assert!(keep.contains(&(p.as_ptr() as usize & !(SLAB_SIZE - 1))));
+            assert!(left.insert(p.as_ptr() as usize));
+        }
+        assert_eq!(left.len(), 2 * per - 2);
+        for p in pages {
+            unsafe { dealloc(p.as_ptr(), Layout::from_size_align(SLAB_SIZE, SLAB_SIZE).unwrap()) };
+        }
+    }
+}
+
+/// Many slabs, every slot free in a scrambled order: all go back, and an
+/// empty list or one without a whole slab gives nothing.
+#[test]
+fn reclaim_sorts_long_lists() {
+    let pages: Vec<NonNull<u8>> = (0..64).map(|_| slab_page()).collect();
+    let mut list = FreeList::new();
+    assert_eq!(list.reclaim(0, |_| panic!("nothing to give")), 0);
+    for &p in &pages {
+        unsafe { list.add_slab(p, 0) };
+    }
+    let mut taken: Vec<NonNull<u8>> = std::iter::from_fn(|| list.pop()).collect();
+    let mut i = 0usize;
+    let mut last = None;
+    while !taken.is_empty() {
+        i = (i * 7919 + 13) % taken.len();
+        let p = taken.swap_remove(i);
+        if last.is_none() {
+            // One slot stays in use for the first round.
+            last = Some(p);
+            continue;
+        }
+        unsafe { list.push(p) };
+    }
+    assert_eq!(list.reclaim(0, |_| {}), 63);
+    unsafe { list.push(last.unwrap()) };
+    assert_eq!(list.reclaim(0, |_| {}), 1);
+    assert_eq!(list.len(), 0);
+    for p in pages {
+        unsafe { dealloc(p.as_ptr(), Layout::from_size_align(SLAB_SIZE, SLAB_SIZE).unwrap()) };
+    }
+}

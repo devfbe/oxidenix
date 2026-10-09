@@ -371,7 +371,7 @@ pub fn dup3(old: u64, new: u64, flags: u64, allow_same: bool) -> SysResult {
         return Err(EBADF);
     }
     let cloexec = flags as u32 & O_CLOEXEC != 0;
-    let replaced = current_files()?.replace(new, FdEntry { file: f, cloexec })?;
+    let replaced = current_files()?.replace(new, FdEntry::new(f, cloexec))?;
     // Closed only here, after the table's lock.
     drop(replaced);
     Ok(new as i64)

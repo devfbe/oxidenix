@@ -177,6 +177,12 @@ extern "sysv64" fn dispatch(f: &mut Frame) {
                 restricted::SYS_LEGACY_SYSCALL => super::linux::legacy(f.rdi, f.rsi).map(Some),
                 nr => super::linux::server_call(nr, [f.rdi, f.rsi, f.rdx, f.r10, f.r8, f.r9]).map(|v| Some(v as u64)),
             };
+            // A service thread (the worker; the pager ends its process
+            // itself) never enters a program, where a dying thread ends:
+            // it ends at its next call once its process exits.
+            if super::linux::is_pager() && signal::dying() {
+                super::exit::exit_thread(0);
+            }
             match result {
                 Ok(None) => unreachable!("restricted_enter returns above"),
                 Ok(Some(v)) => {
