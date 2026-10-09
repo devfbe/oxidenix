@@ -312,7 +312,7 @@ fn test(nr: u64, addr: u64) -> i64 {
         TEST_DISKRING => disktest::run(addr),
         TEST_CACHED => datafs::test(addr),
         TEST_FS_VALUE => records::test_value(addr),
-        TEST_FS_RECORDS => records::live(),
+        TEST_FS_RECORDS => records::test_records(addr != 0),
         TEST_USERCOPY => match usercopy::to_program(addr, b"usercopy") {
             Ok(()) => 0,
             Err(e) => -e,

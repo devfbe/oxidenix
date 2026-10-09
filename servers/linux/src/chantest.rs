@@ -14,6 +14,7 @@ const PAGE: u64 = 4096;
 /// How long a request may take before the test fails instead of hanging.
 const TIMEOUT: u64 = 5_000_000_000;
 const ENOENT: i64 = 2;
+const EIO: i64 = 5;
 const EBUSY: i64 = 16;
 const EINVAL: i64 = 22;
 const EACCES: i64 = 13;
@@ -170,6 +171,7 @@ pub fn run(scenario: u64) -> i64 {
         5 => service_death(),
         6 => service_exec(),
         7 => attached_without_answer(),
+        8 => crash_loop(),
         _ => Err(1000),
     };
     match result {
@@ -342,6 +344,32 @@ fn service_death() -> Result<(), i64> {
     drop(c);
     let mut c = Client::open().map_err(|_| 98)?;
     check!(99, c.status(ECHO, 0, 0, 0, 1) == 2);
+    close(obj);
+    Ok(())
+}
+
+/// The service dies at once every time it is used (a crash loop): the
+/// kernel restarts it a few times in a row (MAX_EARLY_RESTARTS, one more if
+/// the incarnation before had lived long), then gives up on it for good
+/// (EIO). It stays dead afterwards: run this last.
+fn crash_loop() -> Result<(), i64> {
+    let obj = object(1, |_| b'k').map_err(|_| 130)?;
+    let mut cycles = 0;
+    let refused = loop {
+        let mut c = match Client::open() {
+            Ok(c) => c,
+            Err(e) => break e,
+        };
+        check!(131, cycles < 10);
+        let ro = c.grant(obj, 0, 1, 0);
+        check!(132, ro > 0 && c.call(CRASH, ro, 0, 0, 0) == Err(-EPIPE));
+        cycles += 1;
+    };
+    // The live incarnation and its restarts: 5 after it, or 6 if it had
+    // lived long; at most one young death before counts (the restart
+    // after the exec scenario's).
+    check!(133, refused == -EIO && (5..=7).contains(&cycles));
+    check!(134, Client::open().err() == Some(-EIO));
     close(obj);
     Ok(())
 }

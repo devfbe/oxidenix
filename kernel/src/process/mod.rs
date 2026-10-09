@@ -409,7 +409,8 @@ pub struct Server {
     /// How long a (re)started server may take to register its service,
     /// in nanoseconds.
     start_timeout: u64,
-    restarts: core::sync::atomic::AtomicU32,
+    /// Its incarnations so far, to tell a crash loop from deaths far apart.
+    lives: spin::Mutex<Lives>,
     restarting: core::sync::atomic::AtomicBool,
     /// Where its devices reach the pages granted to it (channels).
     pub domain: channel::DmaDomain,
@@ -428,8 +429,33 @@ pub fn server_named(name: &str) -> Option<Arc<Server>> {
     SERVERS.lock().iter().find(|s| s.name == name).cloned()
 }
 
-/// How often a dead server is restarted before the kernel gives up on it.
-const MAX_RESTARTS: u32 = 5;
+/// How often in a row a server that died young is restarted before the
+/// kernel gives up on it: a crash loop (a server that cannot start, or
+/// dies at once whenever it is used) would otherwise cost a start, and its
+/// clients a wait, at every use for ever.
+const MAX_EARLY_RESTARTS: u32 = 5;
+/// The life after which a server's death no longer counts towards a crash
+/// loop: it started and served. Deaths that far apart (a server killed
+/// now and then, as each lxtest run kills ringtest twice, some 1.5 s
+/// apart) are each restarted, however many there are over the uptime; a
+/// server dying faster (a crash loop lives milliseconds) is given up on.
+/// A server that dies at every use is given up on if its clients come back
+/// within that time; if they come more slowly, it is restarted at their
+/// pace, at most twice a second.
+const STABLE_LIFE: u64 = crate::time::NSEC_PER_SEC / 2;
+
+/// A server's incarnations (`Server::revive`).
+#[derive(Default)]
+struct Lives {
+    /// When the running incarnation registered its service (nanoseconds
+    /// since boot); None if it never did.
+    up_since: Option<u64>,
+    /// Restarts in a row of an incarnation that lived shorter than
+    /// STABLE_LIFE (or never registered).
+    early: u32,
+    /// A crash loop: the kernel gave up on the server, it stays dead.
+    given_up: bool,
+}
 
 impl Server {
     pub fn load(name: &'static str, path: &'static str) -> Result<Server, i64> {
@@ -448,7 +474,7 @@ impl Server {
             dma: spin::Mutex::new(None),
             args: Vec::new(),
             start_timeout: 3 * crate::time::NSEC_PER_SEC,
-            restarts: core::sync::atomic::AtomicU32::new(0),
+            lives: spin::Mutex::new(Lives::default()),
             restarting: core::sync::atomic::AtomicBool::new(false),
             domain: channel::DmaDomain::default(),
             doorbell: Arc::new(core::sync::atomic::AtomicBool::new(false)),
@@ -463,13 +489,21 @@ impl Server {
                 servers.push(self.clone());
             }
         }
+        self.lives.lock().up_since = None;
         spawn_server(self)?;
-        ipc::wait_for(self.name, self.start_timeout).ok_or(EIO)
+        let service = ipc::wait_for(self.name, self.start_timeout).ok_or(EIO)?;
+        self.lives.lock().up_since = Some(crate::time::now());
+        Ok(service)
     }
 
     /// The server's service, restarting the server if it died. The first
     /// caller restarts it, concurrent callers wait for the registration.
-    /// After MAX_RESTARTS restarts the server stays dead (EIO).
+    ///
+    /// A crash loop ends it: after MAX_EARLY_RESTARTS restarts in a row of
+    /// a server that died within STABLE_LIFE of its start (or never came
+    /// up), it stays dead (EIO). A death is noticed here, at the next use,
+    /// so a life is measured up to then: a server nobody uses may have
+    /// died young unnoticed, but then its restarts cost nothing either.
     pub fn revive(self: &Arc<Self>) -> Result<(usize, u64), i64> {
         if let Some(found) = ipc::lookup(self.name) {
             return Ok(found);
@@ -477,13 +511,32 @@ impl Server {
         if self.restarting.swap(true, Ordering::Relaxed) {
             return ipc::wait_for(self.name, self.start_timeout).ok_or(EIO);
         }
-        let attempt = self.restarts.fetch_add(1, Ordering::Relaxed) + 1;
-        let result = if attempt > MAX_RESTARTS {
-            Err(EIO)
-        } else {
-            crate::printkln!("[kernel] {} died; restarting it (attempt {} of {})", self.name, attempt, MAX_RESTARTS);
-            self.start()
+        let admitted = {
+            let mut lives = self.lives.lock();
+            let lived = lives.up_since.map(|since| crate::time::now().saturating_sub(since));
+            if lives.given_up {
+                false
+            } else if lived.is_some_and(|ns| ns >= STABLE_LIFE) {
+                lives.early = 0;
+                crate::printkln!("[kernel] {} died (up {} ms); restarting it", self.name, lived.unwrap_or(0) / 1_000_000);
+                true
+            } else if lives.early < MAX_EARLY_RESTARTS {
+                lives.early += 1;
+                crate::printkln!(
+                    "[kernel] {} died young (up {} ms); restarting it ({} of {} in a row)",
+                    self.name,
+                    lived.unwrap_or(0) / 1_000_000,
+                    lives.early,
+                    MAX_EARLY_RESTARTS
+                );
+                true
+            } else {
+                lives.given_up = true;
+                crate::printkln!("[kernel] {} keeps dying young (a crash loop); giving up on it", self.name);
+                false
+            }
         };
+        let result = if admitted { self.start() } else { Err(EIO) };
         self.restarting.store(false, Ordering::Relaxed);
         result
     }

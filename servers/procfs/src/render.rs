@@ -216,3 +216,10 @@ pub fn counters(c: &procproto::Counters) -> String {
     }
     out
 }
+
+/// /proc/<pid>/counters (oxidenix's own): the counters of /proc/counters
+/// the kernel keeps per process, in the same format, so that a program can
+/// measure its own calls while others run.
+pub fn pid_counters(p: &Process) -> String {
+    alloc::format!("legacy_calls {}\n", p.legacy_calls)
+}

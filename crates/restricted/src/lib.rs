@@ -346,7 +346,8 @@ pub const FS_CHILD: u64 = 2;
 /// `(value)`: sets the test value of the caller's record (0: leaves it);
 /// returns it.
 pub const TEST_FS_VALUE: u64 = 1512;
-/// `()`: how many records the instance holds.
+/// `(watch)`: nonzero: watches the caller's record; 0: how many watched
+/// records the kernel still holds (released ones are forgotten).
 pub const TEST_FS_RECORDS: u64 = 1513;
 
 // The kernel's tree through handles (phase R6c.2b): until the server's own
@@ -595,8 +596,8 @@ pub const SYS_THREAD_EXISTS: u64 = 1090;
 /// service (servers/ringtest, `ring::selftest`): 1 rings and doorbells, 2
 /// grants and their bounds, 3 revoking, 4 the client's end going, 5 the
 /// service dying, 6 the service executing a new program, 7 a service that
-/// attaches but answers late. 0 if every
-/// check held, else the negative number of the first that failed.
+/// attaches but answers late, 8 a service in a crash loop given up on
+/// (which leaves it dead). 0 if every check held, else the negative number of the first that failed.
 pub const TEST_CHANNEL: u64 = 1514;
 /// `(scenario)`: the server runs a scenario of the file protocol
 /// (`fsring`) against diskfs over a channel: 1 reading a file of the disk

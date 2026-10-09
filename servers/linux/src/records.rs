@@ -20,8 +20,8 @@
 use crate::sync::Mutex;
 use crate::syscall;
 use alloc::string::String;
-use alloc::sync::Arc;
-use core::sync::atomic::{AtomicU64, Ordering};
+use alloc::sync::{Arc, Weak};
+use alloc::vec::Vec;
 use restricted::*;
 
 pub struct FsState {
@@ -35,9 +35,6 @@ pub struct FsContext {
     pub state: Mutex<FsState>,
 }
 
-/// Records the kernel holds, for the tests.
-static LIVE: AtomicU64 = AtomicU64::new(0);
-
 const SYS_CLONE: u64 = 56;
 const SYS_FORK: u64 = 57;
 const SYS_VFORK: u64 = 58;
@@ -45,7 +42,6 @@ const CLONE_FS: u64 = 0x200;
 
 /// Hands a record to the kernel: one strong reference it holds.
 fn give(context: Arc<FsContext>) -> u64 {
-    LIVE.fetch_add(1, Ordering::Relaxed);
     Arc::into_raw(context) as u64
 }
 
@@ -98,7 +94,6 @@ pub fn before_pass_through(s: &State) {
 
 /// `EVENT_RELEASE`: the kernel's reference goes.
 pub fn released(word: u64) {
-    LIVE.fetch_sub(1, Ordering::Relaxed);
     drop(unsafe { Arc::from_raw(word as *const FsContext) });
 }
 
@@ -111,6 +106,21 @@ pub fn test_value(value: u64) -> i64 {
     st.test as i64
 }
 
-pub fn live() -> i64 {
-    LIVE.load(Ordering::Relaxed) as i64
+/// Records `TEST_FS_RECORDS` watches (one list per instance, as test calls
+/// go): weak references, which tell whether the kernel still holds them
+/// without keeping them.
+static WATCHED: Mutex<Vec<Weak<FsContext>>> = Mutex::new(Vec::new());
+
+/// `TEST_FS_RECORDS`: `watch` set: watches the caller's record; else how
+/// many watched records are still held (forgetting the released ones).
+/// Unlike a count of all the instance's records, this does not depend on
+/// what other processes of the tree do meanwhile.
+pub fn test_records(watch: bool) -> i64 {
+    if watch {
+        WATCHED.lock().push(Arc::downgrade(&current()));
+        return 0;
+    }
+    let mut watched = WATCHED.lock();
+    watched.retain(|w| w.strong_count() > 0);
+    watched.len() as i64
 }
