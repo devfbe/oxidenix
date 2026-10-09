@@ -65,8 +65,12 @@ test('an exception in a worker reaches the parent', async () => {
 });
 
 test('terminate() stops a busy worker', async () => {
-    const w = run(`for (;;) {}`);
-    await new Promise((r) => setTimeout(r, 50));
+    // Once it runs: terminating a worker whose environment does not exist
+    // yet ends it with code 0 (Node's Worker::Exit sets the code only with
+    // an environment; on Linux too, within a few milliseconds of `new
+    // Worker`), so the test waits for the worker to say it is busy.
+    const w = run(`require('node:worker_threads').parentPort.postMessage('busy'); for (;;) {}`);
+    await once(w, 'message');
     assert.equal(await w.terminate(), 1);
 });
 
