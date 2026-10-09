@@ -74,6 +74,9 @@ struct Reported {
     reads: bool,
     writes: bool,
     ready: i16,
+    /// Its placeholder exists: the kernel takes reports for it. An end
+    /// `reopen` made gets them once installed (`PipeEnd::installed`).
+    installed: bool,
 }
 
 pub struct Shared {
@@ -99,7 +102,11 @@ pub struct PipeEnd {
 /// A new pipe: (read end, write end).
 pub fn new() -> (Arc<PipeEnd>, Arc<PipeEnd>) {
     let (rid, wid) = (files::new_id(), files::new_id());
-    let ends = alloc::vec![Reported { id: rid, reads: true, writes: false, ready: 0 }, Reported { id: wid, reads: false, writes: true, ready: POLLOUT }];
+    // (Nobody can change the pipe before both are installed: no report is lost.)
+    let ends = alloc::vec![
+        Reported { id: rid, reads: true, writes: false, ready: 0, installed: true },
+        Reported { id: wid, reads: false, writes: true, ready: POLLOUT, installed: true },
+    ];
     let shared = Arc::new(Shared {
         inner: Mutex::new(Inner { buf: VecDeque::new(), readers: 1, writers: 1, ends }),
         rlock: Mutex::new(()),
@@ -109,25 +116,42 @@ pub fn new() -> (Arc<PipeEnd>, Arc<PipeEnd>) {
     (Arc::new(PipeEnd { shared: shared.clone(), id: rid, reads: true, writes: false }), Arc::new(PipeEnd { shared, id: wid, reads: false, writes: true }))
 }
 
-/// Another end of `end`'s pipe, as open(2) of /proc/<pid>/fd/N makes one
-/// (Linux's fifo_open of a pipe: no waiting for a partner): reading for
-/// O_RDONLY, writing for O_WRONLY, both for O_RDWR. The caller installs it
-/// under its `id` (and `close`s it if that fails).
-pub fn reopen(end: &PipeEnd, flags: u32) -> Arc<PipeEnd> {
-    let mode = flags & files::O_ACCMODE;
-    let (reads, writes) = (mode != files::O_WRONLY, mode != 0);
-    let id = files::new_id();
-    let shared = end.shared.clone();
-    {
-        let mut inner = shared.inner.lock();
-        inner.readers += reads as u32;
-        inner.writers += writes as u32;
-        let ready = inner.readiness(reads, writes);
-        inner.ends.push(Reported { id, reads, writes, ready });
-        // A pipe that had no reader or no writer has one now.
-        shared.changed(&mut inner, false, false);
+/// The pipe itself, apart from its ends (what /proc/<pid>/fd/N of an end
+/// leads to): it keeps the buffer, not an end, so it holds no reader or
+/// writer open.
+#[derive(Clone)]
+pub struct Pipe(Arc<Shared>);
+
+impl Pipe {
+    /// Another end of the pipe, as open(2) of /proc/<pid>/fd/N makes one
+    /// (Linux's fifo_open of a pipe: no waiting for a partner): reading for
+    /// O_RDONLY, writing for O_WRONLY, both for O_RDWR. The caller installs
+    /// it under its `id`, then calls `installed` (or `close` if installing
+    /// failed): the kernel takes readiness reports for the end only once
+    /// its placeholder exists, so the end gets them from then on, and its
+    /// readiness is reported again then (a change between the two is not
+    /// lost).
+    pub fn reopen(&self, flags: u32) -> Arc<PipeEnd> {
+        let mode = flags & files::O_ACCMODE;
+        let (reads, writes) = (mode != files::O_WRONLY, mode != 0);
+        let id = files::new_id();
+        let shared = self.0.clone();
+        {
+            let mut inner = shared.inner.lock();
+            inner.readers += reads as u32;
+            inner.writers += writes as u32;
+            let ready = inner.readiness(reads, writes);
+            inner.ends.push(Reported { id, reads, writes, ready, installed: false });
+            // A pipe that had no reader or no writer has one now.
+            shared.changed(&mut inner, false, false);
+        }
+        Arc::new(PipeEnd { shared, id, reads, writes })
     }
-    Arc::new(PipeEnd { shared, id, reads, writes })
+
+    /// Its `struct stat`: a FIFO of its own inode, as each end's.
+    pub fn stat(&self) -> [u8; 144] {
+        self.0.stat()
+    }
 }
 
 impl Inner {
@@ -169,7 +193,7 @@ impl Shared {
             let now = inner.readiness(reads, writes);
             let event = (data_in && reads) || (room_out && writes);
             let end = &mut inner.ends[i];
-            if now != end.ready || event {
+            if end.installed && (now != end.ready || event) {
                 end.ready = now;
                 files::ready(end.id, now);
             }
@@ -198,6 +222,19 @@ impl PipeEnd {
 
     pub fn readiness(&self) -> i16 {
         self.shared.inner.lock().readiness(self.reads, self.writes)
+    }
+
+    /// The end's placeholder is installed (`reopen`): it gets reports from
+    /// now on, and its readiness now (as an event: data may have come
+    /// while the kernel did not know the end yet).
+    pub fn installed(&self) {
+        let mut inner = self.shared.inner.lock();
+        let now = inner.readiness(self.reads, self.writes);
+        if let Some(end) = inner.ends.iter_mut().find(|e| e.id == self.id) {
+            end.installed = true;
+            end.ready = now;
+            files::ready(self.id, now);
+        }
     }
 
     /// The end's placeholder is gone.
@@ -357,9 +394,20 @@ impl PipeEnd {
 
     /// Its `struct stat`: a FIFO of its own inode.
     pub fn stat(&self) -> [u8; 144] {
+        self.shared.stat()
+    }
+
+    /// The pipe this is an end of.
+    pub fn pipe(&self) -> Pipe {
+        Pipe(self.shared.clone())
+    }
+}
+
+impl Shared {
+    fn stat(&self) -> [u8; 144] {
         const S_IFIFO: u32 = 0o010000;
         let mut st = [0u8; 144];
-        st[8..16].copy_from_slice(&self.ino().to_le_bytes());
+        st[8..16].copy_from_slice(&self.ino.to_le_bytes());
         st[16..24].copy_from_slice(&1u64.to_le_bytes());
         st[24..28].copy_from_slice(&(S_IFIFO | 0o600).to_le_bytes());
         st[56..64].copy_from_slice(&4096u64.to_le_bytes());

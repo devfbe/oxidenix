@@ -70,13 +70,22 @@ pub fn open(node: ProcNode, flags: u32, path: String) -> Result<i64, i64> {
 }
 
 fn reopen(opened: &Opened, flags: u32) -> Result<i64, i64> {
-    let Opened::Server(File::Pipe(end)) = opened else { return Err(ENXIO) };
+    let Opened::Pipe(pipe) = opened else { return Err(ENXIO) };
     if flags & O_DIRECTORY != 0 {
         return Err(ENOTDIR);
     }
-    let new = crate::pipe::reopen(end, flags);
+    let new = pipe.reopen(flags);
     let kept = flags & (O_ACCMODE | files::O_NONBLOCK | files::O_CLOEXEC);
-    files::install(new.id(), File::Pipe(new.clone()), kept, new.readiness()).inspect_err(|_| new.close())
+    match files::install(new.id(), File::Pipe(new.clone()), kept, new.readiness()) {
+        Ok(fd) => {
+            new.installed();
+            Ok(fd)
+        }
+        Err(e) => {
+            new.close();
+            Err(e)
+        }
+    }
 }
 
 /// The calls on an open file of /proc or /sys (`a1`..`a3`: the call's

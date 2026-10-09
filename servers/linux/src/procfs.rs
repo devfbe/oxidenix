@@ -138,13 +138,15 @@ pub enum ProcNode {
     Open(Opened),
 }
 
-/// An open file without a node.
+/// An open file without a node, as a magic link reached it. It keeps
+/// nothing of the file alive that its last close should end (an O_PATH
+/// descriptor of it may outlive every real one): a pipe is the pipe itself
+/// (its buffer, no end: what reopening needs), anything else (a socket, an
+/// eventfd, inotify, an epoll instance) its status when it was reached.
 #[derive(Clone)]
 pub enum Opened {
-    Server(File),
-    /// One of the kernel's (an epoll instance): its status when it was
-    /// reached.
-    Kernel([u8; 144]),
+    Pipe(crate::pipe::Pipe),
+    Anonymous([u8; 144]),
 }
 
 /// What a magic link leads to (`follow`): the node and its mode, and the
@@ -537,8 +539,8 @@ pub fn list(dir: &ProcNode) -> Result<Vec<(String, u64, u8)>, i64> {
 pub fn stat(node: &ProcNode) -> Result<[u8; 144], i64> {
     let now = crate::time::realtime();
     let mut st = match node {
-        ProcNode::Open(Opened::Server(f)) => return files::stat_file(f).map(|s| s.to_bytes()),
-        ProcNode::Open(Opened::Kernel(st)) => return Ok(*st),
+        ProcNode::Open(Opened::Pipe(p)) => return Ok(p.stat()),
+        ProcNode::Open(Opened::Anonymous(st)) => return Ok(*st),
         ProcNode::Remote { sys, ino, .. } => {
             let s = remote_stat(*ino)?;
             let time = |sec: u32| vfs::stat::Time { sec: sec as i64, nsec: 0 };
@@ -655,7 +657,11 @@ pub fn follow(node: &ProcNode) -> Result<Option<Follow>, i64> {
     let fd = *fd;
     let open = |file: File| -> Result<Follow, i64> {
         let st = files::stat_file(&file)?;
-        Ok(Follow { node: Node::Proc(ProcNode::Open(Opened::Server(file))), mode: st.mode, path: None })
+        let opened = match &file {
+            File::Pipe(end) => Opened::Pipe(end.pipe()),
+            _ => Opened::Anonymous(st.to_bytes()),
+        };
+        Ok(Follow { node: Node::Proc(ProcNode::Open(opened)), mode: st.mode, path: None })
     };
     let found = match files::lookup(fd as u64) {
         Some((File::Tmp(f), _)) => Follow { mode: f.inode.mode(), node: Node::Tmp(f.inode.clone()), path: Some(f.path.clone()) },
@@ -669,7 +675,7 @@ pub fn follow(node: &ProcNode) -> Result<Option<Follow>, i64> {
         }
         None => match kernel_file(fd)? {
             (Some((inode, path)), st) => Follow { node: Node::Kernel(inode), mode: namespace::mode_of(&st), path: Some(path) },
-            (None, st) => Follow { node: Node::Proc(ProcNode::Open(Opened::Kernel(st))), mode: namespace::mode_of(&st), path: None },
+            (None, st) => Follow { node: Node::Proc(ProcNode::Open(Opened::Anonymous(st))), mode: namespace::mode_of(&st), path: None },
         },
     };
     Ok(Some(found))
