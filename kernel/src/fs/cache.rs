@@ -351,28 +351,57 @@ impl State {
         self.waits.iter().find(|w| w.index == index).map_or((Seen::default(), 0), |w| (w.failures, w.changes))
     }
 
-    /// The pager could not supply pages `first..end`: whoever waits fails.
-    fn fail_waiters(&mut self, first: u64, end: u64) {
-        for w in self.waits.iter_mut().filter(|w| (first..end).contains(&w.index)) {
+    /// The pager could not supply pages `first..end`: whoever waits for
+    /// one that is still missing fails (a page that is there, or being
+    /// filled by another fill, is not this failure's: a store waiting for
+    /// its backing does not fail for a neighbour's read error).
+    fn fail_waiters(&mut self, first: u64, end: u64) -> Wake {
+        let pages = &self.pages;
+        let mut wake = Wake(false);
+        for w in self.waits.iter_mut().filter(|w| (first..end).contains(&w.index) && !pages.contains_key(&w.index)) {
             w.failures.fill = w.failures.fill.wrapping_add(1);
             w.changes = w.changes.wrapping_add(1);
+            wake.0 = true;
         }
+        wake
     }
 
     /// The pager could not back pages `first..end`: whoever waits for
     /// their backing fails.
-    fn fail_backing(&mut self, first: u64, end: u64) {
+    fn fail_backing(&mut self, first: u64, end: u64) -> Wake {
+        let mut wake = Wake(false);
         for w in self.waits.iter_mut().filter(|w| (first..end).contains(&w.index)) {
             w.failures.backing = w.failures.backing.wrapping_add(1);
+            wake.0 = true;
         }
+        wake
     }
 
     /// Pages `first..end` came, began to be filled or were cut off: a
-    /// request for one that was made before may be done with.
-    fn changed(&mut self, first: u64, end: u64) {
+    /// request for one that was made before may be done with, so its
+    /// waiters look again (and ask again if it is missing).
+    fn changed(&mut self, first: u64, end: u64) -> Wake {
+        let mut wake = Wake(false);
         for w in self.waits.iter_mut().filter(|w| (first..end).contains(&w.index)) {
             w.changes = w.changes.wrapping_add(1);
+            wake.0 = true;
         }
+        wake
+    }
+}
+
+/// Whether a change of a cache's state (`State::fail_waiters`,
+/// `fail_backing`, `changed`) concerns threads waiting for its pages:
+/// they must be woken (`PageCache::wake`) once the state is unlocked, or a
+/// waiter that does not ask again for a request it took as outstanding
+/// would sleep on.
+#[must_use = "the waiters must be woken (PageCache::wake) once the state is unlocked"]
+struct Wake(bool);
+
+impl Wake {
+    /// Both changes' waiters.
+    fn and(self, other: Wake) -> Wake {
+        Wake(self.0 || other.0)
     }
 }
 
@@ -547,6 +576,22 @@ impl PageCache {
         matches!(self.store, Store::Cached { .. })
     }
 
+    /// Wakes the threads waiting for this object's pages if `wake` says a
+    /// change concerned them (call with the state unlocked).
+    fn wake(&self, wake: Wake) {
+        if wake.0 {
+            self.wake_waiters();
+        }
+    }
+
+    /// Wakes the threads waiting for this object's pages (they sleep on
+    /// the pager's channel, `Pager::wait_chan`).
+    fn wake_waiters(&self) {
+        if let Some(pager) = self.pager().and_then(|(p, _)| p.upgrade()) {
+            crate::process::sched::wakeup(pager.wait_chan());
+        }
+    }
+
     /// The pager of a paged or cached object, and its key.
     fn pager(&self) -> Option<(&Weak<dyn Pager>, u64)> {
         match &self.store {
@@ -671,7 +716,7 @@ impl PageCache {
     /// The pager's answer: page `index` with `data` (the rest zero), if it
     /// is still missing; wakes who waits for it. Whether it was inserted.
     pub fn supply(&self, index: u64, data: &[u8]) -> Result<bool, i64> {
-        let Store::Paged { pager, .. } = &self.store else { return Err(EINVAL) };
+        let Store::Paged { .. } = &self.store else { return Err(EINVAL) };
         if data.len() > PAGE as usize {
             return Err(EINVAL);
         }
@@ -691,23 +736,23 @@ impl PageCache {
         let page = frame_bytes(frame);
         page[..data.len()].copy_from_slice(data);
         page[data.len()..].fill(0);
-        let inserted = {
+        let wake = {
             let mut st = self.state.lock();
             if st.pages.contains_key(&index) {
-                false
+                None
             } else {
                 st.pages.insert(index, Page::new(frame));
                 st.charged += 1;
-                st.changed(index, index + 1);
-                true
+                Some(st.changed(index, index + 1))
             }
         };
-        if !inserted {
-            free_frames([frame]);
-            memory::uncommit(1);
-        }
-        if let Some(pager) = pager.upgrade() {
-            crate::process::sched::wakeup(pager.wait_chan());
+        let inserted = wake.is_some();
+        match wake {
+            Some(wake) => self.wake(wake),
+            None => {
+                free_frames([frame]);
+                memory::uncommit(1);
+            }
         }
         Ok(inserted)
     }
@@ -715,19 +760,12 @@ impl PageCache {
     /// The pager's answer that page `index` cannot be had: the threads
     /// waiting for it get an error (a later access asks again).
     pub fn fail(&self, index: u64) -> Result<(), i64> {
-        let Store::Paged { pager, .. } = &self.store else { return Err(EINVAL) };
+        let Store::Paged { .. } = &self.store else { return Err(EINVAL) };
         if index >= page_of(self.size().saturating_add(PAGE - 1)) {
             return Err(EINVAL);
         }
-        {
-            let mut st = self.state.lock();
-            if !st.pages.contains_key(&index) {
-                st.fail_waiters(index, index + 1);
-            }
-        }
-        if let Some(pager) = pager.upgrade() {
-            crate::process::sched::wakeup(pager.wait_chan());
-        }
+        let wake = self.state.lock().fail_waiters(index, index + 1);
+        self.wake(wake);
         Ok(())
     }
 
@@ -1021,14 +1059,14 @@ impl PageCache {
     /// their backing fails: SIGBUS for a store through a mapping, as
     /// Linux's ENOSPC in `page_mkwrite`). Wakes the waiters.
     pub fn backed(&self, first: u64, end: u64, ok: bool) -> Result<(), i64> {
-        let Store::Cached { pager, .. } = &self.store else { return Err(EINVAL) };
+        let Store::Cached { .. } = &self.store else { return Err(EINVAL) };
         if first % PAGE != 0 || end < first || end - first > MAX_RUN * PAGE {
             return Err(EINVAL);
         }
         // (A failure names at least the page at `first`.)
         let from = page_of(first);
         let to = page_of(end.saturating_add(PAGE - 1)).max(from + 1);
-        {
+        let failed = {
             let mut st = self.state.lock();
             for (&index, page) in st.pages.range_mut(from..to) {
                 page.mkwrite = false;
@@ -1036,13 +1074,10 @@ impl PageCache {
                     page.backed = page.backed.max((end - index * PAGE).min(PAGE) as u16);
                 }
             }
-            if !ok {
-                st.fail_backing(from, to);
-            }
-        }
-        if let Some(pager) = pager.upgrade() {
-            crate::process::sched::wakeup(pager.wait_chan());
-        }
+            if ok { Wake(false) } else { st.fail_backing(from, to) }
+        };
+        // Answered either way: whoever waits for the backing looks again.
+        self.wake(Wake(true).and(failed));
         Ok(())
     }
 
@@ -1092,7 +1127,9 @@ impl PageCache {
         }
         st.pages.insert(index, Page::new(frame));
         st.charged += 1;
-        st.changed(index, index + 1);
+        let wake = st.changed(index, index + 1);
+        drop(st);
+        self.wake(wake);
         Ok(())
     }
 
@@ -1125,7 +1162,7 @@ impl PageCache {
         if len > MAX_SIZE {
             return Err(EFBIG);
         }
-        let first_gone = {
+        let (first_gone, wake) = {
             let _io = self.io.lock();
             if let Store::Cached { limit, .. } = self.store {
                 if len > limit {
@@ -1164,20 +1201,16 @@ impl PageCache {
             st.charged -= charged;
             st.size = len;
             st.image_len = st.image_len.min(len);
-            st.changed(first_gone, u64::MAX);
+            let wake = st.changed(first_gone, u64::MAX);
             drop(st);
             undirty(dirty);
             free_frames(gone.into_values().map(|p| p.frame));
             self.uncharge(charged);
-            first_gone
+            (first_gone, wake)
         };
         self.unmap_from(first_gone);
         // Waiters for pages beyond the end look again (and fail there).
-        if let Some((pager, _)) = self.pager() {
-            if let Some(pager) = pager.upgrade() {
-                crate::process::sched::wakeup(pager.wait_chan());
-            }
-        }
+        self.wake(wake);
         Ok(())
     }
 
@@ -1406,8 +1439,10 @@ impl PageCache {
             taken += 1;
         }
         st.charged += taken as u64;
-        st.changed(start, start + taken as u64);
+        let wake = st.changed(start, start + taken as u64);
         drop(st);
+        // Being filled now: their waiters wait without asking.
+        self.wake(wake);
         let no_frame = frames.is_empty();
         let spare = frames.split_off(taken);
         let unused = count - taken as u64;
@@ -1431,13 +1466,13 @@ impl PageCache {
     /// pager that cannot even start a fill answers). Present pages are
     /// left alone. Wakes the waiters.
     pub fn filled(&self, first: u64, count: u64, ok: bool) -> Result<(), i64> {
-        let Store::Cached { pager, .. } = &self.store else { return Err(EINVAL) };
+        let Store::Cached { .. } = &self.store else { return Err(EINVAL) };
         if count > MAX_RUN {
             return Err(EINVAL);
         }
         let end = first.checked_add(count).ok_or(EINVAL)?;
         let mut gone = Vec::new();
-        {
+        let failed = {
             let mut st = self.state.lock();
             let st = &mut *st;
             // Only pages of the file: none lives beyond, nobody waits there.
@@ -1453,17 +1488,14 @@ impl PageCache {
                     gone.push(page.frame);
                 }
             }
-            if !ok {
-                // Missing pages fail only for whoever waits for them now.
-                st.fail_waiters(first, end);
-            }
             st.charged -= gone.len() as u64;
-        }
+            // Missing pages fail only for whoever waits for them now.
+            if ok { Wake(false) } else { st.fail_waiters(first, end) }
+        };
         self.uncharge(gone.len() as u64);
         free_frames(gone);
-        if let Some(pager) = pager.upgrade() {
-            crate::process::sched::wakeup(pager.wait_chan());
-        }
+        // Filled: whoever waits for the pages takes them.
+        self.wake(failed.and(Wake(ok)));
         Ok(())
     }
 
@@ -1516,6 +1548,7 @@ impl PageCache {
     /// be filled. They go, and whoever waits for them fails.
     fn abandon_pending(&self) {
         let mut gone = Vec::new();
+        let mut wake = Wake(false);
         {
             let mut st = self.state.lock();
             let pending: Vec<u64> = st.pages.iter().filter(|(_, p)| p.pending).map(|(&i, _)| i).collect();
@@ -1523,12 +1556,13 @@ impl PageCache {
                 if let Some(page) = st.pages.remove(&index) {
                     gone.push(page.frame);
                 }
-                st.fail_waiters(index, index + 1);
+                wake = wake.and(st.fail_waiters(index, index + 1));
             }
             st.charged -= gone.len() as u64;
         }
         self.uncharge(gone.len() as u64);
         free_frames(gone);
+        self.wake(wake);
     }
 
     /// Marks the present pages among `count` from `first` dirty again (a
