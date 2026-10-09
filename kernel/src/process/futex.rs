@@ -103,6 +103,19 @@ impl Waiter {
 }
 
 const BUCKETS: usize = 256;
+/// Room a bucket keeps when it empties; a larger one (a burst of waiters)
+/// is given back then, so the buckets hold at most this much each beyond
+/// what is waiting now.
+const KEEP: usize = 4;
+
+/// After waiters left `b`: an empty bucket gives back more room than
+/// `KEEP` (no allocation: the vector goes, the next waiter makes one).
+fn tidy(b: &mut Vec<Waiter>) {
+    if b.is_empty() && b.capacity() > KEEP {
+        *b = Vec::new();
+    }
+}
+
 static BUCKETS_: [IrqSpinLock<Vec<Waiter>>; BUCKETS] = [const { IrqSpinLock::new(Vec::new()) }; BUCKETS];
 
 fn bucket_of(key: &Key) -> usize {
@@ -245,6 +258,7 @@ fn unqueue(me: &Task) -> bool {
         }
         if let Some(i) = b.iter().position(|w| w.is_task(me)) {
             b.swap_remove(i);
+            tidy(&mut b);
             return true;
         }
     }
@@ -263,6 +277,7 @@ fn wake_in(b: &mut Vec<Waiter>, key: &Key, n: u64, bitset: u32) -> u64 {
             i += 1;
         }
     }
+    tidy(b);
     woken
 }
 
@@ -332,6 +347,7 @@ fn requeue(uaddr: u64, n_wake: u64, n_move: u64, uaddr2: u64, cmp: Option<u32>, 
             }
             moved += 1;
         }
+        tidy(src);
         return Ok((woken + moved) as i64);
     }
 }
@@ -421,6 +437,7 @@ pub fn wake_object(object: &PageCache) {
                 i += 1;
             }
         }
+        tidy(&mut b);
     }
 }
 

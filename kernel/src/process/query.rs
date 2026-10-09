@@ -23,7 +23,8 @@ fn system() -> System {
     let mem = crate::memory::stats();
     s.mem_total = mem.total_frames * 4096;
     s.mem_free = (mem.total_frames - mem.used_frames) * 4096;
-    s.kernel_heap = (mem.heap_used + mem.heap_free) as u64;
+    // In use (free slots and free heap blocks are free memory).
+    s.kernel_heap = mem.heap_used as u64;
     s.load = sched::loadavg();
     s.load_shift = sched::LOAD_SHIFT as u64;
     {

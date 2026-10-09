@@ -77,6 +77,8 @@ pub fn exit_thread(status: i32) -> ! {
     tlb::switch(mm.as_ref().map(|m| &*m.tlb), None, false);
     drop(mm);
     unsafe { me.own() }.io_bitmap = None;
+    // Its stale timers would keep its memory until they came up.
+    crate::timer::forget(me);
 
     let group = me.group.clone();
     let last = {
@@ -134,8 +136,10 @@ fn process_exit(group: &Arc<ThreadGroup>, status: i32) {
     irq::on_exit(pid);
     // Channels it served lose their service (and their clients learn it).
     super::channel::service_exited(pid);
-    // A zombie gets no SIGALRM.
+    // A zombie gets no SIGALRM, and its timer's entries go (they would
+    // keep its memory until they came up).
     super::signal::stop_alarm(group);
+    crate::timer::forget_alarm(group);
     // Orphans go to the kernel, which reaps them; those that asked for it
     // (PR_SET_PDEATHSIG) get a signal.
     let mut death_signals: Vec<(Pid, u32)> = Vec::new();
