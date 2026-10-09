@@ -254,10 +254,16 @@ fn page_up(x: u64) -> u64 {
 }
 
 /// Bytes the execve calls of one process may hold of their arguments and environments at
-/// once (on the server's heap, shared by the tree): one call with Linux's largest, its
-/// script interpreter's additions and a second, smaller one. Per process, so that no
-/// process keeps the others of the tree from running a program.
+/// once (on the server's heap, shared by the tree): one call with Linux's largest and a
+/// script interpreter's copy of its arguments, with the buffers' slack. Per process, so that
+/// no process alone keeps the others of the tree from running a program.
 const EXEC_STRINGS_MAX: usize = 3 * MAX_ARGS_TOTAL;
+/// And all execve calls of the instance together (the server's heap is the tree's): eight
+/// processes' worth of the largest.
+const EXEC_STRINGS_INSTANCE_MAX: usize = 8 * MAX_ARGS_TOTAL;
+static EXEC_STRINGS_INSTANCE: AtomicUsize = AtomicUsize::new(0);
+/// A buffer grows by this much at least (its slack is charged too).
+const STRINGS_CHUNK: usize = 64 * 1024;
 
 /// An execve's arguments or environment: NUL-terminated strings back to back in one buffer
 /// (one allocation, not one per string), charged to its process (`EXEC_STRINGS_MAX`) while
@@ -274,15 +280,28 @@ impl Strings {
         Strings { bytes: Vec::new(), count: 0, charged: 0, account: account.clone() }
     }
 
-    /// Room for `n` more bytes, charged (ENOMEM beyond the process's bound).
+    /// Room for `n` more bytes. What the buffer takes of the heap (its whole capacity, grown
+    /// in chunks) is charged before it is allocated, to the process and to the instance
+    /// (ENOMEM beyond either bound); `Drop` gives back exactly what was charged.
     fn charge(&mut self, n: usize) -> Result<(), i64> {
-        let before = self.account.fetch_add(n, Ordering::Relaxed);
-        if before + n > EXEC_STRINGS_MAX {
-            self.account.fetch_sub(n, Ordering::Relaxed);
+        let need = self.bytes.len().checked_add(n).ok_or(ENOMEM)?;
+        if need <= self.bytes.capacity() {
+            return Ok(());
+        }
+        let new_cap = need.next_multiple_of(STRINGS_CHUNK);
+        let more = new_cap - self.bytes.capacity();
+        if self.account.fetch_add(more, Ordering::Relaxed) + more > EXEC_STRINGS_MAX {
+            self.account.fetch_sub(more, Ordering::Relaxed);
             return Err(ENOMEM);
         }
-        self.charged += n;
-        self.bytes.try_reserve(n).map_err(|_| ENOMEM)
+        if EXEC_STRINGS_INSTANCE.fetch_add(more, Ordering::Relaxed) + more > EXEC_STRINGS_INSTANCE_MAX {
+            EXEC_STRINGS_INSTANCE.fetch_sub(more, Ordering::Relaxed);
+            self.account.fetch_sub(more, Ordering::Relaxed);
+            return Err(ENOMEM);
+        }
+        self.charged += more;
+        let len = self.bytes.len();
+        self.bytes.try_reserve_exact(new_cap - len).map_err(|_| ENOMEM)
     }
 
     fn push(&mut self, s: &[u8]) -> Result<(), i64> {
@@ -313,6 +332,7 @@ impl Strings {
 impl Drop for Strings {
     fn drop(&mut self) {
         self.account.fetch_sub(self.charged, Ordering::Relaxed);
+        EXEC_STRINGS_INSTANCE.fetch_sub(self.charged, Ordering::Relaxed);
     }
 }
 

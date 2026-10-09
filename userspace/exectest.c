@@ -204,6 +204,60 @@ int main(int argc, char **argv, char **envp) {
     memset(huge, 'x', sizeof huge - 1);
     char *bigargs[] = {"hello", huge, NULL};
     check("an argument beyond MAX_ARG_STRLEN: E2BIG", run("/bin/hello", bigargs) == 100 + E2BIG);
+    /* The memory execve calls hold for their arguments is bounded for the tree: ten
+     * processes each holding about 1.8 MiB of arguments (their execve waits for the last
+     * argument's page, which the pager never supplies: TEST_PAGED_STUCK) do not all get it
+     * (ENOMEM for some), never take the server's heap; once they are killed, everything
+     * they held is given back (a large exec runs). Tiny strings count by what they take: a
+     * million empty ones are E2BIG. */
+    {
+        enum { KIDS = 10, BIG = 15 };
+        static char piece[120 * 1024];
+        memset(piece, 'a', sizeof piece - 1);
+        char *stuck = (char *)0x222000000000;
+        int armed = syscall(1507, stuck) == 0;
+        pid_t kids[KIDS];
+        for (int k = 0; k < KIDS; k++) {
+            kids[k] = fork();
+            if (kids[k] == 0) {
+                static char *bigv[BIG + 3];
+                bigv[0] = "hello";
+                for (int i = 1; i <= BIG; i++) bigv[i] = piece;
+                bigv[BIG + 1] = stuck;
+                bigv[BIG + 2] = NULL;
+                execv("/bin/hello", bigv);
+                _exit(100 + errno);
+            }
+        }
+        struct timespec d = {0, 500000000};
+        nanosleep(&d, NULL);
+        int refused = 0, blocked = 0;
+        for (int k = 0; k < KIDS; k++) {
+            int kst = 0;
+            if (waitpid(kids[k], &kst, WNOHANG) == kids[k]) {
+                if (WIFEXITED(kst) && WEXITSTATUS(kst) == 100 + ENOMEM) refused++;
+            } else {
+                blocked++;
+                kill(kids[k], SIGKILL);
+                waitpid(kids[k], &kst, 0);
+            }
+        }
+        syscall(1507, 0);
+        printf("exec memory: %d held, %d refused\n", blocked, refused);
+        check("execve's argument memory is bounded for the tree (ENOMEM)", armed && refused > 0 && blocked > 0 && blocked + refused == KIDS);
+        static char *again[BIG + 2];
+        again[0] = "hello";
+        for (int i = 1; i <= BIG; i++) again[i] = piece;
+        again[BIG + 1] = NULL;
+        int ok = 1;
+        for (int round = 0; round < 3 && ok; round++) ok = run("/bin/hello", again) == 42;
+        check("... and given back by the processes killed meanwhile", ok);
+        static char *tiny[1000002];
+        tiny[0] = "hello";
+        for (int i = 1; i <= 1000000; i++) tiny[i] = "";
+        tiny[1000001] = NULL;
+        check("a million empty arguments: E2BIG", run("/bin/hello", tiny) == 100 + E2BIG);
+    }
     int all_ran = 1;
     for (int round = 0; round < 20 && all_ran; round++) {
         pid_t c = fork();
