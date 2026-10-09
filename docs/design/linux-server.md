@@ -428,7 +428,9 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
      its port and 4-tuple stay taken. It counts among its instance's sockets; at most 60 s
      in all however often the peer sends its FIN again (each restarts smoltcp's timer); and
      when an instance needs a socket its share or the whole has no room for, the oldest
-     TIME-WAIT connection (its own first) goes, as Linux drops TIME-WAIT beyond
+     TIME-WAIT connection goes: its own first, another instance's only if that one holds
+     more sockets than its reserve (never below it), everything it held given back to its
+     own instance; as Linux drops TIME-WAIT beyond
      tcp_max_tw_buckets, so TIME-WAIT never refuses service. Ports are never shared across instances (TCP: bound,
      listening, connected, closing or in TIME-WAIT; UDP: bound), and a connect never takes a
      live, closing or TIME-WAIT 4-tuple (`EADDRNOTAVAIL`). Raw ICMP sockets see the host's

@@ -964,19 +964,32 @@ impl Service {
     }
 
     /// Ends the oldest connection in TIME-WAIT of `owner` (None: of any
-    /// instance), silently (it leaves smoltcp: nothing is sent); false if
-    /// there is none.
+    /// instance holding more sockets than its reserve: another instance's
+    /// need never takes one below it), silently (it leaves smoltcp: nothing
+    /// is sent); false if there is none. Everything it held goes back to
+    /// its own instance.
     fn recycle_time_wait(&mut self, owner: Option<u64>, sockets: &mut SocketSet<'static>) -> bool {
         let now = crate::now();
+        let socks = &self.socks;
         let oldest = self
             .closing
             .iter()
             .enumerate()
-            .filter(|(_, cl)| owner.is_none_or(|o| cl.owner == o) && sockets.get::<tcp::Socket>(cl.handle).state() == tcp::State::TimeWait)
+            .filter(|(_, cl)| match owner {
+                Some(o) => cl.owner == o,
+                None => socks.beyond_reserve(cl.owner),
+            })
+            .filter(|(_, cl)| sockets.get::<tcp::Socket>(cl.handle).state() == tcp::State::TimeWait)
             .min_by_key(|(_, cl)| cl.time_wait.unwrap_or(now))
             .map(|(i, _)| i);
         let Some(i) = oldest else { return false };
-        let cl = self.closing.swap_remove(i);
+        let mut cl = self.closing.swap_remove(i);
+        // (One that entered TIME-WAIT since the last round is still
+        // counted as an orphan, with leftovers perhaps.)
+        cl.drop_leftover(&mut self.bytes);
+        if cl.orphan {
+            self.orphans.uncharge(cl.owner, 1);
+        }
         self.drop_socket(sockets, cl.handle);
         true
     }
