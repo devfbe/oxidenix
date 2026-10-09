@@ -63,6 +63,12 @@ pub struct FdEntry {
     pub cloexec: bool,
 }
 
+impl Drop for FdEntry {
+    fn drop(&mut self) {
+        self.file.reference_gone();
+    }
+}
+
 impl Process {
     /// The address space, or EINVAL for a task without one.
     pub fn mm(&self) -> Result<Arc<address_space::Mm>, i64> {
@@ -609,6 +615,7 @@ fn spawn_with(path: &str, image: loader::Image, server: Option<&Arc<Server>>, ar
     let mut own = Process::empty();
     let mut space = image.space;
     let mut frame = Frame::user_start(image.entry, image.sp);
+    let mut instance_id = 0;
     if server.is_none() {
         // A new process tree: a new instance of the Linux server, whose
         // first thread starts in the server (ADR 0002).
@@ -618,6 +625,7 @@ fn spawn_with(path: &str, image: loader::Image, server: Option<&Arc<Server>>, ar
             instance.close();
             return Err(if e == address_space::Fault::Oom { ENOMEM } else { EINVAL });
         }
+        instance_id = instance.id;
         let (thread, start) = linux::LinuxThread::new(instance, &frame)?;
         own.linux = Some(thread);
         frame = start;
@@ -628,6 +636,7 @@ fn spawn_with(path: &str, image: loader::Image, server: Option<&Arc<Server>>, ar
     own.server = server.cloned();
     let group = ThreadGroup::new(pid, info, Default::default()).ok_or(ENOMEM)?;
     group.privileged.store(server.is_some(), Ordering::Relaxed);
+    group.instance.store(instance_id, Ordering::Release);
     let t = new_task(pid, group, name, own, frame)?;
     slot.insert(t.clone())?;
     if server.is_none() {

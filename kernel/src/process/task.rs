@@ -160,6 +160,10 @@ pub struct ThreadGroup {
     /// Sequence number of the live arming of the interval timer (0: off),
     /// changed under `sig`.
     pub alarm_seq: AtomicU64,
+    /// The id of the Linux server instance whose tree the process belongs
+    /// to (`linux::Instance::id`; 0: none, a server of the kernel's or the
+    /// instance's pager). Set when its first thread is made.
+    pub instance: AtomicU64,
 }
 
 impl ThreadGroup {
@@ -171,6 +175,7 @@ impl ThreadGroup {
             info: IrqSpinLock::new(info),
             sig: IrqSpinLock::new(sig),
             alarm_seq: AtomicU64::new(0),
+            instance: AtomicU64::new(0),
         })
         .ok()
     }

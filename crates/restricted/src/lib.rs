@@ -139,7 +139,7 @@ pub const SYS_VM_DISCARD: u64 = 1027;
 /// `n` of them, the first `cap` stored at `out` as (key, first page, end
 /// page) triples of u64s.
 pub const SYS_VM_SYNC: u64 = 1028;
-/// `kfile_object(fd) -> handle`: the open file behind descriptor `fd` of
+/// `kfile_object(fd, flags) -> handle`: the open file behind descriptor `fd` of
 /// the calling process (the kernel's descriptor table, until files are the
 /// server's), to map with `mo_map` as mmap maps a file: its page cache,
 /// /dev/zero as anonymous memory; the mapping keeps the file and the
@@ -147,8 +147,12 @@ pub const SYS_VM_SYNC: u64 = 1028;
 /// The handle is also how a descriptor travels between processes
 /// (`SYS_KFD_INSTALL_FILE`): it keeps the open file description, whatever
 /// it is (a file of the kernel's or a placeholder of the server's), alive
-/// while it is in flight.
+/// while it is in flight. With `KFILE_INFLIGHT` the handle is such a
+/// descriptor in flight (it cannot be mapped): while one of a placeholder
+/// is, every descriptor of it that goes and the end of every call that
+/// looked it up (`kfd_lookup`) queue `EVENT_INFLIGHT`.
 pub const SYS_KFILE_OBJECT: u64 = 1029;
+pub const KFILE_INFLIGHT: u64 = 1;
 
 /// Test calls a program can make to its server (lxtest): they exercise the
 /// kernel interface above on the calling process. Each returns 0 or a
@@ -227,6 +231,11 @@ pub const EVENT_SYNC: u64 = 8;
 /// disk space is not secured (`a` key, `b` byte offset of the page): the
 /// server promises it and answers with `mo_backed`.
 pub const EVENT_MKWRITE: u64 = 9;
+/// A reference to one of the server's files with descriptors in flight
+/// (`KFILE_INFLIGHT`) went: sockets may be left that only messages in
+/// flight keep, for the server's collector to find. One is queued at a
+/// time.
+pub const EVENT_INFLIGHT: u64 = 10;
 
 /// A server thread starts with its role in `rsi` (and its `State` in
 /// `rdi`): it serves a program's thread, or it is the instance's pager.
@@ -312,7 +321,10 @@ pub const KFD_ALWAYS_READY: u64 = 1;
 /// `kfd_lookup(fd, flags) -> id`: the server's file behind descriptor
 /// `fd` (0: a file of the kernel's; EBADF, also for another instance's
 /// file), its current open flags stored
-/// at `flags` (a u32 in the server's memory) unless 0.
+/// at `flags` (a u32 in the server's memory) unless 0. The file found is
+/// pinned until the thread enters the program again (as Linux's fdget
+/// holds a file for a call): another thread's close of the descriptor
+/// does not end it under the call.
 pub const SYS_KFD_LOOKUP: u64 = 1035;
 /// `kfd_ready(id, ready)`: the readiness of the server's file `id` for
 /// poll, select and epoll (POLLIN, POLLOUT, POLLERR, POLLHUP); wakes who
@@ -593,7 +605,11 @@ pub const SERVER_LOG_MAX: u64 = 256;
 /// It sees every task of the kernel, other instances' and the servers'
 /// threads included (as /proc does today); with R8 the server answers
 /// from its own process table, scoped to its instance, and this goes.
+/// `thread_exists(pid, THREAD_IN_INSTANCE)`: ESRCH unless a process with
+/// id `pid` belongs to the caller's instance (a pid a socket's credentials
+/// may name, SCM_CREDENTIALS).
 pub const SYS_THREAD_EXISTS: u64 = 1090;
+pub const THREAD_IN_INSTANCE: u64 = 1;
 
 // Descriptors passed between processes (SCM_RIGHTS over the server's
 // AF_UNIX sockets, phase R7a), and the bits of the kernel's process model

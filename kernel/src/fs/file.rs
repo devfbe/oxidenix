@@ -80,6 +80,10 @@ impl EventFd {
 /// the last descriptor of one goes.
 pub trait ServerFiles: Send + Sync {
     fn closed(&self, id: u64);
+    /// A descriptor or pin of a placeholder with references in flight
+    /// went: sockets may have become reachable only from messages in
+    /// flight (the server's collector looks).
+    fn in_flight_reference_gone(&self);
 }
 
 /// A file the Linux server implements, as the kernel's descriptor table
@@ -102,6 +106,13 @@ impl ServerFile {
     /// Whether `owner` (an instance of the Linux server) made this file.
     pub fn owned_by(&self, owner: *const ()) -> bool {
         self.owner.as_ptr() as *const () == owner
+    }
+
+    /// See `ServerFiles::in_flight_reference_gone`.
+    fn in_flight_reference_gone(&self) {
+        if let Some(owner) = self.owner.upgrade() {
+            owner.in_flight_reference_gone();
+        }
     }
 
     /// The server's readiness report: wakes who polls the file.
@@ -155,6 +166,9 @@ pub struct OpenFile {
     pub watchers: spin::Mutex<Vec<Weak<epoll::Item>>>,
     /// A regular file opened for writing holds the right to write it.
     _write_access: Option<super::WriteAccess>,
+    /// The Linux server's handles on it that are descriptors in flight
+    /// (`restricted::KFILE_INFLIGHT`).
+    pub in_flight: AtomicUsize,
 }
 
 impl OpenFile {
@@ -171,11 +185,23 @@ impl OpenFile {
             dir_snapshot: Mutex::new(None),
             watchers: spin::Mutex::new(Vec::new()),
             _write_access: write_access,
+            in_flight: AtomicUsize::new(0),
         })
     }
 
     /// An open inode; `write_access` for a regular file opened for
     /// writing (see `Inode::get_write_access`).
+    /// A descriptor (or the server's pin) of it is going: if it is one of
+    /// the server's placeholders with references in flight, the server is
+    /// told.
+    pub fn reference_gone(&self) {
+        if self.in_flight.load(Ordering::Acquire) > 0 {
+            if let Kind::Server(s) = &self.kind {
+                s.in_flight_reference_gone();
+            }
+        }
+    }
+
     pub fn inode_file(inode: Arc<Inode>, flags: u32, path: String, write_access: Option<super::WriteAccess>) -> Arc<OpenFile> {
         Self::with_access(Kind::Inode(inode), flags, Some(path), write_access)
     }
