@@ -59,6 +59,7 @@ pub const EMSGSIZE: i64 = 90;
 pub const EPROTOTYPE: i64 = 91;
 pub const EOPNOTSUPP: i64 = 95;
 pub const ECONNRESET: i64 = 104;
+pub const ENOBUFS: i64 = 105;
 pub const EISCONN: i64 = 106;
 pub const ENOTCONN: i64 = 107;
 pub const ETIMEDOUT: i64 = 110;
@@ -369,7 +370,7 @@ impl Source<'_> {
     /// Up to `n` bytes, fewer at a fault (EFAULT if none could be read).
     pub fn take(&mut self, n: usize) -> Result<Vec<u8>, i64> {
         let mut out = Vec::new();
-        out.try_reserve_exact(n).map_err(|_| crate::unix::ENOBUFS)?;
+        out.try_reserve_exact(n).map_err(|_| ENOBUFS)?;
         match self {
             Source::Server { buf, at } => {
                 let n = n.min(buf.len() - *at);
@@ -404,7 +405,6 @@ impl Source<'_> {
     }
 }
 
-pub const ENOBUFS: i64 = 105;
 
 /// Marks a call in progress on a socket.
 pub struct Busy(Arc<Sock>);
@@ -1090,10 +1090,9 @@ impl Sock {
             }
             match to {
                 Some(t) => (t, false),
-                None => match (&i.peer, self.ty) {
-                    (Some(p), _) => (p.clone(), true),
-                    (None, SEQPACKET) => return Err(ENOTCONN),
-                    (None, _) => return Err(ENOTCONN),
+                None => match &i.peer {
+                    Some(p) => (p.clone(), true),
+                    None => return Err(ENOTCONN),
                 },
             }
         };
