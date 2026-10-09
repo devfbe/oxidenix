@@ -193,8 +193,6 @@ module comment, and the public types it defines. Where to start for common tasks
 - `userspace/rootfs/etc/bench.sh` Benchmark mode (OXIDENIX_BENCH=1, see docs/benchmarks/README.md): runs the I/O benchmarks on the data disk; the exit status ends QEMU as in test mode.
 - `userspace/rootfs/etc/disktest.sh` Exercises the ext2 driver on /data; every line should end in "ok".
 - `userspace/rootfs/etc/runtests.sh` Runs every self-test and exits non-zero if any fails.
-- `userspace/rootfs/etc/runtests.sh` Runs every self-test and exits non-zero if any fails.
-- `userspace/rootfs/etc/runtests.sh` Runs every self-test and exits non-zero if any fails.
 - `userspace/rootfs/etc/test.sh` A quick manual tour of the shell: files, pipes and a few commands.
 
 ## Kernel ABI of the Linux server
