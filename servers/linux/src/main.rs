@@ -203,8 +203,8 @@ fn dispatch(s: &mut State) -> i64 {
             Err(e) => -e,
         },
         TEST_PASS_THROUGH => {
-            const SYS_GETPID: u64 = 39;
-            s.rax = SYS_GETPID;
+            const SYS_SCHED_YIELD: u64 = 24;
+            s.rax = SYS_SCHED_YIELD;
             pass_through_value(s)
         }
         // Not offered, as by a Linux built without io_uring: libuv (and

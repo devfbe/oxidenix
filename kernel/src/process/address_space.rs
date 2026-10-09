@@ -863,8 +863,10 @@ impl AddressSpace {
             self.grow_stack(page)?;
         }
         let v = self.vma(page).cloned().ok_or(Fault::Segv)?;
+        // A mapping that does not allow the access (SEGV_ACCERR, where no
+        // mapping is SEGV_MAPERR).
         if v.prot.none() || (access.write && !v.prot.write) || (access.exec && !v.prot.exec) {
-            return Err(Fault::Segv);
+            return Err(Fault::Access);
         }
         if let Some(e) = leaf_entry(self.l4, page) {
             let flags = e.flags();

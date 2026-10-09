@@ -365,7 +365,30 @@ int main(void) {
         if (pfd >= 0) close(pfd);
     }
     if (proc) closedir(proc);
-    check("/proc/<pid>/stat via openat on an O_PATH dir fd", consistent && seen >= 3 && found_self);
+    /* (The tree's own processes only: its pid 1 and this one at least.) */
+    check("/proc/<pid>/stat via openat on an O_PATH dir fd", consistent && seen >= 2 && found_self);
+
+    /* The pids are the tree's own namespace: its init is pid 1 with no parent in it, and a
+     * process's parent in /proc is getppid's. */
+    {
+        char sbuf[512] = {0};
+        int fd = open("/proc/1/stat", O_RDONLY);
+        int ok1 = fd >= 0 && read(fd, sbuf, sizeof sbuf - 1) > 0;
+        if (fd >= 0) close(fd);
+        char *rp = strrchr(sbuf, ')');
+        int ppid1 = -1;
+        if (rp) sscanf(rp + 2, "%*c %d", &ppid1);
+        char ppath[64];
+        snprintf(ppath, sizeof ppath, "/proc/%d/stat", getpid());
+        memset(sbuf, 0, sizeof sbuf);
+        fd = open(ppath, O_RDONLY);
+        int ok2 = fd >= 0 && read(fd, sbuf, sizeof sbuf - 1) > 0;
+        if (fd >= 0) close(fd);
+        rp = strrchr(sbuf, ')');
+        int myppid = -1;
+        if (rp) sscanf(rp + 2, "%*c %d", &myppid);
+        check("/proc/1 is the tree's init, /proc/self's parent getppid's", ok1 && ok2 && ppid1 == 0 && myppid == getppid());
+    }
     char link[32] = {0};
     readlink("/proc/self", link, sizeof link - 1);
     check("/proc/self points to the caller", atoi(link) == getpid());

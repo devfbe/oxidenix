@@ -11,6 +11,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/sysinfo.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -155,6 +156,44 @@ int main(int argc, char **argv, char **envp) {
     int st;
     waitpid(runner, &st, 0);
     check("a running program survives unlink of its file", WIFEXITED(st) && WEXITSTATUS(st) == 9);
+
+    /* The loader is the Linux server's (R8): #! scripts, execveat, and its errors. */
+    FILE *f = fopen("/tmp/script.sh", "w");
+    fprintf(f, "#!/bin/sh -e\nexit $(( $# + 20 ))\n");
+    fclose(f);
+    chmod("/tmp/script.sh", 0755);
+    char *sargs[] = {"script.sh", "a", "b", NULL};
+    check("a #! script runs with its interpreter and arguments", run("/tmp/script.sh", sargs) == 22);
+    f = fopen("/tmp/loop.sh", "w");
+    fprintf(f, "#!/tmp/loop.sh\n");
+    fclose(f);
+    chmod("/tmp/loop.sh", 0755);
+    check("a script that is its own interpreter: ELOOP", run("/tmp/loop.sh", sargs) == 100 + ELOOP);
+    f = fopen("/tmp/junk", "w");
+    fprintf(f, "not a program\n");
+    fclose(f);
+    chmod("/tmp/junk", 0755);
+    check("a file that is neither ELF nor #!: ENOEXEC", run("/tmp/junk", t) == 100 + ENOEXEC);
+    chmod("/tmp/junk", 0644);
+    check("a file without an execute bit: EACCES", run("/tmp/junk", t) == 100 + EACCES);
+    check("a directory: EACCES", run("/tmp", t) == 100 + EACCES);
+    pid_t ea = fork();
+    if (ea == 0) {
+        int fd = open("/bin/hello", O_RDONLY);
+        char *hargs[] = {"hello", NULL};
+        char *env[] = {NULL};
+        syscall(SYS_execveat, fd, "", hargs, env, AT_EMPTY_PATH);
+        _exit(100 + errno);
+    }
+    waitpid(ea, &st, 0);
+    check("execveat(fd, \"\", AT_EMPTY_PATH) runs the descriptor's file", WIFEXITED(st) && WEXITSTATUS(st) == 42);
+    static char huge[200 * 1024];
+    memset(huge, 'x', sizeof huge - 1);
+    char *bigargs[] = {"hello", huge, NULL};
+    check("an argument beyond MAX_ARG_STRLEN: E2BIG", run("/bin/hello", bigargs) == 100 + E2BIG);
+    unlink("/tmp/script.sh");
+    unlink("/tmp/loop.sh");
+    unlink("/tmp/junk");
 
     printf("%s\n", failures ? "exectest: FAILED" : "exectest: all passed");
     return failures != 0;

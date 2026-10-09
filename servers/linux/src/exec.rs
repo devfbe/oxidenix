@@ -585,9 +585,11 @@ fn build_stack(p: &Prepared, bias: u64, interp_base: u64, entry: u64) -> Result<
     usercopy::to_program(platform, b"x86_64\0")?;
     sp -= 16;
     let random = sp;
-    let seed = unsafe { core::arch::x86_64::_rdtsc() };
-    let mixed = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ (sp << 7);
-    usercopy::write(random, &[seed.rotate_left(17) ^ mixed, mixed.rotate_left(29) ^ seed])?;
+    // AT_RANDOM: 16 bytes of the kernel's generator (musl seeds its stack
+    // protector and pointer guard from them).
+    let mut bytes = [0u8; 16];
+    syscall(SYS_RANDOM, [bytes.as_mut_ptr() as u64, bytes.len() as u64, 0, 0, 0, 0]);
+    usercopy::to_program(random, &bytes)?;
     let hwcap = core::arch::x86_64::__cpuid(1).edx as u64;
     let auxv = [
         (AT_MINSIGSTKSZ, 2048),

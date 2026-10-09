@@ -821,6 +821,9 @@ pub const SYS_INIT_ARGS: u64 = 1152;
 /// that the server did not place itself (`MO_FIXED`): the program break,
 /// which the server keeps (brk).
 pub const SYS_VM_FLOOR: u64 = 1153;
+/// `random(buf, len)`: `len` (at most 256) bytes of the kernel's generator
+/// into the server's memory (execve's AT_RANDOM).
+pub const SYS_RANDOM: u64 = 1154;
 
 /// What `proc_info` tells about a process.
 #[repr(C)]
@@ -918,7 +921,7 @@ pub const TEST_SERVER_TICKS: u64 = 1518;
 /// other instance, and `sync_done` is the service thread's only. 0 if every check held, else the negative number of the
 /// first that failed.
 pub const TEST_CACHED: u64 = 1516;
-/// `()`: the server passes a `getpid` through to the kernel in its place
-/// and returns its result: a call that always counts as passed through
-/// (`legacy_calls`), whatever the server comes to handle itself.
+/// `()`: the server passes a `sched_yield` through to the kernel in its
+/// place and returns its result (0): a call that always counts as passed
+/// through (`legacy_calls`), whatever the server comes to handle itself.
 pub const TEST_PASS_THROUGH: u64 = 1517;

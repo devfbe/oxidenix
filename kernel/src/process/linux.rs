@@ -1559,7 +1559,7 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
                 }
             }
         }
-        SYS_PROC_SELF..=SYS_VM_FLOOR => process_call(&instance, nr, a),
+        SYS_PROC_SELF..=SYS_RANDOM => process_call(&instance, nr, a),
         SYS_SET_USERCOPY => {
             let (insn, fixup) = (a[0], a[1]);
             let code = IMAGE_BASE..THREADS_BASE;
@@ -2101,6 +2101,13 @@ fn process_call(instance: &Arc<Instance>, nr: u64, a: [u64; 6]) -> SysResult {
             }
             super::current_mm().ok_or(EINVAL)?.lock().brk_end = a[0];
             Ok(0)
+        }
+        SYS_RANDOM => {
+            let mut bytes = [0u8; 256];
+            let n = (a[1] as usize).min(bytes.len());
+            crate::random::fill(&mut bytes[..n]);
+            super::uaccess::copy_to_server(a[0], &bytes[..n])?;
+            Ok(n as i64)
         }
         _ => Err(ENOSYS),
     }

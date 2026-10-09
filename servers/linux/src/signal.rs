@@ -788,6 +788,8 @@ fn next_action(tid: Pid, pid: Pid) -> Next {
             return Next::Die(sig);
         }
         // A handler: its mask, and the frame's (the caller's own after a temporary one).
+        // The handler runs with the mask in force (a temporary one, if a call set it)
+        // and the action's; its frame restores the caller's own.
         let th = t.threads.get_mut(&tid).expect("checked");
         let old_mask = th.sig.restore.take().unwrap_or(th.sig.mask);
         local::get().flags.fetch_and(!local::RESTORE_MASK, Ordering::Relaxed);
@@ -795,7 +797,7 @@ fn next_action(tid: Pid, pid: Pid) -> Next {
         if action.flags & SA_NODEFER == 0 {
             block |= bit(sig);
         }
-        th.sig.mask = (old_mask | block) & !UNBLOCKABLE;
+        th.sig.mask = (th.sig.mask | block) & !UNBLOCKABLE;
         // (An SS_AUTODISARM stack is disarmed when a frame goes onto it: `setup_frame`.)
         let alt = th.sig.alt;
         let trap = core::mem::take(&mut th.sig.trap);
@@ -1449,6 +1451,11 @@ fn set_temporary_mask(mask: u64) {
     if th.sig.mask & !own != 0 {
         retarget(&t, pid);
     }
+    // What the temporary mask lets in now ends the wait (a call that finds its answer
+    // without waiting still gives it, as Linux's poll checks its files first).
+    if deliverable(&t.threads[&tid], &t.procs[&pid]) != 0 {
+        t.kick(tid);
+    }
 }
 
 /// After a call that waited with a temporary mask did not end by EINTR: the caller's own
@@ -1473,8 +1480,7 @@ fn drop_temporary_mask() {
 pub fn with_mask<T>(mask: Option<u64>, wait: impl FnOnce() -> Result<T, i64>) -> Result<T, i64> {
     let Some(mask) = mask else { return wait() };
     set_temporary_mask(mask);
-    // The temporary mask may let a pending signal in: the wait must see it.
-    let result = if pending() { Err(EINTR) } else { wait() };
+    let result = wait();
     if !matches!(result, Err(EINTR)) {
         drop_temporary_mask();
     }
