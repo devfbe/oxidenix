@@ -91,8 +91,11 @@ pub struct State {
 /// `restricted_enter()`: runs the program with the registers in the
 /// thread's `State` until it traps; returns the reason (`REASON_*`). With
 /// the thread's kick flag set it returns `REASON_KICK` at once, without
-/// running the program, and clears the flag; a thread marked dying
-/// (`thread_kill`, or a process the kernel killed) exits here instead.
+/// running the program, and clears the flag. A thread marked dying
+/// (`thread_kill`, or a process the kernel killed) gets `REASON_EXIT` once,
+/// so that its server lets go of what the thread holds (its descriptor
+/// table: before its parent learns of the end) and exits it
+/// (`thread_exit`); a dying thread that enters again exits here.
 pub const SYS_RESTRICTED_ENTER: u64 = 1010;
 /// `legacy_syscall()`: has the kernel's own Linux implementation carry out
 /// the system call in `State` (phase R1's pass-through, which goes away as
@@ -112,6 +115,9 @@ pub const REASON_KICK: u64 = 2;
 /// file's end, a division by zero, an invalid opcode, a breakpoint, ...):
 /// `State::trap_*` say which, for the server's signal.
 pub const REASON_EXCEPTION: u64 = 3;
+/// The thread must die (`thread_kill`, or a process the kernel killed):
+/// the server ends it with `thread_exit` (see `SYS_RESTRICTED_ENTER`).
+pub const REASON_EXIT: u64 = 4;
 /// `trap_kind` of a page fault: no mapping at the address, a mapping that
 /// does not allow the access, an access the mapping's object cannot serve
 /// (beyond the end of a file, an I/O error).
@@ -686,8 +692,10 @@ pub const PROC_SHARE_VM: u64 = 2;
 /// word: zeroed and woken (futex) when it exits. Its server starts in
 /// `ROLE_PROGRAM` with `cookie` and its key (see `ROLE_PROGRAM`). The key
 /// names the thread for the calls below until it is gone; a key is never
-/// reused (a thread area's generation counts up). EAGAIN when the kernel's
-/// task table is full or the caller's process is ending.
+/// reused (a thread area's generation counts up; an area whose 31 bits of
+/// generations are used up is retired). EAGAIN when the kernel's task table
+/// is full or the caller's process is ending, EINTR when the caller is
+/// dying (`thread_kill`).
 pub const SYS_THREAD_CREATE: u64 = 1142;
 pub const THREAD_SETTLS: u64 = 1;
 /// `thread_kick(key)`: the thread (0: the caller) looks at its signals: it

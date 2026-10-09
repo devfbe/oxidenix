@@ -19,7 +19,7 @@
 //! and then, before the new program runs, so its close-on-exec descriptors are closed as on
 //! Linux), and the end of a table (its last `Arc`) closes its descriptors: on the exiting
 //! thread (`process::exit`), or, for a thread the kernel ended without the server, on the
-//! worker (`release_later`).
+//! worker (`end_later`), which then ends the process if that was its last thread.
 //!
 //! Locking: one lock per table, never held while program memory is copied
 //! or a description is let go of (closing a file may take long, and may
@@ -195,36 +195,79 @@ pub fn current() -> Arc<FilesContext> {
     }
 }
 
-/// Tables of threads the kernel ended, for the worker (`release_later`).
-static ENDED: Mutex<Vec<Arc<FilesContext>>> = Mutex::new(Vec::new());
+/// Tables of threads the kernel ended, for the worker (`end_later`), each with the process
+/// whose end waits for it (0: none). Room for one per program thread is reserved when the
+/// thread is made (`reserve_end`), so the service thread never allocates (nor closes
+/// anything) to hand one over.
+struct Ended {
+    items: Vec<(Arc<FilesContext>, u32)>,
+    /// Program threads that may still hand a table over (live ones, and those whose handed
+    /// table the worker has not taken yet): `items`' capacity is at least this.
+    reserved: usize,
+}
+
+static ENDED: Mutex<Ended> = Mutex::new(Ended { items: Vec::new(), reserved: 0 });
+
+/// Room for a new program thread's table at its end (ENOMEM without it).
+pub fn reserve_end() -> Result<(), i64> {
+    let mut e = ENDED.lock();
+    let want = e.reserved + 1;
+    let len = e.items.len();
+    e.items.try_reserve(want - len).map_err(|_| ENOMEM)?;
+    e.reserved = want;
+    Ok(())
+}
+
+/// A thread's reservation goes unused (a clone that failed, a thread that let go of its
+/// table itself).
+pub fn unreserve_end() {
+    let mut e = ENDED.lock();
+    e.reserved = e.reserved.saturating_sub(1);
+}
 
 /// A thread the kernel ended still had its table (`process::thread_ended`, on the service
 /// thread): the worker lets go of it, which closes its descriptors with its last reference
-/// (closing a socket takes its locks, which the service thread must never wait for).
-pub fn release_later(files: Arc<FilesContext>) {
-    let mut ended = ENDED.lock();
-    if ended.try_reserve(1).is_err() {
-        // No room to hand it over: closing here is the lesser evil (it cannot wait for a
-        // socket lock the worker holds, as the worker never waits for the service thread).
-        drop(ended);
-        drop(files);
-        return;
+/// (closing a socket takes its locks, which the service thread must never wait for), and
+/// then ends process `pid` if not 0: its parent learns of the end only after its
+/// descriptors closed (Linux's exit_files before exit_notify). False if it could not be
+/// handed over (the caller ends the process itself then). Called with the process table's
+/// lock held (lock order: `process::PROCS`, then `ENDED`).
+pub fn end_later(files: Arc<FilesContext>, pid: u32) -> bool {
+    let mut e = ENDED.lock();
+    // Within the thread's reservation there is room; without it (never, but for a first
+    // thread whose reservation failed) the table is kept for good rather than closed here.
+    if e.items.try_reserve(1).is_err() {
+        drop(e);
+        let msg = "[linux] no room to hand a descriptor table to the worker: kept\n";
+        syscall(SYS_SERVER_LOG, [msg.as_ptr() as u64, msg.len() as u64, 0, 0, 0, 0]);
+        core::mem::forget(files);
+        return false;
     }
-    ended.push(files);
-    drop(ended);
+    e.items.push((files, pid));
+    drop(e);
     HANDED.fetch_add(1, Ordering::AcqRel);
     crate::scm::request();
+    true
 }
 
 /// Tables handed to the worker, and let go of by it (a futex word).
 static HANDED: AtomicU32 = AtomicU32::new(0);
 static RELEASED: AtomicU32 = AtomicU32::new(0);
 
-/// The worker: lets go of the tables handed to it.
+/// The worker: lets go of the tables handed to it, one by one (the list keeps its room), and
+/// ends the processes that waited for them.
 pub fn release_ended() {
-    let ended = core::mem::take(&mut *ENDED.lock());
-    let n = ended.len() as u32;
-    drop(ended);
+    let mut n = 0;
+    loop {
+        let item = ENDED.lock().items.pop();
+        let Some((files, pid)) = item else { break };
+        drop(files);
+        if pid != 0 {
+            crate::process::end_deferred(pid);
+        }
+        unreserve_end();
+        n += 1;
+    }
     if n > 0 {
         RELEASED.fetch_add(n, Ordering::AcqRel);
         syscall(SYS_SERVER_FUTEX_WAKE, [&RELEASED as *const AtomicU32 as u64, u32::MAX as u64, 0, 0, 0, 0]);

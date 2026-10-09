@@ -99,7 +99,7 @@ pub fn request() {
 }
 
 /// The worker thread: lets go of the descriptor tables whose processes
-/// ended (`fdtable::release_later`) and collects whenever asked.
+/// ended (`fdtable::end_later`) and collects whenever asked.
 pub fn worker() -> ! {
     let mut done = 0;
     loop {

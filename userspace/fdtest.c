@@ -157,6 +157,17 @@ static void limits(void) {
     check("the old limits back", setrlimit(RLIMIT_NOFILE, &old) == 0 && getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur == old.rlim_cur);
 }
 
+/* The CLONE_VM|CLONE_VFORK|CLONE_FILES child (on a stack of its own):
+ * runs `fdtest exec-check vfork_fd 999`. */
+static int vfork_fd;
+static int vfork_exec(void *arg) {
+    (void)arg;
+    char a[16];
+    snprintf(a, sizeof a, "%d", vfork_fd);
+    execl("/bin/fdtest", "fdtest", "exec-check", a, "999", (char *)NULL);
+    _exit(9);
+}
+
 static void processes(void) {
     int p[2];
     pipe(p);
@@ -248,6 +259,75 @@ static void processes(void) {
     unlink("/tmp/fdtest.notelf");
     close(keep);
     close(gone);
+
+    /* A process killed inside execve (its server waits for an argument on
+     * a page the pager never supplies: TEST_PAGED_STUCK) still lets its
+     * table go, and before its parent learns of the end (Linux's
+     * exit_files before exit_notify): the pipe's only writer is gone by the
+     * time waitpid returns. */
+    pipe(p);
+    child = fork();
+    if (child == 0) {
+        close(p[0]);
+        char *stuck = (char *)0x221000000000;
+        if (syscall(1507, stuck) != 0) _exit(1);
+        char *args[] = {"fdtest", stuck, NULL};
+        execv("/bin/fdtest", args);
+        _exit(2);
+    }
+    close(p[1]);
+    sleep_ms(200);
+    kill(child, SIGKILL);
+    waitpid(child, &status, 0);
+    struct pollfd hup = {p[0], POLLIN, 0};
+    check("a process killed inside execve lets its descriptors go before wait",
+          WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL && poll(&hup, 1, 0) == 1 && (hup.revents & POLLHUP));
+    close(p[0]);
+
+    /* The same for a process killed while it runs its program (SIGKILL
+     * from outside, no handler): its descriptors are closed when waitpid
+     * returns, and its port is free. */
+    pipe(p);
+    int ls = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in la = {.sin_family = AF_INET, .sin_port = htons(47191), .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    int one = 1;
+    setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    child = fork();
+    if (child == 0) {
+        close(p[0]);
+        if (bind(ls, (struct sockaddr *)&la, sizeof la) != 0 || listen(ls, 1) != 0) _exit(1);
+        write(p[1], "r", 1);
+        for (volatile unsigned long spin = 0;; spin++) {
+        }
+    }
+    close(ls);
+    close(p[1]);
+    char r = 0;
+    read(p[0], &r, 1);
+    kill(child, SIGKILL);
+    waitpid(child, &status, 0);
+    hup = (struct pollfd){p[0], POLLIN, 0};
+    int closed = poll(&hup, 1, 0) == 1 && (hup.revents & POLLHUP);
+    int again = socket(AF_INET, SOCK_STREAM, 0);
+    setsockopt(again, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    int rebound = bind(again, (struct sockaddr *)&la, sizeof la) == 0 && listen(again, 1) == 0;
+    check("a process killed in its program closes its descriptors before wait", r == 'r' && WIFSIGNALED(status) && closed);
+    check("... and its listening port is free when wait returns", rebound);
+    close(again);
+    close(p[0]);
+
+    /* A vfork child sharing the table (CLONE_VFORK|CLONE_FILES): its
+     * parent goes on only after the new program's table was made, so a
+     * descriptor the parent closes then is still the child's. */
+    pipe(p);
+    vfork_fd = dup(p[0]);
+    static char vfork_stack[16384] __attribute__((aligned(16)));
+    child = clone(vfork_exec, vfork_stack + sizeof vfork_stack, CLONE_VM | CLONE_VFORK | CLONE_FILES | SIGCHLD, NULL);
+    close(vfork_fd);
+    waitpid(child, &status, 0);
+    check("a vfork parent sharing the table goes on after the child's copy", WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    close(p[0]);
+    close(p[1]);
 
     /* An exec closes a close-on-exec pipe end before the new program runs:
      * the reader sees the end at once. */

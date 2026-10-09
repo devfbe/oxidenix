@@ -140,6 +140,9 @@ pub extern "C" fn _start(state: *mut State, role: u64, cookie: u64, key: u64) ->
     } else {
         process::start_thread(cookie, key);
     }
+    if let Some(status) = local::pending_exit() {
+        process::die(status);
+    }
     // Its signals before its first instruction (a stop, a kill of its
     // process, a signal sent while it was made).
     signal::deliver(s, None);
@@ -165,6 +168,11 @@ fn serve(s: &mut State) -> ! {
                 // /data inodes the call let go of go now, before it returns
                 // (an unlink's blocks are free when it returns).
                 datafs::reap();
+                // A failure past an execve's point of no return ends the process here,
+                // where nothing of the call is left on the stack.
+                if let Some(status) = local::pending_exit() {
+                    process::die(status);
+                }
                 // The fast path: the program runs on, unless the call was
                 // interrupted or changed the thread's mask (a kick makes
                 // restricted_enter come back at once).
@@ -173,6 +181,9 @@ fn serve(s: &mut State) -> ! {
                 }
             }
             REASON_KICK => signal::deliver(s, None),
+            // Killed (by the process model or the kernel): the thread ends here, on a clean
+            // stack, letting go of what it holds first.
+            REASON_EXIT => process::exit_killed(),
             REASON_EXCEPTION => {
                 signal::exception(s);
                 signal::deliver(s, None);

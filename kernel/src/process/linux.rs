@@ -477,10 +477,14 @@ impl Instance {
     /// and the area's new generation).
     fn thread(&self) -> Result<(u64, PhysFrame, u64), i64> {
         let mut slots = self.slots.lock();
-        if let Some(n) = slots.free.pop() {
+        while let Some(n) = slots.free.pop() {
             let (state, gen) = slots.states.get_mut(&n).expect("a free area was mapped");
-            // (31 bits: a key is a positive return value.)
-            *gen = gen.wrapping_add(1) & 0x7fff_ffff;
+            // (31 bits: a key is a positive return value.) An area whose generations are
+            // used up is retired, so that no key is ever named twice.
+            if *gen == 0x7fff_ffff {
+                continue;
+            }
+            *gen += 1;
             return Ok((n, *state, n | (*gen as u64) << 32));
         }
         let n = slots.next;
@@ -969,6 +973,9 @@ pub struct LinuxThread {
     /// A program's thread whose end the service thread learns
     /// (`EVENT_THREAD_EXIT`): set once it was listed and started.
     announced: bool,
+    /// The dying thread was told so (`REASON_EXIT`): it exits at its next
+    /// `restricted_enter` if its server did not end it.
+    exit_told: bool,
     /// The server's registers while the program runs.
     normal: Frame,
 }
@@ -1004,6 +1011,7 @@ impl LinuxThread {
             trap_nr: None,
             key,
             announced: false,
+            exit_told: false,
             normal: Frame::default(),
         }
     }
@@ -1995,6 +2003,12 @@ fn thread_create(instance: &Arc<Instance>, a: [u64; 6]) -> SysResult {
     if ctid >= USER_END {
         return Err(EFAULT);
     }
+    // A dying caller makes no thread (Linux's copy_process with a fatal
+    // signal pending): it would escape the kill that ends the caller's
+    // process or the exec that ends its other threads.
+    if dying() {
+        return Err(EINTR);
+    }
     let mut regs = State::default();
     let bytes = unsafe { core::slice::from_raw_parts_mut(&mut regs as *mut State as *mut u8, core::mem::size_of::<State>()) };
     super::uaccess::copy_from_server(state, bytes)?;
@@ -2147,13 +2161,22 @@ pub fn kick_pending() -> bool {
 }
 
 /// restricted_enter() from the server (`f`): runs the program, unless the
-/// thread must die (it exits here, where its server holds no lock) or was
-/// kicked (`REASON_KICK` at once, the flag cleared).
+/// thread must die (`REASON_EXIT` once; then it exits here, where its
+/// server holds no lock) or was kicked (`REASON_KICK` at once, the flag
+/// cleared).
 pub fn enter(f: &mut Frame) -> Result<(), i64> {
     if with_current(|p| p.linux.as_ref().is_some_and(|l| l.pager)) {
         return Err(EPERM);
     }
     if dying() {
+        // Once to the server, which lets go of what the thread holds and
+        // exits it on a clean stack; a second time (a server that did not)
+        // the kernel ends the thread itself.
+        let told = with_current(|p| p.linux.as_mut().map(|l| core::mem::replace(&mut l.exit_told, true)));
+        if told == Some(false) {
+            f.rax = REASON_EXIT;
+            return Ok(());
+        }
         super::exit_thread(super::signal::SIGKILL as i32);
     }
     let me = super::sched::current();
@@ -2203,6 +2226,21 @@ pub fn legacy() -> Result<u64, i64> {
     load(&state, &mut program)?;
     crate::counters::add(|c| &c.legacy_calls, 1);
     super::sched::current().group.legacy_calls.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    // Processes and signals are the server's (R8): the kernel's Linux code
+    // must not create, end, exec, wait for or signal a Linux program's
+    // processes behind the server's tables, whatever a server passes on.
+    const SERVERS_OWN: &[u64] = &[
+        13, 14, 15, 34, 36, 37, 38, 56, 57, 58, 59, 60, 61, 62, 109, 112, 127, 128, 129, 130, 131, 200, 218, 219, 231, 234, 247, 297, 322, 435,
+    ];
+    if SERVERS_OWN.contains(&program.rax) {
+        program.rax = (-ENOSYS) as u64;
+        with_current(|p| {
+            if let Some(l) = p.linux.as_mut() {
+                save(&program, l.state());
+            }
+        });
+        return Ok(0);
+    }
     set_legacy(true);
     super::syscall::dispatch_linux(&mut program);
     set_legacy(false);

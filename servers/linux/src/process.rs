@@ -209,6 +209,8 @@ pub struct Table {
     next_hand: u64,
     /// Real-time signals queued in the instance.
     pub rt_queued: usize,
+    /// Ids a clone under way took (its records come later, in a second lock section).
+    pending: alloc::collections::BTreeSet<Pid>,
 }
 
 pub static PROCS: Mutex<Table> = Mutex::new(Table {
@@ -219,6 +221,7 @@ pub static PROCS: Mutex<Table> = Mutex::new(Table {
     next_pid: 1,
     next_hand: 1,
     rt_queued: 0,
+    pending: alloc::collections::BTreeSet::new(),
 });
 
 /// A child's start: what its server needs before the program runs (`thread_create`'s
@@ -236,9 +239,9 @@ impl Table {
     /// A free pid: not a live or zombie process's, not a thread's, not a process group's or
     /// session's. None when all are taken.
     fn alloc_pid(&mut self) -> Option<Pid> {
-        let used = |t: &Table, p: Pid| {
-            t.procs.contains_key(&p) || t.threads.contains_key(&p) || t.procs.values().any(|q| q.pgid == p || q.sid == p)
-        };
+        // The process groups and sessions in use, once (not per candidate).
+        let groups: alloc::collections::BTreeSet<Pid> = self.procs.values().flat_map(|q| [q.pgid, q.sid]).collect();
+        let used = |t: &Table, p: Pid| t.procs.contains_key(&p) || t.threads.contains_key(&p) || t.pending.contains(&p) || groups.contains(&p);
         let mut candidate = self.next_pid;
         for _ in 0..PID_MAX {
             if candidate >= PID_MAX {
@@ -310,6 +313,22 @@ impl Table {
             if t.key != 0 && !t.exited {
                 syscall(SYS_THREAD_KICK, [t.key, 0, 0, 0, 0, 0]);
             }
+        }
+    }
+
+    /// Gives thread `tid` its kernel key (its creator or the thread itself, whichever comes
+    /// first). A thread killed before it had one (a group exit or an exec's de_thread found
+    /// its record without a key) is killed now.
+    fn set_key(&mut self, tid: Pid, key: u64) {
+        let Some(th) = self.threads.get_mut(&tid) else { return };
+        if th.key == key {
+            return;
+        }
+        th.key = key;
+        let killed = th.exited;
+        self.keys.insert(key, tid);
+        if killed {
+            syscall(SYS_THREAD_KILL, [key, 0, 0, 0, 0, 0]);
         }
     }
 
@@ -402,6 +421,8 @@ pub fn register_init(key: u64) {
     let fs_ptr = Arc::as_ptr(&fs);
     let files = FilesContext::empty();
     let files_ptr = Arc::as_ptr(&files);
+    // (A fresh instance has the room; `end_later` copes without it.)
+    let _ = fdtable::reserve_end();
     {
         let mut t = PROCS.lock();
         let pid = t.alloc_pid().unwrap_or(1);
@@ -451,11 +472,7 @@ pub fn start_thread(cookie: u64, key: u64) {
         // As Linux's schedule_tail: a fault here is ignored.
         let _ = usercopy::write(birth.settid, &birth.tid);
     }
-    let mut t = PROCS.lock();
-    if let Some(th) = t.threads.get_mut(&birth.tid) {
-        th.key = key;
-        t.keys.insert(key, birth.tid);
-    }
+    PROCS.lock().set_key(birth.tid, key);
 }
 
 // ------------------------------------------------------------------ system calls
@@ -586,15 +603,26 @@ fn clone(s: &State, c: Clone) -> Result<i64, i64> {
             return Err(EINVAL);
         }
         let tid = t.alloc_pid().ok_or(EAGAIN)?;
+        t.pending.insert(tid);
         (tid, !thread && flags & CLONE_VM == 0 && flags & CLONE_CHILD_SETTID != 0)
     };
-    // CLONE_PARENT_SETTID before the child runs (pthread_create relies on it), and
-    // CLONE_CHILD_SETTID too where the child's memory is the caller's.
-    if flags & CLONE_PARENT_SETTID != 0 {
-        usercopy::write(c.ptid, &tid)?;
+    // Room for the thread's table at its end (`fdtable::end_later`).
+    if let Err(e) = fdtable::reserve_end() {
+        PROCS.lock().pending.remove(&tid);
+        return Err(e);
     }
+    // Undoes the above (and closes the kernel's process, if made) for a clone that fails.
+    let fail = |e: i64, handle: u64| -> i64 {
+        PROCS.lock().pending.remove(&tid);
+        fdtable::unreserve_end();
+        close_handle(handle);
+        e
+    };
+    // CLONE_CHILD_SETTID where the child's memory is the caller's, before the child runs.
     if flags & CLONE_CHILD_SETTID != 0 && flags & CLONE_VM != 0 {
-        usercopy::write(c.ctid, &tid)?;
+        if let Err(e) = usercopy::write(c.ctid, &tid) {
+            return Err(fail(e, 0));
+        }
     }
     // The kernel's process for a new one.
     let handle = if thread {
@@ -603,10 +631,17 @@ fn clone(s: &State, c: Clone) -> Result<i64, i64> {
         let pflags = if flags & CLONE_VM != 0 { PROC_SHARE_VM } else { PROC_FORK };
         let h = syscall(SYS_PROC_CREATE, [pflags, 0, 0, 0, 0, 0]);
         if h < 0 {
-            return Err(-h);
+            return Err(fail(-h, 0));
         }
         h as u64
     };
+    // CLONE_PARENT_SETTID in the caller's memory after the copy (a forked child's copy does
+    // not get it, as on Linux), before the child runs (pthread_create relies on it).
+    if flags & CLONE_PARENT_SETTID != 0 {
+        if let Err(e) = usercopy::write(c.ptid, &tid) {
+            return Err(fail(e, handle));
+        }
+    }
     let pid = if thread { my_pid } else { tid };
     let fs = {
         let mine = records::current();
@@ -618,21 +653,22 @@ fn clone(s: &State, c: Clone) -> Result<i64, i64> {
     } else {
         match fdtable::current().fork() {
             Ok(f) => f,
-            Err(e) => {
-                close_handle(handle);
-                return Err(e);
-            }
+            Err(e) => return Err(fail(e, handle)),
         }
     };
     let files_ptr = Arc::as_ptr(&files);
     // The records.
     {
         let mut t = PROCS.lock();
-        let Some(me_thread) = t.threads.get(&my_tid) else {
+        // Nothing new comes out of a process that began to end or exec meanwhile (Linux's
+        // copy_process checks under the lock that de_thread and the group exit take): a
+        // thread made now would escape their kill.
+        if t.procs.get(&my_pid).is_none_or(|p| p.exiting.is_some() || p.execing) || t.threads.get(&my_tid).is_none_or(|th| th.exited) {
             drop(t);
-            close_handle(handle);
-            return Err(ESRCH);
-        };
+            return Err(fail(EAGAIN, handle));
+        }
+        t.pending.remove(&tid);
+        let me_thread = &t.threads[&my_tid];
         let thread_sig = me_thread.sig.for_child(flags & CLONE_VM != 0 && flags & CLONE_VFORK == 0);
         let comm = me_thread.comm;
         if !thread {
@@ -719,15 +755,13 @@ fn clone(s: &State, c: Clone) -> Result<i64, i64> {
         drop(t);
         // (The child's table and record go here, after the lock.)
         drop(undone);
+        fdtable::unreserve_end();
         close_handle(handle);
         return Err(-key);
     }
     let vfork_words = {
         let mut t = PROCS.lock();
-        if let Some(th) = t.threads.get_mut(&tid) {
-            th.key = key as u64;
-            t.keys.insert(key as u64, tid);
-        }
+        t.set_key(tid, key as u64);
         name_kernel_thread(key as u64, &t.threads.get(&tid).map_or([0; 16], |th| th.comm));
         (flags & CLONE_VFORK != 0).then(|| t.procs.get(&pid).map(|p| p.words.clone())).flatten()
     };
@@ -798,6 +832,14 @@ pub fn exit(status: i32, group: bool) -> ! {
     unreachable!("thread_exit returned")
 }
 
+/// The calling thread was killed (`REASON_EXIT`): it ends with its process's exit status
+/// (a group exit's, else SIGKILL's; a kill by the kernel is the kernel's to report).
+pub fn exit_killed() -> ! {
+    let pid = local::pid();
+    let status = PROCS.lock().procs.get(&pid).and_then(|p| p.exiting).unwrap_or(signal::SIGKILL as i32);
+    exit(status, false)
+}
+
 /// The process ends as by a fatal signal or exit_group with `status`, from the calling
 /// thread (which ends too).
 pub fn die(status: i32) -> ! {
@@ -833,12 +875,10 @@ pub fn thread_ended(key: u64) {
         let mut t = PROCS.lock();
         let Some(tid) = t.keys.remove(&key) else { return };
         let Some(mut th) = t.threads.remove(&tid) else { return };
-        // A thread the kernel ended without the server (killed in its program, or by the
-        // kernel) still has its table: the worker lets go of it (closing sockets takes their
-        // locks, which the service thread must never wait for).
-        if let Some(files) = th.files.take() {
-            fdtable::release_later(files);
-        }
+        // Its signals go with it (and the instance's count of queued real-time ones).
+        let mut rt = t.rt_queued;
+        th.sig.pending.flush(!0, &mut rt);
+        t.rt_queued = rt;
         let pid = th.pid;
         let mut last = false;
         if let Some(p) = t.procs.get_mut(&pid) {
@@ -847,8 +887,22 @@ pub fn thread_ended(key: u64) {
             // An exec waits for the others to be gone.
             wake_word(&p.words.threads);
         }
+        // A thread the kernel ended without the server (a server that did not end it on
+        // `REASON_EXIT`) still has its table: the worker lets go of it (closing sockets takes
+        // their locks, which the service thread must never wait for), and only then ends its
+        // process if this was its last thread, so that the parent learns of the end after
+        // the descriptors closed.
+        let deferred = match th.files.take() {
+            Some(files) => fdtable::end_later(files, if last { pid } else { 0 }) && last,
+            None => {
+                fdtable::unreserve_end();
+                false
+            }
+        };
         if last {
-            process_end(&mut t, pid, &mut after);
+            if !deferred {
+                process_end(&mut t, pid, &mut after);
+            }
         } else {
             // A group stop does not wait for a thread that is gone; process signals it was
             // to take go to another.
@@ -857,6 +911,19 @@ pub fn thread_ended(key: u64) {
         th
     };
     drop(gone);
+    after.run();
+}
+
+/// The worker let go of the table of process `pid`'s last thread (`fdtable::end_later`): the
+/// process ends now.
+pub fn end_deferred(pid: Pid) {
+    let mut after = After::default();
+    {
+        let mut t = PROCS.lock();
+        if t.procs.get(&pid).is_some_and(|p| p.zombie.is_none() && p.threads.is_empty()) {
+            process_end(&mut t, pid, &mut after);
+        }
+    }
     after.run();
 }
 
@@ -893,6 +960,9 @@ fn process_end(t: &mut Table, pid: Pid, after: &mut After) {
         // A group exit's status, else the kernel's kill, else the main thread's own.
         let status = p.exiting.or((killed != 0).then_some(killed)).or(p.main_status).unwrap_or(0);
         p.zombie = Some(status);
+        // A zombie takes no signals: its pending ones go (and the instance's count of queued
+        // real-time ones).
+        p.sig.shared.flush(!0, &mut t.rt_queued);
         p.itimer = Default::default();
         (p.ppid, p.sid, p.pgid, core::mem::replace(&mut p.vfork, false))
     };
