@@ -201,7 +201,9 @@ pub fn isn(local: IpEndpoint, remote: IpEndpoint, now: Instant) -> u32 {
 /// A B-tree map of `entries` entries of `entry` bytes, at worst (nodes
 /// half full, and their headers).
 const fn btree(entries: usize, entry: usize) -> usize {
-    entries * (2 * entry + 16) + 4096
+    // Leaves at least 45 % full (B = 6: 5 of 11 entries) and the internal
+    // nodes above them (a sixth more), with their headers and edges.
+    entries * (entry * 9 / 4 + 32) + entries / 5 * 96 + 4096
 }
 
 /// What netd's heap holds at most, from the limits (every one of them is a
@@ -229,11 +231,17 @@ pub const HEAP_WORST: usize = {
     let owners = 2 * MAX_SMOLTCP * size_of::<(u16, u64)>();
     // Echo identifiers: `netring::ECHO_PER_OWNER` for each instance with a
     // channel, in two maps; the budgets' owners.
-    let echo = 2 * btree(netring::ECHO_PER_OWNER * MAX_CHANNELS, 32) + 5 * btree(MAX_CHANNELS, 32);
+    let echo = 2 * btree(netring::ECHO_PER_OWNER * MAX_CHANNELS, 32);
+    // The budgets' instances: each holds something or has a channel, so
+    // no more than sockets and channels (gone instances included).
+    let budgets = 5 * btree(MAX_SMOLTCP + MAX_CHANNELS, 32);
+    // The listeners' backlogs (no more handles than sockets: shrunk to
+    // what they hold), a round's sockets that finished closing.
+    let lists = 2 * MAX_SMOLTCP * size_of::<SocketHandle>() + MAX_CHANNELS * 64;
     // Frames: the loopback queue (twice `MAX_LOOPED` at most), one received,
     // the datagram scratch, a LINKS answer.
     let frames = (2 * 64 + 1) * (crate::virtio_net::MTU + 32) + if MAX_UDP > RAW_BUFFER { MAX_UDP } else { RAW_BUFFER } + 4096;
-    set + datagram + chans + closing + per_socket + owners + echo + frames
+    set + datagram + chans + closing + per_socket + owners + echo + budgets + lists + frames
 };
 
 /// netd's heap: the worst case with a quarter more for the allocator's
@@ -1283,6 +1291,9 @@ impl Service {
                 Err(_) => break,
             }
         }
+        // (No more room than its sockets: the heap's worst case counts
+        // handles, not what was asked for.)
+        set.shrink_to_fit();
         let Proto::Tcp(t) = &mut self.sock(c, sock)?.proto else { unreachable!("checked above") };
         if let Some(port) = port {
             t.local = Some(IpListenEndpoint { addr: None, port });
