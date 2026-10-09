@@ -25,6 +25,9 @@ virtio-net with user networking and the echo service at 10.0.2.100:7.
 | `fstat_disk` | `fstat` of a file on the disk: one IPC round trip to diskfs with a small request and reply; cycles, p50/p99 |
 | `fstat_tmpfs` | the same in tmpfs (no IPC), for comparison |
 | `stat_path_tmpfs` | `stat` of a path of four names in tmpfs: path resolution (the Linux server's since R6c.2b) and the attributes; cycles, p50/p99 |
+| `proc_meminfo_pread` | `pread` of `/proc/meminfo` (a system-wide file, procfs's) from offset 0 on an open descriptor, as top and htop re-read it; cycles, p50/p99 of 2000 |
+| `proc_self_stat_pread` | the same for `/proc/self/stat` (a process's own file) |
+| `proc_self_stat_open_read_close` | `/proc/self/stat` opened by path, read and closed; cycles, p50/p99 of 2000 |
 | `seq_write` | 16 MiB in 64 KiB `write`s to a new file, then `fsync`; MB/s |
 | `seq_read_disk` | the file with `O_DIRECT` in 64 KiB `pread`s (past the page cache, from the server); MB/s |
 | `seq_read_cached` | the file from the page cache in 64 KiB `pread`s; MB/s |
