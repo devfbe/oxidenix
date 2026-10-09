@@ -281,7 +281,10 @@ pub const TEST_PAGED: u64 = 1505;
 /// `()`: how many pages the pager supplied so far.
 pub const TEST_SUPPLIED: u64 = 1506;
 /// `(addr)`: a 1-page paged object the pager never supplies, mapped at
-/// `addr` (a thread touching it waits until it is killed).
+/// `addr` (a thread touching it waits until it is killed, or until the
+/// server lets go of the object). `(0)`: the server closes its handle of
+/// the latest such object: the kernel ends the waits for its page (EIO, a
+/// fault SIGBUS), since no answer can come any more; ENOENT if none.
 pub const TEST_PAGED_STUCK: u64 = 1507;
 /// `(addr)`: a 1-page paged object at `addr` whose first request the
 /// pager fails (mo_fail) and whose second it answers with "retry".
@@ -785,6 +788,11 @@ pub const SYS_PROC_INFO: u64 = 1116;
 /// /proc/self/fd until the descriptor table is the server's (R6e).
 pub const SYS_KFD_LIST: u64 = 1117;
 pub const KFD_LIST_MAX: u64 = 256;
+/// `test_mode() -> 0 | 1`: whether the kernel runs in test mode (it booted
+/// into /etc/autorun: the self-tests, a benchmark or a scripted run). The
+/// server's test hooks (`TEST_*`, which reach beyond their caller) answer
+/// only then, ENOSYS otherwise.
+pub const SYS_TEST_MODE: u64 = 1118;
 
 /// `(scenario)`: the server runs a channel scenario against the test
 /// service (servers/ringtest, `ring::selftest`): 1 rings and doorbells, 2
@@ -826,3 +834,10 @@ pub const TEST_CACHED: u64 = 1516;
 /// and returns its result: a call that always counts as passed through
 /// (`legacy_calls`), whatever the server comes to handle itself.
 pub const TEST_PASS_THROUGH: u64 = 1517;
+/// `(ino)`: the pager fails the next backing the kernel asks of it
+/// (`EVENT_MKWRITE`) for the /data file with inode number `ino`, as a full
+/// disk would (`mo_backed` not ok), and answers later ones as usual: the
+/// store through a shared mapping that asked raises SIGBUS, a later one
+/// asks again. Inode 0 disarms it; so does the inode leaving the server's
+/// cache (its number may go to another file). Test mode only.
+pub const TEST_MKWRITE_FAIL: u64 = 1519;

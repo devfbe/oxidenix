@@ -807,9 +807,21 @@ fn secure(inode: &DInode, object: u64, at: u64, to: u64) -> Result<u64, i64> {
 /// object `key`: its space is promised up to the file's end, or the store
 /// fails (SIGBUS, as on Linux when `page_mkwrite` finds no room).
 pub fn mkwrite(key: u64, offset: u64) {
-    // An object no inode has any more has no mapping that waits.
+    // An unknown key: its inode went, and with it the object's handle (the
+    // inode's own; every hold of the object holds the inode). There is no
+    // handle to answer with, and none is needed: at the object's last
+    // handle the kernel ended its waits (`PageCache::orphan`, EIO).
     let Some(inode) = by_key(key) else { return };
-    let Some(object) = *inode.object.lock() else { return };
+    // A key names an object only once `object` made it (under this lock,
+    // which keeps it set from then on).
+    let Some(object) = *inode.object.lock() else {
+        debug_assert!(false, "a backing asked for an inode without its object");
+        return;
+    };
+    if FAIL_MKWRITE.compare_exchange(inode.ino as u64, 0, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+        syscall(SYS_MO_BACKED, [object, offset, offset, 0, 0, 0]);
+        return;
+    }
     let size = syscall(SYS_MO_FILE_SIZE, [object, 0, 0, 0, 0, 0]).max(0) as u64;
     let to = (offset + PAGE).min(size).max(offset);
     let (end, ok) = match live(&inode).and_then(|_| secure(&inode, object, offset, to)) {
@@ -1397,7 +1409,8 @@ pub fn page(key: u64, offset: u64) {
     let index = offset / PAGE;
     // Every object's inode is in `keys` while it lives (its handle is the
     // inode's, and whatever maps or runs the object holds the inode): an
-    // unknown key has no object left, so nobody waits for it.
+    // unknown key has no handle left to answer with, and the kernel ended
+    // the waits for it at its last handle (`PageCache::orphan`).
     let Some(inode) = by_key(key) else { return };
     if let Err(_) = fill(&inode, index, 1) {
         // Whoever waits gets EIO (a mapping SIGBUS).
@@ -1615,6 +1628,9 @@ fn evict(ino: u32) {
             return;
         }
         t.inodes.remove(&ino);
+        // An armed test failure is this inode's, not a later file's that
+        // gets its number.
+        let _ = FAIL_MKWRITE.compare_exchange(ino as u64, 0, Ordering::Relaxed, Ordering::Relaxed);
         if let Some((d, _, n)) = inode.link.lock().take() {
             if t.names.get(&(d, n.clone())) == Some(&ino) {
                 t.names.remove(&(d, n));
@@ -1641,6 +1657,20 @@ pub fn closing() {
 }
 
 // ----------------------------------------------------------- self-test
+
+/// The inode whose next backing `mkwrite` fails (`TEST_MKWRITE_FAIL`; 0:
+/// none).
+static FAIL_MKWRITE: AtomicU64 = AtomicU64::new(0);
+
+/// `TEST_MKWRITE_FAIL` (see `restricted::TEST_MKWRITE_FAIL`): arms the
+/// failure for `ino`, or disarms it (0).
+pub fn fail_next_mkwrite(ino: u64) -> i64 {
+    if ino > u32::MAX as u64 {
+        return -EINVAL;
+    }
+    FAIL_MKWRITE.store(ino, Ordering::Relaxed);
+    0
+}
 
 /// `TEST_CACHED` (see `restricted::TEST_CACHED`).
 pub fn test(scenario: u64) -> i64 {

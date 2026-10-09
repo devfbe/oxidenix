@@ -332,7 +332,9 @@ pages and dirty marks the kernel keeps and whose data the server moves:
   length and the file's size at `out`): they become **pending**, zeroed frames pinned for the grant that nobody reads,
   maps or writes. diskfs reads into them by DMA; `mo_filled(handle, offset, pages, ok)` (1077)
   makes them the file's pages or drops them (the threads waiting for them get `EIO`, a mapping
-  `SIGBUS`; nothing is recorded where nobody waits, so a later access asks again) and wakes the
+  `SIGBUS`: a faulting thread is among a page's waiters before it asks, so the answer to its own
+  request cannot pass it by; nothing is recorded where nobody waits, so a later access asks
+  again) and wakes the
   waiters. No copy: the page the program maps is the page the device wrote. A grant looks at a
   bounded number of present pages per call (with interrupts off) and answers `EAGAIN` with the
   page to go on from. When the pager's thread ends, its pending pages go and their waiters fail.
@@ -358,9 +360,11 @@ pages and dirty marks the kernel keeps and whose data the server moves:
   first) and, after promising a range, `MO_BACKED` with the byte it is backed to: so `write(2)`
   fails with `ENOSPC` itself when the disk is full, never the write-back later. A store through
   a shared mapping into a page not backed sends `EVENT_MKWRITE` (key, offset) and waits with
-  the address space unlocked; `mo_backed(handle, first, end, ok)` (1083) answers (no room:
+  the address space unlocked, among the page's waiters from the moment it found the page
+  unbacked; `mo_backed(handle, first, end, ok)` (1083) answers (no room:
   `SIGBUS`, as Linux's `page_mkwrite`; a kernel copy into the mapping, e.g. `read(2)` from a pipe,
-  fails with `EFAULT` or a short count instead). The kernel's own stores into a space no one can
+  fails with `EFAULT` or a short count instead). A failed backing fails only the threads that
+  wait for the backing, not those that only read the page. The kernel's own stores into a space no one can
   lock yet (a fork child's `CLONE_CHILD_SETTID` word) wait for the backing the same way, holding
   the space. A file that grows write-protects the page that held its
   end if that page's new file bytes are not backed, so a mapping's next store there asks

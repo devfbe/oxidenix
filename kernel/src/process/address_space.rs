@@ -36,7 +36,7 @@
 //! (`tlb`), and frames are freed only after it.
 
 use super::tlb::{self, Tlb};
-use crate::fs::cache::{Dirtied, PageCache};
+use crate::fs::cache::{Dirtied, Lookup, PageCache, PageWait};
 use crate::memory;
 use crate::memory::frame::UserFrames;
 use crate::sync::{Mutex, MutexGuard};
@@ -307,9 +307,9 @@ pub struct AddressSpace {
     owner: Weak<Mm>,
     /// The program file it runs, kept from being written meanwhile.
     pub exe: Option<Hold>,
-    /// The page a fault found missing (`Fault::Retry`): the faulting thread
-    /// waits for it with the space unlocked.
-    awaited: Option<(Arc<PageCache>, u64, bool)>,
+    /// The page a fault found missing (`Fault::Retry`), the faulting thread
+    /// among its waiters already: it waits for it with the space unlocked.
+    awaited: Option<PageWait>,
 }
 
 /// An address space as tasks hold it: shared by the threads of a process
@@ -385,7 +385,7 @@ impl Mm {
             match (result, awaited) {
                 // (A file that keeps changing under it ends it after a few
                 // tries.)
-                (Err(Fault::Retry), Some((cache, index, backed))) if tries < MAX_FAULT_TRIES => match cache.wait_page(index, backed) {
+                (Err(Fault::Retry), Some(awaited)) if tries < MAX_FAULT_TRIES => match awaited.wait() {
                     Ok(frame) => held = frame,
                     Err(_) => return Err(Fault::Bus),
                 },
@@ -934,9 +934,12 @@ impl AddressSpace {
                 // address space is locked. A pager's page is waited for
                 // without the lock (`fault_or_retry`) unless `wait`.
                 let index = (offset + (page - v.start)) / PAGE;
-                let Some(frame) = cache.try_map_page(index, wait)? else {
-                    self.awaited = Some((cache.clone(), index, false));
-                    return Err(Fault::Retry);
+                let frame = match cache.try_map_page(index, wait)? {
+                    Lookup::Frame(frame) => frame,
+                    Lookup::Missing(awaited) => {
+                        self.awaited = Some(awaited);
+                        return Err(Fault::Retry);
+                    }
                 };
                 if *shared && cache.tracks_dirty() {
                     // Writable only once the store marked it dirty, and
@@ -1073,11 +1076,12 @@ impl AddressSpace {
             match cache.set_dirty(index, true) {
                 Dirtied::Yes => return Ok(()),
                 Dirtied::Gone => return Err(Fault::Bus),
-                Dirtied::Unbacked if !wait => {
-                    self.awaited = Some((cache.clone(), index, true));
+                Dirtied::Oom => return Err(Fault::Oom),
+                Dirtied::Unbacked(awaited) if !wait => {
+                    self.awaited = Some(awaited);
                     return Err(Fault::Retry);
                 }
-                Dirtied::Unbacked => match cache.wait_page(index, true) {
+                Dirtied::Unbacked(awaited) => match awaited.wait() {
                     Ok(frame) => frame.into_iter().for_each(PageCache::put_frame),
                     Err(_) => return Err(Fault::Bus),
                 },
@@ -1108,12 +1112,11 @@ impl AddressSpace {
         // The cache's frame (the entry's may be stale if the page was
         // reclaimed or cut meanwhile in a space that is no mapper yet).
         let frame = match cache.try_map_page(index, wait)? {
-            Some(frame) => frame,
-            None if !wait => {
-                self.awaited = Some((cache.clone(), index, false));
+            Lookup::Frame(frame) => frame,
+            Lookup::Missing(awaited) => {
+                self.awaited = Some(awaited);
                 return Err(Fault::Retry);
             }
-            None => return Err(Fault::Bus),
         };
         unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), memory::phys_to_virt(frame.start_address().as_u64() + va % PAGE), data.len()) };
         PageCache::put_frame(frame);
