@@ -336,6 +336,7 @@ kernel that handle them.
 - `docs/benchmarks/2026-10-09-40aac17-r7b-review.md` Benchmark 40aac17 (r7b-review)
 - `docs/benchmarks/2026-10-09-5fce3fc-base-ab.md` Benchmark 5fce3fc (base-ab)
 - `docs/benchmarks/2026-10-09-5fce3fc-base-ab2.md` Benchmark 5fce3fc (base-ab2)
+- `docs/benchmarks/2026-10-09-6a1f1a5-r8.md` Benchmark 6a1f1a5 (r8)
 - `docs/benchmarks/2026-10-09-6cb21ce-r8.md` Benchmark 6cb21ce (r8)
 - `docs/benchmarks/2026-10-09-714815d-r7b-final.md` Benchmark 714815d (r7b-final)
 - `docs/benchmarks/2026-10-09-802b396-quiet.md` Benchmark 802b396 (quiet)
