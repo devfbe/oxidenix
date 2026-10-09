@@ -100,6 +100,41 @@ static int tcp_pair(int fds[2]) {
     return fds[0] >= 0 && fds[1] >= 0 ? 0 : -1;
 }
 
+/* A process blocked on words only netd writes (a receive on a TCP connection whose peer
+ * never sends, an accept nobody connects to) ends at once when killed: no wait of the Linux server on a peer's word outlasts the
+ * waiter's death. */
+static void killed_while_waiting_on_netd(void) {
+    int fds[2];
+    if (tcp_pair(fds) < 0) {
+        check("tcp pair for the kill test", 0);
+        return;
+    }
+    int port = 0, l = listener(&port, 0);
+    for (int which = 0; which < 2; which++) {
+        pid_t kid = fork();
+        if (kid == 0) {
+            char c;
+            if (which == 0) recv(fds[0], &c, 1, 0);
+            if (which == 1) accept(l, NULL, NULL);
+            _exit(0);
+        }
+        struct timespec d = {0, 200000000};
+        nanosleep(&d, NULL);
+        long t0 = now_ms();
+        kill(kid, SIGKILL);
+        int st = 0;
+        waitpid(kid, &st, 0);
+        long took = now_ms() - t0;
+        const char *names[] = {"a receive", "an accept"};
+        char name[96];
+        snprintf(name, sizeof name, "SIGKILL ends %s waiting on netd at once (%ld ms)", names[which], took);
+        check(name, WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL && took < 500);
+    }
+    close(l);
+    close(fds[0]);
+    close(fds[1]);
+}
+
 /* Byte `i` of the bulk transfer's pattern. */
 static unsigned char pattern(unsigned long i) { return (unsigned char)(i * 131 + (i >> 12)); }
 
@@ -765,6 +800,7 @@ int main(void) {
     check("AF_INET6 sockets are not supported", socket(AF_INET6, SOCK_STREAM, 0) < 0 && errno == EAFNOSUPPORT);
 
     stream_semantics();
+    killed_while_waiting_on_netd();
     datagram_semantics();
     many_sockets();
 
