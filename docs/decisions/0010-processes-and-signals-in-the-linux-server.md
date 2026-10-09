@@ -68,6 +68,15 @@ shape of the kernel's interface:
    zombie of the kernel's as well; everything the server creates leaves the kernel's tables
    when its last thread ends.
 
+The descriptor tables (R6e, ADR 0009) and working-directory records belong to the thread
+records: `CLONE_FILES` and `CLONE_FS` share them, a fork copies them before the child
+exists, an execve makes the new table after its point of no return, and an exiting thread
+lets its table go itself. The kernel's records of both, and its descriptor tables of Linux
+processes, go. The server's calls return Linux's restart codes (`ERESTARTSYS`,
+`ERESTARTNOHAND`, `ERESTART_RESTARTBLOCK`, `ERESTARTNOINTR`; a plain EINTR of an
+interruptible wait counts as `ERESTARTSYS`), which its own delivery maps; temporary signal
+masks (sigsuspend, ppoll, pselect6, epoll_pwait) are the thread's state in the server.
+
 Interval timers get a service thread of their own (`ROLE_TIMER`): the kernel's timers stay
 mechanism (deadline sleeps), the timer's semantics (SIGALRM, reloading when the signal is
 taken) are the server's.

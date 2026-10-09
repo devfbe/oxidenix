@@ -36,6 +36,9 @@ virtio-net with user networking and the echo service at 10.0.2.100:7.
 | `clock_gettime` | `clock_gettime(CLOCK_MONOTONIC)` alone, cycles |
 | `read_4k_disk` | the same with `O_DIRECT`; ns, p50/p99 |
 | `tcp_loopback` | 32 MiB in 64 KiB `write`s over 127.0.0.1 to a forked receiver; MB/s |
+| `fork_wait` | `fork` of the benchmark (a small process), the child's `_exit(0)` and the parent's `waitpid`; µs, p50/p99 |
+| `fork_exec_wait` | the same with the child running `/bin/hello` (stdout to `/dev/null`): fork, execve with its ELF loading (the Linux server's since R8), exit and wait; µs, p50/p99 |
+| `signal_handled` | `kill` of the caller itself with `SIGUSR1` and a handler that counts: posting, the frame, the handler and `rt_sigreturn`; cycles, p50/p99 |
 | `tcp_network_echo` | 4 MiB through the network card to QEMU's echo service and back (sent while a forked reader drains the echo); MB/s. Bound by QEMU's user networking and the `cat` behind the echo service as much as by the guest |
 
 For each benchmark a `counters` line gives the counts **per operation** (per call, or per
