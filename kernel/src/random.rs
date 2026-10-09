@@ -37,9 +37,32 @@ fn source() -> Source {
     }
 }
 
+/// The CPU source's last value, and whether it failed the sanity check
+/// (`sane`): from then on it is not used.
+static LAST: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static BROKEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// A value of the CPU's source passes only if it is neither all zeros nor
+/// all ones nor the value before it (the failures of broken
+/// implementations, such as AMD's RDRAND returning all ones after
+/// suspend). There is no health test beyond that (no statistics): the
+/// source is one input among others, and the timing jitter is always mixed
+/// in too.
+fn sane(v: u64) -> bool {
+    use core::sync::atomic::Ordering::Relaxed;
+    let ok = v != 0 && v != u64::MAX && v != LAST.swap(v, Relaxed);
+    if !ok && !BROKEN.swap(true, Relaxed) {
+        crate::printkln!("[kernel] random: the CPU's entropy source repeats itself; not used any more");
+    }
+    ok
+}
+
 /// One 64-bit value from the CPU's source (it may be busy: retried a few
-/// times, as Intel advises), or None.
+/// times, as Intel advises), or None (none, busy, or failed `sane`).
 fn hardware(src: Source) -> Option<u64> {
+    if BROKEN.load(core::sync::atomic::Ordering::Relaxed) {
+        return None;
+    }
     for _ in 0..32 {
         let mut v = 0u64;
         let ok: u8;
@@ -51,7 +74,7 @@ fn hardware(src: Source) -> Option<u64> {
             }
         }
         if ok != 0 {
-            return Some(v);
+            return sane(v).then_some(v);
         }
         core::hint::spin_loop();
     }
@@ -89,16 +112,17 @@ pub fn init() {
             hw += 1;
         }
     }
-    // Jitter always, and much of it without a hardware source.
+    // The full round of jitter always, whatever the CPU's source gave.
     jitter(&mut entropy[64..]);
+    let mut more = [0u8; 512];
+    jitter(&mut more);
     let mut rng = RNG.lock();
     rng.reseed(&entropy);
-    if hw < 8 {
-        let mut more = [0u8; 512];
-        jitter(&mut more);
-        rng.reseed(&more);
-    }
+    rng.reseed(&more);
     drop(rng);
+    if hw < 8 && src != Source::None {
+        crate::printkln!("[kernel] random: the CPU's entropy source gave {} of 8 values", hw);
+    }
     let name = match src {
         Source::Rdseed => "RDSEED",
         Source::Rdrand => "RDRAND",

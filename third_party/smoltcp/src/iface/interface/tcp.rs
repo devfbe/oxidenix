@@ -29,6 +29,17 @@ impl InterfaceInner {
             &self.caps.checksum
         ));
 
+        // oxidenix: a new connection's SYN ends a TIME-WAIT of its 4-tuple
+        // (RFC 9293 3.10.7.4), so that a listener takes it, wherever the
+        // two sockets are in the set.
+        if tcp_repr.control == TcpControl::Syn && tcp_repr.ack_number.is_none() {
+            for tcp_socket in sockets.items_mut().filter_map(|i| Socket::downcast_mut(&mut i.socket)) {
+                if tcp_socket.yields_to_syn(self, &ip_repr, &tcp_repr) {
+                    tcp_socket.end_time_wait();
+                }
+            }
+        }
+
         for tcp_socket in sockets
             .items_mut()
             .filter_map(|i| Socket::downcast_mut(&mut i.socket))

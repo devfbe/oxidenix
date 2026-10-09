@@ -6,3 +6,4 @@ license = "GPL-3.0-only"
 
 [dependencies]
 ring = { path = "../ring" }
+csprng = { path = "../csprng" }
