@@ -398,6 +398,11 @@ pub fn send(pid: Pid, sig: u32) {
     }
 }
 
+/// Sends `sig` to the process `group` (from the kernel: no permission checks).
+pub fn send_to(group: &Arc<ThreadGroup>, sig: u32) {
+    post(group, None, sig);
+}
+
 /// kill(2). Privileged servers are protected like init on Linux: only the
 /// kernel may signal them. A direct kill fails with EPERM, group and
 /// broadcast kills skip them.

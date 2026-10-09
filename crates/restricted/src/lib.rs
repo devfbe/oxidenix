@@ -736,11 +736,13 @@ pub const SYS_PROC_IDS: u64 = 1113;
 pub const IDS_PGRP: u64 = 1;
 pub const IDS_ORPHANED: u64 = 2;
 /// `signal_group(scope, id, sig)`: sends `sig` from the terminal (no
-/// permission checks) to process `id` (`SIGNAL_PROCESS`) or every process of
-/// group `id` (`SIGNAL_PGRP`) of the caller's instance. ESRCH for none.
+/// permission checks) to process `id` (`SIGNAL_PROCESS`), every process of
+/// group `id` (`SIGNAL_PGRP`), or the leader of session `id` if it still leads
+/// it (`SIGNAL_LEADER`), of the caller's instance. ESRCH for none.
 pub const SYS_SIGNAL_GROUP: u64 = 1114;
 pub const SIGNAL_PROCESS: u64 = 0;
 pub const SIGNAL_PGRP: u64 = 1;
+pub const SIGNAL_LEADER: u64 = 2;
 /// `signal_state(sig) -> bits`: `SIGNAL_IGNORED` if the calling process
 /// ignores `sig` (SIG_IGN), `SIGNAL_BLOCKED` if the calling thread blocks it
 /// (SIGTTIN and SIGTTOU of background reads and writes).

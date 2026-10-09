@@ -1756,8 +1756,19 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             }
             match scope {
                 SIGNAL_PROCESS => {
-                    super::proc_ids(instance.id, id, false).ok_or(ESRCH)?;
-                    super::signal::send(id, sig as u32);
+                    // The process the instance check found, not the pid looked up
+                    // again (it could be another process's by then).
+                    let group = super::group(id).filter(|g| super::in_instance(g, instance.id)).ok_or(ESRCH)?;
+                    super::signal::send_to(&group, sig as u32);
+                    Ok(0)
+                }
+                SIGNAL_LEADER => {
+                    // Only while it still leads session `id` (checked on the
+                    // process it signals).
+                    let group = super::group(id)
+                        .filter(|g| super::in_instance(g, instance.id) && g.tgid == id && g.info.lock().sid == id)
+                        .ok_or(ESRCH)?;
+                    super::signal::send_to(&group, sig as u32);
                     Ok(0)
                 }
                 SIGNAL_PGRP => {

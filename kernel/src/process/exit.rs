@@ -153,12 +153,15 @@ fn process_exit(group: &Arc<ThreadGroup>, status: i32) {
     // Orphans go to the kernel, which reaps them; those that asked for it
     // (PR_SET_PDEATHSIG) get a signal.
     let mut death_signals: Vec<(Pid, u32)> = Vec::new();
+    // The process groups and sessions of the children it leaves.
+    let mut children: Vec<(Pid, Pid)> = Vec::new();
     {
         let table = TABLE.lock();
         for g in table.groups.values() {
             let mut info = g.info.lock();
             if info.ppid == pid && g.tgid != pid {
                 info.ppid = 0;
+                children.push((info.pgid, info.sid));
                 // The new parent hears of the end the ordinary way.
                 info.exit_signal = signal::SIGCHLD;
                 if info.pdeath_sig != 0 {
@@ -184,6 +187,47 @@ fn process_exit(group: &Arc<ThreadGroup>, status: i32) {
     let exit_signal = if parent_protected && exit_signal != 0 { signal::SIGCHLD } else { exit_signal };
     if exit_signal != 0 {
         signal::send(ppid, exit_signal);
+    }
+    kill_orphaned_pgrps(group, ppid, &children);
+}
+
+/// POSIX (Linux's `kill_orphaned_pgrp`): a process group this exit leaves orphaned
+/// (no member has a parent in another group of its session any more) that has stopped
+/// members gets SIGHUP, then SIGCONT, so its jobs are not stopped for ever with nobody
+/// to continue them. Candidates: the exiting process's own group, if its parent tied
+/// it to the session, and the groups of its children, if it tied them. For the Linux
+/// server's process trees; process groups and with them this go to the server with
+/// the process model (R8).
+fn kill_orphaned_pgrps(group: &Arc<ThreadGroup>, ppid: Pid, children: &[(Pid, Pid)]) {
+    const SIGHUP: u32 = 1;
+    let instance = group.instance.load(Ordering::Acquire);
+    if instance == 0 {
+        return;
+    }
+    let (pgid, sid) = {
+        let info = group.info.lock();
+        (info.pgid, info.sid)
+    };
+    let mut candidates: Vec<Pid> = Vec::new();
+    if ppid != 0 {
+        let parent = TABLE.lock().groups.get(&ppid).cloned();
+        if let Some(parent) = parent {
+            let p = parent.info.lock();
+            if p.pgid != pgid && p.sid == sid {
+                candidates.push(pgid);
+            }
+        }
+    }
+    for &(cpgid, csid) in children {
+        if cpgid != pgid && csid == sid && !candidates.contains(&cpgid) {
+            candidates.push(cpgid);
+        }
+    }
+    for pg in candidates {
+        if super::pgrp_orphaned(instance, pg) && super::pgrp_stopped(instance, pg) {
+            signal::send_pgrp_in(instance, pg, SIGHUP);
+            signal::send_pgrp_in(instance, pg, signal::SIGCONT);
+        }
     }
 }
 

@@ -218,7 +218,7 @@ pub fn getsid(pid: Pid) -> SysResult {
 }
 
 /// Whether `g` is a program of Linux server instance `instance`.
-fn in_instance(g: &ThreadGroup, instance: u64) -> bool {
+pub(super) fn in_instance(g: &ThreadGroup, instance: u64) -> bool {
     g.tgid != 0 && !g.privileged.load(Ordering::Relaxed) && g.instance.load(Ordering::Acquire) == instance
 }
 
@@ -263,6 +263,16 @@ pub fn pgrp_orphaned(instance: u64, pgid: Pid) -> bool {
         }
     }
     true
+}
+
+/// Whether a live member of process group `pgid` of instance `instance` is stopped
+/// (Linux's `has_stopped_jobs`).
+pub fn pgrp_stopped(instance: u64, pgid: Pid) -> bool {
+    let table = TABLE.lock();
+    table.groups.values().filter(|g| in_instance(g, instance)).any(|g| {
+        let info = g.info.lock();
+        info.pgid == pgid && info.exit_status.is_none() && info.threads.iter().any(|t| t.state() == State::Stopped)
+    })
 }
 
 pub fn setsid() -> SysResult {

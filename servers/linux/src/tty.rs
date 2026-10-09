@@ -6,16 +6,21 @@
 //! descriptor table, as pipes are).
 //!
 //! Locks: `inner` holds the state and is never held across a copy to or from program
-//! memory, nor across a wait or the console's write. Reads go one at a time (`rlock`): the
-//! bytes are peeked under `inner`, copied to the program with only `rlock` held, and
-//! consumed after, unless an input flush came in between (`Inner::epoch`); a change of
-//! settings takes `rlock` too (order: `rlock`, then `inner`). Output is processed under
-//! `inner`; a pty's goes to its master's buffer there, the console's to the device after
-//! (the kernel keeps one write's bytes together; no lock of the server is held across it,
-//! which would give a flooding writer a lock holder's priority for the whole write). Every
-//! change bumps `seq` and wakes its waiters (interruptible server futex waits, with a
-//! deadline for VTIME), and reports the readiness of the terminal's open file descriptions
-//! to the kernel under `inner`, so reports never arrive out of order.
+//! memory, nor across a wait or the console's write. A read or a write takes its turn
+//! (`turn`, Linux's atomic_read_lock and atomic_write_lock) for the whole call: an
+//! interruptible wait on `seq`, not a lock of `sync`, since it is held across waits for
+//! input or room. Within a read the bytes are peeked under `inner`, copied to the program
+//! with only `rlock` held, and consumed after, unless an input flush came in between
+//! (`Inner::epoch`); a change of settings takes `rlock` for the change (order: `rlock`,
+//! then `inner`). `rlock` is held across the copy, where a fault may wait for the pager:
+//! safe, since only programs' reads and settings changes take it, never the pager. Output
+//! is processed under `inner`; a pty's goes to its master's buffer there, the console's to
+//! the device after (no lock of `sync` is held across it, which would give a flooding
+//! writer a lock holder's priority for the whole write). Echoes take no turn and never
+//! wait: the service thread processes the keyboard's input (`console::device_echo`).
+//! Every change bumps `seq` and wakes its waiters (interruptible server futex waits, with
+//! a deadline for VTIME), and reports the readiness of the terminal's open file
+//! descriptions to the kernel under `inner`, so reports never arrive out of order.
 //!
 //! Process groups and sessions are the kernel's until R8: the server asks for them
 //! (`ids`), sends the terminal's signals through the kernel (`signal`) and learns of a
@@ -792,12 +797,11 @@ impl Tty {
             self.changed(&mut inner, true, true);
             (leader, fg)
         };
-        // The leader, if it still leads that session.
+        // The leader, if it still leads that session (the kernel checks it on the
+        // process it signals).
         if let Some(sid) = leader {
-            if ids(sid, 0).is_ok_and(|i| i.pid == sid && i.sid == sid) {
-                signal(SIGNAL_PROCESS, sid, SIGHUP);
-                signal(SIGNAL_PROCESS, sid, SIGCONT);
-            }
+            signal(SIGNAL_LEADER, sid, SIGHUP);
+            signal(SIGNAL_LEADER, sid, SIGCONT);
         }
         if exit_session {
             if let Some(fg) = fg {
