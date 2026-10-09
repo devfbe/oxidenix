@@ -888,9 +888,32 @@ impl Drop for Record {
     }
 }
 
+/// Grants the console device to `instance` (None: the kernel's monitor, which
+/// takes it back when the tree it started has ended its first process); the
+/// instance that held it gets `EVENT_CONSOLE_LOST` (ADR 0007).
+pub fn console_grant(instance: Option<&Arc<Instance>>) {
+    let (id, chan) = instance.map_or((0, 0), |i| (i.id, i.pager_chan()));
+    let old = crate::drivers::console_device::set_holder(id, chan);
+    if old != 0 && old != id {
+        if let Some(previous) = instances(None).into_iter().find(|i| i.id == old) {
+            previous.queue_event(Event { kind: EVENT_CONSOLE_LOST, a: 0, b: 0 });
+        }
+    }
+}
+
+impl Instance {
+    /// The process of a session's leader (`sid`) of this instance ended: its
+    /// server dissociates the session's controlling terminal (until the
+    /// process model is the server's, R8).
+    pub fn session_ended(&self, sid: u64) {
+        self.queue_event(Event { kind: EVENT_SESSION_END, a: sid, b: 0 });
+    }
+}
+
 impl Drop for Instance {
     /// No address space shows the region any more: its frames go.
     fn drop(&mut self) {
+        crate::drivers::console_device::release(self.id);
         memory::uncommit(self.heap_pages.load(core::sync::atomic::Ordering::Relaxed));
         memory::with_frames(|frames| unsafe {
             free_level(frames, self.pdpt, 3);
@@ -943,8 +966,9 @@ pub struct LinuxThread {
 impl LinuxThread {
     /// A thread of `instance` whose program starts with the registers of
     /// `program`; returns it and the frame the thread starts with (the
-    /// server's entry, on the thread's server stack).
-    pub fn new(instance: Arc<Instance>, program: &Frame) -> Result<(LinuxThread, Frame), i64> {
+    /// server's entry, on the thread's server stack). `role`: `ROLE_PROGRAM`,
+    /// or `ROLE_INIT` for the first thread of a new tree.
+    pub fn new(instance: Arc<Instance>, program: &Frame, role: u64) -> Result<(LinuxThread, Frame), i64> {
         let (slot, state) = instance.thread()?;
         // A slot's count of server locks starts at 0 (a thread that died
         // holding some left it).
@@ -952,7 +976,7 @@ impl LinuxThread {
         let thread =
             LinuxThread { instance, slot, state, restricted: false, pager: false, events: false, in_legacy: false, trap_nr: None, closed_now: Vec::new(), pinned: Vec::new(), fs_child: None, exec_target: None, normal: Frame::default() };
         save(program, thread.state());
-        let start = thread.start(ROLE_PROGRAM);
+        let start = thread.start(role);
         Ok((thread, start))
     }
 
@@ -990,6 +1014,11 @@ impl LinuxThread {
         start.rdi = thread_state(self.slot);
         start.rsi = role;
         start
+    }
+
+    /// The instance of a program's thread (None for a service thread's).
+    pub fn program_instance(&self) -> Option<Arc<Instance>> {
+        (!self.pager).then(|| self.instance.clone())
     }
 
     /// Whether the thread's CPU shows the normal view (the server runs).
@@ -1645,6 +1674,116 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             super::uaccess::copy_to_server(a[0], &ids)?;
             Ok(0)
         }
+        SYS_CONSOLE_READ => {
+            use crate::drivers::console_device;
+            if console_device::holder() != instance.id {
+                return Err(EIO);
+            }
+            let mut buf = [0u8; 512];
+            let n = console_device::read(&mut buf[..(a[1] as usize).min(512)]);
+            // (A bad buffer of the server's loses the bytes.)
+            super::uaccess::copy_to_server(a[0], &buf[..n])?;
+            Ok(n as i64)
+        }
+        SYS_CONSOLE_WRITE => {
+            use crate::drivers::console_device;
+            if a[2] & !CONSOLE_ECHO != 0 {
+                return Err(EINVAL);
+            }
+            let mut buf = [0u8; 512];
+            if a[2] & CONSOLE_ECHO != 0 {
+                // Never waits (the service thread's echoes).
+                let n = a[1].min(buf.len() as u64) as usize;
+                super::uaccess::copy_from_server(a[0], &mut buf[..n])?;
+                return console_device::echo(instance.id, &buf[..n]).map(|n| n as i64);
+            }
+            let mut done = 0u64;
+            let result = {
+                let _writer = console_device::writer()?;
+                loop {
+                    if done >= a[1] {
+                        break Ok(done as i64);
+                    }
+                    // Checked for every piece: a long write stops when the
+                    // console is taken away.
+                    if console_device::holder() != instance.id {
+                        break Err(EIO);
+                    }
+                    let n = (a[1] - done).min(buf.len() as u64) as usize;
+                    if let Err(e) = super::uaccess::copy_from_server(a[0] + done, &mut buf[..n]) {
+                        break Err(e);
+                    }
+                    console_device::write(&buf[..n]);
+                    done += n as u64;
+                }
+            };
+            console_device::flush_echo();
+            result
+        }
+        SYS_CONSOLE_INFO => {
+            if crate::drivers::console_device::holder() != instance.id {
+                return Err(EIO);
+            }
+            let (cols, rows) = crate::drivers::console::size();
+            let mut out = [0u8; 16];
+            out[..8].copy_from_slice(&(cols as u64).to_le_bytes());
+            out[8..].copy_from_slice(&(rows as u64).to_le_bytes());
+            super::uaccess::copy_to_server(a[0], &out)?;
+            Ok(0)
+        }
+        SYS_PROC_IDS => {
+            let (id, flags) = (a[0], a[1]);
+            if flags & !(IDS_PGRP | IDS_ORPHANED) != 0 || (flags & IDS_PGRP != 0 && id == 0) {
+                return Err(EINVAL);
+            }
+            let (pid, pgid, sid) = super::proc_ids(instance.id, id, flags & IDS_PGRP != 0).ok_or(ESRCH)?;
+            let orphaned = flags & IDS_ORPHANED != 0 && super::pgrp_orphaned(instance.id, pgid);
+            let mut out = [0u8; 32];
+            out[..8].copy_from_slice(&pid.to_le_bytes());
+            out[8..16].copy_from_slice(&pgid.to_le_bytes());
+            out[16..24].copy_from_slice(&sid.to_le_bytes());
+            out[24..].copy_from_slice(&(if orphaned { IDS_ORPHANED } else { 0 }).to_le_bytes());
+            super::uaccess::copy_to_server(a[2], &out)?;
+            Ok(0)
+        }
+        SYS_SIGNAL_GROUP => {
+            let (scope, id, sig) = (a[0], a[1], a[2]);
+            if sig == 0 || sig > super::signal::NSIG as u64 || id == 0 {
+                return Err(EINVAL);
+            }
+            match scope {
+                SIGNAL_PROCESS => {
+                    // The process the instance check found, not the pid looked up
+                    // again (it could be another process's by then).
+                    let group = super::group(id).filter(|g| super::in_instance(g, instance.id)).ok_or(ESRCH)?;
+                    super::signal::send_to(&group, sig as u32);
+                    Ok(0)
+                }
+                SIGNAL_LEADER => {
+                    // Only while it still leads session `id` (checked on the
+                    // process it signals).
+                    let group = super::group(id)
+                        .filter(|g| super::in_instance(g, instance.id) && g.tgid == id && g.info.lock().sid == id)
+                        .ok_or(ESRCH)?;
+                    super::signal::send_to(&group, sig as u32);
+                    Ok(0)
+                }
+                SIGNAL_PGRP => {
+                    if super::signal::send_pgrp_in(instance.id, id, sig as u32) {
+                        Ok(0)
+                    } else {
+                        Err(ESRCH)
+                    }
+                }
+                _ => Err(EINVAL),
+            }
+        }
+        SYS_SIGNAL_STATE => {
+            if is_pager() {
+                return Err(EPERM);
+            }
+            Ok(super::signal::state(a[0] as u32) as i64)
+        }
         SYS_SERVER_LOG => {
             let len = a[1].min(SERVER_LOG_MAX);
             let mut text = [0u8; SERVER_LOG_MAX as usize];
@@ -1878,6 +2017,11 @@ fn event_wait(instance: &Arc<Instance>, out: u64, deadline: u64) -> Option<SysRe
                     _ => {}
                 }
                 return Some(Some(e));
+            }
+            // Console input the keyboard's interrupt announced (by a flag:
+            // it takes no lock of the instance).
+            if crate::drivers::console_device::take_event(instance.id) {
+                return Some(Some(Event { kind: EVENT_CONSOLE, a: 0, b: 0 }));
             }
             if q.closing {
                 if q.closing_told {

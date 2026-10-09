@@ -209,9 +209,9 @@ pub fn run_program(args: &[&str]) -> Option<crate::process::WaitStatus> {
                 result = Some(WaitStatus::Killed(sig));
             }
             Ok(WaitStatus::Stopped(sig)) => {
-                // The monitor has no job control: resume the program in the foreground.
+                // The monitor has no job control: resume the program (its
+                // terminal's foreground group is its server's business).
                 crate::printkln!("[{} (pid {}) stopped by signal {}; the monitor resumes it]", name, pid, sig);
-                crate::drivers::tty::set_foreground(pid);
                 crate::process::signal::send(pid, crate::process::signal::SIGCONT);
                 continue;
             }
@@ -219,6 +219,9 @@ pub fn run_program(args: &[&str]) -> Option<crate::process::WaitStatus> {
         }
         break;
     }
+    // The tree's first process ended: the console is the monitor's again
+    // (what is left of the tree finds its terminal hung up).
+    crate::process::linux::console_grant(None);
     crate::process::reap_orphans();
     result
 }

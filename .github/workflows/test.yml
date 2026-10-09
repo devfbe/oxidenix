@@ -72,6 +72,10 @@ jobs:
         if: matrix.firmware == 'uefi'
         run: cargo test -p netlink -p netproto
 
+      - name: Test the terminals' line discipline on the host
+        if: matrix.firmware == 'uefi'
+        run: cargo test -p ldisc
+
       - name: Boot oxidenix and run the self-tests
         working-directory: kernel
         shell: bash

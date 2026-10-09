@@ -18,10 +18,9 @@ use super::task::{State, Task, ThreadGroup};
 use super::{uaccess, Pid};
 use crate::interrupts::gdt;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
-pub const SIGINT: u32 = 2;
-pub const SIGQUIT: u32 = 3;
 pub const SIGILL: u32 = 4;
 pub const SIGTRAP: u32 = 5;
 pub const SIGBUS: u32 = 7;
@@ -140,6 +139,11 @@ pub fn stopped_status(sig: u32) -> i32 {
 }
 
 impl GroupSignals {
+    /// Whether a group stop is under way (or done): what SIGCONT counts as stopped.
+    pub fn stopping(&self) -> bool {
+        self.stopping != 0
+    }
+
     fn ignored(&self, sig: u32) -> bool {
         let handler = self.actions[sig as usize - 1].handler;
         handler == SIG_IGN || (handler == SIG_DFL && default_ignored(sig))
@@ -187,24 +191,40 @@ impl ThreadSignals {
     }
 }
 
-/// Background processes reading from the terminal get SIGTTIN (and EINTR,
-/// so the read restarts once they are continued in the foreground), or EIO
-/// if they ignore or block it.
-pub fn check_tty_read(foreground: Pid) -> Result<(), i64> {
-    let me = current();
-    let pgid = me.group.info.lock().pgid;
-    if me.tgid() == 0 || foreground == 0 || pgid == foreground {
-        return Ok(());
+/// Whether the calling process ignores `sig` (`restricted::SIGNAL_IGNORED`)
+/// and whether the calling thread blocks it (`SIGNAL_BLOCKED`): for the Linux
+/// server's terminals, whose background reads and writes depend on it
+/// (SIGTTIN, SIGTTOU), until signals are the server's (R8).
+pub fn state(sig: u32) -> u64 {
+    if sig == 0 || sig > NSIG {
+        return 0;
     }
+    let me = current();
+    let ignored = me.group.sig.lock().actions[sig as usize - 1].handler == SIG_IGN;
+    let blocked = me.sig.lock().mask & bit(sig) != 0;
+    (if ignored { restricted::SIGNAL_IGNORED } else { 0 }) | if blocked { restricted::SIGNAL_BLOCKED } else { 0 }
+}
+
+/// Sends `sig` (from a terminal: no permission checks) to every process of
+/// group `pgid` in Linux server instance `instance`; whether there was one.
+pub fn send_pgrp_in(instance: u64, pgid: Pid, sig: u32) -> bool {
+    let mut targets: Vec<Arc<ThreadGroup>> = Vec::new();
     {
-        let g = me.group.sig.lock();
-        let ignored = g.actions[SIGTTIN as usize - 1].handler == SIG_IGN;
-        if ignored || me.sig.lock().mask & bit(SIGTTIN) != 0 {
-            return Err(EIO);
+        let table = sched::TABLE.lock();
+        for g in table.groups.values() {
+            if g.tgid != 0
+                && !g.privileged.load(Ordering::Relaxed)
+                && g.instance.load(Ordering::Acquire) == instance
+                && g.info.lock().pgid == pgid
+            {
+                targets.push(g.clone());
+            }
         }
     }
-    send_group(pgid, SIGTTIN);
-    Err(EINTR)
+    for g in &targets {
+        post(g, None, sig);
+    }
+    !targets.is_empty()
 }
 
 /// Whether a blocking syscall of the current thread should return EINTR:
@@ -383,22 +403,9 @@ pub fn send(pid: Pid, sig: u32) {
     }
 }
 
-/// Sends `sig` to every process in group `pgid`. Called from interrupt
-/// context (Ctrl+C), so it must not allocate.
-pub fn send_group(pgid: Pid, sig: u32) {
-    let mut targets: heapless::Vec<Arc<ThreadGroup>, { sched::MAX_PROCS }> = heapless::Vec::new();
-    {
-        let table = sched::TABLE.lock();
-        // Servers never belong to a terminal's job; skip them regardless.
-        for g in table.groups.values() {
-            if g.tgid != 0 && !g.privileged.load(Ordering::Relaxed) && g.info.lock().pgid == pgid {
-                let _ = targets.push(g.clone());
-            }
-        }
-    }
-    for g in &targets {
-        post(g, None, sig);
-    }
+/// Sends `sig` to the process `group` (from the kernel: no permission checks).
+pub fn send_to(group: &Arc<ThreadGroup>, sig: u32) {
+    post(group, None, sig);
 }
 
 /// kill(2). Privileged servers are protected like init on Linux: only the

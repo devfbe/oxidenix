@@ -59,7 +59,7 @@ pub fn handle(s: &State) -> Option<i64> {
     })
 }
 
-fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64) -> i64 {
+fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, mut offset: u64) -> i64 {
     if len == 0 || !aligned(addr) || !aligned(offset) || prot & !7 != 0 {
         return -EINVAL;
     }
@@ -95,21 +95,29 @@ fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, offset: u64) -> i64
     // The object to map: none (anonymous private memory), a new one
     // (anonymous shared memory), or the descriptor's file: one of the
     // server's (its file object), or one of the kernel's.
-    let handle = if flags & MAP_ANONYMOUS == 0 {
-        match crate::files::map_object(fd, shared, prot & PROT_WRITE != 0) {
-            Some(Ok((h, read_only))) => {
-                if read_only {
-                    mo_flags |= MO_READONLY;
-                }
-                h as i64
-            }
-            Some(Err(e)) => -e,
-            None => crate::syscall(SYS_KFILE_OBJECT, [fd, 0, 0, 0, 0, 0]),
-        }
-    } else if shared {
-        crate::syscall(SYS_MO_CREATE, [len / PAGE, 0, 0, 0, 0, 0])
+    let mapping = if flags & MAP_ANONYMOUS == 0 {
+        crate::files::map_object(fd, shared, prot & PROT_WRITE != 0)
     } else {
-        0
+        Some(Ok(crate::files::Mapping::Anonymous))
+    };
+    let handle = match mapping {
+        Some(Ok(crate::files::Mapping::Object(h, read_only))) => {
+            if read_only {
+                mo_flags |= MO_READONLY;
+            }
+            h as i64
+        }
+        Some(Err(e)) => -e,
+        None => crate::syscall(SYS_KFILE_OBJECT, [fd, 0, 0, 0, 0, 0]),
+        // Anonymous memory (also zero's): the offset means nothing.
+        Some(Ok(crate::files::Mapping::Anonymous)) if shared => {
+            offset = 0;
+            crate::syscall(SYS_MO_CREATE, [len / PAGE, 0, 0, 0, 0, 0])
+        }
+        Some(Ok(crate::files::Mapping::Anonymous)) => {
+            offset = 0;
+            0
+        }
     };
     if handle < 0 {
         return handle;

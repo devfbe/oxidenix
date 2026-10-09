@@ -136,7 +136,7 @@ pub struct Console {
     utf8: [u8; 4],
     utf8_len: usize,
     utf8_need: usize,
-    reply: [u8; 32],
+    reply: [u8; REPLY_CAP],
     reply_len: usize,
     /// Scroll region, first and last row (inclusive).
     top: usize,
@@ -165,6 +165,11 @@ pub struct Console {
 /// waits long for the console and no timer tick is lost, however much a
 /// program writes.
 const WORK_BUDGET: usize = 64;
+/// The budget an answer to a query takes (see `push_reply`).
+const REPLY_WORK: usize = 16;
+/// Room for the answers of one lock hold: at most `WORK_BUDGET / REPLY_WORK` of
+/// them, each at most 16 bytes ("\x1b[rrrr;ccccR").
+const REPLY_CAP: usize = (WORK_BUDGET / REPLY_WORK) * 16;
 
 impl Console {
     fn put_pixel(&mut self, x: usize, y: usize, (r, g, b): (u8, u8, u8)) {
@@ -366,7 +371,12 @@ impl Console {
         }
     }
 
+    /// An answer to a query (a cursor position report, device attributes). Each
+    /// counts as `REPLY_WORK` of the lock hold's budget, so one hold makes at most
+    /// `WORK_BUDGET / REPLY_WORK` of them, which `reply` always holds: the writer
+    /// takes them before the lock goes (`write_with_replies`), none is lost.
     fn push_reply(&mut self, bytes: &[u8]) {
+        self.work += REPLY_WORK;
         let n = bytes.len().min(self.reply.len() - self.reply_len);
         self.reply[self.reply_len..self.reply_len + n].copy_from_slice(&bytes[..n]);
         self.reply_len += n;
@@ -514,15 +524,15 @@ impl Console {
 
     fn control(&mut self, b: u8) {
         match b {
-            b'\n' => {
-                self.col = 0;
+            // A line feed keeps the column, as on a VT (and Linux's console
+            // without LNM): CR LF is the writer's (the terminal's ONLCR).
+            b'\n' | 0x0b | 0x0c => {
                 self.wrap_pending = false;
                 self.line_feed();
             }
             b'\r' => self.move_to(0, self.row),
             0x08 => self.move_to(self.col.min(self.cols - 1).saturating_sub(1), self.row),
             b'\t' => self.move_to((self.col / 8 + 1) * 8, self.row),
-            0x0b | 0x0c => self.line_feed(),
             // Shift out / shift in: G1 / G0.
             0x0e => self.shift_out = true,
             0x0f => self.shift_out = false,
@@ -690,10 +700,12 @@ impl Console {
         self.redraw_next.is_some()
     }
 
+    /// The kernel's own text (printk): answers to queries in it go nowhere.
     pub fn write_bytes(&mut self, bytes: &[u8]) {
         let mut rest = bytes;
         while !rest.is_empty() || self.redraw_pending() {
             let n = self.write_some(rest);
+            self.reply_len = 0;
             rest = &rest[n..];
         }
     }
@@ -714,9 +726,18 @@ impl fmt::Write for Cursor<'_> {
     }
 }
 
-impl fmt::Write for Console {
+/// The kernel's own text to a byte sink: a newline is a carriage return and a
+/// line feed (the devices take bytes as they are; this is the kernel's ONLCR).
+struct Text<F: FnMut(&[u8])>(F);
+
+impl<F: FnMut(&[u8])> fmt::Write for Text<F> {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        self.write_bytes(s.as_bytes());
+        for (i, part) in s.split('\n').enumerate() {
+            if i > 0 {
+                (self.0)(b"\r\n");
+            }
+            (self.0)(part.as_bytes());
+        }
         Ok(())
     }
 }
@@ -748,7 +769,7 @@ pub fn init(fb: &'static mut FrameBuffer) {
         utf8: [0; 4],
         utf8_len: 0,
         utf8_need: 0,
-        reply: [0; 32],
+        reply: [0; REPLY_CAP],
         reply_len: 0,
         top: 0,
         bottom: 0,
@@ -784,12 +805,23 @@ macro_rules! printkln {
 
 pub fn _print(args: fmt::Arguments) {
     use core::fmt::Write;
-    super::serial::write_fmt(args);
+    let _ = Text(super::serial::write_bytes).write_fmt(args);
     without_interrupts(|| {
         if let Some(c) = CONSOLE.lock().as_mut() {
-            let _ = c.write_fmt(args);
+            let _ = Text(|b: &[u8]| c.write_bytes(b)).write_fmt(args);
         }
     });
+}
+
+/// Writes text of the kernel's (the monitor's echo, the native servers' output):
+/// newlines become CR LF.
+pub fn write_text(bytes: &[u8]) {
+    for (i, part) in bytes.split(|&b| b == b'\n').enumerate() {
+        if i > 0 {
+            write_bytes(b"\r\n");
+        }
+        write_bytes(part);
+    }
 }
 
 /// Bytes per serial-port lock hold (it waits for the UART with interrupts
@@ -803,35 +835,38 @@ const SERIAL_CHUNK: usize = 256;
 /// CPU: a write that redraws the whole screen takes long, and the kernel
 /// does not preempt itself.
 pub fn write_bytes(bytes: &[u8]) {
+    write_with_replies(bytes, &mut |_| {});
+}
+
+/// `write_bytes`, handing the console's answers to queries in `bytes` (a cursor
+/// position report, device attributes) to `replies`: taken in the same lock hold that
+/// made them, so they are this write's and none is lost.
+pub fn write_with_replies(bytes: &[u8], replies: &mut dyn FnMut(&[u8])) {
     for chunk in bytes.chunks(SERIAL_CHUNK) {
         super::serial::write_bytes(chunk);
     }
     let mut rest = bytes;
     loop {
-        let (used, pending) = match CONSOLE.lock().as_mut() {
-            Some(c) => (c.write_some(rest), c.redraw_pending()),
+        let mut reply = [0u8; REPLY_CAP];
+        let (used, pending, n) = match CONSOLE.lock().as_mut() {
+            Some(c) => {
+                let used = c.write_some(rest);
+                let n = c.reply_len;
+                reply[..n].copy_from_slice(&c.reply[..n]);
+                c.reply_len = 0;
+                (used, c.redraw_pending(), n)
+            }
             None => return,
         };
+        if n > 0 {
+            replies(&reply[..n]);
+        }
         rest = &rest[used..];
         if rest.is_empty() && !pending {
             return;
         }
         crate::process::sched::cond_resched();
     }
-}
-
-/// Takes the bytes the terminal wants to send back (e.g. a cursor position
-/// report); they belong into the TTY input queue.
-pub fn take_reply(out: &mut [u8; 32]) -> usize {
-    without_interrupts(|| match CONSOLE.lock().as_mut() {
-        Some(c) => {
-            let n = c.reply_len;
-            out[..n].copy_from_slice(&c.reply[..n]);
-            c.reply_len = 0;
-            n
-        }
-        None => 0,
-    })
 }
 
 /// (columns, rows)

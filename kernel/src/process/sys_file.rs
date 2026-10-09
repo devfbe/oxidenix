@@ -38,11 +38,10 @@ fn resolve_at(dirfd: u64, path: &str, follow: bool) -> Result<(Arc<Inode>, Strin
 }
 
 /// Whether a read of `f` that filled a whole buffer may go on with the
-/// next one: for files and memory devices, which never block. Pipes, the
-/// terminal and sockets answer with what they have, and asking again could
-/// block.
+/// next one: for files and memory devices, which never block. Pipes and
+/// sockets answer with what they have, and asking again could block.
 fn reads_on(f: &OpenFile) -> bool {
-    f.inode().is_some_and(|i| i.device() != Some(fs::Device::Console))
+    f.inode().is_some()
 }
 
 fn read_file(f: &OpenFile, buf: u64, len: u64) -> Result<usize, i64> {
@@ -197,6 +196,11 @@ pub fn openat(dirfd: u64, path: u64, flags: u64, mode: u64) -> SysResult {
 /// A descriptor for a resolved inode, as open(2) makes it: `abs` is its
 /// absolute path (also for the Linux server's `inode_open`).
 pub fn open_inode(inode: Arc<Inode>, flags: u32, abs: String) -> SysResult {
+    // The Linux server's devices (its terminals) are its to open (with
+    // O_PATH too: it opens device nodes alone itself).
+    if matches!(inode.device(), Some(fs::Device::Server(..))) {
+        return Err(ENXIO);
+    }
     let writable = flags & O_ACCMODE != 0;
     if inode.is_dir() && writable {
         return Err(EISDIR);
@@ -220,12 +224,13 @@ pub fn close(fd: u64) -> SysResult {
 }
 
 /// A `struct stat` as Linux lays it out.
-fn stat_bytes(ino: u64, mode: u32, size: u64, extra: (u64, u64, u64, u64)) -> [u8; 144] {
+fn stat_bytes(ino: u64, mode: u32, rdev: u64, size: u64, extra: (u64, u64, u64, u64)) -> [u8; 144] {
     let (nlink, atime, mtime, ctime) = extra;
     let mut st = [0u8; 144];
     st[8..16].copy_from_slice(&ino.to_le_bytes());
     st[16..24].copy_from_slice(&nlink.to_le_bytes());
     st[24..28].copy_from_slice(&mode.to_le_bytes());
+    st[40..48].copy_from_slice(&rdev.to_le_bytes());
     st[72..80].copy_from_slice(&atime.to_le_bytes());
     st[88..96].copy_from_slice(&mtime.to_le_bytes());
     st[104..112].copy_from_slice(&ctime.to_le_bytes());
@@ -238,7 +243,7 @@ fn stat_bytes(ino: u64, mode: u32, size: u64, extra: (u64, u64, u64, u64)) -> [u
 /// An inode's `struct stat`.
 pub fn inode_stat(inode: &Inode) -> Result<[u8; 144], i64> {
     let s = inode.stat()?;
-    Ok(stat_bytes(inode.ino, s.mode, s.size, (s.nlink, s.atime, s.mtime, s.ctime)))
+    Ok(stat_bytes(inode.ino, s.mode, s.rdev, s.size, (s.nlink, s.atime, s.mtime, s.ctime)))
 }
 
 fn stat_inode(inode: &Inode, buf: u64) -> SysResult {
@@ -254,7 +259,7 @@ pub fn fstat(fd: u64, buf: u64) -> SysResult {
 /// The `struct stat` of descriptor `fd` (fstat's answer).
 pub fn fstat_bytes(fd: u64) -> Result<[u8; 144], i64> {
     let f = file(fd)?;
-    let anon = |mode: u32| Ok(stat_bytes(f.number, mode, 0, (1, 0, 0, 0)));
+    let anon = |mode: u32| Ok(stat_bytes(f.number, mode, 0, 0, (1, 0, 0, 0)));
     match f.inode() {
         Some(inode) => inode_stat(inode),
         None if f.socket().is_some() => anon(S_IFSOCK | 0o777),
@@ -276,7 +281,7 @@ pub fn newfstatat(dirfd: u64, path: u64, buf: u64, flags: u64) -> SysResult {
 pub fn lseek(fd: u64, offset: i64, whence: u64) -> SysResult {
     let f = file(fd)?;
     let inode = f.inode().ok_or(ESPIPE)?;
-    if f.is_console() {
+    if inode.device() == Some(fs::Device::Console) {
         return Err(ESPIPE);
     }
     let mut off = f.offset.lock();
@@ -402,24 +407,10 @@ pub fn fcntl(fd: u64, cmd: u64, arg: u64) -> SysResult {
     }
 }
 
+/// ioctl(2) on the kernel's files: only the requests on the descriptor. The
+/// terminals are the Linux server's (R6d); the kernel's files take no
+/// requests of their own (ENOTTY).
 pub fn ioctl(fd: u64, request: u64, arg: u64) -> SysResult {
-    use crate::drivers::tty;
-    const TCGETS: u64 = 0x5401;
-    const TCSETS: u64 = 0x5402;
-    const TCSETSW: u64 = 0x5403;
-    const TCSETSF: u64 = 0x5404;
-    const TCSBRK: u64 = 0x5409;
-    const TCXONC: u64 = 0x540a;
-    const TCFLSH: u64 = 0x540b;
-    const TIOCSCTTY: u64 = 0x540e;
-    const TIOCGPGRP: u64 = 0x540f;
-    const TIOCSPGRP: u64 = 0x5410;
-    const TIOCGWINSZ: u64 = 0x5413;
-    const TIOCSWINSZ: u64 = 0x5414;
-    const FIONREAD: u64 = 0x541b;
-    const TIOCNOTTY: u64 = 0x5422;
-    const TIOCGSID: u64 = 0x5429;
-
     // The requests on the descriptor rather than the file, which every
     // descriptor takes (Linux's do_vfs_ioctl), the Linux server's files too
     // (it passes them through): libuv makes pipes and sockets non-blocking
@@ -446,27 +437,8 @@ pub fn ioctl(fd: u64, request: u64, arg: u64) -> SysResult {
         }
         _ => {}
     }
-
-    if !file(fd)?.is_console() {
-        return Err(ENOTTY);
-    }
-    match request {
-        TCGETS => uaccess::write(arg, tty::termios())?,
-        TCSETS | TCSETSW => tty::set_termios(uaccess::read(arg)?, false),
-        TCSETSF => tty::set_termios(uaccess::read(arg)?, true),
-        TCFLSH if arg != 1 => tty::flush_input(),
-        TCFLSH | TCSBRK | TCXONC | TIOCSCTTY | TIOCNOTTY | TIOCSWINSZ => {}
-        TIOCGPGRP => uaccess::write(arg, tty::foreground() as i32)?,
-        TIOCSPGRP => tty::set_foreground(uaccess::read::<i32>(arg)? as u64),
-        TIOCGSID => uaccess::write(arg, super::getsid(0)? as i32)?,
-        TIOCGWINSZ => {
-            let (cols, rows) = crate::drivers::console::size();
-            uaccess::write(arg, [rows as u16, cols as u16, 0, 0])?;
-        }
-        FIONREAD => uaccess::write(arg, tty::pending() as i32)?,
-        _ => return Err(ENOTTY),
-    }
-    Ok(0)
+    file(fd)?;
+    Err(ENOTTY)
 }
 
 /// The deadline of a timeout of `ns` nanoseconds (None: wait forever).

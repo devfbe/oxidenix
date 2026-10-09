@@ -89,8 +89,11 @@ Its [commit history](#development-history) records every step.
 - **Clocks** with nanosecond resolution from the TSC: every Linux clock, exact CPU time per
   thread and process (`getrusage`, `times`), and wall-clock time that starts from the CMOS
   real-time clock and can be set (`date`, file timestamps).
-- **Terminal**: a termios line discipline (canonical and raw mode, echo, erase/kill/word-erase,
-  EOF), the ANSI escape sequences BusyBox and readline use, a German keyboard layout and UTF-8.
+- **Terminal**: Linux's N_TTY line discipline in the Linux server (canonical and raw mode,
+  VMIN/VTIME, echo and line editing, signals from ^C/^Z/^\, flow control, output processing),
+  the controlling terminal and job control's terminal side, pseudo-terminals (`/dev/ptmx`,
+  devpts), the ANSI escape sequences BusyBox, readline and ncurses use, a German keyboard
+  layout and UTF-8. The kernel keeps the console as a raw device.
 - **~120 Linux system calls**, enough for Bash and BusyBox (see [System calls](#system-calls)).
 
 ## Quick start
@@ -207,7 +210,7 @@ The window scales when it is resized (`zoom-to-fit`), and Ctrl+Alt+F toggles ful
  │  memory          frame allocator (refcounted), heap, address spaces, COW │          │
  │  VFS             memory inodes, remote inodes (fs/remote.rs), pipes, cpio│          │
  │  sockets         Linux socket ABI, forwarded to netd (net.rs)            │          │
- │  terminal        TTY line discipline ─ console (framebuffer, ANSI) ─ keyboard       │
+ │  console device  raw bytes: console (framebuffer, ANSI) ─ keyboard (tty: server)    │
  │  CPU             GDT, TSS + I/O bitmap, IDT, local + I/O APIC (ACPI), SSE│          │
  └──────────────────────────────────────────────────────────────────────────▼──────────┘
       bootloader 0.11 (UEFI/BIOS), QEMU q35, 4 CPUs, 256 MiB RAM, AHCI boot disk, virtio-blk data disk, virtio-net
@@ -240,7 +243,7 @@ oxidenix/
 │       │   ├── address_space.rs areas, demand paging, copy-on-write
 │       │   ├── tlb.rs           which CPUs use an address space, TLB shootdowns
 │       │   ├── syscall.rs       syscall entry/return, dispatch table
-│       │   ├── sys_file.rs      file, directory, pipe, tty-ioctl, poll/select
+│       │   ├── sys_file.rs      file, directory, pipe, poll/select
 │       │   ├── sys_mem.rs       brk, mmap, mprotect, mremap
 │       │   ├── sys_net.rs       socket syscalls (sockaddr_in, msghdr, options)
 │       │   ├── signal.rs        signal state, delivery, sigreturn, kill
@@ -254,7 +257,8 @@ oxidenix/
 │       ├── fs/                  VFS (mod.rs), page cache (cache.rs), open files and
 │       │                        pipes (file.rs), initramfs unpacker (cpio.rs), IPC
 │       │                        client for filesystem servers (remote.rs)
-│       ├── drivers/             framebuffer console (console.rs, glyphs.rs), TTY (tty.rs),
+│       ├── drivers/             framebuffer console (console.rs, glyphs.rs), the console
+│       │                        device the server's terminals drive (console_device.rs),
 │       │                        PS/2 keyboard (keyboard.rs), CMOS clock (rtc.rs),
 │       │                        serial port mirror (serial.rs), PCI scan (pci.rs),
 │       │                        ACPI MADT (acpi.rs)
@@ -312,8 +316,9 @@ About 9,200 lines of Rust (without comments and blank lines) in the kernel and 3
    and a DMA area; netd registers as service `net` once DHCP has configured the interface
    (or after three seconds without an answer). Last, `/sbin/procfs` provides `/proc` and
    `/sys`, replacing the static `/proc` files of the early boot.
-4. Process 0 (the kernel monitor) spawns `/bin/bash` as the foreground process and waits for
-   it. If Bash exits, the monitor takes over the terminal.
+4. Process 0 (the kernel monitor) spawns `/bin/bash` in a new process tree, which gets the
+   console device; its Linux server gives Bash descriptors 0-2 on the console and makes the
+   console its controlling terminal. When Bash exits, the monitor takes the console back.
 
 ### Memory
 
@@ -488,11 +493,11 @@ The scheduler is built for several CPUs (`process/sched.rs`, design in
   by the next task on that CPU, after the switch, so its stack is freed only then.
 - **Sleeping without lost wakeups**: a blocking path first registers on its wait channel
   (`prepare_to_wait`), then checks its condition, then sleeps; a per-task wake lock
-  serializes wakeups with the task descheduling itself. Pipes, the TTY, IPC, `wait4`, stops
-  and timed sleeps all use this protocol.
+  serializes wakeups with the task descheduling itself. The kernel's pipes, the console
+  device, IPC, `wait4`, stops and timed sleeps all use this protocol.
 - **Waiting on several files** (`process/poll.rs`): a file announces readiness changes on a
-  wait queue (a channel of the global queues for pipes, eventfds and the TTY, its own queue
-  for an epoll instance). Wait-queue entries are tasks or callbacks; `poll`, `select` and
+  wait queue (a channel of the global queues for the kernel's pipes and eventfds, the one of a
+  placeholder for a file of the Linux server's, its own queue for an epoll instance). Wait-queue entries are tasks or callbacks; `poll`, `select` and
   `epoll_wait` put one callback on the queue of every file they check, so a wakeup on any
   of them ends the wait at once instead of at a periodic re-check; a wakeup that comes while
   the files are being checked is noted and not lost. Sockets, whose readiness lives in
@@ -519,8 +524,8 @@ The scheduler is built for several CPUs (`process/sched.rs`, design in
 - New processes start by *returning from a syscall*: their kernel stack is pre-filled with a
   register frame that `user_return` consumes. A `fork` child is the parent's frame with
   `rax = 0`.
-- Process groups, sessions and the terminal's foreground group follow POSIX closely enough for
-  Bash and BusyBox job handling.
+- Process groups and sessions follow POSIX closely enough for Bash and BusyBox job handling;
+  the terminal's side (controlling terminal, foreground group) is the Linux server's.
 
 ### Time
 
@@ -811,16 +816,20 @@ the server.
   given. If a signal interrupts them, the mask stays until it is delivered, so the handler
   runs with it and the caller's own mask comes back when the handler returns; otherwise the
   caller's mask is put back at once and a signal the temporary one held off stays pending.
-- Blocking calls (TTY and pipe I/O, `wait4`, `nanosleep`, `poll`/`select`, `pause`) return
-  `EINTR`, but only after checking for available data or a finished child first.
+- Blocking calls (terminal and pipe I/O in the Linux server, `wait4`, `nanosleep`,
+  `poll`/`select`, `pause`) return `EINTR`, but only after checking for available data or a
+  finished child first.
+- **Orphaned process groups**: an exit that leaves a process group orphaned with stopped
+  members sends it SIGHUP and SIGCONT (POSIX), so stopped jobs do not stay stopped for ever.
 - **Syscall restart**: a call interrupted by a stop, or by a handler installed with
   `SA_RESTART`, is rewound to its `syscall` instruction and runs again, so `cat` survives
   Ctrl+Z / `fg`. Sleeps and polls report `EINTR` instead, as on Linux.
 - **Job control**: stopped processes leave the run queue until `SIGCONT` (or `SIGKILL`), and
   parents learn about stops and continues through `SIGCHLD` and `wait4` with `WUNTRACED` and
   `WCONTINUED`. `wait4` supports the POSIX process group selectors (`pid` 0 and < -1).
-- The TTY turns Ctrl+C, Ctrl+\ and Ctrl+Z into `SIGINT`, `SIGQUIT` and `SIGTSTP` for the
-  foreground process group.
+- The terminal (the Linux server's) turns Ctrl+C, Ctrl+\ and Ctrl+Z into `SIGINT`, `SIGQUIT`
+  and `SIGTSTP` for the foreground process group, and stops background readers and writers
+  with `SIGTTIN` and `SIGTTOU`.
 
 ### Filesystem
 
@@ -910,8 +919,8 @@ interrupt dispatch; drivers and filesystems move into user-space servers.
   `/sys/devices/system/cpu`; the kernel mounts its two trees at `/proc` and `/sys`. Requests
   carry the caller's pid, which `/proc/self` resolves to. A non-Linux userland would simply not
   run this server.
-- Still in the kernel today: the VFS itself, pipes, the TTY, console and keyboard. They are the
-  next candidates for servers.
+- Still in the kernel today: the kernel's own VFS (for `/proc`, `/sys` and `/dev`'s nodes) and
+  the console and keyboard as a raw device; the terminals are the Linux server's (R6d).
 
 ### Networking
 
@@ -1031,9 +1040,18 @@ interrupt dispatch; drivers and filesystems move into user-space servers.
   `kernel/assets/logo.svg`; `kernel/build.rs` decodes the rendered `logo.png` into raw RGB at
   build time, so the kernel needs no image decoder. Like on Linux, the logo is plain pixels and
   scrolls away with the text.
-- **TTY**: a termios subset (`TCGETS`/`TCSETS*`, `ICANON`, `ECHO*`, `ISIG`, `ICRNL`, `VMIN`, ...)
-  with canonical line editing, raw mode for readline, EOF handling and `FIONREAD`. Its buffers
-  have fixed sizes because the keyboard path runs in interrupt context and must not allocate.
+- **Console device**: the kernel moves bytes only: output to the screen and the serial mirror
+  as they are (a line feed keeps the column, as on a VT), input from the keyboard and the
+  console's answers to queries into a ring. It is granted to the process tree the kernel
+  starts until that tree's first process ends; the monitor edits its command line on it
+  otherwise (docs/design/linux-server.md, ADR 0007).
+- **Terminals** (the Linux server's, `servers/linux/src/tty.rs`, `crates/ldisc`): Linux's N_TTY
+  line discipline (termios and termios2, canonical editing with `ERASE`/`KILL`/`WERASE`/
+  `REPRINT`/`LNEXT`, `VMIN`/`VTIME`, echo, `ISIG`, `IXON`, `OPOST`/`ONLCR`/`XTABS`, ...), the
+  controlling terminal, `TIOCSPGRP`/`TIOCGPGRP`, `TIOCSCTTY`/`TIOCNOTTY`, `SIGTTIN`/`SIGTTOU`,
+  window sizes with `SIGWINCH`, hangups, `TIOCSTI`, and pseudo-terminals (`/dev/ptmx`,
+  `/dev/pts/n` in devpts). Device nodes name their driver by number (5,0 `/dev/tty`, 5,1
+  `/dev/console`, 5,2 `/dev/ptmx`, 136,n).
 - **Keyboard**: PS/2 scancodes are decoded in the IRQ handler with the German (`De105Key`)
   layout and translated to terminal bytes: CR, DEL, and the Linux console's sequences for
   arrows, editing keys and F1-F12. The AltGr characters the crate's layout lacks
@@ -1052,7 +1070,7 @@ Linux x86_64 numbers, grouped by area (about 120 in total):
 
 | Area | Calls |
 |---|---|
-| Files | `read` `write` `pread64` `pwrite64` `readv` `writev` `preadv` `pwritev` `preadv2` `pwritev2` `open` `openat` (also `O_DIRECT`) `close` `lseek` `sendfile` `truncate` `ftruncate` `fcntl` `ioctl` (the tty's, `FIONBIO`, `FIOCLEX`, `FIONCLEX`) `dup` `dup2` `dup3` `pipe` `pipe2` |
+| Files | `read` `write` `pread64` `pwrite64` `readv` `writev` `preadv` `pwritev` `preadv2` `pwritev2` `open` `openat` (also `O_DIRECT`) `close` `lseek` `sendfile` `truncate` `ftruncate` `fcntl` `ioctl` (the terminals', `FIONBIO`, `FIOCLEX`, `FIONCLEX`) `dup` `dup2` `dup3` `pipe` `pipe2` |
 | Metadata | `stat` `fstat` `lstat` `newfstatat` `statx` `access` `faccessat` `faccessat2` `readlink` `readlinkat` `chmod` `fchmod` `fchmodat` `fchmodat2` `chown` `fchown` `lchown` `fchownat` (owners are not stored: every file is root's) `utimes` `futimesat` `utimensat` (timestamps kept, nanoseconds on tmpfs, seconds on ext2, by the server for the kernel's `/dev`, `/proc` and `/sys` files: the last 1024 set per process tree) `umask`; `inotify_init` `inotify_init1` `inotify_add_watch` `inotify_rm_watch`; `copy_file_range` (all the Linux server's) |
 | Directories | `getdents64` `getcwd` `chdir` `fchdir` `mkdir` `mkdirat` `rmdir` `unlink` `unlinkat` `rename` `renameat` `renameat2` `symlink` `symlinkat` |
 | I/O multiplexing | `poll` `ppoll` `select` `pselect6` `epoll_create` `epoll_create1` `epoll_ctl` `epoll_wait` `epoll_pwait` `epoll_pwait2` `eventfd` `eventfd2` |
@@ -1117,6 +1135,7 @@ Each of these programs and scripts lives in the root filesystem and runs inside 
 | `cachetest` | the page cache of `/data` files: data read back right after writing and `fsync` (from memory), `Cached` in `/proc/meminfo`, committing all free memory reclaims cached pages (and all of it can be used), the file read again from the disk afterwards, read-only shared and private mappings of a disk file, `pwrite` visible to `pread` and both mappings, private stores staying private, `ftruncate` shrinking and growing (zeros, not old data, in reads and the mapping), a program on the disk running from the cache and `ETXTBSY` while it runs |
 | `writebacktest` | stores through a shared mapping of a `/data` file: reading makes nothing dirty, a store makes its page dirty (`Dirty` in `/proc/meminfo`), `msync`, `fsync` and `fdatasync` write it back (also a page stored to again afterwards), `write` and a store in one page both arrive, the server's write-back takes a store to the disk on its own after `munmap`, a store of a process that exited, dirty pages surviving reclaim, truncation of a file with dirty pages, 1 MiB of stores; `O_DIRECT` reads as the view of the disk |
 | `mmaptest /data` | all of `mmaptest` on a disk file |
+| `ttytest` | the Linux server's terminals through pseudo-terminals: `/dev/ptmx`, `TIOCGPTN`, a locked slave (`EIO`), `unlockpt`, `TIOCGPTPEER`, devpts's nodes (136, n) and its refusals (`EACCES`, `EPERM`), the node gone with the master; `/dev/console` and `/dev/tty`; termios defaults and round trips (also through the master); canonical reads a line at a time with echo, partial lines, `FIONREAD`, erase/kill/werase and their echo, `^D`, `^V`, `TIOCSTI`; `ONLCR`, `XTABS`, no `OPOST`; `VMIN`/`VTIME` (0/0, 0/2, 3/0 with poll, 5/1's inter-byte timer); raw input, leaving canonical mode; `^S`/`^Q` and `tcflow`; poll and `tcflush`; window sizes; the master's `EIO` and `POLLHUP` after the slave's close; a session with the slave as controlling terminal: `^C`, `^\`, `^Z` and `SIGWINCH` for the foreground job, `SIGTTIN` and `SIGTTOU` (`TOSTOP`, `tcsetattr`) for background jobs, `EIO` with `SIGTTIN` ignored, `TIOCSPGRP`'s `EPERM`/`ESRCH`, `TIOCSCTTY`/`TIOCNOTTY`; the terminal freed when its session's leader ends; a hangup by the master's close (`SIGHUP`, end of file, `EIO`); `O_PATH` and `O_DIRECTORY` on device nodes; echoes of console input not waiting behind a process flooding the console; echoes into a master that never reads bounded, `TIOCSTI` on a full master, `TIOCSIG`'s signals; a waiting canonical read taking the half line when the mode goes raw, two readers each getting a whole line, a failed slave open leaving the master usable; an orphaned stopped job getting `SIGHUP` and `SIGCONT` |
 | `datatest` | `/data` in the Linux server: reads, writes, `lseek`, `stat`, `fsync` without a call passed through (`legacy_calls` of `/proc/self/counters`), its own device and ext2's `statfs`; two descriptors, a mapping and another process's mapping sharing one page cache; `write` leaving dirty pages, `fsync` writing them (`Dirty` back, the data on the device: `O_DIRECT`), an `O_SYNC` write clean when it returns, a write past the end and its hole, `sync`; truncation with dirty mapped pages (`SIGBUS` beyond, the tail zero, the size on the device); 100 children storing into an inherited mapping while a thread writes it back, every store on the device; 400 forks racing a truncation of a mapped file, every child getting `SIGBUS` beyond the new end; 8 processes reading one uncached file at random offsets at once; 4 threads writing parts of one file; a 32 MiB file written and read back with 12 MiB left to cache it; a read while dirty pages fill memory; a full disk: `write` itself failing with `ENOSPC` (the space promised as data enters the cache), everything accepted on the device after `fsync`, `statfs` counting promised space, a store into a hole raising `SIGBUS`, and going through once there is room again |
 | `bash -c` (in `runtests.sh`) | Bash itself: functions, arrays, arithmetic, `[[ ]]`, a pipe into `grep`, a here-document into a `/tmp` file read back, a subshell's `cd`, command substitution |
 | `sh /etc/test.sh` | files, pipes, `cd`, `mkdir`/`touch`/`rm`, rename cycles via symlinks, the tmpfs size limit |

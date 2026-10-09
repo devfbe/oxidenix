@@ -1,5 +1,6 @@
-//! The server's tmpfs (phase R6c.2c): directories, files, symlinks and
-//! socket inodes (AF_UNIX names, `unix`) in the server's memory; a file's
+//! The server's tmpfs (phase R6c.2c): directories, files, symlinks, socket
+//! inodes (AF_UNIX names, `unix`) and device nodes (devpts's, `pty`) in the
+//! server's memory; a file's
 //! contents are a file object of the kernel's (`SYS_MO_CREATE_FILE`), read,
 //! written and mapped without the kernel's VFS, and charged to the same
 //! tmpfs limit as the kernel's tmpfs.
@@ -37,6 +38,8 @@ use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use restricted::*;
 use vfs::stat::{SetTime, Stat, Times};
 
+pub const EPERM: i64 = 1;
+pub const EACCES: i64 = 13;
 pub const EEXIST: i64 = 17;
 pub const EISDIR: i64 = 21;
 pub const EINVAL: i64 = 22;
@@ -72,6 +75,9 @@ pub enum Kind {
     /// A socket's name in the filesystem (bind(2) of an AF_UNIX socket):
     /// the socket it leads to is found by the inode (`unix`).
     Socket,
+    /// A character device: its number (`st_rdev`) names its driver (the
+    /// terminals of devpts, `pty`).
+    Device(u64),
 }
 
 mod content {
@@ -110,6 +116,10 @@ pub struct State {
     pub perm: u32,
     /// Its kind and contents (the variant is fixed: `content::Content`).
     kind: content::Content,
+    /// A directory whose names only the server makes and removes (devpts):
+    /// creating a name there is EACCES, removing or renaming one EPERM, as
+    /// Linux's devpts (no create, unlink or rename operations).
+    sealed: bool,
     /// Its times, with nanoseconds and a birth time (statx).
     pub times: Times,
     /// > 0: write accesses; < 0: programs running from it (see above).
@@ -149,7 +159,7 @@ pub fn new_root() -> Arc<Inode> {
 impl Inode {
     fn new(kind: Kind, perm: u32) -> Arc<Inode> {
         let file_type = kind_bits(&kind);
-        let state = State { perm, kind: content::Content::new(kind), times: Times::new(now()), writers: 0, removed: false, link: None };
+        let state = State { perm, kind: content::Content::new(kind), sealed: false, times: Times::new(now()), writers: 0, removed: false, link: None };
         Arc::new(Inode {
             ino: NEXT_INO.fetch_add(1, Ordering::Relaxed),
             file_type,
@@ -188,7 +198,7 @@ impl Inode {
         match self.state.lock().kind.get() {
             Kind::File(o) => Ok(o.handle()),
             Kind::Dir(_) => Err(EISDIR),
-            Kind::Symlink(_) | Kind::Socket => Err(EINVAL),
+            Kind::Symlink(_) | Kind::Socket | Kind::Device(_) => Err(EINVAL),
         }
     }
 
@@ -213,15 +223,20 @@ impl Inode {
     /// Its status: every field of `struct stat`, and the birth time (one
     /// snapshot, under one lock).
     pub fn status(&self) -> Stat {
-        let (perm, size, times) = {
+        let (perm, size, times, rdev) = {
             let st = self.state.lock();
-            (st.perm, stat_size(st.kind.get()), st.times)
+            let rdev = match st.kind.get() {
+                Kind::Device(rdev) => *rdev,
+                _ => 0,
+            };
+            (st.perm, stat_size(st.kind.get()), st.times, rdev)
         };
         Stat {
             dev: DEV,
             ino: self.ino,
             nlink: if self.file_type == vfs::S_IFDIR { 2 } else { 1 },
             mode: self.file_type | perm,
+            rdev,
             size,
             blksize: 4096,
             blocks: size.div_ceil(512),
@@ -319,12 +334,53 @@ impl Inode {
         Ok(inode)
     }
 
+    /// A sealed directory (devpts, see `State::sealed`).
+    pub fn new_sealed_dir(perm: u32) -> Arc<Inode> {
+        let dir = Inode::new(Kind::Dir(BTreeMap::new()), perm & 0o7777);
+        dir.state.lock().sealed = true;
+        dir
+    }
+
+    /// A new device node `name` with number `rdev` (EEXIST if taken), also in
+    /// a sealed directory: the server's own.
+    pub fn insert_device(&self, name: &str, rdev: u64, perm: u32) -> Result<Arc<Inode>, i64> {
+        check_name(name)?;
+        let inode = Inode::new(Kind::Device(rdev), perm & 0o7777);
+        self.insert_as(name, inode.clone(), true)?;
+        Ok(inode)
+    }
+
+    /// Removes the server's device node `name` (also from a sealed directory).
+    pub fn remove_device(&self, name: &str) {
+        let _nesting = RENAME.lock();
+        let mut st = self.state.lock();
+        let Some(m) = st.kind.dir_mut() else { return };
+        let Some(child) = m.remove(name) else { return };
+        let now = now();
+        {
+            let mut cst = child.state.lock();
+            cst.removed = true;
+            cst.link = None;
+            cst.times.changed(now);
+        }
+        st.times.modified(now);
+    }
+
     fn insert(&self, name: &str, inode: Arc<Inode>) -> Result<(), i64> {
+        self.insert_as(name, inode, false)
+    }
+
+    /// Inserts `inode` as `name`; `server`: the server's own name, which a
+    /// sealed directory takes.
+    fn insert_as(&self, name: &str, inode: Arc<Inode>, server: bool) -> Result<(), i64> {
         // (Not visible to anyone else yet: its lock is not nested.)
         inode.state.lock().link = Some((self.ino, String::from(name)));
         let mut st = self.state.lock();
         if st.removed {
             return Err(ENOENT);
+        }
+        if st.sealed && !server {
+            return Err(EACCES);
         }
         match st.kind.dir_mut() {
             Some(m) if m.contains_key(name) => Err(EEXIST),
@@ -344,6 +400,9 @@ impl Inode {
     pub fn unlink(&self, name: &str, dir_only: bool) -> Result<Arc<Inode>, i64> {
         let _nesting = RENAME.lock();
         let mut st = self.state.lock();
+        if st.sealed {
+            return Err(EPERM);
+        }
         let Some(m) = st.kind.dir_mut() else { return Err(ENOTDIR) };
         let child = m.get(name).ok_or(ENOENT)?.clone();
         let mut cst = child.state.lock();
@@ -483,6 +542,9 @@ pub fn rename(odir: &Arc<Inode>, oname: &str, ndir: &Arc<Inode>, nname: &str) ->
     let (first, second) = if Arc::as_ptr(odir) <= Arc::as_ptr(ndir) { (odir, ndir) } else { (ndir, odir) };
     let mut first_guard = first.state.lock();
     let mut second_guard = if same { None } else { Some(second.state.lock()) };
+    if first_guard.sealed || second_guard.as_ref().is_some_and(|g| g.sealed) {
+        return Err(EPERM);
+    }
     let first_map = dir_map(&mut first_guard)?;
     let second_map = match second_guard.as_mut() {
         Some(g) => Some(dir_map(g)?),
@@ -599,7 +661,7 @@ fn stat_size(kind: &Kind) -> u64 {
         Kind::File(o) => syscall(SYS_MO_FILE_SIZE, [o.handle(), 0, 0, 0, 0, 0]).max(0) as u64,
         Kind::Symlink(t) => t.len() as u64,
         Kind::Dir(m) => m.len() as u64,
-        Kind::Socket => 0,
+        Kind::Socket | Kind::Device(_) => 0,
     }
 }
 
@@ -609,11 +671,13 @@ fn kind_bits(kind: &Kind) -> u32 {
         Kind::File(_) => vfs::S_IFREG,
         Kind::Symlink(_) => vfs::S_IFLNK,
         Kind::Socket => vfs::S_IFSOCK,
+        Kind::Device(_) => vfs::S_IFCHR,
     }
 }
 
 pub fn dtype(mode: u32) -> u8 {
     match mode & vfs::S_IFMT {
+        vfs::S_IFCHR => 2,
         vfs::S_IFDIR => 4,
         vfs::S_IFREG => 8,
         vfs::S_IFLNK => 10,

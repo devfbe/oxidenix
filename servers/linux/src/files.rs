@@ -5,7 +5,8 @@
 //! last descriptor closed (`EVENT_CLOSED`, to the service thread).
 //!
 //! `handle` takes the system calls on descriptors and creates files (pipe,
-//! pipe2, eventfd, netlink sockets): for a descriptor of one of the
+//! pipe2, eventfd, netlink sockets; terminals are opened by their device
+//! numbers, `tty::open_device`): for a descriptor of one of the
 //! server's files it answers itself, for one of the kernel's it returns
 //! None and the call passes through (except the requests the server
 //! answers for any descriptor: the netdevice ioctls on sockets).
@@ -53,6 +54,21 @@ pub enum File {
     Inotify(Arc<Inotify>),
     /// An AF_UNIX socket.
     Socket(Arc<crate::unix::Sock>),
+    /// An open terminal (the console, a pty's slave).
+    Tty(Arc<crate::tty::TtyOpen>),
+    /// A pty's master.
+    PtyMaster(Arc<crate::pty::PtyMaster>),
+    /// Null or zero on a node of the server's, or a device node opened with O_PATH.
+    Dev(Arc<crate::devices::DevOpen>),
+}
+
+/// What mmap of one of the server's files maps.
+pub enum Mapping {
+    /// A memory object (a handle to close once mapped), and whether the mapping stays
+    /// read-only.
+    Object(u64, bool),
+    /// Anonymous memory, as for MAP_ANONYMOUS (zero's mappings).
+    Anonymous,
 }
 
 static FILES: Mutex<BTreeMap<u64, File>> = Mutex::new(BTreeMap::new());
@@ -65,8 +81,8 @@ pub fn new_id() -> u64 {
 /// Registers `file` under `id` and gives it a descriptor (the lowest free
 /// one). On failure the file is forgotten again.
 pub fn install(id: u64, file: File, flags: u32, ready: i16) -> Result<i64, i64> {
-    // Regular files and directories are always ready.
-    let kind = if matches!(file, File::Tmp(_) | File::Data(_)) { KFD_ALWAYS_READY } else { 0 };
+    // Regular files, directories and null and zero are always ready.
+    let kind = if matches!(file, File::Tmp(_) | File::Data(_) | File::Dev(_)) { KFD_ALWAYS_READY } else { 0 };
     FILES.lock().insert(id, file);
     let fd = syscall(SYS_KFD_INSTALL, [id, flags as u64, ready as u16 as u64, kind, 0, 0]);
     if fd < 0 {
@@ -93,6 +109,8 @@ pub fn closed(id: u64) {
                 crate::scm::request();
             }
         }
+        Some(File::Tty(open)) => open.tty.closed(&open),
+        Some(File::PtyMaster(m)) => crate::pty::master_closed(&m),
         _ => {}
     }
     // An eventfd or a tmpfs or /data file simply goes (the latter two
@@ -137,6 +155,9 @@ pub fn stat_of(fd: u64) -> Result<vfs::stat::Stat, i64> {
         Some((File::Netlink(n), _)) => n.stat(),
         Some((File::Inotify(i), _)) => i.stat(),
         Some((File::Socket(s), _)) => crate::sockcalls::stat(&s),
+        Some((File::Tty(t), _)) => t.stat,
+        Some((File::PtyMaster(m), _)) => m.stat,
+        Some((File::Dev(d), _)) => d.stat,
         None => kernel_stat(fd)?,
     };
     Ok(vfs::stat::Stat::from_bytes(&bytes))
@@ -158,11 +179,15 @@ fn kernel_stat(fd: u64) -> Result<[u8; 144], i64> {
 /// For mmap of descriptor `fd`: None for a file of the kernel's (mapped
 /// through `kfile_object`); else the object to map (a handle to close once
 /// mapped) and whether the mapping stays read-only, or why not.
-pub fn map_object(fd: u64, shared: bool, prot_write: bool) -> Option<Result<(u64, bool), i64>> {
+pub fn map_object(fd: u64, shared: bool, prot_write: bool) -> Option<Result<Mapping, i64>> {
     const ENODEV: i64 = 19;
+    let object = |r: Result<(u64, bool), i64>| r.map(|(h, ro)| Mapping::Object(h, ro));
     Some(match lookup(fd)? {
-        (File::Tmp(f), flags) => f.map_object(flags, shared, prot_write),
-        (File::Data(f), flags) => f.map_object(flags, shared, prot_write),
+        (File::Tmp(f), flags) => object(f.map_object(flags, shared, prot_write)),
+        (File::Data(f), flags) => object(f.map_object(flags, shared, prot_write)),
+        // Linux's zero maps anonymous memory (shared: a new shared object).
+        (File::Dev(d), _) if d.kind == crate::devices::Kind::Zero => Ok(Mapping::Anonymous),
+        (File::Dev(d), _) if d.kind == crate::devices::Kind::Path => Err(EBADF),
         _ => Err(ENODEV),
     })
 }
@@ -307,6 +332,9 @@ fn on_file(nr: u64, file: File, flags: u32, a1: u64, a2: u64, a3: u64) -> Result
         File::Netlink(n) => return netlink::call(nr, &n, flags, [0, a1, a2, a3, 0, 0]),
         File::Inotify(i) => return inotify::call(nr, &i, flags, a1, a2),
         File::Socket(s) => return crate::sockcalls::on_file(nr, &s, flags, a1, a2),
+        File::Tty(t) => return crate::tty::call(nr, &t, flags, a1, a2),
+        File::PtyMaster(m) => return crate::pty::call(nr, &m, flags, a1, a2),
+        File::Dev(d) => return crate::devices::call(nr, &d, flags, a1, a2),
     };
     let readable = flags & O_ACCMODE != O_WRONLY;
     let writable = flags & O_ACCMODE != 0;
@@ -414,6 +442,12 @@ fn sendfile(out_fd: u64, out: Option<(File, u32)>, in_fd: u64, input: Option<(Fi
             Some((File::Tmp(f), _)) => f.read_server(&mut buf[..want]).map(|n| n as i64),
             Some((File::Data(f), _)) => f.read_server(&mut buf[..want]).map(|n| n as i64),
             Some((File::Socket(s), flags)) => crate::sockcalls::read_server(s, *flags, &mut buf[..want]),
+            Some((File::Tty(t), flags)) => {
+                t.tty.read(t, crate::unix::Sink::Server { buf: &mut buf[..want], at: 0 }, flags & O_NONBLOCK != 0)
+            }
+            Some((File::PtyMaster(m), flags)) => m.read(crate::unix::Sink::Server { buf: &mut buf[..want], at: 0 }, flags & O_NONBLOCK != 0),
+            Some((File::Dev(d), _)) if d.kind == crate::devices::Kind::Path => Err(EBADF),
+            Some((File::Dev(d), _)) => crate::devices::read(d, crate::unix::Sink::Server { buf: &mut buf[..want], at: 0 }),
             None => match syscall(SYS_KFD_READ, [in_fd, buf.as_mut_ptr() as u64, want as u64, 0, 0, 0]) {
                 r if r < 0 => Err(-r),
                 r => Ok(r),
@@ -433,6 +467,10 @@ fn sendfile(out_fd: u64, out: Option<(File, u32)>, in_fd: u64, input: Option<(Fi
             Some((File::Tmp(f), flags)) => f.write_server(&buf[..n], flags & O_APPEND != 0).map(|n| n as i64),
             Some((File::Data(f), flags)) => f.write_server(&buf[..n], flags & O_APPEND != 0).map(|n| n as i64),
             Some((File::Socket(s), flags)) => crate::sockcalls::write_server(s, *flags, &buf[..n]),
+            Some((File::Tty(t), flags)) => t.tty.write(t, crate::unix::Source::Server { buf: &buf[..n], at: 0 }, flags & O_NONBLOCK != 0),
+            Some((File::PtyMaster(m), flags)) => m.write(crate::unix::Source::Server { buf: &buf[..n], at: 0 }, flags & O_NONBLOCK != 0),
+            Some((File::Dev(d), _)) if d.kind == crate::devices::Kind::Path => Err(EBADF),
+            Some((File::Dev(_), _)) => Ok(n as i64),
             None => match syscall(SYS_KFD_WRITE, [out_fd, buf.as_ptr() as u64, n as u64, 0, 0, 0]) {
                 r if r < 0 => Err(-r),
                 r => Ok(r),

@@ -41,7 +41,8 @@ An AI research project; see README.md.
   the I/O ring's invariants (with threads; release for realistic interleavings), `cargo test
   -p fsring` the file protocol's encodings and validation (Linux server <-> diskfs), `cargo
   test -p netlink` rtnetlink's messages (the Linux server's netlink sockets), `cargo test -p
-  netproto` the interface records netd describes.
+  netproto` the interface records netd describes, `cargo test -p ldisc` the line discipline
+  of the Linux server's terminals.
 - QEMU must always run with a visible window; never use `-display none`.
 - The image boots via UEFI (OVMF from nixpkgs) by default; `OXIDENIX_FIRMWARE=bios` builds and
   boots a BIOS image instead. CI runs the self-tests with both.

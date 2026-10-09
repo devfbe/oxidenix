@@ -342,6 +342,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ldisc"
+version = "0.1.0"
+
+[[package]]
 name = "libc"
 version = "0.2.190"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -361,6 +365,7 @@ name = "linux"
 version = "0.1.0"
 dependencies = [
  "fsring",
+ "ldisc",
  "linked_list_allocator",
  "netlink",
  "netproto",

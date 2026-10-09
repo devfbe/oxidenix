@@ -217,6 +217,70 @@ pub fn getsid(pid: Pid) -> SysResult {
     Ok(group(pid).ok_or(ESRCH)?.info.lock().sid as i64)
 }
 
+/// Whether `g` is a program of Linux server instance `instance`.
+pub(super) fn in_instance(g: &ThreadGroup, instance: u64) -> bool {
+    g.tgid != 0 && !g.privileged.load(Ordering::Relaxed) && g.instance.load(Ordering::Acquire) == instance
+}
+
+/// The process id, process group and session of process `id` (0: the
+/// caller), or with `pgrp` of a process of group `id`, in Linux server
+/// instance `instance` (a zombie counts until reaped, as on Linux): the
+/// terminals' job control in the server, until the process model is its
+/// own (R8, `restricted::SYS_PROC_IDS`).
+pub fn proc_ids(instance: u64, id: Pid, pgrp: bool) -> Option<(Pid, Pid, Pid)> {
+    let g = if pgrp {
+        let table = TABLE.lock();
+        table.groups.values().find(|g| in_instance(g, instance) && g.info.lock().pgid == id).cloned()?
+    } else {
+        group(id).filter(|g| in_instance(g, instance))?
+    };
+    let info = g.info.lock();
+    Some((g.tgid, info.pgid, info.sid))
+}
+
+/// Whether process group `pgid` of instance `instance` is orphaned (POSIX):
+/// no live member has a parent in another group of the same session. The
+/// kernel, parent of the trees it starts, is not a parent here (Linux's
+/// init is not either).
+pub fn pgrp_orphaned(instance: u64, pgid: Pid) -> bool {
+    let table = TABLE.lock();
+    for g in table.groups.values().filter(|g| in_instance(g, instance)) {
+        let (ppid, sid) = {
+            let info = g.info.lock();
+            if info.pgid != pgid || info.exit_status.is_some() {
+                continue;
+            }
+            (info.ppid, info.sid)
+        };
+        if ppid == 0 {
+            continue;
+        }
+        if let Some(parent) = table.groups.get(&ppid) {
+            let p = parent.info.lock();
+            if p.exit_status.is_none() && p.pgid != pgid && p.sid == sid {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Whether a live member of process group `pgid` of instance `instance` is stopped
+/// (Linux's `has_stopped_jobs`).
+pub fn pgrp_stopped(instance: u64, pgid: Pid) -> bool {
+    let table = TABLE.lock();
+    table.groups.values().filter(|g| in_instance(g, instance)).any(|g| {
+        let info = g.info.lock();
+        if info.pgid != pgid || info.exit_status.is_some() {
+            return false;
+        }
+        // The predicate SIGCONT uses (`signal::post`): a group stop under way counts
+        // (lock order: the process's info, then its signal state).
+        let stopping = g.sig.lock().stopping();
+        stopping || info.threads.iter().any(|t| t.state() == State::Stopped)
+    })
+}
+
 pub fn setsid() -> SysResult {
     let g = &current().group;
     let mut info = g.info.lock();
@@ -845,7 +909,6 @@ fn spawn_pager(instance: &Arc<linux::Instance>) -> Result<Pid, i64> {
 }
 
 fn spawn_with(path: &str, image: loader::Image, server: Option<&Arc<Server>>, args: &[String]) -> Result<Pid, i64> {
-    let console = OpenFile::console();
     let slot = sched::reserve_pid()?;
     let pid = slot.pid;
     // Servers belong to the kernel, even when a program's request
@@ -859,23 +922,28 @@ fn spawn_with(path: &str, image: loader::Image, server: Option<&Arc<Server>>, ar
     let mut own = Process::empty();
     let mut space = image.space;
     let mut frame = Frame::user_start(image.entry, image.sp);
-    let mut instance_id = 0;
+    let mut instance = None;
     if server.is_none() {
         // A new process tree: a new instance of the Linux server, whose
-        // first thread starts in the server (ADR 0002).
-        let instance = linux::Instance::new()?;
-        spawn_pager(&instance)?;
-        if let Err(e) = space.attach(instance.clone(), true) {
-            instance.close();
+        // first thread starts in the server (ADR 0002), which gives it its
+        // standard descriptors on the console (`ROLE_INIT`).
+        let new = linux::Instance::new()?;
+        spawn_pager(&new)?;
+        if let Err(e) = space.attach(new.clone(), true) {
+            new.close();
             return Err(if e == address_space::Fault::Oom { ENOMEM } else { EINVAL });
         }
-        instance_id = instance.id;
-        let (thread, start) = linux::LinuxThread::new(instance, &frame)?;
+        let (thread, start) = linux::LinuxThread::new(new.clone(), &frame, restricted::ROLE_INIT)?;
         own.linux = Some(thread);
         frame = start;
+        instance = Some(new);
     }
+    let instance_id = instance.as_ref().map_or(0, |i| i.id);
     own.mm = Some(address_space::Mm::new(space).ok_or(ENOMEM)?);
-    own.files = Some(Files::new(vec![Some(FdEntry::new(console, false)); 3]).ok_or(ENOMEM)?);
+    // A native server writes to the kernel's console; a Linux program's
+    // descriptors are its server's.
+    let stdio = if server.is_some() { vec![Some(FdEntry::new(OpenFile::console(), false)); 3] } else { Vec::new() };
+    own.files = Some(Files::new(stdio).ok_or(ENOMEM)?);
     own.fs = Some(FsInfo::new("/".to_string()).ok_or(ENOMEM)?);
     own.server = server.cloned();
     let group = ThreadGroup::new(pid, info, Default::default()).ok_or(ENOMEM)?;
@@ -883,8 +951,9 @@ fn spawn_with(path: &str, image: loader::Image, server: Option<&Arc<Server>>, ar
     group.instance.store(instance_id, Ordering::Release);
     let t = new_task(pid, group, name, own, frame)?;
     slot.insert(t.clone())?;
-    if server.is_none() {
-        crate::drivers::tty::set_foreground(pid);
+    // The tree the kernel starts gets the console (ADR 0007).
+    if let Some(instance) = &instance {
+        linux::console_grant(Some(instance));
     }
     if let Some(server) = server {
         // Before it runs, so its registration and exit find it.

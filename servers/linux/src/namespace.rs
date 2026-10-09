@@ -1,7 +1,8 @@
 //! The server's namespace (phase R6c.2): mounts and path resolution.
 //!
 //! A mount puts a filesystem at a path: the server's tmpfs (`tmpfs`) at
-//! the root, diskfs's disk at /data (`datafs`, over the rings), or a
+//! the root and as devpts at /dev/pts (`pty`), diskfs's disk at /data
+//! (`datafs`, over the rings), or a
 //! directory of the kernel's tree (/dev, /proc, /sys), reached through
 //! handles on its inodes (`restricted::SYS_INODE_*`), until the server's
 //! own filesystems serve them. Mounts are found by name, as everything here: ".." is resolved
@@ -201,6 +202,8 @@ fn with_mounts<R>(f: impl FnOnce(&Vec<Mount>) -> R) -> R {
         }
         let _ = root.subdir(DATA_MOUNT, 0o755);
         m.push(Mount { at: alloc::vec![String::from(DATA_MOUNT)], fs: Fs::Data });
+        // devpts (the ptys' nodes, `pty`), on the kernel's /dev/pts.
+        m.push(Mount { at: alloc::vec![String::from("dev"), String::from("pts")], fs: Fs::Tmpfs(crate::pty::devpts()) });
     }
     f(&m)
 }
