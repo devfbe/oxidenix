@@ -422,8 +422,20 @@ static void datagram_semantics(void) {
     int first = connect(t1, (struct sockaddr *)&la, sizeof la) == 0;
     check("a second connection with the same 4-tuple: EADDRNOTAVAIL",
           shared && first && connect(t2, (struct sockaddr *)&la, sizeof la) == -1 && errno == EADDRNOTAVAIL);
+    /* The first closes first (it ends in TIME-WAIT): its 4-tuple stays
+     * taken for a while, as on Linux. */
+    int t1s = accept(l, NULL, NULL);
     close(t1);
+    char eof;
+    read(t1s, &eof, 1);
+    close(t1s);
+    usleep(100000);
     close(t2);
+    int t3 = socket(AF_INET, SOCK_STREAM, 0);
+    setsockopt(t3, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    check("... and in TIME-WAIT too: bound, but EADDRNOTAVAIL",
+          bind(t3, (struct sockaddr *)&ta, sizeof ta) == 0 && connect(t3, (struct sockaddr *)&la, sizeof la) == -1 && errno == EADDRNOTAVAIL);
+    close(t3);
 
     /* Linux's answers at the edges. */
     int fresh = socket(AF_INET, SOCK_STREAM, 0);
@@ -482,6 +494,45 @@ static void many_sockets(void) {
         }
     }
     check("600 TCP sockets open at once", ok);
+    /* Connections reset before they are accepted give their place (and
+     * netd's buffers) back: many of them leave the backlog working. */
+    int resets = 0;
+    struct linger now = {1, 0};
+    for (int i = 0; i < 200; i++) {
+        int r = tcp_connect("127.0.0.1", port);
+        if (r < 0) continue;
+        setsockopt(r, SOL_SOCKET, SO_LINGER, &now, sizeof now);
+        close(r);
+        resets++;
+    }
+    int late = tcp_connect("127.0.0.1", port), late_s = -1;
+    while (late >= 0 && (late_s = accept(l, NULL, NULL)) >= 0) {
+        char b[4];
+        if (write(late, "late", 4) == 4 && read_all(late_s, b, 4) == 4 && memcmp(b, "late", 4) == 0) break;
+        close(late_s);
+        late_s = -1;
+    }
+    check("200 connections reset unaccepted, then one that works", resets == 200 && late_s >= 0);
+    /* More connections closed actively (each ends in TIME-WAIT) than netd
+     * keeps sockets: the oldest TIME-WAIT ones make room, nothing fails. */
+    int cycled = 0;
+    for (int i = 0; i < 4500; i++) {
+        int a = tcp_connect("127.0.0.1", port);
+        int b = a >= 0 ? accept(l, NULL, NULL) : -1;
+        if (a < 0 || b < 0) {
+            printf("  cycle %d: %s\n", i, strerror(errno));
+            if (a >= 0) close(a);
+            break;
+        }
+        close(a);
+        char e;
+        read(b, &e, 1);
+        close(b);
+        cycled++;
+    }
+    check("4500 connections closed in turn: TIME-WAIT recycled", cycled == 4500);
+    if (late >= 0) close(late);
+    if (late_s >= 0) close(late_s);
     /* Every connection both ways: a request, then a larger answer. */
     static char big[16384], got[16384];
     for (unsigned k = 0; k < sizeof big; k++) big[k] = (char)(k * 7);

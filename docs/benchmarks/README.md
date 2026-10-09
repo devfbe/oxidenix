@@ -25,6 +25,9 @@ virtio-net with user networking and the echo service at 10.0.2.100:7.
 | `fstat_disk` | `fstat` of a file on the disk: one IPC round trip to diskfs with a small request and reply; cycles, p50/p99 |
 | `fstat_tmpfs` | the same in tmpfs (no IPC), for comparison |
 | `stat_path_tmpfs` | `stat` of a path of four names in tmpfs: path resolution (the Linux server's since R6c.2b) and the attributes; cycles, p50/p99 |
+| `proc_meminfo_pread` | `pread` of `/proc/meminfo` (a system-wide file, procfs's) from offset 0 on an open descriptor, as top and htop re-read it; cycles, p50/p99 of 2000 |
+| `proc_self_stat_pread` | the same for `/proc/self/stat` (a process's own file) |
+| `proc_self_stat_open_read_close` | `/proc/self/stat` opened by path, read and closed; cycles, p50/p99 of 2000 |
 | `seq_write` | 16 MiB in 64 KiB `write`s to a new file, then `fsync`; MB/s |
 | `seq_read_disk` | the file with `O_DIRECT` in 64 KiB `pread`s (past the page cache, from the server); MB/s |
 | `seq_read_cached` | the file from the page cache in 64 KiB `pread`s; MB/s |
@@ -42,7 +45,7 @@ the kernel and the servers:
 | counter | counted where |
 |---|---|
 | `syscalls` | every system call entry (`process/syscall.rs`), servers' included |
-| `ipc_calls`, `ipc_bytes` | requests the kernel sends to servers, and the bytes of requests and replies it copies (`process/ipc.rs`) |
+| `ipc_calls`, `ipc_bytes` | requests the kernel sends to servers, and the bytes of requests and replies it copies (`process/ipc.rs`): since I/O rings step 5 only channel offers, so 0 per operation for everything on the rings |
 | `address_space_switches` | page table root loads (`process/tlb.rs`) |
 | `user_copy_bytes` | bytes copied between kernel and user memory (`process/uaccess.rs`) |
 | `heap_allocs` | kernel heap allocations |
@@ -145,6 +148,9 @@ Linux's first sizes and growing to 1 MiB; the loopback pushes back instead of dr
 3.5: the disk figures of that run are low for the same reason). Starting connections at 4 KiB
 instead cost half the loopback throughput (565 MB/s: the growth took longer than the transfer)
 and, against QEMU's user network, a one-second stall (its TCP waits for a larger window).
+After the second review (`2026-10-09-29b0502-r7b-rereview.md`: real randomness, RFC 6528
+sequence numbers, half-open connections with small buffers, TIME-WAIT kept in smoltcp):
+`tcp_loopback` 1192 MB/s, `tcp_network_echo` 176 MB/s (host load about 3.7).
 
 ## R6e: the descriptor table in the Linux server
 

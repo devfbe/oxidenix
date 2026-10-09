@@ -8,6 +8,9 @@ are no longer these either (the kernel's socket layer, `sys_net.rs`, `netproto` 
 `ipc_notify` are gone): the Linux server serves sockets over a channel to netd, with control
 blocks in the channel's shared area and the data in byte rings (ADR 0008,
 `docs/design/linux-server.md`, R7b); the socket sections below describe the state before.
+Since I/O rings step 5 `/proc` and `/sys` are no longer reached through `fsproto` either:
+procfs speaks the file protocol over a channel per Linux server instance, and the kernel's
+`RemoteFs` is gone (`docs/design/io-rings.md`, "procfs over the rings").
 
 ## How a Linux system call reaches a server
 

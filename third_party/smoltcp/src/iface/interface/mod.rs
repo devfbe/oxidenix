@@ -52,6 +52,11 @@ use crate::time::{Duration, Instant};
 
 use crate::wire::*;
 
+/// oxidenix: a TCP initial sequence number for a connection from the first
+/// endpoint (local) to the second (remote) at a time
+/// (`Interface::set_isn_generator`).
+pub type IsnGenerator = fn(IpEndpoint, IpEndpoint, Instant) -> u32;
+
 macro_rules! check {
     ($e:expr) => {
         match $e {
@@ -129,6 +134,9 @@ pub struct InterfaceInner {
     caps: DeviceCapabilities,
     now: Instant,
     rand: Rand,
+    /// oxidenix: how TCP chooses its initial sequence numbers
+    /// (`Interface::set_isn_generator`); None: at random from `rand`.
+    isn: Option<IsnGenerator>,
 
     #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
     neighbor_cache: NeighborCache,
@@ -271,6 +279,7 @@ impl Interface {
             fragmenter: Fragmenter::new(),
             inner: InterfaceInner {
                 now,
+                isn: None,
                 caps,
                 hardware_addr: config.hardware_addr,
                 ip_addrs: Vec::new(),
@@ -306,6 +315,14 @@ impl Interface {
     /// The context is needed for some socket methods.
     pub fn context(&mut self) -> &mut InterfaceInner {
         &mut self.inner
+    }
+
+    /// oxidenix: TCP's initial sequence numbers come from `f` (given the
+    /// connection's local and remote endpoints and the time), as RFC 6528
+    /// asks: a clock plus a keyed hash of the 4-tuple, so that nobody can
+    /// guess them. Without it they are drawn from the interface's PRNG.
+    pub fn set_isn_generator(&mut self, f: IsnGenerator) {
+        self.inner.isn = Some(f);
     }
 
     /// Get the HardwareAddress address of the interface.
@@ -862,6 +879,16 @@ impl InterfaceInner {
     #[allow(unused)] // unused depending on which sockets are enabled, and in tests
     pub(crate) fn rand(&mut self) -> &mut Rand {
         &mut self.rand
+    }
+
+    /// oxidenix: the initial sequence number of a TCP connection from
+    /// `local` to `remote` (`Interface::set_isn_generator`).
+    #[allow(unused)]
+    pub(crate) fn isn(&mut self, local: IpEndpoint, remote: IpEndpoint) -> u32 {
+        match self.isn {
+            Some(f) => f(local, remote, self.now),
+            None => self.rand.rand_u32(),
+        }
     }
 
     #[allow(unused)] // unused depending on which sockets are enabled

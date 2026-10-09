@@ -1,8 +1,9 @@
 # I/O rings: the data plane between the Linux server and the device servers
 
-Status: accepted (ADR 0005); steps 1-4 done (files on `/data` go through the rings since
-R6c.3). Implements principles 1-7 of the I/O audit (`docs/io-path-audit.md`) for the paths the
-Linux server takes over in R6c.3 (files on `/data`), R7 (sockets) and later.
+Status: accepted (ADR 0005); steps 1-5 done (files on `/data` go through the rings since
+R6c.3, sockets since R7b, `/proc` and `/sys` since step 5). Implements principles 1-7 of the
+I/O audit (`docs/io-path-audit.md`) for the paths the Linux server takes over in R6c.3 (files
+on `/data`), R7 (sockets) and step 5 (procfs).
 
 ## Problem
 
@@ -140,7 +141,7 @@ rings and the shared area are read and write. The positions start at 0.
 | `ipc_receive` | an offer comes as a control request (id with bit 63 set, `oxrt::Event::Control`) whose payload is a `ring::channel::Offer` (channel id, slots, shared pages, client pid, the client's instance, by which a service accounts what all of an instance's channels take); the service answers with an 8-byte status |
 | `chan_attach(channel) -> addr` (1068) | maps an offered channel (only the service it was offered to, only once) |
 | `chan_detach(channel)` (1069) | lets go of it: the service's mappings of the channel and of its grants go, and the service vouches that no device uses the grants any more |
-| `grant_map(channel, id, &info) -> addr` (1070) | maps a grant: read-only unless granted writable (`mprotect` cannot add write or execute), not inherited by `fork`, not movable by `mremap`; `info` gets (pages, writable) |
+| `grant_map(channel, id, &info, max_pages) -> addr` (1070) | maps a grant: read-only unless granted writable (`mprotect` cannot add write or execute), not inherited by `fork`, not movable by `mremap`; `info` gets (pages, writable); a grant of more than `max_pages` pages (0: any) is refused with `E2BIG` before anything is mapped (`info` stored), so a service bounds what a client makes it map |
 | `grant_dma(channel, id, offset) -> device address` (1071) | of the byte at `offset` (`EINVAL` beyond the grant), valid to the end of its page |
 | `grant_dma_unmap(channel, id)` (1072) | the service's devices are done with the grant |
 | `chan_watch(channel, value)` (1073) | arms the service's doorbell watch on the submission ring: if its `tail` still holds `value` (else `EAGAIN`), the client's next doorbell or its end going makes `ipc_receive` return `Event::Doorbell` (step 3) |
@@ -436,6 +437,65 @@ pages and dirty marks the kernel keeps and whose data the server moves:
   release never overtakes a lookup of the same inode (a reader-writer lock orders them).
 - **Sockets (R7)**: per socket a receive and a send buffer, granted to netd; TCP segments are
   copied once (NIC buffer ↔ socket buffer), as Linux does without zero-copy sockets.
+- **`/proc` and `/sys` (step 5)**: see "procfs over the rings" below.
+
+## procfs over the rings (step 5)
+
+procfs (`servers/procfs`) serves the system-wide part of `/proc` (`stat`, `meminfo`,
+`loadavg`, `uptime`, `cpuinfo`, `version`, `filesystems`, `counters`, `sys/kernel/*`) and all
+of `/sys` (`devices/system/cpu`) in the **file protocol** (`fsring`), as diskfs serves
+`/data`: one channel per Linux server instance (service `procfs`, `fsring::SLOTS` slots, no
+shared area), the server's end the same `fsclient::Client` as diskfs's (the service and the
+size of its scratch buffer are parameters: 16 pages for procfs). Before step 5 the kernel was
+procfs's client (`fs/remote.rs`, IPC messages in the `fsproto` format, the server reaching
+the files through the kernel's inode bridge); both are gone, with the kernel's static
+`/proc` of the early boot and its mount table.
+
+- **Read-only and stateless.** procfs answers `LOOKUP` (v0 the inode, v1 its mode), `STAT`,
+  `READDIR` (cursor = entry index), `READ`, `STATFS`, `FORGET`, and `RELEASE`/`FLUSH` with
+  nothing to do; whatever would change a file is `EROFS` (the server refuses those itself,
+  with Linux's errors, before asking). Inode numbers name what a file is (below 1024): there
+  are no holds, so a procfs that died and was started again serves the same inodes on the
+  client's new channel.
+- **Contents are made per `READ`.** A `READ` at offset 0 into a scratch range gets the bytes
+  that fit and, in v0, the length of the whole contents as made now; the server reads on at
+  the next offset only for contents beyond its scratch buffer (none of procfs's files is near
+  64 KiB). The server keeps what it read in the open file description (`procfile`): reads
+  from offset 0 make the contents anew, reads further on continue in what was kept (Linux's
+  `seq_file`), so a file read in pieces is one snapshot and `pread(fd, .., 0)` (top, htop)
+  is always current.
+- **Names and results travel in the scratch grant**, copied by procfs with the copy that
+  survives a revoke (`oxrt::copy`): a client that revokes its scratch under a request gets
+  `EFAULT` for it; procfs drops its mapping of the grant and goes on.
+- **One thread, answers at once.** procfs's loop is diskfs's without a device: it takes a
+  request only while the completion ring has room, answers it on the spot (nothing waits in
+  procfs), polls its rings for `SPIN_BUDGET` rounds after work, then arms every doorbell and
+  sleeps in `ipc_receive`. A channel whose client went is detached in the next round.
+- **No instance takes what the others need** (`procproto::admission`, host-tested): procfs
+  charges before it takes. At most 2 channels per instance (the instance is the kernel's word
+  in the offer) of 64 in all, so one instance leaves the others 62; at most 16 grants and 256
+  pages mapped per channel (`grant_map` with the room left as `max_pages`: a larger grant is
+  refused before anything is mapped, `ENOMEM` for the request, and one larger than the whole
+  budget is remembered as refused until `FORGET`, so naming it again costs no kernel call; the
+  server grants one scratch buffer of 16 pages); the memory of one answer at most 64 KiB whatever buffer a
+  request names (a listing goes on at its cursor); requests bounded by the rings and taken
+  round-robin, a few per channel per round. Nothing else outlives a request: procfs keeps no
+  snapshots (the server's open files do, in the instance's own memory).
+- **No instance's processes.** procfs serves only system-wide figures: the kernel gives it
+  the system record alone (`proc_query`'s other queries are `EPERM`), so no client can use it
+  to read another instance's processes; each instance's `/proc/<pid>` is its own server's,
+  scoped by the kernel to that instance.
+- **What the server makes itself.** Each process's part of `/proc` (`/proc/<pid>`, `self`,
+  `thread-self`, `mounts`) is the Linux server's (`procfs.rs`), merged into procfs's root
+  listing: it knows its processes (with R8; until then from the kernel's records,
+  `SYS_PROC_INFO`), its descriptors (its own tables since R6e) and its
+  mounts. See `docs/design/linux-server.md`, "/proc and /sys".
+
+**Cost.** A `/proc/meminfo` read is one request on the ring (`READ`) against two IPC round
+trips before (a `STAT` for the file type, then the `READ`); a process's own file
+(`/proc/self/stat`) no request at all (the kernel's record by one kernel call). Benchmarks
+`proc_meminfo_pread`, `proc_self_stat_pread`, `proc_self_stat_open_read_close`
+(`docs/benchmarks/`).
 
 ## Polling and interrupts
 
@@ -478,7 +538,7 @@ for `mprotect`, `ENOMEM` once the service unmapped it).
    into granted pages. Done: see "The file protocol" above.
 4. The Linux server: `/data` through its page cache over the ring; the bridge to the kernel's
    `/data` goes. Done: see "The page cache's kernel interface" and "Paths built on it". The
-   kernel's remote store, its flusher and diskfs's IPC protocol are gone (procfs keeps the
+   kernel's remote store, its flusher and diskfs's IPC protocol are gone (procfs kept the
    kernel's `RemoteFs` until step 5). Each instance caches `/data` on its own: two process trees
    writing one file see each other's changes only through the disk (after write-back), for
    pages the other has not cached, as two machines sharing a disk without a lock manager would.
@@ -486,4 +546,9 @@ for `mprotect`, `ENOMEM` once the service unmapped it).
    audit and Linux (`datatest` checks the semantics: no pass-through, shared pages, write-back
    and durability, truncation, concurrent readers and writers, a file larger than the memory
    left for the cache).
-5. The same for procfs (metadata only) and, in R7, netd.
+5. The same for procfs, and (in R7b) netd. Done: see "procfs over the rings"; the kernel's
+   `RemoteFs`, its IPC client side (`ipc::call`) and the `fsproto` crate are gone: the
+   kernel's IPC carries only channel offers now. The server's namespace reaches the kernel's
+   tree (the inode bridge, `SYS_INODE_*`) for `/dev` alone. `proctest` checks procfs's
+   files, `/sys`, the server's per-process part and its magic links; `lxtest` connects to a
+   service without channels (`ringtest-plain`) for `EOPNOTSUPP`, since procfs takes them.

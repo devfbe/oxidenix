@@ -1,6 +1,6 @@
 //! Open files of the kernel's (phase R6e): an open file description of the
-//! kernel's tree a program opened (/proc and /sys, the kernel's null and
-//! zero, what else the kernel's tree holds), which the server holds by
+//! kernel's tree a program opened (its /dev: null, zero, the directory),
+//! which the server holds by
 //! handle (`SYS_INODE_OPEN`) as one of its own descriptions holds a file
 //! of its own: the inverse of R6's placeholders. The calls on it are the
 //! kernel's (`SYS_KFILE_CALL`), with the program's buffers; mmap maps the
@@ -60,11 +60,11 @@ impl KernelFile {
     }
 
     /// Its `struct stat`, with the times the server keeps for the kernel's
-    /// files (`namespace::set_kernel_times`).
+    /// files (`namespace::set_pseudo_times`).
     pub fn stat(&self) -> Result<[u8; 144], i64> {
         let mut st = [0u8; 144];
         self.call(files::SYS_FSTAT, [st.as_mut_ptr() as u64, 0, 0, 0])?;
-        crate::namespace::kernel_times(&mut st);
+        crate::namespace::pseudo_times(&mut st);
         Ok(st)
     }
 

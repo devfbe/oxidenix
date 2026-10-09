@@ -49,11 +49,13 @@
 #define TEST_DISKRING 1515
 #define TEST_CACHED 1516
 #define TEST_PASS_THROUGH 1517
+#define TEST_SERVER_TICKS 1518
 
 static int failures;
 
 /* CPU time (user + system, in clock ticks) of the process named `name`,
- * from /proc/<pid>/stat; -1 if there is none. */
+ * from /proc/<pid>/stat; -1 if there is none (a process of another tree:
+ * /proc shows the caller's tree's only). */
 static long proc_ticks(const char *name) {
     DIR *d = opendir("/proc");
     struct dirent *e;
@@ -541,7 +543,7 @@ int main(int argc, char **argv) {
     check("removing the mount point /proc is EBUSY", rmdir("/proc") == -1 && errno == EBUSY);
     check("the root and its programs are the server's tmpfs (from the initramfs)",
           stat("/", &sb) == 0 && sb.st_dev == 0x1a && stat("/bin/busybox", &sb) == 0 && sb.st_dev == 0x1a && S_ISREG(sb.st_mode));
-    check("/proc and /dev are the kernel's", stat("/proc/counters", &sb) == 0 && sb.st_dev != 0x1a && stat("/dev/null", &sb) == 0 && S_ISCHR(sb.st_mode));
+    check("/proc is procfs's (0:21), /dev the kernel's", stat("/proc/counters", &sb) == 0 && sb.st_dev == 0x15 && stat("/dev/null", &sb) == 0 && S_ISCHR(sb.st_mode) && sb.st_dev == 0);
     unlink("/tmp/lxdir/one"); unlink("/tmp/lxdir/two"); rmdir("/tmp/lxdir"); unlink("/tmp/lxfile");
     check("unlinked /tmp files are gone", stat("/tmp/lxdir", &sb) == -1 && stat("/tmp/lxfile", &sb) == -1);
 
@@ -589,11 +591,12 @@ int main(int argc, char **argv) {
         errno = 0;
         long r = syscall(TEST_DISKRING, 8);
         if (r != 0) printf("    (scenario 8: check %d failed)\n", errno);
-        long before = proc_ticks("diskfs");
+        long before = syscall(TEST_SERVER_TICKS, "diskfs");
         usleep(500 * 1000);
-        long spent = proc_ticks("diskfs") - before;
-        if (spent > 5) printf("    (diskfs used %ld ticks in 500 ms)\n", spent);
-        check("diskfs ring: requests waiting for room do not keep diskfs busy", r == 0 && before >= 0 && spent <= 5);
+        long spent = syscall(TEST_SERVER_TICKS, "diskfs") - before;
+        if (spent > 50) printf("    (diskfs used %ld ms of CPU in 500 ms)\n", spent);
+        check("diskfs ring: requests waiting for room do not keep diskfs busy", r == 0 && before >= 0 && spent <= 50);
+        check("/proc shows no other tree's processes (not diskfs's)", proc_ticks("diskfs") == -1);
         errno = 0;
         r = syscall(TEST_DISKRING, 9);
         if (r != 0) printf("    (scenario 9: check %d failed)\n", errno);

@@ -811,12 +811,18 @@ fn grant_of(id: u64, grant: u64) -> Result<(Arc<Channel>, ServiceEnd, Arc<Grant>
     Ok((channel, service, g))
 }
 
-/// grant_map(channel, grant, info) -> addr: maps a grant into the calling
-/// service, read-only unless granted writable; stores (pages, writable) as
-/// two u64s at `info`.
-pub fn grant_map(id: u64, grant: u64, info: u64) -> Result<i64, i64> {
+/// grant_map(channel, grant, info, max_pages) -> addr: maps a grant into
+/// the calling service, read-only unless granted writable; stores (pages,
+/// writable) as two u64s at `info`. E2BIG (nothing mapped, `info` stored)
+/// for a grant of more than `max_pages` pages (0: any size).
+pub fn grant_map(id: u64, grant: u64, info: u64, max_pages: u64) -> Result<i64, i64> {
     let (_, service, g) = grant_of(id, grant)?;
     super::uaccess::write(info, [g.frames.len() as u64, g.writable as u64])?;
+    // A service that bounds what a client's grants may take of it refuses
+    // a larger one before anything is mapped.
+    if max_pages != 0 && g.frames.len() as u64 > max_pages {
+        return Err(E2BIG);
+    }
     let st = g.state.lock();
     if st.revoked {
         return Err(ENOENT);

@@ -21,6 +21,7 @@ pub mod sys {
     pub const EXIT_GROUP: u64 = 231;
     pub const IOPERM: u64 = 173;
     pub const CLOCK_GETTIME: u64 = 228;
+    pub const GETRANDOM: u64 = 318;
     /// (name, name length, argument, flags) -> service id; flags:
     /// `IPC_CHANNELS` (the service accepts channel offers)
     pub const IPC_REGISTER: u64 = 1000;
@@ -48,10 +49,12 @@ pub mod sys {
     /// grants go, the client sees `SERVICE_GONE`; vouches that no device
     /// uses its grants any more.
     pub const CHAN_DETACH: u64 = 1069;
-    /// (channel, grant, &info) -> address: maps a grant of the channel's
-    /// client (read-only unless granted writable; never executable, not
-    /// inherited by fork, gone when revoked); stores (pages, writable) as
-    /// two u64s at `info`. ENOENT for an unknown or revoked grant.
+    /// (channel, grant, &info, max_pages) -> address: maps a grant of the
+    /// channel's client (read-only unless granted writable; never
+    /// executable, not inherited by fork, gone when revoked); stores
+    /// (pages, writable) as two u64s at `info`. ENOENT for an unknown or
+    /// revoked grant; E2BIG, nothing mapped, for one of more than
+    /// `max_pages` pages (0: any).
     pub const GRANT_MAP: u64 = 1070;
     /// (channel, grant, offset) -> device address of the byte at `offset`
     /// of the grant (valid to the end of its page); EINVAL beyond the
@@ -108,6 +111,20 @@ pub fn exit(code: i32) -> ! {
 
 pub fn getpid() -> i64 {
     syscall(sys::GETPID, [0; 6])
+}
+
+/// Fills `buf` from the kernel's random generator (ChaCha20, seeded from
+/// the CPU's entropy source and timing jitter: fit for secrets).
+pub fn getrandom(buf: &mut [u8]) {
+    let mut done = 0;
+    while done < buf.len() {
+        let n = syscall(sys::GETRANDOM, [buf[done..].as_mut_ptr() as u64, (buf.len() - done) as u64, 0, 0, 0, 0]);
+        if n <= 0 {
+            // Only a bad buffer fails, and this one is ours.
+            exit(103);
+        }
+        done += n as usize;
+    }
 }
 
 /// Seconds since the Unix epoch.
@@ -238,8 +255,15 @@ pub fn chan_detach(channel: u64) -> Result<(), i64> {
 
 /// Maps grant `grant` of `channel`: (address, pages, writable).
 pub fn grant_map(channel: u64, grant: u32) -> Result<(*mut u8, u64, bool), i64> {
+    grant_map_max(channel, grant, 0).map_err(|(e, _)| e)
+}
+
+/// `grant_map` of a grant of at most `max_pages` pages: the error -E2BIG
+/// (nothing mapped) for a larger one, with its size in pages (0 for an
+/// unknown grant).
+pub fn grant_map_max(channel: u64, grant: u32, max_pages: u64) -> Result<(*mut u8, u64, bool), (i64, u64)> {
     let mut info = [0u64; 2];
-    let addr = result(syscall(sys::GRANT_MAP, [channel, grant as u64, info.as_mut_ptr() as u64, 0, 0, 0]))?;
+    let addr = result(syscall(sys::GRANT_MAP, [channel, grant as u64, info.as_mut_ptr() as u64, max_pages, 0, 0])).map_err(|e| (e, info[0]))?;
     Ok((addr as *mut u8, info[0], info[1] != 0))
 }
 

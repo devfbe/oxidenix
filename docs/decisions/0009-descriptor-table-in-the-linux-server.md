@@ -18,8 +18,8 @@ R6e moves the table, poll, select and epoll into the server. Three questions:
 
 1. **Who decides which processes share a table** while processes (fork, exec, exit,
    CLONE_FILES) are still the kernel's (until R8)?
-2. **What becomes of the kernel's own files** a program still opens (/proc and /sys through
-   the kernel's remote filesystem, the kernel's /dev null and zero)?
+2. **What becomes of the kernel's own files** a program still opens (the kernel's `/dev`:
+   null, zero, the directory)?
 3. **How does the server wait for many files at once**, with ppoll's and pselect6's
    temporary signal masks, and how do readiness changes reach it?
 

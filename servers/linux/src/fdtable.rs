@@ -575,6 +575,12 @@ fn prlimit_nofile(new: u64, old: u64) -> Result<i64, i64> {
 }
 
 impl FilesContext {
+    /// The open descriptors, ascending (/proc/<pid>/fd).
+    pub fn open_fds(&self) -> Vec<u32> {
+        let t = self.table.lock();
+        t.slots.iter().enumerate().filter(|(_, s)| s.is_some()).map(|(fd, _)| fd as u32).collect()
+    }
+
     /// How many descriptors the table has room for now (select's max_fds).
     pub fn size(&self) -> usize {
         self.table.lock().slots.len()

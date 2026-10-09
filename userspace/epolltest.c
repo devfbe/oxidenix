@@ -209,7 +209,10 @@ static void more(int ep) {
 
     /* Files without readiness of their own. */
     int proc = open("/proc/self/stat", O_RDONLY);
-    check("a file of the kernel's (/proc) is EPERM", add(ep, proc, EPOLLIN, 0) == -1 && errno == EPERM);
+    check("a /proc file is EPERM", add(ep, proc, EPOLLIN, 0) == -1 && errno == EPERM);
+    close(proc);
+    proc = open("/dev/zero", O_RDONLY);
+    check("a file of the kernel's (/dev/zero) is EPERM", add(ep, proc, EPOLLIN, 0) == -1 && errno == EPERM);
     close(proc);
     int opath = open("/tmp", O_PATH);
     check("an O_PATH descriptor is EBADF", add(ep, opath, EPOLLIN, 0) == -1 && errno == EBADF);

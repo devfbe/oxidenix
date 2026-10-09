@@ -80,8 +80,10 @@ pub enum File {
     Path(Arc<crate::pathfile::PathOpen>),
     /// An epoll instance.
     Epoll(Arc<crate::epoll::Epoll>),
-    /// An open file of the kernel's (its tree: /proc, /sys, the kernel's
-    /// null and zero), by handle.
+    /// An open file of /proc or /sys.
+    Proc(Arc<crate::procfile::ProcOpen>),
+    /// An open file of the kernel's (its tree, /dev: null, zero, the
+    /// directory), by handle.
     Kernel(Arc<KernelFile>),
 }
 
@@ -90,7 +92,7 @@ impl File {
     /// directory, null and zero, the kernel's files): epoll refuses it with
     /// EPERM, as Linux does for a file without a poll method.
     pub fn always_ready(&self) -> bool {
-        matches!(self, File::Tmp(_) | File::Data(_) | File::Dev(_) | File::Kernel(_))
+        matches!(self, File::Tmp(_) | File::Data(_) | File::Dev(_) | File::Kernel(_) | File::Proc(_))
     }
 }
 
@@ -154,7 +156,7 @@ impl Description {
                 }
             }
             File::Path(_) => POLLNVAL,
-            File::Tmp(_) | File::Data(_) | File::Dev(_) | File::Kernel(_) => ALWAYS_READY,
+            File::Tmp(_) | File::Data(_) | File::Dev(_) | File::Kernel(_) | File::Proc(_) => ALWAYS_READY,
         }
     }
 }
@@ -360,8 +362,20 @@ pub fn origin_of(fd: u64) -> Option<OriginOf> {
 
 /// The status of descriptor `fd` (EBADF for none).
 pub fn stat_of(fd: u64) -> Result<vfs::stat::Stat, i64> {
-    let f = lookup_raw(fd)?;
-    let bytes = match &f.file {
+    stat_file(&lookup_raw(fd)?.file)
+}
+
+/// The open /proc or /sys file behind descriptor `fd`, if it is one.
+pub fn proc_of(fd: u64) -> Option<Arc<crate::procfile::ProcOpen>> {
+    match &lookup_raw(fd).ok()?.file {
+        File::Proc(f) => Some(f.clone()),
+        _ => None,
+    }
+}
+
+/// The status of an open file.
+pub fn stat_file(file: &File) -> Result<vfs::stat::Stat, i64> {
+    let bytes = match file {
         File::Pipe(end) => end.stat(),
         File::EventFd(e) => e.stat(),
         File::Tmp(t) => return Ok(t.inode.status()),
@@ -376,6 +390,7 @@ pub fn stat_of(fd: u64) -> Result<vfs::stat::Stat, i64> {
         File::Path(p) => p.origin.stat()?,
         File::Epoll(e) => e.stat(),
         File::Kernel(k) => k.stat()?,
+        File::Proc(p) => crate::procfs::stat(&p.node)?,
     };
     Ok(vfs::stat::Stat::from_bytes(&bytes))
 }
@@ -543,6 +558,7 @@ fn on_file(nr: u64, file: &File, flags: u32, a1: u64, a2: u64, a3: u64) -> Resul
         File::Path(p) => return crate::pathfile::call(nr, p, a1),
         File::Epoll(e) => return crate::epoll::on_file(nr, e, a1),
         File::Kernel(k) => return k.on_file(nr, a1, a2, a3),
+        File::Proc(p) => return crate::procfile::call(nr, p, flags, a1, a2, a3),
     };
     let readable = flags & O_ACCMODE != O_WRONLY;
     let writable = flags & O_ACCMODE != 0;
@@ -654,6 +670,7 @@ fn sendfile(out_fd: u64, in_fd: u64, offset: u64, count: u64) -> Result<i64, i64
             File::PtyMaster(m) => m.read(crate::unix::Sink::Server { buf: &mut buf[..want], at: 0 }, in_flags & O_NONBLOCK != 0),
             File::Dev(d) => crate::devices::read(d, crate::unix::Sink::Server { buf: &mut buf[..want], at: 0 }),
             File::Kernel(k) => k.read_server(&mut buf[..want]),
+            File::Proc(f) => f.read_server(&mut buf[..want]).map(|n| n as i64),
             File::EventFd(_) | File::Netlink(_) | File::Inotify(_) | File::Epoll(_) | File::Path(_) => Err(EINVAL),
         };
         let n = match n {
@@ -674,7 +691,8 @@ fn sendfile(out_fd: u64, in_fd: u64, offset: u64, count: u64) -> Result<i64, i64
             File::PtyMaster(m) => m.write(crate::unix::Source::Server { buf: &buf[..n], at: 0 }, out_flags & O_NONBLOCK != 0),
             File::Dev(_) => Ok(n as i64),
             File::Kernel(k) => k.write_server(&buf[..n]),
-            File::EventFd(_) | File::Netlink(_) | File::Inotify(_) | File::Epoll(_) | File::Path(_) => Err(EINVAL),
+            File::Path(_) | File::Proc(_) => Err(EBADF),
+            File::EventFd(_) | File::Netlink(_) | File::Inotify(_) | File::Epoll(_) => Err(EINVAL),
         };
         match wrote {
             Ok(_) => total += n as u64,

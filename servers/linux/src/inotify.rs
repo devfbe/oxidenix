@@ -95,17 +95,18 @@ pub enum Key {
     /// Every /data inode of this number (`deleted` only: one this instance
     /// removed and no longer has, so its generation is unknown here).
     DataAny(u32),
-    /// One of the kernel's (device, inode number): watched, without
-    /// events.
-    Kernel(u64, u64),
+    /// A pseudo file's (the kernel's /dev, /proc, /sys) by device and
+    /// inode number: watched, without events (as Linux's procfs sends
+    /// none for contents that change by themselves).
+    Pseudo(u64, u64),
 }
 
 impl Key {
     pub fn of(node: &Node) -> Option<Key> {
         match node {
-            Node::Kernel(_) => {
+            Node::Kernel(_) | Node::Proc(_) => {
                 let st = node.status().ok()?;
-                Some(Key::Kernel(st.dev, st.ino))
+                Some(Key::Pseudo(st.dev, st.ino))
             }
             Node::Tmp(t) => Some(Key::Tmp(t.ino)),
             Node::Data(d) => Some(Key::data(d)),
@@ -439,7 +440,7 @@ pub fn node_event(node: &Node, mask: u32) {
     match node {
         Node::Tmp(t) => tmp_event(t, mask),
         Node::Data(d) => data_event(d, mask),
-        Node::Kernel(_) => {}
+        Node::Kernel(_) | Node::Proc(_) => {}
     }
 }
 

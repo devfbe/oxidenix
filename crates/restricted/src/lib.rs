@@ -751,7 +751,7 @@ pub const FILES_UNSHARE: u64 = 3;
 /// their struct into the server's memory, and read and write with
 /// `KFILE_SERVER_BUFFER` in `nr` move the server's memory (sendfile through
 /// the server, at most 64 KiB). These files (regular files and directories
-/// of the kernel's tree, /proc and /sys, null and zero) are always ready:
+/// of the kernel's tree, its /dev: null and zero) are always ready:
 /// there is nothing to wait for.
 pub const SYS_KFILE_CALL: u64 = 1131;
 pub const KFILE_SERVER_BUFFER: u64 = 1 << 32;
@@ -781,6 +781,25 @@ pub const WAIT_MAX: u64 = 64;
 /// (epoll_pwait with events), not EINTR.
 pub const SYS_RESTORE_SIGMASK: u64 = 1134;
 
+// /proc (I/O rings step 5, docs/design/linux-server.md "/proc and /sys"):
+// the system-wide files are procfs's, over the instance's channel; each
+// process's own part of /proc is the server's, made from the kernel's
+// records until the process model is the server's (R8); its descriptors
+// (/proc/<pid>/fd) from the server's own tables (R6e).
+
+/// `proc_info(op, arg, buf, len) -> n`: the kernel's records of processes
+/// and of the system, as the procfs server's `proc_query` gives them
+/// (`procproto`: `QUERY_SYSTEM`, `QUERY_PIDS`, `QUERY_PROCESS`,
+/// `QUERY_CMDLINE`, `QUERY_EXE`, `QUERY_THREADS`), into the server's
+/// memory; ERANGE if the answer does not fit (the lists of ids take what
+/// fits), ESRCH for no such process. It sees the processes of the caller's
+/// instance only (as a pid namespace would): another tree's, the kernel's
+/// servers' and the kernel's own are ESRCH and not listed. With R8 the
+/// server answers from its own process table.
+pub const SYS_PROC_INFO: u64 = 1116;
+// 1117 was `kfd_list`, the kernel's descriptors for /proc/self/fd: the
+// table is the server's since R6e.
+
 /// `(scenario)`: the server runs a channel scenario against the test
 /// service (servers/ringtest, `ring::selftest`): 1 rings and doorbells, 2
 /// grants and their bounds, 3 revoking, 4 the client's end going, 5 the
@@ -800,6 +819,12 @@ pub const TEST_CHANNEL: u64 = 1514;
 /// checks that diskfs sleeps), 9 their completions taken. 0 if
 /// every check held, else the negative number of the first that failed.
 pub const TEST_DISKRING: u64 = 1515;
+/// `(name, len) -> ms`: the CPU time (user and system, in milliseconds) of
+/// the running process of the kernel's server `name` (ESRCH if none), in
+/// test mode only (ENOSYS otherwise); a program's call with a C string
+/// `name` is the server's to pass on. The self-tests measure a server's
+/// idleness with it: /proc shows only the caller's instance's processes.
+pub const TEST_SERVER_TICKS: u64 = 1518;
 /// `(scenario)`: the server checks the kernel's interface of its page cache
 /// (`SYS_MO_CREATE_CACHED`) on a file of /data: 1 a failed fill beyond the
 /// end of the file or over 256 pages leaves no trace (the file grown later

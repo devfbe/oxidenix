@@ -284,7 +284,7 @@ static void processes(void) {
 }
 
 static void kernel_files(void) {
-    /* /proc and /dev/null are files of the kernel's: the server holds them. */
+    /* /proc's files (the server's, always ready). */
     int f = open("/proc/self/stat", O_RDONLY);
     char buf[256];
     check("a /proc file opens and reads", f >= 0 && read(f, buf, sizeof buf) > 0);
@@ -302,15 +302,29 @@ static void kernel_files(void) {
     check("O_APPEND changes on it", fcntl(f, F_SETFL, O_APPEND) == 0 && (fcntl(f, F_GETFL) & O_APPEND));
     close(d);
     close(f);
-    int dir = open("/proc", O_RDONLY | O_DIRECTORY);
+    /* The kernel's /dev: open files of the kernel's the server holds by
+     * handle. */
+    int dir = open("/dev", O_RDONLY | O_DIRECTORY);
     char cwd[64];
-    check("fchdir to a directory of the kernel's", dir >= 0 && fchdir(dir) == 0 && getcwd(cwd, sizeof cwd) && strcmp(cwd, "/proc") == 0);
-    check("openat relative to it", (f = openat(dir, "self/status", O_RDONLY)) >= 0 && read(f, buf, 5) == 5);
+    check("fchdir to a directory of the kernel's", dir >= 0 && fchdir(dir) == 0 && getcwd(cwd, sizeof cwd) && strcmp(cwd, "/dev") == 0);
+    check("openat relative to it", (f = openat(dir, "zero", O_RDONLY)) >= 0 && read(f, buf, 5) == 5 && buf[4] == 0);
     close(f);
     chdir("/");
     long n = syscall(SYS_getdents64, dir, buf, sizeof buf);
     check("getdents64 on it", n > 0);
+    check("fstat on it", fstat(dir, &st) == 0 && S_ISDIR(st.st_mode));
     close(dir);
+    f = open("/dev/null", O_RDONLY);
+    pf = (struct pollfd){f, POLLIN, 0};
+    check("the kernel's /dev/null is always ready", poll(&pf, 1, 0) == 1 && pf.revents == POLLIN);
+    ep = epoll_create1(0);
+    check("epoll refuses it (EPERM)", epoll_ctl(ep, EPOLL_CTL_ADD, f, &ev) == -1 && errno == EPERM);
+    close(ep);
+    check("fstat: a character device", fstat(f, &st) == 0 && S_ISCHR(st.st_mode));
+    d = dup(f);
+    check("dup and F_SETFL on it", d >= 0 && fcntl(d, F_SETFL, O_NONBLOCK) == 0 && (fcntl(f, F_GETFL) & O_NONBLOCK));
+    close(d);
+    close(f);
     int z = open("/dev/zero", O_RDONLY);
     char *m = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, z, 0);
     check("mmap of the kernel's /dev/zero", m != MAP_FAILED && m[100] == 0);

@@ -505,11 +505,11 @@ static void rights(void) {
 
     /* Any kind of description travels (since R6e references in the
      * server's own memory): an O_PATH descriptor still names its node, an
-     * open file of the kernel's (/proc) still reads, an epoll instance
+     * open file of the kernel's (/dev/zero) still reads, an epoll instance
      * still waits. */
     socketpair(AF_UNIX, SOCK_DGRAM, 0, sv);
     int opath = open("/tmp", O_PATH | O_DIRECTORY);
-    int kf = open("/proc/self/stat", O_RDONLY);
+    int kf = open("/dev/zero", O_RDONLY);
     int epi = epoll_create1(0);
     send_fds(sv[0], (int[]){opath, kf, epi}, 3);
     close(opath);

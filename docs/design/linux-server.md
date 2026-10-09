@@ -226,15 +226,16 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
        that takes a path move into the server, over a mount table whose filesystems are, at
        first, the kernel's tree, reached through handles on its inodes (lookup, create,
        unlink, rename, readlink, stat, open into a descriptor, exec). The same bridge served
-       `/data` until c3 and still serves `/proc`, `/sys` and `/dev` until I/O rings step 5 and
-       R6d.
+       `/data` until c3 and `/proc` and `/sys` until I/O rings step 5 ("/proc and /sys"
+       below); it still serves `/dev` until the server makes its own.
      - **c2c — tmpfs in the server** (done): the server's own tmpfs, with files as file objects
        (read, write, `mmap` and exec without the kernel's VFS; ETXTBSY through holds the kernel
        reports when let go; a thread about to answer ETXTBSY first waits for the releases
        reported until then, `SYS_EVENT_RELEASES`). First mounted at `/tmp`, with the kernel's tree at the root;
        then (done) the root became the server's tmpfs, unpacked from the initramfs (an object
        of the boot image, its members file objects over its bytes), and the kernel's tree
-       stays mounted for what it still serves (`/dev`, `/proc`, `/sys`; `/data` until c3). Each
+       stays mounted for what it still serves (`/dev`; `/data` until c3, `/proc` and `/sys`
+       until I/O rings step 5). Each
        instance has its own copy (a process tree is a container); pages of a program two
        trees run are not shared between them.
      - **c3 — `/data` in the server** (done; I/O rings step 4, `io-rings.md`, ADR 0005): the
@@ -244,8 +245,8 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
        back by DMA into and out of granted pages, write-back instead of write-through. The
        kernel's `/data` (its remote store, write-through, flusher, `O_DIRECT` path and diskfs's
        IPC protocol) is gone; the kernel only starts diskfs and, before it powers off, waits
-       until the instances wrote their caches back. procfs over the rings follows (I/O rings
-       step 5).
+       until the instances wrote their caches back. procfs over the rings followed (I/O rings
+       step 5, "/proc and /sys" below).
    - **R6d — The terminal** (done; ADR 0004, ADR 0007): the console as a device of the server, the
      line discipline and job control's terminal side in the server, and pseudo-terminals.
      See "The terminal" below.
@@ -390,14 +391,15 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
      a channel names only its own sockets (its control blocks), so one instance can neither
      see nor touch another's. Port sharing never crosses instances where it could take
      traffic from one: another instance's bound or listening TCP socket conflicts whatever
-     both opted in to (its connections and TIME-WAIT ports follow Linux's rule), and a UDP
+     both opted in to (since the review: any port another instance holds), and a UDP
      port is shared by `SO_REUSEADDR` only within an instance (`netring::udp_port_conflict`;
      both rules are tested on the host). netd knows each channel's instance from the
      kernel's offer (`Offer::instance`, which no client can forge) and accounts per instance,
      whatever number of channels it opens (`netring::Budget`, charged before anything is
      allocated, given back to the instance charged, tested on the host): every resource
      (netd's socket memory: smoltcp's buffers and closing connections' leftovers; smoltcp
-     sockets; orphans; records of ports in TIME-WAIT) has a limit in all and keeps a
+     sockets, connections in TIME-WAIT among them; orphans; half-open connections) has a
+     limit in all and keeps a
      reserve for every instance with a channel, which others never cut into; beyond the
      reserves it goes to whoever asks first (one instance alone may use nearly all of it,
      n instances can each count on their reserve). `ENOBUFS` beyond (and a reset for a
@@ -411,13 +413,21 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
      while they limit the transfer (smoltcp, vendored, has patches to grow buffers and to
      announce the window scale of the largest). Under pressure (half of netd's 32 MiB in
      use, as Linux's tcp_mem) connections start and stay small and idle ones give their
-     buffers back, so hundreds of connections fit (nettest opens 600). Closed connections
-     that finish in order (orphans, at most 4096) are reset after 60 s in FIN-WAIT-2
+     send buffers back (a receive buffer never shrinks below the window it announced: the
+     right edge never moves left; a segment beyond a buffer is dropped, never half kept),
+     so hundreds of connections fit (nettest opens 600). Closed connections
+     that finish in order (orphans, at most 2048) are reset after 60 s in FIN-WAIT-2
      (tcp_fin_timeout) or 100 s without progress (a zero window, a peer that stopped
      acknowledging); a connection attempt gives up after 127 s, unacknowledged data after
      924 s (Linux's SYN and data retries), reported as `ETIMEDOUT`. A connection in
-     TIME-WAIT keeps only its port's record (its buffers go; a late segment of it is
-     answered with a reset). Ports are never shared across instances (TCP: bound,
+     TIME-WAIT (only the side that closed first enters it) keeps its smoltcp socket, without
+     buffers, until smoltcp's timer ends it: a retransmitted FIN is answered with an ACK, and
+     its port and 4-tuple stay taken. It counts among its instance's sockets; at most 60 s
+     in all however often the peer sends its FIN again (each restarts smoltcp's timer); and
+     when an instance needs a socket its share or the whole has no room for, the oldest
+     TIME-WAIT connection of that instance goes (never another's), and an instance without
+     room skips TIME-WAIT, as Linux drops TIME-WAIT beyond
+     tcp_max_tw_buckets, so TIME-WAIT never refuses service. Ports are never shared across instances (TCP: bound,
      listening, connected, closing or in TIME-WAIT; UDP: bound), and a connect never takes a
      live, closing or TIME-WAIT 4-tuple (`EADDRNOTAVAIL`). Raw ICMP sockets see the host's
      ICMP packets as on Linux, but no instance sees another's: netd gives each instance's
@@ -437,7 +447,9 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
      netd already holds); when netd dies, every socket of the old channel fails
      (`ECONNRESET`, `POLLERR`) and the next socket makes a new channel (netd started again).
 8. **R8 — Processes and signals**: pids, the process tree, `fork` (with the copy-on-write clone
-   of memory objects), `exec`, `wait`, signals, job control, `/proc`'s data. The kernel's
+   of memory objects), `exec`, `wait`, signals, job control, `/proc`'s per-process data (the
+   server already makes `/proc/<pid>`; R8 replaces where its records come from, `process`
+   and `threads` in `procfs.rs`, see "/proc and /sys"). The kernel's
    process model shrinks to processes and threads as containers. `thread_exists` (1090), with
    which the server checks the target of `sched_getscheduler`/`sched_getparam` today and which
    sees every task of the kernel (other instances' and the servers' threads too), goes then:
@@ -604,8 +616,10 @@ pipe's end is.
   on one are EBADF. As a directory of *at calls it must be a
   directory (ENOTDIR: an O_NOFOLLOW symlink's path is not followed); `readlinkat` with an
   empty path reads the symlink it names. It keeps its node (a /data inode unlinked meanwhile
-  goes with its blocks when the last descriptor closes, as an open file's). Not done yet:
-  reopening through `/proc/self/fd/N` (procfs has no fd links) and `execveat` of one.
+  goes with its blocks when the last descriptor closes, as an open file's). Opening
+  `/proc/self/fd/N` of one opens its node for real (the magic links, "/proc and /sys"
+  below), as musl's `fchmod` and `fexecve` of an `O_PATH` descriptor rely on. Not done yet:
+  `execveat` with `AT_EMPTY_PATH`.
 - **ioctls**: `TCGETS`/`TCSETS`/`TCSETSW`/`TCSETSF` and the `termios2` forms, `TCSBRK`,
   `TCSBRKP`, `TCXONC`, `TCFLSH`, `TIOCGWINSZ`/`TIOCSWINSZ`, `TIOCGPGRP`/`TIOCSPGRP`,
   `TIOCGSID`, `TIOCSCTTY`, `TIOCNOTTY`, `TIOCSTI` (everyone is root), `FIONREAD`,
@@ -693,8 +707,8 @@ the kernel keeps descriptor tables for its native servers only. Decisions in ADR
 ### The kernel's files
 
 What remains of the kernel's files for a Linux program are the inodes of the kernel's tree
-(/proc and /sys through the kernel's remote filesystem, the kernel's /dev nodes null and
-zero): the inverse of the placeholders. `inode_open` returns a handle on the kernel's open
+(its `/dev`: the nodes null and zero, the directory; `/proc` and `/sys` are the server's since
+I/O rings step 5): the inverse of the placeholders. `inode_open` returns a handle on the kernel's open
 file description (no descriptor), which the server's description holds (`kfile.rs`); its calls
 are the kernel's with the program's buffers (`kfile_call`: read, write, the positional and
 vectored forms, lseek, getdents64, ioctl, fsync, ftruncate; fstat and fstatfs into the
@@ -760,6 +774,82 @@ flight (`kfile_object`, `KFILE_INFLIGHT`, `kfd_install_file`, `kfile_info`, `EVE
 select with the wait queues' callbacks. Calls on descriptors no longer pass through to the
 kernel; the kernel's descriptor tables, open files, pipes and eventfds stay for its native
 servers until R9.
+
+## /proc and /sys (I/O rings step 5)
+
+`/proc` and `/sys` are mounts of the server's namespace (`namespace.rs`: `Fs::Proc`,
+`Fs::Sys`; `procfs.rs`), made of two sources:
+
+- **procfs's files**, system-wide: `/proc/{stat,meminfo,loadavg,uptime,cpuinfo,version,
+  filesystems,counters}`, `/proc/sys/kernel/*` and all of `/sys`. procfs is a service of the
+  file protocol over the I/O rings (one channel per instance, `fsclient`; the protocol's
+  side in `docs/design/io-rings.md`, "procfs over the rings"): the server looks names up,
+  stats and lists with requests, and reads a file's contents, made by procfs at the moment,
+  through its scratch grant. Nothing of it is cached; a procfs that died is started again
+  for a new channel and serves the same inodes.
+- **The server's own part**, each process's: `/proc/<pid>` with `stat`, `statm`, `status`,
+  `cmdline`, `comm`, `exe`, `counters` (oxidenix's), `mounts`, `task/<tid>/{stat,statm,
+  status,cmdline,comm}`, `fd/<n>`, `cwd` and `root`; `/proc/self`, `/proc/thread-self` and
+  `/proc/mounts` (a link to `self/mounts`), merged into procfs's root listing. The server
+  knows its mounts and its descriptors; the records of processes are the kernel's until R8
+  (`SYS_PROC_INFO`, 1116: `procproto`'s records); the descriptors are the server's own
+  table's (R6e; `SYS_KFD_LIST`, 1117, which listed the kernel's, is gone). The layer that
+  asks is small on purpose:
+  `process`, `ids` and `machine` in `procfs.rs`; R8 replaces them with the server's process
+  table. `/proc` shows the instance's own processes only, as a pid namespace would: the
+  kernel scopes `SYS_PROC_INFO` to the caller's instance (its own word, never the server's),
+  checked on the very process whose record it reads; another tree's processes, the kernel's
+  servers and the kernel itself are ESRCH and not listed. procfs, which serves every
+  instance, gets only the system-wide record from the kernel (`proc_query`: `QUERY_SYSTEM`,
+  EPERM for the per-process ones), so it cannot be made a deputy for one instance's view of
+  another's; system-wide figures (`/proc/stat`, `loadavg`, `meminfo`, `counters`) are
+  aggregates, as in a container on Linux. The self-tests measure a server's CPU time with a
+  test-mode call instead (`TEST_SERVER_TICKS`). The text formats are `procproto::render`'s,
+  shared with procfs and tested on the host.
+
+**Rules** (Linux's): nothing can be created (`open` with `O_CREAT`: EACCES; `mkdir`,
+`symlink`: EPERM, EEXIST for a name that exists), removed, renamed (EPERM; EXDEV across
+`/proc` and `/sys`) or chmodded (EPERM); files open read-only (for writing: EACCES; directories
+EISDIR), nothing executes (EACCES), `statfs` says `PROC_SUPER_MAGIC` and `SYSFS_MAGIC`; times
+set with `utimensat` are kept by the server per device and inode, as for the kernel's `/dev`
+(`namespace::set_pseudo_times`). An open file (`procfile.rs`) keeps a snapshot of its
+contents as Linux's `seq_file` does: a read from offset 0 makes them anew, reads further on
+continue in what was kept; `lseek` from the start or the position (`SEEK_END`: EINVAL); a
+directory's entries are taken at a read from the start. Copies to the program are made with
+no lock held but the description's offset, which the pager never takes.
+
+**Magic links.** `/proc/<pid>/fd/<n>` reads as the path the descriptor was opened by (with
+" (deleted)" for a file unlinked since), `pipe:[ino]`, `socket:[ino]` or
+`anon_inode:[eventfd]`, `anon_inode:inotify`, `anon_inode:[eventpoll]`. Following it does
+not read it: resolution goes to the open file itself (`procfs::follow`, Linux's
+`proc_fd_link`), as the last name its node (a tmpfs or `/data` inode, also unlinked; a
+terminal's, null's or an `O_PATH` descriptor's node, a file of the kernel's `/dev`), with
+names after it through the path the file was opened by (a limit of the namespace, which
+resolves by path: Linux goes on from the directory itself, so a directory renamed or
+removed since its descriptor was opened differs; the descriptor's own node is reached only
+as the last name). A resolved symlink is opened only with `O_PATH` (ELOOP otherwise: an
+`O_PATH|O_NOFOLLOW` descriptor's symlink reached through `/proc/self/fd/N`). A file without a node (a pipe, a
+socket, an eventfd, inotify, epoll) is `ProcNode::Open`, which keeps nothing of the file
+alive that its last close should end (an `O_PATH` descriptor of it may outlive every real
+one): a pipe as the pipe itself, without an end, anything else as its status when it was
+reached. Opening it opens the file again where Linux does: a pipe gets a new end
+reading, writing or both, as `fifo_open` of a pipe, its readiness reported once its
+description is installed; bash's process substitution through `/dev/fd/N` uses it),
+everything else is ENXIO. `/dev/fd`, `/dev/stdin`, `/dev/stdout` and
+`/dev/stderr` are links into `/proc/self/fd` (in the kernel's `/dev`, as udev makes them).
+Until the process model is the server's, only a process's own
+`fd`, `cwd` and `root` are shown: another process's are EACCES (Linux's answer for another
+user's), its `fd` directory unopenable (mode 0500). "Own" is the caller's process (any of
+its threads' ids names it), and what `fd` lists is the calling thread's descriptor table
+(the server's, R6e): the process's, unless a thread made its own with `clone` without
+`CLONE_FILES` (then `/proc/<pid>/fd` shows the caller's table, not the main thread's, as
+`/proc/thread-self/fd` would on Linux). A child after `fork` sees its own copy. R8 (the
+process model) makes this exact. `exe` is an ordinary link to the
+program's path.
+
+**The kernel** keeps no part of `/proc`: its static `/proc` of the early boot, its mount
+table, its `RemoteFs` (IPC requests to procfs in `fsproto`) and its procfs mounts are gone;
+procfs only gets started (and restarted on the next channel, ADR 0006).
 
 ## Decisions taken in the review
 

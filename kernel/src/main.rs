@@ -20,6 +20,7 @@ mod fs;
 mod interrupts;
 mod memory;
 mod process;
+mod random;
 mod shell;
 pub mod smp;
 pub mod sync;
@@ -53,6 +54,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let rsdp = boot_info.rsdp_addr.into_option().expect("bootloader found no ACPI RSDP");
     interrupts::init_controllers(rsdp);
     time::init();
+    random::init();
     timer::init(interrupts::apic::timer_hz());
     timer::init_cpu();
     fs::init(ramdisk);
@@ -96,23 +98,17 @@ fn start_ringtest() {
     }
 }
 
-/// procfs: the Linux view of processes and the system, built from the
-/// kernel's native information (proc_query).
+/// procfs: the system-wide part of /proc and /sys, built from the kernel's
+/// native information (proc_query), served to the Linux server instances
+/// over the I/O rings (each mounts it at /proc and /sys); the kernel starts
+/// it again when an instance connects after it died (ADR 0006).
 fn start_procfs() {
     let server = match process::Server::load("procfs", "/sbin/procfs") {
         Ok(server) => Arc::new(server),
         Err(e) => return printkln!("[boot] cannot load /sbin/procfs (errno {})", e),
     };
-    match server.start() {
-        Ok((service, root)) => {
-            if let Err(e) = fs::mount_remote(server.clone(), service, root as u32, "proc", "proc", "proc") {
-                printkln!("[boot] cannot mount /proc (errno {})", e);
-            }
-            if let Err(e) = fs::mount_remote(server, service, procproto::SYSFS_ROOT, "sys", "sysfs", "sysfs") {
-                printkln!("[boot] cannot mount /sys (errno {})", e);
-            }
-        }
-        Err(e) => printkln!("[boot] procfs did not start (errno {}); /proc stays static", e),
+    if let Err(e) = server.start() {
+        printkln!("[boot] procfs did not start (errno {}); /proc has only the processes", e);
     }
 }
 
@@ -141,9 +137,8 @@ fn start_diskfs() {
         ),
         Err(e) => return printkln!("[boot] cannot load /sbin/diskfs (errno {})", e),
     };
-    match server.start() {
-        Ok(_) => fs::record_mount("/dev/vda", "/data", "ext2"),
-        Err(e) => printkln!("[boot] diskfs did not start (errno {}); /data is not served", e),
+    if let Err(e) = server.start() {
+        printkln!("[boot] diskfs did not start (errno {}); /data is not served", e);
     }
 }
 

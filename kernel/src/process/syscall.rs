@@ -319,7 +319,7 @@ pub(super) fn dispatch_linux(f: &mut Frame) {
         // The service's end of a channel (see `channel`, oxrt::sys).
         1068 => super::channel::attach(a0),
         1069 => super::channel::detach(a0),
-        1070 => super::channel::grant_map(a0, a1, a2),
+        1070 => super::channel::grant_map(a0, a1, a2, a3),
         1071 => super::channel::grant_dma(a0, a1, a2),
         1072 => super::channel::grant_dma_unmap(a0, a1),
         1073 => super::channel::watch(a0, a1),
@@ -355,7 +355,7 @@ pub(super) fn dispatch_linux(f: &mut Frame) {
         // 441) are the Linux server's (R6e): none reaches the kernel.
         290 => sys_file::eventfd2(a0, a1),
         302 => prlimit(a1, a3),
-        318 => getrandom(a0, a1),
+        318 => getrandom(a0, a1, a2),
         nr => {
             crate::printkln!("[kernel] syscall {} not implemented", nr);
             Err(ENOSYS)
@@ -483,17 +483,33 @@ fn prlimit(resource: u64, old: u64) -> SysResult {
     Ok(0)
 }
 
-/// Not cryptographically secure: xorshift seeded from the timestamp counter.
-fn getrandom(buf: u64, len: u64) -> SysResult {
-    let mut x = unsafe { core::arch::x86_64::_rdtsc() } | 1;
-    let n = uaccess::read_to_user(buf, len, true, |out, _| {
-        for b in out.iter_mut() {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            *b = x as u8;
+/// getrandom(2): bytes of the kernel's generator (`crate::random`),
+/// which is seeded before any process runs, so it never blocks and
+/// GRND_NONBLOCK and GRND_RANDOM change nothing (as on Linux since 5.6);
+/// unknown flags, and GRND_INSECURE with GRND_RANDOM, are EINVAL. The
+/// bytes are made in pieces with the generator's lock released before
+/// each copy to the program (a fault may sleep); a fault after some bytes
+/// returns how many were copied.
+fn getrandom(buf: u64, len: u64, flags: u64) -> SysResult {
+    const GRND_NONBLOCK: u64 = 1;
+    const GRND_RANDOM: u64 = 2;
+    const GRND_INSECURE: u64 = 4;
+    if flags & !(GRND_NONBLOCK | GRND_RANDOM | GRND_INSECURE) != 0 || flags & (GRND_RANDOM | GRND_INSECURE) == GRND_RANDOM | GRND_INSECURE {
+        return Err(EINVAL);
+    }
+    // At most what one call to read(2) may return (Linux's limit).
+    let len = len.min(0x7fff_f000);
+    let mut done = 0u64;
+    let mut piece = [0u8; 256];
+    while done < len {
+        let n = (len - done).min(piece.len() as u64) as usize;
+        crate::random::fill(&mut piece[..n]);
+        if let Err(e) = uaccess::copy_to(buf + done, &piece[..n]) {
+            piece.fill(0);
+            return if done > 0 { Ok(done as i64) } else { Err(e) };
         }
-        Ok(out.len())
-    })?;
-    Ok(n as i64)
+        done += n as u64;
+    }
+    piece.fill(0);
+    Ok(done as i64)
 }

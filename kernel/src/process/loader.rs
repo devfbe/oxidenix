@@ -199,8 +199,11 @@ fn build_stack(space: &mut AddressSpace, args: &[String], envs: &[String], auxv:
     let mut sp = strings & !0xf;
     sp -= 16;
     let random = sp;
-    let seed = unsafe { core::arch::x86_64::_rdtsc() };
-    space.write(random, &[seed.to_le_bytes(), seed.rotate_left(29).to_le_bytes()].concat())?;
+    // AT_RANDOM: 16 bytes of the kernel's generator (the C library's stack
+    // protector and pointer guard come from them).
+    let mut seed = [0u8; 16];
+    crate::random::fill(&mut seed);
+    space.write(random, &seed)?;
 
     let mut words: Vec<u64> = Vec::new();
     words.push(argv.len() as u64);

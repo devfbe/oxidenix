@@ -4,14 +4,15 @@
 failed=0
 fail() { echo "FAIL $1"; failed=$((failed + 1)); }
 
-for t in forktest leaktest sigtest jobtest cowtest fstest oomtest nettest smptest proctest vmtest futextest threadtest timetest timertest fdtest polltest eventfdtest sigmasktest epolltest unixtest mmaptest exectest cachetest writebacktest datatest ttytest lxtest libuvtest metatest inotifytest; do
+for t in forktest leaktest sigtest jobtest cowtest fstest oomtest nettest smptest proctest vmtest futextest threadtest timetest randtest timertest fdtest polltest eventfdtest sigmasktest epolltest unixtest mmaptest exectest cachetest writebacktest datatest ttytest lxtest libuvtest metatest inotifytest; do
     echo "=== $t"
     if $t; then echo "PASS $t"; else fail "$t"; fi
 done
 
-# lxtest again, three times, its output into a pipe and beside a program
-# whose calls the server passes through to the kernel (reading /proc): its
-# checks hold in any run and whatever else runs.
+# lxtest again, three times, its output into a pipe and beside a busy
+# reader of /proc (procfs over its channel, the server's own files) whose
+# fork, exec and wait pass through to the kernel: its checks hold in any
+# run and whatever else runs.
 echo "=== lxtest x3 beside a busy reader"
 (while :; do cat /proc/counters /proc/self/stat > /dev/null; done) &
 busy=$!

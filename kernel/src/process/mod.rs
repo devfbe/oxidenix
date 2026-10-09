@@ -701,6 +701,11 @@ impl Server {
         ipc::wait_for(self.name, self.start_timeout).ok_or(EIO)
     }
 
+    /// Its running incarnation's process id.
+    pub fn pid(&self) -> Option<Pid> {
+        self.lives.lock().pid
+    }
+
     /// The incarnation `pid` registered its service (whenever: a start
     /// that timed out may still come up).
     pub fn registered(&self, pid: Pid) {

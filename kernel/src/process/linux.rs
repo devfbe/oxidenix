@@ -1714,6 +1714,20 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
                 _ => Err(EINVAL),
             }
         }
+        SYS_PROC_INFO => super::query::server_query(instance.id, a[0], a[1], a[2], a[3]),
+        TEST_SERVER_TICKS => {
+            if !crate::TEST_MODE.load(core::sync::atomic::Ordering::Relaxed) {
+                return Err(ENOSYS);
+            }
+            let len = a[1].min(64) as usize;
+            let mut name = [0u8; 64];
+            super::uaccess::copy_from_server(a[0], &mut name[..len])?;
+            let name = core::str::from_utf8(&name[..len]).map_err(|_| EINVAL)?;
+            let pid = super::server_named(name).and_then(|s| s.pid()).ok_or(ESRCH)?;
+            let group = super::group(pid).ok_or(ESRCH)?;
+            let (user, system) = group.info.lock().cputime();
+            Ok(((user + system) / 1_000_000) as i64)
+        }
         SYS_SIGNAL_STATE => {
             if is_pager() {
                 return Err(EPERM);
