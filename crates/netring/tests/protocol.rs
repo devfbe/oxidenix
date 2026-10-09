@@ -697,6 +697,30 @@ fn echo_ids_keep_instances_apart() {
     assert!(ids.is_empty());
 }
 
+/// The reserves of instances that are still to come are kept too: one
+/// that connects late finds its reserve whatever the early ones took.
+#[test]
+fn reserves_wait_for_instances_still_to_come() {
+    let mut b = Budget::new(100, 10, 100).for_instances(4);
+    b.activate(1);
+    // Alone, it leaves the three others still to come their reserves.
+    assert_eq!(b.room(1), 70);
+    while b.charge(1, 1).is_ok() {}
+    assert_eq!(b.held(1), 70);
+    // Each newcomer finds its reserve, however late it comes.
+    for owner in 2..=4 {
+        b.activate(owner);
+        assert_eq!(b.room(owner), 10, "instance {owner}");
+        assert_eq!(b.charge(owner, 10), Ok(()));
+        assert_eq!(b.charge(owner, 1), Err(ENOBUFS));
+    }
+    // One that leaves gives its place to the next to come.
+    b.uncharge(4, 10);
+    b.deactivate(4);
+    b.activate(5);
+    assert_eq!(b.room(5), 10);
+}
+
 /// Giving back more than an instance holds is a lost count: debug builds
 /// stop there (release builds give back what it holds).
 #[test]
@@ -706,4 +730,26 @@ fn giving_back_more_than_held_is_caught() {
     let mut b = Budget::new(100, 0, 100);
     b.charge(1, 10).unwrap();
     b.uncharge(1, 11);
+}
+
+#[test]
+fn ephemeral_ports_follow_rfc6056s_fourth_algorithm() {
+    let (k1, k2) = ([1u8; 16], [2u8; 16]);
+    let mut table = [0u32; 1024];
+    // Successive connections to one destination move on.
+    let a = port_start(&k1, &k2, &mut table, 1, 0x0a00_0202, 80, true);
+    let b = port_start(&k1, &k2, &mut table, 1, 0x0a00_0202, 80, true);
+    assert_eq!(b, a.wrapping_add(1));
+    // Another instance's connections to the same destination move a
+    // counter of their own, not this instance's: no cross-instance signal.
+    let mine = (0..table.len()).find(|&i| table[i] == 2).expect("instance 1's counter");
+    let before = table;
+    port_start(&k1, &k2, &mut table, 2, 0x0a00_0202, 80, true);
+    let changed: Vec<usize> = (0..table.len()).filter(|&i| table[i] != before[i]).collect();
+    assert_eq!(changed.len(), 1);
+    assert_ne!(changed[0], mine, "instance 2 has a counter of its own here");
+    assert_eq!(port_start(&k1, &k2, &mut table, 1, 0x0a00_0202, 80, true), b.wrapping_add(1));
+    // Other keys, another start.
+    let mut other = [0u32; 1024];
+    assert_ne!(port_start(&[3; 16], &k2, &mut other, 1, 0x0a00_0202, 80, true), a);
 }

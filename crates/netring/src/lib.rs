@@ -751,9 +751,12 @@ impl Request {
 /// nearly all of it, and n active instances can each count on `reserve`
 /// whatever the others do (the fair share scales with the number of
 /// active instances; `limit` must cover the reserves of as many as there
-/// can be channels). `cap` bounds what one instance holds, whatever
-/// number of channels it opened. Charged before anything is allocated,
-/// given back to the instance that was charged.
+/// can be channels). With `for_instances(n)` the reserves of the n - k
+/// instances that may still come (k active now) are kept too, so one that
+/// connects later finds its reserve whatever the others took. `cap` bounds
+/// what one instance holds, whatever number of channels it opened.
+/// Charged before anything is allocated, given back to the instance that
+/// was charged.
 #[derive(Debug, Default)]
 pub struct Budget {
     limit: usize,
@@ -763,6 +766,10 @@ pub struct Budget {
     /// The reserves of active instances not yet used: what nobody else may
     /// take.
     reserved: usize,
+    /// The instances there can be at once (with a channel), and those
+    /// active now: the reserves of the others are kept for them.
+    slots: usize,
+    active: usize,
     /// What each instance holds and how often it is active (instances
     /// neither holding anything nor active are not kept).
     owners: alloc::collections::BTreeMap<u64, Owner>,
@@ -783,7 +790,14 @@ impl Owner {
 
 impl Budget {
     pub const fn new(limit: usize, reserve: usize, cap: usize) -> Budget {
-        Budget { limit, reserve, cap, used: 0, reserved: 0, owners: alloc::collections::BTreeMap::new() }
+        Budget { limit, reserve, cap, used: 0, reserved: 0, slots: 0, active: 0, owners: alloc::collections::BTreeMap::new() }
+    }
+
+    /// Keeps the reserves of instances that are not active yet, of `slots`
+    /// at most at once.
+    pub const fn for_instances(mut self, slots: usize) -> Budget {
+        self.slots = slots;
+        self
     }
 
     fn owner(&self, owner: u64) -> Owner {
@@ -794,8 +808,14 @@ impl Budget {
     fn update(&mut self, owner: u64, f: impl FnOnce(&mut Owner)) {
         let mut o = self.owner(owner);
         self.reserved -= o.unused(self.reserve);
+        let was = o.active > 0;
         f(&mut o);
         self.reserved += o.unused(self.reserve);
+        match (was, o.active > 0) {
+            (false, true) => self.active += 1,
+            (true, false) => self.active -= 1,
+            _ => {}
+        }
         if o.held == 0 && o.active == 0 {
             self.owners.remove(&owner);
         } else {
@@ -814,10 +834,12 @@ impl Budget {
     }
 
     /// What `owner` may still take: what is free beyond the others'
-    /// unused reserves, within its cap.
+    /// unused reserves (those of instances still to come too), within its
+    /// cap.
     pub fn room(&self, owner: u64) -> usize {
         let o = self.owner(owner);
-        let others = self.reserved - o.unused(self.reserve);
+        let to_come = self.slots.saturating_sub(self.active) * self.reserve;
+        let others = self.reserved - o.unused(self.reserve) + to_come;
         self.limit.saturating_sub(self.used + others).min(self.cap.saturating_sub(o.held))
     }
 
@@ -1117,6 +1139,30 @@ pub fn icmp_key(packet: &[u8]) -> Option<IcmpKey> {
         }
         _ => None,
     }
+}
+
+/// Where netd's search for an ephemeral port starts (an offset into the
+/// range), for `owner`'s connection to `addr`:`port`, by RFC 6056's
+/// fourth algorithm: a keyed hash of the destination (`port_key`) plus one
+/// of `table`'s counters, chosen by a second keyed hash (`table_key`) of
+/// the instance and the destination, and moved on. So ports are
+/// unpredictable without the keys, successive connections to one
+/// destination get different ports, and one instance's connections move
+/// no counter another instance's choice depends on (except by a
+/// collision of the second hash, which nobody can aim at).
+pub fn port_start(port_key: &[u8; 16], table_key: &[u8; 16], table: &mut [u32], owner: u64, addr: u32, port: u16, tcp: bool) -> u32 {
+    let mut data = [0u8; 15];
+    data[..4].copy_from_slice(&addr.to_be_bytes());
+    data[4..6].copy_from_slice(&port.to_be_bytes());
+    data[6] = tcp as u8;
+    data[7..].copy_from_slice(&owner.to_le_bytes());
+    let offset = csprng::siphash(port_key, &data[..7]) as u32;
+    if table.is_empty() {
+        return offset;
+    }
+    let index = csprng::siphash(table_key, &data) as usize % table.len();
+    table[index] = table[index].wrapping_add(1);
+    offset.wrapping_add(table[index])
 }
 
 /// How many bytes a ring holds between a consumer and a producer

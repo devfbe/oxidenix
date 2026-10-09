@@ -400,7 +400,8 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
      (netd's socket memory: smoltcp's buffers and closing connections' leftovers; smoltcp
      sockets, connections in TIME-WAIT among them; orphans; half-open connections) has a
      limit in all and keeps a
-     reserve for every instance with a channel, which others never cut into; beyond the
+     reserve for every instance with a channel and for every one that may still come (64
+     channels), which others never cut into; beyond the
      reserves it goes to whoever asks first (one instance alone may use nearly all of it,
      n instances can each count on their reserve). `ENOBUFS` beyond (and a reset for a
      close whose leftovers do not fit); at most two channels an instance, and a channel
@@ -411,8 +412,8 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
      only the sockets' places); then Linux's first sizes (64 KiB to receive, 16 KiB to
      send; given before the SYN-ACK goes, so it offers a window), which double up to 1 MiB
      while they limit the transfer (smoltcp, vendored, has patches to grow buffers and to
-     announce the window scale of the largest). Under pressure (half of netd's 32 MiB in
-     use, as Linux's tcp_mem) connections start and stay small and idle ones give their
+     announce the window scale of the largest). Under pressure (an instance with less than
+     4 MiB of room left, as Linux's tcp_mem per instance) its connections start and stay small and idle ones give their
      send buffers back (a receive buffer never shrinks below the window it announced: the
      right edge never moves left; a segment beyond a buffer is dropped, never half kept),
      so hundreds of connections fit (nettest opens 600). Closed connections

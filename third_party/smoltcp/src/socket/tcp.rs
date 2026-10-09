@@ -1643,6 +1643,23 @@ impl<'a> Socket<'a> {
         Some(self.ack_reply(ip_repr, repr))
     }
 
+    /// oxidenix: whether `repr` is a new connection's SYN for this
+    /// connection's 4-tuple while it is in TIME-WAIT, beyond everything it
+    /// received (RFC 9293 3.10.7.4, RFC 6191 without timestamps): then
+    /// TIME-WAIT ends at once (`end_time_wait`) and a listener takes it.
+    pub(crate) fn yields_to_syn(&self, cx: &mut Context, ip_repr: &IpRepr, repr: &TcpRepr) -> bool {
+        self.state == State::TimeWait
+            && repr.control == TcpControl::Syn
+            && repr.ack_number.is_none()
+            && self.accepts(cx, ip_repr, repr)
+            && repr.seq_number > self.remote_seq_no + self.rx_buffer.len()
+    }
+
+    /// oxidenix: ends TIME-WAIT silently (`yields_to_syn`).
+    pub(crate) fn end_time_wait(&mut self) {
+        self.reset();
+    }
+
     pub(crate) fn accepts(&self, _cx: &mut Context, ip_repr: &IpRepr, repr: &TcpRepr) -> bool {
         if self.state == State::Closed {
             return false;
@@ -1986,7 +2003,13 @@ impl<'a> Socket<'a> {
             // reason is TCP simultaneous open).
             (State::SynReceived, TcpControl::Rst) if self.listen_endpoint.port != 0 => {
                 tcp_trace!("received RST");
-                self.tuple = None;
+                // oxidenix: everything of the connection that was refused
+                // goes, as `listen` does (its receive state, the window it
+                // announced, what it received): the socket is a fresh
+                // listener again.
+                let endpoint = self.listen_endpoint;
+                self.reset();
+                self.listen_endpoint = endpoint;
                 self.set_state(State::Listen);
                 return None;
             }
@@ -10324,6 +10347,73 @@ mod test {
         let mut all = [0; 64];
         assert_eq!(s.recv_slice(&mut all), Ok(16));
         assert_eq!(&all[..16], &[b'q'; 16]);
+    }
+
+    /// A connection reset in SYN-RECEIVED leaves a fresh listener: nothing
+    /// of it stays (the window it announced, what it received), so its
+    /// buffers may go at once.
+    #[test]
+    fn test_oxidenix_syn_received_rst_leaves_a_fresh_listener() {
+        let mut s = socket_with_buffer_sizes(64, 64);
+        s.listen(LISTEN_END).unwrap();
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: None,
+                ..SEND_TEMPL
+            }
+        );
+        recv!(
+            s,
+            [TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: LOCAL_SEQ,
+                ack_number: Some(REMOTE_SEQ + 1),
+                max_seg_size: Some(BASE_MSS),
+                ..RECV_TEMPL
+            }]
+        );
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Rst,
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ),
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::Listen);
+        assert_eq!(s.listen_endpoint, LISTEN_END);
+        assert_eq!(s.remote_last_ack, None);
+        assert_eq!(s.remote_last_win, 0);
+        assert_eq!(s.announced_window(), 0);
+        assert!(s.assembler.is_empty());
+        assert_eq!(s.replace_rx_buffer(vec![]).ok().map(|b| b.len()), Some(64));
+        assert_eq!(s.replace_tx_buffer(vec![]).ok().map(|b| b.len()), Some(64));
+    }
+
+    /// A new connection's SYN, beyond what the old one received, ends its
+    /// TIME-WAIT; an old duplicate does not.
+    #[test]
+    fn test_oxidenix_time_wait_yields_to_a_new_syn() {
+        let mut s = socket_time_wait(false);
+        let ip = IpReprIpvX(IpvXRepr {
+            src_addr: REMOTE_ADDR,
+            dst_addr: LOCAL_ADDR,
+            next_header: IpProtocol::Tcp,
+            payload_len: 0,
+            hop_limit: 64,
+        });
+        let syn = |seq| TcpRepr { control: TcpControl::Syn, seq_number: seq, ack_number: None, ..SEND_TEMPL };
+        let TestSocket { socket, cx } = &mut s;
+        assert!(!socket.yields_to_syn(cx, &ip, &syn(REMOTE_SEQ)), "an old SYN");
+        assert!(!socket.yields_to_syn(cx, &ip, &syn(REMOTE_SEQ + 1 + 1)), "not beyond");
+        assert!(socket.yields_to_syn(cx, &ip, &syn(REMOTE_SEQ + 1000)));
+        socket.end_time_wait();
+        assert_eq!(s.state, State::Closed);
+        assert_eq!(s.tuple, None);
     }
 
     #[test]
