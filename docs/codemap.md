@@ -108,7 +108,7 @@ module comment, and the public types it defines. Where to start for common tasks
 - `servers/diskfs/src/service.rs` (937) The ring service: diskfs's end of the data plane (docs/design/io-rings.md, the file protocol `fsring`). Types: `Service`.
 - `servers/netd/src/main.rs` (172) netd: the network server.
 - `servers/netd/src/nic.rs` (114) smoltcp's view of the network card, with loopback: frames addressed to this host (its own address or 127.0.0.0/8) never reach the wire but come back as received frames, and ARP requests for those addresses are... Types: `Nic`, `RxToken`, `TxToken`.
-- `servers/netd/src/service.rs` (1201) The socket service: netd's end of the instances' channels (phase R7b, ADR 0007, the protocol `netring`), mapped onto smoltcp's sockets. Types: `Config`, `Service`.
+- `servers/netd/src/service.rs` (1287) The socket service: netd's end of the instances' channels (phase R7b, ADR 0007, the protocol `netring`), mapped onto smoltcp's sockets. Types: `Config`, `Service`.
 - `servers/netd/src/virtio_net.rs` (91) virtio-net driver on the shared virtio transport (crates/virtio). Types: `VirtioNet`.
 - `servers/procfs/src/main.rs` (349) procfs: Linux's /proc, served from user space.
 - `servers/procfs/src/render.rs` (193) The text formats of Linux's /proc files.

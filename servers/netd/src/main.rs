@@ -29,9 +29,10 @@ use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, IpCidr, Ipv4Address, Ipv4Cidr};
 use virtio_net::VirtioNet;
 
-/// The heap holds smoltcp's socket buffers (`service::BUDGET`) and the
-/// rest: the sockets, frames in flight, the channels' bookkeeping.
-const HEAP: usize = service::BUDGET + (8 << 20);
+/// The heap: the sockets themselves, frames in flight, the channels'
+/// bookkeeping. smoltcp's socket buffers are not in it: each socket's are
+/// memory of their own, gone with the socket (`service::Region`).
+const HEAP: usize = 8 << 20;
 
 oxrt::entry!(main, heap = HEAP);
 

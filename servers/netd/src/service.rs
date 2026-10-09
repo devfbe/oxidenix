@@ -130,6 +130,51 @@ struct Grant {
     writable: bool,
 }
 
+/// Memory of its own, mapped (and committed) at once and unmapped when
+/// dropped: a socket's smoltcp buffers, a closed connection's leftovers.
+/// So netd's memory follows its sockets (its heap stays small), and short
+/// memory is ENOBUFS for the socket, never a failed allocation in netd.
+struct Region {
+    addr: *mut u8,
+    len: usize,
+    mapped: usize,
+}
+
+impl Region {
+    fn new(len: usize) -> Result<Region, i64> {
+        const PROT_RW: u64 = 3;
+        const MAP_PRIVATE_ANON: u64 = 0x22;
+        let mapped = len.max(1).next_multiple_of(PAGE as usize);
+        let addr = oxrt::syscall(oxrt::sys::MMAP, [0, mapped as u64, PROT_RW, MAP_PRIVATE_ANON, u64::MAX, 0]);
+        if addr < 0 {
+            return Err(ENOBUFS);
+        }
+        Ok(Region { addr: addr as *mut u8, len, mapped })
+    }
+
+    fn bytes(&self) -> &[u8] {
+        unsafe { core::slice::from_raw_parts(self.addr, self.len) }
+    }
+
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        unsafe { core::slice::from_raw_parts_mut(self.addr, self.len) }
+    }
+
+    /// Its two halves as smoltcp's buffers. They live as long as the
+    /// region: the owner drops the region only after the socket that uses
+    /// them left smoltcp (`Service::drop_socket`).
+    fn halves(&mut self) -> (&'static mut [u8], &'static mut [u8]) {
+        let half = self.len / 2;
+        unsafe { (core::slice::from_raw_parts_mut(self.addr, half), core::slice::from_raw_parts_mut(self.addr.add(half), half)) }
+    }
+}
+
+impl Drop for Region {
+    fn drop(&mut self) {
+        let _ = oxrt::munmap(self.addr, self.mapped);
+    }
+}
+
 /// A socket's rings, resolved: where they lie in netd's mapping.
 #[derive(Clone, Copy)]
 struct Rings {
@@ -232,7 +277,7 @@ struct Closing {
     handle: SocketHandle,
     /// What its send ring still held, sent before the FIN (charged to the
     /// budget with `cost`).
-    leftover: Vec<u8>,
+    leftover: Option<Region>,
     sent: usize,
     local: Option<IpListenEndpoint>,
     reuse: bool,
@@ -281,6 +326,8 @@ pub struct Service {
     bytes: Budget,
     lingering_records: Budget,
     channels: Budget,
+    /// The memory of each smoltcp socket's buffers.
+    regions: BTreeMap<SocketHandle, Region>,
     /// A datagram on its way out.
     scratch: Vec<u8>,
     pub config: Config,
@@ -328,6 +375,7 @@ impl Service {
             bytes: Budget::new(BUDGET, INSTANCE_BUDGET),
             lingering_records: Budget::new(MAX_LINGERING, INSTANCE_LINGERING),
             channels: Budget::new(MAX_CHANNELS, INSTANCE_CHANNELS),
+            regions: BTreeMap::new(),
             scratch: vec![0; MAX_UDP.max(RAW_BUFFER)],
             config: Config::default(),
         }
@@ -449,7 +497,7 @@ impl Service {
         let mut chan = self.chans[c].take().expect("in use");
         for (_, s) in core::mem::take(&mut chan.socks) {
             // The rings went with the grants: nothing more of theirs.
-            self.release(chan.owner, s, false, Vec::new(), sockets);
+            self.release(chan.owner, s, false, None, sockets);
         }
         for (_, g) in core::mem::take(&mut chan.grants) {
             let _ = oxrt::munmap(g.addr, g.bytes as usize);
@@ -521,25 +569,47 @@ impl Service {
         }
     }
 
-    fn new_tcp(sockets: &mut SocketSet<'static>) -> SocketHandle {
-        let rx = tcp::SocketBuffer::new(vec![0; TCP_BUFFER]);
-        let tx = tcp::SocketBuffer::new(vec![0; TCP_BUFFER]);
-        let mut socket = tcp::Socket::new(rx, tx);
+    /// A new TCP socket in smoltcp, its buffers in memory of their own
+    /// (ENOBUFS if memory is short).
+    fn new_tcp(&mut self, sockets: &mut SocketSet<'static>) -> Result<SocketHandle, i64> {
+        let mut region = Region::new(2 * TCP_BUFFER)?;
+        let (rx, tx) = region.halves();
+        let mut socket = tcp::Socket::new(tcp::SocketBuffer::new(rx), tcp::SocketBuffer::new(tx));
         socket.set_timeout(Some(TCP_TIMEOUT));
-        sockets.add(socket)
+        let h = sockets.add(socket);
+        self.regions.insert(h, region);
+        Ok(h)
     }
 
-    /// The bytes channel `c`'s instance may still take: what is left of
-    /// netd's, at most what is left of the instance's share (whatever
-    /// number of channels it has: no instance can take all of netd's memory
-    /// from the others).
-    fn room(&mut self, c: usize) -> usize {
-        let owner = self.chan(c).owner;
-        self.bytes.room(owner)
+    /// A new UDP or raw socket (`raw`), its payload buffers likewise.
+    fn new_datagram(&mut self, sockets: &mut SocketSet<'static>, raw: bool) -> Result<SocketHandle, i64> {
+        let mut region = Region::new(2 * if raw { RAW_BUFFER } else { UDP_BUFFER })?;
+        let (rx, tx) = region.halves();
+        let h = if raw {
+            let rx = raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY; UDP_PACKETS], rx);
+            let tx = raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY; UDP_PACKETS], tx);
+            sockets.add(raw::Socket::new(Some(IpVersion::Ipv4), Some(IpProtocol::Icmp), rx, tx))
+        } else {
+            let rx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; UDP_PACKETS], rx);
+            let tx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; UDP_PACKETS], tx);
+            sockets.add(udp::Socket::new(rx, tx))
+        };
+        self.regions.insert(h, region);
+        Ok(h)
+    }
+
+    /// A socket leaves smoltcp, and its buffers' memory goes back to the
+    /// system.
+    fn drop_socket(&mut self, sockets: &mut SocketSet<'static>, h: SocketHandle) {
+        sockets.remove(h);
+        self.regions.remove(&h);
     }
 
     /// Takes `cost` bytes for channel `c`'s instance before anything is
-    /// allocated (ENOBUFS if they are not there).
+    /// allocated (ENOBUFS if they are not there): at most what is left of
+    /// netd's budget and of the instance's share (whatever number of
+    /// channels it has: no instance can take all of netd's memory from the
+    /// others).
     fn charge(&mut self, c: usize, cost: usize) -> Result<(), i64> {
         let owner = self.chan(c).owner;
         self.bytes.charge(owner, cost)
@@ -568,11 +638,29 @@ impl Service {
         if let Some(a) = &area {
             self.check_area(c, a)?;
         }
+        let cost = match kind {
+            Kind::Tcp => TCP_COST,
+            Kind::Udp => 2 * UDP_BUFFER,
+            Kind::RawIcmp => 2 * RAW_BUFFER,
+        };
+        self.charge(c, cost)?;
+        let made = match kind {
+            Kind::Tcp => self.new_tcp(sockets),
+            Kind::Udp => self.new_datagram(sockets, false),
+            Kind::RawIcmp => self.new_datagram(sockets, true),
+        };
+        let handle = match made {
+            Ok(h) => h,
+            Err(e) => {
+                let owner = self.chan(c).owner;
+                self.uncharge(owner, cost);
+                return Err(e);
+            }
+        };
         let s = match kind {
             Kind::Tcp => {
-                self.charge(c, TCP_COST)?;
                 let t = Tcp {
-                    handle: Self::new_tcp(sockets),
+                    handle,
                     local: None,
                     reuse: false,
                     backlog: None,
@@ -585,20 +673,8 @@ impl Service {
                 };
                 Sock::new(Proto::Tcp(t), None, 0, TCP_COST)
             }
-            Kind::Udp => {
-                self.charge(c, 2 * UDP_BUFFER)?;
-                let rx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; UDP_PACKETS], vec![0; UDP_BUFFER]);
-                let tx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; UDP_PACKETS], vec![0; UDP_BUFFER]);
-                let handle = sockets.add(udp::Socket::new(rx, tx));
-                Sock::new(Proto::Udp { handle, peer: None, reuse: false }, area, state::SEND_OPEN | state::WRITABLE, 2 * UDP_BUFFER)
-            }
-            Kind::RawIcmp => {
-                self.charge(c, 2 * RAW_BUFFER)?;
-                let rx = raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY; UDP_PACKETS], vec![0; RAW_BUFFER]);
-                let tx = raw::PacketBuffer::new(vec![raw::PacketMetadata::EMPTY; UDP_PACKETS], vec![0; RAW_BUFFER]);
-                let socket = raw::Socket::new(Some(IpVersion::Ipv4), Some(IpProtocol::Icmp), rx, tx);
-                Sock::new(Proto::Raw { handle: sockets.add(socket), peer: None }, area, state::SEND_OPEN | state::WRITABLE, 2 * RAW_BUFFER)
-            }
+            Kind::Udp => Sock::new(Proto::Udp { handle, peer: None, reuse: false }, area, state::SEND_OPEN | state::WRITABLE, cost),
+            Kind::RawIcmp => Sock::new(Proto::Raw { handle, peer: None }, area, state::SEND_OPEN | state::WRITABLE, cost),
         };
         self.enter(c, sock, s);
         done(0)
@@ -728,19 +804,27 @@ impl Service {
         // The backlog's sockets beside the socket's own, as many as the
         // budget allows.
         let want = (backlog as usize).clamp(1, MAX_BACKLOG);
-        let extra = (want - 1).min(self.room(c) / TCP_COST);
-        self.charge(c, extra * TCP_COST).expect("within the room");
+        let mut extra = Vec::new();
+        while extra.len() + 1 < want && self.charge(c, TCP_COST).is_ok() {
+            match self.new_tcp(sockets) {
+                Ok(h) => extra.push(h),
+                Err(_) => {
+                    // Memory is short: a smaller backlog.
+                    let owner = self.chan(c).owner;
+                    self.uncharge(owner, TCP_COST);
+                    break;
+                }
+            }
+        }
         let s = self.sock(c, sock)?;
-        s.cost += extra * TCP_COST;
+        s.cost += extra.len() * TCP_COST;
         let Proto::Tcp(t) = &mut s.proto else { unreachable!("checked above") };
         if let Some(port) = port {
             t.local = Some(IpListenEndpoint { addr: None, port });
         }
         let local = t.local.expect("bound");
         let mut set = vec![t.handle];
-        for _ in 0..extra {
-            set.push(Self::new_tcp(sockets));
-        }
+        set.extend(extra);
         for &h in &set {
             sockets.get_mut::<tcp::Socket>(h).listen(local).map_err(|_| EINVAL)?;
         }
@@ -856,11 +940,17 @@ impl Service {
         // A fresh listening socket takes the connection's place, if the
         // budget allows; else the backlog shrinks (never below one).
         let fresh = match self.charge(c, TCP_COST) {
-            Ok(()) => {
-                let h = Self::new_tcp(sockets);
-                let _ = sockets.get_mut::<tcp::Socket>(h).listen(local);
-                Some(h)
-            }
+            Ok(()) => match self.new_tcp(sockets) {
+                Ok(h) => {
+                    let _ = sockets.get_mut::<tcp::Socket>(h).listen(local);
+                    Some(h)
+                }
+                Err(_) => {
+                    let owner = self.chan(c).owner;
+                    self.uncharge(owner, TCP_COST);
+                    None
+                }
+            },
             Err(_) => None,
         };
         let s = self.sock(c, sock)?;
@@ -985,35 +1075,46 @@ impl Service {
     }
 
     fn close(&mut self, c: usize, sock: u32, abort: bool, sockets: &mut SocketSet<'static>) -> Reply {
-        let room = self.room(c);
         let chan = self.chan(c);
         let owner = chan.owner;
         let mut s = chan.socks.remove(&sock).ok_or(EBADF)?;
         // What the send ring still holds goes before the FIN, in netd's
-        // memory: within the budget (the client chooses its rings' size),
-        // else the connection is reset rather than netd run out of memory.
-        let mut leftover = Vec::new();
+        // memory: charged first (the client chooses its rings' size), else
+        // the connection is reset rather than netd run out of memory.
         let mut abort = abort;
+        let mut pending = None;
         if let (Proto::Tcp(t), Some(r)) = (&s.proto, Self::rings(&chan.grants, s.area)) {
             let ctl = chan.area.ctl(sock as usize).expect("decode checked the index");
             let tail = ctl.client.tx_tail.load(SeqCst);
             if !abort && t.established && !t.fin_sent {
-                match fill(s.tx_head, tail, r.size).map(|n| n as usize) {
+                match fill(s.tx_head, tail, r.size) {
                     Some(0) => {}
-                    Some(n) if n <= room && leftover.try_reserve_exact(n).is_ok() => {
-                        leftover.resize(n, 0);
-                        if !Rings::read(r.tx, r.size, s.tx_head, &mut leftover) {
-                            leftover.clear();
-                        }
-                    }
-                    // No room, or positions the client should never have
-                    // published: a reset.
-                    _ => abort = true,
+                    Some(n) => pending = Some((r, n as usize)),
+                    // Positions the client should never have published.
+                    None => abort = true,
                 }
             }
         }
-        self.charge(c, leftover.len()).expect("checked against the room above");
-        s.cost += leftover.len();
+        let mut leftover = None;
+        if let Some((r, n)) = pending {
+            if self.charge(c, n).is_err() {
+                abort = true;
+            } else {
+                match Region::new(n) {
+                    Ok(mut region) => {
+                        // (Charged with the socket: given back when it goes.)
+                        s.cost += n;
+                        if Rings::read(r.tx, r.size, s.tx_head, region.bytes_mut()) {
+                            leftover = Some(region);
+                        }
+                    }
+                    Err(_) => {
+                        self.uncharge(owner, n);
+                        abort = true;
+                    }
+                }
+            }
+        }
         self.release(owner, s, abort, leftover, sockets);
         done(0)
     }
@@ -1022,7 +1123,7 @@ impl Service {
     /// the connections nobody accepted, a TCP connection finishes (with
     /// `leftover` before its FIN), or is reset with `abort` or when data it
     /// received is unread.
-    fn release(&mut self, owner: u64, s: Sock, abort: bool, mut leftover: Vec<u8>, sockets: &mut SocketSet<'static>) {
+    fn release(&mut self, owner: u64, s: Sock, abort: bool, mut leftover: Option<Region>, sockets: &mut SocketSet<'static>) {
         match s.proto {
             Proto::Tcp(t) => {
                 let listener = t.backlog.is_some();
@@ -1030,23 +1131,23 @@ impl Service {
                 let each = s.cost / handles.len();
                 for h in handles {
                     let socket = sockets.get_mut::<tcp::Socket>(h);
-                    let mut rest = Vec::new();
+                    let mut rest = None;
                     if listener || abort || socket.can_recv() {
                         // A listener's unaccepted connections, unread data:
                         // a reset (a socket that only listens just stops).
                         socket.abort();
-                    } else if leftover.is_empty() {
+                    } else if leftover.is_none() {
                         socket.close();
                     } else {
                         // The FIN after the leftovers (`finish_closing`).
-                        rest = core::mem::take(&mut leftover);
+                        rest = leftover.take();
                     }
                     let (local, reuse) = if listener { (None, true) } else { (t.local, t.reuse) };
                     self.closing.push(Closing { handle: h, leftover: rest, sent: 0, local, reuse, owner, cost: each });
                 }
             }
             Proto::Udp { handle, .. } | Proto::Raw { handle, .. } => {
-                sockets.remove(handle);
+                self.drop_socket(sockets, handle);
                 self.uncharge(owner, s.cost);
             }
         }
@@ -1180,7 +1281,7 @@ impl Service {
         let mut progress = false;
         let mut freed = Vec::new();
         let now = crate::now();
-        let (lingering, records) = (&mut self.lingering, &mut self.lingering_records);
+        let (lingering, records, regions) = (&mut self.lingering, &mut self.lingering_records, &mut self.regions);
         lingering.retain(|&(h, until)| {
             if now < until {
                 return true;
@@ -1202,6 +1303,7 @@ impl Service {
                     lingering.push((holder, now + TIME_WAIT));
                 }
                 sockets.remove(cl.handle);
+                regions.remove(&cl.handle);
                 freed.push((cl.owner, cl.cost));
                 progress = true;
                 return false;
@@ -1210,6 +1312,7 @@ impl Service {
                 // (Looked at before anything below closes it: a reset made
                 // here goes out with the next poll, before the socket goes.)
                 sockets.remove(cl.handle);
+                regions.remove(&cl.handle);
                 freed.push((cl.owner, cl.cost));
                 progress = true;
                 return false;
@@ -1218,22 +1321,27 @@ impl Service {
                 // Data for a connection nobody can read any more: a reset,
                 // as Linux answers it (the writer learns it with EPIPE).
                 socket.abort();
-                cl.leftover = Vec::new();
+                cl.leftover = None;
                 cl.sent = 0;
             }
-            if cl.sent < cl.leftover.len() {
-                match socket.send_slice(&cl.leftover[cl.sent..]) {
+            let mut all_sent = false;
+            if let Some(left) = &cl.leftover {
+                let bytes = left.bytes();
+                match socket.send_slice(&bytes[cl.sent..]) {
                     Ok(n) => {
                         cl.sent += n;
                         progress |= n > 0;
                     }
                     // The connection went: what is left is lost, as on Linux.
-                    Err(_) => cl.sent = cl.leftover.len(),
+                    Err(_) => cl.sent = bytes.len(),
                 }
-                if cl.sent == cl.leftover.len() {
-                    cl.leftover = Vec::new();
-                    socket.close();
-                }
+                all_sent = cl.sent == bytes.len();
+            }
+            if all_sent {
+                // Its memory goes back at once (its charge with the
+                // socket's).
+                cl.leftover = None;
+                socket.close();
             }
             true
         });
