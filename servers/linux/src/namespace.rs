@@ -2,20 +2,23 @@
 //!
 //! A mount puts a filesystem at a path: the server's tmpfs (`tmpfs`) at
 //! the root and as devpts at /dev/pts (`pty`), diskfs's disk at /data
-//! (`datafs`, over the rings), or a
-//! directory of the kernel's tree (/dev, /proc, /sys), reached through
-//! handles on its inodes (`restricted::SYS_INODE_*`), until the server's
-//! own filesystems serve them. Mounts are found by name, as everything here: ".." is resolved
+//! (`datafs`, over the rings), /proc and /sys (`procfs`: procfs's files
+//! over the rings and the server's own per-process part), or a directory
+//! of the kernel's tree (/dev), reached through handles on its inodes
+//! (`restricted::SYS_INODE_*`), until the server's own filesystems serve
+//! it. Mounts are found by name, as everything here: ".." is resolved
 //! lexically before symlinks are looked at (as the kernel's VFS did:
 //! "/a/link/.." is "/a"), so the longest mount whose path begins a
 //! normalized path is the filesystem that path lies in. Each symlink is
 //! read and resolution starts over from the root with its target in front
-//! of the rest (at most 16, else ELOOP). In the kernel's tree one call
+//! of the rest (at most 16, else ELOOP); /proc's magic links
+//! (/proc/<pid>/fd/N) lead to the open file itself instead (`procfs::follow`). In the kernel's tree one call
 //! walks as many names as it can and stops after a symlink, so a path
-//! without symlinks costs one call; the tmpfs is walked in the server,
-//! /data one `LOOKUP` per name.
+//! without symlinks costs one call; the tmpfs and /proc are walked in the
+//! server, /data one `LOOKUP` per name.
 
 use crate::datafs::{self, DInode};
+use crate::procfs::{self, ProcNode};
 use crate::sync::Mutex;
 use crate::syscall;
 use crate::tmpfs;
@@ -52,7 +55,7 @@ impl KInode {
     fn stat(&self) -> Result<[u8; 144], i64> {
         let mut st = [0u8; 144];
         check(syscall(SYS_INODE_STAT, [self.0, st.as_mut_ptr() as u64, 0, 0, 0, 0]))?;
-        kernel_times(&mut st);
+        pseudo_times(&mut st);
         Ok(st)
     }
 
@@ -70,30 +73,30 @@ impl Drop for KInode {
     }
 }
 
-/// The times set on files of the kernel's tree (/dev, /proc, /sys), which
-/// keeps none that change: as Linux's devtmpfs, procfs and sysfs take
-/// utimensat, the server keeps them (atime, mtime, ctime) by device and
-/// inode number, for the instance's life, at most `KERNEL_TIMES_MAX` of
-/// them (the oldest set go first, as a pseudo file's inode would be
-/// evicted).
-struct KernelTimes {
+/// The times set on pseudo files, which keep none that change: the
+/// kernel's tree (/dev), /proc and /sys. As Linux's devtmpfs, procfs and
+/// sysfs take utimensat, the server keeps them (atime, mtime, ctime) by
+/// device and inode number, for the instance's life, at most
+/// `PSEUDO_TIMES_MAX` of them (the oldest set go first, as a pseudo file's
+/// inode would be evicted).
+struct PseudoTimes {
     times: BTreeMap<(u64, u64), [vfs::stat::Time; 3]>,
     order: VecDeque<(u64, u64)>,
 }
 
-const KERNEL_TIMES_MAX: usize = 1024;
+const PSEUDO_TIMES_MAX: usize = 1024;
 
-static KERNEL_TIMES: Mutex<KernelTimes> = Mutex::new(KernelTimes { times: BTreeMap::new(), order: VecDeque::new() });
+static PSEUDO_TIMES: Mutex<PseudoTimes> = Mutex::new(PseudoTimes { times: BTreeMap::new(), order: VecDeque::new() });
 
-/// Sets the times of the kernel's file whose `struct stat` is `st`.
-pub fn set_kernel_times(st: &[u8; 144], atime: vfs::stat::SetTime, mtime: vfs::stat::SetTime) {
+/// Sets the times of the pseudo file whose `struct stat` is `st`.
+pub fn set_pseudo_times(st: &[u8; 144], atime: vfs::stat::SetTime, mtime: vfs::stat::SetTime) {
     if atime == vfs::stat::SetTime::Omit && mtime == vfs::stat::SetTime::Omit {
         return;
     }
     let now = crate::time::realtime();
     let current = vfs::stat::Stat::from_bytes(st);
     let key = (current.dev, current.ino);
-    let mut k = KERNEL_TIMES.lock();
+    let mut k = PSEUDO_TIMES.lock();
     let mut t = k.times.get(&key).copied().unwrap_or([current.atime, current.mtime, current.ctime]);
     if let Some(a) = atime.resolve(now) {
         t[0] = a;
@@ -104,7 +107,7 @@ pub fn set_kernel_times(st: &[u8; 144], atime: vfs::stat::SetTime, mtime: vfs::s
     t[2] = now;
     if k.times.insert(key, t).is_none() {
         k.order.push_back(key);
-        if k.order.len() > KERNEL_TIMES_MAX {
+        if k.order.len() > PSEUDO_TIMES_MAX {
             if let Some(old) = k.order.pop_front() {
                 k.times.remove(&old);
             }
@@ -112,10 +115,10 @@ pub fn set_kernel_times(st: &[u8; 144], atime: vfs::stat::SetTime, mtime: vfs::s
     }
 }
 
-/// Puts the times set here into a kernel file's `struct stat`.
-pub fn kernel_times(st: &mut [u8; 144]) {
+/// Puts the times set here into a pseudo file's `struct stat`.
+pub fn pseudo_times(st: &mut [u8; 144]) {
     let s = vfs::stat::Stat::from_bytes(st);
-    if let Some(t) = KERNEL_TIMES.lock().times.get(&(s.dev, s.ino)) {
+    if let Some(t) = PSEUDO_TIMES.lock().times.get(&(s.dev, s.ino)) {
         *st = vfs::stat::Stat { atime: t[0], mtime: t[1], ctime: t[2], ..s }.to_bytes();
     }
 }
@@ -133,6 +136,8 @@ pub enum Node {
     Kernel(KInode),
     Tmp(Arc<tmpfs::Inode>),
     Data(Arc<DInode>),
+    /// One of /proc or /sys (procfs's, or the server's own).
+    Proc(ProcNode),
 }
 
 impl Node {
@@ -150,6 +155,7 @@ impl Node {
             Node::Kernel(k) => k.stat(),
             Node::Tmp(t) => Ok(t.stat()),
             Node::Data(d) => datafs::stat(d),
+            Node::Proc(p) => procfs::stat(p),
         }
     }
 
@@ -158,6 +164,7 @@ impl Node {
             Node::Kernel(k) => k.readlink(),
             Node::Tmp(t) => t.readlink(),
             Node::Data(d) => datafs::readlink(d),
+            Node::Proc(p) => procfs::readlink(p),
         }
     }
 }
@@ -176,6 +183,7 @@ impl Node {
             }
             Node::Tmp(t) => Node::Tmp(t.clone()),
             Node::Data(d) => Node::Data(d.clone()),
+            Node::Proc(p) => Node::Proc(p.clone()),
         })
     }
 }
@@ -213,28 +221,30 @@ impl Drop for Origin {
 }
 
 /// What a mount puts at its path.
+#[derive(Clone)]
 enum Fs {
     /// The kernel's tree at this path (names below its root).
     Kernel(Vec<String>),
     Tmpfs(Arc<tmpfs::Inode>),
     /// diskfs's disk.
     Data,
+    /// /proc (procfs's system-wide files and the server's per-process
+    /// ones), or /sys (procfs's).
+    Proc,
+    Sys,
 }
 
 struct Mount {
     at: Vec<String>,
     fs: Fs,
+    /// What /proc/<pid>/mounts says: the source and the filesystem's type.
+    source: &'static str,
+    fstype: &'static str,
 }
 
-/// The directories of the kernel's tree the namespace shows: the devices,
-/// procfs and sysfs, until the server serves them.
-const KERNEL_MOUNTS: [&str; 3] = ["dev", "proc", "sys"];
-/// Where diskfs's disk is mounted.
-const DATA_MOUNT: &str = "data";
-
 /// The mount table: the instance's own tmpfs at the root, unpacked from
-/// the initramfs when the instance first resolves a path, /data, and the
-/// kernel's directories above.
+/// the initramfs when the instance first resolves a path, the kernel's
+/// /dev, /proc and /sys, /data and devpts.
 static MOUNTS: Mutex<Vec<Mount>> = Mutex::new(Vec::new());
 
 fn with_mounts<R>(f: impl FnOnce(&Vec<Mount>) -> R) -> R {
@@ -244,18 +254,35 @@ fn with_mounts<R>(f: impl FnOnce(&Vec<Mount>) -> R) -> R {
         root.set_perm(0o755);
         crate::initramfs::unpack(&root);
         let _ = root.subdir("tmp", 0o1777);
-        m.push(Mount { at: Vec::new(), fs: Fs::Tmpfs(root.clone()) });
-        for name in KERNEL_MOUNTS {
+        m.push(Mount { at: Vec::new(), fs: Fs::Tmpfs(root.clone()), source: "rootfs", fstype: "tmpfs" });
+        let path = |name: &str| alloc::vec![String::from(name)];
+        let mounts = [
+            ("dev", Fs::Kernel(path("dev")), "devtmpfs", "devtmpfs"),
+            ("proc", Fs::Proc, "proc", "proc"),
+            ("sys", Fs::Sys, "sysfs", "sysfs"),
+            ("data", Fs::Data, "/dev/vda", "ext2"),
+        ];
+        for (name, fs, source, fstype) in mounts {
             // The mount point, so that the root lists it.
             let _ = root.subdir(name, 0o755);
-            m.push(Mount { at: alloc::vec![String::from(name)], fs: Fs::Kernel(alloc::vec![String::from(name)]) });
+            m.push(Mount { at: path(name), fs, source, fstype });
         }
-        let _ = root.subdir(DATA_MOUNT, 0o755);
-        m.push(Mount { at: alloc::vec![String::from(DATA_MOUNT)], fs: Fs::Data });
         // devpts (the ptys' nodes, `pty`), on the kernel's /dev/pts.
-        m.push(Mount { at: alloc::vec![String::from("dev"), String::from("pts")], fs: Fs::Tmpfs(crate::pty::devpts()) });
+        let at = alloc::vec![String::from("dev"), String::from("pts")];
+        m.push(Mount { at, fs: Fs::Tmpfs(crate::pty::devpts()), source: "devpts", fstype: "devpts" });
     }
     f(&m)
+}
+
+/// The mount table as /proc/<pid>/mounts shows it (proc_pid_mounts(5)).
+pub fn mounts_text() -> String {
+    with_mounts(|mounts| {
+        let mut out = String::new();
+        for m in mounts {
+            out.push_str(&alloc::format!("{} {} {} rw 0 0\n", m.source, join(&m.at), m.fstype));
+        }
+        out
+    })
 }
 
 /// The mount `comps` lies in: its filesystem and how many of `comps` name
@@ -267,12 +294,7 @@ fn mount_of(comps: &[String]) -> (Fs, usize) {
             .filter(|m| comps.len() >= m.at.len() && comps[..m.at.len()] == m.at[..])
             .max_by_key(|m| m.at.len())
             .expect("the root is mounted");
-        let fs = match &m.fs {
-            Fs::Kernel(base) => Fs::Kernel(base.clone()),
-            Fs::Tmpfs(root) => Fs::Tmpfs(root.clone()),
-            Fs::Data => Fs::Data,
-        };
-        (fs, m.at.len())
+        (m.fs.clone(), m.at.len())
     })
 }
 
@@ -381,6 +403,21 @@ fn walk_data(names: &[String], follow: bool) -> Result<Step, i64> {
     Ok(Step::Done(Node::Data(cur), mode))
 }
 
+/// Walks `names` in /proc or /sys from its root; `follow`: also at the
+/// last name.
+fn walk_proc(sys: bool, names: &[String], follow: bool) -> Result<Step, i64> {
+    let mut cur = procfs::root(sys);
+    for (i, name) in names.iter().enumerate() {
+        let child = procfs::lookup(&cur, name)?;
+        if procfs::mode(&child) & vfs::S_IFMT == vfs::S_IFLNK && (follow || i + 1 < names.len()) {
+            return Ok(Step::Link(Node::Proc(child), i + 1));
+        }
+        cur = child;
+    }
+    let mode = procfs::mode(&cur);
+    Ok(Step::Done(Node::Proc(cur), mode))
+}
+
 /// Resolves `path` relative to the absolute directory `base`; `follow`:
 /// a symlink as the last name is followed.
 pub fn resolve(base: &str, path: &str, follow: bool) -> Result<Resolved, i64> {
@@ -400,6 +437,8 @@ pub fn resolve(base: &str, path: &str, follow: bool) -> Result<Resolved, i64> {
             Fs::Kernel(base) => walk_kernel(base, names)?,
             Fs::Tmpfs(root) => walk_tmpfs(root, names, follow)?,
             Fs::Data => walk_data(names, follow)?,
+            Fs::Proc => walk_proc(false, names, follow)?,
+            Fs::Sys => walk_proc(true, names, follow)?,
         };
         let (link, walked) = match step {
             Step::Done(node, mode) => return Ok(Resolved { node, mode, path: given }),
@@ -415,7 +454,21 @@ pub fn resolve(base: &str, path: &str, follow: bool) -> Result<Resolved, i64> {
         if links > MAX_LINKS {
             return Err(ELOOP);
         }
-        let target = link.readlink()?;
+        // A magic link (/proc/<pid>/fd/N) leads to the open file itself:
+        // as the last name, its node (an unlinked file, a pipe); with names
+        // after it, through the path the file was opened by.
+        let target = match &link {
+            Node::Proc(p) => match procfs::follow(p)? {
+                Some(procfs::Follow { node, mode, path }) if walked == all.len() => {
+                    let path = path.map(|p| normalize("/", &p)).unwrap_or(given);
+                    return Ok(Resolved { node, mode, path });
+                }
+                Some(procfs::Follow { path: Some(path), .. }) => path,
+                Some(_) => return Err(ENOTDIR),
+                None => link.readlink()?,
+            },
+            _ => link.readlink()?,
+        };
         let mut next = normalize(&join(&all[..walked - 1]), &target);
         next.extend(all[walked..].iter().cloned());
         replaced = Some(next);

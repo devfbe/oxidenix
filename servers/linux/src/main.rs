@@ -35,6 +35,8 @@ mod netlink;
 mod pathfile;
 mod paths;
 mod pipe;
+mod procfile;
+mod procfs;
 mod pty;
 mod records;
 mod ringclient;

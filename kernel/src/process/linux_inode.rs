@@ -1,9 +1,9 @@
 //! The kernel's tree for the Linux server, through handles on its inodes
 //! (phase R6c.2b, `restricted::SYS_INODE_*`): the server resolves paths and
-//! implements the calls that take one; the kernel's filesystems (tmpfs,
-//! the remote filesystems of diskfs and procfs, the devices) answer the
-//! operations on the inodes it reaches, until the server's own filesystems
-//! serve them.
+//! implements the calls that take one; the kernel's tree answers the
+//! operations on the inodes it reaches. The server's namespace mounts only
+//! its `/dev` now (the device nodes; /data, /proc and /sys are the server's
+//! own filesystems over the I/O rings), until the server makes its own.
 //!
 //! Names and paths come from the server's memory as (pointer, length), at
 //! most 4096 bytes. A walk takes names only: the server resolves "." and

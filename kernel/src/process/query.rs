@@ -1,6 +1,8 @@
 //! proc_query (syscall 1005): the kernel's native process and system
-//! information for the procfs server (records in `procproto`). Only
-//! privileged servers may ask; procfs decides what programs see.
+//! information for the procfs server (records in `procproto`), and the same
+//! for the Linux server (`restricted::SYS_PROC_INFO`), whose /proc/<pid>
+//! shows the processes until R8 makes them its own. Only privileged
+//! servers and the Linux server may ask; they decide what programs see.
 
 use super::errno::*;
 use super::sched::{self, TABLE};
@@ -126,29 +128,50 @@ pub fn sysinfo(buf: u64) -> SysResult {
     Ok(0)
 }
 
-/// proc_query(op, arg, buf, len): writes the answer to `buf` and returns
-/// its length; ERANGE if it does not fit (except QUERY_PIDS, which fills
-/// what fits).
-pub fn proc_query(op: u64, arg: u64, buf: u64, len: u64) -> SysResult {
-    if !sched::current().group.privileged.load(Ordering::Relaxed) {
-        return Err(EPERM);
-    }
+/// The answer to `op` about `arg` for a buffer of `len` bytes: ERANGE if
+/// it does not fit (except the lists of ids, which take what fits).
+fn answer(op: u64, arg: u64, len: u64) -> Result<Vec<u8>, i64> {
+    let fit = (len / 8) as usize;
+    let ids = |ids: &mut dyn Iterator<Item = u64>| -> Vec<u8> { ids.take(fit).flat_map(|p| p.to_le_bytes()).collect() };
     let bytes: Vec<u8> = match op {
         QUERY_SYSTEM => as_bytes(&system()).to_vec(),
         QUERY_PIDS => {
             let pids: Vec<u64> = TABLE.lock().groups.keys().copied().collect();
-            let fit = (len / 8) as usize;
-            pids.iter().take(fit).flat_map(|p| p.to_le_bytes()).collect()
+            ids(&mut pids.into_iter())
         }
         QUERY_PROCESS => as_bytes(&process(arg)?).to_vec(),
         QUERY_CMDLINE => text_of(arg, |i| i.cmdline.clone())?,
         QUERY_EXE => text_of(arg, |i| i.exe.as_bytes().to_vec())?,
-        QUERY_MOUNTS => crate::fs::mounts().into_bytes(),
+        QUERY_THREADS => {
+            let g = group(arg)?;
+            let tids: Vec<u64> = g.info.lock().threads.iter().map(|t| t.tid()).collect();
+            ids(&mut tids.into_iter())
+        }
         _ => return Err(EINVAL),
     };
     if bytes.len() as u64 > len {
         return Err(ERANGE);
     }
+    Ok(bytes)
+}
+
+/// proc_query(op, arg, buf, len): writes the answer to `buf` and returns
+/// its length; ERANGE if it does not fit (except QUERY_PIDS and
+/// QUERY_THREADS, which fill what fits). For the kernel's servers (procfs).
+pub fn proc_query(op: u64, arg: u64, buf: u64, len: u64) -> SysResult {
+    if !sched::current().group.privileged.load(Ordering::Relaxed) {
+        return Err(EPERM);
+    }
+    let bytes = answer(op, arg, len)?;
     uaccess::copy_to(buf, &bytes)?;
+    Ok(bytes.len() as i64)
+}
+
+/// `restricted::SYS_PROC_INFO`: proc_query for the Linux server, into its
+/// own memory (the records of its /proc/<pid> until the process model is
+/// the server's, R8).
+pub fn server_query(op: u64, arg: u64, buf: u64, len: u64) -> SysResult {
+    let bytes = answer(op, arg, len)?;
+    uaccess::copy_to_server(buf, &bytes)?;
     Ok(bytes.len() as i64)
 }

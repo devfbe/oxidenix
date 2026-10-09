@@ -16,7 +16,6 @@ pic8259 = "0.10"
 pc-keyboard = "0.7"
 spin = "0.9"
 heapless = "0.9"
-fsproto = { path = "../crates/fsproto" }
 procproto = { path = "../crates/procproto" }
 restricted = { path = "../crates/restricted" }
 vfs = { path = "../crates/vfs" }

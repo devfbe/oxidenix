@@ -9,6 +9,10 @@
 pub const SLOTS: usize = 64;
 /// The service's IPC name.
 pub const SERVICE: &str = "ringtest";
+/// A second name the service registers without taking channels: an offer
+/// to it is refused (EOPNOTSUPP) by the kernel. (Every other service takes
+/// channels.)
+pub const PLAIN: &str = "ringtest-plain";
 
 /// `arg[0] + 1`.
 pub const ECHO: u16 = 1;

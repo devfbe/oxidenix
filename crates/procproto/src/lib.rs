@@ -1,28 +1,45 @@
 //! The kernel's native process and system information (syscall 1005,
-//! `proc_query`), from which the procfs server builds Linux's /proc. The
-//! records are plain `repr(C)` structs of fixed size, copied as bytes.
+//! `proc_query`, for the procfs server; `restricted::SYS_PROC_INFO` for the
+//! Linux server), from which Linux's /proc is built: the records are plain
+//! `repr(C)` structs of fixed size, copied as bytes. `render` has the text
+//! formats of the files, shared by procfs (the system-wide files) and the
+//! Linux server (each process's own, /proc/<pid>), and tested on the host.
+//!
+//! procfs serves its files over the file protocol of the I/O rings
+//! (`fsring`) as the service `SERVICE`: /proc's system-wide part from
+//! `PROC_ROOT`, /sys from `SYSFS_ROOT` (docs/design/io-rings.md, step 5).
 
 #![no_std]
+
+extern crate alloc;
+
+pub mod render;
 
 /// What `proc_query(op, arg, buf, len)` returns in `buf`:
 /// a `System` record.
 pub const QUERY_SYSTEM: u64 = 0;
 /// The pids of all processes as `u64`s (as many as fit).
 pub const QUERY_PIDS: u64 = 1;
-/// The `Process` record of pid `arg`.
+/// The `Process` record of pid `arg` (a process's id, or a thread's).
 pub const QUERY_PROCESS: u64 = 2;
 /// The command line of pid `arg` (NUL-terminated arguments).
 pub const QUERY_CMDLINE: u64 = 3;
 /// The absolute path of the program pid `arg` runs.
 pub const QUERY_EXE: u64 = 4;
-/// The mount table in /proc/mounts format.
-pub const QUERY_MOUNTS: u64 = 5;
+// 5 was the kernel's mount table: the mounts are the Linux server's.
+/// The thread ids of the process pid `arg` names, as `u64`s (as many as
+/// fit), its main thread first.
+pub const QUERY_THREADS: u64 = 6;
+
+/// The procfs service's IPC name (it takes channels of the file protocol,
+/// `fsring`, with `fsring::SLOTS` slots).
+pub const SERVICE: &str = "procfs";
+/// Root inodes of the two trees procfs serves: /proc's system-wide files
+/// and /sys.
+pub const PROC_ROOT: u32 = 1;
+pub const SYSFS_ROOT: u32 = 100;
 
 pub const MAX_CPUS: usize = 16;
-
-/// Root inode of the /sys tree the procfs server also provides (its /proc
-/// root is the argument it registers with).
-pub const SYSFS_ROOT: u32 = 100;
 
 /// Timer ticks a CPU spent in user mode, in the kernel and idle.
 #[repr(C)]

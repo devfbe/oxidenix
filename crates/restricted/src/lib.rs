@@ -763,6 +763,28 @@ pub const SIGNAL_IGNORED: u64 = 1;
 pub const SIGNAL_BLOCKED: u64 = 2;
 pub const SIGNAL_PENDING: u64 = 4;
 
+// /proc (I/O rings step 5, docs/design/linux-server.md "/proc and /sys"):
+// the system-wide files are procfs's, over the instance's channel; each
+// process's own part of /proc is the server's, made from the kernel's
+// records until the process model is the server's (R8), and its
+// descriptors from the kernel's table until that is the server's (R6e).
+
+/// `proc_info(op, arg, buf, len) -> n`: the kernel's records of processes
+/// and of the system, as the procfs server's `proc_query` gives them
+/// (`procproto`: `QUERY_SYSTEM`, `QUERY_PIDS`, `QUERY_PROCESS`,
+/// `QUERY_CMDLINE`, `QUERY_EXE`, `QUERY_THREADS`), into the server's
+/// memory; ERANGE if the answer does not fit (the lists of ids take what
+/// fits), ESRCH for no such process. It sees every process of the kernel,
+/// as Linux's /proc does in the initial pid namespace; with R8 the server
+/// answers from its own process table.
+pub const SYS_PROC_INFO: u64 = 1116;
+/// `kfd_list(from, buf, cap) -> n`: the calling process's open descriptors
+/// from `from` on, in ascending order, as up to `cap` u32s at `buf`; the
+/// count (fewer than `cap`: no more); `cap` at most `KFD_LIST_MAX`. For
+/// /proc/self/fd until the descriptor table is the server's (R6e).
+pub const SYS_KFD_LIST: u64 = 1117;
+pub const KFD_LIST_MAX: u64 = 256;
+
 /// `(scenario)`: the server runs a channel scenario against the test
 /// service (servers/ringtest, `ring::selftest`): 1 rings and doorbells, 2
 /// grants and their bounds, 3 revoking, 4 the client's end going, 5 the

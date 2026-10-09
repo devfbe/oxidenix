@@ -281,7 +281,8 @@ fn lookup(name: &Name) -> Result<Arc<Sock>, i64> {
             match &r.node {
                 Node::Tmp(t) => Key::Tmp(t.ino),
                 Node::Data(d) => Key::Data(d.ino as u64),
-                Node::Kernel(_) => return Err(ECONNREFUSED),
+                // A socket /proc/<pid>/fd/N leads to is sockfs's, no name.
+                Node::Kernel(_) | Node::Proc(_) => return Err(ECONNREFUSED),
             }
         }
     };
@@ -302,8 +303,8 @@ fn socket_inode(path: &[u8]) -> Result<(Key, Option<Node>), i64> {
             let inode = crate::datafs::create(d, &name, crate::datafs::New::Socket, perm).map_err(in_use)?;
             Ok((Key::Data(inode.ino as u64), Some(Node::Data(inode))))
         }
-        // The kernel's tree (/dev, /proc, /sys) takes no sockets.
-        Node::Kernel(_) => Err(EACCES),
+        // The kernel's tree (/dev), /proc and /sys take no sockets.
+        Node::Kernel(_) | Node::Proc(_) => Err(EACCES),
     }
 }
 

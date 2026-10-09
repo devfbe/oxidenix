@@ -1765,6 +1765,18 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
                 _ => Err(EINVAL),
             }
         }
+        SYS_PROC_INFO => super::query::server_query(a[0], a[1], a[2], a[3]),
+        SYS_KFD_LIST => {
+            let (from, buf, cap) = (a[0], a[1], a[2]);
+            if cap > KFD_LIST_MAX {
+                return Err(EINVAL);
+            }
+            let mut fds = [0u32; KFD_LIST_MAX as usize];
+            let n = with_current(|p| p.files().map(|f| f.open_from(from, &mut fds[..cap as usize])))?;
+            let bytes: Vec<u8> = fds[..n].iter().flat_map(|fd| fd.to_le_bytes()).collect();
+            super::uaccess::copy_to_server(buf, &bytes)?;
+            Ok(n as i64)
+        }
         SYS_SIGNAL_STATE => {
             if is_pager() {
                 return Err(EPERM);

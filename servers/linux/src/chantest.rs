@@ -216,7 +216,7 @@ fn rings() -> Result<(), i64> {
     check!(4, c.connect(SERVICE) == -EISCONN);
     let d = Client::create().map_err(|_| 5)?;
     check!(6, d.connect("nosuchservice") == -ENOENT);
-    check!(7, d.connect("procfs") == -EOPNOTSUPP);
+    check!(7, d.connect(PLAIN) == -EOPNOTSUPP);
     let obj = object(1, |_| 0).map_err(|_| 8)?;
     check!(9, d.grant(obj, 0, 1, 0) == -ENOTCONN);
     close(obj);

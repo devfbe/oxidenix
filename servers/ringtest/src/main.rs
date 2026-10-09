@@ -96,6 +96,12 @@ fn main(args: Vec<&'static str>) -> i32 {
         println!("ringtest: cannot register: {}", e);
         return 1;
     }
+    // A name without channels, for the client's EOPNOTSUPP (registered
+    // after the first, which `ipc_receive` serves).
+    if let Err(e) = oxrt::ipc_register(PLAIN, 0) {
+        println!("ringtest: cannot register {}: {}", PLAIN, e);
+        return 1;
+    }
     let mut message = [0u8; 64];
     loop {
         let (id, len) = match oxrt::ipc_receive(&mut message, None) {

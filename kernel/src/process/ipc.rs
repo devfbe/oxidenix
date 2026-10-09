@@ -1,15 +1,13 @@
-//! Synchronous message passing between the kernel and user-space servers.
+//! Synchronous message passing between the kernel and user-space servers:
+//! the control plane of the I/O rings.
 //!
 //! A server registers under a name, then loops over `receive` and `reply`.
-//! The kernel acts as the client on behalf of user programs: `call` queues
-//! a request and sleeps until the reply arrives. Messages are copied
-//! through the kernel. (Only procfs still serves such requests, for the
-//! kernel's `/proc`; the data plane to diskfs and netd is the channels'.)
-//!
-//! Besides the requests of its own protocol, a server registered with
-//! `IPC_CHANNELS` gets control requests from the kernel itself (offers of
-//! data-plane channels, see `channel`): their ids have `CONTROL` set, so no
-//! protocol message can pass for one.
+//! The kernel is the only client, and what it sends are control requests
+//! (offers of data-plane channels, see `channel`) to the services
+//! registered with `IPC_CHANNELS`: their ids have `CONTROL` set, so no
+//! protocol message could pass for one. Messages are copied through the
+//! kernel. (The kernel's own IPC clients, its remote filesystems of diskfs
+//! and procfs, are gone: every data path is a channel's.)
 
 use super::errno::*;
 use super::sched::prepare_to_wait;
@@ -248,42 +246,6 @@ fn fail(id: u64) {
     wakeup(request_chan(id));
 }
 
-fn enqueue(service: usize, message: Vec<u8>, waits: bool, generation: Option<u64>) -> Result<u64, i64> {
-    enqueue_as(service, message, waits, generation, false)
-}
-
-fn enqueue_as(service: usize, message: Vec<u8>, waits: bool, generation: Option<u64>, control: bool) -> Result<u64, i64> {
-    let (id, server) = lock(|ipc| {
-        let current = ipc.services.get(service).filter(|s| s.alive).ok_or(EIO)?;
-        if generation.is_some_and(|g| g != current.generation) {
-            return Err(EIO);
-        }
-        if control && !current.channels {
-            return Err(EOPNOTSUPP);
-        }
-        let id = ipc.next_id | if control { CONTROL } else { 0 };
-        ipc.next_id += 1;
-        ipc.calls += 1;
-        ipc.bytes += message.len() as u64;
-        ipc.requests.insert(id, Request { service, waits, message, reply: Vec::new(), state: State::Queued });
-        ipc.services[service].queue.push_back(id);
-        Ok((id, ipc.services[service].server))
-    })?;
-    wakeup(super::irq::server_chan(server));
-    Ok(id)
-}
-
-/// Sends `message` to `service` and sleeps until the reply. Not
-/// interruptible by signals: the server may already be working on it.
-pub fn call(service: usize, message: Vec<u8>) -> Result<Vec<u8>, i64> {
-    // Enqueueing, checking and sleeping happen with interrupts off, so the
-    // reply cannot slip in between the check and the sleep.
-    without_interrupts(|| {
-        let id = enqueue(service, message, true, None)?;
-        wait_reply(id)
-    })
-}
-
 /// Sends the control request `message` (a channel offer) to this
 /// registration of a server that accepts them; returns its id. The caller
 /// waits on `reply_chan(id)`, takes the answer with `take_reply` and
@@ -291,7 +253,24 @@ pub fn call(service: usize, message: Vec<u8>) -> Result<Vec<u8>, i64> {
 /// a channel's connect is complete once the service attached, answered or
 /// not).
 pub fn send_control(to: Instance, message: Vec<u8>) -> Result<u64, i64> {
-    enqueue_as(to.service, message, true, Some(to.generation), true)
+    let (id, server) = lock(|ipc| {
+        let current = ipc.services.get(to.service).filter(|s| s.alive).ok_or(EIO)?;
+        if current.generation != to.generation {
+            return Err(EIO);
+        }
+        if !current.channels {
+            return Err(EOPNOTSUPP);
+        }
+        let id = ipc.next_id | CONTROL;
+        ipc.next_id += 1;
+        ipc.calls += 1;
+        ipc.bytes += message.len() as u64;
+        ipc.requests.insert(id, Request { service: to.service, waits: true, message, reply: Vec::new(), state: State::Queued });
+        ipc.services[to.service].queue.push_back(id);
+        Ok((id, ipc.services[to.service].server))
+    })?;
+    wakeup(super::irq::server_chan(server));
+    Ok(id)
 }
 
 /// Where the sender of request `id` waits: its answer, its failure and
@@ -341,26 +320,6 @@ pub fn server_of(to: Instance) -> Option<Pid> {
     lock(|ipc| ipc.services.get(to.service).filter(|s| s.alive && s.generation == to.generation).map(|s| s.server))
 }
 
-/// Waits for the reply to `id` (not interruptible: the server may already
-/// be working on it).
-fn wait_reply(id: u64) -> Result<Vec<u8>, i64> {
-    loop {
-        let wait = prepare_to_wait(request_chan(id));
-        let done = lock(|ipc| match ipc.requests.get(&id).map(|r| r.state) {
-            Some(State::Done) => Some(Ok(ipc.requests.remove(&id).expect("present").reply)),
-            Some(State::Failed) | None => {
-                ipc.requests.remove(&id);
-                Some(Err(EIO))
-            }
-            _ => None,
-        });
-        if let Some(result) = done {
-            return result;
-        }
-        wait.sleep();
-    }
-}
-
 /// The current registration behind `name`, if its server is alive.
 pub fn instance(name: &str) -> Option<Instance> {
     lock(|ipc| {
@@ -392,10 +351,6 @@ pub fn on_exit(pid: Pid) {
 /// The service registered under `name`, if its server is alive: (index, arg).
 pub fn lookup(name: &str) -> Option<(usize, u64)> {
     lock(|ipc| ipc.services.iter().position(|s| s.alive && s.name == name).map(|i| (i, ipc.services[i].arg)))
-}
-
-pub fn is_alive(service: usize) -> bool {
-    lock(|ipc| ipc.services.get(service).is_some_and(|s| s.alive))
 }
 
 /// Waits up to `timeout` nanoseconds for `name` to be registered, looking
