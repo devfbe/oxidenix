@@ -1,6 +1,6 @@
 # The Linux server: system calls in restricted mode
 
-Status: accepted; phase R1 implemented (the shared region uses PML4 slot 128, 512 GiB). Decisions: ADR 0001-0004.
+Status: accepted; phase R1 implemented (the shared region uses PML4 slot 128, 512 GiB). Decisions: ADR 0001-0004, 0007 (sockets).
 
 ## Goal
 
@@ -300,10 +300,99 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
      `THREAD_IN_INSTANCE`). When the descriptor table moves into the server (R6e), the
      handles become references in the server's own table and these calls go.
    - **Netlink** (`NETLINK_ROUTE`): the server's files too (`netlink.rs`, messages in
-     `crates/netlink`), answered from netd's description of its interfaces (`netproto`'s
-     `Links`), which the kernel relays meanwhile (`net_links`, 1094), as it answers `fstat`
-     of its own descriptors for the server's `statx` (`kfd_stat`, 1093) until the descriptor
-     table moves (R6e). Both bridges go then.
+     `crates/netlink`), answered from netd's description of its interfaces (`netring`'s
+     `Link` records, asked for over the instance's channel to netd since R7b), as the kernel
+     answers `fstat` of its own descriptors for the server's `statx` (`kfd_stat`, 1093) until
+     the descriptor table moves (R6e).
+   - **R7b — Internet sockets** (ADR 0007; `servers/linux/src/inet.rs`, `inetcalls.rs`,
+     `netclient.rs`, the protocol `crates/netring`, netd's `servers/netd/src/service.rs`):
+     `AF_INET` TCP, UDP and raw ICMP sockets are files of the server, placeholders as
+     `AF_UNIX` ones are; every socket call comes to the server (`AF_INET6` and the families
+     nobody implements are `EAFNOSUPPORT` there), and the kernel's socket layer and its IPC
+     protocol to netd are gone: the kernel only starts netd (and restarts it, ADR 0006).
+
+     **The channel.** Each instance has one channel to netd (service `net`), made at its
+     first socket: 64 request slots, and a **shared area** beside the rings (an extension of
+     `chan_create`: pages both ends map read and write for the protocol's own state, which
+     no revoke takes from the service). The area holds a **control block** per socket (128
+     bytes, at most 1024 sockets an instance) and two bitmaps with a doorbell word each.
+     A control block has netd's cache line (an event counter `seq`, the state bits, the
+     receive ring's `rx_tail`, the send ring's `tx_head`, the latest error with a count,
+     the connections ready to accept, `rx_wait`) and the server's (`rx_head`, `tx_tail`,
+     how many threads wait). Atomics there are safe for netd: the area stays mapped while it
+     is attached, whatever the client does.
+
+     **Data.** A socket's bytes live in a **byte ring** pair (receive and send, 64 KiB
+     each) in the server's buffer pool: memory objects of 2 MiB (16 socket areas) mapped
+     into the server's region and granted to the channel once, more of them as sockets
+     come, the last empty one kept. The server copies between the program and the rings
+     (one copy, no lock but the socket's receive or send lock); netd copies between the
+     rings and smoltcp's socket buffers with the fault-surviving copy (`oxrt::copy`), so a
+     revoked grant fails the socket, never netd. The protocol for a ring is the SPSC one of
+     `crates/ring` on positions instead of slots: the producer writes bytes, then publishes
+     its position (Release); the consumer reads the position (Acquire), copies, then
+     publishes its own. TCP needs no request and no system call in the steady state:
+
+     - *Sending*: the server appends to the send ring, publishes `tx_tail`, sets the
+       socket's bit in the service bitmap and rings the submission doorbell (a futex wake
+       only if netd sleeps). netd moves what fits into smoltcp's send buffer, publishes
+       `tx_head` and wakes the socket's waiters (writers waiting for room).
+     - *Receiving*: netd moves what smoltcp received into the receive ring as soon as there
+       is room (it never waits for a request), publishes `rx_tail` and wakes the socket's
+       waiters. The reader copies out and publishes `rx_head`; only if netd had data that
+       did not fit (`rx_wait`, checked after a fence: Dekker's pattern) does it ring netd.
+     - Datagrams (UDP, raw ICMP) arrive in the receive ring as records (16-byte header:
+       length, source address and port; aligned to 16 bytes, wrapping); a datagram is sent
+       by a request (`SEND`) from the start of the send half, so its errors (`EMSGSIZE`,
+       `ENETUNREACH`, `EAGAIN` for a full smoltcp buffer) are the call's own, as on Linux.
+
+     **Requests** are the rare operations: `SOCKET`, `BIND`, `LISTEN`, `CONNECT`, `ACCEPT`,
+     `SEND` (datagrams), `SHUTDOWN`, `CLOSE`, `NAME`, `SETOPT`, `LINKS`, `FORGET`. netd
+     answers every one **at once**: nothing waits in netd. A connect starts the handshake and
+     completes; the outcome comes through the control block (`ESTABLISHED`, or `CLOSED`
+     with `ECONNREFUSED` or `ETIMEDOUT`); an accept takes a connection the listener's count
+     announced, or answers `EAGAIN`. So all waiting is the server's, on the socket's `seq`
+     (a futex in the shared area, which netd and the server both advance and wake):
+     interruptible by signals (`EINTR`, restarted under `SA_RESTART`), with `SO_RCVTIMEO`
+     and `SO_SNDTIMEO` as deadlines, `O_NONBLOCK`/`MSG_DONTWAIT` as `EAGAIN` (`EINPROGRESS`
+     for a connect), and a signal never leaves anything half done in netd (an interrupted
+     connect goes on: `EALREADY` while it runs, as Linux).
+
+     **Readiness** for `poll`, `select` and `epoll` (still the kernel's until R6e) is
+     reported as for every placeholder (`kfd_ready`), computed by the server from the
+     control block as Linux's `tcp_poll` and `udp_poll` do (with `POLLRDHUP`, `SO_RCVLOWAT`,
+     `POLLHUP` for a socket never connected, `POLLERR` with a pending error). A call that
+     changes it reports it (a read that empties the ring); what netd changes reaches the
+     instance's **net thread** (`ROLE_NET`, a third service thread of the pager's process):
+     netd sets the socket's bit in the client bitmap and wakes the thread if it sleeps (one
+     wake per netd round), the thread reports each marked socket's readiness, and an edge
+     for new data or room (`EPOLLET`). A blocked call does not wait for the net thread:
+     netd wakes it directly.
+
+     **Semantics** (Linux's, `man 7 tcp`, `udp`, `ip`, `socket`): `bind` checks the address
+     is local (`EADDRNOTAVAIL`) and the port: a socket bound to it on an overlapping address
+     conflicts unless both have `SO_REUSEADDR` and neither listens (`EADDRINUSE`); port 0
+     takes an ephemeral port; connections inherit their listener's. `EPIPE` with `SIGPIPE`
+     (unless `MSG_NOSIGNAL`) once the connection cannot send, after a pending error
+     (`ECONNRESET`) is reported once; `MSG_PEEK`, `MSG_WAITALL`, `MSG_TRUNC` (datagrams),
+     `SO_ERROR` (taking the pending error: a nonblocking connect's outcome), `shutdown`
+     (`SHUT_WR` sends `FIN` after what is queued), `TCP_NODELAY` (Nagle's algorithm is on
+     by default, as Linux), `SO_KEEPALIVE`, `IP_TTL`, `FIONREAD`, `SIOCOUTQ`, `SO_LINGER`
+     with a zero time (close sends `RST`), and close with unread data sends `RST`.
+     **Closing** never waits in the closing thread: the net thread sends `CLOSE`; netd then
+     copies what the send ring still holds into its own memory and sends it before its
+     `FIN`, so data written before an exit reaches the peer even after the instance ended
+     (the pager waits for the net thread's closes before it lets the instance go).
+
+     **netd** serves every instance's channel from one TCP/IP stack: ports are global, and
+     a channel names only its own sockets (its control blocks), so one instance can neither
+     see nor touch another's. Each round it takes requests (no more than the completion ring
+     has room for), the service bitmaps, polls the card and smoltcp, moves data between
+     smoltcp and the rings of the sockets that can move some, and publishes what changed;
+     it sleeps (doorbells armed, `ipc_receive` with smoltcp's next deadline) after a spin
+     without progress. When a channel's client goes, its sockets close (`FIN` after the data
+     netd already holds); when netd dies, every socket of the old channel fails
+     (`ECONNRESET`, `POLLERR`) and the next socket makes a new channel (netd started again).
 8. **R8 — Processes and signals**: pids, the process tree, `fork` (with the copy-on-write clone
    of memory objects), `exec`, `wait`, signals, job control, `/proc`'s data. The kernel's
    process model shrinks to processes and threads as containers. `thread_exists` (1090), with
@@ -324,3 +413,5 @@ else.
 - One server instance per process tree, not one for all (ADR 0002).
 - 46 bits of address space for Linux programs (ADR 0003).
 - The tty layer runs in the Linux server; the kernel keeps the console as a device (ADR 0004).
+- Internet sockets keep their state in control blocks in the channel's shared area, their data
+  in byte rings in granted memory, and netd answers every request at once (ADR 0007).
