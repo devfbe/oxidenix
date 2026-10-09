@@ -25,6 +25,7 @@ mod initramfs;
 mod inotify;
 mod mm;
 mod namespace;
+mod netclient;
 mod netdev;
 mod netlink;
 mod paths;
@@ -85,6 +86,9 @@ pub extern "C" fn _start(state: *mut State, role: u64) -> ! {
     }
     if role == ROLE_WORKER {
         scm::worker();
+    }
+    if role == ROLE_NET {
+        netclient::thread();
     }
     loop {
         if call0(SYS_RESTRICTED_ENTER) as u64 != REASON_SYSCALL {

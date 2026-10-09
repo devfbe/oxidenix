@@ -54,6 +54,30 @@ pub struct Desc {
 
 const _: () = assert!(core::mem::size_of::<Desc>() == 64);
 
+/// A completion as the protocols on the rings encode it (`fsring`,
+/// `netring`): the request's tag and operation, a status (a value >= 0 or
+/// a negative errno) and four values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct Completion {
+    pub tag: u64,
+    pub op: u16,
+    pub status: i64,
+    pub values: [u64; 4],
+}
+
+impl Completion {
+    /// As a descriptor: `arg` = [status, v0, v1], `offset` = v2, `object`
+    /// = v3.
+    pub fn to_desc(&self) -> Desc {
+        let [v0, v1, v2, v3] = self.values;
+        Desc { op: self.op, tag: self.tag, arg: [self.status as u64, v0, v1], offset: v2, object: v3, ..Desc::default() }
+    }
+
+    pub fn from_desc(d: &Desc) -> Completion {
+        Completion { tag: d.tag, op: d.op, status: d.arg[0] as i64, values: [d.arg[1], d.arg[2], d.offset, d.object] }
+    }
+}
+
 /// A word on a cache line of its own (the two ends write different ones).
 #[repr(C, align(64))]
 struct Line(AtomicU32);
@@ -169,9 +193,21 @@ impl<const N: usize> Producer<'_, N> {
 
     /// Wakes the consumer if it sleeps (after one or more pushes).
     pub fn ring_doorbell(&mut self, w: &impl Wait) {
+        self.mem.ring_doorbell(w);
+    }
+}
+
+impl<const N: usize> RingMemory<N> {
+    /// The producer's doorbell, rung by anyone on the producer's side (it
+    /// pushes nothing, so it needs no `Producer`): wakes the consumer if
+    /// it announced a sleep. A protocol that tells the consumer about work
+    /// outside the ring (`netring`'s bitmaps) marks the work, then rings:
+    /// the consumer looks for such work after announcing its sleep
+    /// (invariant 4's fences order the two sides).
+    pub fn ring_doorbell(&self, w: &impl Wait) {
         fence(Ordering::SeqCst);
-        if self.mem.sleeping.0.load(Ordering::Relaxed) != 0 {
-            w.wake(&self.mem.tail.0);
+        if self.sleeping.0.load(Ordering::Relaxed) != 0 {
+            w.wake(&self.tail.0);
         }
     }
 }

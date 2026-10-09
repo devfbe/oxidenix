@@ -812,8 +812,9 @@ pub fn spawn_server(server: &Arc<Server>) -> Result<Pid, i64> {
 
 /// The pager process of a Linux server instance: the server's view alone
 /// (no program), one thread that supplies the pages of the instance's
-/// paged objects. It belongs to the kernel, like the servers, and ends
-/// when the instance's last program is gone.
+/// paged objects, and the instance's two other service threads (the worker
+/// and the net thread). It belongs to the kernel, like the servers, and
+/// ends when the instance's last program is gone.
 fn spawn_pager(instance: &Arc<linux::Instance>) -> Result<Pid, i64> {
     let slot = sched::reserve_pid()?;
     let pid = slot.pid;
@@ -832,15 +833,18 @@ fn spawn_pager(instance: &Arc<linux::Instance>) -> Result<Pid, i64> {
     let t = new_task(pid, group.clone(), "linux-pager".to_string(), own, start)?;
     slot.insert(t.clone())?;
     sched::start(t);
-    // The worker: a thread of the pager's process (it ends with it).
-    let wslot = sched::reserve_pid()?;
-    let (thread, start) = linux::LinuxThread::worker(instance.clone())?;
-    let mut own = Process::empty();
-    own.mm = mm;
-    own.linux = Some(thread);
-    let w = new_task(wslot.pid, group, "linux-worker".to_string(), own, start)?;
-    wslot.insert(w.clone())?;
-    sched::start(w);
+    // The worker and the net thread: threads of the pager's process (they
+    // end with it).
+    for (role, name) in [(restricted::ROLE_WORKER, "linux-worker"), (restricted::ROLE_NET, "linux-net")] {
+        let wslot = sched::reserve_pid()?;
+        let (thread, start) = linux::LinuxThread::service(instance.clone(), role)?;
+        let mut own = Process::empty();
+        own.mm = mm.clone();
+        own.linux = Some(thread);
+        let w = new_task(wslot.pid, group.clone(), name.to_string(), own, start)?;
+        wslot.insert(w.clone())?;
+        sched::start(w);
+    }
     Ok(pid)
 }
 

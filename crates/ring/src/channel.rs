@@ -8,12 +8,18 @@
 //!                        `state` on its own cache line
 //! submission             RingMemory<slots>: client -> service
 //! completion             RingMemory<slots>: service -> client
+//! shared                 `shared` pages (none unless asked for): the
+//!                        protocol's own state, beside the rings
 //! ```
 //!
 //! Each ring starts on a page of its own. The layout is a function of the
-//! slot count alone (`Layout::new`), which each end knows from its own
-//! system call. The header page is mapped read-only into both ends (only
-//! the kernel writes it), the rings read and write.
+//! slot count and the shared pages alone (`Layout::with_shared`), which the
+//! client knows from its own system call and the service from the offer.
+//! The header page is mapped read-only into both ends (only the kernel
+//! writes it), the rings and the shared area read and write. Like the
+//! rings, the shared area stays mapped in the service until it detaches,
+//! whatever the client does: the service may use atomics there (unlike in
+//! granted memory, which a revoke takes away at any moment).
 //!
 //! `state` is set by the kernel when an end is gone (`CLIENT_GONE`,
 //! `SERVICE_GONE`); from then on every futex wait on the channel's memory
@@ -27,6 +33,8 @@ pub const PAGE: usize = 4096;
 /// Slots per ring: a power of two in this range.
 pub const MIN_SLOTS: u32 = 2;
 pub const MAX_SLOTS: u32 = 4096;
+/// The most pages a channel's shared area may have.
+pub const MAX_SHARED_PAGES: u32 = 256;
 
 pub const MAGIC: u32 = u32::from_le_bytes(*b"OXCH");
 pub const VERSION: u32 = 1;
@@ -38,18 +46,30 @@ pub struct Layout {
     pub slots: u32,
     pub submission: usize,
     pub completion: usize,
+    /// The shared area (after the completion ring), `shared_pages` long.
+    pub shared: usize,
+    pub shared_pages: usize,
     /// Pages of the whole object.
     pub pages: usize,
 }
 
 impl Layout {
-    /// None unless `slots` is a power of two within MIN_SLOTS..=MAX_SLOTS.
+    /// A channel without a shared area: None unless `slots` is a power of
+    /// two within MIN_SLOTS..=MAX_SLOTS.
     pub const fn new(slots: u32) -> Option<Layout> {
-        if !slots.is_power_of_two() || slots < MIN_SLOTS || slots > MAX_SLOTS {
+        Self::with_shared(slots, 0)
+    }
+
+    /// A channel with `shared_pages` pages of shared area (at most
+    /// `MAX_SHARED_PAGES`).
+    pub const fn with_shared(slots: u32, shared_pages: u32) -> Option<Layout> {
+        if !slots.is_power_of_two() || slots < MIN_SLOTS || slots > MAX_SLOTS || shared_pages > MAX_SHARED_PAGES {
             return None;
         }
         let ring = (RING_HEADER + slots as usize * 64).div_ceil(PAGE) * PAGE;
-        Some(Layout { slots, submission: PAGE, completion: PAGE + ring, pages: (PAGE + 2 * ring) / PAGE })
+        let shared = PAGE + 2 * ring;
+        let shared_pages = shared_pages as usize;
+        Some(Layout { slots, submission: PAGE, completion: PAGE + ring, shared, shared_pages, pages: shared / PAGE + shared_pages })
     }
 
     pub fn bytes(&self) -> usize {
@@ -132,9 +152,18 @@ pub struct Offer {
     /// The channel's id, for the service's channel calls.
     pub channel: u64,
     pub slots: u32,
+    /// Pages of its shared area (0: none).
+    pub shared: u32,
     /// The process (pid) whose server instance connects, for the service's
     /// diagnostics.
     pub client: u64,
+}
+
+impl Offer {
+    /// The layout of the offered channel (valid: `decode` checked it).
+    pub fn layout(&self) -> Option<Layout> {
+        Layout::with_shared(self.slots, self.shared)
+    }
 }
 
 pub const OFFER_MAGIC: u32 = u32::from_le_bytes(*b"OFFR");
@@ -147,6 +176,7 @@ impl Offer {
         b[4..8].copy_from_slice(&VERSION.to_le_bytes());
         b[8..16].copy_from_slice(&self.channel.to_le_bytes());
         b[16..20].copy_from_slice(&self.slots.to_le_bytes());
+        b[20..24].copy_from_slice(&self.shared.to_le_bytes());
         b[24..32].copy_from_slice(&self.client.to_le_bytes());
         b
     }
@@ -158,8 +188,8 @@ impl Offer {
         if u32_at(0) != OFFER_MAGIC || u32_at(4) != VERSION {
             return None;
         }
-        let offer = Offer { channel: u64_at(8), slots: u32_at(16), client: u64_at(24) };
-        Layout::new(offer.slots).map(|_| offer)
+        let offer = Offer { channel: u64_at(8), slots: u32_at(16), shared: u32_at(20), client: u64_at(24) };
+        offer.layout().map(|_| offer)
     }
 }
 
@@ -180,17 +210,33 @@ mod tests {
         let l = Layout::new(MAX_SLOTS).unwrap();
         assert!(l.completion >= l.submission + RING_HEADER + MAX_SLOTS as usize * 64);
         assert_eq!(l.bytes(), l.completion + (l.completion - l.submission));
+        assert_eq!((l.shared, l.shared_pages), (l.bytes(), 0));
+    }
+
+    #[test]
+    fn the_shared_area_follows_the_rings() {
+        let l = Layout::with_shared(64, 33).unwrap();
+        assert_eq!((l.submission, l.completion, l.shared, l.shared_pages, l.pages), (PAGE, 3 * PAGE, 5 * PAGE, 33, 38));
+        assert_eq!(l.bytes(), l.shared + 33 * PAGE);
+        assert_eq!(Layout::with_shared(64, MAX_SHARED_PAGES).map(|l| l.shared_pages), Some(MAX_SHARED_PAGES as usize));
+        assert_eq!(Layout::with_shared(64, MAX_SHARED_PAGES + 1), None);
+        assert_eq!(Layout::with_shared(3, 1), None);
     }
 
     #[test]
     fn offers_round_trip_and_reject_garbage() {
-        let o = Offer { channel: 0x1234_5678_9abc, slots: 64, client: 7 };
+        let o = Offer { channel: 0x1234_5678_9abc, slots: 64, shared: 0, client: 7 };
         assert_eq!(Offer::decode(&o.encode()), Some(o));
+        let with_area = Offer { shared: 33, ..o };
+        assert_eq!(Offer::decode(&with_area.encode()), Some(with_area));
+        assert_eq!(with_area.layout(), Layout::with_shared(64, 33));
         let mut bad = o.encode();
         bad[0] ^= 1;
         assert_eq!(Offer::decode(&bad), None);
         assert_eq!(Offer::decode(&o.encode()[..31]), None);
         let odd = Offer { slots: 3, ..o };
         assert_eq!(Offer::decode(&odd.encode()), None);
+        let huge = Offer { shared: MAX_SHARED_PAGES + 1, ..o };
+        assert_eq!(Offer::decode(&huge.encode()), None);
     }
 }

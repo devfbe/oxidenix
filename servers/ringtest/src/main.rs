@@ -108,7 +108,7 @@ fn main(args: Vec<&'static str>) -> i32 {
         };
         let offer = Offer::decode(&message[..len]).filter(|o| o.slots as usize == SLOTS);
         let attached = match offer {
-            Some(o) => oxrt::chan_attach(o.channel).map(|base| (o.channel, base)),
+            Some(o) => oxrt::chan_attach(o.channel).map(|base| (o, base)),
             None => Err(-EINVAL),
         };
         let status = attached.as_ref().map_or_else(|&e| e, |_| 0);
@@ -116,8 +116,8 @@ fn main(args: Vec<&'static str>) -> i32 {
         if !late {
             let _ = oxrt::ipc_reply(id, &status.to_le_bytes());
         }
-        if let Ok((channel, base)) = attached {
-            serve(channel, base);
+        if let Ok((offer, base)) = attached {
+            serve(&offer, base);
         }
         if late {
             // Nobody waits for it any more.
@@ -126,9 +126,10 @@ fn main(args: Vec<&'static str>) -> i32 {
     }
 }
 
-/// Serves `channel` (mapped at `base`) until its client is gone.
-fn serve(channel: u64, base: *mut u8) {
-    let layout = Layout::new(SLOTS as u32).expect("a valid slot count");
+/// Serves the offered channel (mapped at `base`) until its client is gone.
+fn serve(offer: &Offer, base: *mut u8) {
+    let channel = offer.channel;
+    let layout = offer.layout().expect("decode checked it");
     // The channel stays mapped until chan_detach below.
     let (sub, comp) = unsafe { (layout.ring::<SLOTS>(base, layout.submission), layout.ring::<SLOTS>(base, layout.completion)) };
     let header = unsafe { Header::at(base) };
@@ -136,7 +137,7 @@ fn serve(channel: u64, base: *mut u8) {
     let (mut requests, mut completions) = (sub.consumer(), comp.producer());
     let mut mapped: Vec<Mapped> = Vec::new();
     while let Some(d) = requests.pop_wait_while(&Futex, || header.state() == 0) {
-        let status = handle(channel, base, &d, &mut mapped);
+        let status = handle(channel, base, &layout, &d, &mut mapped);
         let reply = Desc { tag: d.tag, arg: [status as u64, 0, 0], ..Desc::default() };
         while !completions.push(&reply) {
             if header.state() != 0 {
@@ -145,6 +146,13 @@ fn serve(channel: u64, base: *mut u8) {
             oxrt::sched_yield();
         }
         completions.ring_doorbell(&Futex);
+        if d.op == SHARED && status == 0 && d.arg[2] == 1 && layout.shared_pages > 0 {
+            // The late store, with a wake the client's wait must meet.
+            let _ = oxrt::futex_wait(&AtomicU32::new(0), 0, Some(50));
+            let word = unsafe { &*(base.add(layout.shared + 4) as *const AtomicU32) };
+            word.store(!(d.arg[1] as u32), Ordering::Release);
+            let _ = oxrt::futex_wake(word, 1);
+        }
     }
     // The client is gone: the kernel must have taken every grant back.
     if mapped.iter().all(|m| gone(m.addr)) {
@@ -179,9 +187,25 @@ fn range(m: &Mapped, d: &Desc) -> Result<*mut u8, i64> {
     Ok(unsafe { m.addr.add(d.buf_off as usize) })
 }
 
-fn handle(channel: u64, base: *mut u8, d: &Desc, mapped: &mut Vec<Mapped>) -> i64 {
+fn handle(channel: u64, base: *mut u8, layout: &Layout, d: &Desc, mapped: &mut Vec<Mapped>) -> i64 {
     let result: Result<i64, i64> = (|| match d.op {
         ECHO => Ok(d.arg[0] as i64 + 1),
+        SHARED => {
+            if layout.shared_pages as u64 != d.arg[0] {
+                return Ok(1);
+            }
+            for n in 0..layout.shared_pages {
+                let word = unsafe { &*(base.add(layout.shared + n * PAGE as usize) as *const AtomicU32) };
+                if word.load(Ordering::Acquire) != (d.arg[1] as u32).wrapping_add(n as u32) {
+                    return Ok(2);
+                }
+            }
+            if d.arg[2] != 1 && layout.shared_pages > 0 {
+                let word = unsafe { &*(base.add(layout.shared + 4) as *const AtomicU32) };
+                word.store(!(d.arg[1] as u32), Ordering::Release);
+            }
+            Ok(0)
+        }
         READ => {
             let i = map(channel, d.grant, mapped)?;
             let m = &mapped[i];

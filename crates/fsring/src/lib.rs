@@ -469,27 +469,9 @@ pub fn check_target(bytes: &[u8]) -> Result<&str, i64> {
     Ok(target)
 }
 
-/// A completion: the request's tag and operation, the status, values.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub struct Completion {
-    pub tag: u64,
-    pub op: u16,
-    pub status: i64,
-    pub values: [u64; 4],
-}
-
-impl Completion {
-    /// As a descriptor: `arg` = [status, v0, v1], `offset` = v2, `object`
-    /// = v3.
-    pub fn to_desc(&self) -> Desc {
-        let [v0, v1, v2, v3] = self.values;
-        Desc { op: self.op, tag: self.tag, arg: [self.status as u64, v0, v1], offset: v2, object: v3, ..Desc::default() }
-    }
-
-    pub fn from_desc(d: &Desc) -> Completion {
-        Completion { tag: d.tag, op: d.op, status: d.arg[0] as i64, values: [d.arg[1], d.arg[2], d.offset, d.object] }
-    }
-}
+/// A completion: the request's tag and operation, the status, values (the
+/// encoding every protocol on the rings shares).
+pub use ring::Completion;
 
 /// `STAT`'s result.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
