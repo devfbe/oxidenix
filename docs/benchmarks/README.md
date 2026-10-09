@@ -139,6 +139,13 @@ server's rings and netd without the kernel, and no request per `send` or `recv`.
 of the gap to Linux is netd's per-segment work (smoltcp over an emulated Ethernet loopback with
 1500-byte frames) and the two copies in netd (rings ↔ smoltcp).
 
+After the review (`2026-10-09-40aac17-r7b-review.md`: netd's buffers follow use, starting at
+Linux's first sizes and growing to 1 MiB; the loopback pushes back instead of dropping frames)
+`tcp_loopback` stays at 1209 MB/s and `tcp_network_echo` at 158 MB/s on a busier host (load
+3.5: the disk figures of that run are low for the same reason). Starting connections at 4 KiB
+instead cost half the loopback throughput (565 MB/s: the growth took longer than the transfer)
+and, against QEMU's user network, a one-second stall (its TCP waits for a larger window).
+
 ## Open: PCIDs and small cached reads
 
 Turning PCIDs on (commit `fae8292`, before restricted mode) made random 4 KiB reads from the
