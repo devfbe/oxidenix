@@ -742,6 +742,10 @@ from the kernel for them.
   restore_saved_sigmask_unless). A poller announces that it sleeps, so a report makes the
   kernel call that wakes it only then, and an epoll instance reports its own readiness only
   while something watches it; a description that is always ready has no watch at all.
+  Whether a file is always ready is decided per kind of file (`File::always_ready`: tmpfs
+  and /data files, null and zero, the kernel's files, /proc and /sys); a file of such a kind
+  with readiness of its own (a pollable /proc file, as Linux's `/proc/self/mounts`) would need
+  it per node, with a watch.
 - **Signals**: interrupted with nothing ready, poll answers `ERESTART_RESTARTBLOCK` (the
   kernel restarts it as restart_syscall, which the server answers with the deadline it kept
   in the thread's words, unless a handler ran: then EINTR), ppoll, select and pselect6
