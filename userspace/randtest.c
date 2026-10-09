@@ -8,7 +8,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/auxv.h>
+#include <signal.h>
 #include <sys/random.h>
+#include <sys/time.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -17,6 +19,8 @@
 #endif
 
 static int failures;
+
+static void on_alarm(int sig) { (void)sig; }
 
 static void check(const char *name, int ok) {
     printf("%-52s %s\n", name, ok ? "ok" : "FAIL");
@@ -49,6 +53,27 @@ int main(int argc, char **argv) {
     for (int v = 0; v < 256; v++) uniform &= counts[v] > 3500 && counts[v] < 4700;
     check("1 MiB at once, every byte value about as often", uniform);
     free(p);
+
+    /* A long request and signals: it ends early with what it made (never
+     * an error, never a short count that is not whole pieces). */
+    struct sigaction sa = {0};
+    sa.sa_handler = on_alarm;
+    sigaction(SIGALRM, &sa, NULL);
+    struct itimerval every = {{0, 200}, {0, 200}};
+    setitimer(ITIMER_REAL, &every, NULL);
+    size_t huge = 32 << 20;
+    unsigned char *q = malloc(huge);
+    int whole_pieces = q != NULL, early = 0;
+    for (int i = 0; q && i < 8; i++) {
+        long n = getrandom(q, huge, 0);
+        whole_pieces &= n > 0 && (n == (long)huge || n % 256 == 0);
+        early += n > 0 && n < (long)huge;
+    }
+    struct itimerval off = {0};
+    setitimer(ITIMER_REAL, &off, NULL);
+    free(q);
+    check("32 MiB with signals coming: what was made", whole_pieces);
+    printf("  (ended early %d of 8 times)\n", early);
 
     /* AT_RANDOM: 16 bytes, not the same in a child process. */
     unsigned char mine[16], theirs[16];
