@@ -70,10 +70,21 @@ impl GrowingHeap {
             if let Ok(p) = self.0.lock().allocate_first_fit(layout) {
                 return p.as_ptr();
             }
-            if !self.grow(layout) {
+            // Slabs whose slots are all free first, then more memory.
+            if self.reclaim() == 0 && !self.grow(layout) {
                 return null_mut();
             }
         }
+    }
+
+    /// Gives the heap back the slabs whose slots are all free (lock order
+    /// SLABS -> HEAP, taken only here; nothing takes HEAP and then SLABS).
+    fn reclaim(&self) -> usize {
+        let mut given = 0;
+        for (c, slabs) in SLABS.iter().enumerate() {
+            given += slabs.lock().reclaim(c, |slab| unsafe { self.0.lock().deallocate(slab, slab::slab_layout()) });
+        }
+        given
     }
 
     fn grow(&self, layout: Layout) -> bool {

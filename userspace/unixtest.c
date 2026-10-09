@@ -962,6 +962,25 @@ static void inflight_bound(void) {
     check("... and files can still be mapped meanwhile", mapped);
 }
 
+/* Leaves nothing behind for the tests after this one: a last cycle with a
+ * pipe's write end, dropped; the collector takes cycles in the order their
+ * sockets were made, so once that pipe's reader sees the end, the garbage
+ * the tests above left is gone too. */
+static void quiesce(void) {
+    int s[2], p[2];
+    socketpair(AF_UNIX, SOCK_STREAM, 0, s);
+    pipe(p);
+    send_fds(s[0], (int[]){s[0], p[1]}, 2);
+    send_fds(s[1], &s[1], 1);
+    close(p[1]);
+    close(s[0]);
+    close(s[1]);
+    struct pollfd pp = {p[0], POLLIN, 0};
+    char c;
+    check("everything left in flight is collected", poll(&pp, 1, 10000) == 1 && read(p[0], &c, 1) == 0);
+    close(p[0]);
+}
+
 int main(void) {
     stream_pair();
     nonblocking();
@@ -976,6 +995,7 @@ int main(void) {
     ancillary_edges();
     paging_under_locks();
     inflight_bound();
+    quiesce();
     printf("%s\n", failures ? "unixtest: FAILURES" : "unixtest: all ok");
     return failures ? 1 : 0;
 }
