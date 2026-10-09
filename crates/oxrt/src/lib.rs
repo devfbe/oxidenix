@@ -21,6 +21,7 @@ pub mod sys {
     pub const EXIT_GROUP: u64 = 231;
     pub const IOPERM: u64 = 173;
     pub const CLOCK_GETTIME: u64 = 228;
+    pub const GETRANDOM: u64 = 318;
     /// (name, name length, argument, flags) -> service id; flags:
     /// `IPC_CHANNELS` (the service accepts channel offers)
     pub const IPC_REGISTER: u64 = 1000;
@@ -108,6 +109,20 @@ pub fn exit(code: i32) -> ! {
 
 pub fn getpid() -> i64 {
     syscall(sys::GETPID, [0; 6])
+}
+
+/// Fills `buf` from the kernel's random generator (ChaCha20, seeded from
+/// the CPU's entropy source and timing jitter: fit for secrets).
+pub fn getrandom(buf: &mut [u8]) {
+    let mut done = 0;
+    while done < buf.len() {
+        let n = syscall(sys::GETRANDOM, [buf[done..].as_mut_ptr() as u64, (buf.len() - done) as u64, 0, 0, 0, 0]);
+        if n <= 0 {
+            // Only a bad buffer fails, and this one is ours.
+            exit(103);
+        }
+        done += n as usize;
+    }
 }
 
 /// Seconds since the Unix epoch.

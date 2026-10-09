@@ -29,11 +29,13 @@ use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, IpCidr, Ipv4Address, Ipv4Cidr};
 use virtio_net::VirtioNet;
 
-/// The heap: the sockets themselves (smoltcp's socket set, made for
-/// `service::MAX_SMOLTCP` at once, about 1.8 MiB), frames in flight, the
-/// channels' bookkeeping. smoltcp's socket buffers are not in it: each is
-/// memory of its own, gone with the socket (`service::Region`).
-const HEAP: usize = 4 << 20;
+/// The heap, sized from the worst case of everything on it
+/// (`service::HEAP_WORST`: smoltcp's socket set for `service::MAX_SMOLTCP`
+/// sockets, the service's tables at their limits, frames in flight).
+/// smoltcp's socket buffers are not in it: each is memory of its own, gone
+/// with the socket (`service::Region`).
+const HEAP: usize = service::HEAP;
+const _: () = assert!(HEAP >= service::HEAP_WORST, "netd's heap holds its worst case");
 
 oxrt::entry!(main, heap = HEAP);
 
@@ -113,8 +115,15 @@ fn main(args: Vec<&'static str>) -> i32 {
         return 1;
     }
     let mut config = Config::new(mac.into());
-    config.random_seed = oxrt::uptime_ms() ^ (phys << 7);
+    // smoltcp's own randomness (DHCP's transaction ids, its ports when it
+    // picks one) from the kernel's generator; TCP's initial sequence
+    // numbers are RFC 6528's (`service::isn`).
+    let mut seed = [0u8; 8];
+    oxrt::getrandom(&mut seed);
+    config.random_seed = u64::from_le_bytes(seed);
     let mut iface = Interface::new(config, &mut nic, now());
+    service::init_secrets();
+    iface.set_isn_generator(service::isn);
     iface.update_ip_addrs(|addrs| {
         let _ = addrs.push(IpCidr::Ipv4(LOOPBACK));
     });
@@ -126,8 +135,7 @@ fn main(args: Vec<&'static str>) -> i32 {
     // order: register once DHCP is done, or after DHCP_WAIT_MS without it.
     let register_at = oxrt::uptime_ms() + DHCP_WAIT_MS;
     let mut registered = false;
-    let mut service = service::Service::new();
-    service.config.mac = mac.0;
+    let mut service = service::Service::new();    service.config.mac = mac.0;
 
     // The only messages netd takes are the kernel's channel offers (a
     // longer one fails in the kernel).
@@ -138,7 +146,7 @@ fn main(args: Vec<&'static str>) -> i32 {
         let mut progress = service.serve(&mut iface, &mut sockets);
         progress |= poll(&mut iface, &mut nic, &mut sockets, &mut service);
         progress |= service.pump(&mut sockets);
-        service.round_end(progress);
+        service.round_end();
         match sockets.get_mut::<dhcpv4::Socket>(dhcp).poll() {
             Some(dhcpv4::Event::Configured(c)) => {
                 // smoltcp sends from the first address unless the destination
@@ -226,6 +234,11 @@ fn main(args: Vec<&'static str>) -> i32 {
         }
         let event = oxrt::ipc_receive(&mut message, if sleep { timeout } else { Some(0) });
         service.awake();
+        if sleep && service.sleep_cap().is_some() {
+            // Woken from a brief sleep that futile marks forced: one round,
+            // then (without progress) asleep again, not a whole spin.
+            idle = SPIN - 1;
+        }
         match event {
             Ok(oxrt::Event::Interrupt(_)) => {
                 nic.card.ack_interrupt();

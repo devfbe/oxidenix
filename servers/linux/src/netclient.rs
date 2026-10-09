@@ -11,8 +11,9 @@
 //! bytes each: an *area*) are part of a memory object of `CHUNK_AREAS`
 //! areas, mapped into the server's region and granted to the channel once.
 //! Chunks are made as sockets come; an empty chunk goes (`FORGET`, then
-//! the revoke), the last one too, so an instance without sockets holds no
-//! pool memory.
+//! the revoke) at once if another has room, the last one after five
+//! seconds as a spare (`put_rings`, `trim_pool`), so an instance without
+//! sockets soon holds no pool memory.
 //!
 //! **The net thread** (`ROLE_NET`, a service thread of the pager's
 //! process) takes the sockets netd marked (the client bitmap) and reports
@@ -48,6 +49,8 @@ pub const RING: u32 = 64 * 1024;
 const CHUNK_AREAS: u64 = 16;
 const AREA_BYTES: u64 = 2 * RING as u64;
 const CHUNK_PAGES: u64 = CHUNK_AREAS * AREA_BYTES / PAGE;
+/// How long the last empty chunk stays as a spare.
+const SPARE_NS: u64 = 5_000_000_000;
 
 pub const EINTR: i64 = 4;
 pub const EIO: i64 = 5;
@@ -55,6 +58,20 @@ pub const EAGAIN: i64 = 11;
 pub const ENOBUFS: i64 = 105;
 pub const ENETDOWN: i64 = 100;
 const ETIMEDOUT: i64 = 110;
+
+/// The net thread's sleep: a futex wait until a deadline (monotonic
+/// nanoseconds, 0: none).
+struct FutexUntil(u64);
+
+impl Wait for FutexUntil {
+    fn wait(&self, word: &AtomicU32, value: u32) {
+        let _ = syscall(SYS_SERVER_FUTEX_WAIT, [word as *const AtomicU32 as u64, value as u64, self.0, 0, 0, 0]);
+    }
+
+    fn wake(&self, word: &AtomicU32) {
+        futex_wake(word, i32::MAX as u64);
+    }
+}
 
 /// A futex wait on a shared-area word, and a wake of every waiter.
 pub struct Futex;
@@ -119,6 +136,8 @@ struct Chunk {
 
 struct Pool {
     chunks: Vec<Option<Chunk>>,
+    /// The last chunk, empty since then (monotonic nanoseconds).
+    spare: Option<(usize, u64)>,
 }
 
 /// A socket the net thread closes.
@@ -196,7 +215,7 @@ impl Net {
             area,
             free: Mutex::new((0..MAX_SOCKETS as u32).rev().collect()),
             socks: Mutex::new((0..MAX_SOCKETS).map(|_| Weak::new()).collect()),
-            pool: Mutex::new(Pool { chunks: Vec::new() }),
+            pool: Mutex::new(Pool { chunks: Vec::new(), spare: None }),
             closing: Mutex::new(Vec::new()),
             links: Mutex::new(links),
         })
@@ -285,29 +304,69 @@ impl Net {
     }
 
     /// Gives rings back (netd no longer uses them). A chunk that empties
-    /// goes if another one has room (netd forgets its grant first).
+    /// goes at once if another one has room; the last one stays as a spare
+    /// for `SPARE_NS` (a program that closes and opens sockets in turn
+    /// does not make and revoke a chunk each time) and then goes too
+    /// (`trim_pool`, by the net thread), so an instance without sockets
+    /// holds no pool memory.
     pub fn put_rings(&self, r: Rings) {
         let gone = {
             let mut pool = self.pool.lock();
             let Some(Some(chunk)) = pool.chunks.get_mut(r.chunk) else { return };
             chunk.used &= !(1 << r.slot);
-            if chunk.used == 0 { pool.chunks[r.chunk].take() } else { None }
+            if chunk.used != 0 {
+                return;
+            }
+            let room_elsewhere = pool.chunks.iter().enumerate().any(|(k, c)| k != r.chunk && c.as_ref().is_some_and(|c| c.used != (1 << CHUNK_AREAS) - 1));
+            if room_elsewhere {
+                pool.chunks[r.chunk].take()
+            } else {
+                pool.spare = Some((r.chunk, crate::ringclient::now()));
+                None
+            }
         };
         if let Some(chunk) = gone {
-            // Forgotten before it is revoked (no draining): only once netd
-            // let go of it (or is gone) is it revoked; else it stays in the
-            // pool.
-            if self.is_dead() || self.status(Request::Forget { grant: chunk.grant }).is_ok() {
-                syscall(SYS_REVOKE, [self.ring.handle(), chunk.grant as u64, 0, 0, 0, 0]);
-                drop(chunk);
-            } else {
-                let mut pool = self.pool.lock();
-                match pool.chunks.get_mut(r.chunk) {
-                    Some(slot @ None) => *slot = Some(chunk),
-                    _ => pool.chunks.push(Some(chunk)),
-                }
+            self.free_chunk(r.chunk, chunk);
+        }
+    }
+
+    /// Frees an empty chunk that left the pool: forgotten before it is
+    /// revoked (no draining), and revoked only once netd let go of it (or
+    /// is gone); else it goes back into the pool.
+    fn free_chunk(&self, k: usize, chunk: Chunk) {
+        if self.is_dead() || self.status(Request::Forget { grant: chunk.grant }).is_ok() {
+            syscall(SYS_REVOKE, [self.ring.handle(), chunk.grant as u64, 0, 0, 0, 0]);
+            drop(chunk);
+        } else {
+            let mut pool = self.pool.lock();
+            match pool.chunks.get_mut(k) {
+                Some(slot @ None) => *slot = Some(chunk),
+                _ => pool.chunks.push(Some(chunk)),
             }
         }
+    }
+
+    /// The net thread: frees the spare chunk once it was empty for
+    /// `SPARE_NS`; when to look again (monotonic nanoseconds, 0: no spare).
+    fn trim_pool(&self) -> u64 {
+        let gone = {
+            let mut pool = self.pool.lock();
+            let Some((k, since)) = pool.spare else { return 0 };
+            let empty = pool.chunks.get(k).and_then(Option::as_ref).is_some_and(|c| c.used == 0);
+            if !empty {
+                pool.spare = None;
+                return 0;
+            }
+            if crate::ringclient::now() < since + SPARE_NS {
+                return since + SPARE_NS;
+            }
+            pool.spare = None;
+            pool.chunks[k].take().map(|c| (k, c))
+        };
+        if let Some((k, chunk)) = gone {
+            self.free_chunk(k, chunk);
+        }
+        0
     }
 
     /// netd's interfaces.
@@ -407,7 +466,16 @@ impl Drop for Chunk {
 
 /// netd's interfaces (none without netd).
 pub fn links() -> Vec<Link> {
-    net().and_then(|n| n.links()).unwrap_or_default()
+    // A channel that died meanwhile (netd went, or gave an idle channel's
+    // slot away) is made again, once.
+    let ask = || -> Result<Vec<Link>, i64> {
+        let n = net()?;
+        match n.links() {
+            Err(_) if n.is_dead() => net()?.links(),
+            r => r,
+        }
+    };
+    ask().unwrap_or_default()
 }
 
 /// Waits (at most a few seconds) until the closes queued so far are done:
@@ -471,6 +539,8 @@ fn serve(net: &Arc<Net>, generation: u32) {
         if any {
             continue;
         }
-        header.sleep_client(seen, &Futex);
+        // (Until the spare chunk's time is up, if there is one.)
+        let until = net.trim_pool();
+        header.sleep_client(seen, &FutexUntil(until));
     }
 }

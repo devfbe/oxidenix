@@ -59,8 +59,8 @@ Alternatives considered:
   whoever asks first.
 - **netd's memory follows use**: smoltcp (vendored with small patches) lets a connection's
   buffers grow from Linux's first sizes while they limit the transfer, and under pressure
-  connections stay small and idle ones give their buffers back, so an idle connection costs
-  little, as on Linux.
+  connections stay small and idle ones give their send buffers back (a receive buffer never
+  shrinks below the window it announced).
 
 ## Threat model: instances sharing netd
 
@@ -76,17 +76,41 @@ time) and so may anything on the network.
   a port is in use (`EADDRINUSE` at bind, as on Linux; ports are never shared across
   instances, so the 4-tuple check of a connect only ever looks at the instance's own
   connections and cannot reveal whom another one talks to); nothing of other instances'
-  peers, sequence numbers, buffers or traffic. Ephemeral ports are random (RFC 6056),
-  so their choice reveals neither another instance's activity nor what comes next. ICMP
+  peers, sequence numbers, buffers or traffic. Ephemeral ports follow RFC 6056's third
+  algorithm (a keyed hash of the destination, the key from the kernel's generator, plus a
+  counter; a random start for a bind to port 0) and TCP's initial sequence numbers RFC 6528
+  (a 4-microsecond clock plus a keyed hash of the 4-tuple), so neither reveals another
+  instance's activity nor can anyone predict them. ICMP
   echo identifiers are netd's on the wire (`netring::EchoIds`): an instance gets the replies
   to its own requests only, whatever identifier it picks, and the errors about its own ports.
+- **What ICMP still shares**: messages that concern no instance go to every raw socket, as on
+  Linux: echo requests from other hosts (which netd answers itself), and every type netd does
+  not attribute (timestamp, router and address-mask messages, redirects for no port of
+  anyone's). Errors about TCP or UDP ports go to the instance holding the port at the time
+  they arrive; one that comes after the port changed hands (a late error about a closed
+  connection whose port another instance took since) goes to the new holder, and one about
+  a port nobody holds goes to nobody. Echo replies and errors about requests whose
+  identifier netd no longer remembers (after 60 s unused, or beyond 64 per instance) go to
+  nobody.
 - **What an instance can deny another**: nothing below a reserve. Every shared resource
-  (buffer memory, smoltcp sockets, orphans, TIME-WAIT records, half-open connections) is a
+  (buffer memory, smoltcp sockets with those in TIME-WAIT, orphans, half-open connections) is a
   `netring::Budget` with a cap per instance and a reserve kept for every instance with a
   channel; channels are capped per instance and an idle one gives its slot up; the
-  ephemeral range is wider than what one instance can hold (its sockets and its share of
-  TIME-WAIT records). A flood from the network against one instance's listener spends that
+  ephemeral range is wider than what one instance can hold (its share of smoltcp sockets). A flood from the network against one instance's listener spends that
   instance's share of half-open connections.
+- **At each cap** (as Linux where it has one; none blocks an instance for good or leaks):
+
+  | cap | what happens |
+  |---|---|
+  | buffer bytes, smoltcp sockets | `ENOBUFS` for the socket; a connection that arrives is reset; under pressure connections start and stay small |
+  | smoltcp sockets, TIME-WAIT among them | the instance's own oldest TIME-WAIT connection goes (never another instance's); an instance without room skips TIME-WAIT (closed at once, tcp_max_tw_buckets) |
+  | orphans | a close resets the connection (tcp_max_orphans) |
+  | a close's leftovers | the connection is reset |
+  | half-open connections | the SYN is answered with a reset |
+  | backlog | `listen` takes a smaller backlog (at least one) |
+  | channels | an idle channel gives its slot up, else `ENOBUFS` |
+  | echo identifiers | the instance's least recently used goes |
+
 - **From the network**: every packet netd parses itself (ICMP for routing) is length-checked
   (tested over truncations and changed bytes on the host); SYNs cost a 4 KiB buffer until the
   handshake completes; closed connections that stop making progress are reset; the queues to
