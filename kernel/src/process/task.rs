@@ -385,6 +385,10 @@ pub struct Task {
     /// CPU `vcpu` (usize::MAX: a new task, not placed yet).
     pub vruntime: AtomicU64,
     pub vcpu: AtomicUsize,
+    /// The address of the Linux server's count of the locks it holds on
+    /// this thread (`restricted::SERVER_LOCKS_OFFSET` in its State page),
+    /// 0 for a task that is no Linux thread: the scheduler boosts a holder.
+    pub server_locks: AtomicU64,
     /// Channel it waits on (0: none), and the sequence number of the
     /// timer that ends its sleep (0: none; see `timer`).
     pub wait_chan: AtomicUsize,
@@ -436,6 +440,7 @@ impl Task {
             nice: AtomicI8::new(0),
             vruntime: AtomicU64::new(0),
             vcpu: AtomicUsize::new(usize::MAX),
+            server_locks: AtomicU64::new(own.linux.as_ref().map_or(0, |l| l.locks_word())),
             wait_chan: AtomicUsize::new(0),
             timer_seq: AtomicU64::new(0),
             wake_lock: IrqSpinLock::new(()),

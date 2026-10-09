@@ -89,7 +89,12 @@ const FIONREAD: u64 = 0x541b;
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Key {
     Tmp(u64),
-    Data(u32),
+    /// A /data inode: its number and its ext2 generation (a number another
+    /// instance freed and gave to a new file is another file).
+    Data(u32, u32),
+    /// Every /data inode of this number (`deleted` only: one this instance
+    /// removed and no longer has, so its generation is unknown here).
+    DataAny(u32),
     /// One of the kernel's (device, inode number): watched, without
     /// events.
     Kernel(u64, u64),
@@ -103,7 +108,7 @@ impl Key {
                 Some(Key::Kernel(st.dev, st.ino))
             }
             Node::Tmp(t) => Some(Key::Tmp(t.ino)),
-            Node::Data(d) => Some(Key::Data(d.ino)),
+            Node::Data(d) => Some(Key::data(d)),
         }
     }
 
@@ -112,7 +117,7 @@ impl Key {
     }
 
     pub fn data(inode: &DInode) -> Key {
-        Key::Data(inode.ino)
+        Key::Data(inode.ino, inode.generation())
     }
 }
 
@@ -227,21 +232,20 @@ impl Inotify {
             }
             st.next_wd = if wd == i32::MAX { 1 } else { wd + 1 };
             st.watches.insert(wd, Watch { key, mask: events });
+            // In the registry under the instance's lock (instance, then
+            // registry: the only nesting), so rm_watch never misses it.
+            REGISTRY.lock().entry(key).or_default().push((Arc::downgrade(self), wd));
             wd
         };
-        REGISTRY.lock().entry(key).or_default().push((Arc::downgrade(self), wd));
         Ok(wd as i64)
     }
 
     /// inotify_rm_watch: the watch goes, with an IN_IGNORED.
     pub fn rm_watch(&self, wd: i32) -> Result<i64, i64> {
-        let key = {
-            let mut st = self.state.lock();
-            let w = st.watches.remove(&wd).ok_or(EINVAL)?;
-            self.queue(&mut st, Event { wd, mask: IN_IGNORED, cookie: 0, name: Vec::new() });
-            w.key
-        };
-        unregister(key, self, wd);
+        let mut st = self.state.lock();
+        let w = st.watches.remove(&wd).ok_or(EINVAL)?;
+        self.queue(&mut st, Event { wd, mask: IN_IGNORED, cookie: 0, name: Vec::new() });
+        unregister(w.key, self, wd);
         Ok(0)
     }
 
@@ -268,19 +272,21 @@ impl Inotify {
         files::ready(self.id, POLLIN);
     }
 
-    /// Delivers event `mask` to watch `wd` if its mask takes it; whether
-    /// the watch ended (IN_ONESHOT).
-    fn deliver(&self, wd: i32, mask: u32, cookie: u32, name: &[u8]) -> bool {
+    /// Delivers event `mask` about `key` to watch `wd` if it is still that
+    /// inode's and its mask takes it; whether the watch ended (IN_ONESHOT).
+    fn deliver(&self, key: Key, wd: i32, mask: u32, cookie: u32, name: &[u8]) -> bool {
         let mut st = self.state.lock();
         let Some(w) = st.watches.get(&wd) else { return false };
-        if w.mask & mask & IN_ALL_EVENTS == 0 {
+        if w.key != key || w.mask & mask & IN_ALL_EVENTS == 0 {
             return false;
         }
         let oneshot = w.mask & IN_ONESHOT != 0;
+        let key = w.key;
         self.queue(&mut st, Event { wd, mask, cookie, name: name.to_vec() });
         if oneshot {
             st.watches.remove(&wd);
             self.queue(&mut st, Event { wd, mask: IN_IGNORED, cookie: 0, name: Vec::new() });
+            unregister(key, self, wd);
         }
         oneshot
     }
@@ -390,9 +396,7 @@ fn watchers(key: Key) -> Vec<(Arc<Inotify>, i32)> {
 
 fn send(key: Key, mask: u32, cookie: u32, name: &[u8]) {
     for (i, wd) in watchers(key) {
-        if i.deliver(wd, mask, cookie, name) {
-            unregister(key, &i, wd);
-        }
+        i.deliver(key, wd, mask, cookie, name);
     }
 }
 
@@ -421,7 +425,7 @@ pub fn tmp_event(inode: &tmpfs::Inode, mask: u32) {
 pub fn data_event(inode: &DInode, mask: u32) {
     if active() {
         let link = inode.link();
-        event(Key::data(inode), inode.kind == vfs::S_IFDIR, mask, link.as_ref().map(|(d, n)| (Key::Data(*d), n.as_str())));
+        event(Key::data(inode), inode.kind == vfs::S_IFDIR, mask, link.as_ref().map(|(d, g, n)| (Key::Data(*d, *g), n.as_str())));
     }
 }
 
@@ -471,12 +475,18 @@ pub fn deleted(key: Key, dir: bool) {
         return;
     }
     let isdir = if dir { IN_ISDIR } else { 0 };
-    send(key, IN_DELETE_SELF | isdir, 0, &[]);
-    let gone = REGISTRY.lock().remove(&key).unwrap_or_default();
-    WATCHES.fetch_sub(gone.len(), Ordering::Relaxed);
-    for (w, wd) in gone {
-        if let Some(i) = w.upgrade() {
-            i.ignore(wd);
+    let keys: Vec<Key> = match key {
+        Key::DataAny(ino) => REGISTRY.lock().keys().filter(|k| matches!(k, Key::Data(i, _) if *i == ino)).copied().collect(),
+        k => alloc::vec![k],
+    };
+    for key in keys {
+        send(key, IN_DELETE_SELF | isdir, 0, &[]);
+        let gone = REGISTRY.lock().remove(&key).unwrap_or_default();
+        WATCHES.fetch_sub(gone.len(), Ordering::Relaxed);
+        for (w, wd) in gone {
+            if let Some(i) = w.upgrade() {
+                i.ignore(wd);
+            }
         }
     }
 }

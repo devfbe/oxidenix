@@ -173,20 +173,27 @@ pub struct DInode {
     /// The directory and name it was last found by (lookup, create,
     /// rename): where its inotify events about it go besides its own
     /// watches. None once that name went.
-    link: Mutex<Option<(u32, String)>>,
+    link: Mutex<Option<(u32, u32, String)>>,
     /// Open file descriptions of it: an unlinked file's last close is when
     /// it goes (inotify's IN_DELETE_SELF).
     pub opens: AtomicUsize,
 }
 
 impl DInode {
-    pub fn link(&self) -> Option<(u32, String)> {
+    /// The directory (its number and generation) and the name it was last
+    /// found by.
+    pub fn link(&self) -> Option<(u32, u32, String)> {
         self.link.lock().clone()
+    }
+
+    /// Its ext2 generation.
+    pub fn generation(&self) -> u32 {
+        self.generation
     }
 
     /// Whether its last link went.
     pub fn unlinked(&self) -> bool {
-        self.unlinked.load(Ordering::Relaxed)
+        self.unlinked.load(Ordering::SeqCst)
     }
 }
 
@@ -195,23 +202,43 @@ pub fn cached(ino: u32) -> Option<Arc<DInode>> {
     TABLE.lock().inodes.get(&ino).cloned()
 }
 
+/// Records that `inode` was found as `name` in `dir` (`Table::names`).
+fn set_link(inode: &DInode, dir: &DInode, name: &str) {
+    let mut t = TABLE.lock();
+    let mut l = inode.link.lock();
+    if let Some((d, _, n)) = l.take() {
+        if t.names.get(&(d, n.clone())) == Some(&inode.ino) {
+            t.names.remove(&(d, n));
+        }
+    }
+    t.names.insert((dir.ino, String::from(name)), inode.ino);
+    *l = Some((dir.ino, dir.generation, String::from(name)));
+}
+
 /// The names of the table's inodes after a name changed: the inode found
 /// by `from` is now `to`'s (None: it has no name we know any more); one
 /// found by `to` before lost it. The inode that had `from`, if cached.
-fn relink(from: (u32, &str), to: Option<(u32, &str)>) -> Option<u32> {
-    let t = TABLE.lock();
-    let mut moved = None;
-    for i in t.inodes.values() {
-        let mut l = i.link.lock();
-        let is = |l: &Option<(u32, String)>, (d, n): (u32, &str)| l.as_ref().is_some_and(|(ld, ln)| *ld == d && ln == n);
-        if is(&l, from) {
-            *l = to.map(|(d, n)| (d, String::from(n)));
-            moved = Some(i.ino);
-        } else if to.is_some_and(|to| is(&l, to)) {
-            *l = None;
+/// (By the index of names: a removal costs no walk over the cache.)
+fn relink(from: (u32, &str), to: Option<(&DInode, &str)>) -> Option<u32> {
+    let mut t = TABLE.lock();
+    if let Some((dir, name)) = to {
+        if let Some(old) = t.names.remove(&(dir.ino, String::from(name))) {
+            if let Some(i) = t.inodes.get(&old) {
+                *i.link.lock() = None;
+            }
         }
     }
-    moved
+    let moved = t.names.remove(&(from.0, String::from(from.1)))?;
+    let inode = t.inodes.get(&moved).cloned();
+    match (to, inode) {
+        (Some((dir, name)), Some(i)) => {
+            t.names.insert((dir.ino, String::from(name)), moved);
+            *i.link.lock() = Some((dir.ino, dir.generation, String::from(name)));
+        }
+        (None, Some(i)) => *i.link.lock() = None,
+        _ => {}
+    }
+    Some(moved)
 }
 
 /// A file's times as the server set them (seconds: ext2 keeps no more),
@@ -353,9 +380,13 @@ struct Table {
     check: Vec<u32>,
     /// Dirty files (`EVENT_DIRTY`), by inode: since when.
     dirty: BTreeMap<u32, u64>,
+    /// The inodes' names (directory, name) as last found (`DInode::link`),
+    /// indexed: renames and removals find what they move or drop by name.
+    names: BTreeMap<(u32, String), u32>,
 }
 
-static TABLE: Mutex<Table> = Mutex::new(Table { inodes: BTreeMap::new(), keys: BTreeMap::new(), check: Vec::new(), dirty: BTreeMap::new() });
+static TABLE: Mutex<Table> =
+    Mutex::new(Table { inodes: BTreeMap::new(), keys: BTreeMap::new(), check: Vec::new(), dirty: BTreeMap::new(), names: BTreeMap::new() });
 static NAMES: RwLock = RwLock::new();
 static CLIENT: Mutex<Option<Arc<Client>>> = Mutex::new(None);
 static RECONNECT: Mutex<()> = Mutex::new(());
@@ -559,7 +590,7 @@ pub fn lookup(dir: &Arc<DInode>, name: &str) -> Result<Arc<DInode>, i64> {
     let r = c.call(Request::Lookup { dir: dir.ino, name: scratch.buf(0, name.len() as u64) }.encode(0))?;
     status(&r)?;
     let inode = found(r.values[0], r.values[1], r.values[2])?;
-    *inode.link.lock() = Some((dir.ino, String::from(name)));
+    set_link(&inode, dir, name);
     Ok(inode)
 }
 
@@ -595,7 +626,7 @@ pub fn create(dir: &Arc<DInode>, name: &str, new: New, perm: u32) -> Result<Arc<
     let r = c.call(Request::Create { dir: dir.ino, name: scratch.buf(0, n), kind, perm: perm & 0o7777 }.encode(0))?;
     status(&r)?;
     let inode = found(r.values[0], r.values[1], r.values[2])?;
-    *inode.link.lock() = Some((dir.ino, String::from(name)));
+    set_link(&inode, dir, name);
     Ok(inode)
 }
 
@@ -637,7 +668,7 @@ pub fn rename(odir: &Arc<DInode>, oname: &str, ndir: &Arc<DInode>, nname: &str) 
         r.values[0]
     };
     drop(scratch);
-    let moved = relink((odir.ino, oname), Some((ndir.ino, nname)));
+    let moved = relink((odir.ino, oname), Some((ndir, nname)));
     orphaned(&c, gone);
     Ok((moved, u32::try_from(gone).ok().filter(|&g| g != 0)))
 }
@@ -653,7 +684,7 @@ fn orphaned(c: &Client, ino: u64) {
     let mut t = TABLE.lock();
     match t.inodes.get(&ino) {
         Some(i) => {
-            i.unlinked.store(true, Ordering::Relaxed);
+            i.unlinked.store(true, Ordering::SeqCst);
             t.check.push(ino);
             REAP.store(true, Ordering::Relaxed);
         }
@@ -1584,6 +1615,11 @@ fn evict(ino: u32) {
             return;
         }
         t.inodes.remove(&ino);
+        if let Some((d, _, n)) = inode.link.lock().take() {
+            if t.names.get(&(d, n.clone())) == Some(&ino) {
+                t.names.remove(&(d, n));
+            }
+        }
 
         t.dirty.remove(&ino);
         drop(t);

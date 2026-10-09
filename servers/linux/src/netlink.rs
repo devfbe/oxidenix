@@ -329,22 +329,30 @@ impl NetlinkSocket {
         let len = data.len() as i64;
         if to == 0 {
             let interfaces = crate::netdev::interfaces();
-            let (cap_ack, dumping, room) = {
-                let st = self.state.lock();
-                (st.options & (1 << NETLINK_CAP_ACK) != 0, st.dump.is_some(), (st.rcvbuf as usize).saturating_sub(st.queued))
-            };
-            let (replies, overrun) = netlink::answer(&data, port, &interfaces, cap_ack, dumping, room);
-            let mut datagrams = Vec::new();
-            for r in replies {
-                match r {
-                    netlink::Reply::Datagram(d) => datagrams.push(d),
-                    netlink::Reply::Dump(d) => self.state.lock().dump = Some(d),
+            // The answer is made and queued under the lock: two senders at
+            // once cannot both start a dump, nor both take the same room.
+            {
+                let mut st = self.state.lock();
+                let (cap_ack, dumping, room) = (st.options & (1 << NETLINK_CAP_ACK) != 0, st.dump.is_some(), (st.rcvbuf as usize).saturating_sub(st.queued));
+                let (replies, overrun) = netlink::answer(&data, port, &interfaces, cap_ack, dumping, room);
+                let mut added = false;
+                for r in replies {
+                    match r {
+                        netlink::Reply::Datagram(d) => {
+                            st.queued += d.len();
+                            st.queue.push_back(Datagram { from: 0, data: d });
+                            added = true;
+                        }
+                        netlink::Reply::Dump(d) => st.dump = Some(d),
+                    }
+                }
+                if overrun {
+                    Self::overrun(&mut st);
+                }
+                if added {
+                    self.changed(&mut st, true);
                 }
             }
-            if overrun {
-                Self::overrun(&mut self.state.lock());
-            }
-            self.deliver(0, datagrams);
             self.fill_dump(&interfaces);
         } else {
             let peer = PORTS.lock().get(&to).and_then(Weak::upgrade).ok_or(ECONNREFUSED)?;

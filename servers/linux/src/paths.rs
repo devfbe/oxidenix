@@ -383,8 +383,8 @@ fn renameat(odirfd: u64, oaddr: u64, ndirfd: u64, naddr: u64) -> Result<i64, i64
             let (m, gone) = datafs::rename(o, &oname, n, &nname)?;
             // An inode not cached here: the name finds it now.
             let m = m.or_else(|| inotify::active().then(|| datafs::lookup(n, &nname).ok().map(|i| i.ino)).flatten());
-            let is_dir = m.and_then(datafs::cached).is_some_and(|i| i.kind == vfs::S_IFDIR);
-            (m.map(|m| (inotify::Key::Data(m), is_dir)), gone.map(Gone::Data))
+            let moved = m.and_then(datafs::cached).map(|i| (inotify::Key::data(&i), i.kind == vfs::S_IFDIR));
+            (moved, gone.map(Gone::Data))
         }
         _ => return Err(EXDEV),
     };
@@ -413,11 +413,19 @@ impl Gone {
         }
     }
 
+    /// Its key (for /data: with its generation, if the server still has
+    /// it; else any watch of the number), and whether it is still open.
+    /// (SeqCst after the removal's store: see `TmpOpen`'s and `DataOpen`'s
+    /// drop.)
     fn key(&self) -> (inotify::Key, bool) {
-        use core::sync::atomic::Ordering::Acquire;
+        use core::sync::atomic::{fence, Ordering::SeqCst};
+        fence(SeqCst);
         match self {
-            Gone::Tmp(t) => (inotify::Key::tmp(t), t.opens.load(Acquire) > 0),
-            Gone::Data(ino) => (inotify::Key::Data(*ino), datafs::cached(*ino).is_some_and(|i| i.opens.load(Acquire) > 0)),
+            Gone::Tmp(t) => (inotify::Key::tmp(t), t.opens.load(SeqCst) > 0),
+            Gone::Data(ino) => match datafs::cached(*ino) {
+                Some(i) => (inotify::Key::data(&i), i.opens.load(SeqCst) > 0),
+                None => (inotify::Key::DataAny(*ino), false),
+            },
         }
     }
 

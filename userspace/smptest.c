@@ -157,6 +157,35 @@ static void nice_values(void) {
     printf("    nice -1 vs 0 on one CPU: %ld vs %ld ticks\n", a, b);
     check("nice -1 gets a little more than nice 0 (1.25x)", a > b && a * 4 < b * 6);
 
+    /* A loop that had a CPU to itself for seconds, then a second one
+     * there: they share it from the first second on (the newcomer is not
+     * placed at a stale smallest virtual runtime). */
+    pid_t lone = fork();
+    if (lone == 0) {
+        pin(0);
+        for (;;) work(1000000);
+    }
+    sleep(3);
+    pid_t late = fork();
+    if (late == 0) {
+        pin(0);
+        for (;;) work(1000000);
+    }
+    usleep(100 * 1000);
+    int fair = 1;
+    for (int w = 0; w < 2; w++) {
+        long l0 = proc_ticks(lone, NULL), n0 = proc_ticks(late, NULL);
+        usleep(1000 * 1000);
+        long l = proc_ticks(lone, NULL) - l0, n = proc_ticks(late, NULL) - n0;
+        printf("    second %d after a lone loop: %ld vs %ld ticks\n", w + 1, l, n);
+        fair &= l + n > 60 && l * 10 > (l + n) * 3 && n * 10 > (l + n) * 3;
+    }
+    kill(lone, SIGKILL);
+    kill(late, SIGKILL);
+    waitpid(lone, NULL, 0);
+    waitpid(late, NULL, 0);
+    check("a loop that ran alone for seconds shares at once", fair);
+
     /* A sleeper on a CPU a nice -20 loop holds wakes on time: the woken
      * task is owed CPU time and preempts the loop. */
     pid_t hog = fork();
@@ -168,7 +197,8 @@ static void nice_values(void) {
     pid_t sleeper = fork();
     if (sleeper == 0) {
         pin(0);
-        usleep(100 * 1000);
+        /* (A new task starts a slice behind: the loop catches up first.) */
+        usleep(500 * 1000);
         double worst = 0;
         for (int i = 0; i < 50; i++) {
             double t0 = now();
@@ -177,6 +207,7 @@ static void nice_values(void) {
             if (late > worst) worst = late;
         }
         printf("    worst wakeup lateness next to a nice -20 loop: %.1f ms\n", worst * 1000);
+        fflush(stdout);
         _exit(worst < 0.004 ? 0 : 1);
     }
     st = 0;

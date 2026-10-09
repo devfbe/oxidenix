@@ -47,7 +47,9 @@ impl Drop for DataOpen {
             datafs::put_write(&self.inode);
         }
         // An unlinked file's last close: it goes.
-        if self.inode.opens.fetch_sub(1, core::sync::atomic::Ordering::AcqRel) == 1 && self.inode.unlinked() {
+        // (SeqCst, as the unlink's store of `unlinked` and load of `opens`:
+        // one of the two sees the other, the inode's going is never missed.)
+        if self.inode.opens.fetch_sub(1, core::sync::atomic::Ordering::SeqCst) == 1 && self.inode.unlinked() {
             inotify::deleted(inotify::Key::data(&self.inode), self.inode.kind == vfs::S_IFDIR);
         }
         datafs::let_go(&self.inode);

@@ -206,11 +206,10 @@ pub fn disarm_alarm(group: &ThreadGroup) {
 
 /// The local APIC timer interrupt: runs what is due, the scheduler tick
 /// if it is due, and programs the next interrupt. Returns whether the
-/// interrupted user task should give up the CPU (its time slice ended, or
-/// a task woke up to run here).
+/// interrupted user task should give up the CPU (its time slice ended; a
+/// task woken that is owed time asks for the switch itself).
 pub fn interrupt(from_user: bool) -> bool {
     let cpu = smp::cpu();
-    let mut woke = false;
     // Only what is due now: entries armed while this runs wait for the
     // next interrupt.
     let now = time::now();
@@ -226,7 +225,7 @@ pub fn interrupt(from_user: bool) -> bool {
             break;
         }
         for entry in due {
-            woke |= expire(entry);
+            expire(entry);
         }
     }
     let now = time::now();
@@ -243,9 +242,11 @@ pub fn interrupt(from_user: bool) -> bool {
     let next = q.heap.peek().map_or(q.next_tick, |e| e.deadline.min(q.next_tick)).min(q.slice_end);
     program(&mut q, next);
     drop(q);
-    // The running task gives up the CPU when its time slice is over.
+    // The running task gives up the CPU when its time slice is over (a
+    // task woken here asks for the switch itself, `sched::enqueue`, if
+    // it is owed time).
     let over = tick && sched::tick(from_user);
-    over || slice_over || woke
+    over || (slice_over && sched::slice_end())
 }
 
 /// Runs an expired entry if it is still live. Returns whether it woke a

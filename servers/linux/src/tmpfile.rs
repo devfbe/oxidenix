@@ -41,7 +41,11 @@ impl Drop for TmpOpen {
             self.inode.put_write();
         }
         // A removed file's last close: it goes.
-        if self.inode.opens.fetch_sub(1, core::sync::atomic::Ordering::AcqRel) == 1 && self.inode.removed() {
+        // (SeqCst with a fence before `removed`'s lock, as the removal's
+        // store and load of `opens`: one of the two sees the other.)
+        let last = self.inode.opens.fetch_sub(1, core::sync::atomic::Ordering::SeqCst) == 1;
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        if last && self.inode.removed() {
             inotify::deleted(inotify::Key::tmp(&self.inode), self.inode.is_dir());
         }
     }

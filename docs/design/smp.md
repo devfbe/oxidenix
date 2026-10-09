@@ -77,7 +77,12 @@ A process (`Task`, shared as `Arc<Task>`) splits into:
   value (Linux's); the smallest virtual runtime runs; slices are weighted shares of a 12 ms
   period (at least 1.5 ms), ended by a precise timer deadline; a woken or new thread owed
   time preempts at once (IPI to its CPU); sleepers get at most half a period of credit.
-  Virtual runtimes are rebased between CPUs' minimums when threads move.
+  Virtual runtimes are rebased between CPUs' minimums when threads move (a stolen thread
+  relative to its old CPU's minimum, read under that queue's lock); each tick brings the
+  running thread's virtual runtime and the CPU's minimum up to date; a new thread starts a
+  slice after the minimum; comparisons are wrap-safe. A Linux thread that holds one of the
+  Linux server's locks runs with nice −20's weight and goes to the front when preempted or
+  woken holding it (priority inversion; docs/design/linux-server.md).
 - `on_cpu` marks a task whose kernel stack is still in use. A CPU never picks a task whose
   `on_cpu` is still set (a CPU queues its current task before it switches away): it leaves it
   in its queue for a later schedule. Waiting for it with interrupts off could close a cycle,

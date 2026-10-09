@@ -17,6 +17,8 @@
 #include <sys/time.h>
 #include <time.h>
 #include <pthread.h>
+#include <sched.h>
+#include <sys/resource.h>
 #include <setjmp.h>
 #include <signal.h>
 #include <stdint.h>
@@ -136,6 +138,57 @@ static long held_records(void) {
         held = syscall(TEST_FS_RECORDS, 0);
     }
     return held;
+}
+
+static void pin(int cpu) {
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(cpu, &set);
+    sched_setaffinity(0, sizeof set, &set);
+}
+
+/* A nice 19 thread that takes a server lock again and again on a CPU a
+ * nice -20 loop holds: a thread of the instance on another CPU that needs
+ * the lock never waits long for it (the holder runs with nice -20's weight
+ * while it holds it, so it is not stuck behind the loop). */
+static void priority_inversion(void) {
+    pid_t hog = fork();
+    if (hog == 0) {
+        pin(0);
+        setpriority(PRIO_PROCESS, 0, -20);
+        for (volatile unsigned long x = 0;; x++) {
+        }
+    }
+    pid_t holder = fork();
+    if (holder == 0) {
+        pin(0);
+        setpriority(PRIO_PROCESS, 0, 19);
+        for (;;) syscall(TEST_LOCKED_ADD, 1000);
+    }
+    pin(1);
+    usleep(200 * 1000);
+    struct timespec t0, t1, start;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    double worst = 0;
+    int n = 0;
+    do {
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        syscall(TEST_LOCKED_ADD, 1);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        double d = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
+        if (d > worst) worst = d;
+        n++;
+    } while ((t1.tv_sec - start.tv_sec) + (t1.tv_nsec - start.tv_nsec) / 1e9 < 1.5);
+    kill(hog, SIGKILL);
+    kill(holder, SIGKILL);
+    waitpid(hog, NULL, 0);
+    waitpid(holder, NULL, 0);
+    cpu_set_t all;
+    CPU_ZERO(&all);
+    for (int c = 0; c < 64; c++) CPU_SET(c, &all);
+    sched_setaffinity(0, sizeof all, &all);
+    printf("    (%d lock takes, the slowest %.1f ms)\n", n, worst * 1000);
+    check("a nice 19 lock holder next to a nice -20 loop does not hold others up", worst < 0.2);
 }
 
 int main(int argc, char **argv) {
@@ -571,6 +624,7 @@ int main(int argc, char **argv) {
         if (r != 0) printf("    (scenario %d: check %d failed)\n", i + 1, errno);
         check(cached_scenarios[i], r == 0);
     }
+    if (argc == 1) priority_inversion();
     printf("lxtest: %s\n", failures ? "FAILED" : "all passed");
     return failures != 0;
 }
