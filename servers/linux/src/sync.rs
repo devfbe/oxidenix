@@ -9,12 +9,15 @@
 //! its bucket lock before sleeping, so no wakeup is lost. Acquire on lock
 //! and Release on unlock order the protected data.
 //!
-//! Waits are not interruptible by the program's signals, nor ended by the
-//! thread's death (`FUTEX_LOCK`): the server holds these locks for short,
-//! bounded work (like a kernel's spinlocks, never across a copy of program
-//! memory or a page wait), and a dying thread still runs server code that
-//! takes them (`process::exit_killed` lets go of its descriptor table and
-//! ends the thread). So a dying thread sleeps for a lock as any other.
+//! Waits are not interruptible by the program's signals, nor at once ended
+//! by the thread's death (`FUTEX_LOCK`): the server holds these locks for
+//! short, bounded work (like a kernel's spinlocks, never across a copy of
+//! program memory or a page wait), and a dying thread still runs server
+//! code that takes them (`process::exit_killed` lets go of its descriptor
+//! table and ends the thread). So a dying thread sleeps for a lock as any
+//! other, for at most a second (the kernel's grace): a holder that does not
+//! let go by then is wedged, and the dying thread ends where it is
+//! (`abandon`) rather than wait on.
 //!
 //! Priority: the server runs on its programs' threads, with their nice
 //! values. A low-priority thread preempted while it holds a lock would
@@ -72,6 +75,18 @@ fn unhold() {
     h.store(h.load(Ordering::Relaxed).wrapping_sub(1), Ordering::Relaxed);
 }
 
+const EINTR: i64 = 4;
+
+/// A dying thread waited a second for a lock whose holder does not let go: it ends here
+/// (the kernel lets go of what it holds; its descriptor table goes on the worker).
+#[cold]
+fn abandon() -> ! {
+    let msg = "[linux] a dying thread gave up a server lock its holder did not let go of\n";
+    syscall(restricted::SYS_SERVER_LOG, [msg.as_ptr() as u64, msg.len() as u64, 0, 0, 0, 0]);
+    syscall(restricted::SYS_THREAD_EXIT, [9, 0, 0, 0, 0, 0]);
+    unreachable!("thread_exit returned")
+}
+
 pub struct Mutex<T> {
     state: AtomicU32,
     data: UnsafeCell<T>,
@@ -90,7 +105,9 @@ impl<T> Mutex<T> {
         if self.state.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_err() {
             while self.state.swap(2, Ordering::Acquire) != 0 {
                 let addr = &self.state as *const AtomicU32 as u64;
-                syscall(SYS_SERVER_FUTEX_WAIT, [addr, 2, 0, FUTEX_LOCK, 0, 0]);
+                if syscall(SYS_SERVER_FUTEX_WAIT, [addr, 2, 0, FUTEX_LOCK, 0, 0]) == -EINTR {
+                    abandon();
+                }
             }
         }
         hold();
@@ -186,7 +203,9 @@ impl RwLock {
 
     fn sleep(&self, seen: u32) {
         let addr = &self.changed as *const AtomicU32 as u64;
-        syscall(SYS_SERVER_FUTEX_WAIT, [addr, seen as u64, 0, FUTEX_LOCK, 0, 0]);
+        if syscall(SYS_SERVER_FUTEX_WAIT, [addr, seen as u64, 0, FUTEX_LOCK, 0, 0]) == -EINTR {
+            abandon();
+        }
     }
 
     fn advance(&self) {

@@ -1519,12 +1519,17 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             let ends = match flags {
                 0 => Ends::Dying,
                 FUTEX_INTERRUPTIBLE => Ends::Interrupted,
-                FUTEX_LOCK => Ends::Never,
+                FUTEX_LOCK => Ends::Lock,
                 _ => return Err(EINVAL),
             };
             let deadline = (deadline != 0).then_some(deadline);
             // A word of an object mapped into the region has the object's key.
+            // (A lock's wait only on the server's own memory: a word another
+            // party writes must never hold a dying thread.)
             if let Some((object, offset, word)) = instance.object_word(addr) {
+                if ends == Ends::Lock {
+                    return Err(EINVAL);
+                }
                 return super::futex::object_wait(&object, offset, word, val, deadline, ends);
             }
             let word = instance.word(addr)?;
