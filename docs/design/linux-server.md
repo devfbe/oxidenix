@@ -394,14 +394,15 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
      a channel names only its own sockets (its control blocks), so one instance can neither
      see nor touch another's. Port sharing never crosses instances where it could take
      traffic from one: another instance's bound or listening TCP socket conflicts whatever
-     both opted in to (its connections and TIME-WAIT ports follow Linux's rule), and a UDP
+     both opted in to (since the review: any port another instance holds), and a UDP
      port is shared by `SO_REUSEADDR` only within an instance (`netring::udp_port_conflict`;
      both rules are tested on the host). netd knows each channel's instance from the
      kernel's offer (`Offer::instance`, which no client can forge) and accounts per instance,
      whatever number of channels it opens (`netring::Budget`, charged before anything is
      allocated, given back to the instance charged, tested on the host): every resource
      (netd's socket memory: smoltcp's buffers and closing connections' leftovers; smoltcp
-     sockets; orphans; records of ports in TIME-WAIT) has a limit in all and keeps a
+     sockets, connections in TIME-WAIT among them; orphans; half-open connections) has a
+     limit in all and keeps a
      reserve for every instance with a channel, which others never cut into; beyond the
      reserves it goes to whoever asks first (one instance alone may use nearly all of it,
      n instances can each count on their reserve). `ENOBUFS` beyond (and a reset for a
@@ -422,8 +423,9 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
      (tcp_fin_timeout) or 100 s without progress (a zero window, a peer that stopped
      acknowledging); a connection attempt gives up after 127 s, unacknowledged data after
      924 s (Linux's SYN and data retries), reported as `ETIMEDOUT`. A connection in
-     TIME-WAIT keeps only its port's record (its buffers go; a late segment of it is
-     answered with a reset). Ports are never shared across instances (TCP: bound,
+     TIME-WAIT keeps its smoltcp socket, without buffers, until smoltcp's timer ends it: a
+     retransmitted FIN is answered with an ACK, and its port and 4-tuple stay taken however
+     many there are (no early reuse; they count among the instance's sockets). Ports are never shared across instances (TCP: bound,
      listening, connected, closing or in TIME-WAIT; UDP: bound), and a connect never takes a
      live, closing or TIME-WAIT 4-tuple (`EADDRNOTAVAIL`). Raw ICMP sockets see the host's
      ICMP packets as on Linux, but no instance sees another's: netd gives each instance's

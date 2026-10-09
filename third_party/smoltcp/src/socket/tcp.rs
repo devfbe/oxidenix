@@ -681,7 +681,9 @@ impl<'a> Socket<'a> {
     {
         let storage = storage.into();
         assert!(storage.len() <= 1 << 30, "receiving buffer too large, cannot exceed 1 GiB");
-        if storage.len() < self.rx_buffer.capacity() && (!self.assembler.is_empty() || storage.len() < self.announced_window()) {
+        // (After the peer's FIN no data comes: the window no longer counts.)
+        let window = if self.rx_fin_received { 0 } else { self.announced_window() };
+        if storage.len() < self.rx_buffer.capacity() && (!self.assembler.is_empty() || storage.len() < window) {
             return Err(storage);
         }
         self.rx_buffer.replace_storage(storage)
@@ -10242,6 +10244,25 @@ mod test {
             window_len: 58,
             ..RECV_TEMPL
         }));
+    }
+
+    /// After the peer's FIN nothing more comes: an empty receive buffer may
+    /// go entirely (TIME-WAIT keeps no buffers).
+    #[test]
+    fn test_oxidenix_rx_buffer_goes_after_fin() {
+        let mut s = socket_established_with_buffer_sizes(64, 64);
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Fin,
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::CloseWait);
+        assert_eq!(s.replace_rx_buffer(vec![]).ok().map(|b| b.len()), Some(64));
+        assert_eq!(s.replace_tx_buffer(vec![]).ok().map(|b| b.len()), Some(64));
     }
 
     /// A receive buffer smaller than the window announced before (as one

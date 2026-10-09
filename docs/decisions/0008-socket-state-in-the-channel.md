@@ -84,11 +84,10 @@ time) and so may anything on the network.
   echo identifiers are netd's on the wire (`netring::EchoIds`): an instance gets the replies
   to its own requests only, whatever identifier it picks, and the errors about its own ports.
 - **What an instance can deny another**: nothing below a reserve. Every shared resource
-  (buffer memory, smoltcp sockets, orphans, TIME-WAIT records, half-open connections) is a
+  (buffer memory, smoltcp sockets with those in TIME-WAIT, orphans, half-open connections) is a
   `netring::Budget` with a cap per instance and a reserve kept for every instance with a
   channel; channels are capped per instance and an idle one gives its slot up; the
-  ephemeral range is wider than what one instance can hold (its sockets and its share of
-  TIME-WAIT records). A flood from the network against one instance's listener spends that
+  ephemeral range is wider than what one instance can hold (its share of smoltcp sockets). A flood from the network against one instance's listener spends that
   instance's share of half-open connections.
 - **From the network**: every packet netd parses itself (ICMP for routing) is length-checked
   (tested over truncations and changed bytes on the host); SYNs cost a 4 KiB buffer until the

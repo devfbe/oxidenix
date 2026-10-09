@@ -422,8 +422,20 @@ static void datagram_semantics(void) {
     int first = connect(t1, (struct sockaddr *)&la, sizeof la) == 0;
     check("a second connection with the same 4-tuple: EADDRNOTAVAIL",
           shared && first && connect(t2, (struct sockaddr *)&la, sizeof la) == -1 && errno == EADDRNOTAVAIL);
+    /* The first closes first (it ends in TIME-WAIT): its 4-tuple stays
+     * taken for a while, as on Linux. */
+    int t1s = accept(l, NULL, NULL);
     close(t1);
+    char eof;
+    read(t1s, &eof, 1);
+    close(t1s);
+    usleep(100000);
     close(t2);
+    int t3 = socket(AF_INET, SOCK_STREAM, 0);
+    setsockopt(t3, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    check("... and in TIME-WAIT too: bound, but EADDRNOTAVAIL",
+          bind(t3, (struct sockaddr *)&ta, sizeof ta) == 0 && connect(t3, (struct sockaddr *)&la, sizeof la) == -1 && errno == EADDRNOTAVAIL);
+    close(t3);
 
     /* Linux's answers at the edges. */
     int fresh = socket(AF_INET, SOCK_STREAM, 0);
