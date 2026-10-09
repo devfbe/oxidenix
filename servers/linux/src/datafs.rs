@@ -381,8 +381,10 @@ struct Table {
     keys: BTreeMap<u64, alloc::sync::Weak<DInode>>,
     /// Inodes to look at for release (unlinked ones a user let go of).
     check: Vec<u32>,
-    /// Inodes whose last link went while their unlinker could not take `NAMES` (it died):
-    /// orphaned by the next `reap`.
+    /// Inodes whose last link went and that were not cached here then (`orphan`): released
+    /// in diskfs by the next `reap` under `NAMES` alone, unless a lookup that was under way
+    /// meanwhile cached one again (`found`: it is cached unlinked then, and goes as such).
+    /// Each entry is taken by exactly one of them: no inode is released twice.
     orphans: Vec<u32>,
     /// Dirty files (`EVENT_DIRTY`), by inode: since when.
     dirty: BTreeMap<u32, u64>,
@@ -520,10 +522,24 @@ fn found(ino: u64, mode: u64, generation: u64) -> Result<Arc<DInode>, i64> {
     let kind = mode as u32 & vfs::S_IFMT;
     let generation = generation as u32;
     let mut t = TABLE.lock();
+    // A lookup under way while its name went (`orphan`): cached unlinked, no longer an orphan.
+    let orphaned = match t.orphans.iter().position(|&o| o == ino) {
+        Some(at) => {
+            t.orphans.swap_remove(at);
+            true
+        }
+        None => false,
+    };
     match t.inodes.get(&ino) {
         Some(i) if !i.stale.load(Ordering::Relaxed) && i.generation == generation => {
             i.used.store(TICK.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
-            return Ok(i.clone());
+            let i = i.clone();
+            if orphaned {
+                i.unlinked.store(true, Ordering::SeqCst);
+                t.check.push(ino);
+                REAP.store(true, Ordering::Relaxed);
+            }
+            return Ok(i);
         }
         Some(i) => {
             // (Its key stays: its users may still fault on its object.)
@@ -543,7 +559,7 @@ fn found(ino: u64, mode: u64, generation: u64) -> Result<Arc<DInode>, i64> {
         writers: Mutex::new(0),
         wb: crate::sync::SleepLock::new(()),
         append: crate::sync::SleepLock::new(()),
-        unlinked: AtomicBool::new(false),
+        unlinked: AtomicBool::new(orphaned),
         stale: AtomicBool::new(false),
         unflushed: AtomicU64::new(0),
         readahead: Mutex::new((u64::MAX, 0)),
@@ -555,6 +571,10 @@ fn found(ino: u64, mode: u64, generation: u64) -> Result<Arc<DInode>, i64> {
         opens: AtomicUsize::new(0),
     });
     t.inodes.insert(ino, inode.clone());
+    if orphaned {
+        t.check.push(ino);
+        REAP.store(true, Ordering::Relaxed);
+    }
     if t.keys.len() > 2 * t.inodes.len() + 64 {
         t.keys.retain(|_, w| w.strong_count() > 0);
     }
@@ -654,11 +674,13 @@ pub fn unlink(dir: &Arc<DInode>, name: &str, dir_only: bool) -> Result<Option<u3
         let _names = NAMES.read()?;
         let r = c.call(Request::Unlink { dir: dir.ino, name: scratch.buf(0, name.len() as u64), is_dir: dir_only }.encode(0))?;
         status(&r)?;
+        // In the same step as the unlink (under `NAMES`): no gap in which anything else could
+        // release or cache it.
+        orphan(r.values[0]);
         r.values[0]
     };
     drop(scratch);
     relink((dir.ino, name), None);
-    orphaned(&c, gone);
     Ok(u32::try_from(gone).ok().filter(|&g| g != 0))
 }
 
@@ -678,40 +700,48 @@ pub fn rename(odir: &Arc<DInode>, oname: &str, ndir: &Arc<DInode>, nname: &str) 
         let (old, new) = (scratch.buf(0, oname.len() as u64), scratch.buf(oname.len() as u64, nname.len() as u64));
         let r = c.call(Request::Rename { from: odir.ino, name: old, to: ndir.ino, new_name: new }.encode(0))?;
         status(&r)?;
+        orphan(r.values[0]);
         r.values[0]
     };
     drop(scratch);
     let moved = relink((odir.ino, oname), Some((ndir, nname)));
-    orphaned(&c, gone);
     Ok((moved, u32::try_from(gone).ok().filter(|&g| g != 0)))
 }
 
-/// An unlink or rename took the last link of `ino` (0: none): the server
-/// holds it now; it goes once nothing uses it.
-fn orphaned(c: &Client, ino: u64) {
+/// An unlink or rename took the last link of `ino` (0: none), its caller still holding
+/// `NAMES`: the server holds the inode now; it goes once nothing uses it. Cached here: marked
+/// unlinked (it goes when its users let go, `evict`). Else: an orphan for the next `reap`
+/// (whose release needs `NAMES` alone: a lookup under way may still return it).
+fn orphan(ino: u64) {
     let Ok(ino) = u32::try_from(ino) else { return };
     if ino == 0 {
         return;
     }
-    // (A thread that dies before it gets the names leaves the orphan to the next `reap`.)
-    let Ok(_names) = NAMES.write() else {
-        TABLE.lock().orphans.push(ino);
-        REAP.store(true, Ordering::Relaxed);
-        return;
-    };
     let mut t = TABLE.lock();
     match t.inodes.get(&ino) {
         Some(i) => {
             i.unlinked.store(true, Ordering::SeqCst);
             t.check.push(ino);
-            REAP.store(true, Ordering::Relaxed);
         }
-        None => {
-            drop(t);
-            // Not in use here: released at once (a lookup cannot return it:
-            // it has no name).
-            let _ = c.call(Request::Release { ino }.encode(0));
-        }
+        None => t.orphans.push(ino),
+    }
+    REAP.store(true, Ordering::Relaxed);
+}
+
+/// The orphans not cached again meanwhile are released in diskfs (`reap`; with `NAMES`
+/// alone, so no lookup returns one meanwhile). A thread that cannot (it dies, or diskfs is
+/// away) leaves them to a later `reap`.
+fn release_orphans() {
+    if TABLE.lock().orphans.is_empty() {
+        return;
+    }
+    let (Ok(c), Ok(_names)) = (client(), NAMES.write()) else {
+        REAP.store(true, Ordering::Relaxed);
+        return;
+    };
+    let orphans = core::mem::take(&mut TABLE.lock().orphans);
+    for ino in orphans {
+        let _ = c.call(Request::Release { ino }.encode(0));
     }
 }
 
@@ -1617,16 +1647,7 @@ pub fn reap() {
     if !REAP.swap(false, Ordering::AcqRel) {
         return;
     }
-    let orphans = core::mem::take(&mut TABLE.lock().orphans);
-    for ino in orphans {
-        match client() {
-            Ok(c) => orphaned(&c, ino as u64),
-            Err(_) => {
-                TABLE.lock().orphans.push(ino);
-                REAP.store(true, Ordering::Relaxed);
-            }
-        }
-    }
+    release_orphans();
     let victims: Vec<u32> = {
         let mut t = TABLE.lock();
         let mut victims: Vec<u32> = core::mem::take(&mut t.check);
