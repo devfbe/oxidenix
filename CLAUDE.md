@@ -39,7 +39,9 @@ An AI research project; see README.md.
   parts of the Linux server's namespace (paths, cpio) on the host, `cargo test -p slab` the
   size-class allocator of the kernel's and the server's heaps, `cargo test --release -p ring`
   the I/O ring's invariants (with threads; release for realistic interleavings), `cargo test
-  -p fsring` the file protocol's encodings and validation (Linux server <-> diskfs).
+  -p fsring` the file protocol's encodings and validation (Linux server <-> diskfs), `cargo
+  test -p netlink` rtnetlink's messages (the Linux server's netlink sockets), `cargo test -p
+  netproto` the interface records netd describes.
 - QEMU must always run with a visible window; never use `-display none`.
 - The image boots via UEFI (OVMF from nixpkgs) by default; `OXIDENIX_FIRMWARE=bios` builds and
   boots a BIOS image instead. CI runs the self-tests with both.
@@ -70,7 +72,9 @@ An AI research project; see README.md.
     sched → sockets → pass-through), `namespace.rs`/`paths.rs` (paths, mounts),
     `tmpfs.rs`/`tmpfile.rs` (root fs), `datafs.rs`/`datafile.rs`/`fsclient.rs` (`/data` and its
     page cache over the I/O rings), `unix.rs`/`sockcalls.rs`/`scm.rs` (`AF_UNIX` sockets,
-    descriptor passing).
+    descriptor passing), `netdev.rs`/`netlink.rs` + `crates/netlink` (interfaces,
+    `NETLINK_ROUTE`), `inotify.rs`.
+  - Node.js: `userspace/node` (build, smoke tests `tests/*.test.mjs`, runner `run-node.sh`).
   - Memory: `kernel/src/memory/`, `kernel/src/process/address_space.rs`, page cache
     `kernel/src/fs/cache.rs`.
   - Other servers and their protocols: `servers/diskfs` + `crates/fsring` + `crates/ext2fs`,

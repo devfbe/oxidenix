@@ -130,6 +130,22 @@ objects and mappings), `sched.rs`, `task.rs` (threads), `futex.rs`, `ipc.rs`, `i
 `tlb.rs`, `memory/`, `interrupts/`, `smp.rs`, timers, time, drivers for console and keyboard
 input, PCI and ACPI.
 
+### Priority and the server's locks
+
+The server runs on its programs' threads, so with their nice values, and its locks
+(`servers/linux/src/sync.rs`, futexes on its memory) are held in preemptible user mode. A
+low-priority thread preempted while it holds a lock would make every thread of the
+instance that needs the lock wait as long as the low-priority thread waits for the CPU
+(priority inversion: seconds for nice 19 next to a nice −20 loop). The server counts the
+locks each thread holds in a word of the thread's State page
+(`restricted::SERVER_LOCKS_OFFSET`); the scheduler, which knows each Linux thread's page,
+gives a thread holding one the weight of nice −20 (its time with the lock counts at that
+weight) and puts it at the front of its CPU's virtual time when it is preempted or wakes
+holding one. A holder thus comes back as soon as the most favored program would, and a
+program gains no more than that by its calls. A full priority inheritance (waiters lending
+their weight to the owner) needs the owner's identity in every lock word and is not needed
+while the boost bounds the wait.
+
 ### The page cache and the I/O paths
 
 The page cache moves with the VFS into the server. Each cached file is a memory object whose
@@ -283,6 +299,11 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
      `SCM_CREDENTIALS` may name only a process of the caller's tree (`thread_exists` with
      `THREAD_IN_INSTANCE`). When the descriptor table moves into the server (R6e), the
      handles become references in the server's own table and these calls go.
+   - **Netlink** (`NETLINK_ROUTE`): the server's files too (`netlink.rs`, messages in
+     `crates/netlink`), answered from netd's description of its interfaces (`netproto`'s
+     `Links`), which the kernel relays meanwhile (`net_links`, 1094), as it answers `fstat`
+     of its own descriptors for the server's `statx` (`kfd_stat`, 1093) until the descriptor
+     table moves (R6e). Both bridges go then.
 8. **R8 — Processes and signals**: pids, the process tree, `fork` (with the copy-on-write clone
    of memory objects), `exec`, `wait`, signals, job control, `/proc`'s data. The kernel's
    process model shrinks to processes and threads as containers. `thread_exists` (1090), with

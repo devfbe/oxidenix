@@ -219,11 +219,6 @@ pub fn close(fd: u64) -> SysResult {
     old.ok_or(EBADF).map(|_| 0)
 }
 
-fn write_stat(buf: u64, ino: u64, mode: u32, size: u64, extra: (u64, u64, u64, u64)) -> SysResult {
-    uaccess::write(buf, stat_bytes(ino, mode, size, extra))?;
-    Ok(0)
-}
-
 /// A `struct stat` as Linux lays it out.
 fn stat_bytes(ino: u64, mode: u32, size: u64, extra: (u64, u64, u64, u64)) -> [u8; 144] {
     let (nlink, atime, mtime, ctime) = extra;
@@ -252,13 +247,20 @@ fn stat_inode(inode: &Inode, buf: u64) -> SysResult {
 }
 
 pub fn fstat(fd: u64, buf: u64) -> SysResult {
+    uaccess::write(buf, fstat_bytes(fd)?)?;
+    Ok(0)
+}
+
+/// The `struct stat` of descriptor `fd` (fstat's answer).
+pub fn fstat_bytes(fd: u64) -> Result<[u8; 144], i64> {
     let f = file(fd)?;
+    let anon = |mode: u32| Ok(stat_bytes(f.number, mode, 0, (1, 0, 0, 0)));
     match f.inode() {
-        Some(inode) => stat_inode(inode, buf),
-        None if f.socket().is_some() => write_stat(buf, Arc::as_ptr(&f) as u64, S_IFSOCK | 0o777, 0, (1, 0, 0, 0)),
+        Some(inode) => inode_stat(inode),
+        None if f.socket().is_some() => anon(S_IFSOCK | 0o777),
         // An anonymous inode, as on Linux: no file type.
-        None if matches!(f.kind, Kind::EventFd(_) | Kind::Epoll(_)) => write_stat(buf, Arc::as_ptr(&f) as u64, 0o600, 0, (1, 0, 0, 0)),
-        None => write_stat(buf, Arc::as_ptr(&f) as u64, S_IFIFO | 0o600, 0, (1, 0, 0, 0)),
+        None if matches!(f.kind, Kind::EventFd(_) | Kind::Epoll(_)) => anon(0o600),
+        None => anon(S_IFIFO | 0o600),
     }
 }
 

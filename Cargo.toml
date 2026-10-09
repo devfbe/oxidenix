@@ -1,5 +1,5 @@
 [workspace]
-members = ["kernel", "builder", "crates/fsproto", "crates/ext2fs", "crates/oxrt", "crates/netproto", "crates/procproto", "crates/virtio", "crates/restricted", "crates/vfs", "crates/slab", "crates/ring", "crates/fsring", "servers/linux", "servers/diskfs", "servers/netd", "servers/procfs", "servers/ringtest"]
+members = ["kernel", "builder", "crates/fsproto", "crates/ext2fs", "crates/oxrt", "crates/netproto", "crates/procproto", "crates/virtio", "crates/restricted", "crates/vfs", "crates/slab", "crates/ring", "crates/fsring", "crates/netlink", "servers/linux", "servers/diskfs", "servers/netd", "servers/procfs", "servers/ringtest"]
 resolver = "2"
 
 [profile.dev]

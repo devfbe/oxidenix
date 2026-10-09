@@ -31,7 +31,7 @@ use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
-use core::sync::atomic::{fence, AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64, Ordering};
 use x86_64::instructions::interrupts;
 use x86_64::registers::model_specific::FsBase;
 use x86_64::VirtAddr;
@@ -140,6 +140,19 @@ pub struct CpuSched {
     /// space (its time slice ended, or a task woke up here while the CPU
     /// was in the kernel, which is not preempted).
     need_resched: AtomicBool,
+    /// Fair scheduling: the smallest virtual runtime of this CPU's tasks
+    /// so far (it only grows); the running task's virtual runtime, weight
+    /// and whether it is the idle task, as of `curr_since`; when its time
+    /// slice began.
+    min_vruntime: AtomicU64,
+    curr_vruntime: AtomicU64,
+    curr_weight: AtomicU32,
+    curr_since: AtomicU64,
+    curr_idle: AtomicBool,
+    /// The sequence count that makes the curr_* fields one value for
+    /// readers on other CPUs (odd while they change).
+    curr_seq: AtomicU32,
+    slice_start: AtomicU64,
     /// Timer ticks spent in user mode, in the kernel and idling, and
     /// context switches.
     pub user_ticks: AtomicU64,
@@ -157,6 +170,13 @@ impl CpuSched {
             idle: UnsafeCell::new(None),
             halted: AtomicBool::new(false),
             need_resched: AtomicBool::new(false),
+            min_vruntime: AtomicU64::new(0),
+            curr_vruntime: AtomicU64::new(0),
+            curr_weight: AtomicU32::new(DEFAULT_WEIGHT),
+            curr_since: AtomicU64::new(0),
+            curr_idle: AtomicBool::new(true),
+            curr_seq: AtomicU32::new(0),
+            slice_start: AtomicU64::new(0),
             user_ticks: AtomicU64::new(0),
             system_ticks: AtomicU64::new(0),
             idle_ticks: AtomicU64::new(0),
@@ -186,6 +206,8 @@ pub fn set_initial(task: Arc<Task>, idle: Arc<Task>) {
     task.set_state(State::Running);
     task.last_cpu.store(smp::cpu().index, Ordering::Relaxed);
     task.start_running(crate::time::now());
+    rebase(&task, smp::cpu());
+    set_curr(smp::cpu(), task.vruntime.load(Ordering::Relaxed), crate::time::now(), task_weight(&task), task.idle);
     unsafe {
         *cs.current.get() = Some(task);
         *cs.idle.get() = Some(idle);
@@ -205,8 +227,9 @@ fn claim(cpu: &Cpu) -> bool {
 /// Puts a runnable task into the run queue of a CPU it may run on: an idle
 /// one if there is one (preferring the task's last CPU, and claiming it so
 /// that concurrent wakeups spread out), else its last CPU's, else the first
-/// allowed.
-fn enqueue(task: Arc<Task>) {
+/// allowed. A woken or new task that is owed time (its virtual runtime
+/// a wakeup granularity behind the running task's) preempts it.
+fn enqueue(task: Arc<Task>, how: Arrival) {
     let last = task.last_cpu.load(Ordering::Relaxed);
     let allowed = |c: &&Cpu| task.may_run_on(c.index);
     let cpus = || (0..smp::MAX_CPUS).filter_map(smp::by_index);
@@ -217,11 +240,23 @@ fn enqueue(task: Arc<Task>) {
         .or_else(|| smp::by_index(last).filter(allowed))
         .or_else(|| cpus().find(allowed))
         .unwrap_or_else(smp::cpu);
+    rebase(&task, target);
+    if how == Arrival::Wake {
+        let floor = target.sched.min_vruntime.load(Ordering::Relaxed).wrapping_sub(LATENCY / 2);
+        task.vruntime.store(vmax(task.vruntime.load(Ordering::Relaxed), floor), Ordering::Relaxed);
+    }
+    front_if_holding(&task, target);
+    let owed = vtime(WAKEUP_GRANULARITY, task_weight(&task));
+    let v = task.vruntime.load(Ordering::Relaxed);
     target.sched.rq.lock().push_back(task);
     // Pairs with the fence in `idle_loop`: either the idle CPU sees the
     // task, or we see it halted and wake it.
     fence(Ordering::SeqCst);
-    let wake = claimed.is_some() || claim(target);
+    let mut wake = claimed.is_some() || claim(target);
+    if !wake && how != Arrival::Move && curr_state(target, crate::time::now()).is_some_and(|cv| vbefore(v.wrapping_add(owed), cv)) {
+        target.sched.need_resched.store(true, Ordering::Relaxed);
+        wake = true;
+    }
     if wake && target.index != smp::cpu().index {
         crate::interrupts::apic::ipi::send_vector(target.apic_id(), crate::interrupts::apic::ipi::RESCHEDULE_VECTOR);
     }
@@ -243,20 +278,277 @@ fn pick_next(cpu: &Cpu) -> Option<Arc<Task>> {
     loop {
         let t = {
             let mut rq = cpu.sched.rq.lock();
-            let i = rq.iter().position(|t| !t.may_run_on(cpu.index) || switched_out(t));
+            // A task that may not run here first (it moves on), else the
+            // one with the smallest virtual runtime (the first of equals).
+            let min = cpu.sched.min_vruntime.load(Ordering::Relaxed);
+            let i = rq
+                .iter()
+                .position(|t| !t.may_run_on(cpu.index))
+                .or_else(|| {
+                    rq.iter()
+                        .enumerate()
+                        .filter(|(_, t)| switched_out(t))
+                        .min_by_key(|(_, t)| t.vruntime.load(Ordering::Relaxed).wrapping_sub(min) as i64)
+                        .map(|(i, _)| i)
+                });
             i.and_then(|i| rq.remove(i))
         };
         match t {
             Some(t) if t.may_run_on(cpu.index) => return Some(t),
-            Some(t) => enqueue(t),
+            Some(t) => enqueue(t, Arrival::Move),
             None => break,
         }
     }
-    (0..smp::MAX_CPUS).filter(|&i| i != cpu.index).filter_map(smp::by_index).find_map(|other| {
+    // Stealing takes the most owed task another CPU has (the smallest
+    // virtual runtime), placed as far from this CPU's smallest as it was
+    // from its own (taken under that queue's lock).
+    let stolen = (0..smp::MAX_CPUS).filter(|&i| i != cpu.index).filter_map(smp::by_index).find_map(|other| {
         let mut rq = other.sched.rq.lock();
-        let i = rq.iter().rposition(|t| t.may_run_on(cpu.index) && !t.on_cpu.load(Ordering::Acquire))?;
-        rq.remove(i)
+        let omin = other.sched.min_vruntime.load(Ordering::Relaxed);
+        let i = rq
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.may_run_on(cpu.index) && !t.on_cpu.load(Ordering::Acquire))
+            .min_by_key(|(_, t)| t.vruntime.load(Ordering::Relaxed).wrapping_sub(omin) as i64)
+            .map(|(i, _)| i)?;
+        let t = rq.remove(i)?;
+        let lag = if t.vcpu.load(Ordering::Relaxed) == other.index { t.vruntime.load(Ordering::Relaxed).wrapping_sub(omin) } else { 0 };
+        Some((t, lag))
+    });
+    stolen.map(|(t, lag)| {
+        t.vcpu.store(cpu.index, Ordering::Relaxed);
+        t.vruntime.store(cpu.sched.min_vruntime.load(Ordering::Relaxed).wrapping_add(lag), Ordering::Relaxed);
+        t
     })
+}
+
+/// The weight of each nice value, -20 to 19 (Linux's
+/// `sched_prio_to_weight`): each step is about 10% of CPU time.
+const WEIGHTS: [u32; 40] = [
+    88761, 71755, 56483, 46273, 36291, 29154, 23254, 18705, 14949, 11916, 9548, 7620, 6100, 4904, 3906, 3121, 2501, 1991, 1586, 1277,
+    1024, 820, 655, 526, 423, 335, 272, 215, 172, 137, 110, 87, 70, 56, 45, 36, 29, 23, 18, 15,
+];
+/// The weight of nice 0.
+const DEFAULT_WEIGHT: u32 = 1024;
+/// The period in which every runnable task of a CPU runs once (shared by
+/// weight), the shortest time slice, and how far a woken task must be
+/// behind the running one to preempt it (as Linux's sched_latency,
+/// min_granularity and wakeup_granularity on a few CPUs).
+const LATENCY: u64 = 12_000_000;
+const MIN_GRANULARITY: u64 = 1_500_000;
+const WAKEUP_GRANULARITY: u64 = 2_000_000;
+
+/// The scheduling weight of nice value `nice`.
+pub fn weight(nice: i8) -> u32 {
+    WEIGHTS[(nice.clamp(-20, 19) + 20) as usize]
+}
+
+fn task_weight(t: &Task) -> u32 {
+    weight(t.nice.load(Ordering::Relaxed))
+}
+
+/// The virtual time `ns` of running is for a task of weight `w`: the
+/// heavier the task, the slower its virtual time goes.
+fn vtime(ns: u64, w: u32) -> u64 {
+    (ns as u128 * DEFAULT_WEIGHT as u128 / w.max(1) as u128) as u64
+}
+
+/// The weight a task of the Linux server holding one of its locks runs
+/// with (that of nice -20; see `server_locks`).
+const BOOST_WEIGHT: u32 = WEIGHTS[0];
+
+/// How many of the Linux server's locks `t` holds now (0 for a task that
+/// is no Linux thread): the word the server keeps in the thread's State
+/// page (`restricted::SERVER_LOCKS_OFFSET`).
+fn server_locks(t: &Task) -> u32 {
+    locks_at(t.server_locks.load(Ordering::Relaxed))
+}
+
+fn locks_at(word: u64) -> u32 {
+    if word == 0 {
+        return 0;
+    }
+    // A word of the thread's State page, mapped while the task lives.
+    unsafe { (*(word as *const core::sync::atomic::AtomicU32)).load(Ordering::Relaxed) }
+}
+
+/// The weight `t` runs with: its nice value's, or `BOOST_WEIGHT` while it
+/// holds a server lock: then it gets the CPU as the most favored program
+/// does (and no more), so a low nice value cannot keep it in the lock
+/// while threads of its instance wait (priority inversion).
+fn effective_weight(t: &Task) -> u32 {
+    if server_locks(t) > 0 { BOOST_WEIGHT } else { task_weight(t) }
+}
+
+/// Wrap-safe order of virtual runtimes: whether `a` is before `b`.
+fn vbefore(a: u64, b: u64) -> bool {
+    (a.wrapping_sub(b) as i64) < 0
+}
+
+fn vmax(a: u64, b: u64) -> u64 {
+    if vbefore(a, b) { b } else { a }
+}
+
+fn vmin(a: u64, b: u64) -> u64 {
+    if vbefore(a, b) { a } else { b }
+}
+
+/// A task that leaves the CPU, or comes back to a queue, holding a server
+/// lock is placed at the front of the CPU's virtual time (at its smallest)
+/// so it runs again soon and lets go of the lock: the instance's threads
+/// may wait for it. (It gets no more than the most favored program would.)
+fn front_if_holding(t: &Task, cpu: &Cpu) {
+    if server_locks(t) > 0 {
+        let min = cpu.sched.min_vruntime.load(Ordering::Relaxed);
+        t.vruntime.store(vmin(t.vruntime.load(Ordering::Relaxed), min), Ordering::Relaxed);
+    }
+}
+
+/// The running task's virtual runtime on `cpu` at `now` (None: it idles),
+/// read consistently against the CPU updating it (a sequence count).
+fn curr_state(cpu: &Cpu, now: u64) -> Option<u64> {
+    let s = &cpu.sched;
+    loop {
+        let seq = s.curr_seq.load(Ordering::Acquire);
+        if seq & 1 == 1 {
+            core::hint::spin_loop();
+            continue;
+        }
+        let idle = s.curr_idle.load(Ordering::Relaxed);
+        let (v, since, w) = (s.curr_vruntime.load(Ordering::Relaxed), s.curr_since.load(Ordering::Relaxed), s.curr_weight.load(Ordering::Relaxed));
+        fence(Ordering::Acquire);
+        if s.curr_seq.load(Ordering::Relaxed) != seq {
+            continue;
+        }
+        if idle {
+            return None;
+        }
+        return Some(v.wrapping_add(vtime(now.saturating_sub(since), w)));
+    }
+}
+
+/// Writes the running task's state (its own CPU, interrupts off).
+fn set_curr(cpu: &Cpu, v: u64, since: u64, w: u32, idle: bool) {
+    let s = &cpu.sched;
+    s.curr_seq.fetch_add(1, Ordering::Relaxed);
+    fence(Ordering::Release);
+    s.curr_vruntime.store(v, Ordering::Relaxed);
+    s.curr_since.store(since, Ordering::Relaxed);
+    s.curr_weight.store(w, Ordering::Relaxed);
+    s.curr_idle.store(idle, Ordering::Relaxed);
+    s.curr_seq.fetch_add(1, Ordering::Release);
+}
+
+/// Puts `t`'s virtual runtime on `cpu`'s scale: what it was ahead of or
+/// behind its old CPU's smallest, it is of this one's; a new task starts a
+/// slice's worth after the smallest (as CFS's START_DEBIT: a fork loop
+/// gains nothing).
+fn rebase(t: &Task, cpu: &Cpu) {
+    let min = cpu.sched.min_vruntime.load(Ordering::Relaxed);
+    let from = t.vcpu.swap(cpu.index, Ordering::Relaxed);
+    let v = t.vruntime.load(Ordering::Relaxed);
+    let placed = match from {
+        usize::MAX => min.wrapping_add(vtime(MIN_GRANULARITY, task_weight(t))),
+        f if f == cpu.index => v,
+        f => {
+            let old = smp::by_index(f).map_or(min, |c| c.sched.min_vruntime.load(Ordering::Relaxed));
+            min.wrapping_add(v.wrapping_sub(old))
+        }
+    };
+    t.vruntime.store(placed, Ordering::Relaxed);
+}
+
+/// Brings the running task's virtual runtime and the CPU's smallest up to
+/// `now` (Linux's update_curr; every tick, slice end and schedule): what
+/// it ran since counts with the weight it had (a nice value or a server
+/// lock changes it from here on). Interrupts off, on its CPU.
+fn update_curr(cpu: &Cpu, cur: &Task, now: u64) {
+    let s = &cpu.sched;
+    if !cur.idle {
+        let since = s.curr_since.load(Ordering::Relaxed);
+        // Holding a server lock now: the time is counted as a holder's
+        // (the lock was taken since, as like as not).
+        let w = if server_locks(cur) > 0 { BOOST_WEIGHT } else { s.curr_weight.load(Ordering::Relaxed) };
+        let v = cur.vruntime.load(Ordering::Relaxed).wrapping_add(vtime(now.saturating_sub(since), w));
+        cur.vruntime.store(v, Ordering::Relaxed);
+        set_curr(cpu, v, now, effective_weight(cur), false);
+    }
+    update_min(cpu, cur);
+}
+
+/// Moves the CPU's smallest virtual runtime up to its tasks' (it never
+/// goes back: new and woken tasks are placed from it). Its own CPU only.
+fn update_min(cpu: &Cpu, cur: &Task) {
+    let queued = cpu
+        .sched
+        .rq
+        .lock()
+        .iter()
+        .filter(|t| t.vcpu.load(Ordering::Relaxed) == cpu.index)
+        .map(|t| t.vruntime.load(Ordering::Relaxed))
+        .reduce(|a, b| if vbefore(b, a) { b } else { a });
+    let running = (!cur.idle).then(|| cur.vruntime.load(Ordering::Relaxed));
+    let lowest = match (queued, running) {
+        (Some(a), Some(b)) => if vbefore(a, b) { a } else { b },
+        (Some(a), None) | (None, Some(a)) => a,
+        (None, None) => return,
+    };
+    let min = &cpu.sched.min_vruntime;
+    min.store(vmax(min.load(Ordering::Relaxed), lowest), Ordering::Relaxed);
+}
+
+/// The time slice of a task of weight `w` on `cpu`: its share of
+/// `LATENCY` among the tasks queued there, at least `MIN_GRANULARITY`;
+/// None while nothing else waits.
+fn slice(cpu: &Cpu, w: u32) -> Option<u64> {
+    let others: u64 = cpu.sched.rq.lock().iter().filter(|t| t.may_run_on(cpu.index)).map(|t| task_weight(t) as u64).sum();
+    if others == 0 {
+        return None;
+    }
+    Some((LATENCY * w as u64 / (w as u64 + others)).max(MIN_GRANULARITY))
+}
+
+/// `t` starts (or goes on) running on this CPU at `now`: its slice's end
+/// is programmed.
+fn start_slice(cpu: &Cpu, t: &Task, now: u64) {
+    let w = effective_weight(t);
+    set_curr(cpu, t.vruntime.load(Ordering::Relaxed), now, w, t.idle);
+    cpu.sched.slice_start.store(now, Ordering::Relaxed);
+    let end = if t.idle { None } else { slice(cpu, w) };
+    crate::timer::set_slice_end(end.map_or(u64::MAX, |d| now + d));
+}
+
+/// Whether the running task's time slice is over at `now` (after its
+/// virtual runtime was brought up to date): always for the idle task, else
+/// when it ran its share since others came (a slice that began alone has
+/// no end of its own: the tick asks).
+fn slice_over(cpu: &Cpu, cur: &Task, now: u64) -> bool {
+    if cur.idle {
+        return true;
+    }
+    let ran = now.saturating_sub(cpu.sched.slice_start.load(Ordering::Relaxed));
+    slice(cpu, effective_weight(cur)).is_some_and(|s| ran >= s)
+}
+
+/// The timer's slice end on this CPU: whether to switch.
+pub fn slice_end() -> bool {
+    let cpu = smp::cpu();
+    let cur = current();
+    let now = crate::time::now();
+    update_curr(cpu, cur, now);
+    slice_over(cpu, cur, now)
+}
+
+/// How a task comes into a run queue.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Arrival {
+    /// It woke up: it may preempt, and what it slept is credited up to
+    /// half a `LATENCY`.
+    Wake,
+    /// A new task: it may preempt.
+    New,
+    /// Moved between CPUs.
+    Move,
 }
 
 /// Time and switches of one CPU.
@@ -301,8 +593,17 @@ fn update_load(runnable: u64) {
     }
 }
 
+/// Whether this CPU has work: its own queue, or a task in another CPU's
+/// queue that may run here (`pick_next` steals it). Tasks only another
+/// CPU may run (pinned there) are not this CPU's work: counting them kept
+/// an idle CPU looping through `schedule` with interrupts off while a CPU
+/// it cannot help was busy, so its timers (sleeps ending) never fired.
 fn has_work(cpu: &Cpu) -> bool {
-    (0..smp::MAX_CPUS).filter_map(smp::by_index).any(|c| !c.sched.rq.lock().is_empty()) || !cpu.sched.rq.lock().is_empty()
+    !cpu.sched.rq.lock().is_empty()
+        || (0..smp::MAX_CPUS)
+            .filter(|&i| i != cpu.index)
+            .filter_map(smp::by_index)
+            .any(|c| c.sched.rq.lock().iter().any(|t| t.may_run_on(cpu.index)))
 }
 
 // ---------------------------------------------------------- wait queues
@@ -519,7 +820,7 @@ fn make_runnable(t: &Arc<Task>) -> bool {
     }
     t.set_state(State::Runnable);
     t.on_rq.store(true, Ordering::Release);
-    enqueue(t.clone());
+    enqueue(t.clone(), Arrival::Wake);
     true
 }
 
@@ -528,7 +829,7 @@ pub fn start(task: Arc<Task>) {
     task.on_rq.store(true, Ordering::Relaxed);
     task.set_state(State::Runnable);
     task.last_cpu.store(smp::cpu().index, Ordering::Relaxed);
-    enqueue(task);
+    enqueue(task, Arrival::New);
 }
 
 // ------------------------------------------------------------- switching
@@ -542,29 +843,34 @@ pub fn schedule() {
         let cs = &cpu.sched;
         cs.need_resched.store(false, Ordering::Relaxed);
         let cur = current();
+        let now = crate::time::now();
+        update_curr(cpu, cur, now);
         {
             let _w = cur.wake_lock.lock();
             match cur.state() {
                 State::Running if !cur.idle && cur.may_run_on(cpu.index) => {
+                    front_if_holding(cur, cpu);
                     cur.set_state(State::Runnable);
                     cs.rq.lock().push_back(current_arc());
                 }
                 // Its affinity excludes this CPU now: move it.
                 State::Running if !cur.idle => {
                     cur.set_state(State::Runnable);
-                    enqueue(current_arc());
+                    enqueue(current_arc(), Arrival::Move);
                 }
                 State::Running | State::Runnable => {}
                 // Sleeping, stopped or dead: leave the run queues.
                 _ => cur.on_rq.store(false, Ordering::Release),
             }
         }
+        update_min(cpu, cur);
         let next = match pick_next(cpu) {
             Some(next) => next,
             None => unsafe { (*cs.idle.get()).clone().expect("no idle task") },
         };
         if core::ptr::eq(&*next, cur) {
             cur.set_state(State::Running);
+            start_slice(cpu, cur, now);
             return;
         }
         context_switch(next);
@@ -614,6 +920,7 @@ fn context_switch(next: Arc<Task>) {
     let now = crate::time::now();
     prev.stop_running(now);
     next.start_running(now);
+    start_slice(cpu, &next, now);
     unsafe {
         let saved = prev.cpu_state();
         saved.fs_base = FsBase::read().as_u64();
@@ -797,10 +1104,17 @@ pub extern "C" fn idle_loop() -> ! {
 
 /// The scheduler tick (see `timer`), every 10 ms on every CPU; `user`
 /// tells whether it hit user code. It samples where time goes; the
-/// bootstrap CPU also updates the load average.
-pub fn tick(user: bool) {
+/// bootstrap CPU also updates the load average. Whether the running
+/// task's time slice is over (`slice`).
+pub fn tick(user: bool) -> bool {
     let cpu = smp::cpu();
     let cur = current();
+    // Whether the running task's time slice is over: the idle task's
+    // always; another's when it ran its share since others came (a slice
+    // that began with nothing else queued has no end of its own).
+    let now = crate::time::now();
+    update_curr(cpu, cur, now);
+    let over = slice_over(cpu, cur, now);
     let (cpu_counter, task_counter) = match (cur.idle, user) {
         (true, _) => (&cpu.sched.idle_ticks, None),
         (false, true) => (&cpu.sched.user_ticks, Some(&cur.utime)),
@@ -811,7 +1125,7 @@ pub fn tick(user: bool) {
         c.fetch_add(1, Ordering::Relaxed);
     }
     if cpu.index != 0 {
-        return;
+        return over;
     }
     let now = crate::time::now();
     if now >= NEXT_LOAD.load(Ordering::Relaxed) {
@@ -824,4 +1138,5 @@ pub fn tick(user: bool) {
             .count();
         update_load(runnable as u64);
     }
+    over
 }

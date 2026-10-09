@@ -141,6 +141,23 @@ int main(void) {
     /* A non-blocking accept with nothing pending. */
     fcntl(srv, F_SETFL, O_NONBLOCK);
     check("non-blocking accept fails with EAGAIN", accept(srv, NULL, NULL) < 0 && errno == EAGAIN);
+
+    /* The listener's port is in use, also for the wildcard address and
+     * with SO_REUSEADDR; bind(0) takes a port at once. */
+    int second = socket(AF_INET, SOCK_STREAM, 0);
+    setsockopt(second, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    errno = 0;
+    check("bind to a listener's port fails with EADDRINUSE", bind(second, (struct sockaddr *)&a, sizeof a) < 0 && errno == EADDRINUSE);
+    struct sockaddr_in any = addr("0.0.0.0", 8080);
+    errno = 0;
+    check("... also on the wildcard address", bind(second, (struct sockaddr *)&any, sizeof any) < 0 && errno == EADDRINUSE);
+    struct sockaddr_in zero = addr("127.0.0.1", 0), got;
+    socklen_t glen = sizeof got;
+    check("bind to port 0 takes a free port (getsockname)", bind(second, (struct sockaddr *)&zero, sizeof zero) == 0 &&
+                                                                getsockname(second, (struct sockaddr *)&got, &glen) == 0 && ntohs(got.sin_port) != 0);
+    errno = 0;
+    check("binding a bound socket again fails with EINVAL", bind(second, (struct sockaddr *)&zero, sizeof zero) < 0 && errno == EINVAL);
+    close(second);
     close(srv);
 
     /* Non-blocking connect, then poll for completion and read SO_ERROR. */

@@ -18,7 +18,7 @@ use crate::datafs::{self, DInode};
 use crate::sync::Mutex;
 use crate::syscall;
 use crate::tmpfs;
-use alloc::collections::VecDeque;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -51,6 +51,7 @@ impl KInode {
     fn stat(&self) -> Result<[u8; 144], i64> {
         let mut st = [0u8; 144];
         check(syscall(SYS_INODE_STAT, [self.0, st.as_mut_ptr() as u64, 0, 0, 0, 0]))?;
+        kernel_times(&mut st);
         Ok(st)
     }
 
@@ -65,6 +66,56 @@ impl KInode {
 impl Drop for KInode {
     fn drop(&mut self) {
         syscall(SYS_HANDLE_CLOSE, [self.0, 0, 0, 0, 0, 0]);
+    }
+}
+
+/// The times set on files of the kernel's tree (/dev, /proc, /sys), which
+/// keeps none that change: as Linux's devtmpfs, procfs and sysfs take
+/// utimensat, the server keeps them (atime, mtime, ctime) by device and
+/// inode number, for the instance's life, at most `KERNEL_TIMES_MAX` of
+/// them (the oldest set go first, as a pseudo file's inode would be
+/// evicted).
+struct KernelTimes {
+    times: BTreeMap<(u64, u64), [vfs::stat::Time; 3]>,
+    order: VecDeque<(u64, u64)>,
+}
+
+const KERNEL_TIMES_MAX: usize = 1024;
+
+static KERNEL_TIMES: Mutex<KernelTimes> = Mutex::new(KernelTimes { times: BTreeMap::new(), order: VecDeque::new() });
+
+/// Sets the times of the kernel's file whose `struct stat` is `st`.
+pub fn set_kernel_times(st: &[u8; 144], atime: vfs::stat::SetTime, mtime: vfs::stat::SetTime) {
+    if atime == vfs::stat::SetTime::Omit && mtime == vfs::stat::SetTime::Omit {
+        return;
+    }
+    let now = crate::time::realtime();
+    let current = vfs::stat::Stat::from_bytes(st);
+    let key = (current.dev, current.ino);
+    let mut k = KERNEL_TIMES.lock();
+    let mut t = k.times.get(&key).copied().unwrap_or([current.atime, current.mtime, current.ctime]);
+    if let Some(a) = atime.resolve(now) {
+        t[0] = a;
+    }
+    if let Some(m) = mtime.resolve(now) {
+        t[1] = m;
+    }
+    t[2] = now;
+    if k.times.insert(key, t).is_none() {
+        k.order.push_back(key);
+        if k.order.len() > KERNEL_TIMES_MAX {
+            if let Some(old) = k.order.pop_front() {
+                k.times.remove(&old);
+            }
+        }
+    }
+}
+
+/// Puts the times set here into a kernel file's `struct stat`.
+pub fn kernel_times(st: &mut [u8; 144]) {
+    let s = vfs::stat::Stat::from_bytes(st);
+    if let Some(t) = KERNEL_TIMES.lock().times.get(&(s.dev, s.ino)) {
+        *st = vfs::stat::Stat { atime: t[0], mtime: t[1], ctime: t[2], ..s }.to_bytes();
     }
 }
 
@@ -84,6 +135,15 @@ pub enum Node {
 }
 
 impl Node {
+    /// Its status, with the birth time where the filesystem has one
+    /// (statx).
+    pub fn status(&self) -> Result<vfs::stat::Stat, i64> {
+        match self {
+            Node::Tmp(t) => Ok(t.status()),
+            _ => self.stat().map(|st| vfs::stat::Stat::from_bytes(&st)),
+        }
+    }
+
     pub fn stat(&self) -> Result<[u8; 144], i64> {
         match self {
             Node::Kernel(k) => k.stat(),

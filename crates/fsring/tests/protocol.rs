@@ -28,6 +28,8 @@ fn every_request() -> Vec<Request> {
         Request::Release { ino: 99 },
         Request::Readlink { ino: 13, buf: buf(5, 8, 64) },
         Request::SetPerm { ino: 12, perm: 0o600 },
+        Request::SetTimes { ino: 12, atime: Some(1), mtime: None, ctime: None },
+        Request::SetTimes { ino: 12, atime: Some(0), mtime: Some(u32::MAX), ctime: Some(7) },
         Request::Statfs,
         Request::Forget { grant: 4095 },
         Request::Promise { ino: 12, offset: 1 << 40, len: MAX_TRANSFER as u64 },
@@ -53,7 +55,7 @@ fn only_reads_and_writes_are_concurrent() {
 
 #[test]
 fn unknown_operations_are_refused() {
-    for op in [0, 17, 99, u16::MAX] {
+    for op in [0, 18, 99, u16::MAX] {
         let d = Desc { op, ..Desc::default() };
         assert_eq!(Request::decode(&d), Err(ENOSYS));
     }
@@ -101,6 +103,16 @@ fn a_field_the_operation_does_not_use_must_be_zero() {
             assert_eq!(Request::decode(&d), Err(EINVAL), "{r:?} with {d:?}");
         }
     }
+}
+
+#[test]
+fn settimes_takes_known_times_in_32_bits() {
+    let set = |which: u64, arg: [u64; 3]| Request::decode(&Desc { op: op::SETTIMES, object: 12, offset: which, arg, ..Desc::default() });
+    assert_eq!(set(TIME_MTIME, [0, 5, 0]), Ok(Request::SetTimes { ino: 12, atime: None, mtime: Some(5), ctime: None }));
+    assert_eq!(set(8, [0, 0, 0]), Err(EINVAL));
+    assert_eq!(set(TIME_ATIME, [1 << 32, 0, 0]), Err(EINVAL));
+    assert_eq!(set(TIME_ATIME, [1, 1, 0]), Err(EINVAL), "a time not chosen must be 0");
+    assert_eq!(set(0, [0, 0, 0]), Ok(Request::SetTimes { ino: 12, atime: None, mtime: None, ctime: None }));
 }
 
 #[test]

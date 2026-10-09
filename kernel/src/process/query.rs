@@ -81,7 +81,8 @@ fn process(pid: Pid) -> Result<Process, i64> {
         start: g.start_ticks,
         pages: info.mem.as_ref().map_or(0, |m| m.pages.load(Ordering::Relaxed)),
         virt_pages: info.mem.as_ref().map_or(0, |m| m.virt_pages.load(Ordering::Relaxed)),
-        nice: info.nice as i64,
+        // The main thread's (nice values are per thread).
+        nice: info.threads.first().map_or(0, |t| t.nice.load(Ordering::Relaxed)) as i64,
         threads: info.threads.len() as u64,
         cpu: info.threads.first().map_or(0, |t| t.last_cpu.load(Ordering::Relaxed)) as u64,
         flags: 0,

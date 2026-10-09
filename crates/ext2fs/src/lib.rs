@@ -172,6 +172,13 @@ impl RawInode {
     pub fn mtime(&self) -> u32 {
         le32(&self.0, 16)
     }
+    fn set_times(&mut self, atime: Option<u32>, mtime: Option<u32>, ctime: Option<u32>) {
+        for (at, t) in [(8, atime), (16, mtime), (12, ctime)] {
+            if let Some(t) = t {
+                put32(&mut self.0, at, t);
+            }
+        }
+    }
     fn touch(&mut self, now: u32, atime: bool, mtime: bool) {
         if atime {
             put32(&mut self.0, 8, now);
@@ -1297,7 +1304,10 @@ impl<D: Device> State<D> {
                     put16(&mut block, e.pos + 4, used as u16);
                     write_entry(&mut block, e.pos + used, ino, e.rec_len - used, name, ftype);
                 }
-                return self.write_block(blk, &block);
+                self.write_block(blk, &block)?;
+                // A new name changes the directory (its mtime and ctime).
+                inode.touch(self.dev.now(), false, true);
+                return self.write_inode(dir, &inode);
             }
         }
         // No room: append a block holding just the new entry.
@@ -2063,6 +2073,14 @@ impl<D: Device> Ext2<D> {
         inode.set_mode((inode.mode() as u32 & S_IFMT | perm & 0o7777) as u16);
         let now = self.st.dev.now();
         inode.touch(now, false, false);
+        let result = self.st.write_inode(ino, &inode);
+        self.commit(result)
+    }
+
+    /// Sets the times given (seconds since 1970); the others stay.
+    pub fn set_times(&mut self, ino: u32, atime: Option<u32>, mtime: Option<u32>, ctime: Option<u32>) -> Result<(), i64> {
+        let mut inode = self.st.live_inode(ino)?;
+        inode.set_times(atime, mtime, ctime);
         let result = self.st.write_inode(ino, &inode);
         self.commit(result)
     }

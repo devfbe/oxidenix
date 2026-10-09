@@ -89,11 +89,14 @@ pub struct Queue {
     next_tick: u64,
     /// The deadline the local APIC is programmed for (u64::MAX: none).
     programmed: u64,
+    /// When the running task's time slice ends (u64::MAX: no end of its
+    /// own; see `sched::start_slice`).
+    slice_end: u64,
 }
 
 impl Queue {
     pub const fn new() -> Queue {
-        Queue { heap: BinaryHeap::new(), next_tick: 0, programmed: u64::MAX }
+        Queue { heap: BinaryHeap::new(), next_tick: 0, programmed: u64::MAX, slice_end: u64::MAX }
     }
 
     /// Adds an entry without allocating: a full queue first drops what is
@@ -162,6 +165,16 @@ fn queue(entry: Entry) {
     }
 }
 
+/// Sets when the running task's time slice ends on this CPU (u64::MAX:
+/// none); the interrupt then asks for a reschedule.
+pub fn set_slice_end(deadline: u64) {
+    let mut q = smp::cpu().timers.lock();
+    q.slice_end = deadline;
+    if deadline < q.programmed {
+        program(&mut q, deadline);
+    }
+}
+
 fn next_seq() -> u64 {
     NEXT_SEQ.fetch_add(1, Ordering::Relaxed)
 }
@@ -193,11 +206,10 @@ pub fn disarm_alarm(group: &ThreadGroup) {
 
 /// The local APIC timer interrupt: runs what is due, the scheduler tick
 /// if it is due, and programs the next interrupt. Returns whether the
-/// interrupted user task should give up the CPU (its time slice ended, or
-/// a task woke up to run here).
+/// interrupted user task should give up the CPU (its time slice ended; a
+/// task woken that is owed time asks for the switch itself).
 pub fn interrupt(from_user: bool) -> bool {
     let cpu = smp::cpu();
-    let mut woke = false;
     // Only what is due now: entries armed while this runs wait for the
     // next interrupt.
     let now = time::now();
@@ -213,7 +225,7 @@ pub fn interrupt(from_user: bool) -> bool {
             break;
         }
         for entry in due {
-            woke |= expire(entry);
+            expire(entry);
         }
     }
     let now = time::now();
@@ -223,13 +235,18 @@ pub fn interrupt(from_user: bool) -> bool {
         // Ticks missed while interrupts were off are not made up.
         q.next_tick = (q.next_tick + TICK_NS).max(now + TICK_NS / 2);
     }
-    let next = q.heap.peek().map_or(q.next_tick, |e| e.deadline.min(q.next_tick));
+    let slice_over = now >= q.slice_end;
+    if slice_over {
+        q.slice_end = u64::MAX;
+    }
+    let next = q.heap.peek().map_or(q.next_tick, |e| e.deadline.min(q.next_tick)).min(q.slice_end);
     program(&mut q, next);
     drop(q);
-    if tick {
-        sched::tick(from_user);
-    }
-    tick || woke
+    // The running task gives up the CPU when its time slice is over (a
+    // task woken here asks for the switch itself, `sched::enqueue`, if
+    // it is owed time).
+    let over = tick && sched::tick(from_user);
+    over || (slice_over && sched::slice_end())
 }
 
 /// Runs an expired entry if it is still live. Returns whether it woke a

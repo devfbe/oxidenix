@@ -4,8 +4,8 @@
 //! written and mapped without the kernel's VFS, and charged to the same
 //! tmpfs limit as the kernel's tmpfs.
 //!
-//! Locking: each inode has its own lock (its directory map, permissions
-//! and write count). Code holds one inode lock at a time, except under
+//! Locking: each inode has its own lock (its directory map, permissions,
+//! times and write count). Code holds one inode lock at a time, except under
 //! `RENAME` (as Linux's rename mutex), which renames and removals take
 //! first: a rename then locks both directories in address order and,
 //! nested, the inode it replaces; a removal locks the directory and,
@@ -33,8 +33,9 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use restricted::*;
+use vfs::stat::{SetTime, Stat, Times};
 
 pub const EEXIST: i64 = 17;
 pub const EISDIR: i64 = 21;
@@ -76,11 +77,16 @@ pub enum Kind {
 pub struct State {
     pub perm: u32,
     pub kind: Kind,
+    /// Its times, with nanoseconds and a birth time (statx).
+    pub times: Times,
     /// > 0: write accesses; < 0: programs running from it (see above).
     writers: i64,
-    /// A directory that was removed: nothing new goes into it (a lookup
-    /// may have found it just before).
+    /// Removed (its name went): nothing new goes into a directory (a
+    /// lookup may have found it just before).
     removed: bool,
+    /// The directory it is in (its inode number) and its name there: where
+    /// its inotify events about it go besides its own watches.
+    link: Option<(u64, String)>,
 }
 
 pub struct Inode {
@@ -89,6 +95,9 @@ pub struct Inode {
     /// Taken by O_APPEND writes: finding the end and writing there is one
     /// step for every appender.
     pub append: Mutex<()>,
+    /// Open file descriptions of it: a removed file's last close is when
+    /// it goes (inotify's IN_DELETE_SELF).
+    pub opens: AtomicUsize,
 }
 
 static NEXT_INO: AtomicU64 = AtomicU64::new(1);
@@ -102,7 +111,19 @@ pub fn new_root() -> Arc<Inode> {
 
 impl Inode {
     fn new(kind: Kind, perm: u32) -> Arc<Inode> {
-        Arc::new(Inode { ino: NEXT_INO.fetch_add(1, Ordering::Relaxed), state: Mutex::new(State { perm, kind, writers: 0, removed: false }), append: Mutex::new(()) })
+        let state = State { perm, kind, times: Times::new(now()), writers: 0, removed: false, link: None };
+        Arc::new(Inode { ino: NEXT_INO.fetch_add(1, Ordering::Relaxed), state: Mutex::new(state), append: Mutex::new(()), opens: AtomicUsize::new(0) })
+    }
+
+    /// The directory it is in and its name there (None: removed, or the
+    /// root).
+    pub fn link(&self) -> Option<(u64, String)> {
+        self.state.lock().link.clone()
+    }
+
+    /// Whether its name went.
+    pub fn removed(&self) -> bool {
+        self.state.lock().removed
     }
 
     pub fn mode(&self) -> u32 {
@@ -146,28 +167,51 @@ impl Inode {
         }
     }
 
-    /// Its `struct stat`, as the kernel's tmpfs reports one.
-    pub fn stat(&self) -> [u8; 144] {
+    /// Its status: every field of `struct stat`, and the birth time.
+    pub fn status(&self) -> Stat {
         let mode = self.mode();
         let size = self.size();
-        let nlink: u64 = if mode & vfs::S_IFMT == vfs::S_IFDIR { 2 } else { 1 };
-        let time = mount_time();
-        let mut st = [0u8; 144];
-        st[0..8].copy_from_slice(&DEV.to_le_bytes());
-        st[8..16].copy_from_slice(&self.ino.to_le_bytes());
-        st[16..24].copy_from_slice(&nlink.to_le_bytes());
-        st[24..28].copy_from_slice(&mode.to_le_bytes());
-        st[48..56].copy_from_slice(&size.to_le_bytes());
-        st[56..64].copy_from_slice(&4096u64.to_le_bytes());
-        st[64..72].copy_from_slice(&size.div_ceil(512).to_le_bytes());
-        for at in [72, 88, 104] {
-            st[at..at + 8].copy_from_slice(&time.to_le_bytes());
+        let times = self.state.lock().times;
+        Stat {
+            dev: DEV,
+            ino: self.ino,
+            nlink: if mode & vfs::S_IFMT == vfs::S_IFDIR { 2 } else { 1 },
+            mode,
+            size,
+            blksize: 4096,
+            blocks: size.div_ceil(512),
+            atime: times.atime,
+            mtime: times.mtime,
+            ctime: times.ctime,
+            btime: Some(times.btime),
+            ..Stat::default()
         }
-        st
+    }
+
+    /// Its `struct stat`.
+    pub fn stat(&self) -> [u8; 144] {
+        self.status().to_bytes()
     }
 
     pub fn set_perm(&self, perm: u32) {
-        self.state.lock().perm = perm & 0o7777;
+        let mut st = self.state.lock();
+        st.perm = perm & 0o7777;
+        st.times.changed(now());
+    }
+
+    /// The contents changed (a write, a truncation).
+    pub fn modified(&self) {
+        self.state.lock().times.modified(now());
+    }
+
+    /// The contents were read (relatime).
+    pub fn accessed(&self) {
+        self.state.lock().times.accessed(now());
+    }
+
+    /// utimensat.
+    pub fn set_times(&self, atime: SetTime, mtime: SetTime) {
+        self.state.lock().times.set(atime, mtime, now());
     }
 
     /// Directory entries (name, inode number, dirent type), "." and ".."
@@ -231,6 +275,8 @@ impl Inode {
     }
 
     fn insert(&self, name: &str, inode: Arc<Inode>) -> Result<(), i64> {
+        // (Not visible to anyone else yet: its lock is not nested.)
+        inode.state.lock().link = Some((self.ino, String::from(name)));
         let mut st = self.state.lock();
         if st.removed {
             return Err(ENOENT);
@@ -239,6 +285,7 @@ impl Inode {
             Kind::Dir(m) if m.contains_key(name) => Err(EEXIST),
             Kind::Dir(m) => {
                 m.insert(String::from(name), inode);
+                st.times.modified(now());
                 Ok(())
             }
             _ => Err(ENOTDIR),
@@ -248,7 +295,8 @@ impl Inode {
     /// Removes `name`: a directory only with `dir_only` (rmdir) and only
     /// when empty, anything else only without (checked under the child's
     /// lock, so no file appears in a directory being removed).
-    pub fn unlink(&self, name: &str, dir_only: bool) -> Result<(), i64> {
+    /// The inode it removed.
+    pub fn unlink(&self, name: &str, dir_only: bool) -> Result<Arc<Inode>, i64> {
         let _nesting = RENAME.lock();
         let mut st = self.state.lock();
         let Kind::Dir(m) = &mut st.kind else { return Err(ENOTDIR) };
@@ -265,11 +313,14 @@ impl Inode {
             _ => {}
         }
         cst.removed = true;
+        cst.link = None;
+        let now = now();
+        cst.times.changed(now);
         drop(cst);
-        let removed = m.remove(name);
+        m.remove(name);
+        st.times.modified(now);
         drop(st);
-        drop(removed);
-        Ok(())
+        Ok(child)
     }
 
     /// The right to write the file (ETXTBSY while a program runs from it).
@@ -369,8 +420,9 @@ pub(crate) fn settled(try_once: impl Fn() -> Result<(), i64>) -> Result<(), i64>
 }
 
 /// Renames `odir/oname` to `ndir/nname` (both in this tmpfs), replacing a
-/// file or an empty directory there.
-pub fn rename(odir: &Arc<Inode>, oname: &str, ndir: &Arc<Inode>, nname: &str) -> Result<(), i64> {
+/// file or an empty directory there: the inode that moved, and the one it
+/// replaced.
+pub fn rename(odir: &Arc<Inode>, oname: &str, ndir: &Arc<Inode>, nname: &str) -> Result<(Arc<Inode>, Option<Arc<Inode>>), i64> {
     check_name(nname)?;
     let _shape = RENAME.lock();
     let node = odir.lookup(oname)?;
@@ -397,10 +449,21 @@ pub fn rename(odir: &Arc<Inode>, oname: &str, ndir: &Arc<Inode>, nname: &str) ->
         Some(sm) => (Some(sm), first_map),
     };
     let replaced = move_entry(om, nm, oname, nname, &node, node_dir, odir)?;
+    // Both directories' entries changed (their locks are held), and the
+    // inode moved (nested, as above).
+    let now = now();
+    {
+        let mut nst = node.state.lock();
+        nst.times.changed(now);
+        nst.link = Some((ndir.ino, String::from(nname)));
+    }
+    first_guard.times.modified(now);
+    if let Some(g) = second_guard.as_mut() {
+        g.times.modified(now);
+    }
     drop(second_guard);
     drop(first_guard);
-    drop(replaced);
-    Ok(())
+    Ok((node, replaced))
 }
 
 fn dir_map(st: &mut State) -> Result<&mut BTreeMap<String, Arc<Inode>>, i64> {
@@ -449,9 +512,12 @@ fn move_entry(
             (Some(false), true) => return Err(ENOTEMPTY),
             (Some(_), false) => return Err(EISDIR),
             (None, true) => return Err(ENOTDIR),
-            (Some(true), true) => est.removed = true,
             _ => {}
         }
+        // It loses its link.
+        est.removed = true;
+        est.link = None;
+        est.times.changed(now());
     }
     let moved = match om {
         Some(om) => om.remove(oname),
@@ -504,16 +570,6 @@ pub fn dtype(mode: u32) -> u8 {
     }
 }
 
-/// The time every inode reports (the kernel's tmpfs stores no times
-/// either): when the instance's tmpfs came up, in seconds since 1970.
-fn mount_time() -> u64 {
-    static TIME: AtomicU64 = AtomicU64::new(0);
-    let t = TIME.load(Ordering::Relaxed);
-    if t != 0 {
-        return t;
-    }
-    const CLOCK_REALTIME: u64 = 0;
-    let now = syscall(SYS_CLOCK_READ, [CLOCK_REALTIME, 0, 0, 0, 0, 0]).max(0) as u64 / 1_000_000_000;
-    TIME.store(now, Ordering::Relaxed);
-    now
+fn now() -> vfs::stat::Time {
+    crate::time::realtime()
 }

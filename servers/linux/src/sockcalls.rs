@@ -815,16 +815,21 @@ pub fn write_server(sock: &Arc<Sock>, flags: u32, buf: &[u8]) -> Result<i64, i64
 
 /// fstat: a socket inode of sockfs.
 fn fstat(sock: &Sock, buf: u64) -> Result<i64, i64> {
-    const SOCKFS_DEV: u64 = 0x8;
     if buf == 0 {
         return Err(crate::files::EFAULT);
     }
+    usercopy::to_program(buf, &stat(sock)).map(|_| 0)
+}
+
+/// Its `struct stat`: a socket inode of sockfs.
+pub fn stat(sock: &Sock) -> [u8; 144] {
+    const SOCKFS_DEV: u64 = 0x8;
     let mut st = [0u8; 144];
     st[0..8].copy_from_slice(&SOCKFS_DEV.to_le_bytes());
     st[8..16].copy_from_slice(&sock.id().to_le_bytes());
     st[16..24].copy_from_slice(&1u64.to_le_bytes());
     st[24..28].copy_from_slice(&(vfs::S_IFSOCK | 0o777).to_le_bytes());
     st[56..64].copy_from_slice(&4096u64.to_le_bytes());
-    usercopy::to_program(buf, &st).map(|_| 0)
+    st
 }
 

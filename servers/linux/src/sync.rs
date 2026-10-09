@@ -12,12 +12,31 @@
 //! Waits are not interruptible by the program's signals (the server holds
 //! these locks for short, bounded work, like a kernel's spinlocks), but a
 //! dying thread stops waiting and never returns to the server.
+//!
+//! Priority: the server runs on its programs' threads, with their nice
+//! values. A low-priority thread preempted while it holds a lock would
+//! hold up every thread of the instance that needs it (priority
+//! inversion). So each thread counts the locks it holds in a word of its
+//! State page (`restricted::SERVER_LOCKS_OFFSET`, `held`), and the kernel's
+//! scheduler runs a holder with the weight of nice -20: preempted in the
+//! lock, it is back as soon as the most favored program would be (and a
+//! program gains no more than that by its calls).
 
 use crate::syscall;
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicU32, Ordering};
-use restricted::{SYS_SERVER_FUTEX_WAIT, SYS_SERVER_FUTEX_WAKE, SYS_YIELD};
+use restricted::{SERVER_LOCKS_OFFSET, SYS_SERVER_FUTEX_WAIT, SYS_SERVER_FUTEX_WAKE, SYS_YIELD, THREADS_BASE, THREAD_AREA};
+
+/// The calling thread's count of the locks it holds: in its State page,
+/// found from the stack, which is the thread's area's
+/// (`restricted::thread_stack_top`).
+fn held() -> &'static AtomicU32 {
+    let sp: u64;
+    unsafe { core::arch::asm!("mov {}, rsp", out(reg) sp, options(nomem, nostack, preserves_flags)) };
+    let n = (sp - THREADS_BASE) / THREAD_AREA;
+    unsafe { &*((restricted::thread_state(n) + SERVER_LOCKS_OFFSET) as *const AtomicU32) }
+}
 
 pub struct Mutex<T> {
     state: AtomicU32,
@@ -40,6 +59,7 @@ impl<T> Mutex<T> {
                 syscall(SYS_SERVER_FUTEX_WAIT, [addr, 2, 0, 0, 0, 0]);
             }
         }
+        held().fetch_add(1, Ordering::Relaxed);
         MutexGuard { mutex: self }
     }
 }
@@ -67,6 +87,7 @@ impl<T> Drop for MutexGuard<'_, T> {
             let addr = &self.mutex.state as *const AtomicU32 as u64;
             syscall(SYS_SERVER_FUTEX_WAKE, [addr, 1, 0, 0, 0, 0]);
         }
+        held().fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -97,6 +118,7 @@ impl RwLock {
                 let mut st = self.state.lock();
                 if !st.writer && st.writers_waiting == 0 {
                     st.readers += 1;
+                    held().fetch_add(1, Ordering::Relaxed);
                     return ReadGuard { lock: self };
                 }
                 self.changed.load(Ordering::Acquire)
@@ -115,6 +137,7 @@ impl RwLock {
                     if waiting {
                         st.writers_waiting -= 1;
                     }
+                    held().fetch_add(1, Ordering::Relaxed);
                     return WriteGuard { lock: self };
                 }
                 if !waiting {
@@ -157,6 +180,7 @@ impl Drop for ReadGuard<'_> {
         if wake {
             self.lock.advance();
         }
+        held().fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -168,5 +192,6 @@ impl Drop for WriteGuard<'_> {
     fn drop(&mut self) {
         self.lock.state.lock().writer = false;
         self.lock.advance();
+        held().fetch_sub(1, Ordering::Relaxed);
     }
 }

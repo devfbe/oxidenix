@@ -30,6 +30,12 @@ const SYS_CLOCK_GETTIME: u64 = 228;
 const SYS_CLOCK_GETRES: u64 = 229;
 const SYS_CLOCK_NANOSLEEP: u64 = 230;
 
+/// The wall-clock time now, for file timestamps.
+pub fn realtime() -> vfs::stat::Time {
+    let ns = syscall(SYS_CLOCK_READ, [CLOCK_REALTIME as u64, 0, 0, 0, 0, 0]).max(0) as u64;
+    vfs::stat::Time { sec: (ns / NSEC_PER_SEC) as i64, nsec: (ns % NSEC_PER_SEC) as u32 }
+}
+
 /// The result of a time system call in `s`, or None for other calls.
 pub fn handle(s: &State) -> Option<i64> {
     let (a0, a1, a2, a3) = (s.rdi, s.rsi, s.rdx, s.r10);

@@ -946,6 +946,9 @@ impl LinuxThread {
     /// server's entry, on the thread's server stack).
     pub fn new(instance: Arc<Instance>, program: &Frame) -> Result<(LinuxThread, Frame), i64> {
         let (slot, state) = instance.thread()?;
+        // A slot's count of server locks starts at 0 (a thread that died
+        // holding some left it).
+        unsafe { *((memory::phys_to_virt(state.start_address().as_u64()) as u64 + SERVER_LOCKS_OFFSET) as *mut u32) = 0 };
         let thread =
             LinuxThread { instance, slot, state, restricted: false, pager: false, events: false, in_legacy: false, trap_nr: None, closed_now: Vec::new(), pinned: Vec::new(), fs_child: None, exec_target: None, normal: Frame::default() };
         save(program, thread.state());
@@ -958,6 +961,9 @@ impl LinuxThread {
     /// collector of sockets in flight runs there), and its frame.
     pub fn worker(instance: Arc<Instance>) -> Result<(LinuxThread, Frame), i64> {
         let (slot, state) = instance.thread()?;
+        // A slot's count of server locks starts at 0 (a thread that died
+        // holding some left it).
+        unsafe { *((memory::phys_to_virt(state.start_address().as_u64()) as u64 + SERVER_LOCKS_OFFSET) as *mut u32) = 0 };
         let thread =
             LinuxThread { instance, slot, state, restricted: false, pager: true, events: false, in_legacy: false, trap_nr: None, closed_now: Vec::new(), pinned: Vec::new(), fs_child: None, exec_target: None, normal: Frame::default() };
         let start = thread.start(ROLE_WORKER);
@@ -967,6 +973,9 @@ impl LinuxThread {
     /// The pager thread of `instance`, and the frame it starts with.
     pub fn pager(instance: Arc<Instance>) -> Result<(LinuxThread, Frame), i64> {
         let (slot, state) = instance.thread()?;
+        // A slot's count of server locks starts at 0 (a thread that died
+        // holding some left it).
+        unsafe { *((memory::phys_to_virt(state.start_address().as_u64()) as u64 + SERVER_LOCKS_OFFSET) as *mut u32) = 0 };
         let thread =
             LinuxThread { instance, slot, state, restricted: false, pager: true, events: true, in_legacy: false, trap_nr: None, closed_now: Vec::new(), pinned: Vec::new(), fs_child: None, exec_target: None, normal: Frame::default() };
         let start = thread.start(ROLE_PAGER);
@@ -986,6 +995,12 @@ impl LinuxThread {
     /// Whether the thread's CPU shows the normal view (the server runs).
     pub fn normal_view(&self) -> bool {
         !self.restricted && !self.in_legacy
+    }
+
+    /// The kernel's address of the server's count of locks this thread
+    /// holds (in its State page; see `restricted::SERVER_LOCKS_OFFSET`).
+    pub fn locks_word(&self) -> u64 {
+        memory::phys_to_virt(self.state.start_address().as_u64()) as u64 + SERVER_LOCKS_OFFSET
     }
 
     #[allow(clippy::mut_from_ref)]
@@ -1561,6 +1576,18 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
                 return Err(ESRCH);
             }
             Ok(0)
+        }
+        SYS_THREAD_NICE => super::thread_nice(instance.id, a[0], a[1], a[2] != 0, a[3] as i64),
+        SYS_KFD_STAT => {
+            let st = super::sys_file::fstat_bytes(a[0])?;
+            super::uaccess::copy_to_server(a[1], &st)?;
+            Ok(0)
+        }
+        SYS_NET_LINKS => {
+            let links = crate::net::links()?;
+            let n = links.len().min(a[1] as usize);
+            super::uaccess::copy_to_server(a[0], &links[..n])?;
+            Ok(n as i64)
         }
         SYS_KFD_INSTALL_FILE => {
             use crate::fs::file::O_CLOEXEC;

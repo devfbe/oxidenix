@@ -27,6 +27,7 @@
 //! | `RELEASE` | `object` inode | 0: the client holds it no more (see "Holds") |
 //! | `READLINK` | `object` symlink, buffer for the target | length of the target |
 //! | `SETPERM` | `object` inode, `arg[0]` = permission bits | 0 |
+//! | `SETTIMES` | `object` inode, `offset` = which (`TIME_ATIME`, `TIME_MTIME`, `TIME_CTIME`), `arg` = [atime, mtime, ctime] in seconds since 1970 (below 2^32; 0 for one not set) | 0 |
 //! | `STATFS` | - | 0, `Usage` in v0..v3 (sizes, counts, the largest file) |
 //! | `FORGET` | `grant` | 0 once no request on the grant is in flight and the service let go of it |
 //! | `PROMISE` | `object` inode, `offset`, `arg[0]` = length (at most `MAX_TRANSFER`) | 0 once the blocks a later `WRITE` of the range needs are kept for it (see "Promises"); ENOSPC |
@@ -110,7 +111,13 @@ pub mod op {
     pub const STATFS: u16 = 14;
     pub const FORGET: u16 = 15;
     pub const PROMISE: u16 = 16;
+    pub const SETTIMES: u16 = 17;
 }
+
+/// `SETTIMES`'s choice of times (`offset`).
+pub const TIME_ATIME: u64 = 1;
+pub const TIME_MTIME: u64 = 2;
+pub const TIME_CTIME: u64 = 4;
 
 /// The errors the protocol itself gives (others come from the filesystem).
 pub mod errno {
@@ -191,6 +198,9 @@ pub enum Request {
     Release { ino: u32 },
     Readlink { ino: u32, buf: Buf },
     SetPerm { ino: u32, perm: u32 },
+    /// The times to set: access, modification, change (seconds; None:
+    /// keep).
+    SetTimes { ino: u32, atime: Option<u32>, mtime: Option<u32>, ctime: Option<u32> },
     Statfs,
     Forget { grant: u32 },
     Promise { ino: u32, offset: u64, len: u64 },
@@ -297,6 +307,26 @@ impl Request {
                 (Request::Readlink { ino: ino(d.object)?, buf }, Used { object: true, buf: true, ..NONE })
             }
             op::SETPERM => (Request::SetPerm { ino: ino(d.object)?, perm: perm(d.arg[0])? }, Used { object: true, args: 1, ..NONE }),
+            op::SETTIMES => {
+                let which = d.offset;
+                if which & !(TIME_ATIME | TIME_MTIME | TIME_CTIME) != 0 {
+                    return Err(EINVAL);
+                }
+                let time = |bit: u64, value: u64| -> Result<Option<u32>, i64> {
+                    match (which & bit != 0, value) {
+                        (false, 0) => Ok(None),
+                        (false, _) => Err(EINVAL),
+                        (true, v) => u32::try_from(v).map(Some).map_err(|_| EINVAL),
+                    }
+                };
+                let r = Request::SetTimes {
+                    ino: ino(d.object)?,
+                    atime: time(TIME_ATIME, d.arg[0])?,
+                    mtime: time(TIME_MTIME, d.arg[1])?,
+                    ctime: time(TIME_CTIME, d.arg[2])?,
+                };
+                (r, Used { object: true, offset: true, args: 3, ..NONE })
+            }
             op::FORGET => (Request::Forget { grant: d.grant }, Used { grant: true, ..NONE }),
             op::PROMISE => {
                 let len = d.arg[0];
@@ -376,6 +406,12 @@ impl Request {
                 d.object = ino as u64;
                 d.arg[0] = perm as u64;
             }
+            Request::SetTimes { ino, atime, mtime, ctime } => {
+                d.object = ino as u64;
+                let bit = |t: Option<u32>, b: u64| if t.is_some() { b } else { 0 };
+                d.offset = bit(atime, TIME_ATIME) | bit(mtime, TIME_MTIME) | bit(ctime, TIME_CTIME);
+                d.arg = [atime.unwrap_or(0) as u64, mtime.unwrap_or(0) as u64, ctime.unwrap_or(0) as u64];
+            }
             Request::Forget { grant } => d.grant = grant,
             Request::Promise { ino, offset, len } => {
                 d.object = ino as u64;
@@ -401,6 +437,7 @@ impl Request {
             Request::Release { .. } => op::RELEASE,
             Request::Readlink { .. } => op::READLINK,
             Request::SetPerm { .. } => op::SETPERM,
+            Request::SetTimes { .. } => op::SETTIMES,
             Request::Statfs => op::STATFS,
             Request::Forget { .. } => op::FORGET,
             Request::Promise { .. } => op::PROMISE,

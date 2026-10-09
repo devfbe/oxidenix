@@ -66,6 +66,14 @@ fn main() {
     let test_mode = bench_mode || autorun.is_some() || std::env::var_os("OXIDENIX_TEST").is_some();
     println!("Building root filesystem...");
     build_rootfs(&rootfs).expect("Failed to build root filesystem");
+    // With Node.js, its smoke tests (userspace/node/tests, run by
+    // userspace/node/run-node.sh) go along, as /usr/lib/node-tests.
+    if std::env::var_os("OXIDENIX_NODE").is_some_and(|v| !v.is_empty()) {
+        let tests = Path::new(env!("CARGO_MANIFEST_DIR")).join("../userspace/node/tests");
+        let dest = rootfs.join("usr/lib/node-tests");
+        fs::create_dir_all(&dest).expect("Failed to create /usr/lib/node-tests");
+        copy_tree(&tests, &dest).expect("Failed to copy the Node.js tests");
+    }
     if let Some(script) = &autorun {
         fs::copy(script, rootfs.join("etc/autorun")).expect("Failed to copy OXIDENIX_AUTORUN to /etc/autorun");
     } else if test_mode {

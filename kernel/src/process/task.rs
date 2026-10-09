@@ -26,7 +26,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI8, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 pub use crate::memory::kstack::KernelStack;
 
@@ -98,8 +98,6 @@ pub struct Info {
     pub exe: String,
     /// Page counts of its address space (None for kernel tasks and zombies).
     pub mem: Option<Arc<super::address_space::MemStats>>,
-    /// Scheduling niceness, -20 (favored) to 19.
-    pub nice: i8,
     /// Live threads, in creation order.
     pub threads: Vec<Arc<Task>>,
     /// CPU time in nanoseconds (user, system) of threads that exited, and
@@ -136,7 +134,6 @@ impl Info {
             cmdline: Vec::new(),
             exe: String::new(),
             mem: None,
-            nice: 0,
             threads: Vec::new(),
             dead_time: (0, 0),
             children_time: (0, 0),
@@ -203,8 +200,10 @@ pub struct Files {
     fds: IrqSpinLock<Vec<Option<FdEntry>>>,
 }
 
-/// Most descriptors a process may have open.
-pub const MAX_FDS: usize = 256;
+/// Most descriptors a process may have open: RLIMIT_NOFILE, which
+/// `prlimit` reports (Linux's default hard limit). The table grows as
+/// descriptors are used.
+pub const MAX_FDS: usize = 4096;
 
 impl Files {
     pub fn new(fds: Vec<Option<FdEntry>>) -> Option<Arc<Files>> {
@@ -213,9 +212,18 @@ impl Files {
 
     /// A copy for a new process (fork), or for exec of a shared table.
     pub fn duplicate(&self) -> Option<Arc<Files>> {
+        // Memory is reserved outside the lock, for the table's length as it
+        // was; if it grew meanwhile, again.
         let mut copy = Vec::new();
-        copy.try_reserve_exact(MAX_FDS).ok()?;
-        copy.extend(self.fds.lock().iter().cloned());
+        loop {
+            let len = self.fds.lock().len();
+            copy.try_reserve_exact(len).ok()?;
+            let fds = self.fds.lock();
+            if fds.len() <= copy.capacity() {
+                copy.extend(fds.iter().cloned());
+                break;
+            }
+        }
         Files::new(copy)
     }
 
@@ -267,9 +275,18 @@ impl Files {
 
     /// Takes out the descriptors marked close-on-exec (to drop after the lock).
     pub fn take_cloexec(&self) -> Vec<FdEntry> {
+        // Room for every descriptor of the table, reserved outside the lock
+        // (a descriptor that does not fit, should the table have grown
+        // meanwhile and memory run out, stays open).
         let mut out = Vec::new();
-        let _ = out.try_reserve_exact(MAX_FDS);
+        let len = self.fds.lock().len();
+        let _ = out.try_reserve_exact(len);
         let mut fds = self.fds.lock();
+        if fds.len() > out.capacity() {
+            drop(fds);
+            let _ = out.try_reserve_exact(MAX_FDS);
+            fds = self.fds.lock();
+        }
         for e in fds.iter_mut() {
             if e.as_ref().is_some_and(|e| e.cloexec) && out.len() < out.capacity() {
                 out.push(e.take().expect("checked"));
@@ -362,6 +379,16 @@ pub struct Task {
     pub last_cpu: AtomicUsize,
     /// CPUs it may run on (bit per CPU index), see sched_setaffinity.
     pub affinity: AtomicU64,
+    /// Its nice value (-20..=19, see `sched::weight`).
+    pub nice: AtomicI8,
+    /// Fair scheduling (`sched`): its virtual runtime, on the scale of the
+    /// CPU `vcpu` (usize::MAX: a new task, not placed yet).
+    pub vruntime: AtomicU64,
+    pub vcpu: AtomicUsize,
+    /// The address of the Linux server's count of the locks it holds on
+    /// this thread (`restricted::SERVER_LOCKS_OFFSET` in its State page),
+    /// 0 for a task that is no Linux thread: the scheduler boosts a holder.
+    pub server_locks: AtomicU64,
     /// Channel it waits on (0: none), and the sequence number of the
     /// timer that ends its sleep (0: none; see `timer`).
     pub wait_chan: AtomicUsize,
@@ -410,6 +437,10 @@ impl Task {
             on_rq: AtomicBool::new(true),
             last_cpu: AtomicUsize::new(0),
             affinity: AtomicU64::new(u64::MAX),
+            nice: AtomicI8::new(0),
+            vruntime: AtomicU64::new(0),
+            vcpu: AtomicUsize::new(usize::MAX),
+            server_locks: AtomicU64::new(own.linux.as_ref().map_or(0, |l| l.locks_word())),
             wait_chan: AtomicUsize::new(0),
             timer_seq: AtomicU64::new(0),
             wake_lock: IrqSpinLock::new(()),

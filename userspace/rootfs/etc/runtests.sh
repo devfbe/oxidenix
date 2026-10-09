@@ -4,7 +4,7 @@
 failed=0
 fail() { echo "FAIL $1"; failed=$((failed + 1)); }
 
-for t in forktest sigtest jobtest cowtest fstest oomtest nettest smptest proctest vmtest futextest threadtest timetest timertest polltest eventfdtest sigmasktest epolltest unixtest mmaptest exectest cachetest writebacktest datatest lxtest; do
+for t in forktest sigtest jobtest cowtest fstest oomtest nettest smptest proctest vmtest futextest threadtest timetest timertest polltest eventfdtest sigmasktest epolltest unixtest mmaptest exectest cachetest writebacktest datatest lxtest libuvtest metatest inotifytest; do
     echo "=== $t"
     if $t; then echo "PASS $t"; else fail "$t"; fi
 done

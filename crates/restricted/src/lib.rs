@@ -35,6 +35,13 @@ pub const fn thread_state(n: u64) -> u64 {
     thread_stack_top(n)
 }
 
+/// Where in a thread's State page the server counts the locks it holds on
+/// the thread (a u32; `servers/linux/src/sync.rs`): the kernel's scheduler
+/// gives a thread holding one the weight of nice -20, so a program's low
+/// priority never holds up the instance's other threads waiting for the
+/// lock (priority inversion; docs/design/linux-server.md).
+pub const SERVER_LOCKS_OFFSET: u64 = 2048;
+
 /// The Linux program's registers while the server handles one of its
 /// traps: the kernel writes them when the program traps and reads them
 /// when the server enters restricted mode again. The server may change
@@ -616,6 +623,33 @@ pub const SERVER_LOG_MAX: u64 = 256;
 /// id `pid` belongs to the caller's instance (a pid a socket's credentials
 /// may name, SCM_CREDENTIALS).
 pub const SYS_THREAD_EXISTS: u64 = 1090;
+/// `kfd_stat(fd, buf) -> 0`: the `struct stat` (144 bytes) of one of the
+/// kernel's descriptors (EBADF for another), also of one without an inode
+/// (a socket, an epoll instance), at `buf`: fstat as the kernel answers it,
+/// for the server's calls that describe a descriptor in another format
+/// (statx). It goes with the descriptor table (R6e).
+pub const SYS_KFD_STAT: u64 = 1093;
+/// `net_links(buf, cap) -> len`: the network interfaces as netd describes
+/// them (`netproto::Op::Links`: `netproto::Link` records), at most `cap`
+/// bytes at `buf`; ENETDOWN without netd. The kernel only relays netd's
+/// answer. It goes with the sockets (R7), when the server talks to netd
+/// itself.
+pub const SYS_NET_LINKS: u64 = 1094;
+/// `thread_nice(scope, id, set, nice) -> lowest nice + 20`: the nice
+/// values (-20..=19, the kernel scheduler's weights) of the threads in
+/// `scope`, all of the caller's instance: `NICE_THREAD` the thread `id`
+/// (0: the caller; ESRCH for another instance's), `NICE_PGROUP` every
+/// thread of process group `id` (0: the caller's), `NICE_ALL` every thread
+/// of the instance (one user: a user's processes). With `set` 1 they all
+/// get `nice` (clamped; lowering it is allowed: everyone is root, with
+/// CAP_SYS_NICE, and RLIMIT_NICE has no limit). The answer is the lowest
+/// nice value among them, before a change, plus 20; ESRCH for no thread.
+/// Thread ids and process groups are the kernel's until the process model
+/// is the server's (R8).
+pub const SYS_THREAD_NICE: u64 = 1095;
+pub const NICE_THREAD: u64 = 0;
+pub const NICE_PGROUP: u64 = 1;
+pub const NICE_ALL: u64 = 2;
 pub const THREAD_IN_INSTANCE: u64 = 1;
 
 // Descriptors passed between processes (SCM_RIGHTS over the server's

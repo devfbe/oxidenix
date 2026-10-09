@@ -116,11 +116,15 @@ impl EventFd {
 
     /// fstat: an anonymous inode (no file type), as on Linux.
     pub fn fstat(&self, buf: u64) -> Result<i64, i64> {
+        usercopy::to_program(buf, &self.stat()).map(|_| 0).map_err(|_| EFAULT)
+    }
+
+    pub fn stat(&self) -> [u8; 144] {
         let mut st = [0u8; 144];
         st[8..16].copy_from_slice(&self.id.to_le_bytes());
         st[16..24].copy_from_slice(&1u64.to_le_bytes());
         st[24..28].copy_from_slice(&0o600u32.to_le_bytes());
         st[56..64].copy_from_slice(&4096u64.to_le_bytes());
-        usercopy::to_program(buf, &st).map(|_| 0).map_err(|_| EFAULT)
+        st
     }
 }

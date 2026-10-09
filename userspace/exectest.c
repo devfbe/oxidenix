@@ -64,12 +64,27 @@ static int copy_file(const char *from, const char *to) {
     return 0;
 }
 
-int main(int argc, char **argv) {
+/* `--layout`: the arguments and the environment lie as Linux puts them:
+ * each string right after the one before, the environment's after the
+ * arguments'. */
+static int layout(int argc, char **argv, char **envp) {
+    for (int i = 0; i + 1 < argc; i++)
+        if (argv[i + 1] != argv[i] + strlen(argv[i]) + 1) return 1;
+    if (envp[0] && envp[0] != argv[argc - 1] + strlen(argv[argc - 1]) + 1) return 2;
+    for (int i = 0; envp[i] && envp[i + 1]; i++)
+        if (envp[i + 1] != envp[i] + strlen(envp[i]) + 1) return 3;
+    return 0;
+}
+
+int main(int argc, char **argv, char **envp) {
+    if (argc > 1 && strcmp(argv[1], "--layout") == 0) return layout(argc, argv, envp);
     const char *busybox = argc > 1 ? argv[1] : "/bin/busybox";
     const char *hello = argc > 2 ? argv[2] : "/bin/hello";
     int clean = 1;
     for (size_t i = 0; i < sizeof bss; i++) clean &= bss[i] == 0;
     check("initialized data is there and bss is zero", data_word == 42 && clean);
+    char *self[] = {"exectest", "--layout", "a", "", "bcd", NULL};
+    check("arguments and environment lie in order, back to back", run("/bin/exectest", self) == 0);
 
     /* Eight processes running the same program share its pages. */
     long before = free_kib();

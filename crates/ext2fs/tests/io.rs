@@ -753,6 +753,42 @@ fn freed_inodes_take_no_operations() {
     fsck("freedino", &take(fs));
 }
 
+/// Times set by the client stay as set (each on its own), and the
+/// filesystem checks clean; a freed inode takes none.
+#[test]
+fn times_are_set_as_given() {
+    let mut fs = Ext2::mount(mkfs("times", 2 * 1024)).unwrap();
+    let f = fs.create(ROOT_INO, "f", &NewNode::File, 0o644).unwrap();
+    fs.set_times(f, Some(1_000_000_000), Some(1_500_000_000), None).unwrap();
+    let s = fs.stat(f).unwrap();
+    assert_eq!((s.atime, s.mtime), (1_000_000_000, 1_500_000_000));
+    let ctime = s.ctime;
+    fs.set_times(f, None, None, Some(u32::MAX)).unwrap();
+    let s = fs.stat(f).unwrap();
+    assert_eq!((s.atime, s.mtime, s.ctime), (1_000_000_000, 1_500_000_000, u32::MAX));
+    assert_ne!(ctime, u32::MAX);
+    for ino in fs.unlink(ROOT_INO, "f", false).unwrap() {
+        fs.release(ino).unwrap();
+    }
+    assert_eq!(fs.set_times(f, Some(1), None, None), Err(ext2fs::errno::ENOENT));
+    // A new name in room the directory has, and a removed one, change the
+    // directory's modification and change times (to the device's now).
+    let d = fs.create(ROOT_INO, "d", &NewNode::Dir, 0o755).unwrap();
+    for (i, name) in ["a", "b"].into_iter().enumerate() {
+        fs.set_times(d, Some(5), Some(5), Some(5)).unwrap();
+        if i == 0 {
+            fs.create(d, name, &NewNode::File, 0o644).unwrap();
+        } else {
+            for ino in fs.unlink(d, "a", false).unwrap() {
+                fs.release(ino).unwrap();
+            }
+        }
+        let s = fs.stat(d).unwrap();
+        assert_eq!((s.atime, s.mtime, s.ctime), (5, 1_700_000_000, 1_700_000_000), "{name}");
+    }
+    fsck("times", &take(fs));
+}
+
 /// An inode number given to a new file gets a new generation: a client
 /// that held the old file tells them apart.
 #[test]
