@@ -570,9 +570,9 @@ fn ipv4(proto: u8, payload: &[u8]) -> Vec<u8> {
 fn icmp_messages_are_told_apart() {
     // Echo request and reply: their identifier.
     let echo = ipv4(1, &[8, 0, 0, 0, 0x12, 0x34, 0, 1, b'x']);
-    assert_eq!(icmp_key(&echo), Some(IcmpKey::Echo { id: 0x1234, request: true, at: 24, message: 20 }));
+    assert_eq!(icmp_key(&echo), Some(IcmpKey::Echo { id: 0x1234, request: true, at: 24, message: 20, inner: None }));
     let reply = ipv4(1, &[0, 0, 0, 0, 0xab, 0xcd, 0, 1]);
-    assert_eq!(icmp_key(&reply), Some(IcmpKey::Echo { id: 0xabcd, request: false, at: 24, message: 20 }));
+    assert_eq!(icmp_key(&reply), Some(IcmpKey::Echo { id: 0xabcd, request: false, at: 24, message: 20, inner: None }));
     // Errors: the quoted packet's source port or echo identifier.
     let quoted_udp = ipv4(17, &[0x30, 0x39, 0, 53, 0, 8, 0, 0]);
     let unreachable = ipv4(1, &[[3, 3, 0, 0, 0, 0, 0, 0].as_slice(), &quoted_udp].concat());
@@ -582,7 +582,7 @@ fn icmp_messages_are_told_apart() {
     assert_eq!(icmp_key(&exceeded), Some(IcmpKey::Tcp(0xc000)));
     let quoted_echo = ipv4(1, &[8, 0, 0, 0, 0x55, 0x66, 0, 1]);
     let about_echo = ipv4(1, &[[3, 1, 0, 0, 0, 0, 0, 0].as_slice(), &quoted_echo].concat());
-    assert_eq!(icmp_key(&about_echo), Some(IcmpKey::Echo { id: 0x5566, request: false, at: 20 + 8 + 20 + 4, message: 20 }));
+    assert_eq!(icmp_key(&about_echo), Some(IcmpKey::Echo { id: 0x5566, request: false, at: 20 + 8 + 20 + 4, message: 20, inner: Some(20 + 8 + 20) }));
     // An error about a reply is about nobody's identifier.
     let quoted_reply = ipv4(1, &[0, 0, 0, 0, 0x55, 0x66, 0, 1]);
     assert_eq!(icmp_key(&ipv4(1, &[[3, 1, 0, 0, 0, 0, 0, 0].as_slice(), &quoted_reply].concat())), None);
@@ -624,9 +624,10 @@ fn malformed_icmp_never_panics() {
     let mut p = ipv4(1, &[8, 0, 0, 0, 1, 2, 0, 1]);
     let before = p.clone();
     let len = p.len();
-    set_echo_id(&mut p, len - 1, 20, 7);
-    set_echo_id(&mut p, 24, len - 3, 7);
-    set_echo_id(&mut p, usize::MAX, usize::MAX, 7);
+    set_echo_id(&mut p, len - 1, 20, None, 7);
+    set_echo_id(&mut p, 24, len - 3, None, 7);
+    set_echo_id(&mut p, 24, 20, Some(len - 2), 7);
+    set_echo_id(&mut p, usize::MAX, usize::MAX, Some(usize::MAX), 7);
     assert_eq!(p, before);
 }
 
@@ -646,7 +647,7 @@ fn echo_ids_are_rewritten_with_their_checksum() {
     message[2..4].copy_from_slice(&sum.to_be_bytes());
     let mut packet = ipv4(1, &message);
     for id in [0u16, 1, 0x1234, 0xfffe, 0xffff, 0x8000] {
-        set_echo_id(&mut packet, 24, 20, id);
+        set_echo_id(&mut packet, 24, 20, None, id);
         assert_eq!(u16::from_be_bytes([packet[24], packet[25]]), id);
         assert_eq!(checksum(&packet[20..]), 0, "the message's checksum stays right for {id:#x}");
     }
@@ -656,8 +657,10 @@ fn echo_ids_are_rewritten_with_their_checksum() {
     let sum = checksum(&error);
     error[2..4].copy_from_slice(&sum.to_be_bytes());
     let mut packet = ipv4(1, &error);
-    let Some(IcmpKey::Echo { at, message, .. }) = icmp_key(&packet) else { panic!("an error about a request") };
-    set_echo_id(&mut packet, at, message, 0x4242);
+    let Some(IcmpKey::Echo { at, message, inner, .. }) = icmp_key(&packet) else { panic!("an error about a request") };
+    set_echo_id(&mut packet, at, message, inner, 0x4242);
+    // The quoted request's own checksum still holds too.
+    assert_eq!(checksum(&packet[20 + 8 + 20..]), 0);
     assert_eq!(icmp_key(&packet).map(|k| matches!(k, IcmpKey::Echo { id: 0x4242, .. })), Some(true));
     assert_eq!(checksum(&packet[20..]), 0);
 }

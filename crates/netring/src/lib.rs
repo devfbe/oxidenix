@@ -918,29 +918,53 @@ pub enum IcmpKey {
     /// An echo request (`request`) or reply with identifier `id`, or an
     /// error about an echo request: the identifier lies at byte `at` of
     /// the packet, in the ICMP message at byte `message` (whose checksum
-    /// covers it: `set_echo_id`).
-    Echo { id: u16, request: bool, at: usize, message: usize },
+    /// covers it: `set_echo_id`), in an error inside the quoted request at
+    /// byte `inner` (its checksum covers it too).
+    Echo { id: u16, request: bool, at: usize, message: usize, inner: Option<usize> },
     /// An error about a TCP or UDP packet from this (local) port.
     Tcp(u16),
     Udp(u16),
 }
 
 /// Replaces the echo identifier at byte `at` of `packet` with `id`, and
-/// updates the checksum of the ICMP message at byte `message` to match
-/// (RFC 1624's incremental update). Out-of-range offsets change nothing.
-pub fn set_echo_id(packet: &mut [u8], at: usize, message: usize, id: u16) {
-    if at.checked_add(2).is_none_or(|end| end > packet.len()) || message.checked_add(4).is_none_or(|end| end > packet.len()) {
+/// updates the checksums that cover it (RFC 1624's incremental update):
+/// that of the quoted echo request at byte `inner` in an error (whose
+/// checksum covers the whole original request: the identifier is the only
+/// change), then that of the ICMP message at byte `message` (which covers
+/// the identifier and the quoted checksum). Out-of-range offsets change
+/// nothing.
+pub fn set_echo_id(packet: &mut [u8], at: usize, message: usize, inner: Option<usize>, id: u16) {
+    let fits = |o: usize, n: usize| o.checked_add(n).is_some_and(|end| end <= packet.len());
+    if !fits(at, 2) || !fits(message, 4) || inner.is_some_and(|i| !fits(i, 4)) {
         return;
     }
-    let old = u16::from_be_bytes([packet[at], packet[at + 1]]);
-    packet[at..at + 2].copy_from_slice(&id.to_be_bytes());
-    let sum = u16::from_be_bytes([packet[message + 2], packet[message + 3]]);
-    // HC' = ~(~HC + ~m + m'), in ones' complement.
-    let mut s = (!sum) as u32 + (!old) as u32 + id as u32;
-    while s >> 16 != 0 {
-        s = (s & 0xffff) + (s >> 16);
+    fn word(p: &[u8], o: usize) -> u16 {
+        u16::from_be_bytes([p[o], p[o + 1]])
     }
-    packet[message + 2..message + 4].copy_from_slice(&(!(s as u16)).to_be_bytes());
+    // HC' = ~(~HC + ~m + m') for each changed word m -> m'.
+    fn adjust(sum: u16, changes: &[(u16, u16)]) -> u16 {
+        let mut s = (!sum) as u32;
+        for &(old, new) in changes {
+            s += (!old) as u32 + new as u32;
+        }
+        while s >> 16 != 0 {
+            s = (s & 0xffff) + (s >> 16);
+        }
+        !(s as u16)
+    }
+    let old = word(packet, at);
+    packet[at..at + 2].copy_from_slice(&id.to_be_bytes());
+    let mut changes = [(old, id), (0, 0)];
+    let mut n = 1;
+    if let Some(i) = inner {
+        let before = word(packet, i + 2);
+        let after = adjust(before, &changes[..1]);
+        packet[i + 2..i + 4].copy_from_slice(&after.to_be_bytes());
+        changes[1] = (before, after);
+        n = 2;
+    }
+    let sum = adjust(word(packet, message + 2), &changes[..n]);
+    packet[message + 2..message + 4].copy_from_slice(&sum.to_be_bytes());
 }
 
 /// The echo identifiers netd puts on the wire: every instance's echo
@@ -1075,14 +1099,14 @@ pub fn icmp_key(packet: &[u8]) -> Option<IcmpKey> {
         return None;
     }
     match icmp[0] {
-        0 | 8 => echo_id(icmp, None).map(|id| IcmpKey::Echo { id, request: icmp[0] == 8, at: message + 4, message }),
+        0 | 8 => echo_id(icmp, None).map(|id| IcmpKey::Echo { id, request: icmp[0] == 8, at: message + 4, message, inner: None }),
         3 | 4 | 5 | 11 | 12 => {
             let (proto, ihl, l4) = ipv4_payload(&icmp[8..], false)?;
             let port = || Some(u16::from_be_bytes([*l4.first()?, *l4.get(1)?]));
             match proto {
                 // (Only an error about a request of ours is about our
                 // identifier.)
-                1 => echo_id(l4, Some(true)).map(|id| IcmpKey::Echo { id, request: false, at: message + 8 + ihl + 4, message }),
+                1 => echo_id(l4, Some(true)).map(|id| IcmpKey::Echo { id, request: false, at: message + 8 + ihl + 4, message, inner: Some(message + 8 + ihl) }),
                 6 => port().map(IcmpKey::Tcp),
                 17 => port().map(IcmpKey::Udp),
                 _ => None,

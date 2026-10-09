@@ -1504,7 +1504,7 @@ impl Service {
                 let id = u16::from_be_bytes([packet[IPV4_HEADER + 4], packet[IPV4_HEADER + 5]]);
                 let owner = self.chans[c].as_ref().expect("in use").owner;
                 let wire = self.echo.outgoing(owner, id, oxrt::uptime_ms());
-                netring::set_echo_id(packet, IPV4_HEADER + 4, IPV4_HEADER, wire);
+                netring::set_echo_id(packet, IPV4_HEADER + 4, IPV4_HEADER, None, wire);
             }
             socket.send_slice(packet).map_err(|_| EAGAIN)?;
             done(len as i64)
@@ -2220,9 +2220,9 @@ fn pump_one(s: &mut Sock, ctl: &Ctl, rings: Option<Rings>, sockets: &mut SocketS
                         match view {
                             // The instance's own echo identifier, not the
                             // one netd put on the wire.
-                            View::Echo { at, message, id } => {
+                            View::Echo { at, message, inner, id } => {
                                 let mut mine = data.to_vec();
-                                netring::set_echo_id(&mut mine, at, message, id);
+                                netring::set_echo_id(&mut mine, at, message, inner, id);
                                 Rings::write(r.rx, r.size, pos, &mine)
                             }
                             _ => Rings::write(r.rx, r.size, pos, data),
@@ -2280,7 +2280,7 @@ enum View {
     Whole,
     /// It with the echo identifier at byte `at` (in the message at byte
     /// `message`) put back to the instance's own.
-    Echo { at: usize, message: usize, id: u16 },
+    Echo { at: usize, message: usize, inner: Option<usize>, id: u16 },
     Nothing,
 }
 
@@ -2294,9 +2294,9 @@ impl IcmpOwners<'_> {
     fn view(&self, packet: &[u8], owner: u64) -> View {
         let Some(key) = netring::icmp_key(packet) else { return View::Whole };
         let holder = match key {
-            netring::IcmpKey::Echo { id, request, at, message } => {
+            netring::IcmpKey::Echo { id, request, at, message, inner } => {
                 return match self.echo.incoming(id) {
-                    Some((o, local)) if o == owner => View::Echo { at, message, id: local },
+                    Some((o, local)) if o == owner => View::Echo { at, message, inner, id: local },
                     Some(_) => View::Nothing,
                     None if request => View::Whole,
                     None => View::Nothing,
