@@ -178,19 +178,23 @@ int main(void) {
     alarm(0);
     check("SIGKILL ends a thread waiting for a page", WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL);
 
-    /* A page the pager fails: SIGBUS, and a later access asks again. */
-    char *fl = (char *)0x230000000000;
-    check("the server maps a paged object it fails once", syscall(TEST_PAGED_FAIL, fl) == 0);
-    child = fork();
-    if (child == 0) {
-        (void)*(volatile char *)fl;
-        _exit(0);
+    /* A page the pager fails: SIGBUS, and a later access asks again. The
+     * first request of every such object fails, not only the instance's
+     * first (a second object here, as a second lxtest run in one shell). */
+    for (int round = 0; round < 2; round++) {
+        char *fl = (char *)(0x230000000000 + round * 0x1000000000L);
+        check(round ? "a second such object" : "the server maps a paged object it fails once", syscall(TEST_PAGED_FAIL, fl) == 0);
+        child = fork();
+        if (child == 0) {
+            (void)*(volatile char *)fl;
+            _exit(0);
+        }
+        alarm(5);
+        waitpid(child, &st, 0);
+        alarm(0);
+        check(round ? "... its page fails too: SIGBUS" : "a page the pager fails raises SIGBUS", WIFSIGNALED(st) && WTERMSIG(st) == SIGBUS);
+        check(round ? "... and a later access gets it" : "... and a later access asks again and gets it", memcmp(fl, "retry", 5) == 0);
     }
-    alarm(5);
-    waitpid(child, &st, 0);
-    alarm(0);
-    check("a page the pager fails raises SIGBUS", WIFSIGNALED(st) && WTERMSIG(st) == SIGBUS);
-    check("... and a later access asks again and gets it", memcmp(fl, "retry", 5) == 0);
     /* The server's runtime: its heap, and its mutex across the threads of
      * the tree's processes (they all run the same server instance). */
     check("the server's heap: 2000 blocks of many sizes keep their contents", syscall(TEST_ALLOC, 2000) == 0);

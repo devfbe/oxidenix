@@ -111,11 +111,16 @@ static TEST_OBJECT: AtomicU64 = AtomicU64::new(0);
 /// The paged object of TEST_PAGED, and how many pages the pager supplied.
 static TEST_PAGED_OBJECT: AtomicU64 = AtomicU64::new(0);
 static SUPPLIED: AtomicU64 = AtomicU64::new(0);
-/// The key the test's paged object goes by; +1: never answered; +2:
-/// failed once, then answered.
+/// The key the test's paged object goes by; +1: never answered; +2: an
+/// object's first request failed, the later ones answered.
 const TEST_KEY: u64 = 0x7e57;
+/// The object of the last TEST_PAGED_FAIL (one per instance, as test calls
+/// go), with `FAILED` set once the pager failed its first request: the
+/// handle and the flag are one word, so that a new object starts unfailed
+/// (every TEST_PAGED_FAIL's object fails once, not only the instance's
+/// first, which a second lxtest run in one shell would otherwise miss).
 static TEST_FAIL_OBJECT: AtomicU64 = AtomicU64::new(0);
-static FAILED_ONCE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+const FAILED: u64 = 1 << 63;
 
 /// The instance's service thread (the pager thread): supplies the pages
 /// threads wait for (/data's from the disk, `datafs`; the tests' paged
@@ -186,8 +191,9 @@ fn pager() -> ! {
             continue;
         }
         if request.key == TEST_KEY + 2 {
-            let handle = TEST_FAIL_OBJECT.load(Ordering::Acquire);
-            if !FAILED_ONCE.swap(true, Ordering::Relaxed) {
+            let state = TEST_FAIL_OBJECT.fetch_or(FAILED, Ordering::AcqRel);
+            let handle = state & !FAILED;
+            if state & FAILED == 0 {
                 syscall(SYS_MO_FAIL, [handle, request.offset, 0, 0, 0, 0]);
             } else {
                 let text = b"retry";
@@ -292,7 +298,12 @@ fn test(nr: u64, addr: u64) -> i64 {
             if h < 0 {
                 return h;
             }
-            TEST_FAIL_OBJECT.store(h as u64, Ordering::Release);
+            // The new object, not yet failed; the last call's handle goes
+            // (its mappings keep that object as long as they last).
+            let old = TEST_FAIL_OBJECT.swap(h as u64, Ordering::AcqRel) & !FAILED;
+            if old != 0 {
+                syscall(SYS_HANDLE_CLOSE, [old, 0, 0, 0, 0, 0]);
+            }
             let r = syscall(SYS_MO_MAP, [h as u64, addr, PAGE, 0, PROT_READ, MO_SHARED | MO_FIXED]);
             if r < 0 { r } else { 0 }
         }
