@@ -17,7 +17,9 @@
 //! table and ends the thread). So a dying thread sleeps for a lock as any
 //! other, for at most a second (the kernel's grace): a holder that does not
 //! let go by then is wedged, and the dying thread ends where it is
-//! (`abandon`) rather than wait on.
+//! (`abandon`) rather than wait on, unless it holds such locks itself (they
+//! would never be let go of). Locks held across waits for other parties or
+//! copies of program memory are `SleepLock`s, whose waits end on death.
 //!
 //! Priority: the server runs on its programs' threads, with their nice
 //! values. A low-priority thread preempted while it holds a lock would
@@ -77,10 +79,16 @@ fn unhold() {
 
 const EINTR: i64 = 4;
 
-/// A dying thread waited a second for a lock whose holder does not let go: it ends here
-/// (the kernel lets go of what it holds; its descriptor table goes on the worker).
+/// A dying thread waited a second for a lock whose holder does not let go. Holding no
+/// lock of its own, it ends here (the kernel lets go of what it holds; its descriptor table
+/// goes on the worker). Holding some, it must not: they would never be let go of and would
+/// wedge the instance; it waits on (another grace) for the holder, which these locks'
+/// rule (bounded work only) makes let go.
 #[cold]
-fn abandon() -> ! {
+fn abandon() {
+    if held().load(Ordering::Relaxed) != 0 {
+        return;
+    }
     let msg = "[linux] a dying thread gave up a server lock its holder did not let go of\n";
     syscall(restricted::SYS_SERVER_LOG, [msg.as_ptr() as u64, msg.len() as u64, 0, 0, 0, 0]);
     syscall(restricted::SYS_THREAD_EXIT, [9, 0, 0, 0, 0, 0]);
@@ -139,6 +147,48 @@ impl<T> Drop for MutexGuard<'_, T> {
             syscall(SYS_SERVER_FUTEX_WAKE, [addr, 1, 0, 0, 0, 0]);
         }
         unhold();
+    }
+}
+
+/// A lock held across waits for other parties and copies of program memory (a socket's or
+/// a pipe's readers and writers, as Linux's iolock or pipe mutex): no lock of the kind above,
+/// whose holders only do bounded work. Its wait ends with EINTR when the waiting thread dies
+/// (a holder may wait for a page of a program's file or for netd as long as they take), and
+/// it is not counted among the thread's held locks (no priority boost, no say in `abandon`).
+pub struct SleepLock {
+    state: AtomicU32,
+}
+
+impl SleepLock {
+    pub const fn new() -> Self {
+        SleepLock { state: AtomicU32::new(0) }
+    }
+
+    /// Takes the lock; EINTR if the thread dies while it waits.
+    pub fn lock(&self) -> Result<SleepGuard<'_>, i64> {
+        if self.state.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            while self.state.swap(2, Ordering::Acquire) != 0 {
+                let addr = &self.state as *const AtomicU32 as u64;
+                if syscall(SYS_SERVER_FUTEX_WAIT, [addr, 2, 0, 0, 0, 0]) == -EINTR {
+                    // (Others may still wait: the word stays 2, so the holder wakes one.)
+                    return Err(EINTR);
+                }
+            }
+        }
+        Ok(SleepGuard { lock: self })
+    }
+}
+
+pub struct SleepGuard<'a> {
+    lock: &'a SleepLock,
+}
+
+impl Drop for SleepGuard<'_> {
+    fn drop(&mut self) {
+        if self.lock.state.swap(0, Ordering::Release) == 2 {
+            let addr = &self.lock.state as *const AtomicU32 as u64;
+            syscall(SYS_SERVER_FUTEX_WAKE, [addr, 1, 0, 0, 0, 0]);
+        }
     }
 }
 

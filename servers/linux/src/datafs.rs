@@ -1349,17 +1349,20 @@ fn truncate_file(inode: &Arc<DInode>, len: u64) -> Result<(), i64> {
 /// (at most `wait` ns: pins that do not go, a grant diskfs never lets go
 /// of, end it with EBUSY).
 fn cache_truncate(inode: &DInode, object: u64, len: u64, wait: u64) -> Result<(), i64> {
+    const EINTR: i64 = 4;
     let deadline = now() + wait;
     loop {
         let seen = inode.filled.load(Ordering::Acquire);
         match syscall(SYS_MO_TRUNCATE, [object, len, 0, 0, 0, 0]) {
             r if r == -EBUSY && now() >= deadline => return Err(EBUSY),
-            r if r == -EBUSY && inode.fills.load(Ordering::Acquire) > 0 => {
-                syscall(SYS_SERVER_FUTEX_WAIT, [&inode.filled as *const AtomicU32 as u64, seen as u64, deadline, 0, 0, 0]);
-            }
             r if r == -EBUSY => {
-                // Pinned by a grant still draining: a little later.
-                syscall(SYS_SLEEP_UNTIL, [(now() + 1_000_000).min(deadline), 0, 0, 0, 0, 0]);
+                // The fills that pin pages end, or (pinned by a grant still draining) a little
+                // later; a thread that dies meanwhile stops waiting (a wait that only death
+                // ends early: a pending signal does not make it spin).
+                let until = if inode.fills.load(Ordering::Acquire) > 0 { deadline } else { (now() + 1_000_000).min(deadline) };
+                if syscall(SYS_SERVER_FUTEX_WAIT, [&inode.filled as *const AtomicU32 as u64, seen as u64, until, 0, 0, 0]) == -EINTR {
+                    return Err(EINTR);
+                }
             }
             r if r < 0 => return Err(-r),
             _ => return Ok(()),

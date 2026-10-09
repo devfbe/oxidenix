@@ -83,7 +83,7 @@ pub struct Shared {
     inner: Mutex<Inner>,
     /// Reads, one at a time: held across the copy to the program, where
     /// `inner` is not (see `drain`). Never taken by a service thread.
-    rlock: Mutex<()>,
+    rlock: crate::sync::SleepLock,
     /// Bumped on every change; waiters sleep on it.
     seq: AtomicU32,
     /// Its inode number (fstat, /proc/<pid>/fd's "pipe:[ino]"): every end's.
@@ -109,7 +109,7 @@ pub fn new() -> (Arc<PipeEnd>, Arc<PipeEnd>) {
     ];
     let shared = Arc::new(Shared {
         inner: Mutex::new(Inner { buf: VecDeque::new(), readers: 1, writers: 1, ends }),
-        rlock: Mutex::new(()),
+        rlock: crate::sync::SleepLock::new(),
         seq: AtomicU32::new(0),
         ino: rid,
     });
@@ -256,7 +256,7 @@ impl PipeEnd {
         if sink.room() == 0 {
             return Ok(0);
         }
-        let mut reader = Some(self.shared.rlock.lock());
+        let mut reader = Some(self.shared.rlock.lock()?);
         loop {
             let seen;
             {
@@ -278,7 +278,7 @@ impl PipeEnd {
             // Not holding the other readers off while it sleeps.
             drop(reader.take());
             self.shared.wait(seen)?;
-            reader = Some(self.shared.rlock.lock());
+            reader = Some(self.shared.rlock.lock()?);
         }
     }
 

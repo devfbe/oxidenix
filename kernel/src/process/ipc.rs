@@ -370,6 +370,11 @@ pub fn wait_for(name: &str, timeout: u64) -> Option<(usize, u64)> {
         if now >= deadline {
             return None;
         }
-        let _ = super::sleep_until(now.saturating_add(crate::timer::TICK_NS).min(deadline));
+        // A dying caller stops waiting; a signal does not end the wait (a
+        // tick's sleep that a pending signal would not end, so no spin).
+        if super::signal::dying() {
+            return None;
+        }
+        super::sched::prepare_to_sleep().sleep_until(now.saturating_add(crate::timer::TICK_NS).min(deadline));
     }
 }

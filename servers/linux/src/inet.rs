@@ -125,8 +125,8 @@ pub struct InetSock {
     /// Its open file description's id.
     id: AtomicU64,
     rings: Mutex<Option<Rings>>,
-    rlock: Mutex<()>,
-    wlock: Mutex<()>,
+    rlock: crate::sync::SleepLock,
+    wlock: crate::sync::SleepLock,
     pub st: Mutex<Local>,
 }
 
@@ -162,8 +162,8 @@ impl InetSock {
             index,
             id: AtomicU64::new(0),
             rings: Mutex::new(rings),
-            rlock: Mutex::new(()),
-            wlock: Mutex::new(()),
+            rlock: crate::sync::SleepLock::new(),
+            wlock: crate::sync::SleepLock::new(),
             st: Mutex::new(Local {
                 connecting: false,
                 rings_sent,
@@ -615,7 +615,7 @@ impl InetSock {
         if self.kind == Kind::Tcp && connected && !self.net.is_dead() {
             // The FIN after what the send ring holds (writers are done:
             // the send lock).
-            let _w = self.wlock.lock();
+            let _w = self.wlock.lock()?;
             self.net.status(Request::Shutdown { sock: self.index, how: bits })?;
         }
         if self.kind == Kind::Tcp && !connected && bits & netring::SHUT_RD != 0 && self.st.lock().listening {
@@ -655,7 +655,7 @@ impl InetSock {
         let timeout = self.st.lock().opts.sndtimeo;
         let deadline = deadline(timeout);
         let mut sent = 0usize;
-        let mut writer = Some(self.wlock.lock());
+        let mut writer = Some(self.wlock.lock()?);
         loop {
             let seen = self.ctl().seen();
             let snap = self.snap();
@@ -727,7 +727,7 @@ impl InetSock {
                 }
                 return Err(e);
             }
-            writer = Some(self.wlock.lock());
+            writer = Some(self.wlock.lock()?);
         }
         drop(writer);
         self.changed();
@@ -748,7 +748,7 @@ impl InetSock {
             return Err(EPIPE);
         }
         let deadline = deadline(self.st.lock().opts.sndtimeo);
-        let mut writer = Some(self.wlock.lock());
+        let mut writer = Some(self.wlock.lock()?);
         // The datagram at the start of the send ring (a plain buffer for a
         // datagram socket), copied once.
         let buf = unsafe { core::slice::from_raw_parts_mut(r.tx(), len) };
@@ -764,7 +764,7 @@ impl InetSock {
                 return Err(self.pending(&mut self.st.lock(), &self.snap(), true).unwrap_or(EIO));
             }
             if writer.is_none() {
-                writer = Some(self.wlock.lock());
+                writer = Some(self.wlock.lock()?);
                 buf.copy_from_slice(kept.as_deref().expect("kept before the wait"));
             }
             let seen = self.ctl().seen();
@@ -803,7 +803,7 @@ impl InetSock {
         // Linux's sock_rcvlowat: MSG_WAITALL wants all, else SO_RCVLOWAT.
         let target = if o.waitall && !o.peek { want } else { want.min(lowat) };
         let mut copied = 0usize;
-        let mut reader = Some(self.rlock.lock());
+        let mut reader = Some(self.rlock.lock()?);
         loop {
             let seen = self.ctl().seen();
             let snap = self.snap();
@@ -881,7 +881,7 @@ impl InetSock {
                 }
                 return Err(e);
             }
-            reader = Some(self.rlock.lock());
+            reader = Some(self.rlock.lock()?);
         }
         drop(reader);
         if !o.peek {
@@ -893,7 +893,7 @@ impl InetSock {
     fn recv_datagram(&self, dst: &mut Sink, o: RecvOpts) -> Result<Received, i64> {
         let deadline = deadline(self.st.lock().opts.rcvtimeo);
         let Some(r) = self.rings() else { return Err(EIO) };
-        let mut reader = Some(self.rlock.lock());
+        let mut reader = Some(self.rlock.lock()?);
         loop {
             let seen = self.ctl().seen();
             let snap = self.snap();
@@ -948,7 +948,7 @@ impl InetSock {
             // Not holding the other readers off while it sleeps.
             drop(reader.take());
             self.wait(seen, deadline)?;
-            reader = Some(self.rlock.lock());
+            reader = Some(self.rlock.lock()?);
         }
     }
 

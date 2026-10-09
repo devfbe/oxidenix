@@ -66,10 +66,27 @@ const DONE: u32 = 3;
 
 /// Sleeps while `word` holds `value` (a server futex: on a ring word the
 /// channel's object, else the server's own memory). A thread being killed
-/// cannot sleep: it yields instead, and its caller polls.
+/// cannot sleep for long: its caller polls (a request in flight is the
+/// service's until it completes or `REQUEST_TIMEOUT` gives the service up),
+/// so it naps a millisecond at a time rather than spin.
 pub fn futex_wait(word: &AtomicU32, value: u32) {
     let r = syscall(SYS_SERVER_FUTEX_WAIT, [word as *const AtomicU32 as u64, value as u64, 0, 0, 0, 0]);
     if r == -EINTR {
+        dying_nap(word, value, 0);
+    }
+}
+
+/// A dying thread's pause while it polls: a millisecond (or until `deadline`, if earlier).
+/// Only a lock's wait still sleeps for the dying (`FUTEX_LOCK`, within its grace, on the
+/// server's own memory): on a word nobody wakes, it is a timed nap. (`word` and `value`:
+/// what the caller waits for, looked at again by its loop.)
+fn dying_nap(_word: &AtomicU32, _value: u32, deadline: u64) {
+    static NAP: AtomicU32 = AtomicU32::new(0);
+    let mut until = now() + 1_000_000;
+    if deadline != 0 {
+        until = until.min(deadline);
+    }
+    if syscall(SYS_SERVER_FUTEX_WAIT, [&NAP as *const AtomicU32 as u64, 0, until, restricted::FUTEX_LOCK, 0, 0]) == -EINTR {
         syscall(SYS_YIELD, [0; 6]);
     }
 }
@@ -102,7 +119,7 @@ impl Wait for TimedDoorbell {
     fn wait(&self, word: &AtomicU32, value: u32) {
         let r = syscall(SYS_SERVER_FUTEX_WAIT, [word as *const AtomicU32 as u64, value as u64, self.0, 0, 0, 0]);
         if r == -EINTR {
-            syscall(SYS_YIELD, [0; 6]);
+            dying_nap(word, value, self.0);
         }
     }
 
