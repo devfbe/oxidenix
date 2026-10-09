@@ -71,7 +71,8 @@ An AI research project; see README.md.
   - The Linux server: `servers/linux/src/main.rs` (dispatch order mm → time → files → paths →
     pass-through), `namespace.rs`/`paths.rs` (paths, mounts), `tmpfs.rs`/`tmpfile.rs` (root fs),
     `datafs.rs`/`datafile.rs`/`fsclient.rs` (`/data` and its page cache over the I/O rings),
-    `netdev.rs`/`netlink.rs` + `crates/netlink` (interfaces, `NETLINK_ROUTE`).
+    `netdev.rs`/`netlink.rs` + `crates/netlink` (interfaces, `NETLINK_ROUTE`), `inotify.rs`.
+  - Node.js: `userspace/node` (build, smoke tests `tests/*.test.mjs`, runner `run-node.sh`).
   - Memory: `kernel/src/memory/`, `kernel/src/process/address_space.rs`, page cache
     `kernel/src/fs/cache.rs`.
   - Other servers and their protocols: `servers/diskfs` + `crates/fsring` + `crates/ext2fs`,

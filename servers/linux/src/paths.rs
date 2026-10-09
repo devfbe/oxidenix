@@ -4,14 +4,16 @@
 //! Each call resolves its path in the server's namespace (`namespace`) and
 //! acts on the inode it reaches: one of the server's tmpfs, one of /data
 //! (`datafs`), or one of the kernel's tree through its handle. The semantics are the kernel's VFS's,
-//! which they replace: no permission checks (one user), timestamps not
-//! stored, and a descriptor's or the working directory's path is the one
-//! it was opened by (normalized, symlinks not replaced). New: umask(2) is
-//! real.
+//! which they replace: no permission checks and no owners (one user), and
+//! a descriptor's or the working directory's path is the one it was
+//! opened by (normalized, symlinks not replaced). New: umask(2) is real,
+//! and so are the files' times (utimensat and the calls that change them),
+//! statx, and the inotify events of what the calls do.
 
 use crate::datafile;
 use crate::datafs;
 use crate::files;
+use crate::inotify;
 use crate::namespace::{check, mode_of, resolve, resolve_parent, KInode, Node, Resolved, EBUSY, ENOENT, ENOTDIR, EXDEV};
 use crate::records;
 use crate::syscall;
@@ -21,10 +23,14 @@ use crate::usercopy::{self, read_cstr};
 use alloc::string::String;
 use restricted::*;
 use vfs::path::join;
+use vfs::stat::SetTime;
 
 const EEXIST: i64 = 17;
 const ERANGE: i64 = 34;
 const ELOOP: i64 = 40;
+const EINVAL: i64 = 22;
+const EFAULT: i64 = 14;
+const EOPNOTSUPP: i64 = 95;
 
 const AT_FDCWD: i32 = -100;
 const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
@@ -51,6 +57,12 @@ const SYS_UNLINK: u64 = 87;
 const SYS_SYMLINK: u64 = 88;
 const SYS_READLINK: u64 = 89;
 const SYS_CHMOD: u64 = 90;
+const SYS_FCHMOD: u64 = 91;
+const SYS_CHOWN: u64 = 92;
+const SYS_FCHOWN: u64 = 93;
+const SYS_LCHOWN: u64 = 94;
+const SYS_FCHOWNAT: u64 = 260;
+const SYS_FCHMODAT2: u64 = 452;
 const SYS_UMASK: u64 = 95;
 const SYS_STATFS: u64 = 137;
 const SYS_UTIMES: u64 = 235;
@@ -82,7 +94,7 @@ pub fn handle(s: &State) -> Option<i64> {
         SYS_LSTAT => fstatat(CWD, a0, a1, AT_SYMLINK_NOFOLLOW),
         SYS_NEWFSTATAT => {
             if a3 & AT_EMPTY_PATH != 0 && path_is_empty(a1) {
-                stat_dirfd(a0).and_then(|st| usercopy::to_program(a2, &st)).map(|_| 0)
+                stat_dirfd(a0).and_then(|st| usercopy::to_program(a2, &st.to_bytes())).map(|_| 0)
             } else {
                 fstatat(a0, a1, a2, a3)
             }
@@ -94,7 +106,11 @@ pub fn handle(s: &State) -> Option<i64> {
             Ok(()) => return None,
             Err(e) => Err(e),
         },
-        SYS_TRUNCATE => at(CWD, a0, true).and_then(|r| truncate(&r.node, a1)),
+        SYS_TRUNCATE => at(CWD, a0, true).and_then(|r| {
+            truncate(&r.node, a1)?;
+            notify(&r.node, &join(&r.path), inotify::IN_MODIFY);
+            Ok(0)
+        }),
         SYS_GETCWD => getcwd(a0, a1),
         SYS_CHDIR => chdir(a0),
         SYS_FCHDIR => fchdir(a0),
@@ -111,14 +127,19 @@ pub fn handle(s: &State) -> Option<i64> {
         SYS_READLINKAT => readlinkat(a0, a1, a2, a3),
         SYS_CHMOD => chmodat(CWD, a0, a1),
         SYS_FCHMODAT => chmodat(a0, a1, a2),
+        SYS_FCHMOD => fchmod(a0, a1),
+        SYS_FCHMODAT2 => fchmodat2(a0, a1, a2, a3),
+        SYS_CHOWN => chownat(CWD, a0, 0),
+        SYS_LCHOWN => chownat(CWD, a0, AT_SYMLINK_NOFOLLOW),
+        SYS_FCHOWN => fd_inode(a0).and_then(chown_target),
+        SYS_FCHOWNAT => chownat(a0, a1, s.r8),
         SYS_STATX => statx(a0, a1, a2 as u32, a3 as u32, s.r8),
+        inotify::SYS_INOTIFY_ADD_WATCH => inotify_add_watch(a0, a1, a2 as u32),
         SYS_UMASK => Ok(umask(a0 as u32) as i64),
         SYS_STATFS => statfs(a0, a1),
-        // Timestamps are not stored: these only check the target exists.
-        SYS_UTIMES => at(CWD, a0, true).map(|_| 0),
-        SYS_FUTIMESAT if a1 != 0 => at(a0, a1, true).map(|_| 0),
-        SYS_UTIMENSAT if a1 != 0 => at(a0, a1, a3 & AT_SYMLINK_NOFOLLOW == 0).map(|_| 0),
-        SYS_UTIMENSAT | SYS_FUTIMESAT if files::tmp_of(a0).is_some() || files::data_of(a0).is_some() => Ok(0),
+        SYS_UTIMES => utimes(CWD, a0, a1),
+        SYS_FUTIMESAT => utimes(a0, a1, a2),
+        SYS_UTIMENSAT => utimensat(a0, a1, a2, a3),
         _ => return None,
     };
     Some(result.unwrap_or_else(|e| -e))
@@ -240,6 +261,7 @@ fn openat(dirfd: u64, addr: u64, flags: u32, mode: u32) -> Result<i64, i64> {
                 let perm = mode & !umask_now() & 0o7777;
                 match create(&dir.node, &name, NEW_FILE, perm) {
                     Ok(node) => {
+                        inotify::child(&dir.node, inotify::IN_CREATE, &name, false);
                         break Resolved { node, mode: vfs::S_IFREG | perm, path: vfs::path::normalize(&base, &path) };
                     }
                     Err(EEXIST) if flags & O_EXCL == 0 && !retried => {
@@ -270,12 +292,22 @@ fn fstatat(dirfd: u64, addr: u64, buf: u64, flags: u64) -> Result<i64, i64> {
     Ok(0)
 }
 
+/// inotify_add_watch(fd, path, mask): a watch on the file at `path` (its
+/// final symlink followed unless IN_DONT_FOLLOW).
+fn inotify_add_watch(fd: u64, addr: u64, mask: u32) -> Result<i64, i64> {
+    const IN_DONT_FOLLOW: u32 = 0x0200_0000;
+    let instance = inotify::instance(fd)?;
+    let r = at(CWD, addr, mask & IN_DONT_FOLLOW == 0)?;
+    let is_dir = r.mode & vfs::S_IFMT == vfs::S_IFDIR;
+    instance.add_watch(r.node, is_dir, mask)
+}
+
 /// The `struct stat` an empty path with AT_EMPTY_PATH names: descriptor
 /// `dirfd` itself (any kind), or the working directory for AT_FDCWD.
-fn stat_dirfd(dirfd: u64) -> Result<[u8; 144], i64> {
+fn stat_dirfd(dirfd: u64) -> Result<vfs::stat::Stat, i64> {
     if dirfd as i32 == AT_FDCWD {
         let cwd = records::current().state.lock().cwd.clone();
-        return resolve(&cwd, &cwd, true)?.node.stat();
+        return resolve(&cwd, &cwd, true)?.node.status();
     }
     files::stat_of(dirfd)
 }
@@ -286,7 +318,7 @@ fn stat_dirfd(dirfd: u64) -> Result<[u8; 144], i64> {
 /// AT_EMPTY_PATH (or none at all, as since Linux 6.11) means `dirfd`
 /// itself, any descriptor, or the working directory for AT_FDCWD.
 fn statx(dirfd: u64, addr: u64, flags: u32, mask: u32, buf: u64) -> Result<i64, i64> {
-    use vfs::stat::{statx_check, Stat};
+    use vfs::stat::statx_check;
     statx_check(flags, mask)?;
     let empty_path_ok = flags as u64 & AT_EMPTY_PATH != 0;
     let path = if addr == 0 && empty_path_ok { String::new() } else { read_cstr(addr)? };
@@ -296,9 +328,9 @@ fn statx(dirfd: u64, addr: u64, flags: u32, mask: u32, buf: u64) -> Result<i64, 
         }
         stat_dirfd(dirfd)?
     } else {
-        resolve(&base_dir(dirfd, &path)?, &path, flags as u64 & AT_SYMLINK_NOFOLLOW == 0)?.node.stat()?
+        resolve(&base_dir(dirfd, &path)?, &path, flags as u64 & AT_SYMLINK_NOFOLLOW == 0)?.node.status()?
     };
-    usercopy::to_program(buf, &Stat::from_bytes(&st).to_statx())?;
+    usercopy::to_program(buf, &st.to_statx())?;
     Ok(0)
 }
 
@@ -334,34 +366,81 @@ fn fchdir(fd: u64) -> Result<i64, i64> {
 fn renameat(odirfd: u64, oaddr: u64, ndirfd: u64, naddr: u64) -> Result<i64, i64> {
     let (odir, oname) = parent_at(odirfd, oaddr)?;
     let (ndir, nname) = parent_at(ndirfd, naddr)?;
+    // What moves and what it replaces, for their watches.
+    let (moving, replaced) = if inotify::active() { (watched_child(&odir.node, &oname), watched_child(&ndir.node, &nname)) } else { (None, None) };
     match (&odir.node, &ndir.node) {
-        (Node::Kernel(o), Node::Kernel(n)) => check(syscall(
-            SYS_INODE_RENAME,
-            [o.handle(), oname.as_ptr() as u64, oname.len() as u64, n.handle(), nname.as_ptr() as u64, nname.len() as u64],
-        )),
-        (Node::Tmp(o), Node::Tmp(n)) => tmpfs::rename(o, &oname, n, &nname).map(|_| 0),
-        (Node::Data(o), Node::Data(n)) => datafs::rename(o, &oname, n, &nname).map(|_| 0),
-        _ => Err(EXDEV),
+        (Node::Kernel(o), Node::Kernel(n)) => {
+            check(syscall(
+                SYS_INODE_RENAME,
+                [o.handle(), oname.as_ptr() as u64, oname.len() as u64, n.handle(), nname.as_ptr() as u64, nname.len() as u64],
+            ))?;
+        }
+        (Node::Tmp(o), Node::Tmp(n)) => tmpfs::rename(o, &oname, n, &nname)?,
+        (Node::Data(o), Node::Data(n)) => datafs::rename(o, &oname, n, &nname)?,
+        _ => return Err(EXDEV),
     }
+    if let Some((key, is_dir, _)) = moving {
+        if replaced.is_some_and(|r| r.0 == key) {
+            return Ok(0);
+        }
+        inotify::moved(&odir.node, &oname, &ndir.node, &nname, Some(key), is_dir);
+        if let Some((rkey, rdir, links)) = replaced {
+            if !rdir {
+                inotify::event(rkey, false, inotify::IN_ATTRIB, None);
+            }
+            if rdir || links <= 1 {
+                inotify::deleted(rkey, rdir);
+            }
+        }
+    }
+    Ok(0)
 }
 
 fn mkdirat(dirfd: u64, addr: u64, mode: u32) -> Result<i64, i64> {
     // A mount point exists.
     let (dir, name) = parent_at(dirfd, addr).map_err(|e| if e == EBUSY { EEXIST } else { e })?;
     let perm = mode & !umask_now() & 0o7777;
-    create(&dir.node, &name, NEW_DIR, perm).map(|_| 0)
+    create(&dir.node, &name, NEW_DIR, perm)?;
+    inotify::child(&dir.node, inotify::IN_CREATE, &name, true);
+    Ok(0)
 }
 
 fn unlinkat(dirfd: u64, addr: u64, flags: u64) -> Result<i64, i64> {
     let (dir, name) = parent_at(dirfd, addr)?;
     let dir_only = flags & AT_REMOVEDIR != 0;
+    // What the name holds, for its watches (when there are any).
+    let victim = if inotify::active() { watched_child(&dir.node, &name) } else { None };
     match &dir.node {
         Node::Kernel(d) => {
-            check(syscall(SYS_INODE_UNLINK, [d.handle(), name.as_ptr() as u64, name.len() as u64, dir_only as u64, 0, 0]))
+            check(syscall(SYS_INODE_UNLINK, [d.handle(), name.as_ptr() as u64, name.len() as u64, dir_only as u64, 0, 0]))?;
         }
-        Node::Tmp(d) => d.unlink(&name, dir_only).map(|_| 0),
-        Node::Data(d) => datafs::unlink(d, &name, dir_only).map(|_| 0),
+        Node::Tmp(d) => d.unlink(&name, dir_only)?,
+        Node::Data(d) => datafs::unlink(d, &name, dir_only)?,
     }
+    if let Some((key, is_dir, links)) = victim {
+        // As Linux: the link count's IN_ATTRIB, the name's IN_DELETE, then
+        // IN_DELETE_SELF if that was the last link.
+        if !is_dir {
+            inotify::event(key, false, inotify::IN_ATTRIB, None);
+        }
+        inotify::child(&dir.node, inotify::IN_DELETE, &name, is_dir);
+        if is_dir || links <= 1 {
+            inotify::deleted(key, is_dir);
+        }
+    }
+    Ok(0)
+}
+
+/// The inode `name` in `dir` names, for inotify: its key, whether it is a
+/// directory, its link count (None for the kernel's tree or no such name).
+fn watched_child(dir: &Node, name: &str) -> Option<(inotify::Key, bool, u64)> {
+    let node = match dir {
+        Node::Kernel(_) => return None,
+        Node::Tmp(d) => Node::Tmp(d.lookup(name).ok()?),
+        Node::Data(d) => Node::Data(datafs::lookup(d, name).ok()?),
+    };
+    let st = node.status().ok()?;
+    Some((inotify::Key::of(&node)?, st.mode & vfs::S_IFMT == vfs::S_IFDIR, st.nlink))
 }
 
 fn symlinkat(target: u64, dirfd: u64, addr: u64) -> Result<i64, i64> {
@@ -374,7 +453,9 @@ fn symlinkat(target: u64, dirfd: u64, addr: u64) -> Result<i64, i64> {
         )),
         Node::Tmp(d) => d.symlink(&name, target).map(|_| 0),
         Node::Data(d) => datafs::create(d, &name, datafs::New::Symlink(&target), 0o777).map(|_| 0),
-    }
+    }?;
+    inotify::child(&dir.node, inotify::IN_CREATE, &name, false);
+    Ok(0)
 }
 
 fn readlinkat(dirfd: u64, addr: u64, buf: u64, size: u64) -> Result<i64, i64> {
@@ -387,7 +468,13 @@ fn readlinkat(dirfd: u64, addr: u64, buf: u64, size: u64) -> Result<i64, i64> {
 
 fn chmodat(dirfd: u64, addr: u64, mode: u64) -> Result<i64, i64> {
     let r = at(dirfd, addr, true)?;
-    match &r.node {
+    chmod_node(&r.node, mode)?;
+    attrib(&r.node, &join(&r.path));
+    Ok(0)
+}
+
+fn chmod_node(node: &Node, mode: u64) -> Result<i64, i64> {
+    match node {
         Node::Kernel(k) => check(syscall(SYS_INODE_CHMOD, [k.handle(), mode, 0, 0, 0, 0])),
         Node::Tmp(t) => {
             t.set_perm(mode as u32);
@@ -395,6 +482,166 @@ fn chmodat(dirfd: u64, addr: u64, mode: u64) -> Result<i64, i64> {
         }
         Node::Data(d) => datafs::chmod(d, mode as u32).map(|_| 0),
     }
+}
+
+/// IN_ATTRIB for the inode reached by `path`, and its directory.
+fn attrib(node: &Node, path: &str) {
+    notify(node, path, inotify::IN_ATTRIB);
+}
+
+/// Event `mask` for the inode reached by `path`, and its directory.
+fn notify(node: &Node, path: &str, mask: u32) {
+    if !inotify::active() {
+        return;
+    }
+    if let Some(key) = inotify::Key::of(node) {
+        let is_dir = node.status().is_ok_and(|s| s.mode & vfs::S_IFMT == vfs::S_IFDIR);
+        inotify::on_path(key, is_dir, mask, path);
+    }
+}
+
+/// The file a descriptor names and the path it was opened by, for the
+/// calls that change its inode (fchmod, fchown, futimens): None for one
+/// without a path of its own (a pipe, a socket, an eventfd), whose inode is
+/// anonymous.
+fn fd_inode(fd: u64) -> Result<Option<(Node, String)>, i64> {
+    match fd_node(fd) {
+        Ok(found) => Ok(Some(found)),
+        Err(ENOTDIR) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// The working directory and its path.
+fn cwd_inode() -> Result<(Node, String), i64> {
+    let cwd = records::current().state.lock().cwd.clone();
+    let node = resolve(&cwd, &cwd, true)?.node;
+    Ok((node, cwd))
+}
+
+/// The inode an *at call with AT_EMPTY_PATH and an empty path names:
+/// `dirfd` itself, or the working directory.
+fn empty_path_target(dirfd: u64) -> Result<Option<(Node, String)>, i64> {
+    if dirfd as i32 == AT_FDCWD { cwd_inode().map(Some) } else { fd_inode(dirfd) }
+}
+
+/// fchmod(fd, mode). An anonymous inode's mode (a pipe's, a socket's) is
+/// fixed here: the call succeeds without changing it.
+fn fchmod(fd: u64, mode: u64) -> Result<i64, i64> {
+    chmod_target(fd_inode(fd)?, mode)
+}
+
+fn chmod_target(target: Option<(Node, String)>, mode: u64) -> Result<i64, i64> {
+    if let Some((node, path)) = target {
+        chmod_node(&node, mode)?;
+        attrib(&node, &path);
+    }
+    Ok(0)
+}
+
+/// fchmodat2(dirfd, path, mode, flags): with AT_SYMLINK_NOFOLLOW a symlink
+/// itself (EOPNOTSUPP: Linux's filesystems keep no mode for one), with
+/// AT_EMPTY_PATH and an empty path `dirfd` itself.
+fn fchmodat2(dirfd: u64, addr: u64, mode: u64, flags: u64) -> Result<i64, i64> {
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        return Err(EINVAL);
+    }
+    if flags & AT_EMPTY_PATH != 0 && path_is_empty(addr) {
+        return chmod_target(empty_path_target(dirfd)?, mode);
+    }
+    let r = at(dirfd, addr, flags & AT_SYMLINK_NOFOLLOW == 0)?;
+    if r.mode & vfs::S_IFMT == vfs::S_IFLNK {
+        return Err(EOPNOTSUPP);
+    }
+    chmod_target(Some((r.node, join(&r.path))), mode)
+}
+
+/// Sets the times of a target (the kernel's files keep theirs: /dev,
+/// /proc; an anonymous inode's are not kept).
+fn set_times(target: Option<(Node, String)>, atime: SetTime, mtime: SetTime) -> Result<i64, i64> {
+    let Some((node, path)) = target else { return Ok(0) };
+    match &node {
+        Node::Kernel(_) => return Ok(0),
+        Node::Tmp(t) => t.set_times(atime, mtime),
+        Node::Data(d) => datafs::set_times(d, atime, mtime)?,
+    }
+    if atime != SetTime::Omit || mtime != SetTime::Omit {
+        attrib(&node, &path);
+    }
+    Ok(0)
+}
+
+/// The target of the utimes family: the path at `addr` (resolved from
+/// `dirfd`, following a final symlink with `follow`), or with a null path
+/// the descriptor `dirfd` itself.
+fn times_target(dirfd: u64, addr: u64, follow: bool) -> Result<Option<(Node, String)>, i64> {
+    if addr == 0 {
+        if dirfd as i32 == AT_FDCWD {
+            return Err(EFAULT);
+        }
+        return fd_inode(dirfd);
+    }
+    let r = at(dirfd, addr, follow)?;
+    Ok(Some((r.node, join(&r.path))))
+}
+
+/// utimes(path, tv) and futimesat(dirfd, path, tv): microseconds; no
+/// times means now.
+fn utimes(dirfd: u64, addr: u64, tv: u64) -> Result<i64, i64> {
+    let (atime, mtime) = if tv == 0 {
+        (SetTime::Now, SetTime::Now)
+    } else {
+        let [asec, ausec, msec, musec]: [i64; 4] = usercopy::read(tv)?;
+        let one = |sec: i64, usec: i64| if (0..1_000_000).contains(&usec) { Ok(SetTime::To(vfs::stat::Time { sec, nsec: usec as u32 * 1000 })) } else { Err(EINVAL) };
+        (one(asec, ausec)?, one(msec, musec)?)
+    };
+    set_times(times_target(dirfd, addr, true)?, atime, mtime)
+}
+
+/// utimensat(dirfd, path, times, flags): nanoseconds, UTIME_NOW and
+/// UTIME_OMIT; no times means now. A null path (futimens) or an empty
+/// one with AT_EMPTY_PATH is `dirfd` itself.
+fn utimensat(dirfd: u64, addr: u64, ts: u64, flags: u64) -> Result<i64, i64> {
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        return Err(EINVAL);
+    }
+    let (atime, mtime) = if ts == 0 {
+        (SetTime::Now, SetTime::Now)
+    } else {
+        let [asec, ansec, msec, mnsec]: [i64; 4] = usercopy::read(ts)?;
+        (SetTime::from_timespec(asec, ansec)?, SetTime::from_timespec(msec, mnsec)?)
+    };
+    let target = if addr != 0 && flags & AT_EMPTY_PATH != 0 && path_is_empty(addr) {
+        empty_path_target(dirfd)?
+    } else {
+        times_target(dirfd, addr, flags & AT_SYMLINK_NOFOLLOW == 0)?
+    };
+    set_times(target, atime, mtime)
+}
+
+/// The chown family: owners are not stored (one user: every file is
+/// root's, as stat says), so a change of owner checks its target and
+/// arguments and keeps it root's (an IN_ATTRIB all the same, as Linux
+/// sends for any chown). `follow`: chown resolves a final symlink, lchown
+/// does not.
+fn chownat(dirfd: u64, addr: u64, flags: u64) -> Result<i64, i64> {
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        return Err(EINVAL);
+    }
+    let target = if flags & AT_EMPTY_PATH != 0 && path_is_empty(addr) {
+        empty_path_target(dirfd)?
+    } else {
+        let r = at(dirfd, addr, flags & AT_SYMLINK_NOFOLLOW == 0)?;
+        Some((r.node, join(&r.path)))
+    };
+    chown_target(target)
+}
+
+fn chown_target(target: Option<(Node, String)>) -> Result<i64, i64> {
+    if let Some((node, path)) = target {
+        attrib(&node, &path);
+    }
+    Ok(0)
 }
 
 /// truncate(2): with the right to write, as through a writable descriptor.
@@ -406,6 +653,9 @@ fn truncate(node: &Node, len: u64) -> Result<i64, i64> {
             t.get_write()?;
             let r = check(syscall(SYS_MO_TRUNCATE, [object, len, 0, 0, 0, 0]));
             t.put_write();
+            if r.is_ok() {
+                t.modified();
+            }
             r
         }
         Node::Data(d) => {

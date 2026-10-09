@@ -6,6 +6,7 @@
 //! files did.
 
 use crate::files::{self, File, EBADF, EINVAL, O_ACCMODE, O_WRONLY};
+use crate::inotify;
 use crate::namespace::{check, ENOTDIR};
 use crate::sync::Mutex;
 use crate::syscall;
@@ -35,6 +36,7 @@ pub struct TmpOpen {
 
 impl Drop for TmpOpen {
     fn drop(&mut self) {
+        self.notify(if self.write { inotify::IN_CLOSE_WRITE } else { inotify::IN_CLOSE_NOWRITE });
         if self.write {
             self.inode.put_write();
         }
@@ -60,7 +62,10 @@ pub fn open(inode: Arc<Inode>, flags: u32, path: String) -> Result<i64, i64> {
     let open = Arc::new(TmpOpen { inode, path, offset: Mutex::new(0), snapshot: Mutex::new(None), write });
     if write && flags & O_TRUNC != 0 {
         check(syscall(SYS_MO_TRUNCATE, [open.inode.object()?, 0, 0, 0, 0, 0]))?;
+        open.inode.modified();
+        open.notify(inotify::IN_MODIFY);
     }
+    open.notify(inotify::IN_OPEN);
     let kept = flags & (O_ACCMODE | files::O_NONBLOCK | O_APPEND | files::O_CLOEXEC);
     files::install(files::new_id(), File::Tmp(open), kept, POLLIN | POLLOUT)
 }
@@ -89,7 +94,10 @@ pub fn call(nr: u64, f: &TmpOpen, flags: u32, a1: u64, a2: u64, a3: u64) -> Resu
         files::SYS_FTRUNCATE if !writable => Err(EINVAL),
         files::SYS_FTRUNCATE => {
             let object = f.inode.object().map_err(|_| EINVAL)?;
-            check(syscall(SYS_MO_TRUNCATE, [object, a1, 0, 0, 0, 0]))
+            check(syscall(SYS_MO_TRUNCATE, [object, a1, 0, 0, 0, 0]))?;
+            f.inode.modified();
+            f.notify(inotify::IN_MODIFY);
+            Ok(0)
         }
         // The contents are memory: nothing to write back.
         files::SYS_FSYNC | files::SYS_FDATASYNC => Ok(0),
@@ -114,6 +122,13 @@ pub fn statfs(buf: u64) -> Result<i64, i64> {
 }
 
 impl TmpOpen {
+    /// inotify's event `mask` for the file and its directory.
+    fn notify(&self, mask: u32) {
+        if inotify::active() {
+            inotify::on_path(inotify::Key::tmp(&self.inode), self.inode.is_dir(), mask, &self.path);
+        }
+    }
+
     fn object(&self) -> Result<u64, i64> {
         self.inode.object()
     }
@@ -138,6 +153,8 @@ impl TmpOpen {
                 Err(_) => break,
             }
         }
+        self.inode.accessed();
+        self.notify(inotify::IN_ACCESS);
         Ok(done)
     }
 
@@ -158,6 +175,10 @@ impl TmpOpen {
                 Err(e) if done == 0 => return Err(e),
                 Err(_) => break,
             }
+        }
+        if done > 0 {
+            self.inode.modified();
+            self.notify(inotify::IN_MODIFY);
         }
         Ok(done)
     }
@@ -247,6 +268,8 @@ impl TmpOpen {
         // The position moves only once the entries reached the program.
         usercopy::to_program(buf, &out)?;
         *off = next;
+        self.inode.accessed();
+        self.notify(inotify::IN_ACCESS);
         Ok(out.len() as i64)
     }
 
@@ -255,6 +278,30 @@ impl TmpOpen {
         let mut off = self.offset.lock();
         let n = check(syscall(SYS_MO_READ, [self.object()?, *off, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0]))? as usize;
         *off += n as u64;
+        self.inode.accessed();
+        Ok(n)
+    }
+
+    /// The description's file position (for the calls that take one).
+    pub fn position(&self) -> crate::sync::MutexGuard<'_, u64> {
+        self.offset.lock()
+    }
+
+    /// Reads into the server's memory at `off` (copy_file_range).
+    pub fn read_at(&self, off: u64, buf: &mut [u8]) -> Result<usize, i64> {
+        let n = check(syscall(SYS_MO_READ, [self.object()?, off, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0]))? as usize;
+        self.inode.accessed();
+        self.notify(inotify::IN_ACCESS);
+        Ok(n)
+    }
+
+    /// Writes the server's memory at `off` (copy_file_range).
+    pub fn write_at(&self, off: u64, data: &[u8]) -> Result<usize, i64> {
+        let n = check(syscall(SYS_MO_WRITE, [self.object()?, off, data.as_ptr() as u64, data.len() as u64, 0, 0]))? as usize;
+        if n > 0 {
+            self.inode.modified();
+            self.notify(inotify::IN_MODIFY);
+        }
         Ok(n)
     }
 
@@ -267,6 +314,10 @@ impl TmpOpen {
         }
         let n = check(syscall(SYS_MO_WRITE, [self.object()?, *off, data.as_ptr() as u64, data.len() as u64, 0, 0]))? as usize;
         *off += n as u64;
+        if n > 0 {
+            self.inode.modified();
+            self.notify(inotify::IN_MODIFY);
+        }
         Ok(n)
     }
 

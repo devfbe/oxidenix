@@ -3,8 +3,8 @@
 //! kernel's (`SYS_MO_CREATE_FILE`), read, written and mapped without the
 //! kernel's VFS, and charged to the same tmpfs limit as the kernel's tmpfs.
 //!
-//! Locking: each inode has its own lock (its directory map, permissions
-//! and write count). Code holds one inode lock at a time, except under
+//! Locking: each inode has its own lock (its directory map, permissions,
+//! times and write count). Code holds one inode lock at a time, except under
 //! `RENAME` (as Linux's rename mutex), which renames and removals take
 //! first: a rename then locks both directories in address order and,
 //! nested, the inode it replaces; a removal locks the directory and,
@@ -34,6 +34,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use restricted::*;
+use vfs::stat::{SetTime, Stat, Times};
 
 pub const EEXIST: i64 = 17;
 pub const EISDIR: i64 = 21;
@@ -72,6 +73,8 @@ pub enum Kind {
 pub struct State {
     pub perm: u32,
     pub kind: Kind,
+    /// Its times, with nanoseconds and a birth time (statx).
+    pub times: Times,
     /// > 0: write accesses; < 0: programs running from it (see above).
     writers: i64,
     /// A directory that was removed: nothing new goes into it (a lookup
@@ -98,7 +101,8 @@ pub fn new_root() -> Arc<Inode> {
 
 impl Inode {
     fn new(kind: Kind, perm: u32) -> Arc<Inode> {
-        Arc::new(Inode { ino: NEXT_INO.fetch_add(1, Ordering::Relaxed), state: Mutex::new(State { perm, kind, writers: 0, removed: false }), append: Mutex::new(()) })
+        let state = State { perm, kind, times: Times::new(now()), writers: 0, removed: false };
+        Arc::new(Inode { ino: NEXT_INO.fetch_add(1, Ordering::Relaxed), state: Mutex::new(state), append: Mutex::new(()) })
     }
 
     pub fn mode(&self) -> u32 {
@@ -141,28 +145,51 @@ impl Inode {
         }
     }
 
-    /// Its `struct stat`, as the kernel's tmpfs reports one.
-    pub fn stat(&self) -> [u8; 144] {
+    /// Its status: every field of `struct stat`, and the birth time.
+    pub fn status(&self) -> Stat {
         let mode = self.mode();
         let size = self.size();
-        let nlink: u64 = if mode & vfs::S_IFMT == vfs::S_IFDIR { 2 } else { 1 };
-        let time = mount_time();
-        let mut st = [0u8; 144];
-        st[0..8].copy_from_slice(&DEV.to_le_bytes());
-        st[8..16].copy_from_slice(&self.ino.to_le_bytes());
-        st[16..24].copy_from_slice(&nlink.to_le_bytes());
-        st[24..28].copy_from_slice(&mode.to_le_bytes());
-        st[48..56].copy_from_slice(&size.to_le_bytes());
-        st[56..64].copy_from_slice(&4096u64.to_le_bytes());
-        st[64..72].copy_from_slice(&size.div_ceil(512).to_le_bytes());
-        for at in [72, 88, 104] {
-            st[at..at + 8].copy_from_slice(&time.to_le_bytes());
+        let times = self.state.lock().times;
+        Stat {
+            dev: DEV,
+            ino: self.ino,
+            nlink: if mode & vfs::S_IFMT == vfs::S_IFDIR { 2 } else { 1 },
+            mode,
+            size,
+            blksize: 4096,
+            blocks: size.div_ceil(512),
+            atime: times.atime,
+            mtime: times.mtime,
+            ctime: times.ctime,
+            btime: Some(times.btime),
+            ..Stat::default()
         }
-        st
+    }
+
+    /// Its `struct stat`.
+    pub fn stat(&self) -> [u8; 144] {
+        self.status().to_bytes()
     }
 
     pub fn set_perm(&self, perm: u32) {
-        self.state.lock().perm = perm & 0o7777;
+        let mut st = self.state.lock();
+        st.perm = perm & 0o7777;
+        st.times.changed(now());
+    }
+
+    /// The contents changed (a write, a truncation).
+    pub fn modified(&self) {
+        self.state.lock().times.modified(now());
+    }
+
+    /// The contents were read (relatime).
+    pub fn accessed(&self) {
+        self.state.lock().times.accessed(now());
+    }
+
+    /// utimensat.
+    pub fn set_times(&self, atime: SetTime, mtime: SetTime) {
+        self.state.lock().times.set(atime, mtime, now());
     }
 
     /// Directory entries (name, inode number, dirent type), "." and ".."
@@ -226,6 +253,7 @@ impl Inode {
             Kind::Dir(m) if m.contains_key(name) => Err(EEXIST),
             Kind::Dir(m) => {
                 m.insert(String::from(name), inode);
+                st.times.modified(now());
                 Ok(())
             }
             _ => Err(ENOTDIR),
@@ -252,8 +280,11 @@ impl Inode {
             _ => {}
         }
         cst.removed = true;
+        let now = now();
+        cst.times.changed(now);
         drop(cst);
         let removed = m.remove(name);
+        st.times.modified(now);
         drop(st);
         drop(removed);
         Ok(())
@@ -384,6 +415,14 @@ pub fn rename(odir: &Arc<Inode>, oname: &str, ndir: &Arc<Inode>, nname: &str) ->
         Some(sm) => (Some(sm), first_map),
     };
     let replaced = move_entry(om, nm, oname, nname, &node, node_dir, odir)?;
+    // Both directories' entries changed (their locks are held), and the
+    // inode moved (nested, as above).
+    let now = now();
+    node.state.lock().times.changed(now);
+    first_guard.times.modified(now);
+    if let Some(g) = second_guard.as_mut() {
+        g.times.modified(now);
+    }
     drop(second_guard);
     drop(first_guard);
     drop(replaced);
@@ -439,6 +478,8 @@ fn move_entry(
             (Some(true), true) => est.removed = true,
             _ => {}
         }
+        // It loses its link.
+        est.times.changed(now());
     }
     let moved = match om {
         Some(om) => om.remove(oname),
@@ -489,16 +530,6 @@ pub fn dtype(mode: u32) -> u8 {
     }
 }
 
-/// The time every inode reports (the kernel's tmpfs stores no times
-/// either): when the instance's tmpfs came up, in seconds since 1970.
-fn mount_time() -> u64 {
-    static TIME: AtomicU64 = AtomicU64::new(0);
-    let t = TIME.load(Ordering::Relaxed);
-    if t != 0 {
-        return t;
-    }
-    const CLOCK_REALTIME: u64 = 0;
-    let now = syscall(SYS_CLOCK_READ, [CLOCK_REALTIME, 0, 0, 0, 0, 0]).max(0) as u64 / 1_000_000_000;
-    TIME.store(now, Ordering::Relaxed);
-    now
+fn now() -> vfs::stat::Time {
+    crate::time::realtime()
 }

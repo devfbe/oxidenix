@@ -156,6 +156,110 @@ impl Stat {
     }
 }
 
+/// utimensat's special nanosecond values: the time now, and no change.
+pub const UTIME_NOW: i64 = (1 << 30) - 1;
+pub const UTIME_OMIT: i64 = (1 << 30) - 2;
+
+/// What utimensat does to one timestamp.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SetTime {
+    Omit,
+    Now,
+    To(Time),
+}
+
+impl SetTime {
+    /// From a `struct timespec` of utimensat's (EINVAL for nanoseconds
+    /// out of range that are neither UTIME_NOW nor UTIME_OMIT).
+    pub fn from_timespec(sec: i64, nsec: i64) -> Result<SetTime, i64> {
+        match nsec {
+            UTIME_NOW => Ok(SetTime::Now),
+            UTIME_OMIT => Ok(SetTime::Omit),
+            n if (0..1_000_000_000).contains(&n) => Ok(SetTime::To(Time { sec, nsec: n as u32 })),
+            _ => Err(EINVAL),
+        }
+    }
+
+    /// The time it sets, given the time now (None: no change).
+    pub fn resolve(self, now: Time) -> Option<Time> {
+        match self {
+            SetTime::Omit => None,
+            SetTime::Now => Some(now),
+            SetTime::To(t) => Some(t),
+        }
+    }
+}
+
+/// A file's four times, as a filesystem that keeps them in memory holds
+/// them, with Linux's rules for what changes them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Times {
+    pub atime: Time,
+    pub mtime: Time,
+    pub ctime: Time,
+    pub btime: Time,
+}
+
+/// How old an access time may get before a read updates it anyway
+/// (relatime: a day).
+const RELATIME_MAX: i64 = 24 * 60 * 60;
+
+impl Times {
+    /// A new file's: all of them now.
+    pub fn new(now: Time) -> Times {
+        Times { atime: now, mtime: now, ctime: now, btime: now }
+    }
+
+    /// The contents changed (a write, a truncation, a directory's entries).
+    pub fn modified(&mut self, now: Time) {
+        self.mtime = now;
+        self.ctime = now;
+    }
+
+    /// The inode changed (permissions, links, a rename).
+    pub fn changed(&mut self, now: Time) {
+        self.ctime = now;
+    }
+
+    /// The contents were read: the access time moves as with Linux's
+    /// default `relatime`, when it is not later than the last change or a
+    /// day old. Whether it moved.
+    pub fn accessed(&mut self, now: Time) -> bool {
+        let stale = self.atime <= self.mtime || self.atime <= self.ctime || now.sec - self.atime.sec >= RELATIME_MAX;
+        if stale && self.atime != now {
+            self.atime = now;
+        }
+        stale
+    }
+
+    /// utimensat: sets what is not omitted; the change time is now unless
+    /// both are omitted (then nothing changes).
+    pub fn set(&mut self, atime: SetTime, mtime: SetTime, now: Time) {
+        if atime == SetTime::Omit && mtime == SetTime::Omit {
+            return;
+        }
+        if let Some(t) = atime.resolve(now) {
+            self.atime = t;
+        }
+        if let Some(t) = mtime.resolve(now) {
+            self.mtime = t;
+        }
+        self.ctime = now;
+    }
+}
+
+impl PartialOrd for Time {
+    fn partial_cmp(&self, other: &Time) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Time {
+    fn cmp(&self, other: &Time) -> core::cmp::Ordering {
+        (self.sec, self.nsec).cmp(&(other.sec, other.nsec))
+    }
+}
+
 /// statx's checks of its flags and mask (EINVAL), as Linux's
 /// `statx_lookup_flags` and `do_statx` make them.
 pub fn statx_check(flags: u32, mask: u32) -> Result<(), i64> {
@@ -234,6 +338,38 @@ mod tests {
         // Large numbers use the high bits (new_encode_dev).
         let dev = (0x12345u64 & 0xff) | ((0x1234 & 0xfff) << 8) | ((0x12345u64 & !0xff) << 12) | ((0x1234u64 & !0xfff) << 32);
         assert_eq!(dev_split(dev), (0x1234, 0x12345));
+    }
+
+    #[test]
+    fn utimensat_values() {
+        assert_eq!(SetTime::from_timespec(5, UTIME_NOW), Ok(SetTime::Now));
+        assert_eq!(SetTime::from_timespec(5, UTIME_OMIT), Ok(SetTime::Omit));
+        assert_eq!(SetTime::from_timespec(5, 7), Ok(SetTime::To(Time { sec: 5, nsec: 7 })));
+        assert_eq!(SetTime::from_timespec(5, 1_000_000_000), Err(EINVAL));
+        assert_eq!(SetTime::from_timespec(5, -1), Err(EINVAL));
+    }
+
+    #[test]
+    fn times() {
+        let t = |sec| Time { sec, nsec: 0 };
+        let mut x = Times::new(t(100));
+        assert_eq!(x.btime, t(100));
+        // relatime: a read after the last change moves atime once.
+        assert!(x.accessed(t(101)));
+        assert_eq!(x.atime, t(101));
+        assert!(!x.accessed(t(102)));
+        assert_eq!(x.atime, t(101));
+        x.modified(t(103));
+        assert_eq!((x.mtime, x.ctime), (t(103), t(103)));
+        assert!(x.accessed(t(104)));
+        // ... or a day later.
+        assert!(x.accessed(t(104 + 86400)));
+        x.changed(t(200_000));
+        assert_eq!((x.mtime, x.ctime), (t(103), t(200_000)));
+        x.set(SetTime::Omit, SetTime::Omit, t(300_000));
+        assert_eq!(x.ctime, t(200_000), "nothing to set: no change");
+        x.set(SetTime::To(t(5)), SetTime::Now, t(300_000));
+        assert_eq!((x.atime, x.mtime, x.ctime, x.btime), (t(5), t(300_000), t(300_000), t(100)));
     }
 
     #[test]

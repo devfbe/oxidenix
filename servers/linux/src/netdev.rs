@@ -107,8 +107,7 @@ fn netmask(prefix: u8) -> u32 {
 /// ioctl(fd, request, arg) for an interface request: on a socket of any
 /// kind (ENOTTY on another file), as netdevice(7) describes.
 pub fn ioctl(fd: u64, request: u64, arg: u64) -> Result<i64, i64> {
-    let st = files::stat_of(fd)?;
-    if u32::from_le_bytes([st[24], st[25], st[26], st[27]]) & S_IFMT != S_IFSOCK {
+    if files::stat_of(fd)?.mode & S_IFMT != S_IFSOCK {
         return Err(ENOTTY);
     }
     let all = interfaces();

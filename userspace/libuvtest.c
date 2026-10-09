@@ -1,7 +1,8 @@
 /* The Linux interfaces libuv (and so Node.js) uses beyond POSIX, all the
  * Linux server's: statx for every stat, the io_uring probe at start (no
- * io_uring: ENOSYS, quietly), and NETLINK_ROUTE for the interface list
- * (getifaddrs, os.networkInterfaces()) with the data netd has. */
+ * io_uring: ENOSYS, quietly), copy_file_range for copying files, and
+ * NETLINK_ROUTE for the interface list (getifaddrs,
+ * os.networkInterfaces()) with the data netd has. */
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
@@ -143,6 +144,69 @@ static void test_io_uring(void) {
     check("io_uring_setup is ENOSYS", setup == -1 && e1 == ENOSYS);
     check("io_uring_enter and io_uring_register too", enter == -1 && e2 == ENOSYS && reg == -1 && e3 == ENOSYS);
     check("... answered by the server (nothing passed to the kernel)", passed == 0);
+}
+
+static void test_copy_file_range(void) {
+    for (int k = 0; k < 2; k++) {
+        const char *dir = k ? "/data" : "/tmp";
+        char a[64], b[64], name[96];
+        snprintf(a, sizeof a, "%s/cfr-a.%d", dir, getpid());
+        snprintf(b, sizeof b, "%s/cfr-b.%d", dir, getpid());
+        int in = open(a, O_CREAT | O_TRUNC | O_RDWR, 0644), out = open(b, O_CREAT | O_TRUNC | O_RDWR, 0644);
+        static char data[200000];
+        for (size_t i = 0; i < sizeof data; i++) data[i] = (char)(i * 7);
+        write(in, data, sizeof data);
+        lseek(in, 0, SEEK_SET);
+        snprintf(name, sizeof name, "%s: copy_file_range copies all of it at the positions", dir);
+        ssize_t n = 0, r;
+        while ((r = copy_file_range(in, NULL, out, NULL, 65536 * 3, 0)) > 0) n += r;
+        static char back[sizeof data];
+        int same = pread(out, back, sizeof back, 0) == (ssize_t)sizeof back && memcmp(back, data, sizeof data) == 0;
+        check(name, r == 0 && n == (ssize_t)sizeof data && same && lseek(in, 0, SEEK_CUR) == (off_t)sizeof data && lseek(out, 0, SEEK_CUR) == (off_t)sizeof data);
+        loff_t oi = 10, oo = 5;
+        snprintf(name, sizeof name, "%s: ... at offsets, which move (the positions stay)", dir);
+        check(name, copy_file_range(in, &oi, out, &oo, 100, 0) == 100 && oi == 110 && oo == 105 && pread(out, back, 100, 5) == 100 &&
+                        memcmp(back, data + 10, 100) == 0 && lseek(in, 0, SEEK_CUR) == (off_t)sizeof data);
+        oi = 0;
+        oo = 50;
+        errno = 0;
+        snprintf(name, sizeof name, "%s: overlapping ranges of one file are EINVAL", dir);
+        check(name, copy_file_range(in, &oi, in, &oo, 100, 0) == -1 && errno == EINVAL);
+        errno = 0;
+        snprintf(name, sizeof name, "%s: flags are EINVAL, a read-only output EBADF", dir);
+        int ro = open(b, O_RDONLY);
+        check(name, copy_file_range(in, NULL, out, NULL, 1, 1) == -1 && errno == EINVAL && copy_file_range(in, NULL, ro, NULL, 1, 0) == -1 && errno == EBADF);
+        close(ro);
+        int app = open(b, O_WRONLY | O_APPEND);
+        errno = 0;
+        snprintf(name, sizeof name, "%s: an O_APPEND output is EBADF", dir);
+        check(name, copy_file_range(in, NULL, app, NULL, 1, 0) == -1 && errno == EBADF);
+        close(app);
+        int d = open(dir, O_RDONLY | O_DIRECTORY);
+        errno = 0;
+        snprintf(name, sizeof name, "%s: a directory is EISDIR", dir);
+        check(name, copy_file_range(d, NULL, out, NULL, 1, 0) == -1 && errno == EISDIR);
+        close(d);
+        close(in);
+        close(out);
+        unlink(a);
+        unlink(b);
+    }
+    int t = open("/tmp/cfr-x", O_CREAT | O_RDWR | O_TRUNC, 0644), dfd = open("/data/cfr-x", O_CREAT | O_RDWR | O_TRUNC, 0644);
+    write(t, "x", 1);
+    loff_t z = 0;
+    errno = 0;
+    check("copy_file_range across filesystems is EXDEV", copy_file_range(t, &z, dfd, NULL, 1, 0) == -1 && errno == EXDEV);
+    int p[2];
+    pipe(p);
+    errno = 0;
+    check("... from a pipe EINVAL", copy_file_range(p[0], NULL, dfd, NULL, 1, 0) == -1 && errno == EINVAL);
+    close(p[0]);
+    close(p[1]);
+    close(t);
+    close(dfd);
+    unlink("/tmp/cfr-x");
+    unlink("/data/cfr-x");
 }
 
 static void test_getifaddrs(void) {
@@ -365,6 +429,7 @@ static void test_netlink_socket(void) {
 int main(void) {
     test_statx();
     test_io_uring();
+    test_copy_file_range();
     test_getifaddrs();
     test_netdevice();
     test_netlink_socket();

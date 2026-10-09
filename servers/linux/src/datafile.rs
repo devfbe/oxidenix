@@ -5,6 +5,7 @@
 
 use crate::datafs::{self, DInode, HoldKind, EISDIR};
 use crate::files::{self, File, EBADF, EINVAL, O_ACCMODE, O_WRONLY};
+use crate::inotify;
 use crate::namespace::ENOTDIR;
 use crate::sync::Mutex;
 use crate::usercopy;
@@ -41,6 +42,7 @@ pub struct DataOpen {
 
 impl Drop for DataOpen {
     fn drop(&mut self) {
+        self.notify(if self.write { inotify::IN_CLOSE_WRITE } else { inotify::IN_CLOSE_NOWRITE });
         if self.write {
             datafs::put_write(&self.inode);
         }
@@ -74,7 +76,9 @@ pub fn open(inode: Arc<DInode>, flags: u32, path: String) -> Result<i64, i64> {
     });
     if write && flags & O_TRUNC != 0 {
         datafs::truncate(&open.inode, 0)?;
+        open.notify(inotify::IN_MODIFY);
     }
+    open.notify(inotify::IN_OPEN);
     let kept = flags & (O_ACCMODE | files::O_NONBLOCK | O_APPEND | files::O_CLOEXEC);
     files::install(files::new_id(), File::Data(open), kept, POLLIN | POLLOUT)
 }
@@ -103,7 +107,11 @@ pub fn call(nr: u64, f: &DataOpen, flags: u32, a1: u64, a2: u64, a3: u64) -> Res
             Ok(0)
         }
         files::SYS_FTRUNCATE if !writable || f.inode.kind != vfs::S_IFREG => Err(EINVAL),
-        files::SYS_FTRUNCATE => datafs::truncate(&f.inode, a1).map(|_| 0),
+        files::SYS_FTRUNCATE => {
+            datafs::truncate(&f.inode, a1)?;
+            f.notify(inotify::IN_MODIFY);
+            Ok(0)
+        }
         files::SYS_FSYNC | files::SYS_FDATASYNC => datafs::fsync(&f.inode).map(|_| 0),
         files::SYS_GETDENTS64 => f.getdents(a1, a2),
         files::SYS_FSTATFS => {
@@ -120,6 +128,13 @@ fn signed(offset: u64) -> Result<u64, i64> {
 }
 
 impl DataOpen {
+    /// inotify's event `mask` for the file and its directory.
+    fn notify(&self, mask: u32) {
+        if inotify::active() {
+            inotify::on_path(inotify::Key::data(&self.inode), self.inode.kind == vfs::S_IFDIR, mask, &self.path);
+        }
+    }
+
     /// Reads into the program's buffers from `offset`: as far as the file
     /// goes. An error after some bytes ends the read with them.
     fn read(&self, vecs: &[(u64, u64)], offset: u64) -> Result<u64, i64> {
@@ -141,6 +156,7 @@ impl DataOpen {
                 Err(_) => break,
             }
         }
+        self.notify(inotify::IN_ACCESS);
         Ok(done)
     }
 
@@ -161,6 +177,9 @@ impl DataOpen {
                 Err(e) if done == 0 => return Err(e),
                 Err(_) => break,
             }
+        }
+        if done > 0 {
+            self.notify(inotify::IN_MODIFY);
         }
         // O_SYNC, O_DSYNC, RWF_(D)SYNC: durable now; O_DIRECT: on the disk
         // (not flushed), as Linux.
@@ -261,6 +280,7 @@ impl DataOpen {
         // The position moves only once the entries reached the program.
         usercopy::to_program(buf, &out)?;
         *off = next;
+        self.notify(inotify::IN_ACCESS);
         Ok(out.len() as i64)
     }
 
@@ -300,10 +320,33 @@ impl DataOpen {
         if append {
             *off = datafs::size(&self.inode)?;
         }
-        let n = datafs::write_server(&self.inode, *off, data)?;
+        let at = *off;
+        let n = self.write_at(at, data)?;
         *off += n as u64;
+        Ok(n)
+    }
+
+    /// The description's file position (for the calls that take one).
+    pub fn position(&self) -> crate::sync::MutexGuard<'_, u64> {
+        self.offset.lock()
+    }
+
+    /// Reads into the server's memory at `off` (copy_file_range).
+    pub fn read_at(&self, off: u64, buf: &mut [u8]) -> Result<usize, i64> {
+        let n = datafs::read_server(&self.inode, off, buf)?;
+        self.notify(inotify::IN_ACCESS);
+        Ok(n)
+    }
+
+    /// Writes the server's memory at `off` (sendfile, copy_file_range):
+    /// durable before it returns with O_SYNC or O_DSYNC.
+    pub fn write_at(&self, off: u64, data: &[u8]) -> Result<usize, i64> {
+        let n = datafs::write_server(&self.inode, off, data)?;
+        if n > 0 {
+            self.notify(inotify::IN_MODIFY);
+        }
         if self.sync {
-            datafs::fsync_range(&self.inode, *off - n as u64, *off)?;
+            datafs::fsync_range(&self.inode, off, off + n as u64)?;
         }
         Ok(n)
     }

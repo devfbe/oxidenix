@@ -785,7 +785,7 @@ impl Service {
         let chan = self.chan(c);
         match *request {
             Request::Read { ino, .. } | Request::Write { ino, .. } | Request::Stat { ino } | Request::Truncate { ino, .. } => chan.held.set(ino),
-            Request::Readlink { ino, .. } | Request::SetPerm { ino, .. } | Request::Promise { ino, .. } => chan.held.set(ino),
+            Request::Readlink { ino, .. } | Request::SetPerm { ino, .. } | Request::SetTimes { ino, .. } | Request::Promise { ino, .. } => chan.held.set(ino),
             Request::Lookup { dir, .. } | Request::Create { dir, .. } | Request::Unlink { dir, .. } | Request::Readdir { dir, .. } => chan.held.set(dir),
             Request::Rename { from, to, .. } => {
                 chan.held.set(from);
@@ -1115,6 +1115,10 @@ impl Service {
             Request::SetPerm { ino, perm } => {
                 fs.check(ino)?;
                 fs.set_perm(ino, perm).map(|_| (0, none))
+            }
+            Request::SetTimes { ino, atime, mtime, ctime } => {
+                fs.check(ino)?;
+                fs.set_times(ino, atime, mtime, ctime).map(|_| (0, none))
             }
             Request::Readlink { ino, buf } => {
                 fs.check(ino)?;

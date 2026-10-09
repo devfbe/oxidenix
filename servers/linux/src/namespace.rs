@@ -84,6 +84,15 @@ pub enum Node {
 }
 
 impl Node {
+    /// Its status, with the birth time where the filesystem has one
+    /// (statx).
+    pub fn status(&self) -> Result<vfs::stat::Stat, i64> {
+        match self {
+            Node::Tmp(t) => Ok(t.status()),
+            _ => self.stat().map(|st| vfs::stat::Stat::from_bytes(&st)),
+        }
+    }
+
     pub fn stat(&self) -> Result<[u8; 144], i64> {
         match self {
             Node::Kernel(k) => k.stat(),

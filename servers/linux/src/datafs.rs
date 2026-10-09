@@ -168,6 +168,117 @@ pub struct DInode {
     filled: AtomicU32,
     /// When it was last used (a tick, for eviction).
     used: AtomicU64,
+    /// Times set here that diskfs may not have yet (see `Times`).
+    times: Mutex<Times>,
+}
+
+/// A file's times as the server set them (seconds: ext2 keeps no more),
+/// over diskfs's, while written data waits in the cache: a write sets the
+/// modification and change times when it enters the cache, as on Linux,
+/// but diskfs records its own time when the data reaches it; so after
+/// each write-back these go to diskfs (`SETTIMES`, which follows the
+/// `WRITE`s) and are forgotten, and until then stat reports them, and
+/// what changes times meanwhile (utimensat, chmod, truncation) changes
+/// them too. Without data waiting, diskfs's times are the file's
+/// (utimensat sends its times at once).
+#[derive(Clone, Copy, Default)]
+struct Times {
+    atime: Option<u32>,
+    mtime: Option<u32>,
+    ctime: Option<u32>,
+    /// Data written since the last write-back (these times then wait for
+    /// it).
+    pending: bool,
+    /// Counts changes: a write-back forgets only what it sent.
+    seq: u64,
+}
+
+impl Times {
+    fn request(&self, ino: u32) -> Request {
+        Request::SetTimes { ino, atime: self.atime, mtime: self.mtime, ctime: self.ctime }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.atime.is_none() && self.mtime.is_none() && self.ctime.is_none()
+    }
+}
+
+/// The wall-clock time in seconds (ext2's timestamps).
+fn now_secs() -> u32 {
+    crate::time::realtime().sec.clamp(0, u32::MAX as i64) as u32
+}
+
+/// The contents of `inode` changed (a write, a truncation, a store through
+/// a mapping): its modification and change times are now.
+pub fn modified(inode: &DInode) {
+    let now = now_secs();
+    let mut t = inode.times.lock();
+    t.mtime = Some(now);
+    t.ctime = Some(now);
+    t.pending = true;
+    t.seq += 1;
+}
+
+/// What diskfs did to the times itself (a truncation, a change of
+/// permissions: `mtime` too or only the change time), also over times
+/// that wait for a write-back.
+fn changed_on_disk(inode: &DInode, mtime: bool) {
+    let mut t = inode.times.lock();
+    if t.pending {
+        let now = now_secs();
+        if mtime {
+            t.mtime = Some(now);
+        }
+        t.ctime = Some(now);
+        t.seq += 1;
+    }
+}
+
+/// utimensat: the times given (the change time now), sent to diskfs.
+pub fn set_times(inode: &Arc<DInode>, atime: vfs::stat::SetTime, mtime: vfs::stat::SetTime) -> Result<(), i64> {
+    live(inode)?;
+    if atime == vfs::stat::SetTime::Omit && mtime == vfs::stat::SetTime::Omit {
+        return Ok(());
+    }
+    let now = crate::time::realtime();
+    let secs = |t: vfs::stat::Time| t.sec.clamp(0, u32::MAX as i64) as u32;
+    let request = {
+        let mut t = inode.times.lock();
+        if let Some(a) = atime.resolve(now) {
+            t.atime = Some(secs(a));
+        }
+        if let Some(m) = mtime.resolve(now) {
+            t.mtime = Some(secs(m));
+        }
+        t.ctime = Some(secs(now));
+        t.seq += 1;
+        (t.request(inode.ino), t.seq)
+    };
+    let c = client()?;
+    status(&c.call(request.0.encode(0))?)?;
+    // Nothing waits for a write-back: diskfs has them now.
+    let mut t = inode.times.lock();
+    if !t.pending && t.seq == request.1 {
+        *t = Times { seq: t.seq, ..Times::default() };
+    }
+    Ok(())
+}
+
+/// After a write-back: the times set here go to diskfs (after the data,
+/// whose `WRITE`s made diskfs record its own), and are forgotten unless
+/// they changed meanwhile or the write-back covered only part of the file
+/// (`whole`: all of it).
+fn send_times(c: &Client, inode: &DInode, whole: bool) -> Result<(), i64> {
+    let t = *inode.times.lock();
+    if t.is_empty() {
+        return Ok(());
+    }
+    status(&c.call(t.request(inode.ino).encode(0))?)?;
+    let mut now = inode.times.lock();
+    if whole && now.seq == t.seq {
+        *now = Times { seq: now.seq, ..Times::default() };
+    }
+    Ok(())
 }
 
 impl Drop for DInode {
@@ -341,6 +452,7 @@ fn found(ino: u64, mode: u64, generation: u64) -> Result<Arc<DInode>, i64> {
         fills: AtomicU32::new(0),
         filled: AtomicU32::new(0),
         used: AtomicU64::new(TICK.fetch_add(1, Ordering::Relaxed)),
+        times: Mutex::new(Times::default()),
     });
     t.inodes.insert(ino, inode.clone());
     if t.keys.len() > 2 * t.inodes.len() + 64 {
@@ -504,7 +616,9 @@ pub fn readlink(inode: &Arc<DInode>) -> Result<String, i64> {
 pub fn chmod(inode: &Arc<DInode>, perm: u32) -> Result<(), i64> {
     live(inode)?;
     let c = client()?;
-    status(&c.call(Request::SetPerm { ino: inode.ino, perm: perm & 0o7777 }.encode(0))?).map(|_| ())
+    status(&c.call(Request::SetPerm { ino: inode.ino, perm: perm & 0o7777 }.encode(0))?)?;
+    changed_on_disk(inode, false);
+    Ok(())
 }
 
 /// Its `struct stat`: diskfs's, with the size the cache has.
@@ -526,9 +640,10 @@ pub fn stat(inode: &Arc<DInode>) -> Result<[u8; 144], i64> {
     st[48..56].copy_from_slice(&size.to_le_bytes());
     st[56..64].copy_from_slice(&4096u64.to_le_bytes());
     st[64..72].copy_from_slice(&size.div_ceil(512).to_le_bytes());
-    st[72..80].copy_from_slice(&(s.atime as u64).to_le_bytes());
-    st[88..96].copy_from_slice(&(s.mtime as u64).to_le_bytes());
-    st[104..112].copy_from_slice(&(s.ctime as u64).to_le_bytes());
+    let t = *inode.times.lock();
+    st[72..80].copy_from_slice(&(t.atime.unwrap_or(s.atime) as u64).to_le_bytes());
+    st[88..96].copy_from_slice(&(t.mtime.unwrap_or(s.mtime) as u64).to_le_bytes());
+    st[104..112].copy_from_slice(&(t.ctime.unwrap_or(s.ctime) as u64).to_le_bytes());
     Ok(st)
 }
 
@@ -602,6 +717,9 @@ pub fn mkwrite(key: u64, offset: u64) {
         Ok(end) => (end, true),
         Err(_) => (offset, false),
     };
+    if ok {
+        modified(&inode);
+    }
     syscall(SYS_MO_BACKED, [object, offset, end, ok as u64, 0, 0]);
 }
 
@@ -897,6 +1015,9 @@ pub fn write(inode: &Arc<DInode>, off: u64, buf: u64, len: u64) -> Result<u64, i
             _ => break,
         }
     }
+    if done > 0 {
+        modified(inode);
+    }
     Ok(done)
 }
 
@@ -927,7 +1048,13 @@ pub fn write_server(inode: &Arc<DInode>, off: u64, data: &[u8]) -> Result<usize,
         at = to;
     }
     let n = syscall(SYS_MO_WRITE, [object, off, data.as_ptr() as u64, data.len() as u64, 0, 0]);
-    if n < 0 { Err(-n) } else { Ok(n as usize) }
+    if n < 0 {
+        return Err(-n);
+    }
+    if n > 0 {
+        modified(inode);
+    }
+    Ok(n as usize)
 }
 
 /// Writes back the dirty pages of `inode` among `pages` (page indices):
@@ -1001,10 +1128,11 @@ pub fn writeback(inode: &Arc<DInode>, pages: core::ops::Range<u64>) -> Result<u6
     if wrote.get() > 0 {
         inode.unflushed.store(c.generation, Ordering::Release);
     }
-    match failed.get() {
-        Some(e) => Err(e),
-        None => Ok(wrote.get()),
+    if let Some(e) = failed.get() {
+        return Err(e);
     }
+    send_times(&c, inode, pages.start == 0 && pages.end == u64::MAX)?;
+    Ok(wrote.get())
 }
 
 /// Makes everything written so far durable (`FLUSH`); EIO once if a write
@@ -1071,6 +1199,12 @@ pub fn sync_all() -> Result<(), i64> {
 /// cannot hold, EFBIG), then the cache; shrinking, the cache first (its
 /// pages beyond go, also from mappings), then diskfs.
 pub fn truncate(inode: &Arc<DInode>, len: u64) -> Result<(), i64> {
+    truncate_file(inode, len)?;
+    changed_on_disk(inode, true);
+    Ok(())
+}
+
+fn truncate_file(inode: &Arc<DInode>, len: u64) -> Result<(), i64> {
     live(inode)?;
     match inode.kind {
         vfs::S_IFREG => {}
