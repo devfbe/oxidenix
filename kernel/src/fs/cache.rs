@@ -185,14 +185,16 @@ pub enum Backing {
 }
 
 /// What `set_dirty` found.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Dirtied {
     Yes,
     /// The page is gone (truncated meanwhile), or its pager.
     Gone,
-    /// It is not backed: the pager was asked (`Pager::mkwrite`); the store
-    /// waits (`wait_page` with `backed`) and tries again.
-    Unbacked,
+    /// No memory to record the store among the page's waiters.
+    Oom,
+    /// It is not backed: the pager was asked (`Pager::mkwrite`) with the
+    /// store among the page's waiters already; it waits with this (for the
+    /// backing) and tries again.
+    Unbacked(PageWait),
 }
 
 /// Whether a read or write of a cached object fetches the missing pages it
@@ -239,8 +241,22 @@ fn undirty(pages: u64) {
 struct Waiters {
     index: u64,
     count: u32,
-    /// Failed answers for the page (counted while anyone waits).
-    failures: u32,
+    /// Failed answers for the page (counted while anyone waits): fills
+    /// (`fail`, `filled`), and backings (`backed`), which only the threads
+    /// that wait for the backing too see.
+    failures: Seen,
+    /// Changes of the page that may have answered or overtaken a request
+    /// for it (it came, a fill of it began, it was cut off): a request for
+    /// the page made at an earlier count may be done with, one made at the
+    /// current count is still outstanding (`PageWait::asked`).
+    changes: u32,
+}
+
+/// Failed answers for a page that a waiter has seen (`Waiters::failures`).
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+struct Seen {
+    fill: u32,
+    backing: u32,
 }
 
 /// What `PageCache::try_map_page` found.
@@ -254,33 +270,33 @@ pub enum Lookup {
 
 /// A thread's place among the waiters of page `index` of a paged or
 /// cached object (`State::waits`), taken before the pager is asked for the
-/// page (`try_map_page`) or its backing and kept across the address
-/// space's unlock until the thread waited (`wait`) or gave up (dropped).
-/// A pager's failure is recorded only where someone waits, so without it
-/// a failure that came before the wait began would be lost, and the wait
-/// would ask again: the access that made a failed request must fail
-/// (SIGBUS, EFAULT), as on Linux.
+/// page (`try_map_page`) or its backing (`set_dirty`) and kept across the
+/// address space's unlock until the thread waited (`wait`) or gave up
+/// (dropped). A pager's failure is recorded only where someone waits, so
+/// without it a failure that came before the wait began would be lost,
+/// and the wait would ask again: the access that made a failed request
+/// must fail (SIGBUS, EFAULT), as on Linux.
 pub struct PageWait {
     cache: Arc<PageCache>,
     index: u64,
     /// The page must also be backed (`Pager::mkwrite`).
     backed: bool,
     /// The failures for the page it had seen when it entered.
-    seen: u32,
+    seen: Seen,
+    /// The page's `Waiters::changes` when this thread asked the pager for
+    /// it: while they stay, the request is outstanding and the wait does
+    /// not ask again.
+    asked: Option<u32>,
 }
 
 impl PageWait {
-    /// Enters the waiters of page `index` of `cache` (Oom if there is no
-    /// room to record it).
-    pub fn enter(cache: &Arc<PageCache>, index: u64, backed: bool) -> Result<PageWait, Fault> {
-        let seen = cache.state.lock().enter_wait(index).map_err(page_fault)?;
-        Ok(PageWait { cache: cache.clone(), index, backed, seen })
-    }
-
-    /// Waits as `PageCache::wait_page`, counting every failure since it
-    /// entered.
+    /// Waits until the page is there (and backed, with `backed`), counting
+    /// every failure since it entered: its frame with a reference (so
+    /// reclaim cannot take it before the fault is tried again; None if it
+    /// is gone already, truncated), EIO if it cannot be had, EINTR if the
+    /// thread dies.
     pub fn wait(self) -> Result<Option<PhysFrame>, i64> {
-        self.cache.wait_registered(self.index, self.backed, self.seen)?;
+        self.cache.wait_registered(self.index, self.backed, self.seen, self.asked)?;
         Ok(self.cache.waited_frame(self.index))
     }
 }
@@ -311,14 +327,14 @@ pub enum Scan {
 
 impl State {
     /// Counts a waiter of page `index`; the failures it has seen.
-    fn enter_wait(&mut self, index: u64) -> Result<u32, i64> {
+    fn enter_wait(&mut self, index: u64) -> Result<Seen, i64> {
         if let Some(w) = self.waits.iter_mut().find(|w| w.index == index) {
             w.count += 1;
             return Ok(w.failures);
         }
         self.waits.try_reserve(1).map_err(|_| ENOMEM)?;
-        self.waits.push(Waiters { index, count: 1, failures: 0 });
-        Ok(0)
+        self.waits.push(Waiters { index, count: 1, failures: Seen::default(), changes: 0 });
+        Ok(Seen::default())
     }
 
     fn leave_wait(&mut self, index: u64) {
@@ -330,14 +346,32 @@ impl State {
         }
     }
 
-    fn failures(&self, index: u64) -> u32 {
-        self.waits.iter().find(|w| w.index == index).map_or(0, |w| w.failures)
+    /// The failures and changes of page `index` (none where nobody waits).
+    fn waited(&self, index: u64) -> (Seen, u32) {
+        self.waits.iter().find(|w| w.index == index).map_or((Seen::default(), 0), |w| (w.failures, w.changes))
     }
 
     /// The pager could not supply pages `first..end`: whoever waits fails.
     fn fail_waiters(&mut self, first: u64, end: u64) {
         for w in self.waits.iter_mut().filter(|w| (first..end).contains(&w.index)) {
-            w.failures = w.failures.wrapping_add(1);
+            w.failures.fill = w.failures.fill.wrapping_add(1);
+            w.changes = w.changes.wrapping_add(1);
+        }
+    }
+
+    /// The pager could not back pages `first..end`: whoever waits for
+    /// their backing fails.
+    fn fail_backing(&mut self, first: u64, end: u64) {
+        for w in self.waits.iter_mut().filter(|w| (first..end).contains(&w.index)) {
+            w.failures.backing = w.failures.backing.wrapping_add(1);
+        }
+    }
+
+    /// Pages `first..end` came, began to be filled or were cut off: a
+    /// request for one that was made before may be done with.
+    fn changed(&mut self, first: u64, end: u64) {
+        for w in self.waits.iter_mut().filter(|w| (first..end).contains(&w.index)) {
+            w.changes = w.changes.wrapping_add(1);
         }
     }
 }
@@ -355,8 +389,9 @@ struct State {
     cursor: u64,
     /// Pages of a paged or cached object threads wait for, with the
     /// failed answers since: a waiter fails if one came while it waited (a
-    /// later access asks again). Bounded by the threads waiting: a pager's
-    /// failure is recorded only where someone waits.
+    /// later access asks again), and the changes that tell whether its own
+    /// request is still outstanding. Bounded by the threads waiting: a
+    /// pager's failure is recorded only where someone waits.
     waits: Vec<Waiters>,
     /// Dirty pages (cached store).
     dirty: u64,
@@ -544,15 +579,21 @@ impl PageCache {
             return Ok(());
         }
         let seen = self.state.lock().enter_wait(index)?;
-        let result = self.wait_registered(index, backed, seen);
+        let result = self.wait_registered(index, backed, seen, None);
         self.state.lock().leave_wait(index);
         result
     }
 
     /// `wait_paged` for a thread already among the page's waiters
-    /// (`enter_wait`, which said it had seen `seen` failures): it stays
-    /// one, the caller lets go.
-    fn wait_registered(&self, index: u64, backed: bool, seen: u32) -> Result<(), i64> {
+    /// (`enter_wait`, which said it had seen `seen` failures) that asked
+    /// for the page at its changes `asked`, if it did: it stays one, the
+    /// caller lets go. A page that is there (and backed, with `backed`)
+    /// ends the wait whatever failed meanwhile; else a failure since it
+    /// entered does (a fill's, or a backing's for a wait for the backing
+    /// too, never another's: a reader does not fail for a store's full
+    /// disk). The pager is asked for the page only if no request of this
+    /// thread is outstanding (one was answered or overtaken since).
+    fn wait_registered(&self, index: u64, backed: bool, seen: Seen, mut asked: Option<u32>) -> Result<(), i64> {
         let Some((pager, key)) = self.pager() else { return Ok(()) };
         // What the pager is to be asked for.
         enum Ask {
@@ -567,13 +608,20 @@ impl PageCache {
                 let wait = crate::process::sched::prepare_to_wait(pager.wait_chan());
                 let ask = {
                     let mut st = self.state.lock();
-                    if st.failures(index) != seen {
-                        return Err(EIO);
-                    }
                     let need = backing_need(st.size, index);
                     let beyond = index >= page_of(st.size.saturating_add(PAGE - 1));
+                    let (failures, changes) = st.waited(index);
+                    let present = st.pages.get(&index).map(|p| (p.pending, p.backed as u64 >= need));
+                    match present {
+                        Some((false, enough)) if !backed || enough => return Ok(true),
+                        // Cut off meanwhile: the caller looks again.
+                        None if beyond => return Ok(true),
+                        _ => {}
+                    }
+                    if failures.fill != seen.fill || (backed && failures.backing != seen.backing) {
+                        return Err(EIO);
+                    }
                     match st.pages.get_mut(&index) {
-                        Some(p) if !p.pending && (!backed || p.backed as u64 >= need) => return Ok(true),
                         // Being filled or backed: its answer comes without
                         // asking, unless the pager is gone meanwhile.
                         Some(p) if (p.pending || p.mkwrite) && !pager.alive() => return Err(EIO),
@@ -582,9 +630,14 @@ impl PageCache {
                             p.mkwrite = true;
                             Ask::Backing
                         }
-                        // Cut off meanwhile: the caller looks again.
-                        None if beyond => return Ok(true),
-                        None => Ask::Page,
+                        // Its own request is still outstanding: the answer
+                        // comes without asking again.
+                        None if asked == Some(changes) && !pager.alive() => return Err(EIO),
+                        None if asked == Some(changes) => Ask::Nothing,
+                        None => {
+                            asked = Some(changes);
+                            Ask::Page
+                        }
                     }
                 };
                 if crate::process::signal::dying() {
@@ -645,6 +698,7 @@ impl PageCache {
             } else {
                 st.pages.insert(index, Page::new(frame));
                 st.charged += 1;
+                st.changed(index, index + 1);
                 true
             }
         };
@@ -983,7 +1037,7 @@ impl PageCache {
                 }
             }
             if !ok {
-                st.fail_waiters(from, to);
+                st.fail_backing(from, to);
             }
         }
         if let Some(pager) = pager.upgrade() {
@@ -1038,6 +1092,7 @@ impl PageCache {
         }
         st.pages.insert(index, Page::new(frame));
         st.charged += 1;
+        st.changed(index, index + 1);
         Ok(())
     }
 
@@ -1109,6 +1164,7 @@ impl PageCache {
             st.charged -= charged;
             st.size = len;
             st.image_len = st.image_len.min(len);
+            st.changed(first_gone, u64::MAX);
             drop(st);
             undirty(dirty);
             free_frames(gone.into_values().map(|p| p.frame));
@@ -1172,8 +1228,16 @@ impl PageCache {
         }
         // Among the page's waiters before the pager is asked: its answer,
         // a failure too, cannot come before anyone waits for it.
-        let wait = PageWait::enter(self, index, false)?;
-        self.request_page(index).map_err(page_fault)?;
+        // Not asked if it is being filled (its answer comes without).
+        let (seen, asked) = {
+            let mut st = self.state.lock();
+            let seen = st.enter_wait(index).map_err(page_fault)?;
+            (seen, (!st.pages.contains_key(&index)).then(|| st.waited(index).1))
+        };
+        let wait = PageWait { cache: self.clone(), index, backed: false, seen, asked };
+        if wait.asked.is_some() {
+            self.request_page(index).map_err(page_fault)?;
+        }
         Ok(match self.present(index) {
             Some(frame) => Lookup::Frame(frame),
             None => Lookup::Missing(wait),
@@ -1190,35 +1254,19 @@ impl PageCache {
         Some(page.frame)
     }
 
-    /// Asks the pager for page `index` unless it is there or being filled
-    /// (EIO if the pager is gone). Whoever asks is among the page's waiters
-    /// already (`PageWait`), so a failed fill fails its wait.
+    /// Asks the pager for page `index` (EIO if the pager is gone). Whoever
+    /// asks is among the page's waiters already (`PageWait`), so a failed
+    /// fill fails its wait.
     fn request_page(&self, index: u64) -> Result<(), i64> {
         let Some((pager, key)) = self.pager() else { return Ok(()) };
-        {
-            if self.state.lock().pages.contains_key(&index) {
-                return Ok(());
-            }
-        }
         match pager.upgrade() {
             Some(pager) if pager.request(key, index) => Ok(()),
             _ => Err(EIO),
         }
     }
 
-    /// Waits until page `index` of a paged or cached object is there (and
-    /// backed, with `backed`) and returns its frame with a reference (so
-    /// reclaim cannot take it before the fault is tried again; None if it
-    /// is gone already, truncated): EIO if it cannot be had, EINTR if the
-    /// thread dies. For a space no one else can lock yet (the loader's);
-    /// a fault waits with the `PageWait` it got.
-    pub fn wait_page(&self, index: u64, backed: bool) -> Result<Option<PhysFrame>, i64> {
-        self.wait_paged(index, backed)?;
-        Ok(self.waited_frame(index))
-    }
-
     /// The frame of page `index` with a reference for whoever waited for
-    /// it (`wait_page`, `PageWait::wait`).
+    /// it (`PageWait::wait`).
     fn waited_frame(&self, index: u64) -> Option<PhysFrame> {
         let st = self.state.lock();
         st.pages.get(&index).filter(|p| !p.pending).map(|p| {
@@ -1227,7 +1275,7 @@ impl PageCache {
         })
     }
 
-    /// Lets go of the reference `wait_page` or `PageWait::wait` gave.
+    /// Lets go of the reference `PageWait::wait` gave.
     pub fn put_frame(frame: PhysFrame) {
         free_frames([frame]);
     }
@@ -1358,6 +1406,7 @@ impl PageCache {
             taken += 1;
         }
         st.charged += taken as u64;
+        st.changed(start, start + taken as u64);
         drop(st);
         let no_frame = frames.is_empty();
         let spare = frames.split_off(taken);
@@ -1575,27 +1624,34 @@ impl PageCache {
     /// Marks page `index` dirty before a shared mapping may store to it.
     /// With `backed`, the page must be backed up to the file's end first
     /// (else the pager is asked: `Dirtied::Unbacked`, and the store waits
-    /// for it); without, only the dirty mark is set (for a page whose
-    /// store was backed before: `AddressSpace::store_to_file`).
-    pub fn set_dirty(&self, index: u64, backed: bool) -> Dirtied {
+    /// for it, among the page's waiters from before the pager is asked, so
+    /// that a failed backing cannot pass it by); without, only the dirty
+    /// mark is set (for a page whose store was backed before:
+    /// `AddressSpace::store_to_file`).
+    pub fn set_dirty(self: &Arc<Self>, index: u64, backed: bool) -> Dirtied {
         let Store::Cached { pager, key, .. } = &self.store else { return Dirtied::Gone };
         enum Step {
             Dirty { first: bool },
-            /// Not backed; whether the pager must be asked (it was not yet).
-            Unbacked { ask: bool },
+            /// Not backed; whether the pager must be asked (it was not
+            /// yet), and the failures the store has seen as a waiter.
+            Unbacked { ask: bool, seen: Seen },
         }
         let step = {
             let mut st = self.state.lock();
-            let size = st.size;
-            let Some(page) = st.pages.get_mut(&index).filter(|p| !p.pending) else { return Dirtied::Gone };
-            if backed && (page.backed as u64) < backing_need(size, index) {
+            let need = backing_need(st.size, index);
+            let Some(page) = st.pages.get(&index).filter(|p| !p.pending) else { return Dirtied::Gone };
+            if backed && (page.backed as u64) < need {
+                // Among the waiters in the same hold that finds it
+                // unbacked: a `backed` answer cannot come in between.
+                let Ok(seen) = st.enter_wait(index) else { return Dirtied::Oom };
+                let page = st.pages.get_mut(&index).expect("found above");
                 let ask = !page.mkwrite;
                 page.mkwrite = true;
-                Step::Unbacked { ask }
+                Step::Unbacked { ask, seen }
             } else if page.dirty {
                 Step::Dirty { first: false }
             } else {
-                page.dirty = true;
+                st.pages.get_mut(&index).expect("found above").dirty = true;
                 DIRTY.fetch_add(1, Ordering::Relaxed);
                 st.dirty += 1;
                 Step::Dirty { first: st.dirty == 1 }
@@ -1608,10 +1664,11 @@ impl PageCache {
                 }
                 Dirtied::Yes
             }
-            Step::Unbacked { ask: false } => Dirtied::Unbacked,
-            Step::Unbacked { ask: true } => {
-                if pager.upgrade().is_some_and(|p| p.mkwrite(*key, index)) {
-                    return Dirtied::Unbacked;
+            Step::Unbacked { ask, seen } => {
+                // Made with the state unlocked: dropping it locks it.
+                let wait = PageWait { cache: self.clone(), index, backed: true, seen, asked: None };
+                if !ask || pager.upgrade().is_some_and(|p| p.mkwrite(*key, index)) {
+                    return Dirtied::Unbacked(wait);
                 }
                 if let Some(page) = self.state.lock().pages.get_mut(&index) {
                     page.mkwrite = false;

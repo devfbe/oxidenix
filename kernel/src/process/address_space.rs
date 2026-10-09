@@ -1076,11 +1076,12 @@ impl AddressSpace {
             match cache.set_dirty(index, true) {
                 Dirtied::Yes => return Ok(()),
                 Dirtied::Gone => return Err(Fault::Bus),
-                Dirtied::Unbacked if !wait => {
-                    self.awaited = Some(PageWait::enter(cache, index, true)?);
+                Dirtied::Oom => return Err(Fault::Oom),
+                Dirtied::Unbacked(awaited) if !wait => {
+                    self.awaited = Some(awaited);
                     return Err(Fault::Retry);
                 }
-                Dirtied::Unbacked => match cache.wait_page(index, true) {
+                Dirtied::Unbacked(awaited) => match awaited.wait() {
                     Ok(frame) => frame.into_iter().for_each(PageCache::put_frame),
                     Err(_) => return Err(Fault::Bus),
                 },

@@ -208,8 +208,9 @@ const MAX_CHANNELS: usize = 64;
 
 /// Events for the instance's service thread (the pager thread): pages
 /// wanted from it, and server files whose last descriptor went. A page
-/// request is queued once until the pager takes it; after that, a thread
-/// that still waits (the page did not come, or failed) asks again.
+/// request is queued once until the pager takes it; a thread that still
+/// waits asks again only once its request was answered or overtaken (the
+/// page came and went, or was cut off: `PageWait`).
 struct PagerQueue {
     requests: alloc::collections::VecDeque<Event>,
     queued: alloc::collections::BTreeSet<(u64, u64)>,
