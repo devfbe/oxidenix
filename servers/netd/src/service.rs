@@ -98,6 +98,8 @@ const RAW_BUFFER: usize = 16 * 1024;
 /// A raw socket's hop limit until IP_TTL sets one (Linux's
 /// net.ipv4.ip_default_ttl).
 const DEFAULT_TTL: u8 = 64;
+/// The echo identifiers a raw socket remembers (the last it sent).
+const ECHO_IDS: usize = 16;
 /// The bytes of smoltcp's socket buffers (and leftovers) netd keeps at
 /// most, in mappings of their own (`Region`).
 const BUDGET: usize = 32 << 20;
@@ -360,8 +362,10 @@ impl Opts {
 enum Proto {
     Tcp(Tcp),
     Udp { handle: SocketHandle, peer: Option<IpEndpoint>, reuse: bool },
-    /// `ttl`: the hop limit of the packets the socket sends (IP_TTL).
-    Raw { handle: SocketHandle, peer: Option<Ipv4Address>, ttl: u8 },
+    /// `ttl`: the hop limit of the packets the socket sends (IP_TTL);
+    /// `ids`: the identifiers of the echo requests it sent last (their
+    /// replies are its instance's, `IcmpOwners`).
+    Raw { handle: SocketHandle, peer: Option<Ipv4Address>, ttl: u8, ids: Vec<u16> },
 }
 
 /// What netd publishes of a socket, as it last did.
@@ -445,6 +449,15 @@ impl Closing {
     }
 }
 
+/// A connection in TIME-WAIT, as netd keeps it: its port (for the port
+/// rules) and its endpoints (no new connection takes its 4-tuple), until
+/// `until`.
+struct Lingering {
+    holder: PortHolder,
+    tuple: Option<(IpEndpoint, IpEndpoint)>,
+    until: Instant,
+}
+
 struct Chan {
     id: u64,
     /// The instance that connected it (`Offer::instance`): what the
@@ -477,9 +490,9 @@ pub struct Config {
 pub struct Service {
     chans: Vec<Option<Chan>>,
     closing: Vec<Closing>,
-    /// Closed connections in TIME-WAIT: only their port, until then (their
-    /// smoltcp socket and its buffers went).
-    lingering: Vec<(PortHolder, Instant)>,
+    /// Closed connections in TIME-WAIT: only their port and endpoints, until
+    /// then (their smoltcp socket and its buffers went).
+    lingering: Vec<Lingering>,
     next_port: u16,
     /// What the instances hold, each within its share: the bytes of
     /// smoltcp's socket buffers (and of closed connections' leftovers),
@@ -896,7 +909,7 @@ impl Service {
                 Sock::new(Proto::Tcp(t), None, 0)
             }
             Kind::Udp => Sock::new(Proto::Udp { handle, peer: None, reuse: false }, area, state::SEND_OPEN | state::WRITABLE),
-            Kind::RawIcmp => Sock::new(Proto::Raw { handle, peer: None, ttl: DEFAULT_TTL }, area, state::SEND_OPEN | state::WRITABLE),
+            Kind::RawIcmp => Sock::new(Proto::Raw { handle, peer: None, ttl: DEFAULT_TTL, ids: Vec::new() }, area, state::SEND_OPEN | state::WRITABLE),
         };
         self.enter(c, sock, s);
         done(0)
@@ -945,9 +958,21 @@ impl Service {
                     out.push(PortHolder { owner: cl.owner, port: local.port, addr, reuse: cl.reuse, listening: false, connected: false, closing: true });
                 }
             }
-            out.extend(self.lingering.iter().map(|&(h, _)| h));
+            out.extend(self.lingering.iter().map(|l| l.holder));
         }
         out
+    }
+
+    /// Whether a TCP connection from `local` to `remote` exists: live (of
+    /// any channel), closing, or in TIME-WAIT.
+    fn tuple_in_use(&self, local: IpEndpoint, remote: IpEndpoint, sockets: &SocketSet<'static>) -> bool {
+        let same = |h: SocketHandle| {
+            let s = sockets.get::<tcp::Socket>(h);
+            s.local_endpoint() == Some(local) && s.remote_endpoint() == Some(remote)
+        };
+        let live = self.chans.iter().flatten().flat_map(|c| c.socks.values()).any(|s| matches!(&s.proto, Proto::Tcp(t) if t.backlog.is_none() && same(t.handle)));
+        let listening = self.chans.iter().flatten().flat_map(|c| c.socks.values()).any(|s| matches!(&s.proto, Proto::Tcp(Tcp { backlog: Some(set), .. }) if set.iter().any(|&h| same(h))));
+        live || listening || self.closing.iter().any(|cl| same(cl.handle)) || self.lingering.iter().any(|l| l.tuple == Some((local, remote)))
     }
 
     /// Whether socket `sock` of channel `c` may claim `port` on `addr`
@@ -1094,15 +1119,28 @@ impl Service {
                 if to.port == 0 {
                     return Err(ECONNREFUSED);
                 }
+                let remote = IpEndpoint::new(destination(to.addr), to.port);
                 let local = match bound {
-                    Some(l) => l,
+                    Some(l) => {
+                        // A bound socket (SO_REUSEADDR lets several share
+                        // the port) never takes the 4-tuple of another
+                        // connection, live, closing or in TIME-WAIT
+                        // (Linux's __inet_check_established).
+                        let addr = l.addr.or_else(|| match remote.addr {
+                            IpAddress::Ipv4(dst) => iface.get_source_address_ipv4(&dst).map(IpAddress::Ipv4),
+                        });
+                        if addr.is_some_and(|a| self.tuple_in_use(IpEndpoint::new(a, l.port), remote, sockets)) {
+                            return Err(EADDRNOTAVAIL);
+                        }
+                        l
+                    }
+                    // (An ephemeral port is held by no TCP socket at all.)
                     None => IpListenEndpoint { addr: None, port: self.ephemeral(true, sockets)? },
                 };
                 // Its buffers come now (the SYN announces the window).
                 self.equip(handle, sockets)?;
                 let s = self.sock(c, sock)?;
                 let Proto::Tcp(t) = &mut s.proto else { unreachable!("checked above") };
-                let remote = IpEndpoint::new(destination(to.addr), to.port);
                 let socket = sockets.get_mut::<tcp::Socket>(handle);
                 socket.set_timeout(Some(CONNECT_TIMEOUT));
                 socket.connect(iface.context(), remote, local).map_err(|e| match e {
@@ -1227,7 +1265,7 @@ impl Service {
             let proto = match &s.proto {
                 Proto::Tcp(_) => return Err(EOPNOTSUPP),
                 Proto::Udp { handle, peer, .. } => (true, *handle, peer.map(|p| (bits(p.addr), p.port)), 0),
-                Proto::Raw { handle, peer, ttl } => (false, *handle, peer.map(|p| (p.to_bits(), 0)), *ttl),
+                Proto::Raw { handle, peer, ttl, .. } => (false, *handle, peer.map(|p| (p.to_bits(), 0)), *ttl),
             };
             (proto, rings)
         };
@@ -1291,6 +1329,19 @@ impl Service {
                 return Err(EAGAIN);
             }
             socket.send_slice(packet).map_err(|_| EAGAIN)?;
+            // An echo request: its replies are this instance's.
+            let message = &self.scratch[IPV4_HEADER..IPV4_HEADER + len];
+            if len >= 8 && message[0] == 8 {
+                let id = u16::from_be_bytes([message[4], message[5]]);
+                if let Proto::Raw { ids, .. } = &mut self.sock(c, sock)?.proto {
+                    if !ids.contains(&id) {
+                        if ids.len() == ECHO_IDS {
+                            ids.remove(0);
+                        }
+                        ids.push(id);
+                    }
+                }
+            }
             done(len as i64)
         }
     }
@@ -1494,12 +1545,13 @@ impl Service {
     pub fn pump(&mut self, sockets: &mut SocketSet<'static>) -> bool {
         let mut progress = self.finish_closing(sockets);
         let mut wants = core::mem::take(&mut self.wants);
-        let (now, trimming) = (crate::now(), pressure(&self.bytes));
+        let mut round = Round { now: crate::now(), trimming: pressure(&self.bytes), owner: 0, icmp: self.icmp_owners(sockets) };
         for chan in self.chans.iter_mut().flatten() {
+            round.owner = chan.owner;
             for (&i, s) in chan.socks.iter_mut() {
                 let ctl = chan.area.ctl(i as usize).expect("an index below MAX_SOCKETS");
                 let rings = Self::rings(&chan.grants, s.area);
-                match pump_one(s, ctl, rings, sockets, now, trimming, &mut wants) {
+                match pump_one(s, ctl, rings, sockets, &round, &mut wants) {
                     Ok(moved) => progress |= moved,
                     Err(()) => {
                         // The client broke the protocol or took the grant
@@ -1533,6 +1585,25 @@ impl Service {
         progress
     }
 
+    /// Whose ICMP messages are whose, if a raw socket has any to take
+    /// (rare: it is worked out only then).
+    fn icmp_owners(&self, sockets: &SocketSet<'static>) -> Option<IcmpOwners> {
+        let raw = || self.chans.iter().flatten().flat_map(|c| c.socks.values().map(move |s| (c.owner, s)));
+        let pending = raw().any(|(_, s)| matches!(&s.proto, Proto::Raw { handle, .. } if sockets.get::<raw::Socket>(*handle).can_recv()));
+        if !pending {
+            return None;
+        }
+        let mut o = IcmpOwners::default();
+        for (owner, s) in raw() {
+            if let Proto::Raw { ids, .. } = &s.proto {
+                o.echo.extend(ids.iter().map(|&id| (id, owner)));
+            }
+        }
+        o.tcp.extend(self.holders(true, sockets, None).iter().map(|h| (h.port, h.owner)));
+        o.udp.extend(self.holders(false, sockets, None).iter().map(|h| (h.port, h.owner)));
+        Some(o)
+    }
+
     /// Gives the connections that arrived at listeners since smoltcp last
     /// sent their first buffers, so that their SYN-ACK offers a window
     /// (called between smoltcp's taking frames and its sending). A
@@ -1563,11 +1634,11 @@ impl Service {
         let mut done = Vec::new();
         let now = crate::now();
         let Service { lingering, lingering_records: records, closing, mem, bytes, orphans, .. } = self;
-        lingering.retain(|&(h, until)| {
-            if now < until {
+        lingering.retain(|l| {
+            if now < l.until {
                 return true;
             }
-            records.uncharge(h.owner, 1);
+            records.uncharge(l.holder.owner, 1);
             false
         });
         closing.retain_mut(|cl| {
@@ -1583,7 +1654,8 @@ impl Service {
                     // with a reset instead of an ACK.
                     if let Some(local) = cl.local.filter(|_| records.charge(cl.owner, 1).is_ok()) {
                         let holder = PortHolder { owner: cl.owner, port: local.port, addr: local.addr.map(bits), reuse: cl.reuse, listening: false, connected: false, closing: true };
-                        lingering.push((holder, now + TIME_WAIT));
+                        let tuple = socket.local_endpoint().zip(socket.remote_endpoint());
+                        lingering.push(Lingering { holder, tuple, until: now + TIME_WAIT });
                     }
                 }
                 // (A reset made below goes out with the next poll, before
@@ -1651,7 +1723,7 @@ impl Service {
     /// (an orphan's or a TIME-WAIT record's time is up).
     pub fn deadline(&self) -> Option<Instant> {
         let orphans = self.closing.iter().filter_map(Closing::deadline);
-        let records = self.lingering.iter().map(|&(_, until)| until);
+        let records = self.lingering.iter().map(|l| l.until);
         orphans.chain(records).min()
     }
 }
@@ -1660,7 +1732,9 @@ impl Service {
 /// the protocol or took its grant away. A TCP buffer that limits the
 /// transfer goes to `wants` (to grow), as does a connection idle since
 /// `TRIM_AFTER` while `trimming` (memory is under pressure).
-fn pump_one(s: &mut Sock, ctl: &Ctl, rings: Option<Rings>, sockets: &mut SocketSet<'static>, now: Instant, trimming: bool, wants: &mut Vec<(SocketHandle, Want)>) -> Result<bool, ()> {
+fn pump_one(s: &mut Sock, ctl: &Ctl, rings: Option<Rings>, sockets: &mut SocketSet<'static>, ctx: &Round, wants: &mut Vec<(SocketHandle, Want)>) -> Result<bool, ()> {
+    let Round { now, trimming, owner, ref icmp } = *ctx;
+    let icmp = icmp.as_ref();
     let Sock { proto, rx_tail, tx_head, state: st_bits, backlog, err_seq, rx_wait, .. } = s;
     match proto {
         Proto::Tcp(t) => {
@@ -1830,12 +1904,18 @@ fn pump_one(s: &mut Sock, ctl: &Ctl, rings: Option<Rings>, sockets: &mut SocketS
             *st_bits = b;
             Ok(moved)
         }
-        Proto::Udp { handle, .. } => {
+        Proto::Udp { handle, peer, .. } => {
             let socket = sockets.get_mut::<udp::Socket>(*handle);
             let mut moved = false;
             if let Some(r) = rings {
                 loop {
                     let (len, from) = match socket.peek() {
+                        // A connected socket takes datagrams from its peer
+                        // only, as on Linux.
+                        Ok((_, meta)) if peer.is_some_and(|p| p != meta.endpoint) => {
+                            let _ = socket.recv();
+                            continue;
+                        }
                         Ok((data, meta)) => (data.len() as u32, Endpoint { addr: bits(meta.endpoint.addr), port: meta.endpoint.port }),
                         Err(_) => {
                             *rx_wait = false;
@@ -1864,14 +1944,26 @@ fn pump_one(s: &mut Sock, ctl: &Ctl, rings: Option<Rings>, sockets: &mut SocketS
             *st_bits = state::SEND_OPEN | if socket.can_send() { state::WRITABLE } else { 0 };
             Ok(moved)
         }
-        Proto::Raw { handle, .. } => {
+        Proto::Raw { handle, peer, .. } => {
             let socket = sockets.get_mut::<raw::Socket>(*handle);
             let mut moved = false;
             if let Some(r) = rings {
                 loop {
                     let (len, from) = match socket.peek() {
-                        // Whole IPv4 packets, header included, as on Linux.
-                        Ok(data) => (data.len() as u32, Ipv4Packet::new_checked(data).map_or(0, |p| p.src_addr().to_bits())),
+                        Ok(data) => {
+                            let from = Ipv4Packet::new_checked(data).map_or(0, |p| p.src_addr().to_bits());
+                            // A connected socket takes its peer's packets
+                            // only (as on Linux), and an instance sees no
+                            // other instance's ICMP traffic.
+                            let theirs = icmp.and_then(|i| i.owner(data)).is_some_and(|o| o != owner);
+                            if peer.is_some_and(|p| p.to_bits() != from) || theirs {
+                                let _ = socket.recv();
+                                continue;
+                            }
+                            // Whole IPv4 packets, header included, as on
+                            // Linux.
+                            (data.len() as u32, from)
+                        }
                         Err(_) => {
                             *rx_wait = false;
                             break;
@@ -1897,6 +1989,60 @@ fn pump_one(s: &mut Sock, ctl: &Ctl, rings: Option<Rings>, sockets: &mut SocketS
             }
             *st_bits = state::SEND_OPEN | if socket.can_send() { state::WRITABLE } else { 0 };
             Ok(moved)
+        }
+    }
+}
+
+/// What `pump_one` needs to know of the round.
+struct Round {
+    now: Instant,
+    /// Memory is under pressure: idle connections give their buffers back.
+    trimming: bool,
+    /// The instance of the channel pumped.
+    owner: u64,
+    /// Whose ICMP messages are whose (made when a raw socket has some).
+    icmp: Option<IcmpOwners>,
+}
+
+/// Which instance an ICMP message is for, so that none sees another's:
+/// echo requests and replies by the identifier its raw sockets sent,
+/// errors by the TCP or UDP port (or echo identifier) of the packet they
+/// quote. Messages of no instance's (requests from other hosts, say) are
+/// everyone's, as on Linux.
+#[derive(Default)]
+struct IcmpOwners {
+    echo: BTreeMap<u16, u64>,
+    tcp: BTreeMap<u16, u64>,
+    udp: BTreeMap<u16, u64>,
+}
+
+impl IcmpOwners {
+    /// The instance whose `packet` (an IPv4 packet carrying ICMP) is.
+    fn owner(&self, packet: &[u8]) -> Option<u64> {
+        let ip = Ipv4Packet::new_checked(packet).ok()?;
+        let icmp = ip.payload();
+        if icmp.len() < 8 {
+            return None;
+        }
+        let echo_id = |m: &[u8]| (m.len() >= 8 && (m[0] == 0 || m[0] == 8)).then(|| u16::from_be_bytes([m[4], m[5]]));
+        match icmp[0] {
+            0 | 8 => self.echo.get(&echo_id(icmp)?).copied(),
+            // Destination unreachable, source quench, redirect, time
+            // exceeded, parameter problem: the IP header and the first 8
+            // bytes of the packet that caused it follow.
+            3 | 4 | 5 | 11 | 12 => {
+                let quoted = &icmp[8..];
+                let ihl = (*quoted.first()? as usize & 0xf) * 4;
+                let l4 = quoted.get(ihl..)?;
+                let port = || Some(u16::from_be_bytes([*l4.first()?, *l4.get(1)?]));
+                match *quoted.get(9)? {
+                    1 => self.echo.get(&echo_id(l4)?).copied(),
+                    6 => self.tcp.get(&port()?).copied(),
+                    17 => self.udp.get(&port()?).copied(),
+                    _ => None,
+                }
+            }
+            _ => None,
         }
     }
 }

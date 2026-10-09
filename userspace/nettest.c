@@ -387,6 +387,44 @@ static void datagram_semantics(void) {
     close(u2);
     close(rx);
     close(tx);
+
+    /* A connected UDP socket takes datagrams from its peer only. */
+    int me = socket(AF_INET, SOCK_DGRAM, 0), its_peer = socket(AF_INET, SOCK_DGRAM, 0), other = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in ma = addr("127.0.0.1", 0), pa = addr("127.0.0.1", 0);
+    socklen_t ml = sizeof ma, pal = sizeof pa;
+    bind(me, (struct sockaddr *)&ma, sizeof ma);
+    bind(its_peer, (struct sockaddr *)&pa, sizeof pa);
+    getsockname(me, (struct sockaddr *)&ma, &ml);
+    getsockname(its_peer, (struct sockaddr *)&pa, &pal);
+    connect(me, (struct sockaddr *)&pa, sizeof pa);
+    sendto(other, "stranger", 8, 0, (struct sockaddr *)&ma, sizeof ma);
+    sendto(its_peer, "peer", 4, 0, (struct sockaddr *)&ma, sizeof ma);
+    char got[16] = {0};
+    struct pollfd mp = {me, POLLIN, 0};
+    poll(&mp, 1, 2000);
+    check("a connected UDP socket drops a stranger's datagram", recv(me, got, sizeof got, 0) == 4 && memcmp(got, "peer", 4) == 0);
+    check("... and only takes its peer's", recv(me, got, sizeof got, MSG_DONTWAIT) == -1 && errno == EAGAIN);
+    close(me);
+    close(its_peer);
+    close(other);
+
+    /* Two sockets sharing a port (SO_REUSEADDR) cannot both connect to
+     * the same peer: the second's 4-tuple is in use. */
+    int lport = 0, l = listener(&lport, 0);
+    int t1 = socket(AF_INET, SOCK_STREAM, 0), t2 = socket(AF_INET, SOCK_STREAM, 0);
+    setsockopt(t1, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    setsockopt(t2, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    struct sockaddr_in ta = addr("127.0.0.1", 0), la = addr("127.0.0.1", lport);
+    socklen_t tl = sizeof ta;
+    bind(t1, (struct sockaddr *)&ta, sizeof ta);
+    getsockname(t1, (struct sockaddr *)&ta, &tl);
+    int shared = bind(t2, (struct sockaddr *)&ta, sizeof ta) == 0;
+    int first = connect(t1, (struct sockaddr *)&la, sizeof la) == 0;
+    check("a second connection with the same 4-tuple: EADDRNOTAVAIL",
+          shared && first && connect(t2, (struct sockaddr *)&la, sizeof la) == -1 && errno == EADDRNOTAVAIL);
+    close(t1);
+    close(t2);
+    close(l);
 }
 
 /* Hundreds of connections at once, as a server's clients or a package
