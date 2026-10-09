@@ -810,6 +810,10 @@ pub fn mkwrite(key: u64, offset: u64) {
     // An object no inode has any more has no mapping that waits.
     let Some(inode) = by_key(key) else { return };
     let Some(object) = *inode.object.lock() else { return };
+    if FAIL_MKWRITE.compare_exchange(inode.ino as u64, 0, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+        syscall(SYS_MO_BACKED, [object, offset, offset, 0, 0, 0]);
+        return;
+    }
     let size = syscall(SYS_MO_FILE_SIZE, [object, 0, 0, 0, 0, 0]).max(0) as u64;
     let to = (offset + PAGE).min(size).max(offset);
     let (end, ok) = match live(&inode).and_then(|_| secure(&inode, object, offset, to)) {
@@ -1641,6 +1645,19 @@ pub fn closing() {
 }
 
 // ----------------------------------------------------------- self-test
+
+/// The inode whose next backing `mkwrite` fails (`TEST_MKWRITE_FAIL`; 0:
+/// none).
+static FAIL_MKWRITE: AtomicU64 = AtomicU64::new(0);
+
+/// `TEST_MKWRITE_FAIL` (see `restricted::TEST_MKWRITE_FAIL`).
+pub fn fail_next_mkwrite(ino: u64) -> i64 {
+    if ino == 0 {
+        return -EINVAL;
+    }
+    FAIL_MKWRITE.store(ino, Ordering::Relaxed);
+    0
+}
 
 /// `TEST_CACHED` (see `restricted::TEST_CACHED`).
 pub fn test(scenario: u64) -> i64 {

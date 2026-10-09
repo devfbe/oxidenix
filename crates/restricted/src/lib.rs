@@ -826,3 +826,9 @@ pub const TEST_CACHED: u64 = 1516;
 /// and returns its result: a call that always counts as passed through
 /// (`legacy_calls`), whatever the server comes to handle itself.
 pub const TEST_PASS_THROUGH: u64 = 1517;
+/// `(ino)`: the pager fails the next backing the kernel asks of it
+/// (`EVENT_MKWRITE`) for the /data file with inode number `ino`, as a full
+/// disk would (`mo_backed` not ok), and answers later ones as usual: the
+/// store through a shared mapping that asked raises SIGBUS, a later one
+/// asks again. EINVAL for inode 0.
+pub const TEST_MKWRITE_FAIL: u64 = 1519;

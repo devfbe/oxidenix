@@ -125,6 +125,7 @@ pub extern "C" fn _start(state: *mut State, role: u64) -> ! {
                     Err(e) => -e,
                 } as u64;
             }
+            TEST_MKWRITE_FAIL => s.rax = datafs::fail_next_mkwrite(s.rdi) as u64,
             TEST_PASS_THROUGH => {
                 const SYS_GETPID: u64 = 39;
                 s.rax = SYS_GETPID;
