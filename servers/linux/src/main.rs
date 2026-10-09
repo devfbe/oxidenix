@@ -32,6 +32,7 @@ mod namespace;
 mod netclient;
 mod netdev;
 mod netlink;
+mod pathfile;
 mod paths;
 mod pipe;
 mod pty;

@@ -480,9 +480,14 @@ device. Decisions in ADR 0007.
   `EVENT_CONSOLE` (the keyboard interrupt sets a flag and wakes the service thread's
   channel; no lock of the instance is taken in interrupt context); losing the device is
   `EVENT_CONSOLE_LOST`.
-- **Writes and echoes**: a write goes out whole in a writer's turn, a fair sleeping lock of
-  the kernel's (first come first served, so a program flooding the console starves no other
-  writer; a signal interrupts a wait for the turn with EINTR, nothing written). The service
+- **Writes and echoes**: a write (at most 4 KiB per call) goes out whole in a writer's turn,
+  a fair sleeping lock of the kernel's (first come first served, so a program flooding the
+  console starves no other writer). The turn is never held beyond one call, nor across a
+  copy: the kernel checks the holder, copies the call's bytes into its own memory, then
+  takes a ticket and writes them. A signal does not end the wait for the turn (the output
+  was processed for it); a dying thread's wait ends (EINTR, the ticket skipped), and so do
+  the waits of an instance that loses the device (EIO: a change of the holder wakes them),
+  so no instance can keep another's writers waiting. The service
   thread processes the keyboard's input and must never wait behind such a write (the
   instance's page faults wait for it): its echoes (`console_write` with `CONSOLE_ECHO`) go
   into a bounded queue (4 KiB, the rest dropped, as Linux's echo buffer) that the writer
@@ -536,7 +541,8 @@ placeholder in the kernel's descriptor table, as pipes are).
   are interruptible server futex waits with a deadline; whether the read is canonical is
   asked at every pass, as Linux's. A read takes the read turn for the whole call (Linux's
   `atomic_read_lock`: a line or a `VMIN` batch is never split between readers); turns are
-  interruptible waits on the terminal's change counter, not server locks, since they are held
+  interruptible waits on the turn's own counter (woken only when the turn passes on), not
+  server locks, since they are held
   across waits for input, and first come first served (tickets; one given up by a signal is
   skipped), so a caller that comes back at once queues behind the others instead of barging
   in before the woken waiter runs. Bytes are peeked under the terminal's lock, copied to the program
@@ -548,9 +554,12 @@ placeholder in the kernel's descriptor table, as pipes are).
   output processing happens under the terminal's lock into the server's memory, a pty's
   output goes to its master's buffer under it, the console's to the device after it. No lock
   of `sync` is held across the console's write (a flooding writer would get a lock holder's
-  priority for the whole write and starve its CPU's other threads); the columns that output
-  leaves count once it went out (a signal while it waits for the console's turn writes
-  nothing, and the restarted write processes it once). Output stopped by
+  priority for the whole write and starve its CPU's other threads). As on Linux, signals
+  end a write in its wait for the write turn and between its chunks, before a chunk is
+  processed (`n_tty_write` checks `signal_pending` each pass: what went, or EINTR,
+  restarted, if nothing), never in the device's write after processing (no signal ends its
+  wait for the kernel's turn): output processed is output that goes out, so the column
+  bookkeeping moves once and echoes never see it half done. Output stopped by
   `VSTOP` (or `tcflow`) waits for `VSTART`. Echoes take neither turn.
 - **Job control** (Linux's `tty_check_change`): a process of a background group reading its
   controlling terminal gets SIGTTIN for its group and the call restarts after it (EIO if it
@@ -579,11 +588,27 @@ placeholder in the kernel's descriptor table, as pipes are).
   Linux: (5,0) `/dev/tty` (the caller's controlling terminal, ENXIO without one), (5,1)
   `/dev/console`, (5,2) `/dev/ptmx`, (136,n) `/dev/pts/n` are the server's, whatever
   filesystem holds the node; (1,3) and (1,5) are null and zero: the kernel's for its own
-  nodes, the server's (`devices.rs`, with the node's own status; zero maps anonymous memory)
-  for nodes of its filesystems; any other number has no driver (ENXIO). `O_PATH` opens any
-  device node alone, never its driver, as Linux's: the server's node-only file with the
-  node's status, the access mode ignored, reads, writes and ioctls EBADF. `O_DIRECTORY` is
-  ENOTDIR. The kernel's `/dev` gives its nodes their numbers (`st_rdev`).
+  nodes, the server's (`devices.rs`) for nodes of its filesystems (zero maps anonymous
+  memory, EACCES as Linux's for a descriptor not open for reading or a shared writable
+  mapping of one not open for writing, read-only for good then; reads fill the whole count
+  unless a signal comes; counts and buffers checked as Linux's `rw_verify_area` and
+  `import_iovec`); any other number has no driver (ENXIO). `O_DIRECTORY` is ENOTDIR. The
+  server's terminal, null and zero descriptors keep the node they were opened by (`Origin`):
+  fstat is the node's, live, and fchmod, fchown and futimens change it. The kernel's `/dev`
+  gives its nodes their numbers (`st_rdev`).
+- **O_PATH** (`pathfile.rs`, any node of the namespace): the descriptor names the node and
+  opens nothing, no driver, no file, as Linux's: only O_DIRECTORY, O_NOFOLLOW and O_CLOEXEC
+  are kept (O_CREAT creates nothing, the access mode is ignored), O_NOFOLLOW names a symlink
+  itself; fstat and fstatfs describe the node (live), it serves as the directory of *at calls
+  and with AT_EMPTY_PATH as their target, fchdir takes a directory; reads, writes, ioctls,
+  mmap, getdents and fchmod, fchown, futimens are EBADF. Its placeholder in the kernel's
+  table carries O_PATH: F_GETFL shows it, only dup, close and fcntl's F_DUPFD, F_GETFD,
+  F_SETFD and F_GETFL take it there; poll gives POLLNVAL, select, epoll, ioctl and F_SETFL
+  EBADF; inotify and socket calls on one are EBADF. As a directory of *at calls it must be a
+  directory (ENOTDIR: an O_NOFOLLOW symlink's path is not followed); `readlinkat` with an
+  empty path reads the symlink it names. It keeps its node (a /data inode unlinked meanwhile
+  goes with its blocks when the last descriptor closes, as an open file's). Not done yet:
+  reopening through `/proc/self/fd/N` (procfs has no fd links) and `execveat` of one.
 - **ioctls**: `TCGETS`/`TCSETS`/`TCSETSW`/`TCSETSF` and the `termios2` forms, `TCSBRK`,
   `TCSBRKP`, `TCXONC`, `TCFLSH`, `TIOCGWINSZ`/`TIOCSWINSZ`, `TIOCGPGRP`/`TIOCSPGRP`,
   `TIOCGSID`, `TIOCSCTTY`, `TIOCNOTTY`, `TIOCSTI` (everyone is root), `FIONREAD`,

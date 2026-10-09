@@ -9,6 +9,7 @@
 //! init gets /dev/console), and its process the console as its controlling terminal (there
 //! is no getty to make it one; ADR 0007).
 
+use crate::namespace::Origin;
 use crate::sync::Mutex;
 use crate::syscall;
 use crate::tty::{self, Driver, Tty, ENXIO};
@@ -54,19 +55,26 @@ pub fn current() -> Option<Arc<Tty>> {
 }
 
 /// Opens /dev/console (never the caller's controlling terminal by opening, as on Linux).
-pub fn open(flags: u32, stat: [u8; 144]) -> Result<i64, i64> {
+pub fn open(flags: u32, origin: Origin) -> Result<i64, i64> {
     let t = tty().ok_or(ENXIO)?;
-    tty::open(&t, flags, stat, false)
+    tty::open(&t, flags, origin, false)
 }
 
-/// Writes to the device, whole: Ok, or EINTR when a signal came while it waited for its
-/// turn (nothing written). When the instance no longer holds the device the bytes go
-/// (its terminal hangs up at the event).
-pub fn device_write(bytes: &[u8]) -> Result<(), i64> {
-    match syscall(SYS_CONSOLE_WRITE, [bytes.as_ptr() as u64, bytes.len() as u64, 0, 0, 0, 0]) {
-        r if r == -tty::EINTR => Err(tty::EINTR),
-        _ => Ok(()),
+/// Writes to the device (a call per `CONSOLE_WRITE_MAX` bytes, each whole). A signal does
+/// not interrupt it (the output was processed for it already; the writer checks for
+/// signals between its chunks, before processing): Ok, or the bytes that went out before
+/// an error: EINTR for a dying thread, EIO when the instance lost the device (its
+/// terminal hangs up at the event).
+pub fn device_write(bytes: &[u8]) -> Result<(), (usize, i64)> {
+    let mut went = 0;
+    for piece in bytes.chunks(CONSOLE_WRITE_MAX as usize) {
+        let r = syscall(SYS_CONSOLE_WRITE, [piece.as_ptr() as u64, piece.len() as u64, 0, 0, 0, 0]);
+        if r < 0 {
+            return Err((went, -r));
+        }
+        went += piece.len();
     }
+    Ok(())
 }
 
 /// Echoes to the device without ever waiting (the service thread's input processing must
@@ -107,9 +115,11 @@ pub fn lost() {
 /// leader) the console as its controlling terminal.
 pub fn setup_stdio() {
     const O_RDWR: u32 = 2;
-    let stat = crate::namespace::resolve("/", "/dev/console", true).and_then(|r| r.node.stat()).unwrap_or([0; 144]);
+    // The kernel's /dev/console node (it is always there).
+    let Ok(node) = crate::namespace::resolve("/", "/dev/console", true).map(|r| r.node) else { return };
     let Some(t) = tty() else { return };
-    let fd = match tty::open(&t, O_RDWR, stat, false) {
+    let origin = Origin::new(node, alloc::string::String::from("/dev/console"), vfs::S_IFCHR);
+    let fd = match tty::open(&t, O_RDWR, origin, false) {
         Ok(fd) => fd as u64,
         Err(_) => return,
     };

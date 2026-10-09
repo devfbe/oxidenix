@@ -25,6 +25,9 @@ pub const O_NONBLOCK: u32 = 0o4000;
 pub const O_DIRECTORY: u32 = 0o200000;
 pub const O_NOFOLLOW: u32 = 0o400000;
 pub const O_CLOEXEC: u32 = 0o2000000;
+/// A descriptor that only names a node (the Linux server's placeholders of O_PATH
+/// opens): only dup, close and fcntl's F_DUPFD, F_GETFD, F_SETFD and F_GETFL take it.
+pub const O_PATH: u32 = 0o10000000;
 
 const PIPE_CAPACITY: usize = 64 * 1024;
 /// Buffer space charged when a pipe is created. An empty pipe can therefore
@@ -263,6 +266,11 @@ impl OpenFile {
             Kind::Inode(i) => Some(i),
             _ => None,
         }
+    }
+
+    /// An O_PATH descriptor's (see `O_PATH`).
+    pub fn is_path(&self) -> bool {
+        self.flags.load(Ordering::Relaxed) & O_PATH != 0
     }
 
     pub fn readable(&self) -> bool {

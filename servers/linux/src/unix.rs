@@ -377,7 +377,7 @@ impl Sink<'_> {
     pub fn room(&self) -> usize {
         match self {
             Sink::Program { vecs, idx, off } => {
-                vecs.iter().skip(*idx).map(|v| v.1).sum::<u64>().saturating_sub(*off).min(isize::MAX as u64) as usize
+                vecs.iter().skip(*idx).fold(0u64, |t, v| t.saturating_add(v.1)).saturating_sub(*off).min(isize::MAX as u64) as usize
             }
             Sink::Server { buf, at } => buf.len() - *at,
         }
@@ -432,7 +432,7 @@ impl Source<'_> {
     pub fn left(&self) -> usize {
         match self {
             Source::Program { vecs, idx, off } => {
-                vecs.iter().skip(*idx).map(|v| v.1).sum::<u64>().saturating_sub(*off).min(isize::MAX as u64) as usize
+                vecs.iter().skip(*idx).fold(0u64, |t, v| t.saturating_add(v.1)).saturating_sub(*off).min(isize::MAX as u64) as usize
             }
             Source::Server { buf, at } => buf.len() - *at,
         }

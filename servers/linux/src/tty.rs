@@ -7,9 +7,10 @@
 //!
 //! Locks: `inner` holds the state and is never held across a copy to or from program
 //! memory, nor across a wait or the console's write. A read or a write takes its turn
-//! (`turn`, Linux's atomic_read_lock and atomic_write_lock) for the whole call: an
-//! interruptible wait on `seq`, not a lock of `sync`, since it is held across waits for
-//! input or room. Within a read the bytes are peeked under `inner`, copied to the program
+//! (`turn`, Linux's atomic_read_lock and atomic_write_lock) for the whole call: first
+//! come first served, an interruptible wait on the turn's own counter (`turn_words`,
+//! advanced only when the turn passes on), not a lock of `sync`, since it is held across
+//! waits for input or room. Within a read the bytes are peeked under `inner`, copied to the program
 //! with only `rlock` held, and consumed after, unless an input flush came in between
 //! (`Inner::epoch`); a change of settings takes `rlock` for the change (order: `rlock`,
 //! then `inner`). `rlock` is held across the copy, where a fault may wait for the pager:
@@ -28,6 +29,7 @@
 //! whose session is the process's (ADR 0007).
 
 use crate::files::{self, File, EFAULT, EINVAL, ENOTTY, O_ACCMODE, O_CLOEXEC, O_NONBLOCK};
+use crate::namespace::Origin;
 use crate::sync::Mutex;
 use crate::syscall;
 use crate::unix::{Sink, Source};
@@ -159,6 +161,9 @@ pub struct Tty {
     pub inner: Mutex<Inner>,
     /// Bumped on every change; waiters sleep on it.
     seq: AtomicU32,
+    /// Each turn's own change counter (`TURN_*`): its waiters sleep on it, woken only
+    /// when the turn passes on, not by every change of the terminal.
+    turn_words: [AtomicU32; 4],
     /// Reads (and settings changes), one at a time.
     rlock: Mutex<()>,
     /// The settings the driver starts with, which a hangup restores.
@@ -209,7 +214,7 @@ impl Drop for Turn<'_> {
     fn drop(&mut self) {
         let mut inner = self.tty.inner.lock();
         inner.turns[self.which].advance();
-        self.tty.changed(&mut inner, false, false);
+        self.tty.turn_advanced(self.which);
     }
 }
 
@@ -219,8 +224,8 @@ pub struct TtyOpen {
     /// The terminal's hangup generation when it was opened.
     gen: u32,
     pub id: u64,
-    /// The status of the device node it was opened by (fstat).
-    pub stat: [u8; 144],
+    /// The device node it was opened by (fstat, fchmod and the like).
+    pub origin: Origin,
 }
 
 /// A process's ids, as the kernel answers `proc_ids`.
@@ -266,26 +271,27 @@ pub fn ctty_of(sid: u64) -> Option<Arc<Tty>> {
     all().into_iter().find(|t| t.inner.lock().session == Some(sid))
 }
 
-/// Opens the terminal device with number `rdev` (a character device node's, whose status
-/// is `stat`), if it is one: (5,0) /dev/tty, (5,1) /dev/console, (5,2) /dev/ptmx, (136,n)
-/// /dev/pts/n. None for another device.
-pub fn open_device(rdev: u64, flags: u32, stat: [u8; 144]) -> Option<Result<i64, i64>> {
+/// Opens the terminal device with number `rdev` (the character device node `origin`), if
+/// it is one: (5,0) /dev/tty, (5,1) /dev/console, (5,2) /dev/ptmx, (136,n) /dev/pts/n.
+/// None for another device.
+pub fn open_device(rdev: u64, flags: u32, origin: Origin) -> Option<Result<i64, i64>> {
     Some(match vfs::stat::dev_split(rdev) {
         (5, 0) => ids(0, 0).and_then(|me| {
             let tty = ctty_of(me.sid).ok_or(ENXIO)?;
-            open(&tty, flags, stat, false)
+            open(&tty, flags, origin, false)
         }),
-        (5, 1) => crate::console::open(flags, stat),
-        (5, 2) => crate::pty::open_master(flags, stat),
-        (136, n) => crate::pty::open_slave(n, flags, stat),
+        (5, 1) => crate::console::open(flags, origin),
+        (5, 2) => crate::pty::open_master(flags, origin),
+        (136, n) => crate::pty::open_slave(n, flags, origin),
         _ => return None,
     })
 }
 
-/// A new open file description of `tty` for the caller; `ctty`: the open may make it the
-/// caller's controlling terminal (a session leader without one opening a terminal that
-/// controls no session, unless O_NOCTTY: Linux's `tty_open_proc_set_tty`).
-pub fn open(tty: &Arc<Tty>, flags: u32, stat: [u8; 144], ctty: bool) -> Result<i64, i64> {
+/// A new open file description of `tty` for the caller, opened by the node `origin`;
+/// `ctty`: the open may make it the caller's controlling terminal (a session leader
+/// without one opening a terminal that controls no session, unless O_NOCTTY: Linux's
+/// `tty_open_proc_set_tty`).
+pub fn open(tty: &Arc<Tty>, flags: u32, origin: Origin, ctty: bool) -> Result<i64, i64> {
     let id = files::new_id();
     let (open, ready, was_closed) = {
         let mut inner = tty.inner.lock();
@@ -298,7 +304,7 @@ pub fn open(tty: &Arc<Tty>, flags: u32, stat: [u8; 144], ctty: bool) -> Result<i
             was_closed = core::mem::replace(&mut p.slave_closed, false);
         }
         tty.changed(&mut inner, false, false);
-        (Arc::new(TtyOpen { tty: tty.clone(), gen, id, stat }), ready, was_closed)
+        (Arc::new(TtyOpen { tty: tty.clone(), gen, id, origin }), ready, was_closed)
     };
     let fd = match files::install(id, File::Tty(open.clone()), flags & (O_ACCMODE | O_NONBLOCK | O_CLOEXEC), ready) {
         Ok(fd) => fd,
@@ -374,6 +380,7 @@ impl Tty {
                 pty,
             }),
             seq: AtomicU32::new(0),
+            turn_words: Default::default(),
             rlock: Mutex::new(()),
             init,
         })
@@ -538,8 +545,8 @@ impl Tty {
         }
     }
 
-    /// Writes to the console device (no lock held; a signal while it waits for its turn
-    /// loses the bytes: for the flow control characters of TCIOFF and TCION).
+    /// Writes to the console device, no lock held (the flow control characters of TCIOFF
+    /// and TCION; a dying thread's or a lost device's bytes go).
     fn console_write(&self, bytes: &[u8]) {
         if !bytes.is_empty() {
             let _ = crate::console::device_write(bytes);
@@ -547,8 +554,9 @@ impl Tty {
     }
 
     /// The turn `which` (`TURN_*`) for a whole call; EAGAIN with `nonblock` if another
-    /// call has it, EINTR for a signal while waiting. An interruptible wait on `seq`,
-    /// not a lock of `sync`: it is held across waits for input or room, where a
+    /// call has it, EINTR for a signal while waiting. An interruptible wait on the
+    /// turn's counter (`turn_words`), not a lock of `sync`: it is held across waits for
+    /// input or room, where a
     /// program's signals must reach the waiter (and no lock holder's priority is due).
     pub fn turn(&self, which: usize, nonblock: bool) -> Result<Turn<'_>, i64> {
         let ticket = {
@@ -560,27 +568,36 @@ impl Tty {
             q.next = q.next.wrapping_add(1);
             q.next.wrapping_sub(1)
         };
+        let word = &self.turn_words[which];
         loop {
             let seen = {
                 let inner = self.inner.lock();
                 if inner.turns[which].serving == ticket {
                     return Ok(Turn { tty: self, which });
                 }
-                self.seen()
+                word.load(Ordering::Acquire)
             };
-            if let Err(e) = self.wait(seen, 0) {
+            let addr = word as *const AtomicU32 as u64;
+            if syscall(SYS_SERVER_FUTEX_WAIT, [addr, seen as u64, 0, FUTEX_INTERRUPTIBLE, 0, 0]) == -EINTR {
                 // Given up: skipped when it comes (or passed on, if it came just now).
                 let mut inner = self.inner.lock();
                 let q = &mut inner.turns[which];
                 if q.serving == ticket {
                     q.advance();
+                    self.turn_advanced(which);
                 } else {
                     q.abandoned.push(ticket);
                 }
-                self.changed(&mut inner, false, false);
-                return Err(e);
+                return Err(EINTR);
             }
         }
+    }
+
+    /// Turn `which` passed on (lock held): its waiters look whose it is.
+    fn turn_advanced(&self, which: usize) {
+        let word = &self.turn_words[which];
+        word.fetch_add(1, Ordering::Release);
+        syscall(SYS_SERVER_FUTEX_WAKE, [word as *const AtomicU32 as u64, i32::MAX as u64, 0, 0, 0, 0]);
     }
 
     /// Echoes to the console device: never waits (the service thread processes the
@@ -624,6 +641,11 @@ impl Tty {
         let _turn = self.turn(TURN_MASTER_WRITE, nonblock)?;
         let mut written = 0usize;
         while src.left() > 0 {
+            // A signal ends the write between chunks (Linux's n_tty_write checks
+            // signal_pending each pass): what went, or EINTR (restarted) if nothing.
+            if files::signal_pending() {
+                return if written > 0 { Ok(written as i64) } else { Err(EINTR) };
+            }
             let chunk = match src.take(WRITE_CHUNK) {
                 Ok(c) => c,
                 Err(e) => return if written > 0 { Ok(written as i64) } else { Err(e) },
@@ -764,11 +786,22 @@ impl Tty {
         let _turn = self.turn(TURN_WRITE, nonblock)?;
         let mut written = 0usize;
         while src.left() > 0 {
+            // A signal ends the write between chunks (Linux's n_tty_write checks
+            // signal_pending each pass, before processing): what went, or EINTR
+            // (restarted) if nothing. Processed output always goes out.
+            if files::signal_pending() {
+                return if written > 0 { Ok(written as i64) } else { Err(EINTR) };
+            }
             let chunk = match src.take(WRITE_CHUNK) {
                 Ok(c) => c,
                 Err(e) => return if written > 0 { Ok(written as i64) } else { Err(e) },
             };
             loop {
+                // Output processed here goes out: the console's write waits for its
+                // turn but no signal ends that wait (only death, after which nothing
+                // restarts, or the loss of the device, which hangs the terminal up),
+                // so the column bookkeeping moves once per byte that goes out, as
+                // Linux's (the interruptible wait is this write's turn, taken before).
                 let seen = {
                     let mut inner = self.inner.lock();
                     if inner.gen != open.gen {
@@ -776,7 +809,6 @@ impl Tty {
                     }
                     if Self::writable(&inner) {
                         let mut out = Vec::with_capacity(chunk.len() + chunk.len() / 4);
-                        let before = inner.ld.columns();
                         inner.ld.output(&chunk, &mut out);
                         match inner.pty.as_mut() {
                             Some(p) => {
@@ -784,17 +816,13 @@ impl Tty {
                                 self.changed(&mut inner, false, true);
                             }
                             None => {
-                                // The columns this output leaves count once it went
-                                // out: a signal while it waits for the console's turn
-                                // (EINTR, nothing written) must not leave them moved
-                                // for the write's restart to move again.
-                                let after = inner.ld.columns();
-                                inner.ld.set_columns(before);
                                 drop(inner);
-                                if let Err(e) = crate::console::device_write(&out) {
+                                if let Err((went, e)) = crate::console::device_write(&out) {
+                                    // Part of this chunk's output went out: the chunk
+                                    // counts (the rest is lost with the device).
+                                    let written = if went > 0 { written + chunk.len() } else { written };
                                     return if written > 0 { Ok(written as i64) } else { Err(e) };
                                 }
-                                self.inner.lock().ld.set_columns(after);
                             }
                         }
                         break;
@@ -1183,7 +1211,7 @@ pub fn call(nr: u64, open: &Arc<TtyOpen>, flags: u32, a1: u64, a2: u64) -> Resul
             let vecs = files::iovecs(a1, a2)?;
             tty.write(open, Source::program(&vecs), nonblock)
         }
-        SYS_FSTAT => usercopy::to_program(a1, &open.stat).map(|_| 0),
+        SYS_FSTAT => usercopy::to_program(a1, &open.origin.stat()?).map(|_| 0),
         SYS_IOCTL => tty.ioctl(Some(open), a1, a2),
         files::SYS_LSEEK | files::SYS_PREAD64 | files::SYS_PWRITE64 | files::SYS_PREADV | files::SYS_PWRITEV => Err(files::ESPIPE),
         files::SYS_GETDENTS64 => Err(files::ENOTDIR),

@@ -348,7 +348,10 @@ pub const TEST_USERCOPY: u64 = 1511;
 /// poll readiness `ready`; `kind` `KFD_ALWAYS_READY` for a file that is
 /// always ready (a regular file or a directory: epoll refuses it with
 /// EPERM, as Linux does), else 0. When its last descriptor goes,
-/// `EVENT_CLOSED`.
+/// `EVENT_CLOSED`. With O_PATH (and only O_DIRECTORY, O_NOFOLLOW, O_CLOEXEC
+/// besides) the descriptor only names a node: F_GETFL shows those flags, and
+/// the kernel takes it only for dup, close and fcntl's F_DUPFD, F_GETFD,
+/// F_SETFD and F_GETFL (poll: POLLNVAL; select, epoll, ioctl, F_SETFL: EBADF).
 pub const SYS_KFD_INSTALL: u64 = 1034;
 pub const KFD_ALWAYS_READY: u64 = 1;
 /// `kfd_lookup(fd, flags) -> id`: the server's file behind descriptor
@@ -713,17 +716,22 @@ pub const SYS_THREAD_IDS: u64 = 1103;
 /// input (typed on the keyboard, or the console's answers to queries written
 /// to it): 0 when there is none. EIO unless the instance holds the console.
 pub const SYS_CONSOLE_READ: u64 = 1110;
-/// `console_write(buf, len, flags) -> n`: writes `len` bytes to the console as
-/// they are (a VT100: a line feed keeps the column, `ONLCR` is the
-/// terminal's), whole: another write's bytes do not come between them (the
-/// caller waits its turn, first come first served; EINTR if a signal for the
-/// program comes first, with nothing written). With `CONSOLE_ECHO` (an echo of the
-/// line discipline, at most 512 bytes) it never waits: the bytes are queued
-/// and go out between the pieces of a write in progress or at once; what does
-/// not fit in the queue (4 KiB) is dropped, `n` says how much went. EIO
-/// unless the instance holds the console.
+/// `console_write(buf, len, flags) -> n`: writes the first `n` (at most
+/// `CONSOLE_WRITE_MAX`) of `len` bytes to the console as they are (a VT100: a
+/// line feed keeps the column, `ONLCR` is the terminal's), whole: another
+/// write's bytes do not come between them. The kernel copies the bytes first,
+/// then waits for the writer turn (first come first served, held only within
+/// the call); a signal does not end that wait, a dying thread's does (EINTR,
+/// nothing written), and so does the instance's loss of the console (EIO), so
+/// output processed for the write goes out. With `CONSOLE_ECHO` (an echo of the
+/// line discipline, at most `CONSOLE_ECHO_MAX` bytes) it never waits: the bytes
+/// are queued and go out between the pieces of a write in progress or at once;
+/// what does not fit in the queue (4 KiB) is dropped, `n` says how much went.
+/// EIO unless the instance holds the console.
 pub const SYS_CONSOLE_WRITE: u64 = 1111;
 pub const CONSOLE_ECHO: u64 = 1;
+pub const CONSOLE_WRITE_MAX: u64 = 4096;
+pub const CONSOLE_ECHO_MAX: u64 = 512;
 /// `console_info(out)`: the console's size, two u64s at `out` (columns,
 /// rows). EIO unless the instance holds the console.
 pub const SYS_CONSOLE_INFO: u64 = 1112;
@@ -747,10 +755,13 @@ pub const SIGNAL_PGRP: u64 = 1;
 pub const SIGNAL_LEADER: u64 = 2;
 /// `signal_state(sig) -> bits`: `SIGNAL_IGNORED` if the calling process
 /// ignores `sig` (SIG_IGN), `SIGNAL_BLOCKED` if the calling thread blocks it
-/// (SIGTTIN and SIGTTOU of background reads and writes).
+/// (SIGTTIN and SIGTTOU of background reads and writes). `signal_state(0)`:
+/// `SIGNAL_PENDING` if a signal (or a stop) waits for the calling thread (a
+/// long call returns what it did, Linux's signal_pending).
 pub const SYS_SIGNAL_STATE: u64 = 1115;
 pub const SIGNAL_IGNORED: u64 = 1;
 pub const SIGNAL_BLOCKED: u64 = 2;
+pub const SIGNAL_PENDING: u64 = 4;
 
 /// `(scenario)`: the server runs a channel scenario against the test
 /// service (servers/ringtest, `ring::selftest`): 1 rings and doorbells, 2

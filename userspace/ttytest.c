@@ -14,9 +14,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/inotify.h>
 #include <sys/ioctl.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/statfs.h>
 #include <sys/sysmacros.h>
+#include <sys/time.h>
 #include <sys/wait.h>
 #include <termios.h>
 #include <time.h>
@@ -524,6 +528,175 @@ static void read_rules(void) {
     close(m);
 }
 
+/* O_PATH descriptors (the server's, of any node) and the node behind a terminal's
+ * descriptor: fstat is live, fchmod changes the node. */
+static void opath(void) {
+    mkdir("/tmp/opath", 0755);
+    int f = open("/tmp/opath/file", O_RDWR | O_CREAT | O_TRUNC, 0644);
+    write(f, "data", 4);
+    close(f);
+    symlink("file", "/tmp/opath/link");
+    check("O_PATH|O_CREAT creates nothing (ENOENT)", open("/tmp/opath/none", O_PATH | O_CREAT | O_RDWR, 0644) == -1 && errno == ENOENT);
+    int p = open("/tmp/opath/file", O_PATH | O_RDWR);
+    char b[8];
+    struct stat st;
+    check("O_PATH: F_GETFL shows O_PATH, the access mode is gone",
+          p >= 0 && (fcntl(p, F_GETFL) & O_PATH) && (fcntl(p, F_GETFL) & 3) == 0);
+    check("O_PATH: reads and writes are EBADF", read(p, b, 1) == -1 && errno == EBADF && write(p, "x", 1) == -1 && errno == EBADF);
+    check("O_PATH: fstat and fstatfs work", fstat(p, &st) == 0 && S_ISREG(st.st_mode) && st.st_size == 4);
+    chmod("/tmp/opath/file", 0600);
+    check("O_PATH: fstat is live (a chmod by path shows)", fstat(p, &st) == 0 && (st.st_mode & 0777) == 0600);
+    /* The system calls themselves (musl's fchmod goes on through /proc/self/fd). */
+    check("O_PATH: fchmod and futimens are EBADF", syscall(91, p, 0644) == -1 && errno == EBADF &&
+                                                   syscall(280, p, NULL, NULL, 0) == -1 && errno == EBADF);
+    check("O_PATH: fchownat with AT_EMPTY_PATH works", fchownat(p, "", 0, 0, AT_EMPTY_PATH) == 0);
+    int one = 1;
+    check("O_PATH: ioctl(FIONBIO), F_SETFL are EBADF", ioctl(p, FIONBIO, &one) == -1 && errno == EBADF && fcntl(p, F_SETFL, O_NONBLOCK) == -1 && errno == EBADF);
+    struct pollfd pf = {p, POLLIN, 0};
+    check("O_PATH: poll says POLLNVAL", poll(&pf, 1, 0) == 1 && (pf.revents & POLLNVAL));
+    int d = dup(p);
+    check("O_PATH: dup keeps it O_PATH", d >= 0 && (fcntl(d, F_GETFL) & O_PATH));
+    close(d);
+    close(p);
+    int l = open("/tmp/opath/link", O_PATH | O_NOFOLLOW);
+    check("O_PATH|O_NOFOLLOW names the symlink itself", l >= 0 && fstat(l, &st) == 0 && S_ISLNK(st.st_mode));
+    close(l);
+    int dir = open("/tmp/opath", O_PATH | O_DIRECTORY);
+    int in = openat(dir, "file", O_RDONLY);
+    check("O_PATH directory: openat relative to it works", in >= 0 && read(in, b, 4) == 4);
+    close(in);
+    char dbuf[256];
+    check("O_PATH directory: getdents64 is EBADF", syscall(217, dir, dbuf, sizeof dbuf) == -1 && errno == EBADF);
+    char cwd[64];
+    getcwd(cwd, sizeof cwd);
+    check("O_PATH directory: fchdir works", fchdir(dir) == 0 && access("file", F_OK) == 0);
+    chdir(cwd);
+    close(dir);
+    int n = open("/dev/null", O_PATH);
+    check("O_PATH on the kernel's /dev/null: its node, EBADF to write",
+          n >= 0 && fstat(n, &st) == 0 && S_ISCHR(st.st_mode) && major(st.st_rdev) == 1 && write(n, "x", 1) == -1 && errno == EBADF);
+    close(n);
+    int ln = open("/tmp/opath/link", O_PATH | O_NOFOLLOW);
+    char target[16] = {0};
+    check("readlinkat with an empty path reads an O_PATH symlink", readlinkat(ln, "", target, sizeof target) == 4 && memcmp(target, "file", 4) == 0);
+    check("an O_PATH symlink is no directory for *at calls (ENOTDIR)", openat(ln, "x", O_RDONLY) == -1 && errno == ENOTDIR);
+    check("inotify and socket calls on an O_PATH descriptor are EBADF",
+          inotify_add_watch(ln, "/tmp", IN_CREATE) == -1 && errno == EBADF && listen(ln, 1) == -1 && errno == EBADF);
+    close(ln);
+    unlink("/tmp/opath/link");
+    unlink("/tmp/opath/file");
+    rmdir("/tmp/opath");
+
+    /* An unlinked /data file an O_PATH descriptor kept goes with its blocks at the close. */
+    struct statfs fs0, fs1, fs3;
+    statfs("/data", &fs0);
+    int df = open("/data/opath.bin", O_RDWR | O_CREAT | O_TRUNC, 0644);
+    static char mib[1 << 20];
+    memset(mib, 'd', sizeof mib);
+    write(df, mib, sizeof mib);
+    fsync(df);
+    close(df);
+    statfs("/data", &fs1);
+    int dp = open("/data/opath.bin", O_PATH);
+    unlink("/data/opath.bin");
+    close(dp);
+    statfs("/data", &fs3);
+    printf("ttytest: /data free blocks %llu, with the file %llu, after unlink and close %llu\n", (unsigned long long)fs0.f_bfree,
+           (unsigned long long)fs1.f_bfree, (unsigned long long)fs3.f_bfree);
+    check("an O_PATH /data file unlinked: its blocks are free when the close returns", fs1.f_bfree + 200 < fs0.f_bfree && fs3.f_bfree >= fs0.f_bfree);
+
+    /* A terminal's descriptor and its node. */
+    char path[64];
+    int m = new_pty(path, sizeof path);
+    int s = open(path, O_RDWR | O_NOCTTY);
+    chmod(path, 0600);
+    check("a terminal's fstat is its node's, live", fstat(s, &st) == 0 && (st.st_mode & 0777) == 0600);
+    check("fchmod on a terminal changes its node", fchmod(s, 0620) == 0 && stat(path, &st) == 0 && (st.st_mode & 0777) == 0620);
+    close(s);
+    close(m);
+}
+
+static void on_usr1(int sig) { (void)sig; }
+
+/* A signal ends a long console write between its chunks (Linux's n_tty_write): a
+ * write of 4 KiB of palette changes (each a full redraw, a chunk of 1 KiB takes seconds)
+ * interrupted by a handler returns the chunks that went, not all 4 KiB. */
+static void write_interrupted(void) {
+    int c = open("/dev/console", O_WRONLY | O_NOCTTY);
+    static char buf[4096];
+    for (int i = 0; i + 10 <= (int)sizeof buf; i += 10) memcpy(buf + i, (i / 10) % 2 ? "\033]P1ff0000" : "\033]P1000000", 10);
+    for (int i = sizeof buf - sizeof buf % 10; i < (int)sizeof buf; i++) buf[i] = '\r';
+    struct sigaction sa = {0}, old;
+    sa.sa_handler = on_usr1;
+    sigaction(SIGALRM, &sa, &old);
+    struct itimerval it = {{0, 0}, {0, 100000}};
+    setitimer(ITIMER_REAL, &it, NULL);
+    ssize_t n = write(c, buf, sizeof buf);
+    sigaction(SIGALRM, &old, NULL);
+    write(c, "\033]R\r\n", 5);
+    close(c);
+    printf("ttytest: an interrupted console write of %zu bytes returned %zd\n", sizeof buf, n);
+    check("a signal ends a console write between chunks (partial count)", n > 0 && n < (ssize_t)sizeof buf);
+}
+
+/* Waiters for a terminal's write turn that die or are interrupted give their tickets
+ * up: a writer blocks holding the turn (the master's buffer full), a second waits and is
+ * killed, a third waits and a handler interrupts it (EINTR), and once the first is done a
+ * fourth writer gets the turn at once (a ticket left behind would block it for ever). */
+static void turn_abandon(void) {
+    char path[64];
+    static char big[200 * 1024];
+    memset(big, 'a', sizeof big);
+    int m = new_pty(path, sizeof path);
+    int s = open(path, O_RDWR | O_NOCTTY);
+    pid_t holder = fork();
+    if (holder == 0) {
+        alarm(20);
+        _exit(write(s, big, sizeof big) == (ssize_t)sizeof big ? 0 : 1);
+    }
+    sleep_ms(100);
+    pid_t killed = fork();
+    if (killed == 0) {
+        write(s, "b", 1);
+        _exit(0);
+    }
+    pid_t interrupted = fork();
+    if (interrupted == 0) {
+        alarm(20);
+        struct sigaction sa = {0};
+        sa.sa_handler = on_usr1;
+        sigaction(SIGUSR1, &sa, NULL);
+        _exit(write(s, "c", 1) == -1 && errno == EINTR ? 0 : 1);
+    }
+    sleep_ms(100);
+    kill(killed, SIGKILL);
+    waitpid(killed, NULL, 0);
+    kill(interrupted, SIGUSR1);
+    int istatus = 0;
+    waitpid(interrupted, &istatus, 0);
+    /* Drain until the holder's write is done. */
+    char buf[4096];
+    fcntl(m, F_SETFL, O_NONBLOCK);
+    int hstatus = 0;
+    for (int i = 0; i < 2000 && waitpid(holder, &hstatus, WNOHANG) == 0; i++) {
+        while (read(m, buf, sizeof buf) > 0) {
+        }
+        sleep_ms(5);
+    }
+    pid_t last = fork();
+    if (last == 0) {
+        alarm(2);
+        _exit(write(s, "z", 1) == 1 ? 0 : 1);
+    }
+    int lstatus = 0;
+    waitpid(last, &lstatus, 0);
+    check("a killed and an interrupted turn waiter give their tickets up",
+          WIFEXITED(istatus) && WEXITSTATUS(istatus) == 0 && WIFEXITED(hstatus) && WEXITSTATUS(hstatus) == 0 &&
+              WIFEXITED(lstatus) && WEXITSTATUS(lstatus) == 0);
+    close(s);
+    close(m);
+}
+
 static void report_hup(int sig) {
     (void)sig;
     write(3, "H", 1);
@@ -784,6 +957,9 @@ int main(void) {
     pty_bounds();
     read_rules();
     orphans();
+    turn_abandon();
+    opath();
+    write_interrupted();
     job_control();
     printf("ttytest: %s\n", failures ? "FAILED" : "all passed");
     return failures != 0;

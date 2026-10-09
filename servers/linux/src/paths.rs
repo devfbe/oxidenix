@@ -14,7 +14,7 @@ use crate::datafile;
 use crate::datafs;
 use crate::files;
 use crate::inotify;
-use crate::namespace::{check, mode_of, resolve, resolve_parent, KInode, Node, Resolved, EBUSY, ENOENT, ENOTDIR, EXDEV};
+use crate::namespace::{check, mode_of, resolve, resolve_parent, KInode, Node, Origin, Resolved, EBUSY, ENOENT, ENOTDIR, EXDEV};
 use crate::records;
 use crate::syscall;
 use crate::tmpfile;
@@ -133,7 +133,7 @@ pub fn handle(s: &State) -> Option<i64> {
         SYS_FCHMODAT2 => fchmodat2(a0, a1, a2, a3),
         SYS_CHOWN => chownat(CWD, a0, 0),
         SYS_LCHOWN => chownat(CWD, a0, AT_SYMLINK_NOFOLLOW),
-        SYS_FCHOWN => fd_inode(a0).and_then(chown_target),
+        SYS_FCHOWN => fd_inode(a0, false).and_then(chown_target),
         SYS_FCHOWNAT => chownat(a0, a1, s.r8),
         SYS_STATX => statx(a0, a1, a2 as u32, a3 as u32, s.r8),
         inotify::SYS_INOTIFY_ADD_WATCH => inotify_add_watch(a0, a1, a2 as u32),
@@ -156,17 +156,32 @@ fn base_dir(dirfd: u64, path: &str) -> Result<String, i64> {
     if path.starts_with('/') || dirfd as i32 == AT_FDCWD {
         return Ok(records::current().state.lock().cwd.clone());
     }
+    // A descriptor that keeps its origin: its path, without another reference to
+    // the node; ENOTDIR unless it is a directory (an O_PATH|O_NOFOLLOW symlink's
+    // path must not be resolved through the link).
+    if let Some(o) = files::origin_of(dirfd) {
+        return if o.kind == vfs::S_IFDIR { Ok(o.path) } else { Err(ENOTDIR) };
+    }
     Ok(fd_node(dirfd)?.1)
 }
 
 /// The inode behind a descriptor and the path it was opened by (ENOTDIR
-/// for one without: pipes, sockets, the terminal).
+/// for one without: pipes, sockets, eventfds), an O_PATH descriptor's too.
 fn fd_node(fd: u64) -> Result<(Node, String), i64> {
+    fd_node_of(fd).map(|(node, path, _)| (node, path))
+}
+
+/// `fd_node`, and whether the descriptor is an O_PATH one.
+fn fd_node_of(fd: u64) -> Result<(Node, String, bool), i64> {
     if let Some(f) = files::tmp_of(fd) {
-        return Ok((Node::Tmp(f.inode.clone()), f.path.clone()));
+        return Ok((Node::Tmp(f.inode.clone()), f.path.clone(), false));
     }
     if let Some(f) = files::data_of(fd) {
-        return Ok((Node::Data(f.inode.clone()), f.path.clone()));
+        return Ok((Node::Data(f.inode.clone()), f.path.clone(), false));
+    }
+    // Terminals, null and zero, O_PATH: the node they were opened by.
+    if let Some(o) = files::origin_of(fd) {
+        return Ok((o.node()?, o.path, o.o_path));
     }
     if files::is_server_file(fd) {
         return Err(ENOTDIR);
@@ -178,7 +193,7 @@ fn fd_node(fd: u64) -> Result<(Node, String), i64> {
         [fd, buf.as_mut_ptr() as u64, buf.len() as u64, &mut len as *mut u64 as u64, 0, 0],
     ))?;
     buf.truncate(len as usize);
-    Ok((Node::Kernel(inode), String::from_utf8(buf).map_err(|_| ENOENT)?))
+    Ok((Node::Kernel(inode), String::from_utf8(buf).map_err(|_| ENOENT)?, false))
 }
 
 /// Resolves the program's path at `addr` relative to `dirfd`.
@@ -250,6 +265,16 @@ fn openat(dirfd: u64, addr: u64, flags: u32, mode: u32) -> Result<i64, i64> {
     let path = read_cstr(addr)?;
     let base = base_dir(dirfd, &path)?;
     let nofollow = flags & O_NOFOLLOW != 0;
+    // O_PATH names the node and opens nothing (`pathfile`): O_CREAT creates
+    // nothing, O_NOFOLLOW names a symlink itself, the access mode is ignored.
+    if flags & O_PATH != 0 {
+        let r = resolve(&base, &path, !nofollow)?;
+        if flags & O_DIRECTORY != 0 && r.mode & vfs::S_IFMT != vfs::S_IFDIR {
+            return Err(ENOTDIR);
+        }
+        let path = join(&r.path);
+        return crate::pathfile::open(flags, Origin::new(r.node, path, r.mode));
+    }
     // A name created by someone else between our lookup and our create is
     // opened instead, once: a name that exists but does not resolve (a
     // dangling symlink) stays EEXIST, as with the kernel's VFS.
@@ -284,29 +309,27 @@ fn openat(dirfd: u64, addr: u64, flags: u32, mode: u32) -> Result<i64, i64> {
     // A character device node names its driver by its number, wherever the
     // node is (the kernel's /dev, the server's tmpfs or devpts): the terminals
     // are the server's (`tty`); null (1,3) and zero (1,5) the kernel's for its
-    // own nodes, the server's (`devices`, with the node's own status) for its
-    // nodes; any other number has no driver (ENXIO). O_PATH opens the node
-    // alone, never the driver (`devices`: its status, reads and writes EBADF);
-    // O_DIRECTORY is ENOTDIR.
+    // own nodes, the server's (`devices`) for its nodes; any other number has
+    // no driver (ENXIO). The server's opens keep the node they were opened by
+    // (`Origin`: a live fstat, fchmod and the like). O_DIRECTORY is ENOTDIR.
     if resolved.mode & vfs::S_IFMT == vfs::S_IFCHR {
         use crate::devices::{self, Kind};
         if flags & O_DIRECTORY != 0 {
             return Err(ENOTDIR);
         }
-        let st = resolved.node.stat()?;
-        if flags & O_PATH != 0 {
-            return devices::open(Kind::Path, flags, st);
-        }
-        let rdev = vfs::stat::Stat::from_bytes(&st).rdev;
-        if let Some(r) = crate::tty::open_device(rdev, flags, st) {
-            return r;
-        }
-        if !matches!(resolved.node, Node::Kernel(_)) {
-            return match vfs::stat::dev_split(rdev) {
-                (1, 3) => devices::open(Kind::Null, flags, st),
-                (1, 5) => devices::open(Kind::Zero, flags, st),
-                _ => Err(crate::tty::ENXIO),
-            };
+        let rdev = vfs::stat::Stat::from_bytes(&resolved.node.stat()?).rdev;
+        let kernel_node = matches!(resolved.node, Node::Kernel(_));
+        let kind = match vfs::stat::dev_split(rdev) {
+            (1, 3) => Some(Kind::Null),
+            (1, 5) => Some(Kind::Zero),
+            _ => None,
+        };
+        if !kernel_node || kind.is_none() {
+            let origin = Origin::new(resolved.node, abs, vfs::S_IFCHR);
+            if let Some(kind) = kind {
+                return devices::open(kind, flags, origin);
+            }
+            return crate::tty::open_device(rdev, flags, origin).unwrap_or(Err(crate::tty::ENXIO));
         }
     }
     match resolved.node {
@@ -534,8 +557,22 @@ fn symlinkat(target: u64, dirfd: u64, addr: u64) -> Result<i64, i64> {
 }
 
 fn readlinkat(dirfd: u64, addr: u64, buf: u64, size: u64) -> Result<i64, i64> {
-    let r = at(dirfd, addr, false)?;
-    let target = r.node.readlink()?;
+    // An empty path: the symlink `dirfd` names itself (an O_PATH|O_NOFOLLOW
+    // descriptor's), EINVAL for another descriptor, ENOENT without one (Linux's).
+    let target = if path_is_empty(addr) {
+        if dirfd as i32 == AT_FDCWD {
+            return Err(ENOENT);
+        }
+        match files::origin_of(dirfd) {
+            Some(o) if o.kind == vfs::S_IFLNK => o.origin().node.readlink()?,
+            _ => {
+                files::stat_of(dirfd)?;
+                return Err(EINVAL);
+            }
+        }
+    } else {
+        at(dirfd, addr, false)?.node.readlink()?
+    };
     let n = target.len().min(size as usize);
     usercopy::to_program(buf, &target.as_bytes()[..n])?;
     Ok(n as i64)
@@ -568,9 +605,13 @@ fn attrib(node: &Node, _path: &str) {
 /// calls that change its inode (fchmod, fchown, futimens): None for one
 /// without a path of its own (a pipe, a socket, an eventfd), whose inode is
 /// anonymous.
-fn fd_inode(fd: u64) -> Result<Option<(Node, String)>, i64> {
-    match fd_node(fd) {
-        Ok(found) => Ok(Some(found)),
+/// An O_PATH descriptor is EBADF here (it changes nothing through itself), unless
+/// `path_ok` (an *at call with AT_EMPTY_PATH, which takes one).
+fn fd_inode(fd: u64, path_ok: bool) -> Result<Option<(Node, String)>, i64> {
+    const EBADF: i64 = 9;
+    match fd_node_of(fd) {
+        Ok((_, _, true)) if !path_ok => Err(EBADF),
+        Ok((node, path, _)) => Ok(Some((node, path))),
         Err(ENOTDIR) => Ok(None),
         Err(e) => Err(e),
     }
@@ -586,13 +627,13 @@ fn cwd_inode() -> Result<(Node, String), i64> {
 /// The inode an *at call with AT_EMPTY_PATH and an empty path names:
 /// `dirfd` itself, or the working directory.
 fn empty_path_target(dirfd: u64) -> Result<Option<(Node, String)>, i64> {
-    if dirfd as i32 == AT_FDCWD { cwd_inode().map(Some) } else { fd_inode(dirfd) }
+    if dirfd as i32 == AT_FDCWD { cwd_inode().map(Some) } else { fd_inode(dirfd, true) }
 }
 
 /// fchmod(fd, mode). An anonymous inode's mode (a pipe's, a socket's) is
 /// fixed here: the call succeeds without changing it.
 fn fchmod(fd: u64, mode: u64) -> Result<i64, i64> {
-    chmod_target(fd_inode(fd)?, mode)
+    chmod_target(fd_inode(fd, false)?, mode)
 }
 
 fn chmod_target(target: Option<(Node, String)>, mode: u64) -> Result<i64, i64> {
@@ -645,7 +686,7 @@ fn times_target(dirfd: u64, addr: u64, follow: bool) -> Result<Option<(Node, Str
         if dirfd as i32 == AT_FDCWD {
             return Err(EFAULT);
         }
-        return fd_inode(dirfd);
+        return fd_inode(dirfd, false);
     }
     let r = at(dirfd, addr, follow)?;
     Ok(Some((r.node, join(&r.path))))
@@ -741,8 +782,12 @@ fn truncate(node: &Node, len: u64) -> Result<i64, i64> {
 }
 
 fn statfs(addr: u64, buf: u64) -> Result<i64, i64> {
-    let r = at(CWD, addr, true)?;
-    match &r.node {
+    statfs_node(&at(CWD, addr, true)?.node, buf)
+}
+
+/// The `struct statfs` of the filesystem `node` is on, to `buf`.
+pub fn statfs_node(node: &Node, buf: u64) -> Result<i64, i64> {
+    match node {
         Node::Kernel(k) => {
             let mut words = [0u8; 120];
             check(syscall(SYS_INODE_STATFS, [k.handle(), words.as_mut_ptr() as u64, 0, 0, 0, 0]))?;

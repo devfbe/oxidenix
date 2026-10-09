@@ -127,6 +127,8 @@ pub fn handle(s: &State) -> Option<i64> {
                     let r = crate::inetcalls::call(s.rax, &sock, flags, [a0, a1, a2, a3, a4, a5]);
                     return Some(r.unwrap_or_else(|e| -e));
                 }
+                // An O_PATH descriptor is no file (Linux's fdget fails).
+                Ok(Some((File::Path(_), _))) => return Some(-files::EBADF),
                 // Another file, of the server's or of the kernel's.
                 Ok(_) => return Some(-crate::unix::ENOTSOCK),
             };

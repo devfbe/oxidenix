@@ -18,7 +18,15 @@ const AT_EMPTY_PATH: u64 = 0x1000;
 const S_IFIFO: u32 = 0o010000;
 const UMASK: u32 = 0o022;
 
+/// The open file behind `fd` for an operation on the file: EBADF for an `O_PATH`
+/// descriptor (the Linux server's), which only names a node (Linux's fdget).
 pub fn file(fd: u64) -> Result<Arc<OpenFile>, i64> {
+    with_current(|p| p.file(fd)).and_then(|f| if f.is_path() { Err(EBADF) } else { Ok(f) })
+}
+
+/// The open file behind `fd`, an `O_PATH` descriptor too: for what takes one (dup,
+/// fcntl's F_DUPFD, F_GETFD, F_SETFD, F_GETFL; Linux's fdget_raw).
+pub fn file_raw(fd: u64) -> Result<Arc<OpenFile>, i64> {
     with_current(|p| p.file(fd))
 }
 
@@ -361,12 +369,12 @@ pub fn eventfd2(initval: u64, flags: u64) -> SysResult {
 }
 
 pub fn dup(fd: u64) -> SysResult {
-    let f = file(fd)?;
+    let f = file_raw(fd)?;
     with_current(|p| p.alloc_fd(f, false, 0))
 }
 
 pub fn dup3(old: u64, new: u64, flags: u64, allow_same: bool) -> SysResult {
-    let f = file(old)?;
+    let f = file_raw(old)?;
     if old == new {
         return if allow_same { Ok(new as i64) } else { Err(EINVAL) };
     }
@@ -388,7 +396,11 @@ pub fn fcntl(fd: u64, cmd: u64, arg: u64) -> SysResult {
     const F_SETFL: u64 = 4;
     const F_DUPFD_CLOEXEC: u64 = 1030;
     const FD_CLOEXEC: u64 = 1;
-    let f = file(fd)?;
+    let f = file_raw(fd)?;
+    // An O_PATH descriptor takes only these (Linux's fdget_raw in fcntl).
+    if f.is_path() && !matches!(cmd, F_DUPFD | F_DUPFD_CLOEXEC | F_GETFD | F_SETFD | F_GETFL) {
+        return Err(EBADF);
+    }
     match cmd {
         F_DUPFD | F_DUPFD_CLOEXEC => with_current(|p| p.alloc_fd(f, cmd == F_DUPFD_CLOEXEC, arg as usize)),
         F_GETFD => Ok(if current_files()?.cloexec(fd)? { FD_CLOEXEC as i64 } else { 0 }),

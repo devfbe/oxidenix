@@ -196,7 +196,12 @@ impl ThreadSignals {
 /// server's terminals, whose background reads and writes depend on it
 /// (SIGTTIN, SIGTTOU), until signals are the server's (R8).
 pub fn state(sig: u32) -> u64 {
-    if sig == 0 || sig > NSIG {
+    if sig == 0 {
+        // Whether a signal (or a stop) waits for the calling thread: a long call
+        // returns what it did (Linux's signal_pending).
+        return if interrupted() { restricted::SIGNAL_PENDING } else { 0 };
+    }
+    if sig > NSIG {
         return 0;
     }
     let me = current();
