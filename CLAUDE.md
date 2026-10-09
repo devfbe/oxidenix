@@ -60,7 +60,7 @@ An AI research project; see README.md.
   node binary); never needed by CI.
 - `OXIDENIX_AUTORUN=<host script> cargo run > log` boots into that script like test mode
   (exit status to QEMU, serial to stdout): for scripted experiments, e.g. running node and
-  reading "syscall N not implemented" from the kernel log.
+  reading "syscall N not implemented" from the console log (the Linux server says it).
 
 ## Finding code
 
@@ -71,16 +71,19 @@ An AI research project; see README.md.
   module comment (`//!` or `/* */`) whose first sentence says what the file is for.
 - Entry points by topic:
   - Boot: `builder/src/main.rs` (images, QEMU), `kernel/src/main.rs` (`kernel_main`).
-  - System calls: `kernel/src/process/syscall.rs` (entry, dispatch), `sys_*.rs` beside it.
+  - System calls: `kernel/src/process/syscall.rs` (entry, dispatch by caller); the kernel
+    implements no Linux call (R9, ADR 0011): a Linux program's go to its server, the native
+    servers' are `kernel/src/process/native.rs`'s (`oxrt::sys`).
   - Restricted mode and the Linux server's kernel interface: `crates/restricted/src/lib.rs`
-    (ABI constants, documented), `kernel/src/process/linux.rs`, `linux_inode.rs`;
+    (ABI constants, documented), `kernel/src/process/linux.rs`;
     design in `docs/design/linux-server.md`.
   - The Linux server: `servers/linux/src/main.rs` (dispatch order mm → time → fdtable → files →
-    poll → epoll → paths → sched → ids → sockets → pass-through), `fdtable.rs`/`files.rs`
+    poll → epoll → paths → sched → ids → futex → system → sockets → ENOSYS), `fdtable.rs`/`files.rs`
     (the descriptor table, open file descriptions), `poll.rs`/`epoll.rs` (watch lists, poll,
-    select, epoll), `kfile.rs` (the kernel's open files by handle), `local.rs` (per-thread
+    select, epoll), `futex.rs`, `system.rs` (uname, sysinfo, reboot, getrandom, getcpu,
+    arch_prctl), `local.rs` (per-thread
     block), `namespace.rs`/`paths.rs` (paths, mounts),
-    `tmpfs.rs`/`tmpfile.rs` (root fs), `datafs.rs`/`datafile.rs`/`fsclient.rs` (`/data` and its
+    `tmpfs.rs`/`tmpfile.rs` (root fs and /dev), `datafs.rs`/`datafile.rs`/`fsclient.rs` (`/data` and its
     page cache over the I/O rings), `ringclient.rs` (a channel's slots and reaper),
     `unix.rs`/`sockcalls.rs`/`scm.rs` (`AF_UNIX` sockets, descriptor passing),
     `inet.rs`/`inetcalls.rs`/`netclient.rs` (internet sockets over the channel to netd, the net

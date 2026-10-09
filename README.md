@@ -5,8 +5,10 @@
 **A Unix-like x86_64 kernel written from scratch in Rust, designed, implemented and debugged by an AI.**
 
 It boots in QEMU and runs an unmodified, statically linked **GNU Bash 5.3** and **BusyBox**
-on top of a Linux-compatible system call interface. It is moving towards a **microkernel**: the
-disk driver and the ext2 filesystem already run as a user-space server.
+on top of a Linux-compatible system call interface. It is a **microkernel**: the kernel
+implements no Linux system call. Linux programs trap into a user-space **Linux server** (one
+instance per process tree) that implements Linux over the kernel's mechanisms, and the disk
+driver, the ext2 filesystem, the network stack and `/proc` run as user-space servers too.
 
 [![test](https://github.com/devfbe/oxidenix/actions/workflows/test.yml/badge.svg)](https://github.com/devfbe/oxidenix/actions/workflows/test.yml)
 ![Rust](https://img.shields.io/badge/language-Rust%20(nightly)-orange?logo=rust)
@@ -73,8 +75,9 @@ Its [commit history](#development-history) records every step.
   user-space server (procfs, over the I/O rings) and the Linux server (each process's part,
   `/proc/self/fd`'s magic links), from the kernel's own process accounting (CPU time per
   process and CPU, memory, load average).
-- **Filesystem**: an in-memory, tmpfs-like VFS populated from a cpio initramfs, with files,
-  directories, symlinks, `/dev/{console,tty,null,zero}`, and quotas against heap exhaustion.
+- **Filesystem**: each process tree's root is a tmpfs of its Linux server, unpacked from a
+  cpio initramfs, with files, directories, symlinks, socket inodes, a size limit, and `/dev`
+  (console, tty, ptmx, null, zero, devpts, the `/dev/fd` links) as the server's devtmpfs.
 - **Microkernel-style drivers**: the virtio block driver and the read-write **ext2** filesystem
   run in `diskfs`, an ordinary ring-3 process that talks to the kernel over IPC and reaches the
   disk through I/O ports and a DMA area the kernel granted it. If it dies, the kernel restarts it on the next access, and
@@ -95,7 +98,8 @@ Its [commit history](#development-history) records every step.
   the controlling terminal and job control's terminal side, pseudo-terminals (`/dev/ptmx`,
   devpts), the ANSI escape sequences BusyBox, readline and ncurses use, a German keyboard
   layout and UTF-8. The kernel keeps the console as a raw device.
-- **~120 Linux system calls**, enough for Bash and BusyBox (see [System calls](#system-calls)).
+- **~120 Linux system calls**, all implemented by the Linux server, enough for Bash, BusyBox
+  and Node.js (see [System calls](#system-calls)).
 
 ## Quick start
 
@@ -196,24 +200,25 @@ The window scales when it is resized (`zoom-to-fit`), and Ctrl+Alt+F toggles ful
 ### Big picture
 
 ```
- ┌──────────────────────────────── user space (ring 3) ────────────────────────────────┐
- │  GNU Bash 5.3   BusyBox 1.37   test programs     │  diskfs server (Rust, no_std)    │
- │  statically linked against musl libc             │  ext2 + virtio-blk, DMA          │
- │                                                  │  netd server: virtio-net, DMA,   │
- │                                                  │  IRQs, smoltcp TCP/IP, sockets   │
- └───────────────────────┬────────────────▲─────────┴────────▲──────────────┬──────────┘
-          syscall / fault / IRQ       iretq            IPC receive/reply   in/out
- ┌───────────────────────▼────────────────┴──────────────────┴──────────────│──────────┐
- │  syscall layer   process/syscall.rs ─ sys_file.rs ─ sys_mem.rs ─ signal.rs│          │
- │  IPC             services, synchronous call/receive/reply, async post    │          │
- │  drivers         PCI scan, IRQ lines and DMA areas handed to servers     │          │
- │  processes       scheduler, fork/exec/wait, sleep/wakeup, pgid/sid, ioperm          │
- │  memory          frame allocator (refcounted), heap, address spaces, COW │          │
- │  VFS             memory inodes (/dev), page cache, pipes, cpio           │          │
- │  sockets         Linux socket ABI, forwarded to netd (net.rs)            │          │
- │  console device  raw bytes: console (framebuffer, ANSI) ─ keyboard (tty: server)    │
- │  CPU             GDT, TSS + I/O bitmap, IDT, local + I/O APIC (ACPI), SSE│          │
- └──────────────────────────────────────────────────────────────────────────▼──────────┘
+ ┌────────────────────────────────── user space (ring 3) ───────────────────────────────────┐
+ │  GNU Bash 5.3   BusyBox 1.37   Node.js 24   test programs  (static musl, restricted mode)  │
+ │        │ syscall, exception: back to the server on the same thread (restricted_enter)     │
+ │  Linux server instance (one per process tree, servers/linux): descriptors, VFS, tmpfs,    │
+ │  /dev, pipes, terminals, sockets, processes, signals, futex, mmap, ELF loader, /proc/<pid>│
+ │        │ kernel calls (crates/restricted)          │ I/O rings: shared memory, grants     │
+ │  native servers (oxrt::sys): diskfs (ext2, virtio-blk)  netd (smoltcp, virtio-net) procfs │
+ └────────┬───────────────────────────────────────────┬──────────────────────┬──────────────┘
+   kernel calls / faults / IRQs                 channels, IPC            in/out, DMA
+ ┌────────▼───────────────────────────────────────────▼──────────────────────▼──────────────┐
+ │  restricted mode   two views per address space, enter/trap, kicks, exceptions to the server│
+ │  memory objects    anonymous, paged (the server's pager), the server's page cache, files  │
+ │  address spaces    mappings, demand paging, COW, futex keys, TLB shootdowns (PCIDs)       │
+ │  threads           processes as containers, SMP fair scheduler, timers, clocks, kill      │
+ │  IPC and channels  service registry, channel offers, grants, doorbells                    │
+ │  devices           I/O ports, IRQ lines and DMA areas for servers; PCI, ACPI              │
+ │  console device    raw bytes: framebuffer (ANSI) and keyboard (the terminals: the server) │
+ │  CPU               GDT, TSS + I/O bitmap, IDT, local + I/O APIC, SSE; the boot image      │
+ └──────────────────────────────────────────────────────────────────────────────────────────┘
       bootloader 0.11 (UEFI/BIOS), QEMU q35, 4 CPUs, 256 MiB RAM, AHCI boot disk, virtio-blk data disk, virtio-net
 ```
 
@@ -233,27 +238,29 @@ oxidenix/
 │       │                        exception, timer and keyboard handlers (handlers.rs)
 │       ├── memory/              physical frame allocator with refcounts (frame.rs), kernel stacks (kstack.rs),
 │       │                        kernel heap and page table access (mod.rs)
-│       ├── process/             process lifecycle and syscalls on it (mod.rs),
-│       │   ├── task.rs          tasks (threads), thread groups (processes), shared tables
-│       │   ├── clone.rs         clone, fork, vfork
-│       │   ├── exec.rs          execve, ending the other threads first
-│       │   ├── exit.rs          thread and process exit, wait4
+│       ├── process/             processes and threads, the servers and process trees the kernel
+│       │   │                    starts (mod.rs)
+│       │   ├── task.rs          tasks (threads), thread groups (processes as containers)
+│       │   ├── linux.rs         restricted mode: instances, the two views, the Linux server's calls
+│       │   ├── native.rs        the native servers' calls (oxrt::sys)
+│       │   ├── exec.rs          a native server running its program anew
+│       │   ├── exit.rs          thread and process exit, the kernel's wait for its own processes
+│       │   ├── kill.rs          the kernel's kill of a process; what waits ask (kicked, dying)
 │       │   ├── sched.rs         run queues, wait queues, context switch, idle
 │       │   ├── address_space.rs areas, demand paging, copy-on-write
+│       │   ├── vm.rs            mappings as the calls ask for them (placement, remap, discard)
 │       │   ├── tlb.rs           which CPUs use an address space, TLB shootdowns
-│       │   ├── syscall.rs       syscall entry/return, dispatch table
-│       │   ├── sys_file.rs      file, directory, pipe (the native servers'; the open files of
-│       │   │                    the kernel's tree a Linux server holds by handle)
-│       │   ├── sys_mem.rs       brk, mmap, mprotect, mremap
-│       │   ├── signal.rs        signal state, delivery, sigreturn, kill
-│       │   ├── futex.rs         futex wait queues keyed by address space or page cache
-│       │   ├── loader.rs        ELF segments mapped from the page cache, the Linux initial stack
+│       │   ├── syscall.rs       syscall entry/return, dispatch by caller
+│       │   ├── futex.rs         futex wait queues keyed by address space, object or instance
+│       │   ├── clock.rs         the clocks a thread reads
+│       │   ├── loader.rs        ELF segments mapped from the page cache, the initial stack
 │       │   ├── elf.rs           ELF64 parser
+│       │   ├── channel.rs       channels: the kernel's part of the I/O rings
 │       │   ├── ipc.rs           services and message passing
 │       │   ├── irq.rs           device interrupts for user-space drivers
 │       │   └── uaccess.rs       copies to and from user memory
-│       ├── fs/                  VFS (mod.rs), page cache (cache.rs), open files and
-│       │                        pipes (file.rs), initramfs unpacker (cpio.rs)
+│       ├── fs/                  the boot image (mod.rs, cpio.rs: its programs by name) and the
+│       │                        memory objects: page cache, paged and file objects (cache.rs)
 │       ├── drivers/             framebuffer console (console.rs, glyphs.rs), the console
 │       │                        device the server's terminals drive (console_device.rs),
 │       │                        PS/2 keyboard (keyboard.rs), CMOS clock (rtc.rs),
@@ -290,7 +297,7 @@ oxidenix/
                                  Node.js (node/: its build, smoke tests and their runner)
 ```
 
-About 9,200 lines of Rust (without comments and blank lines) in the kernel and 3,200 in the servers, their libraries and runtime, plus a small host-side builder.
+About 13,100 lines of Rust (without comments and blank lines) in the kernel (16,600 before R9 took its Linux code out) and 30,700 in the servers (the Linux server the largest), their libraries and runtime, plus a small host-side builder.
 
 ### Boot sequence
 
@@ -303,12 +310,12 @@ About 9,200 lines of Rust (without comments and blank lines) in the kernel and 3
 2. `kernel_main` runs these steps in order: framebuffer console and boot logo → GDT/TSS/IDT
    (interrupts still off) → frame allocator and 16 MiB kernel heap → ACPI tables (MADT), the
    local APIC with its calibrated timer and the I/O APIC (the 8259 PICs are masked) → the TSC
-   clock (see Time) → VFS from the cpio ramdisk → process subsystem (SSE, syscall MSRs, process 0) → the other
+   clock (see Time) → the boot image (the ramdisk) → process subsystem (SSE, syscall MSRs, process 0) → the other
    CPUs (INIT and STARTUP IPIs; each runs a real-mode trampoline from a page below 1 MiB into
    long mode, then compares its TSC with the bootstrap CPU's and sets up its GDT, TSS, GS
    block, local APIC timer and idle task) →
    **interrupts on**.
-3. The kernel starts the servers: `/sbin/diskfs` asks for its I/O ports, mounts the ext2 disk
+3. The kernel starts the servers from the boot image: `/sbin/diskfs` asks for its I/O ports, mounts the ext2 disk
    and registers as service `diskfs` for channels (each Linux server instance connects one and
    mounts the disk at `/data`). Then the kernel
    scans PCI for a virtio network card and starts `/sbin/netd` with its ports, interrupt line
@@ -446,24 +453,20 @@ The scheduler is built for several CPUs (`process/sched.rs`, design in
 [docs/design/smp.md](docs/design/smp.md)); there is no big kernel lock.
 
 - **Tasks and thread groups** (`process/task.rs`): a task is one thread; a process is a
-  thread group (`ThreadGroup`) of tasks that share the process id, signal handlers, the
-  process's pending signals and interval timer, relations, and the exit status (each with its
-  own lock). As on Linux, the rest is shared per clone flag: the address space (`Mm`,
-  `CLONE_VM`), the descriptor table (`Files`, `CLONE_FILES`) and the working directory
-  (`FsInfo`, `CLONE_FS`) are separate objects that tasks hold references to. A task owns those
-  references, its I/O permissions and its `CLONE_CHILD_CLEARTID` word; FPU state and TLS
-  pointer are saved per task; scheduling state is atomic. The process table maps thread ids to
-  tasks and process ids to thread groups (zombies included); both share one number space, and a
-  process's id is its main thread's.
-- **Threads** (`clone.rs`, `exit.rs`, `exec.rs`): `clone` checks Linux's flag rules (threads
-  need shared handlers, shared handlers need shared memory), sets the new thread's stack, TLS
-  (`CLONE_SETTLS`) and id words (`CLONE_PARENT_SETTID`, `CLONE_CHILD_SETTID`). A thread that
-  exits clears its `CLONE_CHILD_CLEARTID` word and wakes its futex (that is how
-  `pthread_join` works) and leaves no trace; the last thread ends the process, which stays a
-  zombie until reaped. `exit_group` and fatal signals end all threads; `execve` in a thread
-  first ends the others and takes over the process id. `fork` copies only the calling thread.
-  `vfork` (and `clone` with `CLONE_VM|CLONE_VFORK`, as `posix_spawn` uses it) shares the address
-  space and suspends the parent until the child execs or exits.
+  thread group (`ThreadGroup`): a container of tasks that share an id, an address space
+  (`Mm`) and their end (ADR 0010, ADR 0011). A task owns its references, its I/O permissions
+  and a Linux thread's `CLONE_CHILD_CLEARTID` word; FPU state and TLS pointer are saved per
+  task; scheduling state is atomic. The process table maps the kernel's thread ids to tasks
+  and process ids to thread groups. Linux's process model (pids per process tree, the tree,
+  process groups, sessions, signals, `fork`, `clone`, `execve`, `wait4`) is the Linux
+  server's, over `proc_create`, `thread_create`, `exec_space`, kicks, kills and thread-exit
+  events.
+- **Ending** (`exit.rs`, `kill.rs`): a thread that exits clears its `CLONE_CHILD_CLEARTID` word
+  and wakes its futex (that is how `pthread_join` works) and leaves no trace; the last thread
+  ends the process. The kernel kills a whole process itself only when memory runs out, a
+  native server faults, the Linux server fails or the monitor says so (`kill`); its own
+  processes (a tree's first process, the servers, the service processes) are zombies until it
+  reaps them, the ones the Linux server made are the server's to reap.
 - **One kernel stack per task** (64 KiB, see Memory). A context switch saves callee-saved registers,
   the FPU/SSE state (`fxsave`), the FS base (musl's TLS pointer), and switches CR3, the TSS
   stack and I/O bitmap, and the syscall stack in the CPU block.
@@ -492,8 +495,8 @@ The scheduler is built for several CPUs (`process/sched.rs`, design in
   by the next task on that CPU, after the switch, so its stack is freed only then.
 - **Sleeping without lost wakeups**: a blocking path first registers on its wait channel
   (`prepare_to_wait`), then checks its condition, then sleeps; a per-task wake lock
-  serializes wakeups with the task descheduling itself. The kernel's pipes, the console
-  device, IPC, `wait4`, stops and timed sleeps all use this protocol.
+  serializes wakeups with the task descheduling itself. The console device, IPC, channels,
+  futexes and timed sleeps all use this protocol.
 - **Waiting for several things at once** is the Linux server's since R6e (its `poll`,
   `select` and `epoll`, see the Linux server below): the kernel's part is a wait for any of
   several words of the server's memory (`server_wait`), with a deadline; a kick of the
@@ -507,11 +510,9 @@ The scheduler is built for several CPUs (`process/sched.rs`, design in
   Linux): a console write that redraws the whole screen lets a woken task run. Locks are
   `IrqSpinLock`s (fair tickets, interrupts off while held), and long work under a lock is
   cut into bounded pieces (the console draws at most 64 cells per lock hold).
-- New processes start by *returning from a syscall*: their kernel stack is pre-filled with a
-  register frame that `user_return` consumes. A `fork` child is the parent's frame with
-  `rax = 0`.
-- Process groups and sessions follow POSIX closely enough for Bash and BusyBox job handling;
-  the terminal's side (controlling terminal, foreground group) is the Linux server's.
+- New threads start by *returning from a syscall*: their kernel stack is pre-filled with a
+  register frame that `user_return` consumes (a Linux thread's starts in its server, which
+  enters its program).
 
 ### Time
 
@@ -563,23 +564,24 @@ call into a device:
   error code, and `rip, cs, rflags, rsp, ss`. That tail is exactly what the CPU pushes on an
   interrupt from ring 3.
 - **Every interrupt and exception** (except NMI and double fault) enters through a per-vector
-  stub (`interrupts/entry.rs`) that builds the same frame and calls one dispatcher, `trap`. CPU
-  exceptions in user code become signals as on Linux (`SIGSEGV`, `SIGFPE`, `SIGILL`, `SIGBUS`,
-  `SIGTRAP`); they cannot be blocked or ignored, but a handler can catch them. In the kernel
-  they panic with the faulting address. In test mode a panic ends QEMU with a failure.
+  stub (`interrupts/entry.rs`) that builds the same frame and calls one dispatcher, `trap`. A
+  Linux program's CPU exceptions go to its server, which raises Linux's signal (`SIGSEGV`,
+  `SIGFPE`, `SIGILL`, `SIGBUS`, `SIGTRAP`); a native server's end it. In the kernel they panic
+  with the faulting address. In test mode a panic ends QEMU with a failure.
 - All paths return through `user_return`, which uses **`iretq`** (not `sysret`). A signal can
   therefore interrupt user code at any instruction and `rt_sigreturn` restores every register
   exactly, and the classic `sysret` non-canonical-address problem cannot occur.
-- The dispatch table maps Linux x86_64 syscall numbers to Rust functions returning
-  `Result<i64, errno>`.
+- Dispatch is by caller: a Linux program's `syscall` goes to its server (restricted mode), the
+  server's calls are the kernel's interface for it (`crates/restricted`, `linux::server_call`),
+  a native server's are `process/native.rs`'s. The kernel has no table of Linux numbers.
 
 ### Restricted mode and the Linux server
 
-The kernel is moving its Linux implementation out into a user-space **Linux server**
-(`servers/linux`; `docs/design/linux-server.md`, ADRs 0001-0004 in `docs/decisions/`). Phase
-R1 put the mechanism in place, with every system call passed through; the phases since have
-moved memory, time, pipes, eventfd, paths, the root tmpfs, `/data` and `AF_UNIX` sockets into
-the server.
+The kernel's Linux implementation moved out into a user-space **Linux server**
+(`servers/linux`; `docs/design/linux-server.md`, ADRs 0001-0011 in `docs/decisions/`). Phase
+R1 put the mechanism in place, with every system call passed through; the phases since moved
+memory, time, files, terminals, sockets, processes and signals into the server, and R9 removed
+the pass-through: the kernel implements no Linux system call.
 
 - Each process tree started by the kernel (`/init`, the monitor's `run`) gets an **instance**
   of the server: the server's program and, per thread, a stack and the page with the program's
@@ -594,10 +596,15 @@ the server.
   TLB (PCIDs); the server uses neither the FPU nor the FS/GS bases, so only general registers
   move.
 - In phase R1 the server handed every Linux system call back with `legacy_syscall` (1011), which
-  runs the kernel's implementation on the registers in the register page; phase by phase the
-  calls moved into the server, and what still passes through is counted (`legacy_calls`).
-  Numbers of 1000 and above are not Linux's: the server answers them with `ENOSYS` itself. An
-  exception in the server kills its process with a diagnostic.
+  ran the kernel's implementation on the registers in the register page; phase by phase the
+  calls moved into the server, and R9 removed the pass-through (ADR 0011): the last ones
+  (`futex`, `arch_prctl`, `uname`, `sysinfo`, `clock_settime`, `settimeofday`, `prlimit64`,
+  `getrlimit`, `setrlimit`, `getcpu`, `getrandom`, `reboot`, `ioperm`) are the server's over
+  narrow mechanisms (`futex_wait`, `futex_wake`, `futex_requeue` on program memory,
+  `thread_fs`, `clock_set`, `power`), `/dev` is the server's tmpfs, and a call the server does
+  not implement is `ENOSYS` (said on the console: `syscall N not implemented`). Numbers of 1000
+  and above are not Linux's: the server answers them with `ENOSYS` too. An exception in the
+  server kills its process with a diagnostic.
 - **Processes and signals are the server's** (phase R8, ADR 0010; `process.rs`, `signal.rs`,
   `exec.rs`, `timer.rs`): pids per instance (pid 1 is the tree's first process), the process
   tree, process groups and sessions, `fork`/`vfork`/`clone`/`clone3` (one kernel call clones
@@ -617,7 +624,6 @@ the server.
   page cache objects) are created, read and written from the server's memory, and mapped shared
   or private into the calling thread's program view, protected and unmapped. Addresses the server
   passes for its own memory must lie in its shared region; mappings must lie below 64 TiB.
-  A legacy call runs in the program's view, where the server's memory does not exist.
 - **Paged memory objects**: the server supplies their pages. Each instance has a **pager
   process** (`linux-pager`: the server's view alone, protected like the servers) whose thread
   waits for page requests (`pager_wait`) and answers them (`mo_supply`). A thread that needs a
@@ -638,14 +644,12 @@ the server.
   (Drepper's three-state futex lock over the kernel's futex, which keys the server's memory by
   instance and address since that memory is pinned and in no address space's areas).
 - **Memory semantics are the server's** (phase R4): `mmap`, `munmap`, `mprotect`, `mremap`,
-  `madvise`, `msync` and the `mlock` family no longer reach the kernel's Linux code. The server
+  `madvise`, `msync` and the `mlock` family are the server's. The server
   checks the arguments and turns them into kernel mapping calls: `mo_map` with anonymous
-  private memory (handle 0), a new memory object for shared anonymous memory, a file object
-  of the server's, or the handle of an open file of the kernel's that its descriptor holds;
-  placement (a hint, `MAP_FIXED`, `MAP_FIXED_NOREPLACE`), `MAP_NORESERVE` and `MAP_POPULATE`
-  are flags of `mo_map`. The kernel's own `mmap` remains for its native servers.
-  `/proc/counters` counts the calls still passed through (`legacy_calls`), and
-  `/proc/<pid>/counters` a process's own.
+  private memory (handle 0), a new memory object for shared anonymous memory, or a file object
+  of the server's; placement (a hint, `MAP_FIXED`, `MAP_FIXED_NOREPLACE`), `MAP_NORESERVE` and
+  `MAP_POPULATE` are flags of `mo_map`. The native servers map their memory with `mo_map` too
+  (R9).
 - **Program memory and time** (phase R5): the server reads and writes the program's memory
   directly in its view. A fault there is resolved as the program's own would be (demand paging,
   copy-on-write); one the program may not make resumes at the fixup of the server's copy
@@ -673,9 +677,7 @@ the server.
   program's table after its point of no return (closing the close-on-exec descriptors on that
   thread before the program runs), and an exiting thread lets its table go itself (a thread
   the kernel ended in its program: the worker thread). A descriptor's lookup is a lock
-  and a reference count, no kernel call. The kernel's own files a program still opens (its
-  tree, `/dev`: null, zero) are open file descriptions the server
-  holds by handle (`inode_open`, `kfile_call`), always ready. `poll`, `ppoll`, `select`,
+  and a reference count, no kernel call. `poll`, `ppoll`, `select`,
   `pselect6` and `epoll` are the server's: every file reports its readiness changes to its
   description's watch list (`files::ready`), which pollers and epoll interests subscribe
   to; readiness is asked of each file when it is checked. epoll has Linux's semantics:
@@ -684,8 +686,8 @@ the server.
   `EPERM`. poll and select also wait on the control-block words netd wakes, so a poll on a
   socket does not wait for the instance's net thread.
 - **`AF_UNIX` sockets are the server's** (phase R7a, `unix.rs`, `sockcalls.rs`, `scm.rs`):
-  `socket` and `socketpair` for the family come to the server (other families pass through to
-  the kernel and netd), and so does every socket call on one of its sockets' descriptors.
+  `socket` and `socketpair` for the family come to the server (since R7b every family's do),
+  and so does every socket call on one of its sockets' descriptors.
   Stream, datagram and seqpacket sockets, socket pairs, names as socket inodes of the tmpfs
   and of `/data` and in the instance's abstract namespace (autobind too), `listen` with its
   backlog, `accept4`, `connect`, `sendmsg`/`recvmsg` and their relatives (`sendmmsg`,
@@ -696,7 +698,7 @@ the server.
   (`POLLRDHUP` included). Descriptors pass between processes (`SCM_RIGHTS`) as references
   to their open file descriptions while in flight (the receiver's descriptor with
   `MSG_CMSG_CLOEXEC` if asked), so they outlive the sender's close, and any kind of file can
-  be passed (an O_PATH descriptor, an epoll instance, an open file of the kernel's); sockets
+  be passed (an O_PATH descriptor, an epoll instance, a terminal); sockets
   in flight that nothing but messages in flight keeps (a cycle) are collected as Linux's
   `unix_gc` does (a description's references against those in flight; asked for when a
   reference to one in flight goes, also by exit or exec), on the instance's worker thread,
@@ -710,28 +712,29 @@ the server.
   then each context of the kernel's carried the server's record). Every call that takes a path (`open`, the `stat` family,
   `access`, `mkdir`, `unlink`, `rename`, `symlink`, `readlink`, `chmod`, `truncate`, `statfs`,
   `chdir`, `getcwd`, `execve`'s program) resolves in the server: `.` and `..` by name, symlinks
-  by reading them (at most 16). The tree is still the kernel's, reached through handles on its
-  inodes (`inode_walk` walks as far as it can and stops after a symlink, so a path without one
-  costs one call); `inode_open` opens the file for the descriptor. `umask` is real now (the kernel's was fixed at `022`).
+  by reading them (at most 16), over the server's own filesystems (until R9 `/dev` was the
+  kernel's tree, reached through handles on its inodes). `umask` is real now (the kernel's was
+  fixed at `022`).
 - **The root is the server's own tmpfs** (phase R6c.2c): each instance unpacks the boot image's
   initramfs into a tmpfs of its own when it first resolves a path (`initramfs`: the archive as
   a read-only object; `mo_from_image`: a file object over a member's bytes, copied only page
-  by page when needed and written privately). The kernel's tree stays mounted where it still
-  serves: `/dev`, `/proc` and `/sys` (the namespace finds mounts by name, the longest first);
-  `/data` is the server's own (below). The kernel keeps its own view of the initramfs for what it starts itself (the
-  servers, `/init`); a program a tree runs comes from the tree's tmpfs. Its directories
+  by page when needed and written privately). The namespace finds mounts by name, the longest
+  first: `/dev` (a tmpfs of the server's, R9), `/proc` and `/sys` (procfs's and the server's,
+  I/O rings step 5) and `/data` (below). The kernel reads only its own programs from the
+  initramfs (the servers); a program a tree runs comes from the tree's tmpfs. Its directories
   and symlinks (and socket inodes) live in the server; a file's contents are a **file object** of the kernel's
   (`mo_create_file`), a memory object that grows and shrinks like a file, charged to the same
   tmpfs limit, read and written straight into the program's memory (`mo_file_read`,
   `mo_file_write`) and mapped with `mo_map`. Open files are the server's, whose calls (`read`,
   `write` and their vectored and positioned forms, `lseek`, `fstat`, `ftruncate`, `getdents64`,
-  `fstatfs`, `sendfile`, `mmap`) the server answers. ETXTBSY works as in the kernel's VFS: a
+  `fstatfs`, `sendfile`, `mmap`) the server answers. ETXTBSY works as on Linux: a
   shared mapping through a writable descriptor and a program run from the file each keep a
   **hold** on the file object (`mo_hold`), and the kernel tells the server when the last holder
   is gone. Before answering ETXTBSY the server waits until it has taken in every release the
   kernel reported so far, so a program that ended and was reaped no longer keeps its file busy. The tree has a lock per inode and, for renames and removals, a lock of its own (as
   Linux's rename mutex), under which alone two inode locks are ever held. Files there report
-  device `0x1a`; renames between it and the kernel's mounts fail with `EXDEV`, and the mount
+  device `0x1a` (`/dev`'s tmpfs `0:5`, devpts `0:0x18`: each mount its own filesystem); renames
+  between it and the other mounts fail with `EXDEV`, and the mount
   points with `EBUSY`. Its regular files and directories are always ready for `poll` and
   `select`, and `epoll` refuses them (`EPERM`), as on Linux.
 - **File times, watches and copies** (the server's, on tmpfs and `/data`): tmpfs keeps four
@@ -742,7 +745,7 @@ the server.
   the page cache, as on Linux; diskfs, which records its own time when the data reaches it,
   gets them after each write-back (`SETTIMES`, after the `WRITE`s), and stat reports them
   until then. `inotify` (`servers/linux/src/inotify.rs`): watches on tmpfs and `/data` inodes
-  (the kernel's pseudo files report nothing), the events of creating, writing, changing,
+  (the pseudo files of `/proc` and `/sys` report nothing), the events of creating, writing, changing,
   opening, closing, moving (with cookies) and removing names and inodes, `IN_ONESHOT`,
   `IN_ONLYDIR`, `IN_MASK_ADD`/`IN_MASK_CREATE`, `IN_IGNORED`, merged events, `IN_Q_OVERFLOW`,
   `FIONREAD`, poll and epoll readiness: Node.js's `fs.watch`. Watches are keyed by inode and
@@ -807,6 +810,9 @@ the server.
 
 ### Signals
 
+Signals are the Linux server's (phase R8, `servers/linux/src/signal.rs`); the kernel has none
+(R9): it kicks a thread so that its server looks at its signals, and kills threads.
+
 - Per process: 64 actions, the pending set of signals sent to the process, and the interval
   timer. Per thread: the blocked mask and the pending set of signals sent to that thread
   (`tkill`/`tgkill`, faults). A process signal goes to the first thread that does not block it,
@@ -816,8 +822,9 @@ the server.
   a stop signal starts a group stop that every thread joins; the last one to stop reports it
   to the parent, and `SIGCONT` resumes them all.
 - **Delivery** happens on every return to user space (after syscalls and after timer
-  preemption). Default actions terminate, ignore or stop. For handlers, the kernel pushes a
-  signal frame on the user stack: restorer address, saved register frame, saved mask, the
+  preemption, by the thread's server before its program runs again). Default actions
+  terminate, ignore or stop. For handlers, the server writes Linux's signal frame on the user
+  stack: restorer address, saved register frame, saved mask, the
   FPU/SSE state (asynchronous handlers would otherwise clobber it) and `siginfo`.
 - **Temporary masks**: `rt_sigsuspend`, `ppoll` and `pselect6` wait with the mask they are
   given. If a signal interrupts them, the mask stays until it is delivered, so the handler
@@ -840,27 +847,30 @@ the server.
 
 ### Filesystem
 
-- **VFS**: reference-counted inodes (`Arc<Inode>`) holding directories (`BTreeMap`), files,
-  symlinks or devices. Path resolution follows symlinks with loop detection and supports the
-  `*at` family relative to directory descriptors.
-- **Initramfs**: the builder writes a `newc` cpio archive, and the kernel unpacks it at boot
-  without copying file contents. A file's pages are read from the ramdisk until a page is
-  written or mapped; then it gets its own frame in the file's page cache.
-- **tmpfs**: the files in memory keep their contents in their page cache (as Linux's tmpfs).
-  The pages are committed memory, and all of them together may take half of the commit limit
-  (`ENOSPC` beyond, as Linux's default tmpfs size).
-- **Open files** are shared descriptions (`Arc<OpenFile>`) with offset and flags, so `dup`,
-  `fork` and close-on-exec behave as on Linux.
-- **eventfd**: a 64-bit counter as a file (reads take it, or 1 of it with `EFD_SEMAPHORE`; writes add and block before it would overflow), on one wait channel that `poll` and `select` listen on too.
-- **Pipes** have a 64 KiB buffer with blocking reads and writes and EOF/`EPIPE` semantics.
-- **Quotas**: inodes, symlink targets and pipe buffers live on the kernel heap and are charged
-  against an 8 MiB budget (`ENOSPC`), so user programs cannot exhaust the heap.
+The kernel has no filesystem (R9): every file a program sees is its Linux server's (see the
+Linux server above for the details).
+
+- **The namespace** (`servers/linux/src/namespace.rs`): a mount table per instance, the
+  instance's tmpfs at the root, `/dev` (a tmpfs: devtmpfs), devpts at `/dev/pts`, `/data`
+  (diskfs's ext2 over the rings), `/proc` and `/sys`. Path resolution follows symlinks with
+  loop detection and supports the `*at` family relative to directory descriptors.
+- **Initramfs**: the builder writes a `newc` cpio archive. Each instance unpacks it into its
+  tmpfs without copying file contents: a file's pages are read from the boot image until a
+  page is written; then it gets its own frame. The kernel reads its own programs (the servers)
+  from the same archive by name.
+- **tmpfs**: a file's contents are a file object of the kernel's (as Linux's tmpfs, pages in
+  memory). The pages are committed memory, and all of them together may take half of the
+  commit limit (`ENOSPC` beyond, as Linux's default tmpfs size).
+- **Open files** are the server's shared descriptions with offset and flags, so `dup`, `fork`
+  and close-on-exec behave as on Linux; pipes (64 KiB, blocking, EOF and `EPIPE`) and
+  `eventfd` are files of the server's.
 
 ### Microkernel architecture
 
-oxidenix is being restructured into a microkernel step by step, keeping the Linux syscall
-interface working after every step. The kernel keeps memory management, scheduling, IPC and
-interrupt dispatch; drivers and filesystems move into user-space servers.
+oxidenix was restructured into a microkernel step by step, keeping the Linux syscall
+interface working after every step; since R9 the kernel implements no Linux system call. It
+keeps memory management, scheduling, restricted mode, IPC and channels and interrupt
+dispatch; drivers, filesystems, the network stack and Linux itself are user-space servers.
 
 - **IPC** (`process/ipc.rs`): a privileged server registers a service name (`ipc_register`),
   then loops over `ipc_receive` and `ipc_reply` (oxidenix syscalls 1000-1002). The kernel is
@@ -908,14 +918,15 @@ interrupt dispatch; drivers and filesystems move into user-space servers.
   service carries a generation number, and a socket only ever talks to the netd instance that
   created it, so a stale socket handle can never reach a new connection of another program.
   Restarted servers are children of the kernel, never of the program that triggered them.
-  The kernel reads each server program once at boot and restarts it from that copy, so
-  replacing `/sbin/diskfs` later cannot smuggle a different program into a privileged process.
-- **Protected servers**: like init on Linux, privileged servers ignore signals from user space:
-  a direct `kill` fails with `EPERM`, and group, broadcast and terminal signals skip them. Only
-  the kernel can stop them (the monitor's `kill <pid|name>` does, for testing).
-- **Servers in Rust**: `servers/diskfs` and `servers/netd` are `no_std` Rust programs built for
-  `x86_64-unknown-none` as a static `ET_EXEC` binary, using `crates/oxrt` for its entry point,
-  syscalls, heap and port I/O. They share no code with the kernel except the message format.
+  The kernel starts each server from the read-only boot image (its pages committed at boot),
+  so nothing a program writes can smuggle a different program into a privileged process.
+- **Protected servers**: Linux programs cannot reach them: a program's `kill` names only
+  processes of its own tree (the Linux server's pid namespace). Only the kernel ends them (the
+  monitor's `kill <pid|name>` does, for testing).
+- **Servers in Rust**: `servers/diskfs`, `servers/netd`, `servers/procfs` and
+  `servers/ringtest` are `no_std` Rust programs built for `x86_64-unknown-none` as a static
+  `ET_EXEC` binary, using `crates/oxrt` for its entry point, the kernel's own calls
+  (`oxrt::sys`, `kernel/src/process/native.rs`: no Linux numbers), heap and port I/O.
 - **procfs: the Linux personality** (`servers/procfs`). The kernel has no `/proc`. It keeps
   native accounting (user and system ticks per process and CPU, start time, mapped pages,
   command line, program path, a Linux-style load average) and hands it out as fixed binary
@@ -927,14 +938,15 @@ interrupt dispatch; drivers and filesystems move into user-space servers.
   protocol as diskfs's (`fsring`, read-only; `docs/design/io-rings.md`, step 5). The Linux
   server mounts them at `/proc` and `/sys` and makes each process's own part itself
   (`servers/linux/src/procfs.rs`): `/proc/<pid>/{stat,statm,status,cmdline,comm,exe,task,
-  counters,mounts,fd,cwd,root}`, `/proc/self`, `/proc/thread-self`, `/proc/mounts` (its own
+  mounts,fd,cwd,root}`, `/proc/self`, `/proc/thread-self`, `/proc/mounts` (its own
   mount table), with the same formats (`procproto::render`), from its own process table (R8)
   and descriptor tables (any process's `fd`). `/proc/self/fd/N` are magic links: opening one
   opens the file itself (an unlinked file, a new end of a pipe: bash's `<(...)` through
   `/dev/fd`), `O_PATH` descriptors reopen through them. A non-Linux userland would simply not
   run procfs.
-- Still in the kernel today: the kernel's own VFS (for `/dev`'s nodes) and the console and
-  keyboard as a raw device; the terminals are the Linux server's (R6d).
+- What stays in the kernel: the console and keyboard as a raw device (the terminals are the
+  Linux server's, R6d); no VFS, no descriptor tables, no signals, no Linux system call (R9,
+  ADR 0011).
 
 ### Networking
 
@@ -1093,31 +1105,33 @@ cpio archive and hands it to the bootloader as a ramdisk.
 
 ## System calls
 
-Linux x86_64 numbers, grouped by area (about 120 in total):
+Linux x86_64 numbers, grouped by area (about 120 in total), every one the Linux server's (the
+kernel implements none, R9):
 
 | Area | Calls |
 |---|---|
 | Files | `read` `write` `pread64` `pwrite64` `readv` `writev` `preadv` `pwritev` `preadv2` `pwritev2` `open` `openat` (also `O_DIRECT`) `close` `lseek` `sendfile` `truncate` `ftruncate` `fcntl` `ioctl` (the terminals', `FIONBIO`, `FIOCLEX`, `FIONCLEX`) `dup` `dup2` `dup3` `pipe` `pipe2` |
-| Metadata | `stat` `fstat` `lstat` `newfstatat` `statx` `access` `faccessat` `faccessat2` `readlink` `readlinkat` `chmod` `fchmod` `fchmodat` `fchmodat2` `chown` `fchown` `lchown` `fchownat` (owners are not stored: every file is root's) `utimes` `futimesat` `utimensat` (timestamps kept, nanoseconds on tmpfs, seconds on ext2, by the server for the kernel's `/dev` and for `/proc` and `/sys`: the last 1024 set per process tree) `umask`; `inotify_init` `inotify_init1` `inotify_add_watch` `inotify_rm_watch`; `copy_file_range` (all the Linux server's) |
+| Metadata | `stat` `fstat` `lstat` `newfstatat` `statx` `access` `faccessat` `faccessat2` `readlink` `readlinkat` `chmod` `fchmod` `fchmodat` `fchmodat2` `chown` `fchown` `lchown` `fchownat` (owners are not stored: every file is root's) `utimes` `futimesat` `utimensat` (timestamps kept, nanoseconds on tmpfs, seconds on ext2, by the server for `/proc` and `/sys`: the last 1024 set per process tree) `umask`; `inotify_init` `inotify_init1` `inotify_add_watch` `inotify_rm_watch`; `copy_file_range` (all the Linux server's) |
 | Directories | `getdents64` `getcwd` `chdir` `fchdir` `mkdir` `mkdirat` `rmdir` `unlink` `unlinkat` `rename` `renameat` `renameat2` `symlink` `symlinkat` |
 | I/O multiplexing | `poll` `ppoll` `select` `pselect6` `epoll_create` `epoll_create1` `epoll_ctl` `epoll_wait` `epoll_pwait` `epoll_pwait2` `eventfd` `eventfd2` |
 | Memory | `brk` `mmap` (private, shared, anonymous, file through the page cache, `MAP_FIXED[_NOREPLACE]`, `MAP_NORESERVE`, `MAP_POPULATE`) `munmap` `mprotect` `mremap` `madvise` (`DONTNEED`, `FREE`) `msync` `mlock` (no-op) |
 | CPUs | `sched_getaffinity` `sched_setaffinity` `getcpu` `sched_getscheduler` `sched_getparam` (the Linux server's: `SCHED_OTHER`, priority 0) `getpriority` `setpriority` (the Linux server's, over the kernel's fair scheduler; scoped to the caller's process tree) |
-| Processes and threads | `clone` (`CLONE_VM` `FS` `FILES` `SIGHAND` `THREAD` `VFORK` `PARENT` `SETTLS` `PARENT_SETTID` `CHILD_SETTID` `CHILD_CLEARTID`) `fork` `vfork` `execve` `exit` (one thread) `exit_group` `wait4` `getpid` `getppid` `gettid` `set_tid_address` `sched_yield` `arch_prctl` `prlimit64` |
+| Processes and threads | `clone` (`CLONE_VM` `FS` `FILES` `SIGHAND` `THREAD` `VFORK` `PARENT` `SETTLS` `PARENT_SETTID` `CHILD_SETTID` `CHILD_CLEARTID`) `fork` `vfork` `execve` `exit` (one thread) `exit_group` `wait4` `getpid` `getppid` `gettid` `set_tid_address` `sched_yield` `arch_prctl` (`ARCH_SET_FS`, `ARCH_GET_FS`) `prlimit64` `getrlimit` `setrlimit` (`RLIMIT_NOFILE` kept per table; the others Linux's defaults, new ones checked, not kept) |
 | Groups and IDs | `setpgid` `getpgid` `getpgrp` `setsid` `getsid` `getuid` `geteuid` `getgid` `getegid` `getresuid` `getresgid` `setuid` `setgid` `getgroups` `setgroups` (none: root started by init) |
 | Synchronization | `futex` (`WAIT`, `WAKE`, `WAIT_BITSET`, `WAKE_BITSET`, `REQUEUE`, `CMP_REQUEUE`; private and shared, monotonic and realtime timeouts) |
 | Signals | `rt_sigaction` `rt_sigprocmask` `rt_sigreturn` `rt_sigsuspend` `rt_sigpending` `kill` `tkill` `tgkill` `pause` `sigaltstack` `alarm` `setitimer` `getitimer` (`ITIMER_REAL`) `rt_sigtimedwait` |
 | Process control | `prctl` (name, parent-death signal, dumpable, no-new-privs, capability bounding set) `capget` `capset` (everything runs as root with every capability) |
 | Filesystems | `statfs` `fstatfs` `sync` `syncfs` (every process tree's page cache of `/data`) `fsync` `fdatasync` |
-| Linux server (normal mode only) | `restricted_enter` (1010), `legacy_syscall` (1011), `handle_close` (1012), memory objects: `mo_create` (1013), `mo_map` (1014), `mo_unmap` (1015), `mo_protect` (1016), `mo_read` (1017), `mo_write` (1018), paged objects: `mo_create_paged` (1019), `pager_wait` (1020), `mo_supply` (1021), `mo_fail` (1022), runtime: `shared_map` (1023), `server_futex_wait` (1024), `server_futex_wake` (1025), address space: `vm_remap` (1026), `vm_discard` (1027), `vm_sync` (1028), time: `clock_read` (1030), `sleep_until` (1031), `yield` (1032), `set_usercopy` (1033), the kernel's tree: `inode_root` (1041), `inode_walk` (1042), `inode_stat` (1043), `inode_readlink` (1044), `inode_create` (1045), `inode_symlink` (1046), `inode_unlink` (1047), `inode_rename` (1048), `inode_chmod` (1049), `inode_truncate` (1050), `inode_open` (1051), `inode_statfs` (1052), file objects: `mo_create_file` (1055), `mo_hold` (1056), `mo_file_read` (1057), `mo_file_write` (1058), `mo_file_size` (1059), `mo_truncate` (1060), `initramfs` (1061), `mo_from_image` (1062), a thread's nice value: `thread_nice` (1095), the kernel's open files: `kfile_call` (1131), `kfile_inode` (1132), waiting for several words: `server_wait` (1133), processes and threads (R8): `proc_self` (1140), `proc_create` (1141), `thread_create` (1142), `thread_kick` (1143), `thread_kill` (1144), `thread_exit` (1145), `exec_space` (1146), `proc_info` (1147), `thread_info` (1148), `thread_affinity` (1149), `thread_cleartid` (1150), `thread_name` (1151), `init_args` (1152), `vm_floor` (1153), `random` (1154); the full list is in `docs/codemap.md` |
-| Servers | `ioperm` (privileged servers only), `ipc_register` (1000), `ipc_receive` (1001, with timeout and interrupt notifications), `ipc_reply` (1002), `irq_enable` (1003), `dma_map` (1004), `proc_query` (1005), and the service's end of channels (1068-1075, `oxrt::sys`) |
-| System information | `sysinfo` `uname` (reports `oxidenix`, not Linux) |
-| Power | `reboot` (power off ends QEMU, restart resets the machine; every process tree's page cache is written back first) |
+| Linux server (normal mode only) | `restricted_enter` (1010), `handle_close` (1012), memory objects: `mo_create` (1013), `mo_map` (1014), `mo_unmap` (1015), `mo_protect` (1016), `mo_read` (1017), `mo_write` (1018), paged objects: `mo_create_paged` (1019), `pager_wait` (1020), `mo_supply` (1021), `mo_fail` (1022), runtime: `shared_map` (1023), `server_futex_wait` (1024), `server_futex_wake` (1025), address space: `vm_remap` (1026), `vm_discard` (1027), `vm_sync` (1028), time: `clock_read` (1030), `sleep_until` (1031), `yield` (1032), `set_usercopy` (1033), file objects: `mo_create_file` (1055), `mo_hold` (1056), `mo_file_read` (1057), `mo_file_write` (1058), `mo_file_size` (1059), `mo_truncate` (1060), `initramfs` (1061), `mo_from_image` (1062), a thread's nice value: `thread_nice` (1095), waiting for several words: `server_wait` (1133), processes and threads (R8): `proc_self` (1140), `proc_create` (1141), `thread_create` (1142), `thread_kick` (1143), `thread_kill` (1144), `thread_exit` (1145), `exec_space` (1146), `proc_info` (1147), `thread_info` (1148), `thread_affinity` (1149), `thread_cleartid` (1150), `thread_name` (1151), `init_args` (1152), `vm_floor` (1153), `random` (1154), the last mechanisms (R9): `futex_wait` (1160), `futex_wake` (1161), `futex_requeue` (1162), `thread_fs` (1163), `clock_set` (1164), `power` (1165), `file_pages` (1166); the full list is in `docs/codemap.md` (1011 `legacy_syscall`, the inode and kfile calls went with R9) |
+| Native servers (`oxrt::sys`, no Linux numbers) | `ipc_register` (1000), `ipc_receive` (1001, with timeout and interrupt notifications), `ipc_reply` (1002), `irq_enable` (1003), `dma_map` (1004), `proc_query` (1005), `ioperm` (1006, privileged servers only), `exec` (1007, the server's own program again), `log` (1008), the service's end of channels (1068-1075), and with the Linux server's numbers and contracts on their own memory: `mo_map` (anonymous), `mo_unmap`, `mo_protect`, `futex_wait`, `futex_wake`, `futex_requeue`, `clock_read`, `yield`, `random`, `thread_exit` |
+| System information | `sysinfo` `uname` (reports `oxidenix`, not Linux) `getcpu` |
+| Power | `reboot` (power off ends QEMU, restart resets the machine; every process tree's page cache is written back first); `ioperm` and `iopl` are `EPERM` (a process tree has no ports) |
 | Sockets | `socket` `bind` `listen` `accept` `accept4` `connect` `sendto` `recvfrom` `sendmsg` `recvmsg` `shutdown` `getsockname` `getpeername` `setsockopt` (ignored) `getsockopt` (`AF_INET`: TCP, UDP, raw ICMP); `AF_NETLINK` with `NETLINK_ROUTE` (the Linux server's: `RTM_GETLINK`, `RTM_GETADDR`); the interface requests of netdevice(7) on any socket (`SIOCGIFCONF`, `SIOCGIFINDEX`, `SIOCGIFNAME`, `SIOCGIFFLAGS`, `SIOCGIFADDR`, `SIOCGIFNETMASK`, `SIOCGIFBRDADDR`, `SIOCGIFHWADDR`, `SIOCGIFMTU`) |
 | Time | `clock_gettime` `clock_getres` `clock_settime` (every Linux clock, including the CPU-time clocks of threads and processes) `gettimeofday` `settimeofday` `time` `times` `getrusage` `nanosleep` `clock_nanosleep` (relative and `TIMER_ABSTIME`) |
 | Misc | `getrandom` (ChaCha20 with fast key erasure, seeded at boot from RDSEED or RDRAND and timing jitter, reseeded as it is used; also `AT_RANDOM`); `io_uring_setup`, `io_uring_enter`, `io_uring_register` answer `ENOSYS` (from the Linux server, quietly: libuv probes them and uses epoll) |
 
-Everything runs as root. Unknown syscalls print a kernel message and return `ENOSYS`.
+Everything runs as root. An unknown syscall returns `ENOSYS`, and the Linux server prints
+`syscall N not implemented` on the console.
 
 ## Testing
 
@@ -1146,18 +1160,18 @@ Each of these programs and scripts lives in the root filesystem and runs inside 
 | `timetest` | nanosecond resolution of `CLOCK_MONOTONIC`, no step back on one CPU or between two, `clock_getres`, invalid clocks, `BOOTTIME`, `RAW`, `COARSE`, `gettimeofday` and `time` against `CLOCK_REALTIME`, `clock_settime` moving only the wall clock, thread and process CPU clocks (spinning counts, sleeping does not, `pthread_getcpuclockid`, `clock_getcpuclockid`), `getrusage` for the process, the thread and reaped children, `times`, `wait4`'s rusage (a reaped child's CPU time with its own children's, its peak memory, also across `exec`) |
 | `randtest` | `getrandom` (the kernel's ChaCha20 generator, seeded from RDSEED/RDRAND and timing jitter): flags (`GRND_NONBLOCK`, `GRND_RANDOM`, `GRND_INSECURE`, `EINVAL` for unknown ones and `GRND_INSECURE` with `GRND_RANDOM`), answers that differ, 1 MiB at once with every byte value about as often, 32 MiB with signals coming (whole pieces, never an error), `EFAULT`; `AT_RANDOM` differing between processes |
 | `timertest` | sleeps and timeouts end when due, not at the next tick, and never early (median and minimum of nine 1–2 ms waits in `nanosleep`, `poll`, `select`, `futex`, `sigtimedwait`), 100 × `usleep(100)`, `clock_nanosleep` absolute (monotonic, past wall-clock times) and on `CLOCK_BOOTTIME`, refusal on CPU clocks, the time left after an interrupted `nanosleep`, a 2 ms `setitimer` interval firing about 50 times in 100 ms, a 1 µs interval timer leaving another process on its CPU its share (and, ignored, its own process), an ignored timer resuming once handled |
-| `fdtest` | the descriptor table (the Linux server's): `dup`, `dup2`, `dup3` and `F_DUPFD` (lowest free, close-on-exec, errors), status flags shared by a description's descriptors (`F_SETFL`, `FIONBIO`), `close_range` (`CLOSE_RANGE_CLOEXEC`, `CLOSE_RANGE_UNSHARE` in a thread), `RLIMIT_NOFILE` (`EMFILE`, `EBADF`, `EINVAL`, `EPERM`, raising it), `fork`'s copy and shared offsets, threads sharing the table, a blocked read outliving another thread's close, exit and `execve` closing (close-on-exec only; a failed `execve` changing nothing), a process killed inside `execve` (waiting for an argument's page that never comes) or in its program having its pipe closed and its listening port free when `waitpid` returns, a `CLONE_VM|CLONE_VFORK|CLONE_FILES` child's table, the kernel's files held by the server (`/proc` read, `lseek`, `fstat`, always ready, `EPERM` for `epoll`, `fchdir`, `openat`, `getdents64`, `/dev/zero` mapped, `/dev/null`) |
+| `fdtest` | the descriptor table (the Linux server's): `dup`, `dup2`, `dup3` and `F_DUPFD` (lowest free, close-on-exec, errors), status flags shared by a description's descriptors (`F_SETFL`, `FIONBIO`), `close_range` (`CLOSE_RANGE_CLOEXEC`, `CLOSE_RANGE_UNSHARE` in a thread), `RLIMIT_NOFILE` (`EMFILE`, `EBADF`, `EINVAL`, `EPERM`, raising it), `fork`'s copy and shared offsets, threads sharing the table, a blocked read outliving another thread's close, exit and `execve` closing (close-on-exec only; a failed `execve` changing nothing), a process killed inside `execve` (waiting for an argument's page that never comes) or in its program having its pipe closed and its listening port free when `waitpid` returns, a `CLONE_VM|CLONE_VFORK|CLONE_FILES` child's table, pseudo files (`/proc` read, `lseek`, `fstat`, always ready, `EPERM` for `epoll`) and `/dev` (`fchdir`, `openat`, `getdents64`, `/dev/zero` mapped, `/dev/null`) |
 | `polltest` | `poll` and `select` wake within 1 ms of a pipe write or a datagram over loopback (median of nine, the writer on the same or another CPU, next to an idle descriptor), a full pipe polling writable once drained, `POLLHUP` when the last writer closes, `EINTR` in a `poll` and a `select` waiting on files (also under `SA_RESTART`), `POLLNVAL` and `EBADF` for closed and `O_PATH` descriptors, `select` and `ppoll` writing back the time left, `poll`, `select` and `ppoll` going on after a stop and a continue (`restart_syscall`), `EINTR` from `restart_syscall` with nothing to restart, wake-up within 1 ms of data on a TCP connection |
 | `eventfdtest` | `eventfd` counting (initial value, adding writes, reset on read), `EFD_SEMAPHORE`, `EFD_NONBLOCK` and `EFD_CLOEXEC`, `EINVAL` for short reads, 2^64-1 and unknown flags, a full counter (`EAGAIN`, poll state), a blocking read woken by another process, `poll` waking within 1 ms of a write |
 | `sigmasktest` | temporary signal masks of `sigsuspend`, `ppoll` and `pselect`: a pending or arriving signal the mask lets through interrupts them and its handler runs with that mask, the caller's mask comes back afterwards, a successful `ppoll` leaves a blocked signal pending (`sigpending`), a mask that blocks a signal holds it off until the call returns, `EINVAL` for a wrong mask size |
 | `epolltest` | `epoll_create1`/`epoll_create` flags and sizes, `EPOLL_CTL_ADD`/`MOD`/`DEL` and their errors (`EEXIST`, `ENOENT`, `EPERM` for regular files, `EINVAL`, `EBADF`), level-triggered, edge-triggered and one-shot reporting, `EPOLLOUT` and `EPOLLERR` on a pipe's write end, interests removed with the file's last descriptor (not before), `maxevents` rotating through ready files, eventfds and UDP sockets in a set, nested instances (`ELOOP` for a loop and for chains longer than five, built at either end) and `poll` on an instance, wake-up within 1 ms of a write, timeouts, `EINTR` and `epoll_pwait`'s mask, `epoll_pwait2`; `EPOLLEXCLUSIVE` (its `EINVAL` rules, one write waking one of two waiting instances, both without it), an instance shared by a forked child and passed with `SCM_RIGHTS`, interests keyed by descriptor and description, `EPERM` for `/proc` files, `EBADF` for `O_PATH`, `EFAULT` keeping the event |
-| `unixtest` | `AF_UNIX` sockets in the Linux server: stream pairs (`fstat` as a socket, `FIONREAD`, `MSG_PEEK`, reads across writes, names and peer names of a pair, `SO_TYPE`, `SO_DOMAIN`, `SO_PEERCRED`, `SO_SNDBUF` doubled, `EOPNOTSUPP` for other levels, `ESPIPE`), `shutdown(SHUT_WR)` (`POLLRDHUP`, the rest, end of file, `EPIPE` for the writer, the other direction still open), a closed peer (`POLLHUP`, end of file, `EPIPE` with `SIGPIPE`, none with `MSG_NOSIGNAL`, `ECONNRESET` after unread data); nonblocking (`SOCK_NONBLOCK`/`SOCK_CLOEXEC`, `EAGAIN`, edge-triggered `epoll` and new edges, a full send buffer without `POLLOUT` until drained, `EPOLLRDHUP`, `SO_RCVTIMEO`); datagram pairs (boundaries, empty datagrams, truncation with `MSG_TRUNC`) and seqpacket pairs (boundaries, the truncated rest gone, end of file); servers on a tmpfs path, a relative path, a `/data` path and an abstract name (`EADDRINUSE`, `ECONNREFUSED` before `listen`, `SO_ACCEPTCONN`, names given back, a pending connection polling readable, the client's and the listener's names and credentials on both ends, a full backlog's `EAGAIN`, pending clients reset when the listener closes), socket inodes (`S_ISSOCK`, `ENXIO` for `open`, kept after close), `ENOENT` and `ECONNREFUSED` for paths, autobind; named datagram sockets (`recvfrom`'s sender, `connect` and `AF_UNSPEC`, `ENOTCONN`, `EPROTOTYPE`, `ECONNREFUSED`); `SCM_RIGHTS` to a forked child (a pipe end and a file whose offset is shared, `MSG_CMSG_CLOEXEC`, the passed descriptors outliving the sender's close, `MSG_CTRUNC` dropping what does not fit, a socket passed back), `MSG_PEEK` installing copies (only as many as the control buffer holds), `EBADF`, a cycle of sockets in flight collected, also one an exited process left (and its descriptors in flight never blocking another process's); `SO_PASSCRED` and `SCM_CREDENTIALS`, implicit and explicit, `ESRCH` for a process outside the tree, the bytes delivered despite an unwritable control buffer; a blocked `recvmsg` and `accept` outliving another thread's close, 200 races of a close, a receive taking a socket out of flight and the collector; a datagram sender held back by a full receiver not writable for `epoll` until it reads; receives into pages of a `/data` mapping the pager brings while sockets close and the collector runs; five processes trying to put more descriptors in flight than the instance's bound; nothing left in flight when it ends; an `O_PATH` descriptor, an open file of the kernel's and an epoll instance passed, and an epoll instance's interest keeping nothing in flight |
-| `lxtest` | the Linux server's kernel interface through its test calls (answered in test mode only, `SYS_TEST_MODE`): a memory object it filled, mapped into the program, a program store read back by the server, write protection, unmapping, mappings refused at the server's region and unaligned; a paged object whose pages the pager thread supplies when the program reads them or the kernel copies from them (`write` from the mapping), each page once; `SIGKILL` ending a thread that waits for a page the pager never supplies; a page the pager fails raising `SIGBUS` and a later access getting it, for a second such object too; a waiting thread getting `SIGBUS` once the pager closed the object's last handle; a store the pager cannot back raising `SIGBUS` and a later store going through (`TEST_MKWRITE_FAIL`); the server's heap with 2000 blocks of many sizes and its mutex serializing six threads in two processes; `/proc/self/counters` counting the process's own calls passed through (`legacy_calls`; five passed through on purpose, `TEST_PASS_THROUGH`); `mmap`, `mprotect` and `munmap` handled by the server without a call passed through, and `clock_gettime`, `gettimeofday` and `nanosleep` likewise; the server writing a page the program never touched, and `EFAULT` (not death) for read-only, `PROT_NONE` and unmapped program memory, for the server's own memory and across the 64 TiB line; pipe reads and writes without a call passed through, end of file after the writer closes, `EPIPE` and `SIGPIPE` without readers, `FIONBIO`, `FIOCLEX` and `FIONCLEX` on a pipe (the server's descriptor table), other ioctls `ENOTTY`; eventfd likewise, `EAGAIN` when empty and non-blocking; the server's records: a forked child's copy, a thread's shared one, released when processes end; path calls without a call passed through: `chdir`/`getcwd`, `umask` on a new file, `O_EXCL`, symlinks (`readlink`, `stat` vs. `lstat`, `O_NOFOLLOW`, a loop's `ELOOP`, a symlinked directory in a path), `openat` relative to a directory descriptor, `rename`, a child's own working directory, `fchdir`, `rmdir`, `O_CREAT` through a dangling symlink; `/tmp` as the server's tmpfs: its own device, reads, writes, `lseek` and `fstat` without a call passed through, `O_APPEND`, a shared mapping writing the file, `ftruncate`, `readdir`, `EXDEV` and `EBUSY` at the mounts, the root and `/bin/busybox` from the server's tmpfs, `/proc` procfs's and `/dev` the kernel's; channels to the test service `ringtest`: requests and completions through the rings with both ends sleeping on futex doorbells, a service's doorbell watch kept once when armed twice, never moved by a requeue, woken once and arriving as an `ipc_receive` event, connect errors (`EISCONN`, `ENOENT`, `EOPNOTSUPP`, `ENOTCONN`), grant data both ways, a read-only grant the service can neither `mprotect` writable or executable nor have the kernel store into, the kernel's grant bounds, device addresses only within a grant, `EBUSY` for truncating a granted page, `ENODATA` for an unsupplied paged page, a revoked grant gone from the service (its range reserved and inaccessible until the service unmaps it), a draining grant pinned with its id held until the service lets go, the client's end closing while the service sleeps (its grant mappings gone, pins released), the service dying of a store into a read-only grant while the client waits (the client wakes with `EPIPE`, the page unchanged, the service restarted for the next channel), the service executing a new program that can then neither map the grant nor get a device address of it; the file protocol against diskfs (`TEST_DISKRING`): the disk image's README read by DMA at unaligned offsets, stat, readdir with a cursor, statfs, a symlink; aligned, unaligned, one-sector and past-the-end writes, a flush, the file read back against a model, truncate, rename, permissions; malformed requests completing with `ENOSYS`, `EINVAL`, `EBADF`, `EACCES`, `ENOENT`, `ENAMETOOLONG`, `ENOTDIR`, `EEXIST`; 24 writes and 24 reads in flight; a grant revoked under diskfs (`EFAULT`, diskfs alive, `FORGET`); a client closing with reads in flight; a revoked grant's range given to no other grant; an unlinked inode freed only when no channel holds it; a write stalled behind another with every operation slot busy; requests waiting for completion room leaving diskfs idle (its CPU time, `TEST_SERVER_TICKS`), `/proc` not showing diskfs (another tree's processes are not) and completing once there is room; the ring's file read and removed through `/data` (the server's page cache, another channel); the page cache's kernel interface (`TEST_CACHED`): a failed fill past the end of a file leaving no trace once it grows, a write-back scan longer than one call going on where the kernel says, a truncation giving up (`EBUSY`) on a page pinned by a grant never let go of, a sync across instances (`sync_others`); a nice 19 thread taking a server lock next to a nice -20 loop not holding up another thread that needs the lock |
-| `lxtest` x3 (in `runtests.sh`) | all of `lxtest` three more times in the same boot, its output into a pipe, beside a loop reading `/proc` (and forking, exec-ing, waiting: calls passed through): every check holds in any run and whatever else runs |
+| `unixtest` | `AF_UNIX` sockets in the Linux server: stream pairs (`fstat` as a socket, `FIONREAD`, `MSG_PEEK`, reads across writes, names and peer names of a pair, `SO_TYPE`, `SO_DOMAIN`, `SO_PEERCRED`, `SO_SNDBUF` doubled, `EOPNOTSUPP` for other levels, `ESPIPE`), `shutdown(SHUT_WR)` (`POLLRDHUP`, the rest, end of file, `EPIPE` for the writer, the other direction still open), a closed peer (`POLLHUP`, end of file, `EPIPE` with `SIGPIPE`, none with `MSG_NOSIGNAL`, `ECONNRESET` after unread data); nonblocking (`SOCK_NONBLOCK`/`SOCK_CLOEXEC`, `EAGAIN`, edge-triggered `epoll` and new edges, a full send buffer without `POLLOUT` until drained, `EPOLLRDHUP`, `SO_RCVTIMEO`); datagram pairs (boundaries, empty datagrams, truncation with `MSG_TRUNC`) and seqpacket pairs (boundaries, the truncated rest gone, end of file); servers on a tmpfs path, a relative path, a `/data` path and an abstract name (`EADDRINUSE`, `ECONNREFUSED` before `listen`, `SO_ACCEPTCONN`, names given back, a pending connection polling readable, the client's and the listener's names and credentials on both ends, a full backlog's `EAGAIN`, pending clients reset when the listener closes), socket inodes (`S_ISSOCK`, `ENXIO` for `open`, kept after close), `ENOENT` and `ECONNREFUSED` for paths, autobind; named datagram sockets (`recvfrom`'s sender, `connect` and `AF_UNSPEC`, `ENOTCONN`, `EPROTOTYPE`, `ECONNREFUSED`); `SCM_RIGHTS` to a forked child (a pipe end and a file whose offset is shared, `MSG_CMSG_CLOEXEC`, the passed descriptors outliving the sender's close, `MSG_CTRUNC` dropping what does not fit, a socket passed back), `MSG_PEEK` installing copies (only as many as the control buffer holds), `EBADF`, a cycle of sockets in flight collected, also one an exited process left (and its descriptors in flight never blocking another process's); `SO_PASSCRED` and `SCM_CREDENTIALS`, implicit and explicit, `ESRCH` for a process outside the tree, the bytes delivered despite an unwritable control buffer; a blocked `recvmsg` and `accept` outliving another thread's close, 200 races of a close, a receive taking a socket out of flight and the collector; a datagram sender held back by a full receiver not writable for `epoll` until it reads; receives into pages of a `/data` mapping the pager brings while sockets close and the collector runs; five processes trying to put more descriptors in flight than the instance's bound; nothing left in flight when it ends; an `O_PATH` descriptor, a `/dev` file and an epoll instance passed, and an epoll instance's interest keeping nothing in flight |
+| `lxtest` | the Linux server's kernel interface through its test calls (answered in test mode only, `SYS_TEST_MODE`): a memory object it filled, mapped into the program, a program store read back by the server, write protection, unmapping, mappings refused at the server's region and unaligned; a paged object whose pages the pager thread supplies when the program reads them or the kernel copies from them (`write` from the mapping), each page once; `SIGKILL` ending a thread that waits for a page the pager never supplies; a page the pager fails raising `SIGBUS` and a later access getting it, for a second such object too; a waiting thread getting `SIGBUS` once the pager closed the object's last handle; a store the pager cannot back raising `SIGBUS` and a later store going through (`TEST_MKWRITE_FAIL`); the server's heap with 2000 blocks of many sizes and its mutex serializing six threads in two processes; nothing passing through (R9): a call the server does not implement `ENOSYS`, the test call that passed one through gone; futex (`EAGAIN`, a timeout's `ETIMEDOUT`, an absolute deadline past, `EINVAL` for a zero bitset and an unaligned word, `EFAULT` for the server's memory, a wake from another thread), `arch_prctl` (`ARCH_GET_FS` the TLS pointer, `EPERM` above 64 TiB, `ARCH_SET_FS` and back), `uname`, `sysinfo`, `getrandom` beyond one piece and its flags, `getcpu`, `clock_settime` (`EINVAL` for the monotonic clock, the wall clock set and set back by `settimeofday`), the caller's CPU clocks also by pid 0's encoding, the resource limits (an 8 MiB stack, no core files, `EINVAL` for a soft limit above the hard one and for a resource beyond them), `ioperm` `EPERM`, `reboot` with a wrong magic number `EINVAL`, `/dev` as the server's devtmpfs (its nodes and numbers, its links into `/proc/self/fd`, `pts`, `shm`, tmpfs's `statfs`, its own device (`EXDEV` to `/tmp`), files root makes there, `/dev/zero` read and mapped); `mmap`, `mprotect` and `munmap` handled by the server, and `clock_gettime`, `gettimeofday` and `nanosleep`; the server writing a page the program never touched, and `EFAULT` (not death) for read-only, `PROT_NONE` and unmapped program memory, for the server's own memory and across the 64 TiB line; pipe reads and writes, end of file after the writer closes, `EPIPE` and `SIGPIPE` without readers, `FIONBIO`, `FIOCLEX` and `FIONCLEX` on a pipe (the server's descriptor table), other ioctls `ENOTTY`; eventfd likewise, `EAGAIN` when empty and non-blocking; the server's records: a forked child's copy, a thread's shared one, released when processes end; path calls: `chdir`/`getcwd`, `umask` on a new file, `O_EXCL`, symlinks (`readlink`, `stat` vs. `lstat`, `O_NOFOLLOW`, a loop's `ELOOP`, a symlinked directory in a path), `openat` relative to a directory descriptor, `rename`, a child's own working directory, `fchdir`, `rmdir`, `O_CREAT` through a dangling symlink; `/tmp` as the server's tmpfs: its own device, reads, writes, `lseek` and `fstat`, `O_APPEND`, a shared mapping writing the file, `ftruncate`, `readdir`, `EXDEV` and `EBUSY` at the mounts, the root and `/bin/busybox` from the server's tmpfs, `/proc` procfs's and `/dev` the server's devtmpfs; channels to the test service `ringtest`: requests and completions through the rings with both ends sleeping on futex doorbells, a service's doorbell watch kept once when armed twice, never moved by a requeue, woken once and arriving as an `ipc_receive` event, connect errors (`EISCONN`, `ENOENT`, `EOPNOTSUPP`, `ENOTCONN`), grant data both ways, a read-only grant the service can neither `mprotect` writable or executable nor have the kernel store into, the kernel's grant bounds, device addresses only within a grant, `EBUSY` for truncating a granted page, `ENODATA` for an unsupplied paged page, a revoked grant gone from the service (its range reserved and inaccessible until the service unmaps it), a draining grant pinned with its id held until the service lets go, the client's end closing while the service sleeps (its grant mappings gone, pins released), the service dying of a store into a read-only grant while the client waits (the client wakes with `EPIPE`, the page unchanged, the service restarted for the next channel), the service executing a new program that can then neither map the grant nor get a device address of it; the file protocol against diskfs (`TEST_DISKRING`): the disk image's README read by DMA at unaligned offsets, stat, readdir with a cursor, statfs, a symlink; aligned, unaligned, one-sector and past-the-end writes, a flush, the file read back against a model, truncate, rename, permissions; malformed requests completing with `ENOSYS`, `EINVAL`, `EBADF`, `EACCES`, `ENOENT`, `ENAMETOOLONG`, `ENOTDIR`, `EEXIST`; 24 writes and 24 reads in flight; a grant revoked under diskfs (`EFAULT`, diskfs alive, `FORGET`); a client closing with reads in flight; a revoked grant's range given to no other grant; an unlinked inode freed only when no channel holds it; a write stalled behind another with every operation slot busy; requests waiting for completion room leaving diskfs idle (its CPU time, `TEST_SERVER_TICKS`), `/proc` not showing diskfs (another tree's processes are not) and completing once there is room; the ring's file read and removed through `/data` (the server's page cache, another channel); the page cache's kernel interface (`TEST_CACHED`): a failed fill past the end of a file leaving no trace once it grows, a write-back scan longer than one call going on where the kernel says, a truncation giving up (`EBUSY`) on a page pinned by a grant never let go of, a sync across instances (`sync_others`); a nice 19 thread taking a server lock next to a nice -20 loop not holding up another thread that needs the lock |
+| `lxtest` x3 (in `runtests.sh`) | all of `lxtest` three more times in the same boot, its output into a pipe, beside a loop reading `/proc` (and forking, exec-ing, waiting): every check holds in any run and whatever else runs |
 | `lxtest crashloop` (in `runtests.sh`) | the restart policy on the test service dying at every use: restarts with a growing backoff (3.1 s in all), the service down (`EIO` at once) after the sixth young death in a row, up again after the 5 s cooldown |
-| `libuvtest` | what libuv (Node.js) uses beyond POSIX, all answered by the Linux server without a call passed through: `statx` on tmpfs and `/data` against `stat` (every field, device numbers), symlinks followed and not, `AT_EMPTY_PATH` on regular files, pipes, sockets and `/dev/null`, the working directory for `AT_FDCWD` with an empty or `NULL` path, `ENOENT`, `EINVAL` (flags, `STATX__RESERVED`, both sync types), `EFAULT`, `EBADF`; `io_uring_setup`/`enter`/`register` `ENOSYS`; `getifaddrs` (`lo` 127.0.0.1/8, `eth0` with netd's MAC and DHCP address, netmask and broadcast); the netdevice(7) requests on an `AF_INET` and a netlink socket (`SIOCGIFINDEX`, `MTU`, `HWADDR`, `FLAGS`, `ADDR`, `NETMASK`, `BRDADDR`, `NAME`, `CONF` with and without a buffer, `ENODEV`, `ENOTTY` on a pipe); netlink sockets: protocol and type errors, autobind, `EADDRINUSE`, `SO_TYPE`/`SO_PROTOCOL`/`SO_DOMAIN`, `fstat`, `EAGAIN`, `poll`/`epoll` readiness, one link by index with its acknowledgement, `EOPNOTSUPP` for other requests, `MSG_PEEK`/`MSG_TRUNC` and truncation, datagrams between two sockets by port, `ECONNREFUSED`, `ENOTSOCK` for socket calls on a pipe; `copy_file_range` on tmpfs and `/data` at the positions and at offsets, `EINVAL` for overlapping ranges and flags, `EBADF` for read-only and `O_APPEND` outputs, `EISDIR`, `EXDEV` across filesystems; `copy_file_range` in both directions at once (no deadlock), the length clamped to the input's end before the overlap check; netlink's bounds: `EMSGSIZE` beyond the send buffer (also for 2 TiB of iovecs), the buffer options capped, answers beyond the receive buffer dropped with `ENOBUFS`, a dump waiting for room and `EBUSY` for another meanwhile |
-| `metatest` | file times on tmpfs (nanoseconds) and `/data` (seconds): `utimensat`, `futimens` with `UTIME_OMIT`/`UTIME_NOW`, `utimes`, `EINVAL` for nanoseconds out of range; a write moving mtime and ctime (and the times staying after `fsync`, the write-back), `ftruncate`, `chmod` (ctime only), a new and a removed name moving their directory's mtime; tmpfs's birth time in `statx`, none on ext2; `fchmod`, `fchmodat2` with `AT_EMPTY_PATH`, `EOPNOTSUPP` on a symlink, the chown family, `getgroups`/`setgroups`; times before 1970, `EINVAL` for flags with a null path, times set on the kernel's files (`/dev/null`, `/proc`) reading back |
-| `inotifytest` | inotify on tmpfs and `/data`: a directory's watch seeing create, merged modifies, attrib, mkdir, a move's two events with one cookie, delete; a file's own modify, close-write, open, access, close-nowrite; its removal (attrib, delete, delete-self, ignored); `IN_ONESHOT`, `IN_ONLYDIR` (`ENOTDIR`), `IN_MASK_CREATE` (`EEXIST`), `rm_watch` (`IN_IGNORED`, then `EINVAL`); `FIONREAD`, `EINVAL` for a buffer too small, names padded to 16 bytes, poll and a blocking read woken by another thread, `EINVAL`/`EBADF` for other descriptors; a file removed while open (`IN_DELETE_SELF` at its last close); the limits: 128 instances (`EMFILE`), 8192 watches (`ENOSPC`), 16384 events then one `IN_Q_OVERFLOW`; one watch for a kernel file named twice |
+| `libuvtest` | what libuv (Node.js) uses beyond POSIX, all answered by the Linux server: `statx` on tmpfs and `/data` against `stat` (every field, device numbers), symlinks followed and not, `AT_EMPTY_PATH` on regular files, pipes, sockets and `/dev/null`, the working directory for `AT_FDCWD` with an empty or `NULL` path, `ENOENT`, `EINVAL` (flags, `STATX__RESERVED`, both sync types), `EFAULT`, `EBADF`; `io_uring_setup`/`enter`/`register` `ENOSYS`; `getifaddrs` (`lo` 127.0.0.1/8, `eth0` with netd's MAC and DHCP address, netmask and broadcast); the netdevice(7) requests on an `AF_INET` and a netlink socket (`SIOCGIFINDEX`, `MTU`, `HWADDR`, `FLAGS`, `ADDR`, `NETMASK`, `BRDADDR`, `NAME`, `CONF` with and without a buffer, `ENODEV`, `ENOTTY` on a pipe); netlink sockets: protocol and type errors, autobind, `EADDRINUSE`, `SO_TYPE`/`SO_PROTOCOL`/`SO_DOMAIN`, `fstat`, `EAGAIN`, `poll`/`epoll` readiness, one link by index with its acknowledgement, `EOPNOTSUPP` for other requests, `MSG_PEEK`/`MSG_TRUNC` and truncation, datagrams between two sockets by port, `ECONNREFUSED`, `ENOTSOCK` for socket calls on a pipe; `copy_file_range` on tmpfs and `/data` at the positions and at offsets, `EINVAL` for overlapping ranges and flags, `EBADF` for read-only and `O_APPEND` outputs, `EISDIR`, `EXDEV` across filesystems; `copy_file_range` in both directions at once (no deadlock), the length clamped to the input's end before the overlap check; netlink's bounds: `EMSGSIZE` beyond the send buffer (also for 2 TiB of iovecs), the buffer options capped, answers beyond the receive buffer dropped with `ENOBUFS`, a dump waiting for room and `EBUSY` for another meanwhile |
+| `metatest` | file times on tmpfs (nanoseconds) and `/data` (seconds): `utimensat`, `futimens` with `UTIME_OMIT`/`UTIME_NOW`, `utimes`, `EINVAL` for nanoseconds out of range; a write moving mtime and ctime (and the times staying after `fsync`, the write-back), `ftruncate`, `chmod` (ctime only), a new and a removed name moving their directory's mtime; tmpfs's birth time in `statx`, none on ext2; `fchmod`, `fchmodat2` with `AT_EMPTY_PATH`, `EOPNOTSUPP` on a symlink, the chown family, `getgroups`/`setgroups`; times before 1970, `EINVAL` for flags with a null path, times set on `/dev/null` and on `/proc` reading back |
+| `inotifytest` | inotify on tmpfs and `/data`: a directory's watch seeing create, merged modifies, attrib, mkdir, a move's two events with one cookie, delete; a file's own modify, close-write, open, access, close-nowrite; its removal (attrib, delete, delete-self, ignored); `IN_ONESHOT`, `IN_ONLYDIR` (`ENOTDIR`), `IN_MASK_CREATE` (`EEXIST`), `rm_watch` (`IN_IGNORED`, then `EINVAL`); `FIONREAD`, `EINVAL` for a buffer too small, names padded to 16 bytes, poll and a blocking read woken by another thread, `EINVAL`/`EBADF` for other descriptors; a file removed while open (`IN_DELETE_SELF` at its last close); the limits: 128 instances (`EMFILE`), 8192 watches (`ENOSPC`), 16384 events then one `IN_Q_OVERFLOW`; one watch for a pseudo file named twice |
 | `vmtest` | demand paging (a 64 MiB mapping costs nothing until touched), `SIGSEGV` on read-only and `PROT_NONE` pages with contents kept, split areas after a partial `munmap`, NX and the JIT pattern (1 GiB `PROT_NONE` reservation, write code, `mprotect` to executable, call it), commit limit and `MAP_NORESERVE` (also a 4 GiB reservation made writable and executable at once, as V8's code range, and forked counting only its touched pages, while the same without it is `ENOMEM`; 40 rounds of partial `munmap`, `MADV_DONTNEED`, `mremap`, `mprotect`, `fork` with copy-on-write on both sides and `exec` leave `Committed_AS` unchanged; a read-only area read in completely becomes writable with nothing left to commit), `mremap` in place and moving, `MADV_DONTNEED`, shared vs. private memory across `fork`, lazy file mappings and `SIGBUS` beyond the end, `MAP_FIXED_NOREPLACE`, stack growth to 4 MiB and overflow beyond 8 MiB, nothing mapped at or above 64 TiB (fixed mappings fail, hints and the stack stay below), the Linux server's memory out of the program's reach and its kernel calls `ENOSYS` for a program |
 | `smptest` | CPU count and affinity (pinning to every CPU, empty masks), the scheduling policy (`SCHED_OTHER`, priority 0, for the caller and another thread, `ESRCH`, `EINVAL`), parallel speed-up of CPU-bound processes, `fork`/`exit`/`wait` on every CPU at once, 5000 pipe round trips between two CPUs, signals to a process running on another CPU, timers on time while a program floods the console with palette changes on the same CPU; nice values: `getpriority`/`setpriority` (clamped, inherited by a child, in `/proc/<pid>/stat`, `PRIO_PGRP`, `PRIO_USER`, `ESRCH`, `EINVAL`), and the CPU shares they give two processes pinned to one CPU (nice 19 against 0 a small one, -5 about three times 0's) while a sleeper elsewhere still wakes; nice -1 against 0, a process outside the tree `ESRCH`, the lateness of a sleeper next to a nice -20 loop on its CPU; a loop that ran alone for seconds sharing at once with a second one |
 | `nettest` | TCP to an echo service through QEMU, `ECONNREFUSED`, `listen`/`accept` over loopback with a forked client, EOF after the peer closed, non-blocking `accept` and `connect` with `poll` and `SO_ERROR`, `EINTR` in a blocking `recv`, UDP over loopback, raw ICMP echo to the gateway and over loopback, source address for off-subnet destinations, overflowing message vectors (`EINVAL` for a negative iovec length, `EMSGSIZE` for a datagram over 65507 bytes), `AF_INET6` rejected; `EADDRINUSE` for a listener's port (also the wildcard address, with `SO_REUSEADDR`), `bind` to port 0 taking a port at once, `EINVAL` for binding twice; the server's sockets (R7b): 8 MiB through a loopback connection in pieces of many sizes, checked byte by byte in another process; `MSG_DONTWAIT`, `FIONREAD`, `MSG_PEEK`, `MSG_WAITALL` across two writes; `SO_RCVTIMEO` (`EAGAIN` after the time, read back), `SO_SNDTIMEO` (a send to a reader that never reads returns what went, then `EAGAIN`), `SIOCOUTQ`; half-close with `SHUT_WR` (end of file and `POLLRDHUP` for the peer, the other way still open, `EPIPE` and `SIGPIPE` for a write after it); a peer that closed: writes end in `EPIPE` with one `SIGPIPE`, none with `MSG_NOSIGNAL`, `POLLHUP`; a refused nonblocking connect (`SO_ERROR` `ECONNREFUSED`, once); `TCP_NODELAY` off by default and settable, `SO_KEEPALIVE`, `SO_TYPE`/`SO_PROTOCOL`/`SO_DOMAIN`, `ENOPROTOOPT`, `ENOTCONN` for `getpeername` and `recv` unconnected; `accept4`'s flags; an accepted connection's port (`EADDRINUSE` without `SO_REUSEADDR`, a new listener with it); of two sockets sharing a port by `SO_REUSEADDR` only one listens (`EADDRINUSE` for the other's `listen`); a UDP port shared only with `SO_REUSEADDR` on both; `EPOLLET` edges per arrival; `EINTR` in a blocking `accept`; UDP `MSG_TRUNC` and `FIONREAD`, a connected UDP socket (`getpeername`, `send`, `AF_UNSPEC` disconnecting: `EDESTADDRREQ`); `socketpair(AF_INET)` is `EOPNOTSUPP` |
@@ -1167,7 +1181,7 @@ Each of these programs and scripts lives in the root filesystem and runs inside 
 | `writebacktest` | stores through a shared mapping of a `/data` file: reading makes nothing dirty, a store makes its page dirty (`Dirty` in `/proc/meminfo`), `msync`, `fsync` and `fdatasync` write it back (also a page stored to again afterwards), `write` and a store in one page both arrive, the server's write-back takes a store to the disk on its own after `munmap`, a store of a process that exited, dirty pages surviving reclaim, truncation of a file with dirty pages, 1 MiB of stores; `O_DIRECT` reads as the view of the disk |
 | `mmaptest /data` | all of `mmaptest` on a disk file |
 | `ttytest` | the Linux server's terminals through pseudo-terminals: `/dev/ptmx`, `TIOCGPTN`, a locked slave (`EIO`), `unlockpt`, `TIOCGPTPEER`, devpts's nodes (136, n) and its refusals (`EACCES`, `EPERM`), the node gone with the master; `/dev/console` and `/dev/tty`; termios defaults and round trips (also through the master); canonical reads a line at a time with echo, partial lines, `FIONREAD`, erase/kill/werase and their echo, `^D`, `^V`, `TIOCSTI`; `ONLCR`, `XTABS`, no `OPOST`; `VMIN`/`VTIME` (0/0, 0/2, 3/0 with poll, 5/1's inter-byte timer); raw input, leaving canonical mode; `^S`/`^Q` and `tcflow`; poll and `tcflush`; window sizes; the master's `EIO` and `POLLHUP` after the slave's close; a session with the slave as controlling terminal: `^C`, `^\`, `^Z` and `SIGWINCH` for the foreground job, `SIGTTIN` and `SIGTTOU` (`TOSTOP`, `tcsetattr`) for background jobs, `EIO` with `SIGTTIN` ignored, `TIOCSPGRP`'s `EPERM`/`ESRCH`, `TIOCSCTTY`/`TIOCNOTTY`; the terminal freed when its session's leader ends; a hangup by the master's close (`SIGHUP`, end of file, `EIO`); `O_PATH` and `O_DIRECTORY` on device nodes; echoes of console input not waiting behind a process flooding the console; echoes into a master that never reads bounded, `TIOCSTI` on a full master, `TIOCSIG`'s signals; a waiting canonical read taking the half line when the mode goes raw, two readers each getting a whole line, a failed slave open leaving the master usable; an orphaned stopped job getting `SIGHUP` and `SIGCONT` |
-| `datatest` | `/data` in the Linux server: reads, writes, `lseek`, `stat`, `fsync` without a call passed through (`legacy_calls` of `/proc/self/counters`), its own device and ext2's `statfs`; two descriptors, a mapping and another process's mapping sharing one page cache; `write` leaving dirty pages, `fsync` writing them (`Dirty` back, the data on the device: `O_DIRECT`), an `O_SYNC` write clean when it returns, a write past the end and its hole, `sync`; truncation with dirty mapped pages (`SIGBUS` beyond, the tail zero, the size on the device); 100 children storing into an inherited mapping while a thread writes it back, every store on the device; 400 forks racing a truncation of a mapped file, every child getting `SIGBUS` beyond the new end; 8 processes reading one uncached file at random offsets at once; 4 threads writing parts of one file; a 32 MiB file written and read back with 12 MiB left to cache it; a read while dirty pages fill memory; a full disk: `write` itself failing with `ENOSPC` (the space promised as data enters the cache), everything accepted on the device after `fsync`, `statfs` counting promised space, a store into a hole raising `SIGBUS`, and going through once there is room again |
+| `datatest` | `/data` in the Linux server: reads, writes, `lseek`, `stat`, `fsync`, its own device and ext2's `statfs`; two descriptors, a mapping and another process's mapping sharing one page cache; `write` leaving dirty pages, `fsync` writing them (`Dirty` back, the data on the device: `O_DIRECT`), an `O_SYNC` write clean when it returns, a write past the end and its hole, `sync`; truncation with dirty mapped pages (`SIGBUS` beyond, the tail zero, the size on the device); 100 children storing into an inherited mapping while a thread writes it back, every store on the device; 400 forks racing a truncation of a mapped file, every child getting `SIGBUS` beyond the new end; 8 processes reading one uncached file at random offsets at once; 4 threads writing parts of one file; a 32 MiB file written and read back with 12 MiB left to cache it; a read while dirty pages fill memory; a full disk: `write` itself failing with `ENOSPC` (the space promised as data enters the cache), everything accepted on the device after `fsync`, `statfs` counting promised space, a store into a hole raising `SIGBUS`, and going through once there is room again |
 | `bash -c` (in `runtests.sh`) | Bash itself: functions, arrays, arithmetic, `[[ ]]`, a pipe into `grep`, a here-document into a `/tmp` file read back, a subshell's `cd`, command substitution |
 | `sh /etc/test.sh` | files, pipes, `cd`, `mkdir`/`touch`/`rm`, rename cycles via symlinks, the tmpfs size limit |
 | `fstest` | descriptor access modes (`EBADF` on read-only/write-only fds), `O_NOFOLLOW` on symlinks, unlinked-but-open files (kept until closed, never shared with new files), ext2 size limits, overflowing `mmap` offsets; `preadv2`/`pwritev2` and their flags (also in `lxtest` on `/tmp`): the offset -1 as the file position, a positional write to an `O_APPEND` descriptor appending as on Linux, `RWF_APPEND`/`RWF_NOAPPEND`, `EOPNOTSUPP`/`EINVAL` for unsupported or contradicting flags, `ESPIPE` on pipes (`userspace/rwtest.h`) |

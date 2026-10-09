@@ -1,6 +1,6 @@
 # The Linux server: system calls in restricted mode
 
-Status: accepted; phase R1 implemented (the shared region uses PML4 slot 128, 512 GiB). Decisions: ADR 0001-0004, 0007 (terminals), 0008 (sockets), 0009 (the descriptor table), 0010 (processes and signals).
+Status: accepted; phases R1-R9 implemented (the shared region uses PML4 slot 128, 512 GiB): the kernel implements no Linux system call. Decisions: ADR 0001-0004, 0007 (terminals), 0008 (sockets), 0009 (the descriptor table), 0010 (processes and signals), 0011 (the kernel without Linux).
 
 ## Goal
 
@@ -118,18 +118,21 @@ processes, threads, memory objects and the services it uses.
 | memory objects | `mo_create(size)`, `mo_create_paged(size, key)` with `pager_wait` and `mo_supply` for the pager thread, `mo_read`/`mo_write` (`fork` clones a whole address space with `proc_create`, R8), `mo_physical` for DMA/MMIO (drivers) |
 | mappings | `map(space, addr, mo, offset, len, prot, flags)`, `unmap`, `protect` in a process's restricted region (the server keeps the Linux VMAs; the kernel keeps page tables) |
 | waiting | `futex_wait(addr, value, deadline)`, `futex_wake`, `clock_get`; `server_wait` for any of several words (poll, select, epoll; R6e) |
-| descriptor tables | the server's, per thread as its process model shares them (R6e, R8); the kernel's own open files by handle (`inode_open`, `kfile_call`; R6e) |
+| descriptor tables | the server's, per thread as its process model shares them (R6e, R8); the kernel has none (R9) |
 | IPC | today's services, and shared-memory rings for the I/O paths (separate design) |
 | devices | interrupts, I/O ports, PCI functions, DMA areas (as today; IOMMU per `iommu.md`) |
 | console | the framebuffer console and keyboard as a raw device the server's tty layer drives, held by one instance at a time (ADR 0004; `console_read`, `console_write`, `console_info`, `EVENT_CONSOLE`; R6d) |
+| the last mechanisms (R9) | `futex_wait`, `futex_wake`, `futex_requeue` on the program's memory; `thread_fs` (the FS base); `clock_set`; `power`; `file_pages` (tmpfs's statfs) |
 
-What leaves the kernel over the migration: `process/syscall.rs`'s dispatch, `sys_*.rs`,
-`signal.rs`, `epoll.rs` and `poll.rs` (gone with R6e), `prctl.rs`, `exec.rs`, `loader.rs`, `elf.rs`, `clone.rs`
-and `exit.rs` (as Linux semantics), `fs/` (VFS, tmpfs, page cache, remote filesystems, cpio),
-`net.rs`, `drivers/tty.rs`, procfs's data source. What stays: `address_space.rs` (as memory
-objects and mappings), `sched.rs`, `task.rs` (threads), `futex.rs`, `ipc.rs`, `irq.rs`,
-`tlb.rs`, `memory/`, `interrupts/`, `smp.rs`, timers, time, drivers for console and keyboard
-input, PCI and ACPI.
+What left the kernel over the migration (the last of it with R9, "Removing the
+pass-through" below): `process/syscall.rs`'s Linux dispatch, `sys_*.rs`, `signal.rs`,
+`epoll.rs` and `poll.rs` (gone with R6e), `prctl.rs`, `clone.rs`, Linux's `execve` and
+`wait4`, the VFS and tmpfs (`fs/`, but the page cache, which stays as the memory objects, and a
+reader of the boot image), `net.rs`, `drivers/tty.rs`, procfs's data source. What stays:
+`address_space.rs` (as memory objects and mappings), `sched.rs`, `task.rs` (threads),
+`futex.rs`, `ipc.rs`, `irq.rs`, `channel.rs`, `tlb.rs`, `memory/`, `interrupts/`, `smp.rs`,
+timers, time, the loader and `exec.rs` for the native servers, drivers for console and
+keyboard input, PCI and ACPI.
 
 ### Priority and the server's locks
 
@@ -187,7 +190,8 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
    the file through a bridge from the kernel's descriptor table (`kfile_object(fd)`) while
    files were the kernel's (since R6e it maps the handle of the kernel's open file that the
    server's descriptor table holds). `brk` came with the process model (R8), which owns the
-   break. The kernel's own `mmap` stays for its native servers until R9.
+   break. (The kernel's own `mmap` stayed for its native servers until R9, which gave them
+   `mo_map` too.)
 5. **R5 — Time and sleeping** (done, with the server's direct access to program memory: faults
    resolved as the program's, a registered fixup for EFAULT): the clocks, `nanosleep`, `clock_nanosleep`, `gettimeofday`,
    `times` over the kernel's clock and deadline waits (interruptible by signals, which are
@@ -227,7 +231,7 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
        first, the kernel's tree, reached through handles on its inodes (lookup, create,
        unlink, rename, readlink, stat, open into a descriptor, exec). The same bridge served
        `/data` until c3 and `/proc` and `/sys` until I/O rings step 5 ("/proc and /sys"
-       below); it still serves `/dev` until the server makes its own.
+       below), and `/dev` until R9 made it the server's own.
      - **c2c — tmpfs in the server** (done): the server's own tmpfs, with files as file objects
        (read, write, `mmap` and exec without the kernel's VFS; ETXTBSY through holds the kernel
        reports when let go; a thread about to answer ETXTBSY first waits for the releases
@@ -457,9 +461,11 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
    `signal_thread`, `thread_ids`, `proc_ids`, `signal_group`, `signal_state`, `fs_record`,
    `exec_target`, `EVENT_SESSION_END`, `EVENT_RELEASE` of records) and the kernel's
    `kill_orphaned_pgrp` go: the server answers from its own tables, scoped to its instance.
-9. **R9 — Remove the pass-through.** `legacy_syscall` and the kernel's Linux code go; the
-   kernel implements no system call of Linux. Programs that are not Linux (the servers) keep
-   the kernel's own system call interface.
+9. **R9 — Remove the pass-through** (done; ADR 0011; see "Removing the pass-through" below).
+   `legacy_syscall` and the kernel's Linux code went; the kernel implements no system call
+   of Linux. Programs that are not Linux (the native servers) keep the kernel's own system
+   call interface (`oxrt::sys`, numbered as `restricted`'s where a call is the same
+   mechanism).
 
 The order changed after R2 (files were R3, memory semantics R6): every piece of Linux
 semantics needs the server's runtime first, and memory semantics is the smallest piece that
@@ -498,8 +504,8 @@ generation). Processes are handles in the instance's table.
 **Kicks.** `thread_kick` sets the thread's kick flag (Linux's `TIF_SIGPENDING`) and gets it
 into its server: a thread running its program returns from `restricted_enter` with
 `REASON_KICK` at once (an IPI if it runs on another CPU), a thread in an interruptible wait (a
-server futex with `FUTEX_INTERRUPTIBLE`, `sleep_until`, a pass-through call's wait in the
-kernel) ends it with EINTR. The flag stays set until the thread enters restricted mode again:
+server futex with `FUTEX_INTERRUPTIBLE`, `sleep_until`, `server_wait`, a futex wait on the
+program's memory) ends it with EINTR. The flag stays set until the thread enters restricted mode again:
 `restricted_enter` with the flag set returns `REASON_KICK` without entering the program (and
 clears it). So no signal is lost between the server's last look and the program running, and
 every wait after a kick ends at once, as Linux's `signal_pending`. A thread the server or the
@@ -508,8 +514,7 @@ locks yield instead; a copy of the server's whose page wait ends so takes its fi
 and its next `restricted_enter`, the one point where the server holds no lock of its own,
 returns `REASON_EXIT`: the server ends the thread there (`process::exit`, on a stack that
 holds nothing more), letting go of its descriptor table first. A dying thread that enters
-again is ended by the kernel itself. A dying caller makes no thread (`thread_create`: EINTR),
-and the kernel's Linux code refuses the process and signal calls a server might pass through.
+again is ended by the kernel itself. A dying caller makes no thread (`thread_create`: EINTR).
 
 **Faults and exceptions** the kernel cannot resolve (no mapping, a protection violation, a
 read beyond a file's end, `#DE`, `#UD`, `#BP`, `#GP`, `#XM`, ...) return from
@@ -658,8 +663,9 @@ for its group (`tty`), a write to a pipe or socket without a reader SIGPIPE for 
 
 `/proc/<pid>` (also for a thread's tid, as Linux), `/proc/self` and `/proc/thread-self` are
 the server's, from its tables and the kernel's `proc_info`/`thread_info`: `stat`, `statm`,
-`status`, `cmdline`, `comm`, `exe`, `cwd`, `task/<tid>/...`, and oxidenix's `counters` (the
-calls the server passed through for the process). The system's files (`stat`, `meminfo`,
+`status`, `cmdline`, `comm`, `exe`, `cwd`, `task/<tid>/...` (oxidenix's `counters`, the
+calls the server passed through for the process, went with the pass-through in R9). The
+system's files (`stat`, `meminfo`,
 `uptime`, `loadavg`, `cpuinfo`, `mounts`, `counters`, `sys/`) stay procfs's.
 
 ### Calls that name a pid
@@ -909,17 +915,13 @@ the kernel keeps descriptor tables for its native servers only. Decisions in ADR
 
 ### The kernel's files
 
-What remains of the kernel's files for a Linux program are the inodes of the kernel's tree
-(its `/dev`: the nodes null and zero, the directory; `/proc` and `/sys` are the server's since
-I/O rings step 5): the inverse of the placeholders. `inode_open` returns a handle on the kernel's open
-file description (no descriptor), which the server's description holds (`kfile.rs`); its calls
-are the kernel's with the program's buffers (`kfile_call`: read, write, the positional and
-vectored forms, lseek, getdents64, ioctl, fsync, ftruncate; fstat and fstatfs into the
-server's memory), mmap maps the handle, and *at calls and fchdir reach its inode
-(`kfile_inode`). The description's status flags are the server's; the kernel's file gets
-O_APPEND and O_NONBLOCK too, for its own operations. These files are always ready (as
-Linux's regular files: epoll refuses them with EPERM), so poll, select and epoll need nothing
-from the kernel for them.
+Until R9 what remained of the kernel's files for a Linux program were the inodes of the
+kernel's tree (its `/dev`: the nodes null and zero, the directory; `/proc` and `/sys` are the
+server's since I/O rings step 5): the inverse of the placeholders. `inode_open` returned a
+handle on the kernel's open file description, which the server's description held
+(`kfile.rs`); its calls were the kernel's with the program's buffers (`kfile_call`), mmap
+mapped the handle, and *at calls and fchdir reached its inode (`kfile_inode`). R9 made `/dev`
+the server's own tmpfs and removed all of it: every file a program opens is the server's.
 
 ### Readiness and waiting
 
@@ -945,7 +947,7 @@ from the kernel for them.
   kernel call that wakes it only then, and an epoll instance reports its own readiness only
   while something watches it; a description that is always ready has no watch at all.
   Whether a file is always ready is decided per kind of file (`File::always_ready`: tmpfs
-  and /data files, null and zero, the kernel's files, /proc and /sys); a file of such a kind
+  and /data files, null and zero, /proc and /sys); a file of such a kind
   with readiness of its own (a pollable /proc file, as Linux's `/proc/self/mounts`) would need
   it per node, with a watch.
 - **Signals**: interrupted with nothing ready, poll answers `ERESTART_RESTARTBLOCK`
@@ -979,8 +981,8 @@ The placeholders (`ServerFile`, `kfd_install`, `kfd_lookup` and its pins, `kfd_r
 flight (`kfile_object`, `KFILE_INFLIGHT`, `kfd_install_file`, `kfile_info`, `EVENT_INFLIGHT`),
 `EVENT_CLOSED` and `legacy_syscall`'s list of closed files, and the kernel's epoll, poll and
 select with the wait queues' callbacks. Calls on descriptors no longer pass through to the
-kernel; the kernel's descriptor tables, open files, pipes and eventfds stay for its native
-servers until R9.
+kernel; the kernel's descriptor tables, open files, pipes and eventfds stayed for its native
+servers until R9 (which gave them a console log call instead and removed them).
 
 ## /proc and /sys (I/O rings step 5)
 
@@ -995,7 +997,7 @@ servers until R9.
   through its scratch grant. Nothing of it is cached; a procfs that died is started again
   for a new channel and serves the same inodes.
 - **The server's own part**, each process's: `/proc/<pid>` with `stat`, `statm`, `status`,
-  `cmdline`, `comm`, `exe`, `counters` (oxidenix's), `mounts`, `task/<tid>/{stat,statm,
+  `cmdline`, `comm`, `exe`, `mounts`, `task/<tid>/{stat,statm,
   status,cmdline,comm}`, `fd/<n>`, `cwd` and `root`; `/proc/self`, `/proc/thread-self` and
   `/proc/mounts` (a link to `self/mounts`), merged into procfs's root listing. The server
   knows its mounts, its descriptors (any process's table, R6e) and its processes (R8:
@@ -1041,7 +1043,7 @@ reached. Opening it opens the file again where Linux does: a pipe gets a new end
 reading, writing or both, as `fifo_open` of a pipe, its readiness reported once its
 description is installed; bash's process substitution through `/dev/fd/N` uses it),
 everything else is ENXIO. `/dev/fd`, `/dev/stdin`, `/dev/stdout` and
-`/dev/stderr` are links into `/proc/self/fd` (in the kernel's `/dev`, as udev makes them).
+`/dev/stderr` are links into `/proc/self/fd` (in the server's `/dev`, as udev makes them).
 Until the process model is the server's, only a process's own
 `fd`, `cwd` and `root` are shown: another process's are EACCES (Linux's answer for another
 user's), its `fd` directory unopenable (mode 0500). "Own" is the caller's process (any of
@@ -1055,6 +1057,104 @@ program's path.
 **The kernel** keeps no part of `/proc`: its static `/proc` of the early boot, its mount
 table, its `RemoteFs` (IPC requests to procfs in `fsproto`) and its procfs mounts are gone;
 procfs only gets started (and restarted on the next channel, ADR 0006).
+
+## Removing the pass-through (R9)
+
+Until R9 the server handed what it did not implement back to the kernel (`legacy_syscall`),
+which ran its own Linux implementation (`syscall.rs`'s `dispatch_linux`, `sys_file.rs`,
+`sys_mem.rs`, `sys_time.rs`, `signal.rs`, `clone.rs`, `exec.rs`, `exit.rs`'s `wait4`,
+`prctl.rs`, the VFS of `fs/`) on the program's registers. The native servers (diskfs, netd,
+procfs, ringtest) used the same table, with Linux's numbers.
+
+### Inventory
+
+Measured on main (2ff1ef7) by counting every number that reached the kernel through
+`legacy_syscall`, and every call of a native server, over the full self-test suite (UEFI)
+and the twelve Node.js smoke tests (`nodejs-slim-static` 24.21 from the Nix store):
+
+| number | call | self-tests | Node.js | what it needed |
+|---|---|---|---|---|
+| 24 | `sched_yield` | 20 | 0 | lxtest's `TEST_PASS_THROUGH` only (the server has its own) |
+| 63 | `uname` | 10 | 23 | nothing of the kernel's |
+| 99 | `sysinfo` | 3 | 0 | the system's record (`system_info`) |
+| 158 | `arch_prctl` | 46311 | 52 | the FS base, which stays in the CPU while the server runs |
+| 202 | `futex` | 15472 | 221729 | waiting by the kernel's keys on program memory |
+| 227 | `clock_settime` | 4 | 0 | setting the wall clock |
+| 302 | `prlimit64` (not RLIMIT_NOFILE) | 1 | 154 | nothing (the limits the server holds to) |
+| 309 | `getcpu` | 4 | 0 | the CPU (`thread_info`) |
+| 318 | `getrandom` | 18 | 13 | the kernel's generator (`random`) |
+
+Nothing else passed through. Of the kernel's table, `settimeofday` (164), `reboot` (169),
+`ioperm` (173) and `getrlimit`/`setrlimit` for limits other than RLIMIT_NOFILE were not
+exercised and not the server's either; they became the server's too. The native servers
+called `write` (to fd 1 and 2: their messages), `mmap`, `mprotect` and `munmap` of anonymous
+memory, `futex` (wait, wake, requeue), `sched_yield`, `getpid`, `execve` (ringtest, of
+itself), `ioperm`, `clock_gettime`, `exit_group` and `getrandom`, besides the kernel's own
+1000-1005 and 1068-1075.
+
+What existed in the kernel only for Linux programs (or for natives through Linux's
+interface): the Linux dispatch and its helpers (uname, reboot, itimers, prlimit,
+getrandom, arch_prctl, execve's argument copy) in `syscall.rs`; `sys_file.rs` (file calls on
+the kernel's descriptor tables and `kfile_call`); `sys_mem.rs`'s brk and mmap of descriptors;
+`sys_time.rs`'s Linux clock calls, getrusage and times; `signal.rs` (signals, handlers,
+frames, sigreturn, stops, interval timers); `clone.rs` (clone, fork, vfork,
+set_tid_address); `exec.rs`'s execve by path with `de_thread`; `exit.rs`'s wait4 and its
+relations (parents, process groups, sessions, PR_SET_PDEATHSIG); `prctl.rs`; `query.rs`'s
+sysinfo; `linux_inode.rs` (the tree by handle); the VFS (`fs/mod.rs`: the tree, its device
+nodes, cpio unpacking into it; `fs/file.rs`: open files, pipes, eventfds); the descriptor
+tables and working directories in `task.rs` and `mod.rs`; the process-group, session,
+affinity and getcpu calls in `mod.rs`; `timer.rs`'s interval timers; the per-process
+`legacy_calls` counter and `/proc/<pid>/counters`. All of it went: the kernel's sources lost
+5349 lines and gained 708 (21876 to 17527; without comments and blank lines 16625 to 13083).
+
+### Design
+
+- **The calls left** are the server's (`futex.rs`, `system.rs`, `time.rs`, `ids.rs`): futex
+  decodes Linux's operations, reads the timeouts and restarts as Linux (a wait without a
+  timeout ERESTARTSYS, one with a timeout through restart_syscall to the same deadline, a new
+  `RestartBlock::Futex`), over `futex_wait`/`futex_wake`/`futex_requeue`, which key the word
+  as the kernel always did (address space and address, or a shared mapping's object and
+  offset) and wait interruptibly (a kick). `arch_prctl` (ARCH_SET_FS, ARCH_GET_FS) uses
+  `thread_fs`; `clock_settime` and `settimeofday` `clock_set`; `reboot` `power` (every
+  instance writes its caches back first, as the kernel's reboot did); `sysinfo` the system's
+  record (`procs` the instance's threads); `getcpu` `thread_info`; `getrandom` `random` 256
+  bytes at a time, ending early for a signal as Linux beyond the first piece; `uname` is the
+  server's alone; `ioperm` and `iopl` EPERM (the tree has no ports). The resource limits but
+  RLIMIT_NOFILE are answered from Linux's defaults the server holds to (an 8 MiB stack, no
+  core files, 4096 queued signals); a new limit is checked and accepted, not kept (as the
+  kernel's prlimit did; keeping them per process needs the process table's records).
+- **The kernel's clocks** have the kernel's ids (`CLOCK_WALL`, `CLOCK_MONO`,
+  `CLOCK_PROCESS_CPU`, `CLOCK_THREAD_CPU`); Linux's ids and their aliases map to them in the
+  server.
+- **/dev** is a tmpfs of the server's (`namespace::dev`, mounted as devtmpfs): console, tty,
+  ptmx, null and zero as device nodes (their drivers the server's, by number, ADR 0007),
+  `fd`, `stdin`, `stdout`, `stderr` as links into `/proc/self/fd`, `pts` (devpts) and `shm`.
+  Each of the server's tmpfs mounts is a filesystem of its own, as Linux's: the root (device
+  0x1a), `/dev` (0:5) and devpts (0:0x18) report their own device, and a rename between them
+  is EXDEV. tmpfs's statfs comes from the kernel's count of file object pages
+  (`file_pages`).
+- **The native servers' interface** is the kernel's own (`kernel/src/process/native.rs`,
+  `oxrt::sys`): where a call is a mechanism the server uses too it has `restricted`'s number
+  and contract on the caller's own memory (`mo_map` of anonymous memory, `mo_unmap`,
+  `mo_protect`, the futex calls, `clock_read`, `yield`, `random`, `thread_exit`), and
+  `ioperm` (1006), `exec` (1007: the server's own program again, with new arguments; the
+  process is no server any more) and `log` (1008: text on the console) join IPC, interrupts,
+  DMA and the service's end of channels. A Linux number is ENOSYS for them.
+- **What the kernel keeps of a process**: a container of threads with an address space, its
+  CPU time and memory counts and its end (`kill.rs`: `GroupExit`, the kernel's kill of a whole
+  process for the monitor, memory running out, a native server's fault, a failed Linux
+  server; `interrupted` and `dying` for its waits). The kernel's own processes (the tree's
+  first process, the servers, the service processes) are its zombies until it reaps them;
+  wait statuses keep Linux's encoding. The kernel reads its programs from the boot image
+  (`fs::program`: a cpio lookup following the image's symlinks), unchanged since boot, so a
+  restarted server runs what it ran before without a copy.
+- **A call the server does not implement** is ENOSYS and said on the console
+  (`server_log`: "syscall N not implemented"), as the kernel said it before.
+
+lxtest's checks that counted passed-through calls became checks that nothing passes
+through (an unimplemented call is the server's ENOSYS, the test call that passed one through
+is gone) and of the calls R9 moved; fdtest's and ttytest's `/dev` checks hold for the server's
+`/dev`.
 
 ## Decisions taken in the review
 
@@ -1070,5 +1170,9 @@ procfs only gets started (and restarted on the next channel, ADR 0006).
   address space in one call, the ELF loader is the server's, and a tree's first process
   starts in the server (ADR 0010).
 - The descriptor table is the server's, shared as its process model decides (R8; until then
-  the kernel's clone, with records), the kernel's files are held by handle, readiness goes
-  through the server's watch lists over one kernel wait for any of several words (ADR 0009).
+  the kernel's clone, with records), the kernel's files were held by handle (until R9),
+  readiness goes through the server's watch lists over one kernel wait for any of several
+  words (ADR 0009).
+- The kernel implements no Linux system call: the last calls became the server's over narrow
+  mechanisms, /dev the server's tmpfs, the native servers got the kernel's own numbering and
+  the kernel lost its VFS, descriptor tables, signals and Linux process calls (ADR 0011).

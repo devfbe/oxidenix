@@ -342,6 +342,7 @@ kernel that handle them.
 - `docs/decisions/0008-socket-state-in-the-channel.md` ADR 0008: Internet sockets: shared control blocks, byte rings, answers at once
 - `docs/decisions/0009-descriptor-table-in-the-linux-server.md` ADR 0009: The descriptor table in the Linux server: per-table records until R8, the kernel's files by handle, readiness through the server's watches
 - `docs/decisions/0010-processes-and-signals-in-the-linux-server.md` ADR 0010: Processes and signals in the Linux server: containers, kicks, frames by the server
+- `docs/decisions/0011-a-kernel-without-linux.md` ADR 0011: A kernel without Linux: the last calls in the server, natives on the kernel's own interface
 - `docs/design/io-rings.md` I/O rings: the data plane between the Linux server and the device servers
 - `docs/design/iommu.md` DMA isolation with an IOMMU
 - `docs/design/linux-server.md` The Linux server: system calls in restricted mode
