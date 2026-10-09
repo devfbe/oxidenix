@@ -76,9 +76,10 @@ time) and so may anything on the network.
   a port is in use (`EADDRINUSE` at bind, as on Linux; ports are never shared across
   instances, so the 4-tuple check of a connect only ever looks at the instance's own
   connections and cannot reveal whom another one talks to); nothing of other instances'
-  peers, sequence numbers, buffers or traffic. Ephemeral ports follow RFC 6056's third
-  algorithm (a keyed hash of the destination, the key from the kernel's generator, plus a
-  counter; a random start for a bind to port 0) and TCP's initial sequence numbers RFC 6528
+  peers, sequence numbers, buffers or traffic. Ephemeral ports follow RFC 6056's fourth
+  algorithm (a keyed hash of the destination, the key from the kernel's generator, plus one
+  of a table of counters chosen by a second keyed hash of the instance and the destination,
+  so no counter is shared between instances; a random start for a bind to port 0) and TCP's initial sequence numbers RFC 6528
   (a 4-microsecond clock plus a keyed hash of the 4-tuple), so neither reveals another
   instance's activity nor can anyone predict them. ICMP
   echo identifiers are netd's on the wire (`netring::EchoIds`): an instance gets the replies

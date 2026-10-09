@@ -1141,6 +1141,30 @@ pub fn icmp_key(packet: &[u8]) -> Option<IcmpKey> {
     }
 }
 
+/// Where netd's search for an ephemeral port starts (an offset into the
+/// range), for `owner`'s connection to `addr`:`port`, by RFC 6056's
+/// fourth algorithm: a keyed hash of the destination (`port_key`) plus one
+/// of `table`'s counters, chosen by a second keyed hash (`table_key`) of
+/// the instance and the destination, and moved on. So ports are
+/// unpredictable without the keys, successive connections to one
+/// destination get different ports, and one instance's connections move
+/// no counter another instance's choice depends on (except by a
+/// collision of the second hash, which nobody can aim at).
+pub fn port_start(port_key: &[u8; 16], table_key: &[u8; 16], table: &mut [u32], owner: u64, addr: u32, port: u16, tcp: bool) -> u32 {
+    let mut data = [0u8; 15];
+    data[..4].copy_from_slice(&addr.to_be_bytes());
+    data[4..6].copy_from_slice(&port.to_be_bytes());
+    data[6] = tcp as u8;
+    data[7..].copy_from_slice(&owner.to_le_bytes());
+    let offset = csprng::siphash(port_key, &data[..7]) as u32;
+    if table.is_empty() {
+        return offset;
+    }
+    let index = csprng::siphash(table_key, &data) as usize % table.len();
+    table[index] = table[index].wrapping_add(1);
+    offset.wrapping_add(table[index])
+}
+
 /// How many bytes a ring holds between a consumer and a producer
 /// position, None if the producer is more than `size` ahead (or behind:
 /// a protocol violation).

@@ -731,3 +731,25 @@ fn giving_back_more_than_held_is_caught() {
     b.charge(1, 10).unwrap();
     b.uncharge(1, 11);
 }
+
+#[test]
+fn ephemeral_ports_follow_rfc6056s_fourth_algorithm() {
+    let (k1, k2) = ([1u8; 16], [2u8; 16]);
+    let mut table = [0u32; 1024];
+    // Successive connections to one destination move on.
+    let a = port_start(&k1, &k2, &mut table, 1, 0x0a00_0202, 80, true);
+    let b = port_start(&k1, &k2, &mut table, 1, 0x0a00_0202, 80, true);
+    assert_eq!(b, a.wrapping_add(1));
+    // Another instance's connections to the same destination move a
+    // counter of their own, not this instance's: no cross-instance signal.
+    let mine = (0..table.len()).find(|&i| table[i] == 2).expect("instance 1's counter");
+    let before = table;
+    port_start(&k1, &k2, &mut table, 2, 0x0a00_0202, 80, true);
+    let changed: Vec<usize> = (0..table.len()).filter(|&i| table[i] != before[i]).collect();
+    assert_eq!(changed.len(), 1);
+    assert_ne!(changed[0], mine, "instance 2 has a counter of its own here");
+    assert_eq!(port_start(&k1, &k2, &mut table, 1, 0x0a00_0202, 80, true), b.wrapping_add(1));
+    // Other keys, another start.
+    let mut other = [0u32; 1024];
+    assert_ne!(port_start(&[3; 16], &k2, &mut other, 1, 0x0a00_0202, 80, true), a);
+}

@@ -164,9 +164,12 @@ const CHANNEL_IDLE: Duration = Duration::from_secs(10);
 /// statics.
 static ISN_KEY: [core::sync::atomic::AtomicU64; 2] = [const { core::sync::atomic::AtomicU64::new(0) }; 2];
 static PORT_KEY: [core::sync::atomic::AtomicU64; 2] = [const { core::sync::atomic::AtomicU64::new(0) }; 2];
+static PORT_TABLE_KEY: [core::sync::atomic::AtomicU64; 2] = [const { core::sync::atomic::AtomicU64::new(0) }; 2];
+/// The counters of RFC 6056's fourth algorithm (`Service::ephemeral`).
+const PORT_TABLE: usize = 1024;
 
 pub fn init_secrets() {
-    for key in [&ISN_KEY, &PORT_KEY] {
+    for key in [&ISN_KEY, &PORT_KEY, &PORT_TABLE_KEY] {
         let mut b = [0u8; 16];
         oxrt::getrandom(&mut b);
         key[0].store(u64::from_le_bytes(b[..8].try_into().expect("8 bytes")), SeqCst);
@@ -576,9 +579,9 @@ pub struct Service {
     closing: Vec<Closing>,
     /// netd's random numbers (seeded from the kernel's generator).
     rng: csprng::ChaCha,
-    /// RFC 6056's counter (`ephemeral`), and the ports in use as it finds
-    /// them (one bit per ephemeral port).
-    port_counter: u32,
+    /// RFC 6056's table of counters (`ephemeral`), and the ports in use as
+    /// it finds them (one bit per ephemeral port).
+    port_table: [u32; PORT_TABLE],
     port_scratch: [u64; 256],
     /// Who holds which port, for routing ICMP errors (`icmp_ports`; made
     /// room for at the start).
@@ -653,7 +656,7 @@ impl Service {
                 oxrt::getrandom(&mut seed);
                 csprng::ChaCha::new(seed)
             },
-            port_counter: 0,
+            port_table: [0; PORT_TABLE],
             port_scratch: [0; 256],
             tcp_owners: Vec::with_capacity(MAX_SMOLTCP),
             udp_owners: Vec::with_capacity(MAX_SMOLTCP),
@@ -863,6 +866,11 @@ impl Service {
             // Its echo identifiers are free again.
             self.echo.forget(chan.owner);
         }
+    }
+
+    /// The instance of channel `c`.
+    fn owner(&self, c: usize) -> u64 {
+        self.chans[c].as_ref().expect("a channel in use").owner
     }
 
     fn chan(&mut self, c: usize) -> &mut Chan {
@@ -1175,16 +1183,18 @@ impl Service {
         conflict
     }
 
-    /// A free ephemeral port: held by no TCP socket, or bound by no UDP one.
-    /// For a connection to `remote`, RFC 6056's third algorithm: a keyed
-    /// hash of the destination (`PORT_KEY`, secret) gives where the search
-    /// starts and a counter moves it on, so ports are unpredictable to
-    /// anyone (on the network or in another instance) and successive
-    /// connections to one destination do not reuse a port soon; for a bind
-    /// to port 0 (no destination yet), a random start (its first
+    /// A free ephemeral port for instance `owner`: held by no TCP socket,
+    /// or bound by no UDP one. For a connection to `remote`, RFC 6056's
+    /// fourth algorithm: a keyed hash of the destination (`PORT_KEY`)
+    /// gives where the search starts, and a counter moves it on, one of a
+    /// table chosen by a second keyed hash (`PORT_TABLE_KEY`) of the
+    /// instance and the destination, so ports are unpredictable to anyone,
+    /// successive connections to one destination do not reuse a port soon,
+    /// and no counter tells one instance about another's connections; for
+    /// a bind to port 0 (no destination yet), a random start (its first
     /// algorithm). The ports in use are marked in a bitmap kept for this
     /// (no allocation).
-    fn ephemeral(&mut self, tcp: bool, remote: Option<IpEndpoint>, sockets: &SocketSet<'static>) -> Result<u16, i64> {
+    fn ephemeral(&mut self, owner: u64, tcp: bool, remote: Option<IpEndpoint>, sockets: &SocketSet<'static>) -> Result<u16, i64> {
         let mut used = core::mem::replace(&mut self.port_scratch, [0; 256]);
         used.fill(0);
         self.for_each_holder(tcp, sockets, None, |h| {
@@ -1195,12 +1205,7 @@ impl Service {
         const RANGE: u32 = (u16::MAX - FIRST_EPHEMERAL) as u32 + 1;
         let start = match remote {
             Some(r) => {
-                let mut data = [0u8; 7];
-                data[..4].copy_from_slice(&bits(r.addr).to_be_bytes());
-                data[4..6].copy_from_slice(&r.port.to_be_bytes());
-                data[6] = tcp as u8;
-                self.port_counter = self.port_counter.wrapping_add(1);
-                (csprng::siphash(&secret(&PORT_KEY), &data) as u32).wrapping_add(self.port_counter)
+                netring::port_start(&secret(&PORT_KEY), &secret(&PORT_TABLE_KEY), &mut self.port_table, owner, bits(r.addr), r.port, tcp)
             }
             None => self.rng.u64() as u32,
         };
@@ -1223,7 +1228,7 @@ impl Service {
             Proto::Raw { .. } => return done(0),
         };
         let port = match at.port {
-            0 => self.ephemeral(is_tcp, None, sockets)?,
+            0 => self.ephemeral(self.owner(c), is_tcp, None, sockets)?,
             p if self.conflict(is_tcp, c, sock, p, addr, reuse, sockets) => return Err(EADDRINUSE),
             p => p,
         };
@@ -1263,7 +1268,7 @@ impl Service {
                 return Err(EADDRINUSE);
             }
         }
-        let port = if bound.is_none() { Some(self.ephemeral(true, None, sockets)?) } else { None };
+        let port = if bound.is_none() { Some(self.ephemeral(self.owner(c), true, None, sockets)?) } else { None };
         // The backlog's sockets beside the socket's own, as many as the
         // budget allows (a smaller backlog if it is short). They cost only
         // their place until a connection arrives.
@@ -1347,7 +1352,7 @@ impl Service {
                         l
                     }
                     // (An ephemeral port is held by no TCP socket at all.)
-                    None => IpListenEndpoint { addr: None, port: self.ephemeral(true, Some(remote), sockets)? },
+                    None => IpListenEndpoint { addr: None, port: self.ephemeral(self.owner(c), true, Some(remote), sockets)? },
                 };
                 // Its buffers come now (the SYN announces the window).
                 self.equip(handle, sockets)?;
@@ -1382,7 +1387,7 @@ impl Service {
                     return Err(EINVAL);
                 }
                 if peer.is_some() && !sockets.get::<udp::Socket>(handle).is_open() {
-                    let port = self.ephemeral(false, peer, sockets)?;
+                    let port = self.ephemeral(self.owner(c), false, peer, sockets)?;
                     sockets.get_mut::<udp::Socket>(handle).bind(port).map_err(|_| EADDRINUSE)?;
                 }
                 if let Proto::Udp { peer: p, .. } = &mut self.sock(c, sock)?.proto {
@@ -1503,7 +1508,7 @@ impl Service {
                 return Err(ENETUNREACH);
             }
             if !sockets.get::<udp::Socket>(handle).is_open() {
-                let port = self.ephemeral(false, Some(dest), sockets)?;
+                let port = self.ephemeral(self.owner(c), false, Some(dest), sockets)?;
                 sockets.get_mut::<udp::Socket>(handle).bind(port).map_err(|_| EADDRINUSE)?;
             }
             let socket = sockets.get_mut::<udp::Socket>(handle);
