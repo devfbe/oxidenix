@@ -379,15 +379,19 @@ struct Table {
     /// `inodes` (stale) that users still hold: its object's page requests
     /// must be answered (failed) too.
     keys: BTreeMap<u64, alloc::sync::Weak<DInode>>,
-    /// Inodes to look at for release (unlinked ones a user let go of).
-    check: Vec<u32>,
+    /// Inodes to look at for release (unlinked ones a user let go of), by number and object
+    /// key: the key names the very inode (a number may be another file's by the time it is
+    /// looked at: evicted, released and given to a new file meanwhile).
+    check: Vec<(u32, u64)>,
     /// Inodes whose last link went and that were not cached here then (`orphan`): released
     /// in diskfs by the next `reap` under `NAMES` alone, unless a lookup that was under way
     /// meanwhile cached one again (`found`: it is cached unlinked then, and goes as such).
-    /// Each entry is taken by exactly one of them: no inode is released twice.
+    /// Each entry is taken by exactly one of them: no inode is released twice. (By number:
+    /// diskfs holds an orphan's number for the server until its release, so it is no other
+    /// file's meanwhile.)
     orphans: Vec<u32>,
-    /// Dirty files (`EVENT_DIRTY`), by inode: since when.
-    dirty: BTreeMap<u32, u64>,
+    /// Dirty files (`EVENT_DIRTY`), by inode: its object's key (the very inode) and since when.
+    dirty: BTreeMap<u32, (u64, u64)>,
     /// The inodes' names (directory, name) as last found (`DInode::link`),
     /// indexed: renames and removals find what they move or drop by name.
     names: BTreeMap<(u32, String), u32>,
@@ -536,7 +540,7 @@ fn found(ino: u64, mode: u64, generation: u64) -> Result<Arc<DInode>, i64> {
             let i = i.clone();
             if orphaned {
                 i.unlinked.store(true, Ordering::SeqCst);
-                t.check.push(ino);
+                t.check.push((ino, i.key));
                 REAP.store(true, Ordering::Relaxed);
             }
             return Ok(i);
@@ -545,6 +549,8 @@ fn found(ino: u64, mode: u64, generation: u64) -> Result<Arc<DInode>, i64> {
             // (Its key stays: its users may still fault on its object.)
             i.stale.store(true, Ordering::Relaxed);
             t.dirty.remove(&ino);
+            // An armed test failure was the replaced inode's.
+            let _ = FAIL_MKWRITE.compare_exchange(ino as u64, 0, Ordering::Relaxed, Ordering::Relaxed);
         }
         None => {}
     }
@@ -572,7 +578,7 @@ fn found(ino: u64, mode: u64, generation: u64) -> Result<Arc<DInode>, i64> {
     });
     t.inodes.insert(ino, inode.clone());
     if orphaned {
-        t.check.push(ino);
+        t.check.push((ino, inode.key));
         REAP.store(true, Ordering::Relaxed);
     }
     if t.keys.len() > 2 * t.inodes.len() + 64 {
@@ -681,6 +687,7 @@ pub fn unlink(dir: &Arc<DInode>, name: &str, dir_only: bool) -> Result<Option<u3
     };
     drop(scratch);
     relink((dir.ino, name), None);
+    release_orphans();
     Ok(u32::try_from(gone).ok().filter(|&g| g != 0))
 }
 
@@ -705,6 +712,7 @@ pub fn rename(odir: &Arc<DInode>, oname: &str, ndir: &Arc<DInode>, nname: &str) 
     };
     drop(scratch);
     let moved = relink((odir.ino, oname), Some((ndir, nname)));
+    release_orphans();
     Ok((moved, u32::try_from(gone).ok().filter(|&g| g != 0)))
 }
 
@@ -721,16 +729,19 @@ fn orphan(ino: u64) {
     match t.inodes.get(&ino) {
         Some(i) => {
             i.unlinked.store(true, Ordering::SeqCst);
-            t.check.push(ino);
+            let key = i.key;
+            t.check.push((ino, key));
+            REAP.store(true, Ordering::Relaxed);
         }
+        // (Released by the unlinker right after its share of `NAMES`: `release_orphans`.)
         None => t.orphans.push(ino),
     }
-    REAP.store(true, Ordering::Relaxed);
 }
 
-/// The orphans not cached again meanwhile are released in diskfs (`reap`; with `NAMES`
-/// alone, so no lookup returns one meanwhile). A thread that cannot (it dies, or diskfs is
-/// away) leaves them to a later `reap`.
+/// The orphans not cached again meanwhile are released in diskfs (by the unlinker right after
+/// its share of `NAMES`, and by `reap`; with `NAMES` alone, so no lookup returns one
+/// meanwhile). A thread that cannot (it dies, or diskfs is away) leaves them to a later
+/// `reap`.
 fn release_orphans() {
     if TABLE.lock().orphans.is_empty() {
         return;
@@ -1480,12 +1491,16 @@ pub fn page(key: u64, offset: u64) {
 pub fn dirtied(key: u64) {
     // (A stale inode's pages cannot be written: nothing to list.)
     let Some(inode) = by_key(key).filter(|i| !i.stale.load(Ordering::Relaxed)) else { return };
-    TABLE.lock().dirty.entry(inode.ino).or_insert_with(now);
+    let mut t = TABLE.lock();
+    // (Listed for this very inode: one the number names no longer is not.)
+    if t.inodes.get(&inode.ino).is_some_and(|i| Arc::ptr_eq(i, &inode)) {
+        t.dirty.entry(inode.ino).or_insert_with(|| (inode.key, now()));
+    }
 }
 
 /// When the pager must look at the dirty files next (0: none dirty).
 pub fn next_deadline() -> u64 {
-    TABLE.lock().dirty.values().min().map_or(0, |&since| since + WRITEBACK_AGE)
+    TABLE.lock().dirty.values().map(|&(_, since)| since).min().map_or(0, |since| since + WRITEBACK_AGE)
 }
 
 /// The pager writes back the dirty files: those dirty for
@@ -1493,25 +1508,30 @@ pub fn next_deadline() -> u64 {
 /// pages are all written leaves the list (a store makes it dirty again:
 /// `EVENT_DIRTY`, which the pager takes after this).
 pub fn write_dirty(all: bool) {
-    let due: Vec<(u32, u64)> = {
+    let due: Vec<(u32, u64, u64)> = {
         let t = TABLE.lock();
         let horizon = now().saturating_sub(WRITEBACK_AGE);
-        let mut due: Vec<(u32, u64)> = t.dirty.iter().filter(|(_, &since)| all || since <= horizon).map(|(&i, &s)| (i, s)).collect();
-        due.sort_by_key(|&(_, since)| since);
+        let mut due: Vec<(u32, u64, u64)> =
+            t.dirty.iter().filter(|(_, &(_, since))| all || since <= horizon).map(|(&i, &(k, s))| (i, k, s)).collect();
+        due.sort_by_key(|&(_, _, since)| since);
         due
     };
-    for (ino, _) in due {
-        let inode = TABLE.lock().inodes.get(&ino).cloned();
+    for (ino, key, _) in due {
+        // The very inode listed (its number may be another's by now: then nothing to do).
+        let inode = TABLE.lock().inodes.get(&ino).filter(|i| i.key == key).cloned();
         let clean = match inode {
             Some(inode) => clean_after_writeback(&inode),
             None => true,
         };
         let mut t = TABLE.lock();
-        if clean {
-            t.dirty.remove(&ino);
-        } else if let Some(since) = t.dirty.get_mut(&ino) {
+        // Only the entry of that inode (not one another file of the number made since).
+        match t.dirty.get_mut(&ino) {
+            Some(e) if e.0 == key && clean => {
+                t.dirty.remove(&ino);
+            }
             // Failed or dirtied again meanwhile: again later.
-            *since = now();
+            Some(e) if e.0 == key => e.1 = now(),
+            _ => {}
         }
     }
 }
@@ -1519,10 +1539,10 @@ pub fn write_dirty(all: bool) {
 /// Writes back every dirty file once, leaving the list to the pager (only
 /// it takes files off, so none dirtied meanwhile is lost from it).
 fn write_back_dirty() -> u64 {
-    let dirty: Vec<u32> = TABLE.lock().dirty.keys().copied().collect();
+    let dirty: Vec<(u32, u64)> = TABLE.lock().dirty.iter().map(|(&i, &(k, _))| (i, k)).collect();
     let mut wrote = 0;
-    for ino in dirty {
-        let inode = TABLE.lock().inodes.get(&ino).cloned();
+    for (ino, key) in dirty {
+        let inode = TABLE.lock().inodes.get(&ino).filter(|i| i.key == key).cloned();
         if let Some(inode) = inode.filter(|i| !i.stale.load(Ordering::Relaxed)) {
             wrote += writeback(&inode, 0..u64::MAX).unwrap_or(0);
         }
@@ -1632,7 +1652,7 @@ fn allow_write(inode: &DInode) {
 /// looked at for release (`reap`).
 pub fn let_go(inode: &Arc<DInode>) {
     if inode.unlinked.load(Ordering::Relaxed) {
-        TABLE.lock().check.push(inode.ino);
+        TABLE.lock().check.push((inode.ino, inode.key));
         REAP.store(true, Ordering::Relaxed);
     }
 }
@@ -1648,27 +1668,32 @@ pub fn reap() {
         return;
     }
     release_orphans();
-    let victims: Vec<u32> = {
+    let victims: Vec<(u32, u64)> = {
         let mut t = TABLE.lock();
-        let mut victims: Vec<u32> = core::mem::take(&mut t.check);
+        let mut victims: Vec<(u32, u64)> = core::mem::take(&mut t.check);
         if t.inodes.len() > MAX_CACHED {
-            let mut unused: Vec<(u64, u32)> =
-                t.inodes.values().filter(|i| Arc::strong_count(i) == 1 && i.ino != ROOT_INO).map(|i| (i.used.load(Ordering::Relaxed), i.ino)).collect();
+            let mut unused: Vec<(u64, u32, u64)> = t
+                .inodes
+                .values()
+                .filter(|i| Arc::strong_count(i) == 1 && i.ino != ROOT_INO)
+                .map(|i| (i.used.load(Ordering::Relaxed), i.ino, i.key))
+                .collect();
             unused.sort_unstable();
             let excess = t.inodes.len() - MAX_CACHED * 3 / 4;
-            victims.extend(unused.iter().take(excess).map(|&(_, ino)| ino));
+            victims.extend(unused.iter().take(excess).map(|&(_, ino, key)| (ino, key)));
         }
         victims
     };
-    for ino in victims {
-        evict(ino);
+    for (ino, key) in victims {
+        evict(ino, key);
     }
 }
 
-/// Lets go of `ino` if nothing uses it: written back (unless unlinked:
-/// its data is of no use), taken out of the table and released in diskfs.
-fn evict(ino: u32) {
-    let Some(inode) = TABLE.lock().inodes.get(&ino).filter(|i| Arc::strong_count(i) == 1).cloned() else { return };
+/// Lets go of inode `ino` (the one with object key `key`: not another file the number
+/// names by now) if nothing uses it: written back (unless unlinked: its data is of no use),
+/// taken out of the table and released in diskfs.
+fn evict(ino: u32, key: u64) {
+    let Some(inode) = TABLE.lock().inodes.get(&ino).filter(|i| i.key == key && Arc::strong_count(i) == 1).cloned() else { return };
     let unlinked = inode.unlinked.load(Ordering::Relaxed);
     let stale = inode.stale.load(Ordering::Relaxed);
     if !unlinked && !stale && writeback(&inode, 0..u64::MAX).is_err() {
@@ -1695,7 +1720,9 @@ fn evict(ino: u32) {
             }
         }
 
-        t.dirty.remove(&ino);
+        if t.dirty.get(&ino).is_some_and(|e| e.0 == key) {
+            t.dirty.remove(&ino);
+        }
         drop(t);
         c.as_ref().and_then(|c| c.submit(Request::Release { ino }.encode(0), true).ok().flatten())
     };
