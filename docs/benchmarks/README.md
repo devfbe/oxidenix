@@ -146,6 +146,27 @@ Linux's first sizes and growing to 1 MiB; the loopback pushes back instead of dr
 instead cost half the loopback throughput (565 MB/s: the growth took longer than the transfer)
 and, against QEMU's user network, a one-second stall (its TCP waits for a larger window).
 
+## R6e: the descriptor table in the Linux server
+
+`2026-10-09-27a096a-r6e.md` against `2026-10-09-714815d-r7b-final.md`: no kernel call for a
+descriptor's lookup (`kfd_lookup` and its pin), a readiness change (`kfd_ready`) or dup,
+close and fcntl any more.
+
+| per operation | before | now |
+|---|---:|---:|
+| `fstat_tmpfs` system calls | 5 | 3 |
+| `fstat_tmpfs` p50 (cycles) | 2940 | 1941 |
+| `fstat_disk` system calls | 10 | 8 |
+| `read_4k_cached` system calls | 10 | 9 |
+| `seq_read_cached_64k` system calls | 4.02 | 3.02 |
+| `tcp_loopback_64k` system calls | 33.96 | 22.11 |
+| `tcp_network_echo_64k` system calls | 153.05 | 39.09 |
+| kernel heap allocations per `fstat` | 1 | 0 |
+
+What `fstat_disk` keeps is /data's own (its status asked of diskfs over the ring), no
+bridge. `tcp_network_echo` rose to 213 MB/s (from 180); `tcp_loopback` (1131 MB/s against
+1241) is within this host's spread for it.
+
 ## Open: PCIDs and small cached reads
 
 Turning PCIDs on (commit `fae8292`, before restricted mode) made random 4 KiB reads from the
