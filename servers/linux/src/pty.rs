@@ -54,8 +54,6 @@ pub struct PtyMaster {
     pub index: u32,
     /// The status of the node it was opened by (fstat).
     pub stat: [u8; 144],
-    /// Reads, one at a time (the copy to the program with no other lock).
-    reader: Mutex<()>,
 }
 
 /// devpts's root (made at first use; the namespace mounts it at /dev/pts).
@@ -97,7 +95,7 @@ pub fn open_master(flags: u32, stat: [u8; 144]) -> Result<i64, i64> {
         (index, tty)
     };
     let node = devpts().insert_device(&index.to_string(), vfs::stat::dev_make(SLAVE_MAJOR, index), 0o620);
-    let master = Arc::new(PtyMaster { tty: tty.clone(), index, stat, reader: Mutex::new(()) });
+    let master = Arc::new(PtyMaster { tty: tty.clone(), index, stat });
     let ready = {
         let mut inner = tty.inner.lock();
         let ready = Tty::master_readiness(&inner);
@@ -153,10 +151,12 @@ impl PtyMaster {
         if sink.room() == 0 {
             return Ok(0);
         }
+        // One read at a time for the whole read (its copies go to the program with no
+        // lock held; a flush meanwhile is seen by `out_epoch`).
+        let _turn = self.tty.turn(tty::TURN_MASTER_READ, nonblock)?;
         let mut done = 0usize;
         let mut chunk = [0u8; 2048];
         loop {
-            let reader = self.reader.lock();
             let (n, epoch) = {
                 let inner = self.tty.inner.lock();
                 let p = inner.pty.as_ref().ok_or(EIO)?;
@@ -169,7 +169,6 @@ impl PtyMaster {
                     }
                     let seen = self.tty.seen();
                     drop(inner);
-                    drop(reader);
                     if nonblock {
                         return Err(EAGAIN);
                     }
@@ -195,7 +194,6 @@ impl PtyMaster {
                 }
                 self.tty.changed(&mut inner, false, false);
             }
-            drop(reader);
             done += k;
             if k < n || sink.room() == 0 {
                 return Ok(done as i64);
@@ -235,8 +233,12 @@ impl PtyMaster {
                 open_slave(self.index, flags, stat)
             }
             TIOCSIG => {
+                // Only the terminal's own signals (Linux's `pty_signal`).
+                const SIGINT: u64 = 2;
+                const SIGQUIT: u64 = 3;
+                const SIGTSTP: u64 = 20;
                 let sig = arg;
-                if sig == 0 || sig > 64 {
+                if !matches!(sig, SIGINT | SIGQUIT | SIGTSTP) {
                     return Err(EINVAL);
                 }
                 if let Some(fg) = self.tty.inner.lock().pgrp {
@@ -269,11 +271,14 @@ impl PtyMaster {
                 Ok(0)
             }
             TIOCSTI => {
-                // Into the master's own input.
+                // Into the master's own input; dropped when that is full (as a
+                // full line discipline drops it on Linux).
                 let b: u8 = usercopy::read(arg)?;
                 let mut inner = self.tty.inner.lock();
                 if let Some(p) = inner.pty.as_mut() {
-                    p.out.push_back(b);
+                    if p.out.len() < tty::MASTER_CAP {
+                        p.out.push_back(b);
+                    }
                 }
                 self.tty.changed(&mut inner, false, true);
                 Ok(0)

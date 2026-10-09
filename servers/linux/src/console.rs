@@ -59,9 +59,24 @@ pub fn open(flags: u32, stat: [u8; 144]) -> Result<i64, i64> {
     tty::open(&t, flags, stat, false)
 }
 
-/// Writes to the device (EIO when the instance no longer holds it: the bytes go).
-pub fn device_write(bytes: &[u8]) {
-    syscall(SYS_CONSOLE_WRITE, [bytes.as_ptr() as u64, bytes.len() as u64, 0, 0, 0, 0]);
+/// Writes to the device, whole: Ok, or EINTR when a signal came while it waited for its
+/// turn (nothing written). When the instance no longer holds the device the bytes go
+/// (its terminal hangs up at the event).
+pub fn device_write(bytes: &[u8]) -> Result<(), i64> {
+    match syscall(SYS_CONSOLE_WRITE, [bytes.as_ptr() as u64, bytes.len() as u64, 0, 0, 0, 0]) {
+        r if r == -tty::EINTR => Err(tty::EINTR),
+        _ => Ok(()),
+    }
+}
+
+/// Echoes to the device without ever waiting (the service thread's input processing must
+/// not stall behind a program flooding the console): queued by the kernel, written
+/// between the pieces of a write in progress; what does not fit is dropped, as Linux's
+/// echo buffer drops.
+pub fn device_echo(bytes: &[u8]) {
+    for piece in bytes.chunks(512) {
+        syscall(SYS_CONSOLE_WRITE, [piece.as_ptr() as u64, piece.len() as u64, CONSOLE_ECHO, 0, 0, 0]);
+    }
 }
 
 /// `EVENT_CONSOLE`: the device's input into the terminal (service thread).

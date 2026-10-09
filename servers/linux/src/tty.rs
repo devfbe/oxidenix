@@ -62,6 +62,8 @@ const SIGWINCH: u64 = 28;
 pub const MASTER_CAP: usize = 64 * 1024;
 /// Echoes held while output is stopped, at most (more are dropped).
 const HELD_ECHO: usize = 4096;
+/// How far echoes may fill a pty master's buffer beyond `MASTER_CAP` (more are dropped).
+pub const ECHO_ROOM: usize = 4096;
 /// Bytes of a write processed at once (output processing may make 8 times as many).
 const WRITE_CHUNK: usize = 1024;
 
@@ -137,6 +139,8 @@ pub struct Inner {
     /// Input flushes so far (see the module comment).
     epoch: u64,
     exclusive: bool,
+    /// The turns taken (`Tty::turn`, `TURN_*` bits).
+    turns: u8,
     /// Echoes made while output was stopped.
     held_echo: Vec<u8>,
     /// The open file descriptions' placeholders: their generation and the readiness last
@@ -154,6 +158,27 @@ pub struct Tty {
     rlock: Mutex<()>,
     /// The settings the driver starts with, which a hangup restores.
     init: Termios,
+}
+
+/// The turns a call takes for its whole length (Linux's atomic_read_lock and
+/// atomic_write_lock, of the slave and of a pty's master).
+pub const TURN_READ: u8 = 1;
+pub const TURN_WRITE: u8 = 2;
+pub const TURN_MASTER_READ: u8 = 4;
+pub const TURN_MASTER_WRITE: u8 = 8;
+
+/// A call's turn (`Tty::turn`), given back when dropped.
+pub struct Turn<'a> {
+    tty: &'a Tty,
+    which: u8,
+}
+
+impl Drop for Turn<'_> {
+    fn drop(&mut self) {
+        let mut inner = self.tty.inner.lock();
+        inner.turns &= !self.which;
+        self.tty.changed(&mut inner, false, false);
+    }
 }
 
 /// An open file description of a terminal.
@@ -230,22 +255,31 @@ pub fn open_device(rdev: u64, flags: u32, stat: [u8; 144]) -> Option<Result<i64,
 /// controls no session, unless O_NOCTTY: Linux's `tty_open_proc_set_tty`).
 pub fn open(tty: &Arc<Tty>, flags: u32, stat: [u8; 144], ctty: bool) -> Result<i64, i64> {
     let id = files::new_id();
-    let (open, ready) = {
+    let (open, ready, was_closed) = {
         let mut inner = tty.inner.lock();
         let gen = inner.gen;
         let ready = tty.readiness(&inner, gen);
         inner.opens.insert(id, (gen, ready));
+        let mut was_closed = false;
         if let Some(p) = inner.pty.as_mut() {
             p.slaves += 1;
-            p.slave_closed = false;
+            was_closed = core::mem::replace(&mut p.slave_closed, false);
         }
         tty.changed(&mut inner, false, false);
-        (Arc::new(TtyOpen { tty: tty.clone(), gen, id, stat }), ready)
+        (Arc::new(TtyOpen { tty: tty.clone(), gen, id, stat }), ready, was_closed)
     };
     let fd = match files::install(id, File::Tty(open.clone()), flags & (O_ACCMODE | O_NONBLOCK | O_CLOEXEC), ready) {
         Ok(fd) => fd,
         Err(e) => {
-            tty.closed(&open);
+            // Never opened: the slave is as it was (a slave never opened is not
+            // closed for the master).
+            let mut inner = tty.inner.lock();
+            inner.opens.remove(&id);
+            if let Some(p) = inner.pty.as_mut() {
+                p.slaves = p.slaves.saturating_sub(1);
+                p.slave_closed = was_closed;
+            }
+            tty.changed(&mut inner, false, false);
             return Err(e);
         }
     };
@@ -302,6 +336,7 @@ impl Tty {
                 gen: 0,
                 epoch: 0,
                 exclusive: false,
+                turns: 0,
                 held_echo: Vec::new(),
                 opens: BTreeMap::new(),
                 pty,
@@ -460,17 +495,51 @@ impl Tty {
         }
         match inner.pty.as_mut() {
             Some(p) => {
-                p.out.extend(echo);
+                // Echoes may go `ECHO_ROOM` beyond the room writers wait for, no
+                // further: the rest is dropped (Linux's echo buffer is 4 KiB), so a
+                // master that writes but never reads cannot grow the buffer.
+                let room = (MASTER_CAP + ECHO_ROOM).saturating_sub(p.out.len());
+                p.out.extend(&echo[..echo.len().min(room)]);
                 None
             }
             None => Some(echo),
         }
     }
 
-    /// Writes to the console device (no lock held).
+    /// Writes to the console device (no lock held; a signal while it waits for its turn
+    /// loses the bytes: for the flow control characters of TCIOFF and TCION).
     fn console_write(&self, bytes: &[u8]) {
         if !bytes.is_empty() {
-            crate::console::device_write(bytes);
+            let _ = crate::console::device_write(bytes);
+        }
+    }
+
+    /// The turn `which` (`TURN_*`) for a whole call; EAGAIN with `nonblock` if another
+    /// call has it, EINTR for a signal while waiting. An interruptible wait on `seq`,
+    /// not a lock of `sync`: it is held across waits for input or room, where a
+    /// program's signals must reach the waiter (and no lock holder's priority is due).
+    pub fn turn(&self, which: u8, nonblock: bool) -> Result<Turn<'_>, i64> {
+        loop {
+            let seen = {
+                let mut inner = self.inner.lock();
+                if inner.turns & which == 0 {
+                    inner.turns |= which;
+                    return Ok(Turn { tty: self, which });
+                }
+                self.seen()
+            };
+            if nonblock {
+                return Err(EAGAIN);
+            }
+            self.wait(seen, 0)?;
+        }
+    }
+
+    /// Echoes to the console device: never waits (the service thread processes the
+    /// keyboard's input; see `console::device_echo`).
+    fn console_echo(&self, bytes: &[u8]) {
+        if !bytes.is_empty() {
+            crate::console::device_echo(bytes);
         }
     }
 
@@ -481,7 +550,8 @@ impl Tty {
     }
 
     /// Input from the device (the keyboard, TIOCSTI): every byte is taken (what does not
-    /// fit is dropped); echoes and signals follow.
+    /// fit is dropped); the signals go first (as Linux's `isig` in the receive path),
+    /// then the echoes, which never wait.
     pub fn input(&self, bytes: &[u8]) {
         let mut echo = Vec::new();
         let mut signals = Vec::new();
@@ -494,15 +564,16 @@ impl Tty {
             self.changed(&mut inner, true, true);
             out
         };
-        if let Some(out) = out {
-            self.console_write(&out);
-        }
         Self::send(signals);
+        if let Some(out) = out {
+            self.console_echo(&out);
+        }
     }
 
     /// Input from a pty's master: waits while the line discipline is full
     /// (noncanonical mode), so nothing is dropped.
     pub fn master_write(&self, mut src: Source, nonblock: bool) -> Result<i64, i64> {
+        let _turn = self.turn(TURN_MASTER_WRITE, nonblock)?;
         let mut written = 0usize;
         while src.left() > 0 {
             let chunk = match src.take(WRITE_CHUNK) {
@@ -552,27 +623,36 @@ impl Tty {
         if sink.room() == 0 {
             return Ok(0);
         }
-        // The rules at the start (Linux reads them once, too). Canonical: up to a
-        // line's end; else at least `minimum` bytes, with VTIME between bytes once
-        // one came (`time`), or with VMIN 0 as the whole read's timeout (0: none).
-        let (canonical, minimum, time, mut deadline) = match self.inner.lock().ld.mode() {
-            ReadMode::Canonical => (true, 0, 0, None),
-            ReadMode::Raw { min, time } if min > 0 => (false, min as usize, time as u64 * 100_000_000, None),
-            ReadMode::Raw { time, .. } => (false, 1, 0, Some(now() + time as u64 * 100_000_000)),
+        // One read at a time, for the whole read (Linux's atomic_read_lock): a line or
+        // a VMIN batch is never split between readers.
+        let _turn = self.turn(TURN_READ, nonblock)?;
+        // VMIN and VTIME as at the start (Linux reads them once, too): at least
+        // `minimum` bytes, with VTIME between bytes once one came (`time`), or with
+        // VMIN 0 as the whole read's timeout (0: none). Whether the read is canonical
+        // is asked at every pass (a mode switch while it waits applies at once, as
+        // Linux's `ldata->icanon`); begun canonical, `minimum` is 0: switched to raw
+        // mode it ends with what came.
+        let (minimum, time, mut deadline) = match self.inner.lock().ld.mode() {
+            ReadMode::Canonical => (0, 0, None),
+            ReadMode::Raw { min, time } if min > 0 => (min as usize, time as u64 * 100_000_000, None),
+            ReadMode::Raw { time, .. } => (1, 0, Some(now() + time as u64 * 100_000_000)),
         };
         let mut done = 0usize;
         let mut chunk = [0u8; 2048];
         loop {
+            // Held from peeking to consuming, not while waiting: a change of the
+            // settings cannot move the bytes in between (`set_termios` takes it).
             let reader = self.rlock.lock();
-            let (take, epoch) = {
+            let (take, epoch, canonical) = {
                 let inner = self.inner.lock();
                 if inner.gen != open.gen {
                     return Ok(done as i64);
                 }
+                let canonical = inner.ld.mode() == ReadMode::Canonical;
                 match inner.ld.take(sink.room().min(chunk.len())) {
                     Some(take) => {
                         inner.ld.peek(&mut chunk[..take.copy]);
-                        (take, inner.epoch)
+                        (take, inner.epoch, canonical)
                     }
                     None => {
                         let seen = self.seen();
@@ -591,8 +671,9 @@ impl Tty {
                     }
                 }
             };
-            // To the program with no lock but the reader's (a fault may wait for the
-            // pager).
+            // To the program with no lock of the server's but `rlock`: a fault here may
+            // wait for the pager, which never takes `rlock` (only programs' reads and
+            // settings changes do), so no cycle can form.
             let put = sink.put(&chunk[..take.copy]);
             let k = match put {
                 Ok(k) => k,
@@ -607,7 +688,7 @@ impl Tty {
             }
             drop(reader);
             done += k;
-            if k < take.copy || sink.room() == 0 || take.line_end {
+            if k < take.copy || sink.room() == 0 || (canonical && take.line_end) {
                 return Ok(done as i64);
             }
             if !canonical && done >= minimum {
@@ -629,6 +710,10 @@ impl Tty {
         if self.inner.lock().ld.termios().l(TOSTOP) {
             self.job_check(SIGTTOU)?;
         }
+        // One write at a time, for the whole write (Linux's atomic_write_lock): its
+        // output processing and the device's write keep their order. Not a lock the
+        // service thread takes (its echoes never wait, `console_echo`).
+        let _turn = self.turn(TURN_WRITE, nonblock)?;
         let mut written = 0usize;
         while src.left() > 0 {
             let chunk = match src.take(WRITE_CHUNK) {
@@ -651,7 +736,9 @@ impl Tty {
                             }
                             None => {
                                 drop(inner);
-                                self.console_write(&out);
+                                if let Err(e) = crate::console::device_write(&out) {
+                                    return if written > 0 { Ok(written as i64) } else { Err(e) };
+                                }
                             }
                         }
                         break;
@@ -764,9 +851,10 @@ impl Tty {
         self.job_check(SIGTTOU)?;
         let mut bytes = [0u8; TERMIOS2_SIZE];
         usercopy::from_program(arg, &mut bytes[..size]).map_err(|_| EFAULT)?;
-        // No reader is between peeking and consuming meanwhile.
-        let _reader = self.rlock.lock();
+        // No reader is between peeking and consuming meanwhile (`rlock`, held for the
+        // change only: the held echo goes out after it).
         let out = {
+            let _reader = self.rlock.lock();
             let mut inner = self.inner.lock();
             let new = inner.ld.termios().with_bytes(&bytes[..size]);
             if flush {
@@ -784,7 +872,7 @@ impl Tty {
             out
         };
         if let Some(out) = out {
-            self.console_write(&out);
+            self.console_echo(&out);
         }
         Ok(0)
     }
@@ -808,7 +896,7 @@ impl Tty {
             out
         };
         if let Some(out) = out {
-            self.console_write(&out);
+            self.console_echo(&out);
         }
     }
 
