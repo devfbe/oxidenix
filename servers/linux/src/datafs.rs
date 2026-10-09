@@ -106,6 +106,7 @@ pub const EIO: i64 = 5;
 pub const EAGAIN: i64 = 11;
 pub const ENOMEM: i64 = 12;
 pub const EBUSY: i64 = 16;
+const EINTR: i64 = 4;
 pub const EISDIR: i64 = 21;
 pub const EINVAL: i64 = 22;
 pub const EFBIG: i64 = 27;
@@ -386,10 +387,13 @@ struct Table {
     /// Inodes whose last link went and that were not cached here then (`orphan`): released
     /// in diskfs by the next `reap` under `NAMES` alone, unless a lookup that was under way
     /// meanwhile cached one again (`found`: it is cached unlinked then, and goes as such).
-    /// Each entry is taken by exactly one of them: no inode is released twice. (By number:
-    /// diskfs holds an orphan's number for the server until its release, so it is no other
-    /// file's meanwhile.)
-    orphans: Vec<u32>,
+    /// Each entry is taken by exactly one of them: no inode is released twice. By number and
+    /// the generation of the channel to diskfs it was orphaned on: diskfs holds an orphan's
+    /// number for the server until its release (it is no other file's meanwhile), but only
+    /// that diskfs; one that died took its holds along, and an orphan of an older channel is
+    /// neither released to its successor nor matched by a lookup on it (`revalidate` drops
+    /// them).
+    orphans: Vec<(u32, u64)>,
     /// Dirty files (`EVENT_DIRTY`), by inode: its object's key (the very inode) and since when.
     dirty: BTreeMap<u32, (u64, u64)>,
     /// The inodes' names (directory, name) as last found (`DInode::link`),
@@ -449,6 +453,8 @@ pub fn client() -> Result<Arc<Client>, i64> {
 /// After diskfs came back: the inodes in use are held again or stale.
 fn revalidate(c: &Client) -> Result<(), i64> {
     let _names = NAMES.write()?;
+    // The old diskfs's holds went with it: its orphans are nobody's to release.
+    TABLE.lock().orphans.retain(|&(_, g)| g == c.generation);
     let inodes: Vec<Arc<DInode>> = TABLE.lock().inodes.values().cloned().collect();
     for inode in inodes {
         if inode.unlinked.load(Ordering::Relaxed) {
@@ -521,13 +527,13 @@ fn live(inode: &DInode) -> Result<(), i64> {
 /// request returned (held now). A stale inode of that number, or one of
 /// another generation, is another file now: it leaves the table (its users
 /// keep it, failing), a new one takes its place.
-fn found(ino: u64, mode: u64, generation: u64) -> Result<Arc<DInode>, i64> {
+fn found(c: &Client, ino: u64, mode: u64, generation: u64) -> Result<Arc<DInode>, i64> {
     let ino = u32::try_from(ino).ok().filter(|&i| i != 0).ok_or(EIO)?;
     let kind = mode as u32 & vfs::S_IFMT;
     let generation = generation as u32;
     let mut t = TABLE.lock();
     // A lookup under way while its name went (`orphan`): cached unlinked, no longer an orphan.
-    let orphaned = match t.orphans.iter().position(|&o| o == ino) {
+    let orphaned = match t.orphans.iter().position(|&o| o == (ino, c.generation)) {
         Some(at) => {
             t.orphans.swap_remove(at);
             true
@@ -601,7 +607,7 @@ pub fn root() -> Result<Arc<DInode>, i64> {
     let r = c.call(Request::Stat { ino: ROOT_INO }.encode(0))?;
     status(&r)?;
     let s = fsring::Stat::from_values(&r.values);
-    found(ROOT_INO as u64, s.mode as u64, s.generation as u64)
+    found(&c, ROOT_INO as u64, s.mode as u64, s.generation as u64)
 }
 
 /// The inode by its object's key.
@@ -628,7 +634,7 @@ pub fn lookup(dir: &Arc<DInode>, name: &str) -> Result<Arc<DInode>, i64> {
     let _names = NAMES.read()?;
     let r = c.call(Request::Lookup { dir: dir.ino, name: scratch.buf(0, name.len() as u64) }.encode(0))?;
     status(&r)?;
-    let inode = found(r.values[0], r.values[1], r.values[2])?;
+    let inode = found(&c, r.values[0], r.values[1], r.values[2])?;
     set_link(&inode, dir, name);
     Ok(inode)
 }
@@ -664,7 +670,7 @@ pub fn create(dir: &Arc<DInode>, name: &str, new: New, perm: u32) -> Result<Arc<
     let _names = NAMES.read()?;
     let r = c.call(Request::Create { dir: dir.ino, name: scratch.buf(0, n), kind, perm: perm & 0o7777 }.encode(0))?;
     status(&r)?;
-    let inode = found(r.values[0], r.values[1], r.values[2])?;
+    let inode = found(&c, r.values[0], r.values[1], r.values[2])?;
     set_link(&inode, dir, name);
     Ok(inode)
 }
@@ -682,7 +688,7 @@ pub fn unlink(dir: &Arc<DInode>, name: &str, dir_only: bool) -> Result<Option<u3
         status(&r)?;
         // In the same step as the unlink (under `NAMES`): no gap in which anything else could
         // release or cache it.
-        orphan(r.values[0]);
+        orphan(&c, r.values[0]);
         r.values[0]
     };
     drop(scratch);
@@ -707,7 +713,7 @@ pub fn rename(odir: &Arc<DInode>, oname: &str, ndir: &Arc<DInode>, nname: &str) 
         let (old, new) = (scratch.buf(0, oname.len() as u64), scratch.buf(oname.len() as u64, nname.len() as u64));
         let r = c.call(Request::Rename { from: odir.ino, name: old, to: ndir.ino, new_name: new }.encode(0))?;
         status(&r)?;
-        orphan(r.values[0]);
+        orphan(&c, r.values[0]);
         r.values[0]
     };
     drop(scratch);
@@ -720,21 +726,22 @@ pub fn rename(odir: &Arc<DInode>, oname: &str, ndir: &Arc<DInode>, nname: &str) 
 /// `NAMES`: the server holds the inode now; it goes once nothing uses it. Cached here: marked
 /// unlinked (it goes when its users let go, `evict`). Else: an orphan for the next `reap`
 /// (whose release needs `NAMES` alone: a lookup under way may still return it).
-fn orphan(ino: u64) {
+fn orphan(c: &Client, ino: u64) {
     let Ok(ino) = u32::try_from(ino) else { return };
     if ino == 0 {
         return;
     }
     let mut t = TABLE.lock();
     match t.inodes.get(&ino) {
-        Some(i) => {
+        // (A stale entry is a former file of the number: as good as not cached.)
+        Some(i) if !i.stale.load(Ordering::Relaxed) => {
             i.unlinked.store(true, Ordering::SeqCst);
             let key = i.key;
             t.check.push((ino, key));
             REAP.store(true, Ordering::Relaxed);
         }
         // (Released by the unlinker right after its share of `NAMES`: `release_orphans`.)
-        None => t.orphans.push(ino),
+        _ => t.orphans.push((ino, c.generation)),
     }
 }
 
@@ -751,7 +758,8 @@ fn release_orphans() {
         return;
     };
     let orphans = core::mem::take(&mut TABLE.lock().orphans);
-    for ino in orphans {
+    // (An older channel's: its diskfs, and its holds, are gone.)
+    for (ino, _) in orphans.into_iter().filter(|&(_, g)| g == c.generation) {
         let _ = c.call(Request::Release { ino }.encode(0));
     }
 }
@@ -1413,7 +1421,6 @@ fn truncate_file(inode: &Arc<DInode>, len: u64) -> Result<(), i64> {
 /// (at most `wait` ns: pins that do not go, a grant diskfs never lets go
 /// of, end it with EBUSY).
 fn cache_truncate(inode: &DInode, object: u64, len: u64, wait: u64) -> Result<(), i64> {
-    const EINTR: i64 = 4;
     let deadline = now() + wait;
     loop {
         let seen = inode.filled.load(Ordering::Acquire);
@@ -1696,14 +1703,24 @@ fn evict(ino: u32, key: u64) {
     let Some(inode) = TABLE.lock().inodes.get(&ino).filter(|i| i.key == key && Arc::strong_count(i) == 1).cloned() else { return };
     let unlinked = inode.unlinked.load(Ordering::Relaxed);
     let stale = inode.stale.load(Ordering::Relaxed);
-    if !unlinked && !stale && writeback(&inode, 0..u64::MAX).is_err() {
-        // Kept until its data could be written.
-        return;
+    // Looked at again by a later `reap` (a thread that dies meanwhile, a write-back that
+    // failed): the inode stays cached until then.
+    let again = || {
+        TABLE.lock().check.push((ino, key));
+        REAP.store(true, Ordering::Relaxed);
+    };
+    if !unlinked && !stale {
+        match writeback(&inode, 0..u64::MAX) {
+            Ok(_) => {}
+            // (Its user died: the next reap tries again.)
+            Err(EINTR) => return again(),
+            // Kept until its data could be written (a later write-back or eviction).
+            Err(_) => return,
+        }
     }
     let c = if stale { None } else { client().ok().filter(|c| !c.is_dead()) };
     let ticket = {
-        // (A thread that dies meanwhile leaves the inode cached: evicted later.)
-        let Ok(_names) = NAMES.write() else { return };
+        let Ok(_names) = NAMES.write() else { return again() };
         let mut t = TABLE.lock();
         // Used again meanwhile (else only the table's reference and ours
         // are left), or no longer the table's.
