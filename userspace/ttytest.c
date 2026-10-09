@@ -14,9 +14,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/inotify.h>
 #include <sys/ioctl.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/statfs.h>
 #include <sys/sysmacros.h>
+#include <sys/time.h>
 #include <sys/wait.h>
 #include <termios.h>
 #include <time.h>
@@ -572,9 +576,34 @@ static void opath(void) {
     check("O_PATH on the kernel's /dev/null: its node, EBADF to write",
           n >= 0 && fstat(n, &st) == 0 && S_ISCHR(st.st_mode) && major(st.st_rdev) == 1 && write(n, "x", 1) == -1 && errno == EBADF);
     close(n);
+    int ln = open("/tmp/opath/link", O_PATH | O_NOFOLLOW);
+    char target[16] = {0};
+    check("readlinkat with an empty path reads an O_PATH symlink", readlinkat(ln, "", target, sizeof target) == 4 && memcmp(target, "file", 4) == 0);
+    check("an O_PATH symlink is no directory for *at calls (ENOTDIR)", openat(ln, "x", O_RDONLY) == -1 && errno == ENOTDIR);
+    check("inotify and socket calls on an O_PATH descriptor are EBADF",
+          inotify_add_watch(ln, "/tmp", IN_CREATE) == -1 && errno == EBADF && listen(ln, 1) == -1 && errno == EBADF);
+    close(ln);
     unlink("/tmp/opath/link");
     unlink("/tmp/opath/file");
     rmdir("/tmp/opath");
+
+    /* An unlinked /data file an O_PATH descriptor kept goes with its blocks at the close. */
+    struct statfs fs0, fs1, fs3;
+    statfs("/data", &fs0);
+    int df = open("/data/opath.bin", O_RDWR | O_CREAT | O_TRUNC, 0644);
+    static char mib[1 << 20];
+    memset(mib, 'd', sizeof mib);
+    write(df, mib, sizeof mib);
+    fsync(df);
+    close(df);
+    statfs("/data", &fs1);
+    int dp = open("/data/opath.bin", O_PATH);
+    unlink("/data/opath.bin");
+    close(dp);
+    statfs("/data", &fs3);
+    printf("ttytest: /data free blocks %llu, with the file %llu, after unlink and close %llu\n", (unsigned long long)fs0.f_bfree,
+           (unsigned long long)fs1.f_bfree, (unsigned long long)fs3.f_bfree);
+    check("an O_PATH /data file unlinked: its blocks are free when the close returns", fs1.f_bfree + 200 < fs0.f_bfree && fs3.f_bfree >= fs0.f_bfree);
 
     /* A terminal's descriptor and its node. */
     char path[64];
@@ -588,6 +617,27 @@ static void opath(void) {
 }
 
 static void on_usr1(int sig) { (void)sig; }
+
+/* A signal ends a long console write between its chunks (Linux's n_tty_write): a
+ * write of 4 KiB of palette changes (each a full redraw, a chunk of 1 KiB takes seconds)
+ * interrupted by a handler returns the chunks that went, not all 4 KiB. */
+static void write_interrupted(void) {
+    int c = open("/dev/console", O_WRONLY | O_NOCTTY);
+    static char buf[4096];
+    for (int i = 0; i + 10 <= (int)sizeof buf; i += 10) memcpy(buf + i, (i / 10) % 2 ? "\033]P1ff0000" : "\033]P1000000", 10);
+    for (int i = sizeof buf - sizeof buf % 10; i < (int)sizeof buf; i++) buf[i] = '\r';
+    struct sigaction sa = {0}, old;
+    sa.sa_handler = on_usr1;
+    sigaction(SIGALRM, &sa, &old);
+    struct itimerval it = {{0, 0}, {0, 100000}};
+    setitimer(ITIMER_REAL, &it, NULL);
+    ssize_t n = write(c, buf, sizeof buf);
+    sigaction(SIGALRM, &old, NULL);
+    write(c, "\033]R\r\n", 5);
+    close(c);
+    printf("ttytest: an interrupted console write of %zu bytes returned %zd\n", sizeof buf, n);
+    check("a signal ends a console write between chunks (partial count)", n > 0 && n < (ssize_t)sizeof buf);
+}
 
 /* Waiters for a terminal's write turn that die or are interrupted give their tickets
  * up: a writer blocks holding the turn (the master's buffer full), a second waits and is
@@ -909,6 +959,7 @@ int main(void) {
     orphans();
     turn_abandon();
     opath();
+    write_interrupted();
     job_control();
     printf("ttytest: %s\n", failures ? "FAILED" : "all passed");
     return failures != 0;

@@ -422,10 +422,11 @@ placeholder in the kernel's descriptor table, as pipes are).
   output goes to its master's buffer under it, the console's to the device after it. No lock
   of `sync` is held across the console's write (a flooding writer would get a lock holder's
   priority for the whole write and starve its CPU's other threads). As on Linux, signals
-  interrupt the write's turn (taken before any output is processed), never the device's
-  write after processing (no signal ends its wait for the kernel's turn): output processed
-  is output that goes out, so the column bookkeeping moves once and echoes never see it
-  half done. Output stopped by
+  end a write in its wait for the write turn and between its chunks, before a chunk is
+  processed (`n_tty_write` checks `signal_pending` each pass: what went, or EINTR,
+  restarted, if nothing), never in the device's write after processing (no signal ends its
+  wait for the kernel's turn): output processed is output that goes out, so the column
+  bookkeeping moves once and echoes never see it half done. Output stopped by
   `VSTOP` (or `tcflow`) waits for `VSTART`. Echoes take neither turn.
 - **Job control** (Linux's `tty_check_change`): a process of a background group reading its
   controlling terminal gets SIGTTIN for its group and the call restarts after it (EIO if it
@@ -470,7 +471,11 @@ placeholder in the kernel's descriptor table, as pipes are).
   mmap, getdents and fchmod, fchown, futimens are EBADF. Its placeholder in the kernel's
   table carries O_PATH: F_GETFL shows it, only dup, close and fcntl's F_DUPFD, F_GETFD,
   F_SETFD and F_GETFL take it there; poll gives POLLNVAL, select, epoll, ioctl and F_SETFL
-  EBADF.
+  EBADF; inotify and socket calls on one are EBADF. As a directory of *at calls it must be a
+  directory (ENOTDIR: an O_NOFOLLOW symlink's path is not followed); `readlinkat` with an
+  empty path reads the symlink it names. It keeps its node (a /data inode unlinked meanwhile
+  goes with its blocks when the last descriptor closes, as an open file's). Not done yet:
+  reopening through `/proc/self/fd/N` (procfs has no fd links) and `execveat` of one.
 - **ioctls**: `TCGETS`/`TCSETS`/`TCSETSW`/`TCSETSF` and the `termios2` forms, `TCSBRK`,
   `TCSBRKP`, `TCXONC`, `TCFLSH`, `TIOCGWINSZ`/`TIOCSWINSZ`, `TIOCGPGRP`/`TIOCSPGRP`,
   `TIOCGSID`, `TIOCSCTTY`, `TIOCNOTTY`, `TIOCSTI` (everyone is root), `FIONREAD`,
