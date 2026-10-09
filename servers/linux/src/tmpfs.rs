@@ -1,7 +1,8 @@
-//! The server's tmpfs (phase R6c.2c): directories, files and symlinks in
-//! the server's memory; a file's contents are a file object of the
-//! kernel's (`SYS_MO_CREATE_FILE`), read, written and mapped without the
-//! kernel's VFS, and charged to the same tmpfs limit as the kernel's tmpfs.
+//! The server's tmpfs (phase R6c.2c): directories, files, symlinks and
+//! socket inodes (AF_UNIX names, `unix`) in the server's memory; a file's
+//! contents are a file object of the kernel's (`SYS_MO_CREATE_FILE`), read,
+//! written and mapped without the kernel's VFS, and charged to the same
+//! tmpfs limit as the kernel's tmpfs.
 //!
 //! Locking: each inode has its own lock (its directory map, permissions
 //! and write count). Code holds one inode lock at a time, except under
@@ -67,6 +68,9 @@ pub enum Kind {
     Dir(BTreeMap<String, Arc<Inode>>),
     File(Object),
     Symlink(String),
+    /// A socket's name in the filesystem (bind(2) of an AF_UNIX socket):
+    /// the socket it leads to is found by the inode (`unix`).
+    Socket,
 }
 
 pub struct State {
@@ -115,7 +119,7 @@ impl Inode {
         match &self.state.lock().kind {
             Kind::File(o) => Ok(o.handle()),
             Kind::Dir(_) => Err(EISDIR),
-            Kind::Symlink(_) => Err(EINVAL),
+            Kind::Symlink(_) | Kind::Socket => Err(EINVAL),
         }
     }
 
@@ -138,6 +142,7 @@ impl Inode {
             Kind::File(o) => syscall(SYS_MO_FILE_SIZE, [o.handle(), 0, 0, 0, 0, 0]).max(0) as u64,
             Kind::Symlink(t) => t.len() as u64,
             Kind::Dir(m) => m.len() as u64,
+            Kind::Socket => 0,
         }
     }
 
@@ -215,6 +220,14 @@ impl Inode {
     pub fn symlink(&self, name: &str, target: String) -> Result<(), i64> {
         check_name(name)?;
         self.insert(name, Inode::new(Kind::Symlink(target), 0o777))
+    }
+
+    /// A new socket inode `name` (EEXIST if taken), for bind(2).
+    pub fn socket(&self, name: &str, perm: u32) -> Result<Arc<Inode>, i64> {
+        check_name(name)?;
+        let inode = Inode::new(Kind::Socket, perm & 0o7777);
+        self.insert(name, inode.clone())?;
+        Ok(inode)
     }
 
     fn insert(&self, name: &str, inode: Arc<Inode>) -> Result<(), i64> {
@@ -477,6 +490,7 @@ fn kind_bits(kind: &Kind) -> u32 {
         Kind::Dir(_) => vfs::S_IFDIR,
         Kind::File(_) => vfs::S_IFREG,
         Kind::Symlink(_) => vfs::S_IFLNK,
+        Kind::Socket => vfs::S_IFSOCK,
     }
 }
 
@@ -485,6 +499,7 @@ pub fn dtype(mode: u32) -> u8 {
         vfs::S_IFDIR => 4,
         vfs::S_IFREG => 8,
         vfs::S_IFLNK => 10,
+        vfs::S_IFSOCK => 12,
         _ => 0,
     }
 }

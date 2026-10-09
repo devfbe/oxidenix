@@ -27,10 +27,13 @@ mod paths;
 mod pipe;
 mod records;
 mod sched;
+mod scm;
+mod sockcalls;
 mod sync;
 mod time;
 mod tmpfile;
 mod tmpfs;
+mod unix;
 mod usercopy;
 
 use alloc::collections::BTreeMap;
@@ -73,12 +76,15 @@ pub extern "C" fn _start(state: *mut State, role: u64) -> ! {
     if role == ROLE_PAGER {
         pager();
     }
+    if role == ROLE_WORKER {
+        scm::worker();
+    }
     loop {
         if call0(SYS_RESTRICTED_ENTER) as u64 != REASON_SYSCALL {
             continue;
         }
         let s = unsafe { &mut *state };
-        if let Some(result) = mm::handle(s).or_else(|| time::handle(s)).or_else(|| files::handle(s)).or_else(|| paths::handle(s)).or_else(|| sched::handle(s)) {
+        if let Some(result) = mm::handle(s).or_else(|| time::handle(s)).or_else(|| files::handle(s)).or_else(|| paths::handle(s)).or_else(|| sched::handle(s)).or_else(|| sockcalls::handle(s)) {
             s.rax = result as u64;
             // /data inodes the call let go of go now, before it returns
             // (an unlink's blocks are free when it returns).
@@ -183,6 +189,15 @@ fn pager() -> ! {
             }
             EVENT_CLOSING => {
                 datafs::closing();
+                continue;
+            }
+            EVENT_INFLIGHT => {
+                // A socket in flight lost its last way in but messages (a
+                // descriptor closed, by close, exit or exec, or a call that
+                // used one ended): the worker collects. Never here: the
+                // collector waits for sockets' locks, and a thread holding
+                // one may wait for a page this thread brings.
+                scm::request();
                 continue;
             }
             EVENT_MKWRITE => {

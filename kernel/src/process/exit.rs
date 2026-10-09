@@ -109,6 +109,11 @@ pub fn exit_thread(status: i32) -> ! {
         // Process signals this thread was meant to take go to another.
         signal::retarget(&group);
     }
+    // Nothing of this call's stack is ever dropped (schedule does not come
+    // back): the reference to the process must go now, or every process
+    // outlives its reaping (its signal actions, about 2.5 KiB of kernel
+    // heap each).
+    drop(group);
     {
         let _w = me.wake_lock.lock();
         me.set_state(State::Dead);

@@ -63,6 +63,15 @@ impl ServerHeap {
                 if let Ok(p) = heap.allocate_first_fit(layout) {
                     return p.as_ptr();
                 }
+                // Slabs whose slots are all free first, then more memory
+                // (lock order heap -> SLABS, taken only here).
+                let mut given = 0;
+                for (c, slabs) in SLABS.iter().enumerate() {
+                    given += slabs.lock().reclaim(c, |slab| unsafe { heap.deallocate(slab, slab::slab_layout()) });
+                }
+                if given > 0 {
+                    continue;
+                }
             }
             // Room for the block, its alignment and the allocator's bookkeeping.
             let Some((start, len)) = more(layout.size() + layout.align() + 64) else { return null_mut() };

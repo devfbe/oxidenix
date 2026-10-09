@@ -67,8 +67,10 @@ An AI research project; see README.md.
     (ABI constants, documented), `kernel/src/process/linux.rs`, `linux_inode.rs`;
     design in `docs/design/linux-server.md`.
   - The Linux server: `servers/linux/src/main.rs` (dispatch order mm → time → files → paths →
-    pass-through), `namespace.rs`/`paths.rs` (paths, mounts), `tmpfs.rs`/`tmpfile.rs` (root fs),
-    `datafs.rs`/`datafile.rs`/`fsclient.rs` (`/data` and its page cache over the I/O rings).
+    sched → sockets → pass-through), `namespace.rs`/`paths.rs` (paths, mounts),
+    `tmpfs.rs`/`tmpfile.rs` (root fs), `datafs.rs`/`datafile.rs`/`fsclient.rs` (`/data` and its
+    page cache over the I/O rings), `unix.rs`/`sockcalls.rs`/`scm.rs` (`AF_UNIX` sockets,
+    descriptor passing).
   - Memory: `kernel/src/memory/`, `kernel/src/process/address_space.rs`, page cache
     `kernel/src/fs/cache.rs`.
   - Other servers and their protocols: `servers/diskfs` + `crates/fsring` + `crates/ext2fs`,

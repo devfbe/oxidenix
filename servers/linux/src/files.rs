@@ -43,6 +43,8 @@ pub enum File {
     Tmp(Arc<TmpOpen>),
     /// An open file of /data.
     Data(Arc<DataOpen>),
+    /// An AF_UNIX socket.
+    Socket(Arc<crate::unix::Sock>),
 }
 
 static FILES: Mutex<BTreeMap<u64, File>> = Mutex::new(BTreeMap::new());
@@ -74,12 +76,25 @@ pub fn ready(id: u64, ready: i16) {
 /// The kernel closed the placeholder's last descriptor: the object goes.
 pub fn closed(id: u64) {
     let gone = FILES.lock().remove(&id);
-    if let Some(File::Pipe(end)) = gone {
-        end.close();
+    match gone {
+        Some(File::Pipe(end)) => end.close(),
+        Some(File::Socket(sock)) => {
+            sock.release();
+            // It may have been the last way into sockets in flight.
+            if crate::scm::sockets_in_flight() {
+                crate::scm::request();
+            }
+        }
+        _ => {}
     }
     // An eventfd or a tmpfs or /data file simply goes (the latter two
     // returning their write access; an unlinked /data file's inode goes at
     // the next `datafs::reap`).
+}
+
+/// The server's file `id`, if it lives.
+pub fn get(id: u64) -> Option<File> {
+    FILES.lock().get(&id).cloned()
 }
 
 /// Whether descriptor `fd` names one of the server's files.
@@ -221,6 +236,7 @@ fn on_file(nr: u64, file: File, flags: u32, a1: u64, a2: u64, a3: u64) -> Result
         File::EventFd(e) => return on_eventfd(nr, &e, flags, a1, a2),
         File::Tmp(f) => return tmpfile::call(nr, &f, flags, a1, a2, a3),
         File::Data(f) => return datafile::call(nr, &f, flags, a1, a2, a3),
+        File::Socket(s) => return crate::sockcalls::on_file(nr, &s, flags, a1, a2),
     };
     let readable = flags & O_ACCMODE != O_WRONLY;
     let writable = flags & O_ACCMODE != 0;
@@ -325,6 +341,7 @@ fn sendfile(out_fd: u64, out: Option<(File, u32)>, in_fd: u64, input: Option<(Fi
             Some((File::EventFd(_), _)) => Err(EINVAL),
             Some((File::Tmp(f), _)) => f.read_server(&mut buf[..want]).map(|n| n as i64),
             Some((File::Data(f), _)) => f.read_server(&mut buf[..want]).map(|n| n as i64),
+            Some((File::Socket(s), flags)) => crate::sockcalls::read_server(s, *flags, &mut buf[..want]),
             None => match syscall(SYS_KFD_READ, [in_fd, buf.as_mut_ptr() as u64, want as u64, 0, 0, 0]) {
                 r if r < 0 => Err(-r),
                 r => Ok(r),
@@ -343,6 +360,7 @@ fn sendfile(out_fd: u64, out: Option<(File, u32)>, in_fd: u64, input: Option<(Fi
             Some((File::EventFd(_), _)) => Err(EINVAL),
             Some((File::Tmp(f), flags)) => f.write_server(&buf[..n], flags & O_APPEND != 0).map(|n| n as i64),
             Some((File::Data(f), flags)) => f.write_server(&buf[..n], flags & O_APPEND != 0).map(|n| n as i64),
+            Some((File::Socket(s), flags)) => crate::sockcalls::write_server(s, *flags, &buf[..n]),
             None => match syscall(SYS_KFD_WRITE, [out_fd, buf.as_ptr() as u64, n as u64, 0, 0, 0]) {
                 r if r < 0 => Err(-r),
                 r => Ok(r),
