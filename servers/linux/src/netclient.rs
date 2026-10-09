@@ -11,7 +11,8 @@
 //! bytes each: an *area*) are part of a memory object of `CHUNK_AREAS`
 //! areas, mapped into the server's region and granted to the channel once.
 //! Chunks are made as sockets come; an empty chunk goes (`FORGET`, then
-//! the revoke) when another one has room, so the pool shrinks again.
+//! the revoke), the last one too, so an instance without sockets holds no
+//! pool memory.
 //!
 //! **The net thread** (`ROLE_NET`, a service thread of the pager's
 //! process) takes the sockets netd marked (the client bitmap) and reports
@@ -290,9 +291,7 @@ impl Net {
             let mut pool = self.pool.lock();
             let Some(Some(chunk)) = pool.chunks.get_mut(r.chunk) else { return };
             chunk.used &= !(1 << r.slot);
-            let empty = chunk.used == 0;
-            let room_elsewhere = pool.chunks.iter().enumerate().any(|(k, c)| k != r.chunk && c.as_ref().is_some_and(|c| c.used != (1 << CHUNK_AREAS) - 1));
-            if empty && room_elsewhere { pool.chunks[r.chunk].take() } else { None }
+            if chunk.used == 0 { pool.chunks[r.chunk].take() } else { None }
         };
         if let Some(chunk) = gone {
             // Forgotten before it is revoked (no draining): only once netd
