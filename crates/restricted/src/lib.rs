@@ -281,7 +281,10 @@ pub const TEST_PAGED: u64 = 1505;
 /// `()`: how many pages the pager supplied so far.
 pub const TEST_SUPPLIED: u64 = 1506;
 /// `(addr)`: a 1-page paged object the pager never supplies, mapped at
-/// `addr` (a thread touching it waits until it is killed).
+/// `addr` (a thread touching it waits until it is killed, or until the
+/// server lets go of the object). `(0)`: the server closes its handle of
+/// the latest such object: the kernel ends the waits for its page (EIO, a
+/// fault SIGBUS), since no answer can come any more; ENOENT if none.
 pub const TEST_PAGED_STUCK: u64 = 1507;
 /// `(addr)`: a 1-page paged object at `addr` whose first request the
 /// pager fails (mo_fail) and whose second it answers with "retry".

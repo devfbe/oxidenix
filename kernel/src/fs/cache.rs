@@ -424,6 +424,9 @@ struct State {
     waits: Vec<Waiters>,
     /// Dirty pages (cached store).
     dirty: u64,
+    /// The pager let go of its last handle (`orphan`): it cannot answer
+    /// any more, so what is missing or unbacked never comes.
+    orphaned: bool,
 }
 
 /// The address spaces that map an object, in the order they registered
@@ -447,6 +450,9 @@ pub struct PageCache {
     mappers: IrqSpinLock<Mappers>,
     /// Set once by `hang_up`: futex waits on this object fail (EPIPE).
     hung_up: core::sync::atomic::AtomicBool,
+    /// The pager's handles that name this object (`handle_opened`): at
+    /// none left, it is orphaned (`orphan`).
+    handles: AtomicUsize,
 }
 
 /// A tmpfs page charged to commit and tmpfs, released on drop unless kept.
@@ -516,11 +522,13 @@ impl PageCache {
                 cursor: 0,
                 waits: Vec::new(),
                 dirty: 0,
+                orphaned: false,
             }),
             io: Mutex::new(()),
             store,
             mappers: IrqSpinLock::new(Mappers { list: Vec::new(), next: 0 }),
             hung_up: core::sync::atomic::AtomicBool::new(false),
+            handles: AtomicUsize::new(0),
         })
         .map_err(|_| ENOMEM)
     }
@@ -607,6 +615,20 @@ impl PageCache {
         Self::new(Store::Paged { pager, key }, size, 0)
     }
 
+    /// A handle of the pager's names this object (the Linux server's
+    /// handle table holds it).
+    pub fn handle_opened(&self) {
+        self.handles.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A handle of the pager's that named this object went: at the last,
+    /// a paged or cached object is orphaned (`orphan`).
+    pub fn handle_closed(&self) {
+        if self.handles.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.orphan();
+        }
+    }
+
     /// The key of a paged object.
     pub fn paged_key(&self) -> Option<u64> {
         match self.store {
@@ -663,7 +685,8 @@ impl PageCache {
                         None if beyond => return Ok(true),
                         _ => {}
                     }
-                    if failures.fill != seen.fill || (backed && failures.backing != seen.backing) {
+                    // (Orphaned: no answer can come.)
+                    if st.orphaned || failures.fill != seen.fill || (backed && failures.backing != seen.backing) {
                         return Err(EIO);
                     }
                     match st.pages.get_mut(&index) {
@@ -1562,6 +1585,27 @@ impl PageCache {
         }
         self.uncharge(gone.len() as u64);
         free_frames(gone);
+        self.wake(wake);
+    }
+
+    /// The pager let go of its last handle to this paged or cached object
+    /// (the Linux server dropped the file's inode, which nothing maps or
+    /// holds any more): no answer can come for it, since every answer
+    /// names a handle. A thread still waiting for one of its pages or
+    /// their backing (a fault whose mapping went meanwhile) gets EIO
+    /// instead of sleeping on; so do later waits, and pending fills go.
+    pub fn orphan(&self) {
+        if self.pager().is_none() {
+            return;
+        }
+        let wake = {
+            let mut st = self.state.lock();
+            // (Pages' `mkwrite` marks stay: a wait looks at `orphaned`
+            // first.)
+            st.orphaned = true;
+            Wake(!st.waits.is_empty())
+        };
+        self.abandon_pending();
         self.wake(wake);
     }
 

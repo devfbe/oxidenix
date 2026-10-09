@@ -686,6 +686,9 @@ impl Instance {
         }
         let handle = h.next;
         h.next += 1;
+        if let Object::Memory(cache) | Object::File(cache, _) = &object {
+            cache.handle_opened();
+        }
         h.objects.insert(handle, object);
         Ok(handle)
     }
@@ -1156,6 +1159,11 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
     match nr {
         SYS_HANDLE_CLOSE => {
             let object = instance.handles.lock().objects.remove(&a[0]).ok_or(EBADF)?;
+            // At a paged or cached object's last handle the server can no
+            // longer answer for it (`PageCache::orphan`).
+            if let Object::Memory(cache) | Object::File(cache, _) = &object {
+                cache.handle_closed();
+            }
             // Released outside the lock. A channel's end goes now, unless a
             // call of another thread still uses it (then with that call).
             if let Object::Channel(end) = object {

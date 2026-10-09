@@ -636,7 +636,8 @@ the server.
   even an answer that comes at once reaches it), and a later one asks again. A request is
   queued once until the pager takes it, and a waiting thread asks again only once its own
   request was answered or overtaken (the page came and went, or was cut off); if the pager's
-  process dies, every wait for it ends (`EIO`).
+  process dies, every wait for it ends (`EIO`), and so does every wait for an object whose last
+  handle the pager closed (no answer could name it any more).
 - **The server's runtime** (phase R3): a heap in its shared region that grows on demand
   (`shared_map`, committed memory), and a mutex for data shared by all threads of the tree
   (Drepper's three-state futex lock over the kernel's futex, which keys the server's memory by

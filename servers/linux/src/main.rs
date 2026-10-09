@@ -165,6 +165,8 @@ static TEST_OBJECT: AtomicU64 = AtomicU64::new(0);
 /// The paged object of TEST_PAGED, and how many pages the pager supplied.
 static TEST_PAGED_OBJECT: AtomicU64 = AtomicU64::new(0);
 static SUPPLIED: AtomicU64 = AtomicU64::new(0);
+/// TEST_PAGED_STUCK's object (its handle, the latest run's).
+static TEST_STUCK_OBJECT: AtomicU64 = AtomicU64::new(0);
 /// The key the test's paged object goes by; +1: never answered.
 const TEST_KEY: u64 = 0x7e57;
 /// The keys of TEST_PAGED_FAIL's objects, one of its own each, from here
@@ -413,6 +415,13 @@ fn test(nr: u64, addr: u64) -> i64 {
             }
             *COUNTER.lock() as i64
         }
+        TEST_PAGED_STUCK if addr == 0 => {
+            // Let go of: the kernel ends the waits for its page.
+            match TEST_STUCK_OBJECT.swap(0, Ordering::Relaxed) {
+                0 => -namespace::ENOENT,
+                h => syscall(SYS_HANDLE_CLOSE, [h, 0, 0, 0, 0, 0]),
+            }
+        }
         TEST_PAGED_STUCK => {
             // A key the pager does not answer.
             let h = syscall(SYS_MO_CREATE_PAGED, [1, TEST_KEY + 1, 0, 0, 0, 0]);
@@ -420,7 +429,12 @@ fn test(nr: u64, addr: u64) -> i64 {
                 return h;
             }
             let r = syscall(SYS_MO_MAP, [h as u64, addr, PAGE, 0, PROT_READ, MO_SHARED | MO_FIXED]);
-            syscall(SYS_HANDLE_CLOSE, [h as u64, 0, 0, 0, 0, 0]);
+            // Kept (the previous run's goes): at its last handle the
+            // kernel would end the waits for it (no answer could come).
+            let old = TEST_STUCK_OBJECT.swap(h as u64, Ordering::Relaxed);
+            if old != 0 {
+                syscall(SYS_HANDLE_CLOSE, [old, 0, 0, 0, 0, 0]);
+            }
             if r < 0 { r } else { 0 }
         }
         _ => -ENOSYS,

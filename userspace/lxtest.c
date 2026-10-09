@@ -253,6 +253,31 @@ int main(int argc, char **argv) {
     waitpid(child, &st, 0);
     alarm(0);
     check("SIGKILL ends a thread waiting for a page", WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL);
+    /* A page whose pager let go of the object (its last handle, as for a
+     * /data file whose inode the server dropped): no answer can come, so
+     * the wait ends (SIGBUS) rather than sleeping on. */
+    int mapped[2];
+    pipe(mapped);
+    child = fork();
+    if (child == 0) {
+        char *stuck = (char *)0x221000000000;
+        if (syscall(TEST_PAGED_STUCK, stuck) != 0) _exit(1);
+        write(mapped[1], "m", 1);
+        (void)*(volatile char *)stuck;
+        _exit(2);
+    }
+    char m = 0;
+    close(mapped[1]);
+    read(mapped[0], &m, 1);
+    close(mapped[0]);
+    // (Waiting by now, or soon: a fault after the drop fails too.)
+    usleep(100 * 1000);
+    long dropped = m == 'm' ? syscall(TEST_PAGED_STUCK, 0) : -1;
+    alarm(5);
+    st = 0;
+    waitpid(child, &st, 0);
+    alarm(0);
+    check("a page of an object its pager let go of raises SIGBUS", dropped == 0 && WIFSIGNALED(st) && WTERMSIG(st) == SIGBUS);
 
     /* A page the pager fails: SIGBUS, and a later access asks again. The
      * first request of every such object fails, not only the instance's
