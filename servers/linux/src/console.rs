@@ -9,6 +9,7 @@
 //! init gets /dev/console), and its process the console as its controlling terminal (there
 //! is no getty to make it one; ADR 0007).
 
+use crate::namespace::Origin;
 use crate::sync::Mutex;
 use crate::syscall;
 use crate::tty::{self, Driver, Tty, ENXIO};
@@ -54,9 +55,9 @@ pub fn current() -> Option<Arc<Tty>> {
 }
 
 /// Opens /dev/console (never the caller's controlling terminal by opening, as on Linux).
-pub fn open(flags: u32, stat: [u8; 144]) -> Result<i64, i64> {
+pub fn open(flags: u32, origin: Origin) -> Result<i64, i64> {
     let t = tty().ok_or(ENXIO)?;
-    tty::open(&t, flags, stat, false)
+    tty::open(&t, flags, origin, false)
 }
 
 /// Writes to the device (a call per `CONSOLE_WRITE_MAX` bytes, each whole). A signal does
@@ -112,9 +113,11 @@ pub fn lost() {
 /// leader) the console as its controlling terminal.
 pub fn setup_stdio() {
     const O_RDWR: u32 = 2;
-    let stat = crate::namespace::resolve("/", "/dev/console", true).and_then(|r| r.node.stat()).unwrap_or([0; 144]);
+    // The kernel's /dev/console node (it is always there).
+    let Ok(node) = crate::namespace::resolve("/", "/dev/console", true).map(|r| r.node) else { return };
     let Some(t) = tty() else { return };
-    let fd = match tty::open(&t, O_RDWR, stat, false) {
+    let origin = Origin { node, path: alloc::string::String::from("/dev/console") };
+    let fd = match tty::open(&t, O_RDWR, origin, false) {
         Ok(fd) => fd as u64,
         Err(_) => return,
     };

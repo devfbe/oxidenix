@@ -58,8 +58,10 @@ pub enum File {
     Tty(Arc<crate::tty::TtyOpen>),
     /// A pty's master.
     PtyMaster(Arc<crate::pty::PtyMaster>),
-    /// Null or zero on a node of the server's, or a device node opened with O_PATH.
+    /// Null or zero on a node of the server's.
     Dev(Arc<crate::devices::DevOpen>),
+    /// An O_PATH descriptor (of any node).
+    Path(Arc<crate::pathfile::PathOpen>),
 }
 
 /// What mmap of one of the server's files maps.
@@ -67,8 +69,9 @@ pub enum Mapping {
     /// A memory object (a handle to close once mapped), and whether the mapping stays
     /// read-only.
     Object(u64, bool),
-    /// Anonymous memory, as for MAP_ANONYMOUS (zero's mappings).
-    Anonymous,
+    /// Anonymous memory, as for MAP_ANONYMOUS (zero's mappings); `read_only`: a shared
+    /// mapping that may never become writable.
+    Anonymous { read_only: bool },
 }
 
 static FILES: Mutex<BTreeMap<u64, File>> = Mutex::new(BTreeMap::new());
@@ -144,6 +147,21 @@ pub fn data_of(fd: u64) -> Option<Arc<DataOpen>> {
     }
 }
 
+/// The node a descriptor of the server's that keeps its origin was opened by (a
+/// terminal, a pty's master, null or zero, an O_PATH descriptor), its path, and whether
+/// it is an O_PATH descriptor; None for other descriptors.
+pub fn origin_of(fd: u64) -> Option<Result<(crate::namespace::Node, alloc::string::String, bool), i64>> {
+    let (file, _) = lookup(fd)?;
+    let (origin, path) = match &file {
+        File::Tty(t) => (&t.origin, false),
+        File::PtyMaster(m) => (&m.origin, false),
+        File::Dev(d) => (&d.origin, false),
+        File::Path(p) => (&p.origin, true),
+        _ => return None,
+    };
+    Some(origin.node.duplicate().map(|node| (node, origin.path.clone(), path)))
+}
+
 /// The status of descriptor `fd`, one of the server's files or of the
 /// kernel's (EBADF for neither).
 pub fn stat_of(fd: u64) -> Result<vfs::stat::Stat, i64> {
@@ -155,9 +173,10 @@ pub fn stat_of(fd: u64) -> Result<vfs::stat::Stat, i64> {
         Some((File::Netlink(n), _)) => n.stat(),
         Some((File::Inotify(i), _)) => i.stat(),
         Some((File::Socket(s), _)) => crate::sockcalls::stat(&s),
-        Some((File::Tty(t), _)) => t.stat,
-        Some((File::PtyMaster(m), _)) => m.stat,
-        Some((File::Dev(d), _)) => d.stat,
+        Some((File::Tty(t), _)) => t.origin.stat()?,
+        Some((File::PtyMaster(m), _)) => m.origin.stat()?,
+        Some((File::Dev(d), _)) => d.origin.stat()?,
+        Some((File::Path(p), _)) => p.origin.stat()?,
         None => kernel_stat(fd)?,
     };
     Ok(vfs::stat::Stat::from_bytes(&bytes))
@@ -185,9 +204,8 @@ pub fn map_object(fd: u64, shared: bool, prot_write: bool) -> Option<Result<Mapp
     Some(match lookup(fd)? {
         (File::Tmp(f), flags) => object(f.map_object(flags, shared, prot_write)),
         (File::Data(f), flags) => object(f.map_object(flags, shared, prot_write)),
-        // Linux's zero maps anonymous memory (shared: a new shared object).
-        (File::Dev(d), _) if d.kind == crate::devices::Kind::Zero => Ok(Mapping::Anonymous),
-        (File::Dev(d), _) if d.kind == crate::devices::Kind::Path => Err(EBADF),
+        (File::Dev(d), flags) => crate::devices::map(&d, flags, shared, prot_write),
+        (File::Path(_), _) => Err(EBADF),
         _ => Err(ENODEV),
     })
 }
@@ -335,6 +353,7 @@ fn on_file(nr: u64, file: File, flags: u32, a1: u64, a2: u64, a3: u64) -> Result
         File::Tty(t) => return crate::tty::call(nr, &t, flags, a1, a2),
         File::PtyMaster(m) => return crate::pty::call(nr, &m, flags, a1, a2),
         File::Dev(d) => return crate::devices::call(nr, &d, flags, a1, a2),
+        File::Path(p) => return crate::pathfile::call(nr, &p, a1),
     };
     let readable = flags & O_ACCMODE != O_WRONLY;
     let writable = flags & O_ACCMODE != 0;
@@ -403,6 +422,11 @@ fn pipe2(fds: u64, flags: u64) -> Result<i64, i64> {
 /// kernel does it between its own files): chunks through the server's
 /// memory, returning after a short read, as Linux and the kernel do.
 fn sendfile(out_fd: u64, out: Option<(File, u32)>, in_fd: u64, input: Option<(File, u32)>, offset: u64, count: u64) -> Result<i64, i64> {
+    // An O_PATH descriptor is no file to move data through.
+    let path = |f: &Option<(File, u32)>| matches!(f, Some((File::Path(_), _)));
+    if path(&out) || path(&input) {
+        return Err(EBADF);
+    }
     if offset != 0 {
         return Err(EINVAL);
     }
@@ -446,7 +470,7 @@ fn sendfile(out_fd: u64, out: Option<(File, u32)>, in_fd: u64, input: Option<(Fi
                 t.tty.read(t, crate::unix::Sink::Server { buf: &mut buf[..want], at: 0 }, flags & O_NONBLOCK != 0)
             }
             Some((File::PtyMaster(m), flags)) => m.read(crate::unix::Sink::Server { buf: &mut buf[..want], at: 0 }, flags & O_NONBLOCK != 0),
-            Some((File::Dev(d), _)) if d.kind == crate::devices::Kind::Path => Err(EBADF),
+            Some((File::Path(_), _)) => Err(EBADF),
             Some((File::Dev(d), _)) => crate::devices::read(d, crate::unix::Sink::Server { buf: &mut buf[..want], at: 0 }),
             None => match syscall(SYS_KFD_READ, [in_fd, buf.as_mut_ptr() as u64, want as u64, 0, 0, 0]) {
                 r if r < 0 => Err(-r),
@@ -469,7 +493,7 @@ fn sendfile(out_fd: u64, out: Option<(File, u32)>, in_fd: u64, input: Option<(Fi
             Some((File::Socket(s), flags)) => crate::sockcalls::write_server(s, *flags, &buf[..n]),
             Some((File::Tty(t), flags)) => t.tty.write(t, crate::unix::Source::Server { buf: &buf[..n], at: 0 }, flags & O_NONBLOCK != 0),
             Some((File::PtyMaster(m), flags)) => m.write(crate::unix::Source::Server { buf: &buf[..n], at: 0 }, flags & O_NONBLOCK != 0),
-            Some((File::Dev(d), _)) if d.kind == crate::devices::Kind::Path => Err(EBADF),
+            Some((File::Path(_), _)) => Err(EBADF),
             Some((File::Dev(_), _)) => Ok(n as i64),
             None => match syscall(SYS_KFD_WRITE, [out_fd, buf.as_ptr() as u64, n as u64, 0, 0, 0]) {
                 r if r < 0 => Err(-r),
@@ -574,6 +598,7 @@ fn regular(fd: u64) -> Result<(Regular, u32), i64> {
         });
     };
     let kind = match &file {
+        File::Path(_) => return Err(EBADF),
         File::Tmp(f) => f.inode.file_type(),
         File::Data(f) => f.inode.kind,
         _ => return Err(EINVAL),

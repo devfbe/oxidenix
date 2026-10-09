@@ -13,6 +13,7 @@
 
 use crate::files::{self, File, EINVAL, O_ACCMODE, O_CLOEXEC, O_NONBLOCK};
 use crate::sync::Mutex;
+use crate::namespace::Origin;
 use crate::tmpfs;
 use crate::tty::{self, Driver, PtyState, Tty, EAGAIN, EIO, ENXIO};
 use crate::unix::{Sink, Source};
@@ -52,8 +53,8 @@ pub struct PtyMaster {
     /// The slave's terminal.
     pub tty: Arc<Tty>,
     pub index: u32,
-    /// The status of the node it was opened by (fstat).
-    pub stat: [u8; 144],
+    /// The node it was opened by (/dev/ptmx: fstat, fchmod and the like).
+    pub origin: Origin,
 }
 
 /// devpts's root (made at first use; the namespace mounts it at /dev/pts).
@@ -75,7 +76,7 @@ pub fn all() -> Vec<Arc<Tty>> {
 }
 
 /// Opens /dev/ptmx: a new pair, its master's descriptor.
-pub fn open_master(flags: u32, stat: [u8; 144]) -> Result<i64, i64> {
+pub fn open_master(flags: u32, origin: Origin) -> Result<i64, i64> {
     let id = files::new_id();
     let (index, tty) = {
         let mut ptys = PTYS.lock();
@@ -95,7 +96,7 @@ pub fn open_master(flags: u32, stat: [u8; 144]) -> Result<i64, i64> {
         (index, tty)
     };
     let node = devpts().insert_device(&index.to_string(), vfs::stat::dev_make(SLAVE_MAJOR, index), 0o620);
-    let master = Arc::new(PtyMaster { tty: tty.clone(), index, stat });
+    let master = Arc::new(PtyMaster { tty: tty.clone(), index, origin });
     let ready = {
         let mut inner = tty.inner.lock();
         let ready = Tty::master_readiness(&inner);
@@ -115,7 +116,7 @@ pub fn open_master(flags: u32, stat: [u8; 144]) -> Result<i64, i64> {
 }
 
 /// Opens /dev/pts/`index`: EIO while it is locked or its master is gone.
-pub fn open_slave(index: u32, flags: u32, stat: [u8; 144]) -> Result<i64, i64> {
+pub fn open_slave(index: u32, flags: u32, origin: Origin) -> Result<i64, i64> {
     let tty = PTYS.lock().get(&index).cloned().ok_or(ENXIO)?;
     {
         let inner = tty.inner.lock();
@@ -124,7 +125,7 @@ pub fn open_slave(index: u32, flags: u32, stat: [u8; 144]) -> Result<i64, i64> {
             return Err(EIO);
         }
     }
-    tty::open(&tty, flags, stat, true)
+    tty::open(&tty, flags, origin, true)
 }
 
 /// The master's last descriptor went: the slave hangs up, its node goes.
@@ -229,8 +230,10 @@ impl PtyMaster {
                 // A descriptor of the slave from the master (Linux's ptm_open_peer).
                 const O_NOCTTY: u32 = 0o400;
                 let flags = arg as u32 & (O_ACCMODE | O_NONBLOCK | O_CLOEXEC | O_NOCTTY);
-                let stat = devpts().lookup(&self.index.to_string()).map(|n| n.stat()).unwrap_or([0; 144]);
-                open_slave(self.index, flags, stat)
+                let name = self.index.to_string();
+                let node = devpts().lookup(&name).map_err(|_| EIO)?;
+                let path = alloc::format!("/dev/pts/{}", name);
+                open_slave(self.index, flags, Origin { node: crate::namespace::Node::Tmp(node), path })
             }
             TIOCSIG => {
                 // Only the terminal's own signals (Linux's `pty_signal`).
@@ -307,7 +310,7 @@ pub fn call(nr: u64, m: &Arc<PtyMaster>, flags: u32, a1: u64, a2: u64) -> Result
             let vecs = files::iovecs(a1, a2)?;
             m.write(Source::program(&vecs), nonblock)
         }
-        SYS_FSTAT => usercopy::to_program(a1, &m.stat).map(|_| 0).map_err(|_| EFAULT),
+        SYS_FSTAT => usercopy::to_program(a1, &m.origin.stat()?).map(|_| 0).map_err(|_| EFAULT),
         SYS_IOCTL => m.ioctl(a1, a2),
         files::SYS_LSEEK | files::SYS_PREAD64 | files::SYS_PWRITE64 | files::SYS_PREADV | files::SYS_PWRITEV => Err(files::ESPIPE),
         files::SYS_GETDENTS64 => Err(files::ENOTDIR),

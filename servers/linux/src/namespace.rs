@@ -162,6 +162,40 @@ impl Node {
     }
 }
 
+impl Node {
+    /// Another reference to the same inode (a kernel inode: a new handle).
+    pub fn duplicate(&self) -> Result<Node, i64> {
+        Ok(match self {
+            Node::Kernel(k) => {
+                let mut walk = Walk::default();
+                let empty = "";
+                Node::Kernel(KInode::from_result(syscall(
+                    SYS_INODE_WALK,
+                    [k.handle(), empty.as_ptr() as u64, 0, &mut walk as *mut Walk as u64, 0, 0],
+                ))?)
+            }
+            Node::Tmp(t) => Node::Tmp(t.clone()),
+            Node::Data(d) => Node::Data(d.clone()),
+        })
+    }
+}
+
+/// What an open file description of the server's that is not a regular file or a
+/// directory (a terminal, null or zero, an `O_PATH` descriptor) was opened by: the node
+/// and its absolute path. Its status is the node's, live (fstat), and the calls on the
+/// descriptor that change the node (fchmod, fchown, futimens) or take it as a directory
+/// work on it.
+pub struct Origin {
+    pub node: Node,
+    pub path: String,
+}
+
+impl Origin {
+    pub fn stat(&self) -> Result<[u8; 144], i64> {
+        self.node.stat()
+    }
+}
+
 /// What a mount puts at its path.
 enum Fs {
     /// The kernel's tree at this path (names below its root).

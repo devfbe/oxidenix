@@ -98,7 +98,7 @@ fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, mut offset: u64) ->
     let mapping = if flags & MAP_ANONYMOUS == 0 {
         crate::files::map_object(fd, shared, prot & PROT_WRITE != 0)
     } else {
-        Some(Ok(crate::files::Mapping::Anonymous))
+        Some(Ok(crate::files::Mapping::Anonymous { read_only: false }))
     };
     let handle = match mapping {
         Some(Ok(crate::files::Mapping::Object(h, read_only))) => {
@@ -110,11 +110,14 @@ fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, mut offset: u64) ->
         Some(Err(e)) => -e,
         None => crate::syscall(SYS_KFILE_OBJECT, [fd, 0, 0, 0, 0, 0]),
         // Anonymous memory (also zero's): the offset means nothing.
-        Some(Ok(crate::files::Mapping::Anonymous)) if shared => {
+        Some(Ok(crate::files::Mapping::Anonymous { read_only })) if shared => {
             offset = 0;
+            if read_only {
+                mo_flags |= MO_READONLY;
+            }
             crate::syscall(SYS_MO_CREATE, [len / PAGE, 0, 0, 0, 0, 0])
         }
-        Some(Ok(crate::files::Mapping::Anonymous)) => {
+        Some(Ok(crate::files::Mapping::Anonymous { .. })) => {
             offset = 0;
             0
         }

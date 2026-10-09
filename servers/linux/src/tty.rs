@@ -29,6 +29,7 @@
 //! whose session is the process's (ADR 0007).
 
 use crate::files::{self, File, EFAULT, EINVAL, ENOTTY, O_ACCMODE, O_CLOEXEC, O_NONBLOCK};
+use crate::namespace::Origin;
 use crate::sync::Mutex;
 use crate::syscall;
 use crate::unix::{Sink, Source};
@@ -223,8 +224,8 @@ pub struct TtyOpen {
     /// The terminal's hangup generation when it was opened.
     gen: u32,
     pub id: u64,
-    /// The status of the device node it was opened by (fstat).
-    pub stat: [u8; 144],
+    /// The device node it was opened by (fstat, fchmod and the like).
+    pub origin: Origin,
 }
 
 /// A process's ids, as the kernel answers `proc_ids`.
@@ -270,26 +271,27 @@ pub fn ctty_of(sid: u64) -> Option<Arc<Tty>> {
     all().into_iter().find(|t| t.inner.lock().session == Some(sid))
 }
 
-/// Opens the terminal device with number `rdev` (a character device node's, whose status
-/// is `stat`), if it is one: (5,0) /dev/tty, (5,1) /dev/console, (5,2) /dev/ptmx, (136,n)
-/// /dev/pts/n. None for another device.
-pub fn open_device(rdev: u64, flags: u32, stat: [u8; 144]) -> Option<Result<i64, i64>> {
+/// Opens the terminal device with number `rdev` (the character device node `origin`), if
+/// it is one: (5,0) /dev/tty, (5,1) /dev/console, (5,2) /dev/ptmx, (136,n) /dev/pts/n.
+/// None for another device.
+pub fn open_device(rdev: u64, flags: u32, origin: Origin) -> Option<Result<i64, i64>> {
     Some(match vfs::stat::dev_split(rdev) {
         (5, 0) => ids(0, 0).and_then(|me| {
             let tty = ctty_of(me.sid).ok_or(ENXIO)?;
-            open(&tty, flags, stat, false)
+            open(&tty, flags, origin, false)
         }),
-        (5, 1) => crate::console::open(flags, stat),
-        (5, 2) => crate::pty::open_master(flags, stat),
-        (136, n) => crate::pty::open_slave(n, flags, stat),
+        (5, 1) => crate::console::open(flags, origin),
+        (5, 2) => crate::pty::open_master(flags, origin),
+        (136, n) => crate::pty::open_slave(n, flags, origin),
         _ => return None,
     })
 }
 
-/// A new open file description of `tty` for the caller; `ctty`: the open may make it the
-/// caller's controlling terminal (a session leader without one opening a terminal that
-/// controls no session, unless O_NOCTTY: Linux's `tty_open_proc_set_tty`).
-pub fn open(tty: &Arc<Tty>, flags: u32, stat: [u8; 144], ctty: bool) -> Result<i64, i64> {
+/// A new open file description of `tty` for the caller, opened by the node `origin`;
+/// `ctty`: the open may make it the caller's controlling terminal (a session leader
+/// without one opening a terminal that controls no session, unless O_NOCTTY: Linux's
+/// `tty_open_proc_set_tty`).
+pub fn open(tty: &Arc<Tty>, flags: u32, origin: Origin, ctty: bool) -> Result<i64, i64> {
     let id = files::new_id();
     let (open, ready, was_closed) = {
         let mut inner = tty.inner.lock();
@@ -302,7 +304,7 @@ pub fn open(tty: &Arc<Tty>, flags: u32, stat: [u8; 144], ctty: bool) -> Result<i
             was_closed = core::mem::replace(&mut p.slave_closed, false);
         }
         tty.changed(&mut inner, false, false);
-        (Arc::new(TtyOpen { tty: tty.clone(), gen, id, stat }), ready, was_closed)
+        (Arc::new(TtyOpen { tty: tty.clone(), gen, id, origin }), ready, was_closed)
     };
     let fd = match files::install(id, File::Tty(open.clone()), flags & (O_ACCMODE | O_NONBLOCK | O_CLOEXEC), ready) {
         Ok(fd) => fd,
@@ -1195,7 +1197,7 @@ pub fn call(nr: u64, open: &Arc<TtyOpen>, flags: u32, a1: u64, a2: u64) -> Resul
             let vecs = files::iovecs(a1, a2)?;
             tty.write(open, Source::program(&vecs), nonblock)
         }
-        SYS_FSTAT => usercopy::to_program(a1, &open.stat).map(|_| 0),
+        SYS_FSTAT => usercopy::to_program(a1, &open.origin.stat()?).map(|_| 0),
         SYS_IOCTL => tty.ioctl(Some(open), a1, a2),
         files::SYS_LSEEK | files::SYS_PREAD64 | files::SYS_PWRITE64 | files::SYS_PREADV | files::SYS_PWRITEV => Err(files::ESPIPE),
         files::SYS_GETDENTS64 => Err(files::ENOTDIR),
