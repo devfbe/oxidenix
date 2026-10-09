@@ -72,7 +72,9 @@ module comment, and the public types it defines. Where to start for common tasks
 - `servers/linux/src/datafs.rs` (1280) /data in the server (phase R6c.3, I/O rings step 4): diskfs's ext2 filesystem through the file protocol (`fsring`, over `fsclient`'s channel), with the server's own page cache. Types: `DInode`, `New`, `HoldKind`.
 - `servers/linux/src/devices.rs` (103) Null and zero on the server's filesystems (phase R6d): a character device node names its driver by its number wherever it is (ADR 0007), so a node (1,3) or (1,5) on the server's tmpfs or /data is null or zero, served... Types: `Kind`, `DevOpen`.
 - `servers/linux/src/disktest.rs` (530) `TEST_DISKRING`: the client's side of the file protocol (`fsring`) against diskfs, as the page cache will use it in step 4: a channel to diskfs, grants of memory objects, files on /data read and written by DMA into...
+- `servers/linux/src/epoll.rs` (484) epoll (phase R6e): an interest list of open file descriptions and a ready list, the event loop interface of libuv (and so of Node.js), as Linux's fs/eventpoll.c has it. Types: `Epoll`, `Item`.
 - `servers/linux/src/eventfd.rs` (101) eventfd (phase R6b): a counter that reads take and writes add to, a file of the server (an open file description of its table's, `files`). Types: `EventFd`.
+- `servers/linux/src/fdtable.rs` (366) The descriptor table (phase R6e, docs/design/linux-server.md "The descriptor table"): per process, the server's. Types: `FilesContext`.
 - `servers/linux/src/files.rs` (686) The server's open files (phase R6, the descriptor table since R6e): an open file description (`Description`) is a file the server implements (`File`: a pipe end, a socket, an open file of tmpfs or /data, a terminal,... Types: `File`, `Description`, `FileRef`, `OriginOf`, `Mapping`.
 - `servers/linux/src/fsclient.rs` (117) The server's end of the file protocol (`fsring`, docs/design/io-rings.md) to diskfs: one channel for the instance, shared by every thread of the tree's processes and by the pager thread. Types: `Client`, `Scratch`.
 - `servers/linux/src/heap.rs` (67) The server's heap: one allocator for every thread of the instance, in the shared region, growing by `SYS_SHARED_MAP` when it runs out. Types: `ServerHeap`.
@@ -81,7 +83,8 @@ module comment, and the public types it defines. Where to start for common tasks
 - `servers/linux/src/inetcalls.rs` (493) The system calls of internet sockets (phase R7b): socket(2) for the AF_INET family, and every call on a descriptor of one of the server's internet sockets: addresses (`sockaddr_in`), message headers, flags, options,...
 - `servers/linux/src/initramfs.rs` (65) The instance's root tmpfs from the boot image's initramfs (phase R6c.2c): the server reads the archive's headers and names from the kernel's image object (`SYS_INITRAMFS`) and makes each regular file a file object...
 - `servers/linux/src/inotify.rs` (409) inotify(7): watches on the files of the server's filesystems (tmpfs and /data) and the queue of their events, a file of the server, as eventfd. Types: `Key`, `Inotify`.
-- `servers/linux/src/main.rs` (352) The Linux server (docs/design/linux-server.md).
+- `servers/linux/src/kfile.rs` (60) Open files of the kernel's (phase R6e): an open file description of the kernel's tree a program opened (/proc and /sys, the kernel's null and zero, what else the kernel's tree holds), which the server holds by handle... Types: `KernelFile`.
+- `servers/linux/src/main.rs` (356) The Linux server (docs/design/linux-server.md).
 - `servers/linux/src/mm.rs` (166) Memory system calls (phase R4): Linux's semantics of mmap, munmap, mprotect, mremap, madvise, msync and the mlock family, over the kernel's mapping calls.
 - `servers/linux/src/namespace.rs` (323) The server's namespace (phase R6c.2): mounts and path resolution. Types: `KInode`, `Node`, `Origin`, `Resolved`.
 - `servers/linux/src/netclient.rs` (337) The instance's channel to netd (phase R7b, ADR 0008, the protocol `netring`): requests (`ringclient`'s slots), the shared area with a control block per socket, the buffer pool the sockets' rings live in, and the net... Types: `Futex`, `Rings`, `Net`.
@@ -90,6 +93,7 @@ module comment, and the public types it defines. Where to start for common tasks
 - `servers/linux/src/pathfile.rs` (22) O_PATH descriptors (open(2) with O_PATH; phase R6d, for any node of the namespace): the descriptor names a node and opens nothing, no driver, no file. Types: `PathOpen`.
 - `servers/linux/src/paths.rs` (643) The system calls that take a path (phase R6c.2b), and the working directory and umask, which live in the caller's record (`records`).
 - `servers/linux/src/pipe.rs` (248) Pipes (phase R6a): a 64 KiB buffer shared by a read end and a write end, each a file of the server (an open file description of its own). Types: `Dst`, `Src`, `Shared`, `PipeEnd`.
+- `servers/linux/src/poll.rs` (425) Readiness and waiting for many files at once (phase R6e): the watch lists of the server's open file descriptions, poll, ppoll, select, pselect6 and restart_syscall (epoll is `epoll`'s). Types: `Waiter`, `Sub`, `Watch`.
 - `servers/linux/src/pty.rs` (267) Pseudo-terminals (phase R6d, docs/design/linux-server.md "Pseudo-terminals"): opening /dev/ptmx makes a pair, a master (`PtyMaster`, a file of the server) and a slave (a terminal, `tty`, whose driver hands its output... Types: `PtyMaster`.
 - `servers/linux/src/records.rs` (79) Records per working-directory context: the cwd and umask of the processes that share them (phase R6c). Types: `FsState`, `FsContext`.
 - `servers/linux/src/ringclient.rs` (332) The server's end of a channel to a service (docs/design/io-rings.md): request slots and the reaper, for any protocol whose completions are `ring::Completion`s (`fsclient` to diskfs, `netclient` to netd). Types: `Doorbell`, `Ticket`, `RingClient`, `Next`.
@@ -97,6 +101,7 @@ module comment, and the public types it defines. Where to start for common tasks
 - `servers/linux/src/scm.rs` (163) Descriptors in flight (SCM_RIGHTS over AF_UNIX sockets, phase R7a; in the server's own memory since R6e): a descriptor a message carries is a reference to its open file description (`Passed`), whatever the file is... Types: `Passed`.
 - `servers/linux/src/sockcalls.rs` (726) The system calls of AF_UNIX sockets (phase R7a): socket and socketpair for the AF_UNIX family, and every call on a descriptor of one of the server's AF_UNIX sockets: addresses (sockaddr_un, paths in the server's... Types: `MsgHdr`.
 - `servers/linux/src/sync.rs` (153) A mutex for the server's data, shared by every thread of the instance (all the tree's processes run the server in the same shared region). Types: `Mutex`, `MutexGuard`, `RwLock`, `ReadGuard`, `WriteGuard`.
+- `servers/linux/src/thread.rs` (40) The server's own words for each of its threads, in the thread's State page (`restricted::SERVER_THREAD_OFFSET`, which the kernel never touches): the thread's role, the descriptor table it last used (a cache of... Types: `Words`.
 - `servers/linux/src/time.rs` (106) Clocks and sleeping (phase R5): clock_gettime, clock_getres, gettimeofday, time, nanosleep, clock_nanosleep and sched_yield, over the kernel's clock and deadline sleep.
 - `servers/linux/src/tmpfile.rs` (288) Open files of the server's tmpfs (phase R6c.2c): what an open file description of the server's names (offset, directory snapshot, write access); the calls on it are the server's. Types: `TmpOpen`.
 - `servers/linux/src/tmpfs.rs` (504) The server's tmpfs (phase R6c.2c): directories, files, symlinks, socket inodes (AF_UNIX names, `unix`) and device nodes (devpts's, `pty`) in the server's memory; a file's contents are a file object of the kernel's... Types: `Object`, `Kind`, `Content`, `State`, `Inode`.
@@ -161,9 +166,10 @@ module comment, and the public types it defines. Where to start for common tasks
 - `userspace/cachetest.c` (115) The page cache of files on a filesystem server (/data): repeated reads come from memory, writes and truncation stay coherent with cached pages and mappings, programs run from the disk, and cached pages give way when...
 - `userspace/cowtest.c` (68) Copy-on-write after fork: parent and child see their own writes to heap and data, brk stays clear of mappings, and shared read-only frames cannot be written.
 - `userspace/datatest.c` (549) /data in the Linux server (phase R6c.3): its calls never pass through to the kernel, descriptors and mappings of a file share one page cache, write() leaves dirty pages that fsync makes durable (an O_DIRECT read...
-- `userspace/epolltest.c` (245) epoll: interest lists with level- and edge-triggered readiness, the event loop interface of libuv and therefore Node.js.
+- `userspace/epolltest.c` (388) epoll (the Linux server's, phase R6e): interest lists with level- and edge-triggered readiness, the event loop interface of libuv and therefore Node.js; EPOLLEXCLUSIVE, nesting, instances shared by fork and passed...
 - `userspace/eventfdtest.c` (76) eventfd: a 64-bit counter as a file, the wakeup primitive of event loops (libuv wakes its loop through one).
 - `userspace/exectest.c` (116) execve maps programs from the page cache: processes running the same program share its pages, a program file cannot be written while it runs (ETXTBSY) nor run while it is open for writing, and changing a program file...
+- `userspace/fdtest.c` (238) The descriptor table, the Linux server's (phase R6e): dup, dup2, dup3 and fcntl's duplicates, close-on-exec, status flags shared by an open file description's descriptors, close_range (with CLOSE_RANGE_CLOEXEC and...
 - `userspace/forktest.c` (38) fork, exec of a child program, and wait with exit statuses of children running concurrently.
 - `userspace/fstest.c` (68) Filesystem semantics on /data: symlinks and O_NOFOLLOW, unlinked files that stay open, file size limits, the access modes of descriptors, and preadv2/pwritev2's flags.
 - `userspace/futextest.c` (97) futex(2): waiting and waking on private and shared words, timeouts, bitsets, requeueing and interruption by signals.
@@ -179,7 +185,7 @@ module comment, and the public types it defines. Where to start for common tasks
 - `userspace/nettest.c` (598) Socket tests: TCP and UDP over loopback and through QEMU's user network (10.0.2.100:7 is an echo service, see builder/src/main.rs), with the Linux semantics of the server's internet sockets (R7b): bulk data intact,...
 - `userspace/node/run-node.sh` (16) Runs the Node.js smoke tests (userspace/node/tests, in the root filesystem as /usr/lib/node-tests) with /data/bin/node and exits non-zero if any fails.
 - `userspace/oomtest.c` (166) Running out of resources: fork bombs, memory hogs, full pipes and full descriptor tables fail with errors (EAGAIN, ENOMEM, EMFILE) instead of bringing the kernel down, and a process touching uncommitted...
-- `userspace/polltest.c` (161) poll and select wake up when a descriptor becomes ready, not at the next scheduler tick: the waiter sits on the wait queues of the files it polls.
+- `userspace/polltest.c` (297) poll and select (the Linux server's, phase R6e) wake up when a descriptor becomes ready, not at the next scheduler tick: the waiter is subscribed to the watch lists of the files it polls (and waits on the words netd...
 - `userspace/proctest.c` (159) Process information: prctl, capabilities and (later) /proc.
 - `userspace/rwtest.h` (50) Positional and vectored reads and writes with preadv2/pwritev2's flags, on a file at `path` (fstest runs them on /data, the kernel's files; lxtest on /tmp, the Linux server's): the offset -1 means the file position,...
 - `userspace/sigmasktest.c` (102) Calls that wait with a temporary signal mask (sigsuspend, ppoll, pselect): the mask applies while they wait and to a handler that interrupts them; afterwards the caller's own mask is back.
@@ -189,7 +195,7 @@ module comment, and the public types it defines. Where to start for common tasks
 - `userspace/timertest.c` (157) High-resolution timers: sleeps and timeouts end when they are due, not at the next 10 ms timer tick, and never early.
 - `userspace/timetest.c` (173) Clocks: nanosecond resolution, monotonic across CPUs, the CPU-time clocks of threads and processes, wall-clock time and its setting, and the accounting behind getrusage and times.
 - `userspace/ttytest.c` (841) Terminals, the Linux server's (phase R6d), driven through pseudo-terminals: termios round trips, canonical and raw reads with VMIN and VTIME, echo and line editing, output processing, flow control, poll, window...
-- `userspace/unixtest.c` (856) AF_UNIX sockets (the Linux server's, phase R7a): stream, datagram and seqpacket socket pairs, names in the filesystem (tmpfs and /data) and in the abstract namespace, descriptors passed between processes (SCM_RIGHTS,...
+- `userspace/unixtest.c` (887) AF_UNIX sockets (the Linux server's, phase R7a): stream, datagram and seqpacket socket pairs, names in the filesystem (tmpfs and /data) and in the abstract namespace, descriptors passed between processes (SCM_RIGHTS,...
 - `userspace/vmtest.c` (257) Virtual memory: demand paging, protection, remapping, sharing, stacks, commit accounting, and the patterns JIT compilers rely on.
 - `userspace/writebacktest.c` (116) Write-back of shared writable mappings of disk files: stores make pages dirty (Dirty: in /proc/meminfo), msync, fsync and the flusher write them (Dirty: back to 0), also after the mapping is gone; they survive...
 
@@ -313,6 +319,7 @@ kernel that handle them.
 - `docs/decisions/0006-server-restart-policy.md` ADR 0006: Restarting servers: backoff, crash loops and recovery
 - `docs/decisions/0007-terminals-in-the-linux-server.md` ADR 0007: Terminals in the Linux server: a raw console device, devices by number, the controlling terminal per session
 - `docs/decisions/0008-socket-state-in-the-channel.md` ADR 0008: Internet sockets: shared control blocks, byte rings, answers at once
+- `docs/decisions/0009-descriptor-table-in-the-linux-server.md` ADR 0009: The descriptor table in the Linux server: per-table records until R8, the kernel's files by handle, readiness through the server's watches
 - `docs/design/io-rings.md` I/O rings: the data plane between the Linux server and the device servers
 - `docs/design/iommu.md` DMA isolation with an IOMMU
 - `docs/design/linux-server.md` The Linux server: system calls in restricted mode
