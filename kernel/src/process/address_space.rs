@@ -645,17 +645,15 @@ impl AddressSpace {
         memory::uncommit(charged);
     }
 
-    /// Takes the CHARGED bit off the entries in [start, end) and gives
-    /// their commit back: their area is committed as a whole now.
-    fn uncharge_pages(&mut self, start: u64, end: u64) {
-        let mut charged = 0;
+    /// Takes the CHARGED bit off the entries in [start, end): their area is
+    /// committed as a whole now, and their commit counts as part of it
+    /// (`protect` committed only the rest).
+    fn absorb_charged_pages(&mut self, start: u64, end: u64) {
         for_each_leaf(self.l4, start, end, |_, e| {
             if e.flags().contains(CHARGED) {
                 e.set_flags(e.flags() - CHARGED);
-                charged += 1;
             }
         });
-        memory::uncommit(charged);
     }
 
     /// mprotect: new rights for [start, start+len), which must be fully
@@ -680,12 +678,18 @@ impl AddressSpace {
             }
             at = v.end;
         }
-        let needed: u64 = self
+        // The areas to commit as a whole: their pages less those already
+        // committed one by one (CHARGED), whose commit becomes the area's.
+        let ranges: alloc::vec::Vec<(u64, u64)> = self
             .vmas
             .range(..end)
             .filter(|(_, v)| v.end > start && v.private() && !v.charged && !v.noreserve && prot.write)
-            .map(|(_, v)| (v.end.min(end) - v.start.max(start)) / PAGE)
-            .sum();
+            .map(|(_, v)| (v.start.max(start), v.end.min(end)))
+            .collect();
+        let mut needed: u64 = ranges.iter().map(|(s, e)| (e - s) / PAGE).sum();
+        for &(s, e) in &ranges {
+            for_each_leaf(self.l4, s, e, |_, leaf| needed -= leaf.flags().contains(CHARGED) as u64);
+        }
         if needed > 0 && !memory::commit(needed) {
             return Err(Fault::Oom);
         }
@@ -704,7 +708,7 @@ impl AddressSpace {
         self.apply_prot(start, end, prot);
         // Their pages committed one by one are part of the whole now.
         for (s, e) in now_charged {
-            self.uncharge_pages(s, e);
+            self.absorb_charged_pages(s, e);
         }
         Ok(())
     }

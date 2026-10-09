@@ -118,6 +118,24 @@ static void commit_cycles(void) {
     check("memory committed page by page goes back exactly once", after == before);
 }
 
+/* mprotect committing a whole area counts its pages already committed one
+ * by one: a read-only private area read in completely becomes writable
+ * even when nothing else is left to commit. */
+static void protect_counts_touched_pages(void) {
+    pid_t kid = fork();
+    if (kid == 0) {
+        volatile char *r = mmap(NULL, 8 * MIB, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        long sum = 0;
+        for (long i = 0; i < 8 * MIB; i += 4096) sum += r[i];
+        for (long chunk = 64 * MIB; chunk >= 4096; chunk /= 2)
+            while (mmap(NULL, chunk, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) != MAP_FAILED) {}
+        _exit(mprotect((void *)r, 8 * MIB, PROT_READ | PROT_WRITE) == 0 && sum == 0 ? 0 : 1);
+    }
+    int st = -1;
+    waitpid(kid, &st, 0);
+    check("mprotect writable of a read-in area needs no new commit", WIFEXITED(st) && WEXITSTATUS(st) == 0);
+}
+
 int main(void) {
     struct sigaction sa = {0};
     sa.sa_handler = on_fault;
@@ -194,6 +212,7 @@ int main(void) {
     }
     if (range != MAP_FAILED) munmap(range, 4096 * MIB);
     commit_cycles();
+    protect_counts_touched_pages();
     range = mmap(NULL, 4096 * MIB, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     check("... but needs commit without MAP_NORESERVE (ENOMEM)",
           range != MAP_FAILED && mprotect(range, 4096 * MIB, PROT_READ | PROT_WRITE) == -1 && errno == ENOMEM);

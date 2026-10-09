@@ -26,20 +26,20 @@ module comment, and the public types it defines. Where to start for common tasks
 - `kernel/src/interrupts/apic.rs` (210) Local APIC (one per CPU: timer, end of interrupt, inter-processor interrupts) and I/O APIC (routes device interrupts to CPUs).
 - `kernel/src/interrupts/entry.rs` (66) Uniform entry for every interrupt and exception (except NMI and double fault): a per-vector stub pushes the vector (and a dummy error code where the CPU pushes none), the common path saves all registers into a...
 - `kernel/src/interrupts/gdt.rs` (92) Per-CPU GDT and TSS. Types: `CpuTables`.
-- `kernel/src/interrupts/handlers.rs` (183) Interrupt and exception handlers: every vector from `entry::common_entry` lands in `trap`, which dispatches CPU exceptions (page faults, signals for user faults), device interrupts and inter-processor interrupts.
+- `kernel/src/interrupts/handlers.rs` (193) Interrupt and exception handlers: every vector from `entry::common_entry` lands in `trap`, which dispatches CPU exceptions (page faults, signals for user faults), device interrupts and inter-processor interrupts.
 - `kernel/src/interrupts/mod.rs` (72) Interrupt setup: the IDT, the interrupt controllers (local and I/O APIC from ACPI, the 8259 PICs masked) and the per-CPU setup of the other CPUs.
 - `kernel/src/main.rs` (168) The kernel's entry point: `kernel_main` takes the boot information from the bootloader (UEFI or BIOS) and brings up the console, interrupts, memory, ACPI, time, the VFS, processes, the other CPUs and the servers,...
 - `kernel/src/memory/frame.rs` (148) The physical frame allocator: fresh frames from the bootloader's usable regions, freed ones on an intrusive free list, with reference counts for shared and copy-on-write frames. Types: `PhysFrameAllocator`, `UserFrames`.
 - `kernel/src/memory/kstack.rs` (124) Kernel stacks. Types: `KernelStack`.
 - `kernel/src/memory/mod.rs` (262) Kernel memory: the frame allocator, the kernel heap (slab size classes over a first-fit heap), mappings of physical memory, and the commit and page-cache accounting. Types: `Caching`, `Stats`.
 - `kernel/src/net.rs` (124) Client side of the network server (netd): every socket operation of a user program becomes a `netproto` request. Types: `Endpoint`, `Socket`.
-- `kernel/src/process/address_space.rs` (1185) A process's virtual memory: its page tables and the areas (VMAs) that say what each address range is. Types: `Prot`, `Backing`, `Vma`, `MemStats`, `Fault`, `Access`, `AddressSpace`, `Mm`.
+- `kernel/src/process/address_space.rs` (1179) A process's virtual memory: its page tables and the areas (VMAs) that say what each address range is. Types: `Prot`, `Backing`, `Vma`, `MemStats`, `Fault`, `Access`, `AddressSpace`, `Mm`.
 - `kernel/src/process/channel.rs` (718) Channels: the kernel's part of the data plane between the Linux server and the device servers (docs/design/io-rings.md, ADR 0005). Types: `Channel`, `Grant`, `DmaDomain`, `ClientEnd`.
 - `kernel/src/process/clone.rs` (186) clone(2), fork and vfork: new threads and processes.
 - `kernel/src/process/elf.rs` (81) Parsing ELF64 headers and program headers of static executables (for `loader`). Types: `Elf`, `ProgramHeader`, `Header`.
 - `kernel/src/process/epoll.rs` (380) epoll: an interest list of open files and a ready list, the event loop interface of libuv (and so of Node.js). Types: `Epoll`, `Item`.
 - `kernel/src/process/errno.rs` (45) Linux error numbers, as system calls return them (negated).
-- `kernel/src/process/exec.rs` (119) execve(2): replaces the program of the calling process.
+- `kernel/src/process/exec.rs` (121) execve(2): replaces the program of the calling process.
 - `kernel/src/process/exit.rs` (237) Ending threads and processes, and waiting for children. Types: `WaitStatus`.
 - `kernel/src/process/futex.rs` (336) futex(2): sleeping on a user-space word, the base of every pthread mutex, condition variable and join.
 - `kernel/src/process/ipc.rs` (380) Synchronous message passing between the kernel and user-space servers. Types: `Instance`.
@@ -56,7 +56,7 @@ module comment, and the public types it defines. Where to start for common tasks
 - `kernel/src/process/sys_file.rs` (671) File syscalls.
 - `kernel/src/process/sys_mem.rs` (210) Memory syscalls: brk, mmap, munmap, mprotect, mremap, madvise and the ones that need no work here (msync, mlock). Types: `Placement`.
 - `kernel/src/process/sys_net.rs` (196) Socket system calls (IPv4 TCP and UDP).
-- `kernel/src/process/sys_time.rs` (207) Clocks, sleeps and CPU-time accounting: clock_gettime and its relatives, clock_nanosleep, getrusage and times.
+- `kernel/src/process/sys_time.rs` (208) Clocks, sleeps and CPU-time accounting: clock_gettime and its relatives, clock_nanosleep, getrusage and times.
 - `kernel/src/process/syscall.rs` (443) The system call entry: the register `Frame` of every kernel entry, the `syscall` MSR setup, and the dispatch of Linux and native system call numbers to their handlers. Types: `Frame`.
 - `kernel/src/process/task.rs` (360) Tasks and thread groups. Types: `FpuState`, `State`, `Info`, `ThreadGroup`, `CpuState`, `Files`, `FsInfo`, `Process`, `Task`.
 - `kernel/src/process/tlb.rs` (234) TLB coherence: which CPUs use an address space, and shootdowns. Types: `Tlb`, `AsidCache`.
@@ -155,7 +155,7 @@ module comment, and the public types it defines. Where to start for common tasks
 - `userspace/lxtest.c` (404) The Linux server's kernel interface (docs/design/linux-server.md), exercised through the server's test calls (1500 and up, see crates/restricted): the program asks its server to create a memory object, fill it, map...
 - `userspace/mmaptest.c` (135) File mappings through the page cache: shared mappings see write() and read() sees stores through them, across processes; private mappings see the file until they write; truncation and the end of the file give SIGBUS;...
 - `userspace/nettest.c` (170) Socket tests: TCP and UDP over loopback and through QEMU's user network (10.0.2.100:7 is an echo service, see builder/src/main.rs).
-- `userspace/oomtest.c` (126) Running out of resources: fork bombs, memory hogs and full pipes fail with errors (EAGAIN, ENOMEM) instead of bringing the kernel down, and a process touching uncommitted (MAP_NORESERVE) memory beyond the commit...
+- `userspace/oomtest.c` (144) Running out of resources: fork bombs, memory hogs and full pipes fail with errors (EAGAIN, ENOMEM) instead of bringing the kernel down, and a process touching uncommitted (MAP_NORESERVE) memory beyond the commit...
 - `userspace/polltest.c` (158) poll and select wake up when a descriptor becomes ready, not at the next scheduler tick: the waiter sits on the wait queues of the files it polls.
 - `userspace/proctest.c` (159) Process information: prctl, capabilities and (later) /proc.
 - `userspace/rwtest.h` (50) Positional and vectored reads and writes with preadv2/pwritev2's flags, on a file at `path` (fstest runs them on /data, the kernel's files; lxtest on /tmp, the Linux server's): the offset -1 means the file position,...
@@ -164,8 +164,8 @@ module comment, and the public types it defines. Where to start for common tasks
 - `userspace/smptest.c` (187) SMP tests: CPU count, affinity and scheduling policy, real parallel speed-up, fork/exit and cross-CPU wakeups (pipes, signals) under load on every CPU.
 - `userspace/threadtest.c` (336) Threads: pthreads on clone/futex, shared memory and descriptors, TLS, thread and process signals, group exit, fork and exec from threads, vfork and posix_spawn, and TLB coherence (munmap and mprotect while another...
 - `userspace/timertest.c` (157) High-resolution timers: sleeps and timeouts end when they are due, not at the next 10 ms timer tick, and never early.
-- `userspace/timetest.c` (163) Clocks: nanosecond resolution, monotonic across CPUs, the CPU-time clocks of threads and processes, wall-clock time and its setting, and the accounting behind getrusage and times.
-- `userspace/vmtest.c` (242) Virtual memory: demand paging, protection, remapping, sharing, stacks, commit accounting, and the patterns JIT compilers rely on.
+- `userspace/timetest.c` (173) Clocks: nanosecond resolution, monotonic across CPUs, the CPU-time clocks of threads and processes, wall-clock time and its setting, and the accounting behind getrusage and times.
+- `userspace/vmtest.c` (257) Virtual memory: demand paging, protection, remapping, sharing, stacks, commit accounting, and the patterns JIT compilers rely on.
 - `userspace/writebacktest.c` (116) Write-back of shared writable mappings of disk files: stores make pages dirty (Dirty: in /proc/meminfo), msync, fsync and the flusher write them (Dirty: back to 0), also after the mapping is gone; they survive...
 
 ## Scripts
