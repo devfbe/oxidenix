@@ -9,6 +9,9 @@
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
+#include <poll.h>
+#include <sys/epoll.h>
+#include <sys/inotify.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -228,6 +231,55 @@ static void descriptors(void) {
     close(rw);
     close(o);
     unlink("/tmp/proc-opath");
+
+    /* A reopened pipe end gets its readiness reports: epoll on it wakes
+     * when a writer (another process) feeds the pipe. */
+    pipe(p);
+    snprintf(path, sizeof path, "/proc/self/fd/%d", p[0]);
+    int again_r = open(path, O_RDONLY | O_NONBLOCK);
+    int ep = epoll_create1(0);
+    struct epoll_event ev = {.events = EPOLLIN}, got_ev;
+    epoll_ctl(ep, EPOLL_CTL_ADD, again_r, &ev);
+    pid_t feeder = fork();
+    if (feeder == 0) {
+        usleep(100000);
+        write(p[1], "fed", 3);
+        _exit(0);
+    }
+    int woke = epoll_wait(ep, &got_ev, 1, 3000);
+    waitpid(feeder, NULL, 0);
+    check("epoll on a reopened pipe end wakes for a writer", woke == 1 && (got_ev.events & EPOLLIN) && read(again_r, buf, 3) == 3);
+    write(p[1], "now", 3);
+    int r3 = open(path, O_RDONLY | O_NONBLOCK);
+    struct pollfd pfd = {r3, POLLIN, 0};
+    check("... and one reopened with data waiting is readable at once", poll(&pfd, 1, 0) == 1 && (pfd.revents & POLLIN));
+    close(r3);
+    close(ep);
+    close(again_r);
+    close(p[0]);
+    close(p[1]);
+
+    /* An O_PATH descriptor through a magic link keeps nothing alive: 130
+     * inotify instances (the limit is 128) each closed after one. */
+    int opaths[130], made = 0;
+    for (int i = 0; i < 130; i++) {
+        int in = inotify_init();
+        if (in < 0) break;
+        snprintf(path, sizeof path, "/proc/self/fd/%d", in);
+        opaths[i] = open(path, O_PATH);
+        close(in);
+        made++;
+    }
+    check("an O_PATH of an inotify instance keeps it from ending: no", made == 130);
+    for (int i = 0; i < made; i++) close(opaths[i]);
+
+    /* A symlink a magic link leads to is no file to open: ELOOP. */
+    symlink("/tmp/nowhere", "/tmp/proc-link");
+    int l = open("/tmp/proc-link", O_PATH | O_NOFOLLOW);
+    snprintf(path, sizeof path, "/proc/self/fd/%d", l);
+    check("open of a symlink through /proc/self/fd: ELOOP", open(path, O_RDONLY) == -1 && errno == ELOOP);
+    close(l);
+    unlink("/tmp/proc-link");
 
     /* musl's fexecve runs /proc/self/fd/N. */
     int prog = open("/bin/hello", O_RDONLY | O_CLOEXEC);
