@@ -127,7 +127,20 @@ static void devices(void) {
     while (d && (e = readdir(d))) after += e->d_name[0] >= '0' && e->d_name[0] <= '9';
     if (d) closedir(d);
     check("O_PATH opens /dev/ptmx's node, not a pty", op >= 0 && after == ptys && !isatty(op));
+    struct stat ps;
+    char one;
+    check("an O_PATH descriptor: the node's status, EBADF for reads and writes",
+          fstat(op, &ps) == 0 && S_ISCHR(ps.st_mode) && major(ps.st_rdev) == 5 && minor(ps.st_rdev) == 2 &&
+              read(op, &one, 1) == -1 && errno == EBADF && write(op, "x", 1) == -1 && errno == EBADF);
     close(op);
+    int mp = posix_openpt(O_RDWR | O_NOCTTY);
+    unlockpt(mp);
+    char pp[64];
+    ptsname_r(mp, pp, sizeof pp);
+    op = open(pp, O_PATH | O_RDWR);
+    check("O_PATH on a devpts node ignores the access mode (EBADF)", op >= 0 && write(op, "x", 1) == -1 && errno == EBADF);
+    close(op);
+    close(mp);
     check("O_DIRECTORY on a device node: ENOTDIR", open("/dev/tty", O_RDONLY | O_DIRECTORY) == -1 && errno == ENOTDIR);
 
     int c = open("/dev/console", O_RDWR | O_NOCTTY);

@@ -16,6 +16,7 @@ mod chantest;
 mod console;
 mod datafile;
 mod datafs;
+mod devices;
 mod disktest;
 mod eventfd;
 mod files;

@@ -283,28 +283,30 @@ fn openat(dirfd: u64, addr: u64, flags: u32, mode: u32) -> Result<i64, i64> {
     let abs = join(&resolved.path);
     // A character device node names its driver by its number, wherever the
     // node is (the kernel's /dev, the server's tmpfs or devpts): the terminals
-    // are the server's (`tty`), null (1,3) and zero (1,5) the kernel's
-    // (opened through its own node), any other number has no driver (ENXIO).
-    // O_PATH opens the node alone, without the driver; O_DIRECTORY is ENOTDIR.
+    // are the server's (`tty`); null (1,3) and zero (1,5) the kernel's for its
+    // own nodes, the server's (`devices`, with the node's own status) for its
+    // nodes; any other number has no driver (ENXIO). O_PATH opens the node
+    // alone, never the driver (`devices`: its status, reads and writes EBADF);
+    // O_DIRECTORY is ENOTDIR.
     if resolved.mode & vfs::S_IFMT == vfs::S_IFCHR {
+        use crate::devices::{self, Kind};
         if flags & O_DIRECTORY != 0 {
             return Err(ENOTDIR);
         }
-        if flags & O_PATH == 0 {
-            let st = resolved.node.stat()?;
-            let rdev = vfs::stat::Stat::from_bytes(&st).rdev;
-            if let Some(r) = crate::tty::open_device(rdev, flags, st) {
-                return r;
-            }
-            if !matches!(resolved.node, Node::Kernel(_)) {
-                let kernel_node = match vfs::stat::dev_split(rdev) {
-                    (1, 3) => "/dev/null",
-                    (1, 5) => "/dev/zero",
-                    _ => return Err(crate::tty::ENXIO),
-                };
-                let Node::Kernel(k) = resolve("/", kernel_node, true)?.node else { return Err(crate::tty::ENXIO) };
-                return check(syscall(SYS_INODE_OPEN, [k.handle(), flags as u64, abs.as_ptr() as u64, abs.len() as u64, 0, 0]));
-            }
+        let st = resolved.node.stat()?;
+        if flags & O_PATH != 0 {
+            return devices::open(Kind::Path, flags, st);
+        }
+        let rdev = vfs::stat::Stat::from_bytes(&st).rdev;
+        if let Some(r) = crate::tty::open_device(rdev, flags, st) {
+            return r;
+        }
+        if !matches!(resolved.node, Node::Kernel(_)) {
+            return match vfs::stat::dev_split(rdev) {
+                (1, 3) => devices::open(Kind::Null, flags, st),
+                (1, 5) => devices::open(Kind::Zero, flags, st),
+                _ => Err(crate::tty::ENXIO),
+            };
         }
     }
     match resolved.node {
