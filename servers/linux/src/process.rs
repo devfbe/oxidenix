@@ -183,6 +183,9 @@ pub struct Proc {
     /// Descriptor tables of its threads handed to the worker and not let go of yet
     /// (`fdtable::end_later`): its end waits until there are none.
     pub tables_out: u32,
+    /// Bytes its execve calls hold of their arguments and environments
+    /// (`exec::Strings`, bounded per process).
+    pub exec_bytes: Arc<core::sync::atomic::AtomicUsize>,
 }
 
 pub struct Thread {
@@ -475,6 +478,7 @@ pub fn register_init(key: u64) {
             brk: Arc::new(Mutex::new(Brk::default())),
             words: Arc::new(Words::default()),
             tables_out: 0,
+            exec_bytes: Arc::new(core::sync::atomic::AtomicUsize::new(0)),
         };
         t.procs.insert(pid, p);
         let serial = t.new_serial();
@@ -750,6 +754,7 @@ fn clone(s: &State, c: Clone) -> Result<i64, i64> {
                 brk,
                 words: Arc::new(Words::default()),
                 tables_out: 0,
+                exec_bytes: Arc::new(core::sync::atomic::AtomicUsize::new(0)),
             };
             t.procs.insert(pid, p);
             if let Some(pp) = t.procs.get_mut(&ppid) {
@@ -869,6 +874,12 @@ pub fn exit_killed() -> ! {
 /// thread (which ends too).
 pub fn die(status: i32) -> ! {
     exit(status, true)
+}
+
+/// The account the calling process's execve calls charge their arguments to.
+pub fn exec_account() -> Arc<core::sync::atomic::AtomicUsize> {
+    let pid = local::pid();
+    PROCS.lock().procs.get(&pid).map(|p| p.exec_bytes.clone()).unwrap_or_else(|| Arc::new(core::sync::atomic::AtomicUsize::new(0)))
 }
 
 /// Gives the calling thread descriptor table `files` (execve, close_range's unshare): the old

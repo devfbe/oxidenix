@@ -21,6 +21,7 @@ use crate::signal;
 use crate::syscall;
 use crate::usercopy;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -220,13 +221,18 @@ impl Elf {
     /// before the point of no return (ENOEXEC for an image that does not fit below the stack).
     fn bias(&self) -> Result<u64, i64> {
         let (low, high) = self.span();
-        let bias = match self.kind {
-            ET_DYN => DYN_BASE.checked_sub(low).ok_or(ENOEXEC)?,
+        if high <= low {
+            return Err(ENOEXEC);
+        }
+        // ET_DYN: its lowest page at `DYN_BASE`, wherever it was linked (a bias that wraps,
+        // as Linux's load_bias, for an image linked above the base).
+        let (bias, start) = match self.kind {
+            ET_DYN => (DYN_BASE.wrapping_sub(low), DYN_BASE),
             _ if low < MIN_ADDR => return Err(ENOEXEC),
-            _ => 0,
+            _ => (0, low),
         };
-        let end = high.checked_add(bias).ok_or(ENOEXEC)?;
-        if high <= low || end > STACK_TOP - STACK_MAX {
+        let end = start.checked_add(high - low).ok_or(ENOEXEC)?;
+        if end > STACK_TOP - STACK_MAX {
             return Err(ENOEXEC);
         }
         Ok(bias)
@@ -247,29 +253,32 @@ fn page_up(x: u64) -> u64 {
     x.saturating_add(PAGE - 1) & !(PAGE - 1)
 }
 
-/// Bytes all execve calls of the instance may hold of their arguments and environments at
-/// once (on the server's heap, shared by the tree): 8 calls with Linux's largest.
-const EXEC_STRINGS_MAX: usize = 8 * MAX_ARGS_TOTAL;
-static EXEC_STRINGS: AtomicUsize = AtomicUsize::new(0);
+/// Bytes the execve calls of one process may hold of their arguments and environments at
+/// once (on the server's heap, shared by the tree): one call with Linux's largest, its
+/// script interpreter's additions and a second, smaller one. Per process, so that no
+/// process keeps the others of the tree from running a program.
+const EXEC_STRINGS_MAX: usize = 3 * MAX_ARGS_TOTAL;
 
 /// An execve's arguments or environment: NUL-terminated strings back to back in one buffer
-/// (one allocation, not one per string), charged against `EXEC_STRINGS_MAX` while held.
+/// (one allocation, not one per string), charged to its process (`EXEC_STRINGS_MAX`) while
+/// held.
 struct Strings {
     bytes: Vec<u8>,
     count: usize,
     charged: usize,
+    account: Arc<AtomicUsize>,
 }
 
 impl Strings {
-    fn new() -> Strings {
-        Strings { bytes: Vec::new(), count: 0, charged: 0 }
+    fn new(account: &Arc<AtomicUsize>) -> Strings {
+        Strings { bytes: Vec::new(), count: 0, charged: 0, account: account.clone() }
     }
 
-    /// Room for `n` more bytes, charged (ENOMEM beyond the instance's bound).
+    /// Room for `n` more bytes, charged (ENOMEM beyond the process's bound).
     fn charge(&mut self, n: usize) -> Result<(), i64> {
-        let before = EXEC_STRINGS.fetch_add(n, Ordering::Relaxed);
+        let before = self.account.fetch_add(n, Ordering::Relaxed);
         if before + n > EXEC_STRINGS_MAX {
-            EXEC_STRINGS.fetch_sub(n, Ordering::Relaxed);
+            self.account.fetch_sub(n, Ordering::Relaxed);
             return Err(ENOMEM);
         }
         self.charged += n;
@@ -303,7 +312,7 @@ impl Strings {
 
 impl Drop for Strings {
     fn drop(&mut self) {
-        EXEC_STRINGS.fetch_sub(self.charged, Ordering::Relaxed);
+        self.account.fetch_sub(self.charged, Ordering::Relaxed);
     }
 }
 
@@ -341,8 +350,8 @@ fn read_string(addr: u64, max: usize) -> Result<Vec<u8>, i64> {
 
 /// A NULL-terminated array of strings of the program's (argv, envp); a null array is
 /// empty. `total` counts the bytes of all of them (E2BIG beyond `MAX_ARGS_TOTAL`).
-fn read_strings(addr: u64, total: &mut usize) -> Result<Strings, i64> {
-    let mut out = Strings::new();
+fn read_strings(addr: u64, total: &mut usize, account: &Arc<AtomicUsize>) -> Result<Strings, i64> {
+    let mut out = Strings::new(account);
     if addr == 0 {
         return Ok(out);
     }
@@ -396,8 +405,9 @@ fn execveat(s: &mut State, dirfd: u64, path: u64, argv: u64, envp: u64, flags: u
     }
     let filename = String::from_utf8(read_string(path, 4096).map_err(|e| if e == E2BIG { ENAMETOOLONG } else { e })?).map_err(|_| ENOEXEC)?;
     let mut total = 0;
-    let args = read_strings(argv, &mut total)?;
-    let envs = read_strings(envp, &mut total)?;
+    let account = process::exec_account();
+    let args = read_strings(argv, &mut total, &account)?;
+    let envs = read_strings(envp, &mut total, &account)?;
     let (file, exe) = if filename.is_empty() {
         if flags & AT_EMPTY_PATH == 0 {
             return Err(ENOENT);
@@ -442,7 +452,7 @@ fn prepare(file: File, exe: String, filename: String, args: Strings, envs: Strin
             Some(at) => (trimmed[..at].to_vec(), Some(trim(&trimmed[at..]).to_vec())),
             None => (trimmed.to_vec(), None),
         };
-        let mut new_args = Strings::new();
+        let mut new_args = Strings::new(&args.account);
         new_args.push(&interp)?;
         if let Some(a) = arg.filter(|a| !a.is_empty()) {
             new_args.push(&a)?;
@@ -578,19 +588,19 @@ fn load(p: &Prepared) -> Result<(u64, u64, u64), i64> {
     // (Checked by `prepare`.)
     let bias = p.elf.bias()?;
     map_image(&p.file, &p.elf, bias)?;
-    let brk = page_up(bias + p.elf.span().1);
+    let brk = page_up(bias.wrapping_add(p.elf.span().1));
     let (entry, interp_base) = match &p.interp {
         Some((file, elf)) => {
             let (low, high) = elf.span();
             // Room for it where the kernel finds some.
             let at = map(0, None, high - low, 0, 0)?;
-            let ibias = at - low;
+            let ibias = at.wrapping_sub(low);
             map_image(file, elf, ibias)?;
-            (ibias + elf.entry, ibias)
+            (ibias.wrapping_add(elf.entry), ibias)
         }
-        None => (bias + p.elf.entry, 0),
+        None => (bias.wrapping_add(p.elf.entry), 0),
     };
-    let sp = build_stack(p, bias, interp_base, bias + p.elf.entry)?;
+    let sp = build_stack(p, bias, interp_base, bias.wrapping_add(p.elf.entry))?;
     Ok((entry, sp, brk))
 }
 
@@ -620,9 +630,10 @@ fn prot_of(flags: u32) -> u64 {
 fn map_image(file: &File, elf: &Elf, bias: u64) -> Result<(), i64> {
     for seg in elf.loads() {
         let prot = prot_of(seg.flags);
-        let start = bias + (seg.vaddr & !(PAGE - 1));
-        let data_end = bias + seg.vaddr + seg.filesz;
-        let mem_end = bias + seg.vaddr + seg.memsz;
+        // (The bias may wrap: the sums are the addresses in the image's place.)
+        let start = bias.wrapping_add(seg.vaddr & !(PAGE - 1));
+        let data_end = bias.wrapping_add(seg.vaddr + seg.filesz);
+        let mem_end = bias.wrapping_add(seg.vaddr + seg.memsz);
         if seg.filesz > 0 {
             let len = page_up(data_end) - start;
             map(file.handle, Some(start), len, seg.offset & !(PAGE - 1), prot)?;
@@ -719,7 +730,7 @@ fn build_stack(p: &Prepared, bias: u64, interp_base: u64, entry: u64) -> Result<
         (AT_HWCAP, hwcap),
         (AT_PAGESZ, PAGE),
         (AT_CLKTCK, 100),
-        (AT_PHDR, bias + p.elf.phdr()),
+        (AT_PHDR, bias.wrapping_add(p.elf.phdr())),
         (AT_PHENT, p.elf.phentsize as u64),
         (AT_PHNUM, p.elf.segments.len() as u64),
         (AT_BASE, interp_base),
@@ -817,7 +828,8 @@ pub fn init(s: &mut State) {
     let mut parts = buf.split(|&b| b == 0);
     let path = String::from_utf8_lossy(parts.next().unwrap_or(b"")).into_owned();
     let mut strings = || -> Result<(Strings, Strings), i64> {
-        let (mut args, mut envs) = (Strings::new(), Strings::new());
+        let account = process::exec_account();
+        let (mut args, mut envs) = (Strings::new(&account), Strings::new(&account));
         for a in parts.by_ref() {
             if a.is_empty() {
                 break;
