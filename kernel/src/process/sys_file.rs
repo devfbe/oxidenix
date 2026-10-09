@@ -196,8 +196,10 @@ pub fn openat(dirfd: u64, path: u64, flags: u64, mode: u64) -> SysResult {
 /// A descriptor for a resolved inode, as open(2) makes it: `abs` is its
 /// absolute path (also for the Linux server's `inode_open`).
 pub fn open_inode(inode: Arc<Inode>, flags: u32, abs: String) -> SysResult {
-    // The Linux server's devices (its terminals) are its to open.
-    if matches!(inode.device(), Some(fs::Device::Server(..))) {
+    // The Linux server's devices (its terminals) are its to open; with
+    // O_PATH only the node is (reads and writes are ENXIO).
+    const O_PATH: u32 = 0o10000000;
+    if matches!(inode.device(), Some(fs::Device::Server(..))) && flags & O_PATH == 0 {
         return Err(ENXIO);
     }
     let writable = flags & O_ACCMODE != 0;

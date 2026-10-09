@@ -40,6 +40,8 @@ const AT_EMPTY_PATH: u64 = 0x1000;
 const O_CREAT: u32 = 0o100;
 const O_EXCL: u32 = 0o200;
 const O_NOFOLLOW: u32 = 0o400000;
+const O_DIRECTORY: u32 = 0o200000;
+const O_PATH: u32 = 0o10000000;
 
 const SYS_OPEN: u64 = 2;
 const SYS_STAT: u64 = 4;
@@ -278,20 +280,33 @@ fn openat(dirfd: u64, addr: u64, flags: u32, mode: u32) -> Result<i64, i64> {
     if nofollow && resolved.mode & vfs::S_IFMT == vfs::S_IFLNK {
         return Err(ELOOP);
     }
+    let abs = join(&resolved.path);
     // A character device node names its driver by its number, wherever the
-    // node is: the terminals are the server's (`tty`), the kernel's other
-    // devices (null, zero) its own; a node of the server's tmpfs with another
-    // number has no driver.
+    // node is (the kernel's /dev, the server's tmpfs or devpts): the terminals
+    // are the server's (`tty`), null (1,3) and zero (1,5) the kernel's
+    // (opened through its own node), any other number has no driver (ENXIO).
+    // O_PATH opens the node alone, without the driver; O_DIRECTORY is ENOTDIR.
     if resolved.mode & vfs::S_IFMT == vfs::S_IFCHR {
-        let st = resolved.node.stat()?;
-        if let Some(r) = crate::tty::open_device(vfs::stat::Stat::from_bytes(&st).rdev, flags, st) {
-            return r;
+        if flags & O_DIRECTORY != 0 {
+            return Err(ENOTDIR);
         }
-        if !matches!(resolved.node, Node::Kernel(_)) {
-            return Err(crate::tty::ENXIO);
+        if flags & O_PATH == 0 {
+            let st = resolved.node.stat()?;
+            let rdev = vfs::stat::Stat::from_bytes(&st).rdev;
+            if let Some(r) = crate::tty::open_device(rdev, flags, st) {
+                return r;
+            }
+            if !matches!(resolved.node, Node::Kernel(_)) {
+                let kernel_node = match vfs::stat::dev_split(rdev) {
+                    (1, 3) => "/dev/null",
+                    (1, 5) => "/dev/zero",
+                    _ => return Err(crate::tty::ENXIO),
+                };
+                let Node::Kernel(k) = resolve("/", kernel_node, true)?.node else { return Err(crate::tty::ENXIO) };
+                return check(syscall(SYS_INODE_OPEN, [k.handle(), flags as u64, abs.as_ptr() as u64, abs.len() as u64, 0, 0]));
+            }
         }
     }
-    let abs = join(&resolved.path);
     match resolved.node {
         Node::Kernel(k) => check(syscall(SYS_INODE_OPEN, [k.handle(), flags as u64, abs.as_ptr() as u64, abs.len() as u64, 0, 0])),
         Node::Tmp(t) => tmpfile::open(t, flags, abs),
