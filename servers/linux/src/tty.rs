@@ -776,6 +776,7 @@ impl Tty {
                     }
                     if Self::writable(&inner) {
                         let mut out = Vec::with_capacity(chunk.len() + chunk.len() / 4);
+                        let before = inner.ld.columns();
                         inner.ld.output(&chunk, &mut out);
                         match inner.pty.as_mut() {
                             Some(p) => {
@@ -783,10 +784,17 @@ impl Tty {
                                 self.changed(&mut inner, false, true);
                             }
                             None => {
+                                // The columns this output leaves count once it went
+                                // out: a signal while it waits for the console's turn
+                                // (EINTR, nothing written) must not leave them moved
+                                // for the write's restart to move again.
+                                let after = inner.ld.columns();
+                                inner.ld.set_columns(before);
                                 drop(inner);
                                 if let Err(e) = crate::console::device_write(&out) {
                                     return if written > 0 { Ok(written as i64) } else { Err(e) };
                                 }
+                                self.inner.lock().ld.set_columns(after);
                             }
                         }
                         break;
