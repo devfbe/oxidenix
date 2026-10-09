@@ -513,6 +513,24 @@ static void many_sockets(void) {
         late_s = -1;
     }
     check("200 connections reset unaccepted, then one that works", resets == 200 && late_s >= 0);
+    /* More connections closed actively (each ends in TIME-WAIT) than netd
+     * keeps sockets: the oldest TIME-WAIT ones make room, nothing fails. */
+    int cycled = 0;
+    for (int i = 0; i < 4500; i++) {
+        int a = tcp_connect("127.0.0.1", port);
+        int b = a >= 0 ? accept(l, NULL, NULL) : -1;
+        if (a < 0 || b < 0) {
+            printf("  cycle %d: %s\n", i, strerror(errno));
+            if (a >= 0) close(a);
+            break;
+        }
+        close(a);
+        char e;
+        read(b, &e, 1);
+        close(b);
+        cycled++;
+    }
+    check("4500 connections closed in turn: TIME-WAIT recycled", cycled == 4500);
     if (late >= 0) close(late);
     if (late_s >= 0) close(late_s);
     /* Every connection both ways: a request, then a larger answer. */

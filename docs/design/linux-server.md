@@ -423,9 +423,13 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
      (tcp_fin_timeout) or 100 s without progress (a zero window, a peer that stopped
      acknowledging); a connection attempt gives up after 127 s, unacknowledged data after
      924 s (Linux's SYN and data retries), reported as `ETIMEDOUT`. A connection in
-     TIME-WAIT keeps its smoltcp socket, without buffers, until smoltcp's timer ends it: a
-     retransmitted FIN is answered with an ACK, and its port and 4-tuple stay taken however
-     many there are (no early reuse; they count among the instance's sockets). Ports are never shared across instances (TCP: bound,
+     TIME-WAIT (only the side that closed first enters it) keeps its smoltcp socket, without
+     buffers, until smoltcp's timer ends it: a retransmitted FIN is answered with an ACK, and
+     its port and 4-tuple stay taken. It counts among its instance's sockets; at most 60 s
+     in all however often the peer sends its FIN again (each restarts smoltcp's timer); and
+     when an instance needs a socket its share or the whole has no room for, the oldest
+     TIME-WAIT connection (its own first) goes, as Linux drops TIME-WAIT beyond
+     tcp_max_tw_buckets, so TIME-WAIT never refuses service. Ports are never shared across instances (TCP: bound,
      listening, connected, closing or in TIME-WAIT; UDP: bound), and a connect never takes a
      live, closing or TIME-WAIT 4-tuple (`EADDRNOTAVAIL`). Raw ICMP sockets see the host's
      ICMP packets as on Linux, but no instance sees another's: netd gives each instance's

@@ -147,6 +147,9 @@ const TCP_TIMEOUT: Duration = Duration::from_secs(924);
 /// window, a peer that stopped acknowledging) after this (tcp_orphan_retries:
 /// Linux gives up on an orphan after about 8 retries).
 const FIN_TIMEOUT: Duration = Duration::from_secs(60);
+/// The longest a connection stays in TIME-WAIT, whatever the peer sends
+/// (smoltcp's own TIME-WAIT is 10 s, started again by every FIN).
+const TIME_WAIT_MAX: Duration = Duration::from_secs(60);
 const ORPHAN_TIMEOUT: Duration = Duration::from_secs(100);
 const FIRST_EPHEMERAL: u16 = 49152;
 /// A channel without sockets and requests for this long gives its slot
@@ -504,12 +507,17 @@ struct Closing {
     /// (`FIN_TIMEOUT`, `ORPHAN_TIMEOUT`).
     mark: (tcp::State, usize),
     since: Instant,
+    /// It entered TIME-WAIT then (`TIME_WAIT_MAX`).
+    time_wait: Option<Instant>,
 }
 
 impl Closing {
-    /// When it is reset unless it makes progress (None: it is reset
-    /// already).
+    /// When it is reset unless it makes progress, or (in TIME-WAIT) when it
+    /// goes at the latest; None: it is being reset.
     fn deadline(&self) -> Option<Instant> {
+        if let Some(t) = self.time_wait {
+            return Some(t + TIME_WAIT_MAX);
+        }
         match self.mark.0 {
             _ if !self.orphan => None,
             tcp::State::FinWait2 => Some(self.since + FIN_TIMEOUT),
@@ -927,7 +935,19 @@ impl Service {
         F: FnOnce(&'static mut [u8], &'static mut [u8], &mut SocketSet<'static>) -> SocketHandle,
     {
         let bytes = mapped(rx) + mapped(tx);
-        self.socks.charge(owner, 1)?;
+        // Its share or the whole is used up: its own oldest connection in
+        // TIME-WAIT makes room, else the oldest of anyone's (TIME-WAIT never
+        // refuses an instance service, as Linux drops TIME-WAIT beyond
+        // tcp_max_tw_buckets).
+        let mut charged = self.socks.charge(owner, 1);
+        if charged.is_err() && self.recycle_time_wait(Some(owner), sockets) {
+            charged = self.socks.charge(owner, 1);
+        }
+        // (Others' only help while the owner is below its own cap.)
+        while charged.is_err() && self.socks.held(owner) < MAX_SMOLTCP && self.recycle_time_wait(None, sockets) {
+            charged = self.socks.charge(owner, 1);
+        }
+        charged?;
         if let Err(e) = self.bytes.charge(owner, bytes) {
             self.socks.uncharge(owner, 1);
             return Err(e);
@@ -941,6 +961,24 @@ impl Service {
         let h = make(rx_buffer, tx_buffer, sockets);
         self.mem.insert(h, Mem { owner, rx, tx });
         Ok(h)
+    }
+
+    /// Ends the oldest connection in TIME-WAIT of `owner` (None: of any
+    /// instance), silently (it leaves smoltcp: nothing is sent); false if
+    /// there is none.
+    fn recycle_time_wait(&mut self, owner: Option<u64>, sockets: &mut SocketSet<'static>) -> bool {
+        let now = crate::now();
+        let oldest = self
+            .closing
+            .iter()
+            .enumerate()
+            .filter(|(_, cl)| owner.is_none_or(|o| cl.owner == o) && sockets.get::<tcp::Socket>(cl.handle).state() == tcp::State::TimeWait)
+            .min_by_key(|(_, cl)| cl.time_wait.unwrap_or(now))
+            .map(|(i, _)| i);
+        let Some(i) = oldest else { return false };
+        let cl = self.closing.swap_remove(i);
+        self.drop_socket(sockets, cl.handle);
+        true
     }
 
     /// A new TCP socket for `owner`, without buffers until it connects or
@@ -1528,7 +1566,7 @@ impl Service {
                     if h != own {
                         let owner = self.chan(c).owner;
                         // (Its reset goes out before it goes.)
-                        self.closing.push(Closing { handle: h, leftover: None, sent: 0, local: None, reuse: true, owner, orphan: false, mark: (tcp::State::Closed, 0), since: crate::now() });
+                        self.closing.push(Closing { handle: h, leftover: None, sent: 0, local: None, reuse: true, owner, orphan: false, mark: (tcp::State::Closed, 0), since: crate::now(), time_wait: None });
                     }
                 }
                 self.show(c, sock);
@@ -1620,7 +1658,7 @@ impl Service {
                     }
                     let (local, reuse) = if listener { (None, true) } else { (t.local, t.reuse) };
                     let mark = (socket.state(), socket.send_queue());
-                    self.closing.push(Closing { handle: h, leftover: rest, sent: 0, local, reuse, owner, orphan, mark, since: now });
+                    self.closing.push(Closing { handle: h, leftover: rest, sent: 0, local, reuse, owner, orphan, mark, since: now, time_wait: None });
                 }
             }
             Proto::Udp { handle, .. } | Proto::Raw { handle, .. } => {
@@ -1895,10 +1933,19 @@ impl Service {
                     resize(mem, bytes, cl.handle, Way::Tx, 0, sockets);
                 }
                 cl.drop_leftover(bytes);
-                // No longer an orphan (nothing to finish; no deadline of
-                // ours: smoltcp's timer ends it).
+                // No longer an orphan (nothing to finish).
                 if core::mem::take(&mut cl.orphan) {
                     orphans.uncharge(cl.owner, 1);
+                }
+                // smoltcp starts its timer again for every FIN the peer
+                // sends again (RFC 9293): a peer that keeps sending FINs
+                // would keep it forever. It goes after `TIME_WAIT_MAX` in
+                // all, silently (out of smoltcp: nothing more is sent).
+                let since = *cl.time_wait.get_or_insert(now);
+                if now >= since + TIME_WAIT_MAX {
+                    done.push(cl.handle);
+                    progress = true;
+                    return false;
                 }
                 return true;
             }
