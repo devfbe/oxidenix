@@ -635,12 +635,8 @@ pub const SYS_THREAD_EXISTS: u64 = 1090;
 /// for the server's calls that describe a descriptor in another format
 /// (statx). It goes with the descriptor table (R6e).
 pub const SYS_KFD_STAT: u64 = 1093;
-/// `net_links(buf, cap) -> len`: the network interfaces as netd describes
-/// them (`netproto::Op::Links`: `netproto::Link` records), at most `cap`
-/// bytes at `buf`; ENETDOWN without netd. The kernel only relays netd's
-/// answer. It goes with the sockets (R7), when the server talks to netd
-/// itself.
-pub const SYS_NET_LINKS: u64 = 1094;
+// 1094 was `net_links`, the kernel's relay of netd's interface records:
+// the server asks netd itself since R7b (`netring`'s `LINKS`).
 /// `thread_nice(scope, id, set, nice) -> lowest nice + 20`: the nice
 /// values (-20..=19, the kernel scheduler's weights) of the threads in
 /// `scope`, all of the caller's instance: `NICE_THREAD` the thread `id`

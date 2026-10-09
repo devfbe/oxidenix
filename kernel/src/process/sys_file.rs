@@ -16,7 +16,6 @@ const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
 const AT_REMOVEDIR: u64 = 0x200;
 const AT_EMPTY_PATH: u64 = 0x1000;
 const S_IFIFO: u32 = 0o010000;
-const S_IFSOCK: u32 = 0o140000;
 const UMASK: u32 = 0o022;
 
 pub fn file(fd: u64) -> Result<Arc<OpenFile>, i64> {
@@ -257,7 +256,6 @@ pub fn fstat_bytes(fd: u64) -> Result<[u8; 144], i64> {
     let anon = |mode: u32| Ok(stat_bytes(f.number, mode, 0, (1, 0, 0, 0)));
     match f.inode() {
         Some(inode) => inode_stat(inode),
-        None if f.socket().is_some() => anon(S_IFSOCK | 0o777),
         // An anonymous inode, as on Linux: no file type.
         None if matches!(f.kind, Kind::EventFd(_) | Kind::Epoll(_)) => anon(0o600),
         None => anon(S_IFIFO | 0o600),

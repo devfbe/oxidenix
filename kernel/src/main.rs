@@ -19,7 +19,6 @@ mod drivers;
 mod fs;
 mod interrupts;
 mod memory;
-mod net;
 mod process;
 mod shell;
 pub mod smp;
@@ -151,7 +150,10 @@ fn start_diskfs() {
 /// DMA memory for netd: two virtqueues and their packet buffers.
 const NETD_DMA_PAGES: u64 = 128;
 
-/// Hands the first virtio network card (legacy interface) to netd.
+/// Hands the first virtio network card (legacy interface) to netd, which
+/// serves the Linux server instances' sockets over the channels they offer
+/// it (R7b); the kernel starts it again when an instance connects after it
+/// died (ADR 0006).
 fn start_netd() {
     let Some(nic) = drivers::pci::find(0x1af4, 0x1000) else {
         return printkln!("[boot] no virtio network card; networking is off");
@@ -172,12 +174,9 @@ fn start_netd() {
             .start_timeout(5 * time::NSEC_PER_SEC),
         Err(e) => return printkln!("[boot] cannot load /sbin/netd (errno {})", e),
     };
-    let server = Arc::new(server);
-    if let Err(e) = server.start() {
+    if let Err(e) = Arc::new(server).start() {
         printkln!("[boot] netd did not start (errno {}); networking is off", e);
     }
-    // Sockets restart netd through this if it dies.
-    net::set_server(server);
 }
 
 /// Leaves QEMU through its isa-debug-exit device; the exit status of QEMU

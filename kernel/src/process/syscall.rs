@@ -4,7 +4,7 @@
 use super::address_space::USER_END;
 use super::errno::*;
 use super::sys_file::{self, AT_FDCWD};
-use super::{epoll, signal, sys_mem, sys_net, sys_time, uaccess};
+use super::{epoll, signal, sys_mem, sys_time, uaccess};
 use crate::interrupts::gdt;
 use x86_64::registers::model_specific::{Efer, EferFlags, FsBase, LStar, SFMask, Star};
 use x86_64::registers::rflags::RFlags;
@@ -255,22 +255,8 @@ pub(super) fn dispatch_linux(f: &mut Frame) {
         186 => Ok(super::current_tid() as i64),
         218 => super::set_tid_address(a0).map(|tid| tid as i64),
         40 => sys_file::sendfile(a0, a1, a2, a3),
-        41 => sys_net::socket(a0, a1, a2),
-        42 => sys_net::connect(a0, a1, a2),
-        43 => sys_net::accept(a0, a1, a2, 0),
-        44 => sys_net::sendto(a0, a1, a2, a3, a4, a5),
-        45 => sys_net::recvfrom(a0, a1, a2, a3, a4, a5),
-        46 => sys_net::sendmsg(a0, a1, a2),
-        47 => sys_net::recvmsg(a0, a1, a2),
-        48 => sys_net::shutdown(a0, a1),
-        49 => sys_net::bind(a0, a1, a2),
-        50 => sys_net::listen(a0, a1),
-        51 => sys_net::getsockname(a0, a1, a2, false),
-        52 => sys_net::getsockname(a0, a1, a2, true),
-        53 => Err(EOPNOTSUPP), // socketpair: no AF_UNIX
-        54 => sys_net::setsockopt(a0),
-        55 => sys_net::getsockopt(a0, a1, a2, a3, a4),
-        288 => sys_net::accept(a0, a1, a2, a3),
+        // Sockets (41-55, 288, 299, 307) are the Linux server's (R7a, R7b):
+        // none reaches the kernel.
         99 => super::query::sysinfo(a0),
         125 => super::prctl::capget(a0, a1),
         128 => signal::sigtimedwait(a0, a1, a2, a3),
@@ -332,7 +318,6 @@ pub(super) fn dispatch_linux(f: &mut Frame) {
         1003 => super::irq::enable(a0),
         1004 => super::dma_map(a0),
         1005 => super::query::proc_query(a0, a1, a2, a3),
-        1006 => super::ipc::notify(a0),
         // The service's end of a channel (see `channel`, oxrt::sys).
         1068 => super::channel::attach(a0),
         1069 => super::channel::detach(a0),

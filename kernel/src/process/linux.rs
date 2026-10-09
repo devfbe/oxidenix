@@ -1585,12 +1585,6 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             super::uaccess::copy_to_server(a[1], &st)?;
             Ok(0)
         }
-        SYS_NET_LINKS => {
-            let links = crate::net::links()?;
-            let n = links.len().min(a[1] as usize);
-            super::uaccess::copy_to_server(a[0], &links[..n])?;
-            Ok(n as i64)
-        }
         SYS_KFD_INSTALL_FILE => {
             use crate::fs::file::O_CLOEXEC;
             let flags = a[1] as u32;

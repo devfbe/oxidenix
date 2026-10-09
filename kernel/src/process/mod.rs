@@ -21,7 +21,6 @@ pub mod sched;
 pub mod signal;
 mod sys_file;
 mod sys_mem;
-mod sys_net;
 mod sys_time;
 pub mod syscall;
 pub mod task;

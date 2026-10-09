@@ -17,7 +17,6 @@ pc-keyboard = "0.7"
 spin = "0.9"
 heapless = "0.9"
 fsproto = { path = "../crates/fsproto" }
-netproto = { path = "../crates/netproto" }
 procproto = { path = "../crates/procproto" }
 restricted = { path = "../crates/restricted" }
 vfs = { path = "../crates/vfs" }

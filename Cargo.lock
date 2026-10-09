@@ -458,13 +458,6 @@ name = "netlink"
 version = "0.1.0"
 
 [[package]]
-name = "netproto"
-version = "0.1.0"
-dependencies = [
- "fsproto",
-]
-
-[[package]]
 name = "netring"
 version = "0.1.0"
 dependencies = [
@@ -492,7 +485,6 @@ dependencies = [
  "heapless",
  "lazy_static",
  "linked_list_allocator",
- "netproto",
  "noto-sans-mono-bitmap",
  "pc-keyboard",
  "pic8259",

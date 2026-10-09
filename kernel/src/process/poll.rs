@@ -1,16 +1,17 @@
 //! Waiting for any of several files at once (poll, select, epoll_wait).
 //!
 //! A file announces changes of its readiness on a wait queue (its
-//! `PollSource`): a channel of the global wait queues for pipes, eventfds
-//! and the TTY, an epoll instance's own queue for that instance. A
-//! `Registration` puts a waker on that queue until it is dropped.
+//! `PollSource`): a channel of the global wait queues for pipes, eventfds,
+//! the TTY and the Linux server's files (its sockets among them: the
+//! server reports their readiness, `kfd_ready`), an epoll instance's own
+//! queue for that instance. A `Registration` puts a waker on that queue
+//! until it is dropped.
 //!
 //! A `PollTable` registers one waker on the source of every file it
 //! checks, the first time it checks that file, and unregisters them all
 //! when the call returns. A wakeup on any of them ends the wait, so poll
 //! returns as soon as a pipe gets data or a key is typed, not at the next
-//! re-check. Sockets, whose readiness lives in a user-space server, are
-//! announced by that server (`ipc::notify`), and on the server's death.
+//! re-check.
 //!
 //! The protocol cannot lose a wakeup: `rearm` forgets earlier wakeups
 //! before the files are checked, and `wait` sleeps only if none came
@@ -33,9 +34,6 @@ pub enum PollSource {
     Chan(usize),
     /// On an epoll instance's own queue.
     Epoll(Arc<Epoll>),
-    /// By a server (sockets: netd), on its event channel for the file,
-    /// and on the channel woken when that server dies.
-    Server { event: usize, gone: usize },
 }
 
 /// A waker on a file's wait queue; dropping it takes it off again.
@@ -46,7 +44,6 @@ pub struct Registration {
 
 enum Registered {
     Chan(usize),
-    Chans(usize, usize),
     Epoll(Arc<Epoll>),
 }
 
@@ -64,14 +61,6 @@ impl Registration {
                 ep.queue().add_waker(0, waker.clone())?;
                 Registered::Epoll(ep.clone())
             }
-            PollSource::Server { event, gone } => {
-                queue_of(*event).add_waker(*event, waker.clone())?;
-                if let Err(e) = queue_of(*gone).add_waker(*gone, waker.clone()) {
-                    queue_of(*event).remove_waker(*event, &waker);
-                    return Err(e);
-                }
-                Registered::Chans(*event, *gone)
-            }
         };
         Ok(Some(Registration { on, waker }))
     }
@@ -80,7 +69,6 @@ impl Registration {
         match (&self.on, source) {
             (Registered::Chan(a), PollSource::Chan(b)) => a == b,
             (Registered::Epoll(a), PollSource::Epoll(b)) => Arc::ptr_eq(a, b),
-            (Registered::Chans(a, _), PollSource::Server { event: b, .. }) => a == b,
             _ => false,
         }
     }
@@ -90,10 +78,6 @@ impl Drop for Registration {
     fn drop(&mut self) {
         match &self.on {
             Registered::Chan(chan) => queue_of(*chan).remove_waker(*chan, &self.waker),
-            Registered::Chans(a, b) => {
-                queue_of(*a).remove_waker(*a, &self.waker);
-                queue_of(*b).remove_waker(*b, &self.waker);
-            }
             Registered::Epoll(ep) => ep.queue().remove_waker(0, &self.waker),
         }
     }
