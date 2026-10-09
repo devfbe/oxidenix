@@ -732,7 +732,7 @@ impl InetSock {
             return Err(EPIPE);
         }
         let deadline = deadline(self.st.lock().opts.sndtimeo);
-        let _writer = self.wlock.lock();
+        let mut writer = Some(self.wlock.lock());
         // The datagram at the start of the send ring (a plain buffer for a
         // datagram socket), copied once.
         let buf = unsafe { core::slice::from_raw_parts_mut(r.tx(), len) };
@@ -740,9 +740,16 @@ impl InetSock {
         if got < len {
             return Err(EFAULT);
         }
+        // Kept here while it waits for room: other writers may use the
+        // ring meanwhile.
+        let mut kept: Option<alloc::vec::Vec<u8>> = None;
         loop {
             if self.net.is_dead() {
                 return Err(self.pending(&mut self.st.lock(), &self.snap(), true).unwrap_or(EIO));
+            }
+            if writer.is_none() {
+                writer = Some(self.wlock.lock());
+                buf.copy_from_slice(kept.as_deref().expect("kept before the wait"));
             }
             let seen = self.ctl().seen();
             match self.net.status(Request::Send { sock: self.index, to: to.unwrap_or_default(), len: len as u32 }) {
@@ -755,6 +762,12 @@ impl InetSock {
                 // Room came meanwhile: try again at once.
                 continue;
             }
+            // Waiting (interruptibly) without the writer lock: other
+            // threads' sends do not wait behind this one's.
+            if kept.is_none() {
+                kept = Some(buf.to_vec());
+            }
+            drop(writer.take());
             self.wait(seen, deadline)?;
         }
     }

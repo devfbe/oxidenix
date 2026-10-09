@@ -265,17 +265,15 @@ fn budgets_bound_each_instance_and_all() {
     assert_eq!(b.charge(2, 41), Err(ENOBUFS));
     assert_eq!(b.charge(2, 40), Ok(()));
     assert_eq!(b.charge(3, 1), Err(ENOBUFS));
-    // Given back to the instance charged, never more than it holds.
-    b.uncharge(1, 1000);
+    // Given back to the instance charged.
+    b.uncharge(1, 60);
     assert_eq!((b.held(1), b.used()), (0, 40));
-    b.uncharge(4, 10);
-    assert_eq!(b.used(), 40);
     // Instance 1 (active) keeps its reserve: 3 gets the rest.
     assert_eq!(b.room(3), 50);
     assert_eq!(b.charge(3, 50), Ok(()));
     assert_eq!(b.room(1), 10, "an active instance's reserve stays free");
     b.uncharge(2, 40);
-    b.uncharge(3, 60);
+    b.uncharge(3, 50);
     b.deactivate(1);
     b.deactivate(1);
     assert_eq!((b.used(), b.room(5)), (0, 60));
@@ -697,4 +695,15 @@ fn echo_ids_keep_instances_apart() {
     ids.forget(3);
     ids.forget(2);
     assert!(ids.is_empty());
+}
+
+/// Giving back more than an instance holds is a lost count: debug builds
+/// stop there (release builds give back what it holds).
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "gives back")]
+fn giving_back_more_than_held_is_caught() {
+    let mut b = Budget::new(100, 0, 100);
+    b.charge(1, 10).unwrap();
+    b.uncharge(1, 11);
 }

@@ -839,8 +839,10 @@ impl Budget {
         Ok(())
     }
 
-    /// Gives `n` back from `owner` (never more than it holds).
+    /// Gives `n` back from `owner` (never more than it holds: a caller
+    /// that gives back more has lost count, which debug builds catch).
     pub fn uncharge(&mut self, owner: u64, n: usize) {
+        debug_assert!(n <= self.held(owner), "instance {owner} gives back {n} of {}", self.held(owner));
         let n = n.min(self.held(owner));
         self.used -= n;
         self.update(owner, |o| o.held -= n);

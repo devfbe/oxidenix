@@ -83,6 +83,15 @@ time) and so may anything on the network.
   instance's activity nor can anyone predict them. ICMP
   echo identifiers are netd's on the wire (`netring::EchoIds`): an instance gets the replies
   to its own requests only, whatever identifier it picks, and the errors about its own ports.
+- **What ICMP still shares**: messages that concern no instance go to every raw socket, as on
+  Linux: echo requests from other hosts (which netd answers itself), and every type netd does
+  not attribute (timestamp, router and address-mask messages, redirects for no port of
+  anyone's). Errors about TCP or UDP ports go to the instance holding the port at the time
+  they arrive; one that comes after the port changed hands (a late error about a closed
+  connection whose port another instance took since) goes to the new holder, and one about
+  a port nobody holds goes to nobody. Echo replies and errors about requests whose
+  identifier netd no longer remembers (after 60 s unused, or beyond 64 per instance) go to
+  nobody.
 - **What an instance can deny another**: nothing below a reserve. Every shared resource
   (buffer memory, smoltcp sockets with those in TIME-WAIT, orphans, half-open connections) is a
   `netring::Budget` with a cap per instance and a reserve kept for every instance with a
