@@ -28,10 +28,17 @@
 //! sequence word and wakes its waiters, and its readiness (Linux's
 //! unix_poll and unix_dgram_poll) is reported under its lock.
 //!
-//! Locking: a socket's lock is never held while another's is taken, except
-//! the leaf lock of a socket's waiter list; messages (whose drop uncharges
-//! their sender and may close descriptors in flight) are dropped only once
-//! no socket lock is held.
+//! Locking: a socket's lock is never held while another's is taken, with
+//! two exceptions that cannot form a cycle: the leaf lock of a socket's
+//! waiter list, and a new connection (not yet reachable by anyone else),
+//! set up under its listener's lock. The collector's lock (`scm`) comes
+//! before any socket's (MSG_PEEK installs descriptors under a socket's
+//! lock). Messages (whose drop uncharges their sender and may close
+//! descriptors in flight) are dropped only once no socket lock is held.
+//!
+//! A call on a socket keeps it open while it lasts (`kfd_lookup` pins the
+//! file until the call returns): another thread's close does not end a
+//! blocked receive or accept, as on Linux.
 
 use crate::files;
 use crate::namespace::Node;
@@ -262,8 +269,6 @@ pub struct Sock {
     /// The address of its peer's `Sock` (0: none), for a peer's lockless
     /// look.
     peer_addr: AtomicUsize,
-    /// Calls on it in progress (the collector leaves it alone meanwhile).
-    busy: AtomicUsize,
     /// Datagram senders whose writability waits for room in its queue (a
     /// leaf lock).
     waiters: Mutex<Vec<Weak<Sock>>>,
@@ -286,8 +291,37 @@ pub enum Fds {
     /// Taken from their message, to be installed.
     Taken(Vec<Passed>),
     /// Installed already, copies of those of a message left in the queue
-    /// (MSG_PEEK).
-    Installed(Vec<i32>),
+    /// (MSG_PEEK): as many as there was room for, of how many.
+    Installed(Vec<i32>, usize),
+}
+
+/// How a receive goes.
+#[derive(Clone, Copy)]
+pub struct RecvOpts {
+    /// MSG_PEEK: the data stays, the descriptors are installed as copies.
+    pub peek: bool,
+    /// MSG_WAITALL (streams): wait until the buffer is full.
+    pub waitall: bool,
+    pub nonblock: bool,
+    /// MSG_CMSG_CLOEXEC: received descriptors are close-on-exec.
+    pub cloexec: bool,
+    /// How many descriptors the caller's control buffer has room for
+    /// (MSG_PEEK installs no more).
+    pub fd_room: usize,
+}
+
+/// Installs copies of a peeked message's descriptors, as many as there is
+/// room for (`gc` holds the collector off).
+fn peek_fds(fds: &[Passed], gc: &crate::sync::ReadGuard, o: &RecvOpts) -> Fds {
+    let mut out = Vec::new();
+    for p in fds.iter().take(o.fd_room) {
+        match p.install_copy(gc, o.cloexec) {
+            Ok(fd) => out.push(fd),
+            // EMFILE: the rest are not delivered (MSG_CTRUNC).
+            Err(_) => break,
+        }
+    }
+    Fds::Installed(out, fds.len())
 }
 
 /// Where received bytes go.
@@ -406,21 +440,6 @@ impl Source<'_> {
 }
 
 
-/// Marks a call in progress on a socket.
-pub struct Busy(Arc<Sock>);
-
-impl Drop for Busy {
-    fn drop(&mut self) {
-        self.0.busy.fetch_sub(1, Ordering::Release);
-    }
-}
-
-impl core::ops::Deref for Busy {
-    type Target = Arc<Sock>;
-    fn deref(&self) -> &Arc<Sock> {
-        &self.0
-    }
-}
 
 /// Monotonic nanoseconds.
 fn now() -> u64 {
@@ -444,7 +463,6 @@ impl Sock {
             sndbuf: AtomicUsize::new(DEFAULT_BUF),
             qlen: AtomicUsize::new(0),
             peer_addr: AtomicUsize::new(0),
-            busy: AtomicUsize::new(0),
             waiters: Mutex::new(Vec::new()),
             inner: Mutex::new(Inner {
                 state: State::Unconnected,
@@ -496,15 +514,6 @@ impl Sock {
         self.id.store(id, Ordering::Release);
     }
 
-    /// Marks a call in progress (until the guard goes).
-    pub fn enter(self: &Arc<Self>) -> Busy {
-        self.busy.fetch_add(1, Ordering::Acquire);
-        Busy(self.clone())
-    }
-
-    pub fn busy(&self) -> bool {
-        self.busy.load(Ordering::Acquire) > 0
-    }
 
     fn set_peer(&self, i: &mut Inner, peer: Option<Arc<Sock>>) {
         self.peer_addr.store(peer.as_ref().map_or(0, |p| Arc::as_ptr(p) as usize), Ordering::Release);
@@ -1144,6 +1153,10 @@ impl Sock {
                     return Ok(n);
                 }
             }
+            // Held back: the readiness reported may still say writable
+            // (others filled the queue since); it says what holds now, and
+            // the target wakes it when there is room again.
+            self.notify(false);
             if nonblock {
                 drop(msg);
                 return Err(EAGAIN);
@@ -1155,14 +1168,13 @@ impl Sock {
         }
     }
 
-    /// Receives into `dst` (see `Received`). `peek` leaves the data (and
-    /// installs copies of the descriptors, close-on-exec with `cloexec`),
-    /// `waitall` (streams) waits until `dst` is full.
-    pub fn recv(&self, dst: &mut Sink, peek: bool, waitall: bool, nonblock: bool, cloexec: bool) -> Result<Received, i64> {
-        if self.ty == STREAM { self.recv_stream(dst, peek, waitall, nonblock, cloexec) } else { self.recv_dgram(dst, peek, nonblock, cloexec) }
+    /// Receives into `dst` (see `Received`, `RecvOpts`).
+    pub fn recv(&self, dst: &mut Sink, o: RecvOpts) -> Result<Received, i64> {
+        if self.ty == STREAM { self.recv_stream(dst, o) } else { self.recv_dgram(dst, o) }
     }
 
-    fn recv_stream(&self, dst: &mut Sink, peek: bool, waitall: bool, nonblock: bool, cloexec: bool) -> Result<Received, i64> {
+    fn recv_stream(&self, dst: &mut Sink, o: RecvOpts) -> Result<Received, i64> {
+        let (peek, waitall, nonblock) = (o.peek, o.waitall, o.nonblock);
         let want = dst.room();
         let target = if waitall { want } else { want.min(1) };
         let mut out = Received { copied: 0, len: 0, trunc: false, fds: Fds::Taken(Vec::new()), cred: None, from: None };
@@ -1172,6 +1184,9 @@ impl Sock {
         'outer: loop {
             let seen;
             {
+                // Peeked descriptors are installed under the socket's lock:
+                // the collector is held off first (see `scm`).
+                let gc = peek.then(crate::scm::hold);
                 let mut i = self.inner.lock();
                 if i.state != State::Connected {
                     result = Err(EINVAL);
@@ -1195,7 +1210,7 @@ impl Sock {
                     }
                     seen = self.seq.load(Ordering::Acquire);
                 } else {
-                    let (took_fds, fault) = self.take_pieces(&mut i, dst, &mut out, &mut gone, peek, cloexec);
+                    let (took_fds, fault) = self.take_pieces(&mut i, dst, &mut out, &mut gone, gc.as_ref(), &o);
                     if let Some(e) = fault {
                         if out.copied == 0 {
                             result = Err(e);
@@ -1229,7 +1244,8 @@ impl Sock {
     /// different credentials when they are passed, and not beyond one that
     /// carried descriptors. Pieces read up go to `gone`. Returns whether
     /// descriptors came, and the error of a fault.
-    fn take_pieces(&self, i: &mut Inner, dst: &mut Sink, out: &mut Received, gone: &mut Vec<Msg>, peek: bool, cloexec: bool) -> (bool, Option<i64>) {
+    fn take_pieces(&self, i: &mut Inner, dst: &mut Sink, out: &mut Received, gone: &mut Vec<Msg>, gc: Option<&crate::sync::ReadGuard>, o: &RecvOpts) -> (bool, Option<i64>) {
+        let peek = o.peek;
         let passcred = i.passcred;
         let mut took_fds = false;
         let mut fault = None;
@@ -1258,10 +1274,9 @@ impl Sock {
             out.copied += n;
             if !msg.fds.is_empty() {
                 took_fds = true;
-                out.fds = if peek {
-                    Fds::Installed(msg.fds.iter().filter_map(|p| p.install_copy(cloexec).ok()).collect())
-                } else {
-                    Fds::Taken(core::mem::take(&mut msg.fds))
+                out.fds = match gc {
+                    Some(gc) if peek => peek_fds(&msg.fds, gc, o),
+                    _ => Fds::Taken(core::mem::take(&mut msg.fds)),
                 };
             }
             if peek {
@@ -1285,11 +1300,13 @@ impl Sock {
         (took_fds, fault)
     }
 
-    fn recv_dgram(&self, dst: &mut Sink, peek: bool, nonblock: bool, cloexec: bool) -> Result<Received, i64> {
+    fn recv_dgram(&self, dst: &mut Sink, o: RecvOpts) -> Result<Received, i64> {
         let deadline = deadline(self.inner.lock().rcvtimeo);
         loop {
             let seen;
             {
+                // As in `recv_stream`.
+                let gc = o.peek.then(crate::scm::hold);
                 let mut i = self.inner.lock();
                 if self.ty == SEQPACKET && i.state != State::Connected {
                     return Err(ENOTCONN);
@@ -1306,8 +1323,8 @@ impl Sock {
                         cred: passcred.then_some(msg.cred),
                         from: msg.from.clone(),
                     };
-                    if peek {
-                        out.fds = Fds::Installed(msg.fds.iter().filter_map(|p| p.install_copy(cloexec).ok()).collect());
+                    if let Some(gc) = &gc {
+                        out.fds = peek_fds(&msg.fds, gc, &o);
                         return Ok(out);
                     }
                     out.fds = Fds::Taken(core::mem::take(&mut msg.fds));
@@ -1328,7 +1345,7 @@ impl Sock {
                 if i.shut & RCV != 0 {
                     return Ok(Received { copied: 0, len: 0, trunc: false, fds: Fds::Taken(Vec::new()), cred: None, from: None });
                 }
-                if nonblock {
+                if o.nonblock {
                     return Err(EAGAIN);
                 }
                 seen = self.seq.load(Ordering::Acquire);

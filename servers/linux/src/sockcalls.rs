@@ -113,7 +113,6 @@ pub fn handle(s: &State) -> Option<i64> {
                 // Another of the server's files: not a socket.
                 _ => return Some(-crate::unix::ENOTSOCK),
             };
-            let sock = sock.enter();
             match s.rax {
                 SYS_CONNECT => connect(&sock, flags, a1, a2),
                 SYS_ACCEPT => accept4(&sock, flags, a1, a2, 0),
@@ -174,7 +173,15 @@ fn socket(ty: u64, protocol: u64) -> Result<i64, i64> {
 fn socketpair(ty: u64, protocol: u64, sv: u64) -> Result<i64, i64> {
     let kind = kind(ty, protocol)?;
     let (a, b) = Sock::pair(kind);
-    let fa = install(&a, ty)?;
+    let fa = match install(&a, ty) {
+        Ok(fd) => fd,
+        Err(e) => {
+            // Each keeps the other (its peer): both go.
+            a.release();
+            b.release();
+            return Err(e);
+        }
+    };
     let fb = match install(&b, ty) {
         Ok(fd) => fd,
         Err(e) => {
@@ -413,8 +420,11 @@ fn parse_control(control: u64, len: u64) -> Result<(Vec<Passed>, Cred), i64> {
                     let word = |k: usize| u32::from_le_bytes(data[k..k + 4].try_into().expect("4 bytes"));
                     let given = Cred { pid: word(0), uid: word(4), gid: word(8) };
                     // Everyone is root: any process's credentials may be
-                    // claimed, but the process must exist.
-                    if given.pid != cred.pid && (given.pid == 0 || syscall(SYS_THREAD_EXISTS, [given.pid as u64, 0, 0, 0, 0, 0]) < 0) {
+                    // claimed, but the process must exist in this tree
+                    // (another tree's are none of its business).
+                    if given.pid != cred.pid
+                        && (given.pid == 0 || syscall(SYS_THREAD_EXISTS, [given.pid as u64, THREAD_IN_INSTANCE, 0, 0, 0, 0]) < 0)
+                    {
                         return Err(ESRCH);
                     }
                     cred = given;
@@ -496,7 +506,12 @@ fn recv_common(sock: &Arc<Sock>, fflags: u32, dst: &mut Sink, control: u64, cap:
     }
     let nonblock = fflags & O_NONBLOCK != 0 || flags & MSG_DONTWAIT != 0;
     let cloexec = flags & MSG_CMSG_CLOEXEC != 0;
-    let r = sock.recv(dst, flags & MSG_PEEK != 0, flags & MSG_WAITALL != 0, nonblock, cloexec)?;
+    let cap = cap.min(isize::MAX as u64) as usize;
+    // Room for descriptors after the credentials (which come first).
+    let left = cap - if sock.passcred() { cmsg_align(16 + 12).min(cap) } else { 0 };
+    let fd_room = if control != 0 && left > 16 { (left - 16) / 4 } else { 0 };
+    let o = RecvOpts { peek: flags & MSG_PEEK != 0, waitall: flags & MSG_WAITALL != 0, nonblock, cloexec, fd_room };
+    let r = sock.recv(dst, o)?;
     let mut info = RecvInfo { ret: r.copied, flags: 0, from: r.from, control_used: 0 };
     if r.trunc {
         info.flags |= MSG_TRUNC as u32;
@@ -505,9 +520,10 @@ fn recv_common(sock: &Arc<Sock>, fflags: u32, dst: &mut Sink, control: u64, cap:
         }
     }
     let mut used = 0usize;
-    let cap = cap.min(isize::MAX as u64) as usize;
+    // What was received is the caller's now: a control buffer it cannot
+    // be told through loses what it would have said, not the data.
     if let Some(c) = r.cred {
-        put_cmsg(control, cap, &mut used, &mut info.flags, SCM_CREDENTIALS, &c.bytes())?;
+        put_cmsg(control, cap, &mut used, &mut info.flags, SCM_CREDENTIALS, &c.bytes());
     }
     put_fds(control, cap, &mut used, &mut info.flags, r.fds, cloexec);
     info.control_used = used as u64;
@@ -515,12 +531,12 @@ fn recv_common(sock: &Arc<Sock>, fflags: u32, dst: &mut Sink, control: u64, cap:
 }
 
 /// One control message (Linux's put_cmsg: truncated to what is left, with
-/// MSG_CTRUNC).
-fn put_cmsg(control: u64, cap: usize, used: &mut usize, flags: &mut u32, ty: i32, data: &[u8]) -> Result<(), i64> {
+/// MSG_CTRUNC; nothing if the buffer cannot be written).
+fn put_cmsg(control: u64, cap: usize, used: &mut usize, flags: &mut u32, ty: i32, data: &[u8]) {
     let left = cap - *used;
     if control == 0 || left < 16 {
         *flags |= MSG_CTRUNC;
-        return Ok(());
+        return;
     }
     let mut len = 16 + data.len();
     if left < len {
@@ -532,9 +548,9 @@ fn put_cmsg(control: u64, cap: usize, used: &mut usize, flags: &mut u32, ty: i32
     bytes.extend_from_slice(&SOL_SOCKET.to_le_bytes());
     bytes.extend_from_slice(&ty.to_le_bytes());
     bytes.extend_from_slice(data);
-    usercopy::to_program(control + *used as u64, &bytes[..len])?;
-    *used += cmsg_align(16 + data.len()).min(left);
-    Ok(())
+    if usercopy::to_program(control + *used as u64, &bytes[..len]).is_ok() {
+        *used += cmsg_align(16 + data.len()).min(left);
+    }
 }
 
 /// SCM_RIGHTS: installs as many of the descriptors as fit (Linux's
@@ -542,7 +558,7 @@ fn put_cmsg(control: u64, cap: usize, used: &mut usize, flags: &mut u32, ty: i32
 fn put_fds(control: u64, cap: usize, used: &mut usize, flags: &mut u32, fds: Fds, cloexec: bool) {
     let count = match &fds {
         Fds::Taken(v) => v.len(),
-        Fds::Installed(v) => v.len(),
+        Fds::Installed(_, total) => *total,
     };
     if count == 0 {
         return;
@@ -562,7 +578,7 @@ fn put_fds(control: u64, cap: usize, used: &mut usize, flags: &mut u32, fds: Fds
                 }
             }
         }
-        Fds::Installed(v) => {
+        Fds::Installed(v, _) => {
             for fd in v {
                 if installed.len() < fit {
                     installed.push(fd);
@@ -764,7 +780,6 @@ fn getsockopt(sock: &Arc<Sock>, level: u64, name: u64, val: u64, lenp: u64) -> R
 /// read, write, readv, writev, fstat, ioctl and the rest on a socket's
 /// descriptor (`flags`: its open flags).
 pub fn on_file(nr: u64, sock: &Arc<Sock>, flags: u32, a1: u64, a2: u64) -> Result<i64, i64> {
-    let sock = sock.enter();
     match nr {
         files::SYS_READ => recv_common(&sock, flags, &mut Sink::program(&[(a1, a2)]), 0, 0, 0).map(|i| i.ret as i64),
         files::SYS_READV => {
@@ -790,13 +805,11 @@ pub fn on_file(nr: u64, sock: &Arc<Sock>, flags: u32, a1: u64, a2: u64) -> Resul
 
 /// Reads into the server's memory (sendfile from a socket).
 pub fn read_server(sock: &Arc<Sock>, flags: u32, buf: &mut [u8]) -> Result<i64, i64> {
-    let sock = sock.enter();
     recv_common(&sock, flags, &mut Sink::Server { buf, at: 0 }, 0, 0, 0).map(|i| i.ret as i64)
 }
 
 /// Writes the server's memory (sendfile to a socket).
 pub fn write_server(sock: &Arc<Sock>, flags: u32, buf: &[u8]) -> Result<i64, i64> {
-    let sock = sock.enter();
     send_common(&sock, flags, None, &mut Source::Server { buf, at: 0 }, (0, 0), 0).map(|n| n as i64)
 }
 

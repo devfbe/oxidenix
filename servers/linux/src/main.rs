@@ -89,18 +89,13 @@ pub extern "C" fn _start(state: *mut State, role: u64) -> ! {
         match s.rax {
             TEST_MAP..=TEST_CACHED => s.rax = test(s.rax, s.rdi) as u64,
             nr if nr >= FIRST_NON_LINUX => s.rax = -ENOSYS as u64,
-            nr => {
+            _ => {
                 records::before_pass_through(s);
                 // Server files the call closed for good go at once.
                 let mut closed = [0u64; 16];
                 let n = syscall(SYS_LEGACY_SYSCALL, [closed.as_mut_ptr() as u64, closed.len() as u64, 0, 0, 0, 0]);
                 for &id in closed.iter().take(n.max(0) as usize) {
                     files::closed(id);
-                }
-                // A descriptor closed (close, dup2, dup3, close_range) may
-                // have been the last way into sockets in flight.
-                if matches!(nr, 3 | 33 | 292 | 436) && scm::sockets_in_flight() {
-                    scm::collect();
                 }
                 datafs::reap();
             }
@@ -173,6 +168,12 @@ fn pager() -> ! {
             }
             EVENT_CLOSING => {
                 datafs::closing();
+                continue;
+            }
+            EVENT_INFLIGHT => {
+                // A way into sockets in flight went (a descriptor closed,
+                // by close, exit or exec, or a call that used one ended).
+                scm::collect();
                 continue;
             }
             EVENT_MKWRITE => {

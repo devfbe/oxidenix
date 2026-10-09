@@ -79,20 +79,20 @@ module comment, and the public types it defines. Where to start for common tasks
 - `servers/linux/src/fsclient.rs` (410) The server's end of the file protocol (`fsring`, docs/design/io-rings.md) to diskfs: one channel for the instance, shared by every thread of the tree's processes and by the pager thread. Types: `Ticket`, `Client`, `Scratch`, `Next`.
 - `servers/linux/src/heap.rs` (60) The server's heap: one allocator for every thread of the instance, in the shared region, growing by `SYS_SHARED_MAP` when it runs out. Types: `ServerHeap`.
 - `servers/linux/src/initramfs.rs` (65) The instance's root tmpfs from the boot image's initramfs (phase R6c.2c): the server reads the archive's headers and names from the kernel's image object (`SYS_INITRAMFS`) and makes each regular file a file object...
-- `servers/linux/src/main.rs` (285) The Linux server (docs/design/linux-server.md).
+- `servers/linux/src/main.rs` (286) The Linux server (docs/design/linux-server.md).
 - `servers/linux/src/mm.rs` (150) Memory system calls (phase R4): Linux's semantics of mmap, munmap, mprotect, mremap, madvise, msync and the mlock family, over the kernel's mapping calls.
 - `servers/linux/src/namespace.rs` (244) The server's namespace (phase R6c.2): mounts and path resolution. Types: `KInode`, `Node`, `Resolved`.
 - `servers/linux/src/paths.rs` (347) The system calls that take a path (phase R6c.2b), and the working directory and umask, which live in the caller's record (`records`).
 - `servers/linux/src/pipe.rs` (239) Pipes (phase R6a): a 64 KiB buffer shared by a read end and a write end, each a file of the server with a placeholder in the kernel's descriptor table. Types: `Dst`, `Src`, `Shared`, `PipeEnd`.
 - `servers/linux/src/records.rs` (75) Records per working-directory context: the cwd and umask of the processes that share them (phase R6c). Types: `FsState`, `FsContext`.
 - `servers/linux/src/sched.rs` (36) Scheduling policy: sched_getscheduler and sched_getparam.
-- `servers/linux/src/scm.rs` (124) Descriptors in flight (SCM_RIGHTS over AF_UNIX sockets, phase R7a): a descriptor a message carries is a handle on its open file description (`SYS_KFILE_OBJECT`), whatever the file is (one of the kernel's, or a... Types: `Passed`.
-- `servers/linux/src/sockcalls.rs` (694) The system calls of AF_UNIX sockets (phase R7a): socket and socketpair for the AF_UNIX family (the others pass through to the kernel), and every call on a descriptor of one of the server's sockets: addresses...
+- `servers/linux/src/scm.rs` (153) Descriptors in flight (SCM_RIGHTS over AF_UNIX sockets, phase R7a): a descriptor a message carries is a handle on its open file description (`SYS_KFILE_OBJECT` with `KFILE_INFLIGHT`), whatever the file is (one of the... Types: `Passed`.
+- `servers/linux/src/sockcalls.rs` (702) The system calls of AF_UNIX sockets (phase R7a): socket and socketpair for the AF_UNIX family (the others pass through to the kernel), and every call on a descriptor of one of the server's sockets: addresses...
 - `servers/linux/src/sync.rs` (131) A mutex for the server's data, shared by every thread of the instance (all the tree's processes run the server in the same shared region). Types: `Mutex`, `MutexGuard`, `RwLock`, `ReadGuard`, `WriteGuard`.
 - `servers/linux/src/time.rs` (102) Clocks and sleeping (phase R5): clock_gettime, clock_getres, gettimeofday, time, nanosleep, clock_nanosleep and sched_yield, over the kernel's clock and deadline sleep.
 - `servers/linux/src/tmpfile.rs` (243) Open files of the server's tmpfs (phase R6c.2c): a placeholder in the kernel's descriptor table names one (an open file description: offset, directory snapshot, write access); the calls on it are the server's. Types: `TmpOpen`.
 - `servers/linux/src/tmpfs.rs` (390) The server's tmpfs (phase R6c.2c): directories, files, symlinks and socket inodes (AF_UNIX names, `unix`) in the server's memory; a file's contents are a file object of the kernel's (`SYS_MO_CREATE_FILE`), read,... Types: `Object`, `Kind`, `State`, `Inode`.
-- `servers/linux/src/unix.rs` (1133) AF_UNIX sockets (phase R7a): stream, datagram and sequenced-packet sockets of the server, each a file with a placeholder in the kernel's descriptor table, as pipes are. Types: `Cred`, `Name`, `Key`, `Msg`, `Sock`, `Received`, `Fds`, `Sink`, `Source`, `Busy`.
+- `servers/linux/src/unix.rs` (1133) AF_UNIX sockets (phase R7a): stream, datagram and sequenced-packet sockets of the server, each a file with a placeholder in the kernel's descriptor table, as pipes are. Types: `Cred`, `Name`, `Key`, `Msg`, `Sock`, `Received`, `Fds`, `RecvOpts`, `Sink`, `Source`.
 - `servers/linux/src/usercopy.rs` (73) Copies between the server's memory and the program's (which the server sees in its view of the address space).
 
 ## Other servers
@@ -168,7 +168,7 @@ module comment, and the public types it defines. Where to start for common tasks
 - `userspace/threadtest.c` (336) Threads: pthreads on clone/futex, shared memory and descriptors, TLS, thread and process signals, group exit, fork and exec from threads, vfork and posix_spawn, and TLB coherence (munmap and mprotect while another...
 - `userspace/timertest.c` (157) High-resolution timers: sleeps and timeouts end when they are due, not at the next 10 ms timer tick, and never early.
 - `userspace/timetest.c` (173) Clocks: nanosecond resolution, monotonic across CPUs, the CPU-time clocks of threads and processes, wall-clock time and its setting, and the accounting behind getrusage and times.
-- `userspace/unixtest.c` (483) AF_UNIX sockets (the Linux server's, phase R7a): stream, datagram and seqpacket socket pairs, names in the filesystem (tmpfs and /data) and in the abstract namespace, descriptors passed between processes (SCM_RIGHTS,...
+- `userspace/unixtest.c` (705) AF_UNIX sockets (the Linux server's, phase R7a): stream, datagram and seqpacket socket pairs, names in the filesystem (tmpfs and /data) and in the abstract namespace, descriptors passed between processes (SCM_RIGHTS,...
 - `userspace/vmtest.c` (257) Virtual memory: demand paging, protection, remapping, sharing, stacks, commit accounting, and the patterns JIT compilers rely on.
 - `userspace/writebacktest.c` (116) Write-back of shared writable mappings of disk files: stores make pages dirty (Dirty: in /proc/meminfo), msync, fsync and the flusher write them (Dirty: back to 0), also after the mapping is gone; they survive...
 

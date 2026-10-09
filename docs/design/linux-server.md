@@ -260,11 +260,20 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
      descriptor closed). The kernel needs no notion of sockets for this. Sockets that only
      messages in flight keep (a socket in its own queue, a cycle of them) are found by a
      collector as Linux's `unix_gc`: a socket in flight whose description has no reference
-     but its handles in flight (`kfile_info`, 1101) and no call in progress is a candidate,
-     candidates referred to from outside the candidates' queues and what they refer to are
-     reachable, the rest have their queues emptied. It runs when a descriptor is closed while
-     sockets are in flight. When the descriptor table moves into the server (R6e), the handles
-     become references in the server's own table and the three calls go.
+     but its handles in flight (`kfile_info`, 1101) is a candidate, candidates referred to
+     from outside the candidates' queues and what they refer to are reachable, the rest have
+     their queues emptied. A call that uses one of the server's files keeps it referenced
+     until it returns (`kfd_lookup` pins it, as Linux's `fdget`), so a socket a call works on
+     is never a candidate, and another thread's close does not end a blocked receive or
+     accept; a lock the collector takes exclusively (making, installing and letting go of
+     descriptors in flight take it shared) keeps its view still while it runs. Handles of
+     descriptors in flight are marked (`KFILE_INFLIGHT`): every descriptor of such a
+     placeholder that goes (by close, exit or exec) and every call that pinned one ending
+     queues `EVENT_INFLIGHT`, and the collector runs; it also runs before a sender with too
+     many descriptors in flight (16 Ki per process) is refused with `ETOOMANYREFS`.
+     `SCM_CREDENTIALS` may name only a process of the caller's tree (`thread_exists` with
+     `THREAD_IN_INSTANCE`). When the descriptor table moves into the server (R6e), the
+     handles become references in the server's own table and these calls go.
 8. **R8 — Processes and signals**: pids, the process tree, `fork` (with the copy-on-write clone
    of memory objects), `exec`, `wait`, signals, job control, `/proc`'s data. The kernel's
    process model shrinks to processes and threads as containers. `thread_exists` (1090), with

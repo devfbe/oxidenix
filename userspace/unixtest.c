@@ -2,7 +2,8 @@
  * seqpacket socket pairs, names in the filesystem (tmpfs and /data) and in
  * the abstract namespace, descriptors passed between processes
  * (SCM_RIGHTS, also outliving the sender's close, and cycles of sockets in
- * flight collected), credentials (SCM_CREDENTIALS, SO_PEERCRED), shutdown,
+ * flight collected, also after an exit), calls that outlive another
+ * thread's close, credentials (SCM_CREDENTIALS, SO_PEERCRED), shutdown,
  * EPIPE and SIGPIPE, nonblocking I/O and poll/epoll readiness: what
  * Node.js's child_process and net modules rely on. */
 #define _GNU_SOURCE
@@ -10,6 +11,7 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -550,6 +552,262 @@ static void credentials(void) {
     close(sv[1]);
 }
 
+/* A thread blocked in a receive or an accept on a socket another thread
+ * closes the descriptor of: the call keeps the socket (Linux's fdget) and
+ * still gets what comes. */
+struct blocked {
+    int fd;
+    int got[8];
+    int n;
+    int err;
+    int result;
+};
+
+static void *recv_thread(void *arg) {
+    struct blocked *b = arg;
+    b->n = recv_fds(b->fd, b->got, 8, 0, NULL);
+    b->err = errno;
+    return NULL;
+}
+
+static void *accept_thread(void *arg) {
+    struct blocked *b = arg;
+    b->result = accept(b->fd, NULL, NULL);
+    return NULL;
+}
+
+static void closing_under_calls(void) {
+    /* A failure here is EPIPE, to be reported, not a death. */
+    signal(SIGPIPE, SIG_IGN);
+    char buf[16];
+    int sv[2], p[2];
+    socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+    pipe(p);
+    struct blocked b = {.fd = sv[1]};
+    pthread_t t;
+    pthread_create(&t, NULL, recv_thread, &b);
+    usleep(50000);
+    close(sv[1]);
+    usleep(20000);
+    send_fds(sv[0], &p[1], 1);
+    close(p[1]);
+    pthread_join(t, NULL);
+    check("a blocked recvmsg outlives another thread's close", b.n == 1);
+    check("... and the descriptor it got works", b.n == 1 && write(b.got[0], "ok", 2) == 2 && read(p[0], buf, sizeof buf) == 2);
+    if (b.n == 1) close(b.got[0]);
+    close(p[0]);
+    close(sv[0]);
+
+    struct sockaddr_un a;
+    socklen_t alen = abstract_addr(&a, "unixtest-accept");
+    int l = socket(AF_UNIX, SOCK_STREAM, 0);
+    bind(l, (struct sockaddr *)&a, alen);
+    listen(l, 4);
+    struct blocked acc = {.fd = l, .result = -2};
+    pthread_create(&t, NULL, accept_thread, &acc);
+    usleep(50000);
+    close(l);
+    usleep(20000);
+    int c = socket(AF_UNIX, SOCK_STREAM, 0);
+    int r = connect(c, (struct sockaddr *)&a, alen);
+    pthread_join(t, NULL);
+    check("a blocked accept outlives another thread's close", r == 0 && acc.result >= 0);
+    if (acc.result >= 0) close(acc.result);
+    close(c);
+
+    /* Many rounds of the race between a close and a receive that takes a
+     * socket out of flight, with the collector running meanwhile (cycles
+     * made and dropped by another thread). */
+    int lost = 0;
+    /* The receiver's descriptor is replaced by /dev/null (a close that
+     * leaves no number for a new socket to take, which the receiving
+     * thread could then look up instead). */
+    int devnull = open("/dev/null", O_RDONLY);
+    for (int round = 0; round < 200; round++) {
+        int x[2], y[2];
+        socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+        socketpair(AF_UNIX, SOCK_STREAM, 0, y);
+        /* y[0] only in flight, in sv[1]'s queue. */
+        send_fds(sv[0], &y[0], 1);
+        close(y[0]);
+        struct blocked rb = {.fd = sv[1]};
+        pthread_create(&t, NULL, recv_thread, &rb);
+        usleep(round % 7 * 100);
+        dup2(devnull, sv[1]);
+        /* A cycle dropped: the collector runs. */
+        socketpair(AF_UNIX, SOCK_STREAM, 0, x);
+        send_fds(x[0], &x[1], 1);
+        send_fds(x[1], &x[0], 1);
+        close(x[0]);
+        close(x[1]);
+        pthread_join(t, NULL);
+        /* Replaced before the call looked the descriptor up: ENOTSOCK (as
+         * on Linux); a call that has it must get the descriptor, alive. */
+        if (rb.n == 1 ? write(y[1], "z", 1) != 1 || read(rb.got[0], buf, 1) != 1 : rb.err != ENOTSOCK) lost++;
+        close(sv[1]);
+        if (rb.n == 1) close(rb.got[0]);
+        close(y[1]);
+        close(sv[0]);
+    }
+    close(devnull);
+    check("200 races of close, receive and the collector lose nothing", lost == 0);
+    signal(SIGPIPE, SIG_DFL);
+}
+
+/* Sockets in flight in a cycle that an exiting process leaves behind are
+ * collected (its descriptors go with the exit, no close), and descriptors
+ * one process keeps in flight never stop another from passing its own. */
+static void exit_leaves_cycles(void) {
+    int p[2];
+    pipe(p);
+    pid_t child = fork();
+    if (child == 0) {
+        int s[2];
+        socketpair(AF_UNIX, SOCK_STREAM, 0, s);
+        send_fds(s[0], (int[]){s[0], p[1]}, 2);
+        send_fds(s[1], &s[1], 1);
+        /* Many more in flight, in the same cycle. */
+        int many[253];
+        for (int i = 0; i < 253; i++) many[i] = s[0];
+        for (int m = 0; m < 63; m++) {
+            char byte = 'F';
+            struct iovec iov = {&byte, 1};
+            char control[CMSG_SPACE(sizeof many)];
+            struct msghdr msg = {0};
+            msg.msg_iov = &iov;
+            msg.msg_iovlen = 1;
+            msg.msg_control = control;
+            msg.msg_controllen = sizeof control;
+            struct cmsghdr *c = CMSG_FIRSTHDR(&msg);
+            c->cmsg_level = SOL_SOCKET;
+            c->cmsg_type = SCM_RIGHTS;
+            c->cmsg_len = CMSG_LEN(sizeof many);
+            memcpy(CMSG_DATA(c), many, sizeof many);
+            if (sendmsg(s[1], &msg, 0) != 1) _exit(1);
+        }
+        _exit(0);
+    }
+    close(p[1]);
+    int status;
+    waitpid(child, &status, 0);
+    int sv[2];
+    socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+    int ok = 1;
+    int many[253];
+    for (int i = 0; i < 253; i++) many[i] = sv[0];
+    for (int m = 0; m < 8 && ok; m++) {
+        char byte = 'F';
+        struct iovec iov = {&byte, 1};
+        char control[CMSG_SPACE(sizeof many)];
+        struct msghdr msg = {0};
+        msg.msg_iov = &iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = control;
+        msg.msg_controllen = sizeof control;
+        struct cmsghdr *c = CMSG_FIRSTHDR(&msg);
+        c->cmsg_level = SOL_SOCKET;
+        c->cmsg_type = SCM_RIGHTS;
+        c->cmsg_len = CMSG_LEN(sizeof many);
+        memcpy(CMSG_DATA(c), many, sizeof many);
+        ok = sendmsg(sv[0], &msg, 0) == 1;
+    }
+    /* Before any close of ours: nothing but the exit triggers collection. */
+    check("another process passes descriptors after it", ok);
+    struct pollfd pp = {p[0], POLLIN, 0};
+    char buf[1];
+    check("a cycle an exited process left is collected", WIFEXITED(status) && WEXITSTATUS(status) == 0 && poll(&pp, 1, 5000) == 1 &&
+                                                            (pp.revents & POLLHUP) && read(p[0], buf, 1) == 0);
+    close(p[0]);
+    close(sv[0]);
+    close(sv[1]);
+}
+
+/* A datagram sender held back by a receiver others filled is not writable
+ * for level-triggered epoll (no busy loop on EAGAIN), and is again once
+ * the receiver reads. */
+static void dgram_pollout(void) {
+    struct sockaddr_un r;
+    socklen_t rlen = abstract_addr(&r, "unixtest-full");
+    int rs = socket(AF_UNIX, SOCK_DGRAM, 0);
+    bind(rs, (struct sockaddr *)&r, rlen);
+    int a = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK, 0), b = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+    connect(a, (struct sockaddr *)&r, rlen);
+    int filled = 0;
+    while (sendto(b, "x", 1, 0, (struct sockaddr *)&r, rlen) == 1) filled++;
+    int ep = epoll_create1(0);
+    struct epoll_event ev = {.events = EPOLLOUT}, out[2];
+    epoll_ctl(ep, EPOLL_CTL_ADD, a, &ev);
+    int r1 = send(a, "y", 1, 0);
+    int e1 = errno;
+    check("a full datagram receiver holds a sender back: EAGAIN", filled > 0 && r1 == -1 && e1 == EAGAIN);
+    check("... and the sender is not writable for epoll", epoll_wait(ep, out, 2, 0) == 0);
+    char buf[4];
+    recv(rs, buf, sizeof buf, 0);
+    check("... until the receiver reads", epoll_wait(ep, out, 2, 1000) == 1 && (out[0].events & EPOLLOUT));
+    close(ep);
+    close(a);
+    close(b);
+    close(rs);
+}
+
+/* MSG_PEEK installs only what the control buffer has room for (MSG_CTRUNC
+ * for the rest); credentials naming a process of another tree are
+ * refused; a control buffer that cannot be written loses the ancillary
+ * data, not the bytes. */
+static void ancillary_edges(void) {
+    int sv[2], p[2], q[2];
+    socketpair(AF_UNIX, SOCK_DGRAM, 0, sv);
+    pipe(p);
+    pipe(q);
+    send_fds(sv[0], (int[]){p[1], q[1], p[1]}, 3);
+    int lowest = dup(0);
+    close(lowest);
+    int got[8], flags = 0;
+    /* CMSG_SPACE of one int has room for two. */
+    int n = recv_fds(sv[1], got, 1, MSG_PEEK, &flags);
+    int next = dup(0);
+    close(next);
+    check("MSG_PEEK installs only what fits, with MSG_CTRUNC", n == 2 && (flags & MSG_CTRUNC) && next == lowest + 2);
+    for (int i = 0; i < n; i++) close(got[i]);
+    n = recv_fds(sv[1], got, 3, 0, NULL);
+    if (n > 0) {
+        for (int i = 0; i < n; i++) close(got[i]);
+    }
+    close(p[0]);
+    close(p[1]);
+    close(q[0]);
+    close(q[1]);
+
+    struct ucred other = {1, 0, 0};
+    char byte = 'c';
+    struct iovec iov = {&byte, 1};
+    char out[CMSG_SPACE(sizeof other)];
+    memset(out, 0, sizeof out);
+    struct msghdr sm = {0};
+    sm.msg_iov = &iov;
+    sm.msg_iovlen = 1;
+    sm.msg_control = out;
+    sm.msg_controllen = sizeof out;
+    struct cmsghdr *c = CMSG_FIRSTHDR(&sm);
+    c->cmsg_level = SOL_SOCKET;
+    c->cmsg_type = SCM_CREDENTIALS;
+    c->cmsg_len = CMSG_LEN(sizeof other);
+    memcpy(CMSG_DATA(c), &other, sizeof other);
+    check("SCM_CREDENTIALS of a process outside the tree: ESRCH", sendmsg(sv[0], &sm, 0) == -1 && errno == ESRCH);
+
+    int on = 1;
+    setsockopt(sv[1], SOL_SOCKET, SO_PASSCRED, &on, sizeof on);
+    send(sv[0], "d", 1, 0);
+    struct msghdr rm = {0};
+    rm.msg_iov = &iov;
+    rm.msg_iovlen = 1;
+    rm.msg_control = (void *)8;
+    rm.msg_controllen = 64;
+    check("an unwritable control buffer: the bytes still come", recvmsg(sv[1], &rm, 0) == 1 && byte == 'd');
+    close(sv[0]);
+    close(sv[1]);
+}
+
 int main(void) {
     stream_pair();
     nonblocking();
@@ -558,6 +816,10 @@ int main(void) {
     datagrams();
     rights();
     credentials();
+    closing_under_calls();
+    exit_leaves_cycles();
+    dgram_pollout();
+    ancillary_edges();
     printf("%s\n", failures ? "unixtest: FAILURES" : "unixtest: all ok");
     return failures ? 1 : 0;
 }
