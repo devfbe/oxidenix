@@ -5,11 +5,14 @@
 //! last descriptor closed (`EVENT_CLOSED`, to the service thread).
 //!
 //! `handle` takes the system calls on descriptors and creates files (pipe,
-//! pipe2): for a descriptor of one of the server's files it answers itself,
-//! for one of the kernel's it returns None and the call passes through.
+//! pipe2, eventfd, netlink sockets): for a descriptor of one of the
+//! server's files it answers itself, for one of the kernel's it returns
+//! None and the call passes through (except the requests the server
+//! answers for any descriptor: the netdevice ioctls on sockets).
 
 use crate::datafile::{self, DataOpen};
 use crate::eventfd::EventFd;
+use crate::netlink::{self, NetlinkSocket};
 use crate::tmpfile::{self, TmpOpen};
 use crate::pipe::{self, Dst, PipeEnd, Src};
 use crate::sync::Mutex;
@@ -25,6 +28,7 @@ pub const ESPIPE: i64 = 29;
 pub const ENOTTY: i64 = 25;
 pub const EFAULT: i64 = 14;
 pub const ENOTDIR: i64 = 20;
+const ENOTSOCK: i64 = 88;
 
 pub const O_ACCMODE: u32 = 0o3;
 pub const O_WRONLY: u32 = 0o1;
@@ -43,6 +47,8 @@ pub enum File {
     Tmp(Arc<TmpOpen>),
     /// An open file of /data.
     Data(Arc<DataOpen>),
+    /// A netlink socket.
+    Netlink(Arc<NetlinkSocket>),
 }
 
 static FILES: Mutex<BTreeMap<u64, File>> = Mutex::new(BTreeMap::new());
@@ -103,6 +109,25 @@ pub fn data_of(fd: u64) -> Option<Arc<DataOpen>> {
     }
 }
 
+/// The `struct stat` of descriptor `fd`, one of the server's files or of
+/// the kernel's (EBADF for neither).
+pub fn stat_of(fd: u64) -> Result<[u8; 144], i64> {
+    match lookup(fd) {
+        Some((File::Pipe(end), _)) => Ok(end.stat()),
+        Some((File::EventFd(e), _)) => Ok(e.stat()),
+        Some((File::Tmp(f), _)) => Ok(f.inode.stat()),
+        Some((File::Data(f), _)) => crate::datafs::stat(&f.inode),
+        Some((File::Netlink(n), _)) => Ok(n.stat()),
+        None => {
+            let mut st = [0u8; 144];
+            match syscall(SYS_KFD_STAT, [fd, st.as_mut_ptr() as u64, 0, 0, 0, 0]) {
+                r if r < 0 => Err(-r),
+                _ => Ok(st),
+            }
+        }
+    }
+}
+
 /// For mmap of descriptor `fd`: None for a file of the kernel's (mapped
 /// through `kfile_object`); else the object to map (a handle to close once
 /// mapped) and whether the mapping stays read-only, or why not.
@@ -132,6 +157,7 @@ pub const SYS_FSTAT: u64 = 5;
 pub const SYS_LSEEK: u64 = 8;
 pub const SYS_IOCTL: u64 = 16;
 const SYS_SENDFILE: u64 = 40;
+const SYS_SOCKET: u64 = 41;
 pub const SYS_PREAD64: u64 = 17;
 pub const SYS_PWRITE64: u64 = 18;
 pub const SYS_READV: u64 = 19;
@@ -167,6 +193,24 @@ pub fn handle(s: &State) -> Option<i64> {
             sendfile(a0, out, a1, input, a2, s.r10)
         }
         SYS_PIPE2 => pipe2(a0, a1),
+        SYS_SOCKET if a0 == netlink::AF_NETLINK => netlink::socket(a1, a2),
+        netlink::SYS_CONNECT
+        | netlink::SYS_ACCEPT
+        | netlink::SYS_SENDTO
+        | netlink::SYS_RECVFROM
+        | netlink::SYS_SENDMSG
+        | netlink::SYS_RECVMSG
+        | netlink::SYS_SHUTDOWN
+        | netlink::SYS_BIND
+        | netlink::SYS_LISTEN
+        | netlink::SYS_GETSOCKNAME
+        | netlink::SYS_GETPEERNAME
+        | netlink::SYS_SETSOCKOPT
+        | netlink::SYS_GETSOCKOPT
+        | netlink::SYS_ACCEPT4 => match lookup(a0)? {
+            (File::Netlink(n), flags) => netlink::call(s.rax, &n, flags, [a0, a1, a2, a3, s.r8, s.r9]),
+            _ => Err(ENOTSOCK),
+        },
         // The kernel's files have nothing to write back: /data's do, in
         // every instance's page cache.
         SYS_SYNC => sync_everywhere().map(|_| 0),
@@ -180,6 +224,8 @@ pub fn handle(s: &State) -> Option<i64> {
         // FIOCLEX) go there for the server's files, too. A pass-through
         // until the descriptor table moves into the server (R6e).
         SYS_IOCTL if matches!(a1, 0x5421 | 0x5450 | 0x5451) => return None,
+        // The interface requests every socket takes, the kernel's too.
+        SYS_IOCTL if crate::netdev::is_request(a1) => crate::netdev::ioctl(a0, a1, a2),
         SYS_READ | SYS_WRITE | SYS_READV | SYS_WRITEV | SYS_FSTAT | SYS_LSEEK | SYS_IOCTL | SYS_PREAD64 | SYS_PWRITE64
         | SYS_PREADV | SYS_PWRITEV | SYS_FSYNC | SYS_FDATASYNC | SYS_FTRUNCATE | SYS_GETDENTS64 | SYS_FSTATFS => {
             let (file, flags) = lookup(a0)?;
@@ -221,6 +267,7 @@ fn on_file(nr: u64, file: File, flags: u32, a1: u64, a2: u64, a3: u64) -> Result
         File::EventFd(e) => return on_eventfd(nr, &e, flags, a1, a2),
         File::Tmp(f) => return tmpfile::call(nr, &f, flags, a1, a2, a3),
         File::Data(f) => return datafile::call(nr, &f, flags, a1, a2, a3),
+        File::Netlink(n) => return netlink::call(nr, &n, flags, [0, a1, a2, a3, 0, 0]),
     };
     let readable = flags & O_ACCMODE != O_WRONLY;
     let writable = flags & O_ACCMODE != 0;
@@ -292,8 +339,10 @@ fn sendfile(out_fd: u64, out: Option<(File, u32)>, in_fd: u64, input: Option<(Fi
     if offset != 0 {
         return Err(EINVAL);
     }
-    // An eventfd moves 8-byte values, not data; a directory none.
-    if matches!(out, Some((File::EventFd(_), _))) || matches!(input, Some((File::EventFd(_), _))) {
+    // An eventfd moves 8-byte values, not data; a directory none; a
+    // netlink socket datagrams.
+    let unfit = |f: &Option<(File, u32)>| matches!(f, Some((File::EventFd(_) | File::Netlink(_), _)));
+    if unfit(&out) || unfit(&input) {
         return Err(EINVAL);
     }
     if let Some((File::Tmp(f), _)) = &out {
@@ -322,7 +371,7 @@ fn sendfile(out_fd: u64, out: Option<(File, u32)>, in_fd: u64, input: Option<(Fi
         let want = (count - total).min(buf.len() as u64) as usize;
         let n = match &input {
             Some((File::Pipe(end), flags)) => end.read(Dst::Server(&mut buf[..want]), flags & O_NONBLOCK != 0),
-            Some((File::EventFd(_), _)) => Err(EINVAL),
+            Some((File::EventFd(_) | File::Netlink(_), _)) => Err(EINVAL),
             Some((File::Tmp(f), _)) => f.read_server(&mut buf[..want]).map(|n| n as i64),
             Some((File::Data(f), _)) => f.read_server(&mut buf[..want]).map(|n| n as i64),
             None => match syscall(SYS_KFD_READ, [in_fd, buf.as_mut_ptr() as u64, want as u64, 0, 0, 0]) {
@@ -340,7 +389,7 @@ fn sendfile(out_fd: u64, out: Option<(File, u32)>, in_fd: u64, input: Option<(Fi
         }
         let wrote = match &out {
             Some((File::Pipe(end), flags)) => end.write(Src::Server(&buf[..n]), flags & O_NONBLOCK != 0),
-            Some((File::EventFd(_), _)) => Err(EINVAL),
+            Some((File::EventFd(_) | File::Netlink(_), _)) => Err(EINVAL),
             Some((File::Tmp(f), flags)) => f.write_server(&buf[..n], flags & O_APPEND != 0).map(|n| n as i64),
             Some((File::Data(f), flags)) => f.write_server(&buf[..n], flags & O_APPEND != 0).map(|n| n as i64),
             None => match syscall(SYS_KFD_WRITE, [out_fd, buf.as_ptr() as u64, n as u64, 0, 0, 0]) {

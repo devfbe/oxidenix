@@ -1471,6 +1471,17 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             }
             Ok(0)
         }
+        SYS_KFD_STAT => {
+            let st = super::sys_file::fstat_bytes(a[0])?;
+            super::uaccess::copy_to_server(a[1], &st)?;
+            Ok(0)
+        }
+        SYS_NET_LINKS => {
+            let links = crate::net::links()?;
+            let n = links.len().min(a[1] as usize);
+            super::uaccess::copy_to_server(a[0], &links[..n])?;
+            Ok(n as i64)
+        }
         SYS_SERVER_LOG => {
             let len = a[1].min(SERVER_LOG_MAX);
             let mut text = [0u8; SERVER_LOG_MAX as usize];

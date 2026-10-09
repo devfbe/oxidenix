@@ -362,6 +362,8 @@ version = "0.1.0"
 dependencies = [
  "fsring",
  "linked_list_allocator",
+ "netlink",
+ "netproto",
  "restricted",
  "ring",
  "slab 0.1.0",
@@ -449,6 +451,10 @@ dependencies = [
  "smoltcp",
  "virtio",
 ]
+
+[[package]]
+name = "netlink"
+version = "0.1.0"
 
 [[package]]
 name = "netproto"

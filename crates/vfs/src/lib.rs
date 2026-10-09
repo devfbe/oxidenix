@@ -10,6 +10,7 @@ extern crate alloc;
 pub mod cpio;
 pub mod path;
 pub mod rw;
+pub mod stat;
 
 /// File type bits of a mode (stat's st_mode), as Linux has them.
 pub const S_IFMT: u32 = 0o170000;

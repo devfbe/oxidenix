@@ -68,6 +68,10 @@ jobs:
         if: matrix.firmware == 'uefi'
         run: cargo test -p fsring
 
+      - name: Test rtnetlink's messages and netd's interface records on the host
+        if: matrix.firmware == 'uefi'
+        run: cargo test -p netlink -p netproto
+
       - name: Boot oxidenix and run the self-tests
         working-directory: kernel
         shell: bash

@@ -590,6 +590,18 @@ pub const SERVER_LOG_MAX: u64 = 256;
 /// threads included (as /proc does today); with R8 the server answers
 /// from its own process table, scoped to its instance, and this goes.
 pub const SYS_THREAD_EXISTS: u64 = 1090;
+/// `kfd_stat(fd, buf) -> 0`: the `struct stat` (144 bytes) of one of the
+/// kernel's descriptors (EBADF for another), also of one without an inode
+/// (a socket, an epoll instance), at `buf`: fstat as the kernel answers it,
+/// for the server's calls that describe a descriptor in another format
+/// (statx). It goes with the descriptor table (R6e).
+pub const SYS_KFD_STAT: u64 = 1093;
+/// `net_links(buf, cap) -> len`: the network interfaces as netd describes
+/// them (`netproto::Op::Links`: `netproto::Link` records), at most `cap`
+/// bytes at `buf`; ENETDOWN without netd. The kernel only relays netd's
+/// answer. It goes with the sockets (R7), when the server talks to netd
+/// itself.
+pub const SYS_NET_LINKS: u64 = 1094;
 
 /// `(scenario)`: the server runs a channel scenario against the test
 /// service (servers/ringtest, `ring::selftest`): 1 rings and doorbells, 2

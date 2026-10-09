@@ -38,6 +38,8 @@ const TCP_BUFFER: usize = 16 * 1024;
 const UDP_PACKETS: usize = 16;
 const UDP_BUFFER: usize = 16 * 1024;
 const MAX_BACKLOG: usize = 8;
+/// The Ethernet header a frame adds to an IP packet.
+const ETHERNET_HEADER: usize = 14;
 /// Waiting requests, and the data waiting sends may hold in total, so that
 /// many blocked programs cannot exhaust netd's heap.
 const MAX_PENDING: usize = 128;
@@ -697,6 +699,21 @@ impl Service {
                 let c = self.config;
                 let _ = iface;
                 Ok(Done(0, [c.address as u64, c.prefix as u64, c.gateway as u64, c.dns as u64, 0, 0], c.mac.to_vec()))
+            }
+            Op::Links => {
+                // The loopback (frames to the host's own addresses come
+                // back in `Nic`) and the card, both with Ethernet framing:
+                // the card's MTU applies to both.
+                let mtu = (crate::virtio_net::MTU - ETHERNET_HEADER) as u32;
+                let c = self.config;
+                let up = netproto::LINK_UP | netproto::LINK_RUNNING;
+                let (address, prefix) = (crate::LOOPBACK.address().to_bits(), crate::LOOPBACK.prefix_len());
+                let lo = Link { index: 1, kind: netproto::LINK_LOOPBACK, state: up, mtu, mac: [0; 6], prefix, address };
+                let card = Link { index: 2, kind: netproto::LINK_ETHERNET, state: up, mtu, mac: c.mac, prefix: c.prefix, address: c.address };
+                let mut payload = Vec::with_capacity(2 * Link::SIZE);
+                payload.extend_from_slice(&lo.encode());
+                payload.extend_from_slice(&card.encode());
+                Ok(Done(0, [0; 6], payload))
             }
             Op::Close | Op::Cancel => Err(ENOSYS),
         }

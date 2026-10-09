@@ -66,6 +66,7 @@ const SYS_FCHMODAT: u64 = 268;
 const SYS_FACCESSAT: u64 = 269;
 const SYS_UTIMENSAT: u64 = 280;
 const SYS_RENAMEAT2: u64 = 316;
+const SYS_STATX: u64 = 332;
 const SYS_FACCESSAT2: u64 = 439;
 
 const CWD: u64 = AT_FDCWD as i64 as u64;
@@ -81,13 +82,10 @@ pub fn handle(s: &State) -> Option<i64> {
         SYS_LSTAT => fstatat(CWD, a0, a1, AT_SYMLINK_NOFOLLOW),
         SYS_NEWFSTATAT => {
             if a3 & AT_EMPTY_PATH != 0 && path_is_empty(a1) {
-                // fstat of the descriptor itself.
-                if let Some(f) = files::tmp_of(a0) {
-                    return Some(usercopy::to_program(a2, &f.inode.stat()).map(|_| 0).unwrap_or_else(|e| -e));
-                }
-                return files::data_of(a0).map(|f| datafs::stat(&f.inode).and_then(|st| usercopy::to_program(a2, &st)).map(|_| 0).unwrap_or_else(|e| -e));
+                stat_dirfd(a0).and_then(|st| usercopy::to_program(a2, &st)).map(|_| 0)
+            } else {
+                fstatat(a0, a1, a2, a3)
             }
-            fstatat(a0, a1, a2, a3)
         }
         SYS_ACCESS => at(CWD, a0, true).map(|_| 0),
         SYS_FACCESSAT | SYS_FACCESSAT2 => at(a0, a1, true).map(|_| 0),
@@ -113,6 +111,7 @@ pub fn handle(s: &State) -> Option<i64> {
         SYS_READLINKAT => readlinkat(a0, a1, a2, a3),
         SYS_CHMOD => chmodat(CWD, a0, a1),
         SYS_FCHMODAT => chmodat(a0, a1, a2),
+        SYS_STATX => statx(a0, a1, a2 as u32, a3 as u32, s.r8),
         SYS_UMASK => Ok(umask(a0 as u32) as i64),
         SYS_STATFS => statfs(a0, a1),
         // Timestamps are not stored: these only check the target exists.
@@ -268,6 +267,38 @@ fn openat(dirfd: u64, addr: u64, flags: u32, mode: u32) -> Result<i64, i64> {
 fn fstatat(dirfd: u64, addr: u64, buf: u64, flags: u64) -> Result<i64, i64> {
     let r = at(dirfd, addr, flags & AT_SYMLINK_NOFOLLOW == 0)?;
     usercopy::to_program(buf, &r.node.stat()?)?;
+    Ok(0)
+}
+
+/// The `struct stat` an empty path with AT_EMPTY_PATH names: descriptor
+/// `dirfd` itself (any kind), or the working directory for AT_FDCWD.
+fn stat_dirfd(dirfd: u64) -> Result<[u8; 144], i64> {
+    if dirfd as i32 == AT_FDCWD {
+        let cwd = records::current().state.lock().cwd.clone();
+        return resolve(&cwd, &cwd, true)?.node.stat();
+    }
+    files::stat_of(dirfd)
+}
+
+/// statx(dirfd, path, flags, mask, buf) (statx(2)): the file's status as
+/// a `struct statx`, with every field the filesystem knows (`stx_mask`
+/// says which), whatever `mask` asks for. An empty path with
+/// AT_EMPTY_PATH (or none at all, as since Linux 6.11) means `dirfd`
+/// itself, any descriptor, or the working directory for AT_FDCWD.
+fn statx(dirfd: u64, addr: u64, flags: u32, mask: u32, buf: u64) -> Result<i64, i64> {
+    use vfs::stat::{statx_check, Stat};
+    statx_check(flags, mask)?;
+    let empty_path_ok = flags as u64 & AT_EMPTY_PATH != 0;
+    let path = if addr == 0 && empty_path_ok { String::new() } else { read_cstr(addr)? };
+    let st = if path.is_empty() {
+        if !empty_path_ok {
+            return Err(ENOENT);
+        }
+        stat_dirfd(dirfd)?
+    } else {
+        resolve(&base_dir(dirfd, &path)?, &path, flags as u64 & AT_SYMLINK_NOFOLLOW == 0)?.node.stat()?
+    };
+    usercopy::to_program(buf, &Stat::from_bytes(&st).to_statx())?;
     Ok(0)
 }
 

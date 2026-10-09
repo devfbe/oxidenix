@@ -233,7 +233,12 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
      which holds the flags and the close-on-exec bit: `fcntl` and the generic ioctls
      `FIONBIO`, `FIOCLEX` and `FIONCLEX` (the server passes them through for its own files,
      too); they move with the table.
-7. **R7 — Sockets** into the server, talking to netd over rings.
+7. **R7 — Sockets** into the server, talking to netd over rings. The first family is there
+   already: `NETLINK_ROUTE` sockets are the server's files (`netlink.rs`, messages in
+   `crates/netlink`), answered from netd's description of its interfaces (`netproto`'s
+   `Links`), which the kernel relays meanwhile (`net_links`, 1094), as it answers `fstat` of
+   its own descriptors for the server's `statx` (`kfd_stat`, 1093) until the descriptor table
+   moves (R6e). Both bridges go then.
 8. **R8 — Processes and signals**: pids, the process tree, `fork` (with the copy-on-write clone
    of memory objects), `exec`, `wait`, signals, job control, `/proc`'s data. The kernel's
    process model shrinks to processes and threads as containers. `thread_exists` (1090), with

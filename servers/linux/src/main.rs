@@ -23,6 +23,8 @@ mod heap;
 mod initramfs;
 mod mm;
 mod namespace;
+mod netdev;
+mod netlink;
 mod paths;
 mod pipe;
 mod records;
@@ -43,6 +45,9 @@ const PAGE: u64 = 4096;
 const ENOSYS: i64 = 38;
 const PROT_READ: u64 = 1;
 const PROT_RW: u64 = 3;
+const SYS_IO_URING_SETUP: u64 = 425;
+const SYS_IO_URING_ENTER: u64 = 426;
+const SYS_IO_URING_REGISTER: u64 = 427;
 
 pub(crate) fn syscall(nr: u64, a: [u64; 6]) -> i64 {
     let ret: i64;
@@ -86,6 +91,11 @@ pub extern "C" fn _start(state: *mut State, role: u64) -> ! {
         match s.rax {
             TEST_MAP..=TEST_CACHED => s.rax = test(s.rax, s.rdi) as u64,
             nr if nr >= FIRST_NON_LINUX => s.rax = -ENOSYS as u64,
+            // Not offered, as by a Linux built without io_uring: libuv (and
+            // so Node.js) probes io_uring_setup at start and uses epoll
+            // instead. Answered here, so the kernel does not log them as
+            // unknown calls.
+            SYS_IO_URING_SETUP | SYS_IO_URING_ENTER | SYS_IO_URING_REGISTER => s.rax = -ENOSYS as u64,
             _ => {
                 records::before_pass_through(s);
                 // Server files the call closed for good go at once.

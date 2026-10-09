@@ -55,6 +55,12 @@ fn call(netd: ipc::Instance, op: Op, args: [u64; 4], payload: &[u8]) -> Result<R
     Ok(Reply { status: r.status, values: r.values, payload: r.payload.to_vec() })
 }
 
+/// netd's description of its network interfaces (`netproto::Link`
+/// records), relayed to the Linux server (`restricted::SYS_NET_LINKS`).
+pub fn links() -> Result<Vec<u8>, i64> {
+    Ok(call(netd()?, Op::Links, [0; 4], &[])?.payload)
+}
+
 fn flags(nonblocking: bool) -> u64 {
     if nonblocking { NONBLOCK } else { 0 }
 }
