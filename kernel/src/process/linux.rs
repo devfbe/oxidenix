@@ -1471,6 +1471,50 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             }
             Ok(0)
         }
+        SYS_KFD_INSTALL_FILE => {
+            use crate::fs::file::O_CLOEXEC;
+            let flags = a[1] as u32;
+            if is_pager() {
+                return Err(EPERM);
+            }
+            if a[1] > u32::MAX as u64 || flags & !O_CLOEXEC != 0 {
+                return Err(EINVAL);
+            }
+            let Object::KernelFile(file) = instance.object(a[0])? else { return Err(EINVAL) };
+            with_current(|p| p.alloc_fd(file, flags & O_CLOEXEC != 0, 0))
+        }
+        SYS_KFILE_INFO => {
+            let Object::KernelFile(file) = instance.object(a[0])? else { return Err(EINVAL) };
+            // Less the clone `object` just made.
+            let refs = Arc::strong_count(&file) as u64 - 1;
+            let id = match &file.kind {
+                crate::fs::file::Kind::Server(s) if s.owned_by(Arc::as_ptr(&instance) as *const ()) => s.id,
+                _ => 0,
+            };
+            drop(file);
+            let mut out = [0u8; 16];
+            out[..8].copy_from_slice(&refs.to_le_bytes());
+            out[8..].copy_from_slice(&id.to_le_bytes());
+            super::uaccess::copy_to_server(a[1], &out)?;
+            Ok(0)
+        }
+        SYS_SIGNAL_THREAD => {
+            if is_pager() {
+                return Err(EPERM);
+            }
+            if a[0] == 0 || a[0] > 64 {
+                return Err(EINVAL);
+            }
+            super::signal::tgkill(Some(super::current_pid() as i64), super::current_tid() as i64, a[0])
+        }
+        SYS_THREAD_IDS => {
+            let mut ids = [0u8; 32];
+            ids[..8].copy_from_slice(&(super::current_pid() as u64).to_le_bytes());
+            ids[8..16].copy_from_slice(&(super::current_tid() as u64).to_le_bytes());
+            // uid and gid: everyone is root.
+            super::uaccess::copy_to_server(a[0], &ids)?;
+            Ok(0)
+        }
         SYS_SERVER_LOG => {
             let len = a[1].min(SERVER_LOG_MAX);
             let mut text = [0u8; SERVER_LOG_MAX as usize];

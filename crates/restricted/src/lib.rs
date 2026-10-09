@@ -144,6 +144,10 @@ pub const SYS_VM_SYNC: u64 = 1028;
 /// server's), to map with `mo_map` as mmap maps a file: its page cache,
 /// /dev/zero as anonymous memory; the mapping keeps the file and the
 /// descriptor's write access. EBADF, or ENODEV for what cannot be mapped.
+/// The handle is also how a descriptor travels between processes
+/// (`SYS_KFD_INSTALL_FILE`): it keeps the open file description, whatever
+/// it is (a file of the kernel's or a placeholder of the server's), alive
+/// while it is in flight.
 pub const SYS_KFILE_OBJECT: u64 = 1029;
 
 /// Test calls a program can make to its server (lxtest): they exercise the
@@ -590,6 +594,36 @@ pub const SERVER_LOG_MAX: u64 = 256;
 /// threads included (as /proc does today); with R8 the server answers
 /// from its own process table, scoped to its instance, and this goes.
 pub const SYS_THREAD_EXISTS: u64 = 1090;
+
+// Descriptors passed between processes (SCM_RIGHTS over the server's
+// AF_UNIX sockets, phase R7a), and the bits of the kernel's process model
+// sockets need until it is the server's (R6e moves the descriptor table,
+// R8 processes and signals): a passed descriptor is a `kfile_object` handle
+// on its open file description while it is in flight; the receiver gets a
+// descriptor of its own for the same description.
+
+/// `kfd_install_file(handle, flags) -> fd`: a new descriptor (the lowest
+/// free one) of the calling process for the open file description behind a
+/// `kfile_object` handle, shared with its other descriptors (offset, status
+/// flags), close-on-exec with `O_CLOEXEC` (the only flag). The handle stays
+/// the server's. EMFILE when the table is full.
+pub const SYS_KFD_INSTALL_FILE: u64 = 1100;
+/// `kfile_info(handle, out)`: about the open file description behind a
+/// `kfile_object` handle, two u64s at `out`: how many references it has
+/// now (descriptors in every process, the server's handles, this one
+/// included, and calls that use it at the moment), and the id of the
+/// server's file it is a placeholder of (0: a file of the kernel's). The
+/// server's collector of descriptors in flight finds sockets that only
+/// messages in flight keep alive with it.
+pub const SYS_KFILE_INFO: u64 = 1101;
+/// `signal_thread(sig)`: raises `sig` for the calling thread as a signal
+/// of its own action (SIGPIPE for a write to a connection whose reader is
+/// gone); delivered when the call returns to the program, after its result.
+pub const SYS_SIGNAL_THREAD: u64 = 1102;
+/// `thread_ids(out)`: the calling thread's process id, thread id, user id
+/// and group id, four u64s at `out` (the credentials a socket passes,
+/// SCM_CREDENTIALS and SO_PEERCRED).
+pub const SYS_THREAD_IDS: u64 = 1103;
 
 /// `(scenario)`: the server runs a channel scenario against the test
 /// service (servers/ringtest, `ring::selftest`): 1 rings and doorbells, 2
