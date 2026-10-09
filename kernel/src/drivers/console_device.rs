@@ -73,6 +73,8 @@ pub fn set_holder(id: u64, chan: usize) -> u64 {
     // Echoes of the previous holder's input are not the new one's: those queued go,
     // and a batch a writer took out already is dropped when it sees the generation.
     forget_echoes();
+    // Writers of the old holder waiting for a turn give up (EIO).
+    wakeup(TURN_CHAN);
     if !INPUT.lock().is_empty() {
         PENDING.store(true, Ordering::Release);
         wakeup(if chan != 0 { chan } else { MONITOR_CHAN });
@@ -87,6 +89,7 @@ pub fn release(id: u64) {
         HOLDER_CHAN.store(0, Ordering::Release);
         HOLDER.store(0, Ordering::Release);
         forget_echoes();
+        wakeup(TURN_CHAN);
         wakeup(MONITOR_CHAN);
     }
 }
@@ -146,9 +149,13 @@ impl Drop for Writer {
     }
 }
 
-/// Waits for the turn to write (one write's pieces, `write`); EINTR if a signal comes
-/// first.
-pub fn writer() -> Result<Writer, i64> {
+/// Waits for instance `holder`'s turn to write (one write's pieces). A signal does not
+/// end the wait (the write's output is processed already; turns are held for one
+/// bounded write, within one call); a dying thread gives up (EINTR), and so does a
+/// waiter whose instance no longer holds the device (EIO: a change of the holder wakes
+/// the waiters). A ticket given up is skipped when it comes.
+fn writer(holder: u64) -> Result<Writer, i64> {
+    use crate::process::errno::{EINTR, EIO};
     let ticket = {
         let mut t = TURNS.lock();
         t.next += 1;
@@ -158,16 +165,50 @@ pub fn writer() -> Result<Writer, i64> {
         let wait = prepare_to_wait(TURN_CHAN);
         {
             let mut t = TURNS.lock();
+            let gone = if HOLDER.load(Ordering::Acquire) != holder {
+                Some(EIO)
+            } else if crate::process::signal::dying() {
+                Some(EINTR)
+            } else {
+                None
+            };
             if t.serving == ticket {
-                return Ok(Writer(()));
+                if gone.is_none() {
+                    return Ok(Writer(()));
+                }
+                // Came just now: passed on.
+                drop(t);
+                drop(Writer(()));
+                return Err(gone.unwrap_or(EIO));
             }
-            if crate::process::signal::interrupted() {
+            if let Some(e) = gone {
                 t.abandoned.insert(ticket);
-                return Err(crate::process::errno::EINTR);
+                return Err(e);
             }
         }
         wait.sleep();
     }
+}
+
+/// Writes all of `bytes` (the kernel's copy of a write of instance `holder`'s) in
+/// one turn, piece by piece, with the echoes that came between the pieces; EIO when
+/// the instance loses the device (before or during: the rest goes).
+pub fn write_all(holder: u64, bytes: &[u8]) -> Result<(), i64> {
+    let result = {
+        let _turn = writer(holder)?;
+        let mut result = Ok(());
+        for piece in bytes.chunks(512) {
+            if HOLDER.load(Ordering::Acquire) != holder {
+                result = Err(crate::process::errno::EIO);
+                break;
+            }
+            write(piece);
+        }
+        result
+    };
+    // Echoes queued after the last piece go out (unless another writer has the turn).
+    flush_echo();
+    result
 }
 
 /// The turn if nobody writes or waits now (never sleeps).
@@ -187,7 +228,7 @@ static ECHO: IrqSpinLock<Deque<u8, ECHO_QUEUE>> = IrqSpinLock::new(Deque::new())
 /// Writes a piece of the holder's write (the writer's turn held) to the console as it is, then
 /// the echoes that came meanwhile. The console's answers to queries in the bytes (a
 /// cursor position report) become input; answers to the kernel's own text do not.
-pub fn write(bytes: &[u8]) {
+fn write(bytes: &[u8]) {
     out(bytes);
     drain_echo();
 }

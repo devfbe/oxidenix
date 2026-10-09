@@ -711,26 +711,22 @@ pub const SYS_THREAD_IDS: u64 = 1103;
 /// input (typed on the keyboard, or the console's answers to queries written
 /// to it): 0 when there is none. EIO unless the instance holds the console.
 pub const SYS_CONSOLE_READ: u64 = 1110;
-/// `console_write(buf, len, flags) -> n`: writes `len` bytes to the console as
-/// they are (a VT100: a line feed keeps the column, `ONLCR` is the
-/// terminal's), whole: another write's bytes do not come between them (the
-/// caller waits its turn, first come first served; EINTR if a signal for the
-/// program comes first, with nothing written). With `CONSOLE_ECHO` (an echo of the
-/// line discipline, at most 512 bytes) it never waits: the bytes are queued
-/// and go out between the pieces of a write in progress or at once; what does
-/// not fit in the queue (4 KiB) is dropped, `n` says how much went. EIO
-/// unless the instance holds the console.
+/// `console_write(buf, len, flags) -> n`: writes the first `n` (at most
+/// `CONSOLE_WRITE_MAX`) of `len` bytes to the console as they are (a VT100: a
+/// line feed keeps the column, `ONLCR` is the terminal's), whole: another
+/// write's bytes do not come between them. The kernel copies the bytes first,
+/// then waits for the writer turn (first come first served, held only within
+/// the call); a signal does not end that wait, a dying thread's does (EINTR,
+/// nothing written), and so does the instance's loss of the console (EIO), so
+/// output processed for the write goes out. With `CONSOLE_ECHO` (an echo of the
+/// line discipline, at most `CONSOLE_ECHO_MAX` bytes) it never waits: the bytes
+/// are queued and go out between the pieces of a write in progress or at once;
+/// what does not fit in the queue (4 KiB) is dropped, `n` says how much went.
+/// EIO unless the instance holds the console.
 pub const SYS_CONSOLE_WRITE: u64 = 1111;
 pub const CONSOLE_ECHO: u64 = 1;
-/// `console_turn(op)`: `CONSOLE_TURN_TAKE` waits for the console's writer turn
-/// and keeps it for the calling thread (EINTR for a signal first; EBUSY if it
-/// has it already): its `console_write`s go out in it, so a writer can process
-/// its output knowing it will not have to wait any more (its column
-/// bookkeeping moves only for output that goes out). `CONSOLE_TURN_GIVE`
-/// gives it back; so does entering the program, or the thread's end.
-pub const SYS_CONSOLE_TURN: u64 = 1116;
-pub const CONSOLE_TURN_TAKE: u64 = 1;
-pub const CONSOLE_TURN_GIVE: u64 = 0;
+pub const CONSOLE_WRITE_MAX: u64 = 4096;
+pub const CONSOLE_ECHO_MAX: u64 = 512;
 /// `console_info(out)`: the console's size, two u64s at `out` (columns,
 /// rows). EIO unless the instance holds the console.
 pub const SYS_CONSOLE_INFO: u64 = 1112;

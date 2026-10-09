@@ -784,18 +784,11 @@ impl Tty {
                 Err(e) => return if written > 0 { Ok(written as i64) } else { Err(e) },
             };
             loop {
-                // The console's writer turn before anything is processed: a signal
-                // while it waits (EINTR) leaves the column bookkeeping untouched, and
-                // in the turn the device's write never waits, so the output processed
-                // is the output that goes out (no rollback that echoes processed
-                // meanwhile could see half done).
-                let console_turn = match self.driver {
-                    Driver::Console => match crate::console::take_turn() {
-                        Ok(t) => Some(t),
-                        Err(e) => return if written > 0 { Ok(written as i64) } else { Err(e) },
-                    },
-                    Driver::Pty(_) => None,
-                };
+                // Output processed here goes out: the console's write waits for its
+                // turn but no signal ends that wait (only death, after which nothing
+                // restarts, or the loss of the device, which hangs the terminal up),
+                // so the column bookkeeping moves once per byte that goes out, as
+                // Linux's (the interruptible wait is this write's turn, taken before).
                 let seen = {
                     let mut inner = self.inner.lock();
                     if inner.gen != open.gen {
@@ -820,7 +813,6 @@ impl Tty {
                     }
                     self.seen()
                 };
-                drop(console_turn);
                 if nonblock {
                     return if written > 0 { Ok(written as i64) } else { Err(EAGAIN) };
                 }

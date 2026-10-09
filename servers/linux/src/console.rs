@@ -59,33 +59,19 @@ pub fn open(flags: u32, stat: [u8; 144]) -> Result<i64, i64> {
     tty::open(&t, flags, stat, false)
 }
 
-/// Writes to the device, whole: Ok, or EINTR when a signal came while it waited for its
-/// turn (nothing written). When the instance no longer holds the device the bytes go
-/// (its terminal hangs up at the event).
+/// Writes to the device (a call per `CONSOLE_WRITE_MAX` bytes, each whole). A signal does
+/// not interrupt it (the output was processed for it already; the server's own write
+/// turn, taken before, keeps a write(2) whole and is where signals interrupt): Ok, or
+/// EINTR for a dying thread, or EIO when the instance lost the device (its terminal
+/// hangs up at the event).
 pub fn device_write(bytes: &[u8]) -> Result<(), i64> {
-    match syscall(SYS_CONSOLE_WRITE, [bytes.as_ptr() as u64, bytes.len() as u64, 0, 0, 0, 0]) {
-        r if r == -tty::EINTR => Err(tty::EINTR),
-        _ => Ok(()),
+    for piece in bytes.chunks(CONSOLE_WRITE_MAX as usize) {
+        let r = syscall(SYS_CONSOLE_WRITE, [piece.as_ptr() as u64, piece.len() as u64, 0, 0, 0, 0]);
+        if r < 0 {
+            return Err(-r);
+        }
     }
-}
-
-/// The console's writer turn, kept by the calling thread until dropped: writes in it
-/// never wait (or fail with EINTR), so output can be processed knowing it goes out.
-pub struct ConsoleTurn(());
-
-impl Drop for ConsoleTurn {
-    fn drop(&mut self) {
-        syscall(SYS_CONSOLE_TURN, [CONSOLE_TURN_GIVE, 0, 0, 0, 0, 0]);
-    }
-}
-
-/// Waits for the console's writer turn: EINTR for a signal first, EIO when the instance
-/// no longer holds the device.
-pub fn take_turn() -> Result<ConsoleTurn, i64> {
-    match syscall(SYS_CONSOLE_TURN, [CONSOLE_TURN_TAKE, 0, 0, 0, 0, 0]) {
-        r if r < 0 => Err(-r),
-        _ => Ok(ConsoleTurn(())),
-    }
+    Ok(())
 }
 
 /// Echoes to the device without ever waiting (the service thread's input processing must

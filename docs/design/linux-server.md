@@ -347,9 +347,14 @@ device. Decisions in ADR 0007.
   `EVENT_CONSOLE` (the keyboard interrupt sets a flag and wakes the service thread's
   channel; no lock of the instance is taken in interrupt context); losing the device is
   `EVENT_CONSOLE_LOST`.
-- **Writes and echoes**: a write goes out whole in a writer's turn, a fair sleeping lock of
-  the kernel's (first come first served, so a program flooding the console starves no other
-  writer; a signal interrupts a wait for the turn with EINTR, nothing written). The service
+- **Writes and echoes**: a write (at most 4 KiB per call) goes out whole in a writer's turn,
+  a fair sleeping lock of the kernel's (first come first served, so a program flooding the
+  console starves no other writer). The turn is never held beyond one call, nor across a
+  copy: the kernel checks the holder, copies the call's bytes into its own memory, then
+  takes a ticket and writes them. A signal does not end the wait for the turn (the output
+  was processed for it); a dying thread's wait ends (EINTR, the ticket skipped), and so do
+  the waits of an instance that loses the device (EIO: a change of the holder wakes them),
+  so no instance can keep another's writers waiting. The service
   thread processes the keyboard's input and must never wait behind such a write (the
   instance's page faults wait for it): its echoes (`console_write` with `CONSOLE_ECHO`) go
   into a bounded queue (4 KiB, the rest dropped, as Linux's echo buffer) that the writer
@@ -416,11 +421,11 @@ placeholder in the kernel's descriptor table, as pipes are).
   output processing happens under the terminal's lock into the server's memory, a pty's
   output goes to its master's buffer under it, the console's to the device after it. No lock
   of `sync` is held across the console's write (a flooding writer would get a lock holder's
-  priority for the whole write and starve its CPU's other threads). A console write first
-  takes the console's writer turn (`console_turn`), then processes its output and writes it
-  in the turn, where the device's write never waits: a signal can only come while it waits
-  for the turn, before the column bookkeeping moved, so a restarted write processes its
-  output once and echoes never see half-done bookkeeping. Output stopped by
+  priority for the whole write and starve its CPU's other threads). As on Linux, signals
+  interrupt the write's turn (taken before any output is processed), never the device's
+  write after processing (no signal ends its wait for the kernel's turn): output processed
+  is output that goes out, so the column bookkeeping moves once and echoes never see it
+  half done. Output stopped by
   `VSTOP` (or `tcflow`) waits for `VSTART`. Echoes take neither turn.
 - **Job control** (Linux's `tty_check_change`): a process of a background group reading its
   controlling terminal gets SIGTTIN for its group and the call restarts after it (EIO if it
