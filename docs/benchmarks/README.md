@@ -89,6 +89,23 @@ What this shows:
 - **Path resolution in tmpfs got 16 % slower** (4436 → 5143 cycles). This is not
   investigated yet. A candidate is the server lock bookkeeping for the scheduler boost.
 
+## R7b: internet sockets in the Linux server
+
+`2026-10-09-e21f6ae-r7b.md` against `2026-10-09-802b396-quiet.md`. The host was **not idle**
+(other QEMU guests and compilers ran, load about 3.5 on 16 threads): the socket figures below
+are what changed by far the most; the others moved within the noise of such a host
+(`seq_read_cached` halved, which nothing in this change touches) and must be measured again
+on an idle host.
+
+| benchmark | before | now | Linux |
+|---|---:|---:|---:|
+| `tcp_loopback` (MB/s) | 647.1 | 1156.7 | 5831.5 |
+| `tcp_network_echo` (MB/s) | 112.2 | 176.7 | - |
+
+Per 64 KiB written over loopback: 31.9 system calls instead of 112.1, no IPC call instead of 8
+(and 120 bytes copied by the kernel instead of 313217): the data moves between the program,
+the server's rings and netd without the kernel, and no request per `send` or `recv`.
+
 ## Open: PCIDs and small cached reads
 
 Turning PCIDs on (commit `fae8292`, before restricted mode) made random 4 KiB reads from the
