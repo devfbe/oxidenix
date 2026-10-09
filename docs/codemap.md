@@ -76,8 +76,6 @@ module comment, and the public types it defines. Where to start for common tasks
 - `servers/linux/src/eventfd.rs` (101) eventfd (phase R6b): a counter that reads take and writes add to, a file of the server (an open file description of its table's, `files`). Types: `EventFd`.
 - `servers/linux/src/fdtable.rs` (416) The descriptor table (phase R6e, docs/design/linux-server.md "The descriptor table"): per process, the server's. Types: `FilesContext`.
 - `servers/linux/src/files.rs` (701) The server's open files (phase R6, the descriptor table since R6e): an open file description (`Description`) is a file the server implements (`File`: a pipe end, a socket, an open file of tmpfs or /data, a terminal,... Types: `File`, `Description`, `FileRef`, `OriginOf`, `Mapping`.
-- `servers/linux/src/files.rs` (701) The server's open files (phase R6, the descriptor table since R6e): an open file description (`Description`) is a file the server implements (`File`: a pipe end, a socket, an open file of tmpfs or /data, a terminal,... Types: `File`, `Description`, `FileRef`, `OriginOf`, `Mapping`.
-- `servers/linux/src/files.rs` (701) The server's open files (phase R6, the descriptor table since R6e): an open file description (`Description`) is a file the server implements (`File`: a pipe end, a socket, an open file of tmpfs or /data, a terminal,... Types: `File`, `Description`, `FileRef`, `OriginOf`, `Mapping`.
 - `servers/linux/src/fsclient.rs` (122) The server's end of the file protocol (`fsring`, docs/design/io-rings.md) to a filesystem service: diskfs for /data (`datafs`), procfs for /proc's system-wide files and /sys (`procfs`). Types: `Client`, `Scratch`.
 - `servers/linux/src/heap.rs` (67) The server's heap: one allocator for every thread of the instance, in the shared region, growing by `SYS_SHARED_MAP` when it runs out. Types: `ServerHeap`.
 - `servers/linux/src/ids.rs` (23) Supplementary groups: getgroups and setgroups.
@@ -87,8 +85,6 @@ module comment, and the public types it defines. Where to start for common tasks
 - `servers/linux/src/inotify.rs` (409) inotify(7): watches on the files of the server's filesystems (tmpfs and /data) and the queue of their events, a file of the server, as eventfd. Types: `Key`, `Inotify`.
 - `servers/linux/src/kfile.rs` (60) Open files of the kernel's (phase R6e): an open file description of the kernel's tree a program opened (its /dev: null, zero, the directory), which the server holds by handle (`SYS_INODE_OPEN`) as one of its own... Types: `KernelFile`.
 - `servers/linux/src/main.rs` (372) The Linux server (docs/design/linux-server.md).
-- `servers/linux/src/main.rs` (372) The Linux server (docs/design/linux-server.md).
-- `servers/linux/src/main.rs` (372) The Linux server (docs/design/linux-server.md).
 - `servers/linux/src/mm.rs` (166) Memory system calls (phase R4): Linux's semantics of mmap, munmap, mprotect, mremap, madvise, msync and the mlock family, over the kernel's mapping calls.
 - `servers/linux/src/namespace.rs` (365) The server's namespace (phase R6c.2): mounts and path resolution. Types: `KInode`, `Node`, `Origin`, `Resolved`.
 - `servers/linux/src/netclient.rs` (388) The instance's channel to netd (phase R7b, ADR 0008, the protocol `netring`): requests (`ringclient`'s slots), the shared area with a control block per socket, the buffer pool the sockets' rings live in, and the net... Types: `Futex`, `Rings`, `Net`.
@@ -96,8 +92,6 @@ module comment, and the public types it defines. Where to start for common tasks
 - `servers/linux/src/netlink.rs` (535) Netlink sockets (netlink(7)), protocol NETLINK_ROUTE: files of the server, as pipes. Types: `NetlinkSocket`.
 - `servers/linux/src/pathfile.rs` (22) O_PATH descriptors (open(2) with O_PATH; phase R6d, for any node of the namespace): the descriptor names a node and opens nothing, no driver, no file. Types: `PathOpen`.
 - `servers/linux/src/paths.rs` (669) The system calls that take a path (phase R6c.2b), and the working directory and umask, which live in the caller's record (`records`).
-- `servers/linux/src/pipe.rs` (309) Pipes (phase R6a): a 64 KiB buffer shared by a read end and a write end, each a file of the server (an open file description of its own). Types: `Dst`, `Src`, `Shared`, `PipeEnd`, `Pipe`.
-- `servers/linux/src/pipe.rs` (309) Pipes (phase R6a): a 64 KiB buffer shared by a read end and a write end, each a file of the server (an open file description of its own). Types: `Dst`, `Src`, `Shared`, `PipeEnd`, `Pipe`.
 - `servers/linux/src/pipe.rs` (309) Pipes (phase R6a): a 64 KiB buffer shared by a read end and a write end, each a file of the server (an open file description of its own). Types: `Dst`, `Src`, `Shared`, `PipeEnd`, `Pipe`.
 - `servers/linux/src/poll.rs` (451) Readiness and waiting for many files at once (phase R6e): the watch lists of the server's open file descriptions, poll, ppoll, select, pselect6 and restart_syscall (epoll is `epoll`'s). Types: `Waiter`, `Sub`, `Watch`.
 - `servers/linux/src/procfile.rs` (177) Open files of /proc and /sys (I/O rings step 5): what an open file description of the server's names (the node, its offset and a snapshot of its contents); the calls on it are the server's (`procfs` makes the contents). Types: `ProcOpen`.
@@ -153,8 +147,6 @@ module comment, and the public types it defines. Where to start for common tasks
 - `crates/procproto/src/render.rs` (200) The text formats of Linux's /proc files (proc(5)): the system-wide ones procfs serves (`stat`, `meminfo`, `loadavg`, `uptime`, `counters`) and a process's own the Linux server makes (`<pid>/stat`, `statm`, `status`,... Types: `Machine`, `Linux`.
 - `crates/procproto/tests/admission.rs` (57) What procfs gives each client: one instance cannot take the channels or the mapped grants the others need, and what goes is given back.
 - `crates/procproto/tests/render.rs` (102) The text formats of /proc against what Linux programs parse: the field counts and orders of /proc/stat, /proc/<pid>/stat, statm and status, the units of meminfo, the fixed-point load averages, times in USER_HZ.
-- `crates/restricted/src/lib.rs` (204) The interface between the kernel and the Linux server for restricted mode (docs/design/linux-server.md): the layout of the server's shared region, the per-thread register block, and the kernel calls the server makes... Types: `State`, `Event`, `Walk`.
-- `crates/restricted/src/lib.rs` (204) The interface between the kernel and the Linux server for restricted mode (docs/design/linux-server.md): the layout of the server's shared region, the per-thread register block, and the kernel calls the server makes... Types: `State`, `Event`, `Walk`.
 - `crates/restricted/src/lib.rs` (204) The interface between the kernel and the Linux server for restricted mode (docs/design/linux-server.md): the layout of the server's shared region, the per-thread register block, and the kernel calls the server makes... Types: `State`, `Event`, `Walk`.
 - `crates/ring/src/channel.rs` (151) A channel: the memory object both ends of a data-plane connection map (docs/design/io-rings.md). Types: `Layout`, `Header`, `Offer`.
 - `crates/ring/src/lib.rs` (205) Single-producer single-consumer rings of fixed-size descriptors in shared memory: the data plane between the Linux server and the device servers (docs/design/io-rings.md, ADR 0005). Types: `Desc`, `Completion`, `RingMemory`, `Wait`, `Ring`, `Producer`, `Consumer`.
@@ -225,8 +217,6 @@ module comment, and the public types it defines. Where to start for common tasks
 
 - `userspace/rootfs/etc/bench.sh` Benchmark mode (OXIDENIX_BENCH=1, see docs/benchmarks/README.md): runs the I/O benchmarks on the data disk; the exit status ends QEMU as in test mode.
 - `userspace/rootfs/etc/disktest.sh` Exercises the ext2 driver on /data; every line should end in "ok".
-- `userspace/rootfs/etc/runtests.sh` Runs every self-test and exits non-zero if any fails.
-- `userspace/rootfs/etc/runtests.sh` Runs every self-test and exits non-zero if any fails.
 - `userspace/rootfs/etc/runtests.sh` Runs every self-test and exits non-zero if any fails.
 - `userspace/rootfs/etc/test.sh` A quick manual tour of the shell: files, pipes and a few commands.
 
@@ -347,8 +337,6 @@ kernel that handle them.
 - `docs/decisions/0009-descriptor-table-in-the-linux-server.md` ADR 0009: The descriptor table in the Linux server: per-table records until R8, the kernel's files by handle, readiness through the server's watches
 - `docs/design/io-rings.md` I/O rings: the data plane between the Linux server and the device servers
 - `docs/design/iommu.md` DMA isolation with an IOMMU
-- `docs/design/linux-server.md` The Linux server: system calls in restricted mode
-- `docs/design/linux-server.md` The Linux server: system calls in restricted mode
 - `docs/design/linux-server.md` The Linux server: system calls in restricted mode
 - `docs/design/page-cache.md` Page cache and file-backed mappings
 - `docs/design/smp.md` Symmetric multiprocessing in oxidenix
