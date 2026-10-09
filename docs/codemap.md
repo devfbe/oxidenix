@@ -299,6 +299,7 @@ kernel that handle them.
 - `docs/decisions/0004-tty-layer-in-the-linux-server.md` ADR 0004: The tty layer moves into the Linux server
 - `docs/decisions/0005-shared-memory-rings-for-the-data-plane.md` ADR 0005: Shared-memory rings with granted buffers for the data plane
 - `docs/decisions/0006-server-restart-policy.md` ADR 0006: Restarting servers: backoff, crash loops and recovery
+- `docs/decisions/0007-terminals-in-the-linux-server.md` ADR 0007: Terminals in the Linux server: a raw console device, devices by number, the controlling terminal per session
 - `docs/design/io-rings.md` I/O rings: the data plane between the Linux server and the device servers
 - `docs/design/iommu.md` DMA isolation with an IOMMU
 - `docs/design/linux-server.md` The Linux server: system calls in restricted mode

@@ -120,7 +120,7 @@ processes, threads, memory objects and the services it uses.
 | waiting | `futex_wait(addr, value, deadline)`, `futex_wake`, `clock_get` |
 | IPC | today's services, and shared-memory rings for the I/O paths (separate design) |
 | devices | interrupts, I/O ports, PCI functions, DMA areas (as today; IOMMU per `iommu.md`) |
-| console | the framebuffer console and keyboard as a device the server's tty layer drives, held by one instance at a time (ADR 0004) |
+| console | the framebuffer console and keyboard as a raw device the server's tty layer drives, held by one instance at a time (ADR 0004; `console_read`, `console_write`, `console_info`, `EVENT_CONSOLE`; R6d) |
 
 What leaves the kernel over the migration: `process/syscall.rs`'s dispatch, `sys_*.rs`,
 `signal.rs`, `epoll.rs`, `poll.rs`, `prctl.rs`, `exec.rs`, `loader.rs`, `elf.rs`, `clone.rs`
@@ -241,8 +241,9 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
        IPC protocol) is gone; the kernel only starts diskfs and, before it powers off, waits
        until the instances wrote their caches back. procfs over the rings follows (I/O rings
        step 5).
-   - **R6d — The terminal** (ADR 0004): the console as a device of the server, the line
-     discipline and job control's terminal side in the server.
+   - **R6d — The terminal** (ADR 0004, ADR 0007): the console as a device of the server, the
+     line discipline and job control's terminal side in the server, and pseudo-terminals.
+     See "The terminal" below.
    - **R6e — The descriptor table, `poll`, `select` and `epoll`** move with the sockets (R7),
      the last kind the kernel implements, over a kernel wait for the server's events and the
      netd's at once. Until then the descriptor's own requests pass through to the kernel,
@@ -319,8 +320,138 @@ semantics needs the server's runtime first, and memory semantics is the smallest
 takes Linux code out of the kernel, while files are the largest and touch almost everything
 else.
 
+## The terminal (R6d)
+
+Before R6d the kernel had a line discipline for the console (`drivers/tty.rs`), answered the
+terminal ioctls itself and kept one foreground process group. With R6d terminals are the
+server's, as Linux's tty layer: the line discipline, termios, the controlling terminal and
+the foreground group, hangups and pseudo-terminals. The kernel keeps the console as a raw
+device. Decisions in ADR 0007.
+
+### The kernel: the console as a device
+
+- **Output**: bytes to the framebuffer console's VT100 interpreter and the serial mirror,
+  as they are. A line feed is a line feed only (as on a VT: the cursor keeps its column);
+  turning `\n` into `\r\n` is the terminal's `ONLCR`. The kernel's own messages (`printk`,
+  the native servers' standard output) add their carriage returns themselves.
+- **Input**: the keyboard's bytes (UTF-8, control characters, the Linux console's key
+  sequences) and the console's answers to queries a program writes (a cursor position
+  report, device attributes), in a 4 KiB ring. Nothing is interpreted.
+- **One holder**: the kernel grants the device to the process tree it starts (at boot, by
+  autorun, by the monitor's `run`) and takes it back when that tree's first process has ended
+  (the monitor reads its commands from it then); an instance that ends lets it go. Only the
+  holder reads input (`console_read`) and writes (`console_write`, EIO for others);
+  `console_info` gives the size. Input wakes the holder's service thread with
+  `EVENT_CONSOLE` (the keyboard interrupt sets a flag and wakes the service thread's
+  channel; no lock of the instance is taken in interrupt context); losing the device is
+  `EVENT_CONSOLE_LOST`.
+- **The monitor** (the kernel's fallback shell) edits its command line on the raw device
+  while it holds it: echo, backspace, Ctrl+U, Enter. It is not Linux and has no termios.
+
+### Process groups and sessions until R8
+
+They stay the kernel's until R8 moves the process model. The server asks and acts through
+calls that go with R8: `proc_ids` (a process's or a process group's pid, group, session, and
+whether the group is orphaned, within the caller's instance), `signal_group` (a signal from
+the terminal to a process group or a process of the instance), `signal_state` (whether the
+calling thread blocks a signal or its process ignores it, for SIGTTIN and SIGTTOU), and the
+kernel's `EVENT_SESSION_END` when a session leader's process ends.
+
+### The line discipline (`crates/tty`)
+
+Linux's N_TTY as a pure library, tested on the host (`cargo test -p tty`): `struct termios`
+and `struct termios2` in x86-64's layout with the defaults of Linux's `tty_std_termios`;
+input mapping (`ISTRIP`, `INLCR`, `IGNCR`, `ICRNL`, `IUCLC`), `ISIG` with `NOFLSH`, flow
+control (`IXON`, `IXANY`), canonical editing (`VERASE`, `VKILL` with `ECHOK`/`ECHOKE`,
+`VWERASE`, `VREPRINT`, `VLNEXT`, `VEOF`, `VEOL`, `VEOL2`, `IUTF8` erasing whole characters,
+tabs erased by column), the four cases of `VMIN`/`VTIME` (the waiting is the server's, the
+rules are here), echo (`ECHO`, `ECHOE`, `ECHOK`, `ECHOKE`, `ECHONL`, `ECHOCTL`, `ECHOPRT`) and
+output processing (`OPOST`, `ONLCR`, `OCRNL`, `ONOCR`, `ONLRET`, `OLCUC`, `XTABS`) with
+Linux's column bookkeeping. Switching `ICANON` hands a half-typed line to a raw reader, and
+raw input to a canonical one as a line, as Linux does. The buffer holds 4095 bytes: in
+canonical mode a full line takes only its end (`IMAXBEL` rings), in noncanonical mode the
+input waits (a pty master's write) or is dropped (the keyboard).
+
+### Terminals in the server (`servers/linux/src/tty.rs`)
+
+A terminal is a line discipline, its job control state (session, foreground group, window
+size), its hangup generation, the readiness it reported to each of its open file
+descriptions, and a driver: the console (`console.rs`) or a pseudo-terminal's slave
+(`pty.rs`). Each open of a terminal is an open file description of the server's (a
+placeholder in the kernel's descriptor table, as pipes are).
+
+- **Reading** (`n_tty_read`'s rules): canonical reads end at a line's end (an `VEOF` at the
+  start of a line reads 0); noncanonical reads follow `VMIN`/`VTIME` (with `VTIME` an
+  inter-byte timer once a byte came, or the whole read's timeout with `VMIN` 0), the waits
+  are interruptible server futex waits with a deadline. Readers go one at a time; bytes are
+  copied to the program with no lock held and consumed after (as pipes).
+- **Writing**: output processing under the terminal's lock into the server's memory, then to
+  the driver under its write lock (which the service thread also takes for echoes; nobody
+  holding it waits for the pager, and it is never held while program memory is copied).
+  Output stopped by `VSTOP` (or `tcflow`) waits for `VSTART`.
+- **Job control** (Linux's `tty_check_change`): a process of a background group reading its
+  controlling terminal gets SIGTTIN for its group and the call restarts after it (EIO if it
+  ignores or blocks SIGTTIN or its group is orphaned); writing with `TOSTOP`, and
+  `tcsetattr`, `tcflush`, `tcflow`, `TIOCSPGRP`, `tcsendbreak` from the background get
+  SIGTTOU likewise (allowed if it ignores or blocks SIGTTOU, EIO if orphaned). `VINTR`,
+  `VQUIT` and `VSUSP` signal the foreground group (flushing unless `NOFLSH`), `TIOCSWINSZ`
+  sends SIGWINCH when the size changes.
+- **The controlling terminal** belongs to a session: the terminal records the session it
+  controls, and a process's controlling terminal is the one whose session is the process's.
+  A session leader without one gets one by `TIOCSCTTY` or by opening a terminal that has
+  none (not `/dev/console`, not with `O_NOCTTY`, as Linux); `TIOCNOTTY` by the leader and the
+  leader's exit (`EVENT_SESSION_END`) dissociate it as Linux's `disassociate_ctty` does (the
+  console is hung up, a pty's foreground group gets SIGHUP). The instance's first process is
+  a session leader and starts with the console as its controlling terminal, as busybox's
+  `cttyhack` would make it (there is no getty). `TIOCNOTTY` by a process that is not its
+  session's leader takes effect for the whole session only at its leader; per-process
+  controlling terminals come with the server's process records (R8).
+- **Hangup** (Linux's `__tty_hangup`): the terminal's generation advances; its open file
+  descriptions from before read 0, fail writes and ioctls with EIO (`TIOCSPGRP`: ENOTTY) and
+  poll as readable, writable, error and hangup; the session leader gets SIGHUP and SIGCONT,
+  and on a session's end the foreground group SIGHUP. Then the terminal controls no session.
+  The console is hung up when its session ends or the instance loses the device (after which
+  opening it gives ENXIO); a pty's slave when its master closes.
+- **Devices by number**: a character device node names its driver by its device number, as on
+  Linux: (5,0) `/dev/tty` (the caller's controlling terminal, ENXIO without one), (5,1)
+  `/dev/console`, (5,2) `/dev/ptmx`, (136,n) `/dev/pts/n` are the server's, whatever
+  filesystem holds the node; the others (`/dev/null`, `/dev/zero`) stay the kernel's. The
+  kernel's `/dev` gives its nodes their numbers (`st_rdev`).
+- **ioctls**: `TCGETS`/`TCSETS`/`TCSETSW`/`TCSETSF` and the `termios2` forms, `TCSBRK`,
+  `TCSBRKP`, `TCXONC`, `TCFLSH`, `TIOCGWINSZ`/`TIOCSWINSZ`, `TIOCGPGRP`/`TIOCSPGRP`,
+  `TIOCGSID`, `TIOCSCTTY`, `TIOCNOTTY`, `TIOCSTI` (everyone is root), `FIONREAD`,
+  `TIOCOUTQ`, `TIOCEXCL`/`TIOCNXCL`/`TIOCGEXCL`, `TIOCGETD`/`TIOCSETD` (N_TTY only),
+  `TIOCVHANGUP`; on a pty master also `TIOCGPTN`, `TIOCSPTLCK`/`TIOCGPTLCK`, `TIOCGPTPEER`
+  and `TIOCSIG`. Not done: packet mode (`TIOCPKT`), the VT and keyboard ioctls of the Linux
+  console (`KDGKBTYPE`, `VT_*`), modem lines (ENOTTY, as for a pty).
+
+### Pseudo-terminals (`servers/linux/src/pty.rs`)
+
+Opening `/dev/ptmx` makes a pair: the master is a file of the server, the slave a terminal
+whose driver hands its output to the master. Its node `/dev/pts/n` is in the server's devpts,
+a tmpfs mounted at `/dev/pts` whose names only the server makes and removes (with
+`/dev/pts/ptmx`, mode 000, as Linux's): from the master's open until its close. The slave is
+locked until `TIOCSPTLCK` unlocks it (`unlockpt`; opening it before is EIO). A master write is
+the slave's input (in noncanonical mode it waits while the slave's buffer is full); the
+slave's output goes to the master's 64 KiB buffer (its writers wait for room). The master
+reads EIO once the slave's last descriptor went (after what was left), and polls with
+POLLHUP; the master's last close hangs the slave up and removes its node. The master's
+termios, window size and process group ioctls act on the slave, as on Linux.
+
+### What is tested where
+
+`userspace/ttytest.c` drives terminals through ptys, which is everything the server's tty
+layer does: termios round trips, canonical and raw reads, `VMIN`/`VTIME`, echo and editing,
+output processing, ^C/^Z/^\ reaching the foreground group, SIGTTIN and SIGTTOU for a
+background group, the controlling terminal, hangups, window sizes and SIGWINCH, poll. The
+console's own input is the keyboard's (QEMU's serial port is output only), so the console
+driver's input path is checked interactively (bash, busybox, htop); its output path carries
+the whole test suite's output.
+
 ## Decisions taken in the review
 
 - One server instance per process tree, not one for all (ADR 0002).
 - 46 bits of address space for Linux programs (ADR 0003).
 - The tty layer runs in the Linux server; the kernel keeps the console as a device (ADR 0004).
+- Terminals: the console as a granted raw device, devices named by number, the controlling
+  terminal per session until R8, pseudo-terminals in the server (ADR 0007).
