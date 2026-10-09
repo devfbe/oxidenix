@@ -1643,6 +1643,23 @@ impl<'a> Socket<'a> {
         Some(self.ack_reply(ip_repr, repr))
     }
 
+    /// oxidenix: whether `repr` is a new connection's SYN for this
+    /// connection's 4-tuple while it is in TIME-WAIT, beyond everything it
+    /// received (RFC 9293 3.10.7.4, RFC 6191 without timestamps): then
+    /// TIME-WAIT ends at once (`end_time_wait`) and a listener takes it.
+    pub(crate) fn yields_to_syn(&self, cx: &mut Context, ip_repr: &IpRepr, repr: &TcpRepr) -> bool {
+        self.state == State::TimeWait
+            && repr.control == TcpControl::Syn
+            && repr.ack_number.is_none()
+            && self.accepts(cx, ip_repr, repr)
+            && repr.seq_number > self.remote_seq_no + self.rx_buffer.len()
+    }
+
+    /// oxidenix: ends TIME-WAIT silently (`yields_to_syn`).
+    pub(crate) fn end_time_wait(&mut self) {
+        self.reset();
+    }
+
     pub(crate) fn accepts(&self, _cx: &mut Context, ip_repr: &IpRepr, repr: &TcpRepr) -> bool {
         if self.state == State::Closed {
             return false;
@@ -10375,6 +10392,28 @@ mod test {
         assert!(s.assembler.is_empty());
         assert_eq!(s.replace_rx_buffer(vec![]).ok().map(|b| b.len()), Some(64));
         assert_eq!(s.replace_tx_buffer(vec![]).ok().map(|b| b.len()), Some(64));
+    }
+
+    /// A new connection's SYN, beyond what the old one received, ends its
+    /// TIME-WAIT; an old duplicate does not.
+    #[test]
+    fn test_oxidenix_time_wait_yields_to_a_new_syn() {
+        let mut s = socket_time_wait(false);
+        let ip = IpReprIpvX(IpvXRepr {
+            src_addr: REMOTE_ADDR,
+            dst_addr: LOCAL_ADDR,
+            next_header: IpProtocol::Tcp,
+            payload_len: 0,
+            hop_limit: 64,
+        });
+        let syn = |seq| TcpRepr { control: TcpControl::Syn, seq_number: seq, ack_number: None, ..SEND_TEMPL };
+        let TestSocket { socket, cx } = &mut s;
+        assert!(!socket.yields_to_syn(cx, &ip, &syn(REMOTE_SEQ)), "an old SYN");
+        assert!(!socket.yields_to_syn(cx, &ip, &syn(REMOTE_SEQ + 1 + 1)), "not beyond");
+        assert!(socket.yields_to_syn(cx, &ip, &syn(REMOTE_SEQ + 1000)));
+        socket.end_time_wait();
+        assert_eq!(s.state, State::Closed);
+        assert_eq!(s.tuple, None);
     }
 
     #[test]
