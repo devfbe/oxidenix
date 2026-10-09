@@ -11,7 +11,10 @@
 //! - **Grants a channel has mapped in procfs**: at most `GRANTS_PER_CHANNEL`
 //!   and `GRANT_PAGES_PER_CHANNEL` pages (the Linux server grants one
 //!   scratch buffer of 16 pages); `FORGET` and the channel's end give
-//!   them back.
+//!   them back. A grant is mapped with the room left as its limit, so the
+//!   kernel refuses a larger one before mapping anything; procfs remembers
+//!   a refused grant (at most `REFUSED_PER_CHANNEL`) until `FORGET`, so
+//!   naming it again costs no kernel call.
 //! - **Memory per request**: a result is made in at most `MAX_RESULT`
 //!   bytes, whatever buffer the request names (procfs answers one request
 //!   at a time, so that is its working memory).
@@ -26,6 +29,9 @@ pub const CHANNELS_PER_INSTANCE: usize = 2;
 /// Grants of one channel mapped at once, and their pages.
 pub const GRANTS_PER_CHANNEL: usize = 16;
 pub const GRANT_PAGES_PER_CHANNEL: u64 = 256;
+/// Refused grants a channel's record keeps (beyond, a refused grant asks
+/// the kernel again: cheap, it maps nothing).
+pub const REFUSED_PER_CHANNEL: usize = 64;
 /// The most bytes of one result (a directory listing's piece).
 pub const MAX_RESULT: usize = 64 * 1024;
 
@@ -82,6 +88,17 @@ impl Grants {
             return Err(ENOMEM);
         }
         Ok(())
+    }
+
+    /// The most pages another grant may have: the limit to map it with
+    /// (`grant_map`'s `max_pages`, so a larger one is refused before
+    /// anything is mapped); ENOMEM if no grant may be mapped now.
+    pub fn room(&self) -> Result<u64, i64> {
+        self.may_map()?;
+        match GRANT_PAGES_PER_CHANNEL - self.pages {
+            0 => Err(ENOMEM),
+            n => Ok(n),
+        }
     }
 
     /// Charges a grant of `pages` pages just mapped: ENOMEM (the caller

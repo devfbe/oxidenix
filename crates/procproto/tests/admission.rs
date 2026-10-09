@@ -53,7 +53,21 @@ fn grants_are_bounded_in_count_and_pages() {
         g.charge(1).unwrap();
     }
     assert_eq!(g.may_map(), Err(ENOMEM));
+    assert_eq!(g.room(), Err(ENOMEM));
     assert_eq!(g.charge(0), Err(ENOMEM));
     g.uncharge(1);
     assert_eq!(g.may_map(), Ok(()));
+}
+
+#[test]
+fn the_room_is_the_limit_to_map_with() {
+    let mut g = Grants::default();
+    assert_eq!(g.room(), Ok(GRANT_PAGES_PER_CHANNEL));
+    g.charge(200).unwrap();
+    assert_eq!(g.room(), Ok(GRANT_PAGES_PER_CHANNEL - 200));
+    g.charge(GRANT_PAGES_PER_CHANNEL - 200).unwrap();
+    // No pages left: nothing more is mapped, whatever its size.
+    assert_eq!(g.room(), Err(ENOMEM));
+    g.uncharge(16);
+    assert_eq!(g.room(), Ok(16));
 }

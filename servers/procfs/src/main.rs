@@ -33,13 +33,13 @@ extern crate alloc;
 mod render;
 mod tree;
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::AtomicU32;
 use fsring::errno::*;
 use fsring::{Buf, Completion, Request, Stat, Usage};
-use procproto::admission::{Channels, Grants, MAX_CHANNELS, MAX_RESULT};
+use procproto::admission::{Channels, Grants, GRANT_PAGES_PER_CHANNEL, MAX_CHANNELS, MAX_RESULT, REFUSED_PER_CHANNEL};
 use ring::channel::{Header, Layout, Offer};
 use ring::{Consumer, Producer, Ring, Wait};
 
@@ -48,6 +48,7 @@ oxrt::entry!(main);
 const N: usize = fsring::SLOTS as usize;
 const PAGE: u64 = 4096;
 const EROFS: i64 = 30;
+const E2BIG: i64 = 7;
 /// Requests taken from one channel per round, for fairness.
 const TAKE_PER_ROUND: usize = 16;
 /// Rounds without a request before the loop sleeps: a client reading
@@ -85,6 +86,9 @@ struct Chan {
     grants: BTreeMap<u32, Grant>,
     /// What its mapped grants take of procfs (`admission`).
     budget: Grants,
+    /// Grants larger than a channel's whole budget, refused until `FORGET`
+    /// (at most `REFUSED_PER_CHANNEL`).
+    refused: BTreeSet<u32>,
 }
 
 struct Service {
@@ -95,24 +99,37 @@ struct Service {
 }
 
 impl Chan {
-    /// The grant `id`, mapped now if it is new (within the channel's
-    /// budget: a grant beyond it is unmapped again, ENOMEM).
+    /// The grant `id`, mapped now if it is new, within the channel's
+    /// budget: the kernel maps it only if it fits the room left (E2BIG
+    /// otherwise, nothing mapped), and a grant larger than the whole budget
+    /// is remembered as refused until `FORGET`. ENOMEM for either.
     fn grant(&mut self, id: u32) -> Result<Grant, i64> {
         if let Some(g) = self.grants.get(&id) {
             return Ok(*g);
         }
-        self.budget.may_map()?;
-        let (addr, pages, writable) = oxrt::grant_map(self.id, id).map_err(|e| if e == -ENOENT { EBADF } else { -e })?;
-        if let Err(e) = self.budget.charge(pages) {
-            let _ = oxrt::munmap(addr, (pages * PAGE) as usize);
-            return Err(e);
+        if self.refused.contains(&id) {
+            return Err(ENOMEM);
         }
+        let room = self.budget.room()?;
+        let (addr, pages, writable) = match oxrt::grant_map_max(self.id, id, room) {
+            Ok(mapped) => mapped,
+            Err((e, pages)) if e == -E2BIG => {
+                if pages > GRANT_PAGES_PER_CHANNEL && self.refused.len() < REFUSED_PER_CHANNEL {
+                    self.refused.insert(id);
+                }
+                return Err(ENOMEM);
+            }
+            Err((e, _)) if e == -ENOENT => return Err(EBADF),
+            Err((e, _)) => return Err(-e),
+        };
+        self.budget.charge(pages).expect("the kernel kept to the room");
         let g = Grant { addr, pages, writable };
         self.grants.insert(id, g);
         Ok(g)
     }
 
     fn forget(&mut self, id: u32) {
+        self.refused.remove(&id);
         if let Some(g) = self.grants.remove(&id) {
             let _ = oxrt::munmap(g.addr, (g.pages * PAGE) as usize);
             self.budget.uncharge(g.pages);
@@ -270,6 +287,7 @@ impl Service {
             completions: Ring::new(comp).producer(),
             grants: BTreeMap::new(),
             budget: Grants::default(),
+            refused: BTreeSet::new(),
         });
         0
     }

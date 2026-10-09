@@ -66,3 +66,7 @@ pub const WATCH: u16 = 14;
 /// 50 ms after its answer, with a futex wake on the word (which the
 /// client's `server_futex_wait` on its mapping must meet).
 pub const SHARED: u16 = 15;
+/// Maps the grant (not mapped yet) with a limit of `arg[0]` pages
+/// (`grant_map`'s `max_pages`): 0 if it is refused with E2BIG, reporting
+/// its size as `len` pages, and nothing is mapped; 1 if it was mapped.
+pub const MAP_LIMITED: u16 = 16;
