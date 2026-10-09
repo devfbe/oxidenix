@@ -180,6 +180,9 @@ pub struct Proc {
     pub itimer: crate::timer::ITimer,
     pub brk: Arc<Mutex<Brk>>,
     pub words: Arc<Words>,
+    /// Descriptor tables of its threads handed to the worker and not let go of yet
+    /// (`fdtable::end_later`): its end waits until there are none.
+    pub tables_out: u32,
 }
 
 pub struct Thread {
@@ -196,6 +199,11 @@ pub struct Thread {
     pub sig: signal::ThreadSignals,
     /// It called exit, or was killed: no signal is meant for it any more.
     pub exited: bool,
+    /// Which thread this record is (a tid is reused): a key goes only to the record it was
+    /// made for (`Table::set_key`).
+    pub serial: u64,
+    /// Room for its table's hand-over to the worker is reserved (`fdtable::reserve_end`).
+    pub reserved: bool,
 }
 
 pub struct Table {
@@ -209,6 +217,7 @@ pub struct Table {
     next_hand: u64,
     /// Real-time signals queued in the instance.
     pub rt_queued: usize,
+    next_serial: u64,
     /// Ids a clone under way took (its records come later, in a second lock section).
     pending: alloc::collections::BTreeSet<Pid>,
 }
@@ -221,6 +230,7 @@ pub static PROCS: Mutex<Table> = Mutex::new(Table {
     next_pid: 1,
     next_hand: 1,
     rt_queued: 0,
+    next_serial: 1,
     pending: alloc::collections::BTreeSet::new(),
 });
 
@@ -233,6 +243,7 @@ pub struct Birth {
     pub settid: u64,
     pub fs: *const FsContext,
     pub files: *const FilesContext,
+    pub serial: u64,
 }
 
 impl Table {
@@ -319,9 +330,11 @@ impl Table {
     /// Gives thread `tid` its kernel key (its creator or the thread itself, whichever comes
     /// first). A thread killed before it had one (a group exit or an exec's de_thread found
     /// its record without a key) is killed now.
-    fn set_key(&mut self, tid: Pid, key: u64) {
-        let Some(th) = self.threads.get_mut(&tid) else { return };
-        if th.key == key {
+    fn set_key(&mut self, tid: Pid, serial: u64, key: u64) {
+        // Only the record it was made for (the thread may be gone and its tid another
+        // thread's), and only once (the first of its creator and itself).
+        let Some(th) = self.threads.get_mut(&tid).filter(|th| th.serial == serial) else { return };
+        if th.key != 0 {
             return;
         }
         th.key = key;
@@ -330,6 +343,13 @@ impl Table {
         if killed {
             syscall(SYS_THREAD_KILL, [key, 0, 0, 0, 0, 0]);
         }
+    }
+
+    /// A new thread record's serial.
+    fn new_serial(&mut self) -> u64 {
+        let s = self.next_serial;
+        self.next_serial += 1;
+        s
     }
 
     /// Kills thread `tid`: it ends at its next return to its program (every wait of its ends
@@ -422,7 +442,7 @@ pub fn register_init(key: u64) {
     let files = FilesContext::empty();
     let files_ptr = Arc::as_ptr(&files);
     // (A fresh instance has the room; `end_later` copes without it.)
-    let _ = fdtable::reserve_end();
+    let reserved = fdtable::reserve_end().is_ok();
     {
         let mut t = PROCS.lock();
         let pid = t.alloc_pid().unwrap_or(1);
@@ -454,9 +474,11 @@ pub fn register_init(key: u64) {
             itimer: Default::default(),
             brk: Arc::new(Mutex::new(Brk::default())),
             words: Arc::new(Words::default()),
+            tables_out: 0,
         };
         t.procs.insert(pid, p);
-        t.threads.insert(pid, Thread { tid: pid, pid, key, fs, files: Some(files), comm: comm_from("init"), sig: signal::ThreadSignals::default(), exited: false });
+        let serial = t.new_serial();
+        t.threads.insert(pid, Thread { tid: pid, pid, key, fs, files: Some(files), comm: comm_from("init"), sig: signal::ThreadSignals::default(), exited: false, serial, reserved });
         t.keys.insert(key, pid);
         local::set(pid, pid, key, fs_ptr, files_ptr);
     }
@@ -472,7 +494,7 @@ pub fn start_thread(cookie: u64, key: u64) {
         // As Linux's schedule_tail: a fault here is ignored.
         let _ = usercopy::write(birth.settid, &birth.tid);
     }
-    PROCS.lock().set_key(birth.tid, key);
+    PROCS.lock().set_key(birth.tid, birth.serial, key);
 }
 
 // ------------------------------------------------------------------ system calls
@@ -658,7 +680,7 @@ fn clone(s: &State, c: Clone) -> Result<i64, i64> {
     };
     let files_ptr = Arc::as_ptr(&files);
     // The records.
-    {
+    let serial = {
         let mut t = PROCS.lock();
         // Nothing new comes out of a process that began to end or exec meanwhile (Linux's
         // copy_process checks under the lock that de_thread and the group exit take): a
@@ -727,6 +749,7 @@ fn clone(s: &State, c: Clone) -> Result<i64, i64> {
                 itimer: Default::default(),
                 brk,
                 words: Arc::new(Words::default()),
+                tables_out: 0,
             };
             t.procs.insert(pid, p);
             if let Some(pp) = t.procs.get_mut(&ppid) {
@@ -735,15 +758,17 @@ fn clone(s: &State, c: Clone) -> Result<i64, i64> {
         } else {
             t.procs.get_mut(&pid).expect("checked above").threads.push(tid);
         }
-        t.threads.insert(tid, Thread { tid, pid, key: 0, fs, files: Some(files), comm, sig: thread_sig, exited: false });
-    }
+        let serial = t.new_serial();
+        t.threads.insert(tid, Thread { tid, pid, key: 0, fs, files: Some(files), comm, sig: thread_sig, exited: false, serial, reserved: true });
+        serial
+    };
     // The child's registers: the caller's, returning 0, on the new stack.
     let mut child = *s;
     child.rax = 0;
     if c.stack != 0 {
         child.rsp = c.stack;
     }
-    let birth = alloc::boxed::Box::new(Birth { tid, pid, settid: if settid_in_child { c.ctid } else { 0 }, fs: fs_ptr, files: files_ptr });
+    let birth = alloc::boxed::Box::new(Birth { tid, pid, settid: if settid_in_child { c.ctid } else { 0 }, fs: fs_ptr, files: files_ptr, serial });
     let cookie = alloc::boxed::Box::into_raw(birth) as u64;
     let tflags = if flags & CLONE_SETTLS != 0 { THREAD_SETTLS } else { 0 };
     let ctid = if flags & CLONE_CHILD_CLEARTID != 0 { c.ctid } else { 0 };
@@ -761,7 +786,7 @@ fn clone(s: &State, c: Clone) -> Result<i64, i64> {
     }
     let vfork_words = {
         let mut t = PROCS.lock();
-        t.set_key(tid, key as u64);
+        t.set_key(tid, serial, key as u64);
         name_kernel_thread(key as u64, &t.threads.get(&tid).map_or([0; 16], |th| th.comm));
         (flags & CLONE_VFORK != 0).then(|| t.procs.get(&pid).map(|p| p.words.clone())).flatten()
     };
@@ -889,18 +914,22 @@ pub fn thread_ended(key: u64) {
         }
         // A thread the kernel ended without the server (a server that did not end it on
         // `REASON_EXIT`) still has its table: the worker lets go of it (closing sockets takes
-        // their locks, which the service thread must never wait for), and only then ends its
-        // process if this was its last thread, so that the parent learns of the end after
-        // the descriptors closed.
-        let deferred = match th.files.take() {
-            Some(files) => fdtable::end_later(files, if last { pid } else { 0 }) && last,
-            None => {
-                fdtable::unreserve_end();
-                false
+        // their locks, which the service thread must never wait for). Its process ends only
+        // once every table of its threads handed over so went (`end_deferred`), so that the
+        // parent learns of the end after the descriptors closed, whichever thread was last.
+        match th.files.take() {
+            Some(files) => {
+                if fdtable::end_later(files, pid, th.reserved) {
+                    if let Some(p) = t.procs.get_mut(&pid) {
+                        p.tables_out += 1;
+                    }
+                }
             }
-        };
+            None if th.reserved => fdtable::unreserve_end(),
+            None => {}
+        }
         if last {
-            if !deferred {
+            if t.procs.get(&pid).is_some_and(|p| p.tables_out == 0) {
                 process_end(&mut t, pid, &mut after);
             }
         } else {
@@ -914,14 +943,17 @@ pub fn thread_ended(key: u64) {
     after.run();
 }
 
-/// The worker let go of the table of process `pid`'s last thread (`fdtable::end_later`): the
-/// process ends now.
+/// The worker let go of a table of process `pid`'s threads (`fdtable::end_later`): if it was
+/// the last one out and the process has no thread left, the process ends now.
 pub fn end_deferred(pid: Pid) {
     let mut after = After::default();
     {
         let mut t = PROCS.lock();
-        if t.procs.get(&pid).is_some_and(|p| p.zombie.is_none() && p.threads.is_empty()) {
-            process_end(&mut t, pid, &mut after);
+        if let Some(p) = t.procs.get_mut(&pid) {
+            p.tables_out = p.tables_out.saturating_sub(1);
+            if p.tables_out == 0 && p.zombie.is_none() && p.threads.is_empty() {
+                process_end(&mut t, pid, &mut after);
+            }
         }
     }
     after.run();
