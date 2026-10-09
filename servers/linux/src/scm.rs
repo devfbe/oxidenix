@@ -222,9 +222,19 @@ pub fn sockets_in_flight() -> bool {
     !INFLIGHT.lock().sockets.is_empty()
 }
 
+/// One collection at a time, from choosing the candidates until their
+/// messages are let go of (and their descriptors uncharged): a sender
+/// refused for too many in flight collects itself, and must find a
+/// collection under way (the worker's, after an exit) done, not half done
+/// with its garbage still charged (Linux's wait_for_unix_gc). A sleeping
+/// lock: letting go of the garbage closes sockets, which may wait for netd.
+static COLLECTOR: crate::sync::SleepLock = crate::sync::SleepLock::new(());
+
 /// Finds the sockets only unreachable messages keep and empties their
-/// queues (see the module comment).
+/// queues (see the module comment); waits for a collection under way first.
 pub fn collect() {
+    // (A thread that dies meanwhile does not collect.)
+    let Ok(_one) = COLLECTOR.lock() else { return };
     let gc_lock = GC.write();
     let garbage = {
         let gc = INFLIGHT.lock();
