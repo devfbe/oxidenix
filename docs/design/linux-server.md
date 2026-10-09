@@ -1,6 +1,6 @@
 # The Linux server: system calls in restricted mode
 
-Status: accepted; phase R1 implemented (the shared region uses PML4 slot 128, 512 GiB). Decisions: ADR 0001-0004, 0008 (sockets).
+Status: accepted; phase R1 implemented (the shared region uses PML4 slot 128, 512 GiB). Decisions: ADR 0001-0004, 0008 (sockets), 0010 (processes and signals).
 
 ## Goal
 
@@ -440,12 +440,16 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
      without progress. When a channel's client goes, its sockets close (`FIN` after the data
      netd already holds); when netd dies, every socket of the old channel fails
      (`ECONNRESET`, `POLLERR`) and the next socket makes a new channel (netd started again).
-8. **R8 — Processes and signals**: pids, the process tree, `fork` (with the copy-on-write clone
-   of memory objects), `exec`, `wait`, signals, job control, `/proc`'s data. The kernel's
-   process model shrinks to processes and threads as containers. `thread_exists` (1090), with
-   which the server checks the target of `sched_getscheduler`/`sched_getparam` today and which
-   sees every task of the kernel (other instances' and the servers' threads too), goes then:
-   the server answers from its own table, scoped to its instance.
+8. **R8 — Processes and signals** (ADR 0010; see "Processes and signals" below): pids (a
+   namespace per instance, its first process pid 1), the process tree, sessions and process
+   groups, `fork`/`vfork`/`clone`/`clone3` (over a copy-on-write clone of the address space),
+   `execve` with the ELF loader in the server, `exit`, `wait4`/`waitid`, signals with Linux's
+   frames, job control, interval timers, `prctl`, the credentials, `brk`, and `/proc`'s
+   per-process part. The kernel's process model shrinks to processes and threads as
+   containers driven by a small set of calls. The transitional calls (`thread_exists`,
+   `signal_thread`, `thread_ids`, `proc_ids`, `signal_group`, `signal_state`, `fs_record`,
+   `exec_target`, `EVENT_SESSION_END`, `EVENT_RELEASE` of records) and the kernel's
+   `kill_orphaned_pgrp` go: the server answers from its own tables, scoped to its instance.
 9. **R9 — Remove the pass-through.** `legacy_syscall` and the kernel's Linux code go; the
    kernel implements no system call of Linux. Programs that are not Linux (the servers) keep
    the kernel's own system call interface.
@@ -454,6 +458,189 @@ The order changed after R2 (files were R3, memory semantics R6): every piece of 
 semantics needs the server's runtime first, and memory semantics is the smallest piece that
 takes Linux code out of the kernel, while files are the largest and touch almost everything
 else.
+
+## Processes and signals (R8)
+
+Linux's process model is the server's: pids, the tree, sessions and process groups, signals,
+`fork`, `exec`, `exit` and `wait`. The kernel keeps processes and threads as **containers**:
+an address space, a descriptor table (until R6e), threads it schedules, their CPU time and
+memory counts. Decisions in ADR 0010.
+
+### What the kernel offers
+
+| call | what it does |
+|---|---|
+| `proc_self() -> handle` | a handle on the calling thread's process (the tree's first process registers itself with it) |
+| `proc_create(flags) -> handle` | a new, empty process of the instance: its address space a copy-on-write clone of the caller's (`PROC_FORK`) or the caller's own (`PROC_SHARE_VM`); its descriptor table a copy of the caller's or, with `PROC_SHARE_FILES`, the caller's (the table's part goes to the server with R6e) |
+| `thread_create(process, state, flags, tls, ctid, cookie) -> key` | a thread in a new process (handle) or in the caller's (0): its program starts with the registers at `state`, the caller's FPU registers and FS base (or `tls`), `ctid` as its `CLONE_CHILD_CLEARTID` word; its server starts with `cookie` and its key |
+| `thread_kick(key)` | the thread looks at its signals (below) |
+| `thread_kill(key)` | the thread dies: its waits end, it exits at its next `restricted_enter` |
+| `thread_exit(status, flags)` | the caller ends; with `EXIT_GROUP` its process (`exit_group`: the others are killed) |
+| `exec_space(exe, name, len)` | the point of no return of `execve`: the caller's process gets a new, empty address space (attached to the instance, `exe`'s hold kept while it runs), the FPU state and FS base reset, `CLONE_CHILD_CLEARTID` done for the old one, close-on-exec descriptors closed (the table's part goes with R6e) |
+| `proc_info(handle, out)`, `thread_info(key, out)` | CPU time, memory, state, start, last CPU, nice, the kernel's own end of a process it killed (out of memory, the monitor's `kill`) |
+| `thread_nice(key, set, nice)`, `thread_affinity(key, set, mask)` | per thread; the server picks the threads (process groups, users) |
+| `thread_cleartid(addr)` | the caller's `CLONE_CHILD_CLEARTID` word (`set_tid_address`) |
+| `thread_name(key, name, len)` | the kernel's name of a thread (its monitor and messages) |
+| `init_args(buf, cap)` | the command line the kernel started the tree with (for its first thread) |
+| `vm_floor(addr)` | the lowest address a mapping without `MO_FIXED` is placed at (the break: `brk` is the server's) |
+
+A thread's **key** is its thread area's number and a generation (`slot | gen << 32`): the
+server names threads by it, and a key outlives no thread (a reused area gets a new
+generation). Processes are handles in the instance's table.
+
+**Kicks.** `thread_kick` sets the thread's kick flag (Linux's `TIF_SIGPENDING`) and gets it
+into its server: a thread running its program returns from `restricted_enter` with
+`REASON_KICK` at once (an IPI if it runs on another CPU), a thread in an interruptible wait (a
+server futex with `FUTEX_INTERRUPTIBLE`, `sleep_until`, a pass-through call's wait in the
+kernel) ends it with EINTR. The flag stays set until the thread enters restricted mode again:
+`restricted_enter` with the flag set returns `REASON_KICK` without entering the program (and
+clears it). So no signal is lost between the server's last look and the program running, and
+every wait after a kick ends at once, as Linux's `signal_pending`. A thread the server or the
+kernel kills is marked dying: every wait ends, also the uninterruptible ones (the server's
+locks yield instead), and the thread exits at its next `restricted_enter`, the one point where
+the server holds no lock of its own.
+
+**Faults and exceptions** the kernel cannot resolve (no mapping, a protection violation, a
+read beyond a file's end, `#DE`, `#UD`, `#BP`, `#GP`, `#XM`, ...) return from
+`restricted_enter` with `REASON_FAULT` or `REASON_EXCEPTION`; `State` carries the vector, the
+error code and the address, and the server raises the signal with Linux's `siginfo`
+(`SEGV_MAPERR`/`SEGV_ACCERR`, `BUS_ADRERR`, `FPE_INTDIV`, `ILL_ILLOPN`, `TRAP_BRKPT`, ...).
+
+**Thread exits** reach the service thread as `EVENT_THREAD_EXIT` (its key) once the thread is
+gone: its references to the address space and the descriptor table are dropped, so a parent
+that sees its child dead sees its pipes closed (Linux's `exit_files` before `exit_notify`).
+The room for the event is reserved when the thread is created: it is never lost.
+
+**The first process of a tree** (the monitor's `run`, autorun): the kernel makes the process
+with an empty address space attached to a new instance and its first thread in `ROLE_INIT`,
+and keeps the command line for it (`init_args`). The server makes it pid 1, a session and
+process group leader with the console as its controlling terminal, and runs `execve` on it
+itself. The kernel's ELF loader stays only for its native servers. The kernel still waits for
+the tree's first process (the monitor), so that process alone is a zombie of the kernel's
+too; the processes the server makes leave the kernel's table when their last thread ends.
+
+### The server's tables (`process.rs`)
+
+One lock (`PROCS`) guards the processes, threads and signal state of the instance (Linux's
+`tasklist_lock` and `siglock` in one): it is held briefly and never across a copy to or from
+program memory, so the service thread may take it (exit events) without waiting for a page.
+
+- **Processes**: pid, parent, children, process group, session, the kernel's handle, threads,
+  state (alive, zombie with its wait status), the group exit, the stop in progress and the
+  report for `wait` (stopped, continued), `exit_signal`, `pdeath_signal`, dumpable,
+  no_new_privs, child subreaper, name, command line and program path (for `/proc`), the CPU
+  time and peak memory of reaped children, the interval timer, the break (shared by
+  `CLONE_VM` processes), the signal actions (shared with `CLONE_SIGHAND`) and the pending
+  process signals.
+- **Threads**: tid, key, process, mask, pending thread signals, the alternate signal stack,
+  the mask to restore after `sigsuspend`/`ppoll`/`pselect`/`epoll_pwait`, the signals a
+  `sigtimedwait` waits for, a restart block (`restart_syscall`), the working-directory record
+  (`CLONE_FS`), its name. A block in the thread's State page (`SERVER_LOCAL_OFFSET`, the
+  kernel never reads it) holds its tid, pid and record for the hot paths, without the lock.
+- **Pids** are allocated per instance from 1, up to `pid_max` (32768, then from 300 again,
+  never one in use as a pid, process group or session). A thread's tid is a pid too.
+
+### fork, vfork, clone, clone3
+
+`proc_create` (unless `CLONE_THREAD`), then `thread_create` with the caller's registers
+(`rax` 0, the new stack). `CLONE_PARENT_SETTID` is written before the call returns,
+`CLONE_CHILD_SETTID` by the child's own server before its first instruction (it runs in the
+child's address space), `CLONE_SETTLS` and `CLONE_CHILD_CLEARTID` by the kernel. `CLONE_FS`
+shares the record, `CLONE_SIGHAND` the actions (also between processes, with `CLONE_VM`),
+`CLONE_PARENT` makes the caller's parent the parent (with the caller's exit signal),
+`CLONE_VFORK` makes the caller wait (killable only) until the child execs or exits.
+`CLONE_PIDFD` and namespaces are EINVAL (no pidfds yet).
+
+### execve
+
+The server resolves the program (`execveat` too, with `AT_EMPTY_PATH`), checks it (a regular
+file with an execute bit: EACCES; not open for writing: ETXTBSY), follows `#!` lines (four
+deep, ELOOP), reads the ELF headers through its file object (ENOEXEC), copies the arguments
+and environment (E2BIG beyond `MAX_ARG_STRLEN` or 2 MiB), and only then reaches the point of
+no return: the process's other threads are killed and waited for (a thread that is not the
+leader takes the leader's pid), `exec_space` swaps the address space, and the server maps
+the segments (`ET_EXEC` where they say, `ET_DYN` at a fixed base, with its `PT_INTERP`
+interpreter beside it), zeroes the tail of the last file page, maps the bss and a stack that
+grows down (`MO_GROWSDOWN`), writes the strings (arguments, then environment, back to back),
+`AT_RANDOM`, the platform name, the vectors and the auxiliary vector, and starts the program.
+A failure after the point of no return kills the process with SIGSEGV, as on Linux. Handlers
+go back to their default (ignored signals stay ignored), the alternate stack goes, the mask
+and pending signals stay; a vfork parent goes on.
+
+### exit and wait
+
+`exit` ends the thread (`thread_exit`), `exit_group` and a fatal signal the process (every
+other thread killed). When the service thread learns that a process's last thread is gone, the
+process becomes a zombie: its children go to the nearest child subreaper or to pid 1 (none if
+pid 1 is gone: they are reaped when they end), those with `PR_SET_PDEATHSIG` get their
+signal, process groups it leaves orphaned with stopped members get SIGHUP and SIGCONT
+(Linux's `kill_orphaned_pgrp`), a session leader's end dissociates its terminal, and the parent
+gets its exit signal with `CLD_EXITED`/`CLD_KILLED` and is woken; a parent that ignores
+SIGCHLD or set `SA_NOCLDWAIT` reaps it at once. `wait4` and `waitid` select by pid, process
+group or any (`__WCLONE`, `__WALL`), report exits, stops (`WUNTRACED`/`WSTOPPED`) and
+continues (`WCONTINUED`), with `WNOHANG` and `WNOWAIT`, the child's usage (CPU time and peak
+memory, with its reaped children) and `siginfo`. The default action "core" ends the process
+like "terminate" (no core files: `RLIMIT_CORE` is 0, so the status has no core flag).
+
+### Signals
+
+Standard signals pend once, real-time ones queue with their `siginfo` (at most 4096 queued in
+the instance; `sigqueue` beyond is EAGAIN, `kill` keeps the signal without its data). A
+process signal is taken by a thread that does not block it (the main thread first); the
+server kicks it. SIGKILL starts the group exit at once; SIGCONT ends a stop at once (and drops
+pending stop signals), a stop signal drops pending SIGCONT. Pid 1 of the instance gets only
+the signals it has handlers for (Linux's `SIGNAL_UNKILLABLE` from inside its namespace).
+
+**Delivery** happens when a thread goes back to its program after a kick or a call that
+changed its mask: synchronous signals first (SIGSEGV, SIGBUS, SIGILL, SIGTRAP, SIGFPE, SIGSYS),
+then the lowest number. Ignored ones are dropped; a default stop starts or joins the group
+stop (dropped in an orphaned process group, but SIGSTOP); a default terminate or core ends the
+process; a handler gets **Linux's x86-64 frame** (`rt_sigframe`: the return address from
+`SA_RESTORER`, `ucontext` with `uc_flags`, `uc_stack`, `sigcontext` and `uc_sigmask`, the
+`siginfo`, the FPU state in `fxsave` format 64-byte aligned above it), on the alternate stack
+with `SA_ONSTACK` (`SS_AUTODISARM` honored), with `rdi` the signal, `rsi` the `siginfo`, `rdx`
+the `ucontext`; the handler's mask adds `sa_mask` and the signal unless `SA_NODEFER`;
+`SA_RESETHAND` resets the action. Every deliverable signal gets its frame before the program
+runs, as Linux nests them. A frame that cannot be written kills with SIGSEGV. The server
+saves and restores the program's FPU registers itself (`fxsave64`, `fxrstor64` with MXCSR's
+reserved bits cleared): they stay in the CPU while it runs. `rt_sigreturn` restores the
+registers (the kernel accepts only user addresses and harmless flags), the mask, the FPU
+state and the alternate stack.
+
+**Interrupted calls** restart as Linux's restart codes say: most calls (`ERESTARTSYS`) restart
+if no handler ran or the handler has `SA_RESTART`; `poll`, `select`, `ppoll`, `pselect6`,
+`pause`, `rt_sigsuspend` and absolute sleeps (`ERESTARTNOHAND`) only if no handler ran;
+relative sleeps (`ERESTART_RESTARTBLOCK`) continue to their first deadline through
+`restart_syscall` if no handler ran; `epoll_wait`, `rt_sigtimedwait` and `sigreturn` never.
+
+**Stops**: the thread that takes a stop signal starts the group stop and kicks the others;
+each stops in the server (a futex of the process) until SIGCONT or SIGKILL; the last one
+reports `CLD_STOPPED` to the parent (SIGCHLD unless `SA_NOCLDSTOP`, a report for `WUNTRACED`).
+SIGCONT reports `CLD_CONTINUED`.
+
+**Interval timers** (`alarm`, `setitimer`'s `ITIMER_REAL`) are the instance's **timer thread**
+(`ROLE_TIMER`, a fourth service thread of the pager's process): it sleeps until the earliest
+deadline and sends SIGALRM. A periodic timer reloads when its signal is taken (delivered or
+returned by `sigtimedwait`), so a tiny interval costs one expiry per signal handled.
+
+The server's terminals, pipes and sockets use the same tables: a background read gets SIGTTIN
+for its group (`tty`), a write to a pipe or socket without a reader SIGPIPE for the thread.
+
+### /proc
+
+`/proc/<pid>` (also for a thread's tid, as Linux), `/proc/self` and `/proc/thread-self` are
+the server's, from its tables and the kernel's `proc_info`/`thread_info`: `stat`, `statm`,
+`status`, `cmdline`, `comm`, `exe`, `cwd`, `task/<tid>/...`, and oxidenix's `counters` (the
+calls the server passed through for the process). The system's files (`stat`, `meminfo`,
+`uptime`, `loadavg`, `cpuinfo`, `mounts`, `counters`, `sys/`) stay procfs's.
+
+### Calls that name a pid
+
+Every call that takes a pid or tid is the server's, which knows its namespace:
+`kill`/`tkill`/`tgkill`/`rt_sigqueueinfo`/`rt_tgsigqueueinfo`, `wait4`/`waitid`, the
+process group and session calls, `getpriority`/`setpriority`, `sched_getaffinity`/
+`sched_setaffinity`, `sched_getscheduler`/`sched_getparam`, `prlimit64`, `getrusage`,
+`times`, `clock_gettime` of another process's or thread's CPU clock, `capget`/`capset`.
 
 ## The terminal (R6d)
 
@@ -654,3 +841,7 @@ the whole test suite's output.
   terminal per session until R8, pseudo-terminals in the server (ADR 0007).
 - Internet sockets keep their state in control blocks in the channel's shared area, their data
   in byte rings in granted memory, and netd answers every request at once (ADR 0008).
+- Processes and signals: the kernel keeps processes and threads as containers driven by kicks,
+  kills and exit events; the server builds Linux's signal frames itself, `fork` clones the
+  address space in one call, the ELF loader is the server's, and a tree's first process
+  starts in the server (ADR 0010).
