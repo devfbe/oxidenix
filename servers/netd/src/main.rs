@@ -145,7 +145,7 @@ fn main(args: Vec<&'static str>) -> i32 {
         let mut progress = service.serve(&mut iface, &mut sockets);
         progress |= poll(&mut iface, &mut nic, &mut sockets, &mut service);
         progress |= service.pump(&mut sockets);
-        service.round_end(progress);
+        service.round_end();
         match sockets.get_mut::<dhcpv4::Socket>(dhcp).poll() {
             Some(dhcpv4::Event::Configured(c)) => {
                 // smoltcp sends from the first address unless the destination
@@ -233,6 +233,11 @@ fn main(args: Vec<&'static str>) -> i32 {
         }
         let event = oxrt::ipc_receive(&mut message, if sleep { timeout } else { Some(0) });
         service.awake();
+        if sleep && service.sleep_cap().is_some() {
+            // Woken from a brief sleep that futile marks forced: one round,
+            // then (without progress) asleep again, not a whole spin.
+            idle = SPIN - 1;
+        }
         match event {
             Ok(oxrt::Event::Interrupt(_)) => {
                 nic.card.ack_interrupt();

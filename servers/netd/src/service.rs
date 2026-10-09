@@ -515,6 +515,11 @@ struct Chan {
     marked: bool,
     /// When it last had a request (`evict_idle`).
     used: Instant,
+    /// This round it marked sockets for netd; it had requests or data
+    /// moved; rounds in a row it marked for nothing (`prepare_sleep`).
+    marks: bool,
+    busy: bool,
+    futile: u32,
 }
 
 /// Network configuration (DHCP's).
@@ -562,11 +567,7 @@ pub struct Service {
     /// instance whose listener they came to, and those places.
     half_open: BTreeMap<SocketHandle, u64>,
     half_open_budget: Budget,
-    /// Marks were taken this round; rounds in a row that took marks and
-    /// had nothing to do; the sleep being prepared is a brief one
-    /// (`prepare_sleep`).
-    marked: bool,
-    futile: u32,
+    /// The sleep being prepared is a brief one (`prepare_sleep`).
     brief: bool,
     /// A datagram on its way out.
     scratch: Vec<u8>,
@@ -630,8 +631,6 @@ impl Service {
             echo: EchoIds::default(),
             half_open: BTreeMap::new(),
             half_open_budget: Budget::new(MAX_HALF_OPEN, MAX_HALF_OPEN / RESERVED_INSTANCES, MAX_HALF_OPEN / 2),
-            marked: false,
-            futile: 0,
             brief: false,
             scratch: vec![0; MAX_UDP.max(RAW_BUFFER)],
             config: Config::default(),
@@ -684,6 +683,9 @@ impl Service {
             rang: false,
             marked: false,
             used: crate::now(),
+            marks: false,
+            busy: false,
+            futile: 0,
         });
         0
     }
@@ -703,14 +705,16 @@ impl Service {
 
     /// Announces the sleep in every channel and arms its doorbell: false if
     /// work came meanwhile (then nothing sleeps).
-    /// Marks that kept coming without anything to do for `FUTILE_ROUNDS`
-    /// rounds (a client marking for nothing, or in a loop) no longer keep
-    /// netd awake: it sleeps, but at most `BRIEF_SLEEP_MS` (`sleep_cap`),
-    /// so a mark that did mean work is still seen soon.
+    /// A channel whose marks kept coming without anything to do for
+    /// `FUTILE_ROUNDS` rounds (a client marking for nothing, or in a loop)
+    /// no longer keeps netd awake with them: it sleeps, but at most
+    /// `BRIEF_SLEEP_MS` (`sleep_cap`), so a mark that did mean work is
+    /// still seen soon. Counted per channel: another's work does not make
+    /// it count again.
     pub fn prepare_sleep(&mut self) -> bool {
         self.brief = false;
-        let futile = self.futile >= FUTILE_ROUNDS;
         for chan in self.chans.iter_mut().flatten() {
+            let futile = chan.futile >= FUTILE_ROUNDS;
             let Some(tail) = chan.requests.prepare_sleep() else { return false };
             if chan.header.state() != 0 {
                 return false;
@@ -738,11 +742,14 @@ impl Service {
 
     /// The end of a round: whether it took marks without anything to do
     /// (`prepare_sleep`). `progress`: the round's requests, frames and data.
-    pub fn round_end(&mut self, progress: bool) {
-        if core::mem::take(&mut self.marked) && !progress {
-            self.futile = self.futile.saturating_add(1);
-        } else if progress {
-            self.futile = 0;
+    pub fn round_end(&mut self) {
+        for chan in self.chans.iter_mut().flatten() {
+            let (marked, busy) = (core::mem::take(&mut chan.marks), core::mem::take(&mut chan.busy));
+            if busy {
+                chan.futile = 0;
+            } else if marked {
+                chan.futile = chan.futile.saturating_add(1);
+            }
         }
     }
 
@@ -765,7 +772,7 @@ impl Service {
             }
             // The marks only say "look": every socket is pumped each round.
             // (Not progress by themselves: a client could mark forever.)
-            self.marked |= chan.area.header.take_service(|_| {});
+            chan.marks |= chan.area.header.take_service(|_| {});
             for _ in 0..TAKE_PER_ROUND {
                 let chan = self.chan(c);
                 if chan.completions.room() == 0 {
@@ -773,6 +780,7 @@ impl Service {
                 }
                 let Some(d) = chan.requests.pop() else { break };
                 chan.used = crate::now();
+                chan.busy = true;
                 progress = true;
                 let (status, values) = match Request::decode(&d) {
                     Ok(r) => self.handle(c, r, iface, sockets).unwrap_or_else(|e| (-e, [0; 4])),
@@ -1711,7 +1719,10 @@ impl Service {
                 // broken as a failed copy.
                 let pumped = if s.area.is_some() && rings.is_none() { Err(()) } else { pump_one(s, ctl, rings, sockets, &round, &mut wants) };
                 match pumped {
-                    Ok(moved) => progress |= moved,
+                    Ok(moved) => {
+                        progress |= moved;
+                        chan.busy |= moved;
+                    }
                     Err(()) => {
                         // The client broke the protocol or took the grant
                         // away: the socket is reset and reports EIO. A
@@ -1738,6 +1749,7 @@ impl Service {
                 if publish(s, ctl) {
                     chan.area.header.mark_client(i as usize);
                     chan.marked = true;
+                    chan.busy = true;
                     progress = true;
                 }
             }
