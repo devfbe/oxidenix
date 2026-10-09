@@ -23,6 +23,7 @@ use crate::usercopy;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use restricted::*;
 
 const PAGE: u64 = 4096;
@@ -48,6 +49,10 @@ const AT_EMPTY_PATH: u64 = 0x1000;
 const STACK_TOP: u64 = SHARED_BASE - PAGE;
 /// The stack area at start, at least (it grows down on demand, up to 8 MiB).
 const STACK_SIZE: u64 = 256 * 1024;
+/// The most the stack may grow to (its area is kept free of the program's image).
+const STACK_MAX: u64 = 8 << 20;
+/// The lowest address an ET_EXEC program may load at (Linux's default mmap_min_addr).
+const MIN_ADDR: u64 = 64 * 1024;
 /// Where a position-independent program goes (Linux's ELF_ET_DYN_BASE: two thirds of the
 /// address space).
 const DYN_BASE: u64 = (SHARED_BASE / 3 * 2) & !(PAGE - 1);
@@ -210,6 +215,23 @@ impl Elf {
         (low, high)
     }
 
+    /// Where its segments go: the bias added to their addresses (0 for ET_EXEC, which must
+    /// lie above the first 64 KiB, Linux's mmap_min_addr; ET_DYN goes to `DYN_BASE`), checked
+    /// before the point of no return (ENOEXEC for an image that does not fit below the stack).
+    fn bias(&self) -> Result<u64, i64> {
+        let (low, high) = self.span();
+        let bias = match self.kind {
+            ET_DYN => DYN_BASE.checked_sub(low).ok_or(ENOEXEC)?,
+            _ if low < MIN_ADDR => return Err(ENOEXEC),
+            _ => 0,
+        };
+        let end = high.checked_add(bias).ok_or(ENOEXEC)?;
+        if high <= low || end > STACK_TOP - STACK_MAX {
+            return Err(ENOEXEC);
+        }
+        Ok(bias)
+    }
+
     /// Where the program header table lies in memory (AT_PHDR), without the bias.
     fn phdr(&self) -> u64 {
         if let Some(p) = self.segments.iter().find(|s| s.kind == PT_PHDR) {
@@ -225,13 +247,73 @@ fn page_up(x: u64) -> u64 {
     x.saturating_add(PAGE - 1) & !(PAGE - 1)
 }
 
+/// Bytes all execve calls of the instance may hold of their arguments and environments at
+/// once (on the server's heap, shared by the tree): 8 calls with Linux's largest.
+const EXEC_STRINGS_MAX: usize = 8 * MAX_ARGS_TOTAL;
+static EXEC_STRINGS: AtomicUsize = AtomicUsize::new(0);
+
+/// An execve's arguments or environment: NUL-terminated strings back to back in one buffer
+/// (one allocation, not one per string), charged against `EXEC_STRINGS_MAX` while held.
+struct Strings {
+    bytes: Vec<u8>,
+    count: usize,
+    charged: usize,
+}
+
+impl Strings {
+    fn new() -> Strings {
+        Strings { bytes: Vec::new(), count: 0, charged: 0 }
+    }
+
+    /// Room for `n` more bytes, charged (ENOMEM beyond the instance's bound).
+    fn charge(&mut self, n: usize) -> Result<(), i64> {
+        let before = EXEC_STRINGS.fetch_add(n, Ordering::Relaxed);
+        if before + n > EXEC_STRINGS_MAX {
+            EXEC_STRINGS.fetch_sub(n, Ordering::Relaxed);
+            return Err(ENOMEM);
+        }
+        self.charged += n;
+        self.bytes.try_reserve(n).map_err(|_| ENOMEM)
+    }
+
+    fn push(&mut self, s: &[u8]) -> Result<(), i64> {
+        self.charge(s.len() + 1)?;
+        self.bytes.extend_from_slice(s);
+        self.bytes.push(0);
+        self.count += 1;
+        Ok(())
+    }
+
+    fn iter(&self) -> impl DoubleEndedIterator<Item = &[u8]> {
+        // (An empty buffer would still split into one empty string.)
+        let any = self.count > 0;
+        let body = self.bytes.strip_suffix(&[0]).unwrap_or(&[]);
+        body.split(|&b| b == 0).filter(move |_| any)
+    }
+
+    fn len(&self) -> usize {
+        self.count
+    }
+
+    /// Their bytes with the NULs.
+    fn size(&self) -> usize {
+        self.bytes.len()
+    }
+}
+
+impl Drop for Strings {
+    fn drop(&mut self) {
+        EXEC_STRINGS.fetch_sub(self.charged, Ordering::Relaxed);
+    }
+}
+
 /// A program ready to run: its file and headers, its interpreter's, and what it runs with.
 struct Prepared {
     file: File,
     elf: Elf,
     interp: Option<(File, Elf)>,
-    args: Vec<Vec<u8>>,
-    envs: Vec<Vec<u8>>,
+    args: Strings,
+    envs: Strings,
     /// The path execve was given (AT_EXECFN, the name), and the program's absolute path
     /// (/proc's exe).
     filename: String,
@@ -259,24 +341,44 @@ fn read_string(addr: u64, max: usize) -> Result<Vec<u8>, i64> {
 
 /// A NULL-terminated array of strings of the program's (argv, envp); a null array is
 /// empty. `total` counts the bytes of all of them (E2BIG beyond `MAX_ARGS_TOTAL`).
-fn read_strings(addr: u64, total: &mut usize) -> Result<Vec<Vec<u8>>, i64> {
-    let mut out = Vec::new();
+fn read_strings(addr: u64, total: &mut usize) -> Result<Strings, i64> {
+    let mut out = Strings::new();
     if addr == 0 {
         return Ok(out);
     }
+    let mut chunk = [0u8; 256];
     loop {
         let at = addr.checked_add(out.len() as u64 * 8).ok_or(EFAULT)?;
         let ptr: u64 = usercopy::read(at)?;
         if ptr == 0 {
             return Ok(out);
         }
-        let s = read_string(ptr, MAX_ARG_STRLEN)?;
-        *total += s.len() + 1 + 8;
+        // The string straight into the buffer, a piece at a time.
+        let mut len = 0usize;
+        loop {
+            let at = ptr.checked_add(len as u64).ok_or(EFAULT)?;
+            let n = chunk.len().min(4096 - (at % 4096) as usize);
+            usercopy::from_program(at, &mut chunk[..n])?;
+            let end = chunk[..n].iter().position(|&b| b == 0);
+            let piece = &chunk[..end.unwrap_or(n)];
+            len += piece.len();
+            *total += piece.len();
+            if len >= MAX_ARG_STRLEN || *total > MAX_ARGS_TOTAL {
+                return Err(E2BIG);
+            }
+            out.charge(piece.len())?;
+            out.bytes.extend_from_slice(piece);
+            if end.is_some() {
+                break;
+            }
+        }
+        *total += 1 + 8;
         if *total > MAX_ARGS_TOTAL {
             return Err(E2BIG);
         }
-        out.try_reserve(1).map_err(|_| ENOMEM)?;
-        out.push(s);
+        out.charge(1)?;
+        out.bytes.push(0);
+        out.count += 1;
     }
 }
 
@@ -308,13 +410,17 @@ fn execveat(s: &mut State, dirfd: u64, path: u64, argv: u64, envp: u64, flags: u
     };
     let shown = if filename.is_empty() { exe.clone() } else { filename };
     let prepared = prepare(file, exe, shown, args, envs, 0)?;
-    run(s, prepared);
+    // Past the point of no return a failure ends the process; it does so once this call
+    // returned and let go of everything (`local::exit_pending`, carried out by `serve`).
+    if let Err(status) = run(s, prepared) {
+        local::exit_pending(status);
+    }
     Ok(0)
 }
 
 /// Reads the program's first bytes and follows a `#!` line (`depth`: how many were
 /// followed), until an ELF image with its interpreter is ready.
-fn prepare(file: File, exe: String, filename: String, mut args: Vec<Vec<u8>>, envs: Vec<Vec<u8>>, depth: u32) -> Result<Prepared, i64> {
+fn prepare(file: File, exe: String, filename: String, args: Strings, envs: Strings, depth: u32) -> Result<Prepared, i64> {
     let size = file.size()?;
     let mut head = vec![0u8; size.min(256) as usize];
     let n = file.read(0, &mut head)?;
@@ -336,16 +442,16 @@ fn prepare(file: File, exe: String, filename: String, mut args: Vec<Vec<u8>>, en
             Some(at) => (trimmed[..at].to_vec(), Some(trim(&trimmed[at..]).to_vec())),
             None => (trimmed.to_vec(), None),
         };
-        let mut new_args = Vec::new();
-        new_args.push(interp.clone());
+        let mut new_args = Strings::new();
+        new_args.push(&interp)?;
         if let Some(a) = arg.filter(|a| !a.is_empty()) {
-            new_args.push(a);
+            new_args.push(&a)?;
         }
-        new_args.push(filename.as_bytes().to_vec());
-        if !args.is_empty() {
-            args.remove(0);
+        new_args.push(filename.as_bytes())?;
+        for a in args.iter().skip(1) {
+            new_args.push(a)?;
         }
-        new_args.append(&mut args);
+        drop(args);
         drop(file);
         let interp = String::from_utf8(interp).map_err(|_| ENOEXEC)?;
         let cwd = crate::records::current().state.lock().cwd.clone();
@@ -354,6 +460,7 @@ fn prepare(file: File, exe: String, filename: String, mut args: Vec<Vec<u8>>, en
         return prepare(ifile, iexe, filename, new_args, envs, depth + 1);
     }
     let elf = Elf::load(&file, &head)?;
+    elf.bias()?;
     let interp = match &elf.interp {
         Some(name) => {
             let cwd = crate::records::current().state.lock().cwd.clone();
@@ -363,9 +470,13 @@ fn prepare(file: File, exe: String, filename: String, mut args: Vec<Vec<u8>>, en
             let n = ifile.read(0, &mut ihead)?;
             ihead.truncate(n);
             let ielf = Elf::load(&ifile, &ihead)?;
-            // An interpreter has none of its own.
+            // An interpreter has none of its own, and goes wherever there is room: it must
+            // be position-independent.
             if ielf.interp.is_some() {
                 return Err(ELOOP);
+            }
+            if ielf.kind != ET_DYN {
+                return Err(ENOEXEC);
             }
             Some((ifile, ielf))
         }
@@ -381,33 +492,35 @@ fn trim(s: &[u8]) -> &[u8] {
 }
 
 /// The point of no return: the process's other threads end, the address space is replaced,
-/// the program is mapped and started. Any failure kills the process (SIGSEGV).
-fn run(s: &mut State, p: Prepared) {
+/// the program is mapped and started. A failure from here on ends the process: the status
+/// it ends with (SIGKILL if it was killed meanwhile, else SIGSEGV), for the caller to carry
+/// out once everything here is let go of.
+fn run(s: &mut State, p: Prepared) -> Result<(), i32> {
     if de_thread().is_err() {
         // Killed meanwhile: the process ends anyway.
-        process::die(signal::SIGKILL as i32);
+        return Err(signal::SIGKILL as i32);
     }
     // The new program's descriptor table: the old one's descriptors without the close-on-exec
     // ones (Linux's unshare_files and do_close_on_exec). The old table goes now: its
     // close-on-exec descriptors close before the new program runs (if no other process
     // shares it).
-    match fdtable::current().for_exec() {
+    let old = fdtable::current();
+    let new = old.for_exec();
+    drop(old);
+    match new {
         Ok(files) => drop(process::set_files(files)),
-        Err(_) => process::die(signal::SIGSEGV as i32),
+        Err(_) => return Err(signal::SIGSEGV as i32),
     }
     let comm = process::comm_from(&p.filename);
     let name_len = comm.iter().position(|&b| b == 0).unwrap_or(15).min(15);
     let r = syscall(SYS_EXEC_SPACE, [p.file.handle, comm.as_ptr() as u64, name_len as u64, 0, 0, 0]);
     if r < 0 {
-        process::die(signal::SIGSEGV as i32);
+        return Err(signal::SIGSEGV as i32);
     }
-    match load(&p) {
-        Ok((entry, sp, brk)) => {
-            finish(&p, comm, brk);
-            *s = State { rip: entry, rsp: sp, rflags: 0x202, ..State::default() };
-        }
-        Err(_) => process::die(signal::SIGSEGV as i32),
-    }
+    let (entry, sp, brk) = load(&p).map_err(|_| signal::SIGSEGV as i32)?;
+    finish(&p, comm, brk);
+    *s = State { rip: entry, rsp: sp, rflags: 0x202, ..State::default() };
+    Ok(())
 }
 
 /// Ends the calling process's other threads and waits until they are gone; a thread that
@@ -462,14 +575,15 @@ fn de_thread() -> Result<(), i64> {
 /// Maps the program (and its interpreter) and builds the stack: (entry, stack pointer,
 /// program break).
 fn load(p: &Prepared) -> Result<(u64, u64, u64), i64> {
-    let bias = if p.elf.kind == ET_DYN { DYN_BASE - p.elf.span().0 } else { 0 };
+    // (Checked by `prepare`.)
+    let bias = p.elf.bias()?;
     map_image(&p.file, &p.elf, bias)?;
     let brk = page_up(bias + p.elf.span().1);
     let (entry, interp_base) = match &p.interp {
         Some((file, elf)) => {
             let (low, high) = elf.span();
             // Room for it where the kernel finds some.
-            let at = map(0, 0, high - low, 0, 0)?;
+            let at = map(0, None, high - low, 0, 0)?;
             let ibias = at - low;
             map_image(file, elf, ibias)?;
             (ibias + elf.entry, ibias)
@@ -480,10 +594,10 @@ fn load(p: &Prepared) -> Result<(u64, u64, u64), i64> {
     Ok((entry, sp, brk))
 }
 
-/// `mo_map`.
-fn map(handle: u64, addr: u64, len: u64, offset: u64, prot: u64) -> Result<u64, i64> {
-    let flags = if addr != 0 { MO_FIXED } else { 0 };
-    let r = syscall(SYS_MO_MAP, [handle, addr, len, offset, prot, flags]);
+/// `mo_map`, at `addr` (fixed) or where the kernel finds room (None).
+fn map(handle: u64, addr: Option<u64>, len: u64, offset: u64, prot: u64) -> Result<u64, i64> {
+    let flags = if addr.is_some() { MO_FIXED } else { 0 };
+    let r = syscall(SYS_MO_MAP, [handle, addr.unwrap_or(0), len, offset, prot, flags]);
     if r < 0 { Err(-r) } else { Ok(r as u64) }
 }
 
@@ -511,7 +625,7 @@ fn map_image(file: &File, elf: &Elf, bias: u64) -> Result<(), i64> {
         let mem_end = bias + seg.vaddr + seg.memsz;
         if seg.filesz > 0 {
             let len = page_up(data_end) - start;
-            map(file.handle, start, len, seg.offset & !(PAGE - 1), prot)?;
+            map(file.handle, Some(start), len, seg.offset & !(PAGE - 1), prot)?;
         }
         if seg.memsz > seg.filesz {
             if seg.filesz > 0 && data_end % PAGE != 0 {
@@ -531,7 +645,7 @@ fn map_image(file: &File, elf: &Elf, bias: u64) -> Result<(), i64> {
             let bss = if seg.filesz > 0 { page_up(data_end) } else { start };
             let end = page_up(mem_end);
             if end > bss {
-                map(0, bss, end - bss, 0, prot)?;
+                map(0, Some(bss), end - bss, 0, prot)?;
             }
         }
     }
@@ -564,7 +678,7 @@ const AT_MINSIGSTKSZ: u64 = 51;
 /// libuv's process title overwrites them), the platform name, 16 random bytes, then
 /// argc, argv, envp and the auxiliary vector. Returns the stack pointer.
 fn build_stack(p: &Prepared, bias: u64, interp_base: u64, entry: u64) -> Result<u64, i64> {
-    let strings: usize = p.args.iter().chain(&p.envs).map(|s| s.len() + 1).sum::<usize>() + p.filename.len() + 1;
+    let strings: usize = p.args.size() + p.envs.size() + p.filename.len() + 1;
     let vectors = (p.args.len() + p.envs.len() + 3) * 8 + 24 * 16;
     let need = page_up((strings + vectors + 64 * 1024) as u64).max(STACK_SIZE);
     syscall_ok(SYS_MO_MAP, [0, STACK_TOP - need, need, 0, 3, MO_FIXED | MO_GROWSDOWN])?;
@@ -648,7 +762,7 @@ fn finish(p: &Prepared, comm: [u8; 16], brk: u64) {
     let (tid, pid) = process::me();
     syscall(SYS_VM_FLOOR, [brk, 0, 0, 0, 0, 0]);
     let mut cmdline = Vec::new();
-    for a in &p.args {
+    for a in p.args.iter() {
         if cmdline.len() + a.len() + 1 > 4096 {
             break;
         }
@@ -702,30 +816,38 @@ pub fn init(s: &mut State) {
     buf.truncate(n.max(0) as usize);
     let mut parts = buf.split(|&b| b == 0);
     let path = String::from_utf8_lossy(parts.next().unwrap_or(b"")).into_owned();
-    let mut args = Vec::new();
-    for a in parts.by_ref() {
-        if a.is_empty() {
-            break;
+    let mut strings = || -> Result<(Strings, Strings), i64> {
+        let (mut args, mut envs) = (Strings::new(), Strings::new());
+        for a in parts.by_ref() {
+            if a.is_empty() {
+                break;
+            }
+            args.push(a)?;
         }
-        args.push(a.to_vec());
-    }
-    let mut envs = Vec::new();
-    for e in parts {
-        if e.is_empty() {
-            break;
+        for e in parts.by_ref() {
+            if e.is_empty() {
+                break;
+            }
+            envs.push(e)?;
         }
-        envs.push(e.to_vec());
-    }
-    let result = open("/", &path, true).and_then(|(file, exe)| prepare(file, exe, path.clone(), args, envs, 0));
-    match result {
-        Ok(prepared) => run(s, prepared),
+        Ok((args, envs))
+    };
+    let result = strings().and_then(|(args, envs)| open("/", &path, true).and_then(|(file, exe)| prepare(file, exe, path.clone(), args, envs, 0)));
+    drop(buf);
+    let status = match result {
+        Ok(prepared) => match run(s, prepared) {
+            Ok(()) => return,
+            Err(status) => status,
+        },
         Err(e) => {
             let mut msg = String::new();
             let _ = core::fmt::Write::write_fmt(&mut msg, format_args!("cannot run {} (errno {})", path, e));
             syscall(SYS_SERVER_LOG, [msg.as_ptr() as u64, msg.len() as u64, 0, 0, 0, 0]);
-            process::exit(127 << 8, true);
+            127 << 8
         }
-    }
+    };
+    // Ends from the caller's clean stack (`serve`), with nothing of this frame left.
+    local::exit_pending(status);
 }
 
 /// EACCES: a program that is not a regular file or has no execute bit (everyone is root,

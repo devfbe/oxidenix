@@ -29,6 +29,8 @@ pub struct Local {
     /// (`process::Thread::files`) holds, valid while the thread runs (only
     /// the thread itself replaces it: execve, close_range's unshare, exit).
     pub files: AtomicPtr<FilesContext>,
+    /// The status the thread's process ends with (`EXIT_PENDING`).
+    pub exit_status: AtomicU32,
 }
 
 const _: () = assert!(SERVER_LOCAL_OFFSET as usize + core::mem::size_of::<Local>() <= 4096);
@@ -36,6 +38,22 @@ const _: () = assert!(SERVER_LOCAL_OFFSET as usize + core::mem::size_of::<Local>
 /// A call set a temporary signal mask (sigsuspend, ppoll, pselect, epoll_pwait): it is put
 /// back before the program runs again, or by the signal frame of the handler it let in.
 pub const RESTORE_MASK: u32 = 1;
+/// The process must end (a failure past an execve's point of no return): the thread's loop
+/// ends it once the call returned (`exit_pending`), on a stack that holds nothing more.
+pub const EXIT_PENDING: u32 = 2;
+
+/// Asks the thread's loop to end the process with `status` once the current call returned.
+pub fn exit_pending(status: i32) {
+    let l = get();
+    l.exit_status.store(status as u32, Ordering::Relaxed);
+    l.flags.fetch_or(EXIT_PENDING, Ordering::Relaxed);
+}
+
+/// The status a pending end asks for (`exit_pending`), if any.
+pub fn pending_exit() -> Option<i32> {
+    let l = get();
+    (l.flags.load(Ordering::Relaxed) & EXIT_PENDING != 0).then(|| l.exit_status.load(Ordering::Relaxed) as i32)
+}
 
 /// The thread area of the calling thread, from its stack (`restricted::thread_stack_top`).
 pub fn slot() -> u64 {
@@ -74,6 +92,7 @@ pub fn start(role: u64) {
     l.key.store(0, Ordering::Relaxed);
     l.fs.store(core::ptr::null_mut(), Ordering::Relaxed);
     l.files.store(core::ptr::null_mut(), Ordering::Relaxed);
+    l.exit_status.store(0, Ordering::Relaxed);
 }
 
 /// Whether the calling thread is one of the instance's service threads (the pager, the

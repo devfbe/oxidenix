@@ -5,6 +5,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -75,6 +76,18 @@ static int layout(int argc, char **argv, char **envp) {
     for (int i = 0; envp[i] && envp[i + 1]; i++)
         if (envp[i + 1] != envp[i] + strlen(envp[i]) + 1) return 3;
     return 0;
+}
+
+/* A thread that keeps making threads (each ends at once) while the main
+ * thread executes a program: the execve ends every one of them, also those
+ * made while it was under way. */
+static void *spawner(void *arg) {
+    (void)arg;
+    for (;;) {
+        pthread_t t;
+        if (pthread_create(&t, NULL, (void *(*)(void *))pthread_self, NULL) == 0) pthread_detach(t);
+    }
+    return NULL;
 }
 
 int main(int argc, char **argv, char **envp) {
@@ -191,6 +204,24 @@ int main(int argc, char **argv, char **envp) {
     memset(huge, 'x', sizeof huge - 1);
     char *bigargs[] = {"hello", huge, NULL};
     check("an argument beyond MAX_ARG_STRLEN: E2BIG", run("/bin/hello", bigargs) == 100 + E2BIG);
+    int all_ran = 1;
+    for (int round = 0; round < 20 && all_ran; round++) {
+        pid_t c = fork();
+        if (c == 0) {
+            alarm(10);
+            pthread_t t;
+            pthread_create(&t, NULL, spawner, NULL);
+            pthread_create(&t, NULL, spawner, NULL);
+            struct timespec d = {0, 2000000};
+            nanosleep(&d, NULL);
+            char *hargs[] = {"hello", NULL};
+            execv("/bin/hello", hargs);
+            _exit(1);
+        }
+        waitpid(c, &st, 0);
+        all_ran = WIFEXITED(st) && WEXITSTATUS(st) == 42;
+    }
+    check("execve while other threads keep making threads", all_ran);
     unlink("/tmp/script.sh");
     unlink("/tmp/loop.sh");
     unlink("/tmp/junk");
