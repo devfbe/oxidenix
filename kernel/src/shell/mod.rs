@@ -90,8 +90,11 @@ pub fn settle() {
 fn read_line() -> String<256> {
     use crate::drivers::{console, console_device};
     let mut buf: Vec<u8, 255> = Vec::new();
+    // A byte read after an Esc that began no sequence: the next one to handle.
+    let mut pending: Option<u8> = None;
     loop {
-        match console_device::monitor_read() {
+        let byte = pending.take().unwrap_or_else(console_device::monitor_read);
+        match byte {
             b'\r' | b'\n' => {
                 console::write_bytes(b"\r\n");
                 break;
@@ -110,12 +113,23 @@ fn read_line() -> String<256> {
                     }
                 }
             }
-            // Other control characters and escape sequences (arrow keys) are
-            // ignored; their bytes after the escape are printable, so the
-            // sequence's rest is dropped up to its final byte.
-            0x1b => {
-                while !matches!(console_device::monitor_read(), b'A'..=b'Z' | b'a'..=b'z' | b'~') {}
-            }
+            // Other control characters and escape sequences (arrow keys,
+            // function keys: ESC [ or ESC O, then parameters up to a final
+            // byte) are ignored. A bare Esc is ignored alone: the byte after
+            // it, if it begins no sequence, is handled as typed.
+            0x1b => match console_device::monitor_read() {
+                b'[' | b'O' => {
+                    // The Linux console's F1-F5 are ESC [ [ A..E.
+                    let mut b = console_device::monitor_read();
+                    if b == b'[' {
+                        b = console_device::monitor_read();
+                    }
+                    while !(0x40..=0x7e).contains(&b) {
+                        b = console_device::monitor_read();
+                    }
+                }
+                other => pending = Some(other),
+            },
             b if b < 0x20 => {}
             b => {
                 if buf.push(b).is_ok() {
