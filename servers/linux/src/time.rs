@@ -11,6 +11,7 @@ const NSEC_PER_SEC: u64 = 1_000_000_000;
 
 const EINVAL: i64 = 22;
 const EINTR: i64 = 4;
+const EFAULT: i64 = 14;
 const EOPNOTSUPP: i64 = 95;
 
 const CLOCK_REALTIME: i64 = 0;
@@ -166,22 +167,29 @@ fn clock_nanosleep(id: u64, flags: u64, req: u64, rem: u64) -> Result<i64, i64> 
     if flags & TIMER_ABSTIME != 0 {
         // Interrupted, it restarts as it is (ERESTARTNOHAND).
         let slept = syscall(SYS_SLEEP_UNTIL, [deadline, 0, 0, 0, 0, 0]);
-        return if slept < 0 { Err(-slept) } else { Ok(0) };
+        return match slept {
+            s if s == -EINTR => Err(crate::signal::ERESTARTNOHAND),
+            s if s < 0 => Err(-s),
+            _ => Ok(0),
+        };
     }
-    sleep_rest(crate::signal::RestartBlock { deadline, rem })
+    sleep_rest(crate::signal::RestartBlock::Sleep { deadline, rem })
 }
 
 /// A relative sleep to `block.deadline`: cut short by a signal it stores the time left at
 /// `block.rem` and keeps the rest for restart_syscall (ERESTART_RESTARTBLOCK: it goes on
 /// to the same deadline if no handler runs).
 pub fn sleep_rest(block: crate::signal::RestartBlock) -> Result<i64, i64> {
-    let slept = syscall(SYS_SLEEP_UNTIL, [block.deadline, 0, 0, 0, 0, 0]);
+    let crate::signal::RestartBlock::Sleep { deadline, rem } = block else { return Err(EINTR) };
+    let slept = syscall(SYS_SLEEP_UNTIL, [deadline, 0, 0, 0, 0, 0]);
     if slept == -EINTR {
-        if block.rem != 0 {
-            let left = block.deadline.saturating_sub(clock(CLOCK_MONOTONIC as u64)?);
-            let _ = usercopy::write(block.rem, &timespec(left));
+        if rem != 0 {
+            let left = deadline.saturating_sub(clock(CLOCK_MONOTONIC as u64)?);
+            // As Linux's nanosleep_copyout.
+            usercopy::write(rem, &timespec(left)).map_err(|_| EFAULT)?;
         }
         crate::signal::save_block(block);
+        return Err(crate::signal::ERESTART_RESTARTBLOCK);
     }
     if slept < 0 { Err(-slept) } else { Ok(0) }
 }

@@ -15,9 +15,9 @@
 //!   `self`, `thread-self` and `mounts`, merged into procfs's root. The
 //!   records come from the server's process table (`process::query`, R8,
 //!   with the kernel's accounts of CPU time and memory); the descriptors of
-//!   `fd` from the kernel's table (`SYS_KFD_LIST`) until that is the
-//!   server's (R6e). The text formats are `procproto::render`'s, shared
-//!   with procfs.
+//!   `fd` from the process's descriptor table (`fdtable`, R6e;
+//!   `process::files_of`). The text formats are `procproto::render`'s,
+//!   shared with procfs.
 //!
 //! **Magic links.** `/proc/<pid>/fd/<n>` reads as the path the descriptor
 //! was opened by (or `pipe:[ino]`, `socket:[ino]`, `anon_inode:[...]`), and
@@ -25,14 +25,13 @@
 //! `proc_fd_link` does: the file's node (a tmpfs or /data inode, unlinked
 //! or not; a terminal's node; a pipe or socket as `ProcNode::Open`), so
 //! open(2) of it opens that file again (a pipe gets a new end, `pipe::reopen`;
-//! a socket or an anonymous file is ENXIO, as on Linux). Until the
-//! descriptor table is the server's, only a process's own descriptors are
-//! shown (others: EACCES, as Linux's ptrace check would answer another
-//! user).
+//! a socket or an anonymous file is ENXIO, as on Linux). Every process's
+//! descriptors are shown (everyone is root: Linux's ptrace check lets
+//! root see them).
 
-use crate::files::{self, File};
+use crate::files::{self, File, FileRef};
 use crate::fsclient::Client;
-use crate::namespace::{self, KInode, Node};
+use crate::namespace::{self, Node};
 use crate::sync::Mutex;
 use crate::syscall;
 use alloc::format;
@@ -61,7 +60,6 @@ const MAX_REMOTE: usize = 1 << 20;
 const ENOENT: i64 = 2;
 const ESRCH: i64 = 3;
 const EIO: i64 = 5;
-const EACCES: i64 = 13;
 const ENOTDIR: i64 = 20;
 const EISDIR: i64 = 21;
 const EINVAL: i64 = 22;
@@ -345,16 +343,18 @@ fn caller() -> (u64, u64) {
     (crate::local::pid() as u64, crate::local::tid() as u64)
 }
 
-/// EACCES unless `pid` names the caller's process (or one of its threads):
-/// only its own descriptors are the server's to show until the descriptor
-/// table is the server's (R6e).
-fn own(pid: u64) -> Result<(), i64> {
-    let me = caller().0;
-    if pid == me || process(pid)?.tgid == me {
-        Ok(())
-    } else {
-        Err(EACCES)
+/// The descriptor table of process (or thread) `pid`: ENOENT for none (a zombie has none).
+fn table(pid: u64) -> Result<Arc<crate::fdtable::FilesContext>, i64> {
+    let tgid = process(pid)?.tgid;
+    if tgid == caller().0 {
+        return Ok(crate::fdtable::current());
     }
+    crate::process::files_of(tgid as u32).ok_or(ENOENT)
+}
+
+/// The description behind descriptor `fd` of process `pid` (ENOENT for none).
+fn fd_file(pid: u64, fd: u32) -> Result<FileRef, i64> {
+    table(pid)?.get(fd as u64).map_err(|_| ENOENT)
 }
 
 // ------------------------------------------------------------ the tree
@@ -406,46 +406,17 @@ fn check(node: &ProcNode) -> Result<(), i64> {
             }
             Ok(())
         }
-        ProcNode::Fd { pid, fd } => {
-            own(*pid)?;
-            fd_open(*fd)
-        }
+        ProcNode::Fd { pid, fd } => fd_file(*pid, *fd).map(|_| ()),
         _ => Ok(()),
     }
 }
 
-/// Whether the caller may open the node (it exists, and a process's `fd`
-/// directory is its own: EACCES otherwise, as Linux's permission check on
-/// it answers another user).
+/// Whether the caller may open the node (it exists; a process's `fd` directory while the
+/// process has a descriptor table).
 pub fn may_open(node: &ProcNode) -> Result<(), i64> {
     match node {
-        ProcNode::Pid { pid, file: PidFile::Fd } => own(*pid),
+        ProcNode::Pid { pid, file: PidFile::Fd } => table(*pid).map(|_| ()),
         _ => check(node),
-    }
-}
-
-/// ENOENT unless descriptor `fd` of the caller is open.
-fn fd_open(fd: u32) -> Result<(), i64> {
-    let mut found = [0u32; 1];
-    let n = syscall(SYS_KFD_LIST, [fd as u64, found.as_mut_ptr() as u64, 1, 0, 0, 0]);
-    if n == 1 && found[0] == fd { Ok(()) } else { Err(ENOENT) }
-}
-
-/// The caller's open descriptors.
-fn open_fds() -> Vec<u32> {
-    let mut out = Vec::new();
-    let mut from = 0u64;
-    loop {
-        let mut chunk = [0u32; KFD_LIST_MAX as usize];
-        let n = syscall(SYS_KFD_LIST, [from, chunk.as_mut_ptr() as u64, KFD_LIST_MAX, 0, 0, 0]);
-        if n <= 0 {
-            return out;
-        }
-        out.extend_from_slice(&chunk[..n as usize]);
-        if (n as u64) < KFD_LIST_MAX {
-            return out;
-        }
-        from = chunk[n as usize - 1] as u64 + 1;
     }
 }
 
@@ -482,9 +453,8 @@ pub fn lookup(dir: &ProcNode, name: &str) -> Result<ProcNode, i64> {
             Ok(ProcNode::Task { pid: *pid, tid: *tid, file })
         }
         ProcNode::Pid { pid, file: PidFile::Fd } => {
-            own(*pid)?;
             let fd = id_name(name).and_then(|n| u32::try_from(n).ok()).ok_or(ENOENT)?;
-            fd_open(fd)?;
+            fd_file(*pid, fd)?;
             Ok(ProcNode::Fd { pid: *pid, fd })
         }
         _ => Err(ENOTDIR),
@@ -549,9 +519,9 @@ pub fn list(dir: &ProcNode) -> Result<Vec<(String, u64, u8)>, i64> {
             Ok(out)
         }
         ProcNode::Pid { pid, file: PidFile::Fd } => {
-            own(*pid)?;
+            let fds = table(*pid)?.open_fds();
             let mut out = alloc::vec![entry(".", dir), entry("..", &ProcNode::Pid { pid: *pid, file: PidFile::Dir })];
-            for fd in open_fds() {
+            for fd in fds {
                 out.push(entry(&format!("{fd}"), &ProcNode::Fd { pid: *pid, fd }));
             }
             Ok(out)
@@ -615,10 +585,7 @@ pub fn readlink(node: &ProcNode) -> Result<String, i64> {
             process(*pid)?;
             Ok(String::from("/"))
         }
-        ProcNode::Fd { pid, fd } => {
-            own(*pid)?;
-            describe(*fd)
-        }
+        ProcNode::Fd { pid, fd } => describe(&fd_file(*pid, *fd)?),
         _ => Err(EINVAL),
     }
 }
@@ -626,57 +593,28 @@ pub fn readlink(node: &ProcNode) -> Result<String, i64> {
 /// What /proc/<pid>/fd/<fd> reads as: the path the file was opened by
 /// (" (deleted)" after it, for one unlinked meanwhile), or its kind and
 /// inode for a file without a path.
-fn describe(fd: u32) -> Result<String, i64> {
+fn describe(f: &FileRef) -> Result<String, i64> {
     let anon = |kind: &str| Ok(format!("anon_inode:{kind}"));
     let ino = |st: Result<vfs::stat::Stat, i64>| st.map(|s| s.ino).unwrap_or(0);
-    match files::lookup(fd as u64) {
-        Some((File::Tmp(f), _)) => Ok(if f.inode.removed() { format!("{} (deleted)", f.path) } else { f.path.clone() }),
-        Some((File::Data(f), _)) => Ok(if f.inode.unlinked() { format!("{} (deleted)", f.path) } else { f.path.clone() }),
-        Some((File::Proc(p), _)) => Ok(p.path.clone()),
-        Some((File::Pipe(end), _)) => Ok(format!("pipe:[{}]", end.ino())),
-        Some((File::Socket(_) | File::Inet(_) | File::Netlink(_), _)) => Ok(format!("socket:[{}]", ino(files::stat_of(fd as u64)))),
-        Some((File::EventFd(_), _)) => anon("[eventfd]"),
-        Some((File::Inotify(_), _)) => anon("inotify"),
-        Some(_) => files::origin_of(fd as u64).map(|o| o.path).ok_or(ENOENT),
-        None => match kernel_file(fd)? {
-            (Some((_, path)), _) => Ok(path),
-            (None, st) => {
-                let st = vfs::stat::Stat::from_bytes(&st);
-                match st.mode & vfs::S_IFMT {
-                    0o010000 => Ok(format!("pipe:[{}]", st.ino)),
-                    0o140000 => Ok(format!("socket:[{}]", st.ino)),
-                    _ => anon("[eventpoll]"),
-                }
-            }
-        },
+    match &f.file {
+        File::Tmp(t) => Ok(if t.inode.removed() { format!("{} (deleted)", t.path) } else { t.path.clone() }),
+        File::Data(d) => Ok(if d.inode.unlinked() { format!("{} (deleted)", d.path) } else { d.path.clone() }),
+        File::Proc(p) => Ok(p.path.clone()),
+        File::Kernel(k) => Ok(k.path.clone()),
+        File::Pipe(end) => Ok(format!("pipe:[{}]", end.ino())),
+        File::Socket(_) | File::Inet(_) | File::Netlink(_) => Ok(format!("socket:[{}]", ino(files::stat_file(&f.file)))),
+        File::EventFd(_) => anon("[eventfd]"),
+        File::Inotify(_) => anon("inotify"),
+        File::Epoll(_) => anon("[eventpoll]"),
+        File::Tty(_) | File::PtyMaster(_) | File::Dev(_) | File::Path(_) => files::origin_of_file(f).map(|o| o.path).ok_or(ENOENT),
     }
-}
-
-/// A descriptor of the kernel's: its inode and path (a file of /dev), and
-/// its status.
-fn kernel_file(fd: u32) -> Result<(Option<(KInode, String)>, [u8; 144]), i64> {
-    let mut st = [0u8; 144];
-    let r = syscall(SYS_KFD_STAT, [fd as u64, st.as_mut_ptr() as u64, 0, 0, 0, 0]);
-    if r < 0 {
-        return Err(if r == -9 { ENOENT } else { -r });
-    }
-    let mut buf = alloc::vec![0u8; 4096];
-    let mut len = 0u64;
-    let h = syscall(SYS_KFD_INODE, [fd as u64, buf.as_mut_ptr() as u64, buf.len() as u64, &mut len as *mut u64 as u64, 0, 0]);
-    if h < 0 {
-        return Ok((None, st));
-    }
-    let inode = KInode::from_result(h)?;
-    buf.truncate(len as usize);
-    Ok((Some((inode, String::from_utf8(buf).map_err(|_| ENOENT)?)), st))
 }
 
 /// Where a magic link leads (None: an ordinary symlink, read with
 /// `readlink`).
 pub fn follow(node: &ProcNode) -> Result<Option<Follow>, i64> {
     let ProcNode::Fd { pid, fd } = node else { return Ok(None) };
-    own(*pid)?;
-    let fd = *fd;
+    let f = fd_file(*pid, *fd)?;
     let open = |file: File| -> Result<Follow, i64> {
         let st = files::stat_file(&file)?;
         let opened = match &file {
@@ -685,20 +623,17 @@ pub fn follow(node: &ProcNode) -> Result<Option<Follow>, i64> {
         };
         Ok(Follow { node: Node::Proc(ProcNode::Open(opened)), mode: st.mode, path: None })
     };
-    let found = match files::lookup(fd as u64) {
-        Some((File::Tmp(f), _)) => Follow { mode: f.inode.mode(), node: Node::Tmp(f.inode.clone()), path: Some(f.path.clone()) },
-        Some((File::Data(f), _)) => Follow { mode: f.inode.kind | 0o777, node: Node::Data(f.inode.clone()), path: Some(f.path.clone()) },
-        Some((File::Proc(p), _)) => Follow { mode: mode(&p.node), node: Node::Proc(p.node.clone()), path: Some(p.path.clone()) },
-        Some((file @ (File::Pipe(_) | File::Socket(_) | File::Inet(_) | File::Netlink(_) | File::EventFd(_) | File::Inotify(_)), _)) => open(file)?,
-        Some(_) => {
-            let o = files::origin_of(fd as u64).ok_or(ENOENT)?;
+    let found = match &f.file {
+        File::Tmp(t) => Follow { mode: t.inode.mode(), node: Node::Tmp(t.inode.clone()), path: Some(t.path.clone()) },
+        File::Data(d) => Follow { mode: d.inode.kind | 0o777, node: Node::Data(d.inode.clone()), path: Some(d.path.clone()) },
+        File::Proc(p) => Follow { mode: mode(&p.node), node: Node::Proc(p.node.clone()), path: Some(p.path.clone()) },
+        File::Kernel(k) => Follow { node: Node::Kernel(k.inode()?), mode: namespace::mode_of(&k.stat()?), path: Some(k.path.clone()) },
+        file @ (File::Pipe(_) | File::Socket(_) | File::Inet(_) | File::Netlink(_) | File::EventFd(_) | File::Inotify(_) | File::Epoll(_)) => open(file.clone())?,
+        File::Tty(_) | File::PtyMaster(_) | File::Dev(_) | File::Path(_) => {
+            let o = files::origin_of_file(&f).ok_or(ENOENT)?;
             let node = o.node()?;
             Follow { mode: namespace::mode_of(&node.stat()?), node, path: Some(o.path) }
         }
-        None => match kernel_file(fd)? {
-            (Some((inode, path)), st) => Follow { node: Node::Kernel(inode), mode: namespace::mode_of(&st), path: Some(path) },
-            (None, st) => Follow { node: Node::Proc(ProcNode::Open(Opened::Anonymous(st))), mode: namespace::mode_of(&st), path: None },
-        },
     };
     Ok(Some(found))
 }

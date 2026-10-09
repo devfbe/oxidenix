@@ -14,6 +14,7 @@
 //! `ET_EXEC` programs go where they say; `ET_DYN` ones (PIE) at `DYN_BASE`; a `PT_INTERP`
 //! interpreter where the kernel finds room for it. There is no vDSO.
 
+use crate::fdtable;
 use crate::local;
 use crate::process::{self, PROCS};
 use crate::signal;
@@ -385,6 +386,14 @@ fn run(s: &mut State, p: Prepared) {
     if de_thread().is_err() {
         // Killed meanwhile: the process ends anyway.
         process::die(signal::SIGKILL as i32);
+    }
+    // The new program's descriptor table: the old one's descriptors without the close-on-exec
+    // ones (Linux's unshare_files and do_close_on_exec). The old table goes now: its
+    // close-on-exec descriptors close before the new program runs (if no other process
+    // shares it).
+    match fdtable::current().for_exec() {
+        Ok(files) => drop(process::set_files(files)),
+        Err(_) => process::die(signal::SIGSEGV as i32),
     }
     let comm = process::comm_from(&p.filename);
     let name_len = comm.iter().position(|&b| b == 0).unwrap_or(15).min(15);

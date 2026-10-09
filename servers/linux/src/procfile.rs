@@ -1,6 +1,6 @@
-//! Open files of /proc and /sys (I/O rings step 5): a placeholder in the
-//! kernel's descriptor table names one (an open file description: the
-//! node, its offset and a snapshot of its contents); the calls on it are
+//! Open files of /proc and /sys (I/O rings step 5): what an open file
+//! description of the server's names (the node, its offset and a snapshot
+//! of its contents); the calls on it are
 //! the server's (`procfs` makes the contents).
 //!
 //! As Linux's seq_file: a read from offset 0 makes the contents anew and
@@ -27,8 +27,6 @@ const EISDIR: i64 = 21;
 const O_CREAT: u32 = 0o100;
 const O_TRUNC: u32 = 0o1000;
 const O_DIRECTORY: u32 = 0o200000;
-const POLLIN: i16 = 0x1;
-const POLLOUT: i16 = 0x4;
 
 pub struct ProcOpen {
     pub node: ProcNode,
@@ -66,7 +64,7 @@ pub fn open(node: ProcNode, flags: u32, path: String) -> Result<i64, i64> {
     procfs::may_open(&node)?;
     let open = Arc::new(ProcOpen { node, path, dir, offset: Mutex::new(0), contents: Mutex::new(None), entries: Mutex::new(None) });
     let kept = flags & (O_ACCMODE | files::O_NONBLOCK | files::O_CLOEXEC);
-    files::install(files::new_id(), File::Proc(open), kept, POLLIN | POLLOUT)
+    files::install(files::new_id(), File::Proc(open), kept)
 }
 
 fn reopen(opened: &Opened, flags: u32) -> Result<i64, i64> {
@@ -76,7 +74,7 @@ fn reopen(opened: &Opened, flags: u32) -> Result<i64, i64> {
     }
     let new = pipe.reopen(flags);
     let kept = flags & (O_ACCMODE | files::O_NONBLOCK | files::O_CLOEXEC);
-    match files::install(new.id(), File::Pipe(new.clone()), kept, new.readiness()) {
+    match files::install(new.id(), File::Pipe(new.clone()), kept) {
         Ok(fd) => {
             new.installed();
             Ok(fd)

@@ -14,6 +14,7 @@
 //! (`process_end`): its children go to a subreaper or pid 1, its parent hears of it. Pid 1's
 //! end takes the whole instance with it, as a pid namespace's init's does on Linux.
 
+use crate::fdtable::{self, FilesContext};
 use crate::local;
 use crate::records::{self, FsContext};
 use crate::signal::{self, SigInfo};
@@ -187,6 +188,9 @@ pub struct Thread {
     /// The kernel's key (0 until known: a new thread sets it itself at its start too).
     pub key: u64,
     pub fs: Arc<FsContext>,
+    /// Its descriptor table (shared by CLONE_FILES); None once it exited (the table goes on
+    /// the exiting thread, as Linux's exit_files).
+    pub files: Option<Arc<FilesContext>>,
     /// Its name (comm), NUL-padded.
     pub comm: [u8; 16],
     pub sig: signal::ThreadSignals,
@@ -225,6 +229,7 @@ pub struct Birth {
     /// CLONE_CHILD_SETTID's word in a new address space: written by the child itself.
     pub settid: u64,
     pub fs: *const FsContext,
+    pub files: *const FilesContext,
 }
 
 impl Table {
@@ -395,6 +400,8 @@ pub fn register_init(key: u64) {
     let handle = syscall(SYS_PROC_SELF, [0; 6]);
     let fs = records::root();
     let fs_ptr = Arc::as_ptr(&fs);
+    let files = FilesContext::empty();
+    let files_ptr = Arc::as_ptr(&files);
     {
         let mut t = PROCS.lock();
         let pid = t.alloc_pid().unwrap_or(1);
@@ -428,9 +435,9 @@ pub fn register_init(key: u64) {
             words: Arc::new(Words::default()),
         };
         t.procs.insert(pid, p);
-        t.threads.insert(pid, Thread { tid: pid, pid, key, fs, comm: comm_from("init"), sig: signal::ThreadSignals::default(), exited: false });
+        t.threads.insert(pid, Thread { tid: pid, pid, key, fs, files: Some(files), comm: comm_from("init"), sig: signal::ThreadSignals::default(), exited: false });
         t.keys.insert(key, pid);
-        local::set(pid, pid, key, fs_ptr);
+        local::set(pid, pid, key, fs_ptr, files_ptr);
     }
 }
 
@@ -439,7 +446,7 @@ pub fn register_init(key: u64) {
 /// and registers its key (a signal posted meanwhile is seen at its first delivery check).
 pub fn start_thread(cookie: u64, key: u64) {
     let birth = unsafe { alloc::boxed::Box::from_raw(cookie as *mut Birth) };
-    local::set(birth.tid, birth.pid, key, birth.fs);
+    local::set(birth.tid, birth.pid, key, birth.fs, birth.files);
     if birth.settid != 0 {
         // As Linux's schedule_tail: a fault here is ignored.
         let _ = usercopy::write(birth.settid, &birth.tid);
@@ -593,10 +600,7 @@ fn clone(s: &State, c: Clone) -> Result<i64, i64> {
     let handle = if thread {
         0
     } else {
-        let mut pflags = if flags & CLONE_VM != 0 { PROC_SHARE_VM } else { PROC_FORK };
-        if flags & CLONE_FILES != 0 {
-            pflags |= PROC_SHARE_FILES;
-        }
+        let pflags = if flags & CLONE_VM != 0 { PROC_SHARE_VM } else { PROC_FORK };
         let h = syscall(SYS_PROC_CREATE, [pflags, 0, 0, 0, 0, 0]);
         if h < 0 {
             return Err(-h);
@@ -609,6 +613,18 @@ fn clone(s: &State, c: Clone) -> Result<i64, i64> {
         if flags & CLONE_FS != 0 { mine } else { records::copy(&mine) }
     };
     let fs_ptr = Arc::as_ptr(&fs);
+    let files = if flags & CLONE_FILES != 0 {
+        fdtable::current()
+    } else {
+        match fdtable::current().fork() {
+            Ok(f) => f,
+            Err(e) => {
+                close_handle(handle);
+                return Err(e);
+            }
+        }
+    };
+    let files_ptr = Arc::as_ptr(&files);
     // The records.
     {
         let mut t = PROCS.lock();
@@ -683,7 +699,7 @@ fn clone(s: &State, c: Clone) -> Result<i64, i64> {
         } else {
             t.procs.get_mut(&pid).expect("checked above").threads.push(tid);
         }
-        t.threads.insert(tid, Thread { tid, pid, key: 0, fs, comm, sig: thread_sig, exited: false });
+        t.threads.insert(tid, Thread { tid, pid, key: 0, fs, files: Some(files), comm, sig: thread_sig, exited: false });
     }
     // The child's registers: the caller's, returning 0, on the new stack.
     let mut child = *s;
@@ -691,7 +707,7 @@ fn clone(s: &State, c: Clone) -> Result<i64, i64> {
     if c.stack != 0 {
         child.rsp = c.stack;
     }
-    let birth = alloc::boxed::Box::new(Birth { tid, pid, settid: if settid_in_child { c.ctid } else { 0 }, fs: fs_ptr });
+    let birth = alloc::boxed::Box::new(Birth { tid, pid, settid: if settid_in_child { c.ctid } else { 0 }, fs: fs_ptr, files: files_ptr });
     let cookie = alloc::boxed::Box::into_raw(birth) as u64;
     let tflags = if flags & CLONE_SETTLS != 0 { THREAD_SETTLS } else { 0 };
     let ctid = if flags & CLONE_CHILD_CLEARTID != 0 { c.ctid } else { 0 };
@@ -699,8 +715,10 @@ fn clone(s: &State, c: Clone) -> Result<i64, i64> {
     if key < 0 {
         drop(unsafe { alloc::boxed::Box::from_raw(cookie as *mut Birth) });
         let mut t = PROCS.lock();
-        undo_clone(&mut t, tid, pid, thread);
+        let undone = undo_clone(&mut t, tid, pid, thread);
         drop(t);
+        // (The child's table and record go here, after the lock.)
+        drop(undone);
         close_handle(handle);
         return Err(-key);
     }
@@ -726,14 +744,15 @@ fn clone(s: &State, c: Clone) -> Result<i64, i64> {
     Ok(tid as i64)
 }
 
-/// Takes back the records of a clone whose thread the kernel could not make.
-fn undo_clone(t: &mut Table, tid: Pid, pid: Pid, thread: bool) {
-    t.threads.remove(&tid);
+/// Takes back the records of a clone whose thread the kernel could not make (the thread's,
+/// returned, to be let go of after the lock).
+fn undo_clone(t: &mut Table, tid: Pid, pid: Pid, thread: bool) -> Option<Thread> {
+    let gone = t.threads.remove(&tid);
     if thread {
         if let Some(p) = t.procs.get_mut(&pid) {
             p.threads.retain(|&x| x != tid);
         }
-        return;
+        return gone;
     }
     if let Some(p) = t.procs.remove(&pid) {
         t.put_hand(p.sig.hand);
@@ -741,6 +760,7 @@ fn undo_clone(t: &mut Table, tid: Pid, pid: Pid, thread: bool) {
             pp.children.retain(|&c| c != pid);
         }
     }
+    gone
 }
 
 fn close_handle(handle: u64) {
@@ -753,20 +773,26 @@ fn close_handle(handle: u64) {
 /// thread of its process.
 pub fn exit(status: i32, group: bool) -> ! {
     let (tid, pid) = me();
-    {
+    let files = {
         let mut t = PROCS.lock();
         if group {
             t.group_exit(pid, status, Some(tid));
         }
-        if let Some(th) = t.threads.get_mut(&tid) {
+        let files = t.threads.get_mut(&tid).and_then(|th| {
             th.exited = true;
-        }
+            th.files.take()
+        });
         if let Some(p) = t.procs.get_mut(&pid) {
             if tid == pid {
                 p.main_status = Some(status);
             }
         }
-    }
+        files
+    };
+    // Its descriptor table goes here, on the exiting thread (Linux's exit_files: before its
+    // parent learns of the end): with its last reference its descriptors close.
+    local::get().files.store(core::ptr::null_mut(), Ordering::Relaxed);
+    drop(files);
     let flags = if group { EXIT_GROUP } else { 0 };
     syscall(SYS_THREAD_EXIT, [status as u32 as u64, flags, 0, 0, 0, 0]);
     unreachable!("thread_exit returned")
@@ -778,6 +804,27 @@ pub fn die(status: i32) -> ! {
     exit(status, true)
 }
 
+/// Gives the calling thread descriptor table `files` (execve, close_range's unshare): the old
+/// one is returned, to be let go of after the caller's locks.
+pub fn set_files(files: Arc<FilesContext>) -> Option<Arc<FilesContext>> {
+    let ptr = Arc::as_ptr(&files);
+    let old = {
+        let mut t = PROCS.lock();
+        let th = t.threads.get_mut(&local::tid())?;
+        th.files.replace(files)
+    };
+    local::get().files.store(ptr as *mut FilesContext, Ordering::Release);
+    old
+}
+
+/// The descriptor table of process `pid` (its first thread's that has one): prlimit's
+/// RLIMIT_NOFILE and /proc/<pid>/fd of other processes.
+pub fn files_of(pid: Pid) -> Option<Arc<FilesContext>> {
+    let t = PROCS.lock();
+    let p = t.procs.get(&pid).filter(|p| p.zombie.is_none())?;
+    p.threads.iter().find_map(|tid| t.threads.get(tid).and_then(|th| th.files.clone()))
+}
+
 /// `EVENT_THREAD_EXIT` (the service thread): the thread `key` is gone. The last thread of a
 /// process ends the process.
 pub fn thread_ended(key: u64) {
@@ -785,7 +832,13 @@ pub fn thread_ended(key: u64) {
     let gone = {
         let mut t = PROCS.lock();
         let Some(tid) = t.keys.remove(&key) else { return };
-        let Some(th) = t.threads.remove(&tid) else { return };
+        let Some(mut th) = t.threads.remove(&tid) else { return };
+        // A thread the kernel ended without the server (killed in its program, or by the
+        // kernel) still has its table: the worker lets go of it (closing sockets takes their
+        // locks, which the service thread must never wait for).
+        if let Some(files) = th.files.take() {
+            fdtable::release_later(files);
+        }
         let pid = th.pid;
         let mut last = false;
         if let Some(p) = t.procs.get_mut(&pid) {

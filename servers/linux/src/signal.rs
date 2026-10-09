@@ -274,12 +274,32 @@ pub struct AltStack {
     pub autodisarm: bool,
 }
 
-/// What a relative sleep left to do when a signal interrupted it (restart_syscall).
+/// What restart_syscall goes on with (Linux's restart_block): the call interrupted with
+/// `ERESTART_RESTARTBLOCK` kept it.
 #[derive(Clone, Copy)]
-pub struct RestartBlock {
-    /// The monotonic deadline, and where the time left goes (0: nowhere).
-    pub deadline: u64,
-    pub rem: u64,
+pub enum RestartBlock {
+    /// A relative sleep: the monotonic deadline, and where the time left goes (0: nowhere).
+    Sleep { deadline: u64, rem: u64 },
+    /// poll(fds, nfds) until the deadline (None: forever).
+    Poll { fds: u64, nfds: u64, deadline: Option<u64> },
+}
+
+/// Linux's kernel-internal restart codes, which a call the server handles may return when
+/// a signal interrupted it (`deliver` turns them into the program's answer; they never
+/// reach the program): `ERESTARTSYS` restarts the call unless a handler without SA_RESTART
+/// runs (then EINTR), `ERESTARTNOINTR` always, `ERESTARTNOHAND` unless a handler runs,
+/// `ERESTART_RESTARTBLOCK` likewise but by restart_syscall, from the thread's
+/// `RestartBlock`. A plain EINTR is `ERESTARTSYS` for most calls (an interruptible wait's,
+/// as Linux's waits answer) and final for the calls that answer the codes themselves
+/// (`restart_of`).
+pub const ERESTARTSYS: i64 = 512;
+pub const ERESTARTNOINTR: i64 = 513;
+pub const ERESTARTNOHAND: i64 = 514;
+pub const ERESTART_RESTARTBLOCK: i64 = 516;
+
+/// Whether a call's result asks `deliver` to look (EINTR or a restart code).
+pub fn interrupted(result: i64) -> bool {
+    result == -EINTR || (-ERESTART_RESTARTBLOCK..=-ERESTARTSYS).contains(&result)
 }
 
 /// A thread's signal state.
@@ -295,9 +315,9 @@ pub struct ThreadSignals {
     pub restore: Option<u64>,
     /// Signals a sigtimedwait waits for (posters kick it even if it blocks them).
     pub waiting_for: u64,
-    /// The call that returned EINTR, to restart or not when the thread delivers.
-    pub interrupted: Option<u64>,
-    /// A relative sleep's rest (restart_syscall).
+    /// The interrupted call and how it restarts, decided when the thread delivers.
+    pub interrupted: Option<(u64, Restart)>,
+    /// What restart_syscall goes on with.
     pub block: Option<RestartBlock>,
     /// A group stop asks this thread to stop / it has.
     pub must_stop: bool,
@@ -581,27 +601,34 @@ fn pick(set: u64) -> u32 {
 
 /// How an interrupted call restarts (Linux's restart codes).
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Restart {
+pub enum Restart {
     /// ERESTARTSYS: unless a handler without SA_RESTART runs.
     Sys,
+    /// ERESTARTNOINTR: always.
+    Always,
     /// ERESTARTNOHAND: only if no handler runs.
     NoHand,
     /// ERESTART_RESTARTBLOCK: through restart_syscall, if no handler runs.
     Block,
-    /// EINTR, always.
-    Never,
 }
 
-fn restart_of(nr: u64) -> Restart {
-    match nr {
-        // poll, select, pause, rt_sigsuspend, pselect6, ppoll.
-        7 | 23 | 34 | 130 | 270 | 271 => Restart::NoHand,
-        // nanosleep, clock_nanosleep, restart_syscall: a relative sleep saved its rest; an
-        // absolute one restarts as it is.
-        35 | 230 | SYS_RESTART_SYSCALL => Restart::Block,
-        // rt_sigreturn, rt_sigtimedwait, the epoll waits.
-        SYS_RT_SIGRETURN | SYS_RT_SIGTIMEDWAIT | 232 | SYS_EPOLL_PWAIT | SYS_EPOLL_PWAIT2 => Restart::Never,
-        _ => Restart::Sys,
+/// How call `nr`, which returned `result`, restarts (None: it does not).
+fn restart_of(nr: u64, result: i64) -> Option<Restart> {
+    match -result {
+        ERESTARTSYS => Some(Restart::Sys),
+        ERESTARTNOINTR => Some(Restart::Always),
+        ERESTARTNOHAND => Some(Restart::NoHand),
+        ERESTART_RESTARTBLOCK => Some(Restart::Block),
+        EINTR => match nr {
+            // The calls that answer the codes themselves (poll, select, pause, nanosleep,
+            // restart_syscall, rt_sigsuspend, clock_nanosleep, pselect6, ppoll), and the
+            // ones Linux never restarts (rt_sigreturn, rt_sigtimedwait, the epoll waits):
+            // EINTR is their answer.
+            7 | 23 | 34 | 35 | SYS_RESTART_SYSCALL | 130 | 230 | SYS_PSELECT6 | SYS_PPOLL => None,
+            SYS_RT_SIGRETURN | SYS_RT_SIGTIMEDWAIT | 232 | SYS_EPOLL_PWAIT | SYS_EPOLL_PWAIT2 => None,
+            _ => Some(Restart::Sys),
+        },
+        _ => None,
     }
 }
 
@@ -612,16 +639,13 @@ fn rewind(s: &mut State, nr: u64) {
 }
 
 /// The interrupted call when no handler ran: it goes on.
-fn restart_without_handler(s: &mut State, nr: u64, block: Option<RestartBlock>) {
-    match restart_of(nr) {
-        Restart::Sys | Restart::NoHand => rewind(s, nr),
-        Restart::Block if block.is_some() => {
-            // (`s.rip` is still after the call's `syscall`.)
-            s.rax = SYS_RESTART_SYSCALL;
-            s.rip -= 2;
-        }
-        Restart::Block => rewind(s, nr),
-        Restart::Never => {}
+fn restart_without_handler(s: &mut State, nr: u64, how: Restart, block: Option<RestartBlock>) {
+    match how {
+        Restart::Sys | Restart::Always | Restart::NoHand => rewind(s, nr),
+        // (`s.rip` is still after the call's `syscall`.)
+        Restart::Block if block.is_some() => rewind(s, SYS_RESTART_SYSCALL),
+        // Nothing kept to go on with: EINTR.
+        Restart::Block => s.rax = (-EINTR) as u64,
     }
 }
 
@@ -642,7 +666,7 @@ enum Next {
 
 /// Delivers the calling thread's signals before its program runs again (`s`: its
 /// registers). `call`: the system call it just made and its result, if it returned to
-/// here (an EINTR is restarted as Linux's restart codes say).
+/// here (an interrupted call is restarted as Linux's restart codes say).
 pub fn deliver(s: &mut State, call: Option<(u64, i64)>) {
     let (tid, pid) = process::me();
     if tid == 0 {
@@ -651,9 +675,10 @@ pub fn deliver(s: &mut State, call: Option<(u64, i64)>) {
     if let Some((nr, result)) = call {
         let mut t = PROCS.lock();
         let Some(th) = t.threads.get_mut(&tid) else { return };
-        if result == -EINTR && nr != SYS_RT_SIGRETURN {
-            th.sig.interrupted = Some(nr);
-        } else if nr != SYS_RESTART_SYSCALL {
+        th.sig.interrupted = restart_of(nr, result).map(|how| (nr, how));
+        // What restart_syscall would go on with lasts only until the next call (a handler's
+        // rt_sigreturn included, as Linux's).
+        if !matches!(th.sig.interrupted, Some((_, Restart::Block))) {
             th.sig.block = None;
         }
     }
@@ -665,9 +690,8 @@ pub fn deliver(s: &mut State, call: Option<(u64, i64)>) {
                 finish(s);
                 return;
             }
-            Next::Exit(status) => {
-                syscall(SYS_THREAD_EXIT, [status as u32 as u64, 0, 0, 0, 0, 0]);
-            }
+            // (Its descriptor table goes on this thread: `process::exit`.)
+            Next::Exit(status) => process::exit(status, false),
             Next::Die(sig) => process::die(sig as i32),
             Next::Stop(words, seen) => {
                 // Until SIGCONT or a kill; a kick ends the wait too: the kernel's
@@ -685,10 +709,16 @@ pub fn deliver(s: &mut State, call: Option<(u64, i64)>) {
                         th.sig.interrupted.take()
                     })
                 };
-                if let Some(nr) = restart {
-                    // `s.rax` holds -EINTR.
-                    if restart_of(nr) == Restart::Sys && action.flags & SA_RESTART != 0 {
+                if let Some((nr, how)) = restart {
+                    let again = match how {
+                        Restart::Always => true,
+                        Restart::Sys => action.flags & SA_RESTART != 0,
+                        Restart::NoHand | Restart::Block => false,
+                    };
+                    if again {
                         rewind(s, nr);
+                    } else {
+                        s.rax = (-EINTR) as u64;
                     }
                 }
                 if setup_frame(s, sig, &action, &info, old_mask, alt, trap).is_err() {
@@ -841,13 +871,13 @@ fn finish(s: &mut State) {
     if tid == 0 {
         return;
     }
-    let (nr, block) = {
+    let (nr, how, block) = {
         let mut t = PROCS.lock();
         let Some(th) = t.threads.get_mut(&tid) else { return };
-        let Some(nr) = th.sig.interrupted.take() else { return };
-        (nr, th.sig.block)
+        let Some((nr, how)) = th.sig.interrupted.take() else { return };
+        (nr, how, th.sig.block)
     };
-    restart_without_handler(s, nr, block);
+    restart_without_handler(s, nr, how, block);
 }
 
 // ------------------------------------------------------------------ frames
@@ -1219,7 +1249,7 @@ fn simd_code() -> i32 {
 
 /// The result of a signal call in `s`, or None for other calls.
 pub fn handle(s: &mut State) -> Option<i64> {
-    let (a0, a1, a2, a3, a4, a5) = (s.rdi, s.rsi, s.rdx, s.r10, s.r8, s.r9);
+    let (a0, a1, a2, a3) = (s.rdi, s.rsi, s.rdx, s.r10);
     let result = match s.rax {
         SYS_RT_SIGACTION => sigaction(a0, a1, a2, a3),
         SYS_RT_SIGPROCMASK => sigprocmask(a0, a1, a2, a3),
@@ -1235,11 +1265,6 @@ pub fn handle(s: &mut State) -> Option<i64> {
         SYS_TKILL => tgkill(None, a0 as i32, a1),
         SYS_TGKILL => tgkill(Some(a0 as i32), a1 as i32, a2),
         SYS_RESTART_SYSCALL => restart_syscall(),
-        // Until poll, select and epoll are the server's (R6e): the temporary mask is set
-        // here, the call passes through without it.
-        SYS_PPOLL => read_mask(a3, a4).and_then(|m| masked_with(s, 3, m)),
-        SYS_PSELECT6 => pselect_mask(a5).and_then(|m| masked_with(s, 5, m)),
-        SYS_EPOLL_PWAIT | SYS_EPOLL_PWAIT2 => read_mask(a4, a5).and_then(|m| masked_with(s, 4, m)),
         _ => return None,
     };
     Some(result.unwrap_or_else(|e| -e))
@@ -1487,68 +1512,40 @@ pub fn with_mask<T>(mask: Option<u64>, wait: impl FnOnce() -> Result<T, i64>) ->
     result
 }
 
-/// pselect6's sixth argument: a pointer to { mask pointer, size }.
-fn pselect_mask(arg: u64) -> Result<Option<u64>, i64> {
-    if arg == 0 {
-        return Ok(None);
-    }
-    let [ptr, size]: [u64; 2] = usercopy::read(arg)?;
-    read_mask(ptr, size)
-}
-
-/// The argument register `index` (3: r10, 4: r8, 5: r9).
-fn arg_mut(s: &mut State, index: usize) -> &mut u64 {
-    match index {
-        3 => &mut s.r10,
-        4 => &mut s.r8,
-        _ => &mut s.r9,
-    }
-}
-
-/// A call passed through to the kernel (until R6e) with its mask argument (register
-/// `index`) taken over here: the kernel sees none, the thread waits with the mask.
-fn masked_with(s: &mut State, index: usize, mask: Option<u64>) -> Result<i64, i64> {
-    let to_result = |r: i64| if r < 0 { Err(-r) } else { Ok(r) };
-    let Some(mask) = mask else { return to_result(crate::pass_through_value(s)) };
-    let saved = *arg_mut(s, index);
-    let result = with_mask(Some(mask), || {
-        *arg_mut(s, index) = 0;
-        to_result(crate::pass_through_value(s))
-    });
-    *arg_mut(s, index) = saved;
-    result
-}
-
 fn sigsuspend(mask: u64, size: u64) -> Result<i64, i64> {
     let mask = read_mask(mask, size)?.ok_or(EFAULT)?;
-    with_mask(Some(mask), || loop {
+    // (Until a signal; a stop without a handler restarts it, as ERESTARTNOHAND does.)
+    let r = with_mask(Some(mask), || loop {
         if process::wait_word(&NEVER, 0, 0, true) == -EINTR {
             return Err(EINTR);
         }
-    })
+    });
+    r.map_err(|_| ERESTARTNOHAND)
 }
 
 fn pause() -> Result<i64, i64> {
     loop {
         if process::wait_word(&NEVER, 0, 0, true) == -EINTR {
-            return Err(EINTR);
+            return Err(ERESTARTNOHAND);
         }
     }
 }
 
-/// restart_syscall: a relative sleep goes on to its first deadline.
+/// restart_syscall: the interrupted call goes on with what it kept (a relative sleep to its
+/// first deadline, a poll with its deadline); EINTR for nothing kept.
 fn restart_syscall() -> Result<i64, i64> {
     let block = {
         let mut t = PROCS.lock();
         t.threads.get_mut(&local::tid()).and_then(|th| th.sig.block.take())
     };
     match block {
-        Some(b) => crate::time::sleep_rest(b),
+        Some(b @ RestartBlock::Sleep { .. }) => crate::time::sleep_rest(b),
+        Some(RestartBlock::Poll { fds, nfds, deadline }) => crate::poll::poll_until(fds, nfds, deadline),
         None => Err(EINTR),
     }
 }
 
-/// Keeps the rest of an interrupted relative sleep for restart_syscall.
+/// Keeps what restart_syscall goes on with (the call returns `ERESTART_RESTARTBLOCK`).
 pub fn save_block(block: RestartBlock) {
     let mut t = PROCS.lock();
     if let Some(th) = t.threads.get_mut(&local::tid()) {

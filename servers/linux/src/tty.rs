@@ -2,8 +2,7 @@
 //! discipline (`ldisc`), the job control state of a terminal (the session it controls,
 //! its foreground process group, its window size), its hangups, and its driver: the
 //! console (`console`) or a pseudo-terminal's slave (`pty`). Each open of a terminal is an
-//! open file description of the server's (`TtyOpen`, a placeholder in the kernel's
-//! descriptor table, as pipes are).
+//! open file description of the server's (`TtyOpen`), as a pipe's end is.
 //!
 //! Locks: `inner` holds the state and is never held across a copy to or from program
 //! memory, nor across a wait or the console's write. A read or a write takes its turn
@@ -23,9 +22,9 @@
 //! a deadline for VTIME), and reports the readiness of the terminal's open file
 //! descriptions to the kernel under `inner`, so reports never arrive out of order.
 //!
-//! Process groups and sessions are the kernel's until R8: the server asks for them
-//! (`ids`), sends the terminal's signals through the kernel (`signal`) and learns of a
-//! session leader's end (`session_ended`). A process's controlling terminal is the one
+//! Process groups and sessions are the server's process table's (`process`, R8): the
+//! terminal asks it for them (`ids`), sends its signals through it (`signal`) and learns of
+//! a session leader's end (`session_ended`). A process's controlling terminal is the one
 //! whose session is the process's (ADR 0007).
 
 use crate::files::{self, File, EFAULT, EINVAL, ENOTTY, O_ACCMODE, O_CLOEXEC, O_NONBLOCK};
@@ -129,7 +128,7 @@ pub struct PtyState {
     /// The slave's last description went (Linux's TTY_OTHER_CLOSED of the master): the
     /// master reads EIO once `out` is empty.
     pub slave_closed: bool,
-    /// The master's placeholder, and the readiness last reported for it.
+    /// The master's open file description, and the readiness last reported for it.
     pub master_id: u64,
     pub master_reported: i16,
 }
@@ -150,7 +149,7 @@ pub struct Inner {
     turns: [TurnQueue; 4],
     /// Echoes made while output was stopped.
     held_echo: Vec<u8>,
-    /// The open file descriptions' placeholders: their generation and the readiness last
+    /// The open file descriptions (by id): their generation and the readiness last
     /// reported.
     opens: BTreeMap<u64, (u32, i16)>,
     pub pty: Option<PtyState>,
@@ -226,6 +225,15 @@ pub struct TtyOpen {
     pub id: u64,
     /// The device node it was opened by (fstat, fchmod and the like).
     pub origin: Origin,
+}
+
+impl TtyOpen {
+    /// Its readiness for poll and epoll now (all of them once its terminal
+    /// was hung up).
+    pub fn readiness_now(&self) -> i16 {
+        let inner = self.tty.inner.lock();
+        self.tty.readiness(&inner, self.gen)
+    }
 }
 
 /// A process's ids (`process`).
@@ -333,7 +341,7 @@ pub fn open_device(rdev: u64, flags: u32, origin: Origin) -> Option<Result<i64, 
 /// `tty_open_proc_set_tty`).
 pub fn open(tty: &Arc<Tty>, flags: u32, origin: Origin, ctty: bool) -> Result<i64, i64> {
     let id = files::new_id();
-    let (open, ready, was_closed) = {
+    let (open, was_closed) = {
         let mut inner = tty.inner.lock();
         let gen = inner.gen;
         let ready = tty.readiness(&inner, gen);
@@ -344,9 +352,9 @@ pub fn open(tty: &Arc<Tty>, flags: u32, origin: Origin, ctty: bool) -> Result<i6
             was_closed = core::mem::replace(&mut p.slave_closed, false);
         }
         tty.changed(&mut inner, false, false);
-        (Arc::new(TtyOpen { tty: tty.clone(), gen, id, origin }), ready, was_closed)
+        (Arc::new(TtyOpen { tty: tty.clone(), gen, id, origin }), was_closed)
     };
-    let fd = match files::install(id, File::Tty(open.clone()), flags & (O_ACCMODE | O_NONBLOCK | O_CLOEXEC), ready) {
+    let fd = match files::install(id, File::Tty(open.clone()), flags & (O_ACCMODE | O_NONBLOCK | O_CLOEXEC)) {
         Ok(fd) => fd,
         Err(e) => {
             // Never opened: the slave is as it was (a slave never opened is not
@@ -375,7 +383,7 @@ pub fn open(tty: &Arc<Tty>, flags: u32, origin: Origin, ctty: bool) -> Result<i6
     Ok(fd)
 }
 
-/// A session leader's process ended (`EVENT_SESSION_END`): its controlling terminal is
+/// A session leader's process ended (`process`): its controlling terminal is
 /// dissociated (Linux's `disassociate_ctty(1)`): the console is hung up, a pty's
 /// foreground group gets SIGHUP.
 pub fn session_ended(sid: u64) {

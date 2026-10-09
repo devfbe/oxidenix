@@ -1,8 +1,9 @@
 //! proc_query (syscall 1005): the kernel's native process and system
-//! information for the procfs server (records in `procproto`), and the same
-//! for the Linux server (`restricted::SYS_PROC_INFO`), whose /proc/<pid>
-//! shows the processes until R8 makes them its own. Only privileged
-//! servers and the Linux server may ask; they decide what programs see.
+//! information for the procfs server (records in `procproto`): the
+//! system-wide record only, for it and for the Linux server
+//! (`restricted::SYS_SYSTEM_INFO`), whose /proc/<pid> comes from its own
+//! process table (R8). Only privileged servers and the Linux server may
+//! ask; they decide what programs see.
 
 use super::errno::*;
 use super::sched::{self, TABLE};

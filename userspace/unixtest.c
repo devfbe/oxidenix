@@ -502,6 +502,46 @@ static void rights(void) {
     struct pollfd pp = {p[0], POLLIN, 0};
     check("sockets in flight in a cycle are collected", poll(&pp, 1, 5000) == 1 && (pp.revents & POLLHUP) && read(p[0], buf, 1) == 0);
     close(p[0]);
+
+    /* Any kind of description travels (since R6e references in the
+     * server's own memory): an O_PATH descriptor still names its node, an
+     * open file of the kernel's (/dev/zero) still reads, an epoll instance
+     * still waits. */
+    socketpair(AF_UNIX, SOCK_DGRAM, 0, sv);
+    int opath = open("/tmp", O_PATH | O_DIRECTORY);
+    int kf = open("/dev/zero", O_RDONLY);
+    int epi = epoll_create1(0);
+    send_fds(sv[0], (int[]){opath, kf, epi}, 3);
+    close(opath);
+    close(kf);
+    close(epi);
+    int g[3];
+    n = recv_fds(sv[1], g, 3, 0, NULL);
+    struct stat st;
+    check("an O_PATH descriptor travels and names its node", n == 3 && fstat(g[0], &st) == 0 && S_ISDIR(st.st_mode) && (fcntl(g[0], F_GETFL) & O_PATH));
+    check("an open file of the kernel's travels", n == 3 && read(g[1], buf, sizeof buf) > 0);
+    struct epoll_event eev;
+    check("an epoll instance travels", n == 3 && epoll_wait(g[2], &eev, 1, 0) == 0);
+    for (int i = 0; i < n; i++) close(g[i]);
+    close(sv[0]);
+    close(sv[1]);
+
+    /* An epoll instance in flight in the queue of a socket it watches: an
+     * interest is no reference (it goes with its description), so once
+     * the descriptors are closed everything goes, the pipe's end too. */
+    socketpair(AF_UNIX, SOCK_STREAM, 0, sv);
+    pipe(p);
+    int cyc = epoll_create1(0);
+    struct epoll_event cev = {.events = EPOLLIN};
+    epoll_ctl(cyc, EPOLL_CTL_ADD, sv[1], &cev);
+    send_fds(sv[0], (int[]){sv[0], cyc, p[1]}, 3);
+    close(cyc);
+    close(p[1]);
+    close(sv[0]);
+    close(sv[1]);
+    pp = (struct pollfd){p[0], POLLIN, 0};
+    check("an epoll instance's interest keeps nothing in flight", poll(&pp, 1, 5000) == 1 && (pp.revents & POLLHUP));
+    close(p[0]);
 }
 
 static void credentials(void) {

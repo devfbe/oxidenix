@@ -23,8 +23,10 @@ mod datafile;
 mod datafs;
 mod devices;
 mod disktest;
+mod epoll;
 mod eventfd;
 mod exec;
+mod fdtable;
 mod files;
 mod fsclient;
 mod heap;
@@ -34,6 +36,7 @@ mod inetcalls;
 mod initramfs;
 mod inotify;
 mod local;
+mod kfile;
 mod mm;
 mod namespace;
 mod netclient;
@@ -43,6 +46,7 @@ mod pathfile;
 mod paths;
 mod pipe;
 mod process;
+mod poll;
 mod procfile;
 mod procfs;
 mod pty;
@@ -117,6 +121,7 @@ pub(crate) fn state_call(state: &mut State, nr: u64, a: [u64; 6]) -> i64 {
 /// gets its creator's `cookie` (`process::Birth`) and its key.
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(state: *mut State, role: u64, cookie: u64, key: u64) -> ! {
+    local::start(role);
     usercopy::register();
     match role {
         ROLE_PAGER => pager(),
@@ -163,7 +168,7 @@ fn serve(s: &mut State) -> ! {
                 // The fast path: the program runs on, unless the call was
                 // interrupted or changed the thread's mask (a kick makes
                 // restricted_enter come back at once).
-                if result == -EINTR || nr == signal::SYS_RT_SIGRETURN || local::get().flags.load(Ordering::Relaxed) & local::RESTORE_MASK != 0 {
+                if signal::interrupted(result) || nr == signal::SYS_RT_SIGRETURN || local::get().flags.load(Ordering::Relaxed) & local::RESTORE_MASK != 0 {
                     signal::deliver(s, Some((nr, result)));
                 }
             }
@@ -177,8 +182,6 @@ fn serve(s: &mut State) -> ! {
     }
 }
 
-const EINTR: i64 = 4;
-
 /// Handles the program's system call in `s`: its result.
 fn dispatch(s: &mut State) -> i64 {
     if let Some(result) = mm::handle(s)
@@ -187,7 +190,10 @@ fn dispatch(s: &mut State) -> i64 {
         .or_else(|| exec::handle(s))
         .or_else(|| timer::handle(s))
         .or_else(|| time::handle(s))
+        .or_else(|| fdtable::handle(s))
         .or_else(|| files::handle(s))
+        .or_else(|| poll::handle(s))
+        .or_else(|| epoll::handle(s))
         .or_else(|| paths::handle(s))
         .or_else(|| sched::handle(s))
         .or_else(|| ids::handle(s))
@@ -221,12 +227,7 @@ fn dispatch(s: &mut State) -> i64 {
 /// implementation; its result (`s` keeps the call's registers).
 pub fn pass_through_value(s: &mut State) -> i64 {
     let nr = s.rax;
-    // Server files the call closed for good go at once.
-    let mut closed = [0u64; 16];
-    let n = state_call(s, SYS_LEGACY_SYSCALL, [closed.as_mut_ptr() as u64, closed.len() as u64, 0, 0, 0, 0]);
-    for &id in closed.iter().take(n.max(0) as usize) {
-        files::closed(id, false);
-    }
+    state_call(s, SYS_LEGACY_SYSCALL, [0; 6]);
     datafs::reap();
     let result = s.rax as i64;
     s.rax = nr;
@@ -274,10 +275,6 @@ fn pager() -> ! {
             continue;
         }
         match event.kind {
-            EVENT_CLOSED => {
-                files::closed(event.a, true);
-                continue;
-            }
             EVENT_RELEASE => {
                 // Bit 0 tells a tmpfs file's hold, bit 1 a /data file's.
                 if event.a & 1 == 1 {
@@ -308,18 +305,11 @@ fn pager() -> ! {
             }
             EVENT_CLOSING => {
                 // What the instance's sockets still had to send reaches
-                // netd (their closes hand it over) before the instance goes.
+                // netd (their closes hand it over) before the instance goes:
+                // the worker has closed the ended processes' tables first.
+                fdtable::settle();
                 netclient::settle();
                 datafs::closing();
-                continue;
-            }
-            EVENT_INFLIGHT => {
-                // A socket in flight lost its last way in but messages (a
-                // descriptor closed, by close, exit or exec, or a call that
-                // used one ended): the worker collects. Never here: the
-                // collector waits for sockets' locks, and a thread holding
-                // one may wait for a page this thread brings.
-                scm::request();
                 continue;
             }
             EVENT_MKWRITE => {

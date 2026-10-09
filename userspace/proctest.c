@@ -14,6 +14,7 @@
 #include <sys/inotify.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
 #include <sys/sysinfo.h>
@@ -293,10 +294,46 @@ static void descriptors(void) {
     waitpid(kid, &status, 0);
     close(prog);
     check("fexecve runs a program through /proc/self/fd", WIFEXITED(status) && WEXITSTATUS(status) == 42);
+}
 
-    pid_t other = getppid();
-    snprintf(path, sizeof path, "/proc/%d/fd", other);
-    check("another process's descriptors: EACCES", opendir(path) == NULL && errno == EACCES);
+/* Another process's descriptors: listed and described (everyone is root),
+ * and its RLIMIT_NOFILE. */
+static void other_descriptors(void) {
+    char path[64];
+    int p[2];
+    if (pipe(p) != 0) {
+        check("pipe", 0);
+        return;
+    }
+    pid_t kid = fork();
+    if (kid == 0) {
+        close(p[1]);
+        char c;
+        _exit(read(p[0], &c, 1) == 0 ? 0 : 1);
+    }
+    snprintf(path, sizeof path, "/proc/%d/fd/%d", kid, p[0]);
+    char target[64] = {0};
+    ssize_t n = readlink(path, target, sizeof target - 1);
+    check("another process's descriptor reads as its pipe", n > 0 && strncmp(target, "pipe:[", 6) == 0);
+    snprintf(path, sizeof path, "/proc/%d/fd", kid);
+    DIR *d = opendir(path);
+    int seen = 0;
+    for (struct dirent *e; d && (e = readdir(d));) {
+        if (e->d_name[0] != '.' && atoi(e->d_name) == p[0]) {
+            seen = 1;
+        }
+    }
+    if (d) {
+        closedir(d);
+    }
+    check("another process's descriptors are listed", seen);
+    struct rlimit rl = {0};
+    check("prlimit of another process's RLIMIT_NOFILE", syscall(SYS_prlimit64, kid, RLIMIT_NOFILE, NULL, &rl) == 0 && rl.rlim_cur == 4096);
+    close(p[0]);
+    close(p[1]);
+    int status = 0;
+    waitpid(kid, &status, 0);
+    check("the other process saw its pipe's end", WIFEXITED(status) && WEXITSTATUS(status) == 0);
 }
 
 int main(void) {
@@ -441,6 +478,7 @@ int main(void) {
     thread_dir();
     the_servers_part();
     descriptors();
+    other_descriptors();
     printf("proctest: %s\n", failures ? "FAILED" : "all passed");
     return failures;
 }

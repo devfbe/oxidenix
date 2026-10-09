@@ -1,0 +1,642 @@
+path "/home/becker/git/rust-kernel/.claude/worktrees/agent-ab8641d61a173ffff/kernel" does not contain a 'flake.nix', searching up
+warning: Git tree '/home/becker/git/rust-kernel/.claude/worktrees/agent-ab8641d61a173ffff' is dirty
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/becker/git/rust-kernel/.claude/worktrees/agent-ab8641d61a173ffff/kernel/Cargo.toml
+workspace: /home/becker/git/rust-kernel/.claude/worktrees/agent-ab8641d61a173ffff/Cargo.toml
+    Finished `dev` profile [optimized + debuginfo] target(s) in 0.10s
+warning: the following packages contain code that will be rejected by a future version of Rust: core v0.0.0 (/home/becker/.rustup/toolchains/nightly-2026-10-05-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/core)
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running `/home/becker/git/rust-kernel/.claude/worktrees/agent-ab8641d61a173ffff/kernel/./run-builder.sh /home/becker/git/rust-kernel/.claude/worktrees/agent-ab8641d61a173ffff/target/x86_64-unknown-none/debug/oxidenix`
+warning: profiles for the non root package will be ignored, specify profiles at the workspace root:
+package:   /home/becker/git/rust-kernel/.claude/worktrees/agent-ab8641d61a173ffff/kernel/Cargo.toml
+workspace: /home/becker/git/rust-kernel/.claude/worktrees/agent-ab8641d61a173ffff/Cargo.toml
+    Finished `dev` profile [optimized + debuginfo] target(s) in 0.04s
+     Running `target/debug/builder /home/becker/git/rust-kernel/.claude/worktrees/agent-ab8641d61a173ffff/target/x86_64-unknown-none/debug/oxidenix`
+Building root filesystem...
+/home/becker/git/rust-kernel/.claude/worktrees/agent-ab8641d61a173ffff/userspace/iobench.c:250:9: warning: ‘PROC_SAMPLES’ redefined
+  250 | #define PROC_SAMPLES 2000
+      |         ^~~~~~~~~~~~
+/home/becker/git/rust-kernel/.claude/worktrees/agent-ab8641d61a173ffff/userspace/iobench.c:148:9: note: this is the location of the previous definition
+  148 | #define PROC_SAMPLES 200
+      |         ^~~~~~~~~~~~
+Building UEFI disk image...
+Starting QEMU (UEFI) with /home/becker/git/rust-kernel/.claude/worktrees/agent-ab8641d61a173ffff/target/x86_64-unknown-none/debug/oxidenix.img
+[2J[001;001H[=3h[2J[001;001H[2J[001;001H[8;042;160t[2J[001;001H[2J[001;001H[8;056;240t[2J[001;001HBdsDxe: failed to load Boot0002 "UEFI Misc Device" from PciRoot(0x0)/Pci(0x2,0x0): Not Found
+BdsDxe: loading Boot0003 "UEFI QEMU HARDDISK QM00001 " from PciRoot(0x0)/Pci(0x1F,0x2)/Sata(0x0,0xFFFF,0x0)
+BdsDxe: starting Boot0003 "UEFI QEMU HARDDISK QM00001 " from PciRoot(0x0)/Pci(0x1F,0x2)/Sata(0x0,0xFFFF,0x0)
+INFO : Framebuffer info: FrameBufferInfo { byte_len: 4096000, width: 1280, height: 800, pixel_format: Bgr, bytes_per_pixel: 4, stride: 1280 }
+INFO : UEFI bootloader started
+INFO : Using framebuffer at 0x80000000
+INFO : Reading configuration from disk was successful
+INFO : Trying to load ramdisk via Disk
+INFO : Loaded ramdisk
+TRACE: exiting boot services
+TRACE: switching to new level 4 table
+INFO : New page table at: PhysFrame[4KiB](0x101000)
+INFO : Elf file loaded at Pointer {
+    addr: 0x000000000dfe6000,
+    metadata: 2065192,
+}
+INFO : virtual_address_offset: 0xffff800000000000
+INFO : Handling Segment: Ph64(ProgramHeader64 { type_: Ok(Load), flags: Flags(4), offset: 0, virtual_addr: 0, physical_addr: 0, file_size: 87fa4, mem_size: 87fa4, align: 1000 })
+INFO : Handling Segment: Ph64(ProgramHeader64 { type_: Ok(Load), flags: Flags(5), offset: 88000, virtual_addr: 89000, physical_addr: 89000, file_size: b6895, mem_size: b6895, align: 1000 })
+INFO : Handling Segment: Ph64(ProgramHeader64 { type_: Ok(Load), flags: Flags(6), offset: 13e898, virtual_addr: 140898, physical_addr: 140898, file_size: 1c758, mem_size: 1c768, align: 1000 })
+INFO : Mapping bss section
+INFO : Handling Segment: Ph64(ProgramHeader64 { type_: Ok(Load), flags: Flags(6), offset: 15b000, virtual_addr: 15e000, physical_addr: 15e000, file_size: 49e20, mem_size: 4d770, align: 1000 })
+INFO : Mapping bss section
+INFO : Entry point at: 0xffff8000000b4ec0
+INFO : Creating GDT at PhysAddr(0x141000)
+INFO : Map framebuffer
+INFO : Map physical memory
+INFO : Allocate bootinfo
+INFO : Create Memory Map
+INFO : Create bootinfo
+INFO : Jumping to kernel entry point at VirtAddr(0xffff8000000b4ec0)
+[time] TSC at 2112.000 MHz (kvmclock), not marked invariant
+[kernel] random: seeded from RDSEED and timing jitter
+[time] timers: local APIC in TSC-deadline mode
+[tlb] address spaces tagged by PCID
+[smp] 4 of 4 CPUs online
+diskfs: serving ext2 from a 2048 MiB virtio disk (pid 1)
+netd: 10.0.2.15/24 via DHCP, gateway 10.0.2.2 (virtio-net 52:54:00:12:34:56)
+[autorun] running /etc/autorun
+=== fdtest
+dup takes the lowest free descriptor                         ok
+dup2 onto itself returns it                                  ok
+dup3 onto itself is EINVAL                                   ok
+... also for a closed descriptor (before EBADF)              ok
+dup3 with a flag but O_CLOEXEC is EINVAL                     ok
+dup2 of a closed descriptor is EBADF                         ok
+dup2 replaces an open descriptor                             ok
+... which names the new file then                            ok
+dup3 with O_CLOEXEC sets close-on-exec                       ok
+dup does not copy close-on-exec                              ok
+F_DUPFD takes the lowest at or above its argument            ok
+F_DUPFD_CLOEXEC sets close-on-exec                           ok
+FIONCLEX and FIOCLEX                                         ok
+F_SETFD                                                      ok
+close of a closed descriptor is EBADF                        ok
+an unknown fcntl is EINVAL                                   ok
+F_SETFL on one descriptor ...                                ok
+... shows on its duplicates                                  ok
+... and the reads there do not block                         ok
+FIONBIO turns it off for all of them                         ok
+the access mode is kept                                      ok
+F_SETFL cannot change the access mode                        ok
+another pipe's flags are its own                             ok
+close_range with CLOSE_RANGE_CLOEXEC marks them              ok
+close_range closes a range                                   ok
+close_range to ~0 closes the rest                            ok
+close_range with first above last is EINVAL                  ok
+close_range with an unknown flag is EINVAL                   ok
+getrlimit(RLIMIT_NOFILE)                                     ok
+a lower soft limit is taken                                  ok
+opens beyond it fail with EMFILE                             ok
+dup2 beyond it is EBADF                                      ok
+F_DUPFD at it is EINVAL                                      ok
+poll with more entries than the limit is EINVAL              ok
+a soft limit above the hard one is EINVAL                    ok
+an unlimited hard limit is EPERM (fs.nr_open)                ok
+the hard limit may grow (root)                               ok
+the old limits back                                          ok
+a forked child has the parent's descriptors                  ok
+its close does not reach the parent                          ok
+a forked child shares the file offset                        ok
+a thread's open is the process's                             ok
+close_range(CLOSE_RANGE_UNSHARE) closes in the thread's own copy ok
+a blocked read survives another thread's close               ok
+an exit closes the child's descriptors (end of file)         ok
+execve keeps descriptors and closes close-on-exec ones       ok
+a failed execve leaves the table as it was                   ok
+a close-on-exec write end goes with the execve               ok
+a close-on-exec socket's port is free for the new program    ok
+a /proc file opens and reads                                 ok
+lseek on it                                                  ok
+fstat on it                                                  ok
+its duplicate shares the offset                              ok
+it is always ready                                           ok
+epoll refuses it (EPERM)                                     ok
+O_APPEND changes on it                                       ok
+fchdir to a directory of the kernel's                        ok
+openat relative to it                                        ok
+getdents64 on it                                             ok
+fstat on it                                                  ok
+the kernel's /dev/null is always ready                       ok
+epoll refuses it (EPERM)                                     ok
+fstat: a character device                                    ok
+dup and F_SETFL on it                                        ok
+mmap of the kernel's /dev/zero                               ok
+writes to the kernel's /dev/null                             ok
+fdtest: all passed
+PASS fdtest
+=== polltest
+  (poll woke 77 us after the write)
+poll wakes within 1 ms of a pipe write               ok
+  (select woke 77 us after the write)
+select wakes within 1 ms of a pipe write             ok
+  (poll woke 72 us after a datagram was sent)
+poll wakes within 1 ms of a datagram                 ok
+  (poll woke 21 us after a write on another CPU)
+poll wakes on a write from another CPU               ok
+a full pipe polls writable once drained              ok
+closing the last writer wakes poll with POLLHUP      ok
+a signal interrupts poll with EINTR                  ok
+... also with SA_RESTART (Linux's ERESTARTNOHAND)    ok
+select likewise                                      ok
+poll: a closed descriptor is POLLNVAL, a negative one skipped ok
+select: a closed descriptor is EBADF                 ok
+poll: an O_PATH descriptor is POLLNVAL               ok
+select: an O_PATH descriptor is never ready          ok
+select: tv_usec beyond a second is no EINVAL         ok
+  (select left 899837 us of 1 s)
+select writes back the time left                     ok
+ppoll writes back the time left                      ok
+poll goes on after a stop and a continue             ok
+select goes on after a stop and a continue           ok
+ppoll goes on after a stop and a continue            ok
+restart_syscall with nothing to restart is EINTR     ok
+  (poll woke 80 us after data was sent on a TCP connection)
+poll wakes within 1 ms of TCP data                   ok
+polltest: all passed
+PASS polltest
+=== epolltest
+epoll_create1(EPOLL_CLOEXEC)                             ok
+epoll_create rejects a size of 0                         ok
+epoll_create1 rejects unknown flags                      ok
+EPOLL_CTL_ADD a pipe                                     ok
+adding it twice is EEXIST                                ok
+nothing is ready on an empty pipe                        ok
+a write makes it ready with its data                     ok
+level-triggered: still ready until read                  ok
+not ready once drained                                   ok
+EPOLL_CTL_MOD to edge-triggered                          ok
+edge-triggered: reported once per write                  ok
+edge-triggered: the next write is a new edge             ok
+EPOLL_CTL_MOD to one-shot                                ok
+one-shot: reported once                                  ok
+one-shot: armed again by EPOLL_CTL_MOD                   ok
+EPOLL_CTL_DEL                                            ok
+a removed file is not reported                           ok
+removing it again is ENOENT                              ok
+modifying a file not added is ENOENT                     ok
+a regular file is EPERM                                  ok
+an epoll instance cannot watch itself                    ok
+a descriptor that is not open is EBADF                   ok
+epoll_wait on a pipe is EINVAL                           ok
+maxevents of 0 is EINVAL                                 ok
+an empty pipe's write end is writable                    ok
+a write end without readers reports EPOLLERR             ok
+closing the only descriptor removes the file             ok
+a file with a descriptor left stays watched              ok
+closing its last descriptor removes it                   ok
+maxevents limits a call; level-triggered files rotate    ok
+an idle eventfd is not ready                             ok
+an eventfd write makes it ready                          ok
+an epoll instance can watch another                      ok
+a loop of epoll instances is ELOOP                       ok
+nothing ready inside, nothing outside                    ok
+readiness inside reaches the outer instance              ok
+poll reports an epoll instance with ready files          ok
+and not once they are drained                            ok
+  (a chain of 6 instances is refused, built upwards; 6, downwards)
+nesting is limited when built upwards                    ok
+nesting is limited when built downwards                  ok
+  (watching 50 instances over 4 nested layers took 12407 us)
+three fully connected layers of 50 instances can be watched ok
+a removed interest is never reported                     ok
+  (epoll_wait woke 83 us after the write)
+epoll_wait wakes within 1 ms of a write                  ok
+the timeout ends an idle epoll_wait                      ok
+an idle socket is not ready                              ok
+a datagram makes a socket ready                          ok
+not ready once it is read                                ok
+epoll_wait leaves a blocked signal pending               ok
+epoll_pwait's mask lets it interrupt (EINTR)             ok
+epoll_pwait restores the caller's mask                   ok
+epoll_pwait2 takes a timespec timeout                    ok
+EPOLLEXCLUSIVE with EPOLLONESHOT is EINVAL               ok
+EPOLLEXCLUSIVE on an epoll instance is EINVAL            ok
+EPOLLEXCLUSIVE is taken                                  ok
+an exclusive interest cannot be modified                 ok
+EPOLL_CTL_MOD cannot make one exclusive                  ok
+an exclusive interest reports                            ok
+  (one write woke 1 of two exclusive waiters, 2 of two others)
+EPOLLEXCLUSIVE: one write wakes one of two waiting instances ok
+without it, both                                         ok
+a forked child shares the instance (interests added later) ok
+an epoll instance is passed with SCM_RIGHTS              ok
+... and the receiver waits on it after the sender closed it ok
+an interest by number and description                    ok
+the number names another description now: a new interest ok
+the first interest lives with its description            ok
+... and goes with it                                     ok
+a /proc file is EPERM                                    ok
+a file of the kernel's (/dev/zero) is EPERM              ok
+an O_PATH descriptor is EBADF                            ok
+epoll_wait on an O_PATH descriptor is EBADF              ok
+epoll_wait into memory it cannot write is EFAULT, the event kept ok
+a one-shot event not delivered (a fault) stays armed     ok
+events with a signal its mask let through: the events, no handler ok
+... the signal comes once the caller's mask lets it      ok
+epolltest: all passed
+PASS epolltest
+=== sigmasktest
+sigsuspend runs a handler its mask lets through          ok
+the handler runs with the temporary mask                 ok
+sigsuspend restores the caller's mask                    ok
+sigsuspend sleeps until a signal arrives                 ok
+ppoll with a mask is interrupted by a pending signal     ok
+ppoll restores the caller's mask                         ok
+pselect with a mask is interrupted by a pending signal   ok
+pselect restores the caller's mask                       ok
+a successful ppoll leaves a blocked signal pending       ok
+the signal is still pending afterwards                   ok
+the held-off signal arrives once ppoll returns           ok
+a mask of the wrong size is EINVAL                       ok
+sigmasktest: all passed
+PASS sigmasktest
+=== proctest
+PR_SET_NAME/PR_GET_NAME round-trip (15 bytes)        ok
+capget reports the full set (everything is root)     ok
+capget with an unknown version proposes v3           ok
+PR_CAPBSET_READ knows CAP_SYS_ADMIN                  ok
+PR_SET_NO_NEW_PRIVS sticks                           ok
+PR_SET_PDEATHSIG signals an orphaned child           ok
+/proc/<pid>/stat via openat on an O_PATH dir fd      ok
+/proc/1 is the tree's init, /proc/self's parent getppid's ok
+/proc/self points to the caller                      ok
+/proc/stat: a total and one line per CPU, btime      ok
+/proc/meminfo: MemTotal > MemAvailable > 0 (kB)      ok
+/proc/counters counts system calls and allocations   ok
+/proc/loadavg has the Linux format                   ok
+/proc/uptime and sysinfo agree                       ok
+/proc/<pid>/stat has 52 fields and the name          ok
+/proc/<pid>/cmdline is argv with NULs                ok
+/proc/self/exe names the program                     ok
+/sys/devices/system/cpu/online matches nproc         ok
+/sys/devices/system/cpu has a cpuN per CPU           ok
+/proc is read-only                                   ok
+/proc/<tid> of a thread: its Pid, the process's Tgid ok
+/proc/mounts lists the namespace's mounts            ok
+/proc/mounts is a link to self/mounts                ok
+/proc/thread-self names the calling thread           ok
+/proc/self/task lists every thread                   ok
+/proc/self/cwd is the working directory              ok
+statfs: /proc is proc, /sys is sysfs                 ok
+/proc makes no names (EPERM, EACCES)                 ok
+/proc removes, renames and chmods nothing (EPERM)    ok
+/proc's files are read-only (EACCES)                 ok
+/proc files read in pieces are one snapshot          ok
+/proc files seek from the start, not the end         ok
+pread at 0 of a /proc file is current                ok
+/proc/self/fd/N reads as the file's path             ok
+... unlinked: "(deleted)", and opening it opens the file ok
+/proc/self/fd lists the descriptors                  ok
+a pipe's ends read as one pipe:[ino]                 ok
+reopening a pipe's end gives another end             ok
+... the pipe has a writer while one is open          ok
+... and none after the last: end of file             ok
+a socket reads as socket:[ino] and opens ENXIO       ok
+an O_PATH descriptor opens for real through /proc/self/fd ok
+musl's fchmod of it goes through /proc/self/fd       ok
+epoll on a reopened pipe end wakes for a writer      ok
+... and one reopened with data waiting is readable at once ok
+an O_PATH of an inotify instance keeps it from ending: no ok
+open of a symlink through /proc/self/fd: ELOOP       ok
+Hello from user space! argc=1 argv[0]=hello
+fexecve runs a program through /proc/self/fd         ok
+another process's descriptor reads as its pipe       ok
+another process's descriptors are listed             ok
+prlimit of another process's RLIMIT_NOFILE           ok
+the other process saw its pipe's end                 ok
+proctest: all passed
+PASS proctest
+=== exectest
+initialized data is there and bss is zero                    ok
+arguments and environment lie in order, back to back         ok
+    8 x busybox sleep: 1080 KiB (busybox: 1.4 MB)
+8 runs of busybox take less than one copy of it              ok
+copying busybox to /tmp                                      ok
+a program in /tmp runs                                       ok
+opening a running program for writing fails with ETXTBSY     ok
+... and so does truncating it                                ok
+once it ended, it can be opened for writing                  ok
+running a program open for writing fails with ETXTBSY        ok
+after close it runs again                                    ok
+running a program mapped shared and writable fails (ETXTBSY) ok
+after munmap it runs again                                   ok
+... and a read-only shared mapping does not stop it          ok
+overwriting it with another program                          ok
+Hello from user space! argc=1 argv[0]=true
+the next run executes the new contents                       ok
+a running program survives unlink of its file                ok
+a #! script runs with its interpreter and arguments          ok
+a script that is its own interpreter: ELOOP                  ok
+a file that is neither ELF nor #!: ENOEXEC                   ok
+a file without an execute bit: EACCES                        ok
+a directory: EACCES                                          ok
+Hello from user space! argc=1 argv[0]=hello
+execveat(fd, "", AT_EMPTY_PATH) runs the descriptor's file   ok
+an argument beyond MAX_ARG_STRLEN: E2BIG                     ok
+exectest: all passed
+PASS exectest
+=== sigtest
+handler runs for raise(SIGINT)               ok
+SIGTERM kills a busy loop without syscalls   ok
+parent receives SIGCHLD                      ok
+blocking pipe read fails with EINTR          ok
+SIGUSR1 handler ran                          ok
+blocked signal stays pending                 ok
+unblocking delivers it                       ok
+ignored signal does nothing                  ok
+async handlers keep the FPU/SSE state intact ok
+alarm() delivers SIGALRM                     ok
+alarm(0) reports no time left                ok
+setitimer repeats with its interval          ok
+a zero itimerval disarms the timer           ok
+huge timer values neither overflow nor fire  ok
+negative timer values fail with EINVAL       ok
+alarm(UINT_MAX) is accepted                  ok
+division by zero raises a catchable SIGFPE   ok
+a bad pointer raises a catchable SIGSEGV     ok
+int3 raises SIGTRAP and execution continues  ok
+[linux] divide error at 0x0 (rip 0x4019a4, error 0x0, kind 0) in pid 115: process killed
+an uncaught SIGFPE kills the process         ok
+sigtest: all passed
+PASS sigtest
+=== sigframetest
+kill: SI_USER with the sender's pid                          ok
+the frame's ucontext has the interrupted rip                 ok
+tgkill: SI_TKILL                                             ok
+sigqueue: SI_QUEUE with its value                            ok
+real-time signals: every instance, in order                  ok
+sigtimedwait takes a pending signal with its data            ok
+sigtimedwait times out with EAGAIN                           ok
+sigaltstack takes a stack                                    ok
+SA_ONSTACK: the handler runs on the alternate stack          ok
+sigaltstack reports it (not on it now)                       ok
+a stack below MINSIGSTKSZ is ENOMEM                          ok
+SS_AUTODISARM: on the stack, which is back afterwards        ok
+SS_DISABLE: back on the normal stack                         ok
+SA_RESETHAND: one delivery, then the default                 ok
+SA_NODEFER: frames nest                                      ok
+without it the signal waits for the handler's return         ok
+a write to a read-only page: SEGV_ACCERR at its address      ok
+an unmapped page: SEGV_MAPERR at its address                 ok
+a frame that cannot be written: SIGSEGV                      ok
+sigframetest: all passed
+PASS sigframetest
+=== waittest
+waitid(WNOWAIT) reports CLD_EXITED with the status           ok
+... and the child is still there to reap                     ok
+then it is gone (ECHILD)                                     ok
+a killed child: CLD_KILLED with the signal                   ok
+wait4(WNOHANG) of a running child is 0                       ok
+waitid(WNOHANG) of a running child: si_pid 0                 ok
+waitid(WSTOPPED): CLD_STOPPED with SIGSTOP                   ok
+waitid(WCONTINUED): CLD_CONTINUED                            ok
+... then it exits                                            ok
+waitid without WEXITED, WSTOPPED or WCONTINUED is EINVAL     ok
+a clone child is not wait4's without __WCLONE                ok
+__WALL takes it                                              ok
+wait4's rusage counts the child's CPU time                   ok
+RUSAGE_CHILDREN adds it up                                   ok
+SIGCHLD's siginfo names the child and its status             ok
+SA_NOCLDSTOP: a stop sends no SIGCHLD                        ok
+SA_NOCLDWAIT: no zombies, wait is ECHILD                     ok
+SIGCHLD ignored: the child is reaped by itself               ok
+a child subreaper reaps its orphaned grandchild              ok
+PR_SET_PDEATHSIG: the signal comes when the parent ends      ok
+getsid(0) and getpgid(0) answer                              ok
+getpgid of no process is ESRCH                               ok
+setsid makes a leader; a leader's setsid and setpgid are EPERM ok
+a parent puts its child into a group of its own              ok
+... which the child sees                                     ok
+setpgid on a child after its exec is EACCES                  ok
+setpgid of a process not a child is ESRCH                    ok
+clone3 makes a child                                         ok
+clone3: CLONE_THREAD without CLONE_SIGHAND is EINVAL         ok
+clone3: unknown bytes not zero are E2BIG                     ok
+vfork: the child ran first, in the parent's memory           ok
+waittest: all passed
+PASS waittest
+=== unixtest
+socketpair(AF_UNIX, SOCK_STREAM)                             ok
+fstat says it is a socket                                    ok
+a fresh pair is writable, not readable                       ok
+write to one end                                             ok
+the other end is readable                                    ok
+FIONREAD counts the bytes                                    ok
+MSG_PEEK leaves the data                                     ok
+read takes it                                                ok
+a stream read takes across writes                            ok
+getsockname of a pair: just the family                       ok
+getpeername of a pair: just the family                       ok
+SO_TYPE is SOCK_STREAM                                       ok
+SO_DOMAIN is AF_UNIX                                         ok
+SO_PEERCRED of a pair is the creator                         ok
+SO_SNDBUF is kept doubled                                    ok
+options of other levels: EOPNOTSUPP                          ok
+lseek on a socket: ESPIPE                                    ok
+shutdown(SHUT_WR)                                            ok
+the peer sees POLLRDHUP                                      ok
+the peer reads the rest                                      ok
+then end of file                                             ok
+writing after SHUT_WR: EPIPE                                 ok
+the peer can still write back                                ok
+after the peer closed: POLLHUP and POLLIN                    ok
+read after the peer closed: end of file                      ok
+write to a closed peer: EPIPE and SIGPIPE                    ok
+MSG_NOSIGNAL: EPIPE without SIGPIPE                          ok
+unread data, then ECONNRESET, then end of file               ok
+SOCK_NONBLOCK and SOCK_CLOEXEC take                          ok
+an empty nonblocking read: EAGAIN                            ok
+epoll: nothing yet                                           ok
+epoll: EPOLLIN after a write                                 ok
+epoll (edge-triggered): nothing more                         ok
+epoll (edge-triggered): new data is a new edge               ok
+a full send buffer: EAGAIN                                   ok
+and no POLLOUT                                               ok
+everything written arrives                                   ok
+POLLOUT once drained                                         ok
+epoll: EPOLLRDHUP after the peer's shutdown                  ok
+SO_RCVTIMEO: a read times out with EAGAIN                    ok
+socketpair(AF_UNIX, SOCK_DGRAM)                              ok
+datagram FIONREAD: the next datagram's size                  ok
+datagrams keep their boundaries                              ok
+an empty datagram is one                                     ok
+a short buffer truncates, MSG_TRUNC in msg_flags             ok
+MSG_TRUNC returns the real length                            ok
+socketpair(AF_UNIX, SOCK_SEQPACKET)                          ok
+packets keep their boundaries                                ok
+the rest of a truncated packet is gone                       ok
+a packet socket reads end of file after the peer closed      ok
+bind a tmpfs path                                            ok
+a second bind of a tmpfs path: EADDRINUSE                    ok
+connecting before listen: ECONNREFUSED                       ok
+listen                                                       ok
+SO_ACCEPTCONN of a listener                                  ok
+getsockname gives the name back                              ok
+poll: a pending connection makes the listener readable       ok
+accept4: the client is unnamed                               ok
+the accepted socket has the listener's name                  ok
+read from the client                                         ok
+SO_PEERCRED of an accepted socket: the client                ok
+the client over a tmpfs path did its part                    ok
+a full backlog: a nonblocking connect gets EAGAIN            ok
+the listener closed: a pending client is reset               ok
+the name is a socket inode                                   ok
+open() of a socket inode: ENXIO                              ok
+the name stays after close; unlink removes it                ok
+connect to a missing path: ENOENT                            ok
+connect to a file that is no socket: ECONNREFUSED            ok
+bind a relative path                                         ok
+a second bind of a relative path: EADDRINUSE                 ok
+connecting before listen: ECONNREFUSED                       ok
+listen                                                       ok
+SO_ACCEPTCONN of a listener                                  ok
+getsockname gives the name back                              ok
+poll: a pending connection makes the listener readable       ok
+accept4: the client is unnamed                               ok
+the accepted socket has the listener's name                  ok
+read from the client                                         ok
+SO_PEERCRED of an accepted socket: the client                ok
+the client over a relative path did its part                 ok
+a full backlog: a nonblocking connect gets EAGAIN            ok
+the listener closed: a pending client is reset               ok
+bind a /data path                                            ok
+a second bind of a /data path: EADDRINUSE                    ok
+connecting before listen: ECONNREFUSED                       ok
+listen                                                       ok
+SO_ACCEPTCONN of a listener                                  ok
+getsockname gives the name back                              ok
+poll: a pending connection makes the listener readable       ok
+accept4: the client is unnamed                               ok
+the accepted socket has the listener's name                  ok
+read from the client                                         ok
+SO_PEERCRED of an accepted socket: the client                ok
+the client over a /data path did its part                    ok
+a full backlog: a nonblocking connect gets EAGAIN            ok
+the listener closed: a pending client is reset               ok
+a /data socket inode                                         ok
+bind an abstract name                                        ok
+a second bind of an abstract name: EADDRINUSE                ok
+connecting before listen: ECONNREFUSED                       ok
+listen                                                       ok
+SO_ACCEPTCONN of a listener                                  ok
+getsockname gives the name back                              ok
+poll: a pending connection makes the listener readable       ok
+accept4: the client is unnamed                               ok
+the accepted socket has the listener's name                  ok
+read from the client                                         ok
+SO_PEERCRED of an accepted socket: the client                ok
+the client over an abstract name did its part                ok
+a full backlog: a nonblocking connect gets EAGAIN            ok
+the listener closed: a pending client is reset               ok
+autobind (bind with the family only)                         ok
+autobind gives a five-digit abstract name                    ok
+binding a bound socket: EINVAL                               ok
+sendto a named datagram socket                               ok
+recvfrom gives the sender's name                             ok
+connect a datagram socket                                    ok
+an unconnected datagram send: ENOTCONN                       ok
+connect(AF_UNSPEC) disconnects                               ok
+a datagram to a stream socket: EPROTOTYPE                    ok
+a datagram to a closed socket: ECONNREFUSED                  ok
+SCM_RIGHTS: send a pipe and a file                           ok
+a passed descriptor outlives the sender's close              ok
+the passed pipe's only writer went: end of file              ok
+a socket passed back from the child                          ok
+the passed socket carries data                               ok
+the child received and used the descriptors                  ok
+the file's data is intact                                    ok
+MSG_PEEK passes a copy, the receive the original             ok
+both name the same pipe                                      ok
+SCM_RIGHTS with a bad descriptor: EBADF                      ok
+sockets in flight in a cycle are collected                   ok
+an O_PATH descriptor travels and names its node              ok
+an open file of the kernel's travels                         ok
+an epoll instance travels                                    ok
+an epoll instance's interest keeps nothing in flight         ok
+SO_PASSCRED                                                  ok
+SCM_CREDENTIALS names the sending process                    ok
+SCM_CREDENTIALS sent explicitly                              ok
+and received                                                 ok
+a blocked recvmsg outlives another thread's close            ok
+... and the descriptor it got works                          ok
+a blocked accept outlives another thread's close             ok
+200 races of close, receive and the collector lose nothing   ok
+another process passes descriptors after it                  ok
+a cycle an exited process left is collected                  ok
+a full datagram receiver holds a sender back: EAGAIN         ok
+... and the sender is not writable for epoll                 ok
+... until the receiver reads                                 ok
+MSG_PEEK installs only what fits, with MSG_CTRUNC            ok
+SCM_CREDENTIALS of a process outside the tree: ESRCH         ok
+an unwritable control buffer: the bytes still come           ok
+copies into pages the pager brings, sockets closing, collecting ok
+descriptors in flight stay within the instance's bound       ok
+... and files can still be mapped meanwhile                  ok
+everything left in flight is collected                       ok
+unixtest: all ok
+PASS unixtest
+=== forktest
+forktest: pid=656
+child: pid=657 ppid=656, starting hello
+Hello from user space! argc=3 argv[0]=hello
+parent: child 657 exited with 42
+worker A: round 0
+worker B: round 0
+worker A: round 1
+worker B: round 1
+worker A: round 2
+worker B: round 2
+worker A: round 3
+worker B: round 3
+parent: worker A exited with 10
+parent: worker B exited with 11
+PASS forktest
+=== timetest
+CLOCK_MONOTONIC has sub-millisecond resolution       ok
+CLOCK_MONOTONIC never goes back on one CPU           ok
+clock_getres(CLOCK_MONOTONIC) is at most 1 us        ok
+clock_getres on a bad clock fails with EINVAL        ok
+clock_gettime on a bad clock fails with EINVAL       ok
+CLOCK_MONOTONIC advances with real time              ok
+CLOCK_BOOTTIME matches CLOCK_MONOTONIC               ok
+CLOCK_MONOTONIC_RAW and _COARSE work                 ok
+gettimeofday works                                   ok
+gettimeofday agrees with CLOCK_REALTIME              ok
+time() agrees with CLOCK_REALTIME                    ok
+the wall clock is after 2020                         ok
+clock_settime(CLOCK_REALTIME) works                  ok
+the wall clock moved by 1000 s                       ok
+CLOCK_MONOTONIC did not move                         ok
+clock_settime(CLOCK_MONOTONIC) fails with EINVAL     ok
+clock_settime with tv_nsec >= 1e9 fails              ok
+CLOCK_MONOTONIC never goes back between CPUs         ok
+thread CPU time counts 100 ms of spinning            ok
+thread CPU time is not tick-quantized                ok
+thread CPU time does not count sleeping              ok
+another thread's CPU time is its own                 ok
+pthread_getcpuclockid reads a thread's clock         ok
+process CPU time includes all threads                ok
+clock_getcpuclockid(0) reads the process clock       ok
+getrusage(RUSAGE_SELF) works                         ok
+getrusage(RUSAGE_SELF) counts the spinning           ok
+getrusage(RUSAGE_THREAD) counts this thread          ok
+getrusage with a bad target fails                    ok
+times() returns elapsed clock ticks                  ok
+times() counts the reaped child                      ok
+getrusage(RUSAGE_CHILDREN) counts it                 ok
+    (wait4: 201971 us of CPU, maxrss 4148 KiB)
+wait4's rusage has the child's and its children's CPU time ok
+... and its peak memory (4 MiB touched)              ok
+... kept across exec                                 ok
+timetest: all passed
+PASS timetest
+quick: 0 failed
+[sh (pid 5) exited with code 0]
+[autorun] success
+[kernel] power off
+exit 1

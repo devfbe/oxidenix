@@ -208,7 +208,8 @@ pub struct CpuState {
 
 /// A descriptor table, shared by the tasks cloned with CLONE_FILES.
 /// Descriptors are taken out under the lock and dropped after it: closing
-/// a file may wake others or talk to a server.
+/// a file may wake others or talk to a server. A Linux program has none
+/// (its descriptors are its server's, `servers/linux/src/fdtable.rs`).
 pub struct Files {
     fds: IrqSpinLock<Vec<Option<FdEntry>>>,
 }
@@ -238,19 +239,6 @@ impl Files {
             }
         }
         Files::new(copy)
-    }
-
-    /// The open descriptors from `from` on, ascending, as many as `out`
-    /// holds: how many it got.
-    pub fn open_from(&self, from: u64, out: &mut [u32]) -> usize {
-        let fds = self.fds.lock();
-        let open = fds.iter().enumerate().skip(from.min(MAX_FDS as u64) as usize).filter(|(_, e)| e.is_some()).map(|(fd, _)| fd as u32);
-        let mut n = 0;
-        for (slot, fd) in out.iter_mut().zip(open) {
-            *slot = fd;
-            n += 1;
-        }
-        n
     }
 
     pub fn get(&self, fd: u64) -> Result<Arc<OpenFile>, i64> {

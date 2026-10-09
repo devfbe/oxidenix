@@ -117,7 +117,11 @@ pub fn clone(frame: &Frame, flags: u64, stack: u64, parent_tid: u64, child_tid: 
         }
         mm
     };
-    let files = if flags & CLONE_FILES != 0 { parent.files()?.clone() } else { parent.files()?.duplicate().ok_or(ENOMEM)? };
+    let files = if flags & CLONE_FILES != 0 {
+        parent.files()?.clone()
+    } else {
+        parent.files()?.duplicate().ok_or(ENOMEM)?
+    };
     let fs = match (&parent.fs, flags & CLONE_FS != 0) {
         (Some(f), true) => f.clone(),
         (Some(f), false) => FsInfo::new(f.cwd()).ok_or(ENOMEM)?,

@@ -1,6 +1,5 @@
 //! AF_UNIX sockets (phase R7a): stream, datagram and sequenced-packet
-//! sockets of the server, each a file with a placeholder in the kernel's
-//! descriptor table, as pipes are. This is the sockets' semantics (Linux's
+//! sockets of the server, each a file of its own, as pipes are. This is the sockets' semantics (Linux's
 //! net/unix/af_unix.c); `sockcalls` is their system calls (addresses,
 //! message headers, ancillary data, options).
 //!
@@ -45,9 +44,9 @@
 //! copy took under the state lock again. A send copies into the server's
 //! memory before it takes a lock.
 //!
-//! A call on a socket keeps it open while it lasts (`kfd_lookup` pins the
-//! file until the call returns): another thread's close does not end a
-//! blocked receive or accept, as on Linux.
+//! A call on a socket keeps it open while it lasts (it holds a reference
+//! to the description until it returns, Linux's fdget): another thread's
+//! close does not end a blocked receive or accept, as on Linux.
 
 use crate::files;
 use crate::namespace::Node;
@@ -288,8 +287,8 @@ struct Inner {
 pub struct Sock {
     pub ty: u32,
     me: Weak<Sock>,
-    /// The id of its placeholder (0 until it has one: an unaccepted
-    /// connection).
+    /// The id of its open file description (0 until it has one: an
+    /// unaccepted connection).
     id: AtomicU64,
     seq: AtomicU32,
     /// What its messages queued elsewhere are charged (see `Msg`).
@@ -585,8 +584,8 @@ impl Sock {
         self.id.load(Ordering::Acquire)
     }
 
-    /// Its placeholder's id, once it has one; readiness goes there from
-    /// now on (`report_now` after the placeholder exists).
+    /// Its open file description's id, once it has one; readiness goes
+    /// there from now on (`report_now` after the description exists).
     pub fn set_id(&self, id: u64) {
         self.id.store(id, Ordering::Release);
     }
@@ -691,7 +690,7 @@ impl Sock {
         self.changed(&mut i, event);
     }
 
-    /// Reports the readiness as it is (a new placeholder).
+    /// Reports the readiness as it is (a new description).
     pub fn report_now(&self) {
         let mut i = self.inner.lock();
         let now = self.readiness(&i);
@@ -997,7 +996,7 @@ impl Sock {
         Ok(())
     }
 
-    /// Its placeholder's last reference is gone (or an unaccepted
+    /// Its description's last reference is gone (or an unaccepted
     /// connection's listener went): the socket closes.
     pub fn release(&self) {
         let (peer, msgs, pending, bound) = {
@@ -1019,7 +1018,7 @@ impl Sock {
             (peer, msgs, pending, bound)
         };
         // A connection reset: data left unread, or a connection never
-        // accepted (no placeholder).
+        // accepted (no description).
         let reset = !msgs.is_empty() || self.id() == 0;
         if let Some(b) = bound {
             let mut map = BINDINGS.lock();
