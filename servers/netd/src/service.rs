@@ -1963,12 +1963,15 @@ impl Service {
                 // sends again (RFC 9293): a peer that keeps sending FINs
                 // would keep it forever. It goes after `TIME_WAIT_MAX` in
                 // all, silently (out of smoltcp: nothing more is sent).
+                // A connection of an instance with no room for another
+                // socket skips TIME-WAIT as it enters it (closed at once, as
+                // Linux beyond tcp_max_tw_buckets): TIME-WAIT never keeps
+                // it from opening connections. Those already in TIME-WAIT
+                // stay (`recycle_time_wait` takes the oldest when one is
+                // needed).
+                let entering = cl.time_wait.is_none();
                 let since = *cl.time_wait.get_or_insert(now);
-                // An instance with no room for another socket skips
-                // TIME-WAIT (closed at once, as Linux beyond
-                // tcp_max_tw_buckets): TIME-WAIT never keeps it from
-                // opening connections.
-                if now >= since + TIME_WAIT_MAX || socks.room(cl.owner) == 0 {
+                if now >= since + TIME_WAIT_MAX || (entering && socks.room(cl.owner) == 0) {
                     done.push(cl.handle);
                     progress = true;
                     return false;
