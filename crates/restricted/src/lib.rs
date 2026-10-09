@@ -328,11 +328,14 @@ pub const SYS_SHARED_MAP: u64 = 1023;
 /// word at `addr` (the server's memory) holds `val`, until woken, the
 /// deadline (monotonic nanoseconds; 0: none) or, with
 /// `FUTEX_INTERRUPTIBLE`, a kick (EINTR, see `thread_kick`). A dying thread
-/// always stops waiting (EINTR).
+/// stops waiting (EINTR), but for `FUTEX_LOCK`: a lock's wait (its holder
+/// lets go in bounded time, and a dying thread's server needs the lock to
+/// end the thread) ends only when woken.
 pub const SYS_SERVER_FUTEX_WAIT: u64 = 1024;
 /// `server_futex_wake(addr, n) -> woken`.
 pub const SYS_SERVER_FUTEX_WAKE: u64 = 1025;
 pub const FUTEX_INTERRUPTIBLE: u64 = 1;
+pub const FUTEX_LOCK: u64 = 2;
 
 /// `(n)`: the server allocates and frees `n` blocks of many sizes from its
 /// heap, checking their contents; 0 if all were right.

@@ -127,6 +127,11 @@ fn exception(frame: &mut Frame) {
         }
     }
     if frame.from_user() && crate::process::linux::mode() == Some(false) {
+        // A dying thread's server whose access ended with the thread's death
+        // (a page wait cut short) did not fail: the thread just ends.
+        if vector == 14 && signal::dying() {
+            crate::process::exit_thread(signal::SIGKILL as i32);
+        }
         // The Linux server failed: its process cannot go on.
         crate::printkln!(
             "[linux] {} in the Linux server (rip {:#x}, address {:#x}, error {:#x}, cr3 {:#x}, rdi {:#x}), process killed",

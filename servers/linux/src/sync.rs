@@ -9,9 +9,12 @@
 //! its bucket lock before sleeping, so no wakeup is lost. Acquire on lock
 //! and Release on unlock order the protected data.
 //!
-//! Waits are not interruptible by the program's signals (the server holds
-//! these locks for short, bounded work, like a kernel's spinlocks), but a
-//! dying thread stops waiting and never returns to the server.
+//! Waits are not interruptible by the program's signals, nor ended by the
+//! thread's death (`FUTEX_LOCK`): the server holds these locks for short,
+//! bounded work (like a kernel's spinlocks, never across a copy of program
+//! memory or a page wait), and a dying thread still runs server code that
+//! takes them (`process::exit_killed` lets go of its descriptor table and
+//! ends the thread). So a dying thread sleeps for a lock as any other.
 //!
 //! Priority: the server runs on its programs' threads, with their nice
 //! values. A low-priority thread preempted while it holds a lock would
@@ -33,7 +36,7 @@ use crate::syscall;
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{compiler_fence, AtomicU32, Ordering};
-use restricted::{SERVER_LOCKS_OFFSET, SYS_SERVER_FUTEX_WAIT, SYS_SERVER_FUTEX_WAKE, SYS_YIELD, THREADS_BASE, THREAD_AREA};
+use restricted::{FUTEX_LOCK, SERVER_LOCKS_OFFSET, SYS_SERVER_FUTEX_WAIT, SYS_SERVER_FUTEX_WAKE, THREADS_BASE, THREAD_AREA};
 
 /// The calling thread's count of the locks it holds: in its State page,
 /// found from the stack, which is the thread's area's
@@ -87,7 +90,7 @@ impl<T> Mutex<T> {
         if self.state.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_err() {
             while self.state.swap(2, Ordering::Acquire) != 0 {
                 let addr = &self.state as *const AtomicU32 as u64;
-                syscall(SYS_SERVER_FUTEX_WAIT, [addr, 2, 0, 0, 0, 0]);
+                syscall(SYS_SERVER_FUTEX_WAIT, [addr, 2, 0, FUTEX_LOCK, 0, 0]);
             }
         }
         hold();
@@ -183,11 +186,7 @@ impl RwLock {
 
     fn sleep(&self, seen: u32) {
         let addr = &self.changed as *const AtomicU32 as u64;
-        const EINTR: i64 = 4;
-        // A dying thread cannot sleep: it yields while it waits.
-        if syscall(SYS_SERVER_FUTEX_WAIT, [addr, seen as u64, 0, 0, 0, 0]) == -EINTR {
-            syscall(SYS_YIELD, [0; 6]);
-        }
+        syscall(SYS_SERVER_FUTEX_WAIT, [addr, seen as u64, 0, FUTEX_LOCK, 0, 0]);
     }
 
     fn advance(&self) {

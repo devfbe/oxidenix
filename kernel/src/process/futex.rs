@@ -173,12 +173,35 @@ fn wait(uaddr: u64, val: u32, deadline: Option<u64>, bitset: u32, private: bool)
     let hung_up = || object.as_ref().is_some_and(|o| o.is_hung_up());
     // Not readable without a fault: fault it in (not under the bucket's
     // lock), then try again.
-    wait_on(key, || uaccess::read_u32_atomic(uaddr), || uaccess::read::<u32>(uaddr).map(|_| ()), hung_up, val, deadline, bitset, true)
+    wait_on(key, || uaccess::read_u32_atomic(uaddr), || uaccess::read::<u32>(uaddr).map(|_| ()), hung_up, val, deadline, bitset, Ends::Interrupted)
+}
+
+/// What ends a futex wait besides a wake, its word changing and its deadline.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Ends {
+    /// A signal (for a Linux program's thread: a kick), and the thread's death.
+    Interrupted,
+    /// Only the thread's death.
+    Dying,
+    /// Nothing more: a lock of the Linux server's, whose holder lets go in
+    /// bounded time and which a dying thread's server still needs to end the
+    /// thread (`restricted::FUTEX_LOCK`).
+    Never,
+}
+
+impl Ends {
+    fn now(self) -> bool {
+        match self {
+            Ends::Interrupted => signal::interrupted(),
+            Ends::Dying => signal::dying(),
+            Ends::Never => false,
+        }
+    }
 }
 
 /// Waits on `key` while the word is `val`: `peek` reads it without
-/// faulting (None if it cannot), `fault_in` makes it readable. A signal
-/// ends the wait if `interruptible`, a fatal one always. EPIPE if
+/// faulting (None if it cannot), `fault_in` makes it readable. `ends` says
+/// what else ends the wait (EINTR). EPIPE if
 /// `hung_up` (the word's object was hung up; checked under the bucket
 /// lock, which `wake_object` takes after hanging it up).
 #[allow(clippy::too_many_arguments)]
@@ -190,7 +213,7 @@ fn wait_on(
     val: u32,
     deadline: Option<u64>,
     bitset: u32,
-    interruptible: bool,
+    ends: Ends,
 ) -> Result<i64, i64> {
     let me = current();
     let index = bucket_of(&key);
@@ -223,7 +246,7 @@ fn wait_on(
         if deadline.is_some_and(|d| crate::time::now() >= d) {
             break Err(ETIMEDOUT);
         }
-        if if interruptible { signal::interrupted() } else { signal::dying() } {
+        if ends.now() {
             break Err(EINTR);
         }
         match deadline {
@@ -369,9 +392,9 @@ fn requeue(uaddr: u64, n_wake: u64, n_move: u64, uaddr2: u64, cmp: Option<u32>, 
 /// thread that exits (CLONE_CHILD_CLEARTID).
 /// Waits on the word at `addr` of the Linux server's memory (instance
 /// `instance`), read through `word`, while it holds `val`.
-pub fn server_wait(instance: usize, addr: u64, word: &core::sync::atomic::AtomicU32, val: u32, deadline: Option<u64>, interruptible: bool) -> Result<i64, i64> {
+pub fn server_wait(instance: usize, addr: u64, word: &core::sync::atomic::AtomicU32, val: u32, deadline: Option<u64>, ends: Ends) -> Result<i64, i64> {
     let key = Key { base: Base::Server(instance), offset: addr };
-    wait_on(key, || Some(word.load(Ordering::SeqCst)), || Ok(()), || false, val, deadline, FUTEX_BITSET_MATCH_ANY, interruptible)
+    wait_on(key, || Some(word.load(Ordering::SeqCst)), || Ok(()), || false, val, deadline, FUTEX_BITSET_MATCH_ANY, ends)
 }
 
 /// One word of a `server_waitv`: where it is (the Linux server's memory, or
@@ -409,7 +432,7 @@ impl<'a> WaitWord<'a> {
 /// its entry there and marks the task woken; the others are stale from then
 /// on: a wake that meets one drops it without counting it (`wake_in`), and
 /// the task removes what is left before it returns.
-pub fn server_waitv(words: &[WaitWord], deadline: Option<u64>, interruptible: bool) -> Result<i64, i64> {
+pub fn server_waitv(words: &[WaitWord], deadline: Option<u64>, ends: Ends) -> Result<i64, i64> {
     let me = current();
     let mut wait = prepare_to_sleep();
     me.futex_woken.store(false, Ordering::Release);
@@ -441,7 +464,7 @@ pub fn server_waitv(words: &[WaitWord], deadline: Option<u64>, interruptible: bo
             if deadline.is_some_and(|d| crate::time::now() >= d) {
                 break Err(ETIMEDOUT);
             }
-            if if interruptible { signal::interrupted() } else { signal::dying() } {
+            if ends.now() {
                 break Err(EINTR);
             }
             match deadline {
@@ -475,11 +498,11 @@ pub fn object_wait(
     word: &core::sync::atomic::AtomicU32,
     val: u32,
     deadline: Option<u64>,
-    interruptible: bool,
+    ends: Ends,
 ) -> Result<i64, i64> {
     let key = Key { base: Base::Shared(Arc::as_ptr(object) as usize), offset };
     let hung_up = || object.is_hung_up();
-    wait_on(key, || Some(word.load(Ordering::SeqCst)), || Ok(()), hung_up, val, deadline, FUTEX_BITSET_MATCH_ANY, interruptible)
+    wait_on(key, || Some(word.load(Ordering::SeqCst)), || Ok(()), hung_up, val, deadline, FUTEX_BITSET_MATCH_ANY, ends)
 }
 
 /// Arms a doorbell watch of the server process `pid` on the word at

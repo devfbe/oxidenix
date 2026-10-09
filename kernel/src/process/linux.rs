@@ -1394,8 +1394,8 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
                 });
             }
             let deadline = (deadline != 0).then_some(deadline);
-            let interruptible = flags & FUTEX_INTERRUPTIBLE != 0;
-            super::futex::server_waitv(&words, deadline, interruptible)
+            let ends = if flags & FUTEX_INTERRUPTIBLE != 0 { super::futex::Ends::Interrupted } else { super::futex::Ends::Dying };
+            super::futex::server_waitv(&words, deadline, ends)
         }
         SYS_MO_SUPPLY => {
             let (handle, offset, buf, len) = (a[0], a[1], a[2], a[3]);
@@ -1514,18 +1514,22 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             Ok(0)
         }
         SYS_SERVER_FUTEX_WAIT => {
+            use super::futex::Ends;
             let (addr, val, deadline, flags) = (a[0], a[1] as u32, a[2], a[3]);
-            if flags & !FUTEX_INTERRUPTIBLE != 0 {
-                return Err(EINVAL);
-            }
-            let (deadline, interruptible) = ((deadline != 0).then_some(deadline), flags & FUTEX_INTERRUPTIBLE != 0);
+            let ends = match flags {
+                0 => Ends::Dying,
+                FUTEX_INTERRUPTIBLE => Ends::Interrupted,
+                FUTEX_LOCK => Ends::Never,
+                _ => return Err(EINVAL),
+            };
+            let deadline = (deadline != 0).then_some(deadline);
             // A word of an object mapped into the region has the object's key.
             if let Some((object, offset, word)) = instance.object_word(addr) {
-                return super::futex::object_wait(&object, offset, word, val, deadline, interruptible);
+                return super::futex::object_wait(&object, offset, word, val, deadline, ends);
             }
             let word = instance.word(addr)?;
             let id = Arc::as_ptr(&instance) as usize;
-            super::futex::server_wait(id, addr, word, val, deadline, interruptible)
+            super::futex::server_wait(id, addr, word, val, deadline, ends)
         }
         SYS_SERVER_FUTEX_WAKE => {
             if let Some((object, offset, _)) = instance.object_word(a[0]) {
