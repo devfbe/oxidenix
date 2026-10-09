@@ -160,6 +160,8 @@ pub struct ThreadGroup {
     /// Sequence number of the live arming of the interval timer (0: off),
     /// changed under `sig`.
     pub alarm_seq: AtomicU64,
+    /// CPUs whose timer queues it armed its interval timer on.
+    pub alarm_cpus: AtomicU64,
     /// The id of the Linux server instance whose tree the process belongs
     /// to (`linux::Instance::id`; 0: none, a server of the kernel's or the
     /// instance's pager). Set when its first thread is made.
@@ -180,6 +182,7 @@ impl ThreadGroup {
             info: IrqSpinLock::new(info),
             sig: IrqSpinLock::new(sig),
             alarm_seq: AtomicU64::new(0),
+            alarm_cpus: AtomicU64::new(0),
             instance: AtomicU64::new(0),
             legacy_calls: AtomicU64::new(0),
         })
@@ -366,6 +369,8 @@ pub struct Task {
     /// timer that ends its sleep (0: none; see `timer`).
     pub wait_chan: AtomicUsize,
     pub timer_seq: AtomicU64,
+    /// CPUs whose timer queues it armed a timer on (bit per index).
+    pub timer_cpus: AtomicU64,
     /// Serializes wakeups with the task descheduling itself.
     pub wake_lock: IrqSpinLock<()>,
     /// futex wait: set by the waker that dequeued it, and the hash bucket
@@ -412,6 +417,7 @@ impl Task {
             affinity: AtomicU64::new(u64::MAX),
             wait_chan: AtomicUsize::new(0),
             timer_seq: AtomicU64::new(0),
+            timer_cpus: AtomicU64::new(0),
             wake_lock: IrqSpinLock::new(()),
             futex_woken: AtomicBool::new(false),
             futex_bucket: AtomicUsize::new(0),

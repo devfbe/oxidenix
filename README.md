@@ -393,7 +393,8 @@ About 9,200 lines of Rust (without comments and blank lines) in the kernel and 3
   the enqueue are atomic with respect to a waker.
 - **Out of memory is an error, not a panic**: the kernel heap grows by mapping more frames
   when an allocation fails. It never shrinks, so each growth lowers the commit limit by as
-  much; before it grows, the size classes give back the slabs whose slots are all free
+  much (`Slab` in `/proc/meminfo` is what of it is in use); before it grows, the size
+  classes give back the slabs whose slots are all free
   (`slab::FreeList::reclaim`; the Linux server's heap does the same), so a burst of many
   objects of one size does not keep that memory from all others. User memory (pages, page tables, kernel stacks) may not take the last 16 MiB of RAM,
   which stay reserved for the heap. Large allocations that user space can trigger (kernel
@@ -1027,7 +1028,8 @@ Each of these programs and scripts lives in the root filesystem and runs inside 
 | `oomtest` | fork bomb (stops at the process limit), memory exhaustion via `mmap`, 100 full pipes; the kernel survives and memory is reusable; a process touching `MAP_NORESERVE` memory beyond the commit limit is killed while one with committed memory touches all of it; a `read()` into an untouched `MAP_NORESERVE` buffer with nothing left to commit kills the reader too (not `EFAULT`) |
 | `sigtest` | handlers, killing a busy loop, `SIGCHLD`, `EINTR` on pipe reads, blocked and ignored signals, FPU state across asynchronous handlers, `alarm` and repeating `setitimer`, catchable `SIGFPE`/`SIGSEGV`/`SIGTRAP` from CPU exceptions, an uncaught `SIGFPE` killing the process |
 | `jobtest` | stop/continue reporting through `wait4`, restart of a stopped `read()`, `SIGKILL` on stopped processes, `SA_RESTART` |
-| `forktest` | `fork`, `execve`, `wait4`, preemptive interleaving of two workers, 4000 forked and reaped processes leaving the kernel heap as it was |
+| `forktest` | `fork`, `execve`, `wait4`, preemptive interleaving of two workers |
+| `leaktest` | repeated work leaves the kernel's memory as it was: after a warm-up, thousands of rounds of fork and exit, fork and exec, a process whose minute-long `poll` ended early (its timer entry goes with it), threads, shared mappings of `/tmp` and `/data` files, `open`/`close`, pipes and `AF_UNIX` connections keep the kernel heap in use (`Slab` in `/proc/meminfo`) within 16 KiB and the free frames within the kernel stacks' page tables (a cache of at most 1 MiB, `memory/kstack.rs`) |
 | `proctest` | `prctl` name round-trip, `capget`/`capset` versions and the full capability set, no-new-privs, `PR_SET_PDEATHSIG` delivered to an orphan (via `sigwait`); `/proc` as htop reads it (directory fds with `O_PATH` and `openat`), `/proc/self`, the formats of `stat`, `meminfo`, `loadavg`, `uptime` and `/proc/<pid>/{stat,cmdline,exe}`, `/proc/counters` counting system calls and allocations, `sysinfo`, the CPU list in `/sys`, read-only `/proc`, `/proc/<tid>/status` of a thread that is not the main one (its own `Pid`, the process's `Tgid`) |
 | `threadtest` | pthreads: create/join, own tids, TLS, 4 threads counting under a mutex, condition variables and timed waits, 300 threads in a row, `Threads:` in `/proc/self/status`, `exit` and fatal signals ending all threads, the process outliving its main thread, group stop and continue, process signals reaching a thread that does not block them, `pthread_kill`, `fork` and `execve` in a thread, real `vfork`, `posix_spawn`, `munmap` and `mprotect` reaching a writer on another CPU (TLB shootdown), `MADV_DONTNEED` in a loop under three writer threads while another process checks fresh memory for stray stores (this hung the scheduler before) |
 | `futextest` | `FUTEX_WAIT` on a changed value (`EAGAIN`), timeouts, `EINVAL`/`EFAULT`, interruption by a signal (`EINTR`), shared futexes across processes, private memory keeping separate keys after `fork`, bitsets, `FUTEX_CMP_REQUEUE` |

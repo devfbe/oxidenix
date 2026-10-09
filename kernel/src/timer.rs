@@ -11,7 +11,10 @@
 //! Cancelling is lazy: the owner of a timer (a task, a process's interval
 //! timer) holds the sequence number of its live arming, and an entry whose
 //! number is no longer current is skipped when it comes up. Entries refer
-//! to their owner weakly, so a stale one keeps no task alive. The queues
+//! to their owner weakly, so a stale one keeps no task alive; a task that
+//! ends takes its entries out (`forget`), since even a weak reference
+//! keeps its memory until the entry comes up (a wait with a long timeout
+//! that ended early, as the Linux server's 60 s request timeouts). The queues
 //! never allocate after start-up: there is at most one live entry per task
 //! and per process, a queue holds twice that many, and a full queue drops
 //! its stale entries first. So arming works in interrupt context too.
@@ -171,6 +174,7 @@ fn next_seq() -> u64 {
 pub fn wake_at(task: &Arc<Task>, deadline: u64) {
     let seq = next_seq();
     task.timer_seq.store(seq, Ordering::Release);
+    task.timer_cpus.fetch_or(1 << smp::cpu().index, Ordering::Relaxed);
     queue(Entry { deadline, seq, owner: Owner::Task(Arc::downgrade(task)) });
 }
 
@@ -178,17 +182,39 @@ pub fn disarm(task: &Task) {
     task.timer_seq.store(0, Ordering::Release);
 }
 
+/// Takes `task`'s entries out of the queues it armed timers on: it ends,
+/// and none of them can wake it any more.
+pub fn forget(task: &Task) {
+    disarm(task);
+    let cpus = task.timer_cpus.swap(0, Ordering::AcqRel);
+    for i in (0..smp::MAX_CPUS).filter(|i| cpus & 1 << i != 0) {
+        let Some(c) = smp::by_index(i) else { continue };
+        c.timers.lock().heap.retain(|e| !matches!(&e.owner, Owner::Task(t) if core::ptr::eq(t.as_ptr(), task)));
+    }
+}
+
 /// Arms `group`'s interval timer for `deadline`; the caller holds the
 /// group's signal lock, which serializes this with the timer's expiry.
 pub fn arm_alarm(group: &Arc<ThreadGroup>, deadline: u64) {
     let seq = next_seq();
     group.alarm_seq.store(seq, Ordering::Release);
+    group.alarm_cpus.fetch_or(1 << smp::cpu().index, Ordering::Relaxed);
     queue(Entry { deadline, seq, owner: Owner::Alarm(Arc::downgrade(group)) });
 }
 
 /// Cancels `group`'s interval timer (under its signal lock).
 pub fn disarm_alarm(group: &ThreadGroup) {
     group.alarm_seq.store(0, Ordering::Release);
+}
+
+/// Takes the entries of `group`'s interval timer out of the queues: the
+/// process ended (as `forget` for a task).
+pub fn forget_alarm(group: &ThreadGroup) {
+    let cpus = group.alarm_cpus.swap(0, Ordering::AcqRel);
+    for i in (0..smp::MAX_CPUS).filter(|i| cpus & 1 << i != 0) {
+        let Some(c) = smp::by_index(i) else { continue };
+        c.timers.lock().heap.retain(|e| !matches!(&e.owner, Owner::Alarm(g) if core::ptr::eq(g.as_ptr(), group)));
+    }
 }
 
 /// The local APIC timer interrupt: runs what is due, the scheduler tick
