@@ -21,11 +21,18 @@
 //! scheduler runs a holder with the weight of nice -20: preempted in the
 //! lock, it is back as soon as the most favored program would be (and a
 //! program gains no more than that by its calls).
+//!
+//! The count changes by a plain load and store (`hold`, `unhold`), not by
+//! a locked read-modify-write: only its own thread writes it. Locked
+//! instructions cost tens of cycles each, twice per lock, and a path
+//! lookup takes about fifty locks (most of them the heap's): counting
+//! with them made `stat` of a tmpfs path about 15 % slower
+//! (docs/benchmarks/README.md).
 
 use crate::syscall;
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicU32, Ordering};
 use restricted::{SERVER_LOCKS_OFFSET, SYS_SERVER_FUTEX_WAIT, SYS_SERVER_FUTEX_WAKE, SYS_YIELD, THREADS_BASE, THREAD_AREA};
 
 /// The calling thread's count of the locks it holds: in its State page,
@@ -36,6 +43,30 @@ fn held() -> &'static AtomicU32 {
     unsafe { core::arch::asm!("mov {}, rsp", out(reg) sp, options(nomem, nostack, preserves_flags)) };
     let n = (sp - THREADS_BASE) / THREAD_AREA;
     unsafe { &*((restricted::thread_state(n) + SERVER_LOCKS_OFFSET) as *const AtomicU32) }
+}
+
+/// The calling thread took a lock: one more in its count. The thread is
+/// the count's only writer (the kernel zeroes it when it hands out the
+/// slot, before the thread runs, and only reads it after), so a load and a
+/// store make an exact count. The kernel reads it when it schedules: on
+/// this CPU, an interrupt between the two sees the count as it was an
+/// instruction earlier; another CPU sees either value. Both are a valid
+/// moment of the thread's. The compiler fence keeps the store ahead of the
+/// critical section (the lock's Acquire keeps it behind the lock).
+#[inline(always)]
+fn hold() {
+    let h = held();
+    h.store(h.load(Ordering::Relaxed).wrapping_add(1), Ordering::Relaxed);
+    compiler_fence(Ordering::SeqCst);
+}
+
+/// The calling thread let go of a lock (after the release, which the
+/// compiler fence keeps ahead of the store): one fewer in its count.
+#[inline(always)]
+fn unhold() {
+    compiler_fence(Ordering::SeqCst);
+    let h = held();
+    h.store(h.load(Ordering::Relaxed).wrapping_sub(1), Ordering::Relaxed);
 }
 
 pub struct Mutex<T> {
@@ -59,7 +90,7 @@ impl<T> Mutex<T> {
                 syscall(SYS_SERVER_FUTEX_WAIT, [addr, 2, 0, 0, 0, 0]);
             }
         }
-        held().fetch_add(1, Ordering::Relaxed);
+        hold();
         MutexGuard { mutex: self }
     }
 }
@@ -87,7 +118,7 @@ impl<T> Drop for MutexGuard<'_, T> {
             let addr = &self.mutex.state as *const AtomicU32 as u64;
             syscall(SYS_SERVER_FUTEX_WAKE, [addr, 1, 0, 0, 0, 0]);
         }
-        held().fetch_sub(1, Ordering::Relaxed);
+        unhold();
     }
 }
 
@@ -118,7 +149,7 @@ impl RwLock {
                 let mut st = self.state.lock();
                 if !st.writer && st.writers_waiting == 0 {
                     st.readers += 1;
-                    held().fetch_add(1, Ordering::Relaxed);
+                    hold();
                     return ReadGuard { lock: self };
                 }
                 self.changed.load(Ordering::Acquire)
@@ -137,7 +168,7 @@ impl RwLock {
                     if waiting {
                         st.writers_waiting -= 1;
                     }
-                    held().fetch_add(1, Ordering::Relaxed);
+                    hold();
                     return WriteGuard { lock: self };
                 }
                 if !waiting {
@@ -180,7 +211,7 @@ impl Drop for ReadGuard<'_> {
         if wake {
             self.lock.advance();
         }
-        held().fetch_sub(1, Ordering::Relaxed);
+        unhold();
     }
 }
 
@@ -192,6 +223,6 @@ impl Drop for WriteGuard<'_> {
     fn drop(&mut self) {
         self.lock.state.lock().writer = false;
         self.lock.advance();
-        held().fetch_sub(1, Ordering::Relaxed);
+        unhold();
     }
 }

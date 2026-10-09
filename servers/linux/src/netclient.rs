@@ -1,4 +1,4 @@
-//! The instance's channel to netd (phase R7b, ADR 0007, the protocol
+//! The instance's channel to netd (phase R7b, ADR 0008, the protocol
 //! `netring`): requests (`ringclient`'s slots), the shared area with a
 //! control block per socket, the buffer pool the sockets' rings live in,
 //! and the net thread.

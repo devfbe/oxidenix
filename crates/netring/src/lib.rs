@@ -1,4 +1,4 @@
-//! The socket protocol of the data plane (phase R7b, ADR 0007): what the
+//! The socket protocol of the data plane (phase R7b, ADR 0008): what the
 //! Linux server (the client) and netd (the service) share over a channel
 //! (`ring::channel`) for the instance's internet sockets. Kept apart from
 //! both so that its encodings and memory ordering are tested on the host.

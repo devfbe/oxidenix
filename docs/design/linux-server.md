@@ -1,6 +1,6 @@
 # The Linux server: system calls in restricted mode
 
-Status: accepted; phase R1 implemented (the shared region uses PML4 slot 128, 512 GiB). Decisions: ADR 0001-0004, 0007 (sockets).
+Status: accepted; phase R1 implemented (the shared region uses PML4 slot 128, 512 GiB). Decisions: ADR 0001-0004, 0008 (sockets).
 
 ## Goal
 
@@ -138,7 +138,9 @@ low-priority thread preempted while it holds a lock would make every thread of t
 instance that needs the lock wait as long as the low-priority thread waits for the CPU
 (priority inversion: seconds for nice 19 next to a nice −20 loop). The server counts the
 locks each thread holds in a word of the thread's State page
-(`restricted::SERVER_LOCKS_OFFSET`); the scheduler, which knows each Linux thread's page,
+(`restricted::SERVER_LOCKS_OFFSET`), by plain loads and stores, since only the thread
+writes it (a locked increment and decrement per lock cost a path lookup, with about fifty
+locks, some 900 cycles); the scheduler, which knows each Linux thread's page,
 gives a thread holding one the weight of nice −20 (its time with the lock counts at that
 weight) and puts it at the front of its CPU's virtual time when it is preempted or wakes
 holding one. A holder thus comes back as soon as the most favored program would, and a
@@ -303,7 +305,7 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
      `Link` records, asked for over the instance's channel to netd since R7b), as the kernel
      answers `fstat` of its own descriptors for the server's `statx` (`kfd_stat`, 1093) until
      the descriptor table moves (R6e).
-   - **R7b — Internet sockets** (ADR 0007; `servers/linux/src/inet.rs`, `inetcalls.rs`,
+   - **R7b — Internet sockets** (ADR 0008; `servers/linux/src/inet.rs`, `inetcalls.rs`,
      `netclient.rs`, the protocol `crates/netring`, netd's `servers/netd/src/service.rs`):
      `AF_INET` TCP, UDP and raw ICMP sockets are files of the server, placeholders as
      `AF_UNIX` ones are; every socket call comes to the server (`AF_INET6` and the families
@@ -432,4 +434,4 @@ else.
 - 46 bits of address space for Linux programs (ADR 0003).
 - The tty layer runs in the Linux server; the kernel keeps the console as a device (ADR 0004).
 - Internet sockets keep their state in control blocks in the channel's shared area, their data
-  in byte rings in granted memory, and netd answers every request at once (ADR 0007).
+  in byte rings in granted memory, and netd answers every request at once (ADR 0008).

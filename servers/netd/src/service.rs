@@ -1,5 +1,5 @@
 //! The socket service: netd's end of the instances' channels (phase R7b,
-//! ADR 0007, the protocol `netring`), mapped onto smoltcp's sockets. One
+//! ADR 0008, the protocol `netring`), mapped onto smoltcp's sockets. One
 //! TCP/IP stack serves every channel: ports are global, and a channel
 //! names only its own sockets (by their control blocks in its shared
 //! area), so one instance can neither see nor touch another's.

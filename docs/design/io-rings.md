@@ -126,7 +126,7 @@ rings and the shared area are read and write. The positions start at 0.
 
 | Call | |
 |------|---|
-| `chan_create(slots, &addr, shared) -> handle` (1064) | the channel, mapped into the server's region (header read-only) (`MAPS_BASE`..`HEAP_BASE`, a range the kernel maps memory objects into for the server), with `shared` pages (at most 256) of **shared area** after the rings: the protocol's own state, mapped read and write into both ends like the rings and, unlike grants, never taken from the service while it is attached (it may use atomics there; `netring`'s control blocks, ADR 0007); at most 64 per instance |
+| `chan_create(slots, &addr, shared) -> handle` (1064) | the channel, mapped into the server's region (header read-only) (`MAPS_BASE`..`HEAP_BASE`, a range the kernel maps memory objects into for the server), with `shared` pages (at most 256) of **shared area** after the rings: the protocol's own state, mapped read and write into both ends like the rings and, unlike grants, never taken from the service while it is attached (it may use atomics there; `netring`'s control blocks, ADR 0008); at most 64 per instance |
 | `chan_connect(handle, name, len)` (1065) | offers it to the service `name` (a dead server of the kernel's is started again) and waits until it attached or refused; `EISCONN`, `ENOENT`, `EOPNOTSUPP` for a service that takes no channels, `EIO` if it died, `EINTR` for a signal before it attached |
 | `grant(handle, object, offset, pages, flags) -> id` (1066) | pins `pages` pages of a memory or file object (`GRANT_WRITE`: writable); `ENOTCONN` before the service attached, `EPIPE` after it went; at most 4096 grants and 65536 pages per channel |
 | `revoke(handle, id) -> 0 \| REVOKE_DRAINING` (1067) | see below |

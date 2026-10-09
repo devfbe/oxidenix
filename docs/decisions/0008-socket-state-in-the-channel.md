@@ -1,4 +1,4 @@
-# ADR 0007: Internet sockets: shared control blocks, byte rings, answers at once
+# ADR 0008: Internet sockets: shared control blocks, byte rings, answers at once
 
 Date: 2026-10-09. Status: accepted.
 

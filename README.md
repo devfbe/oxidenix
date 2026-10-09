@@ -930,7 +930,7 @@ interrupt dispatch; drivers and filesystems move into user-space servers.
   itself, so a program can talk to a server on the same machine. Frames from the wire that
   claim a `127.0.0.0/8` address are dropped, so services on `127.0.0.1` are not reachable from
   the network.
-- **Sockets** are the Linux server's (phase R7b, ADR 0007; `servers/linux/src/inet.rs`,
+- **Sockets** are the Linux server's (phase R7b, ADR 0008; `servers/linux/src/inet.rs`,
   `inetcalls.rs`, `netclient.rs`): `AF_INET` stream and datagram sockets, plus raw ICMP
   sockets (`SOCK_RAW`, `IPPROTO_ICMP`) for `ping` (the program writes the ICMP message, netd
   adds the IPv4 header, reads return whole IPv4 packets, as on Linux; netd answers echo

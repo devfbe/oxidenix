@@ -1,4 +1,4 @@
-//! Internet sockets (phase R7b, ADR 0007): TCP, UDP and raw ICMP sockets
+//! Internet sockets (phase R7b, ADR 0008): TCP, UDP and raw ICMP sockets
 //! of the server, each a file with a placeholder in the kernel's
 //! descriptor table, as AF_UNIX ones are; netd runs the protocols. This is
 //! the sockets' semantics (Linux's, `man 7 tcp`, `udp`, `ip`, `socket`);

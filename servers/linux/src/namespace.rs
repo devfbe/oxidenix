@@ -300,8 +300,7 @@ fn walk_tmpfs(root: &Arc<tmpfs::Inode>, names: &[String], follow: bool) -> Resul
     let mut cur = root.clone();
     for (i, name) in names.iter().enumerate() {
         let child = cur.lookup(name)?;
-        let mode = child.mode();
-        if mode & vfs::S_IFMT == vfs::S_IFLNK && (follow || i + 1 < names.len()) {
+        if child.file_type() == vfs::S_IFLNK && (follow || i + 1 < names.len()) {
             return Ok(Step::Link(Node::Tmp(child), i + 1));
         }
         cur = child;
@@ -336,11 +335,13 @@ pub fn resolve(base: &str, path: &str, follow: bool) -> Result<Resolved, i64> {
         return Err(ENOENT);
     }
     let given = normalize(base, path);
-    let mut comps: VecDeque<String> = given.clone().into();
+    // The components with the symlinks met so far replaced; None while
+    // there were none (then they are `given`, which needs no copy).
+    let mut replaced: Option<Vec<String>> = None;
     let mut links = 0;
     loop {
-        let all: Vec<String> = comps.iter().cloned().collect();
-        let (fs, at) = mount_of(&all);
+        let all = replaced.as_deref().unwrap_or(&given);
+        let (fs, at) = mount_of(all);
         let names = &all[at..];
         let step = match &fs {
             Fs::Kernel(base) => walk_kernel(base, names)?,
@@ -362,9 +363,9 @@ pub fn resolve(base: &str, path: &str, follow: bool) -> Result<Resolved, i64> {
             return Err(ELOOP);
         }
         let target = link.readlink()?;
-        let mut next: VecDeque<String> = normalize(&join(&all[..walked - 1]), &target).into();
+        let mut next = normalize(&join(&all[..walked - 1]), &target);
         next.extend(all[walked..].iter().cloned());
-        comps = next;
+        replaced = Some(next);
     }
 }
 
