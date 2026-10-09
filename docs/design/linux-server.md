@@ -347,6 +347,16 @@ device. Decisions in ADR 0007.
   `EVENT_CONSOLE` (the keyboard interrupt sets a flag and wakes the service thread's
   channel; no lock of the instance is taken in interrupt context); losing the device is
   `EVENT_CONSOLE_LOST`.
+- **Writes and echoes**: a write goes out whole in a writer's turn, a fair sleeping lock of
+  the kernel's (first come first served, so a program flooding the console starves no other
+  writer; a signal interrupts a wait for the turn with EINTR, nothing written). The service
+  thread processes the keyboard's input and must never wait behind such a write (the
+  instance's page faults wait for it): its echoes (`console_write` with `CONSOLE_ECHO`) go
+  into a bounded queue (4 KiB, the rest dropped, as Linux's echo buffer) that the writer
+  holding the turn drains between its pieces, or the echoing thread when nobody holds it.
+  The signals of ^C, ^\ and ^Z are sent before the echo. The console's answers to queries are
+  taken in the lock hold that made them (each costs budget, so one hold's always fit): they
+  become input for the holder's own writes only, the kernel's text gets none.
 - **The monitor** (the kernel's fallback shell) edits its command line on the raw device
   while it holds it: echo, backspace, Ctrl+U, Enter. It is not Linux and has no termios.
 
@@ -355,13 +365,16 @@ device. Decisions in ADR 0007.
 They stay the kernel's until R8 moves the process model. The server asks and acts through
 calls that go with R8: `proc_ids` (a process's or a process group's pid, group, session, and
 whether the group is orphaned, within the caller's instance), `signal_group` (a signal from
-the terminal to a process group or a process of the instance), `signal_state` (whether the
-calling thread blocks a signal or its process ignores it, for SIGTTIN and SIGTTOU), and the
-kernel's `EVENT_SESSION_END` when a session leader's process ends.
+the terminal to a process group, a process, or a session's leader if it still leads it,
+checked on the process it signals), `signal_state` (whether the calling thread blocks a
+signal or its process ignores it, for SIGTTIN and SIGTTOU), and the kernel's
+`EVENT_SESSION_END` when a session leader's process ends. The kernel's exit path also sends
+SIGHUP and SIGCONT to a process group an exit leaves orphaned with stopped members (POSIX,
+Linux's `kill_orphaned_pgrp`), which goes to the server with the process model too.
 
-### The line discipline (`crates/tty`)
+### The line discipline (`crates/ldisc`)
 
-Linux's N_TTY as a pure library, tested on the host (`cargo test -p tty`): `struct termios`
+Linux's N_TTY as a pure library, tested on the host (`cargo test -p ldisc`): `struct termios`
 and `struct termios2` in x86-64's layout with the defaults of Linux's `tty_std_termios`;
 input mapping (`ISTRIP`, `INLCR`, `IGNCR`, `ICRNL`, `IUCLC`), `ISIG` with `NOFLSH`, flow
 control (`IXON`, `IXANY`), canonical editing (`VERASE`, `VKILL` with `ECHOK`/`ECHOKE`,
@@ -385,14 +398,21 @@ placeholder in the kernel's descriptor table, as pipes are).
 - **Reading** (`n_tty_read`'s rules): canonical reads end at a line's end (an `VEOF` at the
   start of a line reads 0); noncanonical reads follow `VMIN`/`VTIME` (with `VTIME` an
   inter-byte timer once a byte came, or the whole read's timeout with `VMIN` 0), the waits
-  are interruptible server futex waits with a deadline. Readers go one at a time; bytes are
-  copied to the program with no lock held and consumed after (as pipes).
-- **Writing**: output processing under the terminal's lock into the server's memory; a pty's
+  are interruptible server futex waits with a deadline; whether the read is canonical is
+  asked at every pass, as Linux's. A read takes the read turn for the whole call (Linux's
+  `atomic_read_lock`: a line or a `VMIN` batch is never split between readers); turns are
+  interruptible waits on the terminal's change counter, not server locks, since they are held
+  across waits for input. Bytes are peeked under the terminal's lock, copied to the program
+  with only the reader lock (`rlock`) held, and consumed after (a flush in between is seen by
+  an epoch). That lock is safe across the copy, where a fault may wait for the pager: only
+  programs' reads and settings changes take it, never the pager.
+- **Writing**: a write takes the write turn for the whole call (Linux's
+  `atomic_write_lock`), so its output processing and the device's write keep their order;
+  output processing happens under the terminal's lock into the server's memory, a pty's
   output goes to its master's buffer under it, the console's to the device after it. No lock
-  of the server is held across the console's write (a flooding writer would hold a lock
-  holder's priority for the whole write and starve its CPU's other threads); the kernel keeps
-  one write's bytes together (a sleeping lock of its own). Output stopped by `VSTOP` (or
-  `tcflow`) waits for `VSTART`.
+  of `sync` is held across the console's write (a flooding writer would get a lock holder's
+  priority for the whole write and starve its CPU's other threads). Output stopped by
+  `VSTOP` (or `tcflow`) waits for `VSTART`. Echoes take neither turn.
 - **Job control** (Linux's `tty_check_change`): a process of a background group reading its
   controlling terminal gets SIGTTIN for its group and the call restarts after it (EIO if it
   ignores or blocks SIGTTIN or its group is orphaned); writing with `TOSTOP`, and
@@ -419,8 +439,10 @@ placeholder in the kernel's descriptor table, as pipes are).
 - **Devices by number**: a character device node names its driver by its device number, as on
   Linux: (5,0) `/dev/tty` (the caller's controlling terminal, ENXIO without one), (5,1)
   `/dev/console`, (5,2) `/dev/ptmx`, (136,n) `/dev/pts/n` are the server's, whatever
-  filesystem holds the node; the others (`/dev/null`, `/dev/zero`) stay the kernel's. The
-  kernel's `/dev` gives its nodes their numbers (`st_rdev`).
+  filesystem holds the node; (1,3) and (1,5) are the kernel's null and zero (a node of the
+  server's opens the kernel's), any other number has no driver (ENXIO). `O_PATH` opens the
+  node without its driver, `O_DIRECTORY` is ENOTDIR. The kernel's `/dev` gives its nodes their
+  numbers (`st_rdev`).
 - **ioctls**: `TCGETS`/`TCSETS`/`TCSETSW`/`TCSETSF` and the `termios2` forms, `TCSBRK`,
   `TCSBRKP`, `TCXONC`, `TCFLSH`, `TIOCGWINSZ`/`TIOCSWINSZ`, `TIOCGPGRP`/`TIOCSPGRP`,
   `TIOCGSID`, `TIOCSCTTY`, `TIOCNOTTY`, `TIOCSTI` (everyone is root), `FIONREAD`,
@@ -437,7 +459,9 @@ a tmpfs mounted at `/dev/pts` whose names only the server makes and removes (wit
 `/dev/pts/ptmx`, mode 000, as Linux's): from the master's open until its close. The slave is
 locked until `TIOCSPTLCK` unlocks it (`unlockpt`; opening it before is EIO). A master write is
 the slave's input (in noncanonical mode it waits while the slave's buffer is full); the
-slave's output goes to the master's 64 KiB buffer (its writers wait for room). The master
+slave's output goes to the master's 64 KiB buffer (its writers wait for room; echoes may
+fill it 4 KiB further, the rest is dropped, so a master that never reads cannot grow it;
+`TIOCSTI` on a full master drops; `TIOCSIG` takes SIGINT, SIGQUIT and SIGTSTP only). The master
 reads EIO once the slave's last descriptor went (after what was left), and polls with
 POLLHUP; the master's last close hangs the slave up and removes its node. The master's
 termios, window size and process group ioctls act on the slave, as on Linux.
@@ -447,8 +471,11 @@ termios, window size and process group ioctls act on the slave, as on Linux.
 `userspace/ttytest.c` drives terminals through ptys, which is everything the server's tty
 layer does: termios round trips, canonical and raw reads, `VMIN`/`VTIME`, echo and editing,
 output processing, ^C/^Z/^\ reaching the foreground group, SIGTTIN and SIGTTOU for a
-background group, the controlling terminal, hangups, window sizes and SIGWINCH, poll. The
-console's own input is the keyboard's (QEMU's serial port is output only), so the console
+background group, the controlling terminal, hangups, window sizes and SIGWINCH, poll, the
+turns of readers, bounded echoes, orphaned stopped jobs. An echo through the console's
+`TIOCSTI` (the keyboard's path) while another process floods the console checks that echoes
+never wait for a writer. The console's own input is the keyboard's (QEMU's serial port is
+output only), so the console
 driver's input path is checked interactively (bash, busybox, htop); its output path carries
 the whole test suite's output.
 

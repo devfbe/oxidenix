@@ -117,6 +117,19 @@ static void devices(void) {
     close(m);
     check("the master's close removes the node", stat(path, &st) == -1 && errno == ENOENT);
 
+    int ptys = 0;
+    d = opendir("/dev/pts");
+    while (d && (e = readdir(d))) ptys += e->d_name[0] >= '0' && e->d_name[0] <= '9';
+    if (d) closedir(d);
+    int op = open("/dev/ptmx", O_PATH);
+    int after = 0;
+    d = opendir("/dev/pts");
+    while (d && (e = readdir(d))) after += e->d_name[0] >= '0' && e->d_name[0] <= '9';
+    if (d) closedir(d);
+    check("O_PATH opens /dev/ptmx's node, not a pty", op >= 0 && after == ptys && !isatty(op));
+    close(op);
+    check("O_DIRECTORY on a device node: ENOTDIR", open("/dev/tty", O_RDONLY | O_DIRECTORY) == -1 && errno == ENOTDIR);
+
     int c = open("/dev/console", O_RDWR | O_NOCTTY);
     struct winsize ws = {0};
     check("/dev/console is a terminal with a size", c >= 0 && isatty(c) && ioctl(c, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0 && ws.ws_col > 0);
@@ -484,6 +497,44 @@ static void read_rules(void) {
     close(m);
 }
 
+static void report_hup(int sig) {
+    (void)sig;
+    write(3, "H", 1);
+}
+
+/* A stopped job whose group the exit of its session's leader orphans gets SIGHUP and
+ * SIGCONT (POSIX; Linux's kill_orphaned_pgrp), instead of staying stopped for ever. */
+static void orphans(void) {
+    int rep[2];
+    pipe(rep);
+    pid_t leader = fork();
+    if (leader == 0) {
+        setsid();
+        pid_t job = fork();
+        if (job == 0) {
+            setpgid(0, 0);
+            dup2(rep[1], 3);
+            struct sigaction sa = {0};
+            sa.sa_handler = report_hup;
+            sigaction(SIGHUP, &sa, NULL);
+            raise(SIGSTOP);
+            _exit(0);
+        }
+        setpgid(job, job);
+        int status;
+        waitpid(job, &status, WUNTRACED);
+        _exit(WIFSTOPPED(status) ? 0 : 1);
+    }
+    close(rep[1]);
+    int status = 0;
+    waitpid(leader, &status, 0);
+    struct pollfd p = {rep[0], POLLIN, 0};
+    char c = 0;
+    int ok = WIFEXITED(status) && WEXITSTATUS(status) == 0 && poll(&p, 1, 5000) == 1 && read(rep[0], &c, 1) == 1 && c == 'H';
+    check("an orphaned stopped job gets SIGHUP and SIGCONT", ok);
+    close(rep[0]);
+}
+
 static volatile sig_atomic_t got;
 static void on_signal(int sig) { got = sig; }
 
@@ -705,6 +756,7 @@ int main(void) {
     console_flood();
     pty_bounds();
     read_rules();
+    orphans();
     job_control();
     printf("ttytest: %s\n", failures ? "FAILED" : "all passed");
     return failures != 0;
