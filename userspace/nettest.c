@@ -424,7 +424,23 @@ static void datagram_semantics(void) {
           shared && first && connect(t2, (struct sockaddr *)&la, sizeof la) == -1 && errno == EADDRNOTAVAIL);
     close(t1);
     close(t2);
+
+    /* Linux's answers at the edges. */
+    int fresh = socket(AF_INET, SOCK_STREAM, 0);
+    check("send on a TCP socket never connected: EPIPE", send(fresh, "x", 1, MSG_NOSIGNAL) == -1 && errno == EPIPE);
+    close(fresh);
+    int queued = 0;
+    check("FIONREAD on a listener: EINVAL", ioctl(l, FIONREAD, &queued) == -1 && errno == EINVAL);
+    check("shutdown(SHUT_RD) of a listener stops it", shutdown(l, SHUT_RD) == 0);
+    check("... accept is EINVAL then", accept(l, NULL, NULL) == -1 && errno == EINVAL);
+    check("... and a connect is refused", tcp_connect("127.0.0.1", lport) == -1 && errno == ECONNREFUSED);
     close(l);
+    int ud = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in da = addr("127.0.0.1", 9);
+    connect(ud, (struct sockaddr *)&da, sizeof da);
+    shutdown(ud, SHUT_WR);
+    check("UDP send after SHUT_WR: EPIPE", send(ud, "x", 1, MSG_NOSIGNAL) == -1 && errno == EPIPE);
+    close(ud);
 }
 
 /* Hundreds of connections at once, as a server's clients or a package

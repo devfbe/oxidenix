@@ -282,6 +282,35 @@ fn budgets_bound_each_instance_and_all() {
 }
 
 #[test]
+fn a_flood_against_one_instance_leaves_the_others_theirs() {
+    // netd's half-open connections: 1024 in all, at most half for one
+    // instance, 8 kept for each instance with a channel.
+    let mut b = Budget::new(1024, 8, 512);
+    for owner in 1..=20 {
+        b.activate(owner);
+    }
+    let mut flooded = 0;
+    while b.charge(1, 1).is_ok() {
+        flooded += 1;
+    }
+    assert_eq!(flooded, 512, "one instance gets its cap, not more");
+    // Another flood (of a second instance) takes what is left beyond the
+    // reserves of the 18 others...
+    let mut second = 0;
+    while b.charge(2, 1).is_ok() {
+        second += 1;
+    }
+    assert_eq!(second, 1024 - 512 - 18 * 8);
+    // ... and every other instance still has its reserve.
+    for owner in 3..=20 {
+        for _ in 0..8 {
+            assert_eq!(b.charge(owner, 1), Ok(()));
+        }
+        assert_eq!(b.charge(owner, 1), Err(ENOBUFS));
+    }
+}
+
+#[test]
 fn budgets_reserve_a_share_for_every_active_instance() {
     let mut b = Budget::new(100, 20, 100);
     // Alone, an instance may take everything.

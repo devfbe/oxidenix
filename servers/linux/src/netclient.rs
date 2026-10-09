@@ -25,7 +25,9 @@
 //!
 //! Locks: `Net::socks`, `Net::pool`, `Net::closing` and `Net::free` are
 //! leaves, never held across a request to netd or a copy of program
-//! memory.
+//! memory. `Net::links` is held across its `LINKS` request (it guards the
+//! page netd writes the answer into), never across a copy of program
+//! memory, and nothing is taken under it.
 
 use crate::inet::InetSock;
 use crate::ringclient::{futex_wake, RingClient};
@@ -293,10 +295,19 @@ impl Net {
             if empty && room_elsewhere { pool.chunks[r.chunk].take() } else { None }
         };
         if let Some(chunk) = gone {
-            // Forgotten before it is revoked: no draining.
-            let _ = self.call(Request::Forget { grant: chunk.grant });
-            syscall(SYS_REVOKE, [self.ring.handle(), chunk.grant as u64, 0, 0, 0, 0]);
-            drop(chunk);
+            // Forgotten before it is revoked (no draining): only once netd
+            // let go of it (or is gone) is it revoked; else it stays in the
+            // pool.
+            if self.is_dead() || self.status(Request::Forget { grant: chunk.grant }).is_ok() {
+                syscall(SYS_REVOKE, [self.ring.handle(), chunk.grant as u64, 0, 0, 0, 0]);
+                drop(chunk);
+            } else {
+                let mut pool = self.pool.lock();
+                match pool.chunks.get_mut(r.chunk) {
+                    Some(slot @ None) => *slot = Some(chunk),
+                    _ => pool.chunks.push(Some(chunk)),
+                }
+            }
         }
     }
 

@@ -602,6 +602,14 @@ impl InetSock {
             let _w = self.wlock.lock();
             self.net.status(Request::Shutdown { sock: self.index, how: bits })?;
         }
+        if self.kind == Kind::Tcp && !connected && bits & netring::SHUT_RD != 0 && self.st.lock().listening {
+            // A listener stops listening, its queued connections reset (as
+            // Linux's tcp_disconnect); accept is EINVAL from now on.
+            if !self.net.is_dead() {
+                self.net.status(Request::Shutdown { sock: self.index, how: bits })?;
+            }
+            self.st.lock().listening = false;
+        }
         self.poke();
         self.changed();
         if self.kind != Kind::Tcp && self.name(true).is_err() {
@@ -652,10 +660,12 @@ impl InetSock {
                     return Err(EPIPE);
                 }
                 if snap.state & (state::ESTABLISHED | state::CONNECTING) == 0 {
-                    return Err(ENOTCONN);
+                    // Never connected (or listening): EPIPE, and SIGPIPE,
+                    // as Linux's sk_stream_wait_connect.
+                    return Err(EPIPE);
                 }
             }
-            let Some(r) = self.rings() else { return Err(ENOTCONN) };
+            let Some(r) = self.rings() else { return Err(EPIPE) };
             let ctl = self.ctl();
             let tail = ctl.client.tx_tail.load(SeqCst);
             let queued = fill(snap.tx_head, tail, r.size()).ok_or(EIO)?;
@@ -716,6 +726,10 @@ impl InetSock {
         let Some(r) = self.rings() else { return Err(EIO) };
         if len > r.size() as usize {
             return Err(EMSGSIZE);
+        }
+        if self.st.lock().shut_wr {
+            // After SHUT_WR, as Linux's udp_sendmsg (and SIGPIPE).
+            return Err(EPIPE);
         }
         let deadline = deadline(self.st.lock().opts.sndtimeo);
         let _writer = self.wlock.lock();

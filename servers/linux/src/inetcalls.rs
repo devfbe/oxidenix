@@ -550,6 +550,8 @@ pub fn on_file(nr: u64, sock: &Arc<InetSock>, flags: u32, a1: u64, a2: u64) -> R
             usercopy::to_program(a1, &stat(sock)).map(|_| 0)
         }
         files::SYS_IOCTL => match a1 {
+            // (A listener has no bytes: EINVAL, as Linux's tcp_ioctl.)
+            FIONREAD if sock.listening() => Err(EINVAL),
             FIONREAD => usercopy::write(a2, &(sock.inq()? as i32)).map(|_| 0),
             SIOCOUTQ | SIOCOUTQNSD => usercopy::write(a2, &(sock.outq() as i32)).map(|_| 0),
             SIOCATMARK => usercopy::write(a2, &0i32).map(|_| 0),

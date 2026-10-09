@@ -83,6 +83,10 @@ const MAX_CHANNELS: usize = 64;
 const MAX_GRANTS: usize = 256;
 /// Requests taken from one channel per round, for fairness.
 const TAKE_PER_ROUND: usize = 16;
+/// Rounds of marks without anything to do after which marks no longer
+/// keep netd awake, and how long it then sleeps at most.
+const FUTILE_ROUNDS: u32 = 4096;
+const BRIEF_SLEEP_MS: u64 = 1;
 /// A TCP connection's buffers: what it gets when it connects or arrives
 /// (Linux's tcp_rmem and tcp_wmem defaults give a first window of 64 KiB
 /// and 16 KiB to send; less, down to `TCP_MIN`, if the budget is short),
@@ -128,7 +132,7 @@ const INSTANCE_CHANNELS: usize = 2;
 const MAX_BACKLOG: usize = 128;
 /// Half-open connections (SYN-RECEIVED) at once, of all listeners
 /// (Linux's tcp_max_syn_backlog): each holds a `TCP_MIN` buffer.
-const MAX_HALF_OPEN: usize = 256;
+const MAX_HALF_OPEN: usize = 1024;
 /// The largest UDP payload (an IPv4 packet of 65535 bytes).
 const MAX_UDP: usize = 65507;
 const IPV4_HEADER: usize = 20;
@@ -492,7 +496,8 @@ pub struct Service {
     /// Closed connections in TIME-WAIT: only their port and endpoints, until
     /// then (their smoltcp socket and its buffers went).
     lingering: Vec<Lingering>,
-    next_port: u16,
+    /// The state of `random`.
+    rng: u64,
     /// What the instances hold, each within its share: the bytes of
     /// smoltcp's socket buffers (and of closed connections' leftovers),
     /// smoltcp sockets, records of ports in TIME-WAIT, channels.
@@ -508,6 +513,16 @@ pub struct Service {
     wants: Vec<(SocketHandle, Want)>,
     /// The echo identifiers of the instances' raw sockets on the wire.
     echo: EchoIds,
+    /// The half-open connections (SYN-RECEIVED) holding a place, by the
+    /// instance whose listener they came to, and those places.
+    half_open: BTreeMap<SocketHandle, u64>,
+    half_open_budget: Budget,
+    /// Marks were taken this round; rounds in a row that took marks and
+    /// had nothing to do; the sleep being prepared is a brief one
+    /// (`prepare_sleep`).
+    marked: bool,
+    futile: u32,
+    brief: bool,
     /// A datagram on its way out.
     scratch: Vec<u8>,
     pub config: Config,
@@ -551,7 +566,7 @@ impl Service {
             chans: (0..MAX_CHANNELS).map(|_| None).collect(),
             closing: Vec::new(),
             lingering: Vec::new(),
-            next_port: FIRST_EPHEMERAL,
+            rng: unsafe { core::arch::x86_64::_rdtsc() } ^ 0x9e37_79b9_7f4a_7c15,
             bytes: Budget::new(BUDGET, BUDGET / RESERVED_INSTANCES, BUDGET),
             socks: Budget::new(MAX_SMOLTCP, MAX_SMOLTCP / RESERVED_INSTANCES, MAX_SMOLTCP),
             lingering_records: Budget::new(MAX_LINGERING, MAX_LINGERING / RESERVED_INSTANCES, INSTANCE_LINGERING),
@@ -560,6 +575,11 @@ impl Service {
             mem: BTreeMap::new(),
             wants: Vec::new(),
             echo: EchoIds::default(),
+            half_open: BTreeMap::new(),
+            half_open_budget: Budget::new(MAX_HALF_OPEN, MAX_HALF_OPEN / RESERVED_INSTANCES, MAX_HALF_OPEN / 2),
+            marked: false,
+            futile: 0,
+            brief: false,
             scratch: vec![0; MAX_UDP.max(RAW_BUFFER)],
             config: Config::default(),
         }
@@ -594,7 +614,7 @@ impl Service {
                 return e;
             }
         };
-        for b in [&mut self.bytes, &mut self.socks, &mut self.lingering_records, &mut self.orphans] {
+        for b in [&mut self.bytes, &mut self.socks, &mut self.lingering_records, &mut self.orphans, &mut self.half_open_budget] {
             b.activate(offer.instance);
         }
         // Mapped until chan_detach, which comes after the Chan is dropped.
@@ -630,13 +650,25 @@ impl Service {
 
     /// Announces the sleep in every channel and arms its doorbell: false if
     /// work came meanwhile (then nothing sleeps).
+    /// Marks that kept coming without anything to do for `FUTILE_ROUNDS`
+    /// rounds (a client marking for nothing, or in a loop) no longer keep
+    /// netd awake: it sleeps, but at most `BRIEF_SLEEP_MS` (`sleep_cap`),
+    /// so a mark that did mean work is still seen soon.
     pub fn prepare_sleep(&mut self) -> bool {
+        self.brief = false;
+        let futile = self.futile >= FUTILE_ROUNDS;
         for chan in self.chans.iter_mut().flatten() {
             let Some(tail) = chan.requests.prepare_sleep() else { return false };
+            if chan.header.state() != 0 {
+                return false;
+            }
             // The client marks before it rings: a mark made before our
             // announcement is seen here, a later one rings.
-            if chan.area.header.service_pending() || chan.header.state() != 0 {
-                return false;
+            if chan.area.header.service_pending() {
+                if !futile {
+                    return false;
+                }
+                self.brief = true;
             }
             match oxrt::chan_watch(chan.id, tail) {
                 Ok(true) => {}
@@ -644,6 +676,21 @@ impl Service {
             }
         }
         true
+    }
+
+    /// The longest sleep `prepare_sleep` allows (None: no limit of its own).
+    pub fn sleep_cap(&self) -> Option<u64> {
+        self.brief.then_some(BRIEF_SLEEP_MS)
+    }
+
+    /// The end of a round: whether it took marks without anything to do
+    /// (`prepare_sleep`). `progress`: the round's requests, frames and data.
+    pub fn round_end(&mut self, progress: bool) {
+        if core::mem::take(&mut self.marked) && !progress {
+            self.futile = self.futile.saturating_add(1);
+        } else if progress {
+            self.futile = 0;
+        }
     }
 
     /// Ends a sleep: clients stop ringing while netd polls.
@@ -664,7 +711,8 @@ impl Service {
                 continue;
             }
             // The marks only say "look": every socket is pumped each round.
-            progress |= chan.area.header.take_service(|_| {});
+            // (Not progress by themselves: a client could mark forever.)
+            self.marked |= chan.area.header.take_service(|_| {});
             for _ in 0..TAKE_PER_ROUND {
                 let chan = self.chan(c);
                 if chan.completions.room() == 0 {
@@ -712,7 +760,7 @@ impl Service {
         }
         let _ = oxrt::chan_detach(chan.id);
         self.channels.uncharge(chan.owner, 1);
-        for b in [&mut self.bytes, &mut self.socks, &mut self.lingering_records, &mut self.orphans] {
+        for b in [&mut self.bytes, &mut self.socks, &mut self.lingering_records, &mut self.orphans, &mut self.half_open_budget] {
             b.deactivate(chan.owner);
         }
         if self.channels.held(chan.owner) == 0 {
@@ -766,7 +814,7 @@ impl Service {
             Request::Connect { sock, to, area } => self.connect(c, sock, to, area, iface, sockets),
             Request::Accept { sock, new, area } => self.accept(c, sock, new, area, sockets),
             Request::Send { sock, to, len } => self.send(c, sock, to, len, iface, sockets),
-            Request::Shutdown { sock, how } => self.shutdown(c, sock, how),
+            Request::Shutdown { sock, how } => self.shutdown(c, sock, how, sockets),
             Request::Close { sock, abort } => self.close(c, sock, abort, sockets),
             Request::Name { sock, peer } => self.name(c, sock, peer, iface, sockets),
             Request::SetOpt { sock, opt, value } => self.setopt(c, sock, opt, value, sockets),
@@ -840,6 +888,9 @@ impl Service {
     /// system, its place and bytes to its owner's budget.
     fn drop_socket(&mut self, sockets: &mut SocketSet<'static>, h: SocketHandle) {
         sockets.remove(h);
+        if let Some(owner) = self.half_open.remove(&h) {
+            self.half_open_budget.uncharge(owner, 1);
+        }
         if let Some(m) = self.mem.remove(&h) {
             self.bytes.uncharge(m.owner, m.bytes());
             self.socks.uncharge(m.owner, 1);
@@ -969,16 +1020,21 @@ impl Service {
         out
     }
 
-    /// Whether a TCP connection from `local` to `remote` exists: live (of
-    /// any channel), closing, or in TIME-WAIT.
-    fn tuple_in_use(&self, local: IpEndpoint, remote: IpEndpoint, sockets: &SocketSet<'static>) -> bool {
+    /// Whether instance `owner` has a TCP connection from `local` to
+    /// `remote`: live, closing, or in TIME-WAIT. (Only its own: no other
+    /// instance can hold a port it holds, `tcp_port_conflict`, and the
+    /// answer must not tell it about another's connections.)
+    fn tuple_in_use(&self, owner: u64, local: IpEndpoint, remote: IpEndpoint, sockets: &SocketSet<'static>) -> bool {
         let same = |h: SocketHandle| {
             let s = sockets.get::<tcp::Socket>(h);
             s.local_endpoint() == Some(local) && s.remote_endpoint() == Some(remote)
         };
-        let live = self.chans.iter().flatten().flat_map(|c| c.socks.values()).any(|s| matches!(&s.proto, Proto::Tcp(t) if t.backlog.is_none() && same(t.handle)));
-        let listening = self.chans.iter().flatten().flat_map(|c| c.socks.values()).any(|s| matches!(&s.proto, Proto::Tcp(Tcp { backlog: Some(set), .. }) if set.iter().any(|&h| same(h))));
-        live || listening || self.closing.iter().any(|cl| same(cl.handle)) || self.lingering.iter().any(|l| l.tuple == Some((local, remote)))
+        let socks = || self.chans.iter().flatten().filter(|c| c.owner == owner).flat_map(|c| c.socks.values());
+        let live = socks().any(|s| matches!(&s.proto, Proto::Tcp(t) if t.backlog.is_none() && same(t.handle)));
+        let listening = socks().any(|s| matches!(&s.proto, Proto::Tcp(Tcp { backlog: Some(set), .. }) if set.iter().any(|&h| same(h))));
+        let closing = self.closing.iter().any(|cl| cl.owner == owner && same(cl.handle));
+        let lingering = self.lingering.iter().any(|l| l.holder.owner == owner && l.tuple == Some((local, remote)));
+        live || listening || closing || lingering
     }
 
     /// Whether socket `sock` of channel `c` may claim `port` on `addr`
@@ -992,16 +1048,31 @@ impl Service {
     }
 
     /// A free ephemeral port: held by no TCP socket, or bound by no UDP one.
+    /// RFC 6056's first algorithm: a random start, then the next free one,
+    /// so that nobody on the network (or another instance) can guess the
+    /// ports a host's connections will use.
     fn ephemeral(&mut self, tcp: bool, sockets: &SocketSet<'static>) -> Result<u16, i64> {
         let held: alloc::collections::BTreeSet<u16> = self.holders(tcp, sockets, None).iter().map(|h| h.port).collect();
-        for _ in 0..=(u16::MAX - FIRST_EPHEMERAL) {
-            let port = self.next_port;
-            self.next_port = if port == u16::MAX { FIRST_EPHEMERAL } else { port + 1 };
+        let range = (u16::MAX - FIRST_EPHEMERAL) as u64 + 1;
+        let start = (self.random() % range) as u16;
+        for k in 0..range as u16 {
+            let port = FIRST_EPHEMERAL + start.wrapping_add(k) % range as u16;
             if !held.contains(&port) {
                 return Ok(port);
             }
         }
         Err(EADDRINUSE)
+    }
+
+    /// A random number: xorshift64* over a state that the time stamp
+    /// counter stirs at every draw (netd has no other source of entropy).
+    fn random(&mut self) -> u64 {
+        let mut x = self.rng ^ unsafe { core::arch::x86_64::_rdtsc() }.rotate_left(29);
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.rng = x;
+        x.wrapping_mul(0x2545_f491_4f6c_dd1d)
     }
 
     fn bind(&mut self, c: usize, sock: u32, at: Endpoint, reuse: bool, sockets: &mut SocketSet<'static>) -> Reply {
@@ -1135,7 +1206,8 @@ impl Service {
                         let addr = l.addr.or_else(|| match remote.addr {
                             IpAddress::Ipv4(dst) => iface.get_source_address_ipv4(&dst).map(IpAddress::Ipv4),
                         });
-                        if addr.is_some_and(|a| self.tuple_in_use(IpEndpoint::new(a, l.port), remote, sockets)) {
+                        let owner = self.chan(c).owner;
+                        if addr.is_some_and(|a| self.tuple_in_use(owner, IpEndpoint::new(a, l.port), remote, sockets)) {
                             return Err(EADDRNOTAVAIL);
                         }
                         l
@@ -1348,8 +1420,29 @@ impl Service {
         }
     }
 
-    fn shutdown(&mut self, c: usize, sock: u32, how: u64) -> Reply {
+    fn shutdown(&mut self, c: usize, sock: u32, how: u64, sockets: &mut SocketSet<'static>) -> Reply {
         if let Proto::Tcp(t) = &mut self.sock(c, sock)?.proto {
+            if t.backlog.is_some() && how & netring::SHUT_RD != 0 {
+                // A listener stops listening (Linux's tcp_disconnect): the
+                // connections nobody accepted are reset, the backlog's
+                // sockets go, its own stays (bound) for a new listen.
+                let set = t.backlog.take().unwrap_or_default();
+                let own = t.handle;
+                let s = self.sock(c, sock)?;
+                s.state = 0;
+                s.backlog = 0;
+                for h in set {
+                    let socket = sockets.get_mut::<tcp::Socket>(h);
+                    socket.abort();
+                    if h != own {
+                        let owner = self.chan(c).owner;
+                        // (Its reset goes out before it goes.)
+                        self.closing.push(Closing { handle: h, leftover: None, sent: 0, local: None, reuse: true, owner, orphan: false, mark: (tcp::State::Closed, 0), since: crate::now() });
+                    }
+                }
+                self.show(c, sock);
+                return done(0);
+            }
             if !t.established && t.connecting.is_none() {
                 return Err(ENOTCONN);
             }
@@ -1554,11 +1647,23 @@ impl Service {
             for (&i, s) in chan.socks.iter_mut() {
                 let ctl = chan.area.ctl(i as usize).expect("an index below MAX_SOCKETS");
                 let rings = Self::rings(&chan.grants, s.area);
-                match pump_one(s, ctl, rings, sockets, &round, &mut wants) {
+                // An area whose grant netd let go of (it was revoked): as
+                // broken as a failed copy.
+                let pumped = if s.area.is_some() && rings.is_none() { Err(()) } else { pump_one(s, ctl, rings, sockets, &round, &mut wants) };
+                match pumped {
                     Ok(moved) => progress |= moved,
                     Err(()) => {
                         // The client broke the protocol or took the grant
-                        // away: the socket is reset and reports EIO.
+                        // away: the socket is reset and reports EIO. A
+                        // grant that went is let go of here too (its
+                        // mapping no longer holds memory).
+                        if let Some(g) = s.area.and_then(|a| chan.grants.get(&a.grant).map(|g| (a.grant, *g))) {
+                            let mut probe = 0u8;
+                            if !unsafe { oxrt::copy::copy(&mut probe, g.1.addr, 1) } {
+                                chan.grants.remove(&g.0);
+                                let _ = oxrt::munmap(g.1.addr, g.1.bytes as usize);
+                            }
+                        }
                         if let Proto::Tcp(t) = &mut s.proto {
                             sockets.get_mut::<tcp::Socket>(t.handle).abort();
                             t.established = true;
@@ -1612,25 +1717,34 @@ impl Service {
     /// opens with the next segment). One the budget has no room for is
     /// refused with a reset (its socket listens again once the reset went).
     pub fn arrivals(&mut self, sockets: &mut SocketSet<'static>) {
-        let Service { chans, mem, bytes, .. } = self;
-        let slots = || chans.iter().flatten().flat_map(|c| c.socks.values()).filter_map(|s| match &s.proto {
-            Proto::Tcp(Tcp { backlog: Some(set), .. }) => Some(set.iter().copied()),
+        let Service { chans, mem, bytes, half_open, half_open_budget, .. } = self;
+        // Connections that are no longer half-open give their place back.
+        half_open.retain(|&h, &mut owner| {
+            let still = sockets.get::<tcp::Socket>(h).state() == tcp::State::SynReceived;
+            if !still {
+                half_open_budget.uncharge(owner, 1);
+            }
+            still
+        });
+        let slots = || chans.iter().flatten().flat_map(|c| c.socks.values().map(move |s| (c.owner, s))).filter_map(|(owner, s)| match &s.proto {
+            Proto::Tcp(Tcp { backlog: Some(set), .. }) => Some(set.iter().map(move |&h| (owner, h))),
             _ => None,
         });
-        let half_open = |h: SocketHandle| {
-            let sk = sockets.get::<tcp::Socket>(h);
-            sk.state() == tcp::State::SynReceived && sk.recv_capacity() > 0
-        };
-        let mut open = slots().flatten().filter(|&h| half_open(h)).count();
-        for h in slots().flatten() {
+        for (owner, h) in slots().flatten() {
             let sk = sockets.get::<tcp::Socket>(h);
             match sk.state() {
                 tcp::State::Listen | tcp::State::Closed => {}
                 tcp::State::SynReceived if sk.recv_capacity() == 0 => {
-                    let ok = open < MAX_HALF_OPEN && resize(mem, bytes, h, Way::Rx, TCP_MIN, sockets);
-                    if ok {
-                        open += 1;
+                    // A place among the half-open connections, within the
+                    // listener's instance's share (a flood against one
+                    // instance's listener leaves the others theirs).
+                    let ok = half_open_budget.charge(owner, 1).is_ok();
+                    if ok && resize(mem, bytes, h, Way::Rx, TCP_MIN, sockets) {
+                        half_open.insert(h, owner);
                     } else {
+                        if ok {
+                            half_open_budget.uncharge(owner, 1);
+                        }
                         sockets.get_mut::<tcp::Socket>(h).abort();
                     }
                 }
@@ -1964,7 +2078,10 @@ fn pump_one(s: &mut Sock, ctl: &Ctl, rings: Option<Rings>, sockets: &mut SocketS
                     ctl.netd.rx_wait.store(0, SeqCst);
                 }
             }
-            *st_bits = state::SEND_OPEN | if socket.can_send() { state::WRITABLE } else { 0 };
+            // WRITABLE: the largest datagram fits (smoltcp keeps each
+            // contiguous: only an empty buffer is sure to take it), so a send
+            // that found no room waits for WRITABLE, never spins.
+            *st_bits = state::SEND_OPEN | if socket.can_send() && socket.send_queue() == 0 { state::WRITABLE } else { 0 };
             Ok(moved)
         }
         Proto::Raw { handle, peer, .. } => {
@@ -2019,7 +2136,10 @@ fn pump_one(s: &mut Sock, ctl: &Ctl, rings: Option<Rings>, sockets: &mut SocketS
                     ctl.netd.rx_wait.store(0, SeqCst);
                 }
             }
-            *st_bits = state::SEND_OPEN | if socket.can_send() { state::WRITABLE } else { 0 };
+            // WRITABLE: the largest datagram fits (smoltcp keeps each
+            // contiguous: only an empty buffer is sure to take it), so a send
+            // that found no room waits for WRITABLE, never spins.
+            *st_bits = state::SEND_OPEN | if socket.can_send() && socket.send_queue() == 0 { state::WRITABLE } else { 0 };
             Ok(moved)
         }
     }
@@ -2097,17 +2217,24 @@ fn place_record(tail: &mut u32, wait: &mut bool, ctl: &Ctl, r: &Rings, len: u32,
     if span > r.size as u64 {
         return Ok(Placed::Never);
     }
-    let head = ctl.client.rx_head.load(SeqCst);
-    let room = r.size - fill(head, *tail, r.size).ok_or(())?;
-    if (room as u64) < span {
-        if !*wait {
-            *wait = true;
-            ctl.netd.rx_wait.store(1, SeqCst);
-            // Room made meanwhile: go on (the client may not ring).
-            if ctl.client.rx_head.load(SeqCst) != head {
-                *wait = false;
-                return place_record(tail, wait, ctl, r, len, from, data);
-            }
+    // Looked at twice at most: again only if room was made while netd
+    // announced its wait (the client may not ring then).
+    let mut announced = false;
+    loop {
+        let head = ctl.client.rx_head.load(SeqCst);
+        let room = r.size - fill(head, *tail, r.size).ok_or(())?;
+        if room as u64 >= span {
+            break;
+        }
+        if *wait && !announced {
+            // Announced in an earlier round.
+            return Ok(Placed::NoRoom);
+        }
+        *wait = true;
+        ctl.netd.rx_wait.store(1, SeqCst);
+        if !announced && ctl.client.rx_head.load(SeqCst) != head {
+            announced = true;
+            continue;
         }
         return Ok(Placed::NoRoom);
     }

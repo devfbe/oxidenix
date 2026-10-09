@@ -62,6 +62,36 @@ Alternatives considered:
   connections stay small and idle ones give their buffers back, so an idle connection costs
   little, as on Linux.
 
+## Threat model: instances sharing netd
+
+The instances (process trees, each with its own Linux server) share one netd, one address and
+one port space, like containers in one Linux network namespace. netd assumes any instance's
+server may be hostile (it can send any descriptor, publish any position, revoke grants at any
+time) and so may anything on the network.
+
+- **Isolation.** A channel names only its own sockets; the instance comes from the kernel's
+  offer, which no client can forge; every budget charge, port claim, 4-tuple check and ICMP
+  delivery is keyed by it.
+- **What an instance learns of another**, kept to what one IP address makes unavoidable: that
+  a port is in use (`EADDRINUSE` at bind, as on Linux; ports are never shared across
+  instances, so the 4-tuple check of a connect only ever looks at the instance's own
+  connections and cannot reveal whom another one talks to); nothing of other instances'
+  peers, sequence numbers, buffers or traffic. Ephemeral ports are random (RFC 6056),
+  so their choice reveals neither another instance's activity nor what comes next. ICMP
+  echo identifiers are netd's on the wire (`netring::EchoIds`): an instance gets the replies
+  to its own requests only, whatever identifier it picks, and the errors about its own ports.
+- **What an instance can deny another**: nothing below a reserve. Every shared resource
+  (buffer memory, smoltcp sockets, orphans, TIME-WAIT records, half-open connections) is a
+  `netring::Budget` with a cap per instance and a reserve kept for every instance with a
+  channel; channels are capped per instance and an idle one gives its slot up; the
+  ephemeral range is wider than what one instance can hold (its sockets and its share of
+  TIME-WAIT records). A flood from the network against one instance's listener spends that
+  instance's share of half-open connections.
+- **From the network**: every packet netd parses itself (ICMP for routing) is length-checked
+  (tested over truncations and changed bytes on the host); SYNs cost a 4 KiB buffer until the
+  handshake completes; closed connections that stop making progress are reset; the queues to
+  the card and the loopback push back instead of growing.
+
 ## Consequences
 
 - One copy per direction in the server and one in netd (rings ↔ smoltcp), beside smoltcp's
