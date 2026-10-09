@@ -804,43 +804,35 @@ impl AddressSpace {
     /// Moves the page table entries of [from, from+len) to `to`.
     fn move_pages(&mut self, from: u64, to: u64, len: u64) {
         let l4 = self.l4;
-        let mut lost_charged = 0;
-        // Pages that could not be mapped at the target: their frames go
-        // back only after the shootdown of their old addresses (another CPU
-        // may still write through a cached entry).
-        let mut lost: alloc::vec::Vec<(u64, PhysFrame)> = alloc::vec::Vec::new();
+        let mut lost = false;
         let mut mapper = self.mapper();
         let parent = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+        // (Nothing here may allocate from the heap: the frame allocator's
+        // lock is held, and a growing heap takes it.)
         memory::with_frames(|frames| {
             for_each_leaf(l4, from, from + len, |va, e| {
                 let (frame, flags) = (PhysFrame::containing_address(e.addr()), e.flags());
-                e.set_unused();
                 let page = Page::<Size4KiB>::containing_address(VirtAddr::new(to + (va - from)));
                 let mut user = UserFrames(frames);
-                // The target range was unmapped, so this cannot collide;
-                // without a frame for a page table the page goes, and with
-                // it its reference and its own commit.
+                // The target range was unmapped, so this cannot collide. A
+                // page that cannot be mapped there (no frame for a page
+                // table) keeps its old entry for now.
                 match unsafe { mapper.map_to_with_table_flags(page, frame, flags, parent, &mut user) } {
-                    Ok(f) => f.ignore(),
-                    Err(_) => {
-                        lost_charged += flags.contains(CHARGED) as u64;
-                        // (Without room to remember it, the frame is
-                        // leaked rather than freed early.)
-                        if lost.try_reserve(1).is_ok() {
-                            lost.push((va, frame));
-                        }
+                    Ok(f) => {
+                        f.ignore();
+                        e.set_unused();
                     }
+                    Err(_) => lost = true,
                 }
             });
         });
         self.sync_views(to..to + len);
         tlb::shootdown(&self.tlb, from, from + len);
-        let mut gather = Gather::new(&self.tlb);
-        for (va, frame) in lost {
-            gather.add(va, frame);
+        // The pages that could not move go as munmap's do: frames after the
+        // shootdown, with their commit and their count.
+        if lost {
+            self.clear_pages(from, from + len);
         }
-        gather.finish();
-        memory::uncommit(lost_charged);
     }
 
     // ----------------------------------------------------------- faults
