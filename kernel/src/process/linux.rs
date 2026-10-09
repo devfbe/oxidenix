@@ -1263,9 +1263,11 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             Ok(0)
         }
         SYS_KFD_INSTALL => {
-            use crate::fs::file::{OpenFile, ServerFile, Kind, O_ACCMODE, O_APPEND, O_CLOEXEC, O_NONBLOCK};
+            use crate::fs::file::{OpenFile, ServerFile, Kind, O_ACCMODE, O_APPEND, O_CLOEXEC, O_DIRECTORY, O_NOFOLLOW, O_NONBLOCK, O_PATH};
             let (id, flags, ready, kind) = (a[0], a[1] as u32, a[2] as i16, a[3]);
-            if id == 0 || flags & !(O_ACCMODE | O_NONBLOCK | O_APPEND | O_CLOEXEC) != 0 || kind & !KFD_ALWAYS_READY != 0 {
+            // An O_PATH descriptor keeps what Linux's does (F_GETFL shows it).
+            let allowed = if flags & O_PATH != 0 { O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC } else { O_ACCMODE | O_NONBLOCK | O_APPEND | O_CLOEXEC };
+            if id == 0 || flags & !allowed != 0 || kind & !KFD_ALWAYS_READY != 0 {
                 return Err(EINVAL);
             }
             let owner: alloc::sync::Weak<dyn crate::fs::file::ServerFiles> = Arc::downgrade(&instance) as _;

@@ -345,7 +345,10 @@ pub const TEST_USERCOPY: u64 = 1511;
 /// poll readiness `ready`; `kind` `KFD_ALWAYS_READY` for a file that is
 /// always ready (a regular file or a directory: epoll refuses it with
 /// EPERM, as Linux does), else 0. When its last descriptor goes,
-/// `EVENT_CLOSED`.
+/// `EVENT_CLOSED`. With O_PATH (and only O_DIRECTORY, O_NOFOLLOW, O_CLOEXEC
+/// besides) the descriptor only names a node: F_GETFL shows those flags, and
+/// the kernel takes it only for dup, close and fcntl's F_DUPFD, F_GETFD,
+/// F_SETFD and F_GETFL (poll: POLLNVAL; select, epoll, ioctl, F_SETFL: EBADF).
 pub const SYS_KFD_INSTALL: u64 = 1034;
 pub const KFD_ALWAYS_READY: u64 = 1;
 /// `kfd_lookup(fd, flags) -> id`: the server's file behind descriptor
@@ -750,10 +753,13 @@ pub const SIGNAL_PGRP: u64 = 1;
 pub const SIGNAL_LEADER: u64 = 2;
 /// `signal_state(sig) -> bits`: `SIGNAL_IGNORED` if the calling process
 /// ignores `sig` (SIG_IGN), `SIGNAL_BLOCKED` if the calling thread blocks it
-/// (SIGTTIN and SIGTTOU of background reads and writes).
+/// (SIGTTIN and SIGTTOU of background reads and writes). `signal_state(0)`:
+/// `SIGNAL_PENDING` if a signal (or a stop) waits for the calling thread (a
+/// long call returns what it did, Linux's signal_pending).
 pub const SYS_SIGNAL_STATE: u64 = 1115;
 pub const SIGNAL_IGNORED: u64 = 1;
 pub const SIGNAL_BLOCKED: u64 = 2;
+pub const SIGNAL_PENDING: u64 = 4;
 
 /// `(scenario)`: the server runs a channel scenario against the test
 /// service (servers/ringtest, `ring::selftest`): 1 rings and doorbells, 2
