@@ -1930,7 +1930,7 @@ impl Service {
         let mut progress = false;
         let mut done = Vec::new();
         let now = crate::now();
-        let Service { closing, mem, bytes, orphans, .. } = self;
+        let Service { closing, mem, bytes, orphans, socks, .. } = self;
         closing.retain_mut(|cl| {
             let socket = sockets.get_mut::<tcp::Socket>(cl.handle);
             let st = socket.state();
@@ -1955,7 +1955,11 @@ impl Service {
                 // would keep it forever. It goes after `TIME_WAIT_MAX` in
                 // all, silently (out of smoltcp: nothing more is sent).
                 let since = *cl.time_wait.get_or_insert(now);
-                if now >= since + TIME_WAIT_MAX {
+                // An instance with no room for another socket skips
+                // TIME-WAIT (closed at once, as Linux beyond
+                // tcp_max_tw_buckets): TIME-WAIT never keeps it from
+                // opening connections.
+                if now >= since + TIME_WAIT_MAX || socks.room(cl.owner) == 0 {
                     done.push(cl.handle);
                     progress = true;
                     return false;
