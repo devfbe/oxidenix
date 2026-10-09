@@ -71,25 +71,28 @@ module comment, and the public types it defines. Where to start for common tasks
 ## Linux server
 
 - `servers/linux/src/chantest.rs` (309) `TEST_CHANNEL`: the client's side of channels to the test service (servers/ringtest, protocol `ring::selftest`), as the page cache will use them with diskfs: create, connect, grant, move descriptors through the rings...
-- `servers/linux/src/datafile.rs` (273) Open files of /data (phase R6c.3): a placeholder in the kernel's descriptor table names one (an open file description: offset, the directory cursor, write access, O_DIRECT and O_SYNC); the calls on it are the... Types: `DataOpen`.
-- `servers/linux/src/datafs.rs` (1114) /data in the server (phase R6c.3, I/O rings step 4): diskfs's ext2 filesystem through the file protocol (`fsring`, over `fsclient`'s channel), with the server's own page cache. Types: `DInode`, `New`, `HoldKind`.
+- `servers/linux/src/datafile.rs` (277) Open files of /data (phase R6c.3): a placeholder in the kernel's descriptor table names one (an open file description: offset, the directory cursor, write access, O_DIRECT and O_SYNC); the calls on it are the... Types: `DataOpen`.
+- `servers/linux/src/datafs.rs` (1117) /data in the server (phase R6c.3, I/O rings step 4): diskfs's ext2 filesystem through the file protocol (`fsring`, over `fsclient`'s channel), with the server's own page cache. Types: `DInode`, `New`, `HoldKind`.
 - `servers/linux/src/disktest.rs` (530) `TEST_DISKRING`: the client's side of the file protocol (`fsring`) against diskfs, as the page cache will use it in step 4: a channel to diskfs, grants of memory objects, files on /data read and written by DMA into...
 - `servers/linux/src/eventfd.rs` (98) eventfd (phase R6b): a counter that reads take and writes add to, a file of the server with a placeholder in the kernel's descriptor table. Types: `EventFd`.
-- `servers/linux/src/files.rs` (334) The server's files (phase R6): objects the server implements, each named in the kernel's descriptor table by a placeholder (see `restricted::SYS_KFD_INSTALL`). Types: `File`.
+- `servers/linux/src/files.rs` (348) The server's files (phase R6): objects the server implements, each named in the kernel's descriptor table by a placeholder (see `restricted::SYS_KFD_INSTALL`). Types: `File`.
 - `servers/linux/src/fsclient.rs` (410) The server's end of the file protocol (`fsring`, docs/design/io-rings.md) to diskfs: one channel for the instance, shared by every thread of the tree's processes and by the pager thread. Types: `Ticket`, `Client`, `Scratch`, `Next`.
 - `servers/linux/src/heap.rs` (60) The server's heap: one allocator for every thread of the instance, in the shared region, growing by `SYS_SHARED_MAP` when it runs out. Types: `ServerHeap`.
 - `servers/linux/src/initramfs.rs` (65) The instance's root tmpfs from the boot image's initramfs (phase R6c.2c): the server reads the archive's headers and names from the kernel's image object (`SYS_INITRAMFS`) and makes each regular file a file object...
-- `servers/linux/src/main.rs` (279) The Linux server (docs/design/linux-server.md).
+- `servers/linux/src/main.rs` (285) The Linux server (docs/design/linux-server.md).
 - `servers/linux/src/mm.rs` (150) Memory system calls (phase R4): Linux's semantics of mmap, munmap, mprotect, mremap, madvise, msync and the mlock family, over the kernel's mapping calls.
 - `servers/linux/src/namespace.rs` (244) The server's namespace (phase R6c.2): mounts and path resolution. Types: `KInode`, `Node`, `Resolved`.
 - `servers/linux/src/paths.rs` (347) The system calls that take a path (phase R6c.2b), and the working directory and umask, which live in the caller's record (`records`).
 - `servers/linux/src/pipe.rs` (236) Pipes (phase R6a): a 64 KiB buffer shared by a read end and a write end, each a file of the server with a placeholder in the kernel's descriptor table. Types: `Dst`, `Src`, `Shared`, `PipeEnd`.
 - `servers/linux/src/records.rs` (75) Records per working-directory context: the cwd and umask of the processes that share them (phase R6c). Types: `FsState`, `FsContext`.
 - `servers/linux/src/sched.rs` (36) Scheduling policy: sched_getscheduler and sched_getparam.
+- `servers/linux/src/scm.rs` (124) Descriptors in flight (SCM_RIGHTS over AF_UNIX sockets, phase R7a): a descriptor a message carries is a handle on its open file description (`SYS_KFILE_OBJECT`), whatever the file is (one of the kernel's, or a... Types: `Passed`.
+- `servers/linux/src/sockcalls.rs` (694) The system calls of AF_UNIX sockets (phase R7a): socket and socketpair for the AF_UNIX family (the others pass through to the kernel), and every call on a descriptor of one of the server's sockets: addresses...
 - `servers/linux/src/sync.rs` (131) A mutex for the server's data, shared by every thread of the instance (all the tree's processes run the server in the same shared region). Types: `Mutex`, `MutexGuard`, `RwLock`, `ReadGuard`, `WriteGuard`.
 - `servers/linux/src/time.rs` (102) Clocks and sleeping (phase R5): clock_gettime, clock_getres, gettimeofday, time, nanosleep, clock_nanosleep and sched_yield, over the kernel's clock and deadline sleep.
-- `servers/linux/src/tmpfile.rs` (239) Open files of the server's tmpfs (phase R6c.2c): a placeholder in the kernel's descriptor table names one (an open file description: offset, directory snapshot, write access); the calls on it are the server's. Types: `TmpOpen`.
-- `servers/linux/src/tmpfs.rs` (380) The server's tmpfs (phase R6c.2c): directories, files and symlinks in the server's memory; a file's contents are a file object of the kernel's (`SYS_MO_CREATE_FILE`), read, written and mapped without the kernel's... Types: `Object`, `Kind`, `State`, `Inode`.
+- `servers/linux/src/tmpfile.rs` (243) Open files of the server's tmpfs (phase R6c.2c): a placeholder in the kernel's descriptor table names one (an open file description: offset, directory snapshot, write access); the calls on it are the server's. Types: `TmpOpen`.
+- `servers/linux/src/tmpfs.rs` (390) The server's tmpfs (phase R6c.2c): directories, files, symlinks and socket inodes (AF_UNIX names, `unix`) in the server's memory; a file's contents are a file object of the kernel's (`SYS_MO_CREATE_FILE`), read,... Types: `Object`, `Kind`, `State`, `Inode`.
+- `servers/linux/src/unix.rs` (1134) AF_UNIX sockets (phase R7a): stream, datagram and sequenced-packet sockets of the server, each a file with a placeholder in the kernel's descriptor table, as pipes are. Types: `Cred`, `Name`, `Key`, `Msg`, `Sock`, `Received`, `Fds`, `Sink`, `Source`, `Busy`.
 - `servers/linux/src/usercopy.rs` (73) Copies between the server's memory and the program's (which the server sees in its view of the address space).
 
 ## Other servers
@@ -125,7 +128,7 @@ module comment, and the public types it defines. Where to start for common tasks
 - `crates/slab/src/lib.rs` (58) Size classes for small allocations: objects of up to 2 KiB come from slabs (4 KiB, aligned to 4 KiB) cut into equal slots, and a class's free slots form an intrusive list, so allocating and freeing one is O(1). Types: `FreeList`.
 - `crates/slab/tests/classes.rs` (95) Size classes and free lists of the slab allocator.
 - `crates/vfs/src/cpio.rs` (80) The initramfs: a cpio archive in "newc" format. Types: `Header`, `Entry`, `Entries`.
-- `crates/vfs/src/lib.rs` (10) The pure parts of the Linux server's namespace (docs/design/linux-server.md, R6c): path arithmetic, the initramfs format and where reads and writes go.
+- `crates/vfs/src/lib.rs` (11) The pure parts of the Linux server's namespace (docs/design/linux-server.md, R6c): path arithmetic, the initramfs format and where reads and writes go.
 - `crates/vfs/src/path.rs` (28) Path arithmetic.
 - `crates/vfs/src/rw.rs` (30) Where a read or write goes: the file position or an offset, and whether a write appends. Types: `Plan`.
 - `crates/vfs/tests/cpio.rs` (64) Parsing newc cpio archives (the initramfs format).
@@ -165,6 +168,7 @@ module comment, and the public types it defines. Where to start for common tasks
 - `userspace/threadtest.c` (336) Threads: pthreads on clone/futex, shared memory and descriptors, TLS, thread and process signals, group exit, fork and exec from threads, vfork and posix_spawn, and TLB coherence (munmap and mprotect while another...
 - `userspace/timertest.c` (157) High-resolution timers: sleeps and timeouts end when they are due, not at the next 10 ms timer tick, and never early.
 - `userspace/timetest.c` (173) Clocks: nanosecond resolution, monotonic across CPUs, the CPU-time clocks of threads and processes, wall-clock time and its setting, and the accounting behind getrusage and times.
+- `userspace/unixtest.c` (483) AF_UNIX sockets (the Linux server's, phase R7a): stream, datagram and seqpacket socket pairs, names in the filesystem (tmpfs and /data) and in the abstract namespace, descriptors passed between processes (SCM_RIGHTS,...
 - `userspace/vmtest.c` (257) Virtual memory: demand paging, protection, remapping, sharing, stacks, commit accounting, and the patterns JIT compilers rely on.
 - `userspace/writebacktest.c` (116) Write-back of shared writable mappings of disk files: stores make pages dirty (Dirty: in /proc/meminfo), msync, fsync and the flusher write them (Dirty: back to 0), also after the mapping is gone; they survive...
 

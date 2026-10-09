@@ -51,8 +51,9 @@ Its [commit history](#development-history) records every step.
   BusyBox 1.37 (~400 applets: `ls`, `cat`, `grep`, `sed`, `dd`, `vi`, ...) and its own C test
   programs, all unmodified. **Node.js 24** (a static musl build, opt-in on the data disk, see
   [Build and run](#build-and-run)) runs scripts with V8's JIT, timers, files, worker threads,
-  HTTP over loopback, DNS and WebAssembly; child processes with pipes do not work yet (no
-  Unix domain sockets).
+  HTTP over loopback, DNS and WebAssembly, child processes (`spawn`, `exec`, `execSync`,
+  `fork` with its IPC channel, also passing sockets and servers to the child) and `net`
+  servers and clients on Unix paths.
 - **Interactive shell** with line editing, history (arrow keys), tab completion, colors, pipes,
   redirections, subshells, command substitution and arithmetic.
 - **Symmetric multiprocessing**: all CPUs (QEMU runs with 4) execute user programs and the
@@ -144,7 +145,8 @@ Normal runs and CI never build or need Node.
 QEMU (1 = 0, 3 = otherwise). For trying a program, for example
 `OXIDENIX_NODE=1 OXIDENIX_AUTORUN=run-node.sh cargo run > serial.log` with
 `/data/bin/node -e 'console.log(1+1)'` in `run-node.sh`; the kernel logs the calls it does not
-implement ("syscall N not implemented").
+implement ("syscall N not implemented"). `/data/bin/node /etc/node-sockets.js` checks child
+processes and Unix sockets (`userspace/rootfs/etc/node-sockets.js`).
 
 `scripts/bench.sh` runs the I/O benchmarks (`iobench`) on a fresh disk and records the results
 with the commit in `docs/benchmarks/` (see its README); `/proc/counters` counts system calls, IPC
@@ -243,7 +245,7 @@ oxidenix/
 │       ├── timer.rs             per-CPU timer queues on the local APIC timer
 │       └── shell/               built-in kernel monitor (fallback shell)
 ├── servers/
-│   ├── linux/                   the Linux server (restricted mode; memory, time, pipes, eventfd, paths, tmpfs)
+│   ├── linux/                   the Linux server (restricted mode; memory, time, pipes, eventfd, paths, tmpfs, /data, AF_UNIX)
 │   ├── diskfs/                  user-space ext2 server with its virtio-blk driver (blk.rs)
 │   ├── procfs/                  /proc and /sys from the kernel's process information
 │   │                            (main.rs: tree and inodes, render.rs: Linux formats)
@@ -551,7 +553,8 @@ call into a device:
 The kernel is moving its Linux implementation out into a user-space **Linux server**
 (`servers/linux`; `docs/design/linux-server.md`, ADRs 0001-0004 in `docs/decisions/`). Phase
 R1 put the mechanism in place, with every system call passed through; the phases since have
-moved memory, time, pipes, eventfd, paths and the root tmpfs into the server.
+moved memory, time, pipes, eventfd, paths, the root tmpfs, `/data` and `AF_UNIX` sockets into
+the server.
 
 - Each process tree started by the kernel (`/init`, the monitor's `run`) gets an **instance**
   of the server: the server's program and, per thread, a stack and the page with the program's
@@ -629,6 +632,22 @@ moved memory, time, pipes, eventfd, paths and the root tmpfs into the server.
   `sendfile` with a pipe at either end runs in the server (`kfd_read`/`kfd_write` for the
   kernel's file at the other end). As the kernel's pipes did, a write without readers fails
   with `EPIPE` but raises no `SIGPIPE`. `eventfd` followed (R6b), on the same footing.
+- **`AF_UNIX` sockets are the server's** (phase R7a, `unix.rs`, `sockcalls.rs`, `scm.rs`):
+  `socket` and `socketpair` for the family come to the server (other families pass through to
+  the kernel and netd), and so does every socket call on one of its sockets' descriptors.
+  Stream, datagram and seqpacket sockets, socket pairs, names as socket inodes of the tmpfs
+  and of `/data` and in the instance's abstract namespace (autobind too), `listen` with its
+  backlog, `accept4`, `connect`, `sendmsg`/`recvmsg` and their relatives (`sendmmsg`,
+  `recvmmsg`), `shutdown`, `getsockname`/`getpeername`, the options of `SOL_SOCKET`
+  (`SO_SNDBUF` with Linux's accounting, `SO_PASSCRED`, `SO_PEERCRED`, timeouts, ...),
+  `FIONREAD`; `EPIPE` raises `SIGPIPE` (`signal_thread`, 1102) unless `MSG_NOSIGNAL`, a
+  closed end with unread data resets the connection, poll and epoll see Linux's readiness
+  (`POLLRDHUP` included). Descriptors pass between processes (`SCM_RIGHTS`) as handles on
+  their open file descriptions while in flight (`kfile_object`; the receiver's descriptor
+  from `kfd_install_file`, 1100, with `MSG_CMSG_CLOEXEC`), so they outlive the sender's
+  close, and any kind of file can be passed; sockets in flight that nothing but messages in
+  flight keeps (a cycle) are collected as Linux's `unix_gc` does (`kfile_info`, 1101).
+  `SCM_CREDENTIALS` carries the sender's ids (`thread_ids`, 1103).
 - **Paths are the server's** (phase R6c.2): the server keeps a record per working-directory
   context (cwd and umask; `fs_record`). The kernel's clone still decides who shares one
   (`CLONE_FS`): before a clone that makes a new context passes through, the server hands the
@@ -647,7 +666,7 @@ moved memory, time, pipes, eventfd, paths and the root tmpfs into the server.
   serves: `/dev`, `/proc` and `/sys` (the namespace finds mounts by name, the longest first);
   `/data` is the server's own (below). The kernel keeps its own view of the initramfs for what it starts itself (the
   servers, `/init`); a program a tree runs comes from the tree's tmpfs. Its directories
-  and symlinks live in the server; a file's contents are a **file object** of the kernel's
+  and symlinks (and socket inodes) live in the server; a file's contents are a **file object** of the kernel's
   (`mo_create_file`), a memory object that grows and shrinks like a file, charged to the same
   tmpfs limit, read and written straight into the program's memory (`mo_file_read`,
   `mo_file_write`) and mapped with `mo_map`. Open files are placeholders whose calls (`read`,
@@ -867,8 +886,9 @@ interrupt dispatch; drivers and filesystems move into user-space servers.
   at `10.0.2.100:7` (`guestfwd` to `cat` on the host).
 - **Restarts**: a crashed netd is started again by the next socket call (see self-healing). It
   gets the same DMA area, which it clears before handing it to the freshly reset card.
-- Not yet: IPv6, other raw protocols, `AF_UNIX`, and interface configuration from user space
-  (`ifconfig`).
+- Not yet: IPv6, other raw protocols and interface configuration from user space
+  (`ifconfig`). `AF_UNIX` sockets are the Linux server's (see "Restricted mode and the Linux
+  server").
 
 ### Persistent storage
 
@@ -1002,6 +1022,7 @@ Each of these programs and scripts lives in the root filesystem and runs inside 
 | `eventfdtest` | `eventfd` counting (initial value, adding writes, reset on read), `EFD_SEMAPHORE`, `EFD_NONBLOCK` and `EFD_CLOEXEC`, `EINVAL` for short reads, 2^64-1 and unknown flags, a full counter (`EAGAIN`, poll state), a blocking read woken by another process, `poll` waking within 1 ms of a write |
 | `sigmasktest` | temporary signal masks of `sigsuspend`, `ppoll` and `pselect`: a pending or arriving signal the mask lets through interrupts them and its handler runs with that mask, the caller's mask comes back afterwards, a successful `ppoll` leaves a blocked signal pending (`sigpending`), a mask that blocks a signal holds it off until the call returns, `EINVAL` for a wrong mask size |
 | `epolltest` | `epoll_create1`/`epoll_create` flags and sizes, `EPOLL_CTL_ADD`/`MOD`/`DEL` and their errors (`EEXIST`, `ENOENT`, `EPERM` for regular files, `EINVAL`, `EBADF`), level-triggered, edge-triggered and one-shot reporting, `EPOLLOUT` and `EPOLLERR` on a pipe's write end, interests removed with the file's last descriptor (not before), `maxevents` rotating through ready files, eventfds and UDP sockets in a set, nested instances (`ELOOP` for a loop and for chains longer than five, built at either end) and `poll` on an instance, wake-up within 1 ms of a write, timeouts, `EINTR` and `epoll_pwait`'s mask, `epoll_pwait2` |
+| `unixtest` | `AF_UNIX` sockets in the Linux server: stream pairs (`fstat` as a socket, `FIONREAD`, `MSG_PEEK`, reads across writes, names and peer names of a pair, `SO_TYPE`, `SO_DOMAIN`, `SO_PEERCRED`, `SO_SNDBUF` doubled, `EOPNOTSUPP` for other levels, `ESPIPE`), `shutdown(SHUT_WR)` (`POLLRDHUP`, the rest, end of file, `EPIPE` for the writer, the other direction still open), a closed peer (`POLLHUP`, end of file, `EPIPE` with `SIGPIPE`, none with `MSG_NOSIGNAL`, `ECONNRESET` after unread data); nonblocking (`SOCK_NONBLOCK`/`SOCK_CLOEXEC`, `EAGAIN`, edge-triggered `epoll` and new edges, a full send buffer without `POLLOUT` until drained, `EPOLLRDHUP`, `SO_RCVTIMEO`); datagram pairs (boundaries, empty datagrams, truncation with `MSG_TRUNC`) and seqpacket pairs (boundaries, the truncated rest gone, end of file); servers on a tmpfs path, a relative path, a `/data` path and an abstract name (`EADDRINUSE`, `ECONNREFUSED` before `listen`, `SO_ACCEPTCONN`, names given back, a pending connection polling readable, the client's and the listener's names and credentials on both ends, a full backlog's `EAGAIN`, pending clients reset when the listener closes), socket inodes (`S_ISSOCK`, `ENXIO` for `open`, kept after close), `ENOENT` and `ECONNREFUSED` for paths, autobind; named datagram sockets (`recvfrom`'s sender, `connect` and `AF_UNSPEC`, `ENOTCONN`, `EPROTOTYPE`, `ECONNREFUSED`); `SCM_RIGHTS` to a forked child (a pipe end and a file whose offset is shared, `MSG_CMSG_CLOEXEC`, the passed descriptors outliving the sender's close, `MSG_CTRUNC` dropping what does not fit, a socket passed back), `MSG_PEEK` installing copies, `EBADF`, a cycle of sockets in flight collected; `SO_PASSCRED` and `SCM_CREDENTIALS`, implicit and explicit |
 | `lxtest` | the Linux server's kernel interface through its test calls: a memory object it filled, mapped into the program, a program store read back by the server, write protection, unmapping, mappings refused at the server's region and unaligned; a paged object whose pages the pager thread supplies when the program reads them or the kernel copies from them (`write` from the mapping), each page once; `SIGKILL` ending a thread that waits for a page the pager never supplies; a page the pager fails raising `SIGBUS` and a later access getting it; the server's heap with 2000 blocks of many sizes and its mutex serializing six threads in two processes; `mmap`, `mprotect` and `munmap` handled by the server without a call passed through (`legacy_calls`), and `clock_gettime`, `gettimeofday` and `nanosleep` likewise; the server writing a page the program never touched, and `EFAULT` (not death) for read-only, `PROT_NONE` and unmapped program memory, for the server's own memory and across the 64 TiB line; pipe reads and writes without a call passed through, end of file after the writer closes, `FIONBIO`, `FIOCLEX` and `FIONCLEX` on a pipe (the kernel's descriptor flags), other ioctls `ENOTTY`; eventfd likewise, `EAGAIN` when empty and non-blocking; the server's records: a forked child's copy, a thread's shared one, released when processes end; path calls without a call passed through: `chdir`/`getcwd`, `umask` on a new file, `O_EXCL`, symlinks (`readlink`, `stat` vs. `lstat`, `O_NOFOLLOW`, a loop's `ELOOP`, a symlinked directory in a path), `openat` relative to a directory descriptor, `rename`, a child's own working directory, `fchdir`, `rmdir`, `O_CREAT` through a dangling symlink; `/tmp` as the server's tmpfs: its own device, reads, writes, `lseek` and `fstat` without a call passed through, `O_APPEND`, a shared mapping writing the file, `ftruncate`, `readdir`, `EXDEV` and `EBUSY` at the mounts, the root and `/bin/busybox` from the server's tmpfs, `/proc` and `/dev` the kernel's; channels to the test service `ringtest`: requests and completions through the rings with both ends sleeping on futex doorbells, a service's doorbell watch kept once when armed twice, never moved by a requeue, woken once and arriving as an `ipc_receive` event, connect errors (`EISCONN`, `ENOENT`, `EOPNOTSUPP`, `ENOTCONN`), grant data both ways, a read-only grant the service can neither `mprotect` writable or executable nor have the kernel store into, the kernel's grant bounds, device addresses only within a grant, `EBUSY` for truncating a granted page, `ENODATA` for an unsupplied paged page, a revoked grant gone from the service (its range reserved and inaccessible until the service unmaps it), a draining grant pinned with its id held until the service lets go, the client's end closing while the service sleeps (its grant mappings gone, pins released), the service dying of a store into a read-only grant while the client waits (the client wakes with `EPIPE`, the page unchanged, the service restarted for the next channel), the service executing a new program that can then neither map the grant nor get a device address of it; the file protocol against diskfs (`TEST_DISKRING`): the disk image's README read by DMA at unaligned offsets, stat, readdir with a cursor, statfs, a symlink; aligned, unaligned, one-sector and past-the-end writes, a flush, the file read back against a model, truncate, rename, permissions; malformed requests completing with `ENOSYS`, `EINVAL`, `EBADF`, `EACCES`, `ENOENT`, `ENAMETOOLONG`, `ENOTDIR`, `EEXIST`; 24 writes and 24 reads in flight; a grant revoked under diskfs (`EFAULT`, diskfs alive, `FORGET`); a client closing with reads in flight; a revoked grant's range given to no other grant; an unlinked inode freed only when no channel holds it; a write stalled behind another with every operation slot busy; requests waiting for completion room leaving diskfs idle (its CPU ticks in `/proc`) and completing once there is room; the ring's file read and removed through `/data` (the server's page cache, another channel); the page cache's kernel interface (`TEST_CACHED`): a failed fill past the end of a file leaving no trace once it grows, a write-back scan longer than one call going on where the kernel says, a truncation giving up (`EBUSY`) on a page pinned by a grant never let go of, a sync across instances (`sync_others`) |
 | `vmtest` | demand paging (a 64 MiB mapping costs nothing until touched), `SIGSEGV` on read-only and `PROT_NONE` pages with contents kept, split areas after a partial `munmap`, NX and the JIT pattern (1 GiB `PROT_NONE` reservation, write code, `mprotect` to executable, call it), commit limit and `MAP_NORESERVE` (also a 4 GiB reservation made writable and executable at once, as V8's code range, and forked counting only its touched pages, while the same without it is `ENOMEM`; 40 rounds of partial `munmap`, `MADV_DONTNEED`, `mremap`, `mprotect`, `fork` with copy-on-write on both sides and `exec` leave `Committed_AS` unchanged; a read-only area read in completely becomes writable with nothing left to commit), `mremap` in place and moving, `MADV_DONTNEED`, shared vs. private memory across `fork`, lazy file mappings and `SIGBUS` beyond the end, `MAP_FIXED_NOREPLACE`, stack growth to 4 MiB and overflow beyond 8 MiB, nothing mapped at or above 64 TiB (fixed mappings fail, hints and the stack stay below), the Linux server's memory out of the program's reach and its kernel calls `ENOSYS` for a program |
 | `smptest` | CPU count and affinity (pinning to every CPU, empty masks), the scheduling policy (`SCHED_OTHER`, priority 0, for the caller and another thread, `ESRCH`, `EINVAL`), parallel speed-up of CPU-bound processes, `fork`/`exit`/`wait` on every CPU at once, 5000 pipe round trips between two CPUs, signals to a process running on another CPU, timers on time while a program floods the console with palette changes on the same CPU |
@@ -1070,7 +1091,8 @@ watching each other multiplies the cost of each wakeup (with interrupts off).
 - [ ] Hard links
 - [x] Networking: TCP/UDP sockets, DNS, DHCP and loopback through a user-space server (`netd`)
 - [x] `ping` (raw ICMP sockets)
-- [ ] IPv6, `AF_UNIX`, `ifconfig`
+- [x] `AF_UNIX` sockets, with descriptor passing
+- [ ] IPv6, `ifconfig`
 - [x] SMP with fine-grained locking, per-CPU run queues and CPU affinity
 - [x] Threads: `clone`, `futex`, TLB shootdowns
 - [x] A TSC clock with nanosecond resolution and exact CPU time
@@ -1079,8 +1101,10 @@ watching each other multiplies the cost of each wakeup (with interrupts off).
 - [x] `epoll`
 - [x] A page cache with file-backed shared mappings (and programs mapped, not copied)
 - [x] Node.js: `node -e 'console.log(1+1)'`, files, timers, workers, HTTP, DNS, WebAssembly
-- [ ] Node.js: child processes with pipes (`AF_UNIX` socketpairs), `os.networkInterfaces()`
-  (netlink), `statx` and `io_uring` (libuv falls back to `stat` and epoll)
+- [x] Node.js: child processes with pipes (`AF_UNIX` socketpairs), `fork` and handle passing,
+  `net` on Unix paths
+- [ ] Node.js: `os.networkInterfaces()` (netlink), `statx` and `io_uring` (libuv falls back to
+  `stat` and epoll)
 - [ ] Dynamic linking, real entropy, users and permissions
 
 ## Development history
