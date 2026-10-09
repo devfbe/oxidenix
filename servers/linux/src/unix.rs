@@ -438,6 +438,46 @@ impl Source<'_> {
         }
     }
 
+    /// Copies up to `out.len()` bytes into `out` (the server's memory, an
+    /// internet socket's send ring), fewer at a fault (EFAULT if none could
+    /// be read).
+    pub fn read_into(&mut self, out: &mut [u8]) -> Result<usize, i64> {
+        match self {
+            Source::Server { buf, at } => {
+                let n = out.len().min(buf.len() - *at);
+                out[..n].copy_from_slice(&buf[*at..*at + n]);
+                *at += n;
+                Ok(n)
+            }
+            Source::Program { vecs, idx, off } => {
+                let mut done = 0;
+                while done < out.len() && *idx < vecs.len() {
+                    let (base, len) = vecs[*idx];
+                    if *off >= len {
+                        *idx += 1;
+                        *off = 0;
+                        continue;
+                    }
+                    let at = base.wrapping_add(*off);
+                    // A piece never crosses a page: a hole ends the copy
+                    // exactly where it begins.
+                    let k = ((len - *off) as usize).min(out.len() - done).min(4096 - (at % 4096) as usize);
+                    if usercopy::from_program(at, &mut out[done..done + k]).is_err() {
+                        if done == 0 {
+                            return Err(EFAULT);
+                        }
+                        // The rest is not there: what was read is all.
+                        *idx = vecs.len();
+                        break;
+                    }
+                    done += k;
+                    *off += k as u64;
+                }
+                Ok(done)
+            }
+        }
+    }
+
     /// Up to `n` bytes, fewer at a fault (EFAULT if none could be read).
     pub fn take(&mut self, n: usize) -> Result<Vec<u8>, i64> {
         let mut out = Vec::new();

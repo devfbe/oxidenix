@@ -21,6 +21,8 @@ mod files;
 mod fsclient;
 mod heap;
 mod ids;
+mod inet;
+mod inetcalls;
 mod initramfs;
 mod inotify;
 mod mm;
@@ -205,6 +207,9 @@ fn pager() -> ! {
                 continue;
             }
             EVENT_CLOSING => {
+                // What the instance's sockets still had to send reaches
+                // netd (their closes hand it over) before the instance goes.
+                netclient::settle();
                 datafs::closing();
                 continue;
             }

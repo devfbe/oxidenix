@@ -1,9 +1,11 @@
 //! The system calls of AF_UNIX sockets (phase R7a): socket and socketpair
-//! for the AF_UNIX family (the others pass through to the kernel), and
-//! every call on a descriptor of one of the server's sockets: addresses
-//! (sockaddr_un, paths in the server's namespace, the abstract namespace),
-//! message headers and their ancillary data (SCM_RIGHTS, SCM_CREDENTIALS),
-//! options, read and write. The sockets themselves are `unix`.
+//! for the AF_UNIX family, and every call on a descriptor of one of the
+//! server's AF_UNIX sockets: addresses (sockaddr_un, paths in the server's
+//! namespace, the abstract namespace), message headers and their ancillary
+//! data (SCM_RIGHTS, SCM_CREDENTIALS), options, read and write. The
+//! sockets themselves are `unix`. `handle` also routes the socket calls of
+//! the other families: internet sockets to `inetcalls` (R7b); no socket
+//! call reaches the kernel.
 
 use crate::files::{self, File, O_CLOEXEC, O_NONBLOCK, O_RDWR};
 use crate::namespace::{self, Node};
@@ -99,19 +101,34 @@ const SIOCOUTQ: u64 = 0x5411;
 
 const SOCKADDR_UN_MAX: u64 = 110;
 
-/// The result of a socket call in `s` the server handles: AF_UNIX's
-/// socket and socketpair, and the calls on its sockets' descriptors.
+/// The result of a socket call in `s`: every one is the server's (the
+/// kernel implements no sockets). socket(2) and socketpair(2) by family
+/// (netlink's are `files`', the families nobody implements EAFNOSUPPORT),
+/// the calls on a descriptor by the socket behind it (AF_UNIX here,
+/// internet sockets `inetcalls`, netlink `files`; ENOTSOCK for another
+/// file).
 pub fn handle(s: &State) -> Option<i64> {
+    const EAFNOSUPPORT: i64 = 97;
     let (a0, a1, a2, a3, a4, a5) = (s.rdi, s.rsi, s.rdx, s.r10, s.r8, s.r9);
     let result = match s.rax {
         SYS_SOCKET if a0 == AF_UNIX as u64 => socket(a1, a2),
+        SYS_SOCKET if a0 == crate::inetcalls::AF_INET as u64 => crate::inetcalls::socket(a1, a2),
+        SYS_SOCKET => Err(EAFNOSUPPORT),
         SYS_SOCKETPAIR if a0 == AF_UNIX as u64 => socketpair(a1, a2, a3),
+        // Internet sockets come in no pairs.
+        SYS_SOCKETPAIR if a0 == crate::inetcalls::AF_INET as u64 => Err(EOPNOTSUPP),
+        SYS_SOCKETPAIR => Err(EAFNOSUPPORT),
         SYS_CONNECT | SYS_ACCEPT | SYS_SENDTO | SYS_RECVFROM | SYS_SENDMSG | SYS_RECVMSG | SYS_SHUTDOWN | SYS_BIND | SYS_LISTEN
         | SYS_GETSOCKNAME | SYS_GETPEERNAME | SYS_SETSOCKOPT | SYS_GETSOCKOPT | SYS_ACCEPT4 | SYS_RECVMMSG | SYS_SENDMMSG => {
-            let (sock, flags) = match files::lookup(a0)? {
-                (File::Socket(sock), flags) => (sock, flags),
-                // Another of the server's files: not a socket.
-                _ => return Some(-crate::unix::ENOTSOCK),
+            let (sock, flags) = match files::lookup_checked(a0) {
+                Err(e) => return Some(-e),
+                Ok(Some((File::Socket(sock), flags))) => (sock, flags),
+                Ok(Some((File::Inet(sock), flags))) => {
+                    let r = crate::inetcalls::call(s.rax, &sock, flags, [a0, a1, a2, a3, a4, a5]);
+                    return Some(r.unwrap_or_else(|e| -e));
+                }
+                // Another file, of the server's or of the kernel's.
+                Ok(_) => return Some(-crate::unix::ENOTSOCK),
             };
             match s.rax {
                 SYS_CONNECT => connect(&sock, flags, a1, a2),
@@ -362,15 +379,15 @@ fn accept4(sock: &Arc<Sock>, flags: u32, addr: u64, len: u64, aflags: u64) -> Re
 /// A msghdr of the program's.
 #[derive(Clone, Copy, Default)]
 #[repr(C)]
-struct MsgHdr {
-    name: u64,
-    namelen: u32,
+pub struct MsgHdr {
+    pub name: u64,
+    pub namelen: u32,
     _pad: u32,
-    iov: u64,
-    iovlen: u64,
-    control: u64,
-    controllen: u64,
-    flags: i32,
+    pub iov: u64,
+    pub iovlen: u64,
+    pub control: u64,
+    pub controllen: u64,
+    pub flags: i32,
     _pad2: u32,
 }
 
@@ -476,11 +493,18 @@ fn sendmsg(sock: &Arc<Sock>, fflags: u32, msg: u64, flags: u64) -> Result<usize,
 }
 
 fn sendmmsg(sock: &Arc<Sock>, fflags: u32, vec: u64, vlen: u64, flags: u64) -> Result<i64, i64> {
+    sendmmsg_with(vec, vlen, flags, |at, f| sendmsg(sock, fflags, at, f))
+}
+
+/// sendmmsg(2) with `send(msghdr, flags)` for each message: how many went
+/// (an error only if the first failed); each one's length goes to its
+/// `msg_len`.
+pub fn sendmmsg_with(vec: u64, vlen: u64, flags: u64, mut send: impl FnMut(u64, u64) -> Result<usize, i64>) -> Result<i64, i64> {
     let vlen = vlen.min(1024);
     let mut sent = 0;
     while sent < vlen {
         let at = vec + sent * 64;
-        match sendmsg(sock, fflags, at, flags) {
+        match send(at, flags) {
             Ok(n) => usercopy::write(at + 56, &(n as u32))?,
             Err(e) if sent == 0 => return Err(e),
             Err(_) => break,
@@ -645,6 +669,13 @@ fn recvmsg(sock: &Arc<Sock>, fflags: u32, msg: u64, flags: u64) -> Result<usize,
 }
 
 fn recvmmsg(sock: &Arc<Sock>, fflags: u32, vec: u64, vlen: u64, flags: u64, timeout: u64) -> Result<i64, i64> {
+    recvmmsg_with(vec, vlen, flags, timeout, |at, f| recvmsg(sock, fflags, at, f))
+}
+
+/// recvmmsg(2) with `recv(msghdr, flags)` for each message: how many came
+/// (an error only if the first failed), MSG_WAITFORONE and the timeout as
+/// Linux has them.
+pub fn recvmmsg_with(vec: u64, vlen: u64, flags: u64, timeout: u64, mut recv: impl FnMut(u64, u64) -> Result<usize, i64>) -> Result<i64, i64> {
     let vlen = vlen.min(1024);
     let deadline = if timeout != 0 {
         let ts: [i64; 2] = usercopy::read(timeout)?;
@@ -660,7 +691,7 @@ fn recvmmsg(sock: &Arc<Sock>, fflags: u32, vec: u64, vlen: u64, flags: u64, time
     let mut flags = flags;
     while got < vlen {
         let at = vec + got * 64;
-        match recvmsg(sock, fflags, at, flags & !MSG_WAITFORONE) {
+        match recv(at, flags & !MSG_WAITFORONE) {
             Ok(n) => usercopy::write(at + 56, &(n as u32))?,
             Err(e) if got == 0 => return Err(e),
             Err(_) => break,
@@ -679,7 +710,7 @@ fn recvmmsg(sock: &Arc<Sock>, fflags: u32, vec: u64, vlen: u64, flags: u64, time
 
 // Options.
 
-fn opt_int(val: u64, len: u64) -> Result<i32, i64> {
+pub fn opt_int(val: u64, len: u64) -> Result<i32, i64> {
     if len < 4 {
         return Err(EINVAL);
     }
@@ -688,7 +719,7 @@ fn opt_int(val: u64, len: u64) -> Result<i32, i64> {
 
 /// A struct timeval (or __kernel_sock_timeval: the same on x86_64) as
 /// nanoseconds; 0 is none.
-fn opt_timeout(val: u64, len: u64) -> Result<u64, i64> {
+pub fn opt_timeout(val: u64, len: u64) -> Result<u64, i64> {
     if len < 16 {
         return Err(EINVAL);
     }

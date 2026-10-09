@@ -34,8 +34,8 @@ pub mod sys {
     pub const DMA_MAP: u64 = 1004;
     /// (op, argument, buffer, length) -> bytes of process/system information
     pub const PROC_QUERY: u64 = 1005;
-    /// (token): wakes whoever waits on the server's object `token`
-    pub const IPC_NOTIFY: u64 = 1006;
+    // 1006 was `ipc_notify` (netd's readiness announcements to the kernel's
+    // sockets, gone with them in R7b).
 
     // The service's end of a channel (docs/design/io-rings.md; the client's
     // calls are `restricted::SYS_CHAN_CREATE` and the following).
@@ -213,15 +213,6 @@ pub fn dma_map() -> Result<(*mut u8, u64), i64> {
     match syscall(sys::DMA_MAP, [&mut phys as *mut u64 as u64, 0, 0, 0, 0, 0]) {
         e if e < 0 => Err(e),
         addr => Ok((addr as *mut u8, phys)),
-    }
-}
-
-/// Tells the kernel that the object `token` of the calling server changed
-/// (netd: the readiness of the socket with that handle).
-pub fn ipc_notify(token: u64) -> Result<(), i64> {
-    match syscall(sys::IPC_NOTIFY, [token, 0, 0, 0, 0, 0]) {
-        0 => Ok(()),
-        e => Err(e),
     }
 }
 
@@ -404,7 +395,8 @@ macro_rules! println {
 
 #[global_allocator]
 static HEAP: LockedHeap = LockedHeap::empty();
-const HEAP_SIZE: usize = 4 * 1024 * 1024;
+/// The heap a server gets unless its `entry!` asks for another size.
+pub const HEAP_SIZE: usize = 4 * 1024 * 1024;
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
@@ -412,18 +404,19 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     exit(101)
 }
 
-/// Called by `entry!`: sets up the heap, collects argv and runs `main`.
+/// Called by `entry!`: sets up a heap of `heap_size` bytes (committed
+/// memory), collects argv and runs `main`.
 ///
 /// # Safety
 /// `sp` must be the initial stack pointer handed over by the kernel.
-pub unsafe fn start(sp: *const u64, main: fn(Vec<&'static str>) -> i32) -> ! {
+pub unsafe fn start(sp: *const u64, main: fn(Vec<&'static str>) -> i32, heap_size: usize) -> ! {
     const PROT_RW: u64 = 3;
     const MAP_PRIVATE_ANON: u64 = 0x22;
-    let heap = syscall(sys::MMAP, [0, HEAP_SIZE as u64, PROT_RW, MAP_PRIVATE_ANON, u64::MAX, 0]);
+    let heap = syscall(sys::MMAP, [0, heap_size as u64, PROT_RW, MAP_PRIVATE_ANON, u64::MAX, 0]);
     if heap < 0 {
         exit(102);
     }
-    unsafe { HEAP.lock().init(heap as *mut u8, HEAP_SIZE) };
+    unsafe { HEAP.lock().init(heap as *mut u8, heap_size) };
     let argc = unsafe { *sp } as usize;
     let mut args = Vec::new();
     for i in 0..argc {
@@ -438,10 +431,14 @@ pub unsafe fn start(sp: *const u64, main: fn(Vec<&'static str>) -> i32) -> ! {
     exit(main(args))
 }
 
-/// Defines the program entry point `_start`, which calls `main(args)`.
+/// Defines the program entry point `_start`, which calls `main(args)`;
+/// `heap = bytes` sizes the heap (default `HEAP_SIZE`).
 #[macro_export]
 macro_rules! entry {
     ($main:path) => {
+        $crate::entry!($main, heap = $crate::HEAP_SIZE);
+    };
+    ($main:path, heap = $heap:expr) => {
         #[unsafe(naked)]
         #[unsafe(no_mangle)]
         unsafe extern "C" fn _start() -> ! {
@@ -449,7 +446,7 @@ macro_rules! entry {
         }
 
         unsafe extern "C" fn __oxrt_start(sp: *const u64) -> ! {
-            unsafe { $crate::start(sp, $main) }
+            unsafe { $crate::start(sp, $main, $heap) }
         }
     };
 }

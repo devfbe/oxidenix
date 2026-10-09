@@ -53,6 +53,8 @@ pub enum File {
     Inotify(Arc<Inotify>),
     /// An AF_UNIX socket.
     Socket(Arc<crate::unix::Sock>),
+    /// An internet socket (TCP, UDP, raw ICMP).
+    Inet(Arc<crate::inet::InetSock>),
 }
 
 static FILES: Mutex<BTreeMap<u64, File>> = Mutex::new(BTreeMap::new());
@@ -93,6 +95,8 @@ pub fn closed(id: u64) {
                 crate::scm::request();
             }
         }
+        // The net thread closes it in netd.
+        Some(File::Inet(sock)) => sock.release(),
         _ => {}
     }
     // An eventfd or a tmpfs or /data file simply goes (the latter two
@@ -137,6 +141,7 @@ pub fn stat_of(fd: u64) -> Result<vfs::stat::Stat, i64> {
         Some((File::Netlink(n), _)) => n.stat(),
         Some((File::Inotify(i), _)) => i.stat(),
         Some((File::Socket(s), _)) => crate::sockcalls::stat(&s),
+        Some((File::Inet(s), _)) => crate::inetcalls::stat(&s),
         None => {
             let mut st = [0u8; 144];
             match syscall(SYS_KFD_STAT, [fd, st.as_mut_ptr() as u64, 0, 0, 0, 0]) {
@@ -166,12 +171,21 @@ pub fn map_object(fd: u64, shared: bool, prot_write: bool) -> Option<Result<(u64
 /// The server's file behind descriptor `fd` and its open flags, or None
 /// for a file of the kernel's (or a bad descriptor: the kernel answers).
 pub fn lookup(fd: u64) -> Option<(File, u32)> {
+    lookup_checked(fd).ok().flatten()
+}
+
+/// `lookup` for calls the kernel cannot answer: EBADF for a bad
+/// descriptor, None for a file of the kernel's.
+pub fn lookup_checked(fd: u64) -> Result<Option<(File, u32)>, i64> {
     let mut flags = 0u32;
     let id = syscall(SYS_KFD_LOOKUP, [fd, &mut flags as *mut u32 as u64, 0, 0, 0, 0]);
-    if id <= 0 {
-        return None;
+    if id < 0 {
+        return Err(-id);
     }
-    FILES.lock().get(&(id as u64)).cloned().map(|f| (f, flags))
+    if id == 0 {
+        return Ok(None);
+    }
+    Ok(FILES.lock().get(&(id as u64)).cloned().map(|f| (f, flags)))
 }
 
 pub const SYS_READ: u64 = 0;
@@ -303,6 +317,7 @@ fn on_file(nr: u64, file: File, flags: u32, a1: u64, a2: u64, a3: u64) -> Result
         File::Netlink(n) => return netlink::call(nr, &n, flags, [0, a1, a2, a3, 0, 0]),
         File::Inotify(i) => return inotify::call(nr, &i, flags, a1, a2),
         File::Socket(s) => return crate::sockcalls::on_file(nr, &s, flags, a1, a2),
+        File::Inet(s) => return crate::inetcalls::on_file(nr, &s, flags, a1, a2),
     };
     let readable = flags & O_ACCMODE != O_WRONLY;
     let writable = flags & O_ACCMODE != 0;
@@ -329,7 +344,9 @@ fn on_file(nr: u64, file: File, flags: u32, a1: u64, a2: u64, a3: u64) -> Result
     }
 }
 
-/// An iovec array of the program: (base, length) pairs.
+/// An iovec array of the program: (base, length) pairs; EINVAL for more
+/// than 1024 or a length negative as an ssize_t (Linux's
+/// copy_iovec_from_user).
 pub fn iovecs(iov: u64, count: u64) -> Result<alloc::vec::Vec<(u64, u64)>, i64> {
     if count > 1024 {
         return Err(EINVAL);
@@ -337,6 +354,9 @@ pub fn iovecs(iov: u64, count: u64) -> Result<alloc::vec::Vec<(u64, u64)>, i64> 
     let mut out = alloc::vec::Vec::new();
     for i in 0..count {
         let pair: [u64; 2] = crate::usercopy::read(iov + i * 16)?;
+        if (pair[1] as i64) < 0 {
+            return Err(EINVAL);
+        }
         out.push((pair[0], pair[1]));
     }
     Ok(out)
@@ -410,6 +430,7 @@ fn sendfile(out_fd: u64, out: Option<(File, u32)>, in_fd: u64, input: Option<(Fi
             Some((File::Tmp(f), _)) => f.read_server(&mut buf[..want]).map(|n| n as i64),
             Some((File::Data(f), _)) => f.read_server(&mut buf[..want]).map(|n| n as i64),
             Some((File::Socket(s), flags)) => crate::sockcalls::read_server(s, *flags, &mut buf[..want]),
+            Some((File::Inet(s), flags)) => crate::inetcalls::read_server(s, *flags, &mut buf[..want]),
             None => match syscall(SYS_KFD_READ, [in_fd, buf.as_mut_ptr() as u64, want as u64, 0, 0, 0]) {
                 r if r < 0 => Err(-r),
                 r => Ok(r),
@@ -429,6 +450,7 @@ fn sendfile(out_fd: u64, out: Option<(File, u32)>, in_fd: u64, input: Option<(Fi
             Some((File::Tmp(f), flags)) => f.write_server(&buf[..n], flags & O_APPEND != 0).map(|n| n as i64),
             Some((File::Data(f), flags)) => f.write_server(&buf[..n], flags & O_APPEND != 0).map(|n| n as i64),
             Some((File::Socket(s), flags)) => crate::sockcalls::write_server(s, *flags, &buf[..n]),
+            Some((File::Inet(s), flags)) => crate::inetcalls::write_server(s, *flags, &buf[..n]),
             None => match syscall(SYS_KFD_WRITE, [out_fd, buf.as_ptr() as u64, n as u64, 0, 0, 0]) {
                 r if r < 0 => Err(-r),
                 r => Ok(r),

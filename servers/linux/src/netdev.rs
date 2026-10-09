@@ -1,17 +1,15 @@
 //! The network interfaces as Linux programs see them: netd's description
-//! (`SYS_NET_LINKS`, `netproto::Link`) with Linux's names and flags, for
-//! rtnetlink (`netlink`) and for the interface requests every socket takes
-//! (netdevice(7): SIOCGIFCONF, SIOCGIFINDEX, SIOCGIFFLAGS, ...). The
-//! configuration is netd's (DHCP): the requests that would change it are
-//! not taken.
+//! (`LINKS` over the instance's channel, `netring::Link`) with Linux's
+//! names and flags, for rtnetlink (`netlink`) and for the interface
+//! requests every socket takes (netdevice(7): SIOCGIFCONF, SIOCGIFINDEX,
+//! SIOCGIFFLAGS, ...). The configuration is netd's (DHCP): the requests
+//! that would change it are not taken.
 
 use crate::files;
-use crate::syscall;
 use crate::usercopy;
 use alloc::string::String;
 use alloc::vec::Vec;
 use netlink::{Interface, Ipv4};
-use restricted::*;
 
 const AF_INET: u16 = 2;
 
@@ -41,15 +39,11 @@ const S_IFSOCK: u32 = 0o140000;
 /// loopback "lo", Ethernet cards "eth0" and up. None without netd (the
 /// lists are empty then, not an error).
 pub fn interfaces() -> Vec<Interface> {
-    let mut buf = alloc::vec![0u8; 64 * netproto::Link::SIZE];
-    let n = syscall(SYS_NET_LINKS, [buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0, 0, 0]);
-    if n < 0 {
-        return Vec::new();
-    }
     let mut ethernet = 0;
-    netproto::Link::decode_all(&buf[..n as usize])
+    crate::netclient::links()
+        .into_iter()
         .map(|l| {
-            let loopback = l.kind == netproto::LINK_LOOPBACK;
+            let loopback = l.kind == netring::LINK_LOOPBACK;
             let name = if loopback {
                 String::from("lo")
             } else {
@@ -57,9 +51,9 @@ pub fn interfaces() -> Vec<Interface> {
                 alloc::format!("eth{}", ethernet - 1)
             };
             let mut flags = if loopback { netlink::IFF_LOOPBACK } else { netlink::IFF_BROADCAST };
-            if l.state & netproto::LINK_UP != 0 {
+            if l.state & netring::LINK_UP != 0 {
                 flags |= netlink::IFF_UP;
-                if l.state & netproto::LINK_RUNNING != 0 {
+                if l.state & netring::LINK_RUNNING != 0 {
                     flags |= netlink::IFF_RUNNING | netlink::IFF_LOWER_UP;
                 }
             }

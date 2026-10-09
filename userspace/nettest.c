@@ -211,7 +211,9 @@ int main(void) {
     check("raw ICMP echo to the gateway gets a reply", icmp_echo("10.0.2.2"));
     check("raw ICMP echo over loopback gets a reply", icmp_echo("127.0.0.1"));
 
-    /* Lengths chosen to overflow naive arithmetic in the kernel. */
+    /* Lengths chosen to overflow naive arithmetic: an iovec length that is
+     * negative as an ssize_t is EINVAL, a datagram over 65507 bytes
+     * EMSGSIZE (Linux's answers). */
     int u = socket(AF_INET, SOCK_DGRAM, 0);
     a = addr("127.0.0.1", 9);
     struct iovec iov[2] = {{buf, 8}, {buf, (size_t)-4}};
@@ -220,11 +222,11 @@ int main(void) {
     m.msg_namelen = sizeof a;
     m.msg_iov = iov;
     m.msg_iovlen = 2;
-    check("sendmsg with an overflowing iovec fails cleanly", sendmsg(u, &m, 0) < 0 && errno == EMSGSIZE);
+    check("sendmsg with an overflowing iovec fails with EINVAL", sendmsg(u, &m, 0) < 0 && errno == EINVAL);
     iov[1].iov_len = (size_t)-1;
-    check("recvmsg with an overflowing iovec fails cleanly", recvmsg(u, &m, MSG_DONTWAIT) < 0 && errno == EAGAIN);
-    check("sendto with a huge length fails with EFAULT",
-          sendto(u, buf, (size_t)1 << 40, 0, (struct sockaddr *)&a, sizeof a) < 0 && errno == EFAULT);
+    check("recvmsg with an overflowing iovec fails with EINVAL", recvmsg(u, &m, MSG_DONTWAIT) < 0 && errno == EINVAL);
+    check("sendto with a huge length fails with EMSGSIZE",
+          sendto(u, buf, (size_t)1 << 40, 0, (struct sockaddr *)&a, sizeof a) < 0 && errno == EMSGSIZE);
     close(u);
 
     check("AF_INET6 sockets are not supported", socket(AF_INET6, SOCK_STREAM, 0) < 0 && errno == EAFNOSUPPORT);

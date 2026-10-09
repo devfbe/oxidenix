@@ -363,7 +363,7 @@ dependencies = [
  "fsring",
  "linked_list_allocator",
  "netlink",
- "netproto",
+ "netring",
  "restricted",
  "ring",
  "slab 0.1.0",
@@ -446,8 +446,9 @@ dependencies = [
 name = "netd"
 version = "0.1.0"
 dependencies = [
- "netproto",
+ "netring",
  "oxrt",
+ "ring",
  "smoltcp",
  "virtio",
 ]
