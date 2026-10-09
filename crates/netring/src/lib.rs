@@ -1,0 +1,830 @@
+//! The socket protocol of the data plane (phase R7b, ADR 0007): what the
+//! Linux server (the client) and netd (the service) share over a channel
+//! (`ring::channel`) for the instance's internet sockets. Kept apart from
+//! both so that its encodings and memory ordering are tested on the host.
+//!
+//! **The channel** has `SLOTS` slots per ring and a shared area of
+//! `SHARED_PAGES` pages (`SharedArea`): a header page with two bitmaps and
+//! the net thread's doorbell, then a control block (`Ctl`, 128 bytes) per
+//! socket, at most `MAX_SOCKETS`. The client names a socket by the index
+//! of its control block. The shared area stays mapped in netd whatever the
+//! client does, so netd may use atomics there; granted memory it touches
+//! only with its fault-surviving copy.
+//!
+//! **Data** lives in the client's granted memory: a socket's *area* is a
+//! receive ring followed by a send ring of `size` bytes each (`Area`).
+//! Positions run freely modulo 2^32; the receive ring's are `rx_tail`
+//! (netd's, the bytes it put in) and `rx_head` (the client's, the bytes it
+//! took), the send ring's `tx_tail` (the client's) and `tx_head` (netd's).
+//! A producer copies its bytes, then publishes its position; the consumer
+//! reads the position, copies, then publishes its own (SeqCst throughout:
+//! the wake protocols below are Dekker's). Each side keeps its own position
+//! and checks the other's: `fill` beyond the ring's size is a protocol
+//! violation (netd aborts the socket, the client fails it).
+//!
+//! - A stream's receive ring holds bytes; a datagram socket's holds
+//!   *records* (`Record`: a 16-byte header with the length and the source,
+//!   then the data, the next record 16-byte aligned; records wrap around
+//!   the end as bytes do). netd puts in only whole records.
+//! - A stream's send ring holds bytes; a datagram is sent by `SEND` from the
+//!   start of the send ring (which is a plain buffer for a datagram socket).
+//!
+//! **Waking.** Each control block has an event counter `seq` that both
+//! sides advance after a change, and a count of the client's threads that
+//! wait on it (`waiters`): a waiter reads `seq` before it looks at the
+//! state, announces itself, and sleeps on `seq` with the value it read (a
+//! futex: no sleep if `seq` moved); a changer publishes, advances `seq` and
+//! wakes if anyone waits (`Ctl::changed`, `Ctl::sleep`). Changes netd makes
+//! are also marked in the *client bitmap* for the client's net thread
+//! (which reports readiness to the kernel), woken through `client_seq` if
+//! it announced a sleep (`ArenaHeader::mark_client`, `wake_client`,
+//! `sleep_client`). Changes the client makes for netd (bytes appended,
+//! room made in a receive ring netd waits for, `rx_wait`) are marked in
+//! the *service bitmap*, and the client rings the submission ring's
+//! doorbell (`RingMemory::ring_doorbell`); netd looks at the bitmap after
+//! announcing its sleep in the submission ring.
+//!
+//! **Requests** (`Request`) are the rare operations; netd answers each at
+//! once (nothing waits in netd), with a `ring::Completion`:
+//!
+//! | op | request | completion |
+//! |----|---------|------------|
+//! | `SOCKET` | `object` socket, `arg[0]` kind, the area (datagram sockets: required; TCP: none) | 0 |
+//! | `BIND` | socket, `offset` endpoint (address 0: any; port 0: an ephemeral one), `arg[0]` `BIND_REUSEADDR` | v0 = the port |
+//! | `LISTEN` | socket, `arg[0]` backlog | 0 |
+//! | `CONNECT` | socket, endpoint; TCP: the area (unless it has one) | 0 once started (TCP: the outcome comes in the control block); a datagram socket's peer is set (endpoint 0: none) |
+//! | `ACCEPT` | listener, `arg[0]` the new socket, its area | v0 = peer address, v1 = peer port; `EAGAIN` |
+//! | `SEND` | socket, endpoint (0: the peer), `len` bytes at the start of the send ring | bytes; `EAGAIN` if smoltcp's buffer is full |
+//! | `SHUTDOWN` | socket, `arg[0]` `SHUT_RD` / `SHUT_WR` bits | 0 (`SHUT_WR`: FIN after what the send ring holds) |
+//! | `CLOSE` | socket, `arg[0]` `CLOSE_ABORT` | 0 once netd uses neither its control block nor its area |
+//! | `NAME` | socket, `arg[0]` 1 for the peer | v0 = address, v1 = port |
+//! | `SETOPT` | socket, `arg[0]` option, `arg[1]` value | 0 |
+//! | `LINKS` | a buffer | bytes of `Link` records |
+//! | `FORGET` | `grant` | 0 once netd let go of the grant |
+//!
+//! Every field an operation does not use must be 0 (`EINVAL`), an unknown
+//! operation is `ENOSYS`. An endpoint is an IPv4 address and a port in host
+//! order, packed as `address | port << 32`.
+
+#![no_std]
+
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering::SeqCst};
+pub use ring::{Completion, Desc, Wait};
+
+/// The service's IPC name.
+pub const SERVICE: &str = "net";
+/// Slots per ring: requests in flight per instance.
+pub const SLOTS: u32 = 64;
+/// Sockets per channel (control blocks).
+pub const MAX_SOCKETS: usize = 1024;
+pub const PAGE: usize = 4096;
+/// Bytes of a control block.
+pub const CTL_BYTES: usize = 128;
+/// Pages of the shared area: the header page, then the control blocks.
+pub const SHARED_PAGES: u32 = (1 + MAX_SOCKETS * CTL_BYTES / PAGE) as u32;
+/// Words of a bitmap of sockets.
+pub const BITMAP_WORDS: usize = MAX_SOCKETS / 64;
+/// A ring's size: a power of two in this range.
+pub const MIN_RING: u32 = 4096;
+pub const MAX_RING: u32 = 1 << 20;
+/// The most bytes `LINKS` writes.
+pub const MAX_LINKS_BUF: u32 = 64 * 1024;
+
+pub mod op {
+    pub const SOCKET: u16 = 1;
+    pub const BIND: u16 = 2;
+    pub const LISTEN: u16 = 3;
+    pub const CONNECT: u16 = 4;
+    pub const ACCEPT: u16 = 5;
+    pub const SEND: u16 = 6;
+    pub const SHUTDOWN: u16 = 7;
+    pub const CLOSE: u16 = 8;
+    pub const NAME: u16 = 9;
+    pub const SETOPT: u16 = 10;
+    pub const LINKS: u16 = 11;
+    pub const FORGET: u16 = 12;
+}
+
+/// The errors the protocol itself gives (the others are the stack's).
+pub mod errno {
+    pub const EBADF: i64 = 9;
+    pub const EAGAIN: i64 = 11;
+    pub const ENOMEM: i64 = 12;
+    pub const EFAULT: i64 = 14;
+    pub const EBUSY: i64 = 16;
+    pub const EINVAL: i64 = 22;
+    pub const ENOSPC: i64 = 28;
+    pub const EPIPE: i64 = 32;
+    pub const ENOSYS: i64 = 38;
+    pub const EDESTADDRREQ: i64 = 89;
+    pub const EMSGSIZE: i64 = 90;
+    pub const ENOPROTOOPT: i64 = 92;
+    pub const EOPNOTSUPP: i64 = 95;
+    pub const EADDRINUSE: i64 = 98;
+    pub const EADDRNOTAVAIL: i64 = 99;
+    pub const ENETUNREACH: i64 = 101;
+    pub const ECONNRESET: i64 = 104;
+    pub const ENOBUFS: i64 = 105;
+    pub const EISCONN: i64 = 106;
+    pub const ENOTCONN: i64 = 107;
+    pub const ETIMEDOUT: i64 = 110;
+    pub const ECONNREFUSED: i64 = 111;
+    pub const EALREADY: i64 = 114;
+    pub const EIO: i64 = 5;
+}
+use errno::*;
+
+/// What a socket is (`SOCKET`'s `arg[0]`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Tcp = 1,
+    Udp = 2,
+    /// Raw ICMP (SOCK_RAW, IPPROTO_ICMP): sends ICMP messages (netd adds
+    /// the IPv4 header), receives whole IPv4 packets carrying ICMP.
+    RawIcmp = 3,
+}
+
+impl Kind {
+    pub fn from_u64(v: u64) -> Option<Kind> {
+        match v {
+            1 => Some(Kind::Tcp),
+            2 => Some(Kind::Udp),
+            3 => Some(Kind::RawIcmp),
+            _ => None,
+        }
+    }
+
+    /// Whether its receive ring holds records.
+    pub fn datagrams(self) -> bool {
+        self != Kind::Tcp
+    }
+}
+
+/// `BIND`'s flags.
+pub const BIND_REUSEADDR: u64 = 1;
+/// `SHUTDOWN`'s bits.
+pub const SHUT_RD: u64 = 1;
+pub const SHUT_WR: u64 = 2;
+/// `CLOSE`'s flags: reset the connection instead of finishing it (unread
+/// data, `SO_LINGER` with a zero time).
+pub const CLOSE_ABORT: u64 = 1;
+
+/// `SETOPT`'s options.
+pub mod opt {
+    /// 1: Nagle's algorithm off (TCP_NODELAY), 0: on.
+    pub const NODELAY: u32 = 1;
+    /// The keep-alive interval in milliseconds, 0: off (SO_KEEPALIVE with
+    /// TCP_KEEPINTVL).
+    pub const KEEPALIVE: u32 = 2;
+    /// The hop limit of what it sends, 1..=255 (IP_TTL).
+    pub const TTL: u32 = 3;
+}
+
+/// The state bits netd publishes in a control block (`NetdLine::state`).
+pub mod state {
+    /// Listening (TCP).
+    pub const LISTENING: u32 = 1;
+    /// A connect is under way (TCP: the handshake has not finished).
+    pub const CONNECTING: u32 = 2;
+    /// It was connected (stays set; TCP).
+    pub const ESTABLISHED: u32 = 4;
+    /// It can still send (TCP: neither its FIN went nor the connection).
+    pub const SEND_OPEN: u32 = 8;
+    /// No byte beyond `rx_tail` will come (TCP: the peer's FIN, or the
+    /// connection is gone).
+    pub const RECV_EOF: u32 = 16;
+    /// The connection is over (closed, reset, or the connect failed).
+    pub const CLOSED: u32 = 32;
+    /// A datagram of the largest size fits smoltcp's send buffer now.
+    pub const WRITABLE: u32 = 64;
+}
+
+/// A word on a cache line of its own.
+#[repr(C, align(64))]
+pub struct Line(pub AtomicU32);
+
+/// A bit per socket.
+#[repr(C, align(64))]
+pub struct Bitmap(pub [AtomicU64; BITMAP_WORDS]);
+
+impl Bitmap {
+    /// Sets socket `i`'s bit (an index beyond `MAX_SOCKETS` is ignored).
+    pub fn set(&self, i: usize) {
+        if let Some(w) = self.0.get(i / 64) {
+            w.fetch_or(1 << (i % 64), SeqCst);
+        }
+    }
+
+    /// Takes every set bit, calling `f` for each socket; true if any.
+    pub fn take(&self, mut f: impl FnMut(usize)) -> bool {
+        let mut any = false;
+        for (k, w) in self.0.iter().enumerate() {
+            if w.load(SeqCst) == 0 {
+                continue;
+            }
+            let mut bits = w.swap(0, SeqCst);
+            while bits != 0 {
+                any = true;
+                let b = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                f(k * 64 + b);
+            }
+        }
+        any
+    }
+
+    pub fn any(&self) -> bool {
+        self.0.iter().any(|w| w.load(SeqCst) != 0)
+    }
+}
+
+/// The shared area's first page.
+#[repr(C, align(4096))]
+pub struct ArenaHeader {
+    /// Advanced by netd when it wakes the net thread, and by the client
+    /// when it has work for it; the net thread sleeps on it.
+    pub client_seq: Line,
+    /// The net thread announced a sleep.
+    pub client_sleeping: Line,
+    /// Sockets netd changed, for the net thread.
+    pub client_dirty: Bitmap,
+    /// Sockets the client changed, for netd.
+    pub service_dirty: Bitmap,
+}
+
+impl ArenaHeader {
+    /// netd: socket `i` changed (the net thread looks after `wake_client`).
+    pub fn mark_client(&self, i: usize) {
+        self.client_dirty.set(i);
+    }
+
+    /// netd, after marking (once per round): wakes the net thread if it
+    /// announced a sleep. Either the thread sees the marks after its
+    /// announcement, or this sees the announcement.
+    pub fn wake_client(&self, w: &impl Wait) {
+        if self.client_sleeping.0.load(SeqCst) != 0 {
+            self.client_seq.0.fetch_add(1, SeqCst);
+            w.wake(&self.client_seq.0);
+        }
+    }
+
+    /// The client's own work for the net thread (made known elsewhere):
+    /// wakes it whether or not it announced a sleep.
+    pub fn poke_client(&self, w: &impl Wait) {
+        self.client_seq.0.fetch_add(1, SeqCst);
+        w.wake(&self.client_seq.0);
+    }
+
+    /// The net thread: takes the marked sockets; true if any.
+    pub fn take_client(&self, f: impl FnMut(usize)) -> bool {
+        self.client_dirty.take(f)
+    }
+
+    /// The net thread: the value of `client_seq` to sleep on, read before
+    /// it looks for work (marks or its own).
+    pub fn client_seen(&self) -> u32 {
+        self.client_seq.0.load(SeqCst)
+    }
+
+    /// The net thread, having found no work since `seen`: announces its
+    /// sleep, looks at the marks once more, and sleeps unless there are
+    /// some or `client_seq` moved.
+    pub fn sleep_client(&self, seen: u32, w: &impl Wait) {
+        self.client_sleeping.0.store(1, SeqCst);
+        if !self.client_dirty.any() {
+            w.wait(&self.client_seq.0, seen);
+        }
+        self.client_sleeping.0.store(0, SeqCst);
+    }
+
+    /// The client: socket `i` has work for netd (then ring the submission
+    /// ring's doorbell).
+    pub fn mark_service(&self, i: usize) {
+        self.service_dirty.set(i);
+    }
+
+    /// netd: takes the sockets the client marked; true if any.
+    pub fn take_service(&self, f: impl FnMut(usize)) -> bool {
+        self.service_dirty.take(f)
+    }
+
+    /// netd, after announcing its sleep in the submission ring: whether
+    /// the client marked a socket (then it must not sleep).
+    pub fn service_pending(&self) -> bool {
+        self.service_dirty.any()
+    }
+}
+
+/// netd's half of a control block.
+#[repr(C, align(64))]
+pub struct NetdLine {
+    /// The event counter (both sides advance it; waiters sleep on it).
+    pub seq: AtomicU32,
+    /// `state` bits.
+    pub state: AtomicU32,
+    /// The receive ring's producer position.
+    pub rx_tail: AtomicU32,
+    /// The send ring's consumer position.
+    pub tx_head: AtomicU32,
+    /// The latest error (a positive errno), and how many netd posted: the
+    /// client keeps the count it took (SO_ERROR, a failed call).
+    pub error: AtomicU32,
+    pub err_seq: AtomicU32,
+    /// Connections a listener has ready to accept.
+    pub backlog: AtomicU32,
+    /// 1: netd holds received data the receive ring had no room for (the
+    /// client rings after it made room).
+    pub rx_wait: AtomicU32,
+}
+
+/// The client's half.
+#[repr(C, align(64))]
+pub struct ClientLine {
+    /// The receive ring's consumer position.
+    pub rx_head: AtomicU32,
+    /// The send ring's producer position.
+    pub tx_tail: AtomicU32,
+    /// The client's threads waiting on `seq`.
+    pub waiters: AtomicU32,
+}
+
+/// A socket's control block.
+#[repr(C)]
+pub struct Ctl {
+    pub netd: NetdLine,
+    pub client: ClientLine,
+}
+
+impl Ctl {
+    /// After a change either side made (published before): advances `seq`
+    /// and wakes the client's waiters if there are any.
+    pub fn changed(&self, w: &impl Wait) {
+        self.netd.seq.fetch_add(1, SeqCst);
+        if self.client.waiters.load(SeqCst) != 0 {
+            w.wake(&self.netd.seq);
+        }
+    }
+
+    /// The value to sleep on: read before looking at the state.
+    pub fn seen(&self) -> u32 {
+        self.netd.seq.load(SeqCst)
+    }
+
+    /// Sleeps (`sleep(word, seen)`, a futex wait) as a waiter announced to
+    /// the changers. Whatever changed after `seen` was read either moved
+    /// `seq` (the futex does not sleep) or sees the waiter (and wakes it).
+    pub fn sleep<E>(&self, seen: u32, sleep: impl FnOnce(&AtomicU32, u32) -> Result<(), E>) -> Result<(), E> {
+        self.client.waiters.fetch_add(1, SeqCst);
+        let r = sleep(&self.netd.seq, seen);
+        self.client.waiters.fetch_sub(1, SeqCst);
+        r
+    }
+
+    /// netd's half for a new socket (its counters from 0; `seq` goes on).
+    pub fn reset_netd(&self, state: u32) {
+        let n = &self.netd;
+        for w in [&n.rx_tail, &n.tx_head, &n.error, &n.err_seq, &n.backlog, &n.rx_wait] {
+            w.store(0, SeqCst);
+        }
+        n.state.store(state, SeqCst);
+    }
+
+    /// The client's half for a new socket.
+    pub fn reset_client(&self) {
+        self.client.rx_head.store(0, SeqCst);
+        self.client.tx_tail.store(0, SeqCst);
+    }
+}
+
+/// The shared area: the header page, then the control blocks.
+#[repr(C)]
+pub struct SharedArea {
+    pub header: ArenaHeader,
+    pub ctl: [Ctl; MAX_SOCKETS],
+}
+
+const _: () = {
+    assert!(core::mem::size_of::<Ctl>() == CTL_BYTES);
+    assert!(core::mem::size_of::<ArenaHeader>() == PAGE);
+    assert!(core::mem::size_of::<SharedArea>() == SHARED_PAGES as usize * PAGE);
+    assert!(core::mem::offset_of!(Ctl, client) == 64);
+};
+
+impl SharedArea {
+    /// The shared area at `ptr`.
+    ///
+    /// # Safety
+    /// `ptr` is the page-aligned start of a mapping of at least
+    /// `SHARED_PAGES` pages that lives for `'a` (any contents are a valid
+    /// area: a hostile peer cannot make it unsound).
+    pub unsafe fn at<'a>(ptr: *const u8) -> &'a SharedArea {
+        unsafe { &*(ptr as *const SharedArea) }
+    }
+
+    /// Control block `i` (None beyond `MAX_SOCKETS`).
+    pub fn ctl(&self, i: usize) -> Option<&Ctl> {
+        self.ctl.get(i)
+    }
+}
+
+/// A socket's buffers in a grant: the receive ring at `offset`, the send
+/// ring right after it, `size` bytes each.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Area {
+    pub grant: u32,
+    pub offset: u32,
+    pub size: u32,
+}
+
+impl Area {
+    pub fn rx(&self) -> u64 {
+        self.offset as u64
+    }
+
+    pub fn tx(&self) -> u64 {
+        self.offset as u64 + self.size as u64
+    }
+
+    /// The byte after the area, in the grant.
+    pub fn end(&self) -> u64 {
+        self.offset as u64 + 2 * self.size as u64
+    }
+
+    /// From a descriptor's buffer fields: None for none (all 0), EINVAL for
+    /// a malformed one (sizes not a power of two in range, an offset not
+    /// page-aligned).
+    fn from_desc(d: &Desc) -> Result<Option<Area>, i64> {
+        if d.grant == 0 && d.buf_off == 0 && d.len == 0 {
+            return Ok(None);
+        }
+        let size = d.len / 2;
+        if d.grant == 0 || d.len % 2 != 0 || !size.is_power_of_two() || !(MIN_RING..=MAX_RING).contains(&size) || d.buf_off as usize % PAGE != 0 {
+            return Err(EINVAL);
+        }
+        Ok(Some(Area { grant: d.grant, offset: d.buf_off, size }))
+    }
+
+    fn to_desc(area: Option<Area>, d: &mut Desc) {
+        if let Some(a) = area {
+            d.grant = a.grant;
+            d.buf_off = a.offset;
+            d.len = 2 * a.size;
+        }
+    }
+}
+
+/// A byte range of a grant (`LINKS`' result buffer).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Buf {
+    pub grant: u32,
+    pub offset: u32,
+    pub len: u32,
+}
+
+/// An IPv4 endpoint in host order.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Endpoint {
+    pub addr: u32,
+    pub port: u16,
+}
+
+impl Endpoint {
+    pub fn pack(&self) -> u64 {
+        self.addr as u64 | (self.port as u64) << 32
+    }
+
+    pub fn unpack(v: u64) -> Result<Endpoint, i64> {
+        if v >> 48 != 0 {
+            return Err(EINVAL);
+        }
+        Ok(Endpoint { addr: v as u32, port: (v >> 32) as u16 })
+    }
+}
+
+/// A request, validated (`decode`) or to be sent (`encode`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Request {
+    Socket { sock: u32, kind: Kind, area: Option<Area> },
+    Bind { sock: u32, at: Endpoint, reuse: bool },
+    Listen { sock: u32, backlog: u32 },
+    Connect { sock: u32, to: Endpoint, area: Option<Area> },
+    Accept { sock: u32, new: u32, area: Area },
+    Send { sock: u32, to: Endpoint, len: u32 },
+    Shutdown { sock: u32, how: u64 },
+    Close { sock: u32, abort: bool },
+    Name { sock: u32, peer: bool },
+    SetOpt { sock: u32, opt: u32, value: u64 },
+    Links { buf: Buf },
+    Forget { grant: u32 },
+}
+
+fn sock(object: u64) -> Result<u32, i64> {
+    if object >= MAX_SOCKETS as u64 {
+        return Err(EINVAL);
+    }
+    Ok(object as u32)
+}
+
+/// The fields of a `Desc` an operation reads, for the check that the
+/// others are 0.
+#[derive(Clone, Copy)]
+struct Used {
+    object: bool,
+    offset: bool,
+    buf: bool,
+    grant: bool,
+    len: bool,
+    args: usize,
+}
+
+const NONE: Used = Used { object: false, offset: false, buf: false, grant: false, len: false, args: 0 };
+
+impl Request {
+    /// Validates a request copied out of the ring (copied once). A
+    /// negative errno to complete it with if it is malformed: ENOSYS for an
+    /// unknown operation, EINVAL for a field out of range or set where the
+    /// operation takes none. (What netd checks itself: the sockets exist,
+    /// the grant holds the area, the kind fits the operation.)
+    pub fn decode(d: &Desc) -> Result<Request, i64> {
+        let with_sock = Used { object: true, ..NONE };
+        let (request, used) = match d.op {
+            op::SOCKET => {
+                let kind = Kind::from_u64(d.arg[0]).ok_or(EINVAL)?;
+                let area = Area::from_desc(d)?;
+                // Datagram sockets get their rings at once, TCP at connect
+                // or accept (a listener needs none).
+                if area.is_some() != kind.datagrams() {
+                    return Err(EINVAL);
+                }
+                (Request::Socket { sock: sock(d.object)?, kind, area }, Used { buf: true, args: 1, ..with_sock })
+            }
+            op::BIND => {
+                if d.arg[0] & !BIND_REUSEADDR != 0 {
+                    return Err(EINVAL);
+                }
+                let r = Request::Bind { sock: sock(d.object)?, at: Endpoint::unpack(d.offset)?, reuse: d.arg[0] != 0 };
+                (r, Used { offset: true, args: 1, ..with_sock })
+            }
+            op::LISTEN => {
+                let backlog = u32::try_from(d.arg[0]).map_err(|_| EINVAL)?;
+                (Request::Listen { sock: sock(d.object)?, backlog }, Used { args: 1, ..with_sock })
+            }
+            op::CONNECT => {
+                let r = Request::Connect { sock: sock(d.object)?, to: Endpoint::unpack(d.offset)?, area: Area::from_desc(d)? };
+                (r, Used { offset: true, buf: true, ..with_sock })
+            }
+            op::ACCEPT => {
+                let area = Area::from_desc(d)?.ok_or(EINVAL)?;
+                let new = sock(d.arg[0])?;
+                let listener = sock(d.object)?;
+                if new == listener {
+                    return Err(EINVAL);
+                }
+                (Request::Accept { sock: listener, new, area }, Used { buf: true, args: 1, ..with_sock })
+            }
+            op::SEND => {
+                if d.len > MAX_RING {
+                    return Err(EINVAL);
+                }
+                let r = Request::Send { sock: sock(d.object)?, to: Endpoint::unpack(d.offset)?, len: d.len };
+                (r, Used { offset: true, len: true, ..with_sock })
+            }
+            op::SHUTDOWN => {
+                let how = d.arg[0];
+                if how == 0 || how & !(SHUT_RD | SHUT_WR) != 0 {
+                    return Err(EINVAL);
+                }
+                (Request::Shutdown { sock: sock(d.object)?, how }, Used { args: 1, ..with_sock })
+            }
+            op::CLOSE => {
+                if d.arg[0] & !CLOSE_ABORT != 0 {
+                    return Err(EINVAL);
+                }
+                (Request::Close { sock: sock(d.object)?, abort: d.arg[0] != 0 }, Used { args: 1, ..with_sock })
+            }
+            op::NAME => {
+                if d.arg[0] > 1 {
+                    return Err(EINVAL);
+                }
+                (Request::Name { sock: sock(d.object)?, peer: d.arg[0] == 1 }, Used { args: 1, ..with_sock })
+            }
+            op::SETOPT => {
+                let opt = u32::try_from(d.arg[0]).map_err(|_| EINVAL)?;
+                (Request::SetOpt { sock: sock(d.object)?, opt, value: d.arg[1] }, Used { args: 2, ..with_sock })
+            }
+            op::LINKS => {
+                if d.grant == 0 || d.len == 0 || d.len > MAX_LINKS_BUF {
+                    return Err(EINVAL);
+                }
+                (Request::Links { buf: Buf { grant: d.grant, offset: d.buf_off, len: d.len } }, Used { buf: true, ..NONE })
+            }
+            op::FORGET => {
+                if d.grant == 0 {
+                    return Err(EINVAL);
+                }
+                (Request::Forget { grant: d.grant }, Used { grant: true, ..NONE })
+            }
+            _ => return Err(ENOSYS),
+        };
+        let unused = d.flags != 0
+            || (!used.object && d.object != 0)
+            || (!used.offset && d.offset != 0)
+            || (!used.buf && !used.grant && d.grant != 0)
+            || (!used.buf && d.buf_off != 0)
+            || (!used.buf && !used.len && d.len != 0)
+            || d.arg[used.args..].iter().any(|&a| a != 0);
+        if unused {
+            return Err(EINVAL);
+        }
+        Ok(request)
+    }
+
+    /// The request as a descriptor with tag `tag`.
+    pub fn encode(&self, tag: u64) -> Desc {
+        let mut d = Desc { op: self.op(), tag, ..Desc::default() };
+        match *self {
+            Request::Socket { sock, kind, area } => {
+                d.object = sock as u64;
+                d.arg[0] = kind as u64;
+                Area::to_desc(area, &mut d);
+            }
+            Request::Bind { sock, at, reuse } => {
+                d.object = sock as u64;
+                d.offset = at.pack();
+                d.arg[0] = if reuse { BIND_REUSEADDR } else { 0 };
+            }
+            Request::Listen { sock, backlog } => {
+                d.object = sock as u64;
+                d.arg[0] = backlog as u64;
+            }
+            Request::Connect { sock, to, area } => {
+                d.object = sock as u64;
+                d.offset = to.pack();
+                Area::to_desc(area, &mut d);
+            }
+            Request::Accept { sock, new, area } => {
+                d.object = sock as u64;
+                d.arg[0] = new as u64;
+                Area::to_desc(Some(area), &mut d);
+            }
+            Request::Send { sock, to, len } => {
+                d.object = sock as u64;
+                d.offset = to.pack();
+                d.len = len;
+            }
+            Request::Shutdown { sock, how } => {
+                d.object = sock as u64;
+                d.arg[0] = how;
+            }
+            Request::Close { sock, abort } => {
+                d.object = sock as u64;
+                d.arg[0] = if abort { CLOSE_ABORT } else { 0 };
+            }
+            Request::Name { sock, peer } => {
+                d.object = sock as u64;
+                d.arg[0] = peer as u64;
+            }
+            Request::SetOpt { sock, opt, value } => {
+                d.object = sock as u64;
+                d.arg = [opt as u64, value, 0];
+            }
+            Request::Links { buf } => {
+                d.grant = buf.grant;
+                d.buf_off = buf.offset;
+                d.len = buf.len;
+            }
+            Request::Forget { grant } => d.grant = grant,
+        }
+        d
+    }
+
+    pub fn op(&self) -> u16 {
+        match self {
+            Request::Socket { .. } => op::SOCKET,
+            Request::Bind { .. } => op::BIND,
+            Request::Listen { .. } => op::LISTEN,
+            Request::Connect { .. } => op::CONNECT,
+            Request::Accept { .. } => op::ACCEPT,
+            Request::Send { .. } => op::SEND,
+            Request::Shutdown { .. } => op::SHUTDOWN,
+            Request::Close { .. } => op::CLOSE,
+            Request::Name { .. } => op::NAME,
+            Request::SetOpt { .. } => op::SETOPT,
+            Request::Links { .. } => op::LINKS,
+            Request::Forget { .. } => op::FORGET,
+        }
+    }
+}
+
+/// The pieces of the ring range [`pos`, `pos + len`) in a ring of `size`
+/// bytes (a power of two): (offset in the ring, length) before the wrap
+/// and after it (the second empty unless it wraps). `len` is at most
+/// `size`.
+pub fn pieces(pos: u32, len: u32, size: u32) -> [(u32, u32); 2] {
+    let at = pos & (size - 1);
+    let len = len.min(size);
+    let first = len.min(size - at);
+    [(at, first), (0, len - first)]
+}
+
+/// How many bytes a ring holds between a consumer and a producer
+/// position, None if the producer is more than `size` ahead (or behind:
+/// a protocol violation).
+pub fn fill(head: u32, tail: u32, size: u32) -> Option<u32> {
+    let n = tail.wrapping_sub(head);
+    (n <= size).then_some(n)
+}
+
+/// A datagram's record in a receive ring: this header, then the data.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Record {
+    /// Bytes of data.
+    pub len: u32,
+    /// The source.
+    pub from: Endpoint,
+}
+
+/// Bytes of a record's header.
+pub const RECORD_HEADER: u32 = 16;
+
+impl Record {
+    pub fn encode(&self) -> [u8; RECORD_HEADER as usize] {
+        let mut b = [0u8; RECORD_HEADER as usize];
+        b[0..4].copy_from_slice(&self.len.to_le_bytes());
+        b[4..8].copy_from_slice(&self.from.addr.to_le_bytes());
+        b[8..10].copy_from_slice(&self.from.port.to_le_bytes());
+        b
+    }
+
+    pub fn decode(b: &[u8; RECORD_HEADER as usize]) -> Record {
+        let len = u32::from_le_bytes(b[0..4].try_into().expect("4 bytes"));
+        let addr = u32::from_le_bytes(b[4..8].try_into().expect("4 bytes"));
+        let port = u16::from_le_bytes([b[8], b[9]]);
+        Record { len, from: Endpoint { addr, port } }
+    }
+
+    /// Bytes the record takes in the ring (the next starts 16-aligned).
+    pub fn span(len: u32) -> u64 {
+        RECORD_HEADER as u64 + (len as u64).div_ceil(16) * 16
+    }
+}
+
+/// A link of the loopback kind: traffic to the host's own addresses.
+pub const LINK_LOOPBACK: u16 = 1;
+/// An Ethernet link (the network card).
+pub const LINK_ETHERNET: u16 = 2;
+/// Link state: configured up (it sends and receives).
+pub const LINK_UP: u16 = 1;
+/// Link state: the medium is there (a carrier).
+pub const LINK_RUNNING: u16 = 2;
+
+/// A network interface as netd describes it (`LINKS`). netd speaks IPv4
+/// with one address per interface; the names are the Linux server's.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Link {
+    /// Its number, from 1, stable while netd runs.
+    pub index: u32,
+    /// `LINK_LOOPBACK` or `LINK_ETHERNET`.
+    pub kind: u16,
+    /// `LINK_UP`, `LINK_RUNNING`.
+    pub state: u16,
+    /// The largest IP packet it carries.
+    pub mtu: u32,
+    /// Its hardware address (zero for the loopback).
+    pub mac: [u8; 6],
+    /// The IPv4 address's prefix length (with `address` 0: none).
+    pub prefix: u8,
+    /// Its IPv4 address in host order, 0 for none (no DHCP lease yet).
+    pub address: u32,
+}
+
+impl Link {
+    /// The size of one encoded record.
+    pub const SIZE: usize = 24;
+
+    pub fn encode(&self) -> [u8; Self::SIZE] {
+        let mut r = [0u8; Self::SIZE];
+        r[0..4].copy_from_slice(&self.index.to_le_bytes());
+        r[4..6].copy_from_slice(&self.kind.to_le_bytes());
+        r[6..8].copy_from_slice(&self.state.to_le_bytes());
+        r[8..12].copy_from_slice(&self.mtu.to_le_bytes());
+        r[12..18].copy_from_slice(&self.mac);
+        r[18] = self.prefix;
+        r[20..24].copy_from_slice(&self.address.to_le_bytes());
+        r
+    }
+
+    /// The records of a `LINKS` result; a partial record at the end is
+    /// ignored.
+    pub fn decode_all(payload: &[u8]) -> impl Iterator<Item = Link> + '_ {
+        payload.chunks_exact(Self::SIZE).map(|r| Link {
+            index: u32::from_le_bytes(r[0..4].try_into().expect("4 bytes")),
+            kind: u16::from_le_bytes([r[4], r[5]]),
+            state: u16::from_le_bytes([r[6], r[7]]),
+            mtu: u32::from_le_bytes(r[8..12].try_into().expect("4 bytes")),
+            mac: r[12..18].try_into().expect("6 bytes"),
+            prefix: r[18],
+            address: u32::from_le_bytes(r[20..24].try_into().expect("4 bytes")),
+        })
+    }
+}
