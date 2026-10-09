@@ -109,9 +109,12 @@ fn exception(frame: &mut Frame) {
         if frame.rflags & 0x200 != 0 {
             x86_64::instructions::interrupts::enable();
         }
+        // A copy whose wait for the page ended because the thread dies takes
+        // its fixup too (EFAULT): returning would run the copy again, and the
+        // page never comes. The server then unwinds and the thread exits at
+        // its next `restricted_enter`.
         match handle_fault(fault_addr, access) {
             Ok(()) => return,
-            Err(_) if signal::dying() => return,
             Err(e) => {
                 if e == crate::process::address_space::Fault::Oom {
                     oom_kill(fault_addr);
