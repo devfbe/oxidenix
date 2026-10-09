@@ -549,16 +549,6 @@ impl Ldisc {
         self.column
     }
 
-    /// The output's column bookkeeping (the column, and where the canonical line
-    /// began), to put back when output that was processed did not go out after all.
-    pub fn columns(&self) -> (u32, u32) {
-        (self.column, self.canon_column)
-    }
-
-    pub fn set_columns(&mut self, columns: (u32, u32)) {
-        (self.column, self.canon_column) = columns;
-    }
-
     /// Whether output is stopped (VSTOP, TCOOFF).
     pub fn stopped(&self) -> bool {
         self.stopped

@@ -1263,9 +1263,11 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             Ok(0)
         }
         SYS_KFD_INSTALL => {
-            use crate::fs::file::{OpenFile, ServerFile, Kind, O_ACCMODE, O_APPEND, O_CLOEXEC, O_NONBLOCK};
+            use crate::fs::file::{OpenFile, ServerFile, Kind, O_ACCMODE, O_APPEND, O_CLOEXEC, O_DIRECTORY, O_NOFOLLOW, O_NONBLOCK, O_PATH};
             let (id, flags, ready, kind) = (a[0], a[1] as u32, a[2] as i16, a[3]);
-            if id == 0 || flags & !(O_ACCMODE | O_NONBLOCK | O_APPEND | O_CLOEXEC) != 0 || kind & !KFD_ALWAYS_READY != 0 {
+            // An O_PATH descriptor keeps what Linux's does (F_GETFL shows it).
+            let allowed = if flags & O_PATH != 0 { O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC } else { O_ACCMODE | O_NONBLOCK | O_APPEND | O_CLOEXEC };
+            if id == 0 || flags & !allowed != 0 || kind & !KFD_ALWAYS_READY != 0 {
                 return Err(EINVAL);
             }
             let owner: alloc::sync::Weak<dyn crate::fs::file::ServerFiles> = Arc::downgrade(&instance) as _;
@@ -1690,35 +1692,24 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             if a[2] & !CONSOLE_ECHO != 0 {
                 return Err(EINVAL);
             }
-            let mut buf = [0u8; 512];
+            // Not the holder: nothing to queue for, no ticket to take.
+            if console_device::holder() != instance.id {
+                return Err(EIO);
+            }
+            // The bytes first, into the kernel's memory, with no lock or turn
+            // held: no copy (whatever it might wait for) ever happens in the turn,
+            // which is only ever held within this call.
+            let max = if a[2] & CONSOLE_ECHO != 0 { CONSOLE_ECHO_MAX } else { CONSOLE_WRITE_MAX };
+            let n = a[1].min(max) as usize;
+            let mut buf = Vec::new();
+            buf.try_reserve_exact(n).map_err(|_| ENOMEM)?;
+            buf.resize(n, 0);
+            super::uaccess::copy_from_server(a[0], &mut buf)?;
             if a[2] & CONSOLE_ECHO != 0 {
                 // Never waits (the service thread's echoes).
-                let n = a[1].min(buf.len() as u64) as usize;
-                super::uaccess::copy_from_server(a[0], &mut buf[..n])?;
-                return console_device::echo(instance.id, &buf[..n]).map(|n| n as i64);
+                return console_device::echo(instance.id, &buf).map(|n| n as i64);
             }
-            let mut done = 0u64;
-            let result = {
-                let _writer = console_device::writer()?;
-                loop {
-                    if done >= a[1] {
-                        break Ok(done as i64);
-                    }
-                    // Checked for every piece: a long write stops when the
-                    // console is taken away.
-                    if console_device::holder() != instance.id {
-                        break Err(EIO);
-                    }
-                    let n = (a[1] - done).min(buf.len() as u64) as usize;
-                    if let Err(e) = super::uaccess::copy_from_server(a[0] + done, &mut buf[..n]) {
-                        break Err(e);
-                    }
-                    console_device::write(&buf[..n]);
-                    done += n as u64;
-                }
-            };
-            console_device::flush_echo();
-            result
+            console_device::write_all(instance.id, &buf).map(|_| n as i64)
         }
         SYS_CONSOLE_INFO => {
             if crate::drivers::console_device::holder() != instance.id {

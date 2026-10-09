@@ -162,6 +162,56 @@ impl Node {
     }
 }
 
+impl Node {
+    /// Another reference to the same inode (a kernel inode: a new handle).
+    pub fn duplicate(&self) -> Result<Node, i64> {
+        Ok(match self {
+            Node::Kernel(k) => {
+                let mut walk = Walk::default();
+                let empty = "";
+                Node::Kernel(KInode::from_result(syscall(
+                    SYS_INODE_WALK,
+                    [k.handle(), empty.as_ptr() as u64, 0, &mut walk as *mut Walk as u64, 0, 0],
+                ))?)
+            }
+            Node::Tmp(t) => Node::Tmp(t.clone()),
+            Node::Data(d) => Node::Data(d.clone()),
+        })
+    }
+}
+
+/// What an open file description of the server's that is not a regular file or a
+/// directory (a terminal, null or zero, an `O_PATH` descriptor) was opened by: the node
+/// and its absolute path. Its status is the node's, live (fstat), and the calls on the
+/// descriptor that change the node (fchmod, fchown, futimens) or take it as a directory
+/// work on it.
+pub struct Origin {
+    pub node: Node,
+    pub path: String,
+    /// The node's file type (`S_IFMT` bits) when it was opened (it never changes).
+    pub kind: u32,
+}
+
+impl Origin {
+    pub fn new(node: Node, path: String, mode: u32) -> Origin {
+        Origin { node, path, kind: mode & vfs::S_IFMT }
+    }
+
+    pub fn stat(&self) -> Result<[u8; 144], i64> {
+        self.node.stat()
+    }
+}
+
+impl Drop for Origin {
+    /// A /data inode is let go of as an open file's is (`datafs::let_go`): unlinked, it
+    /// goes with its blocks at the end of the call that closed the last descriptor.
+    fn drop(&mut self) {
+        if let Node::Data(d) = &self.node {
+            datafs::let_go(d);
+        }
+    }
+}
+
 /// What a mount puts at its path.
 enum Fs {
     /// The kernel's tree at this path (names below its root).

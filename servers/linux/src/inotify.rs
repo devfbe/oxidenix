@@ -526,6 +526,8 @@ pub fn call(nr: u64, i: &Inotify, flags: u32, a1: u64, a2: u64) -> Result<i64, i
 pub fn instance(fd: u64) -> Result<Arc<Inotify>, i64> {
     match files::lookup(fd) {
         Some((File::Inotify(i), _)) => Ok(i),
+        // An O_PATH descriptor is no file (Linux's fdget fails).
+        Some((File::Path(_), _)) => Err(EBADF),
         // Another file (also one of the kernel's): not an inotify instance.
         Some(_) => Err(EINVAL),
         None => {

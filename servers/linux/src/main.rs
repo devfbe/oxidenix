@@ -29,6 +29,7 @@ mod mm;
 mod namespace;
 mod netdev;
 mod netlink;
+mod pathfile;
 mod paths;
 mod pipe;
 mod pty;
