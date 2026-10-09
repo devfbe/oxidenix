@@ -1099,7 +1099,7 @@ Linux x86_64 numbers, grouped by area (about 120 in total):
 | Power | `reboot` (power off ends QEMU, restart resets the machine; every process tree's page cache is written back first) |
 | Sockets | `socket` `bind` `listen` `accept` `accept4` `connect` `sendto` `recvfrom` `sendmsg` `recvmsg` `shutdown` `getsockname` `getpeername` `setsockopt` (ignored) `getsockopt` (`AF_INET`: TCP, UDP, raw ICMP); `AF_NETLINK` with `NETLINK_ROUTE` (the Linux server's: `RTM_GETLINK`, `RTM_GETADDR`); the interface requests of netdevice(7) on any socket (`SIOCGIFCONF`, `SIOCGIFINDEX`, `SIOCGIFNAME`, `SIOCGIFFLAGS`, `SIOCGIFADDR`, `SIOCGIFNETMASK`, `SIOCGIFBRDADDR`, `SIOCGIFHWADDR`, `SIOCGIFMTU`) |
 | Time | `clock_gettime` `clock_getres` `clock_settime` (every Linux clock, including the CPU-time clocks of threads and processes) `gettimeofday` `settimeofday` `time` `times` `getrusage` `nanosleep` `clock_nanosleep` (relative and `TIMER_ABSTIME`) |
-| Misc | `getrandom`; `io_uring_setup`, `io_uring_enter`, `io_uring_register` answer `ENOSYS` (from the Linux server, quietly: libuv probes them and uses epoll) |
+| Misc | `getrandom` (ChaCha20 with fast key erasure, seeded at boot from RDSEED or RDRAND and timing jitter, reseeded as it is used; also `AT_RANDOM`); `io_uring_setup`, `io_uring_enter`, `io_uring_register` answer `ENOSYS` (from the Linux server, quietly: libuv probes them and uses epoll) |
 
 Everything runs as root. Unknown syscalls print a kernel message and return `ENOSYS`.
 
@@ -1126,6 +1126,7 @@ Each of these programs and scripts lives in the root filesystem and runs inside 
 | `threadtest` | pthreads: create/join, own tids, TLS, 4 threads counting under a mutex, condition variables and timed waits, 300 threads in a row, `Threads:` in `/proc/self/status`, `exit` and fatal signals ending all threads, the process outliving its main thread, group stop and continue, process signals reaching a thread that does not block them, `pthread_kill`, `fork` and `execve` in a thread, real `vfork`, `posix_spawn`, `munmap` and `mprotect` reaching a writer on another CPU (TLB shootdown), `MADV_DONTNEED` in a loop under three writer threads while another process checks fresh memory for stray stores (this hung the scheduler before) |
 | `futextest` | `FUTEX_WAIT` on a changed value (`EAGAIN`), timeouts, `EINVAL`/`EFAULT`, interruption by a signal (`EINTR`), shared futexes across processes, private memory keeping separate keys after `fork`, bitsets, `FUTEX_CMP_REQUEUE` |
 | `timetest` | nanosecond resolution of `CLOCK_MONOTONIC`, no step back on one CPU or between two, `clock_getres`, invalid clocks, `BOOTTIME`, `RAW`, `COARSE`, `gettimeofday` and `time` against `CLOCK_REALTIME`, `clock_settime` moving only the wall clock, thread and process CPU clocks (spinning counts, sleeping does not, `pthread_getcpuclockid`, `clock_getcpuclockid`), `getrusage` for the process, the thread and reaped children, `times`, `wait4`'s rusage (a reaped child's CPU time with its own children's, its peak memory, also across `exec`) |
+| `randtest` | `getrandom` (the kernel's ChaCha20 generator, seeded from RDSEED/RDRAND and timing jitter): flags (`GRND_NONBLOCK`, `GRND_RANDOM`, `GRND_INSECURE`, `EINVAL` for unknown ones and `GRND_INSECURE` with `GRND_RANDOM`), answers that differ, 1 MiB at once with every byte value about as often, `EFAULT`; `AT_RANDOM` differing between processes |
 | `timertest` | sleeps and timeouts end when due, not at the next tick, and never early (median and minimum of nine 1–2 ms waits in `nanosleep`, `poll`, `select`, `futex`, `sigtimedwait`), 100 × `usleep(100)`, `clock_nanosleep` absolute (monotonic, past wall-clock times) and on `CLOCK_BOOTTIME`, refusal on CPU clocks, the time left after an interrupted `nanosleep`, a 2 ms `setitimer` interval firing about 50 times in 100 ms, a 1 µs interval timer leaving another process on its CPU its share (and, ignored, its own process), an ignored timer resuming once handled |
 | `polltest` | `poll` and `select` wake within 1 ms of a pipe write or a datagram over loopback (median of nine, the writer on the same or another CPU, next to an idle descriptor), a full pipe polling writable once drained, `POLLHUP` when the last writer closes, `EINTR` in a `poll` waiting on files |
 | `eventfdtest` | `eventfd` counting (initial value, adding writes, reset on read), `EFD_SEMAPHORE`, `EFD_NONBLOCK` and `EFD_CLOEXEC`, `EINVAL` for short reads, 2^64-1 and unknown flags, a full counter (`EAGAIN`, poll state), a blocking read woken by another process, `poll` waking within 1 ms of a write |
@@ -1187,7 +1188,7 @@ fixed:
 - spinlock self-deadlocks and sleeping while holding an inode lock
 - the `sysret` non-canonical return problem, which the `iretq` return path avoids entirely
 
-Known open issues: `getrandom` and `AT_RANDOM` are not cryptographically secure, any process may
+Known open issues: any process may
 call `reboot` or set the wall clock (everything runs as root), the kernel heap
 never returns grown memory to the frame allocator, and there are no users or permissions
 (everything runs as root). The ext2 driver trusts the on-disk metadata of the image it was given.

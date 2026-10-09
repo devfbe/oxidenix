@@ -1,5 +1,5 @@
 [workspace]
-members = ["kernel", "builder", "crates/fsproto", "crates/ext2fs", "crates/oxrt", "crates/procproto", "crates/virtio", "crates/restricted", "crates/vfs", "crates/slab", "crates/ring", "crates/fsring", "crates/netlink", "crates/netring", "crates/ldisc", "servers/linux", "servers/diskfs", "servers/netd", "servers/procfs", "servers/ringtest"]
+members = ["kernel", "builder", "crates/fsproto", "crates/ext2fs", "crates/oxrt", "crates/procproto", "crates/virtio", "crates/restricted", "crates/vfs", "crates/slab", "crates/ring", "crates/fsring", "crates/netlink", "crates/netring", "crates/ldisc", "crates/csprng", "servers/linux", "servers/diskfs", "servers/netd", "servers/procfs", "servers/ringtest"]
 resolver = "2"
 # Vendored crates are workspaces of their own (their tests run there).
 exclude = ["third_party"]

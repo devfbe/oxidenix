@@ -21,6 +21,7 @@ procproto = { path = "../crates/procproto" }
 restricted = { path = "../crates/restricted" }
 vfs = { path = "../crates/vfs" }
 ring = { path = "../crates/ring" }
+csprng = { path = "../crates/csprng" }
 noto-sans-mono-bitmap = { version = "0.2", features = ["size_24", "unicode-latin-1-supplement", "unicode-specials"] }
 linked_list_allocator = "0.10"
 slab = { path = "../crates/slab" }

@@ -20,6 +20,7 @@ mod fs;
 mod interrupts;
 mod memory;
 mod process;
+mod random;
 mod shell;
 pub mod smp;
 pub mod sync;
@@ -53,6 +54,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     let rsdp = boot_info.rsdp_addr.into_option().expect("bootloader found no ACPI RSDP");
     interrupts::init_controllers(rsdp);
     time::init();
+    random::init();
     timer::init(interrupts::apic::timer_hz());
     timer::init_cpu();
     fs::init(ramdisk);
