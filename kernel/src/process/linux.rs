@@ -1788,6 +1788,7 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             let (user, system) = group.info.lock().cputime();
             Ok(((user + system) / 1_000_000) as i64)
         }
+        SYS_TEST_MODE => Ok(crate::TEST_MODE.load(core::sync::atomic::Ordering::Relaxed) as i64),
         SYS_KFD_LIST => {
             let (from, buf, cap) = (a[0], a[1], a[2]);
             if cap > KFD_LIST_MAX {

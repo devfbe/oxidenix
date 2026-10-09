@@ -788,6 +788,11 @@ pub const SYS_PROC_INFO: u64 = 1116;
 /// /proc/self/fd until the descriptor table is the server's (R6e).
 pub const SYS_KFD_LIST: u64 = 1117;
 pub const KFD_LIST_MAX: u64 = 256;
+/// `test_mode() -> 0 | 1`: whether the kernel runs in test mode (it booted
+/// into /etc/autorun: the self-tests, a benchmark or a scripted run). The
+/// server's test hooks (`TEST_*`, which reach beyond their caller) answer
+/// only then, ENOSYS otherwise.
+pub const SYS_TEST_MODE: u64 = 1118;
 
 /// `(scenario)`: the server runs a channel scenario against the test
 /// service (servers/ringtest, `ring::selftest`): 1 rings and doorbells, 2

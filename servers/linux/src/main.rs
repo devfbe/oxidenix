@@ -67,6 +67,22 @@ const SYS_IO_URING_SETUP: u64 = 425;
 const SYS_IO_URING_ENTER: u64 = 426;
 const SYS_IO_URING_REGISTER: u64 = 427;
 
+/// Whether the kernel runs the self-tests (`SYS_TEST_MODE`), asked once:
+/// 0 not yet known, 1 no, 2 yes.
+static TEST_MODE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Whether the test hooks (`TEST_*`) answer: in test mode only.
+fn test_mode() -> bool {
+    match TEST_MODE.load(Ordering::Relaxed) {
+        0 => {
+            let on = syscall(SYS_TEST_MODE, [0; 6]) == 1;
+            TEST_MODE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+        known => known == 2,
+    }
+}
+
 pub(crate) fn syscall(nr: u64, a: [u64; 6]) -> i64 {
     let ret: i64;
     unsafe {
@@ -117,6 +133,10 @@ pub extern "C" fn _start(state: *mut State, role: u64) -> ! {
             continue;
         }
         match s.rax {
+            // The test hooks reach beyond the caller (the instance's test
+            // objects, the test service, /data files, the server's heap and
+            // locks): only for the self-tests.
+            TEST_MAP..=TEST_MKWRITE_FAIL if !test_mode() => s.rax = -ENOSYS as u64,
             TEST_MAP..=TEST_CACHED => s.rax = test(s.rax, s.rdi) as u64,
             // The kernel's to answer, with the name in the server's memory.
             TEST_SERVER_TICKS => {
