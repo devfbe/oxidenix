@@ -280,7 +280,11 @@ static HANDED: AtomicU32 = AtomicU32::new(0);
 static RELEASED: AtomicU32 = AtomicU32::new(0);
 
 /// The worker: lets go of the tables handed to it, one by one in the order they came (the
-/// queue keeps its room), and tells their processes.
+/// queue keeps its room), and tells their processes. One table's closing never holds up the
+/// ones after it for long: on the worker (a service thread) nothing a description's close
+/// does waits for another party (an internet socket closes through the net thread, a /data
+/// inode goes at the next `datafs::reap`, a socket's messages in flight go to the
+/// collector), so the order costs no process's end more than the closing work before it.
 pub fn release_ended() {
     let mut n = 0;
     loop {

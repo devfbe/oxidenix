@@ -9,17 +9,18 @@
 //! its bucket lock before sleeping, so no wakeup is lost. Acquire on lock
 //! and Release on unlock order the protected data.
 //!
-//! Waits are not interruptible by the program's signals, nor at once ended
-//! by the thread's death (`FUTEX_LOCK`): the server holds these locks for
-//! short, bounded work (like a kernel's spinlocks, never across a copy of
-//! program memory or a page wait), and a dying thread still runs server
-//! code that takes them (`process::exit_killed` lets go of its descriptor
-//! table and ends the thread). So a dying thread sleeps for a lock as any
-//! other, for at most a second (the kernel's grace): a holder that does not
-//! let go by then is wedged, and the dying thread ends where it is
-//! (`abandon`) rather than wait on, unless it holds such locks itself (they
-//! would never be let go of). Locks held across waits for other parties or
-//! copies of program memory are `SleepLock`s, whose waits end on death.
+//! **The rule.** A `Mutex` or `RwLock` is held for bounded work only: never
+//! across a copy of program memory (a page fault may wait for the pager and
+//! for diskfs), a wait for another party (diskfs, netd, procfs, a channel's
+//! offer, a page, a pipe's or socket's peer), or a call that takes a lock
+//! held across one. Their waits are like a kernel's spinlock or plain mutex:
+//! not interruptible by the program's signals, nor ended by the thread's
+//! death (`FUTEX_LOCK`); a dying thread still runs server code that takes
+//! them (`process::exit_killed` lets go of its descriptor table and ends the
+//! thread), and their holders let go in bounded time. A lock that is held
+//! across such waits is a `SleepMutex` (`SleepLock`) or `SleepRwLock`
+//! (Linux's mutex_lock_killable): its wait ends with EINTR when the waiting
+//! thread dies and the caller unwinds; its holders are not priority-boosted.
 //!
 //! Priority: the server runs on its programs' threads, with their nice
 //! values. A low-priority thread preempted while it holds a lock would
@@ -79,22 +80,6 @@ fn unhold() {
 
 const EINTR: i64 = 4;
 
-/// A dying thread waited a second for a lock whose holder does not let go. Holding no
-/// lock of its own, it ends here (the kernel lets go of what it holds; its descriptor table
-/// goes on the worker). Holding some, it must not: they would never be let go of and would
-/// wedge the instance; it waits on (another grace) for the holder, which these locks'
-/// rule (bounded work only) makes let go.
-#[cold]
-fn abandon() {
-    if held().load(Ordering::Relaxed) != 0 {
-        return;
-    }
-    let msg = "[linux] a dying thread gave up a server lock its holder did not let go of\n";
-    syscall(restricted::SYS_SERVER_LOG, [msg.as_ptr() as u64, msg.len() as u64, 0, 0, 0, 0]);
-    syscall(restricted::SYS_THREAD_EXIT, [9, 0, 0, 0, 0, 0]);
-    unreachable!("thread_exit returned")
-}
-
 pub struct Mutex<T> {
     state: AtomicU32,
     data: UnsafeCell<T>,
@@ -113,9 +98,8 @@ impl<T> Mutex<T> {
         if self.state.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_err() {
             while self.state.swap(2, Ordering::Acquire) != 0 {
                 let addr = &self.state as *const AtomicU32 as u64;
-                if syscall(SYS_SERVER_FUTEX_WAIT, [addr, 2, 0, FUTEX_LOCK, 0, 0]) == -EINTR {
-                    abandon();
-                }
+                // (Ends only when woken: bounded work holds it.)
+                syscall(SYS_SERVER_FUTEX_WAIT, [addr, 2, 0, FUTEX_LOCK, 0, 0]);
             }
         }
         hold();
@@ -150,22 +134,25 @@ impl<T> Drop for MutexGuard<'_, T> {
     }
 }
 
-/// A lock held across waits for other parties and copies of program memory (a socket's or
-/// a pipe's readers and writers, as Linux's iolock or pipe mutex): no lock of the kind above,
-/// whose holders only do bounded work. Its wait ends with EINTR when the waiting thread dies
-/// (a holder may wait for a page of a program's file or for netd as long as they take), and
-/// it is not counted among the thread's held locks (no priority boost, no say in `abandon`).
-pub struct SleepLock {
+/// A sleeping lock with data, held across waits for other parties and copies of program
+/// memory (Linux's mutex_lock_killable): its wait ends with EINTR when the waiting thread
+/// dies, and the caller unwinds (`?`). Not counted among the thread's held locks: a holder
+/// is not priority-boosted (it may hold it for as long as a page or a service takes).
+pub struct SleepMutex<T> {
     state: AtomicU32,
+    data: UnsafeCell<T>,
 }
 
-impl SleepLock {
-    pub const fn new() -> Self {
-        SleepLock { state: AtomicU32::new(0) }
+unsafe impl<T: Send> Sync for SleepMutex<T> {}
+unsafe impl<T: Send> Send for SleepMutex<T> {}
+
+impl<T> SleepMutex<T> {
+    pub const fn new(data: T) -> Self {
+        SleepMutex { state: AtomicU32::new(0), data: UnsafeCell::new(data) }
     }
 
     /// Takes the lock; EINTR if the thread dies while it waits.
-    pub fn lock(&self) -> Result<SleepGuard<'_>, i64> {
+    pub fn lock(&self) -> Result<SleepMutexGuard<'_, T>, i64> {
         if self.state.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_err() {
             while self.state.swap(2, Ordering::Acquire) != 0 {
                 let addr = &self.state as *const AtomicU32 as u64;
@@ -175,29 +162,45 @@ impl SleepLock {
                 }
             }
         }
-        Ok(SleepGuard { lock: self })
+        Ok(SleepMutexGuard { mutex: self })
     }
 }
 
-pub struct SleepGuard<'a> {
-    lock: &'a SleepLock,
+pub struct SleepMutexGuard<'a, T> {
+    mutex: &'a SleepMutex<T>,
 }
 
-impl Drop for SleepGuard<'_> {
+impl<T> Deref for SleepMutexGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        unsafe { &*self.mutex.data.get() }
+    }
+}
+
+impl<T> DerefMut for SleepMutexGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        unsafe { &mut *self.mutex.data.get() }
+    }
+}
+
+impl<T> Drop for SleepMutexGuard<'_, T> {
     fn drop(&mut self) {
-        if self.lock.state.swap(0, Ordering::Release) == 2 {
-            let addr = &self.lock.state as *const AtomicU32 as u64;
+        if self.mutex.state.swap(0, Ordering::Release) == 2 {
+            let addr = &self.mutex.state as *const AtomicU32 as u64;
             syscall(SYS_SERVER_FUTEX_WAKE, [addr, 1, 0, 0, 0, 0]);
         }
     }
 }
 
-/// A reader-writer lock without data: any number of readers or one writer.
-/// Its state is a `Mutex`'s (readers, writer, writers waiting); a waiter
-/// sleeps on `changed`, which every unlock that may let someone in
-/// advances (read under the state lock before sleeping, so no wakeup is
-/// lost). Once a writer waits, new readers wait too.
-pub struct RwLock {
+/// A `SleepMutex` without data (a socket's or a pipe's readers and writers, as Linux's
+/// iolock and pipe mutex).
+pub type SleepLock = SleepMutex<()>;
+
+/// The state of a reader-writer lock: any number of readers or one writer, under a
+/// `Mutex`; a waiter sleeps on `changed`, which every unlock that may let someone in
+/// advances (read under the state lock before sleeping, so no wakeup is lost). Once a
+/// writer waits, new readers wait too.
+struct RwCore {
     state: Mutex<RwState>,
     changed: AtomicU32,
 }
@@ -208,27 +211,29 @@ struct RwState {
     writers_waiting: u32,
 }
 
-impl RwLock {
-    pub const fn new() -> Self {
-        RwLock { state: Mutex::new(RwState { readers: 0, writer: false, writers_waiting: 0 }), changed: AtomicU32::new(0) }
+impl RwCore {
+    const fn new() -> Self {
+        RwCore { state: Mutex::new(RwState { readers: 0, writer: false, writers_waiting: 0 }), changed: AtomicU32::new(0) }
     }
 
-    pub fn read(&self) -> ReadGuard<'_> {
+    /// Waits for a share; with `killable`, EINTR if the thread dies meanwhile.
+    fn read(&self, killable: bool) -> Result<(), i64> {
         loop {
             let seen = {
                 let mut st = self.state.lock();
                 if !st.writer && st.writers_waiting == 0 {
                     st.readers += 1;
-                    hold();
-                    return ReadGuard { lock: self };
+                    return Ok(());
                 }
                 self.changed.load(Ordering::Acquire)
             };
-            self.sleep(seen);
+            self.sleep(seen, killable)?;
         }
     }
 
-    pub fn write(&self) -> WriteGuard<'_> {
+    /// Waits for the lock alone; with `killable`, EINTR if the thread dies meanwhile (its
+    /// place among the waiting writers given up, so readers it held off go on).
+    fn write(&self, killable: bool) -> Result<(), i64> {
         let mut waiting = false;
         loop {
             let seen = {
@@ -238,8 +243,7 @@ impl RwLock {
                     if waiting {
                         st.writers_waiting -= 1;
                     }
-                    hold();
-                    return WriteGuard { lock: self };
+                    return Ok(());
                 }
                 if !waiting {
                     st.writers_waiting += 1;
@@ -247,21 +251,66 @@ impl RwLock {
                 }
                 self.changed.load(Ordering::Acquire)
             };
-            self.sleep(seen);
+            if let Err(e) = self.sleep(seen, killable) {
+                self.state.lock().writers_waiting -= 1;
+                self.advance();
+                return Err(e);
+            }
         }
     }
 
-    fn sleep(&self, seen: u32) {
+    fn sleep(&self, seen: u32, killable: bool) -> Result<(), i64> {
         let addr = &self.changed as *const AtomicU32 as u64;
-        if syscall(SYS_SERVER_FUTEX_WAIT, [addr, seen as u64, 0, FUTEX_LOCK, 0, 0]) == -EINTR {
-            abandon();
+        let flags = if killable { 0 } else { FUTEX_LOCK };
+        if syscall(SYS_SERVER_FUTEX_WAIT, [addr, seen as u64, 0, flags, 0, 0]) == -EINTR && killable {
+            return Err(EINTR);
         }
+        Ok(())
     }
 
     fn advance(&self) {
         self.changed.fetch_add(1, Ordering::Release);
         let addr = &self.changed as *const AtomicU32 as u64;
         syscall(SYS_SERVER_FUTEX_WAKE, [addr, u32::MAX as u64, 0, 0, 0, 0]);
+    }
+
+    fn read_done(&self) {
+        let wake = {
+            let mut st = self.state.lock();
+            st.readers -= 1;
+            st.readers == 0 && st.writers_waiting > 0
+        };
+        if wake {
+            self.advance();
+        }
+    }
+
+    fn write_done(&self) {
+        self.state.lock().writer = false;
+        self.advance();
+    }
+}
+
+/// A reader-writer lock without data for bounded work (as `Mutex`).
+pub struct RwLock {
+    core: RwCore,
+}
+
+impl RwLock {
+    pub const fn new() -> Self {
+        RwLock { core: RwCore::new() }
+    }
+
+    pub fn read(&self) -> ReadGuard<'_> {
+        let _ = self.core.read(false);
+        hold();
+        ReadGuard { lock: self }
+    }
+
+    pub fn write(&self) -> WriteGuard<'_> {
+        let _ = self.core.write(false);
+        hold();
+        WriteGuard { lock: self }
     }
 }
 
@@ -271,14 +320,7 @@ pub struct ReadGuard<'a> {
 
 impl Drop for ReadGuard<'_> {
     fn drop(&mut self) {
-        let wake = {
-            let mut st = self.lock.state.lock();
-            st.readers -= 1;
-            st.readers == 0 && st.writers_waiting > 0
-        };
-        if wake {
-            self.lock.advance();
-        }
+        self.lock.core.read_done();
         unhold();
     }
 }
@@ -289,8 +331,49 @@ pub struct WriteGuard<'a> {
 
 impl Drop for WriteGuard<'_> {
     fn drop(&mut self) {
-        self.lock.state.lock().writer = false;
-        self.lock.advance();
+        self.lock.core.write_done();
         unhold();
+    }
+}
+
+/// A reader-writer lock without data held across waits for other parties (as
+/// `SleepMutex`): its waits end with EINTR when the waiting thread dies.
+pub struct SleepRwLock {
+    core: RwCore,
+}
+
+impl SleepRwLock {
+    pub const fn new() -> Self {
+        SleepRwLock { core: RwCore::new() }
+    }
+
+    pub fn read(&self) -> Result<SleepReadGuard<'_>, i64> {
+        self.core.read(true)?;
+        Ok(SleepReadGuard { lock: self })
+    }
+
+    pub fn write(&self) -> Result<SleepWriteGuard<'_>, i64> {
+        self.core.write(true)?;
+        Ok(SleepWriteGuard { lock: self })
+    }
+}
+
+pub struct SleepReadGuard<'a> {
+    lock: &'a SleepRwLock,
+}
+
+impl Drop for SleepReadGuard<'_> {
+    fn drop(&mut self) {
+        self.lock.core.read_done();
+    }
+}
+
+pub struct SleepWriteGuard<'a> {
+    lock: &'a SleepRwLock,
+}
+
+impl Drop for SleepWriteGuard<'_> {
+    fn drop(&mut self) {
+        self.lock.core.write_done();
     }
 }

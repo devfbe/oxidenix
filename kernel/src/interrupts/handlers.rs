@@ -128,8 +128,10 @@ fn exception(frame: &mut Frame) {
     }
     if frame.from_user() && crate::process::linux::mode() == Some(false) {
         // A dying thread's server whose access ended with the thread's death
-        // (a page wait cut short) did not fail: the thread just ends.
-        if vector == 14 && signal::dying() {
+        // (a page wait cut short) did not fail: the thread just ends, if it
+        // holds none of the server's locks (else the diagnostic: they are
+        // lost with it).
+        if vector == 14 && signal::dying() && crate::process::sched::current_server_locks() == 0 {
             crate::process::exit_thread(signal::SIGKILL as i32);
         }
         // The Linux server failed: its process cannot go on.

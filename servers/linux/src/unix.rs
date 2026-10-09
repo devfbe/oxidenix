@@ -539,7 +539,7 @@ impl Sock {
             qlen: AtomicUsize::new(0),
             peer_addr: AtomicUsize::new(0),
             waiters: Mutex::new(Vec::new()),
-            rlock: crate::sync::SleepLock::new(),
+            rlock: crate::sync::SleepLock::new(()),
             inner: Mutex::new(Inner {
                 state: State::Unconnected,
                 connecting: false,

@@ -254,16 +254,17 @@ fn page_up(x: u64) -> u64 {
 }
 
 /// Bytes the execve calls of one process may hold of their arguments and environments at
-/// once (on the server's heap, shared by the tree): one call with Linux's largest and a
-/// script interpreter's copy of its arguments, with the buffers' slack. Per process, so that
-/// no process alone keeps the others of the tree from running a program.
-const EXEC_STRINGS_MAX: usize = 3 * MAX_ARGS_TOTAL;
-/// And all execve calls of the instance together (the server's heap is the tree's): eight
-/// processes' worth of the largest.
+/// once (on the server's heap, shared by the tree): one call with Linux's largest (its
+/// arguments and environment, each buffer up to twice what it holds as it grows) and a
+/// script interpreter's copy of its arguments. Per process, so that no process alone keeps
+/// the others of the tree from running a program (it takes half of the tree's bound); a
+/// second execve of the same process at the same time (another thread) gets what is left.
+const EXEC_STRINGS_MAX: usize = 4 * MAX_ARGS_TOTAL;
+/// And all execve calls of the instance together (the server's heap is the tree's).
 const EXEC_STRINGS_INSTANCE_MAX: usize = 8 * MAX_ARGS_TOTAL;
 static EXEC_STRINGS_INSTANCE: AtomicUsize = AtomicUsize::new(0);
-/// A buffer grows by this much at least (its slack is charged too).
-const STRINGS_CHUNK: usize = 64 * 1024;
+/// A buffer's first size; it doubles as it grows (its slack is charged too).
+const STRINGS_FIRST: usize = 4096;
 
 /// An execve's arguments or environment: NUL-terminated strings back to back in one buffer
 /// (one allocation, not one per string), charged to its process (`EXEC_STRINGS_MAX`) while
@@ -281,14 +282,15 @@ impl Strings {
     }
 
     /// Room for `n` more bytes. What the buffer takes of the heap (its whole capacity, grown
-    /// in chunks) is charged before it is allocated, to the process and to the instance
+    /// geometrically) is charged before it is allocated, to the process and to the instance
     /// (ENOMEM beyond either bound); `Drop` gives back exactly what was charged.
     fn charge(&mut self, n: usize) -> Result<(), i64> {
         let need = self.bytes.len().checked_add(n).ok_or(ENOMEM)?;
         if need <= self.bytes.capacity() {
             return Ok(());
         }
-        let new_cap = need.next_multiple_of(STRINGS_CHUNK);
+        // Doubling (amortized copies), at least what is needed.
+        let new_cap = need.max(self.bytes.capacity().saturating_mul(2)).max(STRINGS_FIRST);
         let more = new_cap - self.bytes.capacity();
         if self.account.fetch_add(more, Ordering::Relaxed) + more > EXEC_STRINGS_MAX {
             self.account.fetch_sub(more, Ordering::Relaxed);
@@ -299,9 +301,15 @@ impl Strings {
             self.account.fetch_sub(more, Ordering::Relaxed);
             return Err(ENOMEM);
         }
-        self.charged += more;
         let len = self.bytes.len();
-        self.bytes.try_reserve_exact(new_cap - len).map_err(|_| ENOMEM)
+        if self.bytes.try_reserve_exact(new_cap - len).is_err() {
+            // Nothing taken: nothing charged.
+            EXEC_STRINGS_INSTANCE.fetch_sub(more, Ordering::Relaxed);
+            self.account.fetch_sub(more, Ordering::Relaxed);
+            return Err(ENOMEM);
+        }
+        self.charged += more;
+        Ok(())
     }
 
     fn push(&mut self, s: &[u8]) -> Result<(), i64> {

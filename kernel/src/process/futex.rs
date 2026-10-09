@@ -183,33 +183,27 @@ pub enum Ends {
     Interrupted,
     /// Only the thread's death.
     Dying,
-    /// A lock of the Linux server's in its own memory
-    /// (`restricted::FUTEX_LOCK`): its holder lets go in bounded time, and a
-    /// dying thread's server still needs the lock to end the thread, so a
-    /// dying thread waits on, but at most `LOCK_GRACE` from when its death
-    /// was seen: no wait outlasts the waiter's death for long, even on a
-    /// holder that never lets go.
+    /// Nothing more: a lock of the Linux server's in its own memory
+    /// (`restricted::FUTEX_LOCK`), held for bounded work only (as a kernel's
+    /// spinlock or a mutex that is not killable), which a dying thread's
+    /// server still takes to end the thread.
     Lock,
 }
 
-/// How long a dying thread still waits for a lock of the Linux server's.
-const LOCK_GRACE: u64 = 1_000_000_000;
-
 impl Ends {
-    /// Whether the wait ends now (`grace`: when a dying thread's lock wait
-    /// gives up, set at the first look that sees the death).
-    fn now(self, grace: &mut Option<u64>) -> bool {
+    /// Whether the wait ends now.
+    fn now(self) -> bool {
         match self {
             Ends::Interrupted => signal::interrupted(),
             Ends::Dying => signal::dying(),
-            Ends::Lock => signal::dying() && crate::time::now() >= *grace.get_or_insert(crate::time::now() + LOCK_GRACE),
+            Ends::Lock => false,
         }
     }
 }
 
-/// Sleeps on `wait` until woken or the earlier of `deadline` and `grace`.
-fn sleep_on(wait: super::sched::Wait, deadline: Option<u64>, grace: Option<u64>) {
-    match deadline.into_iter().chain(grace).min() {
+/// Sleeps on `wait` until woken or `deadline`.
+fn sleep_on(wait: super::sched::Wait, deadline: Option<u64>) {
+    match deadline {
         Some(d) => wait.sleep_until(d),
         None => wait.sleep(),
     }
@@ -255,7 +249,6 @@ fn wait_on(
             }
         }
     };
-    let mut grace = None;
     let result = loop {
         if me.futex_woken.load(Ordering::Acquire) {
             break Ok(0);
@@ -263,10 +256,10 @@ fn wait_on(
         if deadline.is_some_and(|d| crate::time::now() >= d) {
             break Err(ETIMEDOUT);
         }
-        if ends.now(&mut grace) {
+        if ends.now() {
             break Err(EINTR);
         }
-        sleep_on(wait, deadline, grace);
+        sleep_on(wait, deadline);
         wait = prepare_to_sleep();
     };
     drop(wait);
@@ -469,7 +462,6 @@ pub fn server_waitv(words: &[WaitWord], deadline: Option<u64>, ends: Ends) -> Re
         b.push(Waiter { key: w.key, sleeper: Sleeper::Task(current_arc()), bitset: FUTEX_BITSET_MATCH_ANY });
         queued += 1;
     }
-    let mut grace = None;
     let result = match early {
         Some(e) => Err(e),
         None => loop {
@@ -479,10 +471,10 @@ pub fn server_waitv(words: &[WaitWord], deadline: Option<u64>, ends: Ends) -> Re
             if deadline.is_some_and(|d| crate::time::now() >= d) {
                 break Err(ETIMEDOUT);
             }
-            if ends.now(&mut grace) {
+            if ends.now() {
                 break Err(EINTR);
             }
-            sleep_on(wait, deadline, grace);
+            sleep_on(wait, deadline);
             wait = prepare_to_sleep();
         },
     };

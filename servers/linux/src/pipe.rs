@@ -109,7 +109,7 @@ pub fn new() -> (Arc<PipeEnd>, Arc<PipeEnd>) {
     ];
     let shared = Arc::new(Shared {
         inner: Mutex::new(Inner { buf: VecDeque::new(), readers: 1, writers: 1, ends }),
-        rlock: crate::sync::SleepLock::new(),
+        rlock: crate::sync::SleepLock::new(()),
         seq: AtomicU32::new(0),
         ino: rid,
     });

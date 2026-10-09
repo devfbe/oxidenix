@@ -162,8 +162,8 @@ impl InetSock {
             index,
             id: AtomicU64::new(0),
             rings: Mutex::new(rings),
-            rlock: crate::sync::SleepLock::new(),
-            wlock: crate::sync::SleepLock::new(),
+            rlock: crate::sync::SleepLock::new(()),
+            wlock: crate::sync::SleepLock::new(()),
             st: Mutex::new(Local {
                 connecting: false,
                 rings_sent,

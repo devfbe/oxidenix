@@ -1508,7 +1508,18 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             if set { Ok(0) } else { Err(EBUSY) }
         }
         SYS_CLOCK_READ => super::sys_time::read_own_clock(a[0]).map(|ns| ns as i64),
-        SYS_SLEEP_UNTIL => super::sleep_until(a[0]).map(|_| 0),
+        SYS_SLEEP_UNTIL => match a[1] {
+            0 => super::sleep_until(a[0]).map(|_| 0),
+            SLEEP_NAP => {
+                let now = crate::time::now();
+                if a[0] > now.saturating_add(NAP_MAX) {
+                    return Err(EINVAL);
+                }
+                super::sched::prepare_to_sleep().sleep_until(a[0]);
+                Ok(0)
+            }
+            _ => Err(EINVAL),
+        },
         SYS_YIELD => {
             super::yield_now();
             Ok(0)
