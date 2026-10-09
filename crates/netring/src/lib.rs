@@ -825,12 +825,6 @@ impl Budget {
         self.owner(owner).held
     }
 
-    /// Whether `owner` holds more than its reserve: only then may another
-    /// instance's need take something of it (netd recycling a TIME-WAIT
-    /// connection), never below the reserve.
-    pub fn beyond_reserve(&self, owner: u64) -> bool {
-        self.held(owner) > self.reserve
-    }
 
     pub fn used(&self) -> usize {
         self.used

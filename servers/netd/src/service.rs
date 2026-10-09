@@ -116,11 +116,11 @@ const TRIM_AFTER: Duration = Duration::from_millis(500);
 const RESERVED_INSTANCES: usize = 2 * MAX_CHANNELS;
 /// smoltcp sockets at once (each takes its place in smoltcp's socket set,
 /// on netd's heap, made room for at the start).
-pub const MAX_SMOLTCP: usize = 4096;
+pub const MAX_SMOLTCP: usize = 2048;
 /// Connections closed but not finished (sending leftovers, FIN-WAIT,
 /// LAST-ACK, CLOSING): beyond this a close resets the connection, as
 /// Linux's tcp_max_orphans.
-const MAX_ORPHANS: usize = 4096;
+const MAX_ORPHANS: usize = 2048;
 /// Channels of one instance (one, and a new one while netd still tears
 /// down the old after its client gave it up).
 const INSTANCE_CHANNELS: usize = 2;
@@ -935,16 +935,12 @@ impl Service {
         F: FnOnce(&'static mut [u8], &'static mut [u8], &mut SocketSet<'static>) -> SocketHandle,
     {
         let bytes = mapped(rx) + mapped(tx);
-        // Its share or the whole is used up: its own oldest connection in
-        // TIME-WAIT makes room, else the oldest of anyone's (TIME-WAIT never
-        // refuses an instance service, as Linux drops TIME-WAIT beyond
-        // tcp_max_tw_buckets).
+        // Its share is used up: its own oldest connection in TIME-WAIT
+        // makes room (TIME-WAIT never refuses an instance service, as Linux
+        // drops TIME-WAIT beyond tcp_max_tw_buckets). Never another
+        // instance's: what one instance does touches no other's state.
         let mut charged = self.socks.charge(owner, 1);
-        if charged.is_err() && self.recycle_time_wait(Some(owner), sockets) {
-            charged = self.socks.charge(owner, 1);
-        }
-        // (Others' only help while the owner is below its own cap.)
-        while charged.is_err() && self.socks.held(owner) < MAX_SMOLTCP && self.recycle_time_wait(None, sockets) {
+        if charged.is_err() && self.recycle_time_wait(owner, sockets) {
             charged = self.socks.charge(owner, 1);
         }
         charged?;
@@ -963,22 +959,16 @@ impl Service {
         Ok(h)
     }
 
-    /// Ends the oldest connection in TIME-WAIT of `owner` (None: of any
-    /// instance holding more sockets than its reserve: another instance's
-    /// need never takes one below it), silently (it leaves smoltcp: nothing
-    /// is sent); false if there is none. Everything it held goes back to
-    /// its own instance.
-    fn recycle_time_wait(&mut self, owner: Option<u64>, sockets: &mut SocketSet<'static>) -> bool {
+    /// Ends `owner`'s oldest connection in TIME-WAIT, silently (it leaves
+    /// smoltcp: nothing is sent); false if it has none. Everything it held
+    /// goes back to it.
+    fn recycle_time_wait(&mut self, owner: u64, sockets: &mut SocketSet<'static>) -> bool {
         let now = crate::now();
-        let socks = &self.socks;
         let oldest = self
             .closing
             .iter()
             .enumerate()
-            .filter(|(_, cl)| match owner {
-                Some(o) => cl.owner == o,
-                None => socks.beyond_reserve(cl.owner),
-            })
+            .filter(|(_, cl)| cl.owner == owner)
             .filter(|(_, cl)| sockets.get::<tcp::Socket>(cl.handle).state() == tcp::State::TimeWait)
             .min_by_key(|(_, cl)| cl.time_wait.unwrap_or(now))
             .map(|(i, _)| i);

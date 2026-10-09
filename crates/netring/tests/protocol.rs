@@ -697,21 +697,6 @@ fn echo_ids_keep_instances_apart() {
     assert!(ids.is_empty());
 }
 
-/// What another instance's need may take of an instance (netd's TIME-WAIT
-/// recycling): only what it holds beyond its reserve.
-#[test]
-fn only_what_is_beyond_a_reserve_may_be_taken() {
-    let mut b = Budget::new(100, 10, 100);
-    b.activate(1);
-    b.charge(1, 10).unwrap();
-    assert!(!b.beyond_reserve(1), "its reserve is its own");
-    b.charge(1, 1).unwrap();
-    assert!(b.beyond_reserve(1));
-    b.uncharge(1, 1);
-    assert!(!b.beyond_reserve(1));
-    assert!(!b.beyond_reserve(2), "nothing held");
-}
-
 /// Giving back more than an instance holds is a lost count: debug builds
 /// stop there (release builds give back what it holds).
 #[test]

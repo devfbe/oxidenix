@@ -103,7 +103,7 @@ time) and so may anything on the network.
   | cap | what happens |
   |---|---|
   | buffer bytes, smoltcp sockets | `ENOBUFS` for the socket; a connection that arrives is reset; under pressure connections start and stay small |
-  | smoltcp sockets, TIME-WAIT among them | the instance's own oldest TIME-WAIT connection goes, then others' beyond their reserve; an instance without room skips TIME-WAIT (closed at once, tcp_max_tw_buckets) |
+  | smoltcp sockets, TIME-WAIT among them | the instance's own oldest TIME-WAIT connection goes (never another instance's); an instance without room skips TIME-WAIT (closed at once, tcp_max_tw_buckets) |
   | orphans | a close resets the connection (tcp_max_orphans) |
   | a close's leftovers | the connection is reset |
   | half-open connections | the SYN is answered with a reset |
