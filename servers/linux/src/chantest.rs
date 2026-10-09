@@ -348,12 +348,16 @@ fn service_death() -> Result<(), i64> {
     Ok(())
 }
 
-/// The service dies at once every time it is used (a crash loop): the
-/// kernel restarts it a few times in a row (MAX_EARLY_RESTARTS, one more if
-/// the incarnation before had lived long), then gives up on it for good
-/// (EIO). It stays dead afterwards: run this last.
+/// The service dies at once every time it is used (a crash loop), under
+/// the kernel's restart policy (ADR 0006): restarted with a growing backoff
+/// (0.1, 0.2, 0.4, 0.8, 1.6 s after its young deaths), then down after
+/// the sixth young death in a row (EIO at once), and up again once the
+/// 5 s cooldown is over. What it counts on is only that its deaths are
+/// young (milliseconds after each restart, against half a second) and the
+/// incarnation it starts with young or not: no runner is that slow.
 fn crash_loop() -> Result<(), i64> {
     let obj = object(1, |_| b'k').map_err(|_| 130)?;
+    let start = now();
     let mut cycles = 0;
     let refused = loop {
         let mut c = match Client::open() {
@@ -365,11 +369,20 @@ fn crash_loop() -> Result<(), i64> {
         check!(132, ro > 0 && c.call(CRASH, ro, 0, 0, 0) == Err(-EPIPE));
         cycles += 1;
     };
-    // The live incarnation and its restarts: 5 after it, or 6 if it had
-    // lived long; at most one young death before counts (the restart
-    // after the exec scenario's).
-    check!(133, refused == -EIO && (5..=7).contains(&cycles));
-    check!(134, Client::open().err() == Some(-EIO));
+    let elapsed = now() - start;
+    // Opened: the incarnation it found, and a restart after each young
+    // death but the sixth (five), plus one at once if the first death
+    // ended a long life (the usual case: so seven, else six).
+    check!(133, refused == -EIO && (6..=7).contains(&cycles));
+    // The five backoffs: 3.1 s at least.
+    check!(134, elapsed >= 3_100_000_000);
+    // Down: refused at once, no restart.
+    let t = now();
+    check!(135, Client::open().err() == Some(-EIO) && now() - t < 500_000_000);
+    // Up again after the cooldown, with a clean history.
+    pause_ms(5_200);
+    let mut c = Client::open().map_err(|_| 136)?;
+    check!(137, c.status(ECHO, 0, 0, 0, 1) == 2);
     close(obj);
     Ok(())
 }

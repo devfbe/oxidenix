@@ -409,7 +409,7 @@ pub struct Server {
     /// How long a (re)started server may take to register its service,
     /// in nanoseconds.
     start_timeout: u64,
-    /// Its incarnations so far, to tell a crash loop from deaths far apart.
+    /// Its incarnations: the state of the restart policy.
     lives: spin::Mutex<Lives>,
     restarting: core::sync::atomic::AtomicBool,
     /// Where its devices reach the pages granted to it (channels).
@@ -429,32 +429,129 @@ pub fn server_named(name: &str) -> Option<Arc<Server>> {
     SERVERS.lock().iter().find(|s| s.name == name).cloned()
 }
 
-/// How often in a row a server that died young is restarted before the
-/// kernel gives up on it: a crash loop (a server that cannot start, or
-/// dies at once whenever it is used) would otherwise cost a start, and its
-/// clients a wait, at every use for ever.
-const MAX_EARLY_RESTARTS: u32 = 5;
-/// The life after which a server's death no longer counts towards a crash
-/// loop: it started and served. Deaths that far apart (a server killed
-/// now and then, as each lxtest run kills ringtest twice, some 1.5 s
-/// apart) are each restarted, however many there are over the uptime; a
-/// server dying faster (a crash loop lives milliseconds) is given up on.
-/// A server that dies at every use is given up on if its clients come back
-/// within that time; if they come more slowly, it is restarted at their
-/// pace, at most twice a second.
-const STABLE_LIFE: u64 = crate::time::NSEC_PER_SEC / 2;
+// The restart policy (ADR 0006). A dead server is restarted at its next
+// use; a crash loop (a server that cannot start, or dies whenever it is
+// used) must not cost a start, and its clients a wait, at every use for
+// ever, nor may one program that crashes a server a few times take the
+// service away for the rest of the boot.
 
-/// A server's incarnations (`Server::revive`).
+/// A life (registration to exit) this long shows the server works: its
+/// death is not part of a crash loop, and the next restart is immediate.
+/// (A server dying at every use lives milliseconds.)
+const STABLE_LIFE: u64 = crate::time::NSEC_PER_SEC / 2;
+/// The delay before restarting a server after its k-th young death in a
+/// row (measured from the death): BACKOFF_BASE << (k - 1).
+const BACKOFF_BASE: u64 = 100 * 1_000_000;
+/// Young deaths in a row the kernel restarts after (backing off); one more
+/// is a crash loop.
+const MAX_YOUNG: u32 = 5;
+/// Restart intensity, deaths young or not: more than RESTART_INTENSITY
+/// restarts within RESTART_PERIOD is a crash loop too (a server killed
+/// over and over after short use).
+const RESTART_INTENSITY: usize = 20;
+const RESTART_PERIOD: u64 = 60 * crate::time::NSEC_PER_SEC;
+/// After a crash loop the service stays down (EIO at once) for
+/// COOLDOWN_BASE << (crash loops in a row - 1), at most COOLDOWN_MAX; then
+/// the next use tries again with a clean history. A life of
+/// RESTART_PERIOD ends a row of crash loops.
+const COOLDOWN_BASE: u64 = 5 * crate::time::NSEC_PER_SEC;
+const COOLDOWN_MAX: u64 = 300 * crate::time::NSEC_PER_SEC;
+
+/// A server's incarnations: the state of the restart policy.
 #[derive(Default)]
 struct Lives {
-    /// When the running incarnation registered its service (nanoseconds
-    /// since boot); None if it never did.
+    /// The running incarnation (spawned, not exited yet).
+    pid: Option<Pid>,
+    /// When it registered its service (nanoseconds since boot).
     up_since: Option<u64>,
-    /// Restarts in a row of an incarnation that lived shorter than
-    /// STABLE_LIFE (or never registered).
-    early: u32,
-    /// A crash loop: the kernel gave up on the server, it stays dead.
-    given_up: bool,
+    /// When the last incarnation exited.
+    died_at: u64,
+    /// Young deaths in a row (lives shorter than STABLE_LIFE, or never
+    /// registered).
+    young: u32,
+    /// Restarts within the last RESTART_PERIOD.
+    restarts: alloc::collections::VecDeque<u64>,
+    /// A crash loop: the service is down until then.
+    down_until: Option<u64>,
+    /// Crash loops in a row.
+    loops: u32,
+}
+
+/// What `Server::revive` does with a server whose service is gone.
+enum Next {
+    /// Its incarnation has not exited yet (starting, or exiting): wait.
+    Wait,
+    /// Restart it at that time (nanoseconds since boot).
+    RestartAt(u64),
+    /// Down (a crash loop).
+    Down,
+}
+
+impl Lives {
+    /// The policy's decision at `now`.
+    fn next(&mut self, name: &str, now: u64) -> Next {
+        if self.pid.is_some() {
+            return Next::Wait;
+        }
+        match self.down_until {
+            Some(until) if now < until => return Next::Down,
+            Some(_) => {
+                crate::printkln!("[kernel] {} was down after a crash loop; trying again", name);
+                self.down_until = None;
+                self.young = 0;
+                self.restarts.clear();
+            }
+            None => {}
+        }
+        while self.restarts.front().is_some_and(|&t| now.saturating_sub(t) >= RESTART_PERIOD) {
+            self.restarts.pop_front();
+        }
+        if self.young > MAX_YOUNG || self.restarts.len() >= RESTART_INTENSITY {
+            self.loops += 1;
+            let cooldown = (COOLDOWN_BASE << (self.loops - 1).min(16)).min(COOLDOWN_MAX);
+            self.down_until = Some(now + cooldown);
+            crate::printkln!(
+                "[kernel] {} is in a crash loop ({} young deaths in a row, {} restarts in {} s); down for {} s",
+                name,
+                self.young,
+                self.restarts.len(),
+                RESTART_PERIOD / crate::time::NSEC_PER_SEC,
+                cooldown / crate::time::NSEC_PER_SEC
+            );
+            return Next::Down;
+        }
+        let delay = if self.young == 0 { 0 } else { BACKOFF_BASE << (self.young - 1) };
+        Next::RestartAt(self.died_at + delay)
+    }
+
+    /// The incarnation `pid` exited at `now`.
+    fn exited(&mut self, name: &str, pid: Pid, now: u64) {
+        if self.pid != Some(pid) {
+            return;
+        }
+        let life = self.up_since.map(|since| now.saturating_sub(since));
+        let young = !life.is_some_and(|ns| ns >= STABLE_LIFE);
+        self.young = if young { self.young + 1 } else { 0 };
+        if life.is_some_and(|ns| ns >= RESTART_PERIOD) {
+            self.loops = 0;
+        }
+        self.pid = None;
+        self.up_since = None;
+        self.died_at = now;
+        match life {
+            Some(ns) => crate::printkln!("[kernel] {} died after {} ms{}", name, ns / 1_000_000, if young { " (young)" } else { "" }),
+            None => crate::printkln!("[kernel] {} died before it registered", name),
+        }
+    }
+}
+
+/// The server process `pid` exited (before its services are marked dead,
+/// so whoever finds them dead finds its death recorded).
+pub fn server_exited(pid: Pid) {
+    let now = crate::time::now();
+    for server in SERVERS.lock().iter() {
+        server.lives.lock().exited(server.name, pid, now);
+    }
 }
 
 impl Server {
@@ -489,56 +586,84 @@ impl Server {
                 servers.push(self.clone());
             }
         }
-        self.lives.lock().up_since = None;
         spawn_server(self)?;
-        let service = ipc::wait_for(self.name, self.start_timeout).ok_or(EIO)?;
-        self.lives.lock().up_since = Some(crate::time::now());
-        Ok(service)
+        ipc::wait_for(self.name, self.start_timeout).ok_or(EIO)
     }
 
-    /// The server's service, restarting the server if it died. The first
-    /// caller restarts it, concurrent callers wait for the registration.
-    ///
-    /// A crash loop ends it: after MAX_EARLY_RESTARTS restarts in a row of
-    /// a server that died within STABLE_LIFE of its start (or never came
-    /// up), it stays dead (EIO). A death is noticed here, at the next use,
-    /// so a life is measured up to then: a server nobody uses may have
-    /// died young unnoticed, but then its restarts cost nothing either.
+    /// The incarnation `pid` registered its service (whenever: a start
+    /// that timed out may still come up).
+    pub fn registered(&self, pid: Pid) {
+        let mut lives = self.lives.lock();
+        if lives.pid == Some(pid) && lives.up_since.is_none() {
+            lives.up_since = Some(crate::time::now());
+        }
+    }
+
+    /// The server's service, restarting the server if it died, as the
+    /// restart policy says (ADR 0006): at once after a life of
+    /// STABLE_LIFE, else after a backoff; EIO while it is down after a
+    /// crash loop. One caller restarts it, the others wait for it.
     pub fn revive(self: &Arc<Self>) -> Result<(usize, u64), i64> {
-        if let Some(found) = ipc::lookup(self.name) {
-            return Ok(found);
-        }
-        if self.restarting.swap(true, Ordering::Relaxed) {
-            return ipc::wait_for(self.name, self.start_timeout).ok_or(EIO);
-        }
-        let admitted = {
-            let mut lives = self.lives.lock();
-            let lived = lives.up_since.map(|since| crate::time::now().saturating_sub(since));
-            if lives.given_up {
-                false
-            } else if lived.is_some_and(|ns| ns >= STABLE_LIFE) {
-                lives.early = 0;
-                crate::printkln!("[kernel] {} died (up {} ms); restarting it", self.name, lived.unwrap_or(0) / 1_000_000);
-                true
-            } else if lives.early < MAX_EARLY_RESTARTS {
-                lives.early += 1;
-                crate::printkln!(
-                    "[kernel] {} died young (up {} ms); restarting it ({} of {} in a row)",
-                    self.name,
-                    lived.unwrap_or(0) / 1_000_000,
-                    lives.early,
-                    MAX_EARLY_RESTARTS
-                );
-                true
-            } else {
-                lives.given_up = true;
-                crate::printkln!("[kernel] {} keeps dying young (a crash loop); giving up on it", self.name);
-                false
+        // Waiting for an incarnation that has neither registered nor
+        // exited is bounded: one that never does is hung.
+        let deadline = crate::time::now() + self.start_timeout;
+        loop {
+            if let Some(found) = ipc::lookup(self.name) {
+                return Ok(found);
             }
+            if self.restarting.swap(true, Ordering::Acquire) {
+                // Another caller restarts it: wait for its outcome, then
+                // look again.
+                while self.restarting.load(Ordering::Acquire) {
+                    sleep_until(crate::time::now() + crate::timer::TICK_NS)?;
+                }
+                if let Some(found) = ipc::lookup(self.name) {
+                    return Ok(found);
+                }
+                if self.lives.lock().down_until.is_some_and(|until| crate::time::now() < until) {
+                    return Err(EIO);
+                }
+                continue;
+            }
+            let result = self.restart_dead(deadline);
+            self.restarting.store(false, Ordering::Release);
+            match result {
+                Some(result) => return result,
+                None => sleep_until(crate::time::now() + crate::timer::TICK_NS)?,
+            }
+        }
+    }
+
+    /// `revive` for the caller that may restart the server: the result, or
+    /// None to wait for an incarnation still starting or exiting.
+    fn restart_dead(self: &Arc<Self>, deadline: u64) -> Option<Result<(usize, u64), i64>> {
+        // Another caller may have restarted it since this one looked.
+        if let Some(found) = ipc::lookup(self.name) {
+            return Some(Ok(found));
+        }
+        let now = crate::time::now();
+        let at = match self.lives.lock().next(self.name, now) {
+            Next::Wait if now < deadline => return None,
+            Next::Wait | Next::Down => return Some(Err(EIO)),
+            Next::RestartAt(at) => at,
         };
-        let result = if admitted { self.start() } else { Err(EIO) };
-        self.restarting.store(false, Ordering::Relaxed);
-        result
+        if at > now {
+            if let Err(e) = sleep_until(at) {
+                return Some(Err(e));
+            }
+        }
+        {
+            let mut lives = self.lives.lock();
+            lives.restarts.push_back(crate::time::now());
+            crate::printkln!(
+                "[kernel] restarting {} ({} young deaths in a row, {} restarts in {} s)",
+                self.name,
+                lives.young,
+                lives.restarts.len(),
+                RESTART_PERIOD / crate::time::NSEC_PER_SEC
+            );
+        }
+        Some(self.start())
     }
 
     /// Time allowed for registration after a (re)start.
@@ -685,6 +810,12 @@ fn spawn_with(path: &str, image: loader::Image, server: Option<&Arc<Server>>, ar
     slot.insert(t.clone())?;
     if server.is_none() {
         crate::drivers::tty::set_foreground(pid);
+    }
+    if let Some(server) = server {
+        // Before it runs, so its registration and exit find it.
+        let mut lives = server.lives.lock();
+        lives.pid = Some(pid);
+        lives.up_since = None;
     }
     sched::start(t);
     Ok(pid)

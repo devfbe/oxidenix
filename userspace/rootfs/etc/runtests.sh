@@ -81,7 +81,8 @@ if [ "$(uname -s)" = oxidenix ]; then echo "PASS uname names the system oxidenix
 echo "=== server protection"
 if kill -9 1 2>/dev/null; then fail "a server could be killed from user space"; else echo "PASS servers are protected"; fi
 
-# Last: it leaves the test service (ringtest) dead for good.
+# The restart policy (ADR 0006) on the test service (ringtest), dying at
+# every use.
 echo "=== lxtest crashloop"
 if lxtest crashloop; then echo "PASS lxtest crashloop"; else fail "lxtest crashloop"; fi
 

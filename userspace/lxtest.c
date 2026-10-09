@@ -3,9 +3,8 @@
  * crates/restricted): the program asks its server to create a memory
  * object, fill it, map it into the program, protect and unmap it, and
  * checks the effect from the program's side. It may run any number of
- * times in one boot, beside other programs; `lxtest crashloop` checks
- * that the kernel gives up on a service that keeps dying (and leaves the
- * test service dead). */
+ * times in one boot, beside other programs; `lxtest crashloop` checks the
+ * kernel's restart policy on a service that keeps dying (ADR 0006). */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
@@ -47,6 +46,7 @@
 #define TEST_CHANNEL 1514
 #define TEST_DISKRING 1515
 #define TEST_CACHED 1516
+#define TEST_PASS_THROUGH 1517
 
 static int failures;
 
@@ -134,13 +134,13 @@ static long held_records(void) {
 
 int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "crashloop") == 0) {
-        /* The test service dies at every use: the kernel gives up on it
-         * after a few restarts in a row. It stays dead for the rest of the
-         * boot, so this runs last (runtests.sh). */
+        /* The test service dies at every use: the kernel restarts it with
+         * a growing backoff, takes it down after six young deaths in a
+         * row, and brings it back after the cooldown (some 8.5 s). */
         errno = 0;
         long r = syscall(TEST_CHANNEL, 8);
         if (r != 0) printf("    (scenario 8: check %d failed)\n", errno);
-        check("channels: a service in a crash loop is given up on (EIO)", r == 0);
+        check("channels: a crash loop: backoff, down (EIO), up after the cooldown", r == 0);
         return failures != 0;
     }
     signal(SIGSEGV, on_fault);
@@ -194,10 +194,13 @@ int main(int argc, char **argv) {
 
     /* A page the pager fails: SIGBUS, and a later access asks again. The
      * first request of every such object fails, not only the instance's
-     * first (a second object here, as a second lxtest run in one shell). */
+     * first (a second object here, as a second lxtest run in one shell),
+     * and each request is the object's own: both exist before the first
+     * is touched. */
+    check("the server maps a paged object it fails once", syscall(TEST_PAGED_FAIL, (char *)0x230000000000) == 0);
+    check("a second such object", syscall(TEST_PAGED_FAIL, (char *)0x231000000000) == 0);
     for (int round = 0; round < 2; round++) {
         char *fl = (char *)(0x230000000000 + round * 0x1000000000L);
-        check(round ? "a second such object" : "the server maps a paged object it fails once", syscall(TEST_PAGED_FAIL, fl) == 0);
         child = fork();
         if (child == 0) {
             (void)*(volatile char *)fl;
@@ -206,7 +209,7 @@ int main(int argc, char **argv) {
         alarm(5);
         waitpid(child, &st, 0);
         alarm(0);
-        check(round ? "... its page fails too: SIGBUS" : "a page the pager fails raises SIGBUS", WIFSIGNALED(st) && WTERMSIG(st) == SIGBUS);
+        check(round ? "the second object's page fails too: SIGBUS" : "a page the pager fails raises SIGBUS", WIFSIGNALED(st) && WTERMSIG(st) == SIGBUS);
         check(round ? "... and a later access gets it" : "... and a later access asks again and gets it", memcmp(fl, "retry", 5) == 0);
     }
     /* The server's runtime: its heap, and its mutex across the threads of
@@ -226,8 +229,13 @@ int main(int argc, char **argv) {
      * pass through to the kernel's Linux implementation. */
     long idle = legacy_calls();
     long base = legacy_calls() - idle;
-    printf("    (reading /proc/self/counters passes %ld calls through)\n", base);
-    check("/proc/self/counters counts the process's own passed-through calls", idle >= 0 && base > 0);
+    pid_t me = getpid();
+    long c0 = legacy_calls();
+    int own = 1;
+    for (int i = 0; i < 5; i++) own &= syscall(TEST_PASS_THROUGH) == me;
+    long on_purpose = legacy_calls() - c0 - base;
+    printf("    (5 calls passed through on purpose counted as %ld)\n", on_purpose);
+    check("/proc/self/counters counts the process's own passed-through calls", idle >= 0 && own && on_purpose == 5);
     long l0 = legacy_calls();
     for (int i = 0; i < 100; i++) {
         char *m = mmap(NULL, 3 * PG, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);

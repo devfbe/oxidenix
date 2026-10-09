@@ -147,6 +147,7 @@ pub fn register(name: u64, len: u64, arg: u64, flags: u64) -> SysResult {
     })?;
     if let Some(server) = super::with_current(|p| p.server.clone()) {
         server.domain.device_reset();
+        server.registered(me);
     }
     Ok(registered)
 }
