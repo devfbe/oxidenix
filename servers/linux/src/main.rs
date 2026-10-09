@@ -31,6 +31,7 @@ mod netlink;
 mod paths;
 mod pipe;
 mod records;
+mod ringclient;
 mod sched;
 mod scm;
 mod sockcalls;
