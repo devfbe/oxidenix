@@ -959,6 +959,10 @@ pub struct LinuxThread {
     /// The program the thread's next pass-through execve runs, as the
     /// server resolved it, with its absolute path (`SYS_EXEC_TARGET`).
     pub exec_target: Option<(ExecTarget, alloc::string::String)>,
+    /// The console's writer turn the thread took (`SYS_CONSOLE_TURN`): its
+    /// console writes go out in it; given back by the call, or when the
+    /// thread enters the program again or ends.
+    console_turn: Option<crate::drivers::console_device::Writer>,
     /// The server's registers while the program runs.
     normal: Frame,
 }
@@ -974,7 +978,7 @@ impl LinuxThread {
         // holding some left it).
         unsafe { *((memory::phys_to_virt(state.start_address().as_u64()) as u64 + SERVER_LOCKS_OFFSET) as *mut u32) = 0 };
         let thread =
-            LinuxThread { instance, slot, state, restricted: false, pager: false, events: false, in_legacy: false, trap_nr: None, closed_now: Vec::new(), pinned: Vec::new(), fs_child: None, exec_target: None, normal: Frame::default() };
+            LinuxThread { instance, slot, state, restricted: false, pager: false, events: false, in_legacy: false, trap_nr: None, closed_now: Vec::new(), pinned: Vec::new(), fs_child: None, exec_target: None, console_turn: None, normal: Frame::default() };
         save(program, thread.state());
         let start = thread.start(role);
         Ok((thread, start))
@@ -989,7 +993,7 @@ impl LinuxThread {
         // holding some left it).
         unsafe { *((memory::phys_to_virt(state.start_address().as_u64()) as u64 + SERVER_LOCKS_OFFSET) as *mut u32) = 0 };
         let thread =
-            LinuxThread { instance, slot, state, restricted: false, pager: true, events: false, in_legacy: false, trap_nr: None, closed_now: Vec::new(), pinned: Vec::new(), fs_child: None, exec_target: None, normal: Frame::default() };
+            LinuxThread { instance, slot, state, restricted: false, pager: true, events: false, in_legacy: false, trap_nr: None, closed_now: Vec::new(), pinned: Vec::new(), fs_child: None, exec_target: None, console_turn: None, normal: Frame::default() };
         let start = thread.start(ROLE_WORKER);
         Ok((thread, start))
     }
@@ -1001,7 +1005,7 @@ impl LinuxThread {
         // holding some left it).
         unsafe { *((memory::phys_to_virt(state.start_address().as_u64()) as u64 + SERVER_LOCKS_OFFSET) as *mut u32) = 0 };
         let thread =
-            LinuxThread { instance, slot, state, restricted: false, pager: true, events: true, in_legacy: false, trap_nr: None, closed_now: Vec::new(), pinned: Vec::new(), fs_child: None, exec_target: None, normal: Frame::default() };
+            LinuxThread { instance, slot, state, restricted: false, pager: true, events: true, in_legacy: false, trap_nr: None, closed_now: Vec::new(), pinned: Vec::new(), fs_child: None, exec_target: None, console_turn: None, normal: Frame::default() };
         let start = thread.start(ROLE_PAGER);
         Ok((thread, start))
     }
@@ -1699,7 +1703,10 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             }
             let mut done = 0u64;
             let result = {
-                let _writer = console_device::writer()?;
+                // In the turn the thread took (`SYS_CONSOLE_TURN`), or one for
+                // this write.
+                let held = with_current(|p| p.linux.as_ref().is_some_and(|l| l.console_turn.is_some()));
+                let _writer = if held { None } else { Some(console_device::writer()?) };
                 loop {
                     if done >= a[1] {
                         break Ok(done as i64);
@@ -1719,6 +1726,34 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             };
             console_device::flush_echo();
             result
+        }
+        SYS_CONSOLE_TURN => {
+            use crate::drivers::console_device;
+            match a[0] {
+                CONSOLE_TURN_TAKE => {
+                    if console_device::holder() != instance.id {
+                        return Err(EIO);
+                    }
+                    if with_current(|p| p.linux.as_ref().is_some_and(|l| l.console_turn.is_some())) {
+                        return Err(EBUSY);
+                    }
+                    let turn = console_device::writer()?;
+                    with_current(|p| {
+                        if let Some(l) = p.linux.as_mut() {
+                            l.console_turn = Some(turn);
+                        }
+                    });
+                    Ok(0)
+                }
+                CONSOLE_TURN_GIVE => {
+                    let turn = with_current(|p| p.linux.as_mut().and_then(|l| l.console_turn.take()));
+                    drop(turn);
+                    // Echoes queued after the turn's last piece go out now.
+                    console_device::flush_echo();
+                    Ok(0)
+                }
+                _ => Err(EINVAL),
+            }
         }
         SYS_CONSOLE_INFO => {
             if crate::drivers::console_device::holder() != instance.id {
@@ -1908,15 +1943,16 @@ pub fn enter(f: &mut Frame) -> Result<Option<u64>, i64> {
             l.normal = *f;
             *f = program;
             l.restricted = true;
-            Ok::<_, i64>((l.trap_nr.take(), core::mem::take(&mut l.pinned)))
+            Ok::<_, i64>((l.trap_nr.take(), core::mem::take(&mut l.pinned), l.console_turn.take()))
         })
         .inspect(|_| switch_view(false))
     })
-    .map(|(handled, pinned)| {
-        // The call is done with its files.
+    .map(|(handled, pinned, turn)| {
+        // The call is done with its files (and a console turn it kept).
         for file in pinned {
             crate::fs::file::release(file);
         }
+        drop(turn);
         handled
     })
 }

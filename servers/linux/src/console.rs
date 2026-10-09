@@ -69,6 +69,25 @@ pub fn device_write(bytes: &[u8]) -> Result<(), i64> {
     }
 }
 
+/// The console's writer turn, kept by the calling thread until dropped: writes in it
+/// never wait (or fail with EINTR), so output can be processed knowing it goes out.
+pub struct ConsoleTurn(());
+
+impl Drop for ConsoleTurn {
+    fn drop(&mut self) {
+        syscall(SYS_CONSOLE_TURN, [CONSOLE_TURN_GIVE, 0, 0, 0, 0, 0]);
+    }
+}
+
+/// Waits for the console's writer turn: EINTR for a signal first, EIO when the instance
+/// no longer holds the device.
+pub fn take_turn() -> Result<ConsoleTurn, i64> {
+    match syscall(SYS_CONSOLE_TURN, [CONSOLE_TURN_TAKE, 0, 0, 0, 0, 0]) {
+        r if r < 0 => Err(-r),
+        _ => Ok(ConsoleTurn(())),
+    }
+}
+
 /// Echoes to the device without ever waiting (the service thread's input processing must
 /// not stall behind a program flooding the console): queued by the kernel, written
 /// between the pieces of a write in progress; what does not fit is dropped, as Linux's

@@ -281,24 +281,6 @@ fn output_processing() {
 }
 
 #[test]
-fn output_columns_can_be_put_back() {
-    // Output processed for a write that then did not go out leaves no trace.
-    let mut l = std();
-    let mut out = Vec::new();
-    l.output(b"ab", &mut out);
-    let before = l.columns();
-    l.output(b"cd\tx", &mut out);
-    let after = l.columns();
-    assert_eq!(after.0, 9);
-    l.set_columns(before);
-    assert_eq!(l.column(), 2);
-    l.set_columns(after);
-    // A tab typed now erases back to where the line began after it.
-    let (echo, _) = feed(&mut l, b"\t\x7f");
-    assert_eq!(&echo[1..], b"\x08\x08\x08\x08\x08\x08\x08");
-}
-
-#[test]
 fn buffer_limits() {
     // Noncanonical: input beyond 4095 bytes is dropped, room() says when.
     let mut l = with(|t| t.lflag &= !(ICANON | ECHO));

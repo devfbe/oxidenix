@@ -415,9 +415,11 @@ placeholder in the kernel's descriptor table, as pipes are).
   output processing happens under the terminal's lock into the server's memory, a pty's
   output goes to its master's buffer under it, the console's to the device after it. No lock
   of `sync` is held across the console's write (a flooding writer would get a lock holder's
-  priority for the whole write and starve its CPU's other threads); the columns that output
-  leaves count once it went out (a signal while it waits for the console's turn writes
-  nothing, and the restarted write processes it once). Output stopped by
+  priority for the whole write and starve its CPU's other threads). A console write first
+  takes the console's writer turn (`console_turn`), then processes its output and writes it
+  in the turn, where the device's write never waits: a signal can only come while it waits
+  for the turn, before the column bookkeeping moved, so a restarted write processes its
+  output once and echoes never see half-done bookkeeping. Output stopped by
   `VSTOP` (or `tcflow`) waits for `VSTART`. Echoes take neither turn.
 - **Job control** (Linux's `tty_check_change`): a process of a background group reading its
   controlling terminal gets SIGTTIN for its group and the call restarts after it (EIO if it

@@ -769,6 +769,18 @@ impl Tty {
                 Err(e) => return if written > 0 { Ok(written as i64) } else { Err(e) },
             };
             loop {
+                // The console's writer turn before anything is processed: a signal
+                // while it waits (EINTR) leaves the column bookkeeping untouched, and
+                // in the turn the device's write never waits, so the output processed
+                // is the output that goes out (no rollback that echoes processed
+                // meanwhile could see half done).
+                let console_turn = match self.driver {
+                    Driver::Console => match crate::console::take_turn() {
+                        Ok(t) => Some(t),
+                        Err(e) => return if written > 0 { Ok(written as i64) } else { Err(e) },
+                    },
+                    Driver::Pty(_) => None,
+                };
                 let seen = {
                     let mut inner = self.inner.lock();
                     if inner.gen != open.gen {
@@ -776,7 +788,6 @@ impl Tty {
                     }
                     if Self::writable(&inner) {
                         let mut out = Vec::with_capacity(chunk.len() + chunk.len() / 4);
-                        let before = inner.ld.columns();
                         inner.ld.output(&chunk, &mut out);
                         match inner.pty.as_mut() {
                             Some(p) => {
@@ -784,23 +795,17 @@ impl Tty {
                                 self.changed(&mut inner, false, true);
                             }
                             None => {
-                                // The columns this output leaves count once it went
-                                // out: a signal while it waits for the console's turn
-                                // (EINTR, nothing written) must not leave them moved
-                                // for the write's restart to move again.
-                                let after = inner.ld.columns();
-                                inner.ld.set_columns(before);
                                 drop(inner);
                                 if let Err(e) = crate::console::device_write(&out) {
                                     return if written > 0 { Ok(written as i64) } else { Err(e) };
                                 }
-                                self.inner.lock().ld.set_columns(after);
                             }
                         }
                         break;
                     }
                     self.seen()
                 };
+                drop(console_turn);
                 if nonblock {
                     return if written > 0 { Ok(written as i64) } else { Err(EAGAIN) };
                 }

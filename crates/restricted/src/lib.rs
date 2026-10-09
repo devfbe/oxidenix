@@ -722,6 +722,15 @@ pub const SYS_CONSOLE_READ: u64 = 1110;
 /// unless the instance holds the console.
 pub const SYS_CONSOLE_WRITE: u64 = 1111;
 pub const CONSOLE_ECHO: u64 = 1;
+/// `console_turn(op)`: `CONSOLE_TURN_TAKE` waits for the console's writer turn
+/// and keeps it for the calling thread (EINTR for a signal first; EBUSY if it
+/// has it already): its `console_write`s go out in it, so a writer can process
+/// its output knowing it will not have to wait any more (its column
+/// bookkeeping moves only for output that goes out). `CONSOLE_TURN_GIVE`
+/// gives it back; so does entering the program, or the thread's end.
+pub const SYS_CONSOLE_TURN: u64 = 1116;
+pub const CONSOLE_TURN_TAKE: u64 = 1;
+pub const CONSOLE_TURN_GIVE: u64 = 0;
 /// `console_info(out)`: the console's size, two u64s at `out` (columns,
 /// rows). EIO unless the instance holds the console.
 pub const SYS_CONSOLE_INFO: u64 = 1112;
