@@ -1,7 +1,8 @@
 /* Threads: pthreads on clone/futex, shared memory and descriptors, TLS,
  * thread and process signals, group exit, fork and exec from threads,
  * vfork and posix_spawn, and TLB coherence (munmap and mprotect while
- * another thread on another CPU uses the memory). */
+ * another thread on another CPU uses the memory, and frames dropped under
+ * writers staying out of other processes' memory). */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
@@ -228,6 +229,48 @@ static void protect_while_writing(void) {
     _exit(1);
 }
 
+/* Frames dropped under writers on other CPUs (MADV_DONTNEED, munmap of
+ * MAP_NORESERVE memory, committed page by page) must not go back to the
+ * allocator before every CPU dropped its cached entries: a victim process
+ * that keeps taking fresh memory and checking it sees no stray stores. */
+static volatile char *race_mem;
+static volatile int race_stop;
+
+static void *race_writer(void *arg) {
+    long off = (long)arg * 4096;
+    while (!race_stop)
+        for (long i = off; i < 64 * 4096; i += 4 * 4096) race_mem[i] = (char)0xAA;
+    return NULL;
+}
+
+static int dropped_frames_stay_unused(void) {
+    pid_t victim = fork();
+    if (victim == 0) {
+        for (int round = 0; round < 400; round++) {
+            unsigned char *m = mmap(NULL, 64 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (m == MAP_FAILED) _exit(2);
+            memset(m, 0x55, 64 * 4096);
+            sched_yield();
+            for (long i = 0; i < 64 * 4096; i++)
+                if (m[i] != 0x55) _exit(1);
+            munmap(m, 64 * 4096);
+        }
+        _exit(0);
+    }
+    race_mem = mmap(NULL, 64 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    pthread_t t[3];
+    for (long i = 0; i < 3; i++) pthread_create(&t[i], NULL, race_writer, (void *)i);
+    int st = -1;
+    while (waitpid(victim, &st, WNOHANG) == 0) {
+        madvise((void *)race_mem, 64 * 4096, MADV_DONTNEED);
+        sched_yield();
+    }
+    race_stop = 1;
+    for (int i = 0; i < 3; i++) pthread_join(t[i], NULL);
+    munmap((void *)race_mem, 64 * 4096);
+    return WIFEXITED(st) && WEXITSTATUS(st) == 0;
+}
+
 int main(void) {
     /* Creation and join. */
     pid_t got[2] = {0, 0};
@@ -385,6 +428,8 @@ int main(void) {
     check("munmap reaches a thread on another CPU", WIFSIGNALED(st) && WTERMSIG(st) == SIGSEGV);
     st = in_child(protect_while_writing);
     check("mprotect reaches a thread on another CPU", WIFSIGNALED(st) && WTERMSIG(st) == SIGSEGV);
+
+    check("dropped pages written on other CPUs stay out of others' memory", dropped_frames_stay_unused());
 
     printf("threadtest: %s\n", failures ? "FAILED" : "all passed");
     fflush(stdout);

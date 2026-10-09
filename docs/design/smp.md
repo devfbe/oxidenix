@@ -71,9 +71,11 @@ A process (`Task`, shared as `Arc<Task>`) splits into:
 
 - Per-CPU run queues. An idle CPU steals from the longest other queue. A woken task goes to
   the CPU it last ran on unless another CPU is idle; idle CPUs are woken by IPI.
-- `on_cpu` marks a task whose kernel stack is still in use. A CPU that picks a task spins
-  until its previous CPU has finished switching away, and the reaper frees a dead task only
-  once `on_cpu` is clear.
+- `on_cpu` marks a task whose kernel stack is still in use. A CPU never picks a task whose
+  `on_cpu` is still set (a CPU queues its current task before it switches away): it leaves it
+  in its queue for a later schedule. Waiting for it with interrupts off could close a cycle,
+  two CPUs each waiting for the other's outgoing task. The reaper frees a dead task only once
+  `on_cpu` is clear.
 - Each CPU has an idle task; idling loads the kernel page table, so an address space is only
   ever loaded on the CPU that runs its (single-threaded) process. No TLB shootdowns are
   needed as long as processes have one thread.

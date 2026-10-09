@@ -33,7 +33,7 @@ module comment, and the public types it defines. Where to start for common tasks
 - `kernel/src/memory/kstack.rs` (124) Kernel stacks. Types: `KernelStack`.
 - `kernel/src/memory/mod.rs` (262) Kernel memory: the frame allocator, the kernel heap (slab size classes over a first-fit heap), mappings of physical memory, and the commit and page-cache accounting. Types: `Caching`, `Stats`.
 - `kernel/src/net.rs` (124) Client side of the network server (netd): every socket operation of a user program becomes a `netproto` request. Types: `Endpoint`, `Socket`.
-- `kernel/src/process/address_space.rs` (1177) A process's virtual memory: its page tables and the areas (VMAs) that say what each address range is. Types: `Prot`, `Backing`, `Vma`, `MemStats`, `Fault`, `Access`, `AddressSpace`, `Mm`.
+- `kernel/src/process/address_space.rs` (1185) A process's virtual memory: its page tables and the areas (VMAs) that say what each address range is. Types: `Prot`, `Backing`, `Vma`, `MemStats`, `Fault`, `Access`, `AddressSpace`, `Mm`.
 - `kernel/src/process/channel.rs` (718) Channels: the kernel's part of the data plane between the Linux server and the device servers (docs/design/io-rings.md, ADR 0005). Types: `Channel`, `Grant`, `DmaDomain`, `ClientEnd`.
 - `kernel/src/process/clone.rs` (186) clone(2), fork and vfork: new threads and processes.
 - `kernel/src/process/elf.rs` (81) Parsing ELF64 headers and program headers of static executables (for `loader`). Types: `Elf`, `ProgramHeader`, `Header`.
@@ -51,7 +51,7 @@ module comment, and the public types it defines. Where to start for common tasks
 - `kernel/src/process/poll.rs` (105) Waiting for any of several files at once (poll, select, epoll_wait). Types: `PollSource`, `Registration`, `PollTable`.
 - `kernel/src/process/prctl.rs` (120) prctl, capget and capset.
 - `kernel/src/process/query.rs` (131) proc_query (syscall 1005): the kernel's native process and system information for the procfs server (records in `procproto`).
-- `kernel/src/process/sched.rs` (567) The SMP scheduler: per-CPU run queues, wait queues, context switches. Types: `Table`, `PidReservation`, `CpuSched`, `CpuStats`, `WaitQueue`, `Waker`, `PollWaiter`, `Wait`.
+- `kernel/src/process/sched.rs` (573) The SMP scheduler: per-CPU run queues, wait queues, context switches. Types: `Table`, `PidReservation`, `CpuSched`, `CpuStats`, `WaitQueue`, `Waker`, `PollWaiter`, `Wait`.
 - `kernel/src/process/signal.rs` (774) POSIX signals for processes with threads, following Linux. Types: `SigAction`, `GroupExit`, `GroupSignals`, `ThreadSignals`.
 - `kernel/src/process/sys_file.rs` (671) File syscalls.
 - `kernel/src/process/sys_mem.rs` (210) Memory syscalls: brk, mmap, munmap, mprotect, mremap, madvise and the ones that need no work here (msync, mlock). Types: `Placement`.
@@ -162,7 +162,7 @@ module comment, and the public types it defines. Where to start for common tasks
 - `userspace/sigmasktest.c` (102) Calls that wait with a temporary signal mask (sigsuspend, ppoll, pselect): the mask applies while they wait and to a handler that interrupts them; afterwards the caller's own mask is back.
 - `userspace/sigtest.c` (152) Signals: handlers, masks and pending signals, interrupted reads, timers (alarm, setitimer), faults turned into catchable signals, and the FPU state kept across handlers.
 - `userspace/smptest.c` (187) SMP tests: CPU count, affinity and scheduling policy, real parallel speed-up, fork/exit and cross-CPU wakeups (pipes, signals) under load on every CPU.
-- `userspace/threadtest.c` (300) Threads: pthreads on clone/futex, shared memory and descriptors, TLS, thread and process signals, group exit, fork and exec from threads, vfork and posix_spawn, and TLB coherence (munmap and mprotect while another...
+- `userspace/threadtest.c` (336) Threads: pthreads on clone/futex, shared memory and descriptors, TLS, thread and process signals, group exit, fork and exec from threads, vfork and posix_spawn, and TLB coherence (munmap and mprotect while another...
 - `userspace/timertest.c` (157) High-resolution timers: sleeps and timeouts end when they are due, not at the next 10 ms timer tick, and never early.
 - `userspace/timetest.c` (163) Clocks: nanosecond resolution, monotonic across CPUs, the CPU-time clocks of threads and processes, wall-clock time and its setting, and the accounting behind getrusage and times.
 - `userspace/vmtest.c` (242) Virtual memory: demand paging, protection, remapping, sharing, stacks, commit accounting, and the patterns JIT compilers rely on.
