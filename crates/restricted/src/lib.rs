@@ -88,8 +88,17 @@ pub const SYS_RESTRICTED_ENTER: u64 = 1010;
 /// the system call in `State` (phase R1's pass-through, which goes away as
 /// the server takes the calls over); its result and any signal frame land
 /// in `State`. No call that takes a descriptor passes through any more
-/// (R6e): the descriptor table is the server's.
+/// (R6e): the descriptor table is the server's. Returns 0, or after an
+/// execve that succeeded `LEGACY_EXECUTED` with the record of the old
+/// descriptor table or'ed in if the call let go of its last holder (the
+/// server lets the old table go on the calling thread, before the new
+/// program runs); the process then has a new table without a record, for
+/// which the server makes the new program's (`SYS_FILES_RECORD`'s `FS_SET`:
+/// the old one's descriptors without the close-on-exec ones, as from the
+/// point of no return on).
 pub const SYS_LEGACY_SYSCALL: u64 = 1011;
+/// See `SYS_LEGACY_SYSCALL` (records are 8-aligned words, bit 0 is free).
+pub const LEGACY_EXECUTED: u64 = 1;
 
 /// Codes a call the server handles may return (as Linux's kernel-internal
 /// ones), which the kernel's signal delivery turns into the program's
@@ -719,16 +728,15 @@ pub const SIGNAL_PENDING: u64 = 4;
 // (`SYS_FS_RECORD`).
 
 /// `files_record(op, word)`: `fs_record` for the calling thread's
-/// descriptor table: `FS_GET`, `FS_SET`, and `FS_CHILD`, the record of the
-/// table the thread's next pass-through call makes: a clone without
-/// CLONE_FILES, or execve, which gives the process that table at its point
-/// of no return (the server's copy without the close-on-exec descriptors,
-/// made when the call starts, as Linux's unshare_files). `FILES_UNSHARE`
-/// gives the calling thread a table of its own with record `word` at once
-/// (close_range's CLOSE_RANGE_UNSHARE). Every record handed over comes back
-/// exactly once as `EVENT_RELEASE`: when its table ends (the last process
-/// using it exited or executed another program), or, a child's record no
-/// call took, when the call returns.
+/// descriptor table: `FS_GET`, `FS_SET` (also for the table an execve
+/// leaves without one, see `SYS_LEGACY_SYSCALL`), and `FS_CHILD`, the record
+/// of the table the thread's next pass-through clone without CLONE_FILES
+/// makes. `FILES_UNSHARE` gives the calling thread a table of its own with
+/// record `word` at once (close_range's CLOSE_RANGE_UNSHARE). Every record
+/// handed over comes back exactly once: as `EVENT_RELEASE` when its table
+/// ends (the last process using it exited), or a child's record no call
+/// took when the call returns; or from `legacy_syscall` when an execve let
+/// go of its table.
 pub const SYS_FILES_RECORD: u64 = 1130;
 pub const FILES_UNSHARE: u64 = 3;
 

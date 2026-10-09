@@ -13,22 +13,26 @@
 //! program) carries a word of the server's, its record: a pointer to its
 //! `FilesContext`, as working-directory contexts carry theirs (`records`).
 //! The kernel's table holds one strong reference, given with
-//! `Arc::into_raw` (tagged `FILES_TAG`) and taken back with `EVENT_RELEASE`
-//! when it ends: the last process using it exited or executed another
-//! program. The kernel never replaces a table's record, so a thread's own
-//! record is alive while it runs in that table; each thread remembers it in
-//! its words (`thread::files`) after the first lookup, until it executes a
-//! program or unshares its table.
+//! `Arc::into_raw` (tagged `FILES_TAG`) and taken back when it ends: when
+//! the last process using it exited, as `EVENT_RELEASE`, which the service
+//! thread hands to the worker (`release_later`: closing sockets takes their
+//! locks, which the pager must never wait for); when an execve let go of
+//! it, from that call (`executed`, on the calling thread). The kernel never
+//! replaces a table's record, so a thread's own record is alive while it
+//! runs in that table; each thread remembers it in its words
+//! (`thread::files`) after the first lookup, until it executes a program
+//! or unshares its table.
 //!
 //! **fork, exec, exit** (the interface the process model calls; R8 takes
 //! these over from the hooks below): `FilesContext::fork` is the table a
 //! new process gets (a copy: every description shared, close-on-exec kept),
 //! `FilesContext::for_exec` the one a process that executes a program gets
-//! (the copy without the close-on-exec descriptors, made when the call
-//! starts, as Linux's unshare_files; the kernel installs it at the point of
-//! no return), and the end of a table (its last `Arc`) closes its
-//! descriptors. Until R8 the pass-through hooks hand these to the kernel as
-//! records for the clone or execve it carries out (`before_pass_through`).
+//! (the copy without the close-on-exec descriptors, made after the point of
+//! no return, when the execve returns to the server; the old table goes
+//! there and then, before the new program runs, so its close-on-exec
+//! descriptors are closed as on Linux), and the end of a table (its last
+//! `Arc`) closes its descriptors. Until R8 the pass-through hooks hand the
+//! copies to the kernel as records (`before_pass_through`, `executed`).
 //!
 //! Locking: one lock per table, never held while program memory is copied
 //! or a description is let go of (closing a file may take long, and may
@@ -42,6 +46,7 @@ use crate::thread;
 use crate::usercopy;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU32, Ordering};
 use restricted::*;
 
 const EBADF: i64 = 9;
@@ -197,9 +202,9 @@ fn give(context: Arc<FilesContext>) -> u64 {
     Arc::into_raw(context) as u64 | FILES_TAG
 }
 
-/// `EVENT_RELEASE` of a table's record: the kernel's reference goes (the
+/// A table's record came back: the kernel's reference goes here (the
 /// table's descriptors close with its last reference).
-pub fn released(word: u64) {
+fn released_now(word: u64) {
     drop(unsafe { Arc::from_raw((word & !FILES_TAG) as *const FilesContext) });
 }
 
@@ -230,7 +235,7 @@ pub fn current() -> Arc<FilesContext> {
         }
         e => {
             // Not handed over after all.
-            released(word);
+            released_now(word);
             // Another thread of the table was first: take that one.
             if e == -EEXIST { current() } else { context }
         }
@@ -245,26 +250,94 @@ const SYS_EXECVEAT: u64 = 322;
 const CLONE_FILES: u64 = 0x400;
 
 /// Before a system call passes through: a clone that makes a new process
-/// without CLONE_FILES gets a copy of the caller's table, an execve the
-/// copy for the new program (`FilesContext::fork`, `for_exec`). Without
-/// memory for the copy the call fails with ENOMEM before it is made.
-pub fn before_pass_through(s: &State) -> Result<(), i64> {
+/// without CLONE_FILES gets a copy of the caller's table
+/// (`FilesContext::fork`; without memory for it the call fails with ENOMEM
+/// before it is made). An execve keeps a reference to the caller's table
+/// (returned) for `executed`.
+pub fn before_pass_through(s: &State) -> Result<Option<Arc<FilesContext>>, i64> {
     let copy = match s.rax {
         SYS_FORK | SYS_VFORK => current().fork()?,
         SYS_CLONE if s.rdi & CLONE_FILES == 0 => current().fork()?,
-        SYS_EXECVE | SYS_EXECVEAT => current().for_exec()?,
-        _ => return Ok(()),
+        SYS_EXECVE | SYS_EXECVEAT => return Ok(Some(current())),
+        _ => return Ok(None),
     };
     syscall(SYS_FILES_RECORD, [FS_CHILD, give(copy), 0, 0, 0, 0]);
-    Ok(())
+    Ok(None)
 }
 
-/// After a system call passed through (`nr`): a thread that executed a
-/// program has the table it gave for it now (or, if the call failed, still
-/// its own): it looks it up again.
-pub fn after_pass_through(nr: u64) {
-    if matches!(nr, SYS_EXECVE | SYS_EXECVEAT) {
-        thread::set_files(0);
+/// An execve passed through and succeeded (`legacy_syscall`'s answer
+/// `LEGACY_EXECUTED`): the process has a new table of the kernel's without
+/// a record. The new program's table is `old`'s descriptors without the
+/// close-on-exec ones, made now, from the point of no return on (Linux's
+/// do_close_on_exec); `released` is the old table's record if the execve
+/// let go of its last holder. The old table goes here, on the calling
+/// thread, before the new program runs: its close-on-exec descriptors are
+/// closed when the program starts, as on Linux.
+pub fn executed(old: Arc<FilesContext>, released: u64) {
+    match old.for_exec() {
+        Ok(new) => {
+            let word = give(new);
+            if syscall(SYS_FILES_RECORD, [FS_SET, word, 0, 0, 0, 0]) == 0 {
+                thread::set_files(word & !FILES_TAG);
+            } else {
+                thread::set_files(0);
+                drop(unsafe { Arc::from_raw((word & !FILES_TAG) as *const FilesContext) });
+            }
+        }
+        Err(_) => {
+            // Past the point of no return without memory for the table:
+            // the process dies (Linux fails the execve before it).
+            const SIGKILL: u64 = 9;
+            thread::set_files(0);
+            syscall(SYS_SIGNAL_THREAD, [SIGKILL, 0, 0, 0, 0, 0]);
+        }
+    }
+    if released != 0 {
+        released_now(released);
+    }
+    drop(old);
+}
+
+/// Tables whose processes ended, for the worker (`release_later`).
+static ENDED: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+/// `EVENT_RELEASE` of a table's record (its last process exited): the
+/// service thread hands it to the worker, which closes its descriptors
+/// (closing a socket takes its locks, which the pager must never wait
+/// for).
+pub fn release_later(word: u64) {
+    ENDED.lock().push(word);
+    HANDED.fetch_add(1, Ordering::AcqRel);
+    crate::scm::request();
+}
+
+/// Tables handed to the worker, and let go of by it (a futex word).
+static HANDED: AtomicU32 = AtomicU32::new(0);
+static RELEASED: AtomicU32 = AtomicU32::new(0);
+
+/// The worker: lets go of the tables handed to it.
+pub fn release_ended() {
+    let ended = core::mem::take(&mut *ENDED.lock());
+    let n = ended.len() as u32;
+    for word in ended {
+        released_now(word);
+    }
+    if n > 0 {
+        RELEASED.fetch_add(n, Ordering::AcqRel);
+        syscall(SYS_SERVER_FUTEX_WAKE, [&RELEASED as *const AtomicU32 as u64, u32::MAX as u64, 0, 0, 0, 0]);
+    }
+}
+
+/// The instance's last program is gone (`EVENT_CLOSING`): the service
+/// thread waits until the worker let go of every table handed to it, so
+/// that what their sockets still had to send reaches netd first.
+pub fn settle() {
+    loop {
+        let done = RELEASED.load(Ordering::Acquire);
+        if done == HANDED.load(Ordering::Acquire) {
+            return;
+        }
+        syscall(SYS_SERVER_FUTEX_WAIT, [&RELEASED as *const AtomicU32 as u64, done as u64, 0, 0, 0, 0]);
     }
 }
 
@@ -346,7 +419,7 @@ fn close_range(first: u64, last: u64, flags: u64) -> Result<i64, i64> {
         let word = give(own.clone());
         let r = syscall(SYS_FILES_RECORD, [FILES_UNSHARE, word, 0, 0, 0, 0]);
         if r < 0 {
-            released(word);
+            released_now(word);
             return Err(-r);
         }
         thread::set_files(word & !FILES_TAG);

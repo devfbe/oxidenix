@@ -43,11 +43,12 @@ Alternatives considered:
 - **Records, as for working directories.** Each descriptor table of the kernel's carries a
   record of the server's (`SYS_FILES_RECORD`, the same protocol as `SYS_FS_RECORD`): the
   kernel's clone still decides who shares a table (CLONE_FILES), the server hands the kernel
-  the table a clone or an execve makes (fork: a copy made before the call passes through;
-  execve: the copy without close-on-exec descriptors, made when the call starts as Linux's
-  unshare_files, installed at the point of no return), and the kernel gives a record back
-  when its table ends (`EVENT_RELEASE`), when the server lets the table go and its
-  descriptors close. The kernel's tables of Linux programs hold no descriptors. A thread
+  the table a clone makes (a copy made before the call passes through); an execve that
+  succeeded says so when it returns to the server, which makes the new program's table then
+  (the copy without close-on-exec descriptors, from the point of no return on) and lets the
+  old one go on that thread before the new program runs; the kernel gives a record back when
+  the last process using its table exited (`EVENT_RELEASE`), and the worker thread lets the
+  table go and its descriptors close (never the pager: closing a socket takes its locks). The kernel's tables of Linux programs hold no descriptors. A thread
   remembers its table in the server's own words of its State page, so a descriptor's lookup
   is a lock and a reference count. R8 takes over the decisions through a small interface:
   `FilesContext::fork`, `FilesContext::for_exec`, and dropping a table at exit.
@@ -74,8 +75,10 @@ Alternatives considered:
 - No kernel call for a descriptor's lookup, a readiness change, dup, close or fcntl; the
   bridges for placeholders and descriptors in flight are gone from the ABI, and so are the
   kernel's epoll, poll and select (the native servers never used them).
-- A process's descriptors close on the service thread when its table ends (exit, execve),
-  as placeholders' did; close(2) closes on the calling thread before it returns.
+- An exited process's descriptors close on the worker thread; close-on-exec descriptors close
+  on the execve's thread before the new program runs (a reader sees end of file at once, a
+  port is free for the new program); close(2) closes on the calling thread before it
+  returns.
 - The copy at fork and execve costs what Linux's dup_fd costs: one reference per descriptor.
 - RLIMIT_NOFILE is kept with the table until processes are the server's (CLONE_FILES
   without CLONE_THREAD shares it).

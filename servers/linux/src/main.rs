@@ -161,13 +161,20 @@ fn pass_through(s: &mut State) {
     if nr == SYS_RT_SIGRETURN {
         thread::set_restart([thread::RESTART_NONE, 0, 0, 0]);
     }
-    if let Err(e) = fdtable::before_pass_through(s) {
-        s.rax = (-e) as u64;
-        return;
-    }
+    let old_table = match fdtable::before_pass_through(s) {
+        Ok(t) => t,
+        Err(e) => {
+            s.rax = (-e) as u64;
+            return;
+        }
+    };
     records::before_pass_through(s);
-    syscall(SYS_LEGACY_SYSCALL, [0; 6]);
-    fdtable::after_pass_through(nr);
+    let r = syscall(SYS_LEGACY_SYSCALL, [0; 6]) as u64;
+    if r & LEGACY_EXECUTED != 0 {
+        if let Some(old) = old_table {
+            fdtable::executed(old, r & !LEGACY_EXECUTED);
+        }
+    }
     datafs::reap();
 }
 
@@ -213,15 +220,14 @@ fn pager() -> ! {
         match event.kind {
             EVENT_RELEASE => {
                 // Bit 0 tells a tmpfs file's hold, bit 1 a /data file's, bit 2
-                // a descriptor table (whose descriptors close now: a process
-                // exited or executed a program), from a working directory's
-                // record.
+                // a descriptor table (its last process exited: the worker
+                // closes its descriptors), from a working directory's record.
                 if event.a & 1 == 1 {
                     tmpfs::released(event.a);
                 } else if event.a & datafs::HOLD_TAG != 0 {
                     datafs::released(event.a);
                 } else if event.a & fdtable::FILES_TAG != 0 {
-                    fdtable::released(event.a);
+                    fdtable::release_later(event.a);
                 } else {
                     records::released(event.a);
                 }
@@ -243,7 +249,9 @@ fn pager() -> ! {
             }
             EVENT_CLOSING => {
                 // What the instance's sockets still had to send reaches
-                // netd (their closes hand it over) before the instance goes.
+                // netd (their closes hand it over) before the instance goes:
+                // the worker has closed the ended processes' tables first.
+                fdtable::settle();
                 netclient::settle();
                 datafs::closing();
                 continue;

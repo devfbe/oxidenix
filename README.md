@@ -665,9 +665,10 @@ the server.
   call, as Linux's fdget) and descriptors in flight. Until the process model is the server's
   (R8), the kernel's clone decides who shares a table (`CLONE_FILES`): each table of the
   kernel's carries the server's record of its table (`files_record`), the server hands the
-  kernel the copy a fork makes and the copy without close-on-exec descriptors an execve
-  installs at its point of no return, and the kernel gives a table back when its last process
-  is done with it (`EVENT_RELEASE`: its descriptors close). A descriptor's lookup is a lock
+  kernel the copy a fork makes, makes the new program's table after an execve's point of no
+  return (closing the close-on-exec descriptors on that thread before the program runs), and
+  the kernel gives a table back when its last process exited (`EVENT_RELEASE`: the worker
+  thread closes its descriptors). A descriptor's lookup is a lock
   and a reference count, no kernel call. The kernel's own files a program still opens (its
   tree: `/proc`, `/sys`, the kernel's null and zero) are open file descriptions the server
   holds by handle (`inode_open`, `kfile_call`), always ready. `poll`, `ppoll`, `select`,

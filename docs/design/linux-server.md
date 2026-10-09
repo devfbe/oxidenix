@@ -289,7 +289,7 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
      exec, or a call that used one ended), the collector is asked for after the reference is
      gone, so that it sees it gone; it runs on the instance's **worker** thread
      (`ROLE_WORKER`: a second thread of the pager's process that serves neither a program nor
-     a page). Never on the pager: the collector waits for sockets' locks, and nothing may
+     a page), which also closes the descriptor tables of processes that ended (R6e). Never on the pager: the collector waits for sockets' locks, and nothing may
      wait for the pager while it holds one; for the same reason no server lock the pager
      takes is held while program memory is copied (a fault there may need a page the pager
      brings): a receive copies with only its socket's (or pipe's) receive lock held. The
@@ -659,8 +659,8 @@ the kernel keeps descriptor tables for its native servers only. Decisions in ADR
   (`files::FileRef`), and so do a call that uses it (Linux's fdget: another thread's close
   never takes a description from under a call) and a descriptor in flight. With its last
   reference the file closes (Linux's fput), on the thread that let go of it: the closing
-  thread for close(2), the service thread when a process's table ends, the worker for a
-  message the collector dropped (an internet socket's close then goes through the net
+  thread for close(2), the execve's thread for close-on-exec descriptors, the worker when a
+  process's table ends and for a message the collector dropped (an internet socket's close then goes through the net
   thread, which may wait for netd).
 - **The table** (`fdtable::FilesContext`) holds the descriptors (a description and the
   close-on-exec bit), the lowest free slot, and RLIMIT_NOFILE (4096 by default, at most
@@ -674,12 +674,17 @@ the kernel keeps descriptor tables for its native servers only. Decisions in ADR
   as for working directories (`fs_record`): each table of the kernel's (which holds no
   descriptor of a Linux program) carries the server's record of its table
   (`SYS_FILES_RECORD`). A clone without CLONE_FILES (fork, vfork) gets a copy the server makes
-  before the call passes through (`FS_CHILD`); execve gets the copy without the close-on-exec
-  descriptors, made when the call starts (Linux's unshare_files) and installed by the kernel
-  at its point of no return (a failed execve gives it back); a process's exit, or its execve,
-  ends its old table when the last process using it is done with it: the kernel hands the
-  record back (`EVENT_RELEASE`), and the service thread lets the table go, which closes its
-  descriptors. A thread remembers its table's record in the server's words of its State page
+  before the call passes through (`FS_CHILD`). An execve that succeeded leaves the process a
+  new table of the kernel's without a record and says so when it returns to the server
+  (`legacy_syscall`'s `LEGACY_EXECUTED`, with the old table's record if the call let go of its
+  last holder): the server makes the new program's table then, from the point of no return
+  on (the old one's descriptors without the close-on-exec ones), and lets the old table go on
+  that same thread before the new program runs, so close-on-exec descriptors are closed when
+  it starts, as on Linux (a pipe's reader sees its end, a socket's port is free). When the last
+  process using a table exits, the kernel hands the record back (`EVENT_RELEASE`); the service
+  thread passes it to the worker, which lets the table go and closes its descriptors (closing
+  a socket takes its locks, which the pager must never wait for), and the service thread
+  waits for the worker before the instance ends. A thread remembers its table's record in the server's words of its State page
   (`SERVER_THREAD_OFFSET`, `thread.rs`) after the first lookup, until it executes a program
   or unshares its table: a descriptor's lookup is a lock and a reference count, no kernel
   call. The interface the process model will call (R8): `FilesContext::fork`,

@@ -95,27 +95,20 @@ pub fn exec(frame: &mut Frame, path: &str, args: &[String], envs: &[String]) -> 
     // The point of no return: from here on the old program is gone.
     de_thread()?;
     let me = current();
-    // A Linux program's descriptors are its server's: the table the server
-    // gave for the new program (its copy without the close-on-exec
-    // descriptors, `SYS_FILES_RECORD`) takes the old one's place. A
-    // descriptor table of the kernel's still shared (CLONE_FILES without
+    // A Linux program's descriptors are its server's: the process gets a new
+    // table without a record, for which the server makes the new program's
+    // table (its copy without the close-on-exec descriptors) when this call
+    // returns to it, from the point of no return on (`SYS_LEGACY_SYSCALL`).
+    // A descriptor table of the kernel's still shared (CLONE_FILES without
     // CLONE_THREAD) becomes the process's own, as it is once the other
     // threads are gone.
-    let linux_files = with_current(|p| p.linux.as_mut().and_then(|l| l.files_child.take()));
-    let files = match linux_files {
-        Some(record) => match super::task::Files::new(Vec::new()) {
-            Some(files) => {
-                // A new table has none yet.
-                let _ = files.set_record(record);
-                Some(files)
-            }
-            None => {
-                // Back to the server (exit_group does not return).
-                drop(record);
-                super::exit_group(signal::SIGKILL as i32)
-            }
+    let linux = with_current(|p| p.linux.is_some());
+    let files = match linux {
+        true => match super::task::Files::new(Vec::new()) {
+            Some(files) => Some(files),
+            None => super::exit_group(signal::SIGKILL as i32),
         },
-        None => {
+        false => {
             let shared = with_current(|p| p.files.as_ref().filter(|f| alloc::sync::Arc::strong_count(f) > 1).cloned());
             match shared {
                 Some(f) => match f.duplicate() {
@@ -168,7 +161,20 @@ pub fn exec(frame: &mut Frame, path: &str, args: &[String], envs: &[String]) -> 
         super::irq::on_exit(pid);
     }
     drop(closed);
-    drop(old_files);
+    // A Linux program's old table: if this was its last process, its record
+    // goes back to the server on this thread when the call returns (it
+    // closes the old descriptors at once, before the new program runs),
+    // not as an event for the service thread.
+    if linux {
+        let released = old_files.and_then(|f| alloc::sync::Arc::try_unwrap(f).ok()).and_then(|f| f.take_record()).map_or(0, |r| r.into_word());
+        with_current(|p| {
+            if let Some(l) = p.linux.as_mut() {
+                l.executed = Some(released);
+            }
+        });
+    } else {
+        drop(old_files);
+    }
     // The old address space is freed here (unless a vfork parent shares
     // it); no CPU has it loaded for this task any more.
     drop(old_mm);

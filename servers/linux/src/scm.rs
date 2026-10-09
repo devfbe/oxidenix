@@ -98,13 +98,15 @@ pub fn request() {
     syscall(SYS_SERVER_FUTEX_WAKE, [&REQUESTED as *const AtomicU32 as u64, 1, 0, 0, 0, 0]);
 }
 
-/// The worker thread: collects whenever asked.
+/// The worker thread: lets go of the descriptor tables whose processes
+/// ended (`fdtable::release_later`) and collects whenever asked.
 pub fn worker() -> ! {
     let mut done = 0;
     loop {
         let asked = REQUESTED.load(Ordering::Acquire);
         if asked != done {
             done = asked;
+            crate::fdtable::release_ended();
             collect();
             continue;
         }

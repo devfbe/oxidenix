@@ -8,8 +8,12 @@
  * poll. Run as `fdtest exec-check FD FD`, it reports which of two
  * descriptors an execve left open. */
 #define _GNU_SOURCE
+#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <netinet/in.h>
+#include <signal.h>
+#include <sys/socket.h>
 #include <poll.h>
 #include <pthread.h>
 #include <sched.h>
@@ -244,19 +248,38 @@ static void processes(void) {
     close(keep);
     close(gone);
 
-    /* An exec closes a close-on-exec pipe end: the reader sees the end. */
+    /* An exec closes a close-on-exec pipe end before the new program runs:
+     * the reader sees the end at once. */
     pipe2(p, O_CLOEXEC);
     child = fork();
     if (child == 0) {
         close(p[0]);
-        execl("/bin/sleep", "sleep", "1", (char *)NULL);
+        execl("/bin/sleep", "sleep", "2", (char *)NULL);
         _exit(9);
     }
     close(p[1]);
     struct pollfd pf = {p[0], POLLIN, 0};
-    check("a close-on-exec write end goes with the execve", poll(&pf, 1, 900) == 1 && (pf.revents & POLLHUP));
+    check("a close-on-exec write end goes with the execve", poll(&pf, 1, 300) == 1 && (pf.revents & POLLHUP));
     close(p[0]);
+    kill(child, SIGKILL);
     waitpid(child, NULL, 0);
+
+    /* ... and so does a close-on-exec socket: the new program can bind its
+     * port at once. */
+    int s = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    struct sockaddr_in addr = {.sin_family = AF_INET, .sin_port = htons(47190), .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    int bound = bind(s, (struct sockaddr *)&addr, sizeof addr) == 0 && listen(s, 1) == 0;
+    child = fork();
+    if (child == 0) {
+        /* The parent's descriptor is gone by then: the execve lets go of
+         * the last one. */
+        sleep_ms(50);
+        execl("/bin/fdtest", "fdtest", "bind-check", "47190", (char *)NULL);
+        _exit(9);
+    }
+    close(s);
+    waitpid(child, &status, 0);
+    check("a close-on-exec socket's port is free for the new program", bound && WIFEXITED(status) && WEXITSTATUS(status) == 0);
 }
 
 static void kernel_files(void) {
@@ -300,6 +323,11 @@ static void kernel_files(void) {
 int main(int argc, char **argv) {
     if (argc == 4 && strcmp(argv[1], "exec-check") == 0) {
         return is_open(atoi(argv[2])) && !is_open(atoi(argv[3])) ? 0 : 1;
+    }
+    if (argc == 3 && strcmp(argv[1], "bind-check") == 0) {
+        int s = socket(AF_INET, SOCK_STREAM, 0);
+        struct sockaddr_in addr = {.sin_family = AF_INET, .sin_port = htons(atoi(argv[2])), .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+        return bind(s, (struct sockaddr *)&addr, sizeof addr) == 0 && listen(s, 1) == 0 ? 0 : 1;
     }
     basics();
     limits();

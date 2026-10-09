@@ -233,6 +233,12 @@ impl Files {
         Ok(())
     }
 
+    /// Takes the record out (the table's last holder hands it back
+    /// directly: execve, `linux::Record::into_word`).
+    pub fn take_record(&self) -> Option<super::linux::Record> {
+        self.record.lock().take()
+    }
+
     /// A copy for a new process (fork), or for exec of a shared table
     /// (without a record: the caller gives it the server's, if any).
     pub fn duplicate(&self) -> Option<Arc<Files>> {

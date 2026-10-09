@@ -819,6 +819,12 @@ impl Record {
     pub fn word(&self) -> u64 {
         self.word
     }
+
+    /// Hands the record back directly (its word) instead of as an event.
+    pub fn into_word(mut self) -> u64 {
+        self.instance = Weak::new();
+        self.word
+    }
 }
 
 impl Drop for Record {
@@ -890,9 +896,12 @@ pub struct LinuxThread {
     /// pass-through clone creates (`FS_CHILD`).
     pub fs_child: Option<Record>,
     /// The record for the descriptor table the thread's next pass-through
-    /// call makes: a clone without CLONE_FILES, or execve
-    /// (`SYS_FILES_RECORD`'s `FS_CHILD`).
+    /// clone without CLONE_FILES makes (`SYS_FILES_RECORD`'s `FS_CHILD`).
     pub files_child: Option<Record>,
+    /// The thread's pass-through execve succeeded: with the record of the
+    /// old descriptor table if that was its last holder (0: none), which
+    /// `legacy_syscall` hands back.
+    pub executed: Option<u64>,
     /// The program the thread's next pass-through execve runs, as the
     /// server resolved it, with its absolute path (`SYS_EXEC_TARGET`).
     pub exec_target: Option<(ExecTarget, alloc::string::String)>,
@@ -911,7 +920,7 @@ impl LinuxThread {
         // holding some left it).
         unsafe { *((memory::phys_to_virt(state.start_address().as_u64()) as u64 + SERVER_LOCKS_OFFSET) as *mut u32) = 0 };
         let thread =
-            LinuxThread { instance, slot, state, restricted: false, pager: false, events: false, in_legacy: false, trap_nr: None, fs_child: None, files_child: None, exec_target: None, normal: Frame::default() };
+            LinuxThread { instance, slot, state, restricted: false, pager: false, events: false, in_legacy: false, trap_nr: None, fs_child: None, files_child: None, executed: None, exec_target: None, normal: Frame::default() };
         save(program, thread.state());
         let start = thread.start(role);
         Ok((thread, start))
@@ -928,7 +937,7 @@ impl LinuxThread {
         // holding some left it).
         unsafe { *((memory::phys_to_virt(state.start_address().as_u64()) as u64 + SERVER_LOCKS_OFFSET) as *mut u32) = 0 };
         let thread =
-            LinuxThread { instance, slot, state, restricted: false, pager: true, events: false, in_legacy: false, trap_nr: None, fs_child: None, files_child: None, exec_target: None, normal: Frame::default() };
+            LinuxThread { instance, slot, state, restricted: false, pager: true, events: false, in_legacy: false, trap_nr: None, fs_child: None, files_child: None, executed: None, exec_target: None, normal: Frame::default() };
         let start = thread.start(role);
         Ok((thread, start))
     }
@@ -940,7 +949,7 @@ impl LinuxThread {
         // holding some left it).
         unsafe { *((memory::phys_to_virt(state.start_address().as_u64()) as u64 + SERVER_LOCKS_OFFSET) as *mut u32) = 0 };
         let thread =
-            LinuxThread { instance, slot, state, restricted: false, pager: true, events: true, in_legacy: false, trap_nr: None, fs_child: None, files_child: None, exec_target: None, normal: Frame::default() };
+            LinuxThread { instance, slot, state, restricted: false, pager: true, events: true, in_legacy: false, trap_nr: None, fs_child: None, files_child: None, executed: None, exec_target: None, normal: Frame::default() };
         let start = thread.start(ROLE_PAGER);
         Ok((thread, start))
     }
@@ -981,6 +990,11 @@ impl Drop for LinuxThread {
     fn drop(&mut self) {
         if self.events {
             self.instance.pager_gone();
+        }
+        // An old table no legacy call handed back (never: it is taken as the
+        // execve returns), as an event then.
+        if let Some(word) = self.executed.take().filter(|&w| w != 0) {
+            self.instance.queue_event(Event { kind: EVENT_RELEASE, a: word, b: 0 });
         }
         // The slot goes back only now, with the task that owns this
         // thread (`Task::server_locks` points into its State page).
@@ -1861,17 +1875,17 @@ pub fn legacy() -> Result<u64, i64> {
     set_legacy(true);
     super::syscall::dispatch_linux(&mut program);
     set_legacy(false);
-    let unused = with_current(|p| match p.linux.as_mut() {
+    let (unused, executed) = with_current(|p| match p.linux.as_mut() {
         Some(l) => {
             save(&program, l.state());
             l.exec_target = None;
-            (l.fs_child.take(), l.files_child.take())
+            ((l.fs_child.take(), l.files_child.take()), l.executed.take())
         }
-        None => (None, None),
+        None => ((None, None), None),
     });
-    // A child's record no clone (or execve) took goes back to the server.
+    // A child's record no clone took goes back to the server.
     drop(unused);
-    Ok(0)
+    Ok(executed.map_or(0, |word| LEGACY_EXECUTED | word))
 }
 
 /// Enters or leaves a legacy call: the view follows.
