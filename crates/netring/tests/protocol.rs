@@ -27,7 +27,7 @@ fn every_request() -> Vec<Request> {
         Request::Socket { sock: MAX_SOCKETS as u32 - 1, kind: Kind::RawIcmp, area: Some(area(3, 4096, MIN_RING)) },
         Request::Bind { sock: 1, at: ep(0x7f00_0001, 8080), reuse: true },
         Request::Bind { sock: 1, at: ep(0, 0), reuse: false },
-        Request::Listen { sock: 2, backlog: 511 },
+        Request::Listen { sock: 2, backlog: 511, reuse: true },
         Request::Connect { sock: 3, to: ep(0x0a00_0264, 7), area: Some(area(2, 1 << 21, MAX_RING)) },
         Request::Connect { sock: 3, to: ep(0, 0), area: None },
         Request::Accept { sock: 4, new: 5, area: area(9, 8192, 65536) },
@@ -130,8 +130,26 @@ fn sockets_endpoints_and_values_must_be_in_range() {
     assert_eq!(Request::decode(&Desc { len: 0, ..links }), Err(EINVAL));
     assert_eq!(Request::decode(&Desc { len: MAX_LINKS_BUF + 1, ..links }), Err(EINVAL));
     assert_eq!(Request::decode(&Desc { grant: 0, ..links }), Err(EINVAL));
-    let listen = Request::Listen { sock: 1, backlog: 1 }.encode(1);
+    let listen = Request::Listen { sock: 1, backlog: 1, reuse: false }.encode(1);
     assert_eq!(Request::decode(&Desc { arg: [1 << 32, 0, 0], ..listen }), Err(EINVAL));
+    assert_eq!(Request::decode(&Desc { arg: [1, 2, 0], ..listen }), Err(EINVAL));
+}
+
+#[test]
+fn option_values_are_checked_before_netd_uses_them() {
+    let ok = |o: u32, v: u64| Request::decode(&Request::SetOpt { sock: 1, opt: o, value: v }.encode(1));
+    assert!(ok(opt::NODELAY, 0).is_ok() && ok(opt::NODELAY, 1).is_ok());
+    assert_eq!(ok(opt::NODELAY, 2), Err(EINVAL));
+    // Keep-alive: off, or whole seconds Linux takes (1..=32767 s).
+    assert!(ok(opt::KEEPALIVE, 0).is_ok() && ok(opt::KEEPALIVE, 1000).is_ok() && ok(opt::KEEPALIVE, 32_767_000).is_ok());
+    for v in [1, 999, 32_767_001, u64::MAX] {
+        assert_eq!(ok(opt::KEEPALIVE, v), Err(EINVAL), "keep-alive {v}");
+    }
+    assert!(ok(opt::TTL, 1).is_ok() && ok(opt::TTL, 255).is_ok());
+    assert_eq!(ok(opt::TTL, 0), Err(EINVAL));
+    assert_eq!(ok(opt::TTL, 256), Err(EINVAL));
+    assert_eq!(ok(99, 1), Err(ENOPROTOOPT));
+    assert_eq!(ok(0, 0), Err(ENOPROTOOPT));
 }
 
 #[test]

@@ -420,7 +420,8 @@ impl InetSock {
         if snap.state & (state::ESTABLISHED | state::CONNECTING) != 0 {
             return Err(EINVAL);
         }
-        self.net.status(Request::Listen { sock: self.index, backlog: backlog.clamp(0, i32::MAX) as u32 })?;
+        let reuse = self.st.lock().opts.reuseaddr;
+        self.net.status(Request::Listen { sock: self.index, backlog: backlog.clamp(0, i32::MAX) as u32, reuse })?;
         let mut l = self.st.lock();
         l.listening = true;
         self.report(&mut l, false);

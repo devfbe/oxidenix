@@ -373,8 +373,10 @@ fn setsockopt(sock: &Arc<InetSock>, level: u64, name: u64, val: u64, len: u64) -
         (SOL_SOCKET, SO_KEEPALIVE) => {
             let on = int()? != 0;
             if tcp {
-                let interval = sock.st.lock().opts.keepintvl.max(1) as u64 * 1000;
-                sock.setopt(opt::KEEPALIVE, if on { interval } else { 0 })?;
+                // Probes after TCP_KEEPIDLE of silence (smoltcp keeps one
+                // interval: also between probes).
+                let idle = sock.st.lock().opts.keepidle.clamp(1, 32767) as u64 * 1000;
+                sock.setopt(opt::KEEPALIVE, if on { idle } else { 0 })?;
             }
             sock.st.lock().opts.keepalive = on;
         }
@@ -415,7 +417,7 @@ fn setsockopt(sock: &Arc<InetSock>, level: u64, name: u64, val: u64, len: u64) -
                     TCP_KEEPINTVL => l.opts.keepintvl = v,
                     _ => l.opts.keepcnt = v,
                 }
-                l.opts.keepalive.then_some(l.opts.keepintvl as u64 * 1000)
+                (name == TCP_KEEPIDLE && l.opts.keepalive).then_some(l.opts.keepidle as u64 * 1000)
             };
             if let Some(ms) = keepalive {
                 sock.setopt(opt::KEEPALIVE, ms)?;
@@ -435,9 +437,7 @@ fn setsockopt(sock: &Arc<InetSock>, level: u64, name: u64, val: u64, len: u64) -
             if !(1..=255).contains(&ttl) {
                 return Err(EINVAL);
             }
-            if sock.kind != Kind::RawIcmp {
-                sock.setopt(opt::TTL, ttl as u64)?;
-            }
+            sock.setopt(opt::TTL, ttl as u64)?;
             sock.st.lock().opts.ttl = ttl;
         }
         (SOL_IP, IP_TOS) => {

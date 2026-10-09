@@ -69,6 +69,9 @@ pub const TCP_BUFFER: usize = 64 * 1024;
 const UDP_BUFFER: usize = 64 * 1024;
 const UDP_PACKETS: usize = 16;
 const RAW_BUFFER: usize = 16 * 1024;
+/// A raw socket's hop limit until IP_TTL sets one (Linux's
+/// net.ipv4.ip_default_ttl).
+const DEFAULT_TTL: u8 = 64;
 /// The bytes of smoltcp's socket buffers (and leftovers) netd keeps at
 /// most, in mappings of their own (`Region`).
 const BUDGET: usize = 24 << 20;
@@ -228,7 +231,8 @@ struct Tcp {
 enum Proto {
     Tcp(Tcp),
     Udp { handle: SocketHandle, peer: Option<IpEndpoint>, reuse: bool },
-    Raw { handle: SocketHandle, peer: Option<Ipv4Address> },
+    /// `ttl`: the hop limit of the packets the socket sends (IP_TTL).
+    Raw { handle: SocketHandle, peer: Option<Ipv4Address>, ttl: u8 },
 }
 
 /// What netd publishes of a socket, as it last did.
@@ -547,7 +551,7 @@ impl Service {
         match r {
             Request::Socket { sock, kind, area } => self.socket(c, sock, kind, area, sockets),
             Request::Bind { sock, at, reuse } => self.bind(c, sock, at, reuse, sockets),
-            Request::Listen { sock, backlog } => self.listen(c, sock, backlog, sockets),
+            Request::Listen { sock, backlog, reuse } => self.listen(c, sock, backlog, reuse, sockets),
             Request::Connect { sock, to, area } => self.connect(c, sock, to, area, iface, sockets),
             Request::Accept { sock, new, area } => self.accept(c, sock, new, area, sockets),
             Request::Send { sock, to, len } => self.send(c, sock, to, len, iface, sockets),
@@ -674,7 +678,7 @@ impl Service {
                 Sock::new(Proto::Tcp(t), None, 0, TCP_COST)
             }
             Kind::Udp => Sock::new(Proto::Udp { handle, peer: None, reuse: false }, area, state::SEND_OPEN | state::WRITABLE, cost),
-            Kind::RawIcmp => Sock::new(Proto::Raw { handle, peer: None }, area, state::SEND_OPEN | state::WRITABLE, cost),
+            Kind::RawIcmp => Sock::new(Proto::Raw { handle, peer: None, ttl: DEFAULT_TTL }, area, state::SEND_OPEN | state::WRITABLE, cost),
         };
         self.enter(c, sock, s);
         done(0)
@@ -784,11 +788,16 @@ impl Service {
         Ok((0, [port as u64, 0, 0, 0]))
     }
 
-    fn listen(&mut self, c: usize, sock: u32, backlog: u32, sockets: &mut SocketSet<'static>) -> Reply {
-        let bound = match &self.sock(c, sock)?.proto {
+    fn listen(&mut self, c: usize, sock: u32, backlog: u32, reuse: bool, sockets: &mut SocketSet<'static>) -> Reply {
+        let bound = match &mut self.sock(c, sock)?.proto {
             Proto::Tcp(t) if t.backlog.is_some() => return done(0),
             Proto::Tcp(t) if t.established || t.connecting.is_some() => return Err(EINVAL),
-            Proto::Tcp(t) => t.local.map(|l| (l, t.reuse)),
+            Proto::Tcp(t) => {
+                // SO_REUSEADDR as it is now, not as it was at bind
+                // (Linux reads it at listen too).
+                t.reuse = reuse;
+                t.local.map(|l| (l, reuse))
+            }
             _ => return Err(EOPNOTSUPP),
         };
         // The port is claimed again, as a listener's (Linux checks at
@@ -992,8 +1001,8 @@ impl Service {
             let rings = Self::rings(&chan.grants, s.area).ok_or(EINVAL)?;
             let proto = match &s.proto {
                 Proto::Tcp(_) => return Err(EOPNOTSUPP),
-                Proto::Udp { handle, peer, .. } => (true, *handle, peer.map(|p| (bits(p.addr), p.port))),
-                Proto::Raw { handle, peer } => (false, *handle, peer.map(|p| (p.to_bits(), 0))),
+                Proto::Udp { handle, peer, .. } => (true, *handle, peer.map(|p| (bits(p.addr), p.port)), 0),
+                Proto::Raw { handle, peer, ttl } => (false, *handle, peer.map(|p| (p.to_bits(), 0)), *ttl),
             };
             (proto, rings)
         };
@@ -1001,7 +1010,7 @@ impl Service {
             return Err(EMSGSIZE);
         }
         let len = len as usize;
-        let (udp, handle, peer) = proto;
+        let (udp, handle, peer, ttl) = proto;
         if udp {
             if len > MAX_UDP {
                 return Err(EMSGSIZE);
@@ -1050,7 +1059,7 @@ impl Service {
             if !Rings::read(rings.tx, rings.size, 0, &mut packet[IPV4_HEADER..]) {
                 return Err(EFAULT);
             }
-            let repr = Ipv4Repr { src_addr: src, dst_addr: dst, next_header: IpProtocol::Icmp, payload_len: len, hop_limit: 64 };
+            let repr = Ipv4Repr { src_addr: src, dst_addr: dst, next_header: IpProtocol::Icmp, payload_len: len, hop_limit: ttl };
             repr.emit(&mut Ipv4Packet::new_unchecked(&mut packet[..IPV4_HEADER]), &ChecksumCapabilities::default());
             let socket = sockets.get_mut::<raw::Socket>(handle);
             if !socket.can_send() {
@@ -1210,7 +1219,15 @@ impl Service {
                 opt::TTL => sockets.get_mut::<udp::Socket>(*handle).set_hop_limit(Some(ttl.ok_or(EINVAL)?)),
                 _ => return Err(ENOPROTOOPT),
             },
-            Proto::Raw { .. } => return Err(ENOPROTOOPT),
+            Proto::Raw { .. } => match option {
+                opt::TTL => {
+                    let t = ttl.ok_or(EINVAL)?;
+                    if let Proto::Raw { ttl, .. } = &mut self.sock(c, sock)?.proto {
+                        *ttl = t;
+                    }
+                }
+                _ => return Err(ENOPROTOOPT),
+            },
         }
         done(0)
     }

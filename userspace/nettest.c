@@ -291,6 +291,21 @@ static void stream_semantics(void) {
     check("... the first listens, the second's listen is EADDRINUSE", listen(r1, 1) == 0 && listen(r2, 1) == -1 && errno == EADDRINUSE);
     close(r1);
     close(r2);
+    /* SO_REUSEADDR counts as it is at listen, not as it was at bind. */
+    r1 = socket(AF_INET, SOCK_STREAM, 0);
+    r2 = socket(AF_INET, SOCK_STREAM, 0);
+    setsockopt(r1, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    setsockopt(r2, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    a = addr("127.0.0.1", 0);
+    bind(r1, (struct sockaddr *)&a, sizeof a);
+    alen = sizeof a;
+    getsockname(r1, (struct sockaddr *)&a, &alen);
+    bind(r2, (struct sockaddr *)&a, sizeof a);
+    int zero = 0;
+    setsockopt(r1, SOL_SOCKET, SO_REUSEADDR, &zero, sizeof zero);
+    check("SO_REUSEADDR cleared after bind: listen is EADDRINUSE", listen(r1, 1) == -1 && errno == EADDRINUSE);
+    close(r1);
+    close(r2);
     close(c);
     close(s);
 
@@ -400,6 +415,39 @@ static int icmp_echo(const char *ip) {
         int ihl = (reply[0] & 0xf) * 4;
         /* Skip our own request when it comes back over loopback. */
         found = n >= ihl + 16 && reply[9] == 1 && reply[ihl] == 0 && reply[ihl + 4] == 0x12 && reply[ihl + 5] == 0x34;
+    }
+    close(fd);
+    return found;
+}
+
+/* IP_TTL on a raw socket: the request it sends over loopback carries it. */
+static int raw_ttl(void) {
+    int fd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+    if (fd < 0) return 0;
+    int ttl = 7;
+    if (setsockopt(fd, IPPROTO_IP, IP_TTL, &ttl, sizeof ttl) != 0) {
+        close(fd);
+        return 0;
+    }
+    /* An echo request with a checksum over id 0x5678, sequence 1. */
+    unsigned char req[8] = {8, 0, 0, 0, 0x56, 0x78, 0, 1};
+    unsigned sum = 0;
+    for (int i = 0; i < 8; i += 2) sum += req[i] << 8 | req[i + 1];
+    while (sum >> 16) sum = (sum & 0xffff) + (sum >> 16);
+    sum = ~sum & 0xffff;
+    req[2] = sum >> 8;
+    req[3] = sum & 0xff;
+    struct sockaddr_in a = addr("127.0.0.1", 0);
+    int found = 0;
+    if (sendto(fd, req, sizeof req, 0, (struct sockaddr *)&a, sizeof a) == sizeof req) {
+        for (int tries = 0; tries < 8 && !found; tries++) {
+            struct pollfd p = {fd, POLLIN, 0};
+            if (poll(&p, 1, 2000) != 1) break;
+            unsigned char packet[128];
+            int n = recv(fd, packet, sizeof packet, 0);
+            int ihl = (packet[0] & 0xf) * 4;
+            found = n >= ihl + 8 && packet[ihl] == 8 && packet[ihl + 4] == 0x56 && packet[ihl + 5] == 0x78 && packet[8] == 7;
+        }
     }
     close(fd);
     return found;
@@ -531,6 +579,7 @@ int main(void) {
 
     check("raw ICMP echo to the gateway gets a reply", icmp_echo("10.0.2.2"));
     check("raw ICMP echo over loopback gets a reply", icmp_echo("127.0.0.1"));
+    check("IP_TTL on a raw socket sets its packets' TTL", raw_ttl());
 
     /* Lengths chosen to overflow naive arithmetic: an iovec length that is
      * negative as an ssize_t is EINVAL, a datagram over 65507 bytes

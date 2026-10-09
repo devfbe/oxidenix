@@ -51,14 +51,14 @@
 //! |----|---------|------------|
 //! | `SOCKET` | `object` socket, `arg[0]` kind, the area (datagram sockets: required; TCP: none) | 0 |
 //! | `BIND` | socket, `offset` endpoint (address 0: any; port 0: an ephemeral one), `arg[0]` `BIND_REUSEADDR` | v0 = the port |
-//! | `LISTEN` | socket, `arg[0]` backlog | 0 |
+//! | `LISTEN` | socket, `arg[0]` backlog, `arg[1]` `BIND_REUSEADDR` (as at listen) | 0 |
 //! | `CONNECT` | socket, endpoint; TCP: the area (unless it has one) | 0 once started (TCP: the outcome comes in the control block); a datagram socket's peer is set (endpoint 0: none) |
 //! | `ACCEPT` | listener, `arg[0]` the new socket, its area | v0 = peer address, v1 = peer port; `EAGAIN` |
 //! | `SEND` | socket, endpoint (0: the peer), `len` bytes at the start of the send ring | bytes; `EAGAIN` if smoltcp's buffer is full |
 //! | `SHUTDOWN` | socket, `arg[0]` `SHUT_RD` / `SHUT_WR` bits | 0 (`SHUT_WR`: FIN after what the send ring holds) |
 //! | `CLOSE` | socket, `arg[0]` `CLOSE_ABORT` | 0 once netd uses neither its control block nor its area |
 //! | `NAME` | socket, `arg[0]` 1 for the peer | v0 = address, v1 = port |
-//! | `SETOPT` | socket, `arg[0]` option, `arg[1]` value | 0 |
+//! | `SETOPT` | socket, `arg[0]` option (`opt`; another is `ENOPROTOOPT`), `arg[1]` value (in its range: `opt::valid`, else `EINVAL`) | 0 |
 //! | `LINKS` | a buffer | bytes of `Link` records |
 //! | `FORGET` | `grant` | 0 once netd let go of the grant |
 //!
@@ -175,11 +175,22 @@ pub const CLOSE_ABORT: u64 = 1;
 pub mod opt {
     /// 1: Nagle's algorithm off (TCP_NODELAY), 0: on.
     pub const NODELAY: u32 = 1;
-    /// The keep-alive interval in milliseconds, 0: off (SO_KEEPALIVE with
-    /// TCP_KEEPINTVL).
+    /// The idle time before keep-alive probes in milliseconds, 0: off
+    /// (SO_KEEPALIVE with TCP_KEEPIDLE: whole seconds, 1..=32767, as
+    /// Linux takes them).
     pub const KEEPALIVE: u32 = 2;
     /// The hop limit of what it sends, 1..=255 (IP_TTL).
     pub const TTL: u32 = 3;
+
+    /// Whether `value` is valid for `opt` (an unknown option is not).
+    pub fn valid(opt: u32, value: u64) -> bool {
+        match opt {
+            NODELAY => value <= 1,
+            KEEPALIVE => value == 0 || (1000..=32_767_000).contains(&value),
+            TTL => (1..=255).contains(&value),
+            _ => false,
+        }
+    }
 }
 
 /// The state bits netd publishes in a control block (`NetdLine::state`).
@@ -508,7 +519,8 @@ impl Endpoint {
 pub enum Request {
     Socket { sock: u32, kind: Kind, area: Option<Area> },
     Bind { sock: u32, at: Endpoint, reuse: bool },
-    Listen { sock: u32, backlog: u32 },
+    /// `reuse`: SO_REUSEADDR as it is at listen (Linux reads it then).
+    Listen { sock: u32, backlog: u32, reuse: bool },
     Connect { sock: u32, to: Endpoint, area: Option<Area> },
     Accept { sock: u32, new: u32, area: Area },
     Send { sock: u32, to: Endpoint, len: u32 },
@@ -569,7 +581,10 @@ impl Request {
             }
             op::LISTEN => {
                 let backlog = u32::try_from(d.arg[0]).map_err(|_| EINVAL)?;
-                (Request::Listen { sock: sock(d.object)?, backlog }, Used { args: 1, ..with_sock })
+                if d.arg[1] & !BIND_REUSEADDR != 0 {
+                    return Err(EINVAL);
+                }
+                (Request::Listen { sock: sock(d.object)?, backlog, reuse: d.arg[1] != 0 }, Used { args: 2, ..with_sock })
             }
             op::CONNECT => {
                 let r = Request::Connect { sock: sock(d.object)?, to: Endpoint::unpack(d.offset)?, area: Area::from_desc(d)? };
@@ -611,7 +626,16 @@ impl Request {
                 (Request::Name { sock: sock(d.object)?, peer: d.arg[0] == 1 }, Used { args: 1, ..with_sock })
             }
             op::SETOPT => {
-                let opt = u32::try_from(d.arg[0]).map_err(|_| EINVAL)?;
+                let opt = u32::try_from(d.arg[0]).map_err(|_| ENOPROTOOPT)?;
+                if !matches!(opt, opt::NODELAY | opt::KEEPALIVE | opt::TTL) {
+                    return Err(ENOPROTOOPT);
+                }
+                // A value out of range never reaches the stack (a keep-alive
+                // interval of a few milliseconds would make it probe every
+                // round).
+                if !opt::valid(opt, d.arg[1]) {
+                    return Err(EINVAL);
+                }
                 (Request::SetOpt { sock: sock(d.object)?, opt, value: d.arg[1] }, Used { args: 2, ..with_sock })
             }
             op::LINKS => {
@@ -655,9 +679,9 @@ impl Request {
                 d.offset = at.pack();
                 d.arg[0] = if reuse { BIND_REUSEADDR } else { 0 };
             }
-            Request::Listen { sock, backlog } => {
+            Request::Listen { sock, backlog, reuse } => {
                 d.object = sock as u64;
-                d.arg[0] = backlog as u64;
+                d.arg = [backlog as u64, if reuse { BIND_REUSEADDR } else { 0 }, 0];
             }
             Request::Connect { sock, to, area } => {
                 d.object = sock as u64;
