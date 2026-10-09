@@ -4,6 +4,8 @@
  * (MAP_NORESERVE) memory beyond the commit limit is the one killed. */
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -195,12 +197,47 @@ static void descriptor_flood(void) {
     check("after closing them, open works again", (first = open("/dev/null", O_RDONLY)) >= 0 && close(first) == 0 && n > 4000);
 }
 
+static void *idle_thread(void *arg) {
+    (void)arg;
+    for (;;) pause();
+    return NULL;
+}
+
+/* A multi-threaded process the kernel kills (a touch of uncommitted memory
+ * beyond what is left, in its program): its threads share one descriptor
+ * table, which the kernel's kill leaves to the server's worker; the parent
+ * still sees the pipe's only writer gone when waitpid returns. */
+static void killed_with_threads(void) {
+    int p[2];
+    pipe(p);
+    long room = (meminfo("CommitLimit:") - meminfo("Committed_AS:")) * 1024;
+    pid_t kid = fork();
+    if (kid == 0) {
+        close(p[0]);
+        pthread_t t;
+        for (int i = 0; i < 3; i++) pthread_create(&t, NULL, idle_thread, NULL);
+        long size = room + 256 * MIB;
+        char *mem = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if (mem == MAP_FAILED) _exit(2);
+        for (long i = 0; i < size; i += 4096) mem[i] = 1;
+        _exit(3);
+    }
+    close(p[1]);
+    int st = 0;
+    waitpid(kid, &st, 0);
+    struct pollfd hup = {p[0], POLLIN, 0};
+    int closed = poll(&hup, 1, 0) == 1 && (hup.revents & POLLHUP);
+    check("a multi-threaded process the kernel kills closes its table before wait", WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL && closed);
+    close(p[0]);
+}
+
 int main(void) {
     descriptor_flood();
     fork_bomb();
     memory_hog();
     noreserve_toucher();
     noreserve_copy();
+    killed_with_threads();
     pipe_flood();
     printf("oomtest: %s\n", failures ? "FAILED" : "all passed");
     return failures;

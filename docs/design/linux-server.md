@@ -149,6 +149,26 @@ program gains no more than that by its calls. A full priority inheritance (waite
 their weight to the owner) needs the owner's identity in every lock word and is not needed
 while the boost bounds the wait.
 
+These locks (`sync::Mutex`, `RwLock`) are held for bounded work only, never across a copy of
+program memory or a wait for another party (netd, diskfs, procfs, a channel's offer, a page
+the pager brings). Their waits (`FUTEX_LOCK`, on the server's own memory only) are like a
+kernel's spinlock: they go on for a dying thread, whose server still takes them to end it,
+and nothing about the waiter changes them; only a server thread that fails (an exception
+in the server's own code, whatever it held is lost with it) ends them, by breaking its
+instance (every program thread killed, every lock wait ended with EINTR, on which the
+waiter ends). A server thread is never ended on its own from the middle of server code: its
+accesses to program memory go through the copy routine, whose fault (also a page wait cut
+short by the thread's death) ends the copy with EFAULT and the call unwinds. Locks held across such waits (a file
+description's offset, an O_APPEND writer's turn, a /data inode's write-back and the making
+of its cached object, the /data names, a reconnection to diskfs, procfs or netd, a socket's,
+a pipe's or a terminal's readers) are sleeping locks (`SleepMutex`, `SleepLock`,
+`SleepRwLock`, Linux's mutex_lock_killable): their waits end with EINTR when the waiter
+dies and it unwinds; their holders are not priority-boosted. Every
+wait on a word or an event another party controls ends when the waiting thread dies: socket
+and pipe waits, ring completions (a dying thread polls, a millisecond at a time, until the
+request completes or the service is given up), a channel's offer (also after 10 s without
+an answer), page waits, a service's restart.
+
 ### The page cache and the I/O paths
 
 The page cache moves with the VFS into the server. Each cached file is a memory object whose
@@ -519,8 +539,9 @@ error code and the address, and the server raises the signal with Linux's `sigin
 
 **Thread exits** reach the service thread as `EVENT_THREAD_EXIT` (its key) once the thread is
 gone. A thread the server ended let go of its descriptor table itself; one the kernel ended
-alone (a server that did not take `REASON_EXIT`) still has it in its record: the worker lets
-go of it and only then ends the process if that was its last thread, so in every case a
+alone (a server that did not take `REASON_EXIT`, a kill from a fault in the program) still
+has it in its record: the worker lets go of it (in the order they came), and a process ends
+only once every table its threads handed over so went, so in every case a
 parent that sees its child dead sees its pipes closed and its ports free (Linux's
 `exit_files` before `exit_notify`). The room for the event and for that hand-over is
 reserved when the thread is created: neither is lost, and the service thread never closes a
@@ -575,8 +596,9 @@ shares the record, `CLONE_SIGHAND` the actions (also between processes, with `CL
 The server resolves the program (`execveat` too, with `AT_EMPTY_PATH`), checks it (a regular
 file with an execute bit: EACCES; not open for writing: ETXTBSY), follows `#!` lines (four
 deep, ELOOP), reads the ELF headers through its file object (ENOEXEC), copies the arguments
-and environment (E2BIG beyond `MAX_ARG_STRLEN` or 2 MiB; one flat buffer each, charged
-against a bound for the instance's execs at once, ENOMEM beyond it), checks the layout (an
+and environment (E2BIG beyond `MAX_ARG_STRLEN` or 2 MiB; one flat buffer each, whose whole
+capacity is charged before it grows, to the process and to the instance, ENOMEM beyond
+either bound), checks the layout (an
 `ET_EXEC` image not below 64 KiB, an `ET_DYN` one below its base, both below the stack's
 8 MiB; an interpreter must be `ET_DYN`: ENOEXEC), and only then reaches the point of
 no return: the process's other threads are killed and waited for (a clone under way

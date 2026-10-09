@@ -72,9 +72,12 @@ impl EventFd {
                 let mut count = self.count.lock();
                 if *count > 0 {
                     let taken = if self.semaphore { 1 } else { *count };
-                    usercopy::write(buf, &taken)?;
                     *count -= taken;
                     self.changed(*count);
+                    drop(count);
+                    // Copied out after the lock (a fault may wait for a page): taken
+                    // even if the copy fails, as Linux's eventfd_read.
+                    usercopy::write(buf, &taken)?;
                     return Ok(8);
                 }
                 seen = self.seq.load(Ordering::Acquire);

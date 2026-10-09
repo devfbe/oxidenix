@@ -329,6 +329,49 @@ static void processes(void) {
     close(p[0]);
     close(p[1]);
 
+    /* A process waiting for a shared description's offset, which another holds across a copy
+     * that never ends (its write comes from a page the pager never supplies), ends at once when
+     * killed (the offset's lock is a sleeping lock its death ends). */
+    {
+        int f = open("/tmp/fdtest.stuck", O_RDWR | O_CREAT | O_TRUNC, 0600);
+        char block[8192];
+        memset(block, 's', sizeof block);
+        write(f, block, sizeof block);
+        lseek(f, 0, SEEK_SET);
+        char *stuck = (char *)0x223000000000;
+        int armed = syscall(1507, stuck) == 0;
+        pid_t holder = fork();
+        if (holder == 0) {
+            /* (The stuck page is mapped read-only: the write's source.) */
+            write(f, stuck, 4096);
+            _exit(1);
+        }
+        sleep_ms(200);
+        pid_t waiter = fork();
+        if (waiter == 0) {
+            char c[16];
+            read(f, c, sizeof c);
+            _exit(2);
+        }
+        sleep_ms(200);
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        kill(waiter, SIGKILL);
+        int ws = 0;
+        waitpid(waiter, &ws, 0);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        long took = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+        kill(holder, SIGKILL);
+        int hs = 0;
+        waitpid(holder, &hs, 0);
+        syscall(1507, 0);
+        close(f);
+        unlink("/tmp/fdtest.stuck");
+        printf("offset waiter killed in %ld ms\n", took);
+        check("SIGKILL ends a wait for a description's offset held across a stuck copy",
+              armed && WIFSIGNALED(ws) && WTERMSIG(ws) == SIGKILL && took < 500 && WIFSIGNALED(hs));
+    }
+
     /* An exec closes a close-on-exec pipe end before the new program runs:
      * the reader sees the end at once. */
     pipe2(p, O_CLOEXEC);

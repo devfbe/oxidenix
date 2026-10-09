@@ -306,7 +306,7 @@ pub struct Sock {
     /// Receives, one at a time: held across the copy to the program's
     /// memory (which may wait for the pager), where the state lock is not.
     /// Never taken by a service thread.
-    rlock: Mutex<()>,
+    rlock: crate::sync::SleepLock,
     inner: Mutex<Inner>,
 }
 
@@ -539,7 +539,7 @@ impl Sock {
             qlen: AtomicUsize::new(0),
             peer_addr: AtomicUsize::new(0),
             waiters: Mutex::new(Vec::new()),
-            rlock: Mutex::new(()),
+            rlock: crate::sync::SleepLock::new(()),
             inner: Mutex::new(Inner {
                 state: State::Unconnected,
                 connecting: false,
@@ -1258,7 +1258,7 @@ impl Sock {
         let mut result = Ok(());
         // MSG_PEEK goes through the queue: the last piece peeked.
         let mut peeked: Option<u64> = None;
-        let mut reader = Some(self.rlock.lock());
+        let mut reader = Some(self.rlock.lock()?);
         loop {
             // The next piece, or why there is none (under the lock).
             let next = {
@@ -1310,7 +1310,7 @@ impl Sock {
                         }
                         break;
                     }
-                    reader = Some(self.rlock.lock());
+                    reader = Some(self.rlock.lock()?);
                     continue;
                 }
             };
@@ -1373,7 +1373,7 @@ impl Sock {
 
     fn recv_dgram(&self, dst: &mut Sink, o: RecvOpts) -> Result<Received, i64> {
         let deadline = deadline(self.inner.lock().rcvtimeo);
-        let mut reader = Some(self.rlock.lock());
+        let mut reader = Some(self.rlock.lock()?);
         loop {
             let next = {
                 let mut i = self.inner.lock();
@@ -1403,7 +1403,7 @@ impl Sock {
                     // Not holding the other readers off while it sleeps.
                     drop(reader.take());
                     self.wait(seen, deadline)?;
-                    reader = Some(self.rlock.lock());
+                    reader = Some(self.rlock.lock()?);
                     continue;
                 }
             };

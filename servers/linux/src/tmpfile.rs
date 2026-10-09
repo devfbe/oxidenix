@@ -8,7 +8,6 @@
 use crate::files::{self, File, EBADF, EINVAL, O_ACCMODE, O_WRONLY};
 use crate::inotify;
 use crate::namespace::{check, ENOTDIR};
-use crate::sync::Mutex;
 use crate::syscall;
 use crate::tmpfs::{Inode, EISDIR};
 use crate::usercopy;
@@ -25,9 +24,9 @@ pub struct TmpOpen {
     pub inode: Arc<Inode>,
     /// The path it was opened by (for *at calls and fchdir).
     pub path: String,
-    offset: Mutex<u64>,
+    offset: crate::sync::SleepMutex<u64>,
     /// A directory's entries, taken when it is read from the start.
-    snapshot: Mutex<Option<Vec<(String, u64, u8)>>>,
+    snapshot: crate::sync::SleepMutex<Option<Vec<(String, u64, u8)>>>,
     /// Holds write access (opened for writing).
     write: bool,
 }
@@ -71,7 +70,7 @@ pub fn open(inode: Arc<Inode>, flags: u32, path: String) -> Result<i64, i64> {
         inode.get_write()?;
     }
     inode.opens.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
-    let open = Arc::new(TmpOpen { inode, path, offset: Mutex::new(0), snapshot: Mutex::new(None), write });
+    let open = Arc::new(TmpOpen { inode, path, offset: crate::sync::SleepMutex::new(0), snapshot: crate::sync::SleepMutex::new(None), write });
     if write && flags & O_TRUNC != 0 {
         check(syscall(SYS_MO_TRUNCATE, [open.inode.object()?, 0, 0, 0, 0, 0]))?;
         open.inode.modified();
@@ -197,7 +196,7 @@ impl TmpOpen {
     /// end; the description's offset stays.
     fn write_positional(&self, vecs: &[(u64, u64)], offset: u64, append: bool) -> Result<i64, i64> {
         let n = if append {
-            let _append = self.inode.append.lock();
+            let _append = self.inode.append.lock()?;
             self.write(vecs, self.inode.size())?
         } else {
             self.write(vecs, offset)?
@@ -208,7 +207,7 @@ impl TmpOpen {
     /// read/readv: at the description's offset, which moves by what was
     /// read (the offset's lock serializes the description's reads).
     fn read_at_offset(&self, vecs: &[(u64, u64)]) -> Result<i64, i64> {
-        let mut off = self.offset.lock();
+        let mut off = self.offset.lock()?;
         let n = self.read(vecs, *off)?;
         *off += n;
         Ok(n as i64)
@@ -218,9 +217,9 @@ impl TmpOpen {
     /// inode's append lock makes finding the end and writing there one step
     /// for every appender).
     fn write_at_offset(&self, vecs: &[(u64, u64)], append: bool) -> Result<i64, i64> {
-        let mut off = self.offset.lock();
+        let mut off = self.offset.lock()?;
         let n = if append {
-            let _append = self.inode.append.lock();
+            let _append = self.inode.append.lock()?;
             *off = self.inode.size();
             self.write(vecs, *off)?
         } else {
@@ -231,7 +230,7 @@ impl TmpOpen {
     }
 
     fn lseek(&self, offset: i64, whence: u64) -> Result<i64, i64> {
-        let mut off = self.offset.lock();
+        let mut off = self.offset.lock()?;
         let base = match whence {
             0 => 0,
             1 => *off as i64,
@@ -249,8 +248,8 @@ impl TmpOpen {
         if !self.inode.is_dir() {
             return Err(ENOTDIR);
         }
-        let mut off = self.offset.lock();
-        let mut snapshot = self.snapshot.lock();
+        let mut off = self.offset.lock()?;
+        let mut snapshot = self.snapshot.lock()?;
         if *off == 0 || snapshot.is_none() {
             *snapshot = Some(self.inode.list()?);
         }
@@ -285,15 +284,16 @@ impl TmpOpen {
 
     /// Reads into the server's memory (sendfile), at the offset.
     pub fn read_server(&self, buf: &mut [u8]) -> Result<usize, i64> {
-        let mut off = self.offset.lock();
+        let mut off = self.offset.lock()?;
         let n = check(syscall(SYS_MO_READ, [self.object()?, *off, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0]))? as usize;
         *off += n as u64;
         self.inode.accessed();
         Ok(n)
     }
 
-    /// The description's file position (for the calls that take one).
-    pub fn position(&self) -> crate::sync::MutexGuard<'_, u64> {
+    /// The description's file position (for the calls that take one; EINTR if the thread
+    /// dies while it waits for it).
+    pub fn position(&self) -> Result<crate::sync::SleepMutexGuard<'_, u64>, i64> {
         self.offset.lock()
     }
 
@@ -317,8 +317,8 @@ impl TmpOpen {
 
     /// Writes from the server's memory (sendfile), at the offset or the end.
     pub fn write_server(&self, data: &[u8], append: bool) -> Result<usize, i64> {
-        let mut off = self.offset.lock();
-        let _append = if append { Some(self.inode.append.lock()) } else { None };
+        let mut off = self.offset.lock()?;
+        let _append = if append { Some(self.inode.append.lock()?) } else { None };
         if append {
             *off = self.inode.size();
         }
