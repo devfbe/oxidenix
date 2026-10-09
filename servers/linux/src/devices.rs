@@ -12,7 +12,6 @@
 
 use crate::files::{self, File, EINVAL, O_ACCMODE, O_CLOEXEC, O_NONBLOCK};
 use crate::namespace::Origin;
-use crate::syscall;
 use crate::unix::Sink;
 use crate::usercopy;
 use alloc::sync::Arc;
@@ -103,11 +102,6 @@ pub fn call(nr: u64, d: &DevOpen, flags: u32, a1: u64, a2: u64) -> Result<i64, i
     }
 }
 
-/// Whether a signal waits for the calling thread.
-fn signal_pending() -> bool {
-    syscall(SYS_SIGNAL_STATE, [0; 6]) > 0
-}
-
 /// read(2): nothing from null; zeros from zero, the whole count, unless a signal comes
 /// (then what was filled; checked every 64 KiB, as Linux's read_iter_zero checks after
 /// every page).
@@ -129,7 +123,7 @@ pub fn read(d: &DevOpen, mut sink: Sink) -> Result<i64, i64> {
             Err(e) if done == 0 => return Err(e),
             Err(_) => break,
         }
-        if done % (64 * 1024) == 0 && sink.room() > 0 && signal_pending() {
+        if done % (64 * 1024) == 0 && sink.room() > 0 && files::signal_pending() {
             break;
         }
     }

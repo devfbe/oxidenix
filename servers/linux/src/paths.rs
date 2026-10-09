@@ -156,6 +156,12 @@ fn base_dir(dirfd: u64, path: &str) -> Result<String, i64> {
     if path.starts_with('/') || dirfd as i32 == AT_FDCWD {
         return Ok(records::current().state.lock().cwd.clone());
     }
+    // A descriptor that keeps its origin: its path, without another reference to
+    // the node; ENOTDIR unless it is a directory (an O_PATH|O_NOFOLLOW symlink's
+    // path must not be resolved through the link).
+    if let Some(o) = files::origin_of(dirfd) {
+        return if o.kind == vfs::S_IFDIR { Ok(o.path) } else { Err(ENOTDIR) };
+    }
     Ok(fd_node(dirfd)?.1)
 }
 
@@ -174,8 +180,8 @@ fn fd_node_of(fd: u64) -> Result<(Node, String, bool), i64> {
         return Ok((Node::Data(f.inode.clone()), f.path.clone(), false));
     }
     // Terminals, null and zero, O_PATH: the node they were opened by.
-    if let Some(found) = files::origin_of(fd) {
-        return found;
+    if let Some(o) = files::origin_of(fd) {
+        return Ok((o.node()?, o.path, o.o_path));
     }
     if files::is_server_file(fd) {
         return Err(ENOTDIR);
@@ -267,7 +273,7 @@ fn openat(dirfd: u64, addr: u64, flags: u32, mode: u32) -> Result<i64, i64> {
             return Err(ENOTDIR);
         }
         let path = join(&r.path);
-        return crate::pathfile::open(flags, Origin { node: r.node, path });
+        return crate::pathfile::open(flags, Origin::new(r.node, path, r.mode));
     }
     // A name created by someone else between our lookup and our create is
     // opened instead, once: a name that exists but does not resolve (a
@@ -319,7 +325,7 @@ fn openat(dirfd: u64, addr: u64, flags: u32, mode: u32) -> Result<i64, i64> {
             _ => None,
         };
         if !kernel_node || kind.is_none() {
-            let origin = Origin { node: resolved.node, path: abs };
+            let origin = Origin::new(resolved.node, abs, vfs::S_IFCHR);
             if let Some(kind) = kind {
                 return devices::open(kind, flags, origin);
             }
@@ -551,8 +557,22 @@ fn symlinkat(target: u64, dirfd: u64, addr: u64) -> Result<i64, i64> {
 }
 
 fn readlinkat(dirfd: u64, addr: u64, buf: u64, size: u64) -> Result<i64, i64> {
-    let r = at(dirfd, addr, false)?;
-    let target = r.node.readlink()?;
+    // An empty path: the symlink `dirfd` names itself (an O_PATH|O_NOFOLLOW
+    // descriptor's), EINVAL for another descriptor, ENOENT without one (Linux's).
+    let target = if path_is_empty(addr) {
+        if dirfd as i32 == AT_FDCWD {
+            return Err(ENOENT);
+        }
+        match files::origin_of(dirfd) {
+            Some(o) if o.kind == vfs::S_IFLNK => o.origin().node.readlink()?,
+            _ => {
+                files::stat_of(dirfd)?;
+                return Err(EINVAL);
+            }
+        }
+    } else {
+        at(dirfd, addr, false)?.node.readlink()?
+    };
     let n = target.len().min(size as usize);
     usercopy::to_program(buf, &target.as_bytes()[..n])?;
     Ok(n as i64)

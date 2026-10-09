@@ -233,7 +233,7 @@ impl PtyMaster {
                 let name = self.index.to_string();
                 let node = devpts().lookup(&name).map_err(|_| EIO)?;
                 let path = alloc::format!("/dev/pts/{}", name);
-                open_slave(self.index, flags, Origin { node: crate::namespace::Node::Tmp(node), path })
+                open_slave(self.index, flags, Origin::new(crate::namespace::Node::Tmp(node), path, vfs::S_IFCHR))
             }
             TIOCSIG => {
                 // Only the terminal's own signals (Linux's `pty_signal`).

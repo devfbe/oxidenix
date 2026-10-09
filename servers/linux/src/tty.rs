@@ -545,8 +545,8 @@ impl Tty {
         }
     }
 
-    /// Writes to the console device (no lock held; a signal while it waits for its turn
-    /// loses the bytes: for the flow control characters of TCIOFF and TCION).
+    /// Writes to the console device, no lock held (the flow control characters of TCIOFF
+    /// and TCION; a dying thread's or a lost device's bytes go).
     fn console_write(&self, bytes: &[u8]) {
         if !bytes.is_empty() {
             let _ = crate::console::device_write(bytes);
@@ -641,6 +641,11 @@ impl Tty {
         let _turn = self.turn(TURN_MASTER_WRITE, nonblock)?;
         let mut written = 0usize;
         while src.left() > 0 {
+            // A signal ends the write between chunks (Linux's n_tty_write checks
+            // signal_pending each pass): what went, or EINTR (restarted) if nothing.
+            if files::signal_pending() {
+                return if written > 0 { Ok(written as i64) } else { Err(EINTR) };
+            }
             let chunk = match src.take(WRITE_CHUNK) {
                 Ok(c) => c,
                 Err(e) => return if written > 0 { Ok(written as i64) } else { Err(e) },
@@ -781,6 +786,12 @@ impl Tty {
         let _turn = self.turn(TURN_WRITE, nonblock)?;
         let mut written = 0usize;
         while src.left() > 0 {
+            // A signal ends the write between chunks (Linux's n_tty_write checks
+            // signal_pending each pass, before processing): what went, or EINTR
+            // (restarted) if nothing. Processed output always goes out.
+            if files::signal_pending() {
+                return if written > 0 { Ok(written as i64) } else { Err(EINTR) };
+            }
             let chunk = match src.take(WRITE_CHUNK) {
                 Ok(c) => c,
                 Err(e) => return if written > 0 { Ok(written as i64) } else { Err(e) },
@@ -806,7 +817,10 @@ impl Tty {
                             }
                             None => {
                                 drop(inner);
-                                if let Err(e) = crate::console::device_write(&out) {
+                                if let Err((went, e)) = crate::console::device_write(&out) {
+                                    // Part of this chunk's output went out: the chunk
+                                    // counts (the rest is lost with the device).
+                                    let written = if went > 0 { written + chunk.len() } else { written };
                                     return if written > 0 { Ok(written as i64) } else { Err(e) };
                                 }
                             }

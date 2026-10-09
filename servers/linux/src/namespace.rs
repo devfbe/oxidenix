@@ -188,11 +188,27 @@ impl Node {
 pub struct Origin {
     pub node: Node,
     pub path: String,
+    /// The node's file type (`S_IFMT` bits) when it was opened (it never changes).
+    pub kind: u32,
 }
 
 impl Origin {
+    pub fn new(node: Node, path: String, mode: u32) -> Origin {
+        Origin { node, path, kind: mode & vfs::S_IFMT }
+    }
+
     pub fn stat(&self) -> Result<[u8; 144], i64> {
         self.node.stat()
+    }
+}
+
+impl Drop for Origin {
+    /// A /data inode is let go of as an open file's is (`datafs::let_go`): unlinked, it
+    /// goes with its blocks at the end of the call that closed the last descriptor.
+    fn drop(&mut self) {
+        if let Node::Data(d) = &self.node {
+            datafs::let_go(d);
+        }
     }
 }
 

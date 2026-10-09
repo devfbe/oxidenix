@@ -61,16 +61,18 @@ pub fn open(flags: u32, origin: Origin) -> Result<i64, i64> {
 }
 
 /// Writes to the device (a call per `CONSOLE_WRITE_MAX` bytes, each whole). A signal does
-/// not interrupt it (the output was processed for it already; the server's own write
-/// turn, taken before, keeps a write(2) whole and is where signals interrupt): Ok, or
-/// EINTR for a dying thread, or EIO when the instance lost the device (its terminal
-/// hangs up at the event).
-pub fn device_write(bytes: &[u8]) -> Result<(), i64> {
+/// not interrupt it (the output was processed for it already; the writer checks for
+/// signals between its chunks, before processing): Ok, or the bytes that went out before
+/// an error: EINTR for a dying thread, EIO when the instance lost the device (its
+/// terminal hangs up at the event).
+pub fn device_write(bytes: &[u8]) -> Result<(), (usize, i64)> {
+    let mut went = 0;
     for piece in bytes.chunks(CONSOLE_WRITE_MAX as usize) {
         let r = syscall(SYS_CONSOLE_WRITE, [piece.as_ptr() as u64, piece.len() as u64, 0, 0, 0, 0]);
         if r < 0 {
-            return Err(-r);
+            return Err((went, -r));
         }
+        went += piece.len();
     }
     Ok(())
 }
@@ -116,7 +118,7 @@ pub fn setup_stdio() {
     // The kernel's /dev/console node (it is always there).
     let Ok(node) = crate::namespace::resolve("/", "/dev/console", true).map(|r| r.node) else { return };
     let Some(t) = tty() else { return };
-    let origin = Origin { node, path: alloc::string::String::from("/dev/console") };
+    let origin = Origin::new(node, alloc::string::String::from("/dev/console"), vfs::S_IFCHR);
     let fd = match tty::open(&t, O_RDWR, origin, false) {
         Ok(fd) => fd as u64,
         Err(_) => return,

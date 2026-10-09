@@ -110,6 +110,8 @@ pub fn handle(s: &State) -> Option<i64> {
         | SYS_GETSOCKNAME | SYS_GETPEERNAME | SYS_SETSOCKOPT | SYS_GETSOCKOPT | SYS_ACCEPT4 | SYS_RECVMMSG | SYS_SENDMMSG => {
             let (sock, flags) = match files::lookup(a0)? {
                 (File::Socket(sock), flags) => (sock, flags),
+                // An O_PATH descriptor is no file (Linux's fdget fails).
+                (File::Path(_), _) => return Some(-files::EBADF),
                 // Another of the server's files: not a socket.
                 _ => return Some(-crate::unix::ENOTSOCK),
             };

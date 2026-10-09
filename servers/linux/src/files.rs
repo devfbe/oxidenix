@@ -77,6 +77,13 @@ pub enum Mapping {
 static FILES: Mutex<BTreeMap<u64, File>> = Mutex::new(BTreeMap::new());
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Whether a signal (or a stop) waits for the calling thread (Linux's signal_pending):
+/// a long call that does not wait returns what it did so far, or EINTR (restarted as
+/// Linux's ERESTARTSYS) if nothing yet.
+pub fn signal_pending() -> bool {
+    syscall(SYS_SIGNAL_STATE, [0; 6]) as u64 & SIGNAL_PENDING != 0
+}
+
 pub fn new_id() -> u64 {
     NEXT_ID.fetch_add(1, Ordering::Relaxed)
 }
@@ -147,19 +154,46 @@ pub fn data_of(fd: u64) -> Option<Arc<DataOpen>> {
     }
 }
 
-/// The node a descriptor of the server's that keeps its origin was opened by (a
-/// terminal, a pty's master, null or zero, an O_PATH descriptor), its path, and whether
-/// it is an O_PATH descriptor; None for other descriptors.
-pub fn origin_of(fd: u64) -> Option<Result<(crate::namespace::Node, alloc::string::String, bool), i64>> {
+/// What a descriptor of the server's that keeps its origin (a terminal, a pty's master,
+/// null or zero, an O_PATH descriptor) was opened by; None for other descriptors.
+pub struct OriginOf {
+    pub path: alloc::string::String,
+    /// The node's file type (`S_IFMT` bits).
+    pub kind: u32,
+    /// An O_PATH descriptor.
+    pub o_path: bool,
+    file: File,
+}
+
+impl OriginOf {
+    /// The node itself (another reference to it).
+    pub fn node(&self) -> Result<crate::namespace::Node, i64> {
+        self.origin().node.duplicate()
+    }
+
+    pub fn origin(&self) -> &crate::namespace::Origin {
+        match &self.file {
+            File::Tty(t) => &t.origin,
+            File::PtyMaster(m) => &m.origin,
+            File::Dev(d) => &d.origin,
+            File::Path(p) => &p.origin,
+            _ => unreachable!("only files with an origin"),
+        }
+    }
+}
+
+pub fn origin_of(fd: u64) -> Option<OriginOf> {
     let (file, _) = lookup(fd)?;
-    let (origin, path) = match &file {
-        File::Tty(t) => (&t.origin, false),
-        File::PtyMaster(m) => (&m.origin, false),
-        File::Dev(d) => (&d.origin, false),
-        File::Path(p) => (&p.origin, true),
+    let o_path = match &file {
+        File::Tty(_) | File::PtyMaster(_) | File::Dev(_) => false,
+        File::Path(_) => true,
         _ => return None,
     };
-    Some(origin.node.duplicate().map(|node| (node, origin.path.clone(), path)))
+    let mut found = OriginOf { path: alloc::string::String::new(), kind: 0, o_path, file };
+    let (path, kind) = (found.origin().path.clone(), found.origin().kind);
+    found.path = path;
+    found.kind = kind;
+    Some(found)
 }
 
 /// The status of descriptor `fd`, one of the server's files or of the
