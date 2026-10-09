@@ -5,6 +5,7 @@ pub const ENOENT: i64 = 2;
 pub const ESRCH: i64 = 3;
 pub const EINTR: i64 = 4;
 pub const EIO: i64 = 5;
+pub const ENXIO: i64 = 6;
 pub const E2BIG: i64 = 7;
 pub const ENOEXEC: i64 = 8;
 pub const EBADF: i64 = 9;

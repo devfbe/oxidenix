@@ -22,9 +22,29 @@ pub const S_IFCHR: u32 = 0o020000;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Device {
+    /// The kernel's own output to the console, for the native servers' standard
+    /// output and error (not in /dev: Linux programs' terminals are the Linux
+    /// server's, ADR 0007).
     Console,
     Null,
     Zero,
+    /// A device the Linux server implements (its terminals: /dev/tty,
+    /// /dev/console, /dev/ptmx), named here by its number (major, minor); the
+    /// kernel cannot open it (ENXIO).
+    Server(u32, u32),
+}
+
+impl Device {
+    /// Its device number, encoded as Linux's `st_rdev` (`new_encode_dev`).
+    pub fn rdev(&self) -> u64 {
+        let (major, minor) = match *self {
+            Device::Console => (5, 1),
+            Device::Null => (1, 3),
+            Device::Zero => (1, 5),
+            Device::Server(major, minor) => (major, minor),
+        };
+        (minor as u64 & 0xff) | ((major as u64 & 0xfff) << 8) | ((minor as u64 & !0xff) << 12)
+    }
 }
 
 /// Inodes, symlink targets and pipe buffers live on the kernel heap; this
@@ -78,6 +98,8 @@ pub struct DiskRef {
 
 pub struct InodeStat {
     pub mode: u32,
+    /// A device's number (`st_rdev`), else 0.
+    pub rdev: u64,
     pub size: u64,
     pub nlink: u64,
     pub atime: u64,
@@ -256,10 +278,11 @@ impl Inode {
             // One request instead of three, and errors (e.g. a dead server)
             // are reported instead of being mistaken for defaults.
             let s = d.fs.stat(d.ino)?;
-            return Ok(InodeStat { mode: s.mode, size: s.size, nlink: s.links, atime: s.atime, mtime: s.mtime, ctime: s.ctime });
+            return Ok(InodeStat { mode: s.mode, rdev: 0, size: s.size, nlink: s.links, atime: s.atime, mtime: s.mtime, ctime: s.ctime });
         }
         let (nlink, atime, mtime, ctime) = self.stat_extra();
-        Ok(InodeStat { mode: self.mode(), size: self.size(), nlink, atime, mtime, ctime })
+        let rdev = self.device().map_or(0, |d| d.rdev());
+        Ok(InodeStat { mode: self.mode(), rdev, size: self.size(), nlink, atime, mtime, ctime })
     }
 
     /// (link count, access time, modification time, change time)
@@ -514,10 +537,20 @@ pub fn init(ramdisk: Option<&'static [u8]>) {
         }
     }
     let dev = mkdir_p(root, "dev");
-    for (name, d) in [("console", Device::Console), ("tty", Device::Console), ("null", Device::Null), ("zero", Device::Zero)] {
-        let inode = Inode::new(Node::Device(d), 0o666).expect("file quota exhausted at boot");
+    // The terminals are the Linux server's, named by their numbers (ADR 0007);
+    // /dev/pts is where it mounts its devpts.
+    let nodes = [
+        ("console", Device::Server(5, 1), 0o600),
+        ("tty", Device::Server(5, 0), 0o666),
+        ("ptmx", Device::Server(5, 2), 0o666),
+        ("null", Device::Null, 0o666),
+        ("zero", Device::Zero, 0o666),
+    ];
+    for (name, d, perm) in nodes {
+        let inode = Inode::new(Node::Device(d), perm).expect("file quota exhausted at boot");
         let _ = dev.insert(name, inode);
     }
+    mkdir_p(&dev, "pts");
     mkdir_p(root, "tmp");
     write_proc_mounts("");
 }

@@ -13,8 +13,10 @@
 extern crate alloc;
 
 mod chantest;
+mod console;
 mod datafile;
 mod datafs;
+mod devices;
 mod disktest;
 mod eventfd;
 mod files;
@@ -32,6 +34,7 @@ mod netdev;
 mod netlink;
 mod paths;
 mod pipe;
+mod pty;
 mod records;
 mod ringclient;
 mod sched;
@@ -41,6 +44,7 @@ mod sync;
 mod time;
 mod tmpfile;
 mod tmpfs;
+mod tty;
 mod unix;
 mod usercopy;
 
@@ -92,6 +96,10 @@ pub extern "C" fn _start(state: *mut State, role: u64) -> ! {
     }
     if role == ROLE_NET {
         netclient::thread();
+    }
+    if role == ROLE_INIT {
+        // The tree's first thread: its standard descriptors on the console.
+        console::setup_stdio();
     }
     loop {
         if call0(SYS_RESTRICTED_ENTER) as u64 != REASON_SYSCALL {
@@ -224,6 +232,20 @@ fn pager() -> ! {
             }
             EVENT_MKWRITE => {
                 datafs::mkwrite(event.a, event.b);
+                continue;
+            }
+            EVENT_CONSOLE => {
+                // Typed on the keyboard: through the console's line
+                // discipline (echo, signals).
+                console::input();
+                continue;
+            }
+            EVENT_CONSOLE_LOST => {
+                console::lost();
+                continue;
+            }
+            EVENT_SESSION_END => {
+                tty::session_ended(event.a);
                 continue;
             }
             EVENT_SYNC => {

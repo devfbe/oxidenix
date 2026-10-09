@@ -71,6 +71,12 @@ fn u64_at(b: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(b[at..at + 8].try_into().expect("8 bytes"))
 }
 
+/// A device number as Linux encodes it in `st_rdev` (`new_encode_dev`).
+pub fn dev_make(major: u32, minor: u32) -> u64 {
+    let (major, minor) = (major as u64, minor as u64);
+    (minor & 0xff) | ((major & 0xfff) << 8) | ((minor & !0xff) << 12) | ((major & !0xfff) << 32)
+}
+
 /// Linux's encoding of a device number (`new_encode_dev`'s inverse):
 /// (major, minor).
 pub fn dev_split(dev: u64) -> (u32, u32) {

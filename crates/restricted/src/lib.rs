@@ -247,6 +247,15 @@ pub const EVENT_MKWRITE: u64 = 9;
 /// reference is gone): sockets may be left that only messages in flight
 /// keep, for the server's collector to find. One is queued at a time.
 pub const EVENT_INFLIGHT: u64 = 10;
+/// Input came to the console the instance holds: the service thread takes
+/// it (`console_read` until it returns 0). Queued once until taken.
+pub const EVENT_CONSOLE: u64 = 20;
+/// The instance no longer holds the console (the kernel's monitor took it
+/// back): its terminal on it hangs up.
+pub const EVENT_CONSOLE_LOST: u64 = 21;
+/// A session leader's process of the instance ended: `a` is the session.
+/// Its controlling terminal is dissociated (Linux's `disassociate_ctty`).
+pub const EVENT_SESSION_END: u64 = 22;
 
 /// A server thread starts with its role in `rsi` (and its `State` in
 /// `rdi`): it serves a program's thread, or it is the instance's pager, or
@@ -259,7 +268,12 @@ pub const EVENT_INFLIGHT: u64 = 10;
 pub const ROLE_PROGRAM: u64 = 0;
 pub const ROLE_PAGER: u64 = 1;
 pub const ROLE_WORKER: u64 = 2;
-pub const ROLE_NET: u64 = 3;
+/// The first thread of the first program of a new instance (a tree the
+/// kernel started): its descriptor table is empty, and the server gives it
+/// standard input, output and error on the console (as Linux's init gets
+/// /dev/console) before the program runs; then it serves the program.
+pub const ROLE_INIT: u64 = 3;
+pub const ROLE_NET: u64 = 4;
 
 /// `(addr)`: a 4-page paged object mapped shared and readable at `addr`;
 /// page n reads "paged n" (supplied by the pager thread when touched).
@@ -686,6 +700,57 @@ pub const SYS_SIGNAL_THREAD: u64 = 1102;
 /// and group id, four u64s at `out` (the credentials a socket passes,
 /// SCM_CREDENTIALS and SO_PEERCRED).
 pub const SYS_THREAD_IDS: u64 = 1103;
+
+// Terminals (phase R6d, docs/design/linux-server.md "The terminal", ADR
+// 0007): the console is a raw device the kernel grants to one instance at
+// a time (the tree it started, until that tree's first process ends); the
+// line discipline and job control's terminal side are the server's. Process
+// groups and sessions are still the kernel's until the process model is the
+// server's (R8): `proc_ids`, `signal_group`, `signal_state` and
+// `EVENT_SESSION_END` go then.
+
+/// `console_read(buf, cap) -> n`: takes up to `cap` bytes of the console's
+/// input (typed on the keyboard, or the console's answers to queries written
+/// to it): 0 when there is none. EIO unless the instance holds the console.
+pub const SYS_CONSOLE_READ: u64 = 1110;
+/// `console_write(buf, len, flags) -> n`: writes `len` bytes to the console as
+/// they are (a VT100: a line feed keeps the column, `ONLCR` is the
+/// terminal's), whole: another write's bytes do not come between them (the
+/// caller waits its turn, first come first served; EINTR if a signal for the
+/// program comes first, with nothing written). With `CONSOLE_ECHO` (an echo of the
+/// line discipline, at most 512 bytes) it never waits: the bytes are queued
+/// and go out between the pieces of a write in progress or at once; what does
+/// not fit in the queue (4 KiB) is dropped, `n` says how much went. EIO
+/// unless the instance holds the console.
+pub const SYS_CONSOLE_WRITE: u64 = 1111;
+pub const CONSOLE_ECHO: u64 = 1;
+/// `console_info(out)`: the console's size, two u64s at `out` (columns,
+/// rows). EIO unless the instance holds the console.
+pub const SYS_CONSOLE_INFO: u64 = 1112;
+/// `proc_ids(id, flags, out)`: four u64s at `out` about process `id` (0:
+/// the caller's), or with `IDS_PGRP` about process group `id` (one of its
+/// processes): the process id, its process group, its session, and
+/// `IDS_ORPHANED` if asked with `IDS_ORPHANED` and the group is orphaned (no
+/// member has a parent in another group of the same session; the kernel,
+/// parent of the trees it starts, counts as init: not a parent). ESRCH for
+/// none in the caller's instance.
+pub const SYS_PROC_IDS: u64 = 1113;
+pub const IDS_PGRP: u64 = 1;
+pub const IDS_ORPHANED: u64 = 2;
+/// `signal_group(scope, id, sig)`: sends `sig` from the terminal (no
+/// permission checks) to process `id` (`SIGNAL_PROCESS`), every process of
+/// group `id` (`SIGNAL_PGRP`), or the leader of session `id` if it still leads
+/// it (`SIGNAL_LEADER`), of the caller's instance. ESRCH for none.
+pub const SYS_SIGNAL_GROUP: u64 = 1114;
+pub const SIGNAL_PROCESS: u64 = 0;
+pub const SIGNAL_PGRP: u64 = 1;
+pub const SIGNAL_LEADER: u64 = 2;
+/// `signal_state(sig) -> bits`: `SIGNAL_IGNORED` if the calling process
+/// ignores `sig` (SIG_IGN), `SIGNAL_BLOCKED` if the calling thread blocks it
+/// (SIGTTIN and SIGTTOU of background reads and writes).
+pub const SYS_SIGNAL_STATE: u64 = 1115;
+pub const SIGNAL_IGNORED: u64 = 1;
+pub const SIGNAL_BLOCKED: u64 = 2;
 
 /// `(scenario)`: the server runs a channel scenario against the test
 /// service (servers/ringtest, `ring::selftest`): 1 rings and doorbells, 2

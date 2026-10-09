@@ -232,9 +232,12 @@ impl OpenFile {
         Self::with_access(Kind::Inode(inode), flags, Some(path), write_access)
     }
 
+    /// The kernel's console output, the native servers' standard output and
+    /// error (write only; not in /dev).
     pub fn console() -> Arc<OpenFile> {
-        let inode = super::resolve("/", "/dev/console", true).expect("/dev/console missing");
-        OpenFile::new(Kind::Inode(inode), O_RDWR, Some("/dev/console".into()))
+        static CONSOLE: spin::Once<Arc<Inode>> = spin::Once::new();
+        let inode = CONSOLE.call_once(|| Inode::new(super::Node::Device(Device::Console), 0o600).expect("file quota exhausted"));
+        OpenFile::new(Kind::Inode(inode.clone()), O_WRONLY, Some("/dev/console".into()))
     }
 
     pub fn pipe() -> Result<(Arc<OpenFile>, Arc<OpenFile>), i64> {
@@ -260,10 +263,6 @@ impl OpenFile {
             Kind::Inode(i) => Some(i),
             _ => None,
         }
-    }
-
-    pub fn is_console(&self) -> bool {
-        self.inode().is_some_and(|i| i.device() == Some(Device::Console))
     }
 
     pub fn readable(&self) -> bool {
@@ -352,8 +351,9 @@ impl OpenFile {
 
     fn read_inode(&self, inode: &Inode, buf: &mut [u8]) -> Result<usize, i64> {
         match inode.device() {
-            // The TTY may sleep, so no inode lock may be held here.
-            Some(Device::Console) => crate::drivers::tty::read(buf, self.nonblocking()),
+            // Output only (and never opened for reading).
+            Some(Device::Console) => Err(EBADF),
+            Some(Device::Server(..)) => Err(ENXIO),
             Some(Device::Null) => Ok(0),
             Some(Device::Zero) => {
                 buf.fill(0);
@@ -376,7 +376,11 @@ impl OpenFile {
 
     fn write_inode(&self, inode: &Inode, buf: &[u8], append: bool) -> Result<usize, i64> {
         match inode.device() {
-            Some(Device::Console) => Ok(crate::drivers::tty::write(buf)),
+            Some(Device::Console) => {
+                crate::drivers::console::write_text(buf);
+                Ok(buf.len())
+            }
+            Some(Device::Server(..)) => Err(ENXIO),
             Some(_) => Ok(buf.len()),
             None => {
                 let mut off = self.offset.lock();
@@ -539,9 +543,6 @@ impl OpenFile {
     /// Ready events among `events` (plus POLLERR/POLLHUP, which are always reported).
     pub fn poll(&self, events: i16) -> i16 {
         let ready = match &self.kind {
-            Kind::Inode(_) if self.is_console() => {
-                POLLOUT | if crate::drivers::tty::readable() { POLLIN } else { 0 }
-            }
             Kind::Inode(_) => POLLIN | POLLOUT,
             Kind::PipeRead(p) => {
                 let hup = p.writers.load(Ordering::Relaxed) == 0;
@@ -575,7 +576,6 @@ impl OpenFile {
     /// Where this file announces changes of its readiness.
     pub fn poll_source(&self) -> PollSource {
         match &self.kind {
-            Kind::Inode(_) if self.is_console() => PollSource::Chan(crate::drivers::tty::POLL_CHAN),
             // Regular files and devices are always ready.
             Kind::Inode(_) => PollSource::Always,
             Kind::PipeRead(p) => PollSource::Chan(p.read_chan()),
