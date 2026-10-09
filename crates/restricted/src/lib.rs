@@ -838,5 +838,6 @@ pub const TEST_PASS_THROUGH: u64 = 1517;
 /// (`EVENT_MKWRITE`) for the /data file with inode number `ino`, as a full
 /// disk would (`mo_backed` not ok), and answers later ones as usual: the
 /// store through a shared mapping that asked raises SIGBUS, a later one
-/// asks again. EINVAL for inode 0.
+/// asks again. Inode 0 disarms it; so does the inode leaving the server's
+/// cache (its number may go to another file). Test mode only.
 pub const TEST_MKWRITE_FAIL: u64 = 1519;

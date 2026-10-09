@@ -329,6 +329,9 @@ int main(int argc, char **argv) {
         }
         check("a store the pager cannot back raises SIGBUS", ready && bus);
         check("... and a later store asks again and goes through", ready && later);
+        /* (Never left armed for a later file, should the store not have
+         * asked.) */
+        syscall(TEST_MKWRITE_FAIL, 0L);
         if (mw != MAP_FAILED) munmap((void *)mw, PG);
         if (fd >= 0) close(fd);
         unlink(path);

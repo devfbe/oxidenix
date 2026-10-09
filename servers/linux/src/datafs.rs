@@ -1628,6 +1628,9 @@ fn evict(ino: u32) {
             return;
         }
         t.inodes.remove(&ino);
+        // An armed test failure is this inode's, not a later file's that
+        // gets its number.
+        let _ = FAIL_MKWRITE.compare_exchange(ino as u64, 0, Ordering::Relaxed, Ordering::Relaxed);
         if let Some((d, _, n)) = inode.link.lock().take() {
             if t.names.get(&(d, n.clone())) == Some(&ino) {
                 t.names.remove(&(d, n));
@@ -1659,9 +1662,10 @@ pub fn closing() {
 /// none).
 static FAIL_MKWRITE: AtomicU64 = AtomicU64::new(0);
 
-/// `TEST_MKWRITE_FAIL` (see `restricted::TEST_MKWRITE_FAIL`).
+/// `TEST_MKWRITE_FAIL` (see `restricted::TEST_MKWRITE_FAIL`): arms the
+/// failure for `ino`, or disarms it (0).
 pub fn fail_next_mkwrite(ino: u64) -> i64 {
-    if ino == 0 {
+    if ino > u32::MAX as u64 {
         return -EINVAL;
     }
     FAIL_MKWRITE.store(ino, Ordering::Relaxed);
