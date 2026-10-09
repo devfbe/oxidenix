@@ -1986,7 +1986,13 @@ impl<'a> Socket<'a> {
             // reason is TCP simultaneous open).
             (State::SynReceived, TcpControl::Rst) if self.listen_endpoint.port != 0 => {
                 tcp_trace!("received RST");
-                self.tuple = None;
+                // oxidenix: everything of the connection that was refused
+                // goes, as `listen` does (its receive state, the window it
+                // announced, what it received): the socket is a fresh
+                // listener again.
+                let endpoint = self.listen_endpoint;
+                self.reset();
+                self.listen_endpoint = endpoint;
                 self.set_state(State::Listen);
                 return None;
             }
@@ -10324,6 +10330,51 @@ mod test {
         let mut all = [0; 64];
         assert_eq!(s.recv_slice(&mut all), Ok(16));
         assert_eq!(&all[..16], &[b'q'; 16]);
+    }
+
+    /// A connection reset in SYN-RECEIVED leaves a fresh listener: nothing
+    /// of it stays (the window it announced, what it received), so its
+    /// buffers may go at once.
+    #[test]
+    fn test_oxidenix_syn_received_rst_leaves_a_fresh_listener() {
+        let mut s = socket_with_buffer_sizes(64, 64);
+        s.listen(LISTEN_END).unwrap();
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: REMOTE_SEQ,
+                ack_number: None,
+                ..SEND_TEMPL
+            }
+        );
+        recv!(
+            s,
+            [TcpRepr {
+                control: TcpControl::Syn,
+                seq_number: LOCAL_SEQ,
+                ack_number: Some(REMOTE_SEQ + 1),
+                max_seg_size: Some(BASE_MSS),
+                ..RECV_TEMPL
+            }]
+        );
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Rst,
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ),
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::Listen);
+        assert_eq!(s.listen_endpoint, LISTEN_END);
+        assert_eq!(s.remote_last_ack, None);
+        assert_eq!(s.remote_last_win, 0);
+        assert_eq!(s.announced_window(), 0);
+        assert!(s.assembler.is_empty());
+        assert_eq!(s.replace_rx_buffer(vec![]).ok().map(|b| b.len()), Some(64));
+        assert_eq!(s.replace_tx_buffer(vec![]).ok().map(|b| b.len()), Some(64));
     }
 
     #[test]
