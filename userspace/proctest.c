@@ -229,6 +229,19 @@ static void descriptors(void) {
     close(o);
     unlink("/tmp/proc-opath");
 
+    /* musl's fexecve runs /proc/self/fd/N. */
+    int prog = open("/bin/hello", O_RDONLY | O_CLOEXEC);
+    pid_t kid = fork();
+    if (kid == 0) {
+        char *argv[] = {"hello", NULL}, *envp[] = {NULL};
+        fexecve(prog, argv, envp);
+        _exit(1);
+    }
+    int status = 0;
+    waitpid(kid, &status, 0);
+    close(prog);
+    check("fexecve runs a program through /proc/self/fd", WIFEXITED(status) && WEXITSTATUS(status) == 42);
+
     pid_t other = getppid();
     snprintf(path, sizeof path, "/proc/%d/fd", other);
     check("another process's descriptors: EACCES", opendir(path) == NULL && errno == EACCES);
