@@ -40,9 +40,14 @@ An AI research project; see README.md.
   size-class allocator of the kernel's and the server's heaps, `cargo test --release -p ring`
   the I/O ring's invariants (with threads; release for realistic interleavings), `cargo test
   -p fsring` the file protocol's encodings and validation (Linux server <-> diskfs), `cargo
-  test -p netlink` rtnetlink's messages (the Linux server's netlink sockets), `cargo test -p
-  netproto` the interface records netd describes, `cargo test -p ldisc` the line discipline
-  of the Linux server's terminals.
+  test -p netlink` rtnetlink's messages (the Linux server's netlink sockets), `cargo test
+  --release -p netring` the socket protocol (Linux server <-> netd: encodings, validation, the
+  shared area's wake protocols with threads), `cargo test -p ldisc` the line discipline of the
+  Linux server's terminals, `cargo test -p csprng` the kernel's random generator (ChaCha20) and
+  the keyed hash (SipHash) against their test vectors,
+  `cargo test --manifest-path third_party/smoltcp/Cargo.toml --lib`
+  netd's smoltcp (vendored with patches, its own workspace; the patches are listed in its
+  `Cargo.toml` and marked `oxidenix:`).
 - QEMU must always run with a visible window; never use `-display none`.
 - The image boots via UEFI (OVMF from nixpkgs) by default; `OXIDENIX_FIRMWARE=bios` builds and
   boots a BIOS image instead. CI runs the self-tests with both.
@@ -72,14 +77,16 @@ An AI research project; see README.md.
   - The Linux server: `servers/linux/src/main.rs` (dispatch order mm → time → files → paths →
     sched → sockets → pass-through), `namespace.rs`/`paths.rs` (paths, mounts),
     `tmpfs.rs`/`tmpfile.rs` (root fs), `datafs.rs`/`datafile.rs`/`fsclient.rs` (`/data` and its
-    page cache over the I/O rings), `unix.rs`/`sockcalls.rs`/`scm.rs` (`AF_UNIX` sockets,
-    descriptor passing), `netdev.rs`/`netlink.rs` + `crates/netlink` (interfaces,
-    `NETLINK_ROUTE`), `inotify.rs`.
+    page cache over the I/O rings), `ringclient.rs` (a channel's slots and reaper),
+    `unix.rs`/`sockcalls.rs`/`scm.rs` (`AF_UNIX` sockets, descriptor passing),
+    `inet.rs`/`inetcalls.rs`/`netclient.rs` (internet sockets over the channel to netd, the net
+    thread), `netdev.rs`/`netlink.rs` + `crates/netlink` (interfaces, `NETLINK_ROUTE`),
+    `inotify.rs`.
   - Node.js: `userspace/node` (build, smoke tests `tests/*.test.mjs`, runner `run-node.sh`).
   - Memory: `kernel/src/memory/`, `kernel/src/process/address_space.rs`, page cache
     `kernel/src/fs/cache.rs`.
   - Other servers and their protocols: `servers/diskfs` + `crates/fsring` + `crates/ext2fs`,
-    `servers/netd` + `crates/netproto`, `servers/procfs` + `crates/procproto` + `crates/fsproto`
+    `servers/netd` + `crates/netring`, `servers/procfs` + `crates/procproto` + `crates/fsproto`
     (the kernel's `RemoteFs`); I/O rings
     `crates/ring`, `docs/design/io-rings.md`.
   - Tests: C programs in `userspace/*.c` (built by `userspace/build.sh`), run by the list in

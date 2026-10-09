@@ -60,16 +60,23 @@ struct Client {
     requests: Producer<'static, SLOTS>,
     completions: Consumer<'static, SLOTS>,
     tag: u64,
+    /// The shared area (if the channel has one).
+    shared: *mut u8,
 }
 
 impl Client {
     fn create() -> Result<Client, i64> {
+        Client::with_shared(0)
+    }
+
+    /// A channel with `shared` pages of shared area.
+    fn with_shared(shared: u64) -> Result<Client, i64> {
         let mut addr = 0u64;
-        let h = syscall(SYS_CHAN_CREATE, [SLOTS as u64, &mut addr as *mut u64 as u64, 0, 0, 0, 0]);
+        let h = syscall(SYS_CHAN_CREATE, [SLOTS as u64, &mut addr as *mut u64 as u64, shared, 0, 0, 0]);
         if h < 0 {
             return Err(h);
         }
-        let layout = Layout::new(SLOTS as u32).expect("a valid slot count");
+        let layout = Layout::with_shared(SLOTS as u32, shared as u32).expect("a valid layout");
         let base = addr as *const u8;
         // Mapped until the handle is closed (`drop`).
         let (sub, comp) = unsafe { (layout.ring::<SLOTS>(base, layout.submission), layout.ring::<SLOTS>(base, layout.completion)) };
@@ -79,7 +86,14 @@ impl Client {
             requests: Ring::new(sub).producer(),
             completions: Ring::new(comp).consumer(),
             tag: 0,
+            shared: (addr + layout.shared as u64) as *mut u8,
         })
+    }
+
+    /// The u32 at word `n` of the shared area's page `page` (mapped while
+    /// the test runs).
+    fn shared_word(&self, page: u64, n: u64) -> &'static AtomicU32 {
+        unsafe { &*(self.shared.add((page * PAGE + n * 4) as usize) as *const AtomicU32) }
     }
 
     fn connect(&self, name: &str) -> i64 {
@@ -106,8 +120,13 @@ impl Client {
     /// Sends a request and waits for its completion: its status, or EPIPE
     /// once the service is gone.
     fn call(&mut self, op: u16, grant: i64, buf_off: u64, len: u64, arg: u64) -> Result<i64, i64> {
+        self.request(op, grant, buf_off, len, [arg, 0, 0])
+    }
+
+    /// `call` with all three arguments.
+    fn request(&mut self, op: u16, grant: i64, buf_off: u64, len: u64, arg: [u64; 3]) -> Result<i64, i64> {
         self.tag += 1;
-        let d = Desc { op, tag: self.tag, grant: grant as u32, buf_off: buf_off as u32, len: len as u32, arg: [arg, 0, 0], ..Desc::default() };
+        let d = Desc { op, tag: self.tag, grant: grant as u32, buf_off: buf_off as u32, len: len as u32, arg, ..Desc::default() };
         if !self.requests.push(&d) {
             return Err(-ENOSPC);
         }
@@ -205,8 +224,38 @@ fn rings() -> Result<(), i64> {
     for slots in [0, 1, 3, 8192] {
         check!(10, syscall(SYS_CHAN_CREATE, [slots, &mut addr as *mut u64 as u64, 0, 0, 0, 0]) == -EINVAL);
     }
+    check!(50, syscall(SYS_CHAN_CREATE, [SLOTS as u64, &mut addr as *mut u64 as u64, 257, 0, 0, 0]) == -EINVAL);
     // The channel still works after all that.
     check!(11, c.status(ECHO, 0, 0, 0, 41) == 42);
+    // No shared area unless asked for; one is both ends' memory.
+    check!(51, c.status(SHARED, 0, 0, 0, 0) == 0);
+    // (The service serves one channel at a time.)
+    drop(c);
+    shared_area()
+}
+
+/// A channel's shared area: what the client wrote is the service's to read,
+/// what the service stores the client's, and a futex wake of the service's
+/// on its mapping wakes the client's wait on its own.
+fn shared_area() -> Result<(), i64> {
+    use core::sync::atomic::Ordering;
+    const VALUE: u64 = 0x5eed_0000;
+    let mut c = Client::with_shared(3).map_err(|_| 52)?;
+    for page in 0..3 {
+        c.shared_word(page, 0).store(VALUE as u32 + page as u32, Ordering::Release);
+    }
+    check!(53, c.connect(SERVICE) == 0);
+    check!(54, c.request(SHARED, 0, 0, 0, [3, VALUE, 0]) == Ok(0));
+    let word = c.shared_word(0, 1);
+    check!(55, word.load(Ordering::Acquire) == !(VALUE as u32));
+    word.store(0, Ordering::Release);
+    // The service stores 50 ms after its answer and wakes: one wait with a
+    // deadline of two seconds must end early (the wake met it), unless the
+    // store came even before the wait.
+    check!(56, c.request(SHARED, 0, 0, 0, [3, VALUE, 1]) == Ok(0));
+    let start = now();
+    syscall(SYS_SERVER_FUTEX_WAIT, [word as *const AtomicU32 as u64, 0, start + 2_000_000_000, 0, 0, 0]);
+    check!(57, word.load(Ordering::Acquire) == !(VALUE as u32) && now() - start < 1_000_000_000);
     Ok(())
 }
 

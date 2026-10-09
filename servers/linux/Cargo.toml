@@ -17,5 +17,5 @@ slab = { path = "../../crates/slab" }
 linked_list_allocator = { version = "0.10", default-features = false }
 fsring = { path = "../../crates/fsring" }
 netlink = { path = "../../crates/netlink" }
-netproto = { path = "../../crates/netproto" }
+netring = { path = "../../crates/netring" }
 ldisc = { path = "../../crates/ldisc" }

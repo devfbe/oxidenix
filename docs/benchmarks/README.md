@@ -122,6 +122,33 @@ kernel call less, also for `/data`). Now 22 locks per `stat`, 2 per `fstat`.
 Interleaved runs on the same host (A B C A B C): `1e89b0e` (before) 5188 and 5241 cycles,
 `b223846` (the count fixed) 4467 and 4734, `1337e20` 3384 and 3545.
 
+## R7b: internet sockets in the Linux server
+
+`2026-10-09-714815d-r7b-final.md` against `2026-10-09-802b396-quiet.md`. The host was not
+entirely idle (load about 1.4 on 16 threads: another guest), but the figures this change does
+not touch came out as before (`seq_read_cached` 8372 MB/s, `null_syscall` p50 2361 cycles).
+
+| benchmark | before | now | Linux |
+|---|---:|---:|---:|
+| `tcp_loopback` (MB/s) | 647.1 | 1240.6 | 5831.5 |
+| `tcp_network_echo` (MB/s) | 112.2 | 180.2 | - |
+
+Per 64 KiB written over loopback: 34 system calls instead of 112, no IPC call instead of 8 (and
+129 bytes copied by the kernel instead of 313217): the data moves between the program, the
+server's rings and netd without the kernel, and no request per `send` or `recv`. What is left
+of the gap to Linux is netd's per-segment work (smoltcp over an emulated Ethernet loopback with
+1500-byte frames) and the two copies in netd (rings ↔ smoltcp).
+
+After the review (`2026-10-09-40aac17-r7b-review.md`: netd's buffers follow use, starting at
+Linux's first sizes and growing to 1 MiB; the loopback pushes back instead of dropping frames)
+`tcp_loopback` stays at 1209 MB/s and `tcp_network_echo` at 158 MB/s on a busier host (load
+3.5: the disk figures of that run are low for the same reason). Starting connections at 4 KiB
+instead cost half the loopback throughput (565 MB/s: the growth took longer than the transfer)
+and, against QEMU's user network, a one-second stall (its TCP waits for a larger window).
+After the second review (`2026-10-09-29b0502-r7b-rereview.md`: real randomness, RFC 6528
+sequence numbers, half-open connections with small buffers, TIME-WAIT kept in smoltcp):
+`tcp_loopback` 1192 MB/s, `tcp_network_echo` 176 MB/s (host load about 3.7).
+
 ## Open: PCIDs and small cached reads
 
 Turning PCIDs on (commit `fae8292`, before restricted mode) made random 4 KiB reads from the

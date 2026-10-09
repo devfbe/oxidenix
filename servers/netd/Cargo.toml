@@ -12,7 +12,10 @@ bench = false
 [dependencies]
 oxrt = { path = "../../crates/oxrt" }
 virtio = { path = "../../crates/virtio" }
-netproto = { path = "../../crates/netproto" }
-smoltcp = { version = "0.14", default-features = false, features = [
+netring = { path = "../../crates/netring" }
+ring = { path = "../../crates/ring" }
+csprng = { path = "../../crates/csprng" }
+# smoltcp 0.14 with netd's patches (third_party/smoltcp/Cargo.toml lists them).
+smoltcp = { path = "../../third_party/smoltcp", default-features = false, features = [
     "alloc", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-udp", "socket-dhcpv4", "socket-raw", "auto-icmp-echo-reply",
 ] }

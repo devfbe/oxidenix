@@ -4,7 +4,7 @@
 use super::address_space::USER_END;
 use super::errno::*;
 use super::sys_file::{self, AT_FDCWD};
-use super::{epoll, signal, sys_mem, sys_net, sys_time, uaccess};
+use super::{epoll, signal, sys_mem, sys_time, uaccess};
 use crate::interrupts::gdt;
 use x86_64::registers::model_specific::{Efer, EferFlags, FsBase, LStar, SFMask, Star};
 use x86_64::registers::rflags::RFlags;
@@ -255,22 +255,8 @@ pub(super) fn dispatch_linux(f: &mut Frame) {
         186 => Ok(super::current_tid() as i64),
         218 => super::set_tid_address(a0).map(|tid| tid as i64),
         40 => sys_file::sendfile(a0, a1, a2, a3),
-        41 => sys_net::socket(a0, a1, a2),
-        42 => sys_net::connect(a0, a1, a2),
-        43 => sys_net::accept(a0, a1, a2, 0),
-        44 => sys_net::sendto(a0, a1, a2, a3, a4, a5),
-        45 => sys_net::recvfrom(a0, a1, a2, a3, a4, a5),
-        46 => sys_net::sendmsg(a0, a1, a2),
-        47 => sys_net::recvmsg(a0, a1, a2),
-        48 => sys_net::shutdown(a0, a1),
-        49 => sys_net::bind(a0, a1, a2),
-        50 => sys_net::listen(a0, a1),
-        51 => sys_net::getsockname(a0, a1, a2, false),
-        52 => sys_net::getsockname(a0, a1, a2, true),
-        53 => Err(EOPNOTSUPP), // socketpair: no AF_UNIX
-        54 => sys_net::setsockopt(a0),
-        55 => sys_net::getsockopt(a0, a1, a2, a3, a4),
-        288 => sys_net::accept(a0, a1, a2, a3),
+        // Sockets (41-55, 288, 299, 307) are the Linux server's (R7a, R7b):
+        // none reaches the kernel.
         99 => super::query::sysinfo(a0),
         125 => super::prctl::capget(a0, a1),
         128 => signal::sigtimedwait(a0, a1, a2, a3),
@@ -332,7 +318,6 @@ pub(super) fn dispatch_linux(f: &mut Frame) {
         1003 => super::irq::enable(a0),
         1004 => super::dma_map(a0),
         1005 => super::query::proc_query(a0, a1, a2, a3),
-        1006 => super::ipc::notify(a0),
         // The service's end of a channel (see `channel`, oxrt::sys).
         1068 => super::channel::attach(a0),
         1069 => super::channel::detach(a0),
@@ -378,7 +363,7 @@ pub(super) fn dispatch_linux(f: &mut Frame) {
         441 => epoll::epoll_pwait2(a0, a1, a2, a3, a4, a5),
         290 => sys_file::eventfd2(a0, a1),
         302 => prlimit(a1, a3),
-        318 => getrandom(a0, a1),
+        318 => getrandom(a0, a1, a2),
         nr => {
             crate::printkln!("[kernel] syscall {} not implemented", nr);
             Err(ENOSYS)
@@ -506,17 +491,33 @@ fn prlimit(resource: u64, old: u64) -> SysResult {
     Ok(0)
 }
 
-/// Not cryptographically secure: xorshift seeded from the timestamp counter.
-fn getrandom(buf: u64, len: u64) -> SysResult {
-    let mut x = unsafe { core::arch::x86_64::_rdtsc() } | 1;
-    let n = uaccess::read_to_user(buf, len, true, |out, _| {
-        for b in out.iter_mut() {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            *b = x as u8;
+/// getrandom(2): bytes of the kernel's generator (`crate::random`),
+/// which is seeded before any process runs, so it never blocks and
+/// GRND_NONBLOCK and GRND_RANDOM change nothing (as on Linux since 5.6);
+/// unknown flags, and GRND_INSECURE with GRND_RANDOM, are EINVAL. The
+/// bytes are made in pieces with the generator's lock released before
+/// each copy to the program (a fault may sleep); a fault after some bytes
+/// returns how many were copied.
+fn getrandom(buf: u64, len: u64, flags: u64) -> SysResult {
+    const GRND_NONBLOCK: u64 = 1;
+    const GRND_RANDOM: u64 = 2;
+    const GRND_INSECURE: u64 = 4;
+    if flags & !(GRND_NONBLOCK | GRND_RANDOM | GRND_INSECURE) != 0 || flags & (GRND_RANDOM | GRND_INSECURE) == GRND_RANDOM | GRND_INSECURE {
+        return Err(EINVAL);
+    }
+    // At most what one call to read(2) may return (Linux's limit).
+    let len = len.min(0x7fff_f000);
+    let mut done = 0u64;
+    let mut piece = [0u8; 256];
+    while done < len {
+        let n = (len - done).min(piece.len() as u64) as usize;
+        crate::random::fill(&mut piece[..n]);
+        if let Err(e) = uaccess::copy_to(buf + done, &piece[..n]) {
+            piece.fill(0);
+            return if done > 0 { Ok(done as i64) } else { Err(e) };
         }
-        Ok(out.len())
-    })?;
-    Ok(n as i64)
+        done += n as u64;
+    }
+    piece.fill(0);
+    Ok(done as i64)
 }

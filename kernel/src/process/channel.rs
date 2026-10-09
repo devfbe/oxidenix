@@ -2,7 +2,8 @@
 //! and the device servers (docs/design/io-rings.md, ADR 0005).
 //!
 //! A channel is one memory object holding a submission and a completion
-//! ring (layout: `ring::channel`). The client (a Linux server instance)
+//! ring and, if the client asks for one, a shared area for the protocol's
+//! own state (layout: `ring::channel`). The client (a Linux server instance)
 //! creates it, which maps it into the instance's region (`chan_create`),
 //! and offers it to a service (`chan_connect`): the kernel sends the
 //! service a control request (`ipc::call_control`, an `Offer`), the service
@@ -268,9 +269,11 @@ impl DmaDomain {
 }
 
 impl Channel {
-    /// A new channel of `slots` slots per ring.
-    pub fn new(slots: u64) -> Result<Arc<Channel>, i64> {
-        let layout = u32::try_from(slots).ok().and_then(Layout::new).ok_or(EINVAL)?;
+    /// A new channel of `slots` slots per ring and `shared` pages of
+    /// shared area (see `ring::channel`).
+    pub fn new(slots: u64, shared: u64) -> Result<Arc<Channel>, i64> {
+        let (slots, shared) = (u32::try_from(slots).map_err(|_| EINVAL)?, u32::try_from(shared).map_err(|_| EINVAL)?);
+        let layout = Layout::with_shared(slots, shared).ok_or(EINVAL)?;
         let memory = PageCache::anonymous(layout.pages as u64).map_err(|_| ENOMEM)?;
         let header = memory.map_page(0).map_err(|_| ENOMEM)?;
         let doorbell = match memory.map_page((layout.submission / PAGE as usize) as u64) {
@@ -323,8 +326,9 @@ impl Channel {
     // ------------------------------------------------------------ client
 
     /// Offers the channel to the service registered as `name` and waits
-    /// until it attached it (see `restricted::SYS_CHAN_CONNECT`).
-    pub fn connect(&self, name: &str, client: Pid) -> Result<(), i64> {
+    /// until it attached it (see `restricted::SYS_CHAN_CONNECT`), for the
+    /// process `client` of the Linux server instance `instance`.
+    pub fn connect(&self, name: &str, client: Pid, instance: u64) -> Result<(), i64> {
         {
             let inner = self.inner.lock();
             if inner.offered.is_some() || inner.service.is_some() || inner.service_gone {
@@ -347,7 +351,7 @@ impl Channel {
             }
             inner.offered = Some(to);
         }
-        let offer = Offer { channel: self.id, slots: self.layout.slots, client }.encode();
+        let offer = Offer { channel: self.id, slots: self.layout.slots, shared: self.layout.shared_pages as u32, client, instance }.encode();
         let mut message = Vec::new();
         let sent = message.try_reserve_exact(offer.len()).map_err(|_| ENOMEM).and_then(|_| {
             message.extend_from_slice(&offer);
@@ -723,7 +727,8 @@ fn client_gone(channel: &Channel, instance: &Weak<super::linux::Instance>, addr:
 
 /// chan_attach(channel) -> addr: maps a channel offered to the calling
 /// process's service into its address space: the header page read-only
-/// (only the kernel writes `state`), the rings read and write.
+/// (only the kernel writes `state`), the rings and the shared area read
+/// and write.
 pub fn attach(id: u64) -> Result<i64, i64> {
     let me = super::current_pid();
     let server = super::with_current(|p| p.server.clone()).ok_or(EPERM)?;

@@ -980,17 +980,19 @@ impl LinuxThread {
         Ok((thread, start))
     }
 
-    /// The worker thread of `instance` (a second service thread, in the
-    /// pager's process, that serves no program and no page: the server's
-    /// collector of sockets in flight runs there), and its frame.
-    pub fn worker(instance: Arc<Instance>) -> Result<(LinuxThread, Frame), i64> {
+    /// A further service thread of `instance` in the pager's process, that
+    /// serves no program and no page (`role`: `ROLE_WORKER`, where the
+    /// server's collector of sockets in flight runs, or `ROLE_NET`, where
+    /// its internet sockets' readiness and closing are handled), and its
+    /// frame.
+    pub fn service(instance: Arc<Instance>, role: u64) -> Result<(LinuxThread, Frame), i64> {
         let (slot, state) = instance.thread()?;
         // A slot's count of server locks starts at 0 (a thread that died
         // holding some left it).
         unsafe { *((memory::phys_to_virt(state.start_address().as_u64()) as u64 + SERVER_LOCKS_OFFSET) as *mut u32) = 0 };
         let thread =
             LinuxThread { instance, slot, state, restricted: false, pager: true, events: false, in_legacy: false, trap_nr: None, closed_now: Vec::new(), pinned: Vec::new(), fs_child: None, exec_target: None, normal: Frame::default() };
-        let start = thread.start(ROLE_WORKER);
+        let start = thread.start(role);
         Ok((thread, start))
     }
 
@@ -1489,7 +1491,7 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
         }
         SYS_CHAN_CREATE => {
             instance.channel_added()?;
-            let mapped = super::channel::Channel::new(a[0]).and_then(|c| instance.map_object(c.memory(), c.pages(), 1).map(|addr| (c, addr)));
+            let mapped = super::channel::Channel::new(a[0], a[2]).and_then(|c| instance.map_object(c.memory(), c.pages(), 1).map(|addr| (c, addr)));
             let (channel, addr) = mapped.inspect_err(|_| instance.channel_gone())?;
             // (Undone already if the end cannot be made.)
             let end = super::channel::ClientEnd::new(channel, Arc::downgrade(&instance), addr)?;
@@ -1515,7 +1517,7 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             let mut name = [0u8; 64];
             super::uaccess::copy_from_server(a[1], &mut name[..a[2] as usize])?;
             let name = core::str::from_utf8(&name[..a[2] as usize]).map_err(|_| EINVAL)?;
-            end.channel.connect(name, super::current_pid())?;
+            end.channel.connect(name, super::current_pid(), instance.id)?;
             Ok(0)
         }
         SYS_GRANT => {
@@ -1615,12 +1617,6 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             let st = super::sys_file::fstat_bytes(a[0])?;
             super::uaccess::copy_to_server(a[1], &st)?;
             Ok(0)
-        }
-        SYS_NET_LINKS => {
-            let links = crate::net::links()?;
-            let n = links.len().min(a[1] as usize);
-            super::uaccess::copy_to_server(a[0], &links[..n])?;
-            Ok(n as i64)
         }
         SYS_KFD_INSTALL_FILE => {
             use crate::fs::file::O_CLOEXEC;

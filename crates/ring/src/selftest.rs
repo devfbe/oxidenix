@@ -55,3 +55,10 @@ pub const HEADER_READ_ONLY: u16 = 13;
 /// one wake of the word wakes exactly one, and it turns into a doorbell
 /// event of the service's `ipc_receive`.
 pub const WATCH: u16 = 14;
+/// 0 if the channel's shared area is the client's: as many pages as the
+/// offer said (`arg[0]`), the first u32 of page n holding `arg[1] + n`
+/// (written by the client), writable for the service. The service then
+/// stores `!arg[1]` at the second u32 of page 0; with `arg[2]` 1 it does so
+/// 50 ms after its answer, with a futex wake on the word (which the
+/// client's `server_futex_wait` on its mapping must meet).
+pub const SHARED: u16 = 15;

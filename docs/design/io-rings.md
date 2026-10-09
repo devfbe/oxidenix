@@ -117,15 +117,16 @@ ring complete in any order (the device may reorder); the tag matches them up.
 **Layout.** A channel of `slots` slots per ring (a power of two, 2-4096) is one zeroed,
 committed memory object: a header page (magic, version, slots, the rings' offsets, and on its
 own cache line the `state` word), then the submission ring and the completion ring, each a
-`RingMemory<slots>` starting on a page of its own. The layout is a function of `slots` alone
-(`Layout::new`). Both ends map the header page read-only, so neither can forge `state`; the
-rings are read and write. The positions start at 0.
+`RingMemory<slots>` starting on a page of its own, then the shared area if the client asked for
+one. The layout is a function of `slots` and the shared pages alone (`Layout::with_shared`; the
+offer carries both). Both ends map the header page read-only, so neither can forge `state`; the
+rings and the shared area are read and write. The positions start at 0.
 
 **Client calls** (the Linux server, `crates/restricted`):
 
 | Call | |
 |------|---|
-| `chan_create(slots, &addr) -> handle` (1064) | the channel, mapped into the server's region (header read-only) (`MAPS_BASE`..`HEAP_BASE`, a range the kernel maps memory objects into for the server); at most 64 per instance |
+| `chan_create(slots, &addr, shared) -> handle` (1064) | the channel, mapped into the server's region (header read-only) (`MAPS_BASE`..`HEAP_BASE`, a range the kernel maps memory objects into for the server), with `shared` pages (at most 256) of **shared area** after the rings: the protocol's own state, mapped read and write into both ends like the rings and, unlike grants, never taken from the service while it is attached (it may use atomics there; `netring`'s control blocks, ADR 0008); at most 64 per instance |
 | `chan_connect(handle, name, len)` (1065) | offers it to the service `name` (a dead server of the kernel's is started again) and waits until it attached or refused; `EISCONN`, `ENOENT`, `EOPNOTSUPP` for a service that takes no channels, `EIO` if it died, `EINTR` for a signal before it attached |
 | `grant(handle, object, offset, pages, flags) -> id` (1066) | pins `pages` pages of a memory or file object (`GRANT_WRITE`: writable); `ENOTCONN` before the service attached, `EPIPE` after it went; at most 4096 grants and 65536 pages per channel |
 | `revoke(handle, id) -> 0 \| REVOKE_DRAINING` (1067) | see below |
@@ -136,7 +137,7 @@ rings are read and write. The positions start at 0.
 | Call | |
 |------|---|
 | `ipc_register(name, len, arg, IPC_CHANNELS)` (1000) | the service accepts channel offers |
-| `ipc_receive` | an offer comes as a control request (id with bit 63 set, `oxrt::Event::Control`) whose payload is a `ring::channel::Offer` (channel id, slots, client pid); the service answers with an 8-byte status |
+| `ipc_receive` | an offer comes as a control request (id with bit 63 set, `oxrt::Event::Control`) whose payload is a `ring::channel::Offer` (channel id, slots, shared pages, client pid, the client's instance, by which a service accounts what all of an instance's channels take); the service answers with an 8-byte status |
 | `chan_attach(channel) -> addr` (1068) | maps an offered channel (only the service it was offered to, only once) |
 | `chan_detach(channel)` (1069) | lets go of it: the service's mappings of the channel and of its grants go, and the service vouches that no device uses the grants any more |
 | `grant_map(channel, id, &info) -> addr` (1070) | maps a grant: read-only unless granted writable (`mprotect` cannot add write or execute), not inherited by `fork`, not movable by `mremap`; `info` gets (pages, writable) |
@@ -231,7 +232,8 @@ reports the copy as failed, as the Linux server's `set_usercopy` does for progra
 
 **Tests.** `lxtest` has the Linux server run seven scenarios (`TEST_CHANNEL`) against
 `servers/ringtest`, a service started in test mode only (`ring::selftest`): rings and doorbells
-in both directions, connect errors, the header read-only to the service; grants (data both ways, read-only enforced by mprotect, by
+in both directions, connect errors, the header read-only to the service, a shared area (what
+either end stores the other reads, a futex wake of the service's meets the client's wait); grants (data both ways, read-only enforced by mprotect, by
 the kernel's own stores and, fatally, by a CPU store; the kernel's bounds; device addresses;
 pinning against truncation; unsupplied pages); revoking (the mapping gone, a draining grant
 pinned and its id held until `grant_dma_unmap`, ids reused); the client's end going while the

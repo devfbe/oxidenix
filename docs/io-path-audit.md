@@ -3,7 +3,11 @@
 State of commit `34bdbc5` (2026-10-07), before any I/O refactoring. The counts come from
 reading the code path by path; the instrumented counters of the benchmark step (see
 `docs/benchmarks/`) are to confirm them. Since R6c.3 the paths of files on `/data` are no
-longer these: see "Files on `/data` since R6c.3" at the end.
+longer these: see "Files on `/data` since R6c.3" at the end. Since R7b the paths of sockets
+are no longer these either (the kernel's socket layer, `sys_net.rs`, `netproto` and
+`ipc_notify` are gone): the Linux server serves sockets over a channel to netd, with control
+blocks in the channel's shared area and the data in byte rings (ADR 0008,
+`docs/design/linux-server.md`, R7b); the socket sections below describe the state before.
 
 ## How a Linux system call reaches a server
 

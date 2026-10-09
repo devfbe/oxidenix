@@ -23,10 +23,13 @@ mod files;
 mod fsclient;
 mod heap;
 mod ids;
+mod inet;
+mod inetcalls;
 mod initramfs;
 mod inotify;
 mod mm;
 mod namespace;
+mod netclient;
 mod netdev;
 mod netlink;
 mod pathfile;
@@ -34,6 +37,7 @@ mod paths;
 mod pipe;
 mod pty;
 mod records;
+mod ringclient;
 mod sched;
 mod scm;
 mod sockcalls;
@@ -91,6 +95,9 @@ pub extern "C" fn _start(state: *mut State, role: u64) -> ! {
     if role == ROLE_WORKER {
         scm::worker();
     }
+    if role == ROLE_NET {
+        netclient::thread();
+    }
     if role == ROLE_INIT {
         // The tree's first thread: its standard descriptors on the console.
         console::setup_stdio();
@@ -132,7 +139,7 @@ fn pass_through(s: &State) {
     let mut closed = [0u64; 16];
     let n = syscall(SYS_LEGACY_SYSCALL, [closed.as_mut_ptr() as u64, closed.len() as u64, 0, 0, 0, 0]);
     for &id in closed.iter().take(n.max(0) as usize) {
-        files::closed(id);
+        files::closed(id, false);
     }
     datafs::reap();
 }
@@ -179,7 +186,7 @@ fn pager() -> ! {
         }
         match event.kind {
             EVENT_CLOSED => {
-                files::closed(event.a);
+                files::closed(event.a, true);
                 continue;
             }
             EVENT_RELEASE => {
@@ -209,6 +216,9 @@ fn pager() -> ! {
                 continue;
             }
             EVENT_CLOSING => {
+                // What the instance's sockets still had to send reaches
+                // netd (their closes hand it over) before the instance goes.
+                netclient::settle();
                 datafs::closing();
                 continue;
             }

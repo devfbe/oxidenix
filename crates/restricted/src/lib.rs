@@ -259,10 +259,12 @@ pub const EVENT_SESSION_END: u64 = 22;
 
 /// A server thread starts with its role in `rsi` (and its `State` in
 /// `rdi`): it serves a program's thread, or it is the instance's pager, or
-/// its worker: a second thread of the pager's process that serves neither
-/// a program nor a page (it may wait for locks a thread copying to or
-/// from program memory holds, which the pager never may), and ends with
-/// the pager's process.
+/// one of its two other service threads in the pager's process, which
+/// serve neither a program nor a page (they may wait for locks a thread
+/// copying to or from program memory holds, which the pager never may) and
+/// end with the pager's process: the worker (the collector of sockets in
+/// flight) and the net thread (readiness of the instance's internet
+/// sockets, and their closing, over its channel to netd).
 pub const ROLE_PROGRAM: u64 = 0;
 pub const ROLE_PAGER: u64 = 1;
 pub const ROLE_WORKER: u64 = 2;
@@ -271,6 +273,7 @@ pub const ROLE_WORKER: u64 = 2;
 /// standard input, output and error on the console (as Linux's init gets
 /// /dev/console) before the program runs; then it serves the program.
 pub const ROLE_INIT: u64 = 3;
+pub const ROLE_NET: u64 = 4;
 
 /// `(addr)`: a 4-page paged object mapped shared and readable at `addr`;
 /// page n reads "paged n" (supplied by the pager thread when touched).
@@ -522,9 +525,12 @@ pub const SYS_EVENT_RELEASES: u64 = 1063;
 // layout is `ring::channel`. The service's side of these calls is
 // `oxrt::sys::CHAN_ATTACH` and the following.
 
-/// `chan_create(slots, addr) -> handle`: a new channel with `slots` slots
-/// per ring (a power of two, 2..=4096), mapped into the server's region
-/// (the header page read-only, the rings writable); its address is stored at `addr` (a u64 in the server's memory).
+/// `chan_create(slots, addr, shared) -> handle`: a new channel with `slots`
+/// slots per ring (a power of two, 2..=4096) and `shared` pages of shared
+/// area after the rings (0..=256: the protocol's own state, which the
+/// service keeps mapped whatever the client does), mapped into the
+/// server's region (the header page read-only, the rest writable); its
+/// address is stored at `addr` (a u64 in the server's memory).
 /// Futex waits and wakes on it (`server_futex_wait`) meet the service's on
 /// its own mapping. Closing the handle (or the instance's end) tears the
 /// channel down: the service sees `CLIENT_GONE`, every grant is revoked.
@@ -649,12 +655,8 @@ pub const SYS_THREAD_EXISTS: u64 = 1090;
 /// for the server's calls that describe a descriptor in another format
 /// (statx). It goes with the descriptor table (R6e).
 pub const SYS_KFD_STAT: u64 = 1093;
-/// `net_links(buf, cap) -> len`: the network interfaces as netd describes
-/// them (`netproto::Op::Links`: `netproto::Link` records), at most `cap`
-/// bytes at `buf`; ENETDOWN without netd. The kernel only relays netd's
-/// answer. It goes with the sockets (R7), when the server talks to netd
-/// itself.
-pub const SYS_NET_LINKS: u64 = 1094;
+// 1094 was `net_links`, the kernel's relay of netd's interface records:
+// the server asks netd itself since R7b (`netring`'s `LINKS`).
 /// `thread_nice(scope, id, set, nice) -> lowest nice + 20`: the nice
 /// values (-20..=19, the kernel scheduler's weights) of the threads in
 /// `scope`, all of the caller's instance: `NICE_THREAD` the thread `id`

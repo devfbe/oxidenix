@@ -145,7 +145,6 @@ pub enum Kind {
     Inode(Arc<Inode>),
     PipeRead(Arc<Pipe>),
     PipeWrite(Arc<Pipe>),
-    Socket(crate::net::Socket),
     EventFd(Arc<EventFd>),
     Epoll(Arc<Epoll>),
     /// A file of the Linux server (a placeholder).
@@ -304,13 +303,6 @@ impl OpenFile {
         }
     }
 
-    pub fn socket(&self) -> Option<&crate::net::Socket> {
-        match &self.kind {
-            Kind::Socket(s) => Some(s),
-            _ => None,
-        }
-    }
-
     pub fn nonblocking(&self) -> bool {
         self.flags.load(Ordering::Relaxed) & O_NONBLOCK != 0
     }
@@ -323,7 +315,6 @@ impl OpenFile {
             Kind::Inode(inode) => self.read_inode(inode, buf),
             Kind::PipeRead(pipe) => self.read_pipe(pipe, buf),
             Kind::PipeWrite(_) => Err(EBADF),
-            Kind::Socket(s) => s.recv(buf, self.nonblocking(), false).map(|(n, _)| n),
             Kind::EventFd(e) => self.read_eventfd(e, buf),
             // The server reads its files itself.
             Kind::Epoll(_) | Kind::Server(_) => Err(EINVAL),
@@ -361,7 +352,6 @@ impl OpenFile {
             Kind::Inode(inode) => self.write_inode(inode, buf, append),
             Kind::PipeWrite(pipe) => self.write_pipe(pipe, buf),
             Kind::PipeRead(_) => Err(EBADF),
-            Kind::Socket(s) => s.send(buf, None, self.nonblocking()),
             Kind::EventFd(e) => self.write_eventfd(e, buf),
             Kind::Epoll(_) | Kind::Server(_) => Err(EINVAL),
         }
@@ -575,7 +565,6 @@ impl OpenFile {
                     0
                 }
             }
-            Kind::Socket(s) => s.poll(events),
             Kind::EventFd(e) => {
                 let count = *e.count.lock();
                 (if count > 0 { POLLIN } else { 0 }) | if count < EVENTFD_MAX { POLLOUT } else { 0 }
@@ -603,8 +592,6 @@ impl OpenFile {
             Kind::Epoll(e) => PollSource::Epoll(e.clone()),
             Kind::Server(s) if s.always => PollSource::Always,
             Kind::Server(s) => PollSource::Chan(s.chan()),
-            // netd announces readiness changes.
-            Kind::Socket(s) => s.poll_source(),
         }
     }
 }
@@ -628,7 +615,7 @@ impl Drop for OpenFile {
                 wakeup(p.read_chan());
             }
             // A server file tells its owner as its last reference goes.
-            Kind::Inode(_) | Kind::Socket(_) | Kind::EventFd(_) | Kind::Epoll(_) | Kind::Server(_) => {}
+            Kind::Inode(_) | Kind::EventFd(_) | Kind::Epoll(_) | Kind::Server(_) => {}
         }
     }
 }

@@ -2,8 +2,9 @@
 //!
 //! A server registers under a name, then loops over `receive` and `reply`.
 //! The kernel acts as the client on behalf of user programs: `call` queues
-//! a request and sleeps until the reply arrives; `post_to` queues one
-//! without waiting. Messages are copied through the kernel.
+//! a request and sleeps until the reply arrives. Messages are copied
+//! through the kernel. (Only procfs still serves such requests, for the
+//! kernel's `/proc`; the data plane to diskfs and netd is the channels'.)
 //!
 //! Besides the requests of its own protocol, a server registered with
 //! `IPC_CHANNELS` gets control requests from the kernel itself (offers of
@@ -53,8 +54,8 @@ struct Service {
     /// It accepts channel offers (`IPC_CHANNELS`).
     channels: bool,
     /// Unique per registration. A restarted server reuses the service
-    /// index, so clients that hold per-server state (socket handles)
-    /// check the generation to never reach the new server with it.
+    /// index, so a request meant for one registration (a channel offer)
+    /// checks the generation to never reach the new server.
     generation: u64,
 }
 
@@ -93,19 +94,6 @@ pub struct Instance {
 // addresses. A server sleeps on `irq::server_chan(pid)`.
 fn request_chan(id: u64) -> usize {
     0x2_0000_0000 + (id & !CONTROL) as usize
-}
-
-/// The channel a server's event `token` wakes (see `notify`), for one
-/// registration of the server: a restarted server cannot wake the
-/// waiters of its predecessor's objects. Different tokens may share a
-/// channel; that only costs a spurious wakeup.
-pub fn event_chan(server: Instance, token: u64) -> usize {
-    (1 << 44) | ((server.generation as usize & 0xfff) << 32) | (token as usize & 0xffff_ffff)
-}
-
-/// The channel woken when this registration's server dies.
-pub fn gone_chan(server: Instance) -> usize {
-    0x20_0000_0000 + server.generation as usize
 }
 
 fn lock<R>(f: impl FnOnce(&mut Ipc) -> R) -> R {
@@ -247,26 +235,6 @@ pub fn reply(id: u64, buf: u64, len: u64) -> SysResult {
     Ok(0)
 }
 
-/// ipc_notify(token): a server announces that its object `token` changed
-/// (netd: a socket's readiness), waking whoever waits on it. Only for the
-/// services the caller serves.
-pub fn notify(token: u64) -> SysResult {
-    let me = super::current_pid();
-    let served: Vec<Instance> = lock(|ipc| {
-        (0..ipc.services.len())
-            .filter(|&i| ipc.services[i].alive && ipc.services[i].server == me)
-            .map(|i| Instance { service: i, generation: ipc.services[i].generation })
-            .collect()
-    });
-    if served.is_empty() {
-        return Err(EPERM);
-    }
-    for server in served {
-        wakeup(event_chan(server, token));
-    }
-    Ok(0)
-}
-
 fn fail(id: u64) {
     lock(|ipc| {
         if let Some(req) = ipc.requests.get_mut(&id) {
@@ -313,45 +281,6 @@ pub fn call(service: usize, message: Vec<u8>) -> Result<Vec<u8>, i64> {
     without_interrupts(|| {
         let id = enqueue(service, message, true, None)?;
         wait_reply(id)
-    })
-}
-
-/// Like `call`, but a signal ends the wait with EINTR, for requests that may
-/// wait a long time (a socket waiting for data). A request still queued is
-/// withdrawn; one the server has taken is abandoned (its reply will be
-/// dropped) and the message `cancel(id)` is posted so the server forgets it.
-pub fn call_interruptible(to: Instance, message: Vec<u8>, cancel: impl FnOnce(u64) -> Vec<u8>) -> Result<Vec<u8>, i64> {
-    let service = to.service;
-    without_interrupts(|| {
-        let id = enqueue(service, message, true, Some(to.generation))?;
-        let mut cancel = Some(cancel);
-        wait_reply_with(id, &mut || {
-            let taken = lock(|ipc| match ipc.requests.get(&id).map(|r| r.state) {
-                Some(State::Queued) => {
-                    ipc.requests.remove(&id);
-                    if let Some(s) = ipc.services.get_mut(service) {
-                        s.queue.retain(|&q| q != id);
-                    }
-                    Some(false)
-                }
-                Some(State::Taken) => {
-                    ipc.requests.get_mut(&id).expect("present").waits = false;
-                    Some(true)
-                }
-                _ => None,
-            });
-            match taken {
-                Some(true) => {
-                    if let Some(cancel) = cancel.take() {
-                        post_to(to, cancel(id));
-                    }
-                    true
-                }
-                Some(false) => true,
-                // Already answered: take the reply instead.
-                None => false,
-            }
-        })
     })
 }
 
@@ -412,13 +341,9 @@ pub fn server_of(to: Instance) -> Option<Pid> {
     lock(|ipc| ipc.services.get(to.service).filter(|s| s.alive && s.generation == to.generation).map(|s| s.server))
 }
 
+/// Waits for the reply to `id` (not interruptible: the server may already
+/// be working on it).
 fn wait_reply(id: u64) -> Result<Vec<u8>, i64> {
-    wait_reply_with(id, &mut || false)
-}
-
-/// Waits for the reply to `id`. When a signal is pending, `abandon` may
-/// give up the request (returns true; the result is then EINTR).
-fn wait_reply_with(id: u64, abandon: &mut dyn FnMut() -> bool) -> Result<Vec<u8>, i64> {
     loop {
         let wait = prepare_to_wait(request_chan(id));
         let done = lock(|ipc| match ipc.requests.get(&id).map(|r| r.state) {
@@ -432,18 +357,8 @@ fn wait_reply_with(id: u64, abandon: &mut dyn FnMut() -> bool) -> Result<Vec<u8>
         if let Some(result) = done {
             return result;
         }
-        if super::signal::interrupted() && abandon() {
-            return Err(EINTR);
-        }
         wait.sleep();
     }
-}
-
-/// Sends `message` without waiting for (or receiving) a reply, only to
-/// this registration of the server (dropped if the server was restarted
-/// meanwhile). Never sleeps, so it can be used while dropping objects.
-pub fn post_to(to: Instance, message: Vec<u8>) {
-    let _ = enqueue(to.service, message, false, Some(to.generation));
 }
 
 /// The current registration behind `name`, if its server is alive.
@@ -457,27 +372,20 @@ pub fn instance(name: &str) -> Option<Instance> {
 /// Called when a process exits: its services die and every request they
 /// had not answered fails with EIO.
 pub fn on_exit(pid: Pid) {
-    let (failed, gone): (Vec<u64>, Vec<Instance>) = lock(|ipc| {
+    let failed: Vec<u64> = lock(|ipc| {
         let dead: Vec<usize> = (0..ipc.services.len()).filter(|&i| ipc.services[i].server == pid && ipc.services[i].alive).collect();
-        let gone = dead.iter().map(|&i| Instance { service: i, generation: ipc.services[i].generation }).collect();
         for &i in &dead {
             ipc.services[i].alive = false;
             ipc.services[i].queue.clear();
         }
-        let failed = ipc
-            .requests
+        ipc.requests
             .iter()
             .filter(|(_, r)| dead.contains(&r.service) && matches!(r.state, State::Queued | State::Taken))
             .map(|(&id, _)| id)
-            .collect();
-        (failed, gone)
+            .collect()
     });
     for id in failed {
         fail(id);
-    }
-    // Polls on its objects (sockets) see the server gone.
-    for server in gone {
-        wakeup(gone_chan(server));
     }
 }
 
