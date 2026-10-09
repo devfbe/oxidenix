@@ -805,6 +805,10 @@ impl AddressSpace {
     fn move_pages(&mut self, from: u64, to: u64, len: u64) {
         let l4 = self.l4;
         let mut lost_charged = 0;
+        // Pages that could not be mapped at the target: their frames go
+        // back only after the shootdown of their old addresses (another CPU
+        // may still write through a cached entry).
+        let mut lost: alloc::vec::Vec<(u64, PhysFrame)> = alloc::vec::Vec::new();
         let mut mapper = self.mapper();
         let parent = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
         memory::with_frames(|frames| {
@@ -819,15 +823,24 @@ impl AddressSpace {
                 match unsafe { mapper.map_to_with_table_flags(page, frame, flags, parent, &mut user) } {
                     Ok(f) => f.ignore(),
                     Err(_) => {
-                        unsafe { user.0.deallocate_frame(frame) };
                         lost_charged += flags.contains(CHARGED) as u64;
+                        // (Without room to remember it, the frame is
+                        // leaked rather than freed early.)
+                        if lost.try_reserve(1).is_ok() {
+                            lost.push((va, frame));
+                        }
                     }
                 }
             });
         });
-        memory::uncommit(lost_charged);
         self.sync_views(to..to + len);
         tlb::shootdown(&self.tlb, from, from + len);
+        let mut gather = Gather::new(&self.tlb);
+        for (va, frame) in lost {
+            gather.add(va, frame);
+        }
+        gather.finish();
+        memory::uncommit(lost_charged);
     }
 
     // ----------------------------------------------------------- faults
