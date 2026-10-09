@@ -136,7 +136,7 @@ pub struct Console {
     utf8: [u8; 4],
     utf8_len: usize,
     utf8_need: usize,
-    reply: [u8; 32],
+    reply: [u8; REPLY_CAP],
     reply_len: usize,
     /// Scroll region, first and last row (inclusive).
     top: usize,
@@ -165,6 +165,11 @@ pub struct Console {
 /// waits long for the console and no timer tick is lost, however much a
 /// program writes.
 const WORK_BUDGET: usize = 64;
+/// The budget an answer to a query takes (see `push_reply`).
+const REPLY_WORK: usize = 16;
+/// Room for the answers of one lock hold: at most `WORK_BUDGET / REPLY_WORK` of
+/// them, each at most 16 bytes ("\x1b[rrrr;ccccR").
+const REPLY_CAP: usize = (WORK_BUDGET / REPLY_WORK) * 16;
 
 impl Console {
     fn put_pixel(&mut self, x: usize, y: usize, (r, g, b): (u8, u8, u8)) {
@@ -366,7 +371,12 @@ impl Console {
         }
     }
 
+    /// An answer to a query (a cursor position report, device attributes). Each
+    /// counts as `REPLY_WORK` of the lock hold's budget, so one hold makes at most
+    /// `WORK_BUDGET / REPLY_WORK` of them, which `reply` always holds: the writer
+    /// takes them before the lock goes (`write_with_replies`), none is lost.
     fn push_reply(&mut self, bytes: &[u8]) {
+        self.work += REPLY_WORK;
         let n = bytes.len().min(self.reply.len() - self.reply_len);
         self.reply[self.reply_len..self.reply_len + n].copy_from_slice(&bytes[..n]);
         self.reply_len += n;
@@ -690,10 +700,12 @@ impl Console {
         self.redraw_next.is_some()
     }
 
+    /// The kernel's own text (printk): answers to queries in it go nowhere.
     pub fn write_bytes(&mut self, bytes: &[u8]) {
         let mut rest = bytes;
         while !rest.is_empty() || self.redraw_pending() {
             let n = self.write_some(rest);
+            self.reply_len = 0;
             rest = &rest[n..];
         }
     }
@@ -757,7 +769,7 @@ pub fn init(fb: &'static mut FrameBuffer) {
         utf8: [0; 4],
         utf8_len: 0,
         utf8_need: 0,
-        reply: [0; 32],
+        reply: [0; REPLY_CAP],
         reply_len: 0,
         top: 0,
         bottom: 0,
@@ -823,35 +835,38 @@ const SERIAL_CHUNK: usize = 256;
 /// CPU: a write that redraws the whole screen takes long, and the kernel
 /// does not preempt itself.
 pub fn write_bytes(bytes: &[u8]) {
+    write_with_replies(bytes, &mut |_| {});
+}
+
+/// `write_bytes`, handing the console's answers to queries in `bytes` (a cursor
+/// position report, device attributes) to `replies`: taken in the same lock hold that
+/// made them, so they are this write's and none is lost.
+pub fn write_with_replies(bytes: &[u8], replies: &mut dyn FnMut(&[u8])) {
     for chunk in bytes.chunks(SERIAL_CHUNK) {
         super::serial::write_bytes(chunk);
     }
     let mut rest = bytes;
     loop {
-        let (used, pending) = match CONSOLE.lock().as_mut() {
-            Some(c) => (c.write_some(rest), c.redraw_pending()),
+        let mut reply = [0u8; REPLY_CAP];
+        let (used, pending, n) = match CONSOLE.lock().as_mut() {
+            Some(c) => {
+                let used = c.write_some(rest);
+                let n = c.reply_len;
+                reply[..n].copy_from_slice(&c.reply[..n]);
+                c.reply_len = 0;
+                (used, c.redraw_pending(), n)
+            }
             None => return,
         };
+        if n > 0 {
+            replies(&reply[..n]);
+        }
         rest = &rest[used..];
         if rest.is_empty() && !pending {
             return;
         }
         crate::process::sched::cond_resched();
     }
-}
-
-/// Takes the bytes the terminal wants to send back (e.g. a cursor position
-/// report); they belong into the TTY input queue.
-pub fn take_reply(out: &mut [u8; 32]) -> usize {
-    without_interrupts(|| match CONSOLE.lock().as_mut() {
-        Some(c) => {
-            let n = c.reply_len;
-            out[..n].copy_from_slice(&c.reply[..n]);
-            c.reply_len = 0;
-            n
-        }
-        None => 0,
-    })
 }
 
 /// (columns, rows)

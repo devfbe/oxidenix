@@ -711,10 +711,17 @@ pub const SYS_THREAD_IDS: u64 = 1103;
 /// input (typed on the keyboard, or the console's answers to queries written
 /// to it): 0 when there is none. EIO unless the instance holds the console.
 pub const SYS_CONSOLE_READ: u64 = 1110;
-/// `console_write(buf, len) -> len`: writes `len` bytes to the console as
+/// `console_write(buf, len, flags) -> n`: writes `len` bytes to the console as
 /// they are (a VT100: a line feed keeps the column, `ONLCR` is the
-/// terminal's). EIO unless the instance holds the console.
+/// terminal's), whole: another write's bytes do not come between them (the
+/// caller waits its turn, first come first served; EINTR if a signal for the
+/// program comes first, with nothing written). With `CONSOLE_ECHO` (an echo of the
+/// line discipline, at most 512 bytes) it never waits: the bytes are queued
+/// and go out between the pieces of a write in progress or at once; what does
+/// not fit in the queue (4 KiB) is dropped, `n` says how much went. EIO
+/// unless the instance holds the console.
 pub const SYS_CONSOLE_WRITE: u64 = 1111;
+pub const CONSOLE_ECHO: u64 = 1;
 /// `console_info(out)`: the console's size, two u64s at `out` (columns,
 /// rows). EIO unless the instance holds the console.
 pub const SYS_CONSOLE_INFO: u64 = 1112;

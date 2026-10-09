@@ -1687,21 +1687,41 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
         }
         SYS_CONSOLE_WRITE => {
             use crate::drivers::console_device;
+            if a[2] & !CONSOLE_ECHO != 0 {
+                return Err(EINVAL);
+            }
             let mut buf = [0u8; 512];
-            let mut done = 0u64;
-            let _writer = console_device::writer();
-            while done < a[1] {
-                // Checked for every piece: a long write stops when the
-                // console is taken away.
+            if a[2] & CONSOLE_ECHO != 0 {
+                // Never waits (the service thread's echoes).
                 if console_device::holder() != instance.id {
                     return Err(EIO);
                 }
-                let n = (a[1] - done).min(buf.len() as u64) as usize;
-                super::uaccess::copy_from_server(a[0] + done, &mut buf[..n])?;
-                console_device::write(&buf[..n]);
-                done += n as u64;
+                let n = a[1].min(buf.len() as u64) as usize;
+                super::uaccess::copy_from_server(a[0], &mut buf[..n])?;
+                return Ok(console_device::echo(&buf[..n]) as i64);
             }
-            Ok(done as i64)
+            let mut done = 0u64;
+            let result = {
+                let _writer = console_device::writer()?;
+                loop {
+                    if done >= a[1] {
+                        break Ok(done as i64);
+                    }
+                    // Checked for every piece: a long write stops when the
+                    // console is taken away.
+                    if console_device::holder() != instance.id {
+                        break Err(EIO);
+                    }
+                    let n = (a[1] - done).min(buf.len() as u64) as usize;
+                    if let Err(e) = super::uaccess::copy_from_server(a[0] + done, &mut buf[..n]) {
+                        break Err(e);
+                    }
+                    console_device::write(&buf[..n]);
+                    done += n as u64;
+                }
+            };
+            console_device::flush_echo();
+            result
         }
         SYS_CONSOLE_INFO => {
             if crate::drivers::console_device::holder() != instance.id {
