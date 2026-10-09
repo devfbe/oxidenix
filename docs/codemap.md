@@ -25,7 +25,7 @@ module comment, and the public types it defines. Where to start for common tasks
 - `kernel/src/interrupts/apic.rs` (210) Local APIC (one per CPU: timer, end of interrupt, inter-processor interrupts) and I/O APIC (routes device interrupts to CPUs).
 - `kernel/src/interrupts/entry.rs` (66) Uniform entry for every interrupt and exception (except NMI and double fault): a per-vector stub pushes the vector (and a dummy error code where the CPU pushes none), the common path saves all registers into a...
 - `kernel/src/interrupts/gdt.rs` (92) Per-CPU GDT and TSS. Types: `CpuTables`.
-- `kernel/src/interrupts/handlers.rs` (209) Interrupt and exception handlers: every vector from `entry::common_entry` lands in `trap`, which dispatches CPU exceptions (page faults, signals for user faults), device interrupts and inter-processor interrupts.
+- `kernel/src/interrupts/handlers.rs` (204) Interrupt and exception handlers: every vector from `entry::common_entry` lands in `trap`, which dispatches CPU exceptions (page faults, signals for user faults), device interrupts and inter-processor interrupts.
 - `kernel/src/interrupts/mod.rs` (72) Interrupt setup: the IDT, the interrupt controllers (local and I/O APIC from ACPI, the 8259 PICs masked) and the per-CPU setup of the other CPUs.
 - `kernel/src/main.rs` (158) The kernel's entry point: `kernel_main` takes the boot information from the bootloader (UEFI or BIOS) and brings up the console, interrupts, memory, ACPI, time, the VFS, processes, the other CPUs and the servers,...
 - `kernel/src/memory/frame.rs` (148) The physical frame allocator: fresh frames from the bootloader's usable regions, freed ones on an intrusive free list, with reference counts for shared and copy-on-write frames. Types: `PhysFrameAllocator`, `UserFrames`.
@@ -47,7 +47,7 @@ module comment, and the public types it defines. Where to start for common tasks
 - `kernel/src/process/mod.rs` (659) Processes and threads: the process table, the current task, descriptor tables, process groups and sessions, CPU affinity; the submodules hold scheduling, fork/exec/exit, signals, IPC, restricted mode and the system... Types: `FdEntry`, `Server`.
 - `kernel/src/process/prctl.rs` (120) prctl, capget and capset.
 - `kernel/src/process/query.rs` (82) proc_query (syscall 1005): the kernel's native process and system information for the procfs server (records in `procproto`): the system-wide record only, for it and for the Linux server...
-- `kernel/src/process/sched.rs` (739) The SMP scheduler: per-CPU run queues, wait queues, context switches. Types: `Table`, `PidReservation`, `CpuSched`, `CpuStats`, `WaitQueue`, `Wait`.
+- `kernel/src/process/sched.rs` (736) The SMP scheduler: per-CPU run queues, wait queues, context switches. Types: `Table`, `PidReservation`, `CpuSched`, `CpuStats`, `WaitQueue`, `Wait`.
 - `kernel/src/process/signal.rs` (796) POSIX signals for processes with threads, following Linux, for the kernel's native servers (until R9). Types: `SigAction`, `GroupExit`, `GroupSignals`, `ThreadSignals`.
 - `kernel/src/process/sys_file.rs` (541) File syscalls: on the kernel's descriptor tables (the native servers'), and on an open file the Linux server holds by handle (`file_call`, its `restricted::SYS_KFILE_CALL`: the inodes of the kernel's tree a Linux...
 - `kernel/src/process/sys_mem.rs` (210) Memory syscalls: brk, mmap, munmap, mprotect, mremap, madvise and the ones that need no work here (msync, mlock). Types: `Placement`.

@@ -361,11 +361,6 @@ fn server_locks(t: &Task) -> u32 {
     locks_at(t.server_locks.load(Ordering::Relaxed))
 }
 
-/// How many of the Linux server's locks the current task holds.
-pub fn current_server_locks() -> u32 {
-    server_locks(current())
-}
-
 fn locks_at(word: u64) -> u32 {
     if word == 0 {
         return 0;

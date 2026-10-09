@@ -127,14 +127,11 @@ fn exception(frame: &mut Frame) {
         }
     }
     if frame.from_user() && crate::process::linux::mode() == Some(false) {
-        // A dying thread's server whose access ended with the thread's death
-        // (a page wait cut short) did not fail: the thread just ends, if it
-        // holds none of the server's locks (else the diagnostic: they are
-        // lost with it).
-        if vector == 14 && signal::dying() && crate::process::sched::current_server_locks() == 0 {
-            crate::process::exit_thread(signal::SIGKILL as i32);
-        }
-        // The Linux server failed: its process cannot go on.
+        // The Linux server failed (also one whose access to program memory
+        // outside its copy routine ended with the thread's death: every such
+        // access goes through the copy routine, whose fixup unwinds the call).
+        // Whatever it held (its locks, sleeping ones too, references) is lost
+        // with it, so its instance ends: never this thread alone.
         crate::printkln!(
             "[linux] {} in the Linux server (rip {:#x}, address {:#x}, error {:#x}, cr3 {:#x}, rdi {:#x}), process killed",
             exception_name(vector),
@@ -148,10 +145,7 @@ fn exception(frame: &mut Frame) {
             let (program, normal) = mm.tlb.roots();
             crate::printkln!("[linux] program view {:#x}, normal view {:#x}", program, normal);
         }
-        // Its locks are lost with it: the instance ends.
-        if crate::process::sched::current_server_locks() > 0 {
-            crate::process::linux::break_instance();
-        }
+        crate::process::linux::break_instance();
         signal::kernel_kill_current();
     }
     let mut sig = exception_signal(vector);

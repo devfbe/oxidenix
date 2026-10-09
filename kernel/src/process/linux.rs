@@ -195,7 +195,7 @@ pub struct Instance {
     tasks: spin::Mutex<BTreeMap<u64, (u32, Weak<super::task::Task>)>>,
     /// The command line the tree's first process runs (`SYS_INIT_ARGS`).
     init_args: spin::Mutex<Vec<u8>>,
-    /// A thread of the server failed holding its locks (`break_instance`):
+    /// A thread of the server failed (`break_instance`):
     /// the server's state is lost, its lock waits end (`FUTEX_LOCK`).
     broken: core::sync::atomic::AtomicBool,
 }
@@ -1855,9 +1855,9 @@ pub fn instance_broken() -> bool {
     with_current(|p| p.linux.as_ref().is_some_and(|l| l.instance.broken.load(core::sync::atomic::Ordering::Acquire)))
 }
 
-/// The calling thread's server failed while it held some of the server's
-/// locks: they are never let go of, and the server's state they guard is
-/// lost. The instance ends: every program thread is killed, and every wait
+/// The calling thread's server failed (an exception in its own code): what
+/// it held (its locks, sleeping ones too, references) is never let go of,
+/// and the server's state is lost. The instance ends: every program thread is killed, and every wait
 /// for one of the server's locks (`FUTEX_LOCK`, which nothing else ends)
 /// ends with EINTR, on which the server ends the waiting thread. So no
 /// thread of the instance waits for good on a lock a dead holder kept.
@@ -1866,7 +1866,7 @@ pub fn break_instance() {
     if instance.broken.swap(true, core::sync::atomic::Ordering::AcqRel) {
         return;
     }
-    crate::printkln!("[linux] the server failed holding its locks: instance {} ends", instance.id);
+    crate::printkln!("[linux] the server failed: instance {} ends", instance.id);
     let tasks: Vec<Arc<super::task::Task>> = instance.tasks.lock().values().filter_map(|(_, t)| t.upgrade()).collect();
     for t in &tasks {
         kill_task(t);

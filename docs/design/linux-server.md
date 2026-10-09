@@ -153,9 +153,12 @@ These locks (`sync::Mutex`, `RwLock`) are held for bounded work only, never acro
 program memory or a wait for another party (netd, diskfs, procfs, a channel's offer, a page
 the pager brings). Their waits (`FUTEX_LOCK`, on the server's own memory only) are like a
 kernel's spinlock: they go on for a dying thread, whose server still takes them to end it,
-and nothing about the waiter changes them; only a server thread that fails while holding
-locks ends them, by breaking its instance (every program thread killed, every lock wait
-ended with EINTR, on which the waiter ends). Locks held across such waits (a file
+and nothing about the waiter changes them; only a server thread that fails (an exception
+in the server's own code, whatever it held is lost with it) ends them, by breaking its
+instance (every program thread killed, every lock wait ended with EINTR, on which the
+waiter ends). A server thread is never ended on its own from the middle of server code: its
+accesses to program memory go through the copy routine, whose fault (also a page wait cut
+short by the thread's death) ends the copy with EFAULT and the call unwinds. Locks held across such waits (a file
 description's offset, an O_APPEND writer's turn, a /data inode's write-back and the making
 of its cached object, the /data names, a reconnection to diskfs, procfs or netd, a socket's,
 a pipe's or a terminal's readers) are sleeping locks (`SleepMutex`, `SleepLock`,

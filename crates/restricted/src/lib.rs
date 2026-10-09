@@ -333,7 +333,7 @@ pub const SYS_SHARED_MAP: u64 = 1023;
 /// writes never holds a dying thread), whose holder does only bounded work
 /// and which a dying thread's server needs to end the thread: it ends only
 /// when woken (or at the deadline), or with EINTR once the instance broke
-/// (a thread failed holding the server's locks; the server ends the waiter
+/// (a server thread failed, `break_instance`; the server ends the waiter
 /// then).
 pub const SYS_SERVER_FUTEX_WAIT: u64 = 1024;
 /// `server_futex_wake(addr, n) -> woken`.

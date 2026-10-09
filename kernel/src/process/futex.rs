@@ -187,7 +187,7 @@ pub enum Ends {
     /// (`restricted::FUTEX_LOCK`), held for bounded work only (as a kernel's
     /// spinlock or a mutex that is not killable), which a dying thread's
     /// server still takes to end the thread: only the instance's breaking
-    /// (a holder that failed with it, `linux::break_instance`) ends it. No
+    /// (a server thread that failed, `linux::break_instance`) ends it. No
     /// state of the thread's changes how it waits.
     Lock,
 }
