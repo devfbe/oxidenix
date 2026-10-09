@@ -415,7 +415,9 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
      while they limit the transfer (smoltcp, vendored, has patches to grow buffers and to
      announce the window scale of the largest). Under pressure (half of netd's 32 MiB in
      use, as Linux's tcp_mem) connections start and stay small and idle ones give their
-     buffers back, so hundreds of connections fit (nettest opens 600). Closed connections
+     send buffers back (a receive buffer never shrinks below the window it announced: the
+     right edge never moves left; a segment beyond a buffer is dropped, never half kept),
+     so hundreds of connections fit (nettest opens 600). Closed connections
      that finish in order (orphans, at most 4096) are reset after 60 s in FIN-WAIT-2
      (tcp_fin_timeout) or 100 s without progress (a zero window, a peer that stopped
      acknowledging); a connection attempt gives up after 127 s, unacknowledged data after

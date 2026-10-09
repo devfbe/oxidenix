@@ -52,9 +52,9 @@
 //! and the client's ring holds more than it takes. Under pressure (half
 //! of `BUDGET` in use, as Linux's tcp_mem) connections start with
 //! `TCP_MIN`, grow no further than the first sizes, and one idle for
-//! `TRIM_AFTER` gives its empty buffers back (`trim`: the send buffer
-//! entirely, the receive buffer down to `TCP_MIN`), so idle connections
-//! cost little, as on Linux, where they hold no buffers. The window scale
+//! `TRIM_AFTER` gives its empty send buffer back (`trim`; its receive
+//! buffer only as far as the window it announced allows: the right edge
+//! never moves left), so idle connections cost less. The window scale
 //! announced in the SYN is that of `TCP_MAX` (smoltcp's
 //! `set_rx_capacity_max`), so a grown buffer opens the window.
 
@@ -2302,8 +2302,10 @@ fn equip(mem: &mut BTreeMap<SocketHandle, Mem>, bytes: &mut Budget, h: SocketHan
 
 /// An idle connection's buffers go back under pressure: the send buffer
 /// entirely (it comes back with the next write, `grow`), the receive
-/// buffer down to `TCP_MIN` (the window shrinks: see smoltcp's
-/// `replace_rx_buffer`). Only empty buffers shrink; true if one did.
+/// buffer down to `TCP_MIN` only as far as the window announced so far
+/// allows (its right edge never moves left: smoltcp's `replace_rx_buffer`
+/// refuses, so in practice only a connection whose window closed gives
+/// it back). Only empty buffers shrink; true if one did.
 fn trim(mem: &mut BTreeMap<SocketHandle, Mem>, bytes: &mut Budget, h: SocketHandle, sockets: &mut SocketSet<'static>) -> bool {
     let socket = sockets.get::<tcp::Socket>(h);
     let (rx, tx) = (socket.recv_capacity() > TCP_MIN, socket.send_capacity() > 0);

@@ -59,8 +59,8 @@ Alternatives considered:
   whoever asks first.
 - **netd's memory follows use**: smoltcp (vendored with small patches) lets a connection's
   buffers grow from Linux's first sizes while they limit the transfer, and under pressure
-  connections stay small and idle ones give their buffers back, so an idle connection costs
-  little, as on Linux.
+  connections stay small and idle ones give their send buffers back (a receive buffer never
+  shrinks below the window it announced).
 
 ## Threat model: instances sharing netd
 

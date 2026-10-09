@@ -669,9 +669,9 @@ impl<'a> Socket<'a> {
     /// segments too), into `storage` and returns the old storage. A larger
     /// buffer opens the window (announced once it grew enough,
     /// `window_to_update`). A smaller one takes only an empty buffer with no
-    /// out-of-order data (else `storage` is given back as the error); the
-    /// window then shrinks, which RFC 9293 discourages: the caller does it
-    /// only for an idle connection, whose peer has nothing in flight.
+    /// out-of-order data that still holds the whole window announced so far
+    /// (the right edge never moves left, RFC 9293, Linux's
+    /// tcp_select_window); else `storage` is given back as the error.
     ///
     /// # Panics
     /// If `storage` is larger than 1 GiB.
@@ -681,7 +681,7 @@ impl<'a> Socket<'a> {
     {
         let storage = storage.into();
         assert!(storage.len() <= 1 << 30, "receiving buffer too large, cannot exceed 1 GiB");
-        if storage.len() < self.rx_buffer.capacity() && !self.assembler.is_empty() {
+        if storage.len() < self.rx_buffer.capacity() && (!self.assembler.is_empty() || storage.len() < self.announced_window()) {
             return Err(storage);
         }
         self.rx_buffer.replace_storage(storage)
@@ -836,6 +836,15 @@ impl<'a> Socket<'a> {
     #[inline]
     fn scaled_window(&self) -> u16 {
         u16::try_from(self.rx_buffer.window() >> self.remote_win_shift).unwrap_or(u16::MAX)
+    }
+
+    /// oxidenix: what is left of the window announced last (from the
+    /// next byte expected to its right edge); 0 if none was.
+    fn announced_window(&self) -> usize {
+        let Some(last_ack) = self.remote_last_ack else { return 0 };
+        let edge = last_ack + ((self.remote_last_win as usize) << self.remote_win_shift);
+        let start = self.remote_seq_no + self.rx_buffer.len();
+        if edge > start { edge - start } else { 0 }
     }
 
     /// Return the last window field value, including scaling according to RFC 1323.
@@ -1783,6 +1792,15 @@ impl<'a> Socket<'a> {
             last_ack + ((self.remote_last_win as usize) << self.remote_win_shift)
         } else {
             window_start
+        };
+        // oxidenix: no further than the buffer reaches. A buffer that shrank
+        // (`replace_rx_buffer`) may hold less than the window announced
+        // before; what lies beyond it is dropped (the peer sends it again),
+        // never recorded without being stored.
+        let window_end = if window_end > window_start + self.rx_buffer.window() {
+            window_start + self.rx_buffer.window()
+        } else {
+            window_end
         };
         let segment_start = repr.seq_number;
         let segment_end = repr.seq_number + repr.payload.len();
@@ -10183,14 +10201,16 @@ mod test {
         assert!(s.replace_rx_buffer(vec![0; 16]).is_err(), "it holds data");
         let mut data = [0; 6];
         assert_eq!(s.recv_slice(&mut data), Ok(6));
-        assert_eq!(s.replace_rx_buffer(vec![0; 16]).ok().map(|b| b.len()), Some(64));
-        // The next segment that fits is taken, and the window is the new one.
+        // Empty, but 58 bytes of window were announced: never smaller.
+        assert!(s.replace_rx_buffer(vec![0; 16]).is_err(), "the right edge never moves left");
+        assert_eq!(s.replace_rx_buffer(vec![0; 58]).ok().map(|b| b.len()), Some(64));
+        // The peer fills the window it was given: all of it fits.
         send!(
             s,
             TcpRepr {
                 seq_number: REMOTE_SEQ + 1 + 6,
                 ack_number: Some(LOCAL_SEQ + 1),
-                payload: &b"gh"[..],
+                payload: &[b'z'; 58][..],
                 ..SEND_TEMPL
             }
         );
@@ -10198,12 +10218,13 @@ mod test {
             s,
             [TcpRepr {
                 seq_number: LOCAL_SEQ + 1,
-                ack_number: Some(REMOTE_SEQ + 1 + 8),
-                window_len: 14,
+                ack_number: Some(REMOTE_SEQ + 1 + 64),
+                window_len: 0,
                 ..RECV_TEMPL
             }]
         );
-        assert_eq!(s.recv_slice(&mut data), Ok(2));
+        let mut all = [0; 64];
+        assert_eq!(s.recv_slice(&mut all), Ok(58));
         // The send buffer: none at all while idle, and a new one to send.
         assert_eq!(s.replace_tx_buffer(vec![]).ok().map(|b| b.len()), Some(64));
         assert_eq!(s.send_slice(b"x"), Ok(0));
@@ -10211,12 +10232,72 @@ mod test {
         assert_eq!(s.send_slice(b"xyz"), Ok(3));
         recv!(s, time 0, Ok(TcpRepr {
             seq_number: LOCAL_SEQ + 1,
-            ack_number: Some(REMOTE_SEQ + 1 + 8),
+            ack_number: Some(REMOTE_SEQ + 1 + 64),
             payload:    &b"xyz"[..],
-            // "gh" was read: the whole new receive buffer.
-            window_len: 16,
+            window_len: 58,
             ..RECV_TEMPL
         }));
+    }
+
+    /// A receive buffer smaller than the window announced before (as one
+    /// that shrank would be) takes what fits of a segment the peer sends
+    /// within that window and drops the rest: never a panic, never bytes
+    /// recorded that were not stored.
+    #[test]
+    fn test_oxidenix_segment_beyond_a_smaller_buffer() {
+        let mut s = socket_established_with_buffer_sizes(64, 64);
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &b"abcdef"[..],
+                ..SEND_TEMPL
+            }
+        );
+        recv!(
+            s,
+            [TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 6),
+                window_len: 58,
+                ..RECV_TEMPL
+            }]
+        );
+        let mut data = [0; 6];
+        assert_eq!(s.recv_slice(&mut data), Ok(6));
+        s.rx_buffer = SocketBuffer::new(vec![0; 16]);
+        // 40 bytes in order, within the 58 announced: 16 are taken.
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 6,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &[b'q'; 40][..],
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.recv_queue(), 16);
+        // Out of order beyond the buffer: dropped, nothing recorded.
+        send!(
+            s,
+            TcpRepr {
+                seq_number: REMOTE_SEQ + 1 + 6 + 30,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &[b'r'; 20][..],
+                ..SEND_TEMPL
+            },
+            Some(TcpRepr {
+                seq_number: LOCAL_SEQ + 1,
+                ack_number: Some(REMOTE_SEQ + 1 + 6 + 16),
+                window_len: 0,
+                ..RECV_TEMPL
+            })
+        );
+        assert!(s.assembler.is_empty());
+        let mut all = [0; 64];
+        assert_eq!(s.recv_slice(&mut all), Ok(16));
+        assert_eq!(&all[..16], &[b'q'; 16]);
     }
 
     #[test]
