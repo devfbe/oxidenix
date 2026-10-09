@@ -98,6 +98,19 @@ time) and so may anything on the network.
   channel; channels are capped per instance and an idle one gives its slot up; the
   ephemeral range is wider than what one instance can hold (its share of smoltcp sockets). A flood from the network against one instance's listener spends that
   instance's share of half-open connections.
+- **At each cap** (as Linux where it has one; none blocks an instance for good or leaks):
+
+  | cap | what happens |
+  |---|---|
+  | buffer bytes, smoltcp sockets | `ENOBUFS` for the socket; a connection that arrives is reset; under pressure connections start and stay small |
+  | smoltcp sockets, TIME-WAIT among them | the instance's own oldest TIME-WAIT connection goes (never another instance's); an instance without room skips TIME-WAIT (closed at once, tcp_max_tw_buckets) |
+  | orphans | a close resets the connection (tcp_max_orphans) |
+  | a close's leftovers | the connection is reset |
+  | half-open connections | the SYN is answered with a reset |
+  | backlog | `listen` takes a smaller backlog (at least one) |
+  | channels | an idle channel gives its slot up, else `ENOBUFS` |
+  | echo identifiers | the instance's least recently used goes |
+
 - **From the network**: every packet netd parses itself (ICMP for routing) is length-checked
   (tested over truncations and changed bytes on the host); SYNs cost a 4 KiB buffer until the
   handshake completes; closed connections that stop making progress are reset; the queues to

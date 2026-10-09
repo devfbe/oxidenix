@@ -148,6 +148,9 @@ Linux's first sizes and growing to 1 MiB; the loopback pushes back instead of dr
 3.5: the disk figures of that run are low for the same reason). Starting connections at 4 KiB
 instead cost half the loopback throughput (565 MB/s: the growth took longer than the transfer)
 and, against QEMU's user network, a one-second stall (its TCP waits for a larger window).
+After the second review (`2026-10-09-29b0502-r7b-rereview.md`: real randomness, RFC 6528
+sequence numbers, half-open connections with small buffers, TIME-WAIT kept in smoltcp):
+`tcp_loopback` 1192 MB/s, `tcp_network_echo` 176 MB/s (host load about 3.7).
 
 ## Open: PCIDs and small cached reads
 

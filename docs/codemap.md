@@ -115,7 +115,7 @@ module comment, and the public types it defines. Where to start for common tasks
 - `servers/diskfs/src/service.rs` (937) The ring service: diskfs's end of the data plane (docs/design/io-rings.md, the file protocol `fsring`). Types: `Service`.
 - `servers/netd/src/main.rs` (204) netd: the network server.
 - `servers/netd/src/nic.rs` (114) smoltcp's view of the network card, with loopback: frames addressed to this host (its own address or 127.0.0.0/8) never reach the wire but come back as received frames, and ARP requests for those addresses are... Types: `Nic`, `RxToken`, `TxToken`.
-- `servers/netd/src/service.rs` (1857) The socket service: netd's end of the instances' channels (phase R7b, ADR 0008, the protocol `netring`), mapped onto smoltcp's sockets. Types: `Config`, `Service`.
+- `servers/netd/src/service.rs` (1859) The socket service: netd's end of the instances' channels (phase R7b, ADR 0008, the protocol `netring`), mapped onto smoltcp's sockets. Types: `Config`, `Service`.
 - `servers/netd/src/virtio_net.rs` (91) virtio-net driver on the shared virtio transport (crates/virtio). Types: `VirtioNet`.
 - `servers/procfs/src/main.rs` (289) procfs: the system-wide part of Linux's /proc, and /sys, served from user space.
 - `servers/procfs/src/render.rs` (33) The formats of procfs's own making: /proc/cpuinfo (from CPUID, an unprivileged instruction) and /proc/version.
@@ -320,6 +320,7 @@ kernel that handle them.
 - `docs/benchmarks/2026-10-08-fae8292-pcid-quiet.md` Benchmark fae8292 (pcid-quiet)
 - `docs/benchmarks/2026-10-08-linux-6.18.54-quiet.md` Benchmark Linux 6.18.54 (comparison, oxidenix at 92bb179) (quiet)
 - `docs/benchmarks/2026-10-09-1337e20-statpath.md` Benchmark 1337e20 (statpath)
+- `docs/benchmarks/2026-10-09-29b0502-r7b-rereview.md` Benchmark 29b0502 (r7b-rereview)
 - `docs/benchmarks/2026-10-09-40aac17-r7b-review.md` Benchmark 40aac17 (r7b-review)
 - `docs/benchmarks/2026-10-09-714815d-r7b-final.md` Benchmark 714815d (r7b-final)
 - `docs/benchmarks/2026-10-09-802b396-quiet.md` Benchmark 802b396 (quiet)
