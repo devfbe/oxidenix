@@ -927,7 +927,9 @@ interrupt dispatch; drivers and filesystems move into user-space servers.
   card in legacy mode, whose registers are all I/O ports) and hands netd its ports, its
   interrupt line and a 512 KiB DMA area. netd sets up the two virtqueues with 64 fixed 2 KiB
   buffers each and runs [smoltcp](https://github.com/smoltcp-rs/smoltcp) for ARP, IPv4,
-  ICMP, TCP, UDP and the DHCP client. It serves the Linux server instances' sockets over the
+  ICMP, TCP, UDP and the DHCP client (0.14, vendored in `third_party/smoltcp` with a few
+  patches: connection buffers that grow, the window scale for the largest of them, a timeout
+  told from a reset). It serves the Linux server instances' sockets over the
   channels they offer it (one per instance, `servers/netd/src/service.rs`, the protocol
   `crates/netring`): each round it takes their requests, polls the card and the stack, moves
   the sockets' bytes between smoltcp and the instances' rings, and publishes what changed in

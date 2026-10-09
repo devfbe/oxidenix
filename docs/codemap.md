@@ -76,8 +76,6 @@ module comment, and the public types it defines. Where to start for common tasks
 - `servers/linux/src/disktest.rs` (530) `TEST_DISKRING`: the client's side of the file protocol (`fsring`) against diskfs, as the page cache will use it in step 4: a channel to diskfs, grants of memory objects, files on /data read and written by DMA into...
 - `servers/linux/src/eventfd.rs` (101) eventfd (phase R6b): a counter that reads take and writes add to, a file of the server with a placeholder in the kernel's descriptor table. Types: `EventFd`.
 - `servers/linux/src/files.rs` (573) The server's files (phase R6): objects the server implements, each named in the kernel's descriptor table by a placeholder (see `restricted::SYS_KFD_INSTALL`). Types: `File`, `Mapping`.
-- `servers/linux/src/files.rs` (573) The server's files (phase R6): objects the server implements, each named in the kernel's descriptor table by a placeholder (see `restricted::SYS_KFD_INSTALL`). Types: `File`, `Mapping`.
-- `servers/linux/src/files.rs` (573) The server's files (phase R6): objects the server implements, each named in the kernel's descriptor table by a placeholder (see `restricted::SYS_KFD_INSTALL`). Types: `File`, `Mapping`.
 - `servers/linux/src/fsclient.rs` (117) The server's end of the file protocol (`fsring`, docs/design/io-rings.md) to diskfs: one channel for the instance, shared by every thread of the tree's processes and by the pager thread. Types: `Client`, `Scratch`.
 - `servers/linux/src/heap.rs` (67) The server's heap: one allocator for every thread of the instance, in the shared region, growing by `SYS_SHARED_MAP` when it runs out. Types: `ServerHeap`.
 - `servers/linux/src/ids.rs` (23) Supplementary groups: getgroups and setgroups.
@@ -85,8 +83,6 @@ module comment, and the public types it defines. Where to start for common tasks
 - `servers/linux/src/inetcalls.rs` (492) The system calls of internet sockets (phase R7b): socket(2) for the AF_INET family, and every call on a descriptor of one of the server's internet sockets: addresses (`sockaddr_in`), message headers, flags, options,...
 - `servers/linux/src/initramfs.rs` (65) The instance's root tmpfs from the boot image's initramfs (phase R6c.2c): the server reads the archive's headers and names from the kernel's image object (`SYS_INITRAMFS`) and makes each regular file a file object...
 - `servers/linux/src/inotify.rs` (413) inotify(7): watches on the files of the server's filesystems (tmpfs and /data) and the queue of their events, a file of the server with a placeholder in the kernel's descriptor table, as eventfd. Types: `Key`, `Inotify`.
-- `servers/linux/src/main.rs` (339) The Linux server (docs/design/linux-server.md).
-- `servers/linux/src/main.rs` (339) The Linux server (docs/design/linux-server.md).
 - `servers/linux/src/main.rs` (339) The Linux server (docs/design/linux-server.md).
 - `servers/linux/src/mm.rs` (157) Memory system calls (phase R4): Linux's semantics of mmap, munmap, mprotect, mremap, madvise, msync and the mlock family, over the kernel's mapping calls.
 - `servers/linux/src/namespace.rs` (287) The server's namespace (phase R6c.2): mounts and path resolution. Types: `KInode`, `Node`, `Resolved`.
@@ -139,8 +135,6 @@ module comment, and the public types it defines. Where to start for common tasks
 - `crates/netring/tests/protocol.rs` (397) The socket protocol's encodings and its shared memory: every request survives encode and decode, malformed descriptors are refused with the right errno (unknown operations, stray fields, areas, endpoints and sockets...
 - `crates/oxrt/src/lib.rs` (290) Minimal runtime for oxidenix servers: entry point, raw system calls (Linux ABI plus the oxidenix IPC calls), a heap, printing and port I/O. Types: `Event`, `Stdout`.
 - `crates/procproto/src/lib.rs` (78) The kernel's native process and system information (syscall 1005, `proc_query`), from which the procfs server builds Linux's /proc. Types: `CpuTimes`, `System`, `Counters`, `Process`.
-- `crates/restricted/src/lib.rs` (199) The interface between the kernel and the Linux server for restricted mode (docs/design/linux-server.md): the layout of the server's shared region, the per-thread register block, and the kernel calls the server makes... Types: `State`, `Event`, `Walk`.
-- `crates/restricted/src/lib.rs` (199) The interface between the kernel and the Linux server for restricted mode (docs/design/linux-server.md): the layout of the server's shared region, the per-thread register block, and the kernel calls the server makes... Types: `State`, `Event`, `Walk`.
 - `crates/restricted/src/lib.rs` (199) The interface between the kernel and the Linux server for restricted mode (docs/design/linux-server.md): the layout of the server's shared region, the per-thread register block, and the kernel calls the server makes... Types: `State`, `Event`, `Walk`.
 - `crates/ring/src/channel.rs` (151) A channel: the memory object both ends of a data-plane connection map (docs/design/io-rings.md). Types: `Layout`, `Header`, `Offer`.
 - `crates/ring/src/lib.rs` (205) Single-producer single-consumer rings of fixed-size descriptors in shared memory: the data plane between the Linux server and the device servers (docs/design/io-rings.md, ADR 0005). Types: `Desc`, `Completion`, `RingMemory`, `Wait`, `Ring`, `Producer`, `Consumer`.
@@ -327,8 +321,6 @@ kernel that handle them.
 - `docs/decisions/0008-socket-state-in-the-channel.md` ADR 0008: Internet sockets: shared control blocks, byte rings, answers at once
 - `docs/design/io-rings.md` I/O rings: the data plane between the Linux server and the device servers
 - `docs/design/iommu.md` DMA isolation with an IOMMU
-- `docs/design/linux-server.md` The Linux server: system calls in restricted mode
-- `docs/design/linux-server.md` The Linux server: system calls in restricted mode
 - `docs/design/linux-server.md` The Linux server: system calls in restricted mode
 - `docs/design/page-cache.md` Page cache and file-backed mappings
 - `docs/design/smp.md` Symmetric multiprocessing in oxidenix

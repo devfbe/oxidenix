@@ -80,6 +80,10 @@ jobs:
         if: matrix.firmware == 'uefi'
         run: cargo test -p ldisc
 
+      - name: Test netd's patched smoltcp on the host
+        if: matrix.firmware == 'uefi'
+        run: cargo test --manifest-path third_party/smoltcp/Cargo.toml --lib
+
       - name: Boot oxidenix and run the self-tests
         working-directory: kernel
         shell: bash
