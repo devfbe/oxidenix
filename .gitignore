@@ -3,3 +3,4 @@ target/
 disk.img
 .claude/worktrees/
 .direnv/
+.claude/scheduled_tasks.lock
