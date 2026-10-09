@@ -50,6 +50,7 @@
 #define TEST_CACHED 1516
 #define TEST_PASS_THROUGH 1517
 #define TEST_SERVER_TICKS 1518
+#define TEST_MKWRITE_FAIL 1519
 
 static int failures;
 
@@ -252,12 +253,39 @@ int main(int argc, char **argv) {
     waitpid(child, &st, 0);
     alarm(0);
     check("SIGKILL ends a thread waiting for a page", WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL);
+    /* A page whose pager let go of the object (its last handle, as for a
+     * /data file whose inode the server dropped): no answer can come, so
+     * the wait ends (SIGBUS) rather than sleeping on. */
+    int mapped[2];
+    pipe(mapped);
+    child = fork();
+    if (child == 0) {
+        char *stuck = (char *)0x221000000000;
+        if (syscall(TEST_PAGED_STUCK, stuck) != 0) _exit(1);
+        write(mapped[1], "m", 1);
+        (void)*(volatile char *)stuck;
+        _exit(2);
+    }
+    char m = 0;
+    close(mapped[1]);
+    read(mapped[0], &m, 1);
+    close(mapped[0]);
+    // (Waiting by now, or soon: a fault after the drop fails too.)
+    usleep(100 * 1000);
+    long dropped = m == 'm' ? syscall(TEST_PAGED_STUCK, 0) : -1;
+    alarm(5);
+    st = 0;
+    waitpid(child, &st, 0);
+    alarm(0);
+    check("a page of an object its pager let go of raises SIGBUS", dropped == 0 && WIFSIGNALED(st) && WTERMSIG(st) == SIGBUS);
 
     /* A page the pager fails: SIGBUS, and a later access asks again. The
      * first request of every such object fails, not only the instance's
      * first (a second object here, as a second lxtest run in one shell),
      * and each request is the object's own: both exist before the first
-     * is touched. */
+     * is touched. The failure reaches the access that asked however soon
+     * it comes: the faulting thread waits for the page from before its
+     * request (it was lost if it came before the wait began). */
     check("the server maps a paged object it fails once", syscall(TEST_PAGED_FAIL, (char *)0x230000000000) == 0);
     check("a second such object", syscall(TEST_PAGED_FAIL, (char *)0x231000000000) == 0);
     for (int round = 0; round < 2; round++) {
@@ -272,6 +300,41 @@ int main(int argc, char **argv) {
         alarm(0);
         check(round ? "the second object's page fails too: SIGBUS" : "a page the pager fails raises SIGBUS", WIFSIGNALED(st) && WTERMSIG(st) == SIGBUS);
         check(round ? "... and a later access gets it" : "... and a later access asks again and gets it", memcmp(fl, "retry", 5) == 0);
+    }
+    /* A store the pager cannot back (as on a full disk): SIGBUS for the
+     * store that asked, however soon the answer comes (the store waits
+     * from before it asks), and a later store asks again and goes
+     * through. The page is read in first, so the store asks only for its
+     * backing. */
+    {
+        const char *path = "/data/lxtest.mkwrite";
+        int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+        struct stat fst;
+        volatile char *mw = MAP_FAILED;
+        if (fd >= 0 && ftruncate(fd, PG) == 0 && fstat(fd, &fst) == 0)
+            mw = mmap(NULL, PG, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        int ready = mw != MAP_FAILED && mw[0] == 0 && syscall(TEST_MKWRITE_FAIL, (long)fst.st_ino) == 0;
+        int bus = 0, later = 0;
+        for (int round = 0; ready && round < 2; round++) {
+            child = fork();
+            if (child == 0) {
+                mw[0] = round ? 'y' : 'x';
+                _exit(0);
+            }
+            alarm(5);
+            waitpid(child, &st, 0);
+            alarm(0);
+            if (round == 0) bus = WIFSIGNALED(st) && WTERMSIG(st) == SIGBUS;
+            else later = WIFEXITED(st) && WEXITSTATUS(st) == 0 && mw[0] == 'y';
+        }
+        check("a store the pager cannot back raises SIGBUS", ready && bus);
+        check("... and a later store asks again and goes through", ready && later);
+        /* (Never left armed for a later file, should the store not have
+         * asked.) */
+        syscall(TEST_MKWRITE_FAIL, 0L);
+        if (mw != MAP_FAILED) munmap((void *)mw, PG);
+        if (fd >= 0) close(fd);
+        unlink(path);
     }
     /* The server's runtime: its heap, and its mutex across the threads of
      * the tree's processes (they all run the same server instance). */

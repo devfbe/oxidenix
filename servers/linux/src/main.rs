@@ -81,6 +81,22 @@ const SYS_IO_URING_SETUP: u64 = 425;
 const SYS_IO_URING_ENTER: u64 = 426;
 const SYS_IO_URING_REGISTER: u64 = 427;
 
+/// Whether the kernel runs the self-tests (`SYS_TEST_MODE`), asked once:
+/// 0 not yet known, 1 no, 2 yes.
+static TEST_MODE: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Whether the test hooks (`TEST_*`) answer: in test mode only.
+fn test_mode() -> bool {
+    match TEST_MODE.load(Ordering::Relaxed) {
+        0 => {
+            let on = syscall(SYS_TEST_MODE, [0; 6]) == 1;
+            TEST_MODE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+        known => known == 2,
+    }
+}
+
 pub(crate) fn syscall(nr: u64, a: [u64; 6]) -> i64 {
     let ret: i64;
     unsafe {
@@ -213,7 +229,12 @@ fn dispatch(s: &mut State) -> i64 {
         return result;
     }
     match s.rax {
+        // The test hooks reach beyond the caller (the instance's test
+        // objects, the test service, /data files, the server's heap and
+        // locks): only for the self-tests.
+        TEST_MAP..=TEST_MKWRITE_FAIL if !test_mode() => -ENOSYS,
         TEST_MAP..=TEST_CACHED => test(s.rax, s.rdi),
+        TEST_MKWRITE_FAIL => datafs::fail_next_mkwrite(s.rdi),
         // The kernel's to answer, with the name in the server's memory.
         TEST_SERVER_TICKS => match usercopy::read_cstr(s.rdi) {
             Ok(name) => syscall(TEST_SERVER_TICKS, [name.as_ptr() as u64, name.len() as u64, 0, 0, 0, 0]),
@@ -256,6 +277,8 @@ static TEST_OBJECT: AtomicU64 = AtomicU64::new(0);
 /// The paged object of TEST_PAGED, and how many pages the pager supplied.
 static TEST_PAGED_OBJECT: AtomicU64 = AtomicU64::new(0);
 static SUPPLIED: AtomicU64 = AtomicU64::new(0);
+/// TEST_PAGED_STUCK's object (its handle, the latest run's).
+static TEST_STUCK_OBJECT: AtomicU64 = AtomicU64::new(0);
 /// The key the test's paged object goes by; +1: never answered.
 const TEST_KEY: u64 = 0x7e57;
 /// The keys of TEST_PAGED_FAIL's objects, one of its own each, from here
@@ -491,6 +514,13 @@ fn test(nr: u64, addr: u64) -> i64 {
             }
             *COUNTER.lock() as i64
         }
+        TEST_PAGED_STUCK if addr == 0 => {
+            // Let go of: the kernel ends the waits for its page.
+            match TEST_STUCK_OBJECT.swap(0, Ordering::Relaxed) {
+                0 => -namespace::ENOENT,
+                h => syscall(SYS_HANDLE_CLOSE, [h, 0, 0, 0, 0, 0]),
+            }
+        }
         TEST_PAGED_STUCK => {
             // A key the pager does not answer.
             let h = syscall(SYS_MO_CREATE_PAGED, [1, TEST_KEY + 1, 0, 0, 0, 0]);
@@ -498,7 +528,12 @@ fn test(nr: u64, addr: u64) -> i64 {
                 return h;
             }
             let r = syscall(SYS_MO_MAP, [h as u64, addr, PAGE, 0, PROT_READ, MO_SHARED | MO_FIXED]);
-            syscall(SYS_HANDLE_CLOSE, [h as u64, 0, 0, 0, 0, 0]);
+            // Kept (the previous run's goes): at its last handle the
+            // kernel would end the waits for it (no answer could come).
+            let old = TEST_STUCK_OBJECT.swap(h as u64, Ordering::Relaxed);
+            if old != 0 {
+                syscall(SYS_HANDLE_CLOSE, [old, 0, 0, 0, 0, 0]);
+            }
             if r < 0 { r } else { 0 }
         }
         _ => -ENOSYS,

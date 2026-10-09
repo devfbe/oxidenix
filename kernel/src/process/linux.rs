@@ -210,9 +210,10 @@ struct RegionMap {
 const MAX_CHANNELS: usize = 64;
 
 /// Events for the instance's service thread (the pager thread): pages
-/// wanted from it, records and holds released, write-back. A page
-/// request is queued once until the pager takes it; after that, a thread
-/// that still waits (the page did not come, or failed) asks again.
+/// wanted from it, holds released, write-back. A page request is queued
+/// once until the pager takes it; a thread that still waits asks again only
+/// once its request was answered or overtaken (the page came and went, or
+/// was cut off: `PageWait`).
 struct PagerQueue {
     requests: alloc::collections::VecDeque<Event>,
     queued: alloc::collections::BTreeSet<(u64, u64)>,
@@ -766,6 +767,9 @@ impl Instance {
         }
         let handle = h.next;
         h.next += 1;
+        if let Object::Memory(cache) | Object::File(cache, _) = &object {
+            cache.handle_opened();
+        }
         h.objects.insert(handle, object);
         Ok(handle)
     }
@@ -1211,6 +1215,11 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
     match nr {
         SYS_HANDLE_CLOSE => {
             let object = instance.handles.lock().objects.remove(&a[0]).ok_or(EBADF)?;
+            // At a paged or cached object's last handle the server can no
+            // longer answer for it (`PageCache::orphan`).
+            if let Object::Memory(cache) | Object::File(cache, _) = &object {
+                cache.handle_closed();
+            }
             // Released outside the lock. A channel's end goes now, unless a
             // call of another thread still uses it (then with that call).
             if let Object::Channel(end) = object {
@@ -1708,6 +1717,7 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             let (user, system) = group.info.lock().cputime();
             Ok(((user + system) / 1_000_000) as i64)
         }
+        SYS_TEST_MODE => Ok(crate::TEST_MODE.load(core::sync::atomic::Ordering::Relaxed) as i64),
         SYS_SERVER_LOG => {
             let len = a[1].min(SERVER_LOG_MAX);
             let mut text = [0u8; SERVER_LOG_MAX as usize];
