@@ -83,7 +83,7 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 /// a long call that does not wait returns what it did so far, or EINTR (restarted as
 /// Linux's ERESTARTSYS) if nothing yet.
 pub fn signal_pending() -> bool {
-    syscall(SYS_SIGNAL_STATE, [0; 6]) as u64 & SIGNAL_PENDING != 0
+    crate::signal::pending()
 }
 
 pub fn new_id() -> u64 {

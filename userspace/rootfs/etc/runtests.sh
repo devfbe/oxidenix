@@ -78,8 +78,12 @@ if [ $? -eq 143 ]; then echo "PASS timeout stops a command"; else fail "timeout"
 echo "=== uname"
 if [ "$(uname -s)" = oxidenix ]; then echo "PASS uname names the system oxidenix"; else fail "uname -s: $(uname -s)"; fi
 
-echo "=== server protection"
-if kill -9 1 2>/dev/null; then fail "a server could be killed from user space"; else echo "PASS servers are protected"; fi
+echo "=== pid 1"
+# The servers have no pid in a tree's namespace (no program can signal them); the tree's
+# pid 1 (this script) takes no signal it has no handler for from inside the tree, as a pid
+# namespace's init on Linux.
+kill -9 1
+echo "PASS pid 1 survives SIGKILL from its own tree"
 
 # The restart policy (ADR 0006) on the test service (ringtest), dying at
 # every use.

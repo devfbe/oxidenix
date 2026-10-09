@@ -48,7 +48,6 @@ const EPROTONOSUPPORT: i64 = 93;
 const ESOCKTNOSUPPORT: i64 = 94;
 const ESRCH: i64 = 3;
 
-const SIGPIPE: u64 = 13;
 
 const SOCK_TYPE_MASK: u64 = 0xf;
 const SOCK_RAW: u32 = 3;
@@ -442,7 +441,7 @@ fn parse_control(control: u64, len: u64) -> Result<(Vec<Passed>, Cred), i64> {
                     // claimed, but the process must exist in this tree
                     // (another tree's are none of its business).
                     if given.pid != cred.pid
-                        && (given.pid == 0 || syscall(SYS_THREAD_EXISTS, [given.pid as u64, THREAD_IN_INSTANCE, 0, 0, 0, 0]) < 0)
+                        && (given.pid == 0 || !crate::process::exists(given.pid))
                     {
                         return Err(ESRCH);
                     }
@@ -476,7 +475,7 @@ fn send_common(sock: &Arc<Sock>, fflags: u32, name: Option<Vec<u8>>, src: &mut S
     let (fds, cred) = parse_control(control.0, control.1)?;
     let r = sock.send(src, to, fds, cred, nonblock);
     if r == Err(EPIPE) && sock.ty == STREAM && flags & MSG_NOSIGNAL == 0 {
-        syscall(SYS_SIGNAL_THREAD, [SIGPIPE, 0, 0, 0, 0, 0]);
+        crate::signal::raise_thread(crate::signal::SIGPIPE);
     }
     r
 }

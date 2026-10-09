@@ -141,8 +141,10 @@ static void nice_values(void) {
     errno = 0;
     check("an unknown `which` is EINVAL", getpriority(7, 0) == -1 && errno == EINVAL);
     errno = 0;
-    check("a process outside the tree (diskfs, pid 1) is ESRCH", setpriority(PRIO_PROCESS, 1, 19) == -1 && errno == ESRCH &&
-                                                                   getpriority(PRIO_PROCESS, 1) == -1 && errno == ESRCH);
+    /* The tree's pids are its own namespace (the servers have none in it): a pid it never
+     * handed out is no one. */
+    check("a pid outside the tree's namespace is ESRCH", setpriority(PRIO_PROCESS, 32767, 19) == -1 && errno == ESRCH &&
+                                                           getpriority(PRIO_PROCESS, 32767) == -1 && errno == ESRCH);
     errno = 0;
     check("another user has no processes (ESRCH)", getpriority(PRIO_USER, 1000) == -1 && errno == ESRCH);
 

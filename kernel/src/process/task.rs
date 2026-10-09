@@ -168,6 +168,14 @@ pub struct ThreadGroup {
     /// `/proc/counters`, which `/proc/<pid>/counters` shows, so that a
     /// program can count its own calls whatever else runs.
     pub legacy_calls: AtomicU64,
+    /// A process the Linux server made (`SYS_PROC_CREATE`): the server
+    /// reaps it, so it leaves the kernel's tables when its last thread
+    /// ends (no zombie of the kernel's).
+    pub server_reaps: AtomicBool,
+    /// The wait status of a Linux program's process the kernel killed (out
+    /// of memory, the monitor's `kill`, a failed server), else 0: the
+    /// server reports it (`ProcInfo::killed`).
+    pub killed_by_kernel: AtomicU64,
 }
 
 impl ThreadGroup {
@@ -182,6 +190,8 @@ impl ThreadGroup {
             alarm_cpus: AtomicU64::new(0),
             instance: AtomicU64::new(0),
             legacy_calls: AtomicU64::new(0),
+            server_reaps: AtomicBool::new(false),
+            killed_by_kernel: AtomicU64::new(0),
         })
         .ok()
     }
@@ -299,34 +309,15 @@ impl Files {
     }
 }
 
-/// Working directory, shared by the tasks cloned with CLONE_FS.
+/// Working directory, shared by the tasks cloned with CLONE_FS (the
+/// kernel's native servers; a Linux program's is its server's).
 pub struct FsInfo {
     cwd: IrqSpinLock<String>,
-    /// The Linux server's record for this context (`restricted::SYS_FS_RECORD`).
-    record: IrqSpinLock<Option<super::linux::Record>>,
 }
 
 impl FsInfo {
     pub fn new(cwd: String) -> Option<Arc<FsInfo>> {
-        Arc::try_new(FsInfo { cwd: IrqSpinLock::new(cwd), record: IrqSpinLock::new(None) }).ok()
-    }
-
-    pub fn record_word(&self) -> u64 {
-        self.record.lock().as_ref().map_or(0, |r| r.word())
-    }
-
-    /// Gives a new context the server's record (at its creation, or once
-    /// for a context the kernel made without one). Never replaces one: the
-    /// server's threads use their context's record without holding a
-    /// reference of their own (see `restricted::SYS_FS_RECORD`). Returns the
-    /// record back if the context has one (to be dropped without the lock).
-    pub fn set_record(&self, record: super::linux::Record) -> Result<(), super::linux::Record> {
-        let mut slot = self.record.lock();
-        if slot.is_some() {
-            return Err(record);
-        }
-        *slot = Some(record);
-        Ok(())
+        Arc::try_new(FsInfo { cwd: IrqSpinLock::new(cwd) }).ok()
     }
 
     pub fn cwd(&self) -> String {
@@ -421,8 +412,18 @@ pub struct Task {
     run_since: AtomicU64,
     /// Thread name (comm), at most 15 bytes.
     pub comm: IrqSpinLock<String>,
-    /// Its signal mask and the signals sent to this thread.
+    /// Its signal mask and the signals sent to this thread (a task that is
+    /// no Linux program's: the signals of Linux programs are their
+    /// server's, which drives them with the two flags below).
     pub sig: IrqSpinLock<ThreadSignals>,
+    /// A Linux program's thread was kicked (`restricted::SYS_THREAD_KICK`,
+    /// Linux's TIF_SIGPENDING): its interruptible waits end, its program
+    /// stops at once; cleared only by `restricted_enter`.
+    pub kicked: AtomicBool,
+    /// A Linux program's thread was killed (`SYS_THREAD_KILL`, or its
+    /// process by the kernel): every wait ends, and it exits at its next
+    /// `restricted_enter`.
+    pub killed: AtomicBool,
     /// Saved kernel stack pointer while switched out.
     pub kernel_rsp: UnsafeCell<u64>,
     /// None for tasks running on a stack they did not allocate (the
@@ -464,6 +465,8 @@ impl Task {
             run_since: AtomicU64::new(0),
             comm: IrqSpinLock::new(comm),
             sig: IrqSpinLock::new(ThreadSignals::default()),
+            kicked: AtomicBool::new(false),
+            killed: AtomicBool::new(false),
             kernel_rsp: UnsafeCell::new(kernel_rsp),
             kstack,
             own: UnsafeCell::new(own),

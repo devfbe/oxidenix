@@ -30,13 +30,11 @@
 use crate::files;
 use crate::netclient::{self, Net, Rings};
 use crate::sync::Mutex;
-use crate::syscall;
 use crate::unix::{Sink, Source};
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use netring::{fill, pieces, state, Ctl, Endpoint, Kind, Record, Request, RECORD_HEADER};
-use restricted::*;
 
 pub const EIO: i64 = 5;
 pub const EAGAIN: i64 = 11;
@@ -998,8 +996,7 @@ fn read_ring(r: &Rings, pos: u32, out: &mut [u8]) {
 /// Raises SIGPIPE for the calling thread (a write to a connection that
 /// cannot send, without MSG_NOSIGNAL).
 pub fn sigpipe() {
-    const SIGPIPE: u64 = 13;
-    syscall(SYS_SIGNAL_THREAD, [SIGPIPE, 0, 0, 0, 0, 0]);
+    crate::signal::raise_thread(crate::signal::SIGPIPE);
 }
 
 pub const ECONNREFUSED: i64 = 111;

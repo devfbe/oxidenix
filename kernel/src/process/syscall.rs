@@ -165,11 +165,10 @@ extern "sysv64" fn dispatch(f: &mut Frame) {
         Some(false) => {
             let result = match f.rax {
                 restricted::SYS_RESTRICTED_ENTER => match super::linux::enter(f) {
-                    // `f` is the program's now; a call the server handled
-                    // itself is restarted after a signal as the kernel's would be.
-                    Ok(handled) => {
+                    // `f` is the program's now (or the server's with
+                    // `REASON_KICK`): signals are the server's.
+                    Ok(()) => {
                         super::sched::resched_on_return();
-                        signal::deliver(f, handled);
                         return;
                     }
                     Err(e) => Err(e),
@@ -371,7 +370,10 @@ pub(super) fn dispatch_linux(f: &mut Frame) {
     };
     f.rax = result.unwrap_or_else(|e| -e) as u64;
     super::sched::resched_on_return();
-    super::signal::deliver(f, Some(nr));
+    // A Linux program's call passed through: its server delivers signals.
+    if super::linux::mode().is_none() {
+        super::signal::deliver(f, Some(nr));
+    }
 }
 
 /// reboot(2): power off (QEMU exits) or restart the machine.

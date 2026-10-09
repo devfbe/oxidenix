@@ -5,14 +5,15 @@
 //! startup); within it a thread's nice value weighs its share of the CPU,
 //! as on Linux (the kernel's fair scheduler).
 //!
-//! Until the process model is the server's (R8) the thread ids are the
-//! kernel's: the kernel says whether one exists (`SYS_THREAD_EXISTS`) and
-//! keeps the nice values (`SYS_THREAD_NICE`), for the threads of this
-//! process tree only (others are ESRCH, as if in another PID namespace).
-//! Lowering a nice value is allowed: the one user is root, with
-//! CAP_SYS_NICE, and RLIMIT_NICE has no limit.
+//! The thread ids are the instance's (`process`); the kernel keeps each
+//! thread's nice value (`SYS_THREAD_NICE`, by key), and the server picks
+//! the threads a call names: one, a process group's, or every one of the
+//! instance (one user). Lowering a nice value is allowed: the one user is
+//! root, with CAP_SYS_NICE, and RLIMIT_NICE has no limit.
 
+use crate::process::{self, Pid};
 use crate::syscall;
+use alloc::vec::Vec;
 use restricted::*;
 
 const EINVAL: i64 = 22;
@@ -46,23 +47,30 @@ fn priority(which: u64, who: u64, set: Option<i64>) -> Result<i64, i64> {
     const PRIO_PROCESS: u64 = 0;
     const PRIO_PGRP: u64 = 1;
     const PRIO_USER: u64 = 2;
-    let who = who as u32 as u64;
-    let (scope, id) = match which {
-        PRIO_PROCESS => (NICE_THREAD, who),
-        PRIO_PGRP => (NICE_PGROUP, who),
-        PRIO_USER if who == 0 => (NICE_ALL, 0),
+    let who = who as u32;
+    let keys: Vec<u64> = match which {
+        PRIO_PROCESS => alloc::vec![process::key_of(who as Pid).ok_or(ESRCH)?],
+        PRIO_PGRP => {
+            let pgid = if who == 0 { process::ids_of(0).map_or(0, |ids| ids.1) } else { who };
+            process::keys_where(|p| p.pgid == pgid)
+        }
+        PRIO_USER if who == 0 => process::keys_where(|_| true),
         PRIO_USER => return Err(ESRCH),
         _ => return Err(EINVAL),
     };
-    let (setting, nice) = match set {
-        Some(n) => (1, n.clamp(-20, 19) as u64),
-        None => (0, 0),
-    };
-    let lowest = syscall(SYS_THREAD_NICE, [scope, id, setting, nice, 0, 0]);
-    if lowest < 0 {
-        return Err(-lowest);
+    // (nice + 20 of the most favored thread, before a change.)
+    let mut lowest: Option<i64> = None;
+    for key in keys {
+        let (setting, nice) = match set {
+            Some(n) => (1, n.clamp(-20, 19) as u64),
+            None => (0, 0),
+        };
+        let r = syscall(SYS_THREAD_NICE, [key, setting, nice, 0, 0, 0]);
+        if r >= 0 {
+            lowest = Some(lowest.map_or(r, |l| l.min(r)));
+        }
     }
-    // (lowest is nice + 20.)
+    let lowest = lowest.ok_or(ESRCH)?;
     Ok(40 - lowest)
 }
 
@@ -86,8 +94,5 @@ fn target(tid: u64) -> Result<(), i64> {
     if tid == 0 {
         return Ok(());
     }
-    match syscall(SYS_THREAD_EXISTS, [tid as u64, 0, 0, 0, 0, 0]) {
-        0 => Ok(()),
-        _ => Err(ESRCH),
-    }
+    process::key_of(tid as Pid).map(|_| ()).ok_or(ESRCH)
 }

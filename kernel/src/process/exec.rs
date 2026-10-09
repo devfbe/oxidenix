@@ -1,4 +1,5 @@
-//! execve(2): replaces the program of the calling process.
+//! execve(2) of the kernel's native servers: replaces the program of the calling process (a
+//! Linux program's execve is its server's since R8, with the loader in the server).
 //!
 //! In a process with several threads the other threads end first (as on
 //! Linux): the calling thread marks the process, sends them SIGKILL and
@@ -12,7 +13,7 @@ use super::sched::{current, prepare_to_wait, TABLE};
 use super::signal::{self, GroupExit};
 use super::syscall::Frame;
 use super::task;
-use super::{absolute, basename, clone, cmdline_of, load_inode, load_path, tlb, with_current, FdEntry, Pid};
+use super::{absolute, basename, clone, cmdline_of, load_path, tlb, with_current, FdEntry, Pid};
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
@@ -71,27 +72,14 @@ fn de_thread() -> Result<(), i64> {
 }
 
 pub fn exec(frame: &mut Frame, path: &str, args: &[String], envs: &[String]) -> Result<(), i64> {
-    // A Linux program's path was resolved by its server.
-    let target = with_current(|p| p.linux.as_mut().and_then(|l| l.exec_target.take()));
-    let (image, exe) = match target {
-        Some((super::linux::ExecTarget::Inode(inode), abs)) => (load_inode(inode, args, envs)?, abs),
-        // A file of the server's: the hold keeps it unwritten (the server's
-        // ETXTBSY) while the program runs.
-        Some((super::linux::ExecTarget::File(cache, hold), abs)) => {
-            let hold: Option<super::address_space::Hold> = hold.map(|h| h as _);
-            (super::loader::load(&cache, None, hold, args, envs)?, abs)
-        }
-        None => {
-            let cwd = with_current(|p| p.cwd());
-            (load_path(&cwd, path, args, envs)?, absolute(&cwd, path))
-        }
-    };
-    let mut space = image.space;
-    // The new program stays in the process's Linux server instance.
-    if let Some(instance) = with_current(|p| p.mm.as_ref().and_then(|m| m.lock().instance().cloned())) {
-        space.attach(instance, true).map_err(|_| ENOMEM)?;
+    // A Linux program's execve is its server's (the loader in the server,
+    // `linux`'s `SYS_EXEC_SPACE`).
+    if super::linux::mode().is_some() {
+        return Err(ENOSYS);
     }
-    let mm = Mm::new(space).ok_or(ENOMEM)?;
+    let cwd = with_current(|p| p.cwd());
+    let (image, exe) = (load_path(&cwd, path, args, envs)?, absolute(&cwd, path));
+    let mm = Mm::new(image.space).ok_or(ENOMEM)?;
     // The point of no return: from here on the old program is gone.
     de_thread()?;
     let me = current();
@@ -120,9 +108,7 @@ pub fn exec(frame: &mut Frame, path: &str, args: &[String], envs: &[String]) -> 
     // A new program gets no inherited hardware access.
     me.group.privileged.store(false, Ordering::Relaxed);
     let (closed, old_mm, old_files, was_server) = with_current(|p| {
-        // A Linux thread runs this in a legacy call, in the program's view.
-        let server = p.linux.as_ref().is_some_and(|l| l.normal_view());
-        tlb::switch(p.mm.as_ref().map(|m| &*m.tlb), Some(&mm.tlb), server);
+        tlb::switch(p.mm.as_ref().map(|m| &*m.tlb), Some(&mm.tlb), false);
         let old_mm = p.mm.replace(mm);
         let old_files = match files {
             Some(f) => p.files.replace(f),

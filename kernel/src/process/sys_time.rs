@@ -85,6 +85,17 @@ fn process_cputime(pid: Pid) -> Result<(u64, u64), i64> {
     Ok(info.cputime())
 }
 
+/// `read_clock` for the Linux server (`restricted::SYS_CLOCK_READ`): the
+/// caller's own CPU clocks only (a pid in a clock id is the server's, which
+/// asks `proc_info` and `thread_info` for another's).
+pub fn read_own_clock(id: u64) -> Result<u64, i64> {
+    let signed = id as i32 as i64;
+    if signed < 0 && !(signed >> 3) != 0 {
+        return Err(EINVAL);
+    }
+    read_clock(id)
+}
+
 pub fn read_clock(id: u64) -> Result<u64, i64> {
     Ok(match clock(id)? {
         Clock::Monotonic => time::now(),

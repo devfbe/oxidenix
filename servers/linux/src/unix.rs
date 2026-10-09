@@ -120,9 +120,8 @@ pub struct Cred {
 impl Cred {
     /// The calling thread's.
     pub fn current() -> Cred {
-        let mut ids = [0u64; 4];
-        syscall(SYS_THREAD_IDS, [ids.as_mut_ptr() as u64, 0, 0, 0, 0, 0]);
-        Cred { pid: ids[0] as u32, uid: ids[2] as u32, gid: ids[3] as u32 }
+        // Everyone is root (uid and gid 0).
+        Cred { pid: crate::local::pid(), uid: 0, gid: 0 }
     }
 
     /// None known (an unconnected socket's peer): Linux's pid 0 and the

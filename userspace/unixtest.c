@@ -779,7 +779,8 @@ static void ancillary_edges(void) {
     close(q[0]);
     close(q[1]);
 
-    struct ucred other = {1, 0, 0};
+    /* A pid the tree's namespace never handed out (its pid 1 is its own init). */
+    struct ucred other = {32767, 0, 0};
     char byte = 'c';
     struct iovec iov = {&byte, 1};
     char out[CMSG_SPACE(sizeof other)];

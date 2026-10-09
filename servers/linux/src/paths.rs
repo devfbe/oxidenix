@@ -47,7 +47,6 @@ const SYS_OPEN: u64 = 2;
 const SYS_STAT: u64 = 4;
 const SYS_LSTAT: u64 = 6;
 const SYS_ACCESS: u64 = 21;
-const SYS_EXECVE: u64 = 59;
 const SYS_TRUNCATE: u64 = 76;
 const SYS_GETCWD: u64 = 79;
 const SYS_CHDIR: u64 = 80;
@@ -85,8 +84,9 @@ const SYS_FACCESSAT2: u64 = 439;
 
 const CWD: u64 = AT_FDCWD as i64 as u64;
 
-/// The result of a path call in `s`, or None to pass it through (execve
-/// once its program is resolved, and the calls on a descriptor alone).
+/// The result of a path call in `s`, or None to pass it through (the calls
+/// on a descriptor alone). execve is `exec`'s, which resolves its program here
+/// (`exec_open`).
 pub fn handle(s: &State) -> Option<i64> {
     let (a0, a1, a2, a3) = (s.rdi, s.rsi, s.rdx, s.r10);
     let result = match s.rax {
@@ -103,11 +103,6 @@ pub fn handle(s: &State) -> Option<i64> {
         }
         SYS_ACCESS => at(CWD, a0, true).map(|_| 0),
         SYS_FACCESSAT | SYS_FACCESSAT2 => at(a0, a1, true).map(|_| 0),
-        SYS_EXECVE => match exec_target(a0) {
-            // Passes through with its program resolved.
-            Ok(()) => return None,
-            Err(e) => Err(e),
-        },
         SYS_TRUNCATE => at(CWD, a0, true).and_then(|r| {
             truncate(&r.node, a1)?;
             inotify::node_event(&r.node, inotify::IN_MODIFY);
@@ -237,28 +232,40 @@ fn create(dir: &Node, name: &str, kind: u64, perm: u32) -> Result<Node, i64> {
     }
 }
 
-/// The program `execve` runs: resolved here, handed to the kernel's loader
-/// (with the right to run it, for a tmpfs file).
-fn exec_target(addr: u64) -> Result<(), i64> {
-    let r = at(CWD, addr, true)?;
-    let path = join(&r.path);
-    match &r.node {
-        Node::Kernel(k) => {
-            check(syscall(SYS_EXEC_TARGET, [k.handle(), path.as_ptr() as u64, path.len() as u64, 0, 0, 0]))?;
-        }
-        Node::Tmp(_) | Node::Data(_) => {
-            let held = match &r.node {
-                Node::Tmp(t) => tmpfile::exec_hold(t)?,
-                Node::Data(d) => datafile::exec_hold(d)?,
-                Node::Kernel(_) => unreachable!("matched above"),
-            };
-            let set = syscall(SYS_EXEC_TARGET, [held, path.as_ptr() as u64, path.len() as u64, 0, 0, 0]);
-            // The target keeps the hold now (or it goes, if refused).
-            syscall(SYS_HANDLE_CLOSE, [held, 0, 0, 0, 0, 0]);
-            check(set)?;
-        }
+/// The program `path` names (relative to the absolute directory `base`; `follow`: a
+/// symlink as the last name is followed, else ELOOP), opened for execve (`exec`): a handle
+/// on its file object that holds it (nobody may write it while it runs: ETXTBSY), and its
+/// absolute path.
+pub fn exec_open(base: &str, path: &str, follow: bool) -> Result<(u64, String), i64> {
+    let r = resolve(base, path, follow)?;
+    exec_node(&r.node, join(&r.path))
+}
+
+/// The program a descriptor names (execveat with AT_EMPTY_PATH).
+pub fn exec_open_fd(fd: u64) -> Result<(u64, String), i64> {
+    let (node, path) = fd_node(fd)?;
+    exec_node(&node, path)
+}
+
+fn exec_node(node: &Node, path: String) -> Result<(u64, String), i64> {
+    const EACCES: i64 = 13;
+    let mode = mode_of(&node.stat()?);
+    if mode & vfs::S_IFMT == vfs::S_IFLNK {
+        return Err(ELOOP);
     }
-    Ok(())
+    crate::exec::check_mode(mode)?;
+    let held = match node {
+        Node::Tmp(t) => tmpfile::exec_hold(t)?,
+        Node::Data(d) => datafile::exec_hold(d)?,
+        // The kernel's tree (/dev, /proc, /sys) holds no programs.
+        Node::Kernel(_) => return Err(EACCES),
+    };
+    Ok((held, path))
+}
+
+/// The directory a relative path of an *at call (execveat) starts from.
+pub fn base_dir_of(dirfd: u64, path: &str) -> Result<String, i64> {
+    base_dir(dirfd, path)
 }
 
 fn openat(dirfd: u64, addr: u64, flags: u32, mode: u32) -> Result<i64, i64> {

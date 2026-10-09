@@ -1,4 +1,10 @@
-//! POSIX signals for processes with threads, following Linux.
+//! POSIX signals for processes with threads, following Linux, for the
+//! kernel's native servers (until R9). A Linux program's signals are its
+//! server's (phase R8, ADR 0010): the kernel only kicks and kills its
+//! threads (`linux::kick_task`, `linux::kill_task`), and for them the
+//! questions waits ask here (`interrupted`, `dying`, `killed`) are answered
+//! from those two flags; a SIGKILL the kernel sends one (the monitor's
+//! `kill`, out of memory) kills the whole process.
 //!
 //! Handlers, the process's pending set (signals sent to the process) and
 //! the interval timer belong to the thread group; each thread has its own
@@ -139,11 +145,6 @@ pub fn stopped_status(sig: u32) -> i32 {
 }
 
 impl GroupSignals {
-    /// Whether a group stop is under way (or done): what SIGCONT counts as stopped.
-    pub fn stopping(&self) -> bool {
-        self.stopping != 0
-    }
-
     fn ignored(&self, sig: u32) -> bool {
         let handler = self.actions[sig as usize - 1].handler;
         handler == SIG_IGN || (handler == SIG_DFL && default_ignored(sig))
@@ -191,50 +192,18 @@ impl ThreadSignals {
     }
 }
 
-/// Whether the calling process ignores `sig` (`restricted::SIGNAL_IGNORED`)
-/// and whether the calling thread blocks it (`SIGNAL_BLOCKED`): for the Linux
-/// server's terminals, whose background reads and writes depend on it
-/// (SIGTTIN, SIGTTOU), until signals are the server's (R8).
-pub fn state(sig: u32) -> u64 {
-    if sig == 0 {
-        // Whether a signal (or a stop) waits for the calling thread: a long call
-        // returns what it did (Linux's signal_pending).
-        return if interrupted() { restricted::SIGNAL_PENDING } else { 0 };
-    }
-    if sig > NSIG {
-        return 0;
-    }
-    let me = current();
-    let ignored = me.group.sig.lock().actions[sig as usize - 1].handler == SIG_IGN;
-    let blocked = me.sig.lock().mask & bit(sig) != 0;
-    (if ignored { restricted::SIGNAL_IGNORED } else { 0 }) | if blocked { restricted::SIGNAL_BLOCKED } else { 0 }
-}
-
-/// Sends `sig` (from a terminal: no permission checks) to every process of
-/// group `pgid` in Linux server instance `instance`; whether there was one.
-pub fn send_pgrp_in(instance: u64, pgid: Pid, sig: u32) -> bool {
-    let mut targets: Vec<Arc<ThreadGroup>> = Vec::new();
-    {
-        let table = sched::TABLE.lock();
-        for g in table.groups.values() {
-            if g.tgid != 0
-                && !g.privileged.load(Ordering::Relaxed)
-                && g.instance.load(Ordering::Acquire) == instance
-                && g.info.lock().pgid == pgid
-            {
-                targets.push(g.clone());
-            }
-        }
-    }
-    for g in &targets {
-        post(g, None, sig);
-    }
-    !targets.is_empty()
+/// Whether a Linux program's process: its signals are its server's.
+fn linux_process(group: &ThreadGroup) -> bool {
+    group.instance.load(Ordering::Acquire) != 0
 }
 
 /// Whether a blocking syscall of the current thread should return EINTR:
-/// a signal to act on, or a group stop to join.
+/// a signal to act on, or a group stop to join (a Linux program's thread:
+/// it was kicked, or it dies).
 pub fn interrupted() -> bool {
+    if super::linux::serves_program() {
+        return super::linux::kicked();
+    }
     let me = current();
     let g = me.group.sig.lock();
     let t = me.sig.lock();
@@ -242,8 +211,11 @@ pub fn interrupted() -> bool {
 }
 
 /// Whether SIGKILL is pending for the current thread (ends waits that
-/// ignore other signals).
+/// ignore other signals; a Linux program's thread: it dies).
 pub fn killed() -> bool {
+    if super::linux::serves_program() {
+        return super::linux::dying();
+    }
     let me = current();
     let g = me.group.sig.lock();
     (me.sig.lock().pending | g.pending) & bit(SIGKILL) != 0
@@ -252,7 +224,21 @@ pub fn killed() -> bool {
 /// Whether the current thread is about to die: SIGKILL is pending or its
 /// process is exiting (ends waits that nothing else may interrupt).
 pub fn dying() -> bool {
+    if super::linux::serves_program() {
+        return super::linux::dying();
+    }
     killed() || current().group.sig.lock().exit != GroupExit::None
+}
+
+/// The kernel kills the calling thread's process (out of memory, a failed
+/// Linux server): SIGKILL, recorded for the server of a Linux program's.
+pub fn kernel_kill_current() -> ! {
+    let group = current().group.clone();
+    if linux_process(&group) {
+        let _ = group.killed_by_kernel.compare_exchange(0, SIGKILL as u64, Ordering::AcqRel, Ordering::Acquire);
+    }
+    drop(group);
+    super::exit_group(SIGKILL as i32)
 }
 
 /// Raises `sig` for a fault of the current thread (a CPU exception). Such
@@ -304,6 +290,9 @@ pub fn kick(t: &Arc<Task>) {
 fn post(group: &Arc<ThreadGroup>, thread: Option<&Arc<Task>>, sig: u32) {
     if group.tgid == 0 || sig == 0 || sig > NSIG {
         return;
+    }
+    if linux_process(group) {
+        return post_linux(group, thread, sig);
     }
     let mut continued_parent = None;
     {
@@ -365,6 +354,35 @@ fn post(group: &Arc<ThreadGroup>, thread: Option<&Arc<Task>>, sig: u32) {
     }
     if let Some(ppid) = continued_parent {
         notify_parent(ppid);
+    }
+}
+
+/// `post` for a Linux program's process, whose signals are its server's:
+/// only SIGKILL means something to the kernel. For one thread (a group exit
+/// or exec ending the others) it is the server's kill; for the process (the
+/// kernel's own: the monitor, out of memory) every thread dies, and the
+/// server learns that the kernel killed it.
+fn post_linux(group: &Arc<ThreadGroup>, thread: Option<&Arc<Task>>, sig: u32) {
+    if sig != SIGKILL {
+        return;
+    }
+    if let Some(t) = thread {
+        return super::linux::kill_task(t);
+    }
+    let threads: Vec<Arc<Task>> = {
+        let info = group.info.lock();
+        if info.threads.is_empty() {
+            return;
+        }
+        let _ = group.killed_by_kernel.compare_exchange(0, SIGKILL as u64, Ordering::AcqRel, Ordering::Acquire);
+        let mut g = group.sig.lock();
+        if g.exit == GroupExit::None {
+            g.exit = GroupExit::Exiting(SIGKILL as i32);
+        }
+        info.threads.clone()
+    };
+    for t in &threads {
+        super::linux::kill_task(t);
     }
 }
 
@@ -700,6 +718,12 @@ pub fn sigprocmask(how: u64, set: u64, oldset: u64) -> SysResult {
 /// caller's mask lets it through.
 pub fn with_mask<T>(mask: Option<u64>, wait: impl FnOnce() -> Result<T, i64>) -> Result<T, i64> {
     let Some(mask) = mask else { return wait() };
+    // A Linux program's masks are its server's (which sets the temporary
+    // one itself before it passes the call through without it).
+    if super::linux::serves_program() {
+        let _ = mask;
+        return wait();
+    }
     let me = current();
     let blocked_more = {
         let mut t = me.sig.lock();
@@ -866,7 +890,8 @@ fn die(sig: u32) -> ! {
 /// the number of the syscall that is returning, if any, so that calls
 /// interrupted with EINTR can be restarted.
 pub fn deliver(frame: &mut Frame, syscall: Option<u64>) {
-    if !frame.from_user() {
+    // A Linux program's signals are its server's.
+    if !frame.from_user() || super::linux::mode().is_some() {
         return;
     }
     let mut interrupted = syscall.filter(|&nr| frame.rax == (-EINTR) as u64 && restartable(nr));

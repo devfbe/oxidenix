@@ -487,11 +487,6 @@ impl AddressSpace {
         Ok(())
     }
 
-    /// The Linux server instance serving this address space, if any.
-    pub fn instance(&self) -> Option<&Arc<super::linux::Instance>> {
-        self.instance.as_ref()
-    }
-
     /// Copies the program's top-level entries into the normal view; a new
     /// one appears when a mapping needs a new third-level table. Entries
     /// never go away before the address space does.

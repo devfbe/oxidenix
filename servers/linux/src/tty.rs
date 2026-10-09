@@ -228,7 +228,7 @@ pub struct TtyOpen {
     pub origin: Origin,
 }
 
-/// A process's ids, as the kernel answers `proc_ids`.
+/// A process's ids (`process`).
 #[derive(Clone, Copy, Debug)]
 pub struct Ids {
     pub pid: u64,
@@ -237,20 +237,47 @@ pub struct Ids {
     pub orphaned: bool,
 }
 
+/// `ids`: `id` names a process group (one of its live members is asked about).
+pub const IDS_PGRP: u64 = 1;
+/// `ids`: also whether the group is orphaned.
+pub const IDS_ORPHANED: u64 = 2;
+
 /// The ids of process `id` (0: the caller), or with `IDS_PGRP` of a process of group `id`;
-/// with `IDS_ORPHANED` also whether its group is orphaned.
+/// with `IDS_ORPHANED` also whether its group is orphaned. ESRCH for none.
 pub fn ids(id: u64, flags: u64) -> Result<Ids, i64> {
-    let mut out = [0u64; 4];
-    let r = syscall(SYS_PROC_IDS, [id, flags, out.as_mut_ptr() as u64, 0, 0, 0]);
-    if r < 0 {
-        return Err(-r);
-    }
-    Ok(Ids { pid: out[0], pgid: out[1], sid: out[2], orphaned: out[3] & IDS_ORPHANED != 0 })
+    const ESRCH: i64 = 3;
+    let (pid, pgid, sid) = if flags & IDS_PGRP != 0 {
+        let sid = crate::process::pgrp_session(id as u32).ok_or(ESRCH)?;
+        (0, id as u32, sid)
+    } else {
+        crate::process::ids_of(id as u32).ok_or(ESRCH)?
+    };
+    let orphaned = flags & IDS_ORPHANED != 0 && crate::process::pgrp_orphaned(pgid);
+    Ok(Ids { pid: pid as u64, pgid: pgid as u64, sid: sid as u64, orphaned })
 }
 
-/// Sends `sig` to process `id` (`SIGNAL_PROCESS`) or process group `id` (`SIGNAL_PGRP`).
-fn signal(scope: u64, id: u64, sig: u64) {
-    syscall(SYS_SIGNAL_GROUP, [scope, id, sig, 0, 0, 0]);
+/// Whom `signal` sends to: a process group, or a session's leader (while it still leads
+/// it).
+#[derive(Clone, Copy)]
+enum Scope {
+    Pgrp,
+    Leader,
+}
+use Scope::{Leader as SIGNAL_LEADER, Pgrp as SIGNAL_PGRP};
+
+/// Sends `sig` from the terminal (SI_KERNEL) to process group `id` or the leader of
+/// session `id`.
+fn signal(scope: Scope, id: u64, sig: u64) {
+    match scope {
+        Scope::Pgrp => {
+            crate::signal::send_pgrp(id as u32, sig as u32);
+        }
+        Scope::Leader => {
+            if crate::process::ids_of(id as u32).is_some_and(|(pid, _, sid)| pid as u64 == id && sid as u64 == id) {
+                crate::signal::send_process(id as u32, sig as u32);
+            }
+        }
+    }
 }
 
 fn now() -> u64 {
@@ -482,8 +509,8 @@ impl Tty {
         if me.sid != session || me.pgid == fg {
             return Ok(());
         }
-        let state = syscall(SYS_SIGNAL_STATE, [sig, 0, 0, 0, 0, 0]);
-        if state > 0 && state as u64 & (SIGNAL_IGNORED | SIGNAL_BLOCKED) != 0 {
+        let (ignored, blocked) = crate::signal::ignored_or_blocked(sig as u32);
+        if ignored || blocked {
             return if sig == SIGTTIN { Err(EIO) } else { Ok(()) };
         }
         if ids(0, IDS_ORPHANED)?.orphaned {

@@ -14,7 +14,7 @@
 //! chunk taken under it, one reader at a time (`drain`).
 //!
 //! As on Linux: a write without readers raises SIGPIPE for the writer
-//! (`SYS_SIGNAL_THREAD`) and fails with EPIPE (unless some of it was
+//! (`signal::raise_thread`) and fails with EPIPE (unless some of it was
 //! written), a read without writers returns 0, O_NONBLOCK gives EAGAIN.
 
 use crate::files::{self, EFAULT};
@@ -267,8 +267,7 @@ impl PipeEnd {
                         let mut inner = self.shared.inner.lock();
                         if !inner.reader {
                             drop(inner);
-                            const SIGPIPE: u64 = 13;
-                            syscall(SYS_SIGNAL_THREAD, [SIGPIPE, 0, 0, 0, 0, 0]);
+                            crate::signal::raise_thread(crate::signal::SIGPIPE);
                             return if written > 0 { Ok(written as i64) } else { Err(EPIPE) };
                         }
                         let room = CAPACITY.saturating_sub(inner.buf.len()).min(n - pushed);

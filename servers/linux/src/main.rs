@@ -1,11 +1,16 @@
 //! The Linux server (docs/design/linux-server.md). It runs on the threads
 //! of the Linux programs it serves, in their address spaces' normal view,
-//! and handles what the programs trap into: in phase R1 it hands every
-//! system call back to the kernel's own Linux implementation.
+//! and handles what the programs trap into: their system calls (those it
+//! does not implement yet it hands back to the kernel's own Linux
+//! implementation), their exceptions (as signals), and kicks (a signal or a
+//! stop for the thread). Before a thread's program runs again its signals
+//! are delivered (`signal::deliver`).
 //!
 //! Invariants the kernel relies on: no FPU/SSE (the target has none) and
 //! no FS or GS base, so the program's FPU registers and TLS pointer stay in
-//! the CPU while the server runs.
+//! the CPU while the server runs (signal frames save and restore them with
+//! fxsave and fxrstor); no lock of the server is held when a thread enters
+//! its program (a killed thread exits there).
 
 #![no_std]
 #![no_main]
@@ -19,6 +24,7 @@ mod datafs;
 mod devices;
 mod disktest;
 mod eventfd;
+mod exec;
 mod files;
 mod fsclient;
 mod heap;
@@ -27,6 +33,7 @@ mod inet;
 mod inetcalls;
 mod initramfs;
 mod inotify;
+mod local;
 mod mm;
 mod namespace;
 mod netclient;
@@ -35,14 +42,17 @@ mod netlink;
 mod pathfile;
 mod paths;
 mod pipe;
+mod process;
 mod pty;
 mod records;
 mod ringclient;
 mod sched;
 mod scm;
+mod signal;
 mod sockcalls;
 mod sync;
 mod time;
+mod timer;
 mod tmpfile;
 mod tmpfs;
 mod tty;
@@ -83,65 +93,141 @@ fn call0(nr: u64) -> i64 {
     syscall(nr, [0; 6])
 }
 
+/// A kernel call that reads and writes the thread's `State` (restricted_enter,
+/// legacy_syscall): the pointer goes into the asm, so the compiler writes back what the
+/// server set in `state` before and reads it again after (a `&mut` alone would let it
+/// keep fields in registers across the call).
+pub(crate) fn state_call(state: &mut State, nr: u64, a: [u64; 6]) -> i64 {
+    let ret: i64;
+    let ptr = state as *mut State;
+    unsafe {
+        core::arch::asm!(
+            "syscall",
+            inlateout("rax") nr as i64 => ret,
+            in("rdi") a[0], in("rsi") a[1], in("rdx") a[2], in("r10") a[3], in("r8") a[4], in("r9") a[5],
+            in("r12") ptr,
+            out("rcx") _, out("r11") _,
+            options(nostack),
+        );
+    }
+    ret
+}
+
 /// Each thread of a Linux program starts here, on its own server stack,
-/// with its `State` (the program's registers) at `state`; so does the
-/// instance's pager thread (`role`).
+/// with its `State` (the program's registers) at `state`; so do the
+/// instance's service threads (`role`). A program's thread made by clone
+/// gets its creator's `cookie` (`process::Birth`) and its key.
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(state: *mut State, role: u64) -> ! {
+pub extern "C" fn _start(state: *mut State, role: u64, cookie: u64, key: u64) -> ! {
     usercopy::register();
-    if role == ROLE_PAGER {
-        pager();
+    match role {
+        ROLE_PAGER => pager(),
+        ROLE_WORKER => scm::worker(),
+        ROLE_NET => netclient::thread(),
+        ROLE_TIMER => timer::thread(),
+        _ => {}
     }
-    if role == ROLE_WORKER {
-        scm::worker();
-    }
-    if role == ROLE_NET {
-        netclient::thread();
-    }
+    let s = unsafe { &mut *state };
     if role == ROLE_INIT {
-        // The tree's first thread: its standard descriptors on the console.
+        // The tree's first thread: pid 1, its standard descriptors on the
+        // console, then the program the kernel started the tree with.
+        process::register_init(key);
         console::setup_stdio();
+        exec::init(s);
+    } else {
+        process::start_thread(cookie, key);
     }
+    // Its signals before its first instruction (a stop, a kill of its
+    // process, a signal sent while it was made).
+    signal::deliver(s, None);
+    serve(s)
+}
+
+/// The loop of a program's thread: the program runs until it traps, the
+/// server handles the trap, delivers the thread's signals, and the program
+/// runs again.
+fn serve(s: &mut State) -> ! {
     loop {
-        if call0(SYS_RESTRICTED_ENTER) as u64 != REASON_SYSCALL {
-            continue;
+        let reason = state_call(s, SYS_RESTRICTED_ENTER, [0; 6]);
+        if reason < 0 {
+            // The kernel refuses the registers (they never come from the
+            // program unchecked): the process cannot go on.
+            process::die(signal::SIGSEGV as i32);
         }
-        let s = unsafe { &mut *state };
-        if let Some(result) = mm::handle(s).or_else(|| time::handle(s)).or_else(|| files::handle(s)).or_else(|| paths::handle(s)).or_else(|| sched::handle(s)).or_else(|| ids::handle(s)).or_else(|| sockcalls::handle(s)) {
-            s.rax = result as u64;
-            // /data inodes the call let go of go now, before it returns
-            // (an unlink's blocks are free when it returns).
-            datafs::reap();
-            continue;
-        }
-        match s.rax {
-            TEST_MAP..=TEST_CACHED => s.rax = test(s.rax, s.rdi) as u64,
-            TEST_PASS_THROUGH => {
-                const SYS_GETPID: u64 = 39;
-                s.rax = SYS_GETPID;
-                pass_through(s);
+        match reason as u64 {
+            REASON_SYSCALL => {
+                let nr = s.rax;
+                let result = dispatch(s);
+                s.rax = result as u64;
+                // /data inodes the call let go of go now, before it returns
+                // (an unlink's blocks are free when it returns).
+                datafs::reap();
+                // The fast path: the program runs on, unless the call was
+                // interrupted or changed the thread's mask (a kick makes
+                // restricted_enter come back at once).
+                if result == -EINTR || nr == signal::SYS_RT_SIGRETURN || local::get().flags.load(Ordering::Relaxed) & local::RESTORE_MASK != 0 {
+                    signal::deliver(s, Some((nr, result)));
+                }
             }
-            // Not offered, as by a Linux built without io_uring: libuv (and
-            // so Node.js) probes io_uring_setup at start and uses epoll
-            // instead. Answered here, so the kernel does not log them as
-            // unknown calls.
-            SYS_IO_URING_SETUP | SYS_IO_URING_ENTER | SYS_IO_URING_REGISTER => s.rax = -ENOSYS as u64,
-            nr if nr >= FIRST_NON_LINUX => s.rax = -ENOSYS as u64,
-            _ => pass_through(s),
+            REASON_KICK => signal::deliver(s, None),
+            REASON_EXCEPTION => {
+                signal::exception(s);
+                signal::deliver(s, None);
+            }
+            _ => {}
         }
     }
 }
 
-/// Passes the program's call through to the kernel's Linux implementation.
-fn pass_through(s: &State) {
-    records::before_pass_through(s);
+const EINTR: i64 = 4;
+
+/// Handles the program's system call in `s`: its result.
+fn dispatch(s: &mut State) -> i64 {
+    if let Some(result) = mm::handle(s)
+        .or_else(|| process::handle(s))
+        .or_else(|| signal::handle(s))
+        .or_else(|| exec::handle(s))
+        .or_else(|| timer::handle(s))
+        .or_else(|| time::handle(s))
+        .or_else(|| files::handle(s))
+        .or_else(|| paths::handle(s))
+        .or_else(|| sched::handle(s))
+        .or_else(|| ids::handle(s))
+        .or_else(|| sockcalls::handle(s))
+    {
+        return result;
+    }
+    match s.rax {
+        TEST_MAP..=TEST_CACHED => test(s.rax, s.rdi),
+        TEST_PASS_THROUGH => {
+            const SYS_GETPID: u64 = 39;
+            s.rax = SYS_GETPID;
+            pass_through_value(s)
+        }
+        // Not offered, as by a Linux built without io_uring: libuv (and
+        // so Node.js) probes io_uring_setup at start and uses epoll
+        // instead. Answered here, so the kernel does not log them as
+        // unknown calls.
+        SYS_IO_URING_SETUP | SYS_IO_URING_ENTER | SYS_IO_URING_REGISTER => -ENOSYS,
+        nr if nr >= FIRST_NON_LINUX => -ENOSYS,
+        _ => pass_through_value(s),
+    }
+}
+
+/// Passes the program's call in `s` through to the kernel's Linux
+/// implementation; its result (`s` keeps the call's registers).
+pub fn pass_through_value(s: &mut State) -> i64 {
+    let nr = s.rax;
     // Server files the call closed for good go at once.
     let mut closed = [0u64; 16];
-    let n = syscall(SYS_LEGACY_SYSCALL, [closed.as_mut_ptr() as u64, closed.len() as u64, 0, 0, 0, 0]);
+    let n = state_call(s, SYS_LEGACY_SYSCALL, [closed.as_mut_ptr() as u64, closed.len() as u64, 0, 0, 0, 0]);
     for &id in closed.iter().take(n.max(0) as usize) {
         files::closed(id, false);
     }
     datafs::reap();
+    let result = s.rax as i64;
+    s.rax = nr;
+    result
 }
 
 /// A page request of an `EVENT_PAGE`.
@@ -174,8 +260,8 @@ static FAIL_OBJECTS: sync::Mutex<BTreeMap<u64, (u64, bool)>> = sync::Mutex::new(
 /// objects: page n of the first reads "paged n"), writes /data's dirty
 /// files back (when they have been dirty a while, when the kernel asks,
 /// when the instance ends), drops the server's files whose last
-/// descriptor went, and takes back the records and holds the kernel
-/// released.
+/// descriptor went, takes back the holds the kernel released, and ends
+/// the threads and processes whose end the kernel reports (`process`).
 fn pager() -> ! {
     loop {
         datafs::reap();
@@ -190,16 +276,18 @@ fn pager() -> ! {
                 continue;
             }
             EVENT_RELEASE => {
-                // Bit 0 tells a tmpfs file's hold, bit 1 a /data file's, from
-                // a record.
+                // Bit 0 tells a tmpfs file's hold, bit 1 a /data file's.
                 if event.a & 1 == 1 {
                     tmpfs::released(event.a);
                 } else if event.a & datafs::HOLD_TAG != 0 {
                     datafs::released(event.a);
-                } else {
-                    records::released(event.a);
                 }
                 tmpfs::release_handled();
+                continue;
+            }
+            EVENT_THREAD_EXIT => {
+                // A program's thread is gone: its process may have ended.
+                process::thread_ended(event.a);
                 continue;
             }
             EVENT_DIRTY => {
@@ -243,10 +331,6 @@ fn pager() -> ! {
             }
             EVENT_CONSOLE_LOST => {
                 console::lost();
-                continue;
-            }
-            EVENT_SESSION_END => {
-                tty::session_ended(event.a);
                 continue;
             }
             EVENT_SYNC => {

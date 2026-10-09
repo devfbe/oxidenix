@@ -23,7 +23,6 @@ use alloc::string::ToString;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use ldisc::Termios;
-use restricted::*;
 
 const ENOSPC: i64 = 28;
 const EFAULT: i64 = 14;
@@ -245,7 +244,7 @@ impl PtyMaster {
                     return Err(EINVAL);
                 }
                 if let Some(fg) = self.tty.inner.lock().pgrp {
-                    crate::syscall(SYS_SIGNAL_GROUP, [SIGNAL_PGRP, fg, sig, 0, 0, 0]);
+                    crate::signal::send_pgrp(fg as u32, sig as u32);
                 }
                 Ok(0)
             }
