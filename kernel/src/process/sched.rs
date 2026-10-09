@@ -243,7 +243,7 @@ fn pick_next(cpu: &Cpu) -> Option<Arc<Task>> {
     loop {
         let t = {
             let mut rq = cpu.sched.rq.lock();
-            let i = rq.iter().position(|t| !t.may_run_on(cpu.index) || switched_out(t));
+            let i = weighted_turn(&mut rq, |t| !t.may_run_on(cpu.index) || switched_out(t));
             i.and_then(|i| rq.remove(i))
         };
         match t {
@@ -257,6 +257,76 @@ fn pick_next(cpu: &Cpu) -> Option<Arc<Task>> {
         let i = rq.iter().rposition(|t| t.may_run_on(cpu.index) && !t.on_cpu.load(Ordering::Acquire))?;
         rq.remove(i)
     })
+}
+
+/// The weight of each nice value, -20 to 19 (Linux's
+/// `sched_prio_to_weight`): each step is about 10% of CPU time.
+const WEIGHTS: [u32; 40] = [
+    88761, 71755, 56483, 46273, 36291, 29154, 23254, 18705, 14949, 11916, 9548, 7620, 6100, 4904, 3906, 3121, 2501, 1991, 1586, 1277,
+    1024, 820, 655, 526, 423, 335, 272, 215, 172, 137, 110, 87, 70, 56, 45, 36, 29, 23, 18, 15,
+];
+/// The weight of nice 0: one tick per turn.
+const DEFAULT_WEIGHT: u32 = 1024;
+/// The longest time slice, in ticks.
+const MAX_SLICE: u32 = 100;
+
+/// The scheduling weight of nice value `nice`.
+pub fn weight(nice: i8) -> u32 {
+    WEIGHTS[(nice.clamp(-20, 19) + 20) as usize]
+}
+
+/// How many ticks a task runs before its turn ends: a task heavier than
+/// the default runs as many ticks as its weight is defaults (nice -5:
+/// three), a lighter one one tick, but not every round (`weighted_turn`).
+/// Round robin weighted so: CPU time shares as Linux's nice values give.
+fn slice(nice: i8) -> u32 {
+    (weight(nice) + DEFAULT_WEIGHT / 2).div_euclid(DEFAULT_WEIGHT).clamp(1, MAX_SLICE)
+}
+
+/// The queue position whose turn it is among the tasks `eligible` takes:
+/// the first, unless it weighs less than the default and has not saved up
+/// for a turn yet: it then gains its weight as credit and goes to the back
+/// (a task of weight w gets a turn every 1024/w rounds). A lone eligible
+/// task always gets the turn.
+fn weighted_turn(rq: &mut VecDeque<Arc<Task>>, eligible: impl Fn(&Arc<Task>) -> bool) -> Option<usize> {
+    let count = rq.iter().filter(|t| eligible(t)).count();
+    if count <= 1 {
+        return rq.iter().position(&eligible);
+    }
+    let w = |t: &Task| weight(t.nice.load(Ordering::Relaxed));
+    let mut skipped = 0;
+    loop {
+        if skipped == count {
+            // A whole round of light tasks without a turn: the rounds until
+            // the first has saved up enough are given at once (so a pick
+            // takes at most two passes over the queue).
+            let rounds = rq
+                .iter()
+                .filter(|t| eligible(t))
+                .map(|t| (DEFAULT_WEIGHT - t.credit.load(Ordering::Relaxed)).div_ceil(w(t)) - 1)
+                .min()
+                .unwrap_or(0);
+            for t in rq.iter().filter(|t| eligible(t)) {
+                t.credit.fetch_add(rounds * w(t), Ordering::Relaxed);
+            }
+            skipped = 0;
+        }
+        let i = rq.iter().position(&eligible)?;
+        let t = &rq[i];
+        let tw = w(t);
+        if tw >= DEFAULT_WEIGHT {
+            return Some(i);
+        }
+        let credit = t.credit.load(Ordering::Relaxed) + tw;
+        if credit >= DEFAULT_WEIGHT {
+            t.credit.store(credit - DEFAULT_WEIGHT, Ordering::Relaxed);
+            return Some(i);
+        }
+        t.credit.store(credit, Ordering::Relaxed);
+        let light = rq.remove(i).expect("found above");
+        rq.push_back(light);
+        skipped += 1;
+    }
 }
 
 /// Time and switches of one CPU.
@@ -301,8 +371,17 @@ fn update_load(runnable: u64) {
     }
 }
 
+/// Whether this CPU has work: its own queue, or a task in another CPU's
+/// queue that may run here (`pick_next` steals it). Tasks only another
+/// CPU may run (pinned there) are not this CPU's work: counting them kept
+/// an idle CPU looping through `schedule` with interrupts off while a CPU
+/// it cannot help was busy, so its timers (sleeps ending) never fired.
 fn has_work(cpu: &Cpu) -> bool {
-    (0..smp::MAX_CPUS).filter_map(smp::by_index).any(|c| !c.sched.rq.lock().is_empty()) || !cpu.sched.rq.lock().is_empty()
+    !cpu.sched.rq.lock().is_empty()
+        || (0..smp::MAX_CPUS)
+            .filter(|&i| i != cpu.index)
+            .filter_map(smp::by_index)
+            .any(|c| c.sched.rq.lock().iter().any(|t| t.may_run_on(cpu.index)))
 }
 
 // ---------------------------------------------------------- wait queues
@@ -565,6 +644,7 @@ pub fn schedule() {
         };
         if core::ptr::eq(&*next, cur) {
             cur.set_state(State::Running);
+            cur.slice_ticks.store(0, Ordering::Relaxed);
             return;
         }
         context_switch(next);
@@ -608,6 +688,8 @@ fn context_switch(next: Arc<Task>) {
     next.on_cpu.store(true, Ordering::Relaxed);
     next.set_state(State::Running);
     next.last_cpu.store(cpu.index, Ordering::Relaxed);
+    // A new time slice.
+    next.slice_ticks.store(0, Ordering::Relaxed);
     cs.switches.fetch_add(1, Ordering::Relaxed);
 
     let prev = unsafe { (*cs.current.get()).take().expect("no current task") };
@@ -797,10 +879,13 @@ pub extern "C" fn idle_loop() -> ! {
 
 /// The scheduler tick (see `timer`), every 10 ms on every CPU; `user`
 /// tells whether it hit user code. It samples where time goes; the
-/// bootstrap CPU also updates the load average.
-pub fn tick(user: bool) {
+/// bootstrap CPU also updates the load average. Whether the running
+/// task's time slice is over (`slice`).
+pub fn tick(user: bool) -> bool {
     let cpu = smp::cpu();
     let cur = current();
+    // Whether the running task's time slice is over.
+    let over = cur.idle || cur.slice_ticks.fetch_add(1, Ordering::Relaxed) + 1 >= slice(cur.nice.load(Ordering::Relaxed));
     let (cpu_counter, task_counter) = match (cur.idle, user) {
         (true, _) => (&cpu.sched.idle_ticks, None),
         (false, true) => (&cpu.sched.user_ticks, Some(&cur.utime)),
@@ -811,7 +896,7 @@ pub fn tick(user: bool) {
         c.fetch_add(1, Ordering::Relaxed);
     }
     if cpu.index != 0 {
-        return;
+        return over;
     }
     let now = crate::time::now();
     if now >= NEXT_LOAD.load(Ordering::Relaxed) {
@@ -824,4 +909,5 @@ pub fn tick(user: bool) {
             .count();
         update_load(runnable as u64);
     }
+    over
 }

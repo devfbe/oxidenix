@@ -177,16 +177,26 @@ fn map_anon(space: &mut AddressSpace, start: u64, end: u64, prot: Prot) -> Resul
 }
 
 /// Linux initial stack: argc, argv[], NULL, envp[], NULL, auxv pairs, AT_NULL.
+/// The strings lie at the top as Linux puts them: the arguments in
+/// order, each right after the one before, then the environment (programs
+/// rely on it: libuv's process title overwrites the arguments' memory up
+/// to the last one's end).
 fn build_stack(space: &mut AddressSpace, args: &[String], envs: &[String], auxv: &[(u64, u64)]) -> Result<u64, Fault> {
     space.map_stack(STACK_TOP, STACK_SIZE)?;
-    let mut sp = STACK_TOP;
-    let mut push_str = |space: &mut AddressSpace, s: &str| -> Result<u64, Fault> {
-        sp -= s.len() as u64 + 1;
-        space.write(sp, s.as_bytes())?;
-        Ok(sp)
+    let total: u64 = args.iter().chain(envs).map(|s| s.len() as u64 + 1).sum();
+    // The word below the top stays 0, as Linux's end marker.
+    let strings = STACK_TOP.checked_sub(8 + total).filter(|&s| s >= STACK_TOP - STACK_SIZE).ok_or(Fault::Oom)?;
+    let mut at = strings;
+    let mut place = |space: &mut AddressSpace, s: &str| -> Result<u64, Fault> {
+        let addr = at;
+        space.write(addr, s.as_bytes())?;
+        space.write(addr + s.len() as u64, &[0])?;
+        at += s.len() as u64 + 1;
+        Ok(addr)
     };
-    let argv = args.iter().map(|a| push_str(space, a)).collect::<Result<Vec<_>, _>>()?;
-    let envp = envs.iter().map(|e| push_str(space, e)).collect::<Result<Vec<_>, _>>()?;
+    let argv = args.iter().map(|a| place(space, a)).collect::<Result<Vec<_>, _>>()?;
+    let envp = envs.iter().map(|e| place(space, e)).collect::<Result<Vec<_>, _>>()?;
+    let mut sp = strings & !0xf;
     sp -= 16;
     let random = sp;
     let seed = unsafe { core::arch::x86_64::_rdtsc() };

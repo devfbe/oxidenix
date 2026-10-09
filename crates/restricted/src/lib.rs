@@ -602,6 +602,21 @@ pub const SYS_KFD_STAT: u64 = 1093;
 /// answer. It goes with the sockets (R7), when the server talks to netd
 /// itself.
 pub const SYS_NET_LINKS: u64 = 1094;
+/// `thread_nice(scope, id, set, nice) -> lowest nice + 20`: the nice
+/// values (-20..=19, the kernel scheduler's weights) of the threads in
+/// `scope`: `NICE_THREAD` the thread `id` (0: the caller),
+/// `NICE_PGROUP` every thread of process group `id` (0: the caller's),
+/// `NICE_ALL` every thread there is (one user). With `set` 1 they all get
+/// `nice` (clamped). The answer is the lowest nice value among them, before
+/// a change, plus 20; ESRCH for no thread, EPERM for a privileged server's
+/// (a scope that is not one thread passes over those). Thread ids and
+/// process groups are the kernel's until the process model is the
+/// server's (R8), and the scope is not the instance's yet, as for
+/// `SYS_THREAD_EXISTS`.
+pub const SYS_THREAD_NICE: u64 = 1095;
+pub const NICE_THREAD: u64 = 0;
+pub const NICE_PGROUP: u64 = 1;
+pub const NICE_ALL: u64 = 2;
 
 /// `(scenario)`: the server runs a channel scenario against the test
 /// service (servers/ringtest, `ring::selftest`): 1 rings and doorbells, 2

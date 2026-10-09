@@ -226,10 +226,9 @@ pub fn interrupt(from_user: bool) -> bool {
     let next = q.heap.peek().map_or(q.next_tick, |e| e.deadline.min(q.next_tick));
     program(&mut q, next);
     drop(q);
-    if tick {
-        sched::tick(from_user);
-    }
-    tick || woke
+    // The running task gives up the CPU when its time slice is over.
+    let over = tick && sched::tick(from_user);
+    over || woke
 }
 
 /// Runs an expired entry if it is still live. Returns whether it woke a

@@ -291,6 +291,43 @@ pub fn sched_setaffinity(pid: Pid, size: u64, mask: u64) -> SysResult {
     Ok(0)
 }
 
+/// The Linux server's `SYS_THREAD_NICE`: the nice values of a thread, a
+/// process group or every thread; with `set`, they all get `nice`. The
+/// lowest nice value among them before, plus 20.
+pub fn thread_nice(scope: u64, id: u64, set: bool, nice: i64) -> SysResult {
+    use restricted::{NICE_ALL, NICE_PGROUP, NICE_THREAD};
+    let nice = nice.clamp(-20, 19) as i8;
+    let me = current();
+    let targets: Vec<Arc<Task>> = match scope {
+        NICE_THREAD => {
+            let t = if id == 0 { sched::current_arc() } else { task(id as Pid).ok_or(ESRCH)? };
+            if t.group.privileged.load(Ordering::Relaxed) && t.tgid() != me.tgid() {
+                return Err(EPERM);
+            }
+            alloc::vec![t]
+        }
+        NICE_PGROUP | NICE_ALL => {
+            let pgid = if id == 0 { me.group.info.lock().pgid } else { id as Pid };
+            let table = sched::TABLE.lock();
+            table
+                .tasks
+                .values()
+                .filter(|t| t.tgid() != 0 && !t.group.privileged.load(Ordering::Relaxed))
+                .filter(|t| scope == NICE_ALL || t.group.info.lock().pgid == pgid)
+                .cloned()
+                .collect()
+        }
+        _ => return Err(EINVAL),
+    };
+    let lowest = targets.iter().map(|t| t.nice.load(Ordering::Relaxed)).min().ok_or(ESRCH)?;
+    if set {
+        for t in &targets {
+            t.nice.store(nice, Ordering::Relaxed);
+        }
+    }
+    Ok(lowest as i64 + 20)
+}
+
 /// getcpu(&cpu, &node, cache): the CPU the caller runs on; one NUMA node.
 pub fn getcpu(cpu: u64, node: u64) -> SysResult {
     let index = crate::smp::cpu().index as u32;

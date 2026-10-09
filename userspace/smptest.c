@@ -1,9 +1,11 @@
-/* SMP tests: CPU count, affinity and scheduling policy, real parallel speed-up, fork/exit and
+/* SMP tests: CPU count, affinity and scheduling policy, nice values and
+ * the CPU shares they give, real parallel speed-up, fork/exit and
  * cross-CPU wakeups (pipes, signals) under load on every CPU. */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <pthread.h>
 #include <sched.h>
+#include <sys/resource.h>
 #include <sys/syscall.h>
 #include <signal.h>
 #include <stdio.h>
@@ -77,6 +79,79 @@ static void on_usr1(int sig) {
     got_usr1++;
 }
 
+/* CPU time of process `pid` in clock ticks (utime + stime), and its nice
+ * value, from /proc/<pid>/stat. */
+static long proc_ticks(pid_t pid, long *nice) {
+    char path[64], buf[512];
+    snprintf(path, sizeof path, "/proc/%d/stat", pid);
+    FILE *f = fopen(path, "r");
+    if (!f) return -1;
+    size_t n = fread(buf, 1, sizeof buf - 1, f);
+    fclose(f);
+    buf[n] = 0;
+    char *p = strrchr(buf, ')');
+    unsigned long ut = 0, st = 0;
+    long prio = 0, ni = 0;
+    if (!p || sscanf(p + 2, "%*c %*d %*d %*d %*d %*d %*u %*u %*u %*u %*u %lu %lu %*d %*d %ld %ld", &ut, &st, &prio, &ni) != 4) return -1;
+    if (nice) *nice = ni;
+    return (long)(ut + st);
+}
+
+/* Two CPU-bound processes on CPU 0 for 1.5 s, with nice values `a` and
+ * `b`: their CPU times. */
+static void share(int a, int b, long *ta, long *tb) {
+    pid_t kids[2];
+    int nices[2] = {a, b};
+    for (int i = 0; i < 2; i++) {
+        kids[i] = fork();
+        if (kids[i] == 0) {
+            pin(0);
+            setpriority(PRIO_PROCESS, 0, nices[i]);
+            for (;;) work(1000000);
+        }
+    }
+    usleep(300 * 1000);
+    long start[2] = {proc_ticks(kids[0], NULL), proc_ticks(kids[1], NULL)};
+    usleep(1500 * 1000);
+    *ta = proc_ticks(kids[0], NULL) - start[0];
+    *tb = proc_ticks(kids[1], NULL) - start[1];
+    for (int i = 0; i < 2; i++) kill(kids[i], SIGKILL);
+    for (int i = 0; i < 2; i++) waitpid(kids[i], NULL, 0);
+}
+
+static void nice_values(void) {
+    errno = 0;
+    check("getpriority: nice 0 to begin with", getpriority(PRIO_PROCESS, 0) == 0 && errno == 0);
+    long ni = 99;
+    check("setpriority 5, getpriority and /proc see it", setpriority(PRIO_PROCESS, 0, 5) == 0 && getpriority(PRIO_PROCESS, 0) == 5 &&
+                                                         proc_ticks(getpid(), &ni) >= 0 && ni == 5);
+    check("values beyond 19 and -20 are clamped", setpriority(PRIO_PROCESS, 0, 100) == 0 && getpriority(PRIO_PROCESS, 0) == 19 &&
+                                                      setpriority(PRIO_PROCESS, 0, -100) == 0 && getpriority(PRIO_PROCESS, 0) == -20);
+    setpriority(PRIO_PROCESS, 0, 3);
+    pid_t child = fork();
+    if (child == 0) _exit(getpriority(PRIO_PROCESS, 0) == 3 ? 0 : 1);
+    int st = 0;
+    waitpid(child, &st, 0);
+    check("a child inherits the nice value", WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    errno = 0;
+    check("PRIO_PGRP and PRIO_USER answer the most favored", getpriority(PRIO_PGRP, 0) <= 3 && getpriority(PRIO_USER, 0) <= 3 && errno == 0);
+    setpriority(PRIO_PROCESS, 0, 0);
+    errno = 0;
+    check("a missing process is ESRCH", setpriority(PRIO_PROCESS, 999999, 1) == -1 && errno == ESRCH);
+    errno = 0;
+    check("an unknown `which` is EINVAL", getpriority(7, 0) == -1 && errno == EINVAL);
+    errno = 0;
+    check("another user has no processes (ESRCH)", getpriority(PRIO_USER, 1000) == -1 && errno == ESRCH);
+
+    long a, b;
+    share(0, 19, &a, &b);
+    printf("    nice 0 vs 19 on one CPU: %ld vs %ld ticks\n", a, b);
+    check("nice 19 gets a small share against nice 0", a > 10 * (b > 0 ? b : 1) / 2 && a + b > 100);
+    share(-5, 0, &a, &b);
+    printf("    nice -5 vs 0 on one CPU: %ld vs %ld ticks\n", a, b);
+    check("nice -5 gets about three times nice 0's share", a > 2 * b && a < 4 * b + 10);
+}
+
 int main(void) {
     long n = sysconf(_SC_NPROCESSORS_ONLN);
     cpu_set_t set;
@@ -116,6 +191,7 @@ int main(void) {
     check("sched_getscheduler of a missing thread is ESRCH", syscall(SYS_sched_getscheduler, 999999) == -1 && errno == ESRCH);
     errno = 0;
     check("sched_getparam of a negative id is EINVAL", syscall(SYS_sched_getparam, -1, &sp) == -1 && errno == EINVAL);
+    nice_values();
 
     if (n >= 2) {
         /* Calibrate to about half a second of work for one process. */

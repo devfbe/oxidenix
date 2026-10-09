@@ -371,7 +371,7 @@ pub(super) fn dispatch_linux(f: &mut Frame) {
         281 => epoll::epoll_pwait(a0, a1, a2, a3, a4, a5),
         441 => epoll::epoll_pwait2(a0, a1, a2, a3, a4, a5),
         290 => sys_file::eventfd2(a0, a1),
-        302 => prlimit(a3),
+        302 => prlimit(a1, a3),
         318 => getrandom(a0, a1),
         nr => {
             crate::printkln!("[kernel] syscall {} not implemented", nr);
@@ -484,9 +484,18 @@ fn getitimer(which: u64, cur: u64) -> SysResult {
     Ok(0)
 }
 
-fn prlimit(old: u64) -> SysResult {
+/// prlimit64: the descriptor table's size for RLIMIT_NOFILE (soft and hard
+/// alike), no limit for the others; new limits are not taken (nothing
+/// else is limited per process).
+fn prlimit(resource: u64, old: u64) -> SysResult {
+    const RLIMIT_NOFILE: u64 = 7;
+    const RLIM_NLIMITS: u64 = 16;
+    if resource >= RLIM_NLIMITS {
+        return Err(EINVAL);
+    }
     if old != 0 {
-        uaccess::write(old, [u64::MAX, u64::MAX])?;
+        let limit = if resource == RLIMIT_NOFILE { super::task::MAX_FDS as u64 } else { u64::MAX };
+        uaccess::write(old, [limit, limit])?;
     }
     Ok(0)
 }

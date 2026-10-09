@@ -141,7 +141,6 @@ pub fn clone(frame: &Frame, flags: u64, stack: u64, parent_tid: u64, child_tid: 
             cmdline: i.cmdline.clone(),
             exe: i.exe.clone(),
             mem: Some(mm.stats.clone()),
-            nice: i.nice,
             exit_signal,
             ..Info::new(ppid, i.pgid, i.sid, i.name.clone())
         };
@@ -189,6 +188,7 @@ pub fn clone(frame: &Frame, flags: u64, stack: u64, parent_tid: u64, child_tid: 
     }
     *child.sig.lock() = me.sig.lock().inherit();
     child.affinity.store(me.affinity.load(Ordering::Relaxed), Ordering::Relaxed);
+    child.nice.store(me.nice.load(Ordering::Relaxed), Ordering::Relaxed);
 
     // Visible to the caller before the child can run (pthread_create
     // relies on it); for a shared address space also in the child's view.

@@ -1,6 +1,7 @@
-/* Running out of resources: fork bombs, memory hogs and full pipes fail with errors
- * (EAGAIN, ENOMEM) instead of bringing the kernel down, and a process touching
- * uncommitted (MAP_NORESERVE) memory beyond the commit limit is the one killed. */
+/* Running out of resources: fork bombs, memory hogs, full pipes and full
+ * descriptor tables fail with errors (EAGAIN, ENOMEM, EMFILE) instead of
+ * bringing the kernel down, and a process touching uncommitted
+ * (MAP_NORESERVE) memory beyond the commit limit is the one killed. */
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -8,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -169,7 +171,32 @@ static void pipe_flood(void) {
     }
 }
 
+/* Descriptors up to RLIMIT_NOFILE (as getrlimit reports it), then EMFILE;
+ * a fork copies the full table and exec closes the close-on-exec ones. */
+static void descriptor_flood(void) {
+    struct rlimit rl;
+    check("getrlimit(RLIMIT_NOFILE) is 4096", getrlimit(RLIMIT_NOFILE, &rl) == 0 && rl.rlim_cur == 4096 && rl.rlim_max == 4096);
+    int first = -1, last = -1, n = 0;
+    for (;;) {
+        int fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+        if (fd < 0) break;
+        if (first < 0) first = fd;
+        last = fd;
+        n++;
+    }
+    int e = errno;
+    check("open fails with EMFILE once the table is full", e == EMFILE && last == (int)rl.rlim_cur - 1);
+    pid_t child = fork();
+    if (child == 0) _exit(fcntl(last, F_GETFD) >= 0 ? 0 : 1);
+    int status = -1;
+    waitpid(child, &status, 0);
+    check("a fork copies all of them", WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    for (int fd = first; fd <= last; fd++) close(fd);
+    check("after closing them, open works again", (first = open("/dev/null", O_RDONLY)) >= 0 && close(first) == 0 && n > 4000);
+}
+
 int main(void) {
+    descriptor_flood();
     fork_bomb();
     memory_hog();
     noreserve_toucher();

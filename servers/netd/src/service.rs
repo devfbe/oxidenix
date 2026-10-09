@@ -150,6 +150,32 @@ impl Service {
         port
     }
 
+    /// Whether a TCP socket other than `except` holds `port` on an address
+    /// that overlaps `addr` (None: any): a listening socket, or one bound
+    /// and neither listening nor connected yet. Connections (accepted or
+    /// connected) share their port, as Linux allows with SO_REUSEADDR,
+    /// which servers set (Node.js always does).
+    fn tcp_port_taken(&self, port: u16, addr: Option<IpAddress>, except: u64) -> bool {
+        self.entries.iter().any(|(&h, e)| {
+            let Entry::Tcp(t) = e else { return false };
+            let Some(local) = t.local else { return false };
+            let holds = t.backlog.is_some() || (!t.connected && t.connecting.is_none());
+            let overlaps = local.addr.is_none() || addr.is_none() || local.addr == addr;
+            h != except && holds && local.port == port && overlaps
+        })
+    }
+
+    /// A free ephemeral port for a TCP socket.
+    fn ephemeral_tcp_port(&mut self) -> Result<u16, i64> {
+        for _ in 0..=(u16::MAX - 49152) {
+            let port = self.ephemeral_port();
+            if !self.tcp_port_taken(port, None, u64::MAX) {
+                return Ok(port);
+            }
+        }
+        Err(EADDRINUSE)
+    }
+
     fn new_tcp(sockets: &mut SocketSet<'static>) -> SocketHandle {
         let rx = tcp::SocketBuffer::new(vec![0; TCP_BUFFER]);
         let tx = tcp::SocketBuffer::new(vec![0; TCP_BUFFER]);
@@ -447,10 +473,14 @@ impl Service {
             }
             Op::Bind => {
                 let addr = (args[1] != 0).then(|| ipv4(args[1]));
-                let port = if args[2] == 0 && matches!(self.entries.get(&handle), Some(Entry::Udp(_))) {
-                    self.ephemeral_port()
-                } else {
-                    args[2] as u16
+                let port = match self.entries.get(&handle).ok_or(EBADF)? {
+                    Entry::Udp(_) if args[2] == 0 => self.ephemeral_port(),
+                    // A TCP port is taken at bind (getsockname tells it), and
+                    // one a listener or another bound socket holds is in use.
+                    Entry::Tcp(t) if t.local.is_some() => return Err(EINVAL),
+                    Entry::Tcp(_) if args[2] == 0 => self.ephemeral_tcp_port()?,
+                    Entry::Tcp(_) if self.tcp_port_taken(args[2] as u16, addr, handle) => return Err(EADDRINUSE),
+                    _ => args[2] as u16,
                 };
                 match self.entries.get_mut(&handle).ok_or(EBADF)? {
                     Entry::Tcp(t) => {
@@ -468,12 +498,14 @@ impl Service {
             }
             Op::Listen => {
                 let backlog = (args[1] as usize).clamp(1, MAX_BACKLOG);
-                let port = self.ephemeral_port();
                 let free = MAX_SOCKETS.saturating_sub(self.sockets_in_use(sockets));
+                let unbound = match self.entries.get(&handle).ok_or(EBADF)? {
+                    Entry::Tcp(t) if t.backlog.is_some() => return done(0),
+                    Entry::Tcp(t) => t.local.is_none_or(|l| l.port == 0),
+                    _ => return Err(EOPNOTSUPP),
+                };
+                let port = if unbound { self.ephemeral_tcp_port()? } else { 0 };
                 let Entry::Tcp(t) = self.entries.get_mut(&handle).ok_or(EBADF)? else { return Err(EOPNOTSUPP) };
-                if t.backlog.is_some() {
-                    return done(0);
-                }
                 let mut local = t.local.unwrap_or_default();
                 if local.port == 0 {
                     local.port = port;
