@@ -26,7 +26,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, AtomicI8, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI8, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 pub use crate::memory::kstack::KernelStack;
 
@@ -368,12 +368,12 @@ pub struct Task {
     pub last_cpu: AtomicUsize,
     /// CPUs it may run on (bit per CPU index), see sched_setaffinity.
     pub affinity: AtomicU64,
-    /// Its nice value (-20..=19, see `sched::weight`), the ticks it ran in
-    /// its current time slice, and the credit a task with a lower weight
-    /// than the default saves up for its next turn (`sched::pick_next`).
+    /// Its nice value (-20..=19, see `sched::weight`).
     pub nice: AtomicI8,
-    pub slice_ticks: AtomicU32,
-    pub credit: AtomicU32,
+    /// Fair scheduling (`sched`): its virtual runtime, on the scale of the
+    /// CPU `vcpu` (usize::MAX: a new task, not placed yet).
+    pub vruntime: AtomicU64,
+    pub vcpu: AtomicUsize,
     /// Channel it waits on (0: none), and the sequence number of the
     /// timer that ends its sleep (0: none; see `timer`).
     pub wait_chan: AtomicUsize,
@@ -423,8 +423,8 @@ impl Task {
             last_cpu: AtomicUsize::new(0),
             affinity: AtomicU64::new(u64::MAX),
             nice: AtomicI8::new(0),
-            slice_ticks: AtomicU32::new(0),
-            credit: AtomicU32::new(0),
+            vruntime: AtomicU64::new(0),
+            vcpu: AtomicUsize::new(usize::MAX),
             wait_chan: AtomicUsize::new(0),
             timer_seq: AtomicU64::new(0),
             wake_lock: IrqSpinLock::new(()),

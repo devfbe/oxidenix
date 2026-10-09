@@ -150,6 +150,37 @@ static void nice_values(void) {
     share(-5, 0, &a, &b);
     printf("    nice -5 vs 0 on one CPU: %ld vs %ld ticks\n", a, b);
     check("nice -5 gets about three times nice 0's share", a > 2 * b && a < 4 * b + 10);
+    share(-1, 0, &a, &b);
+    printf("    nice -1 vs 0 on one CPU: %ld vs %ld ticks\n", a, b);
+    check("nice -1 gets a little more than nice 0 (1.25x)", a > b && a * 4 < b * 6);
+
+    /* A sleeper on a CPU a nice -20 loop holds wakes on time: the woken
+     * task is owed CPU time and preempts the loop. */
+    pid_t hog = fork();
+    if (hog == 0) {
+        pin(0);
+        setpriority(PRIO_PROCESS, 0, -20);
+        for (;;) work(1000000);
+    }
+    pid_t sleeper = fork();
+    if (sleeper == 0) {
+        pin(0);
+        usleep(100 * 1000);
+        double worst = 0;
+        for (int i = 0; i < 50; i++) {
+            double t0 = now();
+            usleep(5000);
+            double late = now() - t0 - 0.005;
+            if (late > worst) worst = late;
+        }
+        printf("    worst wakeup lateness next to a nice -20 loop: %.1f ms\n", worst * 1000);
+        _exit(worst < 0.004 ? 0 : 1);
+    }
+    st = 0;
+    waitpid(sleeper, &st, 0);
+    kill(hog, SIGKILL);
+    waitpid(hog, NULL, 0);
+    check("a woken task preempts a nice -20 loop at once", WIFEXITED(st) && WEXITSTATUS(st) == 0);
 }
 
 int main(void) {

@@ -89,11 +89,14 @@ pub struct Queue {
     next_tick: u64,
     /// The deadline the local APIC is programmed for (u64::MAX: none).
     programmed: u64,
+    /// When the running task's time slice ends (u64::MAX: no end of its
+    /// own; see `sched::start_slice`).
+    slice_end: u64,
 }
 
 impl Queue {
     pub const fn new() -> Queue {
-        Queue { heap: BinaryHeap::new(), next_tick: 0, programmed: u64::MAX }
+        Queue { heap: BinaryHeap::new(), next_tick: 0, programmed: u64::MAX, slice_end: u64::MAX }
     }
 
     /// Adds an entry without allocating: a full queue first drops what is
@@ -162,6 +165,16 @@ fn queue(entry: Entry) {
     }
 }
 
+/// Sets when the running task's time slice ends on this CPU (u64::MAX:
+/// none); the interrupt then asks for a reschedule.
+pub fn set_slice_end(deadline: u64) {
+    let mut q = smp::cpu().timers.lock();
+    q.slice_end = deadline;
+    if deadline < q.programmed {
+        program(&mut q, deadline);
+    }
+}
+
 fn next_seq() -> u64 {
     NEXT_SEQ.fetch_add(1, Ordering::Relaxed)
 }
@@ -223,12 +236,16 @@ pub fn interrupt(from_user: bool) -> bool {
         // Ticks missed while interrupts were off are not made up.
         q.next_tick = (q.next_tick + TICK_NS).max(now + TICK_NS / 2);
     }
-    let next = q.heap.peek().map_or(q.next_tick, |e| e.deadline.min(q.next_tick));
+    let slice_over = now >= q.slice_end;
+    if slice_over {
+        q.slice_end = u64::MAX;
+    }
+    let next = q.heap.peek().map_or(q.next_tick, |e| e.deadline.min(q.next_tick)).min(q.slice_end);
     program(&mut q, next);
     drop(q);
     // The running task gives up the CPU when its time slice is over.
     let over = tick && sched::tick(from_user);
-    over || woke
+    over || slice_over || woke
 }
 
 /// Runs an expired entry if it is still live. Returns whether it woke a
