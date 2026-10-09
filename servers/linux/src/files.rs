@@ -64,6 +64,8 @@ pub enum File {
     Dev(Arc<crate::devices::DevOpen>),
     /// An O_PATH descriptor (of any node).
     Path(Arc<crate::pathfile::PathOpen>),
+    /// An open file of /proc or /sys.
+    Proc(Arc<crate::procfile::ProcOpen>),
 }
 
 /// What mmap of one of the server's files maps.
@@ -94,7 +96,7 @@ pub fn new_id() -> u64 {
 /// one). On failure the file is forgotten again.
 pub fn install(id: u64, file: File, flags: u32, ready: i16) -> Result<i64, i64> {
     // Regular files, directories and null and zero are always ready.
-    let kind = if matches!(file, File::Tmp(_) | File::Data(_) | File::Dev(_)) { KFD_ALWAYS_READY } else { 0 };
+    let kind = if matches!(file, File::Tmp(_) | File::Data(_) | File::Dev(_) | File::Proc(_)) { KFD_ALWAYS_READY } else { 0 };
     FILES.lock().insert(id, file);
     let fd = syscall(SYS_KFD_INSTALL, [id, flags as u64, ready as u16 as u64, kind, 0, 0]);
     if fd < 0 {
@@ -207,22 +209,38 @@ pub fn origin_of(fd: u64) -> Option<OriginOf> {
 /// The status of descriptor `fd`, one of the server's files or of the
 /// kernel's (EBADF for neither).
 pub fn stat_of(fd: u64) -> Result<vfs::stat::Stat, i64> {
-    let bytes = match lookup(fd) {
-        Some((File::Pipe(end), _)) => end.stat(),
-        Some((File::EventFd(e), _)) => e.stat(),
-        Some((File::Tmp(f), _)) => return Ok(f.inode.status()),
-        Some((File::Data(f), _)) => crate::datafs::stat(&f.inode)?,
-        Some((File::Netlink(n), _)) => n.stat(),
-        Some((File::Inotify(i), _)) => i.stat(),
-        Some((File::Socket(s), _)) => crate::sockcalls::stat(&s),
-        Some((File::Inet(s), _)) => crate::inetcalls::stat(&s),
-        Some((File::Tty(t), _)) => t.origin.stat()?,
-        Some((File::PtyMaster(m), _)) => m.origin.stat()?,
-        Some((File::Dev(d), _)) => d.origin.stat()?,
-        Some((File::Path(p), _)) => p.origin.stat()?,
-        None => kernel_stat(fd)?,
+    match lookup(fd) {
+        Some((file, _)) => stat_file(&file),
+        None => Ok(vfs::stat::Stat::from_bytes(&kernel_stat(fd)?)),
+    }
+}
+
+/// The status of one of the server's files.
+pub fn stat_file(file: &File) -> Result<vfs::stat::Stat, i64> {
+    let bytes = match file {
+        File::Pipe(end) => end.stat(),
+        File::EventFd(e) => e.stat(),
+        File::Tmp(f) => return Ok(f.inode.status()),
+        File::Data(f) => crate::datafs::stat(&f.inode)?,
+        File::Netlink(n) => n.stat(),
+        File::Inotify(i) => i.stat(),
+        File::Socket(s) => crate::sockcalls::stat(s),
+        File::Inet(s) => crate::inetcalls::stat(s),
+        File::Tty(t) => t.origin.stat()?,
+        File::PtyMaster(m) => m.origin.stat()?,
+        File::Dev(d) => d.origin.stat()?,
+        File::Path(p) => p.origin.stat()?,
+        File::Proc(p) => crate::procfs::stat(&p.node)?,
     };
     Ok(vfs::stat::Stat::from_bytes(&bytes))
+}
+
+/// The open /proc or /sys file behind descriptor `fd`, if it is one.
+pub fn proc_of(fd: u64) -> Option<Arc<crate::procfile::ProcOpen>> {
+    match lookup(fd)? {
+        (File::Proc(f), _) => Some(f),
+        _ => None,
+    }
 }
 
 /// The `struct stat` of descriptor `fd`, one of the kernel's files (EBADF
@@ -232,7 +250,7 @@ fn kernel_stat(fd: u64) -> Result<[u8; 144], i64> {
     match syscall(SYS_KFD_STAT, [fd, st.as_mut_ptr() as u64, 0, 0, 0, 0]) {
         r if r < 0 => Err(-r),
         _ => {
-            crate::namespace::kernel_times(&mut st);
+            crate::namespace::pseudo_times(&mut st);
             Ok(st)
         }
     }
@@ -359,7 +377,7 @@ pub fn handle(s: &State) -> Option<i64> {
         | SYS_PREADV | SYS_PWRITEV | SYS_FSYNC | SYS_FDATASYNC | SYS_FTRUNCATE | SYS_GETDENTS64 | SYS_FSTATFS => match lookup(a0) {
             Some((file, flags)) => on_file(s.rax, file, flags, a1, a2, a3),
             // fstat of one of the kernel's files: its answer, with the
-            // times the server keeps for it (`namespace::set_kernel_times`).
+            // times the server keeps for it (`namespace::set_pseudo_times`).
             None if s.rax == SYS_FSTAT => kernel_stat(a0).and_then(|st| crate::usercopy::to_program(a1, &st)).map(|_| 0),
             None => return None,
         },
@@ -407,6 +425,7 @@ fn on_file(nr: u64, file: File, flags: u32, a1: u64, a2: u64, a3: u64) -> Result
         File::PtyMaster(m) => return crate::pty::call(nr, &m, flags, a1, a2),
         File::Dev(d) => return crate::devices::call(nr, &d, flags, a1, a2),
         File::Path(p) => return crate::pathfile::call(nr, &p, a1),
+        File::Proc(p) => return crate::procfile::call(nr, &p, flags, a1, a2, a3),
     };
     let readable = flags & O_ACCMODE != O_WRONLY;
     let writable = flags & O_ACCMODE != 0;
@@ -523,6 +542,7 @@ fn sendfile(out_fd: u64, out: Option<(File, u32)>, in_fd: u64, input: Option<(Fi
             Some((File::EventFd(_) | File::Netlink(_) | File::Inotify(_), _)) => Err(EINVAL),
             Some((File::Tmp(f), _)) => f.read_server(&mut buf[..want]).map(|n| n as i64),
             Some((File::Data(f), _)) => f.read_server(&mut buf[..want]).map(|n| n as i64),
+            Some((File::Proc(f), _)) => f.read_server(&mut buf[..want]).map(|n| n as i64),
             Some((File::Socket(s), flags)) => crate::sockcalls::read_server(s, *flags, &mut buf[..want]),
             Some((File::Inet(s), flags)) => crate::inetcalls::read_server(s, *flags, &mut buf[..want]),
             Some((File::Tty(t), flags)) => {
@@ -553,7 +573,7 @@ fn sendfile(out_fd: u64, out: Option<(File, u32)>, in_fd: u64, input: Option<(Fi
             Some((File::Inet(s), flags)) => crate::inetcalls::write_server(s, *flags, &buf[..n]),
             Some((File::Tty(t), flags)) => t.tty.write(t, crate::unix::Source::Server { buf: &buf[..n], at: 0 }, flags & O_NONBLOCK != 0),
             Some((File::PtyMaster(m), flags)) => m.write(crate::unix::Source::Server { buf: &buf[..n], at: 0 }, flags & O_NONBLOCK != 0),
-            Some((File::Path(_), _)) => Err(EBADF),
+            Some((File::Path(_) | File::Proc(_), _)) => Err(EBADF),
             Some((File::Dev(_), _)) => Ok(n as i64),
             None => match syscall(SYS_KFD_WRITE, [out_fd, buf.as_ptr() as u64, n as u64, 0, 0, 0]) {
                 r if r < 0 => Err(-r),

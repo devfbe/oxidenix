@@ -11,5 +11,6 @@ bench = false
 
 [dependencies]
 oxrt = { path = "../../crates/oxrt" }
-fsproto = { path = "../../crates/fsproto" }
 procproto = { path = "../../crates/procproto" }
+ring = { path = "../../crates/ring" }
+fsring = { path = "../../crates/fsring" }

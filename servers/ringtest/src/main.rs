@@ -25,6 +25,7 @@ const EACCES: i64 = 13;
 const ENOENT: i64 = 2;
 const ENOMEM: i64 = 12;
 const EFAULT: i64 = 14;
+const E2BIG: i64 = 7;
 const PAGE: u64 = 4096;
 const PROT_READ: u64 = 1;
 const PROT_WRITE: u64 = 2;
@@ -94,6 +95,12 @@ fn main(args: Vec<&'static str>) -> i32 {
     }
     if let Err(e) = oxrt::ipc_register_with(SERVICE, 0, oxrt::IPC_CHANNELS) {
         println!("ringtest: cannot register: {}", e);
+        return 1;
+    }
+    // A name without channels, for the client's EOPNOTSUPP (registered
+    // after the first, which `ipc_receive` serves).
+    if let Err(e) = oxrt::ipc_register(PLAIN, 0) {
+        println!("ringtest: cannot register {}: {}", PLAIN, e);
         return 1;
     }
     let mut message = [0u8; 64];
@@ -241,6 +248,19 @@ fn handle(channel: u64, base: *mut u8, layout: &Layout, d: &Desc, mapped: &mut V
             }
             let _ = unsafe { m.addr.read_volatile() };
             Ok(0)
+        }
+        MAP_LIMITED => {
+            if mapped.iter().any(|m| m.grant == d.grant) {
+                return Err(-EINVAL);
+            }
+            match oxrt::grant_map_max(channel, d.grant, d.arg[0]) {
+                Err((e, pages)) if e == -E2BIG => Ok(if pages == d.len as u64 { 0 } else { 2 }),
+                Err((e, _)) => Err(e),
+                Ok((addr, pages, writable)) => {
+                    mapped.push(Mapped { grant: d.grant, addr, len: pages * PAGE, writable });
+                    Ok(1)
+                }
+            }
         }
         DMA => oxrt::grant_dma(channel, d.grant, d.buf_off as u64).map(|a| a as i64),
         DMA_UNMAP => oxrt::grant_dma_unmap(channel, d.grant).map(|_| 0),

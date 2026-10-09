@@ -43,6 +43,8 @@ mod pathfile;
 mod paths;
 mod pipe;
 mod process;
+mod procfile;
+mod procfs;
 mod pty;
 mod records;
 mod ringclient;
@@ -87,10 +89,6 @@ pub(crate) fn syscall(nr: u64, a: [u64; 6]) -> i64 {
         );
     }
     ret
-}
-
-fn call0(nr: u64) -> i64 {
-    syscall(nr, [0; 6])
 }
 
 /// A kernel call that reads and writes the thread's `State` (restricted_enter,
@@ -199,6 +197,11 @@ fn dispatch(s: &mut State) -> i64 {
     }
     match s.rax {
         TEST_MAP..=TEST_CACHED => test(s.rax, s.rdi),
+        // The kernel's to answer, with the name in the server's memory.
+        TEST_SERVER_TICKS => match usercopy::read_cstr(s.rdi) {
+            Ok(name) => syscall(TEST_SERVER_TICKS, [name.as_ptr() as u64, name.len() as u64, 0, 0, 0, 0]),
+            Err(e) => -e,
+        },
         TEST_PASS_THROUGH => {
             const SYS_GETPID: u64 = 39;
             s.rax = SYS_GETPID;

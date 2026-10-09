@@ -1,11 +1,13 @@
 //! proc_query (syscall 1005): the kernel's native process and system
-//! information for the procfs server (records in `procproto`). Only
-//! privileged servers may ask; procfs decides what programs see.
+//! information for the procfs server (records in `procproto`), and the same
+//! for the Linux server (`restricted::SYS_PROC_INFO`), whose /proc/<pid>
+//! shows the processes until R8 makes them its own. Only privileged
+//! servers and the Linux server may ask; they decide what programs see.
 
 use super::errno::*;
 use super::sched::{self, TABLE};
 use super::task::State;
-use super::{uaccess, Pid, TIMER_HZ};
+use super::{uaccess, TIMER_HZ};
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 use procproto::*;
@@ -13,6 +15,7 @@ use procproto::*;
 fn system() -> System {
     let mut s = System { hz: TIMER_HZ, uptime: sched::ticks(), page_size: 4096, ..Default::default() };
     s.boot_time = crate::time::boot_time();
+    s.tsc_hz = crate::time::tsc_hz();
     for i in 0..MAX_CPUS {
         let Some(cpu) = crate::smp::by_index(i) else { continue };
         let st = sched::cpu_stats(cpu);
@@ -46,67 +49,6 @@ fn system() -> System {
     s
 }
 
-/// The process `pid` names: a process id, or the id of one of its threads
-/// (Linux's /proc has a directory for every thread id, though it lists
-/// only processes).
-fn group(pid: Pid) -> Result<alloc::sync::Arc<super::task::ThreadGroup>, i64> {
-    let table = TABLE.lock();
-    table.groups.get(&pid).cloned().or_else(|| table.tasks.get(&pid).map(|t| t.group.clone())).ok_or(ESRCH)
-}
-
-fn process(pid: Pid) -> Result<Process, i64> {
-    let g = group(pid)?;
-    let info = g.info.lock();
-    // The process's state is its main thread's (or the first live one's):
-    // running if any thread runs.
-    let state = if info.threads.is_empty() {
-        STATE_ZOMBIE
-    } else if info.threads.iter().any(|t| matches!(t.state(), State::Running | State::Runnable)) {
-        STATE_RUNNING
-    } else if info.threads.iter().all(|t| t.state() == State::Stopped) {
-        STATE_STOPPED
-    } else {
-        STATE_SLEEPING
-    };
-    let (user_ns, system_ns) = info.cputime();
-    let tick_ns = crate::time::NSEC_PER_SEC / TIMER_HZ;
-    let mut p = Process {
-        pid,
-        tgid: g.tgid,
-        ppid: info.ppid,
-        pgid: info.pgid,
-        sid: info.sid,
-        state: state as u64,
-        utime: user_ns / tick_ns,
-        stime: system_ns / tick_ns,
-        start: g.start_ticks,
-        pages: info.mem.as_ref().map_or(0, |m| m.pages.load(Ordering::Relaxed)),
-        virt_pages: info.mem.as_ref().map_or(0, |m| m.virt_pages.load(Ordering::Relaxed)),
-        // The main thread's (nice values are per thread).
-        nice: info.threads.first().map_or(0, |t| t.nice.load(Ordering::Relaxed)) as i64,
-        threads: info.threads.len() as u64,
-        cpu: info.threads.first().map_or(0, |t| t.last_cpu.load(Ordering::Relaxed)) as u64,
-        flags: 0,
-        legacy_calls: g.legacy_calls.load(Ordering::Relaxed),
-        name: [0; 16],
-    };
-    if g.privileged.load(Ordering::Relaxed) {
-        p.flags |= FLAG_SERVER;
-    }
-    if pid == 0 {
-        p.flags |= FLAG_KERNEL;
-    }
-    let n = info.name.len().min(15);
-    p.name[..n].copy_from_slice(&info.name.as_bytes()[..n]);
-    Ok(p)
-}
-
-fn text_of(pid: Pid, f: impl FnOnce(&super::task::Info) -> Vec<u8>) -> Result<Vec<u8>, i64> {
-    let g = group(pid)?;
-    let info = g.info.lock();
-    Ok(f(&info))
-}
-
 /// sysinfo(2): uptime, load and memory in the layout of `struct sysinfo`.
 pub fn sysinfo(buf: u64) -> SysResult {
     const SI_LOAD_SHIFT: u32 = 16;
@@ -126,29 +68,40 @@ pub fn sysinfo(buf: u64) -> SysResult {
     Ok(0)
 }
 
-/// proc_query(op, arg, buf, len): writes the answer to `buf` and returns
-/// its length; ERANGE if it does not fit (except QUERY_PIDS, which fills
-/// what fits).
-pub fn proc_query(op: u64, arg: u64, buf: u64, len: u64) -> SysResult {
-    if !sched::current().group.privileged.load(Ordering::Relaxed) {
-        return Err(EPERM);
+/// The answer to `op` for a buffer of `len` bytes: the system-wide record
+/// (`QUERY_SYSTEM`; the processes' records are their Linux server's since
+/// R8); ERANGE if it does not fit.
+fn answer(op: u64, len: u64) -> Result<Vec<u8>, i64> {
+    if op != QUERY_SYSTEM {
+        return Err(EINVAL);
     }
-    let bytes: Vec<u8> = match op {
-        QUERY_SYSTEM => as_bytes(&system()).to_vec(),
-        QUERY_PIDS => {
-            let pids: Vec<u64> = TABLE.lock().groups.keys().copied().collect();
-            let fit = (len / 8) as usize;
-            pids.iter().take(fit).flat_map(|p| p.to_le_bytes()).collect()
-        }
-        QUERY_PROCESS => as_bytes(&process(arg)?).to_vec(),
-        QUERY_CMDLINE => text_of(arg, |i| i.cmdline.clone())?,
-        QUERY_EXE => text_of(arg, |i| i.exe.as_bytes().to_vec())?,
-        QUERY_MOUNTS => crate::fs::mounts().into_bytes(),
-        _ => return Err(EINVAL),
-    };
+    let bytes = as_bytes(&system()).to_vec();
     if bytes.len() as u64 > len {
         return Err(ERANGE);
     }
+    Ok(bytes)
+}
+
+/// proc_query(op, arg, buf, len): writes the answer to `buf` and returns
+/// its length; ERANGE if it does not fit. For the kernel's servers
+/// (procfs), and only the system-wide record (`QUERY_SYSTEM`; EPERM for
+/// the others): procfs serves every instance, so it must not be able to
+/// hand one instance another's processes (each instance's /proc/<pid> is
+/// its own server's, `server_query`).
+pub fn proc_query(op: u64, arg: u64, buf: u64, len: u64) -> SysResult {
+    if !sched::current().group.privileged.load(Ordering::Relaxed) || op != QUERY_SYSTEM {
+        return Err(EPERM);
+    }
+    let _ = arg;
+    let bytes = answer(op, len)?;
     uaccess::copy_to(buf, &bytes)?;
+    Ok(bytes.len() as i64)
+}
+
+/// `restricted::SYS_SYSTEM_INFO`: the system's record for a Linux server,
+/// into its own memory.
+pub fn server_query(op: u64, buf: u64, len: u64) -> SysResult {
+    let bytes = answer(op, len)?;
+    uaccess::copy_to_server(buf, &bytes)?;
     Ok(bytes.len() as i64)
 }

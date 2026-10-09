@@ -369,11 +369,6 @@ pub fn me() -> (Pid, Pid) {
     (local::tid(), local::pid())
 }
 
-/// A process's comm: its main thread's name (or the first thread's).
-pub fn comm_of(t: &Table, p: &Proc) -> [u8; 16] {
-    p.threads.first().and_then(|tid| t.threads.get(tid)).map_or([0; 16], |th| th.comm)
-}
-
 /// The name (comm) of `path`'s last component, as exec gives it.
 pub fn comm_from(path: &str) -> [u8; 16] {
     let base = path.rsplit('/').next().unwrap_or(path).as_bytes();
@@ -1271,6 +1266,123 @@ pub fn keys_where(select: impl Fn(&Proc) -> bool) -> Vec<u64> {
         .filter(|p| p.zombie.is_none() && select(p))
         .flat_map(|p| p.threads.iter().filter_map(|tid| t.threads.get(tid)).filter(|th| th.key != 0).map(|th| th.key))
         .collect()
+}
+
+/// The working directory of process `pid` (its main thread's, or its first live one's).
+pub fn cwd_of(pid: Pid) -> Option<String> {
+    let fs = {
+        let t = PROCS.lock();
+        let p = t.procs.get(&pid)?;
+        p.threads.first().and_then(|tid| t.threads.get(tid)).map(|th| th.fs.clone())?
+    };
+    let cwd = fs.state.lock().cwd.clone();
+    Some(cwd)
+}
+
+/// The umask of process `pid` (its main thread's record).
+pub fn umask_of(pid: Pid) -> Option<u32> {
+    let fs = {
+        let t = PROCS.lock();
+        let p = t.procs.get(&pid)?;
+        p.threads.first().and_then(|tid| t.threads.get(tid)).map(|th| th.fs.clone())?
+    };
+    let umask = fs.state.lock().umask;
+    Some(umask)
+}
+
+/// /proc's records of the instance's processes (`procproto`'s `QUERY_PIDS`,
+/// `QUERY_THREADS`, `QUERY_PROCESS`, `QUERY_CMDLINE`, `QUERY_EXE`), from the process table
+/// and the kernel's accounts (`proc_info`, `thread_info`): the bytes of the answer, at most
+/// `cap` (lists of ids: what fits; ERANGE for a record that does not fit), ESRCH for no
+/// such process (or thread).
+pub fn query(op: u64, arg: u64, cap: usize) -> Result<Vec<u8>, i64> {
+    use procproto::*;
+    const ERANGE: i64 = 34;
+    let t = PROCS.lock();
+    let ids = |list: &mut dyn Iterator<Item = Pid>| -> Vec<u8> { list.take(cap / 8).flat_map(|p| (p as u64).to_le_bytes()).collect() };
+    let text = |bytes: &[u8]| if bytes.len() > cap { Err(ERANGE) } else { Ok(bytes.to_vec()) };
+    // The process `arg` names: a process, or a thread's.
+    let id = arg as Pid;
+    let owner = || -> Result<Pid, i64> {
+        if t.procs.contains_key(&id) {
+            Ok(id)
+        } else {
+            t.threads.get(&id).map(|th| th.pid).ok_or(ESRCH)
+        }
+    };
+    match op {
+        QUERY_PIDS => Ok(ids(&mut t.procs.keys().copied())),
+        QUERY_THREADS => {
+            let p = t.procs.get(&owner()?).ok_or(ESRCH)?;
+            let mut tids = p.threads.clone();
+            tids.sort_unstable();
+            Ok(ids(&mut tids.into_iter()))
+        }
+        QUERY_CMDLINE => text(&t.procs[&owner()?].cmdline),
+        QUERY_EXE => text(t.procs[&owner()?].exe.as_bytes()),
+        QUERY_PROCESS => {
+            let pid = owner()?;
+            let p = &t.procs[&pid];
+            let mut info = ProcInfo::default();
+            syscall(SYS_PROC_INFO, [p.handle, &mut info as *mut ProcInfo as u64, 0, 0, 0, 0]);
+            // The thread asked for, or the main (first live) one.
+            let tid = if t.threads.contains_key(&id) { id } else { p.threads.first().copied().unwrap_or(pid) };
+            let th = t.threads.get(&tid);
+            let mut tinfo = ThreadInfo::default();
+            if let Some(th) = th.filter(|th| th.key != 0) {
+                syscall(SYS_THREAD_INFO, [th.key, &mut tinfo as *mut ThreadInfo as u64, 0, 0, 0, 0]);
+            }
+            const TICK_NS: u64 = 10_000_000;
+            let (user, system) = if t.threads.contains_key(&id) && id != pid { (tinfo.user_ns, tinfo.system_ns) } else { (info.user_ns, info.system_ns) };
+            let state = if p.zombie.is_some() {
+                STATE_ZOMBIE
+            } else if p.sig.stop.stopped {
+                STATE_STOPPED
+            } else if (if id != pid { tinfo.running } else { info.running }) > 0 {
+                STATE_RUNNING
+            } else {
+                STATE_SLEEPING
+            };
+            let actions = &t.hands[&p.sig.hand].actions;
+            let (mut ignored, mut caught) = (0, 0);
+            for (i, a) in actions.iter().enumerate() {
+                match a.handler {
+                    signal::SIG_IGN => ignored |= 1 << i,
+                    signal::SIG_DFL => {}
+                    _ => caught |= 1 << i,
+                }
+            }
+            let comm = th.map_or([0; 16], |th| th.comm);
+            let record = Process {
+                pid: id as u64,
+                tgid: pid as u64,
+                ppid: p.ppid as u64,
+                pgid: p.pgid as u64,
+                sid: p.sid as u64,
+                state: state as u64,
+                utime: user / TICK_NS,
+                stime: system / TICK_NS,
+                start: info.start_ticks,
+                pages: info.pages,
+                virt_pages: info.virt_pages,
+                nice: tinfo.nice,
+                threads: p.threads.len() as u64,
+                cpu: tinfo.cpu,
+                flags: 0,
+                legacy_calls: info.legacy_calls,
+                peak_pages: info.peak_pages,
+                virt_peak: info.virt_pages,
+                sig_pending: th.map_or(0, |th| th.sig.pending.set),
+                sig_shared: p.sig.shared.set,
+                sig_blocked: th.map_or(0, |th| th.sig.mask),
+                sig_ignored: ignored,
+                sig_caught: caught,
+                name: comm,
+            };
+            text(as_bytes(&record))
+        }
+        _ => Err(EINVAL),
+    }
 }
 
 /// The program break of process `pid` (shared by the processes sharing its address

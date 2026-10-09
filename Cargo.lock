@@ -237,10 +237,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fsproto"
-version = "0.1.0"
-
-[[package]]
 name = "fsring"
 version = "0.1.0"
 dependencies = [
@@ -373,6 +369,7 @@ dependencies = [
  "linked_list_allocator",
  "netlink",
  "netring",
+ "procproto",
  "restricted",
  "ring",
  "slab 0.1.0",
@@ -492,7 +489,6 @@ version = "0.1.0"
 dependencies = [
  "bootloader_api",
  "csprng",
- "fsproto",
  "heapless",
  "lazy_static",
  "linked_list_allocator",
@@ -563,9 +559,10 @@ dependencies = [
 name = "procfs"
 version = "0.1.0"
 dependencies = [
- "fsproto",
+ "fsring",
  "oxrt",
  "procproto",
+ "ring",
 ]
 
 [[package]]

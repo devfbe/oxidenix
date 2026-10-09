@@ -1805,6 +1805,37 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             super::uaccess::copy_to_server(a[0], &out)?;
             Ok(0)
         }
+        SYS_SYSTEM_INFO => {
+            // The system's records only: the processes are the server's (R8).
+            if a[0] != procproto::QUERY_SYSTEM {
+                return Err(EINVAL);
+            }
+            super::query::server_query(a[0], a[2], a[3])
+        }
+        TEST_SERVER_TICKS => {
+            if !crate::TEST_MODE.load(core::sync::atomic::Ordering::Relaxed) {
+                return Err(ENOSYS);
+            }
+            let len = a[1].min(64) as usize;
+            let mut name = [0u8; 64];
+            super::uaccess::copy_from_server(a[0], &mut name[..len])?;
+            let name = core::str::from_utf8(&name[..len]).map_err(|_| EINVAL)?;
+            let pid = super::server_named(name).and_then(|s| s.pid()).ok_or(ESRCH)?;
+            let group = super::group(pid).ok_or(ESRCH)?;
+            let (user, system) = group.info.lock().cputime();
+            Ok(((user + system) / 1_000_000) as i64)
+        }
+        SYS_KFD_LIST => {
+            let (from, buf, cap) = (a[0], a[1], a[2]);
+            if cap > KFD_LIST_MAX {
+                return Err(EINVAL);
+            }
+            let mut fds = [0u32; KFD_LIST_MAX as usize];
+            let n = with_current(|p| p.files().map(|f| f.open_from(from, &mut fds[..cap as usize])))?;
+            let bytes: Vec<u8> = fds[..n].iter().flat_map(|fd| fd.to_le_bytes()).collect();
+            super::uaccess::copy_to_server(buf, &bytes)?;
+            Ok(n as i64)
+        }
         SYS_SERVER_LOG => {
             let len = a[1].min(SERVER_LOG_MAX);
             let mut text = [0u8; SERVER_LOG_MAX as usize];

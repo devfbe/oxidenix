@@ -237,12 +237,19 @@ pub struct MemStats {
     pub pages: AtomicU64,
     pub virt_pages: AtomicU64,
     pub peak_pages: AtomicU64,
+    /// The most pages of address space it had (Linux's VmPeak).
+    pub virt_peak: AtomicU64,
 }
 
 impl MemStats {
     fn add_resident(&self, pages: u64) {
         let now = self.pages.fetch_add(pages, Ordering::Relaxed) + pages;
         self.peak_pages.fetch_max(now, Ordering::Relaxed);
+    }
+
+    fn add_virt(&self, pages: u64) {
+        let now = self.virt_pages.fetch_add(pages, Ordering::Relaxed) + pages;
+        self.virt_peak.fetch_max(now, Ordering::Relaxed);
     }
 }
 
@@ -522,7 +529,7 @@ impl AddressSpace {
     }
 
     fn insert(&mut self, vma: Vma) {
-        count(&self.stats.virt_pages, vma.pages() as i64);
+        self.stats.add_virt(vma.pages());
         self.vmas.insert(vma.start, vma);
     }
 
@@ -1168,7 +1175,7 @@ impl AddressSpace {
         }
         let mut v = self.vmas.remove(&start).expect("found above");
         v.start = page;
-        count(&self.stats.virt_pages, grow as i64);
+        self.stats.add_virt(grow);
         self.vmas.insert(page, v);
         Ok(())
     }
@@ -1421,7 +1428,9 @@ impl AddressSpace {
         }
         // From here on the areas' commit is released with the space.
         self.vmas = vmas;
-        self.stats.virt_pages.store(self.vmas.values().map(|v| v.pages()).sum(), Ordering::Relaxed);
+        let virt = self.vmas.values().map(|v| v.pages()).sum();
+        self.stats.virt_pages.store(virt, Ordering::Relaxed);
+        self.stats.virt_peak.fetch_max(virt, Ordering::Relaxed);
         let mut mapper = self.mapper();
         let table_flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
         let (vmas, stats) = (&parent.vmas, &self.stats);

@@ -216,7 +216,7 @@ fn rings() -> Result<(), i64> {
     check!(4, c.connect(SERVICE) == -EISCONN);
     let d = Client::create().map_err(|_| 5)?;
     check!(6, d.connect("nosuchservice") == -ENOENT);
-    check!(7, d.connect("procfs") == -EOPNOTSUPP);
+    check!(7, d.connect(PLAIN) == -EOPNOTSUPP);
     let obj = object(1, |_| 0).map_err(|_| 8)?;
     check!(9, d.grant(obj, 0, 1, 0) == -ENOTCONN);
     close(obj);
@@ -286,6 +286,11 @@ fn grants() -> Result<(), i64> {
     check!(35, c.grant(c.handle, 0, 1, 0) == -EINVAL);
     check!(36, c.grant(obj, 0, 0, 0) == -EINVAL);
     check!(37, c.grant(obj, u64::MAX & !(PAGE - 1), 1, 0) == -EINVAL);
+    // A service maps a grant only within the limit it gives (E2BIG before
+    // anything is mapped, with the grant's size), and then at that size.
+    let big = c.grant(obj, 0, 4, 0);
+    check!(138, big > 0 && c.status(MAP_LIMITED, big, 0, 4, 3) == 0);
+    check!(139, c.status(MAP_LIMITED, big, 0, 4, 4) == 1 && c.status(READ, big, 0, PAGE, 0) == PAGE as i64);
     // Device addresses: within the grant only.
     let a = c.status(DMA, g, PAGE + 5, 0, 0);
     check!(38, a > 0 && a % PAGE as i64 == 5);

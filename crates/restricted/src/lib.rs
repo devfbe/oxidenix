@@ -863,6 +863,25 @@ pub struct ThreadInfo {
     pub kernel_tid: u64,
 }
 
+// /proc (I/O rings step 5, docs/design/linux-server.md "/proc and /sys"):
+// the system-wide files are procfs's, over the instance's channel; each
+// process's own part of /proc is the server's, made from its own process
+// table (R8) and the kernel's `proc_info`/`thread_info`, and its
+// descriptors from the kernel's table until that is the server's (R6e).
+
+/// `system_info(QUERY_SYSTEM, 0, buf, len) -> n`: the kernel's record of the
+/// system (`procproto::System`: its tick rate, CPUs, memory, counters), as
+/// the procfs server's `proc_query` gives it, into the server's memory;
+/// ERANGE if it does not fit. (The processes' records are the server's
+/// since R8: any other query is EINVAL.)
+pub const SYS_SYSTEM_INFO: u64 = 1116;
+/// `kfd_list(from, buf, cap) -> n`: the calling process's open descriptors
+/// from `from` on, in ascending order, as up to `cap` u32s at `buf`; the
+/// count (fewer than `cap`: no more); `cap` at most `KFD_LIST_MAX`. For
+/// /proc/self/fd until the descriptor table is the server's (R6e).
+pub const SYS_KFD_LIST: u64 = 1117;
+pub const KFD_LIST_MAX: u64 = 256;
+
 /// `(scenario)`: the server runs a channel scenario against the test
 /// service (servers/ringtest, `ring::selftest`): 1 rings and doorbells, 2
 /// grants and their bounds, 3 revoking, 4 the client's end going, 5 the
@@ -882,6 +901,12 @@ pub const TEST_CHANNEL: u64 = 1514;
 /// checks that diskfs sleeps), 9 their completions taken. 0 if
 /// every check held, else the negative number of the first that failed.
 pub const TEST_DISKRING: u64 = 1515;
+/// `(name, len) -> ms`: the CPU time (user and system, in milliseconds) of
+/// the running process of the kernel's server `name` (ESRCH if none), in
+/// test mode only (ENOSYS otherwise); a program's call with a C string
+/// `name` is the server's to pass on. The self-tests measure a server's
+/// idleness with it: /proc shows only the caller's instance's processes.
+pub const TEST_SERVER_TICKS: u64 = 1518;
 /// `(scenario)`: the server checks the kernel's interface of its page cache
 /// (`SYS_MO_CREATE_CACHED`) on a file of /data: 1 a failed fill beyond the
 /// end of the file or over 256 pages leaves no trace (the file grown later
