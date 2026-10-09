@@ -158,6 +158,43 @@ const TIME_WAIT: Duration = Duration::from_secs(10);
 /// to another instance's if all are taken.
 const CHANNEL_IDLE: Duration = Duration::from_secs(10);
 
+/// The secrets of TCP's initial sequence numbers (RFC 6528) and of the
+/// ephemeral ports (RFC 6056), from the kernel's generator at the start
+/// (`init_secrets`); smoltcp's ISN hook is a plain function, so they are
+/// statics.
+static ISN_KEY: [core::sync::atomic::AtomicU64; 2] = [const { core::sync::atomic::AtomicU64::new(0) }; 2];
+static PORT_KEY: [core::sync::atomic::AtomicU64; 2] = [const { core::sync::atomic::AtomicU64::new(0) }; 2];
+
+pub fn init_secrets() {
+    for key in [&ISN_KEY, &PORT_KEY] {
+        let mut b = [0u8; 16];
+        oxrt::getrandom(&mut b);
+        key[0].store(u64::from_le_bytes(b[..8].try_into().expect("8 bytes")), SeqCst);
+        key[1].store(u64::from_le_bytes(b[8..].try_into().expect("8 bytes")), SeqCst);
+    }
+}
+
+fn secret(key: &[core::sync::atomic::AtomicU64; 2]) -> [u8; 16] {
+    let mut k = [0u8; 16];
+    k[..8].copy_from_slice(&key[0].load(SeqCst).to_le_bytes());
+    k[8..].copy_from_slice(&key[1].load(SeqCst).to_le_bytes());
+    k
+}
+
+/// TCP's initial sequence number for a connection from `local` to
+/// `remote` (RFC 6528): a clock ticking every 4 microseconds plus a keyed
+/// hash (SipHash, `ISN_KEY`) of the 4-tuple, so nobody can predict it, and
+/// a new connection of the same 4-tuple starts beyond the old one.
+pub fn isn(local: IpEndpoint, remote: IpEndpoint, now: Instant) -> u32 {
+    let mut data = [0u8; 12];
+    data[..4].copy_from_slice(&bits(local.addr).to_be_bytes());
+    data[4..6].copy_from_slice(&local.port.to_be_bytes());
+    data[6..10].copy_from_slice(&bits(remote.addr).to_be_bytes());
+    data[10..].copy_from_slice(&remote.port.to_be_bytes());
+    let clock = (now.total_micros() / 4) as u32;
+    clock.wrapping_add(csprng::siphash(&secret(&ISN_KEY), &data) as u32)
+}
+
 /// A futex wake of one sleeper (a ring's doorbell: the client's reaper).
 struct WakeOne;
 
@@ -496,8 +533,16 @@ pub struct Service {
     /// Closed connections in TIME-WAIT: only their port and endpoints, until
     /// then (their smoltcp socket and its buffers went).
     lingering: Vec<Lingering>,
-    /// The state of `random`.
-    rng: u64,
+    /// netd's random numbers (seeded from the kernel's generator).
+    rng: csprng::ChaCha,
+    /// RFC 6056's counter (`ephemeral`), and the ports in use as it finds
+    /// them (one bit per ephemeral port).
+    port_counter: u32,
+    port_scratch: [u64; 256],
+    /// Who holds which port, for routing ICMP errors (`icmp_ports`; made
+    /// room for at the start).
+    tcp_owners: Vec<(u16, u64)>,
+    udp_owners: Vec<(u16, u64)>,
     /// What the instances hold, each within its share: the bytes of
     /// smoltcp's socket buffers (and of closed connections' leftovers),
     /// smoltcp sockets, records of ports in TIME-WAIT, channels.
@@ -566,7 +611,15 @@ impl Service {
             chans: (0..MAX_CHANNELS).map(|_| None).collect(),
             closing: Vec::new(),
             lingering: Vec::new(),
-            rng: unsafe { core::arch::x86_64::_rdtsc() } ^ 0x9e37_79b9_7f4a_7c15,
+            rng: {
+                let mut seed = [0u8; 32];
+                oxrt::getrandom(&mut seed);
+                csprng::ChaCha::new(seed)
+            },
+            port_counter: 0,
+            port_scratch: [0; 256],
+            tcp_owners: Vec::with_capacity(MAX_SMOLTCP + MAX_LINGERING),
+            udp_owners: Vec::with_capacity(MAX_SMOLTCP),
             bytes: Budget::new(BUDGET, BUDGET / RESERVED_INSTANCES, BUDGET),
             socks: Budget::new(MAX_SMOLTCP, MAX_SMOLTCP / RESERVED_INSTANCES, MAX_SMOLTCP),
             lingering_records: Budget::new(MAX_LINGERING, MAX_LINGERING / RESERVED_INSTANCES, INSTANCE_LINGERING),
@@ -984,10 +1037,10 @@ impl Service {
         }
     }
 
-    /// The sockets that hold a port (TCP or UDP ones), of every channel and
-    /// the closing ones; `except` (channel, socket) is left out.
-    fn holders(&self, tcp: bool, sockets: &SocketSet<'static>, except: Option<(usize, u32)>) -> Vec<PortHolder> {
-        let mut out = Vec::new();
+    /// Calls `f` for every socket that holds a port (TCP or UDP ones), of
+    /// every channel and the closing and TIME-WAIT ones; `except` (channel,
+    /// socket) is left out. (A visit, not a list: netd's heap holds no copy.)
+    fn for_each_holder(&self, tcp: bool, sockets: &SocketSet<'static>, except: Option<(usize, u32)>, mut f: impl FnMut(PortHolder)) {
         for (c, chan) in self.chans.iter().enumerate() {
             let Some(chan) = chan else { continue };
             for (&i, s) in &chan.socks {
@@ -1004,7 +1057,7 @@ impl Service {
                 };
                 if let Some((local, reuse, listening, connected)) = held {
                     let addr = local.addr.map(bits);
-                    out.push(PortHolder { owner: chan.owner, port: local.port, addr, reuse, listening, connected, closing: false });
+                    f(PortHolder { owner: chan.owner, port: local.port, addr, reuse, listening, connected, closing: false });
                 }
             }
         }
@@ -1012,12 +1065,11 @@ impl Service {
             for cl in &self.closing {
                 if let Some(local) = cl.local {
                     let addr = local.addr.map(bits);
-                    out.push(PortHolder { owner: cl.owner, port: local.port, addr, reuse: cl.reuse, listening: false, connected: false, closing: true });
+                    f(PortHolder { owner: cl.owner, port: local.port, addr, reuse: cl.reuse, listening: false, connected: false, closing: true });
                 }
             }
-            out.extend(self.lingering.iter().map(|l| l.holder));
+            self.lingering.iter().for_each(|l| f(l.holder));
         }
-        out
     }
 
     /// Whether instance `owner` has a TCP connection from `local` to
@@ -1044,35 +1096,43 @@ impl Service {
         let owner = self.chans[c].as_ref().expect("in use").owner;
         let claim = PortClaim { owner, port, addr: addr.map(bits), reuse };
         let rule = if tcp { tcp_port_conflict } else { udp_port_conflict };
-        self.holders(tcp, sockets, Some((c, sock))).iter().any(|h| rule(&claim, h))
+        let mut conflict = false;
+        self.for_each_holder(tcp, sockets, Some((c, sock)), |h| conflict |= rule(&claim, &h));
+        conflict
     }
 
     /// A free ephemeral port: held by no TCP socket, or bound by no UDP one.
-    /// RFC 6056's first algorithm: a random start, then the next free one,
-    /// so that nobody on the network (or another instance) can guess the
-    /// ports a host's connections will use.
-    fn ephemeral(&mut self, tcp: bool, sockets: &SocketSet<'static>) -> Result<u16, i64> {
-        let held: alloc::collections::BTreeSet<u16> = self.holders(tcp, sockets, None).iter().map(|h| h.port).collect();
-        let range = (u16::MAX - FIRST_EPHEMERAL) as u64 + 1;
-        let start = (self.random() % range) as u16;
-        for k in 0..range as u16 {
-            let port = FIRST_EPHEMERAL + start.wrapping_add(k) % range as u16;
-            if !held.contains(&port) {
-                return Ok(port);
+    /// For a connection to `remote`, RFC 6056's third algorithm: a keyed
+    /// hash of the destination (`PORT_KEY`, secret) gives where the search
+    /// starts and a counter moves it on, so ports are unpredictable to
+    /// anyone (on the network or in another instance) and successive
+    /// connections to one destination do not reuse a port soon; for a bind
+    /// to port 0 (no destination yet), a random start (its first
+    /// algorithm). The ports in use are marked in a bitmap kept for this
+    /// (no allocation).
+    fn ephemeral(&mut self, tcp: bool, remote: Option<IpEndpoint>, sockets: &SocketSet<'static>) -> Result<u16, i64> {
+        let mut used = core::mem::replace(&mut self.port_scratch, [0; 256]);
+        used.fill(0);
+        self.for_each_holder(tcp, sockets, None, |h| {
+            if let Some(i) = h.port.checked_sub(FIRST_EPHEMERAL) {
+                used[i as usize / 64] |= 1 << (i % 64);
             }
-        }
-        Err(EADDRINUSE)
-    }
-
-    /// A random number: xorshift64* over a state that the time stamp
-    /// counter stirs at every draw (netd has no other source of entropy).
-    fn random(&mut self) -> u64 {
-        let mut x = self.rng ^ unsafe { core::arch::x86_64::_rdtsc() }.rotate_left(29);
-        x ^= x >> 12;
-        x ^= x << 25;
-        x ^= x >> 27;
-        self.rng = x;
-        x.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        });
+        const RANGE: u32 = (u16::MAX - FIRST_EPHEMERAL) as u32 + 1;
+        let start = match remote {
+            Some(r) => {
+                let mut data = [0u8; 7];
+                data[..4].copy_from_slice(&bits(r.addr).to_be_bytes());
+                data[4..6].copy_from_slice(&r.port.to_be_bytes());
+                data[6] = tcp as u8;
+                self.port_counter = self.port_counter.wrapping_add(1);
+                (csprng::siphash(&secret(&PORT_KEY), &data) as u32).wrapping_add(self.port_counter)
+            }
+            None => self.rng.u64() as u32,
+        };
+        let found = (0..RANGE).map(|k| start.wrapping_add(k) % RANGE).find(|&i| used[i as usize / 64] & (1 << (i % 64)) == 0);
+        self.port_scratch = used;
+        found.map(|i| FIRST_EPHEMERAL + i as u16).ok_or(EADDRINUSE)
     }
 
     fn bind(&mut self, c: usize, sock: u32, at: Endpoint, reuse: bool, sockets: &mut SocketSet<'static>) -> Reply {
@@ -1089,7 +1149,7 @@ impl Service {
             Proto::Raw { .. } => return done(0),
         };
         let port = match at.port {
-            0 => self.ephemeral(is_tcp, sockets)?,
+            0 => self.ephemeral(is_tcp, None, sockets)?,
             p if self.conflict(is_tcp, c, sock, p, addr, reuse, sockets) => return Err(EADDRINUSE),
             p => p,
         };
@@ -1129,7 +1189,7 @@ impl Service {
                 return Err(EADDRINUSE);
             }
         }
-        let port = if bound.is_none() { Some(self.ephemeral(true, sockets)?) } else { None };
+        let port = if bound.is_none() { Some(self.ephemeral(true, None, sockets)?) } else { None };
         // The backlog's sockets beside the socket's own, as many as the
         // budget allows (a smaller backlog if it is short). They cost only
         // their place until a connection arrives.
@@ -1213,7 +1273,7 @@ impl Service {
                         l
                     }
                     // (An ephemeral port is held by no TCP socket at all.)
-                    None => IpListenEndpoint { addr: None, port: self.ephemeral(true, sockets)? },
+                    None => IpListenEndpoint { addr: None, port: self.ephemeral(true, Some(remote), sockets)? },
                 };
                 // Its buffers come now (the SYN announces the window).
                 self.equip(handle, sockets)?;
@@ -1248,7 +1308,7 @@ impl Service {
                     return Err(EINVAL);
                 }
                 if peer.is_some() && !sockets.get::<udp::Socket>(handle).is_open() {
-                    let port = self.ephemeral(false, sockets)?;
+                    let port = self.ephemeral(false, peer, sockets)?;
                     sockets.get_mut::<udp::Socket>(handle).bind(port).map_err(|_| EADDRINUSE)?;
                 }
                 if let Proto::Udp { peer: p, .. } = &mut self.sock(c, sock)?.proto {
@@ -1369,7 +1429,7 @@ impl Service {
                 return Err(ENETUNREACH);
             }
             if !sockets.get::<udp::Socket>(handle).is_open() {
-                let port = self.ephemeral(false, sockets)?;
+                let port = self.ephemeral(false, Some(dest), sockets)?;
                 sockets.get_mut::<udp::Socket>(handle).bind(port).map_err(|_| EADDRINUSE)?;
             }
             let socket = sockets.get_mut::<udp::Socket>(handle);
@@ -1640,7 +1700,7 @@ impl Service {
     pub fn pump(&mut self, sockets: &mut SocketSet<'static>) -> bool {
         let mut progress = self.finish_closing(sockets);
         let mut wants = core::mem::take(&mut self.wants);
-        let icmp = self.icmp_ports(sockets).map(|(tcp, udp)| IcmpOwners { echo: &self.echo, tcp, udp });
+        let icmp = self.icmp_ports(sockets).then_some(IcmpOwners { echo: &self.echo, tcp: &self.tcp_owners, udp: &self.udp_owners });
         let mut round = Round { now: crate::now(), trimming: pressure(&self.bytes), owner: 0, icmp };
         for chan in self.chans.iter_mut().flatten() {
             round.owner = chan.owner;
@@ -1696,14 +1756,20 @@ impl Service {
     /// Who holds each TCP and UDP port, for the ICMP errors about them, if
     /// a raw socket has messages to take (rare: it is worked out only
     /// then; the echo identifiers are `self.echo`).
-    fn icmp_ports(&self, sockets: &SocketSet<'static>) -> Option<(BTreeMap<u16, u64>, BTreeMap<u16, u64>)> {
+    fn icmp_ports(&mut self, sockets: &SocketSet<'static>) -> bool {
         let pending = self.chans.iter().flatten().flat_map(|c| c.socks.values()).any(|s| matches!(&s.proto, Proto::Raw { handle, .. } if sockets.get::<raw::Socket>(*handle).can_recv()));
         if !pending {
-            return None;
+            return false;
         }
-        let tcp = self.holders(true, sockets, None).iter().map(|h| (h.port, h.owner)).collect();
-        let udp = self.holders(false, sockets, None).iter().map(|h| (h.port, h.owner)).collect();
-        Some((tcp, udp))
+        for tcp in [true, false] {
+            // (Made room for at the start: no allocation here.)
+            let mut owners = core::mem::take(if tcp { &mut self.tcp_owners } else { &mut self.udp_owners });
+            owners.clear();
+            self.for_each_holder(tcp, sockets, None, |h| owners.push((h.port, h.owner)));
+            owners.sort_unstable();
+            *(if tcp { &mut self.tcp_owners } else { &mut self.udp_owners }) = owners;
+        }
+        true
     }
 
     /// Gives the connections that arrived at listeners since smoltcp last
@@ -2170,10 +2236,10 @@ struct IcmpOwners<'a> {
     /// The echo identifiers on the wire (netd gives each instance's
     /// requests their own: `netring::EchoIds`).
     echo: &'a EchoIds,
-    /// Who holds each TCP and UDP port (one instance at most: ports are
-    /// never shared across instances).
-    tcp: BTreeMap<u16, u64>,
-    udp: BTreeMap<u16, u64>,
+    /// Who holds each TCP and UDP port, sorted (one instance at most:
+    /// ports are never shared across instances).
+    tcp: &'a [(u16, u64)],
+    udp: &'a [(u16, u64)],
 }
 
 /// What an instance sees of an ICMP message.
@@ -2204,11 +2270,17 @@ impl IcmpOwners<'_> {
                     None => View::Nothing,
                 };
             }
-            netring::IcmpKey::Tcp(port) => self.tcp.get(&port),
-            netring::IcmpKey::Udp(port) => self.udp.get(&port),
+            netring::IcmpKey::Tcp(port) => holder_of(self.tcp, port),
+            netring::IcmpKey::Udp(port) => holder_of(self.udp, port),
         };
-        if holder == Some(&owner) { View::Whole } else { View::Nothing }
+        if holder == Some(owner) { View::Whole } else { View::Nothing }
     }
+}
+
+/// The instance in `owners` (sorted by port) holding `port`.
+fn holder_of(owners: &[(u16, u64)], port: u16) -> Option<u64> {
+    let i = owners.partition_point(|&(p, _)| p < port);
+    owners.get(i).filter(|&&(p, _)| p == port).map(|&(_, o)| o)
 }
 
 enum Placed {

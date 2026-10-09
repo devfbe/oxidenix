@@ -113,8 +113,15 @@ fn main(args: Vec<&'static str>) -> i32 {
         return 1;
     }
     let mut config = Config::new(mac.into());
-    config.random_seed = oxrt::uptime_ms() ^ (phys << 7);
+    // smoltcp's own randomness (DHCP's transaction ids, its ports when it
+    // picks one) from the kernel's generator; TCP's initial sequence
+    // numbers are RFC 6528's (`service::isn`).
+    let mut seed = [0u8; 8];
+    oxrt::getrandom(&mut seed);
+    config.random_seed = u64::from_le_bytes(seed);
     let mut iface = Interface::new(config, &mut nic, now());
+    service::init_secrets();
+    iface.set_isn_generator(service::isn);
     iface.update_ip_addrs(|addrs| {
         let _ = addrs.push(IpCidr::Ipv4(LOOPBACK));
     });

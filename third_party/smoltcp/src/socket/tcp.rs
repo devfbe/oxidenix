@@ -1144,20 +1144,25 @@ impl<'a> Socket<'a> {
         });
         self.set_state(State::SynSent);
 
-        let seq = Self::random_seq_no(cx);
+        let seq = self.random_seq_no(cx);
         self.local_seq_no = seq;
         self.remote_last_seq = seq;
         Ok(())
     }
 
     #[cfg(test)]
-    fn random_seq_no(_cx: &mut Context) -> TcpSeqNumber {
+    fn random_seq_no(&self, _cx: &mut Context) -> TcpSeqNumber {
         TcpSeqNumber(10000)
     }
 
+    /// oxidenix: from the interface's ISN generator for the connection's
+    /// 4-tuple (RFC 6528), if it has one.
     #[cfg(not(test))]
-    fn random_seq_no(cx: &mut Context) -> TcpSeqNumber {
-        TcpSeqNumber(cx.rand().rand_u32() as i32)
+    fn random_seq_no(&self, cx: &mut Context) -> TcpSeqNumber {
+        match self.tuple {
+            Some(t) => TcpSeqNumber(cx.isn(t.local, t.remote) as i32),
+            None => TcpSeqNumber(cx.rand().rand_u32() as i32),
+        }
     }
 
     /// Close the transmit half of the full-duplex connection.
@@ -2009,7 +2014,7 @@ impl<'a> Socket<'a> {
                     local: IpEndpoint::new(ip_repr.dst_addr(), repr.dst_port),
                     remote: IpEndpoint::new(ip_repr.src_addr(), repr.src_port),
                 });
-                self.local_seq_no = Self::random_seq_no(cx);
+                self.local_seq_no = self.random_seq_no(cx);
                 self.remote_seq_no = repr.seq_number + 1;
                 self.remote_last_seq = self.local_seq_no;
                 self.remote_has_sack = repr.sack_permitted;
@@ -10298,6 +10303,20 @@ mod test {
         let mut all = [0; 64];
         assert_eq!(s.recv_slice(&mut all), Ok(16));
         assert_eq!(&all[..16], &[b'q'; 16]);
+    }
+
+    #[test]
+    fn test_oxidenix_isn_generator() {
+        fn isn(local: IpEndpoint, remote: IpEndpoint, now: Instant) -> u32 {
+            local.port as u32 * 1000 + remote.port as u32 + now.total_millis() as u32
+        }
+        let (mut iface, _, _) = crate::tests::setup(crate::phy::Medium::Ip);
+        let (a, b) = (IpEndpoint::new(LOCAL_ADDR.into(), 7), IpEndpoint::new(REMOTE_ADDR.into(), 9));
+        // Without one: the PRNG's.
+        let _ = iface.context().isn(a, b);
+        iface.set_isn_generator(isn);
+        iface.context().set_now(Instant::from_millis(5));
+        assert_eq!(iface.context().isn(a, b), 7014);
     }
 
     #[test]
