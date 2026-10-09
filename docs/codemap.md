@@ -135,7 +135,7 @@ module comment, and the public types it defines. Where to start for common tasks
 
 ## Host builder
 
-- `builder/src/main.rs` (337) The host-side builder (`cargo run` in kernel/ runs it): builds the root filesystem and its cpio initramfs, the data disk and the UEFI or BIOS boot image, then starts QEMU.
+- `builder/src/main.rs` (391) The host-side builder (`cargo run` in kernel/ runs it): builds the root filesystem and its cpio initramfs, the data disk and the UEFI or BIOS boot image, then starts QEMU.
 
 ## User-space programs and tests
 

@@ -279,13 +279,15 @@ const TEST_DISK_BYTES: u64 = 64 << 20;
 /// the host.
 fn create_data_disk(path: &Path, bytes: u64) -> io::Result<()> {
     let content = Path::new(env!("CARGO_MANIFEST_DIR")).join("../userspace/disk");
-    let mkfs = format!(
-        "unset SOURCE_DATE_EPOCH; mke2fs -q -t ext2 -b 1024 -I 128 -O none,filetype,sparse_super,large_file -L oxidenix -d '{}' -F '{}' {}",
-        content.display(),
-        path.display(),
-        bytes / 1024
-    );
-    let status = Command::new("nix-shell").args(["-p", "e2fsprogs", "--run", &mkfs]).status()?;
+    // (Paths go to mke2fs as arguments of their own, through no shell.)
+    let status = Command::new(e2fsprogs("mke2fs"))
+        .args(["-q", "-t", "ext2", "-b", "1024", "-I", "128", "-O", "none,filetype,sparse_super,large_file", "-L", "oxidenix", "-d"])
+        .arg(&content)
+        .arg("-F")
+        .arg(path)
+        .arg((bytes / 1024).to_string())
+        .env_remove("SOURCE_DATE_EPOCH")
+        .status()?;
     if !status.success() {
         let _ = fs::remove_file(path);
         return Err(io::Error::other("mke2fs failed"));
@@ -319,12 +321,87 @@ fn node_binary() -> Option<PathBuf> {
     Some(link.join("bin/node"))
 }
 
+/// The path of e2fsprogs' program `tool` (mke2fs, debugfs) from the pinned
+/// nixpkgs, built or fetched once.
+fn e2fsprogs(tool: &str) -> PathBuf {
+    static BIN: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    BIN.get_or_init(|| {
+        let out = Command::new("nix-build")
+            .args(["<nixpkgs>", "-A", "e2fsprogs.bin", "--no-out-link"])
+            .stderr(process::Stdio::inherit())
+            .output()
+            .expect("Failed to run nix-build for e2fsprogs");
+        if !out.status.success() {
+            eprintln!("nix-build e2fsprogs failed");
+            process::exit(2);
+        }
+        let store = String::from_utf8(out.stdout).expect("nix-build printed a non-UTF-8 path");
+        Path::new(store.trim()).join("bin")
+    })
+    .join(tool)
+}
+
+/// Runs debugfs on `disk` in `dir` with `args` (no shell: every path is an
+/// argument of its own, and the names in debugfs's own commands are fixed
+/// names in `dir`). Its exit status says nothing about its commands.
+fn debugfs(dir: &Path, disk: &Path, args: &[&str]) -> io::Result<process::Output> {
+    Command::new(e2fsprogs("debugfs"))
+        .current_dir(dir)
+        .args(args)
+        .arg(disk)
+        .env("DEBUGFS_PAGER", "__none__")
+        .env_remove("SOURCE_DATE_EPOCH")
+        .output()
+}
+
+/// Whether the files `a` and `b` have the same contents.
+fn same_contents(a: &Path, b: &Path) -> io::Result<bool> {
+    use std::io::Read;
+    let (mut fa, mut fb) = (fs::File::open(a)?, fs::File::open(b)?);
+    if fa.metadata()?.len() != fb.metadata()?.len() {
+        return Ok(false);
+    }
+    let (mut ba, mut bb) = (vec![0u8; 1 << 20], vec![0u8; 1 << 20]);
+    loop {
+        let n = fa.read(&mut ba)?;
+        if n == 0 {
+            return Ok(true);
+        }
+        fb.read_exact(&mut bb[..n])?;
+        if ba[..n] != bb[..n] {
+            return Ok(false);
+        }
+    }
+}
+
 /// Puts the host file `src` on the ext2 image `disk` as `dest` (relative to
 /// its root, in an existing or new directory), mode 0755 and owned by root,
-/// replacing an older version. debugfs edits the image in place, so the rest
-/// of the persistent disk stays as it is.
+/// replacing an older version; nothing if the disk has these contents there
+/// already. debugfs edits the image in place, so the rest of the persistent
+/// disk stays as it is. Afterwards the file is read back and compared.
 fn install_on_disk(disk: &Path, src: &Path, dest: &str) -> io::Result<()> {
-    let size = fs::metadata(src)?.len();
+    // `dest` goes into debugfs's commands: a plain relative path only.
+    assert!(
+        !dest.is_empty() && dest.split('/').all(|c| !c.is_empty() && c != ".." && c.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))),
+        "install_on_disk: unusual destination {dest}"
+    );
+    let work = disk.with_extension("install");
+    let _ = fs::remove_dir_all(&work);
+    fs::create_dir_all(&work)?;
+    let result = install_in(&work, disk, &fs::canonicalize(src)?, dest);
+    let _ = fs::remove_dir_all(&work);
+    result
+}
+
+fn install_in(work: &Path, disk: &Path, src: &Path, dest: &str) -> io::Result<()> {
+    // debugfs reads the source as `new` and dumps the disk's file as `old`.
+    std::os::unix::fs::symlink(src, work.join("new"))?;
+    let dump = format!("dump /{dest} old");
+    debugfs(work, disk, &["-R", &dump])?;
+    if work.join("old").exists() && same_contents(&work.join("old"), src)? {
+        println!("/{dest} on {} is up to date", disk.display());
+        return Ok(());
+    }
     let mut script = String::new();
     // debugfs goes on after a failing command: the directories that exist
     // already and a missing old version are no errors here.
@@ -333,26 +410,16 @@ fn install_on_disk(disk: &Path, src: &Path, dest: &str) -> io::Result<()> {
         dir = format!("{dir}/{part}");
         script += &format!("mkdir {dir}\n");
     }
-    script += &format!("rm /{dest}\nwrite \"{}\" /{dest}\n", src.display());
+    script += &format!("rm /{dest}\nwrite new /{dest}\n");
     script += &format!("sif /{dest} mode 0100755\nsif /{dest} uid 0\nsif /{dest} gid 0\n");
-    let cmds = disk.with_extension("debugfs");
-    fs::write(&cmds, script)?;
-    let run = |args: &str| {
-        Command::new("nix-shell")
-            .args(["-p", "e2fsprogs", "--run", &format!("unset SOURCE_DATE_EPOCH; debugfs {args} '{}'", disk.display())])
-            .env("DEBUGFS_PAGER", "__none__")
-            .output()
-    };
-    let out = run(&format!("-w -f '{}'", cmds.display()));
-    let _ = fs::remove_file(&cmds);
-    let out = out?;
-    // debugfs's exit status does not tell whether its commands worked: the
-    // file must now be there, as large as its source.
-    let stat = run(&format!("-R 'stat /{dest}'"))?;
-    let expected = format!("Size: {size}\n");
-    if !out.status.success() || !String::from_utf8_lossy(&stat.stdout).contains(&expected) {
-        let log = String::from_utf8_lossy(&out.stderr);
-        return Err(io::Error::other(format!("/{dest} is not on the disk after debugfs:\n{log}")));
+    fs::write(work.join("cmds"), script)?;
+    let wrote = debugfs(work, disk, &["-w", "-f", "cmds"])?;
+    // The file must now be there with the source's contents.
+    let check = format!("dump /{dest} check");
+    debugfs(work, disk, &["-R", &check])?;
+    if !wrote.status.success() || !work.join("check").exists() || !same_contents(&work.join("check"), src)? {
+        let log = String::from_utf8_lossy(&wrote.stderr);
+        return Err(io::Error::other(format!("/{dest} is not on the disk as it should be after debugfs:\n{log}")));
     }
     Ok(())
 }

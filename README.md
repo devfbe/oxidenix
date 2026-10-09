@@ -129,7 +129,8 @@ are off and why). The first build compiles V8 and runs Node's test suites (about
 cores); later runs take it from the Nix store (`target/node` keeps it from garbage collection).
 `OXIDENIX_NODE=<path>` installs another static node binary instead. The builder writes it into
 the existing disk image with `debugfs` (replacing an older version, leaving the rest of the disk
-as it is). Normal runs and CI never build or need Node.
+as it is; nothing if the disk has the same binary already), then reads it back and compares it.
+Normal runs and CI never build or need Node.
 
 `OXIDENIX_AUTORUN=<script> cargo run` boots like test mode into a shell script of the host's
 (copied to `/etc/autorun`): its output and the kernel log go to stdout, its exit status ends
