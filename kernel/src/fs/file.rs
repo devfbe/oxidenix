@@ -171,7 +171,14 @@ pub struct OpenFile {
     pub in_flight: AtomicUsize,
     /// References being let go of through `release` right now.
     releasing: AtomicUsize,
+    /// Its number, the inode number fstat reports for a file without an
+    /// inode (a socket, a pipe, an epoll instance): opaque, never an
+    /// address of the kernel's.
+    pub number: u64,
 }
+
+/// The next `OpenFile::number`.
+static NEXT_NUMBER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
 
 /// Lets go of a descriptor's (or a pin's) reference to `file`. If it is
 /// one of the Linux server's placeholders with descriptors in flight and,
@@ -216,6 +223,7 @@ impl OpenFile {
             _write_access: write_access,
             in_flight: AtomicUsize::new(0),
             releasing: AtomicUsize::new(0),
+            number: NEXT_NUMBER.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
         })
     }
 

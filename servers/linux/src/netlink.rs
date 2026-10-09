@@ -74,8 +74,11 @@ const POLLOUT: i16 = 0x4;
 const POLLERR: i16 = 0x8;
 
 /// Linux's default socket buffer sizes (net.core.rmem_default and
-/// wmem_default), and the least SO_RCVBUF/SO_SNDBUF make of a request.
+/// wmem_default), their largest (rmem_max and wmem_max: also for the
+/// FORCE options here, which Linux lets privileged callers take beyond),
+/// and the least SO_RCVBUF/SO_SNDBUF make of a request.
 const DEFAULT_BUF: u32 = 212_992;
+const MAX_BUF: u32 = 212_992;
 const MIN_RCVBUF: u32 = 2304;
 const MIN_SNDBUF: u32 = 4608;
 
@@ -105,6 +108,9 @@ struct State {
     /// The options that only answer what they were set to.
     options: u32,
     reported: i16,
+    /// A dump the kernel's end is producing as the receive buffer has
+    /// room (`netlink::Dump`).
+    dump: Option<netlink::Dump>,
 }
 
 pub struct NetlinkSocket {
@@ -143,6 +149,7 @@ pub fn socket(ty: u64, protocol: u64) -> Result<i64, i64> {
         sndbuf: DEFAULT_BUF,
         options: 0,
         reported: POLLOUT,
+        dump: None,
     };
     let socket = Arc::new(NetlinkSocket { id: files::new_id(), ty: kind, state: Mutex::new(state), seq: AtomicU32::new(0) });
     let flags = O_RDWR | (ty & (SOCK_NONBLOCK | SOCK_CLOEXEC)) as u32;
@@ -234,15 +241,46 @@ impl NetlinkSocket {
         let mut st = self.state.lock();
         for data in datagrams {
             if st.queued + data.len() > st.rcvbuf as usize {
-                if st.options & (1 << NETLINK_NO_ENOBUFS) == 0 {
-                    st.error = ENOBUFS;
-                }
+                Self::overrun(&mut st);
                 continue;
             }
             st.queued += data.len();
             st.queue.push_back(Datagram { from, data });
         }
         self.changed(&mut st, true);
+    }
+
+    /// Answers were dropped for want of room: ENOBUFS at the next receive
+    /// (unless NETLINK_NO_ENOBUFS).
+    fn overrun(st: &mut State) {
+        if st.options & (1 << NETLINK_NO_ENOBUFS) == 0 {
+            st.error = ENOBUFS;
+        }
+    }
+
+    /// Goes on with a running dump while the receive buffer has room (as
+    /// Linux's netlink_dump: at the request and after each receive that
+    /// leaves the buffer at most half full).
+    fn fill_dump(&self, interfaces: &[netlink::Interface]) {
+        let mut st = self.state.lock();
+        let mut added = false;
+        while st.queued < st.rcvbuf as usize {
+            let Some(dump) = st.dump.as_mut() else { break };
+            match dump.next(interfaces) {
+                Some(data) => {
+                    st.queued += data.len();
+                    st.queue.push_back(Datagram { from: 0, data });
+                    added = true;
+                }
+                None => {}
+            }
+            if st.dump.as_ref().is_none_or(|d| d.is_done()) {
+                st.dump = None;
+            }
+        }
+        if added {
+            self.changed(&mut st, true);
+        }
     }
 
     /// Binds to `port`, or to a free port of its own for 0 (autobind).
@@ -273,20 +311,41 @@ impl NetlinkSocket {
         Ok(chosen)
     }
 
-    /// Sends `data` to port `to` (0: the kernel's end, which answers it).
-    fn send(self: &Arc<Self>, data: Vec<u8>, to: u32) -> Result<i64, i64> {
-        let (sndbuf, cap_ack) = {
-            let st = self.state.lock();
-            (st.sndbuf, st.options & (1 << NETLINK_CAP_ACK) != 0)
-        };
-        if data.len() + 32 > sndbuf as usize {
+    /// Whether a datagram of `len` bytes may be sent (EMSGSIZE beyond the
+    /// send buffer, as Linux): checked before anything is allocated for it.
+    fn fits(&self, len: u64) -> Result<(), i64> {
+        let sndbuf = self.state.lock().sndbuf;
+        if len.saturating_add(32) > sndbuf as u64 {
             return Err(EMSGSIZE);
         }
+        Ok(())
+    }
+
+    /// Sends `data` to port `to` (0: the kernel's end, which answers it:
+    /// no more than its receive buffer has room for, a dump as it reads).
+    fn send(self: &Arc<Self>, data: Vec<u8>, to: u32) -> Result<i64, i64> {
+        self.fits(data.len() as u64)?;
         let port = self.bind_port(0)?;
         let len = data.len() as i64;
         if to == 0 {
-            let answers = netlink::answer(&data, port, &crate::netdev::interfaces(), cap_ack);
-            self.deliver(0, answers);
+            let interfaces = crate::netdev::interfaces();
+            let (cap_ack, dumping, room) = {
+                let st = self.state.lock();
+                (st.options & (1 << NETLINK_CAP_ACK) != 0, st.dump.is_some(), (st.rcvbuf as usize).saturating_sub(st.queued))
+            };
+            let (replies, overrun) = netlink::answer(&data, port, &interfaces, cap_ack, dumping, room);
+            let mut datagrams = Vec::new();
+            for r in replies {
+                match r {
+                    netlink::Reply::Datagram(d) => datagrams.push(d),
+                    netlink::Reply::Dump(d) => self.state.lock().dump = Some(d),
+                }
+            }
+            if overrun {
+                Self::overrun(&mut self.state.lock());
+            }
+            self.deliver(0, datagrams);
+            self.fill_dump(&interfaces);
         } else {
             let peer = PORTS.lock().get(&to).and_then(Weak::upgrade).ok_or(ECONNREFUSED)?;
             peer.deliver(port, alloc::vec![data]);
@@ -295,9 +354,12 @@ impl NetlinkSocket {
     }
 
     /// Receives the next datagram into `iov`: (bytes copied, the
-    /// datagram's length, its sender).
+    /// datagram's length, its sender). The datagram is taken (or, with
+    /// MSG_PEEK, copied) under the lock and copied to the program after it
+    /// (a fault there may need the pager); a copy that faults loses it, as
+    /// on Linux.
     fn recv(&self, iov: &[(u64, u64)], flags: u64, nonblock: bool) -> Result<(usize, usize, u32), i64> {
-        loop {
+        let (d, more) = loop {
             let seen;
             {
                 let mut st = self.state.lock();
@@ -306,20 +368,15 @@ impl NetlinkSocket {
                     self.changed(&mut st, false);
                     return Err(e);
                 }
-                if let Some(d) = st.queue.front() {
-                    let mut done = 0;
-                    for &(base, len) in iov {
-                        let n = (len as usize).min(d.data.len() - done);
-                        usercopy::to_program(base, &d.data[done..done + n])?;
-                        done += n;
+                if flags & MSG_PEEK != 0 {
+                    if let Some(d) = st.queue.front() {
+                        break (Datagram { from: d.from, data: d.data.clone() }, false);
                     }
-                    let (full, from) = (d.data.len(), d.from);
-                    if flags & MSG_PEEK == 0 {
-                        st.queued -= full;
-                        st.queue.pop_front();
-                        self.changed(&mut st, false);
-                    }
-                    return Ok((done, full, from));
+                } else if let Some(d) = st.queue.pop_front() {
+                    st.queued -= d.data.len();
+                    self.changed(&mut st, false);
+                    let more = st.dump.is_some() && st.queued <= st.rcvbuf as usize / 2;
+                    break (d, more);
                 }
                 seen = self.seq.load(Ordering::Acquire);
             }
@@ -327,7 +384,17 @@ impl NetlinkSocket {
                 return Err(EAGAIN);
             }
             self.wait(seen)?;
+        };
+        if more {
+            self.fill_dump(&crate::netdev::interfaces());
         }
+        let mut done = 0;
+        for &(base, len) in iov {
+            let n = (len as usize).min(d.data.len() - done);
+            usercopy::to_program(base, &d.data[done..done + n])?;
+            done += n;
+        }
+        Ok((done, d.data.len(), d.from))
     }
 
     fn sockopt_u32(&self, level: u64, name: u64) -> Result<u32, i64> {
@@ -359,9 +426,9 @@ impl NetlinkSocket {
                 if len < 4 {
                     return Err(EINVAL);
                 }
-                // Linux doubles the request (for its bookkeeping) and
-                // keeps a minimum.
-                let doubled = value.min(i32::MAX as u32 / 2) * 2;
+                // Linux doubles the request (for its bookkeeping), within
+                // rmem_max/wmem_max, and keeps a minimum.
+                let doubled = value.min(MAX_BUF) * 2;
                 if matches!(name, SO_RCVBUF | SO_RCVBUFFORCE) {
                     st.rcvbuf = doubled.max(MIN_RCVBUF);
                 } else {
@@ -497,9 +564,8 @@ pub fn call(nr: u64, sock: &Arc<NetlinkSocket>, flags: u32, a: [u64; 6]) -> Resu
                 sock.state.lock().dst_port
             };
             let total = iov.iter().try_fold(0u64, |sum, &(_, len)| sum.checked_add(len)).ok_or(EINVAL)?;
-            if total > DEFAULT_BUF as u64 * 64 {
-                return Err(EMSGSIZE);
-            }
+            // EMSGSIZE beyond the send buffer, before anything is allocated.
+            sock.fits(total)?;
             let mut data = alloc::vec![0u8; total as usize];
             let mut at = 0;
             for (base, len) in iov {

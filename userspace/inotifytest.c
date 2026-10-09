@@ -131,9 +131,88 @@ static void *creator(void *arg) {
     return NULL;
 }
 
+/* A file removed while open goes at its last close: IN_DELETE_SELF then. */
+static void unlinked_open(const char *dir) {
+    char f[96], name[128];
+    snprintf(f, sizeof f, "%s/inotify-open.%d", dir, getpid());
+    int fd = open(f, O_CREAT | O_RDWR, 0644);
+    int in = inotify_init1(IN_NONBLOCK);
+    inotify_add_watch(in, f, IN_ATTRIB | IN_DELETE_SELF | IN_CLOSE_WRITE);
+    unlink(f);
+    const char *got = drain(in);
+    snprintf(name, sizeof name, "%s: removed while open: the link count only", dir);
+    check(name, strcmp(got, "ATTRIB ") == 0);
+    close(fd);
+    got = drain(in);
+    snprintf(name, sizeof name, "%s: ... IN_DELETE_SELF at the last close", dir);
+    check(name, strcmp(got, "CLOSEW DELSELF IGNORED ") == 0);
+    printf("    (%s)\n", got);
+    close(in);
+}
+
+/* fs.inotify's limits: instances, watches, queued events. */
+static void limits(void) {
+    int fds[200], n = 0;
+    while (n < 200 && (fds[n] = inotify_init1(0)) >= 0) n++;
+    int e = errno;
+    for (int i = 0; i < n; i++) close(fds[i]);
+    check("at most 128 instances, then EMFILE", n == 128 && e == EMFILE);
+
+    int in = inotify_init1(IN_NONBLOCK);
+    check("the same kernel file is one watch", inotify_add_watch(in, "/dev/null", IN_ATTRIB) == inotify_add_watch(in, "/dev/null", IN_ATTRIB));
+    char d[64], f[96];
+    snprintf(d, sizeof d, "/tmp/inotify-lim.%d", getpid());
+    mkdir(d, 0755);
+    int watches = 1, wd = 0;
+    for (int i = 0; i < 9000; i++) {
+        snprintf(f, sizeof f, "%s/%d", d, i);
+        close(open(f, O_CREAT | O_WRONLY, 0644));
+        wd = inotify_add_watch(in, f, IN_ATTRIB);
+        if (wd < 0) break;
+        watches++;
+    }
+    e = errno;
+    printf("    (%d watches)\n", watches);
+    check("at most 8192 watches, then ENOSPC", wd == -1 && e == ENOSPC && watches == 8192);
+    close(in);
+    for (int i = 0; i < 9000; i++) {
+        snprintf(f, sizeof f, "%s/%d", d, i);
+        unlink(f);
+    }
+
+    /* More events than the queue takes: one IN_Q_OVERFLOW. */
+    in = inotify_init1(IN_NONBLOCK);
+    inotify_add_watch(in, d, IN_CREATE | IN_DELETE);
+    snprintf(f, sizeof f, "%s/x", d);
+    for (int i = 0; i < 8300; i++) {
+        close(open(f, O_CREAT | O_WRONLY, 0644));
+        unlink(f);
+    }
+    static char buf[1 << 16] __attribute__((aligned(8)));
+    int total = 0, overflow = 0, after = 0;
+    for (;;) {
+        ssize_t r = read(in, buf, sizeof buf);
+        if (r <= 0) break;
+        for (char *p = buf; p < buf + r;) {
+            struct inotify_event *ev = (struct inotify_event *)p;
+            if (ev->mask & IN_Q_OVERFLOW) overflow++;
+            else if (overflow) after++;
+            else total++;
+            p += sizeof *ev + ev->len;
+        }
+    }
+    printf("    (%d events, %d overflow)\n", total, overflow);
+    check("16384 events, then one IN_Q_OVERFLOW", total == 16384 && overflow == 1 && after == 0);
+    close(in);
+    rmdir(d);
+}
+
 int main(void) {
     on("/tmp");
     on("/data");
+    unlinked_open("/tmp");
+    unlinked_open("/data");
+    limits();
 
     int in = inotify_init();
     char d[64], f[96];

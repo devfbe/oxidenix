@@ -493,6 +493,13 @@ impl Regular {
         }
     }
 
+    fn size(&self) -> Result<u64, i64> {
+        match self {
+            Regular::Tmp(f) => Ok(f.inode.size()),
+            Regular::Data(f) => crate::datafs::size(&f.inode),
+        }
+    }
+
     /// Whether both are the same inode, and whether of one filesystem.
     fn same(&self, other: &Regular) -> (bool, bool) {
         match (self, other) {
@@ -502,12 +509,6 @@ impl Regular {
         }
     }
 
-    fn description(&self) -> *const () {
-        match self {
-            Regular::Tmp(f) => Arc::as_ptr(f) as *const (),
-            Regular::Data(f) => Arc::as_ptr(f) as *const (),
-        }
-    }
 }
 
 /// The file behind `fd` for copy_file_range, with its open flags: EBADF
@@ -565,17 +566,22 @@ fn copy_file_range(fd_in: u64, off_in: u64, fd_out: u64, off_out: u64, len: u64,
     let (given_in, given_out) = (read_off(off_in)?, read_off(off_out)?);
     // The positions of the descriptions that take part (one lock for one
     // description used at both ends).
-    let one = input.description() == output.description();
-    let mut in_pos = if given_in.is_none() { Some(input.position()) } else { None };
-    let mut out_pos = if given_out.is_none() && !(one && in_pos.is_some()) { Some(output.position()) } else { None };
-    let start_in = given_in.unwrap_or_else(|| **in_pos.as_ref().expect("taken above"));
-    let start_out = match (given_out, &out_pos) {
-        (Some(o), _) => o,
-        (None, Some(p)) => **p,
-        // The same description at both ends.
-        (None, None) => start_in,
+    // The positions are read now and written when the copy is done, with
+    // no lock held across it (as Linux: two copies between the same files
+    // in opposite directions must not wait for each other).
+    let start_in = match given_in {
+        Some(o) => o,
+        None => *input.position(),
     };
-    if same_inode && start_in < start_out.saturating_add(len) && start_out < start_in.saturating_add(len) {
+    let start_out = match given_out {
+        Some(o) => o,
+        None => *output.position(),
+    };
+    // Nothing beyond the input's end is copied: the length is clamped
+    // before the overlap is checked (as Linux's generic checks).
+    let size = input.size()?;
+    let len = len.min(size.saturating_sub(start_in));
+    if same_inode && len > 0 && start_in < start_out.saturating_add(len) && start_out < start_in.saturating_add(len) {
         return Err(EINVAL);
     }
     let mut buf = alloc::vec![0u8; 64 * 1024];
@@ -599,21 +605,13 @@ fn copy_file_range(fd_in: u64, off_in: u64, fd_out: u64, off_out: u64, len: u64,
             break;
         }
     }
-    if let Some(p) = in_pos.as_mut() {
-        **p = start_in + done;
-        if one && given_out.is_none() {
-            // (The same position: the copy's end on the output side.)
-            **p = start_out + done;
-        }
+    match given_in {
+        Some(_) => crate::usercopy::write(off_in, &(start_in + done))?,
+        None => *input.position() = start_in + done,
     }
-    if let Some(p) = out_pos.as_mut() {
-        **p = start_out + done;
-    }
-    if given_in.is_some() {
-        crate::usercopy::write(off_in, &(start_in + done))?;
-    }
-    if given_out.is_some() {
-        crate::usercopy::write(off_out, &(start_out + done))?;
+    match given_out {
+        Some(_) => crate::usercopy::write(off_out, &(start_out + done))?,
+        None => *output.position() = start_out + done,
     }
     Ok(done as i64)
 }

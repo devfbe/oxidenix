@@ -1562,7 +1562,7 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             }
             Ok(0)
         }
-        SYS_THREAD_NICE => super::thread_nice(a[0], a[1], a[2] != 0, a[3] as i64),
+        SYS_THREAD_NICE => super::thread_nice(instance.id, a[0], a[1], a[2] != 0, a[3] as i64),
         SYS_KFD_STAT => {
             let st = super::sys_file::fstat_bytes(a[0])?;
             super::uaccess::copy_to_server(a[1], &st)?;

@@ -315,28 +315,29 @@ pub fn sched_setaffinity(pid: Pid, size: u64, mask: u64) -> SysResult {
     Ok(0)
 }
 
-/// The Linux server's `SYS_THREAD_NICE`: the nice values of a thread, a
-/// process group or every thread; with `set`, they all get `nice`. The
-/// lowest nice value among them before, plus 20.
-pub fn thread_nice(scope: u64, id: u64, set: bool, nice: i64) -> SysResult {
+/// The Linux server's `SYS_THREAD_NICE`, for the instance `instance`: the
+/// nice values of a thread, a process group or every thread of the
+/// instance (only its own: ESRCH for another's); with `set`, they all get
+/// `nice`. The lowest nice value among them before, plus 20.
+pub fn thread_nice(instance: u64, scope: u64, id: u64, set: bool, nice: i64) -> SysResult {
     use restricted::{NICE_ALL, NICE_PGROUP, NICE_THREAD};
     let nice = nice.clamp(-20, 19) as i8;
-    let me = current();
+    let mine = |t: &Task| t.group.instance.load(Ordering::Acquire) == instance;
     let targets: Vec<Arc<Task>> = match scope {
         NICE_THREAD => {
             let t = if id == 0 { sched::current_arc() } else { task(id as Pid).ok_or(ESRCH)? };
-            if t.group.privileged.load(Ordering::Relaxed) && t.tgid() != me.tgid() {
-                return Err(EPERM);
+            if !mine(&t) {
+                return Err(ESRCH);
             }
             alloc::vec![t]
         }
         NICE_PGROUP | NICE_ALL => {
-            let pgid = if id == 0 { me.group.info.lock().pgid } else { id as Pid };
+            let pgid = if id == 0 { current().group.info.lock().pgid } else { id as Pid };
             let table = sched::TABLE.lock();
             table
                 .tasks
                 .values()
-                .filter(|t| t.tgid() != 0 && !t.group.privileged.load(Ordering::Relaxed))
+                .filter(|t| mine(t))
                 .filter(|t| scope == NICE_ALL || t.group.info.lock().pgid == pgid)
                 .cloned()
                 .collect()

@@ -254,7 +254,7 @@ pub fn fstat(fd: u64, buf: u64) -> SysResult {
 /// The `struct stat` of descriptor `fd` (fstat's answer).
 pub fn fstat_bytes(fd: u64) -> Result<[u8; 144], i64> {
     let f = file(fd)?;
-    let anon = |mode: u32| Ok(stat_bytes(Arc::as_ptr(&f) as u64, mode, 0, (1, 0, 0, 0)));
+    let anon = |mode: u32| Ok(stat_bytes(f.number, mode, 0, (1, 0, 0, 0)));
     match f.inode() {
         Some(inode) => inode_stat(inode),
         None if f.socket().is_some() => anon(S_IFSOCK | 0o777),

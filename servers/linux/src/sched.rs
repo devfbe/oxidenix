@@ -3,11 +3,14 @@
 //! thread, Linux's SCHED_OTHER with static priority 0, so the first two
 //! answer that (musl's pthread_getschedparam asks both, V8 does at
 //! startup); within it a thread's nice value weighs its share of the CPU,
-//! as on Linux (the kernel's round robin, weighted).
+//! as on Linux (the kernel's fair scheduler).
 //!
 //! Until the process model is the server's (R8) the thread ids are the
 //! kernel's: the kernel says whether one exists (`SYS_THREAD_EXISTS`) and
-//! keeps the nice values (`SYS_THREAD_NICE`).
+//! keeps the nice values (`SYS_THREAD_NICE`), for the threads of this
+//! process tree only (others are ESRCH, as if in another PID namespace).
+//! Lowering a nice value is allowed: the one user is root, with
+//! CAP_SYS_NICE, and RLIMIT_NICE has no limit.
 
 use crate::syscall;
 use restricted::*;

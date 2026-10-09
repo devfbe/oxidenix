@@ -97,7 +97,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::Cell;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use fsring::{Buf, Completion, Kind, Request};
 use restricted::*;
 
@@ -170,6 +170,48 @@ pub struct DInode {
     used: AtomicU64,
     /// Times set here that diskfs may not have yet (see `Times`).
     times: Mutex<Times>,
+    /// The directory and name it was last found by (lookup, create,
+    /// rename): where its inotify events about it go besides its own
+    /// watches. None once that name went.
+    link: Mutex<Option<(u32, String)>>,
+    /// Open file descriptions of it: an unlinked file's last close is when
+    /// it goes (inotify's IN_DELETE_SELF).
+    pub opens: AtomicUsize,
+}
+
+impl DInode {
+    pub fn link(&self) -> Option<(u32, String)> {
+        self.link.lock().clone()
+    }
+
+    /// Whether its last link went.
+    pub fn unlinked(&self) -> bool {
+        self.unlinked.load(Ordering::Relaxed)
+    }
+}
+
+/// The inode `ino` if the server has it now.
+pub fn cached(ino: u32) -> Option<Arc<DInode>> {
+    TABLE.lock().inodes.get(&ino).cloned()
+}
+
+/// The names of the table's inodes after a name changed: the inode found
+/// by `from` is now `to`'s (None: it has no name we know any more); one
+/// found by `to` before lost it. The inode that had `from`, if cached.
+fn relink(from: (u32, &str), to: Option<(u32, &str)>) -> Option<u32> {
+    let t = TABLE.lock();
+    let mut moved = None;
+    for i in t.inodes.values() {
+        let mut l = i.link.lock();
+        let is = |l: &Option<(u32, String)>, (d, n): (u32, &str)| l.as_ref().is_some_and(|(ld, ln)| *ld == d && ln == n);
+        if is(&l, from) {
+            *l = to.map(|(d, n)| (d, String::from(n)));
+            moved = Some(i.ino);
+        } else if to.is_some_and(|to| is(&l, to)) {
+            *l = None;
+        }
+    }
+    moved
 }
 
 /// A file's times as the server set them (seconds: ext2 keeps no more),
@@ -205,7 +247,19 @@ impl Times {
 
 /// The wall-clock time in seconds (ext2's timestamps).
 fn now_secs() -> u32 {
-    crate::time::realtime().sec.clamp(0, u32::MAX as i64) as u32
+    ext2_time(crate::time::realtime().sec)
+}
+
+/// A time in seconds as ext2 keeps it (an inode of 128 bytes has no extra
+/// time fields): a signed 32-bit number of seconds (1901 to 2038), stored
+/// in its unsigned field as Linux does; beyond, clamped.
+fn ext2_time(sec: i64) -> u32 {
+    sec.clamp(i32::MIN as i64, i32::MAX as i64) as i32 as u32
+}
+
+/// An ext2 time field read back: signed.
+fn from_ext2(t: u32) -> i64 {
+    t as i32 as i64
 }
 
 /// The contents of `inode` changed (a write, a truncation, a store through
@@ -241,7 +295,7 @@ pub fn set_times(inode: &Arc<DInode>, atime: vfs::stat::SetTime, mtime: vfs::sta
         return Ok(());
     }
     let now = crate::time::realtime();
-    let secs = |t: vfs::stat::Time| t.sec.clamp(0, u32::MAX as i64) as u32;
+    let secs = |t: vfs::stat::Time| ext2_time(t.sec);
     let request = {
         let mut t = inode.times.lock();
         if let Some(a) = atime.resolve(now) {
@@ -453,6 +507,8 @@ fn found(ino: u64, mode: u64, generation: u64) -> Result<Arc<DInode>, i64> {
         filled: AtomicU32::new(0),
         used: AtomicU64::new(TICK.fetch_add(1, Ordering::Relaxed)),
         times: Mutex::new(Times::default()),
+        link: Mutex::new(None),
+        opens: AtomicUsize::new(0),
     });
     t.inodes.insert(ino, inode.clone());
     if t.keys.len() > 2 * t.inodes.len() + 64 {
@@ -502,7 +558,9 @@ pub fn lookup(dir: &Arc<DInode>, name: &str) -> Result<Arc<DInode>, i64> {
     let _names = NAMES.read();
     let r = c.call(Request::Lookup { dir: dir.ino, name: scratch.buf(0, name.len() as u64) }.encode(0))?;
     status(&r)?;
-    found(r.values[0], r.values[1], r.values[2])
+    let inode = found(r.values[0], r.values[1], r.values[2])?;
+    *inode.link.lock() = Some((dir.ino, String::from(name)));
+    Ok(inode)
 }
 
 /// What `create` makes.
@@ -536,10 +594,13 @@ pub fn create(dir: &Arc<DInode>, name: &str, new: New, perm: u32) -> Result<Arc<
     let _names = NAMES.read();
     let r = c.call(Request::Create { dir: dir.ino, name: scratch.buf(0, n), kind, perm: perm & 0o7777 }.encode(0))?;
     status(&r)?;
-    found(r.values[0], r.values[1], r.values[2])
+    let inode = found(r.values[0], r.values[1], r.values[2])?;
+    *inode.link.lock() = Some((dir.ino, String::from(name)));
+    Ok(inode)
 }
 
-pub fn unlink(dir: &Arc<DInode>, name: &str, dir_only: bool) -> Result<(), i64> {
+/// The inode whose last link went, if any.
+pub fn unlink(dir: &Arc<DInode>, name: &str, dir_only: bool) -> Result<Option<u32>, i64> {
     live(dir)?;
     name_ok(name)?;
     let c = client()?;
@@ -552,11 +613,14 @@ pub fn unlink(dir: &Arc<DInode>, name: &str, dir_only: bool) -> Result<(), i64> 
         r.values[0]
     };
     drop(scratch);
+    relink((dir.ino, name), None);
     orphaned(&c, gone);
-    Ok(())
+    Ok(u32::try_from(gone).ok().filter(|&g| g != 0))
 }
 
-pub fn rename(odir: &Arc<DInode>, oname: &str, ndir: &Arc<DInode>, nname: &str) -> Result<(), i64> {
+/// The inode that moved (if cached here) and the one whose last link the
+/// rename took, if any.
+pub fn rename(odir: &Arc<DInode>, oname: &str, ndir: &Arc<DInode>, nname: &str) -> Result<(Option<u32>, Option<u32>), i64> {
     live(odir)?;
     live(ndir)?;
     name_ok(oname)?;
@@ -573,8 +637,9 @@ pub fn rename(odir: &Arc<DInode>, oname: &str, ndir: &Arc<DInode>, nname: &str) 
         r.values[0]
     };
     drop(scratch);
+    let moved = relink((odir.ino, oname), Some((ndir.ino, nname)));
     orphaned(&c, gone);
-    Ok(())
+    Ok((moved, u32::try_from(gone).ok().filter(|&g| g != 0)))
 }
 
 /// An unlink or rename took the last link of `ino` (0: none): the server
@@ -644,9 +709,9 @@ pub fn stat(inode: &Arc<DInode>) -> Result<[u8; 144], i64> {
     st[56..64].copy_from_slice(&4096u64.to_le_bytes());
     st[64..72].copy_from_slice(&size.div_ceil(512).to_le_bytes());
     let t = *inode.times.lock();
-    st[72..80].copy_from_slice(&(t.atime.unwrap_or(s.atime) as u64).to_le_bytes());
-    st[88..96].copy_from_slice(&(t.mtime.unwrap_or(s.mtime) as u64).to_le_bytes());
-    st[104..112].copy_from_slice(&(t.ctime.unwrap_or(s.ctime) as u64).to_le_bytes());
+    st[72..80].copy_from_slice(&from_ext2(t.atime.unwrap_or(s.atime)).to_le_bytes());
+    st[88..96].copy_from_slice(&from_ext2(t.mtime.unwrap_or(s.mtime)).to_le_bytes());
+    st[104..112].copy_from_slice(&from_ext2(t.ctime.unwrap_or(s.ctime)).to_le_bytes());
     Ok(st)
 }
 

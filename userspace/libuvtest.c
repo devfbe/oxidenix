@@ -13,6 +13,8 @@
 #include <net/if.h>
 #include <netpacket/packet.h>
 #include <poll.h>
+#include <pthread.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,6 +23,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <sys/sysmacros.h>
 #include <unistd.h>
 
@@ -146,6 +149,46 @@ static void test_io_uring(void) {
     check("... answered by the server (nothing passed to the kernel)", passed == 0);
 }
 
+/* Copies between two files in both directions at once, at the
+ * descriptions' positions: no lock may be held across a copy. */
+static int cfr_fds[2];
+
+static void *cfr_back(void *arg) {
+    (void)arg;
+    for (int i = 0; i < 300; i++) {
+        lseek(cfr_fds[1], 0, SEEK_SET);
+        lseek(cfr_fds[0], 0, SEEK_SET);
+        copy_file_range(cfr_fds[1], NULL, cfr_fds[0], NULL, 65536, 0);
+    }
+    return NULL;
+}
+
+static void test_copy_file_range_crossed(void) {
+    pid_t kid = fork();
+    if (kid == 0) {
+        alarm(20);
+        static char data[65536];
+        cfr_fds[0] = open("/tmp/cfr-p", O_CREAT | O_RDWR | O_TRUNC, 0644);
+        cfr_fds[1] = open("/tmp/cfr-q", O_CREAT | O_RDWR | O_TRUNC, 0644);
+        write(cfr_fds[0], data, sizeof data);
+        write(cfr_fds[1], data, sizeof data);
+        pthread_t t;
+        pthread_create(&t, NULL, cfr_back, NULL);
+        for (int i = 0; i < 300; i++) {
+            lseek(cfr_fds[0], 0, SEEK_SET);
+            lseek(cfr_fds[1], 0, SEEK_SET);
+            copy_file_range(cfr_fds[0], NULL, cfr_fds[1], NULL, 65536, 0);
+        }
+        pthread_join(t, NULL);
+        _exit(0);
+    }
+    int st = -1;
+    waitpid(kid, &st, 0);
+    check("copy_file_range both ways at once does not deadlock", WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    unlink("/tmp/cfr-p");
+    unlink("/tmp/cfr-q");
+}
+
 static void test_copy_file_range(void) {
     for (int k = 0; k < 2; k++) {
         const char *dir = k ? "/data" : "/tmp";
@@ -197,6 +240,8 @@ static void test_copy_file_range(void) {
     loff_t z = 0;
     errno = 0;
     check("copy_file_range across filesystems is EXDEV", copy_file_range(t, &z, dfd, NULL, 1, 0) == -1 && errno == EXDEV);
+    loff_t from = 0, to = 1;
+    check("copy_file_range within a file: the length clamped to its end first", copy_file_range(t, &from, t, &to, (size_t)-1 / 2, 0) == 1 && to == 2);
     int p[2];
     pipe(p);
     errno = 0;
@@ -314,6 +359,68 @@ static int nl_send(int fd, int type, int flags, unsigned seq, const void *body, 
     return (int)sendto(fd, buf, h->nlmsg_len, 0, (struct sockaddr *)&kernel, sizeof kernel);
 }
 
+/* The buffers bound what a netlink socket costs: sends beyond the send
+ * buffer fail before anything is allocated, the buffer options stop at
+ * rmem_max/wmem_max, answers that do not fit the receive buffer are
+ * dropped (ENOBUFS), a dump waits for room, and one dump runs at a time. */
+static void test_netlink_limits(int fd, struct rtgenmsg *g) {
+    char buf[8192];
+    errno = 0;
+    check("netlink: a datagram beyond the send buffer is EMSGSIZE", sendto(fd, buf, 300000, 0, NULL, 0) == -1 && errno == EMSGSIZE);
+    struct iovec huge[2] = {{buf, 1L << 40}, {buf, 1L << 40}};
+    struct msghdr hm = {.msg_iov = huge, .msg_iovlen = 2};
+    errno = 0;
+    check("netlink: ... also 2 TiB in an iovec (nothing allocated)", sendmsg(fd, &hm, 0) == -1 && errno == EMSGSIZE);
+    int big = 1 << 30, got = 0;
+    socklen_t len = sizeof got;
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUFFORCE, &big, sizeof big);
+    getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &got, &len);
+    check("netlink: SO_RCVBUF(FORCE) stops at twice rmem_max", got == 2 * 212992);
+    int small = 0;
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &small, sizeof small);
+    getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &got, &len);
+    check("netlink: ... and keeps a minimum (2304)", got == 2304);
+
+    /* Requests without reading: their answers stop at the buffer. */
+    struct ifinfomsg ifi = {.ifi_family = AF_UNSPEC, .ifi_index = 2};
+    for (int i = 0; i < 100; i++) nl_send(fd, RTM_GETLINK, NLM_F_REQUEST, 500 + i, &ifi, sizeof ifi);
+    int n = 0, nobufs = 0;
+    for (;;) {
+        errno = 0;
+        if (recv(fd, buf, sizeof buf, MSG_DONTWAIT) >= 0) n++;
+        else if (errno == ENOBUFS) nobufs = 1;
+        else break;
+    }
+    check("netlink: answers beyond the receive buffer are dropped (ENOBUFS)", nobufs && n > 0 && n < 100);
+
+    /* A dump with the buffer full waits (one may overshoot it, as on
+     * Linux); another one is EBUSY meanwhile. */
+    for (int i = 0; i < 100; i++) nl_send(fd, RTM_GETLINK, NLM_F_REQUEST, 700 + i, &ifi, sizeof ifi);
+    nl_send(fd, RTM_GETADDR, NLM_F_REQUEST | NLM_F_DUMP, 800, g, sizeof *g);
+    nl_send(fd, RTM_GETADDR, NLM_F_REQUEST | NLM_F_DUMP, 801, g, sizeof *g);
+    /* A few answers read (past the ENOBUFS): room for an error, not yet
+     * for the waiting dump (it waits for half the buffer). */
+    for (int read = 0; read < 4;) {
+        if (recv(fd, buf, sizeof buf, MSG_DONTWAIT) >= 0) read++;
+    }
+    nl_send(fd, RTM_GETLINK, NLM_F_REQUEST | NLM_F_DUMP, 802, g, sizeof *g);
+    int done = 0, busy = 0;
+    for (;;) {
+        errno = 0;
+        int r = (int)recv(fd, buf, sizeof buf, MSG_DONTWAIT);
+        if (r < 0 && errno == ENOBUFS) continue;
+        if (r < 0) break;
+        for (struct nlmsghdr *h = (struct nlmsghdr *)buf; NLMSG_OK(h, (unsigned)r); h = NLMSG_NEXT(h, r)) {
+            if (h->nlmsg_type == NLMSG_DONE && (h->nlmsg_seq == 800 || h->nlmsg_seq == 801)) done++;
+            if (h->nlmsg_type == NLMSG_ERROR && h->nlmsg_seq == 802 && ((struct nlmsgerr *)NLMSG_DATA(h))->error == -EBUSY) busy = 1;
+        }
+    }
+    printf("    (dumps done %d, busy %d)\n", done, busy);
+    check("netlink: a dump waits for room, the next is EBUSY meanwhile", done == 2 && busy);
+    int def = 212992 / 2;
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &def, sizeof def);
+}
+
 static void test_netlink_socket(void) {
     errno = 0;
     check("netlink: an unknown protocol is EPROTONOSUPPORT", socket(AF_NETLINK, SOCK_RAW, 99) == -1 && errno == EPROTONOSUPPORT);
@@ -413,6 +520,8 @@ static void test_netlink_socket(void) {
     close(p[0]);
     close(p[1]);
 
+    test_netlink_limits(fd, &g);
+
     long idle = legacy_calls();
     long base = legacy_calls() - idle;
     long start = legacy_calls();
@@ -430,6 +539,7 @@ int main(void) {
     test_statx();
     test_io_uring();
     test_copy_file_range();
+    test_copy_file_range_crossed();
     test_getifaddrs();
     test_netdevice();
     test_netlink_socket();

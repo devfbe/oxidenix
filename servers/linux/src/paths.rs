@@ -29,6 +29,7 @@ const EEXIST: i64 = 17;
 const ERANGE: i64 = 34;
 const ELOOP: i64 = 40;
 const EINVAL: i64 = 22;
+const EPERM: i64 = 1;
 const EFAULT: i64 = 14;
 const EOPNOTSUPP: i64 = 95;
 
@@ -108,7 +109,7 @@ pub fn handle(s: &State) -> Option<i64> {
         },
         SYS_TRUNCATE => at(CWD, a0, true).and_then(|r| {
             truncate(&r.node, a1)?;
-            notify(&r.node, &join(&r.path), inotify::IN_MODIFY);
+            inotify::node_event(&r.node, inotify::IN_MODIFY);
             Ok(0)
         }),
         SYS_GETCWD => getcwd(a0, a1),
@@ -299,7 +300,7 @@ fn inotify_add_watch(fd: u64, addr: u64, mask: u32) -> Result<i64, i64> {
     let instance = inotify::instance(fd)?;
     let r = at(CWD, addr, mask & IN_DONT_FOLLOW == 0)?;
     let is_dir = r.mode & vfs::S_IFMT == vfs::S_IFDIR;
-    instance.add_watch(r.node, is_dir, mask)
+    instance.add_watch(&r.node, is_dir, mask)
 }
 
 /// The `struct stat` an empty path with AT_EMPTY_PATH names: descriptor
@@ -366,34 +367,84 @@ fn fchdir(fd: u64) -> Result<i64, i64> {
 fn renameat(odirfd: u64, oaddr: u64, ndirfd: u64, naddr: u64) -> Result<i64, i64> {
     let (odir, oname) = parent_at(odirfd, oaddr)?;
     let (ndir, nname) = parent_at(ndirfd, naddr)?;
-    // What moves and what it replaces, for their watches.
-    let (moving, replaced) = if inotify::active() { (watched_child(&odir.node, &oname), watched_child(&ndir.node, &nname)) } else { (None, None) };
-    match (&odir.node, &ndir.node) {
+    // What moved and what it replaced (its last link gone), for inotify.
+    let (moved, replaced): (Option<(inotify::Key, bool)>, Option<Gone>) = match (&odir.node, &ndir.node) {
         (Node::Kernel(o), Node::Kernel(n)) => {
             check(syscall(
                 SYS_INODE_RENAME,
                 [o.handle(), oname.as_ptr() as u64, oname.len() as u64, n.handle(), nname.as_ptr() as u64, nname.len() as u64],
             ))?;
+            (None, None)
         }
-        (Node::Tmp(o), Node::Tmp(n)) => tmpfs::rename(o, &oname, n, &nname)?,
-        (Node::Data(o), Node::Data(n)) => datafs::rename(o, &oname, n, &nname)?,
+        (Node::Tmp(o), Node::Tmp(n)) => {
+            let (node, old) = tmpfs::rename(o, &oname, n, &nname)?;
+            (Some((inotify::Key::tmp(&node), node.is_dir())), old.map(Gone::Tmp))
+        }
+        (Node::Data(o), Node::Data(n)) => {
+            let (m, gone) = datafs::rename(o, &oname, n, &nname)?;
+            // An inode not cached here: the name finds it now.
+            let m = m.or_else(|| inotify::active().then(|| datafs::lookup(n, &nname).ok().map(|i| i.ino)).flatten());
+            let is_dir = m.and_then(datafs::cached).is_some_and(|i| i.kind == vfs::S_IFDIR);
+            (m.map(|m| (inotify::Key::Data(m), is_dir)), gone.map(Gone::Data))
+        }
         _ => return Err(EXDEV),
-    }
-    if let Some((key, is_dir, _)) = moving {
-        if replaced.is_some_and(|r| r.0 == key) {
-            return Ok(0);
-        }
+    };
+    if let Some((key, is_dir)) = moved {
         inotify::moved(&odir.node, &oname, &ndir.node, &nname, Some(key), is_dir);
-        if let Some((rkey, rdir, links)) = replaced {
-            if !rdir {
-                inotify::event(rkey, false, inotify::IN_ATTRIB, None);
-            }
-            if rdir || links <= 1 {
-                inotify::deleted(rkey, rdir);
-            }
-        }
+    }
+    if let Some(g) = replaced {
+        g.report();
     }
     Ok(0)
+}
+
+/// An inode whose last link a removal or a rename took: inotify's events
+/// for it (IN_ATTRIB for the link count, IN_DELETE_SELF now or at its last
+/// close).
+enum Gone {
+    Tmp(alloc::sync::Arc<tmpfs::Inode>),
+    Data(u32),
+}
+
+impl Gone {
+    fn is_dir(&self) -> bool {
+        match self {
+            Gone::Tmp(t) => t.is_dir(),
+            Gone::Data(ino) => datafs::cached(*ino).is_some_and(|i| i.kind == vfs::S_IFDIR),
+        }
+    }
+
+    fn key(&self) -> (inotify::Key, bool) {
+        use core::sync::atomic::Ordering::Acquire;
+        match self {
+            Gone::Tmp(t) => (inotify::Key::tmp(t), t.opens.load(Acquire) > 0),
+            Gone::Data(ino) => (inotify::Key::Data(*ino), datafs::cached(*ino).is_some_and(|i| i.opens.load(Acquire) > 0)),
+        }
+    }
+
+    /// IN_ATTRIB for the link count (a file's).
+    fn attrib(&self, dir: bool) {
+        if !dir {
+            inotify::event(self.key().0, false, inotify::IN_ATTRIB, None);
+        }
+    }
+
+    /// IN_DELETE_SELF unless it is still open: then it goes with its last
+    /// close (`TmpOpen`, `DataOpen`).
+    fn finish(&self, dir: bool) {
+        let (key, open) = self.key();
+        if !open {
+            inotify::deleted(key, dir);
+        }
+    }
+
+    fn report(&self) {
+        if inotify::active() {
+            let dir = self.is_dir();
+            self.attrib(dir);
+            self.finish(dir);
+        }
+    }
 }
 
 fn mkdirat(dirfd: u64, addr: u64, mode: u32) -> Result<i64, i64> {
@@ -408,39 +459,26 @@ fn mkdirat(dirfd: u64, addr: u64, mode: u32) -> Result<i64, i64> {
 fn unlinkat(dirfd: u64, addr: u64, flags: u64) -> Result<i64, i64> {
     let (dir, name) = parent_at(dirfd, addr)?;
     let dir_only = flags & AT_REMOVEDIR != 0;
-    // What the name holds, for its watches (when there are any).
-    let victim = if inotify::active() { watched_child(&dir.node, &name) } else { None };
-    match &dir.node {
+    let gone = match &dir.node {
         Node::Kernel(d) => {
             check(syscall(SYS_INODE_UNLINK, [d.handle(), name.as_ptr() as u64, name.len() as u64, dir_only as u64, 0, 0]))?;
+            None
         }
-        Node::Tmp(d) => d.unlink(&name, dir_only)?,
-        Node::Data(d) => datafs::unlink(d, &name, dir_only)?,
-    }
-    if let Some((key, is_dir, links)) = victim {
-        // As Linux: the link count's IN_ATTRIB, the name's IN_DELETE, then
-        // IN_DELETE_SELF if that was the last link.
-        if !is_dir {
-            inotify::event(key, false, inotify::IN_ATTRIB, None);
+        Node::Tmp(d) => Some(Gone::Tmp(d.unlink(&name, dir_only)?)),
+        Node::Data(d) => datafs::unlink(d, &name, dir_only)?.map(Gone::Data),
+    };
+    // As Linux: the link count's IN_ATTRIB, the name's IN_DELETE, then
+    // IN_DELETE_SELF once the inode goes.
+    if inotify::active() {
+        if let Some(g) = &gone {
+            g.attrib(dir_only);
         }
-        inotify::child(&dir.node, inotify::IN_DELETE, &name, is_dir);
-        if is_dir || links <= 1 {
-            inotify::deleted(key, is_dir);
+        inotify::child(&dir.node, inotify::IN_DELETE, &name, dir_only);
+        if let Some(g) = &gone {
+            g.finish(dir_only);
         }
     }
     Ok(0)
-}
-
-/// The inode `name` in `dir` names, for inotify: its key, whether it is a
-/// directory, its link count (None for the kernel's tree or no such name).
-fn watched_child(dir: &Node, name: &str) -> Option<(inotify::Key, bool, u64)> {
-    let node = match dir {
-        Node::Kernel(_) => return None,
-        Node::Tmp(d) => Node::Tmp(d.lookup(name).ok()?),
-        Node::Data(d) => Node::Data(datafs::lookup(d, name).ok()?),
-    };
-    let st = node.status().ok()?;
-    Some((inotify::Key::of(&node)?, st.mode & vfs::S_IFMT == vfs::S_IFDIR, st.nlink))
 }
 
 fn symlinkat(target: u64, dirfd: u64, addr: u64) -> Result<i64, i64> {
@@ -484,20 +522,9 @@ fn chmod_node(node: &Node, mode: u64) -> Result<i64, i64> {
     }
 }
 
-/// IN_ATTRIB for the inode reached by `path`, and its directory.
-fn attrib(node: &Node, path: &str) {
-    notify(node, path, inotify::IN_ATTRIB);
-}
-
-/// Event `mask` for the inode reached by `path`, and its directory.
-fn notify(node: &Node, path: &str, mask: u32) {
-    if !inotify::active() {
-        return;
-    }
-    if let Some(key) = inotify::Key::of(node) {
-        let is_dir = node.status().is_ok_and(|s| s.mode & vfs::S_IFMT == vfs::S_IFDIR);
-        inotify::on_path(key, is_dir, mask, path);
-    }
+/// IN_ATTRIB for an inode, and its directory.
+fn attrib(node: &Node, _path: &str) {
+    inotify::node_event(node, inotify::IN_ATTRIB);
 }
 
 /// The file a descriptor names and the path it was opened by, for the
@@ -556,12 +583,13 @@ fn fchmodat2(dirfd: u64, addr: u64, mode: u64, flags: u64) -> Result<i64, i64> {
     chmod_target(Some((r.node, join(&r.path))), mode)
 }
 
-/// Sets the times of a target (the kernel's files keep theirs: /dev,
-/// /proc; an anonymous inode's are not kept).
+/// Sets the times of a target. The kernel's tree (/dev, /proc, /sys)
+/// keeps no times that could change: EPERM. An anonymous inode's (a
+/// pipe's, a socket's) are not kept: nothing to do.
 fn set_times(target: Option<(Node, String)>, atime: SetTime, mtime: SetTime) -> Result<i64, i64> {
     let Some((node, path)) = target else { return Ok(0) };
     match &node {
-        Node::Kernel(_) => return Ok(0),
+        Node::Kernel(_) => return Err(EPERM),
         Node::Tmp(t) => t.set_times(atime, mtime),
         Node::Data(d) => datafs::set_times(d, atime, mtime)?,
     }
@@ -611,6 +639,10 @@ fn utimensat(dirfd: u64, addr: u64, ts: u64, flags: u64) -> Result<i64, i64> {
         let [asec, ansec, msec, mnsec]: [i64; 4] = usercopy::read(ts)?;
         (SetTime::from_timespec(asec, ansec)?, SetTime::from_timespec(msec, mnsec)?)
     };
+    // futimens (a null path) takes no flags.
+    if addr == 0 && flags != 0 {
+        return Err(EINVAL);
+    }
     let target = if addr != 0 && flags & AT_EMPTY_PATH != 0 && path_is_empty(addr) {
         empty_path_target(dirfd)?
     } else {

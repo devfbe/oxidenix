@@ -46,6 +46,10 @@ impl Drop for DataOpen {
         if self.write {
             datafs::put_write(&self.inode);
         }
+        // An unlinked file's last close: it goes.
+        if self.inode.opens.fetch_sub(1, core::sync::atomic::Ordering::AcqRel) == 1 && self.inode.unlinked() {
+            inotify::deleted(inotify::Key::data(&self.inode), self.inode.kind == vfs::S_IFDIR);
+        }
         datafs::let_go(&self.inode);
     }
 }
@@ -70,6 +74,7 @@ pub fn open(inode: Arc<DInode>, flags: u32, path: String) -> Result<i64, i64> {
     if write {
         datafs::get_write(&inode)?;
     }
+    inode.opens.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
     let open = Arc::new(DataOpen {
         inode,
         path,
@@ -135,9 +140,7 @@ fn signed(offset: u64) -> Result<u64, i64> {
 impl DataOpen {
     /// inotify's event `mask` for the file and its directory.
     fn notify(&self, mask: u32) {
-        if inotify::active() {
-            inotify::on_path(inotify::Key::data(&self.inode), self.inode.kind == vfs::S_IFDIR, mask, &self.path);
-        }
+        inotify::data_event(&self.inode, mask);
     }
 
     /// Reads into the program's buffers from `offset`: as far as the file

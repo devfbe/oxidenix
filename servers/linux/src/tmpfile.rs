@@ -40,6 +40,10 @@ impl Drop for TmpOpen {
         if self.write {
             self.inode.put_write();
         }
+        // A removed file's last close: it goes.
+        if self.inode.opens.fetch_sub(1, core::sync::atomic::Ordering::AcqRel) == 1 && self.inode.removed() {
+            inotify::deleted(inotify::Key::tmp(&self.inode), self.inode.is_dir());
+        }
     }
 }
 
@@ -64,6 +68,7 @@ pub fn open(inode: Arc<Inode>, flags: u32, path: String) -> Result<i64, i64> {
     if write {
         inode.get_write()?;
     }
+    inode.opens.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
     let open = Arc::new(TmpOpen { inode, path, offset: Mutex::new(0), snapshot: Mutex::new(None), write });
     if write && flags & O_TRUNC != 0 {
         check(syscall(SYS_MO_TRUNCATE, [open.inode.object()?, 0, 0, 0, 0, 0]))?;
@@ -129,9 +134,7 @@ pub fn statfs(buf: u64) -> Result<i64, i64> {
 impl TmpOpen {
     /// inotify's event `mask` for the file and its directory.
     fn notify(&self, mask: u32) {
-        if inotify::active() {
-            inotify::on_path(inotify::Key::tmp(&self.inode), self.inode.is_dir(), mask, &self.path);
-        }
+        inotify::tmp_event(&self.inode, mask);
     }
 
     fn object(&self) -> Result<u64, i64> {

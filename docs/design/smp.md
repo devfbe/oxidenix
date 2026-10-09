@@ -73,8 +73,11 @@ A process (`Task`, shared as `Arc<Task>`) splits into:
   the CPU it last ran on unless another CPU is idle; idle CPUs are woken by IPI. An idle CPU
   counts as its work only tasks it may run: tasks pinned to a busy CPU must not keep it out of
   `hlt` with interrupts off (its timers would never fire).
-- Weighted round robin: a thread's nice value gives it Linux's weight; heavier threads run
-  several ticks per turn, lighter ones save up credit and skip turns, so shares match Linux's.
+- Fair scheduling by virtual runtime: run time scaled by the weight of the thread's nice
+  value (Linux's); the smallest virtual runtime runs; slices are weighted shares of a 12 ms
+  period (at least 1.5 ms), ended by a precise timer deadline; a woken or new thread owed
+  time preempts at once (IPI to its CPU); sleepers get at most half a period of credit.
+  Virtual runtimes are rebased between CPUs' minimums when threads move.
 - `on_cpu` marks a task whose kernel stack is still in use. A CPU never picks a task whose
   `on_cpu` is still set (a CPU queues its current task before it switches away): it leaves it
   in its queue for a later schedule. Waiting for it with interrupts off could close a cycle,

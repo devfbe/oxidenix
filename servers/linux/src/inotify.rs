@@ -3,31 +3,39 @@
 //! placeholder in the kernel's descriptor table, as eventfd. libuv (and so
 //! Node.js's fs.watch) watches directories with it.
 //!
-//! The filesystem calls report what they did (`event`, `child`, `moved`,
-//! `deleted`), and every watch of the inode, or of its directory for an
-//! event about a name in it, whose mask takes the event gets it. A watch
-//! keeps its inode (as Linux pins it) until it is removed: by
-//! inotify_rm_watch, IN_ONESHOT, the inode's last link going
-//! (IN_DELETE_SELF), or the instance's last descriptor. The kernel's
-//! files (/dev, /proc, /sys) can be watched but report nothing, as most of
-//! Linux's pseudo files.
+//! Watches are keyed by inode (`Key`: tmpfs's inode numbers are never
+//! reused in an instance, /data's are the disk's), so they need not keep
+//! their inode: a /data inode the server let go of and looked up again is
+//! the same key. The filesystem calls report what they did (`event`,
+//! `child`, `moved`, `deleted`), and every watch of the inode, or of its
+//! directory for an event about a name in it, whose mask takes the event
+//! gets it. The directory and name come from the inode itself (`link`: the
+//! name it was created, found or renamed by), not from a path. A watch
+//! ends by inotify_rm_watch, IN_ONESHOT, the instance's last descriptor,
+//! or when its inode goes: IN_DELETE_SELF once its last link went and its
+//! last open file description closed, as Linux sends it when the inode is
+//! evicted. The kernel's files (/dev, /proc, /sys) can be watched but
+//! report nothing, as most of Linux's pseudo files; changes another
+//! instance makes on /data are not seen (its calls are its own server's).
 //!
 //! As Linux: an event equal to the last one queued and not read yet is
 //! merged with it; beyond `MAX_EVENTS` queued events one IN_Q_OVERFLOW
-//! (watch -1) stands for the ones lost; read(2) returns whole events
-//! (EINVAL if the first does not fit); names are padded with NULs to a
-//! multiple of 16 bytes. The directory an open file's events also go to
-//! is the one of the path it was opened by.
+//! (watch -1) stands for the ones lost; at most `MAX_INSTANCES` instances
+//! (EMFILE) and `MAX_WATCHES` watches (ENOSPC) per user, Linux's defaults
+//! of fs.inotify.max_user_instances and max_user_watches (one user: the
+//! instance's); read(2) returns whole events (EINVAL if the first does not
+//! fit); names are padded with NULs to a multiple of 16 bytes. No lock is
+//! held while events are copied to the program (a fault there may need the
+//! pager, which reports closes here).
 
 use crate::datafs::DInode;
 use crate::files::{self, File, EBADF, EFAULT, EINVAL, O_NONBLOCK, O_RDWR};
-use crate::namespace::{self, Node};
+use crate::namespace::Node;
 use crate::sync::Mutex;
 use crate::syscall;
 use crate::tmpfs;
 use crate::usercopy;
 use alloc::collections::{BTreeMap, VecDeque};
-use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
@@ -62,12 +70,17 @@ const EAGAIN: i64 = 11;
 const EINTR: i64 = 4;
 const EEXIST: i64 = 17;
 const ENOTDIR: i64 = 20;
-const ESPIPE: i64 = 29;
+const EMFILE: i64 = 24;
 const ENOTTY: i64 = 25;
+const ENOSPC: i64 = 28;
+const ESPIPE: i64 = 29;
 const POLLIN: i16 = 0x1;
 
-/// Linux's default fs.inotify.max_queued_events.
-const MAX_EVENTS: usize = 16384;
+/// Linux's defaults of fs.inotify.max_queued_events, max_user_instances
+/// and max_user_watches.
+pub const MAX_EVENTS: usize = 16384;
+pub const MAX_INSTANCES: usize = 128;
+pub const MAX_WATCHES: usize = 8192;
 /// `struct inotify_event` without its name.
 const EVENT_HEADER: usize = 16;
 const FIONREAD: u64 = 0x541b;
@@ -77,12 +90,18 @@ const FIONREAD: u64 = 0x541b;
 pub enum Key {
     Tmp(u64),
     Data(u32),
+    /// One of the kernel's (device, inode number): watched, without
+    /// events.
+    Kernel(u64, u64),
 }
 
 impl Key {
     pub fn of(node: &Node) -> Option<Key> {
         match node {
-            Node::Kernel(_) => None,
+            Node::Kernel(_) => {
+                let st = node.status().ok()?;
+                Some(Key::Kernel(st.dev, st.ino))
+            }
             Node::Tmp(t) => Some(Key::Tmp(t.ino)),
             Node::Data(d) => Some(Key::Data(d.ino)),
         }
@@ -97,18 +116,9 @@ impl Key {
     }
 }
 
-/// What keeps a watched inode.
-enum Pin {
-    /// One of the kernel's: watched, without events.
-    None,
-    Tmp(#[allow(dead_code)] Arc<tmpfs::Inode>),
-    Data(#[allow(dead_code)] Arc<DInode>),
-}
-
 struct Watch {
-    key: Option<Key>,
+    key: Key,
     mask: u32,
-    _pin: Pin,
 }
 
 #[derive(PartialEq, Eq)]
@@ -128,6 +138,15 @@ impl Event {
 
     fn size(&self) -> usize {
         EVENT_HEADER + self.name_len()
+    }
+
+    fn encode(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.wd.to_le_bytes());
+        out.extend_from_slice(&self.mask.to_le_bytes());
+        out.extend_from_slice(&self.cookie.to_le_bytes());
+        out.extend_from_slice(&(self.name_len() as u32).to_le_bytes());
+        out.extend_from_slice(&self.name);
+        out.resize(out.len() + self.name_len() - self.name.len(), 0);
     }
 }
 
@@ -149,9 +168,11 @@ pub struct Inotify {
 
 /// Every watch of the instance by inode: (instance, watch descriptor).
 static REGISTRY: Mutex<BTreeMap<Key, Vec<(Weak<Inotify>, i32)>>> = Mutex::new(BTreeMap::new());
-/// How many watches the registry has: the filesystem calls skip all of
-/// this while there are none.
+/// How many watches the registry has (`MAX_WATCHES`): the filesystem calls
+/// skip all of this while there are none.
 static WATCHES: AtomicUsize = AtomicUsize::new(0);
+/// How many instances there are (`MAX_INSTANCES`).
+static INSTANCES: AtomicUsize = AtomicUsize::new(0);
 /// The cookie that ties an IN_MOVED_FROM to its IN_MOVED_TO.
 static COOKIE: AtomicU32 = AtomicU32::new(1);
 
@@ -166,14 +187,16 @@ pub fn init(flags: u64) -> Result<i64, i64> {
     if flags & !allowed != 0 {
         return Err(EINVAL);
     }
+    INSTANCES.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| (n < MAX_INSTANCES).then_some(n + 1)).map_err(|_| EMFILE)?;
     let state = State { watches: BTreeMap::new(), next_wd: 1, queue: VecDeque::new(), overflowed: false, reported: 0 };
     let i = Arc::new(Inotify { id: files::new_id(), state: Mutex::new(state), seq: AtomicU32::new(0) });
+    // (Dropping `i` on failure gives the instance back.)
     files::install(i.id, File::Inotify(i.clone()), O_RDWR | flags as u32, 0)
 }
 
 impl Inotify {
     /// inotify_add_watch on the resolved `node` (a directory if `is_dir`).
-    pub fn add_watch(self: &Arc<Self>, node: Node, is_dir: bool, mask: u32) -> Result<i64, i64> {
+    pub fn add_watch(self: &Arc<Self>, node: &Node, is_dir: bool, mask: u32) -> Result<i64, i64> {
         if mask & !WATCH_BITS != 0 || mask & IN_ALL_EVENTS == 0 {
             return Err(EINVAL);
         }
@@ -183,11 +206,11 @@ impl Inotify {
         if mask & IN_ONLYDIR != 0 && !is_dir {
             return Err(ENOTDIR);
         }
-        let key = Key::of(&node);
+        let key = Key::of(node).ok_or(EINVAL)?;
         let events = mask & (IN_ALL_EVENTS | IN_EXCL_UNLINK | IN_ONESHOT);
         let wd = {
             let mut st = self.state.lock();
-            let existing = key.and_then(|k| st.watches.iter().find(|(_, w)| w.key == Some(k)).map(|(&wd, _)| wd));
+            let existing = st.watches.iter().find(|(_, w)| w.key == key).map(|(&wd, _)| wd);
             if let Some(wd) = existing {
                 if mask & IN_MASK_CREATE != 0 {
                     return Err(EEXIST);
@@ -196,20 +219,17 @@ impl Inotify {
                 w.mask = if mask & IN_MASK_ADD != 0 { w.mask | events } else { events };
                 return Ok(wd as i64);
             }
-            let wd = st.next_wd;
-            st.next_wd = st.next_wd.checked_add(1).unwrap_or(1);
-            let pin = match node {
-                Node::Kernel(_) => Pin::None,
-                Node::Tmp(t) => Pin::Tmp(t),
-                Node::Data(d) => Pin::Data(d),
-            };
-            st.watches.insert(wd, Watch { key, mask: events, _pin: pin });
+            WATCHES.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| (n < MAX_WATCHES).then_some(n + 1)).map_err(|_| ENOSPC)?;
+            // The next descriptor not in use (they wrap at i32::MAX).
+            let mut wd = st.next_wd;
+            while st.watches.contains_key(&wd) {
+                wd = if wd == i32::MAX { 1 } else { wd + 1 };
+            }
+            st.next_wd = if wd == i32::MAX { 1 } else { wd + 1 };
+            st.watches.insert(wd, Watch { key, mask: events });
             wd
         };
-        if let Some(k) = key {
-            REGISTRY.lock().entry(k).or_default().push((Arc::downgrade(self), wd));
-            WATCHES.fetch_add(1, Ordering::Relaxed);
-        }
+        REGISTRY.lock().entry(key).or_default().push((Arc::downgrade(self), wd));
         Ok(wd as i64)
     }
 
@@ -221,9 +241,7 @@ impl Inotify {
             self.queue(&mut st, Event { wd, mask: IN_IGNORED, cookie: 0, name: Vec::new() });
             w.key
         };
-        if let Some(k) = key {
-            unregister(k, self, wd);
-        }
+        unregister(key, self, wd);
         Ok(0)
     }
 
@@ -267,7 +285,7 @@ impl Inotify {
         oneshot
     }
 
-    /// The inode's watches end (its last link went): IN_IGNORED.
+    /// The watch's inode went: IN_IGNORED.
     fn ignore(&self, wd: i32) {
         let mut st = self.state.lock();
         if st.watches.remove(&wd).is_some() {
@@ -275,9 +293,11 @@ impl Inotify {
         }
     }
 
-    /// read(2): whole events into the program's buffer at `buf`.
+    /// read(2): whole events into the program's buffer at `buf`. They are
+    /// taken out under the lock and copied after it (lost if the copy
+    /// faults, as on Linux).
     fn read(&self, buf: u64, len: u64, nonblock: bool) -> Result<i64, i64> {
-        loop {
+        let out = loop {
             let seen;
             {
                 let mut st = self.state.lock();
@@ -287,27 +307,21 @@ impl Inotify {
                         if out.len() + e.size() > len as usize {
                             break;
                         }
-                        out.extend_from_slice(&e.wd.to_le_bytes());
-                        out.extend_from_slice(&e.mask.to_le_bytes());
-                        out.extend_from_slice(&e.cookie.to_le_bytes());
-                        out.extend_from_slice(&(e.name_len() as u32).to_le_bytes());
-                        out.extend_from_slice(&e.name);
-                        out.resize(out.len() + e.name_len() - e.name.len(), 0);
+                        e.encode(&mut out);
+                        if e.mask == IN_Q_OVERFLOW {
+                            st.overflowed = false;
+                        }
                         st.queue.pop_front();
                     }
                     if out.is_empty() {
                         return Err(EINVAL);
-                    }
-                    usercopy::to_program(buf, &out)?;
-                    if st.queue.iter().all(|e| e.mask != IN_Q_OVERFLOW) {
-                        st.overflowed = false;
                     }
                     let now = if st.queue.is_empty() { 0 } else { POLLIN };
                     if now != st.reported {
                         st.reported = now;
                         files::ready(self.id, now);
                     }
-                    return Ok(out.len() as i64);
+                    break out;
                 }
                 seen = self.seq.load(Ordering::Acquire);
             }
@@ -318,7 +332,14 @@ impl Inotify {
             if syscall(SYS_SERVER_FUTEX_WAIT, [word, seen as u64, 0, FUTEX_INTERRUPTIBLE, 0, 0]) == -EINTR {
                 return Err(EINTR);
             }
-        }
+        };
+        usercopy::to_program(buf, &out)?;
+        Ok(out.len() as i64)
+    }
+
+    /// The bytes of the queued events (FIONREAD).
+    fn queued_bytes(&self) -> usize {
+        self.state.lock().queue.iter().map(Event::size).sum()
     }
 
     /// Its `struct stat`: an anonymous inode, as on Linux.
@@ -334,7 +355,8 @@ impl Inotify {
 
 impl Drop for Inotify {
     fn drop(&mut self) {
-        let keys: Vec<Key> = self.state.lock().watches.values().filter_map(|w| w.key).collect();
+        INSTANCES.fetch_sub(1, Ordering::Relaxed);
+        let keys: Vec<Key> = self.state.lock().watches.values().map(|w| w.key).collect();
         let mut r = REGISTRY.lock();
         for k in keys {
             if let Some(list) = r.get_mut(&k) {
@@ -387,6 +409,31 @@ pub fn event(key: Key, dir: bool, mask: u32, parent: Option<(Key, &str)>) {
     }
 }
 
+/// Event `mask` on a tmpfs inode and on its directory.
+pub fn tmp_event(inode: &tmpfs::Inode, mask: u32) {
+    if active() {
+        let link = inode.link();
+        event(Key::tmp(inode), inode.is_dir(), mask, link.as_ref().map(|(d, n)| (Key::Tmp(*d), n.as_str())));
+    }
+}
+
+/// Event `mask` on a /data inode and on its directory.
+pub fn data_event(inode: &DInode, mask: u32) {
+    if active() {
+        let link = inode.link();
+        event(Key::data(inode), inode.kind == vfs::S_IFDIR, mask, link.as_ref().map(|(d, n)| (Key::Data(*d), n.as_str())));
+    }
+}
+
+/// Event `mask` on the inode `node` and on its directory.
+pub fn node_event(node: &Node, mask: u32) {
+    match node {
+        Node::Tmp(t) => tmp_event(t, mask),
+        Node::Data(d) => data_event(d, mask),
+        Node::Kernel(_) => {}
+    }
+}
+
 /// Event `mask` (IN_CREATE, IN_DELETE) about `name` in the directory
 /// `dir`; `is_dir`: the name is a directory's.
 pub fn child(dir: &Node, mask: u32, name: &str, is_dir: bool) {
@@ -417,8 +464,8 @@ pub fn moved(odir: &Node, oname: &str, ndir: &Node, nname: &str, node: Option<Ke
     }
 }
 
-/// The inode `key` lost its last link: IN_DELETE_SELF, and its watches
-/// end. (Its IN_ATTRIB for the link count comes before, from the caller.)
+/// The inode `key` went (its last link and its last open file description
+/// are gone): IN_DELETE_SELF, and its watches end.
 pub fn deleted(key: Key, dir: bool) {
     if !active() {
         return;
@@ -432,26 +479,6 @@ pub fn deleted(key: Key, dir: bool) {
             i.ignore(wd);
         }
     }
-}
-
-/// The directory an absolute `path` names its last component in, and that
-/// name (for the events of a file opened by `path`).
-pub fn parent_of(path: &str) -> Option<(Key, String)> {
-    if !active() {
-        return None;
-    }
-    let (dir, name) = namespace::resolve_parent("/", path).ok()?;
-    Some((Key::of(&dir.node)?, name))
-}
-
-/// Event `mask` on an inode reached by `path` (absolute): to it, and to
-/// its directory about its name.
-pub fn on_path(key: Key, dir: bool, mask: u32, path: &str) {
-    if !active() {
-        return;
-    }
-    let parent = parent_of(path);
-    event(key, dir, mask, parent.as_ref().map(|(k, n)| (*k, n.as_str())));
 }
 
 pub const SYS_INOTIFY_INIT: u64 = 253;
@@ -475,7 +502,7 @@ pub fn call(nr: u64, i: &Inotify, flags: u32, a1: u64, a2: u64) -> Result<i64, i
         files::SYS_WRITE | files::SYS_WRITEV => Err(EINVAL),
         files::SYS_FSTAT => usercopy::to_program(a1, &i.stat()).map(|_| 0).map_err(|_| EFAULT),
         files::SYS_IOCTL if a1 == FIONREAD => {
-            let n: usize = i.state.lock().queue.iter().map(Event::size).sum();
+            let n = i.queued_bytes();
             usercopy::write(a2, &(n as i32))?;
             Ok(0)
         }

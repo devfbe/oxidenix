@@ -59,6 +59,12 @@ static void times_on(const char *dir, int nanoseconds) {
     struct timespec bad[2] = {{0, 1000000000}, {0, 0}};
     snprintf(name, sizeof name, "%s: nanoseconds out of range are EINVAL", dir);
     check(name, utimensat(AT_FDCWD, path, bad, 0) == -1 && errno == EINVAL);
+    struct timespec old[2] = {{-100000, 0}, {-2000000000, 0}};
+    snprintf(name, sizeof name, "%s: times before 1970", dir);
+    check(name, utimensat(AT_FDCWD, path, old, 0) == 0 && stat(path, &st) == 0 && st.st_atim.tv_sec == -100000 && st.st_mtim.tv_sec == -2000000000);
+    errno = 0;
+    snprintf(name, sizeof name, "%s: futimens with flags is EINVAL", dir);
+    check(name, syscall(SYS_utimensat, fd, NULL, NULL, AT_SYMLINK_NOFOLLOW) == -1 && errno == EINVAL);
 
     /* A write moves mtime and ctime to now, not atime. */
     utimensat(AT_FDCWD, path, set, 0);
@@ -131,6 +137,9 @@ int main(void) {
                                                      x.stx_btime.tv_sec >= t0.tv_sec - 1 && x.stx_btime.tv_sec <= t0.tv_sec + 5);
     unlink(path);
     check("/data reports none (ext2)", syscall(SYS_statx, AT_FDCWD, "/data", 0, STATX_BTIME, &x) == 0 && !(x.stx_mask & STATX_BTIME));
+
+    errno = 0;
+    check("the kernel's files keep no times (EPERM)", utimensat(AT_FDCWD, "/dev/null", NULL, 0) == -1 && errno == EPERM);
 
     /* Supplementary groups: none (root, started by init). */
     gid_t groups[4];

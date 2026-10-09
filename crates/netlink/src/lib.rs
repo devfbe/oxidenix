@@ -265,33 +265,90 @@ fn done_message(seq: u32, port: u32) -> Vec<u8> {
     m.finish()
 }
 
-/// Packs a dump's messages, then `NLMSG_DONE`, into datagrams of at most
-/// `DUMP_DATAGRAM` bytes (a message larger than that goes alone).
-fn pack(messages: Vec<Vec<u8>>, done: Vec<u8>, out: &mut Vec<Vec<u8>>) {
-    let mut current: Vec<u8> = Vec::new();
-    for m in messages.into_iter().chain(core::iter::once(done)) {
-        if !current.is_empty() && current.len() + m.len() > DUMP_DATAGRAM {
-            out.push(core::mem::take(&mut current));
-        }
-        current.extend_from_slice(&m);
-    }
-    out.push(current);
+const EBUSY: i32 = 16;
+
+/// What a dump lists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Listing {
+    Links,
+    /// Addresses of the family (`AF_UNSPEC`: all).
+    Addresses(u8),
 }
 
-/// Answers one request into `out`: Ok(true) for a dump (which ends with
-/// `NLMSG_DONE` and is not acknowledged), Ok(false) for an answered
-/// request, or the error to report (nothing added).
-fn request(req: &[u8], h: &Header, port: u32, interfaces: &[Interface], out: &mut Vec<Vec<u8>>) -> Result<bool, i32> {
+/// A dump in progress: `answer` starts it, and `next` produces its
+/// datagrams one at a time, as the socket's receive buffer has room (as
+/// Linux's `netlink_dump` fills one buffer per call), so a dump never
+/// takes more memory than the reader leaves free. Each datagram carries
+/// at most `DUMP_DATAGRAM` bytes of messages; the last ends with
+/// `NLMSG_DONE`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Dump {
+    listing: Listing,
+    seq: u32,
+    port: u32,
+    /// The position in the interface list the next message describes.
+    at: usize,
+    finished: bool,
+}
+
+impl Dump {
+    /// Whether its last datagram (`NLMSG_DONE`) was produced.
+    pub fn is_done(&self) -> bool {
+        self.finished
+    }
+
+    /// The dump's next datagram over the interfaces as they are now, or
+    /// None once it ended.
+    pub fn next(&mut self, interfaces: &[Interface]) -> Option<Vec<u8>> {
+        if self.finished {
+            return None;
+        }
+        let mut out: Vec<u8> = Vec::new();
+        while self.at < interfaces.len() {
+            let i = &interfaces[self.at];
+            let m = match self.listing {
+                Listing::Links => Some(link_message(i, NLM_F_MULTI, self.seq, self.port)),
+                Listing::Addresses(f) if f == AF_UNSPEC || f == AF_INET => {
+                    i.ipv4.as_ref().map(|a| address_message(i, a, NLM_F_MULTI, self.seq, self.port))
+                }
+                Listing::Addresses(_) => None,
+            };
+            if let Some(m) = m {
+                if !out.is_empty() && out.len() + m.len() > DUMP_DATAGRAM {
+                    return Some(out);
+                }
+                out.extend_from_slice(&m);
+            }
+            self.at += 1;
+        }
+        let done = done_message(self.seq, self.port);
+        if !out.is_empty() && out.len() + done.len() > DUMP_DATAGRAM {
+            return Some(out);
+        }
+        out.extend_from_slice(&done);
+        self.finished = true;
+        Some(out)
+    }
+}
+
+/// The answer to a request: a datagram, or a dump to produce.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Reply {
+    Datagram(Vec<u8>),
+    Dump(Dump),
+}
+
+/// Answers one request into `out`: Ok(true) for a dump (which is not
+/// acknowledged), Ok(false) for an answered request, or the error to
+/// report (nothing added). `dumping`: a dump is running (EBUSY for
+/// another, as Linux allows one per socket).
+fn request(req: &[u8], h: &Header, port: u32, interfaces: &[Interface], dumping: bool, out: &mut Vec<Reply>) -> Result<bool, i32> {
     let body = &req[NLMSG_HDRLEN..];
     let dump = h.flags & NLM_F_DUMP != 0;
-    match h.ty {
-        RTM_GETLINK if dump => {
-            // Every interface, whatever the family asked for (a link
-            // belongs to none).
-            let all = interfaces.iter().map(|i| link_message(i, NLM_F_MULTI, h.seq, port)).collect();
-            pack(all, done_message(h.seq, port), out);
-            Ok(true)
-        }
+    let listing = match h.ty {
+        RTM_GETLINK if dump => Listing::Links,
+        // struct ifaddrmsg's (or rtgenmsg's) family: IPv4 or any.
+        RTM_GETADDR if dump => Listing::Addresses(body.first().copied().unwrap_or(AF_UNSPEC)),
         RTM_GETLINK => {
             // struct ifinfomsg, then attributes: by index, else by name.
             if body.len() < 16 {
@@ -308,35 +365,37 @@ fn request(req: &[u8], h: &Header, port: u32, interfaces: &[Interface], out: &mu
                 }
             };
             let i = found.ok_or(ENODEV)?;
-            out.push(link_message(i, 0, h.seq, port));
-            Ok(false)
+            out.push(Reply::Datagram(link_message(i, 0, h.seq, port)));
+            return Ok(false);
         }
-        RTM_GETADDR if dump => {
-            // struct ifaddrmsg's (or rtgenmsg's) family: IPv4 or any.
-            let family = body.first().copied().unwrap_or(AF_UNSPEC);
-            let all = interfaces
-                .iter()
-                .filter(|_| family == AF_UNSPEC || family == AF_INET)
-                .filter_map(|i| i.ipv4.as_ref().map(|a| address_message(i, a, NLM_F_MULTI, h.seq, port)))
-                .collect();
-            pack(all, done_message(h.seq, port), out);
-            Ok(true)
-        }
-        _ => Err(EOPNOTSUPP),
+        _ => return Err(EOPNOTSUPP),
+    };
+    if dumping {
+        return Err(EBUSY);
     }
+    out.push(Reply::Dump(Dump { listing, seq: h.seq, port, at: 0, finished: false }));
+    Ok(true)
 }
 
-/// The datagrams that answer `datagram`, the requests a socket with port
-/// id `port` sent to the kernel's end, given the `interfaces`; `cap_ack`:
-/// the socket asked for capped acknowledgements (NETLINK_CAP_ACK).
+/// What answers `datagram`, the requests a socket with port id `port`
+/// sent to the kernel's end, given the `interfaces`; `cap_ack`: the socket
+/// asked for capped acknowledgements (NETLINK_CAP_ACK); `dumping`: it has a
+/// dump running; `room`: the bytes of datagrams its receive buffer takes.
+/// Answers beyond `room` are dropped (the second value says so: the
+/// socket reports ENOBUFS, as Linux when a reader's buffer is full), so a
+/// datagram of many small requests cannot make the server build more than
+/// that.
 ///
 /// As Linux: requests are taken one after the other until one is
 /// malformed; control messages and messages that are not requests only
 /// get an acknowledgement if they ask for one (`NLM_F_ACK`); a dump ends
-/// with `NLMSG_DONE` and is not acknowledged; any other request is
-/// acknowledged if it asks, and a failed one always answers its error.
-pub fn answer(datagram: &[u8], port: u32, interfaces: &[Interface], cap_ack: bool) -> Vec<Vec<u8>> {
+/// with `NLMSG_DONE` and is not acknowledged (one at a time: EBUSY for
+/// another); any other request is acknowledged if it asks, and a failed
+/// one always answers its error.
+pub fn answer(datagram: &[u8], port: u32, interfaces: &[Interface], cap_ack: bool, mut dumping: bool, room: usize) -> (Vec<Reply>, bool) {
     let mut out = Vec::new();
+    let mut used = 0usize;
+    let mut overrun = false;
     let mut at = 0;
     while at + NLMSG_HDRLEN <= datagram.len() {
         let h = header(&datagram[at..]);
@@ -345,19 +404,33 @@ pub fn answer(datagram: &[u8], port: u32, interfaces: &[Interface], cap_ack: boo
             break;
         }
         let req = &datagram[at..at + len];
+        at += (len + 3) & !3;
+        let mut replies = Vec::new();
         let result = if h.flags & NLM_F_REQUEST == 0 || h.ty < NLMSG_MIN_TYPE {
             Ok(false)
         } else {
-            request(req, &h, port, interfaces, &mut out)
+            request(req, &h, port, interfaces, dumping, &mut replies)
         };
         match result {
-            Err(e) => out.push(error_message(req, &h, e, port, cap_ack)),
-            Ok(false) if h.flags & NLM_F_ACK != 0 => out.push(error_message(req, &h, 0, port, cap_ack)),
-            Ok(_) => {}
+            Err(e) => replies.push(Reply::Datagram(error_message(req, &h, e, port, cap_ack))),
+            Ok(false) if h.flags & NLM_F_ACK != 0 => replies.push(Reply::Datagram(error_message(req, &h, 0, port, cap_ack))),
+            Ok(true) => dumping = true,
+            Ok(false) => {}
         }
-        at += (len + 3) & !3;
+        for r in replies {
+            let size = match &r {
+                Reply::Datagram(d) => d.len(),
+                Reply::Dump(_) => 0,
+            };
+            if used + size > room {
+                overrun = true;
+                continue;
+            }
+            used += size;
+            out.push(r);
+        }
     }
-    out
+    (out, overrun)
 }
 
 #[cfg(test)]
@@ -366,6 +439,68 @@ mod tests {
     use super::*;
     use alloc::string::ToString;
     use alloc::vec;
+
+
+    /// Everything `answer` gives, dumps produced to their end.
+    fn run(datagram: &[u8], port: u32, ifs: &[Interface], cap: bool) -> Vec<Vec<u8>> {
+        let (replies, overrun) = answer(datagram, port, ifs, cap, false, usize::MAX);
+        assert!(!overrun);
+        let mut out = Vec::new();
+        for r in replies {
+            match r {
+                Reply::Datagram(d) => out.push(d),
+                Reply::Dump(mut d) => {
+                    while let Some(x) = d.next(ifs) {
+                        out.push(x);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn dumps_are_produced_a_datagram_at_a_time() {
+        let many: Vec<Interface> = (1..=100).map(|n| Interface { index: n, name: alloc::format!("eth{n}"), ..interfaces()[1].clone() }).collect();
+        let (replies, _) = answer(&request(RTM_GETLINK, NLM_F_REQUEST | NLM_F_DUMP, 1, &[0]), 5, &many, false, false, usize::MAX);
+        let [Reply::Dump(mut d)] = <[Reply; 1]>::try_from(replies).unwrap() else { panic!("a dump") };
+        let first = d.next(&many).unwrap();
+        assert!(first.len() <= DUMP_DATAGRAM && messages(&first).iter().all(|m| m.0.ty == RTM_NEWLINK));
+        let mut rest = 0;
+        let mut last = Vec::new();
+        while let Some(x) = d.next(&many) {
+            rest += messages(&x).len();
+            last = x;
+        }
+        assert_eq!(messages(&first).len() + rest, 101);
+        assert_eq!(messages(&last).last().unwrap().0.ty, NLMSG_DONE);
+        assert_eq!(d.next(&many), None);
+    }
+
+    #[test]
+    fn one_dump_at_a_time() {
+        let mut d = request(RTM_GETLINK, NLM_F_REQUEST | NLM_F_DUMP, 1, &[0, 0, 0, 0]);
+        d.extend(request(RTM_GETADDR, NLM_F_REQUEST | NLM_F_DUMP, 2, &[0, 0, 0, 0]));
+        let (replies, _) = answer(&d, 5, &interfaces(), false, false, usize::MAX);
+        assert!(matches!(replies[0], Reply::Dump(_)));
+        let Reply::Datagram(e) = &replies[1] else { panic!("an error") };
+        assert_eq!(&messages(e)[0].1[..4], &(-EBUSY).to_le_bytes());
+        // A socket with a dump running: EBUSY.
+        let (replies, _) = answer(&request(RTM_GETLINK, NLM_F_REQUEST | NLM_F_DUMP, 1, &[0]), 5, &interfaces(), false, true, usize::MAX);
+        assert!(matches!(&replies[..], [Reply::Datagram(_)]));
+    }
+
+    #[test]
+    fn answers_stop_at_the_room_left() {
+        // 2000 acknowledged requests in one datagram, 4 KiB of room.
+        let mut d = Vec::new();
+        for i in 0..2000 {
+            d.extend(request(NLMSG_NOOP, NLM_F_REQUEST | NLM_F_ACK, i, &[]));
+        }
+        let (replies, overrun) = answer(&d, 5, &interfaces(), false, false, 4096);
+        let used: usize = replies.iter().map(|r| if let Reply::Datagram(x) = r { x.len() } else { 0 }).sum();
+        assert!(overrun && used <= 4096 && !replies.is_empty());
+    }
 
     fn interfaces() -> Vec<Interface> {
         vec![
@@ -424,7 +559,7 @@ mod tests {
     #[test]
     fn link_dump() {
         let req = request(RTM_GETLINK, NLM_F_REQUEST | NLM_F_DUMP, 7, &[AF_UNSPEC]);
-        let out = answer(&req, 4242, &interfaces(), false);
+        let out = run(&req, 4242, &interfaces(), false);
         assert_eq!(out.len(), 1);
         let msgs = messages(&out[0]);
         assert_eq!(msgs.len(), 3);
@@ -447,7 +582,7 @@ mod tests {
     #[test]
     fn address_dump() {
         let req = request(RTM_GETADDR, NLM_F_REQUEST | NLM_F_DUMP, 8, &[AF_UNSPEC]);
-        let msgs = messages(&answer(&req, 1, &interfaces(), false)[0]);
+        let msgs = messages(&run(&req, 1, &interfaces(), false)[0]);
         assert_eq!(msgs.len(), 3);
         let (h, p, _) = &msgs[0];
         assert_eq!(h.ty, RTM_NEWADDR);
@@ -462,7 +597,7 @@ mod tests {
         assert_eq!(attr(p, 8, IFA_BROADCAST).unwrap(), [10, 0, 2, 255]);
         // IPv6 only: an empty dump.
         let req = request(RTM_GETADDR, NLM_F_REQUEST | NLM_F_DUMP, 9, &[10]);
-        let msgs = messages(&answer(&req, 1, &interfaces(), false)[0]);
+        let msgs = messages(&run(&req, 1, &interfaces(), false)[0]);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].0.ty, NLMSG_DONE);
     }
@@ -472,7 +607,7 @@ mod tests {
         let mut body = vec![0u8; 16];
         body[4..8].copy_from_slice(&1i32.to_le_bytes());
         let req = request(RTM_GETLINK, NLM_F_REQUEST | NLM_F_ACK, 3, &body);
-        let out = answer(&req, 5, &interfaces(), false);
+        let out = run(&req, 5, &interfaces(), false);
         assert_eq!(out.len(), 2, "the link, then the acknowledgement");
         let link = messages(&out[0]);
         assert_eq!((link[0].0.ty, link[0].0.flags), (RTM_NEWLINK, 0));
@@ -485,12 +620,12 @@ mod tests {
         let mut m = Message::new(RTM_GETLINK, NLM_F_REQUEST, 4, 0);
         m.put(&[0u8; 16]);
         m.attr(IFLA_IFNAME, b"eth0\0");
-        let out = answer(&m.finish(), 5, &interfaces(), false);
+        let out = run(&m.finish(), 5, &interfaces(), false);
         assert_eq!(i32::from_le_bytes(messages(&out[0])[0].1[4..8].try_into().unwrap()), 2);
         // No such interface.
         body[4..8].copy_from_slice(&9i32.to_le_bytes());
         let req = request(RTM_GETLINK, NLM_F_REQUEST, 5, &body);
-        let out = answer(&req, 5, &interfaces(), false);
+        let out = run(&req, 5, &interfaces(), false);
         let err = messages(&out[0]);
         assert_eq!(err[0].0.ty, NLMSG_ERROR);
         assert_eq!(&err[0].1[..4], &(-ENODEV).to_le_bytes());
@@ -501,20 +636,20 @@ mod tests {
     fn refused_and_ignored() {
         // A request of a type it does not implement.
         let req = request(24, NLM_F_REQUEST, 1, &[0u8; 12]);
-        let out = answer(&req, 5, &interfaces(), true);
+        let out = run(&req, 5, &interfaces(), true);
         let err = messages(&out[0]);
         assert_eq!(&err[0].1[..4], &(-EOPNOTSUPP).to_le_bytes());
         assert_eq!(err[0].1.len(), 4 + NLMSG_HDRLEN, "capped by NETLINK_CAP_ACK");
         // Not a request, a control message: nothing, unless acknowledged.
-        assert!(answer(&request(RTM_GETLINK, 0, 1, &[0]), 5, &interfaces(), false).is_empty());
-        assert!(answer(&request(NLMSG_NOOP, NLM_F_REQUEST, 1, &[]), 5, &interfaces(), false).is_empty());
-        assert_eq!(answer(&request(NLMSG_NOOP, NLM_F_REQUEST | NLM_F_ACK, 1, &[]), 5, &interfaces(), false).len(), 1);
+        assert!(run(&request(RTM_GETLINK, 0, 1, &[0]), 5, &interfaces(), false).is_empty());
+        assert!(run(&request(NLMSG_NOOP, NLM_F_REQUEST, 1, &[]), 5, &interfaces(), false).is_empty());
+        assert_eq!(run(&request(NLMSG_NOOP, NLM_F_REQUEST | NLM_F_ACK, 1, &[]), 5, &interfaces(), false).len(), 1);
         // Malformed: a length beyond the datagram ends the processing.
         let mut bad = request(RTM_GETLINK, NLM_F_REQUEST | NLM_F_DUMP, 1, &[0]);
         bad[0] = 200;
-        assert!(answer(&bad, 5, &interfaces(), false).is_empty());
+        assert!(run(&bad, 5, &interfaces(), false).is_empty());
         // A short GETLINK.
-        let out = answer(&request(RTM_GETLINK, NLM_F_REQUEST, 1, &[0]), 5, &interfaces(), false);
+        let out = run(&request(RTM_GETLINK, NLM_F_REQUEST, 1, &[0]), 5, &interfaces(), false);
         assert_eq!(&messages(&out[0])[0].1[..4], &(-EINVAL).to_le_bytes());
     }
 
@@ -522,7 +657,7 @@ mod tests {
     fn two_requests_in_one_datagram() {
         let mut d = request(RTM_GETLINK, NLM_F_REQUEST | NLM_F_DUMP, 1, &[0, 0, 0, 0]);
         d.extend(request(RTM_GETADDR, NLM_F_REQUEST | NLM_F_DUMP, 2, &[0, 0, 0, 0]));
-        let out = answer(&d, 5, &interfaces(), false);
+        let out = run(&d, 5, &interfaces(), false);
         assert_eq!(out.len(), 2);
         assert_eq!(messages(&out[1])[0].0.seq, 2);
     }
@@ -532,7 +667,7 @@ mod tests {
         let many: Vec<Interface> = (1..=100)
             .map(|n| Interface { index: n, name: alloc::format!("eth{n}"), ..interfaces()[1].clone() })
             .collect();
-        let out = answer(&request(RTM_GETLINK, NLM_F_REQUEST | NLM_F_DUMP, 1, &[0]), 5, &many, false);
+        let out = run(&request(RTM_GETLINK, NLM_F_REQUEST | NLM_F_DUMP, 1, &[0]), 5, &many, false);
         assert!(out.len() > 1);
         let total: usize = out.iter().map(|d| messages(d).len()).sum();
         assert_eq!(total, 101);
