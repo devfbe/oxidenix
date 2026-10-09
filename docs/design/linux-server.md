@@ -138,7 +138,9 @@ low-priority thread preempted while it holds a lock would make every thread of t
 instance that needs the lock wait as long as the low-priority thread waits for the CPU
 (priority inversion: seconds for nice 19 next to a nice −20 loop). The server counts the
 locks each thread holds in a word of the thread's State page
-(`restricted::SERVER_LOCKS_OFFSET`); the scheduler, which knows each Linux thread's page,
+(`restricted::SERVER_LOCKS_OFFSET`), by plain loads and stores, since only the thread
+writes it (a locked increment and decrement per lock cost a path lookup, with about fifty
+locks, some 900 cycles); the scheduler, which knows each Linux thread's page,
 gives a thread holding one the weight of nice −20 (its time with the lock counts at that
 weight) and puts it at the front of its CPU's virtual time when it is preempted or wakes
 holding one. A holder thus comes back as soon as the most favored program would, and a

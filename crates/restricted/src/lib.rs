@@ -39,7 +39,9 @@ pub const fn thread_state(n: u64) -> u64 {
 /// the thread (a u32; `servers/linux/src/sync.rs`): the kernel's scheduler
 /// gives a thread holding one the weight of nice -20, so a program's low
 /// priority never holds up the instance's other threads waiting for the
-/// lock (priority inversion; docs/design/linux-server.md).
+/// lock (priority inversion; docs/design/linux-server.md). Only the thread
+/// itself writes it, by plain stores (the kernel zeroes it before it hands
+/// out the slot, and only reads it after).
 pub const SERVER_LOCKS_OFFSET: u64 = 2048;
 
 /// The Linux program's registers while the server handles one of its
