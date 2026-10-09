@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <stdlib.h>
 #include <sys/eventfd.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <dirent.h>
@@ -261,6 +262,18 @@ int main(void) {
     passed = legacy_calls() - l0 - base;
     printf("    (%ld of 200 pipe calls passed through)\n", passed);
     check("pipe reads and writes are the server's", passed == 0 && same);
+    /* The descriptor's ioctls (libuv makes Node's stdio pipes non-blocking
+     * with FIONBIO): on the kernel's flags of the server's pipe. */
+    int on = 1, off = 0;
+    errno = 0;
+    check("FIONBIO makes an empty pipe EAGAIN", ioctl(q[0], FIONBIO, &on) == 0 && (fcntl(q[0], F_GETFL) & O_NONBLOCK)
+          && read(q[0], buf, 1) == -1 && errno == EAGAIN);
+    check("... and blocking again", ioctl(q[0], FIONBIO, &off) == 0 && !(fcntl(q[0], F_GETFL) & O_NONBLOCK));
+    check("FIONCLEX and FIOCLEX set the close-on-exec flag", ioctl(q[0], FIONCLEX) == 0 && !(fcntl(q[0], F_GETFD) & FD_CLOEXEC)
+          && ioctl(q[0], FIOCLEX) == 0 && (fcntl(q[0], F_GETFD) & FD_CLOEXEC));
+    check("... other ioctls on a pipe are ENOTTY", ioctl(q[0], TCGETS, buf) == -1 && errno == ENOTTY);
+    errno = 0;
+    check("... FIONBIO on a bad descriptor is EBADF (not EFAULT)", ioctl(999, FIONBIO, NULL) == -1 && errno == EBADF);
     close(q[1]);
     check("... end of file once the writer is closed", read(q[0], buf, 1) == 0);
     close(q[0]);

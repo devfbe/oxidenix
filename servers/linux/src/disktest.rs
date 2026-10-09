@@ -295,7 +295,12 @@ fn reading() -> Result<(), i64> {
     check!(20, r.status > 0 && r.values[0] > 0);
     let u = c.call(Request::Statfs).map_err(|_| 21)?;
     let usage = Usage::from_values(&u.values);
-    check!(22, u.status == 0 && usage.block_size == 1024 && usage.blocks == 65536 && usage.free_blocks < usage.blocks);
+    // The builder's disks (the persistent one or the tests' own) are whole
+    // MiB in 1 KiB blocks; /data's own channel (the page cache's) sees the
+    // same filesystem.
+    let through_data = crate::datafs::usage().map_err(|_| 21)?;
+    check!(22, u.status == 0 && usage.block_size == 1024 && usage.blocks % 1024 == 0 && usage.blocks >= 64 * 1024
+        && usage.blocks == through_data.blocks && usage.block_size == through_data.block_size && usage.free_blocks < usage.blocks);
     // A symlink, made and read back, then gone.
     let _ = remove(&mut c, &names, b"ringtest.link");
     let (n, target) = names.put(b"ringtest.link", b"../some/target");

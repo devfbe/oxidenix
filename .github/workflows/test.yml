@@ -81,7 +81,7 @@ jobs:
           test "$code" -eq 1
 
       - name: Check the ext2 disk written by oxidenix
-        run: nix-shell -p e2fsprogs --run "e2fsck -fn disk.img"
+        run: nix-shell -p e2fsprogs --run "e2fsck -fn target/test-disk.img"
 
       - name: Upload the serial log
         if: always()

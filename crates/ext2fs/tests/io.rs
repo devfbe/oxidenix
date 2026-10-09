@@ -868,3 +868,102 @@ fn promises_end_with_truncation_release_and_owner() {
     assert_eq!(free(&fs), total);
     fsck("promise-end", &take(fs));
 }
+
+/// A write in flight for promised blocks (reserved, not linked yet) holds
+/// them once: the promise still counts them until the write links them, so
+/// the rest of the disk stays promisable to the last block. (Write-back of
+/// a big file keeps megabytes in flight; counted twice, they made write()
+/// fail with ENOSPC early.)
+#[test]
+fn blocks_in_flight_for_a_promise_count_once() {
+    let mut fs = Ext2::mount(mkfs("promise-flight", 4 * 1024)).unwrap();
+    let a = fs.create(ROOT_INO, "a", &NewNode::File, 0o644).unwrap();
+    fs.promise(1, a, 0, 64 * 1024).unwrap();
+    let promised = free(&fs);
+    let r = fs.reserve(a, 0, 64 * 1024).unwrap();
+    assert_eq!(free(&fs), promised);
+    // Everything else can be promised to another file, block by block.
+    let b = fs.create(ROOT_INO, "b", &NewNode::File, 0o644).unwrap();
+    let mut fb = 0;
+    while fs.promise(2, b, fb * 1024, 1024).is_ok() {
+        fb += 1;
+    }
+    assert!(free(&fs) <= 2, "{} blocks left unpromisable", free(&fs));
+    // The write in flight lands; so do the other owner's.
+    dma_write(&mut fs, &r, 0, &[4u8; 64 * 1024]);
+    fs.link(&r, 64 * 1024).unwrap();
+    fs.write(b, 0, &vec![5u8; fb as usize * 1024]).unwrap();
+    assert_eq!(fs.promised(), 0);
+    fs.sync().unwrap();
+    // A promise that ends while its blocks are in flight leaves them
+    // counted as reserved.
+    let c = fs.create(ROOT_INO, "c", &NewNode::File, 0o644).unwrap();
+    for ino in fs.unlink(ROOT_INO, "b", false).unwrap() {
+        fs.release(ino).unwrap();
+    }
+    fs.sync().unwrap();
+    let before = free(&fs);
+    fs.promise(3, c, 0, 8 * 1024).unwrap();
+    let r = fs.reserve(c, 0, 8 * 1024).unwrap();
+    assert_eq!(free(&fs), before - 8);
+    fs.forget_promises(3);
+    assert_eq!(fs.promised(), 0);
+    let mut d = 0;
+    let e = fs.create(ROOT_INO, "e", &NewNode::File, 0o644).unwrap();
+    while fs.promise(4, e, d * 1024, 1024).is_ok() {
+        d += 1;
+    }
+    fs.forget_promises(4);
+    // Only the 8 blocks in flight were kept from the promises (and the
+    // indirect blocks of e's: one single, one double with its tables).
+    let tables = |n: u64| (n > 12) as u64 + if n > 268 { 1 + (n - 268).div_ceil(256) } else { 0 };
+    let used = d + tables(d) + 8;
+    assert!(used <= before && used + 2 >= before, "{d} promised of {before}");
+    fs.unreserve(&r);
+    assert_eq!(free(&fs), before);
+    fsck("promise-flight", &take(fs));
+}
+
+/// Many blocks in flight at once (a write-back burst of a big file): each
+/// counts once while in flight, linking them costs no rescans, and a
+/// truncation that ends part of the promise leaves exactly those blocks
+/// counted as reserved.
+#[test]
+fn many_blocks_in_flight_count_once() {
+    let mut fs = Ext2::mount(mkfs("promise-many", 32 * 1024)).unwrap();
+    let a = fs.create(ROOT_INO, "a", &NewNode::File, 0o644).unwrap();
+    const LEN: u64 = 8 * 1024 * 1024;
+    const CHUNK: u64 = 64 * 1024;
+    let total = free(&fs);
+    fs.promise(1, a, 0, LEN).unwrap();
+    let promised = fs.promised();
+    let started = std::time::Instant::now();
+    let reservations: Vec<_> = (0..LEN / CHUNK).map(|i| fs.reserve(a, i * CHUNK, CHUNK).unwrap()).collect();
+    assert_eq!(free(&fs), total - promised);
+    // The rest of the disk can be promised to another file.
+    let b = fs.create(ROOT_INO, "b", &NewNode::File, 0o644).unwrap();
+    let rest = free(&fs);
+    assert!(fs.promise(2, b, 0, (rest - rest / 64 - 8) * 1024).is_ok());
+    fs.forget_promises(2);
+    // The first half lands.
+    let half = reservations.len() / 2;
+    for (i, r) in reservations[..half].iter().enumerate() {
+        dma_write(&mut fs, r, i as u64 * CHUNK, &vec![6u8; CHUNK as usize]);
+        fs.link(r, (i as u64 + 1) * CHUNK).unwrap();
+    }
+    // The file is cut there: the promise of the second half ends, and its
+    // blocks in flight count as reserved until given back.
+    fs.truncate(a, half as u64 * CHUNK).unwrap();
+    assert_eq!(fs.promised(), 0);
+    let in_flight = (reservations.len() - half) as u64 * (CHUNK / 1024);
+    let c = fs.create(ROOT_INO, "c", &NewNode::File, 0o644).unwrap();
+    let left = free(&fs) - in_flight;
+    assert!(fs.promise(3, c, 0, (left + 1) * 1024).is_err());
+    fs.forget_promises(3);
+    for r in &reservations[half..] {
+        fs.unreserve(r);
+    }
+    assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+    fs.sync().unwrap();
+    fsck("promise-many", &take(fs));
+}

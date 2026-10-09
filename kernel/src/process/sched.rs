@@ -230,9 +230,22 @@ fn enqueue(task: Arc<Task>) {
 /// The next task for this CPU: its own queue first, else one stolen from
 /// the back of another CPU's queue (one that may run here). A task whose
 /// affinity no longer allows this CPU moves on to one it may run on.
+///
+/// A task another CPU is still switching away from (`on_cpu`; a CPU puts
+/// its current task back in a queue before it switches) is left where it
+/// is: `context_switch` would wait for it with interrupts off, and two
+/// CPUs that each took the other's outgoing task (one from its own queue,
+/// one by stealing the newest entry of the other's) waited for each other
+/// for good. It is taken at a later schedule, once its switch is done.
 fn pick_next(cpu: &Cpu) -> Option<Arc<Task>> {
+    let cur: *const Task = current();
+    let switched_out = |t: &Arc<Task>| !t.on_cpu.load(Ordering::Acquire) || core::ptr::eq(&**t, cur);
     loop {
-        let t = cpu.sched.rq.lock().pop_front();
+        let t = {
+            let mut rq = cpu.sched.rq.lock();
+            let i = rq.iter().position(|t| !t.may_run_on(cpu.index) || switched_out(t));
+            i.and_then(|i| rq.remove(i))
+        };
         match t {
             Some(t) if t.may_run_on(cpu.index) => return Some(t),
             Some(t) => enqueue(t),
@@ -241,7 +254,7 @@ fn pick_next(cpu: &Cpu) -> Option<Arc<Task>> {
     }
     (0..smp::MAX_CPUS).filter(|&i| i != cpu.index).filter_map(smp::by_index).find_map(|other| {
         let mut rq = other.sched.rq.lock();
-        let i = rq.iter().rposition(|t| t.may_run_on(cpu.index))?;
+        let i = rq.iter().rposition(|t| t.may_run_on(cpu.index) && !t.on_cpu.load(Ordering::Acquire))?;
         rq.remove(i)
     })
 }

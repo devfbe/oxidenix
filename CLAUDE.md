@@ -31,7 +31,9 @@ An AI research project; see README.md.
   `NIX_PATH=nixpkgs=nix/nixpkgs.nix`. Use the same for manual Nix calls (the host ext2 test:
   `NIX_PATH=nixpkgs=$PWD/nix/nixpkgs.nix nix-shell -p e2fsprogs --run ...`).
 - `cd kernel && OXIDENIX_TEST=1 cargo run` runs all self-tests (`/etc/runtests.sh`) and
-  exits QEMU with 1 on success, 3 on failure; CI runs the same on every push.
+  exits QEMU with 1 on success, 3 on failure; CI runs the same on every push. The tests get a
+  fresh 64 MiB data disk of their own, `target/test-disk.img` (never `disk.img`); check it
+  afterwards with `nix-shell -p e2fsprogs --run "e2fsck -fn target/test-disk.img"` (CI does).
 - `nix-shell -p e2fsprogs --run "cargo test -p ext2fs"` (workspace root) tests the ext2
   library on the host against a RAM disk; CI runs it too. `cargo test -p vfs` tests the pure
   parts of the Linux server's namespace (paths, cpio) on the host, `cargo test -p slab` the
@@ -43,6 +45,13 @@ An AI research project; see README.md.
   boots a BIOS image instead. CI runs the self-tests with both.
 - `cd kernel && OXIDENIX_BUILD_ONLY=1 cargo run` builds the boot image and data disk without
   starting QEMU.
+- The data disk `disk.img` (2 GiB ext2, sparse) is created only when missing; delete it for a
+  fresh one. `OXIDENIX_NODE=1` puts a static Node.js (`userspace/node`, about an hour to
+  build the first time) on it as `/data/bin/node` (`OXIDENIX_NODE=<path>`: another static
+  node binary); never needed by CI.
+- `OXIDENIX_AUTORUN=<host script> cargo run > log` boots into that script like test mode
+  (exit status to QEMU, serial to stdout): for scripted experiments, e.g. running node and
+  reading "syscall N not implemented" from the kernel log.
 
 ## Finding code
 

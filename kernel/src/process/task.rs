@@ -106,6 +106,11 @@ pub struct Info {
     /// of reaped children (with their own reaped children).
     pub dead_time: (u64, u64),
     pub children_time: (u64, u64),
+    /// The most pages it ever had resident, kept when its address space
+    /// goes at exit (wait4's ru_maxrss), and the most of its reaped
+    /// children's (with theirs).
+    pub peak_pages: u64,
+    pub children_peak: u64,
 }
 
 impl Info {
@@ -135,6 +140,8 @@ impl Info {
             threads: Vec::new(),
             dead_time: (0, 0),
             children_time: (0, 0),
+            peak_pages: 0,
+            children_peak: 0,
         }
     }
 }

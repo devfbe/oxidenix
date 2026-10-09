@@ -110,7 +110,10 @@ pub fn exec(frame: &mut Frame, path: &str, args: &[String], envs: &[String]) -> 
         info.name = basename(path).to_string();
         info.cmdline = cmdline_of(args);
         info.exe = exe;
-        info.mem = Some(mm.stats.clone());
+        // The high-water mark survives exec, as on Linux (ru_maxrss).
+        if let Some(old) = info.mem.replace(mm.stats.clone()) {
+            info.peak_pages = info.peak_pages.max(old.peak_pages.load(Ordering::Relaxed));
+        }
     }
     *me.comm.lock() = basename(path).chars().take(15).collect();
     me.group.sig.lock().reset_on_exec();

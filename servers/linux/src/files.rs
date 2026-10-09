@@ -175,6 +175,11 @@ pub fn handle(s: &State) -> Option<i64> {
             Some(_) => Ok(0),
             None => return None,
         },
+        // The kernel's descriptor table holds the descriptor's flags and
+        // close-on-exec bit: the requests on those (FIONBIO, FIONCLEX,
+        // FIOCLEX) go there for the server's files, too. A pass-through
+        // until the descriptor table moves into the server (R6e).
+        SYS_IOCTL if matches!(a1, 0x5421 | 0x5450 | 0x5451) => return None,
         SYS_READ | SYS_WRITE | SYS_READV | SYS_WRITEV | SYS_FSTAT | SYS_LSEEK | SYS_IOCTL | SYS_PREAD64 | SYS_PWRITE64
         | SYS_PREADV | SYS_PWRITEV | SYS_FSYNC | SYS_FDATASYNC | SYS_FTRUNCATE | SYS_GETDENTS64 | SYS_FSTATFS => {
             let (file, flags) = lookup(a0)?;

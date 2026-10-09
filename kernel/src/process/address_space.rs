@@ -9,11 +9,20 @@
 //! Writable private memory is committed when it is mapped, against a
 //! system-wide limit (`memory::commit`), so running out of memory is an
 //! ENOMEM from `mmap`, `brk`, `mprotect` or `fork`, not a killed process.
-//! `PROT_NONE` and `MAP_NORESERVE` areas commit nothing until made writable.
+//! Private areas that are not committed as a whole (`MAP_NORESERVE` ones,
+//! also after `mprotect` made them writable, as on Linux, and areas that
+//! are not writable) commit page by page instead: a page that gets a
+//! private frame of its own is committed then, one page, and carries the
+//! CHARGED bit until it goes. JITs such as V8 reserve a large code range
+//! with `MAP_NORESERVE` and make all of it writable and executable at
+//! once; only what they touch counts. When the commit fails at a touch, the
+//! toucher is killed, never a process whose memory was committed (a copy
+//! by the kernel or the Linux server ends at its fixup and the process gets
+//! SIGKILL, see the page fault handler).
 //!
-//! Page table entries carry two software bits: COW (a shared frame that is
-//! copied on the first write) and PROT_NONE (a frame kept while its area
-//! denies all access).
+//! Page table entries carry three software bits: COW (a shared frame that
+//! is copied on the first write), PROT_NONE (a frame kept while its area
+//! denies all access) and CHARGED (a page committed on its own, above).
 //!
 //! File mappings map the frames of the file's page cache (`fs::cache`):
 //! shared ones the cache frame itself, private ones the cache frame
@@ -52,6 +61,9 @@ pub const COW: PageTableFlags = PageTableFlags::BIT_9;
 /// A frame kept for an area that currently denies access (PROT_NONE); the
 /// entry is not present.
 const PROT_NONE: PageTableFlags = PageTableFlags::BIT_10;
+/// A private frame of an area not committed as a whole, committed on its
+/// own (one page) when it was made; uncommitted when the entry goes.
+const CHARGED: PageTableFlags = PageTableFlags::BIT_11;
 
 /// Highest address `mmap` hands out; the stack lives above.
 pub const MMAP_TOP: u64 = 0x0000_3000_0000_0000;
@@ -173,6 +185,9 @@ pub struct Vma {
     pub backing: Backing,
     /// Its length is committed (writable private memory).
     pub charged: bool,
+    /// Mapped with MAP_NORESERVE: never committed, not even when
+    /// `mprotect` makes it writable (Linux's VM_NORESERVE).
+    pub noreserve: bool,
     /// A stack: accesses just below it grow it, up to STACK_LIMIT.
     pub grows_down: bool,
 }
@@ -193,6 +208,12 @@ impl Vma {
             *offset += shift;
         }
         v
+    }
+
+    /// Whether a private frame of this area is committed page by page (the
+    /// area is private and not committed as a whole).
+    fn per_page(&self) -> bool {
+        self.private() && !self.charged
     }
 
     /// Whether this area would need commit when writable.
@@ -524,6 +545,7 @@ impl AddressSpace {
             a.end == b.start
                 && a.prot == b.prot
                 && a.charged == b.charged
+                && a.noreserve == b.noreserve
                 && a.grows_down == b.grows_down
                 && matches!((&a.backing, &b.backing), (Backing::Anon, Backing::Anon))
         };
@@ -564,7 +586,7 @@ impl AddressSpace {
     /// `noreserve`; on failure nothing changes (ENOMEM).
     pub fn map(&mut self, start: u64, len: u64, prot: Prot, backing: Backing, noreserve: bool) -> Result<(), Fault> {
         let end = start.checked_add(len).filter(|&e| e <= USER_END && len > 0).ok_or(Fault::Segv)?;
-        let mut vma = Vma { start, end, prot, backing, charged: false, grows_down: false };
+        let mut vma = Vma { start, end, prot, backing, charged: false, noreserve, grows_down: false };
         if let Some((cache, _)) = vma.file() {
             if self.owner.strong_count() > 0 {
                 cache.register(&self.owner)?;
@@ -612,15 +634,28 @@ impl AddressSpace {
     /// Frees the frames mapped in [start, end) (the areas stay).
     fn clear_pages(&mut self, start: u64, end: u64) {
         let mut gather = Gather::new(&self.tlb);
-        let mut freed = 0i64;
+        let (mut freed, mut charged) = (0i64, 0u64);
         for_each_leaf(self.l4, start, end, |va, e| {
             let frame = PhysFrame::containing_address(e.addr());
+            charged += e.flags().contains(CHARGED) as u64;
             e.set_unused();
             gather.add(va, frame);
             freed += 1;
         });
         gather.finish();
         count(&self.stats.pages, -freed);
+        memory::uncommit(charged);
+    }
+
+    /// Takes the CHARGED bit off the entries in [start, end): their area is
+    /// committed as a whole now, and their commit counts as part of it
+    /// (`protect` committed only the rest).
+    fn absorb_charged_pages(&mut self, start: u64, end: u64) {
+        for_each_leaf(self.l4, start, end, |_, e| {
+            if e.flags().contains(CHARGED) {
+                e.set_flags(e.flags() - CHARGED);
+            }
+        });
     }
 
     /// mprotect: new rights for [start, start+len), which must be fully
@@ -645,26 +680,38 @@ impl AddressSpace {
             }
             at = v.end;
         }
-        let needed: u64 = self
+        // The areas to commit as a whole: their pages less those already
+        // committed one by one (CHARGED), whose commit becomes the area's.
+        let ranges: alloc::vec::Vec<(u64, u64)> = self
             .vmas
             .range(..end)
-            .filter(|(_, v)| v.end > start && v.private() && !v.charged && prot.write)
-            .map(|(_, v)| (v.end.min(end) - v.start.max(start)) / PAGE)
-            .sum();
+            .filter(|(_, v)| v.end > start && v.private() && !v.charged && !v.noreserve && prot.write)
+            .map(|(_, v)| (v.start.max(start), v.end.min(end)))
+            .collect();
+        let mut needed: u64 = ranges.iter().map(|(s, e)| (e - s) / PAGE).sum();
+        for &(s, e) in &ranges {
+            for_each_leaf(self.l4, s, e, |_, leaf| needed -= leaf.flags().contains(CHARGED) as u64);
+        }
         if needed > 0 && !memory::commit(needed) {
             return Err(Fault::Oom);
         }
         self.split_at(start);
         self.split_at(end);
         let keys: alloc::vec::Vec<u64> = self.vmas.range(start..end).map(|(&s, _)| s).collect();
+        let mut now_charged = alloc::vec::Vec::new();
         for s in keys {
             let v = self.vmas.get_mut(&s).expect("listed above");
             v.prot = prot;
-            if prot.write && v.private() && !v.charged {
+            if prot.write && v.private() && !v.charged && !v.noreserve {
                 v.charged = true;
+                now_charged.push((v.start, v.end));
             }
         }
         self.apply_prot(start, end, prot);
+        // Their pages committed one by one are part of the whole now.
+        for (s, e) in now_charged {
+            self.absorb_charged_pages(s, e);
+        }
         Ok(())
     }
 
@@ -763,20 +810,35 @@ impl AddressSpace {
     /// Moves the page table entries of [from, from+len) to `to`.
     fn move_pages(&mut self, from: u64, to: u64, len: u64) {
         let l4 = self.l4;
+        let mut lost = false;
         let mut mapper = self.mapper();
         let parent = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+        // (Nothing here may allocate from the heap: the frame allocator's
+        // lock is held, and a growing heap takes it.)
         memory::with_frames(|frames| {
             for_each_leaf(l4, from, from + len, |va, e| {
                 let (frame, flags) = (PhysFrame::containing_address(e.addr()), e.flags());
-                e.set_unused();
                 let page = Page::<Size4KiB>::containing_address(VirtAddr::new(to + (va - from)));
                 let mut user = UserFrames(frames);
-                // The target range was unmapped, so this cannot collide.
-                let _ = unsafe { mapper.map_to_with_table_flags(page, frame, flags, parent, &mut user) }.map(|f| f.ignore());
+                // The target range was unmapped, so this cannot collide. A
+                // page that cannot be mapped there (no frame for a page
+                // table) keeps its old entry for now.
+                match unsafe { mapper.map_to_with_table_flags(page, frame, flags, parent, &mut user) } {
+                    Ok(f) => {
+                        f.ignore();
+                        e.set_unused();
+                    }
+                    Err(_) => lost = true,
+                }
             });
         });
         self.sync_views(to..to + len);
         tlb::shootdown(&self.tlb, from, from + len);
+        // The pages that could not move go as munmap's do: frames after the
+        // shootdown, with their commit and their count.
+        if lost {
+            self.clear_pages(from, from + len);
+        }
     }
 
     // ----------------------------------------------------------- faults
@@ -825,13 +887,33 @@ impl AddressSpace {
             }
             return Ok(());
         }
-        let (frame, writable_ok) = self.new_frame(page, &v, access, wait)?;
-        let mut flags = v.prot.flags();
-        if !writable_ok && flags.contains(PageTableFlags::WRITABLE) {
-            flags.remove(PageTableFlags::WRITABLE);
-            flags.insert(COW);
+        // A private frame of an area committed page by page is committed
+        // now; if that fails, the toucher dies (Oom), not a process whose
+        // memory was committed.
+        let private_frame = match &v.backing {
+            Backing::Anon => true,
+            Backing::File { shared, .. } => !shared && access.write,
+            _ => false,
+        };
+        let charge = private_frame && v.per_page();
+        if charge && !memory::commit(1) {
+            return Err(Fault::Oom);
         }
-        self.install(page, frame, flags)
+        let installed = self.new_frame(page, &v, access, wait).and_then(|(frame, writable_ok)| {
+            let mut flags = v.prot.flags();
+            if !writable_ok && flags.contains(PageTableFlags::WRITABLE) {
+                flags.remove(PageTableFlags::WRITABLE);
+                flags.insert(COW);
+            }
+            if charge {
+                flags.insert(CHARGED);
+            }
+            self.install(page, frame, flags)
+        });
+        if installed.is_err() && charge {
+            memory::uncommit(1);
+        }
+        installed
     }
 
     /// A frame with the page's initial contents (holding a reference for
@@ -918,6 +1000,14 @@ impl AddressSpace {
         let old = PhysFrame::containing_address(e.addr());
         let shared_area = v.backing.shared();
         self.mark_dirty(page, v, wait)?;
+        // The page becomes private memory of this space: committed now if
+        // its area is committed page by page (the toucher dies if that
+        // fails).
+        let charge = !shared_area && v.per_page() && !flags.contains(CHARGED);
+        if charge && !memory::commit(1) {
+            return Err(Fault::Oom);
+        }
+        let writable = if charge { writable | CHARGED } else { writable };
         let copied = memory::with_frames(|frames| {
             if shared_area || frames.refcount(old) <= 1 {
                 // Only rights grow: a stale read-only entry elsewhere just
@@ -935,7 +1025,13 @@ impl AddressSpace {
             }
             e.set_addr(new.start_address(), writable);
             Ok(true)
-        })?;
+        });
+        // (The commit's bookkeeping happens outside the frame allocator's
+        // lock: a commit may reclaim cache pages, which takes it.)
+        if copied.is_err() && charge {
+            memory::uncommit(1);
+        }
+        let copied = copied?;
         if copied {
             // Other threads must stop reading the old frame before this
             // mapping lets go of it.
@@ -1026,8 +1122,20 @@ impl AddressSpace {
     fn privatize(&mut self, page: u64) -> Result<(), Fault> {
         let e = leaf_entry(self.l4, page).ok_or(Fault::Segv)?;
         let old = PhysFrame::containing_address(e.addr());
+        // A copy of its own is committed first if its area is committed page
+        // by page, outside the frame allocator's lock: a commit may reclaim
+        // cache pages, which frees frames under that lock.
+        let shared = memory::with_frames(|frames| frames.refcount(old) > 1);
+        let charge = shared && self.vma(page).is_some_and(|v| v.per_page()) && !e.flags().contains(CHARGED);
+        if charge && !memory::commit(1) {
+            return Err(Fault::Oom);
+        }
         let copied = memory::with_frames(|frames| {
             if frames.refcount(old) <= 1 {
+                // Its own meanwhile: kept, with the commit made for it.
+                if charge {
+                    e.set_flags(e.flags() | CHARGED);
+                }
                 return Ok(false);
             }
             let new = UserFrames(frames).allocate_frame().ok_or(Fault::Oom)?;
@@ -1038,9 +1146,14 @@ impl AddressSpace {
                     PAGE as usize,
                 );
             }
-            e.set_addr(new.start_address(), e.flags() - COW);
+            let flags = if charge { (e.flags() - COW) | CHARGED } else { e.flags() - COW };
+            e.set_addr(new.start_address(), flags);
             Ok(true)
-        })?;
+        });
+        if copied.is_err() && charge {
+            memory::uncommit(1);
+        }
+        let copied = copied?;
         if copied {
             let mut gather = Gather::new(&self.tlb);
             gather.add(page, old);
@@ -1088,7 +1201,7 @@ impl AddressSpace {
             return Err(Fault::Segv);
         }
         self.unmap(start, len);
-        self.insert(Vma { start, end: start + len, prot, backing: Backing::Device, charged: false, grows_down: false });
+        self.insert(Vma { start, end: start + len, prot, backing: Backing::Device, charged: false, noreserve: false, grows_down: false });
         for i in 0..pages {
             let frame = PhysFrame::containing_address(PhysAddr::new(phys + i * PAGE));
             memory::with_frames(|f| f.share(frame));
@@ -1106,7 +1219,7 @@ impl AddressSpace {
             return Err(Fault::Segv);
         }
         let prot = Prot { read: true, write: writable, exec: false };
-        self.insert(Vma { start, end: start + len, prot, backing: Backing::Granted { grant, writable }, charged: false, grows_down: false });
+        self.insert(Vma { start, end: start + len, prot, backing: Backing::Granted { grant, writable }, charged: false, noreserve: false, grows_down: false });
         for (i, &frame) in frames.iter().enumerate() {
             memory::with_frames(|f| f.share(frame));
             if let Err(e) = self.install(start + i as u64 * PAGE, frame, prot.flags()) {
@@ -1127,7 +1240,7 @@ impl AddressSpace {
         for (start, len) in ranges {
             self.unmap(start, len);
             let none = Prot { read: false, write: false, exec: false };
-            self.insert(Vma { start, end: start + len, prot: none, backing: Backing::Revoked { channel }, charged: false, grows_down: false });
+            self.insert(Vma { start, end: start + len, prot: none, backing: Backing::Revoked { channel }, charged: false, noreserve: false, grows_down: false });
         }
     }
 
@@ -1286,7 +1399,15 @@ impl AddressSpace {
     /// write-back write-protects it like the parent's.
     fn copy_from(&mut self, parent: &AddressSpace) -> Result<(), Fault> {
         debug_assert!(self.vmas.is_empty() && self.owner.strong_count() > 0);
-        let charged: u64 = parent.vmas.values().filter(|v| v.charged).map(|v| v.pages()).sum();
+        // The areas committed as a whole, and the pages committed one by
+        // one (the child's entries keep the CHARGED bit: they may diverge).
+        let mut charged: u64 = parent.vmas.values().filter(|v| v.charged).map(|v| v.pages()).sum();
+        let mut page_charged = 0;
+        for_each_leaf(parent.l4, 0, USER_END, |va, e| {
+            let granted = parent.vma(va).is_some_and(|v| matches!(v.backing, Backing::Granted { .. }));
+            page_charged += (!granted && e.flags().contains(CHARGED)) as u64;
+        });
+        charged += page_charged;
         if !memory::commit(charged) {
             return Err(Fault::Oom);
         }
@@ -1309,6 +1430,9 @@ impl AddressSpace {
         let mut mapper = self.mapper();
         let table_flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
         let (vmas, stats) = (&parent.vmas, &self.stats);
+        // The CHARGED entries the child got: a partial copy (Oom) gives back
+        // the commit of those it did not (its space releases the others).
+        let mut copied_charged = 0;
         let result = memory::with_frames(|frames| {
             let mut frames = UserFrames(frames);
             let l4 = table_at(parent.l4);
@@ -1337,6 +1461,7 @@ impl AddressSpace {
                             // Only a successful mapping owns a reference.
                             frames.0.share(frame);
                             stats.add_resident(1);
+                            copied_charged += flags.contains(CHARGED) as u64;
                         }
                     }
                 }
@@ -1346,6 +1471,9 @@ impl AddressSpace {
         // The parent's pages just lost their write permission, also for
         // its other threads.
         tlb::shootdown(&parent.tlb, 0, USER_END);
+        if result.is_err() {
+            memory::uncommit(page_charged - copied_charged);
+        }
         result?;
         self.brk_start = parent.brk_start;
         self.brk_end = parent.brk_end;
@@ -1361,7 +1489,8 @@ impl Drop for AddressSpace {
     fn drop(&mut self) {
         // Every task left it (see `tlb::switch`) before the last reference went.
         debug_assert!(!self.active(), "dropping the loaded address space");
-        let charged: u64 = self.vmas.values().filter(|v| v.charged).map(|v| v.pages()).sum();
+        let mut charged: u64 = self.vmas.values().filter(|v| v.charged).map(|v| v.pages()).sum();
+        for_each_leaf(self.l4, 0, USER_END, |_, e| charged += e.flags().contains(CHARGED) as u64);
         memory::uncommit(charged);
         // Shared objects drop with the areas, after the frames' mappings.
         let vmas = core::mem::take(&mut self.vmas);
@@ -1479,7 +1608,7 @@ fn for_each_leaf(l4: PhysFrame, start: u64, end: u64, mut f: impl FnMut(u64, &'s
 ///   the stored data.
 /// - Other shared memory: writable as the area allows.
 fn leaf_flags(backing: Option<&Backing>, prot: Prot, old: PageTableFlags, refs: u32) -> PageTableFlags {
-    let mut flags = prot.flags();
+    let mut flags = prot.flags() | (old & CHARGED);
     let was_cow = old.contains(COW);
     let must_fault = match backing {
         Some(b) if b.shared() => b.tracks_dirty() && !old.contains(PageTableFlags::WRITABLE),

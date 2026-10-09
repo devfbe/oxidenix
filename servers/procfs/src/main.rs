@@ -284,6 +284,8 @@ fn entries(node: Node) -> Result<Vec<(String, u32, u8)>, i64> {
 
 fn lookup(node: Node, name: &str) -> Result<u32, i64> {
     if let Node::Global(ROOT) = node {
+        // Any thread's id has a directory, as on Linux (the kernel finds
+        // its process), though the listing shows processes only.
         if let Ok(pid) = name.parse::<u64>() {
             return if pid != 0 && process(pid).is_some() { Ok(pid_ino(pid, P_DIR)) } else { Err(ENOENT) };
         }

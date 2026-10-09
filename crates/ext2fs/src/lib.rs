@@ -38,8 +38,10 @@
 
 extern crate alloc;
 
+mod blockset;
 mod cache;
 
+use blockset::BlockSet;
 use cache::BlockCache;
 
 use alloc::collections::{BTreeMap, BTreeSet};
@@ -244,6 +246,10 @@ struct State<D: Device> {
     /// Data blocks reserved for writes in flight (`Ext2::reserve`): in no
     /// bitmap and no inode yet, but no allocation takes them.
     reserved: BTreeSet<u32>,
+    /// The reserved blocks taken for a promised file block, by (inode,
+    /// file block): until the write links them the promise still counts
+    /// them (`promised`), so `avail` must not count them twice.
+    reserved_promised: BTreeMap<(u32, u64), u32>,
     /// Blocks allocated for metadata (indirect, directory and symlink
     /// blocks) whose contents have not reached the device yet. Like file
     /// data, they are written and flushed before any metadata that may
@@ -253,8 +259,8 @@ struct State<D: Device> {
     /// Blocks freed since the last successful commit: the metadata on the
     /// disk may still point to them, so no allocation takes them before a
     /// commit wrote the change (else a crash shows the new owner's data in
-    /// the old file).
-    freed: BTreeSet<u32>,
+    /// the old file). Ranges: a big file frees millions of blocks at once.
+    freed: BlockSet,
     /// Blocks were written that metadata may point to (file data, zeroed
     /// fresh blocks, new metadata blocks, and the data of the caller's own
     /// writes that `Ext2::link` records) and the device has not been
@@ -616,7 +622,7 @@ impl<D: Device> State<D> {
         let start = if start < limit { start } else { 0 };
         for bit in (start..limit).chain(0..start) {
             let (byte, mask) = ((bit / 8) as usize, 1u8 << (bit % 8));
-            let taken = first.is_some_and(|f| self.reserved.contains(&(f + bit)) || self.freed.contains(&(f + bit)));
+            let taken = first.is_some_and(|f| self.reserved.contains(&(f + bit)) || self.freed.contains(f + bit));
             if bitmap[byte] & mask == 0 && !taken {
                 return Ok(Some(bit));
             }
@@ -647,9 +653,20 @@ impl<D: Device> State<D> {
         self.write_block(bitmap_block, &bitmap)
     }
 
-    /// Free blocks no promise and no write in flight holds.
+    /// Free blocks no promise and no write in flight holds (a block in
+    /// flight for a promised file block counts once, as promised).
     fn avail(&self) -> u64 {
-        (self.free_blocks as u64).saturating_sub(self.reserved.len() as u64 + self.promised)
+        let unpromised = self.reserved.len().saturating_sub(self.reserved_promised.len()) as u64;
+        (self.free_blocks as u64).saturating_sub(unpromised + self.promised)
+    }
+
+    /// Reserved block `block` (for file block `fb` of `ino`) is linked or
+    /// given back: it leaves the reserved blocks.
+    fn unreserve_block(&mut self, ino: u32, fb: u64, block: u32) -> bool {
+        if self.reserved_promised.get(&(ino, fb)) == Some(&block) {
+            self.reserved_promised.remove(&(ino, fb));
+        }
+        self.reserved.remove(&block)
     }
 
     /// Runs an allocation that spends a promise if `promised` (it may take
@@ -725,6 +742,18 @@ impl<D: Device> State<D> {
         }
         self.promises.insert(ino, m);
         self.tidy_promises(ino);
+        // Blocks in flight for what went count as reserved now (only a
+        // promise's end leaves such blocks: a link takes its block out of
+        // `reserved_promised` before it spends the promise).
+        let gone: Vec<(u32, u64)> = self
+            .reserved_promised
+            .range((ino, keep)..=(ino, u64::MAX))
+            .map(|(&k, _)| k)
+            .filter(|&(i, fb)| !self.data_promised(i, fb))
+            .collect();
+        for k in gone {
+            self.reserved_promised.remove(&k);
+        }
     }
 
     /// Whether file block `fb` has a data block, and the indirect blocks
@@ -1674,7 +1703,11 @@ impl<D: Device> State<D> {
                 // that fails keeps it.
                 let promised = self.data_promised(ino, fb);
                 let goal = self.group_of(ino);
-                Ok((self.spend(promised, |s| s.reserve_block(goal, after))?, true))
+                let block = self.spend(promised, |s| s.reserve_block(goal, after))?;
+                if promised {
+                    self.reserved_promised.insert((ino, fb), block);
+                }
+                Ok((block, true))
             }
             // As in `read_map`: the device must hold the block's current data.
             b if self.fresh.contains(&b) || self.cache.contains(b) => Err(EAGAIN),
@@ -1722,8 +1755,8 @@ impl<D: Device> State<D> {
 
     fn unreserve(&mut self, r: &Reservation) {
         for run in r.runs.iter().filter(|run| run.new) {
-            for b in run.block..run.block + run.count {
-                self.reserved.remove(&b);
+            for i in 0..run.count {
+                self.unreserve_block(r.ino, run.file_block + i as u64, run.block + i);
             }
         }
     }
@@ -1760,7 +1793,7 @@ impl<D: Device> State<D> {
         for run in r.runs.iter().filter(|run| run.new) {
             for i in 0..run.count {
                 let block = run.block + i;
-                if self.reserved.remove(&block) && result.is_ok() {
+                if self.unreserve_block(r.ino, run.file_block + i as u64, block) && result.is_ok() {
                     result = self.link_block(r.ino, &mut inode, run.file_block + i as u64, block);
                 }
             }
@@ -1887,11 +1920,12 @@ impl<D: Device> Ext2<D> {
             fresh: BTreeSet::new(),
             unlinked: Vec::new(),
             reserved: BTreeSet::new(),
+            reserved_promised: BTreeMap::new(),
             promises: BTreeMap::new(),
             promised: 0,
             spending: false,
             new_meta: BTreeSet::new(),
-            freed: BTreeSet::new(),
+            freed: BlockSet::new(),
             unflushed: false,
         };
         let count = (blocks_count - first_data_block).div_ceil(blocks_per_group) as usize;
@@ -2066,6 +2100,11 @@ impl<D: Device> Ext2<D> {
         }
         st.promises.retain(|_, m| !m.is_empty());
         st.promised = st.promises.values().flat_map(|m| m.values()).map(Promise::total).sum();
+        // Blocks in flight for what it promised count as reserved now.
+        let gone: Vec<(u32, u64)> = st.reserved_promised.keys().copied().filter(|&(ino, fb)| !st.data_promised(ino, fb)).collect();
+        for k in gone {
+            st.reserved_promised.remove(&k);
+        }
     }
 
     /// Blocks promised now.

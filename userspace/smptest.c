@@ -1,8 +1,10 @@
-/* SMP tests: CPU count and affinity, real parallel speed-up, fork/exit and
+/* SMP tests: CPU count, affinity and scheduling policy, real parallel speed-up, fork/exit and
  * cross-CPU wakeups (pipes, signals) under load on every CPU. */
 #define _GNU_SOURCE
 #include <errno.h>
+#include <pthread.h>
 #include <sched.h>
+#include <sys/syscall.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -61,6 +63,14 @@ static double parallel(int n, long rounds) {
     return now() - t0;
 }
 
+/* A thread that waits until a byte arrives on park_pipe. */
+static int park_pipe[2];
+static void *park(void *arg) {
+    char c;
+    read(park_pipe[0], &c, 1);
+    return arg;
+}
+
 static volatile sig_atomic_t got_usr1;
 static void on_usr1(int sig) {
     (void)sig;
@@ -86,6 +96,26 @@ int main(void) {
     check("an empty affinity mask is rejected", sched_setaffinity(0, sizeof set, &set) == -1 && errno == EINVAL);
     for (int cpu = 0; cpu < n; cpu++) CPU_SET(cpu, &set);
     sched_setaffinity(0, sizeof set, &set);
+
+    /* One scheduling policy, SCHED_OTHER with priority 0 (V8 asks through
+     * pthread_getschedparam at startup). */
+    struct sched_param sp = {.sched_priority = 7};
+    int policy = -1;
+    check("pthread_getschedparam: SCHED_OTHER, priority 0",
+          pthread_getschedparam(pthread_self(), &policy, &sp) == 0 && policy == SCHED_OTHER && sp.sched_priority == 0);
+    pthread_t other;
+    pipe(park_pipe);
+    pthread_create(&other, NULL, park, NULL);
+    sp.sched_priority = 7;
+    policy = -1;
+    check("... also for another thread (its own id)",
+          pthread_getschedparam(other, &policy, &sp) == 0 && policy == SCHED_OTHER && sp.sched_priority == 0);
+    write(park_pipe[1], "x", 1);
+    pthread_join(other, NULL);
+    errno = 0;
+    check("sched_getscheduler of a missing thread is ESRCH", syscall(SYS_sched_getscheduler, 999999) == -1 && errno == ESRCH);
+    errno = 0;
+    check("sched_getparam of a negative id is EINVAL", syscall(SYS_sched_getparam, -1, &sp) == -1 && errno == EINVAL);
 
     if (n >= 2) {
         /* Calibrate to about half a second of work for one process. */

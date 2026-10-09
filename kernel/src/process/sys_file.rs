@@ -390,9 +390,10 @@ pub fn fcntl(fd: u64, cmd: u64, arg: u64) -> SysResult {
         F_SETFD => current_files()?.set_cloexec(fd, arg & FD_CLOEXEC != 0).map(|_| 0),
         F_GETFL => Ok(f.flags.load(Ordering::Relaxed) as i64),
         F_SETFL => {
+            // Atomic: another thread may change the same open file's flags
+            // at once (FIONBIO, F_SETFL).
             let changeable = O_APPEND | O_NONBLOCK;
-            let old = f.flags.load(Ordering::Relaxed);
-            f.flags.store(old & !changeable | arg as u32 & changeable, Ordering::Relaxed);
+            let _ = f.flags.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| Some(old & !changeable | arg as u32 & changeable));
             Ok(0)
         }
         _ => Err(EINVAL),
@@ -416,6 +417,33 @@ pub fn ioctl(fd: u64, request: u64, arg: u64) -> SysResult {
     const FIONREAD: u64 = 0x541b;
     const TIOCNOTTY: u64 = 0x5422;
     const TIOCGSID: u64 = 0x5429;
+
+    // The requests on the descriptor rather than the file, which every
+    // descriptor takes (Linux's do_vfs_ioctl), the Linux server's files too
+    // (it passes them through): libuv makes pipes and sockets non-blocking
+    // with FIONBIO. Here only because the descriptor table is still the
+    // kernel's; they move into the Linux server with it (R6e,
+    // docs/design/linux-server.md).
+    const FIONBIO: u64 = 0x5421;
+    const FIONCLEX: u64 = 0x5450;
+    const FIOCLEX: u64 = 0x5451;
+    match request {
+        FIONBIO => {
+            // The descriptor first: a bad one is EBADF whatever `arg` is.
+            let f = file(fd)?;
+            if uaccess::read::<i32>(arg)? != 0 {
+                f.flags.fetch_or(O_NONBLOCK, Ordering::Relaxed);
+            } else {
+                f.flags.fetch_and(!O_NONBLOCK, Ordering::Relaxed);
+            }
+            return Ok(0);
+        }
+        FIOCLEX | FIONCLEX => {
+            file(fd)?;
+            return current_files()?.set_cloexec(fd, request == FIOCLEX).map(|_| 0);
+        }
+        _ => {}
+    }
 
     if !file(fd)?.is_console() {
         return Err(ENOTTY);

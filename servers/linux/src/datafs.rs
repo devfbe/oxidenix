@@ -533,7 +533,7 @@ pub fn stat(inode: &Arc<DInode>) -> Result<[u8; 144], i64> {
 }
 
 /// The filesystem's usage, and its largest file.
-fn usage() -> Result<fsring::Usage, i64> {
+pub(crate) fn usage() -> Result<fsring::Usage, i64> {
     let c = client()?;
     let r = c.call(Request::Statfs.encode(0))?;
     status(&r)?;

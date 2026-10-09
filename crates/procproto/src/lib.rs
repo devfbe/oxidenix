@@ -102,7 +102,11 @@ pub const FLAG_KERNEL: u64 = 2;
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug)]
 pub struct Process {
+    /// The id asked for: the process's, or one of its threads' (Linux's
+    /// /proc/<tid>).
     pub pid: u64,
+    /// The process's id (its thread group's).
+    pub tgid: u64,
     pub ppid: u64,
     pub pgid: u64,
     pub sid: u64,

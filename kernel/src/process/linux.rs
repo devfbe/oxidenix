@@ -1465,6 +1465,12 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             super::uaccess::copy_to_server(a[2], &info)?;
             Ok(found)
         }
+        SYS_THREAD_EXISTS => {
+            if a[0] == 0 || super::task(a[0]).is_none() {
+                return Err(ESRCH);
+            }
+            Ok(0)
+        }
         SYS_SERVER_LOG => {
             let len = a[1].min(SERVER_LOG_MAX);
             let mut text = [0u8; SERVER_LOG_MAX as usize];

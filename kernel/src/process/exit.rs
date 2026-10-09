@@ -149,7 +149,9 @@ fn process_exit(group: &Arc<ThreadGroup>, status: i32) {
     let (ppid, exit_signal) = {
         let mut info = group.info.lock();
         info.exit_status = Some(status);
-        info.mem = None;
+        if let Some(mem) = info.mem.take() {
+            info.peak_pages = info.peak_pages.max(mem.peak_pages.load(Ordering::Relaxed));
+        }
         (info.ppid, info.exit_signal)
     };
     notify_parent(ppid);
@@ -165,11 +167,20 @@ const WNOHANG: u64 = 1;
 const WUNTRACED: u64 = 2;
 const WCONTINUED: u64 = 8;
 
+/// What a child used, as wait4 reports it: CPU time in nanoseconds (user,
+/// system) and the most pages resident, its own and those of the children
+/// it reaped.
+#[derive(Clone, Copy, Default)]
+struct Usage {
+    time: (u64, u64),
+    peak_pages: u64,
+}
+
 /// Waits for a child selected like wait4's `pid` (> 0: that child, 0: same
-/// process group, -1: any, < -1: group -pid). Returns (pid, wait status),
-/// or None with WNOHANG if nothing is ready. Stops and continues are
-/// reported with WUNTRACED and WCONTINUED.
-fn wait_child(pid: i64, options: u64) -> Result<Option<(Pid, i32)>, i64> {
+/// process group, -1: any, < -1: group -pid). Returns (pid, wait status,
+/// the child's usage), or None with WNOHANG if nothing is ready. Stops and
+/// continues are reported with WUNTRACED and WCONTINUED.
+fn wait_child(pid: i64, options: u64) -> Result<Option<(Pid, i32, Usage)>, i64> {
     let me = current();
     let my_pid = me.tgid();
     let my_pgid = me.group.info.lock().pgid;
@@ -180,8 +191,9 @@ fn wait_child(pid: i64, options: u64) -> Result<Option<(Pid, i32)>, i64> {
         let wait = prepare_to_wait(child_chan(my_pid));
         let mut any_child = false;
         let mut found: Option<(Pid, i32, bool)> = None;
-        // CPU time of a reaped child, which moves to the parent's account.
-        let mut reaped_time = (0, 0);
+        // What the child used (a reaped child's moves to the parent's
+        // account).
+        let mut usage = Usage::default();
         {
             let mut table = TABLE.lock();
             for g in table.groups.values() {
@@ -200,10 +212,14 @@ fn wait_child(pid: i64, options: u64) -> Result<Option<(Pid, i32)>, i64> {
                     continue;
                 }
                 any_child = true;
+                let (own, children) = (info.cputime(), info.children_time);
+                let live_peak = info.mem.as_ref().map_or(0, |m| m.peak_pages.load(Ordering::Relaxed));
+                usage = Usage {
+                    time: (own.0 + children.0, own.1 + children.1),
+                    peak_pages: info.peak_pages.max(live_peak).max(info.children_peak),
+                };
                 if let Some(status) = info.exit_status {
                     found = Some((g.tgid, status, true));
-                    let (own, children) = (info.cputime(), info.children_time);
-                    reaped_time = (own.0 + children.0, own.1 + children.1);
                     break;
                 }
                 if let Some(r) = info.report.filter(|&r| wanted(r)) {
@@ -216,15 +232,16 @@ fn wait_child(pid: i64, options: u64) -> Result<Option<(Pid, i32)>, i64> {
                 table.groups.remove(&child);
                 table.zombies -= 1;
                 let mut info = me.group.info.lock();
-                info.children_time.0 += reaped_time.0;
-                info.children_time.1 += reaped_time.1;
+                info.children_time.0 += usage.time.0;
+                info.children_time.1 += usage.time.1;
+                info.children_peak = info.children_peak.max(usage.peak_pages);
             }
         }
         if !any_child {
             return Err(ECHILD);
         }
         if let Some((child, status, _)) = found {
-            return Ok(Some((child, status)));
+            return Ok(Some((child, status, usage)));
         }
         if options & WNOHANG != 0 {
             return Ok(None);
@@ -237,11 +254,17 @@ fn wait_child(pid: i64, options: u64) -> Result<Option<(Pid, i32)>, i64> {
     }
 }
 
-pub fn wait4(pid: i64, status_ptr: u64, options: u64) -> SysResult {
+/// wait4(pid, status, options, rusage): the child's wait status and, at
+/// `rusage`, what it used (with its reaped children, as Linux reports a
+/// reaped child; a stopped one's so far).
+pub fn wait4(pid: i64, status_ptr: u64, options: u64, rusage: u64) -> SysResult {
     match wait_child(pid, options)? {
-        Some((pid, status)) => {
+        Some((pid, status, usage)) => {
             if status_ptr != 0 {
                 uaccess::write(status_ptr, status)?;
+            }
+            if rusage != 0 {
+                super::sys_time::write_rusage(rusage, usage.time, usage.peak_pages)?;
             }
             Ok(pid as i64)
         }

@@ -26,6 +26,7 @@ mod namespace;
 mod paths;
 mod pipe;
 mod records;
+mod sched;
 mod sync;
 mod time;
 mod tmpfile;
@@ -75,7 +76,7 @@ pub extern "C" fn _start(state: *mut State, role: u64) -> ! {
             continue;
         }
         let s = unsafe { &mut *state };
-        if let Some(result) = mm::handle(s).or_else(|| time::handle(s)).or_else(|| files::handle(s)).or_else(|| paths::handle(s)) {
+        if let Some(result) = mm::handle(s).or_else(|| time::handle(s)).or_else(|| files::handle(s)).or_else(|| paths::handle(s)).or_else(|| sched::handle(s)) {
             s.rax = result as u64;
             // /data inodes the call let go of go now, before it returns
             // (an unlink's blocks are free when it returns).
