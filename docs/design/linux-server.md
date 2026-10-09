@@ -149,12 +149,18 @@ program gains no more than that by its calls. A full priority inheritance (waite
 their weight to the owner) needs the owner's identity in every lock word and is not needed
 while the boost bounds the wait.
 
-These locks are held for bounded work only, never across a copy of program memory or a wait
-for another party (netd, diskfs, a page the pager brings). Their waits (`FUTEX_LOCK`, on the
-server's own memory only) go on for a dying thread, whose server still takes them to end it,
-but at most a second from when its death was seen; a dying thread that holds no such lock
-then ends where it is. Locks that are held across such waits (a socket's or a pipe's readers
-and writers, Linux's iolock and pipe mutex) are `SleepLock`s, whose waits end on death. Every
+These locks (`sync::Mutex`, `RwLock`) are held for bounded work only, never across a copy of
+program memory or a wait for another party (netd, diskfs, procfs, a channel's offer, a page
+the pager brings). Their waits (`FUTEX_LOCK`, on the server's own memory only) are like a
+kernel's spinlock: they go on for a dying thread, whose server still takes them to end it,
+and nothing about the waiter changes them; only a server thread that fails while holding
+locks ends them, by breaking its instance (every program thread killed, every lock wait
+ended with EINTR, on which the waiter ends). Locks held across such waits (a file
+description's offset, an O_APPEND writer's turn, a /data inode's write-back and the making
+of its cached object, the /data names, a reconnection to diskfs, procfs or netd, a socket's,
+a pipe's or a terminal's readers) are sleeping locks (`SleepMutex`, `SleepLock`,
+`SleepRwLock`, Linux's mutex_lock_killable): their waits end with EINTR when the waiter
+dies and it unwinds; their holders are not priority-boosted. Every
 wait on a word or an event another party controls ends when the waiting thread dies: socket
 and pipe waits, ring completions (a dying thread polls, a millisecond at a time, until the
 request completes or the service is given up), a channel's offer (also after 10 s without

@@ -7,7 +7,6 @@ use crate::datafs::{self, DInode, HoldKind, EISDIR};
 use crate::files::{self, File, EBADF, EINVAL, O_ACCMODE, O_WRONLY};
 use crate::inotify;
 use crate::namespace::ENOTDIR;
-use crate::sync::Mutex;
 use crate::usercopy;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -25,10 +24,10 @@ pub struct DataOpen {
     /// The path it was opened by (for *at calls and fchdir).
     pub path: String,
     /// The file position; for a directory, the index of the next entry.
-    offset: Mutex<u64>,
+    offset: crate::sync::SleepMutex<u64>,
     /// A directory's entries, taken when it is read from the start (as
     /// tmpfs's: removing entries while reading skips none).
-    snapshot: Mutex<Option<Vec<(u32, u8, Vec<u8>)>>>,
+    snapshot: crate::sync::SleepMutex<Option<Vec<(u32, u8, Vec<u8>)>>>,
     /// Holds write access (opened for writing).
     write: bool,
     /// O_DIRECT reads come from the disk; O_SYNC and O_DSYNC writes are
@@ -78,8 +77,8 @@ pub fn open(inode: Arc<DInode>, flags: u32, path: String) -> Result<i64, i64> {
     let open = Arc::new(DataOpen {
         inode,
         path,
-        offset: Mutex::new(0),
-        snapshot: Mutex::new(None),
+        offset: crate::sync::SleepMutex::new(0),
+        snapshot: crate::sync::SleepMutex::new(None),
         write,
         direct: flags & O_DIRECT != 0,
         sync: flags & O_DSYNC != 0 || flags & O_SYNC == O_SYNC,
@@ -206,7 +205,7 @@ impl DataOpen {
     /// end; the description's offset stays.
     fn write_positional(&self, vecs: &[(u64, u64)], offset: u64, append: bool, sync: bool) -> Result<i64, i64> {
         let n = if append {
-            let _append = self.inode.append.lock();
+            let _append = self.inode.append.lock()?;
             self.write(vecs, datafs::size(&self.inode)?, sync)?
         } else {
             self.write(vecs, offset, sync)?
@@ -217,7 +216,7 @@ impl DataOpen {
     /// read/readv: at the description's offset, which moves by what was
     /// read (the offset's lock serializes the description's reads).
     fn read_at_offset(&self, vecs: &[(u64, u64)]) -> Result<i64, i64> {
-        let mut off = self.offset.lock();
+        let mut off = self.offset.lock()?;
         let n = self.read(vecs, *off)?;
         *off += n;
         Ok(n as i64)
@@ -227,9 +226,9 @@ impl DataOpen {
     /// inode's append lock makes finding the end and writing there one
     /// step for every appender).
     fn write_at_offset(&self, vecs: &[(u64, u64)], append: bool, sync: bool) -> Result<i64, i64> {
-        let mut off = self.offset.lock();
+        let mut off = self.offset.lock()?;
         let n = if append {
-            let _append = self.inode.append.lock();
+            let _append = self.inode.append.lock()?;
             *off = datafs::size(&self.inode)?;
             self.write(vecs, *off, sync)?
         } else {
@@ -240,7 +239,7 @@ impl DataOpen {
     }
 
     fn lseek(&self, offset: i64, whence: u64) -> Result<i64, i64> {
-        let mut off = self.offset.lock();
+        let mut off = self.offset.lock()?;
         let base = match whence {
             0 => 0,
             1 => *off as i64,
@@ -259,8 +258,8 @@ impl DataOpen {
         if self.inode.kind != vfs::S_IFDIR {
             return Err(ENOTDIR);
         }
-        let mut off = self.offset.lock();
-        let mut snapshot = self.snapshot.lock();
+        let mut off = self.offset.lock()?;
+        let mut snapshot = self.snapshot.lock()?;
         if *off == 0 || snapshot.is_none() {
             *snapshot = Some(self.list()?);
         }
@@ -315,7 +314,7 @@ impl DataOpen {
 
     /// Reads into the server's memory (sendfile), at the offset.
     pub fn read_server(&self, buf: &mut [u8]) -> Result<usize, i64> {
-        let mut off = self.offset.lock();
+        let mut off = self.offset.lock()?;
         let n = datafs::read_server(&self.inode, *off, buf)?;
         *off += n as u64;
         Ok(n)
@@ -323,8 +322,8 @@ impl DataOpen {
 
     /// Writes from the server's memory (sendfile), at the offset or the end.
     pub fn write_server(&self, data: &[u8], append: bool) -> Result<usize, i64> {
-        let mut off = self.offset.lock();
-        let _append = if append { Some(self.inode.append.lock()) } else { None };
+        let mut off = self.offset.lock()?;
+        let _append = if append { Some(self.inode.append.lock()?) } else { None };
         if append {
             *off = datafs::size(&self.inode)?;
         }
@@ -334,8 +333,9 @@ impl DataOpen {
         Ok(n)
     }
 
-    /// The description's file position (for the calls that take one).
-    pub fn position(&self) -> crate::sync::MutexGuard<'_, u64> {
+    /// The description's file position (for the calls that take one; EINTR if the thread
+    /// dies while it waits for it).
+    pub fn position(&self) -> Result<crate::sync::SleepMutexGuard<'_, u64>, i64> {
         self.offset.lock()
     }
 

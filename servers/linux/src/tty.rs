@@ -13,7 +13,8 @@
 //! with only `rlock` held, and consumed after, unless an input flush came in between
 //! (`Inner::epoch`); a change of settings takes `rlock` for the change (order: `rlock`,
 //! then `inner`). `rlock` is held across the copy, where a fault may wait for the pager:
-//! safe, since only programs' reads and settings changes take it, never the pager. Output
+//! safe, since only programs' reads and settings changes take it, never the pager; it is a
+//! sleeping lock (`sync::SleepLock`) whose wait ends when the waiter dies. Output
 //! is processed under `inner`; a pty's goes to its master's buffer there, the console's to
 //! the device after (no lock of `sync` is held across it, which would give a flooding
 //! writer a lock holder's priority for the whole write). Echoes take no turn and never
@@ -164,7 +165,7 @@ pub struct Tty {
     /// when the turn passes on, not by every change of the terminal.
     turn_words: [AtomicU32; 4],
     /// Reads (and settings changes), one at a time.
-    rlock: Mutex<()>,
+    rlock: crate::sync::SleepLock,
     /// The settings the driver starts with, which a hangup restores.
     init: Termios,
 }
@@ -429,7 +430,7 @@ impl Tty {
             }),
             seq: AtomicU32::new(0),
             turn_words: Default::default(),
-            rlock: Mutex::new(()),
+            rlock: crate::sync::SleepLock::new(()),
             init,
         })
     }
@@ -760,7 +761,10 @@ impl Tty {
         loop {
             // Held from peeking to consuming, not while waiting: a change of the
             // settings cannot move the bytes in between (`set_termios` takes it).
-            let reader = self.rlock.lock();
+            let reader = match self.rlock.lock() {
+                Ok(r) => r,
+                Err(e) => return if done > 0 { Ok(done as i64) } else { Err(e) },
+            };
             let (take, epoch, canonical) = {
                 let inner = self.inner.lock();
                 if inner.gen != open.gen {
@@ -985,7 +989,7 @@ impl Tty {
         // No reader is between peeking and consuming meanwhile (`rlock`, held for the
         // change only: the held echo goes out after it).
         let out = {
-            let _reader = self.rlock.lock();
+            let _reader = self.rlock.lock()?;
             let mut inner = self.inner.lock();
             let new = inner.ld.termios().with_bytes(&bytes[..size]);
             if flush {

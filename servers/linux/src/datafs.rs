@@ -88,7 +88,7 @@
 //! fsync of their file, or the next sync, reports EIO once.
 
 use crate::fsclient::{self, Client, Next, PAGE};
-use crate::sync::{Mutex, RwLock};
+use crate::sync::Mutex;
 use crate::syscall;
 use crate::usercopy;
 use alloc::boxed::Box;
@@ -145,15 +145,18 @@ pub struct DInode {
     generation: u32,
     /// The cached object's key (`EVENT_PAGE`, `EVENT_DIRTY`).
     key: u64,
-    /// The cached object, once there is one (regular files).
+    /// The cached object, once there is one (regular files); held only to read or set it.
     object: Mutex<Option<u64>>,
+    /// Making the cached object (diskfs asked for the size first), one maker at a time.
+    making: crate::sync::SleepLock,
     /// Write accesses (> 0) or programs running from it (< 0), as tmpfs.
     writers: Mutex<i64>,
-    /// Serializes write-back and truncation.
-    wb: Mutex<()>,
+    /// Serializes write-back and truncation (held across diskfs's requests: a sleeping
+    /// lock, `sync::SleepLock`).
+    wb: crate::sync::SleepLock,
     /// Taken by O_APPEND writes (finding the end and writing there is one
     /// step for every appender).
-    pub append: Mutex<()>,
+    pub append: crate::sync::SleepLock,
     /// Its last link went: released as soon as nothing uses it.
     unlinked: AtomicBool,
     /// Gone with a diskfs that died: every call fails (EIO).
@@ -378,6 +381,9 @@ struct Table {
     keys: BTreeMap<u64, alloc::sync::Weak<DInode>>,
     /// Inodes to look at for release (unlinked ones a user let go of).
     check: Vec<u32>,
+    /// Inodes whose last link went while their unlinker could not take `NAMES` (it died):
+    /// orphaned by the next `reap`.
+    orphans: Vec<u32>,
     /// Dirty files (`EVENT_DIRTY`), by inode: since when.
     dirty: BTreeMap<u32, u64>,
     /// The inodes' names (directory, name) as last found (`DInode::link`),
@@ -386,10 +392,14 @@ struct Table {
 }
 
 static TABLE: Mutex<Table> =
-    Mutex::new(Table { inodes: BTreeMap::new(), keys: BTreeMap::new(), check: Vec::new(), dirty: BTreeMap::new(), names: BTreeMap::new() });
-static NAMES: RwLock = RwLock::new();
+    Mutex::new(Table { inodes: BTreeMap::new(), keys: BTreeMap::new(), check: Vec::new(), orphans: Vec::new(), dirty: BTreeMap::new(), names: BTreeMap::new() });
+/// Name operations (shared) against a reconnection's revalidation and an eviction or an
+/// orphan's release (alone); held across diskfs's requests: a sleeping lock.
+static NAMES: crate::sync::SleepRwLock = crate::sync::SleepRwLock::new();
 static CLIENT: Mutex<Option<Arc<Client>>> = Mutex::new(None);
-static RECONNECT: Mutex<()> = Mutex::new(());
+/// One reconnection at a time (held across the channel's offer and the revalidation: a
+/// sleeping lock).
+static RECONNECT: crate::sync::SleepLock = crate::sync::SleepLock::new(());
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 /// The cached objects' keys count up from here (the test objects' are
 /// below).
@@ -411,7 +421,7 @@ pub fn client() -> Result<Arc<Client>, i64> {
     if let Some(c) = CLIENT.lock().clone().filter(|c| !c.is_dead()) {
         return Ok(c);
     }
-    let _one = RECONNECT.lock();
+    let _one = RECONNECT.lock()?;
     let old = CLIENT.lock().clone();
     if let Some(c) = old.as_ref().filter(|c| !c.is_dead()) {
         return Ok(c.clone());
@@ -422,7 +432,8 @@ pub fn client() -> Result<Arc<Client>, i64> {
     // request names an inode diskfs may have freed meanwhile, and the
     // dirty pages have their disk space promised again.
     if old.is_some() {
-        revalidate(&c);
+        // (A thread that dies meanwhile installs nothing: the next caller connects anew.)
+        revalidate(&c)?;
         repromise(&c);
     }
     *CLIENT.lock() = Some(c.clone());
@@ -430,8 +441,8 @@ pub fn client() -> Result<Arc<Client>, i64> {
 }
 
 /// After diskfs came back: the inodes in use are held again or stale.
-fn revalidate(c: &Client) {
-    let _names = NAMES.write();
+fn revalidate(c: &Client) -> Result<(), i64> {
+    let _names = NAMES.write()?;
     let inodes: Vec<Arc<DInode>> = TABLE.lock().inodes.values().cloned().collect();
     for inode in inodes {
         if inode.unlinked.load(Ordering::Relaxed) {
@@ -444,6 +455,7 @@ fn revalidate(c: &Client) {
             inode.stale.store(true, Ordering::Relaxed);
         }
     }
+    Ok(())
 }
 
 /// After diskfs came back: its promises went with the old channel. Every
@@ -527,9 +539,10 @@ fn found(ino: u64, mode: u64, generation: u64) -> Result<Arc<DInode>, i64> {
         generation,
         key,
         object: Mutex::new(None),
+        making: crate::sync::SleepLock::new(()),
         writers: Mutex::new(0),
-        wb: Mutex::new(()),
-        append: Mutex::new(()),
+        wb: crate::sync::SleepLock::new(()),
+        append: crate::sync::SleepLock::new(()),
         unlinked: AtomicBool::new(false),
         stale: AtomicBool::new(false),
         unflushed: AtomicU64::new(0),
@@ -558,7 +571,7 @@ pub fn root() -> Result<Arc<DInode>, i64> {
         return Ok(r.clone());
     }
     let c = client()?;
-    let _names = NAMES.read();
+    let _names = NAMES.read()?;
     let r = c.call(Request::Stat { ino: ROOT_INO }.encode(0))?;
     status(&r)?;
     let s = fsring::Stat::from_values(&r.values);
@@ -586,7 +599,7 @@ pub fn lookup(dir: &Arc<DInode>, name: &str) -> Result<Arc<DInode>, i64> {
     let c = client()?;
     let scratch = c.scratch(1);
     scratch.put(0, name.as_bytes());
-    let _names = NAMES.read();
+    let _names = NAMES.read()?;
     let r = c.call(Request::Lookup { dir: dir.ino, name: scratch.buf(0, name.len() as u64) }.encode(0))?;
     status(&r)?;
     let inode = found(r.values[0], r.values[1], r.values[2])?;
@@ -622,7 +635,7 @@ pub fn create(dir: &Arc<DInode>, name: &str, new: New, perm: u32) -> Result<Arc<
             Kind::Symlink(scratch.buf(n, target.len() as u64))
         }
     };
-    let _names = NAMES.read();
+    let _names = NAMES.read()?;
     let r = c.call(Request::Create { dir: dir.ino, name: scratch.buf(0, n), kind, perm: perm & 0o7777 }.encode(0))?;
     status(&r)?;
     let inode = found(r.values[0], r.values[1], r.values[2])?;
@@ -638,7 +651,7 @@ pub fn unlink(dir: &Arc<DInode>, name: &str, dir_only: bool) -> Result<Option<u3
     let scratch = c.scratch(1);
     scratch.put(0, name.as_bytes());
     let gone = {
-        let _names = NAMES.read();
+        let _names = NAMES.read()?;
         let r = c.call(Request::Unlink { dir: dir.ino, name: scratch.buf(0, name.len() as u64), is_dir: dir_only }.encode(0))?;
         status(&r)?;
         r.values[0]
@@ -661,7 +674,7 @@ pub fn rename(odir: &Arc<DInode>, oname: &str, ndir: &Arc<DInode>, nname: &str) 
     scratch.put(0, oname.as_bytes());
     scratch.put(oname.len() as u64, nname.as_bytes());
     let gone = {
-        let _names = NAMES.read();
+        let _names = NAMES.read()?;
         let (old, new) = (scratch.buf(0, oname.len() as u64), scratch.buf(oname.len() as u64, nname.len() as u64));
         let r = c.call(Request::Rename { from: odir.ino, name: old, to: ndir.ino, new_name: new }.encode(0))?;
         status(&r)?;
@@ -680,7 +693,12 @@ fn orphaned(c: &Client, ino: u64) {
     if ino == 0 {
         return;
     }
-    let _names = NAMES.write();
+    // (A thread that dies before it gets the names leaves the orphan to the next `reap`.)
+    let Ok(_names) = NAMES.write() else {
+        TABLE.lock().orphans.push(ino);
+        REAP.store(true, Ordering::Relaxed);
+        return;
+    };
     let mut t = TABLE.lock();
     match t.inodes.get(&ino) {
         Some(i) => {
@@ -890,14 +908,19 @@ pub fn readdir(dir: &Arc<DInode>, cursor: u64) -> Result<(Vec<(u32, u8, Vec<u8>)
 /// The file's cached object (made on first use; regular files only).
 pub fn object(inode: &Arc<DInode>) -> Result<u64, i64> {
     live(inode)?;
-    let mut o = inode.object.lock();
-    if let Some(h) = *o {
+    if let Some(h) = *inode.object.lock() {
         return Ok(h);
     }
     match inode.kind {
         vfs::S_IFREG => {}
         vfs::S_IFDIR => return Err(EISDIR),
         _ => return Err(EINVAL),
+    }
+    // One maker; `object` itself is never held across diskfs's requests (a reconnection
+    // takes it for every inode while it holds `RECONNECT`).
+    let _making = inode.making.lock()?;
+    if let Some(h) = *inode.object.lock() {
+        return Ok(h);
     }
     let limit = max_file()?;
     let c = client()?;
@@ -908,7 +931,7 @@ pub fn object(inode: &Arc<DInode>) -> Result<u64, i64> {
     if h < 0 {
         return Err(-h);
     }
-    *o = Some(h as u64);
+    *inode.object.lock() = Some(h as u64);
     Ok(h as u64)
 }
 
@@ -1178,7 +1201,7 @@ pub fn writeback(inode: &Arc<DInode>, pages: core::ops::Range<u64>) -> Result<u6
     if inode.stale.load(Ordering::Relaxed) {
         return Err(EIO);
     }
-    let _wb = inode.wb.lock();
+    let _wb = inode.wb.lock()?;
     let c = client()?;
     let (cursor, pinned, wrote, failed) = (Cell::new(pages.start), Cell::new(0u64), Cell::new(0u64), Cell::new(None));
     let mut out = [0u64; 3];
@@ -1326,7 +1349,7 @@ fn truncate_file(inode: &Arc<DInode>, len: u64) -> Result<(), i64> {
     if len > max_file()? {
         return Err(EFBIG);
     }
-    let _wb = inode.wb.lock();
+    let _wb = inode.wb.lock()?;
     let c = client()?;
     // A file with nothing cached: diskfs's size is all (its object, made
     // later, starts from it).
@@ -1594,6 +1617,16 @@ pub fn reap() {
     if !REAP.swap(false, Ordering::AcqRel) {
         return;
     }
+    let orphans = core::mem::take(&mut TABLE.lock().orphans);
+    for ino in orphans {
+        match client() {
+            Ok(c) => orphaned(&c, ino as u64),
+            Err(_) => {
+                TABLE.lock().orphans.push(ino);
+                REAP.store(true, Ordering::Relaxed);
+            }
+        }
+    }
     let victims: Vec<u32> = {
         let mut t = TABLE.lock();
         let mut victims: Vec<u32> = core::mem::take(&mut t.check);
@@ -1623,7 +1656,8 @@ fn evict(ino: u32) {
     }
     let c = if stale { None } else { client().ok().filter(|c| !c.is_dead()) };
     let ticket = {
-        let _names = NAMES.write();
+        // (A thread that dies meanwhile leaves the inode cached: evicted later.)
+        let Ok(_names) = NAMES.write() else { return };
         let mut t = TABLE.lock();
         // Used again meanwhile (else only the table's reference and ours
         // are left), or no longer the table's.

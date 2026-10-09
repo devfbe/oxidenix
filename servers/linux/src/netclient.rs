@@ -157,12 +157,15 @@ pub struct Net {
     pool: Mutex<Pool>,
     closing: Mutex<Vec<Closing>>,
     /// A page granted for `LINKS`' result.
-    links: Mutex<(u64, u64, u32)>,
+    links: crate::sync::SleepMutex<(u64, u64, u32)>,
 }
 
 /// The instance's current channel, and its generation (the net thread
 /// waits on it for a new one).
 static NET: Mutex<Option<Arc<Net>>> = Mutex::new(None);
+/// One connection at a time (held across the channel's offer: a sleeping lock; `NET`
+/// itself is held only to read or set it, also by the net thread).
+static CONNECT: crate::sync::SleepLock = crate::sync::SleepLock::new(());
 static GENERATION: AtomicU32 = AtomicU32::new(0);
 /// Closes queued and not yet done (the pager waits for them before the
 /// instance goes).
@@ -171,13 +174,15 @@ static CLOSES: AtomicU32 = AtomicU32::new(0);
 /// The channel to netd, made (or made again after netd died) now if need
 /// be.
 pub fn net() -> Result<Arc<Net>, i64> {
-    let mut current = NET.lock();
-    if let Some(n) = current.as_ref().filter(|n| !n.ring.is_dead()) {
+    if let Some(n) = NET.lock().as_ref().filter(|n| !n.ring.is_dead()) {
+        return Ok(n.clone());
+    }
+    let _one = CONNECT.lock()?;
+    if let Some(n) = NET.lock().as_ref().filter(|n| !n.ring.is_dead()) {
         return Ok(n.clone());
     }
     let n = Arc::new(Net::connect()?);
-    *current = Some(n.clone());
-    drop(current);
+    *NET.lock() = Some(n.clone());
     GENERATION.fetch_add(1, Ordering::SeqCst);
     futex_wake(&GENERATION, u32::MAX as u64);
     Ok(n)
@@ -217,7 +222,7 @@ impl Net {
             socks: Mutex::new((0..MAX_SOCKETS).map(|_| Weak::new()).collect()),
             pool: Mutex::new(Pool { chunks: Vec::new(), spare: None }),
             closing: Mutex::new(Vec::new()),
-            links: Mutex::new(links),
+            links: crate::sync::SleepMutex::new(links),
         })
     }
 
@@ -371,7 +376,7 @@ impl Net {
 
     /// netd's interfaces.
     pub fn links(&self) -> Result<Vec<Link>, i64> {
-        let page = self.links.lock();
+        let page = self.links.lock()?;
         let (_, addr, grant) = *page;
         let c = self.status(Request::Links { buf: Buf { grant, offset: 0, len: PAGE as u32 } })?;
         let n = (c.status as usize).min(PAGE as usize);
@@ -427,7 +432,7 @@ impl Net {
 
 impl Drop for Net {
     fn drop(&mut self) {
-        let (object, addr, _) = *self.links.lock();
+        let (object, addr, _) = *self.links.get_mut();
         syscall(SYS_MO_UNMAP_SERVER, [addr, 0, 0, 0, 0, 0]);
         syscall(SYS_HANDLE_CLOSE, [object, 0, 0, 0, 0, 0]);
         // The pool's chunks go with `pool` (after `ring`: the channel, and

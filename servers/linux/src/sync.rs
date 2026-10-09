@@ -175,6 +175,11 @@ impl<T> SleepMutex<T> {
         }
         Ok(SleepMutexGuard { mutex: self })
     }
+
+    /// The data, for its owner alone (`&mut self`: nobody can hold the lock).
+    pub fn get_mut(&mut self) -> &mut T {
+        self.data.get_mut()
+    }
 }
 
 pub struct SleepMutexGuard<'a, T> {

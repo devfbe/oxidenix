@@ -141,7 +141,7 @@ pub struct Inode {
     pub state: Mutex<State>,
     /// Taken by O_APPEND writes: finding the end and writing there is one
     /// step for every appender.
-    pub append: Mutex<()>,
+    pub append: crate::sync::SleepLock,
     /// Open file descriptions of it: a removed file's last close is when
     /// it goes (inotify's IN_DELETE_SELF).
     pub opens: AtomicUsize,
@@ -164,7 +164,7 @@ impl Inode {
             ino: NEXT_INO.fetch_add(1, Ordering::Relaxed),
             file_type,
             state: Mutex::new(state),
-            append: Mutex::new(()),
+            append: crate::sync::SleepLock::new(()),
             opens: AtomicUsize::new(0),
         })
     }
