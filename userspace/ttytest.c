@@ -340,7 +340,9 @@ static void console_flood(void) {
     pipe(ready);
     pid_t f = fork();
     if (f == 0) {
-        static char buf[20000];
+        /* 10 palette changes per write, each a full redraw (about 0.35 s per write
+         * under QEMU): a fair turn waits for one write of the flood, not for ever. */
+        static char buf[100];
         for (int i = 0; i + 10 <= (int)sizeof buf; i += 10) memcpy(buf + i, (i / 10) % 2 ? "\033]P1ff0000" : "\033]P1000000", 10);
         write(ready[1], "r", 1);
         for (;;) write(c, buf, sizeof buf);
@@ -353,22 +355,32 @@ static void console_flood(void) {
     pipe(result);
     pid_t meter = fork();
     if (meter == 0) {
-        alarm(5);
-        int64_t worst = 0;
+        alarm(10);
+        int64_t worst[2] = {0, 0};
         for (int i = 0; i < 5; i++) {
             char x = 'x';
             int64_t t0 = now_ms();
             ioctl(c, TIOCSTI, &x);
             int64_t took = now_ms() - t0;
-            if (took > worst) worst = took;
+            if (took > worst[0]) worst[0] = took;
             sleep_ms(20);
         }
-        write(result[1], &worst, sizeof worst);
+        write(result[1], &worst[0], sizeof worst[0]);
+        /* A second writer gets its turn after the flood's current write, not never. */
+        for (int i = 0; i < 3; i++) {
+            int64_t t0 = now_ms();
+            write(c, "\r", 1);
+            int64_t took = now_ms() - t0;
+            if (took > worst[1]) worst[1] = took;
+        }
+        write(result[1], &worst[1], sizeof worst[1]);
         _exit(0);
     }
     close(result[1]);
-    int64_t worst = -1;
-    if (read(result[0], &worst, sizeof worst) != sizeof worst) worst = -1;
+    int64_t worsts[2] = {-1, -1};
+    for (int i = 0; i < 2; i++)
+        if (read(result[0], &worsts[i], sizeof worsts[i]) != sizeof worsts[i]) break;
+    int64_t worst = worsts[0];
     waitpid(meter, NULL, 0);
     close(result[0]);
     kill(f, SIGKILL);
@@ -376,8 +388,10 @@ static void console_flood(void) {
     write(c, "\033]R\r\n", 5);
     tcflush(c, TCIFLUSH);
     close(c);
-    printf("ttytest: the slowest echo during a console flood took %lld ms\n", (long long)worst);
+    printf("ttytest: during a console flood the slowest echo took %lld ms, the slowest write %lld ms\n", (long long)worst,
+           (long long)worsts[1]);
     check("echoing console input does not wait for a flooding writer", worst >= 0 && worst < 100);
+    check("a second console writer gets through a flood (turns are FIFO)", worsts[1] >= 0 && worsts[1] < 3000);
 }
 
 /* Echoes cannot grow a pty master's buffer without bound when the master never reads,

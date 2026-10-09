@@ -144,8 +144,8 @@ pub struct Inner {
     /// Input flushes so far (see the module comment).
     epoch: u64,
     exclusive: bool,
-    /// The turns taken (`Tty::turn`, `TURN_*` bits).
-    turns: u8,
+    /// The turns' queues (`Tty::turn`, by `TURN_*`).
+    turns: [TurnQueue; 4],
     /// Echoes made while output was stopped.
     held_echo: Vec<u8>,
     /// The open file descriptions' placeholders: their generation and the readiness last
@@ -167,21 +167,48 @@ pub struct Tty {
 
 /// The turns a call takes for its whole length (Linux's atomic_read_lock and
 /// atomic_write_lock, of the slave and of a pty's master).
-pub const TURN_READ: u8 = 1;
-pub const TURN_WRITE: u8 = 2;
-pub const TURN_MASTER_READ: u8 = 4;
-pub const TURN_MASTER_WRITE: u8 = 8;
+pub const TURN_READ: usize = 0;
+pub const TURN_WRITE: usize = 1;
+pub const TURN_MASTER_READ: usize = 2;
+pub const TURN_MASTER_WRITE: usize = 3;
+
+/// The callers waiting for one turn, first come first served: each takes a ticket, the
+/// turn goes to `serving` (free when `next` is `serving`). A caller that writes again at
+/// once queues behind the others, so a writer flooding the terminal starves nobody (a
+/// flag that the next caller takes would let it barge in before the woken waiter runs).
+/// A waiter a signal interrupts gives its ticket up (`abandoned`, skipped when it comes).
+#[derive(Default)]
+struct TurnQueue {
+    next: u32,
+    serving: u32,
+    abandoned: Vec<u32>,
+}
+
+impl TurnQueue {
+    fn free(&self) -> bool {
+        self.next == self.serving
+    }
+
+    /// The turn goes to the next ticket not given up.
+    fn advance(&mut self) {
+        self.serving = self.serving.wrapping_add(1);
+        while let Some(i) = self.abandoned.iter().position(|&t| t == self.serving) {
+            self.abandoned.swap_remove(i);
+            self.serving = self.serving.wrapping_add(1);
+        }
+    }
+}
 
 /// A call's turn (`Tty::turn`), given back when dropped.
 pub struct Turn<'a> {
     tty: &'a Tty,
-    which: u8,
+    which: usize,
 }
 
 impl Drop for Turn<'_> {
     fn drop(&mut self) {
         let mut inner = self.tty.inner.lock();
-        inner.turns &= !self.which;
+        inner.turns[self.which].advance();
         self.tty.changed(&mut inner, false, false);
     }
 }
@@ -341,7 +368,7 @@ impl Tty {
                 gen: 0,
                 epoch: 0,
                 exclusive: false,
-                turns: 0,
+                turns: Default::default(),
                 held_echo: Vec::new(),
                 opens: BTreeMap::new(),
                 pty,
@@ -523,20 +550,36 @@ impl Tty {
     /// call has it, EINTR for a signal while waiting. An interruptible wait on `seq`,
     /// not a lock of `sync`: it is held across waits for input or room, where a
     /// program's signals must reach the waiter (and no lock holder's priority is due).
-    pub fn turn(&self, which: u8, nonblock: bool) -> Result<Turn<'_>, i64> {
+    pub fn turn(&self, which: usize, nonblock: bool) -> Result<Turn<'_>, i64> {
+        let ticket = {
+            let mut inner = self.inner.lock();
+            let q = &mut inner.turns[which];
+            if nonblock && !q.free() {
+                return Err(EAGAIN);
+            }
+            q.next = q.next.wrapping_add(1);
+            q.next.wrapping_sub(1)
+        };
         loop {
             let seen = {
-                let mut inner = self.inner.lock();
-                if inner.turns & which == 0 {
-                    inner.turns |= which;
+                let inner = self.inner.lock();
+                if inner.turns[which].serving == ticket {
                     return Ok(Turn { tty: self, which });
                 }
                 self.seen()
             };
-            if nonblock {
-                return Err(EAGAIN);
+            if let Err(e) = self.wait(seen, 0) {
+                // Given up: skipped when it comes (or passed on, if it came just now).
+                let mut inner = self.inner.lock();
+                let q = &mut inner.turns[which];
+                if q.serving == ticket {
+                    q.advance();
+                } else {
+                    q.abandoned.push(ticket);
+                }
+                self.changed(&mut inner, false, false);
+                return Err(e);
             }
-            self.wait(seen, 0)?;
         }
     }
 
