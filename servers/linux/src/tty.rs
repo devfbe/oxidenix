@@ -7,9 +7,10 @@
 //!
 //! Locks: `inner` holds the state and is never held across a copy to or from program
 //! memory, nor across a wait or the console's write. A read or a write takes its turn
-//! (`turn`, Linux's atomic_read_lock and atomic_write_lock) for the whole call: an
-//! interruptible wait on `seq`, not a lock of `sync`, since it is held across waits for
-//! input or room. Within a read the bytes are peeked under `inner`, copied to the program
+//! (`turn`, Linux's atomic_read_lock and atomic_write_lock) for the whole call: first
+//! come first served, an interruptible wait on the turn's own counter (`turn_words`,
+//! advanced only when the turn passes on), not a lock of `sync`, since it is held across
+//! waits for input or room. Within a read the bytes are peeked under `inner`, copied to the program
 //! with only `rlock` held, and consumed after, unless an input flush came in between
 //! (`Inner::epoch`); a change of settings takes `rlock` for the change (order: `rlock`,
 //! then `inner`). `rlock` is held across the copy, where a fault may wait for the pager:
@@ -159,6 +160,9 @@ pub struct Tty {
     pub inner: Mutex<Inner>,
     /// Bumped on every change; waiters sleep on it.
     seq: AtomicU32,
+    /// Each turn's own change counter (`TURN_*`): its waiters sleep on it, woken only
+    /// when the turn passes on, not by every change of the terminal.
+    turn_words: [AtomicU32; 4],
     /// Reads (and settings changes), one at a time.
     rlock: Mutex<()>,
     /// The settings the driver starts with, which a hangup restores.
@@ -209,7 +213,7 @@ impl Drop for Turn<'_> {
     fn drop(&mut self) {
         let mut inner = self.tty.inner.lock();
         inner.turns[self.which].advance();
-        self.tty.changed(&mut inner, false, false);
+        self.tty.turn_advanced(self.which);
     }
 }
 
@@ -374,6 +378,7 @@ impl Tty {
                 pty,
             }),
             seq: AtomicU32::new(0),
+            turn_words: Default::default(),
             rlock: Mutex::new(()),
             init,
         })
@@ -547,8 +552,9 @@ impl Tty {
     }
 
     /// The turn `which` (`TURN_*`) for a whole call; EAGAIN with `nonblock` if another
-    /// call has it, EINTR for a signal while waiting. An interruptible wait on `seq`,
-    /// not a lock of `sync`: it is held across waits for input or room, where a
+    /// call has it, EINTR for a signal while waiting. An interruptible wait on the
+    /// turn's counter (`turn_words`), not a lock of `sync`: it is held across waits for
+    /// input or room, where a
     /// program's signals must reach the waiter (and no lock holder's priority is due).
     pub fn turn(&self, which: usize, nonblock: bool) -> Result<Turn<'_>, i64> {
         let ticket = {
@@ -560,27 +566,36 @@ impl Tty {
             q.next = q.next.wrapping_add(1);
             q.next.wrapping_sub(1)
         };
+        let word = &self.turn_words[which];
         loop {
             let seen = {
                 let inner = self.inner.lock();
                 if inner.turns[which].serving == ticket {
                     return Ok(Turn { tty: self, which });
                 }
-                self.seen()
+                word.load(Ordering::Acquire)
             };
-            if let Err(e) = self.wait(seen, 0) {
+            let addr = word as *const AtomicU32 as u64;
+            if syscall(SYS_SERVER_FUTEX_WAIT, [addr, seen as u64, 0, FUTEX_INTERRUPTIBLE, 0, 0]) == -EINTR {
                 // Given up: skipped when it comes (or passed on, if it came just now).
                 let mut inner = self.inner.lock();
                 let q = &mut inner.turns[which];
                 if q.serving == ticket {
                     q.advance();
+                    self.turn_advanced(which);
                 } else {
                     q.abandoned.push(ticket);
                 }
-                self.changed(&mut inner, false, false);
-                return Err(e);
+                return Err(EINTR);
             }
         }
+    }
+
+    /// Turn `which` passed on (lock held): its waiters look whose it is.
+    fn turn_advanced(&self, which: usize) {
+        let word = &self.turn_words[which];
+        word.fetch_add(1, Ordering::Release);
+        syscall(SYS_SERVER_FUTEX_WAKE, [word as *const AtomicU32 as u64, i32::MAX as u64, 0, 0, 0, 0]);
     }
 
     /// Echoes to the console device: never waits (the service thread processes the

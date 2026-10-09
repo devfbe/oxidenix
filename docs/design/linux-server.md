@@ -403,7 +403,8 @@ placeholder in the kernel's descriptor table, as pipes are).
   are interruptible server futex waits with a deadline; whether the read is canonical is
   asked at every pass, as Linux's. A read takes the read turn for the whole call (Linux's
   `atomic_read_lock`: a line or a `VMIN` batch is never split between readers); turns are
-  interruptible waits on the terminal's change counter, not server locks, since they are held
+  interruptible waits on the turn's own counter (woken only when the turn passes on), not
+  server locks, since they are held
   across waits for input, and first come first served (tickets; one given up by a signal is
   skipped), so a caller that comes back at once queues behind the others instead of barging
   in before the woken waiter runs. Bytes are peeked under the terminal's lock, copied to the program
