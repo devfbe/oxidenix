@@ -312,6 +312,178 @@ static void termios_and_reads(void) {
     close(m);
 }
 
+/* Echoes of console input never wait for a program flooding the console (the server's
+ * service thread echoes the keyboard's input; it must not stall behind such a write).
+ * TIOCSTI takes the same path from a program thread: its echo must come back at once
+ * while another process writes long palette changes (each a full redraw). */
+static void console_flood(void) {
+    int c = open("/dev/console", O_RDWR | O_NOCTTY);
+    struct termios t;
+    if (c < 0 || tcgetattr(c, &t) != 0 || !(t.c_lflag & ECHO)) {
+        check("console flood: the console echoes", 0);
+        return;
+    }
+    int ready[2];
+    pipe(ready);
+    pid_t f = fork();
+    if (f == 0) {
+        static char buf[20000];
+        for (int i = 0; i + 10 <= (int)sizeof buf; i += 10) memcpy(buf + i, (i / 10) % 2 ? "\033]P1ff0000" : "\033]P1000000", 10);
+        write(ready[1], "r", 1);
+        for (;;) write(c, buf, sizeof buf);
+    }
+    char r;
+    read(ready[0], &r, 1);
+    sleep_ms(100);
+    /* Measured in a child: an echo stuck behind the flood ends it by its alarm. */
+    int result[2];
+    pipe(result);
+    pid_t meter = fork();
+    if (meter == 0) {
+        alarm(5);
+        int64_t worst = 0;
+        for (int i = 0; i < 5; i++) {
+            char x = 'x';
+            int64_t t0 = now_ms();
+            ioctl(c, TIOCSTI, &x);
+            int64_t took = now_ms() - t0;
+            if (took > worst) worst = took;
+            sleep_ms(20);
+        }
+        write(result[1], &worst, sizeof worst);
+        _exit(0);
+    }
+    close(result[1]);
+    int64_t worst = -1;
+    if (read(result[0], &worst, sizeof worst) != sizeof worst) worst = -1;
+    waitpid(meter, NULL, 0);
+    close(result[0]);
+    kill(f, SIGKILL);
+    waitpid(f, NULL, 0);
+    write(c, "\033]R\r\n", 5);
+    tcflush(c, TCIFLUSH);
+    close(c);
+    printf("ttytest: the slowest echo during a console flood took %lld ms\n", (long long)worst);
+    check("echoing console input does not wait for a flooding writer", worst >= 0 && worst < 100);
+}
+
+/* Echoes cannot grow a pty master's buffer without bound when the master never reads,
+ * TIOCSTI on a full master drops, and TIOCSIG takes only the terminal's signals. */
+static void pty_bounds(void) {
+    char path[64], buf[4096];
+    int m = new_pty(path, sizeof path);
+    int s = open(path, O_RDWR | O_NOCTTY);
+    struct termios t;
+    tcgetattr(s, &t);
+    t.c_lflag &= ~ICANON;
+    t.c_lflag |= ECHO;
+    t.c_cc[VMIN] = 1;
+    t.c_cc[VTIME] = 0;
+    tcsetattr(s, TCSANOW, &t);
+    memset(buf, 'e', sizeof buf);
+    for (int i = 0; i < 40; i++) {
+        write(m, buf, 4000);
+        int got = 0;
+        while (got < 4000) {
+            int n = read(s, buf, 4000 - got);
+            if (n <= 0) break;
+            got += n;
+        }
+    }
+    int queued = -1;
+    ioctl(m, FIONREAD, &queued);
+    check("echoes stop at the master's bound when it never reads", queued > 0 && queued <= 64 * 1024 + 4096);
+    char x = 'q';
+    check("TIOCSTI on a full master drops (no growth)", ioctl(m, TIOCSTI, &x) == 0 && ioctl(m, FIONREAD, &queued) == 0 && queued <= 64 * 1024 + 4096);
+    check("TIOCSIG refuses a signal that is not the terminal's", ioctl(m, TIOCSIG, SIGKILL) == -1 && errno == EINVAL);
+    check("TIOCSIG takes SIGINT", ioctl(m, TIOCSIG, SIGINT) == 0);
+    close(s);
+    close(m);
+}
+
+/* Reads take whole turns and see mode switches: a canonical read waiting for a line
+ * returns the half line when the terminal goes raw; two readers each get a whole long
+ * line (never parts of both); a slave open that fails (EMFILE) leaves the master as it
+ * was (not hung up). */
+static void read_rules(void) {
+    char path[64], buf[4096];
+    int m = new_pty(path, sizeof path);
+    int s = open(path, O_RDWR | O_NOCTTY);
+    struct termios t;
+    tcgetattr(s, &t);
+    t.c_lflag &= ~ECHO;
+    tcsetattr(s, TCSANOW, &t);
+    int res[2];
+    pipe(res);
+    pid_t r = fork();
+    if (r == 0) {
+        alarm(5);
+        int n = read(s, buf, 100);
+        write(res[1], &n, sizeof n);
+        _exit(0);
+    }
+    write(m, "abc", 3);
+    sleep_ms(100);
+    struct termios raw = t;
+    raw.c_lflag &= ~ICANON;
+    raw.c_cc[VMIN] = 1;
+    raw.c_cc[VTIME] = 0;
+    tcsetattr(s, TCSANOW, &raw);
+    int n = -1;
+    read(res[0], &n, sizeof n);
+    waitpid(r, NULL, 0);
+    check("a waiting canonical read takes the half line when the mode goes raw", n == 3);
+    tcsetattr(s, TCSANOW, &t);
+
+    /* Two readers, two lines of 3000 bytes (the second waits for room). */
+    pid_t readers[2];
+    for (int i = 0; i < 2; i++) {
+        readers[i] = fork();
+        if (readers[i] == 0) {
+            alarm(5);
+            int k = read(s, buf, sizeof buf);
+            int whole = k == 3000 && buf[2999] == '\n';
+            for (int j = 1; whole && j < 2999; j++) whole = buf[j] == buf[0];
+            int report = whole ? buf[0] : -k;
+            write(res[1], &report, sizeof report);
+            _exit(0);
+        }
+    }
+    sleep_ms(50);
+    char line[3000];
+    memset(line, 'A', sizeof line);
+    line[2999] = '\n';
+    write(m, line, sizeof line);
+    memset(line, 'B', sizeof line - 1);
+    write(m, line, sizeof line);
+    int a = 0, b = 0;
+    read(res[0], &a, sizeof a);
+    read(res[0], &b, sizeof b);
+    for (int i = 0; i < 2; i++) waitpid(readers[i], NULL, 0);
+    check("two readers each get one whole line", (a == 'A' && b == 'B') || (a == 'B' && b == 'A'));
+    close(s);
+
+    /* A slave whose open fails: the master is not hung up. */
+    char path2[64];
+    int m2 = new_pty(path2, sizeof path2);
+    pid_t c = fork();
+    if (c == 0) {
+        while (dup(0) >= 0) {
+        }
+        _exit(open(path2, O_RDWR | O_NOCTTY) == -1 && errno == EMFILE ? 0 : 1);
+    }
+    int status = 0;
+    waitpid(c, &status, 0);
+    struct pollfd p = {m2, POLLIN, 0};
+    fcntl(m2, F_SETFL, O_NONBLOCK);
+    int pr = poll(&p, 1, 0);
+    int rr = read(m2, buf, 1);
+    check("a slave open that fails (EMFILE) leaves the master open, not hung up",
+          WIFEXITED(status) && WEXITSTATUS(status) == 0 && pr == 0 && rr == -1 && errno == EAGAIN);
+    close(m2);
+    close(m);
+}
+
 static volatile sig_atomic_t got;
 static void on_signal(int sig) { got = sig; }
 
@@ -530,6 +702,9 @@ int main(void) {
     signal(SIGTTOU, SIG_IGN);
     devices();
     termios_and_reads();
+    console_flood();
+    pty_bounds();
+    read_rules();
     job_control();
     printf("ttytest: %s\n", failures ? "FAILED" : "all passed");
     return failures != 0;
