@@ -332,7 +332,9 @@ pages and dirty marks the kernel keeps and whose data the server moves:
   length and the file's size at `out`): they become **pending**, zeroed frames pinned for the grant that nobody reads,
   maps or writes. diskfs reads into them by DMA; `mo_filled(handle, offset, pages, ok)` (1077)
   makes them the file's pages or drops them (the threads waiting for them get `EIO`, a mapping
-  `SIGBUS`; nothing is recorded where nobody waits, so a later access asks again) and wakes the
+  `SIGBUS`: a faulting thread is among a page's waiters before it asks, so the answer to its own
+  request cannot pass it by; nothing is recorded where nobody waits, so a later access asks
+  again) and wakes the
   waiters. No copy: the page the program maps is the page the device wrote. A grant looks at a
   bounded number of present pages per call (with interrupts off) and answers `EAGAIN` with the
   page to go on from. When the pager's thread ends, its pending pages go and their waiters fail.

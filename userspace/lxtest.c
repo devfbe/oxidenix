@@ -257,7 +257,9 @@ int main(int argc, char **argv) {
      * first request of every such object fails, not only the instance's
      * first (a second object here, as a second lxtest run in one shell),
      * and each request is the object's own: both exist before the first
-     * is touched. */
+     * is touched. The failure reaches the access that asked however soon
+     * it comes: the faulting thread waits for the page from before its
+     * request (it was lost if it came before the wait began). */
     check("the server maps a paged object it fails once", syscall(TEST_PAGED_FAIL, (char *)0x230000000000) == 0);
     check("a second such object", syscall(TEST_PAGED_FAIL, (char *)0x231000000000) == 0);
     for (int round = 0; round < 2; round++) {

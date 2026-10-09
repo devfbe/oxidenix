@@ -632,7 +632,8 @@ the server.
   ends when the tree's last program is gone. The wait for a page ends when the thread dies
   (`SIGKILL`, an exiting process), so a pager that never answers cannot make it unkillable. A
   pager that cannot supply a page says so (`mo_fail`): the access fails (`SIGBUS`, as an I/O
-  error under `mmap` on Linux), and a later one asks again. A request counts as asked only
+  error under `mmap` on Linux; the faulting thread waits for the page from before it asks, so
+  even an answer that comes at once reaches it), and a later one asks again. A request counts as asked only
   until the pager takes it, and if the pager's process dies, every wait for it ends (`EIO`).
 - **The server's runtime** (phase R3): a heap in its shared region that grows on demand
   (`shared_map`, committed memory), and a mutex for data shared by all threads of the tree

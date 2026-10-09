@@ -243,6 +243,60 @@ struct Waiters {
     failures: u32,
 }
 
+/// What `PageCache::try_map_page` found.
+pub enum Lookup {
+    /// The page's frame, with a new reference for the mapping.
+    Frame(PhysFrame),
+    /// The page must come from the pager first: the caller waits with this
+    /// once it holds no lock the pager may need, then tries again.
+    Missing(PageWait),
+}
+
+/// A thread's place among the waiters of page `index` of a paged or
+/// cached object (`State::waits`), taken before the pager is asked for the
+/// page (`try_map_page`) or its backing and kept across the address
+/// space's unlock until the thread waited (`wait`) or gave up (dropped).
+/// A pager's failure is recorded only where someone waits, so without it
+/// a failure that came before the wait began would be lost, and the wait
+/// would ask again: the access that made a failed request must fail
+/// (SIGBUS, EFAULT), as on Linux.
+pub struct PageWait {
+    cache: Arc<PageCache>,
+    index: u64,
+    /// The page must also be backed (`Pager::mkwrite`).
+    backed: bool,
+    /// The failures for the page it had seen when it entered.
+    seen: u32,
+}
+
+impl PageWait {
+    /// Enters the waiters of page `index` of `cache` (Oom if there is no
+    /// room to record it).
+    pub fn enter(cache: &Arc<PageCache>, index: u64, backed: bool) -> Result<PageWait, Fault> {
+        let seen = cache.state.lock().enter_wait(index).map_err(page_fault)?;
+        Ok(PageWait { cache: cache.clone(), index, backed, seen })
+    }
+
+    /// Waits as `PageCache::wait_page`, counting every failure since it
+    /// entered.
+    pub fn wait(self) -> Result<Option<PhysFrame>, i64> {
+        self.cache.wait_registered(self.index, self.backed, self.seen)?;
+        Ok(self.cache.waited_frame(self.index))
+    }
+}
+
+impl Drop for PageWait {
+    fn drop(&mut self) {
+        self.cache.state.lock().leave_wait(self.index);
+    }
+}
+
+/// The fault for an error making or getting a page: tmpfs is full or the
+/// server failed, no page to map (Bus, as on Linux), or no memory.
+fn page_fault(e: i64) -> Fault {
+    if e == ENOMEM { Fault::Oom } else { Fault::Bus }
+}
+
 /// Most present pages one `pin_fill` or `pin_dirty` looks at (with
 /// interrupts off): beyond, it says where to go on (`Scan::Resume`).
 const MAX_SCAN: usize = 1024;
@@ -486,15 +540,27 @@ impl PageCache {
     /// (it failed, or is gone), EINTR if the thread is dying (a pager that
     /// never answers must not leave it unkillable).
     fn wait_paged(&self, index: u64, backed: bool) -> Result<(), i64> {
-        let Some((pager, key)) = self.pager() else { return Ok(()) };
+        if self.pager().is_none() {
+            return Ok(());
+        }
         let seen = self.state.lock().enter_wait(index)?;
+        let result = self.wait_registered(index, backed, seen);
+        self.state.lock().leave_wait(index);
+        result
+    }
+
+    /// `wait_paged` for a thread already among the page's waiters
+    /// (`enter_wait`, which said it had seen `seen` failures): it stays
+    /// one, the caller lets go.
+    fn wait_registered(&self, index: u64, backed: bool, seen: u32) -> Result<(), i64> {
+        let Some((pager, key)) = self.pager() else { return Ok(()) };
         // What the pager is to be asked for.
         enum Ask {
             Nothing,
             Page,
             Backing,
         }
-        let result = loop {
+        loop {
             let done = x86_64::instructions::interrupts::without_interrupts(|| {
                 let Some(pager) = pager.upgrade() else { return Err(EIO) };
                 // Registered before looking, so an answer cannot slip by.
@@ -543,12 +609,10 @@ impl PageCache {
             });
             match done {
                 Ok(false) => {}
-                Ok(true) => break Ok(()),
-                Err(e) => break Err(e),
+                Ok(true) => return Ok(()),
+                Err(e) => return Err(e),
             }
-        };
-        self.state.lock().leave_wait(index);
-        result
+        }
     }
 
     /// The pager's answer: page `index` with `data` (the rest zero), if it
@@ -1076,7 +1140,16 @@ impl PageCache {
     /// the page cannot be read).
     pub fn map_page(&self, index: u64) -> Result<PhysFrame, Fault> {
         loop {
-            if let Some(frame) = self.try_map_page(index, true)? {
+            if index >= page_of(self.size().saturating_add(PAGE - 1)) {
+                return Err(Fault::Bus);
+            }
+            match self.store {
+                Store::Memory { .. } => self.create(index),
+                Store::Paged { .. } | Store::Cached { .. } => self.wait_paged(index, false),
+            }
+            .map_err(page_fault)?;
+            // Missing again if a truncation or reclaim came in between.
+            if let Some(frame) = self.present(index) {
                 return Ok(frame);
             }
         }
@@ -1084,42 +1157,42 @@ impl PageCache {
 
     /// `map_page`, which without `wait` does not wait for the page of a
     /// paged or cached object that is missing (it asks the pager for it)
-    /// or being filled: None, and the caller waits with `wait_page` once
-    /// it holds no lock the pager may need (the address space's), then
-    /// tries again.
-    pub fn try_map_page(&self, index: u64, wait: bool) -> Result<Option<PhysFrame>, Fault> {
+    /// or being filled: `Lookup::Missing`, and the caller waits with it
+    /// once it holds no lock the pager may need (the address space's),
+    /// then tries again.
+    pub fn try_map_page(self: &Arc<Self>, index: u64, wait: bool) -> Result<Lookup, Fault> {
+        if wait || self.pager().is_none() {
+            return self.map_page(index).map(Lookup::Frame);
+        }
         if index >= page_of(self.size().saturating_add(PAGE - 1)) {
             return Err(Fault::Bus);
         }
-        let made = match self.store {
-            Store::Memory { .. } => self.create(index),
-            Store::Paged { .. } | Store::Cached { .. } if wait => self.wait_paged(index, false),
-            Store::Paged { .. } | Store::Cached { .. } => self.request_page(index),
-        };
-        match made {
-            Ok(()) => {}
-            Err(ENOMEM) => return Err(Fault::Oom),
-            // tmpfs is full or the server failed: no page to map, as on
-            // Linux.
-            Err(_) => return Err(Fault::Bus),
+        if let Some(frame) = self.present(index) {
+            return Ok(Lookup::Frame(frame));
         }
+        // Among the page's waiters before the pager is asked: its answer,
+        // a failure too, cannot come before anyone waits for it.
+        let wait = PageWait::enter(self, index, false)?;
+        self.request_page(index).map_err(page_fault)?;
+        Ok(match self.present(index) {
+            Some(frame) => Lookup::Frame(frame),
+            None => Lookup::Missing(wait),
+        })
+    }
+
+    /// Page `index`'s frame with a new reference for a mapping, if it is
+    /// there and not being filled.
+    fn present(&self, index: u64) -> Option<PhysFrame> {
         let mut st = self.state.lock();
-        // Missing again if a truncation or reclaim came in between (or not
-        // there yet: the caller waits).
-        match st.pages.get_mut(&index) {
-            Some(page) if !page.pending => {
-                page.referenced = true;
-                memory::with_frames(|f| f.share(page.frame));
-                Ok(Some(page.frame))
-            }
-            _ => Ok(None),
-        }
+        let page = st.pages.get_mut(&index).filter(|p| !p.pending)?;
+        page.referenced = true;
+        memory::with_frames(|f| f.share(page.frame));
+        Some(page.frame)
     }
 
     /// Asks the pager for page `index` unless it is there or being filled
-    /// (EIO if the pager is gone). A failure of the fill is seen by the
-    /// wait that follows (`wait_page`), which asks again if it came before
-    /// the wait began.
+    /// (EIO if the pager is gone). Whoever asks is among the page's waiters
+    /// already (`PageWait`), so a failed fill fails its wait.
     fn request_page(&self, index: u64) -> Result<(), i64> {
         let Some((pager, key)) = self.pager() else { return Ok(()) };
         {
@@ -1133,21 +1206,28 @@ impl PageCache {
         }
     }
 
-    /// Waits until page `index` of a paged or cached object is there (see
-    /// `try_map_page`) and returns its frame with a reference (so reclaim
-    /// cannot take it before the fault is tried again; None if it is gone
-    /// already, truncated): EIO if it cannot be had, EINTR if the thread
-    /// dies.
+    /// Waits until page `index` of a paged or cached object is there (and
+    /// backed, with `backed`) and returns its frame with a reference (so
+    /// reclaim cannot take it before the fault is tried again; None if it
+    /// is gone already, truncated): EIO if it cannot be had, EINTR if the
+    /// thread dies. For a space no one else can lock yet (the loader's);
+    /// a fault waits with the `PageWait` it got.
     pub fn wait_page(&self, index: u64, backed: bool) -> Result<Option<PhysFrame>, i64> {
         self.wait_paged(index, backed)?;
-        let st = self.state.lock();
-        Ok(st.pages.get(&index).filter(|p| !p.pending).map(|p| {
-            memory::with_frames(|f| f.share(p.frame));
-            p.frame
-        }))
+        Ok(self.waited_frame(index))
     }
 
-    /// Lets go of the reference `wait_page` gave.
+    /// The frame of page `index` with a reference for whoever waited for
+    /// it (`wait_page`, `PageWait::wait`).
+    fn waited_frame(&self, index: u64) -> Option<PhysFrame> {
+        let st = self.state.lock();
+        st.pages.get(&index).filter(|p| !p.pending).map(|p| {
+            memory::with_frames(|f| f.share(p.frame));
+            p.frame
+        })
+    }
+
+    /// Lets go of the reference `wait_page` or `PageWait::wait` gave.
     pub fn put_frame(frame: PhysFrame) {
         free_frames([frame]);
     }
