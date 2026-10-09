@@ -967,3 +967,27 @@ fn many_blocks_in_flight_count_once() {
     fs.sync().unwrap();
     fsck("promise-many", &take(fs));
 }
+
+/// A socket's name (bind(2) on /data): an inode without data, listed as a
+/// socket, that renames keep a socket and that goes like a file.
+#[test]
+fn socket_inodes() {
+    let mut fs = Ext2::mount(mkfs("socket", 1024)).unwrap();
+    let ino = fs.create(ROOT_INO, "sock", &NewNode::Socket, 0o755).unwrap();
+    let st = fs.stat(ino).unwrap();
+    assert_eq!((st.mode, st.size, st.links), (0o140755, 0, 1));
+    assert!(fs.create(ROOT_INO, "sock", &NewNode::Socket, 0o755).is_err());
+    fs.rename(ROOT_INO, "sock", ROOT_INO, "moved").unwrap();
+    let listed = fs.list(ROOT_INO).unwrap();
+    let entry = listed.iter().find(|e| e.0 == "moved").expect("listed");
+    assert_eq!((entry.1, entry.2), (ino, 6));
+    fs.sync().unwrap();
+    let disk = take(fs);
+    fsck("socket", &disk);
+    let mut fs = Ext2::mount(disk).unwrap();
+    for gone in fs.unlink(ROOT_INO, "moved", false).unwrap() {
+        fs.release(gone).unwrap();
+    }
+    fs.sync().unwrap();
+    fsck("socket-gone", &take(fs));
+}
