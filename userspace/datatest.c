@@ -36,10 +36,11 @@ static void check(const char *name, int ok) {
     if (!ok) failures++;
 }
 
-/* The kernel's count of system calls the server passed back to it. */
+/* The kernel's count of this process's system calls the server passed back
+ * to it (its own: other programs running meanwhile do not count). */
 static long legacy_calls(void) {
     char text[512] = {0};
-    int fd = open("/proc/counters", O_RDONLY);
+    int fd = open("/proc/self/counters", O_RDONLY);
     read(fd, text, sizeof text - 1);
     close(fd);
     char *p = strstr(text, "legacy_calls ");
@@ -111,7 +112,7 @@ static void no_pass_through(void) {
     io &= fsync(fd) == 0 && ftruncate(fd, 10) == 0;
     long passed = legacy_calls() - l0 - base;
     printf("    (%ld of 127 /data calls passed through)\n", passed);
-    check("reads, writes, lseek, stat, fsync of /data are the server's", passed == 0 && io);
+    check("reads, writes, lseek, stat, fsync of /data are the server's", idle >= 0 && passed == 0 && io);
     struct statfs fs;
     check("/data is ext2 with its own device", fstatfs(fd, &fs) == 0 && fs.f_type == 0xef53 && fstat(fd, &st) == 0 && st.st_dev != 0 && st.st_dev != 0x1a);
     close(fd);

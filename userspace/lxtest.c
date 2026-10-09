@@ -2,7 +2,9 @@
  * exercised through the server's test calls (1500 and up, see
  * crates/restricted): the program asks its server to create a memory
  * object, fill it, map it into the program, protect and unmap it, and
- * checks the effect from the program's side. */
+ * checks the effect from the program's side. It may run any number of
+ * times in one boot, beside other programs; `lxtest crashloop` checks the
+ * kernel's restart policy on a service that keeps dying (ADR 0006). */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
@@ -44,6 +46,7 @@
 #define TEST_CHANNEL 1514
 #define TEST_DISKRING 1515
 #define TEST_CACHED 1516
+#define TEST_PASS_THROUGH 1517
 
 static int failures;
 
@@ -100,10 +103,12 @@ static int faults(volatile char *p, int write) {
     return got == SIGSEGV;
 }
 
-/* The kernel's count of system calls the server passed back to it. */
+/* The kernel's count of this process's system calls the server passed back
+ * to it (its own, not /proc/counters' for all: other programs running
+ * meanwhile do not count). */
 static long legacy_calls(void) {
     char text[512] = {0};
-    int fd = open("/proc/counters", O_RDONLY);
+    int fd = open("/proc/self/counters", O_RDONLY);
     read(fd, text, sizeof text - 1);
     close(fd);
     char *p = strstr(text, "legacy_calls ");
@@ -122,19 +127,28 @@ static void *set_eleven(void *arg) {
     return NULL;
 }
 
-/* The count of the server's records once releases stopped arriving. */
-static long settled_records(void) {
-    long last = syscall(TEST_FS_RECORDS);
-    for (int i = 0; i < 20; i++) {
+/* How many watched records the kernel still holds, once it released them
+ * all or a second went by (releases arrive as events of the pager). */
+static long held_records(void) {
+    long held = syscall(TEST_FS_RECORDS, 0);
+    for (int i = 0; i < 20 && held != 0; i++) {
         usleep(50 * 1000);
-        long now = syscall(TEST_FS_RECORDS);
-        if (now == last) break;
-        last = now;
+        held = syscall(TEST_FS_RECORDS, 0);
     }
-    return last;
+    return held;
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    if (argc > 1 && strcmp(argv[1], "crashloop") == 0) {
+        /* The test service dies at every use: the kernel restarts it with
+         * a growing backoff, takes it down after six young deaths in a
+         * row, and brings it back after the cooldown (some 8.5 s). */
+        errno = 0;
+        long r = syscall(TEST_CHANNEL, 8);
+        if (r != 0) printf("    (scenario 8: check %d failed)\n", errno);
+        check("channels: a crash loop: backoff, down (EIO), up after the cooldown", r == 0);
+        return failures != 0;
+    }
     signal(SIGSEGV, on_fault);
     char *at = (char *)0x200000000000;
 
@@ -184,19 +198,26 @@ int main(void) {
     alarm(0);
     check("SIGKILL ends a thread waiting for a page", WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL);
 
-    /* A page the pager fails: SIGBUS, and a later access asks again. */
-    char *fl = (char *)0x230000000000;
-    check("the server maps a paged object it fails once", syscall(TEST_PAGED_FAIL, fl) == 0);
-    child = fork();
-    if (child == 0) {
-        (void)*(volatile char *)fl;
-        _exit(0);
+    /* A page the pager fails: SIGBUS, and a later access asks again. The
+     * first request of every such object fails, not only the instance's
+     * first (a second object here, as a second lxtest run in one shell),
+     * and each request is the object's own: both exist before the first
+     * is touched. */
+    check("the server maps a paged object it fails once", syscall(TEST_PAGED_FAIL, (char *)0x230000000000) == 0);
+    check("a second such object", syscall(TEST_PAGED_FAIL, (char *)0x231000000000) == 0);
+    for (int round = 0; round < 2; round++) {
+        char *fl = (char *)(0x230000000000 + round * 0x1000000000L);
+        child = fork();
+        if (child == 0) {
+            (void)*(volatile char *)fl;
+            _exit(0);
+        }
+        alarm(5);
+        waitpid(child, &st, 0);
+        alarm(0);
+        check(round ? "the second object's page fails too: SIGBUS" : "a page the pager fails raises SIGBUS", WIFSIGNALED(st) && WTERMSIG(st) == SIGBUS);
+        check(round ? "... and a later access gets it" : "... and a later access asks again and gets it", memcmp(fl, "retry", 5) == 0);
     }
-    alarm(5);
-    waitpid(child, &st, 0);
-    alarm(0);
-    check("a page the pager fails raises SIGBUS", WIFSIGNALED(st) && WTERMSIG(st) == SIGBUS);
-    check("... and a later access asks again and gets it", memcmp(fl, "retry", 5) == 0);
     /* The server's runtime: its heap, and its mutex across the threads of
      * the tree's processes (they all run the same server instance). */
     check("the server's heap: 2000 blocks of many sizes keep their contents", syscall(TEST_ALLOC, 2000) == 0);
@@ -214,6 +235,13 @@ int main(void) {
      * pass through to the kernel's Linux implementation. */
     long idle = legacy_calls();
     long base = legacy_calls() - idle;
+    pid_t me = getpid();
+    long c0 = legacy_calls();
+    int own = 1;
+    for (int i = 0; i < 5; i++) own &= syscall(TEST_PASS_THROUGH) == me;
+    long on_purpose = legacy_calls() - c0 - base;
+    printf("    (5 calls passed through on purpose counted as %ld)\n", on_purpose);
+    check("/proc/self/counters counts the process's own passed-through calls", idle >= 0 && own && on_purpose == 5);
     long l0 = legacy_calls();
     for (int i = 0; i < 100; i++) {
         char *m = mmap(NULL, 3 * PG, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -324,14 +352,34 @@ int main(void) {
     pthread_create(&t, NULL, set_eleven, NULL);
     pthread_join(t, NULL);
     check("a thread shares its process's record", syscall(TEST_FS_VALUE, 0) == 11);
-    long recs = settled_records();
-    for (int i = 0; i < 10; i++) {
-        if ((c = fork()) == 0) _exit(0);
+    /* The children's own records, watched (not the count of all the
+     * instance's records, which other processes change). */
+    int hold[2];
+    pipe(hold);
+    pid_t holder = fork();
+    if (holder == 0) {
+        char x;
+        close(hold[1]);
+        syscall(TEST_FS_RECORDS, 1);
+        read(hold[0], &x, 1);
+        _exit(0);
+    }
+    close(hold[0]);
+    long live = 0;
+    for (int i = 0; i < 20 && live == 0; i++) {
+        usleep(10 * 1000);
+        live = syscall(TEST_FS_RECORDS, 0);
+    }
+    check("a running child's record is held", live == 1);
+    close(hold[1]);
+    waitpid(holder, &st, 0);
+    for (int i = 0; i < 9; i++) {
+        if ((c = fork()) == 0) _exit(syscall(TEST_FS_RECORDS, 1) == 0 ? 0 : 1);
         waitpid(c, &st, 0);
     }
-    long after = settled_records();
-    printf("    (records %ld -> %ld after 10 forks)\n", recs, after);
-    check("the kernel releases the records of ended processes", after <= recs);
+    long held = held_records();
+    printf("    (%ld of 10 ended children's records still held)\n", held);
+    check("the kernel releases the records of ended processes", held == 0);
 
     /* Paths are the server's (R6c.2b): resolution, the working directory
      * and umask live in it; the kernel's tree answers through handles. */

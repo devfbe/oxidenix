@@ -164,6 +164,11 @@ pub struct ThreadGroup {
     /// to (`linux::Instance::id`; 0: none, a server of the kernel's or the
     /// instance's pager). Set when its first thread is made.
     pub instance: AtomicU64,
+    /// Linux system calls of this process the Linux server passed back to
+    /// the kernel (`linux::legacy`): the process's share of the counter in
+    /// `/proc/counters`, which `/proc/<pid>/counters` shows, so that a
+    /// program can count its own calls whatever else runs.
+    pub legacy_calls: AtomicU64,
 }
 
 impl ThreadGroup {
@@ -176,6 +181,7 @@ impl ThreadGroup {
             sig: IrqSpinLock::new(sig),
             alarm_seq: AtomicU64::new(0),
             instance: AtomicU64::new(0),
+            legacy_calls: AtomicU64::new(0),
         })
         .ok()
     }

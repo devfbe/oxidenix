@@ -125,6 +125,11 @@ pub fn exit_thread(status: i32) -> ! {
 /// The last thread of `group` left: the process becomes a zombie.
 fn process_exit(group: &Arc<ThreadGroup>, status: i32) {
     let pid = group.tgid;
+    // A server's death is recorded before its services are marked dead
+    // (the restart policy measures its life).
+    if group.privileged.load(Ordering::Relaxed) {
+        super::server_exited(pid);
+    }
     ipc::on_exit(pid);
     irq::on_exit(pid);
     // Channels it served lose their service (and their clients learn it).

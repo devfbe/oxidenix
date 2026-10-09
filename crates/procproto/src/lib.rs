@@ -124,6 +124,9 @@ pub struct Process {
     pub threads: u64,
     pub cpu: u64,
     pub flags: u64,
+    /// Its Linux system calls the Linux server passed back to the kernel
+    /// (its share of `Counters::legacy_calls`).
+    pub legacy_calls: u64,
     /// Name (comm), NUL-padded.
     pub name: [u8; 16],
 }

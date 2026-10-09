@@ -76,6 +76,8 @@ const P_TASK: u32 = 7;
 /// task/<pid> (the only thread) and its files (P_STAT..P_COMM + offset).
 const P_THREAD: u32 = 8;
 const THREAD_FILES: u32 = 8;
+/// counters (oxidenix's own): the process's share of /proc/counters.
+const P_COUNTERS: u32 = P_THREAD + THREAD_FILES + 1;
 
 const PER_PID: u32 = 64;
 const PID_BASE: u32 = 16;
@@ -138,6 +140,7 @@ const PROCESS_FILES: &[(&str, u32)] = &[
     ("comm", P_COMM),
     ("exe", P_EXE),
     ("task", P_TASK),
+    ("counters", P_COUNTERS),
 ];
 
 pub fn system() -> System {
@@ -174,7 +177,7 @@ fn exists(node: Node) -> bool {
                 || (CPU_DIR_ONLINE..CPU_DIR_ONLINE + cpus()).contains(&ino)
         }
         Node::Process(pid, kind) => {
-            pid != 0 && (kind <= P_THREAD || thread_file(kind).is_some()) && process(pid).is_some()
+            pid != 0 && (kind <= P_THREAD || kind == P_COUNTERS || thread_file(kind).is_some()) && process(pid).is_some()
         }
     }
 }
@@ -327,6 +330,7 @@ fn contents(node: Node) -> Result<Vec<u8>, i64> {
                 P_STATUS => render::pid_status(&p, &system()),
                 P_CMDLINE => return Ok(query_text(QUERY_CMDLINE, pid).unwrap_or_default()),
                 P_COMM => alloc::format!("{}\n", render::name(&p)),
+                P_COUNTERS => render::pid_counters(&p),
                 _ => return Err(EINVAL),
             }
         }

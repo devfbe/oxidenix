@@ -1783,6 +1783,7 @@ pub fn legacy(closed: u64, cap: u64) -> Result<u64, i64> {
     let mut program = Frame::default();
     load(&state, &mut program)?;
     crate::counters::add(|c| &c.legacy_calls, 1);
+    super::sched::current().group.legacy_calls.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     set_legacy(true);
     super::syscall::dispatch_linux(&mut program);
     set_legacy(false);
