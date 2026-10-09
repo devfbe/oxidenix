@@ -139,6 +139,21 @@ pub fn stopped_status(sig: u32) -> i32 {
 }
 
 impl GroupSignals {
+    /// (pending for the process, ignored, caught) as bit masks (bit n-1
+    /// for signal n), what /proc/<pid>/status shows (ShdPnd, SigIgn,
+    /// SigCgt).
+    pub fn summary(&self) -> (u64, u64, u64) {
+        let (mut ignored, mut caught) = (0, 0);
+        for (i, a) in self.actions.iter().enumerate() {
+            match a.handler {
+                SIG_IGN => ignored |= 1 << i,
+                SIG_DFL => {}
+                _ => caught |= 1 << i,
+            }
+        }
+        (self.pending, ignored, caught)
+    }
+
     /// Whether a group stop is under way (or done): what SIGCONT counts as stopped.
     pub fn stopping(&self) -> bool {
         self.stopping != 0
@@ -181,6 +196,11 @@ impl GroupSignals {
 }
 
 impl ThreadSignals {
+    /// The signals sent to this thread that wait (SigPnd).
+    pub fn pending(&self) -> u64 {
+        self.pending
+    }
+
     pub fn set_stop(&mut self) {
         self.stop = true;
     }

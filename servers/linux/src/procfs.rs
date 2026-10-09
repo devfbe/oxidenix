@@ -277,7 +277,8 @@ fn proc_info(op: u64, arg: u64, cap: usize) -> Result<Vec<u8>, i64> {
 
 /// A list of ids (`QUERY_PIDS`, `QUERY_THREADS`), all of them.
 fn ids(op: u64, arg: u64) -> Result<Vec<u64>, i64> {
-    let mut cap = 512;
+    // Sized by what comes back: a small buffer first, doubled while full.
+    let mut cap = 64;
     loop {
         let bytes = proc_info(op, arg, cap * 8)?;
         if bytes.len() < cap * 8 || cap >= 1 << 16 {
@@ -285,6 +286,30 @@ fn ids(op: u64, arg: u64) -> Result<Vec<u64>, i64> {
         }
         cap *= 2;
     }
+}
+
+/// A text record (`QUERY_CMDLINE`, `QUERY_EXE`) of process `pid`, in a
+/// buffer sized by probing: 256 bytes first, doubled on ERANGE up to 128
+/// KiB (Linux's ARG_MAX for a command line). ENOENT for no process.
+fn text(op: u64, pid: u64) -> Result<Vec<u8>, i64> {
+    let mut cap = 256;
+    loop {
+        match proc_info(op, pid, cap) {
+            Err(ERANGE) if cap < 128 * 1024 => cap *= 2,
+            Err(ESRCH) => return Err(ENOENT),
+            other => return other,
+        }
+    }
+}
+
+/// What the server knows of process `p` beyond the kernel's record: its
+/// session's controlling terminal, and its umask if it is the caller's
+/// own (another's umask is in its own record, which only the process
+/// model of R8 will let the server find).
+fn linux(p: &Process) -> fmt::Linux {
+    let (tty_nr, tpgid) = crate::tty::proc_fields(p.sid);
+    let umask = (p.tgid == caller().0).then(|| crate::records::current().state.lock().umask);
+    fmt::Linux { tty_nr, tpgid, umask }
 }
 
 /// The process (or thread) `pid`: ENOENT if there is none. The kernel's
@@ -579,7 +604,7 @@ pub fn readlink(node: &ProcNode) -> Result<String, i64> {
         }
         ProcNode::MountsLink => Ok(String::from("self/mounts")),
         ProcNode::Pid { pid, file: PidFile::Exe } => {
-            let exe = proc_info(QUERY_EXE, *pid, 4096).map_err(|e| if e == ESRCH || e == ERANGE { ENOENT } else { e })?;
+            let exe = text(QUERY_EXE, *pid).map_err(|e| if e == ERANGE { ENOENT } else { e })?;
             if exe.is_empty() {
                 return Err(ENOENT);
             }
@@ -695,10 +720,10 @@ pub fn contents(node: &ProcNode) -> Result<Vec<u8>, i64> {
     };
     let p = process(id)?;
     let text = match file {
-        PidFile::Stat => fmt::pid_stat(&p, &machine()),
+        PidFile::Stat => fmt::pid_stat(&p, &machine(), &linux(&p)),
         PidFile::Statm => fmt::pid_statm(&p),
-        PidFile::Status => fmt::pid_status(&p, &machine()),
-        PidFile::Cmdline => return proc_info(QUERY_CMDLINE, id, 64 * 1024).map_err(|e| if e == ESRCH { ENOENT } else { e }),
+        PidFile::Status => fmt::pid_status(&p, &machine(), &linux(&p)),
+        PidFile::Cmdline => return text(QUERY_CMDLINE, id),
         PidFile::Comm => format!("{}\n", fmt::name(&p)),
         PidFile::Counters => fmt::pid_counters(&p),
         PidFile::Mounts => namespace::mounts_text(),

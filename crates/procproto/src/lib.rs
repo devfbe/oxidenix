@@ -87,6 +87,9 @@ pub struct System {
     /// Cached file pages stored to and not yet written back (bytes).
     pub dirty: u64,
     pub counters: Counters,
+    /// The time stamp counter's frequency, in Hz (the CPUs' clock as far
+    /// as the system knows it).
+    pub tsc_hz: u64,
 }
 
 /// Hot-path event counters since boot (for benchmarks; /proc/counters).
@@ -97,7 +100,8 @@ pub struct Counters {
     /// Linux system calls the Linux server passed back to the kernel.
     pub legacy_calls: u64,
     /// IPC requests the kernel sent to servers, and the bytes of the
-    /// requests and replies it copied.
+    /// requests and replies it copied: since I/O rings step 5 only channel
+    /// offers (the data plane goes through the rings, uncounted here).
     pub ipc_calls: u64,
     pub ipc_bytes: u64,
     /// Page table root loads (CR3 writes).
@@ -145,6 +149,17 @@ pub struct Process {
     /// Its Linux system calls the Linux server passed back to the kernel
     /// (its share of `Counters::legacy_calls`).
     pub legacy_calls: u64,
+    /// The most resident pages and pages of address space it had.
+    pub peak_pages: u64,
+    pub virt_peak: u64,
+    /// Signal masks (bit n-1 for signal n): pending for the thread asked
+    /// for (its main thread for a process id) and for the process, blocked
+    /// by that thread, ignored and caught by the process.
+    pub sig_pending: u64,
+    pub sig_shared: u64,
+    pub sig_blocked: u64,
+    pub sig_ignored: u64,
+    pub sig_caught: u64,
     /// Name (comm), NUL-padded.
     pub name: [u8; 16],
 }

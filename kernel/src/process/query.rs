@@ -15,6 +15,7 @@ use procproto::*;
 fn system() -> System {
     let mut s = System { hz: TIMER_HZ, uptime: sched::ticks(), page_size: 4096, ..Default::default() };
     s.boot_time = crate::time::boot_time();
+    s.tsc_hz = crate::time::tsc_hz();
     for i in 0..MAX_CPUS {
         let Some(cpu) = crate::smp::by_index(i) else { continue };
         let st = sched::cpu_stats(cpu);
@@ -97,8 +98,14 @@ fn process(pid: Pid, instance: u64) -> Result<Process, i64> {
         cpu: info.threads.first().map_or(0, |t| t.last_cpu.load(Ordering::Relaxed)) as u64,
         flags: 0,
         legacy_calls: g.legacy_calls.load(Ordering::Relaxed),
+        peak_pages: info.mem.as_ref().map_or(0, |m| m.peak_pages.load(Ordering::Relaxed)),
+        virt_peak: info.mem.as_ref().map_or(0, |m| m.virt_peak.load(Ordering::Relaxed)),
         name: [0; 16],
+        ..Default::default()
     };
+    // The thread asked for (a thread's id), or the main thread; its signal
+    // state is read once `info` is let go of (no lock order between them).
+    let thread = info.threads.iter().find(|t| t.tid() == pid).or(info.threads.first()).cloned();
     if g.privileged.load(Ordering::Relaxed) {
         p.flags |= FLAG_SERVER;
     }
@@ -107,6 +114,12 @@ fn process(pid: Pid, instance: u64) -> Result<Process, i64> {
     }
     let n = info.name.len().min(15);
     p.name[..n].copy_from_slice(&info.name.as_bytes()[..n]);
+    drop(info);
+    if let Some(t) = thread {
+        let s = t.sig.lock();
+        (p.sig_pending, p.sig_blocked) = (s.pending(), s.mask);
+    }
+    (p.sig_shared, p.sig_ignored, p.sig_caught) = g.sig.lock().summary();
     Ok(p)
 }
 

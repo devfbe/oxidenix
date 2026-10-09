@@ -27,6 +27,26 @@ impl Machine {
     }
 }
 
+/// What the Linux server knows of a process beyond the kernel's record:
+/// its controlling terminal (`tty_nr`, 0 for none; the foreground group
+/// `tpgid`, -1 for none) and its umask (None where it does not know it:
+/// another process's, until the process model is the server's).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Linux {
+    pub tty_nr: u64,
+    pub tpgid: i64,
+    pub umask: Option<u32>,
+}
+
+impl Default for Linux {
+    fn default() -> Linux {
+        Linux { tty_nr: 0, tpgid: -1, umask: None }
+    }
+}
+
+/// Everyone is root: every capability (Linux's CAP_LAST_CAP is 40).
+const CAPS_ALL: u64 = (1 << 41) - 1;
+
 pub fn to_user_hz(ticks: u64, hz: u64) -> u64 {
     ticks * USER_HZ / hz.max(1)
 }
@@ -156,12 +176,14 @@ pub fn counters(c: &Counters) -> String {
 const PF_KTHREAD: u64 = 0x0020_0000;
 
 /// /proc/<pid>/stat: 52 space-separated fields.
-pub fn pid_stat(p: &Process, m: &Machine) -> String {
+pub fn pid_stat(p: &Process, m: &Machine, l: &Linux) -> String {
     let flags = if p.flags & FLAG_KERNEL != 0 { PF_KTHREAD } else { 0 };
     let priority = 20 + p.nice;
     let vsize = p.virt_pages * m.page_size;
     format!(
-        "{pid} ({name}) {state} {ppid} {pgid} {sid} 0 -1 {flags} 0 0 0 0 {utime} {stime} 0 0 {priority} {nice} {threads} 0 {start} {vsize} {rss} 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 {cpu} 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+        "{pid} ({name}) {state} {ppid} {pgid} {sid} {tty} {tpgid} {flags} 0 0 0 0 {utime} {stime} 0 0 {priority} {nice} {threads} 0 {start} {vsize} {rss} 18446744073709551615 0 0 0 0 0 0 0 0 0 0 0 0 17 {cpu} 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+        tty = l.tty_nr,
+        tpgid = l.tpgid,
         pid = p.pid,
         name = name(p),
         state = p.state as u8 as char,
@@ -183,8 +205,11 @@ pub fn pid_statm(p: &Process) -> String {
     format!("{} {} 0 0 0 {} 0\n", p.virt_pages, p.pages, p.pages)
 }
 
-/// /proc/<pid>/status: the fields programs read, in Linux's order.
-pub fn pid_status(p: &Process, m: &Machine) -> String {
+/// /proc/<pid>/status: the fields programs read, in Linux's order. (The
+/// kernel keeps no split of the address space by kind, so VmData, VmStk,
+/// VmExe and VmLib are not shown, nor the context switches it does not
+/// count per thread.)
+pub fn pid_status(p: &Process, m: &Machine, l: &Linux) -> String {
     let state = match p.state as u8 {
         STATE_RUNNING => "R (running)",
         STATE_SLEEPING => "S (sleeping)",
@@ -192,19 +217,39 @@ pub fn pid_status(p: &Process, m: &Machine) -> String {
         STATE_ZOMBIE => "Z (zombie)",
         _ => "? (unknown)",
     };
-    let kb = p.pages * m.page_size / 1024;
-    let virt_kb = p.virt_pages * m.page_size / 1024;
-    format!(
-        "Name:\t{name}\nUmask:\t0022\nState:\t{state}\nTgid:\t{tgid}\nNgid:\t0\nPid:\t{pid}\nPPid:\t{ppid}\nTracerPid:\t0\n\
-         Uid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nFDSize:\t256\nGroups:\t\nVmPeak:\t{virt_kb:>8} kB\nVmSize:\t{virt_kb:>8} kB\n\
-         VmRSS:\t{kb:>8} kB\nRssAnon:\t{kb:>8} kB\nVmSwap:\t       0 kB\nThreads:\t{threads}\nCpus_allowed_list:\t{cpus}\n",
-        name = name(p),
+    let kb = |pages: u64| pages * m.page_size / 1024;
+    let mut out = format!("Name:\t{}\n", name(p));
+    if let Some(umask) = l.umask {
+        let _ = writeln!(out, "Umask:\t{umask:04o}");
+    }
+    let _ = write!(
+        out,
+        "State:\t{state}\nTgid:\t{tgid}\nNgid:\t0\nPid:\t{pid}\nPPid:\t{ppid}\nTracerPid:\t0\n\
+         Uid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nFDSize:\t256\nGroups:\t\nNStgid:\t{tgid}\nNSpid:\t{pid}\nNSpgid:\t{pgid}\nNSsid:\t{sid}\n\
+         VmPeak:\t{peak:>8} kB\nVmSize:\t{virt:>8} kB\nVmLck:\t       0 kB\nVmPin:\t       0 kB\nVmHWM:\t{hwm:>8} kB\n\
+         VmRSS:\t{rss:>8} kB\nRssAnon:\t{rss:>8} kB\nRssFile:\t       0 kB\nRssShmem:\t       0 kB\nVmSwap:\t       0 kB\n\
+         Threads:\t{threads}\nSigPnd:\t{pnd:016x}\nShdPnd:\t{shd:016x}\nSigBlk:\t{blk:016x}\nSigIgn:\t{ign:016x}\nSigCgt:\t{cgt:016x}\n\
+         CapInh:\t0000000000000000\nCapPrm:\t{caps:016x}\nCapEff:\t{caps:016x}\nCapBnd:\t{caps:016x}\nCapAmb:\t0000000000000000\n\
+         Cpus_allowed_list:\t{cpus}\n",
         pid = p.pid,
         tgid = p.tgid,
         ppid = p.ppid,
+        pgid = p.pgid,
+        sid = p.sid,
+        peak = kb(p.virt_peak.max(p.virt_pages)),
+        virt = kb(p.virt_pages),
+        hwm = kb(p.peak_pages.max(p.pages)),
+        rss = kb(p.pages),
         threads = p.threads,
+        pnd = p.sig_pending,
+        shd = p.sig_shared,
+        blk = p.sig_blocked,
+        ign = p.sig_ignored,
+        cgt = p.sig_caught,
+        caps = CAPS_ALL,
         cpus = cpu_list(m.cpus),
-    )
+    );
+    out
 }
 
 /// /proc/<pid>/counters (oxidenix's own): the counters of /proc/counters

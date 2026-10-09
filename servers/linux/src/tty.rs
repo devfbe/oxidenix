@@ -271,6 +271,19 @@ pub fn ctty_of(sid: u64) -> Option<Arc<Tty>> {
     all().into_iter().find(|t| t.inner.lock().session == Some(sid))
 }
 
+/// The controlling terminal of session `sid` as /proc/<pid>/stat shows it:
+/// its device number (`tty_nr`, 0 for none) and its foreground process
+/// group (`tpgid`, -1 for none).
+pub fn proc_fields(sid: u64) -> (u64, i64) {
+    let Some(tty) = ctty_of(sid) else { return (0, -1) };
+    let rdev = match tty.driver {
+        Driver::Console => vfs::stat::dev_make(5, 1),
+        Driver::Pty(n) => vfs::stat::dev_make(crate::pty::SLAVE_MAJOR, n),
+    };
+    let fg = tty.inner.lock().pgrp.map_or(-1, |g| g as i64);
+    (rdev, fg)
+}
+
 /// Opens the terminal device with number `rdev` (the character device node `origin`), if
 /// it is one: (5,0) /dev/tty, (5,1) /dev/console, (5,2) /dev/ptmx, (136,n) /dev/pts/n.
 /// None for another device.
