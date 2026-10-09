@@ -482,6 +482,27 @@ static void many_sockets(void) {
         }
     }
     check("600 TCP sockets open at once", ok);
+    /* Connections reset before they are accepted give their place (and
+     * netd's buffers) back: many of them leave the backlog working. */
+    int resets = 0;
+    struct linger now = {1, 0};
+    for (int i = 0; i < 200; i++) {
+        int r = tcp_connect("127.0.0.1", port);
+        if (r < 0) continue;
+        setsockopt(r, SOL_SOCKET, SO_LINGER, &now, sizeof now);
+        close(r);
+        resets++;
+    }
+    int late = tcp_connect("127.0.0.1", port), late_s = -1;
+    while (late >= 0 && (late_s = accept(l, NULL, NULL)) >= 0) {
+        char b[4];
+        if (write(late, "late", 4) == 4 && read_all(late_s, b, 4) == 4 && memcmp(b, "late", 4) == 0) break;
+        close(late_s);
+        late_s = -1;
+    }
+    check("200 connections reset unaccepted, then one that works", resets == 200 && late_s >= 0);
+    if (late >= 0) close(late);
+    if (late_s >= 0) close(late_s);
     /* Every connection both ways: a request, then a larger answer. */
     static char big[16384], got[16384];
     for (unsigned k = 0; k < sizeof big; k++) big[k] = (char)(k * 7);

@@ -1733,6 +1733,14 @@ impl Service {
         for (owner, h) in slots().flatten() {
             let sk = sockets.get::<tcp::Socket>(h);
             match sk.state() {
+                // A connection that went before it was accepted (reset,
+                // timed out) left its socket listening again: its buffers
+                // go, so the next one is counted as half-open again (and a
+                // peer cannot pin buffers by connecting and resetting).
+                tcp::State::Listen if sk.recv_capacity() > 0 || sk.send_capacity() > 0 => {
+                    resize(mem, bytes, h, Way::Rx, 0, sockets);
+                    resize(mem, bytes, h, Way::Tx, 0, sockets);
+                }
                 tcp::State::Listen | tcp::State::Closed => {}
                 tcp::State::SynReceived if sk.recv_capacity() == 0 => {
                     // A place among the half-open connections, within the
