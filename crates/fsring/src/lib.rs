@@ -6,7 +6,8 @@
 //! over the rings"); what follows is diskfs's side where they differ.
 //!
 //! A request is a `ring::Desc`: `op`, the client's `tag` (echoed by the
-//! completion), the inode in `object`, and a buffer, a range of a grant
+//! completion), the inode in `object` (a handle, `Node`: its number and
+//! generation), and a buffer, a range of a grant
 //! (`grant`, `buf_off`, `len`). File data travels in granted pages only:
 //! diskfs's device moves it between the disk and the grant by DMA. Names
 //! and results that do not fit a completion travel in a grant too. Every
@@ -21,9 +22,10 @@
 //! | `WRITE` | `object` inode, `offset`, buffer | bytes written (all of them), v0 = file size |
 //! | `FLUSH` | - | 0 once every write completed before it is durable |
 //! | `STAT` | `object` inode | 0, `Stat` in v0..v3 |
+//! | `ROOT` | - | the root directory: v0 = inode, v1 = its mode, v2 = its generation |
 //! | `LOOKUP` | `object` directory, buffer = name | v0 = inode, v1 = its mode, v2 = its generation |
 //! | `CREATE` | `object` directory, buffer = name, `arg` = [kind, permissions, target length]; a symlink's target follows the name in the grant | v0 = new inode, v1 = its mode, v2 = its generation |
-//! | `UNLINK` | `object` directory, buffer = name, `arg[0]` = 1 for a directory | v0 = inode whose last link went (0: none) |
+//! | `UNLINK` | `object` directory, buffer = name, `arg[0]` = 1 for a directory | v0 = inode whose last link went and that the client holds (0: none), v1 = its generation |
 //! | `RENAME` | `object` old directory, buffer = old name, `arg` = [new directory, new name length]; the new name follows the old one | as `UNLINK` (an entry replaced) |
 //! | `TRUNCATE` | `object` inode, `offset` = new size | 0 |
 //! | `READDIR` | `object` directory, `offset` = cursor (0: from the start), buffer for entries | bytes of entries (`dirents`), v0 = next cursor (0: done) |
@@ -34,6 +36,14 @@
 //! | `STATFS` | - | 0, `Usage` in v0..v3 (sizes, counts, the largest file) |
 //! | `FORGET` | `grant` | 0 once no request on the grant is in flight and the service let go of it |
 //! | `PROMISE` | `object` inode, `offset`, `arg[0]` = length (at most `MAX_TRANSFER`) | 0 once the blocks a later `WRITE` of the range needs are kept for it (see "Promises"); ENOSPC |
+//!
+//! **Handles.** A request names an inode by its number and its generation
+//! (`Node`, in `object` and `RENAME`'s new directory): a number is reused for
+//! a new file once the old one is freed, and the new file has another
+//! generation. A handle whose inode is gone or another file's completes
+//! with `ESTALE`, so a client never acts on another file than the one it
+//! means (after a restart of the service, say). (procfs's inodes all have
+//! generation 0.)
 //!
 //! **Ordering.** Reads and writes run concurrently and complete in any
 //! order (the device reorders them); a write waits only for writes in
@@ -53,12 +63,18 @@
 //! complete, and with it what completed writes changed (also data
 //! first).
 //!
-//! **Holds.** A client holds every inode it named in a request or got
-//! back from `LOOKUP`, `CREATE`, `UNLINK` or `RENAME`, until it sends
-//! `RELEASE` for it or its channel goes. An inode whose last link went is
-//! freed (with its blocks) only when no client holds it: one client's
-//! `RELEASE` never frees what another still uses. (A client releases what it no longer caches; until then an
-//! unlinked inode stays allocated.)
+//! **Holds.** A client holds every inode it named in a request (with a
+//! valid handle) or got back from `ROOT`, `LOOKUP`, `CREATE`, `UNLINK` or
+//! `RENAME`, until it sends `RELEASE` for it or its channel goes. An inode
+//! whose last link went is freed (with its blocks) only when no client
+//! holds it: one client's `RELEASE` never frees what another still uses.
+//! (A client releases what it no longer caches; until then an unlinked
+//! inode stays allocated.) An `UNLINK` or `RENAME` that takes the last link
+//! of an inode no client holds frees it at once (v0 = 0). The holds outlive
+//! the service: a restarted diskfs keeps every unlinked inode until each
+//! client the dead one served has named again what it holds (it does so
+//! before its first other request on its new channel: a `STAT` of each
+//! inode it holds) or is gone (diskfs, "Restarts").
 //!
 //! **Room.** The service takes a request only when the completion ring
 //! has room for its completion; a request that waits for room does not
@@ -114,6 +130,7 @@ pub mod op {
     pub const FORGET: u16 = 15;
     pub const PROMISE: u16 = 16;
     pub const SETTIMES: u16 = 17;
+    pub const ROOT: u16 = 18;
 }
 
 /// `SETTIMES`'s choice of times (`offset`).
@@ -137,6 +154,8 @@ pub mod errno {
     pub const ERANGE: i64 = 34;
     pub const ENAMETOOLONG: i64 = 36;
     pub const ENOSYS: i64 = 38;
+    /// A handle whose inode is gone or another file's (see "Handles").
+    pub const ESTALE: i64 = 116;
 }
 use errno::*;
 
@@ -184,28 +203,51 @@ pub enum Kind {
     Socket,
 }
 
+/// An inode as a request names it (see "Handles"): its number and its
+/// generation, in a descriptor's `object` as `generation << 32 | ino`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct Node {
+    pub ino: u32,
+    pub generation: u32,
+}
+
+impl Node {
+    pub const fn new(ino: u32, generation: u32) -> Node {
+        Node { ino, generation }
+    }
+
+    pub const fn to_object(self) -> u64 {
+        (self.generation as u64) << 32 | self.ino as u64
+    }
+
+    pub const fn from_object(object: u64) -> Node {
+        Node { ino: object as u32, generation: (object >> 32) as u32 }
+    }
+}
+
 /// A request, validated (`decode`) or to be sent (`encode`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Request {
-    Read { ino: u32, offset: u64, buf: Buf },
-    Write { ino: u32, offset: u64, buf: Buf },
+    Read { ino: Node, offset: u64, buf: Buf },
+    Write { ino: Node, offset: u64, buf: Buf },
     Flush,
-    Stat { ino: u32 },
-    Lookup { dir: u32, name: Buf },
-    Create { dir: u32, name: Buf, kind: Kind, perm: u32 },
-    Unlink { dir: u32, name: Buf, is_dir: bool },
-    Rename { from: u32, name: Buf, to: u32, new_name: Buf },
-    Truncate { ino: u32, len: u64 },
-    Readdir { dir: u32, cursor: u64, buf: Buf },
-    Release { ino: u32 },
-    Readlink { ino: u32, buf: Buf },
-    SetPerm { ino: u32, perm: u32 },
+    Stat { ino: Node },
+    Root,
+    Lookup { dir: Node, name: Buf },
+    Create { dir: Node, name: Buf, kind: Kind, perm: u32 },
+    Unlink { dir: Node, name: Buf, is_dir: bool },
+    Rename { from: Node, name: Buf, to: Node, new_name: Buf },
+    Truncate { ino: Node, len: u64 },
+    Readdir { dir: Node, cursor: u64, buf: Buf },
+    Release { ino: Node },
+    Readlink { ino: Node, buf: Buf },
+    SetPerm { ino: Node, perm: u32 },
     /// The times to set: access, modification, change (seconds; None:
     /// keep).
-    SetTimes { ino: u32, atime: Option<u32>, mtime: Option<u32>, ctime: Option<u32> },
+    SetTimes { ino: Node, atime: Option<u32>, mtime: Option<u32>, ctime: Option<u32> },
     Statfs,
     Forget { grant: u32 },
-    Promise { ino: u32, offset: u64, len: u64 },
+    Promise { ino: Node, offset: u64, len: u64 },
 }
 
 /// The fields of a `Desc` an operation reads, for the check that the
@@ -220,8 +262,8 @@ struct Used {
 
 const NONE: Used = Used { object: false, offset: false, buf: false, grant: false, args: 0 };
 
-fn ino(object: u64) -> Result<u32, i64> {
-    u32::try_from(object).map_err(|_| EINVAL)
+fn ino(object: u64) -> Result<Node, i64> {
+    Ok(Node::from_object(object))
 }
 
 fn name_len(len: u64) -> Result<u64, i64> {
@@ -258,6 +300,7 @@ impl Request {
                 (r, Used { object: true, offset: true, buf: true, ..NONE })
             }
             op::FLUSH => (Request::Flush, NONE),
+            op::ROOT => (Request::Root, NONE),
             op::STATFS => (Request::Statfs, NONE),
             op::STAT => (Request::Stat { ino: ino(d.object)? }, Used { object: true, ..NONE }),
             op::RELEASE => (Request::Release { ino: ino(d.object)? }, Used { object: true, ..NONE }),
@@ -361,18 +404,18 @@ impl Request {
         };
         match *self {
             Request::Read { ino, offset, buf } | Request::Write { ino, offset, buf } => {
-                d.object = ino as u64;
+                d.object = ino.to_object();
                 d.offset = offset;
                 set_buf(&mut d, &buf);
             }
-            Request::Flush | Request::Statfs => {}
-            Request::Stat { ino } | Request::Release { ino } => d.object = ino as u64,
+            Request::Flush | Request::Statfs | Request::Root => {}
+            Request::Stat { ino } | Request::Release { ino } => d.object = ino.to_object(),
             Request::Lookup { dir, name } => {
-                d.object = dir as u64;
+                d.object = dir.to_object();
                 set_buf(&mut d, &name);
             }
             Request::Create { dir, name, kind, perm } => {
-                d.object = dir as u64;
+                d.object = dir.to_object();
                 set_buf(&mut d, &name);
                 d.arg = match kind {
                     Kind::File => [KIND_FILE, perm as u64, 0],
@@ -382,41 +425,41 @@ impl Request {
                 };
             }
             Request::Unlink { dir, name, is_dir } => {
-                d.object = dir as u64;
+                d.object = dir.to_object();
                 set_buf(&mut d, &name);
                 d.arg[0] = is_dir as u64;
             }
             Request::Rename { from, name, to, new_name } => {
-                d.object = from as u64;
+                d.object = from.to_object();
                 set_buf(&mut d, &name);
-                d.arg = [to as u64, new_name.len as u64, 0];
+                d.arg = [to.to_object(), new_name.len as u64, 0];
             }
             Request::Truncate { ino, len } => {
-                d.object = ino as u64;
+                d.object = ino.to_object();
                 d.offset = len;
             }
             Request::Readdir { dir, cursor, buf } => {
-                d.object = dir as u64;
+                d.object = dir.to_object();
                 d.offset = cursor;
                 set_buf(&mut d, &buf);
             }
             Request::Readlink { ino, buf } => {
-                d.object = ino as u64;
+                d.object = ino.to_object();
                 set_buf(&mut d, &buf);
             }
             Request::SetPerm { ino, perm } => {
-                d.object = ino as u64;
+                d.object = ino.to_object();
                 d.arg[0] = perm as u64;
             }
             Request::SetTimes { ino, atime, mtime, ctime } => {
-                d.object = ino as u64;
+                d.object = ino.to_object();
                 let bit = |t: Option<u32>, b: u64| if t.is_some() { b } else { 0 };
                 d.offset = bit(atime, TIME_ATIME) | bit(mtime, TIME_MTIME) | bit(ctime, TIME_CTIME);
                 d.arg = [atime.unwrap_or(0) as u64, mtime.unwrap_or(0) as u64, ctime.unwrap_or(0) as u64];
             }
             Request::Forget { grant } => d.grant = grant,
             Request::Promise { ino, offset, len } => {
-                d.object = ino as u64;
+                d.object = ino.to_object();
                 d.offset = offset;
                 d.arg[0] = len;
             }
@@ -430,6 +473,7 @@ impl Request {
             Request::Write { .. } => op::WRITE,
             Request::Flush => op::FLUSH,
             Request::Stat { .. } => op::STAT,
+            Request::Root => op::ROOT,
             Request::Lookup { .. } => op::LOOKUP,
             Request::Create { .. } => op::CREATE,
             Request::Unlink { .. } => op::UNLINK,

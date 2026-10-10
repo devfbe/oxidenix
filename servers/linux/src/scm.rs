@@ -99,13 +99,15 @@ pub fn request() {
 }
 
 /// The worker thread: lets go of the descriptor tables whose processes
-/// ended (`fdtable::end_later`) and collects whenever asked.
+/// ended (`fdtable::end_later`), connects to a restarted diskfs
+/// (`datafs::reconnect_later`) and collects whenever asked.
 pub fn worker() -> ! {
     let mut done = 0;
     loop {
         let asked = REQUESTED.load(Ordering::Acquire);
         if asked != done {
             done = asked;
+            crate::datafs::reconnect_if_asked();
             crate::fdtable::release_ended();
             collect();
             continue;

@@ -183,6 +183,11 @@ fn call(c: &Client, r: Request) -> Result<Completion, i64> {
     Ok(done)
 }
 
+/// procfs's handle of inode `ino` (its inodes all have generation 0).
+fn proc_node(ino: u32) -> fsring::Node {
+    fsring::Node::new(ino, 0)
+}
+
 fn remote_lookup(sys: bool, dir: u32, name: &str) -> Result<ProcNode, i64> {
     if name.is_empty() || name.len() > vfs::NAME_MAX {
         return Err(ENOENT);
@@ -190,7 +195,7 @@ fn remote_lookup(sys: bool, dir: u32, name: &str) -> Result<ProcNode, i64> {
     let c = client()?;
     let scratch = c.scratch(1);
     scratch.put(0, name.as_bytes());
-    let done = call(&c, Request::Lookup { dir, name: scratch.buf(0, name.len() as u64) })?;
+    let done = call(&c, Request::Lookup { dir: proc_node(dir), name: scratch.buf(0, name.len() as u64) })?;
     let ino = u32::try_from(done.values[0]).map_err(|_| EIO)?;
     let mode = done.values[1] as u32;
     if !matches!(mode & vfs::S_IFMT, S_IFDIR | S_IFREG) {
@@ -201,7 +206,7 @@ fn remote_lookup(sys: bool, dir: u32, name: &str) -> Result<ProcNode, i64> {
 
 fn remote_stat(ino: u32) -> Result<fsring::Stat, i64> {
     let c = client()?;
-    Ok(fsring::Stat::from_values(&call(&c, Request::Stat { ino })?.values))
+    Ok(fsring::Stat::from_values(&call(&c, Request::Stat { ino: proc_node(ino) })?.values))
 }
 
 /// A file's contents, as procfs makes them now: one `READ` into the
@@ -212,7 +217,7 @@ fn remote_read(ino: u32) -> Result<Vec<u8>, i64> {
     let mut data = Vec::new();
     loop {
         let len = scratch.len();
-        let done = call(&c, Request::Read { ino, offset: data.len() as u64, buf: scratch.buf(0, len) })?;
+        let done = call(&c, Request::Read { ino: proc_node(ino), offset: data.len() as u64, buf: scratch.buf(0, len) })?;
         let n = done.status as u64;
         if n > len {
             return Err(EIO);
@@ -236,7 +241,7 @@ fn remote_readdir(dir: u32) -> Result<Vec<(String, u64, u8)>, i64> {
     let mut cursor = 0;
     loop {
         let len = scratch.len();
-        let done = call(&c, Request::Readdir { dir, cursor, buf: scratch.buf(0, len) })?;
+        let done = call(&c, Request::Readdir { dir: proc_node(dir), cursor, buf: scratch.buf(0, len) })?;
         let n = done.status as u64;
         if n > len {
             return Err(EIO);

@@ -235,6 +235,9 @@ pub struct Server {
     /// reports it. (A restarted process may see its predecessor's: a
     /// spurious wakeup, nothing more.)
     pub doorbell: Arc<core::sync::atomic::AtomicBool>,
+    /// Channels bound to it: attached by one of its processes, with their
+    /// client still there and not detached (`channel`, "Successors").
+    pub bound: core::sync::atomic::AtomicU64,
 }
 
 /// The servers the kernel started, by name: a channel to a dead one
@@ -388,6 +391,7 @@ impl Server {
             restarting: core::sync::atomic::AtomicBool::new(false),
             domain: channel::DmaDomain::default(),
             doorbell: Arc::new(core::sync::atomic::AtomicBool::new(false)),
+            bound: core::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -406,6 +410,15 @@ impl Server {
     /// Its running incarnation's process id.
     pub fn pid(&self) -> Option<Pid> {
         self.lives.lock().pid
+    }
+
+    /// Rings its doorbell: its process's `ipc_receive` returns (a spurious
+    /// wakeup if nothing came: it looks and sleeps again).
+    pub fn ring(&self) {
+        self.doorbell.store(true, core::sync::atomic::Ordering::Release);
+        if let Some(pid) = self.pid() {
+            wakeup(irq::server_chan(pid));
+        }
     }
 
     /// The incarnation `pid` registered its service (whenever: a start

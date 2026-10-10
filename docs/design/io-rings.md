@@ -147,6 +147,7 @@ rings and the shared area are read and write. The positions start at 0.
 | `chan_watch(channel, value)` (1073) | arms the service's doorbell watch on the submission ring: if its `tail` still holds `value` (else `EAGAIN`), the client's next doorbell or its end going makes `ipc_receive` return `Event::Doorbell` (step 3) |
 | `set_copy_fixup(insn, fixup)` (1074) | a fault of the program's copy instruction on granted memory resumes at `fixup` instead of killing it (`oxrt::copy`, step 3) |
 | `grant_dma_pages(channel, id, first, count, &out)` (1075) | `grant_dma` for up to 512 pages in one call (step 3) |
+| `chan_predecessors() -> n` (1086) | how many channels earlier processes of the caller's server attached whose clients are still there; only falls, each fall rings the doorbell ("Restarts of diskfs") |
 
 **Attach.** The Linux server has no IPC of its own (only the kernel is an IPC client), so the
 kernel carries the offer: `chan_connect` sends the service a control request, typed by its id
@@ -255,7 +256,8 @@ answers the offer only after it served the channel.
 | `READ` / `WRITE` | inode, file offset, a grant range (at most 1 MiB; `READ` needs a writable grant) | bytes (a read is short at the end of the file), v0 = file size |
 | `FLUSH` | - | 0: every write completed before it is durable |
 | `STAT`, `STATFS` | inode / - | 0, the values packed in v0..v3 (`fsring::Stat` with the inode's generation, `Usage`) |
-| `LOOKUP`, `CREATE`, `UNLINK`, `RENAME` | directory, names in a grant (a symlink's target or the new name right after the first name) | v0 = the inode found or made (v1 = its mode, v2 = its generation), or the one whose last link went |
+| `ROOT` | - | the root directory as `LOOKUP` returns an inode |
+| `LOOKUP`, `CREATE`, `UNLINK`, `RENAME` | directory, names in a grant (a symlink's target or the new name right after the first name) | v0 = the inode found or made (v1 = its mode, v2 = its generation), or the one whose last link went and that someone holds (v1 = its generation; 0: none, it was freed at once) |
 | `TRUNCATE`, `SETPERM` | inode and the new size / permissions | 0 |
 | `RELEASE` | inode | 0: the client holds it no more (see "Holds" below) |
 | `READDIR`, `READLINK` | a result buffer in a writable grant (`READDIR` with a cursor) | bytes, v0 = the next cursor |
@@ -302,10 +304,40 @@ and spends the promise. Promising again what the same channel promised costs not
 ends when its blocks are written, truncated away or freed with the file, or when its channel
 goes, and `STATFS` counts promised blocks as used. A `PROMISE` runs at once (no barrier).
 
-**Holds.** A client holds every inode it named or got back from `LOOKUP`, `CREATE`, `UNLINK`
-or `RENAME`, until its `RELEASE` or the end of its channel. An inode whose last link went is
-freed when no client holds it, so one client never frees what another uses. (Until step 4 the
-kernel's IPC client held inodes too; it is gone.)
+**Handles.** A request names an inode by its number and its ext2 generation (`fsring::Node`,
+in `object`): a handle whose inode is gone or is another file of the number now completes with
+`ESTALE` and holds nothing, so no request acts on another file than the one meant (after a
+restart of diskfs, say). The root's handle comes from `ROOT`.
+
+**Holds.** A client holds every inode it named (by a valid handle) or got back from `ROOT`,
+`LOOKUP`, `CREATE`, `UNLINK` or `RENAME`, until its `RELEASE` or the end of its channel. An
+inode whose last link went is freed when no client holds it, so one client never frees what
+another uses; while held it is on ext2's orphan list (written in an order a crash cannot hurt:
+the name's removal, the inode, the list's head; off the list before it is freed), so a crash
+leaves nothing allocated for good: the first diskfs after boot frees the list. A commit that
+fails is retried alone before anything else changes, and a sequence of these steps ends at its
+first failed commit (the inode then waits, held, for its release; never freed out of order); a
+free that fails half way leaves the cache untrustworthy, and diskfs exits to be restarted from
+the disk's state (`ext2fs`, "Failed commits"). New inodes get random generations. (Until step 4
+the kernel's IPC client held inodes too; it is gone.)
+
+**Restarts of diskfs.** Holds are diskfs's memory, but the clients' open files outlive a diskfs
+that dies. The kernel binds a channel to the server whose process attached it until its client
+end goes or the service detaches it, also after that process died; a restarted diskfs asks how
+many such channels of its predecessors still have clients (`chan_predecessors`, 1086) and,
+while there are any, frees nothing they might hold: no inode on the orphan list at its start,
+no inode that existed then whose last link goes (it frees those it created as usual). The
+kernel tells each such client that the service died (`EVENT_SERVICE_GONE`); the Linux server
+connects again at once, names every inode it holds (`STAT` by handle; unlinked open files
+included), and only then closes its old channel. Each old channel that goes rings diskfs's
+doorbell; at 0 diskfs frees what is on the orphan list and no channel holds. So an open,
+unlinked file reads and writes on across a restart and goes with its last close. The kernel
+knows exactly which clients to wait for, and they come back in milliseconds; the wait is
+still bounded (`RESTART_GRACE`, 5 s): a client that has not named what it held by then (it
+hangs, or is hostile) loses it as if it were gone, and its handles are stale (`ESTALE`), never
+another file's. What a client holds is bounded by the filesystem (a bit per inode and channel),
+only inodes in use with the generation the handle names are held, and deciding whether an
+inode may be freed looks at each channel's bit (at most 16); the orphan list is walked once.
 
 **Room.** A request waits in the submission ring while its channel's completion ring has no
 room for its completion; diskfs then sleeps on that ring's doorbell instead of polling, and a
@@ -432,9 +464,10 @@ pages and dirty marks the kernel keeps and whose data the server moves:
   flight with `EIO`; no wait of the server on diskfs or on other programs is unbounded (fills
   that write back for memory, grant scans and truncations waiting for pinned pages are capped
   too); the next request connects a new channel (diskfs is
-  started again), the inodes in use are named again to hold them before anyone uses the new
-  channel (an unlinked one, one that is gone, and one whose number now has another type or
-  ext2 generation are stale: `EIO`; `STAT` reports the generation), dirty pages whose write failed are written on the new channel, and a write that
+  started again; also at once when the kernel says diskfs died, `EVENT_SERVICE_GONE`), the
+  inodes in use are named again to hold them before anyone uses the new channel (unlinked open
+  files too: the new diskfs kept them, "Restarts of diskfs"; one that is gone or another file
+  now, `ESTALE`, is stale: `EIO`), dirty pages whose write failed are written on the new channel, and a write that
   completed but was not flushed before diskfs died makes the next `fsync` of its file report
   `EIO`.
 - **Metadata** (lookup, create, unlink, rename, stat, readdir, readlink) goes through the same
@@ -459,7 +492,8 @@ procfs's client (`fs/remote.rs`, IPC messages in the `fsproto` format, the serve
 the files through the kernel's inode bridge); both are gone, with the kernel's static
 `/proc` of the early boot and its mount table.
 
-- **Read-only and stateless.** procfs answers `LOOKUP` (v0 the inode, v1 its mode), `STAT`,
+- **Read-only and stateless.** procfs answers `LOOKUP` (v0 the inode, v1 its mode; every
+  inode's generation is 0, its two roots are known by number: `ROOT` is `EINVAL`), `STAT`,
   `READDIR` (cursor = entry index), `READ`, `STATFS`, `FORGET`, and `RELEASE`/`FLUSH` with
   nothing to do; whatever would change a file is `EROFS` (the server refuses those itself,
   with Linux's errors, before asking). Inode numbers name what a file is (below 1024): there
@@ -520,14 +554,15 @@ short buffer) and removed; writes aligned, unaligned within existing blocks, wit
 and past the end leaving a hole, a `FLUSH`, the file read back against a model, truncated
 shorter and longer, renamed, permissions changed; malformed requests (`ENOSYS`, stray flags
 and arguments, `EBADF`, ranges beyond a grant, over 1 MiB, `EACCES` for a read-only grant,
-`ENOENT` for inodes not in use, `EINVAL`, `ENAMETOOLONG`, `ENOTDIR`, `EEXIST`) with the channel
+`ESTALE` for handles of inodes not in use or of another generation, `EINVAL`, `ENAMETOOLONG`, `ENOTDIR`, `EEXIST`) with the channel
 working afterwards; 24 writes and then 24 reads in flight, completions matched by tag; a grant
 revoked under diskfs (`REVOKE_DRAINING`, then `EFAULT` for a copy into it, diskfs alive,
 `FORGET` freeing the id, `FORGET` before `revoke` not draining) and a client closing its
 channel with 16 reads in flight (diskfs serves the next one); the range of a revoked grant
 given to no other grant (a copy to it `EFAULT`, the next grant untouched); an unlinked inode
 one channel released still working for another that holds it, freed when that one releases
-it or goes; a write stalled behind an overlapping one while another channel's long reads keep
+it or goes (its handle `ESTALE` then); a raw client of a killed diskfs that never names its
+unlinked inode again losing it after the next diskfs's grace, the handle stale; a write stalled behind an overlapping one while another channel's long reads keep
 the operation slots busy; requests waiting for room in their completion ring with diskfs using
 no CPU meanwhile (its ticks in `/proc` over 500 ms), all completing once the client makes room.
 The file the second scenario leaves is read through `/data` (the server's page cache, over its
