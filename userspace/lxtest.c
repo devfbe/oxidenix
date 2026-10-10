@@ -62,7 +62,7 @@
 #define TEST_SLEEP_LOCKED 1521
 #define TEST_HOST 1522
 #define TEST_FUTEX_WATCH 1524
-#define TEST_HEAP_STATS 1525
+#define TEST_HEAP_STATS 1526
 
 static int failures;
 
