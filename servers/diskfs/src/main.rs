@@ -64,8 +64,22 @@ fn main(args: Vec<&'static str>) -> i32 {
             return 1;
         }
     };
+    // What a crash left on the orphan list goes now; what a diskfs that died left there
+    // waits for its clients (`service`, "Restarts").
+    // (Not known: assumed, the grace bounds the wait.)
+    let inherited = oxrt::chan_predecessors().unwrap_or(1);
+    if inherited == 0 {
+        match fs.recover_orphans(|_| false) {
+            Ok(0) => {}
+            Ok(n) => println!("diskfs: freed {} orphaned inodes", n),
+            Err(e) => println!("diskfs: cannot free the orphaned inodes (errno {})", e),
+        }
+    } else {
+        let orphans = fs.orphans().len();
+        println!("diskfs: {} clients of the diskfs before; keeping {} orphaned inodes for them", inherited, orphans);
+    }
     let inodes = fs.usage().3;
-    let mut rings = match service::Service::new(fs.device(), fs.block_size(), inodes) {
+    let mut rings = match service::Service::new(fs.device(), fs.block_size(), inodes, inherited > 0) {
         Ok(rings) => rings,
         Err(e) => {
             println!("diskfs: cannot serve this disk: {}", e);
@@ -89,7 +103,7 @@ fn main(args: Vec<&'static str>) -> i32 {
     loop {
         // Sleep only with nothing to do and every doorbell armed.
         let sleep = !rings.busy() && rings.prepare_sleep();
-        let event = oxrt::ipc_receive(&mut request, if sleep { None } else { Some(0) });
+        let event = oxrt::ipc_receive(&mut request, if sleep { rings.sleep_limit() } else { Some(0) });
         rings.awake();
         match event {
             // No protocol besides the rings.
@@ -100,8 +114,18 @@ fn main(args: Vec<&'static str>) -> i32 {
                 let status = rings.offer(&request[..len]);
                 let _ = oxrt::ipc_reply(id, &status.to_le_bytes());
             }
+            // A doorbell (also when a predecessor's channel went), or the end
+            // of the predecessors' grace.
+            Ok(oxrt::Event::Doorbell) => rings.settle(&mut fs, true),
+            Ok(oxrt::Event::Timeout) => rings.settle(&mut fs, false),
             _ => {}
         }
         rings.run(&mut fs);
+        if fs.broken() {
+            // The cache holds what must never reach the disk: the kernel starts diskfs
+            // again, which goes on from the disk's state (its clients name what they hold).
+            println!("diskfs: an operation failed part way through a free; starting again");
+            return 1;
+        }
     }
 }

@@ -359,4 +359,10 @@ impl ext2fs::Device for VirtioBlk {
     fn now(&self) -> u32 {
         oxrt::now() as u32
     }
+
+    fn random(&mut self) -> u32 {
+        let mut b = [0u8; 4];
+        oxrt::getrandom(&mut b);
+        u32::from_le_bytes(b)
+    }
 }

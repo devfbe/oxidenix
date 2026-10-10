@@ -276,6 +276,11 @@ pub const EVENT_CONSOLE_LOST: u64 = 21;
 /// let go of its address space. The room for the
 /// event was reserved when the thread was made, so none is ever lost.
 pub const EVENT_THREAD_EXIT: u64 = 23;
+/// A service one of the instance's channels was attached to died (`a`: the
+/// channel): what it held for the instance waits for the instance to
+/// connect again and name it (diskfs's holds: `fsring`, "Holds"); the
+/// instance does so now rather than at its next use of the service.
+pub const EVENT_SERVICE_GONE: u64 = 24;
 
 /// A server thread starts with its `State` in `rdi`, its role in `rsi`,
 /// and, serving a program, the `cookie` its creator gave `thread_create`
@@ -337,7 +342,8 @@ pub const SYS_SERVER_FUTEX_WAIT: u64 = 1024;
 pub const SYS_SERVER_FUTEX_WAKE: u64 = 1025;
 pub const FUTEX_INTERRUPTIBLE: u64 = 1;
 pub const FUTEX_LOCK: u64 = 2;
-/// A sleeping lock's wait (the server's `SleepMutex`, `SleepRwLock`): ends
+/// A sleeping lock's wait (the server's `SleepMutex`, `SleepRwLock`; on the
+/// server's own memory only, EINVAL on an object's word): ends
 /// (EINTR) when the waiter dies, and when the instance broke (its holder
 /// may be the server thread that failed: the instance's service threads,
 /// which never die, must not wait for it; they give up what they wanted it
@@ -924,3 +930,8 @@ pub const TEST_SLEEP_LOCKED: u64 = 1521;
 /// it: lxtest checks the tree without it. Test mode only; a program's call
 /// is the server's to pass on.
 pub const TEST_HOST: u64 = 1522;
+/// `(name, len)`: kills the running process of the kernel's server `name`
+/// (ESRCH if none), as a crash would: the restart policy brings it back at
+/// its next use. Test mode only (ENOSYS otherwise); a program's call with a
+/// C string `name` is the server's to pass on (datatest: diskfs's orphans).
+pub const TEST_KILL_SERVER: u64 = 1523;

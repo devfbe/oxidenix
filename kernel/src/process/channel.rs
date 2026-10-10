@@ -36,6 +36,16 @@
 //! ring memory itself (it is plain memory, theirs to unmap: the client by
 //! closing its handle, the service by `chan_detach`).
 //!
+//! **Successors.** What a service gave a client (diskfs: the inodes the
+//! client holds, `fsring` "Holds") may outlive the service's process: a
+//! channel stays bound to the server whose process attached it until its
+//! client end goes or the service detaches it (`Inner::bound`), also after
+//! that process died. A restarted server asks how many channels its earlier
+//! processes served whose clients are still there (`predecessors`): what
+//! they were given waits for them. Each such client hears of the death
+//! (`EVENT_SERVICE_GONE`), connects again and closes the old channel, and
+//! each one that goes rings the server's doorbell, so it looks again.
+//!
 //! A peer is hostile: the kernel never reads the rings; it validates every
 //! grant id, offset and length a service passes; a grant id is reused only
 //! once the old grant is fully gone. Teardowns triggered where the kernel
@@ -122,6 +132,13 @@ struct Inner {
     offer_request: Option<u64>,
     client_gone: bool,
     service_gone: bool,
+    /// The server whose process attached the channel, from the attach
+    /// until the client end goes or the service detaches (also after that
+    /// process died: see "Successors"); counted in its `Server::bound`.
+    /// Changed with `CHANNELS` held (`predecessors` counts under it).
+    bound: Option<Arc<Server>>,
+    /// The instance whose end it is (told when the service dies).
+    client: Weak<super::linux::Instance>,
     /// Grants by id: live ones and revoked ones still draining.
     grants: Grants,
     /// Grants being made (`grant` reserves a slot before it pins).
@@ -289,7 +306,18 @@ impl Channel {
         // Positions start at 0 (the memory is zeroed).
         unsafe { (memory::phys_to_virt(header.start_address().as_u64()) as *mut Header).write(Header::new(&layout)) };
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        let inner = Inner { offered: None, service: None, offer_request: None, client_gone: false, service_gone: false, grants: Grants::default(), reserved: 0, pages: 0 };
+        let inner = Inner {
+            offered: None,
+            service: None,
+            offer_request: None,
+            client_gone: false,
+            service_gone: false,
+            bound: None,
+            client: Weak::new(),
+            grants: Grants::default(),
+            reserved: 0,
+            pages: 0,
+        };
         // From here on, dropping the channel releases both pages.
         let channel = Channel { id, layout, memory, header, doorbell, inner: IrqSpinLock::new(inner) };
         let channel = Arc::try_new(channel).map_err(|_| ENOMEM)?;
@@ -583,15 +611,24 @@ impl Channel {
     /// The client's end is gone: every grant is revoked (draining ones
     /// stay until the service lets go), the service sees `CLIENT_GONE`.
     fn client_gone(&self) {
-        let (grants, service) = {
+        let (grants, service, bound) = {
+            let _channels = CHANNELS.lock();
             let mut inner = self.inner.lock();
             if inner.client_gone {
                 return;
             }
             inner.client_gone = true;
             inner.offered = None;
-            (inner.grants.iter().map(|(id, g)| (id, g.clone())).collect::<Vec<_>>(), inner.service.clone())
+            let bound = inner.bound.take();
+            if let Some(server) = &bound {
+                server.bound.fetch_sub(1, Ordering::Relaxed);
+            }
+            (inner.grants.iter().map(|(id, g)| (id, g.clone())).collect::<Vec<_>>(), inner.service.clone(), bound)
         };
+        // Its server's process looks again at what waits for its predecessors' clients.
+        if let Some(server) = bound {
+            server.ring();
+        }
         for (id, grant) in grants {
             let mut st = grant.state.lock();
             let draining = !st.revoked && self.retire(&grant, &mut st, service.as_ref());
@@ -626,7 +663,7 @@ impl Channel {
         // The service ends in the registry and in the channel at once (see
         // `CHANNELS`); the registry's reference is dropped at the end (the
         // caller holds another one).
-        let (grants, service, registered) = {
+        let (grants, service, registered, client) = {
             let mut channels = CHANNELS.lock();
             let mut inner = self.inner.lock();
             if inner.service_gone {
@@ -634,11 +671,19 @@ impl Channel {
             }
             inner.service_gone = true;
             inner.offered = None;
+            // A service that lets go of the channel lets go of what it gave the client; one
+            // that died leaves it to its successor.
+            if !died {
+                if let Some(server) = inner.bound.take() {
+                    server.bound.fetch_sub(1, Ordering::Relaxed);
+                }
+            }
+            let client = (died && !inner.client_gone).then(|| inner.client.clone());
             let grants = core::mem::take(&mut inner.grants);
             // Exactly their pages: grants being made release their own.
             inner.pages -= grants.iter().map(|(_, g)| g.frames.len() as u64).sum::<u64>();
             let registered = entry(&mut channels, self.id).and_then(|e| e.service.take());
-            (grants, inner.service.take(), registered)
+            (grants, inner.service.take(), registered, client)
         };
         let mm = service.as_ref().and_then(|s| s.mm.upgrade());
         for grant in grants.slots.into_iter().flatten() {
@@ -664,6 +709,11 @@ impl Channel {
         }
         self.set_gone(SERVICE_GONE);
         drop(registered);
+        // The client connects again (and names what it holds) without waiting for its next
+        // use of the service (after `SERVICE_GONE`: it sees the channel dead).
+        if let Some(instance) = client.and_then(|c| c.upgrade()) {
+            instance.queue_event(restricted::Event { kind: restricted::EVENT_SERVICE_GONE, a: self.id, b: 0 });
+        }
     }
 }
 
@@ -697,6 +747,7 @@ impl ClientEnd {
     /// The end of `channel` mapped at `addr` of `instance`'s region; if it
     /// cannot be made, the channel's client end goes now.
     pub fn new(channel: Arc<Channel>, instance: Weak<super::linux::Instance>, addr: u64) -> Result<ClientEnd, i64> {
+        channel.inner.lock().client = instance.clone();
         let work = Work::ClientGone { channel: channel.clone(), instance, addr };
         match Box::<WorkNode>::try_new_uninit() {
             Ok(node) => Ok(ClientEnd { channel, teardown: Some(Box::write(node, WorkNode { work, next: None })) }),
@@ -785,6 +836,8 @@ pub fn attach(id: u64) -> Result<i64, i64> {
         if inner.client_gone || inner.service.is_some() || inner.offered != Some(to) {
             Err(if inner.client_gone { EPIPE } else { ECONNREFUSED })
         } else {
+            server.bound.fetch_add(1, Ordering::Relaxed);
+            inner.bound = Some(server.clone());
             inner.service = Some(ServiceEnd { mm: Arc::downgrade(&mm), server });
             if let Some(entry) = entry(&mut channels, id) {
                 entry.service = Some(Registered { pid: me, channel: channel.clone(), exit: Some(exit) });
@@ -906,6 +959,23 @@ pub fn watch(id: u64, value: u64) -> Result<i64, i64> {
     let value = u32::try_from(value).map_err(|_| EINVAL)?;
     let offset = (channel.layout.submission + ring::TAIL_OFFSET) as u64;
     super::futex::object_watch(&channel.memory, offset, channel.submission_tail(), value, &service.server.doorbell, super::current_pid())
+}
+
+/// chan_predecessors() -> n: how many channels the earlier processes of the
+/// caller's server served whose clients are still there (see "Successors").
+/// The count only falls (the caller's own channels are not counted); each
+/// fall rings the caller's doorbell (`ipc_receive`).
+pub fn predecessors() -> Result<i64, i64> {
+    let me = super::current_pid();
+    let server = super::with_current(|p| p.server.clone()).ok_or(EPERM)?;
+    // (Every change of `bound` happens with the registry held: one snapshot.)
+    let channels = CHANNELS.lock();
+    let mine = channels
+        .iter()
+        .filter_map(|e| e.service.as_ref())
+        .filter(|r| r.pid == me && r.channel.inner.lock().bound.as_ref().is_some_and(|b| Arc::ptr_eq(b, &server)))
+        .count() as u64;
+    Ok(server.bound.load(Ordering::Relaxed).saturating_sub(mine) as i64)
 }
 
 /// grant_dma_unmap(channel, grant): the service's devices are done with

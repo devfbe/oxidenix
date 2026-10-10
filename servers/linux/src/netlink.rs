@@ -81,8 +81,11 @@ const DEFAULT_BUF: u32 = 212_992;
 /// What a queued datagram of `len` bytes counts against the receive buffer: its bytes and
 /// what it takes besides (as Linux's skb truesize).
 fn cost(len: usize) -> usize {
-    len + 64
+    len + DGRAM_OVERHEAD
 }
+
+/// What a queued datagram takes besides its bytes (`cost`).
+const DGRAM_OVERHEAD: usize = 64;
 const MAX_BUF: u32 = 212_992;
 const MIN_RCVBUF: u32 = 2304;
 const MIN_SNDBUF: u32 = 4608;
@@ -349,7 +352,7 @@ impl NetlinkSocket {
             {
                 let mut st = self.state.lock();
                 let (cap_ack, dumping, room) = (st.options & (1 << NETLINK_CAP_ACK) != 0, st.dump.is_some(), (st.rcvbuf as usize).saturating_sub(st.queued));
-                let (replies, overrun) = netlink::answer(&data, port, &interfaces, cap_ack, dumping, room);
+                let (replies, overrun) = netlink::answer(&data, port, &interfaces, cap_ack, dumping, room, DGRAM_OVERHEAD);
                 let mut added = false;
                 for r in replies {
                     match r {
