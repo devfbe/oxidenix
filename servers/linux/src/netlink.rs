@@ -78,6 +78,11 @@ const POLLERR: i16 = 0x8;
 /// FORCE options here, which Linux lets privileged callers take beyond),
 /// and the least SO_RCVBUF/SO_SNDBUF make of a request.
 const DEFAULT_BUF: u32 = 212_992;
+/// What a queued datagram of `len` bytes counts against the receive buffer: its bytes and
+/// what it takes besides (as Linux's skb truesize).
+fn cost(len: usize) -> usize {
+    len + 64
+}
 const MAX_BUF: u32 = 212_992;
 const MIN_RCVBUF: u32 = 2304;
 const MIN_SNDBUF: u32 = 4608;
@@ -238,18 +243,19 @@ impl NetlinkSocket {
 
     /// Queues datagrams from port `from`; what does not fit the receive
     /// buffer is dropped, and the next receive fails with ENOBUFS (unless
-    /// NETLINK_NO_ENOBUFS).
+    /// NETLINK_NO_ENOBUFS). A datagram counts with what it takes besides its
+    /// bytes (`cost`), so even empty ones fill the buffer.
     fn deliver(&self, from: u32, datagrams: Vec<Vec<u8>>) {
         if datagrams.is_empty() {
             return;
         }
         let mut st = self.state.lock();
         for data in datagrams {
-            if st.queued + data.len() > st.rcvbuf as usize {
+            if st.queued + cost(data.len()) > st.rcvbuf as usize || st.queue.try_reserve(1).is_err() {
                 Self::overrun(&mut st);
                 continue;
             }
-            st.queued += data.len();
+            st.queued += cost(data.len());
             st.queue.push_back(Datagram { from, data });
         }
         self.changed(&mut st, true);
@@ -273,7 +279,11 @@ impl NetlinkSocket {
             let Some(dump) = st.dump.as_mut() else { break };
             match dump.next(interfaces) {
                 Some(data) => {
-                    st.queued += data.len();
+                    if st.queue.try_reserve(1).is_err() {
+                        Self::overrun(&mut st);
+                        break;
+                    }
+                    st.queued += cost(data.len());
                     st.queue.push_back(Datagram { from: 0, data });
                     added = true;
                 }
@@ -344,7 +354,11 @@ impl NetlinkSocket {
                 for r in replies {
                     match r {
                         netlink::Reply::Datagram(d) => {
-                            st.queued += d.len();
+                            if st.queue.try_reserve(1).is_err() {
+                                Self::overrun(&mut st);
+                                continue;
+                            }
+                            st.queued += cost(d.len());
                             st.queue.push_back(Datagram { from: 0, data: d });
                             added = true;
                         }
@@ -386,7 +400,7 @@ impl NetlinkSocket {
                         break (Datagram { from: d.from, data: d.data.clone() }, false);
                     }
                 } else if let Some(d) = st.queue.pop_front() {
-                    st.queued -= d.data.len();
+                    st.queued -= cost(d.data.len());
                     self.changed(&mut st, false);
                     let more = st.dump.is_some() && st.queued <= st.rcvbuf as usize / 2;
                     break (d, more);

@@ -14,6 +14,7 @@
 
 #![no_std]
 #![no_main]
+#![feature(allocator_ext)]
 
 extern crate alloc;
 
