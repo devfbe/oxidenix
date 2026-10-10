@@ -1930,7 +1930,10 @@ impl PageCache {
                     // `reclaim_file_pages` wants it.)
                     // A space that is busy keeps its entries: their pages
                     // stay (still shared) and the next look tries again.
-                    self.for_each_mapper_reclaim(|mm| {
+                    // (A walk cut short, no slot left for a reference:
+                    // the spaces not visited keep their entries, so
+                    // their pages stay, shared.)
+                    let _ = self.for_each_mapper_reclaim(|mm| {
                         if let Some(mut space) = mm.try_lock() {
                             space.reclaim_file_pages(self, &mapped, &mut young, force);
                         }
@@ -2099,24 +2102,35 @@ impl PageCache {
     /// overtakes them). It goes on after the sequence number it visited
     /// last, not at an index, so dead entries may be removed meanwhile
     /// (by registrations, by other walks) without making it skip one.
-    /// `for_each_mapper` for reclaim: an address space whose last
-    /// reference it held is not dropped here (`defer_drop`).
-    fn for_each_mapper_reclaim(&self, mut f: impl FnMut(&Mm)) {
+    /// `for_each_mapper` for reclaim: the references it takes go to the
+    /// background reclaimer (`defer_drop`), never dropped here; when no
+    /// slot is left for one, the walk ends (false: not every mapper was
+    /// visited).
+    fn for_each_mapper_reclaim(&self, mut f: impl FnMut(&Mm)) -> bool {
         let mut last = None;
         loop {
+            if !defer_slot() {
+                return false;
+            }
             let entry = {
                 let mappers = self.mappers.lock();
                 let i = last.map_or(0, |seq| mappers.list.partition_point(|&(s, _)| s <= seq));
                 mappers.list.get(i).map(|(seq, mm)| (*seq, mm.upgrade()))
             };
-            let Some((seq, mm)) = entry else { break };
+            let Some((seq, mm)) = entry else {
+                defer_unslot();
+                break;
+            };
             last = Some(seq);
-            if let Some(mm) = mm {
-                f(&mm);
-                defer_drop(Deferred::Space(mm));
+            match mm {
+                Some(mm) => {
+                    f(&mm);
+                    defer_drop(Deferred::Space(mm));
+                }
+                None => defer_unslot(),
             }
         }
-        self.mappers.lock().compact();
+        true
     }
 
     fn for_each_mapper(&self, mut f: impl FnMut(&Mm)) {
@@ -2241,52 +2255,60 @@ fn ask_pagers(pages: u64) {
     }
 }
 
-/// What reclaim held the last reference of: dropping it runs an address
+/// A reference reclaim took: dropping it may be the last drop, an address
 /// space's or a cache's teardown (`AddressSpace::drop` tells the Linux
-/// server's instance, `PageCache::drop` frees frames), which must not run
-/// within an allocation that reclaimed (its caller may hold any lock).
+/// server's instance and futexes, `PageCache::drop` frees frames), which
+/// must not run within an allocation that reclaimed (its caller may hold
+/// any lock). So reclaim never drops one: it hands each to the background
+/// reclaimer, which drops it holding no lock (the `Arc` itself, so the
+/// object stays where it is until then). Held only to be dropped.
+#[allow(dead_code)]
 enum Deferred {
     Space(Arc<Mm>),
     Cache(Arc<PageCache>),
 }
 
-/// A teardown left for later: the value whose last reference went (held
-/// only to be dropped).
-#[allow(dead_code)]
-enum Owned {
-    Space(Mm),
-    Cache(PageCache),
-}
+/// How many references may wait for the background reclaimer.
+const DEFERRED_MAX: usize = 256;
 
-/// Teardowns left for the background reclaimer (`drop_deferred`).
-static DEFERRED: IrqSpinLock<Vec<Owned>> = IrqSpinLock::new(Vec::new());
+/// The references left for the background reclaimer (`drop_deferred`), in
+/// a fixed array (no allocation), and the slots taken (`defer_slot`): a
+/// slot is taken before the reference, so handing it over cannot fail.
+static DEFERRED: IrqSpinLock<heapless::Vec<Deferred, DEFERRED_MAX>> = IrqSpinLock::new(heapless::Vec::new());
+static DEFERRED_SLOTS: AtomicUsize = AtomicUsize::new(0);
 
-/// Lets go of reclaim's reference `d`; if it was the last (atomically, as
-/// `Arc::into_inner` decides), the teardown is left to the background
-/// reclaimer (done here only if the list has no room).
-fn defer_drop(d: Deferred) {
-    let owned = match d {
-        Deferred::Space(mm) => Arc::into_inner(mm).map(Owned::Space),
-        Deferred::Cache(cache) => Arc::into_inner(cache).map(Owned::Cache),
-    };
-    let Some(d) = owned else { return };
-    let mut list = DEFERRED.lock();
-    if list.try_reserve(1).is_ok() {
-        list.push(d);
-        drop(list);
+/// Takes a slot for a reference reclaim is about to take; false if all are
+/// taken (the reclaim stops its walk for this round: the background
+/// reclaimer, woken, frees them).
+fn defer_slot() -> bool {
+    let taken = DEFERRED_SLOTS.try_update(Ordering::AcqRel, Ordering::Acquire, |n| (n < DEFERRED_MAX).then_some(n + 1)).is_ok();
+    if !taken {
         memory::wake_reclaimer();
-        return;
     }
-    drop(list);
-    drop(d);
+    taken
 }
 
-/// Runs the teardowns reclaim left (the background reclaimer, which holds
-/// no lock).
+/// Gives back a slot taken for a reference that never came (the object
+/// was gone).
+fn defer_unslot() {
+    DEFERRED_SLOTS.fetch_sub(1, Ordering::AcqRel);
+}
+
+/// Hands reclaim's reference `d` (its slot taken) to the background
+/// reclaimer.
+fn defer_drop(d: Deferred) {
+    let pushed = DEFERRED.lock().push(d);
+    debug_assert!(pushed.is_ok(), "a deferred reference without its slot");
+    memory::wake_reclaimer();
+}
+
+/// Drops the references reclaim left (the background reclaimer, which
+/// holds no lock).
 pub fn drop_deferred() {
     loop {
         let Some(d) = DEFERRED.lock().pop() else { return };
         drop(d);
+        DEFERRED_SLOTS.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -2310,17 +2332,23 @@ fn reclaim(want: u64, force: bool) -> u64 {
         let mut budget = RECLAIM_SCAN.max(want as usize * 16);
         let caches = CACHES.lock().len();
         for _ in 0..caches {
+            // (A slot for the reference first: `defer_drop`.)
+            if !defer_slot() {
+                return freed;
+            }
             let cache = {
                 let list = CACHES.lock();
                 if list.is_empty() {
+                    defer_unslot();
                     break;
                 }
                 list[NEXT.fetch_add(1, Ordering::Relaxed) % list.len()].upgrade()
             };
+            if cache.is_none() {
+                defer_unslot();
+            }
             if let Some(cache) = cache {
                 freed += cache.shrink(want - freed, unmap, force, &mut budget);
-                // (Its last reference, if this was it, goes where no
-                // allocation waits on reclaim: `defer_drop`.)
                 defer_drop(Deferred::Cache(cache));
             }
             if freed >= want {

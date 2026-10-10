@@ -117,6 +117,14 @@ impl GrowingHeap {
             let _ = COMMIT_LIMIT.try_update(core::sync::atomic::Ordering::Relaxed, core::sync::atomic::Ordering::Relaxed, |l| {
                 Some(l.saturating_sub(want / PAGE))
             });
+            // The heap took from the free frames (the kernel's reserve if
+            // need be): below the low watermark, the background reclaimer
+            // makes up for it. Not woken from here (the frames and the
+            // heap are locked, and any lock may be held around an
+            // allocation): the next timer tick does (`reclaim_tick`).
+            if !frames.user_may_take(low_watermark(frames)) {
+                RECLAIM_KICK.store(true, core::sync::atomic::Ordering::Release);
+            }
             true
         }
     }
@@ -473,6 +481,18 @@ fn reclaimer_chan() -> usize {
     &RECLAIMER_WANTED as *const _ as usize
 }
 
+/// A wakeup of the background reclaimer asked for where it could not be
+/// made (the kernel heap's growth): the timer tick makes it.
+static RECLAIM_KICK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Called by the timer tick (interrupt context): makes a wakeup asked for
+/// by the kernel heap's growth.
+pub fn reclaim_tick() {
+    if RECLAIM_KICK.load(core::sync::atomic::Ordering::Relaxed) && RECLAIM_KICK.swap(false, core::sync::atomic::Ordering::AcqRel) {
+        wake_reclaimer();
+    }
+}
+
 /// Wakes the background reclaimer (cheap when it is awake already).
 pub fn wake_reclaimer() {
     if !RECLAIMER_WANTED.swap(true, core::sync::atomic::Ordering::AcqRel) {
@@ -497,10 +517,15 @@ fn reclaimer() -> ! {
             continue;
         }
         drop(wait);
-        // Up to the high watermark; after a fruitless round also pages used
-        // lately; a little rest when even that drops nothing (write-back,
-        // busy address spaces), then it looks again while still low.
-        let mut force = false;
+        // Up to the high watermark, giving pages used lately their second
+        // chance. Only below the low watermark, and only after a whole
+        // sweep of the cache without it dropped anything, it takes those
+        // too (`force`); when even that drops nothing (write-back, busy
+        // address spaces, nothing reclaimable), it rests, longer each time
+        // up to a second (Linux's kswapd_failures), and looks again while
+        // still low. A kick (a deferred reference, a new shortage) ends a
+        // rest at once.
+        let (mut force, mut fruitless, mut failures) = (false, 0u64, 0u32);
         loop {
             crate::fs::cache::drop_deferred();
             let (short, low) = with_frames(|f| {
@@ -512,24 +537,42 @@ fn reclaimer() -> ! {
             }
             let freed = RECLAIM.get().map_or(0, |reclaim| reclaim(RECLAIM_BATCH * 4, force));
             if freed > 0 {
-                force = false;
+                (force, fruitless, failures) = (false, 0, 0);
+                continue;
+            }
+            if !low {
+                // Between the watermarks with nothing to drop unforced:
+                // done for now.
+                break;
+            }
+            fruitless += 1;
+            // Rounds that look at the whole cache (each at most
+            // `fs::cache`'s scan budget, three turns for the second chances).
+            let sweep = 3 * (cached_pages() / RECLAIM_SWEEP_PAGES + 1);
+            if !force && fruitless < sweep {
                 continue;
             }
             if !force {
                 force = true;
                 continue;
             }
-            if !low {
-                // Between the watermarks with nothing to drop: done for now.
-                break;
-            }
             crate::fs::cache::ask_writeback(RECLAIM_BATCH);
-            let deadline = crate::time::now() + RECLAIM_THROTTLE;
-            crate::process::sched::prepare_to_wait(reclaim_chan()).sleep_until(deadline);
-            force = false;
+            let rest = (RECLAIM_THROTTLE << failures.min(4)).min(RECLAIMER_REST_MAX);
+            failures = failures.saturating_add(1);
+            let wait = crate::process::sched::prepare_to_wait(reclaimer_chan());
+            if !RECLAIMER_WANTED.swap(false, core::sync::atomic::Ordering::AcqRel) {
+                wait.sleep_until(crate::time::now() + rest);
+            }
+            (force, fruitless) = (false, 0);
         }
     }
 }
+
+/// The pages one reclaim pass looks at (`fs::cache`'s scan budget), for
+/// the background reclaimer's sweep; the longest it rests when nothing
+/// can be dropped.
+const RECLAIM_SWEEP_PAGES: u64 = 4096;
+const RECLAIMER_REST_MAX: u64 = 1_000_000_000;
 
 /// Makes `n` frames free for user memory above the low watermark,
 /// reclaiming cache pages if they are not (for allocations made with the

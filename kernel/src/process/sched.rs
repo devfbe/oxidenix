@@ -1039,6 +1039,8 @@ pub fn tick(user: bool) -> bool {
     if cpu.index != 0 {
         return over;
     }
+    // (A wakeup of the background reclaimer the kernel heap asked for.)
+    crate::memory::reclaim_tick();
     let now = crate::time::now();
     if now >= NEXT_LOAD.load(Ordering::Relaxed) {
         NEXT_LOAD.store(now + LOAD_INTERVAL, Ordering::Relaxed);
