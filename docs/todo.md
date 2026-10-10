@@ -59,6 +59,19 @@ storage and network (NVMe or USB mass storage via xHCI, a wired NIC) instead of 
 them it boots to the shell on the framebuffer with the PS/2 keyboard and runs from the
 initramfs, without `/data` and without network.
 
+Planned target: the development machine, a Framework Laptop (12th Gen Intel, i5-1240P, UEFI,
+PS/2 keyboard behind the embedded controller, Samsung NVMe, Intel Wi-Fi 7, xHCI USB). Steps:
+
+1. **Live USB stick to the shell** (small, about half a day plus test rounds on the machine):
+   TSC-based delays and APIC timer calibration (no PIT), x2APIC mode, Secure Boot off, the UEFI
+   image written to a stick, boot via the firmware's boot menu. No serial port there, so boot
+   messages must be readable on the framebuffer.
+2. **Node.js on the stick**: put the static `node` into the initramfs (about 100 MB), since
+   there is no `/data` without a disk driver.
+3. **`/data` on the stick** (large): an xHCI driver plus USB mass storage. An NVMe driver would
+   be simpler but would touch the internal SSD; only with a dedicated partition, if at all.
+4. **Network**: a USB Ethernet adapter after the xHCI driver; Wi-Fi is out of reach.
+
 ## Housekeeping
 
 - About 15 finished agent worktrees remain under `.claude/worktrees`.
