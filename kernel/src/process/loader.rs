@@ -182,7 +182,7 @@ fn map_anon(space: &mut AddressSpace, start: u64, end: u64, prot: Prot) -> Resul
 /// rely on it: libuv's process title overwrites the arguments' memory up
 /// to the last one's end).
 fn build_stack(space: &mut AddressSpace, args: &[String], envs: &[String], auxv: &[(u64, u64)]) -> Result<u64, Fault> {
-    space.map_stack(STACK_TOP, STACK_SIZE)?;
+    space.map_stack(STACK_TOP, STACK_SIZE, super::address_space::STACK_LIMIT)?;
     let total: u64 = args.iter().chain(envs).map(|s| s.len() as u64 + 1).sum();
     // The word below the top stays 0, as Linux's end marker.
     let strings = STACK_TOP.checked_sub(8 + total).filter(|&s| s >= STACK_TOP - STACK_SIZE).ok_or(Fault::Oom)?;

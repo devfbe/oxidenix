@@ -159,6 +159,61 @@ static void *futex_waker(void *arg) {
     return NULL;
 }
 
+/* `lxtest stack <MiB>`: uses that much stack, 64 KiB a frame. */
+static int stack_use(int frames) {
+    volatile char frame[64 * 1024];
+    frame[0] = (char)frames;
+    frame[sizeof frame - 1] = (char)frames;
+    if (frames <= 1)
+        return 1;
+    /* (Not a tail call: the frame is live across it.) */
+    return stack_use(frames - 1) + (frame[0] == frame[sizeof frame - 1] ? 0 : 1);
+}
+
+/* Runs `lxtest stack <mib>` in a child with RLIMIT_STACK `limit` (0: as inherited) and
+ * about `env_bytes` of environment (strings of 64 KiB: one string may have 128 KiB); the
+ * child's wait status (exit status 100 + errno if its execve failed). */
+static int stack_child(rlim_t limit, int mib, size_t env_bytes) {
+    pid_t kid = fork();
+    if (kid == 0) {
+        if (limit) {
+            struct rlimit rl = {limit, RLIM_INFINITY};
+            setrlimit(RLIMIT_STACK, &rl);
+        }
+        char arg[16];
+        snprintf(arg, sizeof arg, "%d", mib);
+        char *env[16] = {NULL};
+        for (int i = 0; env_bytes > 0 && i < 15; i++) {
+            size_t n = env_bytes < 65536 ? env_bytes : 65536;
+            env[i] = malloc(n + 1);
+            memset(env[i], 'e', n);
+            env[i][0] = 'A' + i;
+            env[i][1] = '=';
+            env[i][n] = 0;
+            env_bytes -= n;
+        }
+        char *args[] = {"lxtest", "stack", arg, NULL};
+        execve("/proc/self/exe", args, env);
+        _exit(100 + errno);
+    }
+    int status = 0;
+    waitpid(kid, &status, 0);
+    return status;
+}
+
+/* RLIMIT_STACK, as execve takes it: the new stack grows as far as the limit says, and the
+ * arguments and environment take at most a quarter of it. */
+static void stack_checks(void) {
+    int big = stack_child(64 << 20, 24, 0);
+    int dflt = stack_child(0, 24, 0);
+    int fits = stack_child(1 << 20, 0, 200 * 1024);
+    int e2big = stack_child(1 << 20, 0, 300 * 1024);
+    check("RLIMIT_STACK: a 64 MiB limit lets the stack grow to 24 MiB, the default 8 MiB does not",
+          WIFEXITED(big) && WEXITSTATUS(big) == 0 && WIFSIGNALED(dflt) && WTERMSIG(dflt) == SIGSEGV);
+    check("... and a quarter of it bounds the arguments and environment (E2BIG)",
+          WIFEXITED(fits) && WEXITSTATUS(fits) == 0 && WIFEXITED(e2big) && WEXITSTATUS(e2big) == 100 + E2BIG);
+}
+
 static int rq_from, rq_to, rq_done;
 
 static void *requeue_waiter(void *arg) {
@@ -343,6 +398,28 @@ static void r9_checks(void) {
     setrlimit(RLIMIT_CORE, &core_lim);
     check("resource limits are kept per process: set, inherited by fork, another's by prlimit",
           kept && other_set && WIFEXITED(lim_status) && WEXITSTATUS(lim_status) == 0);
+    /* RLIMIT_SIGPENDING bounds the real-time signals queued with their data. */
+    struct rlimit sp_old, sp_two = {2, 4096};
+    sigset_t rt, old_mask;
+    sigemptyset(&rt);
+    sigaddset(&rt, SIGRTMIN);
+    sigprocmask(SIG_BLOCK, &rt, &old_mask);
+    getrlimit(RLIMIT_SIGPENDING, &sp_old);
+    setrlimit(RLIMIT_SIGPENDING, &sp_two);
+    union sigval sv = {.sival_int = 7};
+    int q1 = sigqueue(getpid(), SIGRTMIN, sv) == 0, q2 = sigqueue(getpid(), SIGRTMIN, sv) == 0;
+    errno = 0;
+    int q3 = sigqueue(getpid(), SIGRTMIN, sv) == -1 && errno == EAGAIN;
+    setrlimit(RLIMIT_SIGPENDING, &sp_old);
+    struct timespec no_wait = {0, 0};
+    siginfo_t info;
+    int drained = 0;
+    while (sigtimedwait(&rt, &info, &no_wait) == SIGRTMIN)
+        drained++;
+    sigprocmask(SIG_SETMASK, &old_mask, NULL);
+    check("RLIMIT_SIGPENDING bounds the queued real-time signals (sigqueue beyond EAGAIN)",
+          sp_old.rlim_cur == 4096 && q1 && q2 && q3 && drained == 2);
+    stack_checks();
     errno = 0;
     check("ioperm is EPERM (the tree has no ports)", syscall(SYS_ioperm, 0x80, 1, 1) == -1 && errno == EPERM);
     errno = 0;
@@ -513,6 +590,10 @@ static int server_fail(void) {
 int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "serverfail") == 0) {
         return server_fail();
+    }
+    if (argc > 2 && strcmp(argv[1], "stack") == 0) {
+        int frames = atoi(argv[2]) * 16;
+        return frames > 0 ? stack_use(frames) != 1 : 0;
     }
     if (argc > 1 && strcmp(argv[1], "crashloop") == 0) {
         /* The test service dies at every use: the kernel restarts it with

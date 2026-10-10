@@ -13,6 +13,10 @@
 //!
 //! `ET_EXEC` programs go where they say; `ET_DYN` ones (PIE) at `DYN_BASE`; a `PT_INTERP`
 //! interpreter where the kernel finds room for it. There is no vDSO.
+//!
+//! The caller's soft RLIMIT_STACK (read once, as Linux's bprm->rlim_stack) bounds the new
+//! stack's growth (`stack_room`: the kernel's `MO_GROWSDOWN` limit, an image must end below
+//! it) and the arguments and environment (`args_max`, Linux's bprm_stack_limits).
 
 use crate::fdtable;
 use crate::local;
@@ -48,19 +52,32 @@ const AT_EMPTY_PATH: u64 = 0x1000;
 
 /// Where the stack ends (the word below is the end marker), as the kernel's loader had it.
 const STACK_TOP: u64 = SHARED_BASE - PAGE;
-/// The stack area at start, at least (it grows down on demand, up to 8 MiB).
+/// The stack area at start, at least (it grows down on demand, up to `stack_room`).
 const STACK_SIZE: u64 = 256 * 1024;
-/// The most the stack may grow to (its area is kept free of the program's image).
-const STACK_MAX: u64 = 8 << 20;
+
+/// How far the stack may grow below `STACK_TOP` for a soft RLIMIT_STACK of `limit`: the
+/// limit, at most the room above the kernel's mmap area (`MMAP_TOP`, 16 TiB below: Linux
+/// places its mmap base below a gap of the limit, which is never more than that here, so the
+/// base stays put), a page at least. Its area is kept free of the program's image.
+fn stack_room(limit: u64) -> u64 {
+    (limit & !(PAGE - 1)).clamp(PAGE, STACK_TOP - MMAP_TOP)
+}
+
+/// The most bytes of arguments and environment, their pointers counted, for a soft
+/// RLIMIT_STACK of `limit` (Linux's bprm_stack_limits): a quarter of the limit, at most
+/// three quarters of Linux's default stack, at least ARG_MAX (32 pages).
+fn args_max(limit: u64) -> usize {
+    (limit / 4).min(ARGS_CEILING as u64).max(32 * PAGE) as usize
+}
 /// The lowest address an ET_EXEC program may load at (Linux's default mmap_min_addr).
 const MIN_ADDR: u64 = 64 * 1024;
 /// Where a position-independent program goes (Linux's ELF_ET_DYN_BASE: two thirds of the
 /// address space).
 const DYN_BASE: u64 = (SHARED_BASE / 3 * 2) & !(PAGE - 1);
-/// Linux's limits: one string, and all of them with their pointers (a quarter of the 8 MiB
-/// stack).
+/// Linux's limits: one string, and all of them with their pointers at most (`args_max`:
+/// three quarters of the default 8 MiB stack).
 const MAX_ARG_STRLEN: usize = 32 * 4096;
-const MAX_ARGS_TOTAL: usize = 2 * 1024 * 1024;
+const ARGS_CEILING: usize = 6 * 1024 * 1024;
 /// How deep `#!` interpreters may nest.
 const MAX_SCRIPT_DEPTH: u32 = 4;
 /// The most bytes of ELF and program headers read.
@@ -219,7 +236,7 @@ impl Elf {
     /// Where its segments go: the bias added to their addresses (0 for ET_EXEC, which must
     /// lie above the first 64 KiB, Linux's mmap_min_addr; ET_DYN goes to `DYN_BASE`), checked
     /// before the point of no return (ENOEXEC for an image that does not fit below the stack).
-    fn bias(&self) -> Result<u64, i64> {
+    fn bias(&self, stack: u64) -> Result<u64, i64> {
         let (low, high) = self.span();
         if high <= low {
             return Err(ENOEXEC);
@@ -232,7 +249,7 @@ impl Elf {
             _ => (0, low),
         };
         let end = start.checked_add(high - low).ok_or(ENOEXEC)?;
-        if end > STACK_TOP - STACK_MAX {
+        if end > STACK_TOP - stack {
             return Err(ENOEXEC);
         }
         Ok(bias)
@@ -254,31 +271,36 @@ fn page_up(x: u64) -> u64 {
 }
 
 /// Bytes the execve calls of one process may hold of their arguments and environments at
-/// once (on the server's heap, shared by the tree): one call with Linux's largest (its
-/// arguments and environment, each buffer up to twice what it holds as it grows) and a
-/// script interpreter's copy of its arguments. Per process, so that no process alone keeps
-/// the others of the tree from running a program (it takes half of the tree's bound); a
-/// second execve of the same process at the same time (another thread) gets what is left.
-const EXEC_STRINGS_MAX: usize = 4 * MAX_ARGS_TOTAL;
-/// And all execve calls of the instance together (the server's heap is the tree's).
-const EXEC_STRINGS_INSTANCE_MAX: usize = 8 * MAX_ARGS_TOTAL;
+/// once (on the server's heap, shared by the tree), for its `args_max`: one call with the
+/// largest it may pass (its arguments and environment, each buffer up to twice what it holds
+/// as it grows) and a script interpreter's copy of its arguments. Per process, so that no
+/// process with the default limit alone keeps the others of the tree from running a program
+/// (it takes a third of the tree's bound); a second execve of the same process at the same
+/// time (another thread) gets what is left.
+fn exec_strings_max(args_max: usize) -> usize {
+    4 * args_max
+}
+/// And all execve calls of the instance together (the server's heap is the tree's): one
+/// call of Linux's largest (a raised RLIMIT_STACK), or three of the default.
+const EXEC_STRINGS_INSTANCE_MAX: usize = 4 * ARGS_CEILING;
 static EXEC_STRINGS_INSTANCE: AtomicUsize = AtomicUsize::new(0);
 /// A buffer's first size; it doubles as it grows (its slack is charged too).
 const STRINGS_FIRST: usize = 4096;
 
 /// An execve's arguments or environment: NUL-terminated strings back to back in one buffer
-/// (one allocation, not one per string), charged to its process (`EXEC_STRINGS_MAX`) while
-/// held.
+/// (one allocation, not one per string), charged to its process (up to `limit`,
+/// `exec_strings_max`) while held.
 struct Strings {
     bytes: Vec<u8>,
     count: usize,
     charged: usize,
     account: Arc<AtomicUsize>,
+    limit: usize,
 }
 
 impl Strings {
-    fn new(account: &Arc<AtomicUsize>) -> Strings {
-        Strings { bytes: Vec::new(), count: 0, charged: 0, account: account.clone() }
+    fn new(account: &Arc<AtomicUsize>, limit: usize) -> Strings {
+        Strings { bytes: Vec::new(), count: 0, charged: 0, account: account.clone(), limit }
     }
 
     /// Room for `n` more bytes. What the buffer takes of the heap (its whole capacity, grown
@@ -292,7 +314,7 @@ impl Strings {
         // Doubling (amortized copies), at least what is needed.
         let new_cap = need.max(self.bytes.capacity().saturating_mul(2)).max(STRINGS_FIRST);
         let more = new_cap - self.bytes.capacity();
-        if self.account.fetch_add(more, Ordering::Relaxed) + more > EXEC_STRINGS_MAX {
+        if self.account.fetch_add(more, Ordering::Relaxed) + more > self.limit {
             self.account.fetch_sub(more, Ordering::Relaxed);
             return Err(ENOMEM);
         }
@@ -355,6 +377,8 @@ struct Prepared {
     /// (/proc's exe).
     filename: String,
     exe: String,
+    /// How far its stack may grow (`stack_room`).
+    stack: u64,
 }
 
 /// A NUL-terminated string of the program's, at most `max` bytes (E2BIG beyond).
@@ -377,9 +401,9 @@ fn read_string(addr: u64, max: usize) -> Result<Vec<u8>, i64> {
 }
 
 /// A NULL-terminated array of strings of the program's (argv, envp); a null array is
-/// empty. `total` counts the bytes of all of them (E2BIG beyond `MAX_ARGS_TOTAL`).
-fn read_strings(addr: u64, total: &mut usize, account: &Arc<AtomicUsize>) -> Result<Strings, i64> {
-    let mut out = Strings::new(account);
+/// empty. `total` counts the bytes of all of them with their pointers (E2BIG beyond `max`).
+fn read_strings(addr: u64, total: &mut usize, max: usize, account: &Arc<AtomicUsize>) -> Result<Strings, i64> {
+    let mut out = Strings::new(account, exec_strings_max(max));
     if addr == 0 {
         return Ok(out);
     }
@@ -400,7 +424,7 @@ fn read_strings(addr: u64, total: &mut usize, account: &Arc<AtomicUsize>) -> Res
             let piece = &chunk[..end.unwrap_or(n)];
             len += piece.len();
             *total += piece.len();
-            if len >= MAX_ARG_STRLEN || *total > MAX_ARGS_TOTAL {
+            if len >= MAX_ARG_STRLEN || *total > max {
                 return Err(E2BIG);
             }
             out.charge(piece.len())?;
@@ -410,7 +434,7 @@ fn read_strings(addr: u64, total: &mut usize, account: &Arc<AtomicUsize>) -> Res
             }
         }
         *total += 1 + 8;
-        if *total > MAX_ARGS_TOTAL {
+        if *total > max {
             return Err(E2BIG);
         }
         out.charge(1)?;
@@ -434,8 +458,9 @@ fn execveat(s: &mut State, dirfd: u64, path: u64, argv: u64, envp: u64, flags: u
     let filename = String::from_utf8(read_string(path, 4096).map_err(|e| if e == E2BIG { ENAMETOOLONG } else { e })?).map_err(|_| ENOEXEC)?;
     let mut total = 0;
     let account = process::exec_account();
-    let args = read_strings(argv, &mut total, &account)?;
-    let envs = read_strings(envp, &mut total, &account)?;
+    let stack = crate::ids::soft(crate::ids::RLIMIT_STACK);
+    let args = read_strings(argv, &mut total, args_max(stack), &account)?;
+    let envs = read_strings(envp, &mut total, args_max(stack), &account)?;
     let (file, exe) = if filename.is_empty() {
         if flags & AT_EMPTY_PATH == 0 {
             return Err(ENOENT);
@@ -447,7 +472,7 @@ fn execveat(s: &mut State, dirfd: u64, path: u64, argv: u64, envp: u64, flags: u
         open(&base, &filename, flags & AT_SYMLINK_NOFOLLOW == 0)?
     };
     let shown = if filename.is_empty() { exe.clone() } else { filename };
-    let prepared = prepare(file, exe, shown, args, envs, 0)?;
+    let prepared = prepare(file, exe, shown, args, envs, stack_room(stack), 0)?;
     // Past the point of no return a failure ends the process; it does so once this call
     // returned and let go of everything (`local::exit_pending`, carried out by `serve`).
     if let Err(status) = run(s, prepared) {
@@ -458,7 +483,7 @@ fn execveat(s: &mut State, dirfd: u64, path: u64, argv: u64, envp: u64, flags: u
 
 /// Reads the program's first bytes and follows a `#!` line (`depth`: how many were
 /// followed), until an ELF image with its interpreter is ready.
-fn prepare(file: File, exe: String, filename: String, args: Strings, envs: Strings, depth: u32) -> Result<Prepared, i64> {
+fn prepare(file: File, exe: String, filename: String, args: Strings, envs: Strings, stack: u64, depth: u32) -> Result<Prepared, i64> {
     let size = file.size()?;
     let mut head = vec![0u8; size.min(256) as usize];
     let n = file.read(0, &mut head)?;
@@ -480,7 +505,7 @@ fn prepare(file: File, exe: String, filename: String, args: Strings, envs: Strin
             Some(at) => (trimmed[..at].to_vec(), Some(trim(&trimmed[at..]).to_vec())),
             None => (trimmed.to_vec(), None),
         };
-        let mut new_args = Strings::new(&args.account);
+        let mut new_args = Strings::new(&args.account, args.limit);
         new_args.push(&interp)?;
         if let Some(a) = arg.filter(|a| !a.is_empty()) {
             new_args.push(&a)?;
@@ -495,10 +520,10 @@ fn prepare(file: File, exe: String, filename: String, args: Strings, envs: Strin
         let cwd = crate::records::current().state.lock().cwd.clone();
         let (ifile, iexe) = open(&cwd, &interp, true)?;
         // (AT_EXECFN and the name stay the script's, as Linux's bprm->filename.)
-        return prepare(ifile, iexe, filename, new_args, envs, depth + 1);
+        return prepare(ifile, iexe, filename, new_args, envs, stack, depth + 1);
     }
     let elf = Elf::load(&file, &head)?;
-    elf.bias()?;
+    elf.bias(stack)?;
     let interp = match &elf.interp {
         Some(name) => {
             let cwd = crate::records::current().state.lock().cwd.clone();
@@ -520,7 +545,7 @@ fn prepare(file: File, exe: String, filename: String, args: Strings, envs: Strin
         }
         None => None,
     };
-    Ok(Prepared { file, elf, interp, args, envs, filename, exe })
+    Ok(Prepared { file, elf, interp, args, envs, filename, exe, stack })
 }
 
 fn trim(s: &[u8]) -> &[u8] {
@@ -614,7 +639,7 @@ fn de_thread() -> Result<(), i64> {
 /// program break).
 fn load(p: &Prepared) -> Result<(u64, u64, u64), i64> {
     // (Checked by `prepare`.)
-    let bias = p.elf.bias()?;
+    let bias = p.elf.bias(p.stack)?;
     map_image(&p.file, &p.elf, bias)?;
     let brk = page_up(bias.wrapping_add(p.elf.span().1));
     let (entry, interp_base) = match &p.interp {
@@ -720,7 +745,7 @@ fn build_stack(p: &Prepared, bias: u64, interp_base: u64, entry: u64) -> Result<
     let strings: usize = p.args.size() + p.envs.size() + p.filename.len() + 1;
     let vectors = (p.args.len() + p.envs.len() + 3) * 8 + 24 * 16;
     let need = page_up((strings + vectors + 64 * 1024) as u64).max(STACK_SIZE);
-    syscall_ok(SYS_MO_MAP, [0, STACK_TOP - need, need, 0, 3, MO_FIXED | MO_GROWSDOWN])?;
+    syscall_ok(SYS_MO_MAP, [0, STACK_TOP - need, need, p.stack, 3, MO_FIXED | MO_GROWSDOWN])?;
     // Nothing here allocates (past the point of no return, with as many strings as the
     // program gave): the strings go as their buffers hold them, back to back, and the
     // vectors are written a few words at a time.
@@ -887,7 +912,8 @@ pub fn init(s: &mut State) {
     let path = String::from_utf8_lossy(parts.next().unwrap_or(b"")).into_owned();
     let mut strings = || -> Result<(Strings, Strings), i64> {
         let account = process::exec_account();
-        let (mut args, mut envs) = (Strings::new(&account), Strings::new(&account));
+        let limit = exec_strings_max(args_max(crate::ids::soft(crate::ids::RLIMIT_STACK)));
+        let (mut args, mut envs) = (Strings::new(&account, limit), Strings::new(&account, limit));
         for a in parts.by_ref() {
             if a.is_empty() {
                 break;
@@ -902,7 +928,7 @@ pub fn init(s: &mut State) {
         }
         Ok((args, envs))
     };
-    let result = strings().and_then(|(args, envs)| open("/", &path, true).and_then(|(file, exe)| prepare(file, exe, path.clone(), args, envs, 0)));
+    let result = strings().and_then(|(args, envs)| open("/", &path, true).and_then(|(file, exe)| prepare(file, exe, path.clone(), args, envs, stack_room(crate::ids::soft(crate::ids::RLIMIT_STACK)), 0)));
     drop(buf);
     let status = match result {
         Ok(prepared) => match run(s, prepared) {

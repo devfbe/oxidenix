@@ -102,8 +102,6 @@ pub const UNBLOCKABLE: u64 = (1 << (SIGKILL - 1)) | (1 << (SIGSTOP - 1));
 /// Delivered before the others (Linux's SYNCHRONOUS_MASK): faults.
 const SYNCHRONOUS: u64 = (1 << (SIGSEGV - 1)) | (1 << (SIGBUS - 1)) | (1 << (SIGILL - 1)) | (1 << (SIGTRAP - 1)) | (1 << (SIGFPE - 1)) | (1 << (SIGSYS - 1));
 const STOP_SIGNALS: u64 = (1 << (SIGSTOP - 1)) | (1 << (SIGTSTP - 1)) | (1 << (SIGTTIN - 1)) | (1 << (SIGTTOU - 1));
-/// Most real-time signals queued with their data in the instance (RLIMIT_SIGPENDING).
-const MAX_QUEUED: usize = 4096;
 
 fn ignored_by_default(sig: u32) -> bool {
     matches!(sig, SIGCHLD | SIGCONT | SIGURG | SIGWINCH)
@@ -186,14 +184,16 @@ pub struct Queue {
 }
 
 impl Queue {
-    /// Queues `info`; false if a standard signal was pending already (merged).
-    fn push(&mut self, info: SigInfo, rt_queued: &mut usize, may_fail: bool) -> Result<bool, i64> {
+    /// Queues `info`; false if a standard signal was pending already (merged). A real-time
+    /// signal queues its data while the instance's count (`rt_queued`: Linux counts per
+    /// user, and the one user is root) is below `max`, the target's soft RLIMIT_SIGPENDING.
+    fn push(&mut self, info: SigInfo, rt_queued: &mut usize, max: u64, may_fail: bool) -> Result<bool, i64> {
         let sig = info.signo();
         if sig < SIGRTMIN && self.set & bit(sig) != 0 {
             return Ok(false);
         }
         if sig >= SIGRTMIN {
-            if *rt_queued >= MAX_QUEUED || self.list.try_reserve(1).is_err() {
+            if *rt_queued as u64 >= max || self.list.try_reserve(1).is_err() {
                 // Out of queue space: sigqueue fails, kill pends without its data.
                 if may_fail {
                     return Err(EAGAIN);
@@ -428,12 +428,13 @@ fn post(t: &mut Table, pid: Pid, thread: Option<Pid>, info: SigInfo, force: bool
         return Ok(());
     }
     let mut rt = t.rt_queued;
+    let max = t.procs[&pid].limits.soft(crate::ids::RLIMIT_SIGPENDING);
     let queued = match thread {
         Some(tid) => match t.threads.get_mut(&tid) {
-            Some(th) => th.sig.pending.push(info, &mut rt, may_fail),
+            Some(th) => th.sig.pending.push(info, &mut rt, max, may_fail),
             None => return Err(ESRCH),
         },
-        None => t.procs.get_mut(&pid).expect("checked").sig.shared.push(info, &mut rt, may_fail),
+        None => t.procs.get_mut(&pid).expect("checked").sig.shared.push(info, &mut rt, max, may_fail),
     };
     t.rt_queued = rt;
     if queued? {

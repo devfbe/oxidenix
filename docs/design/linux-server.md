@@ -639,8 +639,10 @@ like "terminate" (no core files: `RLIMIT_CORE` is 0, so the status has no core f
 
 ### Signals
 
-Standard signals pend once, real-time ones queue with their `siginfo` (at most 4096 queued in
-the instance; `sigqueue` beyond is EAGAIN, `kill` keeps the signal without its data). A
+Standard signals pend once, real-time ones queue with their `siginfo` while the instance's
+count of queued ones is below the target process's soft RLIMIT_SIGPENDING (4096 by default;
+Linux counts per user, and the one user is root); `sigqueue` beyond is EAGAIN, `kill` keeps
+the signal without its data. A
 process signal is taken by a thread that does not block it (the main thread first); the
 server kicks it. SIGKILL starts the group exit at once; SIGCONT ends a stop at once (and drops
 pending stop signals), a stop signal drops pending SIGCONT. Pid 1 of the instance gets only
@@ -1144,11 +1146,15 @@ affinity and getcpu calls in `mod.rs`; `timer.rs`'s interval timers; the per-pro
   record (`procs` the instance's threads); `getcpu` `thread_info`; `getrandom` `random` 256
   bytes at a time, ending early for a signal as Linux beyond the first piece; `uname` is the
   server's alone; `ioperm` and `iopl` EPERM (the tree has no ports). The resource limits
-  start as Linux's defaults the server holds to (an 8 MiB stack, no core files, 4096
-  descriptors, 4096 queued signals) and are kept per process (`ids::Limits`, shared by
-  `process::Proc` and its threads, which read them without a lock: copied by fork and clone,
-  kept by execve and by a zombie, another process's by prlimit64, named by any of its
-  threads' ids).
+  start as Linux's defaults (an 8 MiB stack, no core files, 4096 descriptors, 4096 queued
+  real-time signals) and are kept per process (`ids::Limits`, shared by `process::Proc` and
+  its threads, which read them without a lock: copied by fork and clone, kept by execve and
+  by a zombie, another process's by prlimit64, named by any of its threads' ids). The server
+  holds to RLIMIT_STACK (execve's new stack grows as far as the caller's soft limit, at most
+  the 16 TiB above `MMAP_TOP`, the kernel's `MO_GROWSDOWN` limit; a quarter of it, at most
+  6 MiB, bounds the arguments and environment), RLIMIT_NOFILE, RLIMIT_SIGPENDING (against the
+  target's limit, the instance's count: Linux counts per user, the one user is root) and
+  RLIMIT_CORE; RLIMIT_NPROC is not enforced, as Linux does not for root.
 - **The host grant** (ADR 0011, decision 5): `clock_set` and `power` need the instance's
   grant, which the kernel gives the trees it starts and takes back with the console when
   the tree's first process ends (`process::Tree::end`); without it the server acts as a

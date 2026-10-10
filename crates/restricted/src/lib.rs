@@ -143,8 +143,12 @@ pub const SYS_MO_CREATE: u64 = 1013;
 /// mapping goes at `addr` (replacing what was there, or EEXIST with
 /// `MO_NOREPLACE`); otherwise `addr` is a hint, taken if that range is
 /// free, and the kernel finds a free range. `MO_POPULATE` makes the pages
-/// present now. `prot`: mmap's PROT_ bits.
+/// present now. `prot`: mmap's PROT_ bits. The kernel finds room below
+/// `MMAP_TOP`.
 pub const SYS_MO_MAP: u64 = 1014;
+/// Where the room `mo_map` finds ends: the stack's area lies above (16 TiB
+/// up to the 64 TiB line).
+pub const MMAP_TOP: u64 = 0x3000_0000_0000;
 /// `mo_unmap(addr, len)` in the calling thread's program view.
 pub const SYS_MO_UNMAP: u64 = 1015;
 /// `mo_protect(addr, len, prot)` in the calling thread's program view.
@@ -164,8 +168,10 @@ pub const MO_POPULATE: u64 = 16;
 /// A shared mapping that may never become writable (a file object mapped
 /// through a descriptor not open for writing: mprotect gives EACCES).
 pub const MO_READONLY: u64 = 32;
-/// Anonymous private memory that grows down on demand, up to 8 MiB, when
-/// the program touches the page below it (the stack `execve` makes).
+/// Anonymous private memory that grows down on demand when the program
+/// touches the page below it (the stack `execve` makes), until it reaches
+/// as far below its top as `offset` says (the program's RLIMIT_STACK; the
+/// mapping's length if that is more) or another mapping.
 pub const MO_GROWSDOWN: u64 = 64;
 
 // Bridges to state the kernel still owns, and address space operations

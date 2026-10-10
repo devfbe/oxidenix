@@ -83,6 +83,8 @@ of the kernel's tree that `/dev` still was. Four questions decided the shape:
   for what Linux decides by the capability before the arguments (decision 5).
 - The native servers can no longer be confused with Linux programs; ringtest's checks of the
   kernel's refusals use the native calls (`random` into a read-only grant, `futex_requeue`).
-- Resource limits start as Linux's defaults the server holds to and are kept per process in
-  the server (`ids::Limits`: inherited by fork, kept by execve and by a zombie); RLIMIT_NOFILE
-  left the descriptor table for them (ADR 0009's update).
+- Resource limits start as Linux's defaults and are kept per process in the server
+  (`ids::Limits`: inherited by fork, kept by execve and by a zombie); RLIMIT_NOFILE left the
+  descriptor table for them (ADR 0009's update). The server holds to RLIMIT_STACK (the
+  kernel's `MO_GROWSDOWN` takes the stack's limit), RLIMIT_NOFILE, RLIMIT_SIGPENDING and
+  RLIMIT_CORE; RLIMIT_NPROC binds no root process on Linux, nor here.

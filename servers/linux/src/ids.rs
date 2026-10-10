@@ -97,9 +97,13 @@ const RLIMIT_RTPRIO: u64 = 14;
 const NR_OPEN: u64 = 1 << 20;
 
 /// The (soft, hard) limit of `resource` a tree's first process starts with: Linux's
-/// defaults for a process init starts, where the server holds to them (an execve's stack
-/// grows to 8 MiB, no core files are written, 4096 descriptors, the instance queues at most
-/// 4096 real-time signals); nothing else is limited.
+/// defaults for a process init starts. The server holds to RLIMIT_STACK (how far the stack
+/// of the program execve starts may grow, and a quarter of it for the arguments and
+/// environment: `exec`), RLIMIT_CORE (no core file is ever written), RLIMIT_NOFILE (new
+/// descriptors: `fdtable`) and RLIMIT_SIGPENDING (real-time signals queued in the instance,
+/// against the target's limit: Linux counts per user, and the one user is root). The others
+/// are kept, not enforced: RLIMIT_NPROC as Linux for root, who is exempt (a fork bomb stops
+/// at the kernel's process table, `oomtest`).
 fn limit(resource: u64) -> (u64, u64) {
     match resource {
         RLIMIT_STACK => (8 << 20, RLIM_INFINITY),

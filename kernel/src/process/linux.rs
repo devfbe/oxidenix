@@ -1275,12 +1275,12 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             }
             if flags & MO_GROWSDOWN != 0 {
                 // A stack: anonymous, private, readable and writable, where
-                // the server puts it.
+                // the server puts it, growing as far as `offset` says.
                 if handle != 0 || flags != MO_GROWSDOWN | MO_FIXED || a[4] != 3 {
                     return Err(EINVAL);
                 }
                 let top = addr.checked_add(len).filter(|&e| e <= USER_END && addr != 0).ok_or(EINVAL)?;
-                mm()?.lock().map_stack(top, len).map_err(|_| ENOMEM)?;
+                mm()?.lock().map_stack(top, len, offset).map_err(|_| ENOMEM)?;
                 return Ok(addr as i64);
             }
             let shared = flags & MO_SHARED != 0;

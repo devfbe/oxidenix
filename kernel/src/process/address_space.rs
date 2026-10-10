@@ -66,8 +66,9 @@ const PROT_NONE: PageTableFlags = PageTableFlags::BIT_10;
 const CHARGED: PageTableFlags = PageTableFlags::BIT_11;
 
 /// Highest address `mmap` hands out; the stack lives above.
-pub const MMAP_TOP: u64 = 0x0000_3000_0000_0000;
-/// How far a stack may grow below its top (RLIMIT_STACK).
+pub const MMAP_TOP: u64 = restricted::MMAP_TOP;
+/// How far a native server's stack may grow below its top (a Linux
+/// program's: its RLIMIT_STACK, `map_stack`).
 pub const STACK_LIMIT: u64 = 8 * 1024 * 1024;
 
 fn page_down(x: u64) -> u64 {
@@ -188,8 +189,9 @@ pub struct Vma {
     /// Mapped with MAP_NORESERVE: never committed, not even when
     /// `mprotect` makes it writable (Linux's VM_NORESERVE).
     pub noreserve: bool,
-    /// A stack: accesses just below it grow it, up to STACK_LIMIT.
-    pub grows_down: bool,
+    /// A stack: accesses just below it grow it, until it reaches this far
+    /// below its end (0: not a stack).
+    pub stack_limit: u64,
 }
 
 impl Vma {
@@ -542,7 +544,7 @@ impl AddressSpace {
                 && a.prot == b.prot
                 && a.charged == b.charged
                 && a.noreserve == b.noreserve
-                && a.grows_down == b.grows_down
+                && a.stack_limit == b.stack_limit
                 && matches!((&a.backing, &b.backing), (Backing::Anon, Backing::Anon))
         };
         let Some(cur) = self.vmas.get(&start).cloned() else { return };
@@ -582,7 +584,7 @@ impl AddressSpace {
     /// `noreserve`; on failure nothing changes (ENOMEM).
     pub fn map(&mut self, start: u64, len: u64, prot: Prot, backing: Backing, noreserve: bool) -> Result<(), Fault> {
         let end = start.checked_add(len).filter(|&e| e <= USER_END && len > 0).ok_or(Fault::Segv)?;
-        let mut vma = Vma { start, end, prot, backing, charged: false, noreserve, grows_down: false };
+        let mut vma = Vma { start, end, prot, backing, charged: false, noreserve, stack_limit: 0 };
         if let Some((cache, _)) = vma.file() {
             if self.owner.strong_count() > 0 {
                 cache.register(&self.owner)?;
@@ -600,12 +602,13 @@ impl AddressSpace {
         Ok(())
     }
 
-    /// The process stack: an area below `top` that grows down on demand.
-    pub fn map_stack(&mut self, top: u64, initial: u64) -> Result<(), Fault> {
+    /// The process stack: an area below `top` that grows down on demand,
+    /// until it reaches `limit` below `top` (at least `initial`).
+    pub fn map_stack(&mut self, top: u64, initial: u64, limit: u64) -> Result<(), Fault> {
         let start = top - initial;
         self.map(start, initial, Prot::RW, Backing::Anon, false)?;
         if let Some(v) = self.vmas.get_mut(&start) {
-            v.grows_down = true;
+            v.stack_limit = limit.max(initial);
         }
         Ok(())
     }
@@ -1165,7 +1168,7 @@ impl AddressSpace {
     /// An access just below a stack extends it (charging the commit).
     fn grow_stack(&mut self, page: u64) -> Result<(), Fault> {
         let (&start, stack) = self.vmas.range(page..).next().ok_or(Fault::Segv)?;
-        if !stack.grows_down || stack.end - page > STACK_LIMIT || self.overlaps(page, start) {
+        if stack.stack_limit == 0 || stack.end - page > stack.stack_limit || self.overlaps(page, start) {
             return Err(Fault::Segv);
         }
         let grow = (start - page) / PAGE;
@@ -1211,7 +1214,7 @@ impl AddressSpace {
             return Err(Fault::Segv);
         }
         self.unmap(start, len);
-        self.insert(Vma { start, end: start + len, prot, backing: Backing::Device, charged: false, noreserve: false, grows_down: false });
+        self.insert(Vma { start, end: start + len, prot, backing: Backing::Device, charged: false, noreserve: false, stack_limit: 0 });
         for i in 0..pages {
             let frame = PhysFrame::containing_address(PhysAddr::new(phys + i * PAGE));
             memory::with_frames(|f| f.share(frame));
@@ -1229,7 +1232,7 @@ impl AddressSpace {
             return Err(Fault::Segv);
         }
         let prot = Prot { read: true, write: writable, exec: false };
-        self.insert(Vma { start, end: start + len, prot, backing: Backing::Granted { grant, writable }, charged: false, noreserve: false, grows_down: false });
+        self.insert(Vma { start, end: start + len, prot, backing: Backing::Granted { grant, writable }, charged: false, noreserve: false, stack_limit: 0 });
         for (i, &frame) in frames.iter().enumerate() {
             memory::with_frames(|f| f.share(frame));
             if let Err(e) = self.install(start + i as u64 * PAGE, frame, prot.flags()) {
@@ -1250,7 +1253,7 @@ impl AddressSpace {
         for (start, len) in ranges {
             self.unmap(start, len);
             let none = Prot { read: false, write: false, exec: false };
-            self.insert(Vma { start, end: start + len, prot: none, backing: Backing::Revoked { channel }, charged: false, noreserve: false, grows_down: false });
+            self.insert(Vma { start, end: start + len, prot: none, backing: Backing::Revoked { channel }, charged: false, noreserve: false, stack_limit: 0 });
         }
     }
 
