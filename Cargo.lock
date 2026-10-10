@@ -502,7 +502,6 @@ dependencies = [
  "ring",
  "slab 0.1.0",
  "spin",
- "vfs",
  "x86_64 0.15.5",
 ]
 
@@ -511,6 +510,7 @@ name = "oxrt"
 version = "0.1.0"
 dependencies = [
  "linked_list_allocator",
+ "restricted",
 ]
 
 [[package]]

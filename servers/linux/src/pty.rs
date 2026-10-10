@@ -62,7 +62,7 @@ pub fn devpts() -> Arc<tmpfs::Inode> {
     if let Some(r) = root.as_ref() {
         return r.clone();
     }
-    let r = tmpfs::Inode::new_sealed_dir(0o755);
+    let r = tmpfs::Inode::new_sealed_dir(0o755, tmpfs::DEVPTS_DEV);
     // Linux's devpts has its own ptmx node (mode 000 unless mounted otherwise).
     let _ = r.insert_device("ptmx", vfs::stat::dev_make(5, 2), 0);
     *root = Some(r.clone());

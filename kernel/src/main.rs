@@ -1,5 +1,5 @@
 //! The kernel's entry point: `kernel_main` takes the boot information from the bootloader
-//! (UEFI or BIOS) and brings up the console, interrupts, memory, ACPI, time, the VFS, processes,
+//! (UEFI or BIOS) and brings up the console, interrupts, memory, ACPI, time, the boot image, processes,
 //! the other CPUs and the servers, then starts the first program.
 
 #![no_std]
@@ -58,7 +58,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     timer::init(interrupts::apic::timer_hz());
     timer::init_cpu();
     fs::init(ramdisk);
-    if fs::resolve("/", "/etc/autorun", true).is_ok() {
+    if fs::program("/etc/autorun").is_some() {
         TEST_MODE.store(true, core::sync::atomic::Ordering::Relaxed);
     }
     process::init();

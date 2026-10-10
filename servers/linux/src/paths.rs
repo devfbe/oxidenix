@@ -2,9 +2,10 @@
 //! directory and umask, which live in the caller's record (`records`).
 //!
 //! Each call resolves its path in the server's namespace (`namespace`) and
-//! acts on the inode it reaches: one of the server's tmpfs, one of /data
-//! (`datafs`), or one of the kernel's tree through its handle. The semantics are the kernel's VFS's,
-//! which they replace: no permission checks and no owners (one user), and
+//! acts on the inode it reaches: one of the server's tmpfs (the root, /dev,
+//! devpts), one of /data (`datafs`), or one of /proc and /sys (`procfs`).
+//! The semantics are the kernel's former VFS's: no permission checks and
+//! no owners (one user), and
 //! a descriptor's or the working directory's path is the one it was
 //! opened by (normalized, symlinks not replaced). New: umask(2) is real,
 //! and so are the files' times (utimensat and the calls that change them),
@@ -14,7 +15,7 @@ use crate::datafile;
 use crate::datafs;
 use crate::files;
 use crate::inotify;
-use crate::namespace::{check, mode_of, resolve, resolve_parent, KInode, Node, Origin, Resolved, EBUSY, ENOENT, ENOTDIR, EXDEV};
+use crate::namespace::{check, mode_of, resolve, resolve_parent, Node, Origin, Resolved, EBUSY, ENOENT, ENOTDIR, EXDEV};
 use crate::records;
 use crate::syscall;
 use crate::tmpfile;
@@ -179,14 +180,14 @@ fn fd_node_of(fd: u64) -> Result<(Node, String, bool), i64> {
     if let Some(f) = files::proc_of(fd) {
         return Ok((Node::Proc(f.node.clone()), f.path.clone(), false));
     }
-    // Terminals, null and zero, O_PATH: the node they were opened by.
-    if let Some(o) = files::origin_of(fd) {
-        return Ok((o.node()?, o.path, o.o_path));
-    }
-    // An open file of the kernel's tree: its inode; any other file has none.
-    match &files::lookup_raw(fd)?.file {
-        files::File::Kernel(k) => Ok((Node::Kernel(k.inode()?), k.path.clone(), false)),
-        _ => Err(ENOTDIR),
+    // Terminals, null and zero, O_PATH: the node they were opened by; any
+    // other file has none.
+    match files::origin_of(fd) {
+        Some(o) => Ok((o.node()?, o.path, o.o_path)),
+        None => {
+            files::lookup_raw(fd)?;
+            Err(ENOTDIR)
+        }
     }
 }
 
@@ -212,17 +213,12 @@ fn umask(new: u32) -> u32 {
     core::mem::replace(&mut st.umask, new & 0o777)
 }
 
-const NEW_FILE: u64 = INODE_FILE;
-const NEW_DIR: u64 = INODE_DIR;
+const NEW_FILE: u64 = 0;
+const NEW_DIR: u64 = 1;
 
 /// A new file or directory `name` in the directory `dir`.
 fn create(dir: &Node, name: &str, kind: u64, perm: u32) -> Result<Node, i64> {
     match dir {
-        Node::Kernel(d) => KInode::from_result(syscall(
-            SYS_INODE_CREATE,
-            [d.handle(), name.as_ptr() as u64, name.len() as u64, kind, perm as u64, 0],
-        ))
-        .map(Node::Kernel),
         Node::Tmp(d) => d.create(name, kind == NEW_DIR, perm).map(Node::Tmp),
         Node::Data(d) => {
             let new = if kind == NEW_DIR { datafs::New::Dir } else { datafs::New::File };
@@ -260,8 +256,8 @@ fn exec_node(node: &Node, path: String) -> Result<(u64, String), i64> {
     let held = match node {
         Node::Tmp(t) => tmpfile::exec_hold(t)?,
         Node::Data(d) => datafile::exec_hold(d)?,
-        // The kernel's tree (/dev) and /proc and /sys hold no programs.
-        Node::Kernel(_) | Node::Proc(_) => return Err(EACCES),
+        // /proc and /sys hold no programs.
+        Node::Proc(_) => return Err(EACCES),
     };
     Ok((held, path))
 }
@@ -320,36 +316,24 @@ fn openat(dirfd: u64, addr: u64, flags: u32, mode: u32) -> Result<i64, i64> {
     }
     let abs = join(&resolved.path);
     // A character device node names its driver by its number, wherever the
-    // node is (the kernel's /dev, the server's tmpfs or devpts): the terminals
-    // are the server's (`tty`); null (1,3) and zero (1,5) the kernel's for its
-    // own nodes, the server's (`devices`) for its nodes; any other number has
-    // no driver (ENXIO). The server's opens keep the node they were opened by
-    // (`Origin`: a live fstat, fchmod and the like). O_DIRECTORY is ENOTDIR.
+    // node is (/dev, devpts, any tmpfs or /data): the terminals are `tty`'s,
+    // null (1,3) and zero (1,5) `devices`'; any other number has no driver
+    // (ENXIO). The opens keep the node they were opened by (`Origin`: a live
+    // fstat, fchmod and the like). O_DIRECTORY is ENOTDIR.
     if resolved.mode & vfs::S_IFMT == vfs::S_IFCHR {
         use crate::devices::{self, Kind};
         if flags & O_DIRECTORY != 0 {
             return Err(ENOTDIR);
         }
         let rdev = vfs::stat::Stat::from_bytes(&resolved.node.stat()?).rdev;
-        let kernel_node = matches!(resolved.node, Node::Kernel(_));
-        let kind = match vfs::stat::dev_split(rdev) {
-            (1, 3) => Some(Kind::Null),
-            (1, 5) => Some(Kind::Zero),
-            _ => None,
+        let origin = Origin::new(resolved.node, abs, vfs::S_IFCHR);
+        return match vfs::stat::dev_split(rdev) {
+            (1, 3) => devices::open(Kind::Null, flags, origin),
+            (1, 5) => devices::open(Kind::Zero, flags, origin),
+            _ => crate::tty::open_device(rdev, flags, origin).unwrap_or(Err(crate::tty::ENXIO)),
         };
-        if !kernel_node || kind.is_none() {
-            let origin = Origin::new(resolved.node, abs, vfs::S_IFCHR);
-            if let Some(kind) = kind {
-                return devices::open(kind, flags, origin);
-            }
-            return crate::tty::open_device(rdev, flags, origin).unwrap_or(Err(crate::tty::ENXIO));
-        }
     }
     match resolved.node {
-        Node::Kernel(k) => {
-            let handle = check(syscall(SYS_INODE_OPEN, [k.handle(), flags as u64, abs.as_ptr() as u64, abs.len() as u64, 0, 0]))?;
-            crate::kfile::install(handle as u64, flags, abs)
-        }
         Node::Tmp(t) => tmpfile::open(t, flags, abs),
         Node::Data(d) => datafile::open(d, flags, abs),
         Node::Proc(p) => crate::procfile::open(p, flags, abs),
@@ -450,13 +434,6 @@ fn renameat(odirfd: u64, oaddr: u64, ndirfd: u64, naddr: u64) -> Result<i64, i64
     let (ndir, nname) = parent_at(ndirfd, naddr)?;
     // What moved and what it replaced (its last link gone), for inotify.
     let (moved, replaced): (Option<(inotify::Key, bool)>, Option<Gone>) = match (&odir.node, &ndir.node) {
-        (Node::Kernel(o), Node::Kernel(n)) => {
-            check(syscall(
-                SYS_INODE_RENAME,
-                [o.handle(), oname.as_ptr() as u64, oname.len() as u64, n.handle(), nname.as_ptr() as u64, nname.len() as u64],
-            ))?;
-            (None, None)
-        }
         (Node::Tmp(o), Node::Tmp(n)) => {
             let (node, old) = tmpfs::rename(o, &oname, n, &nname)?;
             (Some((inotify::Key::tmp(&node), node.is_dir())), old.map(Gone::Tmp))
@@ -555,10 +532,6 @@ fn unlinkat(dirfd: u64, addr: u64, flags: u64) -> Result<i64, i64> {
     let (dir, name) = parent_at(dirfd, addr)?;
     let dir_only = flags & AT_REMOVEDIR != 0;
     let gone = match &dir.node {
-        Node::Kernel(d) => {
-            check(syscall(SYS_INODE_UNLINK, [d.handle(), name.as_ptr() as u64, name.len() as u64, dir_only as u64, 0, 0]))?;
-            None
-        }
         Node::Tmp(d) => Some(Gone::Tmp(d.unlink(&name, dir_only)?)),
         Node::Data(d) => datafs::unlink(d, &name, dir_only)?.map(Gone::Data),
         // Nothing of /proc and /sys can be removed (Linux: EPERM).
@@ -585,10 +558,6 @@ fn symlinkat(target: u64, dirfd: u64, addr: u64) -> Result<i64, i64> {
     let target = read_cstr(target)?;
     let (dir, name) = parent_at(dirfd, addr).map_err(|e| if e == EBUSY { EEXIST } else { e })?;
     match &dir.node {
-        Node::Kernel(d) => check(syscall(
-            SYS_INODE_SYMLINK,
-            [d.handle(), name.as_ptr() as u64, name.len() as u64, target.as_ptr() as u64, target.len() as u64, 0],
-        )),
         Node::Tmp(d) => d.symlink(&name, target).map(|_| 0),
         Node::Data(d) => datafs::create(d, &name, datafs::New::Symlink(&target), 0o777).map(|_| 0),
         Node::Proc(d) if crate::procfs::lookup(d, &name).is_ok() => Err(EEXIST),
@@ -629,7 +598,6 @@ fn chmodat(dirfd: u64, addr: u64, mode: u64) -> Result<i64, i64> {
 
 fn chmod_node(node: &Node, mode: u64) -> Result<i64, i64> {
     match node {
-        Node::Kernel(k) => check(syscall(SYS_INODE_CHMOD, [k.handle(), mode, 0, 0, 0, 0])),
         // The modes of /proc's and /sys's files are what they are (Linux's
         // proc_setattr: EPERM).
         Node::Proc(_) => Err(EPERM),
@@ -706,14 +674,14 @@ fn fchmodat2(dirfd: u64, addr: u64, mode: u64, flags: u64) -> Result<i64, i64> {
     chmod_target(Some((r.node, join(&r.path))), mode)
 }
 
-/// Sets the times of a target. The kernel's tree (/dev), /proc and /sys
-/// keep no times that change: the server keeps them
+/// Sets the times of a target. /proc and /sys keep no times that change:
+/// the server keeps them
 /// (`namespace::set_pseudo_times`). An anonymous inode's (a pipe's, a
 /// socket's) are not kept: nothing to do.
 fn set_times(target: Option<(Node, String)>, atime: SetTime, mtime: SetTime) -> Result<i64, i64> {
     let Some((node, path)) = target else { return Ok(0) };
     match &node {
-        Node::Kernel(_) | Node::Proc(_) => crate::namespace::set_pseudo_times(&node.stat()?, atime, mtime),
+        Node::Proc(_) => crate::namespace::set_pseudo_times(&node.stat()?, atime, mtime),
         Node::Tmp(t) => t.set_times(atime, mtime),
         Node::Data(d) => datafs::set_times(d, atime, mtime)?,
     }
@@ -803,7 +771,6 @@ fn chown_target(target: Option<(Node, String)>) -> Result<i64, i64> {
 /// truncate(2): with the right to write, as through a writable descriptor.
 fn truncate(node: &Node, len: u64) -> Result<i64, i64> {
     match node {
-        Node::Kernel(k) => check(syscall(SYS_INODE_TRUNCATE, [k.handle(), len, 0, 0, 0, 0])),
         Node::Tmp(t) => {
             let object = t.object()?;
             t.get_write()?;
@@ -836,12 +803,6 @@ fn statfs(addr: u64, buf: u64) -> Result<i64, i64> {
 /// The `struct statfs` of the filesystem `node` is on, to `buf`.
 pub fn statfs_node(node: &Node, buf: u64) -> Result<i64, i64> {
     match node {
-        Node::Kernel(k) => {
-            let mut words = [0u8; 120];
-            check(syscall(SYS_INODE_STATFS, [k.handle(), words.as_mut_ptr() as u64, 0, 0, 0, 0]))?;
-            usercopy::to_program(buf, &words)?;
-            Ok(0)
-        }
         Node::Tmp(_) => tmpfile::statfs(buf),
         Node::Data(_) => {
             usercopy::to_program(buf, &datafs::statfs()?)?;

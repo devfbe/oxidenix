@@ -1,10 +1,10 @@
 //! The Linux server (docs/design/linux-server.md). It runs on the threads
 //! of the Linux programs it serves, in their address spaces' normal view,
-//! and handles what the programs trap into: their system calls (those it
-//! does not implement yet it hands back to the kernel's own Linux
-//! implementation), their exceptions (as signals), and kicks (a signal or a
-//! stop for the thread). Before a thread's program runs again its signals
-//! are delivered (`signal::deliver`).
+//! and handles what the programs trap into: their system calls (every one:
+//! the kernel implements none, R9; one the server does not implement is
+//! ENOSYS), their exceptions (as signals), and kicks (a signal or a stop
+//! for the thread). Before a thread's program runs again its signals are
+//! delivered (`signal::deliver`).
 //!
 //! Invariants the kernel relies on: no FPU/SSE (the target has none) and
 //! no FS or GS base, so the program's FPU registers and TLS pointer stay in
@@ -30,6 +30,7 @@ mod exec;
 mod fdtable;
 mod files;
 mod fsclient;
+mod futex;
 mod heap;
 mod ids;
 mod inet;
@@ -37,7 +38,6 @@ mod inetcalls;
 mod initramfs;
 mod inotify;
 mod local;
-mod kfile;
 mod mm;
 mod namespace;
 mod netclient;
@@ -58,6 +58,7 @@ mod scm;
 mod signal;
 mod sockcalls;
 mod sync;
+mod system;
 mod time;
 mod timer;
 mod tmpfile;
@@ -112,8 +113,8 @@ pub(crate) fn syscall(nr: u64, a: [u64; 6]) -> i64 {
     ret
 }
 
-/// A kernel call that reads and writes the thread's `State` (restricted_enter,
-/// legacy_syscall): the pointer goes into the asm, so the compiler writes back what the
+/// A kernel call that reads and writes the thread's `State` (restricted_enter):
+/// the pointer goes into the asm, so the compiler writes back what the
 /// server set in `state` before and reads it again after (a `&mut` alone would let it
 /// keep fields in registers across the call).
 pub(crate) fn state_call(state: &mut State, nr: u64, a: [u64; 6]) -> i64 {
@@ -225,6 +226,8 @@ fn dispatch(s: &mut State) -> i64 {
         .or_else(|| paths::handle(s))
         .or_else(|| sched::handle(s))
         .or_else(|| ids::handle(s))
+        .or_else(|| futex::handle(s))
+        .or_else(|| system::handle(s))
         .or_else(|| sockcalls::handle(s))
     {
         return result;
@@ -256,30 +259,21 @@ fn dispatch(s: &mut State) -> i64 {
             Ok(name) => syscall(TEST_SERVER_TICKS, [name.as_ptr() as u64, name.len() as u64, 0, 0, 0, 0]),
             Err(e) => -e,
         },
-        TEST_PASS_THROUGH => {
-            const SYS_SCHED_YIELD: u64 = 24;
-            s.rax = SYS_SCHED_YIELD;
-            pass_through_value(s)
-        }
         // Not offered, as by a Linux built without io_uring: libuv (and
         // so Node.js) probes io_uring_setup at start and uses epoll
         // instead. Answered here, so the kernel does not log them as
         // unknown calls.
         SYS_IO_URING_SETUP | SYS_IO_URING_ENTER | SYS_IO_URING_REGISTER => -ENOSYS,
         nr if nr >= FIRST_NON_LINUX => -ENOSYS,
-        _ => pass_through_value(s),
+        // Nothing passes through (R9): a Linux call the server does not
+        // implement is ENOSYS, said on the console (scripted runs read
+        // which calls a program misses from there).
+        nr => {
+            let text = alloc::format!("syscall {} not implemented", nr);
+            syscall(SYS_SERVER_LOG, [text.as_ptr() as u64, text.len() as u64, 0, 0, 0, 0]);
+            -ENOSYS
+        }
     }
-}
-
-/// Passes the program's call in `s` through to the kernel's Linux
-/// implementation; its result (`s` keeps the call's registers).
-pub fn pass_through_value(s: &mut State) -> i64 {
-    let nr = s.rax;
-    state_call(s, SYS_LEGACY_SYSCALL, [0; 6]);
-    datafs::reap();
-    let result = s.rax as i64;
-    s.rax = nr;
-    result
 }
 
 /// A page request of an `EVENT_PAGE`.

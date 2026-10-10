@@ -31,7 +31,7 @@ fn cmd_help() {
     crate::printkln!("  ps            - list processes");
     crate::printkln!("  lspci         - list PCI devices");
     crate::printkln!("  cpus          - CPUs with load and context switches");
-    crate::printkln!("  kill <pid|name> - send SIGKILL (the kernel may also stop servers)");
+    crate::printkln!("  kill <pid|name> - end a process (also a server's)");
     crate::printkln!("  halt          - halt the system");
 }
 
@@ -197,28 +197,20 @@ pub fn run_program(args: &[&str]) -> Option<crate::process::WaitStatus> {
         }
     };
     use crate::process::WaitStatus;
-    let mut result = None;
-    loop {
-        match crate::process::wait_for(pid).map(crate::process::decode_status) {
-            Ok(WaitStatus::Exited(code)) => {
-                crate::printkln!("[{} (pid {}) exited with code {}]", name, pid, code);
-                result = Some(WaitStatus::Exited(code));
-            }
-            Ok(WaitStatus::Killed(sig)) => {
-                crate::printkln!("[{} (pid {}) killed by signal {}]", name, pid, sig);
-                result = Some(WaitStatus::Killed(sig));
-            }
-            Ok(WaitStatus::Stopped(sig)) => {
-                // The monitor has no job control: resume the program (its
-                // terminal's foreground group is its server's business).
-                crate::printkln!("[{} (pid {}) stopped by signal {}; the monitor resumes it]", name, pid, sig);
-                crate::process::signal::send(pid, crate::process::signal::SIGCONT);
-                continue;
-            }
-            Err(errno) => crate::printkln!("run: wait failed (errno {})", errno),
+    let result = match crate::process::wait_for(pid).map(crate::process::decode_status) {
+        Ok(WaitStatus::Exited(code)) => {
+            crate::printkln!("[{} (pid {}) exited with code {}]", name, pid, code);
+            Some(WaitStatus::Exited(code))
         }
-        break;
-    }
+        Ok(WaitStatus::Killed(sig)) => {
+            crate::printkln!("[{} (pid {}) killed by signal {}]", name, pid, sig);
+            Some(WaitStatus::Killed(sig))
+        }
+        Err(errno) => {
+            crate::printkln!("run: wait failed (errno {})", errno);
+            None
+        }
+    };
     // The tree's first process ended: the console is the monitor's again
     // (what is left of the tree finds its terminal hung up).
     crate::process::linux::console_grant(None);
@@ -228,9 +220,9 @@ pub fn run_program(args: &[&str]) -> Option<crate::process::WaitStatus> {
 
 
 fn cmd_ps() {
-    crate::printkln!("  PID  PPID  CPU  THR  STATE     NAME");
-    for (pid, ppid, name, state, server, cpu, threads) in crate::process::list() {
-        crate::printkln!("{:5} {:5}  {:3}  {:3}  {:9} {}{}", pid, ppid, cpu, threads, state, name, if server { " (server)" } else { "" });
+    crate::printkln!("  PID  CPU  THR  STATE     NAME");
+    for (pid, name, state, server, cpu, threads) in crate::process::list() {
+        crate::printkln!("{:5}  {:3}  {:3}  {:9} {}{}", pid, cpu, threads, state, name, if server { " (server)" } else { "" });
     }
 }
 
@@ -240,14 +232,14 @@ fn cmd_kill(args: &Vec<&str, 8>) {
         return;
     };
     let pid = target.parse::<u64>().ok().or_else(|| {
-        crate::process::list().into_iter().find(|p| p.2 == target && p.0 != 0).map(|p| p.0)
+        crate::process::list().into_iter().find(|p| p.1 == target && p.0 != 0).map(|p| p.0)
     });
     let Some(pid) = pid.filter(|&p| p > 0) else {
         crate::printkln!("kill: no such process: {}", target);
         return;
     };
-    match crate::process::signal::kill(pid as i64, 9) {
-        Ok(_) => crate::printkln!("killed {}", pid),
+    match crate::process::kill::kill_pid(pid) {
+        Ok(()) => crate::printkln!("killed {}", pid),
         Err(errno) => crate::printkln!("kill: errno {}", errno),
     }
     crate::process::reap_orphans();

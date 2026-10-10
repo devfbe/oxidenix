@@ -1,9 +1,9 @@
 //! Interrupt and exception handlers: every vector from `entry::common_entry` lands in `trap`,
-//! which dispatches CPU exceptions (page faults, signals for user faults), device interrupts and
-//! inter-processor interrupts.
+//! which dispatches CPU exceptions (page faults; a Linux program's other faults go to its server,
+//! a native server dies of its own), device interrupts and inter-processor interrupts.
 
 use super::apic;
-use crate::process::signal;
+use crate::process::kill;
 use crate::process::syscall::Frame;
 use x86_64::instructions::port::Port;
 use x86_64::registers::control::Cr2;
@@ -34,13 +34,13 @@ pub extern "sysv64" fn trap(frame: &mut Frame) {
         // Spurious interrupts need no EOI.
         _ => {}
     }
-    // Every return to user space is a chance to switch tasks and to
-    // deliver pending signals: a native task's here; a Linux program that
-    // was kicked goes back to its server, which delivers its signals.
+    // Every return to user space is a chance to switch tasks, and to end a
+    // native task whose process ends; a Linux program that was kicked goes
+    // back to its server, which delivers its signals.
     if frame.from_user() {
         crate::process::sched::resched_on_return();
         match crate::process::linux::mode() {
-            None => signal::deliver(frame, None),
+            None => kill::exit_if_dying(frame),
             Some(true) if crate::process::linux::kick_pending() => crate::process::linux::trap(frame, restricted::REASON_KICK),
             Some(_) => {}
         }
@@ -54,14 +54,15 @@ fn halt_forever() -> ! {
     }
 }
 
-/// The signal a user-mode exception raises, as on Linux.
+/// The signal a user-mode exception raises on Linux: what a native
+/// server that raised it dies of.
 fn exception_signal(vector: u8) -> u32 {
     match vector {
-        0 | 9 | 16 | 19 => signal::SIGFPE,
-        1 | 3 => signal::SIGTRAP,
-        6 | 7 => signal::SIGILL,
-        12 | 17 => signal::SIGBUS,
-        _ => signal::SIGSEGV,
+        0 | 9 | 16 | 19 => kill::SIGFPE,
+        1 | 3 => kill::SIGTRAP,
+        6 | 7 => kill::SIGILL,
+        12 | 17 => kill::SIGBUS,
+        _ => kill::SIGSEGV,
     }
 }
 
@@ -86,14 +87,13 @@ fn exception_name(vector: u8) -> &'static str {
 }
 
 /// Memory ran out at a copy's touch of user memory (the kernel's uaccess
-/// or the Linux server's copy routine): the process dies of SIGKILL, as of
-/// a touch of its own, but by a signal, so the copy still ends at its
-/// fixup and the call unwinds (locks and references the kernel or the
-/// server hold are given back) before the kill takes effect on the way
-/// back to user mode.
+/// or the Linux server's copy routine): the process is killed, as by a
+/// touch of its own, but the copy still ends at its fixup and the call
+/// unwinds (locks and references the kernel or the server hold are given
+/// back) before the kill takes effect on the way back to user mode.
 fn oom_kill(addr: u64) {
     crate::printkln!("[kernel] out of memory at {:#x} (in a copy): process killed", addr);
-    signal::send_to(&crate::process::sched::current().group.clone(), signal::SIGKILL);
+    kill::kill_process(&crate::process::sched::current().group.clone(), kill::SIGKILL as i32);
 }
 
 fn exception(frame: &mut Frame) {
@@ -146,7 +146,7 @@ fn exception(frame: &mut Frame) {
             crate::printkln!("[linux] program view {:#x}, normal view {:#x}", program, normal);
         }
         crate::process::linux::break_instance();
-        signal::kernel_kill_current();
+        kill::kernel_kill_current();
     }
     let mut sig = exception_signal(vector);
     // A page fault's kind, for a Linux program's server (`FAULT_*`).
@@ -173,8 +173,8 @@ fn exception(frame: &mut Frame) {
             match handle_fault(addr, access) {
                 Ok(()) => return,
                 // The wait for the page ended because the thread dies: the
-                // return to user mode carries out SIGKILL or the exit.
-                Err(_) if fixup.is_none() && signal::dying() => return,
+                // return to user mode carries out the exit.
+                Err(_) if fixup.is_none() && kill::dying() => return,
                 Err(e) if fixup.is_some() => {
                     if e == Fault::Oom {
                         oom_kill(addr);
@@ -183,12 +183,12 @@ fn exception(frame: &mut Frame) {
                     return;
                 }
                 Err(Fault::Bus | Fault::Retry) => {
-                    sig = signal::SIGBUS;
+                    sig = kill::SIGBUS;
                     kind = restricted::FAULT_BUS;
                 }
                 Err(Fault::Oom) => {
                     crate::printkln!("[kernel] out of memory at {:#x}: process killed", addr);
-                    signal::kernel_kill_current();
+                    kill::kernel_kill_current();
                 }
                 Err(Fault::Segv) => kind = restricted::FAULT_UNMAPPED,
                 Err(Fault::Access) => kind = restricted::FAULT_PROTECTION,
@@ -208,16 +208,14 @@ fn exception(frame: &mut Frame) {
         crate::process::linux::trap_exception(frame, vector as u64, frame.error, fault_addr, kind);
         return;
     }
+    // A native server's: it dies of it (it has no signal handlers).
     if frame.from_user() && vector != 18 {
-        if signal::force(sig) {
-            // No handler: the process dies, so say why.
-            match vector {
-                14 if sig == signal::SIGBUS => crate::printkln!("[kernel] bus error at {:#x} (rip {:#x}), process killed", fault_addr, frame.rip),
-                14 => crate::printkln!("[kernel] segmentation fault at {:#x} (rip {:#x}), process killed", fault_addr, frame.rip),
-                _ => crate::printkln!("[kernel] {} (rip {:#x}), process killed", exception_name(vector), frame.rip),
-            }
+        match vector {
+            14 if sig == kill::SIGBUS => crate::printkln!("[kernel] bus error at {:#x} (rip {:#x}), process killed", fault_addr, frame.rip),
+            14 => crate::printkln!("[kernel] segmentation fault at {:#x} (rip {:#x}), process killed", fault_addr, frame.rip),
+            _ => crate::printkln!("[kernel] {} (rip {:#x}), process killed", exception_name(vector), frame.rip),
         }
-        return;
+        crate::process::exit_group(sig as i32);
     }
     let cr2 = fault_addr;
     panic!(

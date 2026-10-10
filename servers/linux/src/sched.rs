@@ -9,7 +9,7 @@
 //! thread's nice value (`SYS_THREAD_NICE`, by key), and the server picks
 //! the threads a call names: one, a process group's, or every one of the
 //! instance (one user). Lowering a nice value is allowed: the one user is
-//! root, with CAP_SYS_NICE, and RLIMIT_NICE has no limit.
+//! root, with CAP_SYS_NICE, which RLIMIT_NICE does not bind.
 
 use crate::process::{self, Pid};
 use crate::syscall;

@@ -17,8 +17,8 @@
 //! with `MAP_NORESERVE` and make all of it writable and executable at
 //! once; only what they touch counts. When the commit fails at a touch, the
 //! toucher is killed, never a process whose memory was committed (a copy
-//! by the kernel or the Linux server ends at its fixup and the process gets
-//! SIGKILL, see the page fault handler).
+//! by the kernel or the Linux server ends at its fixup and the process is
+//! killed, see the page fault handler).
 //!
 //! Page table entries carry three software bits: COW (a shared frame that
 //! is copied on the first write), PROT_NONE (a frame kept while its area
@@ -313,7 +313,7 @@ pub struct AddressSpace {
 }
 
 /// An address space as tasks hold it: shared by the threads of a process
-/// (and by a vfork child until it execs or exits).
+/// (and by a Linux program's vfork child until it execs or exits).
 pub struct Mm {
     /// What a context switch needs, readable without the lock.
     pub tlb: Arc<Tlb>,
@@ -351,14 +351,6 @@ impl Mm {
         // registrations, which no longer reach an address space.
         child.lock().copy_from(parent)?;
         Ok(child)
-    }
-
-    /// Writes `data` at `addr` as a user write would (the area must be
-    /// writable), from a thread that may not run in this space (fork's
-    /// CLONE_CHILD_SETTID into the child). A page or its backing from a
-    /// pager is waited for with the space unlocked, as a fault does.
-    pub fn write_user(&self, addr: u64, data: &[u8]) -> Result<(), Fault> {
-        self.retrying(|space| space.write_as(addr, data, true, false))
     }
 
     /// Runs `op` on the locked space until it no longer asks for a page
@@ -524,7 +516,9 @@ impl AddressSpace {
         self.vmas.range(..=addr).next_back().map(|(_, v)| v).filter(|v| addr < v.end)
     }
 
-    fn overlaps(&self, start: u64, end: u64) -> bool {
+    /// Whether any area lies in [start, end): one lookup, whatever the
+    /// range's size.
+    pub fn overlaps(&self, start: u64, end: u64) -> bool {
         self.vmas.range(..end).next_back().is_some_and(|(_, v)| v.end > start)
     }
 
@@ -1189,8 +1183,17 @@ impl AddressSpace {
     /// A page that must come from a pager is asked for, not waited for (the
     /// space is locked, and the pager may need it): best effort, as
     /// MAP_POPULATE is on Linux.
+    /// The thread's death ends it early (a range of 64 TiB is many pages),
+    /// and the CPU goes to others between pieces.
     pub fn populate(&mut self, start: u64, len: u64, write: bool) -> Result<(), Fault> {
-        for page in user_pages(start, start.saturating_add(len)) {
+        let end = start.checked_add(len).filter(|&e| e <= USER_END).ok_or(Fault::Segv)?;
+        for (i, page) in user_pages(start, end).enumerate() {
+            if i % 512 == 511 {
+                if super::kill::dying() {
+                    return Ok(());
+                }
+                super::sched::cond_resched();
+            }
             match self.fault_or_retry(page.start_address().as_u64(), Access { write, exec: false }, false) {
                 Ok(()) => {}
                 Err(Fault::Retry) => self.awaited = None,

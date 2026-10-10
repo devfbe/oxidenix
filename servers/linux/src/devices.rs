@@ -1,9 +1,8 @@
-//! Null and zero on the server's filesystems (phase R6d): a character device node names
-//! its driver by its number wherever it is (ADR 0007), so a node (1,3) or (1,5) on the
+//! Null and zero (phase R6d; /dev's since R9): a character device node names its driver
+//! by its number wherever it is (ADR 0007), so a node (1,3) or (1,5) in /dev, on the
 //! server's tmpfs or /data is null or zero, served here. The open file description keeps
 //! the node it was opened by (`Origin`): fstat is the node's, live, and the calls that
-//! change the node (fchmod, fchown, futimens) change it. The kernel's own /dev/null and
-//! /dev/zero stay the kernel's.
+//! change the node (fchmod, fchown, futimens) change it.
 //!
 //! Reads and writes check their buffers as Linux's (`rw_verify_area`, `import_iovec`):
 //! a count above `isize::MAX` is EINVAL, a range beyond the program's memory EFAULT, and

@@ -1,8 +1,8 @@
 //! The SMP scheduler: per-CPU run queues, wait queues, context switches.
 //!
-//! Lock order (outer to inner): process table → group info → group
-//! signals → thread signals → wait queue → task wake_lock → run queue. The
-//! heap and the frame allocator are leaves.
+//! Lock order (outer to inner): process table → group info → group exit →
+//! wait queue → task wake_lock → run queue. The heap and the frame
+//! allocator are leaves.
 //!
 //! Sleeping uses the classic protocol that cannot lose a wakeup:
 //!
@@ -89,14 +89,10 @@ impl PidReservation {
         let group = task.group.clone();
         // Nothing new comes out of a process that is ending or exec'ing:
         // neither a thread nor a forked child.
-        if current().group.sig.lock().exit != super::signal::GroupExit::None {
+        if *current().group.exit.lock() != super::kill::GroupExit::None {
             return Err(super::errno::EAGAIN);
         }
         let mut info = group.info.lock();
-        if task.tid() != group.tgid && group.sig.lock().joins_stop() {
-            // A thread born during a group stop stops too.
-            task.sig.lock().set_stop();
-        }
         info.threads.try_reserve(1).map_err(|_| super::errno::ENOMEM)?;
         info.threads.push(task.clone());
         drop(info);
@@ -647,7 +643,7 @@ pub struct Wait {
     _not_send: core::marker::PhantomData<*const ()>,
 }
 
-/// Channel for sleeps that only a deadline (or a signal) ends.
+/// Channel for sleeps that only a deadline (or a kick) ends.
 fn private_chan(pid: Pid) -> usize {
     0x4_0000_0000 + pid as usize
 }
@@ -666,7 +662,7 @@ pub fn prepare_to_wait(chan: usize) -> Wait {
     Wait { chan, _not_send: core::marker::PhantomData }
 }
 
-/// Prepares a sleep that ends only at a deadline or by a signal.
+/// Prepares a sleep that ends only at a deadline or by a kick.
 pub fn prepare_to_sleep() -> Wait {
     prepare_to_wait(private_chan(current().tid()))
 }
@@ -707,8 +703,8 @@ pub fn wakeup(chan: usize) {
     queue_of(chan).wake(chan);
 }
 
-/// Moves `t` from state `from` (Sleeping, or Stopped for SIGCONT/SIGKILL)
-/// back to running. Returns whether it did.
+/// Moves `t` from state `from` (Sleeping) back to running. Returns whether
+/// it did.
 pub fn try_wake(t: &Arc<Task>, from: State) -> bool {
     let _w = t.wake_lock.lock();
     if t.state() != from {

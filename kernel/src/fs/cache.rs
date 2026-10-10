@@ -6,11 +6,12 @@
 //! that maps a frame holds another, so a page dropped from the cache stays
 //! valid for its mappings until they are removed.
 //!
-//! The memory store (tmpfs files, anonymous shared memory) has no other
-//! copy of the data: its pages are committed memory and are never dropped
-//! while the file has them. A page missing within the file is read from the
-//! initramfs image (while that part of the file was never cut off) or is
-//! zero; `read` takes those bytes without creating the page.
+//! The memory store (the Linux server's tmpfs files, anonymous shared
+//! memory, the programs the kernel starts) has no other copy of the data:
+//! its pages are committed memory and are never dropped while the file has
+//! them. A page missing within the file is read from the boot image (while
+//! that part of the file was never cut off) or is zero; `read` takes those
+//! bytes without creating the page.
 //!
 //! The paged store belongs to a pager in user space (the Linux server): a
 //! missing page is requested from it and the thread that needs the page
@@ -539,6 +540,19 @@ impl PageCache {
         Self::new(Store::Memory { image, prepaid: 0 }, image.len() as u64, image.len() as u64)
     }
 
+    /// A program the kernel starts (a native server, the Linux server),
+    /// over its bytes in the boot image: every page committed now, so
+    /// that a page made at a fault never fails, whatever memory is left
+    /// then (a server must not die of a full tmpfs or commit limit when it
+    /// first runs a part of its code).
+    pub fn program(image: &'static [u8]) -> Result<Arc<PageCache>, i64> {
+        let pages = (image.len() as u64).div_ceil(PAGE);
+        if !memory::commit(pages) {
+            return Err(ENOMEM);
+        }
+        Self::new(Store::Memory { image, prepaid: pages }, image.len() as u64, image.len() as u64).inspect_err(|_| memory::uncommit(pages))
+    }
+
     /// Anonymous shared memory of `pages` zeroed pages, committed now.
     pub fn anonymous(pages: u64) -> Result<Arc<PageCache>, Fault> {
         if !memory::commit(pages) {
@@ -708,7 +722,7 @@ impl PageCache {
                         }
                     }
                 };
-                if crate::process::signal::dying() {
+                if crate::process::kill::dying() {
                     if let Ask::Backing = ask {
                         if let Some(p) = self.state.lock().pages.get_mut(&index) {
                             p.mkwrite = false;
@@ -790,27 +804,6 @@ impl PageCache {
         let wake = self.state.lock().fail_waiters(index, index + 1);
         self.wake(wake);
         Ok(())
-    }
-
-    /// A private in-memory copy of a file's current contents (a server's
-    /// program, kept unchanged whatever happens to the file later).
-    pub fn copy_of(file: &super::Inode) -> Result<Arc<PageCache>, i64> {
-        let size = file.size();
-        let copy = Self::anonymous(size.div_ceil(PAGE)).map_err(|_| ENOMEM)?;
-        let mut buf = Vec::new();
-        buf.try_reserve_exact(64 * 1024).map_err(|_| ENOMEM)?;
-        buf.resize(64 * 1024, 0);
-        let mut off = 0;
-        while off < size {
-            let n = file.read_at(off, &mut buf)?;
-            if n == 0 {
-                break;
-            }
-            copy.write(off, &buf[..n])?;
-            off += n as u64;
-        }
-        copy.truncate(off)?;
-        Ok(copy)
     }
 
     pub fn size(&self) -> u64 {
@@ -1856,7 +1849,7 @@ pub fn balance_dirty() {
     let deadline = crate::time::now() + THROTTLE;
     loop {
         let wait = crate::process::sched::prepare_to_wait(dirty_chan());
-        if dirty_pages() <= hard || crate::time::now() >= deadline || crate::process::signal::dying() {
+        if dirty_pages() <= hard || crate::time::now() >= deadline || crate::process::kill::dying() {
             break;
         }
         wait.sleep_until(deadline);

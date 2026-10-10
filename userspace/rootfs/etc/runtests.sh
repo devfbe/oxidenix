@@ -10,9 +10,9 @@ for t in forktest waittest leaktest sigtest sigframetest jobtest cowtest fstest 
 done
 
 # lxtest again, three times, its output into a pipe and beside a busy
-# reader of /proc (procfs over its channel, the server's own files) whose
-# fork, exec and wait pass through to the kernel: its checks hold in any
-# run and whatever else runs.
+# reader of /proc (procfs over its channel, the server's own files) that
+# forks, execs and waits all the time: its checks hold in any run and
+# whatever else runs.
 echo "=== lxtest x3 beside a busy reader"
 (while :; do cat /proc/counters /proc/self/stat > /dev/null; done) &
 busy=$!

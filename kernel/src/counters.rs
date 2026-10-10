@@ -13,16 +13,13 @@ use core::sync::atomic::{AtomicU64, Ordering};
 /// Counters every CPU keeps for itself (in its `smp::Cpu` block).
 pub struct PerCpu {
     pub syscalls: AtomicU64,
-    /// Linux system calls the Linux server passed back to the kernel's
-    /// implementation (see `linux::legacy`).
-    pub legacy_calls: AtomicU64,
     pub address_space_switches: AtomicU64,
     pub user_copy_bytes: AtomicU64,
 }
 
 impl PerCpu {
     pub const fn new() -> Self {
-        PerCpu { syscalls: AtomicU64::new(0), legacy_calls: AtomicU64::new(0), address_space_switches: AtomicU64::new(0), user_copy_bytes: AtomicU64::new(0) }
+        PerCpu { syscalls: AtomicU64::new(0), address_space_switches: AtomicU64::new(0), user_copy_bytes: AtomicU64::new(0) }
     }
 }
 
@@ -41,7 +38,6 @@ pub fn snapshot() -> procproto::Counters {
         let Some(cpu) = crate::smp::by_index(i) else { continue };
         let p = &cpu.counters;
         c.syscalls += p.syscalls.load(Ordering::Relaxed);
-        c.legacy_calls += p.legacy_calls.load(Ordering::Relaxed);
         c.address_space_switches += p.address_space_switches.load(Ordering::Relaxed);
         c.user_copy_bytes += p.user_copy_bytes.load(Ordering::Relaxed);
     }

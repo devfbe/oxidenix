@@ -17,10 +17,11 @@
 //! PCIDs neither switch flushes the TLB, and the server touches neither the
 //! FPU nor the FS/GS bases, so only general registers move.
 //!
-//! Phase R1: the server hands every system call back with `legacy_syscall`,
-//! which runs the kernel's own Linux implementation on the registers in
-//! `State`. Faults and exceptions of the program are still handled by the
-//! kernel directly, as before.
+//! The server implements every Linux system call (R9: the pass-through
+//! of phase R1, `legacy_syscall`, and the kernel's Linux code are gone);
+//! the kernel's part is the mechanism this module's calls offer
+//! (`server_call`). Faults the kernel cannot resolve and exceptions of the
+//! program go back to the server as `REASON_EXCEPTION`.
 
 use super::address_space::{free_level, USER_END};
 use super::errno::*;
@@ -47,8 +48,7 @@ pub fn table_flags() -> PageTableFlags {
 
 /// rflags bits a program may set: CF PF AF ZF SF TF DF OF (as sigreturn).
 const USER_FLAGS: u64 = 0xcd5;
-/// The server's program file, read once at boot: a restart of a process
-/// tree must not run whatever was written to /sbin/linux since.
+/// The server's program in the boot image.
 const SERVER_PATH: &str = "/sbin/linux";
 /// The largest server program accepted.
 const MAX_IMAGE: u64 = 16 * 1024 * 1024;
@@ -107,7 +107,7 @@ pub fn sync_wait(ticket: u64, except: Option<&Instance>, deadline: u64) -> bool 
         if asked.iter().all(|i| i.synced(ticket)) {
             return true;
         }
-        if super::signal::dying() || (deadline != 0 && crate::time::now() >= deadline) {
+        if super::kill::dying() || (deadline != 0 && crate::time::now() >= deadline) {
             return false;
         }
         if deadline != 0 {
@@ -115,6 +115,22 @@ pub fn sync_wait(ticket: u64, except: Option<&Instance>, deadline: u64) -> bool 
         } else {
             wait.sleep();
         }
+    }
+}
+
+/// `SYS_POWER`: every instance writes its caches back and flushes them
+/// (the caller's too: its pager is another thread), at most `SYNC_WAIT`
+/// (each request to diskfs is bounded on its own), then the machine powers
+/// off or restarts.
+fn power(how: u64) -> ! {
+    const SYNC_WAIT: u64 = 60 * crate::time::NSEC_PER_SEC;
+    let ticket = sync_start(None);
+    if !sync_wait(ticket, None, crate::time::now() + SYNC_WAIT) {
+        crate::printkln!("[kernel] power: a Linux server did not write its caches back");
+    }
+    match how {
+        POWER_RESTART => crate::restart(),
+        _ => crate::power_off(0),
     }
 }
 
@@ -138,7 +154,7 @@ pub fn settle(deadline: u64) -> bool {
 /// Reads the Linux server's program (at boot, once the root filesystem is
 /// there).
 pub fn init() {
-    match crate::fs::resolve("/", SERVER_PATH, true).and_then(|inode| PageCache::copy_of(&inode)) {
+    match crate::fs::program(SERVER_PATH).ok_or(ENOENT).and_then(PageCache::program) {
         Ok(image) => {
             IMAGE.call_once(|| image);
         }
@@ -249,12 +265,6 @@ struct PagerQueue {
 pub(super) enum Object {
     /// A memory object (pages that mappings and reads and writes share).
     Memory(Arc<PageCache>),
-    /// An open file description of the kernel's (`SYS_INODE_OPEN`), which
-    /// the server's descriptor table holds: its calls are
-    /// `SYS_KFILE_CALL`'s, `mo_map` maps it.
-    KernelFile(Arc<crate::fs::file::OpenFile>),
-    /// An inode of the kernel's tree (`super::linux_inode`).
-    Inode(Arc<crate::fs::Inode>),
     /// The contents of a file of the server's (a tmpfs file object), with
     /// the hold this handle carries (`SYS_MO_HOLD`).
     File(Arc<PageCache>, Option<Arc<Record>>),
@@ -275,12 +285,10 @@ pub struct Container {
     fresh: spin::Mutex<Option<Fresh>>,
 }
 
-/// The address space and working directory of a process without a thread
-/// yet, and the id its first thread takes. (A Linux program has no
-/// descriptor table of the kernel's: its descriptors are its server's.)
+/// The address space of a process without a thread yet, and the id its
+/// first thread takes.
 struct Fresh {
     mm: Arc<super::address_space::Mm>,
-    fs: Arc<super::task::FsInfo>,
     pid: super::sched::PidReservation,
 }
 
@@ -969,13 +977,6 @@ pub struct LinuxThread {
     pager: bool,
     /// The pager, which takes the instance's events.
     events: bool,
-    /// The server waits in `legacy_syscall`: the kernel runs the call in
-    /// the program's view.
-    in_legacy: bool,
-    /// The system call the program trapped with, while the server handles
-    /// it itself: signal delivery after it restarts it as the kernel's
-    /// own handling would (taken by a pass-through, which delivers itself).
-    trap_nr: Option<u64>,
     /// The thread's key (`slot | generation << 32`).
     key: u64,
     /// A program's thread whose end the service thread learns
@@ -1015,8 +1016,6 @@ impl LinuxThread {
             restricted: false,
             pager,
             events,
-            in_legacy: false,
-            trap_nr: None,
             key,
             announced: false,
             exit_told: false,
@@ -1076,7 +1075,7 @@ impl LinuxThread {
 
     /// Whether the thread's CPU shows the normal view (the server runs).
     pub fn normal_view(&self) -> bool {
-        !self.restricted && !self.in_legacy
+        !self.restricted
     }
 
     /// The kernel's address of the server's count of locks this thread
@@ -1167,8 +1166,8 @@ pub fn mode() -> Option<bool> {
     with_current(|p| p.linux.as_ref().map(|l| l.restricted))
 }
 
-/// Whether the calling thread runs its Linux server, with the normal view
-/// loaded (not in a legacy call).
+/// Whether the calling thread runs its Linux server (the normal view
+/// loaded).
 pub fn in_server() -> bool {
     with_current(|p| p.linux.as_ref().is_some_and(|l| l.normal_view()))
 }
@@ -1191,7 +1190,7 @@ fn instance() -> Result<Arc<Instance>, i64> {
 /// (see `restricted::SYS_*`). Mappings go into the calling thread's
 /// program view.
 pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
-    use super::address_space::{Backing, Prot};
+    use super::address_space::Backing;
     if nr == SYS_THREAD_EXIT {
         // Before anything of this call is on the stack: it does not return.
         if is_pager() {
@@ -1199,7 +1198,7 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             // instance broke and a lock it waits for is lost (`break_instance`):
             // then the service threads' process ends, and the instance with it.
             if instance_broken() {
-                super::exit_group(super::signal::SIGKILL as i32);
+                super::exit_group(super::kill::SIGKILL as i32);
             }
             return Err(EPERM);
         }
@@ -1212,15 +1211,6 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
     }
     let instance = instance()?;
     let page_aligned = |x: u64| x % PAGE == 0;
-    // A range of the program's memory: page-aligned, below 64 TiB.
-    let range = |addr: u64, len: u64| -> Result<u64, i64> {
-        let len = len.checked_add(PAGE - 1).ok_or(EINVAL)? & !(PAGE - 1);
-        if !page_aligned(addr) || len == 0 || addr.checked_add(len).is_none_or(|e| e > USER_END) {
-            return Err(EINVAL);
-        }
-        Ok(len)
-    };
-    let prot = |bits: u64| if bits & !7 != 0 { Err(EINVAL) } else { Ok(Prot::from_bits(bits)) };
     let mm = || super::current_mm().ok_or(EINVAL);
     match nr {
         SYS_HANDLE_CLOSE => {
@@ -1248,9 +1238,9 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             Ok(instance.insert(Object::Memory(object))? as i64)
         }
         SYS_MO_MAP => {
-            use super::sys_mem::{anon_backing, file_backing, place_and_map, Placement};
+            use super::vm::{anon_backing, place_and_map, Placement};
             let (handle, addr, offset, flags) = (a[0], a[1], a[3], a[5]);
-            let prot = prot(a[4])?;
+            let prot = super::vm::prot(a[4])?;
             let all = MO_SHARED | MO_FIXED | MO_NOREPLACE | MO_NORESERVE | MO_POPULATE | MO_READONLY | MO_GROWSDOWN;
             let may_write = flags & MO_READONLY == 0;
             if !page_aligned(addr) || !page_aligned(offset) || flags & !all != 0 {
@@ -1279,8 +1269,7 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
                         offset.checked_add(len).filter(|&e| e <= cache.size()).ok_or(EINVAL)?;
                         Backing::File { cache, offset, shared, may_write, _hold: None }
                     }
-                    Object::KernelFile(f) => file_backing(&f, shared, prot, len, offset)?,
-                    Object::Inode(_) | Object::Image(_) | Object::Channel(_) | Object::Process(_) => return Err(EINVAL),
+                    Object::Image(_) | Object::Channel(_) | Object::Process(_) => return Err(EINVAL),
                     // As a file's mapping: it may reach beyond the end (SIGBUS
                     // there), and keeps the handle's hold while it exists.
                     Object::File(cache, hold) => {
@@ -1297,9 +1286,9 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             };
             place_and_map(addr, len, prot, backing, placement)
         }
-        SYS_VM_REMAP => super::sys_mem::mremap(a[0], a[1], a[2], a[3], a[4]),
-        SYS_VM_DISCARD => super::sys_mem::madvise(a[0], a[1], 4),
-        SYS_VM_SYNC => super::sys_mem::msync_server(a[0], a[1], a[2], a[3], a[4]),
+        SYS_VM_REMAP => super::vm::remap(a[0], a[1], a[2], a[3], a[4]),
+        SYS_VM_DISCARD => super::vm::discard(a[0], a[1]),
+        SYS_VM_SYNC => super::vm::sync(a[0], a[1], a[2], a[3], a[4]),
         SYS_MO_CREATE_PAGED => {
             let pages = a[0];
             if pages == 0 || pages > USER_END / PAGE {
@@ -1340,50 +1329,6 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             drop(q);
             super::wakeup(sync_chan());
             Ok(0)
-        }
-        SYS_KFILE_CALL => {
-            let Object::KernelFile(f) = instance.object(a[0])? else { return Err(EINVAL) };
-            const SYS_READ: u64 = 0;
-            const SYS_WRITE: u64 = 1;
-            const SYS_FSTAT: u64 = 5;
-            const SYS_FSTATFS: u64 = 138;
-            match a[1] {
-                // Into the server's memory: it adds what it keeps (times).
-                SYS_FSTAT => {
-                    super::uaccess::copy_to_server(a[2], &super::sys_file::file_stat(&f)?)?;
-                    Ok(0)
-                }
-                SYS_FSTATFS => {
-                    let words = super::sys_file::statfs_words(f.inode().ok_or(EINVAL)?);
-                    let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-                    super::uaccess::copy_to_server(a[2], &bytes)?;
-                    Ok(0)
-                }
-                nr if nr & KFILE_SERVER_BUFFER != 0 => {
-                    let (buf, len) = (a[2], a[3].min(64 * 1024) as usize);
-                    let mut data = Vec::new();
-                    data.try_reserve_exact(len).map_err(|_| ENOMEM)?;
-                    data.resize(len, 0);
-                    match nr & !KFILE_SERVER_BUFFER {
-                        SYS_READ => {
-                            let n = f.read(&mut data)?;
-                            super::uaccess::copy_to_server(buf, &data[..n])?;
-                            Ok(n as i64)
-                        }
-                        SYS_WRITE => {
-                            super::uaccess::copy_from_server(buf, &mut data)?;
-                            Ok(f.write(&data)? as i64)
-                        }
-                        _ => Err(EINVAL),
-                    }
-                }
-                nr => super::sys_file::file_call(&f, nr, [a[2], a[3], a[4], a[5]]),
-            }
-        }
-        SYS_KFILE_INODE => {
-            let Object::KernelFile(f) = instance.object(a[0])? else { return Err(EINVAL) };
-            let inode = f.inode().cloned().ok_or(ENOTDIR)?;
-            Ok(instance.insert(Object::Inode(inode))? as i64)
         }
         SYS_SERVER_WAIT => {
             let (list, n, deadline, flags) = (a[0], a[1], a[2], a[3]);
@@ -1427,7 +1372,6 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             Ok(0)
         }
         SYS_SHARED_MAP => Ok(instance.grow_heap(a[0])? as i64),
-        SYS_INODE_ROOT..=SYS_INODE_STATFS => super::linux_inode::call(&instance, nr, a),
         SYS_INITRAMFS => {
             let image = crate::fs::initramfs().ok_or(ENOENT)?;
             super::uaccess::copy_to_server(a[0], &(image.len() as u64).to_le_bytes())?;
@@ -1482,7 +1426,7 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
                 _ => crate::fs::cache::Backing::Ignore,
             };
             match nr {
-                // As the kernel's tmpfs files are read and written.
+                // The server's tmpfs files' reads and writes.
                 SYS_MO_FILE_READ => {
                     let n = super::uaccess::read_to_user(buf, len, true, |chunk, done| cache.read_with(offset + done, chunk, fill))?;
                     Ok(n as i64)
@@ -1517,7 +1461,47 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             });
             if set { Ok(0) } else { Err(EBUSY) }
         }
-        SYS_CLOCK_READ => super::sys_time::read_own_clock(a[0]).map(|ns| ns as i64),
+        SYS_CLOCK_READ => super::clock::read(a[0]).map(|ns| ns as i64),
+        // On the program's memory (in this view, below 64 TiB).
+        SYS_FUTEX_WAIT | SYS_FUTEX_WAKE | SYS_FUTEX_REQUEUE => {
+            if is_pager() {
+                return Err(EPERM);
+            }
+            super::native::futex_call(nr, a)
+        }
+        SYS_THREAD_FS => {
+            use x86_64::registers::model_specific::FsBase;
+            if !serves_program() {
+                return Err(EPERM);
+            }
+            let old = FsBase::read().as_u64();
+            match a[0] {
+                0 => {}
+                1 if a[1] < USER_END => FsBase::write(x86_64::VirtAddr::new(a[1])),
+                _ => return Err(EINVAL),
+            }
+            Ok(old as i64)
+        }
+        SYS_CLOCK_SET => {
+            crate::time::set_realtime(a[0]);
+            Ok(0)
+        }
+        SYS_POWER => {
+            if a[0] != POWER_OFF && a[0] != POWER_RESTART {
+                return Err(EINVAL);
+            }
+            // Nothing of this call may stay referenced: it does not return.
+            drop(instance);
+            power(a[0])
+        }
+        SYS_FILE_PAGES => {
+            let (used, limit) = crate::fs::cache::tmpfs_usage();
+            let mut out = [0u8; 16];
+            out[..8].copy_from_slice(&used.to_le_bytes());
+            out[8..].copy_from_slice(&limit.to_le_bytes());
+            super::uaccess::copy_to_server(a[0], &out)?;
+            Ok(0)
+        }
         SYS_SLEEP_UNTIL => match a[1] {
             0 => super::sleep_until(a[0]).map(|_| 0),
             SLEEP_NAP => {
@@ -1770,17 +1754,8 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             let end = instance.channel(a[0])?;
             end.channel.revoke(u32::try_from(a[1]).map_err(|_| EINVAL)?)
         }
-        SYS_MO_UNMAP => {
-            let len = range(a[0], a[1])?;
-            mm()?.lock().unmap(a[0], len);
-            Ok(0)
-        }
-        SYS_MO_PROTECT => {
-            let len = range(a[0], a[1])?;
-            let prot = prot(a[2])?;
-            mm()?.lock().protect(a[0], len, prot).map_err(|e| if e == super::address_space::Fault::Access { EACCES } else { ENOMEM })?;
-            Ok(0)
-        }
+        SYS_MO_UNMAP => super::vm::unmap(a[0], a[1]),
+        SYS_MO_PROTECT => super::vm::protect(a[0], a[1], a[2]),
         SYS_MO_READ | SYS_MO_WRITE => {
             let (handle, offset, buf, len) = (a[0], a[1], a[2], a[3]);
             let object = instance.object(handle)?;
@@ -1852,7 +1827,7 @@ fn container(instance: &Instance, handle: u64) -> Result<Arc<Container>, i64> {
 /// program stops at once (see `restricted::SYS_THREAD_KICK`).
 pub fn kick_task(t: &Arc<super::task::Task>) {
     t.kicked.store(true, core::sync::atomic::Ordering::SeqCst);
-    super::signal::kick(t);
+    super::kill::kick(t);
 }
 
 /// Whether the calling thread's instance is broken (`break_instance`).
@@ -1887,7 +1862,7 @@ pub fn kill_task(t: &Arc<super::task::Task>) {
 }
 
 /// Whether the calling thread of a Linux program was kicked or must die:
-/// its interruptible waits end (`signal::interrupted`).
+/// its interruptible waits end (`kill::interrupted`).
 pub fn kicked() -> bool {
     let me = super::sched::current();
     me.kicked.load(core::sync::atomic::Ordering::SeqCst) || dying()
@@ -1897,7 +1872,7 @@ pub fn kicked() -> bool {
 /// or its process is ending (`exit_group`, the kernel's kill).
 pub fn dying() -> bool {
     let me = super::sched::current();
-    me.killed.load(core::sync::atomic::Ordering::SeqCst) || me.group.sig.lock().exit != super::signal::GroupExit::None
+    me.killed.load(core::sync::atomic::Ordering::SeqCst) || *me.group.exit.lock() != super::kill::GroupExit::None
 }
 
 /// Whether the calling thread serves a program (not a service thread, not a
@@ -1923,7 +1898,7 @@ fn process_call(instance: &Arc<Instance>, nr: u64, a: [u64; 6]) -> SysResult {
             Ok(instance.insert(Object::Process(c))? as i64)
         }
         SYS_PROC_CREATE => {
-            use super::task::{FsInfo, Info, ThreadGroup};
+            use super::task::{Info, ThreadGroup};
             let flags = a[0];
             let vm = flags & (PROC_FORK | PROC_SHARE_VM);
             if flags & !(PROC_FORK | PROC_SHARE_VM) != 0 || (vm != PROC_FORK && vm != PROC_SHARE_VM) {
@@ -1932,14 +1907,13 @@ fn process_call(instance: &Arc<Instance>, nr: u64, a: [u64; 6]) -> SysResult {
             let pid = super::sched::reserve_pid()?;
             let mm = with_current(|p| p.mm.clone()).ok_or(EINVAL)?;
             let mm = if vm == PROC_SHARE_VM { mm } else { super::address_space::Mm::fork(&mm.lock()).map_err(|_| ENOMEM)? };
-            let fs = FsInfo::new(alloc::string::String::from("/")).ok_or(ENOMEM)?;
             let name = super::sched::current().group.info.lock().name.clone();
-            let mut info = Info::new(0, 0, 0, name);
+            let mut info = Info::new(name);
             info.mem = Some(mm.stats.clone());
-            let group = ThreadGroup::new(pid.pid, info, Default::default()).ok_or(ENOMEM)?;
+            let group = ThreadGroup::new(pid.pid, info).ok_or(ENOMEM)?;
             group.instance.store(instance.id, Release);
             group.server_reaps.store(true, Relaxed);
-            let c = Arc::try_new(Container { group, fresh: spin::Mutex::new(Some(Fresh { mm, fs, pid })) }).map_err(|_| ENOMEM)?;
+            let c = Arc::try_new(Container { group, fresh: spin::Mutex::new(Some(Fresh { mm, pid })) }).map_err(|_| ENOMEM)?;
             Ok(instance.insert(Object::Process(c))? as i64)
         }
         SYS_THREAD_CREATE => thread_create(instance, a),
@@ -1971,7 +1945,6 @@ fn process_call(instance: &Arc<Instance>, nr: u64, a: [u64; 6]) -> SysResult {
                 out.running = info.threads.iter().filter(|t| matches!(t.state(), super::task::State::Running | super::task::State::Runnable)).count() as u64;
             }
             out.killed = group.killed_by_kernel.load(Acquire);
-            out.legacy_calls = group.legacy_calls.load(Relaxed);
             super::uaccess::copy_to_server(a[1], as_bytes(&out))?;
             Ok(0)
         }
@@ -2080,24 +2053,21 @@ fn thread_create(instance: &Arc<Instance>, a: [u64; 6]) -> SysResult {
     let mut program = Frame::default();
     load(&regs, &mut program)?;
     let me = super::sched::current();
-    let (group, mm, fs, pid) = if process == 0 {
-        let (mm, fs) = with_current(|p| (p.mm.clone(), p.fs.clone()));
-        (me.group.clone(), mm.ok_or(EINVAL)?, fs.ok_or(EINVAL)?, super::sched::reserve_pid()?)
+    let (group, mm, pid) = if process == 0 {
+        let mm = with_current(|p| p.mm.clone());
+        (me.group.clone(), mm.ok_or(EINVAL)?, super::sched::reserve_pid()?)
     } else {
         let c = container(instance, process)?;
         let fresh = c.fresh.lock().take().ok_or(EBUSY)?;
-        (c.group.clone(), fresh.mm, fresh.fs, fresh.pid)
+        (c.group.clone(), fresh.mm, fresh.pid)
     };
     let (linux, start) = LinuxThread::new(instance.clone(), &program, ROLE_PROGRAM, cookie)?;
     let key = linux.key();
     let own = super::Process {
         mm: Some(mm),
-        files: None,
-        fs: Some(fs),
         io_bitmap: None,
         server: None,
         clear_child_tid: ctid,
-        vfork_done: None,
         linux: Some(linux),
         copy_fixup: None,
     };
@@ -2206,7 +2176,6 @@ fn trap_with(f: &mut Frame, reason: u64, detail: [u64; 4]) {
     x86_64::instructions::interrupts::without_interrupts(|| {
         with_current(|p| {
             let l = p.linux.as_mut().expect("a Linux thread");
-            l.trap_nr = (reason == REASON_SYSCALL).then_some(f.rax);
             let state = l.state();
             save(f, state);
             [state.trap_vector, state.trap_error, state.trap_addr, state.trap_kind] = detail;
@@ -2242,7 +2211,7 @@ pub fn enter(f: &mut Frame) -> Result<(), i64> {
             f.rax = REASON_EXIT;
             return Ok(());
         }
-        super::exit_thread(super::signal::SIGKILL as i32);
+        super::exit_thread(super::kill::SIGKILL as i32);
     }
     let me = super::sched::current();
     if me.kicked.swap(false, core::sync::atomic::Ordering::SeqCst) {
@@ -2257,7 +2226,6 @@ pub fn enter(f: &mut Frame) -> Result<(), i64> {
             l.normal = *f;
             *f = program;
             l.restricted = true;
-            l.trap_nr = None;
             Ok::<_, i64>(())
         })
         .inspect(|_| switch_view(false))
@@ -2271,62 +2239,6 @@ pub fn server_fault(rip: u64) -> Option<u64> {
     let instance = with_current(|p| p.linux.as_ref().map(|l| l.instance.clone()))?;
     let &(insn, fixup) = instance.usercopy.get()?;
     (rip == insn).then_some(fixup)
-}
-
-/// legacy_syscall() from the server: the kernel's Linux implementation
-/// carries out the system call in `State`, which then holds the result (or
-/// the new program after execve, or a signal frame).
-///
-/// The call runs in the program's view, as it would without the server:
-/// the server's memory is then out of reach of the kernel's Linux code
-/// altogether, not only because every user pointer is checked against
-/// 64 TiB (`uaccess`).
-pub fn legacy() -> Result<u64, i64> {
-    let state = with_current(|p| {
-        let l = p.linux.as_mut().filter(|l| !l.pager)?;
-        Some(*l.state())
-    })
-    .ok_or(EPERM)?;
-    let mut program = Frame::default();
-    load(&state, &mut program)?;
-    crate::counters::add(|c| &c.legacy_calls, 1);
-    super::sched::current().group.legacy_calls.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    // Processes and signals are the server's (R8): the kernel's Linux code
-    // must not create, end, exec, wait for or signal a Linux program's
-    // processes behind the server's tables, whatever a server passes on.
-    const SERVERS_OWN: &[u64] = &[
-        13, 14, 15, 34, 36, 37, 38, 56, 57, 58, 59, 60, 61, 62, 109, 112, 127, 128, 129, 130, 131, 200, 218, 219, 231, 234, 247, 297, 322, 435,
-    ];
-    if SERVERS_OWN.contains(&program.rax) {
-        program.rax = (-ENOSYS) as u64;
-        with_current(|p| {
-            if let Some(l) = p.linux.as_mut() {
-                save(&program, l.state());
-            }
-        });
-        return Ok(0);
-    }
-    set_legacy(true);
-    super::syscall::dispatch_linux(&mut program);
-    set_legacy(false);
-    with_current(|p| {
-        if let Some(l) = p.linux.as_mut() {
-            save(&program, l.state());
-        }
-    });
-    Ok(0)
-}
-
-/// Enters or leaves a legacy call: the view follows.
-fn set_legacy(on: bool) {
-    x86_64::instructions::interrupts::without_interrupts(|| {
-        with_current(|p| {
-            if let Some(l) = p.linux.as_mut() {
-                l.in_legacy = on;
-            }
-        });
-        switch_view(!on);
-    });
 }
 
 /// event_wait(event, deadline): the instance's next event (a page a

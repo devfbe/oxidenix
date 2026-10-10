@@ -1,5 +1,9 @@
-//! futex(2): sleeping on a user-space word, the base of every pthread
-//! mutex, condition variable and join.
+//! Futexes: sleeping on a word of user memory, the mechanism under every
+//! pthread mutex, condition variable and join. Linux's futex(2) is the
+//! Linux server's (its operations, timeouts and restarts); the kernel
+//! offers waiting, waking and requeueing by key (`restricted::SYS_FUTEX_*`,
+//! for a Linux program's memory through its server and for a native
+//! server's own), and the server's own words (`server_wait`).
 //!
 //! A futex is identified by a key: for private futexes (and futexes in
 //! private memory) the address space and the address, for futexes in shared
@@ -36,20 +40,12 @@ use super::errno::*;
 use crate::fs::cache::PageCache;
 use super::sched::{current, current_arc, prepare_to_sleep, try_wake};
 use super::task::{State, Task};
-use super::{signal, uaccess, Pid};
+use super::{kill, uaccess, Pid};
 use crate::sync::IrqSpinLock;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-const FUTEX_WAIT: u64 = 0;
-const FUTEX_WAKE: u64 = 1;
-const FUTEX_REQUEUE: u64 = 3;
-const FUTEX_CMP_REQUEUE: u64 = 4;
-const FUTEX_WAIT_BITSET: u64 = 9;
-const FUTEX_WAKE_BITSET: u64 = 10;
-const FUTEX_PRIVATE_FLAG: u64 = 128;
-const FUTEX_CLOCK_REALTIME: u64 = 256;
 const FUTEX_BITSET_MATCH_ANY: u32 = u32::MAX;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -147,25 +143,10 @@ fn key_of(uaddr: u64, private: bool) -> Result<(Key, Option<Arc<PageCache>>), i6
     })
 }
 
-/// Deadline (nanoseconds of the monotonic clock) for a futex timeout at
-/// `ts` (a timespec): an interval for FUTEX_WAIT, an absolute time
-/// (monotonic, or the realtime clock) for FUTEX_WAIT_BITSET.
-fn deadline(ts: u64, absolute: bool, realtime: bool) -> Result<Option<u64>, i64> {
-    if ts == 0 {
-        return Ok(None);
-    }
-    let t = super::sys_time::read_timespec(ts)?;
-    let now = crate::time::now();
-    Ok(Some(if !absolute {
-        now.saturating_add(t)
-    } else if realtime {
-        now.saturating_add(t.saturating_sub(crate::time::realtime()))
-    } else {
-        t
-    }))
-}
-
-fn wait(uaddr: u64, val: u32, deadline: Option<u64>, bitset: u32, private: bool) -> Result<i64, i64> {
+/// Waits while the word at `uaddr` of the caller's address space holds
+/// `val`, until a wake with a bit of `bitset`, `deadline` (monotonic
+/// nanoseconds) or a kick (`kill::interrupted`).
+pub fn wait(uaddr: u64, val: u32, deadline: Option<u64>, bitset: u32, private: bool) -> Result<i64, i64> {
     if bitset == 0 {
         return Err(EINVAL);
     }
@@ -199,9 +180,9 @@ impl Ends {
     /// Whether the wait ends now.
     fn now(self) -> bool {
         match self {
-            Ends::Interrupted => signal::interrupted(),
-            Ends::Dying => signal::dying(),
-            Ends::SleepLock => signal::dying() || super::linux::instance_broken(),
+            Ends::Interrupted => kill::interrupted(),
+            Ends::Dying => kill::dying(),
+            Ends::SleepLock => kill::dying() || super::linux::instance_broken(),
             Ends::Lock => super::linux::instance_broken(),
         }
     }
@@ -346,7 +327,9 @@ fn wake_in(b: &mut Vec<Waiter>, key: &Key, n: u64, bitset: u32) -> u64 {
     woken
 }
 
-fn wake(uaddr: u64, n: u64, bitset: u32, private: bool) -> Result<i64, i64> {
+/// Wakes at most `n` waiters of the word at `uaddr` that share a bit of
+/// `bitset`; how many.
+pub fn wake(uaddr: u64, n: u64, bitset: u32, private: bool) -> Result<i64, i64> {
     if bitset == 0 {
         return Err(EINVAL);
     }
@@ -357,7 +340,7 @@ fn wake(uaddr: u64, n: u64, bitset: u32, private: bool) -> Result<i64, i64> {
 
 /// Wakes up to `n_wake` waiters of `uaddr` and moves up to `n_move` more
 /// to `uaddr2`; with `cmp`, only if the word still holds that value.
-fn requeue(uaddr: u64, n_wake: u64, n_move: u64, uaddr2: u64, cmp: Option<u32>, private: bool) -> Result<i64, i64> {
+pub fn requeue(uaddr: u64, n_wake: u64, n_move: u64, uaddr2: u64, cmp: Option<u32>, private: bool) -> Result<i64, i64> {
     let (from, to) = (key_of(uaddr, private)?.0, key_of(uaddr2, private)?.0);
     let (i1, i2) = (bucket_of(&from), bucket_of(&to));
     loop {
@@ -417,8 +400,6 @@ fn requeue(uaddr: u64, n_wake: u64, n_move: u64, uaddr2: u64, cmp: Option<u32>, 
     }
 }
 
-/// Wakes one waiter of the (shared-keyed) futex at `uaddr`: the join of a
-/// thread that exits (CLONE_CHILD_CLEARTID).
 /// Waits on the word at `addr` of the Linux server's memory (instance
 /// `instance`), read through `word`, while it holds `val`.
 pub fn server_wait(instance: usize, addr: u64, word: &core::sync::atomic::AtomicU32, val: u32, deadline: Option<u64>, ends: Ends) -> Result<i64, i64> {
@@ -452,7 +433,7 @@ impl<'a> WaitWord<'a> {
 
 /// Waits until any of `words` is woken, while each holds its value (EAGAIN
 /// at once if one does not), until `deadline` or, if `interruptible`, a
-/// signal (a fatal one always): the Linux server's wait for any of several
+/// kick (the thread's death always): the Linux server's wait for any of several
 /// events (`restricted::SYS_SERVER_WAIT`: poll, select and epoll_wait wait
 /// on their own word and on the words netd wakes). EPIPE if a word's object
 /// was hung up.
@@ -601,28 +582,8 @@ pub fn server_wake(instance: usize, addr: u64, n: u64) -> i64 {
     wake_in(&mut b, &key, n, FUTEX_BITSET_MATCH_ANY) as i64
 }
 
+/// Wakes one waiter of the (shared-keyed) futex at `uaddr`: the join of a
+/// thread that exits (CLONE_CHILD_CLEARTID).
 pub fn wake_one(uaddr: u64) -> Result<i64, i64> {
     wake(uaddr, 1, FUTEX_BITSET_MATCH_ANY, false)
-}
-
-/// futex(uaddr, op, val, timeout/val2, uaddr2, val3).
-pub fn futex(uaddr: u64, op: u64, val: u64, timeout: u64, uaddr2: u64, val3: u64) -> SysResult {
-    let private = op & FUTEX_PRIVATE_FLAG != 0;
-    let realtime = op & FUTEX_CLOCK_REALTIME != 0;
-    let cmd = op & !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
-    if realtime && !matches!(cmd, FUTEX_WAIT | FUTEX_WAIT_BITSET) {
-        return Err(ENOSYS);
-    }
-    let count = |n: u64| (n as u32 as i32).max(0) as u64;
-    match cmd {
-        FUTEX_WAIT => wait(uaddr, val as u32, deadline(timeout, false, false)?, FUTEX_BITSET_MATCH_ANY, private),
-        FUTEX_WAIT_BITSET => wait(uaddr, val as u32, deadline(timeout, true, realtime)?, val3 as u32, private),
-        FUTEX_WAKE => wake(uaddr, count(val), FUTEX_BITSET_MATCH_ANY, private),
-        FUTEX_WAKE_BITSET => wake(uaddr, count(val), val3 as u32, private),
-        // For the requeue operations the timeout argument is a count.
-        FUTEX_REQUEUE => requeue(uaddr, count(val), count(timeout), uaddr2, None, private),
-        FUTEX_CMP_REQUEUE => requeue(uaddr, count(val), count(timeout), uaddr2, Some(val3 as u32), private),
-        // FUTEX_WAKE_OP and the priority-inheritance operations.
-        _ => Err(ENOSYS),
-    }
 }

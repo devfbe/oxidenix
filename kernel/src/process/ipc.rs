@@ -199,7 +199,7 @@ fn receive_loop(buf: u64, len: u64, id_out: u64, deadline: Option<u64>) -> SysRe
                 return Ok(message.len() as i64);
             }
             Err(()) => {
-                if super::signal::interrupted() {
+                if super::kill::interrupted() {
                     return Err(EINTR);
                 }
                 match deadline {
@@ -372,7 +372,7 @@ pub fn wait_for(name: &str, timeout: u64) -> Option<(usize, u64)> {
         }
         // A dying caller stops waiting; a signal does not end the wait (a
         // tick's sleep that a pending signal would not end, so no spin).
-        if super::signal::dying() {
+        if super::kill::dying() {
             return None;
         }
         super::sched::prepare_to_sleep().sleep_until(now.saturating_add(crate::timer::TICK_NS).min(deadline));

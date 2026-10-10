@@ -593,7 +593,7 @@ static void opath(void) {
     chdir(cwd);
     close(dir);
     int n = open("/dev/null", O_PATH);
-    check("O_PATH on the kernel's /dev/null: its node, EBADF to write",
+    check("O_PATH on /dev/null: its node, EBADF to write",
           n >= 0 && fstat(n, &st) == 0 && S_ISCHR(st.st_mode) && major(st.st_rdev) == 1 && write(n, "x", 1) == -1 && errno == EBADF);
     close(n);
     int ln = open("/tmp/opath/link", O_PATH | O_NOFOLLOW);
