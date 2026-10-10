@@ -20,8 +20,9 @@
 #define PG 4096
 #define MIB (1024 * 1024L)
 /* The file: as large as the memory that using all the commit limit
- * leaves free, and 8 MiB more, less the kernel's reserve (16 MiB, which
- * user memory cannot take), so that its pages must give way. */
+ * leaves to the cache (free, and other files' cached pages, which go
+ * first), and 8 MiB more, less the kernel's reserve (16 MiB, which user
+ * memory cannot take), so that its pages must give way. */
 static long SIZE, PAGES;
 #define MAPPERS 4
 #define HOGS 2
@@ -116,7 +117,8 @@ int main(int argc, char **argv) {
     char path[256];
     snprintf(path, sizeof path, "%s/reclaimtest.file", dir);
     long left = (meminfo("CommitLimit:") - meminfo("Committed_AS:")) * 1024;
-    SIZE = (meminfo("MemFree:") * 1024 - left - 8 * MIB) / MIB * MIB;
+    long other = (meminfo("Cached:") - meminfo("Shmem:")) * 1024;
+    SIZE = (meminfo("MemFree:") * 1024 + other - left - 8 * MIB) / MIB * MIB;
     if (SIZE < 8 * MIB) SIZE = 8 * MIB;
     if (SIZE > 40 * MIB) SIZE = 40 * MIB;
     PAGES = SIZE / PG;

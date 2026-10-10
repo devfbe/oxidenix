@@ -67,14 +67,16 @@ static long meminfo(const char *key) {
  * of pages it did not use since are removed), and the child, reading the
  * file again through its mapping, gets every page back from the disk.
  * The file is as large as the memory that using all the commit limit
- * leaves free (memory promised to others but not used) and 8 MiB more,
+ * leaves to the cache (memory promised to others but not used, and what
+ * other files' cached pages hold now, which go first) and 8 MiB more,
  * less the kernel's reserve (16 MiB, which user memory cannot take), so
  * at least 8 MiB of it must go. */
 static void mapped_pages_give_way(const char *dir) {
     char path[256];
     snprintf(path, sizeof path, "%s/cachetest.mapped", dir);
     long room = (meminfo("CommitLimit:") - meminfo("Committed_AS:")) * 1024 - MIB;
-    long mapped = (meminfo("MemFree:") * 1024 - room - 8 * MIB) / MIB * MIB;
+    long other = (meminfo("Cached:") - meminfo("Shmem:")) * 1024;
+    long mapped = (meminfo("MemFree:") * 1024 + other - room - 8 * MIB) / MIB * MIB;
     if (mapped < 8 * MIB) mapped = 8 * MIB;
     if (mapped > 40 * MIB) mapped = 40 * MIB;
     int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
