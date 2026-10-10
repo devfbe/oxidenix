@@ -36,6 +36,8 @@ struct RamDisk {
     log: Option<Vec<Event>>,
     /// The device says it takes no writes (`Device::read_only`).
     read_only: bool,
+    /// Writes "succeed" without changing anything (a device that lies).
+    lose_writes: bool,
 }
 
 /// A device request, as the crash tests replay them.
@@ -92,6 +94,9 @@ impl Device for RamDisk {
             return Err(());
         }
         let at = lba as usize * 512;
+        if self.lose_writes {
+            return Ok(());
+        }
         self.data.get_mut(at..at + buf.len()).ok_or(())?.copy_from_slice(buf);
         self.counts.writes += 1;
         if let Some(log) = &mut self.log {
@@ -150,7 +155,7 @@ fn mkfs(name: &str, kib: usize) -> RamDisk {
     assert!(ok, "mke2fs failed");
     let data = std::fs::read(&path).unwrap();
     std::fs::remove_file(&path).unwrap();
-    RamDisk { data, counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false }
+    RamDisk { data, counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false, lose_writes: false }
 }
 
 /// e2fsck -fn on the disk's contents.
@@ -629,7 +634,7 @@ fn crash_image(base: &[u8], log: &[Event], epoch: usize, seed: u64) -> Vec<u8> {
 /// Errors are allowed (ext2 has no journal: a crash may leave an
 /// inconsistency for e2fsck), stale data is not.
 fn assert_no_secret(image: Vec<u8>, what: &str) {
-    let disk = RamDisk { data: image, counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false };
+    let disk = RamDisk { data: image, counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false, lose_writes: false };
     let Ok(mut fs) = Ext2::mount(disk) else { return };
     let mut dirs = vec![ROOT_INO];
     let mut seen = std::collections::HashSet::new();
@@ -731,11 +736,11 @@ fn a_crash_never_exposes_freed_blocks() {
 fn impossible_group_sizes_are_refused_at_mount() {
     let good = mkfs("sizes", 2 * 1024);
     for (offset, value) in [(32usize, 8 * 1024 + 1u32), (40, 8 * 1024 + 1), (32, 0)] {
-        let mut disk = RamDisk { data: good.data.clone(), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false };
+        let mut disk = RamDisk { data: good.data.clone(), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false, lose_writes: false };
         disk.data[1024 + offset..1024 + offset + 4].copy_from_slice(&value.to_le_bytes());
         assert!(Ext2::mount(disk).is_err(), "superblock field {offset} = {value}");
     }
-    let mut disk = RamDisk { data: good.data.clone(), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false };
+    let mut disk = RamDisk { data: good.data.clone(), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false, lose_writes: false };
     disk.data[1024 + 88..1024 + 90].copy_from_slice(&2048u16.to_le_bytes());
     assert!(Ext2::mount(disk).is_err(), "inodes larger than a block");
     assert!(Ext2::mount(good).is_ok());
@@ -1159,7 +1164,7 @@ fn crashes_never_free_a_named_or_a_free_inode() {
     for epoch in 0..=epochs {
         for seed in 0..32 {
             let image = crash_image(&base, &log, epoch, seed);
-            let d = RamDisk { data: image, counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false };
+            let d = RamDisk { data: image, counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false, lose_writes: false };
             let mut fs = Ext2::mount(d).unwrap();
             fs.recover_orphans(|_| false).unwrap();
             assert!(fs.orphans().is_empty());
@@ -1255,7 +1260,7 @@ fn failed_commits_never_free_a_named_or_a_free_inode() {
     fs.unlink(ROOT_INO, "held-1", false).unwrap();
     let base = take(fs).data;
     // How many writes and flushes the sequence makes when nothing fails.
-    let mut fs = Ext2::mount(RamDisk { data: base.clone(), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false }).unwrap();
+    let mut fs = Ext2::mount(RamDisk { data: base.clone(), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false, lose_writes: false }).unwrap();
     // The handles the caller holds: (number, generation).
     let handles: Vec<(u32, u32)> = files.iter().map(|&f| (f, fs.stat(f).unwrap().generation)).collect();
     let before = fs.device().counts.clone();
@@ -1268,7 +1273,7 @@ fn failed_commits_never_free_a_named_or_a_free_inode() {
     let modes = (0..writes).map(|n| (0, n)).chain((0..flushes).map(|n| (1, n))).chain((0..writes).map(|n| (2, n)));
     for (mode, n) in modes {
         let what = format!("{} {n} failing", ["write", "flush", "every write from"][mode]);
-        let mut disk = RamDisk { data: base.clone(), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: Some(Vec::new()), read_only: false };
+        let mut disk = RamDisk { data: base.clone(), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: Some(Vec::new()), read_only: false, lose_writes: false };
         match mode {
             0 => disk.fail_writes(n, 1),
             1 => disk.fail_flush = Some(n),
@@ -1314,7 +1319,7 @@ fn failed_commits_never_free_a_named_or_a_free_inode() {
             for epoch in 0..=epochs {
                 for seed in 0..6 {
                     let image = crash_image(&base, &log, epoch, seed);
-                    let d = RamDisk { data: image, counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false };
+                    let d = RamDisk { data: image, counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false, lose_writes: false };
                     let mut fs = Ext2::mount(d).unwrap();
                     let fresh = fs.create(ROOT_INO, "fresh", &NewNode::File, 0o644).unwrap();
                     write_file(&mut fs, fresh, 64 * 1024);
@@ -1377,7 +1382,7 @@ fn a_truncation_failing_part_way_is_undone() {
     let base = take(fs).data;
     let mut failed = 0;
     for n in 0..64 {
-        let disk = RamDisk { data: base.clone(), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false };
+        let disk = RamDisk { data: base.clone(), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false, lose_writes: false };
         let mut fs = Ext2::mount_with_cache(disk, 16 * 1024).unwrap();
         let (_, _, free_before, _, _) = fs.usage();
         fs.device_mut().fail_read = Some(n);
@@ -1423,7 +1428,7 @@ fn the_state_says_in_use_until_let_go() {
     assert_eq!(state(fs.device()), 0);
     write_file(&mut fs, f, 64 * 1024);
     // A crash now: the disk is not clean, and e2fsck -p checks it.
-    let crashed = RamDisk { data: fs.device().data.clone(), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false };
+    let crashed = RamDisk { data: fs.device().data.clone(), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false, lose_writes: false };
     let path = scratch("state-crashed");
     std::fs::write(&path, &crashed.data).unwrap();
     let out = Command::new("e2fsck").arg("-p").arg(&path).output().expect("e2fsck not found");
@@ -1487,7 +1492,7 @@ fn a_journal_is_added_at_the_first_mount() {
     disk.read_only = true;
     let fs = Ext2::mount(disk).unwrap();
     assert!(take(fs).data == plain, "a read-only mount added a journal");
-    let mut fs = Ext2::mount(RamDisk { data: plain, counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false }).unwrap();
+    let mut fs = Ext2::mount(RamDisk { data: plain, counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false, lose_writes: false }).unwrap();
     fs.create(ROOT_INO, "f", &NewNode::File, 0o644).unwrap();
     let disk = take(fs);
     let path = scratch("add-journal-dump");
@@ -1549,7 +1554,7 @@ fn a_rename_failing_part_way_leaves_every_file_a_name() {
     let base = take(fs).data;
     let mut failed = 0;
     for n in 0..40 {
-        let disk = RamDisk { data: base.clone(), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false };
+        let disk = RamDisk { data: base.clone(), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false, lose_writes: false };
         let mut fs = Ext2::mount_with_cache(disk, 2 * 1024).unwrap();
         fs.device_mut().fail_read = Some(n);
         let result = fs.rename(ROOT_INO, "moved", dir, "entry-045-with-some-length");
@@ -1602,7 +1607,7 @@ fn a_failed_commit_in_use_leaves_the_disk_not_clean() {
 fn take_copy(fs: &mut Ext2<RamDisk>) -> RamDisk {
     fs.sync().unwrap();
     let copy = fs.device().data.clone();
-    let d = RamDisk { data: copy, counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false };
+    let d = RamDisk { data: copy, counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false, lose_writes: false };
     // (Its journal is replayed by a mount, which empties it: what e2fsck is to see.)
     take(Ext2::mount(d).unwrap())
 }
@@ -1711,7 +1716,7 @@ fn renames_never_leave_more_names_than_links() {
     };
     let mut problems = Vec::new();
     // How many writes and flushes the renames make.
-    let mut fs = Ext2::mount(RamDisk { data: base.clone(), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: Some(Vec::new()), read_only: false }).unwrap();
+    let mut fs = Ext2::mount(RamDisk { data: base.clone(), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: Some(Vec::new()), read_only: false, lose_writes: false }).unwrap();
     sequence(&mut fs);
     problems.extend(names_within_links(&mut fs, "no failure"));
     let (writes, flushes) = (fs.device().counts.writes, fs.device().counts.flushes);
@@ -1721,7 +1726,7 @@ fn renames_never_leave_more_names_than_links() {
     let epochs = log.iter().filter(|e| matches!(e, Event::Flush)).count();
     for epoch in 0..=epochs {
         for seed in 0..8 {
-            let d = RamDisk { data: crash_image(&base, &log, epoch, seed), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false };
+            let d = RamDisk { data: crash_image(&base, &log, epoch, seed), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false, lose_writes: false };
             let mut fs = Ext2::mount(d).unwrap();
             fs.recover_orphans(|_| false).unwrap();
             let what = format!("crash at {epoch}/{seed}");
@@ -1739,7 +1744,7 @@ fn renames_never_leave_more_names_than_links() {
     // middle of a step (a small cache: every step reads), so that a step breaks off with
     // part of it in the cache (a name added, its directory's inode not written).
     let reads = {
-        let d = RamDisk { data: base.clone(), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false };
+        let d = RamDisk { data: base.clone(), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false, lose_writes: false };
         let mut fs = Ext2::mount_with_cache(d, 1024).unwrap();
         let before = fs.device().counts.reads;
         sequence(&mut fs);
@@ -1748,7 +1753,7 @@ fn renames_never_leave_more_names_than_links() {
     let modes = (0..writes).map(|n| (0, n)).chain((0..flushes).map(|n| (1, n))).chain((0..writes).map(|n| (2, n))).chain((0..reads).map(|n| (3, n)));
     for (mode, n) in modes {
         let what = format!("{} {n} failing", ["write", "flush", "every write from", "read"][mode]);
-        let mut d = RamDisk { data: base.clone(), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false };
+        let mut d = RamDisk { data: base.clone(), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false, lose_writes: false };
         match mode {
             0 => d.fail_writes(n, 1),
             1 => d.fail_flush = Some(n),
@@ -1804,7 +1809,7 @@ fn a_rename_between_hard_links_does_nothing() {
     assert!(ok, "debugfs");
     let data = std::fs::read(&path).unwrap();
     std::fs::remove_file(&path).unwrap();
-    let mut fs = Ext2::mount(RamDisk { data, counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false }).unwrap();
+    let mut fs = Ext2::mount(RamDisk { data, counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false, lose_writes: false }).unwrap();
     assert_eq!(fs.lookup(ROOT_INO, "g"), Ok(f));
     assert_eq!(fs.rename(ROOT_INO, "f", ROOT_INO, "g").unwrap(), Vec::<u32>::new());
     assert_eq!((fs.lookup(ROOT_INO, "f"), fs.lookup(ROOT_INO, "g")), (Ok(f), Ok(f)));
@@ -1886,7 +1891,7 @@ fn mkfs_journal(name: &str, kib: usize) -> RamDisk {
     assert!(ok, "mke2fs failed");
     let data = std::fs::read(&path).unwrap();
     std::fs::remove_file(&path).unwrap();
-    RamDisk { data, counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false }
+    RamDisk { data, counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false, lose_writes: false }
 }
 
 /// Runs debugfs (`-w`) with `commands` on a copy of `data`; the copy afterwards, and what
@@ -1912,7 +1917,7 @@ fn debugfs(data: &[u8], name: &str, commands: &str) -> (Vec<u8>, String) {
 
 /// The disk as it is (journal and all), not unmounted: what a crash now leaves.
 fn crashed(fs: &Ext2<RamDisk>) -> RamDisk {
-    RamDisk { data: fs.device().data.clone(), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false }
+    RamDisk { data: fs.device().data.clone(), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false, lose_writes: false }
 }
 
 /// Our journal is ext3's: debugfs's `logdump` reads its transactions, e2fsck replays a
@@ -1934,7 +1939,7 @@ fn the_journal_is_ext3s() {
     std::fs::write(&path, &disk.data).unwrap();
     let out = Command::new("e2fsck").arg("-fy").arg(&path).output().unwrap();
     let said = String::from_utf8_lossy(&out.stdout).to_string();
-    let replayed = RamDisk { data: std::fs::read(&path).unwrap(), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false };
+    let replayed = RamDisk { data: std::fs::read(&path).unwrap(), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false, lose_writes: false };
     std::fs::remove_file(&path).unwrap();
     assert!(said.contains("recovering journal"), "{said}");
     assert_eq!(fsck_findings(&replayed, "replayed by e2fsck"), None);
@@ -1958,9 +1963,9 @@ fn the_journal_is_ext3s() {
     let (_, dump) = debugfs(&data, "ext3-foreign-dump", "logdump\n");
     assert!(dump.contains("revoke table"), "{said}{dump}");
     // Read-only, a journal that needs recovery cannot be mounted.
-    let disk = RamDisk { data: data.clone(), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: true };
+    let disk = RamDisk { data: data.clone(), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: true, lose_writes: false };
     assert!(Ext2::mount(disk).is_err());
-    let disk = RamDisk { data, counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false };
+    let disk = RamDisk { data, counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false, lose_writes: false };
     let fs = Ext2::mount(disk).unwrap();
     let disk = take(fs);
     assert!(disk.data[3000 * 1024..3001 * 1024] == block[..], "the transaction was not replayed");
@@ -2099,7 +2104,7 @@ fn corrupted_journals_never_panic() {
             };
             data[b * 1024 + at..b * 1024 + at + 4].copy_from_slice(&v.to_be_bytes());
         }
-        let disk = RamDisk { data, counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false };
+        let disk = RamDisk { data, counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false, lose_writes: false };
         match Ext2::mount(disk) {
             Ok(fs) => {
                 mounted += 1;
@@ -2145,7 +2150,7 @@ fn long_operations_commit_part_way_and_crashes_finish_them() {
     let mut problems = Vec::new();
     for epoch in 0..=epochs {
         for seed in 0..2 {
-            let d = RamDisk { data: crash_image(&base, &log, epoch, seed), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false };
+            let d = RamDisk { data: crash_image(&base, &log, epoch, seed), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false, lose_writes: false };
             let mut fs = Ext2::mount(d).unwrap();
             fs.recover_orphans(|_| false).unwrap();
             let what = format!("crash at {epoch}/{seed}");
@@ -2167,4 +2172,115 @@ fn long_operations_commit_part_way_and_crashes_finish_them() {
         }
     }
     assert!(problems.is_empty(), "{:#?}", problems);
+}
+
+/// Targeted hostile logs: a descriptor whose tags never end, revoke blocks claiming huge
+/// counts, a ring full of transactions of one sequence (as if the log ran in a circle), a
+/// wrong sequence, short (truncated) blocks, a committed tag naming a block beyond the
+/// filesystem. Each scan ends within the ring's blocks, in bounded time, writing nothing
+/// beyond the filesystem; and a device that loses the replay's writes makes the mount fail
+/// instead of replaying for ever.
+#[test]
+fn targeted_hostile_journals_end() {
+    use ext2fs::journal::{recover, Log, Superblock, COMPAT_CHECKSUM};
+    struct VecLog {
+        blocks: Vec<Vec<u8>>,
+        reads: usize,
+        writes: usize,
+    }
+    impl Log for VecLog {
+        fn read(&mut self, n: u32) -> Result<Vec<u8>, ()> {
+            self.reads += 1;
+            self.blocks.get(n as usize).cloned().ok_or(())
+        }
+        fn write_home(&mut self, home: u32, _: &[u8]) -> Result<(), ()> {
+            assert!(home < 4096);
+            self.writes += 1;
+            Ok(())
+        }
+    }
+    let len = 1024u32;
+    let header = |b: &mut Vec<u8>, kind: u32, seq: u32| {
+        b[0..4].copy_from_slice(&0xC03B_3998u32.to_be_bytes());
+        b[4..8].copy_from_slice(&kind.to_be_bytes());
+        b[8..12].copy_from_slice(&seq.to_be_bytes());
+    };
+    let started = std::time::Instant::now();
+    for case in 0..6 {
+        for checksums in [false, true] {
+            let mut sb = Superblock::new(1024, len, [3; 16]);
+            sb.compat = if checksums { COMPAT_CHECKSUM } else { 0 };
+            sb.start = 1;
+            sb.sequence = 7;
+            let mut blocks = vec![vec![0u8; 1024]; len as usize];
+            match case {
+                // Every block a descriptor of sequence 7 whose tags (block 5, SAME_UUID, no
+                // LAST_TAG) fill it: tags run on through the whole ring.
+                0 => {
+                    for b in blocks.iter_mut().skip(1) {
+                        header(b, 1, 7);
+                        for t in (12..1024 - 8).step_by(8) {
+                            b[t..t + 4].copy_from_slice(&5u32.to_be_bytes());
+                            b[t + 6..t + 8].copy_from_slice(&2u16.to_be_bytes());
+                        }
+                    }
+                }
+                // Revoke blocks claiming 4 GiB of records, each followed by a commit: the
+                // ring round of transactions.
+                1 => {
+                    for (i, b) in blocks.iter_mut().enumerate().skip(1) {
+                        let seq = 7 + (i as u32 - 1) / 2;
+                        if i % 2 == 1 {
+                            header(b, 5, seq);
+                            b[12..16].copy_from_slice(&u32::MAX.to_be_bytes());
+                        } else {
+                            header(b, 2, seq);
+                        }
+                    }
+                }
+                // A ring of commit blocks of one sequence (a cycle of empty transactions,
+                // if the scan did not check sequences).
+                2 => {
+                    for b in blocks.iter_mut().skip(1) {
+                        header(b, 2, 7);
+                    }
+                }
+                // The wrong sequence at the start: an empty log.
+                3 => {
+                    for b in blocks.iter_mut().skip(1) {
+                        header(b, 1, 8);
+                    }
+                }
+                // Short blocks (a device that returns less than asked).
+                4 => {
+                    for b in blocks.iter_mut().skip(1) {
+                        header(b, 2, 7);
+                        b.truncate(100);
+                    }
+                }
+                // A descriptor naming a block beyond the filesystem, committed.
+                _ => {
+                    header(&mut blocks[1], 1, 7);
+                    blocks[1][12..16].copy_from_slice(&u32::MAX.to_be_bytes());
+                    blocks[1][18..20].copy_from_slice(&8u16.to_be_bytes());
+                    header(&mut blocks[3], 2, 7);
+                }
+            }
+            let mut log = VecLog { blocks, reads: 0, writes: 0 };
+            let result = recover(&sb, 4096, &mut log);
+            assert!(log.reads <= 3 * len as usize, "case {case}: {} reads", log.reads);
+            assert!(log.writes <= len as usize, "case {case}: {} writes", log.writes);
+            if case == 5 && !checksums {
+                assert!(result.is_err(), "a block beyond the filesystem accepted");
+            }
+        }
+    }
+    assert!(started.elapsed() < std::time::Duration::from_secs(10), "{:?}", started.elapsed());
+
+    // A device that loses the replay's writes: the mount fails once, it does not loop.
+    let mut fs = Ext2::mount(mkfs_journal("lying", 4 * 1024)).unwrap();
+    fs.create(ROOT_INO, "f", &NewNode::File, 0o644).unwrap();
+    let mut disk = crashed(&fs);
+    disk.lose_writes = true;
+    assert!(Ext2::mount(disk).is_err());
 }

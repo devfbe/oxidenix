@@ -403,6 +403,44 @@ struct State<D: Device> {
     spending: bool,
 }
 
+/// Writes blocks to the device, those that follow one another on the disk gathered into
+/// one request (up to `Runs::MAX` bytes).
+struct Runs {
+    block_size: usize,
+    sectors: u64,
+    /// The first block of the run gathered, and its bytes.
+    first: u32,
+    buf: Vec<u8>,
+}
+
+impl Runs {
+    const MAX: usize = 64 * 1024;
+
+    fn new(block_size: usize, sectors: u64) -> Runs {
+        Runs { block_size, sectors, first: 0, buf: Vec::new() }
+    }
+
+    fn push<D: Device + ?Sized>(&mut self, dev: &mut D, block: u32, data: &[u8]) -> Result<(), ()> {
+        let count = (self.buf.len() / self.block_size) as u32;
+        if !self.buf.is_empty() && (self.first.checked_add(count) != Some(block) || self.buf.len() + data.len() > Self::MAX) {
+            self.finish(dev)?;
+        }
+        if self.buf.is_empty() {
+            self.first = block;
+        }
+        self.buf.extend_from_slice(data);
+        Ok(())
+    }
+
+    fn finish<D: Device + ?Sized>(&mut self, dev: &mut D) -> Result<(), ()> {
+        if !self.buf.is_empty() {
+            dev.write(self.first as u64 * self.sectors, &self.buf)?;
+            self.buf.clear();
+        }
+        Ok(())
+    }
+}
+
 /// An indirect block of a file by its place in the file's tree: the
 /// inode's block slot it hangs from (12, 13, 14), its height (1: it points
 /// to data blocks) and its index among the tables of that height.
@@ -902,12 +940,15 @@ impl<D: Device> State<D> {
         }
         let (start, starting) = (j.head, j.sb.start == 0);
         let mut at = j.head;
+        // (Blocks that lie one after the other on the disk go out as one request.)
+        let mut runs = Runs::new(bs, sectors);
         let mut write = |b: &[u8]| -> Result<(), ()> {
-            dev.write(j.map[at as usize] as u64 * sectors, b)?;
+            runs.push(&mut *dev, j.map[at as usize], b)?;
             at = j.sb.next(at);
             Ok(())
         };
         journal::write_transaction(bs, &j.sb.uuid, j.sequence, &blocks, &j.revokes, now, &mut write).map_err(io)?;
+        runs.finish(&mut *dev).map_err(io)?;
         if starting {
             // The log was empty: it starts at this transaction (in the same flush: a torn
             // transaction is not replayed, whatever the superblock says).
@@ -918,8 +959,9 @@ impl<D: Device> State<D> {
         dev.flush().map_err(io)?;
         // Committed: home now (no flush of their own).
         for &(n, data) in &blocks {
-            dev.write(n as u64 * sectors, data).map_err(io)?;
+            runs.push(&mut *dev, n, data).map_err(io)?;
         }
+        runs.finish(&mut *dev).map_err(io)?;
         let homes: Vec<u32> = blocks.iter().map(|&(n, _)| n).collect();
         for &n in &homes {
             self.cache.mark_clean(n);
@@ -1050,22 +1092,31 @@ impl<D: Device> State<D> {
         inode.set_links(1);
         inode.touch(self.dev.now(), true, true);
         let bs = self.block_size;
-        let mut first = 0;
+        // Its blocks (data blocks: not zeroed in the cache, which holds only metadata),
+        // each run zeroed on the device as it is allocated (a stale block could read as a
+        // log block), then its superblock.
+        const RUN: usize = 64;
+        let zeros = vec![0u8; RUN * bs];
+        let (mut first, mut run) = (0, (0u32, 0usize));
         for fb in 0..len as u64 {
-            let b = self.bmap(JOURNAL_INO, &mut inode, fb, true).map_err(fail)?;
+            let (b, _) = self.bmap_data(JOURNAL_INO, &mut inode, fb).map_err(fail)?;
             if fb == 0 {
                 first = b;
             }
+            if run.1 > 0 && (b != run.0 + run.1 as u32 || run.1 == RUN) {
+                self.write_data(run.0, &zeros[..run.1 * bs]).map_err(fail)?;
+                run.1 = 0;
+            }
+            if run.1 == 0 {
+                run.0 = b;
+            }
+            run.1 += 1;
+        }
+        if run.1 > 0 {
+            self.write_data(run.0, &zeros[..run.1 * bs]).map_err(fail)?;
         }
         inode.set_size(len as u64 * bs as u64);
         self.write_inode(JOURNAL_INO, &inode).map_err(fail)?;
-        // Its blocks zeroed (a stale block could read as a log block), its superblock.
-        let zeros = vec![0u8; bs];
-        let mut copy = inode.clone();
-        for fb in 1..len as u64 {
-            let b = self.bmap(JOURNAL_INO, &mut copy, fb, false).map_err(fail)?;
-            self.write_data(b, &zeros).map_err(fail)?;
-        }
         let uuid: [u8; 16] = self.sb[104..120].try_into().unwrap();
         let jsb = journal::Superblock::new(bs as u32, len, uuid).encode();
         self.write_data(first, &jsb).map_err(fail)?;
@@ -2870,7 +2921,13 @@ impl<D: Device> Ext2<D> {
 
     /// `mount` with a metadata cache of `cache_bytes` (the tests make it
     /// small, so that blocks are evicted all the time).
-    pub fn mount_with_cache(mut dev: D, cache_bytes: usize) -> Result<Self, &'static str> {
+    pub fn mount_with_cache(dev: D, cache_bytes: usize) -> Result<Self, &'static str> {
+        Self::mount_replayed(dev, cache_bytes, false)
+    }
+
+    /// `mount_with_cache`; `replayed`: the journal was just replayed (a device that does
+    /// not keep what it is given cannot make the mount replay for ever).
+    fn mount_replayed(mut dev: D, cache_bytes: usize, replayed: bool) -> Result<Self, &'static str> {
         let mut sb = [0u8; 1024];
         dev.read(2, &mut sb).map_err(|_| "cannot read the superblock")?;
         if le16(&sb, 56) != MAGIC {
@@ -2969,11 +3026,14 @@ impl<D: Device> Ext2<D> {
                 if st.read_only {
                     return Err("the journal needs recovery, the device is read-only");
                 }
+                if replayed {
+                    return Err("the journal needs recovery again after its replay");
+                }
                 // Replayed (the log empty after), then mounted again from what the disk
                 // has now.
                 st.replay(j)?;
                 let cache_bytes = st.cache_bytes();
-                return Self::mount_with_cache(st.dev, cache_bytes);
+                return Self::mount_replayed(st.dev, cache_bytes, true);
             }
             st.journal = Some(j);
             if !st.read_only {

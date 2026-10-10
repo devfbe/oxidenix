@@ -111,7 +111,15 @@ the logged ones again for the checksum and the replay); a complete transaction n
 block beyond the filesystem makes the journal corrupt (the mount fails, nothing written);
 revokes of such blocks are ignored. What recovery keeps in memory is one entry per tag (at
 most the ring's blocks) and one per revoked block (at most the filesystem's blocks), never a
-count read from the log.
+count read from the log. A mount replays at most once: a device that does not keep the
+replay's writes (the log still not empty when mounted again) fails the mount.
+
+**Writes.** A commit writes its log blocks, and then the home blocks, in runs: blocks that
+follow one another on the disk go out as one request (up to 64 KiB). Adding a journal
+allocates its blocks as data blocks (never through the cache) and zeroes them on the device
+in runs. The builder writes the zeros of a new disk's journal for real after mke2fs (which
+leaves `fallocate`d unwritten extents in an image file, whose conversion on the host would
+make every early flush of the guest a commit of the host's own journal).
 
 **Failed commits.** A transaction that cannot be written breaks the filesystem
 (`broken`): nothing more is written, every change fails, and diskfs exits; its restart
