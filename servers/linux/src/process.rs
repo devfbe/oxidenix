@@ -186,6 +186,8 @@ pub struct Proc {
     /// Bytes its execve calls hold of their arguments and environments
     /// (`exec::Strings`, bounded per process).
     pub exec_bytes: Arc<core::sync::atomic::AtomicUsize>,
+    /// Its resource limits but RLIMIT_NOFILE (`ids::Limits`).
+    pub limits: crate::ids::Limits,
 }
 
 pub struct Thread {
@@ -479,6 +481,7 @@ pub fn register_init(key: u64) {
             words: Arc::new(Words::default()),
             tables_out: 0,
             exec_bytes: Arc::new(core::sync::atomic::AtomicUsize::new(0)),
+            limits: Default::default(),
         };
         t.procs.insert(pid, p);
         let serial = t.new_serial();
@@ -755,6 +758,7 @@ fn clone(s: &State, c: Clone) -> Result<i64, i64> {
                 words: Arc::new(Words::default()),
                 tables_out: 0,
                 exec_bytes: Arc::new(core::sync::atomic::AtomicUsize::new(0)),
+                limits: parent.limits,
             };
             t.procs.insert(pid, p);
             if let Some(pp) = t.procs.get_mut(&ppid) {

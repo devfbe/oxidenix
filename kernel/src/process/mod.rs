@@ -588,7 +588,9 @@ pub fn spawn(name: &str, args: &[&str]) -> Result<Pid, i64> {
             return Err(e);
         }
     };
-    // The tree the kernel starts gets the console (ADR 0007).
+    // The tree the kernel starts gets the console (ADR 0007) and, the only
+    // tree the machine runs at a time, the host grant (ADR 0011).
+    linux::host_grant(&instance, true);
     linux::console_grant(Some(&instance));
     sched::start(t);
     Ok(pid)

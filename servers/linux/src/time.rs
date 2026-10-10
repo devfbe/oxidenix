@@ -126,9 +126,18 @@ fn clock_settime(id: u64, ts: u64) -> Result<i64, i64> {
     if id as i32 as i64 != CLOCK_REALTIME {
         return Err(EINVAL);
     }
-    let ns = read_timespec(ts)?;
-    syscall(SYS_CLOCK_SET, [ns, 0, 0, 0, 0, 0]);
-    Ok(0)
+    set_wall(read_timespec(ts)?)
+}
+
+/// Sets the wall clock to `ns`: EINVAL for a time before the monotonic
+/// clock's (as Linux's timekeeping_validate: the wall clock never goes
+/// below boot).
+fn set_wall(ns: u64) -> Result<i64, i64> {
+    if ns < clock(CLOCK_MONOTONIC as u64)? {
+        return Err(EINVAL);
+    }
+    let r = syscall(SYS_CLOCK_SET, [ns, 0, 0, 0, 0, 0]);
+    if r < 0 { Err(-r) } else { Ok(0) }
 }
 
 /// settimeofday(tv, tz): the wall clock from a timeval (the time zone is ignored, as
@@ -140,7 +149,7 @@ fn settimeofday(tv: u64) -> Result<i64, i64> {
             return Err(EINVAL);
         }
         let ns = (sec as u64).saturating_mul(NSEC_PER_SEC).saturating_add(usec as u64 * 1000);
-        syscall(SYS_CLOCK_SET, [ns, 0, 0, 0, 0, 0]);
+        return set_wall(ns);
     }
     Ok(0)
 }

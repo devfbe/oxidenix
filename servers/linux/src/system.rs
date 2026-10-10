@@ -1,13 +1,16 @@
 //! Calls about the machine and the calling thread's CPU state (phase R9, from the kernel's
 //! Linux code): uname, sysinfo, reboot, getrandom, getcpu, arch_prctl, and ioperm and iopl,
 //! over the kernel's mechanisms (`SYS_SYSTEM_INFO`, `SYS_POWER`, `SYS_RANDOM`,
-//! `SYS_THREAD_INFO`, `SYS_THREAD_FS`).
+//! `SYS_THREAD_INFO`, `SYS_THREAD_FS`). A tree without the kernel's host grant is a pid
+//! namespace that is not the initial one: reboot ends the tree (ADR 0011).
 
 use crate::syscall;
 use crate::usercopy;
 use restricted::*;
 
 const EPERM: i64 = 1;
+const SIGHUP: i32 = 1;
+const SIGINT: i32 = 2;
 const EINVAL: i64 = 22;
 const EFAULT: i64 = 14;
 
@@ -26,7 +29,7 @@ pub fn handle(s: &State) -> Option<i64> {
     let result = match s.rax {
         SYS_UNAME => uname(a0),
         SYS_SYSINFO => sysinfo(a0),
-        SYS_REBOOT => reboot(a0, a1, a2),
+        SYS_REBOOT => reboot(a0, a1, a2, s.r10),
         SYS_GETRANDOM => getrandom(a0, a1, a2),
         SYS_GETCPU => getcpu(a0, a1),
         SYS_ARCH_PRCTL => arch_prctl(a0, a1),
@@ -73,23 +76,42 @@ fn sysinfo(buf: u64) -> Result<i64, i64> {
 
 /// reboot(2): power off (QEMU exits) or restart the machine, after every instance of the
 /// server wrote its caches back (`SYS_POWER`). The magic numbers are checked as Linux does;
-/// LINUX_REBOOT_CMD_HALT powers off too.
-fn reboot(magic: u64, magic2: u64, cmd: u64) -> Result<i64, i64> {
+/// LINUX_REBOOT_CMD_HALT powers off too, RESTART2 restarts (its command string is
+/// checked, not used); CAD_ON and CAD_OFF are accepted (there is no Ctrl-Alt-Del to
+/// configure).
+fn reboot(magic: u64, magic2: u64, cmd: u64, arg: u64) -> Result<i64, i64> {
     const MAGIC: u64 = 0xfee1_dead;
     const MAGIC2: [u64; 4] = [0x2812_1969, 0x0512_1996, 0x1604_1998, 0x2011_2000];
     const RESTART: u64 = 0x0123_4567;
+    const RESTART2: u64 = 0xa1b2_c3d4;
     const HALT: u64 = 0xcdef_0123;
     const POWER_OFF_CMD: u64 = 0x4321_fedc;
+    const CAD_ON: u64 = 0x89ab_cdef;
+    const CAD_OFF: u64 = 0;
     if magic as u32 as u64 != MAGIC || !MAGIC2.contains(&(magic2 as u32 as u64)) {
         return Err(EINVAL);
     }
     let how = match cmd as u32 as u64 {
+        CAD_ON | CAD_OFF => return Ok(0),
         RESTART => POWER_RESTART,
+        RESTART2 => {
+            usercopy::read_cstr(arg)?;
+            POWER_RESTART
+        }
         HALT | POWER_OFF_CMD => POWER_OFF,
         _ => return Err(EINVAL),
     };
     let r = syscall(SYS_POWER, [how, 0, 0, 0, 0, 0]);
-    Err(-r)
+    if r != -EPERM {
+        return Err(-r);
+    }
+    // No host grant: the tree is a pid namespace that is not the initial
+    // one, and reboot ends it as Linux's reboot_pid_ns does: its init dies
+    // (and with it every process of the tree), its parent's wait reporting
+    // SIGHUP for a restart, SIGINT for a power off or halt; the caller exits.
+    let sig = if how == POWER_RESTART { SIGHUP } else { SIGINT };
+    crate::process::PROCS.lock().group_exit(1, sig, None);
+    crate::process::die(0)
 }
 
 /// getrandom(2): bytes of the kernel's generator, which is seeded before any process runs,

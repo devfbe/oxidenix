@@ -70,3 +70,9 @@ pub const SHARED: u16 = 15;
 /// (`grant_map`'s `max_pages`): 0 if it is refused with E2BIG, reporting
 /// its size as `len` pages, and nothing is mapped; 1 if it was mapped.
 pub const MAP_LIMITED: u16 = 16;
+/// 50 ms after the request came (the client then sleeps on the completion
+/// ring's tail), the service requeues every waiter of that word to another
+/// word of the channel; the status is how many it moved. The client's wait
+/// (the Linux server's own, `server_futex_wait` on its mapping) must not
+/// move: 0, and the completion's wake still reaches the client at once.
+pub const REQUEUE_AWAY: u16 = 17;
