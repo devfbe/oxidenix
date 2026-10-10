@@ -186,7 +186,8 @@ fn exception(frame: &mut Frame) {
                     sig = kill::SIGBUS;
                     kind = restricted::FAULT_BUS;
                 }
-                Err(Fault::Oom) => {
+                // (CommitWait never leaves `Mm::retrying`.)
+                Err(Fault::Oom | Fault::CommitWait) => {
                     crate::printkln!("[kernel] out of memory at {:#x}: process killed", addr);
                     kill::kernel_kill_current();
                 }

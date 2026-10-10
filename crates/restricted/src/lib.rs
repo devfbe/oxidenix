@@ -540,7 +540,9 @@ pub const GRANT_FILL: u64 = 2;
 /// u64s): a run of dirty pages holds data up to that size (a write makes
 /// a page dirty and the file longer at once). One call looks at a bounded
 /// number of present pages: EAGAIN with the page to go on from at `out`
-/// if it found no run among them.
+/// if it found no run among them. EBUSY if the instance's cached objects
+/// have as many pages pinned as one instance may (a quarter of the commit
+/// limit): the server asks again once its transfers in flight ended.
 pub const GRANT_DIRTY: u64 = 4;
 /// `revoke(handle, grant) -> 0 | REVOKE_DRAINING`: takes a grant back. Its
 /// mappings in the service are gone when the call returns. If the service
@@ -565,15 +567,23 @@ pub const REVOKE_DRAINING: u64 = 1;
 /// fills it by DMA into the pages it grants (`GRANT_FILL`, `mo_filled`).
 /// Stores (writes, shared mappings) mark pages dirty (`EVENT_DIRTY`); the
 /// server writes them back (`GRANT_DIRTY`, `mo_redirty`). Its pages are
-/// cached memory: clean ones nothing pins or maps are reclaimed when
-/// memory is short.
+/// cached memory, not committed: clean ones nothing pins are reclaimed
+/// when memory is short (mapped ones after reclaim removed them from the
+/// mappings that did not use them lately).
 pub const SYS_MO_CREATE_CACHED: u64 = 1076;
-/// `mo_filled(handle, offset, pages, ok)`: the pending pages among `pages`
-/// (at most 256) from `offset` hold the file's data now (`ok` 1), or could
-/// not be read (0: they go, and whoever waits for them or for missing pages
-/// of the range now gets an error, SIGBUS for a mapping; nothing is kept
-/// for later accesses, which ask again). Wakes the waiters.
+/// `mo_filled(handle, offset, pages, status)`: the pending pages among
+/// `pages` (at most 256) from `offset` hold the file's data now
+/// (`FILL_OK`), or could not be read (`FILL_FAILED`) or not be had for
+/// want of memory (`FILL_NOMEM`): then they go, and whoever waits for them
+/// or for missing pages of the range now gets an error (EIO: SIGBUS for a
+/// mapping; ENOMEM: a mapping's toucher is killed, as by Linux's OOM
+/// killer); nothing is kept for later accesses, which ask again. Wakes the
+/// waiters. EINVAL for another status.
 pub const SYS_MO_FILLED: u64 = 1077;
+/// `mo_filled`'s statuses.
+pub const FILL_FAILED: u64 = 0;
+pub const FILL_OK: u64 = 1;
+pub const FILL_NOMEM: u64 = 2;
 /// `mo_redirty(handle, offset, pages)`: marks the present pages among
 /// `pages` from `offset` dirty again (their write-back failed).
 pub const SYS_MO_REDIRTY: u64 = 1078;

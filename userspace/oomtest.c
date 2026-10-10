@@ -13,6 +13,7 @@
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #define MIB (1024 * 1024)
@@ -231,12 +232,181 @@ static void killed_with_threads(void) {
     close(p[0]);
 }
 
+/* Cache pages that reclaim cannot drop (dirty ones, until written back)
+ * are not there for committed memory: a commit that needs them waits for
+ * their write-back (the server writes dirty files back on its own only
+ * after 5 s, long after this) and is granted then, and the memory is
+ * usable. (The page cache's clean pages count as free: a commit of all
+ * that is left succeeds with a cache full of them, see cachetest.) */
+static long now_ms(void);
+static void dirty_counts_against_commit(void) {
+    const char *path = "/data/oomtest.dirty";
+    static char chunk[64 * 1024];
+    memset(chunk, 'd', sizeof chunk);
+    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    for (int i = 0; i < 128; i++) write(fd, chunk, sizeof chunk);
+    long dirty = meminfo("Dirty:");
+    long room = (meminfo("CommitLimit:") - meminfo("Committed_AS:")) * 1024 - 2 * MIB;
+    long t = now_ms();
+    void *m = mmap(NULL, room, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    t = now_ms() - t;
+    long after = meminfo("Dirty:") + meminfo("Writeback:");
+    int granted = m != MAP_FAILED;
+    if (granted) {
+        for (long off = 0; off < room; off += 4096) ((char *)m)[off] = 1;
+        munmap(m, room);
+    }
+    printf("dirty: %ld kB, then %ld kB dirty or pinned once the commit was granted (after %ld ms)\n", dirty, after, t);
+    check("a commit that dirty cache pages stand in the way of waits for their write-back", dirty >= 4096 && granted && after <= 2048 + 1024 && t < 5000);
+    close(fd);
+    unlink(path);
+}
+
+static long now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000L + ts.tv_nsec / 1000000;
+}
+
+/* Writers cannot fill memory with dirty pages: their tree's share is a
+ * tenth of the commit limit, beyond which they wait for write-back (as
+ * Linux's balance_dirty_pages), also four writing at once (each at most a
+ * chunk beyond it), and they finish. */
+#define WRITERS 4
+static void dirty_share(void) {
+    long share = meminfo("CommitLimit:") / 10, most = 0;
+    volatile int *done = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    *done = 0;
+    long t = now_ms();
+    pid_t kids[WRITERS];
+    for (int w = 0; w < WRITERS; w++) {
+        if ((kids[w] = fork()) == 0) {
+            char path[64];
+            snprintf(path, sizeof path, "/data/oomtest.share%d", w);
+            static char chunk[64 * 1024];
+            memset(chunk, 's', sizeof chunk);
+            int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+            int good = fd >= 0;
+            for (int i = 0; good && i < 8 * 16; i++) good = write(fd, chunk, sizeof chunk) == (ssize_t)sizeof chunk;
+            __atomic_add_fetch(done, 1, __ATOMIC_SEQ_CST);
+            _exit(good ? 0 : 1);
+        }
+    }
+    while (*done < WRITERS) {
+        long d = meminfo("Dirty:");
+        if (d > most) most = d;
+    }
+    int good = 1;
+    for (int w = 0; w < WRITERS; w++) {
+        int st = -1;
+        waitpid(kids[w], &st, 0);
+        good &= WIFEXITED(st) && WEXITSTATUS(st) == 0;
+        char path[64];
+        snprintf(path, sizeof path, "/data/oomtest.share%d", w);
+        unlink(path);
+    }
+    t = now_ms() - t;
+    printf("dirty share: %ld kB at most of %ld kB allowed, 4 x 8 MiB written at once in %ld ms\n", most, share, t);
+    check("writers' dirty pages stay within their tree's share", good && most <= share + WRITERS * 1024);
+}
+
+/* A writer throttled because dirty pages crowd out committed memory (all
+ * but 4 MiB of the commit limit promised to another process) still dies
+ * at once when killed: every wait for memory or write-back is killable. */
+static void throttled_writer_killable(void) {
+    const char *path = "/data/oomtest.crowd";
+    int go[2];
+    pipe(go);
+    volatile long *written = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    *written = 0;
+    /* (Forked first: a fork would commit the promised memory again.) */
+    pid_t kid = fork();
+    if (kid == 0) {
+        char c;
+        read(go[0], &c, 1);
+        static char chunk[64 * 1024];
+        memset(chunk, 'c', sizeof chunk);
+        int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+        for (;;) {
+            ssize_t n = write(fd, chunk, sizeof chunk);
+            if (n > 0) *written += n;
+            /* (The disk is full: from the start again.) */
+            if (n < 0) lseek(fd, 0, SEEK_SET);
+        }
+    }
+    if (kid < 0) {
+        check("... and a throttled writer is killable (fork)", 0);
+        return;
+    }
+    long room = (meminfo("CommitLimit:") - meminfo("Committed_AS:")) * 1024 - 4L * MIB;
+    void *promised = mmap(NULL, room, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    write(go[1], "g", 1);
+    struct timespec ts = {1, 0};
+    nanosleep(&ts, NULL);
+    long dirty = meminfo("Dirty:");
+    long t = now_ms();
+    kill(kid, SIGKILL);
+    int st = 0;
+    waitpid(kid, &st, 0);
+    t = now_ms() - t;
+    printf("crowded writer: %ld kB written, Dirty %ld kB, gone %ld ms after SIGKILL\n", *written / 1024, dirty, t);
+    check("dirty pages never crowd out committed memory", promised != MAP_FAILED && *written > 0 && dirty <= 4096 + 1024);
+    check("... and a throttled writer is killable", WIFSIGNALED(st) && WTERMSIG(st) == SIGKILL && t < 1000);
+    if (promised != MAP_FAILED) munmap(promised, room);
+    close(go[0]);
+    close(go[1]);
+    unlink(path);
+}
+
+/* Truncation racing write-back and fills (whose pages are pinned for
+ * diskfs's DMA): a pinned page is never taken from the cache, the file
+ * reads what it should afterwards, and once all is done no page counts as
+ * pinned or dirty any more (a commit of all that is left succeeds). */
+static void truncate_while_pinned(void) {
+    const char *path = "/data/oomtest.trunc";
+    static char chunk[64 * 1024], back[64 * 1024];
+    int good = 1;
+    for (int round = 0; round < 8 && good; round++) {
+        int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+        memset(chunk, 'a' + round, sizeof chunk);
+        for (int i = 0; i < 64; i++) write(fd, chunk, sizeof chunk);
+        pid_t kid = fork();
+        if (kid == 0) {
+            /* Write-back (pins the dirty pages) and reads (fills). */
+            fsync(fd);
+            for (long off = 0; off < 4 * MIB; off += sizeof back) pread(fd, back, sizeof back, off);
+            _exit(0);
+        }
+        for (int i = 0; i < 16; i++) ftruncate(fd, (long)(i % 4) * MIB);
+        waitpid(kid, NULL, 0);
+        ftruncate(fd, 2 * MIB);
+        for (long off = 0; good && off < 2 * MIB; off += sizeof back) {
+            good = pread(fd, back, sizeof back, off) == (ssize_t)sizeof back;
+            for (size_t j = 0; good && j < sizeof back; j += 509)
+                good = back[j] == 'a' + round || back[j] == 0;
+        }
+        fsync(fd);
+        close(fd);
+    }
+    unlink(path);
+    long room = (meminfo("CommitLimit:") - meminfo("Committed_AS:")) * 1024 - 2 * MIB;
+    void *m = mmap(NULL, room, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (m != MAP_FAILED) munmap(m, room);
+    printf("truncate while pinned: dirty %ld kB after\n", meminfo("Dirty:"));
+    check("truncation racing write-back and fills keeps the data", good);
+    check("... and leaves nothing counted as pinned or dirty", m != MAP_FAILED && meminfo("Dirty:") == 0);
+}
+
 int main(void) {
     descriptor_flood();
     fork_bomb();
     memory_hog();
     noreserve_toucher();
     noreserve_copy();
+    dirty_counts_against_commit();
+    truncate_while_pinned();
+    dirty_share();
+    throttled_writer_killable();
     killed_with_threads();
     pipe_flood();
     printf("oomtest: %s\n", failures ? "FAILED" : "all passed");

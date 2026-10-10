@@ -382,10 +382,14 @@ static void readers(void) {
     }
     fsync(fd);
     close(fd);
-    /* Drop the cached pages: commit what memory allows, then let go. */
+    /* Drop the cached pages: commit what memory allows and use it (the
+     * cache gives way to committed memory when it is touched), then let go. */
     long room = (meminfo("CommitLimit:") - meminfo("Committed_AS:")) * 1024 - 4 * MIB;
     char *all = room > 0 ? mmap(NULL, room, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) : MAP_FAILED;
-    if (all != MAP_FAILED) munmap(all, room);
+    if (all != MAP_FAILED) {
+        for (long off = 0; off < room; off += PG) all[off] = 1;
+        munmap(all, room);
+    }
     pid_t kids[READERS];
     for (int r = 0; r < READERS; r++) {
         kids[r] = fork();
@@ -469,7 +473,9 @@ static void larger_than_cache(void) {
     int good = fd >= 0;
     for (long off = 0; good && off < LARGE; off += sizeof chunk) {
         for (size_t i = 0; i < sizeof chunk; i++) chunk[i] = (char)pattern(off + i, 5);
-        good &= write(fd, chunk, sizeof chunk) == (ssize_t)sizeof chunk;
+        ssize_t n = write(fd, chunk, sizeof chunk);
+        good &= n == (ssize_t)sizeof chunk;
+        if (!good) printf("    (write at %ld: %zd, errno %d)\n", off, n, errno);
     }
     good &= fsync(fd) == 0;
     check("writing a 32 MiB file with 12 MiB to cache it", good);
