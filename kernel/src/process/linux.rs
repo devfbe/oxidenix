@@ -1523,6 +1523,11 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             drop(instance);
             power(a[0])
         }
+        SYS_STACK_LIMIT => {
+            let group = if a[0] == 0 { super::sched::current().group.clone() } else { container(&instance, a[0])?.group.clone() };
+            group.stack_soft.store(a[1], core::sync::atomic::Ordering::Relaxed);
+            Ok(0)
+        }
         SYS_HOST_GRANTED => match instance.host.load(core::sync::atomic::Ordering::Acquire) {
             true => Ok(0),
             false => Err(EPERM),
@@ -1957,6 +1962,7 @@ fn process_call(instance: &Arc<Instance>, nr: u64, a: [u64; 6]) -> SysResult {
             let mut info = Info::new(name);
             info.mem = Some(mm.stats.clone());
             let group = ThreadGroup::new(pid.pid, info).ok_or(ENOMEM)?;
+            group.stack_soft.store(super::sched::current().group.stack_soft.load(Relaxed), Relaxed);
             group.instance.store(instance.id, Release);
             group.server_reaps.store(true, Relaxed);
             let c = Arc::try_new(Container { group, fresh: spin::Mutex::new(Some(Fresh { mm, pid })) }).map_err(|_| ENOMEM)?;

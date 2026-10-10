@@ -155,14 +155,16 @@ impl Limits {
         self.soft[resource as usize].load(Ordering::Relaxed)
     }
 
-    /// The (soft, hard) limit of `resource` before, replaced by `new` if given.
-    fn exchange(&self, resource: u64, new: Option<(u64, u64)>) -> (u64, u64) {
+    /// The (soft, hard) limit of `resource` before, replaced by `new` if given; `changed`
+    /// gets the new soft limit, in the order of the changes.
+    fn exchange(&self, resource: u64, new: Option<(u64, u64)>, changed: impl FnOnce(u64)) -> (u64, u64) {
         let r = resource as usize;
         let _change = self.change.lock();
         let before = (self.soft[r].load(Ordering::Relaxed), self.hard[r].load(Ordering::Relaxed));
         if let Some((soft, hard)) = new {
             self.soft[r].store(soft, Ordering::Relaxed);
             self.hard[r].store(hard, Ordering::Relaxed);
+            changed(soft);
         }
         before
     }
@@ -217,14 +219,21 @@ fn prlimit(pid: Pid, resource: u64, new: u64, old: u64) -> Result<i64, i64> {
     } else {
         None
     };
-    let limits = if pid == 0 {
-        current()
+    let (limits, handle) = if pid == 0 {
+        (current(), 0)
     } else {
         let t = PROCS.lock();
         let target = t.threads.get(&pid).map_or(pid, |th| th.pid);
-        t.procs.get(&target).ok_or(ESRCH)?.limits.clone()
+        let p = t.procs.get(&target).ok_or(ESRCH)?;
+        (p.limits.clone(), p.handle)
     };
-    let before = limits.exchange(resource, new);
+    // The kernel reads the stack's soft limit at each growth (Linux's RLIMIT_STACK is read
+    // then too); a zombie's has no stack left to grow.
+    let before = limits.exchange(resource, new, |soft| {
+        if resource == RLIMIT_STACK {
+            syscall(SYS_STACK_LIMIT, [handle, soft, 0, 0, 0, 0]);
+        }
+    });
     if old != 0 {
         usercopy::write(old, &[before.0, before.1])?;
     }

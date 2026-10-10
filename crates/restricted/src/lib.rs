@@ -170,8 +170,10 @@ pub const MO_POPULATE: u64 = 16;
 pub const MO_READONLY: u64 = 32;
 /// Anonymous private memory that grows down on demand when the program
 /// touches the page below it (the stack `execve` makes), until it reaches
-/// as far below its top as `offset` says (the program's RLIMIT_STACK; the
-/// mapping's length if that is more) or another mapping.
+/// as far below its top as `offset` says (its ceiling; the mapping's length
+/// if that is more), its process's soft limit (`SYS_STACK_LIMIT`) or the
+/// guard gap of 256 pages above another accessible mapping. A growth that
+/// cannot be committed is a segmentation fault (EFAULT for a copy).
 pub const MO_GROWSDOWN: u64 = 64;
 
 // Bridges to state the kernel still owns, and address space operations
@@ -796,6 +798,12 @@ pub const SYS_FILE_PAGES: u64 = 1166;
 /// before it looks at the arguments (`reboot` in a pid namespace that is
 /// not the initial one, `settimeofday` with only a time zone).
 pub const SYS_HOST_GRANTED: u64 = 1167;
+/// `stack_limit(handle, limit)`: how far the stack of process `handle` (0:
+/// the caller's) may grow below its top, its soft RLIMIT_STACK, read at
+/// each growth within the stack's ceiling (`MO_GROWSDOWN`'s offset).
+/// Unbounded until set; a process `proc_create` makes starts with its
+/// creator's.
+pub const SYS_STACK_LIMIT: u64 = 1168;
 
 /// What `proc_info` tells about a process.
 #[repr(C)]

@@ -14,9 +14,12 @@
 //! `ET_EXEC` programs go where they say; `ET_DYN` ones (PIE) at `DYN_BASE`; a `PT_INTERP`
 //! interpreter where the kernel finds room for it. There is no vDSO.
 //!
-//! The caller's soft RLIMIT_STACK (read once, as Linux's bprm->rlim_stack) bounds the new
-//! stack's growth (`stack_room`: the kernel's `MO_GROWSDOWN` limit, an image must end below
-//! it) and the arguments and environment (`args_max`, Linux's bprm_stack_limits).
+//! The caller's soft RLIMIT_STACK at the call (Linux's bprm->rlim_stack) sets the room kept
+//! for the new stack (`stack_ceiling`, as Linux's mmap gap: at least 128 MiB; the kernel's
+//! `MO_GROWSDOWN` ceiling, an image must end below it) and bounds the arguments and
+//! environment (`args_max`, Linux's bprm_stack_limits). How far the stack grows within its
+//! ceiling is the process's soft limit at the time of each growth, which the kernel reads
+//! (`SYS_STACK_LIMIT`, set by `ids` whenever it changes).
 
 use crate::fdtable;
 use crate::local;
@@ -52,15 +55,25 @@ const AT_EMPTY_PATH: u64 = 0x1000;
 
 /// Where the stack ends (the word below is the end marker), as the kernel's loader had it.
 const STACK_TOP: u64 = SHARED_BASE - PAGE;
-/// The stack area at start, at least (it grows down on demand, up to `stack_room`).
+/// The stack area at start, at least (it grows down on demand, up to `stack_ceiling`).
 const STACK_SIZE: u64 = 256 * 1024;
+/// The least room kept for a stack (Linux's MIN_GAP for its mmap base).
+const MIN_STACK_GAP: u64 = 128 << 20;
 
-/// How far the stack may grow below `STACK_TOP` for a soft RLIMIT_STACK of `limit`: the
-/// limit, at most the room above the kernel's mmap area (`MMAP_TOP`, 16 TiB below: Linux
-/// places its mmap base below a gap of the limit, which is never more than that here, so the
-/// base stays put), a page at least. Its area is kept free of the program's image.
-fn stack_room(limit: u64) -> u64 {
-    (limit & !(PAGE - 1)).clamp(PAGE, STACK_TOP - MMAP_TOP)
+/// The room kept below `STACK_TOP` for the stack of a program started with a soft
+/// RLIMIT_STACK of `limit`, as Linux's mmap gap: the limit, at least 128 MiB, at most the
+/// room above the kernel's mmap area (`MMAP_TOP`, 16 TiB below, which therefore never moves).
+/// The stack never grows beyond it, and the program's image is kept out of it.
+fn stack_ceiling(limit: u64) -> u64 {
+    (limit & !(PAGE - 1)).clamp(MIN_STACK_GAP, STACK_TOP - MMAP_TOP)
+}
+
+/// The stack area a program starts with (its strings, vectors and some room to run, at
+/// least `STACK_SIZE`).
+fn stack_need(args: &Strings, envs: &Strings, filename: &str) -> u64 {
+    let strings: usize = args.size() + envs.size() + filename.len() + 1;
+    let vectors = (args.len() + envs.len() + 3) * 8 + 24 * 16;
+    page_up((strings + vectors + 64 * 1024) as u64).max(STACK_SIZE)
 }
 
 /// The most bytes of arguments and environment, their pointers counted, for a soft
@@ -377,7 +390,7 @@ struct Prepared {
     /// (/proc's exe).
     filename: String,
     exe: String,
-    /// How far its stack may grow (`stack_room`).
+    /// The room kept for its stack (`stack_ceiling`).
     stack: u64,
 }
 
@@ -472,7 +485,7 @@ fn execveat(s: &mut State, dirfd: u64, path: u64, argv: u64, envp: u64, flags: u
         open(&base, &filename, flags & AT_SYMLINK_NOFOLLOW == 0)?
     };
     let shown = if filename.is_empty() { exe.clone() } else { filename };
-    let prepared = prepare(file, exe, shown, args, envs, stack_room(stack), 0)?;
+    let prepared = prepare(file, exe, shown, args, envs, stack_ceiling(stack), 0)?;
     // Past the point of no return a failure ends the process; it does so once this call
     // returned and let go of everything (`local::exit_pending`, carried out by `serve`).
     if let Err(status) = run(s, prepared) {
@@ -523,6 +536,8 @@ fn prepare(file: File, exe: String, filename: String, args: Strings, envs: Strin
         return prepare(ifile, iexe, filename, new_args, envs, stack, depth + 1);
     }
     let elf = Elf::load(&file, &head)?;
+    // (The image ends below the stack's room, and below the stack it starts with.)
+    let stack = stack.max(stack_need(&args, &envs, &filename));
     elf.bias(stack)?;
     let interp = match &elf.interp {
         Some(name) => {
@@ -742,9 +757,7 @@ const AT_MINSIGSTKSZ: u64 = 51;
 /// libuv's process title overwrites them), the platform name, 16 random bytes, then
 /// argc, argv, envp and the auxiliary vector. Returns the stack pointer.
 fn build_stack(p: &Prepared, bias: u64, interp_base: u64, entry: u64) -> Result<u64, i64> {
-    let strings: usize = p.args.size() + p.envs.size() + p.filename.len() + 1;
-    let vectors = (p.args.len() + p.envs.len() + 3) * 8 + 24 * 16;
-    let need = page_up((strings + vectors + 64 * 1024) as u64).max(STACK_SIZE);
+    let need = stack_need(&p.args, &p.envs, &p.filename);
     syscall_ok(SYS_MO_MAP, [0, STACK_TOP - need, need, p.stack, 3, MO_FIXED | MO_GROWSDOWN])?;
     // Nothing here allocates (past the point of no return, with as many strings as the
     // program gave): the strings go as their buffers hold them, back to back, and the
@@ -928,7 +941,7 @@ pub fn init(s: &mut State) {
         }
         Ok((args, envs))
     };
-    let result = strings().and_then(|(args, envs)| open("/", &path, true).and_then(|(file, exe)| prepare(file, exe, path.clone(), args, envs, stack_room(crate::ids::soft(crate::ids::RLIMIT_STACK)), 0)));
+    let result = strings().and_then(|(args, envs)| open("/", &path, true).and_then(|(file, exe)| prepare(file, exe, path.clone(), args, envs, stack_ceiling(crate::ids::soft(crate::ids::RLIMIT_STACK)), 0)));
     drop(buf);
     let status = match result {
         Ok(prepared) => match run(s, prepared) {

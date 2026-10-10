@@ -454,6 +454,8 @@ pub fn register_init(key: u64) {
     let files_ptr = Arc::as_ptr(&files);
     let limits = Arc::new(crate::ids::Limits::initial());
     let limits_ptr = Arc::as_ptr(&limits);
+    // The kernel's bound on the stack's growth (its processes inherit it).
+    syscall(SYS_STACK_LIMIT, [0, limits.soft(crate::ids::RLIMIT_STACK), 0, 0, 0, 0]);
     // (A fresh instance has the room; `end_later` copes without it.)
     let reserved = fdtable::reserve_end().is_ok();
     {

@@ -134,6 +134,11 @@ pub struct ThreadGroup {
     /// of memory, the monitor's `kill`, a failed server), else 0: the
     /// server reports it (`ProcInfo::killed`).
     pub killed_by_kernel: AtomicU64,
+    /// How far its stack may grow below its top, its soft RLIMIT_STACK
+    /// (`restricted::SYS_STACK_LIMIT`; read at each growth, within the
+    /// stack's ceiling): unbounded until the Linux server sets it, copied
+    /// by a fork.
+    pub stack_soft: AtomicU64,
 }
 
 impl ThreadGroup {
@@ -147,6 +152,7 @@ impl ThreadGroup {
             instance: AtomicU64::new(0),
             server_reaps: AtomicBool::new(false),
             killed_by_kernel: AtomicU64::new(0),
+            stack_soft: AtomicU64::new(u64::MAX),
         })
         .ok()
     }

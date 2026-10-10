@@ -171,10 +171,23 @@ static int stack_use(int frames) {
     return stack_use(frames - 1) + (frame[0] == frame[sizeof frame - 1] ? 0 : 1);
 }
 
+/* `lxtest wild`: an access 2 MiB above the mmap area, far below the stack, with an unlimited
+ * RLIMIT_STACK: a copy into it is EFAULT, a store SIGSEGV (no growth by 16 TiB, and no
+ * out-of-memory kill for trying). */
+static int wild_access(void) {
+    char *wild = (char *)0x300000200000UL;
+    int fd = open("/dev/zero", O_RDONLY);
+    errno = 0;
+    if (read(fd, wild, 1) != -1 || errno != EFAULT)
+        return 2;
+    *(volatile char *)wild = 1;
+    return 3;
+}
+
 /* Runs `lxtest stack <mib>` in a child with RLIMIT_STACK `limit` (0: as inherited) and
  * about `env_bytes` of environment (strings of 64 KiB: one string may have 128 KiB); the
  * child's wait status (exit status 100 + errno if its execve failed). */
-static int stack_child(rlim_t limit, int mib, size_t env_bytes) {
+static int stack_run(rlim_t limit, const char *mode, int mib, size_t env_bytes) {
     pid_t kid = fork();
     if (kid == 0) {
         if (limit) {
@@ -193,13 +206,17 @@ static int stack_child(rlim_t limit, int mib, size_t env_bytes) {
             env[i][n] = 0;
             env_bytes -= n;
         }
-        char *args[] = {"lxtest", "stack", arg, NULL};
+        char *args[] = {"lxtest", (char *)mode, arg, NULL};
         execve("/proc/self/exe", args, env);
         _exit(100 + errno);
     }
     int status = 0;
     waitpid(kid, &status, 0);
     return status;
+}
+
+static int stack_child(rlim_t limit, int mib, size_t env_bytes) {
+    return stack_run(limit, "stack", mib, env_bytes);
 }
 
 /* RLIMIT_STACK, as execve takes it: the new stack grows as far as the limit says, and the
@@ -213,6 +230,15 @@ static void stack_checks(void) {
           WIFEXITED(big) && WEXITSTATUS(big) == 0 && WIFSIGNALED(dflt) && WTERMSIG(dflt) == SIGSEGV);
     check("... and a quarter of it bounds the arguments and environment (E2BIG)",
           WIFEXITED(fits) && WEXITSTATUS(fits) == 0 && WIFEXITED(e2big) && WEXITSTATUS(e2big) == 100 + E2BIG);
+    /* The limit counts when the stack grows (as on Linux), within the 128 MiB at least that
+     * execve keeps for it. */
+    int raised = stack_run(0, "stack-raise", 24, 0);
+    int lowered = stack_run(64 << 20, "stack-lower", 24, 0);
+    check("... and is read when the stack grows: raised by the program it lets it grow, lowered it stops it",
+          WIFEXITED(raised) && WEXITSTATUS(raised) == 0 && WIFSIGNALED(lowered) && WTERMSIG(lowered) == SIGSEGV);
+    int wild = stack_run(RLIM_INFINITY, "wild", 0, 0);
+    check("an unlimited stack does not grow 16 TiB down to a wild access: EFAULT for a copy, SIGSEGV for a store",
+          WIFSIGNALED(wild) && WTERMSIG(wild) == SIGSEGV);
 }
 
 /* Waiters that wait again at once after every wake: a wake of many goes through the bucket
@@ -655,9 +681,15 @@ int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "serverfail") == 0) {
         return server_fail();
     }
-    if (argc > 2 && strcmp(argv[1], "stack") == 0) {
+    if (argc > 2 && strncmp(argv[1], "stack", 5) == 0) {
+        struct rlimit rl = {strcmp(argv[1], "stack-raise") == 0 ? 64 << 20 : 8 << 20, RLIM_INFINITY};
+        if (strcmp(argv[1], "stack") != 0)
+            setrlimit(RLIMIT_STACK, &rl);
         int frames = atoi(argv[2]) * 16;
         return frames > 0 ? stack_use(frames) != 1 : 0;
+    }
+    if (argc > 1 && strcmp(argv[1], "wild") == 0) {
+        return wild_access();
     }
     if (argc > 1 && strcmp(argv[1], "crashloop") == 0) {
         /* The test service dies at every use: the kernel restarts it with
