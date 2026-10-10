@@ -231,12 +231,45 @@ static void killed_with_threads(void) {
     close(p[0]);
 }
 
+/* Cache pages that reclaim cannot drop (dirty ones, until written back)
+ * are not there for committed memory: a commit that needs them is refused
+ * while they are dirty and granted once they are written back. (The page
+ * cache's clean pages count as free: a commit of all that is left
+ * succeeds with a cache full of them, see cachetest.) */
+static void dirty_counts_against_commit(void) {
+    const char *path = "/data/oomtest.dirty";
+    static char chunk[64 * 1024];
+    memset(chunk, 'd', sizeof chunk);
+    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    for (int i = 0; i < 128; i++) write(fd, chunk, sizeof chunk);
+    /* (The server writes dirty files back after 5 s: well after this.) */
+    long dirty = meminfo("Dirty:");
+    long room = (meminfo("CommitLimit:") - meminfo("Committed_AS:")) * 1024 - 2 * MIB;
+    void *m = mmap(NULL, room, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    int refused = m == MAP_FAILED && errno == ENOMEM;
+    if (m != MAP_FAILED) munmap(m, room);
+    fsync(fd);
+    long after = meminfo("Dirty:");
+    m = mmap(NULL, room, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    int granted = m != MAP_FAILED;
+    if (granted) {
+        for (long off = 0; off < room; off += 4096) ((char *)m)[off] = 1;
+        munmap(m, room);
+    }
+    printf("dirty: %ld kB, then %ld kB after fsync\n", dirty, after);
+    check("dirty cache pages count against the commit limit", dirty >= 4096 && refused);
+    check("... and are free for it once written back", after < 2048 && granted);
+    close(fd);
+    unlink(path);
+}
+
 int main(void) {
     descriptor_flood();
     fork_bomb();
     memory_hog();
     noreserve_toucher();
     noreserve_copy();
+    dirty_counts_against_commit();
     killed_with_threads();
     pipe_flood();
     printf("oomtest: %s\n", failures ? "FAILED" : "all passed");

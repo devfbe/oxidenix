@@ -1392,9 +1392,10 @@ impl AddressSpace {
     /// bit) gets the bit cleared and its page counts as `young` (a second
     /// chance); one not used is removed, so the page goes back to being
     /// only the cache's and the next access faults it in again. Entries
-    /// that map other frames (private copies) are left alone. Returns the
+    /// that map other frames (private copies) are left alone. With `force`
+    /// (reclaim under pressure), used entries are removed too. Returns the
     /// entries removed.
-    pub fn reclaim_file_pages(&mut self, cache: &PageCache, pages: &[(u64, PhysFrame)], young: &mut [bool]) -> u64 {
+    pub fn reclaim_file_pages(&mut self, cache: &PageCache, pages: &[(u64, PhysFrame)], young: &mut [bool], force: bool) -> u64 {
         let areas: alloc::vec::Vec<(u64, u64, u64)> = self
             .vmas
             .values()
@@ -1417,7 +1418,7 @@ impl AddressSpace {
                     continue;
                 }
                 let flags = e.flags();
-                if flags.contains(PageTableFlags::ACCESSED) {
+                if flags.contains(PageTableFlags::ACCESSED) && !force {
                     // No flush: a TLB entry still holding the bit only
                     // hides further uses until it goes (as on Linux).
                     e.set_flags(flags - PageTableFlags::ACCESSED);

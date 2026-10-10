@@ -281,8 +281,13 @@ pub fn phys_to_virt(addr: u64) -> *mut u8 {
 /// such as the stacks of threads, is most of what is promised), and when a
 /// commitment claims one and none is free, clean cache pages are reclaimed
 /// for it (`user_frame`), those that programs map included. What cannot be
-/// dropped at once is bounded: dirty pages by the dirty limits (write-back
-/// cleans them), pages being filled or granted by the grants in flight.
+/// dropped at once, dirty and pinned cache pages
+/// (`fs::cache::unavailable_pages`), counts against the limit as taken:
+/// a commit fails while committed and those together would exceed it, and
+/// a store that makes them exceed it waits for write-back
+/// (`fs::cache::balance_dirty`). So every committed page has a frame: free,
+/// or a clean cache page's, which reclaim can always take (the fault that
+/// needs it waits for write-back meanwhile, `reclaim_retry`).
 struct Account {
     committed: u64,
     cached: u64,
@@ -290,19 +295,25 @@ struct Account {
 
 static ACCOUNT: IrqSpinLock<Account> = IrqSpinLock::new(Account { committed: 0, cached: 0 });
 static COMMIT_LIMIT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-/// Drops up to the given number of reclaimable cache pages; returns how
-/// many it dropped (set by the file cache).
-static RECLAIM: Once<fn(u64) -> u64> = Once::new();
+/// Drops up to the given number of reclaimable cache pages, with `true`
+/// also those used lately (no second chance); returns how many it dropped
+/// (set by the file cache).
+static RECLAIM: Once<fn(u64, bool) -> u64> = Once::new();
 
-pub fn set_reclaim(f: fn(u64) -> u64) {
+pub fn set_reclaim(f: fn(u64, bool) -> u64) {
     RECLAIM.call_once(|| f);
 }
 
 /// Promises `pages` pages; false (nothing promised) if over the limit.
 pub fn commit(pages: u64) -> bool {
+    // Cache pages reclaim cannot drop now (dirty, pinned) are not there for
+    // the commitment: they count as taken until write-back or the grant
+    // ends (stores wait meanwhile rather than crowd out what was promised,
+    // `fs::cache::balance_dirty`).
+    let unavailable = crate::fs::cache::unavailable_pages();
     let mut a = ACCOUNT.lock();
     let limit = COMMIT_LIMIT.load(core::sync::atomic::Ordering::Relaxed);
-    if a.committed.saturating_add(pages) > limit {
+    if a.committed.saturating_add(pages).saturating_add(unavailable) > limit {
         return false;
     }
     a.committed += pages;
@@ -339,8 +350,8 @@ const RECLAIM_BATCH: u64 = 32;
 /// Reclaims cache pages for `n` frames (at least `RECLAIM_BATCH`); how
 /// many it dropped. Only with interrupts on: then no spinlock is held that
 /// reclaim takes, and it may unmap pages (TLB shootdowns). The caller holds
-/// no page cache lock.
-fn reclaim_for(n: u64) -> u64 {
+/// no page cache lock. With `force`, pages used lately go too.
+fn reclaim_for(n: u64, force: bool) -> u64 {
     use core::sync::atomic::Ordering::Relaxed;
     if !x86_64::instructions::interrupts::are_enabled() {
         return 0;
@@ -350,10 +361,10 @@ fn reclaim_for(n: u64) -> u64 {
     // a large cache with nothing to drop (dirty, in use) is not scanned
     // whole for every frame.
     let now = crate::time::now();
-    if now < FRUITLESS_UNTIL.load(Relaxed) {
+    if !force && now < FRUITLESS_UNTIL.load(Relaxed) {
         return 0;
     }
-    let freed = RECLAIM.get().map_or(0, |reclaim| reclaim(n.max(RECLAIM_BATCH)));
+    let freed = RECLAIM.get().map_or(0, |reclaim| reclaim(n.max(RECLAIM_BATCH), force));
     if freed == 0 {
         FRUITLESS_UNTIL.store(now + FRUITLESS_PAUSE, Relaxed);
     }
@@ -387,7 +398,7 @@ pub fn user_frame() -> Option<PhysFrame> {
         if frame.is_some() {
             return frame;
         }
-        if reclaim_for(1) == 0 {
+        if reclaim_for(1, false) == 0 {
             return with_frames(|f| frame::UserFrames(f).allocate_frame());
         }
     }
@@ -402,7 +413,7 @@ pub fn ensure_user_frames(n: u64) -> bool {
         if with_frames(|f| f.user_may_take(n + low_watermark(f))) {
             return true;
         }
-        if reclaim_for(n) == 0 {
+        if reclaim_for(n, false) == 0 {
             return with_frames(|f| f.user_may_take(n));
         }
     }
@@ -421,15 +432,26 @@ const RECLAIM_THROTTLE: u64 = 100_000_000;
 /// or busy address spaces if nothing could be dropped now (as Linux's
 /// reclaim throttling). Whether the allocation should be tried again:
 /// false once `tries` rounds made no progress, or the thread is dying.
+/// After a round without progress, pages used lately go too (as Linux's
+/// reclaim raises its priority): a committed page needs its frame more
+/// than a cached page that is in use (which is read again when used).
 pub fn reclaim_retry(n: u64, tries: &mut u32) -> bool {
+    let mut force = false;
     loop {
         if crate::process::kill::dying() || *tries >= RECLAIM_RETRIES {
             return false;
         }
-        if with_frames(|f| f.user_may_take(n)) || reclaim_for(n) > 0 {
+        if with_frames(|f| f.user_may_take(n)) || reclaim_for(n, force) > 0 {
             return true;
         }
-        *tries += 1;
+        force = true;
+        // Dirty or pinned cache pages become droppable once written back
+        // or ungranted: no try is lost waiting for them (commit counted
+        // them as taken, so what was promised is there once they are),
+        // except for a pager's thread, which may be the one to write them.
+        if crate::fs::cache::unavailable_pages() == 0 || crate::process::linux::is_pager() {
+            *tries += 1;
+        }
         let deadline = crate::time::now() + RECLAIM_THROTTLE;
         crate::process::sched::prepare_to_wait(reclaim_chan()).sleep_until(deadline);
     }

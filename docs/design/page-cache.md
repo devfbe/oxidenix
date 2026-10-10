@@ -116,13 +116,22 @@ space, and the walks (truncation, write-back) drop it before they lock a mapper.
   pages that programs map, through the reverse map (`mappers`): each address space that maps
   the file is taken if it is free (never waited for: its holder may be waiting for memory
   itself), its entries for the pages are aged by the accessed bit (cleared, the page kept) or
-  removed, and a page that only the cache holds afterwards is dropped. A fault that finds no
-  frame reclaims again with its address space unlocked, so that its own mappings can go too,
-  waiting 100 ms at a time for write-back or busy address spaces (Linux's reclaim throttling)
-  until 16 tries made no progress; then the toucher is killed. Dirty pages are bounded by the
-  dirty ratios (`balance_dirty`: write-back asked above a tenth of the commit limit, storing
-  threads waiting above a fifth), and reclaim that finds them in its way asks the pagers to
-  write back.
+  removed, and a page that only the cache (and reclaim) holds afterwards is dropped. Reclaim
+  holds a reference on each mapped candidate's frame during the walk, so the frame cannot be
+  dropped by another reclaim and reused (say, for a private copy of the same file page) while
+  it looks at the entries: an entry holding the frame can only map this page.
+- **The commit guarantee.** Cache pages reclaim cannot drop now, dirty and pinned ones
+  (`cache::unavailable_pages`), count against the limit as taken: `memory::commit` refuses
+  what would need them, and a store that makes committed memory and them exceed the limit
+  waits (killably, asking the pagers again every 100 ms) until write-back made room
+  (`balance_dirty`, beside the dirty ratios: write-back asked above a tenth of the commit
+  limit, storing threads waiting up to a second above a fifth). Every other cache page can be
+  reclaimed, so a committed page always gets its frame: a fault that finds none reclaims again
+  with its address space unlocked, so that its own mappings can go too, after a round without
+  progress also pages used lately (Linux's rising reclaim priority), waiting 100 ms at a time
+  for write-back or busy address spaces (Linux's reclaim throttling); it counts a fruitless
+  try only while nothing is dirty or pinned (a pager's own thread always), and after 16 of
+  them the toucher is killed.
 - The file metadata quota (inodes, symlink targets, pipes) on the kernel heap stays.
 
 ### Disk files
