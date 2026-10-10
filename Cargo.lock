@@ -494,6 +494,7 @@ dependencies = [
  "lazy_static",
  "linked_list_allocator",
  "noto-sans-mono-bitmap",
+ "pageheap",
  "pc-keyboard",
  "pic8259",
  "png",

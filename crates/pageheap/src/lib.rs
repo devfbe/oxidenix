@@ -29,11 +29,15 @@
 //! pages' is taken; `grow` (serializing growth of the metadata) is taken
 //! before the pages' lock.
 //!
+//! `charge` is the kernel's side: the account of a heap area's commitment
+//! (mapped pages and the instance's reserve) and the pool of all reserves.
+//!
 //! The crate holds locks of the caller's kind (`RawLock`: the server's
 //! futex mutex, a spin lock in the host tests) and allocates nothing.
 
 #![no_std]
 
+pub mod charge;
 mod pages;
 mod slabs;
 

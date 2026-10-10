@@ -212,14 +212,21 @@ the wait.
 **The instance's reserve.** A server cannot fail an allocation but by breaking its instance,
 and a heap that gives memory back must commit again later, possibly when its programs have
 taken everything they may or dirty pages crowd the limit (the server is what writes them back;
-in reclaimtest a heap commit was refused that way). So each instance holds 2 MiB of commitment
-beyond its mapped heap pages (`HEAP_RESERVE`, charged when the instance is made, like any
-commitment, and returned when it goes): a heap commit takes from it first and is an ordinary
-commit (counting dirty and pinned pages) only beyond it; a decommit refills it before it
-returns commitment. The instance's charge is always its mapped heap pages plus the free reserve,
-so the commit guarantee holds (the reserve counts as committed for everyone), nothing is
-refunded that was not charged, and no tree can take another's reserve. A heap commit refused
-beyond the reserve is logged once per instance (a tree can cause it at will).
+in reclaimtest a heap commit was refused that way). So each instance holds up to 2 MiB of
+commitment beyond its mapped heap pages (`HEAP_RESERVE`), its own (no other tree can take it):
+a heap commit takes from it first and is an ordinary commit (counting dirty and pinned pages)
+only beyond it; a decommit, or a commit's pages that could not be mapped, refill it before
+commitment is returned. The reserve is had only when there is room: a tree whose instance is
+made near the limit starts with less or none (never refused for it), and it is topped up after
+each successful commit as far as there is room then. All instances' reserves together are at
+most a 16th of the commit limit (a pool), so many trees cannot crowd out programs with them.
+The account (`pageheap::charge`: `Charge`, `Pool`) is pure arithmetic, host-tested over random
+operations: an instance holds exactly its mapped pages plus its reserve, the pool's count is
+the sum of the reserves, no refund exceeds what was charged (an unmap of more pages than are
+mapped is refused; the heap area is mapped only by `shared_commit`), and closing the instance
+returns all of it. The commit guarantee holds: the reserve counts as committed for everyone. A
+heap commit refused beyond the reserve is logged once per instance (a tree can cause it at
+will).
 
 
 **The allocator** (`pageheap`, host-tested with a model of the kernel that poisons decommitted

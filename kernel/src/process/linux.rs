@@ -215,32 +215,43 @@ fn zeroed_frame() -> Result<PhysFrame, i64> {
     Ok(frame)
 }
 
-/// Pages of commitment each instance holds for its heap beyond what is
+/// Pages of commitment an instance holds for its heap beyond what is
 /// mapped there (2 MiB): a server cannot fail an allocation but by breaking
 /// its instance, and a heap that gives memory back has to commit again
 /// later, maybe when its programs have taken all there is or dirty pages
 /// crowd the limit (the server is what writes them back). The reserve is
 /// the instance's own (no other tree can take it) and counted as committed
 /// for everyone (the commit guarantee holds); commits beyond it are
-/// ordinary ones.
+/// ordinary ones. It is had when there is room (never at the cost of a
+/// tree's start or of another commit) and all instances' together are at
+/// most `HEAP_POOL_SHARE` of the commit limit (`pageheap::charge`, whose
+/// arithmetic is host-tested).
 const HEAP_RESERVE: u64 = 512;
+const HEAP_POOL_SHARE: u64 = 16;
+static HEAP_POOL: pageheap::charge::Pool = pageheap::charge::Pool::new();
 
-/// The heap area's charge beyond its mapped pages (`Instance::heap`).
-pub struct HeapReserve {
-    /// Reserve pages not mapped now (at most `HEAP_RESERVE`).
-    free: u64,
-    /// A refused commit was logged (once per instance).
+/// The heap area's commitment (`Instance::heap`).
+pub struct HeapArea {
+    /// Its mapped pages and its reserve: what it holds of the commit limit.
+    charge: pageheap::charge::Charge,
+    /// A refused commit or a broken account was logged (once per instance).
     refused_told: bool,
 }
 
-impl HeapReserve {
-    /// `pages` of commitment come back (pages decommitted, or a commit's
-    /// that could not be mapped): the reserve is filled first, the rest
-    /// returned. The instance's charge stays its mapped pages plus `free`.
-    fn give_back(&mut self, pages: u64) {
-        let refill = pages.min(HEAP_RESERVE - self.free);
-        self.free += refill;
-        memory::uncommit(pages - refill);
+impl HeapArea {
+    /// Tops the reserve up as far as the pool and the commit limit allow
+    /// now (failing nothing).
+    fn grow_reserve(&mut self) {
+        HEAP_POOL.set_max(memory::commit_stats().1 / HEAP_POOL_SHARE);
+        let want = HEAP_POOL.take(self.charge.deficit(HEAP_RESERVE));
+        if want == 0 {
+            return;
+        }
+        if memory::commit(want) {
+            self.charge.grow_reserve(want, HEAP_RESERVE);
+        } else {
+            HEAP_POOL.give(want);
+        }
     }
 }
 
@@ -333,8 +344,7 @@ pub struct Instance {
     /// (`HEAP_BASE..THREADS_BASE`) change and while a word there is taken
     /// for a wait (`word`); the pages committed there (each exactly while
     /// it is mapped, `SYS_SHARED_COMMIT`).
-    heap: crate::sync::Mutex<HeapReserve>,
-    heap_pages: core::sync::atomic::AtomicU64,
+    heap: crate::sync::Mutex<HeapArea>,
     /// Memory is short: the service thread gets `EVENT_SHRINK` (a flag,
     /// `post_shrink`), at most once per `SHRINK_INTERVAL` (when it got the
     /// last).
@@ -500,8 +510,7 @@ impl Instance {
                 announced: 0,
             }),
             programs: core::sync::atomic::AtomicUsize::new(0),
-            heap: crate::sync::Mutex::new(HeapReserve { free: 0, refused_told: false }),
-            heap_pages: core::sync::atomic::AtomicU64::new(0),
+            heap: crate::sync::Mutex::new(HeapArea { charge: pageheap::charge::Charge::new(), refused_told: false }),
             shrink: core::sync::atomic::AtomicBool::new(false),
             shrunk_at: core::sync::atomic::AtomicU64::new(0),
             cache_counts,
@@ -513,12 +522,10 @@ impl Instance {
             broken: core::sync::atomic::AtomicBool::new(false),
         };
         instance.entry = instance.load(image)?;
-        // The heap's reserve, charged like any commitment (dropping the
-        // instance returns it).
-        if !memory::commit(HEAP_RESERVE) {
-            return Err(ENOMEM);
-        }
-        instance.heap.get_mut().free = HEAP_RESERVE;
+        // The heap's reserve as far as there is room (none: the tree starts
+        // anyway, the reserve comes with later commits). Dropping the
+        // instance returns it.
+        instance.heap.get_mut().grow_reserve();
         // Counted from here on (its drop uncounts it).
         LIVE.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
         let instance = Arc::try_new(instance).map_err(|_| ENOMEM)?;
@@ -749,6 +756,8 @@ impl Instance {
 
     /// The frame of the data page at `addr`, mapped (zeroed) if missing.
     fn ensure(&self, addr: u64) -> Result<PhysFrame, i64> {
+        // (The heap area is mapped only by `commit_heap`, which counts it.)
+        assert!(!(HEAP_BASE..THREADS_BASE).contains(&addr), "ensure in the heap area");
         let mapper = unsafe { OffsetPageTable::new(table_at(self.view), memory::phys_offset()) };
         let page = Page::<Size4KiB>::containing_address(VirtAddr::new(addr));
         if let Ok(frame) = mapper.translate_page(page) {
@@ -771,8 +780,9 @@ impl Instance {
         }
         // From the instance's own reserve first (committed already), the
         // rest as any commitment.
-        let from_reserve = missing.min(area.free);
-        if missing > from_reserve && !memory::commit(missing - from_reserve) {
+        let plan = area.charge.begin(missing, &HEAP_POOL);
+        if plan.fresh > 0 && !memory::commit(plan.fresh) {
+            memory::uncommit(area.charge.abort(plan, &HEAP_POOL, HEAP_RESERVE));
             // Said once per instance (a tree can make it happen at will).
             if !core::mem::replace(&mut area.refused_told, true) {
                 let (committed, limit) = memory::commit_stats();
@@ -787,7 +797,6 @@ impl Instance {
             }
             return Err(ENOMEM);
         }
-        area.free -= from_reserve;
         // Each page committed exactly while it is mapped: what is mapped
         // when a frame or a table cannot be had stays (the caller
         // decommits the range), the rest of the commitment goes back.
@@ -803,8 +812,10 @@ impl Instance {
             }
             mapped += 1;
         }
-        self.heap_pages.fetch_add(mapped, core::sync::atomic::Ordering::Relaxed);
-        area.give_back(missing - mapped);
+        memory::uncommit(area.charge.end(plan, mapped, &HEAP_POOL, HEAP_RESERVE));
+        if result.is_ok() {
+            area.grow_reserve();
+        }
         result
     }
 
@@ -815,8 +826,17 @@ impl Instance {
         let end = heap_range(addr, len)?;
         let mut area = self.heap.lock();
         let gone = self.unmap_pages(addr, (end - addr) / PAGE);
-        self.heap_pages.fetch_sub(gone, core::sync::atomic::Ordering::Relaxed);
-        area.give_back(gone);
+        // The heap area is mapped only by `commit_heap`, which counts each
+        // page: more cannot go than it counted. Were the account broken,
+        // the commitment stays held (never refunded twice).
+        match area.charge.unmapped(gone, &HEAP_POOL, HEAP_RESERVE) {
+            Ok(back) => memory::uncommit(back),
+            Err(_) => {
+                if !core::mem::replace(&mut area.refused_told, true) {
+                    crate::printkln!("[linux] instance {}: heap account broken ({} pages unmapped)", self.id, gone);
+                }
+            }
+        }
         Ok(gone)
     }
 
@@ -1206,7 +1226,7 @@ impl Drop for Instance {
     /// No address space shows the region any more: its frames go.
     fn drop(&mut self) {
         crate::drivers::console_device::release(self.id);
-        memory::uncommit(self.heap_pages.load(core::sync::atomic::Ordering::Relaxed) + self.heap.get_mut().free);
+        memory::uncommit(self.heap.get_mut().charge.close(&HEAP_POOL));
         memory::with_frames(|frames| unsafe {
             free_level(frames, self.pdpt, 3);
             frames.deallocate_frame(self.view);
