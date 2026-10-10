@@ -431,9 +431,11 @@ static void heap_returns(long start_committed, struct heap start) {
      * have caused). */
     usleep(1100 * 1000);
     long room = (meminfo("CommitLimit:") - meminfo("Committed_AS:")) * 1024;
+    struct heap before = server_heap(); /* (before the refusal: its shrink may be quick) */
     void *big = mmap(NULL, room + 64 * MIB, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    struct heap before = server_heap();
-    for (int i = 0; i < 30 && (h = server_heap()).shrinks == before.shrinks; i++) usleep(100 * 1000);
+    /* (Delivered within a second or two: at most one shrink a second per
+     * instance, handed to the worker.) */
+    for (int i = 0; i < 100 && (h = server_heap()).shrinks == before.shrinks; i++) usleep(100 * 1000);
     printf("shrink: free %lu kB before, %lu kB after (%lu shrinks)\n", before.free / 1024, h.free / 1024, h.shrinks);
     check("a refused commit makes the server shrink its heap", big == MAP_FAILED && h.shrinks > before.shrinks);
     check("... down to its floor of free pages, not below", h.free <= 1280 * 1024 && h.committed - h.in_use >= 1024 * 1024 - 64 * 1024);

@@ -128,7 +128,9 @@ pub fn shrink_if_asked() {
         return;
     }
     crate::HEAP.0.shrink(pages as usize);
-    crate::datafs::shrink(pages);
     LAST_TRIM.store(now(), Ordering::Relaxed);
+    // Counted once the heap gave back (the inodes' releases may wait for
+    // diskfs a while).
     SHRINKS.fetch_add(1, Ordering::Relaxed);
+    crate::datafs::shrink(pages);
 }
