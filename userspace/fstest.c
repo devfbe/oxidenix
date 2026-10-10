@@ -18,7 +18,56 @@ static void check(const char *name, int ok) {
     if (!ok) failures++;
 }
 
+/* Directories made in /tmp until the tree's tmpfs bound says ENOSPC (all removed again):
+ * how many inodes are left. */
+static int tmpfs_room(void) {
+    char p[64];
+    int n = 0;
+    mkdir("/tmp/budget", 0755);
+    for (;;) {
+        snprintf(p, sizeof p, "/tmp/budget/d%d", n);
+        if (mkdir(p, 0755) != 0) break;
+        n++;
+    }
+    int full = errno == ENOSPC;
+    for (int i = 0; i < n; i++) {
+        snprintf(p, sizeof p, "/tmp/budget/d%d", i);
+        rmdir(p);
+    }
+    rmdir("/tmp/budget");
+    return full ? n : -1;
+}
+
+/* The tmpfs bounds give back exactly what an inode charged, once, when the inode goes: after
+ * files made, renamed over (also while the replaced one is open), unlinked while open,
+ * symlinks with long targets and failed creations, the room is what it was. */
+static void tmpfs_budget(void) {
+    int before = tmpfs_room();
+    static char target[4000];
+    memset(target, 't', sizeof target - 1);
+    for (int i = 0; i < 300; i++) {
+        int a = open("/tmp/budget-a", O_RDWR | O_CREAT | O_TRUNC, 0600);
+        int b = open("/tmp/budget-b", O_RDWR | O_CREAT | O_TRUNC, 0600);
+        write(a, "a", 1);
+        /* b replaces a, which stays open. */
+        rename("/tmp/budget-b", "/tmp/budget-a");
+        /* Unlinked while open. */
+        unlink("/tmp/budget-a");
+        symlink(target, "/tmp/budget-l");
+        /* A failed creation (the name is taken). */
+        symlink(target, "/tmp/budget-l");
+        mkdir("/tmp/budget-l", 0755);
+        unlink("/tmp/budget-l");
+        close(a);
+        close(b);
+    }
+    int after = tmpfs_room();
+    printf("    (tmpfs room: %d inodes before, %d after)\n", before, after);
+    check("tmpfs bounds: ENOSPC, and every inode's charge given back once", before > 0 && after == before);
+}
+
 int main(void) {
+    tmpfs_budget();
     const char *dir = "/data/fstest";
     char path[64], buf[64];
     mkdir(dir, 0755);

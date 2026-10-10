@@ -14,6 +14,7 @@
 
 #![no_std]
 #![no_main]
+#![feature(allocator_ext)]
 
 extern crate alloc;
 
@@ -238,6 +239,21 @@ fn dispatch(s: &mut State) -> i64 {
         TEST_MAP..=TEST_HOST if !test_mode() => -ENOSYS,
         TEST_MAP..=TEST_CACHED => test(s.rax, s.rdi),
         TEST_MKWRITE_FAIL => datafs::fail_next_mkwrite(s.rdi),
+        TEST_SLEEP_LOCKED => match TEST_SLEEP_LOCK.lock() {
+            Ok(_held) => {
+                let until = syscall(SYS_CLOCK_READ, [1, 0, 0, 0, 0, 0]).max(0) as u64 + s.rdi;
+                syscall(SYS_SLEEP_UNTIL, [until, 0, 0, 0, 0, 0]);
+                0
+            }
+            Err(e) => -e,
+        },
+        TEST_SERVER_FAIL => {
+            let _plain = COUNTER.lock();
+            let _sleeping = TEST_SLEEP_LOCK.lock();
+            // The server's own code fails with both held.
+            unsafe { core::arch::asm!("ud2", options(nomem, nostack)) };
+            0
+        }
         // The kernel's to answer, with the name in the server's memory.
         TEST_SERVER_TICKS => match usercopy::read_cstr(s.rdi) {
             Ok(name) => syscall(TEST_SERVER_TICKS, [name.as_ptr() as u64, name.len() as u64, 0, 0, 0, 0]),
@@ -272,6 +288,9 @@ struct PagerRequest {
     key: u64,
     offset: u64,
 }
+
+/// The sleeping lock of `TEST_SLEEP_LOCKED` and `TEST_SERVER_FAIL`.
+static TEST_SLEEP_LOCK: sync::SleepLock = sync::SleepLock::new(());
 
 /// The object of the last TEST_MAP (one per instance, as test calls go).
 static TEST_OBJECT: AtomicU64 = AtomicU64::new(0);

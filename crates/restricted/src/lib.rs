@@ -337,6 +337,14 @@ pub const SYS_SERVER_FUTEX_WAIT: u64 = 1024;
 pub const SYS_SERVER_FUTEX_WAKE: u64 = 1025;
 pub const FUTEX_INTERRUPTIBLE: u64 = 1;
 pub const FUTEX_LOCK: u64 = 2;
+/// A sleeping lock's wait (the server's `SleepMutex`, `SleepRwLock`): ends
+/// (EINTR) when the waiter dies, and when the instance broke (its holder
+/// may be the server thread that failed: the instance's service threads,
+/// which never die, must not wait for it; they give up what they wanted it
+/// for and wind down as the instance closes. A service thread that waits
+/// for a plain lock the failed thread held ends with `thread_exit`, which
+/// ends the service threads' process once the instance broke).
+pub const FUTEX_SLEEPLOCK: u64 = 4;
 
 /// `(n)`: the server allocates and frees `n` blocks of many sizes from its
 /// heap, checking their contents; 0 if all were right.
@@ -901,8 +909,18 @@ pub const TEST_CACHED: u64 = 1516;
 /// asks again. Inode 0 disarms it; so does the inode leaving the server's
 /// cache (its number may go to another file). Test mode only.
 pub const TEST_MKWRITE_FAIL: u64 = 1519;
+/// `()`: the server fails on the calling thread (an invalid opcode in its own
+/// code) while it holds a plain lock (`TEST_LOCKED_ADD`'s) and a sleeping
+/// one (`TEST_SLEEP_LOCKED`'s): its instance breaks (`break_instance`).
+/// Test mode only; it ends the whole tree (`lxtest serverfail`, run on its
+/// own by autorun, not by the self-tests).
+pub const TEST_SERVER_FAIL: u64 = 1520;
+/// `(ns)`: takes the sleeping lock `TEST_SERVER_FAIL` holds, keeps it `ns`
+/// nanoseconds, and lets go (0 if it got it, EINTR if its wait ended).
+/// Test mode only.
+pub const TEST_SLEEP_LOCKED: u64 = 1521;
 /// `(on) -> old`: the kernel gives the caller's instance the host grant
 /// (`SYS_CLOCK_SET`, `SYS_POWER`) or takes it, and returns whether it had
 /// it: lxtest checks the tree without it. Test mode only; a program's call
 /// is the server's to pass on.
-pub const TEST_HOST: u64 = 1520;
+pub const TEST_HOST: u64 = 1522;

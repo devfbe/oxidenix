@@ -81,6 +81,16 @@ const POLLIN: i16 = 0x1;
 pub const MAX_EVENTS: usize = 16384;
 pub const MAX_INSTANCES: usize = 128;
 pub const MAX_WATCHES: usize = 8192;
+/// Most bytes all instances of the tree may hold in queued events (with what each takes
+/// besides its name): beyond it events are lost as by a full queue (IN_Q_OVERFLOW), so
+/// 128 instances' queues cannot fill the server's heap.
+const MAX_QUEUED_BYTES: usize = 8 << 20;
+static QUEUED_BYTES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// What a queued event takes.
+fn cost(e: &Event) -> usize {
+    48 + e.name.len()
+}
 /// `struct inotify_event` without its name.
 const EVENT_HEADER: usize = 16;
 const FIONREAD: u64 = 0x541b;
@@ -261,15 +271,25 @@ impl Inotify {
         if st.queue.back() == Some(&e) {
             return;
         }
-        if st.queue.len() >= MAX_EVENTS {
+        let room = st.queue.len() < MAX_EVENTS
+            && QUEUED_BYTES.load(Ordering::Relaxed) + cost(&e) <= MAX_QUEUED_BYTES
+            && st.queue.try_reserve(1).is_ok();
+        let e = if room {
+            e
+        } else {
             if st.overflowed {
                 return;
             }
             st.overflowed = true;
-            st.queue.push_back(Event { wd: -1, mask: IN_Q_OVERFLOW, cookie: 0, name: Vec::new() });
-        } else {
-            st.queue.push_back(e);
-        }
+            // (The overflow event's room: within the reservation the bounds above leave, or
+            // none: then it is dropped too, and the reader sees the overflow as the queue's end.)
+            if st.queue.try_reserve(1).is_err() {
+                return;
+            }
+            Event { wd: -1, mask: IN_Q_OVERFLOW, cookie: 0, name: Vec::new() }
+        };
+        QUEUED_BYTES.fetch_add(cost(&e), Ordering::Relaxed);
+        st.queue.push_back(e);
         self.seq.fetch_add(1, Ordering::Release);
         let word = &self.seq as *const AtomicU32 as u64;
         syscall(SYS_SERVER_FUTEX_WAKE, [word, i32::MAX as u64, 0, 0, 0, 0]);
@@ -320,9 +340,11 @@ impl Inotify {
                             break;
                         }
                         e.encode(&mut out);
-                        if e.mask == IN_Q_OVERFLOW {
+                        let (overflow, taken) = (e.mask == IN_Q_OVERFLOW, cost(e));
+                        if overflow {
                             st.overflowed = false;
                         }
+                        QUEUED_BYTES.fetch_sub(taken, Ordering::Relaxed);
                         st.queue.pop_front();
                     }
                     if out.is_empty() {
@@ -368,6 +390,8 @@ impl Inotify {
 impl Drop for Inotify {
     fn drop(&mut self) {
         INSTANCES.fetch_sub(1, Ordering::Relaxed);
+        let queued: usize = self.state.lock().queue.iter().map(cost).sum();
+        QUEUED_BYTES.fetch_sub(queued, Ordering::Relaxed);
         let keys: Vec<Key> = self.state.lock().watches.values().map(|w| w.key).collect();
         let mut r = REGISTRY.lock();
         for k in keys {
