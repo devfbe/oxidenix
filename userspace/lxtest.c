@@ -265,6 +265,12 @@ static void r9_checks(void) {
     int eperm1 = clock_settime(CLOCK_REALTIME, &later) == -1 && errno == EPERM;
     errno = 0;
     int eperm2 = settimeofday(&tv_now, NULL) == -1 && errno == EPERM;
+    /* (musl's settimeofday ignores the zone: the raw call.) */
+    struct timezone zone = {60, 0};
+    errno = 0;
+    int eperm3 = syscall(SYS_settimeofday, NULL, &zone) == -1 && errno == EPERM;
+    errno = 0;
+    int eperm4 = syscall(SYS_settimeofday, NULL, NULL) == -1 && errno == EPERM;
     /* reboot_pid_ns takes only the restart, power off and halt commands. */
     errno = 0;
     int cad_off = syscall(SYS_reboot, 0xfee1dead, 0x28121969, 0, NULL) == -1 && errno == EINVAL;
@@ -273,6 +279,24 @@ static void r9_checks(void) {
     syscall(TEST_HOST, 1);
     check("without the host grant clock_settime and settimeofday are EPERM", had == 1 && eperm1 && eperm2 && time(NULL) < later.tv_sec - 1800);
     check("... and reboot's CAD_ON and CAD_OFF EINVAL (a pid namespace's reboot)", cad_off && cad_on);
+    check("... and settimeofday with only a time zone, or nothing, EPERM", eperm3 && eperm4);
+    struct timezone seen_zone = {0, 0}, bad_zone = {16 * 60, 0}, utc = {0, 0};
+    int zone_set = syscall(SYS_settimeofday, NULL, &zone) == 0 && syscall(SYS_gettimeofday, NULL, &seen_zone) == 0 && seen_zone.tz_minuteswest == 60;
+    syscall(SYS_settimeofday, NULL, &utc);
+    errno = 0;
+    int zone_fault = syscall(SYS_settimeofday, NULL, (void *)8) == -1 && errno == EFAULT;
+    errno = 0;
+    int zone_range = syscall(SYS_settimeofday, NULL, &bad_zone) == -1 && errno == EINVAL;
+    check("settimeofday sets the time zone gettimeofday reports; a bad one is EFAULT, one beyond 15 hours EINVAL",
+          zone_set && zone_fault && zone_range);
+    /* Linux's TIME_SETTOD_SEC_MAX: KTIME_SEC_MAX less 30 years. */
+    struct timespec too_late = {9223372036L - 946080000L, 0};
+    struct timeval too_late_tv = {9223372036L, 0};
+    errno = 0;
+    int late1 = clock_settime(CLOCK_REALTIME, &too_late) == -1 && errno == EINVAL;
+    errno = 0;
+    int late2 = syscall(SYS_settimeofday, &too_late_tv, NULL) == -1 && errno == EINVAL;
+    check("a wall clock past TIME_SETTOD_SEC_MAX is EINVAL", late1 && late2 && time(NULL) < later.tv_sec - 1800);
     errno = 0;
     check("reboot: CAD_OFF is taken, RESTART2 checks its string (EFAULT)",
           syscall(SYS_reboot, 0xfee1dead, 0x28121969, 0, NULL) == 0
@@ -292,6 +316,9 @@ static void r9_checks(void) {
     errno = 0;
     check("... a soft limit above the hard one is EINVAL, a resource beyond them too",
           setrlimit(RLIMIT_STACK, &bad) == -1 && errno == EINVAL && syscall(SYS_prlimit64, 0, 16, NULL, &rl) == -1);
+    check("... the resource is an unsigned int (the upper half of the register is not looked at)",
+          syscall(SYS_prlimit64, 0, (1UL << 32) | RLIMIT_CORE, NULL, &rl) == 0 && rl.rlim_cur == 0
+          && syscall(SYS_prlimit64, 0, (1UL << 32) | RLIMIT_NOFILE, NULL, &rl) == 0 && rl.rlim_cur > 0);
     struct rlimit core_lim = {1 << 20, RLIM_INFINITY}, seen;
     int kept = setrlimit(RLIMIT_CORE, &core_lim) == 0 && getrlimit(RLIMIT_CORE, &seen) == 0 && seen.rlim_cur == 1 << 20;
     int lim_pipe[2];

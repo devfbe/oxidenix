@@ -361,9 +361,9 @@ pub fn handle(s: &State) -> Option<i64> {
         SYS_CLOSE_RANGE => close_range(a0 as u32 as u64, a1 as u32 as u64, a2),
         SYS_IOCTL if matches!(a1 as u32 as u64, FIONBIO | FIOCLEX | FIONCLEX) => ioctl(a0, a1 as u32 as u64, a2),
         // RLIMIT_NOFILE (the table's; the other limits are `ids`').
-        SYS_PRLIMIT64 if a1 == RLIMIT_NOFILE => table_of(a0 as i32).and_then(|t| prlimit_nofile(&t, a2, a3)),
-        SYS_GETRLIMIT if a0 == RLIMIT_NOFILE => prlimit_nofile(&current(), 0, a1),
-        SYS_SETRLIMIT if a0 == RLIMIT_NOFILE => prlimit_nofile(&current(), a1, 0),
+        SYS_PRLIMIT64 if a1 as u32 as u64 == RLIMIT_NOFILE => table_of(a0 as i32).and_then(|t| prlimit_nofile(&t, a2, a3)),
+        SYS_GETRLIMIT if a0 as u32 as u64 == RLIMIT_NOFILE => prlimit_nofile(&current(), 0, a1),
+        SYS_SETRLIMIT if a0 as u32 as u64 == RLIMIT_NOFILE => prlimit_nofile(&current(), a1, 0),
         _ => return None,
     };
     Some(result.unwrap_or_else(|e| -e))

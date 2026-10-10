@@ -69,9 +69,10 @@ pub fn handle(s: &State) -> Option<i64> {
         SYS_TIMES => times(a0),
         SYS_SCHED_GETAFFINITY => getaffinity(a0 as i32, a1, a2),
         SYS_SCHED_SETAFFINITY => setaffinity(a0 as i32, a1, a2),
-        SYS_PRLIMIT64 => process_exists(a0 as i32).and_then(|_| prlimit(a0 as Pid, a1, a2, a3)),
-        SYS_GETRLIMIT => prlimit(0, a0, 0, a1),
-        SYS_SETRLIMIT => prlimit(0, a0, a1, 0),
+        // (The resource is an unsigned int.)
+        SYS_PRLIMIT64 => process_exists(a0 as i32).and_then(|_| prlimit(a0 as Pid, a1 as u32 as u64, a2, a3)),
+        SYS_GETRLIMIT => prlimit(0, a0 as u32 as u64, 0, a1),
+        SYS_SETRLIMIT => prlimit(0, a0 as u32 as u64, a1, 0),
         _ => return None,
     };
     Some(result.unwrap_or_else(|e| -e))
