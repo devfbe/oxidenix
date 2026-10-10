@@ -329,6 +329,12 @@ pub struct Mm {
     space: Mutex<AddressSpace>,
 }
 
+impl Drop for Mm {
+    fn drop(&mut self) {
+        super::futex::mm_gone(self);
+    }
+}
+
 impl Mm {
     /// Fails (None) without memory, dropping the space.
     pub fn new(space: AddressSpace) -> Option<Arc<Mm>> {

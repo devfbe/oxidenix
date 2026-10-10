@@ -188,6 +188,31 @@ fn tidy(b: &mut Vec<Waiter>) {
     }
 }
 
+/// Room for `n` more waiters in `b` without allocating under its lock: if
+/// `b` has too little, `spare` (allocated with the lock released, `spare_for`)
+/// takes its waiters and becomes it, and the old buffer is left in `spare`
+/// for the caller to drop after the lock. False: `spare` is too small too.
+fn make_room(b: &mut Vec<Waiter>, n: usize, spare: &mut Vec<Waiter>) -> bool {
+    if b.capacity() - b.len() >= n {
+        return true;
+    }
+    if spare.capacity() < b.len() + n {
+        return false;
+    }
+    spare.append(b);
+    core::mem::swap(b, spare);
+    true
+}
+
+/// A spare buffer for `make_room` of a bucket that had `len` waiters and
+/// needs `n` more (some slack for those that come meanwhile), allocated
+/// with no lock held. ENOMEM without memory.
+fn spare_for(len: usize, n: usize) -> Result<Vec<Waiter>, i64> {
+    let mut spare = Vec::new();
+    spare.try_reserve_exact((len + n).max(KEEP) * 2).map_err(|_| ENOMEM)?;
+    Ok(spare)
+}
+
 static BUCKETS_: [IrqSpinLock<Vec<Waiter>>; BUCKETS] = [const { IrqSpinLock::new(Vec::new()) }; BUCKETS];
 
 fn bucket_of(key: &Key) -> usize {
@@ -307,6 +332,8 @@ fn wait_on(
 ) -> Result<i64, i64> {
     let me = current();
     let index = bucket_of(&key);
+    // (Declared before the guards: the old buffer goes after the lock.)
+    let mut spare = Vec::new();
     let mut wait = loop {
         let wait = prepare_to_sleep();
         let mut b = BUCKETS_[index].lock();
@@ -316,7 +343,13 @@ fn wait_on(
         match peek() {
             Some(v) if v != val => return Err(EAGAIN),
             Some(_) => {
-                b.try_reserve(1).map_err(|_| ENOMEM)?;
+                if !make_room(&mut b, 1, &mut spare) {
+                    let len = b.len();
+                    drop(b);
+                    drop(wait);
+                    spare = spare_for(len, 1)?;
+                    continue;
+                }
                 me.futex_woken.store(false, Ordering::Relaxed);
                 me.futex_bucket.store(index, Ordering::Relaxed);
                 b.push(Waiter { key, sleeper: Sleeper::Task(current_arc()), bitset, seq: next_seq(), movable });
@@ -453,6 +486,7 @@ pub fn requeue(uaddr: u64, n_wake: u64, n_move: u64, uaddr2: u64, cmp: Option<u3
     // after the locks: room for each entry of `from`, reserved with the locks
     // released (declared first: dropped after the guards).
     let mut out: Vec<Arc<Task>> = Vec::new();
+    let mut spare = Vec::new();
     loop {
         // Both buckets, in index order (once if they are the same).
         let mut first = BUCKETS_[i1.min(i2)].lock();
@@ -492,7 +526,14 @@ pub fn requeue(uaddr: u64, n_wake: u64, n_move: u64, uaddr2: u64, cmp: Option<u3
         let moves = |w: &Waiter| w.key == from && w.movable && matches!(w.sleeper, Sleeper::Task(_)) && !stale(w);
         let matching = src.iter().filter(|w| moves(w)).count() as u64;
         if let Some(d) = dst.as_mut() {
-            d.try_reserve(matching.min(n_move) as usize).map_err(|_| ENOMEM)?;
+            let need = matching.min(n_move) as usize;
+            if !make_room(d, need, &mut spare) {
+                let len = d.len();
+                drop(second);
+                drop(first);
+                spare = spare_for(len, need)?;
+                continue;
+            }
         }
         let (woken, _) = wake_in(src, &from, n_wake, FUTEX_BITSET_MATCH_ANY, u64::MAX, &mut out);
         let mut moved = 0;
@@ -568,18 +609,29 @@ pub fn server_waitv(words: &[WaitWord], deadline: Option<u64>, ends: Ends) -> Re
     me.futex_woken.store(false, Ordering::Release);
     let mut queued = 0;
     let mut early = None;
-    for w in words {
-        let mut b = BUCKETS_[bucket_of(&w.key)].lock();
+    let mut spare = Vec::new();
+    'words: for w in words {
+        let mut b = loop {
+            let mut b = BUCKETS_[bucket_of(&w.key)].lock();
+            if make_room(&mut b, 1, &mut spare) {
+                break b;
+            }
+            let len = b.len();
+            drop(b);
+            match spare_for(len, 1) {
+                Ok(s) => spare = s,
+                Err(e) => {
+                    early = Some(e);
+                    break 'words;
+                }
+            }
+        };
         if w.object.as_ref().is_some_and(|o| o.is_hung_up()) {
             early = Some(EPIPE);
             break;
         }
         if w.word.load(Ordering::SeqCst) != w.val {
             early = Some(EAGAIN);
-            break;
-        }
-        if b.try_reserve(1).is_err() {
-            early = Some(ENOMEM);
             break;
         }
         b.push(Waiter { key: w.key, sleeper: Sleeper::Task(current_arc()), bitset: FUTEX_BITSET_MATCH_ANY, seq: next_seq(), movable: false });
@@ -653,7 +705,16 @@ pub fn object_watch(
     pid: Pid,
 ) -> Result<i64, i64> {
     let key = Key { base: Base::Shared(Arc::as_ptr(object) as usize), offset };
-    let mut b = BUCKETS_[bucket_of(&key)].lock();
+    let mut spare = Vec::new();
+    let mut b = loop {
+        let mut b = BUCKETS_[bucket_of(&key)].lock();
+        if make_room(&mut b, 1, &mut spare) {
+            break b;
+        }
+        let len = b.len();
+        drop(b);
+        spare = spare_for(len, 1)?;
+    };
     if object.is_hung_up() {
         return Err(EPIPE);
     }
@@ -662,14 +723,14 @@ pub fn object_watch(
     }
     let armed = |w: &Waiter| w.key == key && matches!(&w.sleeper, Sleeper::Watch(_, p) if *p == pid);
     if !b.iter().any(armed) {
-        b.try_reserve(1).map_err(|_| ENOMEM)?;
         b.push(Waiter { key, sleeper: Sleeper::Watch(doorbell.clone(), pid), bitset: FUTEX_BITSET_MATCH_ANY, seq: next_seq(), movable: false });
     }
     Ok(0)
 }
 
-/// The doorbell of `test_watch`'s watch, while one is armed.
-static TEST_DOORBELL: IrqSpinLock<Option<Arc<AtomicBool>>> = IrqSpinLock::new(None);
+/// The doorbell of `test_watch`'s watch and the word it is on, while one
+/// is armed.
+static TEST_DOORBELL: IrqSpinLock<Option<(Arc<AtomicBool>, Key)>> = IrqSpinLock::new(None);
 
 /// Test mode (`restricted::TEST_FUTEX_WATCH`): a doorbell watch on a word
 /// of the caller's memory, a waiter no requeue moves, beside the program's
@@ -678,32 +739,56 @@ static TEST_DOORBELL: IrqSpinLock<Option<Arc<AtomicBool>>> = IrqSpinLock::new(No
 /// it back and returns whether a wake rang its doorbell.
 pub fn test_watch(uaddr: u64, arm: bool) -> Result<i64, i64> {
     if uaddr == 0 {
-        let Some(doorbell) = TEST_DOORBELL.lock().take() else { return Ok(0) };
-        let mine = |w: &Waiter| matches!(&w.sleeper, Sleeper::Watch(d, _) if Arc::ptr_eq(d, &doorbell));
-        for bucket in BUCKETS_.iter() {
-            let mut b = bucket.lock();
-            b.retain(|w| !mine(w));
-            tidy(&mut b);
-        }
-        return Ok(doorbell.load(Ordering::Acquire) as i64);
+        return Ok(test_unwatch(|_| true).unwrap_or(false) as i64);
     }
     let (key, _) = key_of(uaddr, true)?;
-    let mut doorbell = None;
-    if arm {
+    if !arm {
+        return Ok(BUCKETS_[bucket_of(&key)].lock().iter().filter(|w| w.key == key).count() as i64);
+    }
+    let d = Arc::try_new(AtomicBool::new(false)).map_err(|_| ENOMEM)?;
+    let mut spare = Vec::new();
+    loop {
+        // The slot, then the bucket (`test_unwatch` takes them one after the
+        // other): it is set only once the watch is in.
         let mut slot = TEST_DOORBELL.lock();
         if slot.is_some() {
             return Err(EBUSY);
         }
-        let d = Arc::try_new(AtomicBool::new(false)).map_err(|_| ENOMEM)?;
-        *slot = Some(d.clone());
-        doorbell = Some(d);
+        let mut b = BUCKETS_[bucket_of(&key)].lock();
+        if !make_room(&mut b, 1, &mut spare) {
+            let len = b.len();
+            drop(b);
+            drop(slot);
+            spare = spare_for(len, 1)?;
+            continue;
+        }
+        b.push(Waiter { key, sleeper: Sleeper::Watch(d.clone(), super::current_pid()), bitset: FUTEX_BITSET_MATCH_ANY, seq: next_seq(), movable: false });
+        *slot = Some((d, key));
+        return Ok(b.iter().filter(|w| w.key == key).count() as i64);
     }
+}
+
+/// Takes `test_watch`'s watch back if one is armed on a word `which`
+/// accepts: whether a wake rang it (None: there was none).
+fn test_unwatch(which: impl Fn(&Key) -> bool) -> Option<bool> {
+    let (doorbell, key) = {
+        let mut slot = TEST_DOORBELL.lock();
+        if !slot.as_ref().is_some_and(|(_, k)| which(k)) {
+            return None;
+        }
+        slot.take()?
+    };
     let mut b = BUCKETS_[bucket_of(&key)].lock();
-    if let Some(d) = doorbell {
-        b.try_reserve(1).map_err(|_| ENOMEM)?;
-        b.push(Waiter { key, sleeper: Sleeper::Watch(d, super::current_pid()), bitset: FUTEX_BITSET_MATCH_ANY, seq: next_seq(), movable: false });
-    }
-    Ok(b.iter().filter(|w| w.key == key).count() as i64)
+    b.retain(|w| !matches!(&w.sleeper, Sleeper::Watch(d, _) if Arc::ptr_eq(d, &doorbell)));
+    tidy(&mut b);
+    drop(b);
+    Some(doorbell.load(Ordering::Acquire))
+}
+
+/// An address space goes (`Mm`'s drop): a test watch left on one of its
+/// words goes with it (its key would name whatever takes the address next).
+pub fn mm_gone(mm: *const super::address_space::Mm) {
+    test_unwatch(|k| k.base == Base::Mm(mm as usize));
 }
 
 /// Wakes up to `n` waiters on the word at `offset` of `object`.
