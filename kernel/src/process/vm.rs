@@ -71,26 +71,38 @@ pub fn place_and_map(addr: u64, len: u64, prot: Prot, backing: Backing, how: Pla
         return Err(EINVAL);
     }
     let mm = mm()?;
-    let mut space = mm.lock();
-    let floor = page_up(space.brk_end);
-    let start = if how.fixed {
-        let end = addr.checked_add(len).filter(|&e| e <= address_space::USER_END && addr != 0).ok_or(EINVAL)?;
-        if how.no_replace && space.overlaps(addr, end) {
-            return Err(EEXIST);
-        }
-        addr
-    } else {
-        // A hint is taken if the range is free (one lookup of the areas,
-        // whatever the length).
-        let hint_free = addr != 0
-            && addr >= floor
-            && addr.checked_add(len).is_some_and(|e| e <= address_space::MMAP_TOP && !space.overlaps(addr, e));
-        if hint_free { addr } else { space.find_free(len, floor).ok_or(ENOMEM)? }
-    };
-    space.map(start, len, prot, backing, how.no_reserve).map_err(errno)?;
+    // (Again after waiting for write-back if only dirty cache pages stood
+    // in the way of the commit: `Mm::committing`.)
+    // (The placement's own errors inside, the mapping's outside.)
+    let placed = mm.committing(|space| {
+        let floor = page_up(space.brk_end);
+        let start = if how.fixed {
+            let Some(end) = addr.checked_add(len).filter(|&e| e <= address_space::USER_END && addr != 0) else { return Ok(Err(EINVAL)) };
+            if how.no_replace && space.overlaps(addr, end) {
+                return Ok(Err(EEXIST));
+            }
+            addr
+        } else {
+            // A hint is taken if the range is free (one lookup of the areas,
+            // whatever the length).
+            let hint_free = addr != 0
+                && addr >= floor
+                && addr.checked_add(len).is_some_and(|e| e <= address_space::MMAP_TOP && !space.overlaps(addr, e));
+            match hint_free {
+                true => addr,
+                false => match space.find_free(len, floor) {
+                    Some(start) => start,
+                    None => return Ok(Err(ENOMEM)),
+                },
+            }
+        };
+        space.map(start, len, prot, backing.clone(), how.no_reserve)?;
+        Ok(Ok(start))
+    });
+    let start = placed.map_err(errno)??;
     if how.populate && !prot.none() {
         // Best effort, as on Linux.
-        let _ = space.populate(start, len, prot.write);
+        let _ = mm.lock().populate(start, len, prot.write);
     }
     Ok(start as i64)
 }
@@ -109,7 +121,7 @@ pub fn unmap(addr: u64, len: u64) -> SysResult {
 pub fn protect(addr: u64, len: u64, bits: u64) -> SysResult {
     let len = range(addr, len)?;
     let prot = prot(bits)?;
-    mm()?.lock().protect(addr, len, prot).map_err(|e| if e == Fault::Access { EACCES } else { ENOMEM })?;
+    mm()?.committing(|space| space.protect(addr, len, prot)).map_err(|e| if e == Fault::Access { EACCES } else { ENOMEM })?;
     Ok(0)
 }
 
@@ -139,9 +151,11 @@ pub fn remap(old: u64, old_len: u64, new_len: u64, flags: u64, new_addr: u64) ->
         }
     }
     let mm = mm()?;
-    let mut space = mm.lock();
-    let floor = page_up(space.brk_end);
-    match space.remap(old, old_len, new_len, flags & MREMAP_MAYMOVE != 0, fixed, floor) {
+    let remapped = mm.committing(|space| {
+        let floor = page_up(space.brk_end);
+        space.remap(old, old_len, new_len, flags & MREMAP_MAYMOVE != 0, fixed, floor)
+    });
+    match remapped {
         Ok(at) => Ok(at as i64),
         Err(Fault::Oom) => Err(ENOMEM),
         Err(_) => Err(EFAULT),

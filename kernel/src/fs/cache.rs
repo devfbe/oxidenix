@@ -367,7 +367,8 @@ impl Drop for PageWait {
 /// server failed, no page to map (Bus, as on Linux), or no memory (Oom:
 /// the toucher is killed).
 pub fn page_fault(e: i64) -> Fault {
-    if e == ENOMEM { Fault::Oom } else { Fault::Bus }
+    // (EAGAIN: tmpfs's commit waits for write-back, `Mm::retrying`.)
+    if e == ENOMEM || e == EAGAIN { Fault::Oom } else { Fault::Bus }
 }
 
 /// Most present pages one `pin_fill` or `pin_dirty` looks at (with
@@ -525,7 +526,10 @@ impl Charge {
             .map_err(|_| ENOSPC)?;
         if !memory::commit(1) {
             TMPFS_PAGES.fetch_sub(1, Ordering::Relaxed);
-            return Err(ENOSPC);
+            // Only dirty or pinned disk-file pages in the way: EAGAIN, the
+            // caller waits for their write-back where it holds no lock
+            // (`create_waiting`; a fault in `Mm::retrying`).
+            return Err(if memory::commit_blocked_by_cache(1) { EAGAIN } else { ENOSPC });
         }
         Ok(Charge(true))
     }
@@ -895,6 +899,20 @@ impl PageCache {
         out[to - from..].fill(0);
     }
 
+    /// `create`, waiting for write-back when only dirty or pinned cache
+    /// pages stand in the way of the page's commit (EAGAIN): for callers
+    /// that hold no address space (a write, a grant).
+    fn create_waiting(&self, index: u64) -> Result<(), i64> {
+        let mut deadline = None;
+        loop {
+            match self.create(index) {
+                Err(EAGAIN) if memory::wait_for_cache(1, &mut deadline) => {}
+                Err(EAGAIN) => return Err(ENOSPC),
+                r => return r,
+            }
+        }
+    }
+
     /// Creates page `index` of a memory store if it is missing.
     fn create(&self, index: u64) -> Result<(), i64> {
         if self.state.lock().pages.contains_key(&index) {
@@ -1000,7 +1018,7 @@ impl PageCache {
             let (index, in_page) = (page_of(pos), (pos % PAGE) as usize);
             let n = ((PAGE as usize) - in_page).min((end - pos) as usize);
             let chunk = &data[(pos - off) as usize..][..n];
-            if let Err(e) = self.create(index) {
+            if let Err(e) = self.create_waiting(index) {
                 // A short write if some data went in.
                 return if pos == off { Err(e) } else { Ok((pos - off) as usize) };
             }
@@ -1471,7 +1489,7 @@ impl PageCache {
                 return Err(EINVAL);
             }
             match self.store {
-                Store::Memory { .. } => self.create(index)?,
+                Store::Memory { .. } => self.create_waiting(index)?,
                 Store::Paged { .. } => {}
                 Store::Cached { .. } => return Err(EINVAL),
             }
@@ -2139,6 +2157,14 @@ pub fn pager_gone(pager: *const ()) {
 
 /// Asks the pagers whose cached objects have dirty pages to write back
 /// about `pages` of them (each pager queues one request at a time).
+/// Asks the pagers to write back about `pages` dirty pages (for a commit
+/// that the cache's dirty pages stand in the way of).
+pub fn ask_writeback(pages: u64) {
+    if dirty_pages() > 0 {
+        ask_pagers(pages.max(1));
+    }
+}
+
 fn ask_pagers(pages: u64) {
     let mut i = CACHES.lock().len();
     while i > 0 {

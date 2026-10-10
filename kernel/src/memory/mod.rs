@@ -320,6 +320,46 @@ pub fn commit(pages: u64) -> bool {
     true
 }
 
+/// Whether a commit of `pages` failed only for the cache pages that are
+/// dirty or pinned now (write-back will make room), not for memory
+/// promised.
+pub fn commit_blocked_by_cache(pages: u64) -> bool {
+    let unavailable = crate::fs::cache::unavailable_pages();
+    let (committed, limit) = commit_stats();
+    unavailable > 0 && committed.saturating_add(pages) <= limit
+}
+
+/// How long a commit waits for write-back at most (all its waits
+/// together), and how often it looks again.
+const CACHE_WAIT: u64 = 30_000_000_000;
+const CACHE_RECHECK: u64 = 100_000_000;
+
+/// For a commit of `pages` that failed only for dirty or pinned cache
+/// pages, with no lock held that write-back may need (an address space's):
+/// asks the pagers to write back and waits until the commit would fit,
+/// killably, until `deadline` (set at the first wait, `CACHE_WAIT` on).
+/// Whether to try the commit again.
+///
+/// Only where no lock is held (an address space unlocked by
+/// `Mm::retrying` or `Mm::committing`); never from within an allocation.
+pub fn wait_for_cache(pages: u64, deadline: &mut Option<u64>) -> bool {
+    debug_assert!(x86_64::instructions::interrupts::are_enabled(), "waiting for write-back with a spinlock held");
+    let end = *deadline.get_or_insert_with(|| crate::time::now() + CACHE_WAIT);
+    loop {
+        if !commit_blocked_by_cache(pages) {
+            // Room now, or no write-back can make it.
+            let (committed, limit) = commit_stats();
+            return committed + pages + crate::fs::cache::unavailable_pages() <= limit;
+        }
+        let now = crate::time::now();
+        if now >= end || crate::process::kill::dying() {
+            return false;
+        }
+        crate::fs::cache::ask_writeback(pages);
+        crate::process::sched::prepare_to_wait(reclaim_chan()).sleep_until((now + CACHE_RECHECK).min(end));
+    }
+}
+
 pub fn uncommit(pages: u64) {
     ACCOUNT.lock().committed -= pages;
 }
@@ -439,6 +479,7 @@ const RECLAIM_THROTTLE: u64 = 100_000_000;
 /// reclaim raises its priority): a committed page needs its frame more
 /// than a cached page that is in use (which is read again when used).
 pub fn reclaim_retry(n: u64, tries: &mut u32) -> bool {
+    debug_assert!(x86_64::instructions::interrupts::are_enabled(), "waiting for reclaim with a spinlock held");
     let mut force = false;
     loop {
         // Dirty or pinned cache pages become droppable once written back
