@@ -44,6 +44,7 @@ pub const EEXIST: i64 = 17;
 pub const EISDIR: i64 = 21;
 pub const EINVAL: i64 = 22;
 pub const ENOSPC: i64 = 28;
+const ENOMEM: i64 = 12;
 pub const ENAMETOOLONG: i64 = 36;
 pub const ENOTEMPTY: i64 = 39;
 pub const ETXTBSY: i64 = 26;
@@ -145,6 +146,27 @@ pub struct Inode {
     /// Open file descriptions of it: a removed file's last close is when
     /// it goes (inotify's IN_DELETE_SELF).
     pub opens: AtomicUsize,
+    /// What it charged to the tmpfs's bounds (`INODES`, `META_BYTES`): given back when it
+    /// goes.
+    charged: usize,
+}
+
+/// Most inodes the programs may make in the tree's tmpfs (Linux's nr_inodes; the server's
+/// own, the root and the device nodes, do not count): directories, symlinks and socket
+/// names take the server's heap, not file pages, so they are bounded apart (ENOSPC).
+const MAX_INODES: usize = 32768;
+static INODES: AtomicUsize = AtomicUsize::new(0);
+/// Most bytes the programs' symlink targets may take in the tree's tmpfs (ENOSPC beyond).
+const MAX_META_BYTES: usize = 4 << 20;
+static META_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+impl Drop for Inode {
+    fn drop(&mut self) {
+        if self.charged != usize::MAX {
+            INODES.fetch_sub(1, Ordering::Relaxed);
+            META_BYTES.fetch_sub(self.charged, Ordering::Relaxed);
+        }
+    }
 }
 
 static NEXT_INO: AtomicU64 = AtomicU64::new(1);
@@ -153,20 +175,52 @@ static RENAME: Mutex<()> = Mutex::new(());
 
 /// A new, empty tmpfs: its root directory.
 pub fn new_root() -> Arc<Inode> {
-    Inode::new(Kind::Dir(BTreeMap::new()), 0o1777)
+    // (Made at the server's start: without memory for it the instance cannot begin.)
+    Inode::server(Kind::Dir(BTreeMap::new()), 0o1777).expect("memory for the root")
 }
 
 impl Inode {
-    fn new(kind: Kind, perm: u32) -> Arc<Inode> {
+    /// A programs' inode, charged to the tmpfs's bounds (ENOSPC beyond them, ENOMEM
+    /// without memory).
+    fn new(kind: Kind, perm: u32) -> Result<Arc<Inode>, i64> {
+        let meta = match &kind {
+            Kind::Symlink(t) => t.len(),
+            _ => 0,
+        };
+        if INODES.fetch_add(1, Ordering::Relaxed) >= MAX_INODES {
+            INODES.fetch_sub(1, Ordering::Relaxed);
+            return Err(ENOSPC);
+        }
+        if META_BYTES.fetch_add(meta, Ordering::Relaxed) + meta > MAX_META_BYTES {
+            META_BYTES.fetch_sub(meta, Ordering::Relaxed);
+            INODES.fetch_sub(1, Ordering::Relaxed);
+            return Err(ENOSPC);
+        }
+        // (A failure from here on gives the charge back with the inode's drop, or here.)
+        Inode::make(kind, perm, meta).map_err(|e| {
+            INODES.fetch_sub(1, Ordering::Relaxed);
+            META_BYTES.fetch_sub(meta, Ordering::Relaxed);
+            e
+        })
+    }
+
+    /// The server's own inode (the root, devpts and its nodes): not charged.
+    fn server(kind: Kind, perm: u32) -> Result<Arc<Inode>, i64> {
+        Inode::make(kind, perm, usize::MAX)
+    }
+
+    fn make(kind: Kind, perm: u32, charged: usize) -> Result<Arc<Inode>, i64> {
         let file_type = kind_bits(&kind);
         let state = State { perm, kind: content::Content::new(kind), sealed: false, times: Times::new(now()), writers: 0, removed: false, link: None };
-        Arc::new(Inode {
+        Arc::try_new(Inode {
             ino: NEXT_INO.fetch_add(1, Ordering::Relaxed),
             file_type,
             state: Mutex::new(state),
             append: crate::sync::SleepLock::new(()),
             opens: AtomicUsize::new(0),
+            charged,
         })
+        .map_err(|_| ENOMEM)
     }
 
     /// The directory it is in and its name there (None: removed, or the
@@ -296,7 +350,7 @@ impl Inode {
         } else {
             Kind::File(Object(check(syscall(SYS_MO_CREATE_FILE, [0; 6])).map_err(|e| if e == 24 { ENOSPC } else { e })? as u64))
         };
-        let inode = Inode::new(kind, perm & 0o7777);
+        let inode = Inode::new(kind, perm & 0o7777)?;
         self.insert(name, inode.clone())?;
         Ok(inode)
     }
@@ -306,7 +360,7 @@ impl Inode {
     pub fn insert_object(&self, name: &str, handle: u64, perm: u32) -> Result<(), i64> {
         let object = Object(handle);
         check_name(name)?;
-        self.insert(name, Inode::new(Kind::File(object), perm & 0o7777))
+        self.insert(name, Inode::new(Kind::File(object), perm & 0o7777)?)
     }
 
     /// The directory `name`, made if missing.
@@ -323,20 +377,21 @@ impl Inode {
 
     pub fn symlink(&self, name: &str, target: String) -> Result<(), i64> {
         check_name(name)?;
-        self.insert(name, Inode::new(Kind::Symlink(target), 0o777))
+        self.insert(name, Inode::new(Kind::Symlink(target), 0o777)?)
     }
 
     /// A new socket inode `name` (EEXIST if taken), for bind(2).
     pub fn socket(&self, name: &str, perm: u32) -> Result<Arc<Inode>, i64> {
         check_name(name)?;
-        let inode = Inode::new(Kind::Socket, perm & 0o7777);
+        let inode = Inode::new(Kind::Socket, perm & 0o7777)?;
         self.insert(name, inode.clone())?;
         Ok(inode)
     }
 
     /// A sealed directory (devpts, see `State::sealed`).
     pub fn new_sealed_dir(perm: u32) -> Arc<Inode> {
-        let dir = Inode::new(Kind::Dir(BTreeMap::new()), perm & 0o7777);
+        // (Made at the server's start, as the root.)
+        let dir = Inode::server(Kind::Dir(BTreeMap::new()), perm & 0o7777).expect("memory for devpts");
         dir.state.lock().sealed = true;
         dir
     }
@@ -345,7 +400,7 @@ impl Inode {
     /// a sealed directory: the server's own.
     pub fn insert_device(&self, name: &str, rdev: u64, perm: u32) -> Result<Arc<Inode>, i64> {
         check_name(name)?;
-        let inode = Inode::new(Kind::Device(rdev), perm & 0o7777);
+        let inode = Inode::server(Kind::Device(rdev), perm & 0o7777)?;
         self.insert_as(name, inode.clone(), true)?;
         Ok(inode)
     }
