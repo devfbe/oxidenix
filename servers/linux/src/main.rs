@@ -263,6 +263,7 @@ fn dispatch(s: &mut State) -> i64 {
             Ok(name) => syscall(TEST_SERVER_TICKS, [name.as_ptr() as u64, name.len() as u64, 0, 0, 0, 0]),
             Err(e) => -e,
         },
+        TEST_HOST => syscall(TEST_HOST, [s.rdi, 0, 0, 0, 0, 0]),
         // Not offered, as by a Linux built without io_uring: libuv (and
         // so Node.js) probes io_uring_setup at start and uses epoll
         // instead. Answered here, so the kernel does not log them as
@@ -273,8 +274,14 @@ fn dispatch(s: &mut State) -> i64 {
         // implement is ENOSYS, said on the console (scripted runs read
         // which calls a program misses from there).
         nr => {
-            let text = alloc::format!("syscall {} not implemented", nr);
-            syscall(SYS_SERVER_LOG, [text.as_ptr() as u64, text.len() as u64, 0, 0, 0, 0]);
+            // Once per number and instance: a program that probes a call in
+            // a loop does not flood the console.
+            static SAID: [AtomicU64; (FIRST_NON_LINUX as usize).div_ceil(64)] = [const { AtomicU64::new(0) }; (FIRST_NON_LINUX as usize).div_ceil(64)];
+            let bit = 1u64 << (nr % 64);
+            if SAID[(nr / 64) as usize].fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+                let text = alloc::format!("syscall {} not implemented", nr);
+                syscall(SYS_SERVER_LOG, [text.as_ptr() as u64, text.len() as u64, 0, 0, 0, 0]);
+            }
             -ENOSYS
         }
     }

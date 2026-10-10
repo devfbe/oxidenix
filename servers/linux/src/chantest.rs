@@ -213,6 +213,11 @@ fn rings() -> Result<(), i64> {
     check!(3, c.status(SLEEPS, 0, 0, 0, 0) > 0);
     check!(12, c.status(HEADER_READ_ONLY, 0, 0, 0, 0) == 0);
     check!(13, c.status(WATCH, 0, 0, 0, 0) == 0);
+    // A service's requeue of the completion word moves none of the
+    // server's own waits: the client is woken by the completion at once.
+    let t0 = now();
+    check!(14, c.status(REQUEUE_AWAY, 0, 0, 0, 0) == 0);
+    check!(15, now() - t0 < 1_000_000_000);
     check!(4, c.connect(SERVICE) == -EISCONN);
     let d = Client::create().map_err(|_| 5)?;
     check!(6, d.connect("nosuchservice") == -ENOENT);

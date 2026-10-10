@@ -70,6 +70,10 @@ fn futex(uaddr: u64, op: u64, val: u64, timeout: u64, uaddr2: u64, val3: u64) ->
         FUTEX_WAKE_BITSET => check(syscall(SYS_FUTEX_WAKE, [uaddr, count(val), val3 as u32 as u64, private, 0, 0])),
         // For the requeue operations the timeout argument is a count.
         FUTEX_REQUEUE | FUTEX_CMP_REQUEUE => {
+            // Negative counts are EINVAL here (Linux's futex_requeue).
+            if (val as u32 as i32) < 0 || (timeout as u32 as i32) < 0 {
+                return Err(EINVAL);
+            }
             if uaddr2 >= SHARED_BASE {
                 return Err(usercopy::EFAULT);
             }
