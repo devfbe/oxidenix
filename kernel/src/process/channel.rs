@@ -268,6 +268,9 @@ impl DmaDomain {
     }
 }
 
+/// How long a channel's offer waits for its service to attach or answer.
+const OFFER_TIMEOUT: u64 = 10_000_000_000;
+
 impl Channel {
     /// A new channel of `slots` slots per ring and `shared` pages of
     /// shared area (see `ring::channel`).
@@ -367,7 +370,11 @@ impl Channel {
         self.inner.lock().offer_request = Some(id);
         // Done once the service attached (it need not have answered),
         // answered, or died; the caller's end (its kick, or its death)
-        // gives the offer up unless the service attached.
+        // gives the offer up unless the service attached, and so does a service that neither
+        // attaches nor answers within `OFFER_TIMEOUT` (a live but stalled
+        // service never holds the caller, which may hold the Linux server's
+        // lock of its channel, for good).
+        let deadline = crate::time::now().saturating_add(OFFER_TIMEOUT);
         let answer = loop {
             let wait = super::sched::prepare_to_wait(ipc::reply_chan(id));
             if self.inner.lock().service.is_some() {
@@ -379,7 +386,10 @@ impl Channel {
             if super::kill::interrupted() || super::kill::dying() {
                 break Some(Err(EINTR));
             }
-            wait.sleep();
+            if crate::time::now() >= deadline {
+                break Some(Err(ETIMEDOUT));
+            }
+            wait.sleep_until(deadline);
         };
         ipc::abandon(id);
         let refused = match answer {

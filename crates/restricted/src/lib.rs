@@ -325,11 +325,18 @@ pub const SYS_SHARED_MAP: u64 = 1023;
 /// word at `addr` (the server's memory) holds `val`, until woken, the
 /// deadline (monotonic nanoseconds; 0: none) or, with
 /// `FUTEX_INTERRUPTIBLE`, a kick (EINTR, see `thread_kick`). A dying thread
-/// always stops waiting (EINTR).
+/// stops waiting (EINTR), but for `FUTEX_LOCK`: a lock's wait in the
+/// server's own memory (EINVAL on an object's word: a word another party
+/// writes never holds a dying thread), whose holder does only bounded work
+/// and which a dying thread's server needs to end the thread: it ends only
+/// when woken (or at the deadline), or with EINTR once the instance broke
+/// (a server thread failed, `break_instance`; the server ends the waiter
+/// then).
 pub const SYS_SERVER_FUTEX_WAIT: u64 = 1024;
 /// `server_futex_wake(addr, n) -> woken`.
 pub const SYS_SERVER_FUTEX_WAKE: u64 = 1025;
 pub const FUTEX_INTERRUPTIBLE: u64 = 1;
+pub const FUTEX_LOCK: u64 = 2;
 
 /// `(n)`: the server allocates and frees `n` blocks of many sizes from its
 /// heap, checking their contents; 0 if all were right.
@@ -363,9 +370,14 @@ pub const CLOCK_WALL: u64 = 0;
 pub const CLOCK_MONO: u64 = 1;
 pub const CLOCK_PROCESS_CPU: u64 = 2;
 pub const CLOCK_THREAD_CPU: u64 = 3;
-/// `sleep_until(deadline) -> 0`: sleeps until `deadline` (monotonic
-/// nanoseconds), or EINTR when the thread is kicked (`thread_kick`).
+/// `sleep_until(deadline, flags) -> 0`: sleeps until `deadline` (monotonic
+/// nanoseconds), or EINTR when the thread is kicked (`thread_kick`) or dies.
+/// With `SLEEP_NAP` a short pause that neither ends (EINVAL for a deadline
+/// more than `NAP_MAX` ahead): what a dying thread polls with while it
+/// waits for a request of its that a service still holds.
 pub const SYS_SLEEP_UNTIL: u64 = 1031;
+pub const SLEEP_NAP: u64 = 1;
+pub const NAP_MAX: u64 = 10_000_000;
 /// `yield()`: lets other threads run.
 pub const SYS_YIELD: u64 = 1032;
 

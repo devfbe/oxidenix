@@ -750,7 +750,7 @@ impl Regular {
         }
     }
 
-    fn position(&self) -> crate::sync::MutexGuard<'_, u64> {
+    fn position(&self) -> Result<crate::sync::SleepMutexGuard<'_, u64>, i64> {
         match self {
             Regular::Tmp(f) => f.position(),
             Regular::Data(f) => f.position(),
@@ -827,11 +827,11 @@ fn copy_file_range(fd_in: u64, off_in: u64, fd_out: u64, off_out: u64, len: u64,
     // in opposite directions must not wait for each other).
     let start_in = match given_in {
         Some(o) => o,
-        None => *input.position(),
+        None => *input.position()?,
     };
     let start_out = match given_out {
         Some(o) => o,
-        None => *output.position(),
+        None => *output.position()?,
     };
     // Nothing beyond the input's end is copied: the length is clamped
     // before the overlap is checked (as Linux's generic checks).
@@ -863,11 +863,11 @@ fn copy_file_range(fd_in: u64, off_in: u64, fd_out: u64, off_out: u64, len: u64,
     }
     match given_in {
         Some(_) => crate::usercopy::write(off_in, &(start_in + done))?,
-        None => *input.position() = start_in + done,
+        None => *input.position()? = start_in + done,
     }
     match given_out {
         Some(_) => crate::usercopy::write(off_out, &(start_out + done))?,
-        None => *output.position() = start_out + done,
+        None => *output.position()? = start_out + done,
     }
     Ok(done as i64)
 }

@@ -156,7 +156,8 @@ pub struct Follow {
 // ------------------------------------------------------------- procfs
 
 static CLIENT: Mutex<Option<Arc<Client>>> = Mutex::new(None);
-static RECONNECT: Mutex<()> = Mutex::new(());
+/// One reconnection at a time (held across the channel's offer: a sleeping lock).
+static RECONNECT: crate::sync::SleepLock = crate::sync::SleepLock::new(());
 
 /// The instance's channel to procfs, a new one if the old died (procfs is
 /// started again if it did).
@@ -164,7 +165,7 @@ fn client() -> Result<Arc<Client>, i64> {
     if let Some(c) = CLIENT.lock().clone().filter(|c| !c.is_dead()) {
         return Ok(c);
     }
-    let _one = RECONNECT.lock();
+    let _one = RECONNECT.lock()?;
     if let Some(c) = CLIENT.lock().clone().filter(|c| !c.is_dead()) {
         return Ok(c);
     }

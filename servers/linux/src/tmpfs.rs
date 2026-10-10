@@ -147,7 +147,7 @@ pub struct Inode {
     pub state: Mutex<State>,
     /// Taken by O_APPEND writes: finding the end and writing there is one
     /// step for every appender.
-    pub append: Mutex<()>,
+    pub append: crate::sync::SleepLock,
     /// Open file descriptions of it: a removed file's last close is when
     /// it goes (inotify's IN_DELETE_SELF).
     pub opens: AtomicUsize,
@@ -171,7 +171,7 @@ impl Inode {
             dev,
             file_type,
             state: Mutex::new(state),
-            append: Mutex::new(()),
+            append: crate::sync::SleepLock::new(()),
             opens: AtomicUsize::new(0),
         })
     }
@@ -507,15 +507,18 @@ pub fn release_handled() {
 }
 
 /// Waits until the service thread has handled every release the kernel has
-/// queued so far.
-fn settle() {
+/// queued so far (or the calling thread dies: EINTR).
+fn settle() -> Result<(), i64> {
+    const EINTR: i64 = 4;
     let target = syscall(SYS_EVENT_RELEASES, [0; 6]) as u32;
     loop {
         let done = RELEASES_HANDLED.load(Ordering::Acquire);
         if done.wrapping_sub(target) as i32 >= 0 {
-            return;
+            return Ok(());
         }
-        syscall(SYS_SERVER_FUTEX_WAIT, [&RELEASES_HANDLED as *const AtomicU32 as u64, done as u64, 0, 0, 0, 0]);
+        if syscall(SYS_SERVER_FUTEX_WAIT, [&RELEASES_HANDLED as *const AtomicU32 as u64, done as u64, 0, 0, 0, 0]) == -EINTR {
+            return Err(EINTR);
+        }
     }
 }
 
@@ -524,7 +527,7 @@ fn settle() {
 pub(crate) fn settled(try_once: impl Fn() -> Result<(), i64>) -> Result<(), i64> {
     match try_once() {
         Err(ETXTBSY) => {
-            settle();
+            settle()?;
             try_once()
         }
         r => r,

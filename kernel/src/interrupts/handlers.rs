@@ -127,7 +127,11 @@ fn exception(frame: &mut Frame) {
         }
     }
     if frame.from_user() && crate::process::linux::mode() == Some(false) {
-        // The Linux server failed: its process cannot go on.
+        // The Linux server failed (also one whose access to program memory
+        // outside its copy routine ended with the thread's death: every such
+        // access goes through the copy routine, whose fixup unwinds the call).
+        // Whatever it held (its locks, sleeping ones too, references) is lost
+        // with it, so its instance ends: never this thread alone.
         crate::printkln!(
             "[linux] {} in the Linux server (rip {:#x}, address {:#x}, error {:#x}, cr3 {:#x}, rdi {:#x}), process killed",
             exception_name(vector),
@@ -141,6 +145,7 @@ fn exception(frame: &mut Frame) {
             let (program, normal) = mm.tlb.roots();
             crate::printkln!("[linux] program view {:#x}, normal view {:#x}", program, normal);
         }
+        crate::process::linux::break_instance();
         kill::kernel_kill_current();
     }
     let mut sig = exception_signal(vector);

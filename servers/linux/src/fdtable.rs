@@ -32,6 +32,7 @@ use crate::syscall;
 use crate::local;
 use crate::usercopy;
 use alloc::sync::Arc;
+use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
 use restricted::*;
@@ -195,31 +196,50 @@ pub fn current() -> Arc<FilesContext> {
     }
 }
 
-/// Tables of threads the kernel ended, for the worker (`end_later`), each with the process
-/// whose end waits for it (0: none). Room for one per program thread is reserved when the
-/// thread is made (`reserve_end`), so the service thread never allocates (nor closes
-/// anything) to hand one over.
+/// Tables of threads the kernel ended, for the worker (`end_later`), in the order they came,
+/// each with its process (whose end waits for it) and whether it was handed over within its
+/// thread's reservation. Room for one per program thread is reserved when the thread is made
+/// (`reserve_end`), so the service thread never allocates (nor closes anything) to hand one
+/// over.
 struct Ended {
-    items: Vec<(Arc<FilesContext>, u32)>,
-    /// Program threads that may still hand a table over (live ones, and those whose handed
-    /// table the worker has not taken yet): `items`' capacity is at least this.
+    items: VecDeque<Handed>,
+    /// Program threads that may still hand a table over within their reservation (live
+    /// ones, and those whose handed table the worker has not taken yet).
     reserved: usize,
+    /// Tables handed over without a reservation (room found when they came) still queued.
+    extra: usize,
 }
 
-static ENDED: Mutex<Ended> = Mutex::new(Ended { items: Vec::new(), reserved: 0 });
+struct Handed {
+    files: Arc<FilesContext>,
+    pid: u32,
+    reserved: bool,
+}
+
+impl Ended {
+    /// Room for every table that may be queued: `items`' capacity at least
+    /// `reserved + extra`.
+    fn ensure(&mut self) -> Result<(), i64> {
+        let need = (self.reserved + self.extra).saturating_sub(self.items.len());
+        self.items.try_reserve(need).map_err(|_| ENOMEM)
+    }
+}
+
+static ENDED: Mutex<Ended> = Mutex::new(Ended { items: VecDeque::new(), reserved: 0, extra: 0 });
 
 /// Room for a new program thread's table at its end (ENOMEM without it).
 pub fn reserve_end() -> Result<(), i64> {
     let mut e = ENDED.lock();
-    let want = e.reserved + 1;
-    let len = e.items.len();
-    e.items.try_reserve(want - len).map_err(|_| ENOMEM)?;
-    e.reserved = want;
+    e.reserved += 1;
+    if let Err(err) = e.ensure() {
+        e.reserved -= 1;
+        return Err(err);
+    }
     Ok(())
 }
 
 /// A thread's reservation goes unused (a clone that failed, a thread that let go of its
-/// table itself).
+/// table itself, a reserved hand-over the worker took).
 pub fn unreserve_end() {
     let mut e = ENDED.lock();
     e.reserved = e.reserved.saturating_sub(1);
@@ -228,22 +248,27 @@ pub fn unreserve_end() {
 /// A thread the kernel ended still had its table (`process::thread_ended`, on the service
 /// thread): the worker lets go of it, which closes its descriptors with its last reference
 /// (closing a socket takes its locks, which the service thread must never wait for), and
-/// then ends process `pid` if not 0: its parent learns of the end only after its
-/// descriptors closed (Linux's exit_files before exit_notify). False if it could not be
-/// handed over (the caller ends the process itself then). Called with the process table's
-/// lock held (lock order: `process::PROCS`, then `ENDED`).
-pub fn end_later(files: Arc<FilesContext>, pid: u32) -> bool {
+/// then tells process `pid` (`process::end_deferred`): its parent learns of the end only
+/// after its descriptors closed (Linux's exit_files before exit_notify). `reserved`: the
+/// thread's reservation covers it; without one (a first thread whose reservation failed)
+/// room is found now, or the table is kept for good rather than closed here. False if it was
+/// not handed over (nothing then waits for it). Called with the process table's lock held
+/// (lock order: `process::PROCS`, then `ENDED`).
+pub fn end_later(files: Arc<FilesContext>, pid: u32, reserved: bool) -> bool {
     let mut e = ENDED.lock();
-    // Within the thread's reservation there is room; without it (never, but for a first
-    // thread whose reservation failed) the table is kept for good rather than closed here.
-    if e.items.try_reserve(1).is_err() {
-        drop(e);
-        let msg = "[linux] no room to hand a descriptor table to the worker: kept\n";
-        syscall(SYS_SERVER_LOG, [msg.as_ptr() as u64, msg.len() as u64, 0, 0, 0, 0]);
-        core::mem::forget(files);
-        return false;
+    if !reserved {
+        e.extra += 1;
+        if e.ensure().is_err() {
+            e.extra -= 1;
+            drop(e);
+            let msg = "[linux] no room to hand a descriptor table to the worker: kept\n";
+            syscall(SYS_SERVER_LOG, [msg.as_ptr() as u64, msg.len() as u64, 0, 0, 0, 0]);
+            core::mem::forget(files);
+            return false;
+        }
     }
-    e.items.push((files, pid));
+    // (Within the room `ensure` keeps: no allocation.)
+    e.items.push_back(Handed { files, pid, reserved });
     drop(e);
     HANDED.fetch_add(1, Ordering::AcqRel);
     crate::scm::request();
@@ -254,18 +279,27 @@ pub fn end_later(files: Arc<FilesContext>, pid: u32) -> bool {
 static HANDED: AtomicU32 = AtomicU32::new(0);
 static RELEASED: AtomicU32 = AtomicU32::new(0);
 
-/// The worker: lets go of the tables handed to it, one by one (the list keeps its room), and
-/// ends the processes that waited for them.
+/// The worker: lets go of the tables handed to it, one by one in the order they came (the
+/// queue keeps its room), and tells their processes. One table's closing never holds up the
+/// ones after it for long: on the worker (a service thread) nothing a description's close
+/// does waits for another party (an internet socket closes through the net thread, a /data
+/// inode goes at the next `datafs::reap`, a socket's messages in flight go to the
+/// collector), so the order costs no process's end more than the closing work before it.
 pub fn release_ended() {
     let mut n = 0;
     loop {
-        let item = ENDED.lock().items.pop();
-        let Some((files, pid)) = item else { break };
+        let item = ENDED.lock().items.pop_front();
+        let Some(Handed { files, pid, reserved }) = item else { break };
         drop(files);
-        if pid != 0 {
-            crate::process::end_deferred(pid);
+        {
+            let mut e = ENDED.lock();
+            if reserved {
+                e.reserved = e.reserved.saturating_sub(1);
+            } else {
+                e.extra = e.extra.saturating_sub(1);
+            }
         }
-        unreserve_end();
+        crate::process::end_deferred(pid);
         n += 1;
     }
     if n > 0 {

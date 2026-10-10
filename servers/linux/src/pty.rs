@@ -247,7 +247,9 @@ impl PtyMaster {
                 if !matches!(sig, SIGINT | SIGQUIT | SIGTSTP) {
                     return Err(EINVAL);
                 }
-                if let Some(fg) = self.tty.inner.lock().pgrp {
+                // (The terminal's lock goes before the process table's is taken.)
+                let fg = self.tty.inner.lock().pgrp;
+                if let Some(fg) = fg {
                     crate::signal::send_pgrp(fg as u32, sig as u32);
                 }
                 Ok(0)

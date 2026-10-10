@@ -34,7 +34,7 @@ pub struct ProcOpen {
     pub path: String,
     dir: bool,
     /// The file position; for a directory, the index of the next entry.
-    offset: Mutex<u64>,
+    offset: crate::sync::SleepMutex<u64>,
     /// The contents (a file) as of the last read from the start.
     contents: Mutex<Option<Arc<Vec<u8>>>>,
     /// The entries (a directory) as of the last read from the start.
@@ -62,7 +62,7 @@ pub fn open(node: ProcNode, flags: u32, path: String) -> Result<i64, i64> {
     // It must exist now (a process may have ended since the walk), and be
     // the caller's to open.
     procfs::may_open(&node)?;
-    let open = Arc::new(ProcOpen { node, path, dir, offset: Mutex::new(0), contents: Mutex::new(None), entries: Mutex::new(None) });
+    let open = Arc::new(ProcOpen { node, path, dir, offset: crate::sync::SleepMutex::new(0), contents: Mutex::new(None), entries: Mutex::new(None) });
     let kept = flags & (O_ACCMODE | files::O_NONBLOCK | files::O_CLOEXEC);
     files::install(files::new_id(), File::Proc(open), kept)
 }
@@ -152,7 +152,7 @@ impl ProcOpen {
     /// read/readv: at the description's offset, which moves by what was
     /// read (its lock serializes the description's reads).
     fn read_at_offset(&self, vecs: &[(u64, u64)]) -> Result<i64, i64> {
-        let mut off = self.offset.lock();
+        let mut off = self.offset.lock()?;
         let n = self.read(vecs, *off)?;
         *off += n as u64;
         Ok(n)
@@ -163,7 +163,7 @@ impl ProcOpen {
         if self.dir {
             return Err(EISDIR);
         }
-        let mut off = self.offset.lock();
+        let mut off = self.offset.lock()?;
         let data = self.snapshot(*off)?;
         let at = (*off).min(data.len() as u64) as usize;
         let n = buf.len().min(data.len() - at);
@@ -175,7 +175,7 @@ impl ProcOpen {
     /// As Linux's seq_lseek: from the start or the position, not the end
     /// (the size is not known).
     fn lseek(&self, offset: i64, whence: u64) -> Result<i64, i64> {
-        let mut off = self.offset.lock();
+        let mut off = self.offset.lock()?;
         let base = match whence {
             0 => 0,
             1 => *off as i64,
@@ -192,7 +192,7 @@ impl ProcOpen {
         if !self.dir {
             return Err(ENOTDIR);
         }
-        let mut off = self.offset.lock();
+        let mut off = self.offset.lock()?;
         let entries = {
             let kept = self.entries.lock().clone();
             match kept {

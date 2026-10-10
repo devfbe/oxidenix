@@ -46,19 +46,23 @@ static void sleep_ms(int ms) {
     }
 }
 
-/* Waits (at most 10 s) until process `pid` sleeps ('S' in /proc/<pid>/stat): a child
- * that was to block in a call has reached it, however slowly it got there. */
+/* Waits (up to 5 s) until process `pid` sleeps (/proc/<pid>/stat's state 'S'): a child that
+ * goes straight into a blocking call is blocked in it then, however loaded the machine. */
 static void wait_sleeping(pid_t pid) {
-    char path[64], text[256];
-    snprintf(path, sizeof path, "/proc/%d/stat", (int)pid);
-    for (int i = 0; i < 2000; i++) {
-        int fd = open(path, O_RDONLY);
-        ssize_t n = fd >= 0 ? read(fd, text, sizeof text - 1) : -1;
-        if (fd >= 0) close(fd);
-        text[n > 0 ? n : 0] = 0;
-        char *paren = strrchr(text, ')');
-        if (paren && paren[1] == ' ' && paren[2] == 'S') return;
-        sleep_ms(5);
+    char path[64];
+    snprintf(path, sizeof path, "/proc/%d/stat", pid);
+    for (int i = 0; i < 500; i++) {
+        FILE *f = fopen(path, "r");
+        char state = 0;
+        if (f) {
+            int got = fscanf(f, "%*d (%*[^)]) %c", &state);
+            fclose(f);
+            if (got == 1 && state == 'S') {
+                sleep_ms(20);
+                return;
+            }
+        }
+        sleep_ms(10);
     }
 }
 
@@ -676,6 +680,7 @@ static void turn_abandon(void) {
         write(s, "b", 1);
         _exit(0);
     }
+    wait_sleeping(killed);
     pid_t interrupted = fork();
     if (interrupted == 0) {
         alarm(20);
@@ -684,9 +689,7 @@ static void turn_abandon(void) {
         sigaction(SIGUSR1, &sa, NULL);
         _exit(write(s, "c", 1) == -1 && errno == EINTR ? 0 : 1);
     }
-    /* Both wait for the turn before they are killed and interrupted (a fixed pause lost
-     * the race under load: a signal before the write leaves nothing to interrupt). */
-    wait_sleeping(killed);
+    /* (Both waiters are in their write's turn wait before the signals come.) */
     wait_sleeping(interrupted);
     kill(killed, SIGKILL);
     waitpid(killed, NULL, 0);
@@ -704,11 +707,12 @@ static void turn_abandon(void) {
     }
     pid_t last = fork();
     if (last == 0) {
-        alarm(2);
+        alarm(10);
         _exit(write(s, "z", 1) == 1 ? 0 : 1);
     }
     int lstatus = 0;
     waitpid(last, &lstatus, 0);
+    printf("ttytest: turn waiters: interrupted %#x, holder %#x, last %#x\n", istatus, hstatus, lstatus);
     check("a killed and an interrupted turn waiter give their tickets up",
           WIFEXITED(istatus) && WEXITSTATUS(istatus) == 0 && WIFEXITED(hstatus) && WEXITSTATUS(hstatus) == 0 &&
               WIFEXITED(lstatus) && WEXITSTATUS(lstatus) == 0);

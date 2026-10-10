@@ -278,13 +278,16 @@ impl Epoll {
             File::Epoll(e) => Some(e.clone()),
             _ => None,
         };
-        let _nesting = match &inner {
+        // The descriptions the loop check reached, let go of after `NESTING` (the last
+        // reference to one closes its file, which may wait for netd).
+        let mut reached: Vec<Arc<Description>> = Vec::new();
+        let nesting = match &inner {
             Some(inner) => {
                 let guard = NESTING.lock();
                 // A chain of watching instances stays short in both
                 // directions: what watches this one, it, and what the
                 // target watches.
-                if levels_above(self) + 1 + levels_below(inner, self)? > MAX_NESTING + 1 {
+                if levels_above(self) + 1 + levels_below(inner, self, &mut reached)? > MAX_NESTING + 1 {
                     return Err(ELOOP);
                 }
                 Some(guard)
@@ -318,6 +321,8 @@ impl Epoll {
         watch.subscribe(Sub::Item(item.clone()))?;
         interest.insert(key, item.clone());
         drop(interest);
+        drop(nesting);
+        drop(reached);
         Epoll::wake_if_ready(&item, target);
         Ok(())
     }
@@ -450,11 +455,17 @@ impl Epoll {
 /// down through the instances it watches (`target` included). ELOOP if
 /// it reaches `epoll` (a cycle) or gets too long. Each instance is
 /// visited once (its result is remembered).
-fn levels_below(target: &Arc<Epoll>, epoll: &Epoll) -> Result<usize, i64> {
-    levels_below_from(target, epoll, 1, &mut BTreeMap::new())
+fn levels_below(target: &Arc<Epoll>, epoll: &Epoll, reached: &mut Vec<Arc<Description>>) -> Result<usize, i64> {
+    levels_below_from(target, epoll, 1, &mut BTreeMap::new(), reached)
 }
 
-fn levels_below_from(target: &Arc<Epoll>, epoll: &Epoll, depth: usize, seen: &mut BTreeMap<usize, usize>) -> Result<usize, i64> {
+fn levels_below_from(
+    target: &Arc<Epoll>,
+    epoll: &Epoll,
+    depth: usize,
+    seen: &mut BTreeMap<usize, usize>,
+    reached: &mut Vec<Arc<Description>>,
+) -> Result<usize, i64> {
     if core::ptr::eq(Arc::as_ptr(target), epoll) || depth > MAX_NESTING + 1 {
         return Err(ELOOP);
     }
@@ -463,8 +474,8 @@ fn levels_below_from(target: &Arc<Epoll>, epoll: &Epoll, depth: usize, seen: &mu
         return Ok(levels);
     }
     let mut levels = 1;
-    for inner in watched_instances(target) {
-        levels = levels.max(1 + levels_below_from(&inner, epoll, depth + 1, seen)?);
+    for inner in watched_instances(target, reached) {
+        levels = levels.max(1 + levels_below_from(&inner, epoll, depth + 1, seen, reached)?);
     }
     seen.insert(key, levels);
     Ok(levels)
@@ -472,17 +483,19 @@ fn levels_below_from(target: &Arc<Epoll>, epoll: &Epoll, depth: usize, seen: &mu
 
 /// The instances `epoll` watches. The descriptions are reached only after
 /// the interest list's lock is released (letting go of one closed
-/// meanwhile takes that lock to forget it).
-fn watched_instances(epoll: &Epoll) -> Vec<Arc<Epoll>> {
+/// meanwhile takes that lock to forget it), and kept in `reached`: the
+/// caller lets go of them once it holds no lock (one may be the last
+/// reference, whose close may wait for netd).
+fn watched_instances(epoll: &Epoll, reached: &mut Vec<Arc<Description>>) -> Vec<Arc<Epoll>> {
     let files: Vec<Weak<Description>> = epoll.interest.lock().values().map(|i| i.file.clone()).collect();
-    files
-        .iter()
-        .filter_map(Weak::upgrade)
-        .filter_map(|f| match &f.file {
-            File::Epoll(inner) => Some(inner.clone()),
-            _ => None,
-        })
-        .collect()
+    let mut instances = Vec::new();
+    for f in files.iter().filter_map(Weak::upgrade) {
+        if let File::Epoll(inner) = &f.file {
+            instances.push(inner.clone());
+        }
+        reached.push(f);
+    }
+    instances
 }
 
 /// The instances in the longest chain of instances that watch `epoll`,
