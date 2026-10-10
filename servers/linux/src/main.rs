@@ -386,7 +386,8 @@ fn pager() -> ! {
             }
             EVENT_SERVICE_GONE => {
                 // diskfs keeps our unlinked open files for us until we name them again.
-                datafs::service_gone();
+                // (On the worker: the reconnection waits for locks, the pager must not.)
+                datafs::reconnect_later();
                 continue;
             }
             EVENT_SYNC => {

@@ -74,7 +74,8 @@
 //! up).
 //!
 //! **diskfs restarts.** A new channel is made (`client`) as soon as the
-//! kernel says diskfs died (`EVENT_SERVICE_GONE`, `service_gone`), or at the
+//! kernel says diskfs died (`EVENT_SERVICE_GONE`: the worker thread connects,
+//! `reconnect_later`), or at the
 //! next use; every request in flight on the old one failed (a fill: EIO for
 //! its waiters, SIGBUS for a mapping; a write-back: its pages are dirty again
 //! and written on the new channel). Before anyone uses the new channel, the
@@ -349,7 +350,7 @@ pub fn set_times(inode: &Arc<DInode>, atime: vfs::stat::SetTime, mtime: vfs::sta
         (t.request(inode.node()), t.seq)
     };
     let c = client()?;
-    status(&c.call(request.0.encode(0))?)?;
+    status(&call(&c, request.0.encode(0))?)?;
     // Nothing waits for a write-back: diskfs has them now.
     let mut t = inode.times.lock();
     if !t.pending && t.seq == request.1 {
@@ -367,7 +368,7 @@ fn send_times(c: &Client, inode: &DInode, whole: bool) -> Result<(), i64> {
     if t.is_empty() {
         return Ok(());
     }
-    status(&c.call(t.request(inode.node()).encode(0))?)?;
+    status(&call(&c, t.request(inode.node()).encode(0))?)?;
     let mut now = inode.times.lock();
     if whole && now.seq == t.seq {
         *now = Times { seq: now.seq, ..Times::default() };
@@ -456,11 +457,23 @@ pub fn client() -> Result<Arc<Client>, i64> {
     Ok(c)
 }
 
-/// `EVENT_SERVICE_GONE`: a service the instance had a channel to died. If it was diskfs,
+/// `EVENT_SERVICE_GONE` (on the pager): a service the instance had a channel to died. If it was diskfs,
 /// connect again now (not at the next use of /data): the new diskfs keeps every unlinked
 /// inode until each client of the dead one named again what it holds or is gone (`fsring`,
 /// "Holds"), so an idle instance would keep the disk space of every file unlinked meanwhile.
-pub fn service_gone() {
+pub fn reconnect_later() {
+    RECONNECT_ASKED.store(true, Ordering::Release);
+    crate::scm::request();
+}
+
+static RECONNECT_ASKED: AtomicBool = AtomicBool::new(false);
+
+/// On the worker thread: the reconnection `reconnect_later` asked for (it waits for
+/// `NAMES` and for diskfs: never on the pager, which must stay free to bring pages).
+pub fn reconnect_if_asked() {
+    if !RECONNECT_ASKED.swap(false, Ordering::AcqRel) {
+        return;
+    }
     let dead = CLIENT.lock().as_ref().is_some_and(|c| c.is_dead());
     if dead {
         // (A failure leaves it to the next use.)
@@ -476,7 +489,7 @@ fn revalidate(c: &Client) -> Result<(), i64> {
     // release need no hold: their release names them by handle.
     let inodes: Vec<Arc<DInode>> = TABLE.lock().inodes.values().cloned().collect();
     for inode in inodes {
-        let same = c.call(Request::Stat { ino: inode.node() }.encode(0)).ok().filter(|r| r.status == 0).map(|r| fsring::Stat::from_values(&r.values));
+        let same = call(&c, Request::Stat { ino: inode.node() }.encode(0)).ok().filter(|r| r.status == 0).map(|r| fsring::Stat::from_values(&r.values));
         // Gone (ESTALE: freed, or its number another file's), or not what it was.
         if !same.is_some_and(|s| s.mode & vfs::S_IFMT == inode.kind && s.generation == inode.generation) {
             inode.stale.store(true, Ordering::Relaxed);
@@ -525,12 +538,31 @@ fn log(text: &str) {
     syscall(SYS_SERVER_LOG, [text.as_ptr() as u64, text.len() as u64, 0, 0, 0, 0]);
 }
 
-/// A status as a result (a value outside the errno range is EIO).
+/// A status as a result (a value outside the errno range is EIO, and so is ESTALE: the
+/// file is gone, `call` marked it stale).
 fn status(c: &Completion) -> Result<i64, i64> {
     match c.status {
         s if s >= 0 => Ok(s),
+        s if s == -fsring::errno::ESTALE => Err(EIO),
         s if s >= -4095 => Err(-s),
         _ => Err(EIO),
+    }
+}
+
+/// A request to diskfs and its completion; one that says the inode it names is gone
+/// (ESTALE: freed, or its number another file's) makes that inode stale here.
+fn call(c: &Client, d: fsring::Desc) -> Result<Completion, i64> {
+    let r = c.call(d)?;
+    if r.status == -fsring::errno::ESTALE {
+        stale_handle(Node::from_object(d.object));
+    }
+    Ok(r)
+}
+
+/// The inode of handle `node` is gone in diskfs: stale if the server still has it.
+fn stale_handle(node: Node) {
+    if let Some(i) = TABLE.lock().inodes.get(&node.ino).filter(|i| i.generation == node.generation) {
+        i.stale.store(true, Ordering::Relaxed);
     }
 }
 
@@ -619,7 +651,7 @@ pub fn root() -> Result<Arc<DInode>, i64> {
     }
     let c = client()?;
     let _names = NAMES.read()?;
-    let r = c.call(Request::Root.encode(0))?;
+    let r = call(&c, Request::Root.encode(0))?;
     status(&r)?;
     if r.values[0] != ROOT_INO as u64 {
         return Err(EIO);
@@ -649,7 +681,7 @@ pub fn lookup(dir: &Arc<DInode>, name: &str) -> Result<Arc<DInode>, i64> {
     let scratch = c.scratch(1);
     scratch.put(0, name.as_bytes());
     let _names = NAMES.read()?;
-    let r = c.call(Request::Lookup { dir: dir.node(), name: scratch.buf(0, name.len() as u64) }.encode(0))?;
+    let r = call(&c, Request::Lookup { dir: dir.node(), name: scratch.buf(0, name.len() as u64) }.encode(0))?;
     status(&r)?;
     let inode = found(r.values[0], r.values[1], r.values[2])?;
     set_link(&inode, dir, name);
@@ -685,7 +717,7 @@ pub fn create(dir: &Arc<DInode>, name: &str, new: New, perm: u32) -> Result<Arc<
         }
     };
     let _names = NAMES.read()?;
-    let r = c.call(Request::Create { dir: dir.node(), name: scratch.buf(0, n), kind, perm: perm & 0o7777 }.encode(0))?;
+    let r = call(&c, Request::Create { dir: dir.node(), name: scratch.buf(0, n), kind, perm: perm & 0o7777 }.encode(0))?;
     status(&r)?;
     let inode = found(r.values[0], r.values[1], r.values[2])?;
     set_link(&inode, dir, name);
@@ -701,7 +733,7 @@ pub fn unlink(dir: &Arc<DInode>, name: &str, dir_only: bool) -> Result<Option<u3
     scratch.put(0, name.as_bytes());
     let gone = {
         let _names = NAMES.read()?;
-        let r = c.call(Request::Unlink { dir: dir.node(), name: scratch.buf(0, name.len() as u64), is_dir: dir_only }.encode(0))?;
+        let r = call(&c, Request::Unlink { dir: dir.node(), name: scratch.buf(0, name.len() as u64), is_dir: dir_only }.encode(0))?;
         status(&r)?;
         // In the same step as the unlink (under `NAMES`): no gap in which anything else could
         // release or cache it.
@@ -728,7 +760,7 @@ pub fn rename(odir: &Arc<DInode>, oname: &str, ndir: &Arc<DInode>, nname: &str) 
     let gone = {
         let _names = NAMES.read()?;
         let (old, new) = (scratch.buf(0, oname.len() as u64), scratch.buf(oname.len() as u64, nname.len() as u64));
-        let r = c.call(Request::Rename { from: odir.node(), name: old, to: ndir.node(), new_name: new }.encode(0))?;
+        let r = call(&c, Request::Rename { from: odir.node(), name: old, to: ndir.node(), new_name: new }.encode(0))?;
         status(&r)?;
         orphan(r.values[0], r.values[1]);
         r.values[0]
@@ -778,7 +810,7 @@ fn release_orphans() {
     };
     let orphans = core::mem::take(&mut TABLE.lock().orphans);
     for ino in orphans {
-        let _ = c.call(Request::Release { ino }.encode(0));
+        let _ = call(&c, Request::Release { ino }.encode(0));
     }
 }
 
@@ -789,7 +821,7 @@ pub fn readlink(inode: &Arc<DInode>) -> Result<String, i64> {
     }
     let c = client()?;
     let scratch = c.scratch(1);
-    let r = c.call(Request::Readlink { ino: inode.node(), buf: scratch.buf(0, PAGE) }.encode(0))?;
+    let r = call(&c, Request::Readlink { ino: inode.node(), buf: scratch.buf(0, PAGE) }.encode(0))?;
     let n = status(&r)? as u64;
     if n == 0 || n > PAGE {
         return Err(EIO);
@@ -800,7 +832,7 @@ pub fn readlink(inode: &Arc<DInode>) -> Result<String, i64> {
 pub fn chmod(inode: &Arc<DInode>, perm: u32) -> Result<(), i64> {
     live(inode)?;
     let c = client()?;
-    status(&c.call(Request::SetPerm { ino: inode.node(), perm: perm & 0o7777 }.encode(0))?)?;
+    status(&call(&c, Request::SetPerm { ino: inode.node(), perm: perm & 0o7777 }.encode(0))?)?;
     changed_on_disk(inode, false);
     Ok(())
 }
@@ -809,7 +841,7 @@ pub fn chmod(inode: &Arc<DInode>, perm: u32) -> Result<(), i64> {
 pub fn stat(inode: &Arc<DInode>) -> Result<[u8; 144], i64> {
     live(inode)?;
     let c = client()?;
-    let r = c.call(Request::Stat { ino: inode.node() }.encode(0))?;
+    let r = call(&c, Request::Stat { ino: inode.node() }.encode(0))?;
     status(&r)?;
     let s = fsring::Stat::from_values(&r.values);
     let size = match *inode.object.lock() {
@@ -834,7 +866,7 @@ pub fn stat(inode: &Arc<DInode>) -> Result<[u8; 144], i64> {
 /// The filesystem's usage, and its largest file.
 pub(crate) fn usage() -> Result<fsring::Usage, i64> {
     let c = client()?;
-    let r = c.call(Request::Statfs.encode(0))?;
+    let r = call(&c, Request::Statfs.encode(0))?;
     status(&r)?;
     let u = fsring::Usage::from_values(&r.values);
     if u.block_size == 0 || u.max_file_size == 0 {
@@ -850,7 +882,7 @@ fn block_size_on(c: &Client) -> Result<u64, i64> {
     if let b @ 1.. = BLOCK.load(Ordering::Relaxed) {
         return Ok(b);
     }
-    let r = c.call(Request::Statfs.encode(0))?;
+    let r = call(&c, Request::Statfs.encode(0))?;
     status(&r)?;
     match fsring::Usage::from_values(&r.values).block_size as u64 {
         0 => Err(EIO),
@@ -867,7 +899,7 @@ fn promise_on(c: &Client, ino: Node, first: u64, end: u64) -> Result<(), i64> {
     let mut at = first;
     while at < end {
         let len = (end - at).min(fsring::MAX_TRANSFER as u64);
-        status(&c.call(Request::Promise { ino, offset: at, len }.encode(0))?)?;
+        status(&call(&c, Request::Promise { ino, offset: at, len }.encode(0))?)?;
         at += len;
     }
     Ok(())
@@ -944,7 +976,7 @@ pub fn readdir(dir: &Arc<DInode>, cursor: u64) -> Result<(Vec<(u32, u8, Vec<u8>)
     live(dir)?;
     let c = client()?;
     let scratch = c.scratch(1);
-    let r = c.call(Request::Readdir { dir: dir.node(), cursor, buf: scratch.buf(0, PAGE) }.encode(0))?;
+    let r = call(&c, Request::Readdir { dir: dir.node(), cursor, buf: scratch.buf(0, PAGE) }.encode(0))?;
     let n = status(&r)? as u64;
     if n > PAGE {
         return Err(EIO);
@@ -991,7 +1023,7 @@ pub fn object(inode: &Arc<DInode>) -> Result<u64, i64> {
     }
     let limit = max_file()?;
     let c = client()?;
-    let r = c.call(Request::Stat { ino: inode.node() }.encode(0))?;
+    let r = call(&c, Request::Stat { ino: inode.node() }.encode(0))?;
     status(&r)?;
     let size = fsring::Stat::from_values(&r.values).size.min(limit);
     let h = syscall(SYS_MO_CREATE_CACHED, [size, inode.key, limit, 0, 0, 0]);
@@ -1107,6 +1139,9 @@ fn fill_once(inode: &Arc<DInode>, index: u64, want: u64) -> Result<bool, i64> {
                 // A short read ends at diskfs's end of the file: the rest of
                 // the pages stays zero (a hole, or not written back yet).
                 let ok = r.status >= 0 && r.status as u64 <= count * PAGE;
+                if r.status == -fsring::errno::ESTALE {
+                    inode.stale.store(true, Ordering::Relaxed);
+                }
                 syscall(SYS_MO_FILLED, [object, first * PAGE, count, ok as u64, 0, 0]);
                 if !ok {
                     failed.set(Some(EIO));
@@ -1313,6 +1348,9 @@ pub fn writeback(inode: &Arc<DInode>, pages: core::ops::Range<u64>) -> Result<u6
                 if r.status == len as i64 {
                     wrote.set(wrote.get() + count);
                 } else {
+                    if r.status == -fsring::errno::ESTALE {
+                        inode.stale.store(true, Ordering::Relaxed);
+                    }
                     syscall(SYS_MO_REDIRTY, [object, first * PAGE, count, 0, 0, 0]);
                     // diskfs's reason (a full disk), or EIO.
                     failed.set(Some(status(&r).err().unwrap_or(EIO)));
@@ -1341,7 +1379,7 @@ pub fn writeback(inode: &Arc<DInode>, pages: core::ops::Range<u64>) -> Result<u6
 /// of `inode` completed on a connection to a diskfs that died before.
 fn flush(inode: Option<&Arc<DInode>>) -> Result<(), i64> {
     let c = client()?;
-    status(&c.call(Request::Flush.encode(0))?)?;
+    status(&call(&c, Request::Flush.encode(0))?)?;
     if let Some(inode) = inode {
         let gen = inode.unflushed.swap(0, Ordering::AcqRel);
         if gen != 0 && gen != c.generation {
@@ -1421,18 +1459,18 @@ fn truncate_file(inode: &Arc<DInode>, len: u64) -> Result<(), i64> {
     // A file with nothing cached: diskfs's size is all (its object, made
     // later, starts from it).
     let Some(object) = *inode.object.lock() else {
-        return status(&c.call(Request::Truncate { ino: inode.node(), len }.encode(0))?).map(|_| ());
+        return status(&call(&c, Request::Truncate { ino: inode.node(), len }.encode(0))?).map(|_| ());
     };
     // Growing: diskfs first (it refuses what it cannot hold), then the
     // cache. Shrinking: the cache first, which may have to wait for fills
     // in flight (they pin pages); diskfs only once the cache could.
     let size = syscall(SYS_MO_FILE_SIZE, [object, 0, 0, 0, 0, 0]).max(0) as u64;
     if len >= size {
-        status(&c.call(Request::Truncate { ino: inode.node(), len }.encode(0))?)?;
+        status(&call(&c, Request::Truncate { ino: inode.node(), len }.encode(0))?)?;
         return cache_truncate(inode, object, len, TRUNCATE_WAIT);
     }
     cache_truncate(inode, object, len, TRUNCATE_WAIT)?;
-    status(&c.call(Request::Truncate { ino: inode.node(), len }.encode(0))?).map(|_| ())
+    status(&call(&c, Request::Truncate { ino: inode.node(), len }.encode(0))?).map(|_| ())
 }
 
 /// Truncates the cached object, waiting for the fills that pin its pages
@@ -1474,7 +1512,7 @@ pub fn read_direct(inode: &Arc<DInode>, off: u64, buf: u64, len: u64) -> Result<
     let mut done = 0u64;
     while done < len {
         let n = (len - done).min(scratch.len());
-        let r = c.call(Request::Read { ino: inode.node(), offset: off + done, buf: scratch.buf(0, n) }.encode(0))?;
+        let r = call(&c, Request::Read { ino: inode.node(), offset: off + done, buf: scratch.buf(0, n) }.encode(0))?;
         let got = match status(&r) {
             Ok(got) if got as u64 <= n => got as u64,
             Ok(_) => return Err(EIO),
