@@ -1154,7 +1154,8 @@ affinity and getcpu calls in `mod.rs`; `timer.rs`'s interval timers; the per-pro
   caller's soft limit but at least 128 MiB and at most the 16 TiB above `MMAP_TOP`, the
   kernel's `MO_GROWSDOWN` ceiling; within it the stack grows as far as the process's soft
   limit at the time, which the kernel reads at each growth, `stack_limit`, set whenever it
-  changes; a quarter of the caller's limit, at most 6 MiB, bounds the arguments and
+  changes and for every new process from its copy of the limits; brk stays out of the room
+  and its guard gap; a quarter of the caller's limit, at most 6 MiB, bounds the arguments and
   environment; a growth into the 256-page guard gap above another mapping, or one that cannot
   be committed, is SIGSEGV, EFAULT for a copy), RLIMIT_NOFILE, RLIMIT_SIGPENDING (against the
   target's limit, the instance's count: Linux counts per user, the one user is root) and

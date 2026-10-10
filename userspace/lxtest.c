@@ -234,8 +234,10 @@ static void stack_checks(void) {
      * execve keeps for it. */
     int raised = stack_run(0, "stack-raise", 24, 0);
     int lowered = stack_run(64 << 20, "stack-lower", 24, 0);
-    check("... and is read when the stack grows: raised by the program it lets it grow, lowered it stops it",
-          WIFEXITED(raised) && WEXITSTATUS(raised) == 0 && WIFSIGNALED(lowered) && WTERMSIG(lowered) == SIGSEGV);
+    int forked = stack_run(0, "stack-fork", 24, 0);
+    check("... and is read when the stack grows: raised by the program it lets it grow, lowered it stops it, a fork inherits it",
+          WIFEXITED(raised) && WEXITSTATUS(raised) == 0 && WIFSIGNALED(lowered) && WTERMSIG(lowered) == SIGSEGV
+          && WIFEXITED(forked) && WEXITSTATUS(forked) == 0);
     int wild = stack_run(RLIM_INFINITY, "wild", 0, 0);
     check("an unlimited stack does not grow 16 TiB down to a wild access: EFAULT for a copy, SIGSEGV for a store",
           WIFSIGNALED(wild) && WTERMSIG(wild) == SIGSEGV);
@@ -686,6 +688,17 @@ int main(int argc, char **argv) {
         if (strcmp(argv[1], "stack") != 0)
             setrlimit(RLIMIT_STACK, &rl);
         int frames = atoi(argv[2]) * 16;
+        if (strcmp(argv[1], "stack-fork") == 0) {
+            /* A forked child grows by the limit it inherited (64 MiB). */
+            rl.rlim_cur = 64 << 20;
+            setrlimit(RLIMIT_STACK, &rl);
+            pid_t kid = fork();
+            if (kid == 0)
+                _exit(stack_use(frames) != 1);
+            int st = 0;
+            waitpid(kid, &st, 0);
+            return !(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+        }
         return frames > 0 ? stack_use(frames) != 1 : 0;
     }
     if (argc > 1 && strcmp(argv[1], "wild") == 0) {

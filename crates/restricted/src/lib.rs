@@ -149,6 +149,10 @@ pub const SYS_MO_MAP: u64 = 1014;
 /// Where the room `mo_map` finds ends: the stack's area lies above (16 TiB
 /// up to the 64 TiB line).
 pub const MMAP_TOP: u64 = 0x3000_0000_0000;
+/// The room kept free below a stack (Linux's stack_guard_gap, 256 pages):
+/// it grows no closer to an accessible mapping below it, and the kernel
+/// places none closer (the server's brk neither).
+pub const STACK_GUARD_GAP: u64 = 256 * 4096;
 /// `mo_unmap(addr, len)` in the calling thread's program view.
 pub const SYS_MO_UNMAP: u64 = 1015;
 /// `mo_protect(addr, len, prot)` in the calling thread's program view.

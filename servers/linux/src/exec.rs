@@ -904,7 +904,7 @@ fn finish(p: &Prepared, comm: [u8; 16], brk: u64) {
         proc.dumpable = true;
         proc.cmdline = cmdline;
         proc.exe = p.exe.clone();
-        *proc.brk.lock() = process::Brk { start: brk, end: brk };
+        *proc.brk.lock() = process::Brk { start: brk, end: brk, limit: (STACK_TOP - p.stack).saturating_sub(STACK_GUARD_GAP) };
         // A vfork parent goes on: the child no longer uses its memory.
         core::mem::replace(&mut proc.vfork, false).then(|| proc.words.clone())
     };

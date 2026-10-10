@@ -73,7 +73,7 @@ pub const STACK_LIMIT: u64 = 8 * 1024 * 1024;
 /// The room kept free below a stack (Linux's stack_guard_gap, 256 pages):
 /// a stack does not grow closer to an accessible mapping below it, and the
 /// kernel places no mapping closer below it.
-pub const STACK_GUARD_GAP: u64 = 256 * PAGE;
+pub const STACK_GUARD_GAP: u64 = restricted::STACK_GUARD_GAP;
 
 fn page_down(x: u64) -> u64 {
     x & !(PAGE - 1)
@@ -1197,6 +1197,8 @@ impl AddressSpace {
     /// program, EFAULT for a copy), never an out-of-memory kill.
     fn grow_stack(&mut self, page: u64) -> Result<(), Fault> {
         let (&start, stack) = self.vmas.range(page..).next().ok_or(Fault::Segv)?;
+        // The faulting thread's process's limit (as Linux's current's rlimit): a
+        // space shared by processes (CLONE_VM) grows by whichever faults.
         let reach = stack.stack_limit.min(super::sched::current().group.stack_soft.load(core::sync::atomic::Ordering::Relaxed));
         if stack.stack_limit == 0 || stack.end - page > reach || self.overlaps(page, start) {
             return Err(Fault::Segv);

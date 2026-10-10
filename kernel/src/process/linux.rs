@@ -1983,6 +1983,7 @@ fn process_call(instance: &Arc<Instance>, nr: u64, a: [u64; 6]) -> SysResult {
             let mut info = Info::new(name);
             info.mem = Some(mm.stats.clone());
             let group = ThreadGroup::new(pid.pid, info).ok_or(ENOMEM)?;
+            // (A default: the server sets the new process's own, from its copy of the limits.)
             group.stack_soft.store(super::sched::current().group.stack_soft.load(Relaxed), Relaxed);
             group.instance.store(instance.id, Release);
             group.server_reaps.store(true, Relaxed);

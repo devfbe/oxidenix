@@ -136,6 +136,9 @@ pub enum Report {
 pub struct Brk {
     pub start: u64,
     pub end: u64,
+    /// The most the break may reach: below the room execve kept for the stack and its
+    /// guard gap (0 before the first execve: no heap yet).
+    pub limit: u64,
 }
 
 pub struct Proc {
@@ -448,6 +451,12 @@ pub fn name_kernel_thread(key: u64, comm: &[u8; 16]) {
 /// with a record at the root. Its program is run by `exec::init`.
 pub fn register_init(key: u64) {
     let handle = syscall(SYS_PROC_SELF, [0; 6]);
+    if handle <= 0 {
+        // Without a handle on itself no other process could name it to the kernel (0
+        // would name the caller): the tree cannot start (status 127, as a failed exec).
+        syscall(SYS_THREAD_EXIT, [127 << 8, EXIT_GROUP, 0, 0, 0, 0]);
+        unreachable!("thread_exit returned");
+    }
     let fs = records::root();
     let fs_ptr = Arc::as_ptr(&fs);
     let files = FilesContext::empty();
@@ -467,7 +476,7 @@ pub fn register_init(key: u64) {
             ppid: 0,
             pgid: pid,
             sid: pid,
-            handle: handle.max(0) as u64,
+            handle: handle as u64,
             threads: alloc::vec![pid],
             children: Vec::new(),
             zombie: None,
@@ -699,6 +708,11 @@ fn clone(s: &State, c: Clone) -> Result<i64, i64> {
     // A new process's limits: a copy of the caller's.
     let limits = if thread { crate::ids::current() } else { Arc::new(crate::ids::current().copy()) };
     let limits_ptr = Arc::as_ptr(&limits);
+    if !thread {
+        // The kernel's bound on its stack's growth, from the copy (no one else sees it
+        // yet: a change of the caller's limit meanwhile is the caller's alone).
+        syscall(SYS_STACK_LIMIT, [handle, limits.soft(crate::ids::RLIMIT_STACK), 0, 0, 0, 0]);
+    }
     // The records.
     let serial = {
         let mut t = PROCS.lock();
@@ -739,7 +753,7 @@ fn clone(s: &State, c: Clone) -> Result<i64, i64> {
                 parent.brk.clone()
             } else {
                 let b = parent.brk.lock();
-                Arc::new(Mutex::new(Brk { start: b.start, end: b.end }))
+                Arc::new(Mutex::new(Brk { start: b.start, end: b.end, limit: b.limit }))
             };
             let p = Proc {
                 pid,
