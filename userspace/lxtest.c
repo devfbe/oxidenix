@@ -484,7 +484,9 @@ int main(int argc, char **argv) {
     check("the kernel copies from a page the pager supplies (write)", write(p[1], pg + 2 * PG, 7) == 7 && read(p[0], buf, 7) == 7 && memcmp(buf, "paged 2", 7) == 0);
     check("the program reads pages the pager supplies",
           memcmp(pg, "paged 0", 7) == 0 && memcmp(pg + 3 * PG, "paged 3", 7) == 0 && memcmp(pg + PG, "paged 1", 7) == 0);
-    check("... each page once", pg[2 * PG] == 'p' && syscall(TEST_SUPPLIED) - before == 4);
+    long supplied = syscall(TEST_SUPPLIED) - before;
+    if (supplied != 4) printf("    (the pager supplied %ld pages)\n", supplied);
+    check("... each page once", pg[2 * PG] == 'p' && supplied == 4);
 
     /* A page that never comes: SIGKILL still ends the waiting thread. */
     pid_t child = fork();

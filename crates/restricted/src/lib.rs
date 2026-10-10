@@ -308,7 +308,8 @@ pub const ROLE_TIMER: u64 = 5;
 /// `(addr)`: a 4-page paged object mapped shared and readable at `addr`;
 /// page n reads "paged n" (supplied by the pager thread when touched).
 pub const TEST_PAGED: u64 = 1505;
-/// `()`: how many pages the pager supplied so far.
+/// `()`: how many pages the pager supplied so far (every page the caller
+/// has seen arrive among them).
 pub const TEST_SUPPLIED: u64 = 1506;
 /// `(addr)`: a 1-page paged object the pager never supplies, mapped at
 /// `addr` (a thread touching it waits until it is killed, or until the
