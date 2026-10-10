@@ -39,10 +39,20 @@ checksum, so a torn one is never replayed.
 
 ## In ext2fs
 
-**Cache states.** A metadata block in the cache is *clean*, *dirty* (changed by the running
-transaction: never evicted, never written home before its commit), or *committed* (in a
-committed transaction, its home write issued but not yet flushed: it may be evicted).
-`BlockCache` keeps dirty blocks pinned.
+**Cache states.** A metadata block in the cache is *clean* or *dirty* (changed by the running
+transaction: never evicted, never written home before its commit). A commit writes its
+blocks home right after the commit block's flush and marks them clean; their durability
+comes with the next flush. `BlockCache` keeps dirty blocks pinned; since a transaction takes
+at most half the cache (below), the cache stays within its capacity.
+
+**Operations as units.** Every public operation runs inside an undo scope
+(`State::begin`): the first change of each cached block keeps its old contents, and the
+in-memory state (superblock, group counts, orphan list, fresh blocks, promises, revokes) is
+kept as it was. An operation that fails (a logical error such as `ENOSPC`, or a read error
+in the middle) is rolled back whole (`State::rollback`), so a transaction never holds part
+of an operation and the filesystem goes on; there is no hand-written undo path. Data
+written straight to the device by an operation that fails lands in blocks that are free
+again.
 
 **A transaction.** Operations change metadata in the cache. `commit` (at the end of an
 operation, or of a batch: group commit) makes the dirty set a transaction:
@@ -57,17 +67,26 @@ operation, or of a batch: group commit) makes the dirty set a transaction:
 4. The logged blocks are written home (no flush: the next commit's flush covers them) and
    become clean.
 
-A transaction is limited to a quarter of the journal (JBD2's rule); an operation that would
-need more is cut into chunks that each leave the filesystem consistent (a truncation, see
-below). The first transaction after mount also sets `RECOVER` in the superblock.
+A transaction is limited to a quarter of the journal (JBD2's rule) and to half the block
+cache (so that its dirty blocks fit the server's memory); before an operation starts, a
+running transaction at that limit (the ring path's links add to one without committing) is
+committed. An operation that needs more stops at consistent states and commits there
+(`State::pause`): a truncation or the free of a big file between freed blocks (the inode on
+the orphan list meanwhile, see below), a long write or link after a run of blocks (the size
+as far as the data is), a long reservation after its indirect blocks. An operation that
+fails after such a commit stops the filesystem (part of it is on the disk). The first
+transaction after mount also sets `RECOVER` in the superblock: the superblock as the last
+commit left it (kept in memory), so nothing of the running transaction goes out early. The
+log blocks are written straight from the cache (only a block that must be escaped is
+copied).
 
 **The log's tail.** The journal is a ring from `s_first` to `s_maxlen`. A transaction's space
-is free once its home writes are durable, which a later flush ensures (the next commit's).
-When the head would run into the tail, the tail moves to the oldest transaction whose home
-writes are not known durable (after a flush if need be) and the journal superblock is
-written with the new `s_start`/`s_sequence` (and flushed) before the space is reused. On a
-clean shutdown (`set_in_use(false)`, the last client gone) everything is flushed, the
-superblock gets `s_start` 0, and `RECOVER` goes.
+is free once its home writes are durable, which any later flush ensures. When the next
+transaction does not fit the rest of the ring, the device is flushed (every home write is
+durable then) and the log is emptied: the journal superblock gets `s_start` 0 (flushed), and
+the next transaction starts the log again, writing `s_start` in its own flush. On a clean
+shutdown (`set_in_use(false)`, the last client gone) everything is committed and flushed, the
+log emptied, and `RECOVER` goes.
 
 **Revokes.** A block freed (a truncated indirect block, a removed directory's blocks) may
 have copies in the live journal; if the block is reused for data, replaying an old copy
@@ -75,18 +94,34 @@ would destroy it. ext2fs remembers which blocks the live journal has copies of; 
 adds a revoke record to the running transaction. Recovery skips any copy of a revoked block
 in a transaction older than the revoke.
 
-**Recovery** (at mount, before anything else reads metadata): if `RECOVER` is set, the
-journal is scanned from `s_start` with `s_sequence` (descriptors, commit blocks with their
-checksums: the last complete transaction ends the scan), the revoke records collected, and
-the logged blocks of the complete transactions written home (unescaped), then flushed; the
-journal superblock gets `s_start` 0. Then the orphan list is read as before.
+**Recovery** (at mount, before anything else reads metadata): if the log is not empty, it is
+scanned from `s_start` with `s_sequence` (descriptors, commit blocks with their checksums:
+the last complete transaction ends the scan), the revoke records of complete transactions
+collected, and the logged blocks of the complete transactions written home (unescaped) one
+at a time as the replay finds them, oldest first, then flushed; the journal superblock gets
+`s_start` 0, and the filesystem is mounted again from what the disk has. Then the orphan
+list is read as before. A journal mke2fs made (no features) gets ours (`CHECKSUM`, `REVOKE`,
+`ASYNC_COMMIT`) at the first read-write mount, while its log is empty.
+
+**Untrusted journals.** The journal comes from the disk: the superblock's fields are checked
+(magic, version, block size equal to the filesystem's, a ring of at least 1024 blocks that
+fits inode 8, which fits the filesystem; `s_start` in the ring; no unknown incompatible
+feature) before anything is read by them; the scan reads every log block at most once (and
+the logged ones again for the checksum and the replay); a complete transaction naming a
+block beyond the filesystem makes the journal corrupt (the mount fails, nothing written);
+revokes of such blocks are ignored. What recovery keeps in memory is one entry per tag (at
+most the ring's blocks) and one per revoked block (at most the filesystem's blocks), never a
+count read from the log.
 
 **Failed commits.** A transaction that cannot be written breaks the filesystem
 (`broken`): nothing more is written, every change fails, and diskfs exits; its restart
-replays the journal. What the old design needed to survive a failed commit goes: the retry
-gate, `after_commit`, `unlisted`, `releasing`, `deferred` (beyond the owner's frees),
-`broken_renames`; each operation is one transaction again (a rename: both names and the
-links at once; an unlink: the name, the orphan list or the free at once).
+replays the journal. What the old design needed to survive a failed commit is gone: the
+retry gate, `after_commit`, `unlisted`, `releasing`, `deferred`, `broken_renames`, the
+multi-step rename and creation; each operation is one transaction (a creation: the inode
+and its name; a rename: both names, a moved directory's `..`, the parents' counts and the
+replaced inode's link at once; an unlink: the name, the link, and the orphan list or the
+free at once). `check_free` still checks every free (tests): in the transaction that frees
+it, the inode has no links, is on no orphan list, and no entry names it.
 
 **Orphans.** As ext3: an inode whose last link went while in use is put on the orphan list
 in the unlink's transaction and taken off in its release's (which frees it); the first mount
@@ -107,10 +142,12 @@ an ext2 disk with leaked blocks (e2fsck's), never a half journal.
 
 ## In diskfs
 
-Barrier operations already run one at a time; each round of the event loop ends with one
-commit for the operations it ran, and their completions are posted after it (group commit):
-a client sees an operation complete only when it is durable, as before, and a burst of
-creations or renames shares flushes. `FLUSH` commits too (and flushes data first, as now).
+Barrier operations run one at a time once no data operation is in flight; the barriers
+that run together (`Ext2::batch`) are one transaction, committed after the last of them, and
+their completions are posted after it (group commit): a client sees an operation complete
+only when it is durable, as before, and a burst of creations or renames shares one flush. A
+commit that fails turns their successes into `EIO` (and diskfs starts again). `FLUSH` commits
+too (and flushes data first). A read-only device (`VIRTIO_BLK_F_RO`) is mounted read-only.
 
 ## Tests
 

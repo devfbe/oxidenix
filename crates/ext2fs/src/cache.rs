@@ -1,11 +1,10 @@
 //! The metadata block cache: inode tables, bitmaps, group descriptors,
 //! directories, symlink and indirect blocks. Changes stay in the cache
-//! (dirty) until the operation that made them commits, which writes them
-//! together and flushes (after what they point to, see the crate's
-//! "Ordering"); a block stays dirty until it was written, so
-//! a failed commit is retried by the next one. Least recently used clean
-//! blocks give way when the cache is full; dirty ones stay (the journal's
-//! rule: a transaction's blocks reach their places only after its commit).
+//! (dirty) until the running transaction commits them (the crate's
+//! "Transactions"). Least recently used clean blocks give way when the cache
+//! is full; dirty ones stay (a transaction's blocks reach their places only
+//! after its commit), so the cache holds more than its capacity while a
+//! transaction is bigger: transactions are bounded (`State::transaction_limit`).
 //!
 //! File data does not pass through here: the kernel's page cache holds it,
 //! and reads and writes of whole blocks go straight to the device (or, on
@@ -27,11 +26,13 @@ pub struct BlockCache {
     lru: BTreeMap<u64, u32>,
     clock: u64,
     capacity: usize,
+    /// How many blocks are dirty.
+    dirty: usize,
 }
 
 impl BlockCache {
     pub fn new(capacity: usize) -> BlockCache {
-        BlockCache { blocks: BTreeMap::new(), lru: BTreeMap::new(), clock: 0, capacity: capacity.max(1) }
+        BlockCache { blocks: BTreeMap::new(), lru: BTreeMap::new(), clock: 0, capacity: capacity.max(1), dirty: 0 }
     }
 
     /// Block `n`, marked as just used.
@@ -42,6 +43,21 @@ impl BlockCache {
         e.used = self.clock;
         self.lru.insert(self.clock, n);
         Some(&e.data)
+    }
+
+    /// Block `n`, if cached, without marking it used.
+    pub fn peek(&self, n: u32) -> Option<&[u8]> {
+        self.blocks.get(&n).map(|e| &e.data[..])
+    }
+
+    /// How many blocks it holds when full (clean ones give way from there).
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// How many blocks are dirty.
+    pub fn dirty_count(&self) -> usize {
+        self.dirty
     }
 
     /// Whether block `n` is cached.
@@ -56,7 +72,7 @@ impl BlockCache {
 
     /// Whether any block is dirty.
     pub fn has_dirty(&self) -> bool {
-        self.blocks.values().any(|e| e.dirty)
+        self.dirty > 0
     }
 
     /// Cached blocks in `range`, without marking them used.
@@ -66,15 +82,12 @@ impl BlockCache {
 
     /// The block to evict before another one can be cached, if the cache
     /// is full: the least recently used clean one. Dirty blocks are the running
-    /// transaction's and stay until it commits (the journal's rule: nothing of it reaches
-    /// its place before its commit); with only dirty blocks the cache grows. (The second
-    /// value, contents to write first, is never given any more.)
-    pub fn victim(&self, incoming: u32) -> Option<(u32, Option<&[u8]>)> {
+    /// transaction's and stay until it commits; with only dirty blocks the cache grows.
+    pub fn victim(&self, incoming: u32) -> Option<u32> {
         if self.blocks.len() < self.capacity || self.blocks.contains_key(&incoming) {
             return None;
         }
-        let n = self.lru.values().copied().find(|n| !self.blocks[n].dirty)?;
-        Some((n, None))
+        self.lru.values().copied().find(|n| !self.blocks[n].dirty)
     }
 
     /// Caches block `n` (replacing what was there). The caller made room
@@ -84,6 +97,7 @@ impl BlockCache {
         self.remove(n);
         self.clock += 1;
         self.lru.insert(self.clock, n);
+        self.dirty += dirty as usize;
         self.blocks.insert(n, Entry { data, dirty, used: self.clock });
     }
 
@@ -91,6 +105,7 @@ impl BlockCache {
     pub fn remove(&mut self, n: u32) {
         if let Some(e) = self.blocks.remove(&n) {
             self.lru.remove(&e.used);
+            self.dirty -= e.dirty as usize;
         }
     }
 
@@ -102,6 +117,12 @@ impl BlockCache {
         }
     }
 
+    /// The dirty blocks in ascending order, as they are (they stay dirty
+    /// until `mark_clean`).
+    pub fn dirty_blocks(&self) -> impl Iterator<Item = (u32, &[u8])> {
+        self.blocks.iter().filter(|(_, e)| e.dirty).map(|(&n, e)| (n, &e.data[..]))
+    }
+
     /// The dirty blocks in ascending order (they stay dirty until
     /// `mark_clean`).
     pub fn dirty(&self) -> Vec<(u32, Vec<u8>)> {
@@ -111,6 +132,7 @@ impl BlockCache {
     /// Block `n` reached the device.
     pub fn mark_clean(&mut self, n: u32) {
         if let Some(e) = self.blocks.get_mut(&n) {
+            self.dirty -= e.dirty as usize;
             e.dirty = false;
         }
     }

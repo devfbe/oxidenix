@@ -281,15 +281,16 @@ const DATA_DISK_BYTES: u64 = 2 << 30;
 /// The size of the self-tests' disk: small, so that filling it is quick.
 const TEST_DISK_BYTES: u64 = 64 << 20;
 
-/// An ext2 filesystem of `bytes` (1 KiB blocks, 128-byte inodes, no
-/// extensions the kernel does not implement), pre-filled from userspace/disk.
+/// An ext2 filesystem of `bytes` with an ext3 journal (1 KiB blocks, 128-byte
+/// inodes, no extensions diskfs does not implement; docs/design/ext3-journal.md),
+/// pre-filled from userspace/disk.
 /// The image is a sparse file: only the blocks mke2fs writes take space on
 /// the host.
 fn create_data_disk(path: &Path, bytes: u64) -> io::Result<()> {
     let content = Path::new(env!("CARGO_MANIFEST_DIR")).join("../userspace/disk");
     // (Paths go to mke2fs as arguments of their own, through no shell.)
     let status = Command::new(e2fsprogs("mke2fs"))
-        .args(["-q", "-t", "ext2", "-b", "1024", "-I", "128", "-O", "none,filetype,sparse_super,large_file", "-L", "oxidenix", "-d"])
+        .args(["-q", "-t", "ext2", "-b", "1024", "-I", "128", "-O", "none,has_journal,filetype,sparse_super,large_file", "-L", "oxidenix", "-d"])
         .arg(&content)
         .arg("-F")
         .arg(path)

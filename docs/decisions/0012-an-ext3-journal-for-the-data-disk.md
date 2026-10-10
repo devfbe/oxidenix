@@ -39,7 +39,7 @@ the format Linux and e2fsprogs already know.
    disk without a journal (made before, or by a test) gets one on its first read-write mount,
    as `tune2fs -j` adds one: inode 8, the size mke2fs would choose for the disk, zeroed, the
    superblock's fields last. So there is one code path: diskfs never writes ext2 without a
-   journal.
+   journal (only a filesystem too small for one, under 2048 blocks, stays plain ext2).
 3. **One operation, one transaction; data first.** Each operation's metadata changes form a
    transaction (several operations may share one: group commit); the ordered-data rule of
    ext3's `data=ordered` stays: file data a transaction's metadata points to is written and
@@ -47,13 +47,14 @@ the format Linux and e2fsprogs already know.
    operations' consistency: it ends only between operations (or between the chunks of a long
    truncation, each of which leaves the filesystem consistent, with the inode on the orphan
    list until the last, as ext3 does).
-4. **Metadata goes home after the commit, the tail moves lazily.** After its commit, a
+4. **Metadata goes home after the commit, the log empties when full.** After its commit, a
    transaction's blocks are written to their places (no flush of their own: the next commit's
-   flush covers them); the journal's tail moves past a transaction once a flush followed its
-   home writes. A metadata block freed while copies of it are in the live journal gets a
-   revoke record, so recovery never writes an old copy over the block's new use. The
-   journal's superblock is written when its tail moves for room, and on a clean shutdown,
-   which leaves the journal empty and the superblock without `needs_recovery`.
+   flush covers them). When the ring has no room for the next transaction, a flush makes every
+   home write durable and the log starts again empty. A metadata block freed while copies of
+   it are in the live journal gets a revoke record, so recovery never writes an old copy over
+   the block's new use. The journal's superblock is written when the log starts and empties,
+   and on a clean shutdown, which leaves the journal empty and the superblock without
+   `needs_recovery`.
 5. **Recovery at mount.** A disk with `needs_recovery` (`INCOMPAT_RECOVER`) has its journal
    replayed when it is mounted (scan, revokes, replay, as JBD2's three passes), before the
    orphan list is read. The orphan list keeps its ext3 meaning: inodes whose last link went
@@ -75,8 +76,10 @@ the format Linux and e2fsprogs already know.
   is consistent after replay: e2fsck finds nothing to fix, no leaks, no link counts too
   high. The crash harness says so for every replayed image.
 - Metadata is written twice (journal, home), as on ext3.
-- The journal takes space (mke2fs's choice: 4 MiB for the 64 MiB test disk, 64 MiB for the
-  2 GiB data disk).
+- The journal takes space (mke2fs's choice: 4 MiB for the 64 MiB test disk, 16 MiB for the
+  2 GiB data disk with its 1 KiB blocks).
+- An operation that fails is undone in memory whole (no hand-written undo paths), so a
+  transaction never carries part of one.
 - Older e2fsprogs or kernels that do not know `ASYNC_COMMIT` refuse the disk; e2fsprogs 1.47
   and Linux 6.x know it.
 - `docs/design/ext3-journal.md` has the design; `crates/ext2fs` the implementation.

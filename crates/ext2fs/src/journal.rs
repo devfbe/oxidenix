@@ -2,10 +2,17 @@
 //! the log blocks a transaction is written as (descriptors with their tags, the logged
 //! blocks, revoke blocks, the commit block with its CRC-32), and recovery's scan of a log
 //! (which transactions are complete, which blocks they revoke, what to write where).
-//! Pure: the caller reads and writes the journal's blocks (`Journal` in `lib.rs`).
+//! Pure: the caller reads and writes the journal's blocks (`Log`).
 //! Everything on the disk is big-endian.
+//!
+//! **Untrusted.** A journal is read from a disk anyone may have written: the superblock's
+//! fields are checked before anything is read by them, the scan reads at most the ring's
+//! blocks once, every block number a complete transaction names must be the
+//! filesystem's, and what recovery keeps in memory is bounded by the filesystem and the
+//! journal sizes (the caller checks those against the disk), never by a count read from
+//! the log: copies are written home as the replay finds them, one block at a time.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -21,6 +28,8 @@ pub const INCOMPAT_64BIT: u32 = 2;
 pub const INCOMPAT_ASYNC_COMMIT: u32 = 4;
 /// The incompatible features we read (others refuse the journal).
 pub const INCOMPAT_KNOWN: u32 = INCOMPAT_REVOKE | INCOMPAT_ASYNC_COMMIT;
+/// The fewest blocks a journal has (JBD2's `JBD2_MIN_JOURNAL_BLOCKS`).
+pub const MIN_BLOCKS: u32 = 1024;
 
 const FLAG_ESCAPE: u16 = 1;
 const FLAG_SAME_UUID: u16 = 2;
@@ -123,7 +132,10 @@ impl Superblock {
         if sb.incompat & !INCOMPAT_KNOWN != 0 || be32(b, 44) != 0 {
             return Err("unsupported journal features");
         }
-        if sb.block_size as usize != b.len() || sb.first == 0 || sb.first >= sb.len || sb.start >= sb.len {
+        // The ring is `first..len` (at least the minimum's worth), and the log starts in it.
+        let ring = sb.first != 0 && sb.first < sb.len && sb.len - sb.first >= MIN_BLOCKS - 1;
+        let start = sb.start == 0 || (sb.start >= sb.first && sb.start < sb.len);
+        if sb.block_size as usize != b.len() || !ring || !start {
             return Err("corrupt journal superblock");
         }
         Ok(sb)
@@ -174,24 +186,30 @@ pub fn transaction_len(block_size: usize, blocks: usize, revokes: usize) -> usiz
     blocks.div_ceil(per) + blocks + revokes.div_ceil(rper) + 1
 }
 
-/// Transaction `sequence` as log blocks, in order: `blocks` (home block number, contents),
-/// `revokes`, a commit block at `time` (seconds). The commit's CRC-32 covers the
-/// descriptors and logged blocks in log order.
-pub fn encode_transaction(block_size: usize, uuid: &[u8; 16], sequence: u32, blocks: &[(u32, &[u8])], revokes: &[u32], time: u64) -> Vec<Vec<u8>> {
-    let mut out = Vec::new();
+/// Writes transaction `sequence` with `out`, its log blocks in order: `blocks` (home
+/// block number, contents) with descriptors, `revokes`, a commit block at `time`
+/// (seconds). The commit's CRC-32 covers the descriptors and logged blocks in log order.
+/// Nothing is copied but a block that must be escaped (one that starts with the magic
+/// number is logged with its first word zeroed).
+pub fn write_transaction(
+    block_size: usize,
+    uuid: &[u8; 16],
+    sequence: u32,
+    blocks: &[(u32, &[u8])],
+    revokes: &[u32],
+    time: u64,
+    out: &mut dyn FnMut(&[u8]) -> Result<(), ()>,
+) -> Result<(), ()> {
     let mut crc = !0u32;
     let per = tags_per_descriptor(block_size);
+    let escaped = |data: &[u8]| be32(data, 0) == MAGIC;
     for chunk in blocks.chunks(per) {
         let mut d = vec![0u8; block_size];
         header(&mut d, DESCRIPTOR, sequence);
         let mut at = HEADER;
-        let mut logged = Vec::with_capacity(chunk.len());
         for (i, &(home, data)) in chunk.iter().enumerate() {
             let mut flags = 0;
-            let mut copy = data.to_vec();
-            if be32(&copy, 0) == MAGIC {
-                // (Would read as a header: logged with its first word zeroed.)
-                copy[..4].fill(0);
+            if escaped(data) {
                 flags |= FLAG_ESCAPE;
             }
             if i > 0 {
@@ -208,13 +226,19 @@ pub fn encode_transaction(block_size: usize, uuid: &[u8; 16], sequence: u32, blo
                 d[at..at + 16].copy_from_slice(uuid);
                 at += 16;
             }
-            logged.push(copy);
         }
         crc = crc32_be(crc, &d);
-        out.push(d);
-        for copy in logged {
-            crc = crc32_be(crc, &copy);
-            out.push(copy);
+        out(&d)?;
+        for &(_, data) in chunk {
+            if escaped(data) {
+                let mut copy = data.to_vec();
+                copy[..4].fill(0);
+                crc = crc32_be(crc, &copy);
+                out(&copy)?;
+            } else {
+                crc = crc32_be(crc, data);
+                out(data)?;
+            }
         }
     }
     let rper = revokes_per_block(block_size);
@@ -225,7 +249,7 @@ pub fn encode_transaction(block_size: usize, uuid: &[u8; 16], sequence: u32, blo
         for (i, &b) in chunk.iter().enumerate() {
             put_be32(&mut r, HEADER + 4 + i * 4, b);
         }
-        out.push(r);
+        out(&r)?;
     }
     let mut c = vec![0u8; block_size];
     header(&mut c, COMMIT, sequence);
@@ -233,34 +257,42 @@ pub fn encode_transaction(block_size: usize, uuid: &[u8; 16], sequence: u32, blo
     c[13] = 4;
     put_be32(&mut c, 16, crc);
     c[48..56].copy_from_slice(&time.to_be_bytes());
-    out.push(c);
-    out
+    out(&c)
+}
+
+/// The journal's blocks as recovery reads them, and the filesystem's as it writes them.
+pub trait Log {
+    /// Journal block `n` (`n` < the journal's length).
+    fn read(&mut self, n: u32) -> Result<Vec<u8>, ()>;
+    /// Writes a replayed copy of filesystem block `home`.
+    fn write_home(&mut self, home: u32, data: &[u8]) -> Result<(), ()>;
 }
 
 /// What recovery found in a log.
 #[derive(Debug, Default)]
 pub struct Recovery {
-    /// The blocks to write home (the newest copy of each, revokes applied), unescaped.
-    pub blocks: BTreeMap<u32, Vec<u8>>,
     /// Complete transactions, and the sequence after the last.
     pub transactions: u32,
     pub next_sequence: u32,
     /// Where the log continues after the last complete transaction.
     pub next_block: u32,
+    /// Copies written home.
+    pub replayed: u32,
 }
 
-/// One transaction as the scan found it.
+/// One transaction as the scan found it: (home block, log block, escaped) of its tags, in
+/// order (at most one per log block the scan read).
 struct Found {
     sequence: u32,
-    /// (home block, log block, escaped) of its tags, in order.
     tags: Vec<(u32, u32, bool)>,
-    revokes: Vec<u32>,
 }
 
-/// Scans the log of `sb` (reading journal block `n` with `read`), collects the complete
-/// transactions' revokes and the blocks to replay (as JBD2's three passes). A torn or
-/// foreign block ends the log.
-pub fn recover(sb: &Superblock, read: &mut dyn FnMut(u32) -> Result<Vec<u8>, ()>) -> Result<Recovery, &'static str> {
+/// Recovers the log of `sb` (as JBD2's passes): scans it for complete transactions (a
+/// torn, foreign or corrupt block ends the log), collects their revokes, and writes the
+/// copies no newer revoke cancels home, oldest first (so each block ends as its newest
+/// copy). `blocks` is the filesystem's size: a complete transaction naming a block beyond
+/// it is a corrupt journal (nothing is written then).
+pub fn recover(sb: &Superblock, blocks: u32, log: &mut dyn Log) -> Result<Recovery, &'static str> {
     let mut rec = Recovery { next_sequence: sb.sequence, next_block: if sb.start == 0 { sb.first } else { sb.start }, ..Recovery::default() };
     if sb.start == 0 {
         return Ok(rec);
@@ -268,28 +300,34 @@ pub fn recover(sb: &Superblock, read: &mut dyn FnMut(u32) -> Result<Vec<u8>, ()>
     let bs = sb.block_size as usize;
     let checksums = sb.compat & COMPAT_CHECKSUM != 0;
     let mut found: Vec<Found> = Vec::new();
+    // The newest complete transaction that revokes each block (a block of the filesystem:
+    // at most `blocks` entries), and the running transaction's revokes.
+    let mut revoked: BTreeMap<u32, u32> = BTreeMap::new();
+    let mut revoking: BTreeSet<u32> = BTreeSet::new();
     let mut at = sb.start;
     let mut sequence = sb.sequence;
-    let mut current = Found { sequence, tags: Vec::new(), revokes: Vec::new() };
+    let mut tags: Vec<(u32, u32, bool)> = Vec::new();
     let mut crc = !0u32;
-    // (At most the whole ring: a log never wraps onto itself.)
-    let mut budget = sb.log_blocks() as u64 + 1;
-    loop {
-        if budget == 0 {
-            break;
-        }
-        let b = read(at).map_err(|_| "cannot read the journal")?;
+    // Every log block is read at most once by the scan: a log never wraps onto itself.
+    let mut budget = sb.log_blocks();
+    let corrupt = "the journal names a block beyond the filesystem";
+    'scan: while budget > 0 {
+        let b = log.read(at).map_err(|_| "cannot read the journal")?;
         budget -= 1;
-        if be32(&b, 0) != MAGIC || be32(&b, 8) != sequence {
+        if b.len() != bs || be32(&b, 0) != MAGIC || be32(&b, 8) != sequence {
             break;
         }
         match be32(&b, 4) {
             DESCRIPTOR => {
                 crc = crc32_be(crc, &b);
                 let mut o = HEADER;
-                let mut log = sb.next(at);
+                let mut data = sb.next(at);
                 let mut last = false;
                 while !last && o + TAG_BYTES <= bs {
+                    // (Each tag's block is one of the ring's: none past the budget.)
+                    if budget == 0 {
+                        break 'scan;
+                    }
                     let home = be32(&b, o);
                     let flags = be16(&b, o + 6);
                     o += TAG_BYTES;
@@ -298,22 +336,26 @@ pub fn recover(sb: &Superblock, read: &mut dyn FnMut(u32) -> Result<Vec<u8>, ()>
                     }
                     last = flags & FLAG_LAST_TAG != 0;
                     if checksums {
-                        let data = read(log).map_err(|_| "cannot read the journal")?;
-                        crc = crc32_be(crc, &data);
+                        let copy = log.read(data).map_err(|_| "cannot read the journal")?;
+                        crc = crc32_be(crc, &copy);
                     }
                     if flags & FLAG_DELETED == 0 {
-                        current.tags.push((home, log, flags & FLAG_ESCAPE != 0));
+                        tags.push((home, data, flags & FLAG_ESCAPE != 0));
                     }
-                    log = sb.next(log);
-                    budget = budget.saturating_sub(1);
+                    data = sb.next(data);
+                    budget -= 1;
                 }
-                at = log;
+                at = data;
             }
             REVOKE => {
                 let count = (be32(&b, HEADER) as usize).min(bs);
                 let mut o = HEADER + 4;
                 while o + 4 <= count {
-                    current.revokes.push(be32(&b, o));
+                    // (A block the filesystem does not have has no copy to cancel.)
+                    let n = be32(&b, o);
+                    if n < blocks {
+                        revoking.insert(n);
+                    }
                     o += 4;
                 }
                 at = sb.next(at);
@@ -323,8 +365,17 @@ pub fn recover(sb: &Superblock, read: &mut dyn FnMut(u32) -> Result<Vec<u8>, ()>
                     // Torn (async commit): this transaction and what follows are not replayed.
                     break;
                 }
+                if tags.iter().any(|&(home, _, _)| home >= blocks) {
+                    return Err(corrupt);
+                }
                 at = sb.next(at);
-                found.push(core::mem::replace(&mut current, Found { sequence: sequence.wrapping_add(1), tags: Vec::new(), revokes: Vec::new() }));
+                for n in core::mem::take(&mut revoking) {
+                    let e = revoked.entry(n).or_insert(sequence);
+                    if seq_after(sequence, *e) {
+                        *e = sequence;
+                    }
+                }
+                found.push(Found { sequence, tags: core::mem::take(&mut tags) });
                 sequence = sequence.wrapping_add(1);
                 crc = !0;
                 rec.next_block = at;
@@ -333,27 +384,21 @@ pub fn recover(sb: &Superblock, read: &mut dyn FnMut(u32) -> Result<Vec<u8>, ()>
             _ => break,
         }
     }
-    // Revokes: the newest sequence that revokes each block.
-    let mut revoked: BTreeMap<u32, u32> = BTreeMap::new();
-    for t in &found {
-        for &b in &t.revokes {
-            let e = revoked.entry(b).or_insert(t.sequence);
-            if seq_after(t.sequence, *e) {
-                *e = t.sequence;
-            }
-        }
-    }
     // Replay, oldest first: a copy is skipped if a transaction as new or newer revokes it.
     for t in &found {
-        for &(home, log, escaped) in &t.tags {
+        for &(home, at, escaped) in &t.tags {
             if revoked.get(&home).is_some_and(|&r| !seq_after(t.sequence, r)) {
                 continue;
             }
-            let mut data = read(log).map_err(|_| "cannot read the journal")?;
+            let mut data = log.read(at).map_err(|_| "cannot read the journal")?;
+            if data.len() != bs {
+                return Err("cannot read the journal");
+            }
             if escaped {
                 data[..4].copy_from_slice(&MAGIC.to_be_bytes());
             }
-            rec.blocks.insert(home, data);
+            log.write_home(home, &data).map_err(|_| "cannot write a replayed block")?;
+            rec.replayed += 1;
         }
     }
     rec.transactions = found.len() as u32;

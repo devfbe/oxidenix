@@ -14,8 +14,9 @@
 //! then writes the sector from there and from the grant (a new block is
 //! padded with zeros from the zero page instead); the sector bytes a read
 //! does not want land in a sink page. A block whose current data is not
-//! (only) on the disk (after a failed commit) makes the request go through
-//! ext2fs's own read or write with a bounce copy (`EAGAIN`, rare). A write
+//! (only) on the disk (one ext2fs's own write allocated, not committed yet)
+//! makes the request go through ext2fs's own read or write with a bounce
+//! copy (`EAGAIN`, rare). A write
 //! links its new blocks once its data is on the device; it is durable
 //! after a `FLUSH` (see `fsring`, "Durability").
 //!
@@ -23,7 +24,8 @@
 //! flight: taking one stops taking requests (on
 //! every channel) until the operations taken before it completed; then it
 //! runs synchronously. Barriers wait in a queue, in the order they were
-//! taken. A write waits ("stalls") while another write in flight covers
+//! taken; those that run together are one transaction of the journal (group
+//! commit: one flush for all), and they complete once it is committed. A write waits ("stalls") while another write in flight covers
 //! one of its blocks, while scratch memory is short, or while every
 //! operation slot is taken; it was taken before every barrier waiting, so
 //! it is retried whatever waits, and if it must go through ext2fs's own
@@ -387,7 +389,7 @@ pub struct Service {
     grace_until: u64,
     /// The inodes this diskfs created (no earlier one's client holds them).
     created: Bitmap,
-    /// Inodes whose free a failed commit kept back (`try_free` again).
+    /// Inodes whose release failed (undone: on the orphan list still; `try_free` again).
     unfreed: BTreeSet<u32>,
     /// The channel the next round starts with.
     rr: usize,
@@ -761,11 +763,24 @@ impl Service {
             }
         }
         self.rr = (self.rr + 1) % count;
-        // Barriers in order, each once everything taken before it is done.
+        // Barriers in order, each once everything taken before it is done; those that run
+        // together are one transaction (group commit), and they complete once it is
+        // committed.
+        let mut done = Vec::new();
+        fs.batch(true);
         while self.ops.iter().all(Option::is_none) && self.chans.iter().flatten().all(|c| c.stalled.is_none()) {
             let Some((c, d)) = self.barriers.pop_front() else { break };
-            self.run_barrier(fs, c, &d);
+            done.push(self.run_barrier(fs, c, &d));
             any = true;
+        }
+        fs.batch(false);
+        if !done.is_empty() {
+            // (A commit that fails stops the filesystem: nothing it held happened.)
+            let committed = fs.sync();
+            for (c, tag, op, status, values) in done {
+                let (status, values) = if committed.is_err() && status >= 0 { (-EIO, [0; 4]) } else { (status, values) };
+                self.complete(c, tag, op, status, values);
+            }
         }
         any
     }
@@ -869,17 +884,17 @@ impl Service {
         if self.in_use(ino) || fs.check(ino).is_err() {
             return;
         }
-        // (`releasable`: its last link went; also one a failed commit left with its links.)
+        // (`releasable`: its last link went.)
         if fs.releasable(ino) && fs.release(ino).is_err() {
-            // (A commit failed: tried again with the next barrier.)
+            // (Undone, on the orphan list still: tried again with the next barrier. A
+            // failed commit stops the filesystem instead: diskfs starts again.)
             self.unfreed.insert(ino);
         }
     }
 
-    /// Frees again what a failed commit kept from being freed (diskfs's own tries, and the
-    /// inodes the filesystem kept back: `take_deferred`), unless someone may use them.
+    /// Frees again what a failed release left (on the orphan list), unless someone may use
+    /// it.
     fn retry_frees(&mut self, fs: &mut Fs) {
-        self.unfreed.extend(fs.take_deferred());
         for ino in core::mem::take(&mut self.unfreed) {
             self.try_free(fs, ino);
         }
@@ -1138,7 +1153,9 @@ impl Service {
 
     // ------------------------------------------------------------ barriers
 
-    fn run_barrier(&mut self, fs: &mut Fs, c: usize, d: &Desc) {
+    /// Runs barrier `d` of channel `c`; its completion, to be posted once its transaction
+    /// is committed: (channel, tag, op, status, values).
+    fn run_barrier(&mut self, fs: &mut Fs, c: usize, d: &Desc) -> (usize, u64, u16, i64, [u64; 4]) {
         self.retry_frees(fs);
         let (status, values) = match Request::decode(d).and_then(|r| self.execute(fs, c, r)) {
             Ok((status, values)) => (status, values),
@@ -1152,7 +1169,7 @@ impl Service {
                 self.created.set(values[0] as u32);
             }
         }
-        self.complete(c, d.tag, d.op, status, values);
+        (c, d.tag, d.op, status, values)
     }
 
     /// A name from a grant: copied out once, then checked.

@@ -276,8 +276,10 @@ completed (except a `FORGET` of a grant no request in flight uses, which complet
 client sends one after every fill and write-back of its page cache). A completed `WRITE` is visible to every later request, also through the kernel's
 IPC path, and durable after a `FLUSH`: write-back. diskfs reserves the blocks of a write in
 memory (in no bitmap or inode), writes the data by DMA, then links them; a `FLUSH` (and any
-commit) flushes the device before metadata reaches it and again after, so a crash never
-leaves a pointer to a block whose data did not reach the disk (ext2fs, "Ordering").
+commit of the journal) flushes the device before the transaction that points to the data,
+so a crash never leaves a pointer to a block whose data did not reach the disk (ext2fs,
+"Ordering"). The barriers that run together are one transaction, answered once it is
+committed (group commit; docs/design/ext3-journal.md).
 
 **What moves the data.** The device, by DMA between the disk and the granted pages, at their
 device addresses (`grant_dma_pages`, cached per channel): no copy for any read and for any
@@ -285,8 +287,9 @@ write of whole sectors. Sector bytes a read does not want go to a sink page; a w
 to whole blocks (a new block) takes zeros from a zero page. The CPU copies only: zeros into
 the holes of a read; one or two sectors read from the disk into scratch memory for a write
 that starts or ends inside an existing block's sector (the device then writes them from there
-and the grant); names and small results (`READDIR`, `READLINK`); and, after a failed commit
-left a block's data in ext2fs's cache, the whole request through ext2fs's own read or write.
+and the grant); names and small results (`READDIR`, `READLINK`); and, when a block's data is
+in ext2fs's cache or not zeroed yet (ext2fs's own write allocated it, its commit still to
+come), the whole request through ext2fs's own read or write.
 With 1 KiB ext2 blocks a 4 KiB page is four blocks, contiguous or not: a run of contiguous
 blocks is one device request, otherwise several, all still DMA.
 
@@ -312,13 +315,11 @@ restart of diskfs, say). The root's handle comes from `ROOT`.
 **Holds.** A client holds every inode it named (by a valid handle) or got back from `ROOT`,
 `LOOKUP`, `CREATE`, `UNLINK` or `RENAME`, until its `RELEASE` or the end of its channel. An
 inode whose last link went is freed when no client holds it, so one client never frees what
-another uses; while held it is on ext2's orphan list (written in an order a crash cannot hurt:
-the name's removal, the inode, the list's head; off the list before it is freed), so a crash
-leaves nothing allocated for good: the first diskfs after boot frees the list. A commit that
-fails is retried alone before anything else changes, and a sequence of these steps ends at its
-first failed commit (the inode then waits, held, for its release; never freed out of order); a
-free that fails half way leaves the cache untrustworthy, and diskfs exits to be restarted from
-the disk's state (`ext2fs`, "Failed commits"). New inodes get random generations. (Until step 4
+another uses; while held it is on the orphan list (put there in the transaction that takes its
+last link, taken off in the one that frees it), so a crash leaves nothing allocated for good:
+the first diskfs after boot frees the list. A commit that fails stops the filesystem, and
+diskfs exits to be restarted; its mount replays the journal and goes on from the last commit
+(`ext2fs`, "Failures"). New inodes get random generations. (Until step 4
 the kernel's IPC client held inodes too; it is gone.)
 
 **Restarts of diskfs.** Holds are diskfs's memory, but the clients' open files outlive a diskfs

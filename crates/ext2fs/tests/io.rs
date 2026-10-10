@@ -1,11 +1,12 @@
 //! ext2fs on a RAM disk that counts device requests: large reads and writes
-//! take few requests, a write flushes twice (data, then metadata), and the
+//! take few requests, a write flushes twice (data, then its transaction), and the
 //! filesystem stays consistent for e2fsck; on the ring path, reserved
 //! blocks stay out of the metadata until linked and `sync` flushes data
 //! before metadata; a crash at any point never exposes a deleted file's
 //! blocks; promised blocks are kept for the writes that promised them;
-//! orphans outlive a mount until `recover_orphans`, and a crash while they
-//! come and go never frees a named or a free inode. Needs mke2fs and e2fsck (e2fsprogs) in PATH:
+//! orphans outlive a mount until `recover_orphans`; and after a crash at any point, or a
+//! device request failing anywhere, the journal's replay leaves a filesystem e2fsck finds
+//! nothing wrong with. Needs mke2fs, e2fsck and debugfs (e2fsprogs) in PATH:
 //! `nix-shell -p e2fsprogs --run "cargo test -p ext2fs"`.
 
 use ext2fs::{Device, Ext2, NewNode, ROOT_INO};
@@ -33,6 +34,8 @@ struct RamDisk {
     fail_read: Option<usize>,
     /// Every write and flush from some point on, for crash images.
     log: Option<Vec<Event>>,
+    /// The device says it takes no writes (`Device::read_only`).
+    read_only: bool,
 }
 
 /// A device request, as the crash tests replay them.
@@ -117,8 +120,12 @@ impl Device for RamDisk {
         1_700_000_000
     }
 
-    /// Every free checks that no name points to the inode and its last link is gone on
-    /// the disk (`Device::checks`).
+    fn read_only(&self) -> bool {
+        self.read_only
+    }
+
+    /// Every free checks that no name and no orphan list points to the inode and it has
+    /// no links (`Device::checks`).
     fn checks(&self) -> bool {
         true
     }
@@ -143,7 +150,7 @@ fn mkfs(name: &str, kib: usize) -> RamDisk {
     assert!(ok, "mke2fs failed");
     let data = std::fs::read(&path).unwrap();
     std::fs::remove_file(&path).unwrap();
-    RamDisk { data, counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None }
+    RamDisk { data, counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false }
 }
 
 /// e2fsck -fn on the disk's contents.
@@ -622,7 +629,7 @@ fn crash_image(base: &[u8], log: &[Event], epoch: usize, seed: u64) -> Vec<u8> {
 /// Errors are allowed (ext2 has no journal: a crash may leave an
 /// inconsistency for e2fsck), stale data is not.
 fn assert_no_secret(image: Vec<u8>, what: &str) {
-    let disk = RamDisk { data: image, counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None };
+    let disk = RamDisk { data: image, counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false };
     let Ok(mut fs) = Ext2::mount(disk) else { return };
     let mut dirs = vec![ROOT_INO];
     let mut seen = std::collections::HashSet::new();
@@ -724,20 +731,14 @@ fn a_crash_never_exposes_freed_blocks() {
 fn impossible_group_sizes_are_refused_at_mount() {
     let good = mkfs("sizes", 2 * 1024);
     for (offset, value) in [(32usize, 8 * 1024 + 1u32), (40, 8 * 1024 + 1), (32, 0)] {
-        let mut disk = RamDisk { data: good.data.clone(), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None };
+        let mut disk = RamDisk { data: good.data.clone(), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false };
         disk.data[1024 + offset..1024 + offset + 4].copy_from_slice(&value.to_le_bytes());
         assert!(Ext2::mount(disk).is_err(), "superblock field {offset} = {value}");
     }
-    let mut disk = RamDisk { data: good.data.clone(), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None };
+    let mut disk = RamDisk { data: good.data.clone(), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false };
     disk.data[1024 + 88..1024 + 90].copy_from_slice(&2048u16.to_le_bytes());
     assert!(Ext2::mount(disk).is_err(), "inodes larger than a block");
     assert!(Ext2::mount(good).is_ok());
-}
-
-/// The blocks of `ino` (from its extents).
-fn blocks_of(fs: &mut Ext2<RamDisk>, ino: u32, len: u64) -> Vec<u32> {
-    let (_, extents) = fs.read_map(ino, 0, len).unwrap();
-    extents.iter().filter_map(|e| e.disk.map(|d| (d / 1024) as u32..((d + e.len) / 1024) as u32)).flatten().collect()
 }
 
 /// A truncation whose commit fails stops the filesystem: nothing more is written (no
@@ -1124,9 +1125,8 @@ fn fs_generation_unknown() -> u32 {
 }
 
 /// Crashes while orphans come and go (unlinks of open files, releases, a boot's recovery),
-/// at every flush, with any of the writes after it lost: after the next boot's recovery no
-/// name points to a freed inode, no inode is freed twice, and the free counts e2fsck sees
-/// are the bitmaps'.
+/// at every flush, with any of the writes after it lost: after the journal's replay and the
+/// next boot's recovery no name points to a freed inode, and e2fsck finds nothing at all.
 #[test]
 fn crashes_never_free_a_named_or_a_free_inode() {
     let mut fs = Ext2::mount(mkfs("orphan-crash", 4 * 1024)).unwrap();
@@ -1159,7 +1159,7 @@ fn crashes_never_free_a_named_or_a_free_inode() {
     for epoch in 0..=epochs {
         for seed in 0..32 {
             let image = crash_image(&base, &log, epoch, seed);
-            let d = RamDisk { data: image, counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None };
+            let d = RamDisk { data: image, counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false };
             let mut fs = Ext2::mount(d).unwrap();
             fs.recover_orphans(|_| false).unwrap();
             assert!(fs.orphans().is_empty());
@@ -1169,25 +1169,8 @@ fn crashes_never_free_a_named_or_a_free_inode() {
                     assert!(fs.stat(ino).unwrap().links > 0, "epoch {epoch} seed {seed}: {name} names an inode without links");
                 }
             }
-            let disk = take(fs);
-            let path = scratch("crash-fsck");
-            std::fs::write(&path, &disk.data).unwrap();
-            let out = Command::new("e2fsck").arg("-fn").arg(&path).output().expect("e2fsck not found");
-            std::fs::remove_file(&path).unwrap();
-            for line in String::from_utf8_lossy(&out.stdout).lines() {
-                // Allowed after a crash (ext2 has no journal): an inode without a name, also
-                // one chained to the list whose head did not reach the disk (e2fsck takes
-                // it), counts and bitmap bits of space not yet given back. Not allowed: an
-                // entry pointing to a deleted or unused inode, an orphan list left over, a
-                // block or inode marked free that is in use.
-                let chained = line.contains("was part of the orphaned inode list") || line.contains("corrupted orphan linked list");
-                let bad = line.contains("deleted/unused")
-                    || (line.contains("orphan") && !chained)
-                    || line.contains("multiply-claimed")
-                    || (line.contains("differences:") && line.split_whitespace().any(|w| w.starts_with('+')));
-                if bad {
-                    problems.insert(format!("epoch {epoch} seed {seed}: {}", line.trim()));
-                }
+            if let Some(f) = fsck_findings(&take(fs), &format!("epoch {epoch} seed {seed}")) {
+                problems.insert(f);
             }
         }
     }
@@ -1209,32 +1192,13 @@ fn released_orphans_leave_an_empty_list() {
     fsck("orphans-released", &take(fs));
 }
 
-/// What may never be seen after a crash or a failed commit: a name of a freed inode or of
-/// one without links, a deleted or unused inode an entry points to, an orphan list left
-/// over (after a boot's recovery), blocks claimed twice, a block or inode marked free that
-/// is in use. (Allowed, as after any crash of ext2: inodes without a name, also one chained
-/// to a list whose head did not reach the disk, and counts and bits of space not given
-/// back: e2fsck takes those.)
+/// What may never be seen after a crash or a failed commit, once the journal is replayed
+/// (and the orphans recovered): a name of a freed inode or of one without enough links, or
+/// anything at all e2fsck would fix (a leak, a link count too high, a bitmap difference).
 fn unsafe_findings(fs: Ext2<RamDisk>, what: &str) -> Vec<String> {
     let mut fs = fs;
-    // Every name in the tree: its inode in use, with at least as many links as names.
     let mut found = names_within_links(&mut fs, what);
-    let disk = take(fs);
-    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let path = scratch(&format!("unsafe-fsck-{}", N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
-    std::fs::write(&path, &disk.data).unwrap();
-    let out = Command::new("e2fsck").arg("-fn").arg(&path).output().expect("e2fsck not found");
-    std::fs::remove_file(&path).unwrap();
-    for line in String::from_utf8_lossy(&out.stdout).lines() {
-        let chained = line.contains("was part of the orphaned inode list") || line.contains("corrupted orphan linked list");
-        let bad = line.contains("deleted/unused")
-            || (line.contains("orphan") && !chained)
-            || line.contains("multiply-claimed")
-            || (line.contains("differences:") && line.split_whitespace().any(|w| w.starts_with('+')));
-        if bad {
-            found.push(format!("{what}: {}", line.trim()));
-        }
-    }
+    found.extend(fsck_findings(&take(fs), what));
     found
 }
 
@@ -1274,11 +1238,10 @@ fn orphan_sequence(fs: &mut Ext2<RamDisk>, files: &[u32]) -> Vec<u32> {
 
 /// A device write or flush that fails anywhere in the orphans' sequence (unlinks of open
 /// files, releases, a restart's recovery, an immediate free, a rename over a file): the
-/// failed step is retried alone before anything else changes, so neither the state the
-/// filesystem goes on with nor a crash at any later point (any writes after a flush
-/// lost) ever frees a named or a free inode; once the device works again everything the
-/// caller holds is freed as usual, or, if a free broke off half way (`broken`), the next
-/// mount goes on from the disk's state.
+/// failed commit stops the filesystem (`broken`), and the next mount (the journal's
+/// replay, then the boot's recovery) has a filesystem e2fsck finds nothing wrong with;
+/// where nothing failed, everything the caller holds is freed as usual, and a crash at any
+/// point of that run (any writes after a flush lost) leaves nothing either.
 #[test]
 fn failed_commits_never_free_a_named_or_a_free_inode() {
     let mut fs = Ext2::mount(mkfs("orphan-fail", 4 * 1024)).unwrap();
@@ -1292,7 +1255,7 @@ fn failed_commits_never_free_a_named_or_a_free_inode() {
     fs.unlink(ROOT_INO, "held-1", false).unwrap();
     let base = take(fs).data;
     // How many writes and flushes the sequence makes when nothing fails.
-    let mut fs = Ext2::mount(RamDisk { data: base.clone(), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None }).unwrap();
+    let mut fs = Ext2::mount(RamDisk { data: base.clone(), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false }).unwrap();
     // The handles the caller holds: (number, generation).
     let handles: Vec<(u32, u32)> = files.iter().map(|&f| (f, fs.stat(f).unwrap().generation)).collect();
     let before = fs.device().counts.clone();
@@ -1305,14 +1268,14 @@ fn failed_commits_never_free_a_named_or_a_free_inode() {
     let modes = (0..writes).map(|n| (0, n)).chain((0..flushes).map(|n| (1, n))).chain((0..writes).map(|n| (2, n)));
     for (mode, n) in modes {
         let what = format!("{} {n} failing", ["write", "flush", "every write from"][mode]);
-        let mut disk = RamDisk { data: base.clone(), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: Some(Vec::new()) };
+        let mut disk = RamDisk { data: base.clone(), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: Some(Vec::new()), read_only: false };
         match mode {
             0 => disk.fail_writes(n, 1),
             1 => disk.fail_flush = Some(n),
             _ => disk.fail_writes(n, usize::MAX),
         }
         let mut fs = Ext2::mount(disk).unwrap();
-        let mut held = orphan_sequence(&mut fs, &files);
+        let held = orphan_sequence(&mut fs, &files);
         fs.device_mut().fail_at = None;
         // After every failure: names within links, and what the caller holds still the
         // very files of its handles.
@@ -1332,14 +1295,9 @@ fn failed_commits_never_free_a_named_or_a_free_inode() {
             fs.recover_orphans(|_| false).unwrap();
             problems.extend(unsafe_findings(fs, &format!("{what}, remounted")));
         } else {
-            // The device works again: the caller releases what it holds (what nobody holds
-            // the filesystem frees itself), and goes down cleanly: e2fsck finds nothing.
-            // (A rename that broke off is finished by doing it again.)
-            if let Ok(g) = fs.rename(ROOT_INO, "held-5", ROOT_INO, "held-4") {
-                held.extend(g);
-            }
-            let deferred = fs.take_deferred();
-            for &ino in held.iter().chain(deferred.iter()) {
+            // The device works again: the caller releases what it holds, and goes down
+            // cleanly: e2fsck finds nothing.
+            for &ino in held.iter() {
                 if fs.releasable(ino) {
                     if let Err(e) = fs.release(ino) {
                         problems.push(format!("{what}: releasing {ino}: {e} (held {held:?}, broken {})", fs.broken()));
@@ -1356,7 +1314,7 @@ fn failed_commits_never_free_a_named_or_a_free_inode() {
             for epoch in 0..=epochs {
                 for seed in 0..6 {
                     let image = crash_image(&base, &log, epoch, seed);
-                    let d = RamDisk { data: image, counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None };
+                    let d = RamDisk { data: image, counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false };
                     let mut fs = Ext2::mount(d).unwrap();
                     let fresh = fs.create(ROOT_INO, "fresh", &NewNode::File, 0o644).unwrap();
                     write_file(&mut fs, fresh, 64 * 1024);
@@ -1387,7 +1345,10 @@ fn an_unlink_whose_commit_fails_leaves_nothing_behind() {
         let unlinked = fs.unlink(ROOT_INO, "held", false);
         if unlinked.is_ok() {
             assert!(!fs.broken());
-            fs.release(held).unwrap();
+            // (The release's own commit may be the one that fails.)
+            if fs.release(held).is_err() {
+                assert!(fs.broken());
+            }
         } else {
             assert!(fs.broken());
         }
@@ -1404,43 +1365,42 @@ fn an_unlink_whose_commit_fails_leaves_nothing_behind() {
     }
 }
 
-/// A truncation that fails part way (a read of an indirect block fails) leaves the cache
-/// untrustworthy: the filesystem is broken and writes nothing, so the disk still has the
-/// file whole (no block free in the bitmap that the file still owns); the next mount goes
-/// on from there.
+/// A truncation that fails part way (a read of an indirect block fails) is undone whole:
+/// the file as it was, nothing of it committed, and the filesystem goes on (the next
+/// truncation goes through); e2fsck finds nothing after either.
 #[test]
-fn a_truncation_failing_part_way_writes_nothing() {
+fn a_truncation_failing_part_way_is_undone() {
     let mut fs = Ext2::mount_with_cache(mkfs("trunc-fail", 8 * 1024), 16 * 1024).unwrap();
     let f = fs.create(ROOT_INO, "big", &NewNode::File, 0o644).unwrap();
     write_file(&mut fs, f, 2 * MIB);
     fs.sync().unwrap();
     let base = take(fs).data;
-    let mut broke = 0;
+    let mut failed = 0;
     for n in 0..64 {
-        let disk = RamDisk { data: base.clone(), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None };
+        let disk = RamDisk { data: base.clone(), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false };
         let mut fs = Ext2::mount_with_cache(disk, 16 * 1024).unwrap();
+        let (_, _, free_before, _, _) = fs.usage();
         fs.device_mut().fail_read = Some(n);
         let result = fs.truncate(f, 1000);
-        if fs.broken() {
-            // Nothing more is written, and the disk has the file whole.
-            broke += 1;
-            assert!(result.is_err());
-            assert!(fs.write(f, 0, b"x").is_err() && fs.sync().is_err());
-            fs.device_mut().fail_read = None;
-            let mut fs = Ext2::mount(take(fs)).unwrap();
-            assert_eq!(fs.stat(f).unwrap().size, 2 * MIB as u64);
+        fs.device_mut().fail_read = None;
+        assert!(!fs.broken(), "read {n}");
+        if result.is_err() {
+            failed += 1;
+            assert_eq!(fs.stat(f).unwrap().size, 2 * MIB as u64, "read {n}");
+            assert_eq!(fs.usage().2, free_before, "read {n}");
             check_file(&mut fs, f, 2 * MIB);
+            let mut fs = Ext2::mount(take(fs)).unwrap();
+            assert_eq!(fs.stat(f).unwrap().size, 2 * MIB as u64, "read {n}");
+            check_file(&mut fs, f, 2 * MIB);
+            fs.truncate(f, 1000).unwrap();
             assert_eq!(fsck_findings(&take(fs), &format!("read {n} failing")), None);
         } else {
-            // It failed before it changed anything, or went through.
-            let size = if result.is_ok() { 1000 } else { 2 * MIB as u64 };
-            fs.device_mut().fail_read = None;
             let mut fs = Ext2::mount(take(fs)).unwrap();
-            assert_eq!(fs.stat(f).unwrap().size, size, "read {n}");
+            assert_eq!(fs.stat(f).unwrap().size, 1000, "read {n}");
             assert_eq!(fsck_findings(&take(fs), &format!("read {n} failing")), None);
         }
     }
-    assert!(broke > 0, "no read of the truncation failed");
+    assert!(failed > 0, "no read of the truncation failed");
 }
 
 /// `s_state` of the disk (the superblock at byte 1024, the field at 58).
@@ -1463,7 +1423,7 @@ fn the_state_says_in_use_until_let_go() {
     assert_eq!(state(fs.device()), 0);
     write_file(&mut fs, f, 64 * 1024);
     // A crash now: the disk is not clean, and e2fsck -p checks it.
-    let crashed = RamDisk { data: fs.device().data.clone(), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None };
+    let crashed = RamDisk { data: fs.device().data.clone(), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false };
     let path = scratch("state-crashed");
     std::fs::write(&path, &crashed.data).unwrap();
     let out = Command::new("e2fsck").arg("-p").arg(&path).output().expect("e2fsck not found");
@@ -1486,8 +1446,9 @@ fn the_state_says_in_use_until_let_go() {
     assert_eq!(state(fs.device()), 0);
 }
 
-/// A read-only disk (every write fails): in use, it serves reads and refuses changes, and
-/// nothing is ever written (not even the state).
+/// A read-only device: mounted read-only, it serves reads and refuses changes (EROFS), and
+/// nothing is ever written (not even the state, nor a journal). A disk whose writes fail
+/// (not saying it is read-only) serves reads too: its first change stops it.
 #[test]
 fn a_read_only_disk_serves_reads() {
     let mut fs = Ext2::mount(mkfs("readonly", 2 * 1024)).unwrap();
@@ -1495,17 +1456,48 @@ fn a_read_only_disk_serves_reads() {
     write_file(&mut fs, f, 64 * 1024);
     let mut disk = take(fs);
     let before = disk.data.clone();
-    disk.fail_writes(0, usize::MAX);
+    disk.read_only = true;
     let mut fs = Ext2::mount(disk).unwrap();
     fs.set_in_use(true).unwrap();
     assert_eq!(fs.lookup(ROOT_INO, "f"), Ok(f));
     check_file(&mut fs, f, 64 * 1024);
-    assert!(fs.create(ROOT_INO, "g", &NewNode::File, 0o644).is_err());
-    assert!(fs.write(f, 0, b"x").is_err());
-    // (Reads still work after a refused change.)
+    assert_eq!(fs.create(ROOT_INO, "g", &NewNode::File, 0o644), Err(ext2fs::errno::EROFS));
+    assert_eq!(fs.write(f, 0, b"x"), Err(ext2fs::errno::EROFS));
     check_file(&mut fs, f, 64 * 1024);
     let _ = fs.set_in_use(false);
-    assert!(take(fs).data == before, "a read-only disk was written");
+    let mut disk = take(fs);
+    assert!(disk.data == before, "a read-only disk was written");
+    // Writes failing: reads go on, the first change fails and stops the filesystem.
+    disk.read_only = false;
+    disk.fail_writes(0, usize::MAX);
+    let mut fs = Ext2::mount(disk).unwrap();
+    fs.set_in_use(true).unwrap();
+    assert!(fs.create(ROOT_INO, "g", &NewNode::File, 0o644).is_err());
+    assert!(fs.broken());
+    check_file(&mut fs, f, 64 * 1024);
+    assert!(take(fs).data == before, "a failing disk was written");
+}
+
+/// A plain ext2 disk (no journal) gets one at its first read-write mount (as `tune2fs
+/// -j`), which e2fsck accepts; mounted read-only it stays without.
+#[test]
+fn a_journal_is_added_at_the_first_mount() {
+    let mut disk = mkfs("add-journal", 4 * 1024);
+    let plain = disk.data.clone();
+    disk.read_only = true;
+    let fs = Ext2::mount(disk).unwrap();
+    assert!(take(fs).data == plain, "a read-only mount added a journal");
+    let mut fs = Ext2::mount(RamDisk { data: plain, counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false }).unwrap();
+    fs.create(ROOT_INO, "f", &NewNode::File, 0o644).unwrap();
+    let disk = take(fs);
+    let path = scratch("add-journal-dump");
+    std::fs::write(&path, &disk.data).unwrap();
+    let out = Command::new("dumpe2fs").arg("-h").arg(&path).output().expect("dumpe2fs not found");
+    std::fs::remove_file(&path).unwrap();
+    let said = String::from_utf8_lossy(&out.stdout);
+    assert!(said.contains("has_journal") && said.contains("Journal inode:            8"), "{said}");
+    assert!(!said.contains("needs_recovery"), "{said}");
+    fsck("add-journal", &disk);
 }
 
 /// A rename over an existing name takes the file into that name's entry in place (nothing
@@ -1541,9 +1533,8 @@ fn a_rename_over_a_name_needs_no_room() {
     fsck("rename-full", &take(fs));
 }
 
-/// A rename over a name that fails part way (a read fails at each point in turn) never
-/// leaves the moved file without a name: the new name is the moved file's or the old one's,
-/// and the old name, if it is still there, is the moved file's.
+/// A rename over a name that fails part way (a read fails at each point in turn) is undone
+/// whole: both names as they were.
 #[test]
 fn a_rename_failing_part_way_leaves_every_file_a_name() {
     let mut fs = Ext2::mount(mkfs("rename-fail", 2 * 1024)).unwrap();
@@ -1558,7 +1549,7 @@ fn a_rename_failing_part_way_leaves_every_file_a_name() {
     let base = take(fs).data;
     let mut failed = 0;
     for n in 0..40 {
-        let disk = RamDisk { data: base.clone(), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None };
+        let disk = RamDisk { data: base.clone(), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false };
         let mut fs = Ext2::mount_with_cache(disk, 2 * 1024).unwrap();
         fs.device_mut().fail_read = Some(n);
         let result = fs.rename(ROOT_INO, "moved", dir, "entry-045-with-some-length");
@@ -1566,6 +1557,11 @@ fn a_rename_failing_part_way_leaves_every_file_a_name() {
         failed += result.is_err() as u32;
         let new = fs.lookup(dir, "entry-045-with-some-length");
         let old = fs.lookup(ROOT_INO, "moved");
+        // Undone whole, or done whole.
+        match result {
+            Ok(_) => assert!(new == Ok(moved) && old.is_err(), "read {n}: {new:?} {old:?}"),
+            Err(_) => assert!(new == Ok(target) && old == Ok(moved), "read {n}: {new:?} {old:?}"),
+        }
         assert!(new == Ok(moved) || new == Ok(target), "read {n}: the new name is {new:?}");
         assert!(old.is_err() || old == Ok(moved), "read {n}: the old name is {old:?}");
         assert!(old == Ok(moved) || new == Ok(moved), "read {n}: the moved file has no name");
@@ -1599,6 +1595,16 @@ fn a_failed_commit_in_use_leaves_the_disk_not_clean() {
     assert_eq!(fs.set_in_use(false), Ok(false), "it was not clean at mount");
     assert_eq!(state(fs.device()), 0);
     fsck("state-fail", &take(fs));
+}
+
+/// The disk as a clean unmount would leave it now (committed, the journal emptied), the
+/// filesystem mounted on as before.
+fn take_copy(fs: &mut Ext2<RamDisk>) -> RamDisk {
+    fs.sync().unwrap();
+    let copy = fs.device().data.clone();
+    let d = RamDisk { data: copy, counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false };
+    // (Its journal is replayed by a mount, which empties it: what e2fsck is to see.)
+    take(Ext2::mount(d).unwrap())
 }
 
 /// Every name in the tree and how many name each inode (`.` and `..` aside).
@@ -1658,10 +1664,11 @@ fn dotdots_at_parents(fs: &mut Ext2<RamDisk>, what: &str) -> Vec<String> {
 }
 
 /// Renames of every kind (a file to a new name, over a file, a directory to another
-/// directory, over an empty directory), each step committed in order: a crash at any
-/// point, or a write or flush failing anywhere (one, or every one from some point on),
-/// never leaves a name more than its inode has links; and removing every name afterwards
-/// (which frees what loses its last link) never frees a named inode or a block in use.
+/// directory, over an empty directory), each one transaction: a crash at any point, or a
+/// write, flush or read failing anywhere (one, or every one from some point on), leaves
+/// (after the journal's replay) every rename done or not, and a filesystem e2fsck finds
+/// nothing wrong with; removing every name afterwards (which frees what loses its last
+/// link) leaves nothing either.
 #[test]
 fn renames_never_leave_more_names_than_links() {
     let mut fs = Ext2::mount(mkfs("rename-crash", 4 * 1024)).unwrap();
@@ -1704,7 +1711,7 @@ fn renames_never_leave_more_names_than_links() {
     };
     let mut problems = Vec::new();
     // How many writes and flushes the renames make.
-    let mut fs = Ext2::mount(RamDisk { data: base.clone(), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: Some(Vec::new()) }).unwrap();
+    let mut fs = Ext2::mount(RamDisk { data: base.clone(), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: Some(Vec::new()), read_only: false }).unwrap();
     sequence(&mut fs);
     problems.extend(names_within_links(&mut fs, "no failure"));
     let (writes, flushes) = (fs.device().counts.writes, fs.device().counts.flushes);
@@ -1714,12 +1721,13 @@ fn renames_never_leave_more_names_than_links() {
     let epochs = log.iter().filter(|e| matches!(e, Event::Flush)).count();
     for epoch in 0..=epochs {
         for seed in 0..8 {
-            let d = RamDisk { data: crash_image(&base, &log, epoch, seed), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None };
+            let d = RamDisk { data: crash_image(&base, &log, epoch, seed), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false };
             let mut fs = Ext2::mount(d).unwrap();
             fs.recover_orphans(|_| false).unwrap();
             let what = format!("crash at {epoch}/{seed}");
             problems.extend(names_within_links(&mut fs, &what));
-            // The renames again (one of a directory that broke off is finished).
+            problems.extend(fsck_findings(&take_copy(&mut fs), &what));
+            // The renames again (those done find nothing to do).
             sequence(&mut fs);
             problems.extend(names_within_links(&mut fs, &format!("{what}, again")));
             problems.extend(dotdots_at_parents(&mut fs, &format!("{what}, again")));
@@ -1731,7 +1739,7 @@ fn renames_never_leave_more_names_than_links() {
     // middle of a step (a small cache: every step reads), so that a step breaks off with
     // part of it in the cache (a name added, its directory's inode not written).
     let reads = {
-        let d = RamDisk { data: base.clone(), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None };
+        let d = RamDisk { data: base.clone(), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false };
         let mut fs = Ext2::mount_with_cache(d, 1024).unwrap();
         let before = fs.device().counts.reads;
         sequence(&mut fs);
@@ -1740,7 +1748,7 @@ fn renames_never_leave_more_names_than_links() {
     let modes = (0..writes).map(|n| (0, n)).chain((0..flushes).map(|n| (1, n))).chain((0..writes).map(|n| (2, n))).chain((0..reads).map(|n| (3, n)));
     for (mode, n) in modes {
         let what = format!("{} {n} failing", ["write", "flush", "every write from", "read"][mode]);
-        let mut d = RamDisk { data: base.clone(), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None };
+        let mut d = RamDisk { data: base.clone(), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false };
         match mode {
             0 => d.fail_writes(n, 1),
             1 => d.fail_flush = Some(n),
@@ -1755,19 +1763,26 @@ fn renames_never_leave_more_names_than_links() {
         fs.device_mut().fail_at = None;
         fs.device_mut().fail_read = None;
         if fs.broken() {
+            // The next mount (the journal's replay) goes on from the disk.
+            let mut d = fs.into_device();
+            d.fail_at = None;
+            let mut fs = Ext2::mount(d).unwrap();
+            fs.recover_orphans(|_| false).unwrap();
+            problems.extend(names_within_links(&mut fs, &format!("{what}, remounted")));
+            problems.extend(fsck_findings(&take_copy(&mut fs), &format!("{what}, remounted")));
+            sequence(&mut fs);
+            remove_all(&mut fs);
+            problems.extend(unsafe_findings(fs, &format!("{what}, remounted, all removed")));
             continue;
         }
         problems.extend(names_within_links(&mut fs, &what));
-        // The device works again: renames that broke off are finished by doing them again.
         sequence(&mut fs);
         problems.extend(names_within_links(&mut fs, &format!("{what}, again")));
         problems.extend(dotdots_at_parents(&mut fs, &format!("{what}, again")));
         remove_all(&mut fs);
-        for ino in fs.take_deferred() {
-            if fs.releasable(ino) {
-                let _ = fs.release(ino);
-            }
-        }
+        // (A release that failed left its inode on the orphan list: the boot's recovery
+        // frees it.)
+        fs.recover_orphans(|_| false).unwrap();
         problems.extend(unsafe_findings(fs, &format!("{what}, all removed")));
     }
     assert!(problems.is_empty(), "{:#?}", problems);
@@ -1789,7 +1804,7 @@ fn a_rename_between_hard_links_does_nothing() {
     assert!(ok, "debugfs");
     let data = std::fs::read(&path).unwrap();
     std::fs::remove_file(&path).unwrap();
-    let mut fs = Ext2::mount(RamDisk { data, counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None }).unwrap();
+    let mut fs = Ext2::mount(RamDisk { data, counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false }).unwrap();
     assert_eq!(fs.lookup(ROOT_INO, "g"), Ok(f));
     assert_eq!(fs.rename(ROOT_INO, "f", ROOT_INO, "g").unwrap(), Vec::<u32>::new());
     assert_eq!((fs.lookup(ROOT_INO, "f"), fs.lookup(ROOT_INO, "g")), (Ok(f), Ok(f)));
@@ -1801,44 +1816,355 @@ fn a_rename_between_hard_links_does_nothing() {
     fsck("hardlinks", &take(fs));
 }
 
-/// The flushes each kind of operation costs (printed: `--nocapture`), bounded.
+/// The flushes each kind of operation costs (printed: `--nocapture`): one transaction,
+/// one flush, whatever it does.
 #[test]
 fn what_operations_flush() {
     let mut fs = Ext2::mount(mkfs("flushes", 2 * 1024)).unwrap();
     let d = fs.create(ROOT_INO, "d", &NewNode::Dir, 0o755).unwrap();
-    let mut count = |fs: &mut Ext2<RamDisk>, what: &str, op: &mut dyn FnMut(&mut Ext2<RamDisk>)| {
+    let count = |fs: &mut Ext2<RamDisk>, what: &str, op: &mut dyn FnMut(&mut Ext2<RamDisk>)| {
         let before = fs.device().counts.flushes;
         op(fs);
         let n = fs.device().counts.flushes - before;
         eprintln!("    {what}: {n} flushes");
         n
     };
-    let mut total = 0;
-    total += count(&mut fs, "create", &mut |fs| {
+    assert_eq!(count(&mut fs, "create", &mut |fs| {
         fs.create(d, "f", &NewNode::File, 0o644).unwrap();
-    });
-    total += count(&mut fs, "mkdir", &mut |fs| {
+    }), 1);
+    assert_eq!(count(&mut fs, "mkdir", &mut |fs| {
         fs.create(d, "sub", &NewNode::Dir, 0o755).unwrap();
-    });
-    total += count(&mut fs, "rename to a new name", &mut |fs| {
+    }), 1);
+    assert_eq!(count(&mut fs, "rename to a new name", &mut |fs| {
         fs.rename(d, "f", d, "g").unwrap();
-    });
-    let other = fs.create(d, "h", &NewNode::File, 0o644).unwrap();
-    total += count(&mut fs, "rename over a name", &mut |fs| {
-        for ino in fs.rename(d, "g", d, "h").unwrap() {
+    }), 1);
+    fs.create(d, "h", &NewNode::File, 0o644).unwrap();
+    assert_eq!(count(&mut fs, "rename over a name (the replaced file freed at once)", &mut |fs| {
+        fs.rename_unless(d, "g", d, "h", |_| false).unwrap();
+    }), 1);
+    fs.create(d, "i", &NewNode::File, 0o644).unwrap();
+    assert_eq!(count(&mut fs, "rename over a name, then the replaced file's release", &mut |fs| {
+        for ino in fs.rename(d, "h", d, "i").unwrap() {
             fs.release(ino).unwrap();
         }
-    });
-    let _ = other;
-    total += count(&mut fs, "rename of a directory to another one", &mut |fs| {
+    }), 2);
+    assert_eq!(count(&mut fs, "rename of a directory to another one", &mut |fs| {
         fs.rename(d, "sub", ROOT_INO, "sub").unwrap();
-    });
-    total += count(&mut fs, "unlink (freed at once)", &mut |fs| {
-        fs.unlink_unless(d, "h", false, |_| false).unwrap();
-    });
-    total += count(&mut fs, "rmdir (freed at once)", &mut |fs| {
+    }), 1);
+    assert_eq!(count(&mut fs, "unlink (freed at once)", &mut |fs| {
+        fs.unlink_unless(d, "i", false, |_| false).unwrap();
+    }), 1);
+    assert_eq!(count(&mut fs, "rmdir (freed at once)", &mut |fs| {
         fs.unlink_unless(ROOT_INO, "sub", true, |_| false).unwrap();
-    });
-    assert!(total < 60, "{total} flushes");
+    }), 1);
+    // Batched (diskfs's group commit): one flush for all.
+    fs.batch(true);
+    assert_eq!(count(&mut fs, "a batch of 20 creations and removals", &mut |fs| {
+        for i in 0..10 {
+            fs.create(d, &format!("b{i}"), &NewNode::File, 0o644).unwrap();
+        }
+        for i in 0..10 {
+            fs.unlink_unless(d, &format!("b{i}"), false, |_| false).unwrap();
+        }
+        fs.sync().unwrap();
+    }), 1);
+    fs.batch(false);
     fsck("flushes", &take(fs));
+}
+
+/// A fresh disk made with a journal by mke2fs (as the builder's data disk).
+fn mkfs_journal(name: &str, kib: usize) -> RamDisk {
+    let path = scratch(name);
+    let ok = Command::new("mke2fs")
+        .args(["-q", "-t", "ext2", "-b", "1024", "-I", "128", "-O", "none,has_journal,filetype,sparse_super,large_file", "-F"])
+        .arg(&path)
+        .arg(kib.to_string())
+        .env_remove("SOURCE_DATE_EPOCH")
+        .status()
+        .expect("mke2fs not found (run under nix-shell -p e2fsprogs)")
+        .success();
+    assert!(ok, "mke2fs failed");
+    let data = std::fs::read(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    RamDisk { data, counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false }
+}
+
+/// Runs debugfs (`-w`) with `commands` on a copy of `data`; the copy afterwards, and what
+/// debugfs said.
+fn debugfs(data: &[u8], name: &str, commands: &str) -> (Vec<u8>, String) {
+    let path = scratch(name);
+    std::fs::write(&path, data).unwrap();
+    let mut child = Command::new("debugfs")
+        .args(["-w", "-f", "-"])
+        .arg(&path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("debugfs not found");
+    use std::io::Write;
+    child.stdin.take().unwrap().write_all(commands.as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    let data = std::fs::read(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    (data, String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr))
+}
+
+/// The disk as it is (journal and all), not unmounted: what a crash now leaves.
+fn crashed(fs: &Ext2<RamDisk>) -> RamDisk {
+    RamDisk { data: fs.device().data.clone(), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false }
+}
+
+/// Our journal is ext3's: debugfs's `logdump` reads its transactions, e2fsck replays a
+/// crashed disk's journal (`-fy`) and then finds nothing, and the journal e2fsprogs writes
+/// (debugfs's `journal_write`, with a revoke) is replayed by our mount as ext3 would.
+#[test]
+fn the_journal_is_ext3s() {
+    let mut fs = Ext2::mount(mkfs_journal("ext3", 8 * 1024)).unwrap();
+    let d = fs.create(ROOT_INO, "d", &NewNode::Dir, 0o755).unwrap();
+    let f = fs.create(d, "f", &NewNode::File, 0o644).unwrap();
+    write_file(&mut fs, f, 256 * 1024);
+    fs.rename(d, "f", ROOT_INO, "g").unwrap();
+    fs.unlink_unless(ROOT_INO, "d", true, |_| false).unwrap();
+    let disk = crashed(&fs);
+    let (_, said) = debugfs(&disk.data, "ext3-logdump", "logdump\n");
+    assert!(said.contains("descriptor block") && said.contains("commit block") && !said.contains("Invalid"), "{said}");
+    // e2fsck replays it and then finds the filesystem whole.
+    let path = scratch("ext3-e2fsck");
+    std::fs::write(&path, &disk.data).unwrap();
+    let out = Command::new("e2fsck").arg("-fy").arg(&path).output().unwrap();
+    let said = String::from_utf8_lossy(&out.stdout).to_string();
+    let replayed = RamDisk { data: std::fs::read(&path).unwrap(), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false };
+    std::fs::remove_file(&path).unwrap();
+    assert!(said.contains("recovering journal"), "{said}");
+    assert_eq!(fsck_findings(&replayed, "replayed by e2fsck"), None);
+    let mut fs2 = Ext2::mount(replayed).unwrap();
+    check_file(&mut fs2, f, 256 * 1024);
+    assert_eq!(fs2.lookup(ROOT_INO, "g"), Ok(f));
+    drop(fs);
+
+    // A transaction e2fsprogs wrote: block 3000 replayed home; one whose copy a newer
+    // transaction revokes: not.
+    let base = mkfs_journal("ext3-foreign", 8 * 1024).data;
+    let block: Vec<u8> = (0..1024).map(|i| (i * 7 + 3) as u8).collect();
+    let other: Vec<u8> = (0..1024).map(|i| (i * 5 + 1) as u8).collect();
+    let (a, b) = (scratch("ext3-block-a"), scratch("ext3-block-b"));
+    std::fs::write(&a, &block).unwrap();
+    std::fs::write(&b, &other).unwrap();
+    let commands = format!("jo\njw -b 3000 {}\njc\njo\njw -b 3001 {}\njc\njo\njw -r 3001\njc\n", a.display(), b.display());
+    let (data, said) = debugfs(&base, "ext3-foreign-img", &commands);
+    std::fs::remove_file(&a).unwrap();
+    std::fs::remove_file(&b).unwrap();
+    let (_, dump) = debugfs(&data, "ext3-foreign-dump", "logdump\n");
+    assert!(dump.contains("revoke table"), "{said}{dump}");
+    // Read-only, a journal that needs recovery cannot be mounted.
+    let disk = RamDisk { data: data.clone(), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: true };
+    assert!(Ext2::mount(disk).is_err());
+    let disk = RamDisk { data, counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false };
+    let fs = Ext2::mount(disk).unwrap();
+    let disk = take(fs);
+    assert!(disk.data[3000 * 1024..3001 * 1024] == block[..], "the transaction was not replayed");
+    assert!(disk.data[3001 * 1024..3002 * 1024] != other[..], "a revoked copy was replayed");
+    assert_eq!(fsck_findings(&disk, "replayed"), None);
+}
+
+/// A tiny xorshift generator for the fuzz tests.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n.max(1)
+    }
+}
+
+/// The journal superblock's fields are checked before anything is read by them.
+#[test]
+fn journal_superblocks_are_checked() {
+    use ext2fs::journal::Superblock;
+    let good = Superblock::new(1024, 1024, [7; 16]).encode();
+    assert!(Superblock::parse(&good).is_ok());
+    let field = |at: usize, v: u32| {
+        let mut b = good.clone();
+        b[at..at + 4].copy_from_slice(&v.to_be_bytes());
+        Superblock::parse(&b)
+    };
+    // Block size, length, first block, start, magic, type, features.
+    for (at, v) in [(12, 4096), (16, 100), (16, 0), (20, 0), (20, 1024), (28, 1024), (28, u32::MAX), (0, 0), (4, 3), (40, 0x10), (44, 1)] {
+        assert!(field(at, v).is_err(), "field {at} = {v:#x} accepted");
+    }
+    assert!(Superblock::parse(&good[..512]).is_err());
+}
+
+/// A journal as an attacker writes it: random blocks with valid headers (no checksums to
+/// stop the scan), any counts, block numbers, flags. Recovery never panics, reads each log
+/// block a bounded number of times, writes only the filesystem's blocks, and never more
+/// copies than the log has blocks.
+#[test]
+fn hostile_logs_are_scanned_safely() {
+    use ext2fs::journal::{recover, Log, Superblock};
+    struct VecLog {
+        blocks: Vec<Vec<u8>>,
+        reads: usize,
+        writes: usize,
+        fs_blocks: u32,
+    }
+    impl Log for VecLog {
+        fn read(&mut self, n: u32) -> Result<Vec<u8>, ()> {
+            self.reads += 1;
+            self.blocks.get(n as usize).cloned().ok_or(())
+        }
+        fn write_home(&mut self, home: u32, data: &[u8]) -> Result<(), ()> {
+            assert!(home < self.fs_blocks, "a block beyond the filesystem written");
+            assert_eq!(data.len(), 1024);
+            self.writes += 1;
+            Ok(())
+        }
+    }
+    let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+    for round in 0..400 {
+        let len = 1024u32;
+        let mut sb = Superblock::new(1024, len, [1; 16]);
+        sb.compat = if round % 2 == 0 { 0 } else { ext2fs::journal::COMPAT_CHECKSUM };
+        sb.start = 1 + rng.below(len as u64 - 1) as u32;
+        sb.sequence = rng.next() as u32;
+        let mut blocks = vec![vec![0u8; 1024]; len as usize];
+        let mut seq = sb.sequence;
+        for b in blocks.iter_mut().skip(1) {
+            for x in b.iter_mut() {
+                *x = rng.next() as u8;
+            }
+            if rng.below(4) != 0 {
+                b[0..4].copy_from_slice(&0xC03B_3998u32.to_be_bytes());
+                b[4..8].copy_from_slice(&(1 + rng.below(5) as u32).to_be_bytes());
+                b[8..12].copy_from_slice(&seq.to_be_bytes());
+                if rng.below(3) == 0 {
+                    seq = seq.wrapping_add(1);
+                }
+                // Revoke counts and tag flags as they come; sometimes the last tag soon.
+                if rng.below(2) == 0 {
+                    b[12..16].copy_from_slice(&(rng.below(2048) as u32).to_be_bytes());
+                }
+            }
+        }
+        let fs_blocks = 1 + rng.below(1 << 20) as u32;
+        let mut log = VecLog { blocks, reads: 0, writes: 0, fs_blocks };
+        let result = recover(&sb, fs_blocks, &mut log);
+        // (At most every block for the scan, every block again for checksums, and every
+        // copy once for the replay.)
+        assert!(log.reads <= 3 * len as usize, "round {round}: {} reads", log.reads);
+        assert!(log.writes <= len as usize, "round {round}: {} writes", log.writes);
+        if let Ok(rec) = result {
+            assert_eq!(rec.replayed as usize, log.writes);
+        }
+    }
+}
+
+/// A crashed disk whose journal was corrupted at random (its superblock and log blocks):
+/// mounting it never panics or hangs; it mounts or is refused.
+#[test]
+fn corrupted_journals_never_panic() {
+    let mut fs = Ext2::mount(mkfs_journal("corrupt-journal", 4 * 1024)).unwrap();
+    for i in 0..8 {
+        let f = fs.create(ROOT_INO, &format!("f{i}"), &NewNode::File, 0o644).unwrap();
+        write_file(&mut fs, f, 32 * 1024);
+        if i % 3 == 0 {
+            fs.unlink_unless(ROOT_INO, &format!("f{i}"), false, |_| false).unwrap();
+        }
+    }
+    let image = crashed(&fs).data;
+    // The journal's blocks: those that start with its magic number.
+    let magic = 0xC03B_3998u32.to_be_bytes();
+    let marked: Vec<usize> = (0..image.len() / 1024).filter(|&b| image[b * 1024..b * 1024 + 4] == magic).collect();
+    assert!(marked.len() > 3, "no journal found");
+    let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+    let (mut mounted, mut refused) = (0, 0);
+    for _ in 0..300 {
+        let mut data = image.clone();
+        for _ in 0..1 + rng.below(4) {
+            let b = marked[rng.below(marked.len() as u64) as usize];
+            // A word at one of the fields' places, or anywhere.
+            let at = if rng.below(2) == 0 { [4, 8, 12, 16, 20, 24, 28, 36, 40][rng.below(9) as usize] } else { rng.below(1020) as usize & !3 };
+            let v = match rng.below(4) {
+                0 => 0,
+                1 => u32::MAX,
+                2 => rng.below(4096) as u32,
+                _ => rng.next() as u32,
+            };
+            data[b * 1024 + at..b * 1024 + at + 4].copy_from_slice(&v.to_be_bytes());
+        }
+        let disk = RamDisk { data, counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false };
+        match Ext2::mount(disk) {
+            Ok(fs) => {
+                mounted += 1;
+                drop(take(fs));
+            }
+            Err(_) => refused += 1,
+        }
+    }
+    assert!(mounted > 0 && refused > 0, "{mounted} mounted, {refused} refused");
+}
+
+/// Long operations (a truncation, a removal of a big file, a long write, a ring write)
+/// commit part way when their transaction reaches its limit (a small one here): a crash
+/// at any point leaves, after the journal's replay and recovery (which finishes an
+/// interrupted cut), each file whole in its old or new size with its data, and a
+/// filesystem e2fsck finds nothing wrong with.
+#[test]
+fn long_operations_commit_part_way_and_crashes_finish_them() {
+    let mut fs = Ext2::mount(mkfs_journal("long-ops", 8 * 1024)).unwrap();
+    let big = fs.create(ROOT_INO, "big", &NewNode::File, 0o644).unwrap();
+    write_file(&mut fs, big, 320 * 1024);
+    let gone = fs.create(ROOT_INO, "gone", &NewNode::File, 0o644).unwrap();
+    write_file(&mut fs, gone, 160 * 1024);
+    let w = fs.create(ROOT_INO, "w", &NewNode::File, 0o644).unwrap();
+    let r = fs.create(ROOT_INO, "r", &NewNode::File, 0o644).unwrap();
+    let mut disk = take(fs);
+    let base = disk.data.clone();
+    disk.log = Some(Vec::new());
+    let mut fs = Ext2::mount(disk).unwrap();
+    fs.limit_transactions(4);
+    let before = fs.device().counts.flushes;
+    fs.truncate(big, 100_000).unwrap();
+    fs.unlink_unless(ROOT_INO, "gone", false, |_| false).unwrap();
+    let data: Vec<u8> = (0..160 * 1024).map(pattern).collect();
+    assert_eq!(fs.write(w, 0, &data).unwrap(), data.len());
+    ring_write(&mut fs, r, 0, &data);
+    fs.sync().unwrap();
+    assert!(fs.device().counts.flushes - before > 20, "the operations did not commit part way");
+    let mut disk = take(fs);
+    let log = disk.log.take().unwrap();
+    assert_eq!(fsck_findings(&disk, "long operations"), None);
+    let epochs = log.iter().filter(|e| matches!(e, Event::Flush)).count();
+    let mut problems = Vec::new();
+    for epoch in 0..=epochs {
+        for seed in 0..2 {
+            let d = RamDisk { data: crash_image(&base, &log, epoch, seed), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false };
+            let mut fs = Ext2::mount(d).unwrap();
+            fs.recover_orphans(|_| false).unwrap();
+            let what = format!("crash at {epoch}/{seed}");
+            let size = fs.stat(big).unwrap().size;
+            if size != 100_000 && size != 320 * 1024 {
+                problems.push(format!("{what}: big is {size} bytes"));
+            }
+            let mut buf = vec![0u8; 100_000];
+            fs.read(big, 0, &mut buf).unwrap();
+            if buf.iter().enumerate().any(|(i, &b)| b != pattern(i)) {
+                problems.push(format!("{what}: big's data changed"));
+            }
+            // The removed file whole or gone.
+            match fs.lookup(ROOT_INO, "gone") {
+                Ok(_) => check_file(&mut fs, gone, 160 * 1024),
+                Err(_) => assert!(fs.check(gone).is_err(), "{what}: gone's inode left"),
+            }
+            problems.extend(unsafe_findings(fs, &what));
+        }
+    }
+    assert!(problems.is_empty(), "{:#?}", problems);
 }
