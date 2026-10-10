@@ -350,9 +350,10 @@ pub const TEST_PAGED_FAIL: u64 = 1508;
 /// memory for every thread of the instance: each page not committed yet is
 /// committed (from the instance's heap reserve, up to 2 MiB of commitment
 /// it holds beyond its mapped pages, then against the commit limit) and
-/// mapped zeroed; returns how many were. ENOMEM when the commit
-/// limit or memory is exhausted (nothing waits for write-back: the caller
-/// may hold locks the pager needs); some pages of the range may be
+/// mapped zeroed (its frame a free one or one clean cache pages give
+/// back); returns how many were. ENOMEM at once when the commit limit or
+/// memory is exhausted (nothing waits, for write-back or reclaim: the
+/// caller may hold locks the pager needs, or be the pager); some pages of the range may be
 /// committed then, and the caller decommits the range to know its state.
 /// A page is committed exactly while it is mapped: the kernel never commits
 /// one by itself, and a server access to a page that is not committed is

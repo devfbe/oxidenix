@@ -332,6 +332,17 @@ pub fn commit(pages: u64) -> bool {
     true
 }
 
+/// Promises as many as `max` pages as fit now (none: no sign of pressure,
+/// nobody is asked to shrink); how many. For speculative reserves.
+pub fn commit_some(max: u64) -> u64 {
+    let unavailable = crate::fs::cache::unavailable_pages();
+    let mut a = ACCOUNT.lock();
+    let limit = COMMIT_LIMIT.load(core::sync::atomic::Ordering::Relaxed);
+    let n = limit.saturating_sub(a.committed.saturating_add(unavailable)).min(max);
+    a.committed += n;
+    n
+}
+
 /// A commit was refused at the limit: the background reclaimer asks the
 /// Linux servers to shrink (`linux::post_shrink`).
 static SHRINK_WANTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);

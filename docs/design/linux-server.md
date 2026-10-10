@@ -197,7 +197,9 @@ grow by 18 MiB that stayed committed for the tree's life (Committed_AS 30.4 → 
 server lays out itself. `shared_commit(addr, len)` commits each page of the range that is not
 (charged against the commit limit up front; ENOMEM at the limit, without waiting for
 write-back, since the caller may hold locks the pager needs) and maps it
-zeroed, waiting for reclaim for its frame as a fault does; `shared_decommit(addr, len)` unmaps
+zeroed, its frame a free one or one that dropping clean cache pages gives back, gotten before
+the area's lock is taken (never a wait: the server may be what writes back; ENOMEM at once,
+the heap's null); `shared_decommit(addr, len)` unmaps
 the range's pages from every view of the region, shoots their TLB entries down (in batches whose
 frames wait on the stack: nothing is allocated) and frees them with their commitment. A page is
 committed exactly while it is mapped, so the region needs no charge bits: the instance's

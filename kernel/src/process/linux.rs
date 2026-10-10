@@ -247,11 +247,11 @@ impl HeapArea {
         if want == 0 {
             return;
         }
-        if memory::commit(want) {
-            self.charge.grow_reserve(want, HEAP_RESERVE);
-        } else {
-            HEAP_POOL.give(want);
-        }
+        // As much as there is room for now; a top-up that finds none is
+        // no sign of pressure (it asks nobody to shrink).
+        let got = memory::commit_some(want);
+        HEAP_POOL.give(want - got);
+        self.charge.grow_reserve(got, HEAP_RESERVE);
     }
 }
 
@@ -259,20 +259,22 @@ impl HeapArea {
 /// stack until the shootdown).
 const UNMAP_BATCH: usize = 64;
 
-/// A frame for a page committed already (`SYS_SHARED_COMMIT`): zeroed,
-/// waiting for reclaim as a fault does (with no lock held but the heap
-/// area's, which reclaim never takes) until one comes or the thread dies.
-fn committed_frame() -> Result<PhysFrame, i64> {
-    let mut tries = 0;
-    loop {
-        if let Ok(frame) = zeroed_frame() {
-            return Ok(frame);
-        }
-        if !memory::reclaim_retry(1, &mut tries) {
-            return Err(ENOMEM);
-        }
+/// A zeroed frame for the server's heap (`SYS_SHARED_COMMIT`): a free one,
+/// else one clean cache pages give back (those used lately too); never a
+/// wait (for write-back, for an address space): the server may be the one
+/// to write back, and its heap fails fast (ENOMEM) rather than wait for
+/// itself.
+fn heap_frame() -> Result<PhysFrame, i64> {
+    if let Ok(frame) = zeroed_frame() {
+        return Ok(frame);
     }
+    memory::reclaim_forced(1);
+    zeroed_frame()
 }
+
+/// Pages `Instance::commit_heap` takes frames for at a time (on the stack,
+/// gotten before the heap area's lock).
+const COMMIT_BATCH: u64 = 64;
 
 /// The end of [addr, addr + len) if it is a page-aligned range of the
 /// heap area (`HEAP_BASE..THREADS_BASE`), else EINVAL.
@@ -769,14 +771,55 @@ impl Instance {
     }
 
     /// `SYS_SHARED_COMMIT`: commits and maps (zeroed) the pages of the
-    /// heap area's [addr, addr + len) that are not; returns how many.
+    /// heap area's [addr, addr + len) that are not; returns how many. In
+    /// batches of `COMMIT_BATCH` pages, each one's frames gotten first with
+    /// no lock held, then committed and mapped under the area's lock (never
+    /// a wait for memory under it: a decommit, which gives memory back,
+    /// never waits behind a commit that waits for memory).
     fn commit_heap(&self, addr: u64, len: u64) -> Result<u64, i64> {
         let end = heap_range(addr, len)?;
-        let mut area = self.heap.lock();
+        let mut total = 0;
+        let mut at = addr;
+        while at < end {
+            let to = (at + COMMIT_BATCH * PAGE).min(end);
+            total += self.commit_batch(at, to)?;
+            at = to;
+        }
+        Ok(total)
+    }
+
+    fn commit_batch(&self, from: u64, to: u64) -> Result<u64, i64> {
         let mapper = unsafe { OffsetPageTable::new(table_at(self.view), memory::phys_offset()) };
-        let missing = (addr..end).step_by(PAGE as usize).filter(|&at| mapper.translate_page(heap_page(at)).is_err()).count() as u64;
-        if missing == 0 {
+        let missing = || (from..to).step_by(PAGE as usize).filter(|&at| mapper.translate_page(heap_page(at)).is_err()).count();
+        let want = missing();
+        if want == 0 {
             return Ok(0);
+        }
+        let mut frames = [None::<PhysFrame>; COMMIT_BATCH as usize];
+        let free = |frames: &mut [Option<PhysFrame>]| {
+            memory::with_frames(|f| {
+                for frame in frames.iter_mut().filter_map(Option::take) {
+                    unsafe { f.deallocate_frame(frame) };
+                }
+            })
+        };
+        for slot in frames.iter_mut().take(want) {
+            match heap_frame() {
+                Ok(frame) => *slot = Some(frame),
+                Err(e) => {
+                    free(&mut frames);
+                    return Err(e);
+                }
+            }
+        }
+        let mut area = self.heap.lock();
+        // (Counted again: only the server's own concurrent calls on the
+        // same pages could change it, and they get no more frames.)
+        let missing = missing() as u64;
+        if missing > want as u64 {
+            drop(area);
+            free(&mut frames);
+            return Err(ENOMEM);
         }
         // From the instance's own reserve first (committed already), the
         // rest as any commitment.
@@ -784,7 +827,10 @@ impl Instance {
         if plan.fresh > 0 && !memory::commit(plan.fresh) {
             memory::uncommit(area.charge.abort(plan, &HEAP_POOL, HEAP_RESERVE));
             // Said once per instance (a tree can make it happen at will).
-            if !core::mem::replace(&mut area.refused_told, true) {
+            let tell = !core::mem::replace(&mut area.refused_told, true);
+            drop(area);
+            free(&mut frames);
+            if tell {
                 let (committed, limit) = memory::commit_stats();
                 crate::printkln!(
                     "[linux] instance {}: heap commit of {} pages refused beyond its reserve (committed {}, dirty or pinned {}, limit {})",
@@ -798,24 +844,28 @@ impl Instance {
             return Err(ENOMEM);
         }
         // Each page committed exactly while it is mapped: what is mapped
-        // when a frame or a table cannot be had stays (the caller
-        // decommits the range), the rest of the commitment goes back.
-        let mut mapped = 0;
+        // when a table cannot be had stays (the caller decommits the
+        // range), the rest of the commitment goes back.
+        let (mut done, mut next) = (0, 0);
         let mut result = Ok(missing);
-        for at in (addr..end).step_by(PAGE as usize) {
+        for at in (from..to).step_by(PAGE as usize) {
             if mapper.translate_page(heap_page(at)).is_ok() {
                 continue;
             }
-            if let Err(e) = committed_frame().and_then(|frame| self.map(at, frame, PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE)) {
+            let frame = frames[next].take().expect("a frame for each missing page");
+            next += 1;
+            if let Err(e) = self.map(at, frame, PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE) {
                 result = Err(e);
                 break;
             }
-            mapped += 1;
+            done += 1;
         }
-        memory::uncommit(area.charge.end(plan, mapped, &HEAP_POOL, HEAP_RESERVE));
+        memory::uncommit(area.charge.end(plan, done, &HEAP_POOL, HEAP_RESERVE));
         if result.is_ok() {
             area.grow_reserve();
         }
+        drop(area);
+        free(&mut frames);
         result
     }
 
