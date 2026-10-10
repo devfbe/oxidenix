@@ -89,7 +89,7 @@
 //! after taking completions (`fsring`, "Room").
 
 use crate::blk::{Kind, SubmitError, VirtioBlk, SECTOR_SIZE};
-use alloc::collections::{BTreeMap, VecDeque};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -387,6 +387,8 @@ pub struct Service {
     grace_until: u64,
     /// The inodes this diskfs created (no earlier one's client holds them).
     created: Bitmap,
+    /// Inodes whose free a failed commit kept back (`try_free` again).
+    unfreed: BTreeSet<u32>,
     /// The channel the next round starts with.
     rr: usize,
     /// Free scratch slots, and the scratch memory's device address.
@@ -434,6 +436,7 @@ impl Service {
             inherited,
             grace_until: oxrt::uptime_ms().saturating_add(RESTART_GRACE),
             created: Bitmap::new(inodes),
+            unfreed: BTreeSet::new(),
             rr: 0,
             bounce: (0..slots).rev().collect(),
             scratch,
@@ -861,8 +864,16 @@ impl Service {
         if self.in_use(ino) || fs.check(ino).is_err() {
             return;
         }
-        if fs.stat(ino).is_ok_and(|s| s.links == 0) {
-            let _ = fs.release(ino);
+        if fs.stat(ino).is_ok_and(|s| s.links == 0) && fs.release(ino).is_err() {
+            // (A commit failed: tried again with the next barrier.)
+            self.unfreed.insert(ino);
+        }
+    }
+
+    /// Frees again what a failed commit kept from being freed.
+    fn retry_frees(&mut self, fs: &mut Fs) {
+        for ino in core::mem::take(&mut self.unfreed) {
+            self.try_free(fs, ino);
         }
     }
 
@@ -884,7 +895,8 @@ impl Service {
         if !rang && !expired {
             return;
         }
-        let waiting = oxrt::chan_predecessors().unwrap_or(0);
+        // (Not known: waited for until the grace is over.)
+        let waiting = oxrt::chan_predecessors().unwrap_or(u64::MAX);
         if waiting > 0 && !expired {
             return;
         }
@@ -1109,6 +1121,9 @@ impl Service {
     // ------------------------------------------------------------ barriers
 
     fn run_barrier(&mut self, fs: &mut Fs, c: usize, d: &Desc) {
+        if !self.unfreed.is_empty() {
+            self.retry_frees(fs);
+        }
         let (status, values) = match Request::decode(d).and_then(|r| self.execute(fs, c, r)) {
             Ok((status, values)) => (status, values),
             Err(e) => (-e, [0; 4]),
@@ -1133,9 +1148,8 @@ impl Service {
 
     /// An unlink's or rename's completion: the inode whose last link went
     /// and that someone uses (0: none), and its generation.
-    fn gone(fs: &mut Fs, gone: &[u32]) -> Result<(i64, [u64; 4]), i64> {
-        let Some(&ino) = gone.first() else { return Ok((0, [0; 4])) };
-        let generation = fs.stat(ino)?.generation;
+    fn gone(gone: &[(u32, u32)]) -> Result<(i64, [u64; 4]), i64> {
+        let Some(&(ino, generation)) = gone.first() else { return Ok((0, [0; 4])) };
         Ok((0, [ino as u64, generation as u64, 0, 0]))
     }
 
@@ -1205,7 +1219,7 @@ impl Service {
                 // An inode no one may use is freed at once; one in use is orphaned, and
                 // the client gets it to hold and release.
                 let gone = fs.unlink_unless(dir, &name, is_dir, |ino| self.in_use(ino))?;
-                Self::gone(fs, &gone)
+                Self::gone(&gone)
             }
             Request::Rename { from, name, to, new_name } => {
                 let from = Self::node(fs, from)?;
@@ -1213,7 +1227,7 @@ impl Service {
                 Self::live_dir(fs, to)?;
                 let (old, new) = (self.name(c, &name)?, self.name(c, &new_name)?);
                 let gone = fs.rename_unless(from, &old, to, &new, |ino| self.in_use(ino))?;
-                Self::gone(fs, &gone)
+                Self::gone(&gone)
             }
             Request::Truncate { ino, len } => {
                 let ino = Self::node(fs, ino)?;

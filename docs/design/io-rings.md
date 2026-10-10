@@ -314,7 +314,11 @@ restart of diskfs, say). The root's handle comes from `ROOT`.
 inode whose last link went is freed when no client holds it, so one client never frees what
 another uses; while held it is on ext2's orphan list (written in an order a crash cannot hurt:
 the name's removal, the inode, the list's head; off the list before it is freed), so a crash
-leaves nothing allocated for good: the first diskfs after boot frees the list. (Until step 4
+leaves nothing allocated for good: the first diskfs after boot frees the list. A commit that
+fails is retried alone before anything else changes, and a sequence of these steps ends at its
+first failed commit (the inode then waits, held, for its release; never freed out of order); a
+free that fails half way leaves the cache untrustworthy, and diskfs exits to be restarted from
+the disk's state (`ext2fs`, "Failed commits"). New inodes get random generations. (Until step 4
 the kernel's IPC client held inodes too; it is gone.)
 
 **Restarts of diskfs.** Holds are diskfs's memory, but the clients' open files outlive a diskfs

@@ -66,7 +66,8 @@ fn main(args: Vec<&'static str>) -> i32 {
     };
     // What a crash left on the orphan list goes now; what a diskfs that died left there
     // waits for its clients (`service`, "Restarts").
-    let inherited = oxrt::chan_predecessors().unwrap_or(0);
+    // (Not known: assumed, the grace bounds the wait.)
+    let inherited = oxrt::chan_predecessors().unwrap_or(1);
     if inherited == 0 {
         match fs.recover_orphans(|_| false) {
             Ok(0) => {}
@@ -120,5 +121,11 @@ fn main(args: Vec<&'static str>) -> i32 {
             _ => {}
         }
         rings.run(&mut fs);
+        if fs.broken() {
+            // The cache holds what must never reach the disk: the kernel starts diskfs
+            // again, which goes on from the disk's state (its clients name what they hold).
+            println!("diskfs: an operation failed part way through a free; starting again");
+            return 1;
+        }
     }
 }
