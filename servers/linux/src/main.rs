@@ -367,7 +367,7 @@ fn pager() -> ! {
                 // the worker has closed the ended processes' tables first.
                 fdtable::settle();
                 netclient::settle();
-                datafs::closing();
+                datafs::ending();
                 continue;
             }
             EVENT_MKWRITE => {
@@ -392,8 +392,7 @@ fn pager() -> ! {
             }
             EVENT_SYNC => {
                 // Another instance's sync(2), or a reboot.
-                datafs::closing();
-                syscall(SYS_SYNC_DONE, [event.a, 0, 0, 0, 0, 0]);
+                datafs::sync_event(event.a);
                 continue;
             }
             _ => {}

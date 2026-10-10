@@ -555,12 +555,19 @@ pub const REVOKE_DRAINING: u64 = 1;
 /// cached memory: clean ones nothing pins or maps are reclaimed when
 /// memory is short.
 pub const SYS_MO_CREATE_CACHED: u64 = 1076;
-/// `mo_filled(handle, offset, pages, ok)`: the pending pages among `pages`
-/// (at most 256) from `offset` hold the file's data now (`ok` 1), or could
-/// not be read (0: they go, and whoever waits for them or for missing pages
-/// of the range now gets an error, SIGBUS for a mapping; nothing is kept
-/// for later accesses, which ask again). Wakes the waiters.
+/// `mo_filled(handle, offset, pages, outcome)`: the pending pages among
+/// `pages` (at most 256) from `offset` hold the file's data now
+/// (`MO_FILLED_OK`), could not be read (`MO_FILLED_FAILED`: they go, and
+/// whoever waits for them or for missing pages of the range now gets an
+/// error, SIGBUS for a mapping; nothing is kept for later accesses, which
+/// ask again), or were not read for a reason that says nothing about the
+/// file (`MO_FILLED_AGAIN`, the filesystem's server died: they go, and
+/// whoever waits for them asks again). Wakes the waiters. EINVAL for another
+/// outcome.
 pub const SYS_MO_FILLED: u64 = 1077;
+pub const MO_FILLED_FAILED: u64 = 0;
+pub const MO_FILLED_OK: u64 = 1;
+pub const MO_FILLED_AGAIN: u64 = 2;
 /// `mo_redirty(handle, offset, pages)`: marks the present pages among
 /// `pages` from `offset` dirty again (their write-back failed).
 pub const SYS_MO_REDIRTY: u64 = 1078;

@@ -362,8 +362,10 @@ pages and dirty marks the kernel keeps and whose data the server moves:
   there, `EAGAIN` if nothing was done). The server grants the first run of missing pages of a
   window (`grant(.., GRANT_WRITE | GRANT_FILL, out)`: at most 256, the run's first page, its
   length and the file's size at `out`): they become **pending**, zeroed frames pinned for the grant that nobody reads,
-  maps or writes. diskfs reads into them by DMA; `mo_filled(handle, offset, pages, ok)` (1077)
-  makes them the file's pages or drops them (the threads waiting for them get `EIO`, a mapping
+  maps or writes. diskfs reads into them by DMA; `mo_filled(handle, offset, pages, outcome)`
+  (1077) makes them the file's pages, or drops them as missing again when diskfs died under the
+  read (`MO_FILLED_AGAIN`: their waiters ask again, and the next channel fills them), or drops
+  them as failed (the threads waiting for them get `EIO`, a mapping
   `SIGBUS`: a faulting thread is among a page's waiters before it asks, so the answer to its own
   request cannot pass it by; nothing is recorded where nobody waits, so a later access asks
   again) and wakes the

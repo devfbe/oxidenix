@@ -391,6 +391,18 @@ impl State {
     }
 }
 
+/// What became of pages being filled (`PageCache::filled`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Filled {
+    /// They hold the file's data.
+    Ok,
+    /// They could not be read: whoever waits for them fails.
+    Failed,
+    /// They were not read for a reason that says nothing about the file (the
+    /// filesystem's server died): missing again, their waiters ask again.
+    Again,
+}
+
 /// Whether a change of a cache's state (`State::fail_waiters`,
 /// `fail_backing`, `changed`) concerns threads waiting for its pages:
 /// they must be woken (`PageCache::wake`) once the state is unlocked, or a
@@ -1481,7 +1493,8 @@ impl PageCache {
     /// (whoever waits for them gets EIO, a later access asks again; so a
     /// pager that cannot even start a fill answers). Present pages are
     /// left alone. Wakes the waiters.
-    pub fn filled(&self, first: u64, count: u64, ok: bool) -> Result<(), i64> {
+    pub fn filled(&self, first: u64, count: u64, outcome: Filled) -> Result<(), i64> {
+        let ok = outcome == Filled::Ok;
         let Store::Cached { .. } = &self.store else { return Err(EINVAL) };
         if count > MAX_RUN {
             return Err(EINVAL);
@@ -1505,8 +1518,13 @@ impl PageCache {
                 }
             }
             st.charged -= gone.len() as u64;
-            // Missing pages fail only for whoever waits for them now.
-            if ok { Wake(false) } else { st.fail_waiters(first, end) }
+            // Missing pages fail only for whoever waits for them now; pages to be read
+            // again are only missing: their waiters ask again.
+            match outcome {
+                Filled::Ok => Wake(false),
+                Filled::Failed => st.fail_waiters(first, end),
+                Filled::Again => st.changed(first, end),
+            }
         };
         self.uncharge(gone.len() as u64);
         free_frames(gone);

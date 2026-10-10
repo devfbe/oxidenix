@@ -697,6 +697,58 @@ static void orphan_survives_diskfs_restart(void) {
     check("... and its blocks come back after the last close", freed);
 }
 
+/* A mapping's faults while diskfs is away: the pager never connects to diskfs itself (it
+ * must stay free to bring pages); the worker does, and then brings the pages the pager
+ * left to it, and backs the stores. So a fault on a page not in the cache right after
+ * diskfs died, and a store into a clean page, both go through, with the right data on the
+ * device afterwards. (The file's pages leave the cache first: its inode is pushed out by
+ * more files than the server keeps unused.) */
+static void mapping_across_diskfs_restart(void) {
+    const char *path = "/data/datatest.mapped";
+    enum { PAGES = 64, PUSH = 600 };
+    unlink(path);
+    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    static char page[PG];
+    for (int i = 0; i < PAGES; i++) {
+        for (int j = 0; j < PG; j++) page[j] = pattern((long)i * PG + j, 11);
+        write(fd, page, PG);
+    }
+    fsync(fd);
+    close(fd);
+    char name[64];
+    mkdir("/data/datatest.push", 0755);
+    for (int i = 0; i < PUSH; i++) {
+        snprintf(name, sizeof name, "/data/datatest.push/%d", i);
+        close(open(name, O_WRONLY | O_CREAT, 0644));
+    }
+    fd = open(path, O_RDWR);
+    char *map = mmap(NULL, PAGES * PG, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    long killed = syscall(TEST_KILL_SERVER, "diskfs");
+    volatile int faulted = 0, right = map != MAP_FAILED;
+    got = 0;
+    if (right && sigsetjmp(env, 1) == 0) {
+        /* Read faults first (pages not in the cache), then a store into a clean page. */
+        for (int i = 0; i < PAGES; i += 7)
+            for (int j = 0; j < PG; j += 512)
+                if ((unsigned char)map[(long)i * PG + j] != pattern((long)i * PG + j, 11)) right = 0;
+        memcpy(map + 3 * PG, "stored while diskfs was away", 28);
+    } else {
+        faulted = 1;
+    }
+    int stored = !faulted && right && msync(map, PAGES * PG, MS_SYNC) == 0 && on_disk(path, 3 * PG, page, PG) == PG &&
+                 memcmp(page, "stored while diskfs was away", 28) == 0;
+    if (map != MAP_FAILED) munmap(map, PAGES * PG);
+    close(fd);
+    for (int i = 0; i < PUSH; i++) {
+        snprintf(name, sizeof name, "/data/datatest.push/%d", i);
+        unlink(name);
+    }
+    rmdir("/data/datatest.push");
+    unlink(path);
+    check("a mapping's faults right after diskfs died: pages brought, no SIGBUS", killed == 0 && !faulted && right);
+    check("... and a store into a clean page backed, on the device after msync", stored);
+}
+
 int main(void) {
     struct sigaction sa = {0};
     sa.sa_handler = on_fault;
@@ -716,6 +768,7 @@ int main(void) {
     read_with_dirty_memory();
     full_disk();
     orphan_survives_diskfs_restart();
+    mapping_across_diskfs_restart();
     printf("%s\n", failures ? "datatest: FAILED" : "datatest: all passed");
     return failures != 0;
 }
