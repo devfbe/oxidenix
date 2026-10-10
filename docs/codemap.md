@@ -365,3 +365,4 @@ kernel that handle them.
 - `docs/io-path-audit.md` I/O path audit
 - `docs/superpowers/plans/2026-10-06-rust-kernel.md` Rust Kernel Implementation Plan
 - `docs/superpowers/specs/2026-10-06-rust-kernel-design.md` Rust Kernel — Design Spec
+- `docs/todo.md` Open items
