@@ -1479,12 +1479,12 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
                     // chunk after the first and after the last.
                     let n = super::uaccess::write_from_user(buf, len, |chunk, done| {
                         if done > 0 && cache.is_cached() {
-                            crate::fs::cache::balance_dirty(Some(&cache));
+                            crate::fs::cache::balance_dirty(&cache);
                         }
                         cache.write_with(offset + done, chunk, fill, backing)
                     });
                     if cache.is_cached() {
-                        crate::fs::cache::balance_dirty(Some(&cache));
+                        crate::fs::cache::balance_dirty(&cache);
                     }
                     Ok(n? as i64)
                 }
@@ -1894,7 +1894,7 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
                     // A file object that cannot grow further (ENOSPC):
                     // what was written counts.
                     if cache.is_cached() && done > 0 && done % (64 * PAGE) == 0 {
-                        crate::fs::cache::balance_dirty(Some(&cache));
+                        crate::fs::cache::balance_dirty(&cache);
                     }
                     match cache.write(offset + done, &chunk[..n]) {
                         Ok(w) if w < n => return Ok((done + w as u64) as i64),

@@ -122,10 +122,14 @@ space, and the walks (truncation, write-back) drop it before they lock a mapper.
   it looks at the entries: an entry holding the frame can only map this page.
 - **The commit guarantee.** Cache pages reclaim cannot drop now, dirty and pinned ones
   (`cache::unavailable_pages`), count against the limit as taken: `memory::commit` refuses
-  what would need them, and a store that makes committed memory and them exceed the limit
-  waits (killably, asking the pagers again every 100 ms) until write-back made room
+  what would need them, and a store that dirties a disk file's page (a `write`, a store
+  through a shared mapping) and makes committed memory and them exceed the limit waits
+  (killably, asking the pagers again every 100 ms) until write-back made room
   (`balance_dirty`, beside the dirty ratios: write-back asked above a tenth of the commit
-  limit, storing threads waiting up to a second above a fifth). Every other cache page can be
+  limit, storing threads waiting up to a second above a fifth). Only such a store, as Linux's
+  `balance_dirty_pages`: a store to other memory adds no dirty page, and its thread may be
+  the one write-back waits for (diskfs faulting in its own heap while it writes the pages
+  back would wait for itself). Every other cache page can be
   reclaimed, so a committed page always gets its frame: a fault that finds none reclaims again
   with its address space unlocked, so that its own mappings can go too, after a round without
   progress also pages used lately (Linux's rising reclaim priority), waiting 100 ms at a time
