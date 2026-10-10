@@ -1057,7 +1057,12 @@ dispatch; drivers, filesystems, the network stack and Linux itself are user-spac
   lists the disk at `/data`) make `df` work.
 - A file that is deleted while still open stays allocated as an orphan until the last
   reference is dropped, as on Linux (the server holds it in diskfs), so its inode number cannot
-  be reused under an open file.
+  be reused under an open file. Such an inode is on ext2's orphan list (`s_last_orphan`, as
+  ext3's), written in an order a crash cannot hurt (the name's removal, then the inode, then
+  the list's head; off the list before it is freed): the first mount after a crash frees what
+  the list still has. On a Linux host, the ext2 driver ignores the list, the ext4 driver frees
+  it at mount (also read-only, unless the device is read-only), `e2fsck -fy` frees it and
+  `e2fsck -fn` reports it.
 - Only regular files are read, written, truncated or executed through their data blocks; a
   fast symlink's block pointers hold text, never block numbers.
 - Directory reads take a snapshot at offset 0, so `rm -r` deleting entries while it reads never

@@ -3,7 +3,9 @@
 //! filesystem stays consistent for e2fsck; on the ring path, reserved
 //! blocks stay out of the metadata until linked and `sync` flushes data
 //! before metadata; a crash at any point never exposes a deleted file's
-//! blocks; promised blocks are kept for the writes that promised them. Needs mke2fs and e2fsck (e2fsprogs) in PATH:
+//! blocks; promised blocks are kept for the writes that promised them;
+//! orphans outlive a mount until `recover_orphans`, and a crash while they
+//! come and go never frees a named or a free inode. Needs mke2fs and e2fsck (e2fsprogs) in PATH:
 //! `nix-shell -p e2fsprogs --run "cargo test -p ext2fs"`.
 
 use ext2fs::{Device, Ext2, NewNode, ROOT_INO};
@@ -1029,7 +1031,7 @@ fn socket_inodes() {
 }
 
 #[test]
-fn orphans_outlive_a_mount_and_are_freed_by_the_next() {
+fn orphans_outlive_a_mount_kept_on_restart_and_freed_at_boot() {
     let mut fs = Ext2::mount(mkfs("orphans", 16 * 1024)).unwrap();
     let (_, _, free_before, _, inodes_before) = fs.usage();
     let mut files = Vec::new();
@@ -1049,13 +1051,114 @@ fn orphans_outlive_a_mount_and_are_freed_by_the_next() {
     // The middle one is released as usual: off the list (wherever it is in the chain).
     fs.release(files[1]).unwrap();
     assert_eq!(fs.orphans().len(), 2);
-    // The user goes away without the others' release (a diskfs that dies): the next mount
-    // frees them, and the filesystem is as before and clean.
+    let generation = fs.stat(files[0]).unwrap().generation;
+    // A restart (the server's users live on): the mount keeps the list, the files are
+    // still there under their handles, and a restarted server frees only what no user
+    // keeps.
     let mut fs = Ext2::mount(take(fs)).unwrap();
+    let mut on_list = fs.orphans();
+    on_list.sort_unstable();
+    assert_eq!(on_list, vec![files[0], files[2]]);
+    fs.check_handle(files[0], generation).unwrap();
+    assert_eq!(fs.check_handle(files[0], generation + 1), Err(ext2fs::errno::ESTALE));
+    check_file(&mut fs, files[0], MIB);
+    check_file(&mut fs, files[2], MIB);
+    write_file(&mut fs, files[0], MIB);
+    assert_eq!(fs.recover_orphans(|ino| ino == files[0]).unwrap(), 1);
+    assert_eq!(fs.orphans(), vec![files[0]]);
+    // Freed: its handle is stale (also once the number is a new file's).
+    assert_eq!(fs.check_handle(files[2], fs_generation_unknown()), Err(ext2fs::errno::ESTALE));
+    // The machine goes down without the last one's release: the first mount after boot
+    // frees it, and the filesystem is as before and clean.
+    let mut fs = Ext2::mount(take(fs)).unwrap();
+    assert_eq!(fs.recover_orphans(|_| false).unwrap(), 1);
     assert!(fs.orphans().is_empty());
+    assert_eq!(fs.check_handle(files[0], generation), Err(ext2fs::errno::ESTALE));
     let (_, _, free_after, _, inodes_after) = fs.usage();
     assert_eq!((free_after, inodes_after), (free_before, inodes_before));
+    // A new file of a freed number has another generation.
+    let again = fs.create(ROOT_INO, "again", &NewNode::File, 0o644).unwrap();
+    if again == files[0] {
+        assert_ne!(fs.stat(again).unwrap().generation, generation);
+        assert_eq!(fs.check_handle(again, generation), Err(ext2fs::errno::ESTALE));
+    }
     fsck("orphans", &take(fs));
+}
+
+/// A generation no inode of these tests has.
+fn fs_generation_unknown() -> u32 {
+    0xdead_beef
+}
+
+/// Crashes while orphans come and go (unlinks of open files, releases, a boot's recovery),
+/// at every flush, with any of the writes after it lost: after the next boot's recovery no
+/// name points to a freed inode, no inode is freed twice, and the free counts e2fsck sees
+/// are the bitmaps'.
+#[test]
+fn crashes_never_free_a_named_or_a_free_inode() {
+    let mut fs = Ext2::mount(mkfs("orphan-crash", 4 * 1024)).unwrap();
+    let mut files = Vec::new();
+    for i in 0..6 {
+        let f = fs.create(ROOT_INO, &format!("held-{i}"), &NewNode::File, 0o644).unwrap();
+        write_file(&mut fs, f, 64 * 1024);
+        files.push(f);
+    }
+    fs.unlink(ROOT_INO, "held-0", false).unwrap();
+    fs.unlink(ROOT_INO, "held-1", false).unwrap();
+    let mut disk = take(fs);
+    let base = disk.data.clone();
+    disk.log = Some(Vec::new());
+    // Logged: a restart that keeps one orphan and frees the other, unlinks, a release, a
+    // removal from the middle of the list, and an unlink that frees at once.
+    let mut fs = Ext2::mount(disk).unwrap();
+    assert_eq!(fs.recover_orphans(|ino| ino == files[0]).unwrap(), 1);
+    fs.unlink(ROOT_INO, "held-2", false).unwrap();
+    fs.release(files[2]).unwrap();
+    fs.unlink(ROOT_INO, "held-3", false).unwrap();
+    fs.unlink(ROOT_INO, "held-4", false).unwrap();
+    fs.release(files[3]).unwrap();
+    assert!(fs.unlink_unless(ROOT_INO, "held-5", false, |_| false).unwrap().is_empty());
+    assert!(fs.check(files[5]).is_err());
+    let mut disk = take(fs);
+    let log = disk.log.take().unwrap();
+    let epochs = log.iter().filter(|e| matches!(e, Event::Flush)).count();
+    let mut problems = std::collections::BTreeSet::new();
+    for epoch in 0..=epochs {
+        for seed in 0..32 {
+            let image = crash_image(&base, &log, epoch, seed);
+            let d = RamDisk { data: image, counts: Counts::default(), fail_at: None, fail_count: 0, log: None };
+            let mut fs = Ext2::mount(d).unwrap();
+            fs.recover_orphans(|_| false).unwrap();
+            assert!(fs.orphans().is_empty());
+            for (name, ino, _) in fs.list(ROOT_INO).unwrap() {
+                if name != "." && name != ".." {
+                    assert!(fs.check(ino).is_ok(), "epoch {epoch} seed {seed}: {name} names freed inode {ino}");
+                    assert!(fs.stat(ino).unwrap().links > 0, "epoch {epoch} seed {seed}: {name} names an inode without links");
+                }
+            }
+            let disk = take(fs);
+            let path = scratch("crash-fsck");
+            std::fs::write(&path, &disk.data).unwrap();
+            let out = Command::new("e2fsck").arg("-fn").arg(&path).output().expect("e2fsck not found");
+            std::fs::remove_file(&path).unwrap();
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                // Allowed after a crash (ext2 has no journal): an inode without a name, also
+                // one chained to the list whose head did not reach the disk (e2fsck takes
+                // it), counts and bitmap bits of space not yet given back. Not allowed: an
+                // entry pointing to a deleted or unused inode, an orphan list left over, a
+                // block or inode marked free that is in use.
+                let chained = line.contains("was part of the orphaned inode list") || line.contains("corrupted orphan linked list");
+                let bad = line.contains("deleted/unused")
+                    || (line.contains("orphan") && !chained)
+                    || line.contains("multiply-claimed")
+                    || (line.contains("differences:") && line.split_whitespace().any(|w| w.starts_with('+')));
+                if bad {
+                    problems.insert(format!("epoch {epoch} seed {seed}: {}", line.trim()));
+                }
+            }
+        }
+    }
+    assert!(problems.is_empty(), "{:#?}", problems);
 }
 
 #[test]

@@ -21,11 +21,32 @@
 //! **Orphans.** An inode whose last link went while a client still uses it (an open file
 //! unlinked) stays allocated until `release`. So that a crash or a diskfs that dies before
 //! the release does not leave it allocated for good, it is on the superblock's orphan list
-//! (`s_last_orphan`, chained through the inodes' deletion-time field, as ext3's: e2fsck
-//! processes the list for ext2 without a journal as well) from the operation that took its
-//! last link (the same commit) until its release, and `mount` frees every inode the list
-//! still has. While on the list an inode's deletion time is the next orphan's number, so
-//! it is in use despite a nonzero one (`orphans`).
+//! (`s_last_orphan`, chained through the inodes' deletion-time field, as ext3's) from the
+//! operation that took its last link until its release. While on the list an inode's
+//! deletion time is the next orphan's number, so it is in use despite a nonzero one.
+//! `mount` reads the list (trusting an entry only as e2fsck and ext4 do: a number from
+//! `s_first_ino` on, allocated in the inode bitmap, a mode, no links, not seen before; the
+//! list is cut before the first one that is not) but frees nothing: whoever mounts decides
+//! with `recover_orphans`. The first mount since boot frees them all (no user of them
+//! survived); a restarted server keeps those its clients may still have open (diskfs,
+//! "Holds").
+//!
+//! The list is kept in an order a crash cannot hurt (no journal: each step is flushed
+//! before the next, as soft updates do). Unlinking the last name first makes the
+//! directory's change durable while the inode still has its links on the disk, then writes
+//! the inode (no links, its deletion time the old head) and flushes, then the superblock's
+//! head: a name never points to an inode the list has (a crash in between leaves an inode
+//! without a name, which e2fsck takes, never a name whose inode recovery would free and
+//! another file reuse). Freeing takes the inode off the list (the head, or its
+//! predecessor's link) and flushes before it clears the inode and its bits: a crash in
+//! between leaves an unlisted inode for e2fsck, never one listed and freed (which the next
+//! recovery would free again). Freeing an inode bumps its generation (as reusing its
+//! number does), so stale handles stay stale.
+//!
+//! On a host: Linux's ext2 driver ignores `s_last_orphan`; its ext4 driver frees the
+//! listed inodes at mount (also read-only, unless the device itself is read-only);
+//! `e2fsck -fy` frees them, `e2fsck -fn` reports a non-empty list. A cleanly unmounted
+//! disk has an empty list.
 //!
 //! The ring path (`read_map`, `reserve`, `link`, `sync`) is the exception
 //! to the commit per operation: there the caller moves file data between
@@ -72,6 +93,9 @@ pub mod errno {
     pub const ENAMETOOLONG: i64 = 36;
     pub const ENOTEMPTY: i64 = 39;
     pub const ELOOP: i64 = 40;
+    /// A handle (number and generation) of an inode that is gone, or whose
+    /// number is another file's now.
+    pub const ESTALE: i64 = 116;
 }
 use errno::*;
 
@@ -264,9 +288,14 @@ struct State<D: Device> {
     /// Inodes whose last link went away; the Ext2 wrapper decides whether
     /// to free them now or when the last open reference is dropped.
     unlinked: Vec<(u32, RawInode)>,
-    /// The inodes on the superblock's orphan list (see the module comment): in use
-    /// although their deletion time is set (it chains the list).
-    orphans: BTreeSet<u32>,
+    /// The inodes on the superblock's orphan list (see the module comment), each with the
+    /// next one (0: the last): in use although their deletion time is set (it chains the
+    /// list). And each one's predecessor (none for the head): taking one off is a step.
+    orphans: BTreeMap<u32, u32>,
+    orphan_prev: BTreeMap<u32, u32>,
+    /// Inodes whose last link went that could not be put on the list (an I/O error): they
+    /// are freed at release all the same, but a crash before leaks them (`orphan_failures`).
+    orphan_failures: u32,
     /// The superblock has the orphan list's field (revision 1).
     has_orphan_list: bool,
     /// Data blocks reserved for writes in flight (`Ext2::reserve`): in no
@@ -673,10 +702,21 @@ impl<D: Device> State<D> {
         Ok(bit)
     }
 
-    fn clear_bit(&mut self, bitmap_block: u32, bit: u32) -> Result<(), i64> {
+    /// Clears a bit; whether it was set (a free counts only then: a bit
+    /// cleared twice never makes the free counts drift).
+    fn clear_bit(&mut self, bitmap_block: u32, bit: u32) -> Result<bool, i64> {
         let mut bitmap = self.read_block(bitmap_block)?;
-        bitmap[(bit / 8) as usize] &= !(1u8 << (bit % 8));
-        self.write_block(bitmap_block, &bitmap)
+        let mask = 1u8 << (bit % 8);
+        let was = bitmap[(bit / 8) as usize] & mask != 0;
+        if was {
+            bitmap[(bit / 8) as usize] &= !mask;
+            self.write_block(bitmap_block, &bitmap)?;
+        }
+        Ok(was)
+    }
+
+    fn test_bit(&mut self, bitmap_block: u32, bit: u32) -> Result<bool, i64> {
+        Ok(self.read_block(bitmap_block)?[(bit / 8) as usize] & 1u8 << (bit % 8) != 0)
     }
 
     /// Free blocks no promise and no write in flight holds (a block in
@@ -896,7 +936,9 @@ impl<D: Device> State<D> {
         self.freed.insert(block);
         let rel = block - self.first_data_block;
         let g = (rel / self.blocks_per_group) as usize;
-        self.clear_bit(self.groups[g].block_bitmap, rel % self.blocks_per_group)?;
+        if !self.clear_bit(self.groups[g].block_bitmap, rel % self.blocks_per_group)? {
+            return Ok(());
+        }
         self.groups[g].free_blocks += 1;
         self.free_blocks += 1;
         self.write_group(g)?;
@@ -925,10 +967,12 @@ impl<D: Device> State<D> {
 
     fn free_inode(&mut self, ino: u32, dir: bool) -> Result<(), i64> {
         let g = self.group_of(ino);
-        self.clear_bit(self.groups[g].inode_bitmap, (ino - 1) % self.inodes_per_group)?;
+        if !self.clear_bit(self.groups[g].inode_bitmap, (ino - 1) % self.inodes_per_group)? {
+            return Ok(());
+        }
         self.groups[g].free_inodes += 1;
         if dir {
-            self.groups[g].used_dirs -= 1;
+            self.groups[g].used_dirs = self.groups[g].used_dirs.saturating_sub(1);
         }
         self.free_inodes += 1;
         self.write_group(g)?;
@@ -1463,10 +1507,13 @@ impl<D: Device> State<D> {
     }
 
     /// Frees an inode whose last link is gone, with all its blocks.
+    /// (Its generation goes up: a handle of the file is stale, also before
+    /// the number is reused.)
     fn release(&mut self, ino: u32, mut inode: RawInode) -> Result<(), i64> {
         let dir = inode.is_dir();
         self.truncate(ino, &mut inode, 0)?;
         inode.set_links(0);
+        inode.set_generation(inode.generation().wrapping_add(1));
         let now = self.dev.now();
         put32(&mut inode.0, 20, now); // dtime
         self.write_inode(ino, &inode)?;
@@ -1488,14 +1535,18 @@ impl<D: Device> State<D> {
         self.dir_remove(dir, name)?;
         if inode.is_dir() {
             self.adjust_links(dir, -1)?;
-            inode.set_links(0);
-        } else {
-            inode.set_links(inode.links().saturating_sub(1));
         }
         inode.touch(self.dev.now(), false, false);
-        self.write_inode(ino, &inode)?;
-        if inode.links() == 0 {
+        let links = if inode.is_dir() { 0 } else { inode.links().saturating_sub(1) };
+        if links == 0 {
+            // The inode keeps its links on the disk until the name's removal is (see
+            // `Ext2::orphan_unlinked`).
+            self.write_inode(ino, &inode)?;
+            inode.set_links(0);
             self.unlinked.push((ino, inode));
+        } else {
+            inode.set_links(links);
+            self.write_inode(ino, &inode)?;
         }
         Ok(())
     }
@@ -1577,7 +1628,7 @@ impl<D: Device> State<D> {
             return Err(ENOENT);
         }
         let inode = self.read_inode(ino)?;
-        if inode.mode() == 0 || (le32(&inode.0, 20) != 0 && !self.orphans.contains(&ino)) {
+        if inode.mode() == 0 || (le32(&inode.0, 20) != 0 && !self.orphans.contains_key(&ino)) {
             return Err(ENOENT);
         }
         Ok(inode)
@@ -1598,68 +1649,99 @@ impl<D: Device> State<D> {
         }
     }
 
-    /// Puts `ino` (its last link just went, `inode` as written) at the list's head.
-    fn add_orphan(&mut self, ino: u32, inode: &mut RawInode) -> Result<(), i64> {
-        if !self.has_orphan_list || self.orphans.contains(&ino) {
-            return Ok(());
-        }
-        put32(&mut inode.0, 20, self.last_orphan());
-        self.write_inode(ino, inode)?;
-        self.set_last_orphan(ino);
-        self.orphans.insert(ino);
-        Ok(())
+    /// The first inode number files get (`s_first_ino`; below it the reserved ones).
+    fn first_ino(&self) -> u32 {
+        if self.has_orphan_list { le32(&self.sb, 84) } else { 11 }
     }
 
-    /// Takes `ino` off the list (before its release frees it), wherever it is.
-    fn remove_orphan(&mut self, ino: u32) -> Result<(), i64> {
-        if !self.orphans.remove(&ino) {
-            return Ok(());
-        }
-        let next = le32(&self.read_inode(ino)?.0, 20);
-        if self.last_orphan() == ino {
-            self.set_last_orphan(next);
-            return Ok(());
-        }
-        // Its predecessor points past it (at most as many steps as there are orphans: the
-        // list is the set's).
-        let mut at = self.last_orphan();
-        for _ in 0..=self.orphans.len() {
-            if at == 0 {
-                break;
-            }
-            let mut prev = self.read_inode(at)?;
-            let after = le32(&prev.0, 20);
-            if after == ino {
-                put32(&mut prev.0, 20, next);
-                return self.write_inode(at, &prev);
-            }
-            at = after;
-        }
-        // Not found on the disk's list (it cannot be): nothing points to it.
-        Ok(())
+    fn inode_count(&self) -> u32 {
+        (self.inodes_per_group as u64 * self.groups.len() as u64).min(u32::MAX as u64) as u32
     }
 
-    /// At mount: frees every inode the orphan list has (their users went with a diskfs
-    /// that ended or a crash) and empties the list. An entry that is no orphan (out of
-    /// range, not allocated, still linked) ends the walk: the list is not trusted further.
-    fn recover_orphans(&mut self) -> Result<u32, i64> {
-        let count = self.inodes_per_group as u64 * self.groups.len() as u64;
+    /// Whether `ino` may be on the orphan list: a file's number, allocated in the inode
+    /// bitmap, with a mode and no links (as e2fsck and ext4 check an entry).
+    fn may_be_orphan(&mut self, ino: u32) -> Result<bool, i64> {
+        if ino < self.first_ino().max(1) || ino > self.inode_count() {
+            return Ok(false);
+        }
+        let g = self.group_of(ino);
+        if !self.test_bit(self.groups[g].inode_bitmap, (ino - 1) % self.inodes_per_group)? {
+            return Ok(false);
+        }
+        let inode = self.read_inode(ino)?;
+        Ok(inode.mode() != 0 && inode.links() == 0)
+    }
+
+    /// At mount: reads the list into `orphans`. The list is cut before the first entry
+    /// that cannot be one (see `may_be_orphan`; or seen before: a cycle): nothing after it
+    /// is trusted. Whether it was cut (the change is to be committed).
+    fn load_orphans(&mut self) -> Result<bool, i64> {
         let mut at = self.last_orphan();
-        let mut freed = 0;
-        let mut steps = 0u64;
-        while at != 0 && (at as u64) <= count && steps < count {
-            steps += 1;
-            let inode = self.read_inode(at)?;
-            if inode.mode() == 0 || inode.links() != 0 {
-                break;
+        let mut prev = 0;
+        while at != 0 {
+            if self.orphans.contains_key(&at) || !self.may_be_orphan(at)? {
+                if prev == 0 {
+                    self.set_last_orphan(0);
+                } else {
+                    let mut p = self.read_inode(prev)?;
+                    put32(&mut p.0, 20, 0);
+                    self.write_inode(prev, &p)?;
+                    self.orphans.insert(prev, 0);
+                }
+                return Ok(true);
             }
-            let next = le32(&inode.0, 20);
-            self.release(at, inode)?;
-            freed += 1;
+            let next = le32(&self.read_inode(at)?.0, 20);
+            self.orphans.insert(at, next);
+            if prev != 0 {
+                self.orphan_prev.insert(at, prev);
+            }
+            prev = at;
             at = next;
         }
-        self.set_last_orphan(0);
-        Ok(freed)
+        Ok(false)
+    }
+
+    /// Writes `inode` (its last link just went; the name's removal is durable) with no
+    /// links and, with an orphan list, at the list's head: its deletion time is the old
+    /// head. The superblock's head is set by `set_last_orphan` after this reached the disk.
+    fn add_orphan(&mut self, ino: u32, inode: &mut RawInode) -> Result<(), i64> {
+        inode.set_links(0);
+        if !self.has_orphan_list || self.orphans.contains_key(&ino) {
+            return self.write_inode(ino, inode);
+        }
+        let head = self.last_orphan();
+        put32(&mut inode.0, 20, head);
+        self.write_inode(ino, inode)?;
+        self.orphans.insert(ino, head);
+        if head != 0 {
+            self.orphan_prev.insert(head, ino);
+        }
+        Ok(())
+    }
+
+    /// Takes `ino` off the list (before it is freed): the head moves on, or its
+    /// predecessor points past it. Whether it was on the list.
+    fn remove_orphan(&mut self, ino: u32) -> Result<bool, i64> {
+        let Some(&next) = self.orphans.get(&ino) else { return Ok(false) };
+        let prev = self.orphan_prev.get(&ino).copied();
+        match prev {
+            None => self.set_last_orphan(next),
+            Some(p) => {
+                let mut pi = self.read_inode(p)?;
+                put32(&mut pi.0, 20, next);
+                self.write_inode(p, &pi)?;
+                self.orphans.insert(p, next);
+            }
+        }
+        self.orphans.remove(&ino);
+        self.orphan_prev.remove(&ino);
+        if next != 0 {
+            match prev {
+                Some(p) => self.orphan_prev.insert(next, p),
+                None => self.orphan_prev.remove(&next),
+            };
+        }
+        Ok(true)
     }
 
     /// Where the pointer to the data block of file block `fb` lives; with
@@ -2031,7 +2113,9 @@ impl<D: Device> Ext2<D> {
             written: false,
             fresh: BTreeSet::new(),
             unlinked: Vec::new(),
-            orphans: BTreeSet::new(),
+            orphans: BTreeMap::new(),
+            orphan_prev: BTreeMap::new(),
+            orphan_failures: 0,
             has_orphan_list: rev >= 1,
             reserved: BTreeSet::new(),
             reserved_promised: BTreeMap::new(),
@@ -2058,9 +2142,9 @@ impl<D: Device> Ext2<D> {
             });
         }
         let mut fs = Ext2 { st };
-        // What a diskfs that ended (or a crash) left on the orphan list goes now.
-        let recovered = fs.st.recover_orphans();
-        fs.commit(recovered).map_err(|_| "cannot free the orphaned inodes")?;
+        // The orphan list as it is (freed by `recover_orphans`, if the mounter says so).
+        let cut = fs.st.load_orphans();
+        fs.commit(cut).map_err(|_| "cannot read the orphan list")?;
         Ok(fs)
     }
 
@@ -2125,52 +2209,164 @@ impl<D: Device> Ext2<D> {
         self.commit(result)
     }
 
-    /// Inodes that lost their last link during the last operation. If the
-    /// operation failed, nobody else can know about them, so they are freed.
-    fn take_unlinked(&mut self, ok: bool) -> Vec<u32> {
+    /// Inodes that lost their last link during the last operation: those `in_use` says
+    /// someone uses go on the orphan list (returned), the others are freed once the names'
+    /// removal is durable. If the operation failed, nobody else can know about them, so
+    /// they are freed.
+    fn take_unlinked(&mut self, ok: bool, in_use: impl Fn(u32) -> bool) -> Vec<u32> {
         let gone: Vec<(u32, RawInode)> = core::mem::take(&mut self.st.unlinked);
-        if ok {
-            // On the orphan list until released (in the same commit as the unlink).
-            let mut out = Vec::with_capacity(gone.len());
-            for (ino, mut inode) in gone {
-                let _ = self.st.add_orphan(ino, &mut inode);
-                out.push(ino);
+        if !ok {
+            for (ino, inode) in gone {
+                let _ = self.st.release(ino, inode);
             }
-            return out;
+            return Vec::new();
         }
-        for (ino, inode) in gone {
-            let _ = self.st.release(ino, inode);
+        let (used, unused): (Vec<_>, Vec<_>) = gone.into_iter().partition(|&(ino, _)| in_use(ino));
+        let out = self.orphan_unlinked(used);
+        if !unused.is_empty() {
+            // The names' removal first (the inodes keep their links on the disk until then),
+            // then the inodes deleted (no links, a deletion time), then their bits and
+            // blocks freed: a crash in between leaves space for e2fsck to give back, never
+            // a free block or inode that an inode on the disk still has.
+            let _ = self.st.commit();
+            let now = self.st.dev.now();
+            for (ino, inode) in &unused {
+                let mut gone = inode.clone();
+                gone.set_links(0);
+                put32(&mut gone.0, 20, now.max(1));
+                let _ = self.st.write_inode(*ino, &gone);
+            }
+            let _ = self.st.commit();
+            for (ino, inode) in unused {
+                let _ = self.st.release(ino, inode);
+            }
         }
-        Vec::new()
+        out
+    }
+
+    /// Puts the inodes whose last link an operation took on the orphan list, in the order
+    /// of the module comment ("Orphans"): the operation's changes (the names' removal; the
+    /// inodes keep their links on the disk) are committed first, then each inode (no links,
+    /// chained to the old head), then the head. The inodes stay usable until `release`
+    /// whatever fails (a failure is counted, `orphan_failures`: such an inode is no orphan
+    /// on the disk, and a crash before its release leaves it to e2fsck).
+    fn orphan_unlinked(&mut self, gone: Vec<(u32, RawInode)>) -> Vec<u32> {
+        if gone.is_empty() {
+            return Vec::new();
+        }
+        let mut ok = self.st.commit().is_ok();
+        let mut out = Vec::with_capacity(gone.len());
+        for (ino, mut inode) in gone {
+            out.push(ino);
+            // (After a failed commit, everything goes together with a later one: the
+            // inode is written, but kept off the list, which cannot be ordered then.)
+            if !ok {
+                inode.set_links(0);
+                let _ = self.st.write_inode(ino, &inode);
+                self.st.orphan_failures += 1;
+                continue;
+            }
+            let listed = self.st.add_orphan(ino, &mut inode).and_then(|_| self.st.commit());
+            if listed.is_err() {
+                // Off the list again, and in use (no deletion time) as such.
+                ok = false;
+                if let Some(head) = self.st.orphans.remove(&ino) {
+                    self.st.orphan_prev.remove(&head);
+                }
+                put32(&mut inode.0, 20, 0);
+                let _ = self.st.write_inode(ino, &inode);
+                self.st.orphan_failures += 1;
+                continue;
+            }
+            self.st.set_last_orphan(ino);
+            if self.st.commit().is_err() {
+                // (The head reaches the disk with the next commit.)
+                ok = false;
+            }
+        }
+        out
     }
 
     /// Removes `name`; returns the inodes whose last link went away. They
-    /// stay allocated until `release`, so open files keep working.
+    /// stay allocated (on the orphan list) until `release`, so open files keep working.
     pub fn unlink(&mut self, dir: u32, name: &str, want_dir: bool) -> Result<Vec<u32>, i64> {
+        self.unlink_unless(dir, name, want_dir, |_| true)
+    }
+
+    /// `unlink`, but an inode whose last link went is freed at once unless `in_use` says
+    /// someone uses it (no orphan list to go through, and nothing to release).
+    pub fn unlink_unless(&mut self, dir: u32, name: &str, want_dir: bool, in_use: impl Fn(u32) -> bool) -> Result<Vec<u32>, i64> {
         let result = self.st.unlink(dir, name, want_dir);
-        let gone = self.take_unlinked(result.is_ok());
+        let gone = self.take_unlinked(result.is_ok(), in_use);
         self.commit(result.map(|_| gone))
     }
 
     pub fn rename(&mut self, odir: u32, oname: &str, ndir: u32, nname: &str) -> Result<Vec<u32>, i64> {
+        self.rename_unless(odir, oname, ndir, nname, |_| true)
+    }
+
+    /// `rename`; a replaced inode is freed at once unless `in_use` (see `unlink_unless`).
+    pub fn rename_unless(&mut self, odir: u32, oname: &str, ndir: u32, nname: &str, in_use: impl Fn(u32) -> bool) -> Result<Vec<u32>, i64> {
         let result = self.st.rename(odir, oname, ndir, nname);
-        let gone = self.take_unlinked(result.is_ok());
+        let gone = self.take_unlinked(result.is_ok(), in_use);
         self.commit(result.map(|_| gone))
     }
 
-    /// Frees an inode returned by `unlink` or `rename`, with all its blocks.
+    /// Frees an inode returned by `unlink` or `rename`, with all its blocks. It leaves the
+    /// orphan list first (committed: a crash then leaks it, never frees it twice); if
+    /// freeing fails it goes back on the list, to be released again.
     pub fn release(&mut self, ino: u32) -> Result<(), i64> {
         let inode = self.st.live_inode(ino)?;
         if inode.links() != 0 {
             return Err(EINVAL);
         }
-        let result = self.st.remove_orphan(ino).and_then(|_| self.st.read_inode(ino)).and_then(|inode| self.st.release(ino, inode));
-        self.commit(result)
+        // (If this commit fails, a later one writes the removal and the freeing together:
+        // a crash may then leave it listed but free, which `load_orphans` drops.)
+        if self.st.remove_orphan(ino)? {
+            let _ = self.st.commit();
+        }
+        let inode = self.st.read_inode(ino)?;
+        let freed = self.st.release(ino, inode.clone());
+        if let Err(e) = self.commit(freed) {
+            let mut inode = self.st.read_inode(ino).unwrap_or(inode);
+            if inode.mode() != 0 && self.st.add_orphan(ino, &mut inode).and_then(|_| self.st.commit()).is_ok() {
+                self.st.set_last_orphan(ino);
+                let _ = self.st.commit();
+            }
+            return Err(e);
+        }
+        Ok(())
     }
 
-    /// The inodes on the orphan list now (for the tests).
+    /// Frees every inode on the orphan list but those `keep` names, one at a time: each
+    /// leaves the list (committed) before it is freed (see `release`). The first mount
+    /// since boot frees them all (their users went with the machine); a server restarted
+    /// while its clients live keeps those they may still use. How many were freed; an
+    /// error stops it (the rest stay listed).
+    pub fn recover_orphans(&mut self, keep: impl Fn(u32) -> bool) -> Result<u32, i64> {
+        let listed: Vec<u32> = self.st.orphans.keys().copied().collect();
+        let mut freed = 0;
+        for ino in listed.into_iter().filter(|&i| !keep(i)) {
+            self.release(ino)?;
+            freed += 1;
+        }
+        Ok(freed)
+    }
+
+    /// The inodes on the orphan list now.
     pub fn orphans(&self) -> Vec<u32> {
-        self.st.orphans.iter().copied().collect()
+        self.st.orphans.keys().copied().collect()
+    }
+
+    /// Whether `ino` is on the orphan list.
+    pub fn is_orphan(&self, ino: u32) -> bool {
+        self.st.orphans.contains_key(&ino)
+    }
+
+    /// Inodes whose last link went that could not be put on the orphan list (I/O errors),
+    /// since the mount.
+    pub fn orphan_failures(&self) -> u32 {
+        self.st.orphan_failures
     }
 
     pub fn readlink(&mut self, ino: u32) -> Result<String, i64> {
@@ -2268,6 +2464,16 @@ impl<D: Device> Ext2<D> {
     /// ENOENT unless inode `ino` is in use (allocated and not freed).
     pub fn check(&mut self, ino: u32) -> Result<(), i64> {
         self.st.live_inode(ino).map(|_| ())
+    }
+
+    /// The handle (`ino`, `generation`) names a file in use: ESTALE if the inode is not
+    /// in use (freed) or is another file of the number (another generation).
+    pub fn check_handle(&mut self, ino: u32, generation: u32) -> Result<(), i64> {
+        match self.st.live_inode(ino) {
+            Ok(inode) if inode.generation() == generation => Ok(()),
+            Ok(_) | Err(ENOENT) => Err(ESTALE),
+            Err(e) => Err(e),
+        }
     }
 
     /// Where the bytes `off..off + len` of regular file `ino` lie (clipped

@@ -64,6 +64,12 @@ fn main(args: Vec<&'static str>) -> i32 {
             return 1;
         }
     };
+    // What a diskfs that ended (or a crash) left on the orphan list.
+    match fs.recover_orphans(|_| false) {
+        Ok(0) => {}
+        Ok(n) => println!("diskfs: freed {} orphaned inodes", n),
+        Err(e) => println!("diskfs: cannot free the orphaned inodes (errno {})", e),
+    }
     let inodes = fs.usage().3;
     let mut rings = match service::Service::new(fs.device(), fs.block_size(), inodes) {
         Ok(rings) => rings,
