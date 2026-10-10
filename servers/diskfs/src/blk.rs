@@ -360,6 +360,12 @@ impl ext2fs::Device for VirtioBlk {
         oxrt::now() as u32
     }
 
+    /// A device that takes no writes (`VIRTIO_BLK_F_RO`): the filesystem is mounted
+    /// read-only.
+    fn read_only(&self) -> bool {
+        self.read_only
+    }
+
     fn random(&mut self) -> u32 {
         let mut b = [0u8; 4];
         oxrt::getrandom(&mut b);

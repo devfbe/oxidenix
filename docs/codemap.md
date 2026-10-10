@@ -114,9 +114,9 @@ module comment, and the public types it defines. Where to start for common tasks
 
 ## Other servers
 
-- `servers/diskfs/src/blk.rs` (273) virtio-blk driver on the shared virtio transport (crates/virtio). Types: `Kind`, `SubmitError`, `VirtioBlk`.
+- `servers/diskfs/src/blk.rs` (276) virtio-blk driver on the shared virtio transport (crates/virtio). Types: `Kind`, `SubmitError`, `VirtioBlk`.
 - `servers/diskfs/src/main.rs` (98) diskfs: the ext2 filesystem server.
-- `servers/diskfs/src/service.rs` (1017) The ring service: diskfs's end of the data plane (docs/design/io-rings.md, the file protocol `fsring`). Types: `Service`.
+- `servers/diskfs/src/service.rs` (1026) The ring service: diskfs's end of the data plane (docs/design/io-rings.md, the file protocol `fsring`). Types: `Service`.
 - `servers/netd/src/main.rs` (204) netd: the network server.
 - `servers/netd/src/nic.rs` (114) smoltcp's view of the network card, with loopback: frames addressed to this host (its own address or 127.0.0.0/8) never reach the wire but come back as received frames, and ARP requests for those addresses are... Types: `Nic`, `RxToken`, `TxToken`.
 - `servers/netd/src/service.rs` (1863) The socket service: netd's end of the instances' channels (phase R7b, ADR 0008, the protocol `netring`), mapped onto smoltcp's sockets. Types: `Config`, `Service`.
@@ -131,9 +131,10 @@ module comment, and the public types it defines. Where to start for common tasks
 - `crates/csprng/src/lib.rs` (123) Cryptographic randomness for the kernel and the servers: ChaCha20 (RFC 8439) as a random generator with fast key erasure (the kernel's getrandom, the servers' secrets), and SipHash-2-4 as the keyed hash for values... Types: `ChaCha`.
 - `crates/csprng/tests/vectors.rs` (64) The algorithms against their published test vectors, and the generator's properties.
 - `crates/ext2fs/src/blockset.rs` (64) A set of block numbers kept as ranges, for sets that follow a file's blocks: freeing a 2 GiB file frees two million mostly contiguous blocks, which as single entries would take more memory than diskfs has, and as... Types: `BlockSet`.
-- `crates/ext2fs/src/cache.rs` (72) The metadata block cache: inode tables, bitmaps, group descriptors, directories, symlink and indirect blocks. Types: `BlockCache`.
-- `crates/ext2fs/src/lib.rs` (2450) ext2 on the data disk (any `Device`): revision 1 with the `filetype` feature, 1/2/4 KiB blocks, direct and single/double/triple indirect blocks. Types: `Device`, `NewNode`, `RawInode`, `Extent`, `Run`, `Reservation`, `Stat`, `Ext2`.
-- `crates/ext2fs/tests/io.rs` (1464) ext2fs on a RAM disk that counts device requests: large reads and writes take few requests, a write flushes twice (data, then metadata), and the filesystem stays consistent for e2fsck; on the ring path, reserved...
+- `crates/ext2fs/src/cache.rs` (86) The metadata block cache: inode tables, bitmaps, group descriptors, directories, symlink and indirect blocks. Types: `BlockCache`.
+- `crates/ext2fs/src/journal.rs` (321) The JBD2 journal format (ext3's, docs/design/ext3-journal.md): the journal superblock, the log blocks a transaction is written as (descriptors with their tags, the logged blocks, revoke blocks, the commit block with... Types: `Superblock`, `Log`, `Recovery`.
+- `crates/ext2fs/src/lib.rs` (2698) ext2 with an ext3 journal on the data disk (any `Device`): revision 1 with the `filetype` feature, 1/2/4 KiB blocks, direct and single/double/triple indirect blocks, and a JBD2 journal in inode 8 (`journal.rs`;... Types: `Device`, `NewNode`, `RawInode`, `Extent`, `Run`, `Reservation`, `Stat`, `Ext2`.
+- `crates/ext2fs/tests/io.rs` (1832) ext2fs on a RAM disk that counts device requests: large reads and writes take few requests, a write flushes twice (data, then its transaction), and the filesystem stays consistent for e2fsck; on the ring path,...
 - `crates/fsring/src/lib.rs` (426) The file protocol of the data plane: the requests the Linux server (the client) sends diskfs (the service) through a channel's submission ring, and their completions (docs/design/io-rings.md, "The file protocol"). Types: `Buf`, `Kind`, `Node`, `Request`, `Stat`, `Usage`.
 - `crates/fsring/tests/protocol.rs` (169) The file protocol's encodings: every request survives encode and decode (inode handles with their generations), malformed descriptors are refused with the right errno (unknown operations, stray fields, lengths,...
 - `crates/ldisc/src/lib.rs` (527) Linux's N_TTY line discipline as a library, for the Linux server's terminals (docs/design/linux-server.md, "The terminal"): input mapping, signals from the keyboard, flow control, canonical line editing with echo,... Types: `Received`, `Take`, `ReadMode`, `Ldisc`.
@@ -172,7 +173,7 @@ module comment, and the public types it defines. Where to start for common tasks
 
 ## Host builder
 
-- `builder/src/main.rs` (397) The host-side builder (`cargo run` in kernel/ runs it): builds the root filesystem and its cpio initramfs, the data disk and the UEFI or BIOS boot image, then starts QEMU.
+- `builder/src/main.rs` (420) The host-side builder (`cargo run` in kernel/ runs it): builds the root filesystem and its cpio initramfs, the data disk and the UEFI or BIOS boot image, then starts QEMU.
 
 ## User-space programs and tests
 
@@ -189,7 +190,7 @@ module comment, and the public types it defines. Where to start for common tasks
 - `userspace/futextest.c` (97) futex(2): waiting and waking on private and shared words, timeouts, bitsets, requeueing and interruption by signals.
 - `userspace/hello.c` (4) The smallest program: prints its arguments and exits with 42.
 - `userspace/inotifytest.c` (215) inotify in the Linux server, on tmpfs (/tmp) and on /data: the events of creating, writing, changing, moving and removing files in a watched directory and of a watched file itself, IN_ONESHOT, IN_ONLYDIR,...
-- `userspace/iobench.c` (362) I/O benchmarks (docs/benchmarks/README.md): IPC round trip latency, /proc reads, sequential block I/O, small synchronous reads, TCP throughput over loopback and over the network card, each with the system calls, IPC...
+- `userspace/iobench.c` (402) I/O benchmarks (docs/benchmarks/README.md): IPC round trip latency, /proc reads, sequential block I/O, small synchronous reads, durable metadata operations and small fsyncs on the disk, TCP throughput over loopback...
 - `userspace/jobtest.c` (108) Job control: stopping and continuing processes (SIGSTOP, SIGTSTP, SIGCONT), waitpid with WUNTRACED and WCONTINUED, and restarting interrupted reads.
 - `userspace/leaktest.c` (107) Repeated operations leave the kernel's memory as it was: after a warm-up, many rounds of fork and exit, fork and exec, a process whose long wait ended early (its timer), threads, file mappings (the server's tmpfs and...
 - `userspace/libuvtest.c` (450) The Linux interfaces libuv (and so Node.js) uses beyond POSIX, all the Linux server's: statx for every stat, the io_uring probe at start (no io_uring: ENOSYS, quietly), copy_file_range for copying files, and...
@@ -342,6 +343,8 @@ kernel that handle them.
 - `docs/benchmarks/2026-10-09-bdf16a2-pre-procfs-rings.md` Benchmark bdf16a2 (pre-procfs-rings)
 - `docs/benchmarks/2026-10-09-ec81472-procfs-rings.md` Benchmark ec81472 (procfs-rings)
 - `docs/benchmarks/2026-10-10-33b4a97-heaptrim.md` Benchmark 33b4a97 (heaptrim)
+- `docs/benchmarks/2026-10-10-37ad156-dirty-ordered-baseline.md` Benchmark 37ad156-dirty (the ordered design: main before the journal, with 9d468e6's iobench)
+- `docs/benchmarks/2026-10-10-4afe2fa-ext3-journal.md` Benchmark 4afe2fa (ext3 journal)
 - `docs/benchmarks/2026-10-10-70444cc-heaptrim-review.md` Benchmark 70444cc (heaptrim-review)
 - `docs/benchmarks/2026-10-10-7c6ebd0-main.md` Benchmark 7c6ebd0 (main)
 - `docs/benchmarks/2026-10-10-b1fea5d-memfix.md` Benchmark b1fea5d (memfix)
@@ -357,6 +360,8 @@ kernel that handle them.
 - `docs/decisions/0009-descriptor-table-in-the-linux-server.md` ADR 0009: The descriptor table in the Linux server: per-table records until R8, the kernel's files by handle, readiness through the server's watches
 - `docs/decisions/0010-processes-and-signals-in-the-linux-server.md` ADR 0010: Processes and signals in the Linux server: containers, kicks, frames by the server
 - `docs/decisions/0011-a-kernel-without-linux.md` ADR 0011: A kernel without Linux: the last calls in the server, natives on the kernel's own interface
+- `docs/decisions/0012-an-ext3-journal-for-the-data-disk.md` ADR 0012: An ext3 journal for the data disk
+- `docs/design/ext3-journal.md` The ext3 journal of the data disk
 - `docs/design/io-rings.md` I/O rings: the data plane between the Linux server and the device servers
 - `docs/design/iommu.md` DMA isolation with an IOMMU
 - `docs/design/linux-server.md` The Linux server: system calls in restricted mode

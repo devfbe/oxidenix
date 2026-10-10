@@ -281,15 +281,16 @@ const DATA_DISK_BYTES: u64 = 2 << 30;
 /// The size of the self-tests' disk: small, so that filling it is quick.
 const TEST_DISK_BYTES: u64 = 64 << 20;
 
-/// An ext2 filesystem of `bytes` (1 KiB blocks, 128-byte inodes, no
-/// extensions the kernel does not implement), pre-filled from userspace/disk.
-/// The image is a sparse file: only the blocks mke2fs writes take space on
-/// the host.
+/// An ext2 filesystem of `bytes` with an ext3 journal (1 KiB blocks, 128-byte
+/// inodes, no extensions diskfs does not implement; docs/design/ext3-journal.md),
+/// pre-filled from userspace/disk.
+/// The image is a sparse file: only the blocks mke2fs writes (and the journal's)
+/// take space on the host.
 fn create_data_disk(path: &Path, bytes: u64) -> io::Result<()> {
     let content = Path::new(env!("CARGO_MANIFEST_DIR")).join("../userspace/disk");
     // (Paths go to mke2fs as arguments of their own, through no shell.)
     let status = Command::new(e2fsprogs("mke2fs"))
-        .args(["-q", "-t", "ext2", "-b", "1024", "-I", "128", "-O", "none,filetype,sparse_super,large_file", "-L", "oxidenix", "-d"])
+        .args(["-q", "-t", "ext2", "-b", "1024", "-I", "128", "-O", "none,has_journal,filetype,sparse_super,large_file", "-L", "oxidenix", "-d"])
         .arg(&content)
         .arg("-F")
         .arg(path)
@@ -300,7 +301,36 @@ fn create_data_disk(path: &Path, bytes: u64) -> io::Result<()> {
         let _ = fs::remove_file(path);
         return Err(io::Error::other("mke2fs failed"));
     }
+    if let Err(e) = write_journal_zeros(path) {
+        let _ = fs::remove_file(path);
+        return Err(e);
+    }
     Ok(())
+}
+
+/// Writes the zeros of the journal's blocks (inode 8) for real: mke2fs zeroes a file's range
+/// with `fallocate`, leaving unwritten extents, and the host's filesystem would convert one
+/// on every first write of a log block, making each of the guest's flushes a commit of the
+/// host's own journal (several times slower) until the log has gone round once.
+fn write_journal_zeros(path: &Path) -> io::Result<()> {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    let out = Command::new(e2fsprogs("debugfs")).args(["-R", "blocks <8>"]).arg(path).output()?;
+    if !out.status.success() {
+        return Err(io::Error::other("debugfs failed"));
+    }
+    let blocks: Vec<u64> = String::from_utf8_lossy(&out.stdout).split_whitespace().filter_map(|w| w.parse().ok()).collect();
+    let mut file = fs::OpenOptions::new().read(true).write(true).open(path)?;
+    let mut block = [0u8; 1024];
+    for n in blocks {
+        file.seek(SeekFrom::Start(n * 1024))?;
+        file.read_exact(&mut block)?;
+        // (The journal's superblock stays as it is.)
+        if block.iter().all(|&b| b == 0) {
+            file.seek(SeekFrom::Start(n * 1024))?;
+            file.write_all(&block)?;
+        }
+    }
+    file.sync_all()
 }
 
 /// The Node.js binary `OXIDENIX_NODE` asks for: `1` builds userspace/node

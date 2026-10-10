@@ -1,5 +1,6 @@
 /* I/O benchmarks (docs/benchmarks/README.md): IPC round trip latency, /proc reads,
- * sequential block I/O, small synchronous reads, TCP throughput over
+ * sequential block I/O, small synchronous reads, durable metadata operations
+ * and small fsyncs on the disk, TCP throughput over
  * loopback and over the network card, each with the system calls, IPC
  * round trips, IPC bytes, address space switches, user copies and kernel
  * heap allocations per operation from /proc/counters (where it exists:
@@ -371,6 +372,53 @@ static void block_io(void) {
     unlink(path);
 }
 
+/* ---------------------------------------------------------- metadata */
+
+#define META_FILES 500
+
+/* Metadata operations on the disk, each durable when it returns (a
+ * transaction of diskfs's journal): creations, renames, removals, and a
+ * 4 KiB overwrite made durable by fsync. */
+static void metadata_ops(void) {
+    static uint64_t lat[META_FILES];
+    char d[256], path[300], other[300];
+    snprintf(d, sizeof d, "%s/iobench.meta", dir);
+    mkdir(d, 0755);
+    const char *names[] = {"create_disk", "rename_disk", "unlink_disk"};
+    for (int op = 0; op < 3; op++) {
+        start_counting();
+        for (int i = 0; i < META_FILES; i++) {
+            snprintf(path, sizeof path, "%s/f%d", d, i);
+            snprintf(other, sizeof other, "%s/renamed%d", d, i);
+            double a = now();
+            if (op == 0) close(open(path, O_RDWR | O_CREAT | O_EXCL, 0644));
+            if (op == 1) rename(path, other);
+            if (op == 2) unlink(other);
+            lat[i] = (uint64_t)((now() - a) * 1e9);
+        }
+        per_op(names[op], META_FILES);
+        percentiles(names[op], lat, META_FILES, "ns");
+    }
+    snprintf(path, sizeof path, "%s/sync", d);
+    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    pwrite(fd, buf, 4096, 0);
+    fsync(fd);
+    enum { N = 200 };
+    start_counting();
+    for (int i = 0; i < N; i++) {
+        buf[0] = (char)i;
+        double a = now();
+        pwrite(fd, buf, 4096, 0);
+        fsync(fd);
+        lat[i] = (uint64_t)((now() - a) * 1e9);
+    }
+    per_op("write_fsync_4k", N);
+    percentiles("write_fsync_4k", lat, N, "ns");
+    close(fd);
+    unlink(path);
+    rmdir(d);
+}
+
 /* --------------------------------------------------------------- TCP */
 
 static int tcp_connect(const char *ip, int port) {
@@ -470,6 +518,7 @@ int main(int argc, char **argv) {
     ipc_round_trip();
     proc_reads();
     block_io();
+    metadata_ops();
     tcp_loopback();
     tcp_network(argc > 2 ? argv[2] : "10.0.2.100", argc > 3 ? atoi(argv[3]) : 7);
     printf("iobench: done\n");

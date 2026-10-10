@@ -29,7 +29,7 @@ trap 'rm -rf "$WORK"' EXIT
 if [ -n "$LINUX" ]; then
     # The data disk as the builder makes it, and QEMU as the builder runs it
     # (keep in sync with builder/src/main.rs), booting Linux instead.
-    nix-shell -p e2fsprogs --run "mke2fs -q -t ext2 -b 1024 -I 128 -O none,filetype,sparse_super,large_file -F '$WORK/disk.img' 65536"
+    nix-shell -p e2fsprogs --run "mke2fs -q -t ext2 -b 1024 -I 128 -O none,has_journal,filetype,sparse_super,large_file -F '$WORK/disk.img' 65536"
     GUEST="$(nix-build "$ROOT/scripts/linux-guest.nix" --no-out-link -A initrd)"
     KERNEL="$(nix-instantiate --eval --raw "$ROOT/scripts/linux-guest.nix" -A kernel)"
     nix-build "$ROOT/scripts/linux-guest.nix" -A kernel --no-out-link > /dev/null 2>&1 || true
@@ -75,7 +75,7 @@ results="$(sed -n '/^=== iobench/,/^iobench: done/p' "$WORK/serial.log" | tr -d 
     echo "- Commit: $COMMIT$DIRTY ($(git -C "$ROOT" log -1 --format=%s HEAD))"
     echo "- Host: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | sed 's/^ //'), $(nproc) threads, Linux $(uname -r)"
     echo "- QEMU: $(qemu-system-x86_64 --version | head -1), KVM: $([ -w /dev/kvm ] && echo yes || echo no)"
-    echo "- Guest: q35, 4 CPUs, 256 MiB, virtio-blk data disk (fresh 64 MiB ext2, 1 KiB blocks), virtio-net with user networking"
+    echo "- Guest: q35, 4 CPUs, 256 MiB, virtio-blk data disk (fresh 64 MiB ext2 with an ext3 journal, 1 KiB blocks), virtio-net with user networking"
     echo
     echo "## Results"
     echo

@@ -86,8 +86,9 @@ Its [commit history](#development-history) records every step.
   `nslookup` from BusyBox reach the Internet through QEMU's user network. The driver for the virtio network
   card and the TCP/IP stack (smoltcp) run in `netd`, a user-space server; the interface is
   configured by DHCP, and loopback (`127.0.0.1`) works too.
-- **Persistent storage**: the data disk is mounted at `/data`, survives reboots, and stays
-  consistent enough that `e2fsck` on the host accepts it. The Linux server serves it from its
+- **Persistent storage**: the data disk is mounted at `/data`, survives reboots, and keeps its
+  metadata in an ext3 (JBD2) journal: after a crash the journal's replay leaves it as the last
+  completed operation left it, and `e2fsck` on the host finds nothing to fix. The Linux server serves it from its
   own page cache, which the disk server fills and writes back by DMA through shared-memory
   rings (write-back, as on Linux: `fsync` makes data durable).
 - **Clocks** with nanosecond resolution from the TSC: every Linux clock, exact CPU time per
@@ -130,8 +131,10 @@ This builds the kernel, assembles the root filesystem (C test programs, Bash, Bu
 `userspace/rootfs/`), packs it as a cpio initramfs, creates a UEFI disk image and starts QEMU with the OVMF firmware
 from nixpkgs (`OXIDENIX_OVMF=<dir>` uses another directory holding `OVMF_CODE.fd` and
 `OVMF_VARS.fd`). `OXIDENIX_FIRMWARE=bios` builds a BIOS image and boots it with SeaBIOS instead.
-On the first run it also creates `disk.img`, a 2 GiB ext2 data disk (via `mke2fs` from nixpkgs,
-pre-filled from `userspace/disk/`; a sparse file, about 20 MB on the host when new). This file is
+On the first run it also creates `disk.img`, a 2 GiB ext2 data disk with an ext3 journal (via
+`mke2fs -O has_journal` from nixpkgs, pre-filled from `userspace/disk/`; a sparse file, about
+35 MB on the host when new, 16 MB of it the journal; diskfs adds a journal to an older disk without one at its first
+mount). This file is
 kept between runs; delete it for a fresh disk. A `disk.img` from before the disk grew from 64 MiB
 to 2 GiB stays 64 MiB (the builder points it out): delete it to get the bigger one.
 Extra arguments after `--` are passed to QEMU; `OXIDENIX_BUILD_ONLY=1 cargo run` only builds the images.
@@ -1058,25 +1061,34 @@ dispatch; drivers, filesystems, the network stack and Linux itself are user-spac
   the device's interrupts off (PCI interrupt lines may be shared: under QEMU the disk shares one
   with the network card, while the kernel gives each line to one server). A flush empties the
   device's write cache.
-- **ext2** (`crates/ext2fs`; revision 1 with the `filetype` feature, 1/2/4 KiB blocks) supports reading and
+- **ext2 with an ext3 journal** (`crates/ext2fs`; revision 1 with the `filetype` feature, 1/2/4
+  KiB blocks, a JBD2 journal in inode 8: docs/design/ext3-journal.md, ADR 0012) supports reading and
   writing files through direct, single, double and triple indirect blocks, holes, truncation
   (freeing whole indirect subtrees), directories growing by blocks, fast and block symlinks,
   `rename` across directories (with `..` and link count updates and a cycle check), `rmdir`, and
   `chmod`. Allocation goes through the block and inode bitmaps, and group descriptors and the
   superblock's free counts are updated on every change.
+- **Transactions**: every operation is one unit. Its metadata changes join the running
+  transaction whole, or (it failed: `ENOSPC`, a read error) not at all; the transaction is
+  committed before the operation answers (diskfs commits the operations it ran together as one:
+  group commit), so a finished `write`, `create` or `rename` is durable: its blocks go to the
+  journal's log with a checksummed commit block, one flush, then to their places. Data the
+  metadata points to is flushed before (ext3's `data=ordered`), so no file ever shows a deleted
+  file's data. A create, rename, unlink or `rmdir` costs one flush; a long operation (the free of
+  a big file, a long write) commits part way at consistent states. A crash at any point leaves,
+  once the journal is replayed (by diskfs's mount, `e2fsck` or Linux), every operation done
+  whole or not at all, and `e2fsck -fn` with nothing to fix.
 - **Block cache** (`crates/ext2fs/src/cache.rs`, 1 MiB, least recently used): metadata blocks
   (inode tables, bitmaps, group descriptors, directories, indirect blocks) are read once and
-  changed in memory. Every operation commits before it answers: its dirty blocks are written
-  (adjacent ones in one request), then the device is flushed once, so a finished `write` or
-  `create` is durable as before. File data bypasses this cache (the Linux server's page cache
+  changed in memory; a transaction's blocks stay until it commits (a transaction takes at most
+  half the cache). File data bypasses this cache (the Linux server's page cache
   holds it): whole blocks are read and written straight to the device, a run of contiguous blocks as
   one request, and new data blocks are not zeroed first when they are written whole. Reading
   2 MiB from the disk takes about 60 ms (4.4 s with the former ATA PIO driver).
-- Failures stay safe: a block stays dirty until it was written, so what a failed commit (or
-  eviction) could not write goes with the next request; a new data block whose write failed is
-  zeroed before any metadata pointing to it reaches the disk, so no file ever shows a deleted
-  file's data; block pointers read from the disk must lie inside the filesystem (`EIO`
-  otherwise).
+- Failures stay safe: a commit that fails stops diskfs, whose restart replays the journal and goes
+  on from the last commit; block pointers read from the disk must lie inside the filesystem
+  (`EIO` otherwise), and the journal is read as untrusted (its fields checked, its scan bounded by
+  its size, every block it names the filesystem's). A read-only disk is mounted read-only.
 - `write` leaves dirty pages in the Linux server's page cache; `fsync`, `sync`, `msync` and the
   server's write-back write them, a `FLUSH` makes them durable. Before the machine powers off,
   the kernel waits until every instance wrote its caches back and diskfs closed their channels.
@@ -1090,15 +1102,14 @@ dispatch; drivers, filesystems, the network stack and Linux itself are user-spac
   lists the disk at `/data`) make `df` work.
 - A file that is deleted while still open stays allocated as an orphan until the last
   reference is dropped, as on Linux (the server holds it in diskfs), so its inode number cannot
-  be reused under an open file. Such an inode is on ext2's orphan list (`s_last_orphan`, as
-  ext3's), written in an order a crash cannot hurt (the name's removal, then the inode, then
-  the list's head; off the list before it is freed): the first mount after a crash frees what
-  the list still has. A diskfs that dies is restarted by the kernel and keeps every unlinked
+  be reused under an open file. Such an inode is on the orphan list (`s_last_orphan`, as
+  ext3's), put there in the unlink's transaction and taken off in the one that frees it: the
+  first mount after a crash frees what the list still has. A diskfs that dies is restarted by the kernel and keeps every unlinked
   inode until the Linux server instances it served connected again and named what they hold
   (the kernel tells them at once; requests name inodes by number and generation, `ESTALE` for
-  another file's): an open, deleted file outlives the restart. On a Linux host, the ext2
-  driver ignores the list, the ext4 driver frees it at mount (also read-only, unless the
-  device is read-only), `e2fsck -fy` frees it and `e2fsck -fn` reports it.
+  another file's): an open, deleted file outlives the restart. On a Linux host, the ext3/ext4
+  driver replays the journal and frees the list at mount (also read-only, unless the
+  device is read-only), `e2fsck -fy` does both and `e2fsck -fn` reports them.
 - Only regular files are read, written, truncated or executed through their data blocks; a
   fast symlink's block pointers hold text, never block numbers.
 - Directory reads take a snapshot at offset 0, so `rm -r` deleting entries while it reads never
@@ -1229,7 +1240,7 @@ Each of these programs and scripts lives in the root filesystem and runs inside 
 | `fstest` | descriptor access modes (`EBADF` on read-only/write-only fds), `O_NOFOLLOW` on symlinks, unlinked-but-open files (kept until closed, never shared with new files), ext2 size limits, overflowing `mmap` offsets; `preadv2`/`pwritev2` and their flags (also in `lxtest` on `/tmp`): the offset -1 as the file position, a positional write to an `O_APPEND` descriptor appending as on Linux, `RWF_APPEND`/`RWF_NOAPPEND`, `EOPNOTSUPP`/`EINVAL` for unsupported or contradicting flags, `ESPIPE` on pipes (`userspace/rwtest.h`); `getdents64` with a huge buffer returning bounded pieces that together list every entry once, `..` the parent's inode (tmpfs and `/data`); the tmpfs bounds' room the same after files made, renamed over and unlinked while open, long symlinks and failed creations |
 | `sh /etc/disktest.sh` | ext2: 150-file directory, 1.5 MiB file (double indirect), append, truncate, rename, cycles, symlinks, `rm -r`, space accounting |
 | `e2fsck -fn target/test-disk.img` (host, after a test run) | the filesystem the tests wrote is consistent |
-| `cargo test -p ext2fs` (host, needs e2fsprogs) | ext2 on a RAM disk that counts requests and can fail writes: 4 MiB read in about one device read per 32 KiB request, two flushes per write (data, then metadata), nothing written by reads, blocks moving between directories and files, a file larger than the block cache, corrupt block pointers (`EIO`, no crash), every write of a commit failing in turn (retried, nothing lost), failed data writes never exposing a deleted file's blocks; the ring path: writes into reserved blocks read back through both paths, extents clipped at the end with holes, reserved blocks out of every bitmap and inode until linked (`e2fsck` clean meanwhile, other allocations never take them), `sync` flushing the data before the metadata, `ENOENT` for inodes not in use; crashes: every write and flush of IPC and ring operations replayed up to a crash in each flush epoch, with arbitrary losses of what came after the last flush and a two-block metadata cache evicting all the time, never showing a deleted file's data in a file, directory or symlink; blocks freed before a failed commit not reused (ring or IPC) until a commit succeeds; freed inodes refusing reads, writes, truncation, permission changes (`ENOENT`); superblocks whose group or inode sizes do not fit a block refused at mount; blocks in flight for a promise counted once (the rest of the disk stays promisable, also after the promise ends; 128 reservations of 64 blocks in flight, half linked, half cut off by a truncation); freed blocks kept as ranges (unit test); socket inodes (a socket's mode and directory entry type, kept by a rename, freed by an unlink); `e2fsck` after each |
+| `cargo test -p ext2fs` (host, needs e2fsprogs) | ext2 on a RAM disk that counts requests and can fail writes: 4 MiB read in about one device read per 32 KiB request, two flushes per write (data, then its transaction), one flush per create, rename, unlink and `rmdir` and one for a batch of them, nothing written by reads, blocks moving between directories and files, a file larger than the block cache, corrupt block pointers (`EIO`, no crash), every write of a commit failing in turn (the filesystem stops; the journal's replay keeps what was committed, each operation whole or not at all), operations failing part way (a read error in a truncation or rename: undone whole), failed data writes never exposing a deleted file's blocks; the journal: ext3's (debugfs's `logdump` reads it, `e2fsck -fy` replays a crashed disk's, ours replays one e2fsprogs wrote, revokes included), added to a disk without one, refused read-only when it needs recovery, its superblock's fields checked, hostile and randomly corrupted logs scanned safely (bounded, no panic, only the filesystem's blocks written), long operations committing part way and a crash in between finished at the next mount; after every crash point and every failed device request of unlinks, releases, renames and recoveries, `e2fsck -fn` finds nothing at all; the ring path: writes into reserved blocks read back through both paths, extents clipped at the end with holes, reserved blocks out of every bitmap and inode until linked (`e2fsck` clean meanwhile, other allocations never take them), `sync` flushing the data before the metadata, `ENOENT` for inodes not in use; crashes: every write and flush of IPC and ring operations replayed up to a crash in each flush epoch, with arbitrary losses of what came after the last flush and a two-block metadata cache evicting all the time, never showing a deleted file's data in a file, directory or symlink; blocks freed before a failed commit not reused (ring or IPC) until a commit succeeds; freed inodes refusing reads, writes, truncation, permission changes (`ENOENT`); superblocks whose group or inode sizes do not fit a block refused at mount; blocks in flight for a promise counted once (the rest of the disk stays promisable, also after the promise ends; 128 reservations of 64 blocks in flight, half linked, half cut off by a truncation); freed blocks kept as ranges (unit test); socket inodes (a socket's mode and directory entry type, kept by a rename, freed by an unlink); `e2fsck` after each |
 | `cargo test -p fsring` (host) | the file protocol: every request survives encode and decode (socket inodes too), `ENOSYS` for unknown operations, `EINVAL` for any field an operation does not use, transfers, names and targets bounded (`EINVAL`, `ENAMETOOLONG`), names without `/` or NUL, completions, stat, usage and directory entries round-trip; `SETTIMES` takes the chosen times in 32 bits only |
 | `cargo test -p netlink` (host) | rtnetlink's answers: link and address dumps (`NLM_F_MULTI`, `NLMSG_DONE`, sequence numbers and port ids, the attributes getifaddrs reads), one link by index or by name with its acknowledgement, `ENODEV`, `EINVAL` for a short request, `EOPNOTSUPP` for other requests (capped with `NETLINK_CAP_ACK`), no answer for control messages and non-requests, a malformed length ending the datagram, two requests in one datagram, dumps split into page-sized datagrams; dumps produced a datagram at a time, one dump at a time (`EBUSY`), answers stopped at the room left |
 | `cargo test --release -p netring` (host) | the socket protocol between the Linux server and netd: every request survives encode and decode, `ENOSYS` for unknown operations, `EINVAL` for stray fields, malformed areas (two power-of-two rings on a page), sockets, endpoints and values out of range; the shared area's layout; ring arithmetic across the wrap; datagram records and interface records round-trip; netd's port rules (Linux's `SO_REUSEADDR` rule within an instance, never a port another instance serves, UDP reuse within an instance only); netd's budgets (a cap per instance however it asks, a reserve kept for every instance with a channel, refused charges take nothing, given back only to the instance charged, a flood against one instance leaving the others theirs); ICMP messages told apart by what they concern, malformed ones (every truncation, changed bytes) never a panic; echo identifiers rewritten with their checksum and kept apart per instance; 4 MiB streamed through a ring between two threads (the reader sleeping on the control block, the writer waiting for room) and 100000 marks handed to a sleeping net thread, with no wakeup lost |

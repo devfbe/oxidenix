@@ -122,9 +122,10 @@ fn main(args: Vec<&'static str>) -> i32 {
         }
         rings.run(&mut fs);
         if fs.broken() {
-            // The cache holds what must never reach the disk: the kernel starts diskfs
-            // again, which goes on from the disk's state (its clients name what they hold).
-            println!("diskfs: an operation failed part way through a free; starting again");
+            // A commit failed: the cache holds what must never reach the disk. The kernel
+            // starts diskfs again, whose mount replays the journal and goes on from the
+            // disk's state (its clients name what they hold).
+            println!("diskfs: a commit failed; starting again");
             return 1;
         }
     }
