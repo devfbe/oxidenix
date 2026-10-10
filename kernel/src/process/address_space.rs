@@ -1899,11 +1899,12 @@ pub fn handle_fault(va: u64, access: Access) -> Result<(), Fault> {
     // A page from a pager is waited for with the space unlocked, then the
     // fault is tried again.
     let (result, dirtied) = mm.retrying(|space| space.fault_or_retry(va, access, false));
-    if access.write && result.is_ok() {
-        // The store may have made a page dirty: too many (of all, or of
-        // the file's owner's share), and this writer waits for write-back
-        // (with no lock held).
-        crate::fs::cache::balance_dirty(dirtied.as_deref());
+    if let (Some(cache), Ok(())) = (dirtied, &result) {
+        // The store made a page of a disk file dirty: too many (of all, or
+        // of the file's owner's share), and this writer waits for
+        // write-back (with no lock held). Only such a store: one to any
+        // other memory is never throttled (`balance_dirty`).
+        crate::fs::cache::balance_dirty(&cache);
     }
     result
 }
