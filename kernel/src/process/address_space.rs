@@ -318,6 +318,9 @@ pub struct AddressSpace {
     /// The page a fault found missing (`Fault::Retry`), the faulting thread
     /// among its waiters already: it waits for it with the space unlocked.
     awaited: Option<PageWait>,
+    /// A fault failed for want of a frame (not of commit): it reclaims and
+    /// tries again with the space unlocked (`Mm::retrying`).
+    out_of_frames: bool,
 }
 
 /// An address space as tasks hold it: shared by the threads of a process
@@ -380,10 +383,11 @@ impl Mm {
         let mut tries = 0;
         let (mut reclaims, mut fruitless) = (0, 0);
         loop {
-            let (result, awaited) = {
+            let (result, awaited, out_of_frames) = {
                 let mut space = self.lock();
+                space.out_of_frames = false;
                 let result = op(&mut space);
-                (result, space.awaited.take())
+                (result, space.awaited.take(), core::mem::take(&mut space.out_of_frames))
             };
             if let Some(frame) = held.take() {
                 PageCache::put_frame(frame);
@@ -397,14 +401,12 @@ impl Mm {
                     Err(e) => return Err(page_fault(e)),
                 },
                 (Err(Fault::Retry), _) => return Err(Fault::Bus),
-                // No frame (not a failed commit: frames are short now):
-                // reclaim with the space unlocked, so that its own mappings
-                // of cache pages can go too, and try again, until reclaim
-                // makes no more progress (then the toucher dies).
+                // No frame (not a failed commit): reclaim with the space
+                // unlocked, so that its own mappings of cache pages can go
+                // too, and try again, until reclaim makes no more progress
+                // (then the toucher dies).
                 (Err(Fault::Oom), _)
-                    if reclaims < MAX_FAULT_RECLAIMS
-                        && !memory::with_frames(|f| f.user_may_take(FAULT_FRAMES))
-                        && memory::reclaim_retry(FAULT_FRAMES, &mut fruitless) =>
+                    if out_of_frames && reclaims < MAX_FAULT_RECLAIMS && memory::reclaim_retry(FAULT_FRAMES, &mut fruitless) =>
                 {
                     reclaims += 1;
                 }
@@ -486,6 +488,7 @@ impl AddressSpace {
             owner: Weak::new(),
             exe: None,
             awaited: None,
+            out_of_frames: false,
         })
     }
 
@@ -944,7 +947,7 @@ impl AddressSpace {
     /// this mapping), and whether it may be mapped writable directly.
     fn new_frame(&mut self, page: u64, v: &Vma, access: Access, wait: bool) -> Result<(PhysFrame, bool), Fault> {
         match &v.backing {
-            Backing::Anon => Ok((zeroed_frame()?, true)),
+            Backing::Anon => Ok((zeroed_frame().map_err(|e| self.no_frame(e))?, true)),
             Backing::Device | Backing::Granted { .. } | Backing::Revoked { .. } => Err(Fault::Segv),
             Backing::File { cache, offset, shared, .. } => {
                 // Reading a missing page may sleep (a remote file): only the
@@ -986,9 +989,15 @@ impl AddressSpace {
                     }
                     unsafe { f.deallocate_frame(frame) };
                 });
-                Ok((copy.ok_or(Fault::Oom)?, true))
+                Ok((copy.ok_or_else(|| self.no_frame(Fault::Oom))?, true))
             }
         }
+    }
+
+    /// Notes that a fault failed for want of a frame (`out_of_frames`).
+    fn no_frame(&mut self, e: Fault) -> Fault {
+        self.out_of_frames = true;
+        e
     }
 
     fn install(&mut self, page: u64, frame: PhysFrame, flags: PageTableFlags) -> Result<(), Fault> {
@@ -1009,7 +1018,7 @@ impl AddressSpace {
             }
         });
         if !mapped {
-            return Err(Fault::Oom);
+            return Err(self.no_frame(Fault::Oom));
         }
         self.sync_views(page..page + PAGE);
         // The entry was not present before, so no TLB holds it.
@@ -1058,12 +1067,10 @@ impl AddressSpace {
             e.set_addr(new.start_address(), writable);
             Ok(true)
         });
-        // (The commit's bookkeeping happens outside the frame allocator's
-        // lock: a commit may reclaim cache pages, which takes it.)
         if copied.is_err() && charge {
             memory::uncommit(1);
         }
-        let copied = copied?;
+        let copied = copied.map_err(|e| self.no_frame(e))?;
         if copied {
             // Other threads must stop reading the old frame before this
             // mapping lets go of it.
@@ -1188,7 +1195,7 @@ impl AddressSpace {
         if copied.is_err() && charge {
             memory::uncommit(1);
         }
-        let copied = copied?;
+        let copied = copied.map_err(|e| self.no_frame(e))?;
         if copied {
             let mut gather = Gather::new(&self.tlb);
             gather.add(page, old);
