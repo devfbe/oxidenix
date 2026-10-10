@@ -1004,13 +1004,39 @@ impl PageCache {
             if fill == Fill::No && !pending && self.is_cached() {
                 return if pos == off { Err(EAGAIN) } else { Ok((pos - off) as usize) };
             }
-            // (Only a paged or cached object misses pages.)
-            match self.wait_paged(index, false) {
-                Ok(()) => continue,
+            // (Only a paged or cached object misses pages.) The page waited
+            // for is copied from right away, with a reference of the wait's
+            // own: reclaim, which may take a page as soon as it came under
+            // pressure, cannot take it before this read got its bytes, so a
+            // read always makes progress.
+            let frame = match self.wait_frame(index) {
+                Ok(frame) => frame,
                 Err(e) if pos == off => return Err(e),
                 Err(_) => return Ok((pos - off) as usize),
+            };
+            let Some(frame) = frame else { continue };
+            let size = self.size();
+            let in_page = (pos % PAGE) as usize;
+            let end = off.saturating_add(buf.len() as u64).min(size);
+            if page_of(pos) == index && pos < end {
+                let n = ((PAGE as usize) - in_page).min((end - pos) as usize);
+                buf[(pos - off) as usize..][..n].copy_from_slice(&frame_bytes(frame)[in_page..in_page + n]);
+                pos += n as u64;
             }
+            Self::put_frame(frame);
         }
+    }
+
+    /// `wait_paged` for page `index`, which returns its frame with a
+    /// reference (None if it was cut off meanwhile).
+    fn wait_frame(&self, index: u64) -> Result<Option<PhysFrame>, i64> {
+        if self.pager().is_none() {
+            return Ok(None);
+        }
+        let seen = self.state.lock().enter_wait(index)?;
+        let result = self.wait_registered(index, false, seen, None).map(|()| self.waited_frame(index));
+        self.state.lock().leave_wait(index);
+        result
     }
 
     /// Writes `data` at `off`, growing the file.
@@ -1599,30 +1625,43 @@ impl PageCache {
             Ok((start, stop - start))
         };
         let (start, count) = find(&self.state.lock())?;
-        let reserved = self.reserve_pins(count)?;
         let mut frames = Vec::new();
-        if frames.try_reserve_exact(reserved as usize).is_err() {
-            self.unreserve_pins(reserved);
-            return Err(Scan::Errno(ENOMEM));
-        }
+        frames.try_reserve_exact(count as usize).map_err(|_| Scan::Errno(ENOMEM))?;
         // Frames from free memory or reclaimed cache pages (no cache lock
-        // held); a shorter run will do. Without any, the fill waits for
-        // reclaim to make progress (write-back, address spaces busy, mapped
-        // pages used since the last look, programs ending), except on the
-        // pager's own thread while dirty pages stand in the way: it is told
+        // held), before the pins are reserved (a fill waiting for memory
+        // holds no room others could use); a shorter run will do. Without
+        // any, the fill waits for reclaim to make progress (write-back,
+        // address spaces busy, mapped pages used since the last look,
+        // programs ending), except on the pager's own thread while dirty
+        // pages stand in the way: after one forced reclaim it is told
         // (ENOMEM) and writes them back itself first.
         let mut tries = 0;
         let pager_must_write = || dirty_pages() > 0 && crate::process::linux::is_pager();
-        while frames.len() < reserved as usize {
+        while frames.len() < count as usize {
             match new_frame() {
                 Some(frame) => {
                     frame_bytes(frame).fill(0);
                     frames.push(frame);
                 }
                 None if frames.is_empty() && !pager_must_write() && memory::reclaim_retry(1, &mut tries) => {}
+                None if frames.is_empty() && pager_must_write() && tries == 0 => {
+                    tries = 1;
+                    memory::reclaim_forced(1);
+                }
                 None => break,
             }
         }
+        // The pins for what it got; frames beyond the instance's room go.
+        let reserved = match self.reserve_pins(frames.len() as u64) {
+            // (No frame: ENOMEM below, no pins.)
+            _ if frames.is_empty() => 0,
+            Ok(reserved) => reserved,
+            Err(e) => {
+                free_frames(frames);
+                return Err(e);
+            }
+        };
+        free_frames(frames.split_off(reserved as usize));
         memory::cache_charge(frames.len() as u64);
         let count = frames.len() as u64;
         // The run as it is now: a page may have come or the file shrunk.
@@ -2083,25 +2122,6 @@ impl PageCache {
         self.for_each_mapper(|mm| mm.lock().unmap_file(self, index));
     }
 
-    /// Calls `f` for each address space that maps this file, one at a time
-    /// with no lock of the cache held (`f` locks the space), in the order
-    /// they registered, those that register meanwhile included.
-    ///
-    /// That is what makes a change to the cache (a truncation, a write-back
-    /// cleaning pages) reach a fork child's copy of its parent's entries:
-    /// the walk starts after the change and visits the parent under the
-    /// parent's lock. If the fork copied the entries before that visit, it
-    /// registered the child before (`Mm::fork`, under the parent's lock), so
-    /// the walk visits the child after the parent, once the copy is done
-    /// (the child's lock is held for it); if it copied them after the
-    /// visit, they are as current as the parent's.
-    ///
-    /// A walk ends once it caught up with the registrations, so forks in a
-    /// tight loop prolong it (by design: each new child may hold a copy
-    /// the walk must reach; it ends when the forks pause or the walk
-    /// overtakes them). It goes on after the sequence number it visited
-    /// last, not at an index, so dead entries may be removed meanwhile
-    /// (by registrations, by other walks) without making it skip one.
     /// `for_each_mapper` for reclaim: the references it takes go to the
     /// background reclaimer (`defer_drop`), never dropped here; when no
     /// slot is left for one, the walk ends (false: not every mapper was
@@ -2133,6 +2153,25 @@ impl PageCache {
         true
     }
 
+    /// Calls `f` for each address space that maps this file, one at a time
+    /// with no lock of the cache held (`f` locks the space), in the order
+    /// they registered, those that register meanwhile included.
+    ///
+    /// That is what makes a change to the cache (a truncation, a write-back
+    /// cleaning pages) reach a fork child's copy of its parent's entries:
+    /// the walk starts after the change and visits the parent under the
+    /// parent's lock. If the fork copied the entries before that visit, it
+    /// registered the child before (`Mm::fork`, under the parent's lock), so
+    /// the walk visits the child after the parent, once the copy is done
+    /// (the child's lock is held for it); if it copied them after the
+    /// visit, they are as current as the parent's.
+    ///
+    /// A walk ends once it caught up with the registrations, so forks in a
+    /// tight loop prolong it (by design: each new child may hold a copy
+    /// the walk must reach; it ends when the forks pause or the walk
+    /// overtakes them). It goes on after the sequence number it visited
+    /// last, not at an index, so dead entries may be removed meanwhile
+    /// (by registrations, by other walks) without making it skip one.
     fn for_each_mapper(&self, mut f: impl FnMut(&Mm)) {
         let mut last = None;
         loop {
@@ -2230,8 +2269,6 @@ pub fn pager_gone(pager: *const ()) {
     }
 }
 
-/// Asks the pagers whose cached objects have dirty pages to write back
-/// about `pages` of them (each pager queues one request at a time).
 /// Asks the pagers to write back about `pages` dirty pages (for a commit
 /// that the cache's dirty pages stand in the way of).
 pub fn ask_writeback(pages: u64) {
@@ -2240,6 +2277,8 @@ pub fn ask_writeback(pages: u64) {
     }
 }
 
+/// Asks the pagers whose cached objects have dirty pages to write back
+/// about `pages` of them (each pager queues one request at a time).
 fn ask_pagers(pages: u64) {
     let mut i = CACHES.lock().len();
     while i > 0 {

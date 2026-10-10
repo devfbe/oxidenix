@@ -430,6 +430,12 @@ fn reclaim_for(n: u64, force: bool) -> u64 {
     freed
 }
 
+/// One reclaim for `n` frames that takes pages used lately too (with no
+/// lock held: the pager's thread before it is told to write back).
+pub fn reclaim_forced(n: u64) -> u64 {
+    reclaim_for(n, true)
+}
+
 /// Until when (`time::now`) a reclaim that found nothing makes the next
 /// ones skip, and for how long.
 static FRUITLESS_UNTIL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);

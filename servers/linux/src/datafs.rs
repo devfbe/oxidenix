@@ -1151,7 +1151,11 @@ fn fill_once(inode: &Arc<DInode>, index: u64, want: u64) -> Result<bool, i64> {
             let at = cursor.get();
             let g = loop {
                 match grant_run(&c, object, at, end, GRANT_WRITE | GRANT_FILL, &mut out) {
-                    Ok(g) => break g,
+                    Ok(g) => {
+                        // (A wait for pins counts from its own refusal.)
+                        pin_wait.set(None);
+                        break g;
+                    }
                     Err(EBUSY) => match pins_wait(pinned.get(), &pin_wait, &failed) {
                         Some(next) => return next,
                         None => {}
@@ -1224,10 +1228,21 @@ pub fn read(inode: &Arc<DInode>, off: u64, buf: u64, len: u64) -> Result<u64, i6
                 let index = (off + done) / PAGE;
                 let want = off.saturating_add(len).div_ceil(PAGE).saturating_sub(index);
                 match fill(inode, index, want) {
-                    // Missing again (reclaimed meanwhile) more than a few
-                    // times: memory is too short to cache it.
                     Ok(_) if stuck < 8 => stuck += 1,
-                    Ok(_) => return if done == 0 { Err(ENOMEM) } else { Ok(done) },
+                    // Missing again (reclaimed meanwhile) more than a few
+                    // times, memory being short: the kernel reads it,
+                    // asking this server's pager for each page it misses
+                    // and copying from it as soon as it came (it cannot be
+                    // reclaimed in between), so the read makes progress.
+                    Ok(_) => match syscall(SYS_MO_FILE_READ, [object, off + done, buf + done, len - done, 0, 0]) {
+                        r if r > 0 => {
+                            done += r as u64;
+                            stuck = 0;
+                        }
+                        0 => break,
+                        e if done == 0 => return Err(-e),
+                        _ => break,
+                    },
                     Err(e) if done == 0 => return Err(e),
                     Err(_) => break,
                 }
@@ -1362,7 +1377,11 @@ pub fn writeback(inode: &Arc<DInode>, pages: core::ops::Range<u64>) -> Result<u6
             }
             let g = loop {
                 match grant_run(&c, object, at, pages.end, GRANT_DIRTY, &mut out) {
-                    Ok(g) => break g,
+                    Ok(g) => {
+                        // (A wait for pins counts from its own refusal.)
+                        pin_wait.set(None);
+                        break g;
+                    }
                     Err(EBUSY) => match pins_wait(pinned.get(), &pin_wait, &failed) {
                         Some(next) => return next,
                         None => {}

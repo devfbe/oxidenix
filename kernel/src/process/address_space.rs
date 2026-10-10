@@ -1166,16 +1166,19 @@ impl AddressSpace {
             return Err(self.commit_failed(1, Fault::Oom));
         }
         let writable = if charge { writable | CHARGED } else { writable };
-        // (No frame for the copy: the fault reclaims with the space
-        // unlocked and tries again, `out_of_frames`.)
-        let copied = memory::with_frames(|frames| {
-            if shared_area || frames.refcount(old) <= 1 {
-                // Only rights grow: a stale read-only entry elsewhere just
-                // faults once more and finds the page writable.
-                e.set_flags(writable);
-                return Ok(false);
-            }
-            let new = UserFrames(frames).allocate_frame().ok_or(Fault::Oom)?;
+        // A copy if others share the frame: its frame from free memory or
+        // reclaim (`user_frame`, not with the frames locked), filled
+        // outside the frame allocator's lock (others only copy from the
+        // old frame too while it is shared: nobody stores to it in place),
+        // and the sharing looked at again under it. No frame: the fault
+        // reclaims with the space unlocked and tries again (`out_of_frames`).
+        let new = if !shared_area && memory::with_frames(|frames| frames.refcount(old) > 1) {
+            let Some(new) = memory::user_frame() else {
+                if charge {
+                    memory::uncommit(1);
+                }
+                return Err(self.no_frame(Fault::Oom));
+            };
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     memory::phys_to_virt(old.start_address().as_u64()),
@@ -1183,13 +1186,26 @@ impl AddressSpace {
                     PAGE as usize,
                 );
             }
-            e.set_addr(new.start_address(), writable);
-            Ok(true)
+            Some(new)
+        } else {
+            None
+        };
+        let copied = memory::with_frames(|frames| match new {
+            Some(new) if frames.refcount(old) > 1 => {
+                e.set_addr(new.start_address(), writable);
+                true
+            }
+            // The last user meanwhile, or never shared: only rights grow
+            // (a stale read-only entry elsewhere just faults once more and
+            // finds the page writable); a copy made goes again.
+            _ => {
+                e.set_flags(writable);
+                if let Some(new) = new {
+                    unsafe { frames.deallocate_frame(new) };
+                }
+                false
+            }
         });
-        if copied.is_err() && charge {
-            memory::uncommit(1);
-        }
-        let copied = copied.map_err(|e| self.no_frame(e))?;
         if copied {
             // Other threads must stop reading the old frame before this
             // mapping lets go of it.
