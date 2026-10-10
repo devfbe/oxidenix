@@ -417,8 +417,13 @@ About 13,100 lines of Rust (without comments and blank lines) in the kernel (16,
   write-back may still make room) kills the toucher. Every such wait is killable and bounded,
   one reclaim pass looks at a bounded number of pages, and each Linux server instance may hold
   at most a tenth of the commit limit in dirty pages (its writers wait beyond) and a quarter
-  pinned. `/proc/meminfo` shows `Committed_AS`, `CommitLimit`, `Cached` (with tmpfs), `Shmem`
-  (tmpfs and shared memory) and a `MemAvailable` that includes the droppable pages.
+  pinned. A commit that only dirty or pinned pages block waits for their write-back with the
+  address space unlocked (mmap, mprotect, mremap, faults). A background reclaimer (a kernel
+  thread, Linux's kswapd) keeps free memory above the low watermark for allocations that
+  cannot reclaim themselves. A heuristic overcommit mode would need a real OOM killer first.
+  `/proc/meminfo` shows `Committed_AS`, `CommitLimit`, `Cached` (with tmpfs), `Shmem` (tmpfs and
+  shared memory), `Writeback` (pinned for the disk server) and a `MemAvailable` that includes
+  the droppable pages.
 - **Copy-on-write**: `fork` shares all private frames. Writable pages become read-only in both
   processes and are tagged with an OS-available page table bit. A write fault either copies the
   frame or, for the last owner, just restores write access. Shared memory stays shared.

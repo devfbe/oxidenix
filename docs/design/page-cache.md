@@ -132,10 +132,24 @@ space, and the walks (truncation, write-back) drop it before they lock a mapper.
   for write-back or busy address spaces (Linux's reclaim throttling); after 16 fruitless tries
   (300, about 30 s, while dirty or pinned pages may still become droppable; 16 for a pager's
   own thread, which may be the one to write them) the toucher is killed.
+- **Commits that only write-back stands in the way of** wait for it instead of failing: a
+  failed commit notes its pages (`short_commit`), and if only dirty or pinned pages blocked it
+  (`memory::commit_blocked_by_cache`), mmap, mprotect and mremap (`Mm::committing`) and faults
+  (`Mm::retrying`) wait with the address space unlocked (the pager may need it), killably and
+  up to 30 s, asking the pagers, then try again. A tmpfs page's commit says EAGAIN then: a
+  fault waits the same way, a write or a grant in place. Waits happen only there and in the
+  fills, never inside an allocation (it may run with any lock held; debug builds assert
+  interrupts are on, so no spinlock is held).
+- **The background reclaimer** (`memory::start_reclaimer`, Linux's kswapd): woken when free
+  frames above the kernel's reserve come below the low watermark, it reclaims with no lock held
+  until they are above twice that, so the allocations that cannot reclaim (page tables made
+  with the frames locked, kernel stacks, a fork's copies, anything with interrupts off) find
+  frames without direct reclaim. It also runs the teardowns of address spaces and caches whose
+  last reference reclaim held (`defer_drop`), which must not run inside an allocation. A page
+  whose mappings one reclaim walks is isolated from the others (`Page::isolated`).
 - **Bounded, per instance.** No wait for memory is endless or unkillable: a throttled store
   waits at most 30 s (then the committed side has its own end, above), a fill waits for frames
-  as a fault does, a fill or write-back for its instance's pins at most a second (then
-  `ENOMEM`). One reclaim pass looks at no more than 4096 pages (16 per page asked for, if
+  as a fault does. One reclaim pass looks at no more than 4096 pages (16 per page asked for, if
   more), taking each cache's lock for at most 256 at a time and no lock across the walks of the
   mappings. No Linux server instance can hold more than its share of what reclaim cannot drop
   (`CacheCounts`): a page is charged to the instance that owns its file (whoever stored to
@@ -144,7 +158,14 @@ space, and the walks (truncation, write-back) drop it before they lock a mapper.
   tenth of the commit limit (Linux bounds each device's share likewise; each writer passes it
   by at most the page or 64 KiB chunk it just stored). Fills and write-backs reserve their
   pins against a quarter of the limit in one atomic step (`reserve_pins`) and return what they
-  did not pin, so concurrent ones cannot pass it together.
+  did not pin, so concurrent ones cannot pass it together; a grant beyond it is refused
+  (EBUSY) without waiting in the kernel (the caller may hold pins of its own in flight): the
+  server goes on once one of its transfers ended, or waits for the other threads' (up to 30 s;
+  then the fill fails as an I/O error, never as out of memory). `Writeback:` in /proc/meminfo
+  counts the pinned pages.
+- **Overcommit** stays strict (`overcommit_memory=2`, ratio 100%). A heuristic mode as Linux's
+  default would let touches of promised memory fail at fault time; it needs a real OOM killer
+  first (one that picks its victim by size, not the toucher).
 - The file metadata quota (inodes, symlink targets, pipes) on the kernel heap stays.
 
 ### Disk files

@@ -2135,6 +2135,11 @@ impl Mappers {
 /// `THROTTLE` at a time; never a pager's own thread, which does the
 /// writing).
 pub fn balance_dirty(dirtied: Option<&PageCache>) {
+    // (Nothing dirty or pinned: nothing to balance, at the cost of two
+    // atomic loads on every write fault.)
+    if unavailable_pages() == 0 {
+        return;
+    }
     let limit = memory::commit_stats().1;
     let (background, hard) = (limit / BACKGROUND, limit / HARD);
     // The share of the instance that owns the file the store dirtied (it

@@ -471,7 +471,9 @@ static void larger_than_cache(void) {
     int good = fd >= 0;
     for (long off = 0; good && off < LARGE; off += sizeof chunk) {
         for (size_t i = 0; i < sizeof chunk; i++) chunk[i] = (char)pattern(off + i, 5);
-        good &= write(fd, chunk, sizeof chunk) == (ssize_t)sizeof chunk;
+        ssize_t n = write(fd, chunk, sizeof chunk);
+        good &= n == (ssize_t)sizeof chunk;
+        if (!good) printf("    (write at %ld: %zd, errno %d)\n", off, n, errno);
     }
     good &= fsync(fd) == 0;
     check("writing a 32 MiB file with 12 MiB to cache it", good);

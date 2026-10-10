@@ -1214,7 +1214,6 @@ pub fn is_pager() -> bool {
     with_current(|p| p.linux.as_ref().is_some_and(|l| l.pager))
 }
 
-
 /// Whether the caller is the instance's pager, which takes its events.
 fn owns_events() -> bool {
     with_current(|p| p.linux.as_ref().is_some_and(|l| l.events))
