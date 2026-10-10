@@ -116,6 +116,12 @@ impl Device for RamDisk {
     fn now(&self) -> u32 {
         1_700_000_000
     }
+
+    /// Every free checks that no name points to the inode and its last link is gone on
+    /// the disk (`Device::checks`).
+    fn checks(&self) -> bool {
+        true
+    }
 }
 
 fn scratch(name: &str) -> PathBuf {
@@ -1206,12 +1212,8 @@ fn released_orphans_leave_an_empty_list() {
 /// back: e2fsck takes those.)
 fn unsafe_findings(fs: Ext2<RamDisk>, what: &str) -> Vec<String> {
     let mut fs = fs;
-    let mut found = Vec::new();
-    for (name, ino, _) in fs.list(ROOT_INO).unwrap_or_default() {
-        if name != "." && name != ".." && !(fs.check(ino).is_ok() && fs.stat(ino).is_ok_and(|s| s.links > 0)) {
-            found.push(format!("{what}: {name} names inode {ino}, freed or without links"));
-        }
-    }
+    // Every name in the tree: its inode in use, with at least as many links as names.
+    let mut found = names_within_links(&mut fs, what);
     let disk = take(fs);
     static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let path = scratch(&format!("unsafe-fsck-{}", N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
@@ -1286,6 +1288,8 @@ fn failed_commits_never_free_a_named_or_a_free_inode() {
     let base = take(fs).data;
     // How many writes and flushes the sequence makes when nothing fails.
     let mut fs = Ext2::mount(RamDisk { data: base.clone(), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None }).unwrap();
+    // The handles the caller holds: (number, generation).
+    let handles: Vec<(u32, u32)> = files.iter().map(|&f| (f, fs.stat(f).unwrap().generation)).collect();
     let before = fs.device().counts.clone();
     orphan_sequence(&mut fs, &files);
     let (writes, flushes) = (fs.device().counts.writes - before.writes, fs.device().counts.flushes - before.flushes);
@@ -1305,6 +1309,16 @@ fn failed_commits_never_free_a_named_or_a_free_inode() {
         let mut fs = Ext2::mount(disk).unwrap();
         let mut held = orphan_sequence(&mut fs, &files);
         fs.device_mut().fail_at = None;
+        // After every failure: names within links, and what the caller holds still the
+        // very files of its handles.
+        if !fs.broken() {
+            problems.extend(names_within_links(&mut fs, &format!("{what}, held")));
+            for &(ino, generation) in handles.iter().filter(|(ino, _)| held.contains(ino)) {
+                if let Err(e) = fs.check_handle(ino, generation) {
+                    problems.push(format!("{what}: the held handle ({ino}, {generation}): {e}"));
+                }
+            }
+        }
         if fs.broken() {
             // What the disk has: the next mount (a restart, then the boot's recovery).
             let mut disk = fs.into_device();

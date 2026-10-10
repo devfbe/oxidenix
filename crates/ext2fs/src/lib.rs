@@ -53,7 +53,12 @@
 //! a moved directory's new parent counts its ".." first, its old parent stops after). A
 //! directory is removed only with no more links than "." and its name, so none whose
 //! count another directory's ".." is still in is freed. A rename that broke off after its
-//! new name is finished by the same rename again.
+//! new name is finished by the same rename again. So an inode is freed only when its last
+//! link is gone on the disk and no directory entry names it (and, the owner's part, no
+//! client holds it): every free (`Ext2::release`, an immediate free, a recovery's) starts
+//! from a durable state, and on a device that asks for it (`Device::checks`, the tests)
+//! checks exactly that first (`State::check_free`: the inode on the disk, every entry of
+//! the tree).
 //!
 //! **Failed commits.** A commit that fails (a device write or flush did) leaves what it
 //! had to write in the cache. Before any later operation changes anything, that commit is
@@ -167,6 +172,11 @@ pub trait Device {
     /// guessed from its number). None by default: generations then count up.
     fn random(&mut self) -> u32 {
         0
+    }
+    /// Whether every free checks the filesystem's invariant first (`State::check_free`:
+    /// a scan of the whole tree each time, for tests).
+    fn checks(&self) -> bool {
+        false
     }
 }
 
@@ -540,6 +550,37 @@ fn write_entry(block: &mut [u8], pos: usize, inode: u32, rec_len: usize, name: &
 impl<D: Device> State<D> {
     fn sectors_per_block(&self) -> u64 {
         (self.block_size / SECTOR_SIZE) as u64
+    }
+
+    fn checks(&self) -> bool {
+        self.dev.checks()
+    }
+
+    /// The invariant every free keeps (`Device::checks`): the inode is freed only when its
+    /// last link is gone durably (no change waits in the cache, and the inode on the disk
+    /// has no links) and no directory entry names it. Panics otherwise.
+    fn check_free(&mut self, ino: u32) {
+        assert!(!self.cache.has_dirty() && !self.super_dirty, "freeing inode {ino} with changes not on the disk");
+        let (block, off) = self.inode_location(ino).expect("an inode in range");
+        let mut buf = vec![0u8; self.block_size];
+        self.dev.read(self.lba(block), &mut buf).expect("the inode's block");
+        assert_eq!(le16(&buf, off + 26), 0, "freeing inode {ino} whose links on the disk are not 0");
+        // Every directory, from the root, the way lookups go.
+        let (mut dirs, mut seen) = (vec![ROOT_INO], BTreeSet::new());
+        while let Some(dir) = dirs.pop() {
+            if !seen.insert(dir) {
+                continue;
+            }
+            for (name, entry, kind) in self.list(dir).expect("a directory") {
+                if name == "." || name == ".." {
+                    continue;
+                }
+                assert_ne!(entry, ino, "freeing inode {ino} that {name} in directory {dir} names");
+                if kind == FT_DIR {
+                    dirs.push(entry);
+                }
+            }
+        }
     }
 
     fn lba(&self, block: u32) -> u64 {
@@ -1578,10 +1619,12 @@ impl<D: Device> State<D> {
         let ino = self.alloc_inode(is_dir, self.group_of(dir))?;
         let result = self.init_inode(dir, ino, name, kind, perm);
         if result.is_err() {
-            // Undone: its name if it got one, then the inode as any is freed (its blocks,
-            // a deletion time: no inode in use that the bitmap says is free).
-            if self.lookup(dir, name) == Ok(ino) {
-                let _ = self.dir_remove(dir, name);
+            // Undone: its name if it got one (that removal durable first: the name may
+            // have reached the disk), then the inode as any is freed (its blocks, a
+            // deletion time: no inode in use that the bitmap says is free). If the removal
+            // cannot be made durable, the inode stays (e2fsck's).
+            if self.lookup(dir, name) == Ok(ino) && (self.dir_remove(dir, name).is_err() || self.commit().is_err()) {
+                return result.map(|_| ino);
             }
             match self.read_inode(ino) {
                 Ok(inode) if inode.mode() != 0 => {
@@ -2567,18 +2610,32 @@ impl<D: Device> Ext2<D> {
             }
             return out;
         }
-        for (ino, mut inode) in unused {
+        // One at a time, each committed: every free starts from a durable state. What a
+        // failure leaves waits to be freed (deleted on the disk already), as any a commit
+        // kept back.
+        let mut rest = unused.into_iter();
+        while let Some((ino, mut inode)) = rest.next() {
             inode.set_links(0);
             put32(&mut inode.0, 20, now);
             let frees = self.st.frees;
+            if self.st.checks() {
+                self.st.check_free(ino);
+            }
             if self.st.release(ino, inode).is_err() {
                 if self.st.frees != frees {
                     self.st.broken = true;
                     break;
                 }
-                // (Nothing freed yet: it waits to be freed, as any the commit kept back.)
                 self.st.releasing.insert(ino);
                 self.st.deferred.push(ino);
+                continue;
+            }
+            if self.st.commit().is_err() {
+                for (ino, _) in rest {
+                    self.st.releasing.insert(ino);
+                    self.st.deferred.push(ino);
+                }
+                break;
             }
         }
         out
@@ -2754,8 +2811,8 @@ impl<D: Device> Ext2<D> {
     /// Frees an inode returned by `unlink` or `rename`, with all its blocks. It leaves the
     /// orphan list first (committed: a crash then leaks it, never frees it twice). If that
     /// commit fails, nothing is freed: the next commit writes the removal alone (`ready`),
-    /// and the release can be asked again. If the free's own commit fails, the free is
-    /// done in the cache and the next commit writes it.
+    /// and the release can be asked again. If the free's own commit fails, the inode is
+    /// freed all the same (in the cache; the next commit writes it, alone): Ok.
     pub fn release(&mut self, ino: u32) -> Result<(), i64> {
         self.ready()?;
         self.free(ino)
@@ -2790,6 +2847,9 @@ impl<D: Device> Ext2<D> {
         }
         let inode = self.st.read_inode(ino)?;
         let frees = self.st.frees;
+        if self.st.checks() {
+            self.st.check_free(ino);
+        }
         if let Err(e) = self.st.release(ino, inode) {
             // Partly freed in the cache: none of it may reach the disk.
             if self.st.frees != frees {
@@ -2798,7 +2858,9 @@ impl<D: Device> Ext2<D> {
             return Err(e);
         }
         self.st.releasing.remove(&ino);
-        self.st.commit()
+        // (Freed: a commit that fails leaves only the durability to its retry, `ready`.)
+        let _ = self.st.commit();
+        Ok(())
     }
 
     /// Frees every inode on the orphan list but those `keep` names, one at a time: each
