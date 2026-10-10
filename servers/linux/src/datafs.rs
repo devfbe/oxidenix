@@ -461,7 +461,7 @@ fn revalidate(c: &Client) -> Result<(), i64> {
     let _names = NAMES.write()?;
     // The old diskfs's holds went with it: its orphans are nobody's to release.
     TABLE.lock().orphans.retain(|&(_, g)| g == c.generation);
-    let inodes: Vec<Arc<DInode>> = TABLE.lock().inodes.values().cloned().collect();
+    let inodes: Vec<Transient> = TABLE.lock().inodes.values().cloned().map(Transient).collect();
     for inode in inodes {
         if inode.unlinked.load(Ordering::Relaxed) {
             inode.stale.store(true, Ordering::Relaxed);
@@ -481,7 +481,7 @@ fn revalidate(c: &Client) -> Result<(), i64> {
 /// again (a store to a clean page asks anew).
 fn repromise(c: &Client) {
     let Ok(bs) = block_size_on(c) else { return };
-    let inodes: Vec<Arc<DInode>> = TABLE.lock().inodes.values().cloned().collect();
+    let inodes: Vec<Transient> = TABLE.lock().inodes.values().cloned().map(Transient).collect();
     for inode in inodes.iter().filter(|i| !i.stale.load(Ordering::Relaxed)) {
         let Some(object) = *inode.object.lock() else { continue };
         let mut from = 0u64;
@@ -884,7 +884,7 @@ pub fn mkwrite(key: u64, offset: u64) {
     // inode's own; every hold of the object holds the inode). There is no
     // handle to answer with, and none is needed: at the object's last
     // handle the kernel ended its waits (`PageCache::orphan`, EIO).
-    let Some(inode) = by_key(key) else { return };
+    let Some(inode) = by_key(key).map(Transient) else { return };
     // A key names an object only once `object` made it (under this lock,
     // which keeps it set from then on).
     let Some(object) = *inode.object.lock() else {
@@ -1355,13 +1355,13 @@ pub fn fsync_range(inode: &Arc<DInode>, from: u64, to: u64) -> Result<(), i64> {
 
 /// msync(MS_SYNC) of pages `first..end` of the object `key`.
 pub fn msync(key: u64, first: u64, end: u64) -> Result<(), i64> {
-    let Some(inode) = by_key(key) else { return Ok(()) };
+    let Some(inode) = by_key(key).map(Transient) else { return Ok(()) };
     fsync_range(&inode, first.saturating_mul(PAGE), end.saturating_mul(PAGE))
 }
 
 /// sync(2): every file written back, then a flush.
 pub fn sync_all() -> Result<(), i64> {
-    let inodes: Vec<Arc<DInode>> = TABLE.lock().inodes.values().cloned().collect();
+    let inodes: Vec<Transient> = TABLE.lock().inodes.values().cloned().map(Transient).collect();
     let mut result = Ok(());
     for inode in &inodes {
         if !inode.stale.load(Ordering::Relaxed) {
@@ -1491,7 +1491,7 @@ pub fn page(key: u64, offset: u64) {
     // inode's, and whatever maps or runs the object holds the inode): an
     // unknown key has no handle left to answer with, and the kernel ended
     // the waits for it at its last handle (`PageCache::orphan`).
-    let Some(inode) = by_key(key) else { return };
+    let Some(inode) = by_key(key).map(Transient) else { return };
     if let Err(e) = fill(&inode, index, 1) {
         // Whoever waits gets EIO (a mapping SIGBUS), or ENOMEM if there
         // was no memory for the page even after waiting for reclaim (a
@@ -1506,7 +1506,8 @@ pub fn page(key: u64, offset: u64) {
 /// `EVENT_DIRTY`: the file `key` has dirty pages now.
 pub fn dirtied(key: u64) {
     // (A stale inode's pages cannot be written: nothing to list.)
-    let Some(inode) = by_key(key).filter(|i| !i.stale.load(Ordering::Relaxed)) else { return };
+    let Some(inode) = by_key(key).filter(|i| !i.stale.load(Ordering::Relaxed)).map(Transient) else { return };
+    // (Declared after the inode: unlocked before it is done with.)
     let mut t = TABLE.lock();
     // (Listed for this very inode: one the number names no longer is not.)
     if t.inodes.get(&inode.ino).is_some_and(|i| Arc::ptr_eq(i, &inode)) {
@@ -1534,7 +1535,7 @@ pub fn write_dirty(all: bool) {
     };
     for (ino, key, _) in due {
         // The very inode listed (its number may be another's by now: then nothing to do).
-        let inode = TABLE.lock().inodes.get(&ino).filter(|i| i.key == key).cloned();
+        let inode = TABLE.lock().inodes.get(&ino).filter(|i| i.key == key).cloned().map(Transient);
         let clean = match inode {
             Some(inode) => clean_after_writeback(&inode),
             None => true,
@@ -1558,7 +1559,7 @@ fn write_back_dirty() -> u64 {
     let dirty: Vec<(u32, u64)> = TABLE.lock().dirty.iter().map(|(&i, &(k, _))| (i, k)).collect();
     let mut wrote = 0;
     for (ino, key) in dirty {
-        let inode = TABLE.lock().inodes.get(&ino).filter(|i| i.key == key).cloned();
+        let inode = TABLE.lock().inodes.get(&ino).filter(|i| i.key == key).cloned().map(Transient);
         if let Some(inode) = inode.filter(|i| !i.stale.load(Ordering::Relaxed)) {
             wrote += writeback(&inode, 0..u64::MAX).unwrap_or(0);
         }
@@ -1662,6 +1663,26 @@ fn deny_write(inode: &DInode) -> Result<(), i64> {
 
 fn allow_write(inode: &DInode) {
     *inode.writers.lock() += 1;
+}
+
+/// An inode taken from the table for a moment (by the pager, a sync): when
+/// it is done with, an unlinked one is looked at for release as by
+/// `let_go`. `evict` skips an inode that someone else holds, so a last
+/// user letting go while the pager wrote the file back would otherwise
+/// leave the unlinked inode (and its blocks) for ever.
+struct Transient(Arc<DInode>);
+
+impl core::ops::Deref for Transient {
+    type Target = Arc<DInode>;
+    fn deref(&self) -> &Arc<DInode> {
+        &self.0
+    }
+}
+
+impl Drop for Transient {
+    fn drop(&mut self) {
+        let_go(&self.0);
+    }
 }
 
 /// A user lets go of `inode` (an open file, a hold): an unlinked inode is
