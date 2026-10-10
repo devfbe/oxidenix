@@ -239,7 +239,7 @@ fn dispatch(s: &mut State) -> i64 {
         TEST_MAP..=TEST_HEAP_STATS if !test_mode() => -ENOSYS,
         TEST_MAP..=TEST_CACHED => test(s.rax, s.rdi),
         TEST_MKWRITE_FAIL => datafs::fail_next_mkwrite(s.rdi),
-        TEST_FILL_GONE => datafs::fail_next_fill(s.rdi),
+        TEST_FILL_GONE => datafs::fail_next_fill(s.rdi, s.rsi),
         TEST_SLEEP_LOCKED => match TEST_SLEEP_LOCK.lock() {
             Ok(_held) => {
                 let until = (syscall(SYS_CLOCK_READ, [1, 0, 0, 0, 0, 0]).max(0) as u64).saturating_add(s.rdi);

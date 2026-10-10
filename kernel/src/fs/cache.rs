@@ -2216,15 +2216,21 @@ impl Mappers {
     }
 }
 
-/// Called after a store made a page dirty, with no lock held, so dirty
-/// pages (which reclaim cannot drop) never crowd out memory: above a tenth
-/// of the commit limit the pagers of the cached objects are asked to
-/// write back; above a fifth the storing thread waits for them (up to
+/// Called after a store made a page of `dirtied` dirty, with no lock held,
+/// so dirty pages (which reclaim cannot drop) never crowd out memory: above
+/// a tenth of the commit limit the pagers of the cached objects are asked
+/// to write back; above a fifth the storing thread waits for them (up to
 /// `THROTTLE` at a time; never a pager's own thread, which does the
 /// writing).
-pub fn balance_dirty(dirtied: Option<&PageCache>) {
-    // (Nothing dirty or pinned: nothing to balance, at the cost of two
-    // atomic loads on every write fault.)
+///
+/// Only a store that dirtied a page of a disk file is throttled, as Linux
+/// calls `balance_dirty_pages` only where a page cache page was dirtied: a
+/// store to anonymous or tmpfs memory adds nothing write-back could take
+/// away, and the thread that stores may be the one write-back waits for (a
+/// disk server faulting in its own heap or stack while it writes the
+/// pages back: throttled, it would wait for itself).
+pub fn balance_dirty(dirtied: &PageCache) {
+    // (Nothing dirty or pinned: nothing to balance.)
     if unavailable_pages() == 0 {
         return;
     }
@@ -2232,7 +2238,7 @@ pub fn balance_dirty(dirtied: Option<&PageCache>) {
     let (background, hard) = (limit / BACKGROUND, limit / HARD);
     // The share of the instance that owns the file the store dirtied (it
     // was charged for the page, whoever stored).
-    let own = dirtied.and_then(PageCache::counts);
+    let own = dirtied.counts();
     let own_over = || own.is_some_and(|c| c.dirty.load(Ordering::Relaxed) > CacheCounts::dirty_limit());
     // Committed memory and the cache pages reclaim cannot drop together
     // beyond the limit: the frames promised could not all be had.

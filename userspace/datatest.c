@@ -464,11 +464,13 @@ static void writers(void) {
 #define ROOM (12 * MIB)
 #define LARGE (32 * MIB)
 
-static void larger_than_cache(void) {
+static void larger_than_cache(const char *when) {
     const char *path = "/data/datatest.large";
+    char name[128];
     long room = (meminfo("CommitLimit:") - meminfo("Committed_AS:")) * 1024 - ROOM;
     char *all = mmap(NULL, room, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    check("committing all but 12 MiB of memory", all != MAP_FAILED);
+    snprintf(name, sizeof name, "committing all but 12 MiB of memory%s", when);
+    check(name, all != MAP_FAILED);
     if (all == MAP_FAILED) return;
     for (long off = 0; off < room; off += PG) all[off] = 1;
     int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
@@ -481,7 +483,8 @@ static void larger_than_cache(void) {
         if (!good) printf("    (write at %ld: %zd, errno %d)\n", off, n, errno);
     }
     good &= fsync(fd) == 0;
-    check("writing a 32 MiB file with 12 MiB to cache it", good);
+    snprintf(name, sizeof name, "writing a 32 MiB file with 12 MiB to cache it%s", when);
+    check(name, good);
     good = lseek(fd, 0, SEEK_SET) == 0;
     for (long off = 0; good && off < LARGE; off += sizeof chunk) {
         ssize_t n = read(fd, chunk, sizeof chunk);
@@ -769,24 +772,49 @@ static void mapping_across_diskfs_restart(void) {
     unlink(path);
     check("a mapping read while diskfs is killed: every page brought, no SIGBUS", killed == 0 && read_through);
     /* A fill that fails because diskfs went (made so: TEST_FILL_GONE) is tried again,
-     * never SIGBUS: a page of a hole (missing from the cache) after the file grew. */
-    {
+     * never SIGBUS: a page of a hole (missing from the cache) after the file grew; the fill
+     * failing before its grant, after it (its pending pages missing again, their waiters
+     * asking again: the kernel's FILL_AGAIN), and then left to the worker. */
+    for (long mode = 0; mode < 3; mode++) {
         int hf = open("/data/datatest.gone", O_RDWR | O_CREAT | O_TRUNC, 0644);
         struct stat hs;
-        int armed = hf >= 0 && ftruncate(hf, 16 * PG) == 0 && fstat(hf, &hs) == 0 && syscall(TEST_FILL_GONE, (long)hs.st_ino) == 0;
+        int armed = hf >= 0 && ftruncate(hf, 16 * PG) == 0 && fstat(hf, &hs) == 0 && syscall(TEST_FILL_GONE, (long)hs.st_ino, mode) == 0;
         volatile char *hm = armed ? mmap(NULL, 16 * PG, PROT_READ, MAP_SHARED, hf, 0) : MAP_FAILED;
         volatile int zero = 0, bus = 0;
         got = 0;
         if (hm != MAP_FAILED && sigsetjmp(env, 1) == 0) zero = hm[5 * PG] == 0;
         else bus = 1;
-        syscall(TEST_FILL_GONE, 0L);
+        syscall(TEST_FILL_GONE, 0L, 0L);
         if (hm != MAP_FAILED) munmap((void *)hm, 16 * PG);
         close(hf);
         unlink("/data/datatest.gone");
-        check("a fill that failed as diskfs went is tried again: no SIGBUS", armed && zero && !bus);
+        static const char *what[] = {
+            "a fill that failed as diskfs went (before its grant) is tried again: no SIGBUS",
+            "... failed after its grant: the pages asked for again, no SIGBUS",
+            "... and left to the worker: brought, no SIGBUS",
+        };
+        check(what[mode], armed && zero && !bus);
     }
     check("a mapping's faults right after diskfs died: pages brought, no SIGBUS", !faulted && right);
     check("... and a store into a clean page backed, on the device after msync", stored);
+}
+
+/* The file larger than the cache's room again, written back by a fresh diskfs (killed
+ * here, started again: none of its memory touched yet). While the dirty and pinned pages
+ * fill the room, its stores to its own memory (heap, stack) fault in fresh pages: those
+ * store to no file and must not wait for write-back, which waits for diskfs itself (they
+ * did: the write-back stalled until the Linux server gave diskfs up as hung after a
+ * minute, and the write failed with EIO). */
+static void larger_than_cache_fresh_diskfs(void) {
+    long killed = syscall(TEST_KILL_SERVER, "diskfs");
+    struct statfs st;
+    int up = 0;
+    for (int i = 0; i < 100 && !up; i++) {
+        up = statfs("/data", &st) == 0;
+        if (!up) usleep(50 * 1000);
+    }
+    check("diskfs started again (its memory untouched)", killed == 0 && up);
+    larger_than_cache(", diskfs fresh");
 }
 
 int main(void) {
@@ -804,11 +832,12 @@ int main(void) {
     reprotect();
     readers();
     writers();
-    larger_than_cache();
+    larger_than_cache("");
     read_with_dirty_memory();
     full_disk();
     orphan_survives_diskfs_restart();
     mapping_across_diskfs_restart();
+    larger_than_cache_fresh_diskfs();
     printf("%s\n", failures ? "datatest: FAILED" : "datatest: all passed");
     return failures != 0;
 }
