@@ -1654,6 +1654,24 @@ fn names_within_links(fs: &mut Ext2<RamDisk>, what: &str) -> Vec<String> {
     found
 }
 
+/// Every directory with one name has its ".." at the directory that names it (a rename
+/// that broke off and was finished leaves none behind).
+fn dotdots_at_parents(fs: &mut Ext2<RamDisk>, what: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    for (ino, (count, paths)) in names(fs) {
+        if count != 1 || !fs.stat(ino).is_ok_and(|s| s.mode & 0o170000 == 0o040000) {
+            continue;
+        }
+        let parent_path = paths[0].rsplit_once('/').unwrap().0;
+        let parent = parent_path.split('/').filter(|n| !n.is_empty()).try_fold(ROOT_INO, |d, n| fs.lookup(d, n));
+        let dotdot = fs.lookup(ino, "..");
+        if parent.is_err() || dotdot != parent {
+            found.push(format!("{what}: {} has its \"..\" at {dotdot:?}, its parent is {parent:?}", paths[0]));
+        }
+    }
+    found
+}
+
 /// Renames of every kind (a file to a new name, over a file, a directory to another
 /// directory, over an empty directory), each step committed in order: a crash at any
 /// point, or a write or flush failing anywhere (one, or every one from some point on),
@@ -1716,23 +1734,41 @@ fn renames_never_leave_more_names_than_links() {
             fs.recover_orphans(|_| false).unwrap();
             let what = format!("crash at {epoch}/{seed}");
             problems.extend(names_within_links(&mut fs, &what));
+            // The renames again (one of a directory that broke off is finished).
+            sequence(&mut fs);
+            problems.extend(names_within_links(&mut fs, &format!("{what}, again")));
+            problems.extend(dotdots_at_parents(&mut fs, &format!("{what}, again")));
             remove_all(&mut fs);
             problems.extend(unsafe_findings(fs, &format!("{what}, all removed")));
         }
     }
-    // A write or flush failing, once or from some point on.
-    let modes = (0..writes).map(|n| (0, n)).chain((0..flushes).map(|n| (1, n))).chain((0..writes).map(|n| (2, n)));
+    // A write or flush failing, once or from some point on; or a read failing in the
+    // middle of a step (a small cache: every step reads), so that a step breaks off with
+    // part of it in the cache (a name added, its directory's inode not written).
+    let reads = {
+        let d = RamDisk { data: base.clone(), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None };
+        let mut fs = Ext2::mount_with_cache(d, 1024).unwrap();
+        let before = fs.device().counts.reads;
+        sequence(&mut fs);
+        fs.device().counts.reads - before
+    };
+    let modes = (0..writes).map(|n| (0, n)).chain((0..flushes).map(|n| (1, n))).chain((0..writes).map(|n| (2, n))).chain((0..reads).map(|n| (3, n)));
     for (mode, n) in modes {
-        let what = format!("{} {n} failing", ["write", "flush", "every write from"][mode]);
+        let what = format!("{} {n} failing", ["write", "flush", "every write from", "read"][mode]);
         let mut d = RamDisk { data: base.clone(), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None };
         match mode {
             0 => d.fail_writes(n, 1),
             1 => d.fail_flush = Some(n),
-            _ => d.fail_writes(n, usize::MAX),
+            2 => d.fail_writes(n, usize::MAX),
+            _ => {}
         }
-        let mut fs = Ext2::mount(d).unwrap();
+        let mut fs = if mode == 3 { Ext2::mount_with_cache(d, 1024).unwrap() } else { Ext2::mount(d).unwrap() };
+        if mode == 3 {
+            fs.device_mut().fail_read = Some(n);
+        }
         sequence(&mut fs);
         fs.device_mut().fail_at = None;
+        fs.device_mut().fail_read = None;
         if fs.broken() {
             continue;
         }
@@ -1740,6 +1776,7 @@ fn renames_never_leave_more_names_than_links() {
         // The device works again: renames that broke off are finished by doing them again.
         sequence(&mut fs);
         problems.extend(names_within_links(&mut fs, &format!("{what}, again")));
+        problems.extend(dotdots_at_parents(&mut fs, &format!("{what}, again")));
         remove_all(&mut fs);
         for ino in fs.take_deferred() {
             if fs.releasable(ino) {
@@ -1749,4 +1786,74 @@ fn renames_never_leave_more_names_than_links() {
         problems.extend(unsafe_findings(fs, &format!("{what}, all removed")));
     }
     assert!(problems.is_empty(), "{:#?}", problems);
+}
+
+/// Two names of one file made outside (debugfs's `ln`, a hard link): a rename of one onto
+/// the other does nothing (POSIX), both names stay; a rename of one elsewhere moves only
+/// that name, and the file keeps its other one and its link count.
+#[test]
+fn a_rename_between_hard_links_does_nothing() {
+    let mut fs = Ext2::mount(mkfs("hardlinks", 2 * 1024)).unwrap();
+    let f = fs.create(ROOT_INO, "f", &NewNode::File, 0o644).unwrap();
+    write_file(&mut fs, f, 4096);
+    let disk = take(fs);
+    let path = scratch("hardlinks-debugfs");
+    std::fs::write(&path, &disk.data).unwrap();
+    let ok = Command::new("debugfs").args(["-w", "-R", "ln f g"]).arg(&path).status().unwrap().success()
+        && Command::new("debugfs").args(["-w", "-R", "sif f links_count 2"]).arg(&path).status().unwrap().success();
+    assert!(ok, "debugfs");
+    let data = std::fs::read(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    let mut fs = Ext2::mount(RamDisk { data, counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None }).unwrap();
+    assert_eq!(fs.lookup(ROOT_INO, "g"), Ok(f));
+    assert_eq!(fs.rename(ROOT_INO, "f", ROOT_INO, "g").unwrap(), Vec::<u32>::new());
+    assert_eq!((fs.lookup(ROOT_INO, "f"), fs.lookup(ROOT_INO, "g")), (Ok(f), Ok(f)));
+    assert_eq!(fs.stat(f).unwrap().links, 2);
+    fs.rename(ROOT_INO, "g", ROOT_INO, "h").unwrap();
+    assert_eq!((fs.lookup(ROOT_INO, "f"), fs.lookup(ROOT_INO, "h")), (Ok(f), Ok(f)));
+    assert!(fs.lookup(ROOT_INO, "g").is_err());
+    assert_eq!(fs.stat(f).unwrap().links, 2);
+    fsck("hardlinks", &take(fs));
+}
+
+/// The flushes each kind of operation costs (printed: `--nocapture`), bounded.
+#[test]
+fn what_operations_flush() {
+    let mut fs = Ext2::mount(mkfs("flushes", 2 * 1024)).unwrap();
+    let d = fs.create(ROOT_INO, "d", &NewNode::Dir, 0o755).unwrap();
+    let mut count = |fs: &mut Ext2<RamDisk>, what: &str, op: &mut dyn FnMut(&mut Ext2<RamDisk>)| {
+        let before = fs.device().counts.flushes;
+        op(fs);
+        let n = fs.device().counts.flushes - before;
+        eprintln!("    {what}: {n} flushes");
+        n
+    };
+    let mut total = 0;
+    total += count(&mut fs, "create", &mut |fs| {
+        fs.create(d, "f", &NewNode::File, 0o644).unwrap();
+    });
+    total += count(&mut fs, "mkdir", &mut |fs| {
+        fs.create(d, "sub", &NewNode::Dir, 0o755).unwrap();
+    });
+    total += count(&mut fs, "rename to a new name", &mut |fs| {
+        fs.rename(d, "f", d, "g").unwrap();
+    });
+    let other = fs.create(d, "h", &NewNode::File, 0o644).unwrap();
+    total += count(&mut fs, "rename over a name", &mut |fs| {
+        for ino in fs.rename(d, "g", d, "h").unwrap() {
+            fs.release(ino).unwrap();
+        }
+    });
+    let _ = other;
+    total += count(&mut fs, "rename of a directory to another one", &mut |fs| {
+        fs.rename(d, "sub", ROOT_INO, "sub").unwrap();
+    });
+    total += count(&mut fs, "unlink (freed at once)", &mut |fs| {
+        fs.unlink_unless(d, "h", false, |_| false).unwrap();
+    });
+    total += count(&mut fs, "rmdir (freed at once)", &mut |fs| {
+        fs.unlink_unless(ROOT_INO, "sub", true, |_| false).unwrap();
+    });
+    assert!(total < 60, "{total} flushes");
+    fsck("flushes", &take(fs));
 }

@@ -44,21 +44,37 @@
 //! number does), so stale handles stay stale.
 //!
 //! **Names and links.** No state of the disk has more names for an inode than its link
-//! count says (a crash or a failed commit may leave a link too many, e2fsck's; never a
-//! name too many, which would let the inode be freed while a name still points to it): a
-//! link count goes down only once the name's removal is durable (`drop_link`, then the
-//! lower count with `Ext2::take_unlinked`, or after the retry of a failed commit:
-//! `after_commit`), and up before a new name (a rename: the file gains the link its new
-//! name takes, the new name comes, the old one goes, the extra link goes, each committed;
-//! a moved directory's new parent counts its ".." first, its old parent stops after). A
-//! directory is removed only with no more links than "." and its name, so none whose
-//! count another directory's ".." is still in is freed. A rename that broke off after its
-//! new name is finished by the same rename again. So an inode is freed only when its last
-//! link is gone on the disk and no directory entry names it (and, the owner's part, no
-//! client holds it): every free (`Ext2::release`, an immediate free, a recovery's) starts
-//! from a durable state, and on a device that asks for it (`Device::checks`, the tests)
-//! checks exactly that first (`State::check_free`: the inode on the disk, every entry of
-//! the tree).
+//! count says, and no name or ".." points to an inode the disk does not have (a crash or
+//! a failed commit may leave a link too many, e2fsck's; never a name too many, which
+//! would let the inode be freed while a name still points to it). Each step below is
+//! committed before the next:
+//! - A creation writes the inode (a directory's parent counts its ".." then), and only
+//!   then its name; one whose name cannot be added deletes the inode, frees it, and then
+//!   the parent's count goes.
+//! - A name's removal goes before the lower link count (`drop_link`; the count with
+//!   `Ext2::take_unlinked`, applied to the inode as it is then, or after the retry of a
+//!   failed commit: `after_commit`); a removed directory's parent stops counting its ".."
+//!   only once the directory is freed (`Ext2::freed_dir`).
+//! - A rename: the file gains the link its new name takes (a moved directory's new
+//!   parent: the link of its ".."), the ".." moves, the new name comes (over an existing
+//!   name its entry takes the file in place: nothing to allocate), the old name goes, the
+//!   extra links go. A step that fails is undone only when provably not done (the new
+//!   name absent); else the rename stops with its extra links, and the same rename again
+//!   finishes it (also a directory's ".." on the disk after a crash). Two names of one
+//!   regular file are taken for hard links (rename does nothing then, as POSIX says)
+//!   unless a rename of this mount broke off between them: after a crash a broken rename
+//!   of a file looks like hard links and keeps both names (a link count that matches).
+//! - A directory is removed only with no more links than "." and its name, so none whose
+//!   count another directory's ".." is still in is freed.
+//!
+//! So an inode is freed only when its last link is gone on the disk and no directory entry
+//! (".." included) names it (and, the owner's part, no client holds it): every free
+//! (`Ext2::release`, an immediate free, a recovery's, an undone creation's) starts from a
+//! durable state, and on a device that asks for it (`Device::checks`, the tests) checks
+//! exactly that first (`State::check_free`: the inode on the disk, every entry of the
+//! tree). The flushes this costs: a creation 2, a directory's 3, a rename 4 (over a name
+//! 9, the replaced inode's free included), an unlink that frees at once 3, a removed
+//! directory 4.
 //!
 //! **Failed commits.** A commit that fails (a device write or flush did) leaves what it
 //! had to write in the cache. Before any later operation changes anything, that commit is
@@ -350,7 +366,7 @@ struct State<D: Device> {
     fresh: BTreeSet<u32>,
     /// Inodes whose last link went away; the Ext2 wrapper decides whether
     /// to free them now or when the last open reference is dropped.
-    unlinked: Vec<(u32, RawInode)>,
+    unlinked: Vec<Dropped>,
     /// The inodes on the superblock's orphan list (see the module comment), each with the
     /// next one (0: the last): in use although their deletion time is set (it chains the
     /// list). And each one's predecessor (none for the head): taking one off is a step.
@@ -363,6 +379,9 @@ struct State<D: Device> {
     releasing: BTreeSet<u32>,
     /// Inodes whose last link went that are not on the list (a commit failed: `unlisted`).
     unlisted: BTreeSet<u32>,
+    /// Files whose rename broke off after their new name (this mount): a rename of the
+    /// two names finishes it (else two names of a file are hard links: nothing to do).
+    broken_renames: BTreeSet<u32>,
     /// Link drops whose names' removal a failed commit holds back: done once its retry
     /// went through (`Ext2::ready`), never before (no state of the disk with more names
     /// than links).
@@ -497,7 +516,16 @@ impl Promise {
 }
 
 /// One directory entry as found on disk.
+/// A name an inode lost (`State::drop_link`), to be applied once that is durable.
+struct Dropped {
+    ino: u32,
+    /// Its last: it goes (an orphan, or freed); else one link less. (A directory's
+    /// parent stops counting its ".." when it is freed: `Ext2::freed_dir`.)
+    last: bool,
+}
+
 /// A link drop waiting for a commit (`State::after_commit`).
+#[derive(Clone, Copy)]
 enum AfterCommit {
     /// `ino` lost its name in `dir` (`State::drop_link`).
     Drop { dir: u32, ino: u32 },
@@ -556,6 +584,14 @@ impl<D: Device> State<D> {
         self.dev.checks()
     }
 
+    /// The parent a directory's ".." names (None for another inode, or the root).
+    fn dotdot(&mut self, ino: u32, inode: &RawInode) -> Option<u32> {
+        if !inode.is_dir() {
+            return None;
+        }
+        self.lookup(ino, "..").ok().filter(|&p| p != ino)
+    }
+
     /// The invariant every free keeps (`Device::checks`): the inode is freed only when its
     /// last link is gone durably (no change waits in the cache, and the inode on the disk
     /// has no links) and no directory entry names it. Panics otherwise.
@@ -563,7 +599,9 @@ impl<D: Device> State<D> {
         assert!(!self.cache.has_dirty() && !self.super_dirty, "freeing inode {ino} with changes not on the disk");
         let (block, off) = self.inode_location(ino).expect("an inode in range");
         let mut buf = vec![0u8; self.block_size];
-        self.dev.read(self.lba(block), &mut buf).expect("the inode's block");
+        // (A test device's failure of a read is not the check's: asked again.)
+        let lba = self.lba(block);
+        self.dev.read(lba, &mut buf).or_else(|_| self.dev.read(lba, &mut buf)).expect("the inode's block");
         assert_eq!(le16(&buf, off + 26), 0, "freeing inode {ino} whose links on the disk are not 0");
         // Every directory, from the root, the way lookups go.
         let (mut dirs, mut seen) = (vec![ROOT_INO], BTreeSet::new());
@@ -571,12 +609,16 @@ impl<D: Device> State<D> {
             if !seen.insert(dir) {
                 continue;
             }
-            for (name, entry, kind) in self.list(dir).expect("a directory") {
-                if name == "." || name == ".." {
+            let entries = self.list(dir).or_else(|_| self.list(dir)).expect("a directory");
+            for (name, entry, _) in entries {
+                // ("." is the directory itself, which a name already led to.)
+                if name == "." {
                     continue;
                 }
+                // A name, and a directory's "..": neither may point to a freed inode.
                 assert_ne!(entry, ino, "freeing inode {ino} that {name} in directory {dir} names");
-                if kind == FT_DIR {
+                // (By the inode's own type: without the filetype feature entries say none.)
+                if name != ".." && self.read_inode(entry).or_else(|_| self.read_inode(entry)).is_ok_and(|i| i.is_dir()) {
                     dirs.push(entry);
                 }
             }
@@ -1605,7 +1647,9 @@ impl<D: Device> State<D> {
         self.write_inode(ino, &inode)
     }
 
-    fn create(&mut self, dir: u32, name: &str, kind: &NewNode, perm: u32) -> Result<u32, i64> {
+    /// A new inode for `name` in `dir` (none there yet), written, without the name: its
+    /// number and type. One that cannot be made whole is freed again (nothing names it).
+    fn create_inode(&mut self, dir: u32, name: &str, kind: &NewNode, perm: u32) -> Result<(u32, u8), i64> {
         if name.len() > NAME_MAX {
             return Err(ENAMETOOLONG);
         }
@@ -1617,28 +1661,35 @@ impl<D: Device> State<D> {
         }
         let is_dir = matches!(kind, NewNode::Dir);
         let ino = self.alloc_inode(is_dir, self.group_of(dir))?;
-        let result = self.init_inode(dir, ino, name, kind, perm);
-        if result.is_err() {
-            // Undone: its name if it got one (that removal durable first: the name may
-            // have reached the disk), then the inode as any is freed (its blocks, a
-            // deletion time: no inode in use that the bitmap says is free). If the removal
-            // cannot be made durable, the inode stays (e2fsck's).
-            if self.lookup(dir, name) == Ok(ino) && (self.dir_remove(dir, name).is_err() || self.commit().is_err()) {
-                return result.map(|_| ino);
-            }
-            match self.read_inode(ino) {
-                Ok(inode) if inode.mode() != 0 => {
-                    let _ = self.release(ino, inode);
-                }
-                _ => {
-                    let _ = self.free_inode(ino, is_dir);
-                }
+        match self.init_inode(dir, ino, kind, perm) {
+            Ok(ftype) => Ok((ino, ftype)),
+            Err(e) => {
+                // (The parent's count is the last step: not reached.)
+                self.unmake(ino, dir, is_dir, false);
+                Err(e)
             }
         }
-        result.map(|_| ino)
     }
 
-    fn init_inode(&mut self, dir: u32, ino: u32, name: &str, kind: &NewNode, perm: u32) -> Result<(), i64> {
+    /// Frees inode `ino` that nothing names and nothing on the disk counts on (a creation
+    /// that did not go through), with a directory's link in its parent if it got it.
+    fn unmake(&mut self, ino: u32, dir: u32, is_dir: bool, counted: bool) {
+        match self.read_inode(ino) {
+            Ok(inode) if inode.mode() != 0 => {
+                if is_dir && counted {
+                    let _ = self.adjust_links(dir, -1);
+                }
+                let _ = self.release(ino, inode);
+            }
+            _ => {
+                let _ = self.free_inode(ino, is_dir);
+            }
+        }
+    }
+
+    /// Writes new inode `ino` (in `dir`) and what it holds; its type for its entry. The
+    /// name comes later (`Ext2::create`: after the inode is durable).
+    fn init_inode(&mut self, dir: u32, ino: u32, kind: &NewNode, perm: u32) -> Result<u8, i64> {
         let goal = self.group_of(dir);
         let is_dir = matches!(kind, NewNode::Dir);
         // A new generation for the number, unlike its last (a freed inode keeps that), and
@@ -1693,11 +1744,11 @@ impl<D: Device> State<D> {
             }
         };
         self.write_inode(ino, &inode)?;
-        self.dir_add(dir, name, ino, ftype)?;
+        // A directory's parent counts its ".." from now on (before the name exists).
         if is_dir {
             self.adjust_links(dir, 1)?;
         }
-        Ok(())
+        Ok(ftype)
     }
 
     /// Frees an inode whose last link is gone, with all its blocks.
@@ -1734,20 +1785,18 @@ impl<D: Device> State<D> {
     }
 
     /// `ino` (as `inode`) lost a name in `dir`: one link less (a directory with one name:
-    /// none, and `dir` loses its ".." link). The inode keeps its links (on the disk, too)
-    /// until the name's removal is durable: the lower count goes out after it (`unlinked`,
-    /// `Ext2::take_unlinked`), so no state of the disk has more names than links.
+    /// none, and `dir` loses its ".." link). Nothing of that is written now: the inode keeps
+    /// its links (on the disk, too) and `dir` its count until the name's removal is
+    /// durable; then `Ext2::take_unlinked` applies the changes to the inodes as they are
+    /// then (`unlinked`), so no state of the disk has more names than links.
     fn drop_link(&mut self, dir: u32, ino: u32, mut inode: RawInode) -> Result<(), i64> {
-        if inode.is_dir() {
-            self.adjust_links(dir, -1)?;
-        }
         inode.touch(self.dev.now(), false, false);
         self.write_inode(ino, &inode)?;
         // (A directory has "." and its name; one with more, a rename's that broke off,
-        // keeps a name.)
-        let links = if inode.is_dir() && inode.links() <= 2 { 0 } else { inode.links().saturating_sub(1) };
-        inode.set_links(links);
-        self.unlinked.push((ino, inode));
+        // keeps a name, and its ".." stays.)
+        let _ = dir;
+        let last = if inode.is_dir() { inode.links() <= 2 } else { inode.links() <= 1 };
+        self.unlinked.push(Dropped { ino, last });
         Ok(())
     }
 
@@ -1795,6 +1844,13 @@ impl<D: Device> State<D> {
             // no hard links otherwise) is finished; the same name is nothing to do.
             Some(e) if e == ino => {
                 if odir == ndir && oname == nname {
+                    return Ok(None);
+                }
+                // Two names of one file: hard links (rename does nothing then, as POSIX
+                // says), or a rename of this mount that broke off after its new name (it is
+                // finished). A directory has no hard links: two names are a broken rename.
+                // (After a crash a file's broken rename looks like hard links: kept.)
+                if !inode.is_dir() && !self.broken_renames.contains(&ino) {
                     return Ok(None);
                 }
                 plan.named = true;
@@ -2337,6 +2393,7 @@ impl<D: Device> Ext2<D> {
             unlisted: BTreeSet::new(),
             deferred: Vec::new(),
             after_commit: Vec::new(),
+            broken_renames: BTreeSet::new(),
             pending: false,
             broken: false,
             has_orphan_list: rev >= 1,
@@ -2408,18 +2465,31 @@ impl<D: Device> Ext2<D> {
         }
         // Link drops that waited for that commit (it removed their names).
         if !self.st.after_commit.is_empty() {
-            for a in core::mem::take(&mut self.st.after_commit) {
-                match a {
-                    AfterCommit::Drop { dir, ino } => {
-                        let inode = self.st.read_inode(ino)?;
-                        self.st.drop_link(dir, ino, inode)?;
-                    }
-                    AfterCommit::Links { ino, delta } => self.st.adjust_links(ino, delta)?,
+            let mut todo = core::mem::take(&mut self.st.after_commit).into_iter();
+            let mut failed = None;
+            for a in todo.by_ref() {
+                let done = match a {
+                    AfterCommit::Drop { dir, ino } => self.st.read_inode(ino).and_then(|inode| self.st.drop_link(dir, ino, inode)),
+                    AfterCommit::Links { ino, delta } => self.st.adjust_links(ino, delta),
+                };
+                if let Err(e) = done {
+                    // (It and the rest stay to do.)
+                    self.st.after_commit.push(a);
+                    failed = Some(e);
+                    break;
                 }
             }
+            self.st.after_commit.extend(todo);
             // (Who holds an inode whose last link went is the owner's to know.)
             let gone = self.take_unlinked(true, &|_| true);
             self.st.deferred.extend(gone.into_iter().map(|(ino, _)| ino));
+            if let Some(e) = failed {
+                return Err(e);
+            }
+        }
+        // (A commit of that failed: nothing new before its retry.)
+        if self.st.pending {
+            return Err(EIO);
         }
         if self.st.in_use {
             let state = self.st.mount_state & !STATE_VALID;
@@ -2429,6 +2499,9 @@ impl<D: Device> Ext2<D> {
                 self.st.commit()?;
             }
             self.st.marked = true;
+        }
+        if self.st.pending {
+            return Err(EIO);
         }
         Ok(())
     }
@@ -2543,10 +2616,46 @@ impl<D: Device> Ext2<D> {
         self.looked(result)
     }
 
+    /// The inode is made durable before its name (each committed: no name ever points to
+    /// an inode the disk does not have), and a creation whose name cannot be added deletes
+    /// its durable inode in order (no links, then freed) before its parent stops counting
+    /// a directory's "..".
     pub fn create(&mut self, dir: u32, name: &str, kind: &NewNode, perm: u32) -> Result<u32, i64> {
         self.ready()?;
-        let result = self.st.create(dir, name, kind, perm);
-        self.commit(result)
+        let is_dir = matches!(kind, NewNode::Dir);
+        let (ino, ftype) = match self.st.create_inode(dir, name, kind, perm) {
+            Ok(made) => made,
+            Err(e) => {
+                let _ = self.st.commit();
+                return Err(e);
+            }
+        };
+        if let Err(e) = self.st.commit() {
+            // (Nothing names it: allocated and freed in the cache, the retry writes both.)
+            self.st.unmake(ino, dir, is_dir, true);
+            return Err(e);
+        }
+        let named = self.st.dir_add(dir, name, ino, ftype);
+        if named.is_ok() || self.st.lookup(dir, name) == Ok(ino) {
+            // (Named, in the cache at least: the retry of a failed commit writes it.)
+            let _ = self.st.commit();
+            return Ok(ino);
+        }
+        // Not named: the inode deleted on the disk, then freed, then the parent's count.
+        if let Ok(mut inode) = self.st.read_inode(ino) {
+            inode.set_links(0);
+            put32(&mut inode.0, 20, self.st.dev.now().max(1));
+            if self.st.write_inode(ino, &inode).is_ok() && self.st.commit().is_ok() {
+                if self.st.checks() {
+                    self.st.check_free(ino);
+                }
+                if self.st.release(ino, inode).is_ok() && self.st.commit().is_ok() && is_dir {
+                    let _ = self.st.adjust_links(dir, -1);
+                    let _ = self.st.commit();
+                }
+            }
+        }
+        named.map(|_| ino)
     }
 
     /// Inodes that lost their last link during the last operation, with their generations:
@@ -2558,25 +2667,37 @@ impl<D: Device> Ext2<D> {
     /// way (names may be gone in the cache), they keep their links and are left alone:
     /// freeing them could go out with the names unordered (e2fsck takes them).
     fn take_unlinked(&mut self, ok: bool, in_use: &dyn Fn(u32) -> bool) -> Vec<(u32, u32)> {
-        let dropped: Vec<(u32, RawInode)> = core::mem::take(&mut self.st.unlinked);
-        let (gone, kept): (Vec<_>, Vec<_>) = dropped.into_iter().partition(|(_, inode)| inode.links() == 0);
+        let dropped: Vec<Dropped> = core::mem::take(&mut self.st.unlinked);
         if !ok {
             // (They keep their links: names may be gone in the cache, unordered.)
-            self.st.orphan_failures += gone.len() as u32;
+            self.st.orphan_failures += dropped.iter().filter(|d| d.last).count() as u32;
             return Vec::new();
         }
-        // Inodes that keep a name: their lower count once the names' removal is durable
-        // (after a failed commit, once its retry wrote the removal: `after_commit`).
-        if !kept.is_empty() {
-            if self.st.commit().is_ok() {
-                for (ino, inode) in kept {
-                    let _ = self.st.write_inode(ino, &inode);
-                }
-                let _ = self.st.commit();
-            } else {
-                for (ino, _) in kept {
+        // Once the names' removal is durable (after a failed commit, once its retry wrote
+        // it: `after_commit`): one link less for an inode that keeps a name, applied to the
+        // inode as it is then.
+        let deltas: Vec<u32> = dropped.iter().filter(|d| !d.last).map(|d| d.ino).collect();
+        let durable = self.st.commit().is_ok();
+        if !deltas.is_empty() {
+            for ino in deltas {
+                if !durable || self.st.adjust_links(ino, -1).is_err() {
                     self.st.after_commit.push(AfterCommit::Links { ino, delta: -1 });
                 }
+            }
+            if durable {
+                let _ = self.st.commit();
+            }
+        }
+        // The inodes whose last link went, as they are now (no links from here on).
+        let mut gone = Vec::new();
+        for d in dropped.into_iter().filter(|d| d.last) {
+            match self.st.read_inode(d.ino) {
+                Ok(mut inode) => {
+                    inode.set_links(0);
+                    gone.push((d.ino, inode));
+                }
+                // (Unreadable: it keeps its links; e2fsck's.)
+                Err(_) => self.st.orphan_failures += 1,
             }
         }
         let (used, unused): (Vec<_>, Vec<_>) = gone.into_iter().partition(|&(ino, _)| in_use(ino));
@@ -2618,6 +2739,7 @@ impl<D: Device> Ext2<D> {
             inode.set_links(0);
             put32(&mut inode.0, 20, now);
             let frees = self.st.frees;
+            let parent = self.st.dotdot(ino, &inode);
             if self.st.checks() {
                 self.st.check_free(ino);
             }
@@ -2630,7 +2752,8 @@ impl<D: Device> Ext2<D> {
                 self.st.deferred.push(ino);
                 continue;
             }
-            if self.st.commit().is_err() {
+            self.freed_dir(parent);
+            if self.st.pending {
                 for (ino, _) in rest {
                     self.st.releasing.insert(ino);
                     self.st.deferred.push(ino);
@@ -2728,9 +2851,10 @@ impl<D: Device> Ext2<D> {
         self.ready()?;
         let Some(p) = self.st.rename_plan(odir, oname, ndir, nname)? else { return Ok(Vec::new()) };
         let moves_dir = p.is_dir && odir != ndir;
+        let mut gone = Vec::new();
         if !p.named {
-            // The link the new name takes.
-            // (Undone as far as it went if it cannot be committed.)
+            // The link the new name takes (a moved directory's new parent: the link of its
+            // ".."). Undone as far as it went if it cannot be committed.
             self.st.adjust_links(p.ino, 1)?;
             if moves_dir {
                 if let Err(e) = self.st.adjust_links(ndir, 1) {
@@ -2745,55 +2869,86 @@ impl<D: Device> Ext2<D> {
                 }
                 return Err(e);
             }
-            // The new name.
-            let named = match p.replaced {
+            // A moved directory's ".." first (its new parent counts it already), then the
+            // new name. Undone only when the new name is provably not there.
+            let dotdot = if moves_dir { self.st.set_dotdot(p.ino, ndir) } else { Ok(()) };
+            let named = dotdot.and_then(|_| match p.replaced {
                 Some(_) => self.st.dir_set(ndir, nname, p.ino, p.ftype),
                 None => self.st.dir_add(ndir, nname, p.ino, p.ftype),
-            };
-            let named = named.and_then(|_| if moves_dir { self.st.set_dotdot(p.ino, ndir) } else { Ok(()) });
+            });
             if let Err(e) = named {
-                // Not named (no room, say): the link goes again.
-                let _ = self.st.adjust_links(p.ino, -1);
-                if moves_dir {
-                    let _ = self.st.adjust_links(ndir, -1);
+                match (p.replaced, self.st.lookup(ndir, nname)) {
+                    // (It is there, in the cache at least: the rename goes on.)
+                    (_, Ok(i)) if i == p.ino => {}
+                    // Provably not named: no such name, or the replaced inode's still.
+                    (None, Err(ENOENT)) | (Some(_), Ok(_)) => {
+                        // The ".." back, and the links.
+                        if moves_dir {
+                            let _ = self.st.set_dotdot(p.ino, odir);
+                        }
+                        let _ = self.st.adjust_links(p.ino, -1);
+                        if moves_dir {
+                            let _ = self.st.adjust_links(ndir, -1);
+                        }
+                        let _ = self.st.commit();
+                        return Err(e);
+                    }
+                    // Not known: the extra links stay (a link too many, never a name).
+                    _ => {
+                        self.st.broken_renames.insert(p.ino);
+                        return Err(e);
+                    }
                 }
-                let _ = self.st.commit();
-                return Err(e);
             }
             if self.st.commit().is_err() {
                 // (Written by the retry, alone: the replaced inode's link goes after.)
                 if let Some(e) = p.replaced {
                     self.st.after_commit.push(AfterCommit::Drop { dir: ndir, ino: e });
                 }
+                self.st.broken_renames.insert(p.ino);
                 return Err(EIO);
             }
-        }
-        // The new name is durable: the replaced inode loses its link (an unlink's).
-        let mut gone = Vec::new();
-        if let Some(e) = p.replaced.filter(|_| !p.named) {
-            let dropped = self.st.read_inode(e).and_then(|ex| self.st.drop_link(ndir, e, ex));
-            gone = self.take_unlinked(dropped.is_ok(), &in_use);
-            dropped?;
-        }
-        // The old name, then the links it (and a moved directory's "..": its old parent's)
-        // had. If that cannot go on now, what the caller was to hold is the owner's
-        // (`take_deferred`), and the rest is done by a rename of the same names again.
-        let finish = |fs: &mut Self| -> Result<(), i64> {
-            fs.st.dir_remove(odir, oname)?;
-            if fs.st.commit().is_err() {
-                fs.st.after_commit.push(AfterCommit::Links { ino: p.ino, delta: -1 });
-                if moves_dir {
-                    fs.st.after_commit.push(AfterCommit::Links { ino: odir, delta: -1 });
+            // The new name is durable: the replaced inode loses its link (an unlink's).
+            if let Some(e) = p.replaced {
+                let dropped = self.st.read_inode(e).and_then(|ex| self.st.drop_link(ndir, e, ex));
+                if dropped.is_err() {
+                    self.st.after_commit.push(AfterCommit::Drop { dir: ndir, ino: e });
                 }
-                return Err(EIO);
+                gone = self.take_unlinked(true, &in_use);
             }
-            fs.st.adjust_links(p.ino, -1)?;
-            if moves_dir {
-                fs.st.adjust_links(odir, -1)?;
+        } else if moves_dir && self.st.lookup(p.ino, "..") != Ok(ndir) {
+            // Finishing a broken rename of a directory: its ".." to the new parent first
+            // (which counts it since the rename's first step).
+            let dotdot = self.st.set_dotdot(p.ino, ndir).and_then(|_| self.st.commit());
+            if let Err(e) = dotdot {
+                return Err(e);
             }
-            Ok(())
+        }
+        // The old name, then the links it (a moved directory's "..": its old parent's) had.
+        // Whatever cannot be done now is queued (after the retry of a failed commit) or left
+        // to a rename of the same names again; what the caller was to hold is the owner's.
+        self.st.broken_renames.insert(p.ino);
+        let removed = self.st.dir_remove(odir, oname);
+        let gone_old = match self.st.lookup(odir, oname) {
+            Err(ENOENT) => true,
+            _ => false,
         };
-        if let Err(e) = finish(self) {
+        if removed.is_err() && !gone_old {
+            self.st.deferred.extend(gone.iter().map(|&(ino, _)| ino));
+            return Err(removed.err().unwrap_or(EIO));
+        }
+        let mut drops = vec![(p.ino, -1)];
+        if moves_dir {
+            drops.push((odir, -1));
+        }
+        if self.st.commit().is_ok() {
+            drops.retain(|&(ino, delta)| self.st.adjust_links(ino, delta).is_err());
+        }
+        for (ino, delta) in drops {
+            self.st.after_commit.push(AfterCommit::Links { ino, delta });
+        }
+        self.st.broken_renames.remove(&p.ino);
+        if let Err(e) = removed {
             self.st.deferred.extend(gone.iter().map(|&(ino, _)| ino));
             return Err(e);
         }
@@ -2846,6 +3001,7 @@ impl<D: Device> Ext2<D> {
             self.st.commit()?;
         }
         let inode = self.st.read_inode(ino)?;
+        let parent = self.st.dotdot(ino, &inode);
         let frees = self.st.frees;
         if self.st.checks() {
             self.st.check_free(ino);
@@ -2859,8 +3015,21 @@ impl<D: Device> Ext2<D> {
         }
         self.st.releasing.remove(&ino);
         // (Freed: a commit that fails leaves only the durability to its retry, `ready`.)
-        let _ = self.st.commit();
+        self.freed_dir(parent);
         Ok(())
+    }
+
+    /// After a directory's free: its parent stops counting its ".." once the free is
+    /// durable (the count stays high until then: nothing that points to the parent is
+    /// left uncounted).
+    fn freed_dir(&mut self, parent: Option<u32>) {
+        let durable = self.st.commit().is_ok();
+        let Some(parent) = parent else { return };
+        if !durable || self.st.adjust_links(parent, -1).is_err() {
+            self.st.after_commit.push(AfterCommit::Links { ino: parent, delta: -1 });
+            return;
+        }
+        let _ = self.st.commit();
     }
 
     /// Frees every inode on the orphan list but those `keep` names, one at a time: each
