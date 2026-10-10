@@ -25,7 +25,7 @@ pub struct TmpOpen {
     pub path: String,
     offset: crate::sync::SleepMutex<u64>,
     /// A directory's entries, taken when it is read from the start.
-    snapshot: crate::sync::SleepMutex<Option<Vec<(String, u64, u8)>>>,
+    snapshot: crate::sync::SleepMutex<Option<(Vec<(String, u64, u8)>, crate::files::SnapshotCharge)>>,
     /// Holds write access (opened for writing).
     write: bool,
 }
@@ -260,9 +260,13 @@ impl TmpOpen {
         let mut off = self.offset.lock()?;
         let mut snapshot = self.snapshot.lock()?;
         if *off == 0 || snapshot.is_none() {
-            *snapshot = Some(self.inode.list()?);
+            // (The old one goes first: its charge with it.)
+            *snapshot = None;
+            let mut charge = crate::files::SnapshotCharge::new();
+            let entries = self.inode.list(&mut charge)?;
+            *snapshot = Some((entries, charge));
         }
-        let entries = snapshot.as_ref().expect("taken above");
+        let entries = &snapshot.as_ref().expect("taken above").0;
         let mut out = Vec::new();
         let mut next = *off;
         while let Some((name, ino, dtype)) = entries.get(next as usize) {

@@ -159,7 +159,10 @@ kernel's spinlock: they go on for a dying thread, whose server still takes them 
 and nothing about the waiter changes them; only a server thread that fails (an exception
 in the server's own code, whatever it held is lost with it) ends them, by breaking its
 instance (every program thread killed, every lock wait ended with EINTR, on which the
-waiter ends). A server thread is never ended on its own from the middle of server code: its
+waiter ends; sleeping locks' waits end too, also the service threads', which give up what
+they wanted the lock for, and a service thread whose plain lock is lost ends the service
+threads' process: the instance closes, nothing waits for good). `lxtest serverfail`, run on
+its own by autorun (`TEST_SERVER_FAIL`), checks it: the tree ends at once. A server thread is never ended on its own from the middle of server code: its
 accesses to program memory go through the copy routine, whose fault (also a page wait cut
 short by the thread's death) ends the copy with EFAULT and the call unwinds. Locks held across such waits (a file
 description's offset, an O_APPEND writer's turn, a /data inode's write-back and the making

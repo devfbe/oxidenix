@@ -181,12 +181,16 @@ pub const TURN_MASTER_WRITE: usize = 3;
 /// turn goes to `serving` (free when `next` is `serving`). A caller that writes again at
 /// once queues behind the others, so a writer flooding the terminal starves nobody (a
 /// flag that the next caller takes would let it barge in before the woken waiter runs).
-/// A waiter a signal interrupts gives its ticket up (`abandoned`, skipped when it comes).
+/// A waiter a signal interrupts gives its ticket up: the last ticket handed out is taken
+/// back (and the given-up ones before it), any other is skipped when it comes
+/// (`abandoned`). So the given-up tickets kept are only those of waiters that came before
+/// a waiter still waiting: no more than the threads that waited at once, however often a
+/// caller is interrupted, and the tickets do not run on (no wrap-around).
 #[derive(Default)]
 struct TurnQueue {
     next: u32,
     serving: u32,
-    abandoned: Vec<u32>,
+    abandoned: alloc::collections::BTreeSet<u32>,
 }
 
 impl TurnQueue {
@@ -197,9 +201,21 @@ impl TurnQueue {
     /// The turn goes to the next ticket not given up.
     fn advance(&mut self) {
         self.serving = self.serving.wrapping_add(1);
-        while let Some(i) = self.abandoned.iter().position(|&t| t == self.serving) {
-            self.abandoned.swap_remove(i);
+        while self.abandoned.remove(&self.serving) {
             self.serving = self.serving.wrapping_add(1);
+        }
+    }
+
+    /// Ticket `ticket`'s waiter gives up (not served yet).
+    fn give_up(&mut self, ticket: u32) {
+        if ticket == self.next.wrapping_sub(1) {
+            self.next = ticket;
+            // Given-up tickets now last go too.
+            while self.next != self.serving && self.abandoned.remove(&self.next.wrapping_sub(1)) {
+                self.next = self.next.wrapping_sub(1);
+            }
+        } else {
+            self.abandoned.insert(ticket);
         }
     }
 }
@@ -635,7 +651,7 @@ impl Tty {
                     q.advance();
                     self.turn_advanced(which);
                 } else {
-                    q.abandoned.push(ticket);
+                    q.give_up(ticket);
                 }
                 return Err(EINTR);
             }
@@ -950,7 +966,10 @@ impl Tty {
             let mut inner = self.inner.lock();
             let out = match inner.pty.as_mut() {
                 Some(p) => {
-                    p.out.push_back(c);
+                    // Within the room echoes have (TCXONC in a loop does not grow it).
+                    if p.out.len() < MASTER_CAP + ECHO_ROOM && p.out.try_reserve(1).is_ok() {
+                        p.out.push_back(c);
+                    }
                     None
                 }
                 None => Some([c]),

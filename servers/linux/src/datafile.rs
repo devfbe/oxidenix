@@ -27,7 +27,7 @@ pub struct DataOpen {
     offset: crate::sync::SleepMutex<u64>,
     /// A directory's entries, taken when it is read from the start (as
     /// tmpfs's: removing entries while reading skips none).
-    snapshot: crate::sync::SleepMutex<Option<Vec<(u32, u8, Vec<u8>)>>>,
+    snapshot: crate::sync::SleepMutex<Option<(Vec<(u32, u8, Vec<u8>)>, crate::files::SnapshotCharge)>>,
     /// Holds write access (opened for writing).
     write: bool,
     /// O_DIRECT reads come from the disk; O_SYNC and O_DSYNC writes are
@@ -261,9 +261,13 @@ impl DataOpen {
         let mut off = self.offset.lock()?;
         let mut snapshot = self.snapshot.lock()?;
         if *off == 0 || snapshot.is_none() {
-            *snapshot = Some(self.list()?);
+            // (The old one goes first: its charge with it.)
+            *snapshot = None;
+            let mut charge = crate::files::SnapshotCharge::new();
+            let entries = self.list(&mut charge)?;
+            *snapshot = Some((entries, charge));
         }
-        let entries = snapshot.as_ref().expect("taken above");
+        let entries = &snapshot.as_ref().expect("taken above").0;
         let mut out = Vec::new();
         let mut next = *off;
         while let Some((ino, dtype, name)) = entries.get(next as usize) {
@@ -294,13 +298,15 @@ impl DataOpen {
     /// Every entry of the directory ("." and ".." included), at most
     /// `MAX_ENTRIES` (more than an ext2 directory holds: diskfs's listing
     /// is not trusted to end).
-    fn list(&self) -> Result<Vec<(u32, u8, Vec<u8>)>, i64> {
+    fn list(&self, charge: &mut crate::files::SnapshotCharge) -> Result<Vec<(u32, u8, Vec<u8>)>, i64> {
         const MAX_ENTRIES: usize = 1 << 20;
         const ENOMEM: i64 = 12;
         let mut all = Vec::new();
         let mut cursor = 0;
         loop {
             let (entries, next) = datafs::readdir(&self.inode, cursor)?;
+            charge.add(entries.iter().map(|(_, _, n)| n.len() + 48).sum())?;
+            all.try_reserve(entries.len()).map_err(|_| ENOMEM)?;
             all.extend(entries);
             if all.len() > MAX_ENTRIES {
                 return Err(ENOMEM);

@@ -51,6 +51,14 @@ const EINVAL: i64 = 22;
 const ESPIPE: i64 = 29;
 const ENOTTY: i64 = 25;
 const ELOOP: i64 = 40;
+const ENOSPC: i64 = 28;
+
+/// Most interests (items) in all epoll instances of the tree (Linux's
+/// fs.epoll.max_user_watches, per user: everyone in a tree is root): beyond
+/// it EPOLL_CTL_ADD is ENOSPC, so instances times descriptors cannot fill
+/// the server's heap.
+const MAX_WATCHES: usize = 65536;
+static WATCHES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 const ETIMEDOUT: i64 = 110;
 
 const EPOLLIN: u32 = 0x1;
@@ -128,6 +136,13 @@ pub struct Item {
     /// On the ready list.
     queued: AtomicBool,
     removed: AtomicBool,
+}
+
+impl Drop for Item {
+    fn drop(&mut self) {
+        // (Never below zero: a wrapped count would be no bound.)
+        let _ = WATCHES.try_update(SeqCst, SeqCst, |c| Some(c.saturating_sub(1)));
+    }
 }
 
 impl Item {
@@ -301,7 +316,12 @@ impl Epoll {
         }
         // (Files that are always ready have no watch: EPERM before.)
         let watch = target.watch.clone().ok_or(EPERM)?;
-        let item = Arc::new(Item {
+        // Counted from here; the item value owns it and its drop gives it back, exactly once
+        // (also when no memory is found for it: `Arc::try_new` drops the value).
+        if WATCHES.try_update(SeqCst, SeqCst, |c| (c < MAX_WATCHES).then_some(c + 1)).is_err() {
+            return Err(ENOSPC);
+        }
+        let item = Arc::try_new(Item {
             key,
             file: Arc::downgrade(target.arc()),
             watch: watch.clone(),
@@ -310,7 +330,8 @@ impl Epoll {
             data: AtomicU64::new(data),
             queued: AtomicBool::new(false),
             removed: AtomicBool::new(false),
-        });
+        })
+        .map_err(|_| ENOMEM)?;
         // Room for every item on the ready list before anything can fail
         // halfway.
         {

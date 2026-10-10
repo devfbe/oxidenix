@@ -275,7 +275,57 @@ static void more(int ep) {
     close(p[1]);
 }
 
+/* The tree's bound on epoll interests (Linux's max_user_watches): adding until ENOSPC, every
+ * way an interest goes gives its place back exactly once (EPOLL_CTL_DEL, the watched file's
+ * last close, the instance's close), so the same number fits again afterwards. */
+enum { DUPS = 1500, INSTANCES = 64 };
+static int fill_watches(int *eps, int neps, const int *fds, int nfds) {
+    int added = 0;
+    for (int e = 0; e < neps; e++) {
+        for (int f = 0; f < nfds; f++) {
+            if (add(eps[e], fds[f], EPOLLIN, 0) != 0) {
+                return errno == ENOSPC ? added : -1;
+            }
+            added++;
+        }
+    }
+    return added;
+}
+
+static void watch_bound(void) {
+    static int fds[DUPS], eps[INSTANCES];
+    int p[2];
+    pipe(p);
+    for (int i = 0; i < DUPS; i++) fds[i] = dup(p[0]);
+    for (int e = 0; e < INSTANCES; e++) eps[e] = epoll_create1(0);
+    int first = fill_watches(eps, INSTANCES, fds, DUPS);
+    int full = first > 0 && add(eps[INSTANCES - 1], p[0], EPOLLIN, 0) == -1 && errno == ENOSPC;
+    check("epoll interests are bounded for the tree (ENOSPC)", first > 60000 && full);
+    /* EPOLL_CTL_DEL gives one place back, once. */
+    int del = epoll_ctl(eps[0], EPOLL_CTL_DEL, fds[0], NULL) == 0;
+    int one = add(eps[INSTANCES - 1], p[0], EPOLLIN, 0) == 0;
+    int again = add(eps[INSTANCES - 2], p[0], EPOLLIN, 0) == -1 && errno == ENOSPC;
+    check("... EPOLL_CTL_DEL gives exactly one back", del && one && again);
+    /* Closing the watched descriptions (every duplicate) and the instances gives all back:
+     * the same number fits again. */
+    for (int i = 0; i < DUPS; i++) close(fds[i]);
+    for (int e = 0; e < INSTANCES; e++) close(eps[e]);
+    close(p[0]);
+    close(p[1]);
+    pipe(p);
+    for (int i = 0; i < DUPS; i++) fds[i] = dup(p[0]);
+    for (int e = 0; e < INSTANCES; e++) eps[e] = epoll_create1(0);
+    int second = fill_watches(eps, INSTANCES, fds, DUPS);
+    printf("    (%d interests, then %d after closing)\n", first, second);
+    check("... closing files and instances gives every place back", second == first);
+    for (int i = 0; i < DUPS; i++) close(fds[i]);
+    for (int e = 0; e < INSTANCES; e++) close(eps[e]);
+    close(p[0]);
+    close(p[1]);
+}
+
 int main(void) {
+    watch_bound();
     int ep = epoll_create1(EPOLL_CLOEXEC);
     check("epoll_create1(EPOLL_CLOEXEC)", ep >= 0 && (fcntl(ep, F_GETFD) & FD_CLOEXEC));
     check("epoll_create rejects a size of 0", epoll_create(0) == -1 && errno == EINVAL);

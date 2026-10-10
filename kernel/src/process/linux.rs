@@ -1194,6 +1194,12 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
     if nr == SYS_THREAD_EXIT {
         // Before anything of this call is on the stack: it does not return.
         if is_pager() {
+            // A service thread ends only with its instance, or when the
+            // instance broke and a lock it waits for is lost (`break_instance`):
+            // then the service threads' process ends, and the instance with it.
+            if instance_broken() {
+                super::exit_group(super::kill::SIGKILL as i32);
+            }
             return Err(EPERM);
         }
         let status = a[0] as i32;
@@ -1519,6 +1525,7 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
                 0 => Ends::Dying,
                 FUTEX_INTERRUPTIBLE => Ends::Interrupted,
                 FUTEX_LOCK => Ends::Lock,
+                FUTEX_SLEEPLOCK => Ends::SleepLock,
                 _ => return Err(EINVAL),
             };
             let deadline = (deadline != 0).then_some(deadline);
@@ -1823,8 +1830,6 @@ pub fn kick_task(t: &Arc<super::task::Task>) {
     super::kill::kick(t);
 }
 
-/// Kills a Linux program's thread: marked dying and kicked, it exits at its
-/// next `restricted_enter`.
 /// Whether the calling thread's instance is broken (`break_instance`).
 pub fn instance_broken() -> bool {
     with_current(|p| p.linux.as_ref().is_some_and(|l| l.instance.broken.load(core::sync::atomic::Ordering::Acquire)))
@@ -1849,6 +1854,8 @@ pub fn break_instance() {
     super::futex::shake_server(Arc::as_ptr(&instance) as usize);
 }
 
+/// Kills a Linux program's thread: marked dying and kicked, it exits at its
+/// next `restricted_enter`.
 pub fn kill_task(t: &Arc<super::task::Task>) {
     t.killed.store(true, core::sync::atomic::Ordering::SeqCst);
     kick_task(t);
