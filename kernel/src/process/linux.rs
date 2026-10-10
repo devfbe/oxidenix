@@ -734,7 +734,16 @@ impl Instance {
         if missing == 0 {
             return Ok(0);
         }
-        if !memory::commit(missing) {
+        if !memory::commit_server(missing) {
+            let (committed, limit) = memory::commit_stats();
+            crate::printkln!(
+                "[linux] instance {}: heap commit of {} pages refused (committed {}, dirty or pinned {}, limit {})",
+                self.id,
+                missing,
+                committed,
+                crate::fs::cache::unavailable_pages(),
+                limit
+            );
             return Err(ENOMEM);
         }
         // Each page committed exactly while it is mapped: what is mapped

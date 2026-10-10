@@ -195,8 +195,8 @@ grow by 18 MiB that stayed committed for the tree's life (Committed_AS 30.4 → 
 
 **The kernel's part.** The heap area (`HEAP_BASE..THREADS_BASE`, 192 GiB) is address space the
 server lays out itself. `shared_commit(addr, len)` commits each page of the range that is not
-(charged against the commit limit up front, as a program's private page; ENOMEM at the limit,
-without waiting for write-back, since the caller may hold locks the pager needs) and maps it
+(charged against the commit limit up front; ENOMEM at the limit, without waiting for
+write-back, since the caller may hold locks the pager needs) and maps it
 zeroed, waiting for reclaim for its frame as a fault does; `shared_decommit(addr, len)` unmaps
 the range's pages from every view of the region, shoots their TLB entries down (in batches whose
 frames wait on the stack: nothing is allocated) and frees them with their commitment. A page is
@@ -208,6 +208,19 @@ own copies from server memory end at their fixup (EFAULT). A futex wait on a hea
 reference on the word's frame, taken with the frames locked (a decommit frees the frame with them
 locked only after it cleared the entry), so a concurrent decommit cannot free the frame under
 the wait.
+
+**The servers' reserve.** A server cannot fail an allocation but by breaking its instance, and
+a heap that gives memory back must commit again later, possibly when its programs have taken
+everything they may (reclaimtest does). So programs' commits leave a reserve of the commit
+limit to the servers' heaps (`memory::commit_server`): a 32nd of the limit, at most 8 MiB, as
+Linux's admin reserve under strict overcommit. `CommitLimit` in /proc/meminfo is what programs
+may reach (the limit less the reserve); `Committed_AS` counts the heaps too. A commit refused
+at the programs' limit also asks the servers to shrink, which refills the reserve. Unlike a
+program's commit, a heap's does not count the dirty and pinned cache pages as taken: the server
+is what writes them back, so its memory must not wait for them (in reclaimtest, dirty pages
+filled the reserve and the server failed on its next commit); the frames it may take beyond the
+guarantee are bounded by the reserve, and reclaim gets them back once write-back made the
+pages droppable. A refused heap commit is logged (`heap commit of N pages refused`).
 
 **The allocator** (`pageheap`, host-tested with a model of the kernel that poisons decommitted
 pages and checks the poison when they are committed again):

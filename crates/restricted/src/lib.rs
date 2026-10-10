@@ -348,8 +348,8 @@ pub const TEST_PAGED_FAIL: u64 = 1508;
 /// `shared_commit(addr, len) -> pages`: makes the pages of
 /// [`addr`, `addr + len`) (page-aligned, within `HEAP_BASE..THREADS_BASE`)
 /// memory for every thread of the instance: each page not committed yet is
-/// committed (charged against the commit limit, as a program's private
-/// page) and mapped zeroed; returns how many were. ENOMEM when the commit
+/// committed (charged against the commit limit, which keeps a reserve
+/// for the servers' heaps that programs cannot take) and mapped zeroed; returns how many were. ENOMEM when the commit
 /// limit or memory is exhausted (nothing waits for write-back: the caller
 /// may hold locks the pager needs); some pages of the range may be
 /// committed then, and the caller decommits the range to know its state.
