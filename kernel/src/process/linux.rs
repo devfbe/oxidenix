@@ -215,6 +215,35 @@ fn zeroed_frame() -> Result<PhysFrame, i64> {
     Ok(frame)
 }
 
+/// Pages of commitment each instance holds for its heap beyond what is
+/// mapped there (2 MiB): a server cannot fail an allocation but by breaking
+/// its instance, and a heap that gives memory back has to commit again
+/// later, maybe when its programs have taken all there is or dirty pages
+/// crowd the limit (the server is what writes them back). The reserve is
+/// the instance's own (no other tree can take it) and counted as committed
+/// for everyone (the commit guarantee holds); commits beyond it are
+/// ordinary ones.
+const HEAP_RESERVE: u64 = 512;
+
+/// The heap area's charge beyond its mapped pages (`Instance::heap`).
+pub struct HeapReserve {
+    /// Reserve pages not mapped now (at most `HEAP_RESERVE`).
+    free: u64,
+    /// A refused commit was logged (once per instance).
+    refused_told: bool,
+}
+
+impl HeapReserve {
+    /// `pages` of commitment come back (pages decommitted, or a commit's
+    /// that could not be mapped): the reserve is filled first, the rest
+    /// returned. The instance's charge stays its mapped pages plus `free`.
+    fn give_back(&mut self, pages: u64) {
+        let refill = pages.min(HEAP_RESERVE - self.free);
+        self.free += refill;
+        memory::uncommit(pages - refill);
+    }
+}
+
 /// Pages `Instance::unmap_pages` takes off at a time (their frames on the
 /// stack until the shootdown).
 const UNMAP_BATCH: usize = 64;
@@ -304,7 +333,7 @@ pub struct Instance {
     /// (`HEAP_BASE..THREADS_BASE`) change and while a word there is taken
     /// for a wait (`word`); the pages committed there (each exactly while
     /// it is mapped, `SYS_SHARED_COMMIT`).
-    heap: crate::sync::Mutex<()>,
+    heap: crate::sync::Mutex<HeapReserve>,
     heap_pages: core::sync::atomic::AtomicU64,
     /// Memory is short: the service thread gets `EVENT_SHRINK` (a flag,
     /// `post_shrink`), at most once per `SHRINK_INTERVAL` (when it got the
@@ -471,7 +500,7 @@ impl Instance {
                 announced: 0,
             }),
             programs: core::sync::atomic::AtomicUsize::new(0),
-            heap: crate::sync::Mutex::new(()),
+            heap: crate::sync::Mutex::new(HeapReserve { free: 0, refused_told: false }),
             heap_pages: core::sync::atomic::AtomicU64::new(0),
             shrink: core::sync::atomic::AtomicBool::new(false),
             shrunk_at: core::sync::atomic::AtomicU64::new(0),
@@ -484,6 +513,12 @@ impl Instance {
             broken: core::sync::atomic::AtomicBool::new(false),
         };
         instance.entry = instance.load(image)?;
+        // The heap's reserve, charged like any commitment (dropping the
+        // instance returns it).
+        if !memory::commit(HEAP_RESERVE) {
+            return Err(ENOMEM);
+        }
+        instance.heap.get_mut().free = HEAP_RESERVE;
         // Counted from here on (its drop uncounts it).
         LIVE.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
         let instance = Arc::try_new(instance).map_err(|_| ENOMEM)?;
@@ -728,24 +763,31 @@ impl Instance {
     /// heap area's [addr, addr + len) that are not; returns how many.
     fn commit_heap(&self, addr: u64, len: u64) -> Result<u64, i64> {
         let end = heap_range(addr, len)?;
-        let _area = self.heap.lock();
+        let mut area = self.heap.lock();
         let mapper = unsafe { OffsetPageTable::new(table_at(self.view), memory::phys_offset()) };
         let missing = (addr..end).step_by(PAGE as usize).filter(|&at| mapper.translate_page(heap_page(at)).is_err()).count() as u64;
         if missing == 0 {
             return Ok(0);
         }
-        if !memory::commit_server(missing) {
-            let (committed, limit) = memory::commit_stats();
-            crate::printkln!(
-                "[linux] instance {}: heap commit of {} pages refused (committed {}, dirty or pinned {}, limit {})",
-                self.id,
-                missing,
-                committed,
-                crate::fs::cache::unavailable_pages(),
-                limit
-            );
+        // From the instance's own reserve first (committed already), the
+        // rest as any commitment.
+        let from_reserve = missing.min(area.free);
+        if missing > from_reserve && !memory::commit(missing - from_reserve) {
+            // Said once per instance (a tree can make it happen at will).
+            if !core::mem::replace(&mut area.refused_told, true) {
+                let (committed, limit) = memory::commit_stats();
+                crate::printkln!(
+                    "[linux] instance {}: heap commit of {} pages refused beyond its reserve (committed {}, dirty or pinned {}, limit {})",
+                    self.id,
+                    missing,
+                    committed,
+                    crate::fs::cache::unavailable_pages(),
+                    limit
+                );
+            }
             return Err(ENOMEM);
         }
+        area.free -= from_reserve;
         // Each page committed exactly while it is mapped: what is mapped
         // when a frame or a table cannot be had stays (the caller
         // decommits the range), the rest of the commitment goes back.
@@ -761,8 +803,8 @@ impl Instance {
             }
             mapped += 1;
         }
-        memory::uncommit(missing - mapped);
         self.heap_pages.fetch_add(mapped, core::sync::atomic::Ordering::Relaxed);
+        area.give_back(missing - mapped);
         result
     }
 
@@ -771,10 +813,10 @@ impl Instance {
     /// commitment; how many there were.
     fn decommit_heap(&self, addr: u64, len: u64) -> Result<u64, i64> {
         let end = heap_range(addr, len)?;
-        let _area = self.heap.lock();
+        let mut area = self.heap.lock();
         let gone = self.unmap_pages(addr, (end - addr) / PAGE);
         self.heap_pages.fetch_sub(gone, core::sync::atomic::Ordering::Relaxed);
-        memory::uncommit(gone);
+        area.give_back(gone);
         Ok(gone)
     }
 
@@ -1164,7 +1206,7 @@ impl Drop for Instance {
     /// No address space shows the region any more: its frames go.
     fn drop(&mut self) {
         crate::drivers::console_device::release(self.id);
-        memory::uncommit(self.heap_pages.load(core::sync::atomic::Ordering::Relaxed));
+        memory::uncommit(self.heap_pages.load(core::sync::atomic::Ordering::Relaxed) + self.heap.get_mut().free);
         memory::with_frames(|frames| unsafe {
             free_level(frames, self.pdpt, 3);
             frames.deallocate_frame(self.view);

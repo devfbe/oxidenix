@@ -312,49 +312,15 @@ pub fn set_reclaim(f: fn(u64, bool) -> u64) {
     RECLAIM.call_once(|| f);
 }
 
-/// The most of the commit limit kept for the Linux servers' heaps
-/// (`commit_server`): programs' commits leave a 32nd of it, at most 8 MiB
-/// (Linux's admin reserve under strict overcommit), so a server that has
-/// to allocate while its programs took all they could still can (it has no
-/// way to fail but breaking its instance).
-const SERVER_RESERVE_MAX: u64 = 2048;
-
-fn server_reserve(limit: u64) -> u64 {
-    (limit / 32).min(SERVER_RESERVE_MAX)
-}
-
-/// What programs may commit (the limit less the servers' reserve): the
-/// `CommitLimit` they are told.
-pub fn user_commit_limit() -> u64 {
-    let limit = COMMIT_LIMIT.load(core::sync::atomic::Ordering::Relaxed);
-    limit - server_reserve(limit)
-}
-
-/// Promises `pages` pages for a program (or for memory a program makes:
-/// tmpfs, anonymous shared memory); false (nothing promised) if over what
-/// programs may commit.
+/// Promises `pages` pages; false (nothing promised) if over the limit.
 pub fn commit(pages: u64) -> bool {
-    commit_within(pages, true)
-}
-
-/// Promises `pages` pages of a Linux server's heap (`SYS_SHARED_COMMIT`),
-/// which may take the servers' reserve too.
-pub fn commit_server(pages: u64) -> bool {
-    commit_within(pages, false)
-}
-
-fn commit_within(pages: u64, user: bool) -> bool {
     // Cache pages reclaim cannot drop now (dirty, pinned) are not there for
     // the commitment: they count as taken until write-back or the grant
     // ends (stores wait meanwhile rather than crowd out what was promised,
     // `fs::cache::balance_dirty`).
-    // A server's commit does not count them: it is what writes them back
-    // (and ends the pins), so its memory must not wait for them; the frames
-    // it takes beyond the guarantee are at most the reserve, and reclaim
-    // gets them back once write-back made the dirty pages droppable.
-    let unavailable = if user { crate::fs::cache::unavailable_pages() } else { 0 };
+    let unavailable = crate::fs::cache::unavailable_pages();
     let mut a = ACCOUNT.lock();
-    let limit = if user { user_commit_limit() } else { COMMIT_LIMIT.load(core::sync::atomic::Ordering::Relaxed) };
+    let limit = COMMIT_LIMIT.load(core::sync::atomic::Ordering::Relaxed);
     if a.committed.saturating_add(pages).saturating_add(unavailable) > limit {
         drop(a);
         // The Linux servers give back what they keep committed and free.
@@ -375,14 +341,14 @@ static SHRINK_WANTED: core::sync::atomic::AtomicBool = core::sync::atomic::Atomi
 /// promised.
 pub fn commit_blocked_by_cache(pages: u64) -> bool {
     let unavailable = crate::fs::cache::unavailable_pages();
-    let (committed, limit) = (commit_stats().0, user_commit_limit());
+    let (committed, limit) = commit_stats();
     unavailable > 0 && committed.saturating_add(pages) <= limit
 }
 
 /// Whether a commit of `pages` would fit now (the cache's dirty and
 /// pinned pages counted as taken, as `commit` counts them).
 fn commit_fits(pages: u64) -> bool {
-    let (committed, limit) = (commit_stats().0, user_commit_limit());
+    let (committed, limit) = commit_stats();
     committed.saturating_add(pages).saturating_add(crate::fs::cache::unavailable_pages()) <= limit
 }
 

@@ -422,6 +422,8 @@ About 13,100 lines of Rust (without comments and blank lines) in the kernel (16,
   address space unlocked (mmap, mprotect, mremap, faults). A background reclaimer (a kernel
   thread, Linux's kswapd) keeps free memory above the low watermark for allocations that
   cannot reclaim themselves. A heuristic overcommit mode would need a real OOM killer first.
+  Each Linux server instance holds 2 MiB of commitment for its heap beyond what is mapped
+  there (its own reserve: a server cannot fail an allocation but by breaking its instance).
   `/proc/meminfo` shows `Committed_AS`, `CommitLimit`, `Cached` (with tmpfs), `Shmem` (tmpfs and
   shared memory), `Writeback` (pinned for the disk server) and a `MemAvailable` that includes
   the droppable pages.

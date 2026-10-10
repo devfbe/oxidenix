@@ -182,10 +182,9 @@ space, and the walks (truncation, write-back) drop it before they lock a mapper.
   counts the pinned pages.
 - **Overcommit** stays strict (`overcommit_memory=2`, ratio 100%). A heuristic mode as Linux's
   default would let touches of promised memory fail at fault time; it needs a real OOM killer
-  first (one that picks its victim by size, not the toucher). Programs may commit the limit
-  less a reserve for the Linux servers' heaps (a 32nd, at most 8 MiB, as Linux's admin reserve;
-  `CommitLimit` shows what programs may reach): a server cannot fail an allocation but by
-  breaking its instance (linux-server.md, "The server's heap").
+  first (one that picks its victim by size, not the toucher). Each Linux server instance holds
+  2 MiB of commitment for its heap beyond what is mapped there, its own (a server cannot fail an
+  allocation but by breaking its instance; linux-server.md, "The server's heap").
 - The file metadata quota (inodes, symlink targets, pipes) on the kernel heap stays.
 
 ### Disk files

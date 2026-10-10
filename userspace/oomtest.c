@@ -433,6 +433,22 @@ static void heap_returns(long start_committed, struct heap start) {
     for (int i = 0; i < 30 && (h = server_heap()).free >= before.free && before.free > 64 * 1024; i++) usleep(100 * 1000);
     printf("shrink: free %lu kB before, %lu kB after\n", before.free / 1024, h.free / 1024);
     check("a refused commit makes the server shrink its heap", big == MAP_FAILED && (h.free < before.free || before.free <= 64 * 1024));
+    /* With every page programs may commit taken (the heap shrunk to
+     * nothing free), the server still allocates: from its instance's
+     * reserve (TEST_ALLOC keeps about 1.4 MiB of blocks for a moment). */
+    long left = (meminfo("CommitLimit:") - meminfo("Committed_AS:")) * 1024;
+    void *all = MAP_FAILED;
+    for (long len = left; all == MAP_FAILED && len > 0; len -= 256 * 1024) {
+        all = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (all != MAP_FAILED) left = len;
+    }
+    void *more = mmap(NULL, 512 * 1024, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    long r = syscall(1509 /* TEST_ALLOC */, 60);
+    printf("reserve: %ld kB taken by the program, a further 512 kB %s, the server's allocations %s\n", left / 1024,
+           more == MAP_FAILED ? "refused" : "granted", r == 0 ? "served" : "failed");
+    check("with all commitment taken the server allocates from its reserve", all != MAP_FAILED && more == MAP_FAILED && r == 0);
+    if (all != MAP_FAILED) munmap(all, left);
+    if (more != MAP_FAILED) munmap(more, 512 * 1024);
 }
 
 int main(void) {

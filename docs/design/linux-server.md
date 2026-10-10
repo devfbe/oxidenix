@@ -209,18 +209,18 @@ reference on the word's frame, taken with the frames locked (a decommit frees th
 locked only after it cleared the entry), so a concurrent decommit cannot free the frame under
 the wait.
 
-**The servers' reserve.** A server cannot fail an allocation but by breaking its instance, and
-a heap that gives memory back must commit again later, possibly when its programs have taken
-everything they may (reclaimtest does). So programs' commits leave a reserve of the commit
-limit to the servers' heaps (`memory::commit_server`): a 32nd of the limit, at most 8 MiB, as
-Linux's admin reserve under strict overcommit. `CommitLimit` in /proc/meminfo is what programs
-may reach (the limit less the reserve); `Committed_AS` counts the heaps too. A commit refused
-at the programs' limit also asks the servers to shrink, which refills the reserve. Unlike a
-program's commit, a heap's does not count the dirty and pinned cache pages as taken: the server
-is what writes them back, so its memory must not wait for them (in reclaimtest, dirty pages
-filled the reserve and the server failed on its next commit); the frames it may take beyond the
-guarantee are bounded by the reserve, and reclaim gets them back once write-back made the
-pages droppable. A refused heap commit is logged (`heap commit of N pages refused`).
+**The instance's reserve.** A server cannot fail an allocation but by breaking its instance,
+and a heap that gives memory back must commit again later, possibly when its programs have
+taken everything they may or dirty pages crowd the limit (the server is what writes them back;
+in reclaimtest a heap commit was refused that way). So each instance holds 2 MiB of commitment
+beyond its mapped heap pages (`HEAP_RESERVE`, charged when the instance is made, like any
+commitment, and returned when it goes): a heap commit takes from it first and is an ordinary
+commit (counting dirty and pinned pages) only beyond it; a decommit refills it before it
+returns commitment. The instance's charge is always its mapped heap pages plus the free reserve,
+so the commit guarantee holds (the reserve counts as committed for everyone), nothing is
+refunded that was not charged, and no tree can take another's reserve. A heap commit refused
+beyond the reserve is logged once per instance (a tree can cause it at will).
+
 
 **The allocator** (`pageheap`, host-tested with a model of the kernel that poisons decommitted
 pages and checks the poison when they are committed again):
@@ -254,7 +254,8 @@ workload that frees and allocates in turn does not commit and decommit all the t
 pages are decommitted from the arena's top down until 1 MiB, or an eighth of what is allocated,
 is left. When memory is short, the kernel's background reclaimer (below its low watermark, or
 after a commit was refused at the limit) flags every instance, and the service thread gets
-`EVENT_SHRINK` (at most once a second per instance): the heap keeps no free page and gives back
+`EVENT_SHRINK` (a flag per instance, so requests coalesce, delivered at most once a second; one
+tree's refused commits cost the others at most a trim and an inode-cache pass a second): the heap keeps no free page and gives back
 the classes' empty slabs, and `/data`'s unused clean inodes go with their cached objects
 (Linux's shrinkers). After `oomtest` the heap is back within 2 MiB of where it started and
 Committed_AS 1.5 MB above its start (the test checks both, within 2 MiB and 4 MB, and the

@@ -39,8 +39,7 @@ fn system() -> System {
         s.max_pid = table.next_pid;
     }
     s.forks = sched::forks();
-    // (The limit programs may reach: the servers' reserve is not theirs.)
-    let (committed, limit) = (crate::memory::commit_stats().0, crate::memory::user_commit_limit());
+    let (committed, limit) = crate::memory::commit_stats();
     s.committed = committed * 4096;
     s.commit_limit = limit * 4096;
     let shmem = crate::fs::cache::tmpfs_usage().0;
