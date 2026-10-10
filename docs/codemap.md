@@ -30,14 +30,14 @@ module comment, and the public types it defines. Where to start for common tasks
 - `kernel/src/memory/frame.rs` (148) The physical frame allocator: fresh frames from the bootloader's usable regions, freed ones on an intrusive free list, with reference counts for shared and copy-on-write frames. Types: `PhysFrameAllocator`, `UserFrames`.
 - `kernel/src/memory/kstack.rs` (124) Kernel stacks. Types: `KernelStack`.
 - `kernel/src/memory/mod.rs` (269) Kernel memory: the frame allocator, the kernel heap (slab size classes over a first-fit heap), mappings of physical memory, and the commit and page-cache accounting. Types: `Caching`, `Stats`.
-- `kernel/src/process/address_space.rs` (1203) A process's virtual memory: its page tables and the areas (VMAs) that say what each address range is. Types: `Prot`, `Backing`, `Vma`, `MemStats`, `Fault`, `Access`, `AddressSpace`, `Mm`.
+- `kernel/src/process/address_space.rs` (1208) A process's virtual memory: its page tables and the areas (VMAs) that say what each address range is. Types: `Prot`, `Backing`, `Vma`, `MemStats`, `Fault`, `Access`, `AddressSpace`, `Mm`.
 - `kernel/src/process/channel.rs` (727) Channels: the kernel's part of the data plane between the Linux server and the device servers (docs/design/io-rings.md, ADR 0005). Types: `Channel`, `Grant`, `DmaDomain`, `ClientEnd`.
 - `kernel/src/process/clock.rs` (16) The clocks a thread reads (`restricted::SYS_CLOCK_READ`): the wall clock, the monotonic clock, and the CPU time of its own process and of itself, by the kernel's clock ids (`restricted::CLOCK_*`).
 - `kernel/src/process/elf.rs` (81) Parsing ELF64 headers and program headers of static executables (for `loader`). Types: `Elf`, `ProgramHeader`, `Header`.
 - `kernel/src/process/errno.rs` (30) The kernel's error numbers, as its calls return them (negated): Linux's values, which the Linux server passes on to its programs unchanged.
 - `kernel/src/process/exec.rs` (50) A native server running its program anew (`oxrt::sys::EXEC`): the calling process gets a fresh address space with the server's program (the image the kernel read at boot; the kernel has no paths) and the given...
 - `kernel/src/process/exit.rs` (148) Ending threads and processes, and the kernel's wait for its own. Types: `WaitStatus`.
-- `kernel/src/process/futex.rs` (509) Futexes: sleeping on a word of user memory, the mechanism under every pthread mutex, condition variable and join. Types: `Ends`, `WaitWord`.
+- `kernel/src/process/futex.rs` (575) Futexes: sleeping on a word of user memory, the mechanism under every pthread mutex, condition variable and join. Types: `Ends`, `WaitWord`.
 - `kernel/src/process/ipc.rs` (282) Synchronous message passing between the kernel and user-space servers: the control plane of the I/O rings. Types: `Instance`.
 - `kernel/src/process/irq.rs` (52) Device interrupts for user-space drivers.
 - `kernel/src/process/kill.rs` (93) Killing threads and processes, and what the kernel's waits ask about it (`interrupted`, `dying`). Types: `GroupExit`.

@@ -215,7 +215,7 @@ pub fn run_program(args: &[&str]) -> Option<crate::process::WaitStatus> {
     // The tree's first process ended: the console is the monitor's again
     // and the host grant goes (what is left of the tree finds its terminal
     // hung up and the machine's state no longer its to change).
-    tree.end();
+    drop(tree);
     crate::process::reap_orphans();
     result
 }

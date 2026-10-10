@@ -954,14 +954,14 @@ impl Drop for Record {
     }
 }
 
-/// Grants the console device to `instance` (None: the kernel's monitor, which
-/// takes it back when the tree it started has ended its first process); the
-/// instance that held it gets `EVENT_CONSOLE_LOST` (ADR 0007).
 /// Gives `instance` the host grant (see `Instance::host`), or takes it.
 pub fn host_grant(instance: &Instance, on: bool) {
     instance.host.store(on, core::sync::atomic::Ordering::Release);
 }
 
+/// Grants the console device to `instance` (None: the kernel's monitor, which
+/// takes it back when the tree it started has ended its first process); the
+/// instance that held it gets `EVENT_CONSOLE_LOST` (ADR 0007).
 pub fn console_grant(instance: Option<&Arc<Instance>>) {
     let (id, chan) = instance.map_or((0, 0), |i| (i.id, i.pager_chan()));
     let old = crate::drivers::console_device::set_holder(id, chan);
