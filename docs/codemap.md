@@ -334,6 +334,7 @@ kernel that handle them.
 - `docs/benchmarks/2026-10-09-802b396-quiet.md` Benchmark 802b396 (quiet)
 - `docs/benchmarks/2026-10-09-bdf16a2-pre-procfs-rings.md` Benchmark bdf16a2 (pre-procfs-rings)
 - `docs/benchmarks/2026-10-09-ec81472-procfs-rings.md` Benchmark ec81472 (procfs-rings)
+- `docs/benchmarks/2026-10-10-b1fea5d-memfix.md` Benchmark b1fea5d (memfix)
 - `docs/benchmarks/README.md` Benchmarks
 - `docs/decisions/0001-linux-abi-in-a-user-space-server.md` ADR 0001: The Linux ABI moves out of the kernel, into a server in restricted mode
 - `docs/decisions/0002-one-linux-server-per-process-tree.md` ADR 0002: One Linux server instance per process tree
