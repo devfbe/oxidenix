@@ -202,8 +202,8 @@ the area's lock is taken (never a wait: the server may be what writes back; ENOM
 the heap's null); `shared_decommit(addr, len)` unmaps
 the range's pages from every view of the region, shoots their TLB entries down (in batches whose
 frames wait on the stack: nothing is allocated) and frees them with their commitment. A page is
-committed exactly while it is mapped, so the region needs no charge bits: the instance's
-committed count is its mapped heap pages. The kernel never commits a page by itself: a server
+committed exactly while it is mapped, so the region needs no charge bits: the instance holds
+its mapped heap pages and its reserve (below). The kernel never commits a page by itself: a server
 access to a page that is not committed is a fault in the server, which breaks the instance with a
 diagnostic (the page was never committed, or freed and decommitted: a server bug); the kernel's
 own copies from server memory end at their fixup (EFAULT). A futex wait on a heap word holds a
