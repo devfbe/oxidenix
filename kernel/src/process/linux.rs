@@ -968,14 +968,14 @@ impl Drop for Record {
     }
 }
 
-/// Grants the console device to `instance` (None: the kernel's monitor, which
-/// takes it back when the tree it started has ended its first process); the
-/// instance that held it gets `EVENT_CONSOLE_LOST` (ADR 0007).
 /// Gives `instance` the host grant (see `Instance::host`), or takes it.
 pub fn host_grant(instance: &Instance, on: bool) {
     instance.host.store(on, core::sync::atomic::Ordering::Release);
 }
 
+/// Grants the console device to `instance` (None: the kernel's monitor, which
+/// takes it back when the tree it started has ended its first process); the
+/// instance that held it gets `EVENT_CONSOLE_LOST` (ADR 0007).
 pub fn console_grant(instance: Option<&Arc<Instance>>) {
     let (id, chan) = instance.map_or((0, 0), |i| (i.id, i.pager_chan()));
     let old = crate::drivers::console_device::set_holder(id, chan);
@@ -1289,12 +1289,12 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             }
             if flags & MO_GROWSDOWN != 0 {
                 // A stack: anonymous, private, readable and writable, where
-                // the server puts it.
+                // the server puts it, growing as far as `offset` says.
                 if handle != 0 || flags != MO_GROWSDOWN | MO_FIXED || a[4] != 3 {
                     return Err(EINVAL);
                 }
                 let top = addr.checked_add(len).filter(|&e| e <= USER_END && addr != 0).ok_or(EINVAL)?;
-                mm()?.lock().map_stack(top, len).map_err(|_| ENOMEM)?;
+                mm()?.lock().map_stack(top, len, offset).map_err(|_| ENOMEM)?;
                 return Ok(addr as i64);
             }
             let shared = flags & MO_SHARED != 0;
@@ -1544,6 +1544,15 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             drop(instance);
             power(a[0])
         }
+        SYS_STACK_LIMIT => {
+            let group = if a[0] == 0 { super::sched::current().group.clone() } else { container(&instance, a[0])?.group.clone() };
+            group.stack_soft.store(a[1], core::sync::atomic::Ordering::Relaxed);
+            Ok(0)
+        }
+        SYS_HOST_GRANTED => match instance.host.load(core::sync::atomic::Ordering::Acquire) {
+            true => Ok(0),
+            false => Err(EPERM),
+        },
         SYS_FILE_PAGES => {
             let (used, limit) = crate::fs::cache::tmpfs_usage();
             let mut out = [0u8; 16];
@@ -1784,6 +1793,12 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             let old = instance.host.swap(a[0] != 0, core::sync::atomic::Ordering::AcqRel);
             Ok(old as i64)
         }
+        TEST_FUTEX_WATCH => {
+            if !crate::TEST_MODE.load(core::sync::atomic::Ordering::Relaxed) {
+                return Err(ENOSYS);
+            }
+            super::futex::test_watch(a[0], a[1] != 0)
+        }
         TEST_SERVER_TICKS => {
             if !crate::TEST_MODE.load(core::sync::atomic::Ordering::Relaxed) {
                 return Err(ENOSYS);
@@ -1995,6 +2010,8 @@ fn process_call(instance: &Arc<Instance>, nr: u64, a: [u64; 6]) -> SysResult {
             let mut info = Info::new(name);
             info.mem = Some(mm.stats.clone());
             let group = ThreadGroup::new(pid.pid, info).ok_or(ENOMEM)?;
+            // (A default: the server sets the new process's own, from its copy of the limits.)
+            group.stack_soft.store(super::sched::current().group.stack_soft.load(Relaxed), Relaxed);
             group.instance.store(instance.id, Release);
             group.server_reaps.store(true, Relaxed);
             let c = Arc::try_new(Container { group, fresh: spin::Mutex::new(Some(Fresh { mm, pid })) }).map_err(|_| ENOMEM)?;

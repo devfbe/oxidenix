@@ -1,11 +1,11 @@
 //! The descriptor table (phase R6e, docs/design/linux-server.md "The
 //! descriptor table"): per process, the server's. A descriptor is a slot
 //! with a reference to an open file description (`files::FileRef`) and the
-//! close-on-exec bit; the table also keeps RLIMIT_NOFILE. The calls on
-//! descriptors as such are here: close, close_range, dup, dup2, dup3,
+//! close-on-exec bit. A new descriptor is below the caller's process's soft RLIMIT_NOFILE
+//! (`ids::soft`: a table may be shared by processes with limits of their own, as on Linux).
+//! The calls on descriptors as such are here: close, close_range, dup, dup2, dup3,
 //! fcntl's F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_SETFD, F_GETFL and
-//! F_SETFL, the ioctls FIONBIO, FIOCLEX and FIONCLEX, and prlimit's
-//! RLIMIT_NOFILE. F_SETFL changes O_APPEND and O_NONBLOCK; of the rest of
+//! F_SETFL, the ioctls FIONBIO, FIOCLEX and FIONCLEX. F_SETFL changes O_APPEND and O_NONBLOCK; of the rest of
 //! Linux's SETFL_MASK it ignores O_DIRECT (kept as opened), O_NOATIME (no
 //! access times are kept apart) and O_ASYNC (no SIGIO), as the kernel did.
 //!
@@ -41,12 +41,6 @@ const EBADF: i64 = 9;
 const ENOMEM: i64 = 12;
 const EINVAL: i64 = 22;
 const EMFILE: i64 = 24;
-const EPERM: i64 = 1;
-
-/// The largest RLIMIT_NOFILE (Linux's fs.nr_open).
-const NR_OPEN: u64 = 1 << 20;
-/// RLIMIT_NOFILE a tree starts with (soft and hard).
-const DEFAULT_NOFILE: u64 = 4096;
 
 /// A descriptor.
 #[derive(Clone)]
@@ -59,10 +53,6 @@ struct Table {
     slots: Vec<Option<Slot>>,
     /// No slot below this one is free (Linux's next_fd).
     free_from: usize,
-    /// RLIMIT_NOFILE: (soft, hard). Kept with the table (a process's limit
-    /// until the process model is the server's: tables are per process but
-    /// for CLONE_FILES without CLONE_THREAD).
-    limit: (u64, u64),
 }
 
 /// A descriptor table and the processes' record of it.
@@ -71,11 +61,11 @@ pub struct FilesContext {
 }
 
 impl Table {
-    /// The lowest free descriptor at or above `min`, below the soft limit.
+    /// The lowest free descriptor at or above `min`, below the caller's soft limit.
     fn free_slot(&self, min: usize) -> Result<usize, i64> {
         let from = min.max(self.free_from);
         let found = (from..self.slots.len()).find(|&i| self.slots[i].is_none()).unwrap_or(self.slots.len().max(from));
-        if found as u64 >= self.limit.0 {
+        if found as u64 >= nofile() {
             return Err(EMFILE);
         }
         Ok(found)
@@ -119,7 +109,7 @@ impl FilesContext {
 
     /// A table without descriptors (the tree's first process starts with one).
     pub fn empty() -> Arc<FilesContext> {
-        FilesContext::new(Table { slots: Vec::new(), free_from: 0, limit: (DEFAULT_NOFILE, DEFAULT_NOFILE) })
+        FilesContext::new(Table { slots: Vec::new(), free_from: 0 })
     }
 
     /// The description behind descriptor `fd` (EBADF).
@@ -175,7 +165,7 @@ impl FilesContext {
             if t.slots.len() <= slots.capacity() {
                 slots.extend(t.slots.iter().map(|s| s.as_ref().filter(|s| !(exec && s.cloexec)).cloned()));
                 let free_from = if exec { slots.iter().position(|s| s.is_none()).unwrap_or(slots.len()) } else { t.free_from };
-                return Ok(FilesContext::new(Table { slots, free_from, limit: t.limit }));
+                return Ok(FilesContext::new(Table { slots, free_from }));
             }
         }
     }
@@ -330,9 +320,6 @@ const SYS_DUP: u64 = 32;
 const SYS_DUP2: u64 = 33;
 const SYS_FCNTL: u64 = 72;
 const SYS_DUP3: u64 = 292;
-const SYS_PRLIMIT64: u64 = 302;
-const SYS_GETRLIMIT: u64 = 97;
-const SYS_SETRLIMIT: u64 = 160;
 const SYS_CLOSE_RANGE: u64 = 436;
 
 const FIONBIO: u64 = 0x5421;
@@ -347,11 +334,9 @@ const F_SETFL: u64 = 4;
 const F_DUPFD_CLOEXEC: u64 = 1030;
 const FD_CLOEXEC: u64 = 1;
 
-const RLIMIT_NOFILE: u64 = 7;
-
 /// The result of a call on descriptors as such in `s`, or None.
 pub fn handle(s: &State) -> Option<i64> {
-    let (a0, a1, a2, a3) = (s.rdi, s.rsi, s.rdx, s.r10);
+    let (a0, a1, a2) = (s.rdi, s.rsi, s.rdx);
     let result = match s.rax {
         SYS_CLOSE => close(a0),
         SYS_DUP => dup(a0),
@@ -360,24 +345,9 @@ pub fn handle(s: &State) -> Option<i64> {
         SYS_FCNTL => fcntl(a0, a1, a2),
         SYS_CLOSE_RANGE => close_range(a0 as u32 as u64, a1 as u32 as u64, a2),
         SYS_IOCTL if matches!(a1 as u32 as u64, FIONBIO | FIOCLEX | FIONCLEX) => ioctl(a0, a1 as u32 as u64, a2),
-        // RLIMIT_NOFILE (the table's; the other limits are `ids`').
-        SYS_PRLIMIT64 if a1 == RLIMIT_NOFILE => table_of(a0 as i32).and_then(|t| prlimit_nofile(&t, a2, a3)),
-        SYS_GETRLIMIT if a0 == RLIMIT_NOFILE => prlimit_nofile(&current(), 0, a1),
-        SYS_SETRLIMIT if a0 == RLIMIT_NOFILE => prlimit_nofile(&current(), a1, 0),
         _ => return None,
     };
     Some(result.unwrap_or_else(|e| -e))
-}
-
-/// The table of prlimit's `pid` (0: the caller's); ESRCH for no such process.
-fn table_of(pid: i32) -> Result<Arc<FilesContext>, i64> {
-    const ESRCH: i64 = 3;
-    match pid {
-        0 => Ok(current()),
-        p if p < 0 => Err(ESRCH),
-        p if p as u32 == local::pid() => Ok(current()),
-        p => crate::process::files_of(p as u32).ok_or(ESRCH),
-    }
 }
 
 /// close(fd): the descriptor goes, its description with its last
@@ -452,10 +422,10 @@ fn dup3(old: u64, new: u64, flags: u64, dup2: bool) -> Result<i64, i64> {
         return Ok(new as i64);
     }
     let replaced = {
-        let mut t = context.table.lock();
-        if new >= t.limit.0 {
+        if new >= nofile() {
             return Err(EBADF);
         }
+        let mut t = context.table.lock();
         t.reserve(new as usize)?;
         t.put(new as usize, Slot { file, cloexec: flags & O_CLOEXEC as u64 != 0 })
     };
@@ -473,8 +443,7 @@ fn fcntl(fd: u64, cmd: u64, arg: u64) -> Result<i64, i64> {
     }
     match cmd {
         F_DUPFD | F_DUPFD_CLOEXEC => {
-            let limit = context.table.lock().limit.0;
-            if arg >= limit {
+            if arg >= nofile() {
                 return Err(EINVAL);
             }
             context.install(file, cmd == F_DUPFD_CLOEXEC, arg)
@@ -523,34 +492,6 @@ fn ioctl(fd: u64, request: u64, arg: u64) -> Result<i64, i64> {
     }
 }
 
-/// prlimit64 for RLIMIT_NOFILE of `context`'s processes: the old limits to `old`
-/// unless 0, the new ones from `new` unless 0 (soft at most hard, hard at
-/// most `NR_OPEN`; everyone is root, so the hard limit may grow).
-fn prlimit_nofile(context: &FilesContext, new: u64, old: u64) -> Result<i64, i64> {
-    let wanted: Option<[u64; 2]> = if new != 0 { Some(usercopy::read(new)?) } else { None };
-    if let Some([soft, hard]) = wanted {
-        if soft > hard {
-            return Err(EINVAL);
-        }
-        // (RLIM_INFINITY is beyond it, as on Linux.)
-        if hard > NR_OPEN {
-            return Err(EPERM);
-        }
-    }
-    let before = {
-        let mut t = context.table.lock();
-        let before = t.limit;
-        if let Some([soft, hard]) = wanted {
-            t.limit = (soft, hard);
-        }
-        before
-    };
-    if old != 0 {
-        usercopy::write(old, &[before.0, before.1])?;
-    }
-    Ok(0)
-}
-
 impl FilesContext {
     /// The open descriptors, ascending (/proc/<pid>/fd).
     pub fn open_fds(&self) -> Vec<u32> {
@@ -564,7 +505,8 @@ impl FilesContext {
     }
 }
 
-/// The soft RLIMIT_NOFILE of the caller (poll's bound on `nfds`).
+/// The soft RLIMIT_NOFILE of the caller's process (the bound on its descriptors, and
+/// poll's on `nfds`).
 pub fn nofile() -> u64 {
-    current().table.lock().limit.0
+    crate::ids::soft(crate::ids::RLIMIT_NOFILE)
 }

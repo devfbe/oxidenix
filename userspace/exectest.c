@@ -204,14 +204,14 @@ int main(int argc, char **argv, char **envp) {
     memset(huge, 'x', sizeof huge - 1);
     char *bigargs[] = {"hello", huge, NULL};
     check("an argument beyond MAX_ARG_STRLEN: E2BIG", run("/bin/hello", bigargs) == 100 + E2BIG);
-    /* The memory execve calls hold for their arguments is bounded for the tree: ten
-     * processes each holding about 1.8 MiB of arguments (their execve waits for the last
+    /* The memory execve calls hold for their arguments is bounded for the tree (24 MiB):
+     * fifteen processes each holding about 1.8 MiB of arguments (2 MiB of buffer) (their execve waits for the last
      * argument's page, which the pager never supplies: TEST_PAGED_STUCK) do not all get it
      * (ENOMEM for some), never take the server's heap; once they are killed, everything
      * they held is given back (a large exec runs). Tiny strings count by what they take: a
      * million empty ones are E2BIG. */
     {
-        enum { KIDS = 10, BIG = 15 };
+        enum { KIDS = 15, BIG = 15 };
         static char piece[120 * 1024];
         memset(piece, 'a', sizeof piece - 1);
         char *stuck = (char *)0x222000000000;

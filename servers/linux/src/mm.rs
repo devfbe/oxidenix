@@ -136,8 +136,9 @@ fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, mut offset: u64) ->
 
 /// brk(addr) (phase R8, the process model's): the heap is anonymous memory from the end of
 /// the program (the break exec set) to the break, committed as it grows. It may not run
-/// into a mapping above it (then the break stays). The kernel places mappings above the
-/// break (`SYS_VM_FLOOR`). Returns the (possibly unchanged) break.
+/// into a mapping above it, nor into the stack's room and its guard gap (`Brk::limit`; then
+/// the break stays). The kernel places mappings above the break (`SYS_VM_FLOOR`). Returns
+/// the (possibly unchanged) break.
 fn brk(addr: u64) -> i64 {
     let Some(brk) = crate::process::brk_of(crate::local::pid()) else { return 0 };
     let mut b = brk.lock();
@@ -146,6 +147,9 @@ fn brk(addr: u64) -> i64 {
     }
     let (Some(old_top), Some(new_top)) = (page_up(b.end), page_up(addr)) else { return b.end as i64 };
     if new_top > old_top {
+        if new_top > b.limit {
+            return b.end as i64;
+        }
         let r = crate::syscall(SYS_MO_MAP, [0, old_top, new_top - old_top, 0, 3, MO_FIXED | MO_NOREPLACE]);
         if r < 0 {
             return b.end as i64;
