@@ -189,14 +189,15 @@ fn cmd_run(args: &Vec<&str, 8>) {
 /// and waits for it; returns how it ended.
 pub fn run_program(args: &[&str]) -> Option<crate::process::WaitStatus> {
     let name = args[0];
-    let pid = match crate::process::spawn(name, args) {
-        Ok(pid) => pid,
+    let tree = match crate::process::spawn(name, args) {
+        Ok(tree) => tree,
         Err(errno) => {
             crate::printkln!("run: cannot start {} (errno {})", name, errno);
             return None;
         }
     };
     use crate::process::WaitStatus;
+    let pid = tree.pid;
     let result = match crate::process::wait_for(pid).map(crate::process::decode_status) {
         Ok(WaitStatus::Exited(code)) => {
             crate::printkln!("[{} (pid {}) exited with code {}]", name, pid, code);
@@ -212,8 +213,9 @@ pub fn run_program(args: &[&str]) -> Option<crate::process::WaitStatus> {
         }
     };
     // The tree's first process ended: the console is the monitor's again
-    // (what is left of the tree finds its terminal hung up).
-    crate::process::linux::console_grant(None);
+    // and the host grant goes (what is left of the tree finds its terminal
+    // hung up and the machine's state no longer its to change).
+    tree.end();
     crate::process::reap_orphans();
     result
 }

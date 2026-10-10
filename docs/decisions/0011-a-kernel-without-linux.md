@@ -51,11 +51,12 @@ of the kernel's tree that `/dev` still was. Four questions decided the shape:
    (`clock_set`) and powering off or restarting (`power`) act on the whole machine, not one
    tree: they need the instance's **host grant**, which the kernel gives when it starts a
    tree itself (the monitor's `run`, autorun: today the only trees there are), as it grants
-   the console. Without it both are EPERM, and the server acts as Linux in a pid namespace
-   that is not the initial one: `clock_settime` and `settimeofday` are EPERM, and `reboot`
-   ends the tree (its init dies, and with it every process; its parent's wait reports SIGHUP
-   for a restart, SIGINT for a power off or halt; the caller exits), as `reboot_pid_ns`
-   does. A test-mode call (`TEST_HOST`) takes the grant from the self-tests' tree for the
+   the console, and takes back with the console once the tree's first process has ended
+   (what is left of the tree runs on without either). Without it both are EPERM, and the
+   server acts as Linux in a pid namespace that is not the initial one: `clock_settime` and
+   `settimeofday` are EPERM, and `reboot` ends the tree (its init dies, and with it every
+   process; its parent's wait reports SIGHUP for a restart, SIGINT for a power off or halt;
+   the caller exits), as `reboot_pid_ns` does. A test-mode call (`TEST_HOST`) takes the grant from the self-tests' tree for the
    clock's checks; the reboot without it ends the suite's own tree and is not tried there.
 6. **Requeues move only plain futex waits** (added in review): `futex_requeue` moves
    waiters that entered through `futex_wait`, never the Linux server's own waits

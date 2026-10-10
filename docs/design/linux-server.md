@@ -1150,7 +1150,8 @@ affinity and getcpu calls in `mod.rs`; `timer.rs`'s interval timers; the per-pro
   (`ids::Limits` in `process::Proc`: inherited by fork and clone, kept by execve, another
   process's by prlimit64).
 - **The host grant** (ADR 0011, decision 5): `clock_set` and `power` need the instance's
-  grant, which the kernel gives the trees it starts; without it the server acts as a
+  grant, which the kernel gives the trees it starts and takes back with the console when
+  the tree's first process ends (`process::Tree::end`); without it the server acts as a
   non-initial pid namespace (EPERM for setting the clock, `reboot` ends the tree with SIGHUP
   or SIGINT for its init). A `futex_requeue` moves only waits of `futex_wait` (decision 6).
 - **The kernel's clocks** have the kernel's ids (`CLOCK_WALL`, `CLOCK_MONO`,
