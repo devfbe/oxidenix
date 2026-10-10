@@ -1,16 +1,19 @@
 # Open items
 
 What is known to be missing or unfinished, collected from the reviews and agent reports up to
-2026-10-10 (main 5ecdff9). Items that are being worked on name their branch. When an item is
+2026-10-10 (main after the ext3 journal). Items that are being worked on name their branch. When an item is
 done, delete it here in the same commit.
 
-## In progress
+## Filesystem hardening
 
-- **ext3-compatible journal for `/data`** (branch `ext3-journal`, ADR to follow). JBD2 format,
-  one transaction per operation, ordered data, recovery at mount. Replaces the ordered-commit
-  steps of `crates/ext2fs` (a `mv` costs 4 flushes today, and an interrupted rename can leave
-  link counts too high that only `e2fsck` repairs, which makes such directories impossible to
-  `rmdir`).
+- **Sequence after replay** (`crates/ext2fs` `replay`): Linux skips one transaction id after
+  recovery; we continue at the scan's next sequence, so only the v1 checksum separates a torn
+  old transaction of the same id at the new log start (a 2^-32 collision). Use
+  `next_sequence + 1` when the scan stopped on a torn or foreign block.
+- **`Ext2::reserve`** allocates indirect blocks without an `over_limit` check; an oversized
+  request ends in EFBIG and a broken filesystem (availability, not integrity).
+- The ext2 code trusts other on-disk metadata (directory sizes, group counts) bounded only by
+  the device.
 
 ## Performance
 
