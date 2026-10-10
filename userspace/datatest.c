@@ -769,21 +769,28 @@ static void mapping_across_diskfs_restart(void) {
     unlink(path);
     check("a mapping read while diskfs is killed: every page brought, no SIGBUS", killed == 0 && read_through);
     /* A fill that fails because diskfs went (made so: TEST_FILL_GONE) is tried again,
-     * never SIGBUS: a page of a hole (missing from the cache) after the file grew. */
-    {
+     * never SIGBUS: a page of a hole (missing from the cache) after the file grew; the fill
+     * failing before its grant, after it (its pending pages missing again, their waiters
+     * asking again: the kernel's FILL_AGAIN), and then left to the worker. */
+    for (long mode = 0; mode < 3; mode++) {
         int hf = open("/data/datatest.gone", O_RDWR | O_CREAT | O_TRUNC, 0644);
         struct stat hs;
-        int armed = hf >= 0 && ftruncate(hf, 16 * PG) == 0 && fstat(hf, &hs) == 0 && syscall(TEST_FILL_GONE, (long)hs.st_ino) == 0;
+        int armed = hf >= 0 && ftruncate(hf, 16 * PG) == 0 && fstat(hf, &hs) == 0 && syscall(TEST_FILL_GONE, (long)hs.st_ino, mode) == 0;
         volatile char *hm = armed ? mmap(NULL, 16 * PG, PROT_READ, MAP_SHARED, hf, 0) : MAP_FAILED;
         volatile int zero = 0, bus = 0;
         got = 0;
         if (hm != MAP_FAILED && sigsetjmp(env, 1) == 0) zero = hm[5 * PG] == 0;
         else bus = 1;
-        syscall(TEST_FILL_GONE, 0L);
+        syscall(TEST_FILL_GONE, 0L, 0L);
         if (hm != MAP_FAILED) munmap((void *)hm, 16 * PG);
         close(hf);
         unlink("/data/datatest.gone");
-        check("a fill that failed as diskfs went is tried again: no SIGBUS", armed && zero && !bus);
+        static const char *what[] = {
+            "a fill that failed as diskfs went (before its grant) is tried again: no SIGBUS",
+            "... failed after its grant: the pages asked for again, no SIGBUS",
+            "... and left to the worker: brought, no SIGBUS",
+        };
+        check(what[mode], armed && zero && !bus);
     }
     check("a mapping's faults right after diskfs died: pages brought, no SIGBUS", !faulted && right);
     check("... and a store into a clean page backed, on the device after msync", stored);
