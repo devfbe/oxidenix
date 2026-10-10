@@ -1213,7 +1213,8 @@ fn unsafe_findings(fs: Ext2<RamDisk>, what: &str) -> Vec<String> {
         }
     }
     let disk = take(fs);
-    let path = scratch("unsafe-fsck");
+    static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let path = scratch(&format!("unsafe-fsck-{}", N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
     std::fs::write(&path, &disk.data).unwrap();
     let out = Command::new("e2fsck").arg("-fn").arg(&path).output().expect("e2fsck not found");
     std::fs::remove_file(&path).unwrap();
@@ -1302,7 +1303,7 @@ fn failed_commits_never_free_a_named_or_a_free_inode() {
             _ => disk.fail_writes(n, usize::MAX),
         }
         let mut fs = Ext2::mount(disk).unwrap();
-        let held = orphan_sequence(&mut fs, &files);
+        let mut held = orphan_sequence(&mut fs, &files);
         fs.device_mut().fail_at = None;
         if fs.broken() {
             // What the disk has: the next mount (a restart, then the boot's recovery).
@@ -1314,6 +1315,10 @@ fn failed_commits_never_free_a_named_or_a_free_inode() {
         } else {
             // The device works again: the caller releases what it holds (what nobody holds
             // the filesystem frees itself), and goes down cleanly: e2fsck finds nothing.
+            // (A rename that broke off is finished by doing it again.)
+            if let Ok(g) = fs.rename(ROOT_INO, "held-5", ROOT_INO, "held-4") {
+                held.extend(g);
+            }
             let deferred = fs.take_deferred();
             for &ino in held.iter().chain(deferred.iter()) {
                 if fs.releasable(ino) {
@@ -1556,9 +1561,178 @@ fn a_rename_failing_part_way_leaves_every_file_a_name() {
         assert!(old == Ok(moved) || new == Ok(moved), "read {n}: the moved file has no name");
         for ino in [moved, target] {
             if fs.lookup(dir, "entry-045-with-some-length") == Ok(ino) || fs.lookup(ROOT_INO, "moved") == Ok(ino) {
-                assert!(fs.stat(ino).unwrap().links > 0, "read {n}: a named inode without links");
+                assert!(fs.stat(ino).unwrap().links > 0, "read {n}: a named inode without links: {ino} (moved {moved}, target {target}), result {result:?}, new {:?}, old {:?}", fs.lookup(dir, "entry-045-with-some-length"), fs.lookup(ROOT_INO, "moved"));
             }
         }
     }
     assert!(failed > 0, "no read of the rename failed");
+}
+
+/// The commit that says "clean" fails: the disk never says "clean" while in use afterwards
+/// (the retry writes "not clean", and the next change keeps it so); once commits go through
+/// and the filesystem is let go of, it says "clean".
+#[test]
+fn a_failed_clean_state_is_never_written_while_in_use() {
+    let mut fs = Ext2::mount(mkfs("state-fail", 2 * 1024)).unwrap();
+    fs.set_in_use(true).unwrap();
+    let f = fs.create(ROOT_INO, "f", &NewNode::File, 0o644).unwrap();
+    assert_eq!(state(fs.device()), 0);
+    // Let go of: the state's own commit fails (the metadata's goes through).
+    fs.sync().unwrap();
+    fs.device_mut().fail_writes(0, 1);
+    assert!(fs.set_in_use(false).is_err());
+    assert_eq!(state(fs.device()), 0);
+    // A client again, and a change: the disk says "not clean" throughout.
+    assert_eq!(fs.set_in_use(true), Ok(false));
+    write_file(&mut fs, f, 16 * 1024);
+    assert_eq!(state(fs.device()), 0);
+    fs.sync().unwrap();
+    assert_eq!(state(fs.device()), 0);
+    // A device that keeps failing: still never "clean" in use.
+    fs.device_mut().fail_writes(0, usize::MAX);
+    assert!(fs.set_in_use(false).is_err());
+    assert!(fs.set_in_use(true).is_ok());
+    assert!(fs.create(ROOT_INO, "g", &NewNode::File, 0o644).is_err());
+    fs.device_mut().fail_at = None;
+    assert!(fs.create(ROOT_INO, "g", &NewNode::File, 0o644).is_ok());
+    assert_eq!(state(fs.device()), 0);
+    // Let go of for good: clean.
+    assert_eq!(fs.set_in_use(false), Ok(true));
+    assert_eq!(state(fs.device()), 1);
+    fsck("state-fail", &take(fs));
+}
+
+/// Every name in the tree and how many name each inode (`.` and `..` aside).
+fn names(fs: &mut Ext2<RamDisk>) -> std::collections::BTreeMap<u32, (u32, Vec<String>)> {
+    let mut out: std::collections::BTreeMap<u32, (u32, Vec<String>)> = Default::default();
+    let mut dirs = vec![(ROOT_INO, String::from(""))];
+    let mut seen = std::collections::BTreeSet::new();
+    while let Some((dir, path)) = dirs.pop() {
+        if !seen.insert(dir) {
+            continue;
+        }
+        for (name, ino, kind) in fs.list(dir).unwrap_or_default() {
+            if name == "." || name == ".." {
+                continue;
+            }
+            let full = format!("{path}/{name}");
+            let e = out.entry(ino).or_default();
+            e.0 += 1;
+            e.1.push(full.clone());
+            if kind == 2 {
+                dirs.push((ino, full));
+            }
+        }
+    }
+    out
+}
+
+/// No inode has more names than links, and every named one is in use.
+fn names_within_links(fs: &mut Ext2<RamDisk>, what: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    for (ino, (count, paths)) in names(fs) {
+        match fs.stat(ino) {
+            Ok(s) if fs.check(ino).is_ok() && s.links >= count => {}
+            Ok(s) => found.push(format!("{what}: inode {ino} named {paths:?} has {} links", s.links)),
+            Err(e) => found.push(format!("{what}: inode {ino} named {paths:?}: {e}")),
+        }
+    }
+    found
+}
+
+/// Renames of every kind (a file to a new name, over a file, a directory to another
+/// directory, over an empty directory), each step committed in order: a crash at any
+/// point, or a write or flush failing anywhere (one, or every one from some point on),
+/// never leaves a name more than its inode has links; and removing every name afterwards
+/// (which frees what loses its last link) never frees a named inode or a block in use.
+#[test]
+fn renames_never_leave_more_names_than_links() {
+    let mut fs = Ext2::mount(mkfs("rename-crash", 4 * 1024)).unwrap();
+    let a = fs.create(ROOT_INO, "a", &NewNode::Dir, 0o755).unwrap();
+    let b = fs.create(ROOT_INO, "b", &NewNode::Dir, 0o755).unwrap();
+    for name in ["f1", "f2", "f3"] {
+        let f = fs.create(a, name, &NewNode::File, 0o644).unwrap();
+        write_file(&mut fs, f, 16 * 1024);
+    }
+    fs.create(a, "sub", &NewNode::Dir, 0o755).unwrap();
+    fs.create(b, "empty", &NewNode::Dir, 0o755).unwrap();
+    fs.create(b, "f2", &NewNode::File, 0o644).unwrap();
+    let base = take(fs).data;
+    // (What a rename replaced is released, as its caller does.)
+    let sequence = |fs: &mut Ext2<RamDisk>| {
+        for (from, to, dir) in [("f1", "f1-renamed", a), ("f2", "f2", b), ("sub", "empty", b), ("f3", "f3", b)] {
+            if let Ok(gone) = fs.rename(a, from, dir, to) {
+                for ino in gone {
+                    let _ = fs.release(ino);
+                }
+            }
+        }
+    };
+    // Every name removed (files, then directories deepest first), each freed.
+    let remove_all = |fs: &mut Ext2<RamDisk>| {
+        let all = names(fs);
+        let mut paths: Vec<(String, u32)> = all.iter().flat_map(|(&ino, (_, p))| p.iter().map(move |p| (p.clone(), ino))).collect();
+        paths.sort_by_key(|(p, _)| std::cmp::Reverse(p.matches('/').count()));
+        for (path, _) in paths {
+            let (parent, name) = path.rsplit_once('/').unwrap();
+            let dir = if parent.is_empty() { Ok(ROOT_INO) } else { parent[1..].split('/').try_fold(ROOT_INO, |d, n| fs.lookup(d, n)) };
+            let Ok(dir) = dir else { continue };
+            let is_dir = fs.lookup(dir, name).ok().and_then(|i| fs.stat(i).ok()).is_some_and(|s| s.mode & 0o170000 == 0o040000);
+            if let Ok(gone) = fs.unlink(dir, name, is_dir) {
+                for ino in gone {
+                    let _ = fs.release(ino);
+                }
+            }
+        }
+    };
+    let mut problems = Vec::new();
+    // How many writes and flushes the renames make.
+    let mut fs = Ext2::mount(RamDisk { data: base.clone(), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: Some(Vec::new()) }).unwrap();
+    sequence(&mut fs);
+    problems.extend(names_within_links(&mut fs, "no failure"));
+    let (writes, flushes) = (fs.device().counts.writes, fs.device().counts.flushes);
+    let mut disk = take(fs);
+    let log = disk.log.take().unwrap();
+    // Crashes at every flush, any of the writes after it lost.
+    let epochs = log.iter().filter(|e| matches!(e, Event::Flush)).count();
+    for epoch in 0..=epochs {
+        for seed in 0..8 {
+            let d = RamDisk { data: crash_image(&base, &log, epoch, seed), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None };
+            let mut fs = Ext2::mount(d).unwrap();
+            fs.recover_orphans(|_| false).unwrap();
+            let what = format!("crash at {epoch}/{seed}");
+            problems.extend(names_within_links(&mut fs, &what));
+            remove_all(&mut fs);
+            problems.extend(unsafe_findings(fs, &format!("{what}, all removed")));
+        }
+    }
+    // A write or flush failing, once or from some point on.
+    let modes = (0..writes).map(|n| (0, n)).chain((0..flushes).map(|n| (1, n))).chain((0..writes).map(|n| (2, n)));
+    for (mode, n) in modes {
+        let what = format!("{} {n} failing", ["write", "flush", "every write from"][mode]);
+        let mut d = RamDisk { data: base.clone(), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None };
+        match mode {
+            0 => d.fail_writes(n, 1),
+            1 => d.fail_flush = Some(n),
+            _ => d.fail_writes(n, usize::MAX),
+        }
+        let mut fs = Ext2::mount(d).unwrap();
+        sequence(&mut fs);
+        fs.device_mut().fail_at = None;
+        if fs.broken() {
+            continue;
+        }
+        problems.extend(names_within_links(&mut fs, &what));
+        // The device works again: renames that broke off are finished by doing them again.
+        sequence(&mut fs);
+        problems.extend(names_within_links(&mut fs, &format!("{what}, again")));
+        remove_all(&mut fs);
+        for ino in fs.take_deferred() {
+            if fs.releasable(ino) {
+                let _ = fs.release(ino);
+            }
+        }
+        problems.extend(unsafe_findings(fs, &format!("{what}, all removed")));
+    }
+    assert!(problems.is_empty(), "{:#?}", problems);
 }
