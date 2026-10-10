@@ -68,8 +68,9 @@ static void tmpfs_budget(void) {
 }
 
 /* getdents64 with a buffer far larger than the directory (as a program may claim): each
- * call returns at most a bounded piece, and the calls together list every entry once. */
-static void getdents_pieces(const char *dir, int files) {
+ * call returns at most a bounded piece, and the calls together list every entry once; ".."
+ * is the parent's inode. */
+static void getdents_pieces(const char *parent, const char *dir, int files) {
     char p[96];
     mkdir(dir, 0755);
     for (int i = 0; i < files; i++) {
@@ -80,6 +81,7 @@ static void getdents_pieces(const char *dir, int files) {
     size_t size = 1 << 20;
     char *buf = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     int seen = 0, calls = 0;
+    unsigned long long dotdot = 0;
     long most = 0, n;
     while ((n = syscall(SYS_getdents64, d, buf, 0x7fffffffL)) > 0) {
         calls++;
@@ -87,11 +89,14 @@ static void getdents_pieces(const char *dir, int files) {
         for (long at = 0; at < n;) {
             unsigned short reclen = *(unsigned short *)(buf + at + 16);
             if (strncmp(buf + at + 19, "entry-", 6) == 0) seen++;
+            if (strcmp(buf + at + 19, "..") == 0) dotdot = *(unsigned long long *)(buf + at);
             at += reclen;
         }
     }
     printf("    (%s: %d entries in %d calls, at most %ld bytes a call)\n", dir, seen, calls, most);
     check("getdents64: a huge buffer gets bounded pieces, every entry once", n == 0 && seen == files && most <= 65536 && calls > 1);
+    struct stat up;
+    check("getdents64: \"..\" is the parent directory's inode", stat(parent, &up) == 0 && dotdot == up.st_ino);
     munmap(buf, size);
     close(d);
     for (int i = 0; i < files; i++) {
@@ -102,8 +107,8 @@ static void getdents_pieces(const char *dir, int files) {
 }
 
 int main(void) {
-    getdents_pieces("/tmp/getdents", 3000);
-    getdents_pieces("/data/getdents", 1500);
+    getdents_pieces("/tmp", "/tmp/getdents", 3000);
+    getdents_pieces("/data", "/data/getdents", 1500);
     tmpfs_budget();
     const char *dir = "/data/fstest";
     char path[64], buf[64];

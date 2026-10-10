@@ -1725,7 +1725,11 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             if !crate::TEST_MODE.load(core::sync::atomic::Ordering::Relaxed) {
                 return Err(ENOSYS);
             }
-            let len = a[1].min(64) as usize;
+            // (A longer name names no server.)
+            if a[1] > 64 {
+                return Err(ENAMETOOLONG);
+            }
+            let len = a[1] as usize;
             let mut name = [0u8; 64];
             super::uaccess::copy_from_server(a[0], &mut name[..len])?;
             let name = core::str::from_utf8(&name[..len]).map_err(|_| EINVAL)?;
@@ -1738,7 +1742,11 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             if !crate::TEST_MODE.load(core::sync::atomic::Ordering::Relaxed) {
                 return Err(ENOSYS);
             }
-            let len = a[1].min(64) as usize;
+            // (A longer name names no server.)
+            if a[1] > 64 {
+                return Err(ENAMETOOLONG);
+            }
+            let len = a[1] as usize;
             let mut name = [0u8; 64];
             super::uaccess::copy_from_server(a[0], &mut name[..len])?;
             let name = core::str::from_utf8(&name[..len]).map_err(|_| EINVAL)?;

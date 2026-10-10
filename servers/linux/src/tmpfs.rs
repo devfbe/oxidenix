@@ -355,8 +355,10 @@ impl Inode {
             s.push_str(n);
             Ok(s)
         };
+        // ".." is the directory it is in (the root's, and a removed one's, itself).
+        let parent = st.link.as_ref().map_or(self.ino, |&(p, _)| p);
         out.push((copy(".")?, self.ino, 4));
-        out.push((copy("..")?, self.ino, 4));
+        out.push((copy("..")?, parent, 4));
         for (n, c) in m.iter() {
             out.push((copy(n)?, c.ino, dtype(c.file_type())));
         }
