@@ -452,10 +452,16 @@ impl Service {
 
     /// An offer from the kernel (a control request's payload): the status
     /// to answer with. The channel is attached unless it is refused here.
-    pub fn offer(&mut self, message: &[u8]) -> i64 {
+    pub fn offer(&mut self, fs: &mut Fs, message: &[u8]) -> i64 {
         let Some(offer) = Offer::decode(message) else { return -EINVAL };
         if offer.slots != fsring::SLOTS {
             return -EINVAL;
+        }
+        // The first client: the disk says "in use" (not cleanly unmounted) from now on.
+        if self.chans.iter().all(Option::is_none) {
+            if let Err(e) = fs.set_in_use(true) {
+                return -e;
+            }
         }
         let Some(slot) = self.chans.iter().position(Option::is_none) else { return -ENOSPC };
         let base = match oxrt::chan_attach(offer.channel) {
@@ -916,12 +922,19 @@ impl Service {
     /// Channel `c` ends: diskfs lets go of it and its client's inodes.
     fn close(&mut self, fs: &mut Fs, c: usize) {
         let chan = self.chans[c].take().expect("a channel in use");
-        // Vouches that no device uses its grants any more.
-        let _ = oxrt::chan_detach(chan.id);
         fs.forget_promises(chan.id);
         for ino in chan.held.inodes() {
             self.try_free(fs, ino);
         }
+        // The last client gone: the disk says what it said at mount (clean), before the
+        // channel goes (the kernel powers off once every channel went).
+        if self.chans.iter().all(Option::is_none) {
+            if let Err(e) = fs.set_in_use(false) {
+                println!("diskfs: cannot mark the disk clean (errno {})", e);
+            }
+        }
+        // Vouches that no device uses its grants any more.
+        let _ = oxrt::chan_detach(chan.id);
     }
 
     fn post(&mut self) -> bool {

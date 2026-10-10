@@ -111,7 +111,7 @@ fn main(args: Vec<&'static str>) -> i32 {
                 let _ = oxrt::ipc_reply(id, &(-ENOSYS).to_le_bytes());
             }
             Ok(oxrt::Event::Control(id, len)) => {
-                let status = rings.offer(&request[..len]);
+                let status = rings.offer(&mut fs, &request[..len]);
                 let _ = oxrt::ipc_reply(id, &status.to_le_bytes());
             }
             // A doorbell (also when a predecessor's channel went), or the end

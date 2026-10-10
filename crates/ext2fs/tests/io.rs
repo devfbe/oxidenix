@@ -1421,3 +1421,38 @@ fn a_truncation_failing_part_way_writes_nothing() {
     }
     assert!(broke > 0, "no read of the truncation failed");
 }
+
+/// `s_state` of the disk (the superblock at byte 1024, the field at 58).
+fn state(disk: &RamDisk) -> u16 {
+    u16::from_le_bytes([disk.data[1024 + 58], disk.data[1024 + 59]])
+}
+
+/// While in use, the disk says "not cleanly unmounted" (a crash then makes e2fsck -p check
+/// it); afterwards the state it had at mount: clean again, or still not clean when it was
+/// not at mount.
+#[test]
+fn the_state_says_in_use_until_let_go() {
+    let disk = mkfs("state", 2 * 1024);
+    assert_eq!(state(&disk), 1);
+    let mut fs = Ext2::mount(disk).unwrap();
+    fs.set_in_use(true).unwrap();
+    assert_eq!(state(fs.device()), 0);
+    let f = fs.create(ROOT_INO, "f", &NewNode::File, 0o644).unwrap();
+    write_file(&mut fs, f, 64 * 1024);
+    // A crash now: the disk is not clean, and e2fsck -p checks it.
+    let crashed = RamDisk { data: fs.device().data.clone(), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None };
+    let path = scratch("state-crashed");
+    std::fs::write(&path, &crashed.data).unwrap();
+    let out = Command::new("e2fsck").arg("-p").arg(&path).output().expect("e2fsck not found");
+    std::fs::remove_file(&path).unwrap();
+    let said = String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+    assert!(said.contains("was not cleanly unmounted"), "e2fsck -p: {said}");
+    fs.set_in_use(false).unwrap();
+    assert_eq!(state(fs.device()), 1);
+    fsck("state", &take(fs));
+    // Mounted after that crash: it stays not clean when let go of (e2fsck's to clear).
+    let mut fs = Ext2::mount(crashed).unwrap();
+    fs.set_in_use(true).unwrap();
+    fs.set_in_use(false).unwrap();
+    assert_eq!(state(fs.device()), 0);
+}

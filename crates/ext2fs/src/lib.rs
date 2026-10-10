@@ -65,9 +65,13 @@
 //! it is freed), the inodes of an operation that failed part way (unlink or rename: kept
 //! with their links), and an `unlisted` or `releasing` inode when the filesystem is mounted
 //! again before its release (a crash, a diskfs restart: it is on no list the next mount
-//! reads). Not done yet: the superblock's state is not marked "not clean"
-//! while mounted (`s_state`), so after a crash a host's `e2fsck -p` does not know to check;
-//! `e2fsck -f` does.
+//! reads).
+//!
+//! **Clean.** The superblock's state (`s_state`) says "not cleanly unmounted" while the
+//! filesystem is in use (`set_in_use`: diskfs, while any client is connected), so after a
+//! crash a host's `e2fsck -p` (and Linux's mount) knows to check it; when it is no longer in
+//! use the state it had at mount is written back (a filesystem that was not clean then
+//! stays so until e2fsck).
 //!
 //! On a host: Linux's ext2 driver ignores `s_last_orphan`; its ext4 driver frees the
 //! listed inodes at mount (also read-only, unless the device itself is read-only);
@@ -162,6 +166,8 @@ pub enum NewNode {
 
 pub const ROOT_INO: u32 = 2;
 const MAGIC: u16 = 0xef53;
+/// `s_state`: cleanly unmounted (`EXT2_VALID_FS`).
+const STATE_VALID: u16 = 1;
 const INCOMPAT_FILETYPE: u32 = 0x2;
 const RO_COMPAT_SUPPORTED: u32 = 0x1 | 0x2; // sparse_super, large_file
 const DIRECT: usize = 12;
@@ -342,6 +348,8 @@ struct State<D: Device> {
     broken: bool,
     /// The superblock has the orphan list's field (revision 1).
     has_orphan_list: bool,
+    /// `s_state` as it was at mount (`set_in_use`).
+    mount_state: u16,
     /// Data blocks reserved for writes in flight (`Ext2::reserve`): in no
     /// bitmap and no inode yet, but no allocation takes them.
     reserved: BTreeSet<u32>,
@@ -2186,6 +2194,7 @@ impl<D: Device> Ext2<D> {
             pending: false,
             broken: false,
             has_orphan_list: rev >= 1,
+            mount_state: le16(&sb, 58),
             reserved: BTreeSet::new(),
             reserved_promised: BTreeMap::new(),
             promises: BTreeMap::new(),
@@ -2264,6 +2273,18 @@ impl<D: Device> Ext2<D> {
             }
         }
         Ok(())
+    }
+
+    /// Marks the filesystem in use (`s_state` without "valid": not cleanly unmounted) or
+    /// not (the state it had at mount), committed (module comment, "Clean").
+    pub fn set_in_use(&mut self, in_use: bool) -> Result<(), i64> {
+        self.ready()?;
+        let state = if in_use { self.st.mount_state & !STATE_VALID } else { self.st.mount_state };
+        if le16(&self.st.sb, 58) != state {
+            put16(&mut self.st.sb, 58, state);
+            self.st.super_dirty = true;
+        }
+        self.commit(Ok(()))
     }
 
     /// Whether the cache holds changes that must never reach the disk (an operation

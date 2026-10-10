@@ -1051,7 +1051,10 @@ dispatch; drivers, filesystems, the network stack and Linux itself are user-spac
   server's write-back write them, a `FLUSH` makes them durable. Before the machine powers off,
   the kernel waits until every instance wrote its caches back and diskfs closed their channels.
   After a session, `e2fsck -fn disk.img` on the host reports a clean filesystem, and `debugfs`
-  can read the files.
+  can read the files. While a Linux server instance is connected, the superblock says "not
+  cleanly unmounted" (`s_state`), so after a crash (or a diskfs that died) a host's `e2fsck -p`
+  checks the disk; when the last instance lets go, diskfs writes back the state the disk had
+  when it was mounted.
 - **Integration**: `/data` is a mount of every Linux server instance's namespace; one disk inode
   is one `DInode` of the server's. `statfs` and `/proc/mounts` (the server's mount table, which
   lists the disk at `/data`) make `df` work.
