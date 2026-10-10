@@ -455,8 +455,10 @@ impl Channel {
             self.unreserve(pages);
             return Err(ENOMEM);
         }
+        // (One wait for write-back for all the pages: `PageCache::pin`.)
+        let mut deadline = None;
         for i in 0..pages {
-            match object.pin(first + i) {
+            match object.pin(first + i, &mut deadline) {
                 Ok(frame) => frames.push(frame),
                 Err(e) => {
                     for (j, frame) in frames.into_iter().enumerate() {

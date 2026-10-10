@@ -15,7 +15,7 @@ const MREMAP_FIXED: u64 = 2;
 
 fn errno(f: Fault) -> i64 {
     match f {
-        Fault::Oom => ENOMEM,
+        Fault::Oom | Fault::CommitWait => ENOMEM,
         Fault::Access => EACCES,
         Fault::Segv | Fault::Bus | Fault::Retry => EINVAL,
     }

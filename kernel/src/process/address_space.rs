@@ -288,6 +288,11 @@ pub enum Fault {
     Oom,
     /// The file does not grant the rights asked for (mprotect: EACCES).
     Access,
+    /// A commit only dirty or pinned cache pages stood in the way of
+    /// (`AddressSpace::short_commit`): tried again after waiting for their
+    /// write-back with the space unlocked (`Mm::retrying`,
+    /// `Mm::committing`), which never pass it on.
+    CommitWait,
     /// The page must come from a pager first (`AddressSpace::awaited`):
     /// the fault is tried again once it is there. Only `handle_fault` and
     /// `populate` ask for this.
@@ -329,9 +334,14 @@ pub struct AddressSpace {
     /// A fault failed for want of a frame (not of commit): it reclaims and
     /// tries again with the space unlocked (`Mm::retrying`).
     out_of_frames: bool,
-    /// The pages of the last commit that failed (`commit`), for a wait for
-    /// write-back with the space unlocked (`Mm::retrying`, `Mm::committing`).
+    /// The pages of the last commit that only write-back stood in the way
+    /// of (`Fault::CommitWait`), for a wait with the space unlocked
+    /// (`Mm::retrying`, `Mm::committing`).
     short_commit: u64,
+    /// Whether a commit that only write-back stands in the way of may be
+    /// waited for (`commit_failed`): not in the last try after a wait
+    /// that ended, so the operation fails as it would without the cache.
+    commit_waits: bool,
     /// The disk file whose page a store made dirty last, for the writer's
     /// throttling by its owner's share (`handle_fault`).
     dirtied: Option<Arc<PageCache>>,
@@ -377,15 +387,20 @@ impl Mm {
     /// it again (mmap, mprotect, mremap: `op` changes nothing on failure).
     pub fn committing<R>(&self, mut op: impl FnMut(&mut AddressSpace) -> Result<R, Fault>) -> Result<R, Fault> {
         let mut deadline = None;
+        let mut may_wait = true;
         loop {
             let (result, short) = {
                 let mut space = self.lock();
                 space.short_commit = 0;
+                space.commit_waits = may_wait;
                 let result = op(&mut space);
+                space.commit_waits = false;
                 (result, core::mem::take(&mut space.short_commit))
             };
             match result {
-                Err(Fault::Oom) if short > 0 && memory::commit_blocked_by_cache(short) && memory::wait_for_cache(short, &mut deadline) => {}
+                // A wait that ended without room: once more, failing as
+                // it would without the cache.
+                Err(Fault::CommitWait) => may_wait = memory::wait_for_cache(short.max(1), &mut deadline),
                 result => return result,
             }
         }
@@ -445,13 +460,16 @@ impl Mm {
         // it after a few), and rounds of reclaim that made no progress.
         let (mut waits, mut fruitless) = (0, 0);
         let mut cache_deadline = None;
+        let mut may_wait = true;
         loop {
             let (result, awaited, out_of_frames, short) = {
                 let mut space = self.lock();
                 space.out_of_frames = false;
                 space.short_commit = 0;
+                space.commit_waits = may_wait;
                 space.dirtied = None;
                 let result = op(&mut space);
+                space.commit_waits = false;
                 *dirtied = space.dirtied.take();
                 (result, space.awaited.take(), core::mem::take(&mut space.out_of_frames), core::mem::take(&mut space.short_commit))
             };
@@ -472,14 +490,12 @@ impl Mm {
                         return Err(Fault::Oom);
                     }
                 }
-                // A commit that only cache pages being written back stand
-                // in the way of: wait for the write-back, unlocked.
-                // (A commit of the space's own, or of a tmpfs page: one.)
-                (Err(Fault::Oom), _) if memory::commit_blocked_by_cache(short.max(1)) => {
-                    if !memory::wait_for_cache(short.max(1), &mut cache_deadline) {
-                        return Err(Fault::Oom);
-                    }
-                }
+                // A commit that only cache pages being written back stood
+                // in the way of (the space's own, or a tmpfs page's): wait
+                // for the write-back, unlocked; if that ends without room,
+                // once more, failing as it would without the cache (an
+                // OOM kill, SIGSEGV for a stack, SIGBUS for tmpfs).
+                (Err(Fault::CommitWait), _) => may_wait = memory::wait_for_cache(short.max(1), &mut cache_deadline),
                 (result, _) => return result,
             }
         }
@@ -560,6 +576,7 @@ impl AddressSpace {
             awaited: None,
             out_of_frames: false,
             short_commit: 0,
+            commit_waits: false,
             dirtied: None,
         })
     }
@@ -700,8 +717,8 @@ impl AddressSpace {
             }
         }
         if prot.write && vma.private() && !noreserve {
-            if !self.commit(vma.pages()) {
-                return Err(Fault::Oom);
+            if !memory::commit(vma.pages()) {
+                return Err(self.commit_failed(vma.pages(), Fault::Oom));
             }
             vma.charged = true;
         }
@@ -801,8 +818,8 @@ impl AddressSpace {
         for &(s, e) in &ranges {
             for_each_leaf(self.l4, s, e, |_, leaf| needed -= leaf.flags().contains(CHARGED) as u64);
         }
-        if needed > 0 && !self.commit(needed) {
-            return Err(Fault::Oom);
+        if needed > 0 && !memory::commit(needed) {
+            return Err(self.commit_failed(needed, Fault::Oom));
         }
         self.split_at(start);
         self.split_at(end);
@@ -870,8 +887,8 @@ impl AddressSpace {
         let grow = new_len - old_len.min(new_len);
         // In place, if the area ends here and the space behind it is free.
         if fixed.is_none() && old_end == v.end && !self.overlaps(old_end, old_end + grow) && old_end + grow <= MMAP_TOP {
-            if v.charged && !self.commit(grow / PAGE) {
-                return Err(Fault::Oom);
+            if v.charged && !memory::commit(grow / PAGE) {
+                return Err(self.commit_failed(grow / PAGE, Fault::Oom));
             }
             let mut ext = v.slice(old_end - PAGE, old_end);
             ext.start = old_end;
@@ -890,8 +907,8 @@ impl AddressSpace {
             Some(t) => t,
             None => self.find_free(new_len, floor).ok_or(Fault::Oom)?,
         };
-        if v.charged && grow > 0 && !self.commit(grow / PAGE) {
-            return Err(Fault::Oom);
+        if v.charged && grow > 0 && !memory::commit(grow / PAGE) {
+            return Err(self.commit_failed(grow / PAGE, Fault::Oom));
         }
         if fixed.is_some() {
             self.unmap(target, new_len);
@@ -1007,8 +1024,8 @@ impl AddressSpace {
             _ => false,
         };
         let charge = private_frame && v.per_page();
-        if charge && !self.commit(1) {
-            return Err(Fault::Oom);
+        if charge && !memory::commit(1) {
+            return Err(self.commit_failed(1, Fault::Oom));
         }
         let installed = self.new_frame(page, &v, access, wait).and_then(|(frame, writable_ok)| {
             let mut flags = v.prot.flags();
@@ -1038,7 +1055,16 @@ impl AddressSpace {
                 // address space is locked. A pager's page is waited for
                 // without the lock (`fault_or_retry`) unless `wait`.
                 let index = (offset + (page - v.start)) / PAGE;
-                let frame = match cache.try_map_page(index, wait)? {
+                // (A tmpfs page's commit that write-back stands in the
+                // way of: waited for as the space's own, or SIGBUS.)
+                let frame = match cache.try_map_page(index, wait).map_err(|e| match e {
+                    Fault::CommitWait if self.commit_waits => {
+                        self.short_commit = 1;
+                        e
+                    }
+                    Fault::CommitWait => Fault::Bus,
+                    e => e,
+                })? {
                     Lookup::Frame(frame) => frame,
                     Lookup::Missing(awaited) => {
                         self.awaited = Some(awaited);
@@ -1078,13 +1104,16 @@ impl AddressSpace {
         }
     }
 
-    /// `memory::commit`, noting the pages of a failed one (`short_commit`).
-    fn commit(&mut self, pages: u64) -> bool {
-        let ok = memory::commit(pages);
-        if !ok {
+    /// The fault for a commit of `pages` that failed: `CommitWait` (its
+    /// pages noted in `short_commit`) if only dirty or pinned cache pages
+    /// stood in the way and the caller may wait for their write-back
+    /// (`commit_waits`), else `otherwise` (what that operation fails with).
+    fn commit_failed(&mut self, pages: u64, otherwise: Fault) -> Fault {
+        if self.commit_waits && memory::commit_blocked_by_cache(pages) {
             self.short_commit = pages;
+            return Fault::CommitWait;
         }
-        ok
+        otherwise
     }
 
     /// Notes that a fault failed for want of a frame (`out_of_frames`).
@@ -1133,8 +1162,8 @@ impl AddressSpace {
         // its area is committed page by page (the toucher dies if that
         // fails).
         let charge = !shared_area && v.per_page() && !flags.contains(CHARGED);
-        if charge && !self.commit(1) {
-            return Err(Fault::Oom);
+        if charge && !memory::commit(1) {
+            return Err(self.commit_failed(1, Fault::Oom));
         }
         let writable = if charge { writable | CHARGED } else { writable };
         // (No frame for the copy: the fault reclaims with the space
@@ -1259,8 +1288,8 @@ impl AddressSpace {
         // account does not need).
         let shared = memory::with_frames(|frames| frames.refcount(old) > 1);
         let charge = shared && self.vma(page).is_some_and(|v| v.per_page()) && !e.flags().contains(CHARGED);
-        if charge && !self.commit(1) {
-            return Err(Fault::Oom);
+        if charge && !memory::commit(1) {
+            return Err(self.commit_failed(1, Fault::Oom));
         }
         let copied = memory::with_frames(|frames| {
             if frames.refcount(old) <= 1 {
@@ -1313,10 +1342,10 @@ impl AddressSpace {
             return Err(Fault::Segv);
         }
         let grow = (start - page) / PAGE;
-        if !self.commit(grow) {
+        if !memory::commit(grow) {
             // (Only write-back in the way: the fault waits for it and
-            // tries again, `Mm::retrying`.)
-            return Err(if memory::commit_blocked_by_cache(grow) { Fault::Oom } else { Fault::Segv });
+            // tries again, `Mm::retrying`; if that ends, SIGSEGV still.)
+            return Err(self.commit_failed(grow, Fault::Segv));
         }
         let mut v = self.vmas.remove(&start).expect("found above");
         v.start = page;

@@ -329,6 +329,13 @@ pub fn commit_blocked_by_cache(pages: u64) -> bool {
     unavailable > 0 && committed.saturating_add(pages) <= limit
 }
 
+/// Whether a commit of `pages` would fit now (the cache's dirty and
+/// pinned pages counted as taken, as `commit` counts them).
+fn commit_fits(pages: u64) -> bool {
+    let (committed, limit) = commit_stats();
+    committed.saturating_add(pages).saturating_add(crate::fs::cache::unavailable_pages()) <= limit
+}
+
 /// How long a commit waits for write-back at most (all its waits
 /// together), and how often it looks again.
 const CACHE_WAIT: u64 = 30_000_000_000;
@@ -346,10 +353,14 @@ pub fn wait_for_cache(pages: u64, deadline: &mut Option<u64>) -> bool {
     debug_assert!(x86_64::instructions::interrupts::are_enabled(), "waiting for write-back with a spinlock held");
     let end = *deadline.get_or_insert_with(|| crate::time::now() + CACHE_WAIT);
     loop {
+        // Room as soon as write-back made enough (not only once nothing is
+        // dirty or pinned any more), none ever if memory promised is in
+        // the way.
+        if commit_fits(pages) {
+            return true;
+        }
         if !commit_blocked_by_cache(pages) {
-            // Room now, or no write-back can make it.
-            let (committed, limit) = commit_stats();
-            return committed + pages + crate::fs::cache::unavailable_pages() <= limit;
+            return false;
         }
         let now = crate::time::now();
         if now >= end || crate::process::kill::dying() {

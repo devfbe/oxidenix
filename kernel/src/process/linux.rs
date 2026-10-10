@@ -692,6 +692,10 @@ impl Instance {
 
     fn map_region(&self, object: &Arc<PageCache>, pages: u64, read_only: u64, server: bool) -> Result<u64, i64> {
         let len = pages.checked_mul(PAGE).filter(|&l| l > 0).ok_or(EINVAL)?;
+        // The pages made first, before the region's lock (a tmpfs page's
+        // commit may wait for write-back, which the pager does: it may
+        // need that lock to map objects of its own).
+        object.make_pages(pages)?;
         let mut maps = self.maps.lock();
         // First fit.
         let mut start = MAPS_BASE;

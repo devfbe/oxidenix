@@ -371,8 +371,12 @@ impl Drop for PageWait {
 /// server failed, no page to map (Bus, as on Linux), or no memory (Oom:
 /// the toucher is killed).
 pub fn page_fault(e: i64) -> Fault {
-    // (EAGAIN: tmpfs's commit waits for write-back, `Mm::retrying`.)
-    if e == ENOMEM || e == EAGAIN { Fault::Oom } else { Fault::Bus }
+    match e {
+        ENOMEM => Fault::Oom,
+        // (A tmpfs page's commit waits for write-back, `Mm::retrying`.)
+        EAGAIN => Fault::CommitWait,
+        _ => Fault::Bus,
+    }
 }
 
 /// Most present pages one `pin_fill` or `pin_dirty` looks at (with
@@ -905,16 +909,29 @@ impl PageCache {
 
     /// `create`, waiting for write-back when only dirty or pinned cache
     /// pages stand in the way of the page's commit (EAGAIN): for callers
-    /// that hold no address space (a write, a grant).
-    fn create_waiting(&self, index: u64) -> Result<(), i64> {
-        let mut deadline = None;
+    /// that hold no address space (a write, a grant), with one `deadline`
+    /// for all the pages of their call.
+    fn create_waiting(&self, index: u64, deadline: &mut Option<u64>) -> Result<(), i64> {
         loop {
             match self.create(index) {
-                Err(EAGAIN) if memory::wait_for_cache(1, &mut deadline) => {}
+                Err(EAGAIN) if memory::wait_for_cache(1, deadline) => {}
                 Err(EAGAIN) => return Err(ENOSPC),
                 r => return r,
             }
         }
+    }
+
+    /// Makes the first `pages` pages of a memory store (a channel's, mapped
+    /// into the Linux server's region next), waiting for write-back if
+    /// their commit needs it. Nothing to do for other stores.
+    pub fn make_pages(&self, pages: u64) -> Result<(), i64> {
+        if let Store::Memory { .. } = self.store {
+            let mut deadline = None;
+            for index in 0..pages.min(page_of(self.size().saturating_add(PAGE - 1))) {
+                self.create_waiting(index, &mut deadline)?;
+            }
+        }
+        Ok(())
     }
 
     /// Creates page `index` of a memory store if it is missing.
@@ -1018,11 +1035,12 @@ impl PageCache {
         let _io = self.io.lock();
         let end = off + data.len() as u64;
         let mut pos = off;
+        let mut deadline = None;
         while pos < end {
             let (index, in_page) = (page_of(pos), (pos % PAGE) as usize);
             let n = ((PAGE as usize) - in_page).min((end - pos) as usize);
             let chunk = &data[(pos - off) as usize..][..n];
-            if let Err(e) = self.create_waiting(index) {
+            if let Err(e) = self.create_waiting(index, &mut deadline) {
                 // A short write if some data went in.
                 return if pos == off { Err(e) } else { Ok((pos - off) as usize) };
             }
@@ -1486,14 +1504,15 @@ impl PageCache {
     /// skips it (its frame is shared), so the frame a service or device
     /// reaches is always the object's page. A cached object's pages are
     /// granted only to be filled or written back (`pin_fill`, `pin_dirty`:
-    /// EINVAL here).
-    pub fn pin(&self, index: u64) -> Result<PhysFrame, i64> {
+    /// EINVAL here). A memory-store page made here may wait for write-back
+    /// for its commit, until `deadline` (one for all the pages of a grant).
+    pub fn pin(&self, index: u64, deadline: &mut Option<u64>) -> Result<PhysFrame, i64> {
         loop {
             if index >= page_of(self.size().saturating_add(PAGE - 1)) {
                 return Err(EINVAL);
             }
             match self.store {
-                Store::Memory { .. } => self.create_waiting(index)?,
+                Store::Memory { .. } => self.create_waiting(index, deadline)?,
                 Store::Paged { .. } => {}
                 Store::Cached { .. } => return Err(EINVAL),
             }
