@@ -271,9 +271,15 @@ impl Inotify {
         if st.queue.back() == Some(&e) {
             return;
         }
-        let room = st.queue.len() < MAX_EVENTS
-            && QUEUED_BYTES.load(Ordering::Relaxed) + cost(&e) <= MAX_QUEUED_BYTES
-            && st.queue.try_reserve(1).is_ok();
+        // Room in the queue, then the tree's bytes taken in one step (no other queue can take
+        // the same room meanwhile), given back if the queue cannot grow after all.
+        let n = cost(&e);
+        let mut room = st.queue.len() < MAX_EVENTS
+            && QUEUED_BYTES.try_update(Ordering::Relaxed, Ordering::Relaxed, |c| (c + n <= MAX_QUEUED_BYTES).then_some(c + n)).is_ok();
+        if room && st.queue.try_reserve(1).is_err() {
+            QUEUED_BYTES.fetch_sub(n, Ordering::Relaxed);
+            room = false;
+        }
         let e = if room {
             e
         } else {
@@ -286,9 +292,11 @@ impl Inotify {
             if st.queue.try_reserve(1).is_err() {
                 return;
             }
-            Event { wd: -1, mask: IN_Q_OVERFLOW, cookie: 0, name: Vec::new() }
+            // (An overflow event goes beyond the bytes' bound: one per instance at most.)
+            let o = Event { wd: -1, mask: IN_Q_OVERFLOW, cookie: 0, name: Vec::new() };
+            QUEUED_BYTES.fetch_add(cost(&o), Ordering::Relaxed);
+            o
         };
-        QUEUED_BYTES.fetch_add(cost(&e), Ordering::Relaxed);
         st.queue.push_back(e);
         self.seq.fetch_add(1, Ordering::Release);
         let word = &self.seq as *const AtomicU32 as u64;

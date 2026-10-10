@@ -348,10 +348,17 @@ impl Inode {
         charge.add(m.keys().map(|n| n.len() + 48).sum::<usize>() + 2 * 48)?;
         let mut out = Vec::new();
         out.try_reserve_exact(m.len() + 2).map_err(|_| ENOMEM)?;
-        out.push((String::from("."), self.ino, 4));
-        out.push((String::from(".."), self.ino, 4));
+        // Each name copied into room reserved first (ENOMEM without it).
+        let copy = |n: &str| -> Result<String, i64> {
+            let mut s = String::new();
+            s.try_reserve_exact(n.len()).map_err(|_| ENOMEM)?;
+            s.push_str(n);
+            Ok(s)
+        };
+        out.push((copy(".")?, self.ino, 4));
+        out.push((copy("..")?, self.ino, 4));
         for (n, c) in m.iter() {
-            out.push((n.clone(), c.ino, dtype(c.file_type())));
+            out.push((copy(n)?, c.ino, dtype(c.file_type())));
         }
         Ok(out)
     }

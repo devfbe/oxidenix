@@ -1533,7 +1533,9 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             // (A lock's wait only on the server's own memory: a word another
             // party writes must never hold a dying thread.)
             if let Some((object, offset, word)) = instance.object_word(addr) {
-                if ends == Ends::Lock {
+                // (Nor a sleeping lock's: a broken instance's shake reaches only waits on the
+                // server's own memory.)
+                if matches!(ends, Ends::Lock | Ends::SleepLock) {
                     return Err(EINVAL);
                 }
                 return super::futex::object_wait(&object, offset, word, val, deadline, ends);
@@ -1731,6 +1733,17 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             let group = super::group(pid).ok_or(ESRCH)?;
             let (user, system) = group.info.lock().cputime();
             Ok(((user + system) / 1_000_000) as i64)
+        }
+        TEST_KILL_SERVER => {
+            if !crate::TEST_MODE.load(core::sync::atomic::Ordering::Relaxed) {
+                return Err(ENOSYS);
+            }
+            let len = a[1].min(64) as usize;
+            let mut name = [0u8; 64];
+            super::uaccess::copy_from_server(a[0], &mut name[..len])?;
+            let name = core::str::from_utf8(&name[..len]).map_err(|_| EINVAL)?;
+            let pid = super::server_named(name).and_then(|s| s.pid()).ok_or(ESRCH)?;
+            super::kill::kill_pid(pid).map(|_| 0)
         }
         SYS_TEST_MODE => Ok(crate::TEST_MODE.load(core::sync::atomic::Ordering::Relaxed) as i64),
         SYS_SERVER_LOG => {

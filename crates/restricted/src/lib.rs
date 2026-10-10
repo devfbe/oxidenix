@@ -337,7 +337,8 @@ pub const SYS_SERVER_FUTEX_WAIT: u64 = 1024;
 pub const SYS_SERVER_FUTEX_WAKE: u64 = 1025;
 pub const FUTEX_INTERRUPTIBLE: u64 = 1;
 pub const FUTEX_LOCK: u64 = 2;
-/// A sleeping lock's wait (the server's `SleepMutex`, `SleepRwLock`): ends
+/// A sleeping lock's wait (the server's `SleepMutex`, `SleepRwLock`; on the
+/// server's own memory only, EINVAL on an object's word): ends
 /// (EINTR) when the waiter dies, and when the instance broke (its holder
 /// may be the server thread that failed: the instance's service threads,
 /// which never die, must not wait for it; they give up what they wanted it
@@ -915,3 +916,8 @@ pub const TEST_SERVER_FAIL: u64 = 1520;
 /// nanoseconds, and lets go (0 if it got it, EINTR if its wait ended).
 /// Test mode only.
 pub const TEST_SLEEP_LOCKED: u64 = 1521;
+/// `(name, len)`: kills the running process of the kernel's server `name`
+/// (ESRCH if none), as a crash would: the restart policy brings it back at
+/// its next use. Test mode only (ENOSYS otherwise); a program's call with a
+/// C string `name` is the server's to pass on (datatest: diskfs's orphans).
+pub const TEST_KILL_SERVER: u64 = 1522;

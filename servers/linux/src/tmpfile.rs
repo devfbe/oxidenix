@@ -267,11 +267,15 @@ impl TmpOpen {
             *snapshot = Some((entries, charge));
         }
         let entries = &snapshot.as_ref().expect("taken above").0;
+        // At most `GETDENTS_MAX` bytes a call (a short getdents64 is a valid one: the program
+        // asks again), reserved first: the program's buffer size sets no allocation.
+        let room = (len as usize).min(crate::files::GETDENTS_MAX);
         let mut out = Vec::new();
+        out.try_reserve_exact(room).map_err(|_| 12i64)?;
         let mut next = *off;
         while let Some((name, ino, dtype)) = entries.get(next as usize) {
             let reclen = (19 + name.len() + 1).next_multiple_of(8);
-            if out.len() + reclen > len as usize {
+            if out.len() + reclen > room {
                 if out.is_empty() {
                     return Err(EINVAL);
                 }

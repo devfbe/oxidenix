@@ -246,6 +246,9 @@ impl Drop for FileRef {
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Most bytes one getdents64 call returns (its buffer is the server's, reserved up front).
+pub const GETDENTS_MAX: usize = 64 * 1024;
+
 /// Most bytes all directory snapshots of the tree may take (`getdents64` takes one per open
 /// directory description from its start): a directory read through many descriptions at
 /// once cannot fill the server's heap (ENOMEM beyond it).
