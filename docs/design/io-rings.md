@@ -362,11 +362,13 @@ pages and dirty marks the kernel keeps and whose data the server moves:
   there, `EAGAIN` if nothing was done). The server grants the first run of missing pages of a
   window (`grant(.., GRANT_WRITE | GRANT_FILL, out)`: at most 256, the run's first page, its
   length and the file's size at `out`): they become **pending**, zeroed frames pinned for the grant that nobody reads,
-  maps or writes. diskfs reads into them by DMA; `mo_filled(handle, offset, pages, outcome)`
-  (1077) makes them the file's pages, or drops them as missing again when diskfs died under the
-  read (`MO_FILLED_AGAIN`: their waiters ask again, and the next channel fills them), or drops
-  them as failed (the threads waiting for them get `EIO`, a mapping
-  `SIGBUS`: a faulting thread is among a page's waiters before it asks, so the answer to its own
+  maps or writes. diskfs reads into them by DMA; `mo_filled(handle, offset, pages, status)`
+  (1077) makes them the file's pages (`FILL_OK`), drops them as missing again when diskfs died
+  under the read (`FILL_AGAIN`: their waiters ask again, and the next channel fills them), or
+  drops them as failed (the threads waiting for them get
+  `EIO`, a mapping `SIGBUS`, for `FILL_FAILED`, a page that could not be read; `ENOMEM`, the
+  toucher of a mapping killed as out of memory, for `FILL_NOMEM`, a page there was no memory
+  for even after waiting for reclaim: a faulting thread is among a page's waiters before it asks, so the answer to its own
   request cannot pass it by; nothing is recorded where nobody waits, so a later access asks
   again) and wakes the
   waiters. No copy: the page the program maps is the page the device wrote. A grant looks at a
@@ -406,9 +408,11 @@ pages and dirty marks the kernel keeps and whose data the server moves:
   restarted lost the promises: `mo_unback(handle, from, out)` (1084) clears the pages' backing
   and returns the runs of dirty pages, which the server promises again before anyone uses the
   new channel. A final write-back that fails is logged on the console (`server_log`, 1085).
-- **Memory.** The pages are cached memory (`Cached:`, `memory::cache_charge`): clean ones that
-  nothing pins or maps are reclaimed when a commit or a new cache page needs room; pending and
-  dirty ones are not. Dirty pages of all caches count in `Dirty:`; above a tenth of the commit
+- **Memory.** The pages are cached memory (`Cached:`, `memory::cache_charge`), not committed:
+  they use the frames commitments have not claimed yet, and clean ones that nothing pins are
+  reclaimed when memory for programs (or another cache page) needs their frames, mapped ones
+  after reclaim removed them from the mappings that did not use them since its last look
+  (docs/design/page-cache.md, "Memory accounting"); pending and dirty ones are not. Dirty pages of all caches count in `Dirty:`; above a tenth of the commit
   limit, or when reclaim finds them in its way, the pagers get `EVENT_WRITEBACK` (one queued at a
   time), and above a fifth a thread that stores waits up to a second for them (Linux's dirty
   ratios; never the pager, which does the writing). `event_wait` takes a deadline (`EVENT_TIMER`,

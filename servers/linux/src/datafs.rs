@@ -49,11 +49,17 @@
 //! reclaimed when memory is short, dirty ones are bounded by the kernel's
 //! dirty limits (the pager is asked to write back above a tenth of the
 //! commit limit, writers wait above a fifth), pinned ones by `PINNED` per
-//! fill or write-back in flight. A fill that finds no memory for a page
-//! writes the dirty files back (reclaim can drop their pages then) and
-//! tries again, `FILL_ROUNDS` times at most (programs that keep dirtying
-//! pages could otherwise keep it writing for ever); it fails (ENOMEM) when
-//! nothing is left to write or the rounds are used up. Unused inodes are
+//! fill or write-back in flight. The kernel finds a fill's frames by
+//! reclaiming other cache pages and waits for reclaim to make progress
+//! (busy address spaces, programs ending); a fill that still finds no
+//! memory for a page (ENOMEM: dirty pages in the way, or memory really
+//! full) writes the dirty files back (reclaim can drop their pages then)
+//! and tries again, `FILL_ROUNDS` times at most (programs that keep
+//! dirtying pages could otherwise keep it writing for ever); it fails
+//! (ENOMEM) when nothing is left to write or the rounds are used up, and
+//! a page asked for by a fault is then answered `FILL_NOMEM`: the toucher
+//! is killed as out of memory, not sent SIGBUS (which is for pages that
+//! cannot be read). Unused inodes are
 //! bounded by `MAX_CACHED`; their objects keep pages only until reclaim
 //! takes them.
 //!
@@ -80,7 +86,7 @@
 //! connection waits for `NAMES` and for diskfs): a page or a backing it is
 //! asked for meanwhile waits for the worker (`later`), a write-back is tried
 //! again. Every request in flight on the old channel failed: a fill's pages
-//! are missing again and their waiters ask again (`MO_FILLED_AGAIN`; a
+//! are missing again and their waiters ask again (`FILL_AGAIN`; a
 //! program's own read fills them on the new channel), a backing is promised
 //! on the new one, a write-back's pages are dirty again and written on the
 //! new channel (whatever error a request got while diskfs was going: none of it
@@ -572,7 +578,7 @@ fn revalidate(c: &Client) -> Result<(), i64> {
     // Every inode in use, unlinked ones (open files) included: diskfs kept those for us
     // (`fsring`, "Holds"); naming them holds them again. The orphans waiting for their
     // release need no hold: their release names them by handle.
-    let inodes: Vec<Arc<DInode>> = TABLE.lock().inodes.values().cloned().collect();
+    let inodes: Vec<Transient> = TABLE.lock().inodes.values().cloned().map(Transient).collect();
     for inode in inodes {
         // Only diskfs's answer counts: a channel that fails (it died, or timed out) or an
         // I/O error says nothing about the file, and the revalidation is given up (the new
@@ -606,7 +612,7 @@ fn revalidate(c: &Client) -> Result<(), i64> {
 /// again (a store to a clean page asks anew).
 fn repromise(c: &Client) {
     let Ok(bs) = block_size_on(c) else { return };
-    let inodes: Vec<Arc<DInode>> = TABLE.lock().inodes.values().cloned().collect();
+    let inodes: Vec<Transient> = TABLE.lock().inodes.values().cloned().map(Transient).collect();
     for inode in inodes.iter().filter(|i| !i.stale.load(Ordering::Relaxed)) {
         let Some(object) = *inode.object.lock() else { continue };
         let mut from = 0u64;
@@ -1036,7 +1042,7 @@ pub fn mkwrite(key: u64, offset: u64) {
     // inode's own; every hold of the object holds the inode). There is no
     // handle to answer with, and none is needed: at the object's last
     // handle the kernel ended its waits (`PageCache::orphan`, EIO).
-    let Some(inode) = by_key(key) else { return };
+    let Some(inode) = by_key(key).map(Transient) else { return };
     // A key names an object only once `object` made it (under this lock,
     // which keeps it set from then on).
     let Some(object) = *inode.object.lock() else {
@@ -1188,6 +1194,35 @@ fn grant_run(c: &Client, object: u64, mut at: u64, end: u64, flags: u64, out: &m
     Err(EIO)
 }
 
+/// How long a fill or write-back waits for room among its instance's
+/// pinned pages (the kernel's per-instance bound) while it has none of its
+/// own in flight (other threads' transfers end meanwhile; a disk that is
+/// stuck fails it as an I/O error, never as a want of memory), and how
+/// often it asks again.
+const PIN_WAIT: u64 = 30_000_000_000;
+const PIN_RECHECK: u64 = 10_000_000;
+
+/// A grant refused for want of room among the instance's pinned pages
+/// (EBUSY): with transfers of its own in flight, the run goes on once one
+/// ended (`Later`); without, it waits a little (since `since`, up to
+/// `PIN_WAIT`) and the caller asks again (None); EIO after that.
+fn pins_wait<T>(own: u64, since: &Cell<Option<u64>>, failed: &Cell<Option<i64>>) -> Option<Next<T>> {
+    if own > 0 {
+        return Some(Next::Later);
+    }
+    let start = since.get().unwrap_or_else(now);
+    since.set(Some(start));
+    if now() >= start + PIN_WAIT {
+        failed.set(Some(EIO));
+        return Some(Next::Done);
+    }
+    if syscall(SYS_SLEEP_UNTIL, [now() + PIN_RECHECK, 0, 0, 0, 0, 0]) == -EINTR {
+        failed.set(Some(EINTR));
+        return Some(Next::Done);
+    }
+    None
+}
+
 /// What a request of a fill or a write-back is about.
 enum Io {
     Fill { grant: u32, first: u64, count: u64 },
@@ -1202,7 +1237,7 @@ enum Io {
 /// when none is left to write it fails (ENOMEM).
 pub fn fill(inode: &Arc<DInode>, index: u64, want: u64) -> Result<bool, i64> {
     match fill_rounds(inode, index, want) {
-        // diskfs died under it (the pages are missing again: `MO_FILLED_AGAIN`): a program's
+        // diskfs died under it (the pages are missing again: `FILL_AGAIN`): a program's
         // thread fills them on the next channel; the pager leaves them to their waiters,
         // who ask again (`page`).
         Err(ENOTCONN) if !crate::local::is_pager() => fill_rounds(inode, index, want).map_err(|e| if e == ENOTCONN { EIO } else { e }),
@@ -1233,6 +1268,7 @@ fn fill_once(inode: &Arc<DInode>, index: u64, want: u64) -> Result<bool, i64> {
     let end = index.saturating_add(window(inode, index, want));
     inode.fills.fetch_add(1, Ordering::AcqRel);
     let (cursor, pinned, any, failed) = (Cell::new(index), Cell::new(0u64), Cell::new(false), Cell::new(None));
+    let pin_wait = Cell::new(None);
     let mut out = [0u64; 3];
     fsclient::run(
         &c,
@@ -1244,15 +1280,25 @@ fn fill_once(inode: &Arc<DInode>, index: u64, want: u64) -> Result<bool, i64> {
                 return Next::Later;
             }
             let at = cursor.get();
-            let g = match grant_run(&c, object, at, end, GRANT_WRITE | GRANT_FILL, &mut out) {
-                Ok(g) => g,
-                Err(e) => {
-                    // (A grant refused because diskfs is gone: the kernel left the pages
-                    // missing, to be asked for again.)
-                    if e != ENOENT && !any.get() {
-                        failed.set(Some(if c.is_dead() { ENOTCONN } else { e }));
+            let g = loop {
+                match grant_run(&c, object, at, end, GRANT_WRITE | GRANT_FILL, &mut out) {
+                    Ok(g) => {
+                        // (A wait for pins counts from its own refusal.)
+                        pin_wait.set(None);
+                        break g;
                     }
-                    return Next::Done;
+                    Err(EBUSY) => match pins_wait(pinned.get(), &pin_wait, &failed) {
+                        Some(next) => return next,
+                        None => {}
+                    },
+                    Err(e) => {
+                        // (A grant refused because diskfs is gone: the kernel left the pages
+                        // missing, to be asked for again.)
+                        if e != ENOENT && !any.get() {
+                            failed.set(Some(if c.is_dead() { ENOTCONN } else { e }));
+                        }
+                        return Next::Done;
+                    }
                 }
             };
             let (first, count) = (out[0], out[1]);
@@ -1278,7 +1324,7 @@ fn fill_once(inode: &Arc<DInode>, index: u64, want: u64) -> Result<bool, i64> {
                 // A read that failed because diskfs died says nothing about the file: the
                 // pages are missing again, not failed (their waiters ask again).
                 let died = !ok && c.is_dead();
-                let outcome = if ok { MO_FILLED_OK } else if died { MO_FILLED_AGAIN } else { MO_FILLED_FAILED };
+                let outcome = if ok { FILL_OK } else if died { FILL_AGAIN } else { FILL_FAILED };
                 syscall(SYS_MO_FILLED, [object, first * PAGE, count, outcome, 0, 0]);
                 if !ok {
                     failed.set(Some(if died { ENOTCONN } else { EIO }));
@@ -1319,10 +1365,21 @@ pub fn read(inode: &Arc<DInode>, off: u64, buf: u64, len: u64) -> Result<u64, i6
                 let index = (off + done) / PAGE;
                 let want = off.saturating_add(len).div_ceil(PAGE).saturating_sub(index);
                 match fill(inode, index, want) {
-                    // Missing again (reclaimed meanwhile) more than a few
-                    // times: memory is too short to cache it.
                     Ok(_) if stuck < 8 => stuck += 1,
-                    Ok(_) => return if done == 0 { Err(ENOMEM) } else { Ok(done) },
+                    // Missing again (reclaimed meanwhile) more than a few
+                    // times, memory being short: the kernel reads it,
+                    // asking this server's pager for each page it misses
+                    // and copying from it as soon as it came (it cannot be
+                    // reclaimed in between), so the read makes progress.
+                    Ok(_) => match syscall(SYS_MO_FILE_READ, [object, off + done, buf + done, len - done, 0, 0]) {
+                        r if r > 0 => {
+                            done += r as u64;
+                            stuck = 0;
+                        }
+                        0 => break,
+                        e if done == 0 => return Err(-e),
+                        _ => break,
+                    },
                     Err(e) if done == 0 => return Err(e),
                     Err(_) => break,
                 }
@@ -1443,6 +1500,7 @@ pub fn writeback(inode: &Arc<DInode>, pages: core::ops::Range<u64>) -> Result<u6
     let _wb = inode.wb.lock()?;
     let c = client()?;
     let (cursor, pinned, wrote, failed) = (Cell::new(pages.start), Cell::new(0u64), Cell::new(0u64), Cell::new(None));
+    let pin_wait = Cell::new(None);
     let mut out = [0u64; 3];
     fsclient::run(
         &c,
@@ -1454,13 +1512,23 @@ pub fn writeback(inode: &Arc<DInode>, pages: core::ops::Range<u64>) -> Result<u6
             if pinned.get() >= PINNED {
                 return Next::Later;
             }
-            let g = match grant_run(&c, object, at, pages.end, GRANT_DIRTY, &mut out) {
-                Ok(g) => g,
-                Err(e) => {
-                    if e != ENOENT {
-                        failed.set(Some(e));
+            let g = loop {
+                match grant_run(&c, object, at, pages.end, GRANT_DIRTY, &mut out) {
+                    Ok(g) => {
+                        // (A wait for pins counts from its own refusal.)
+                        pin_wait.set(None);
+                        break g;
                     }
-                    return Next::Done;
+                    Err(EBUSY) => match pins_wait(pinned.get(), &pin_wait, &failed) {
+                        Some(next) => return next,
+                        None => {}
+                    },
+                    Err(e) => {
+                        if e != ENOENT {
+                            failed.set(Some(e));
+                        }
+                        return Next::Done;
+                    }
                 }
             };
             let (first, count, size) = (out[0], out[1], out[2]);
@@ -1542,13 +1610,13 @@ pub fn fsync_range(inode: &Arc<DInode>, from: u64, to: u64) -> Result<(), i64> {
 
 /// msync(MS_SYNC) of pages `first..end` of the object `key`.
 pub fn msync(key: u64, first: u64, end: u64) -> Result<(), i64> {
-    let Some(inode) = by_key(key) else { return Ok(()) };
+    let Some(inode) = by_key(key).map(Transient) else { return Ok(()) };
     fsync_range(&inode, first.saturating_mul(PAGE), end.saturating_mul(PAGE))
 }
 
 /// sync(2): every file written back, then a flush.
 pub fn sync_all() -> Result<(), i64> {
-    let inodes: Vec<Arc<DInode>> = TABLE.lock().inodes.values().cloned().collect();
+    let inodes: Vec<Transient> = TABLE.lock().inodes.values().cloned().map(Transient).collect();
     let mut result = Ok(());
     for inode in &inodes {
         if !inode.stale.load(Ordering::Relaxed) {
@@ -1679,7 +1747,7 @@ pub fn page(key: u64, offset: u64) {
     // inode's, and whatever maps or runs the object holds the inode): an
     // unknown key has no handle left to answer with, and the kernel ended
     // the waits for it at its last handle (`PageCache::orphan`).
-    let Some(inode) = by_key(key) else { return };
+    let Some(inode) = by_key(key).map(Transient) else { return };
     let mut filled = fill(&inode, index, 1);
     if matches!(filled, Err(e) if e == ENOTCONN || channel_died()) {
         // diskfs is away, or died under it (whatever the error says: none of it is about
@@ -1690,10 +1758,13 @@ pub fn page(key: u64, offset: u64) {
             Err(_) => filled = fill(&inode, index, 1),
         }
     }
-    if filled.is_err() {
-        // Whoever waits gets EIO (a mapping SIGBUS).
+    if let Err(e) = filled {
+        // Whoever waits gets EIO (a mapping SIGBUS), or ENOMEM if there
+        // was no memory for the page even after waiting for reclaim (a
+        // mapping's toucher is killed, as on Linux's OOM).
+        let status = if e == ENOMEM { FILL_NOMEM } else { FILL_FAILED };
         if let Some(h) = *inode.object.lock() {
-            syscall(SYS_MO_FILLED, [h, index * PAGE, 1, 0, 0, 0]);
+            syscall(SYS_MO_FILLED, [h, index * PAGE, 1, status, 0, 0]);
         }
     }
 }
@@ -1702,14 +1773,15 @@ pub fn page(key: u64, offset: u64) {
 /// SIGBUS).
 fn fail_page(key: u64, offset: u64) {
     if let Some(h) = by_key(key).and_then(|i| *i.object.lock()) {
-        syscall(SYS_MO_FILLED, [h, offset / PAGE * PAGE, 1, MO_FILLED_FAILED, 0, 0]);
+        syscall(SYS_MO_FILLED, [h, offset / PAGE * PAGE, 1, FILL_FAILED, 0, 0]);
     }
 }
 
 /// `EVENT_DIRTY`: the file `key` has dirty pages now.
 pub fn dirtied(key: u64) {
     // (A stale inode's pages cannot be written: nothing to list.)
-    let Some(inode) = by_key(key).filter(|i| !i.stale.load(Ordering::Relaxed)) else { return };
+    let Some(inode) = by_key(key).filter(|i| !i.stale.load(Ordering::Relaxed)).map(Transient) else { return };
+    // (Declared after the inode: unlocked before it is done with.)
     let mut t = TABLE.lock();
     // (Listed for this very inode: one the number names no longer is not.)
     if t.inodes.get(&inode.ino).is_some_and(|i| Arc::ptr_eq(i, &inode)) {
@@ -1737,7 +1809,7 @@ pub fn write_dirty(all: bool) {
     };
     for (ino, key, _) in due {
         // The very inode listed (its number may be another's by now: then nothing to do).
-        let inode = TABLE.lock().inodes.get(&ino).filter(|i| i.key == key).cloned();
+        let inode = TABLE.lock().inodes.get(&ino).filter(|i| i.key == key).cloned().map(Transient);
         let clean = match inode {
             Some(inode) => clean_after_writeback(&inode),
             None => true,
@@ -1761,7 +1833,7 @@ fn write_back_dirty() -> u64 {
     let dirty: Vec<(u32, u64)> = TABLE.lock().dirty.iter().map(|(&i, &(k, _))| (i, k)).collect();
     let mut wrote = 0;
     for (ino, key) in dirty {
-        let inode = TABLE.lock().inodes.get(&ino).filter(|i| i.key == key).cloned();
+        let inode = TABLE.lock().inodes.get(&ino).filter(|i| i.key == key).cloned().map(Transient);
         if let Some(inode) = inode.filter(|i| !i.stale.load(Ordering::Relaxed)) {
             wrote += writeback(&inode, 0..u64::MAX).unwrap_or(0);
         }
@@ -1865,6 +1937,26 @@ fn deny_write(inode: &DInode) -> Result<(), i64> {
 
 fn allow_write(inode: &DInode) {
     *inode.writers.lock() += 1;
+}
+
+/// An inode taken from the table for a moment (by the pager, a sync): when
+/// it is done with, an unlinked one is looked at for release as by
+/// `let_go`. `evict` skips an inode that someone else holds, so a last
+/// user letting go while the pager wrote the file back would otherwise
+/// leave the unlinked inode (and its blocks) for ever.
+struct Transient(Arc<DInode>);
+
+impl core::ops::Deref for Transient {
+    type Target = Arc<DInode>;
+    fn deref(&self) -> &Arc<DInode> {
+        &self.0
+    }
+}
+
+impl Drop for Transient {
+    fn drop(&mut self) {
+        let_go(&self.0);
+    }
 }
 
 /// A user lets go of `inode` (an open file, a hold): an unlinked inode is
@@ -2036,8 +2128,8 @@ pub fn test(scenario: u64) -> i64 {
                 check!(12, syscall(SYS_MO_FILLED, [object, 100 * PAGE, 256, 0, 0, 0]) == 0);
                 check!(13, syscall(SYS_MO_FILLED, [object, u64::MAX & !(PAGE - 1), 1, 0, 0, 0]) == 0);
                 // Only the three outcomes; pages to be read again are simply missing.
-                check!(17, syscall(SYS_MO_FILLED, [object, 0, 1, 3, 0, 0]) == -EINVAL);
-                check!(18, syscall(SYS_MO_FILLED, [object, 100 * PAGE, 1, MO_FILLED_AGAIN, 0, 0]) == 0);
+                check!(17, syscall(SYS_MO_FILLED, [object, 0, 1, 4, 0, 0]) == -EINVAL);
+                check!(18, syscall(SYS_MO_FILLED, [object, 100 * PAGE, 1, FILL_AGAIN, 0, 0]) == 0);
                 // Grown: the pages that "failed" beyond the old end are holes.
                 check!(14, truncate(&inode, 200 * PAGE).is_ok());
                 let mut back = alloc::vec![1u8; 64];

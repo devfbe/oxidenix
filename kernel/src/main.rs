@@ -78,6 +78,12 @@ fn start_servers() {
     if let Err(e) = process::sched::spawn_kernel_thread("channels", process::channel::worker) {
         printkln!("[boot] cannot start the channel worker (errno {})", e);
     }
+    // Keeps free memory above the low watermark and drops what reclaim
+    // took (memory::start_reclaimer): without it, allocations that cannot
+    // reclaim and reclaim's deferred references would have nobody.
+    if let Err(e) = memory::start_reclaimer() {
+        panic!("cannot start the background reclaimer (errno {})", e);
+    }
     start_diskfs();
     start_netd();
     start_procfs();

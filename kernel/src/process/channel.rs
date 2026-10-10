@@ -455,8 +455,10 @@ impl Channel {
             self.unreserve(pages);
             return Err(ENOMEM);
         }
+        // (One wait for write-back for all the pages: `PageCache::pin`.)
+        let mut deadline = None;
         for i in 0..pages {
-            match object.pin(first + i) {
+            match object.pin(first + i, &mut deadline) {
                 Ok(frame) => frames.push(frame),
                 Err(e) => {
                     for (j, frame) in frames.into_iter().enumerate() {
@@ -500,7 +502,7 @@ impl Channel {
                 // Nobody will fill or write them: pending pages go again (missing, to be
                 // asked for again, when the service is gone: that says nothing about the
                 // file), dirty ones are dirty again.
-                let outcome = if e == EPIPE { crate::fs::cache::Filled::Again } else { crate::fs::cache::Filled::Failed };
+                let outcome = if e == EPIPE { crate::fs::cache::Filled::Again } else { crate::fs::cache::Filled::Failed(EIO) };
                 let _ = if fill { object.filled(first, count, outcome) } else { object.redirty(first, count) };
                 Err(Scan::Errno(e))
             }

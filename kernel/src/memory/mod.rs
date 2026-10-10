@@ -117,6 +117,14 @@ impl GrowingHeap {
             let _ = COMMIT_LIMIT.try_update(core::sync::atomic::Ordering::Relaxed, core::sync::atomic::Ordering::Relaxed, |l| {
                 Some(l.saturating_sub(want / PAGE))
             });
+            // The heap took from the free frames (the kernel's reserve if
+            // need be): below the low watermark, the background reclaimer
+            // makes up for it. Not woken from here (the frames and the
+            // heap are locked, and any lock may be held around an
+            // allocation): the next timer tick does (`reclaim_tick`).
+            if !frames.user_may_take(low_watermark(frames)) {
+                RECLAIM_KICK.store(true, core::sync::atomic::Ordering::Release);
+            }
             true
         }
     }
@@ -269,11 +277,25 @@ pub fn phys_to_virt(addr: u64) -> *mut u8 {
 }
 
 /// Pages of memory promised to processes (writable private mappings, see
-/// process::address_space), pages of the file cache that can be dropped
-/// again (fs::cache), and the most both together may be: all usable
-/// frames except the kernel's reserve. Committing up front makes running
-/// out of memory an ENOMEM at mmap/brk/fork time instead of a fault;
-/// cached pages are reclaimed to make room for a commit.
+/// process::address_space; tmpfs pages, the Linux servers' heaps, paged
+/// objects' pages), and the most that may be: all usable frames except
+/// the kernel's reserve (Linux's `overcommit_memory=2` with a ratio of
+/// 100%). Committing up front makes running out of memory an ENOMEM at
+/// mmap/brk/fork time instead of a fault.
+///
+/// Pages of the file cache (`cached`) are counted, not committed, as on
+/// Linux, where they are no part of Committed_AS: they live in the frames
+/// that commitments have not claimed yet (memory promised but not touched,
+/// such as the stacks of threads, is most of what is promised), and when a
+/// commitment claims one and none is free, clean cache pages are reclaimed
+/// for it (`user_frame`), those that programs map included. What cannot be
+/// dropped at once, dirty and pinned cache pages
+/// (`fs::cache::unavailable_pages`), counts against the limit as taken:
+/// a commit fails while committed and those together would exceed it, and
+/// a store that makes them exceed it waits for write-back
+/// (`fs::cache::balance_dirty`). So every committed page has a frame: free,
+/// or a clean cache page's, which reclaim can always take (the fault that
+/// needs it waits for write-back meanwhile, `reclaim_retry`).
 struct Account {
     committed: u64,
     cached: u64,
@@ -281,52 +303,89 @@ struct Account {
 
 static ACCOUNT: IrqSpinLock<Account> = IrqSpinLock::new(Account { committed: 0, cached: 0 });
 static COMMIT_LIMIT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-/// Drops up to the given number of reclaimable cache pages; returns how
-/// many it dropped (set by the file cache).
-static RECLAIM: Once<fn(u64) -> u64> = Once::new();
+/// Drops up to the given number of reclaimable cache pages, with `true`
+/// also those used lately (no second chance); returns how many it dropped
+/// (set by the file cache).
+static RECLAIM: Once<fn(u64, bool) -> u64> = Once::new();
 
-pub fn set_reclaim(f: fn(u64) -> u64) {
+pub fn set_reclaim(f: fn(u64, bool) -> u64) {
     RECLAIM.call_once(|| f);
-}
-
-/// Adds `pages` to the committed or (`cache`) the cached pages if both
-/// together stay within the limit, reclaiming cache pages for room. Never
-/// called with a page cache lock held (reclaiming takes them).
-fn charge(pages: u64, cache: bool) -> bool {
-    loop {
-        let over = {
-            let mut a = ACCOUNT.lock();
-            let limit = COMMIT_LIMIT.load(core::sync::atomic::Ordering::Relaxed);
-            let total = a.committed.saturating_add(a.cached).saturating_add(pages);
-            if total <= limit {
-                *(if cache { &mut a.cached } else { &mut a.committed }) += pages;
-                return true;
-            }
-            // Reclaiming can at most empty the cache.
-            if a.committed.saturating_add(pages) > limit || a.cached == 0 {
-                return false;
-            }
-            total - limit
-        };
-        if RECLAIM.get().map_or(0, |reclaim| reclaim(over)) == 0 {
-            return false;
-        }
-    }
 }
 
 /// Promises `pages` pages; false (nothing promised) if over the limit.
 pub fn commit(pages: u64) -> bool {
-    charge(pages, false)
+    // Cache pages reclaim cannot drop now (dirty, pinned) are not there for
+    // the commitment: they count as taken until write-back or the grant
+    // ends (stores wait meanwhile rather than crowd out what was promised,
+    // `fs::cache::balance_dirty`).
+    let unavailable = crate::fs::cache::unavailable_pages();
+    let mut a = ACCOUNT.lock();
+    let limit = COMMIT_LIMIT.load(core::sync::atomic::Ordering::Relaxed);
+    if a.committed.saturating_add(pages).saturating_add(unavailable) > limit {
+        return false;
+    }
+    a.committed += pages;
+    true
+}
+
+/// Whether a commit of `pages` failed only for the cache pages that are
+/// dirty or pinned now (write-back will make room), not for memory
+/// promised.
+pub fn commit_blocked_by_cache(pages: u64) -> bool {
+    let unavailable = crate::fs::cache::unavailable_pages();
+    let (committed, limit) = commit_stats();
+    unavailable > 0 && committed.saturating_add(pages) <= limit
+}
+
+/// Whether a commit of `pages` would fit now (the cache's dirty and
+/// pinned pages counted as taken, as `commit` counts them).
+fn commit_fits(pages: u64) -> bool {
+    let (committed, limit) = commit_stats();
+    committed.saturating_add(pages).saturating_add(crate::fs::cache::unavailable_pages()) <= limit
+}
+
+/// How long a commit waits for write-back at most (all its waits
+/// together), and how often it looks again.
+const CACHE_WAIT: u64 = 30_000_000_000;
+const CACHE_RECHECK: u64 = 100_000_000;
+
+/// For a commit of `pages` that failed only for dirty or pinned cache
+/// pages, with no lock held that write-back may need (an address space's):
+/// asks the pagers to write back and waits until the commit would fit,
+/// killably, until `deadline` (set at the first wait, `CACHE_WAIT` on).
+/// Whether to try the commit again.
+///
+/// Only where no lock is held (an address space unlocked by
+/// `Mm::retrying` or `Mm::committing`); never from within an allocation.
+pub fn wait_for_cache(pages: u64, deadline: &mut Option<u64>) -> bool {
+    debug_assert!(x86_64::instructions::interrupts::are_enabled(), "waiting for write-back with a spinlock held");
+    let end = *deadline.get_or_insert_with(|| crate::time::now() + CACHE_WAIT);
+    loop {
+        // Room as soon as write-back made enough (not only once nothing is
+        // dirty or pinned any more), none ever if memory promised is in
+        // the way.
+        if commit_fits(pages) {
+            return true;
+        }
+        if !commit_blocked_by_cache(pages) {
+            return false;
+        }
+        let now = crate::time::now();
+        if now >= end || crate::process::kill::dying() {
+            return false;
+        }
+        crate::fs::cache::ask_writeback(pages);
+        crate::process::sched::prepare_to_wait(reclaim_chan()).sleep_until((now + CACHE_RECHECK).min(end));
+    }
 }
 
 pub fn uncommit(pages: u64) {
     ACCOUNT.lock().committed -= pages;
 }
 
-/// Accounts `pages` new pages of the file cache; false if they would not
-/// fit even after reclaiming others.
-pub fn cache_charge(pages: u64) -> bool {
-    charge(pages, true)
+/// Counts `pages` new pages of the file cache.
+pub fn cache_charge(pages: u64) {
+    ACCOUNT.lock().cached += pages;
 }
 
 pub fn cache_uncharge(pages: u64) {
@@ -338,9 +397,252 @@ pub fn commit_stats() -> (u64, u64) {
     (ACCOUNT.lock().committed, COMMIT_LIMIT.load(core::sync::atomic::Ordering::Relaxed))
 }
 
-/// Reclaimable pages of the file cache.
+/// Pages of the file cache (disk files').
 pub fn cached_pages() -> u64 {
     ACCOUNT.lock().cached
+}
+
+/// Cache pages one reclaim for a frame drops at least (Linux's
+/// SWAP_CLUSTER_MAX), so a run of allocations does not reclaim page by page.
+const RECLAIM_BATCH: u64 = 32;
+
+/// Reclaims cache pages for `n` frames (at least `RECLAIM_BATCH`); how
+/// many it dropped. Only with interrupts on: then no spinlock is held that
+/// reclaim takes, and it may unmap pages (TLB shootdowns). The caller holds
+/// no page cache lock. With `force`, pages used lately go too.
+fn reclaim_for(n: u64, force: bool) -> u64 {
+    use core::sync::atomic::Ordering::Relaxed;
+    if !x86_64::instructions::interrupts::are_enabled() {
+        return 0;
+    }
+    // After a reclaim that found nothing, the allocations that would
+    // reclaim again at once take from the watermark instead for a moment:
+    // a large cache with nothing to drop (dirty, in use) is not scanned
+    // whole for every frame.
+    let now = crate::time::now();
+    if !force && now < FRUITLESS_UNTIL.load(Relaxed) {
+        return 0;
+    }
+    let freed = RECLAIM.get().map_or(0, |reclaim| reclaim(n.max(RECLAIM_BATCH), force));
+    if freed == 0 {
+        FRUITLESS_UNTIL.store(now + FRUITLESS_PAUSE, Relaxed);
+    }
+    freed
+}
+
+/// One reclaim for `n` frames that takes pages used lately too (with no
+/// lock held: the pager's thread before it is told to write back).
+pub fn reclaim_forced(n: u64) -> u64 {
+    reclaim_for(n, true)
+}
+
+/// Until when (`time::now`) a reclaim that found nothing makes the next
+/// ones skip, and for how long.
+static FRUITLESS_UNTIL: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+const FRUITLESS_PAUSE: u64 = 10_000_000;
+
+/// Free frames above the kernel's reserve that allocations for user
+/// memory leave for those that cannot reclaim (page tables made with the
+/// frames locked, a fork's copies, allocations with interrupts off): below,
+/// they reclaim cache pages first (Linux's low watermark; about 1/128 of
+/// memory, at least 1 MiB).
+fn low_watermark(f: &PhysFrameAllocator) -> u64 {
+    (f.total_frames / 128).max(256)
+}
+
+/// A frame for user memory (or memory a user can demand: page tables,
+/// cache pages): a free one above the kernel's reserve and the low
+/// watermark, else one that reclaiming cache pages gives back, else one
+/// of the watermark's. None if there is none at all and reclaim found
+/// nothing to drop now. Never called with the frames locked.
+pub fn user_frame() -> Option<PhysFrame> {
+    loop {
+        let (frame, low) = with_frames(|f| {
+            let frame = if f.user_may_take(1 + low_watermark(f)) { frame::UserFrames(f).allocate_frame() } else { None };
+            (frame, !f.user_may_take(low_watermark(f)))
+        });
+        if low {
+            wake_reclaimer();
+        }
+        if frame.is_some() {
+            return frame;
+        }
+        if reclaim_for(1, false) == 0 {
+            return with_frames(|f| frame::UserFrames(f).allocate_frame());
+        }
+    }
+}
+
+/// The background reclaimer (Linux's kswapd): woken when the free frames
+/// above the kernel's reserve come below the low watermark, it reclaims
+/// cache pages until they are above the high one (twice the low), so the
+/// allocations that cannot reclaim (page tables made with the frames
+/// locked, a fork's copies, kernel stacks, anything with interrupts off)
+/// find frames without depending on direct reclaim, which a fruitless
+/// reclaim pauses for a moment. It holds no lock while it reclaims, so it
+/// can unmap pages from every address space that is not busy.
+static RECLAIMER_WANTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+fn reclaimer_chan() -> usize {
+    &RECLAIMER_WANTED as *const _ as usize
+}
+
+/// A wakeup of the background reclaimer asked for where it could not be
+/// made (the kernel heap's growth): the timer tick makes it.
+static RECLAIM_KICK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Called by the timer tick (interrupt context): makes a wakeup asked for
+/// by the kernel heap's growth.
+pub fn reclaim_tick() {
+    if RECLAIM_KICK.load(core::sync::atomic::Ordering::Relaxed) && RECLAIM_KICK.swap(false, core::sync::atomic::Ordering::AcqRel) {
+        wake_reclaimer();
+    }
+}
+
+/// Wakes the background reclaimer (cheap when it is awake already).
+pub fn wake_reclaimer() {
+    if !RECLAIMER_WANTED.swap(true, core::sync::atomic::Ordering::AcqRel) {
+        crate::process::sched::wakeup(reclaimer_chan());
+    }
+}
+
+/// Starts the background reclaimer's kernel thread.
+pub fn start_reclaimer() -> Result<(), i64> {
+    crate::process::sched::spawn_kernel_thread("reclaim", reclaimer)
+}
+
+fn reclaimer() -> ! {
+    loop {
+        // A kick is consumed before the work it asks for, so one that comes
+        // while it works (and finds the flag clear: it wakes nobody) makes
+        // the next round run instead of being lost; registered as a sleeper
+        // before looking, so a kick between the look and the sleep wakes it.
+        let wait = crate::process::sched::prepare_to_wait(reclaimer_chan());
+        if !RECLAIMER_WANTED.swap(false, core::sync::atomic::Ordering::AcqRel) {
+            wait.sleep();
+            continue;
+        }
+        drop(wait);
+        // Up to the high watermark, giving pages used lately their second
+        // chance. Only below the low watermark, and only after a whole
+        // sweep of the cache without it dropped anything, it takes those
+        // too (`force`); when even that drops nothing (write-back, busy
+        // address spaces, nothing reclaimable), it rests, longer each time
+        // up to a second (Linux's kswapd_failures), and looks again while
+        // still low. A kick (a deferred reference, a new shortage) ends a
+        // rest at once.
+        let (mut force, mut fruitless, mut failures) = (false, 0u64, 0u32);
+        loop {
+            crate::fs::cache::drop_deferred();
+            let (short, low) = with_frames(|f| {
+                let high = 2 * low_watermark(f);
+                (!f.user_may_take(high), !f.user_may_take(low_watermark(f)))
+            });
+            if !short {
+                break;
+            }
+            let freed = RECLAIM.get().map_or(0, |reclaim| reclaim(RECLAIM_BATCH * 4, force));
+            if freed > 0 {
+                (force, fruitless, failures) = (false, 0, 0);
+                continue;
+            }
+            if !low {
+                // Between the watermarks with nothing to drop unforced:
+                // done for now.
+                break;
+            }
+            fruitless += 1;
+            // Rounds that look at the whole cache (each at most
+            // `fs::cache`'s scan budget, three turns for the second chances).
+            let sweep = 3 * (cached_pages() / RECLAIM_SWEEP_PAGES + 1);
+            if !force && fruitless < sweep {
+                continue;
+            }
+            if !force {
+                force = true;
+                continue;
+            }
+            crate::fs::cache::ask_writeback(RECLAIM_BATCH);
+            let rest = (RECLAIM_THROTTLE << failures.min(4)).min(RECLAIMER_REST_MAX);
+            failures = failures.saturating_add(1);
+            let wait = crate::process::sched::prepare_to_wait(reclaimer_chan());
+            if !RECLAIMER_WANTED.swap(false, core::sync::atomic::Ordering::AcqRel) {
+                wait.sleep_until(crate::time::now() + rest);
+            }
+            (force, fruitless) = (false, 0);
+        }
+    }
+}
+
+/// The pages one reclaim pass looks at (`fs::cache`'s scan budget), for
+/// the background reclaimer's sweep; the longest it rests when nothing
+/// can be dropped.
+const RECLAIM_SWEEP_PAGES: u64 = 4096;
+const RECLAIMER_REST_MAX: u64 = 1_000_000_000;
+
+/// Makes `n` frames free for user memory above the low watermark,
+/// reclaiming cache pages if they are not (for allocations made with the
+/// frames locked: page tables, a copy). Whether `n` are free (if need be,
+/// within the watermark); another CPU may take them before the caller.
+pub fn ensure_user_frames(n: u64) -> bool {
+    loop {
+        if with_frames(|f| f.user_may_take(n + low_watermark(f))) {
+            return true;
+        }
+        wake_reclaimer();
+        if reclaim_for(n, false) == 0 {
+            return with_frames(|f| f.user_may_take(n));
+        }
+    }
+}
+
+/// How often an allocation that found no frame tries again after reclaim
+/// dropped nothing (Linux's MAX_RECLAIM_RETRIES), and how long it waits
+/// before each try (for write-back to clean dirty pages, for a busy
+/// address space, for programs to end): about 1.6 s without any progress
+/// before the allocation fails (and its process is killed).
+pub const RECLAIM_RETRIES: u32 = 16;
+/// The same while dirty or pinned cache pages may still become droppable
+/// (write-back in progress): about 30 s.
+const RECLAIM_RETRIES_IO: u32 = 300;
+const RECLAIM_THROTTLE: u64 = 100_000_000;
+
+/// For an allocation that failed for want of a frame, with no lock held:
+/// reclaims cache pages for `n` frames, waiting a little for write-back
+/// or busy address spaces if nothing could be dropped now (as Linux's
+/// reclaim throttling). Whether the allocation should be tried again:
+/// false once `tries` rounds made no progress, or the thread is dying.
+/// After a round without progress, pages used lately go too (as Linux's
+/// reclaim raises its priority): a committed page needs its frame more
+/// than a cached page that is in use (which is read again when used).
+pub fn reclaim_retry(n: u64, tries: &mut u32) -> bool {
+    debug_assert!(x86_64::instructions::interrupts::are_enabled(), "waiting for reclaim with a spinlock held");
+    let mut force = false;
+    loop {
+        // Dirty or pinned cache pages become droppable once written back
+        // or ungranted: while there are some, more tries are allowed
+        // (commit counted them as taken, so what was promised is there
+        // once they are), but not for ever (a stuck disk), and not for a
+        // pager's thread, which may be the one to write them.
+        let waiting_for_io = crate::fs::cache::unavailable_pages() > 0 && !crate::process::linux::is_pager();
+        let most = if waiting_for_io { RECLAIM_RETRIES_IO } else { RECLAIM_RETRIES };
+        if crate::process::kill::dying() || *tries >= most {
+            return false;
+        }
+        if with_frames(|f| f.user_may_take(n)) || reclaim_for(n, force) > 0 {
+            return true;
+        }
+        force = true;
+        *tries += 1;
+        let deadline = crate::time::now() + RECLAIM_THROTTLE;
+        crate::process::sched::prepare_to_wait(reclaim_chan()).sleep_until(deadline);
+    }
+}
+
+/// Where throttled allocations wait (only for time to pass: nothing
+/// wakes it).
+fn reclaim_chan() -> usize {
+    &RECLAIM as *const _ as usize
 }
 
 pub fn with_frames<R>(f: impl FnOnce(&mut PhysFrameAllocator) -> R) -> R {

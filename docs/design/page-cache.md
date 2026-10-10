@@ -103,13 +103,83 @@ space, and the walks (truncation, write-back) drop it before they lock a mapper.
   tmpfs as a whole is limited to half of the commit limit, as Linux's default (`ENOSPC`, or
   `SIGBUS` for a fault in a shared mapping). Anonymous shared memory is committed whole when
   it is created, as before, and not counted again per page.
-- **Cached-store pages** are not committed but counted (`memory::cache_pages`). Commit keeps
-  `committed + cached ≤ limit`: when a commit or a new cache page would break it, clean
-  unpinned unmapped cache pages are reclaimed first (second chance: a page used since the last
-  pass is skipped once). If nothing can be reclaimed, the commit fails (`ENOMEM`) and the
-  pagers are asked to write back the dirty pages in the way. Dirty pages are bounded by the
-  dirty ratios (`balance_dirty`: write-back asked above a tenth of the commit limit, storing
-  threads waiting above a fifth).
+- **Cached-store pages** are not committed but counted (`memory::cache_charge`, `Cached:`),
+  as on Linux, where page cache is no part of `Committed_AS`: commit keeps only `committed ≤
+  limit`, and the cache lives in the frames that commitments have not claimed yet (memory
+  promised but never touched, such as thread stacks, is most of what is promised: eight Node.js
+  workers promise about 190 MB of a 256 MB machine and touch less than half). It gives way
+  when a commitment claims a frame: an allocation for user memory (`memory::user_frame`) that
+  would take the free frames below a low watermark (1/128 of RAM above the kernel's reserve,
+  left for allocations that cannot reclaim: page tables made with the frames locked,
+  allocations with interrupts off) first reclaims clean unpinned cache pages (second chance: a
+  page used since the last pass is skipped once). Pages only the cache holds go first; then
+  pages that programs map, through the reverse map (`mappers`): each address space that maps
+  the file is taken if it is free (never waited for: its holder may be waiting for memory
+  itself), its entries for the pages are aged by the accessed bit (cleared, the page kept) or
+  removed, and a page that only the cache (and reclaim) holds afterwards is dropped. Reclaim
+  holds a reference on each mapped candidate's frame during the walk, so the frame cannot be
+  dropped by another reclaim and reused (say, for a private copy of the same file page) while
+  it looks at the entries: an entry holding the frame can only map this page.
+- **The commit guarantee.** Cache pages reclaim cannot drop now, dirty and pinned ones
+  (`cache::unavailable_pages`), count against the limit as taken: `memory::commit` refuses
+  what would need them, and a store that makes committed memory and them exceed the limit
+  waits (killably, asking the pagers again every 100 ms) until write-back made room
+  (`balance_dirty`, beside the dirty ratios: write-back asked above a tenth of the commit
+  limit, storing threads waiting up to a second above a fifth). Every other cache page can be
+  reclaimed, so a committed page always gets its frame: a fault that finds none reclaims again
+  with its address space unlocked, so that its own mappings can go too, after a round without
+  progress also pages used lately (Linux's rising reclaim priority), waiting 100 ms at a time
+  for write-back or busy address spaces (Linux's reclaim throttling); after 16 fruitless tries
+  (300, about 30 s, while dirty or pinned pages may still become droppable; 16 for a pager's
+  own thread, which may be the one to write them) the toucher is killed.
+- **Commits that only write-back stands in the way of** wait for it instead of failing: such
+  a commit fails with `Fault::CommitWait` (its pages in `short_commit`; a tmpfs page's commit
+  says EAGAIN, which becomes the same), and only that cause is waited for: mmap, mprotect and
+  mremap (`Mm::committing`) and faults (`Mm::retrying`) wait with the address space unlocked
+  (the pager may need it), killably, up to 30 s, asking the pagers, until the commit fits
+  (dirty and pinned pages counted as taken), and try again; a wait that ends without room
+  tries once more with waiting off, so the operation fails as it would without the cache (an
+  OOM kill for a page, SIGSEGV for a stack that cannot grow, SIGBUS for tmpfs, ENOMEM for
+  mmap). A tmpfs write or a grant waits in place (one deadline per call), an object mapped into
+  the Linux server's region has its pages made before the region's lock. Waits happen only
+  there and in the fills, never inside an allocation (it may run with any lock held; debug
+  builds assert interrupts are on, so no spinlock is held).
+- **The background reclaimer** (`memory::start_reclaimer`, Linux's kswapd): woken when free
+  frames above the kernel's reserve come below the low watermark, it reclaims with no lock held
+  until they are above twice that, so the allocations that cannot reclaim (page tables made
+  with the frames locked, kernel stacks, a fork's copies, anything with interrupts off) find
+  frames without direct reclaim; the kernel heap's growth asks for it through a flag the timer
+  tick turns into a wakeup. It gives pages used lately their second chance: only below the low
+  watermark, after a sweep of the whole cache dropped nothing, it takes them too, and when even
+  that drops nothing it rests, longer each time up to a second (Linux's kswapd_failures), until
+  a kick. Reclaim never drops a reference it took to an address space or a cache (its drop may
+  be the teardown, which must not run inside an allocation): each goes, as the `Arc`, into a
+  fixed array of 256 that the reclaimer empties (`defer_drop`), a slot taken before the
+  reference; a walk with no slot left ends there. A page whose mappings one reclaim walks is
+  isolated from the others (`Page::isolated`).
+- **Reads progress** under any pressure: the kernel's read of a cached object copies from each
+  page it waited for with a reference of the wait's own, so reclaim cannot take it in between;
+  the Linux server falls back to such a read when the pages it filled were reclaimed before it
+  could copy them. A fill takes its frames before it reserves its pins.
+- **Bounded, per instance.** No wait for memory is endless or unkillable: a throttled store
+  waits at most 30 s (then the committed side has its own end, above), a fill waits for frames
+  as a fault does. One reclaim pass looks at no more than 4096 pages (16 per page asked for, if
+  more), taking each cache's lock for at most 256 at a time and no lock across the walks of the
+  mappings. No Linux server instance can hold more than its share of what reclaim cannot drop
+  (`CacheCounts`): a page is charged to the instance that owns its file (whoever stored to
+  it) when it is marked dirty, under the cache's lock, and refunded exactly once when it is
+  cleaned, cut off or freed; a storing thread waits for write-back while the owner is above a
+  tenth of the commit limit (Linux bounds each device's share likewise; each writer passes it
+  by at most the page or 64 KiB chunk it just stored). Fills and write-backs reserve their
+  pins against a quarter of the limit in one atomic step (`reserve_pins`) and return what they
+  did not pin, so concurrent ones cannot pass it together; a grant beyond it is refused
+  (EBUSY) without waiting in the kernel (the caller may hold pins of its own in flight): the
+  server goes on once one of its transfers ended, or waits for the other threads' (up to 30 s
+  from its latest refusal; then the fill fails as an I/O error, never as out of memory). `Writeback:` in /proc/meminfo
+  counts the pinned pages.
+- **Overcommit** stays strict (`overcommit_memory=2`, ratio 100%). A heuristic mode as Linux's
+  default would let touches of promised memory fail at fault time; it needs a real OOM killer
+  first (one that picks its victim by size, not the toucher).
 - The file metadata quota (inodes, symlink targets, pipes) on the kernel heap stays.
 
 ### Disk files

@@ -86,6 +86,9 @@ pub struct System {
     pub shmem: u64,
     /// Cached file pages stored to and not yet written back (bytes).
     pub dirty: u64,
+    /// Cached file pages pinned for the disk server (being filled or
+    /// written back, bytes).
+    pub writeback: u64,
     pub counters: Counters,
     /// The time stamp counter's frequency, in Hz (the CPUs' clock as far
     /// as the system knows it).

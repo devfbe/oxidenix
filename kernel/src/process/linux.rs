@@ -35,7 +35,7 @@ use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use restricted::*;
-use x86_64::structures::paging::{FrameAllocator, FrameDeallocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags, PhysFrame, Size4KiB};
+use x86_64::structures::paging::{FrameDeallocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags, PhysFrame, Size4KiB};
 use x86_64::VirtAddr;
 
 /// The top-level slot of the shared region.
@@ -170,8 +170,9 @@ fn table_at(frame: PhysFrame) -> &'static mut PageTable {
     unsafe { &mut *(memory::phys_to_virt(frame.start_address().as_u64()) as *mut PageTable) }
 }
 
+/// A zeroed frame, reclaiming cache pages for it if none is free.
 fn zeroed_frame() -> Result<PhysFrame, i64> {
-    let frame = memory::with_frames(|f| UserFrames(f).allocate_frame()).ok_or(ENOMEM)?;
+    let frame = memory::user_frame().ok_or(ENOMEM)?;
     unsafe { core::ptr::write_bytes(memory::phys_to_virt(frame.start_address().as_u64()), 0, 4096) };
     Ok(frame)
 }
@@ -208,6 +209,9 @@ pub struct Instance {
     /// The top of the server's heap, and the pages committed for it.
     heap_end: spin::Mutex<u64>,
     heap_pages: core::sync::atomic::AtomicU64,
+    /// The dirty and pinned pages of its cached objects (bounded per
+    /// instance, `fs::cache`).
+    cache_counts: Arc<crate::fs::cache::CacheCounts>,
     /// Memory objects the kernel mapped into the region (channels), by
     /// address; held while their entries change and shootdowns run.
     maps: crate::sync::Mutex<BTreeMap<u64, RegionMap>>,
@@ -331,6 +335,13 @@ impl Instance {
                 return Err(e);
             }
         };
+        let Ok(cache_counts) = Arc::try_new(crate::fs::cache::CacheCounts::default()) else {
+            memory::with_frames(|f| unsafe {
+                f.deallocate_frame(view);
+                f.deallocate_frame(pdpt);
+            });
+            return Err(ENOMEM);
+        };
         table_at(view)[SHARED_SLOT].set_frame(pdpt, table_flags());
         // From here on, dropping the instance frees what was mapped.
         static NEXT_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
@@ -360,6 +371,7 @@ impl Instance {
             programs: core::sync::atomic::AtomicUsize::new(0),
             heap_end: spin::Mutex::new(HEAP_BASE),
             heap_pages: core::sync::atomic::AtomicU64::new(0),
+            cache_counts,
             maps: crate::sync::Mutex::new(BTreeMap::new()),
             spaces: spin::Mutex::new(Vec::new()),
             channels: core::sync::atomic::AtomicUsize::new(0),
@@ -413,6 +425,8 @@ impl Instance {
         let mut mapper = unsafe { OffsetPageTable::new(table_at(self.view), memory::phys_offset()) };
         let page = Page::<Size4KiB>::containing_address(VirtAddr::new(addr));
         let flags = flags | PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+        // Frames for the tables it may need, reclaimed if none are free.
+        memory::ensure_user_frames(3);
         let mapped = memory::with_frames(|f| {
             let mut user = UserFrames(f);
             unsafe { mapper.map_to_with_table_flags(page, frame, flags, table_flags(), &mut user) }.map(|m| m.ignore())
@@ -678,6 +692,10 @@ impl Instance {
 
     fn map_region(&self, object: &Arc<PageCache>, pages: u64, read_only: u64, server: bool) -> Result<u64, i64> {
         let len = pages.checked_mul(PAGE).filter(|&l| l > 0).ok_or(EINVAL)?;
+        // The pages made first, before the region's lock (a tmpfs page's
+        // commit may wait for write-back, which the pager does: it may
+        // need that lock to map objects of its own).
+        object.make_pages(pages)?;
         let mut maps = self.maps.lock();
         // First fit.
         let mut start = MAPS_BASE;
@@ -1456,10 +1474,17 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
                 }
                 SYS_MO_FILE_WRITE => {
                     offset.checked_add(len).ok_or(EFBIG)?;
-                    let n = super::uaccess::write_from_user(buf, len, |chunk, done| cache.write_with(offset + done, chunk, fill, backing));
+                    // Too many dirty pages (of all, or of the file's owner's
+                    // share): this writer waits for write-back, before each
+                    // chunk after the first and after the last.
+                    let n = super::uaccess::write_from_user(buf, len, |chunk, done| {
+                        if done > 0 && cache.is_cached() {
+                            crate::fs::cache::balance_dirty(Some(&cache));
+                        }
+                        cache.write_with(offset + done, chunk, fill, backing)
+                    });
                     if cache.is_cached() {
-                        // Too many dirty pages: this writer waits a little.
-                        crate::fs::cache::balance_dirty();
+                        crate::fs::cache::balance_dirty(Some(&cache));
                     }
                     Ok(n? as i64)
                 }
@@ -1647,7 +1672,7 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
                     if let Err(e) = super::uaccess::copy_to_server(a[5], &info) {
                         // The caller cannot know the run: it goes again.
                         let _ = end.channel.revoke(id);
-                        let _ = if mode == GRANT_FILL { object.filled(first, count, crate::fs::cache::Filled::Failed) } else { object.redirty(first, count) };
+                        let _ = if mode == GRANT_FILL { object.filled(first, count, crate::fs::cache::Filled::Failed(EIO)) } else { object.redirty(first, count) };
                         return Err(e);
                     }
                     Ok(id as i64)
@@ -1658,7 +1683,7 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
         SYS_MO_CREATE_CACHED => {
             let (size, key, limit) = (a[0], a[1], a[2]);
             let pager: alloc::sync::Weak<dyn crate::fs::cache::Pager> = Arc::downgrade(&instance) as _;
-            let cache = PageCache::cached(size, limit, pager, key)?;
+            let cache = PageCache::cached(size, limit, pager, key, instance.cache_counts.clone())?;
             Ok(instance.insert(Object::File(cache, None))? as i64)
         }
         SYS_MO_FILLED | SYS_MO_REDIRTY => {
@@ -1669,9 +1694,10 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             let (first, count) = (a[1] / PAGE, a[2]);
             if nr == SYS_MO_FILLED {
                 let outcome = match a[3] {
-                    MO_FILLED_OK => crate::fs::cache::Filled::Ok,
-                    MO_FILLED_FAILED => crate::fs::cache::Filled::Failed,
-                    MO_FILLED_AGAIN => crate::fs::cache::Filled::Again,
+                    FILL_OK => crate::fs::cache::Filled::Ok,
+                    FILL_FAILED => crate::fs::cache::Filled::Failed(EIO),
+                    FILL_NOMEM => crate::fs::cache::Filled::Failed(ENOMEM),
+                    FILL_AGAIN => crate::fs::cache::Filled::Again,
                     _ => return Err(EINVAL),
                 };
                 cache.filled(first, count, outcome)?;
@@ -1868,7 +1894,7 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
                     // A file object that cannot grow further (ENOSPC):
                     // what was written counts.
                     if cache.is_cached() && done > 0 && done % (64 * PAGE) == 0 {
-                        crate::fs::cache::balance_dirty();
+                        crate::fs::cache::balance_dirty(Some(&cache));
                     }
                     match cache.write(offset + done, &chunk[..n]) {
                         Ok(w) if w < n => return Ok((done + w as u64) as i64),
