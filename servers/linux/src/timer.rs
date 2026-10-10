@@ -75,11 +75,13 @@ pub fn handled(t: &mut Table, pid: Pid) {
     }
 }
 
-/// The timer thread: sends SIGALRM for every timer that expired, then sleeps until the next
-/// deadline or a change.
+/// The timer thread: sends SIGALRM for every timer that expired, trims the server's heap when
+/// that is asked for and due (`heap::trim_if_due`), then sleeps until the next deadline or a
+/// change.
 pub fn thread() -> ! {
     loop {
         let seen = CHANGED.load(Ordering::Acquire);
+        crate::heap::trim_if_due();
         let next = {
             let mut t = PROCS.lock();
             let now = now();
@@ -95,6 +97,10 @@ pub fn thread() -> ! {
                 signal::post_process(&mut t, pid, SigInfo::kernel(signal::SIGALRM), false);
             }
             t.procs.values().filter(|p| p.zombie.is_none() && p.itimer.at != 0 && !p.itimer.parked).map(|p| p.itimer.at).min().unwrap_or(0)
+        };
+        let next = match (next, crate::heap::trim_due()) {
+            (0, trim) | (trim, 0) => trim,
+            (a, b) => a.min(b),
         };
         // (A dying service thread's wait ends at once; its next call ends it.)
         process::wait_word(&CHANGED, seen, next, false);

@@ -291,6 +291,7 @@ oxidenix/
 │   ├── restricted/              restricted mode: shared region layout, register page, kernel calls
 │   ├── ring/                    SPSC descriptor rings and the channel layout (I/O rings)
 │   ├── fsring/                  the file protocol over the rings (Linux server <-> diskfs, procfs)
+│   ├── pageheap/                the Linux server's heap: page runs, slabs, commits and trimming
 │   └── oxrt/                    runtime for servers: entry, syscalls, heap, port I/O
 ├── builder/                     host tool: rootfs + cpio + boot image + ext2 data disk + QEMU
 └── userspace/                   C test programs, build script, rootfs and data disk templates,
@@ -421,6 +422,9 @@ About 13,100 lines of Rust (without comments and blank lines) in the kernel (16,
   address space unlocked (mmap, mprotect, mremap, faults). A background reclaimer (a kernel
   thread, Linux's kswapd) keeps free memory above the low watermark for allocations that
   cannot reclaim themselves. A heuristic overcommit mode would need a real OOM killer first.
+  Each Linux server instance holds up to 2 MiB of commitment for its heap beyond what is mapped
+  there when there is room (its own reserve, all together at most a 16th of the limit: a server
+  cannot fail an allocation but by breaking its instance).
   `/proc/meminfo` shows `Committed_AS`, `CommitLimit`, `Cached` (with tmpfs), `Shmem` (tmpfs and
   shared memory), `Writeback` (pinned for the disk server) and a `MemAvailable` that includes
   the droppable pages.
@@ -449,7 +453,8 @@ About 13,100 lines of Rust (without comments and blank lines) in the kernel (16,
   when an allocation fails. It never shrinks, so each growth lowers the commit limit by as
   much (`Slab` in `/proc/meminfo` is what of it is in use); before it grows, the size
   classes give back the slabs whose slots are all free
-  (`slab::FreeList::reclaim`; the Linux server's heap does the same), so a burst of many
+  (`slab::FreeList::reclaim`; the Linux server's heap returns empty slabs at once and
+  decommits its free pages, `crates/pageheap`), so a burst of many
   objects of one size does not keep that memory from all others. User memory (pages, page tables, kernel stacks) may not take the last 16 MiB of RAM,
   which stay reserved for the heap. Large allocations that user space can trigger (kernel
   stacks, file contents, pipe buffers, `execve` arguments) are fallible and return
@@ -661,10 +666,13 @@ the pass-through: the kernel implements no Linux system call.
   request was answered or overtaken (the page came and went, or was cut off); if the pager's
   process dies, every wait for it ends (`EIO`), and so does every wait for an object whose last
   handle the pager closed (no answer could name it any more).
-- **The server's runtime** (phase R3): a heap in its shared region that grows on demand
-  (`shared_map`, committed memory), and a mutex for data shared by all threads of the tree
+- **The server's runtime** (phase R3): a heap in its shared region whose pages it commits
+  and decommits itself (`shared_commit`, `shared_decommit`), and a mutex for data shared by all threads of the tree
   (Drepper's three-state futex lock over the kernel's futex, which keys the server's memory by
-  instance and address since that memory is pinned and in no address space's areas).
+  instance and address since that memory is in no address space's areas). The heap gives memory
+  back: free pages are decommitted by the timer thread when more than 2 MiB and a quarter of the
+  heap are free, and all of them when the kernel says memory is short (`EVENT_SHRINK`;
+  docs/design/linux-server.md, "The server's heap").
 - **Memory semantics are the server's** (phase R4): `mmap`, `munmap`, `mprotect`, `mremap`,
   `madvise`, `msync` and the `mlock` family are the server's. The server
   checks the arguments and turns them into kernel mapping calls: `mo_map` with anonymous
@@ -1155,7 +1163,7 @@ kernel implements none, R9):
 | Signals | `rt_sigaction` `rt_sigprocmask` `rt_sigreturn` `rt_sigsuspend` `rt_sigpending` `kill` `tkill` `tgkill` `pause` `sigaltstack` `alarm` `setitimer` `getitimer` (`ITIMER_REAL`) `rt_sigtimedwait` |
 | Process control | `prctl` (name, parent-death signal, dumpable, no-new-privs, capability bounding set) `capget` `capset` (everything runs as root with every capability) |
 | Filesystems | `statfs` `fstatfs` `sync` `syncfs` (every process tree's page cache of `/data`) `fsync` `fdatasync` |
-| Linux server (normal mode only) | `restricted_enter` (1010), `handle_close` (1012), memory objects: `mo_create` (1013), `mo_map` (1014), `mo_unmap` (1015), `mo_protect` (1016), `mo_read` (1017), `mo_write` (1018), paged objects: `mo_create_paged` (1019), `pager_wait` (1020), `mo_supply` (1021), `mo_fail` (1022), runtime: `shared_map` (1023), `server_futex_wait` (1024), `server_futex_wake` (1025), address space: `vm_remap` (1026), `vm_discard` (1027), `vm_sync` (1028), time: `clock_read` (1030), `sleep_until` (1031), `yield` (1032), `set_usercopy` (1033), file objects: `mo_create_file` (1055), `mo_hold` (1056), `mo_file_read` (1057), `mo_file_write` (1058), `mo_file_size` (1059), `mo_truncate` (1060), `initramfs` (1061), `mo_from_image` (1062), a thread's nice value: `thread_nice` (1095), waiting for several words: `server_wait` (1133), processes and threads (R8): `proc_self` (1140), `proc_create` (1141), `thread_create` (1142), `thread_kick` (1143), `thread_kill` (1144), `thread_exit` (1145), `exec_space` (1146), `proc_info` (1147), `thread_info` (1148), `thread_affinity` (1149), `thread_cleartid` (1150), `thread_name` (1151), `init_args` (1152), `vm_floor` (1153), `random` (1154), the last mechanisms (R9): `futex_wait` (1160), `futex_wake` (1161), `futex_requeue` (1162), `thread_fs` (1163), `clock_set` (1164), `power` (1165), `file_pages` (1166), `host_granted` (1167); the full list is in `docs/codemap.md` (1011 `legacy_syscall`, the inode and kfile calls went with R9) |
+| Linux server (normal mode only) | `restricted_enter` (1010), `handle_close` (1012), memory objects: `mo_create` (1013), `mo_map` (1014), `mo_unmap` (1015), `mo_protect` (1016), `mo_read` (1017), `mo_write` (1018), paged objects: `mo_create_paged` (1019), `pager_wait` (1020), `mo_supply` (1021), `mo_fail` (1022), runtime: `server_futex_wait` (1024), `server_futex_wake` (1025), address space: `vm_remap` (1026), `vm_discard` (1027), `vm_sync` (1028), time: `clock_read` (1030), `sleep_until` (1031), `yield` (1032), `set_usercopy` (1033), file objects: `mo_create_file` (1055), `mo_hold` (1056), `mo_file_read` (1057), `mo_file_write` (1058), `mo_file_size` (1059), `mo_truncate` (1060), `initramfs` (1061), `mo_from_image` (1062), a thread's nice value: `thread_nice` (1095), waiting for several words: `server_wait` (1133), processes and threads (R8): `proc_self` (1140), `proc_create` (1141), `thread_create` (1142), `thread_kick` (1143), `thread_kill` (1144), `thread_exit` (1145), `exec_space` (1146), `proc_info` (1147), `thread_info` (1148), `thread_affinity` (1149), `thread_cleartid` (1150), `thread_name` (1151), `init_args` (1152), `vm_floor` (1153), `random` (1154), the last mechanisms (R9): `futex_wait` (1160), `futex_wake` (1161), `futex_requeue` (1162), `thread_fs` (1163), `clock_set` (1164), `power` (1165), `file_pages` (1166), `host_granted` (1167), the server heap's memory: `shared_commit` (1169), `shared_decommit` (1170); the full list is in `docs/codemap.md` (1011 `legacy_syscall`, the inode and kfile calls went with R9; 1023 `shared_map` with the heap's own commits) |
 | Native servers (`oxrt::sys`, no Linux numbers) | `ipc_register` (1000), `ipc_receive` (1001, with timeout and interrupt notifications), `ipc_reply` (1002), `irq_enable` (1003), `dma_map` (1004), `proc_query` (1005), `ioperm` (1006, privileged servers only), `exec` (1007, the server's own program again), `log` (1008), the service's end of channels (1068-1075), and with the Linux server's numbers and contracts on their own memory: `mo_map` (anonymous), `mo_unmap`, `mo_protect`, `futex_wait`, `futex_wake`, `futex_requeue`, `clock_read`, `yield`, `random`, `thread_exit` |
 | System information | `sysinfo` `uname` (reports `oxidenix`, not Linux) `getcpu` |
 | Power | `reboot` (power off ends QEMU, restart resets the machine; every process tree's page cache is written back first; a tree without the kernel's host grant is ended instead, as a Linux pid namespace's: ADR 0011); `ioperm` and `iopl` are `EPERM` (a process tree has no ports) |
@@ -1180,7 +1188,7 @@ Each of these programs and scripts lives in the root filesystem and runs inside 
 | Test | Covers |
 |---|---|
 | `cowtest` | copy-on-write isolation between parent and child, kernel writes into shared pages, 50 forks, shared read-only frames stay unchanged, `brk` does not grow over a mapping |
-| `oomtest` | fork bomb (stops at the process limit), memory exhaustion via `mmap`, 100 full pipes; the kernel survives and memory is reusable; a process touching `MAP_NORESERVE` memory beyond the commit limit is killed while one with committed memory touches all of it; a `read()` into an untouched `MAP_NORESERVE` buffer with nothing left to commit kills the reader too (not `EFAULT`); a commit that dirty cache pages stand in the way of waits for their write-back, truncation racing write-back and fills keeps data and accounting, a writer's dirty pages stay within its tree's share, and a writer throttled because dirty pages would crowd out committed memory is killable at once; descriptors up to `RLIMIT_NOFILE` (4096, as `getrlimit` says), then `EMFILE`, a fork copying them all |
+| `oomtest` | fork bomb (stops at the process limit), memory exhaustion via `mmap`, 100 full pipes; the kernel survives and memory is reusable; a process touching `MAP_NORESERVE` memory beyond the commit limit is killed while one with committed memory touches all of it; a `read()` into an untouched `MAP_NORESERVE` buffer with nothing left to commit kills the reader too (not `EFAULT`); a commit that dirty cache pages stand in the way of waits for their write-back, truncation racing write-back and fills keeps data and accounting, a writer's dirty pages stay within its tree's share, and a writer throttled because dirty pages would crowd out committed memory is killable at once; descriptors up to `RLIMIT_NOFILE` (4096, as `getrlimit` says), then `EMFILE`, a fork copying them all; afterwards the Linux server's heap gives its free memory back (within 2 MiB of its start, Committed_AS within 4 MB, `TEST_HEAP_STATS`) and a commit refused at the limit makes it shrink (`EVENT_SHRINK`) down to its floor of free pages, not below; with all commitment taken the server still allocates, from its instance's reserve, and with memory full of a hog and of page cache it keeps allocating (none fails, none waits) |
 | `sigtest` | handlers, killing a busy loop, `SIGCHLD`, `EINTR` on pipe reads, blocked and ignored signals, FPU state across asynchronous handlers, `alarm` and repeating `setitimer`, catchable `SIGFPE`/`SIGSEGV`/`SIGTRAP` from CPU exceptions, an uncaught `SIGFPE` killing the process |
 | `jobtest` | stop/continue reporting through `wait4`, restart of a stopped `read()`, `SIGKILL` on stopped processes, `SA_RESTART` |
 | `waittest` | processes in the Linux server: `wait4` and `waitid` with their options (`WNOHANG`, `WNOWAIT`, `WEXITED`, `WSTOPPED`, `WCONTINUED`, `__WCLONE`, `__WALL`), the `siginfo` and `rusage` they report, an ignored `SIGCHLD` and `SA_NOCLDWAIT` reaping at once, child subreapers, the parent-death signal, process groups and sessions (`setpgid`, `setsid`, `getsid` and their errors), `clone3`, `vfork` |

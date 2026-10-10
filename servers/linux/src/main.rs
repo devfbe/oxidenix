@@ -236,7 +236,7 @@ fn dispatch(s: &mut State) -> i64 {
         // The test hooks reach beyond the caller (the instance's test
         // objects, the test service, /data files, the server's heap and
         // locks): only for the self-tests.
-        TEST_MAP..=TEST_FILL_GONE if !test_mode() => -ENOSYS,
+        TEST_MAP..=TEST_HEAP_STATS if !test_mode() => -ENOSYS,
         TEST_MAP..=TEST_CACHED => test(s.rax, s.rdi),
         TEST_MKWRITE_FAIL => datafs::fail_next_mkwrite(s.rdi),
         TEST_FILL_GONE => datafs::fail_next_fill(s.rdi, s.rsi),
@@ -266,6 +266,7 @@ fn dispatch(s: &mut State) -> i64 {
         },
         TEST_HOST => syscall(TEST_HOST, [s.rdi, 0, 0, 0, 0, 0]),
         TEST_FUTEX_WATCH => syscall(TEST_FUTEX_WATCH, [s.rdi, s.rsi, 0, 0, 0, 0]),
+        TEST_HEAP_STATS => test(s.rax, s.rdi),
         // Not offered, as by a Linux built without io_uring: libuv (and
         // so Node.js) probes io_uring_setup at start and uses epoll
         // instead. Answered here, so the kernel does not log them as
@@ -389,6 +390,13 @@ fn pager() -> ! {
             }
             EVENT_CONSOLE_LOST => {
                 console::lost();
+                continue;
+            }
+            EVENT_SHRINK => {
+                // Memory is short: the worker gives back about `a` pages
+                // (the heap's free memory, unused /data inodes); not here,
+                // where pages are brought and written back.
+                heap::ask_shrink(event.a);
                 continue;
             }
             EVENT_SERVICE_GONE => {
@@ -530,6 +538,18 @@ fn test(nr: u64, addr: u64) -> i64 {
             if r < 0 { r } else { 0 }
         }
         TEST_ALLOC => test_alloc(addr) as i64,
+        TEST_HEAP_STATS => {
+            let stats = HEAP.stats();
+            let mut bytes = [0u8; 40];
+            let shrinks = heap::SHRINKS.load(Ordering::Relaxed) as usize;
+            for (i, v) in [stats.committed, stats.in_use, stats.free, stats.decommitted, shrinks].into_iter().enumerate() {
+                bytes[i * 8..i * 8 + 8].copy_from_slice(&(v as u64).to_le_bytes());
+            }
+            match usercopy::to_program(addr, &bytes) {
+                Ok(()) => 0,
+                Err(e) => -e,
+            }
+        }
         TEST_CHANNEL => chantest::run(addr),
         TEST_DISKRING => disktest::run(addr),
         TEST_CACHED => datafs::test(addr),

@@ -15,8 +15,9 @@ pub const IMAGE_BASE: u64 = SHARED_BASE;
 /// Where the kernel maps memory objects into the region for the server
 /// (channels, `SYS_CHAN_CREATE`), up to `HEAP_BASE`.
 pub const MAPS_BASE: u64 = SHARED_BASE + 0x08_0000_0000;
-/// The server's heap: grows from here (`SYS_SHARED_MAP`) up to the thread
-/// areas.
+/// The server's heap area, up to the thread areas: address space the
+/// server lays out itself; its pages are memory only while committed
+/// (`SYS_SHARED_COMMIT`, `SYS_SHARED_DECOMMIT`).
 pub const HEAP_BASE: u64 = SHARED_BASE + 0x10_0000_0000;
 /// Per-thread areas: a guard page, the server's stack for the thread, and
 /// the page with its `State`.
@@ -293,6 +294,13 @@ pub const EVENT_THREAD_EXIT: u64 = 23;
 /// connect again and name it (diskfs's holds: `fsring`, "Holds"); the
 /// instance does so now rather than at its next use of the service.
 pub const EVENT_SERVICE_GONE: u64 = 24;
+/// Memory is short (a commit refused at the limit, or reclaim found no
+/// clean cache page to drop): the server gives back about `a` pages of what
+/// it can do without, its heap's free pages beyond the floor it keeps
+/// (`SYS_SHARED_DECOMMIT`) and the least recently used of the caches that
+/// cost nothing to make again (Linux's shrinkers). Requests coalesce into
+/// the largest until taken; at most one a second.
+pub const EVENT_SHRINK: u64 = 25;
 
 /// A server thread starts with its `State` in `rdi`, its role in `rsi`,
 /// and, serving a program, the `cookie` its creator gave `thread_create`
@@ -335,10 +343,32 @@ pub const TEST_PAGED_FAIL: u64 = 1508;
 
 // The server's runtime.
 
-/// `shared_map(len) -> addr`: `len` more bytes (rounded to pages) of
-/// zeroed, committed memory at the top of the server's heap, for every
-/// thread of the instance.
-pub const SYS_SHARED_MAP: u64 = 1023;
+// 1023 was `shared_map(len)`, which grew the heap at its top and never
+// shrank it: the heap commits and decommits its pages itself since
+// (`SYS_SHARED_COMMIT`, `SYS_SHARED_DECOMMIT`).
+/// `shared_commit(addr, len) -> pages`: makes the pages of
+/// [`addr`, `addr + len`) (page-aligned, within `HEAP_BASE..THREADS_BASE`)
+/// memory for every thread of the instance: each page not committed yet is
+/// committed (from the instance's heap reserve, up to 2 MiB of commitment
+/// it holds beyond its mapped pages, then against the commit limit) and
+/// mapped zeroed (its frame a free one or one clean cache pages give
+/// back); returns how many were. ENOMEM at once when the commit limit or
+/// memory is exhausted (nothing waits, for write-back or reclaim: the
+/// caller may hold locks the pager needs, or be the pager); some pages of the range may be
+/// committed then, and the caller decommits the range to know its state.
+/// A page is committed exactly while it is mapped: the kernel never commits
+/// one by itself, and a server access to a page that is not committed is
+/// a fault in the server (the instance breaks, `break_instance`).
+pub const SYS_SHARED_COMMIT: u64 = 1169;
+/// `shared_decommit(addr, len) -> pages`: gives back the committed pages of
+/// [`addr`, `addr + len`) (same range rules): unmapped from every view of
+/// the region (TLBs shot down), their frames freed and their commitment
+/// returned (to the instance's reserve first); returns how many there were. Their contents are lost.
+pub const SYS_SHARED_DECOMMIT: u64 = 1170;
+/// `shared_decommit_runs(list, n) -> pages`: `shared_decommit` of `n` (at
+/// most 16) runs, the (address, length) u64 pairs at `list`, with one TLB
+/// shootdown per batch of pages instead of one per run (a trim's).
+pub const SYS_SHARED_DECOMMIT_RUNS: u64 = 1171;
 /// `server_futex_wait(addr, val, deadline_ns, flags)`: sleeps while the
 /// word at `addr` (the server's memory) holds `val`, until woken, the
 /// deadline (monotonic nanoseconds; 0: none) or, with
@@ -989,3 +1019,9 @@ pub const TEST_FUTEX_WATCH: u64 = 1524;
 /// waits for is still brought, never SIGBUS. Inode 0 disarms it. Test mode
 /// only.
 pub const TEST_FILL_GONE: u64 = 1525;
+/// `(buf)`: the server writes its heap's numbers to the program's `buf`,
+/// five u64s: in bytes, memory it holds from the kernel (committed), in
+/// use by its objects, committed but free, and given back (decommitted);
+/// then how many shrinks (`EVENT_SHRINK`) it made.
+/// Test mode only.
+pub const TEST_HEAP_STATS: u64 = 1526;

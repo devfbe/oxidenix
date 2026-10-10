@@ -23,6 +23,7 @@ csprng = { path = "../crates/csprng" }
 noto-sans-mono-bitmap = { version = "0.2", features = ["size_24", "unicode-latin-1-supplement", "unicode-specials"] }
 linked_list_allocator = "0.10"
 slab = { path = "../crates/slab" }
+pageheap = { path = "../crates/pageheap" }
 lazy_static = { version = "1.0", features = ["spin_no_std"] }
 
 [build-dependencies]

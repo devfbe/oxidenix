@@ -366,9 +366,9 @@ version = "0.1.0"
 dependencies = [
  "fsring",
  "ldisc",
- "linked_list_allocator",
  "netlink",
  "netring",
+ "pageheap",
  "procproto",
  "restricted",
  "ring",
@@ -494,6 +494,7 @@ dependencies = [
  "lazy_static",
  "linked_list_allocator",
  "noto-sans-mono-bitmap",
+ "pageheap",
  "pc-keyboard",
  "pic8259",
  "png",
@@ -511,6 +512,13 @@ version = "0.1.0"
 dependencies = [
  "linked_list_allocator",
  "restricted",
+]
+
+[[package]]
+name = "pageheap"
+version = "0.1.0"
+dependencies = [
+ "slab 0.1.0",
 ]
 
 [[package]]
