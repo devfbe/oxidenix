@@ -122,7 +122,7 @@ processes, threads, memory objects and the services it uses.
 | IPC | today's services, and shared-memory rings for the I/O paths (separate design) |
 | devices | interrupts, I/O ports, PCI functions, DMA areas (as today; IOMMU per `iommu.md`) |
 | console | the framebuffer console and keyboard as a raw device the server's tty layer drives, held by one instance at a time (ADR 0004; `console_read`, `console_write`, `console_info`, `EVENT_CONSOLE`; R6d) |
-| the last mechanisms (R9) | `futex_wait`, `futex_wake`, `futex_requeue` on the program's memory; `thread_fs` (the FS base); `clock_set`; `power`; `file_pages` (tmpfs's statfs) |
+| the last mechanisms (R9) | `futex_wait`, `futex_wake`, `futex_requeue` on the program's memory; `thread_fs` (the FS base); `clock_set`; `power`; `host_granted`; `file_pages` (tmpfs's statfs) |
 
 What left the kernel over the migration (the last of it with R9, "Removing the
 pass-through" below): `process/syscall.rs`'s Linux dispatch, `sys_*.rs`, `signal.rs`,

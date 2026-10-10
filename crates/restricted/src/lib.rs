@@ -785,6 +785,11 @@ pub const POWER_RESTART: u64 = 1;
 /// instance's tmpfs files: `mo_create_file`, `mo_from_image`) take and
 /// their limit, two u64s at `out` in the server's memory (tmpfs's statfs).
 pub const SYS_FILE_PAGES: u64 = 1166;
+/// `host_granted()`: 0 if the caller's instance has the host grant (see
+/// `SYS_CLOCK_SET`), EPERM if not. For what Linux decides by the capability
+/// before it looks at the arguments (`reboot` in a pid namespace that is
+/// not the initial one, `settimeofday` with only a time zone).
+pub const SYS_HOST_GRANTED: u64 = 1167;
 
 /// What `proc_info` tells about a process.
 #[repr(C)]

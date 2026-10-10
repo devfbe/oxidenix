@@ -265,8 +265,14 @@ static void r9_checks(void) {
     int eperm1 = clock_settime(CLOCK_REALTIME, &later) == -1 && errno == EPERM;
     errno = 0;
     int eperm2 = settimeofday(&tv_now, NULL) == -1 && errno == EPERM;
+    /* reboot_pid_ns takes only the restart, power off and halt commands. */
+    errno = 0;
+    int cad_off = syscall(SYS_reboot, 0xfee1dead, 0x28121969, 0, NULL) == -1 && errno == EINVAL;
+    errno = 0;
+    int cad_on = syscall(SYS_reboot, 0xfee1dead, 0x28121969, 0x89abcdef, NULL) == -1 && errno == EINVAL;
     syscall(TEST_HOST, 1);
     check("without the host grant clock_settime and settimeofday are EPERM", had == 1 && eperm1 && eperm2 && time(NULL) < later.tv_sec - 1800);
+    check("... and reboot's CAD_ON and CAD_OFF EINVAL (a pid namespace's reboot)", cad_off && cad_on);
     errno = 0;
     check("reboot: CAD_OFF is taken, RESTART2 checks its string (EFAULT)",
           syscall(SYS_reboot, 0xfee1dead, 0x28121969, 0, NULL) == 0

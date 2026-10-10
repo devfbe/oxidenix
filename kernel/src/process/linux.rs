@@ -1523,6 +1523,10 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             drop(instance);
             power(a[0])
         }
+        SYS_HOST_GRANTED => match instance.host.load(core::sync::atomic::Ordering::Acquire) {
+            true => Ok(0),
+            false => Err(EPERM),
+        },
         SYS_FILE_PAGES => {
             let (used, limit) = crate::fs::cache::tmpfs_usage();
             let mut out = [0u8; 16];

@@ -56,8 +56,11 @@ of the kernel's tree that `/dev` still was. Four questions decided the shape:
    server acts as Linux in a pid namespace that is not the initial one: `clock_settime` and
    `settimeofday` are EPERM, and `reboot` ends the tree (its init dies, and with it every
    process; its parent's wait reports SIGHUP for a restart, SIGINT for a power off or halt;
-   the caller exits), as `reboot_pid_ns` does. A test-mode call (`TEST_HOST`) takes the grant from the self-tests' tree for the
-   clock's checks; the reboot without it ends the suite's own tree and is not tried there.
+   the caller exits), as `reboot_pid_ns` does: any other command (CAD_ON, CAD_OFF) is
+   EINVAL and a RESTART2's string is not read. The server asks for the grant first
+   (`host_granted`) where Linux checks the capability before the arguments. A test-mode
+   call (`TEST_HOST`) takes the grant from the self-tests' tree for the clock's checks and
+   reboot's refusals; a reboot without it ends the suite's own tree and is not tried there.
 6. **Requeues move only plain futex waits** (added in review): `futex_requeue` moves
    waiters that entered through `futex_wait`, never the Linux server's own waits
    (`server_futex_wait` on its memory or an object mapped there, `server_wait`) nor doorbell
@@ -76,7 +79,8 @@ of the kernel's tree that `/dev` still was. Four questions decided the shape:
   (said on the console, as the kernel used to).
 - The server owns every Linux semantic, so a fix to one is a server change; the kernel's
   interface grew by six narrow calls (`futex_wait`, `futex_wake`, `futex_requeue`,
-  `thread_fs`, `clock_set`, `power`) and `file_pages` for tmpfs's statfs.
+  `thread_fs`, `clock_set`, `power`), `file_pages` for tmpfs's statfs and `host_granted`
+  for what Linux decides by the capability before the arguments (decision 5).
 - The native servers can no longer be confused with Linux programs; ringtest's checks of the
   kernel's refusals use the native calls (`random` into a read-only grant, `futex_requeue`).
 - Resource limits other than RLIMIT_NOFILE start as Linux's defaults the server holds to and
