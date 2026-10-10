@@ -9,7 +9,7 @@ use crate::syscall;
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::{null_mut, NonNull};
 use linked_list_allocator::Heap;
-use restricted::SYS_SHARED_MAP;
+use restricted::SYS_SHARED_COMMIT;
 
 /// The heap grows at least this much at a time.
 const GROWTH: usize = 1024 * 1024;
@@ -22,11 +22,19 @@ impl ServerHeap {
     }
 }
 
+/// The top of the heap's committed memory (under the heap's lock).
+static TOP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(restricted::HEAP_BASE);
+
 /// More memory from the kernel: (start, length), or None.
 fn more(at_least: usize) -> Option<(usize, usize)> {
     let len = at_least.max(GROWTH).next_multiple_of(4096);
-    let start = syscall(SYS_SHARED_MAP, [len as u64, 0, 0, 0, 0, 0]);
-    (start > 0).then_some((start as usize, len))
+    let start = TOP.load(core::sync::atomic::Ordering::Relaxed);
+    if syscall(SYS_SHARED_COMMIT, [start, len as u64, 0, 0, 0, 0]) < 0 {
+        syscall(restricted::SYS_SHARED_DECOMMIT, [start, len as u64, 0, 0, 0, 0]);
+        return None;
+    }
+    TOP.store(start + len as u64, core::sync::atomic::Ordering::Relaxed);
+    Some((start as usize, len))
 }
 
 /// Free slots of each size class.

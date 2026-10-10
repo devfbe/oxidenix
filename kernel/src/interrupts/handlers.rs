@@ -145,6 +145,12 @@ fn exception(frame: &mut Frame) {
             let (program, normal) = mm.tlb.roots();
             crate::printkln!("[linux] program view {:#x}, normal view {:#x}", program, normal);
         }
+        // The kernel never commits a page of the server's heap by itself
+        // (`restricted::SYS_SHARED_COMMIT`): a touch of one not committed
+        // is the server's own error.
+        if vector == 14 && (restricted::HEAP_BASE..restricted::THREADS_BASE).contains(&fault_addr) {
+            crate::printkln!("[linux] the server touched a page of its heap area that is not committed (never, or decommitted since)");
+        }
         crate::process::linux::break_instance();
         kill::kernel_kill_current();
     }

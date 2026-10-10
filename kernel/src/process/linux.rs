@@ -177,6 +177,62 @@ fn zeroed_frame() -> Result<PhysFrame, i64> {
     Ok(frame)
 }
 
+/// Pages `Instance::unmap_pages` takes off at a time (their frames on the
+/// stack until the shootdown).
+const UNMAP_BATCH: usize = 64;
+
+/// A frame for a page committed already (`SYS_SHARED_COMMIT`): zeroed,
+/// waiting for reclaim as a fault does (with no lock held but the heap
+/// area's, which reclaim never takes) until one comes or the thread dies.
+fn committed_frame() -> Result<PhysFrame, i64> {
+    let mut tries = 0;
+    loop {
+        if let Ok(frame) = zeroed_frame() {
+            return Ok(frame);
+        }
+        if !memory::reclaim_retry(1, &mut tries) {
+            return Err(ENOMEM);
+        }
+    }
+}
+
+/// The end of [addr, addr + len) if it is a page-aligned range of the
+/// heap area (`HEAP_BASE..THREADS_BASE`), else EINVAL.
+fn heap_range(addr: u64, len: u64) -> Result<u64, i64> {
+    let end = addr.checked_add(len).ok_or(EINVAL)?;
+    if addr % PAGE != 0 || len % PAGE != 0 || len == 0 || addr < HEAP_BASE || end > THREADS_BASE {
+        return Err(EINVAL);
+    }
+    Ok(end)
+}
+
+fn heap_page(addr: u64) -> Page<Size4KiB> {
+    Page::containing_address(VirtAddr::new(addr))
+}
+
+/// A word of the server's memory a wait reads (`Instance::word`), with the
+/// reference on its frame it holds if the page may be decommitted.
+struct ServerWord {
+    word: *const core::sync::atomic::AtomicU32,
+    frame: Option<PhysFrame>,
+}
+
+impl ServerWord {
+    fn get(&self) -> &core::sync::atomic::AtomicU32 {
+        // The frame is mapped in the physical map for good, and either the
+        // instance's (image, thread areas) or held by this reference.
+        unsafe { &*self.word }
+    }
+}
+
+impl Drop for ServerWord {
+    fn drop(&mut self) {
+        if let Some(frame) = self.frame {
+            memory::with_frames(|f| unsafe { f.deallocate_frame(frame) });
+        }
+    }
+}
+
 /// One instance of the Linux server: the page tables of its shared region
 /// and its threads' areas.
 pub struct Instance {
@@ -206,8 +262,11 @@ pub struct Instance {
     /// Address spaces of the tree's programs: when the last goes, so does
     /// the pager's process.
     programs: core::sync::atomic::AtomicUsize,
-    /// The top of the server's heap, and the pages committed for it.
-    heap_end: spin::Mutex<u64>,
+    /// Held while the entries of the server's heap area
+    /// (`HEAP_BASE..THREADS_BASE`) change and while a word there is taken
+    /// for a wait (`word`); the pages committed there (each exactly while
+    /// it is mapped, `SYS_SHARED_COMMIT`).
+    heap: crate::sync::Mutex<()>,
     heap_pages: core::sync::atomic::AtomicU64,
     /// The dirty and pinned pages of its cached objects (bounded per
     /// instance, `fs::cache`).
@@ -369,7 +428,7 @@ impl Instance {
                 announced: 0,
             }),
             programs: core::sync::atomic::AtomicUsize::new(0),
-            heap_end: spin::Mutex::new(HEAP_BASE),
+            heap: crate::sync::Mutex::new(()),
             heap_pages: core::sync::atomic::AtomicU64::new(0),
             cache_counts,
             maps: crate::sync::Mutex::new(BTreeMap::new()),
@@ -620,49 +679,86 @@ impl Instance {
         Ok(frame)
     }
 
-    /// Grows the server's heap by `len` bytes (rounded up to pages):
-    /// zeroed, committed memory. Returns where it starts.
-    fn grow_heap(&self, len: u64) -> Result<u64, i64> {
-        let len = len.checked_add(PAGE - 1).ok_or(EINVAL)? & !(PAGE - 1);
-        let mut end = self.heap_end.lock();
-        let start = *end;
-        if len == 0 || start.checked_add(len).is_none_or(|e| e > THREADS_BASE) {
+    /// `SYS_SHARED_COMMIT`: commits and maps (zeroed) the pages of the
+    /// heap area's [addr, addr + len) that are not; returns how many.
+    fn commit_heap(&self, addr: u64, len: u64) -> Result<u64, i64> {
+        let end = heap_range(addr, len)?;
+        let _area = self.heap.lock();
+        let mapper = unsafe { OffsetPageTable::new(table_at(self.view), memory::phys_offset()) };
+        let missing = (addr..end).step_by(PAGE as usize).filter(|&at| mapper.translate_page(heap_page(at)).is_err()).count() as u64;
+        if missing == 0 {
+            return Ok(0);
+        }
+        if !memory::commit(missing) {
             return Err(ENOMEM);
         }
-        let pages = len / PAGE;
-        if !memory::commit(pages) {
-            return Err(ENOMEM);
-        }
-        self.heap_pages.fetch_add(pages, core::sync::atomic::Ordering::Relaxed);
-        for addr in (start..start + len).step_by(PAGE as usize) {
-            // Mapped pages stay (the instance frees them); the rest of the
-            // commit is given back below with the failure.
-            if let Err(e) = self.ensure(addr) {
-                *end = addr;
-                let left = (start + len - addr) / PAGE;
-                self.heap_pages.fetch_sub(left, core::sync::atomic::Ordering::Relaxed);
-                memory::uncommit(left);
-                return Err(e);
+        // Each page committed exactly while it is mapped: what is mapped
+        // when a frame or a table cannot be had stays (the caller
+        // decommits the range), the rest of the commitment goes back.
+        let mut mapped = 0;
+        let mut result = Ok(missing);
+        for at in (addr..end).step_by(PAGE as usize) {
+            if mapper.translate_page(heap_page(at)).is_ok() {
+                continue;
             }
+            if let Err(e) = committed_frame().and_then(|frame| self.map(at, frame, PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE)) {
+                result = Err(e);
+                break;
+            }
+            mapped += 1;
         }
-        *end = start + len;
-        Ok(start)
+        memory::uncommit(missing - mapped);
+        self.heap_pages.fetch_add(mapped, core::sync::atomic::Ordering::Relaxed);
+        result
+    }
+
+    /// `SYS_SHARED_DECOMMIT`: unmaps the committed pages of the heap area's
+    /// [addr, addr + len) from every view, frees them and returns their
+    /// commitment; how many there were.
+    fn decommit_heap(&self, addr: u64, len: u64) -> Result<u64, i64> {
+        let end = heap_range(addr, len)?;
+        let _area = self.heap.lock();
+        let gone = self.unmap_pages(addr, (end - addr) / PAGE);
+        self.heap_pages.fetch_sub(gone, core::sync::atomic::Ordering::Relaxed);
+        memory::uncommit(gone);
+        Ok(gone)
     }
 
     /// The word at `addr` of the server's own memory (mapped, 4-aligned),
-    /// which stays mapped as long as the instance lives. Not in the range
-    /// of the objects mapped into the region (`object_word`): those come
-    /// and go.
-    fn word(&self, addr: u64) -> Result<&core::sync::atomic::AtomicU32, i64> {
+    /// for a wait: not in the range of the objects mapped into the region
+    /// (`object_word`). A word of the image or a thread area stays mapped
+    /// as long as the instance lives; one in the heap area holds a
+    /// reference on its frame (a decommit of the page meanwhile unmaps it,
+    /// the frame stays until the wait lets go of it).
+    fn word(&self, addr: u64) -> Result<ServerWord, i64> {
         if (MAPS_BASE..HEAP_BASE).contains(&addr) {
             return Err(EFAULT);
         }
-        self.translate_word(addr)
+        let heap = (HEAP_BASE..THREADS_BASE).contains(&addr);
+        // Translated and shared with the frames locked: a decommit frees
+        // the frame (with them locked) only after it cleared the entry, so
+        // an entry found here still holds its frame until it is shared.
+        memory::with_frames(|f| {
+            let (frame, word) = self.translate_word(addr)?;
+            if heap {
+                f.share(frame);
+            }
+            Ok(ServerWord { word, frame: heap.then_some(frame) })
+        })
     }
 
-    /// The word at `addr` of the region, mapped or not; the caller keeps
-    /// what is mapped there.
-    fn translate_word(&self, addr: u64) -> Result<&core::sync::atomic::AtomicU32, i64> {
+    /// Whether a word at `addr` of the server's own memory is mapped (for a
+    /// wake, which reads nothing there).
+    fn word_mapped(&self, addr: u64) -> Result<(), i64> {
+        if (MAPS_BASE..HEAP_BASE).contains(&addr) {
+            return Err(EFAULT);
+        }
+        self.translate_word(addr).map(|_| ())
+    }
+
+    /// The word at `addr` of the region and its frame, mapped or not; the
+    /// caller keeps what is mapped there.
+    fn translate_word(&self, addr: u64) -> Result<(PhysFrame, *const core::sync::atomic::AtomicU32), i64> {
         if addr % 4 != 0 || !(SHARED_BASE..SHARED_END).contains(&addr) {
             return Err(EINVAL);
         }
@@ -670,7 +766,7 @@ impl Instance {
         let page = Page::<Size4KiB>::containing_address(VirtAddr::new(addr));
         let frame = mapper.translate_page(page).map_err(|_| EFAULT)?;
         let phys = frame.start_address().as_u64() + addr % PAGE;
-        Ok(unsafe { &*(memory::phys_to_virt(phys) as *const core::sync::atomic::AtomicU32) })
+        Ok((frame, memory::phys_to_virt(phys) as *const core::sync::atomic::AtomicU32))
     }
 
     /// An address space whose normal view shows the region appeared.
@@ -743,38 +839,58 @@ impl Instance {
         Ok(())
     }
 
-    /// Removes the entries of `pages` pages at `start`, drops them from the
-    /// TLBs of every address space showing the region, then lets go of the
-    /// frames.
-    fn unmap_pages(&self, start: u64, pages: u64) {
+    /// Removes the entries of `pages` pages at `start` (those mapped), drops
+    /// them from the TLBs of every address space showing the region, then
+    /// lets go of the frames; how many there were. In batches of
+    /// `UNMAP_BATCH` frames, held on the stack (nothing is allocated).
+    fn unmap_pages(&self, start: u64, pages: u64) -> u64 {
         let mut mapper = unsafe { OffsetPageTable::new(table_at(self.view), memory::phys_offset()) };
-        let mut frames = Vec::new();
-        // Without room to collect the frames, one page at a time.
-        let batch = frames.try_reserve_exact(pages as usize).is_ok();
-        for i in 0..pages {
-            let at = start + i * PAGE;
-            if let Ok((frame, flush)) = mapper.unmap(Page::<Size4KiB>::containing_address(VirtAddr::new(at))) {
-                flush.ignore();
-                if batch {
-                    frames.push(frame);
-                } else {
-                    self.shootdown(at, at + PAGE);
-                    memory::with_frames(|f| unsafe { f.deallocate_frame(frame) });
+        let end = start + pages * PAGE;
+        let mut frames = [None::<PhysFrame>; UNMAP_BATCH];
+        let (mut at, mut gone) = (start, 0);
+        while at < end {
+            let (from, mut n) = (at, 0);
+            while at < end && n < UNMAP_BATCH {
+                if let Ok((frame, flush)) = mapper.unmap(Page::<Size4KiB>::containing_address(VirtAddr::new(at))) {
+                    flush.ignore();
+                    frames[n] = Some(frame);
+                    n += 1;
                 }
+                at += PAGE;
             }
-        }
-        if batch {
-            self.shootdown(start, start + pages * PAGE);
-        }
-        memory::with_frames(|f| {
-            for frame in frames {
-                unsafe { f.deallocate_frame(frame) };
+            if n == 0 {
+                continue;
             }
-        });
+            self.shootdown(from, at);
+            memory::with_frames(|f| {
+                for frame in frames[..n].iter_mut().filter_map(Option::take) {
+                    unsafe { f.deallocate_frame(frame) };
+                }
+            });
+            gone += n as u64;
+        }
+        gone
     }
 
+    /// Drops [start, end) of the region from the TLBs of every address
+    /// space showing it. Their list is copied out under its lock into room
+    /// reserved before (nothing allocated under a spinlock); without room,
+    /// every CPU flushes the range and every address space's entries (a
+    /// flush of the kernel's mappings reaches them all).
     fn shootdown(&self, start: u64, end: u64) {
-        let spaces: Vec<Arc<super::tlb::Tlb>> = self.spaces.lock().iter().filter_map(Weak::upgrade).collect();
+        let mut spaces: Vec<Arc<super::tlb::Tlb>> = Vec::new();
+        loop {
+            let want = self.spaces.lock().len();
+            if spaces.try_reserve_exact(want).is_err() {
+                super::tlb::shootdown_kernel(start, end);
+                return;
+            }
+            let list = self.spaces.lock();
+            if list.len() <= spaces.capacity() {
+                spaces.extend(list.iter().filter_map(Weak::upgrade));
+                break;
+            }
+        }
         for tlb in spaces {
             super::tlb::shootdown(&tlb, start, end);
         }
@@ -793,8 +909,8 @@ impl Instance {
         }
         // Translated under the lock: the entry is still the object's page,
         // which the object (returned with it) keeps.
-        let word = self.translate_word(addr).ok()?;
-        Some((m.object.clone(), addr - start, word))
+        let (_, word) = self.translate_word(addr).ok()?;
+        Some((m.object.clone(), addr - start, unsafe { &*word }))
     }
 
     /// Counts a new channel of the instance (EMFILE beyond `MAX_CHANNELS`).
@@ -1378,15 +1494,30 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             }
             let mut raw = [0u8; 16 * WAIT_MAX as usize];
             super::uaccess::copy_from_server(list, &mut raw[..16 * n as usize])?;
+            let pairs = || {
+                raw[..16 * n as usize].chunks_exact(16).map(|pair| {
+                    let addr = u64::from_le_bytes(pair[..8].try_into().unwrap_or_default());
+                    (addr, u64::from_le_bytes(pair[8..].try_into().unwrap_or_default()) as u32)
+                })
+            };
+            // The server's own words first, each held for the wait (`word`).
+            let mut held = Vec::new();
+            held.try_reserve_exact(n as usize).map_err(|_| ENOMEM)?;
+            for (addr, _) in pairs() {
+                if !(MAPS_BASE..HEAP_BASE).contains(&addr) {
+                    held.push(instance.word(addr)?);
+                }
+            }
             let mut words = Vec::new();
             words.try_reserve_exact(n as usize).map_err(|_| ENOMEM)?;
-            for pair in raw[..16 * n as usize].chunks_exact(16) {
-                let addr = u64::from_le_bytes(pair[..8].try_into().unwrap_or_default());
-                let val = u64::from_le_bytes(pair[8..].try_into().unwrap_or_default()) as u32;
+            let mut own = held.iter();
+            for (addr, val) in pairs() {
                 // A word of an object mapped into the region has the object's key.
-                words.push(match instance.object_word(addr) {
-                    Some((object, offset, word)) => super::futex::WaitWord::object(object, offset, word, val),
-                    None => super::futex::WaitWord::server(Arc::as_ptr(&instance) as usize, addr, instance.word(addr)?, val),
+                words.push(if (MAPS_BASE..HEAP_BASE).contains(&addr) {
+                    let (object, offset, word) = instance.object_word(addr).ok_or(EFAULT)?;
+                    super::futex::WaitWord::object(object, offset, word, val)
+                } else {
+                    super::futex::WaitWord::server(Arc::as_ptr(&instance) as usize, addr, own.next().expect("held above").get(), val)
                 });
             }
             let deadline = (deadline != 0).then_some(deadline);
@@ -1412,7 +1543,8 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             cache.fail(offset / PAGE)?;
             Ok(0)
         }
-        SYS_SHARED_MAP => Ok(instance.grow_heap(a[0])? as i64),
+        SYS_SHARED_COMMIT => Ok(instance.commit_heap(a[0], a[1])? as i64),
+        SYS_SHARED_DECOMMIT => Ok(instance.decommit_heap(a[0], a[1])? as i64),
         SYS_INITRAMFS => {
             let image = crate::fs::initramfs().ok_or(ENOENT)?;
             super::uaccess::copy_to_server(a[0], &(image.len() as u64).to_le_bytes())?;
@@ -1605,13 +1737,13 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             }
             let word = instance.word(addr)?;
             let id = Arc::as_ptr(&instance) as usize;
-            super::futex::server_wait(id, addr, word, val, deadline, ends)
+            super::futex::server_wait(id, addr, word.get(), val, deadline, ends)
         }
         SYS_SERVER_FUTEX_WAKE => {
             if let Some((object, offset, _)) = instance.object_word(a[0]) {
                 return Ok(super::futex::object_wake(&object, offset, a[1]));
             }
-            instance.word(a[0])?;
+            instance.word_mapped(a[0])?;
             Ok(super::futex::server_wake(Arc::as_ptr(&instance) as usize, a[0], a[1]))
         }
         SYS_CHAN_CREATE => {

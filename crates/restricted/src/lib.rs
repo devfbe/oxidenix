@@ -15,8 +15,9 @@ pub const IMAGE_BASE: u64 = SHARED_BASE;
 /// Where the kernel maps memory objects into the region for the server
 /// (channels, `SYS_CHAN_CREATE`), up to `HEAP_BASE`.
 pub const MAPS_BASE: u64 = SHARED_BASE + 0x08_0000_0000;
-/// The server's heap: grows from here (`SYS_SHARED_MAP`) up to the thread
-/// areas.
+/// The server's heap area, up to the thread areas: address space the
+/// server lays out itself; its pages are memory only while committed
+/// (`SYS_SHARED_COMMIT`, `SYS_SHARED_DECOMMIT`).
 pub const HEAP_BASE: u64 = SHARED_BASE + 0x10_0000_0000;
 /// Per-thread areas: a guard page, the server's stack for the thread, and
 /// the page with its `State`.
@@ -293,6 +294,12 @@ pub const EVENT_THREAD_EXIT: u64 = 23;
 /// connect again and name it (diskfs's holds: `fsring`, "Holds"); the
 /// instance does so now rather than at its next use of the service.
 pub const EVENT_SERVICE_GONE: u64 = 24;
+/// Memory is short (free frames below the reclaimer's low watermark, or a
+/// commit refused at the limit): the server gives back what it can do
+/// without, its heap's free pages (`SYS_SHARED_DECOMMIT`) and caches that
+/// cost nothing to make again (Linux's shrinkers). Queued once until taken,
+/// and at most once a second.
+pub const EVENT_SHRINK: u64 = 25;
 
 /// A server thread starts with its `State` in `rdi`, its role in `rsi`,
 /// and, serving a program, the `cookie` its creator gave `thread_create`
@@ -335,10 +342,26 @@ pub const TEST_PAGED_FAIL: u64 = 1508;
 
 // The server's runtime.
 
-/// `shared_map(len) -> addr`: `len` more bytes (rounded to pages) of
-/// zeroed, committed memory at the top of the server's heap, for every
-/// thread of the instance.
-pub const SYS_SHARED_MAP: u64 = 1023;
+// 1023 was `shared_map(len)`, which grew the heap at its top and never
+// shrank it: the heap commits and decommits its pages itself since
+// (`SYS_SHARED_COMMIT`, `SYS_SHARED_DECOMMIT`).
+/// `shared_commit(addr, len) -> pages`: makes the pages of
+/// [`addr`, `addr + len`) (page-aligned, within `HEAP_BASE..THREADS_BASE`)
+/// memory for every thread of the instance: each page not committed yet is
+/// committed (charged against the commit limit, as a program's private
+/// page) and mapped zeroed; returns how many were. ENOMEM when the commit
+/// limit or memory is exhausted (nothing waits for write-back: the caller
+/// may hold locks the pager needs); some pages of the range may be
+/// committed then, and the caller decommits the range to know its state.
+/// A page is committed exactly while it is mapped: the kernel never commits
+/// one by itself, and a server access to a page that is not committed is
+/// a fault in the server (the instance breaks, `break_instance`).
+pub const SYS_SHARED_COMMIT: u64 = 1169;
+/// `shared_decommit(addr, len) -> pages`: gives back the committed pages of
+/// [`addr`, `addr + len`) (same range rules): unmapped from every view of
+/// the region (TLBs shot down), their frames freed and their commitment
+/// returned; returns how many there were. Their contents are lost.
+pub const SYS_SHARED_DECOMMIT: u64 = 1170;
 /// `server_futex_wait(addr, val, deadline_ns, flags)`: sleeps while the
 /// word at `addr` (the server's memory) holds `val`, until woken, the
 /// deadline (monotonic nanoseconds; 0: none) or, with
