@@ -300,7 +300,12 @@ static TEST_SLEEP_LOCK: sync::SleepLock = sync::SleepLock::new(());
 static TEST_OBJECT: AtomicU64 = AtomicU64::new(0);
 /// The paged object of TEST_PAGED, and how many pages the pager supplied.
 static TEST_PAGED_OBJECT: AtomicU64 = AtomicU64::new(0);
-static SUPPLIED: AtomicU64 = AtomicU64::new(0);
+/// Held by the pager across a supply and its count (bounded work: the
+/// supply copies from the pager's own memory and waits for nothing), so a
+/// thread that saw a page come and then asks (TEST_SUPPLIED) finds it
+/// counted: the supply wakes the page's waiters, which may run and ask
+/// before the pager is back from it.
+static SUPPLIED: sync::Mutex<u64> = sync::Mutex::new(0);
 /// TEST_PAGED_STUCK's object (its handle, the latest run's).
 static TEST_STUCK_OBJECT: AtomicU64 = AtomicU64::new(0);
 /// The key the test's paged object goes by; +1: never answered.
@@ -424,8 +429,9 @@ fn pager() -> ! {
         page[..text.len()].copy_from_slice(&text);
         page[text.len() - 1] = b'0' + (request.offset / PAGE) as u8 % 10;
         let handle = TEST_PAGED_OBJECT.load(Ordering::Acquire);
+        let mut supplied = SUPPLIED.lock();
         if syscall(SYS_MO_SUPPLY, [handle, request.offset, page.as_ptr() as u64, PAGE, 0, 0]) == 1 {
-            SUPPLIED.fetch_add(1, Ordering::Relaxed);
+            *supplied += 1;
         }
     }
 }
@@ -507,7 +513,7 @@ fn test(nr: u64, addr: u64) -> i64 {
             let r = syscall(SYS_MO_MAP, [h as u64, addr, 4 * PAGE, 0, PROT_READ, MO_SHARED | MO_FIXED]);
             if r < 0 { r } else { 0 }
         }
-        TEST_SUPPLIED => SUPPLIED.load(Ordering::Relaxed) as i64,
+        TEST_SUPPLIED => *SUPPLIED.lock() as i64,
         TEST_PAGED_FAIL => {
             let key = NEXT_FAIL_KEY.fetch_add(1, Ordering::Relaxed);
             if key >= datafs::KEY_BASE {
