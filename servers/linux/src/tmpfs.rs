@@ -160,11 +160,19 @@ static INODES: AtomicUsize = AtomicUsize::new(0);
 const MAX_META_BYTES: usize = 4 << 20;
 static META_BYTES: AtomicUsize = AtomicUsize::new(0);
 
+/// Gives `n` back to a bound's count, never below zero (a count that wrapped would be no
+/// bound at all).
+fn give_back(count: &AtomicUsize, n: usize) {
+    let _ = count.try_update(Ordering::Relaxed, Ordering::Relaxed, |c| Some(c.saturating_sub(n)));
+}
+
+/// The inode itself goes (its last reference: its names, open files and walks are gone):
+/// what it charged at its creation is given back, here and only here.
 impl Drop for Inode {
     fn drop(&mut self) {
         if self.charged != usize::MAX {
-            INODES.fetch_sub(1, Ordering::Relaxed);
-            META_BYTES.fetch_sub(self.charged, Ordering::Relaxed);
+            give_back(&INODES, 1);
+            give_back(&META_BYTES, self.charged);
         }
     }
 }
@@ -187,21 +195,16 @@ impl Inode {
             Kind::Symlink(t) => t.len(),
             _ => 0,
         };
-        if INODES.fetch_add(1, Ordering::Relaxed) >= MAX_INODES {
-            INODES.fetch_sub(1, Ordering::Relaxed);
+        if INODES.try_update(Ordering::Relaxed, Ordering::Relaxed, |c| (c < MAX_INODES).then_some(c + 1)).is_err() {
             return Err(ENOSPC);
         }
-        if META_BYTES.fetch_add(meta, Ordering::Relaxed) + meta > MAX_META_BYTES {
-            META_BYTES.fetch_sub(meta, Ordering::Relaxed);
-            INODES.fetch_sub(1, Ordering::Relaxed);
+        if META_BYTES.try_update(Ordering::Relaxed, Ordering::Relaxed, |c| (c + meta <= MAX_META_BYTES).then_some(c + meta)).is_err() {
+            give_back(&INODES, 1);
             return Err(ENOSPC);
         }
-        // (A failure from here on gives the charge back with the inode's drop, or here.)
-        Inode::make(kind, perm, meta).map_err(|e| {
-            INODES.fetch_sub(1, Ordering::Relaxed);
-            META_BYTES.fetch_sub(meta, Ordering::Relaxed);
-            e
-        })
+        // Charged: from here on the inode value owns the charge, and its drop gives it back
+        // (also when no memory is found for it: `Arc::try_new` drops the value).
+        Inode::make(kind, perm, meta)
     }
 
     /// The server's own inode (the root, devpts and its nodes): not charged.
@@ -330,15 +333,19 @@ impl Inode {
 
     /// Directory entries (name, inode number, dirent type), "." and ".."
     /// first.
-    pub fn list(&self) -> Result<Vec<(String, u64, u8)>, i64> {
-        let children: Vec<(String, Arc<Inode>)> = match self.state.lock().kind.get() {
-            Kind::Dir(m) => m.iter().map(|(n, c)| (n.clone(), c.clone())).collect(),
-            _ => return Err(ENOTDIR),
-        };
-        let mut out = Vec::with_capacity(children.len() + 2);
+    /// Its entries ("." and ".." first), charged to the tree's snapshot bound (`charge`).
+    pub fn list(&self, charge: &mut crate::files::SnapshotCharge) -> Result<Vec<(String, u64, u8)>, i64> {
+        // The names are copied under the lock, after their room is charged and reserved.
+        let st = self.state.lock();
+        let Kind::Dir(m) = st.kind.get() else { return Err(ENOTDIR) };
+        charge.add(m.keys().map(|n| n.len() + 48).sum::<usize>() + 2 * 48)?;
+        let mut out = Vec::new();
+        out.try_reserve_exact(m.len() + 2).map_err(|_| ENOMEM)?;
         out.push((String::from("."), self.ino, 4));
         out.push((String::from(".."), self.ino, 4));
-        out.extend(children.into_iter().map(|(n, c)| (n, c.ino, dtype(c.file_type()))));
+        for (n, c) in m.iter() {
+            out.push((n.clone(), c.ino, dtype(c.file_type())));
+        }
         Ok(out)
     }
 

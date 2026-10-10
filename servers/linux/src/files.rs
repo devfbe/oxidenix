@@ -254,6 +254,38 @@ impl Drop for FileRef {
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
+/// Most bytes all directory snapshots of the tree may take (`getdents64` takes one per open
+/// directory description from its start): a directory read through many descriptions at
+/// once cannot fill the server's heap (ENOMEM beyond it).
+const MAX_SNAPSHOT_BYTES: usize = 32 << 20;
+const ENOMEM: i64 = 12;
+static SNAPSHOT_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// What a directory snapshot takes of `MAX_SNAPSHOT_BYTES`, given back when it goes.
+pub struct SnapshotCharge {
+    bytes: usize,
+}
+
+impl SnapshotCharge {
+    pub const fn new() -> SnapshotCharge {
+        SnapshotCharge { bytes: 0 }
+    }
+
+    /// `n` bytes more (an entry's name and what it takes besides); ENOMEM beyond the bound.
+    pub fn add(&mut self, n: usize) -> Result<(), i64> {
+        SNAPSHOT_BYTES.try_update(Ordering::Relaxed, Ordering::Relaxed, |c| (c + n <= MAX_SNAPSHOT_BYTES).then_some(c + n)).map_err(|_| ENOMEM)?;
+        self.bytes += n;
+        Ok(())
+    }
+}
+
+impl Drop for SnapshotCharge {
+    fn drop(&mut self) {
+        let n = self.bytes;
+        let _ = SNAPSHOT_BYTES.try_update(Ordering::Relaxed, Ordering::Relaxed, |c| Some(c.saturating_sub(n)));
+    }
+}
+
 /// Whether a signal (or a stop) waits for the calling thread (Linux's signal_pending):
 /// a long call that does not wait returns what it did so far, or EINTR (restarted as
 /// Linux's ERESTARTSYS) if nothing yet.

@@ -140,7 +140,8 @@ pub struct Item {
 
 impl Drop for Item {
     fn drop(&mut self) {
-        WATCHES.fetch_sub(1, SeqCst);
+        // (Never below zero: a wrapped count would be no bound.)
+        let _ = WATCHES.try_update(SeqCst, SeqCst, |c| Some(c.saturating_sub(1)));
     }
 }
 
@@ -315,9 +316,9 @@ impl Epoll {
         }
         // (Files that are always ready have no watch: EPERM before.)
         let watch = target.watch.clone().ok_or(EPERM)?;
-        // Counted from here; the item's drop gives it back.
-        if WATCHES.fetch_add(1, SeqCst) >= MAX_WATCHES {
-            WATCHES.fetch_sub(1, SeqCst);
+        // Counted from here; the item value owns it and its drop gives it back, exactly once
+        // (also when no memory is found for it: `Arc::try_new` drops the value).
+        if WATCHES.try_update(SeqCst, SeqCst, |c| (c < MAX_WATCHES).then_some(c + 1)).is_err() {
             return Err(ENOSPC);
         }
         let item = Arc::try_new(Item {
@@ -330,10 +331,7 @@ impl Epoll {
             queued: AtomicBool::new(false),
             removed: AtomicBool::new(false),
         })
-        .map_err(|_| {
-            WATCHES.fetch_sub(1, SeqCst);
-            ENOMEM
-        })?;
+        .map_err(|_| ENOMEM)?;
         // Room for every item on the ready list before anything can fail
         // halfway.
         {

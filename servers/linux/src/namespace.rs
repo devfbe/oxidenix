@@ -357,7 +357,8 @@ fn walk_kernel(base: &[String], names: &[String]) -> Result<Step, i64> {
         SYS_INODE_WALK,
         [kernel_root(), rel.as_ptr() as u64, rel.len() as u64, &mut walk as *mut Walk as u64, 0, 0],
     ))?;
-    let walked = if rel.is_empty() { 0 } else { rel[..walk.consumed as usize].split('/').count() };
+    // (The kernel's count is checked, not trusted: a wrong one is no such name.)
+    let walked = if rel.is_empty() { 0 } else { rel.get(..walk.consumed as usize).ok_or(ENOENT)?.split('/').count() };
     let in_names = walked.saturating_sub(base.len());
     if walk.mode & vfs::S_IFMT == vfs::S_IFLNK && in_names > 0 {
         return Ok(Step::Link(Node::Kernel(inode), in_names));
