@@ -37,7 +37,8 @@ An AI research project; see README.md.
 - `nix-shell -p e2fsprogs --run "cargo test -p ext2fs"` (workspace root) tests the ext2
   library on the host against a RAM disk; CI runs it too. `cargo test -p vfs` tests the pure
   parts of the Linux server's namespace (paths, cpio) on the host, `cargo test -p slab` the
-  size-class allocator of the kernel's and the server's heaps, `cargo test --release -p ring`
+  size classes of the kernel's and the server's heaps, `cargo test --release -p pageheap` the
+  server's heap (page runs, slabs, commits and trimming, with threads), `cargo test --release -p ring`
   the I/O ring's invariants (with threads; release for realistic interleavings), `cargo test
   -p fsring` the file protocol's encodings and validation (Linux server <-> diskfs), `cargo
   test -p netlink` rtnetlink's messages (the Linux server's netlink sockets), `cargo test

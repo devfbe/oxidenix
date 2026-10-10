@@ -12,6 +12,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -397,7 +398,124 @@ static void truncate_while_pinned(void) {
     check("... and leaves nothing counted as pinned or dirty", m != MAP_FAILED && meminfo("Dirty:") == 0);
 }
 
+/* The server's heap (TEST_HEAP_STATS, test mode): committed, in use, free,
+ * decommitted, in bytes. */
+#define TEST_HEAP_STATS 1526
+struct heap { unsigned long committed, in_use, free, decommitted, shrinks; };
+
+static struct heap server_heap(void) {
+    struct heap h = {0};
+    syscall(TEST_HEAP_STATS, &h);
+    return h;
+}
+
+/* After the floods the server's heap gives its memory back: the timer
+ * thread trims it (within a second or so), so the tree's commitment
+ * returns near where it started; and a commit refused at the limit makes
+ * the kernel ask the server to shrink (EVENT_SHRINK), which keeps no more
+ * than its floor of free pages (KEEP_FLOOR, 1 MiB). */
+static void heap_returns(long start_committed, struct heap start) {
+    struct heap h = server_heap();
+    long c = meminfo("Committed_AS:");
+    for (int i = 0; i < 50 && h.committed > start.committed + 2 * MIB; i++) {
+        usleep(100 * 1000);
+        h = server_heap();
+        c = meminfo("Committed_AS:");
+    }
+    printf("server heap: %lu kB committed (%lu kB at the start), %lu kB in use, %lu kB free; Committed_AS %ld kB (%ld kB)\n",
+           h.committed / 1024, start.committed / 1024, h.in_use / 1024, h.free / 1024, c, start_committed);
+    check("the server's heap gives its free memory back", h.committed <= start.committed + 2 * MIB);
+    check("... and the commitment returns near its start", c <= start_committed + 4096);
+    /* A commit beyond the limit: refused, and the servers shrink. */
+    long room = (meminfo("CommitLimit:") - meminfo("Committed_AS:")) * 1024;
+    void *big = mmap(NULL, room + 64 * MIB, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    struct heap before = server_heap();
+    for (int i = 0; i < 30 && (h = server_heap()).shrinks == before.shrinks; i++) usleep(100 * 1000);
+    printf("shrink: free %lu kB before, %lu kB after (%lu shrinks)\n", before.free / 1024, h.free / 1024, h.shrinks);
+    check("a refused commit makes the server shrink its heap", big == MAP_FAILED && h.shrinks > before.shrinks);
+    check("... down to its floor of free pages, not below", h.free <= 1280 * 1024 && h.committed - h.in_use >= 1024 * 1024 - 64 * 1024);
+    /* With every page programs may commit taken (the heap shrunk to
+     * nothing free), the server still allocates: from its instance's
+     * reserve (TEST_ALLOC keeps about 1.4 MiB of blocks for a moment). */
+    long left = (meminfo("CommitLimit:") - meminfo("Committed_AS:")) * 1024;
+    void *all = MAP_FAILED;
+    for (long len = left; all == MAP_FAILED && len > 0; len -= 256 * 1024) {
+        all = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (all != MAP_FAILED) left = len;
+    }
+    void *more = mmap(NULL, 512 * 1024, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    long r = syscall(1509 /* TEST_ALLOC */, 60);
+    printf("reserve: %ld kB taken by the program, a further 512 kB %s, the server's allocations %s\n", left / 1024,
+           more == MAP_FAILED ? "refused" : "granted", r == 0 ? "served" : "failed");
+    check("with all commitment taken the server allocates from its reserve", all != MAP_FAILED && more == MAP_FAILED && r == 0);
+    if (all != MAP_FAILED) munmap(all, left);
+    if (more != MAP_FAILED) munmap(more, 512 * 1024);
+}
+
+/* Memory full of page cache while the server allocates: most memory is
+ * taken (touched) by a hog, a reader keeps a /data file larger than what
+ * is left in the cache, and the server's heap allocates and frees all the
+ * while (TEST_ALLOC): its commits get their frames from clean cache pages,
+ * at once, and never fail. */
+static void heap_under_cache_pressure(void) {
+    const char *path = "/data/oomtest.read";
+    static char block[1 << 16];
+    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    long size = 48L * MIB;
+    for (long off = 0; fd >= 0 && off < size; off += sizeof block) {
+        memset(block, (int)(off >> 16), sizeof block);
+        if (write(fd, block, sizeof block) != sizeof block) break;
+    }
+    fsync(fd);
+    /* The reader first (a fork after the hog would need its memory twice),
+     * waiting until the hog holds its memory. */
+    int go[2];
+    pipe(go);
+    pid_t reader = fork();
+    if (reader == 0) {
+        char c;
+        close(go[1]);
+        if (read(go[0], &c, 1) != 1) _exit(1);
+        long until = now_ms() + 3000;
+        while (now_ms() < until) {
+            lseek(fd, 0, SEEK_SET);
+            while (read(fd, block, sizeof block) > 0) {}
+        }
+        _exit(0);
+    }
+    close(go[0]);
+    long room = (meminfo("CommitLimit:") - meminfo("Committed_AS:")) * 1024 - 4 * MIB;
+    long free_now = meminfo("MemFree:") * 1024 - 8 * MIB;
+    long hog = room < free_now ? room : free_now;
+    char *mem = hog > 0 ? mmap(NULL, hog, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) : MAP_FAILED;
+    if (mem != MAP_FAILED)
+        for (long i = 0; i < hog; i += 4096) mem[i] = 1;
+    write(go[1], "g", 1);
+    close(go[1]);
+    int bad = 0, rounds = 0;
+    long cached = 0;
+    long started = now_ms(), slowest = 0;
+    while (reader) {
+        long t0 = now_ms();
+        if (syscall(1509 /* TEST_ALLOC */, 60) != 0) bad++;
+        if (now_ms() - t0 > slowest) slowest = now_ms() - t0;
+        rounds++;
+        long c = meminfo("Cached:");
+        if (c > cached) cached = c;
+        if (waitpid(reader, NULL, WNOHANG) == reader) reader = 0;
+    }
+    if (reader) waitpid(reader, NULL, 0);
+    printf("cache pressure: hog %ld MiB, %ld kB cached at most, MemFree %ld kB, %d rounds of server allocations in %ld ms (slowest %ld ms), %d failed\n",
+           hog / MIB, cached, meminfo("MemFree:"), rounds, now_ms() - started, slowest, bad);
+    check("the server allocates while the page cache fills memory", reader == 0 && mem != MAP_FAILED && bad == 0 && rounds > 10);
+    if (mem != MAP_FAILED) munmap(mem, hog);
+    close(fd);
+    unlink(path);
+}
+
 int main(void) {
+    long start_committed = meminfo("Committed_AS:");
+    struct heap start = server_heap();
     descriptor_flood();
     fork_bomb();
     memory_hog();
@@ -409,6 +527,8 @@ int main(void) {
     throttled_writer_killable();
     killed_with_threads();
     pipe_flood();
+    heap_returns(start_committed, start);
+    heap_under_cache_pressure();
     printf("oomtest: %s\n", failures ? "FAILED" : "all passed");
     return failures;
 }

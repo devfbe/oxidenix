@@ -90,8 +90,59 @@ fn broken() -> ! {
     unreachable!("thread_exit returned")
 }
 
-pub struct Mutex<T> {
+/// The lock of a `Mutex` alone (the heap's locks, `pageheap::RawLock`).
+pub struct RawMutex {
     state: AtomicU32,
+}
+
+impl RawMutex {
+    pub const fn new() -> Self {
+        RawMutex { state: AtomicU32::new(0) }
+    }
+
+    #[inline]
+    pub fn lock(&self) {
+        if self.state.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            self.contended();
+        }
+        hold();
+    }
+
+    #[cold]
+    fn contended(&self) {
+        while self.state.swap(2, Ordering::Acquire) != 0 {
+            let addr = &self.state as *const AtomicU32 as u64;
+            // (Ends only when woken, bounded work holds it; or the instance broke.)
+            if syscall(SYS_SERVER_FUTEX_WAIT, [addr, 2, 0, FUTEX_LOCK, 0, 0]) == -EINTR {
+                broken();
+            }
+        }
+    }
+
+    /// # Safety
+    /// The calling thread holds the lock.
+    #[inline]
+    pub unsafe fn unlock(&self) {
+        if self.state.swap(0, Ordering::Release) == 2 {
+            let addr = &self.state as *const AtomicU32 as u64;
+            syscall(SYS_SERVER_FUTEX_WAKE, [addr, 1, 0, 0, 0, 0]);
+        }
+        unhold();
+    }
+}
+
+unsafe impl pageheap::RawLock for RawMutex {
+    const NEW: Self = RawMutex::new();
+    fn lock(&self) {
+        RawMutex::lock(self)
+    }
+    unsafe fn unlock(&self) {
+        unsafe { RawMutex::unlock(self) }
+    }
+}
+
+pub struct Mutex<T> {
+    raw: RawMutex,
     data: UnsafeCell<T>,
 }
 
@@ -101,20 +152,11 @@ unsafe impl<T: Send> Send for Mutex<T> {}
 
 impl<T> Mutex<T> {
     pub const fn new(data: T) -> Self {
-        Mutex { state: AtomicU32::new(0), data: UnsafeCell::new(data) }
+        Mutex { raw: RawMutex::new(), data: UnsafeCell::new(data) }
     }
 
     pub fn lock(&self) -> MutexGuard<'_, T> {
-        if self.state.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_err() {
-            while self.state.swap(2, Ordering::Acquire) != 0 {
-                let addr = &self.state as *const AtomicU32 as u64;
-                // (Ends only when woken, bounded work holds it; or the instance broke.)
-                if syscall(SYS_SERVER_FUTEX_WAIT, [addr, 2, 0, FUTEX_LOCK, 0, 0]) == -EINTR {
-                    broken();
-                }
-            }
-        }
-        hold();
+        self.raw.lock();
         MutexGuard { mutex: self }
     }
 }
@@ -138,11 +180,7 @@ impl<T> DerefMut for MutexGuard<'_, T> {
 
 impl<T> Drop for MutexGuard<'_, T> {
     fn drop(&mut self) {
-        if self.mutex.state.swap(0, Ordering::Release) == 2 {
-            let addr = &self.mutex.state as *const AtomicU32 as u64;
-            syscall(SYS_SERVER_FUTEX_WAKE, [addr, 1, 0, 0, 0, 0]);
-        }
-        unhold();
+        unsafe { self.mutex.raw.unlock() };
     }
 }
 

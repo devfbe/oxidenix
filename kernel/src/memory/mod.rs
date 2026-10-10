@@ -322,11 +322,32 @@ pub fn commit(pages: u64) -> bool {
     let mut a = ACCOUNT.lock();
     let limit = COMMIT_LIMIT.load(core::sync::atomic::Ordering::Relaxed);
     if a.committed.saturating_add(pages).saturating_add(unavailable) > limit {
+        drop(a);
+        // The Linux servers give back what they keep committed and free
+        // (as much as this commit lacked, at least).
+        SHRINK_PAGES.fetch_max(pages.max(1), core::sync::atomic::Ordering::Relaxed);
+        wake_reclaimer();
         return false;
     }
     a.committed += pages;
     true
 }
+
+/// Promises as many as `max` pages as fit now (none: no sign of pressure,
+/// nobody is asked to shrink); how many. For speculative reserves.
+pub fn commit_some(max: u64) -> u64 {
+    let unavailable = crate::fs::cache::unavailable_pages();
+    let mut a = ACCOUNT.lock();
+    let limit = COMMIT_LIMIT.load(core::sync::atomic::Ordering::Relaxed);
+    let n = limit.saturating_sub(a.committed.saturating_add(unavailable)).min(max);
+    a.committed += n;
+    n
+}
+
+/// A commit was refused at the limit: the background reclaimer asks the
+/// Linux servers to shrink by (at least) this many pages
+/// (`linux::post_shrink`); 0 if none was.
+static SHRINK_PAGES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Whether a commit of `pages` failed only for the cache pages that are
 /// dirty or pinned now (write-back will make room), not for memory
@@ -538,6 +559,14 @@ fn reclaimer() -> ! {
                 let high = 2 * low_watermark(f);
                 (!f.user_may_take(high), !f.user_may_take(low_watermark(f)))
             });
+            // After a commit was refused at the limit, the Linux servers give
+            // back what they can do without (their shrinkers, `EVENT_SHRINK`,
+            // scaled by what was refused; each server at most once a
+            // second). Kept for later if it cannot be posted now.
+            let asked = SHRINK_PAGES.swap(0, core::sync::atomic::Ordering::Relaxed);
+            if asked > 0 && !crate::process::linux::post_shrink(asked) {
+                SHRINK_PAGES.fetch_max(asked, core::sync::atomic::Ordering::Relaxed);
+            }
             if !short {
                 break;
             }
@@ -563,6 +592,11 @@ fn reclaimer() -> ! {
                 continue;
             }
             crate::fs::cache::ask_writeback(RECLAIM_BATCH);
+            // Clean cache, used lately or not, gave nothing: the servers are
+            // asked for what is missing up to the high watermark (not
+            // before: their caches are worth more than clean file pages).
+            let lacking = with_frames(|f| (2 * low_watermark(f) + frame::KERNEL_RESERVE_FRAMES).saturating_sub(f.free_frames()));
+            crate::process::linux::post_shrink(lacking.max(1));
             let rest = (RECLAIM_THROTTLE << failures.min(4)).min(RECLAIMER_REST_MAX);
             failures = failures.saturating_add(1);
             let wait = crate::process::sched::prepare_to_wait(reclaimer_chan());

@@ -275,6 +275,10 @@ static SHOOTER: spin::Mutex<()> = spin::Mutex::new(());
 
 /// `Request::l4` of a flush of kernel mappings, which every CPU does.
 const KERNEL: u64 = 0;
+/// `Request::l4` of a flush of several address spaces' range
+/// (`shootdown_many`): each target flushes it whatever it has loaded (no
+/// table is at address 1).
+const ANY: u64 = 1;
 
 /// Flushes for the current request if it targets this CPU (from the IPI
 /// handler, and from every wait of the protocol).
@@ -289,7 +293,7 @@ fn serve_here() {
     }
     let l4 = REQUEST.l4.load(Ordering::Relaxed);
     let cr3 = Cr3::read().0.start_address().as_u64();
-    if l4 == KERNEL || cr3 == l4 || cr3 == REQUEST.normal.load(Ordering::Relaxed) {
+    if l4 == KERNEL || l4 == ANY || cr3 == l4 || cr3 == REQUEST.normal.load(Ordering::Relaxed) {
         flush_local(REQUEST.start.load(Ordering::Relaxed), REQUEST.end.load(Ordering::Relaxed));
     }
     // Kernel mappings are cached under every PCID.
@@ -322,6 +326,29 @@ pub fn shootdown(space: &Tlb, start: u64, end: u64) {
     let others = space.cpus.load(Ordering::SeqCst) & !my_bit();
     let normal = space.normal.get().map_or(0, |n| n.start_address().as_u64());
     request(space.l4.start_address().as_u64(), normal, others, start, end);
+}
+
+/// `shootdown` of [start, end) in several address spaces at once (the
+/// Linux server's region, which every address space of an instance shows):
+/// one request to the union of the CPUs that have any of them, each of
+/// which flushes the range in what it has loaded (harmless in another
+/// space); entries under other PCIDs go with each space's new generation.
+pub fn shootdown_many(spaces: &[alloc::sync::Arc<Tlb>], start: u64, end: u64) {
+    if start >= end || spaces.is_empty() {
+        return;
+    }
+    let mut here = false;
+    for space in spaces {
+        space.generation.fetch_add(1, Ordering::SeqCst);
+        here |= space.active_here();
+    }
+    if here {
+        flush_local(start, end);
+    }
+    // (Pairs with the fetch_or in `switch`, as in `shootdown`.)
+    fence(Ordering::SeqCst);
+    let others = spaces.iter().fold(0, |m, s| m | s.cpus.load(Ordering::SeqCst)) & !my_bit();
+    request(ANY, ANY, others, start, end);
 }
 
 /// Drops the entries for [start, end) of the kernel's own mappings (shared

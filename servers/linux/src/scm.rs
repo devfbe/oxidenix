@@ -100,7 +100,9 @@ pub fn request() {
 
 /// The worker thread: lets go of the descriptor tables whose processes
 /// ended (`fdtable::end_later`), connects to a restarted diskfs
-/// (`datafs::reconnect_later`) and collects whenever asked.
+/// (`datafs::reconnect_later`), shrinks the heap and /data's inode cache
+/// when memory is short (`heap::shrink_if_asked`) and collects whenever
+/// asked.
 pub fn worker() -> ! {
     let mut done = 0;
     loop {
@@ -109,6 +111,7 @@ pub fn worker() -> ! {
             done = asked;
             crate::datafs::reconnect_if_asked();
             crate::fdtable::release_ended();
+            crate::heap::shrink_if_asked();
             collect();
             continue;
         }

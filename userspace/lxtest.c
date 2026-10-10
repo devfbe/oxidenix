@@ -62,6 +62,7 @@
 #define TEST_SLEEP_LOCKED 1521
 #define TEST_HOST 1522
 #define TEST_FUTEX_WATCH 1524
+#define TEST_HEAP_STATS 1526
 
 static int failures;
 
@@ -680,6 +681,15 @@ static int server_fail(void) {
 }
 
 int main(int argc, char **argv) {
+    if (argc > 1 && strcmp(argv[1], "heap") == 0) {
+        /* The server's heap, in KiB: committed, in use, free, decommitted. */
+        uint64_t s[5];
+        if (syscall(TEST_HEAP_STATS, s) != 0) return 1;
+        printf("server heap: committed %llu kB, in use %llu kB, free %llu kB, decommitted %llu kB\n",
+               (unsigned long long)s[0] / 1024, (unsigned long long)s[1] / 1024, (unsigned long long)s[2] / 1024,
+               (unsigned long long)s[3] / 1024);
+        return 0;
+    }
     if (argc > 1 && strcmp(argv[1], "serverfail") == 0) {
         return server_fail();
     }

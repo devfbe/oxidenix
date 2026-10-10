@@ -186,6 +186,105 @@ through shared-memory rings with buffers granted from its memory objects (zero c
 IOMMU-confined DMA); that design follows the principles of the I/O audit and is its own
 document (`io-rings.md`).
 
+### The server's heap
+
+One heap serves every thread of an instance (`servers/linux/src/heap.rs` over
+`crates/pageheap`). It gives memory back: a fork bomb or a descriptor flood once made the heap
+grow by 18 MiB that stayed committed for the tree's life (Committed_AS 30.4 → 48.9 MB after
+`oomtest`, 260 KiB of it in use).
+
+**The kernel's part.** The heap area (`HEAP_BASE..THREADS_BASE`, 192 GiB) is address space the
+server lays out itself. `shared_commit(addr, len)` commits each page of the range that is not
+(charged against the commit limit up front; ENOMEM at the limit, without waiting for
+write-back, since the caller may hold locks the pager needs) and maps it
+zeroed, its frame a free one or one that dropping clean cache pages gives back, gotten before
+the area's lock is taken (never a wait: the server may be what writes back; ENOMEM at once,
+the heap's null); `shared_decommit(addr, len)` unmaps
+the range's pages from every view of the region, shoots their TLB entries down (in batches whose
+frames wait on the stack: nothing is allocated) and frees them with their commitment. A page is
+committed exactly while it is mapped, so the region needs no charge bits: the instance holds
+its mapped heap pages and its reserve (below). The kernel never commits a page by itself: a server
+access to a page that is not committed is a fault in the server, which breaks the instance with a
+diagnostic (the page was never committed, or freed and decommitted: a server bug); the kernel's
+own copies from server memory end at their fixup (EFAULT). A futex wait on a heap word holds a
+reference on the word's frame, taken with the frames locked (a decommit frees the frame with them
+locked only after it cleared the entry), so a concurrent decommit cannot free the frame under
+the wait.
+
+**The instance's reserve.** A server cannot fail an allocation but by breaking its instance,
+and a heap that gives memory back must commit again later, possibly when its programs have
+taken everything they may or dirty pages crowd the limit (the server is what writes them back;
+in reclaimtest a heap commit was refused that way). So each instance holds up to 2 MiB of
+commitment beyond its mapped heap pages (`HEAP_RESERVE`), its own (no other tree can take it):
+a heap commit takes from it first and is an ordinary commit (counting dirty and pinned pages)
+only beyond it; a decommit, or a commit's pages that could not be mapped, refill it before
+commitment is returned. The reserve is had only when there is room: a tree whose instance is
+made near the limit starts with less or none (never refused for it), and it is topped up after
+each successful commit as far as there is room then. All instances' reserves together are at
+most a 16th of the commit limit (a pool), so many trees cannot crowd out programs with them.
+The account (`pageheap::charge`: `Charge`, `Pool`) is pure arithmetic, host-tested over random
+operations: an instance holds exactly its mapped pages plus its reserve, the pool's count is
+the sum of the reserves, no refund exceeds what was charged (an unmap of more pages than are
+mapped is refused; the heap area is mapped only by `shared_commit`), and closing the instance
+returns all of it. The commit guarantee holds: the reserve counts as committed for everyone. A
+heap commit refused beyond the reserve is logged once per instance (a tree can cause it at
+will).
+
+
+**The allocator** (`pageheap`, host-tested with a model of the kernel that poisons decommitted
+pages and checks the poison when they are committed again):
+
+- *Pages.* The arena (after the metadata, up to 64 GiB) is cut into chunks of 512 pages. Each
+  chunk has two bitmaps, allocated and committed, and a summary of its free runs (the run at its
+  start, the longest, the run at its end); every 16 summaries have one on the level above, up to
+  a root over the whole arena (Go's page allocator). Lowest first fit descends the tree in a few
+  steps and keeps what is in use low, so free memory gathers at the top. A run with uncommitted
+  pages is committed before it is handed out, with up to 16 free uncommitted pages after it (one
+  kernel call per 64 KiB as the heap grows); a failed commit is a null allocation (the server's
+  ENOMEM path), never a page committed implicitly later.
+- *Slabs.* Objects up to 2 KiB come from one-page slabs of the size classes (`slab::class`).
+  Each slab has a 16-byte descriptor outside the arena: its free-slot list (indices linked
+  through the free slots), a bump index for slots never used, its use count and its place on its
+  class's list of partial slabs. Allocating and freeing a slot are O(1) under the class's lock; a
+  slab whose last object goes returns to the pages at once (a class keeps one empty slab). Larger
+  objects are runs of whole pages.
+- *Metadata.* Bitmaps, summaries and slab descriptors (16 bytes per page, 0.4 %) live in an area
+  of their own at `HEAP_BASE`, committed as the arena grows and never decommitted: nothing about
+  free memory is kept in free pages, so a decommitted page is never read.
+- *Locks.* The heap's locks are the server's futex mutex (`sync::RawMutex`, in the image), held
+  for bounded work only: no lock is held across a kernel call. A run is reserved under the
+  pages' lock (marked allocated), committed or decommitted with the lock released, and finished
+  under it again; growth of the metadata is serialized by a lock of its own, taken before the
+  pages'. A class's lock is never held while the pages' is taken.
+
+**When memory goes back.** When the free committed pages exceed 2 MiB and a quarter of what is
+committed, the heap asks the instance's timer thread, which trims at most every 500 ms (a
+workload that frees and allocates in turn does not commit and decommit all the time): free
+pages are decommitted from the arena's top down (the walk goes on where the last batch stopped),
+16 runs per kernel call (`shared_decommit_runs`, one shootdown per batch of pages to the CPUs of
+all the instance's address spaces at once), until 1 MiB (`KEEP_FLOOR`), or an eighth of what is
+allocated, is left. When memory is short, the kernel asks for a shrink with how many pages it
+lacks: after a commit was refused at the limit (the pages refused), or when its background
+reclaimer found no clean cache page to drop, used lately or not (the pages missing up to its
+high watermark), never merely for being below a watermark (clean file pages go first). Each
+instance gets `EVENT_SHRINK` with the largest request since its last (requests coalesce), at most
+once a second; the service thread hands it to the worker (it must not wait for the heap's locks
+or for diskfs itself), which gives back about that many pages: the classes' empty slabs and
+the heap's free pages, never below the floor of 1 MiB (the heap then still allocates without a
+kernel call when memory is tightest), and the least recently used of `/data`'s unused clean
+inodes with their cached objects, one per 64 pages asked for, at most 32, chosen without
+allocating (Linux's shrinkers). One tree's refused commits cost the others at most one such
+shrink a second. After `oomtest` the heap is back within 2 MiB of where it started and
+Committed_AS 1.5 MB above its start (the test checks both, within 2 MiB and 4 MB, and the
+shrink after a refused commit, down to the floor and not below); with memory full of a hog and
+of page cache (a 48 MiB file read over and over), the server's allocations keep being served
+(about 3700 rounds of `TEST_ALLOC` in 3 s, the slowest 2 ms, none failed).
+
+The allocation fast path is as fast as before (`scripts/bench.sh`: `stat_path_tmpfs`, about
+fifty heap operations, 3107 cycles against 3141 on main, docs/benchmarks/2026-10-10-*). What it
+costs: page-granular large objects (a 3 KiB object takes a page), 0.4 % of the arena in slab
+descriptors, and a kernel call per 64 KiB the heap grows by.
+
 ## Migration
 
 Each phase keeps the suite green, has its benchmark numbers, and is a series of commits.
@@ -199,10 +298,10 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
 2. **R2 — Memory objects and mappings** as kernel objects by handle: anonymous and paged
    objects with the instance's pager thread, mapping into a program's view (done; `fork`'s
    copy-on-write clone of a whole address space came with R8).
-3. **R3 — The server's runtime** (done): a heap in the shared region that grows (a kernel
-   call maps more of the region for the instance) and locks that work across the tree's
+3. **R3 — The server's runtime** (done): a heap in the shared region (since: committed and
+   decommitted page by page, "The server's heap") and locks that work across the tree's
    processes (futexes on the server's memory, keyed by instance and address, since that memory
-   is pinned and outside any address space's areas). Records per process come with the first
+   is outside any address space's areas; a wait on a heap word holds its frame) Records per process come with the first
    per-process Linux state the server owns (descriptors, R6), with the kernel's notice when a
    process ends.
 4. **R4 — Memory semantics** (done): `mmap`, `munmap`, `mprotect`, `mremap`, `madvise`, `msync` and

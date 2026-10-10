@@ -446,6 +446,43 @@ static MAX_FILE: AtomicU64 = AtomicU64::new(0);
 static BLOCK: AtomicU64 = AtomicU64::new(0);
 /// Whether `reap` has work (inodes to check, or too many cached).
 static REAP: AtomicBool = AtomicBool::new(false);
+/// Most unused inodes one shrink lets go of.
+const SHRINK_MAX: usize = 32;
+
+/// `EVENT_SHRINK` for `pages` pages (on the worker): the least recently
+/// used unused clean inodes go with their cached objects, one per 64
+/// pages asked for, at least one and at most `SHRINK_MAX` (dirty ones would
+/// cost a write-back). Chosen without allocating: memory is short.
+pub fn shrink(pages: u64) {
+    let want = ((pages / 64) as usize).clamp(1, SHRINK_MAX);
+    // The `want` oldest, by last use, kept sorted (oldest first).
+    let mut oldest = [(0u64, 0u32, 0u64); SHRINK_MAX];
+    let mut n = 0;
+    {
+        let t = TABLE.lock();
+        for i in t.inodes.values() {
+            if Arc::strong_count(i) != 1 || i.ino == ROOT_INO || t.dirty.contains_key(&i.ino) {
+                continue;
+            }
+            let entry = (i.used.load(Ordering::Relaxed), i.ino, i.key);
+            if n == want && entry.0 >= oldest[n - 1].0 {
+                continue;
+            }
+            let mut at = n.min(want - 1);
+            if n < want {
+                n += 1;
+            }
+            while at > 0 && oldest[at - 1].0 > entry.0 {
+                oldest[at] = oldest[at - 1];
+                at -= 1;
+            }
+            oldest[at] = entry;
+        }
+    }
+    for &(_, ino, key) in &oldest[..n] {
+        evict(ino, key);
+    }
+}
 
 fn now() -> u64 {
     syscall(SYS_CLOCK_READ, [1, 0, 0, 0, 0, 0]).max(0) as u64

@@ -60,6 +60,10 @@ jobs:
         if: matrix.firmware == 'uefi'
         run: cargo test -p slab
 
+      - name: Test the Linux server's heap (commits, trimming) on the host
+        if: matrix.firmware == 'uefi'
+        run: cargo test --release -p pageheap
+
       - name: Test the I/O ring on the host
         if: matrix.firmware == 'uefi'
         run: cargo test --release -p ring

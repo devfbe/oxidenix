@@ -160,7 +160,11 @@ space, and the walks (truncation, write-back) drop it before they lock a mapper.
   be the teardown, which must not run inside an allocation): each goes, as the `Arc`, into a
   fixed array of 256 that the reclaimer empties (`defer_drop`), a slot taken before the
   reference; a walk with no slot left ends there. A page whose mappings one reclaim walks is
-  isolated from the others (`Page::isolated`).
+  isolated from the others (`Page::isolated`). After a commit was refused at the limit, and when
+  it finds no clean cache page to drop (used lately or not), it asks the Linux servers to give
+  back about as many pages as are lacking (`EVENT_SHRINK`: their heaps' free pages beyond a
+  floor, the least recently used unused clean `/data` inodes; linux-server.md, "The server's
+  heap"); clean file pages go before the servers' caches.
 - **Reads progress** under any pressure: the kernel's read of a cached object copies from each
   page it waited for with a reference of the wait's own, so reclaim cannot take it in between;
   the Linux server falls back to such a read when the pages it filled were reclaimed before it
@@ -183,7 +187,10 @@ space, and the walks (truncation, write-back) drop it before they lock a mapper.
   counts the pinned pages.
 - **Overcommit** stays strict (`overcommit_memory=2`, ratio 100%). A heuristic mode as Linux's
   default would let touches of promised memory fail at fault time; it needs a real OOM killer
-  first (one that picks its victim by size, not the toucher).
+  first (one that picks its victim by size, not the toucher). Each Linux server instance holds
+  up to 2 MiB of commitment for its heap beyond what is mapped there, its own, when there is room
+  (all together at most a 16th of the limit; a server cannot fail an allocation but by breaking
+  its instance; linux-server.md, "The server's heap").
 - The file metadata quota (inodes, symlink targets, pipes) on the kernel heap stays.
 
 ### Disk files
