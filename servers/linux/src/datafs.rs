@@ -547,7 +547,7 @@ pub fn reconnect_if_asked() {
             (Later::Sync(ticket), true) => sync_event(ticket),
             (Later::Page(key, offset), false) => fail_page(key, offset),
             (Later::Mkwrite(key, offset), false) => {
-                if let Some(object) = by_key(key).and_then(|i| *i.object.lock()) {
+                if let Some(object) = by_key(key).map(Transient).and_then(|i| *i.object.lock()) {
                     syscall(SYS_MO_BACKED, [object, offset, offset, 0, 0, 0]);
                 }
             }
@@ -585,7 +585,8 @@ fn revalidate(c: &Client) -> Result<(), i64> {
         // channel is not installed).
         let mut same = None;
         for _ in 0..REVALIDATE_TRIES {
-            let r = c.call(Request::Stat { ino: inode.node() }.encode(0))?;
+            // (A channel that fails: EIO, whatever the transport said.)
+            let r = c.call(Request::Stat { ino: inode.node() }.encode(0)).map_err(|_| EIO)?;
             match r.status {
                 0 => {
                     let s = fsring::Stat::from_values(&r.values);
@@ -1262,7 +1263,7 @@ fn fill_once(inode: &Arc<DInode>, index: u64, want: u64) -> Result<bool, i64> {
     let object = object(inode)?;
     // (No channel now, diskfs away: `ENOTCONN`, as when it dies under a read.)
     let c = client().map_err(|e| if channel_died() { ENOTCONN } else { e })?;
-    if FAIL_FILL.compare_exchange(inode.ino as u64, 0, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+    if fill_fails(inode, false) {
         return Err(ENOTCONN);
     }
     let end = index.saturating_add(window(inode, index, want));
@@ -1323,7 +1324,9 @@ fn fill_once(inode: &Arc<DInode>, index: u64, want: u64) -> Result<bool, i64> {
                 }
                 // A read that failed because diskfs died says nothing about the file: the
                 // pages are missing again, not failed (their waiters ask again).
-                let died = !ok && c.is_dead();
+                let forced = ok && fill_fails(inode, true);
+                let ok = ok && !forced;
+                let died = !ok && (forced || c.is_dead());
                 let outcome = if ok { FILL_OK } else if died { FILL_AGAIN } else { FILL_FAILED };
                 syscall(SYS_MO_FILLED, [object, first * PAGE, count, outcome, 0, 0]);
                 if !ok {
@@ -1753,6 +1756,12 @@ pub fn page(key: u64, offset: u64) {
         // diskfs is away, or died under it (whatever the error says: none of it is about
         // the file): the next channel brings the page. The pager leaves it to the worker,
         // which connects; on the worker (or with a new channel there already) once more.
+        if FORCE_LATER.swap(false, Ordering::Relaxed) && crate::local::is_pager() {
+            // (`TEST_FILL_GONE` mode 2: as if the channel were dead now.)
+            LATER.lock().push(Later::Page(key, offset));
+            reconnect_later();
+            return;
+        }
         match later(Later::Page(key, offset)) {
             Ok(()) => return,
             Err(_) => filled = fill(&inode, index, 1),
@@ -1772,7 +1781,7 @@ pub fn page(key: u64, offset: u64) {
 /// Page `offset` of the object `key` cannot be brought: whoever waits gets EIO (a mapping
 /// SIGBUS).
 fn fail_page(key: u64, offset: u64) {
-    if let Some(h) = by_key(key).and_then(|i| *i.object.lock()) {
+    if let Some(h) = by_key(key).map(Transient).and_then(|i| *i.object.lock()) {
         syscall(SYS_MO_FILLED, [h, offset / PAGE * PAGE, 1, FILL_FAILED, 0, 0]);
     }
 }
@@ -2079,14 +2088,33 @@ pub fn closing() {
 
 /// The inode whose next fill fails as if diskfs died under it (`TEST_FILL_GONE`; 0: none).
 static FAIL_FILL: AtomicU64 = AtomicU64::new(0);
+/// How it fails (`restricted::TEST_FILL_GONE`): before its grant (0), after it, with its
+/// pages pending and waited for (1), and then left to the worker (2).
+static FAIL_FILL_MODE: AtomicU64 = AtomicU64::new(0);
+/// The next page `page` cannot bring now goes to the worker (`TEST_FILL_GONE` mode 2).
+static FORCE_LATER: AtomicBool = AtomicBool::new(false);
 
 /// `TEST_FILL_GONE`.
-pub fn fail_next_fill(ino: u64) -> i64 {
-    if ino > u32::MAX as u64 {
+pub fn fail_next_fill(ino: u64, mode: u64) -> i64 {
+    if ino > u32::MAX as u64 || mode > 2 {
         return -EINVAL;
     }
+    FAIL_FILL_MODE.store(mode, Ordering::Relaxed);
     FAIL_FILL.store(ino, Ordering::Relaxed);
     0
+}
+
+/// Whether the fill of `inode` is to fail as if diskfs went (`TEST_FILL_GONE`), at this
+/// point (`after`: its grant made).
+fn fill_fails(inode: &DInode, after: bool) -> bool {
+    let mode = FAIL_FILL_MODE.load(Ordering::Relaxed);
+    if (mode != 0) != after || FAIL_FILL.compare_exchange(inode.ino as u64, 0, Ordering::Relaxed, Ordering::Relaxed).is_err() {
+        return false;
+    }
+    if mode == 2 {
+        FORCE_LATER.store(true, Ordering::Relaxed);
+    }
+    true
 }
 
 /// The inode whose next backing `mkwrite` fails (`TEST_MKWRITE_FAIL`; 0:
@@ -2127,7 +2155,7 @@ pub fn test(scenario: u64) -> i64 {
                 check!(11, syscall(SYS_MO_FILLED, [object, 0, 300, 0, 0, 0]) == -EINVAL);
                 check!(12, syscall(SYS_MO_FILLED, [object, 100 * PAGE, 256, 0, 0, 0]) == 0);
                 check!(13, syscall(SYS_MO_FILLED, [object, u64::MAX & !(PAGE - 1), 1, 0, 0, 0]) == 0);
-                // Only the three outcomes; pages to be read again are simply missing.
+                // Only the four outcomes; pages to be read again are simply missing.
                 check!(17, syscall(SYS_MO_FILLED, [object, 0, 1, 4, 0, 0]) == -EINVAL);
                 check!(18, syscall(SYS_MO_FILLED, [object, 100 * PAGE, 1, FILL_AGAIN, 0, 0]) == 0);
                 // Grown: the pages that "failed" beyond the old end are holes.
