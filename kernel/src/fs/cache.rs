@@ -1331,9 +1331,11 @@ impl PageCache {
                 return Ok(());
             }
             let first_gone = page_of(len + PAGE - 1);
-            // A granted page stays the object's until it is revoked, and a
-            // page being filled gets its data only then (its cut-off tail
-            // could not stay zero).
+            // A granted page stays the object's until it is revoked (a
+            // pinned page is never taken from the cache: DMA or a copy may
+            // be in flight, and its frame and pinned accounting go only at
+            // the last unpin), and a page being filled gets its data only
+            // then (its cut-off tail could not stay zero).
             let partial_pending = len % PAGE != 0 && st.pages.get(&page_of(len)).is_some_and(|p| p.pending);
             if partial_pending || st.pages.range(first_gone..).any(|(_, p)| p.pins > 0) {
                 return Err(EBUSY);
@@ -1346,6 +1348,7 @@ impl PageCache {
                 }
             }
             let gone = st.pages.split_off(&first_gone);
+            debug_assert!(gone.values().all(|p| p.pins == 0), "truncation took a pinned page");
             let dirty = gone.values().filter(|p| p.dirty).count() as u64;
             st.dirty -= dirty.min(st.dirty);
             let prepaid = self.prepaid();
@@ -1488,7 +1491,11 @@ impl PageCache {
             // Truncated between the check above and the creation: the
             // page made past the end goes again (no page lives there).
             if index >= page_of(st.size.saturating_add(PAGE - 1)) {
-                let past = st.pages.remove(&index).filter(|p| p.pins == 0);
+                // (Only if nobody pinned it meanwhile: a pinned page is
+                // never taken from the cache, its frame and accounting
+                // stay until the last unpin.)
+                let unpinned = st.pages.get(&index).is_some_and(|p| p.pins == 0);
+                let past = if unpinned { st.pages.remove(&index) } else { None };
                 if let Some(page) = past {
                     let charged = (index >= self.prepaid()) as u64;
                     st.charged -= charged;

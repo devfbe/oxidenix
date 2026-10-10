@@ -360,6 +360,45 @@ static void throttled_writer_killable(void) {
     unlink(path);
 }
 
+/* Truncation racing write-back and fills (whose pages are pinned for
+ * diskfs's DMA): a pinned page is never taken from the cache, the file
+ * reads what it should afterwards, and once all is done no page counts as
+ * pinned or dirty any more (a commit of all that is left succeeds). */
+static void truncate_while_pinned(void) {
+    const char *path = "/data/oomtest.trunc";
+    static char chunk[64 * 1024], back[64 * 1024];
+    int good = 1;
+    for (int round = 0; round < 8 && good; round++) {
+        int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+        memset(chunk, 'a' + round, sizeof chunk);
+        for (int i = 0; i < 64; i++) write(fd, chunk, sizeof chunk);
+        pid_t kid = fork();
+        if (kid == 0) {
+            /* Write-back (pins the dirty pages) and reads (fills). */
+            fsync(fd);
+            for (long off = 0; off < 4 * MIB; off += sizeof back) pread(fd, back, sizeof back, off);
+            _exit(0);
+        }
+        for (int i = 0; i < 16; i++) ftruncate(fd, (long)(i % 4) * MIB);
+        waitpid(kid, NULL, 0);
+        ftruncate(fd, 2 * MIB);
+        for (long off = 0; good && off < 2 * MIB; off += sizeof back) {
+            good = pread(fd, back, sizeof back, off) == (ssize_t)sizeof back;
+            for (size_t j = 0; good && j < sizeof back; j += 509)
+                good = back[j] == 'a' + round || back[j] == 0;
+        }
+        fsync(fd);
+        close(fd);
+    }
+    unlink(path);
+    long room = (meminfo("CommitLimit:") - meminfo("Committed_AS:")) * 1024 - 2 * MIB;
+    void *m = mmap(NULL, room, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (m != MAP_FAILED) munmap(m, room);
+    printf("truncate while pinned: dirty %ld kB after\n", meminfo("Dirty:"));
+    check("truncation racing write-back and fills keeps the data", good);
+    check("... and leaves nothing counted as pinned or dirty", m != MAP_FAILED && meminfo("Dirty:") == 0);
+}
+
 int main(void) {
     descriptor_flood();
     fork_bomb();
@@ -367,6 +406,7 @@ int main(void) {
     noreserve_toucher();
     noreserve_copy();
     dirty_counts_against_commit();
+    truncate_while_pinned();
     dirty_share();
     throttled_writer_killable();
     killed_with_threads();
