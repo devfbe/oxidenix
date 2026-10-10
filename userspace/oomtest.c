@@ -12,6 +12,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -397,7 +398,46 @@ static void truncate_while_pinned(void) {
     check("... and leaves nothing counted as pinned or dirty", m != MAP_FAILED && meminfo("Dirty:") == 0);
 }
 
+/* The server's heap (TEST_HEAP_STATS, test mode): committed, in use, free,
+ * decommitted, in bytes. */
+#define TEST_HEAP_STATS 1526
+struct heap { unsigned long committed, in_use, free, decommitted; };
+
+static struct heap server_heap(void) {
+    struct heap h = {0};
+    syscall(TEST_HEAP_STATS, &h);
+    return h;
+}
+
+/* After the floods the server's heap gives its memory back: the timer
+ * thread trims it (within a second or so), so the tree's commitment
+ * returns near where it started; and a commit refused at the limit makes
+ * the kernel ask the server to shrink (EVENT_SHRINK), which keeps no free
+ * page. */
+static void heap_returns(long start_committed, struct heap start) {
+    struct heap h = server_heap();
+    long c = meminfo("Committed_AS:");
+    for (int i = 0; i < 50 && h.committed > start.committed + 2 * MIB; i++) {
+        usleep(100 * 1000);
+        h = server_heap();
+        c = meminfo("Committed_AS:");
+    }
+    printf("server heap: %lu kB committed (%lu kB at the start), %lu kB in use, %lu kB free; Committed_AS %ld kB (%ld kB)\n",
+           h.committed / 1024, start.committed / 1024, h.in_use / 1024, h.free / 1024, c, start_committed);
+    check("the server's heap gives its free memory back", h.committed <= start.committed + 2 * MIB);
+    check("... and the commitment returns near its start", c <= start_committed + 4096);
+    /* A commit beyond the limit: refused, and the servers shrink. */
+    long room = (meminfo("CommitLimit:") - meminfo("Committed_AS:")) * 1024;
+    void *big = mmap(NULL, room + 64 * MIB, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    struct heap before = server_heap();
+    for (int i = 0; i < 30 && (h = server_heap()).free >= before.free && before.free > 64 * 1024; i++) usleep(100 * 1000);
+    printf("shrink: free %lu kB before, %lu kB after\n", before.free / 1024, h.free / 1024);
+    check("a refused commit makes the server shrink its heap", big == MAP_FAILED && (h.free < before.free || before.free <= 64 * 1024));
+}
+
 int main(void) {
+    long start_committed = meminfo("Committed_AS:");
+    struct heap start = server_heap();
     descriptor_flood();
     fork_bomb();
     memory_hog();
@@ -409,6 +449,7 @@ int main(void) {
     throttled_writer_killable();
     killed_with_threads();
     pipe_flood();
+    heap_returns(start_committed, start);
     printf("oomtest: %s\n", failures ? "FAILED" : "all passed");
     return failures;
 }

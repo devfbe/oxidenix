@@ -392,6 +392,14 @@ fn pager() -> ! {
                 console::lost();
                 continue;
             }
+            EVENT_SHRINK => {
+                // Memory is short: unused /data inodes go (at the loop's
+                // `reap`, with their objects), and the heap's free memory.
+                datafs::shrink();
+                datafs::reap();
+                heap::shrink();
+                continue;
+            }
             EVENT_SERVICE_GONE => {
                 // diskfs keeps our unlinked open files for us until we name them again.
                 // (On the worker: the reconnection waits for locks, the pager must not.)

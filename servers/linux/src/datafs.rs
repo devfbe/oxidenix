@@ -446,6 +446,15 @@ static MAX_FILE: AtomicU64 = AtomicU64::new(0);
 static BLOCK: AtomicU64 = AtomicU64::new(0);
 /// Whether `reap` has work (inodes to check, or too many cached).
 static REAP: AtomicBool = AtomicBool::new(false);
+/// Memory is short: `reap` lets go of every unused clean inode.
+static SHRINK: AtomicBool = AtomicBool::new(false);
+
+/// `EVENT_SHRINK`: the cache of unused inodes goes, but for dirty ones (at
+/// the next `reap`).
+pub fn shrink() {
+    SHRINK.store(true, Ordering::Release);
+    REAP.store(true, Ordering::Release);
+}
 
 fn now() -> u64 {
     syscall(SYS_CLOCK_READ, [1, 0, 0, 0, 0, 0]).max(0) as u64
@@ -1992,6 +2001,12 @@ pub fn reap() {
             unused.sort_unstable();
             let excess = t.inodes.len() - MAX_CACHED * 3 / 4;
             victims.extend(unused.iter().take(excess).map(|&(_, ino, key)| (ino, key)));
+        }
+        // Memory is short (`shrink`): every unused clean inode goes too
+        // (with its cached object; a dirty one would cost a write-back).
+        if SHRINK.swap(false, Ordering::AcqRel) {
+            let clean = t.inodes.values().filter(|i| Arc::strong_count(i) == 1 && i.ino != ROOT_INO && !t.dirty.contains_key(&i.ino));
+            victims.extend(clean.map(|i| (i.ino, i.key)).collect::<Vec<_>>());
         }
         victims
     };

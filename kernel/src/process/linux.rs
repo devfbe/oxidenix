@@ -78,13 +78,51 @@ fn sync_chan() -> usize {
     &SYNC_TICKET as *const _ as usize
 }
 
-/// The instances alive, but `except`.
+/// The instances alive, but `except` (none if there is no memory for the
+/// list). The list is copied out under its lock into room reserved before,
+/// and references are dropped only after it (a drop may be the instance's
+/// teardown).
 fn instances(except: Option<&Instance>) -> Vec<Arc<Instance>> {
-    let all = INSTANCES.lock();
-    all.iter()
-        .filter_map(|w| w.upgrade())
-        .filter(|i| !except.is_some_and(|e| core::ptr::eq(Arc::as_ptr(i), e)))
-        .collect()
+    let mut out: Vec<Arc<Instance>> = Vec::new();
+    loop {
+        let want = INSTANCES.lock().len();
+        if out.try_reserve_exact(want).is_err() {
+            return out;
+        }
+        let all = INSTANCES.lock();
+        if all.len() <= out.capacity() {
+            out.extend(all.iter().filter_map(|w| w.upgrade()));
+            break;
+        }
+    }
+    out.retain(|i| !except.is_some_and(|e| core::ptr::eq(Arc::as_ptr(i), e)));
+    out
+}
+
+/// When `post_shrink` last went through the instances (`time::now`), and
+/// how often it may; how often an instance gets `EVENT_SHRINK` at most
+/// (one asked for sooner waits, `event_wait`).
+static LAST_SHRINK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+const SHRINK_POST_INTERVAL: u64 = 100_000_000;
+const SHRINK_INTERVAL: u64 = 1_000_000_000;
+
+/// Memory is short (the background reclaimer below its low watermark, a
+/// commit refused): every instance's service thread gets `EVENT_SHRINK`
+/// (each at most once a second). From a thread that holds no lock (the
+/// reclaimer). False if it went through them less than 100 ms ago and did
+/// nothing (the caller asks again later).
+pub fn post_shrink() -> bool {
+    use core::sync::atomic::Ordering::Relaxed;
+    let now = crate::time::now();
+    let last = LAST_SHRINK.load(Relaxed);
+    if last != 0 && now < last + SHRINK_POST_INTERVAL || LAST_SHRINK.compare_exchange(last, now, Relaxed, Relaxed).is_err() {
+        return false;
+    }
+    for instance in instances(None) {
+        instance.shrink.store(true, core::sync::atomic::Ordering::Release);
+        super::wakeup(instance.pager_chan());
+    }
+    true
 }
 
 /// Asks every instance's pager but `except`'s to write its caches back
@@ -268,6 +306,11 @@ pub struct Instance {
     /// it is mapped, `SYS_SHARED_COMMIT`).
     heap: crate::sync::Mutex<()>,
     heap_pages: core::sync::atomic::AtomicU64,
+    /// Memory is short: the service thread gets `EVENT_SHRINK` (a flag,
+    /// `post_shrink`), at most once per `SHRINK_INTERVAL` (when it got the
+    /// last).
+    shrink: core::sync::atomic::AtomicBool,
+    shrunk_at: core::sync::atomic::AtomicU64,
     /// The dirty and pinned pages of its cached objects (bounded per
     /// instance, `fs::cache`).
     cache_counts: Arc<crate::fs::cache::CacheCounts>,
@@ -430,6 +473,8 @@ impl Instance {
             programs: core::sync::atomic::AtomicUsize::new(0),
             heap: crate::sync::Mutex::new(()),
             heap_pages: core::sync::atomic::AtomicU64::new(0),
+            shrink: core::sync::atomic::AtomicBool::new(false),
+            shrunk_at: core::sync::atomic::AtomicU64::new(0),
             cache_counts,
             maps: crate::sync::Mutex::new(BTreeMap::new()),
             spaces: spin::Mutex::new(Vec::new()),
@@ -2516,6 +2561,18 @@ fn event_wait(instance: &Arc<Instance>, out: u64, deadline: u64) -> Option<SysRe
             if crate::drivers::console_device::take_event(instance.id) {
                 return Some(Some(Event { kind: EVENT_CONSOLE, a: 0, b: 0 }));
             }
+            // Memory is short (`post_shrink`, by a flag likewise), once
+            // `SHRINK_INTERVAL` passed since the last time.
+            let mut shrink_due = 0;
+            if instance.shrink.load(core::sync::atomic::Ordering::Acquire) {
+                let now = crate::time::now();
+                let at = instance.shrunk_at.load(core::sync::atomic::Ordering::Relaxed);
+                shrink_due = if at == 0 { now } else { at + SHRINK_INTERVAL };
+                if now >= shrink_due && instance.shrink.swap(false, core::sync::atomic::Ordering::AcqRel) {
+                    instance.shrunk_at.store(now, core::sync::atomic::Ordering::Relaxed);
+                    return Some(Some(Event { kind: EVENT_SHRINK, a: 0, b: 0 }));
+                }
+            }
             if q.closing {
                 if q.closing_told {
                     return Some(None);
@@ -2524,13 +2581,14 @@ fn event_wait(instance: &Arc<Instance>, out: u64, deadline: u64) -> Option<SysRe
                 return Some(Some(Event { kind: EVENT_CLOSING, a: 0, b: 0 }));
             }
             drop(q);
-            if deadline != 0 {
-                if crate::time::now() >= deadline {
-                    return Some(Some(Event { kind: EVENT_TIMER, a: 0, b: 0 }));
-                }
-                wait.sleep_until(deadline);
-            } else {
-                wait.sleep();
+            if deadline != 0 && crate::time::now() >= deadline {
+                return Some(Some(Event { kind: EVENT_TIMER, a: 0, b: 0 }));
+            }
+            // Until the deadline or a shrink's turn, whichever is first.
+            match (deadline, shrink_due) {
+                (0, 0) => wait.sleep(),
+                (0, until) | (until, 0) => wait.sleep_until(until),
+                (a, b) => wait.sleep_until(a.min(b)),
             }
             None
         });
@@ -2549,6 +2607,7 @@ fn event_wait(instance: &Arc<Instance>, out: u64, deadline: u64) -> Option<SysRe
                         }
                         EVENT_PAGE if !q.queued.insert((event.a, event.b / PAGE)) => {}
                         EVENT_TIMER => {}
+                        EVENT_SHRINK => instance.shrink.store(true, core::sync::atomic::Ordering::Release),
                         EVENT_CLOSING => q.closing_told = false,
                         EVENT_WRITEBACK if q.writeback_queued => {}
                         EVENT_SYNC if q.sync_queued => {}

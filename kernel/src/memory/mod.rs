@@ -322,11 +322,19 @@ pub fn commit(pages: u64) -> bool {
     let mut a = ACCOUNT.lock();
     let limit = COMMIT_LIMIT.load(core::sync::atomic::Ordering::Relaxed);
     if a.committed.saturating_add(pages).saturating_add(unavailable) > limit {
+        drop(a);
+        // The Linux servers give back what they keep committed and free.
+        SHRINK_WANTED.store(true, core::sync::atomic::Ordering::Relaxed);
+        wake_reclaimer();
         return false;
     }
     a.committed += pages;
     true
 }
+
+/// A commit was refused at the limit: the background reclaimer asks the
+/// Linux servers to shrink (`linux::post_shrink`).
+static SHRINK_WANTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 /// Whether a commit of `pages` failed only for the cache pages that are
 /// dirty or pinned now (write-back will make room), not for memory
@@ -538,6 +546,12 @@ fn reclaimer() -> ! {
                 let high = 2 * low_watermark(f);
                 (!f.user_may_take(high), !f.user_may_take(low_watermark(f)))
             });
+            // Below the low watermark or after a refused commit, the Linux
+            // servers give back what they can do without (their shrinkers,
+            // `EVENT_SHRINK`; at most once a second).
+            if (low || SHRINK_WANTED.load(core::sync::atomic::Ordering::Relaxed)) && crate::process::linux::post_shrink() {
+                SHRINK_WANTED.store(false, core::sync::atomic::Ordering::Relaxed);
+            }
             if !short {
                 break;
             }
