@@ -516,7 +516,9 @@ impl AddressSpace {
         self.vmas.range(..=addr).next_back().map(|(_, v)| v).filter(|v| addr < v.end)
     }
 
-    fn overlaps(&self, start: u64, end: u64) -> bool {
+    /// Whether any area lies in [start, end): one lookup, whatever the
+    /// range's size.
+    pub fn overlaps(&self, start: u64, end: u64) -> bool {
         self.vmas.range(..end).next_back().is_some_and(|(_, v)| v.end > start)
     }
 
@@ -1181,8 +1183,17 @@ impl AddressSpace {
     /// A page that must come from a pager is asked for, not waited for (the
     /// space is locked, and the pager may need it): best effort, as
     /// MAP_POPULATE is on Linux.
+    /// The thread's death ends it early (a range of 64 TiB is many pages),
+    /// and the CPU goes to others between pieces.
     pub fn populate(&mut self, start: u64, len: u64, write: bool) -> Result<(), Fault> {
-        for page in user_pages(start, start.saturating_add(len)) {
+        let end = start.checked_add(len).filter(|&e| e <= USER_END).ok_or(Fault::Segv)?;
+        for (i, page) in user_pages(start, end).enumerate() {
+            if i % 512 == 511 {
+                if super::kill::dying() {
+                    return Ok(());
+                }
+                super::sched::cond_resched();
+            }
             match self.fault_or_retry(page.start_address().as_u64(), Access { write, exec: false }, false) {
                 Ok(()) => {}
                 Err(Fault::Retry) => self.awaited = None,

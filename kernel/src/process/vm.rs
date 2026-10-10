@@ -67,23 +67,24 @@ pub struct Placement {
 /// below MMAP_TOP and above the floor (`restricted::SYS_VM_FLOOR`; a native
 /// server's: the end of its program). Returns where.
 pub fn place_and_map(addr: u64, len: u64, prot: Prot, backing: Backing, how: Placement) -> SysResult {
+    if len == 0 || len % PAGE != 0 || len > address_space::USER_END || addr % PAGE != 0 {
+        return Err(EINVAL);
+    }
     let mm = mm()?;
     let mut space = mm.lock();
     let floor = page_up(space.brk_end);
     let start = if how.fixed {
-        if addr.checked_add(len).is_none_or(|e| e > address_space::USER_END) || addr == 0 {
-            return Err(EINVAL);
-        }
-        if how.no_replace && (addr..addr + len).step_by(PAGE as usize).any(|a| space.vma(a).is_some()) {
+        let end = addr.checked_add(len).filter(|&e| e <= address_space::USER_END && addr != 0).ok_or(EINVAL)?;
+        if how.no_replace && space.overlaps(addr, end) {
             return Err(EEXIST);
         }
         addr
     } else {
-        // A hint is taken if the range is free.
+        // A hint is taken if the range is free (one lookup of the areas,
+        // whatever the length).
         let hint_free = addr != 0
             && addr >= floor
-            && addr.checked_add(len).is_some_and(|e| e <= address_space::MMAP_TOP)
-            && (addr..addr + len).step_by(PAGE as usize).all(|a| space.vma(a).is_none());
+            && addr.checked_add(len).is_some_and(|e| e <= address_space::MMAP_TOP && !space.overlaps(addr, e));
         if hint_free { addr } else { space.find_free(len, floor).ok_or(ENOMEM)? }
     };
     space.map(start, len, prot, backing, how.no_reserve).map_err(errno)?;
@@ -114,7 +115,9 @@ pub fn protect(addr: u64, len: u64, bits: u64) -> SysResult {
 
 /// mremap's contract (`restricted::SYS_VM_REMAP`): grows in place when the
 /// space behind is free, else moves (MREMAP_MAYMOVE) or goes to `new_addr`
-/// (MREMAP_FIXED).
+/// (MREMAP_FIXED). Every range is checked to lie within the program's
+/// 64 TiB first (EINVAL, ENOMEM for a length beyond it, as Linux's), so no
+/// sum below can wrap.
 pub fn remap(old: u64, old_len: u64, new_len: u64, flags: u64, new_addr: u64) -> SysResult {
     if !aligned(old) || new_len == 0 || old_len == 0 || flags & !(MREMAP_MAYMOVE | MREMAP_FIXED) != 0 {
         return Err(EINVAL);
@@ -122,11 +125,16 @@ pub fn remap(old: u64, old_len: u64, new_len: u64, flags: u64, new_addr: u64) ->
     if flags & MREMAP_FIXED != 0 && (flags & MREMAP_MAYMOVE == 0 || !aligned(new_addr)) {
         return Err(EINVAL);
     }
-    let (old_len, new_len) = (page_up(old_len), page_up(new_len));
+    let old_len = range(old, old_len)?;
+    let new_len = new_len.checked_add(PAGE - 1).ok_or(ENOMEM)? & !(PAGE - 1);
+    if new_len > address_space::USER_END {
+        return Err(ENOMEM);
+    }
     let fixed = (flags & MREMAP_FIXED != 0).then_some(new_addr);
     if let Some(t) = fixed {
-        let overlap = t < old + old_len && old < t + new_len;
-        if overlap || t.checked_add(new_len).is_none_or(|e| e > address_space::USER_END) {
+        let t_end = t.checked_add(new_len).filter(|&e| e <= address_space::USER_END).ok_or(EINVAL)?;
+        let overlap = t < old + old_len && old < t_end;
+        if overlap {
             return Err(EINVAL);
         }
     }
@@ -152,7 +160,7 @@ pub fn sync(addr: u64, len: u64, flags: u64, out: u64, cap: u64) -> SysResult {
     if !aligned(addr) || flags & !(MS_ASYNC | MS_INVALIDATE | MS_SYNC) != 0 || flags & (MS_ASYNC | MS_SYNC) == MS_ASYNC | MS_SYNC {
         return Err(EINVAL);
     }
-    let end = addr.checked_add(page_up(len)).filter(|&e| e <= address_space::USER_END).ok_or(ENOMEM)?;
+    let end = len.checked_add(PAGE - 1).map(|l| l & !(PAGE - 1)).and_then(|l| addr.checked_add(l)).filter(|&e| e <= address_space::USER_END).ok_or(ENOMEM)?;
     let files = mm()?.lock().file_ranges(addr, end).ok_or(ENOMEM)?;
     if flags & MS_SYNC == 0 {
         return Ok(0);
@@ -179,7 +187,8 @@ pub fn discard(addr: u64, len: u64) -> SysResult {
         return Err(EINVAL);
     }
     if len > 0 {
-        mm()?.lock().discard(addr, page_up(len)).map_err(errno)?;
+        let len = range(addr, len)?;
+        mm()?.lock().discard(addr, len).map_err(errno)?;
     }
     Ok(0)
 }

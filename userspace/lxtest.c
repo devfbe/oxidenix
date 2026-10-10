@@ -141,6 +141,12 @@ static int fs_moved(unsigned long tls, unsigned long delta) {
 
 static int futex_word;
 
+static int64_t now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
 static void *futex_waker(void *arg) {
     (void)arg;
     usleep(20 * 1000);
@@ -223,6 +229,30 @@ static void r9_checks(void) {
     check("ioperm is EPERM (the tree has no ports)", syscall(SYS_ioperm, 0x80, 1, 1) == -1 && errno == EPERM);
     errno = 0;
     check("reboot with a wrong magic number is EINVAL", syscall(SYS_reboot, 0, 0, 0, NULL) == -1 && errno == EINVAL);
+    /* The kernel's range checks on what reaches it (vm.rs): lengths near 2^64,
+     * sums that would wrap, and ranges of tens of TiB looked at in one lookup
+     * (no loop over their pages: each call returns at once). */
+    int64_t t0 = now_ms();
+    errno = 0;
+    check("mmap of a length near 2^64 is ENOMEM", mmap(NULL, (size_t)-4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) == MAP_FAILED && errno == ENOMEM);
+    char *huge_hint = (char *)0x100000000000UL;
+    char *big = mmap(huge_hint, 1UL << 45, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    check("a 32 TiB hint is taken or placed elsewhere in one lookup", big != MAP_FAILED);
+    errno = 0;
+    check("MAP_FIXED_NOREPLACE over a 32 TiB mapping is EEXIST",
+          big != MAP_FAILED && mmap(big + (1UL << 44), 1UL << 44, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0) == MAP_FAILED && errno == EEXIST);
+    errno = 0;
+    check("mremap to a length near 2^64 fails", big != MAP_FAILED && mremap(big, 4096, (size_t)-4096, MREMAP_MAYMOVE) == MAP_FAILED && (errno == ENOMEM || errno == EINVAL));
+    errno = 0;
+    check("mremap to a fixed address whose end wraps is EINVAL",
+          big != MAP_FAILED && mremap(big, 4096, 1UL << 40, MREMAP_MAYMOVE | MREMAP_FIXED, (void *)(-(1L << 39) & ~4095L)) == MAP_FAILED && errno == EINVAL);
+    errno = 0;
+    check("madvise and msync of a range that wraps fail", big != MAP_FAILED && madvise(big, (size_t)-4096, MADV_DONTNEED) == -1 && msync(big, (size_t)-4096, MS_SYNC) == -1);
+    check("madvise(MADV_DONTNEED) of the 32 TiB mapping returns", big != MAP_FAILED && madvise(big, 1UL << 45, MADV_DONTNEED) == 0);
+    if (big != MAP_FAILED) munmap(big, 1UL << 45);
+    int64_t took = now_ms() - t0;
+    printf("    (the range checks took %lld ms)\n", (long long)took);
+    check("... all of it at once (no loop over the pages)", took < 2000);
     struct stat sb;
     struct statfs fs;
     char target[64] = {0};

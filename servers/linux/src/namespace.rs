@@ -201,7 +201,10 @@ fn with_mounts<R>(f: impl FnOnce(&Vec<Mount>) -> R) -> R {
         root.set_perm(0o755);
         crate::initramfs::unpack(&root);
         let _ = root.subdir("tmp", 0o1777);
-        m.push(Mount { at: Vec::new(), fs: Fs::Tmpfs(root.clone()), source: "rootfs", fstype: "tmpfs" });
+        // Named "tmpfs", not "rootfs": tools skip a "rootfs" entry as
+        // Linux's always-present initial one (busybox df would find no
+        // mount for "/", now that /dev is a filesystem of its own).
+        m.push(Mount { at: Vec::new(), fs: Fs::Tmpfs(root.clone()), source: "tmpfs", fstype: "tmpfs" });
         let path = |name: &str| alloc::vec![String::from(name)];
         let mounts = [
             ("dev", Fs::Tmpfs(dev()), "devtmpfs", "devtmpfs"),
