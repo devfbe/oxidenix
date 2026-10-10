@@ -1,8 +1,8 @@
 //! Credentials and process attributes (phase R8): the user and group ids, supplementary
 //! groups, capabilities, prctl, the resource usage calls (getrusage, times), the calls
 //! that name a thread or process for the kernel (sched_getaffinity, sched_setaffinity), and
-//! the resource limits but RLIMIT_NOFILE, which is the descriptor table's (`fdtable`):
-//! prlimit64, getrlimit and setrlimit (R9).
+//! the resource limits: prlimit64, getrlimit and setrlimit (R9), kept per process
+//! (`Limits`) and read without a lock by the calls they bound.
 //!
 //! oxidenix has one user, root (uid and gid 0, every capability): the id getters answer 0,
 //! setting an id is accepted (there is no other user to become), a process has no
@@ -11,8 +11,11 @@
 
 use crate::local;
 use crate::process::{self, Pid, PROCS};
+use crate::sync::Mutex;
 use crate::syscall;
 use crate::usercopy;
+use alloc::sync::Arc;
+use core::sync::atomic::{AtomicU64, Ordering};
 use restricted::*;
 
 const EPERM: i64 = 1;
@@ -78,25 +81,30 @@ pub fn handle(s: &State) -> Option<i64> {
     Some(result.unwrap_or_else(|e| -e))
 }
 
-/// The resource limits (Linux's RLIMIT_ numbers, but RLIMIT_NOFILE).
+/// The resource limits (Linux's RLIMIT_ numbers).
 const RLIM_NLIMITS: u64 = 16;
-const RLIM_INFINITY: u64 = u64::MAX;
-const RLIMIT_STACK: u64 = 3;
+pub const RLIM_INFINITY: u64 = u64::MAX;
+pub const RLIMIT_STACK: u64 = 3;
 const RLIMIT_CORE: u64 = 4;
+pub const RLIMIT_NOFILE: u64 = 7;
 const RLIMIT_MEMLOCK: u64 = 8;
-const RLIMIT_SIGPENDING: u64 = 11;
+pub const RLIMIT_SIGPENDING: u64 = 11;
 const RLIMIT_MSGQUEUE: u64 = 12;
 const RLIMIT_NICE: u64 = 13;
 const RLIMIT_RTPRIO: u64 = 14;
 
+/// The largest RLIMIT_NOFILE (Linux's fs.nr_open).
+const NR_OPEN: u64 = 1 << 20;
+
 /// The (soft, hard) limit of `resource` a tree's first process starts with: Linux's
 /// defaults for a process init starts, where the server holds to them (an execve's stack
-/// grows to 8 MiB, no core files are written, the instance queues at most 4096 real-time
-/// signals); nothing else is limited.
+/// grows to 8 MiB, no core files are written, 4096 descriptors, the instance queues at most
+/// 4096 real-time signals); nothing else is limited.
 fn limit(resource: u64) -> (u64, u64) {
     match resource {
         RLIMIT_STACK => (8 << 20, RLIM_INFINITY),
         RLIMIT_CORE => (0, RLIM_INFINITY),
+        RLIMIT_NOFILE => (4096, 4096),
         RLIMIT_MEMLOCK => (8 << 20, 8 << 20),
         RLIMIT_SIGPENDING => (4096, 4096),
         RLIMIT_MSGQUEUE => (819_200, 819_200),
@@ -105,23 +113,89 @@ fn limit(resource: u64) -> (u64, u64) {
     }
 }
 
-/// A process's resource limits but RLIMIT_NOFILE (the descriptor table's), as (soft, hard)
-/// by Linux's RLIMIT_ number: kept in its record (`process::Proc::limits`), inherited by
-/// fork and clone, kept by execve, as Linux keeps them per process (its signal struct).
-#[derive(Clone, Copy)]
-pub struct Limits(pub [(u64, u64); RLIM_NLIMITS as usize]);
+/// A process's resource limits, (soft, hard) by Linux's RLIMIT_ number, as Linux keeps
+/// them (its signal struct): one record per process (`process::Proc::limits`, shared by its
+/// threads), copied by fork and clone without CLONE_THREAD, kept by execve and while the
+/// process is a zombie. A thread finds its process's without a lock (`local::Local::limits`,
+/// `soft`); the calls they bound read the soft limit at the time (descriptors, poll's
+/// `nfds`, a queued real-time signal's target, execve's stack).
+pub struct Limits {
+    soft: [AtomicU64; RLIM_NLIMITS as usize],
+    hard: [AtomicU64; RLIM_NLIMITS as usize],
+    /// Serializes changes: a prlimit's old and new pair is one step.
+    change: Mutex<()>,
+}
 
-impl Default for Limits {
-    fn default() -> Limits {
-        Limits(core::array::from_fn(|r| limit(r as u64)))
+impl Limits {
+    /// A tree's first process's (`limit`).
+    pub fn initial() -> Limits {
+        Limits {
+            soft: core::array::from_fn(|r| AtomicU64::new(limit(r as u64).0)),
+            hard: core::array::from_fn(|r| AtomicU64::new(limit(r as u64).1)),
+            change: Mutex::new(()),
+        }
+    }
+
+    /// A copy for a new process (fork, clone without CLONE_THREAD).
+    pub fn copy(&self) -> Limits {
+        let _change = self.change.lock();
+        Limits {
+            soft: core::array::from_fn(|r| AtomicU64::new(self.soft[r].load(Ordering::Relaxed))),
+            hard: core::array::from_fn(|r| AtomicU64::new(self.hard[r].load(Ordering::Relaxed))),
+            change: Mutex::new(()),
+        }
+    }
+
+    /// The soft limit of `resource`.
+    pub fn soft(&self, resource: u64) -> u64 {
+        self.soft[resource as usize].load(Ordering::Relaxed)
+    }
+
+    /// The (soft, hard) limit of `resource` before, replaced by `new` if given.
+    fn exchange(&self, resource: u64, new: Option<(u64, u64)>) -> (u64, u64) {
+        let r = resource as usize;
+        let _change = self.change.lock();
+        let before = (self.soft[r].load(Ordering::Relaxed), self.hard[r].load(Ordering::Relaxed));
+        if let Some((soft, hard)) = new {
+            self.soft[r].store(soft, Ordering::Relaxed);
+            self.hard[r].store(hard, Ordering::Relaxed);
+        }
+        before
     }
 }
 
+/// The calling thread's process's limits (a service thread, which serves no program, has
+/// the initial ones).
+pub fn current() -> Arc<Limits> {
+    let ptr = local::get().limits.load(Ordering::Acquire);
+    if ptr.is_null() {
+        return Arc::new(Limits::initial());
+    }
+    // The thread's record keeps it alive while the thread runs; this reference is the
+    // caller's.
+    unsafe {
+        Arc::increment_strong_count(ptr);
+        Arc::from_raw(ptr)
+    }
+}
+
+/// The soft limit of `resource` of the calling thread's process (a service thread's: the
+/// initial one), without a lock.
+pub fn soft(resource: u64) -> u64 {
+    let ptr = local::get().limits.load(Ordering::Acquire);
+    if ptr.is_null() {
+        return limit(resource).0;
+    }
+    // Valid while the thread runs (see `current`).
+    unsafe { &*ptr }.soft(resource)
+}
+
 /// prlimit64(pid, resource, new, old) for process `pid` (0: the caller's; a thread's id
-/// names its process; checked to exist by the caller), and getrlimit and setrlimit: the
-/// limits before at `old`, the new ones taken (EINVAL for a soft limit above the hard one;
-/// the one user is root, who may raise them). The program's memory is read and written
-/// with no lock held.
+/// names its process; a zombie has its limits too; checked to exist by the caller), and
+/// getrlimit and setrlimit: the limits before at `old`, the new ones taken (EINVAL for a
+/// soft limit above the hard one; the one user is root, who may raise them, RLIMIT_NOFILE's
+/// hard limit up to `NR_OPEN`, beyond it EPERM, as Linux). The program's memory is read and
+/// written with no lock held.
 fn prlimit(pid: Pid, resource: u64, new: u64, old: u64) -> Result<i64, i64> {
     if resource >= RLIM_NLIMITS {
         return Err(EINVAL);
@@ -131,22 +205,22 @@ fn prlimit(pid: Pid, resource: u64, new: u64, old: u64) -> Result<i64, i64> {
         if soft > hard {
             return Err(EINVAL);
         }
+        // (RLIM_INFINITY is beyond it, as on Linux.)
+        if resource == RLIMIT_NOFILE && hard > NR_OPEN {
+            return Err(EPERM);
+        }
         Some((soft, hard))
     } else {
         None
     };
-    let before = {
-        let mut t = PROCS.lock();
-        let id = if pid == 0 { local::pid() } else { pid };
-        let target = t.threads.get(&id).map_or(id, |th| th.pid);
-        let p = t.procs.get_mut(&target).ok_or(ESRCH)?;
-        let slot = &mut p.limits.0[resource as usize];
-        let before = *slot;
-        if let Some(n) = new {
-            *slot = n;
-        }
-        before
+    let limits = if pid == 0 {
+        current()
+    } else {
+        let t = PROCS.lock();
+        let target = t.threads.get(&pid).map_or(pid, |th| th.pid);
+        t.procs.get(&target).ok_or(ESRCH)?.limits.clone()
     };
+    let before = limits.exchange(resource, new);
     if old != 0 {
         usercopy::write(old, &[before.0, before.1])?;
     }

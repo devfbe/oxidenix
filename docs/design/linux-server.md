@@ -914,13 +914,12 @@ the kernel keeps descriptor tables for its native servers only. Decisions in ADR
   process's table ends and for a message the collector dropped (an internet socket's close then goes through the net
   thread, which may wait for netd).
 - **The table** (`fdtable::FilesContext`) holds the descriptors (a description and the
-  close-on-exec bit), the lowest free slot, and RLIMIT_NOFILE (4096 by default, at most
-  2^20, Linux's fs.nr_open). Its calls: close, close_range (with `CLOSE_RANGE_CLOEXEC` and
+  close-on-exec bit) and the lowest free slot; a new descriptor is below the caller's
+  process's soft RLIMIT_NOFILE (`ids::Limits`: 4096 by default, at most 2^20, Linux's
+  fs.nr_open). Its calls: close, close_range (with `CLOSE_RANGE_CLOEXEC` and
   `CLOSE_RANGE_UNSHARE`), dup, dup2, dup3, fcntl's `F_DUPFD`, `F_DUPFD_CLOEXEC`, `F_GETFD`,
   `F_SETFD`, `F_GETFL` and `F_SETFL` (O_APPEND, O_NONBLOCK; O_DIRECT, O_NOATIME and O_ASYNC are ignored), the ioctls `FIONBIO`, `FIOCLEX`
-  and `FIONCLEX`, and RLIMIT_NOFILE of prlimit64 (any process's), getrlimit and setrlimit
-  (the limit is kept with the table, so processes sharing one with `CLONE_FILES` but not
-  `CLONE_THREAD` share it too, where Linux keeps one per process). No lock of a table is held
+  and `FIONCLEX`. No lock of a table is held
   while program memory is copied or a description is let go of.
 - **Which threads share a table** is the process model's (R8; until then the kernel's clone
   decided, with the server's record of each table in the kernel's, `SYS_FILES_RECORD`): each
@@ -1144,11 +1143,12 @@ affinity and getcpu calls in `mod.rs`; `timer.rs`'s interval timers; the per-pro
   instance writes its caches back first, as the kernel's reboot did); `sysinfo` the system's
   record (`procs` the instance's threads); `getcpu` `thread_info`; `getrandom` `random` 256
   bytes at a time, ending early for a signal as Linux beyond the first piece; `uname` is the
-  server's alone; `ioperm` and `iopl` EPERM (the tree has no ports). The resource limits but
-  RLIMIT_NOFILE start as Linux's defaults the server holds to (an 8 MiB stack, no core
-  files, 4096 queued signals) and are kept per process in the server's process table
-  (`ids::Limits` in `process::Proc`: inherited by fork and clone, kept by execve, another
-  process's by prlimit64).
+  server's alone; `ioperm` and `iopl` EPERM (the tree has no ports). The resource limits
+  start as Linux's defaults the server holds to (an 8 MiB stack, no core files, 4096
+  descriptors, 4096 queued signals) and are kept per process (`ids::Limits`, shared by
+  `process::Proc` and its threads, which read them without a lock: copied by fork and clone,
+  kept by execve and by a zombie, another process's by prlimit64, named by any of its
+  threads' ids).
 - **The host grant** (ADR 0011, decision 5): `clock_set` and `power` need the instance's
   grant, which the kernel gives the trees it starts and takes back with the console when
   the tree's first process ends (`process::Tree::end`); without it the server acts as a
