@@ -321,6 +321,9 @@ pub struct AddressSpace {
     /// A fault failed for want of a frame (not of commit): it reclaims and
     /// tries again with the space unlocked (`Mm::retrying`).
     out_of_frames: bool,
+    /// The disk file whose page a store made dirty last, for the writer's
+    /// throttling by its owner's share (`handle_fault`).
+    dirtied: Option<Arc<PageCache>>,
 }
 
 /// An address space as tasks hold it: shared by the threads of a process
@@ -489,6 +492,7 @@ impl AddressSpace {
             exe: None,
             awaited: None,
             out_of_frames: false,
+            dirtied: None,
         })
     }
 
@@ -1103,7 +1107,10 @@ impl AddressSpace {
     fn dirty_backed(&mut self, cache: &Arc<PageCache>, index: u64, wait: bool) -> Result<(), Fault> {
         for _ in 0..MAX_FAULT_TRIES {
             match cache.set_dirty(index, true) {
-                Dirtied::Yes => return Ok(()),
+                Dirtied::Yes => {
+                    self.dirtied = Some(cache.clone());
+                    return Ok(());
+                }
                 Dirtied::Gone => return Err(Fault::Bus),
                 Dirtied::Oom => return Err(Fault::Oom),
                 Dirtied::Unbacked(awaited) if !wait => {
@@ -1748,9 +1755,11 @@ pub fn handle_fault(va: u64, access: Access) -> Result<(), Fault> {
     // fault is tried again.
     let result = mm.retrying(|space| space.fault_or_retry(va, access, false));
     if access.write && result.is_ok() {
-        // The store may have made a page dirty: too many, and this writer
-        // writes back (with no lock held).
-        crate::fs::cache::balance_dirty();
+        // The store may have made a page dirty: too many (of all, or of
+        // the file's owner's share), and this writer waits for write-back
+        // (with no lock held).
+        let dirtied = mm.lock().dirtied.take();
+        crate::fs::cache::balance_dirty(dirtied.as_deref());
     }
     result
 }

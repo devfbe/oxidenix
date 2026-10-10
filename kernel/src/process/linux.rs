@@ -1191,11 +1191,6 @@ pub fn is_pager() -> bool {
     with_current(|p| p.linux.as_ref().is_some_and(|l| l.pager))
 }
 
-/// The dirty and pinned cache pages of the caller's instance, if it runs
-/// a Linux program or server.
-pub fn cache_counts() -> Option<Arc<crate::fs::cache::CacheCounts>> {
-    with_current(|p| p.linux.as_ref().map(|l| l.instance.cache_counts.clone()))
-}
 
 /// Whether the caller is the instance's pager, which takes its events.
 fn owns_events() -> bool {
@@ -1453,10 +1448,17 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
                 }
                 SYS_MO_FILE_WRITE => {
                     offset.checked_add(len).ok_or(EFBIG)?;
-                    let n = super::uaccess::write_from_user(buf, len, |chunk, done| cache.write_with(offset + done, chunk, fill, backing));
+                    // Too many dirty pages (of all, or of the file's owner's
+                    // share): this writer waits for write-back, before each
+                    // chunk after the first and after the last.
+                    let n = super::uaccess::write_from_user(buf, len, |chunk, done| {
+                        if done > 0 && cache.is_cached() {
+                            crate::fs::cache::balance_dirty(Some(&cache));
+                        }
+                        cache.write_with(offset + done, chunk, fill, backing)
+                    });
                     if cache.is_cached() {
-                        // Too many dirty pages: this writer waits a little.
-                        crate::fs::cache::balance_dirty();
+                        crate::fs::cache::balance_dirty(Some(&cache));
                     }
                     Ok(n? as i64)
                 }
@@ -1816,7 +1818,7 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
                     // A file object that cannot grow further (ENOSPC):
                     // what was written counts.
                     if cache.is_cached() && done > 0 && done % (64 * PAGE) == 0 {
-                        crate::fs::cache::balance_dirty();
+                        crate::fs::cache::balance_dirty(Some(&cache));
                     }
                     match cache.write(offset + done, &chunk[..n]) {
                         Ok(w) if w < n => return Ok((done + w as u64) as i64),

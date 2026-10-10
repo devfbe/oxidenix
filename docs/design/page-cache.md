@@ -138,9 +138,13 @@ space, and the walks (truncation, write-back) drop it before they lock a mapper.
   `ENOMEM`). One reclaim pass looks at no more than 4096 pages (16 per page asked for, if
   more), taking each cache's lock for at most 256 at a time and no lock across the walks of the
   mappings. No Linux server instance can hold more than its share of what reclaim cannot drop
-  (`CacheCounts`): its storing threads wait above a tenth of the commit limit of dirty pages
-  (Linux bounds each device's share likewise), and its fills and write-backs pin at most a
-  quarter of it.
+  (`CacheCounts`): a page is charged to the instance that owns its file (whoever stored to
+  it) when it is marked dirty, under the cache's lock, and refunded exactly once when it is
+  cleaned, cut off or freed; a storing thread waits for write-back while the owner is above a
+  tenth of the commit limit (Linux bounds each device's share likewise; each writer passes it
+  by at most the page or 64 KiB chunk it just stored). Fills and write-backs reserve their
+  pins against a quarter of the limit in one atomic step (`reserve_pins`) and return what they
+  did not pin, so concurrent ones cannot pass it together.
 - The file metadata quota (inodes, symlink targets, pipes) on the kernel heap stays.
 
 ### Disk files

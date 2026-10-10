@@ -1238,10 +1238,16 @@ impl PageCache {
         undirty(pages);
     }
 
+    /// `pages` pages became pinned under a reservation (`reserve_pins`),
+    /// which already counts them for the instance.
     fn pinned_added(&self, pages: u64) {
         PINNED.fetch_add(pages, Ordering::Relaxed);
+    }
+
+    /// Returns the part of a reservation that was not pinned.
+    fn unreserve_pins(&self, pages: u64) {
         if let Some(c) = self.counts() {
-            c.pinned.fetch_add(pages, Ordering::Relaxed);
+            c.pinned.fetch_sub(pages, Ordering::Relaxed);
         }
     }
 
@@ -1252,15 +1258,22 @@ impl PageCache {
         }
     }
 
-    /// How many more pages this object's instance may pin (`pin_fill`,
-    /// `pin_dirty`), at most `want`: if none, it waits for its fills and
-    /// write-backs in flight to end, up to `PIN_WAIT` (killably); ENOMEM
-    /// after that.
-    fn pin_room(&self, want: u64) -> Result<u64, Scan> {
+    /// Reserves up to `want` pages of this object's instance's pins
+    /// (`pin_fill`, `pin_dirty`) in one atomic step, so concurrent fills
+    /// cannot together pass the limit; the caller returns what it did not
+    /// pin (`unreserve_pins`). If none are left, it waits for the
+    /// instance's fills and write-backs in flight to end, up to `PIN_WAIT`
+    /// (killably); ENOMEM after that.
+    fn reserve_pins(&self, want: u64) -> Result<u64, Scan> {
+        let Some(counts) = self.counts() else { return Ok(want) };
         let deadline = crate::time::now() + PIN_WAIT;
         loop {
-            let pinned = self.counts().map_or(0, |c| c.pinned.load(Ordering::Relaxed));
-            let room = want.min(CacheCounts::pinned_limit().saturating_sub(pinned));
+            let limit = CacheCounts::pinned_limit();
+            let mut room = 0;
+            let _ = counts.pinned.try_update(Ordering::AcqRel, Ordering::Acquire, |pinned| {
+                room = want.min(limit.saturating_sub(pinned));
+                (room > 0).then_some(pinned + room)
+            });
             if room > 0 {
                 return Ok(room);
             }
@@ -1550,9 +1563,12 @@ impl PageCache {
             Ok((start, stop - start))
         };
         let (start, count) = find(&self.state.lock())?;
-        let count = self.pin_room(count)?;
+        let reserved = self.reserve_pins(count)?;
         let mut frames = Vec::new();
-        frames.try_reserve_exact(count as usize).map_err(|_| Scan::Errno(ENOMEM))?;
+        if frames.try_reserve_exact(reserved as usize).is_err() {
+            self.unreserve_pins(reserved);
+            return Err(Scan::Errno(ENOMEM));
+        }
         // Frames from free memory or reclaimed cache pages (no cache lock
         // held); a shorter run will do. Without any, the fill waits for
         // reclaim to make progress (address spaces busy, mapped pages used
@@ -1560,7 +1576,7 @@ impl PageCache {
         // in the way: then the pager, which may be this very thread, is
         // told (ENOMEM) and writes them back first.
         let mut tries = 0;
-        while frames.len() < count as usize {
+        while frames.len() < reserved as usize {
             match new_frame() {
                 Some(frame) => {
                     frame_bytes(frame).fill(0);
@@ -1586,6 +1602,7 @@ impl PageCache {
             taken += 1;
         }
         self.pinned_added(taken as u64);
+        self.unreserve_pins(reserved - taken as u64);
         st.charged += taken as u64;
         let wake = st.changed(start, start + taken as u64);
         drop(st);
@@ -1668,10 +1685,14 @@ impl PageCache {
             return Err(Scan::Errno(EINVAL));
         }
         let end = first.saturating_add(window);
-        let room = self.pin_room(window.min(MAX_RUN))?;
+        let room = self.reserve_pins(window.min(MAX_RUN))?;
         let mut frames = Vec::new();
-        frames.try_reserve_exact(room as usize).map_err(|_| Scan::Errno(ENOMEM))?;
-        let (start, size) = {
+        if frames.try_reserve_exact(room as usize).is_err() {
+            self.unreserve_pins(room);
+            return Err(Scan::Errno(ENOMEM));
+        }
+        let mut newly = 0;
+        let run = (|| {
             let mut st = self.state.lock();
             if st.dirty == 0 {
                 return Err(Scan::Errno(ENOENT));
@@ -1688,15 +1709,20 @@ impl PageCache {
                 }
                 page.dirty = false;
                 if page.pins == 0 {
-                    self.pinned_added(1);
+                    newly += 1;
                 }
                 page.pins += 1;
                 frames.push(page.frame);
             }
             let Some(start) = start else { return Err(Scan::Errno(ENOENT)) };
             st.dirty -= (frames.len() as u64).min(st.dirty);
-            (start, size)
-        };
+            Ok((start, size))
+        })();
+        // Pinned now: the pages that were not before (the reservation
+        // counted them for the instance); the rest of it goes back.
+        self.pinned_added(newly);
+        self.unreserve_pins(room - newly);
+        let (start, size) = run?;
         self.dirty_removed(frames.len() as u64);
         memory::with_frames(|f| frames.iter().for_each(|&frame| f.share(frame)));
         let pages: Vec<u64> = (start..start + frames.len() as u64).collect();
@@ -2057,12 +2083,13 @@ impl Mappers {
 /// write back; above a fifth the storing thread waits for them (up to
 /// `THROTTLE` at a time; never a pager's own thread, which does the
 /// writing).
-pub fn balance_dirty() {
+pub fn balance_dirty(dirtied: Option<&PageCache>) {
     let limit = memory::commit_stats().1;
     let (background, hard) = (limit / BACKGROUND, limit / HARD);
-    // The caller's instance's share of the dirty pages.
-    let own = crate::process::linux::cache_counts();
-    let own_over = || own.as_ref().is_some_and(|c| c.dirty.load(Ordering::Relaxed) > CacheCounts::dirty_limit());
+    // The share of the instance that owns the file the store dirtied (it
+    // was charged for the page, whoever stored).
+    let own = dirtied.and_then(PageCache::counts);
+    let own_over = || own.is_some_and(|c| c.dirty.load(Ordering::Relaxed) > CacheCounts::dirty_limit());
     // Committed memory and the cache pages reclaim cannot drop together
     // beyond the limit: the frames promised could not all be had.
     let crowding = || {

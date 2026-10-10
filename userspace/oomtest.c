@@ -270,27 +270,46 @@ static long now_ms(void) {
     return ts.tv_sec * 1000L + ts.tv_nsec / 1000000;
 }
 
-/* One writer cannot fill memory with dirty pages: its tree's share is a
- * tenth of the commit limit, beyond which it waits for write-back (as
- * Linux's balance_dirty_pages), and it finishes. */
+/* Writers cannot fill memory with dirty pages: their tree's share is a
+ * tenth of the commit limit, beyond which they wait for write-back (as
+ * Linux's balance_dirty_pages), also four writing at once (each at most a
+ * chunk beyond it), and they finish. */
+#define WRITERS 4
 static void dirty_share(void) {
-    const char *path = "/data/oomtest.share";
-    static char chunk[64 * 1024];
-    memset(chunk, 's', sizeof chunk);
     long share = meminfo("CommitLimit:") / 10, most = 0;
-    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    volatile int *done = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    *done = 0;
     long t = now_ms();
-    int good = fd >= 0;
-    for (int i = 0; good && i < 32 * 16; i++) {
-        good = write(fd, chunk, sizeof chunk) == (ssize_t)sizeof chunk;
+    pid_t kids[WRITERS];
+    for (int w = 0; w < WRITERS; w++) {
+        if ((kids[w] = fork()) == 0) {
+            char path[64];
+            snprintf(path, sizeof path, "/data/oomtest.share%d", w);
+            static char chunk[64 * 1024];
+            memset(chunk, 's', sizeof chunk);
+            int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+            int good = fd >= 0;
+            for (int i = 0; good && i < 8 * 16; i++) good = write(fd, chunk, sizeof chunk) == (ssize_t)sizeof chunk;
+            __atomic_add_fetch(done, 1, __ATOMIC_SEQ_CST);
+            _exit(good ? 0 : 1);
+        }
+    }
+    while (*done < WRITERS) {
         long d = meminfo("Dirty:");
         if (d > most) most = d;
     }
+    int good = 1;
+    for (int w = 0; w < WRITERS; w++) {
+        int st = -1;
+        waitpid(kids[w], &st, 0);
+        good &= WIFEXITED(st) && WEXITSTATUS(st) == 0;
+        char path[64];
+        snprintf(path, sizeof path, "/data/oomtest.share%d", w);
+        unlink(path);
+    }
     t = now_ms() - t;
-    printf("dirty share: %ld kB at most of %ld kB allowed, 32 MiB written in %ld ms\n", most, share, t);
-    check("a writer's dirty pages stay within its share", good && most <= share + 4096);
-    close(fd);
-    unlink(path);
+    printf("dirty share: %ld kB at most of %ld kB allowed, 4 x 8 MiB written at once in %ld ms\n", most, share, t);
+    check("writers' dirty pages stay within their tree's share", good && most <= share + WRITERS * 1024);
 }
 
 /* A writer throttled because dirty pages crowd out committed memory (all
