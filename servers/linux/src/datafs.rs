@@ -83,9 +83,12 @@
 //! are missing again and their waiters ask again (`MO_FILLED_AGAIN`; a
 //! program's own read fills them on the new channel), a backing is promised
 //! on the new one, a write-back's pages are dirty again and written on the
-//! new channel. A channel whose revalidation cannot finish (it dies, or
-//! diskfs cannot answer) is not installed and marks nothing stale: the next
-//! use tries again. Before anyone uses the new channel, the
+//! new channel (whatever error a request got while diskfs was going: none of it
+//! is about the file). If the worker cannot connect, what waits for it fails
+//! at once (EIO, SIGBUS for a mapping). A channel whose revalidation cannot
+//! finish (it dies) is not installed and marks nothing stale: the next use
+//! tries again; an inode diskfs keeps failing to read (`REVALIDATE_TRIES`)
+//! is stale. Before anyone uses the new channel, the
 //! inodes in use are named again (`STAT`, by handle) to hold them in the new
 //! diskfs, unlinked open files included: the new diskfs kept them on ext2's
 //! orphan list for us until we did (or closed the old channel, which comes
@@ -527,17 +530,25 @@ pub fn reconnect_if_asked() {
         return;
     }
     let dead = CLIENT.lock().as_ref().is_none_or(|c| c.is_dead());
-    if dead {
-        // (A failure leaves it to the next use; what waits fails then.)
-        let _ = client();
-    }
-    // What the pager left: done here (the worker may connect).
+    let connected = !dead || client().is_ok();
+    // What the pager left: done here (the worker may connect); failed at once if diskfs
+    // cannot be reached (not after another wait for it each).
     let work = core::mem::take(&mut *LATER.lock());
     for w in work {
-        match w {
-            Later::Page(key, offset) => page(key, offset),
-            Later::Mkwrite(key, offset) => mkwrite(key, offset),
-            Later::Sync(ticket) => sync_event(ticket),
+        match (w, connected) {
+            (Later::Page(key, offset), true) => page(key, offset),
+            (Later::Mkwrite(key, offset), true) => mkwrite(key, offset),
+            (Later::Sync(ticket), true) => sync_event(ticket),
+            (Later::Page(key, offset), false) => fail_page(key, offset),
+            (Later::Mkwrite(key, offset), false) => {
+                if let Some(object) = by_key(key).and_then(|i| *i.object.lock()) {
+                    syscall(SYS_MO_BACKED, [object, offset, offset, 0, 0, 0]);
+                }
+            }
+            (Later::Sync(ticket), false) => {
+                log("/data: diskfs cannot be reached; the cache is not written back");
+                syscall(SYS_SYNC_DONE, [ticket, 0, 0, 0, 0, 0]);
+            }
         }
     }
     // And the inodes whose release waited for a channel.
@@ -552,6 +563,9 @@ pub fn sync_event(ticket: u64) {
     syscall(SYS_SYNC_DONE, [ticket, 0, 0, 0, 0, 0]);
 }
 
+/// How often revalidation asks for an inode diskfs fails to read before it is stale.
+const REVALIDATE_TRIES: u32 = 3;
+
 /// After diskfs came back: the inodes in use are held again or stale.
 fn revalidate(c: &Client) -> Result<(), i64> {
     let _names = NAMES.write()?;
@@ -563,16 +577,23 @@ fn revalidate(c: &Client) -> Result<(), i64> {
         // Only diskfs's answer counts: a channel that fails (it died, or timed out) or an
         // I/O error says nothing about the file, and the revalidation is given up (the new
         // channel is not installed).
-        let r = c.call(Request::Stat { ino: inode.node() }.encode(0))?;
-        let same = match r.status {
-            0 => {
-                let s = fsring::Stat::from_values(&r.values);
-                s.mode & vfs::S_IFMT == inode.kind && s.generation == inode.generation
+        let mut same = None;
+        for _ in 0..REVALIDATE_TRIES {
+            let r = c.call(Request::Stat { ino: inode.node() }.encode(0))?;
+            match r.status {
+                0 => {
+                    let s = fsring::Stat::from_values(&r.values);
+                    same = Some(s.mode & vfs::S_IFMT == inode.kind && s.generation == inode.generation);
+                }
+                // Gone: freed, or its number another file's.
+                s if s == -fsring::errno::ESTALE => same = Some(false),
+                // (diskfs cannot read it now: asked again, a few times.)
+                _ => continue,
             }
-            // Gone: freed, or its number another file's.
-            s if s == -fsring::errno::ESTALE => false,
-            _ => return Err(EIO),
-        };
+            break;
+        }
+        // One diskfs keeps failing to read is stale (the others go on).
+        let same = same.unwrap_or(false);
         if !same {
             inode.stale.store(true, Ordering::Relaxed);
         }
@@ -634,7 +655,8 @@ fn status(c: &Completion) -> Result<i64, i64> {
 /// A request to diskfs and its completion; one that says the inode it names is gone
 /// (ESTALE: freed, or its number another file's) makes that inode stale here.
 fn call(c: &Client, d: fsring::Desc) -> Result<Completion, i64> {
-    let r = c.call(d)?;
+    // (A channel that fails, diskfs gone: EIO for programs.)
+    let r = c.call(d).map_err(|_| EIO)?;
     // (A RENAME names two directories: which one is gone is not said, so neither is
     // marked; the next request on the gone one says.)
     if r.status == -fsring::errno::ESTALE && d.op != fsring::op::RENAME {
@@ -688,6 +710,7 @@ fn found(ino: u64, mode: u64, generation: u64) -> Result<Arc<DInode>, i64> {
             t.dirty.remove(&ino);
             // An armed test failure was the replaced inode's.
             let _ = FAIL_MKWRITE.compare_exchange(ino as u64, 0, Ordering::Relaxed, Ordering::Relaxed);
+            let _ = FAIL_FILL.compare_exchange(ino as u64, 0, Ordering::Relaxed, Ordering::Relaxed);
         }
         None => {}
     }
@@ -1202,7 +1225,11 @@ fn fill_rounds(inode: &Arc<DInode>, index: u64, want: u64) -> Result<bool, i64> 
 fn fill_once(inode: &Arc<DInode>, index: u64, want: u64) -> Result<bool, i64> {
     live(inode)?;
     let object = object(inode)?;
-    let c = client()?;
+    // (No channel now, diskfs away: `ENOTCONN`, as when it dies under a read.)
+    let c = client().map_err(|e| if channel_died() { ENOTCONN } else { e })?;
+    if FAIL_FILL.compare_exchange(inode.ino as u64, 0, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+        return Err(ENOTCONN);
+    }
     let end = index.saturating_add(window(inode, index, want));
     inode.fills.fetch_add(1, Ordering::AcqRel);
     let (cursor, pinned, any, failed) = (Cell::new(index), Cell::new(0u64), Cell::new(false), Cell::new(None));
@@ -1220,8 +1247,10 @@ fn fill_once(inode: &Arc<DInode>, index: u64, want: u64) -> Result<bool, i64> {
             let g = match grant_run(&c, object, at, end, GRANT_WRITE | GRANT_FILL, &mut out) {
                 Ok(g) => g,
                 Err(e) => {
+                    // (A grant refused because diskfs is gone: the kernel left the pages
+                    // missing, to be asked for again.)
                     if e != ENOENT && !any.get() {
-                        failed.set(Some(e));
+                        failed.set(Some(if c.is_dead() { ENOTCONN } else { e }));
                     }
                     return Next::Done;
                 }
@@ -1651,18 +1680,29 @@ pub fn page(key: u64, offset: u64) {
     // unknown key has no handle left to answer with, and the kernel ended
     // the waits for it at its last handle (`PageCache::orphan`).
     let Some(inode) = by_key(key) else { return };
-    let filled = fill(&inode, index, 1);
-    if filled == Err(ENOTCONN) {
-        // diskfs died under it: the pages are missing again and their waiters ask again
-        // (the next channel brings them; the worker connects).
-        reconnect_later();
-        return;
+    let mut filled = fill(&inode, index, 1);
+    if matches!(filled, Err(e) if e == ENOTCONN || channel_died()) {
+        // diskfs is away, or died under it (whatever the error says: none of it is about
+        // the file): the next channel brings the page. The pager leaves it to the worker,
+        // which connects; on the worker (or with a new channel there already) once more.
+        match later(Later::Page(key, offset)) {
+            Ok(()) => return,
+            Err(_) => filled = fill(&inode, index, 1),
+        }
     }
     if filled.is_err() {
         // Whoever waits gets EIO (a mapping SIGBUS).
         if let Some(h) = *inode.object.lock() {
             syscall(SYS_MO_FILLED, [h, index * PAGE, 1, 0, 0, 0]);
         }
+    }
+}
+
+/// Page `offset` of the object `key` cannot be brought: whoever waits gets EIO (a mapping
+/// SIGBUS).
+fn fail_page(key: u64, offset: u64) {
+    if let Some(h) = by_key(key).and_then(|i| *i.object.lock()) {
+        syscall(SYS_MO_FILLED, [h, offset / PAGE * PAGE, 1, MO_FILLED_FAILED, 0, 0]);
     }
 }
 
@@ -1908,6 +1948,7 @@ fn evict(ino: u32, key: u64) {
         // An armed test failure is this inode's, not a later file's that
         // gets its number.
         let _ = FAIL_MKWRITE.compare_exchange(ino as u64, 0, Ordering::Relaxed, Ordering::Relaxed);
+        let _ = FAIL_FILL.compare_exchange(ino as u64, 0, Ordering::Relaxed, Ordering::Relaxed);
         if let Some((d, _, n)) = inode.link.lock().take() {
             if t.names.get(&(d, n.clone())) == Some(&ino) {
                 t.names.remove(&(d, n));
@@ -1943,6 +1984,18 @@ pub fn closing() {
 }
 
 // ----------------------------------------------------------- self-test
+
+/// The inode whose next fill fails as if diskfs died under it (`TEST_FILL_GONE`; 0: none).
+static FAIL_FILL: AtomicU64 = AtomicU64::new(0);
+
+/// `TEST_FILL_GONE`.
+pub fn fail_next_fill(ino: u64) -> i64 {
+    if ino > u32::MAX as u64 {
+        return -EINVAL;
+    }
+    FAIL_FILL.store(ino, Ordering::Relaxed);
+    0
+}
 
 /// The inode whose next backing `mkwrite` fails (`TEST_MKWRITE_FAIL`; 0:
 /// none).

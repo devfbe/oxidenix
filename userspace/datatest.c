@@ -29,6 +29,9 @@
 #define PG 4096
 /* restricted::TEST_KILL_SERVER (test mode): kills the kernel's server `name`. */
 #define TEST_KILL_SERVER 1523
+/* restricted::TEST_FILL_GONE (test mode): the next fill of inode `ino` fails as if diskfs
+ * died under it. */
+#define TEST_FILL_GONE 1525
 #define MIB (1024 * 1024L)
 
 static int failures;
@@ -705,7 +708,7 @@ static void orphan_survives_diskfs_restart(void) {
  * more files than the server keeps unused.) */
 static void mapping_across_diskfs_restart(void) {
     const char *path = "/data/datatest.mapped";
-    enum { PAGES = 64, PUSH = 600 };
+    enum { PAGES = 2048, PUSH = 600 };
     unlink(path);
     int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
     static char page[PG];
@@ -723,7 +726,20 @@ static void mapping_across_diskfs_restart(void) {
     }
     fd = open(path, O_RDWR);
     char *map = mmap(NULL, PAGES * PG, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    /* A child reads the whole mapping in order while diskfs is killed: fills in flight then,
+     * and asked for while it is away, all go through. */
+    pid_t reader = fork();
+    if (reader == 0) {
+        for (long i = 0; i < PAGES; i++)
+            if ((unsigned char)map[i * PG + 5] != pattern(i * PG + 5, 11)) _exit(1);
+        _exit(0);
+    }
+    usleep(2000);
     long killed = syscall(TEST_KILL_SERVER, "diskfs");
+    int status = -1;
+    waitpid(reader, &status, 0);
+    int read_through = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    if (!read_through) printf("    (the reader: status %#x)\n", status);
     volatile int faulted = 0, right = map != MAP_FAILED;
     got = 0;
     if (right && sigsetjmp(env, 1) == 0) {
@@ -745,7 +761,25 @@ static void mapping_across_diskfs_restart(void) {
     }
     rmdir("/data/datatest.push");
     unlink(path);
-    check("a mapping's faults right after diskfs died: pages brought, no SIGBUS", killed == 0 && !faulted && right);
+    check("a mapping read while diskfs is killed: every page brought, no SIGBUS", killed == 0 && read_through);
+    /* A fill that fails because diskfs went (made so: TEST_FILL_GONE) is tried again,
+     * never SIGBUS: a page of a hole (missing from the cache) after the file grew. */
+    {
+        int hf = open("/data/datatest.gone", O_RDWR | O_CREAT | O_TRUNC, 0644);
+        struct stat hs;
+        int armed = hf >= 0 && ftruncate(hf, 16 * PG) == 0 && fstat(hf, &hs) == 0 && syscall(TEST_FILL_GONE, (long)hs.st_ino) == 0;
+        volatile char *hm = armed ? mmap(NULL, 16 * PG, PROT_READ, MAP_SHARED, hf, 0) : MAP_FAILED;
+        volatile int zero = 0, bus = 0;
+        got = 0;
+        if (hm != MAP_FAILED && sigsetjmp(env, 1) == 0) zero = hm[5 * PG] == 0;
+        else bus = 1;
+        syscall(TEST_FILL_GONE, 0L);
+        if (hm != MAP_FAILED) munmap((void *)hm, 16 * PG);
+        close(hf);
+        unlink("/data/datatest.gone");
+        check("a fill that failed as diskfs went is tried again: no SIGBUS", armed && zero && !bus);
+    }
+    check("a mapping's faults right after diskfs died: pages brought, no SIGBUS", !faulted && right);
     check("... and a store into a clean page backed, on the device after msync", stored);
 }
 

@@ -975,3 +975,8 @@ pub const TEST_KILL_SERVER: u64 = 1523;
 /// that a requeue's wakes spent on such waiters still move what it asked
 /// for. Test mode only; a program's call is the server's to pass on.
 pub const TEST_FUTEX_WATCH: u64 = 1524;
+/// `(ino)`: the next fill of the /data file with inode number `ino` fails as
+/// if diskfs died under it (the Linux server's own call, never the kernel's):
+/// a page a mapping waits for is still brought (on the next try), never
+/// SIGBUS. Inode 0 disarms it. Test mode only.
+pub const TEST_FILL_GONE: u64 = 1525;

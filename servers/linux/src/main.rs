@@ -236,9 +236,10 @@ fn dispatch(s: &mut State) -> i64 {
         // The test hooks reach beyond the caller (the instance's test
         // objects, the test service, /data files, the server's heap and
         // locks): only for the self-tests.
-        TEST_MAP..=TEST_FUTEX_WATCH if !test_mode() => -ENOSYS,
+        TEST_MAP..=TEST_FILL_GONE if !test_mode() => -ENOSYS,
         TEST_MAP..=TEST_CACHED => test(s.rax, s.rdi),
         TEST_MKWRITE_FAIL => datafs::fail_next_mkwrite(s.rdi),
+        TEST_FILL_GONE => datafs::fail_next_fill(s.rdi),
         TEST_SLEEP_LOCKED => match TEST_SLEEP_LOCK.lock() {
             Ok(_held) => {
                 let until = (syscall(SYS_CLOCK_READ, [1, 0, 0, 0, 0, 0]).max(0) as u64).saturating_add(s.rdi);

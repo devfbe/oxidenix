@@ -497,9 +497,11 @@ impl Channel {
         match self.enter(object, first, frames, writable, count) {
             Ok(id) => Ok((id, first, count, size)),
             Err(e) => {
-                // Nobody will fill or write them: pending pages go again,
-                // dirty ones are dirty again.
-                let _ = if fill { object.filled(first, count, crate::fs::cache::Filled::Failed) } else { object.redirty(first, count) };
+                // Nobody will fill or write them: pending pages go again (missing, to be
+                // asked for again, when the service is gone: that says nothing about the
+                // file), dirty ones are dirty again.
+                let outcome = if e == EPIPE { crate::fs::cache::Filled::Again } else { crate::fs::cache::Filled::Failed };
+                let _ = if fill { object.filled(first, count, outcome) } else { object.redirty(first, count) };
                 Err(Scan::Errno(e))
             }
         }
