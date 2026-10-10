@@ -518,7 +518,7 @@ impl Drop for Gather<'_> {
 
 impl AddressSpace {
     pub fn new() -> Option<Self> {
-        let l4 = memory::with_frames(|f| UserFrames(f).allocate_frame())?;
+        let l4 = memory::user_frame()?;
         let table = table_at(l4);
         let kernel = table_at(memory::kernel_l4());
         for i in 0..256 {
@@ -1460,14 +1460,16 @@ impl AddressSpace {
     /// (reclaim under pressure), used entries are removed too. Returns the
     /// entries removed.
     pub fn reclaim_file_pages(&mut self, cache: &PageCache, pages: &[(u64, PhysFrame)], young: &mut [bool], force: bool) -> u64 {
-        let areas: alloc::vec::Vec<(u64, u64, u64)> = self
-            .vmas
-            .values()
-            .filter_map(|v| {
-                let (c, first) = v.file()?;
-                core::ptr::eq(Arc::as_ptr(c), cache).then_some((v.start, v.pages(), first))
-            })
-            .collect();
+        let ours = |v: &Vma| v.file().filter(|(c, _)| core::ptr::eq(Arc::as_ptr(c), cache)).map(|(_, first)| (v.start, v.pages(), first));
+        let mut areas = alloc::vec::Vec::new();
+        // (No memory to list them: nothing is looked at, the pages stay.)
+        if areas.try_reserve(self.vmas.values().filter(|v| ours(v).is_some()).count()).is_err() {
+            for y in young.iter_mut() {
+                *y = true;
+            }
+            return 0;
+        }
+        areas.extend(self.vmas.values().filter_map(ours));
         let mut gather = Gather::new(&self.tlb);
         let (mut removed, mut charged) = (0u64, 0u64);
         for (start, len, first) in areas {
@@ -1481,14 +1483,16 @@ impl AddressSpace {
                 if e.addr() != frame.start_address() {
                     continue;
                 }
-                let flags = e.flags();
-                if flags.contains(PageTableFlags::ACCESSED) && !force {
+                // The accessed bit taken off atomically: the CPU may set it
+                // (or the dirty bit) at any moment through another TLB.
+                let word = unsafe { &*(e as *mut PageTableEntry as *const core::sync::atomic::AtomicU64) };
+                if !force && word.fetch_and(!PageTableFlags::ACCESSED.bits(), Ordering::AcqRel) & PageTableFlags::ACCESSED.bits() != 0 {
                     // No flush: a TLB entry still holding the bit only
                     // hides further uses until it goes (as on Linux).
-                    e.set_flags(flags - PageTableFlags::ACCESSED);
                     young[i] = true;
                     continue;
                 }
+                let flags = e.flags();
                 charged += flags.contains(CHARGED) as u64;
                 e.set_unused();
                 gather.add(va, frame);

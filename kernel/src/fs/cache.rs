@@ -202,11 +202,15 @@ struct Page {
     backed: u16,
     /// The pager was asked to back it (`Pager::mkwrite`), no answer yet.
     mkwrite: bool,
+    /// Taken by a reclaim that walks its mappings (`shrink`, as Linux's
+    /// isolated pages): other reclaims leave it alone meanwhile (their own
+    /// reference would keep each other from dropping it).
+    isolated: bool,
 }
 
 impl Page {
     fn new(frame: PhysFrame) -> Page {
-        Page { frame, referenced: true, dirty: false, pins: 0, pending: false, backed: 0, mkwrite: false }
+        Page { frame, referenced: true, dirty: false, pins: 0, pending: false, backed: 0, mkwrite: false, isolated: false }
     }
 }
 
@@ -1867,6 +1871,9 @@ impl PageCache {
                 for (&index, page) in st.pages.range_mut(start..).take(take) {
                     looked += 1;
                     next = index + 1;
+                    if page.isolated {
+                        continue;
+                    }
                     if page.referenced && !force {
                         page.referenced = false;
                         continue;
@@ -1884,6 +1891,7 @@ impl PageCache {
                         // copy of this very file page), so an entry that
                         // holds it can only be a mapping of this page.
                         frames.share(page.frame);
+                        page.isolated = true;
                         mapped.push((index, page.frame));
                     }
                 }
@@ -1903,7 +1911,7 @@ impl PageCache {
                     // `reclaim_file_pages` wants it.)
                     // A space that is busy keeps its entries: their pages
                     // stay (still shared) and the next look tries again.
-                    self.for_each_mapper(|mm| {
+                    self.for_each_mapper_reclaim(|mm| {
                         if let Some(mut space) = mm.try_lock() {
                             space.reclaim_file_pages(self, &mapped, &mut young, force);
                         }
@@ -1927,6 +1935,7 @@ impl PageCache {
                     let before = frames.len();
                     for (&(index, frame), &kept) in mapped.iter().zip(&young) {
                         let Some(page) = st.pages.get_mut(&index).filter(|p| p.frame == frame) else { continue };
+                        page.isolated = false;
                         if kept {
                             page.referenced = true;
                         } else if !page.dirty && !page.pending && page.pins == 0 {
@@ -1935,6 +1944,14 @@ impl PageCache {
                         }
                     }
                     st.charged -= (frames.len() - before) as u64;
+                } else {
+                    // (No memory to walk them: they go back as they were.)
+                    let mut st = self.state.lock();
+                    for &(index, frame) in &mapped {
+                        if let Some(page) = st.pages.get_mut(&index).filter(|p| p.frame == frame) {
+                            page.isolated = false;
+                        }
+                    }
                 }
                 // Reclaim's own references go (a page dropped above goes
                 // with the cache's, freed below).
@@ -2063,6 +2080,26 @@ impl PageCache {
     /// overtakes them). It goes on after the sequence number it visited
     /// last, not at an index, so dead entries may be removed meanwhile
     /// (by registrations, by other walks) without making it skip one.
+    /// `for_each_mapper` for reclaim: an address space whose last
+    /// reference it held is not dropped here (`defer_drop`).
+    fn for_each_mapper_reclaim(&self, mut f: impl FnMut(&Mm)) {
+        let mut last = None;
+        loop {
+            let entry = {
+                let mappers = self.mappers.lock();
+                let i = last.map_or(0, |seq| mappers.list.partition_point(|&(s, _)| s <= seq));
+                mappers.list.get(i).map(|(seq, mm)| (*seq, mm.upgrade()))
+            };
+            let Some((seq, mm)) = entry else { break };
+            last = Some(seq);
+            if let Some(mm) = mm {
+                f(&mm);
+                defer_drop(Deferred::Space(mm));
+            }
+        }
+        self.mappers.lock().compact();
+    }
+
     fn for_each_mapper(&self, mut f: impl FnMut(&Mm)) {
         let mut last = None;
         loop {
@@ -2180,6 +2217,55 @@ fn ask_pagers(pages: u64) {
     }
 }
 
+/// What reclaim held the last reference of: dropping it runs an address
+/// space's or a cache's teardown (`AddressSpace::drop` tells the Linux
+/// server's instance, `PageCache::drop` frees frames), which must not run
+/// within an allocation that reclaimed (its caller may hold any lock).
+enum Deferred {
+    Space(Arc<Mm>),
+    Cache(Arc<PageCache>),
+}
+
+/// A teardown left for later: the value whose last reference went (held
+/// only to be dropped).
+#[allow(dead_code)]
+enum Owned {
+    Space(Mm),
+    Cache(PageCache),
+}
+
+/// Teardowns left for the background reclaimer (`drop_deferred`).
+static DEFERRED: IrqSpinLock<Vec<Owned>> = IrqSpinLock::new(Vec::new());
+
+/// Lets go of reclaim's reference `d`; if it was the last (atomically, as
+/// `Arc::into_inner` decides), the teardown is left to the background
+/// reclaimer (done here only if the list has no room).
+fn defer_drop(d: Deferred) {
+    let owned = match d {
+        Deferred::Space(mm) => Arc::into_inner(mm).map(Owned::Space),
+        Deferred::Cache(cache) => Arc::into_inner(cache).map(Owned::Cache),
+    };
+    let Some(d) = owned else { return };
+    let mut list = DEFERRED.lock();
+    if list.try_reserve(1).is_ok() {
+        list.push(d);
+        drop(list);
+        memory::wake_reclaimer();
+        return;
+    }
+    drop(list);
+    drop(d);
+}
+
+/// Runs the teardowns reclaim left (the background reclaimer, which holds
+/// no lock).
+pub fn drop_deferred() {
+    loop {
+        let Some(d) = DEFERRED.lock().pop() else { return };
+        drop(d);
+    }
+}
+
 /// Drops up to `want` reclaimable pages of cached objects, visiting the
 /// caches in turn; returns how many it dropped. Called by `memory` when a
 /// commit or a new cache page needs room, never with a cache lock held.
@@ -2207,9 +2293,11 @@ fn reclaim(want: u64, force: bool) -> u64 {
                 }
                 list[NEXT.fetch_add(1, Ordering::Relaxed) % list.len()].upgrade()
             };
-            // (The last reference may go here, outside the list's lock.)
             if let Some(cache) = cache {
                 freed += cache.shrink(want - freed, unmap, force, &mut budget);
+                // (Its last reference, if this was it, goes where no
+                // allocation waits on reclaim: `defer_drop`.)
+                defer_drop(Deferred::Cache(cache));
             }
             if freed >= want {
                 break;

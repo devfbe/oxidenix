@@ -432,14 +432,88 @@ fn low_watermark(f: &PhysFrameAllocator) -> u64 {
 /// nothing to drop now. Never called with the frames locked.
 pub fn user_frame() -> Option<PhysFrame> {
     loop {
-        let frame = with_frames(|f| {
-            if f.user_may_take(1 + low_watermark(f)) { frame::UserFrames(f).allocate_frame() } else { None }
+        let (frame, low) = with_frames(|f| {
+            let frame = if f.user_may_take(1 + low_watermark(f)) { frame::UserFrames(f).allocate_frame() } else { None };
+            (frame, !f.user_may_take(low_watermark(f)))
         });
+        if low {
+            wake_reclaimer();
+        }
         if frame.is_some() {
             return frame;
         }
         if reclaim_for(1, false) == 0 {
             return with_frames(|f| frame::UserFrames(f).allocate_frame());
+        }
+    }
+}
+
+/// The background reclaimer (Linux's kswapd): woken when the free frames
+/// above the kernel's reserve come below the low watermark, it reclaims
+/// cache pages until they are above the high one (twice the low), so the
+/// allocations that cannot reclaim (page tables made with the frames
+/// locked, a fork's copies, kernel stacks, anything with interrupts off)
+/// find frames without depending on direct reclaim, which a fruitless
+/// reclaim pauses for a moment. It holds no lock while it reclaims, so it
+/// can unmap pages from every address space that is not busy.
+static RECLAIMER_WANTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+fn reclaimer_chan() -> usize {
+    &RECLAIMER_WANTED as *const _ as usize
+}
+
+/// Wakes the background reclaimer (cheap when it is awake already).
+pub fn wake_reclaimer() {
+    if !RECLAIMER_WANTED.swap(true, core::sync::atomic::Ordering::AcqRel) {
+        crate::process::sched::wakeup(reclaimer_chan());
+    }
+}
+
+/// Starts the background reclaimer's kernel thread.
+pub fn start_reclaimer() -> Result<(), i64> {
+    crate::process::sched::spawn_kernel_thread("reclaim", reclaimer)
+}
+
+fn reclaimer() -> ! {
+    loop {
+        let wait = crate::process::sched::prepare_to_wait(reclaimer_chan());
+        if !RECLAIMER_WANTED.load(core::sync::atomic::Ordering::Acquire) {
+            wait.sleep();
+            continue;
+        }
+        drop(wait);
+        crate::fs::cache::drop_deferred();
+        // Up to the high watermark; after a fruitless round also pages used
+        // lately; a little rest when even that drops nothing (write-back,
+        // busy address spaces), then it looks again while still low.
+        let mut force = false;
+        loop {
+            let (short, low) = with_frames(|f| {
+                let high = 2 * low_watermark(f);
+                (!f.user_may_take(high), !f.user_may_take(low_watermark(f)))
+            });
+            if !short {
+                RECLAIMER_WANTED.store(false, core::sync::atomic::Ordering::Release);
+                break;
+            }
+            let freed = RECLAIM.get().map_or(0, |reclaim| reclaim(RECLAIM_BATCH * 4, force));
+            if freed > 0 {
+                force = false;
+                continue;
+            }
+            if !force {
+                force = true;
+                continue;
+            }
+            if !low {
+                // Between the watermarks with nothing to drop: done for now.
+                RECLAIMER_WANTED.store(false, core::sync::atomic::Ordering::Release);
+                break;
+            }
+            crate::fs::cache::ask_writeback(RECLAIM_BATCH);
+            let deadline = crate::time::now() + RECLAIM_THROTTLE;
+            crate::process::sched::prepare_to_wait(reclaim_chan()).sleep_until(deadline);
+            force = false;
         }
     }
 }
@@ -453,6 +527,7 @@ pub fn ensure_user_frames(n: u64) -> bool {
         if with_frames(|f| f.user_may_take(n + low_watermark(f))) {
             return true;
         }
+        wake_reclaimer();
         if reclaim_for(n, false) == 0 {
             return with_frames(|f| f.user_may_take(n));
         }

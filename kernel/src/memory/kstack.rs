@@ -70,6 +70,11 @@ impl KernelStack {
         if charge && !super::commit(PAGES) {
             return None;
         }
+        // (Mapped with the frames locked: free frames made first, by
+        // reclaim if need be.)
+        if charge {
+            super::ensure_user_frames(PAGES + 3);
+        }
         let stack = Self::map(charge);
         if stack.is_none() && charge {
             super::uncommit(PAGES);
