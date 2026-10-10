@@ -1237,6 +1237,15 @@ enum Io {
 /// dirty pages are written back first (reclaim may drop them then); only
 /// when none is left to write it fails (ENOMEM).
 pub fn fill(inode: &Arc<DInode>, index: u64, want: u64) -> Result<bool, i64> {
+    let filled = fill_inner(inode, index, want);
+    // (`TEST_FILL_GONE` mode 2 is for the pager's `page`: no one else takes it.)
+    if !crate::local::is_pager() {
+        FORCE_LATER.store(false, Ordering::Relaxed);
+    }
+    filled
+}
+
+fn fill_inner(inode: &Arc<DInode>, index: u64, want: u64) -> Result<bool, i64> {
     match fill_rounds(inode, index, want) {
         // diskfs died under it (the pages are missing again: `FILL_AGAIN`): a program's
         // thread fills them on the next channel; the pager leaves them to their waiters,
