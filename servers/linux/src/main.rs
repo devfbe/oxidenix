@@ -377,6 +377,11 @@ fn pager() -> ! {
                 console::lost();
                 continue;
             }
+            EVENT_SERVICE_GONE => {
+                // diskfs keeps our unlinked open files for us until we name them again.
+                datafs::service_gone();
+                continue;
+            }
             EVENT_SYNC => {
                 // Another instance's sync(2), or a reboot.
                 datafs::closing();

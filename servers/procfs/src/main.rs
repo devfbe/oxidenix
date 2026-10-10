@@ -167,10 +167,12 @@ impl Chan {
         Ok(())
     }
 
-    /// Answers one request: (status, values).
+    /// Answers one request: (status, values). (Handles: every inode's
+    /// generation is 0.)
     fn execute(&mut self, request: Request) -> Result<(i64, [u64; 4]), i64> {
         match request {
             Request::Stat { ino } => {
+                let ino = node(ino)?;
                 if !tree::exists(ino) {
                     return Err(ENOENT);
                 }
@@ -182,18 +184,18 @@ impl Chan {
             Request::Lookup { dir, name } => {
                 let bytes = self.copy_in(&name)?;
                 let name = fsring::check_name(&bytes)?;
-                let ino = tree::lookup(dir, name)?;
+                let ino = tree::lookup(node(dir)?, name)?;
                 Ok((0, [ino as u64, tree::mode(ino).0 as u64, 0, 0]))
             }
             Request::Read { ino, offset, buf } => {
-                let data = tree::contents(ino)?;
+                let data = tree::contents(node(ino)?)?;
                 let start = (offset.min(data.len() as u64)) as usize;
                 let end = data.len().min(start + buf.len as usize);
                 self.copy_out(&buf, &data[start..end])?;
                 Ok(((end - start) as i64, [data.len() as u64, 0, 0, 0]))
             }
             Request::Readdir { dir, cursor, buf } => {
-                let all = tree::entries(dir)?;
+                let all = tree::entries(node(dir)?)?;
                 // At most MAX_RESULT bytes of procfs's memory, whatever the
                 // buffer (the listing goes on at the cursor).
                 let mut out = vec![0u8; (buf.len as usize).min(MAX_RESULT)];
@@ -212,6 +214,8 @@ impl Chan {
             }
             // Neither tree has symlinks (`self` is the Linux server's).
             Request::Readlink { .. } => Err(EINVAL),
+            // Two roots, known by number (`procproto::PROC_ROOT`, `SYSFS_ROOT`).
+            Request::Root => Err(EINVAL),
             Request::Statfs => {
                 let usage = Usage { block_size: PAGE as u32, ..Usage::default() };
                 Ok((0, usage.to_values()))
@@ -394,4 +398,12 @@ fn main(_args: Vec<&'static str>) -> i32 {
         }
         service.run();
     }
+}
+
+/// The inode a handle names: procfs's inodes all have generation 0.
+fn node(n: fsring::Node) -> Result<u32, i64> {
+    if n.generation != 0 {
+        return Err(fsring::errno::ESTALE);
+    }
+    Ok(n.ino)
 }

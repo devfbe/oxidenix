@@ -8,16 +8,21 @@
 use crate::syscall;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::sync::atomic::AtomicU32;
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use fsring::errno::*;
-use fsring::{op, Buf, Completion, Kind, Request, Stat, Usage, SERVICE};
+use fsring::{op, Buf, Completion, Kind, Node, Request, Stat, Usage, SERVICE};
 use restricted::*;
 use ring::channel::{Header, Layout};
 use ring::{Consumer, Desc, Producer, Ring, Wait};
 
 const N: usize = fsring::SLOTS as usize;
 const PAGE: u64 = 4096;
-const ROOT: u32 = 2;
+/// The root directory's handle (asked with `ROOT` by every new channel).
+static ROOT_NODE: AtomicU64 = AtomicU64::new(0);
+
+fn root() -> Node {
+    Node::from_object(ROOT_NODE.load(Ordering::Relaxed))
+}
 /// How long a request may take before the test fails instead of hanging.
 const TIMEOUT: u64 = 10_000_000_000;
 const ETIMEDOUT: i64 = 110;
@@ -103,9 +108,16 @@ impl Client {
         let (sub, comp) = unsafe { (layout.ring::<N>(base, layout.submission), layout.ring::<N>(base, layout.completion)) };
         let c = Client { handle: h as u64, header: unsafe { Header::at(base) }, requests: Ring::new(sub).producer(), completions: Ring::new(comp).consumer(), tag: 0 };
         match syscall(SYS_CHAN_CONNECT, [c.handle, SERVICE.as_ptr() as u64, SERVICE.len() as u64, 0, 0, 0]) {
-            0 => Ok(c),
-            e => Err(e),
+            0 => {}
+            e => return Err(e),
         }
+        let mut c = c;
+        let r = c.call(Request::Root)?;
+        if r.status != 0 || r.values[0] != 2 {
+            return Err(EPROTO);
+        }
+        ROOT_NODE.store(Node::new(2, r.values[2] as u32).to_object(), Ordering::Relaxed);
+        Ok(c)
     }
 
     fn grant(&self, o: &Object, writable: bool) -> i64 {
@@ -204,18 +216,22 @@ impl Names {
     }
 }
 
-fn lookup(c: &mut Client, names: &Names, dir: u32, name: &[u8]) -> Result<u32, i64> {
+/// The handle a `LOOKUP` or `CREATE` returned.
+fn found(r: &Completion) -> Result<Node, i64> {
+    if r.status < 0 { Err(r.status) } else { Ok(Node::new(r.values[0] as u32, r.values[2] as u32)) }
+}
+
+fn lookup(c: &mut Client, names: &Names, dir: Node, name: &[u8]) -> Result<Node, i64> {
     let (name, _) = names.put(name, b"");
-    let r = c.call(Request::Lookup { dir, name })?;
-    if r.status < 0 { Err(r.status) } else { Ok(r.values[0] as u32) }
+    found(&c.call(Request::Lookup { dir, name })?)
 }
 
 /// Removes `name` from the root if it is there (left by an earlier run).
 fn remove(c: &mut Client, names: &Names, name: &[u8]) -> Result<(), i64> {
     let (n, _) = names.put(name, b"");
-    let r = c.call(Request::Unlink { dir: ROOT, name: n, is_dir: false })?;
+    let r = c.call(Request::Unlink { dir: root(), name: n, is_dir: false })?;
     if r.status == 0 && r.values[0] != 0 {
-        let r = c.call(Request::Release { ino: r.values[0] as u32 })?;
+        let r = c.call(Request::Release { ino: Node::new(r.values[0] as u32, r.values[1] as u32) })?;
         if r.status != 0 {
             return Err(r.status);
         }
@@ -223,11 +239,10 @@ fn remove(c: &mut Client, names: &Names, name: &[u8]) -> Result<(), i64> {
     Ok(())
 }
 
-fn create(c: &mut Client, names: &Names, name: &[u8]) -> Result<u32, i64> {
+fn create(c: &mut Client, names: &Names, name: &[u8]) -> Result<Node, i64> {
     remove(c, names, name)?;
     let (n, _) = names.put(name, b"");
-    let r = c.call(Request::Create { dir: ROOT, name: n, kind: Kind::File, perm: 0o644 })?;
-    if r.status < 0 { Err(r.status) } else { Ok(r.values[0] as u32) }
+    found(&c.call(Request::Create { dir: root(), name: n, kind: Kind::File, perm: 0o644 })?)
 }
 
 fn buf(grant: u32, offset: u64, len: usize) -> Buf {
@@ -265,7 +280,7 @@ pub fn run(scenario: u64) -> i64 {
 fn reading() -> Result<(), i64> {
     let mut c = Client::open().map_err(|_| 1)?;
     let names = Names::new(&c).map_err(|_| 2)?;
-    let ino = lookup(&mut c, &names, ROOT, b"README.txt").map_err(|_| 3)?;
+    let ino = lookup(&mut c, &names, root(), b"README.txt").map_err(|_| 3)?;
     let st = c.call(Request::Stat { ino }).map_err(|_| 4)?;
     check!(5, st.status == 0);
     let stat = Stat::from_values(&st.values);
@@ -285,13 +300,13 @@ fn reading() -> Result<(), i64> {
     // At and beyond the end: nothing.
     check!(14, c.status(Request::Read { ino, offset: README.len() as u64, buf: buf(g as u32, 0, 10) }) == 0);
     // The root's entries.
-    let r = c.call(Request::Readdir { dir: ROOT, cursor: 0, buf: buf(g as u32, 0, 2 * PAGE as usize) }).map_err(|_| 15)?;
+    let r = c.call(Request::Readdir { dir: root(), cursor: 0, buf: buf(g as u32, 0, 2 * PAGE as usize) }).map_err(|_| 15)?;
     check!(16, r.status > 0 && r.values[0] == 0);
     let entries = data.read(0, r.status as usize);
-    check!(17, fsring::dirents(&entries).any(|(i, t, n)| i == ino && t == fsring::TYPE_FILE && n == b"README.txt"));
-    check!(18, fsring::dirents(&entries).any(|(i, t, n)| i == ROOT && t == fsring::TYPE_DIR && n == b".."));
+    check!(17, fsring::dirents(&entries).any(|(i, t, n)| i == ino.ino && t == fsring::TYPE_FILE && n == b"README.txt"));
+    check!(18, fsring::dirents(&entries).any(|(i, t, n)| i == root().ino && t == fsring::TYPE_DIR && n == b".."));
     // A small buffer: the listing goes on at the cursor.
-    let r = c.call(Request::Readdir { dir: ROOT, cursor: 0, buf: buf(g as u32, 0, 20) }).map_err(|_| 19)?;
+    let r = c.call(Request::Readdir { dir: root(), cursor: 0, buf: buf(g as u32, 0, 20) }).map_err(|_| 19)?;
     check!(20, r.status > 0 && r.values[0] > 0);
     let u = c.call(Request::Statfs).map_err(|_| 21)?;
     let usage = Usage::from_values(&u.values);
@@ -304,14 +319,14 @@ fn reading() -> Result<(), i64> {
     // A symlink, made and read back, then gone.
     let _ = remove(&mut c, &names, b"ringtest.link");
     let (n, target) = names.put(b"ringtest.link", b"../some/target");
-    let r = c.call(Request::Create { dir: ROOT, name: n, kind: Kind::Symlink(target), perm: 0 }).map_err(|_| 23)?;
+    let r = c.call(Request::Create { dir: root(), name: n, kind: Kind::Symlink(target), perm: 0 }).map_err(|_| 23)?;
     check!(24, r.status == 0);
-    let link = r.values[0] as u32;
+    let link = found(&r).map_err(|_| 24)?;
     let r = c.call(Request::Readlink { ino: link, buf: buf(g as u32, 0, 64) }).map_err(|_| 25)?;
     check!(26, r.status == 14 && data.read(0, 14) == b"../some/target");
     check!(27, c.status(Request::Readlink { ino: link, buf: buf(g as u32, 0, 5) }) == -ERANGE);
     remove(&mut c, &names, b"ringtest.link").map_err(|_| 28)?;
-    check!(29, lookup(&mut c, &names, ROOT, b"ringtest.link") == Err(-ENOENT));
+    check!(29, lookup(&mut c, &names, root(), b"ringtest.link") == Err(-ENOENT));
     Ok(())
 }
 
@@ -377,9 +392,9 @@ fn writing() -> Result<(), i64> {
     // Rename over nothing, then remove.
     let _ = remove(&mut c, &names, b"ringtest.moved");
     let (old, new) = names.put(b"ringtest.tmp", b"ringtest.moved");
-    let r = c.call(Request::Rename { from: ROOT, name: old, to: ROOT, new_name: new }).map_err(|_| 53)?;
+    let r = c.call(Request::Rename { from: root(), name: old, to: root(), new_name: new }).map_err(|_| 53)?;
     check!(54, r.status == 0 && r.values[0] == 0);
-    check!(55, lookup(&mut c, &names, ROOT, b"ringtest.moved") == Ok(ino));
+    check!(55, lookup(&mut c, &names, root(), b"ringtest.moved") == Ok(ino));
     check!(56, c.status(Request::SetPerm { ino, perm: 0o600 }) == 0);
     let st = Stat::from_values(&c.call(Request::Stat { ino }).map_err(|_| 57)?.values);
     check!(58, st.mode & 0o7777 == 0o600);
@@ -397,7 +412,7 @@ fn writing() -> Result<(), i64> {
 fn errors() -> Result<(), i64> {
     let mut c = Client::open().map_err(|_| 70)?;
     let names = Names::new(&c).map_err(|_| 71)?;
-    let ino = lookup(&mut c, &names, ROOT, b"README.txt").map_err(|_| 72)?;
+    let ino = lookup(&mut c, &names, root(), b"README.txt").map_err(|_| 72)?;
     let data = Object::new(1).map_err(|_| 73)?;
     let rw = c.grant(&data, true);
     let ro = c.grant(&data, false);
@@ -411,23 +426,24 @@ fn errors() -> Result<(), i64> {
     check!(79, c.status(read(rw, PAGE - 10, 11)) == -EINVAL);
     check!(80, c.status(read(rw, 0, fsring::MAX_TRANSFER as usize + 1)) == -EINVAL);
     check!(81, c.status(read(ro, 0, 10)) == -EACCES);
-    for dead in [0u32, 999_999, 16_000] {
-        check!(82, c.status(Request::Stat { ino: dead }) == -ENOENT);
-        check!(83, c.status(Request::Read { ino: dead, offset: 0, buf: buf(rw, 0, 10) }) == -ENOENT);
+    // Handles of no inode in use, and of README.txt in another generation: stale.
+    for dead in [Node::new(0, 0), Node::new(999_999, 0), Node::new(16_000, 0), Node::new(ino.ino, ino.generation ^ 1)] {
+        check!(82, c.status(Request::Stat { ino: dead }) == -ESTALE);
+        check!(83, c.status(Request::Read { ino: dead, offset: 0, buf: buf(rw, 0, 10) }) == -ESTALE);
     }
-    check!(84, c.status(Request::Read { ino: ROOT, offset: 0, buf: buf(rw, 0, 10) }) == -EINVAL);
-    check!(85, lookup(&mut c, &names, ROOT, b"a/b") == Err(-EINVAL));
-    check!(86, lookup(&mut c, &names, ROOT, b"no such file") == Err(-ENOENT));
+    check!(84, c.status(Request::Read { ino: root(), offset: 0, buf: buf(rw, 0, 10) }) == -EINVAL);
+    check!(85, lookup(&mut c, &names, root(), b"a/b") == Err(-EINVAL));
+    check!(86, lookup(&mut c, &names, root(), b"no such file") == Err(-ENOENT));
 
-    check!(87, c.raw(Desc { op: op::LOOKUP, object: ROOT as u64, grant: names.grant, len: 256, ..Desc::default() }).map(|r| r.status) == Ok(-ENAMETOOLONG));
+    check!(87, c.raw(Desc { op: op::LOOKUP, object: root().to_object(), grant: names.grant, len: 256, ..Desc::default() }).map(|r| r.status) == Ok(-ENAMETOOLONG));
 
-    check!(88, c.status(Request::Readdir { dir: ROOT, cursor: 0, buf: buf(ro, 0, 100) }) == -EACCES);
+    check!(88, c.status(Request::Readdir { dir: root(), cursor: 0, buf: buf(ro, 0, 100) }) == -EACCES);
     check!(89, c.status(Request::Readdir { dir: ino, cursor: 0, buf: buf(rw, 0, 100) }) == -20); // ENOTDIR
     let (n, _) = names.put(b"README.txt", b"");
-    check!(90, c.status(Request::Create { dir: ROOT, name: n, kind: Kind::File, perm: 0o644 }) == -EEXIST);
+    check!(90, c.status(Request::Create { dir: root(), name: n, kind: Kind::File, perm: 0o644 }) == -EEXIST);
     // A write of a read-only grant is fine (the device reads it); of a
     // file that is a directory, not.
-    check!(91, c.status(Request::Write { ino: ROOT, offset: 0, buf: buf(ro, 0, 10) }) == -EINVAL);
+    check!(91, c.status(Request::Write { ino: root(), offset: 0, buf: buf(ro, 0, 10) }) == -EINVAL);
     // After all that, the channel still works.
     check!(92, c.status(Request::Stat { ino }) == 0);
     Ok(())
@@ -490,7 +506,7 @@ fn in_flight() -> Result<(), i64> {
 fn revoked_and_gone() -> Result<(), i64> {
     let mut c = Client::open().map_err(|_| 130)?;
     let names = Names::new(&c).map_err(|_| 131)?;
-    let ino = lookup(&mut c, &names, ROOT, b"README.txt").map_err(|_| 132)?;
+    let ino = lookup(&mut c, &names, root(), b"README.txt").map_err(|_| 132)?;
     let data = Object::new(2).map_err(|_| 133)?;
     let g = c.grant(&data, true);
     check!(134, g > 0);
@@ -499,7 +515,7 @@ fn revoked_and_gone() -> Result<(), i64> {
     // diskfs holds a device address of it: the revoke drains.
     check!(136, c.revoke(g) == REVOKE_DRAINING as i64);
     // Its mapping in diskfs is gone: a copy into it fails, diskfs lives.
-    check!(137, c.status(Request::Readdir { dir: ROOT, cursor: 0, buf: buf(g, 0, 100) }) == -EFAULT);
+    check!(137, c.status(Request::Readdir { dir: root(), cursor: 0, buf: buf(g, 0, 100) }) == -EFAULT);
     check!(138, c.status(Request::Stat { ino }) == 0);
     // The range the revoked grant had in diskfs goes to no other grant
     // (it stays reserved until FORGET): a copy to the stale grant faults
@@ -509,7 +525,7 @@ fn revoked_and_gone() -> Result<(), i64> {
     let g2 = c.grant(&other, true);
     check!(151, g2 > 0 && g2 != g as i64);
     check!(152, c.status(Request::Read { ino, offset: 0, buf: buf(g2 as u32, 0, 100) }) == 100);
-    check!(153, c.status(Request::Readdir { dir: ROOT, cursor: 0, buf: buf(g, 0, 2 * PAGE as usize) }) == -EFAULT);
+    check!(153, c.status(Request::Readdir { dir: root(), cursor: 0, buf: buf(g, 0, 2 * PAGE as usize) }) == -EFAULT);
     let after = other.read(0, 2 * PAGE as usize);
     check!(154, after[..100] == README[..100] && after[100..].iter().all(|&b| b == 0xee));
     check!(155, c.status(Request::Forget { grant: g2 as u32 }) == 0);
@@ -553,11 +569,11 @@ fn holds() -> Result<(), i64> {
     src.write(0, b"hello");
     let ga = a.grant(&src, false);
     check!(166, ga > 0 && a.status(Request::Write { ino: x, offset: 0, buf: buf(ga as u32, 0, 5) }) == 5);
-    check!(167, lookup(&mut b, &nb, ROOT, b"ringtest.held") == Ok(x));
+    check!(167, lookup(&mut b, &nb, root(), b"ringtest.held") == Ok(x));
     // a unlinks it and lets go; b still has it.
     let (n, _) = na.put(b"ringtest.held", b"");
-    let r = a.call(Request::Unlink { dir: ROOT, name: n, is_dir: false }).map_err(|_| 168)?;
-    check!(169, r.status == 0 && r.values[0] == x as u64);
+    let r = a.call(Request::Unlink { dir: root(), name: n, is_dir: false }).map_err(|_| 168)?;
+    check!(169, r.status == 0 && r.values[0] == x.ino as u64 && r.values[1] == x.generation as u64);
     check!(170, a.status(Request::Release { ino: x }) == 0);
     let dst = Object::new(1).map_err(|_| 171)?;
     let gb = b.grant(&dst, true);
@@ -567,20 +583,20 @@ fn holds() -> Result<(), i64> {
     check!(175, dst.read(0, 5) == b"hello");
     // b lets go: now it is freed.
     check!(176, b.status(Request::Release { ino: x }) == 0);
-    check!(177, a.status(Request::Stat { ino: x }) == -ENOENT);
+    check!(177, a.status(Request::Stat { ino: x }) == -ESTALE);
     // A channel that goes lets go of what it held. (Naming an inode holds
     // it: the checks below look from channels of their own, which go.)
     let y = create(&mut a, &na, b"ringtest.held").map_err(|_| 178)?;
-    let stat = |ino: u32| Client::open().map(|mut d| d.status(Request::Stat { ino })).unwrap_or(-1);
+    let stat = |ino: Node| Client::open().map(|mut d| d.status(Request::Stat { ino })).unwrap_or(-1);
     {
         let mut c = Client::open().map_err(|_| 179)?;
         let nc = Names::new(&c).map_err(|_| 180)?;
-        check!(181, lookup(&mut c, &nc, ROOT, b"ringtest.held") == Ok(y));
+        check!(181, lookup(&mut c, &nc, root(), b"ringtest.held") == Ok(y));
         remove(&mut a, &na, b"ringtest.held").map_err(|_| 182)?;
         check!(183, stat(y) == 0);
     }
     let deadline = now() + TIMEOUT;
-    while stat(y) != -ENOENT {
+    while stat(y) != -ESTALE {
         check!(184, now() < deadline);
         pause_ms(10);
     }
@@ -603,7 +619,7 @@ fn stalls_with_full_slots() -> Result<(), i64> {
     // Long reads (of the file the writes go to) keep the slots busy.
     const LONG: usize = 256 * 1024;
     check!(197, a.status(Request::Write { ino: f, offset: 0, buf: buf(ga as u32, 0, 128 * PAGE as usize) }) == 128 * PAGE as i64);
-    check!(198, lookup(&mut b, &nb, ROOT, b"ringtest.stall") == Ok(f));
+    check!(198, lookup(&mut b, &nb, root(), b"ringtest.stall") == Ok(f));
     let dst = Object::new((LONG as u64) / PAGE).map_err(|_| 199)?;
     let gb = b.grant(&dst, true);
     check!(207, gb > 0);
@@ -627,14 +643,14 @@ fn stalls_with_full_slots() -> Result<(), i64> {
 
 /// The channel scenario 8 leaves for scenario 9: requests waiting for room
 /// in its completion ring.
-static BLOCKED: crate::sync::Mutex<Option<(Client, u32, Vec<u64>)>> = crate::sync::Mutex::new(None);
+static BLOCKED: crate::sync::Mutex<Option<(Client, Node, Vec<u64>)>> = crate::sync::Mutex::new(None);
 
 /// Fills the completion ring and leaves as many requests waiting for room
 /// (lxtest then checks that diskfs does not spin meanwhile).
 fn block_on_room() -> Result<(), i64> {
     let mut c = Client::open().map_err(|_| 210)?;
     let names = Names::new(&c).map_err(|_| 211)?;
-    let ino = lookup(&mut c, &names, ROOT, b"README.txt").map_err(|_| 212)?;
+    let ino = lookup(&mut c, &names, root(), b"README.txt").map_err(|_| 212)?;
     let stats: Vec<Desc> = (0..N).map(|_| Request::Stat { ino }.encode(0)).collect();
     let mut tags = c.send(&stats).map_err(|_| 213)?;
     // Long enough for diskfs to complete them all.

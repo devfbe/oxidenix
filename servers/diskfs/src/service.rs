@@ -36,11 +36,29 @@
 //! **Holds.** diskfs keeps, per channel, a bit per inode the client holds
 //! (`fsring`, "Holds"): an inode whose last link went is freed only when
 //! no client holds it, so one client's `RELEASE` never frees an inode
-//! another one still uses. A channel's holds go with it. The holds are
-//! diskfs's memory: a restarted diskfs knows a client's again only as it
-//! names them. An inode whose last link went while held is on the
-//! filesystem's orphan list (`ext2fs`, "Orphans") until its release, so one
-//! a diskfs that died left behind is freed when the next one mounts.
+//! another one still uses. A channel's holds go with it. An inode whose
+//! last link went while held is on the filesystem's orphan list (`ext2fs`,
+//! "Orphans") until it is freed; one no client holds is freed at once. A
+//! request names an inode by a handle (`fsring`, "Handles"): one whose
+//! inode is gone or another file's completes with ESTALE and holds
+//! nothing.
+//!
+//! **Restarts.** The holds are diskfs's memory, but the clients' open files
+//! outlive a diskfs that dies: the kernel restarts it, and each client
+//! connects again and names every inode it holds (`STAT`) before anything
+//! else. Until then, an unlinked inode may be one a client still has open.
+//! So a diskfs started while channels of the diskfs before it still have
+//! their clients (`oxrt::chan_predecessors`: the kernel counts the channels
+//! a dead process of the server attached whose client end is still there)
+//! frees nothing a predecessor's client might hold: no inode on the orphan
+//! list at its start, and no inode that existed then whose last link goes
+//! (inodes it created itself are no predecessor's). Each client of the
+//! dead diskfs hears of its death from the kernel (`EVENT_SERVICE_GONE`),
+//! connects, names what it holds and then closes its old channel; once
+//! the count is 0 (each fall rings diskfs's doorbell), diskfs frees what is
+//! on the orphan list and no channel holds (`settle`). The first diskfs
+//! since boot has no predecessors: it frees the whole list at once (what
+//! a crash left).
 //!
 //! **Hostile clients.** Each descriptor is copied out of the ring once and
 //! validated (`fsring::Request::decode`); a grant must exist and hold the
@@ -69,7 +87,8 @@ use alloc::vec::Vec;
 use core::sync::atomic::AtomicU32;
 use ext2fs::{Ext2, NewNode, Reservation};
 use fsring::errno::*;
-use fsring::{op, Buf, Completion, Kind as NodeKind, Request};
+use fsring::{op, Buf, Completion, Kind as NodeKind, Node, Request};
+use oxrt::println;
 use ring::channel::{Header, Layout, Offer};
 use ring::{Consumer, Desc, Producer, Ring, Wait};
 
@@ -222,6 +241,11 @@ struct Chan {
     held: Bitmap,
 }
 
+/// Whether a channel of `chans` holds `ino`.
+fn held(chans: &[Option<Chan>], ino: u32) -> bool {
+    chans.iter().flatten().any(|c| c.held.has(ino))
+}
+
 impl Chan {
     /// Whether the client has requests (or completions to take) that wait
     /// only for it to make room in its completion ring: it rings the
@@ -344,6 +368,11 @@ pub struct Service {
     /// fallback goes in front (it was taken earlier than every one here).
     barriers: VecDeque<(usize, Desc)>,
     inodes: u64,
+    /// Channels of an earlier diskfs still have clients (see "Restarts"):
+    /// nothing they might hold is freed meanwhile.
+    inherited: bool,
+    /// The inodes this diskfs created (no earlier one's client holds them).
+    created: Bitmap,
     /// The channel the next round starts with.
     rr: usize,
     /// Free scratch slots, and the scratch memory's device address.
@@ -361,7 +390,7 @@ impl Service {
     /// The service for `disk` with a filesystem of `inodes` inodes and
     /// blocks of `block_size`; an error for a device or an image the ring
     /// path cannot serve.
-    pub fn new(disk: &VirtioBlk, block_size: usize, inodes: u64) -> Result<Service, &'static str> {
+    pub fn new(disk: &VirtioBlk, block_size: usize, inodes: u64, inherited: bool) -> Result<Service, &'static str> {
         let (_, scratch) = disk.scratch();
         let slots = (crate::blk::SCRATCH_PAGES as u64 * PAGE / BOUNCE) as usize;
         if block_size as u64 > PAGE {
@@ -388,6 +417,8 @@ impl Service {
             ops: (0..MAX_OPS).map(|_| None).collect(),
             barriers: VecDeque::new(),
             inodes,
+            inherited,
+            created: Bitmap::new(inodes),
             rr: 0,
             bounce: (0..slots).rev().collect(),
             scratch,
@@ -725,7 +756,7 @@ impl Service {
                 return true;
             }
         };
-        self.hold_named(c, &request);
+        self.hold_named(fs, c, &request);
         // A grant no operation uses is let go at once: no barrier (the
         // client sends FORGET after the requests on it completed).
         if let Request::Forget { grant } = request {
@@ -755,8 +786,8 @@ impl Service {
             return !retry;
         };
         let started = match request {
-            Request::Read { ino, offset, buf } => self.start_read(fs, c, ino, offset, buf),
-            Request::Write { ino, offset, buf } => self.start_write(fs, c, ino, offset, buf),
+            Request::Read { ino, offset, buf } => Self::node(fs, ino).and_then(|ino| self.start_read(fs, c, ino, offset, buf)),
+            Request::Write { ino, offset, buf } => Self::node(fs, ino).and_then(|ino| self.start_write(fs, c, ino, offset, buf)),
             _ => unreachable!("data requests only"),
         };
         match started {
@@ -781,29 +812,58 @@ impl Service {
 
     // ------------------------------------------------------------- holds
 
-    /// Records that channel `c` holds the inodes `request` names (see
-    /// `Holds` in the module comment).
-    fn hold_named(&mut self, c: usize, request: &Request) {
-        let chan = self.chan(c);
-        match *request {
-            Request::Read { ino, .. } | Request::Write { ino, .. } | Request::Stat { ino } | Request::Truncate { ino, .. } => chan.held.set(ino),
-            Request::Readlink { ino, .. } | Request::SetPerm { ino, .. } | Request::SetTimes { ino, .. } | Request::Promise { ino, .. } => chan.held.set(ino),
-            Request::Lookup { dir, .. } | Request::Create { dir, .. } | Request::Unlink { dir, .. } | Request::Readdir { dir, .. } => chan.held.set(dir),
-            Request::Rename { from, to, .. } => {
-                chan.held.set(from);
-                chan.held.set(to);
+    /// Records that channel `c` holds the inodes `request` names by valid
+    /// handles (see `Holds` in the module comment).
+    fn hold_named(&mut self, fs: &mut Fs, c: usize, request: &Request) {
+        let named: [Option<Node>; 2] = match *request {
+            Request::Read { ino, .. } | Request::Write { ino, .. } | Request::Stat { ino } | Request::Truncate { ino, .. } => [Some(ino), None],
+            Request::Readlink { ino, .. } | Request::SetPerm { ino, .. } | Request::SetTimes { ino, .. } | Request::Promise { ino, .. } => [Some(ino), None],
+            Request::Lookup { dir, .. } | Request::Create { dir, .. } | Request::Unlink { dir, .. } | Request::Readdir { dir, .. } => [Some(dir), None],
+            Request::Rename { from, to, .. } => [Some(from), Some(to)],
+            Request::Release { .. } | Request::Flush | Request::Statfs | Request::Forget { .. } | Request::Root => [None, None],
+        };
+        for node in named.into_iter().flatten() {
+            if let Ok(ino) = Self::node(fs, node) {
+                self.chan(c).held.set(ino);
             }
-            Request::Release { .. } | Request::Flush | Request::Statfs | Request::Forget { .. } => {}
         }
     }
 
-    /// Frees `ino` if its last link is gone and no client holds it.
+    /// The inode a handle names: ESTALE if it is gone or another file's.
+    fn node(fs: &mut Fs, node: Node) -> Result<u32, i64> {
+        fs.check_handle(node.ino, node.generation).map(|_| node.ino)
+    }
+
+    /// Whether someone may still use inode `ino`: a client holds it, or it
+    /// existed when this diskfs started and a predecessor's client may hold
+    /// it (see "Restarts").
+    fn in_use(&self, ino: u32) -> bool {
+        held(&self.chans, ino) || (self.inherited && !self.created.has(ino))
+    }
+
+    /// Frees `ino` if its last link is gone and no one may use it.
     fn try_free(&mut self, fs: &mut Fs, ino: u32) {
-        if self.chans.iter().flatten().any(|c| c.held.has(ino)) || fs.check(ino).is_err() {
+        if self.in_use(ino) || fs.check(ino).is_err() {
             return;
         }
         if fs.stat(ino).is_ok_and(|s| s.links == 0) {
             let _ = fs.release(ino);
+        }
+    }
+
+    /// Called when the doorbell rang (and at start): once no channel of an
+    /// earlier diskfs has a client left, the orphans no client holds are
+    /// freed (see "Restarts").
+    pub fn settle(&mut self, fs: &mut Fs) {
+        if !self.inherited || oxrt::chan_predecessors().is_ok_and(|n| n > 0) {
+            return;
+        }
+        self.inherited = false;
+        let chans = &self.chans;
+        match fs.recover_orphans(|ino| held(chans, ino)) {
+            Ok(0) => {}
+            Ok(n) => println!("diskfs: freed {} orphaned inodes no client holds any more", n),
+            Err(e) => println!("diskfs: cannot free the orphaned inodes (errno {})", e),
         }
     }
 
@@ -1022,8 +1082,11 @@ impl Service {
         };
         // The inode a lookup or create returns, and the one whose last link
         // an unlink or rename took (the client releases it), are held.
-        if status == 0 && matches!(d.op, op::LOOKUP | op::CREATE | op::UNLINK | op::RENAME) && values[0] != 0 {
+        if status == 0 && matches!(d.op, op::ROOT | op::LOOKUP | op::CREATE | op::UNLINK | op::RENAME) && values[0] != 0 {
             self.chan(c).held.set(values[0] as u32);
+            if d.op == op::CREATE {
+                self.created.set(values[0] as u32);
+            }
         }
         self.complete(c, d.tag, d.op, status, values);
     }
@@ -1033,6 +1096,14 @@ impl Service {
         let g = self.grant(c, buf.grant)?;
         let bytes = g.copy_in(buf)?;
         Ok(String::from(fsring::check_name(&bytes)?))
+    }
+
+    /// An unlink's or rename's completion: the inode whose last link went
+    /// and that someone uses (0: none), and its generation.
+    fn gone(fs: &mut Fs, gone: &[u32]) -> Result<(i64, [u64; 4]), i64> {
+        let Some(&ino) = gone.first() else { return Ok((0, [0; 4])) };
+        let generation = fs.stat(ino)?.generation;
+        Ok((0, [ino as u64, generation as u64, 0, 0]))
     }
 
     /// A directory that can take new entries (not removed).
@@ -1049,7 +1120,7 @@ impl Service {
         match request {
             Request::Flush => fs.sync().map(|_| (0, none)),
             Request::Stat { ino } => {
-                fs.check(ino)?;
+                let ino = Self::node(fs, ino)?;
                 let s = fs.stat(ino)?;
                 let stat = fsring::Stat { mode: s.mode, links: s.links, size: s.size, atime: s.atime, mtime: s.mtime, ctime: s.ctime, generation: s.generation };
                 Ok((0, stat.to_values()))
@@ -1066,14 +1137,19 @@ impl Service {
                 };
                 Ok((0, u.to_values()))
             }
+            Request::Root => {
+                let s = fs.stat(ext2fs::ROOT_INO)?;
+                Ok((0, [ext2fs::ROOT_INO as u64, s.mode as u64, s.generation as u64, 0]))
+            }
             Request::Lookup { dir, name } => {
-                fs.check(dir)?;
+                let dir = Self::node(fs, dir)?;
                 let name = self.name(c, &name)?;
                 let ino = fs.lookup(dir, &name)?;
                 let s = fs.stat(ino)?;
                 Ok((0, [ino as u64, s.mode as u64, s.generation as u64, 0]))
             }
             Request::Create { dir, name, kind, perm } => {
+                let dir = Self::node(fs, dir)?;
                 Self::live_dir(fs, dir)?;
                 let name = self.name(c, &name)?;
                 let node = match kind {
@@ -1091,40 +1167,43 @@ impl Service {
                 Ok((0, [ino as u64, s.mode as u64, s.generation as u64, 0]))
             }
             Request::Unlink { dir, name, is_dir } => {
-                fs.check(dir)?;
+                let dir = Self::node(fs, dir)?;
                 let name = self.name(c, &name)?;
-                let gone = fs.unlink(dir, &name, is_dir)?;
-                Ok((0, [gone.first().copied().unwrap_or(0) as u64, 0, 0, 0]))
+                // An inode no one may use is freed at once; one in use is orphaned, and
+                // the client gets it to hold and release.
+                let gone = fs.unlink_unless(dir, &name, is_dir, |ino| self.in_use(ino))?;
+                Self::gone(fs, &gone)
             }
             Request::Rename { from, name, to, new_name } => {
-                fs.check(from)?;
+                let from = Self::node(fs, from)?;
+                let to = Self::node(fs, to)?;
                 Self::live_dir(fs, to)?;
                 let (old, new) = (self.name(c, &name)?, self.name(c, &new_name)?);
-                let gone = fs.rename(from, &old, to, &new)?;
-                Ok((0, [gone.first().copied().unwrap_or(0) as u64, 0, 0, 0]))
+                let gone = fs.rename_unless(from, &old, to, &new, |ino| self.in_use(ino))?;
+                Self::gone(fs, &gone)
             }
             Request::Truncate { ino, len } => {
-                fs.check(ino)?;
+                let ino = Self::node(fs, ino)?;
                 fs.truncate(ino, len).map(|_| (0, none))
             }
             Request::Release { ino } => {
                 // The client lets go of it: freed if its last link is gone
                 // and no other client holds it.
-                fs.check(ino)?;
+                let ino = Self::node(fs, ino)?;
                 self.chan(c).held.clear(ino);
                 self.try_free(fs, ino);
                 Ok((0, none))
             }
             Request::SetPerm { ino, perm } => {
-                fs.check(ino)?;
+                let ino = Self::node(fs, ino)?;
                 fs.set_perm(ino, perm).map(|_| (0, none))
             }
             Request::SetTimes { ino, atime, mtime, ctime } => {
-                fs.check(ino)?;
+                let ino = Self::node(fs, ino)?;
                 fs.set_times(ino, atime, mtime, ctime).map(|_| (0, none))
             }
             Request::Readlink { ino, buf } => {
-                fs.check(ino)?;
+                let ino = Self::node(fs, ino)?;
                 let g = self.grant(c, buf.grant)?;
                 g.check(&buf)?;
                 let target = fs.readlink(ino)?;
@@ -1135,7 +1214,7 @@ impl Service {
                 Ok((target.len() as i64, none))
             }
             Request::Readdir { dir, cursor, buf } => {
-                fs.check(dir)?;
+                let dir = Self::node(fs, dir)?;
                 let g = self.grant(c, buf.grant)?;
                 g.check(&buf)?;
                 if !g.writable {
@@ -1166,12 +1245,12 @@ impl Service {
             // (Run at once by `dispatch`; never a barrier.)
             Request::Promise { ino, offset, len } => {
                 let owner = self.chan(c).id;
-                fs.check(ino)?;
+                let ino = Self::node(fs, ino)?;
                 fs.promise(owner, ino, offset, len).map(|_| (0, none))
             }
             // Through ext2fs's own paths, with a bounce copy (see `Start::Fallback`).
             Request::Read { ino, offset, buf } => {
-                fs.check(ino)?;
+                let ino = Self::node(fs, ino)?;
                 let g = self.grant(c, buf.grant)?;
                 g.check(&buf)?;
                 let mut chunk = vec![0u8; 32 * 1024];
@@ -1188,7 +1267,7 @@ impl Service {
                 Ok((done as i64, [fs.stat(ino)?.size, 0, 0, 0]))
             }
             Request::Write { ino, offset, buf } => {
-                fs.check(ino)?;
+                let ino = Self::node(fs, ino)?;
                 let g = self.grant(c, buf.grant)?;
                 g.check(&buf)?;
                 let mut done = 0u64;

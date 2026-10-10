@@ -906,7 +906,7 @@ impl crate::fs::cache::Pager for Instance {
 impl Instance {
     /// Queues an event for the service thread (none once it is gone or
     /// going: nobody would take it).
-    fn queue_event(&self, event: Event) {
+    pub(super) fn queue_event(&self, event: Event) {
         let mut q = self.pager.lock();
         if q.dead || q.closing {
             return;

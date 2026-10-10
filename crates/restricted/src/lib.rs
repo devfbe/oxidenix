@@ -276,6 +276,11 @@ pub const EVENT_CONSOLE_LOST: u64 = 21;
 /// let go of its address space. The room for the
 /// event was reserved when the thread was made, so none is ever lost.
 pub const EVENT_THREAD_EXIT: u64 = 23;
+/// A service one of the instance's channels was attached to died (`a`: the
+/// channel): what it held for the instance waits for the instance to
+/// connect again and name it (diskfs's holds: `fsring`, "Holds"); the
+/// instance does so now rather than at its next use of the service.
+pub const EVENT_SERVICE_GONE: u64 = 24;
 
 /// A server thread starts with its `State` in `rdi`, its role in `rsi`,
 /// and, serving a program, the `cookie` its creator gave `thread_create`

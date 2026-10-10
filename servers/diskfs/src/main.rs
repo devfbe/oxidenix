@@ -64,14 +64,21 @@ fn main(args: Vec<&'static str>) -> i32 {
             return 1;
         }
     };
-    // What a diskfs that ended (or a crash) left on the orphan list.
-    match fs.recover_orphans(|_| false) {
-        Ok(0) => {}
-        Ok(n) => println!("diskfs: freed {} orphaned inodes", n),
-        Err(e) => println!("diskfs: cannot free the orphaned inodes (errno {})", e),
+    // What a crash left on the orphan list goes now; what a diskfs that died left there
+    // waits for its clients (`service`, "Restarts").
+    let inherited = oxrt::chan_predecessors().unwrap_or(0);
+    if inherited == 0 {
+        match fs.recover_orphans(|_| false) {
+            Ok(0) => {}
+            Ok(n) => println!("diskfs: freed {} orphaned inodes", n),
+            Err(e) => println!("diskfs: cannot free the orphaned inodes (errno {})", e),
+        }
+    } else {
+        let orphans = fs.orphans().len();
+        println!("diskfs: {} clients of the diskfs before; keeping {} orphaned inodes for them", inherited, orphans);
     }
     let inodes = fs.usage().3;
-    let mut rings = match service::Service::new(fs.device(), fs.block_size(), inodes) {
+    let mut rings = match service::Service::new(fs.device(), fs.block_size(), inodes, inherited > 0) {
         Ok(rings) => rings,
         Err(e) => {
             println!("diskfs: cannot serve this disk: {}", e);
@@ -106,8 +113,10 @@ fn main(args: Vec<&'static str>) -> i32 {
                 let status = rings.offer(&request[..len]);
                 let _ = oxrt::ipc_reply(id, &status.to_le_bytes());
             }
+            // A doorbell: also when a predecessor's channel went.
             _ => {}
         }
+        rings.settle(&mut fs);
         rings.run(&mut fs);
     }
 }

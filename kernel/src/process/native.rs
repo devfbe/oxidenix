@@ -35,6 +35,7 @@ const GRANT_DMA_UNMAP: u64 = 1072;
 const CHAN_WATCH: u64 = 1073;
 const SET_COPY_FIXUP: u64 = 1074;
 const GRANT_DMA_PAGES: u64 = 1075;
+const CHAN_PREDECESSORS: u64 = 1086;
 /// Bytes of randomness one `SYS_RANDOM` gives at most.
 const RANDOM_MAX: usize = 256;
 
@@ -66,6 +67,7 @@ pub fn dispatch(f: &mut Frame) {
         CHAN_WATCH => super::channel::watch(a0, a1),
         SET_COPY_FIXUP => super::channel::set_copy_fixup(a0, a1),
         GRANT_DMA_PAGES => super::channel::grant_dma_pages(a0, a1, a2, a3, a4),
+        CHAN_PREDECESSORS => super::channel::predecessors(),
         SYS_MO_MAP => map(a0, a1, a2, a3, a4, a5),
         SYS_MO_UNMAP => vm::unmap(a0, a1),
         SYS_MO_PROTECT => vm::protect(a0, a1, a2),
