@@ -53,7 +53,25 @@ unsafe impl GlobalAlloc for ServerHeap {
     }
 }
 
+/// The heap's numbers, in bytes (`restricted::TEST_HEAP_STATS`).
+pub struct Stats {
+    pub committed: usize,
+    pub in_use: usize,
+    pub free: usize,
+    pub decommitted: usize,
+}
+
 impl ServerHeap {
+    pub fn stats(&self) -> Stats {
+        let guard = self.0.lock();
+        let (heap, started) = &*guard;
+        if !*started {
+            return Stats { committed: 0, in_use: 0, free: 0, decommitted: 0 };
+        }
+        let slab_free: usize = SLABS.iter().enumerate().map(|(c, s)| s.lock().len() * slab::class_size(c)).sum();
+        Stats { committed: heap.size(), in_use: heap.used() - slab_free, free: heap.free() + slab_free, decommitted: 0 }
+    }
+
     /// From the heap itself, growing it as needed.
     fn alloc_large(&self, layout: Layout) -> *mut u8 {
         let mut guard = self.0.lock();

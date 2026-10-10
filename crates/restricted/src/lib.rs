@@ -978,3 +978,8 @@ pub const TEST_KILL_SERVER: u64 = 1523;
 /// that a requeue's wakes spent on such waiters still move what it asked
 /// for. Test mode only; a program's call is the server's to pass on.
 pub const TEST_FUTEX_WATCH: u64 = 1524;
+/// `(buf)`: the server writes its heap's numbers to the program's `buf`,
+/// four u64s in bytes: memory it holds from the kernel (committed), in use
+/// by its objects, committed but free, and given back (decommitted).
+/// Test mode only.
+pub const TEST_HEAP_STATS: u64 = 1525;
