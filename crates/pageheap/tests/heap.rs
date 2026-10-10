@@ -3,7 +3,7 @@
 //! trimmed, a decommitted page is never written (its poison is checked when
 //! it is committed again) and a failed commit leaves the heap usable.
 
-use pageheap::{Backing, Heap, RawLock, Stats, CHUNK, CHUNK_PAGES, PAGE};
+use pageheap::{Backing, Heap, RawLock, Stats, CHUNK, CHUNK_PAGES, KEEP_FLOOR, PAGE};
 use std::alloc::Layout;
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -175,7 +175,7 @@ fn freed_memory_goes_back_when_trimmed() {
         }
     }
     assert!(h.backing().trims_wanted.load(Ordering::Relaxed) > wanted, "no trim asked for");
-    h.trim(false);
+    h.trim();
     let trimmed = agrees(h);
     // What is kept: the survivors' pages, the free pages kept (1 MiB), the
     // metadata, a few slabs.
@@ -183,9 +183,19 @@ fn freed_memory_goes_back_when_trimmed() {
     let survivors: usize = keep.iter().map(|&(_, layout, _)| layout.size().div_ceil(PAGE)).sum();
     assert!(trimmed.committed < full.committed / 4, "{trimmed:?}");
     assert!(trimmed.committed - trimmed.meta <= (survivors + 8) * PAGE + (1 << 20), "{trimmed:?}");
-    h.trim(true);
+    // A shrink gives back about what it is asked for, never below the
+    // floor of free pages it keeps.
+    let big = Layout::from_size_align(600 * PAGE, 8).unwrap();
+    let p = h.alloc(big);
+    unsafe { h.dealloc(p, big) };
+    let before = agrees(h);
+    h.shrink(100);
+    let after = agrees(h);
+    assert_eq!(before.committed - after.committed, 100 * PAGE, "{before:?} {after:?}");
+    h.shrink(usize::MAX);
     let shrunk = agrees(h);
-    assert!(shrunk.committed - shrunk.meta <= (survivors + 8) * PAGE, "{shrunk:?}");
+    assert!(shrunk.committed - shrunk.meta <= (survivors + 8 + KEEP_FLOOR) * PAGE, "{shrunk:?}");
+    assert!(shrunk.committed - shrunk.meta >= KEEP_FLOOR * PAGE, "{shrunk:?}");
     for &(p, layout, tag) in &keep {
         check(p, layout.size(), tag);
     }
@@ -263,7 +273,11 @@ fn runs_are_the_lowest_that_fit() {
             unsafe { h.dealloc((base + page * PAGE) as *mut u8, Layout::from_size_align(n * PAGE, 8).unwrap()) };
         }
         if rand() % 500 == 0 {
-            h.trim(rand() % 2 == 0);
+            if rand() % 2 == 0 {
+                h.trim();
+            } else {
+                h.shrink(rand() as usize % 1000);
+            }
         }
     }
     agrees(h);
@@ -326,8 +340,8 @@ fn threads_and_a_trimmer() {
     std::thread::scope(|s| {
         s.spawn(|| {
             while !stop.load(Ordering::Relaxed) {
-                h.trim(false);
-                h.trim(true);
+                h.trim();
+                h.shrink(usize::MAX);
                 std::thread::yield_now();
             }
         });
@@ -368,8 +382,8 @@ fn threads_and_a_trimmer() {
         }
         stop.store(true, Ordering::Relaxed);
     });
-    h.trim(true);
+    h.shrink(usize::MAX);
     let s = agrees(h);
     assert_eq!(s.in_use, 0);
-    assert!(s.free <= 8 * PAGE, "{s:?}");
+    assert!(s.free <= (KEEP_FLOOR + 8) * PAGE, "{s:?}");
 }

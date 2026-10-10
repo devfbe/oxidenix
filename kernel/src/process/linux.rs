@@ -106,12 +106,13 @@ static LAST_SHRINK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU6
 const SHRINK_POST_INTERVAL: u64 = 100_000_000;
 const SHRINK_INTERVAL: u64 = 1_000_000_000;
 
-/// Memory is short (the background reclaimer below its low watermark, a
-/// commit refused): every instance's service thread gets `EVENT_SHRINK`
-/// (each at most once a second). From a thread that holds no lock (the
-/// reclaimer). False if it went through them less than 100 ms ago and did
-/// nothing (the caller asks again later).
-pub fn post_shrink() -> bool {
+/// Memory is short (a commit was refused at the limit, or reclaim found no
+/// clean cache page to drop): every instance's service thread gets
+/// `EVENT_SHRINK` for `pages` pages (requests coalesce into the largest;
+/// each instance gets one at most once a second). From a thread that holds
+/// no lock (the reclaimer). False if it went through them less than 100 ms
+/// ago and did nothing (the caller asks again later).
+pub fn post_shrink(pages: u64) -> bool {
     use core::sync::atomic::Ordering::Relaxed;
     let now = crate::time::now();
     let last = LAST_SHRINK.load(Relaxed);
@@ -119,7 +120,7 @@ pub fn post_shrink() -> bool {
         return false;
     }
     for instance in instances(None) {
-        instance.shrink.store(true, core::sync::atomic::Ordering::Release);
+        instance.shrink.fetch_max(pages, core::sync::atomic::Ordering::AcqRel);
         super::wakeup(instance.pager_chan());
     }
     true
@@ -255,6 +256,9 @@ impl HeapArea {
     }
 }
 
+/// Runs one `SYS_SHARED_DECOMMIT_RUNS` takes at most.
+const DECOMMIT_RUNS_MAX: u64 = 16;
+
 /// Pages `Instance::unmap_pages` takes off at a time (their frames on the
 /// stack until the shootdown).
 const UNMAP_BATCH: usize = 64;
@@ -343,14 +347,15 @@ pub struct Instance {
     /// the pager's process.
     programs: core::sync::atomic::AtomicUsize,
     /// Held while the entries of the server's heap area
-    /// (`HEAP_BASE..THREADS_BASE`) change and while a word there is taken
-    /// for a wait (`word`); the pages committed there (each exactly while
-    /// it is mapped, `SYS_SHARED_COMMIT`).
+    /// (`HEAP_BASE..THREADS_BASE`) change, with its commitment (mapped pages
+    /// and reserve, `SYS_SHARED_COMMIT`); never across a wait for memory.
+    /// (A wait on a word there takes no part of it: `word` relies on the
+    /// frames' lock, under which a decommit frees.)
     heap: crate::sync::Mutex<HeapArea>,
-    /// Memory is short: the service thread gets `EVENT_SHRINK` (a flag,
-    /// `post_shrink`), at most once per `SHRINK_INTERVAL` (when it got the
-    /// last).
-    shrink: core::sync::atomic::AtomicBool,
+    /// Memory is short: the service thread gets `EVENT_SHRINK` for this
+    /// many pages (0: none asked; `post_shrink`), at most once per
+    /// `SHRINK_INTERVAL` (when it got the last).
+    shrink: core::sync::atomic::AtomicU64,
     shrunk_at: core::sync::atomic::AtomicU64,
     /// The dirty and pinned pages of its cached objects (bounded per
     /// instance, `fs::cache`).
@@ -513,7 +518,7 @@ impl Instance {
             }),
             programs: core::sync::atomic::AtomicUsize::new(0),
             heap: crate::sync::Mutex::new(HeapArea { charge: pageheap::charge::Charge::new(), refused_told: false }),
-            shrink: core::sync::atomic::AtomicBool::new(false),
+            shrink: core::sync::atomic::AtomicU64::new(0),
             shrunk_at: core::sync::atomic::AtomicU64::new(0),
             cache_counts,
             maps: crate::sync::Mutex::new(BTreeMap::new()),
@@ -874,8 +879,32 @@ impl Instance {
     /// commitment; how many there were.
     fn decommit_heap(&self, addr: u64, len: u64) -> Result<u64, i64> {
         let end = heap_range(addr, len)?;
+        self.decommit_runs(&[(addr, (end - addr) / PAGE)])
+    }
+
+    /// `SYS_SHARED_DECOMMIT_RUNS`: `decommit_heap` for up to
+    /// `DECOMMIT_RUNS_MAX` (address, length) pairs at `list` in the server's
+    /// memory, with one shootdown per batch of pages.
+    fn decommit_list(&self, list: u64, n: u64) -> Result<u64, i64> {
+        if n == 0 || n > DECOMMIT_RUNS_MAX {
+            return Err(EINVAL);
+        }
+        let mut raw = [0u8; 16 * DECOMMIT_RUNS_MAX as usize];
+        super::uaccess::copy_from_server(list, &mut raw[..16 * n as usize])?;
+        let mut runs = [(0u64, 0u64); DECOMMIT_RUNS_MAX as usize];
+        for (run, pair) in runs.iter_mut().zip(raw[..16 * n as usize].chunks_exact(16)) {
+            let addr = u64::from_le_bytes(pair[..8].try_into().unwrap_or_default());
+            let len = u64::from_le_bytes(pair[8..].try_into().unwrap_or_default());
+            *run = (addr, (heap_range(addr, len)? - addr) / PAGE);
+        }
+        self.decommit_runs(&runs[..n as usize])
+    }
+
+    /// Unmaps the runs (start, pages) of the heap area and returns their
+    /// commitment; how many pages were committed.
+    fn decommit_runs(&self, runs: &[(u64, u64)]) -> Result<u64, i64> {
         let mut area = self.heap.lock();
-        let gone = self.unmap_pages(addr, (end - addr) / PAGE);
+        let gone = self.unmap_runs(runs);
         // The heap area is mapped only by `commit_heap`, which counts each
         // page: more cannot go than it counted. Were the account broken,
         // the commitment stays held (never refunded twice).
@@ -1007,34 +1036,44 @@ impl Instance {
 
     /// Removes the entries of `pages` pages at `start` (those mapped), drops
     /// them from the TLBs of every address space showing the region, then
-    /// lets go of the frames; how many there were. In batches of
-    /// `UNMAP_BATCH` frames, held on the stack (nothing is allocated).
+    /// lets go of the frames; how many there were.
     fn unmap_pages(&self, start: u64, pages: u64) -> u64 {
+        self.unmap_runs(&[(start, pages)])
+    }
+
+    /// `unmap_pages` for several runs (start, pages) at once: in batches of
+    /// `UNMAP_BATCH` frames, held on the stack (nothing is allocated), each
+    /// with one shootdown over the span its pages lie in.
+    fn unmap_runs(&self, runs: &[(u64, u64)]) -> u64 {
         let mut mapper = unsafe { OffsetPageTable::new(table_at(self.view), memory::phys_offset()) };
-        let end = start + pages * PAGE;
         let mut frames = [None::<PhysFrame>; UNMAP_BATCH];
-        let (mut at, mut gone) = (start, 0);
-        while at < end {
-            let (from, mut n) = (at, 0);
-            while at < end && n < UNMAP_BATCH {
-                if let Ok((frame, flush)) = mapper.unmap(Page::<Size4KiB>::containing_address(VirtAddr::new(at))) {
-                    flush.ignore();
+        let (mut n, mut lo, mut hi, mut gone) = (0, u64::MAX, 0, 0);
+        let flush = |frames: &mut [Option<PhysFrame>], n: &mut usize, lo: &mut u64, hi: &mut u64| {
+            if *n > 0 {
+                self.shootdown(*lo, *hi);
+                memory::with_frames(|f| {
+                    for frame in frames[..*n].iter_mut().filter_map(Option::take) {
+                        unsafe { f.deallocate_frame(frame) };
+                    }
+                });
+            }
+            (*n, *lo, *hi) = (0, u64::MAX, 0);
+        };
+        for &(start, pages) in runs {
+            for at in (start..start + pages * PAGE).step_by(PAGE as usize) {
+                if let Ok((frame, tlb)) = mapper.unmap(Page::<Size4KiB>::containing_address(VirtAddr::new(at))) {
+                    tlb.ignore();
                     frames[n] = Some(frame);
                     n += 1;
+                    gone += 1;
+                    (lo, hi) = (lo.min(at), hi.max(at + PAGE));
+                    if n == UNMAP_BATCH {
+                        flush(&mut frames, &mut n, &mut lo, &mut hi);
+                    }
                 }
-                at += PAGE;
             }
-            if n == 0 {
-                continue;
-            }
-            self.shootdown(from, at);
-            memory::with_frames(|f| {
-                for frame in frames[..n].iter_mut().filter_map(Option::take) {
-                    unsafe { f.deallocate_frame(frame) };
-                }
-            });
-            gone += n as u64;
         }
+        flush(&mut frames, &mut n, &mut lo, &mut hi);
         gone
     }
 
@@ -1057,9 +1096,9 @@ impl Instance {
                 break;
             }
         }
-        for tlb in spaces {
-            super::tlb::shootdown(&tlb, start, end);
-        }
+        // One request to the CPUs of them all (the region is the same in
+        // every one).
+        super::tlb::shootdown_many(&spaces, start, end);
     }
 
     /// The object mapped by `map_object` at `addr`, the offset of `addr` in
@@ -1711,6 +1750,7 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
         }
         SYS_SHARED_COMMIT => Ok(instance.commit_heap(a[0], a[1])? as i64),
         SYS_SHARED_DECOMMIT => Ok(instance.decommit_heap(a[0], a[1])? as i64),
+        SYS_SHARED_DECOMMIT_RUNS => Ok(instance.decommit_list(a[0], a[1])? as i64),
         SYS_INITRAMFS => {
             let image = crate::fs::initramfs().ok_or(ENOENT)?;
             super::uaccess::copy_to_server(a[0], &(image.len() as u64).to_le_bytes())?;
@@ -2685,13 +2725,16 @@ fn event_wait(instance: &Arc<Instance>, out: u64, deadline: u64) -> Option<SysRe
             // Memory is short (`post_shrink`, by a flag likewise), once
             // `SHRINK_INTERVAL` passed since the last time.
             let mut shrink_due = 0;
-            if instance.shrink.load(core::sync::atomic::Ordering::Acquire) {
+            if instance.shrink.load(core::sync::atomic::Ordering::Acquire) != 0 {
                 let now = crate::time::now();
                 let at = instance.shrunk_at.load(core::sync::atomic::Ordering::Relaxed);
                 shrink_due = if at == 0 { now } else { at + SHRINK_INTERVAL };
-                if now >= shrink_due && instance.shrink.swap(false, core::sync::atomic::Ordering::AcqRel) {
-                    instance.shrunk_at.store(now, core::sync::atomic::Ordering::Relaxed);
-                    return Some(Some(Event { kind: EVENT_SHRINK, a: 0, b: 0 }));
+                if now >= shrink_due {
+                    let pages = instance.shrink.swap(0, core::sync::atomic::Ordering::AcqRel);
+                    if pages != 0 {
+                        instance.shrunk_at.store(now, core::sync::atomic::Ordering::Relaxed);
+                        return Some(Some(Event { kind: EVENT_SHRINK, a: pages, b: 0 }));
+                    }
                 }
             }
             if q.closing {
@@ -2728,7 +2771,9 @@ fn event_wait(instance: &Arc<Instance>, out: u64, deadline: u64) -> Option<SysRe
                         }
                         EVENT_PAGE if !q.queued.insert((event.a, event.b / PAGE)) => {}
                         EVENT_TIMER => {}
-                        EVENT_SHRINK => instance.shrink.store(true, core::sync::atomic::Ordering::Release),
+                        EVENT_SHRINK => {
+                            instance.shrink.fetch_max(event.a, core::sync::atomic::Ordering::AcqRel);
+                        }
                         EVENT_CLOSING => q.closing_told = false,
                         EVENT_WRITEBACK if q.writeback_queued => {}
                         EVENT_SYNC if q.sync_queued => {}

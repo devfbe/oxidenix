@@ -260,15 +260,25 @@ pages and checks the poison when they are committed again):
 **When memory goes back.** When the free committed pages exceed 2 MiB and a quarter of what is
 committed, the heap asks the instance's timer thread, which trims at most every 500 ms (a
 workload that frees and allocates in turn does not commit and decommit all the time): free
-pages are decommitted from the arena's top down until 1 MiB, or an eighth of what is allocated,
-is left. When memory is short, the kernel's background reclaimer (below its low watermark, or
-after a commit was refused at the limit) flags every instance, and the service thread gets
-`EVENT_SHRINK` (a flag per instance, so requests coalesce, delivered at most once a second; one
-tree's refused commits cost the others at most a trim and an inode-cache pass a second): the heap keeps no free page and gives back
-the classes' empty slabs, and `/data`'s unused clean inodes go with their cached objects
-(Linux's shrinkers). After `oomtest` the heap is back within 2 MiB of where it started and
+pages are decommitted from the arena's top down (the walk goes on where the last batch stopped),
+16 runs per kernel call (`shared_decommit_runs`, one shootdown per batch of pages to the CPUs of
+all the instance's address spaces at once), until 1 MiB (`KEEP_FLOOR`), or an eighth of what is
+allocated, is left. When memory is short, the kernel asks for a shrink with how many pages it
+lacks: after a commit was refused at the limit (the pages refused), or when its background
+reclaimer found no clean cache page to drop, used lately or not (the pages missing up to its
+high watermark), never merely for being below a watermark (clean file pages go first). Each
+instance gets `EVENT_SHRINK` with the largest request since its last (requests coalesce), at most
+once a second; the service thread hands it to the worker (it must not wait for the heap's locks
+or for diskfs itself), which gives back about that many pages: the classes' empty slabs and
+the heap's free pages, never below the floor of 1 MiB (the heap then still allocates without a
+kernel call when memory is tightest), and the least recently used of `/data`'s unused clean
+inodes with their cached objects, one per 64 pages asked for, at most 32, chosen without
+allocating (Linux's shrinkers). One tree's refused commits cost the others at most one such
+shrink a second. After `oomtest` the heap is back within 2 MiB of where it started and
 Committed_AS 1.5 MB above its start (the test checks both, within 2 MiB and 4 MB, and the
-shrink after a refused commit).
+shrink after a refused commit, down to the floor and not below); with memory full of a hog and
+of page cache (a 48 MiB file read over and over), the server's allocations keep being served
+(about 3700 rounds of `TEST_ALLOC` in 3 s, the slowest 2 ms, none failed).
 
 The allocation fast path is as fast as before (`scripts/bench.sh`: `stat_path_tmpfs`, about
 fifty heap operations, 3107 cycles against 3141 on main, docs/benchmarks/2026-10-10-*). What it

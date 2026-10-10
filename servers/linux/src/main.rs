@@ -393,11 +393,10 @@ fn pager() -> ! {
                 continue;
             }
             EVENT_SHRINK => {
-                // Memory is short: unused /data inodes go (at the loop's
-                // `reap`, with their objects), and the heap's free memory.
-                datafs::shrink();
-                datafs::reap();
-                heap::shrink();
+                // Memory is short: the worker gives back about `a` pages
+                // (the heap's free memory, unused /data inodes); not here,
+                // where pages are brought and written back.
+                heap::ask_shrink(event.a);
                 continue;
             }
             EVENT_SERVICE_GONE => {
@@ -541,8 +540,9 @@ fn test(nr: u64, addr: u64) -> i64 {
         TEST_ALLOC => test_alloc(addr) as i64,
         TEST_HEAP_STATS => {
             let stats = HEAP.stats();
-            let mut bytes = [0u8; 32];
-            for (i, v) in [stats.committed, stats.in_use, stats.free, stats.decommitted].into_iter().enumerate() {
+            let mut bytes = [0u8; 40];
+            let shrinks = heap::SHRINKS.load(Ordering::Relaxed) as usize;
+            for (i, v) in [stats.committed, stats.in_use, stats.free, stats.decommitted, shrinks].into_iter().enumerate() {
                 bytes[i * 8..i * 8 + 8].copy_from_slice(&(v as u64).to_le_bytes());
             }
             match usercopy::to_program(addr, &bytes) {

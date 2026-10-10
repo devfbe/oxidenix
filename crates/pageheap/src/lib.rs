@@ -17,8 +17,8 @@
 //!   (`Backing::trim_wanted`); the trim (`trim`, on a thread that holds no
 //!   lock) decommits free pages from the arena's top down until
 //!   `KEEP_FLOOR` (1 MiB) or an eighth of what is allocated is left;
-//!   `trim(true)` (memory is short) keeps nothing and takes the classes'
-//!   empty slabs too.
+//!   `shrink(pages)` (memory is short) gives back about `pages` more, the
+//!   classes' empty slabs too, but never goes below `KEEP_FLOOR`.
 //!
 //! Nothing about free memory is kept in it: bitmaps, summaries and slab
 //! descriptors are in their own area, committed as the arena grows and
@@ -51,6 +51,10 @@ pub const PAGE: usize = 4096;
 /// Pages of a chunk: one bitmap word each per 64, one summary.
 pub const CHUNK_PAGES: usize = 512;
 pub const CHUNK: usize = CHUNK_PAGES * PAGE;
+/// Runs a trim gives back per `Backing::decommit_runs`.
+pub const TRIM_RUNS: usize = 16;
+/// Free committed pages a trim or a shrink keeps at least.
+pub const KEEP_FLOOR: usize = pages::KEEP_FLOOR;
 
 /// Where the heap's memory comes from.
 pub trait Backing {
@@ -59,6 +63,13 @@ pub trait Backing {
     fn commit(&self, addr: usize, len: usize) -> bool;
     /// Gives [addr, addr + len) back; its contents are lost.
     fn decommit(&self, addr: usize, len: usize);
+    /// Gives several (address, length) runs back at once (one kernel call
+    /// and one TLB shootdown where the backing can).
+    fn decommit_runs(&self, runs: &[(usize, usize)]) {
+        for &(addr, len) in runs {
+            self.decommit(addr, len);
+        }
+    }
     /// The heap has more free committed memory than it keeps: `trim` it
     /// soon, from where no lock is held. Called without the heap's locks.
     fn trim_wanted(&self);
@@ -299,33 +310,54 @@ impl<L: RawLock, B: Backing> Heap<L, B> {
         true
     }
 
-    /// Gives free committed memory back: down to what the heap keeps, or
-    /// (`everything`: memory is short) all of it, the classes' empty slabs
-    /// too. From a thread that holds none of the heap's locks.
-    pub fn trim(&self, everything: bool) {
-        self.pages.lock().trim_begins();
-        if everything {
-            for (c, class) in self.classes.iter().enumerate() {
-                let _ = c;
-                let mut out = [0usize; slabs::EMPTY_KEEP as usize];
-                let n = class.lock().drain(self.place, &mut out);
-                for &page in &out[..n] {
-                    self.free_pages(page, 1);
-                }
+    /// Gives free committed memory back, down to what the heap keeps
+    /// (`KEEP_FLOOR` pages, or an eighth of what is allocated if more). From
+    /// a thread that holds none of the heap's locks.
+    pub fn trim(&self) {
+        let keep = {
+            let mut pages = self.pages.lock();
+            pages.trim_begins();
+            pages.keep()
+        };
+        self.trim_to(keep);
+    }
+
+    /// Memory is short: gives back about `pages` pages of free committed
+    /// memory (the classes' empty slabs first), but never below
+    /// `KEEP_FLOOR` free pages: the heap keeps a floor to allocate from
+    /// without a kernel call when memory is tight. From a thread that holds
+    /// none of the heap's locks.
+    pub fn shrink(&self, pages: usize) {
+        for class in self.classes.iter() {
+            let mut out = [0usize; slabs::EMPTY_KEEP as usize];
+            let n = class.lock().drain(self.place, &mut out);
+            for &page in &out[..n] {
+                self.free_pages(page, 1);
             }
         }
+        let keep = {
+            let mut p = self.pages.lock();
+            p.trim_begins();
+            pages::KEEP_FLOOR.max(p.free_committed.saturating_sub(pages))
+        };
+        self.trim_to(keep);
+    }
+
+    /// Decommits free committed pages, the highest first, until `keep`
+    /// are left, up to `TRIM_RUNS` runs per kernel call.
+    fn trim_to(&self, keep: usize) {
         loop {
-            let mut runs = [(0usize, 0usize); 16];
-            let n = {
-                let mut pages = self.pages.lock();
-                let keep = if everything { 0 } else { pages.keep() };
-                pages.take_for_trim(keep, &mut runs)
-            };
+            let mut runs = [(0usize, 0usize); TRIM_RUNS];
+            let n = self.pages.lock().take_for_trim(keep, &mut runs);
             if n == 0 {
                 break;
             }
-            for &(page, len) in &runs[..n] {
-                self.backing.decommit(self.place.arena + page * PAGE, len * PAGE);
+            for run in &mut runs[..n] {
+                *run = (self.place.arena + run.0 * PAGE, run.1 * PAGE);
+            }
+            self.backing.decommit_runs(&runs[..n]);
+            for run in &mut runs[..n] {
+                *run = ((run.0 - self.place.arena) / PAGE, run.1 / PAGE);
             }
             self.pages.lock().trimmed(&runs[..n]);
         }

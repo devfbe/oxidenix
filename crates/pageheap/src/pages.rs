@@ -87,6 +87,9 @@ pub(crate) struct Pages {
     pub free_committed: usize,
     /// A trim was asked for (`ask_trim`) and has not begun.
     trim_asked: bool,
+    /// Where a trim goes on (`take_for_trim`): the chunks above it have no
+    /// free committed page left for it (since `trim_begins`).
+    trim_cursor: usize,
 }
 
 const fn page_up(x: usize) -> usize {
@@ -232,6 +235,7 @@ impl Pages {
             allocated: 0,
             free_committed: 0,
             trim_asked: false,
+            trim_cursor: 0,
         }
     }
 
@@ -459,6 +463,7 @@ impl Pages {
 
     pub fn trim_begins(&mut self) {
         self.trim_asked = false;
+        self.trim_cursor = self.chunks;
     }
 
     /// Reserves free committed pages beyond `keep` for a trim, highest
@@ -466,7 +471,7 @@ impl Pages {
     pub fn take_for_trim(&mut self, keep: usize, out: &mut [(usize, usize)]) -> usize {
         let mut want = self.free_committed.saturating_sub(keep);
         let mut n = 0;
-        let mut c = self.chunks;
+        let mut c = self.trim_cursor.min(self.chunks);
         while c > 0 && want > 0 && n < out.len() {
             c -= 1;
             let meta = self.meta(c);
@@ -489,6 +494,8 @@ impl Pages {
                 want -= end - p;
             }
         }
+        // On from the chunk it stopped in (it may have more).
+        self.trim_cursor = if n == out.len() || want == 0 { (c + 1).min(self.chunks) } else { c };
         for &(page, len) in &out[..n] {
             self.set(page, len, Some(true), None);
         }

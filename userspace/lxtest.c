@@ -683,7 +683,7 @@ static int server_fail(void) {
 int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "heap") == 0) {
         /* The server's heap, in KiB: committed, in use, free, decommitted. */
-        uint64_t s[4];
+        uint64_t s[5];
         if (syscall(TEST_HEAP_STATS, s) != 0) return 1;
         printf("server heap: committed %llu kB, in use %llu kB, free %llu kB, decommitted %llu kB\n",
                (unsigned long long)s[0] / 1024, (unsigned long long)s[1] / 1024, (unsigned long long)s[2] / 1024,

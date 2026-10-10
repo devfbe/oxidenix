@@ -294,11 +294,12 @@ pub const EVENT_THREAD_EXIT: u64 = 23;
 /// connect again and name it (diskfs's holds: `fsring`, "Holds"); the
 /// instance does so now rather than at its next use of the service.
 pub const EVENT_SERVICE_GONE: u64 = 24;
-/// Memory is short (free frames below the reclaimer's low watermark, or a
-/// commit refused at the limit): the server gives back what it can do
-/// without, its heap's free pages (`SYS_SHARED_DECOMMIT`) and caches that
-/// cost nothing to make again (Linux's shrinkers). Queued once until taken,
-/// and at most once a second.
+/// Memory is short (a commit refused at the limit, or reclaim found no
+/// clean cache page to drop): the server gives back about `a` pages of what
+/// it can do without, its heap's free pages beyond the floor it keeps
+/// (`SYS_SHARED_DECOMMIT`) and the least recently used of the caches that
+/// cost nothing to make again (Linux's shrinkers). Requests coalesce into
+/// the largest until taken; at most one a second.
 pub const EVENT_SHRINK: u64 = 25;
 
 /// A server thread starts with its `State` in `rdi`, its role in `rsi`,
@@ -364,6 +365,10 @@ pub const SYS_SHARED_COMMIT: u64 = 1169;
 /// the region (TLBs shot down), their frames freed and their commitment
 /// returned (to the instance's reserve first); returns how many there were. Their contents are lost.
 pub const SYS_SHARED_DECOMMIT: u64 = 1170;
+/// `shared_decommit_runs(list, n) -> pages`: `shared_decommit` of `n` (at
+/// most 16) runs, the (address, length) u64 pairs at `list`, with one TLB
+/// shootdown per batch of pages instead of one per run (a trim's).
+pub const SYS_SHARED_DECOMMIT_RUNS: u64 = 1171;
 /// `server_futex_wait(addr, val, deadline_ns, flags)`: sleeps while the
 /// word at `addr` (the server's memory) holds `val`, until woken, the
 /// deadline (monotonic nanoseconds; 0: none) or, with
@@ -1015,7 +1020,8 @@ pub const TEST_FUTEX_WATCH: u64 = 1524;
 /// only.
 pub const TEST_FILL_GONE: u64 = 1525;
 /// `(buf)`: the server writes its heap's numbers to the program's `buf`,
-/// four u64s in bytes: memory it holds from the kernel (committed), in use
-/// by its objects, committed but free, and given back (decommitted).
+/// five u64s: in bytes, memory it holds from the kernel (committed), in
+/// use by its objects, committed but free, and given back (decommitted);
+/// then how many shrinks (`EVENT_SHRINK`) it made.
 /// Test mode only.
 pub const TEST_HEAP_STATS: u64 = 1526;

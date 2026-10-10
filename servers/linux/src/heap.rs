@@ -17,7 +17,7 @@ use crate::syscall;
 use core::alloc::{GlobalAlloc, Layout};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use pageheap::{Backing, Heap, CHUNK};
-use restricted::{HEAP_BASE, SYS_CLOCK_READ, SYS_SHARED_COMMIT, SYS_SHARED_DECOMMIT, THREADS_BASE};
+use restricted::{HEAP_BASE, SYS_CLOCK_READ, SYS_SHARED_COMMIT, SYS_SHARED_DECOMMIT, SYS_SHARED_DECOMMIT_RUNS, THREADS_BASE};
 
 /// Most chunks of arena (64 GiB: far beyond any commit limit).
 const MAX_CHUNKS: usize = 32 * 1024;
@@ -37,6 +37,17 @@ impl Backing for Kernel {
 
     fn decommit(&self, addr: usize, len: usize) {
         syscall(SYS_SHARED_DECOMMIT, [addr as u64, len as u64, 0, 0, 0, 0]);
+    }
+
+    fn decommit_runs(&self, runs: &[(usize, usize)]) {
+        // (In the image's stack: never memory the heap decommits.)
+        let mut list = [0u64; 2 * pageheap::TRIM_RUNS];
+        for chunk in runs.chunks(pageheap::TRIM_RUNS) {
+            for (i, &(addr, len)) in chunk.iter().enumerate() {
+                (list[2 * i], list[2 * i + 1]) = (addr as u64, len as u64);
+            }
+            syscall(SYS_SHARED_DECOMMIT_RUNS, [list.as_ptr() as u64, chunk.len() as u64, 0, 0, 0, 0]);
+        }
     }
 
     fn trim_wanted(&self) {
@@ -93,12 +104,31 @@ pub fn trim_if_due() {
         return;
     }
     TRIM.store(false, Ordering::Relaxed);
-    crate::HEAP.0.trim(false);
+    crate::HEAP.0.trim();
     LAST_TRIM.store(now(), Ordering::Relaxed);
 }
 
-/// `EVENT_SHRINK`: everything free goes back.
-pub fn shrink() {
-    crate::HEAP.0.trim(true);
+/// Pages `EVENT_SHRINK` asked for and the worker has not given yet (the
+/// largest request), and how many shrinks the worker made (for the tests).
+static SHRINK_ASKED: AtomicU64 = AtomicU64::new(0);
+pub static SHRINKS: AtomicU64 = AtomicU64::new(0);
+
+/// `EVENT_SHRINK` (on the service thread, which must not wait for the
+/// heap's locks or for diskfs): the worker shrinks.
+pub fn ask_shrink(pages: u64) {
+    SHRINK_ASKED.fetch_max(pages.max(1), Ordering::AcqRel);
+    crate::scm::request();
+}
+
+/// The worker: gives back about the pages asked for, of the heap's free
+/// memory beyond its floor and of /data's unused clean inodes.
+pub fn shrink_if_asked() {
+    let pages = SHRINK_ASKED.swap(0, Ordering::AcqRel);
+    if pages == 0 {
+        return;
+    }
+    crate::HEAP.0.shrink(pages as usize);
+    crate::datafs::shrink(pages);
     LAST_TRIM.store(now(), Ordering::Relaxed);
+    SHRINKS.fetch_add(1, Ordering::Relaxed);
 }
