@@ -327,9 +327,13 @@ kernel tells each such client that the service died (`EVENT_SERVICE_GONE`); the 
 connects again at once, names every inode it holds (`STAT` by handle; unlinked open files
 included), and only then closes its old channel. Each old channel that goes rings diskfs's
 doorbell; at 0 diskfs frees what is on the orphan list and no channel holds. So an open,
-unlinked file reads and writes on across a restart and goes with its last close. (A grace
-period instead would free files of instances that are merely idle; the kernel knows exactly
-which clients to wait for.)
+unlinked file reads and writes on across a restart and goes with its last close. The kernel
+knows exactly which clients to wait for, and they come back in milliseconds; the wait is
+still bounded (`RESTART_GRACE`, 5 s): a client that has not named what it held by then (it
+hangs, or is hostile) loses it as if it were gone, and its handles are stale (`ESTALE`), never
+another file's. What a client holds is bounded by the filesystem (a bit per inode and channel),
+only inodes in use with the generation the handle names are held, and deciding whether an
+inode may be freed looks at each channel's bit (at most 16); the orphan list is walked once.
 
 **Room.** A request waits in the submission ring while its channel's completion ring has no
 room for its completion; diskfs then sleeps on that ring's doorbell instead of polling, and a
@@ -549,7 +553,8 @@ revoked under diskfs (`REVOKE_DRAINING`, then `EFAULT` for a copy into it, diskf
 channel with 16 reads in flight (diskfs serves the next one); the range of a revoked grant
 given to no other grant (a copy to it `EFAULT`, the next grant untouched); an unlinked inode
 one channel released still working for another that holds it, freed when that one releases
-it or goes (its handle `ESTALE` then); a write stalled behind an overlapping one while another channel's long reads keep
+it or goes (its handle `ESTALE` then); a raw client of a killed diskfs that never names its
+unlinked inode again losing it after the next diskfs's grace, the handle stale; a write stalled behind an overlapping one while another channel's long reads keep
 the operation slots busy; requests waiting for room in their completion ring with diskfs using
 no CPU meanwhile (its ticks in `/proc` over 500 ms), all completing once the client makes room.
 The file the second scenario leaves is read through `/data` (the server's page cache, over its

@@ -268,6 +268,7 @@ pub fn run(scenario: u64) -> i64 {
         7 => stalls_with_full_slots(),
         8 => block_on_room(),
         9 => unblock(),
+        10 => lapsed_holds(),
         _ => Err(1000),
     };
     match result {
@@ -638,6 +639,50 @@ fn stalls_with_full_slots() -> Result<(), i64> {
         check!(205, w1.status > 0 && w2.status > 0);
     }
     remove(&mut a, &na, b"ringtest.stall").map_err(|_| 206)?;
+    Ok(())
+}
+
+/// A client of a diskfs that died which never names again what it held (this
+/// raw channel does not, unlike the server's page cache) loses it after the
+/// next diskfs's grace (`RESTART_GRACE`, 5 s): that diskfs keeps the client's
+/// unlinked inode at first, frees it once the grace is over although the old
+/// channel is still open, and the handle is stale then. (A client that does
+/// not come back holds nothing for good.)
+fn lapsed_holds() -> Result<(), i64> {
+    let mut a = Client::open().map_err(|_| 220)?;
+    let na = Names::new(&a).map_err(|_| 221)?;
+    let x = create(&mut a, &na, b"ringtest.lapse").map_err(|_| 222)?;
+    let src = Object::new(64).map_err(|_| 223)?;
+    let ga = a.grant(&src, false);
+    check!(224, ga > 0);
+    check!(225, a.status(Request::Write { ino: x, offset: 0, buf: buf(ga as u32, 0, 64 * PAGE as usize) }) == 64 * PAGE as i64);
+    check!(226, a.status(Request::Flush) == 0);
+    let (n, _) = na.put(b"ringtest.lapse", b"");
+    let r = a.call(Request::Unlink { dir: root(), name: n, is_dir: false }).map_err(|_| 227)?;
+    check!(228, r.status == 0 && r.values[0] == x.ino as u64);
+    let free = |c: &mut Client| c.call(Request::Statfs).map(|r| Usage::from_values(&r.values).free_blocks as i64).unwrap_or(-1);
+    let held = free(&mut a);
+    let name = b"diskfs";
+    check!(229, syscall(TEST_KILL_SERVER, [name.as_ptr() as u64, name.len() as u64, 0, 0, 0, 0]) == 0);
+    let start = now();
+    // A new client (it starts diskfs again, once the old one is gone) sees the
+    // inode kept, then freed.
+    let mut b = loop {
+        match Client::open() {
+            Ok(b) => break b,
+            Err(_) if now() < start + TIMEOUT => pause_ms(20),
+            Err(_) => return Err(230),
+        }
+    };
+    check!(231, (0..=held + 4).contains(&free(&mut b)));
+    let deadline = start + 20_000_000_000;
+    while free(&mut b) < held + 64 {
+        check!(232, now() < deadline);
+        pause_ms(100);
+    }
+    check!(233, now() - start >= 4_000_000_000);
+    check!(234, b.status(Request::Stat { ino: x }) == -ESTALE);
+    drop(a);
     Ok(())
 }
 

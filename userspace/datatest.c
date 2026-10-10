@@ -27,6 +27,8 @@
 #include <unistd.h>
 
 #define PG 4096
+/* restricted::TEST_KILL_SERVER (test mode): kills the kernel's server `name`. */
+#define TEST_KILL_SERVER 1523
 #define MIB (1024 * 1024L)
 
 static int failures;
@@ -652,12 +654,12 @@ static void orphan_survives_diskfs_restart(void) {
     unlink(path);
     sync();
     statfs("/data", &held);
-    long killed = syscall(1522, "diskfs");
+    long killed = syscall(TEST_KILL_SERVER, "diskfs");
     /* The Linux server connects to the next diskfs at once (the kernel tells it the old
      * one died), without a use of /data: a while later there is a diskfs to kill again
      * (the file must outlive that restart too). */
     usleep(500 * 1000);
-    long again = syscall(1522, "diskfs");
+    long again = syscall(TEST_KILL_SERVER, "diskfs");
     int up = 0;
     for (int i = 0; i < 100 && !up; i++) {
         up = statfs("/data", &restarted) == 0;

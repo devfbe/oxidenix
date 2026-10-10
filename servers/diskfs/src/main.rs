@@ -102,7 +102,7 @@ fn main(args: Vec<&'static str>) -> i32 {
     loop {
         // Sleep only with nothing to do and every doorbell armed.
         let sleep = !rings.busy() && rings.prepare_sleep();
-        let event = oxrt::ipc_receive(&mut request, if sleep { None } else { Some(0) });
+        let event = oxrt::ipc_receive(&mut request, if sleep { rings.sleep_limit() } else { Some(0) });
         rings.awake();
         match event {
             // No protocol besides the rings.
@@ -113,10 +113,12 @@ fn main(args: Vec<&'static str>) -> i32 {
                 let status = rings.offer(&request[..len]);
                 let _ = oxrt::ipc_reply(id, &status.to_le_bytes());
             }
-            // A doorbell: also when a predecessor's channel went.
+            // A doorbell (also when a predecessor's channel went), or the end
+            // of the predecessors' grace.
+            Ok(oxrt::Event::Doorbell) => rings.settle(&mut fs, true),
+            Ok(oxrt::Event::Timeout) => rings.settle(&mut fs, false),
             _ => {}
         }
-        rings.settle(&mut fs);
         rings.run(&mut fs);
     }
 }

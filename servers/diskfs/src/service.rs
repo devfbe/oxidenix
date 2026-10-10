@@ -56,9 +56,18 @@
 //! dead diskfs hears of its death from the kernel (`EVENT_SERVICE_GONE`),
 //! connects, names what it holds and then closes its old channel; once
 //! the count is 0 (each fall rings diskfs's doorbell), diskfs frees what is
-//! on the orphan list and no channel holds (`settle`). The first diskfs
-//! since boot has no predecessors: it frees the whole list at once (what
-//! a crash left).
+//! on the orphan list and no channel holds (`settle`). The wait is bounded:
+//! a client that has not done so within `RESTART_GRACE` (it is told at
+//! once, and does it in milliseconds) loses what it held, as if it were
+//! gone; its handles are stale then (ESTALE), never another file's. The
+//! first diskfs since boot has no predecessors: it frees the whole list at
+//! once (what a crash left).
+//!
+//! What a client holds is bounded by the filesystem (a bit per inode and
+//! channel, `Bitmap`), and only inodes in use with the generation the
+//! handle names are held. Per request, deciding whether an inode may be
+//! freed looks at each channel's bit (at most `MAX_CHANNELS`); the orphan
+//! list is walked once, when the predecessors are done.
 //!
 //! **Hostile clients.** Each descriptor is copied out of the ring once and
 //! validated (`fsring::Request::decode`); a grant must exist and hold the
@@ -100,6 +109,9 @@ const SECTOR: u64 = SECTOR_SIZE as u64;
 
 /// Channels attached at once (one per Linux server instance).
 const MAX_CHANNELS: usize = 16;
+/// How long a restarted diskfs keeps what its predecessors' clients may
+/// hold for them, at most (see "Restarts"), in milliseconds.
+pub const RESTART_GRACE: u64 = 5_000;
 /// Grants of a channel diskfs keeps what it learnt of (`FORGET` lets go).
 const MAX_GRANTS: usize = 1024;
 /// Reads and writes in flight, over all channels.
@@ -369,8 +381,10 @@ pub struct Service {
     barriers: VecDeque<(usize, Desc)>,
     inodes: u64,
     /// Channels of an earlier diskfs still have clients (see "Restarts"):
-    /// nothing they might hold is freed meanwhile.
+    /// nothing they might hold is freed meanwhile, until this deadline
+    /// (`oxrt::uptime_ms`) at the latest.
     inherited: bool,
+    grace_until: u64,
     /// The inodes this diskfs created (no earlier one's client holds them).
     created: Bitmap,
     /// The channel the next round starts with.
@@ -418,6 +432,7 @@ impl Service {
             barriers: VecDeque::new(),
             inodes,
             inherited,
+            grace_until: oxrt::uptime_ms().saturating_add(RESTART_GRACE),
             created: Bitmap::new(inodes),
             rr: 0,
             bounce: (0..slots).rev().collect(),
@@ -851,12 +866,30 @@ impl Service {
         }
     }
 
-    /// Called when the doorbell rang (and at start): once no channel of an
-    /// earlier diskfs has a client left, the orphans no client holds are
-    /// freed (see "Restarts").
-    pub fn settle(&mut self, fs: &mut Fs) {
-        if !self.inherited || oxrt::chan_predecessors().is_ok_and(|n| n > 0) {
+    /// How long the event loop may sleep at most: until the grace for the
+    /// predecessors' clients ends (None: no limit).
+    pub fn sleep_limit(&self) -> Option<u64> {
+        self.inherited.then(|| self.grace_until.saturating_sub(oxrt::uptime_ms()))
+    }
+
+    /// Called when the doorbell rang (`rang`: a predecessor's channel may
+    /// have gone; the count is asked only then) or a wait timed out: once no
+    /// channel of an earlier diskfs has a client left, or the grace is over,
+    /// the orphans no client holds are freed (see "Restarts").
+    pub fn settle(&mut self, fs: &mut Fs, rang: bool) {
+        if !self.inherited {
             return;
+        }
+        let expired = oxrt::uptime_ms() >= self.grace_until;
+        if !rang && !expired {
+            return;
+        }
+        let waiting = oxrt::chan_predecessors().unwrap_or(0);
+        if waiting > 0 && !expired {
+            return;
+        }
+        if waiting > 0 {
+            println!("diskfs: {} clients of the diskfs before did not come back in time; what they held is let go", waiting);
         }
         self.inherited = false;
         let chans = &self.chans;

@@ -834,6 +834,14 @@ int main(int argc, char **argv) {
         if (r != 0) printf("    (scenario 9: check %d failed)\n", errno);
         check("diskfs ring: they complete once the client makes room", r == 0);
     }
+    /* A client of a dead diskfs that never comes back loses its holds after
+     * the next diskfs's grace (and its handles are stale then). */
+    {
+        errno = 0;
+        long r = syscall(TEST_DISKRING, 10);
+        if (r != 0) printf("    (scenario 10: check %d failed)\n", errno);
+        check("diskfs ring: a dead diskfs's client that never comes back loses its holds", r == 0);
+    }
     /* What the ring wrote (and flushed), read through /data (the server's
      * page cache, over its own channel): byte i is i % 251. */
     {

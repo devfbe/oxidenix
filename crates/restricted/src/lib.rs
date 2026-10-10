@@ -925,4 +925,4 @@ pub const TEST_SLEEP_LOCKED: u64 = 1521;
 /// (ESRCH if none), as a crash would: the restart policy brings it back at
 /// its next use. Test mode only (ENOSYS otherwise); a program's call with a
 /// C string `name` is the server's to pass on (datatest: diskfs's orphans).
-pub const TEST_KILL_SERVER: u64 = 1522;
+pub const TEST_KILL_SERVER: u64 = 1523;
