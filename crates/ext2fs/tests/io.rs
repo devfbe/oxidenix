@@ -1314,7 +1314,8 @@ fn failed_commits_never_free_a_named_or_a_free_inode() {
         } else {
             // The device works again: the caller releases what it holds (what nobody holds
             // the filesystem frees itself), and goes down cleanly: e2fsck finds nothing.
-            for &ino in &held {
+            let deferred = fs.take_deferred();
+            for &ino in held.iter().chain(deferred.iter()) {
                 if fs.releasable(ino) {
                     if let Err(e) = fs.release(ino) {
                         problems.push(format!("{what}: releasing {ino}: {e} (held {held:?}, broken {})", fs.broken()));
@@ -1373,7 +1374,12 @@ fn inodes_a_failed_commit_kept_are_freed_later() {
         fs.unlink_unless(ROOT_INO, "unused", false, |_| false).unwrap();
     }
     fs.release(held).unwrap();
-    // (The next change frees what nobody holds.)
+    // What nobody holds is the owner's to free (it knows the holds).
+    for ino in fs.take_deferred() {
+        if fs.releasable(ino) {
+            fs.release(ino).unwrap();
+        }
+    }
     let x = fs.create(ROOT_INO, "x", &NewNode::File, 0o644).unwrap();
     fs.unlink_unless(ROOT_INO, "x", false, |_| false).unwrap();
     assert!(fs.check(held).is_err() && fs.check(unused).is_err() && fs.check(x).is_err());
@@ -1435,9 +1441,11 @@ fn the_state_says_in_use_until_let_go() {
     let disk = mkfs("state", 2 * 1024);
     assert_eq!(state(&disk), 1);
     let mut fs = Ext2::mount(disk).unwrap();
+    // In use: nothing written until the first change, then "not clean" before it.
     fs.set_in_use(true).unwrap();
-    assert_eq!(state(fs.device()), 0);
+    assert_eq!(state(fs.device()), 1);
     let f = fs.create(ROOT_INO, "f", &NewNode::File, 0o644).unwrap();
+    assert_eq!(state(fs.device()), 0);
     write_file(&mut fs, f, 64 * 1024);
     // A crash now: the disk is not clean, and e2fsck -p checks it.
     let crashed = RamDisk { data: fs.device().data.clone(), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None };
@@ -1447,12 +1455,40 @@ fn the_state_says_in_use_until_let_go() {
     std::fs::remove_file(&path).unwrap();
     let said = String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
     assert!(said.contains("was not cleanly unmounted"), "e2fsck -p: {said}");
-    fs.set_in_use(false).unwrap();
+    // An inode still to be freed (an open file unlinked): not clean while it is owed.
+    fs.unlink(ROOT_INO, "f", false).unwrap();
+    assert_eq!(fs.set_in_use(false), Ok(false));
+    assert_eq!(state(fs.device()), 0);
+    fs.release(f).unwrap();
+    assert_eq!(fs.set_in_use(false), Ok(true));
     assert_eq!(state(fs.device()), 1);
     fsck("state", &take(fs));
     // Mounted after that crash: it stays not clean when let go of (e2fsck's to clear).
     let mut fs = Ext2::mount(crashed).unwrap();
     fs.set_in_use(true).unwrap();
+    fs.create(ROOT_INO, "g", &NewNode::File, 0o644).unwrap();
     fs.set_in_use(false).unwrap();
     assert_eq!(state(fs.device()), 0);
+}
+
+/// A read-only disk (every write fails): in use, it serves reads and refuses changes, and
+/// nothing is ever written (not even the state).
+#[test]
+fn a_read_only_disk_serves_reads() {
+    let mut fs = Ext2::mount(mkfs("readonly", 2 * 1024)).unwrap();
+    let f = fs.create(ROOT_INO, "f", &NewNode::File, 0o644).unwrap();
+    write_file(&mut fs, f, 64 * 1024);
+    let mut disk = take(fs);
+    let before = disk.data.clone();
+    disk.fail_writes(0, usize::MAX);
+    let mut fs = Ext2::mount(disk).unwrap();
+    fs.set_in_use(true).unwrap();
+    assert_eq!(fs.lookup(ROOT_INO, "f"), Ok(f));
+    check_file(&mut fs, f, 64 * 1024);
+    assert!(fs.create(ROOT_INO, "g", &NewNode::File, 0o644).is_err());
+    assert!(fs.write(f, 0, b"x").is_err());
+    // (Reads still work after a refused change.)
+    check_file(&mut fs, f, 64 * 1024);
+    let _ = fs.set_in_use(false);
+    assert!(take(fs).data == before, "a read-only disk was written");
 }

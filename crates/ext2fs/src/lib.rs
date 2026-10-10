@@ -53,8 +53,10 @@
 //! did not commit waits to be freed (`releasing`) and is released again, never re-listed.
 //! An unlink or rename whose final commit fails still happened (it is in the cache, and the
 //! retry writes it): its caller gets the inodes to hold all the same. Inodes nobody holds
-//! that a failed commit kept from being freed (an immediate free's, a recovery's) are the
-//! filesystem's own (`deferred`): `ready` frees them once commits go through. An operation
+//! that a failed commit kept from being freed (an immediate free's, a recovery's) wait for
+//! their owner to free them (`take_deferred`: it knows who holds what). An unlink whose
+//! commits failed has happened in the cache only: if the filesystem breaks (or its owner
+//! dies) before the retry writes it, the unlink is lost although it was acknowledged. An operation
 //! that fails part way through a free (a release, a truncation: blocks freed in the cache
 //! while the inode on the disk still points to them) leaves changes that must never reach
 //! the disk: the filesystem is `broken` (every change and `sync` fail, nothing is written,
@@ -68,10 +70,12 @@
 //! reads).
 //!
 //! **Clean.** The superblock's state (`s_state`) says "not cleanly unmounted" while the
-//! filesystem is in use (`set_in_use`: diskfs, while any client is connected), so after a
-//! crash a host's `e2fsck -p` (and Linux's mount) knows to check it; when it is no longer in
-//! use the state it had at mount is written back (a filesystem that was not clean then
-//! stays so until e2fsck).
+//! filesystem is in use (`set_in_use`: diskfs, while any client is connected) and anything
+//! has been changed, so after a crash a host's `e2fsck -p` (and Linux's mount) knows to
+//! check it; it is written before the first change (a read-only disk is never written).
+//! When it is no longer in use, and nothing is owed (`owed`: inodes still to be freed, or
+//! that failed commits left), the state it had at mount is written back, after everything
+//! else reached the disk (a filesystem that was not clean then stays so until e2fsck).
 //!
 //! On a host: Linux's ext2 driver ignores `s_last_orphan`; its ext4 driver frees the
 //! listed inodes at mount (also read-only, unless the device itself is read-only);
@@ -348,8 +352,14 @@ struct State<D: Device> {
     broken: bool,
     /// The superblock has the orphan list's field (revision 1).
     has_orphan_list: bool,
-    /// `s_state` as it was at mount (`set_in_use`).
+    /// `s_state` as it was at mount (`set_in_use`); whether the filesystem is in use, and
+    /// whether the disk says so now (not clean).
     mount_state: u16,
+    in_use: bool,
+    marked: bool,
+    /// Blocks and inodes freed since the mount: an operation that fails after it freed
+    /// something leaves the cache untrustworthy (`broken`), one that fails before does not.
+    frees: u64,
     /// Data blocks reserved for writes in flight (`Ext2::reserve`): in no
     /// bitmap and no inode yet, but no allocation takes them.
     reserved: BTreeSet<u32>,
@@ -994,6 +1004,7 @@ impl<D: Device> State<D> {
 
     fn free_block(&mut self, block: u32) -> Result<(), i64> {
         self.check_block(block)?;
+        self.frees += 1;
         self.cache.remove(block);
         self.fresh.remove(&block);
         self.new_meta.remove(&block);
@@ -1031,6 +1042,7 @@ impl<D: Device> State<D> {
     }
 
     fn free_inode(&mut self, ino: u32, dir: bool) -> Result<(), i64> {
+        self.frees += 1;
         let g = self.group_of(ino);
         if !self.clear_bit(self.groups[g].inode_bitmap, (ino - 1) % self.inodes_per_group)? {
             return Ok(());
@@ -2195,6 +2207,9 @@ impl<D: Device> Ext2<D> {
             broken: false,
             has_orphan_list: rev >= 1,
             mount_state: le16(&sb, 58),
+            in_use: false,
+            marked: false,
+            frees: 0,
             reserved: BTreeSet::new(),
             reserved_promised: BTreeMap::new(),
             promises: BTreeMap::new(),
@@ -2228,7 +2243,7 @@ impl<D: Device> Ext2<D> {
 
     pub fn stat(&mut self, ino: u32) -> Result<Stat, i64> {
         let i = self.st.read_inode(ino);
-        let i = self.commit(i)?;
+        let i = self.looked(i)?;
         Ok(Stat {
             mode: i.mode() as u32,
             size: i.size(),
@@ -2242,7 +2257,7 @@ impl<D: Device> Ext2<D> {
 
     pub fn read(&mut self, ino: u32, off: u64, buf: &mut [u8]) -> Result<usize, i64> {
         let result = self.st.read(ino, off, buf);
-        self.commit(result)
+        self.looked(result)
     }
 
     /// Commits what `result`'s operation changed; its error wins. Every
@@ -2259,32 +2274,57 @@ impl<D: Device> Ext2<D> {
         if self.st.pending {
             self.st.commit()?;
         }
-        // Inodes nobody holds that a failed commit kept from being freed (`deferred`).
-        while let Some(ino) = self.st.deferred.pop() {
-            // (Its free may be done already, with a commit that failed.)
-            if !self.releasable(ino) {
-                continue;
+        // In use: the disk says "not clean" before the first change goes out ("Clean").
+        if self.st.in_use && !self.st.marked {
+            let state = self.st.mount_state & !STATE_VALID;
+            if le16(&self.st.sb, 58) != state {
+                put16(&mut self.st.sb, 58, state);
+                self.st.super_dirty = true;
             }
-            if let Err(e) = self.free(ino) {
-                if !self.st.broken {
-                    self.st.deferred.push(ino);
-                }
-                return Err(e);
-            }
+            self.st.commit()?;
+            self.st.marked = true;
         }
         Ok(())
     }
 
-    /// Marks the filesystem in use (`s_state` without "valid": not cleanly unmounted) or
-    /// not (the state it had at mount), committed (module comment, "Clean").
-    pub fn set_in_use(&mut self, in_use: bool) -> Result<(), i64> {
-        self.ready()?;
-        let state = if in_use { self.st.mount_state & !STATE_VALID } else { self.st.mount_state };
-        if le16(&self.st.sb, 58) != state {
-            put16(&mut self.st.sb, 58, state);
-            self.st.super_dirty = true;
+    /// The inodes nobody holds that a failed commit kept from being freed (an immediate
+    /// free's, a recovery's), for the owner to free (`release`) when no one holds them: it
+    /// knows who holds what. Taken: asked again, they are not listed again.
+    pub fn take_deferred(&mut self) -> Vec<u32> {
+        core::mem::take(&mut self.st.deferred)
+    }
+
+    /// The filesystem is in use (its owner has clients) or not (module comment, "Clean").
+    /// In use: the disk is marked "not clean" before the first change goes out (nothing is
+    /// written now: a read-only disk serves reads all the same). Not in use: once every
+    /// change is on the disk (committed and flushed first) and nothing is owed that only
+    /// e2fsck or a later release would repair (`owed`), the state it had at mount is
+    /// written back, in a commit of its own. Whether the disk says so now.
+    pub fn set_in_use(&mut self, in_use: bool) -> Result<bool, i64> {
+        self.st.in_use = in_use;
+        if in_use || !self.st.marked {
+            return Ok(!self.st.marked);
         }
-        self.commit(Ok(()))
+        if self.owed() {
+            return Ok(false);
+        }
+        self.ready()?;
+        // Everything first, then the state, each flushed: the state never says "clean"
+        // over metadata that did not reach the disk.
+        self.st.commit()?;
+        put16(&mut self.st.sb, 58, self.st.mount_state);
+        self.st.super_dirty = true;
+        self.st.commit()?;
+        self.st.marked = false;
+        Ok(true)
+    }
+
+    /// Whether repairs are owed (the disk is not clean even when everything is written):
+    /// inodes whose last link went that are still allocated (listed or not), and those a
+    /// failed commit could not list.
+    pub fn owed(&self) -> bool {
+        let st = &self.st;
+        !st.orphans.is_empty() || !st.unlisted.is_empty() || !st.releasing.is_empty() || !st.deferred.is_empty() || st.orphan_failures > 0
     }
 
     /// Whether the cache holds changes that must never reach the disk (an operation
@@ -2292,6 +2332,16 @@ impl<D: Device> Ext2<D> {
     /// again (diskfs restarts) to go on from the disk's state.
     pub fn broken(&self) -> bool {
         self.st.broken
+    }
+
+    /// Ends an operation that changes nothing: what a failed commit left is tried again,
+    /// but its failure is not the reader's (a read-only or failing disk still serves
+    /// reads).
+    fn looked<T>(&mut self, result: Result<T, i64>) -> Result<T, i64> {
+        if self.st.pending && !self.st.broken {
+            let _ = self.st.commit();
+        }
+        result
     }
 
     fn commit<T>(&mut self, result: Result<T, i64>) -> Result<T, i64> {
@@ -2315,10 +2365,14 @@ impl<D: Device> Ext2<D> {
         if len > self.st.max_file_size() {
             return Err(EFBIG);
         }
-        // A truncation that fails part way may have freed blocks the inode on the disk
-        // still points to: none of it may reach the disk (`broken`).
+        // A truncation that fails after it freed blocks the inode on the disk still points
+        // to: none of it may reach the disk (`broken`). One that fails before changed
+        // nothing that matters.
+        let frees = self.st.frees;
         if let Err(e) = self.st.truncate(ino, &mut inode, len) {
-            self.st.broken = true;
+            if self.st.frees != frees {
+                self.st.broken = true;
+            }
             return Err(e);
         }
         self.commit(Ok(()))
@@ -2326,12 +2380,12 @@ impl<D: Device> Ext2<D> {
 
     pub fn list(&mut self, dir: u32) -> Result<Vec<(String, u32, u8)>, i64> {
         let result = self.st.list(dir);
-        self.commit(result)
+        self.looked(result)
     }
 
     pub fn lookup(&mut self, dir: u32, name: &str) -> Result<u32, i64> {
         let result = self.st.lookup(dir, name);
-        self.commit(result)
+        self.looked(result)
     }
 
     pub fn create(&mut self, dir: u32, name: &str, kind: &NewNode, perm: u32) -> Result<u32, i64> {
@@ -2388,9 +2442,15 @@ impl<D: Device> Ext2<D> {
         for (ino, mut inode) in unused {
             inode.set_links(0);
             put32(&mut inode.0, 20, now);
+            let frees = self.st.frees;
             if self.st.release(ino, inode).is_err() {
-                self.st.broken = true;
-                break;
+                if self.st.frees != frees {
+                    self.st.broken = true;
+                    break;
+                }
+                // (Nothing freed yet: it waits to be freed, as any the commit kept back.)
+                self.st.releasing.insert(ino);
+                self.st.deferred.push(ino);
             }
         }
         out
@@ -2523,9 +2583,12 @@ impl<D: Device> Ext2<D> {
             self.st.commit()?;
         }
         let inode = self.st.read_inode(ino)?;
+        let frees = self.st.frees;
         if let Err(e) = self.st.release(ino, inode) {
             // Partly freed in the cache: none of it may reach the disk.
-            self.st.broken = true;
+            if self.st.frees != frees {
+                self.st.broken = true;
+            }
             return Err(e);
         }
         self.st.releasing.remove(&ino);
@@ -2583,7 +2646,7 @@ impl<D: Device> Ext2<D> {
 
     pub fn readlink(&mut self, ino: u32) -> Result<String, i64> {
         let result = self.st.readlink(ino);
-        self.commit(result)
+        self.looked(result)
     }
 
     pub fn set_perm(&mut self, ino: u32, perm: u32) -> Result<(), i64> {

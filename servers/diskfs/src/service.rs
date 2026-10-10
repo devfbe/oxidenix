@@ -457,11 +457,10 @@ impl Service {
         if offer.slots != fsring::SLOTS {
             return -EINVAL;
         }
-        // The first client: the disk says "in use" (not cleanly unmounted) from now on.
+        // The first client: the filesystem is in use (the disk says "not clean" before the
+        // first change goes out; nothing is written now, so a read-only disk serves reads).
         if self.chans.iter().all(Option::is_none) {
-            if let Err(e) = fs.set_in_use(true) {
-                return -e;
-            }
+            let _ = fs.set_in_use(true);
         }
         let Some(slot) = self.chans.iter().position(Option::is_none) else { return -ENOSPC };
         let base = match oxrt::chan_attach(offer.channel) {
@@ -877,8 +876,10 @@ impl Service {
         }
     }
 
-    /// Frees again what a failed commit kept from being freed.
+    /// Frees again what a failed commit kept from being freed (diskfs's own tries, and the
+    /// inodes the filesystem kept back: `take_deferred`), unless someone may use them.
     fn retry_frees(&mut self, fs: &mut Fs) {
+        self.unfreed.extend(fs.take_deferred());
         for ino in core::mem::take(&mut self.unfreed) {
             self.try_free(fs, ino);
         }
@@ -926,11 +927,14 @@ impl Service {
         for ino in chan.held.inodes() {
             self.try_free(fs, ino);
         }
-        // The last client gone: the disk says what it said at mount (clean), before the
-        // channel goes (the kernel powers off once every channel went).
+        // The last client gone: the disk says what it said at mount (clean) unless repairs
+        // are owed, before the channel goes (the kernel powers off once every channel went).
         if self.chans.iter().all(Option::is_none) {
-            if let Err(e) = fs.set_in_use(false) {
-                println!("diskfs: cannot mark the disk clean (errno {})", e);
+            self.retry_frees(fs);
+            if self.unfreed.is_empty() {
+                if let Err(e) = fs.set_in_use(false) {
+                    println!("diskfs: cannot mark the disk clean (errno {})", e);
+                }
             }
         }
         // Vouches that no device uses its grants any more.
@@ -1135,9 +1139,7 @@ impl Service {
     // ------------------------------------------------------------ barriers
 
     fn run_barrier(&mut self, fs: &mut Fs, c: usize, d: &Desc) {
-        if !self.unfreed.is_empty() {
-            self.retry_frees(fs);
-        }
+        self.retry_frees(fs);
         let (status, values) = match Request::decode(d).and_then(|r| self.execute(fs, c, r)) {
             Ok((status, values)) => (status, values),
             Err(e) => (-e, [0; 4]),
