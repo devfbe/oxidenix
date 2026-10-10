@@ -413,8 +413,11 @@ About 13,100 lines of Rust (without comments and blank lines) in the kernel (16,
   crowd out committed memory waits for write-back. So every committed page has a frame: a
   fault that finds none reclaims again with its address space unlocked (so its own mappings
   can go too), then also pages used lately (as Linux raises its reclaim priority), and waits
-  for write-back meanwhile; only reclaim that makes no progress for about 1.6 s with nothing
-  dirty or pinned kills the toucher. `/proc/meminfo` shows `Committed_AS`, `CommitLimit`, `Cached` (with tmpfs), `Shmem`
+  for write-back meanwhile; only reclaim that makes no progress for about 1.6 s (30 s while
+  write-back may still make room) kills the toucher. Every such wait is killable and bounded,
+  one reclaim pass looks at a bounded number of pages, and each Linux server instance may hold
+  at most a tenth of the commit limit in dirty pages (its writers wait beyond) and a quarter
+  pinned. `/proc/meminfo` shows `Committed_AS`, `CommitLimit`, `Cached` (with tmpfs), `Shmem`
   (tmpfs and shared memory) and a `MemAvailable` that includes the droppable pages.
 - **Copy-on-write**: `fork` shares all private frames. Writable pages become read-only in both
   processes and are tagged with an OS-available page table bit. A write fault either copies the
@@ -1161,7 +1164,7 @@ Each of these programs and scripts lives in the root filesystem and runs inside 
 | Test | Covers |
 |---|---|
 | `cowtest` | copy-on-write isolation between parent and child, kernel writes into shared pages, 50 forks, shared read-only frames stay unchanged, `brk` does not grow over a mapping |
-| `oomtest` | fork bomb (stops at the process limit), memory exhaustion via `mmap`, 100 full pipes; the kernel survives and memory is reusable; a process touching `MAP_NORESERVE` memory beyond the commit limit is killed while one with committed memory touches all of it; a `read()` into an untouched `MAP_NORESERVE` buffer with nothing left to commit kills the reader too (not `EFAULT`); dirty cache pages count against the commit limit until written back; descriptors up to `RLIMIT_NOFILE` (4096, as `getrlimit` says), then `EMFILE`, a fork copying them all |
+| `oomtest` | fork bomb (stops at the process limit), memory exhaustion via `mmap`, 100 full pipes; the kernel survives and memory is reusable; a process touching `MAP_NORESERVE` memory beyond the commit limit is killed while one with committed memory touches all of it; a `read()` into an untouched `MAP_NORESERVE` buffer with nothing left to commit kills the reader too (not `EFAULT`); dirty cache pages count against the commit limit until written back, a writer's dirty pages stay within its tree's share, and a writer throttled because dirty pages would crowd out committed memory is killable at once; descriptors up to `RLIMIT_NOFILE` (4096, as `getrlimit` says), then `EMFILE`, a fork copying them all |
 | `sigtest` | handlers, killing a busy loop, `SIGCHLD`, `EINTR` on pipe reads, blocked and ignored signals, FPU state across asynchronous handlers, `alarm` and repeating `setitimer`, catchable `SIGFPE`/`SIGSEGV`/`SIGTRAP` from CPU exceptions, an uncaught `SIGFPE` killing the process |
 | `jobtest` | stop/continue reporting through `wait4`, restart of a stopped `read()`, `SIGKILL` on stopped processes, `SA_RESTART` |
 | `waittest` | processes in the Linux server: `wait4` and `waitid` with their options (`WNOHANG`, `WNOWAIT`, `WEXITED`, `WSTOPPED`, `WCONTINUED`, `__WCLONE`, `__WALL`), the `siginfo` and `rusage` they report, an ignored `SIGCHLD` and `SA_NOCLDWAIT` reaping at once, child subreapers, the parent-death signal, process groups and sessions (`setpgid`, `setsid`, `getsid` and their errors), `clone3`, `vfork` |

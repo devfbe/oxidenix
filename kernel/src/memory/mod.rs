@@ -425,6 +425,9 @@ pub fn ensure_user_frames(n: u64) -> bool {
 /// address space, for programs to end): about 1.6 s without any progress
 /// before the allocation fails (and its process is killed).
 pub const RECLAIM_RETRIES: u32 = 16;
+/// The same while dirty or pinned cache pages may still become droppable
+/// (write-back in progress): about 30 s.
+const RECLAIM_RETRIES_IO: u32 = 300;
 const RECLAIM_THROTTLE: u64 = 100_000_000;
 
 /// For an allocation that failed for want of a frame, with no lock held:
@@ -438,20 +441,21 @@ const RECLAIM_THROTTLE: u64 = 100_000_000;
 pub fn reclaim_retry(n: u64, tries: &mut u32) -> bool {
     let mut force = false;
     loop {
-        if crate::process::kill::dying() || *tries >= RECLAIM_RETRIES {
+        // Dirty or pinned cache pages become droppable once written back
+        // or ungranted: while there are some, more tries are allowed
+        // (commit counted them as taken, so what was promised is there
+        // once they are), but not for ever (a stuck disk), and not for a
+        // pager's thread, which may be the one to write them.
+        let waiting_for_io = crate::fs::cache::unavailable_pages() > 0 && !crate::process::linux::is_pager();
+        let most = if waiting_for_io { RECLAIM_RETRIES_IO } else { RECLAIM_RETRIES };
+        if crate::process::kill::dying() || *tries >= most {
             return false;
         }
         if with_frames(|f| f.user_may_take(n)) || reclaim_for(n, force) > 0 {
             return true;
         }
         force = true;
-        // Dirty or pinned cache pages become droppable once written back
-        // or ungranted: no try is lost waiting for them (commit counted
-        // them as taken, so what was promised is there once they are),
-        // except for a pager's thread, which may be the one to write them.
-        if crate::fs::cache::unavailable_pages() == 0 || crate::process::linux::is_pager() {
-            *tries += 1;
-        }
+        *tries += 1;
         let deadline = crate::time::now() + RECLAIM_THROTTLE;
         crate::process::sched::prepare_to_wait(reclaim_chan()).sleep_until(deadline);
     }

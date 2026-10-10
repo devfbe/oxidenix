@@ -129,9 +129,18 @@ space, and the walks (truncation, write-back) drop it before they lock a mapper.
   reclaimed, so a committed page always gets its frame: a fault that finds none reclaims again
   with its address space unlocked, so that its own mappings can go too, after a round without
   progress also pages used lately (Linux's rising reclaim priority), waiting 100 ms at a time
-  for write-back or busy address spaces (Linux's reclaim throttling); it counts a fruitless
-  try only while nothing is dirty or pinned (a pager's own thread always), and after 16 of
-  them the toucher is killed.
+  for write-back or busy address spaces (Linux's reclaim throttling); after 16 fruitless tries
+  (300, about 30 s, while dirty or pinned pages may still become droppable; 16 for a pager's
+  own thread, which may be the one to write them) the toucher is killed.
+- **Bounded, per instance.** No wait for memory is endless or unkillable: a throttled store
+  waits at most 30 s (then the committed side has its own end, above), a fill waits for frames
+  as a fault does, a fill or write-back for its instance's pins at most a second (then
+  `ENOMEM`). One reclaim pass looks at no more than 4096 pages (16 per page asked for, if
+  more), taking each cache's lock for at most 256 at a time and no lock across the walks of the
+  mappings. No Linux server instance can hold more than its share of what reclaim cannot drop
+  (`CacheCounts`): its storing threads wait above a tenth of the commit limit of dirty pages
+  (Linux bounds each device's share likewise), and its fills and write-backs pin at most a
+  quarter of it.
 - The file metadata quota (inodes, symlink targets, pipes) on the kernel heap stays.
 
 ### Disk files

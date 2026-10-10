@@ -66,6 +66,8 @@ use x86_64::structures::paging::{FrameDeallocator, PhysFrame};
 
 /// Largest file size (as `off_t` allows).
 pub const MAX_SIZE: u64 = i64::MAX as u64;
+/// Pages one reclaim looks at at least (more for larger requests).
+const RECLAIM_SCAN: usize = 4096;
 /// Pages reclaim looks at per hold of a cache's lock.
 const RECLAIM_BATCH: usize = 256;
 
@@ -80,6 +82,40 @@ pub fn dirty_pages() -> u64 {
 /// Pages of cached objects that are pinned: being filled, written back or
 /// granted otherwise.
 static PINNED: AtomicU64 = AtomicU64::new(0);
+
+/// The dirty and pinned pages of one pager's (one Linux server
+/// instance's) cached objects: no instance may hold more than its share
+/// of what reclaim cannot drop, so one cannot starve the others.
+#[derive(Default)]
+pub struct CacheCounts {
+    dirty: AtomicU64,
+    pinned: AtomicU64,
+}
+
+impl CacheCounts {
+    /// The dirty pages above which an instance's storing threads wait for
+    /// its write-back (half the global hard ratio: Linux bounds each
+    /// device's share of the dirty pages the same way).
+    fn dirty_limit() -> u64 {
+        memory::commit_stats().1 / HARD / 2
+    }
+
+    /// The most pages an instance may have pinned (filled or written back
+    /// at once): a quarter of the commit limit.
+    fn pinned_limit() -> u64 {
+        memory::commit_stats().1 / 4
+    }
+}
+
+/// How long a fill or write-back waits for its instance's pinned pages
+/// to drop below the limit, and how often it looks.
+const PIN_WAIT: u64 = 1_000_000_000;
+const PIN_RECHECK: u64 = 10_000_000;
+
+/// Where they wait (for the time to pass).
+fn pin_chan() -> usize {
+    &PINNED as *const AtomicU64 as usize
+}
 
 /// Cache pages that reclaim cannot drop now, dirty or pinned: they are
 /// not there for committed memory until write-back or the grant ends, so
@@ -150,7 +186,7 @@ enum Store {
     Paged { pager: Weak<dyn Pager>, key: u64 },
     /// A file the pager caches (see the module comment), known to it as
     /// `key`, which may grow to `limit` bytes.
-    Cached { pager: Weak<dyn Pager>, key: u64, limit: u64 },
+    Cached { pager: Weak<dyn Pager>, key: u64, limit: u64, counts: Arc<CacheCounts> },
 }
 
 struct Page {
@@ -233,9 +269,11 @@ const BACKGROUND: u64 = 10;
 const HARD: u64 = 5;
 /// The longest a storing thread waits for write-back at once.
 const THROTTLE: u64 = 1_000_000_000;
-/// How often a store waiting for dirty pages that crowd out committed
-/// memory looks again (and asks the pagers again).
+/// How often a throttled store looks again (and asks the pagers again),
+/// and the longest it waits while dirty pages crowd out committed memory
+/// or its instance is over its share.
 const CROWDED_RECHECK: u64 = 100_000_000;
+const CROWDED_WAIT: u64 = 30_000_000_000;
 
 /// Where threads throttled by `balance_dirty` wait.
 fn dirty_chan() -> usize {
@@ -602,12 +640,12 @@ impl PageCache {
 
     /// A file of `size` bytes (at most `limit`) that `pager` caches and
     /// knows as `key` (see the module comment).
-    pub fn cached(size: u64, limit: u64, pager: Weak<dyn Pager>, key: u64) -> Result<Arc<PageCache>, i64> {
+    pub fn cached(size: u64, limit: u64, pager: Weak<dyn Pager>, key: u64, counts: Arc<CacheCounts>) -> Result<Arc<PageCache>, i64> {
         let limit = limit.min(MAX_SIZE);
         if size > limit {
             return Err(EFBIG);
         }
-        let cache = Self::new(Store::Cached { pager, key, limit }, size, 0)?;
+        let cache = Self::new(Store::Cached { pager, key, limit, counts }, size, 0)?;
         Self::reclaimable(&cache)?;
         Ok(cache)
     }
@@ -1027,7 +1065,7 @@ impl PageCache {
                             page.dirty = true;
                             st.dirty += 1;
                             first_dirty |= st.dirty == 1;
-                            DIRTY.fetch_add(1, Ordering::Relaxed);
+                            self.dirty_added(1);
                         }
                         if pos > size {
                             Self::grow(&mut st, pos);
@@ -1178,6 +1216,62 @@ impl PageCache {
         Ok(())
     }
 
+    /// The instance's counts of a cached object.
+    fn counts(&self) -> Option<&CacheCounts> {
+        match &self.store {
+            Store::Cached { counts, .. } => Some(counts),
+            _ => None,
+        }
+    }
+
+    fn dirty_added(&self, pages: u64) {
+        DIRTY.fetch_add(pages, Ordering::Relaxed);
+        if let Some(c) = self.counts() {
+            c.dirty.fetch_add(pages, Ordering::Relaxed);
+        }
+    }
+
+    fn dirty_removed(&self, pages: u64) {
+        if let Some(c) = self.counts() {
+            c.dirty.fetch_sub(pages, Ordering::Relaxed);
+        }
+        undirty(pages);
+    }
+
+    fn pinned_added(&self, pages: u64) {
+        PINNED.fetch_add(pages, Ordering::Relaxed);
+        if let Some(c) = self.counts() {
+            c.pinned.fetch_add(pages, Ordering::Relaxed);
+        }
+    }
+
+    fn pinned_removed(&self, pages: u64) {
+        PINNED.fetch_sub(pages, Ordering::Relaxed);
+        if let Some(c) = self.counts() {
+            c.pinned.fetch_sub(pages, Ordering::Relaxed);
+        }
+    }
+
+    /// How many more pages this object's instance may pin (`pin_fill`,
+    /// `pin_dirty`), at most `want`: if none, it waits for its fills and
+    /// write-backs in flight to end, up to `PIN_WAIT` (killably); ENOMEM
+    /// after that.
+    fn pin_room(&self, want: u64) -> Result<u64, Scan> {
+        let deadline = crate::time::now() + PIN_WAIT;
+        loop {
+            let pinned = self.counts().map_or(0, |c| c.pinned.load(Ordering::Relaxed));
+            let room = want.min(CacheCounts::pinned_limit().saturating_sub(pinned));
+            if room > 0 {
+                return Ok(room);
+            }
+            let now = crate::time::now();
+            if now >= deadline || crate::process::kill::dying() {
+                return Err(Scan::Errno(ENOMEM));
+            }
+            crate::process::sched::prepare_to_wait(pin_chan()).sleep_until((now + PIN_RECHECK).min(deadline));
+        }
+    }
+
     /// Tells the pager that this object has a dirty page now (its first).
     fn notify_dirty(&self) {
         if let Store::Cached { pager, key, .. } = &self.store {
@@ -1248,7 +1342,7 @@ impl PageCache {
             st.image_len = st.image_len.min(len);
             let wake = st.changed(first_gone, u64::MAX);
             drop(st);
-            undirty(dirty);
+            self.dirty_removed(dirty);
             free_frames(gone.into_values().map(|p| p.frame));
             self.uncharge(charged);
             (first_gone, wake)
@@ -1415,7 +1509,7 @@ impl PageCache {
                 Some(page) if page.frame == frame && page.pins > 0 => {
                     page.pins -= 1;
                     if page.pins == 0 && self.is_cached() {
-                        PINNED.fetch_sub(1, Ordering::Relaxed);
+                        self.pinned_removed(1);
                     }
                 }
                 _ => debug_assert!(self.is_cached(), "unpinning a page that is not pinned"),
@@ -1456,6 +1550,7 @@ impl PageCache {
             Ok((start, stop - start))
         };
         let (start, count) = find(&self.state.lock())?;
+        let count = self.pin_room(count)?;
         let mut frames = Vec::new();
         frames.try_reserve_exact(count as usize).map_err(|_| Scan::Errno(ENOMEM))?;
         // Frames from free memory or reclaimed cache pages (no cache lock
@@ -1490,7 +1585,7 @@ impl PageCache {
             st.pages.insert(index, Page { pins: 1, pending: true, ..Page::new(frame) });
             taken += 1;
         }
-        PINNED.fetch_add(taken as u64, Ordering::Relaxed);
+        self.pinned_added(taken as u64);
         st.charged += taken as u64;
         let wake = st.changed(start, start + taken as u64);
         drop(st);
@@ -1541,7 +1636,7 @@ impl PageCache {
                     // A pin keeps its own reference (`unpin`, which finds
                     // the page gone: it is no longer pinned memory).
                     if page.pins > 0 {
-                        PINNED.fetch_sub(1, Ordering::Relaxed);
+                        self.pinned_removed(1);
                     }
                     gone.push(page.frame);
                 }
@@ -1573,8 +1668,9 @@ impl PageCache {
             return Err(Scan::Errno(EINVAL));
         }
         let end = first.saturating_add(window);
+        let room = self.pin_room(window.min(MAX_RUN))?;
         let mut frames = Vec::new();
-        frames.try_reserve_exact(window.min(MAX_RUN) as usize).map_err(|_| Scan::Errno(ENOMEM))?;
+        frames.try_reserve_exact(room as usize).map_err(|_| Scan::Errno(ENOMEM))?;
         let (start, size) = {
             let mut st = self.state.lock();
             if st.dirty == 0 {
@@ -1587,12 +1683,12 @@ impl PageCache {
                     None if scanned >= MAX_SCAN => return Err(Scan::Resume(index)),
                     None if !page.dirty => continue,
                     None => start = Some(index),
-                    Some(s) if !page.dirty || index != s + frames.len() as u64 || frames.len() as u64 == MAX_RUN => break,
+                    Some(s) if !page.dirty || index != s + frames.len() as u64 || frames.len() as u64 == room => break,
                     Some(_) => {}
                 }
                 page.dirty = false;
                 if page.pins == 0 {
-                    PINNED.fetch_add(1, Ordering::Relaxed);
+                    self.pinned_added(1);
                 }
                 page.pins += 1;
                 frames.push(page.frame);
@@ -1601,7 +1697,7 @@ impl PageCache {
             st.dirty -= (frames.len() as u64).min(st.dirty);
             (start, size)
         };
-        undirty(frames.len() as u64);
+        self.dirty_removed(frames.len() as u64);
         memory::with_frames(|f| frames.iter().for_each(|&frame| f.share(frame)));
         let pages: Vec<u64> = (start..start + frames.len() as u64).collect();
         self.write_protect(&pages);
@@ -1619,7 +1715,7 @@ impl PageCache {
             for index in pending {
                 if let Some(page) = st.pages.remove(&index) {
                     if page.pins > 0 {
-                        PINNED.fetch_sub(1, Ordering::Relaxed);
+                        self.pinned_removed(1);
                     }
                     gone.push(page.frame);
                 }
@@ -1671,7 +1767,7 @@ impl PageCache {
             }
             let was = st.dirty;
             st.dirty += marked;
-            DIRTY.fetch_add(marked, Ordering::Relaxed);
+            self.dirty_added(marked);
             was == 0 && marked > 0
         };
         if first_dirty {
@@ -1704,7 +1800,8 @@ impl PageCache {
     /// map this file, `mappers`, each taken only if free, so reclaim never
     /// waits for a space whose holder may be waiting for memory). Returns
     /// how many it dropped.
-    fn shrink(&self, want: u64, unmap: bool, force: bool) -> u64 {
+    /// Looks at no more pages than `budget` allows (and takes them off).
+    fn shrink(&self, want: u64, unmap: bool, force: bool, budget: &mut usize) -> u64 {
         let mut freed = 0;
         let mut seen = 0;
         loop {
@@ -1712,10 +1809,11 @@ impl PageCache {
             // Three turns around the file: the first may only clear the
             // marks, the second the accessed bits of the mapped pages.
             let turns = if unmap { 3 } else { 2 };
-            if freed >= want || seen >= turns * st.pages.len() {
+            if freed >= want || seen >= turns * st.pages.len() || *budget == 0 {
                 break;
             }
             let start = st.cursor;
+            let take = RECLAIM_BATCH.min(*budget);
             let (mut gone, mut frames, mut mapped) = (Vec::new(), Vec::new(), Vec::new());
             if gone.try_reserve(RECLAIM_BATCH).is_err()
                 || frames.try_reserve(RECLAIM_BATCH).is_err()
@@ -1726,7 +1824,7 @@ impl PageCache {
             let mut next = 0;
             let mut looked = 0;
             memory::with_frames(|frames| {
-                for (&index, page) in st.pages.range_mut(start..).take(RECLAIM_BATCH) {
+                for (&index, page) in st.pages.range_mut(start..).take(take) {
                     looked += 1;
                     next = index + 1;
                     if page.referenced && !force {
@@ -1751,7 +1849,9 @@ impl PageCache {
                 }
             });
             seen += looked.max(1);
-            st.cursor = if looked < RECLAIM_BATCH { 0 } else { next };
+            *budget = budget.saturating_sub(looked.max(1));
+            // (Fewer than it could take: the end of the file.)
+            st.cursor = if looked < take { 0 } else { next };
             frames.extend(gone.iter().filter_map(|i| st.pages.remove(i)).map(|p| p.frame));
             st.charged -= frames.len() as u64;
             drop(st);
@@ -1844,7 +1944,7 @@ impl PageCache {
                 Step::Dirty { first: false }
             } else {
                 st.pages.get_mut(&index).expect("found above").dirty = true;
-                DIRTY.fetch_add(1, Ordering::Relaxed);
+                self.dirty_added(1);
                 st.dirty += 1;
                 Step::Dirty { first: st.dirty == 1 }
             }
@@ -1960,35 +2060,40 @@ impl Mappers {
 pub fn balance_dirty() {
     let limit = memory::commit_stats().1;
     let (background, hard) = (limit / BACKGROUND, limit / HARD);
+    // The caller's instance's share of the dirty pages.
+    let own = crate::process::linux::cache_counts();
+    let own_over = || own.as_ref().is_some_and(|c| c.dirty.load(Ordering::Relaxed) > CacheCounts::dirty_limit());
     // Committed memory and the cache pages reclaim cannot drop together
     // beyond the limit: the frames promised could not all be had.
     let crowding = || {
         let (committed, limit) = memory::commit_stats();
         committed + unavailable_pages() > limit
     };
-    if dirty_pages() <= background && !crowding() {
+    if dirty_pages() <= background && !crowding() && !own_over() {
         return;
     }
     ask_pagers(dirty_pages().saturating_sub(background).max(1));
-    if crate::process::linux::is_pager() || (dirty_pages() <= hard && !crowding()) {
+    if crate::process::linux::is_pager() || (dirty_pages() <= hard && !crowding() && !own_over()) {
         return;
     }
-    // Above the hard ratio: up to `THROTTLE`. Crowding out committed
-    // memory: until write-back made room (killable), asking again.
-    let deadline = crate::time::now() + THROTTLE;
+    // Above the hard ratio, above the instance's share or crowding out
+    // committed memory: the storing thread waits for write-back, killably,
+    // up to `THROTTLE` (`CROWDED_WAIT` while it crowds out committed
+    // memory or its instance is over its share), looking again (and asking
+    // the pagers again) every `CROWDED_RECHECK`. A write-back that makes
+    // no progress for that long (a stuck disk) does not hold the store
+    // for ever: committed memory then has its own end (`memory::reclaim_retry`).
+    let start = crate::time::now();
     loop {
         let wait = crate::process::sched::prepare_to_wait(dirty_chan());
-        let crowded = crowding();
+        let (crowded, over) = (crowding(), own_over());
         let now = crate::time::now();
-        if crate::process::kill::dying() || (!crowded && (dirty_pages() <= hard || now >= deadline)) {
+        let limit = if crowded || over { CROWDED_WAIT } else { THROTTLE };
+        if crate::process::kill::dying() || (!crowded && !over && dirty_pages() <= hard) || now >= start + limit {
             break;
         }
-        if crowded {
-            wait.sleep_until(now + CROWDED_RECHECK);
-            ask_pagers(dirty_pages().max(1));
-        } else {
-            wait.sleep_until(deadline);
-        }
+        wait.sleep_until((now + CROWDED_RECHECK).min(start + limit));
+        ask_pagers(dirty_pages().max(1));
     }
 }
 
@@ -2040,6 +2145,10 @@ fn reclaim(want: u64, force: bool) -> u64 {
         if freed >= want || (unmap && !may_unmap) {
             break;
         }
+        // The work of one pass is bounded: it looks at no more pages than
+        // this (a large cache with little to drop is not walked whole each
+        // time; the cursors go on where it stopped).
+        let mut budget = RECLAIM_SCAN.max(want as usize * 16);
         let caches = CACHES.lock().len();
         for _ in 0..caches {
             let cache = {
@@ -2051,7 +2160,7 @@ fn reclaim(want: u64, force: bool) -> u64 {
             };
             // (The last reference may go here, outside the list's lock.)
             if let Some(cache) = cache {
-                freed += cache.shrink(want - freed, unmap, force);
+                freed += cache.shrink(want - freed, unmap, force, &mut budget);
             }
             if freed >= want {
                 break;
@@ -2077,9 +2186,9 @@ impl Drop for PageCache {
         // instance's end), or does not want the data (an unlinked file);
         // what an instance that died without writing back left is lost, as
         // on a crash.
-        undirty(pages.values().filter(|p| p.dirty).count() as u64);
+        self.dirty_removed(pages.values().filter(|p| p.dirty).count() as u64);
         if self.is_cached() {
-            PINNED.fetch_sub(pages.values().filter(|p| p.pins > 0).count() as u64, Ordering::Relaxed);
+            self.pinned_removed(pages.values().filter(|p| p.pins > 0).count() as u64);
         }
         free_frames(pages.into_values().map(|p| p.frame));
         self.uncharge(charged);

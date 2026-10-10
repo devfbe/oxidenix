@@ -199,6 +199,9 @@ pub struct Instance {
     /// The top of the server's heap, and the pages committed for it.
     heap_end: spin::Mutex<u64>,
     heap_pages: core::sync::atomic::AtomicU64,
+    /// The dirty and pinned pages of its cached objects (bounded per
+    /// instance, `fs::cache`).
+    cache_counts: Arc<crate::fs::cache::CacheCounts>,
     /// Memory objects the kernel mapped into the region (channels), by
     /// address; held while their entries change and shootdowns run.
     maps: crate::sync::Mutex<BTreeMap<u64, RegionMap>>,
@@ -322,6 +325,13 @@ impl Instance {
                 return Err(e);
             }
         };
+        let Ok(cache_counts) = Arc::try_new(crate::fs::cache::CacheCounts::default()) else {
+            memory::with_frames(|f| unsafe {
+                f.deallocate_frame(view);
+                f.deallocate_frame(pdpt);
+            });
+            return Err(ENOMEM);
+        };
         table_at(view)[SHARED_SLOT].set_frame(pdpt, table_flags());
         // From here on, dropping the instance frees what was mapped.
         static NEXT_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
@@ -350,6 +360,7 @@ impl Instance {
             programs: core::sync::atomic::AtomicUsize::new(0),
             heap_end: spin::Mutex::new(HEAP_BASE),
             heap_pages: core::sync::atomic::AtomicU64::new(0),
+            cache_counts,
             maps: crate::sync::Mutex::new(BTreeMap::new()),
             spaces: spin::Mutex::new(Vec::new()),
             channels: core::sync::atomic::AtomicUsize::new(0),
@@ -1180,6 +1191,12 @@ pub fn is_pager() -> bool {
     with_current(|p| p.linux.as_ref().is_some_and(|l| l.pager))
 }
 
+/// The dirty and pinned cache pages of the caller's instance, if it runs
+/// a Linux program or server.
+pub fn cache_counts() -> Option<Arc<crate::fs::cache::CacheCounts>> {
+    with_current(|p| p.linux.as_ref().map(|l| l.instance.cache_counts.clone()))
+}
+
 /// Whether the caller is the instance's pager, which takes its events.
 fn owns_events() -> bool {
     with_current(|p| p.linux.as_ref().is_some_and(|l| l.events))
@@ -1621,7 +1638,7 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
         SYS_MO_CREATE_CACHED => {
             let (size, key, limit) = (a[0], a[1], a[2]);
             let pager: alloc::sync::Weak<dyn crate::fs::cache::Pager> = Arc::downgrade(&instance) as _;
-            let cache = PageCache::cached(size, limit, pager, key)?;
+            let cache = PageCache::cached(size, limit, pager, key, instance.cache_counts.clone())?;
             Ok(instance.insert(Object::File(cache, None))? as i64)
         }
         SYS_MO_FILLED | SYS_MO_REDIRTY => {
