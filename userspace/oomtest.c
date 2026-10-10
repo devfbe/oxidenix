@@ -233,33 +233,31 @@ static void killed_with_threads(void) {
 }
 
 /* Cache pages that reclaim cannot drop (dirty ones, until written back)
- * are not there for committed memory: a commit that needs them is refused
- * while they are dirty and granted once they are written back. (The page
- * cache's clean pages count as free: a commit of all that is left
- * succeeds with a cache full of them, see cachetest.) */
+ * are not there for committed memory: a commit that needs them waits for
+ * their write-back (the server writes dirty files back on its own only
+ * after 5 s, long after this) and is granted then, and the memory is
+ * usable. (The page cache's clean pages count as free: a commit of all
+ * that is left succeeds with a cache full of them, see cachetest.) */
+static long now_ms(void);
 static void dirty_counts_against_commit(void) {
     const char *path = "/data/oomtest.dirty";
     static char chunk[64 * 1024];
     memset(chunk, 'd', sizeof chunk);
     int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
     for (int i = 0; i < 128; i++) write(fd, chunk, sizeof chunk);
-    /* (The server writes dirty files back after 5 s: well after this.) */
     long dirty = meminfo("Dirty:");
     long room = (meminfo("CommitLimit:") - meminfo("Committed_AS:")) * 1024 - 2 * MIB;
+    long t = now_ms();
     void *m = mmap(NULL, room, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    int refused = m == MAP_FAILED && errno == ENOMEM;
-    if (m != MAP_FAILED) munmap(m, room);
-    fsync(fd);
-    long after = meminfo("Dirty:");
-    m = mmap(NULL, room, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    t = now_ms() - t;
+    long after = meminfo("Dirty:") + meminfo("Writeback:");
     int granted = m != MAP_FAILED;
     if (granted) {
         for (long off = 0; off < room; off += 4096) ((char *)m)[off] = 1;
         munmap(m, room);
     }
-    printf("dirty: %ld kB, then %ld kB after fsync\n", dirty, after);
-    check("dirty cache pages count against the commit limit", dirty >= 4096 && refused);
-    check("... and are free for it once written back", after < 2048 && granted);
+    printf("dirty: %ld kB, then %ld kB dirty or pinned once the commit was granted (after %ld ms)\n", dirty, after, t);
+    check("a commit that dirty cache pages stand in the way of waits for their write-back", dirty >= 4096 && granted && after <= 2048 + 1024 && t < 5000);
     close(fd);
     unlink(path);
 }

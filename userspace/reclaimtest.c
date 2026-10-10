@@ -112,6 +112,94 @@ static void hog(long len) {
     _exit(0);
 }
 
+static long now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000L + ts.tv_nsec / 1000000;
+}
+
+/* Waiters for memory and write-back, frees and kills at once: writers
+ * keep pages dirty while hogs commit and use all that is left (their
+ * commits and faults wait for write-back and reclaim), and half of each
+ * are killed in the middle. The killed die at once, the rest finish, and
+ * afterwards nothing stays committed, dirty or pinned that was not
+ * before (no wait, reservation or charge lost). */
+#define STRESS 4
+static void waiters_frees_kills(const char *dir) {
+    long base = meminfo("Committed_AS:");
+    long room = (meminfo("CommitLimit:") - base) * 1024 - 8 * MIB;
+    pid_t kids[2 * STRESS];
+    for (int i = 0; i < 2 * STRESS; i++) {
+        if ((kids[i] = fork()) != 0) continue;
+        if (i < STRESS) {
+            /* A writer: 4 MiB dirty again and again, written back now and then. */
+            char path[256];
+            snprintf(path, sizeof path, "%s/reclaimtest.w%d", dir, i);
+            static char chunk[64 * 1024];
+            memset(chunk, 'w', sizeof chunk);
+            int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+            for (int round = 0; round < 6; round++) {
+                lseek(fd, 0, SEEK_SET);
+                for (int c = 0; c < 64; c++) write(fd, chunk, sizeof chunk);
+                if (round % 2) fsync(fd);
+            }
+            fsync(fd);
+            unlink(path);
+            _exit(0);
+        }
+        /* A hog: its share of what is left, committed and used, twice. */
+        for (int round = 0; round < 2; round++) {
+            long len = room / STRESS / PG * PG;
+            char *m = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (m == MAP_FAILED) _exit(2);
+            for (long off = 0; off < len; off += PG) m[off] = (char)(off / PG);
+            for (long off = 0; off < len; off += PG)
+                if (m[off] != (char)(off / PG)) _exit(3);
+            munmap(m, len);
+        }
+        _exit(0);
+    }
+    struct timespec ts = {0, 300 * 1000000L};
+    nanosleep(&ts, NULL);
+    /* Every other writer and hog killed now, waiting or not. */
+    long t = now_ms();
+    for (int i = 0; i < 2 * STRESS; i += 2) kill(kids[i], SIGKILL);
+    int killed_ok = 1, rest_ok = 1;
+    for (int i = 0; i < 2 * STRESS; i += 2) {
+        int st = -1;
+        waitpid(kids[i], &st, 0);
+        killed_ok &= WIFSIGNALED(st) || (WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    }
+    t = now_ms() - t;
+    for (int i = 1; i < 2 * STRESS; i += 2) {
+        int st = -1;
+        waitpid(kids[i], &st, 0);
+        if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+            printf("    %s %d: status %#x\n", i < STRESS ? "writer" : "hog", i, st);
+            rest_ok = 0;
+        }
+    }
+    for (int i = 0; i < STRESS; i++) {
+        char path[256];
+        snprintf(path, sizeof path, "%s/reclaimtest.w%d", dir, i);
+        unlink(path);
+    }
+    sync();
+    /* (The files' pages go with their release, a moment after the unlink.) */
+    long after = 0, left = 0;
+    for (int i = 0; i < 40; i++) {
+        after = meminfo("Committed_AS:");
+        left = meminfo("Dirty:") + meminfo("Writeback:");
+        if (after <= base + 512 && left == 0) break;
+        struct timespec pause = {0, 50 * 1000000L};
+        nanosleep(&pause, NULL);
+    }
+    printf("    killed gone in %ld ms; Committed_AS %ld kB before, %ld kB after; %ld kB dirty or pinned left\n", t, base, after, left);
+    check("waiters for memory and write-back die at once when killed", killed_ok && t < 2000);
+    check("... the others finish", rest_ok);
+    check("... and nothing stays committed, dirty or pinned", after <= base + 512 && left == 0);
+}
+
 int main(int argc, char **argv) {
     const char *dir = argc > 1 ? argv[1] : "/data";
     char path[256];
@@ -170,6 +258,7 @@ int main(int argc, char **argv) {
     }
     check("mapped pages (shared, private and copied) always hold their data", mappers_ok);
     unlink(path);
+    waiters_frees_kills(dir);
     printf("%s\n", failures ? "reclaimtest: FAILED" : "reclaimtest: all passed");
     return failures != 0;
 }
