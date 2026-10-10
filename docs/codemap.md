@@ -342,6 +342,7 @@ kernel that handle them.
 - `docs/benchmarks/2026-10-09-bdf16a2-pre-procfs-rings.md` Benchmark bdf16a2 (pre-procfs-rings)
 - `docs/benchmarks/2026-10-09-ec81472-procfs-rings.md` Benchmark ec81472 (procfs-rings)
 - `docs/benchmarks/2026-10-10-33b4a97-heaptrim.md` Benchmark 33b4a97 (heaptrim)
+- `docs/benchmarks/2026-10-10-70444cc-heaptrim-review.md` Benchmark 70444cc (heaptrim-review)
 - `docs/benchmarks/2026-10-10-7c6ebd0-main.md` Benchmark 7c6ebd0 (main)
 - `docs/benchmarks/2026-10-10-b1fea5d-memfix.md` Benchmark b1fea5d (memfix)
 - `docs/benchmarks/README.md` Benchmarks
