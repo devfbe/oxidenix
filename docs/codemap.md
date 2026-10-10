@@ -116,7 +116,7 @@ module comment, and the public types it defines. Where to start for common tasks
 
 - `servers/diskfs/src/blk.rs` (273) virtio-blk driver on the shared virtio transport (crates/virtio). Types: `Kind`, `SubmitError`, `VirtioBlk`.
 - `servers/diskfs/src/main.rs` (98) diskfs: the ext2 filesystem server.
-- `servers/diskfs/src/service.rs` (1004) The ring service: diskfs's end of the data plane (docs/design/io-rings.md, the file protocol `fsring`). Types: `Service`.
+- `servers/diskfs/src/service.rs` (1007) The ring service: diskfs's end of the data plane (docs/design/io-rings.md, the file protocol `fsring`). Types: `Service`.
 - `servers/netd/src/main.rs` (204) netd: the network server.
 - `servers/netd/src/nic.rs` (114) smoltcp's view of the network card, with loopback: frames addressed to this host (its own address or 127.0.0.0/8) never reach the wire but come back as received frames, and ARP requests for those addresses are... Types: `Nic`, `RxToken`, `TxToken`.
 - `servers/netd/src/service.rs` (1863) The socket service: netd's end of the instances' channels (phase R7b, ADR 0008, the protocol `netring`), mapped onto smoltcp's sockets. Types: `Config`, `Service`.
@@ -132,8 +132,8 @@ module comment, and the public types it defines. Where to start for common tasks
 - `crates/csprng/tests/vectors.rs` (64) The algorithms against their published test vectors, and the generator's properties.
 - `crates/ext2fs/src/blockset.rs` (64) A set of block numbers kept as ranges, for sets that follow a file's blocks: freeing a 2 GiB file frees two million mostly contiguous blocks, which as single entries would take more memory than diskfs has, and as... Types: `BlockSet`.
 - `crates/ext2fs/src/cache.rs` (72) The metadata block cache: inode tables, bitmaps, group descriptors, directories, symlink and indirect blocks. Types: `BlockCache`.
-- `crates/ext2fs/src/lib.rs` (2065) ext2 on the data disk (any `Device`): revision 1 with the `filetype` feature, 1/2/4 KiB blocks, direct and single/double/triple indirect blocks. Types: `Device`, `NewNode`, `RawInode`, `Extent`, `Run`, `Reservation`, `Stat`, `Ext2`.
-- `crates/ext2fs/tests/io.rs` (1023) ext2fs on a RAM disk that counts device requests: large reads and writes take few requests, a write flushes twice (data, then metadata), and the filesystem stays consistent for e2fsck; on the ring path, reserved...
+- `crates/ext2fs/src/lib.rs` (2110) ext2 on the data disk (any `Device`): revision 1 with the `filetype` feature, 1/2/4 KiB blocks, direct and single/double/triple indirect blocks. Types: `Device`, `NewNode`, `RawInode`, `Extent`, `Run`, `Reservation`, `Stat`, `Ext2`.
+- `crates/ext2fs/tests/io.rs` (1105) ext2fs on a RAM disk that counts device requests: large reads and writes take few requests, a write flushes twice (data, then metadata), and the filesystem stays consistent for e2fsck; on the ring path, reserved...
 - `crates/fsring/src/lib.rs` (426) The file protocol of the data plane: the requests the Linux server (the client) sends diskfs (the service) through a channel's submission ring, and their completions (docs/design/io-rings.md, "The file protocol"). Types: `Buf`, `Kind`, `Node`, `Request`, `Stat`, `Usage`.
 - `crates/fsring/tests/protocol.rs` (169) The file protocol's encodings: every request survives encode and decode (inode handles with their generations), malformed descriptors are refused with the right errno (unknown operations, stray fields, lengths,...
 - `crates/ldisc/src/lib.rs` (527) Linux's N_TTY line discipline as a library, for the Linux server's terminals (docs/design/linux-server.md, "The terminal"): input mapping, signals from the keyboard, flow control, canonical line editing with echo,... Types: `Received`, `Take`, `ReadMode`, `Ldisc`.
