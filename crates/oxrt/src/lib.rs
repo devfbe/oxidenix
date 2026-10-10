@@ -101,6 +101,11 @@ pub mod sys {
     /// addresses of `count` (at most 512) pages of a grant, stored as u64s;
     /// `GRANT_DMA` for a range.
     pub const GRANT_DMA_PAGES: u64 = 1075;
+    /// () -> n: how many channels earlier processes of this server served
+    /// whose clients are still there (what those were given may still be
+    /// theirs: diskfs's holds). Only falls; each fall rings the doorbell
+    /// (`Event::Doorbell`).
+    pub const CHAN_PREDECESSORS: u64 = 1086;
 }
 
 /// `ipc_register` flag: the service accepts channel offers.
@@ -304,6 +309,12 @@ pub fn grant_dma_unmap(channel: u64, grant: u32) -> Result<(), i64> {
 /// `grant` (at most 512 at once).
 pub fn grant_dma_pages(channel: u64, grant: u32, first: u64, out: &mut [u64]) -> Result<(), i64> {
     result(syscall(sys::GRANT_DMA_PAGES, [channel, grant as u64, first, out.len() as u64, out.as_mut_ptr() as u64, 0])).map(|_| ())
+}
+
+/// How many channels earlier processes of this server served whose clients
+/// are still there (`sys::CHAN_PREDECESSORS`).
+pub fn chan_predecessors() -> Result<u64, i64> {
+    result(syscall(sys::CHAN_PREDECESSORS, [0; 6]))
 }
 
 /// Arms the doorbell watch of `channel` if its submission `tail` still

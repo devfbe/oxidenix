@@ -380,7 +380,8 @@ fn request(req: &[u8], h: &Header, port: u32, interfaces: &[Interface], dumping:
 /// What answers `datagram`, the requests a socket with port id `port`
 /// sent to the kernel's end, given the `interfaces`; `cap_ack`: the socket
 /// asked for capped acknowledgements (NETLINK_CAP_ACK); `dumping`: it has a
-/// dump running; `room`: the bytes of datagrams its receive buffer takes.
+/// dump running; `room`: the bytes of datagrams its receive buffer takes, each counting
+/// `overhead` bytes besides its own (what a queued datagram takes, as the socket counts it).
 /// Answers beyond `room` are dropped (the second value says so: the
 /// socket reports ENOBUFS, as Linux when a reader's buffer is full), so a
 /// datagram of many small requests cannot make the server build more than
@@ -392,7 +393,7 @@ fn request(req: &[u8], h: &Header, port: u32, interfaces: &[Interface], dumping:
 /// with `NLMSG_DONE` and is not acknowledged (one at a time: EBUSY for
 /// another); any other request is acknowledged if it asks, and a failed
 /// one always answers its error.
-pub fn answer(datagram: &[u8], port: u32, interfaces: &[Interface], cap_ack: bool, mut dumping: bool, room: usize) -> (Vec<Reply>, bool) {
+pub fn answer(datagram: &[u8], port: u32, interfaces: &[Interface], cap_ack: bool, mut dumping: bool, room: usize, overhead: usize) -> (Vec<Reply>, bool) {
     let mut out = Vec::new();
     let mut used = 0usize;
     let mut overrun = false;
@@ -419,7 +420,7 @@ pub fn answer(datagram: &[u8], port: u32, interfaces: &[Interface], cap_ack: boo
         }
         for r in replies {
             let size = match &r {
-                Reply::Datagram(d) => d.len(),
+                Reply::Datagram(d) => d.len() + overhead,
                 Reply::Dump(_) => 0,
             };
             if used + size > room {
@@ -443,7 +444,7 @@ mod tests {
 
     /// Everything `answer` gives, dumps produced to their end.
     fn run(datagram: &[u8], port: u32, ifs: &[Interface], cap: bool) -> Vec<Vec<u8>> {
-        let (replies, overrun) = answer(datagram, port, ifs, cap, false, usize::MAX);
+        let (replies, overrun) = answer(datagram, port, ifs, cap, false, usize::MAX, 0);
         assert!(!overrun);
         let mut out = Vec::new();
         for r in replies {
@@ -462,7 +463,7 @@ mod tests {
     #[test]
     fn dumps_are_produced_a_datagram_at_a_time() {
         let many: Vec<Interface> = (1..=100).map(|n| Interface { index: n, name: alloc::format!("eth{n}"), ..interfaces()[1].clone() }).collect();
-        let (replies, _) = answer(&request(RTM_GETLINK, NLM_F_REQUEST | NLM_F_DUMP, 1, &[0]), 5, &many, false, false, usize::MAX);
+        let (replies, _) = answer(&request(RTM_GETLINK, NLM_F_REQUEST | NLM_F_DUMP, 1, &[0]), 5, &many, false, false, usize::MAX, 0);
         let [Reply::Dump(mut d)] = <[Reply; 1]>::try_from(replies).unwrap() else { panic!("a dump") };
         let first = d.next(&many).unwrap();
         assert!(first.len() <= DUMP_DATAGRAM && messages(&first).iter().all(|m| m.0.ty == RTM_NEWLINK));
@@ -481,12 +482,12 @@ mod tests {
     fn one_dump_at_a_time() {
         let mut d = request(RTM_GETLINK, NLM_F_REQUEST | NLM_F_DUMP, 1, &[0, 0, 0, 0]);
         d.extend(request(RTM_GETADDR, NLM_F_REQUEST | NLM_F_DUMP, 2, &[0, 0, 0, 0]));
-        let (replies, _) = answer(&d, 5, &interfaces(), false, false, usize::MAX);
+        let (replies, _) = answer(&d, 5, &interfaces(), false, false, usize::MAX, 0);
         assert!(matches!(replies[0], Reply::Dump(_)));
         let Reply::Datagram(e) = &replies[1] else { panic!("an error") };
         assert_eq!(&messages(e)[0].1[..4], &(-EBUSY).to_le_bytes());
         // A socket with a dump running: EBUSY.
-        let (replies, _) = answer(&request(RTM_GETLINK, NLM_F_REQUEST | NLM_F_DUMP, 1, &[0]), 5, &interfaces(), false, true, usize::MAX);
+        let (replies, _) = answer(&request(RTM_GETLINK, NLM_F_REQUEST | NLM_F_DUMP, 1, &[0]), 5, &interfaces(), false, true, usize::MAX, 0);
         assert!(matches!(&replies[..], [Reply::Datagram(_)]));
     }
 
@@ -497,7 +498,7 @@ mod tests {
         for i in 0..2000 {
             d.extend(request(NLMSG_NOOP, NLM_F_REQUEST | NLM_F_ACK, i, &[]));
         }
-        let (replies, overrun) = answer(&d, 5, &interfaces(), false, false, 4096);
+        let (replies, overrun) = answer(&d, 5, &interfaces(), false, false, 4096, 0);
         let used: usize = replies.iter().map(|r| if let Reply::Datagram(x) = r { x.len() } else { 0 }).sum();
         assert!(overrun && used <= 4096 && !replies.is_empty());
     }

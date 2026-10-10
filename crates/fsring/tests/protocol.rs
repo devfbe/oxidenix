@@ -1,4 +1,5 @@
-//! The file protocol's encodings: every request survives encode and decode,
+//! The file protocol's encodings: every request survives encode and decode
+//! (inode handles with their generations),
 //! malformed descriptors are refused with the right errno (unknown
 //! operations, stray fields, lengths, promises and names out of range), and the
 //! completion, stat, usage and directory entry encodings round-trip.
@@ -10,29 +11,35 @@ fn buf(grant: u32, offset: u32, len: u32) -> Buf {
     Buf { grant, offset, len }
 }
 
+/// A handle (a generation that does not fit 16 bits, so its bits are checked).
+fn n(ino: u32) -> Node {
+    Node::new(ino, 0x8000_0000 | ino << 4)
+}
+
 fn every_request() -> Vec<Request> {
     vec![
-        Request::Read { ino: 12, offset: 1 << 40, buf: buf(3, 4096, MAX_TRANSFER) },
-        Request::Write { ino: 12, offset: 7, buf: buf(1, 0, 1) },
+        Request::Root,
+        Request::Read { ino: n(12), offset: 1 << 40, buf: buf(3, 4096, MAX_TRANSFER) },
+        Request::Write { ino: n(12), offset: 7, buf: buf(1, 0, 1) },
         Request::Flush,
-        Request::Stat { ino: 2 },
-        Request::Lookup { dir: 2, name: buf(4, 100, NAME_MAX) },
-        Request::Create { dir: 2, name: buf(4, 0, 5), kind: Kind::File, perm: 0o644 },
-        Request::Create { dir: 2, name: buf(4, 0, 5), kind: Kind::Dir, perm: 0o7777 },
-        Request::Create { dir: 2, name: buf(4, 0, 5), kind: Kind::Socket, perm: 0o755 },
-        Request::Create { dir: 2, name: buf(4, 10, 5), kind: Kind::Symlink(buf(4, 15, TARGET_MAX)), perm: 0 },
-        Request::Unlink { dir: 2, name: buf(4, 0, 3), is_dir: true },
-        Request::Rename { from: 2, name: buf(4, 0, 3), to: 11, new_name: buf(4, 3, 9) },
-        Request::Truncate { ino: 12, len: 12345 },
-        Request::Readdir { dir: 2, cursor: 17, buf: buf(5, 0, 4096) },
-        Request::Release { ino: 99 },
-        Request::Readlink { ino: 13, buf: buf(5, 8, 64) },
-        Request::SetPerm { ino: 12, perm: 0o600 },
-        Request::SetTimes { ino: 12, atime: Some(1), mtime: None, ctime: None },
-        Request::SetTimes { ino: 12, atime: Some(0), mtime: Some(u32::MAX), ctime: Some(7) },
+        Request::Stat { ino: n(2) },
+        Request::Lookup { dir: n(2), name: buf(4, 100, NAME_MAX) },
+        Request::Create { dir: n(2), name: buf(4, 0, 5), kind: Kind::File, perm: 0o644 },
+        Request::Create { dir: n(2), name: buf(4, 0, 5), kind: Kind::Dir, perm: 0o7777 },
+        Request::Create { dir: n(2), name: buf(4, 0, 5), kind: Kind::Socket, perm: 0o755 },
+        Request::Create { dir: n(2), name: buf(4, 10, 5), kind: Kind::Symlink(buf(4, 15, TARGET_MAX)), perm: 0 },
+        Request::Unlink { dir: n(2), name: buf(4, 0, 3), is_dir: true },
+        Request::Rename { from: n(2), name: buf(4, 0, 3), to: n(11), new_name: buf(4, 3, 9) },
+        Request::Truncate { ino: n(12), len: 12345 },
+        Request::Readdir { dir: n(2), cursor: 17, buf: buf(5, 0, 4096) },
+        Request::Release { ino: n(99) },
+        Request::Readlink { ino: n(13), buf: buf(5, 8, 64) },
+        Request::SetPerm { ino: n(12), perm: 0o600 },
+        Request::SetTimes { ino: n(12), atime: Some(1), mtime: None, ctime: None },
+        Request::SetTimes { ino: n(12), atime: Some(0), mtime: Some(u32::MAX), ctime: Some(7) },
         Request::Statfs,
         Request::Forget { grant: 4095 },
-        Request::Promise { ino: 12, offset: 1 << 40, len: MAX_TRANSFER as u64 },
+        Request::Promise { ino: n(12), offset: 1 << 40, len: MAX_TRANSFER as u64 },
     ]
 }
 
@@ -55,7 +62,7 @@ fn only_reads_and_writes_are_concurrent() {
 
 #[test]
 fn unknown_operations_are_refused() {
-    for op in [0, 18, 99, u16::MAX] {
+    for op in [0, 19, 99, u16::MAX] {
         let d = Desc { op, ..Desc::default() };
         assert_eq!(Request::decode(&d), Err(ENOSYS));
     }
@@ -107,12 +114,12 @@ fn a_field_the_operation_does_not_use_must_be_zero() {
 
 #[test]
 fn settimes_takes_known_times_in_32_bits() {
-    let set = |which: u64, arg: [u64; 3]| Request::decode(&Desc { op: op::SETTIMES, object: 12, offset: which, arg, ..Desc::default() });
-    assert_eq!(set(TIME_MTIME, [0, 5, 0]), Ok(Request::SetTimes { ino: 12, atime: None, mtime: Some(5), ctime: None }));
+    let set = |which: u64, arg: [u64; 3]| Request::decode(&Desc { op: op::SETTIMES, object: n(12).to_object(), offset: which, arg, ..Desc::default() });
+    assert_eq!(set(TIME_MTIME, [0, 5, 0]), Ok(Request::SetTimes { ino: n(12), atime: None, mtime: Some(5), ctime: None }));
     assert_eq!(set(8, [0, 0, 0]), Err(EINVAL));
     assert_eq!(set(TIME_ATIME, [1 << 32, 0, 0]), Err(EINVAL));
     assert_eq!(set(TIME_ATIME, [1, 1, 0]), Err(EINVAL), "a time not chosen must be 0");
-    assert_eq!(set(0, [0, 0, 0]), Ok(Request::SetTimes { ino: 12, atime: None, mtime: None, ctime: None }));
+    assert_eq!(set(0, [0, 0, 0]), Ok(Request::SetTimes { ino: n(12), atime: None, mtime: None, ctime: None }));
 }
 
 #[test]
@@ -122,9 +129,9 @@ fn transfers_are_bounded() {
     assert_eq!(read(0, MAX_TRANSFER + 1), Err(EINVAL));
     assert_eq!(read(u64::MAX - 10, 11), Err(EINVAL));
     assert!(read(u64::MAX - 10, 10).is_ok());
-    // An inode is 32 bits.
-    let d = Desc { op: op::STAT, object: 1 << 32, ..Desc::default() };
-    assert_eq!(Request::decode(&d), Err(EINVAL));
+    // A handle is the inode's number (low half) and generation (high half).
+    let d = Desc { op: op::STAT, object: 7 << 32 | 12, ..Desc::default() };
+    assert_eq!(Request::decode(&d), Ok(Request::Stat { ino: Node::new(12, 7) }));
     // A promise covers at most one transfer.
     let promise = |offset: u64, len: u64| Request::decode(&Desc { op: op::PROMISE, object: 12, offset, arg: [len, 0, 0], ..Desc::default() });
     assert!(promise(0, MAX_TRANSFER as u64).is_ok());

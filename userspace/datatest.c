@@ -27,6 +27,8 @@
 #include <unistd.h>
 
 #define PG 4096
+/* restricted::TEST_KILL_SERVER (test mode): kills the kernel's server `name`. */
+#define TEST_KILL_SERVER 1523
 #define MIB (1024 * 1024L)
 
 static int failures;
@@ -628,6 +630,73 @@ static void full_disk(void) {
     unlink(hole);
 }
 
+/* An open file unlinked is on ext2's orphan list until its last user lets go. A diskfs that
+ * dies meanwhile (killed here: TEST_KILL_SERVER) leaves it there, and the diskfs that the
+ * kernel starts next keeps it for the clients of the dead one: the Linux server connects
+ * again and names the file (its handle) before anything else, so the still-open
+ * descriptor reads its data back from the device (O_DIRECT) and writes on; once it is
+ * closed, the file's blocks come back (e2fsck then finds the filesystem clean). */
+static void orphan_survives_diskfs_restart(void) {
+    const char *path = "/data/datatest.orphan";
+    enum { CHUNK = 64 * 1024, CHUNKS = 64 };
+    unlink(path);
+    sync();
+    struct statfs before, held, restarted, after;
+    statfs("/data", &before);
+    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    int dfd = open(path, O_RDONLY | O_DIRECT);
+    static char block[CHUNK];
+    for (int i = 0; i < CHUNKS; i++) {
+        for (int j = 0; j < CHUNK; j++) block[j] = pattern((long)i * CHUNK + j, 5);
+        write(fd, block, CHUNK);
+    }
+    fsync(fd);
+    unlink(path);
+    sync();
+    statfs("/data", &held);
+    long killed = syscall(TEST_KILL_SERVER, "diskfs");
+    /* The Linux server connects to the next diskfs at once (the kernel tells it the old
+     * one died), without a use of /data: a while later there is a diskfs to kill again
+     * (the file must outlive that restart too). */
+    usleep(500 * 1000);
+    long again = syscall(TEST_KILL_SERVER, "diskfs");
+    int up = 0;
+    for (int i = 0; i < 100 && !up; i++) {
+        up = statfs("/data", &restarted) == 0;
+        if (!up) usleep(50 * 1000);
+    }
+    /* Still allocated: its blocks did not come back. */
+    int kept = up && restarted.f_bfree + 4000 <= before.f_bfree;
+    /* Its data as the device has it, through the descriptor opened before. */
+    int intact = 1;
+    for (int i = 0; i < CHUNKS && intact; i++) {
+        if (pread(dfd, direct_buf, CHUNK, (off_t)i * CHUNK) != CHUNK) intact = 0;
+        for (int j = 0; j < CHUNK && intact; j++)
+            if ((unsigned char)direct_buf[j] != pattern((long)i * CHUNK + j, 5)) intact = 0;
+    }
+    /* And it takes writes: through the cache, durable after fsync. */
+    for (int j = 0; j < CHUNK; j++) block[j] = pattern((long)CHUNKS * CHUNK + j, 9);
+    int wrote = pwrite(fd, block, CHUNK, (off_t)CHUNKS * CHUNK) == CHUNK && fsync(fd) == 0;
+    wrote = wrote && pread(dfd, direct_buf, CHUNK, (off_t)CHUNKS * CHUNK) == CHUNK && memcmp(direct_buf, block, CHUNK) == 0;
+    struct stat st;
+    wrote = wrote && fstat(fd, &st) == 0 && st.st_size == (off_t)(CHUNKS + 1) * CHUNK && st.st_nlink == 0;
+    close(dfd);
+    close(fd);
+    /* Closed: freed (once no client of the dead diskfs is left to name what it holds). */
+    int freed = 0;
+    for (int i = 0; i < 100 && !freed; i++) {
+        freed = statfs("/data", &after) == 0 && after.f_bfree >= before.f_bfree;
+        if (!freed) usleep(50 * 1000);
+    }
+    printf("    (free blocks: %ld before, %ld with the open unlinked file, %ld after diskfs restarted, %ld after the close)\n",
+           (long)before.f_bfree, (long)held.f_bfree, (long)restarted.f_bfree, (long)after.f_bfree);
+    check("diskfs is started again without a use of /data (EVENT_SERVICE_GONE)", killed == 0 && again == 0);
+    check("an open unlinked file outlives two diskfs restarts: still allocated", held.f_bfree + 4000 <= before.f_bfree && kept);
+    check("... the open descriptor reads its data back from the device", intact);
+    check("... and writes on (durable, still unlinked)", wrote);
+    check("... and its blocks come back after the last close", freed);
+}
+
 int main(void) {
     struct sigaction sa = {0};
     sa.sa_handler = on_fault;
@@ -646,6 +715,7 @@ int main(void) {
     larger_than_cache();
     read_with_dirty_memory();
     full_disk();
+    orphan_survives_diskfs_restart();
     printf("%s\n", failures ? "datatest: FAILED" : "datatest: all passed");
     return failures != 0;
 }

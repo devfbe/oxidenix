@@ -241,7 +241,7 @@ fn dispatch(s: &mut State) -> i64 {
         TEST_MKWRITE_FAIL => datafs::fail_next_mkwrite(s.rdi),
         TEST_SLEEP_LOCKED => match TEST_SLEEP_LOCK.lock() {
             Ok(_held) => {
-                let until = syscall(SYS_CLOCK_READ, [1, 0, 0, 0, 0, 0]).max(0) as u64 + s.rdi;
+                let until = (syscall(SYS_CLOCK_READ, [1, 0, 0, 0, 0, 0]).max(0) as u64).saturating_add(s.rdi);
                 syscall(SYS_SLEEP_UNTIL, [until, 0, 0, 0, 0, 0]);
                 0
             }
@@ -255,6 +255,10 @@ fn dispatch(s: &mut State) -> i64 {
             0
         }
         // The kernel's to answer, with the name in the server's memory.
+        TEST_KILL_SERVER => match usercopy::read_cstr(s.rdi) {
+            Ok(name) => syscall(TEST_KILL_SERVER, [name.as_ptr() as u64, name.len() as u64, 0, 0, 0, 0]),
+            Err(e) => -e,
+        },
         TEST_SERVER_TICKS => match usercopy::read_cstr(s.rdi) {
             Ok(name) => syscall(TEST_SERVER_TICKS, [name.as_ptr() as u64, name.len() as u64, 0, 0, 0, 0]),
             Err(e) => -e,
@@ -379,6 +383,12 @@ fn pager() -> ! {
             }
             EVENT_CONSOLE_LOST => {
                 console::lost();
+                continue;
+            }
+            EVENT_SERVICE_GONE => {
+                // diskfs keeps our unlinked open files for us until we name them again.
+                // (On the worker: the reconnection waits for locks, the pager must not.)
+                datafs::reconnect_later();
                 continue;
             }
             EVENT_SYNC => {
