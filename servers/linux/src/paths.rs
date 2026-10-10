@@ -399,12 +399,21 @@ fn getcwd(buf: u64, size: u64) -> Result<i64, i64> {
     Ok(out.len() as i64)
 }
 
+/// The longest working directory kept (every relative path call works from it, so its
+/// length is bounded as a path's work is): a deeper one is ENAMETOOLONG.
+const CWD_MAX: usize = 64 * 1024;
+const ENAMETOOLONG: i64 = 36;
+
 fn chdir(addr: u64) -> Result<i64, i64> {
     let r = at(CWD, addr, true)?;
     if r.mode & vfs::S_IFMT != vfs::S_IFDIR {
         return Err(ENOTDIR);
     }
-    records::current().state.lock().cwd = join(&r.path);
+    let cwd = join(&r.path);
+    if cwd.len() > CWD_MAX {
+        return Err(ENAMETOOLONG);
+    }
+    records::current().state.lock().cwd = cwd;
     Ok(0)
 }
 
@@ -412,6 +421,9 @@ fn fchdir(fd: u64) -> Result<i64, i64> {
     let (node, path) = fd_node(fd)?;
     if mode_of(&node.stat()?) & vfs::S_IFMT != vfs::S_IFDIR {
         return Err(ENOTDIR);
+    }
+    if path.len() > CWD_MAX {
+        return Err(ENAMETOOLONG);
     }
     records::current().state.lock().cwd = path;
     Ok(0)

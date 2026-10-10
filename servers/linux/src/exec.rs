@@ -721,26 +721,21 @@ fn build_stack(p: &Prepared, bias: u64, interp_base: u64, entry: u64) -> Result<
     let vectors = (p.args.len() + p.envs.len() + 3) * 8 + 24 * 16;
     let need = page_up((strings + vectors + 64 * 1024) as u64).max(STACK_SIZE);
     syscall_ok(SYS_MO_MAP, [0, STACK_TOP - need, need, 0, 3, MO_FIXED | MO_GROWSDOWN])?;
+    // Nothing here allocates (past the point of no return, with as many strings as the
+    // program gave): the strings go as their buffers hold them, back to back, and the
+    // vectors are written a few words at a time.
     let mut at = STACK_TOP - 8;
-    let mut place = |bytes: &[u8]| -> Result<u64, i64> {
-        at -= bytes.len() as u64 + 1;
-        usercopy::to_program(at, bytes)?;
-        usercopy::to_program(at + bytes.len() as u64, &[0])?;
-        Ok(at)
-    };
-    let execfn = place(p.filename.as_bytes())?;
-    // The environment's, then the arguments' (placed from the top down, in reverse, so that
-    // they lie in order).
-    let mut envp = Vec::new();
-    for e in p.envs.iter().rev() {
-        envp.push(place(e)?);
-    }
-    envp.reverse();
-    let mut argv = Vec::new();
-    for a in p.args.iter().rev() {
-        argv.push(place(a)?);
-    }
-    argv.reverse();
+    at -= p.filename.len() as u64 + 1;
+    let execfn = at;
+    usercopy::to_program(execfn, p.filename.as_bytes())?;
+    usercopy::to_program(execfn + p.filename.len() as u64, &[0])?;
+    // The environment's, then the arguments' (each block in order, NUL-terminated strings).
+    at -= p.envs.size() as u64;
+    let env_start = at;
+    usercopy::to_program(env_start, &p.envs.bytes)?;
+    at -= p.args.size() as u64;
+    let args_start = at;
+    usercopy::to_program(args_start, &p.args.bytes)?;
     let mut sp = at & !15;
     sp -= 16;
     let platform = sp;
@@ -775,19 +770,54 @@ fn build_stack(p: &Prepared, bias: u64, interp_base: u64, entry: u64) -> Result<
         (AT_PLATFORM, platform),
         (AT_NULL, 0),
     ];
-    let mut words: Vec<u64> = Vec::new();
-    words.push(argv.len() as u64);
-    words.extend(&argv);
-    words.push(0);
-    words.extend(&envp);
-    words.push(0);
-    for (k, v) in auxv {
-        words.extend([k, v]);
+    let n = 1 + p.args.len() + 1 + p.envs.len() + 1 + 2 * auxv.len();
+    sp = (sp - n as u64 * 8) & !15;
+    let mut out = Words { at: sp, buf: [0; 64], used: 0 };
+    out.put(p.args.len() as u64)?;
+    let mut ptr = args_start;
+    for a in p.args.iter() {
+        out.put(ptr)?;
+        ptr += a.len() as u64 + 1;
     }
-    sp = (sp - words.len() as u64 * 8) & !15;
-    let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-    usercopy::to_program(sp, &bytes)?;
+    out.put(0)?;
+    let mut ptr = env_start;
+    for e in p.envs.iter() {
+        out.put(ptr)?;
+        ptr += e.len() as u64 + 1;
+    }
+    out.put(0)?;
+    for (k, v) in auxv {
+        out.put(k)?;
+        out.put(v)?;
+    }
+    out.flush()?;
     Ok(sp)
+}
+
+/// Words written to the program's stack a buffer at a time (`build_stack`).
+struct Words {
+    at: u64,
+    buf: [u64; 64],
+    used: usize,
+}
+
+impl Words {
+    fn put(&mut self, w: u64) -> Result<(), i64> {
+        self.buf[self.used] = w;
+        self.used += 1;
+        if self.used == self.buf.len() {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<(), i64> {
+        let bytes = unsafe { core::slice::from_raw_parts(self.buf.as_ptr() as *const u8, self.used * 8) };
+        usercopy::to_program(self.at, bytes)?;
+        self.at += self.used as u64 * 8;
+        self.used = 0;
+        Ok(())
+    }
 }
 
 fn syscall_ok(nr: u64, a: [u64; 6]) -> Result<i64, i64> {
