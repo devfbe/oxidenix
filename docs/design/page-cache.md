@@ -103,13 +103,26 @@ space, and the walks (truncation, write-back) drop it before they lock a mapper.
   tmpfs as a whole is limited to half of the commit limit, as Linux's default (`ENOSPC`, or
   `SIGBUS` for a fault in a shared mapping). Anonymous shared memory is committed whole when
   it is created, as before, and not counted again per page.
-- **Cached-store pages** are not committed but counted (`memory::cache_pages`). Commit keeps
-  `committed + cached ≤ limit`: when a commit or a new cache page would break it, clean
-  unpinned unmapped cache pages are reclaimed first (second chance: a page used since the last
-  pass is skipped once). If nothing can be reclaimed, the commit fails (`ENOMEM`) and the
-  pagers are asked to write back the dirty pages in the way. Dirty pages are bounded by the
+- **Cached-store pages** are not committed but counted (`memory::cache_charge`, `Cached:`),
+  as on Linux, where page cache is no part of `Committed_AS`: commit keeps only `committed ≤
+  limit`, and the cache lives in the frames that commitments have not claimed yet (memory
+  promised but never touched, such as thread stacks, is most of what is promised: eight Node.js
+  workers promise about 190 MB of a 256 MB machine and touch less than half). It gives way
+  when a commitment claims a frame: an allocation for user memory (`memory::user_frame`) that
+  would take the free frames below a low watermark (1/128 of RAM above the kernel's reserve,
+  left for allocations that cannot reclaim: page tables made with the frames locked,
+  allocations with interrupts off) first reclaims clean unpinned cache pages (second chance: a
+  page used since the last pass is skipped once). Pages only the cache holds go first; then
+  pages that programs map, through the reverse map (`mappers`): each address space that maps
+  the file is taken if it is free (never waited for: its holder may be waiting for memory
+  itself), its entries for the pages are aged by the accessed bit (cleared, the page kept) or
+  removed, and a page that only the cache holds afterwards is dropped. A fault that finds no
+  frame reclaims again with its address space unlocked, so that its own mappings can go too,
+  waiting 100 ms at a time for write-back or busy address spaces (Linux's reclaim throttling)
+  until 16 tries made no progress; then the toucher is killed. Dirty pages are bounded by the
   dirty ratios (`balance_dirty`: write-back asked above a tenth of the commit limit, storing
-  threads waiting above a fifth).
+  threads waiting above a fifth), and reclaim that finds them in its way asks the pagers to
+  write back.
 - The file metadata quota (inodes, symlink targets, pipes) on the kernel heap stays.
 
 ### Disk files

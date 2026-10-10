@@ -39,11 +39,15 @@
 //! write-protected in every mapping, pinned for a read-only grant): a
 //! store in between faults, marks the page dirty again and is written next
 //! time, so none is lost; `redirty` puts back what a failed write took.
-//! Its pages are counted as cached memory (`memory::cache_charge`), which
-//! commits and new cache pages reclaim: clean pages that nothing pins or
-//! maps, a page used since the last look getting a second chance. Dirty
-//! ones the reclaim cannot drop make it ask the pagers to write back
-//! (`Pager::writeback`), and so do too many dirty pages (`balance_dirty`).
+//! Its pages are counted as cached memory (`memory::cache_charge`), not
+//! committed: they use the frames commitments have not claimed yet, and
+//! allocations for user memory reclaim them when free frames run low
+//! (`reclaim`): clean pages that nothing pins, a page used since the last
+//! look getting a second chance; a page programs map after its mappings
+//! that did not use it since the last look are removed (`shrink`, through
+//! `mappers`). Dirty ones the reclaim cannot drop make it ask the pagers
+//! to write back (`Pager::writeback`), and so do too many dirty pages
+//! (`balance_dirty`).
 //!
 //! Lock order: address space (sleeping) → `io` (sleeping) → `state` →
 //! frames. `io` serializes what changes contents or size (`write`,
@@ -51,7 +55,6 @@
 //! hits only take `state`.
 
 use crate::memory;
-use crate::memory::frame::UserFrames;
 use crate::process::address_space::{Fault, Mm, PAGE};
 use crate::process::errno::*;
 use crate::sync::{IrqSpinLock, Mutex};
@@ -59,7 +62,7 @@ use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use x86_64::structures::paging::{FrameAllocator, FrameDeallocator, PhysFrame};
+use x86_64::structures::paging::{FrameDeallocator, PhysFrame};
 
 /// Largest file size (as `off_t` allows).
 pub const MAX_SIZE: u64 = i64::MAX as u64;
@@ -309,8 +312,9 @@ impl Drop for PageWait {
 }
 
 /// The fault for an error making or getting a page: tmpfs is full or the
-/// server failed, no page to map (Bus, as on Linux), or no memory.
-fn page_fault(e: i64) -> Fault {
+/// server failed, no page to map (Bus, as on Linux), or no memory (Oom:
+/// the toucher is killed).
+pub fn page_fault(e: i64) -> Fault {
     if e == ENOMEM { Fault::Oom } else { Fault::Bus }
 }
 
@@ -500,8 +504,10 @@ fn page_of(off: u64) -> u64 {
     off / PAGE
 }
 
+/// A frame for a page, reclaiming other cache pages for it if none is
+/// free (`memory::user_frame`; never with a cache's state locked).
 fn new_frame() -> Option<PhysFrame> {
-    memory::with_frames(|f| UserFrames(f).allocate_frame())
+    memory::user_frame()
 }
 
 fn free_frames(frames: impl IntoIterator<Item = PhysFrame>) {
@@ -836,13 +842,16 @@ impl PageCache {
         if self.state.lock().pages.contains_key(&index) {
             return Ok(());
         }
-        // Charge first: committing may not happen under the state lock.
+        // Charge and frame first: neither may be had under the state lock
+        // (a frame may come from reclaim, which takes cache locks).
         let charge = if index >= self.prepaid() { Some(Charge::take()?) } else { None };
+        let frame = new_frame().ok_or(ENOMEM)?;
         let mut st = self.state.lock();
         if st.pages.contains_key(&index) {
+            drop(st);
+            free_frames([frame]);
             return Ok(());
         }
-        let frame = new_frame().ok_or(ENOMEM)?;
         self.fill_memory(&st, index, frame_bytes(frame));
         st.pages.insert(index, Page::new(frame));
         if let Some(c) = charge {
@@ -1126,13 +1135,8 @@ impl PageCache {
     /// Creates page `index` of a cached object, zeroed, unless it exists by
     /// now (the caller writes it next).
     fn create_cached(&self, index: u64) -> Result<(), i64> {
-        if !memory::cache_charge(1) {
-            return Err(ENOMEM);
-        }
-        let Some(frame) = new_frame() else {
-            memory::cache_uncharge(1);
-            return Err(ENOMEM);
-        };
+        let frame = new_frame().ok_or(ENOMEM)?;
+        memory::cache_charge(1);
         frame_bytes(frame).fill(0);
         let mut st = self.state.lock();
         if st.pages.contains_key(&index) {
@@ -1422,25 +1426,27 @@ impl PageCache {
             Ok((start, stop - start))
         };
         let (start, count) = find(&self.state.lock())?;
-        // Charged first (reclaiming may take cache locks); one page will do
-        // if more do not fit.
-        let count = if memory::cache_charge(count) {
-            count
-        } else if count > 1 && memory::cache_charge(1) {
-            1
-        } else {
-            return Err(Scan::Errno(ENOMEM));
-        };
         let mut frames = Vec::new();
-        if frames.try_reserve_exact(count as usize).is_err() {
-            memory::cache_uncharge(count);
-            return Err(Scan::Errno(ENOMEM));
+        frames.try_reserve_exact(count as usize).map_err(|_| Scan::Errno(ENOMEM))?;
+        // Frames from free memory or reclaimed cache pages (no cache lock
+        // held); a shorter run will do. Without any, the fill waits for
+        // reclaim to make progress (address spaces busy, mapped pages used
+        // since the last look, programs ending), unless dirty pages stand
+        // in the way: then the pager, which may be this very thread, is
+        // told (ENOMEM) and writes them back first.
+        let mut tries = 0;
+        while frames.len() < count as usize {
+            match new_frame() {
+                Some(frame) => {
+                    frame_bytes(frame).fill(0);
+                    frames.push(frame);
+                }
+                None if frames.is_empty() && dirty_pages() == 0 && memory::reclaim_retry(1, &mut tries) => {}
+                None => break,
+            }
         }
-        for _ in 0..count {
-            let Some(frame) = new_frame() else { break };
-            frame_bytes(frame).fill(0);
-            frames.push(frame);
-        }
+        memory::cache_charge(frames.len() as u64);
+        let count = frames.len() as u64;
         // The run as it is now: a page may have come or the file shrunk.
         let mut st = self.state.lock();
         let size = st.size;
@@ -1645,20 +1651,31 @@ impl PageCache {
         self.hung_up.load(Ordering::SeqCst)
     }
 
-    /// Drops up to `want` clean pages that only the cache uses, giving a
-    /// page used since the last look a second chance. Returns how many.
-    fn shrink(&self, want: u64) -> u64 {
+    /// Drops up to `want` clean pages, giving a page used since the last
+    /// look a second chance: those only the cache uses directly, and, with
+    /// `unmap`, also those programs map, after taking them out of every
+    /// mapping that has not used them since the last look (as Linux's
+    /// reclaim unmaps file pages through the reverse map: the spaces that
+    /// map this file, `mappers`, each taken only if free, so reclaim never
+    /// waits for a space whose holder may be waiting for memory). Returns
+    /// how many it dropped.
+    fn shrink(&self, want: u64, unmap: bool) -> u64 {
         let mut freed = 0;
         let mut seen = 0;
         loop {
             let mut st = self.state.lock();
-            // Two turns around the file: the first may only clear marks.
-            if freed >= want || seen >= 2 * st.pages.len() {
+            // Three turns around the file: the first may only clear the
+            // marks, the second the accessed bits of the mapped pages.
+            let turns = if unmap { 3 } else { 2 };
+            if freed >= want || seen >= turns * st.pages.len() {
                 break;
             }
             let start = st.cursor;
-            let (mut gone, mut frames) = (Vec::new(), Vec::new());
-            if gone.try_reserve(RECLAIM_BATCH).is_err() || frames.try_reserve(RECLAIM_BATCH).is_err() {
+            let (mut gone, mut frames, mut mapped) = (Vec::new(), Vec::new(), Vec::new());
+            if gone.try_reserve(RECLAIM_BATCH).is_err()
+                || frames.try_reserve(RECLAIM_BATCH).is_err()
+                || (unmap && mapped.try_reserve(RECLAIM_BATCH).is_err())
+            {
                 break;
             }
             let mut next = 0;
@@ -1669,8 +1686,15 @@ impl PageCache {
                     next = index + 1;
                     if page.referenced {
                         page.referenced = false;
-                    } else if !page.dirty && !page.pending && frames.refcount(page.frame) == 1 && freed + (gone.len() as u64) < want {
+                        continue;
+                    }
+                    if page.dirty || page.pending || page.pins > 0 || freed + ((gone.len() + mapped.len()) as u64) >= want {
+                        continue;
+                    }
+                    if frames.refcount(page.frame) == 1 {
                         gone.push(index);
+                    } else if unmap {
+                        mapped.push((index, page.frame));
                     }
                 }
             });
@@ -1679,6 +1703,42 @@ impl PageCache {
             frames.extend(gone.iter().filter_map(|i| st.pages.remove(i)).map(|p| p.frame));
             st.charged -= frames.len() as u64;
             drop(st);
+            if !mapped.is_empty() {
+                let mut young = Vec::new();
+                if young.try_reserve_exact(mapped.len()).is_ok() {
+                    young.resize(mapped.len(), false);
+                    // A space that is busy keeps its entries: their pages
+                    // stay (still shared) and the next look tries again.
+                    self.for_each_mapper(|mm| {
+                        if let Some(mut space) = mm.try_lock() {
+                            space.reclaim_file_pages(self, &mapped, &mut young);
+                        }
+                    });
+                    // Unmapped everywhere and still the same clean page:
+                    // only the cache holds its frame now.
+                    let mut st = self.state.lock();
+                    // Whether only the cache holds each frame now (`young`
+                    // reused: no allocation while the frames are locked).
+                    memory::with_frames(|f| {
+                        for (&(_, frame), young) in mapped.iter().zip(young.iter_mut()) {
+                            if !*young && f.refcount(frame) > 1 {
+                                *young = true;
+                            }
+                        }
+                    });
+                    let before = frames.len();
+                    for (&(index, frame), &kept) in mapped.iter().zip(&young) {
+                        let Some(page) = st.pages.get_mut(&index).filter(|p| p.frame == frame) else { continue };
+                        if kept {
+                            page.referenced = true;
+                        } else if !page.dirty && !page.pending && page.pins == 0 {
+                            frames.push(frame);
+                            st.pages.remove(&index);
+                        }
+                    }
+                    st.charged -= (frames.len() - before) as u64;
+                }
+            }
             freed += frames.len() as u64;
             self.uncharge(frames.len() as u64);
             free_frames(frames);
@@ -1893,23 +1953,33 @@ fn ask_pagers(pages: u64) {
 /// Drops up to `want` reclaimable pages of cached objects, visiting the
 /// caches in turn; returns how many it dropped. Called by `memory` when a
 /// commit or a new cache page needs room, never with a cache lock held.
+/// The pages only the caches use go first; then, if that was not enough,
+/// those that programs map too (unmapped where unused, `shrink`), unless
+/// interrupts are off: unmapping needs TLB shootdowns, which must not be
+/// waited for there.
 fn reclaim(want: u64) -> u64 {
     let mut freed = 0;
-    let caches = CACHES.lock().len();
-    for _ in 0..caches {
-        let cache = {
-            let list = CACHES.lock();
-            if list.is_empty() {
+    let may_unmap = x86_64::instructions::interrupts::are_enabled();
+    for unmap in [false, true] {
+        if freed >= want || (unmap && !may_unmap) {
+            break;
+        }
+        let caches = CACHES.lock().len();
+        for _ in 0..caches {
+            let cache = {
+                let list = CACHES.lock();
+                if list.is_empty() {
+                    break;
+                }
+                list[NEXT.fetch_add(1, Ordering::Relaxed) % list.len()].upgrade()
+            };
+            // (The last reference may go here, outside the list's lock.)
+            if let Some(cache) = cache {
+                freed += cache.shrink(want - freed, unmap);
+            }
+            if freed >= want {
                 break;
             }
-            list[NEXT.fetch_add(1, Ordering::Relaxed) % list.len()].upgrade()
-        };
-        // (The last reference may go here, outside the list's lock.)
-        if let Some(cache) = cache {
-            freed += cache.shrink(want - freed);
-        }
-        if freed >= want {
-            break;
         }
     }
     // Dirty pages stand in the way: the pagers write them back (they can

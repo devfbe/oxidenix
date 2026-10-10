@@ -20,6 +20,14 @@
 //! by the kernel or the Linux server ends at its fixup and the process is
 //! killed, see the page fault handler).
 //!
+//! Frames come from free memory or from page cache pages reclaimed for
+//! them (`memory::user_frame`), which are not committed: they live in the
+//! frames that commitments have not claimed yet. A fault that finds no
+//! frame reclaims again with the space unlocked (`Mm::retrying`), so the
+//! space's own mappings of cache pages can be removed too
+//! (`reclaim_file_pages`), and gives up (the toucher is killed) only when
+//! reclaim makes no more progress.
+//!
 //! Page table entries carry three software bits: COW (a shared frame that
 //! is copied on the first write), PROT_NONE (a frame kept while its area
 //! denies all access) and CHARGED (a page committed on its own, above).
@@ -36,7 +44,7 @@
 //! (`tlb`), and frames are freed only after it.
 
 use super::tlb::{self, Tlb};
-use crate::fs::cache::{Dirtied, Lookup, PageCache, PageWait};
+use crate::fs::cache::{page_fault, Dirtied, Lookup, PageCache, PageWait};
 use crate::memory;
 use crate::memory::frame::UserFrames;
 use crate::sync::{Mutex, MutexGuard};
@@ -340,6 +348,12 @@ impl Mm {
         self.space.lock()
     }
 
+    /// The address space if nobody holds it now (reclaim, which must not
+    /// wait for a space: its holder may be waiting for memory itself).
+    pub fn try_lock(&self) -> Option<MutexGuard<'_, AddressSpace>> {
+        self.space.try_lock()
+    }
+
     /// fork: a new address space with a copy-on-write copy of `parent`
     /// (locked by the caller), see `AddressSpace::copy_from`. The child is
     /// an `Mm` before it gets anything, so that it is among the mappers of
@@ -364,6 +378,7 @@ impl Mm {
         // finds it (unless the mapping or the file changed meanwhile).
         let mut held: Option<PhysFrame> = None;
         let mut tries = 0;
+        let (mut reclaims, mut fruitless) = (0, 0);
         loop {
             let (result, awaited) = {
                 let mut space = self.lock();
@@ -379,9 +394,20 @@ impl Mm {
                 // tries.)
                 (Err(Fault::Retry), Some(awaited)) if tries < MAX_FAULT_TRIES => match awaited.wait() {
                     Ok(frame) => held = frame,
-                    Err(_) => return Err(Fault::Bus),
+                    Err(e) => return Err(page_fault(e)),
                 },
                 (Err(Fault::Retry), _) => return Err(Fault::Bus),
+                // No frame (not a failed commit: frames are short now):
+                // reclaim with the space unlocked, so that its own mappings
+                // of cache pages can go too, and try again, until reclaim
+                // makes no more progress (then the toucher dies).
+                (Err(Fault::Oom), _)
+                    if reclaims < MAX_FAULT_RECLAIMS
+                        && !memory::with_frames(|f| f.user_may_take(FAULT_FRAMES))
+                        && memory::reclaim_retry(FAULT_FRAMES, &mut fruitless) =>
+                {
+                    reclaims += 1;
+                }
                 (result, _) => return result,
             }
         }
@@ -947,7 +973,7 @@ impl AddressSpace {
                     // A private page stays the cache's until written.
                     return Ok((frame, *shared));
                 }
-                let copy = memory::with_frames(|f| UserFrames(f).allocate_frame());
+                let copy = memory::user_frame();
                 memory::with_frames(|f| {
                     if let Some(copy) = copy {
                         unsafe {
@@ -1009,6 +1035,11 @@ impl AddressSpace {
             return Err(Fault::Oom);
         }
         let writable = if charge { writable | CHARGED } else { writable };
+        // A frame for the copy, reclaimed if none is free, outside the
+        // frame allocator's lock (taken here only if a copy is needed).
+        if !shared_area && memory::with_frames(|frames| frames.refcount(old) > 1) {
+            memory::ensure_user_frames(1);
+        }
         let copied = memory::with_frames(|frames| {
             if shared_area || frames.refcount(old) <= 1 {
                 // Only rights grow: a stale read-only entry elsewhere just
@@ -1074,7 +1105,7 @@ impl AddressSpace {
                 }
                 Dirtied::Unbacked(awaited) => match awaited.wait() {
                     Ok(frame) => frame.into_iter().for_each(PageCache::put_frame),
-                    Err(_) => return Err(Fault::Bus),
+                    Err(e) => return Err(page_fault(e)),
                 },
             }
         }
@@ -1130,6 +1161,9 @@ impl AddressSpace {
         let charge = shared && self.vma(page).is_some_and(|v| v.per_page()) && !e.flags().contains(CHARGED);
         if charge && !memory::commit(1) {
             return Err(Fault::Oom);
+        }
+        if shared {
+            memory::ensure_user_frames(1);
         }
         let copied = memory::with_frames(|frames| {
             if frames.refcount(old) <= 1 {
@@ -1344,6 +1378,57 @@ impl AddressSpace {
         }
     }
 
+    /// Reclaim's look at this space's entries for `pages` of `cache` (file
+    /// page index and the cache's frame for it, ascending by index), the
+    /// way Linux's rmap walk ages and unmaps a page cache page: an entry
+    /// that maps the frame and was used since the last look (the accessed
+    /// bit) gets the bit cleared and its page counts as `young` (a second
+    /// chance); one not used is removed, so the page goes back to being
+    /// only the cache's and the next access faults it in again. Entries
+    /// that map other frames (private copies) are left alone. Returns the
+    /// entries removed.
+    pub fn reclaim_file_pages(&mut self, cache: &PageCache, pages: &[(u64, PhysFrame)], young: &mut [bool]) -> u64 {
+        let areas: alloc::vec::Vec<(u64, u64, u64)> = self
+            .vmas
+            .values()
+            .filter_map(|v| {
+                let (c, first) = v.file()?;
+                core::ptr::eq(Arc::as_ptr(c), cache).then_some((v.start, v.pages(), first))
+            })
+            .collect();
+        let mut gather = Gather::new(&self.tlb);
+        let (mut removed, mut charged) = (0u64, 0u64);
+        for (start, len, first) in areas {
+            let from = pages.partition_point(|&(index, _)| index < first);
+            for (i, &(index, frame)) in pages.iter().enumerate().skip(from) {
+                if index - first >= len {
+                    break;
+                }
+                let va = start + (index - first) * PAGE;
+                let Some(e) = leaf_entry(self.l4, va) else { continue };
+                if e.addr() != frame.start_address() {
+                    continue;
+                }
+                let flags = e.flags();
+                if flags.contains(PageTableFlags::ACCESSED) {
+                    // No flush: a TLB entry still holding the bit only
+                    // hides further uses until it goes (as on Linux).
+                    e.set_flags(flags - PageTableFlags::ACCESSED);
+                    young[i] = true;
+                    continue;
+                }
+                charged += flags.contains(CHARGED) as u64;
+                e.set_unused();
+                gather.add(va, frame);
+                removed += 1;
+            }
+        }
+        gather.finish();
+        count(&self.stats.pages, -(removed as i64));
+        memory::uncommit(charged);
+        removed
+    }
+
     /// The shared file mappings in [start, end) with the file pages they
     /// cover; None if part of the range is not mapped (msync: ENOMEM).
     pub fn file_ranges(&self, start: u64, end: u64) -> Option<alloc::vec::Vec<(Arc<PageCache>, core::ops::Range<u64>)>> {
@@ -1523,8 +1608,10 @@ impl Drop for AddressSpace {
     }
 }
 
+/// A zeroed frame for user memory, reclaiming cache pages for it if none
+/// is free (`memory::user_frame`).
 fn zeroed_frame() -> Result<PhysFrame, Fault> {
-    let frame = memory::with_frames(|f| UserFrames(f).allocate_frame()).ok_or(Fault::Oom)?;
+    let frame = memory::user_frame().ok_or(Fault::Oom)?;
     unsafe { core::ptr::write_bytes(memory::phys_to_virt(frame.start_address().as_u64()), 0, PAGE as usize) };
     Ok(frame)
 }
@@ -1637,6 +1724,12 @@ fn leaf_flags(backing: Option<&Backing>, prot: Prot, old: PageTableFlags, refs: 
 
 /// How often a fault waits for a pager's page and tries again.
 const MAX_FAULT_TRIES: u32 = 16;
+/// The frames one fault may need: the page and up to three page tables.
+const FAULT_FRAMES: u64 = 4;
+/// How often a fault that found no frame tries again after reclaim made
+/// room (other threads may take the room first; reclaim that makes no
+/// progress ends it sooner, `memory::reclaim_retry`).
+const MAX_FAULT_RECLAIMS: u32 = 64;
 
 /// The page fault handler's part: satisfies a fault of the running task
 /// at `va` in its address space. May sleep (the address space is locked,

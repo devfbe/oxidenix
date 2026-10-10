@@ -61,6 +61,70 @@ static long meminfo(const char *key) {
     return p ? strtol(p + strlen(key) + 1, NULL, 10) : -1;
 }
 
+/* Cached pages that a program maps give way too, as on Linux (the reverse
+ * map): a child maps a file and reads all of it, then leaves it alone;
+ * committed memory that is used takes their frames (the child's mappings
+ * of pages it did not use since are removed), and the child, reading the
+ * file again through its mapping, gets every page back from the disk.
+ * The file is as large as the memory that using all the commit limit
+ * leaves free (memory promised to others but not used) and 8 MiB more,
+ * less the kernel's reserve (16 MiB, which user memory cannot take), so
+ * at least 8 MiB of it must go. */
+static void mapped_pages_give_way(const char *dir) {
+    char path[256];
+    snprintf(path, sizeof path, "%s/cachetest.mapped", dir);
+    long room = (meminfo("CommitLimit:") - meminfo("Committed_AS:")) * 1024 - MIB;
+    long mapped = (meminfo("MemFree:") * 1024 - room - 8 * MIB) / MIB * MIB;
+    if (mapped < 8 * MIB) mapped = 8 * MIB;
+    if (mapped > 40 * MIB) mapped = 40 * MIB;
+    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    for (long off = 0; off < mapped; off += sizeof buf) {
+        for (size_t i = 0; i < sizeof buf; i++) buf[i] = pattern(off + i);
+        write(fd, buf, sizeof buf);
+    }
+    printf("    a file of %ld MiB\n", mapped / MIB);
+    check("fsync writes the file back", fsync(fd) == 0);
+    int ready[2], go[2];
+    pipe(ready);
+    pipe(go);
+    pid_t child = fork();
+    if (child == 0) {
+        char *m = mmap(NULL, mapped, PROT_READ, MAP_SHARED, fd, 0);
+        int good = m != MAP_FAILED;
+        for (long off = 0; good && off < mapped; off += PG) good &= m[off + off / PG % PG] == pattern(off + off / PG % PG);
+        char c = good ? 'y' : 'n';
+        write(ready[1], &c, 1);
+        read(go[0], &c, 1);
+        for (long off = 0; good && off < mapped; off += PG) good &= m[off + off / PG % PG] == pattern(off + off / PG % PG);
+        _exit(good ? 0 : 1);
+    }
+    char c = 0;
+    read(ready[0], &c, 1);
+    long cached = meminfo("Cached:");
+    printf("    Cached with the file mapped: %ld kB\n", cached);
+    check("a child maps the file and reads it whole", c == 'y' && cached >= mapped / 1024);
+    room = (meminfo("CommitLimit:") - meminfo("Committed_AS:")) * 1024 - MIB;
+    char *all = mmap(NULL, room, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    long during = -1;
+    if (all != MAP_FAILED) {
+        for (long off = 0; off < room; off += PG) all[off] = 1;
+        during = meminfo("Cached:");
+        munmap(all, room);
+    }
+    printf("    committing and using %ld MiB: Cached %ld kB\n", room / MIB, during);
+    check("committed memory in use takes the frames of mapped cache pages", all != MAP_FAILED && during >= 0 && during < mapped / 1024);
+    write(go[1], "g", 1);
+    int status = 0;
+    waitpid(child, &status, 0);
+    check("... which come back from the disk through the mapping", WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    close(fd);
+    close(ready[0]);
+    close(ready[1]);
+    close(go[0]);
+    close(go[1]);
+    unlink(path);
+}
+
 int main(int argc, char **argv) {
     /* Run as a program from the disk: a child that sleeps a while. */
     if (strcmp(argv[0], "sleeper") == 0) {
@@ -153,6 +217,8 @@ int main(int argc, char **argv) {
     waitpid(sleeper, &status, 0);
     check("... and it ran (until killed)", WIFSIGNALED(status) && WTERMSIG(status) == SIGTERM);
     unlink(prog);
+
+    mapped_pages_give_way(dir);
 
     printf("%s\n", failures ? "cachetest: FAILED" : "cachetest: all passed");
     return failures != 0;

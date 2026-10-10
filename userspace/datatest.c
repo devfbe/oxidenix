@@ -380,10 +380,14 @@ static void readers(void) {
     }
     fsync(fd);
     close(fd);
-    /* Drop the cached pages: commit what memory allows, then let go. */
+    /* Drop the cached pages: commit what memory allows and use it (the
+     * cache gives way to committed memory when it is touched), then let go. */
     long room = (meminfo("CommitLimit:") - meminfo("Committed_AS:")) * 1024 - 4 * MIB;
     char *all = room > 0 ? mmap(NULL, room, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) : MAP_FAILED;
-    if (all != MAP_FAILED) munmap(all, room);
+    if (all != MAP_FAILED) {
+        for (long off = 0; off < room; off += PG) all[off] = 1;
+        munmap(all, room);
+    }
     pid_t kids[READERS];
     for (int r = 0; r < READERS; r++) {
         kids[r] = fork();

@@ -398,10 +398,19 @@ About 13,100 lines of Rust (without comments and blank lines) in the kernel (16,
   that fails, the process touching it is killed (also when a copy of the kernel or the Linux
   server touches it for the process: the copy ends, then SIGKILL), never one whose memory was
   committed. Cached
-  disk pages count against the same limit but give way: when a commit (or a new cache page) would exceed it, clean cached pages that no mapping
-  uses are dropped first, visiting the files in turn and giving a page used since the last look
-  a second chance. `/proc/meminfo` shows `Committed_AS`, `CommitLimit`, `Cached` (with tmpfs),
-  `Shmem` (tmpfs and shared memory) and a `MemAvailable` that includes the droppable pages.
+  disk pages are not committed (as on Linux, where they are no part of `Committed_AS`): they
+  live in the frames that commitments have not claimed yet (most promised memory is never
+  touched: thread stacks, V8's heap reservations) and give way when one does. An allocation
+  for user memory that would take the free frames below a low watermark (1/128 of RAM) first
+  reclaims clean cached pages, visiting the files in turn and giving a page used since the last
+  look a second chance: those only the cache holds, then those that programs map, which are
+  removed from every mapping that has not used them since the last look (the page table's
+  accessed bit; the address spaces that map a file are its reverse map, each taken only if
+  free, so reclaim never waits for one). A fault that finds no frame reclaims again with its
+  address space unlocked (so its own mappings can go too) and waits for write-back or busy
+  address spaces before it gives up (about 1.6 s without progress: then the toucher is
+  killed). `/proc/meminfo` shows `Committed_AS`, `CommitLimit`, `Cached` (with tmpfs), `Shmem`
+  (tmpfs and shared memory) and a `MemAvailable` that includes the droppable pages.
 - **Copy-on-write**: `fork` shares all private frames. Writable pages become read-only in both
   processes and are tagged with an OS-available page table bit. A write fault either copies the
   frame or, for the last owner, just restores write access. Shared memory stays shared.

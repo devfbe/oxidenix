@@ -35,7 +35,7 @@ use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use restricted::*;
-use x86_64::structures::paging::{FrameAllocator, FrameDeallocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags, PhysFrame, Size4KiB};
+use x86_64::structures::paging::{FrameDeallocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags, PhysFrame, Size4KiB};
 use x86_64::VirtAddr;
 
 /// The top-level slot of the shared region.
@@ -166,8 +166,9 @@ fn table_at(frame: PhysFrame) -> &'static mut PageTable {
     unsafe { &mut *(memory::phys_to_virt(frame.start_address().as_u64()) as *mut PageTable) }
 }
 
+/// A zeroed frame, reclaiming cache pages for it if none is free.
 fn zeroed_frame() -> Result<PhysFrame, i64> {
-    let frame = memory::with_frames(|f| UserFrames(f).allocate_frame()).ok_or(ENOMEM)?;
+    let frame = memory::user_frame().ok_or(ENOMEM)?;
     unsafe { core::ptr::write_bytes(memory::phys_to_virt(frame.start_address().as_u64()), 0, 4096) };
     Ok(frame)
 }
@@ -402,6 +403,8 @@ impl Instance {
         let mut mapper = unsafe { OffsetPageTable::new(table_at(self.view), memory::phys_offset()) };
         let page = Page::<Size4KiB>::containing_address(VirtAddr::new(addr));
         let flags = flags | PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
+        // Frames for the tables it may need, reclaimed if none are free.
+        memory::ensure_user_frames(3);
         let mapped = memory::with_frames(|f| {
             let mut user = UserFrames(f);
             unsafe { mapper.map_to_with_table_flags(page, frame, flags, table_flags(), &mut user) }.map(|m| m.ignore())
