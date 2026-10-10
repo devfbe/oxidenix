@@ -3,8 +3,9 @@
 //! (dirty) until the operation that made them commits, which writes them
 //! together and flushes (after what they point to, see the crate's
 //! "Ordering"); a block stays dirty until it was written, so
-//! a failed commit is retried by the next one. Least recently used blocks
-//! give way when the cache is full; a dirty one is written first.
+//! a failed commit is retried by the next one. Least recently used clean
+//! blocks give way when the cache is full; dirty ones stay (the journal's
+//! rule: a transaction's blocks reach their places only after its commit).
 //!
 //! File data does not pass through here: the kernel's page cache holds it,
 //! and reads and writes of whole blocks go straight to the device (or, on
@@ -64,14 +65,16 @@ impl BlockCache {
     }
 
     /// The block to evict before another one can be cached, if the cache
-    /// is full: (number, contents if it is dirty and must be written first).
+    /// is full: the least recently used clean one. Dirty blocks are the running
+    /// transaction's and stay until it commits (the journal's rule: nothing of it reaches
+    /// its place before its commit); with only dirty blocks the cache grows. (The second
+    /// value, contents to write first, is never given any more.)
     pub fn victim(&self, incoming: u32) -> Option<(u32, Option<&[u8]>)> {
         if self.blocks.len() < self.capacity || self.blocks.contains_key(&incoming) {
             return None;
         }
-        let (_, &n) = self.lru.first_key_value()?;
-        let e = &self.blocks[&n];
-        Some((n, e.dirty.then_some(&e.data[..])))
+        let n = self.lru.values().copied().find(|n| !self.blocks[n].dirty)?;
+        Some((n, None))
     }
 
     /// Caches block `n` (replacing what was there). The caller made room

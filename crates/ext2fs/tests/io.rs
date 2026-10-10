@@ -212,11 +212,12 @@ fn large_writes_take_few_requests_and_two_flushes() {
     let after = fs.device().counts.clone();
     let requests = 32;
     // One for the data (before the metadata that points to it), one for
-    // the metadata.
+    // the transaction (its log blocks and commit).
     assert_eq!(after.flushes - before.flushes, 2 * requests, "two flushes per write");
-    // Per request: the data, the inode, the bitmap, the group descriptor,
-    // the superblock and the indirect blocks it touched.
-    assert!(after.writes - before.writes <= requests * 8, "{} device writes for 1 MiB", after.writes - before.writes);
+    // Per request: the data, and twice (the journal, then home) the inode, the bitmap, the
+    // group descriptor, the superblock and the indirect blocks it touched, with a
+    // descriptor and a commit block.
+    assert!(after.writes - before.writes <= requests * 16, "{} device writes for 1 MiB", after.writes - before.writes);
     check_file(&mut fs, ino, MIB);
     fsck("writes", &take(fs));
 }
@@ -337,11 +338,11 @@ fn block_pointers_out_of_range_are_errors() {
     }
 }
 
-/// A commit whose writes fail keeps its changes and writes them with the
-/// next one: once the device works again, nothing is lost.
+/// A commit whose writes fail stops the filesystem (broken: nothing more is written); the
+/// next mount replays the journal: what was committed is there, the operation that failed
+/// is there whole or not at all, and e2fsck finds nothing to fix.
 #[test]
-fn failed_commits_are_retried() {
-    // Every write of the operation in turn fails, until it has fewer.
+fn a_failed_commit_stops_and_the_journal_keeps_what_was_committed() {
     for skip in 0.. {
         let mut fs = Ext2::mount(mkfs("retry", 2 * 1024)).unwrap();
         fs.create(ROOT_INO, "before", &NewNode::File, 0o644).unwrap();
@@ -350,12 +351,18 @@ fn failed_commits_are_retried() {
             assert!(skip > 2, "an operation that writes only {} times", skip);
             break;
         }
-        fs.create(ROOT_INO, "after", &NewNode::File, 0o644).unwrap();
-        let disk = take(fs);
-        fsck("retry", &disk);
+        assert!(fs.broken(), "write {skip}: a failed commit stops the filesystem");
+        assert!(fs.create(ROOT_INO, "after", &NewNode::File, 0o644).is_err());
+        let mut disk = take(fs);
+        disk.fail_at = None;
         let mut fs = Ext2::mount(disk).unwrap();
         let names: Vec<String> = fs.list(ROOT_INO).unwrap().into_iter().map(|(n, _, _)| n).collect();
-        assert!(names.contains(&"before".to_string()) && names.contains(&"after".to_string()), "{:?}", names);
+        assert!(names.contains(&"before".to_string()) && !names.contains(&"after".to_string()), "{:?}", names);
+        if names.contains(&"during".to_string()) {
+            let d = fs.lookup(ROOT_INO, "during").unwrap();
+            assert!(fs.list(d).is_ok());
+        }
+        assert_eq!(fsck_findings(&take(fs), &format!("write {skip} failing")), None);
     }
 }
 
@@ -733,33 +740,31 @@ fn blocks_of(fs: &mut Ext2<RamDisk>, ino: u32, len: u64) -> Vec<u32> {
     extents.iter().filter_map(|e| e.disk.map(|d| (d / 1024) as u32..((d + e.len) / 1024) as u32)).flatten().collect()
 }
 
-/// Blocks freed by an operation whose commit failed are still pointed to
-/// on the disk: nothing new is changed (no ring reservation, no IPC write)
-/// until that commit went out alone, so a crash never shows another file's
-/// data in the old file.
+/// A truncation whose commit fails stops the filesystem: nothing more is written (no
+/// reservation, no write), and the next mount has the file as it was or truncated, never
+/// its blocks given to another file.
 #[test]
-fn blocks_freed_before_a_failed_commit_are_not_reused() {
+fn a_truncation_whose_commit_fails_frees_nothing_twice() {
     let mut fs = Ext2::mount(mkfs("freed", 2 * 1024)).unwrap();
     let a = fs.create(ROOT_INO, "a", &NewNode::File, 0o644).unwrap();
     write_file(&mut fs, a, 64 * 1024);
-    let old = blocks_of(&mut fs, a, 64 * 1024);
-    assert_eq!(old.len(), 64);
     let b = fs.create(ROOT_INO, "b", &NewNode::File, 0o644).unwrap();
     let c = fs.create(ROOT_INO, "c", &NewNode::File, 0o644).unwrap();
     fs.device_mut().fail_writes(0, 1000);
     assert!(fs.truncate(a, 0).is_err());
-    // While the device still fails, nothing new is changed.
+    assert!(fs.broken());
     assert!(fs.reserve(b, 0, 64 * 1024).is_err());
     assert!(fs.write(c, 0, &[7u8; 16 * 1024]).is_err());
-    fs.device_mut().fail_at = None;
-    // Then the truncation goes out first, alone: on the disk, too, `a` is empty when its
-    // blocks can be taken.
-    let r = fs.reserve(b, 0, 64 * 1024).unwrap();
-    let copy = RamDisk { data: fs.device().data.clone(), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None };
-    assert_eq!(Ext2::mount(copy).unwrap().stat(a).unwrap().size, 0);
-    fs.unreserve(&r);
+    let mut disk = take(fs);
+    disk.fail_at = None;
+    let mut fs = Ext2::mount(disk).unwrap();
+    let size = fs.stat(a).unwrap().size;
+    assert!(size == 0 || size == 64 * 1024, "{size}");
+    if size > 0 {
+        check_file(&mut fs, a, 64 * 1024);
+    }
     fs.write(c, 0, &[7u8; 16 * 1024]).unwrap();
-    fsck("freed", &take(fs));
+    assert_eq!(fsck_findings(&take(fs), "freed"), None);
 }
 
 /// An inode that was freed takes no more reads or writes from the IPC
@@ -1368,44 +1373,35 @@ fn failed_commits_never_free_a_named_or_a_free_inode() {
     assert!(problems.is_empty(), "{:#?}", problems);
 }
 
-/// An unlink whose commits fail: a held file keeps its links but no name (`unlisted`),
-/// is releasable and freed by its release; one nobody holds is freed by the filesystem
-/// itself once commits go through again. Afterwards e2fsck finds nothing.
+/// An unlink whose commit fails stops the filesystem; the next mount has the name or not
+/// (whole), and an inode whose last link went is on the orphan list until it is freed (the
+/// next boot's recovery): nothing leaks, e2fsck finds nothing.
 #[test]
-fn inodes_a_failed_commit_kept_are_freed_later() {
-    let mut fs = Ext2::mount(mkfs("unlisted", 4 * 1024)).unwrap();
-    let (_, _, free_before, _, inodes_before) = fs.usage();
-    let held = fs.create(ROOT_INO, "held", &NewNode::File, 0o644).unwrap();
-    write_file(&mut fs, held, 64 * 1024);
-    let unused = fs.create(ROOT_INO, "unused", &NewNode::File, 0o644).unwrap();
-    write_file(&mut fs, unused, 64 * 1024);
-    // The names' commit fails (and the device keeps failing for a while).
-    fs.device_mut().fail_writes(0, 5);
-    let gone = fs.unlink_unless(ROOT_INO, "held", false, |_| true).unwrap();
-    assert_eq!(gone.iter().map(|&(i, _)| i).collect::<Vec<_>>(), vec![held]);
-    assert!(fs.unlink_unless(ROOT_INO, "unused", false, |_| false).is_err() || fs.lookup(ROOT_INO, "unused").is_err());
-    fs.device_mut().fail_at = None;
-    // Still usable, its links kept, releasable.
-    check_file(&mut fs, held, 64 * 1024);
-    assert!(fs.stat(held).unwrap().links > 0);
-    assert!(fs.releasable(held));
-    if fs.lookup(ROOT_INO, "unused").is_ok() {
-        fs.unlink_unless(ROOT_INO, "unused", false, |_| false).unwrap();
-    }
-    fs.release(held).unwrap();
-    // What nobody holds is the owner's to free (it knows the holds).
-    for ino in fs.take_deferred() {
-        if fs.releasable(ino) {
-            fs.release(ino).unwrap();
+fn an_unlink_whose_commit_fails_leaves_nothing_behind() {
+    for skip in 0..12 {
+        let mut fs = Ext2::mount(mkfs("unlisted", 4 * 1024)).unwrap();
+        let (_, _, free_before, _, inodes_before) = fs.usage();
+        let held = fs.create(ROOT_INO, "held", &NewNode::File, 0o644).unwrap();
+        write_file(&mut fs, held, 64 * 1024);
+        fs.device_mut().fail_writes(skip, 1);
+        let unlinked = fs.unlink(ROOT_INO, "held", false);
+        if unlinked.is_ok() {
+            assert!(!fs.broken());
+            fs.release(held).unwrap();
+        } else {
+            assert!(fs.broken());
         }
+        let mut disk = take(fs);
+        disk.fail_at = None;
+        let mut fs = Ext2::mount(disk).unwrap();
+        fs.recover_orphans(|_| false).unwrap();
+        if fs.lookup(ROOT_INO, "held").is_ok() {
+            fs.unlink_unless(ROOT_INO, "held", false, |_| false).unwrap();
+        }
+        let (_, _, free_after, _, inodes_after) = fs.usage();
+        assert_eq!((free_after, inodes_after), (free_before, inodes_before), "write {skip} failing");
+        assert_eq!(fsck_findings(&take(fs), &format!("unlink, write {skip} failing")), None);
     }
-    let x = fs.create(ROOT_INO, "x", &NewNode::File, 0o644).unwrap();
-    fs.unlink_unless(ROOT_INO, "x", false, |_| false).unwrap();
-    assert!(fs.check(held).is_err() && fs.check(unused).is_err() && fs.check(x).is_err());
-    assert_eq!(fs.orphan_failures(), 0);
-    let (_, _, free_after, _, inodes_after) = fs.usage();
-    assert_eq!((free_after, inodes_after), (free_before, inodes_before));
-    fsck("unlisted", &take(fs));
 }
 
 /// A truncation that fails part way (a read of an indirect block fails) leaves the cache
@@ -1582,37 +1578,26 @@ fn a_rename_failing_part_way_leaves_every_file_a_name() {
     assert!(failed > 0, "no read of the rename failed");
 }
 
-/// The commit that says "clean" fails: the disk never says "clean" while in use afterwards
-/// (the retry writes "not clean", and the next change keeps it so); once commits go through
-/// and the filesystem is let go of, it says "clean".
+/// A commit that fails while in use stops the filesystem with the disk saying "not
+/// clean"; the next mount, once let go of, says "clean".
 #[test]
-fn a_failed_clean_state_is_never_written_while_in_use() {
+fn a_failed_commit_in_use_leaves_the_disk_not_clean() {
     let mut fs = Ext2::mount(mkfs("state-fail", 2 * 1024)).unwrap();
     fs.set_in_use(true).unwrap();
     let f = fs.create(ROOT_INO, "f", &NewNode::File, 0o644).unwrap();
     assert_eq!(state(fs.device()), 0);
-    // Let go of: the state's own commit fails (the metadata's goes through).
-    fs.sync().unwrap();
-    fs.device_mut().fail_writes(0, 1);
-    assert!(fs.set_in_use(false).is_err());
-    assert_eq!(state(fs.device()), 0);
-    // A client again, and a change: the disk says "not clean" throughout.
-    assert_eq!(fs.set_in_use(true), Ok(false));
-    write_file(&mut fs, f, 16 * 1024);
-    assert_eq!(state(fs.device()), 0);
-    fs.sync().unwrap();
-    assert_eq!(state(fs.device()), 0);
-    // A device that keeps failing: still never "clean" in use.
     fs.device_mut().fail_writes(0, usize::MAX);
+    assert!(fs.write(f, 0, &[1u8; 4096]).is_err() || fs.sync().is_err());
     assert!(fs.set_in_use(false).is_err());
-    assert!(fs.set_in_use(true).is_ok());
-    assert!(fs.create(ROOT_INO, "g", &NewNode::File, 0o644).is_err());
-    fs.device_mut().fail_at = None;
-    assert!(fs.create(ROOT_INO, "g", &NewNode::File, 0o644).is_ok());
     assert_eq!(state(fs.device()), 0);
-    // Let go of for good: clean.
-    assert_eq!(fs.set_in_use(false), Ok(true));
-    assert_eq!(state(fs.device()), 1);
+    let mut disk = take(fs);
+    disk.fail_at = None;
+    let mut fs = Ext2::mount(disk).unwrap();
+    assert_eq!(state(fs.device()), 0);
+    fs.set_in_use(true).unwrap();
+    fs.create(ROOT_INO, "g", &NewNode::File, 0o644).unwrap();
+    assert_eq!(fs.set_in_use(false), Ok(false), "it was not clean at mount");
+    assert_eq!(state(fs.device()), 0);
     fsck("state-fail", &take(fs));
 }
 

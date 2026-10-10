@@ -137,6 +137,7 @@ extern crate alloc;
 
 mod blockset;
 mod cache;
+pub mod journal;
 
 use blockset::BlockSet;
 use cache::BlockCache;
@@ -189,6 +190,11 @@ pub trait Device {
     fn random(&mut self) -> u32 {
         0
     }
+    /// Whether the device takes no writes: the filesystem is mounted read-only (nothing is
+    /// written, no journal added; one that needs recovery cannot be mounted).
+    fn read_only(&self) -> bool {
+        false
+    }
     /// Whether every free checks the filesystem's invariant first (`State::check_free`:
     /// a scan of the whole tree each time, for tests).
     fn checks(&self) -> bool {
@@ -211,6 +217,11 @@ const MAGIC: u16 = 0xef53;
 /// `s_state`: cleanly unmounted (`EXT2_VALID_FS`).
 const STATE_VALID: u16 = 1;
 const INCOMPAT_FILETYPE: u32 = 0x2;
+/// `needs_recovery`: the journal may hold transactions not yet at their places.
+const INCOMPAT_RECOVER: u32 = 0x4;
+const COMPAT_HAS_JOURNAL: u32 = 0x4;
+/// The journal's inode (`s_journal_inum`).
+pub const JOURNAL_INO: u32 = 8;
 const RO_COMPAT_SUPPORTED: u32 = 0x1 | 0x2; // sparse_super, large_file
 const DIRECT: usize = 12;
 /// Symlink targets shorter than this live in the block pointers ("fast").
@@ -355,6 +366,8 @@ struct State<D: Device> {
     gdt_block: u32,
     groups: Vec<Group>,
     cache: BlockCache,
+    /// What `cache` was made with (a mount after replay makes it again).
+    cache_bytes: usize,
     /// The superblock as read at mount; the free counts change in it.
     sb: [u8; 1024],
     super_dirty: bool,
@@ -428,6 +441,11 @@ struct State<D: Device> {
     /// writes that `Ext2::link` records) and the device has not been
     /// flushed since: it is, before any metadata reaches the device.
     unflushed: bool,
+    /// The journal (ext3's: `journal.rs`, docs/design/ext3-journal.md); None only before
+    /// one is added or on a read-only mount without one.
+    journal: Option<Journal>,
+    /// Mounted read-only (`Device::read_only`): every change fails (EROFS).
+    read_only: bool,
     /// Blocks promised to writes to come (`Ext2::promise`), by inode and
     /// owner, and their total.
     promises: BTreeMap<u32, BTreeMap<u64, Promise>>,
@@ -533,6 +551,28 @@ enum AfterCommit {
     Links { ino: u32, delta: i32 },
 }
 
+/// The journal as the mounted filesystem keeps it (docs/design/ext3-journal.md).
+struct Journal {
+    sb: journal::Superblock,
+    /// The filesystem block of each journal block.
+    map: Vec<u32>,
+    /// Where the next transaction goes, and its sequence.
+    head: u32,
+    sequence: u32,
+    /// Log blocks in use since the tail (`sb.start`; 0: none).
+    used: u32,
+    /// Blocks the live log has copies of: freeing one revokes them.
+    logged: BTreeSet<u32>,
+    /// Revokes for the running transaction.
+    revokes: Vec<u32>,
+    /// The superblock on the disk says `needs_recovery`.
+    recovering: bool,
+    /// The block holding the superblock (1 with 1 KiB blocks, else 0), and the rest of
+    /// that block's bytes (the superblock is at byte 1024 of the disk).
+    sb_block: u32,
+    sb_block_data: Vec<u8>,
+}
+
 /// A rename's steps (`State::rename_plan`).
 struct RenamePlan {
     ino: u32,
@@ -582,6 +622,10 @@ impl<D: Device> State<D> {
 
     fn checks(&self) -> bool {
         self.dev.checks()
+    }
+
+    fn cache_bytes(&self) -> usize {
+        self.cache_bytes
     }
 
     /// The parent a directory's ".." names (None for another inode, or the root).
@@ -745,9 +789,306 @@ impl<D: Device> State<D> {
         if self.broken {
             return Err(EIO);
         }
+        if self.journal.is_some() {
+            // A transaction that cannot be written stops the filesystem (ADR 0012).
+            let result = self.journal_commit();
+            if result.is_err() {
+                self.broken = true;
+            }
+            return result;
+        }
         let result = self.write_out();
         self.pending = result.is_err();
         result
+    }
+
+    // ------------------------------------------------------------- the journal
+
+    /// The block holding the superblock, as it is to be written.
+    fn sb_block_contents(&self) -> Option<(u32, Vec<u8>)> {
+        let j = self.journal.as_ref()?;
+        let mut b = j.sb_block_data.clone();
+        let at = if self.block_size == 1024 { 0 } else { 1024 };
+        b[at..at + 1024].copy_from_slice(&self.sb);
+        Some((j.sb_block, b))
+    }
+
+    /// The running transaction committed (docs/design/ext3-journal.md, "A transaction"):
+    /// the data its metadata points to flushed first, then its log blocks and its commit
+    /// block, one flush, then its blocks written home (the next commit's flush covers them).
+    fn journal_commit(&mut self) -> Result<(), i64> {
+        // Ordered data: fresh blocks zeroed and data written since the last commit reach
+        // the disk before the metadata that points to them is committed.
+        self.zero_fresh()?;
+        let blocks_dirty = self.cache.has_dirty() || self.super_dirty;
+        let revokes = self.journal.as_ref().map_or(0, |j| j.revokes.len());
+        if !blocks_dirty && revokes == 0 {
+            self.freed.clear();
+            return Ok(());
+        }
+        // (New metadata blocks are logged with the rest: nothing to write ahead.)
+        self.new_meta.clear();
+        if self.unflushed {
+            self.dev.flush().map_err(io)?;
+            self.unflushed = false;
+        }
+        if !self.journal.as_ref().is_some_and(|j| j.recovering) {
+            self.set_recovering()?;
+        }
+        let mut blocks = self.cache.dirty();
+        if self.super_dirty {
+            if let Some(sb) = self.sb_block_contents() {
+                blocks.push(sb);
+            }
+        }
+        let bs = self.block_size;
+        let len = journal::transaction_len(bs, blocks.len(), revokes) as u32;
+        self.make_room(len)?;
+        let now = self.dev.now() as u64;
+        let j = self.journal.as_mut().expect("a journal");
+        let refs: Vec<(u32, &[u8])> = blocks.iter().map(|(n, d)| (*n, &d[..])).collect();
+        let log = journal::encode_transaction(bs, &j.sb.uuid, j.sequence, &refs, &j.revokes, now);
+        let (map, mut at) = (j.map.clone(), j.head);
+        let start = j.head;
+        let starting = j.sb.start == 0;
+        for b in &log {
+            self.dev.write(self.lba(map[at as usize]), b).map_err(io)?;
+            at = self.journal.as_ref().expect("a journal").sb.next(at);
+        }
+        if starting {
+            // The log was empty: it starts at this transaction (in the same flush: a torn
+            // transaction is not replayed, whatever the superblock says).
+            let j = self.journal.as_mut().expect("a journal");
+            j.sb.start = start;
+            j.sb.sequence = j.sequence;
+            let jsb = j.sb.encode();
+            let home = map[0];
+            self.dev.write(self.lba(home), &jsb).map_err(io)?;
+        }
+        self.dev.flush().map_err(io)?;
+        // Committed: home now (no flush of their own).
+        for (n, data) in &blocks {
+            self.dev.write(self.lba(*n), data).map_err(io)?;
+            self.cache.mark_clean(*n);
+        }
+        self.super_dirty = false;
+        self.written = true;
+        let j = self.journal.as_mut().expect("a journal");
+        j.head = at;
+        j.sequence = j.sequence.wrapping_add(1);
+        j.used += len;
+        j.logged.extend(blocks.iter().map(|(n, _)| *n));
+        j.revokes.clear();
+        self.freed.clear();
+        Ok(())
+    }
+
+    /// Room for a transaction of `len` log blocks: if the log lacks it, everything written
+    /// home so far is flushed and the log starts again at the head (the journal's
+    /// superblock says so, flushed, before the space is reused).
+    fn make_room(&mut self, len: u32) -> Result<(), i64> {
+        let j = self.journal.as_ref().expect("a journal");
+        if len >= j.sb.log_blocks() {
+            return Err(EFBIG);
+        }
+        if j.used + len < j.sb.log_blocks() {
+            return Ok(());
+        }
+        self.dev.flush().map_err(io)?;
+        self.empty_log()
+    }
+
+    /// Every transaction is at its place (the caller flushed): the log is empty from here,
+    /// its superblock says so (flushed).
+    fn empty_log(&mut self) -> Result<(), i64> {
+        let j = self.journal.as_mut().expect("a journal");
+        j.sb.start = 0;
+        j.sb.sequence = j.sequence;
+        j.used = 0;
+        j.logged.clear();
+        let jsb = j.sb.encode();
+        let home = j.map[0];
+        self.dev.write(self.lba(home), &jsb).map_err(io)?;
+        self.dev.flush().map_err(io)
+    }
+
+    /// The superblock on the disk says `needs_recovery` before the first transaction (so
+    /// that e2fsck and Linux replay the journal after a crash).
+    fn set_recovering(&mut self) -> Result<(), i64> {
+        let incompat = le32(&self.sb, 96);
+        put32(&mut self.sb, 96, incompat | INCOMPAT_RECOVER);
+        let (n, b) = self.sb_block_contents().expect("a journal");
+        self.dev.write(self.lba(n), &b).map_err(io)?;
+        self.dev.flush().map_err(io)?;
+        self.journal.as_mut().expect("a journal").recovering = true;
+        Ok(())
+    }
+
+    /// A clean stop (the last user gone, or an unmount): everything committed and flushed,
+    /// the log empty, and the superblock without `needs_recovery`.
+    fn quiesce(&mut self) -> Result<(), i64> {
+        self.commit()?;
+        if !self.journal.as_ref().is_some_and(|j| j.recovering) {
+            return Ok(());
+        }
+        self.dev.flush().map_err(io)?;
+        self.empty_log()?;
+        let incompat = le32(&self.sb, 96);
+        put32(&mut self.sb, 96, incompat & !INCOMPAT_RECOVER);
+        let (n, b) = self.sb_block_contents().expect("a journal");
+        self.dev.write(self.lba(n), &b).map_err(io)?;
+        self.dev.flush().map_err(io)?;
+        self.journal.as_mut().expect("a journal").recovering = false;
+        Ok(())
+    }
+
+    /// Block `n` is freed: copies of it in the live log are revoked.
+    fn revoke(&mut self, n: u32) {
+        if let Some(j) = self.journal.as_mut() {
+            if j.logged.remove(&n) {
+                j.revokes.push(n);
+            }
+        }
+    }
+
+    /// The journal size mke2fs would choose for this filesystem, in blocks (None: too small
+    /// for one).
+    fn journal_size(&self) -> Option<u32> {
+        let n = self.blocks_count;
+        match n {
+            0..2048 => None,
+            2048..32768 => Some(1024),
+            32768..262144 => Some(4096),
+            262144..524288 => Some(8192),
+            524288..4194304 => Some(16384),
+            _ => Some(32768),
+        }
+    }
+
+    /// Adds a journal (as `tune2fs -j`, docs/design/ext3-journal.md, "Adding a journal"):
+    /// inode 8's blocks allocated, zeroed, the journal superblock written, inode 8 and the
+    /// bitmaps committed and flushed; then the superblock's journal fields, flushed. A crash
+    /// before the last step leaves ext2 with leaked blocks, never half a journal. A
+    /// filesystem too small for one (or of revision 0) stays without.
+    fn add_journal(&mut self) -> Result<(), &'static str> {
+        let Some(len) = self.journal_size().filter(|_| self.has_orphan_list) else { return Ok(()) };
+        if (self.free_blocks as u64) < len as u64 + len as u64 / 16 + 64 {
+            return Ok(());
+        }
+        let fail = |_| "cannot add a journal";
+        let old = self.read_inode(JOURNAL_INO).map_err(fail)?;
+        if old.mode() != 0 {
+            return Err("inode 8 is in use but the filesystem has no journal");
+        }
+        let mut inode = RawInode([0; 128]);
+        inode.set_mode((S_IFREG | 0o600) as u16);
+        inode.set_links(1);
+        inode.touch(self.dev.now(), true, true);
+        let bs = self.block_size;
+        let mut first = 0;
+        for fb in 0..len as u64 {
+            let b = self.bmap(JOURNAL_INO, &mut inode, fb, true).map_err(fail)?;
+            if fb == 0 {
+                first = b;
+            }
+        }
+        inode.set_size(len as u64 * bs as u64);
+        self.write_inode(JOURNAL_INO, &inode).map_err(fail)?;
+        // Its blocks zeroed (a stale block could read as a log block), its superblock.
+        let zeros = vec![0u8; bs];
+        let mut copy = inode.clone();
+        for fb in 1..len as u64 {
+            let b = self.bmap(JOURNAL_INO, &mut copy, fb, false).map_err(fail)?;
+            self.write_data(b, &zeros).map_err(fail)?;
+        }
+        let uuid: [u8; 16] = self.sb[104..120].try_into().unwrap();
+        let jsb = journal::Superblock::new(bs as u32, len, uuid).encode();
+        self.write_data(first, &jsb).map_err(fail)?;
+        self.write_out().map_err(fail)?;
+        // The superblock last: the journal's fields, a copy of inode 8's block map.
+        let compat = le32(&self.sb, 92);
+        put32(&mut self.sb, 92, compat | COMPAT_HAS_JOURNAL);
+        put32(&mut self.sb, 224, JOURNAL_INO);
+        put32(&mut self.sb, 228, 0);
+        self.sb[208..224].fill(0);
+        self.sb[0xFD] = 1;
+        for i in 0..15 {
+            put32(&mut self.sb, 0x10C + i * 4, le32(&inode.0, 40 + i * 4));
+        }
+        put32(&mut self.sb, 0x10C + 15 * 4, le32(&inode.0, 108));
+        put32(&mut self.sb, 0x10C + 16 * 4, le32(&inode.0, 4));
+        self.super_dirty = true;
+        self.write_out().map_err(fail)?;
+        self.journal = Some(self.open_journal()?);
+        Ok(())
+    }
+
+    /// The journal of inode 8: its block map and superblock.
+    fn open_journal(&mut self) -> Result<Journal, &'static str> {
+        let mut inode = self.read_inode(JOURNAL_INO).map_err(|_| "cannot read the journal inode")?;
+        let bs = self.block_size as u64;
+        let blocks = inode.size().div_ceil(bs);
+        if blocks < 1024 || blocks > u32::MAX as u64 {
+            return Err("the journal is too small");
+        }
+        let mut map = Vec::with_capacity(blocks as usize);
+        for fb in 0..blocks {
+            let b = self.bmap(JOURNAL_INO, &mut inode, fb, false).map_err(|_| "cannot map the journal")?;
+            if b == 0 {
+                return Err("the journal has holes");
+            }
+            map.push(b);
+        }
+        let mut raw = vec![0u8; self.block_size];
+        self.dev.read(self.lba(map[0]), &mut raw).map_err(|_| "cannot read the journal")?;
+        let sb = journal::Superblock::parse(&raw)?;
+        if sb.block_size as usize != self.block_size || sb.len as u64 > blocks {
+            return Err("the journal does not fit its inode");
+        }
+        let sb_block = if self.block_size == 1024 { 1 } else { 0 };
+        let mut sb_block_data = vec![0u8; self.block_size];
+        self.dev.read(self.lba(sb_block), &mut sb_block_data).map_err(|_| "cannot read the superblock")?;
+        let head = if sb.start == 0 { sb.first } else { sb.start };
+        Ok(Journal {
+            sequence: sb.sequence,
+            head,
+            used: 0,
+            logged: BTreeSet::new(),
+            revokes: Vec::new(),
+            recovering: le32(&self.sb, 96) & INCOMPAT_RECOVER != 0,
+            sb_block,
+            sb_block_data,
+            map,
+            sb,
+        })
+    }
+
+    /// Replays the journal's complete transactions (their blocks home, flushed) and leaves
+    /// the log empty. Whether anything was replayed.
+    fn replay(&mut self, mut j: Journal) -> Result<bool, &'static str> {
+        let map = j.map.clone();
+        let bs = self.block_size;
+        let dev = &mut self.dev;
+        let mut read = |n: u32| -> Result<Vec<u8>, ()> {
+            let mut b = vec![0u8; bs];
+            let at = *map.get(n as usize).ok_or(())? as u64 * (bs / SECTOR_SIZE) as u64;
+            dev.read(at, &mut b)?;
+            Ok(b)
+        };
+        let rec = journal::recover(&j.sb, &mut read)?;
+        for (home, data) in &rec.blocks {
+            if *home >= self.blocks_count {
+                return Err("the journal names a block beyond the filesystem");
+            }
+            self.dev.write(self.lba(*home), data).map_err(|_| "cannot write a replayed block")?;
+        }
+        self.dev.flush().map_err(|_| "cannot flush the replayed blocks")?;
+        j.sb.start = 0;
+        j.sb.sequence = rec.next_sequence;
+        let jsb = j.sb.encode();
+        self.dev.write(self.lba(map[0]), &jsb).map_err(|_| "cannot write the journal superblock")?;
+        self.dev.flush().map_err(|_| "cannot flush the journal superblock")?;
+        Ok(rec.transactions > 0)
     }
 
     fn write_out(&mut self) -> Result<(), i64> {
@@ -1123,6 +1464,7 @@ impl<D: Device> State<D> {
     fn free_block(&mut self, block: u32) -> Result<(), i64> {
         self.check_block(block)?;
         self.frees += 1;
+        self.revoke(block);
         self.cache.remove(block);
         self.fresh.remove(&block);
         self.new_meta.remove(&block);
@@ -2346,7 +2688,7 @@ impl<D: Device> Ext2<D> {
         } else {
             (128, 0, 0)
         };
-        if incompat & !INCOMPAT_FILETYPE != 0 || ro_compat & !RO_COMPAT_SUPPORTED != 0 {
+        if incompat & !(INCOMPAT_FILETYPE | INCOMPAT_RECOVER) != 0 || ro_compat & !RO_COMPAT_SUPPORTED != 0 {
             return Err("unsupported ext2 features");
         }
         let log = le32(&sb, 24);
@@ -2381,6 +2723,7 @@ impl<D: Device> Ext2<D> {
             gdt_block: first_data_block + 1,
             groups: Vec::new(),
             cache: BlockCache::new(cache_bytes / block_size),
+            cache_bytes,
             sb,
             super_dirty: false,
             written: false,
@@ -2409,6 +2752,8 @@ impl<D: Device> Ext2<D> {
             new_meta: BTreeSet::new(),
             freed: BlockSet::new(),
             unflushed: false,
+            journal: None,
+            read_only: false,
         };
         let count = (blocks_count - first_data_block).div_ceil(blocks_per_group) as usize;
         for g in 0..count {
@@ -2425,7 +2770,33 @@ impl<D: Device> Ext2<D> {
                 used_dirs: le16(&buf, o + 16),
             });
         }
+        st.read_only = st.dev.read_only();
+        if le32(&st.sb, 92) & COMPAT_HAS_JOURNAL != 0 {
+            if le32(&st.sb, 224) != JOURNAL_INO {
+                return Err("an external journal");
+            }
+            let j = st.open_journal()?;
+            if j.sb.start != 0 {
+                if st.read_only {
+                    return Err("the journal needs recovery, the device is read-only");
+                }
+                // Replayed (the log empty after), then mounted again from what the disk
+                // has now.
+                st.replay(j)?;
+                let cache_bytes = st.cache_bytes();
+                return Self::mount_with_cache(st.dev, cache_bytes);
+            }
+            st.journal = Some(j);
+        } else if !st.read_only {
+            st.add_journal()?;
+        }
         let mut fs = Ext2 { st };
+        if fs.st.read_only {
+            // (Read as it is: nothing is written.)
+            let _ = fs.st.load_orphans();
+            fs.st.super_dirty = false;
+            return Ok(fs);
+        }
         // The orphan list as it is (freed by `recover_orphans`, if the mounter says so).
         let cut = fs.st.load_orphans();
         fs.commit(cut).map_err(|_| "cannot read the orphan list")?;
@@ -3115,8 +3486,12 @@ impl<D: Device> Ext2<D> {
 
     /// Unmounts the filesystem and returns its device, after writing what
     /// a failed commit left (if the device lets it).
+    /// Unmounts: everything committed, the journal emptied and the superblock clean of
+    /// `needs_recovery` (a clean stop).
     pub fn into_device(mut self) -> D {
-        let _ = self.st.commit();
+        if !self.st.read_only && !self.st.broken {
+            let _ = self.st.quiesce();
+        }
         self.st.dev
     }
 

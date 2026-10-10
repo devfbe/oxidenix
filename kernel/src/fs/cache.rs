@@ -1619,7 +1619,9 @@ impl PageCache {
         // The first gap among the present pages of the window (walking
         // them, at most `MAX_SCAN`), and the run of missing pages there.
         let find = |st: &State| {
-            let end = first.saturating_add(window).min(page_of(st.size.saturating_add(PAGE - 1)));
+            // (A window beyond the end of the file, which shrank since the pager looked:
+            // empty, not reversed.)
+            let end = first.saturating_add(window).min(page_of(st.size.saturating_add(PAGE - 1))).max(first);
             let mut start = first;
             for (scanned, (&index, _)) in st.pages.range(first..end).enumerate() {
                 if index != start {
