@@ -1,0 +1,9 @@
+# rust-analyzer settings for the whole workspace (read by the LSP).
+# The kernel, the servers and oxrt are no_std: checking their test targets for the host pulls
+# in std and reports a false "duplicate lang item `panic_impl`", so only the normal targets are
+# checked.
+[check]
+allTargets = false
+
+[cargo]
+allTargets = false

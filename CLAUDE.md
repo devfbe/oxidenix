@@ -25,7 +25,11 @@ An AI research project; see README.md.
 - The Rust nightly is pinned by date in `rust-toolchain.toml`; update the date deliberately and
   run all tests.
 - rust-analyzer (in `rust-toolchain.toml`, used by the LSP) works on the whole workspace
-  without extra configuration: prefer it for definitions, references and callers over grep.
+  without extra configuration (`rust-analyzer.toml` only turns off the host test targets of
+  the no_std crates): prefer it for definitions, references and callers over grep. The LSP
+  needs `~/.cargo/bin` in Claude Code's PATH (start it from the dev shell), and it serves the
+  main checkout only: in an agent's git worktree (`.claude/worktrees/...`) it finds nothing,
+  so query the main checkout's copy of the file there or fall back to grep.
 - All Nix packages (musl toolchain, Bash, BusyBox, OVMF, e2fsprogs) come from the nixpkgs pinned
   in `nix/nixpkgs.nix`; the builder, `userspace/build.sh`, `scripts/bench.sh` and CI set
   `NIX_PATH=nixpkgs=nix/nixpkgs.nix`. Use the same for manual Nix calls (the host ext2 test:
