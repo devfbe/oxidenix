@@ -426,7 +426,10 @@ static void heap_returns(long start_committed, struct heap start) {
            h.committed / 1024, start.committed / 1024, h.in_use / 1024, h.free / 1024, c, start_committed);
     check("the server's heap gives its free memory back", h.committed <= start.committed + 2 * MIB);
     check("... and the commitment returns near its start", c <= start_committed + 4096);
-    /* A commit beyond the limit: refused, and the servers shrink. */
+    /* A commit beyond the limit: refused, and the servers shrink (each at
+     * most once a second: a second after any shrink the steps before may
+     * have caused). */
+    usleep(1100 * 1000);
     long room = (meminfo("CommitLimit:") - meminfo("Committed_AS:")) * 1024;
     void *big = mmap(NULL, room + 64 * MIB, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     struct heap before = server_heap();
