@@ -628,6 +628,37 @@ static void full_disk(void) {
     unlink(hole);
 }
 
+/* An open file unlinked is on ext2's orphan list until its last user lets go; a diskfs
+ * that dies first (killed here: TEST_KILL_SERVER) leaves it there, and the diskfs that
+ * starts next frees it: its blocks come back without e2fsck (which then finds the
+ * filesystem clean). */
+static void orphan_after_diskfs_died(void) {
+    const char *path = "/data/datatest.orphan";
+    unlink(path);
+    sync();
+    struct statfs before, held, after;
+    statfs("/data", &before);
+    int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    static char block[64 * 1024];
+    memset(block, 'o', sizeof block);
+    for (int i = 0; i < 64; i++) write(fd, block, sizeof block);
+    fsync(fd);
+    unlink(path);
+    sync();
+    statfs("/data", &held);
+    long killed = syscall(1522, "diskfs");
+    /* The next use of /data starts diskfs again (its restart policy). */
+    int up = 0;
+    for (int i = 0; i < 100 && !up; i++) {
+        up = statfs("/data", &after) == 0 && after.f_bfree >= before.f_bfree;
+        if (!up) usleep(50 * 1000);
+    }
+    close(fd);
+    printf("    (free blocks: %ld before, %ld with the open unlinked file, %ld after diskfs restarted)\n",
+           (long)before.f_bfree, (long)held.f_bfree, (long)after.f_bfree);
+    check("an orphan a dead diskfs left is freed by the next one", killed == 0 && held.f_bfree + 4000 <= before.f_bfree && up);
+}
+
 int main(void) {
     struct sigaction sa = {0};
     sa.sa_handler = on_fault;
@@ -646,6 +677,7 @@ int main(void) {
     larger_than_cache();
     read_with_dirty_memory();
     full_disk();
+    orphan_after_diskfs_died();
     printf("%s\n", failures ? "datatest: FAILED" : "datatest: all passed");
     return failures != 0;
 }

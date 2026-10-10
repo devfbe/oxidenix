@@ -1027,3 +1027,48 @@ fn socket_inodes() {
     fs.sync().unwrap();
     fsck("socket-gone", &take(fs));
 }
+
+#[test]
+fn orphans_outlive_a_mount_and_are_freed_by_the_next() {
+    let mut fs = Ext2::mount(mkfs("orphans", 16 * 1024)).unwrap();
+    let (_, _, free_before, _, inodes_before) = fs.usage();
+    let mut files = Vec::new();
+    for i in 0..3 {
+        let f = fs.create(ROOT_INO, &format!("open-{i}"), &NewNode::File, 0o644).unwrap();
+        write_file(&mut fs, f, MIB);
+        files.push(f);
+    }
+    // Unlinked while still in use (not released): on the orphan list, still readable.
+    for i in 0..3 {
+        assert_eq!(fs.unlink(ROOT_INO, &format!("open-{i}"), false).unwrap(), vec![files[i]]);
+    }
+    let mut on_list = fs.orphans();
+    on_list.sort_unstable();
+    assert_eq!(on_list, files);
+    check_file(&mut fs, files[1], MIB);
+    // The middle one is released as usual: off the list (wherever it is in the chain).
+    fs.release(files[1]).unwrap();
+    assert_eq!(fs.orphans().len(), 2);
+    // The user goes away without the others' release (a diskfs that dies): the next mount
+    // frees them, and the filesystem is as before and clean.
+    let mut fs = Ext2::mount(take(fs)).unwrap();
+    assert!(fs.orphans().is_empty());
+    let (_, _, free_after, _, inodes_after) = fs.usage();
+    assert_eq!((free_after, inodes_after), (free_before, inodes_before));
+    fsck("orphans", &take(fs));
+}
+
+#[test]
+fn released_orphans_leave_an_empty_list() {
+    let mut fs = Ext2::mount(mkfs("orphans-released", 4 * 1024)).unwrap();
+    for round in 0..50 {
+        let f = fs.create(ROOT_INO, "f", &NewNode::File, 0o644).unwrap();
+        write_file(&mut fs, f, 64 * 1024);
+        let gone = fs.unlink(ROOT_INO, "f", false).unwrap();
+        assert_eq!(gone, vec![f], "round {round}");
+        fs.release(f).unwrap();
+    }
+    assert!(fs.orphans().is_empty());
+    // A clean filesystem: e2fsck -fn has nothing to say about the list.
+    fsck("orphans-released", &take(fs));
+}

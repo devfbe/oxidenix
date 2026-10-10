@@ -38,7 +38,9 @@
 //! no client holds it, so one client's `RELEASE` never frees an inode
 //! another one still uses. A channel's holds go with it. The holds are
 //! diskfs's memory: a restarted diskfs knows a client's again only as it
-//! names them.
+//! names them. An inode whose last link went while held is on the
+//! filesystem's orphan list (`ext2fs`, "Orphans") until its release, so one
+//! a diskfs that died left behind is freed when the next one mounts.
 //!
 //! **Hostile clients.** Each descriptor is copied out of the ring once and
 //! validated (`fsring::Request::decode`); a grant must exist and hold the

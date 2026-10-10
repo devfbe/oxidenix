@@ -18,6 +18,15 @@
 //! replaying every write and flush with arbitrary losses). A write thus
 //! costs two flushes: data, then metadata.
 //!
+//! **Orphans.** An inode whose last link went while a client still uses it (an open file
+//! unlinked) stays allocated until `release`. So that a crash or a diskfs that dies before
+//! the release does not leave it allocated for good, it is on the superblock's orphan list
+//! (`s_last_orphan`, chained through the inodes' deletion-time field, as ext3's: e2fsck
+//! processes the list for ext2 without a journal as well) from the operation that took its
+//! last link (the same commit) until its release, and `mount` frees every inode the list
+//! still has. While on the list an inode's deletion time is the next orphan's number, so
+//! it is in use despite a nonzero one (`orphans`).
+//!
 //! The ring path (`read_map`, `reserve`, `link`, `sync`) is the exception
 //! to the commit per operation: there the caller moves file data between
 //! the device and its client's pages itself, several requests at once,
@@ -255,6 +264,11 @@ struct State<D: Device> {
     /// Inodes whose last link went away; the Ext2 wrapper decides whether
     /// to free them now or when the last open reference is dropped.
     unlinked: Vec<(u32, RawInode)>,
+    /// The inodes on the superblock's orphan list (see the module comment): in use
+    /// although their deletion time is set (it chains the list).
+    orphans: BTreeSet<u32>,
+    /// The superblock has the orphan list's field (revision 1).
+    has_orphan_list: bool,
     /// Data blocks reserved for writes in flight (`Ext2::reserve`): in no
     /// bitmap and no inode yet, but no allocation takes them.
     reserved: BTreeSet<u32>,
@@ -1563,10 +1577,89 @@ impl<D: Device> State<D> {
             return Err(ENOENT);
         }
         let inode = self.read_inode(ino)?;
-        if inode.mode() == 0 || le32(&inode.0, 20) != 0 {
+        if inode.mode() == 0 || (le32(&inode.0, 20) != 0 && !self.orphans.contains(&ino)) {
             return Err(ENOENT);
         }
         Ok(inode)
+    }
+
+    // ------------------------------------- the orphan list (see the module comment)
+
+    const LAST_ORPHAN: usize = 232;
+
+    fn last_orphan(&self) -> u32 {
+        if self.has_orphan_list { le32(&self.sb, Self::LAST_ORPHAN) } else { 0 }
+    }
+
+    fn set_last_orphan(&mut self, ino: u32) {
+        if self.has_orphan_list {
+            put32(&mut self.sb, Self::LAST_ORPHAN, ino);
+            self.super_dirty = true;
+        }
+    }
+
+    /// Puts `ino` (its last link just went, `inode` as written) at the list's head.
+    fn add_orphan(&mut self, ino: u32, inode: &mut RawInode) -> Result<(), i64> {
+        if !self.has_orphan_list || self.orphans.contains(&ino) {
+            return Ok(());
+        }
+        put32(&mut inode.0, 20, self.last_orphan());
+        self.write_inode(ino, inode)?;
+        self.set_last_orphan(ino);
+        self.orphans.insert(ino);
+        Ok(())
+    }
+
+    /// Takes `ino` off the list (before its release frees it), wherever it is.
+    fn remove_orphan(&mut self, ino: u32) -> Result<(), i64> {
+        if !self.orphans.remove(&ino) {
+            return Ok(());
+        }
+        let next = le32(&self.read_inode(ino)?.0, 20);
+        if self.last_orphan() == ino {
+            self.set_last_orphan(next);
+            return Ok(());
+        }
+        // Its predecessor points past it (at most as many steps as there are orphans: the
+        // list is the set's).
+        let mut at = self.last_orphan();
+        for _ in 0..=self.orphans.len() {
+            if at == 0 {
+                break;
+            }
+            let mut prev = self.read_inode(at)?;
+            let after = le32(&prev.0, 20);
+            if after == ino {
+                put32(&mut prev.0, 20, next);
+                return self.write_inode(at, &prev);
+            }
+            at = after;
+        }
+        // Not found on the disk's list (it cannot be): nothing points to it.
+        Ok(())
+    }
+
+    /// At mount: frees every inode the orphan list has (their users went with a diskfs
+    /// that ended or a crash) and empties the list. An entry that is no orphan (out of
+    /// range, not allocated, still linked) ends the walk: the list is not trusted further.
+    fn recover_orphans(&mut self) -> Result<u32, i64> {
+        let count = self.inodes_per_group as u64 * self.groups.len() as u64;
+        let mut at = self.last_orphan();
+        let mut freed = 0;
+        let mut steps = 0u64;
+        while at != 0 && (at as u64) <= count && steps < count {
+            steps += 1;
+            let inode = self.read_inode(at)?;
+            if inode.mode() == 0 || inode.links() != 0 {
+                break;
+            }
+            let next = le32(&inode.0, 20);
+            self.release(at, inode)?;
+            freed += 1;
+            at = next;
+        }
+        self.set_last_orphan(0);
+        Ok(freed)
     }
 
     /// Where the pointer to the data block of file block `fb` lives; with
@@ -1938,6 +2031,8 @@ impl<D: Device> Ext2<D> {
             written: false,
             fresh: BTreeSet::new(),
             unlinked: Vec::new(),
+            orphans: BTreeSet::new(),
+            has_orphan_list: rev >= 1,
             reserved: BTreeSet::new(),
             reserved_promised: BTreeMap::new(),
             promises: BTreeMap::new(),
@@ -1962,7 +2057,11 @@ impl<D: Device> Ext2<D> {
                 used_dirs: le16(&buf, o + 16),
             });
         }
-        Ok(Ext2 { st })
+        let mut fs = Ext2 { st };
+        // What a diskfs that ended (or a crash) left on the orphan list goes now.
+        let recovered = fs.st.recover_orphans();
+        fs.commit(recovered).map_err(|_| "cannot free the orphaned inodes")?;
+        Ok(fs)
     }
 
     pub fn stat(&mut self, ino: u32) -> Result<Stat, i64> {
@@ -2031,7 +2130,13 @@ impl<D: Device> Ext2<D> {
     fn take_unlinked(&mut self, ok: bool) -> Vec<u32> {
         let gone: Vec<(u32, RawInode)> = core::mem::take(&mut self.st.unlinked);
         if ok {
-            return gone.into_iter().map(|(ino, _)| ino).collect();
+            // On the orphan list until released (in the same commit as the unlink).
+            let mut out = Vec::with_capacity(gone.len());
+            for (ino, mut inode) in gone {
+                let _ = self.st.add_orphan(ino, &mut inode);
+                out.push(ino);
+            }
+            return out;
         }
         for (ino, inode) in gone {
             let _ = self.st.release(ino, inode);
@@ -2059,8 +2164,13 @@ impl<D: Device> Ext2<D> {
         if inode.links() != 0 {
             return Err(EINVAL);
         }
-        let result = self.st.release(ino, inode);
+        let result = self.st.remove_orphan(ino).and_then(|_| self.st.read_inode(ino)).and_then(|inode| self.st.release(ino, inode));
         self.commit(result)
+    }
+
+    /// The inodes on the orphan list now (for the tests).
+    pub fn orphans(&self) -> Vec<u32> {
+        self.st.orphans.iter().copied().collect()
     }
 
     pub fn readlink(&mut self, ino: u32) -> Result<String, i64> {
