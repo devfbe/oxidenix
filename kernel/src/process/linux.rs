@@ -528,12 +528,19 @@ impl Instance {
 
     /// The live task of the thread `key` (of a program of this instance).
     fn task_of(&self, key: u64) -> Option<Arc<super::task::Task>> {
-        let tasks = self.tasks.lock();
-        let (gen, task) = tasks.get(&(key & 0xffff_ffff))?;
-        if *gen as u64 != key >> 32 {
-            return None;
-        }
-        task.upgrade().filter(|t| t.state() != super::task::State::Dead)
+        // The weak reference only, under the lock: a reference made from it
+        // may be the task's last once it was upgraded, and dropping that
+        // drops the thread's `LinuxThread`, whose `thread_gone` takes this
+        // lock (a dead thread found here deadlocked its CPU).
+        let weak = {
+            let tasks = self.tasks.lock();
+            let (gen, task) = tasks.get(&(key & 0xffff_ffff))?;
+            if *gen as u64 != key >> 32 {
+                return None;
+            }
+            task.clone()
+        };
+        weak.upgrade().filter(|t| t.state() != super::task::State::Dead)
     }
 
     /// Makes room for the exit of one more program thread, which then counts
