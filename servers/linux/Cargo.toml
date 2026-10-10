@@ -14,7 +14,7 @@ restricted = { path = "../../crates/restricted" }
 ring = { path = "../../crates/ring" }
 vfs = { path = "../../crates/vfs" }
 slab = { path = "../../crates/slab" }
-linked_list_allocator = { version = "0.10", default-features = false }
+pageheap = { path = "../../crates/pageheap" }
 fsring = { path = "../../crates/fsring" }
 procproto = { path = "../../crates/procproto" }
 netlink = { path = "../../crates/netlink" }
