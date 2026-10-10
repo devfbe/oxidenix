@@ -476,24 +476,27 @@ pub fn start_reclaimer() -> Result<(), i64> {
 
 fn reclaimer() -> ! {
     loop {
+        // A kick is consumed before the work it asks for, so one that comes
+        // while it works (and finds the flag clear: it wakes nobody) makes
+        // the next round run instead of being lost; registered as a sleeper
+        // before looking, so a kick between the look and the sleep wakes it.
         let wait = crate::process::sched::prepare_to_wait(reclaimer_chan());
-        if !RECLAIMER_WANTED.load(core::sync::atomic::Ordering::Acquire) {
+        if !RECLAIMER_WANTED.swap(false, core::sync::atomic::Ordering::AcqRel) {
             wait.sleep();
             continue;
         }
         drop(wait);
-        crate::fs::cache::drop_deferred();
         // Up to the high watermark; after a fruitless round also pages used
         // lately; a little rest when even that drops nothing (write-back,
         // busy address spaces), then it looks again while still low.
         let mut force = false;
         loop {
+            crate::fs::cache::drop_deferred();
             let (short, low) = with_frames(|f| {
                 let high = 2 * low_watermark(f);
                 (!f.user_may_take(high), !f.user_may_take(low_watermark(f)))
             });
             if !short {
-                RECLAIMER_WANTED.store(false, core::sync::atomic::Ordering::Release);
                 break;
             }
             let freed = RECLAIM.get().map_or(0, |reclaim| reclaim(RECLAIM_BATCH * 4, force));
@@ -507,7 +510,6 @@ fn reclaimer() -> ! {
             }
             if !low {
                 // Between the watermarks with nothing to drop: done for now.
-                RECLAIMER_WANTED.store(false, core::sync::atomic::Ordering::Release);
                 break;
             }
             crate::fs::cache::ask_writeback(RECLAIM_BATCH);
