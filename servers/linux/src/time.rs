@@ -52,7 +52,7 @@ pub fn handle(s: &State) -> Option<i64> {
         SYS_CLOCK_GETTIME => clock_gettime(a0, a1),
         SYS_CLOCK_GETRES => clock_getres(a0, a1),
         SYS_GETTIMEOFDAY => gettimeofday(a0, a1),
-        SYS_SETTIMEOFDAY => settimeofday(a0),
+        SYS_SETTIMEOFDAY => settimeofday(a0, a1),
         SYS_CLOCK_SETTIME => clock_settime(a0, a1),
         SYS_TIME => time(a0),
         SYS_NANOSLEEP => clock_nanosleep(CLOCK_MONOTONIC as u64, 0, a0, a1),
@@ -126,13 +126,39 @@ fn clock_settime(id: u64, ts: u64) -> Result<i64, i64> {
     if id as i32 as i64 != CLOCK_REALTIME {
         return Err(EINVAL);
     }
-    set_wall(read_timespec(ts)?)
+    set_time(Some(read_timespec(ts)?), None)
 }
 
-/// Sets the wall clock to `ns`: EINVAL for a time before the monotonic
-/// clock's (as Linux's timekeeping_validate: the wall clock never goes
-/// below boot).
-fn set_wall(ns: u64) -> Result<i64, i64> {
+/// The latest second the wall clock may be set to, exclusive: Linux's TIME_SETTOD_SEC_MAX
+/// (KTIME_SEC_MAX less 30 years of uptime, so that the monotonic clock cannot overflow).
+const SETTOD_SEC_MAX: u64 = 9_223_372_036 - 30 * 365 * 86_400;
+
+/// The time zone settimeofday set (`struct timezone`: minutes west of Greenwich, the
+/// type of daylight saving time), which gettimeofday reports; Linux's sys_tz. Only a
+/// tree with the host grant sets it, the machine's own (today the only one there is).
+static TIME_ZONE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Linux's do_sys_settimeofday64: sets the wall clock to `ns` and the time zone to `tz`,
+/// whichever is given, in Linux's order: a time past `SETTOD_SEC_MAX` is EINVAL, then
+/// without the host grant EPERM (even with neither given: the capability is checked
+/// first), then a zone more than 15 hours from Greenwich EINVAL, and a time before the
+/// monotonic clock's (as Linux's timekeeping: the wall clock never goes below boot). The
+/// zone is only reported (the wall clock is UTC: no warp of a local-time RTC).
+fn set_time(ns: Option<u64>, tz: Option<[i32; 2]>) -> Result<i64, i64> {
+    if ns.is_some_and(|ns| ns / NSEC_PER_SEC >= SETTOD_SEC_MAX) {
+        return Err(EINVAL);
+    }
+    let granted = syscall(SYS_HOST_GRANTED, [0; 6]);
+    if granted < 0 {
+        return Err(-granted);
+    }
+    if let Some([west, dst]) = tz {
+        if !(-15 * 60..=15 * 60).contains(&west) {
+            return Err(EINVAL);
+        }
+        TIME_ZONE.store((west as u32 as u64) | (dst as u32 as u64) << 32, core::sync::atomic::Ordering::Relaxed);
+    }
+    let Some(ns) = ns else { return Ok(0) };
     if ns < clock(CLOCK_MONOTONIC as u64)? {
         return Err(EINVAL);
     }
@@ -140,18 +166,19 @@ fn set_wall(ns: u64) -> Result<i64, i64> {
     if r < 0 { Err(-r) } else { Ok(0) }
 }
 
-/// settimeofday(tv, tz): the wall clock from a timeval (the time zone is ignored, as
-/// Linux's warp_clock aside).
-fn settimeofday(tv: u64) -> Result<i64, i64> {
+/// settimeofday(tv, tz): the wall clock from a timeval, and the time zone (`set_time`);
+/// both read first (EFAULT, EINVAL for a timeval that is not normalized).
+fn settimeofday(tv: u64, tz: u64) -> Result<i64, i64> {
+    let mut ns = None;
     if tv != 0 {
         let [sec, usec]: [i64; 2] = usercopy::read(tv)?;
         if sec < 0 || !(0..1_000_000).contains(&usec) {
             return Err(EINVAL);
         }
-        let ns = (sec as u64).saturating_mul(NSEC_PER_SEC).saturating_add(usec as u64 * 1000);
-        return set_wall(ns);
+        ns = Some((sec as u64).saturating_mul(NSEC_PER_SEC).saturating_add(usec as u64 * 1000));
     }
-    Ok(0)
+    let zone = if tz != 0 { Some(usercopy::read::<[i32; 2]>(tz)?) } else { None };
+    set_time(ns, zone)
 }
 
 fn timespec(ns: u64) -> [u64; 2] {
@@ -188,8 +215,9 @@ fn gettimeofday(tv: u64, tz: u64) -> Result<i64, i64> {
         usercopy::write(tv, &[ns / NSEC_PER_SEC, ns % NSEC_PER_SEC / 1000])?;
     }
     if tz != 0 {
-        // struct timezone: UTC, no daylight saving.
-        usercopy::write(tz, &[0u32; 2])?;
+        // struct timezone, as settimeofday set it (UTC, no daylight saving, at first).
+        let zone = TIME_ZONE.load(core::sync::atomic::Ordering::Relaxed);
+        usercopy::write(tz, &[zone as u32, (zone >> 32) as u32])?;
     }
     Ok(0)
 }

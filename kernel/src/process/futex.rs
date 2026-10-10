@@ -52,7 +52,7 @@ use super::{kill, uaccess, Pid};
 use crate::sync::IrqSpinLock;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 const FUTEX_BITSET_MATCH_ANY: u32 = u32::MAX;
 
@@ -76,6 +76,11 @@ struct Waiter {
     key: Key,
     sleeper: Sleeper,
     bitset: u32,
+    /// When it was queued (`SEQ`, taken under its bucket's lock; a requeue
+    /// keeps it): a wake that takes several holds of the lock wakes only
+    /// waiters queued before its first (`wake_key`), so a waiter it woke
+    /// that waits again is not woken (or counted) twice.
+    seq: u64,
     /// A requeue may move it to another word: only a wait of `wait` (a
     /// program's or a native server's futex wait). The Linux server's own
     /// waits (`server_wait`, `object_wait`, `server_waitv`) stay on the
@@ -98,12 +103,15 @@ impl Waiter {
         matches!(&self.sleeper, Sleeper::Task(w) if core::ptr::eq(&**w, t))
     }
 
-    /// Wakes the task, or rings the watching service's doorbell.
-    fn wake(self) {
+    /// Wakes the task, or rings the watching service's doorbell. The task's
+    /// reference goes to `out`, to be dropped once the bucket is unlocked
+    /// (`sink`).
+    fn wake(self, out: &mut impl Sink) {
         match self.sleeper {
             Sleeper::Task(task) => {
                 task.futex_woken.store(true, Ordering::Release);
                 try_wake(&task, State::Sleeping);
+                out.put(task);
             }
             Sleeper::Watch(doorbell, pid) => {
                 doorbell.store(true, Ordering::Release);
@@ -111,6 +119,63 @@ impl Waiter {
             }
         }
     }
+
+    /// Takes the entry out without waking it (a stale one): its task's
+    /// reference goes to `out` as `wake`'s does.
+    fn discard(self, out: &mut impl Sink) {
+        if let Sleeper::Task(task) = self.sleeper {
+            out.put(task);
+        }
+    }
+}
+
+/// Where a wake leaves the references to the tasks it took out of a bucket:
+/// they are dropped after the bucket's lock (a task's last reference may go
+/// with them, and with it its thread's state, whose drop takes other locks,
+/// a Linux server instance's included, which may wake futexes in turn). A
+/// wake takes out only while there is room (`room`).
+trait Sink {
+    fn room(&self) -> bool;
+    fn put(&mut self, task: Arc<Task>);
+}
+
+/// A chunk on the stack: wakes of many waiters go a chunk per lock hold.
+type Chunk = heapless::Vec<Arc<Task>, 32>;
+
+impl Sink for Chunk {
+    fn room(&self) -> bool {
+        !self.is_full()
+    }
+
+    fn put(&mut self, task: Arc<Task>) {
+        let _ = self.push(task);
+    }
+}
+
+/// Room reserved before the lock was taken (`requeue`, whose wake and move
+/// are one step under both locks).
+impl Sink for Vec<Arc<Task>> {
+    fn room(&self) -> bool {
+        self.len() < self.capacity()
+    }
+
+    fn put(&mut self, task: Arc<Task>) {
+        if self.room() {
+            self.push(task);
+        }
+    }
+}
+
+/// The order waiters were queued in (`Waiter::seq`), over all buckets: one
+/// counter, so that a requeue can move a waiter to another bucket with its
+/// number and stay comparable there (one relaxed increment per wait; per
+/// bucket counters would have to re-number moved waiters, and a waiter
+/// moved during a chunked wake of its new word could then be missed).
+static SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// A new waiter's `seq` (under its bucket's lock).
+fn next_seq() -> u64 {
+    SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
 const BUCKETS: usize = 256;
@@ -125,6 +190,31 @@ fn tidy(b: &mut Vec<Waiter>) {
     if b.is_empty() && b.capacity() > KEEP {
         *b = Vec::new();
     }
+}
+
+/// Room for `n` more waiters in `b` without allocating under its lock: if
+/// `b` has too little, `spare` (allocated with the lock released, `spare_for`)
+/// takes its waiters and becomes it, and the old buffer is left in `spare`
+/// for the caller to drop after the lock. False: `spare` is too small too.
+fn make_room(b: &mut Vec<Waiter>, n: usize, spare: &mut Vec<Waiter>) -> bool {
+    if b.capacity() - b.len() >= n {
+        return true;
+    }
+    if spare.capacity() < b.len() + n {
+        return false;
+    }
+    spare.append(b);
+    core::mem::swap(b, spare);
+    true
+}
+
+/// A spare buffer for `make_room` of a bucket that had `len` waiters and
+/// needs `n` more (some slack for those that come meanwhile), allocated
+/// with no lock held. ENOMEM without memory.
+fn spare_for(len: usize, n: usize) -> Result<Vec<Waiter>, i64> {
+    let mut spare = Vec::new();
+    spare.try_reserve_exact((len + n).max(KEEP) * 2).map_err(|_| ENOMEM)?;
+    Ok(spare)
 }
 
 static BUCKETS_: [IrqSpinLock<Vec<Waiter>>; BUCKETS] = [const { IrqSpinLock::new(Vec::new()) }; BUCKETS];
@@ -246,6 +336,8 @@ fn wait_on(
 ) -> Result<i64, i64> {
     let me = current();
     let index = bucket_of(&key);
+    // (Declared before the guards: the old buffer goes after the lock.)
+    let mut spare = Vec::new();
     let mut wait = loop {
         let wait = prepare_to_sleep();
         let mut b = BUCKETS_[index].lock();
@@ -255,10 +347,19 @@ fn wait_on(
         match peek() {
             Some(v) if v != val => return Err(EAGAIN),
             Some(_) => {
-                b.try_reserve(1).map_err(|_| ENOMEM)?;
+                if !make_room(&mut b, 1, &mut spare) {
+                    let len = b.len();
+                    drop(b);
+                    drop(wait);
+                    spare = spare_for(len, 1)?;
+                    continue;
+                }
                 me.futex_woken.store(false, Ordering::Relaxed);
                 me.futex_bucket.store(index, Ordering::Relaxed);
-                b.push(Waiter { key, sleeper: Sleeper::Task(current_arc()), bitset, movable });
+                b.push(Waiter { key, sleeper: Sleeper::Task(current_arc()), bitset, seq: next_seq(), movable });
+                drop(b);
+                // (The old buffer, after the lock, before the sleep.)
+                drop(core::mem::take(&mut spare));
                 break wait;
             }
             None => {
@@ -322,25 +423,55 @@ fn stale(w: &Waiter) -> bool {
 }
 
 /// Wakes waiters of `bucket` with `key` (and a bitset bit in common), at
-/// most `n`; returns how many. Stale entries of a vectored wait go without
-/// counting, so they never take a wake another waiter needs.
-fn wake_in(b: &mut Vec<Waiter>, key: &Key, n: u64, bitset: u32) -> u64 {
+/// most `n`, while `out` has room; returns how many, and whether it stopped
+/// for lack of room with waiters of `key` left. Stale entries of a vectored
+/// wait go without counting, so they never take a wake another waiter needs.
+/// Only waiters queued before `before` (`Waiter::seq`) are looked at.
+fn wake_in(b: &mut Vec<Waiter>, key: &Key, n: u64, bitset: u32, before: u64, out: &mut impl Sink) -> (u64, bool) {
     let mut woken = 0;
     let mut i = 0;
     while i < b.len() && woken < n {
-        if b[i].key == *key && stale(&b[i]) {
-            b.remove(i);
+        let w = &b[i];
+        let stale = w.key == *key && w.seq < before && stale(w);
+        if w.key != *key || w.seq >= before || !stale && w.bitset & bitset == 0 {
+            i += 1;
             continue;
         }
-        if b[i].key == *key && b[i].bitset & bitset != 0 {
-            b.remove(i).wake();
-            woken += 1;
+        if !out.room() {
+            tidy(b);
+            return (woken, true);
+        }
+        if stale {
+            b.remove(i).discard(out);
         } else {
-            i += 1;
+            b.remove(i).wake(out);
+            woken += 1;
         }
     }
     tidy(b);
-    woken
+    (woken, false)
+}
+
+/// Wakes at most `n` waiters of `key` (bitset `bitset`), a chunk per hold of
+/// the bucket's lock, the tasks' references dropped between (`Sink`). Only
+/// the waiters queued when it first held the lock: one it woke that waits
+/// again meanwhile is a new waiter, which this wake neither wakes again nor
+/// counts (so `n` wakes reach `n` waiters, and a wake of all ends).
+fn wake_key(key: &Key, n: u64, bitset: u32) -> u64 {
+    let mut woken = 0;
+    let mut before = None;
+    loop {
+        let mut chunk = Chunk::new();
+        let mut b = BUCKETS_[bucket_of(key)].lock();
+        let limit = *before.get_or_insert_with(|| SEQ.load(Ordering::Relaxed));
+        let (w, more) = wake_in(&mut b, key, n - woken, bitset, limit, &mut chunk);
+        drop(b);
+        woken += w;
+        drop(chunk);
+        if !more || woken >= n {
+            return woken;
+        }
+    }
 }
 
 /// Wakes at most `n` waiters of the word at `uaddr` that share a bit of
@@ -350,15 +481,21 @@ pub fn wake(uaddr: u64, n: u64, bitset: u32, private: bool) -> Result<i64, i64> 
         return Err(EINVAL);
     }
     let (key, _) = key_of(uaddr, private)?;
-    let mut b = BUCKETS_[bucket_of(&key)].lock();
-    Ok(wake_in(&mut b, &key, n, bitset) as i64)
+    Ok(wake_key(&key, n, bitset) as i64)
 }
 
 /// Wakes up to `n_wake` waiters of `uaddr` and moves up to `n_move` more
 /// to `uaddr2`; with `cmp`, only if the word still holds that value.
 pub fn requeue(uaddr: u64, n_wake: u64, n_move: u64, uaddr2: u64, cmp: Option<u32>, private: bool) -> Result<i64, i64> {
-    let (from, to) = (key_of(uaddr, private)?.0, key_of(uaddr2, private)?.0);
+    let from = key_of(uaddr, private)?.0;
+    // (The target's object, if it is a shared one: kept to see a hang-up.)
+    let (to, to_object) = key_of(uaddr2, private)?;
     let (i1, i2) = (bucket_of(&from), bucket_of(&to));
+    // The references of the tasks it takes out (woken or stale), dropped
+    // after the locks: room for each entry of `from`, reserved with the locks
+    // released (declared first: dropped after the guards).
+    let mut out: Vec<Arc<Task>> = Vec::new();
+    let mut spare = Vec::new();
     loop {
         // Both buckets, in index order (once if they are the same).
         let mut first = BUCKETS_[i1.min(i2)].lock();
@@ -380,22 +517,45 @@ pub fn requeue(uaddr: u64, n_wake: u64, n_move: u64, uaddr2: u64, cmp: Option<u3
             Some(s) if i1 < i2 => (&mut *first, Some(&mut **s)),
             Some(s) => (&mut **s, Some(&mut *first)),
         };
-        // Room first, so that nothing fails halfway. Only the waits of
-        // `wait` move (`Waiter::movable`): a doorbell watch stays on its
-        // channel's word, whose hang-up is what removes it for good (moved
-        // elsewhere, it would outlive the channel and escape
+        let entries = src.iter().filter(|w| w.key == from).count();
+        if out.capacity() < entries {
+            drop(second);
+            drop(first);
+            out.try_reserve_exact(entries).map_err(|_| ENOMEM)?;
+            continue;
+        }
+        // As Linux: up to `n_wake` waiters woken (whichever kind), then up
+        // to `n_move` of the movable ones left moved, with room for as many
+        // as may move reserved first, so that nothing fails halfway. Only
+        // the waits of `wait` move (`Waiter::movable`): a doorbell watch
+        // stays on its channel's word, whose hang-up is what removes it for
+        // good (moved elsewhere, it would outlive the channel and escape
         // `object_watch`'s one-per-word rule), and the Linux server's own
         // waits stay where they are; a stale entry is nobody's to move.
         let moves = |w: &Waiter| w.key == from && w.movable && matches!(w.sleeper, Sleeper::Task(_)) && !stale(w);
         let matching = src.iter().filter(|w| moves(w)).count() as u64;
-        let movable = matching.saturating_sub(n_wake).min(n_move);
         if let Some(d) = dst.as_mut() {
-            d.try_reserve(movable as usize).map_err(|_| ENOMEM)?;
+            let need = matching.min(n_move) as usize;
+            if !make_room(d, need, &mut spare) {
+                let len = d.len();
+                drop(second);
+                drop(first);
+                spare = spare_for(len, need)?;
+                continue;
+            }
         }
-        let woken = wake_in(src, &from, n_wake, FUTEX_BITSET_MATCH_ANY);
+        // A word of a hung-up object takes no waiters (`wake_object` has gone
+        // through its buckets): those to move are woken instead, and wait
+        // again to find the hang-up (checked under the target's lock, which
+        // `wake_object` takes after hanging up).
+        if to_object.as_ref().is_some_and(|o| o.is_hung_up()) {
+            let (woken, _) = wake_in(src, &from, n_wake.saturating_add(n_move), FUTEX_BITSET_MATCH_ANY, u64::MAX, &mut out);
+            return Ok(woken as i64);
+        }
+        let (woken, _) = wake_in(src, &from, n_wake, FUTEX_BITSET_MATCH_ANY, u64::MAX, &mut out);
         let mut moved = 0;
         let mut i = 0;
-        while i < src.len() && moved < movable {
+        while i < src.len() && moved < n_move {
             if !moves(&src[i]) {
                 i += 1;
                 continue;
@@ -466,8 +626,23 @@ pub fn server_waitv(words: &[WaitWord], deadline: Option<u64>, ends: Ends) -> Re
     me.futex_woken.store(false, Ordering::Release);
     let mut queued = 0;
     let mut early = None;
-    for w in words {
-        let mut b = BUCKETS_[bucket_of(&w.key)].lock();
+    let mut spare = Vec::new();
+    'words: for w in words {
+        let mut b = loop {
+            let mut b = BUCKETS_[bucket_of(&w.key)].lock();
+            if make_room(&mut b, 1, &mut spare) {
+                break b;
+            }
+            let len = b.len();
+            drop(b);
+            match spare_for(len, 1) {
+                Ok(s) => spare = s,
+                Err(e) => {
+                    early = Some(e);
+                    break 'words;
+                }
+            }
+        };
         if w.object.as_ref().is_some_and(|o| o.is_hung_up()) {
             early = Some(EPIPE);
             break;
@@ -476,12 +651,10 @@ pub fn server_waitv(words: &[WaitWord], deadline: Option<u64>, ends: Ends) -> Re
             early = Some(EAGAIN);
             break;
         }
-        if b.try_reserve(1).is_err() {
-            early = Some(ENOMEM);
-            break;
-        }
-        b.push(Waiter { key: w.key, sleeper: Sleeper::Task(current_arc()), bitset: FUTEX_BITSET_MATCH_ANY, movable: false });
+        b.push(Waiter { key: w.key, sleeper: Sleeper::Task(current_arc()), bitset: FUTEX_BITSET_MATCH_ANY, seq: next_seq(), movable: false });
         queued += 1;
+        drop(b);
+        drop(core::mem::take(&mut spare));
     }
     let result = match early {
         Some(e) => Err(e),
@@ -551,7 +724,16 @@ pub fn object_watch(
     pid: Pid,
 ) -> Result<i64, i64> {
     let key = Key { base: Base::Shared(Arc::as_ptr(object) as usize), offset };
-    let mut b = BUCKETS_[bucket_of(&key)].lock();
+    let mut spare = Vec::new();
+    let mut b = loop {
+        let mut b = BUCKETS_[bucket_of(&key)].lock();
+        if make_room(&mut b, 1, &mut spare) {
+            break b;
+        }
+        let len = b.len();
+        drop(b);
+        spare = spare_for(len, 1)?;
+    };
     if object.is_hung_up() {
         return Err(EPIPE);
     }
@@ -560,17 +742,78 @@ pub fn object_watch(
     }
     let armed = |w: &Waiter| w.key == key && matches!(&w.sleeper, Sleeper::Watch(_, p) if *p == pid);
     if !b.iter().any(armed) {
-        b.try_reserve(1).map_err(|_| ENOMEM)?;
-        b.push(Waiter { key, sleeper: Sleeper::Watch(doorbell.clone(), pid), bitset: FUTEX_BITSET_MATCH_ANY, movable: false });
+        b.push(Waiter { key, sleeper: Sleeper::Watch(doorbell.clone(), pid), bitset: FUTEX_BITSET_MATCH_ANY, seq: next_seq(), movable: false });
     }
     Ok(0)
+}
+
+/// The doorbell of `test_watch`'s watch and the word it is on, while one
+/// is armed.
+static TEST_DOORBELL: IrqSpinLock<Option<(Arc<AtomicBool>, Key)>> = IrqSpinLock::new(None);
+
+/// Test mode (`restricted::TEST_FUTEX_WATCH`): a doorbell watch on a word
+/// of the caller's memory, a waiter no requeue moves, beside the program's
+/// own (movable) waits. `arm`: arms it on the private word at `uaddr` (one
+/// at a time); either way, how many waiters the word has. `uaddr` 0: takes
+/// it back and returns whether a wake rang its doorbell.
+pub fn test_watch(uaddr: u64, arm: bool) -> Result<i64, i64> {
+    if uaddr == 0 {
+        return Ok(test_unwatch(|_| true).unwrap_or(false) as i64);
+    }
+    let (key, _) = key_of(uaddr, true)?;
+    if !arm {
+        return Ok(BUCKETS_[bucket_of(&key)].lock().iter().filter(|w| w.key == key).count() as i64);
+    }
+    let d = Arc::try_new(AtomicBool::new(false)).map_err(|_| ENOMEM)?;
+    let mut spare = Vec::new();
+    loop {
+        // The slot, then the bucket (`test_unwatch` takes them one after the
+        // other): it is set only once the watch is in.
+        let mut slot = TEST_DOORBELL.lock();
+        if slot.is_some() {
+            return Err(EBUSY);
+        }
+        let mut b = BUCKETS_[bucket_of(&key)].lock();
+        if !make_room(&mut b, 1, &mut spare) {
+            let len = b.len();
+            drop(b);
+            drop(slot);
+            spare = spare_for(len, 1)?;
+            continue;
+        }
+        b.push(Waiter { key, sleeper: Sleeper::Watch(d.clone(), super::current_pid()), bitset: FUTEX_BITSET_MATCH_ANY, seq: next_seq(), movable: false });
+        *slot = Some((d, key));
+        return Ok(b.iter().filter(|w| w.key == key).count() as i64);
+    }
+}
+
+/// Takes `test_watch`'s watch back if one is armed on a word `which`
+/// accepts: whether a wake rang it (None: there was none).
+fn test_unwatch(which: impl Fn(&Key) -> bool) -> Option<bool> {
+    let (doorbell, key) = {
+        let mut slot = TEST_DOORBELL.lock();
+        if !slot.as_ref().is_some_and(|(_, k)| which(k)) {
+            return None;
+        }
+        slot.take()?
+    };
+    let mut b = BUCKETS_[bucket_of(&key)].lock();
+    b.retain(|w| !matches!(&w.sleeper, Sleeper::Watch(d, _) if Arc::ptr_eq(d, &doorbell)));
+    tidy(&mut b);
+    drop(b);
+    Some(doorbell.load(Ordering::Acquire))
+}
+
+/// An address space goes (`Mm`'s drop): a test watch left on one of its
+/// words goes with it (its key would name whatever takes the address next).
+pub fn mm_gone(mm: *const super::address_space::Mm) {
+    test_unwatch(|k| k.base == Base::Mm(mm as usize));
 }
 
 /// Wakes up to `n` waiters on the word at `offset` of `object`.
 pub fn object_wake(object: &PageCache, offset: u64, n: u64) -> i64 {
     let key = Key { base: Base::Shared(object as *const PageCache as usize), offset };
-    let mut b = BUCKETS_[bucket_of(&key)].lock();
-    wake_in(&mut b, &key, n, FUTEX_BITSET_MATCH_ANY) as i64
+    wake_key(&key, n, FUTEX_BITSET_MATCH_ANY) as i64
 }
 
 /// Wakes every waiter on any word of `object` (after `hang_up`). It looks
@@ -580,24 +823,36 @@ pub fn object_wake(object: &PageCache, offset: u64, n: u64) -> i64 {
 pub fn wake_object(object: &PageCache) {
     let base = Base::Shared(object as *const PageCache as usize);
     for bucket in BUCKETS_.iter() {
-        let mut b = bucket.lock();
-        let mut i = 0;
-        while i < b.len() {
-            if b[i].key.base == base {
-                b.swap_remove(i).wake();
-            } else {
-                i += 1;
+        // A chunk per lock hold, the tasks' references dropped between. (No
+        // waiter it woke comes back: a wait checks for the hang-up under the
+        // bucket's lock, which it takes after this chunk let go of it.)
+        loop {
+            let mut chunk = Chunk::new();
+            let mut b = bucket.lock();
+            let mine = |w: &Waiter| w.key.base == base;
+            let mut i = 0;
+            while i < b.len() && chunk.room() {
+                if mine(&b[i]) {
+                    b.swap_remove(i).wake(&mut chunk);
+                } else {
+                    i += 1;
+                }
+            }
+            let more = b.iter().any(mine);
+            tidy(&mut b);
+            drop(b);
+            drop(chunk);
+            if !more {
+                break;
             }
         }
-        tidy(&mut b);
     }
 }
 
 /// Wakes up to `n` waiters on `addr` of the Linux server's memory.
 pub fn server_wake(instance: usize, addr: u64, n: u64) -> i64 {
     let key = Key { base: Base::Server(instance), offset: addr };
-    let mut b = BUCKETS_[bucket_of(&key)].lock();
-    wake_in(&mut b, &key, n, FUTEX_BITSET_MATCH_ANY) as i64
+    wake_key(&key, n, FUTEX_BITSET_MATCH_ANY) as i64
 }
 
 /// Wakes one waiter of the (shared-keyed) futex at `uaddr`: the join of a

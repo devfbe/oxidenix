@@ -143,8 +143,16 @@ pub const SYS_MO_CREATE: u64 = 1013;
 /// mapping goes at `addr` (replacing what was there, or EEXIST with
 /// `MO_NOREPLACE`); otherwise `addr` is a hint, taken if that range is
 /// free, and the kernel finds a free range. `MO_POPULATE` makes the pages
-/// present now. `prot`: mmap's PROT_ bits.
+/// present now. `prot`: mmap's PROT_ bits. The kernel finds room below
+/// `MMAP_TOP`.
 pub const SYS_MO_MAP: u64 = 1014;
+/// Where the room `mo_map` finds ends: the stack's area lies above (16 TiB
+/// up to the 64 TiB line).
+pub const MMAP_TOP: u64 = 0x3000_0000_0000;
+/// The room kept free below a stack (Linux's stack_guard_gap, 256 pages):
+/// it grows no closer to an accessible mapping below it, and the kernel
+/// places none closer (the server's brk neither).
+pub const STACK_GUARD_GAP: u64 = 256 * 4096;
 /// `mo_unmap(addr, len)` in the calling thread's program view.
 pub const SYS_MO_UNMAP: u64 = 1015;
 /// `mo_protect(addr, len, prot)` in the calling thread's program view.
@@ -164,8 +172,12 @@ pub const MO_POPULATE: u64 = 16;
 /// A shared mapping that may never become writable (a file object mapped
 /// through a descriptor not open for writing: mprotect gives EACCES).
 pub const MO_READONLY: u64 = 32;
-/// Anonymous private memory that grows down on demand, up to 8 MiB, when
-/// the program touches the page below it (the stack `execve` makes).
+/// Anonymous private memory that grows down on demand when the program
+/// touches the page below it (the stack `execve` makes), until it reaches
+/// as far below its top as `offset` says (its ceiling; the mapping's length
+/// if that is more), its process's soft limit (`SYS_STACK_LIMIT`) or the
+/// guard gap of 256 pages above another accessible mapping. A growth that
+/// cannot be committed is a segmentation fault (EFAULT for a copy).
 pub const MO_GROWSDOWN: u64 = 64;
 
 // Bridges to state the kernel still owns, and address space operations
@@ -760,8 +772,10 @@ pub const SYS_FUTEX_WAIT: u64 = 1160;
 /// of the word at `addr` whose bitset shares a bit with `bitset`.
 pub const SYS_FUTEX_WAKE: u64 = 1161;
 /// `futex_requeue(addr, n_wake, n_move, addr2, val, flags) -> n`: wakes at
-/// most `n_wake` waiters of `addr` and moves at most `n_move` more to wait
-/// on `addr2`; with `FUTEX_CMP` only if the word at `addr` still holds
+/// most `n_wake` waiters of `addr` and then moves at most `n_move` of the
+/// movable ones left (the waits of `futex_wait`) to wait on `addr2`, as
+/// Linux: a wake that went to a waiter no requeue moves takes nothing from
+/// the moves. With `FUTEX_CMP` only if the word at `addr` still holds
 /// `val` (EAGAIN otherwise). Returns how many were woken and moved.
 pub const SYS_FUTEX_REQUEUE: u64 = 1162;
 /// The word is private to the address space (Linux's FUTEX_PRIVATE_FLAG).
@@ -790,6 +804,17 @@ pub const POWER_RESTART: u64 = 1;
 /// instance's tmpfs files: `mo_create_file`, `mo_from_image`) take and
 /// their limit, two u64s at `out` in the server's memory (tmpfs's statfs).
 pub const SYS_FILE_PAGES: u64 = 1166;
+/// `host_granted()`: 0 if the caller's instance has the host grant (see
+/// `SYS_CLOCK_SET`), EPERM if not. For what Linux decides by the capability
+/// before it looks at the arguments (`reboot` in a pid namespace that is
+/// not the initial one, `settimeofday` with only a time zone).
+pub const SYS_HOST_GRANTED: u64 = 1167;
+/// `stack_limit(handle, limit)`: how far the stack of process `handle` (0:
+/// the caller's) may grow below its top, its soft RLIMIT_STACK, read at
+/// each growth within the stack's ceiling (`MO_GROWSDOWN`'s offset).
+/// Unbounded until set; a process `proc_create` makes starts with its
+/// creator's.
+pub const SYS_STACK_LIMIT: u64 = 1168;
 
 /// What `proc_info` tells about a process.
 #[repr(C)]
@@ -936,3 +961,10 @@ pub const TEST_HOST: u64 = 1522;
 /// its next use. Test mode only (ENOSYS otherwise); a program's call with a
 /// C string `name` is the server's to pass on (datatest: diskfs's orphans).
 pub const TEST_KILL_SERVER: u64 = 1523;
+/// `(addr, arm) -> waiters`: with `arm`, the kernel arms a doorbell watch
+/// (a waiter no requeue moves) on the program's private futex word at
+/// `addr`; either way it returns how many waiters the word has. `addr` 0
+/// takes the watch back and returns whether a wake rang it: lxtest checks
+/// that a requeue's wakes spent on such waiters still move what it asked
+/// for. Test mode only; a program's call is the server's to pass on.
+pub const TEST_FUTEX_WATCH: u64 = 1524;

@@ -136,6 +136,9 @@ pub enum Report {
 pub struct Brk {
     pub start: u64,
     pub end: u64,
+    /// The most the break may reach: below the room execve kept for the stack and its
+    /// guard gap (0 before the first execve: no heap yet).
+    pub limit: u64,
 }
 
 pub struct Proc {
@@ -186,8 +189,8 @@ pub struct Proc {
     /// Bytes its execve calls hold of their arguments and environments
     /// (`exec::Strings`, bounded per process).
     pub exec_bytes: Arc<core::sync::atomic::AtomicUsize>,
-    /// Its resource limits but RLIMIT_NOFILE (`ids::Limits`).
-    pub limits: crate::ids::Limits,
+    /// Its resource limits (`ids::Limits`), its threads' too.
+    pub limits: Arc<crate::ids::Limits>,
 }
 
 pub struct Thread {
@@ -199,6 +202,11 @@ pub struct Thread {
     /// Its descriptor table (shared by CLONE_FILES); None once it exited (the table goes on
     /// the exiting thread, as Linux's exit_files).
     pub files: Option<Arc<FilesContext>>,
+    /// Its process's resource limits (`Proc::limits`): the reference behind
+    /// `local::Local::limits`, held until the thread is gone (its process may be reaped
+    /// while it still runs to its end).
+    #[allow(dead_code)]
+    pub limits: Arc<crate::ids::Limits>,
     /// Its name (comm), NUL-padded.
     pub comm: [u8; 16],
     pub sig: signal::ThreadSignals,
@@ -248,6 +256,7 @@ pub struct Birth {
     pub settid: u64,
     pub fs: *const FsContext,
     pub files: *const FilesContext,
+    pub limits: *const crate::ids::Limits,
     pub serial: u64,
 }
 
@@ -442,10 +451,20 @@ pub fn name_kernel_thread(key: u64, comm: &[u8; 16]) {
 /// with a record at the root. Its program is run by `exec::init`.
 pub fn register_init(key: u64) {
     let handle = syscall(SYS_PROC_SELF, [0; 6]);
+    if handle <= 0 {
+        // Without a handle on itself no other process could name it to the kernel (0
+        // would name the caller): the tree cannot start (status 127, as a failed exec).
+        syscall(SYS_THREAD_EXIT, [127 << 8, EXIT_GROUP, 0, 0, 0, 0]);
+        unreachable!("thread_exit returned");
+    }
     let fs = records::root();
     let fs_ptr = Arc::as_ptr(&fs);
     let files = FilesContext::empty();
     let files_ptr = Arc::as_ptr(&files);
+    let limits = Arc::new(crate::ids::Limits::initial());
+    let limits_ptr = Arc::as_ptr(&limits);
+    // The kernel's bound on the stack's growth (its processes inherit it).
+    syscall(SYS_STACK_LIMIT, [0, limits.soft(crate::ids::RLIMIT_STACK), 0, 0, 0, 0]);
     // (A fresh instance has the room; `end_later` copes without it.)
     let reserved = fdtable::reserve_end().is_ok();
     {
@@ -457,7 +476,7 @@ pub fn register_init(key: u64) {
             ppid: 0,
             pgid: pid,
             sid: pid,
-            handle: handle.max(0) as u64,
+            handle: handle as u64,
             threads: alloc::vec![pid],
             children: Vec::new(),
             zombie: None,
@@ -481,13 +500,13 @@ pub fn register_init(key: u64) {
             words: Arc::new(Words::default()),
             tables_out: 0,
             exec_bytes: Arc::new(core::sync::atomic::AtomicUsize::new(0)),
-            limits: Default::default(),
+            limits: limits.clone(),
         };
         t.procs.insert(pid, p);
         let serial = t.new_serial();
-        t.threads.insert(pid, Thread { tid: pid, pid, key, fs, files: Some(files), comm: comm_from("init"), sig: signal::ThreadSignals::default(), exited: false, serial, reserved });
+        t.threads.insert(pid, Thread { tid: pid, pid, key, fs, files: Some(files), limits, comm: comm_from("init"), sig: signal::ThreadSignals::default(), exited: false, serial, reserved });
         t.keys.insert(key, pid);
-        local::set(pid, pid, key, fs_ptr, files_ptr);
+        local::set(pid, pid, key, fs_ptr, files_ptr, limits_ptr);
     }
 }
 
@@ -496,7 +515,7 @@ pub fn register_init(key: u64) {
 /// and registers its key (a signal posted meanwhile is seen at its first delivery check).
 pub fn start_thread(cookie: u64, key: u64) {
     let birth = unsafe { alloc::boxed::Box::from_raw(cookie as *mut Birth) };
-    local::set(birth.tid, birth.pid, key, birth.fs, birth.files);
+    local::set(birth.tid, birth.pid, key, birth.fs, birth.files, birth.limits);
     if birth.settid != 0 {
         // As Linux's schedule_tail: a fault here is ignored.
         let _ = usercopy::write(birth.settid, &birth.tid);
@@ -686,6 +705,14 @@ fn clone(s: &State, c: Clone) -> Result<i64, i64> {
         }
     };
     let files_ptr = Arc::as_ptr(&files);
+    // A new process's limits: a copy of the caller's.
+    let limits = if thread { crate::ids::current() } else { Arc::new(crate::ids::current().copy()) };
+    let limits_ptr = Arc::as_ptr(&limits);
+    if !thread {
+        // The kernel's bound on its stack's growth, from the copy (no one else sees it
+        // yet: a change of the caller's limit meanwhile is the caller's alone).
+        syscall(SYS_STACK_LIMIT, [handle, limits.soft(crate::ids::RLIMIT_STACK), 0, 0, 0, 0]);
+    }
     // The records.
     let serial = {
         let mut t = PROCS.lock();
@@ -726,7 +753,7 @@ fn clone(s: &State, c: Clone) -> Result<i64, i64> {
                 parent.brk.clone()
             } else {
                 let b = parent.brk.lock();
-                Arc::new(Mutex::new(Brk { start: b.start, end: b.end }))
+                Arc::new(Mutex::new(Brk { start: b.start, end: b.end, limit: b.limit }))
             };
             let p = Proc {
                 pid,
@@ -758,7 +785,7 @@ fn clone(s: &State, c: Clone) -> Result<i64, i64> {
                 words: Arc::new(Words::default()),
                 tables_out: 0,
                 exec_bytes: Arc::new(core::sync::atomic::AtomicUsize::new(0)),
-                limits: parent.limits,
+                limits: limits.clone(),
             };
             t.procs.insert(pid, p);
             if let Some(pp) = t.procs.get_mut(&ppid) {
@@ -768,7 +795,7 @@ fn clone(s: &State, c: Clone) -> Result<i64, i64> {
             t.procs.get_mut(&pid).expect("checked above").threads.push(tid);
         }
         let serial = t.new_serial();
-        t.threads.insert(tid, Thread { tid, pid, key: 0, fs, files: Some(files), comm, sig: thread_sig, exited: false, serial, reserved: true });
+        t.threads.insert(tid, Thread { tid, pid, key: 0, fs, files: Some(files), limits, comm, sig: thread_sig, exited: false, serial, reserved: true });
         serial
     };
     // The child's registers: the caller's, returning 0, on the new stack.
@@ -777,7 +804,7 @@ fn clone(s: &State, c: Clone) -> Result<i64, i64> {
     if c.stack != 0 {
         child.rsp = c.stack;
     }
-    let birth = alloc::boxed::Box::new(Birth { tid, pid, settid: if settid_in_child { c.ctid } else { 0 }, fs: fs_ptr, files: files_ptr, serial });
+    let birth = alloc::boxed::Box::new(Birth { tid, pid, settid: if settid_in_child { c.ctid } else { 0 }, fs: fs_ptr, files: files_ptr, limits: limits_ptr, serial });
     let cookie = alloc::boxed::Box::into_raw(birth) as u64;
     let tflags = if flags & CLONE_SETTLS != 0 { THREAD_SETTLS } else { 0 };
     let ctid = if flags & CLONE_CHILD_CLEARTID != 0 { c.ctid } else { 0 };
@@ -899,8 +926,8 @@ pub fn set_files(files: Arc<FilesContext>) -> Option<Arc<FilesContext>> {
     old
 }
 
-/// The descriptor table of process `pid` (its first thread's that has one): prlimit's
-/// RLIMIT_NOFILE and /proc/<pid>/fd of other processes.
+/// The descriptor table of process `pid` (its first thread's that has one): /proc/<pid>/fd
+/// of other processes.
 pub fn files_of(pid: Pid) -> Option<Arc<FilesContext>> {
     let t = PROCS.lock();
     let p = t.procs.get(&pid).filter(|p| p.zombie.is_none())?;

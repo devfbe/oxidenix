@@ -78,7 +78,8 @@ fn sysinfo(buf: u64) -> Result<i64, i64> {
 /// server wrote its caches back (`SYS_POWER`). The magic numbers are checked as Linux does;
 /// LINUX_REBOOT_CMD_HALT powers off too, RESTART2 restarts (its command string is
 /// checked, not used); CAD_ON and CAD_OFF are accepted (there is no Ctrl-Alt-Del to
-/// configure).
+/// configure). Without the host grant the tree is a pid namespace that is not the initial
+/// one, and the command goes to `reboot_pid_ns` once the magic numbers are right.
 fn reboot(magic: u64, magic2: u64, cmd: u64, arg: u64) -> Result<i64, i64> {
     const MAGIC: u64 = 0xfee1_dead;
     const MAGIC2: [u64; 4] = [0x2812_1969, 0x0512_1996, 0x1604_1998, 0x2011_2000];
@@ -90,6 +91,13 @@ fn reboot(magic: u64, magic2: u64, cmd: u64, arg: u64) -> Result<i64, i64> {
     const CAD_OFF: u64 = 0;
     if magic as u32 as u64 != MAGIC || !MAGIC2.contains(&(magic2 as u32 as u64)) {
         return Err(EINVAL);
+    }
+    if syscall(SYS_HOST_GRANTED, [0; 6]) == -EPERM {
+        return reboot_pid_ns(match cmd as u32 as u64 {
+            RESTART | RESTART2 => POWER_RESTART,
+            HALT | POWER_OFF_CMD => POWER_OFF,
+            _ => return Err(EINVAL),
+        });
     }
     let how = match cmd as u32 as u64 {
         CAD_ON | CAD_OFF => return Ok(0),
@@ -105,10 +113,16 @@ fn reboot(magic: u64, magic2: u64, cmd: u64, arg: u64) -> Result<i64, i64> {
     if r != -EPERM {
         return Err(-r);
     }
-    // No host grant: the tree is a pid namespace that is not the initial
-    // one, and reboot ends it as Linux's reboot_pid_ns does: its init dies
-    // (and with it every process of the tree), its parent's wait reporting
-    // SIGHUP for a restart, SIGINT for a power off or halt; the caller exits.
+    // The grant went meanwhile.
+    reboot_pid_ns(how)
+}
+
+/// reboot(2) in a pid namespace that is not the initial one (a tree without the host
+/// grant), as Linux's reboot_pid_ns: the tree's init dies (and with it every process of
+/// the tree), its parent's wait reporting SIGHUP for a restart (`how`), SIGINT for a power
+/// off or halt; the caller exits. No other command reaches it: those are EINVAL, and a
+/// RESTART2's string is never read.
+fn reboot_pid_ns(how: u64) -> Result<i64, i64> {
     let sig = if how == POWER_RESTART { SIGHUP } else { SIGINT };
     crate::process::PROCS.lock().group_exit(1, sig, None);
     crate::process::die(0)

@@ -8,6 +8,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <sys/eventfd.h>
 #include <sys/ioctl.h>
@@ -60,6 +61,7 @@
 #define TEST_SERVER_FAIL 1520
 #define TEST_SLEEP_LOCKED 1521
 #define TEST_HOST 1522
+#define TEST_FUTEX_WATCH 1524
 
 static int failures;
 
@@ -158,6 +160,186 @@ static void *futex_waker(void *arg) {
     return NULL;
 }
 
+/* `lxtest stack <MiB>`: uses that much stack, 64 KiB a frame. */
+static int stack_use(int frames) {
+    volatile char frame[64 * 1024];
+    frame[0] = (char)frames;
+    frame[sizeof frame - 1] = (char)frames;
+    if (frames <= 1)
+        return 1;
+    /* (Not a tail call: the frame is live across it.) */
+    return stack_use(frames - 1) + (frame[0] == frame[sizeof frame - 1] ? 0 : 1);
+}
+
+/* `lxtest wild`: an access 2 MiB above the mmap area, far below the stack, with an unlimited
+ * RLIMIT_STACK: a copy into it is EFAULT, a store SIGSEGV (no growth by 16 TiB, and no
+ * out-of-memory kill for trying). */
+static int wild_access(void) {
+    char *wild = (char *)0x300000200000UL;
+    int fd = open("/dev/zero", O_RDONLY);
+    errno = 0;
+    if (read(fd, wild, 1) != -1 || errno != EFAULT)
+        return 2;
+    *(volatile char *)wild = 1;
+    return 3;
+}
+
+/* Runs `lxtest stack <mib>` in a child with RLIMIT_STACK `limit` (0: as inherited) and
+ * about `env_bytes` of environment (strings of 64 KiB: one string may have 128 KiB); the
+ * child's wait status (exit status 100 + errno if its execve failed). */
+static int stack_run(rlim_t limit, const char *mode, int mib, size_t env_bytes) {
+    pid_t kid = fork();
+    if (kid == 0) {
+        if (limit) {
+            struct rlimit rl = {limit, RLIM_INFINITY};
+            setrlimit(RLIMIT_STACK, &rl);
+        }
+        char arg[16];
+        snprintf(arg, sizeof arg, "%d", mib);
+        char *env[16] = {NULL};
+        for (int i = 0; env_bytes > 0 && i < 15; i++) {
+            size_t n = env_bytes < 65536 ? env_bytes : 65536;
+            env[i] = malloc(n + 1);
+            memset(env[i], 'e', n);
+            env[i][0] = 'A' + i;
+            env[i][1] = '=';
+            env[i][n] = 0;
+            env_bytes -= n;
+        }
+        char *args[] = {"lxtest", (char *)mode, arg, NULL};
+        execve("/proc/self/exe", args, env);
+        _exit(100 + errno);
+    }
+    int status = 0;
+    waitpid(kid, &status, 0);
+    return status;
+}
+
+static int stack_child(rlim_t limit, int mib, size_t env_bytes) {
+    return stack_run(limit, "stack", mib, env_bytes);
+}
+
+/* RLIMIT_STACK, as execve takes it: the new stack grows as far as the limit says, and the
+ * arguments and environment take at most a quarter of it. */
+static void stack_checks(void) {
+    int big = stack_child(64 << 20, 24, 0);
+    int dflt = stack_child(0, 24, 0);
+    int fits = stack_child(1 << 20, 0, 200 * 1024);
+    int e2big = stack_child(1 << 20, 0, 300 * 1024);
+    check("RLIMIT_STACK: a 64 MiB limit lets the stack grow to 24 MiB, the default 8 MiB does not",
+          WIFEXITED(big) && WEXITSTATUS(big) == 0 && WIFSIGNALED(dflt) && WTERMSIG(dflt) == SIGSEGV);
+    check("... and a quarter of it bounds the arguments and environment (E2BIG)",
+          WIFEXITED(fits) && WEXITSTATUS(fits) == 0 && WIFEXITED(e2big) && WEXITSTATUS(e2big) == 100 + E2BIG);
+    /* The limit counts when the stack grows (as on Linux), within the 128 MiB at least that
+     * execve keeps for it. */
+    int raised = stack_run(0, "stack-raise", 24, 0);
+    int lowered = stack_run(64 << 20, "stack-lower", 24, 0);
+    int forked = stack_run(0, "stack-fork", 24, 0);
+    check("... and is read when the stack grows: raised by the program it lets it grow, lowered it stops it, a fork inherits it",
+          WIFEXITED(raised) && WEXITSTATUS(raised) == 0 && WIFSIGNALED(lowered) && WTERMSIG(lowered) == SIGSEGV
+          && WIFEXITED(forked) && WEXITSTATUS(forked) == 0);
+    int wild = stack_run(RLIM_INFINITY, "wild", 0, 0);
+    check("an unlimited stack does not grow 16 TiB down to a wild access: EFAULT for a copy, SIGSEGV for a store",
+          WIFSIGNALED(wild) && WTERMSIG(wild) == SIGSEGV);
+}
+
+/* Waiters that wait again at once after every wake: a wake of many goes through the bucket
+ * in pieces, and must neither wake one of them twice nor count it twice. */
+enum { REWAITERS = 64 };
+static int rewait_word, rewait_stop;
+static int rewait_woken[REWAITERS];
+
+static void *rewaiter(void *arg) {
+    int me = (int)(long)arg;
+    while (!__atomic_load_n(&rewait_stop, __ATOMIC_SEQ_CST)) {
+        if (syscall(SYS_futex, &rewait_word, FUTEX_WAIT_PRIVATE, 0, NULL, NULL, 0) == 0)
+            __atomic_add_fetch(&rewait_woken[me], 1, __ATOMIC_SEQ_CST);
+    }
+    return NULL;
+}
+
+/* How many of the rewaiters wait on the word now (TEST_FUTEX_WATCH's count), once all do
+ * (at most two seconds). */
+static long rewaiters_queued(void) {
+    long queued = 0;
+    for (int i = 0; i < 2000 && queued < REWAITERS; i++) {
+        queued = syscall(TEST_FUTEX_WATCH, &rewait_word, 0);
+        if (queued < REWAITERS)
+            usleep(1000);
+    }
+    return queued;
+}
+
+static int rewaiters_woken(void) {
+    int sum = 0;
+    for (int i = 0; i < REWAITERS; i++)
+        sum += __atomic_load_n(&rewait_woken[i], __ATOMIC_SEQ_CST);
+    return sum;
+}
+
+static void rewait_check(void) {
+    pthread_t t[REWAITERS];
+    for (long i = 0; i < REWAITERS; i++)
+        pthread_create(&t[i], NULL, rewaiter, (void *)i);
+    long q1 = rewaiters_queued();
+    long some = syscall(SYS_futex, &rewait_word, FUTEX_WAKE_PRIVATE, 40, NULL, NULL, 0);
+    long q2 = rewaiters_queued();
+    int distinct = 1;
+    for (int i = 0; i < REWAITERS; i++)
+        if (rewait_woken[i] > 1)
+            distinct = 0;
+    int after_some = rewaiters_woken();
+    int64_t t0 = now_ms();
+    long all = syscall(SYS_futex, &rewait_word, FUTEX_WAKE_PRIVATE, INT_MAX, NULL, NULL, 0);
+    int64_t took = now_ms() - t0;
+    long q3 = rewaiters_queued();
+    int after_all = rewaiters_woken();
+    __atomic_store_n(&rewait_stop, 1, __ATOMIC_SEQ_CST);
+    for (int i = 0; i < REWAITERS; i++) {
+        syscall(SYS_futex, &rewait_word, FUTEX_WAKE_PRIVATE, INT_MAX, NULL, NULL, 0);
+        pthread_join(t[i], NULL);
+    }
+    check("futex: a wake of 40 of 64 waiters that wait again wakes 40 of them, each once",
+          q1 == REWAITERS && some == 40 && q2 == REWAITERS && after_some == 40 && distinct);
+    check("... and a wake of all of them wakes each once and returns at once",
+          all == REWAITERS && q3 == REWAITERS && after_all == 40 + REWAITERS && took < 1000);
+}
+
+static int rq_from, rq_to, rq_done;
+
+static void *requeue_waiter(void *arg) {
+    (void)arg;
+    while (!__atomic_load_n(&rq_done, __ATOMIC_SEQ_CST))
+        syscall(SYS_futex, &rq_from, FUTEX_WAIT_PRIVATE, 0, NULL, NULL, 0);
+    return NULL;
+}
+
+/* A requeue wakes up to n_wake waiters of whichever kind and then moves up
+ * to n_move of the movable ones left (Linux): a wake spent on a waiter it
+ * cannot move (the test's doorbell watch, queued first) takes nothing from
+ * the moves. */
+static void requeue_check(void) {
+    long armed = syscall(TEST_FUTEX_WATCH, &rq_from, 1);
+    pthread_t t;
+    pthread_create(&t, NULL, requeue_waiter, NULL);
+    long queued = 0;
+    for (int i = 0; i < 2000 && queued < 2; i++) {
+        queued = syscall(TEST_FUTEX_WATCH, &rq_from, 0);
+        if (queued < 2)
+            usleep(1000);
+    }
+    long n = syscall(SYS_futex, &rq_from, FUTEX_CMP_REQUEUE_PRIVATE, 1, (void *)1, &rq_to, 0);
+    long left = syscall(TEST_FUTEX_WATCH, &rq_from, 0);
+    long on_to = syscall(TEST_FUTEX_WATCH, &rq_to, 0);
+    long rang = syscall(TEST_FUTEX_WATCH, 0, 0);
+    __atomic_store_n(&rq_done, 1, __ATOMIC_SEQ_CST);
+    long woken = syscall(SYS_futex, &rq_to, FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0);
+    syscall(SYS_futex, &rq_from, FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0);
+    pthread_join(t, NULL);
+    check("futex: a requeue's wake spent on a waiter it cannot move takes nothing from the moves",
+          armed == 1 && queued == 2 && n == 2 && left == 0 && on_to == 1 && rang == 1 && woken == 1);
+}
+
 /* R9: every Linux call is the server's; the kernel's mechanisms under the
  * last ones it implemented (futexes on program memory, the FS base, the wall
  * clock, power, the system's record) and /dev, now the server's devtmpfs. */
@@ -229,8 +411,38 @@ static void r9_checks(void) {
     int eperm1 = clock_settime(CLOCK_REALTIME, &later) == -1 && errno == EPERM;
     errno = 0;
     int eperm2 = settimeofday(&tv_now, NULL) == -1 && errno == EPERM;
+    /* (musl's settimeofday ignores the zone: the raw call.) */
+    struct timezone zone = {60, 0};
+    errno = 0;
+    int eperm3 = syscall(SYS_settimeofday, NULL, &zone) == -1 && errno == EPERM;
+    errno = 0;
+    int eperm4 = syscall(SYS_settimeofday, NULL, NULL) == -1 && errno == EPERM;
+    /* reboot_pid_ns takes only the restart, power off and halt commands. */
+    errno = 0;
+    int cad_off = syscall(SYS_reboot, 0xfee1dead, 0x28121969, 0, NULL) == -1 && errno == EINVAL;
+    errno = 0;
+    int cad_on = syscall(SYS_reboot, 0xfee1dead, 0x28121969, 0x89abcdef, NULL) == -1 && errno == EINVAL;
     syscall(TEST_HOST, 1);
     check("without the host grant clock_settime and settimeofday are EPERM", had == 1 && eperm1 && eperm2 && time(NULL) < later.tv_sec - 1800);
+    check("... and reboot's CAD_ON and CAD_OFF EINVAL (a pid namespace's reboot)", cad_off && cad_on);
+    check("... and settimeofday with only a time zone, or nothing, EPERM", eperm3 && eperm4);
+    struct timezone seen_zone = {0, 0}, bad_zone = {16 * 60, 0}, utc = {0, 0};
+    int zone_set = syscall(SYS_settimeofday, NULL, &zone) == 0 && syscall(SYS_gettimeofday, NULL, &seen_zone) == 0 && seen_zone.tz_minuteswest == 60;
+    syscall(SYS_settimeofday, NULL, &utc);
+    errno = 0;
+    int zone_fault = syscall(SYS_settimeofday, NULL, (void *)8) == -1 && errno == EFAULT;
+    errno = 0;
+    int zone_range = syscall(SYS_settimeofday, NULL, &bad_zone) == -1 && errno == EINVAL;
+    check("settimeofday sets the time zone gettimeofday reports; a bad one is EFAULT, one beyond 15 hours EINVAL",
+          zone_set && zone_fault && zone_range);
+    /* Linux's TIME_SETTOD_SEC_MAX: KTIME_SEC_MAX less 30 years. */
+    struct timespec too_late = {9223372036L - 946080000L, 0};
+    struct timeval too_late_tv = {9223372036L, 0};
+    errno = 0;
+    int late1 = clock_settime(CLOCK_REALTIME, &too_late) == -1 && errno == EINVAL;
+    errno = 0;
+    int late2 = syscall(SYS_settimeofday, &too_late_tv, NULL) == -1 && errno == EINVAL;
+    check("a wall clock past TIME_SETTOD_SEC_MAX is EINVAL", late1 && late2 && time(NULL) < later.tv_sec - 1800);
     errno = 0;
     check("reboot: CAD_OFF is taken, RESTART2 checks its string (EFAULT)",
           syscall(SYS_reboot, 0xfee1dead, 0x28121969, 0, NULL) == 0
@@ -238,6 +450,8 @@ static void r9_checks(void) {
     int other = 0;
     errno = 0;
     check("futex: a negative requeue count is EINVAL", syscall(SYS_futex, &word, FUTEX_REQUEUE_PRIVATE, 0, -1, &other, 0) == -1 && errno == EINVAL);
+    requeue_check();
+    rewait_check();
     struct timespec cpu_now;
     check("the CPU clocks of the caller, also by pid 0's encoding",
           clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cpu_now) == 0 && clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_now) == 0
@@ -249,6 +463,9 @@ static void r9_checks(void) {
     errno = 0;
     check("... a soft limit above the hard one is EINVAL, a resource beyond them too",
           setrlimit(RLIMIT_STACK, &bad) == -1 && errno == EINVAL && syscall(SYS_prlimit64, 0, 16, NULL, &rl) == -1);
+    check("... the resource is an unsigned int (the upper half of the register is not looked at)",
+          syscall(SYS_prlimit64, 0, (1UL << 32) | RLIMIT_CORE, NULL, &rl) == 0 && rl.rlim_cur == 0
+          && syscall(SYS_prlimit64, 0, (1UL << 32) | RLIMIT_NOFILE, NULL, &rl) == 0 && rl.rlim_cur > 0);
     struct rlimit core_lim = {1 << 20, RLIM_INFINITY}, seen;
     int kept = setrlimit(RLIMIT_CORE, &core_lim) == 0 && getrlimit(RLIMIT_CORE, &seen) == 0 && seen.rlim_cur == 1 << 20;
     int lim_pipe[2];
@@ -273,6 +490,28 @@ static void r9_checks(void) {
     setrlimit(RLIMIT_CORE, &core_lim);
     check("resource limits are kept per process: set, inherited by fork, another's by prlimit",
           kept && other_set && WIFEXITED(lim_status) && WEXITSTATUS(lim_status) == 0);
+    /* RLIMIT_SIGPENDING bounds the real-time signals queued with their data. */
+    struct rlimit sp_old, sp_two = {2, 4096};
+    sigset_t rt, old_mask;
+    sigemptyset(&rt);
+    sigaddset(&rt, SIGRTMIN);
+    sigprocmask(SIG_BLOCK, &rt, &old_mask);
+    getrlimit(RLIMIT_SIGPENDING, &sp_old);
+    setrlimit(RLIMIT_SIGPENDING, &sp_two);
+    union sigval sv = {.sival_int = 7};
+    int q1 = sigqueue(getpid(), SIGRTMIN, sv) == 0, q2 = sigqueue(getpid(), SIGRTMIN, sv) == 0;
+    errno = 0;
+    int q3 = sigqueue(getpid(), SIGRTMIN, sv) == -1 && errno == EAGAIN;
+    setrlimit(RLIMIT_SIGPENDING, &sp_old);
+    struct timespec no_wait = {0, 0};
+    siginfo_t info;
+    int drained = 0;
+    while (sigtimedwait(&rt, &info, &no_wait) == SIGRTMIN)
+        drained++;
+    sigprocmask(SIG_SETMASK, &old_mask, NULL);
+    check("RLIMIT_SIGPENDING bounds the queued real-time signals (sigqueue beyond EAGAIN)",
+          sp_old.rlim_cur == 4096 && q1 && q2 && q3 && drained == 2);
+    stack_checks();
     errno = 0;
     check("ioperm is EPERM (the tree has no ports)", syscall(SYS_ioperm, 0x80, 1, 1) == -1 && errno == EPERM);
     errno = 0;
@@ -443,6 +682,27 @@ static int server_fail(void) {
 int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "serverfail") == 0) {
         return server_fail();
+    }
+    if (argc > 2 && strncmp(argv[1], "stack", 5) == 0) {
+        struct rlimit rl = {strcmp(argv[1], "stack-raise") == 0 ? 64 << 20 : 8 << 20, RLIM_INFINITY};
+        if (strcmp(argv[1], "stack") != 0)
+            setrlimit(RLIMIT_STACK, &rl);
+        int frames = atoi(argv[2]) * 16;
+        if (strcmp(argv[1], "stack-fork") == 0) {
+            /* A forked child grows by the limit it inherited (64 MiB). */
+            rl.rlim_cur = 64 << 20;
+            setrlimit(RLIMIT_STACK, &rl);
+            pid_t kid = fork();
+            if (kid == 0)
+                _exit(stack_use(frames) != 1);
+            int st = 0;
+            waitpid(kid, &st, 0);
+            return !(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+        }
+        return frames > 0 ? stack_use(frames) != 1 : 0;
+    }
+    if (argc > 1 && strcmp(argv[1], "wild") == 0) {
+        return wild_access();
     }
     if (argc > 1 && strcmp(argv[1], "crashloop") == 0) {
         /* The test service dies at every use: the kernel restarts it with
