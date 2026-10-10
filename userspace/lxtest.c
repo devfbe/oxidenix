@@ -8,6 +8,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <sys/eventfd.h>
 #include <sys/ioctl.h>
@@ -214,6 +215,68 @@ static void stack_checks(void) {
           WIFEXITED(fits) && WEXITSTATUS(fits) == 0 && WIFEXITED(e2big) && WEXITSTATUS(e2big) == 100 + E2BIG);
 }
 
+/* Waiters that wait again at once after every wake: a wake of many goes through the bucket
+ * in pieces, and must neither wake one of them twice nor count it twice. */
+enum { REWAITERS = 64 };
+static int rewait_word, rewait_stop;
+static int rewait_woken[REWAITERS];
+
+static void *rewaiter(void *arg) {
+    int me = (int)(long)arg;
+    while (!__atomic_load_n(&rewait_stop, __ATOMIC_SEQ_CST)) {
+        if (syscall(SYS_futex, &rewait_word, FUTEX_WAIT_PRIVATE, 0, NULL, NULL, 0) == 0)
+            __atomic_add_fetch(&rewait_woken[me], 1, __ATOMIC_SEQ_CST);
+    }
+    return NULL;
+}
+
+/* How many of the rewaiters wait on the word now (TEST_FUTEX_WATCH's count), once all do
+ * (at most two seconds). */
+static long rewaiters_queued(void) {
+    long queued = 0;
+    for (int i = 0; i < 2000 && queued < REWAITERS; i++) {
+        queued = syscall(TEST_FUTEX_WATCH, &rewait_word, 0);
+        if (queued < REWAITERS)
+            usleep(1000);
+    }
+    return queued;
+}
+
+static int rewaiters_woken(void) {
+    int sum = 0;
+    for (int i = 0; i < REWAITERS; i++)
+        sum += __atomic_load_n(&rewait_woken[i], __ATOMIC_SEQ_CST);
+    return sum;
+}
+
+static void rewait_check(void) {
+    pthread_t t[REWAITERS];
+    for (long i = 0; i < REWAITERS; i++)
+        pthread_create(&t[i], NULL, rewaiter, (void *)i);
+    long q1 = rewaiters_queued();
+    long some = syscall(SYS_futex, &rewait_word, FUTEX_WAKE_PRIVATE, 40, NULL, NULL, 0);
+    long q2 = rewaiters_queued();
+    int distinct = 1;
+    for (int i = 0; i < REWAITERS; i++)
+        if (rewait_woken[i] > 1)
+            distinct = 0;
+    int after_some = rewaiters_woken();
+    int64_t t0 = now_ms();
+    long all = syscall(SYS_futex, &rewait_word, FUTEX_WAKE_PRIVATE, INT_MAX, NULL, NULL, 0);
+    int64_t took = now_ms() - t0;
+    long q3 = rewaiters_queued();
+    int after_all = rewaiters_woken();
+    __atomic_store_n(&rewait_stop, 1, __ATOMIC_SEQ_CST);
+    for (int i = 0; i < REWAITERS; i++) {
+        syscall(SYS_futex, &rewait_word, FUTEX_WAKE_PRIVATE, INT_MAX, NULL, NULL, 0);
+        pthread_join(t[i], NULL);
+    }
+    check("futex: a wake of 40 of 64 waiters that wait again wakes 40 of them, each once",
+          q1 == REWAITERS && some == 40 && q2 == REWAITERS && after_some == 40 && distinct);
+    check("... and a wake of all of them wakes each once and returns at once",
+          all == REWAITERS && q3 == REWAITERS && after_all == 40 + REWAITERS && took < 1000);
+}
+
 static int rq_from, rq_to, rq_done;
 
 static void *requeue_waiter(void *arg) {
@@ -360,6 +423,7 @@ static void r9_checks(void) {
     errno = 0;
     check("futex: a negative requeue count is EINVAL", syscall(SYS_futex, &word, FUTEX_REQUEUE_PRIVATE, 0, -1, &other, 0) == -1 && errno == EINVAL);
     requeue_check();
+    rewait_check();
     struct timespec cpu_now;
     check("the CPU clocks of the caller, also by pid 0's encoding",
           clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cpu_now) == 0 && clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_now) == 0

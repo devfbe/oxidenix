@@ -52,7 +52,7 @@ use super::{kill, uaccess, Pid};
 use crate::sync::IrqSpinLock;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 const FUTEX_BITSET_MATCH_ANY: u32 = u32::MAX;
 
@@ -76,6 +76,11 @@ struct Waiter {
     key: Key,
     sleeper: Sleeper,
     bitset: u32,
+    /// When it was queued (`SEQ`, taken under its bucket's lock; a requeue
+    /// keeps it): a wake that takes several holds of the lock wakes only
+    /// waiters queued before its first (`wake_key`), so a waiter it woke
+    /// that waits again is not woken (or counted) twice.
+    seq: u64,
     /// A requeue may move it to another word: only a wait of `wait` (a
     /// program's or a native server's futex wait). The Linux server's own
     /// waits (`server_wait`, `object_wait`, `server_waitv`) stay on the
@@ -159,6 +164,14 @@ impl Sink for Vec<Arc<Task>> {
             self.push(task);
         }
     }
+}
+
+/// The order waiters were queued in (`Waiter::seq`), over all buckets.
+static SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// A new waiter's `seq` (under its bucket's lock).
+fn next_seq() -> u64 {
+    SEQ.fetch_add(1, Ordering::Relaxed)
 }
 
 const BUCKETS: usize = 256;
@@ -306,7 +319,7 @@ fn wait_on(
                 b.try_reserve(1).map_err(|_| ENOMEM)?;
                 me.futex_woken.store(false, Ordering::Relaxed);
                 me.futex_bucket.store(index, Ordering::Relaxed);
-                b.push(Waiter { key, sleeper: Sleeper::Task(current_arc()), bitset, movable });
+                b.push(Waiter { key, sleeper: Sleeper::Task(current_arc()), bitset, seq: next_seq(), movable });
                 break wait;
             }
             None => {
@@ -373,11 +386,14 @@ fn stale(w: &Waiter) -> bool {
 /// most `n`, while `out` has room; returns how many, and whether it stopped
 /// for lack of room with waiters of `key` left. Stale entries of a vectored
 /// wait go without counting, so they never take a wake another waiter needs.
-fn wake_in(b: &mut Vec<Waiter>, key: &Key, n: u64, bitset: u32, out: &mut impl Sink) -> (u64, bool) {
+/// Only waiters queued before `before` (`Waiter::seq`) are looked at.
+fn wake_in(b: &mut Vec<Waiter>, key: &Key, n: u64, bitset: u32, before: u64, out: &mut impl Sink) -> (u64, bool) {
     let mut woken = 0;
     let mut i = 0;
     while i < b.len() && woken < n {
-        if b[i].key != *key {
+        let w = &b[i];
+        let stale = w.key == *key && w.seq < before && stale(w);
+        if w.key != *key || w.seq >= before || !stale && w.bitset & bitset == 0 {
             i += 1;
             continue;
         }
@@ -385,15 +401,11 @@ fn wake_in(b: &mut Vec<Waiter>, key: &Key, n: u64, bitset: u32, out: &mut impl S
             tidy(b);
             return (woken, true);
         }
-        if stale(&b[i]) {
+        if stale {
             b.remove(i).discard(out);
-            continue;
-        }
-        if b[i].bitset & bitset != 0 {
+        } else {
             b.remove(i).wake(out);
             woken += 1;
-        } else {
-            i += 1;
         }
     }
     tidy(b);
@@ -401,12 +413,19 @@ fn wake_in(b: &mut Vec<Waiter>, key: &Key, n: u64, bitset: u32, out: &mut impl S
 }
 
 /// Wakes at most `n` waiters of `key` (bitset `bitset`), a chunk per hold of
-/// the bucket's lock, the tasks' references dropped between (`Sink`).
+/// the bucket's lock, the tasks' references dropped between (`Sink`). Only
+/// the waiters queued when it first held the lock: one it woke that waits
+/// again meanwhile is a new waiter, which this wake neither wakes again nor
+/// counts (so `n` wakes reach `n` waiters, and a wake of all ends).
 fn wake_key(key: &Key, n: u64, bitset: u32) -> u64 {
     let mut woken = 0;
+    let mut before = None;
     loop {
         let mut chunk = Chunk::new();
-        let (w, more) = wake_in(&mut BUCKETS_[bucket_of(key)].lock(), key, n - woken, bitset, &mut chunk);
+        let mut b = BUCKETS_[bucket_of(key)].lock();
+        let limit = *before.get_or_insert_with(|| SEQ.load(Ordering::Relaxed));
+        let (w, more) = wake_in(&mut b, key, n - woken, bitset, limit, &mut chunk);
+        drop(b);
         woken += w;
         drop(chunk);
         if !more || woken >= n {
@@ -475,7 +494,7 @@ pub fn requeue(uaddr: u64, n_wake: u64, n_move: u64, uaddr2: u64, cmp: Option<u3
         if let Some(d) = dst.as_mut() {
             d.try_reserve(matching.min(n_move) as usize).map_err(|_| ENOMEM)?;
         }
-        let (woken, _) = wake_in(src, &from, n_wake, FUTEX_BITSET_MATCH_ANY, &mut out);
+        let (woken, _) = wake_in(src, &from, n_wake, FUTEX_BITSET_MATCH_ANY, u64::MAX, &mut out);
         let mut moved = 0;
         let mut i = 0;
         while i < src.len() && moved < n_move {
@@ -563,7 +582,7 @@ pub fn server_waitv(words: &[WaitWord], deadline: Option<u64>, ends: Ends) -> Re
             early = Some(ENOMEM);
             break;
         }
-        b.push(Waiter { key: w.key, sleeper: Sleeper::Task(current_arc()), bitset: FUTEX_BITSET_MATCH_ANY, movable: false });
+        b.push(Waiter { key: w.key, sleeper: Sleeper::Task(current_arc()), bitset: FUTEX_BITSET_MATCH_ANY, seq: next_seq(), movable: false });
         queued += 1;
     }
     let result = match early {
@@ -644,7 +663,7 @@ pub fn object_watch(
     let armed = |w: &Waiter| w.key == key && matches!(&w.sleeper, Sleeper::Watch(_, p) if *p == pid);
     if !b.iter().any(armed) {
         b.try_reserve(1).map_err(|_| ENOMEM)?;
-        b.push(Waiter { key, sleeper: Sleeper::Watch(doorbell.clone(), pid), bitset: FUTEX_BITSET_MATCH_ANY, movable: false });
+        b.push(Waiter { key, sleeper: Sleeper::Watch(doorbell.clone(), pid), bitset: FUTEX_BITSET_MATCH_ANY, seq: next_seq(), movable: false });
     }
     Ok(0)
 }
@@ -682,7 +701,7 @@ pub fn test_watch(uaddr: u64, arm: bool) -> Result<i64, i64> {
     let mut b = BUCKETS_[bucket_of(&key)].lock();
     if let Some(d) = doorbell {
         b.try_reserve(1).map_err(|_| ENOMEM)?;
-        b.push(Waiter { key, sleeper: Sleeper::Watch(d, super::current_pid()), bitset: FUTEX_BITSET_MATCH_ANY, movable: false });
+        b.push(Waiter { key, sleeper: Sleeper::Watch(d, super::current_pid()), bitset: FUTEX_BITSET_MATCH_ANY, seq: next_seq(), movable: false });
     }
     Ok(b.iter().filter(|w| w.key == key).count() as i64)
 }
@@ -700,19 +719,22 @@ pub fn object_wake(object: &PageCache, offset: u64, n: u64) -> i64 {
 pub fn wake_object(object: &PageCache) {
     let base = Base::Shared(object as *const PageCache as usize);
     for bucket in BUCKETS_.iter() {
-        // A chunk per lock hold, the tasks' references dropped between.
+        // A chunk per lock hold, the tasks' references dropped between. (No
+        // waiter it woke comes back: a wait checks for the hang-up under the
+        // bucket's lock, which it takes after this chunk let go of it.)
         loop {
             let mut chunk = Chunk::new();
             let mut b = bucket.lock();
+            let mine = |w: &Waiter| w.key.base == base;
             let mut i = 0;
             while i < b.len() && chunk.room() {
-                if b[i].key.base == base {
+                if mine(&b[i]) {
                     b.swap_remove(i).wake(&mut chunk);
                 } else {
                     i += 1;
                 }
             }
-            let more = b.iter().any(|w| w.key.base == base);
+            let more = b.iter().any(mine);
             tidy(&mut b);
             drop(b);
             drop(chunk);
