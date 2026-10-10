@@ -57,6 +57,7 @@
 /* 1517 was TEST_PASS_THROUGH: nothing passes through to the kernel since R9. */
 #define TEST_SERVER_TICKS 1518
 #define TEST_MKWRITE_FAIL 1519
+#define TEST_HOST 1520
 
 static int failures;
 
@@ -214,6 +215,27 @@ static void r9_checks(void) {
     struct timeval tv_back = {wall.tv_sec, 0};
     check("clock_settime sets the wall clock, settimeofday sets it back",
           set && back.tv_sec >= later.tv_sec && settimeofday(&tv_back, NULL) == 0 && time(NULL) < later.tv_sec - 1800);
+    /* (`mono` was read before: the monotonic clock is past it now.) */
+    errno = 0;
+    check("clock_settime before the monotonic clock is EINVAL", clock_settime(CLOCK_REALTIME, &mono) == -1 && errno == EINVAL);
+    /* Without the host grant the tree is a pid namespace that is not the
+     * initial one: the wall clock is not its to set (reboot would end the
+     * tree, which is the suite's own: not tried here). */
+    long had = syscall(TEST_HOST, 0);
+    struct timeval tv_now = {wall.tv_sec, 0};
+    errno = 0;
+    int eperm1 = clock_settime(CLOCK_REALTIME, &later) == -1 && errno == EPERM;
+    errno = 0;
+    int eperm2 = settimeofday(&tv_now, NULL) == -1 && errno == EPERM;
+    syscall(TEST_HOST, 1);
+    check("without the host grant clock_settime and settimeofday are EPERM", had == 1 && eperm1 && eperm2 && time(NULL) < later.tv_sec - 1800);
+    errno = 0;
+    check("reboot: CAD_OFF is taken, RESTART2 checks its string (EFAULT)",
+          syscall(SYS_reboot, 0xfee1dead, 0x28121969, 0, NULL) == 0
+          && syscall(SYS_reboot, 0xfee1dead, 0x28121969, 0xa1b2c3d4, NULL) == -1 && errno == EFAULT);
+    int other = 0;
+    errno = 0;
+    check("futex: a negative requeue count is EINVAL", syscall(SYS_futex, &word, FUTEX_REQUEUE_PRIVATE, 0, -1, &other, 0) == -1 && errno == EINVAL);
     struct timespec cpu_now;
     check("the CPU clocks of the caller, also by pid 0's encoding",
           clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cpu_now) == 0 && clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_now) == 0
@@ -225,6 +247,30 @@ static void r9_checks(void) {
     errno = 0;
     check("... a soft limit above the hard one is EINVAL, a resource beyond them too",
           setrlimit(RLIMIT_STACK, &bad) == -1 && errno == EINVAL && syscall(SYS_prlimit64, 0, 16, NULL, &rl) == -1);
+    struct rlimit core_lim = {1 << 20, RLIM_INFINITY}, seen;
+    int kept = setrlimit(RLIMIT_CORE, &core_lim) == 0 && getrlimit(RLIMIT_CORE, &seen) == 0 && seen.rlim_cur == 1 << 20;
+    int lim_pipe[2];
+    pipe(lim_pipe);
+    pid_t lim_child = fork();
+    if (lim_child == 0) {
+        struct rlimit l;
+        char x;
+        read(lim_pipe[0], &x, 1);
+        _exit(getrlimit(RLIMIT_CORE, &l) == 0 && l.rlim_cur == 1 << 20 ? 0 : 1);
+    }
+    struct rlimit child_lim = {4096, RLIM_INFINITY}, child_seen;
+    int other_set = syscall(SYS_prlimit64, lim_child, RLIMIT_DATA, &child_lim, NULL) == 0
+                    && syscall(SYS_prlimit64, lim_child, RLIMIT_DATA, NULL, &child_seen) == 0 && child_seen.rlim_cur == 4096
+                    && getrlimit(RLIMIT_DATA, &seen) == 0 && seen.rlim_cur == RLIM_INFINITY;
+    write(lim_pipe[1], "x", 1);
+    int lim_status = 0;
+    waitpid(lim_child, &lim_status, 0);
+    close(lim_pipe[0]);
+    close(lim_pipe[1]);
+    core_lim.rlim_cur = 0;
+    setrlimit(RLIMIT_CORE, &core_lim);
+    check("resource limits are kept per process: set, inherited by fork, another's by prlimit",
+          kept && other_set && WIFEXITED(lim_status) && WEXITSTATUS(lim_status) == 0);
     errno = 0;
     check("ioperm is EPERM (the tree has no ports)", syscall(SYS_ioperm, 0x80, 1, 1) == -1 && errno == EPERM);
     errno = 0;
@@ -269,6 +315,16 @@ static void r9_checks(void) {
           && made >= 0 && write(made, "x", 1) == 1 && rename("/dev/lxfile", "/tmp/lxfile") == -1 && errno == EXDEV
           && unlink("/dev/lxfile") == 0);
     close(made);
+    check("... devpts has its own kind (statfs)", statfs("/dev/pts", &fs) == 0 && fs.f_type == 0x1cd1);
+    int cin = open("/tmp/lxcopy", O_CREAT | O_RDWR | O_TRUNC, 0644), cout = open("/dev/lxcopy", O_CREAT | O_RDWR | O_TRUNC, 0644);
+    errno = 0;
+    check("... copy_file_range from /tmp to /dev is EXDEV (another tmpfs)",
+          cin >= 0 && cout >= 0 && write(cin, "abc", 3) == 3 && lseek(cin, 0, SEEK_SET) == 0
+          && copy_file_range(cin, NULL, cout, NULL, 3, 0) == -1 && errno == EXDEV);
+    close(cin);
+    close(cout);
+    unlink("/tmp/lxcopy");
+    unlink("/dev/lxcopy");
     int zfd = open("/dev/zero", O_RDONLY);
     char *zmap = zfd >= 0 ? mmap(NULL, PG, PROT_READ | PROT_WRITE, MAP_PRIVATE, zfd, 0) : MAP_FAILED;
     check("... /dev/zero reads and maps zeros", zfd >= 0 && read(zfd, target, 8) == 8 && target[0] == 0 && zmap != MAP_FAILED && zmap[100] == 0);

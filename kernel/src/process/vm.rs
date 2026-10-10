@@ -171,7 +171,8 @@ pub fn sync(addr: u64, len: u64, flags: u64, out: u64, cap: u64) -> SysResult {
             if cached < cap {
                 let words = [key, pages.start, pages.end];
                 let bytes: alloc::vec::Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-                super::uaccess::copy_to_server(out + cached * 24, &bytes)?;
+                let at = cached.checked_mul(24).and_then(|o| out.checked_add(o)).ok_or(EFAULT)?;
+                super::uaccess::copy_to_server(at, &bytes)?;
             }
             cached += 1;
         }

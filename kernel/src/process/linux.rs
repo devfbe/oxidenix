@@ -98,22 +98,25 @@ pub fn sync_start(except: Option<&Instance>) -> u64 {
 }
 
 /// Waits until every instance but `except` that `ticket` asked has
-/// answered (or its pager is gone), at most until `deadline` (0: none), or
-/// until the caller is being killed. Whether all did.
-pub fn sync_wait(ticket: u64, except: Option<&Instance>, deadline: u64) -> bool {
+/// answered (or its pager is gone), at most until `deadline` (0: none), or,
+/// if `killable`, until the caller is being killed. Whether all did.
+pub fn sync_wait(ticket: u64, except: Option<&Instance>, deadline: u64, killable: bool) -> bool {
     let asked = instances(except);
     loop {
         let wait = super::sched::prepare_to_wait(sync_chan());
         if asked.iter().all(|i| i.synced(ticket)) {
             return true;
         }
-        if super::kill::dying() || (deadline != 0 && crate::time::now() >= deadline) {
+        let dying = super::kill::dying();
+        if (killable && dying) || (deadline != 0 && crate::time::now() >= deadline) {
             return false;
         }
-        if deadline != 0 {
-            wait.sleep_until(deadline);
-        } else {
-            wait.sleep();
+        match deadline {
+            // A dying caller that must wait on (`power`) sleeps a tick at a
+            // time: whatever ends its sleeps does not make it spin.
+            d if dying => wait.sleep_until((crate::time::now() + crate::timer::TICK_NS).min(d)),
+            0 => wait.sleep(),
+            d => wait.sleep_until(d),
         }
     }
 }
@@ -121,11 +124,12 @@ pub fn sync_wait(ticket: u64, except: Option<&Instance>, deadline: u64) -> bool 
 /// `SYS_POWER`: every instance writes its caches back and flushes them
 /// (the caller's too: its pager is another thread), at most `SYNC_WAIT`
 /// (each request to diskfs is bounded on its own), then the machine powers
-/// off or restarts.
+/// off or restarts. A caller killed meanwhile still waits: the machine
+/// goes off either way, and its data with it unless the write-back is done.
 fn power(how: u64) -> ! {
     const SYNC_WAIT: u64 = 60 * crate::time::NSEC_PER_SEC;
     let ticket = sync_start(None);
-    if !sync_wait(ticket, None, crate::time::now() + SYNC_WAIT) {
+    if !sync_wait(ticket, None, crate::time::now() + SYNC_WAIT, false) {
         crate::printkln!("[kernel] power: a Linux server did not write its caches back");
     }
     match how {
@@ -178,6 +182,12 @@ pub struct Instance {
     /// Unique among every instance the kernel ever made (process groups
     /// name theirs by it: `ThreadGroup::instance`).
     pub id: u64,
+    /// The host grant: the tree may change what is the machine's, not its
+    /// own (the wall clock, `SYS_CLOCK_SET`; power, `SYS_POWER`). Given by
+    /// whoever starts the tree (`host_grant`: the monitor's `run` and
+    /// autorun do); without it those calls are EPERM, and the server acts
+    /// as Linux in a pid namespace that is not the initial one (ADR 0011).
+    host: core::sync::atomic::AtomicBool,
     /// A top-level table with only the shared slot, to map into the region.
     view: PhysFrame,
     /// The region's third-level table.
@@ -326,6 +336,7 @@ impl Instance {
         static NEXT_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
         let mut instance = Instance {
             id: NEXT_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
+            host: core::sync::atomic::AtomicBool::new(false),
             view,
             pdpt,
             entry: 0,
@@ -939,6 +950,11 @@ impl Drop for Record {
 /// Grants the console device to `instance` (None: the kernel's monitor, which
 /// takes it back when the tree it started has ended its first process); the
 /// instance that held it gets `EVENT_CONSOLE_LOST` (ADR 0007).
+/// Gives `instance` the host grant (see `Instance::host`), or takes it.
+pub fn host_grant(instance: &Instance, on: bool) {
+    instance.host.store(on, core::sync::atomic::Ordering::Release);
+}
+
 pub fn console_grant(instance: Option<&Arc<Instance>>) {
     let (id, chan) = instance.map_or((0, 0), |i| (i.id, i.pager_chan()));
     let old = crate::drivers::console_device::set_holder(id, chan);
@@ -1311,7 +1327,7 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             if a[0] == 0 {
                 return Ok(sync_start(Some(&instance)) as i64);
             }
-            sync_wait(a[0], Some(&instance), 0);
+            sync_wait(a[0], Some(&instance), 0, true);
             Ok(0)
         }
         SYS_SYNC_DONE => {
@@ -1477,12 +1493,18 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             Ok(old as i64)
         }
         SYS_CLOCK_SET => {
+            if !instance.host.load(core::sync::atomic::Ordering::Acquire) {
+                return Err(EPERM);
+            }
             crate::time::set_realtime(a[0]);
             Ok(0)
         }
         SYS_POWER => {
             if a[0] != POWER_OFF && a[0] != POWER_RESTART {
                 return Err(EINVAL);
+            }
+            if !instance.host.load(core::sync::atomic::Ordering::Acquire) {
+                return Err(EPERM);
             }
             // Nothing of this call may stay referenced: it does not return.
             drop(instance);
@@ -1711,6 +1733,13 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
                 return Err(EINVAL);
             }
             super::query::server_query(a[0], a[2], a[3])
+        }
+        TEST_HOST => {
+            if !crate::TEST_MODE.load(core::sync::atomic::Ordering::Relaxed) {
+                return Err(ENOSYS);
+            }
+            let old = instance.host.swap(a[0] != 0, core::sync::atomic::Ordering::AcqRel);
+            Ok(old as i64)
         }
         TEST_SERVER_TICKS => {
             if !crate::TEST_MODE.load(core::sync::atomic::Ordering::Relaxed) {

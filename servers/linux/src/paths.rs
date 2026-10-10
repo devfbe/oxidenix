@@ -791,7 +791,7 @@ fn statfs(addr: u64, buf: u64) -> Result<i64, i64> {
 /// The `struct statfs` of the filesystem `node` is on, to `buf`.
 pub fn statfs_node(node: &Node, buf: u64) -> Result<i64, i64> {
     match node {
-        Node::Tmp(_) => tmpfile::statfs(buf),
+        Node::Tmp(t) => tmpfile::statfs(t.dev, buf),
         Node::Data(_) => {
             usercopy::to_program(buf, &datafs::statfs()?)?;
             Ok(0)

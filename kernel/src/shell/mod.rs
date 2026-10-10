@@ -61,7 +61,7 @@ pub fn settle() {
         }
     };
     let ticket = crate::process::linux::sync_start(None);
-    if !wait(&mut |until| crate::process::linux::sync_wait(ticket, None, until)) {
+    if !wait(&mut |until| crate::process::linux::sync_wait(ticket, None, until, true)) {
         crate::printkln!("[kernel] a Linux server instance did not write its caches back");
     }
     // (The pagers' processes end last, as the kernel's children: reaped

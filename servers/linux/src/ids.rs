@@ -69,9 +69,9 @@ pub fn handle(s: &State) -> Option<i64> {
         SYS_TIMES => times(a0),
         SYS_SCHED_GETAFFINITY => getaffinity(a0 as i32, a1, a2),
         SYS_SCHED_SETAFFINITY => setaffinity(a0 as i32, a1, a2),
-        SYS_PRLIMIT64 => process_exists(a0 as i32).and_then(|_| prlimit(a1, a2, a3)),
-        SYS_GETRLIMIT => prlimit(a0, 0, a1),
-        SYS_SETRLIMIT => prlimit(a0, a1, 0),
+        SYS_PRLIMIT64 => process_exists(a0 as i32).and_then(|_| prlimit(a0 as Pid, a1, a2, a3)),
+        SYS_GETRLIMIT => prlimit(0, a0, 0, a1),
+        SYS_SETRLIMIT => prlimit(0, a0, a1, 0),
         _ => return None,
     };
     Some(result.unwrap_or_else(|e| -e))
@@ -88,10 +88,10 @@ const RLIMIT_MSGQUEUE: u64 = 12;
 const RLIMIT_NICE: u64 = 13;
 const RLIMIT_RTPRIO: u64 = 14;
 
-/// The (soft, hard) limit of `resource` every process has: Linux's defaults for a process
-/// init starts, where the server holds to them (an execve's stack grows to 8 MiB, no core
-/// files are written, the instance queues at most 4096 real-time signals); nothing else is
-/// limited.
+/// The (soft, hard) limit of `resource` a tree's first process starts with: Linux's
+/// defaults for a process init starts, where the server holds to them (an execve's stack
+/// grows to 8 MiB, no core files are written, the instance queues at most 4096 real-time
+/// signals); nothing else is limited.
 fn limit(resource: u64) -> (u64, u64) {
     match resource {
         RLIMIT_STACK => (8 << 20, RLIM_INFINITY),
@@ -104,24 +104,50 @@ fn limit(resource: u64) -> (u64, u64) {
     }
 }
 
-/// prlimit64(pid, resource, new, old) for the caller's process (`pid` checked by the
-/// caller), and getrlimit and setrlimit: the limits `limit` gives at `old`; new limits are
-/// checked (EINVAL for a soft limit above the hard one) and, the one user being root,
-/// allowed, but not kept: the processes hold to the defaults (an open issue of R9, until
-/// the process table keeps limits per process).
-fn prlimit(resource: u64, new: u64, old: u64) -> Result<i64, i64> {
+/// A process's resource limits but RLIMIT_NOFILE (the descriptor table's), as (soft, hard)
+/// by Linux's RLIMIT_ number: kept in its record (`process::Proc::limits`), inherited by
+/// fork and clone, kept by execve, as Linux keeps them per process (its signal struct).
+#[derive(Clone, Copy)]
+pub struct Limits(pub [(u64, u64); RLIM_NLIMITS as usize]);
+
+impl Default for Limits {
+    fn default() -> Limits {
+        Limits(core::array::from_fn(|r| limit(r as u64)))
+    }
+}
+
+/// prlimit64(pid, resource, new, old) for process `pid` (0: the caller's; a thread's id
+/// names its process; checked to exist by the caller), and getrlimit and setrlimit: the
+/// limits before at `old`, the new ones taken (EINVAL for a soft limit above the hard one;
+/// the one user is root, who may raise them). The program's memory is read and written
+/// with no lock held.
+fn prlimit(pid: Pid, resource: u64, new: u64, old: u64) -> Result<i64, i64> {
     if resource >= RLIM_NLIMITS {
         return Err(EINVAL);
     }
-    if new != 0 {
+    let new = if new != 0 {
         let [soft, hard]: [u64; 2] = usercopy::read(new)?;
         if soft > hard {
             return Err(EINVAL);
         }
-    }
+        Some((soft, hard))
+    } else {
+        None
+    };
+    let before = {
+        let mut t = PROCS.lock();
+        let id = if pid == 0 { local::pid() } else { pid };
+        let target = t.threads.get(&id).map_or(id, |th| th.pid);
+        let p = t.procs.get_mut(&target).ok_or(ESRCH)?;
+        let slot = &mut p.limits.0[resource as usize];
+        let before = *slot;
+        if let Some(n) = new {
+            *slot = n;
+        }
+        before
+    };
     if old != 0 {
-        let (soft, hard) = limit(resource);
-        usercopy::write(old, &[soft, hard])?;
+        usercopy::write(old, &[before.0, before.1])?;
     }
     Ok(0)
 }

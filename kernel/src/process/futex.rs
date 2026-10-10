@@ -28,6 +28,14 @@
 //! its `ipc_receive` instead of a task. A watch is one-shot, compares the
 //! word like a wait, and goes with the wake (or the object's hang-up).
 //!
+//! Keys name their base by its address, not by a reference: a waiter's base
+//! lives while it waits (its own address space, the object it found the word
+//! in, its instance), but a waker may name an address whose object went and
+//! whose memory a new object took since. Such a wake can only meet waiters
+//! of the new object's words, which then wake for nothing: a spurious wakeup,
+//! which every futex user tolerates (it looks at the word again), never a
+//! lost one.
+//!
 //! Waiters sit in hashed buckets. A waiter compares the futex word under
 //! its bucket lock and enqueues itself before releasing it; a waker changes
 //! the word in user space first and then takes the same lock, so a wakeup
@@ -68,6 +76,13 @@ struct Waiter {
     key: Key,
     sleeper: Sleeper,
     bitset: u32,
+    /// A requeue may move it to another word: only a wait of `wait` (a
+    /// program's or a native server's futex wait). The Linux server's own
+    /// waits (`server_wait`, `object_wait`, `server_waitv`) stay on the
+    /// words they chose: a requeue of a word anyone can name (a channel's)
+    /// must not take a server thread off it, and a vectored wait finds its
+    /// entries again only where it put them.
+    movable: bool,
 }
 
 enum Sleeper {
@@ -154,7 +169,7 @@ pub fn wait(uaddr: u64, val: u32, deadline: Option<u64>, bitset: u32, private: b
     let hung_up = || object.as_ref().is_some_and(|o| o.is_hung_up());
     // Not readable without a fault: fault it in (not under the bucket's
     // lock), then try again.
-    wait_on(key, || uaccess::read_u32_atomic(uaddr), || uaccess::read::<u32>(uaddr).map(|_| ()), hung_up, val, deadline, bitset, Ends::Interrupted)
+    wait_on(key, || uaccess::read_u32_atomic(uaddr), || uaccess::read::<u32>(uaddr).map(|_| ()), hung_up, val, deadline, bitset, Ends::Interrupted, true)
 }
 
 /// What ends a futex wait besides a wake, its word changing and its deadline.
@@ -223,6 +238,7 @@ fn wait_on(
     deadline: Option<u64>,
     bitset: u32,
     ends: Ends,
+    movable: bool,
 ) -> Result<i64, i64> {
     let me = current();
     let index = bucket_of(&key);
@@ -238,7 +254,7 @@ fn wait_on(
                 b.try_reserve(1).map_err(|_| ENOMEM)?;
                 me.futex_woken.store(false, Ordering::Relaxed);
                 me.futex_bucket.store(index, Ordering::Relaxed);
-                b.push(Waiter { key, sleeper: Sleeper::Task(current_arc()), bitset });
+                b.push(Waiter { key, sleeper: Sleeper::Task(current_arc()), bitset, movable });
                 break wait;
             }
             None => {
@@ -360,11 +376,13 @@ pub fn requeue(uaddr: u64, n_wake: u64, n_move: u64, uaddr2: u64, cmp: Option<u3
             Some(s) if i1 < i2 => (&mut *first, Some(&mut **s)),
             Some(s) => (&mut **s, Some(&mut *first)),
         };
-        // Room first, so that nothing fails halfway. Only tasks move: a
-        // doorbell watch stays on its channel's word, whose hang-up is
-        // what removes it for good (moved elsewhere, it would outlive the
-        // channel and escape `object_watch`'s one-per-word rule).
-        let moves = |w: &Waiter| w.key == from && matches!(w.sleeper, Sleeper::Task(_));
+        // Room first, so that nothing fails halfway. Only the waits of
+        // `wait` move (`Waiter::movable`): a doorbell watch stays on its
+        // channel's word, whose hang-up is what removes it for good (moved
+        // elsewhere, it would outlive the channel and escape
+        // `object_watch`'s one-per-word rule), and the Linux server's own
+        // waits stay where they are; a stale entry is nobody's to move.
+        let moves = |w: &Waiter| w.key == from && w.movable && matches!(w.sleeper, Sleeper::Task(_)) && !stale(w);
         let matching = src.iter().filter(|w| moves(w)).count() as u64;
         let movable = matching.saturating_sub(n_wake).min(n_move);
         if let Some(d) = dst.as_mut() {
@@ -400,7 +418,7 @@ pub fn requeue(uaddr: u64, n_wake: u64, n_move: u64, uaddr2: u64, cmp: Option<u3
 /// `instance`), read through `word`, while it holds `val`.
 pub fn server_wait(instance: usize, addr: u64, word: &core::sync::atomic::AtomicU32, val: u32, deadline: Option<u64>, ends: Ends) -> Result<i64, i64> {
     let key = Key { base: Base::Server(instance), offset: addr };
-    wait_on(key, || Some(word.load(Ordering::SeqCst)), || Ok(()), || false, val, deadline, FUTEX_BITSET_MATCH_ANY, ends)
+    wait_on(key, || Some(word.load(Ordering::SeqCst)), || Ok(()), || false, val, deadline, FUTEX_BITSET_MATCH_ANY, ends, false)
 }
 
 /// One word of a `server_waitv`: where it is (the Linux server's memory, or
@@ -458,7 +476,7 @@ pub fn server_waitv(words: &[WaitWord], deadline: Option<u64>, ends: Ends) -> Re
             early = Some(ENOMEM);
             break;
         }
-        b.push(Waiter { key: w.key, sleeper: Sleeper::Task(current_arc()), bitset: FUTEX_BITSET_MATCH_ANY });
+        b.push(Waiter { key: w.key, sleeper: Sleeper::Task(current_arc()), bitset: FUTEX_BITSET_MATCH_ANY, movable: false });
         queued += 1;
     }
     let result = match early {
@@ -505,7 +523,7 @@ pub fn object_wait(
 ) -> Result<i64, i64> {
     let key = Key { base: Base::Shared(Arc::as_ptr(object) as usize), offset };
     let hung_up = || object.is_hung_up();
-    wait_on(key, || Some(word.load(Ordering::SeqCst)), || Ok(()), hung_up, val, deadline, FUTEX_BITSET_MATCH_ANY, ends)
+    wait_on(key, || Some(word.load(Ordering::SeqCst)), || Ok(()), hung_up, val, deadline, FUTEX_BITSET_MATCH_ANY, ends, false)
 }
 
 /// Arms a doorbell watch of the server process `pid` on the word at
@@ -539,7 +557,7 @@ pub fn object_watch(
     let armed = |w: &Waiter| w.key == key && matches!(&w.sleeper, Sleeper::Watch(_, p) if *p == pid);
     if !b.iter().any(armed) {
         b.try_reserve(1).map_err(|_| ENOMEM)?;
-        b.push(Waiter { key, sleeper: Sleeper::Watch(doorbell.clone(), pid), bitset: FUTEX_BITSET_MATCH_ANY });
+        b.push(Waiter { key, sleeper: Sleeper::Watch(doorbell.clone(), pid), bitset: FUTEX_BITSET_MATCH_ANY, movable: false });
     }
     Ok(0)
 }

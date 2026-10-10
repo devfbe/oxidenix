@@ -759,11 +759,15 @@ pub const FUTEX_CMP: u64 = 2;
 /// EINVAL). For arch_prctl.
 pub const SYS_THREAD_FS: u64 = 1163;
 /// `clock_set(ns)`: sets the wall clock (CLOCK_REALTIME) to `ns`
-/// nanoseconds since the epoch, for every process of the machine.
+/// nanoseconds since the epoch, for every process of the machine. EPERM
+/// without the host grant: the kernel gives a tree's instance that grant
+/// when it starts the tree (the monitor's `run`, autorun); a tree without
+/// it acts as a Linux pid namespace that is not the initial one (ADR 0011).
 pub const SYS_CLOCK_SET: u64 = 1164;
 /// `power(how) -> !`: every instance of the Linux server writes its caches
-/// back (at most a minute), then the machine powers off (`POWER_OFF`) or
-/// restarts (`POWER_RESTART`). EINVAL for another `how`.
+/// back (at most a minute, also if the caller is killed meanwhile), then the
+/// machine powers off (`POWER_OFF`) or restarts (`POWER_RESTART`). EINVAL
+/// for another `how`; EPERM without the host grant (see `SYS_CLOCK_SET`).
 pub const SYS_POWER: u64 = 1165;
 pub const POWER_OFF: u64 = 0;
 pub const POWER_RESTART: u64 = 1;
@@ -897,3 +901,8 @@ pub const TEST_CACHED: u64 = 1516;
 /// asks again. Inode 0 disarms it; so does the inode leaving the server's
 /// cache (its number may go to another file). Test mode only.
 pub const TEST_MKWRITE_FAIL: u64 = 1519;
+/// `(on) -> old`: the kernel gives the caller's instance the host grant
+/// (`SYS_CLOCK_SET`, `SYS_POWER`) or takes it, and returns whether it had
+/// it: lxtest checks the tree without it. Test mode only; a program's call
+/// is the server's to pass on.
+pub const TEST_HOST: u64 = 1520;

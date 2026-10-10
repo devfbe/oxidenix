@@ -112,7 +112,7 @@ pub fn call(nr: u64, f: &TmpOpen, flags: u32, a1: u64, a2: u64, a3: u64) -> Resu
         // The contents are memory: nothing to write back.
         files::SYS_FSYNC | files::SYS_FDATASYNC => Ok(0),
         files::SYS_GETDENTS64 => f.getdents(a1, a2),
-        files::SYS_FSTATFS => statfs(a1),
+        files::SYS_FSTATFS => statfs(f.inode.dev, a1),
         files::SYS_IOCTL => Err(files::ENOTTY),
         _ => Err(EINVAL),
     }
@@ -125,14 +125,17 @@ fn signed(offset: u64) -> Result<u64, i64> {
 /// A tmpfs `struct statfs` at the program's `buf`: the pages every
 /// instance's tmpfs files take and their limit (`SYS_FILE_PAGES`: they are
 /// charged to one limit, half of what may be committed, as Linux's tmpfs).
-pub fn statfs(buf: u64) -> Result<i64, i64> {
-    const TMPFS_MAGIC: u64 = 0x0102_1994;
+pub fn statfs(dev: u64, buf: u64) -> Result<i64, i64> {
+    // devpts is a filesystem of its own kind (its magic), its nodes in the
+    // same memory.
+    const DEVPTS_SUPER_MAGIC: u64 = 0x1cd1;
+    let magic = if dev == crate::tmpfs::DEVPTS_DEV { DEVPTS_SUPER_MAGIC } else { 0x0102_1994 };
     const NAME_MAX: u64 = 255;
     let mut pages = [0u64; 2];
     check(syscall(SYS_FILE_PAGES, [pages.as_mut_ptr() as u64, 0, 0, 0, 0, 0]))?;
     let [used, limit] = pages;
     let free = limit.saturating_sub(used);
-    let words: [u64; 15] = [TMPFS_MAGIC, 4096, limit, free, free, 0, 0, 0, NAME_MAX, 4096, 0, 0, 0, 0, 0];
+    let words: [u64; 15] = [magic, 4096, limit, free, free, 0, 0, 0, NAME_MAX, 4096, 0, 0, 0, 0, 0];
     let mut bytes = [0u8; 120];
     for (chunk, w) in bytes.chunks_exact_mut(8).zip(words) {
         chunk.copy_from_slice(&w.to_le_bytes());

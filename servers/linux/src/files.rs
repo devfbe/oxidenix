@@ -767,7 +767,8 @@ impl Regular {
     /// Whether both are the same inode, and whether of one filesystem.
     fn same(&self, other: &Regular) -> (bool, bool) {
         match (self, other) {
-            (Regular::Tmp(a), Regular::Tmp(b)) => (Arc::ptr_eq(&a.inode, &b.inode), true),
+            // Each tmpfs mount is a filesystem of its own (EXDEV across).
+            (Regular::Tmp(a), Regular::Tmp(b)) => (Arc::ptr_eq(&a.inode, &b.inode), a.inode.dev == b.inode.dev),
             (Regular::Data(a), Regular::Data(b)) => (Arc::ptr_eq(&a.inode, &b.inode), true),
             _ => (false, false),
         }
