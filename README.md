@@ -291,6 +291,7 @@ oxidenix/
 │   ├── restricted/              restricted mode: shared region layout, register page, kernel calls
 │   ├── ring/                    SPSC descriptor rings and the channel layout (I/O rings)
 │   ├── fsring/                  the file protocol over the rings (Linux server <-> diskfs, procfs)
+│   ├── pageheap/                the Linux server's heap: page runs, slabs, commits and trimming
 │   └── oxrt/                    runtime for servers: entry, syscalls, heap, port I/O
 ├── builder/                     host tool: rootfs + cpio + boot image + ext2 data disk + QEMU
 └── userspace/                   C test programs, build script, rootfs and data disk templates,
@@ -449,7 +450,8 @@ About 13,100 lines of Rust (without comments and blank lines) in the kernel (16,
   when an allocation fails. It never shrinks, so each growth lowers the commit limit by as
   much (`Slab` in `/proc/meminfo` is what of it is in use); before it grows, the size
   classes give back the slabs whose slots are all free
-  (`slab::FreeList::reclaim`; the Linux server's heap does the same), so a burst of many
+  (`slab::FreeList::reclaim`; the Linux server's heap returns empty slabs at once and
+  decommits its free pages, `crates/pageheap`), so a burst of many
   objects of one size does not keep that memory from all others. User memory (pages, page tables, kernel stacks) may not take the last 16 MiB of RAM,
   which stay reserved for the heap. Large allocations that user space can trigger (kernel
   stacks, file contents, pipe buffers, `execve` arguments) are fallible and return
@@ -664,7 +666,10 @@ the pass-through: the kernel implements no Linux system call.
 - **The server's runtime** (phase R3): a heap in its shared region whose pages it commits
   and decommits itself (`shared_commit`, `shared_decommit`), and a mutex for data shared by all threads of the tree
   (Drepper's three-state futex lock over the kernel's futex, which keys the server's memory by
-  instance and address since that memory is pinned and in no address space's areas).
+  instance and address since that memory is in no address space's areas). The heap gives memory
+  back: free pages are decommitted by the timer thread when more than 2 MiB and a quarter of the
+  heap are free, and all of them when the kernel says memory is short (`EVENT_SHRINK`;
+  docs/design/linux-server.md, "The server's heap").
 - **Memory semantics are the server's** (phase R4): `mmap`, `munmap`, `mprotect`, `mremap`,
   `madvise`, `msync` and the `mlock` family are the server's. The server
   checks the arguments and turns them into kernel mapping calls: `mo_map` with anonymous
@@ -1180,7 +1185,7 @@ Each of these programs and scripts lives in the root filesystem and runs inside 
 | Test | Covers |
 |---|---|
 | `cowtest` | copy-on-write isolation between parent and child, kernel writes into shared pages, 50 forks, shared read-only frames stay unchanged, `brk` does not grow over a mapping |
-| `oomtest` | fork bomb (stops at the process limit), memory exhaustion via `mmap`, 100 full pipes; the kernel survives and memory is reusable; a process touching `MAP_NORESERVE` memory beyond the commit limit is killed while one with committed memory touches all of it; a `read()` into an untouched `MAP_NORESERVE` buffer with nothing left to commit kills the reader too (not `EFAULT`); a commit that dirty cache pages stand in the way of waits for their write-back, truncation racing write-back and fills keeps data and accounting, a writer's dirty pages stay within its tree's share, and a writer throttled because dirty pages would crowd out committed memory is killable at once; descriptors up to `RLIMIT_NOFILE` (4096, as `getrlimit` says), then `EMFILE`, a fork copying them all |
+| `oomtest` | fork bomb (stops at the process limit), memory exhaustion via `mmap`, 100 full pipes; the kernel survives and memory is reusable; a process touching `MAP_NORESERVE` memory beyond the commit limit is killed while one with committed memory touches all of it; a `read()` into an untouched `MAP_NORESERVE` buffer with nothing left to commit kills the reader too (not `EFAULT`); a commit that dirty cache pages stand in the way of waits for their write-back, truncation racing write-back and fills keeps data and accounting, a writer's dirty pages stay within its tree's share, and a writer throttled because dirty pages would crowd out committed memory is killable at once; descriptors up to `RLIMIT_NOFILE` (4096, as `getrlimit` says), then `EMFILE`, a fork copying them all; afterwards the Linux server's heap gives its free memory back (within 2 MiB of its start, Committed_AS within 4 MB, `TEST_HEAP_STATS`) and a commit refused at the limit makes it shrink (`EVENT_SHRINK`) |
 | `sigtest` | handlers, killing a busy loop, `SIGCHLD`, `EINTR` on pipe reads, blocked and ignored signals, FPU state across asynchronous handlers, `alarm` and repeating `setitimer`, catchable `SIGFPE`/`SIGSEGV`/`SIGTRAP` from CPU exceptions, an uncaught `SIGFPE` killing the process |
 | `jobtest` | stop/continue reporting through `wait4`, restart of a stopped `read()`, `SIGKILL` on stopped processes, `SA_RESTART` |
 | `waittest` | processes in the Linux server: `wait4` and `waitid` with their options (`WNOHANG`, `WNOWAIT`, `WEXITED`, `WSTOPPED`, `WCONTINUED`, `__WCLONE`, `__WALL`), the `siginfo` and `rusage` they report, an ignored `SIGCHLD` and `SA_NOCLDWAIT` reaping at once, child subreapers, the parent-death signal, process groups and sessions (`setpgid`, `setsid`, `getsid` and their errors), `clone3`, `vfork` |

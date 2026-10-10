@@ -156,7 +156,10 @@ space, and the walks (truncation, write-back) drop it before they lock a mapper.
   be the teardown, which must not run inside an allocation): each goes, as the `Arc`, into a
   fixed array of 256 that the reclaimer empties (`defer_drop`), a slot taken before the
   reference; a walk with no slot left ends there. A page whose mappings one reclaim walks is
-  isolated from the others (`Page::isolated`).
+  isolated from the others (`Page::isolated`). Below the low watermark, and after a commit was
+  refused at the limit, it also asks the Linux servers to give back what they can do without
+  (`EVENT_SHRINK`: their heaps' free pages, unused clean `/data` inodes; linux-server.md, "The
+  server's heap").
 - **Reads progress** under any pressure: the kernel's read of a cached object copies from each
   page it waited for with a reference of the wait's own, so reclaim cannot take it in between;
   the Linux server falls back to such a read when the pages it filled were reclaimed before it

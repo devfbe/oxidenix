@@ -186,6 +186,72 @@ through shared-memory rings with buffers granted from its memory objects (zero c
 IOMMU-confined DMA); that design follows the principles of the I/O audit and is its own
 document (`io-rings.md`).
 
+### The server's heap
+
+One heap serves every thread of an instance (`servers/linux/src/heap.rs` over
+`crates/pageheap`). It gives memory back: a fork bomb or a descriptor flood once made the heap
+grow by 18 MiB that stayed committed for the tree's life (Committed_AS 30.4 → 48.9 MB after
+`oomtest`, 260 KiB of it in use).
+
+**The kernel's part.** The heap area (`HEAP_BASE..THREADS_BASE`, 192 GiB) is address space the
+server lays out itself. `shared_commit(addr, len)` commits each page of the range that is not
+(charged against the commit limit up front, as a program's private page; ENOMEM at the limit,
+without waiting for write-back, since the caller may hold locks the pager needs) and maps it
+zeroed, waiting for reclaim for its frame as a fault does; `shared_decommit(addr, len)` unmaps
+the range's pages from every view of the region, shoots their TLB entries down (in batches whose
+frames wait on the stack: nothing is allocated) and frees them with their commitment. A page is
+committed exactly while it is mapped, so the region needs no charge bits: the instance's
+committed count is its mapped heap pages. The kernel never commits a page by itself: a server
+access to a page that is not committed is a fault in the server, which breaks the instance with a
+diagnostic (the page was never committed, or freed and decommitted: a server bug); the kernel's
+own copies from server memory end at their fixup (EFAULT). A futex wait on a heap word holds a
+reference on the word's frame, taken with the frames locked (a decommit frees the frame with them
+locked only after it cleared the entry), so a concurrent decommit cannot free the frame under
+the wait.
+
+**The allocator** (`pageheap`, host-tested with a model of the kernel that poisons decommitted
+pages and checks the poison when they are committed again):
+
+- *Pages.* The arena (after the metadata, up to 64 GiB) is cut into chunks of 512 pages. Each
+  chunk has two bitmaps, allocated and committed, and a summary of its free runs (the run at its
+  start, the longest, the run at its end); every 16 summaries have one on the level above, up to
+  a root over the whole arena (Go's page allocator). Lowest first fit descends the tree in a few
+  steps and keeps what is in use low, so free memory gathers at the top. A run with uncommitted
+  pages is committed before it is handed out, with up to 16 free uncommitted pages after it (one
+  kernel call per 64 KiB as the heap grows); a failed commit is a null allocation (the server's
+  ENOMEM path), never a page committed implicitly later.
+- *Slabs.* Objects up to 2 KiB come from one-page slabs of the size classes (`slab::class`).
+  Each slab has a 16-byte descriptor outside the arena: its free-slot list (indices linked
+  through the free slots), a bump index for slots never used, its use count and its place on its
+  class's list of partial slabs. Allocating and freeing a slot are O(1) under the class's lock; a
+  slab whose last object goes returns to the pages at once (a class keeps one empty slab). Larger
+  objects are runs of whole pages.
+- *Metadata.* Bitmaps, summaries and slab descriptors (16 bytes per page, 0.4 %) live in an area
+  of their own at `HEAP_BASE`, committed as the arena grows and never decommitted: nothing about
+  free memory is kept in free pages, so a decommitted page is never read.
+- *Locks.* The heap's locks are the server's futex mutex (`sync::RawMutex`, in the image), held
+  for bounded work only: no lock is held across a kernel call. A run is reserved under the
+  pages' lock (marked allocated), committed or decommitted with the lock released, and finished
+  under it again; growth of the metadata is serialized by a lock of its own, taken before the
+  pages'. A class's lock is never held while the pages' is taken.
+
+**When memory goes back.** When the free committed pages exceed 2 MiB and a quarter of what is
+committed, the heap asks the instance's timer thread, which trims at most every 500 ms (a
+workload that frees and allocates in turn does not commit and decommit all the time): free
+pages are decommitted from the arena's top down until 1 MiB, or an eighth of what is allocated,
+is left. When memory is short, the kernel's background reclaimer (below its low watermark, or
+after a commit was refused at the limit) flags every instance, and the service thread gets
+`EVENT_SHRINK` (at most once a second per instance): the heap keeps no free page and gives back
+the classes' empty slabs, and `/data`'s unused clean inodes go with their cached objects
+(Linux's shrinkers). After `oomtest` the heap is back within 2 MiB of where it started and
+Committed_AS 1.5 MB above its start (the test checks both, within 2 MiB and 4 MB, and the
+shrink after a refused commit).
+
+The allocation fast path is as fast as before (`scripts/bench.sh`: `stat_path_tmpfs`, about
+fifty heap operations, 3107 cycles against 3141 on main, docs/benchmarks/2026-10-10-*). What it
+costs: page-granular large objects (a 3 KiB object takes a page), 0.4 % of the arena in slab
+descriptors, and a kernel call per 64 KiB the heap grows by.
+
 ## Migration
 
 Each phase keeps the suite green, has its benchmark numbers, and is a series of commits.
@@ -199,10 +265,10 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
 2. **R2 — Memory objects and mappings** as kernel objects by handle: anonymous and paged
    objects with the instance's pager thread, mapping into a program's view (done; `fork`'s
    copy-on-write clone of a whole address space came with R8).
-3. **R3 — The server's runtime** (done): a heap in the shared region that grows (a kernel
-   call maps more of the region for the instance) and locks that work across the tree's
+3. **R3 — The server's runtime** (done): a heap in the shared region (since: committed and
+   decommitted page by page, "The server's heap") and locks that work across the tree's
    processes (futexes on the server's memory, keyed by instance and address, since that memory
-   is pinned and outside any address space's areas). Records per process come with the first
+   is outside any address space's areas; a wait on a heap word holds its frame) Records per process come with the first
    per-process Linux state the server owns (descriptors, R6), with the kernel's notice when a
    process ends.
 4. **R4 — Memory semantics** (done): `mmap`, `munmap`, `mprotect`, `mremap`, `madvise`, `msync` and
