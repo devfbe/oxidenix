@@ -167,7 +167,7 @@ fn writer(holder: u64) -> Result<Writer, i64> {
             let mut t = TURNS.lock();
             let gone = if HOLDER.load(Ordering::Acquire) != holder {
                 Some(EIO)
-            } else if crate::process::signal::dying() {
+            } else if crate::process::kill::dying() {
                 Some(EINTR)
             } else {
                 None

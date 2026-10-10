@@ -115,7 +115,7 @@ pub fn lost() {
 /// leader) the console as its controlling terminal.
 pub fn setup_stdio() {
     const O_RDWR: u32 = 2;
-    // The kernel's /dev/console node (it is always there).
+    // /dev/console (`namespace::dev` makes it with the instance).
     let Ok(node) = crate::namespace::resolve("/", "/dev/console", true).map(|r| r.node) else { return };
     let Some(t) = tty() else { return };
     let origin = Origin::new(node, alloc::string::String::from("/dev/console"), vfs::S_IFCHR);

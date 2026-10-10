@@ -1,33 +1,28 @@
 //! The server's namespace (phase R6c.2): mounts and path resolution.
 //!
 //! A mount puts a filesystem at a path: the server's tmpfs (`tmpfs`) at
-//! the root and as devpts at /dev/pts (`pty`), diskfs's disk at /data
-//! (`datafs`, over the rings), /proc and /sys (`procfs`: procfs's files
-//! over the rings and the server's own per-process part), or a directory
-//! of the kernel's tree (/dev), reached through handles on its inodes
-//! (`restricted::SYS_INODE_*`), until the server's own filesystems serve
-//! it. Mounts are found by name, as everything here: ".." is resolved
+//! the root, at /dev (devtmpfs: the device nodes and the descriptors'
+//! links, made when the instance starts; R9, until then the kernel's tree)
+//! and as devpts at /dev/pts (`pty`), diskfs's disk at /data (`datafs`,
+//! over the rings), /proc and /sys (`procfs`: procfs's files over the
+//! rings and the server's own per-process part). Mounts are found by
+//! name, as everything here: ".." is resolved
 //! lexically before symlinks are looked at (as the kernel's VFS did:
 //! "/a/link/.." is "/a"), so the longest mount whose path begins a
 //! normalized path is the filesystem that path lies in. Each symlink is
 //! read and resolution starts over from the root with its target in front
 //! of the rest (at most 16, else ELOOP); /proc's magic links
-//! (/proc/<pid>/fd/N) lead to the open file itself instead (`procfs::follow`). In the kernel's tree one call
-//! walks as many names as it can and stops after a symlink, so a path
-//! without symlinks costs one call; the tmpfs and /proc are walked in the
-//! server, /data one `LOOKUP` per name.
+//! (/proc/<pid>/fd/N) lead to the open file itself instead (`procfs::follow`). The tmpfs and
+//! /proc are walked in the server, /data one `LOOKUP` per name.
 
 use crate::datafs::{self, DInode};
 use crate::procfs::{self, ProcNode};
 use crate::sync::Mutex;
-use crate::syscall;
 use crate::tmpfs;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
-use restricted::*;
 use vfs::path::{join, normalize};
 
 pub const ENOENT: i64 = 2;
@@ -39,43 +34,8 @@ pub const ELOOP: i64 = 40;
 
 const MAX_LINKS: u32 = 16;
 
-/// A handle on an inode of the kernel's tree, closed when dropped.
-pub struct KInode(u64);
-
-impl KInode {
-    pub fn handle(&self) -> u64 {
-        self.0
-    }
-
-    /// Takes a handle the kernel returned (or its error).
-    pub fn from_result(r: i64) -> Result<KInode, i64> {
-        if r < 0 { Err(-r) } else { Ok(KInode(r as u64)) }
-    }
-
-    fn stat(&self) -> Result<[u8; 144], i64> {
-        let mut st = [0u8; 144];
-        check(syscall(SYS_INODE_STAT, [self.0, st.as_mut_ptr() as u64, 0, 0, 0, 0]))?;
-        pseudo_times(&mut st);
-        Ok(st)
-    }
-
-    fn readlink(&self) -> Result<String, i64> {
-        let mut buf = alloc::vec![0u8; 4096];
-        let n = check(syscall(SYS_INODE_READLINK, [self.0, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0, 0]))?;
-        buf.truncate(n as usize);
-        String::from_utf8(buf).map_err(|_| ENOENT)
-    }
-}
-
-impl Drop for KInode {
-    fn drop(&mut self) {
-        syscall(SYS_HANDLE_CLOSE, [self.0, 0, 0, 0, 0, 0]);
-    }
-}
-
-/// The times set on pseudo files, which keep none that change: the
-/// kernel's tree (/dev), /proc and /sys. As Linux's devtmpfs, procfs and
-/// sysfs take utimensat, the server keeps them (atime, mtime, ctime) by
+/// The times set on pseudo files, which keep none that change: /proc and
+/// /sys. As Linux's procfs and sysfs take utimensat, the server keeps them (atime, mtime, ctime) by
 /// device and inode number, for the instance's life, at most
 /// `PSEUDO_TIMES_MAX` of them (the oldest set go first, as a pseudo file's
 /// inode would be evicted).
@@ -133,7 +93,6 @@ pub fn mode_of(st: &[u8; 144]) -> u32 {
 
 /// An inode of any of the filesystems.
 pub enum Node {
-    Kernel(KInode),
     Tmp(Arc<tmpfs::Inode>),
     Data(Arc<DInode>),
     /// One of /proc or /sys (procfs's, or the server's own).
@@ -152,7 +111,6 @@ impl Node {
 
     pub fn stat(&self) -> Result<[u8; 144], i64> {
         match self {
-            Node::Kernel(k) => k.stat(),
             Node::Tmp(t) => Ok(t.stat()),
             Node::Data(d) => datafs::stat(d),
             Node::Proc(p) => procfs::stat(p),
@@ -161,7 +119,6 @@ impl Node {
 
     pub fn readlink(&self) -> Result<String, i64> {
         match self {
-            Node::Kernel(k) => k.readlink(),
             Node::Tmp(t) => t.readlink(),
             Node::Data(d) => datafs::readlink(d),
             Node::Proc(p) => procfs::readlink(p),
@@ -170,17 +127,9 @@ impl Node {
 }
 
 impl Node {
-    /// Another reference to the same inode (a kernel inode: a new handle).
+    /// Another reference to the same inode.
     pub fn duplicate(&self) -> Result<Node, i64> {
         Ok(match self {
-            Node::Kernel(k) => {
-                let mut walk = Walk::default();
-                let empty = "";
-                Node::Kernel(KInode::from_result(syscall(
-                    SYS_INODE_WALK,
-                    [k.handle(), empty.as_ptr() as u64, 0, &mut walk as *mut Walk as u64, 0, 0],
-                ))?)
-            }
             Node::Tmp(t) => Node::Tmp(t.clone()),
             Node::Data(d) => Node::Data(d.clone()),
             Node::Proc(p) => Node::Proc(p.clone()),
@@ -223,8 +172,6 @@ impl Drop for Origin {
 /// What a mount puts at its path.
 #[derive(Clone)]
 enum Fs {
-    /// The kernel's tree at this path (names below its root).
-    Kernel(Vec<String>),
     Tmpfs(Arc<tmpfs::Inode>),
     /// diskfs's disk.
     Data,
@@ -243,21 +190,24 @@ struct Mount {
 }
 
 /// The mount table: the instance's own tmpfs at the root, unpacked from
-/// the initramfs when the instance first resolves a path, the kernel's
-/// /dev, /proc and /sys, /data and devpts.
+/// the initramfs when the instance first resolves a path, /dev (`dev`),
+/// /proc and /sys, /data and devpts.
 static MOUNTS: Mutex<Vec<Mount>> = Mutex::new(Vec::new());
 
 fn with_mounts<R>(f: impl FnOnce(&Vec<Mount>) -> R) -> R {
     let mut m = MOUNTS.lock();
     if m.is_empty() {
-        let root = tmpfs::new_root();
+        let root = tmpfs::new_root(tmpfs::DEV);
         root.set_perm(0o755);
         crate::initramfs::unpack(&root);
         let _ = root.subdir("tmp", 0o1777);
-        m.push(Mount { at: Vec::new(), fs: Fs::Tmpfs(root.clone()), source: "rootfs", fstype: "tmpfs" });
+        // Named "tmpfs", not "rootfs": tools skip a "rootfs" entry as
+        // Linux's always-present initial one (busybox df would find no
+        // mount for "/", now that /dev is a filesystem of its own).
+        m.push(Mount { at: Vec::new(), fs: Fs::Tmpfs(root.clone()), source: "tmpfs", fstype: "tmpfs" });
         let path = |name: &str| alloc::vec![String::from(name)];
         let mounts = [
-            ("dev", Fs::Kernel(path("dev")), "devtmpfs", "devtmpfs"),
+            ("dev", Fs::Tmpfs(dev()), "devtmpfs", "devtmpfs"),
             ("proc", Fs::Proc, "proc", "proc"),
             ("sys", Fs::Sys, "sysfs", "sysfs"),
             ("data", Fs::Data, "/dev/vda", "ext2"),
@@ -267,11 +217,38 @@ fn with_mounts<R>(f: impl FnOnce(&Vec<Mount>) -> R) -> R {
             let _ = root.subdir(name, 0o755);
             m.push(Mount { at: path(name), fs, source, fstype });
         }
-        // devpts (the ptys' nodes, `pty`), on the kernel's /dev/pts.
+        // devpts (the ptys' nodes, `pty`), on /dev/pts.
         let at = alloc::vec![String::from("dev"), String::from("pts")];
         m.push(Mount { at, fs: Fs::Tmpfs(crate::pty::devpts()), source: "devpts", fstype: "devpts" });
     }
     f(&m)
+}
+
+/// The instance's /dev, as Linux's devtmpfs with udev's links: the
+/// terminals (`tty`: the controlling terminal, the console, ptmx), null
+/// and zero (`devices`), `fd`, `stdin`, `stdout` and `stderr` as links into
+/// /proc/self/fd, the mount point of devpts and `shm` for POSIX shared
+/// memory. A tmpfs like the root (root may make files and directories in it).
+fn dev() -> Arc<tmpfs::Inode> {
+    use vfs::stat::dev_make;
+    let dev = tmpfs::new_root(tmpfs::DEVTMPFS_DEV);
+    dev.set_perm(0o755);
+    let nodes = [
+        ("console", dev_make(5, 1), 0o600),
+        ("tty", dev_make(5, 0), 0o666),
+        ("ptmx", dev_make(5, 2), 0o666),
+        ("null", dev_make(1, 3), 0o666),
+        ("zero", dev_make(1, 5), 0o666),
+    ];
+    for (name, rdev, perm) in nodes {
+        let _ = dev.insert_device(name, rdev, perm);
+    }
+    for (name, target) in [("fd", "/proc/self/fd"), ("stdin", "/proc/self/fd/0"), ("stdout", "/proc/self/fd/1"), ("stderr", "/proc/self/fd/2")] {
+        let _ = dev.symlink(name, String::from(target));
+    }
+    let _ = dev.subdir("pts", 0o755);
+    let _ = dev.subdir("shm", 0o1777);
+    dev
 }
 
 /// The mount table as /proc/<pid>/mounts shows it (proc_pid_mounts(5)).
@@ -304,28 +281,6 @@ pub fn is_mount_point(comps: &[String]) -> bool {
     !comps.is_empty() && with_mounts(|mounts| mounts.iter().any(|m| m.at[..] == comps[..]))
 }
 
-/// The handle on the kernel's root, taken once for the instance and never
-/// closed.
-pub fn kernel_root() -> u64 {
-    static ROOT: AtomicU64 = AtomicU64::new(0);
-    let h = ROOT.load(Ordering::Acquire);
-    if h != 0 {
-        return h;
-    }
-    let new = syscall(SYS_INODE_ROOT, [0; 6]);
-    if new <= 0 {
-        // No handle left: the walks fail with it.
-        return 0;
-    }
-    match ROOT.compare_exchange(0, new as u64, Ordering::AcqRel, Ordering::Acquire) {
-        Ok(_) => new as u64,
-        Err(other) => {
-            syscall(SYS_HANDLE_CLOSE, [new as u64, 0, 0, 0, 0, 0]);
-            other
-        }
-    }
-}
-
 /// A resolved path: its inode, its mode (of a /data inode: its type
 /// only), and its absolute path as given
 /// (normalized, symlinks not replaced: what the descriptor and the working
@@ -341,33 +296,6 @@ pub struct Resolved {
 enum Step {
     Done(Node, u32),
     Link(Node, usize),
-}
-
-/// Walks `names` in the kernel's tree below `base`.
-fn walk_kernel(base: &[String], names: &[String]) -> Result<Step, i64> {
-    let mut rel = String::new();
-    for c in base.iter().chain(names) {
-        if !rel.is_empty() {
-            rel.push('/');
-        }
-        rel.push_str(c);
-    }
-    let mut walk = Walk::default();
-    let inode = KInode::from_result(syscall(
-        SYS_INODE_WALK,
-        [kernel_root(), rel.as_ptr() as u64, rel.len() as u64, &mut walk as *mut Walk as u64, 0, 0],
-    ))?;
-    let walked = if rel.is_empty() { 0 } else { rel[..walk.consumed as usize].split('/').count() };
-    let in_names = walked.saturating_sub(base.len());
-    if walk.mode & vfs::S_IFMT == vfs::S_IFLNK && in_names > 0 {
-        return Ok(Step::Link(Node::Kernel(inode), in_names));
-    }
-    if in_names != names.len() {
-        // A walk stops early only at a symlink (one in the mount's own
-        // path is the kernel's business: refuse it).
-        return Err(ENOENT);
-    }
-    Ok(Step::Done(Node::Kernel(inode), walk.mode))
 }
 
 /// Walks `names` in the tmpfs from `root`; `follow`: also at the last name.
@@ -434,7 +362,6 @@ pub fn resolve(base: &str, path: &str, follow: bool) -> Result<Resolved, i64> {
         let (fs, at) = mount_of(all);
         let names = &all[at..];
         let step = match &fs {
-            Fs::Kernel(base) => walk_kernel(base, names)?,
             Fs::Tmpfs(root) => walk_tmpfs(root, names, follow)?,
             Fs::Data => walk_data(names, follow)?,
             Fs::Proc => walk_proc(false, names, follow)?,
@@ -444,8 +371,8 @@ pub fn resolve(base: &str, path: &str, follow: bool) -> Result<Resolved, i64> {
             Step::Done(node, mode) => return Ok(Resolved { node, mode, path: given }),
             Step::Link(node, n) => (node, at + n),
         };
-        // The kernel's walk stops at any symlink: the last one is followed
-        // only when asked for.
+        // A walk stops at a symlink it must follow (a last one only when
+        // asked for).
         if walked == all.len() && !follow {
             let mode = mode_of(&link.stat()?);
             return Ok(Resolved { node: link, mode, path: given });

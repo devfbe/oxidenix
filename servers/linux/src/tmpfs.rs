@@ -2,8 +2,8 @@
 //! inodes (AF_UNIX names, `unix`) and device nodes (devpts's, `pty`) in the
 //! server's memory; a file's
 //! contents are a file object of the kernel's (`SYS_MO_CREATE_FILE`), read,
-//! written and mapped without the kernel's VFS, and charged to the same
-//! tmpfs limit as the kernel's tmpfs.
+//! written and mapped through the object, and charged to the kernel's limit
+//! of file objects (`SYS_FILE_PAGES`).
 //!
 //! Locking: each inode has its own lock (its directory map, permissions,
 //! times and write count). Code holds one inode lock at a time, except under
@@ -41,6 +41,7 @@ use vfs::stat::{SetTime, Stat, Times};
 pub const EPERM: i64 = 1;
 pub const EACCES: i64 = 13;
 pub const EEXIST: i64 = 17;
+pub const EXDEV: i64 = 18;
 pub const EISDIR: i64 = 21;
 pub const EINVAL: i64 = 22;
 pub const ENOSPC: i64 = 28;
@@ -48,10 +49,13 @@ pub const ENAMETOOLONG: i64 = 36;
 pub const ENOTEMPTY: i64 = 39;
 pub const ETXTBSY: i64 = 26;
 
-/// st_dev of the server's tmpfs (the kernel's files have 0), so that
-/// tools that tell files apart by device and inode number never mistake
-/// one of each for the same file.
+/// st_dev of each of the server's tmpfs mounts (Linux's numbers of the
+/// kind): the root, /dev (devtmpfs) and devpts. Each is its own filesystem
+/// (`df`, `find -xdev`, rename's EXDEV); their inode numbers are one
+/// sequence, so no two files share device and inode number.
 pub const DEV: u64 = 0x1a;
+pub const DEVTMPFS_DEV: u64 = 0x5;
+pub const DEVPTS_DEV: u64 = 0x18;
 
 /// A file object of the kernel's, closed when the file goes.
 pub struct Object(u64);
@@ -134,6 +138,8 @@ pub struct State {
 
 pub struct Inode {
     pub ino: u64,
+    /// The tmpfs it is in (`DEV`, `DEVTMPFS_DEV`, `DEVPTS_DEV`), its root's.
+    pub dev: u64,
     /// Its file type (`S_IFMT` bits), fixed at creation: known without the
     /// lock (a path walk asks each name's). It stays right because the
     /// kind's variant cannot change (`content::Content`).
@@ -151,17 +157,18 @@ static NEXT_INO: AtomicU64 = AtomicU64::new(1);
 /// Taken by renames and removals (see the module comment).
 static RENAME: Mutex<()> = Mutex::new(());
 
-/// A new, empty tmpfs: its root directory.
-pub fn new_root() -> Arc<Inode> {
-    Inode::new(Kind::Dir(BTreeMap::new()), 0o1777)
+/// A new, empty tmpfs with device number `dev`: its root directory.
+pub fn new_root(dev: u64) -> Arc<Inode> {
+    Inode::new(Kind::Dir(BTreeMap::new()), 0o1777, dev)
 }
 
 impl Inode {
-    fn new(kind: Kind, perm: u32) -> Arc<Inode> {
+    fn new(kind: Kind, perm: u32, dev: u64) -> Arc<Inode> {
         let file_type = kind_bits(&kind);
         let state = State { perm, kind: content::Content::new(kind), sealed: false, times: Times::new(now()), writers: 0, removed: false, link: None };
         Arc::new(Inode {
             ino: NEXT_INO.fetch_add(1, Ordering::Relaxed),
+            dev,
             file_type,
             state: Mutex::new(state),
             append: crate::sync::SleepLock::new(()),
@@ -232,7 +239,7 @@ impl Inode {
             (st.perm, stat_size(st.kind.get()), st.times, rdev)
         };
         Stat {
-            dev: DEV,
+            dev: self.dev,
             ino: self.ino,
             nlink: if self.file_type == vfs::S_IFDIR { 2 } else { 1 },
             mode: self.file_type | perm,
@@ -296,7 +303,7 @@ impl Inode {
         } else {
             Kind::File(Object(check(syscall(SYS_MO_CREATE_FILE, [0; 6])).map_err(|e| if e == 24 { ENOSPC } else { e })? as u64))
         };
-        let inode = Inode::new(kind, perm & 0o7777);
+        let inode = Inode::new(kind, perm & 0o7777, self.dev);
         self.insert(name, inode.clone())?;
         Ok(inode)
     }
@@ -306,7 +313,7 @@ impl Inode {
     pub fn insert_object(&self, name: &str, handle: u64, perm: u32) -> Result<(), i64> {
         let object = Object(handle);
         check_name(name)?;
-        self.insert(name, Inode::new(Kind::File(object), perm & 0o7777))
+        self.insert(name, Inode::new(Kind::File(object), perm & 0o7777, self.dev))
     }
 
     /// The directory `name`, made if missing.
@@ -323,20 +330,21 @@ impl Inode {
 
     pub fn symlink(&self, name: &str, target: String) -> Result<(), i64> {
         check_name(name)?;
-        self.insert(name, Inode::new(Kind::Symlink(target), 0o777))
+        self.insert(name, Inode::new(Kind::Symlink(target), 0o777, self.dev))
     }
 
     /// A new socket inode `name` (EEXIST if taken), for bind(2).
     pub fn socket(&self, name: &str, perm: u32) -> Result<Arc<Inode>, i64> {
         check_name(name)?;
-        let inode = Inode::new(Kind::Socket, perm & 0o7777);
+        let inode = Inode::new(Kind::Socket, perm & 0o7777, self.dev);
         self.insert(name, inode.clone())?;
         Ok(inode)
     }
 
-    /// A sealed directory (devpts, see `State::sealed`).
-    pub fn new_sealed_dir(perm: u32) -> Arc<Inode> {
-        let dir = Inode::new(Kind::Dir(BTreeMap::new()), perm & 0o7777);
+    /// A sealed directory, the root of a tmpfs with device number `dev`
+    /// (devpts, see `State::sealed`).
+    pub fn new_sealed_dir(perm: u32, dev: u64) -> Arc<Inode> {
+        let dir = Inode::new(Kind::Dir(BTreeMap::new()), perm & 0o7777, dev);
         dir.state.lock().sealed = true;
         dir
     }
@@ -345,7 +353,7 @@ impl Inode {
     /// a sealed directory: the server's own.
     pub fn insert_device(&self, name: &str, rdev: u64, perm: u32) -> Result<Arc<Inode>, i64> {
         check_name(name)?;
-        let inode = Inode::new(Kind::Device(rdev), perm & 0o7777);
+        let inode = Inode::new(Kind::Device(rdev), perm & 0o7777, self.dev);
         self.insert_as(name, inode.clone(), true)?;
         Ok(inode)
     }
@@ -531,6 +539,10 @@ pub(crate) fn settled(try_once: impl Fn() -> Result<(), i64>) -> Result<(), i64>
 /// replaced.
 pub fn rename(odir: &Arc<Inode>, oname: &str, ndir: &Arc<Inode>, nname: &str) -> Result<(Arc<Inode>, Option<Arc<Inode>>), i64> {
     check_name(nname)?;
+    // Another tmpfs is another filesystem.
+    if odir.dev != ndir.dev {
+        return Err(EXDEV);
+    }
     let _shape = RENAME.lock();
     let node = odir.lookup(oname)?;
     // Moving a directory below itself would detach it in a reference cycle.

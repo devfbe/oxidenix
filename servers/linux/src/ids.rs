@@ -1,7 +1,8 @@
 //! Credentials and process attributes (phase R8): the user and group ids, supplementary
-//! groups, capabilities, prctl, the resource usage calls (getrusage, times) and the calls
-//! that name a thread or process for the kernel (sched_getaffinity, sched_setaffinity,
-//! prlimit64).
+//! groups, capabilities, prctl, the resource usage calls (getrusage, times), the calls
+//! that name a thread or process for the kernel (sched_getaffinity, sched_setaffinity), and
+//! the resource limits but RLIMIT_NOFILE, which is the descriptor table's (`fdtable`):
+//! prlimit64, getrlimit and setrlimit (R9).
 //!
 //! oxidenix has one user, root (uid and gid 0, every capability): the id getters answer 0,
 //! setting an id is accepted (there is no other user to become), a process has no
@@ -42,12 +43,14 @@ const SYS_PRCTL: u64 = 157;
 const SYS_SCHED_SETAFFINITY: u64 = 203;
 const SYS_SCHED_GETAFFINITY: u64 = 204;
 const SYS_PRLIMIT64: u64 = 302;
+const SYS_GETRLIMIT: u64 = 97;
+const SYS_SETRLIMIT: u64 = 160;
 /// Linux's NGROUPS_MAX.
 const NGROUPS_MAX: u64 = 65536;
 
 /// The result of a credentials or attribute call in `s`, or None for other calls.
-pub fn handle(s: &mut State) -> Option<i64> {
-    let (a0, a1, a2) = (s.rdi, s.rsi, s.rdx);
+pub fn handle(s: &State) -> Option<i64> {
+    let (a0, a1, a2, a3) = (s.rdi, s.rsi, s.rdx, s.r10);
     let result = match s.rax {
         SYS_GETUID | SYS_GETGID | SYS_GETEUID | SYS_GETEGID => Ok(0),
         SYS_SETUID | SYS_SETGID | SYS_SETREUID | SYS_SETREGID | SYS_SETRESUID | SYS_SETRESGID => Ok(0),
@@ -66,21 +69,61 @@ pub fn handle(s: &mut State) -> Option<i64> {
         SYS_TIMES => times(a0),
         SYS_SCHED_GETAFFINITY => getaffinity(a0 as i32, a1, a2),
         SYS_SCHED_SETAFFINITY => setaffinity(a0 as i32, a1, a2),
-        SYS_PRLIMIT64 => match process_exists(a0 as i32) {
-            // The limits are the kernel's (the descriptor table's size): asked for the
-            // caller, whoever was named.
-            Ok(()) => {
-                let saved = s.rdi;
-                s.rdi = 0;
-                let r = crate::pass_through_value(s);
-                s.rdi = saved;
-                Ok(r).and_then(|r| if r < 0 { Err(-r) } else { Ok(r) })
-            }
-            Err(e) => Err(e),
-        },
+        SYS_PRLIMIT64 => process_exists(a0 as i32).and_then(|_| prlimit(a1, a2, a3)),
+        SYS_GETRLIMIT => prlimit(a0, 0, a1),
+        SYS_SETRLIMIT => prlimit(a0, a1, 0),
         _ => return None,
     };
     Some(result.unwrap_or_else(|e| -e))
+}
+
+/// The resource limits (Linux's RLIMIT_ numbers, but RLIMIT_NOFILE).
+const RLIM_NLIMITS: u64 = 16;
+const RLIM_INFINITY: u64 = u64::MAX;
+const RLIMIT_STACK: u64 = 3;
+const RLIMIT_CORE: u64 = 4;
+const RLIMIT_MEMLOCK: u64 = 8;
+const RLIMIT_SIGPENDING: u64 = 11;
+const RLIMIT_MSGQUEUE: u64 = 12;
+const RLIMIT_NICE: u64 = 13;
+const RLIMIT_RTPRIO: u64 = 14;
+
+/// The (soft, hard) limit of `resource` every process has: Linux's defaults for a process
+/// init starts, where the server holds to them (an execve's stack grows to 8 MiB, no core
+/// files are written, the instance queues at most 4096 real-time signals); nothing else is
+/// limited.
+fn limit(resource: u64) -> (u64, u64) {
+    match resource {
+        RLIMIT_STACK => (8 << 20, RLIM_INFINITY),
+        RLIMIT_CORE => (0, RLIM_INFINITY),
+        RLIMIT_MEMLOCK => (8 << 20, 8 << 20),
+        RLIMIT_SIGPENDING => (4096, 4096),
+        RLIMIT_MSGQUEUE => (819_200, 819_200),
+        RLIMIT_NICE | RLIMIT_RTPRIO => (0, 0),
+        _ => (RLIM_INFINITY, RLIM_INFINITY),
+    }
+}
+
+/// prlimit64(pid, resource, new, old) for the caller's process (`pid` checked by the
+/// caller), and getrlimit and setrlimit: the limits `limit` gives at `old`; new limits are
+/// checked (EINVAL for a soft limit above the hard one) and, the one user being root,
+/// allowed, but not kept: the processes hold to the defaults (an open issue of R9, until
+/// the process table keeps limits per process).
+fn prlimit(resource: u64, new: u64, old: u64) -> Result<i64, i64> {
+    if resource >= RLIM_NLIMITS {
+        return Err(EINVAL);
+    }
+    if new != 0 {
+        let [soft, hard]: [u64; 2] = usercopy::read(new)?;
+        if soft > hard {
+            return Err(EINVAL);
+        }
+    }
+    if old != 0 {
+        let (soft, hard) = limit(resource);
+        usercopy::write(old, &[soft, hard])?;
+    }
+    Ok(0)
 }
 
 /// getresuid and getresgid: real, effective and saved are all 0.

@@ -1,10 +1,12 @@
-//! Processes and threads: the process table, the current task, descriptor tables, process
-//! groups and sessions, CPU affinity; the submodules hold scheduling, fork/exec/exit, signals,
-//! IPC, restricted mode and the system calls.
+//! Processes and threads: the process table, the current task, the servers the kernel starts
+//! and the process trees it starts with their Linux server instance; the submodules hold
+//! scheduling, address spaces, exit and kill, futexes, IPC and channels, restricted mode (the
+//! Linux server's interface) and the native servers' system calls. The kernel implements no
+//! Linux system call (R9).
 
 pub mod address_space;
 pub mod channel;
-pub mod clone;
+mod clock;
 pub mod elf;
 pub mod errno;
 mod exec;
@@ -12,94 +14,43 @@ mod exit;
 mod futex;
 pub mod ipc;
 pub mod irq;
+pub mod kill;
 mod loader;
-mod prctl;
+mod native;
 pub mod query;
 pub mod sched;
-pub mod signal;
-mod sys_file;
-mod sys_mem;
-mod sys_time;
 pub mod syscall;
 pub mod task;
 pub mod tlb;
 pub mod linux;
-mod linux_inode;
 pub mod uaccess;
+mod vm;
 
-use crate::fs::file::OpenFile;
-use crate::fs;
 use crate::memory;
 use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
-use alloc::vec;
 use alloc::vec::Vec;
 use core::ops::Range;
 use core::sync::atomic::Ordering;
 use errno::*;
 use sched::{current, TABLE};
 use syscall::Frame;
-use task::{Files, FsInfo, Info, KernelStack, State, Task, ThreadGroup};
+use task::{Info, KernelStack, State, Task, ThreadGroup};
 use x86_64::instructions::interrupts;
 
-pub use clone::{clone, set_tid_address};
-pub use exec::exec;
-pub use exit::{decode_status, exit_group, exit_thread, notify_parent, reap_orphans, wait4, wait_for, WaitStatus};
+pub use exit::{decode_status, exit_group, exit_thread, reap_orphans, wait_for, WaitStatus};
 pub use sched::{prepare_to_sleep, schedule, wakeup};
-pub use signal::{get_alarm, set_alarm};
 pub use task::Process;
 
 pub type Pid = u64;
 
 pub const TIMER_HZ: u64 = 100;
 
-/// A descriptor of the kernel's tables (the native servers'; a Linux
-/// program's descriptors are its server's).
-#[derive(Clone)]
-pub struct FdEntry {
-    file: Arc<OpenFile>,
-    pub cloexec: bool,
-}
-
-impl FdEntry {
-    pub fn new(file: Arc<OpenFile>, cloexec: bool) -> FdEntry {
-        FdEntry { file, cloexec }
-    }
-
-    pub fn file(&self) -> &Arc<OpenFile> {
-        &self.file
-    }
-}
-
 impl Process {
     /// The address space, or EINVAL for a task without one.
     pub fn mm(&self) -> Result<Arc<address_space::Mm>, i64> {
         self.mm.clone().ok_or(EINVAL)
-    }
-
-    /// The descriptor table (EBADF after exit).
-    pub fn files(&self) -> Result<&Arc<Files>, i64> {
-        self.files.as_ref().ok_or(EBADF)
-    }
-
-    pub fn file(&self, fd: u64) -> Result<Arc<OpenFile>, i64> {
-        self.files()?.get(fd)
-    }
-
-    /// Lowest free descriptor >= `min`.
-    pub fn alloc_fd(&self, file: Arc<OpenFile>, cloexec: bool, min: usize) -> Result<i64, i64> {
-        self.files()?.alloc(file, cloexec, min)
-    }
-
-    pub fn cwd(&self) -> String {
-        self.fs.as_ref().map_or_else(|| "/".to_string(), |f| f.cwd())
-    }
-
-    pub fn set_cwd(&self, cwd: String) {
-        if let Some(f) = &self.fs {
-            f.set_cwd(cwd);
-        }
     }
 }
 
@@ -114,9 +65,14 @@ pub fn current_mm() -> Option<Arc<address_space::Mm>> {
     with_current(|p| p.mm.clone())
 }
 
-/// The running task's descriptor table.
-pub fn current_files() -> Result<Arc<Files>, i64> {
-    with_current(|p| p.files().cloned())
+/// The calling process's id (the kernel's: its thread group's).
+pub fn current_pid() -> Pid {
+    current().tgid()
+}
+
+/// The process with the kernel's id `pid`.
+pub fn group(pid: Pid) -> Option<Arc<ThreadGroup>> {
+    TABLE.lock().groups.get(&pid).cloned()
 }
 
 /// Process 0, the kernel monitor, runs on the boot stack of the bootstrap
@@ -125,11 +81,8 @@ pub fn init() {
     enable_sse();
     tlb::init_cpu(true);
     syscall::init();
-    let group = ThreadGroup::new(0, Info::new(0, 0, 0, "kernel".to_string()), Default::default()).expect("boot");
-    let mut own = Process::empty();
-    own.files = Files::new(Vec::new());
-    own.fs = FsInfo::new("/".to_string());
-    let kernel = Arc::new(Task::new(0, group.clone(), "kernel".to_string(), own, None, 0));
+    let group = ThreadGroup::new(0, Info::new("kernel".to_string())).expect("boot");
+    let kernel = Arc::new(Task::new(0, group.clone(), "kernel".to_string(), Process::empty(), None, 0));
     group.info.lock().threads.push(kernel.clone());
     {
         let mut table = TABLE.lock();
@@ -149,65 +102,6 @@ pub fn enable_sse() {
         });
         Cr4::update(|f| f.insert(Cr4Flags::OSFXSR | Cr4Flags::OSXMMEXCPT_ENABLE));
     }
-}
-
-/// The calling process's id (its thread group).
-pub fn current_pid() -> Pid {
-    current().tgid()
-}
-
-/// The calling thread's id.
-pub fn current_tid() -> Pid {
-    current().tid()
-}
-
-pub fn current_ppid() -> Pid {
-    current().group.info.lock().ppid
-}
-
-/// The thread with id `tid` (0: the caller).
-pub fn task(tid: Pid) -> Option<Arc<Task>> {
-    if tid == 0 {
-        return Some(sched::current_arc());
-    }
-    TABLE.lock().tasks.get(&tid).cloned()
-}
-
-/// The process with id `pid` (0: the caller's), also found by the id of
-/// one of its threads, as Linux does for process ids.
-pub fn group(pid: Pid) -> Option<Arc<ThreadGroup>> {
-    if pid == 0 {
-        return Some(current().group.clone());
-    }
-    let table = TABLE.lock();
-    table.groups.get(&pid).cloned().or_else(|| table.tasks.get(&pid).map(|t| t.group.clone()))
-}
-
-pub fn setpgid(pid: Pid, pgid: Pid) -> SysResult {
-    let me = current_pid();
-    let g = group(pid).ok_or(ESRCH)?;
-    let mut info = g.info.lock();
-    if g.tgid != me && info.ppid != me {
-        return Err(ESRCH);
-    }
-    info.pgid = if pgid == 0 { g.tgid } else { pgid };
-    Ok(0)
-}
-
-pub fn getpgid(pid: Pid) -> SysResult {
-    Ok(group(pid).ok_or(ESRCH)?.info.lock().pgid as i64)
-}
-
-pub fn getsid(pid: Pid) -> SysResult {
-    Ok(group(pid).ok_or(ESRCH)?.info.lock().sid as i64)
-}
-
-pub fn setsid() -> SysResult {
-    let g = &current().group;
-    let mut info = g.info.lock();
-    info.sid = g.tgid;
-    info.pgid = g.tgid;
-    Ok(g.tgid as i64)
 }
 
 /// ioperm(from, count, on) for privileged servers: grants or revokes
@@ -237,9 +131,9 @@ pub fn ioperm(from: u64, count: u64, on: u64) -> SysResult {
     })
 }
 
-/// (pid, parent, name, state, server, cpu, threads) of every process, for
-/// the monitor.
-pub fn list() -> Vec<(Pid, Pid, String, &'static str, bool, usize, usize)> {
+/// (pid, name, state, server, cpu, threads) of every process, for the
+/// monitor.
+pub fn list() -> Vec<(Pid, String, &'static str, bool, usize, usize)> {
     let groups: Vec<Arc<ThreadGroup>> = TABLE.lock().groups.values().cloned().collect();
     groups
         .iter()
@@ -251,11 +145,10 @@ pub fn list() -> Vec<(Pid, Pid, String, &'static str, bool, usize, usize)> {
                 Some(State::Running) => "running",
                 Some(State::Runnable) => "ready",
                 Some(State::Sleeping) => "sleeping",
-                Some(State::Stopped) => "stopped",
                 Some(State::Dead) => "exiting",
             };
             let cpu = main.map_or(0, |t| t.last_cpu.load(Ordering::Relaxed));
-            (g.tgid, info.ppid, info.name.clone(), state, g.privileged.load(Ordering::Relaxed), cpu, info.threads.len())
+            (g.tgid, info.name.clone(), state, g.privileged.load(Ordering::Relaxed), cpu, info.threads.len())
         })
         .collect()
 }
@@ -265,76 +158,18 @@ pub fn online_mask() -> u64 {
     (0..crate::smp::MAX_CPUS).filter(|&i| crate::smp::by_index(i).is_some()).fold(0, |m, i| m | 1 << i)
 }
 
-/// sched_getaffinity(tid, size, mask): the CPUs the thread may run on, as
-/// a 64-bit mask; returns the bytes written, as Linux does.
-pub fn sched_getaffinity(pid: Pid, size: u64, mask: u64) -> SysResult {
-    if size < 8 {
-        return Err(EINVAL);
-    }
-    let t = task(pid).ok_or(ESRCH)?;
-    uaccess::write(mask, t.affinity.load(Ordering::Relaxed) & online_mask())?;
-    Ok(8)
-}
-
-/// sched_setaffinity(tid, size, mask): restricts the thread to the CPUs in
-/// `mask` that run. If the caller excludes its own CPU it moves at once.
-pub fn sched_setaffinity(pid: Pid, size: u64, mask: u64) -> SysResult {
-    if size == 0 {
-        return Err(EINVAL);
-    }
-    let mut bytes = [0u8; 8];
-    let n = size.min(8);
-    uaccess::copy_from(mask, &mut bytes[..n as usize])?;
-    let wanted = u64::from_le_bytes(bytes) & online_mask();
-    if wanted == 0 {
-        return Err(EINVAL);
-    }
-    let t = task(pid).ok_or(ESRCH)?;
-    if t.group.privileged.load(Ordering::Relaxed) && current_pid() != 0 {
-        return Err(EPERM);
-    }
-    t.affinity.store(wanted, Ordering::Relaxed);
-    if core::ptr::eq(&*t, current()) && !t.may_run_on(crate::smp::cpu().index) {
-        schedule();
-    }
-    Ok(0)
-}
-
-/// getcpu(&cpu, &node, cache): the CPU the caller runs on; one NUMA node.
-pub fn getcpu(cpu: u64, node: u64) -> SysResult {
-    let index = crate::smp::cpu().index as u32;
-    if cpu != 0 {
-        uaccess::write(cpu, index)?;
-    }
-    if node != 0 {
-        uaccess::write(node, 0u32)?;
-    }
-    Ok(0)
-}
-
-/// Sleeps until `deadline` (nanoseconds since boot); a signal ends the
-/// sleep early with EINTR.
+/// Sleeps until `deadline` (nanoseconds since boot); a kick (or the end
+/// of the process) ends the sleep early with EINTR.
 pub fn sleep_until(deadline: u64) -> Result<(), i64> {
     loop {
         let wait = prepare_to_sleep();
         if crate::time::now() >= deadline {
             return Ok(());
         }
-        if signal::interrupted() {
+        if kill::interrupted() {
             return Err(EINTR);
         }
         wait.sleep_until(deadline);
-    }
-}
-
-/// pause(2): sleeps until a signal arrives.
-pub fn pause() -> SysResult {
-    loop {
-        let wait = prepare_to_sleep();
-        if signal::interrupted() {
-            return Err(EINTR);
-        }
-        wait.sleep();
     }
 }
 
@@ -366,35 +201,8 @@ fn cmdline_of(args: &[String]) -> Vec<u8> {
     out
 }
 
-/// Absolute form of `path` relative to `cwd` (for /proc/<pid>/exe).
-fn absolute(cwd: &str, path: &str) -> String {
-    if path.starts_with('/') {
-        path.to_string()
-    } else if cwd.ends_with('/') {
-        alloc::format!("{cwd}{path}")
-    } else {
-        alloc::format!("{cwd}/{path}")
-    }
-}
-
 fn basename(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
-}
-
-fn load_path(cwd: &str, path: &str, args: &[String], envs: &[String]) -> Result<loader::Image, i64> {
-    load_inode(fs::resolve(cwd, path, true)?, args, envs)
-}
-
-fn load_inode(inode: Arc<fs::Inode>, args: &[String], envs: &[String]) -> Result<loader::Image, i64> {
-    if inode.file_type() != fs::S_IFREG {
-        return Err(if inode.is_dir() { EISDIR } else { ENOEXEC });
-    }
-    // Not while it is open for writing; nobody may write it while it runs.
-    let exe = inode.deny_write_access()?;
-    let cache = inode.cache()?;
-    let file: address_space::Hold = fs::MappedFile::new(inode, false)?;
-    let exe: address_space::Hold = Arc::try_new(exe).map_err(|_| ENOMEM)?;
-    loader::load(&cache, Some(file), Some(exe), args, envs)
 }
 
 /// A user-space server the kernel starts and restarts.
@@ -402,9 +210,9 @@ pub struct Server {
     /// Name of the IPC service it registers.
     pub name: &'static str,
     pub path: &'static str,
-    /// The program, copied once at boot: a restart must not run whatever
-    /// was written to `path` since then with the server's privileges.
-    image: Arc<fs::cache::PageCache>,
+    /// The program: `path` of the boot image (read-only, so a restart runs
+    /// the same program), committed at boot.
+    image: Arc<crate::fs::cache::PageCache>,
     /// I/O port ranges (start..end) the server may request with ioperm.
     ports: Vec<Range<u64>>,
     /// Interrupt line it may enable.
@@ -565,11 +373,7 @@ pub fn server_exited(pid: Pid) {
 
 impl Server {
     pub fn load(name: &'static str, path: &'static str) -> Result<Server, i64> {
-        let inode = fs::resolve("/", path, true)?;
-        if inode.file_type() != fs::S_IFREG {
-            return Err(ENOEXEC);
-        }
-        let image = fs::cache::PageCache::copy_of(&inode)?;
+        let image = crate::fs::cache::PageCache::program(crate::fs::program(path).ok_or(ENOENT)?)?;
         Ok(Server {
             name,
             path,
@@ -764,14 +568,13 @@ pub fn spawn(name: &str, args: &[&str]) -> Result<Pid, i64> {
         space.attach(instance.clone(), true).map_err(|e| if e == address_space::Fault::Oom { ENOMEM } else { EINVAL })?;
         let (thread, start) = linux::LinuxThread::new(instance.clone(), &Frame::user_start(0, 0), restricted::ROLE_INIT, 0)?;
         let name = basename(&path).to_string();
-        let mut info = Info::new(current_pid(), pid, pid, name.clone());
+        let mut info = Info::new(name.clone());
         info.exe = path.clone();
         info.mem = Some(space.stats.clone());
         let mut own = Process::empty();
         own.mm = Some(address_space::Mm::new(space).ok_or(ENOMEM)?);
-        own.fs = Some(FsInfo::new("/".to_string()).ok_or(ENOMEM)?);
         own.linux = Some(thread);
-        let group = ThreadGroup::new(pid, info, Default::default()).ok_or(ENOMEM)?;
+        let group = ThreadGroup::new(pid, info).ok_or(ENOMEM)?;
         group.instance.store(instance.id, Ordering::Release);
         let t = new_task(pid, group, name, own, start)?;
         unsafe { t.own() }.linux.as_mut().expect("set above").announce(&t)?;
@@ -814,10 +617,10 @@ fn spawn_pager(instance: &Arc<linux::Instance>) -> Result<Pid, i64> {
     let mut own = Process::empty();
     own.mm = Some(address_space::Mm::new(space).ok_or(ENOMEM)?);
     own.linux = Some(thread);
-    let mut info = Info::new(0, pid, pid, "linux-pager".to_string());
+    let mut info = Info::new("linux-pager".to_string());
     info.exe = String::from("/sbin/linux");
-    let group = ThreadGroup::new(pid, info, Default::default()).ok_or(ENOMEM)?;
-    // Protected from signals of programs, as the servers are.
+    let group = ThreadGroup::new(pid, info).ok_or(ENOMEM)?;
+    // A process of the kernel's, as the servers are.
     group.privileged.store(true, Ordering::Relaxed);
     let mm = own.mm.clone();
     let t = new_task(pid, group.clone(), "linux-pager".to_string(), own, start)?;
@@ -843,20 +646,17 @@ fn spawn_with(path: &str, image: loader::Image, server: &Arc<Server>, args: &[St
     let slot = sched::reserve_pid()?;
     let pid = slot.pid;
     // Servers belong to the kernel, even when a program's request
-    // (re)started them, so no program can wait for or signal them.
+    // (re)started them: only the kernel waits for them or ends them.
     let name = basename(path).to_string();
-    let mut info = Info::new(0, pid, pid, name.clone());
+    let mut info = Info::new(name.clone());
     info.cmdline = cmdline_of(args);
     info.exe = path.to_string();
     info.mem = Some(image.space.stats.clone());
     let mut own = Process::empty();
     let frame = Frame::user_start(image.entry, image.sp);
     own.mm = Some(address_space::Mm::new(image.space).ok_or(ENOMEM)?);
-    // A native server writes to the kernel's console.
-    own.files = Some(Files::new(vec![Some(FdEntry::new(OpenFile::console(), false)); 3]).ok_or(ENOMEM)?);
-    own.fs = Some(FsInfo::new("/".to_string()).ok_or(ENOMEM)?);
     own.server = Some(server.clone());
-    let group = ThreadGroup::new(pid, info, Default::default()).ok_or(ENOMEM)?;
+    let group = ThreadGroup::new(pid, info).ok_or(ENOMEM)?;
     group.privileged.store(true, Ordering::Relaxed);
     let t = new_task(pid, group, name, own, frame)?;
     slot.insert(t.clone())?;

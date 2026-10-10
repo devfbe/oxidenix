@@ -1,31 +1,31 @@
 //! Timers: per-CPU queues of deadlines on the monotonic clock, and the
 //! local APIC timer programmed for the earliest one.
 //!
-//! A sleep with a timeout, an interval timer (ITIMER_REAL) and the
-//! scheduler tick are all deadlines in nanoseconds. A deadline is queued
+//! A sleep with a timeout and the scheduler tick are deadlines in
+//! nanoseconds (a Linux program's interval timers are its server's timer
+//! thread's sleeps). A deadline is queued
 //! on the CPU that arms it, and that CPU's local APIC interrupts when the
 //! first one is due: in TSC-deadline mode where the CPU has it (the
 //! interrupt comes when the TSC reaches a value), else with a one-shot
 //! count. A sleep therefore ends when it is due, not at the next tick.
 //!
-//! Cancelling is lazy: the owner of a timer (a task, a process's interval
-//! timer) holds the sequence number of its live arming, and an entry whose
+//! Cancelling is lazy: the task that owns a timer holds the sequence
+//! number of its live arming, and an entry whose
 //! number is no longer current is skipped when it comes up. Entries refer
 //! to their owner weakly, so a stale one keeps no task alive; a task that
 //! ends takes its entries out (`forget`), since even a weak reference
 //! keeps its memory until the entry comes up (a wait with a long timeout
 //! that ended early, as the Linux server's 60 s request timeouts). The queues
-//! never allocate after start-up: there is at most one live entry per task
-//! and per process, a queue holds twice that many, and a full queue drops
-//! its stale entries first. So arming works in interrupt context too.
+//! never allocate after start-up: there is at most one live entry per task,
+//! a queue holds twice that many, and a full queue drops its stale entries
+//! first. So arming works in interrupt context too.
 //!
-//! Nothing re-queues itself from the interrupt (an interval timer is
-//! reloaded when its signal is taken), and the interrupt runs only what is
-//! due when it starts: its work is bounded by the queue's size.
+//! Nothing re-queues itself from the interrupt, and the interrupt runs only
+//! what is due when it starts: its work is bounded by the queue's size.
 
 use crate::interrupts::apic;
 use crate::process::sched::{self, MAX_PROCS};
-use crate::process::task::{State, Task, ThreadGroup};
+use crate::process::task::{State, Task};
 use crate::smp;
 use crate::sync::IrqSpinLock;
 use crate::time;
@@ -37,30 +37,20 @@ use core::sync::atomic::{AtomicU64, Ordering};
 /// The scheduler's time slice and the period of its accounting tick.
 pub const TICK_NS: u64 = time::NSEC_PER_SEC / crate::process::TIMER_HZ;
 
-/// Live entries: one sleep per task, one interval timer per process.
+/// One live sleep per task, and as much room again for stale entries.
 const CAPACITY: usize = 2 * MAX_PROCS + 2;
 
-/// Who a timer belongs to, and what happens when it expires.
-enum Owner {
-    /// A sleeping task is woken.
-    Task(Weak<Task>),
-    /// A process's ITIMER_REAL sends SIGALRM (and reloads itself).
-    Alarm(Weak<ThreadGroup>),
-}
-
+/// A sleeping task's deadline: it is woken when it expires.
 struct Entry {
     deadline: u64,
     seq: u64,
-    owner: Owner,
+    task: Weak<Task>,
 }
 
 impl Entry {
-    /// The owner's sequence number of its live arming (0: none).
+    /// Whether this is the task's live arming.
     fn live(&self) -> bool {
-        match &self.owner {
-            Owner::Task(t) => t.upgrade().is_some_and(|t| t.timer_seq.load(Ordering::Acquire) == self.seq),
-            Owner::Alarm(g) => g.upgrade().is_some_and(|g| g.alarm_seq.load(Ordering::Acquire) == self.seq),
-        }
+        self.task.upgrade().is_some_and(|t| t.timer_seq.load(Ordering::Acquire) == self.seq)
     }
 }
 
@@ -188,7 +178,7 @@ pub fn wake_at(task: &Arc<Task>, deadline: u64) {
     let seq = next_seq();
     task.timer_seq.store(seq, Ordering::Release);
     task.timer_cpus.fetch_or(1 << smp::cpu().index, Ordering::Relaxed);
-    queue(Entry { deadline, seq, owner: Owner::Task(Arc::downgrade(task)) });
+    queue(Entry { deadline, seq, task: Arc::downgrade(task) });
 }
 
 pub fn disarm(task: &Task) {
@@ -202,31 +192,7 @@ pub fn forget(task: &Task) {
     let cpus = task.timer_cpus.swap(0, Ordering::AcqRel);
     for i in (0..smp::MAX_CPUS).filter(|i| cpus & 1 << i != 0) {
         let Some(c) = smp::by_index(i) else { continue };
-        c.timers.lock().heap.retain(|e| !matches!(&e.owner, Owner::Task(t) if core::ptr::eq(t.as_ptr(), task)));
-    }
-}
-
-/// Arms `group`'s interval timer for `deadline`; the caller holds the
-/// group's signal lock, which serializes this with the timer's expiry.
-pub fn arm_alarm(group: &Arc<ThreadGroup>, deadline: u64) {
-    let seq = next_seq();
-    group.alarm_seq.store(seq, Ordering::Release);
-    group.alarm_cpus.fetch_or(1 << smp::cpu().index, Ordering::Relaxed);
-    queue(Entry { deadline, seq, owner: Owner::Alarm(Arc::downgrade(group)) });
-}
-
-/// Cancels `group`'s interval timer (under its signal lock).
-pub fn disarm_alarm(group: &ThreadGroup) {
-    group.alarm_seq.store(0, Ordering::Release);
-}
-
-/// Takes the entries of `group`'s interval timer out of the queues: the
-/// process ended (as `forget` for a task).
-pub fn forget_alarm(group: &ThreadGroup) {
-    let cpus = group.alarm_cpus.swap(0, Ordering::AcqRel);
-    for i in (0..smp::MAX_CPUS).filter(|i| cpus & 1 << i != 0) {
-        let Some(c) = smp::by_index(i) else { continue };
-        c.timers.lock().heap.retain(|e| !matches!(&e.owner, Owner::Alarm(g) if core::ptr::eq(g.as_ptr(), group)));
+        c.timers.lock().heap.retain(|e| !core::ptr::eq(e.task.as_ptr(), task));
     }
 }
 
@@ -278,18 +244,9 @@ pub fn interrupt(from_user: bool) -> bool {
 /// Runs an expired entry if it is still live. Returns whether it woke a
 /// task.
 fn expire(entry: Entry) -> bool {
-    match &entry.owner {
-        Owner::Task(t) => {
-            let Some(task) = t.upgrade() else { return false };
-            if task.timer_seq.compare_exchange(entry.seq, 0, Ordering::AcqRel, Ordering::Relaxed).is_err() {
-                return false;
-            }
-            sched::try_wake(&task, State::Sleeping)
-        }
-        Owner::Alarm(g) => {
-            let Some(group) = g.upgrade() else { return false };
-            crate::process::signal::alarm_expired(&group, entry.seq, entry.deadline);
-            false
-        }
+    let Some(task) = entry.task.upgrade() else { return false };
+    if task.timer_seq.compare_exchange(entry.seq, 0, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+        return false;
     }
+    sched::try_wake(&task, State::Sleeping)
 }

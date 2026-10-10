@@ -1,7 +1,9 @@
 //! Clocks and sleeping (phase R5): clock_gettime, clock_getres,
 //! gettimeofday, time, nanosleep, clock_nanosleep and sched_yield, over the
-//! kernel's clock and deadline sleep. Setting the clock stays with the
-//! kernel for now.
+//! kernel's clocks (`SYS_CLOCK_READ`: wall, monotonic, the caller's own CPU
+//! time; Linux's clock ids map to them here) and deadline sleep; and
+//! setting the wall clock (clock_settime, settimeofday: `SYS_CLOCK_SET`,
+//! R9).
 
 use crate::syscall;
 use crate::usercopy;
@@ -16,7 +18,11 @@ const EOPNOTSUPP: i64 = 95;
 
 const CLOCK_REALTIME: i64 = 0;
 const CLOCK_MONOTONIC: i64 = 1;
+const CLOCK_PROCESS_CPUTIME_ID: i64 = 2;
 const CLOCK_THREAD_CPUTIME_ID: i64 = 3;
+const CLOCK_MONOTONIC_RAW: i64 = 4;
+const CLOCK_REALTIME_COARSE: i64 = 5;
+const CLOCK_MONOTONIC_COARSE: i64 = 6;
 const CLOCK_BOOTTIME: i64 = 7;
 const CLOCK_REALTIME_ALARM: i64 = 8;
 const CLOCK_BOOTTIME_ALARM: i64 = 9;
@@ -26,14 +32,16 @@ const TIMER_ABSTIME: u64 = 1;
 const SYS_SCHED_YIELD: u64 = 24;
 const SYS_NANOSLEEP: u64 = 35;
 const SYS_GETTIMEOFDAY: u64 = 96;
+const SYS_SETTIMEOFDAY: u64 = 164;
 const SYS_TIME: u64 = 201;
+const SYS_CLOCK_SETTIME: u64 = 227;
 const SYS_CLOCK_GETTIME: u64 = 228;
 const SYS_CLOCK_GETRES: u64 = 229;
 const SYS_CLOCK_NANOSLEEP: u64 = 230;
 
 /// The wall-clock time now, for file timestamps.
 pub fn realtime() -> vfs::stat::Time {
-    let ns = syscall(SYS_CLOCK_READ, [CLOCK_REALTIME as u64, 0, 0, 0, 0, 0]).max(0) as u64;
+    let ns = syscall(SYS_CLOCK_READ, [CLOCK_WALL, 0, 0, 0, 0, 0]).max(0) as u64;
     vfs::stat::Time { sec: (ns / NSEC_PER_SEC) as i64, nsec: (ns % NSEC_PER_SEC) as u32 }
 }
 
@@ -44,6 +52,8 @@ pub fn handle(s: &State) -> Option<i64> {
         SYS_CLOCK_GETTIME => clock_gettime(a0, a1),
         SYS_CLOCK_GETRES => clock_getres(a0, a1),
         SYS_GETTIMEOFDAY => gettimeofday(a0, a1),
+        SYS_SETTIMEOFDAY => settimeofday(a0),
+        SYS_CLOCK_SETTIME => clock_settime(a0, a1),
         SYS_TIME => time(a0),
         SYS_NANOSLEEP => clock_nanosleep(CLOCK_MONOTONIC as u64, 0, a0, a1),
         SYS_CLOCK_NANOSLEEP => clock_nanosleep(a0, a1, a2, a3),
@@ -53,45 +63,86 @@ pub fn handle(s: &State) -> Option<i64> {
     Some(result.unwrap_or_else(|e| -e))
 }
 
-/// The clock `id`: the kernel's, but the CPU clock of another process or thread, whose
-/// id is the instance's (Linux's encoding: `!pid << 3`, bit 2 a thread, the low two bits
-/// what is counted). A thread's clock is only its own process's threads' (Linux's
-/// lookup_task).
+/// The clock with Linux's id `id`, in nanoseconds: the kernel's wall and monotonic clocks
+/// (nothing suspends, so boot time is monotonic time; the coarse and raw clocks are the
+/// precise ones; TAI is the wall clock), the caller's own CPU clocks, or the CPU clock of a
+/// process or thread by its id in the instance (Linux's encoding: `!pid << 3`, bit 2 a
+/// thread, the low two bits what is counted; pid 0 the caller). A thread's clock is only
+/// its own process's threads' (Linux's lookup_task).
 fn clock(id: u64) -> Result<u64, i64> {
     let signed = id as i32 as i64;
-    if signed < 0 {
-        let pid = !(signed >> 3) as u32;
-        if pid != 0 {
-            let what = signed & 3;
-            if what == 3 {
+    let kernel = match signed {
+        CLOCK_REALTIME | CLOCK_REALTIME_COARSE | CLOCK_REALTIME_ALARM | CLOCK_TAI => CLOCK_WALL,
+        CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_MONOTONIC_COARSE | CLOCK_BOOTTIME | CLOCK_BOOTTIME_ALARM => CLOCK_MONO,
+        CLOCK_PROCESS_CPUTIME_ID => CLOCK_PROCESS_CPU,
+        CLOCK_THREAD_CPUTIME_ID => CLOCK_THREAD_CPU,
+        id if id < 0 => return cpu_clock(id),
+        _ => return Err(EINVAL),
+    };
+    let ns = syscall(SYS_CLOCK_READ, [kernel, 0, 0, 0, 0, 0]);
+    if ns < 0 { Err(-ns) } else { Ok(ns as u64) }
+}
+
+/// The CPU clock `id` (negative: see `clock`) of a process or thread.
+fn cpu_clock(id: i64) -> Result<u64, i64> {
+    let pid = !(id >> 3) as u32;
+    let what = id & 3;
+    if what == 3 {
+        return Err(EINVAL);
+    }
+    let (user, system, run) = if id & 4 != 0 {
+        // 0 is the caller to the kernel.
+        let key = if pid == 0 {
+            0
+        } else {
+            if crate::process::PROCS.lock().threads.get(&pid).is_none_or(|t| t.pid != crate::local::pid()) {
                 return Err(EINVAL);
             }
-            let (user, system, run) = if signed & 4 != 0 {
-                if crate::process::PROCS.lock().threads.get(&pid).is_none_or(|t| t.pid != crate::local::pid()) {
-                    return Err(EINVAL);
-                }
-                let key = crate::process::key_of(pid).ok_or(EINVAL)?;
-                let mut info = ThreadInfo::default();
-                if syscall(SYS_THREAD_INFO, [key, &mut info as *mut ThreadInfo as u64, 0, 0, 0, 0]) < 0 {
-                    return Err(EINVAL);
-                }
-                (info.user_ns, info.system_ns, info.run_ns)
-            } else {
-                let handle = crate::process::handle_of(pid).ok_or(EINVAL)?;
-                let mut info = ProcInfo::default();
-                syscall(SYS_PROC_INFO, [handle, &mut info as *mut ProcInfo as u64, 0, 0, 0, 0]);
-                (info.user_ns, info.system_ns, info.user_ns + info.system_ns)
-            };
-            // CPUCLOCK_PROF, CPUCLOCK_VIRT, CPUCLOCK_SCHED.
-            return Ok(match what {
-                0 => user + system,
-                1 => user,
-                _ => run,
-            });
+            crate::process::key_of(pid).ok_or(EINVAL)?
+        };
+        let mut info = ThreadInfo::default();
+        if syscall(SYS_THREAD_INFO, [key, &mut info as *mut ThreadInfo as u64, 0, 0, 0, 0]) < 0 {
+            return Err(EINVAL);
         }
+        (info.user_ns, info.system_ns, info.run_ns)
+    } else {
+        let handle = if pid == 0 { 0 } else { crate::process::handle_of(pid).ok_or(EINVAL)? };
+        let mut info = ProcInfo::default();
+        if syscall(SYS_PROC_INFO, [handle, &mut info as *mut ProcInfo as u64, 0, 0, 0, 0]) < 0 {
+            return Err(EINVAL);
+        }
+        (info.user_ns, info.system_ns, info.user_ns + info.system_ns)
+    };
+    // CPUCLOCK_PROF, CPUCLOCK_VIRT, CPUCLOCK_SCHED.
+    Ok(match what {
+        0 => user + system,
+        1 => user,
+        _ => run,
+    })
+}
+
+/// clock_settime(clock, ts): only the wall clock can be set (every other clock EINVAL).
+fn clock_settime(id: u64, ts: u64) -> Result<i64, i64> {
+    if id as i32 as i64 != CLOCK_REALTIME {
+        return Err(EINVAL);
     }
-    let ns = syscall(SYS_CLOCK_READ, [id, 0, 0, 0, 0, 0]);
-    if ns < 0 { Err(-ns) } else { Ok(ns as u64) }
+    let ns = read_timespec(ts)?;
+    syscall(SYS_CLOCK_SET, [ns, 0, 0, 0, 0, 0]);
+    Ok(0)
+}
+
+/// settimeofday(tv, tz): the wall clock from a timeval (the time zone is ignored, as
+/// Linux's warp_clock aside).
+fn settimeofday(tv: u64) -> Result<i64, i64> {
+    if tv != 0 {
+        let [sec, usec]: [i64; 2] = usercopy::read(tv)?;
+        if sec < 0 || !(0..1_000_000).contains(&usec) {
+            return Err(EINVAL);
+        }
+        let ns = (sec as u64).saturating_mul(NSEC_PER_SEC).saturating_add(usec as u64 * 1000);
+        syscall(SYS_CLOCK_SET, [ns, 0, 0, 0, 0, 0]);
+    }
+    Ok(0)
 }
 
 fn timespec(ns: u64) -> [u64; 2] {

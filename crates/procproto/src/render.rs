@@ -1,7 +1,7 @@
 //! The text formats of Linux's /proc files (proc(5)): the system-wide ones
 //! procfs serves (`stat`, `meminfo`, `loadavg`, `uptime`, `counters`) and a
-//! process's own the Linux server makes (`<pid>/stat`, `statm`, `status`,
-//! `counters`), from the kernel's records. Pure functions, tested on the
+//! process's own the Linux server makes (`<pid>/stat`, `statm`, `status`),
+//! from the kernel's records. Pure functions, tested on the
 //! host (`cargo test -p procproto`).
 
 use crate::*;
@@ -160,7 +160,6 @@ pub fn counters(c: &Counters) -> String {
     let mut out = String::new();
     for (key, value) in [
         ("syscalls", c.syscalls),
-        ("legacy_calls", c.legacy_calls),
         ("ipc_calls", c.ipc_calls),
         ("ipc_bytes", c.ipc_bytes),
         ("address_space_switches", c.address_space_switches),
@@ -252,9 +251,3 @@ pub fn pid_status(p: &Process, m: &Machine, l: &Linux) -> String {
     out
 }
 
-/// /proc/<pid>/counters (oxidenix's own): the counters of /proc/counters
-/// the kernel keeps per process, in the same format, so that a program can
-/// measure its own calls while others run.
-pub fn pid_counters(p: &Process) -> String {
-    format!("legacy_calls {}\n", p.legacy_calls)
-}

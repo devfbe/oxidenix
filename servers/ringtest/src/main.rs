@@ -78,15 +78,12 @@ fn after_exec(args: &[&str]) -> i32 {
     0
 }
 
-/// execve(2) of this program with `args`.
+/// Runs this program again with `args` (the kernel's `EXEC`).
 fn exec_self(args: &[&str]) -> i64 {
-    const EXECVE: u64 = 59;
-    let path = b"/sbin/ringtest\0";
     let strings: Vec<Vec<u8>> = args.iter().map(|a| a.bytes().chain(core::iter::once(0)).collect()).collect();
     let mut argv: Vec<u64> = strings.iter().map(|s| s.as_ptr() as u64).collect();
     argv.push(0);
-    let envp = [0u64];
-    oxrt::syscall(EXECVE, [path.as_ptr() as u64, argv.as_ptr() as u64, envp.as_ptr() as u64, 0, 0, 0])
+    oxrt::syscall(oxrt::sys::EXEC, [argv.as_ptr() as u64, 0, 0, 0, 0, 0])
 }
 
 fn main(args: Vec<&'static str>) -> i32 {
@@ -241,9 +238,8 @@ fn handle(channel: u64, base: *mut u8, layout: &Layout, d: &Desc, mapped: &mut V
             if oxrt::mprotect(m.addr, len, PROT_READ | PROT_EXEC) != Err(-EACCES) {
                 return Ok(2);
             }
-            // The kernel stores a timespec there for us: it must refuse.
-            const CLOCK_MONOTONIC: u64 = 1;
-            if oxrt::syscall(oxrt::sys::CLOCK_GETTIME, [CLOCK_MONOTONIC, m.addr as u64, 0, 0, 0, 0]) != -EFAULT {
+            // The kernel stores random bytes there for us: it must refuse.
+            if oxrt::syscall(oxrt::sys::RANDOM, [m.addr as u64, 8, 0, 0, 0, 0]) != -EFAULT {
                 return Ok(3);
             }
             let _ = unsafe { m.addr.read_volatile() };
@@ -298,8 +294,7 @@ fn handle(channel: u64, base: *mut u8, layout: &Layout, d: &Desc, mapped: &mut V
             if oxrt::mprotect(base, PAGE as usize, PROT_READ | PROT_WRITE) != Err(-EACCES) {
                 return Ok(1);
             }
-            const CLOCK_MONOTONIC: u64 = 1;
-            if oxrt::syscall(oxrt::sys::CLOCK_GETTIME, [CLOCK_MONOTONIC, base as u64, 0, 0, 0, 0]) != -EFAULT {
+            if oxrt::syscall(oxrt::sys::RANDOM, [base as u64, 8, 0, 0, 0, 0]) != -EFAULT {
                 return Ok(2);
             }
             Ok(0)
@@ -314,10 +309,8 @@ fn handle(channel: u64, base: *mut u8, layout: &Layout, d: &Desc, mapped: &mut V
                     return Ok(1);
                 }
             }
-            // FUTEX_REQUEUE (shared): wake none, move all to another word.
-            const FUTEX_REQUEUE: u64 = 3;
-            let moved = oxrt::syscall(oxrt::sys::FUTEX, [tail as *const _ as u64, FUTEX_REQUEUE, 0, i32::MAX as u64, other as *const _ as u64, 0]);
-            if moved != 0 {
+            // A requeue (shared): wake none, move all to another word.
+            if oxrt::futex_requeue(tail, 0, i32::MAX as u32, other) != Ok(0) {
                 return Ok(2);
             }
             if oxrt::futex_wake(tail, i32::MAX as u32) != Ok(1) {

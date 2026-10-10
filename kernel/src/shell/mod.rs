@@ -7,14 +7,14 @@ use heapless::{String, Vec};
 pub fn run() -> ! {
     // Test mode: the builder links /etc/autorun to the test script; its exit
     // status becomes QEMU's (1 = success, 3 = failure).
-    if crate::fs::resolve("/", "/etc/autorun", true).is_ok() {
+    if crate::fs::program("/etc/autorun").is_some() {
         crate::printkln!("[autorun] running /etc/autorun");
         let ok = matches!(commands::run_program(&["sh", "/etc/autorun"]), Some(crate::process::WaitStatus::Exited(0)));
         crate::printkln!("[autorun] {}", if ok { "success" } else { "failure" });
         settle();
         crate::power_off(if ok { 0 } else { 1 });
     }
-    let shell = if crate::fs::resolve("/", "/bin/bash", true).is_ok() { "bash" } else { "sh" };
+    let shell = if crate::fs::program("/bin/bash").is_some() { "bash" } else { "sh" };
     crate::printkln!("\x1b[1;33m  oxidenix\x1b[0m - a Unix-like kernel in Rust, built with AI");
     crate::printkln!("  starting /bin/{} ('exit' returns to the kernel monitor)\n", shell);
     commands::run_program(&[shell]);
@@ -73,7 +73,7 @@ pub fn settle() {
     let deadline = now() + SETTLE;
     if !ended {
         crate::printkln!("[kernel] a Linux server instance did not end; its caches may not be written back. Still there:");
-        for (pid, _, name, state, server, _, _) in crate::process::list() {
+        for (pid, name, state, server, _, _) in crate::process::list() {
             if !server || name == "linux-pager" {
                 crate::printkln!("  {} {} ({})", pid, name, state);
             }

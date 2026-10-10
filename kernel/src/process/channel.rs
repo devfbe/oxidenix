@@ -369,8 +369,8 @@ impl Channel {
         };
         self.inner.lock().offer_request = Some(id);
         // Done once the service attached (it need not have answered),
-        // answered, or died; a signal (always a fatal one) gives the offer
-        // up unless the service attached, and so does a service that neither
+        // answered, or died; the caller's end (its kick, or its death)
+        // gives the offer up unless the service attached, and so does a service that neither
         // attaches nor answers within `OFFER_TIMEOUT` (a live but stalled
         // service never holds the caller, which may hold the Linux server's
         // lock of its channel, for good).
@@ -383,7 +383,7 @@ impl Channel {
             if let Some(answer) = ipc::take_reply(id) {
                 break Some(answer);
             }
-            if super::signal::interrupted() || super::signal::dying() {
+            if super::kill::interrupted() || super::kill::dying() {
                 break Some(Err(EINTR));
             }
             if crate::time::now() >= deadline {

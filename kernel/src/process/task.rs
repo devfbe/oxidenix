@@ -1,24 +1,21 @@
 //! Tasks and thread groups.
 //!
 //! A task is one thread as the scheduler sees it (or a CPU's idle loop); a
-//! thread group is a process: the tasks that share a process id, signal
-//! handlers and pending process signals, relations, and the exit status.
-//! Like on Linux, what threads share beyond that is chosen by clone flags:
-//! address space (`Mm`), descriptor table (`Files`) and working directory
-//! (`FsInfo`) are separate shared objects that a task holds references to.
+//! thread group is a process: a container of threads that share an id, an
+//! address space (`Mm`) and their end (the kernel's processes are
+//! containers, ADR 0010: a Linux program's relations, signals, descriptors
+//! and working directory are its server's).
 //!
 //! A task's state splits by who may touch it:
-//! - `Process` (references to those objects, I/O permissions, the futex
-//!   word to clear at exit) belongs to the task itself: only the CPU
-//!   running it, or the CPU switching to or from it, may use it.
-//! - `sig` (its signal mask and pending signals) is locked, after the
-//!   group's signal lock.
+//! - `Process` (its address space, I/O permissions, the futex word to
+//!   clear at exit, its place in restricted mode) belongs to the task
+//!   itself: only the CPU running it, or the CPU switching to or from it,
+//!   may use it.
 //! - The scheduling fields are atomics, written under `wake_lock`.
 
 use super::address_space::Mm;
-use super::signal::{GroupSignals, ThreadSignals};
-use super::{FdEntry, Pid, Server};
-use crate::fs::file::OpenFile;
+use super::kill::GroupExit;
+use super::{Pid, Server};
 use crate::interrupts::gdt;
 use crate::sync::IrqSpinLock;
 use alloc::boxed::Box;
@@ -50,12 +47,10 @@ pub enum State {
     Running = 0,
     /// Waiting in a run queue.
     Runnable = 1,
-    /// Waiting for `wakeup` of its channel, its deadline or a signal.
+    /// Waiting for `wakeup` of its channel, its deadline or a kick.
     Sleeping = 2,
-    /// Stopped by a signal until SIGCONT (or SIGKILL).
-    Stopped = 3,
     /// Exited; never runs again.
-    Dead = 4,
+    Dead = 3,
 }
 
 impl State {
@@ -64,7 +59,6 @@ impl State {
             0 => State::Running,
             1 => State::Runnable,
             2 => State::Sleeping,
-            3 => State::Stopped,
             _ => State::Dead,
         }
     }
@@ -72,73 +66,48 @@ impl State {
 
 /// Process information, shared by the threads and locked.
 pub struct Info {
-    pub ppid: Pid,
-    pub pgid: Pid,
-    pub sid: Pid,
     /// Process name (the main thread's name).
     pub name: String,
     /// Wait status once the last thread exited (exit code << 8, or the
-    /// signal number): the process is a zombie until its parent reaps it.
+    /// number of the signal it died of): a process of the kernel's stays a
+    /// zombie until the kernel reaps it.
     pub exit_status: Option<i32>,
-    /// Stop/continue event not yet collected by the parent's wait4.
-    pub report: Option<i32>,
     /// Exit status of the main thread if it exited on its own (the
     /// process's status unless a group exit sets one).
     pub main_status: Option<i32>,
-    /// Signal the parent gets when the process ends (SIGCHLD; 0: none).
-    pub exit_signal: u32,
-    /// prctl state: signal sent when the parent dies (0: none), core
-    /// dumps allowed, no new privileges (kept across fork and exec).
-    pub pdeath_sig: u32,
-    pub dumpable: bool,
-    pub no_new_privs: bool,
     /// Arguments of the running program, NUL-terminated (capped at 4 KiB),
-    /// and its absolute path.
+    /// and its absolute path (for the monitor).
     pub cmdline: Vec<u8>,
     pub exe: String,
     /// Page counts of its address space (None for kernel tasks and zombies).
     pub mem: Option<Arc<super::address_space::MemStats>>,
     /// Live threads, in creation order.
     pub threads: Vec<Arc<Task>>,
-    /// CPU time in nanoseconds (user, system) of threads that exited, and
-    /// of reaped children (with their own reaped children).
+    /// CPU time in nanoseconds (user, system) of threads that exited.
     pub dead_time: (u64, u64),
-    pub children_time: (u64, u64),
     /// The most pages it ever had resident, kept when its address space
-    /// goes at exit (wait4's ru_maxrss), and the most of its reaped
-    /// children's (with theirs).
+    /// goes (for the Linux server's `proc_info`).
     pub peak_pages: u64,
-    pub children_peak: u64,
 }
 
 impl Info {
     /// (user, system) CPU time in nanoseconds of the whole process: live
-    /// and exited threads, not children.
+    /// and exited threads.
     pub fn cputime(&self) -> (u64, u64) {
         self.threads.iter().map(|t| t.cputime()).fold(self.dead_time, |a, b| (a.0 + b.0, a.1 + b.1))
     }
 
-    pub fn new(ppid: super::Pid, pgid: super::Pid, sid: super::Pid, name: String) -> Info {
+    pub fn new(name: String) -> Info {
         Info {
-            ppid,
-            pgid,
-            sid,
             name,
             exit_status: None,
-            report: None,
             main_status: None,
-            exit_signal: super::signal::SIGCHLD,
-            pdeath_sig: 0,
-            dumpable: true,
-            no_new_privs: false,
             cmdline: Vec::new(),
             exe: String::new(),
             mem: None,
             threads: Vec::new(),
             dead_time: (0, 0),
-            children_time: (0, 0),
             peak_pages: 0,
-            children_peak: 0,
         }
     }
 }
@@ -147,27 +116,16 @@ impl Info {
 pub struct ThreadGroup {
     pub tgid: Pid,
     /// Servers started by the kernel: may register IPC services and ask
-    /// for I/O ports; protected from user signals.
+    /// for I/O ports.
     pub privileged: AtomicBool,
     pub start_ticks: u64,
     pub info: IrqSpinLock<Info>,
-    /// Handlers, pending process signals, the interval timer, and group
-    /// stops and exits. Taken before any thread's `sig`.
-    pub sig: IrqSpinLock<GroupSignals>,
-    /// Sequence number of the live arming of the interval timer (0: off),
-    /// changed under `sig`.
-    pub alarm_seq: AtomicU64,
-    /// CPUs whose timer queues it armed its interval timer on.
-    pub alarm_cpus: AtomicU64,
+    /// Whether it is ending (taken after `info`).
+    pub exit: IrqSpinLock<GroupExit>,
     /// The id of the Linux server instance whose tree the process belongs
     /// to (`linux::Instance::id`; 0: none, a server of the kernel's or the
     /// instance's pager). Set when its first thread is made.
     pub instance: AtomicU64,
-    /// Linux system calls of this process the Linux server passed back to
-    /// the kernel (`linux::legacy`): the process's share of the counter in
-    /// `/proc/counters`, which `/proc/<pid>/counters` shows, so that a
-    /// program can count its own calls whatever else runs.
-    pub legacy_calls: AtomicU64,
     /// A process the Linux server made (`SYS_PROC_CREATE`): the server
     /// reaps it, so it leaves the kernel's tables when its last thread
     /// ends (no zombie of the kernel's).
@@ -179,17 +137,14 @@ pub struct ThreadGroup {
 }
 
 impl ThreadGroup {
-    pub fn new(tgid: Pid, info: Info, sig: GroupSignals) -> Option<Arc<ThreadGroup>> {
+    pub fn new(tgid: Pid, info: Info) -> Option<Arc<ThreadGroup>> {
         Arc::try_new(ThreadGroup {
             tgid,
             privileged: AtomicBool::new(false),
             start_ticks: super::sched::ticks(),
             info: IrqSpinLock::new(info),
-            sig: IrqSpinLock::new(sig),
-            alarm_seq: AtomicU64::new(0),
-            alarm_cpus: AtomicU64::new(0),
+            exit: IrqSpinLock::new(GroupExit::None),
             instance: AtomicU64::new(0),
-            legacy_calls: AtomicU64::new(0),
             server_reaps: AtomicBool::new(false),
             killed_by_kernel: AtomicU64::new(0),
         })
@@ -206,148 +161,19 @@ pub struct CpuState {
     pub fpu: Box<FpuState>,
 }
 
-/// A descriptor table, shared by the tasks cloned with CLONE_FILES.
-/// Descriptors are taken out under the lock and dropped after it: closing
-/// a file may wake others or talk to a server. A Linux program has none
-/// (its descriptors are its server's, `servers/linux/src/fdtable.rs`).
-pub struct Files {
-    fds: IrqSpinLock<Vec<Option<FdEntry>>>,
-}
-
-/// Most descriptors a process may have open: RLIMIT_NOFILE, which
-/// `prlimit` reports (Linux's default hard limit). The table grows as
-/// descriptors are used.
-pub const MAX_FDS: usize = 4096;
-
-impl Files {
-    pub fn new(fds: Vec<Option<FdEntry>>) -> Option<Arc<Files>> {
-        Arc::try_new(Files { fds: IrqSpinLock::new(fds) }).ok()
-    }
-
-    /// A copy for a new process (fork), or for exec of a shared table.
-    pub fn duplicate(&self) -> Option<Arc<Files>> {
-        // Memory is reserved outside the lock, for the table's length as it
-        // was; if it grew meanwhile, again.
-        let mut copy = Vec::new();
-        loop {
-            let len = self.fds.lock().len();
-            copy.try_reserve_exact(len).ok()?;
-            let fds = self.fds.lock();
-            if fds.len() <= copy.capacity() {
-                copy.extend(fds.iter().cloned());
-                break;
-            }
-        }
-        Files::new(copy)
-    }
-
-    pub fn get(&self, fd: u64) -> Result<Arc<OpenFile>, i64> {
-        self.fds.lock().get(fd as usize).and_then(|e| e.as_ref()).map(|e| e.file().clone()).ok_or(super::errno::EBADF)
-    }
-
-    /// Installs `file` at the lowest free descriptor >= `min`.
-    pub fn alloc(&self, file: Arc<OpenFile>, cloexec: bool, min: usize) -> Result<i64, i64> {
-        let mut fds = self.fds.lock();
-        let fd = (min..MAX_FDS).find(|&i| fds.get(i).is_none_or(|e| e.is_none())).ok_or(super::errno::EMFILE)?;
-        if fds.len() <= fd {
-            let more = fd + 1 - fds.len();
-            fds.try_reserve(more).map_err(|_| super::errno::ENOMEM)?;
-            fds.resize(fd + 1, None);
-        }
-        fds[fd] = Some(FdEntry::new(file, cloexec));
-        Ok(fd as i64)
-    }
-
-    /// Puts `entry` at `fd`; returns what was there (for the caller to drop
-    /// after the lock).
-    pub fn replace(&self, fd: u64, entry: FdEntry) -> Result<Option<FdEntry>, i64> {
-        if fd as usize >= MAX_FDS {
-            return Err(super::errno::EBADF);
-        }
-        let mut fds = self.fds.lock();
-        if fds.len() <= fd as usize {
-            let more = fd as usize + 1 - fds.len();
-            fds.try_reserve(more).map_err(|_| super::errno::ENOMEM)?;
-            fds.resize(fd as usize + 1, None);
-        }
-        Ok(fds[fd as usize].replace(entry))
-    }
-
-    pub fn take(&self, fd: u64) -> Option<FdEntry> {
-        self.fds.lock().get_mut(fd as usize).and_then(|e| e.take())
-    }
-
-    pub fn cloexec(&self, fd: u64) -> Result<bool, i64> {
-        self.fds.lock().get(fd as usize).and_then(|e| e.as_ref()).map(|e| e.cloexec).ok_or(super::errno::EBADF)
-    }
-
-    pub fn set_cloexec(&self, fd: u64, on: bool) -> Result<(), i64> {
-        let mut fds = self.fds.lock();
-        fds.get_mut(fd as usize).and_then(|e| e.as_mut()).ok_or(super::errno::EBADF)?.cloexec = on;
-        Ok(())
-    }
-
-    /// Takes out the descriptors marked close-on-exec (to drop after the lock).
-    pub fn take_cloexec(&self) -> Vec<FdEntry> {
-        // Room for every descriptor of the table, reserved outside the lock
-        // (a descriptor that does not fit, should the table have grown
-        // meanwhile and memory run out, stays open).
-        let mut out = Vec::new();
-        let len = self.fds.lock().len();
-        let _ = out.try_reserve_exact(len);
-        let mut fds = self.fds.lock();
-        if fds.len() > out.capacity() {
-            drop(fds);
-            let _ = out.try_reserve_exact(MAX_FDS);
-            fds = self.fds.lock();
-        }
-        for e in fds.iter_mut() {
-            if e.as_ref().is_some_and(|e| e.cloexec) && out.len() < out.capacity() {
-                out.push(e.take().expect("checked"));
-            }
-        }
-        out
-    }
-}
-
-/// Working directory, shared by the tasks cloned with CLONE_FS (the
-/// kernel's native servers; a Linux program's is its server's).
-pub struct FsInfo {
-    cwd: IrqSpinLock<String>,
-}
-
-impl FsInfo {
-    pub fn new(cwd: String) -> Option<Arc<FsInfo>> {
-        Arc::try_new(FsInfo { cwd: IrqSpinLock::new(cwd) }).ok()
-    }
-
-    pub fn cwd(&self) -> String {
-        self.cwd.lock().clone()
-    }
-
-    pub fn set_cwd(&self, cwd: String) {
-        let old = core::mem::replace(&mut *self.cwd.lock(), cwd);
-        drop(old);
-    }
-}
-
 /// State owned by the task itself (see the module comment).
 pub struct Process {
     /// The address space (None for kernel tasks and after exit).
     pub mm: Option<Arc<Mm>>,
-    /// Descriptors and working directory (None only after exit).
-    pub files: Option<Arc<Files>>,
-    pub fs: Option<Arc<FsInfo>>,
     /// I/O permission bitmap (0 = allowed) installed in the TSS while
     /// this task runs (per thread, as ioperm is on Linux).
     pub io_bitmap: Option<Box<[u8; gdt::IOMAP_BYTES]>>,
     /// The server this task runs, with the resources assigned to it.
     pub server: Option<Arc<Server>>,
-    /// CLONE_CHILD_CLEARTID / set_tid_address: cleared and woken (futex)
-    /// when the task exits, which is how a thread is joined.
+    /// A Linux program's CLONE_CHILD_CLEARTID word (`SYS_THREAD_CREATE`,
+    /// `SYS_THREAD_CLEARTID`): cleared and woken (futex) when the task
+    /// exits, which is how a thread is joined.
     pub clear_child_tid: u64,
-    /// A vfork parent sleeps until this is set: the child exec'd or exited.
-    pub vfork_done: Option<Arc<AtomicBool>>,
     /// A thread of a Linux program: its place in restricted mode.
     pub linux: Option<super::linux::LinuxThread>,
     /// A service's copy routine on granted memory (`channel::set_copy_fixup`):
@@ -413,10 +239,6 @@ pub struct Task {
     run_since: AtomicU64,
     /// Thread name (comm), at most 15 bytes.
     pub comm: IrqSpinLock<String>,
-    /// Its signal mask and the signals sent to this thread (a task that is
-    /// no Linux program's: the signals of Linux programs are their
-    /// server's, which drives them with the two flags below).
-    pub sig: IrqSpinLock<ThreadSignals>,
     /// A Linux program's thread was kicked (`restricted::SYS_THREAD_KICK`,
     /// Linux's TIF_SIGPENDING): its interruptible waits end, its program
     /// stops at once; cleared only by `restricted_enter`.
@@ -465,7 +287,6 @@ impl Task {
             run_ns: AtomicU64::new(0),
             run_since: AtomicU64::new(0),
             comm: IrqSpinLock::new(comm),
-            sig: IrqSpinLock::new(ThreadSignals::default()),
             kicked: AtomicBool::new(false),
             killed: AtomicBool::new(false),
             kernel_rsp: UnsafeCell::new(kernel_rsp),
@@ -478,7 +299,7 @@ impl Task {
     pub fn idle_task(cpu: usize, kstack: Option<KernelStack>, kernel_rsp: u64) -> Task {
         let id = u64::MAX - cpu as u64;
         let name = alloc::format!("idle/{cpu}");
-        let group = ThreadGroup::new(id, Info::new(0, 0, 0, name.clone()), GroupSignals::default()).expect("idle task at boot");
+        let group = ThreadGroup::new(id, Info::new(name.clone())).expect("idle task at boot");
         let mut t = Task::new(id, group, name, Process::empty(), kstack, kernel_rsp);
         t.idle = true;
         t.state = AtomicU8::new(State::Running as u8);
@@ -487,17 +308,12 @@ impl Task {
 
     /// A kernel thread (see `sched::spawn_kernel_thread`).
     pub fn kernel_thread(id: u64, name: &str, kstack: KernelStack, kernel_rsp: u64) -> Option<Arc<Task>> {
-        let group = ThreadGroup::new(id, Info::new(0, 0, 0, name.into()), GroupSignals::default())?;
+        let group = ThreadGroup::new(id, Info::new(name.into()))?;
         Arc::try_new(Task::new(id, group, name.into(), Process::empty(), Some(kstack), kernel_rsp)).ok()
     }
 
     pub fn tid(&self) -> Pid {
         self.tid.load(Ordering::Relaxed)
-    }
-
-    /// Takes over the main thread's id (exec in another thread).
-    pub fn set_tid(&self, tid: Pid) {
-        self.tid.store(tid, Ordering::Relaxed);
     }
 
     pub fn tgid(&self) -> Pid {
@@ -586,12 +402,9 @@ impl Process {
     pub fn empty() -> Process {
         Process {
             mm: None,
-            files: None,
-            fs: None,
             io_bitmap: None,
             server: None,
             clear_child_tid: 0,
-            vfork_done: None,
             linux: None,
             copy_fixup: None,
         }

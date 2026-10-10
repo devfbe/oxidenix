@@ -19,6 +19,12 @@
 #include <pthread.h>
 #include <sched.h>
 #include <sys/resource.h>
+#include <sys/statfs.h>
+#include <sys/sysmacros.h>
+#include <sys/sysinfo.h>
+#include <sys/utsname.h>
+#include <sys/random.h>
+#include <linux/futex.h>
 #include <setjmp.h>
 #include <signal.h>
 #include <stdint.h>
@@ -48,7 +54,7 @@
 #define TEST_CHANNEL 1514
 #define TEST_DISKRING 1515
 #define TEST_CACHED 1516
-#define TEST_PASS_THROUGH 1517
+/* 1517 was TEST_PASS_THROUGH: nothing passes through to the kernel since R9. */
 #define TEST_SERVER_TICKS 1518
 #define TEST_MKWRITE_FAIL 1519
 
@@ -108,16 +114,166 @@ static int faults(volatile char *p, int write) {
     return got == SIGSEGV;
 }
 
-/* The kernel's count of this process's system calls the server passed back
- * to it (its own, not /proc/counters' for all: other programs running
- * meanwhile do not count). */
-static long legacy_calls(void) {
-    char text[512] = {0};
-    int fd = open("/proc/self/counters", O_RDONLY);
-    read(fd, text, sizeof text - 1);
-    close(fd);
-    char *p = strstr(text, "legacy_calls ");
-    return p ? atol(p + 13) : -1;
+/* A thread's TLS pointer (the FS base), as arch_prctl(ARCH_GET_FS) reads it. */
+static unsigned long fs_base(void) {
+    unsigned long base = 0;
+    syscall(SYS_arch_prctl, 0x1003, &base);
+    return base;
+}
+
+/* arch_prctl without libc: while the FS base is moved, nothing may use the
+ * thread pointer (errno, locks), so these are raw system calls. */
+static long raw_arch_prctl(long code, unsigned long addr) {
+    long r;
+    __asm__ volatile("syscall" : "=a"(r) : "a"((long)SYS_arch_prctl), "D"(code), "S"(addr) : "rcx", "r11", "memory");
+    return r;
+}
+
+/* Moves the FS base by `delta`, reads it, puts it back: whether all of it
+ * worked and the base read was the moved one. */
+static int fs_moved(unsigned long tls, unsigned long delta) {
+    unsigned long seen = 0;
+    long set = raw_arch_prctl(0x1002, tls + delta);
+    long got = raw_arch_prctl(0x1003, (unsigned long)&seen);
+    long back = raw_arch_prctl(0x1002, tls);
+    return set == 0 && got == 0 && back == 0 && seen == tls + delta;
+}
+
+static int futex_word;
+
+static int64_t now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static void *futex_waker(void *arg) {
+    (void)arg;
+    usleep(20 * 1000);
+    __atomic_store_n(&futex_word, 1, __ATOMIC_SEQ_CST);
+    syscall(SYS_futex, &futex_word, FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0);
+    return NULL;
+}
+
+/* R9: every Linux call is the server's; the kernel's mechanisms under the
+ * last ones it implemented (futexes on program memory, the FS base, the wall
+ * clock, power, the system's record) and /dev, now the server's devtmpfs. */
+static void r9_checks(void) {
+    errno = 0;
+    check("nothing passes through: a call the server does not implement is ENOSYS", syscall(335) == -1 && errno == ENOSYS);
+    errno = 0;
+    check("... and the test call that passed one through is gone", syscall(1517) == -1 && errno == ENOSYS);
+    struct timespec short_wait = {0, 2 * 1000 * 1000};
+    int word = 7;
+    errno = 0;
+    check("futex: a wait on a word that changed is EAGAIN", syscall(SYS_futex, &word, FUTEX_WAIT_PRIVATE, 8, NULL, NULL, 0) == -1 && errno == EAGAIN);
+    errno = 0;
+    check("futex: a wait with a timeout ends with ETIMEDOUT", syscall(SYS_futex, &word, FUTEX_WAIT_PRIVATE, 7, &short_wait, NULL, 0) == -1 && errno == ETIMEDOUT);
+    errno = 0;
+    check("futex: an absolute deadline in the past (FUTEX_WAIT_BITSET) too",
+          syscall(SYS_futex, &word, FUTEX_WAIT_BITSET_PRIVATE, 7, &(struct timespec){0, 0}, NULL, FUTEX_BITSET_MATCH_ANY) == -1 && errno == ETIMEDOUT);
+    errno = 0;
+    check("futex: a zero bitset is EINVAL", syscall(SYS_futex, &word, FUTEX_WAIT_BITSET_PRIVATE, 7, NULL, NULL, 0) == -1 && errno == EINVAL);
+    errno = 0;
+    check("futex: an unaligned word is EINVAL", syscall(SYS_futex, (char *)&word + 1, FUTEX_WAKE, 1, NULL, NULL, 0) == -1 && errno == EINVAL);
+    errno = 0;
+    check("futex: the server's memory is EFAULT", syscall(SYS_futex, (int *)0x404000009000, FUTEX_WAKE, 1, NULL, NULL, 0) == -1 && errno == EFAULT);
+    pthread_t waker;
+    futex_word = 0;
+    pthread_create(&waker, NULL, futex_waker, NULL);
+    long waited = 0;
+    while (__atomic_load_n(&futex_word, __ATOMIC_SEQ_CST) == 0 && waited == 0)
+        waited = syscall(SYS_futex, &futex_word, FUTEX_WAIT_PRIVATE, 0, NULL, NULL, 0);
+    pthread_join(waker, NULL);
+    check("futex: a waiter is woken by another thread's FUTEX_WAKE", futex_word == 1 && (waited == 0 || errno == EAGAIN));
+    check("futex: a wake with no waiter wakes none", syscall(SYS_futex, &word, FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0) == 0);
+    unsigned long tls = fs_base();
+    errno = 0;
+    check("arch_prctl: ARCH_GET_FS is the TLS pointer, a pointer above 64 TiB EPERM",
+          tls != 0 && tls == (unsigned long)pthread_self() && syscall(SYS_arch_prctl, 0x1002, 0x400000000000UL) == -1 && errno == EPERM && fs_base() == tls);
+    check("arch_prctl: ARCH_SET_FS and back", fs_moved(tls, 4096) && fs_base() == tls);
+    struct utsname u;
+    check("uname: oxidenix on x86_64", uname(&u) == 0 && strcmp(u.sysname, "oxidenix") == 0 && strcmp(u.machine, "x86_64") == 0);
+    struct sysinfo si;
+    check("sysinfo: uptime, memory and processes", sysinfo(&si) == 0 && si.totalram > 0 && si.freeram <= si.totalram && si.procs > 0 && si.mem_unit == 1);
+    unsigned char rnd[600] = {0};
+    check("getrandom fills more than one piece", getrandom(rnd, sizeof rnd, 0) == (ssize_t)sizeof rnd && memcmp(rnd + 300, rnd + 400, 16) != 0);
+    errno = 0;
+    check("... GRND_RANDOM with GRND_INSECURE is EINVAL", getrandom(rnd, 1, GRND_RANDOM | 4) == -1 && errno == EINVAL);
+    unsigned cpu = 99;
+    check("getcpu names a CPU that runs", syscall(SYS_getcpu, &cpu, NULL, NULL) == 0 && cpu < (unsigned)sysconf(_SC_NPROCESSORS_ONLN));
+    struct timespec mono;
+    clock_gettime(CLOCK_MONOTONIC, &mono);
+    errno = 0;
+    check("clock_settime of the monotonic clock is EINVAL", clock_settime(CLOCK_MONOTONIC, &mono) == -1 && errno == EINVAL);
+    struct timespec wall, back;
+    clock_gettime(CLOCK_REALTIME, &wall);
+    struct timespec later = {wall.tv_sec + 3600, wall.tv_nsec};
+    int set = clock_settime(CLOCK_REALTIME, &later) == 0;
+    clock_gettime(CLOCK_REALTIME, &back);
+    struct timeval tv_back = {wall.tv_sec, 0};
+    check("clock_settime sets the wall clock, settimeofday sets it back",
+          set && back.tv_sec >= later.tv_sec && settimeofday(&tv_back, NULL) == 0 && time(NULL) < later.tv_sec - 1800);
+    struct timespec cpu_now;
+    check("the CPU clocks of the caller, also by pid 0's encoding",
+          clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cpu_now) == 0 && clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_now) == 0
+          && clock_gettime((clockid_t)((~0u << 3) | 2), &cpu_now) == 0 && clock_gettime((clockid_t)((~0u << 3) | 6), &cpu_now) == 0);
+    struct rlimit rl;
+    check("prlimit: an 8 MiB stack, no core files", getrlimit(RLIMIT_STACK, &rl) == 0 && rl.rlim_cur == 8 << 20
+          && getrlimit(RLIMIT_CORE, &rl) == 0 && rl.rlim_cur == 0 && getrlimit(RLIMIT_AS, &rl) == 0 && rl.rlim_cur == RLIM_INFINITY);
+    struct rlimit bad = {10, 5};
+    errno = 0;
+    check("... a soft limit above the hard one is EINVAL, a resource beyond them too",
+          setrlimit(RLIMIT_STACK, &bad) == -1 && errno == EINVAL && syscall(SYS_prlimit64, 0, 16, NULL, &rl) == -1);
+    errno = 0;
+    check("ioperm is EPERM (the tree has no ports)", syscall(SYS_ioperm, 0x80, 1, 1) == -1 && errno == EPERM);
+    errno = 0;
+    check("reboot with a wrong magic number is EINVAL", syscall(SYS_reboot, 0, 0, 0, NULL) == -1 && errno == EINVAL);
+    /* The kernel's range checks on what reaches it (vm.rs): lengths near 2^64,
+     * sums that would wrap, and ranges of tens of TiB looked at in one lookup
+     * (no loop over their pages: each call returns at once). */
+    int64_t t0 = now_ms();
+    errno = 0;
+    check("mmap of a length near 2^64 is ENOMEM", mmap(NULL, (size_t)-4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) == MAP_FAILED && errno == ENOMEM);
+    char *huge_hint = (char *)0x100000000000UL;
+    char *big = mmap(huge_hint, 1UL << 45, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    check("a 32 TiB hint is taken or placed elsewhere in one lookup", big != MAP_FAILED);
+    errno = 0;
+    check("MAP_FIXED_NOREPLACE over a 32 TiB mapping is EEXIST",
+          big != MAP_FAILED && mmap(big + (1UL << 44), 1UL << 44, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0) == MAP_FAILED && errno == EEXIST);
+    errno = 0;
+    check("mremap to a length near 2^64 fails", big != MAP_FAILED && mremap(big, 4096, (size_t)-4096, MREMAP_MAYMOVE) == MAP_FAILED && (errno == ENOMEM || errno == EINVAL));
+    errno = 0;
+    check("mremap to a fixed address whose end wraps is EINVAL",
+          big != MAP_FAILED && mremap(big, 4096, 1UL << 40, MREMAP_MAYMOVE | MREMAP_FIXED, (void *)(-(1L << 39) & ~4095L)) == MAP_FAILED && errno == EINVAL);
+    errno = 0;
+    check("madvise and msync of a range that wraps fail", big != MAP_FAILED && madvise(big, (size_t)-4096, MADV_DONTNEED) == -1 && msync(big, (size_t)-4096, MS_SYNC) == -1);
+    check("madvise(MADV_DONTNEED) of the 32 TiB mapping returns", big != MAP_FAILED && madvise(big, 1UL << 45, MADV_DONTNEED) == 0);
+    if (big != MAP_FAILED) munmap(big, 1UL << 45);
+    int64_t took = now_ms() - t0;
+    printf("    (the range checks took %lld ms)\n", (long long)took);
+    check("... all of it at once (no loop over the pages)", took < 2000);
+    struct stat sb;
+    struct statfs fs;
+    char target[64] = {0};
+    check("/dev is the server's devtmpfs: null (1,3), zero, the terminals",
+          stat("/dev/null", &sb) == 0 && S_ISCHR(sb.st_mode) && sb.st_rdev == makedev(1, 3) && sb.st_dev == 5
+          && stat("/dev/zero", &sb) == 0 && sb.st_rdev == makedev(1, 5) && stat("/dev/tty", &sb) == 0 && sb.st_rdev == makedev(5, 0)
+          && stat("/dev/ptmx", &sb) == 0 && stat("/dev/console", &sb) == 0 && sb.st_rdev == makedev(5, 1));
+    check("... its links into /proc/self/fd and its directories",
+          readlink("/dev/stdin", target, sizeof target) == 15 && strcmp(target, "/proc/self/fd/0") == 0
+          && stat("/dev/fd/1", &sb) == 0 && stat("/dev/pts", &sb) == 0 && S_ISDIR(sb.st_mode) && stat("/dev/shm", &sb) == 0 && (sb.st_mode & 07777) == 01777);
+    int made = open("/dev/lxfile", O_CREAT | O_RDWR, 0644);
+    errno = 0;
+    check("... a tmpfs of its own (statfs, EXDEV) root writes in", statfs("/dev", &fs) == 0 && fs.f_type == 0x01021994
+          && made >= 0 && write(made, "x", 1) == 1 && rename("/dev/lxfile", "/tmp/lxfile") == -1 && errno == EXDEV
+          && unlink("/dev/lxfile") == 0);
+    close(made);
+    int zfd = open("/dev/zero", O_RDONLY);
+    char *zmap = zfd >= 0 ? mmap(NULL, PG, PROT_READ | PROT_WRITE, MAP_PRIVATE, zfd, 0) : MAP_FAILED;
+    check("... /dev/zero reads and maps zeros", zfd >= 0 && read(zfd, target, 8) == 8 && target[0] == 0 && zmap != MAP_FAILED && zmap[100] == 0);
+    if (zmap != MAP_FAILED) munmap(zmap, PG);
+    close(zfd);
 }
 
 static void *adder(void *arg) {
@@ -349,30 +505,23 @@ int main(int argc, char **argv) {
     long end = syscall(TEST_LOCKED_ADD, 0);
     printf("    (counter %ld -> %ld)\n", start, end);
     check("the server's mutex serializes 6 threads in 2 processes", end - start == 6 * 2000);
-    /* Memory semantics are the server's (R4): mmap and friends no longer
-     * pass through to the kernel's Linux implementation. */
-    long idle = legacy_calls();
-    long base = legacy_calls() - idle;
-    long c0 = legacy_calls();
-    int own = 1;
-    for (int i = 0; i < 5; i++) own &= syscall(TEST_PASS_THROUGH) == 0;
-    long on_purpose = legacy_calls() - c0 - base;
-    printf("    (5 calls passed through on purpose counted as %ld)\n", on_purpose);
-    check("/proc/self/counters counts the process's own passed-through calls", idle >= 0 && own && on_purpose == 5);
-    long l0 = legacy_calls();
+    /* The kernel implements no Linux call (R9). */
+    r9_checks();
+    /* Memory semantics are the server's (R4). */
+    int mem_ok = 1;
     for (int i = 0; i < 100; i++) {
         char *m = mmap(NULL, 3 * PG, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (m == MAP_FAILED) {
+            mem_ok = 0;
+            break;
+        }
         m[PG] = 1;
-        mprotect(m, PG, PROT_READ);
-        munmap(m, 3 * PG);
+        mem_ok &= mprotect(m, PG, PROT_READ) == 0 && munmap(m, 3 * PG) == 0;
     }
-    long passed = legacy_calls() - l0 - base;
-    printf("    (%ld of 300 memory calls passed through)\n", passed);
-    check("mmap, mprotect and munmap are the server's (no pass-through)", passed == 0);
+    check("mmap, mprotect and munmap are the server's", mem_ok);
 
     /* Time is the server's too (R5), and it writes the program's memory
      * directly: faults there are the program's, bad addresses EFAULT. */
-    l0 = legacy_calls();
     struct timespec ts, z = {0, 0};
     struct timeval tv;
     for (int i = 0; i < 100; i++) {
@@ -380,8 +529,7 @@ int main(int argc, char **argv) {
         gettimeofday(&tv, NULL);
         nanosleep(&z, NULL);
     }
-    passed = legacy_calls() - l0 - base;
-    check("clock_gettime, gettimeofday and nanosleep are the server's", passed == 0 && ts.tv_sec >= 0 && tv.tv_sec > 1000000000);
+    check("clock_gettime, gettimeofday and nanosleep are the server's", ts.tv_sec >= 0 && tv.tv_sec > 1000000000);
     char *fresh = mmap(NULL, 2 * PG, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     check("the server writes a page the program never touched", clock_gettime(CLOCK_REALTIME, (struct timespec *)(fresh + PG)) == 0 && *(long *)(fresh + PG) > 1000000000);
     mprotect(fresh, PG, PROT_READ);
@@ -398,11 +546,9 @@ int main(int argc, char **argv) {
     check("a PROT_NONE page is EFAULT for the server's copy", syscall(TEST_USERCOPY, none) == -1 && errno == EFAULT);
     check("the server's copy reaches program memory", syscall(TEST_USERCOPY, fresh + PG) == 0 && memcmp(fresh + PG, "usercopy", 8) == 0);
 
-    /* Pipes are the server's (R6a): reads and writes pass nothing through,
-     * the kernel's table still holds their descriptors. */
+    /* Pipes are the server's (R6a). */
     int q[2];
     check("pipe2 gives two descriptors", pipe2(q, O_CLOEXEC) == 0 && q[0] >= 0 && q[1] > q[0] && (fcntl(q[0], F_GETFD) & FD_CLOEXEC));
-    l0 = legacy_calls();
     int same = 1;
     for (int i = 0; i < 100; i++) {
         char c = (char)i, d = 0;
@@ -410,9 +556,7 @@ int main(int argc, char **argv) {
         read(q[0], &d, 1);
         same &= d == c;
     }
-    passed = legacy_calls() - l0 - base;
-    printf("    (%ld of 200 pipe calls passed through)\n", passed);
-    check("pipe reads and writes are the server's", passed == 0 && same);
+    check("pipe reads and writes are the server's", same);
     /* The descriptor's ioctls (libuv makes Node's stdio pipes non-blocking
      * with FIONBIO): on the kernel's flags of the server's pipe. */
     int on = 1, off = 0;
@@ -440,15 +584,13 @@ int main(int argc, char **argv) {
     /* eventfd too (R6b). */
     int efd = eventfd(5, EFD_NONBLOCK);
     uint64_t v = 0;
-    l0 = legacy_calls();
     int counted = 1;
     for (int i = 0; i < 50; i++) {
         uint64_t one = 1;
         write(efd, &one, 8);
         counted &= read(efd, &v, 8) == 8;
     }
-    passed = legacy_calls() - l0 - base;
-    check("eventfd reads and writes are the server's", passed == 0 && counted && v == 1);
+    check("eventfd reads and writes are the server's", counted && v == 1);
     errno = 0;
     check("... an empty one is EAGAIN when non-blocking", read(efd, &v, 8) == -1 && errno == EAGAIN);
     close(efd);
@@ -499,17 +641,14 @@ int main(int argc, char **argv) {
     check("the kernel releases the records of ended processes", held == 0);
 
     /* Paths are the server's (R6c.2b): resolution, the working directory
-     * and umask live in it; the kernel's tree answers through handles. */
+     * and umask live in it. */
     struct stat sb;
     char cwd[256];
-    l0 = legacy_calls();
     int found = 1;
     for (int i = 0; i < 50; i++) {
         found &= stat("/etc/runtests.sh", &sb) == 0 && access("/bin", F_OK) == 0 && getcwd(cwd, sizeof cwd) != NULL;
     }
-    passed = legacy_calls() - l0 - base;
-    printf("    (%ld of 150 path calls passed through)\n", passed);
-    check("stat, access and getcwd are the server's", passed == 0 && found && S_ISREG(sb.st_mode));
+    check("stat, access and getcwd are the server's", found && S_ISREG(sb.st_mode));
     check("stat of the root", stat("/", &sb) == 0 && S_ISDIR(sb.st_mode) && stat("/..", &sb) == 0 && S_ISDIR(sb.st_mode));
     mkdir("/tmp/lx", 0777);
     check("chdir and getcwd", chdir("/tmp/lx") == 0 && getcwd(cwd, sizeof cwd) && strcmp(cwd, "/tmp/lx") == 0);
@@ -561,7 +700,6 @@ int main(int argc, char **argv) {
     check("a /tmp file is the server's tmpfs (its own device)", tf >= 0 && fstat(tf, &sb) == 0 && sb.st_dev == 0x1a && S_ISREG(sb.st_mode));
     char block[4096];
     memset(block, 'z', sizeof block);
-    l0 = legacy_calls();
     int io = 1;
     for (int i = 0; i < 25; i++) {
         io &= pwrite(tf, block, sizeof block, (off_t)i * 4096) == 4096;
@@ -569,19 +707,14 @@ int main(int argc, char **argv) {
         io &= lseek(tf, 0, SEEK_END) == 25 * 4096 || i < 24;
         io &= fstat(tf, &sb) == 0;
     }
-    passed = legacy_calls() - l0 - base;
-    printf("    (%ld of 100 /tmp file calls passed through)\n", passed);
-    check("reads, writes, lseek and fstat of a /tmp file are the server's", passed == 0 && io && sb.st_size == 25 * 4096);
+    check("reads, writes, lseek and fstat of a /tmp file are the server's", io && sb.st_size == 25 * 4096);
     rw_flag_checks("/tmp/lxrw", check);
-    l0 = legacy_calls();
     io = 1;
     for (int i = 0; i < 25; i++) {
         io &= rw_pwritev2(tf, "v2", (long)i * 4096, RWF_NOAPPEND) == 2;
         io &= rw_preadv2(tf, cwd, 2, (long)i * 4096, 0) == 2;
     }
-    passed = legacy_calls() - l0 - base;
-    printf("    (%ld of 50 preadv2/pwritev2 calls passed through)\n", passed);
-    check("preadv2 and pwritev2 of a /tmp file are the server's", passed == 0 && io);
+    check("preadv2 and pwritev2 of a /tmp file are the server's", io);
     check("O_APPEND writes at the end", (fd = open("/tmp/lxfile", O_WRONLY | O_APPEND)) >= 0 && write(fd, "end", 3) == 3 && lseek(tf, 0, SEEK_END) == 25 * 4096 + 3);
     close(fd);
     char *map = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, tf, 0);
@@ -605,7 +738,7 @@ int main(int argc, char **argv) {
     check("removing the mount point /proc is EBUSY", rmdir("/proc") == -1 && errno == EBUSY);
     check("the root and its programs are the server's tmpfs (from the initramfs)",
           stat("/", &sb) == 0 && sb.st_dev == 0x1a && stat("/bin/busybox", &sb) == 0 && sb.st_dev == 0x1a && S_ISREG(sb.st_mode));
-    check("/proc is procfs's (0:21), /dev the kernel's", stat("/proc/counters", &sb) == 0 && sb.st_dev == 0x15 && stat("/dev/null", &sb) == 0 && S_ISCHR(sb.st_mode) && sb.st_dev == 0);
+    check("/proc is procfs's (0:21), /dev the server's devtmpfs (0:5)", stat("/proc/counters", &sb) == 0 && sb.st_dev == 0x15 && stat("/dev/null", &sb) == 0 && S_ISCHR(sb.st_mode) && sb.st_dev == 5);
     unlink("/tmp/lxdir/one"); unlink("/tmp/lxdir/two"); rmdir("/tmp/lxdir"); unlink("/tmp/lxfile");
     check("unlinked /tmp files are gone", stat("/tmp/lxdir", &sb) == -1 && stat("/tmp/lxfile", &sb) == -1);
 

@@ -83,7 +83,7 @@ fn main(args: Vec<&'static str>) -> i32 {
         return 1;
     }
     let mode = if read_only { ", read-only" } else { "" };
-    println!("diskfs: serving ext2 from a {} MiB virtio disk{} (pid {})", sectors / 2048, mode, oxrt::getpid());
+    println!("diskfs: serving ext2 from a {} MiB virtio disk{}", sectors / 2048, mode);
 
     let mut request = vec![0u8; MAX_MESSAGE];
     loop {

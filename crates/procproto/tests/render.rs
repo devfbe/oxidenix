@@ -115,9 +115,8 @@ fn statm_status_and_counters() {
     assert!(status.contains("\nPid:\t42\n") && status.contains("\nTgid:\t42\n") && status.contains("\nPPid:\t1\n"));
     assert!(status.contains("\nThreads:\t3\n") && status.contains("\nVmRSS:\t      40 kB\n"));
     assert!(status.contains("\nCpus_allowed_list:\t0-1\n"));
-    assert_eq!(pid_counters(&Process { legacy_calls: 7, ..p }), "legacy_calls 7\n");
     let c = counters(&Counters { syscalls: 5, ..Default::default() });
-    assert!(c.starts_with("syscalls 5\nlegacy_calls 0\n") && c.lines().count() == 7);
+    assert!(c.starts_with("syscalls 5\nipc_calls 0\n") && c.lines().count() == 6);
 }
 
 #[test]
