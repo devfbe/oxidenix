@@ -249,6 +249,10 @@ struct Waiters {
     /// (`fail`, `filled`), and backings (`backed`), which only the threads
     /// that wait for the backing too see.
     failures: Seen,
+    /// Why the last fill failed: EIO (the page could not be read: SIGBUS
+    /// for a mapping) or ENOMEM (no memory for it: the toucher is killed,
+    /// as by Linux's OOM killer, not sent SIGBUS).
+    fill_errno: i64,
     /// Changes of the page that may have answered or overtaken a request
     /// for it (it came, a fill of it began, it was cut off): a request for
     /// the page made at an earlier count may be done with, one made at the
@@ -297,8 +301,8 @@ impl PageWait {
     /// Waits until the page is there (and backed, with `backed`), counting
     /// every failure since it entered: its frame with a reference (so
     /// reclaim cannot take it before the fault is tried again; None if it
-    /// is gone already, truncated), EIO if it cannot be had, EINTR if the
-    /// thread dies.
+    /// is gone already, truncated), EIO if it cannot be had (ENOMEM if the
+    /// pager had no memory for it), EINTR if the thread dies.
     pub fn wait(self) -> Result<Option<PhysFrame>, i64> {
         self.cache.wait_registered(self.index, self.backed, self.seen, self.asked)?;
         Ok(self.cache.waited_frame(self.index))
@@ -338,7 +342,7 @@ impl State {
             return Ok(w.failures);
         }
         self.waits.try_reserve(1).map_err(|_| ENOMEM)?;
-        self.waits.push(Waiters { index, count: 1, failures: Seen::default(), changes: 0 });
+        self.waits.push(Waiters { index, count: 1, failures: Seen::default(), fill_errno: EIO, changes: 0 });
         Ok(Seen::default())
     }
 
@@ -359,12 +363,14 @@ impl State {
     /// The pager could not supply pages `first..end`: whoever waits for
     /// one that is still missing fails (a page that is there, or being
     /// filled by another fill, is not this failure's: a store waiting for
-    /// its backing does not fail for a neighbour's read error).
-    fn fail_waiters(&mut self, first: u64, end: u64) -> Wake {
+    /// its backing does not fail for a neighbour's read error), with
+    /// `errno` (`Waiters::fill_errno`).
+    fn fail_waiters(&mut self, first: u64, end: u64, errno: i64) -> Wake {
         let pages = &self.pages;
         let mut wake = Wake(false);
         for w in self.waits.iter_mut().filter(|w| (first..end).contains(&w.index) && !pages.contains_key(&w.index)) {
             w.failures.fill = w.failures.fill.wrapping_add(1);
+            w.fill_errno = errno;
             w.changes = w.changes.wrapping_add(1);
             wake.0 = true;
         }
@@ -659,7 +665,8 @@ impl PageCache {
 
     /// Waits until the pager supplied page `index` and, with `backed`, also
     /// backed it up to the file's end (`Pager::mkwrite`): EIO if it cannot
-    /// (it failed, or is gone), EINTR if the thread is dying (a pager that
+    /// (it failed, or is gone; ENOMEM if the fill found no memory), EINTR
+    /// if the thread is dying (a pager that
     /// never answers must not leave it unkillable).
     fn wait_paged(&self, index: u64, backed: bool) -> Result<(), i64> {
         if self.pager().is_none() {
@@ -706,8 +713,11 @@ impl PageCache {
                         _ => {}
                     }
                     // (Orphaned: no answer can come.)
-                    if st.orphaned || failures.fill != seen.fill || (backed && failures.backing != seen.backing) {
+                    if st.orphaned || (backed && failures.backing != seen.backing) {
                         return Err(EIO);
+                    }
+                    if failures.fill != seen.fill {
+                        return Err(st.waits.iter().find(|w| w.index == index).map_or(EIO, |w| w.fill_errno));
                     }
                     match st.pages.get_mut(&index) {
                         // Being filled or backed: its answer comes without
@@ -807,7 +817,7 @@ impl PageCache {
         if index >= page_of(self.size().saturating_add(PAGE - 1)) {
             return Err(EINVAL);
         }
-        let wake = self.state.lock().fail_waiters(index, index + 1);
+        let wake = self.state.lock().fail_waiters(index, index + 1, EIO);
         self.wake(wake);
         Ok(())
     }
@@ -1482,12 +1492,13 @@ impl PageCache {
     }
 
     /// The pager's answer for `count` pages from `first` (at most
-    /// `MAX_RUN`) it filled (`pin_fill`): with `ok` they hold the file's
+    /// `MAX_RUN`) it filled (`pin_fill`): with `Ok` they hold the file's
     /// data now, else the pending ones go and the missing ones fail too
-    /// (whoever waits for them gets EIO, a later access asks again; so a
-    /// pager that cannot even start a fill answers). Present pages are
-    /// left alone. Wakes the waiters.
-    pub fn filled(&self, first: u64, count: u64, ok: bool) -> Result<(), i64> {
+    /// (whoever waits for them gets the error, EIO or ENOMEM, a later
+    /// access asks again; so a pager that cannot even start a fill
+    /// answers). Present pages are left alone. Wakes the waiters.
+    pub fn filled(&self, first: u64, count: u64, result: Result<(), i64>) -> Result<(), i64> {
+        let ok = result.is_ok();
         let Store::Cached { .. } = &self.store else { return Err(EINVAL) };
         if count > MAX_RUN {
             return Err(EINVAL);
@@ -1512,7 +1523,10 @@ impl PageCache {
             }
             st.charged -= gone.len() as u64;
             // Missing pages fail only for whoever waits for them now.
-            if ok { Wake(false) } else { st.fail_waiters(first, end) }
+            match result {
+                Ok(()) => Wake(false),
+                Err(e) => st.fail_waiters(first, end, e),
+            }
         };
         self.uncharge(gone.len() as u64);
         free_frames(gone);
@@ -1578,7 +1592,7 @@ impl PageCache {
                 if let Some(page) = st.pages.remove(&index) {
                     gone.push(page.frame);
                 }
-                wake = wake.and(st.fail_waiters(index, index + 1));
+                wake = wake.and(st.fail_waiters(index, index + 1, EIO));
             }
             st.charged -= gone.len() as u64;
         }

@@ -49,11 +49,17 @@
 //! reclaimed when memory is short, dirty ones are bounded by the kernel's
 //! dirty limits (the pager is asked to write back above a tenth of the
 //! commit limit, writers wait above a fifth), pinned ones by `PINNED` per
-//! fill or write-back in flight. A fill that finds no memory for a page
-//! writes the dirty files back (reclaim can drop their pages then) and
-//! tries again, `FILL_ROUNDS` times at most (programs that keep dirtying
-//! pages could otherwise keep it writing for ever); it fails (ENOMEM) when
-//! nothing is left to write or the rounds are used up. Unused inodes are
+//! fill or write-back in flight. The kernel finds a fill's frames by
+//! reclaiming other cache pages and waits for reclaim to make progress
+//! (busy address spaces, programs ending); a fill that still finds no
+//! memory for a page (ENOMEM: dirty pages in the way, or memory really
+//! full) writes the dirty files back (reclaim can drop their pages then)
+//! and tries again, `FILL_ROUNDS` times at most (programs that keep
+//! dirtying pages could otherwise keep it writing for ever); it fails
+//! (ENOMEM) when nothing is left to write or the rounds are used up, and
+//! a page asked for by a fault is then answered `FILL_NOMEM`: the toucher
+//! is killed as out of memory, not sent SIGBUS (which is for pages that
+//! cannot be read). Unused inodes are
 //! bounded by `MAX_CACHED`; their objects keep pages only until reclaim
 //! takes them.
 //!
@@ -1081,7 +1087,7 @@ fn fill_once(inode: &Arc<DInode>, index: u64, want: u64) -> Result<bool, i64> {
                 // A short read ends at diskfs's end of the file: the rest of
                 // the pages stays zero (a hole, or not written back yet).
                 let ok = r.status >= 0 && r.status as u64 <= count * PAGE;
-                syscall(SYS_MO_FILLED, [object, first * PAGE, count, ok as u64, 0, 0]);
+                syscall(SYS_MO_FILLED, [object, first * PAGE, count, if ok { FILL_OK } else { FILL_FAILED }, 0, 0]);
                 if !ok {
                     failed.set(Some(EIO));
                 }
@@ -1479,10 +1485,13 @@ pub fn page(key: u64, offset: u64) {
     // unknown key has no handle left to answer with, and the kernel ended
     // the waits for it at its last handle (`PageCache::orphan`).
     let Some(inode) = by_key(key) else { return };
-    if let Err(_) = fill(&inode, index, 1) {
-        // Whoever waits gets EIO (a mapping SIGBUS).
+    if let Err(e) = fill(&inode, index, 1) {
+        // Whoever waits gets EIO (a mapping SIGBUS), or ENOMEM if there
+        // was no memory for the page even after waiting for reclaim (a
+        // mapping's toucher is killed, as on Linux's OOM).
+        let status = if e == ENOMEM { FILL_NOMEM } else { FILL_FAILED };
         if let Some(h) = *inode.object.lock() {
-            syscall(SYS_MO_FILLED, [h, index * PAGE, 1, 0, 0, 0]);
+            syscall(SYS_MO_FILLED, [h, index * PAGE, 1, status, 0, 0]);
         }
     }
 }

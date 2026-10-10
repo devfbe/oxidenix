@@ -471,7 +471,7 @@ impl Channel {
             Err(e) => {
                 // Nobody will fill or write them: pending pages go again,
                 // dirty ones are dirty again.
-                let _ = if fill { object.filled(first, count, false) } else { object.redirty(first, count) };
+                let _ = if fill { object.filled(first, count, Err(EIO)) } else { object.redirty(first, count) };
                 Err(Scan::Errno(e))
             }
         }

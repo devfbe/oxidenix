@@ -1603,7 +1603,7 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
                     if let Err(e) = super::uaccess::copy_to_server(a[5], &info) {
                         // The caller cannot know the run: it goes again.
                         let _ = end.channel.revoke(id);
-                        let _ = if mode == GRANT_FILL { object.filled(first, count, false) } else { object.redirty(first, count) };
+                        let _ = if mode == GRANT_FILL { object.filled(first, count, Err(EIO)) } else { object.redirty(first, count) };
                         return Err(e);
                     }
                     Ok(id as i64)
@@ -1624,7 +1624,13 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             }
             let (first, count) = (a[1] / PAGE, a[2]);
             if nr == SYS_MO_FILLED {
-                cache.filled(first, count, a[3] != 0)?;
+                let result = match a[3] {
+                    FILL_OK => Ok(()),
+                    FILL_FAILED => Err(EIO),
+                    FILL_NOMEM => Err(ENOMEM),
+                    _ => return Err(EINVAL),
+                };
+                cache.filled(first, count, result)?;
             } else {
                 cache.redirty(first, count)?;
             }
