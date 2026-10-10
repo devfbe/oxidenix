@@ -1287,6 +1287,8 @@ watching each other multiplies the cost of each wakeup (with interrupts off).
 
 ## Limitations and roadmap
 
+The full list of known open items is in [docs/todo.md](docs/todo.md).
+
 - [x] Copy-on-write `fork`
 - [x] `ENOMEM` instead of a kernel panic when memory runs out
 - [x] Job control: stopping (Ctrl+Z), `fg`/`bg`, `SIGCONT`
@@ -1312,7 +1314,8 @@ watching each other multiplies the cost of each wakeup (with interrupts off).
   `stat` and epoll)
 - [x] Node.js: `os.networkInterfaces()` (netlink), `statx`, the `io_uring` probe answered quietly
 - [x] Node.js smoke tests (`userspace/node/run-node.sh`): fs with `fs.watch` (inotify) and timestamps, os, process, crypto, zlib, workers, HTTP(S), fetch, ESM, an npm-style workload
-- [ ] Dynamic linking, real entropy, users and permissions
+- [x] Real entropy (RDSEED/RDRAND feeding ChaCha20)
+- [ ] Dynamic linking, users and permissions
 
 ## Development history
 
