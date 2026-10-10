@@ -1755,6 +1755,12 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             let old = instance.host.swap(a[0] != 0, core::sync::atomic::Ordering::AcqRel);
             Ok(old as i64)
         }
+        TEST_FUTEX_WATCH => {
+            if !crate::TEST_MODE.load(core::sync::atomic::Ordering::Relaxed) {
+                return Err(ENOSYS);
+            }
+            super::futex::test_watch(a[0], a[1] != 0)
+        }
         TEST_SERVER_TICKS => {
             if !crate::TEST_MODE.load(core::sync::atomic::Ordering::Relaxed) {
                 return Err(ENOSYS);

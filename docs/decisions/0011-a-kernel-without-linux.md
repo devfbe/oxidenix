@@ -62,7 +62,12 @@ of the kernel's tree that `/dev` still was. Four questions decided the shape:
    (`server_futex_wait` on its memory or an object mapped there, `server_wait`) nor doorbell
    watches. A word of a channel is named by its service too: without this a native server
    could take a server thread off the word it waits on (and a vectored wait would no longer
-   find its entry where it put it).
+   find its entry where it put it). As in Linux, the `n_wake` wakes go to whichever waiters
+   come first and the moves to up to `n_move` of the movable ones left, so a wake spent on a
+   waiter that cannot move takes nothing from the moves (`TEST_FUTEX_WATCH` checks it). A
+   wake drops its references to the tasks it took out of a bucket only after the bucket's
+   lock: a task's last reference takes its thread's state with it, whose drop takes other
+   locks (the 21cd469 deadlock's pattern).
 
 ## Consequences
 

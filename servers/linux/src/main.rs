@@ -236,7 +236,7 @@ fn dispatch(s: &mut State) -> i64 {
         // The test hooks reach beyond the caller (the instance's test
         // objects, the test service, /data files, the server's heap and
         // locks): only for the self-tests.
-        TEST_MAP..=TEST_HOST if !test_mode() => -ENOSYS,
+        TEST_MAP..=TEST_FUTEX_WATCH if !test_mode() => -ENOSYS,
         TEST_MAP..=TEST_CACHED => test(s.rax, s.rdi),
         TEST_MKWRITE_FAIL => datafs::fail_next_mkwrite(s.rdi),
         TEST_SLEEP_LOCKED => match TEST_SLEEP_LOCK.lock() {
@@ -260,6 +260,7 @@ fn dispatch(s: &mut State) -> i64 {
             Err(e) => -e,
         },
         TEST_HOST => syscall(TEST_HOST, [s.rdi, 0, 0, 0, 0, 0]),
+        TEST_FUTEX_WATCH => syscall(TEST_FUTEX_WATCH, [s.rdi, s.rsi, 0, 0, 0, 0]),
         // Not offered, as by a Linux built without io_uring: libuv (and
         // so Node.js) probes io_uring_setup at start and uses epoll
         // instead. Answered here, so the kernel does not log them as

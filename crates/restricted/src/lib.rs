@@ -753,8 +753,10 @@ pub const SYS_FUTEX_WAIT: u64 = 1160;
 /// of the word at `addr` whose bitset shares a bit with `bitset`.
 pub const SYS_FUTEX_WAKE: u64 = 1161;
 /// `futex_requeue(addr, n_wake, n_move, addr2, val, flags) -> n`: wakes at
-/// most `n_wake` waiters of `addr` and moves at most `n_move` more to wait
-/// on `addr2`; with `FUTEX_CMP` only if the word at `addr` still holds
+/// most `n_wake` waiters of `addr` and then moves at most `n_move` of the
+/// movable ones left (the waits of `futex_wait`) to wait on `addr2`, as
+/// Linux: a wake that went to a waiter no requeue moves takes nothing from
+/// the moves. With `FUTEX_CMP` only if the word at `addr` still holds
 /// `val` (EAGAIN otherwise). Returns how many were woken and moved.
 pub const SYS_FUTEX_REQUEUE: u64 = 1162;
 /// The word is private to the address space (Linux's FUTEX_PRIVATE_FLAG).
@@ -924,3 +926,10 @@ pub const TEST_SLEEP_LOCKED: u64 = 1521;
 /// it: lxtest checks the tree without it. Test mode only; a program's call
 /// is the server's to pass on.
 pub const TEST_HOST: u64 = 1522;
+/// `(addr, arm) -> waiters`: with `arm`, the kernel arms a doorbell watch
+/// (a waiter no requeue moves) on the program's private futex word at
+/// `addr`; either way it returns how many waiters the word has. `addr` 0
+/// takes the watch back and returns whether a wake rang it: lxtest checks
+/// that a requeue's wakes spent on such waiters still move what it asked
+/// for. Test mode only; a program's call is the server's to pass on.
+pub const TEST_FUTEX_WATCH: u64 = 1524;

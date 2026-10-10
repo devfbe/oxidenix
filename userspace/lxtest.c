@@ -60,6 +60,7 @@
 #define TEST_SERVER_FAIL 1520
 #define TEST_SLEEP_LOCKED 1521
 #define TEST_HOST 1522
+#define TEST_FUTEX_WATCH 1524
 
 static int failures;
 
@@ -158,6 +159,41 @@ static void *futex_waker(void *arg) {
     return NULL;
 }
 
+static int rq_from, rq_to, rq_done;
+
+static void *requeue_waiter(void *arg) {
+    (void)arg;
+    while (!__atomic_load_n(&rq_done, __ATOMIC_SEQ_CST))
+        syscall(SYS_futex, &rq_from, FUTEX_WAIT_PRIVATE, 0, NULL, NULL, 0);
+    return NULL;
+}
+
+/* A requeue wakes up to n_wake waiters of whichever kind and then moves up
+ * to n_move of the movable ones left (Linux): a wake spent on a waiter it
+ * cannot move (the test's doorbell watch, queued first) takes nothing from
+ * the moves. */
+static void requeue_check(void) {
+    long armed = syscall(TEST_FUTEX_WATCH, &rq_from, 1);
+    pthread_t t;
+    pthread_create(&t, NULL, requeue_waiter, NULL);
+    long queued = 0;
+    for (int i = 0; i < 2000 && queued < 2; i++) {
+        queued = syscall(TEST_FUTEX_WATCH, &rq_from, 0);
+        if (queued < 2)
+            usleep(1000);
+    }
+    long n = syscall(SYS_futex, &rq_from, FUTEX_CMP_REQUEUE_PRIVATE, 1, (void *)1, &rq_to, 0);
+    long left = syscall(TEST_FUTEX_WATCH, &rq_from, 0);
+    long on_to = syscall(TEST_FUTEX_WATCH, &rq_to, 0);
+    long rang = syscall(TEST_FUTEX_WATCH, 0, 0);
+    __atomic_store_n(&rq_done, 1, __ATOMIC_SEQ_CST);
+    long woken = syscall(SYS_futex, &rq_to, FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0);
+    syscall(SYS_futex, &rq_from, FUTEX_WAKE_PRIVATE, 1, NULL, NULL, 0);
+    pthread_join(t, NULL);
+    check("futex: a requeue's wake spent on a waiter it cannot move takes nothing from the moves",
+          armed == 1 && queued == 2 && n == 2 && left == 0 && on_to == 1 && rang == 1 && woken == 1);
+}
+
 /* R9: every Linux call is the server's; the kernel's mechanisms under the
  * last ones it implemented (futexes on program memory, the FS base, the wall
  * clock, power, the system's record) and /dev, now the server's devtmpfs. */
@@ -238,6 +274,7 @@ static void r9_checks(void) {
     int other = 0;
     errno = 0;
     check("futex: a negative requeue count is EINVAL", syscall(SYS_futex, &word, FUTEX_REQUEUE_PRIVATE, 0, -1, &other, 0) == -1 && errno == EINVAL);
+    requeue_check();
     struct timespec cpu_now;
     check("the CPU clocks of the caller, also by pid 0's encoding",
           clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &cpu_now) == 0 && clock_gettime(CLOCK_THREAD_CPUTIME_ID, &cpu_now) == 0
