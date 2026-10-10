@@ -551,7 +551,7 @@ for `mprotect`, `ENOMEM` once the service unmapped it).
    left for the cache).
 5. The same for procfs, and (in R7b) netd. Done: see "procfs over the rings"; the kernel's
    `RemoteFs`, its IPC client side (`ipc::call`) and the `fsproto` crate are gone: the
-   kernel's IPC carries only channel offers now. The server's namespace reaches the kernel's
-   tree (the inode bridge, `SYS_INODE_*`) for `/dev` alone. `proctest` checks procfs's
+   kernel's IPC carries only channel offers now. (The server's namespace reached the kernel's
+   tree, the inode bridge `SYS_INODE_*`, for `/dev` alone until R9 made `/dev` its own.) `proctest` checks procfs's
    files, `/sys`, the server's per-process part and its magic links; `lxtest` connects to a
    service without channels (`ringtest-plain`) for `EOPNOTSUPP`, since procfs takes them.

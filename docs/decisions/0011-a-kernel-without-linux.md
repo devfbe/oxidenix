@@ -47,6 +47,22 @@ of the kernel's tree that `/dev` still was. Four questions decided the shape:
    end; `dying`). Signals, process groups, sessions, parents other than the kernel and wait4
    are gone; the kernel's own processes are its zombies until it reaps them, with Linux's
    encoding of wait statuses.
+5. **The machine's state is a capability** (added in review). Setting the wall clock
+   (`clock_set`) and powering off or restarting (`power`) act on the whole machine, not one
+   tree: they need the instance's **host grant**, which the kernel gives when it starts a
+   tree itself (the monitor's `run`, autorun: today the only trees there are), as it grants
+   the console. Without it both are EPERM, and the server acts as Linux in a pid namespace
+   that is not the initial one: `clock_settime` and `settimeofday` are EPERM, and `reboot`
+   ends the tree (its init dies, and with it every process; its parent's wait reports SIGHUP
+   for a restart, SIGINT for a power off or halt; the caller exits), as `reboot_pid_ns`
+   does. A test-mode call (`TEST_HOST`) takes the grant from the self-tests' tree for the
+   clock's checks; the reboot without it ends the suite's own tree and is not tried there.
+6. **Requeues move only plain futex waits** (added in review): `futex_requeue` moves
+   waiters that entered through `futex_wait`, never the Linux server's own waits
+   (`server_futex_wait` on its memory or an object mapped there, `server_wait`) nor doorbell
+   watches. A word of a channel is named by its service too: without this a native server
+   could take a server thread off the word it waits on (and a vectored wait would no longer
+   find its entry where it put it).
 
 ## Consequences
 
@@ -57,5 +73,5 @@ of the kernel's tree that `/dev` still was. Four questions decided the shape:
   `thread_fs`, `clock_set`, `power`) and `file_pages` for tmpfs's statfs.
 - The native servers can no longer be confused with Linux programs; ringtest's checks of the
   kernel's refusals use the native calls (`random` into a read-only grant, `futex_requeue`).
-- Resource limits other than RLIMIT_NOFILE are Linux's defaults the server holds to, accepted
-  but not kept per process until the process table keeps them.
+- Resource limits other than RLIMIT_NOFILE start as Linux's defaults the server holds to and
+  are kept per process in the server's process table (inherited by fork, kept by execve).
