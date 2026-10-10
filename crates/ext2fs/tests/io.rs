@@ -1492,3 +1492,73 @@ fn a_read_only_disk_serves_reads() {
     let _ = fs.set_in_use(false);
     assert!(take(fs).data == before, "a read-only disk was written");
 }
+
+/// A rename over an existing name takes the file into that name's entry in place (nothing
+/// to allocate), so it works on a full disk with a full directory; a rename to a new name
+/// that needs room fails with ENOSPC and leaves both names as they were.
+#[test]
+fn a_rename_over_a_name_needs_no_room() {
+    let mut fs = Ext2::mount(mkfs("rename-full", 2 * 1024)).unwrap();
+    let a = fs.create(ROOT_INO, "a", &NewNode::File, 0o644).unwrap();
+    write_file(&mut fs, a, 32 * 1024);
+    let b = fs.create(ROOT_INO, "b", &NewNode::File, 0o644).unwrap();
+    // The disk full: a file takes every free block, then names take the directory's room.
+    let big = fs.create(ROOT_INO, "big", &NewNode::File, 0o644).unwrap();
+    let chunk = vec![1u8; 1024];
+    let mut off = 0u64;
+    while fs.write(big, off, &chunk).is_ok() {
+        off += 1024;
+    }
+    let mut n = 0;
+    while fs.create(ROOT_INO, &format!("filler-with-a-long-name-{n:05}"), &NewNode::File, 0o644).is_ok() {
+        n += 1;
+    }
+    assert_eq!(fs.create(ROOT_INO, "one-more-name-that-needs-room", &NewNode::File, 0o644), Err(ext2fs::errno::ENOSPC));
+    // To a new name: ENOSPC, both names as they were.
+    assert_eq!(fs.rename(ROOT_INO, "a", ROOT_INO, "a-new-name-that-needs-room-too"), Err(ext2fs::errno::ENOSPC));
+    assert_eq!(fs.lookup(ROOT_INO, "a"), Ok(a));
+    // Over an existing name: in place.
+    assert_eq!(fs.rename(ROOT_INO, "a", ROOT_INO, "b").unwrap(), vec![b]);
+    assert_eq!(fs.lookup(ROOT_INO, "b"), Ok(a));
+    assert!(fs.lookup(ROOT_INO, "a").is_err());
+    check_file(&mut fs, a, 32 * 1024);
+    fs.release(b).unwrap();
+    fsck("rename-full", &take(fs));
+}
+
+/// A rename over a name that fails part way (a read fails at each point in turn) never
+/// leaves the moved file without a name: the new name is the moved file's or the old one's,
+/// and the old name, if it is still there, is the moved file's.
+#[test]
+fn a_rename_failing_part_way_leaves_every_file_a_name() {
+    let mut fs = Ext2::mount(mkfs("rename-fail", 2 * 1024)).unwrap();
+    let dir = fs.create(ROOT_INO, "d", &NewNode::Dir, 0o755).unwrap();
+    let mut names = Vec::new();
+    for i in 0..60 {
+        let f = fs.create(dir, &format!("entry-{i:03}-with-some-length"), &NewNode::File, 0o644).unwrap();
+        names.push(f);
+    }
+    let moved = fs.create(ROOT_INO, "moved", &NewNode::File, 0o644).unwrap();
+    let target = names[45];
+    let base = take(fs).data;
+    let mut failed = 0;
+    for n in 0..40 {
+        let disk = RamDisk { data: base.clone(), counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None };
+        let mut fs = Ext2::mount_with_cache(disk, 2 * 1024).unwrap();
+        fs.device_mut().fail_read = Some(n);
+        let result = fs.rename(ROOT_INO, "moved", dir, "entry-045-with-some-length");
+        fs.device_mut().fail_read = None;
+        failed += result.is_err() as u32;
+        let new = fs.lookup(dir, "entry-045-with-some-length");
+        let old = fs.lookup(ROOT_INO, "moved");
+        assert!(new == Ok(moved) || new == Ok(target), "read {n}: the new name is {new:?}");
+        assert!(old.is_err() || old == Ok(moved), "read {n}: the old name is {old:?}");
+        assert!(old == Ok(moved) || new == Ok(moved), "read {n}: the moved file has no name");
+        for ino in [moved, target] {
+            if fs.lookup(dir, "entry-045-with-some-length") == Ok(ino) || fs.lookup(ROOT_INO, "moved") == Ok(ino) {
+                assert!(fs.stat(ino).unwrap().links > 0, "read {n}: a named inode without links");
+            }
+        }
+    }
+    assert!(failed > 0, "no read of the rename failed");
+}

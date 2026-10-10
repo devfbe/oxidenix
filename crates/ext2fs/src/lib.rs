@@ -1482,6 +1482,28 @@ impl<D: Device> State<D> {
         Err(ENOENT)
     }
 
+    /// Points the entry `name` of `dir` at `ino` (of type `ftype`), in place.
+    fn dir_set(&mut self, dir: u32, name: &str, ino: u32, ftype: u8) -> Result<(), i64> {
+        let mut inode = self.read_inode(dir)?;
+        for fb in 0..self.dir_blocks(&inode) {
+            let blk = self.bmap(dir, &mut inode, fb, false)?;
+            if blk == 0 {
+                continue;
+            }
+            let mut block = self.read_block(blk)?;
+            let entries = parse_entries(&block)?;
+            if let Some(e) = entries.iter().find(|e| e.inode != 0 && &block[e.pos + 8..e.pos + 8 + e.name_len] == name.as_bytes()) {
+                let pos = e.pos;
+                put32(&mut block, pos, ino);
+                block[pos + 7] = ftype;
+                self.write_block(blk, &block)?;
+                inode.touch(self.dev.now(), false, true);
+                return self.write_inode(dir, &inode);
+            }
+        }
+        Err(ENOENT)
+    }
+
     fn dir_is_empty(&mut self, dir: u32) -> Result<bool, i64> {
         Ok(self.list(dir)?.iter().all(|(n, _, _)| n == "." || n == ".."))
     }
@@ -1511,14 +1533,29 @@ impl<D: Device> State<D> {
         if name.len() > NAME_MAX {
             return Err(ENAMETOOLONG);
         }
-        if self.lookup(dir, name).is_ok() {
-            return Err(EEXIST);
+        // (Only "no such name" lets it be made: a failed lookup is no proof of none.)
+        match self.lookup(dir, name) {
+            Ok(_) => return Err(EEXIST),
+            Err(ENOENT) => {}
+            Err(e) => return Err(e),
         }
         let is_dir = matches!(kind, NewNode::Dir);
         let ino = self.alloc_inode(is_dir, self.group_of(dir))?;
         let result = self.init_inode(dir, ino, name, kind, perm);
         if result.is_err() {
-            let _ = self.free_inode(ino, is_dir);
+            // Undone: its name if it got one, then the inode as any is freed (its blocks,
+            // a deletion time: no inode in use that the bitmap says is free).
+            if self.lookup(dir, name) == Ok(ino) {
+                let _ = self.dir_remove(dir, name);
+            }
+            match self.read_inode(ino) {
+                Ok(inode) if inode.mode() != 0 => {
+                    let _ = self.release(ino, inode);
+                }
+                _ => {
+                    let _ = self.free_inode(ino, is_dir);
+                }
+            }
         }
         result.map(|_| ino)
     }
@@ -1612,6 +1649,12 @@ impl<D: Device> State<D> {
             _ => {}
         }
         self.dir_remove(dir, name)?;
+        self.drop_link(dir, ino, inode)
+    }
+
+    /// `ino` (as `inode`) lost its name in `dir`: one link less (a directory: none, and
+    /// `dir` loses its ".." link); its last gone, it is `unlinked`.
+    fn drop_link(&mut self, dir: u32, ino: u32, mut inode: RawInode) -> Result<(), i64> {
         if inode.is_dir() {
             self.adjust_links(dir, -1)?;
         }
@@ -1653,7 +1696,23 @@ impl<D: Device> State<D> {
         if inode.is_dir() && self.is_ancestor(ino, ndir)? {
             return Err(EINVAL);
         }
-        if let Ok(existing) = self.lookup(ndir, nname) {
+        let ftype = match inode.mode() as u32 & S_IFMT {
+            S_IFDIR => FT_DIR,
+            S_IFLNK => FT_SYMLINK,
+            S_IFSOCK => FT_SOCK,
+            _ => FT_REG,
+        };
+        // The new name first, the old one after (as Linux's ext2_rename): a rename that
+        // fails part way leaves the file a name. Over an existing name its entry takes the
+        // file in place (nothing to allocate: no ENOSPC part way), and the replaced inode
+        // loses that link.
+        // (Only "no such name" means none: another failure is the rename's.)
+        let existing = match self.lookup(ndir, nname) {
+            Ok(existing) => Some(existing),
+            Err(ENOENT) => None,
+            Err(e) => return Err(e),
+        };
+        if let Some(existing) = existing {
             if existing == ino {
                 return Ok(());
             }
@@ -1661,17 +1720,14 @@ impl<D: Device> State<D> {
             match (ex.is_dir(), inode.is_dir()) {
                 (true, false) => return Err(EISDIR),
                 (false, true) => return Err(ENOTDIR),
+                (true, true) if !self.dir_is_empty(existing)? => return Err(ENOTEMPTY),
                 _ => {}
             }
-            self.unlink(ndir, nname, ex.is_dir())?;
+            self.dir_set(ndir, nname, ino, ftype)?;
+            self.drop_link(ndir, existing, ex)?;
+        } else {
+            self.dir_add(ndir, nname, ino, ftype)?;
         }
-        let ftype = match inode.mode() as u32 & S_IFMT {
-            S_IFDIR => FT_DIR,
-            S_IFLNK => FT_SYMLINK,
-            S_IFSOCK => FT_SOCK,
-            _ => FT_REG,
-        };
-        self.dir_add(ndir, nname, ino, ftype)?;
         self.dir_remove(odir, oname)?;
         if inode.is_dir() && odir != ndir {
             self.set_dotdot(ino, ndir)?;
