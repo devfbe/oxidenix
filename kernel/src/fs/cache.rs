@@ -107,14 +107,9 @@ impl CacheCounts {
     }
 }
 
-/// How long a fill or write-back waits for its instance's pinned pages
-/// to drop below the limit, and how often it looks.
-const PIN_WAIT: u64 = 1_000_000_000;
-const PIN_RECHECK: u64 = 10_000_000;
-
-/// Where they wait (for the time to pass).
-fn pin_chan() -> usize {
-    &PINNED as *const AtomicU64 as usize
+/// Pinned pages of cached objects (`Writeback:` in /proc/meminfo).
+pub fn pinned_pages() -> u64 {
+    PINNED.load(Ordering::Relaxed)
 }
 
 /// Cache pages that reclaim cannot drop now, dirty or pinned: they are
@@ -1261,28 +1256,21 @@ impl PageCache {
     /// Reserves up to `want` pages of this object's instance's pins
     /// (`pin_fill`, `pin_dirty`) in one atomic step, so concurrent fills
     /// cannot together pass the limit; the caller returns what it did not
-    /// pin (`unreserve_pins`). If none are left, it waits for the
-    /// instance's fills and write-backs in flight to end, up to `PIN_WAIT`
-    /// (killably); ENOMEM after that.
+    /// pin (`unreserve_pins`). EBUSY if none are left: never a wait here
+    /// (the caller may hold pins of its own in flight, which only it can
+    /// let go of); the server waits for its transfers and asks again.
     fn reserve_pins(&self, want: u64) -> Result<u64, Scan> {
         let Some(counts) = self.counts() else { return Ok(want) };
-        let deadline = crate::time::now() + PIN_WAIT;
-        loop {
-            let limit = CacheCounts::pinned_limit();
-            let mut room = 0;
-            let _ = counts.pinned.try_update(Ordering::AcqRel, Ordering::Acquire, |pinned| {
-                room = want.min(limit.saturating_sub(pinned));
-                (room > 0).then_some(pinned + room)
-            });
-            if room > 0 {
-                return Ok(room);
-            }
-            let now = crate::time::now();
-            if now >= deadline || crate::process::kill::dying() {
-                return Err(Scan::Errno(ENOMEM));
-            }
-            crate::process::sched::prepare_to_wait(pin_chan()).sleep_until((now + PIN_RECHECK).min(deadline));
+        let limit = CacheCounts::pinned_limit();
+        let mut room = 0;
+        let _ = counts.pinned.try_update(Ordering::AcqRel, Ordering::Acquire, |pinned| {
+            room = want.min(limit.saturating_sub(pinned));
+            (room > 0).then_some(pinned + room)
+        });
+        if room == 0 {
+            return Err(Scan::Errno(EBUSY));
         }
+        Ok(room)
     }
 
     /// Tells the pager that this object has a dirty page now (its first).
@@ -1578,18 +1566,19 @@ impl PageCache {
         }
         // Frames from free memory or reclaimed cache pages (no cache lock
         // held); a shorter run will do. Without any, the fill waits for
-        // reclaim to make progress (address spaces busy, mapped pages used
-        // since the last look, programs ending), unless dirty pages stand
-        // in the way: then the pager, which may be this very thread, is
-        // told (ENOMEM) and writes them back first.
+        // reclaim to make progress (write-back, address spaces busy, mapped
+        // pages used since the last look, programs ending), except on the
+        // pager's own thread while dirty pages stand in the way: it is told
+        // (ENOMEM) and writes them back itself first.
         let mut tries = 0;
+        let pager_must_write = || dirty_pages() > 0 && crate::process::linux::is_pager();
         while frames.len() < reserved as usize {
             match new_frame() {
                 Some(frame) => {
                     frame_bytes(frame).fill(0);
                     frames.push(frame);
                 }
-                None if frames.is_empty() && dirty_pages() == 0 && memory::reclaim_retry(1, &mut tries) => {}
+                None if frames.is_empty() && !pager_must_write() && memory::reclaim_retry(1, &mut tries) => {}
                 None => break,
             }
         }

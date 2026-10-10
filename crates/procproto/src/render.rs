@@ -104,6 +104,7 @@ pub fn meminfo(s: &System) -> String {
         ("SwapTotal", 0),
         ("SwapFree", 0),
         ("Dirty", kb(s.dirty)),
+        ("Writeback", kb(s.writeback)),
         ("Shmem", kb(s.shmem)),
         ("Slab", kb(s.kernel_heap)),
         ("SReclaimable", 0),

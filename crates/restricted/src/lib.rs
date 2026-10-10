@@ -521,7 +521,9 @@ pub const GRANT_FILL: u64 = 2;
 /// u64s): a run of dirty pages holds data up to that size (a write makes
 /// a page dirty and the file longer at once). One call looks at a bounded
 /// number of present pages: EAGAIN with the page to go on from at `out`
-/// if it found no run among them.
+/// if it found no run among them. EBUSY if the instance's cached objects
+/// have as many pages pinned as one instance may (a quarter of the commit
+/// limit): the server asks again once its transfers in flight ended.
 pub const GRANT_DIRTY: u64 = 4;
 /// `revoke(handle, grant) -> 0 | REVOKE_DRAINING`: takes a grant back. Its
 /// mappings in the service are gone when the call returns. If the service

@@ -1027,6 +1027,35 @@ fn grant_run(c: &Client, object: u64, mut at: u64, end: u64, flags: u64, out: &m
     Err(EIO)
 }
 
+/// How long a fill or write-back waits for room among its instance's
+/// pinned pages (the kernel's per-instance bound) while it has none of its
+/// own in flight (other threads' transfers end meanwhile; a disk that is
+/// stuck fails it as an I/O error, never as a want of memory), and how
+/// often it asks again.
+const PIN_WAIT: u64 = 30_000_000_000;
+const PIN_RECHECK: u64 = 10_000_000;
+
+/// A grant refused for want of room among the instance's pinned pages
+/// (EBUSY): with transfers of its own in flight, the run goes on once one
+/// ended (`Later`); without, it waits a little (since `since`, up to
+/// `PIN_WAIT`) and the caller asks again (None); EIO after that.
+fn pins_wait<T>(own: u64, since: &Cell<Option<u64>>, failed: &Cell<Option<i64>>) -> Option<Next<T>> {
+    if own > 0 {
+        return Some(Next::Later);
+    }
+    let start = since.get().unwrap_or_else(now);
+    since.set(Some(start));
+    if now() >= start + PIN_WAIT {
+        failed.set(Some(EIO));
+        return Some(Next::Done);
+    }
+    if syscall(SYS_SLEEP_UNTIL, [now() + PIN_RECHECK, 0, 0, 0, 0, 0]) == -EINTR {
+        failed.set(Some(EINTR));
+        return Some(Next::Done);
+    }
+    None
+}
+
 /// What a request of a fill or a write-back is about.
 enum Io {
     Fill { grant: u32, first: u64, count: u64 },
@@ -1058,6 +1087,7 @@ fn fill_once(inode: &Arc<DInode>, index: u64, want: u64) -> Result<bool, i64> {
     let end = index.saturating_add(window(inode, index, want));
     inode.fills.fetch_add(1, Ordering::AcqRel);
     let (cursor, pinned, any, failed) = (Cell::new(index), Cell::new(0u64), Cell::new(false), Cell::new(None));
+    let pin_wait = Cell::new(None);
     let mut out = [0u64; 3];
     fsclient::run(
         &c,
@@ -1069,13 +1099,19 @@ fn fill_once(inode: &Arc<DInode>, index: u64, want: u64) -> Result<bool, i64> {
                 return Next::Later;
             }
             let at = cursor.get();
-            let g = match grant_run(&c, object, at, end, GRANT_WRITE | GRANT_FILL, &mut out) {
-                Ok(g) => g,
-                Err(e) => {
-                    if e != ENOENT && !any.get() {
-                        failed.set(Some(e));
+            let g = loop {
+                match grant_run(&c, object, at, end, GRANT_WRITE | GRANT_FILL, &mut out) {
+                    Ok(g) => break g,
+                    Err(EBUSY) => match pins_wait(pinned.get(), &pin_wait, &failed) {
+                        Some(next) => return next,
+                        None => {}
+                    },
+                    Err(e) => {
+                        if e != ENOENT && !any.get() {
+                            failed.set(Some(e));
+                        }
+                        return Next::Done;
                     }
-                    return Next::Done;
                 }
             };
             let (first, count) = (out[0], out[1]);
@@ -1259,6 +1295,7 @@ pub fn writeback(inode: &Arc<DInode>, pages: core::ops::Range<u64>) -> Result<u6
     let _wb = inode.wb.lock()?;
     let c = client()?;
     let (cursor, pinned, wrote, failed) = (Cell::new(pages.start), Cell::new(0u64), Cell::new(0u64), Cell::new(None));
+    let pin_wait = Cell::new(None);
     let mut out = [0u64; 3];
     fsclient::run(
         &c,
@@ -1270,13 +1307,19 @@ pub fn writeback(inode: &Arc<DInode>, pages: core::ops::Range<u64>) -> Result<u6
             if pinned.get() >= PINNED {
                 return Next::Later;
             }
-            let g = match grant_run(&c, object, at, pages.end, GRANT_DIRTY, &mut out) {
-                Ok(g) => g,
-                Err(e) => {
-                    if e != ENOENT {
-                        failed.set(Some(e));
+            let g = loop {
+                match grant_run(&c, object, at, pages.end, GRANT_DIRTY, &mut out) {
+                    Ok(g) => break g,
+                    Err(EBUSY) => match pins_wait(pinned.get(), &pin_wait, &failed) {
+                        Some(next) => return next,
+                        None => {}
+                    },
+                    Err(e) => {
+                        if e != ENOENT {
+                            failed.set(Some(e));
+                        }
+                        return Next::Done;
                     }
-                    return Next::Done;
                 }
             };
             let (first, count, size) = (out[0], out[1], out[2]);
