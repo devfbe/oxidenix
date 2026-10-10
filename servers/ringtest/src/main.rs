@@ -326,6 +326,15 @@ fn handle(channel: u64, base: *mut u8, layout: &Layout, d: &Desc, mapped: &mut V
             LATE.store(1, Ordering::Relaxed);
             Ok(0)
         }
+        REQUEUE_AWAY => {
+            let layout = Layout::new(SLOTS as u32).expect("a valid slot count");
+            let tail = unsafe { &*(base.add(layout.completion + ring::TAIL_OFFSET) as *const AtomicU32) };
+            let other = unsafe { &*(base.add(layout.completion + ring::SLEEPING_OFFSET) as *const AtomicU32) };
+            // The client sleeps on the completion tail by then.
+            let pause = AtomicU32::new(0);
+            let _ = oxrt::futex_wait(&pause, 0, Some(50));
+            oxrt::futex_requeue(tail, 0, i32::MAX as u32, other).map(|n| n as i64)
+        }
         _ => Err(-EINVAL),
     })();
     result.unwrap_or_else(|e| e)
