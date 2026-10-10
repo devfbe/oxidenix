@@ -35,6 +35,8 @@ virtio-net with user networking and the echo service at 10.0.2.100:7.
 | `pread_4k_cached` | random 4 KiB `pread`s from the page cache alone, in cycles (no clock calls around each) |
 | `clock_gettime` | `clock_gettime(CLOCK_MONOTONIC)` alone, cycles |
 | `read_4k_disk` | the same with `O_DIRECT`; ns, p50/p99 |
+| `create_disk`, `rename_disk`, `unlink_disk` | 500 files created (`open` with `O_CREAT`, `close`), renamed and removed in a directory on the disk, each durable when it returns (diskfs commits a transaction); ns, p50/p99 |
+| `write_fsync_4k` | a 4 KiB overwrite of a file on the disk and `fsync`, 200 times; ns, p50/p99 |
 | `tcp_loopback` | 32 MiB in 64 KiB `write`s over 127.0.0.1 to a forked receiver; MB/s |
 | `fork_wait` | `fork` of the benchmark (a small process), the child's `_exit(0)` and the parent's `waitpid`; µs, p50/p99 |
 | `fork_exec_wait` | the same with the child running `/bin/hello` (stdout to `/dev/null`): fork, execve with its ELF loading (the Linux server's since R8), exit and wait; µs, p50/p99 |
