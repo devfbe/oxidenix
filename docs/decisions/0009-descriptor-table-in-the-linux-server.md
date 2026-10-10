@@ -92,3 +92,10 @@ one after its point of no return), and an exiting thread lets its table go itsel
 kernel ended in its program: the worker). The temporary signal masks and the restart codes
 are the server's own signal delivery's now; `server_wait` takes no mask any more.
 RLIMIT_NOFILE stays with the table.
+
+## Update (R9 follow-ups, ADR 0011)
+
+RLIMIT_NOFILE left the table: it is kept per process with the other limits (`ids::Limits`,
+read without a lock through the thread's block), so processes sharing a table with
+`CLONE_FILES` but not `CLONE_THREAD` have limits of their own, a zombie keeps its, and a new
+descriptor is bounded by the caller's process's soft limit, as on Linux.

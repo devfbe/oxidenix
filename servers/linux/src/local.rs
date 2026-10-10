@@ -7,6 +7,7 @@
 //! dead thread's).
 
 use crate::fdtable::FilesContext;
+use crate::ids::Limits;
 use crate::records::FsContext;
 use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use restricted::{thread_state, SERVER_LOCAL_OFFSET, THREADS_BASE, THREAD_AREA};
@@ -29,6 +30,10 @@ pub struct Local {
     /// (`process::Thread::files`) holds, valid while the thread runs (only
     /// the thread itself replaces it: execve, close_range's unshare, exit).
     pub files: AtomicPtr<FilesContext>,
+    /// Its process's resource limits: the reference its thread record
+    /// (`process::Thread::limits`) holds, valid while the thread runs (a
+    /// process keeps its limits for good).
+    pub limits: AtomicPtr<Limits>,
     /// The status the thread's process ends with (`EXIT_PENDING`).
     pub exit_status: AtomicU32,
 }
@@ -92,6 +97,7 @@ pub fn start(role: u64) {
     l.key.store(0, Ordering::Relaxed);
     l.fs.store(core::ptr::null_mut(), Ordering::Relaxed);
     l.files.store(core::ptr::null_mut(), Ordering::Relaxed);
+    l.limits.store(core::ptr::null_mut(), Ordering::Relaxed);
     l.exit_status.store(0, Ordering::Relaxed);
 }
 
@@ -108,7 +114,7 @@ pub fn is_pager() -> bool {
 }
 
 /// Sets up a program thread's block (at its start, and when an exec changes its tid).
-pub fn set(tid: u32, pid: u32, key: u64, fs: *const FsContext, files: *const FilesContext) {
+pub fn set(tid: u32, pid: u32, key: u64, fs: *const FsContext, files: *const FilesContext, limits: *const Limits) {
     let l = get();
     l.tid.store(tid, Ordering::Relaxed);
     l.pid.store(pid, Ordering::Relaxed);
@@ -116,4 +122,5 @@ pub fn set(tid: u32, pid: u32, key: u64, fs: *const FsContext, files: *const Fil
     l.flags.store(0, Ordering::Relaxed);
     l.fs.store(fs as *mut FsContext, Ordering::Release);
     l.files.store(files as *mut FilesContext, Ordering::Release);
+    l.limits.store(limits as *mut Limits, Ordering::Release);
 }

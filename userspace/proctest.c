@@ -296,8 +296,20 @@ static void descriptors(void) {
     check("fexecve runs a program through /proc/self/fd", WIFEXITED(status) && WEXITSTATUS(status) == 42);
 }
 
+static volatile pid_t limit_tid;
+static volatile int limit_done;
+
+static void *limit_thread(void *arg) {
+    (void)arg;
+    limit_tid = (pid_t)syscall(SYS_gettid);
+    while (!limit_done)
+        usleep(1000);
+    return NULL;
+}
+
 /* Another process's descriptors: listed and described (everyone is root),
- * and its RLIMIT_NOFILE. */
+ * and its RLIMIT_NOFILE: per process, named by any of its threads' ids, kept
+ * while it is a zombie. */
 static void other_descriptors(void) {
     char path[64];
     int p[2];
@@ -327,13 +339,34 @@ static void other_descriptors(void) {
         closedir(d);
     }
     check("another process's descriptors are listed", seen);
-    struct rlimit rl = {0};
+    struct rlimit rl = {0}, kid_lim = {100, 4096}, mine;
     check("prlimit of another process's RLIMIT_NOFILE", syscall(SYS_prlimit64, kid, RLIMIT_NOFILE, NULL, &rl) == 0 && rl.rlim_cur == 4096);
+    check("... set for it alone", syscall(SYS_prlimit64, kid, RLIMIT_NOFILE, &kid_lim, NULL) == 0
+          && getrlimit(RLIMIT_NOFILE, &mine) == 0 && mine.rlim_cur == 4096);
     close(p[0]);
     close(p[1]);
+    siginfo_t si;
+    waitid(P_PID, kid, &si, WEXITED | WNOWAIT);
+    rl.rlim_cur = 0;
+    check("... and kept while it is a zombie", syscall(SYS_prlimit64, kid, RLIMIT_NOFILE, NULL, &rl) == 0 && rl.rlim_cur == 100);
     int status = 0;
     waitpid(kid, &status, 0);
     check("the other process saw its pipe's end", WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    pthread_t t;
+    limit_done = 0;
+    limit_tid = 0;
+    pthread_create(&t, NULL, limit_thread, NULL);
+    while (!limit_tid)
+        usleep(1000);
+    struct rlimit by_tid = {200, 4096}, now = {0}, back = {4096, 4096};
+    int set = syscall(SYS_prlimit64, limit_tid, RLIMIT_NOFILE, &by_tid, NULL) == 0;
+    int got = getrlimit(RLIMIT_NOFILE, &now) == 0 && now.rlim_cur == 200;
+    errno = 0;
+    int emfile = dup2(0, 200) == -1 && errno == EBADF && fcntl(0, F_DUPFD, 200) == -1 && errno == EINVAL;
+    setrlimit(RLIMIT_NOFILE, &back);
+    limit_done = 1;
+    pthread_join(t, NULL);
+    check("a thread's id names its process's RLIMIT_NOFILE, which bounds the descriptors", set && got && emfile);
 }
 
 int main(void) {

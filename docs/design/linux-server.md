@@ -122,7 +122,7 @@ processes, threads, memory objects and the services it uses.
 | IPC | today's services, and shared-memory rings for the I/O paths (separate design) |
 | devices | interrupts, I/O ports, PCI functions, DMA areas (as today; IOMMU per `iommu.md`) |
 | console | the framebuffer console and keyboard as a raw device the server's tty layer drives, held by one instance at a time (ADR 0004; `console_read`, `console_write`, `console_info`, `EVENT_CONSOLE`; R6d) |
-| the last mechanisms (R9) | `futex_wait`, `futex_wake`, `futex_requeue` on the program's memory; `thread_fs` (the FS base); `clock_set`; `power`; `file_pages` (tmpfs's statfs) |
+| the last mechanisms (R9) | `futex_wait`, `futex_wake`, `futex_requeue` on the program's memory; `thread_fs` (the FS base); `clock_set`; `power`; `host_granted`; `file_pages` (tmpfs's statfs) |
 
 What left the kernel over the migration (the last of it with R9, "Removing the
 pass-through" below): `process/syscall.rs`'s Linux dispatch, `sys_*.rs`, `signal.rs`,
@@ -639,8 +639,10 @@ like "terminate" (no core files: `RLIMIT_CORE` is 0, so the status has no core f
 
 ### Signals
 
-Standard signals pend once, real-time ones queue with their `siginfo` (at most 4096 queued in
-the instance; `sigqueue` beyond is EAGAIN, `kill` keeps the signal without its data). A
+Standard signals pend once, real-time ones queue with their `siginfo` while the instance's
+count of queued ones is below the target process's soft RLIMIT_SIGPENDING (4096 by default;
+Linux counts per user, and the one user is root); `sigqueue` beyond is EAGAIN, `kill` keeps
+the signal without its data. A
 process signal is taken by a thread that does not block it (the main thread first); the
 server kicks it. SIGKILL starts the group exit at once; SIGCONT ends a stop at once (and drops
 pending stop signals), a stop signal drops pending SIGCONT. Pid 1 of the instance gets only
@@ -914,13 +916,12 @@ the kernel keeps descriptor tables for its native servers only. Decisions in ADR
   process's table ends and for a message the collector dropped (an internet socket's close then goes through the net
   thread, which may wait for netd).
 - **The table** (`fdtable::FilesContext`) holds the descriptors (a description and the
-  close-on-exec bit), the lowest free slot, and RLIMIT_NOFILE (4096 by default, at most
-  2^20, Linux's fs.nr_open). Its calls: close, close_range (with `CLOSE_RANGE_CLOEXEC` and
+  close-on-exec bit) and the lowest free slot; a new descriptor is below the caller's
+  process's soft RLIMIT_NOFILE (`ids::Limits`: 4096 by default, at most 2^20, Linux's
+  fs.nr_open). Its calls: close, close_range (with `CLOSE_RANGE_CLOEXEC` and
   `CLOSE_RANGE_UNSHARE`), dup, dup2, dup3, fcntl's `F_DUPFD`, `F_DUPFD_CLOEXEC`, `F_GETFD`,
   `F_SETFD`, `F_GETFL` and `F_SETFL` (O_APPEND, O_NONBLOCK; O_DIRECT, O_NOATIME and O_ASYNC are ignored), the ioctls `FIONBIO`, `FIOCLEX`
-  and `FIONCLEX`, and RLIMIT_NOFILE of prlimit64 (any process's), getrlimit and setrlimit
-  (the limit is kept with the table, so processes sharing one with `CLONE_FILES` but not
-  `CLONE_THREAD` share it too, where Linux keeps one per process). No lock of a table is held
+  and `FIONCLEX`. No lock of a table is held
   while program memory is copied or a description is let go of.
 - **Which threads share a table** is the process model's (R8; until then the kernel's clone
   decided, with the server's record of each table in the kernel's, `SYS_FILES_RECORD`): each
@@ -1144,13 +1145,24 @@ affinity and getcpu calls in `mod.rs`; `timer.rs`'s interval timers; the per-pro
   instance writes its caches back first, as the kernel's reboot did); `sysinfo` the system's
   record (`procs` the instance's threads); `getcpu` `thread_info`; `getrandom` `random` 256
   bytes at a time, ending early for a signal as Linux beyond the first piece; `uname` is the
-  server's alone; `ioperm` and `iopl` EPERM (the tree has no ports). The resource limits but
-  RLIMIT_NOFILE start as Linux's defaults the server holds to (an 8 MiB stack, no core
-  files, 4096 queued signals) and are kept per process in the server's process table
-  (`ids::Limits` in `process::Proc`: inherited by fork and clone, kept by execve, another
-  process's by prlimit64).
+  server's alone; `ioperm` and `iopl` EPERM (the tree has no ports). The resource limits
+  start as Linux's defaults (an 8 MiB stack, no core files, 4096 descriptors, 4096 queued
+  real-time signals) and are kept per process (`ids::Limits`, shared by `process::Proc` and
+  its threads, which read them without a lock: copied by fork and clone, kept by execve and
+  by a zombie, another process's by prlimit64, named by any of its threads' ids). The server
+  holds to RLIMIT_STACK (execve keeps room for the new stack as Linux's mmap gap, the
+  caller's soft limit but at least 128 MiB and at most the 16 TiB above `MMAP_TOP`, the
+  kernel's `MO_GROWSDOWN` ceiling; within it the stack grows as far as the process's soft
+  limit at the time, which the kernel reads at each growth, `stack_limit`, set whenever it
+  changes and for every new process from its copy of the limits; brk stays out of the room
+  and its guard gap; a quarter of the caller's limit, at most 6 MiB, bounds the arguments and
+  environment; a growth into the 256-page guard gap above another mapping, or one that cannot
+  be committed, is SIGSEGV, EFAULT for a copy), RLIMIT_NOFILE, RLIMIT_SIGPENDING (against the
+  target's limit, the instance's count: Linux counts per user, the one user is root) and
+  RLIMIT_CORE; RLIMIT_NPROC is not enforced, as Linux does not for root.
 - **The host grant** (ADR 0011, decision 5): `clock_set` and `power` need the instance's
-  grant, which the kernel gives the trees it starts; without it the server acts as a
+  grant, which the kernel gives the trees it starts and takes back with the console when
+  the tree's first process ends (dropping its `process::Tree`); without it the server acts as a
   non-initial pid namespace (EPERM for setting the clock, `reboot` ends the tree with SIGHUP
   or SIGINT for its init). A `futex_requeue` moves only waits of `futex_wait` (decision 6).
 - **The kernel's clocks** have the kernel's ids (`CLOCK_WALL`, `CLOCK_MONO`,

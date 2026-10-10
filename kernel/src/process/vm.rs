@@ -84,7 +84,7 @@ pub fn place_and_map(addr: u64, len: u64, prot: Prot, backing: Backing, how: Pla
         // whatever the length).
         let hint_free = addr != 0
             && addr >= floor
-            && addr.checked_add(len).is_some_and(|e| e <= address_space::MMAP_TOP && !space.overlaps(addr, e));
+            && addr.checked_add(len).is_some_and(|e| e <= address_space::MMAP_TOP && !space.overlaps(addr, e) && !space.below_stack(e));
         if hint_free { addr } else { space.find_free(len, floor).ok_or(ENOMEM)? }
     };
     space.map(start, len, prot, backing, how.no_reserve).map_err(errno)?;

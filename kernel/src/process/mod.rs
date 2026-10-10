@@ -568,7 +568,9 @@ fn start_env() -> Vec<String> {
 /// address space and its first thread in the server (`ROLE_INIT`), which
 /// makes it pid 1 of the tree, gives it standard input, output and error
 /// on the console and execs the program; if that fails, it exits with 127.
-pub fn spawn(name: &str, args: &[&str]) -> Result<Pid, i64> {
+/// The starter ends the grants by dropping the `Tree` once the first
+/// process is gone.
+pub fn spawn(name: &str, args: &[&str]) -> Result<Tree, i64> {
     let path = if name.contains('/') { name.to_string() } else { alloc::format!("/bin/{name}") };
     let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
     let slot = sched::reserve_pid()?;
@@ -606,7 +608,28 @@ pub fn spawn(name: &str, args: &[&str]) -> Result<Pid, i64> {
     linux::host_grant(&instance, true);
     linux::console_grant(Some(&instance));
     sched::start(t);
-    Ok(pid)
+    Ok(Tree { pid, instance: Arc::downgrade(&instance) })
+}
+
+/// A process tree the kernel started (`spawn`): its first process, and
+/// what the grants it was given are attached to. The starter keeps it until
+/// that process has ended (it waited for it); dropping it then ends the
+/// grants: the console is the monitor's again and the host grant goes, so
+/// what is left of the tree finds its terminal hung up and the machine's
+/// state no longer its own to change (ADR 0007, 0011).
+#[must_use = "dropping the tree ends its grants"]
+pub struct Tree {
+    pub pid: Pid,
+    instance: alloc::sync::Weak<linux::Instance>,
+}
+
+impl Drop for Tree {
+    fn drop(&mut self) {
+        linux::console_grant(None);
+        if let Some(instance) = self.instance.upgrade() {
+            linux::host_grant(&instance, false);
+        }
+    }
 }
 
 /// Starts a privileged server process: it may register IPC services and
