@@ -108,6 +108,11 @@ pub fn is_service() -> bool {
     matches!(get().role.load(Ordering::Relaxed) as u64, ROLE_PAGER | ROLE_WORKER | ROLE_NET | ROLE_TIMER)
 }
 
+/// Whether the calling thread is the instance's pager.
+pub fn is_pager() -> bool {
+    get().role.load(Ordering::Relaxed) as u64 == restricted::ROLE_PAGER
+}
+
 /// Sets up a program thread's block (at its start, and when an exec changes its tid).
 pub fn set(tid: u32, pid: u32, key: u64, fs: *const FsContext, files: *const FilesContext, limits: *const Limits) {
     let l = get();

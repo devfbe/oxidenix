@@ -577,13 +577,16 @@ pub const SYS_MO_CREATE_CACHED: u64 = 1076;
 /// want of memory (`FILL_NOMEM`): then they go, and whoever waits for them
 /// or for missing pages of the range now gets an error (EIO: SIGBUS for a
 /// mapping; ENOMEM: a mapping's toucher is killed, as by Linux's OOM
-/// killer); nothing is kept for later accesses, which ask again. Wakes the
-/// waiters. EINVAL for another status.
+/// killer); nothing is kept for later accesses, which ask again. Or they
+/// were not read for a reason that says nothing about the file
+/// (`FILL_AGAIN`: the filesystem's server died): they go, and whoever waits
+/// for them asks again. Wakes the waiters. EINVAL for another status.
 pub const SYS_MO_FILLED: u64 = 1077;
 /// `mo_filled`'s statuses.
 pub const FILL_FAILED: u64 = 0;
 pub const FILL_OK: u64 = 1;
 pub const FILL_NOMEM: u64 = 2;
+pub const FILL_AGAIN: u64 = 3;
 /// `mo_redirty(handle, offset, pages)`: marks the present pages among
 /// `pages` from `offset` dirty again (their write-back failed).
 pub const SYS_MO_REDIRTY: u64 = 1078;
@@ -978,3 +981,8 @@ pub const TEST_KILL_SERVER: u64 = 1523;
 /// that a requeue's wakes spent on such waiters still move what it asked
 /// for. Test mode only; a program's call is the server's to pass on.
 pub const TEST_FUTEX_WATCH: u64 = 1524;
+/// `(ino)`: the next fill of the /data file with inode number `ino` fails as
+/// if diskfs died under it (the Linux server's own call, never the kernel's):
+/// a page a mapping waits for is still brought (on the next try), never
+/// SIGBUS. Inode 0 disarms it. Test mode only.
+pub const TEST_FILL_GONE: u64 = 1525;

@@ -452,10 +452,15 @@ impl Service {
 
     /// An offer from the kernel (a control request's payload): the status
     /// to answer with. The channel is attached unless it is refused here.
-    pub fn offer(&mut self, message: &[u8]) -> i64 {
+    pub fn offer(&mut self, fs: &mut Fs, message: &[u8]) -> i64 {
         let Some(offer) = Offer::decode(message) else { return -EINVAL };
         if offer.slots != fsring::SLOTS {
             return -EINVAL;
+        }
+        // The first client: the filesystem is in use (the disk says "not clean" before the
+        // first change goes out; nothing is written now, so a read-only disk serves reads).
+        if self.chans.iter().all(Option::is_none) {
+            let _ = fs.set_in_use(true);
         }
         let Some(slot) = self.chans.iter().position(Option::is_none) else { return -ENOSPC };
         let base = match oxrt::chan_attach(offer.channel) {
@@ -864,14 +869,17 @@ impl Service {
         if self.in_use(ino) || fs.check(ino).is_err() {
             return;
         }
-        if fs.stat(ino).is_ok_and(|s| s.links == 0) && fs.release(ino).is_err() {
+        // (`releasable`: its last link went; also one a failed commit left with its links.)
+        if fs.releasable(ino) && fs.release(ino).is_err() {
             // (A commit failed: tried again with the next barrier.)
             self.unfreed.insert(ino);
         }
     }
 
-    /// Frees again what a failed commit kept from being freed.
+    /// Frees again what a failed commit kept from being freed (diskfs's own tries, and the
+    /// inodes the filesystem kept back: `take_deferred`), unless someone may use them.
     fn retry_frees(&mut self, fs: &mut Fs) {
+        self.unfreed.extend(fs.take_deferred());
         for ino in core::mem::take(&mut self.unfreed) {
             self.try_free(fs, ino);
         }
@@ -915,12 +923,22 @@ impl Service {
     /// Channel `c` ends: diskfs lets go of it and its client's inodes.
     fn close(&mut self, fs: &mut Fs, c: usize) {
         let chan = self.chans[c].take().expect("a channel in use");
-        // Vouches that no device uses its grants any more.
-        let _ = oxrt::chan_detach(chan.id);
         fs.forget_promises(chan.id);
         for ino in chan.held.inodes() {
             self.try_free(fs, ino);
         }
+        // The last client gone: the disk says what it said at mount (clean) unless repairs
+        // are owed, before the channel goes (the kernel powers off once every channel went).
+        if self.chans.iter().all(Option::is_none) {
+            self.retry_frees(fs);
+            if self.unfreed.is_empty() {
+                if let Err(e) = fs.set_in_use(false) {
+                    println!("diskfs: cannot mark the disk clean (errno {})", e);
+                }
+            }
+        }
+        // Vouches that no device uses its grants any more.
+        let _ = oxrt::chan_detach(chan.id);
     }
 
     fn post(&mut self) -> bool {
@@ -1121,9 +1139,7 @@ impl Service {
     // ------------------------------------------------------------ barriers
 
     fn run_barrier(&mut self, fs: &mut Fs, c: usize, d: &Desc) {
-        if !self.unfreed.is_empty() {
-            self.retry_frees(fs);
-        }
+        self.retry_frees(fs);
         let (status, values) = match Request::decode(d).and_then(|r| self.execute(fs, c, r)) {
             Ok((status, values)) => (status, values),
             Err(e) => (-e, [0; 4]),
@@ -1148,8 +1164,14 @@ impl Service {
 
     /// An unlink's or rename's completion: the inode whose last link went
     /// and that someone uses (0: none), and its generation.
-    fn gone(gone: &[(u32, u32)]) -> Result<(i64, [u64; 4]), i64> {
+    /// (An unlink or rename takes the last link of one inode at most; were there more,
+    /// the client could hold only the first: the others are let go of here, freed once
+    /// whoever else holds them lets go.)
+    fn gone(&mut self, fs: &mut Fs, gone: &[(u32, u32)]) -> Result<(i64, [u64; 4]), i64> {
         let Some(&(ino, generation)) = gone.first() else { return Ok((0, [0; 4])) };
+        for &(other, _) in &gone[1..] {
+            self.try_free(fs, other);
+        }
         Ok((0, [ino as u64, generation as u64, 0, 0]))
     }
 
@@ -1219,7 +1241,7 @@ impl Service {
                 // An inode no one may use is freed at once; one in use is orphaned, and
                 // the client gets it to hold and release.
                 let gone = fs.unlink_unless(dir, &name, is_dir, |ino| self.in_use(ino))?;
-                Self::gone(&gone)
+                self.gone(fs, &gone)
             }
             Request::Rename { from, name, to, new_name } => {
                 let from = Self::node(fs, from)?;
@@ -1227,7 +1249,7 @@ impl Service {
                 Self::live_dir(fs, to)?;
                 let (old, new) = (self.name(c, &name)?, self.name(c, &new_name)?);
                 let gone = fs.rename_unless(from, &old, to, &new, |ino| self.in_use(ino))?;
-                Self::gone(&gone)
+                self.gone(fs, &gone)
             }
             Request::Truncate { ino, len } => {
                 let ino = Self::node(fs, ino)?;

@@ -363,7 +363,9 @@ pages and dirty marks the kernel keeps and whose data the server moves:
   window (`grant(.., GRANT_WRITE | GRANT_FILL, out)`: at most 256, the run's first page, its
   length and the file's size at `out`): they become **pending**, zeroed frames pinned for the grant that nobody reads,
   maps or writes. diskfs reads into them by DMA; `mo_filled(handle, offset, pages, status)`
-  (1077) makes them the file's pages (`FILL_OK`) or drops them (the threads waiting for them get
+  (1077) makes them the file's pages (`FILL_OK`), drops them as missing again when diskfs died
+  under the read (`FILL_AGAIN`: their waiters ask again, and the next channel fills them), or
+  drops them as failed (the threads waiting for them get
   `EIO`, a mapping `SIGBUS`, for `FILL_FAILED`, a page that could not be read; `ENOMEM`, the
   toucher of a mapping killed as out of memory, for `FILL_NOMEM`, a page there was no memory
   for even after waiting for reclaim: a faulting thread is among a page's waiters before it asks, so the answer to its own
