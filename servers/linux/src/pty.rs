@@ -12,6 +12,7 @@
 //! the slave, as Linux's.
 
 use crate::files::{self, File, EINVAL, O_ACCMODE, O_CLOEXEC, O_NONBLOCK};
+use crate::heap::{self, TryGrow};
 use crate::sync::Mutex;
 use crate::namespace::Origin;
 use crate::tmpfs;
@@ -21,7 +22,6 @@ use crate::usercopy;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::ToString;
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 use ldisc::Termios;
 
 const ENOSPC: i64 = 28;
@@ -69,15 +69,19 @@ pub fn devpts() -> Arc<tmpfs::Inode> {
     r
 }
 
-/// Every pty's slave terminal.
-pub fn all() -> Vec<Arc<Tty>> {
-    PTYS.lock().values().cloned().collect()
+/// The pty after index `after` (the first without), and its slave terminal: the ptys one
+/// after the other, none listed (`tty::find`).
+pub fn next(after: Option<u32>) -> Option<(u32, Arc<Tty>)> {
+    let from = after.map_or(0, |a| a as u64 + 1);
+    let ptys = PTYS.lock();
+    let (&index, tty) = ptys.range(u32::try_from(from).ok()?..).next()?;
+    Some((index, tty.clone()))
 }
 
 /// Opens /dev/ptmx: a new pair, its master's descriptor.
 pub fn open_master(flags: u32, origin: Origin) -> Result<i64, i64> {
     let id = files::new_id();
-    let (index, tty) = {
+    let (index, master) = {
         let mut ptys = PTYS.lock();
         let index = (0..MAX_PTYS).find(|i| !ptys.contains_key(i)).ok_or(ENOSPC)?;
         let state = PtyState {
@@ -90,12 +94,15 @@ pub fn open_master(flags: u32, origin: Origin) -> Result<i64, i64> {
             master_id: id,
             master_reported: 0,
         };
-        let tty = Tty::new(Driver::Pty(index), Termios::default(), [0; 4], Some(state));
+        // The pair and its master's memory before it is listed (ENOMEM: nothing made).
+        let tty = Tty::new(Driver::Pty(index), Termios::default(), [0; 4], Some(state))?;
+        let master = heap::try_arc(PtyMaster { tty: tty.clone(), index, origin })?;
+        heap::preload()?;
         ptys.insert(index, tty.clone());
-        (index, tty)
+        (index, master)
     };
+    let tty = master.tty.clone();
     let node = devpts().insert_device(&index.to_string(), vfs::stat::dev_make(SLAVE_MAJOR, index), 0o620);
-    let master = Arc::new(PtyMaster { tty: tty.clone(), index, origin });
     {
         let mut inner = tty.inner.lock();
         let ready = Tty::master_readiness(&inner);
@@ -235,7 +242,8 @@ impl PtyMaster {
                 let flags = arg as u32 & (O_ACCMODE | O_NONBLOCK | O_CLOEXEC | O_NOCTTY);
                 let name = self.index.to_string();
                 let node = devpts().lookup(&name).map_err(|_| EIO)?;
-                let path = alloc::format!("/dev/pts/{}", name);
+                // (Kept with the open file description: had fallibly.)
+                let path = crate::try_format!("/dev/pts/{}", name)?;
                 open_slave(self.index, flags, Origin::new(crate::namespace::Node::Tmp(node), path, vfs::S_IFCHR))
             }
             TIOCSIG => {
@@ -284,7 +292,8 @@ impl PtyMaster {
                 let b: u8 = usercopy::read(arg)?;
                 let mut inner = self.tty.inner.lock();
                 if let Some(p) = inner.pty.as_mut() {
-                    if p.out.len() < tty::MASTER_CAP {
+                    // (Without memory: dropped, as when it is full.)
+                    if p.out.len() < tty::MASTER_CAP && p.out.try_grow(1).is_ok() {
                         p.out.push_back(b);
                     }
                 }

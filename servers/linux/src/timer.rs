@@ -85,9 +85,15 @@ pub fn thread() -> ! {
         let next = {
             let mut t = PROCS.lock();
             let now = now();
-            let due: alloc::vec::Vec<Pid> =
-                t.procs.values().filter(|p| p.zombie.is_none() && p.itimer.at != 0 && !p.itimer.parked && p.itimer.at <= now).map(|p| p.pid).collect();
-            for pid in due {
+            // The expired ones one after the other, in pid order (none listed: the
+            // service thread allocates nothing for the programs' timers).
+            let mut from: Pid = 0;
+            while let Some(pid) = t
+                .procs
+                .range(from..)
+                .find(|(_, p)| p.zombie.is_none() && p.itimer.at != 0 && !p.itimer.parked && p.itimer.at <= now)
+                .map(|(&pid, _)| pid)
+            {
                 let p = t.procs.get_mut(&pid).expect("listed");
                 if p.itimer.every == 0 {
                     p.itimer.at = 0;
@@ -95,6 +101,8 @@ pub fn thread() -> ! {
                     p.itimer.parked = true;
                 }
                 signal::post_process(&mut t, pid, SigInfo::kernel(signal::SIGALRM), false);
+                let Some(next) = pid.checked_add(1) else { break };
+                from = next;
             }
             t.procs.values().filter(|p| p.zombie.is_none() && p.itimer.at != 0 && !p.itimer.parked).map(|p| p.itimer.at).min().unwrap_or(0)
         };
