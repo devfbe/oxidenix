@@ -128,14 +128,19 @@ it reads, the clock, is the kernel's. Five questions shaped the design:
   clock page is the same for every process: none can write it.
 - The coarse clocks cost what the precise ones cost (a TSC read). Linux's tick-updated
   coarse time would need the kernel to publish the time at every tick from one CPU; with
-  the precise clocks at about 50 cycles there is little to gain.
+  the precise clocks at about 80 cycles there is little to gain.
 - Not done: `[vvar]`'s Linux name of the per-clock page (`[vvar_vclock]`, Linux 6.13), the
   vDSO's `getrandom` (Linux 6.11; musl does not use it), names of other mapped files in
   `/proc/<pid>/maps` and `smaps`.
 
 ## Measurements
 
-Filled in below (`scripts/bench.sh`, several boots before and after, idle host).
+`scripts/bench.sh`, three boots before (`9b2c6be`) and after (`c12ae4f`) in turn, p50 in
+cycles including the two RDTSCs around the call and musl's wrapper
+(`docs/benchmarks/README.md`, "The vDSO"): `clock_gettime(CLOCK_MONOTONIC)` 1536, 1544, 1554
+→ 79, 82; `gettimeofday` 1546, 1509, 1559 → 85, 85 (a third run after, on a host that got
+busy, 104 and 110). The forwarded null call (1330 → 1334) and `fork_exec_wait` (152 → 153 µs)
+are unchanged.
 
 Tested by `userspace/vdsotest.c` (in the self-tests): `AT_SYSINFO_EHDR`, the ELF (one R+X
 `PT_LOAD`, no relocations, `linux-vdso.so.1`, `DT_HASH`, versions) and the five functions

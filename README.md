@@ -617,7 +617,7 @@ call into a device:
   kernel's own formulas, so they agree with the system call to the nanosecond; the CPU-time
   and alarm clocks, invalid clocks and a time zone are the system call's, as on Linux. musl
   uses it for `clock_gettime`, `gettimeofday`, `time` and `sched_getcpu`: `clock_gettime`
-  costs about 50 cycles instead of about 1 540.
+  costs about 80 cycles (measured around the call) instead of about 1 540.
 - **CPU time**: each context switch adds the time slice to the task's run time (under a
   sequence counter, so other CPUs read it consistently); the current slice counts too. The
   per-thread and per-process CPU clocks (also those of other threads, as
