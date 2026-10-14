@@ -144,8 +144,12 @@ static void sysctls(void) {
           set_mode(3) == EINVAL && write_text("/proc/sys/vm/overcommit_memory", "-1") == EINVAL && write_text("/proc/sys/vm/overcommit_memory", "two") == EINVAL &&
               read_long("/proc/sys/vm/overcommit_memory") == 2);
 
+    /* This tree's pid 1 is the machine's init while the tree holds the host grant:
+     * never chosen (oom_score 0), and chosen like any other without it. */
+    long init_score = pid_long(1, "oom_score");
     /* Without the host grant (a tree that is not the machine's owner): read-only. */
     long had = syscall(TEST_HOST, 0);
+    long init_plain = pid_long(1, "oom_score");
     int ro = open("/proc/sys/vm/overcommit_memory", O_WRONLY) < 0 && errno == EACCES;
     int readable = read_long("/proc/sys/vm/overcommit_memory") == 2;
     int below = pid_write(getpid(), "oom_score_adj", "-5") == EACCES;
@@ -153,6 +157,7 @@ static void sysctls(void) {
     syscall(TEST_HOST, had);
     check("without the host grant: overcommit_memory is EACCES to write, readable", had == 1 && ro && readable);
     check("... and oom_score_adj cannot go below its least (EACCES), up it can", below && raise);
+    check("pid 1 of the host's tree scores 0, of a tree without the grant more", init_score == 0 && init_plain > 0);
 }
 
 static void scores(void) {
@@ -181,6 +186,7 @@ static void scores(void) {
     char task[64];
     snprintf(task, sizeof task, "task/%d/oom_score_adj", small);
     check("a thread's directory shows its process's", pid_long(small, task) == -1000);
+    check("only -1000 exempts: -999 still scores", pid_write(small, "oom_score_adj", "-999") == 0 && pid_long(small, "oom_score") > 0);
     kill(small, SIGKILL);
     kill(big, SIGKILL);
     waitpid(small, NULL, 0);

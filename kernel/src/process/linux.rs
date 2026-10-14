@@ -342,7 +342,9 @@ pub struct Instance {
     /// whoever starts the tree (`host_grant`: the monitor's `run` and
     /// autorun do); without it those calls are EPERM, and the server acts
     /// as Linux in a pid namespace that is not the initial one (ADR 0011).
-    host: core::sync::atomic::AtomicBool,
+    /// Shared with the tree's first process (`ThreadGroup::host_init`), so
+    /// the OOM killer reads it without looking the instance up.
+    host: Arc<core::sync::atomic::AtomicBool>,
     /// Its writes to the kernel's log without the host grant (`SYS_KLOG_WRITE`).
     klog_limit: crate::klog::RateLimit,
     /// A top-level table with only the shared slot, to map into the region.
@@ -491,6 +493,7 @@ impl Instance {
     /// A new instance with the server's program loaded.
     pub fn new() -> Result<Arc<Instance>, i64> {
         let image = IMAGE.get().ok_or(ENOEXEC)?;
+        let host = Arc::try_new(core::sync::atomic::AtomicBool::new(false)).map_err(|_| ENOMEM)?;
         let view = zeroed_frame()?;
         let pdpt = match zeroed_frame() {
             Ok(f) => f,
@@ -511,7 +514,7 @@ impl Instance {
         static NEXT_ID: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
         let mut instance = Instance {
             id: NEXT_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
-            host: core::sync::atomic::AtomicBool::new(false),
+            host,
             klog_limit: crate::klog::RateLimit::new(),
             view,
             pdpt,
@@ -1326,11 +1329,10 @@ pub fn host_grant(instance: &Instance, on: bool) {
     instance.host.store(on, core::sync::atomic::Ordering::Release);
 }
 
-/// Whether the instance `id` (`ThreadGroup::instance`) holds the host grant
-/// (false if it is gone); None if there is no memory to look, which a
-/// caller deciding what to protect must take as granted. With no lock held.
-pub fn host_granted(id: u64) -> Option<bool> {
-    Some(try_instances(None)?.iter().any(|i| i.id == id && i.host.load(core::sync::atomic::Ordering::Acquire)))
+/// The instance's host grant, as its tree's first process keeps it
+/// (`ThreadGroup::host_init`).
+pub fn host_flag(instance: &Instance) -> Arc<core::sync::atomic::AtomicBool> {
+    instance.host.clone()
 }
 
 /// Grants the console device to `instance` (None: the kernel's monitor, which

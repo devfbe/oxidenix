@@ -148,6 +148,10 @@ pub struct ThreadGroup {
     /// The OOM killer killed it (Linux's TIF_MEMDIE): its threads' faults
     /// may take frames of the kernel's reserve, so it can get to its end.
     pub oom_victim: AtomicBool,
+    /// The first process of a tree: its instance's host grant (while it
+    /// holds, the process is Linux's global init, which the OOM killer
+    /// never chooses). Unset for every other process.
+    pub host_init: spin::Once<Arc<AtomicBool>>,
 }
 
 impl ThreadGroup {
@@ -165,6 +169,7 @@ impl ThreadGroup {
             oom_score_adj: AtomicI64::new(0),
             oom_score_adj_min: AtomicI64::new(0),
             oom_victim: AtomicBool::new(false),
+            host_init: spin::Once::new(),
         })
         .ok()
     }

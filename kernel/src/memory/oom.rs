@@ -124,11 +124,11 @@ fn next_group(at: &mut Option<u64>) -> Option<Arc<ThreadGroup>> {
 }
 
 /// Whether `group` is the first process of a tree that holds the host grant (Linux's
-/// global init, which is never killed). A tree's first process counts as one when the
-/// instances cannot be looked at (no memory): protected rather than killed by mistake.
+/// global init, which is never killed): read from the grant the process keeps, without a
+/// lookup that could fail (nothing a program does can make it fail and so win itself an
+/// exemption, nor lose the host's init its own).
 fn host_init(group: &ThreadGroup) -> bool {
-    let instance = group.instance.load(Ordering::Acquire);
-    instance != 0 && !group.server_reaps.load(Ordering::Relaxed) && crate::process::linux::host_granted(instance).unwrap_or(true)
+    group.host_init.get().is_some_and(|host| host.load(Ordering::Acquire))
 }
 
 /// Whether `group` is a victim whose memory has not come back yet (killed, its address
@@ -212,8 +212,9 @@ pub fn out_of_memory(n: u64) -> bool {
     let mut best: Option<(Arc<ThreadGroup>, Arc<MemStats>, i64)> = None;
     let mut at = None;
     while let Some(group) = next_group(&mut at) {
-        // A victim not waited for (`VICTIMS` was full) still holds the choice off, as
-        // Linux's `oom_evaluate_task` aborts at one: no second kill for memory on its way.
+        // A victim whose memory is on its way (the reaper sees to it within a second, or
+        // it was never queued and is skipped) holds the choice off, as Linux's
+        // `oom_evaluate_task` aborts at one: no second kill for the same memory.
         if unresolved_victim(&group) {
             return true;
         }
@@ -327,6 +328,10 @@ fn kill(victim: &Arc<ThreadGroup>, stats: &Arc<MemStats>) {
     };
     if queued {
         sched::wakeup(reaper_chan());
+    } else {
+        // Not waited for (nobody would reap it or give up on it): the next choice
+        // goes on without it rather than wait for good.
+        stats.oom_skip.store(true, Ordering::Release);
     }
 }
 
