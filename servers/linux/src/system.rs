@@ -1,5 +1,6 @@
 //! Calls about the machine and the calling thread's CPU state (phase R9, from the kernel's
-//! Linux code): uname, sysinfo, reboot, getrandom, getcpu, arch_prctl, and ioperm and iopl,
+//! Linux code): uname, sysinfo, reboot, getrandom, getcpu, arch_prctl, syslog (`kmsg`'s),
+//! and ioperm and iopl,
 //! over the kernel's mechanisms (`SYS_SYSTEM_INFO`, `SYS_POWER`, `SYS_RANDOM`,
 //! `SYS_THREAD_INFO`, `SYS_THREAD_FS`). A tree without the kernel's host grant is a pid
 //! namespace that is not the initial one: reboot ends the tree (ADR 0011).
@@ -16,6 +17,7 @@ const EFAULT: i64 = 14;
 
 const SYS_UNAME: u64 = 63;
 const SYS_SYSINFO: u64 = 99;
+const SYS_SYSLOG: u64 = 103;
 const SYS_ARCH_PRCTL: u64 = 158;
 const SYS_IOPL: u64 = 172;
 const SYS_IOPERM: u64 = 173;
@@ -33,6 +35,7 @@ pub fn handle(s: &State) -> Option<i64> {
         SYS_GETRANDOM => getrandom(a0, a1, a2),
         SYS_GETCPU => getcpu(a0, a1),
         SYS_ARCH_PRCTL => arch_prctl(a0, a1),
+        SYS_SYSLOG => crate::kmsg::syslog(a0, a1, a2),
         // The tree has no I/O ports (the native servers' are the kernel's to give).
         SYS_IOPERM | SYS_IOPL => Err(EPERM),
         _ => return None,

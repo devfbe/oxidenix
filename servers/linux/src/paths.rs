@@ -317,7 +317,7 @@ fn openat(dirfd: u64, addr: u64, flags: u32, mode: u32) -> Result<i64, i64> {
     let abs = join(&resolved.path);
     // A character device node names its driver by its number, wherever the
     // node is (/dev, devpts, any tmpfs or /data): the terminals are `tty`'s,
-    // null (1,3) and zero (1,5) `devices`'; any other number has no driver
+    // null (1,3) and zero (1,5) `devices`', kmsg (1,11) `kmsg`'s; any other number has no driver
     // (ENXIO). The opens keep the node they were opened by (`Origin`: a live
     // fstat, fchmod and the like). O_DIRECTORY is ENOTDIR.
     if resolved.mode & vfs::S_IFMT == vfs::S_IFCHR {
@@ -330,6 +330,7 @@ fn openat(dirfd: u64, addr: u64, flags: u32, mode: u32) -> Result<i64, i64> {
         return match vfs::stat::dev_split(rdev) {
             (1, 3) => devices::open(Kind::Null, flags, origin),
             (1, 5) => devices::open(Kind::Zero, flags, origin),
+            (1, 11) => crate::kmsg::open(flags, origin),
             _ => crate::tty::open_device(rdev, flags, origin).unwrap_or(Err(crate::tty::ENXIO)),
         };
     }

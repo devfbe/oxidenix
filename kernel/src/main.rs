@@ -18,6 +18,7 @@ mod counters;
 mod drivers;
 mod fs;
 mod interrupts;
+mod klog;
 mod memory;
 mod process;
 mod random;
@@ -208,6 +209,8 @@ pub static TEST_MODE: core::sync::atomic::AtomicBool = core::sync::atomic::Atomi
 fn panic(info: &PanicInfo) -> ! {
     // Stop the other CPUs first, so the message is the last word.
     interrupts::apic::ipi::halt_others();
+    // (The stopped CPUs may hold the log's locks: the message goes to the console only.)
+    klog::panic();
     printkln!("KERNEL PANIC (CPU {}): {}", smp::cpu().index, info);
     if TEST_MODE.load(core::sync::atomic::Ordering::Relaxed) {
         power_off(1);

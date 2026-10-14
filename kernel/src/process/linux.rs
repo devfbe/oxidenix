@@ -1315,6 +1315,7 @@ impl Drop for Instance {
     /// No address space shows the region any more: its frames go.
     fn drop(&mut self) {
         crate::drivers::console_device::release(self.id);
+        crate::klog::forget(self.id);
         memory::uncommit(self.heap.get_mut().charge.close(&HEAP_POOL));
         memory::with_frames(|frames| unsafe {
             free_level(frames, self.pdpt, 3);
@@ -2183,6 +2184,41 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             crate::printkln!("[linux] {}", text.trim_end());
             Ok(0)
         }
+        SYS_KLOG_READ => {
+            let cap = a[2].min(KLOG_READ_MAX) as usize;
+            let mut records = Vec::new();
+            records.try_reserve_exact(cap).map_err(|_| ENOMEM)?;
+            let (first, next) = crate::klog::read(a[0], cap, &mut records);
+            // (`cap` 0 asks for the window alone: `buf` may be null.)
+            if !records.is_empty() {
+                super::uaccess::copy_to_server(a[1], &records)?;
+            }
+            let window = [first.to_le_bytes(), next.to_le_bytes()].concat();
+            super::uaccess::copy_to_server(a[3], &window)?;
+            Ok(records.len() as i64)
+        }
+        SYS_KLOG_WRITE => {
+            if a[0] >= KLOG_PRIO_END {
+                return Err(EINVAL);
+            }
+            let len = a[2].min(KLOG_LINE_MAX) as usize;
+            let mut text = [0u8; KLOG_LINE_MAX as usize];
+            super::uaccess::copy_from_server(a[1], &mut text[..len])?;
+            crate::klog::log_record(a[0] as u16, &text[..len]);
+            if crate::klog::on_console(a[0] as u16) {
+                crate::drivers::console::write_text(&text[..len]);
+                crate::drivers::console::write_text(b"\n");
+            }
+            Ok(0)
+        }
+        SYS_KLOG_ARM => crate::klog::arm(instance.id, instance.pager_chan(), a[0]).map(|armed| armed as i64),
+        SYS_KLOG_CONSOLE => {
+            // The console's level is the machine's, as its clock (ADR 0011).
+            if !instance.host.load(core::sync::atomic::Ordering::Acquire) {
+                return Err(EPERM);
+            }
+            crate::klog::console(a[0], a[1]).map(|_| 0)
+        }
         SYS_MO_MAP_SERVER => {
             // Plain memory only (its pages are made present now).
             let Object::Memory(object) = instance.object(a[0])? else { return Err(EINVAL) };
@@ -2721,6 +2757,10 @@ fn event_wait(instance: &Arc<Instance>, out: u64, deadline: u64) -> Option<SysRe
             // it takes no lock of the instance).
             if crate::drivers::console_device::take_event(instance.id) {
                 return Some(Some(Event { kind: EVENT_CONSOLE, a: 0, b: 0 }));
+            }
+            // A record of the kernel's log the instance armed its watch for.
+            if crate::klog::take_event(instance.id) {
+                return Some(Some(Event { kind: EVENT_KLOG, a: 0, b: 0 }));
             }
             // Memory is short (`post_shrink`, by a flag likewise), once
             // `SHRINK_INTERVAL` passed since the last time.

@@ -803,8 +803,22 @@ macro_rules! printkln {
     ($($arg:tt)*) => ($crate::printk!("{}\n", format_args!($($arg)*)));
 }
 
+/// `printk`: the kernel's message to its log (`KERN_INFO`) and, unless the console's
+/// level hides it, to the console.
 pub fn _print(args: fmt::Arguments) {
     use core::fmt::Write;
+    /// The text as it is (lines end in `\n`).
+    struct Raw<F: FnMut(&[u8])>(F);
+    impl<F: FnMut(&[u8])> fmt::Write for Raw<F> {
+        fn write_str(&mut self, s: &str) -> fmt::Result {
+            (self.0)(s.as_bytes());
+            Ok(())
+        }
+    }
+    let _ = Raw(|b: &[u8]| crate::klog::log(crate::klog::LEVEL_INFO, b)).write_fmt(args);
+    if !crate::klog::on_console(crate::klog::LEVEL_INFO) {
+        return;
+    }
     let _ = Text(super::serial::write_bytes).write_fmt(args);
     without_interrupts(|| {
         if let Some(c) = CONSOLE.lock().as_mut() {

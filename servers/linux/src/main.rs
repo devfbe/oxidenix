@@ -37,6 +37,7 @@ mod inet;
 mod inetcalls;
 mod initramfs;
 mod inotify;
+mod kmsg;
 mod local;
 mod mm;
 mod namespace;
@@ -390,6 +391,11 @@ fn pager() -> ! {
             }
             EVENT_CONSOLE_LOST => {
                 console::lost();
+                continue;
+            }
+            EVENT_KLOG => {
+                // New records in the kernel's log: its readers look again.
+                kmsg::event();
                 continue;
             }
             EVENT_SHRINK => {

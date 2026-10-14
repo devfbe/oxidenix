@@ -144,13 +144,16 @@ fn random(buf: u64, len: u64) -> SysResult {
     copied.map(|_| n as i64)
 }
 
-/// `log(buf, len)`: the caller's text on the console.
+/// `log(buf, len)`: the caller's text on the console and in the kernel's log.
 fn log(buf: u64, len: u64) -> SysResult {
     let n = len.min(LOG_MAX) as usize;
     let mut text = alloc::vec::Vec::new();
     text.try_reserve_exact(n).map_err(|_| ENOMEM)?;
     text.resize(n, 0);
     uaccess::copy_from(buf, &mut text)?;
-    crate::drivers::console::write_text(&text);
+    crate::klog::log(crate::klog::LEVEL_INFO, &text);
+    if crate::klog::on_console(crate::klog::LEVEL_INFO) {
+        crate::drivers::console::write_text(&text);
+    }
     Ok(n as i64)
 }

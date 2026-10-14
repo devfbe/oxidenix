@@ -301,6 +301,10 @@ pub const EVENT_SERVICE_GONE: u64 = 24;
 /// cost nothing to make again (Linux's shrinkers). Requests coalesce into
 /// the largest until taken; at most one a second.
 pub const EVENT_SHRINK: u64 = 25;
+/// The kernel's log has a record the instance armed its watch for
+/// (`klog_arm`): its readers of `syslog` and `/dev/kmsg` look again. Once
+/// per arming.
+pub const EVENT_KLOG: u64 = 26;
 
 /// A server thread starts with its `State` in `rdi`, its role in `rsi`,
 /// and, serving a program, the `cookie` its creator gave `thread_create`
@@ -656,6 +660,57 @@ pub const SYS_MO_UNBACK: u64 = 1084;
 /// the server does not implement.
 pub const SYS_SERVER_LOG: u64 = 1085;
 pub const SERVER_LOG_MAX: u64 = 256;
+
+// The kernel's log (Linux's printk buffer, `kernel/src/klog.rs`): records of
+// the kernel's messages, the servers' and what programs write to /dev/kmsg;
+// `syslog(2)` and /dev/kmsg, with their readers' positions, are the server's.
+
+/// `klog_read(from, buf, cap, out) -> n`: the log's records from sequence
+/// `from` on (or its first, if older ones are gone), as many whole ones as
+/// fit in `cap` bytes, to `buf`: each a `KlogRecord` and its text, padded
+/// to 8 bytes; `n` bytes in all. Two u64s to `out`: the sequence of the
+/// log's first record and the next one's. `cap` is at most `KLOG_READ_MAX`;
+/// with `cap` 0 (`buf` may be null) only the window is written.
+pub const SYS_KLOG_READ: u64 = 1172;
+pub const KLOG_READ_MAX: u64 = 64 * 1024;
+/// `klog_write(prio, buf, len)`: appends a record of priority `prio`
+/// (`facility << 3 | level`, below `KLOG_PRIO_END`: Linux's facilities go
+/// to 127) with the text at `buf` (at most `KLOG_LINE_MAX` bytes kept), and
+/// prints it on the console if the console's level shows it.
+pub const SYS_KLOG_WRITE: u64 = 1173;
+pub const KLOG_LINE_MAX: u64 = 992;
+pub const KLOG_PRIO_END: u64 = 1024;
+/// `klog_arm(seq) -> armed`: 0 if the log has a record of sequence `seq`
+/// or later; else 1, and `EVENT_KLOG` comes once one is there (an earlier
+/// arming of the instance's that has not fired keeps the lower sequence).
+pub const SYS_KLOG_ARM: u64 = 1174;
+/// `klog_console(action, level)`: the console's level, as `syslog`'s
+/// actions 6 (`CONSOLE_OFF`), 7 (`CONSOLE_ON`) and 8 (`CONSOLE_LEVEL`,
+/// `level` 1..=8); EINVAL otherwise. EPERM without the kernel's host grant
+/// (the level is the machine's, as its clock: ADR 0011).
+pub const SYS_KLOG_CONSOLE: u64 = 1175;
+/// The log's size in bytes (`syslog`'s `SIZE_BUFFER`).
+pub const KLOG_BYTES: u64 = 128 * 1024;
+
+/// A record as `klog_read` gives it, its text after it.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct KlogRecord {
+    pub seq: u64,
+    /// Nanoseconds since boot.
+    pub ts_ns: u64,
+    /// The text's length in bytes.
+    pub len: u32,
+    /// `facility << 3 | level`.
+    pub prio: u32,
+}
+
+impl KlogRecord {
+    pub fn as_bytes(&self) -> &[u8] {
+        // (A plain struct of integers without padding.)
+        unsafe { core::slice::from_raw_parts(self as *const Self as *const u8, core::mem::size_of::<Self>()) }
+    }
+}
 // 1090 was `thread_exists`: thread ids are the server's since R8.
 // 1093 was `kfd_stat`.
 // 1094 was `net_links`, the kernel's relay of netd's interface records:

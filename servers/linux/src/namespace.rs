@@ -239,6 +239,7 @@ fn dev() -> Arc<tmpfs::Inode> {
         ("ptmx", dev_make(5, 2), 0o666),
         ("null", dev_make(1, 3), 0o666),
         ("zero", dev_make(1, 5), 0o666),
+        ("kmsg", dev_make(1, 11), 0o644),
     ];
     for (name, rdev, perm) in nodes {
         let _ = dev.insert_device(name, rdev, perm);
