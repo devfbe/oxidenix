@@ -221,7 +221,10 @@ only beyond it; a decommit, or a commit's pages that could not be mapped, refill
 commitment is returned. The reserve is had only when there is room: a tree whose instance is
 made near the limit starts with less or none (never refused for it), and it is topped up after
 each successful commit as far as there is room then. All instances' reserves together are at
-most a 16th of the commit limit (a pool), so many trees cannot crowd out programs with them.
+most a 16th of user memory (a pool), so many trees cannot crowd out programs with them. When
+memory is overcommitted (ADR 0013) a commitment is no frame: a commit from the reserve (the
+allocations the server cannot fail) may then take frames of the kernel's reserve, until the
+OOM killer made room.
 The account (`pageheap::charge`: `Charge`, `Pool`) is pure arithmetic, host-tested over random
 operations: an instance holds exactly its mapped pages plus its reserve, the pool's count is
 the sum of the reserves, no refund exceeds what was charged (an unmap of more pages than are
@@ -636,6 +639,8 @@ memory counts. Decisions in ADR 0010.
 | `thread_name(key, name, len)` | the kernel's name of a thread (its monitor and messages) |
 | `init_args(buf, cap)` | the command line the kernel started the tree with (for its first thread) |
 | `vm_floor(addr)` | the lowest address a mapping without `MO_FIXED` is placed at (the break: `brk` is the server's) |
+| `oom_score_adj(handle, set, value)` | the OOM killer's adjustment of a process (and of those sharing its address space): read, or set within -1000..=1000, below its least only with the host grant (ADR 0013); `proc_info` reports the killer's badness of it and its resident pages by kind |
+| `overcommit(which, set, value)` | the machine's overcommit policy (mode, ratio, KiB), set with the host grant only (ADR 0013) |
 
 A thread's **key** is its thread area's number and a generation (`slot | gen << 32`): the
 server names threads by it, and a key outlives no thread (a reused area gets a new
@@ -812,10 +817,11 @@ for its group (`tty`), a write to a pipe or socket without a reader SIGPIPE for 
 
 `/proc/<pid>` (also for a thread's tid, as Linux), `/proc/self` and `/proc/thread-self` are
 the server's, from its tables and the kernel's `proc_info`/`thread_info`: `stat`, `statm`,
-`status`, `cmdline`, `comm`, `exe`, `cwd`, `task/<tid>/...` (oxidenix's `counters`, the
-calls the server passed through for the process, went with the pass-through in R9). The
-system's files (`stat`, `meminfo`,
-`uptime`, `loadavg`, `cpuinfo`, `mounts`, `counters`, `sys/`) stay procfs's.
+`status`, `cmdline`, `comm`, `exe`, `cwd`, `oom_score`, `oom_score_adj`, `oom_adj`,
+`task/<tid>/...` (oxidenix's `counters`, the calls the server passed through for the process,
+went with the pass-through in R9). The system's files (`stat`, `meminfo`,
+`uptime`, `loadavg`, `cpuinfo`, `mounts`, `counters`, `sys/`) stay procfs's, but for
+`/proc/sys/vm` (the overcommit policy, the server's over the kernel's `overcommit` call).
 
 ### Calls that name a pid
 
@@ -1146,9 +1152,12 @@ servers until R9 (which gave them a console log call instead and removed them).
   through its scratch grant. Nothing of it is cached; a procfs that died is started again
   for a new channel and serves the same inodes.
 - **The server's own part**, each process's: `/proc/<pid>` with `stat`, `statm`, `status`,
-  `cmdline`, `comm`, `exe`, `mounts`, `task/<tid>/{stat,statm,
-  status,cmdline,comm}`, `fd/<n>`, `cwd` and `root`; `/proc/self`, `/proc/thread-self` and
-  `/proc/mounts` (a link to `self/mounts`), merged into procfs's root listing. The server
+  `cmdline`, `comm`, `exe`, `mounts`, `oom_score`, `oom_score_adj`, `oom_adj`,
+  `task/<tid>/{stat,statm,status,cmdline,comm,oom_score,oom_score_adj,oom_adj}`, `fd/<n>`,
+  `cwd` and `root`; `/proc/self`, `/proc/thread-self` and
+  `/proc/mounts` (a link to `self/mounts`), merged into procfs's root listing; and
+  `/proc/sys/vm/overcommit_{memory,ratio,kbytes}` (the kernel's overcommit policy, ADR 0013),
+  merged into procfs's `/proc/sys`. The server
   knows its mounts, its descriptors (any process's table, R6e) and its processes (R8:
   `process::query` answers `procproto`'s records from the server's process table, with the
   kernel's accounts of CPU time and memory, `proc_info` and `thread_info` of a process's
@@ -1166,7 +1175,9 @@ servers until R9 (which gave them a console log call instead and removed them).
 **Rules** (Linux's): nothing can be created (`open` with `O_CREAT`: EACCES; `mkdir`,
 `symlink`: EPERM, EEXIST for a name that exists), removed, renamed (EPERM; EXDEV across
 `/proc` and `/sys`) or chmodded (EPERM); files open read-only (for writing: EACCES; directories
-EISDIR), nothing executes (EACCES), `statfs` says `PROC_SUPER_MAGIC` and `SYSFS_MAGIC`; times
+EISDIR) but `oom_score_adj`, `oom_adj` and, for a tree with the host grant, the overcommit
+files, each write one number as Linux reads it (`kstrtoint`: `EINVAL` otherwise; at most 12
+bytes taken for the two per process), nothing executes (EACCES), `statfs` says `PROC_SUPER_MAGIC` and `SYSFS_MAGIC`; times
 set with `utimensat` are kept by the server per device and inode, as for the kernel's `/dev`
 (`namespace::set_pseudo_times`). An open file (`procfile.rs`) keeps a snapshot of its
 contents as Linux's `seq_file` does: a read from offset 0 makes them anew, reads further on

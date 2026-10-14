@@ -100,7 +100,7 @@ space, and the walks (truncation, write-back) drop it before they lock a mapper.
 ### Memory accounting
 
 - **tmpfs pages** are committed (`memory::commit`) when created and released when dropped, and
-  tmpfs as a whole is limited to half of the commit limit, as Linux's default (`ENOSPC`, or
+  tmpfs as a whole is limited to half of user memory, as Linux's default (`ENOSPC`, or
   `SIGBUS` for a fault in a shared mapping). Anonymous shared memory is committed whole when
   it is created, as before, and not counted again per page.
 - **Cached-store pages** are not committed but counted (`memory::cache_charge`, `Cached:`),
@@ -125,8 +125,8 @@ space, and the walks (truncation, write-back) drop it before they lock a mapper.
   what would need them, and a store that dirties a disk file's page (a `write`, a store
   through a shared mapping) and makes committed memory and them exceed the limit waits
   (killably, asking the pagers again every 100 ms) until write-back made room
-  (`balance_dirty`, beside the dirty ratios: write-back asked above a tenth of the commit
-  limit, storing threads waiting up to a second above a fifth). Only such a store, as Linux's
+  (`balance_dirty`, beside the dirty ratios: write-back asked above a tenth of user
+  memory, storing threads waiting up to a second above a fifth). Only such a store, as Linux's
   `balance_dirty_pages`: a store to other memory adds no dirty page, and its thread may be
   the one write-back waits for (diskfs faulting in its own heap while it writes the pages
   back would wait for itself). Every other cache page can be
@@ -135,7 +135,9 @@ space, and the walks (truncation, write-back) drop it before they lock a mapper.
   progress also pages used lately (Linux's rising reclaim priority), waiting 100 ms at a time
   for write-back or busy address spaces (Linux's reclaim throttling); after 16 fruitless tries
   (300, about 30 s, while dirty or pinned pages may still become droppable; 16 for a pager's
-  own thread, which may be the one to write them) the toucher is killed.
+  own thread, which may be the one to write them) the OOM killer ends the process of the
+  highest badness (`memory::oom`, ADR 0013) and the tries start anew; only if no process may
+  be killed is the toucher killed.
 - **Commits that only write-back stands in the way of** wait for it instead of failing: such
   a commit fails with `Fault::CommitWait` (its pages in `short_commit`; a tmpfs page's commit
   says EAGAIN, which becomes the same), and only that cause is waited for: mmap, mprotect and
@@ -177,20 +179,29 @@ space, and the walks (truncation, write-back) drop it before they lock a mapper.
   (`CacheCounts`): a page is charged to the instance that owns its file (whoever stored to
   it) when it is marked dirty, under the cache's lock, and refunded exactly once when it is
   cleaned, cut off or freed; a storing thread waits for write-back while the owner is above a
-  tenth of the commit limit (Linux bounds each device's share likewise; each writer passes it
+  tenth of user memory (Linux bounds each device's share likewise; each writer passes it
   by at most the page or 64 KiB chunk it just stored). Fills and write-backs reserve their
-  pins against a quarter of the limit in one atomic step (`reserve_pins`) and return what they
+  pins against a quarter of user memory in one atomic step (`reserve_pins`) and return what they
   did not pin, so concurrent ones cannot pass it together; a grant beyond it is refused
   (EBUSY) without waiting in the kernel (the caller may hold pins of its own in flight): the
   server goes on once one of its transfers ended, or waits for the other threads' (up to 30 s
   from its latest refusal; then the fill fails as an I/O error, never as out of memory). `Writeback:` in /proc/meminfo
   counts the pinned pages.
-- **Overcommit** stays strict (`overcommit_memory=2`, ratio 100%). A heuristic mode as Linux's
-  default would let touches of promised memory fail at fault time; it needs a real OOM killer
-  first (one that picks its victim by size, not the toucher). Each Linux server instance holds
-  up to 2 MiB of commitment for its heap beyond what is mapped there, its own, when there is room
-  (all together at most a 16th of the limit; a server cannot fail an allocation but by breaking
-  its instance; linux-server.md, "The server's heap").
+- **Overcommit** is strict by default (`overcommit_memory=2`, ratio 100%), and all of the
+  above is the strict mode's promise. Linux's heuristic (0) and always (1) modes are there
+  too, set by a tree with the host grant through `/proc/sys/vm` (ADR 0013): then commits are
+  not refused at the limit (the heuristic mode refuses one larger than all memory), dirty and
+  pinned cache pages no longer count as taken nor hold stores back for committed memory (the
+  dirty ratios and shares still do), and a touch that finds no frame after reclaim makes the
+  OOM killer end the process of the highest badness (resident pages and page tables, plus
+  oom_score_adj), whose private memory the OOM reaper frees at once. Committed_AS is counted
+  and CommitLimit shown in every mode; the shares scaled by memory (dirty ratios, tmpfs's
+  size, pins, the servers' heap reserves) are taken of user memory, not of the commit limit.
+  Each Linux server instance holds up to 2 MiB of commitment for its heap beyond what is
+  mapped there, its own, when there is room (all together at most a 16th of user memory; a
+  server cannot fail an allocation but by breaking its instance, so those allocations may take
+  frames of the kernel's reserve when memory is overcommitted; linux-server.md, "The server's
+  heap").
 - The file metadata quota (inodes, symlink targets, pipes) on the kernel heap stays.
 
 ### Disk files
