@@ -107,7 +107,7 @@ fn statm_status_and_counters() {
     let m = Machine::of(&system());
     let p = process();
     // Shared: the resident file and shmem pages.
-    assert_eq!(pid_statm(&p), "300 10 4 0 0 10 0\n");
+    assert_eq!(pid_statm(&p), "300 10 4 0 0 0 0\n");
     let status = pid_status(&p, &m, &Linux::default());
     assert!(status.starts_with("Name:\tsome name\nState:"), "no Umask line without one known");
     let p2 = Process { sig_blocked: 1 << 1, sig_ignored: 1 << 12, sig_caught: 1 << 16, peak_pages: 20, virt_peak: 400, ..p };
@@ -119,12 +119,34 @@ fn statm_status_and_counters() {
     assert!(status.contains("\nPid:\t42\n") && status.contains("\nTgid:\t42\n") && status.contains("\nPPid:\t1\n"));
     assert!(status.contains("\nThreads:\t3\n") && status.contains("\nVmRSS:\t      40 kB\n"));
     assert!(status.contains("\nCpus_allowed_list:\t0-1\n"));
-    // Resident pages by kind, and the page tables, in Linux's order.
+    // Resident pages by kind, the areas by kind, the page tables: Linux's order.
     assert!(status.contains(
-        "\nVmRSS:\t      40 kB\nRssAnon:\t      24 kB\nRssFile:\t      12 kB\nRssShmem:\t       4 kB\nVmPTE:\t       8 kB\nVmSwap:\t       0 kB\n"
+        "\nVmRSS:\t      40 kB\nRssAnon:\t      24 kB\nRssFile:\t      12 kB\nRssShmem:\t       4 kB\n\
+         VmData:\t       0 kB\nVmStk:\t       0 kB\nVmExe:\t       0 kB\nVmLib:\t       0 kB\nVmPTE:\t       8 kB\nVmSwap:\t       0 kB\n"
     ));
     let c = counters(&Counters { syscalls: 5, ..Default::default() });
     assert!(c.starts_with("syscalls 5\nipc_calls 0\n") && c.lines().count() == 6);
+}
+
+#[test]
+fn memory_by_kind_of_mapping() {
+    let m = Machine::of(&system());
+    // 20 pages of code mapped executable, 5 more executable pages (a library, JIT code),
+    // 100 of data and 64 of stack.
+    let p = Process { text_pages: 20, exec_pages: 25, data_pages: 100, stack_pages: 64, ..process() };
+    // statm: size resident shared text lib data dt; data counts the stacks too.
+    assert_eq!(pid_statm(&p), "300 10 4 20 0 164 0\n");
+    let status = pid_status(&p, &m, &Linux::default());
+    // In Linux's order: after RssShmem, before VmPTE and VmSwap.
+    let want = "\nRssShmem:\t       4 kB\nVmData:\t     400 kB\nVmStk:\t     256 kB\nVmExe:\t      80 kB\nVmLib:\t      20 kB\nVmPTE:\t       8 kB\nVmSwap:\t       0 kB\n";
+    assert!(status.contains(want), "{status}");
+    // VmExe is at most what is mapped executable (Linux's min with exec_vm); VmLib never
+    // below zero.
+    let unmapped = Process { text_pages: 20, exec_pages: 8, ..process() };
+    let status = pid_status(&unmapped, &m, &Linux::default());
+    assert!(status.contains("\nVmExe:\t      32 kB\nVmLib:\t       0 kB\n"), "{status}");
+    // statm's text is the code's span, as Linux's (not bounded by what is mapped).
+    assert_eq!(pid_statm(&unmapped).split(' ').nth(3), Some("20"));
 }
 
 #[test]

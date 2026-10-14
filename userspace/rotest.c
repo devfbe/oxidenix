@@ -1,7 +1,8 @@
 /* A read-only data disk (run by /etc/rotests.sh in the builder's read-only
  * boot): /data mounted read-only as Linux mounts a filesystem whose device
  * takes no writes. Readable: the file the builder put there, the first boot's
- * last file ("after-rw"), directories, shared and private mappings; every
+ * last file ("after-rw", with its FIFO and device node, which open and work),
+ * directories, shared and private mappings; every
  * change EROFS (Linux's order: EEXIST for a name that exists, EISDIR for a
  * directory opened for writing); statfs's ST_RDONLY, /proc/mounts' "ro";
  * fsync and sync do nothing and return; nothing waits for ever (a watchdog
@@ -19,6 +20,7 @@
 #include <sys/stat.h>
 #include <sys/statfs.h>
 #include <sys/statvfs.h>
+#include <sys/sysmacros.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -78,6 +80,26 @@ int main(int argc, char **argv) {
         char text[64] = {0};
         check("the first boot's last file reads back", slurp("/data/rotest/written", text, sizeof text - 1) == 26 &&
                                                               strcmp(text, "written by the self-tests\n") == 0);
+        /* Its FIFO and device node: a read-only disk keeps them usable (Linux asks
+         * for write access to a file, a directory or a symlink only). */
+        const char *fifo = "/data/rotest/fifo", *null = "/data/rotest/null";
+        check("its FIFO: S_IFIFO", stat(fifo, &st) == 0 && S_ISFIFO(st.st_mode) && (st.st_mode & 07777) == 0600);
+        check("... access W_OK: 0", access(fifo, W_OK) == 0);
+        int rw = open(fifo, O_RDWR | O_NONBLOCK);
+        check("... opens O_RDWR, writes and reads", rw >= 0 && write(rw, "ro", 2) == 2 && read(rw, text, sizeof text) == 2 && memcmp(text, "ro", 2) == 0);
+        int w = open(fifo, O_WRONLY | O_NONBLOCK);
+        check("... a writer opens beside it", w >= 0);
+        if (w >= 0) close(w);
+        if (rw >= 0) close(rw);
+        check("... O_WRONLY|O_NONBLOCK without readers: ENXIO", fails(open(fifo, O_WRONLY | O_NONBLOCK), ENXIO));
+        check("... truncate: EINVAL", fails(truncate(fifo, 0), EINVAL));
+        check("... mknod over it: EEXIST", fails(mknod(fifo, S_IFIFO | 0600, 0), EEXIST));
+        check("its device node: (1,3)", stat(null, &st) == 0 && S_ISCHR(st.st_mode) && major(st.st_rdev) == 1 && minor(st.st_rdev) == 3);
+        int fd = open(null, O_WRONLY);
+        check("... opens null for writing", fd >= 0 && write(fd, "gone", 4) == 4);
+        if (fd >= 0) close(fd);
+        check("mknod of a new name: EROFS", fails(mknod("/data/rotest/new", S_IFIFO | 0600, 0), EROFS) &&
+                                               fails(mknod("/data/rotest/new", S_IFCHR | 0600, makedev(1, 3)), EROFS));
     }
     DIR *d = opendir("/data/rotest");
     int listed = 0;
@@ -130,6 +152,8 @@ int main(int argc, char **argv) {
     check("mkdir of an existing name: EEXIST", fails(mkdir("/data/rotest", 0755), EEXIST));
     check("symlink: EROFS", fails(symlink("hello", "/data/rotest/link"), EROFS));
     check("symlink over an existing name: EEXIST", fails(symlink("x", hello), EEXIST));
+    check("mknod: EROFS", fails(mknod("/data/rotest/node", S_IFIFO | 0600, 0), EROFS) && fails(mkfifo("/data/rotest/node", 0600), EROFS));
+    check("mknod of an existing name: EEXIST", fails(mknod(hello, S_IFCHR | 0600, makedev(1, 3)), EEXIST));
     check("unlink: EROFS", fails(unlink(hello), EROFS));
     check("unlink of a missing name: EROFS (before the lookup)", fails(unlink("/data/rotest/missing"), EROFS));
     check("rmdir: EROFS", fails(rmdir("/data/rotest"), EROFS));
@@ -148,7 +172,8 @@ int main(int argc, char **argv) {
     check("the file is as it was", m == n && memcmp(a, b, n) == 0 && stat(hello, &st) == 0 && (st.st_mode & 07777) == 0755);
     check("... its times too (the refused changes left none behind)",
           st.st_atime == was.st_atime && st.st_mtime == was.st_mtime && st.st_ctime == was.st_ctime);
-    check("no new name", access("/data/rotest/new", F_OK) < 0 && access("/data/rotest/dir", F_OK) < 0 && access("/data/rotest/moved", F_OK) < 0);
+    check("no new name", access("/data/rotest/new", F_OK) < 0 && access("/data/rotest/dir", F_OK) < 0 && access("/data/rotest/moved", F_OK) < 0 &&
+                             access("/data/rotest/node", F_OK) < 0);
     sync();
     check("sync returns", 1);
     printf("rotest: %s\n", failures ? "FAILED" : "all passed");

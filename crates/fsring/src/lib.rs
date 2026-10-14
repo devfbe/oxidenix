@@ -21,10 +21,10 @@
 //! | `READ` | `object` inode, `offset`, buffer (a writable grant) | bytes read (short at the end of the file), v0 = file size |
 //! | `WRITE` | `object` inode, `offset`, buffer | bytes written (all of them), v0 = file size |
 //! | `FLUSH` | - | 0 once every write completed before it is durable |
-//! | `STAT` | `object` inode | 0, `Stat` in v0..v3 |
+//! | `STAT` | `object` inode | 0, `Stat` in v0..v3 (a device's number in place of its size, which is 0) |
 //! | `ROOT` | - | the root directory: v0 = inode, v1 = its mode, v2 = its generation; v3 = the mount's flags (`ROOT_READ_ONLY`) |
 //! | `LOOKUP` | `object` directory, buffer = name | v0 = inode, v1 = its mode, v2 = its generation |
-//! | `CREATE` | `object` directory, buffer = name, `arg` = [kind, permissions, target length]; a symlink's target follows the name in the grant | v0 = new inode, v1 = its mode, v2 = its generation |
+//! | `CREATE` | `object` directory, buffer = name, `arg` = [kind, permissions, target length or device number]; a symlink's target follows the name in the grant, a device's number is as `st_rdev` has it (EINVAL for one the filesystem cannot keep) | v0 = new inode, v1 = its mode, v2 = its generation |
 //! | `UNLINK` | `object` directory, buffer = name, `arg[0]` = 1 for a directory | v0 = inode whose last link went and that the client holds (0: none), v1 = its generation |
 //! | `RENAME` | `object` old directory, buffer = old name, `arg` = [new directory, new name length]; the new name follows the old one | as `UNLINK` (an entry replaced) |
 //! | `TRUNCATE` | `object` inode, `offset` = new size | 0 |
@@ -170,10 +170,18 @@ pub const KIND_DIR: u64 = 2;
 pub const KIND_SYMLINK: u64 = 3;
 /// A socket's name: an inode without data.
 pub const KIND_SOCKET: u64 = 4;
+/// A FIFO (mknod(2)): an inode without data; its pipe is the client's.
+pub const KIND_FIFO: u64 = 5;
+/// A character or block device: an inode without data, with its number (`arg[2]`).
+pub const KIND_CHRDEV: u64 = 6;
+pub const KIND_BLKDEV: u64 = 7;
 
 /// Entry types in `READDIR` results (ext2's).
 pub const TYPE_FILE: u8 = 1;
 pub const TYPE_DIR: u8 = 2;
+pub const TYPE_CHRDEV: u8 = 3;
+pub const TYPE_BLKDEV: u8 = 4;
+pub const TYPE_FIFO: u8 = 5;
 pub const TYPE_SOCKET: u8 = 6;
 pub const TYPE_SYMLINK: u8 = 7;
 
@@ -206,6 +214,10 @@ pub enum Kind {
     /// The target is in the grant, right after the name.
     Symlink(Buf),
     Socket,
+    Fifo,
+    /// A device and its number (as `st_rdev` has it).
+    CharDev(u64),
+    BlockDev(u64),
 }
 
 /// An inode as a request names it (see "Handles"): its number and its
@@ -320,6 +332,9 @@ impl Request {
                     KIND_FILE if target == 0 => Kind::File,
                     KIND_DIR if target == 0 => Kind::Dir,
                     KIND_SOCKET if target == 0 => Kind::Socket,
+                    KIND_FIFO if target == 0 => Kind::Fifo,
+                    KIND_CHRDEV => Kind::CharDev(target),
+                    KIND_BLKDEV => Kind::BlockDev(target),
                     KIND_SYMLINK if target == 0 => return Err(EINVAL),
                     KIND_SYMLINK if target > TARGET_MAX as u64 => return Err(ENAMETOOLONG),
                     KIND_SYMLINK => Kind::Symlink(buf.after(target)?),
@@ -426,6 +441,9 @@ impl Request {
                     Kind::File => [KIND_FILE, perm as u64, 0],
                     Kind::Dir => [KIND_DIR, perm as u64, 0],
                     Kind::Socket => [KIND_SOCKET, perm as u64, 0],
+                    Kind::Fifo => [KIND_FIFO, perm as u64, 0],
+                    Kind::CharDev(rdev) => [KIND_CHRDEV, perm as u64, rdev],
+                    Kind::BlockDev(rdev) => [KIND_BLKDEV, perm as u64, rdev],
                     Kind::Symlink(target) => [KIND_SYMLINK, perm as u64, target.len as u64],
                 };
             }
@@ -537,29 +555,39 @@ pub struct Stat {
     /// i_generation): a client that held an inode before a restart of the
     /// service tells it from a new file of that number.
     pub generation: u32,
+    /// A character or block device's number (as `st_rdev` has it); 0 for any other inode.
+    pub rdev: u64,
+}
+
+/// Whether `mode` is a character or block device's (`S_IFCHR`, `S_IFBLK`).
+pub fn is_device(mode: u32) -> bool {
+    matches!(mode & 0o170000, 0o020000 | 0o060000)
 }
 
 impl Stat {
-    /// v0 = mode | links << 32, v1 = size, v2 = atime | mtime << 32,
-    /// v3 = ctime | generation << 32.
+    /// v0 = mode | links << 32, v1 = size (a device's: its number; its size is 0),
+    /// v2 = atime | mtime << 32, v3 = ctime | generation << 32.
     pub fn to_values(&self) -> [u64; 4] {
         [
             self.mode as u64 | (self.links as u64) << 32,
-            self.size,
+            if is_device(self.mode) { self.rdev } else { self.size },
             self.atime as u64 | (self.mtime as u64) << 32,
             self.ctime as u64 | (self.generation as u64) << 32,
         ]
     }
 
     pub fn from_values(v: &[u64; 4]) -> Stat {
+        let mode = v[0] as u32;
+        let (size, rdev) = if is_device(mode) { (0, v[1]) } else { (v[1], 0) };
         Stat {
-            mode: v[0] as u32,
+            mode,
             links: (v[0] >> 32) as u32,
-            size: v[1],
+            size,
             atime: v[2] as u32,
             mtime: (v[2] >> 32) as u32,
             ctime: v[3] as u32,
             generation: (v[3] >> 32) as u32,
+            rdev,
         }
     }
 }

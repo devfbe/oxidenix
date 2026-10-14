@@ -123,6 +123,7 @@ processes, threads, memory objects and the services it uses.
 | devices | interrupts, I/O ports, PCI functions, DMA areas (as today; IOMMU per `iommu.md`) |
 | console | the framebuffer console and keyboard as a raw device the server's tty layer drives, held by one instance at a time (ADR 0004; `console_read`, `console_write`, `console_info`, `EVENT_CONSOLE`; R6d) |
 | the last mechanisms (R9) | `futex_wait`, `futex_wake`, `futex_requeue` on the program's memory; `thread_fs` (the FS base); `clock_set`; `power`; `host_granted`; `file_pages` (tmpfs's statfs) |
+| futexes beyond R9 | `futex_wake_op`; `futex_owner_died` (a robust list's entry); PI locks: `futex_lock_pi`, `futex_unlock_pi`, `futex_wait_requeue_pi`, `futex_cmp_requeue_pi` (see "PI futexes and robust lists") |
 
 What left the kernel over the migration (the last of it with R9, "Removing the
 pass-through" below): `process/syscall.rs`'s Linux dispatch, `sys_*.rs`, `signal.rs`,
@@ -633,7 +634,7 @@ memory counts. Decisions in ADR 0010.
 | `thread_kill(key)` | the thread dies: its waits end, its next `restricted_enter` returns `REASON_EXIT` (the server ends it), the one after ends it |
 | `thread_exit(status, flags)` | the caller ends; with `EXIT_GROUP` its process (`exit_group`: the others are killed) |
 | `exec_space(exe, name, len)` | the point of no return of `execve`: the caller's process gets a new, empty address space (attached to the instance, `exe`'s hold kept while it runs), the FPU state and FS base reset, `CLONE_CHILD_CLEARTID` done for the old one, close-on-exec descriptors closed (the table's part goes with R6e) |
-| `proc_info(handle, out)`, `thread_info(key, out)` | CPU time, memory, state, start, last CPU, nice, the kernel's own end of a process it killed (out of memory, the monitor's `kill`) |
+| `proc_info(handle, out)`, `thread_info(key, out)` | CPU time, memory (by kind of area: code, stack, data), state, start, last CPU, nice, the kernel's own end of a process it killed (out of memory, the monitor's `kill`) |
 | `thread_nice(key, set, nice)`, `thread_affinity(key, set, mask)` | per thread; the server picks the threads (process groups, users) |
 | `thread_cleartid(addr)` | the caller's `CLONE_CHILD_CLEARTID` word (`set_tid_address`) |
 | `thread_name(key, name, len)` | the kernel's name of a thread (its monitor and messages) |
@@ -1139,6 +1140,38 @@ select with the wait queues' callbacks. Calls on descriptors no longer pass thro
 kernel; the kernel's descriptor tables, open files, pipes and eventfds stayed for its native
 servers until R9 (which gave them a console log call instead and removed them).
 
+### FIFOs and device nodes (`mknod`)
+
+`mknod` and `mknodat` (`paths.rs`) make regular files, FIFOs, character and block devices
+and socket names on the server's tmpfs (`tmpfs::Special`, `socket`) and on `/data`
+(`fsring`'s `KIND_FIFO`, `KIND_CHRDEV`, `KIND_BLKDEV`, `KIND_SOCKET`; ext2 keeps a device's
+number in the block pointers as Linux's ext2 does, the old 16-bit encoding below 256, the new
+one beyond, and `STAT` reports it), in Linux's order: the type first (a directory's `EPERM`,
+an unknown one `EINVAL`), then the name (`EEXIST`, `ENOENT`, `ENOTDIR`, a trailing slash),
+then the filesystem (`EROFS`; `/proc`'s `ENOENT`, `/sys`'s and devpts' `EPERM`). `dev` is
+Linux's unsigned int (`new_decode_dev`). Everyone is root, so devices may be made; a character
+node opens its driver by number wherever it is (`devices`, `tty`, `kmsg`; "Devices by number"
+above), a block node has none (`ENXIO`).
+
+A FIFO's pipe is the server's (`fifo.rs`, `pipe.rs`): the node keeps it while anyone has it
+open (tmpfs's inode, `/data`'s `DInode`, whose inode stays cached meanwhile; a weak slot, the
+ends holding it), so every opener of the inode, by any path or process tree, gets the same
+buffer, and with the last close it goes, as Linux's `i_pipe`. ext2 keeps only the node. The
+open is Linux's `fifo_open`: readers and writers counted (and the counters of their opens), a
+reader without `O_NONBLOCK` waiting until a writer *opened* (the writer counter moved), a
+writer likewise for a reader, `O_NONBLOCK` writers without readers `ENXIO`, `O_RDWR` never
+waiting; the wait is the pipe's interruptible futex, so a signal ends it with `EINTR`
+(`ERESTARTSYS`: restarted under `SA_RESTART`) and the end is uncounted. A reader opened
+`O_NONBLOCK` before any writer gets no `POLLHUP` until one came (Linux's `f_pipe`). The
+descriptor and its watch are had before the open waits, so no partner ever sees an end that
+then fails to be installed. In all else an end is a pipe end (`File::Pipe`): reads, writes,
+`EPIPE`/`SIGPIPE`, poll, select, epoll. It keeps its node (`fifo::Named`, an `Origin`): fstat
+and fchmod are the node's, `/proc/<pid>/fd/N` shows the path and leads to the node, inotify
+sees the opens, reads, writes and closes, and reads and writes move the node's times (on
+`/data` kept by the server and sent with the inode's next write-back, so a FIFO's traffic asks
+diskfs nothing). On a read-only `/data` a FIFO and a device node still open for writing, as
+Linux asks for write access only for files, directories and symlinks.
+
 ## /proc and /sys (I/O rings step 5)
 
 `/proc` and `/sys` are mounts of the server's namespace (`namespace.rs`: `Fs::Proc`,
@@ -1186,7 +1219,7 @@ directory's entries are taken at a read from the start. Copies to the program ar
 no lock held but the description's offset, which the pager never takes.
 
 **Magic links.** `/proc/<pid>/fd/<n>` reads as the path the descriptor was opened by (with
-" (deleted)" for a file unlinked since), `pipe:[ino]`, `socket:[ino]` or
+" (deleted)" for a file unlinked since; a FIFO's end too, which leads to its node), `pipe:[ino]`, `socket:[ino]` or
 `anon_inode:[eventfd]`, `anon_inode:inotify`, `anon_inode:[eventpoll]`. Following it does
 not read it: resolution goes to the open file itself (`procfs::follow`, Linux's
 `proc_fd_link`), as the last name its node (a tmpfs or `/data` inode, also unlinked; a
@@ -1211,8 +1244,34 @@ its threads' ids names it), and what `fd` lists is the calling thread's descript
 (the server's, R6e): the process's, unless a thread made its own with `clone` without
 `CLONE_FILES` (then `/proc/<pid>/fd` shows the caller's table, not the main thread's, as
 `/proc/thread-self/fd` would on Linux). A child after `fork` sees its own copy. R8 (the
-process model) makes this exact. `exe` is an ordinary link to the
-program's path.
+process model) makes this exact.
+
+`/proc/<pid>/exe` is a magic link too (Linux's `proc_exe_link`): each process keeps the
+program file it runs (`process::Proc::exe`, Linux's `mm->exe_file`): the node `execve`
+resolved, with the absolute path it was run by, taken at the point of no return (for a
+`#!` script the interpreter's, as Linux's `bprm->file`), shared by `fork` and let go of
+when the process becomes a zombie (its `exe` is ENOENT then, as for no process; the link
+itself stays, `lstat`). Following it reaches that node, a tmpfs or `/data` inode, also
+after the file was renamed or removed: `open` opens it, `stat` is its status (no links
+once removed), `execve("/proc/self/exe")` runs it again. `readlink` gives the path with
+" (deleted)" once its name went; a rename's new name is not known (the server's
+filesystems keep no path of an inode, as for `fd/N`), so it reads as the old one. The
+kernel's hold of the file (`exec_space`'s `exe`, ETXTBSY) is separate: the node is the
+server's own reference, a removed `/data` file's last user lets it go as an open file's
+last close does.
+
+**Memory by kind.** `statm` and `status` split the address space as Linux's `task_mem`
+and `task_statm`: the kernel counts each space's pages by kind of area as Linux's
+`vm_stat_account` (`MemStats` in `address_space.rs`: `exec_vm` executable and not
+writable, `stack_vm` the growing-down stack, `data_vm` private and writable; kept in step
+by `MemStats::tally` wherever an area comes, goes, grows or changes its rights), reported
+by `proc_info` (`ProcInfo`, with VmPeak). The program's code span is the server's (its ELF
+headers: Linux's `end_code - start_code`, kept per process). `VmData` is `data_vm`,
+`VmStk` `stack_vm`, `VmExe` the code (at most `exec_vm`), `VmLib` the rest of `exec_vm`;
+`statm`'s text is the code, its data `data_vm + stack_vm`, its shared the resident file and
+shmem pages, lib and dt 0. The resident pages themselves are counted by what they are (ADR
+0013: `RssAnon`, `RssFile`, `RssShmem`, from two software bits of the page table entries),
+and the page tables too (`VmPTE`).
 
 **The kernel** keeps no part of `/proc`: its static `/proc` of the early boot, its mount
 table, its `RemoteFs` (IPC requests to procfs in `fsproto`) and its procfs mounts are gone;
@@ -1299,6 +1358,32 @@ affinity and getcpu calls in `mod.rs`; `timer.rs`'s interval timers; the per-pro
   the tree's first process ends (dropping its `process::Tree`); without it the server acts as a
   non-initial pid namespace (EPERM for setting the clock, `reboot` ends the tree with SIGHUP
   or SIGINT for its init). A `futex_requeue` moves only waits of `futex_wait` (decision 6).
+- **PI futexes and robust lists.** Linux's priority-inheritance operations (FUTEX_LOCK_PI,
+  LOCK_PI2, TRYLOCK_PI, UNLOCK_PI, WAIT_REQUEUE_PI, CMP_REQUEUE_PI) are the server's to decode
+  (timeouts: LOCK_PI's on the wall clock, the others' monotonic unless FUTEX_CLOCK_REALTIME;
+  an interrupted lock wait restarts with ERESTARTNOINTR, as its deadline is absolute) over
+  the kernel's PI locks (`kernel/src/process/futex/pi.rs`): the word holds the owner's
+  Linux tid, which the kernel only compares and copies. The kernel keeps a record of a lock
+  only while somebody waits for it; the first waiter names the owner, which the server
+  looks up in its thread table and passes by its thread's key (if the word names another
+  owner by the time the kernel looks, `PI_RETRY` makes the server look again). An unlock
+  hands the lock to the waiter of the largest weight, writing its tid into the word; an
+  owner's end (or exec) hands each lock on with `FUTEX_OWNER_DIED`, the new owner fixing the
+  word in its own address space. Priority inheritance on the fair scheduler: the priority is
+  the weight, so an owner runs with the largest weight of its waiters, theirs including what
+  they inherit, along the whole chain (`Task::pi_weight`, recomputed at every change and at
+  a waiter's nice change); a wait that would close a cycle is EDEADLK (Linux's full chain
+  walk). The kernel's PI state is one table under one lock (as FreeBSD's umtx PI chains):
+  PI operations serialize machine-wide, for work linear in the waiters, which costs nothing
+  for uncontended locks (user space's) and buys a chain walk that never drops locks;
+  Linux's per-lock and per-task locks would scale across many CPUs at the price of its
+  lock-dropping walk. Robust lists (set_robust_list, get_robust_list) are the server's: a
+  thread's head is kept in its record (none after clone or fork), and when it exits or
+  execs the server walks the list in the program's memory as Linux's exit_robust_list (at
+  most 2048 entries, the pending one last), marking each word the thread still holds with
+  `futex_owner_died` (an atomic step on the program's word: the owner bits give way to
+  FUTEX_OWNER_DIED, a non-PI word with waiters wakes one by its shared key). FUTEX_WAKE_OP's
+  change is a compare-and-swap under both words' bucket locks (`futex_wake_op`).
 - **The kernel's clocks** have the kernel's ids (`CLOCK_WALL`, `CLOCK_MONO`,
   `CLOCK_PROCESS_CPU`, `CLOCK_THREAD_CPU`); Linux's ids and their aliases map to them in the
   server.

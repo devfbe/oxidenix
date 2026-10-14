@@ -178,7 +178,7 @@ impl Chan {
                 }
                 let (mode, links) = tree::mode(ino);
                 let now = oxrt::now() as u32;
-                let st = Stat { mode, links, size: 0, atime: now, mtime: now, ctime: now, generation: 0 };
+                let st = Stat { mode, links, size: 0, atime: now, mtime: now, ctime: now, generation: 0, rdev: 0 };
                 Ok((0, st.to_values()))
             }
             Request::Lookup { dir, name } => {

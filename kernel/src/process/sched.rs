@@ -368,9 +368,20 @@ fn locks_at(word: u64) -> u32 {
 /// The weight `t` runs with: its nice value's, or `BOOST_WEIGHT` while it
 /// holds a server lock: then it gets the CPU as the most favored program
 /// does (and no more), so a low nice value cannot keep it in the lock
-/// while threads of its instance wait (priority inversion).
-fn effective_weight(t: &Task) -> u32 {
-    if server_locks(t) > 0 { BOOST_WEIGHT } else { task_weight(t) }
+/// while threads of its instance wait (priority inversion). While it owns
+/// a PI lock (`futex::pi`) it runs with at least the largest weight of the
+/// tasks that wait for it, directly or along a chain of PI locks: the
+/// waiters lend it the CPU share they would have had (priority
+/// inheritance, as the fair scheduler's priority is its weight).
+pub fn effective_weight(t: &Task) -> u32 {
+    if server_locks(t) > 0 { BOOST_WEIGHT } else { task_weight(t).max(t.pi_weight.load(Ordering::Relaxed)) }
+}
+
+/// The weight `t` lends the owner of a PI lock it waits for: its own, or
+/// what it inherits itself (a server lock's boost is not passed on: a
+/// thread waiting for a PI lock holds none).
+pub fn lent_weight(t: &Task) -> u32 {
+    task_weight(t).max(t.pi_weight.load(Ordering::Relaxed))
 }
 
 /// Wrap-safe order of virtual runtimes: whether `a` is before `b`.
@@ -459,9 +470,10 @@ fn update_curr(cpu: &Cpu, cur: &Task, now: u64) {
     let s = &cpu.sched;
     if !cur.idle {
         let since = s.curr_since.load(Ordering::Relaxed);
-        // Holding a server lock now: the time is counted as a holder's
-        // (the lock was taken since, as like as not).
-        let w = if server_locks(cur) > 0 { BOOST_WEIGHT } else { s.curr_weight.load(Ordering::Relaxed) };
+        // Holding a server lock or inheriting a waiter's weight now: the
+        // time is counted with that weight (the lock was taken, or the
+        // waiter came, since, as like as not).
+        let w = s.curr_weight.load(Ordering::Relaxed).max(effective_weight(cur));
         let v = cur.vruntime.load(Ordering::Relaxed).wrapping_add(vtime(now.saturating_sub(since), w));
         cur.vruntime.store(v, Ordering::Relaxed);
         set_curr(cpu, v, now, effective_weight(cur), false);

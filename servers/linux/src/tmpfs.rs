@@ -1,6 +1,6 @@
 //! The server's tmpfs (phase R6c.2c): directories, files, symlinks, socket
-//! inodes (AF_UNIX names, `unix`) and device nodes (devpts's, `pty`) in the
-//! server's memory; a file's
+//! inodes (AF_UNIX names, `unix`), FIFOs (`fifo`) and device nodes (devpts's,
+//! `pty`; mknod(2)'s) in the server's memory; a file's
 //! contents are a file object of the kernel's (`SYS_MO_CREATE_FILE`), read,
 //! written and mapped through the object, and charged to the kernel's limit
 //! of file objects (`SYS_FILE_PAGES`).
@@ -33,7 +33,7 @@ use crate::syscall;
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use restricted::*;
@@ -81,8 +81,19 @@ pub enum Kind {
     /// the socket it leads to is found by the inode (`unix`).
     Socket,
     /// A character device: its number (`st_rdev`) names its driver (the
-    /// terminals of devpts, `pty`).
+    /// terminals of devpts, `pty`; any node mknod(2) made, `devices`).
     Device(u64),
+    /// A block device: its number (the server drives none: opening it is ENXIO).
+    BlockDevice(u64),
+    /// A FIFO (mknod(2), mkfifo(3)): its pipe while anyone has it open (`fifo`).
+    Fifo(Weak<crate::pipe::Shared>),
+}
+
+/// What `Inode::special` makes (mknod(2)).
+pub enum Special {
+    Fifo,
+    Char(u64),
+    Block(u64),
 }
 
 mod content {
@@ -111,6 +122,14 @@ mod content {
         pub fn dir_mut(&mut self) -> Option<&mut BTreeMap<String, Arc<Inode>>> {
             match &mut self.0 {
                 Kind::Dir(m) => Some(m),
+                _ => None,
+            }
+        }
+
+        /// A FIFO's pipe, to look at or set (None for any other kind).
+        pub fn fifo_mut(&mut self) -> Option<&mut alloc::sync::Weak<crate::pipe::Shared>> {
+            match &mut self.0 {
+                Kind::Fifo(p) => Some(p),
                 _ => None,
             }
         }
@@ -264,8 +283,16 @@ impl Inode {
         match self.state.lock().kind.get() {
             Kind::File(o) => Ok(o.handle()),
             Kind::Dir(_) => Err(EISDIR),
-            Kind::Symlink(_) | Kind::Socket | Kind::Device(_) => Err(EINVAL),
+            Kind::Symlink(_) | Kind::Socket | Kind::Device(_) | Kind::BlockDevice(_) | Kind::Fifo(_) => Err(EINVAL),
         }
+    }
+
+    /// A FIFO's pipe: the one its openers share, or a new one if nobody has it open
+    /// (`pipe::fifo_pipe`). EINVAL for any other kind, ENOMEM without memory.
+    pub fn fifo_pipe(&self) -> Result<Arc<crate::pipe::Shared>, i64> {
+        let mut st = self.state.lock();
+        let slot = st.kind.fifo_mut().ok_or(EINVAL)?;
+        Ok(crate::pipe::fifo_pipe(slot)?)
     }
 
     pub fn lookup(&self, name: &str) -> Result<Arc<Inode>, i64> {
@@ -289,18 +316,20 @@ impl Inode {
     /// Its status: every field of `struct stat`, and the birth time (one
     /// snapshot, under one lock).
     pub fn status(&self) -> Stat {
-        let (perm, size, times, rdev) = {
+        let (perm, size, times, rdev, removed) = {
             let st = self.state.lock();
             let rdev = match st.kind.get() {
-                Kind::Device(rdev) => *rdev,
+                Kind::Device(rdev) | Kind::BlockDevice(rdev) => *rdev,
                 _ => 0,
             };
-            (st.perm, stat_size(st.kind.get()), st.times, rdev)
+            (st.perm, stat_size(st.kind.get()), st.times, rdev, st.removed)
         };
         Stat {
             dev: self.dev,
             ino: self.ino,
-            nlink: if self.file_type == vfs::S_IFDIR { 2 } else { 1 },
+            // (An inode has one name at most: removed, it has none, as an open file's or a
+            // running program's that was unlinked on Linux.)
+            nlink: if removed { 0 } else if self.file_type == vfs::S_IFDIR { 2 } else { 1 },
             mode: self.file_type | perm,
             rdev,
             size,
@@ -402,6 +431,20 @@ impl Inode {
     pub fn socket(&self, name: &str, perm: u32) -> Result<Arc<Inode>, i64> {
         check_name(name)?;
         let inode = Inode::new(Kind::Socket, perm & 0o7777, self.dev)?;
+        self.insert(name, inode.clone())?;
+        Ok(inode)
+    }
+
+    /// A new FIFO or device node `name` (EEXIST if taken), for mknod(2): the programs'
+    /// own, charged as any of their inodes.
+    pub fn special(&self, name: &str, special: Special, perm: u32) -> Result<Arc<Inode>, i64> {
+        check_name(name)?;
+        let kind = match special {
+            Special::Fifo => Kind::Fifo(Weak::new()),
+            Special::Char(rdev) => Kind::Device(rdev),
+            Special::Block(rdev) => Kind::BlockDevice(rdev),
+        };
+        let inode = Inode::new(kind, perm & 0o7777, self.dev)?;
         self.insert(name, inode.clone())?;
         Ok(inode)
     }
@@ -758,7 +801,7 @@ fn stat_size(kind: &Kind) -> u64 {
         Kind::File(o) => syscall(SYS_MO_FILE_SIZE, [o.handle(), 0, 0, 0, 0, 0]).max(0) as u64,
         Kind::Symlink(t) => t.len() as u64,
         Kind::Dir(m) => m.len() as u64,
-        Kind::Socket | Kind::Device(_) => 0,
+        Kind::Socket | Kind::Device(_) | Kind::BlockDevice(_) | Kind::Fifo(_) => 0,
     }
 }
 
@@ -769,12 +812,16 @@ fn kind_bits(kind: &Kind) -> u32 {
         Kind::Symlink(_) => vfs::S_IFLNK,
         Kind::Socket => vfs::S_IFSOCK,
         Kind::Device(_) => vfs::S_IFCHR,
+        Kind::BlockDevice(_) => vfs::S_IFBLK,
+        Kind::Fifo(_) => vfs::S_IFIFO,
     }
 }
 
 pub fn dtype(mode: u32) -> u8 {
     match mode & vfs::S_IFMT {
+        vfs::S_IFIFO => 1,
         vfs::S_IFCHR => 2,
+        vfs::S_IFBLK => 6,
         vfs::S_IFDIR => 4,
         vfs::S_IFREG => 8,
         vfs::S_IFLNK => 10,

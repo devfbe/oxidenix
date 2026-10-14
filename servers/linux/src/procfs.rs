@@ -29,7 +29,10 @@
 //! open(2) of it opens that file again (a pipe gets a new end, `pipe::reopen`;
 //! a socket or an anonymous file is ENXIO, as on Linux). Every process's
 //! descriptors are shown (everyone is root: Linux's ptrace check lets
-//! root see them).
+//! root see them). `/proc/<pid>/exe` is one too (Linux's `proc_exe_link`):
+//! the program file's node the process keeps from its execve
+//! (`process::Proc::exe`), read as the path it was run by (" (deleted)"
+//! once removed), ENOENT for a zombie.
 
 use crate::files::{self, File, FileRef};
 use crate::fsclient::Client;
@@ -350,7 +353,7 @@ fn ids(op: u64, arg: u64) -> Result<Vec<u64>, i64> {
     }
 }
 
-/// A text record (`QUERY_CMDLINE`, `QUERY_EXE`) of process `pid`, in a
+/// A text record (`QUERY_CMDLINE`) of process `pid`, in a
 /// buffer sized by probing: 256 bytes first, doubled on ERANGE up to 128
 /// KiB (Linux's ARG_MAX for a command line). ENOENT for no process.
 fn text(op: u64, pid: u64) -> Result<Vec<u8>, i64> {
@@ -719,11 +722,8 @@ pub fn readlink(node: &ProcNode) -> Result<String, i64> {
         }
         ProcNode::MountsLink => Ok(try_string("self/mounts")?),
         ProcNode::Pid { pid, file: PidFile::Exe } => {
-            let exe = text(QUERY_EXE, *pid).map_err(|e| if e == ERANGE { ENOENT } else { e })?;
-            if exe.is_empty() {
-                return Err(ENOENT);
-            }
-            String::from_utf8(exe).map_err(|_| ENOENT)
+            let exe = exe(*pid)?;
+            named(&exe.path, removed(&exe.node))
         }
         ProcNode::Pid { pid, file: PidFile::Cwd } => crate::process::cwd_of(process(*pid)?.tgid as u32).ok_or(ENOENT),
         ProcNode::Pid { pid, file: PidFile::Root } => {
@@ -735,18 +735,55 @@ pub fn readlink(node: &ProcNode) -> Result<String, i64> {
     }
 }
 
+/// A file's path as a magic link reads: " (deleted)" after it once its last name went
+/// (`removed`), as Linux's d_path.
+fn named(path: &str, gone: bool) -> Result<String, i64> {
+    Ok(if gone { try_format!("{} (deleted)", path)? } else { try_string(path)? })
+}
+
+/// Whether a node's name went (a tmpfs inode removed, a /data inode unlinked).
+fn removed(node: &Node) -> bool {
+    match node {
+        Node::Tmp(t) => t.removed(),
+        Node::Data(d) => d.unlinked(),
+        Node::Proc(_) => false,
+    }
+}
+
+/// The program file process (or thread) `pid` runs (ENOENT for none: no such process, a
+/// zombie, one that never exec'd).
+fn exe(pid: u64) -> Result<Arc<namespace::Origin>, i64> {
+    process(pid)?;
+    crate::process::exe_of(pid as u32).ok_or(ENOENT)
+}
+
+/// What a magic link to a filesystem's node leads to: the node itself and its mode, and
+/// the path it was reached by.
+fn to_node(node: Node, path: &str) -> Result<Follow, i64> {
+    let mode = match &node {
+        Node::Tmp(t) => t.mode(),
+        // (Its type is what resolution looks at: no STAT for the permissions.)
+        Node::Data(d) => d.kind | 0o777,
+        Node::Proc(p) => mode(p),
+    };
+    Ok(Follow { node, mode, path: Some(try_string(path)?) })
+}
+
 /// What /proc/<pid>/fd/<fd> reads as: the path the file was opened by
 /// (" (deleted)" after it, for one unlinked meanwhile), or its kind and
 /// inode for a file without a path.
 fn describe(f: &FileRef) -> Result<String, i64> {
     let anon = |kind: &str| Ok(try_format!("anon_inode:{kind}")?);
     let ino = |st: Result<vfs::stat::Stat, i64>| st.map(|s| s.ino).unwrap_or(0);
-    let path = |path: &str, gone: bool| Ok(if gone { try_format!("{} (deleted)", path)? } else { try_string(path)? });
     match &f.file {
-        File::Tmp(t) => path(&t.path, t.inode.removed()),
-        File::Data(d) => path(&d.path, d.inode.unlinked()),
-        File::Proc(p) => path(&p.path, false),
-        File::Pipe(end) => Ok(try_format!("pipe:[{}]", end.ino())?),
+        File::Tmp(t) => named(&t.path, t.inode.removed()),
+        File::Data(d) => named(&d.path, d.inode.unlinked()),
+        File::Proc(p) => named(&p.path, false),
+        // A FIFO's end: its node's path.
+        File::Pipe(end) => match end.named().map(|n| n.origin()) {
+            Some(o) => named(&o.path, removed(&o.node)),
+            None => Ok(try_format!("pipe:[{}]", end.ino())?),
+        },
         File::Socket(_) | File::Inet(_) | File::Netlink(_) => Ok(try_format!("socket:[{}]", ino(files::stat_file(&f.file)))?),
         File::EventFd(_) => anon("[eventfd]"),
         File::Inotify(_) => anon("inotify"),
@@ -758,7 +795,15 @@ fn describe(f: &FileRef) -> Result<String, i64> {
 /// Where a magic link leads (None: an ordinary symlink, read with
 /// `readlink`).
 pub fn follow(node: &ProcNode) -> Result<Option<Follow>, i64> {
-    let ProcNode::Fd { pid, fd } = node else { return Ok(None) };
+    let (pid, fd) = match node {
+        ProcNode::Fd { pid, fd } => (pid, fd),
+        // The program file itself (Linux's proc_exe_link): also renamed or removed since.
+        ProcNode::Pid { pid, file: PidFile::Exe } => {
+            let exe = exe(*pid)?;
+            return to_node(exe.node.duplicate()?, &exe.path).map(Some);
+        }
+        _ => return Ok(None),
+    };
     let f = fd_file(*pid, *fd)?;
     let open = |file: File| -> Result<Follow, i64> {
         let st = files::stat_file(&file)?;
@@ -769,9 +814,15 @@ pub fn follow(node: &ProcNode) -> Result<Option<Follow>, i64> {
         Ok(Follow { node: Node::Proc(ProcNode::Open(opened)), mode: st.mode, path: None })
     };
     let found = match &f.file {
-        File::Tmp(t) => Follow { mode: t.inode.mode(), node: Node::Tmp(t.inode.clone()), path: Some(try_string(&t.path)?) },
-        File::Data(d) => Follow { mode: d.inode.kind | 0o777, node: Node::Data(d.inode.clone()), path: Some(try_string(&d.path)?) },
-        File::Proc(p) => Follow { mode: mode(&p.node), node: Node::Proc(p.node.clone()), path: Some(try_string(&p.path)?) },
+        File::Tmp(t) => to_node(Node::Tmp(t.inode.clone()), &t.path)?,
+        File::Data(d) => to_node(Node::Data(d.inode.clone()), &d.path)?,
+        File::Proc(p) => to_node(Node::Proc(p.node.clone()), &p.path)?,
+        // A FIFO's end leads to its node (opening it is a FIFO open, `fifo`).
+        File::Pipe(end) if end.named().is_some() => {
+            let o = end.named().expect("named").origin();
+            let node = o.node.duplicate()?;
+            Follow { mode: namespace::mode_of(&node.stat()?), node, path: Some(try_string(&o.path)?) }
+        }
         file @ (File::Pipe(_) | File::Socket(_) | File::Inet(_) | File::Netlink(_) | File::EventFd(_) | File::Inotify(_) | File::Epoll(_)) => open(file.clone())?,
         File::Tty(_) | File::PtyMaster(_) | File::Dev(_) | File::Kmsg(_) | File::Path(_) => {
             let o = files::origin_of_file(&f).ok_or(ENOENT)?;
