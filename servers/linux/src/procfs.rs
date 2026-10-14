@@ -687,7 +687,11 @@ fn describe(f: &FileRef) -> Result<String, i64> {
         File::Tmp(t) => named(&t.path, t.inode.removed()),
         File::Data(d) => named(&d.path, d.inode.unlinked()),
         File::Proc(p) => named(&p.path, false),
-        File::Pipe(end) => Ok(try_format!("pipe:[{}]", end.ino())?),
+        // A FIFO's end: its node's path.
+        File::Pipe(end) => match end.named().map(|n| n.origin()) {
+            Some(o) => named(&o.path, removed(&o.node)),
+            None => Ok(try_format!("pipe:[{}]", end.ino())?),
+        },
         File::Socket(_) | File::Inet(_) | File::Netlink(_) => Ok(try_format!("socket:[{}]", ino(files::stat_file(&f.file)))?),
         File::EventFd(_) => anon("[eventfd]"),
         File::Inotify(_) => anon("inotify"),
@@ -721,6 +725,12 @@ pub fn follow(node: &ProcNode) -> Result<Option<Follow>, i64> {
         File::Tmp(t) => to_node(Node::Tmp(t.inode.clone()), &t.path)?,
         File::Data(d) => to_node(Node::Data(d.inode.clone()), &d.path)?,
         File::Proc(p) => to_node(Node::Proc(p.node.clone()), &p.path)?,
+        // A FIFO's end leads to its node (opening it is a FIFO open, `fifo`).
+        File::Pipe(end) if end.named().is_some() => {
+            let o = end.named().expect("named").origin();
+            let node = o.node.duplicate()?;
+            Follow { mode: namespace::mode_of(&node.stat()?), node, path: Some(try_string(&o.path)?) }
+        }
         file @ (File::Pipe(_) | File::Socket(_) | File::Inet(_) | File::Netlink(_) | File::EventFd(_) | File::Inotify(_) | File::Epoll(_)) => open(file.clone())?,
         File::Tty(_) | File::PtyMaster(_) | File::Dev(_) | File::Kmsg(_) | File::Path(_) => {
             let o = files::origin_of_file(&f).ok_or(ENOENT)?;

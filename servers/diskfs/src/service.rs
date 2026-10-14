@@ -1208,7 +1208,7 @@ impl Service {
             Request::Stat { ino } => {
                 let ino = Self::node(fs, ino)?;
                 let s = fs.stat(ino)?;
-                let stat = fsring::Stat { mode: s.mode, links: s.links, size: s.size, atime: s.atime, mtime: s.mtime, ctime: s.ctime, generation: s.generation };
+                let stat = fsring::Stat { mode: s.mode, links: s.links, size: s.size, atime: s.atime, mtime: s.mtime, ctime: s.ctime, generation: s.generation, rdev: s.rdev };
                 Ok((0, stat.to_values()))
             }
             Request::Statfs => {
@@ -1243,6 +1243,9 @@ impl Service {
                     NodeKind::File => NewNode::File,
                     NodeKind::Dir => NewNode::Dir,
                     NodeKind::Socket => NewNode::Socket,
+                    NodeKind::Fifo => NewNode::Fifo,
+                    NodeKind::CharDev(rdev) => NewNode::CharDev(rdev),
+                    NodeKind::BlockDev(rdev) => NewNode::BlockDev(rdev),
                     NodeKind::Symlink(target) => {
                         let g = self.grant(c, target.grant)?;
                         let bytes = g.copy_in(&target)?;

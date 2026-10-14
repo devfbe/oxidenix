@@ -255,9 +255,9 @@ answers the offer only after it served the channel.
 |----|---------|------------|
 | `READ` / `WRITE` | inode, file offset, a grant range (at most 1 MiB; `READ` needs a writable grant) | bytes (a read is short at the end of the file), v0 = file size |
 | `FLUSH` | - | 0: every write completed before it is durable |
-| `STAT`, `STATFS` | inode / - | 0, the values packed in v0..v3 (`fsring::Stat` with the inode's generation, `Usage`) |
+| `STAT`, `STATFS` | inode / - | 0, the values packed in v0..v3 (`fsring::Stat` with the inode's generation and a device's number, `Usage`) |
 | `ROOT` | - | the root directory as `LOOKUP` returns an inode; v3 the mount's flags (`ROOT_READ_ONLY`: the device takes no writes, every change is `EROFS`, and the Linux server says so: `ST_RDONLY`, `ro` in `/proc/mounts`, Linux's `EROFS` before it asks) |
-| `LOOKUP`, `CREATE`, `UNLINK`, `RENAME` | directory, names in a grant (a symlink's target or the new name right after the first name) | v0 = the inode found or made (v1 = its mode, v2 = its generation), or the one whose last link went and that someone holds (v1 = its generation; 0: none, it was freed at once) |
+| `LOOKUP`, `CREATE`, `UNLINK`, `RENAME` | directory, names in a grant (a symlink's target or the new name right after the first name); `CREATE` makes a file, directory, symlink, socket, FIFO or character or block device (its number in `arg[2]`, kept as Linux's ext2 keeps it) | v0 = the inode found or made (v1 = its mode, v2 = its generation), or the one whose last link went and that someone holds (v1 = its generation; 0: none, it was freed at once) |
 | `TRUNCATE`, `SETPERM` | inode and the new size / permissions | 0 |
 | `RELEASE` | inode | 0: the client holds it no more (see "Holds" below) |
 | `READDIR`, `READLINK` | a result buffer in a writable grant (`READDIR` with a cursor) | bytes, v0 = the next cursor |
