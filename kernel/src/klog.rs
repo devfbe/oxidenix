@@ -304,6 +304,52 @@ pub fn forget(instance: u64) {
     }
 }
 
+/// Linux's ratelimit of writes to /dev/kmsg (`printk.devkmsg=ratelimit`): `BURST` records
+/// per `INTERVAL`, the rest dropped and counted, their number logged when the next interval
+/// starts. Per instance, for trees without the host grant (a tree cannot flood the log
+/// the others and the host read).
+pub struct RateLimit(IrqSpinLock<(u64, u32, u32)>);
+
+impl RateLimit {
+    const INTERVAL: u64 = 5_000_000_000;
+    const BURST: u32 = 10;
+
+    pub const fn new() -> RateLimit {
+        RateLimit(IrqSpinLock::new((0, 0, 0)))
+    }
+
+    /// Whether a record may go now.
+    pub fn allow(&self) -> bool {
+        let now = crate::time::now();
+        let missed = {
+            let mut s = self.0.lock();
+            let (begin, printed, missed) = &mut *s;
+            let mut told = 0;
+            if *begin == 0 || now - *begin >= Self::INTERVAL {
+                told = core::mem::take(missed);
+                *begin = now;
+                *printed = 0;
+            }
+            let ok = *printed < Self::BURST;
+            if ok {
+                *printed += 1;
+            } else {
+                *missed += 1;
+            }
+            if !ok {
+                return false;
+            }
+            told
+        };
+        if missed != 0 {
+            let mut text = heapless::String::<64>::new();
+            let _ = core::fmt::Write::write_fmt(&mut text, format_args!("kmsg: {missed} output lines suppressed due to ratelimiting"));
+            log_record(4, text.as_bytes());
+        }
+        true
+    }
+}
+
 /// `syslog`'s console actions: 6 (`CONSOLE_OFF`), 7 (`CONSOLE_ON`), 8 (`CONSOLE_LEVEL`,
 /// `level` 1..=8). EINVAL for another action or level.
 pub fn console(action: u64, level: u64) -> Result<(), i64> {

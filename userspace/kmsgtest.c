@@ -174,6 +174,35 @@ int main(void) {
     close(r);
     close(w);
 
+    /* Without the kernel's host grant (TEST_HOST, test mode only) the tree is Linux in a
+     * container: the log is not its to read, its writes are ratelimited. */
+    long had = syscall(1522, 0);
+    errno = 0;
+    int no_read = klogctl(3, all, sizeof all) == -1 && errno == EPERM;
+    errno = 0;
+    int no_clear = klogctl(5, NULL, 0) == -1 && errno == EPERM;
+    errno = 0;
+    int no_level = klogctl(8, NULL, 7) == -1 && errno == EPERM;
+    int size_ok = klogctl(10, NULL, 0) == 128 * 1024;
+    errno = 0;
+    int no_open = open("/dev/kmsg", O_RDONLY) == -1 && errno == EPERM;
+    int wo = open("/dev/kmsg", O_WRONLY);
+    int writes = 0;
+    for (int i = 0; i < 30; i++) {
+        char text[64];
+        int len = snprintf(text, sizeof text, "<7>kmsgtest: limited %d\n", i);
+        writes += write(wo, text, len) == len;
+    }
+    close(wo);
+    syscall(1522, 1);
+    check("without the host grant reading the log is EPERM", had == 1 && no_read && no_clear && no_open);
+    check("... and so is the console's level; SIZE_BUFFER is not", no_level && size_ok);
+    n = read_all();
+    int kept = 0;
+    for (char *s = all; (s = strstr(s, "kmsgtest: limited ")); s++) kept++;
+    printf("  (%d of 30 writes kept)\n", kept);
+    check("... writes succeed, at most 10 per 5 s reach the log", writes == 30 && kept >= 1 && kept <= 10);
+
     /* busybox's dmesg reads it all with READ_ALL. */
     log_line("kmsgtest: for dmesg\n");
     check("busybox dmesg shows the log", system("dmesg | grep -q 'kmsgtest: for dmesg'") == 0);

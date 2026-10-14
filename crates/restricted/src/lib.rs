@@ -670,13 +670,17 @@ pub const SERVER_LOG_MAX: u64 = 256;
 /// fit in `cap` bytes, to `buf`: each a `KlogRecord` and its text, padded
 /// to 8 bytes; `n` bytes in all. Two u64s to `out`: the sequence of the
 /// log's first record and the next one's. `cap` is at most `KLOG_READ_MAX`;
-/// with `cap` 0 (`buf` may be null) only the window is written.
+/// with `cap` 0 (`buf` may be null) only the window is written. EPERM
+/// without the kernel's host grant (the log is the machine's: Linux's
+/// CAP_SYSLOG of the initial namespace), as for `klog_arm`.
 pub const SYS_KLOG_READ: u64 = 1172;
 pub const KLOG_READ_MAX: u64 = 64 * 1024;
 /// `klog_write(prio, buf, len)`: appends a record of priority `prio`
 /// (`facility << 3 | level`, below `KLOG_PRIO_END`: Linux's facilities go
 /// to 127) with the text at `buf` (at most `KLOG_LINE_MAX` bytes kept), and
-/// prints it on the console if the console's level shows it.
+/// prints it on the console if the console's level shows it. Without the
+/// host grant at most 10 records per 5 s go (Linux's /dev/kmsg ratelimit),
+/// the rest are dropped (still 0) and counted in the log.
 pub const SYS_KLOG_WRITE: u64 = 1173;
 pub const KLOG_LINE_MAX: u64 = 992;
 pub const KLOG_PRIO_END: u64 = 1024;

@@ -19,13 +19,19 @@
 //! the clear position (`SEEK_DATA`) or past the newest (`SEEK_END`); poll is readable while
 //! there is a record, with POLLERR and POLLPRI too if records were lost.
 //!
+//! **Permissions**: the log is the machine's. A tree without the kernel's host grant (ADR
+//! 0011) is Linux in a container without the initial namespace's CAP_SYSLOG: syslog's
+//! reading, clearing and console actions and a readable open of /dev/kmsg are EPERM (the
+//! kernel refuses `SYS_KLOG_READ`, `SYS_KLOG_ARM` and `SYS_KLOG_CONSOLE`); its writes go,
+//! ratelimited by the kernel as Linux's /dev/kmsg (10 records per 5 s).
+//!
 //! **Waiting**: a reader that finds nothing new arms the instance's watch in the kernel
 //! (`SYS_KLOG_ARM`); the record that passes it sends `EVENT_KLOG` to the service thread,
 //! which bumps `SEQ`, wakes the readers sleeping on it and reports every open /dev/kmsg as
 //! readable to its pollers (`event`). No lock is held while program memory is copied.
 
 use crate::devices::{checked_iovecs, one_buffer};
-use crate::files::{self, File, EINVAL, ESPIPE, ENOTTY, O_ACCMODE, O_CLOEXEC, O_NONBLOCK, O_WRONLY, POLLERR, POLLIN, POLLRDNORM};
+use crate::files::{self, File, EINVAL, ESPIPE, ENOTTY, O_ACCMODE, O_CLOEXEC, O_NONBLOCK, O_WRONLY, POLLERR, POLLIN, POLLNVAL, POLLRDNORM};
 use crate::namespace::Origin;
 use crate::signal::ERESTARTSYS;
 use crate::sync::Mutex;
@@ -79,13 +85,14 @@ struct Record<'a> {
     text: &'a [u8],
 }
 
-/// The log's window: (first, next).
-fn window() -> (u64, u64) {
+/// The log's window: (first, next). EPERM for a tree without the host grant.
+fn window() -> Result<(u64, u64), i64> {
     let mut out = [0u64; 2];
     let r = syscall(SYS_KLOG_READ, [u64::MAX, 0, 0, out.as_mut_ptr() as u64, 0, 0]);
-    // (Only a fault on `out`, the server's own stack, could fail it.)
-    assert!(r == 0, "klog_read of the window failed: {r}");
-    (out[0], out[1])
+    if r < 0 {
+        return Err(-r);
+    }
+    Ok((out[0], out[1]))
 }
 
 /// Calls `each` with the records from `from` on, oldest first, until it returns false or
@@ -249,7 +256,7 @@ pub fn syslog(action: u64, buf: u64, len: u64) -> Result<i64, i64> {
         }
         // CLEAR
         5 => {
-            SYSLOG.lock().clear = window().1;
+            SYSLOG.lock().clear = window()?.1;
             Ok(0)
         }
         6..=8 => {
@@ -327,6 +334,8 @@ pub struct KmsgOpen {
     pub origin: Origin,
     /// The next record it reads.
     seq: Mutex<u64>,
+    /// Opened for reading (a write-only open has no position).
+    readable: bool,
 }
 
 impl Drop for KmsgOpen {
@@ -338,7 +347,11 @@ impl Drop for KmsgOpen {
 /// Opens /dev/kmsg by the node `origin`.
 pub fn open(flags: u32, origin: Origin) -> Result<i64, i64> {
     let kept = flags & (O_ACCMODE | O_NONBLOCK | O_CLOEXEC);
-    let k = Arc::new(KmsgOpen { id: files::new_id(), origin, seq: Mutex::new(window().0) });
+    // Reading needs the log's read permission (EPERM without the host grant, as Linux's
+    // check at open); a write-only open does not.
+    let readable = kept & O_ACCMODE != O_WRONLY;
+    let first = if readable { window()?.0 } else { 0 };
+    let k = Arc::new(KmsgOpen { id: files::new_id(), origin, seq: Mutex::new(first), readable });
     {
         let mut opens = OPENS.lock();
         opens.try_reserve(1).map_err(|_| ENOMEM)?;
@@ -350,8 +363,12 @@ pub fn open(flags: u32, origin: Origin) -> Result<i64, i64> {
 impl KmsgOpen {
     /// Its readiness for poll and epoll now (arming the kernel's watch if nothing is new).
     pub fn readiness_now(&self) -> i16 {
+        // A write-only open has nothing to read (Linux's poll without a reader).
+        if !self.readable {
+            return POLLERR | POLLNVAL;
+        }
         let seq = *self.seq.lock();
-        let (first, next) = window();
+        let Ok((first, next)) = window() else { return POLLERR | POLLNVAL };
         let mut ready = 0;
         if seq < next || syscall(SYS_KLOG_ARM, [seq, 0, 0, 0, 0, 0]) == 0 {
             ready = POLLIN | POLLRDNORM;
@@ -370,7 +387,7 @@ impl KmsgOpen {
                 let (line, at) = kmsg_line(*seq)?;
                 if at > *seq {
                     // Lost under the position: told once, then on from the oldest.
-                    *seq = if line.is_some() { at } else { window().0 };
+                    *seq = if line.is_some() { at } else { window()?.0 };
                     return Err(EPIPE);
                 }
                 match line {
@@ -441,9 +458,9 @@ impl KmsgOpen {
             return Err(ESPIPE);
         }
         let to = match whence {
-            SEEK_SET => window().0,
-            SEEK_DATA => SYSLOG.lock().clear.max(window().0),
-            SEEK_END => window().1,
+            SEEK_SET => window()?.0,
+            SEEK_DATA => SYSLOG.lock().clear.max(window()?.0),
+            SEEK_END => window()?.1,
             _ => return Err(EINVAL),
         };
         *self.seq.lock() = to;

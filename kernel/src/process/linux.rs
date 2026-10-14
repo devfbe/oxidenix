@@ -329,6 +329,8 @@ pub struct Instance {
     /// autorun do); without it those calls are EPERM, and the server acts
     /// as Linux in a pid namespace that is not the initial one (ADR 0011).
     host: core::sync::atomic::AtomicBool,
+    /// Its writes to the kernel's log without the host grant (`SYS_KLOG_WRITE`).
+    klog_limit: crate::klog::RateLimit,
     /// A top-level table with only the shared slot, to map into the region.
     view: PhysFrame,
     /// The region's third-level table.
@@ -496,6 +498,7 @@ impl Instance {
         let mut instance = Instance {
             id: NEXT_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
             host: core::sync::atomic::AtomicBool::new(false),
+            klog_limit: crate::klog::RateLimit::new(),
             view,
             pdpt,
             entry: 0,
@@ -2184,6 +2187,10 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             crate::printkln!("[linux] {}", text.trim_end());
             Ok(0)
         }
+        // The log is the machine's: read by trees with the host grant only (Linux's
+        // CAP_SYSLOG of the initial namespace); written by any, those without the grant
+        // ratelimited.
+        SYS_KLOG_READ | SYS_KLOG_ARM if !instance.host.load(core::sync::atomic::Ordering::Acquire) => Err(EPERM),
         SYS_KLOG_READ => {
             let cap = a[2].min(KLOG_READ_MAX) as usize;
             let mut records = Vec::new();
@@ -2204,6 +2211,9 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             let len = a[2].min(KLOG_LINE_MAX) as usize;
             let mut text = [0u8; KLOG_LINE_MAX as usize];
             super::uaccess::copy_from_server(a[1], &mut text[..len])?;
+            if !instance.host.load(core::sync::atomic::Ordering::Acquire) && !instance.klog_limit.allow() {
+                return Ok(0);
+            }
             crate::klog::log_record(a[0] as u16, &text[..len]);
             if crate::klog::on_console(a[0] as u16) {
                 crate::drivers::console::write_text(&text[..len]);
