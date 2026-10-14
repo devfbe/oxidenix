@@ -211,8 +211,8 @@ reference on the word's frame, taken with the frames locked (a decommit frees th
 locked only after it cleared the entry), so a concurrent decommit cannot free the frame under
 the wait.
 
-**The instance's reserve.** A server cannot fail an allocation but by breaking its instance,
-and a heap that gives memory back must commit again later, possibly when its programs have
+**The instance's reserve.** A server cannot fail most of its allocations but by breaking its
+instance (those a program drives it answers, below), and a heap that gives memory back must commit again later, possibly when its programs have
 taken everything they may or dirty pages crowd the limit (the server is what writes them back;
 in reclaimtest a heap commit was refused that way). So each instance holds up to 2 MiB of
 commitment beyond its mapped heap pages (`HEAP_RESERVE`), its own (no other tree can take it):
@@ -229,6 +229,24 @@ mapped is refused; the heap area is mapped only by `shared_commit`), and closing
 returns all of it. The commit guarantee holds: the reserve counts as committed for everyone. A
 heap commit refused beyond the reserve is logged once per instance (a tree can cause it at
 will).
+
+**Allocations that may fail.** What a program's call makes the server hold, in an amount the
+program chooses or that grows with what programs do (queued data, buffers, copies of its
+arguments and paths, listings, descriptors, watches, queued signals, records of what it made),
+is allocated fallibly and answered: ENOMEM, or what Linux answers there (ENOBUFS for a socket's
+send, EAGAIN for a signal that cannot be queued), with nothing of the call left behind. The
+rest, small allocations of fixed size whose total another limit bounds and what must not fail
+(an exit, a close, a wake: what gives memory back), stays infallible. The two take memory from
+different places: a fallible allocation runs in a scope (`heap::fallible`, under the helpers
+`TryGrow`, `try_box`, `try_arc`, `try_to_vec`, `try_format`) in which the heap commits with
+`COMMIT_NO_RESERVE`, against the limit only, so no program can drain the reserve the
+infallible ones fall back on. A `BTreeMap` insert has no fallible form: a program's is preceded
+by `heap::preload`, which makes sure, fallibly, that a free committed page is there for its
+nodes (Linux's `radix_tree_preload`). The test hook `TEST_FAIL_NTH` fails the calling thread's
+n-th fallible allocation (Linux's `fail-nth`): `nomemtest` fails each allocation of a call in
+turn and checks the answer and that nothing changed, then takes all commitment and fills socket
+queues and pipes until the heap refuses (ENOBUFS, ENOMEM) while the server's own allocations
+are still served from the reserve, and checks that everything works once memory is back.
 
 
 **The allocator** (`pageheap`, host-tested with a model of the kernel that poisons decommitted
