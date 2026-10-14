@@ -79,7 +79,8 @@ An AI research project; see README.md.
 - `docs/codemap.md` lists every source file with a one-sentence summary and its public types,
   the Linux server's kernel ABI (call number → handling match arm) and all documents. Read it
   before searching the tree. It is generated: run `python3 scripts/codemap.py` after adding,
-  removing or re-documenting files (CI fails if it is stale); every source file starts with a
+  removing or re-documenting files (CI fails if it is stale; it lists the files git tracks, so
+  `git add` new files first, and never run it while a merge has unresolved conflicts); every source file starts with a
   module comment (`//!` or `/* */`) whose first sentence says what the file is for.
 - Entry points by topic:
   - Boot: `builder/src/main.rs` (images, QEMU), `kernel/src/main.rs` (`kernel_main`).
