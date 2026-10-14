@@ -8,6 +8,7 @@
 //! call reaches the kernel.
 
 use crate::files::{self, File, O_CLOEXEC, O_NONBLOCK, O_RDWR};
+use crate::heap::{self, TryGrow};
 use crate::namespace::{self, Node};
 use crate::records;
 use crate::scm::Passed;
@@ -190,12 +191,12 @@ fn kind(ty: u64, protocol: u64) -> Result<u32, i64> {
 
 fn socket(ty: u64, protocol: u64) -> Result<i64, i64> {
     let kind = kind(ty, protocol)?;
-    install(&Sock::new(kind), ty)
+    install(&Sock::new(kind)?, ty)
 }
 
 fn socketpair(ty: u64, protocol: u64, sv: u64) -> Result<i64, i64> {
     let kind = kind(ty, protocol)?;
-    let (a, b) = Sock::pair(kind);
+    let (a, b) = Sock::pair(kind)?;
     let fa = match install(&a, ty) {
         Ok(fd) => fd,
         Err(e) => {
@@ -230,7 +231,8 @@ fn read_addr(addr: u64, len: u64) -> Result<Vec<u8>, i64> {
     if len > SOCKADDR_UN_MAX || len < 2 {
         return Err(EINVAL);
     }
-    let mut bytes = alloc::vec![0u8; len as usize];
+    let mut bytes = heap::try_vec(len as usize)?;
+    bytes.resize(len as usize, 0);
     usercopy::from_program(addr, &mut bytes)?;
     Ok(bytes)
 }
@@ -246,16 +248,17 @@ fn parse(bytes: &[u8]) -> Result<Name, i64> {
     }
     let path = &bytes[2..];
     if path[0] == 0 {
-        return Ok(Name::Abstract(path[1..].to_vec()));
+        return Ok(Name::Abstract(heap::try_to_vec(&path[1..])?));
     }
     let end = path.iter().position(|&b| b == 0).unwrap_or(path.len());
-    Ok(Name::Path(path[..end].to_vec()))
+    Ok(Name::Path(heap::try_to_vec(&path[..end])?))
 }
 
 /// Writes `name`'s sockaddr_un to `addr` (at most the length at `len`
 /// says, an int) and its full length to `len`.
 fn put_addr(name: Option<&Name>, addr: u64, len: u64) -> Result<(), i64> {
-    let bytes = Name::sockaddr(name);
+    let addr_un = Name::sockaddr(name);
+    let bytes = addr_un.bytes();
     let cap: i32 = usercopy::read(len)?;
     if cap < 0 {
         return Err(EINVAL);
@@ -265,8 +268,8 @@ fn put_addr(name: Option<&Name>, addr: u64, len: u64) -> Result<(), i64> {
     usercopy::write(len, &(bytes.len() as i32))
 }
 
-fn cwd() -> alloc::string::String {
-    records::current().state.lock().cwd.clone()
+fn cwd() -> Result<alloc::string::String, i64> {
+    Ok(heap::try_string(&records::current().state.lock().cwd)?)
 }
 
 fn path_str(p: &[u8]) -> Result<&str, i64> {
@@ -277,9 +280,9 @@ fn path_str(p: &[u8]) -> Result<&str, i64> {
 /// file that is no socket, or a socket inode nobody has bound now).
 fn lookup(name: &Name) -> Result<Arc<Sock>, i64> {
     let key = match name {
-        Name::Abstract(a) => Key::Abstract(a.clone()),
+        Name::Abstract(a) => Key::Abstract(heap::try_to_vec(a)?),
         Name::Path(p) => {
-            let r = namespace::resolve(&cwd(), path_str(p)?, true)?;
+            let r = namespace::resolve(&cwd()?, path_str(p)?, true)?;
             if r.mode & vfs::S_IFMT != vfs::S_IFSOCK {
                 return Err(ECONNREFUSED);
             }
@@ -296,7 +299,7 @@ fn lookup(name: &Name) -> Result<Arc<Sock>, i64> {
 
 /// A new socket inode for `path` (EADDRINUSE if the name exists).
 fn socket_inode(path: &[u8]) -> Result<(Key, Option<Node>), i64> {
-    let (dir, name) = namespace::resolve_parent(&cwd(), path_str(path)?).map_err(|e| if e == namespace::EBUSY { EADDRINUSE } else { e })?;
+    let (dir, name) = namespace::resolve_parent(&cwd()?, path_str(path)?).map_err(|e| if e == namespace::EBUSY { EADDRINUSE } else { e })?;
     let perm = 0o777 & !records::current().state.lock().umask;
     let in_use = |e: i64| if e == EEXIST { EADDRINUSE } else { e };
     match &dir.node {
@@ -326,10 +329,17 @@ fn bind(sock: &Arc<Sock>, addr: u64, len: u64) -> Result<i64, i64> {
         return sock.autobind().map(|_| 0);
     }
     let name = parse(&bytes)?;
+    // The name's memory before a path's inode is made (nothing after it
+    // needs any: a failed bind leaves no socket file).
+    let key = match &name {
+        Name::Abstract(a) => Some(Key::Abstract(heap::try_to_vec(a)?)),
+        Name::Path(_) => None,
+    };
+    let name = Sock::bind_name(name)?;
     sock.begin_bind()?;
-    let made = match &name {
-        Name::Abstract(a) => Ok((Key::Abstract(a.clone()), None)),
-        Name::Path(p) => socket_inode(p),
+    let made = match (&*name, key) {
+        (Name::Path(p), _) => socket_inode(p),
+        (Name::Abstract(_), key) => key.map(|k| (k, None)).ok_or(EINVAL),
     };
     match made {
         Ok((key, node)) => sock.end_bind(Some((name, key, node))).map(|_| 0),
@@ -415,7 +425,10 @@ fn parse_control(control: u64, len: u64) -> Result<(Vec<Passed>, Cred), i64> {
     if len > OPTMEM_MAX {
         return Err(ENOBUFS);
     }
-    let mut buf = alloc::vec![0u8; len as usize];
+    // ENOBUFS without memory for it, ENOMEM for the descriptors' list, as
+    // Linux's sock_kmalloc and scm_fp_copy.
+    let mut buf = heap::try_vec(len as usize).map_err(|_| ENOBUFS)?;
+    buf.resize(len as usize, 0);
     usercopy::from_program(control, &mut buf)?;
     let mut off = 0usize;
     while off + 16 <= buf.len() {
@@ -433,6 +446,7 @@ fn parse_control(control: u64, len: u64) -> Result<(Vec<Passed>, Cred), i64> {
                     if fds.len() + n > SCM_MAX_FD {
                         return Err(EINVAL);
                     }
+                    fds.try_grow(n)?;
                     for k in 0..n {
                         let fd = i32::from_le_bytes(data[k * 4..k * 4 + 4].try_into().expect("4 bytes"));
                         fds.push(Passed::take(fd)?);
@@ -562,8 +576,9 @@ fn recv_common(sock: &Arc<Sock>, fflags: u32, dst: &mut Sink, control: u64, cap:
     Ok(info)
 }
 
-/// One control message (Linux's put_cmsg: truncated to what is left, with
-/// MSG_CTRUNC; nothing if the buffer cannot be written).
+/// One control message of at most 16 bytes of data (Linux's put_cmsg:
+/// truncated to what is left, with MSG_CTRUNC; nothing if the buffer
+/// cannot be written).
 fn put_cmsg(control: u64, cap: usize, used: &mut usize, flags: &mut u32, ty: i32, data: &[u8]) {
     let left = cap - *used;
     if control == 0 || left < 16 {
@@ -575,11 +590,11 @@ fn put_cmsg(control: u64, cap: usize, used: &mut usize, flags: &mut u32, ty: i32
         *flags |= MSG_CTRUNC;
         len = left;
     }
-    let mut bytes = Vec::with_capacity(16 + data.len());
-    bytes.extend_from_slice(&(len as u64).to_le_bytes());
-    bytes.extend_from_slice(&SOL_SOCKET.to_le_bytes());
-    bytes.extend_from_slice(&ty.to_le_bytes());
-    bytes.extend_from_slice(data);
+    let mut bytes = [0u8; 32];
+    bytes[..8].copy_from_slice(&(len as u64).to_le_bytes());
+    bytes[8..12].copy_from_slice(&SOL_SOCKET.to_le_bytes());
+    bytes[12..16].copy_from_slice(&ty.to_le_bytes());
+    bytes[16..16 + data.len()].copy_from_slice(data);
     if usercopy::to_program(control + *used as u64, &bytes[..len]).is_ok() {
         *used += cmsg_align(16 + data.len()).min(left);
     }
@@ -596,47 +611,54 @@ fn put_fds(control: u64, cap: usize, used: &mut usize, flags: &mut u32, fds: Fds
         return;
     }
     let left = cap - *used;
-    let fit = if control != 0 && left > 16 { (left - 16) / 4 } else { 0 };
-    let mut installed: Vec<i32> = Vec::new();
+    // (A message carries at most SCM_MAX_FD: the control message is built
+    // in the stack, nothing allocated once the descriptors are taken.)
+    let fit = if control != 0 && left > 16 { ((left - 16) / 4).min(SCM_MAX_FD) } else { 0 };
+    let mut bytes = [0u8; 16 + 4 * SCM_MAX_FD];
+    let mut installed = 0;
+    let mut add = |fd: i32| {
+        bytes[16 + 4 * installed..20 + 4 * installed].copy_from_slice(&fd.to_le_bytes());
+        installed += 1;
+    };
     match fds {
         Fds::Taken(v) => {
+            let mut room = fit;
             for p in v.into_iter() {
-                if installed.len() >= fit {
+                if room == 0 {
                     break;
                 }
                 match p.install(cloexec) {
-                    Ok(fd) => installed.push(fd),
+                    Ok(fd) => add(fd),
                     Err(_) => break,
                 }
+                room -= 1;
             }
         }
         Fds::Installed(v, _) => {
+            let mut room = fit;
             for fd in v {
-                if installed.len() < fit {
-                    installed.push(fd);
+                if room > 0 {
+                    add(fd);
+                    room -= 1;
                 } else {
                     drop(crate::fdtable::current().take(fd as u64));
                 }
             }
         }
     }
-    if installed.len() < count {
+    if installed < count {
         *flags |= MSG_CTRUNC;
     }
-    if installed.is_empty() {
+    if installed == 0 {
         return;
     }
-    let len = 16 + installed.len() * 4;
-    let mut bytes = Vec::with_capacity(len);
-    bytes.extend_from_slice(&(len as u64).to_le_bytes());
-    bytes.extend_from_slice(&SOL_SOCKET.to_le_bytes());
-    bytes.extend_from_slice(&SCM_RIGHTS.to_le_bytes());
-    for fd in &installed {
-        bytes.extend_from_slice(&fd.to_le_bytes());
-    }
+    let len = 16 + installed * 4;
+    bytes[..8].copy_from_slice(&(len as u64).to_le_bytes());
+    bytes[8..12].copy_from_slice(&SOL_SOCKET.to_le_bytes());
+    bytes[12..16].copy_from_slice(&SCM_RIGHTS.to_le_bytes());
     // The descriptors are the receiver's now, whether or not it can be
     // told (as on Linux).
-    let _ = usercopy::to_program(control + *used as u64, &bytes);
+    let _ = usercopy::to_program(control + *used as u64, &bytes[..len]);
     *used += cmsg_align(len).min(left);
 }
 
@@ -663,7 +685,8 @@ fn recvmsg(sock: &Arc<Sock>, fflags: u32, msg: u64, flags: u64) -> Result<usize,
     let info = recv_common(sock, fflags, &mut Sink::program(&vecs), h.control, h.controllen, flags)?;
     let namelen = match (&info.from, h.name) {
         (Some(n), name) if name != 0 => {
-            let bytes = Name::sockaddr(Some(n));
+            let addr_un = Name::sockaddr(Some(n));
+            let bytes = addr_un.bytes();
             let k = bytes.len().min(h.namelen as usize);
             usercopy::to_program(name, &bytes[..k])?;
             bytes.len() as u32
@@ -778,14 +801,31 @@ fn getsockopt(sock: &Arc<Sock>, level: u64, name: u64, val: u64, lenp: u64) -> R
     if cap < 0 {
         return Err(EINVAL);
     }
-    let int = |v: i64| (v as i32).to_le_bytes().to_vec();
+    // (At most 16 bytes, in the stack.)
+    struct Opt([u8; 16], usize);
+    impl Opt {
+        fn extend_from_slice(&mut self, b: &[u8]) {
+            self.0[self.1..self.1 + b.len()].copy_from_slice(b);
+            self.1 += b.len();
+        }
+    }
+    let int = |v: i64| {
+        let mut b = Opt([0; 16], 0);
+        b.extend_from_slice(&(v as i32).to_le_bytes());
+        b
+    };
     let timeval = |ns: u64| {
-        let mut b = Vec::with_capacity(16);
+        let mut b = Opt([0; 16], 0);
         b.extend_from_slice(&((ns / 1_000_000_000) as i64).to_le_bytes());
         b.extend_from_slice(&((ns % 1_000_000_000 / 1000) as i64).to_le_bytes());
         b
     };
-    let bytes = match name {
+    let peercred = |c: Cred| {
+        let mut b = Opt([0; 16], 0);
+        b.extend_from_slice(&c.bytes());
+        b
+    };
+    let opt = match name {
         SO_TYPE => int(sock.ty as i64),
         SO_DOMAIN => int(AF_UNIX as i64),
         SO_PROTOCOL => int(0),
@@ -794,7 +834,7 @@ fn getsockopt(sock: &Arc<Sock>, level: u64, name: u64, val: u64, lenp: u64) -> R
         SO_PASSCRED => int(sock.passcred() as i64),
         SO_SNDBUF => int(sock.bufs().0 as i64),
         SO_RCVBUF => int(sock.bufs().1 as i64),
-        SO_PEERCRED => sock.peercred().bytes().to_vec(),
+        SO_PEERCRED => peercred(sock.peercred()),
         SO_RCVTIMEO_OLD | SO_RCVTIMEO_NEW => timeval(sock.timeouts().0),
         SO_SNDTIMEO_OLD | SO_SNDTIMEO_NEW => timeval(sock.timeouts().1),
         SO_RCVLOWAT => int(sock.opt(name).unwrap_or(1) as i64),
@@ -808,6 +848,7 @@ fn getsockopt(sock: &Arc<Sock>, level: u64, name: u64, val: u64, lenp: u64) -> R
         n if PLAIN_OPTS.contains(&n) => int(sock.opt(n).unwrap_or(0) as i64),
         _ => return Err(ENOPROTOOPT),
     };
+    let bytes = &opt.0[..opt.1];
     let n = bytes.len().min(cap as usize);
     usercopy::to_program(val, &bytes[..n])?;
     usercopy::write(lenp, &(n as i32))?;

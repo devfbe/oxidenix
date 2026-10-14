@@ -14,6 +14,7 @@
 //! a message here (netd's configuration changes are not announced).
 
 use crate::files::{self, File, EBADF, EFAULT, EINVAL, O_ACCMODE, O_NONBLOCK, O_RDWR, O_WRONLY};
+use crate::heap::{self, TryGrow};
 use crate::sync::Mutex;
 use crate::syscall;
 use crate::usercopy;
@@ -159,7 +160,7 @@ pub fn socket(ty: u64, protocol: u64) -> Result<i64, i64> {
         reported: POLLOUT,
         dump: None,
     };
-    let socket = Arc::new(NetlinkSocket { id: files::new_id(), ty: kind, state: Mutex::new(state), seq: AtomicU32::new(0) });
+    let socket = heap::try_arc(NetlinkSocket { id: files::new_id(), ty: kind, state: Mutex::new(state), seq: AtomicU32::new(0) })?;
     let flags = O_RDWR | (ty & (SOCK_NONBLOCK | SOCK_CLOEXEC)) as u32;
     files::install(socket.id, File::Netlink(socket.clone()), flags)
 }
@@ -244,20 +245,16 @@ impl NetlinkSocket {
         }
     }
 
-    /// Queues datagrams from port `from`; what does not fit the receive
-    /// buffer is dropped, and the next receive fails with ENOBUFS (unless
+    /// Queues a datagram from port `from`; if it does not fit the receive
+    /// buffer (or there is no memory for its place in the queue) it is
+    /// dropped, and the next receive fails with ENOBUFS (unless
     /// NETLINK_NO_ENOBUFS). A datagram counts with what it takes besides its
     /// bytes (`cost`), so even empty ones fill the buffer.
-    fn deliver(&self, from: u32, datagrams: Vec<Vec<u8>>) {
-        if datagrams.is_empty() {
-            return;
-        }
+    fn deliver(&self, from: u32, data: Vec<u8>) {
         let mut st = self.state.lock();
-        for data in datagrams {
-            if st.queued + cost(data.len()) > st.rcvbuf as usize || st.queue.try_reserve(1).is_err() {
-                Self::overrun(&mut st);
-                continue;
-            }
+        if st.queued + cost(data.len()) > st.rcvbuf as usize || st.queue.try_grow(1).is_err() {
+            Self::overrun(&mut st);
+        } else {
             st.queued += cost(data.len());
             st.queue.push_back(Datagram { from, data });
         }
@@ -282,7 +279,7 @@ impl NetlinkSocket {
             let Some(dump) = st.dump.as_mut() else { break };
             match dump.next(interfaces) {
                 Some(data) => {
-                    if st.queue.try_reserve(1).is_err() {
+                    if st.queue.try_grow(1).is_err() {
                         Self::overrun(&mut st);
                         break;
                     }
@@ -308,6 +305,8 @@ impl NetlinkSocket {
         if st.port != 0 {
             return if port == 0 || port == st.port { Ok(st.port) } else { Err(EINVAL) };
         }
+        // For the binding (ENOMEM before anything changes).
+        heap::preload()?;
         let mut ports = PORTS.lock();
         let chosen = if port != 0 {
             if ports.get(&port).is_some_and(|w| w.strong_count() > 0) {
@@ -346,7 +345,9 @@ impl NetlinkSocket {
         let port = self.bind_port(0)?;
         let len = data.len() as i64;
         if to == 0 {
-            let interfaces = crate::netdev::interfaces();
+            // (The replies themselves are the `netlink` crate's, at most the
+            // receive buffer's room.)
+            let interfaces = crate::netdev::interfaces().map_err(|_| ENOBUFS)?;
             // The answer is made and queued under the lock: two senders at
             // once cannot both start a dump, nor both take the same room.
             {
@@ -357,7 +358,7 @@ impl NetlinkSocket {
                 for r in replies {
                     match r {
                         netlink::Reply::Datagram(d) => {
-                            if st.queue.try_reserve(1).is_err() {
+                            if st.queue.try_grow(1).is_err() {
                                 Self::overrun(&mut st);
                                 continue;
                             }
@@ -378,7 +379,7 @@ impl NetlinkSocket {
             self.fill_dump(&interfaces);
         } else {
             let peer = PORTS.lock().get(&to).and_then(Weak::upgrade).ok_or(ECONNREFUSED)?;
-            peer.deliver(port, alloc::vec![data]);
+            peer.deliver(port, data);
         }
         Ok(len)
     }
@@ -400,7 +401,7 @@ impl NetlinkSocket {
                 }
                 if flags & MSG_PEEK != 0 {
                     if let Some(d) = st.queue.front() {
-                        break (Datagram { from: d.from, data: d.data.clone() }, false);
+                        break (Datagram { from: d.from, data: heap::try_to_vec(&d.data)? }, false);
                     }
                 } else if let Some(d) = st.queue.pop_front() {
                     st.queued -= cost(d.data.len());
@@ -416,7 +417,18 @@ impl NetlinkSocket {
             self.wait(seen)?;
         };
         if more {
-            self.fill_dump(&crate::netdev::interfaces());
+            match crate::netdev::interfaces() {
+                Ok(interfaces) => self.fill_dump(&interfaces),
+                Err(_) => {
+                    // No memory to go on: the dump ends with ENOBUFS at the
+                    // next receive (whatever NETLINK_NO_ENOBUFS says, as
+                    // Linux's failed netlink_dump; the program dumps again).
+                    let mut st = self.state.lock();
+                    st.dump = None;
+                    st.error = ENOBUFS;
+                    self.changed(&mut st, false);
+                }
+            }
         }
         let mut done = 0;
         for &(base, len) in iov {
@@ -546,9 +558,9 @@ pub fn call(nr: u64, sock: &Arc<NetlinkSocket>, flags: u32, a: [u64; 6]) -> Resu
                 return Err(EBADF);
             }
             let (iov, rflags, name, name_len, msg) = match nr {
-                files::SYS_READ => (alloc::vec![(a[1], a[2])], 0, 0, 0, 0),
+                files::SYS_READ => (heap::try_to_vec(&[(a[1], a[2])])?, 0, 0, 0, 0),
                 files::SYS_READV => (files::iovecs(a[1], a[2])?, 0, 0, 0, 0),
-                SYS_RECVFROM => (alloc::vec![(a[1], a[2])], a[3], a[4], a[5], 0),
+                SYS_RECVFROM => (heap::try_to_vec(&[(a[1], a[2])])?, a[3], a[4], a[5], 0),
                 _ => {
                     let h = read_msghdr(a[1])?;
                     (h.iov, a[2], h.name, a[1] + 8, a[1])
@@ -580,9 +592,9 @@ pub fn call(nr: u64, sock: &Arc<NetlinkSocket>, flags: u32, a: [u64; 6]) -> Resu
                 return Err(EBADF);
             }
             let (iov, name, namelen) = match nr {
-                files::SYS_WRITE => (alloc::vec![(a[1], a[2])], 0, 0),
+                files::SYS_WRITE => (heap::try_to_vec(&[(a[1], a[2])])?, 0, 0),
                 files::SYS_WRITEV => (files::iovecs(a[1], a[2])?, 0, 0),
-                SYS_SENDTO => (alloc::vec![(a[1], a[2])], a[4], a[5]),
+                SYS_SENDTO => (heap::try_to_vec(&[(a[1], a[2])])?, a[4], a[5]),
                 _ => {
                     let h = read_msghdr(a[1])?;
                     (h.iov, h.name, h.namelen as u64)
@@ -596,7 +608,9 @@ pub fn call(nr: u64, sock: &Arc<NetlinkSocket>, flags: u32, a: [u64; 6]) -> Resu
             let total = iov.iter().try_fold(0u64, |sum, &(_, len)| sum.checked_add(len)).ok_or(EINVAL)?;
             // EMSGSIZE beyond the send buffer, before anything is allocated.
             sock.fits(total)?;
-            let mut data = alloc::vec![0u8; total as usize];
+            // ENOBUFS without memory for it, as Linux's failed skb.
+            let mut data = heap::try_vec(total as usize).map_err(|_| ENOBUFS)?;
+            data.resize(total as usize, 0);
             let mut at = 0;
             for (base, len) in iov {
                 usercopy::from_program(base, &mut data[at..at + len as usize])?;

@@ -6,8 +6,8 @@
 //! that would change it are not taken.
 
 use crate::files;
+use crate::heap::{self, NoMem};
 use crate::usercopy;
-use alloc::string::String;
 use alloc::vec::Vec;
 use netlink::{Interface, Ipv4};
 
@@ -37,18 +37,19 @@ const S_IFSOCK: u32 = 0o140000;
 
 /// The interfaces as netd describes them, named as Linux would: the
 /// loopback "lo", Ethernet cards "eth0" and up. None without netd (the
-/// lists are empty then, not an error).
-pub fn interfaces() -> Vec<Interface> {
+/// lists are empty then, not an error; ENOMEM without memory for them).
+pub fn interfaces() -> Result<Vec<Interface>, NoMem> {
     let mut ethernet = 0;
-    crate::netclient::links()
-        .into_iter()
-        .map(|l| {
+    let links = crate::netclient::links()?;
+    let mut out = heap::try_vec(links.len())?;
+    for l in links {
+        out.push({
             let loopback = l.kind == netring::LINK_LOOPBACK;
             let name = if loopback {
-                String::from("lo")
+                heap::try_string("lo")?
             } else {
                 ethernet += 1;
-                alloc::format!("eth{}", ethernet - 1)
+                crate::try_format!("eth{}", ethernet - 1)?
             };
             let mut flags = if loopback { netlink::IFF_LOOPBACK } else { netlink::IFF_BROADCAST };
             if l.state & netring::LINK_UP != 0 {
@@ -74,8 +75,9 @@ pub fn interfaces() -> Vec<Interface> {
                 broadcast_mac: if loopback { [0; 6] } else { [0xff; 6] },
                 ipv4,
             }
-        })
-        .collect()
+        });
+    }
+    Ok(out)
 }
 
 /// Whether `request` is one of the interface requests answered here.
@@ -104,19 +106,19 @@ pub fn ioctl(fd: u64, request: u64, arg: u64) -> Result<i64, i64> {
     if files::stat_of(fd)?.mode & S_IFMT != S_IFSOCK {
         return Err(ENOTTY);
     }
-    let all = interfaces();
+    let all = interfaces()?;
     if request == SIOCGIFCONF {
         // struct ifconf: the buffer's length, then the buffer; a null
         // buffer asks for the length needed. One entry per IPv4 address.
         let len: i32 = usercopy::read(arg)?;
         let buf: u64 = usercopy::read(arg + 8)?;
-        let with_address: Vec<&Interface> = all.iter().filter(|i| i.ipv4.is_some()).collect();
+        let with_address = || all.iter().filter(|i| i.ipv4.is_some());
         if buf == 0 {
-            usercopy::write(arg, &((with_address.len() * IFREQ) as i32))?;
+            usercopy::write(arg, &((with_address().count() * IFREQ) as i32))?;
             return Ok(0);
         }
         let mut used = 0;
-        for i in with_address {
+        for i in with_address() {
             if used + IFREQ > len.max(0) as usize {
                 break;
             }

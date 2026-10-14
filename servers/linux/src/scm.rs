@@ -52,10 +52,11 @@
 //! is never dropped under a socket's lock, nor while `GC` is held.
 
 use crate::files::{self, Description, File, FileRef};
+use crate::heap::{self, NoMem, TryGrow};
 use crate::sync::{Mutex, ReadGuard, RwLock};
 use crate::syscall;
 use crate::unix::{Cred, Sock};
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::BTreeMap;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
@@ -150,12 +151,18 @@ fn uncharge(gc: &mut Inflight, user: u32) {
 impl Passed {
     /// Descriptor `fd` of the calling process, to send (EBADF; an O_PATH
     /// one too, as Linux's fget_raw; ETOOMANYREFS when too many are in
-    /// flight even after collecting).
+    /// flight even after collecting; ENOMEM without memory for a socket's
+    /// entry in `INFLIGHT`).
     pub fn take(fd: i32) -> Result<Passed, i64> {
         if fd < 0 {
             return Err(files::EBADF);
         }
         let file = files::lookup_raw(fd as u64)?;
+        if matches!(file.file, File::Socket(_)) {
+            // Before anything is charged: its entry (a program's sockets in
+            // flight are up to `MAX_INFLIGHT`).
+            crate::heap::preload()?;
+        }
         let user = Cred::current().uid;
         if !charge(user) {
             // Linux's wait_for_unix_gc: garbage may hold them. (On this
@@ -237,54 +244,85 @@ static COLLECTOR: crate::sync::SleepLock = crate::sync::SleepLock::new(());
 
 /// Finds the sockets only unreachable messages keep and empties their
 /// queues (see the module comment); waits for a collection under way first.
+/// Its memory grows with the sockets in flight, so it is allocated
+/// fallibly: without it the collection ends with nothing changed (or, in
+/// the purge, with the queues taken so far let go of); the garbage stays
+/// for a later one (the next close or descriptor let go of asks again).
 pub fn collect() {
     // (A thread that dies meanwhile does not collect.)
     let Ok(_one) = COLLECTOR.lock() else { return };
     let gc_lock = GC.write();
-    let garbage = {
+    let mut garbage = Vec::new();
+    // (Errors are handled where they end the collection.)
+    let _ = find_garbage(&mut garbage);
+    drop(gc_lock);
+    drop(garbage);
+}
+
+/// `collect`'s work with `GC` held: the garbage's queues go to `garbage`.
+fn find_garbage(garbage: &mut Vec<alloc::collections::VecDeque<crate::unix::Msg>>) -> Result<(), NoMem> {
+    // Candidates, by id (ascending: `INFLIGHT` is ordered, so a binary
+    // search finds one): every reference is one in flight (no descriptor,
+    // no call that uses it). The reference taken to look is not counted.
+    let mut candidates: Vec<(u64, Arc<Sock>, usize)> = Vec::new();
+    {
         let gc = INFLIGHT.lock();
         if gc.sockets.is_empty() {
-            return;
+            return Ok(());
         }
-        // Candidates: every reference is one in flight (no descriptor, no
-        // call that uses it). The reference taken to look is not counted.
-        let mut candidates: BTreeMap<u64, (Arc<Sock>, usize)> = BTreeMap::new();
         for (&id, (sock, file, n)) in gc.sockets.iter() {
             let Some(file) = file.upgrade() else { continue };
             if Arc::strong_count(&file) - 1 == *n {
-                candidates.insert(id, (sock.clone(), *n));
+                candidates.try_push((id, sock.clone(), *n))?;
             }
         }
-        drop(gc);
-        if candidates.is_empty() {
-            return;
+    }
+    if candidates.is_empty() {
+        return Ok(());
+    }
+    let index = |id: u64| candidates.binary_search_by_key(&id, |c| c.0).ok();
+    // What each candidate's queues refer to.
+    let mut edges: Vec<Vec<u64>> = heap::try_vec(candidates.len())?;
+    for (_, sock, _) in &candidates {
+        let mut targets = Vec::new();
+        sock.passed_sockets(&mut targets)?;
+        edges.push(targets);
+    }
+    // References from candidates' queues, taken off each target's count:
+    // what remains comes from outside.
+    let mut outside: Vec<usize> = heap::try_vec(candidates.len())?;
+    outside.extend(candidates.iter().map(|c| c.2));
+    for t in edges.iter().flatten() {
+        if let Some(k) = index(*t) {
+            outside[k] = outside[k].saturating_sub(1);
         }
-        // What each candidate's queues refer to.
-        let edges: BTreeMap<u64, Vec<u64>> = candidates.iter().map(|(&id, (sock, _))| (id, sock.passed_sockets())).collect();
-        // References from candidates' queues, taken off each target's
-        // count: what remains comes from outside.
-        let mut outside: BTreeMap<u64, usize> = candidates.iter().map(|(&id, (_, n))| (id, *n)).collect();
-        for targets in edges.values() {
-            for t in targets {
-                if let Some(n) = outside.get_mut(t) {
-                    *n = n.saturating_sub(1);
+    }
+    // Each candidate is pushed at most once (when first seen): no growth.
+    let mut reachable: Vec<usize> = heap::try_vec(candidates.len())?;
+    let mut seen: Vec<bool> = heap::try_vec(candidates.len())?;
+    seen.resize(candidates.len(), false);
+    for (k, &n) in outside.iter().enumerate() {
+        if n > 0 {
+            seen[k] = true;
+            reachable.push(k);
+        }
+    }
+    while let Some(k) = reachable.pop() {
+        for t in &edges[k] {
+            if let Some(j) = index(*t) {
+                if !seen[j] {
+                    seen[j] = true;
+                    reachable.push(j);
                 }
             }
         }
-        let mut reachable: Vec<u64> = outside.iter().filter(|(_, n)| **n > 0).map(|(id, _)| *id).collect();
-        let mut seen: BTreeSet<u64> = reachable.iter().copied().collect();
-        while let Some(id) = reachable.pop() {
-            for t in edges.get(&id).into_iter().flatten() {
-                if candidates.contains_key(t) && seen.insert(*t) {
-                    reachable.push(*t);
-                }
-            }
+    }
+    // Their messages leave the queues now; they are dropped (and the
+    // references let go of) once the locks are free.
+    for (k, (_, sock, _)) in candidates.iter().enumerate() {
+        if !seen[k] {
+            sock.purge(garbage)?;
         }
-        let dead: Vec<Arc<Sock>> = candidates.into_iter().filter(|(id, _)| !seen.contains(id)).map(|(_, (s, _))| s).collect();
-        // Their messages leave the queues now; they are dropped (and the
-        // references let go of) once the locks are free.
-        dead.iter().flat_map(|s| s.purge()).collect::<Vec<_>>()
-    };
-    drop(gc_lock);
-    drop(garbage);
+    }
+    Ok(())
 }
