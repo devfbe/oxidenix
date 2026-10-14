@@ -283,8 +283,10 @@ fn dispatch(s: &mut State) -> i64 {
             static SAID: [AtomicU64; (FIRST_NON_LINUX as usize).div_ceil(64)] = [const { AtomicU64::new(0) }; (FIRST_NON_LINUX as usize).div_ceil(64)];
             let bit = 1u64 << (nr % 64);
             if SAID[(nr / 64) as usize].fetch_or(bit, Ordering::Relaxed) & bit == 0 {
-                let text = alloc::format!("syscall {} not implemented", nr);
-                syscall(SYS_SERVER_LOG, [text.as_ptr() as u64, text.len() as u64, 0, 0, 0, 0]);
+                // (Said if there is memory for it.)
+                if let Ok(text) = try_format!("syscall {} not implemented", nr) {
+                    syscall(SYS_SERVER_LOG, [text.as_ptr() as u64, text.len() as u64, 0, 0, 0, 0]);
+                }
             }
             -ENOSYS
         }

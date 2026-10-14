@@ -15,6 +15,7 @@
 //! end takes the whole instance with it, as a pid namespace's init's does on Linux.
 
 use crate::fdtable::{self, FilesContext};
+use crate::heap::{self, NoMem, TryGrow};
 use crate::local;
 use crate::records::{self, FsContext};
 use crate::signal::{self, SigInfo};
@@ -247,6 +248,19 @@ pub static PROCS: Mutex<Table> = Mutex::new(Table {
     pending: alloc::collections::BTreeSet::new(),
 });
 
+/// `heap::preload` before an insert into a `BTreeMap<K, V>` a program drives, for maps whose
+/// nodes are larger than a slab's objects too (11 entries a node: a `Proc`, a `Thread` or a
+/// `Hand` makes a node of several pages): a run of one node's size is committed fallibly and
+/// given back to the heap's free pages, where the insert's split finds it.
+pub fn preload_map<K, V>() -> Result<(), NoMem> {
+    heap::preload()?;
+    let node = 11 * (core::mem::size_of::<K>() + core::mem::size_of::<V>()) + 12 * 8 + 64;
+    if node > 2048 {
+        drop(heap::try_vec::<u8>(node)?);
+    }
+    Ok(())
+}
+
 /// A child's start: what its server needs before the program runs (`thread_create`'s
 /// cookie points at it; the child takes it).
 pub struct Birth {
@@ -262,11 +276,15 @@ pub struct Birth {
 
 impl Table {
     /// A free pid: not a live or zombie process's, not a thread's, not a process group's or
-    /// session's. None when all are taken.
-    fn alloc_pid(&mut self) -> Option<Pid> {
-        // The process groups and sessions in use, once (not per candidate).
-        let groups: alloc::collections::BTreeSet<Pid> = self.procs.values().flat_map(|q| [q.pgid, q.sid]).collect();
-        let used = |t: &Table, p: Pid| t.procs.contains_key(&p) || t.threads.contains_key(&p) || t.pending.contains(&p) || groups.contains(&p);
+    /// session's. EAGAIN when all are taken, ENOMEM without room for the list of groups.
+    fn alloc_pid(&mut self) -> Result<Pid, i64> {
+        // The process groups and sessions in use, once (not per candidate), sorted.
+        let mut groups = heap::try_vec::<Pid>(2 * self.procs.len())?;
+        groups.extend(self.procs.values().flat_map(|q| [q.pgid, q.sid]));
+        groups.sort_unstable();
+        let used = |t: &Table, p: Pid| {
+            t.procs.contains_key(&p) || t.threads.contains_key(&p) || t.pending.contains(&p) || groups.binary_search(&p).is_ok()
+        };
         let mut candidate = self.next_pid;
         for _ in 0..PID_MAX {
             if candidate >= PID_MAX {
@@ -274,11 +292,11 @@ impl Table {
             }
             if !used(self, candidate) {
                 self.next_pid = candidate + 1;
-                return Some(candidate);
+                return Ok(candidate);
             }
             candidate += 1;
         }
-        None
+        Err(EAGAIN)
     }
 
     /// A new set of actions (a copy of `from`'s, or the defaults), with one reference.
@@ -353,6 +371,8 @@ impl Table {
         }
         th.key = key;
         let killed = th.exited;
+        // (Infallible: the thread runs already. One entry per thread, whose records the
+        // clone made fallibly.)
         self.keys.insert(key, tid);
         if killed {
             syscall(SYS_THREAD_KILL, [key, 0, 0, 0, 0, 0]);
@@ -385,8 +405,9 @@ impl Table {
             return;
         }
         p.exiting = Some(status);
-        let threads = p.threads.clone();
-        for tid in threads {
+        // (By index, with no copy of the list: an exit cannot fail for memory.)
+        for i in 0..p.threads.len() {
+            let tid = self.procs[&pid].threads[i];
             if Some(tid) != except {
                 self.kill_thread(tid);
             }
@@ -587,12 +608,16 @@ fn clone3(s: &State, args: u64, size: u64) -> Result<i64, i64> {
     let known = (size as usize).min(88);
     let bytes = unsafe { core::slice::from_raw_parts_mut(raw.as_mut_ptr() as *mut u8, 88) };
     usercopy::from_program(args, &mut bytes[..known])?;
-    if size as usize > 88 {
-        let mut rest = alloc::vec![0u8; size as usize - 88];
-        usercopy::from_program(args + 88, &mut rest)?;
-        if rest.iter().any(|&b| b != 0) {
+    // The rest, in pieces on the stack.
+    let mut at = 88;
+    while at < size {
+        let mut rest = [0u8; 256];
+        let n = (size - at).min(256) as usize;
+        usercopy::from_program(args + at, &mut rest[..n])?;
+        if rest[..n].iter().any(|&b| b != 0) {
             return Err(E2BIG);
         }
+        at += n as u64;
     }
     let [flags, pidfd, child_tid, parent_tid, exit_signal, stack, stack_size, tls, set_tid, set_tid_size, cgroup] = raw;
     let _ = (pidfd, cgroup);
@@ -650,7 +675,8 @@ fn clone(s: &State, c: Clone) -> Result<i64, i64> {
         if flags & CLONE_PARENT != 0 && my_pid == 1 {
             return Err(EINVAL);
         }
-        let tid = t.alloc_pid().ok_or(EAGAIN)?;
+        let tid = t.alloc_pid()?;
+        heap::preload()?;
         t.pending.insert(tid);
         (tid, !thread && flags & CLONE_VM == 0 && flags & CLONE_CHILD_SETTID != 0)
     };
@@ -706,8 +732,33 @@ fn clone(s: &State, c: Clone) -> Result<i64, i64> {
     };
     let files_ptr = Arc::as_ptr(&files);
     // A new process's limits: a copy of the caller's.
-    let limits = if thread { crate::ids::current() } else { Arc::new(crate::ids::current().copy()) };
+    let limits = if thread {
+        crate::ids::current()
+    } else {
+        match heap::try_arc(crate::ids::current().copy()) {
+            Ok(l) => l,
+            Err(e) => return Err(fail(e.into(), handle)),
+        }
+    };
     let limits_ptr = Arc::as_ptr(&limits);
+    // What else the records need from the heap, before anything changes (a clone without
+    // memory is ENOMEM with nothing of it left, as Linux's copy_process): a new process's
+    // shared words, exec account and (without CLONE_VM) break, and the child's birth record.
+    let fresh = (|| -> Result<_, NoMem> {
+        let own = if thread {
+            None
+        } else {
+            let brk = if flags & CLONE_VM != 0 { None } else { Some(heap::try_arc(Mutex::new(Brk::default()))?) };
+            Some((brk, heap::try_arc(Words::default())?, heap::try_arc(core::sync::atomic::AtomicUsize::new(0))?))
+        };
+        let settid = if settid_in_child { c.ctid } else { 0 };
+        let birth = heap::try_box(Birth { tid, pid, settid, fs: fs_ptr, files: files_ptr, limits: limits_ptr, serial: 0 })?;
+        Ok((own, birth))
+    })();
+    let (own, mut birth) = match fresh {
+        Ok(f) => f,
+        Err(e) => return Err(fail(e.into(), handle)),
+    };
     if !thread {
         // The kernel's bound on its stack's growth, from the copy (no one else sees it
         // yet: a change of the caller's limit meanwhile is the caller's alone).
@@ -723,11 +774,38 @@ fn clone(s: &State, c: Clone) -> Result<i64, i64> {
             drop(t);
             return Err(fail(EAGAIN, handle));
         }
+        // The copies and the tables' room, before anything changes.
+        let ppid = if flags & CLONE_PARENT != 0 { t.procs[&my_pid].ppid } else { my_pid };
+        let room = (|| -> Result<Option<(Vec<Pid>, Vec<u8>, String)>, NoMem> {
+            preload_map::<Pid, Thread>()?;
+            if thread {
+                t.procs.get_mut(&pid).expect("checked above").threads.try_grow(1)?;
+                return Ok(None);
+            }
+            preload_map::<Pid, Proc>()?;
+            if flags & CLONE_SIGHAND == 0 {
+                preload_map::<u64, signal::Hand>()?;
+            }
+            if let Some(pp) = t.procs.get_mut(&ppid) {
+                pp.children.try_grow(1)?;
+            }
+            let parent = &t.procs[&my_pid];
+            let mut threads = heap::try_vec(1)?;
+            threads.push(tid);
+            Ok(Some((threads, heap::try_to_vec(&parent.cmdline)?, heap::try_string(&parent.exe)?)))
+        })();
+        let copies = match room {
+            Ok(r) => r,
+            Err(e) => {
+                drop(t);
+                return Err(fail(e.into(), handle));
+            }
+        };
         t.pending.remove(&tid);
         let me_thread = &t.threads[&my_tid];
         let thread_sig = me_thread.sig.for_child(flags & CLONE_VM != 0 && flags & CLONE_VFORK == 0);
         let comm = me_thread.comm;
-        if !thread {
+        if let (Some((threads, cmdline, exe)), Some((own_brk, words, exec_bytes))) = (copies, own) {
             let parent_hand = t.procs[&my_pid].sig.hand;
             let hand = if flags & CLONE_SIGHAND != 0 {
                 t.hands.get_mut(&parent_hand).expect("the caller's actions").refs += 1;
@@ -747,13 +825,14 @@ fn clone(s: &State, c: Clone) -> Result<i64, i64> {
             let parent = &t.procs[&my_pid];
             // With CLONE_PARENT the caller's parent is the parent, and gets the caller's exit
             // signal, as on Linux.
-            let (ppid, exit_signal) =
-                if flags & CLONE_PARENT != 0 { (parent.ppid, parent.exit_signal) } else { (my_pid, c.exit_signal as u32) };
-            let brk = if flags & CLONE_VM != 0 {
-                parent.brk.clone()
-            } else {
-                let b = parent.brk.lock();
-                Arc::new(Mutex::new(Brk { start: b.start, end: b.end, limit: b.limit }))
+            let exit_signal = if flags & CLONE_PARENT != 0 { parent.exit_signal } else { c.exit_signal as u32 };
+            let brk = match own_brk {
+                None => parent.brk.clone(),
+                Some(own) => {
+                    let b = parent.brk.lock();
+                    *own.lock() = Brk { start: b.start, end: b.end, limit: b.limit };
+                    own
+                }
             };
             let p = Proc {
                 pid,
@@ -761,7 +840,7 @@ fn clone(s: &State, c: Clone) -> Result<i64, i64> {
                 pgid: parent.pgid,
                 sid: parent.sid,
                 handle,
-                threads: alloc::vec![tid],
+                threads,
                 children: Vec::new(),
                 zombie: None,
                 exiting: None,
@@ -775,20 +854,21 @@ fn clone(s: &State, c: Clone) -> Result<i64, i64> {
                 no_new_privs: parent.no_new_privs,
                 subreaper: false,
                 vfork: flags & CLONE_VFORK != 0,
-                cmdline: parent.cmdline.clone(),
-                exe: parent.exe.clone(),
+                cmdline,
+                exe,
                 sig: signal::ProcSignals::new(hand),
                 report: None,
                 children_usage: Usage::default(),
                 itimer: Default::default(),
                 brk,
-                words: Arc::new(Words::default()),
+                words,
                 tables_out: 0,
-                exec_bytes: Arc::new(core::sync::atomic::AtomicUsize::new(0)),
+                exec_bytes,
                 limits: limits.clone(),
             };
             t.procs.insert(pid, p);
             if let Some(pp) = t.procs.get_mut(&ppid) {
+                // (Room made above.)
                 pp.children.push(pid);
             }
         } else {
@@ -804,7 +884,7 @@ fn clone(s: &State, c: Clone) -> Result<i64, i64> {
     if c.stack != 0 {
         child.rsp = c.stack;
     }
-    let birth = alloc::boxed::Box::new(Birth { tid, pid, settid: if settid_in_child { c.ctid } else { 0 }, fs: fs_ptr, files: files_ptr, limits: limits_ptr, serial });
+    birth.serial = serial;
     let cookie = alloc::boxed::Box::into_raw(birth) as u64;
     let tflags = if flags & CLONE_SETTLS != 0 { THREAD_SETTLS } else { 0 };
     let ctid = if flags & CLONE_CHILD_CLEARTID != 0 { c.ctid } else { 0 };
@@ -1455,14 +1535,19 @@ pub fn key_of(tid: Pid) -> Option<u64> {
     t.threads.get(&tid).filter(|th| th.key != 0).map(|th| th.key)
 }
 
-/// The keys of every live thread of the processes that `select` picks.
-pub fn keys_where(select: impl Fn(&Proc) -> bool) -> Vec<u64> {
+/// The keys of every live thread of the processes that `select` picks (ENOMEM without room
+/// for the list).
+pub fn keys_where(select: impl Fn(&Proc) -> bool) -> Result<Vec<u64>, NoMem> {
     let t = PROCS.lock();
-    t.procs
-        .values()
-        .filter(|p| p.zombie.is_none() && select(p))
-        .flat_map(|p| p.threads.iter().filter_map(|tid| t.threads.get(tid)).filter(|th| th.key != 0).map(|th| th.key))
-        .collect()
+    let keys = || {
+        t.procs
+            .values()
+            .filter(|p| p.zombie.is_none() && select(p))
+            .flat_map(|p| p.threads.iter().filter_map(|tid| t.threads.get(tid)).filter(|th| th.key != 0).map(|th| th.key))
+    };
+    let mut out = heap::try_vec(keys().count())?;
+    out.extend(keys());
+    Ok(out)
 }
 
 /// The working directory of process `pid` (its main thread's, or its first live one's).
@@ -1496,8 +1581,13 @@ pub fn query(op: u64, arg: u64, cap: usize) -> Result<Vec<u8>, i64> {
     use procproto::*;
     const ERANGE: i64 = 34;
     let t = PROCS.lock();
-    let ids = |list: &mut dyn Iterator<Item = Pid>| -> Vec<u8> { list.take(cap / 8).flat_map(|p| (p as u64).to_le_bytes()).collect() };
-    let text = |bytes: &[u8]| if bytes.len() > cap { Err(ERANGE) } else { Ok(bytes.to_vec()) };
+    let ids = |list: &mut dyn ExactSizeIterator<Item = Pid>| -> Result<Vec<u8>, i64> {
+        let n = list.len().min(cap / 8);
+        let mut out = heap::try_vec(8 * n)?;
+        out.extend(list.take(n).flat_map(|p| (p as u64).to_le_bytes()));
+        Ok(out)
+    };
+    let text = |bytes: &[u8]| if bytes.len() > cap { Err(ERANGE) } else { Ok(heap::try_to_vec(bytes)?) };
     // The process `arg` names: a process, or a thread's.
     let id = arg as Pid;
     let owner = || -> Result<Pid, i64> {
@@ -1508,12 +1598,12 @@ pub fn query(op: u64, arg: u64, cap: usize) -> Result<Vec<u8>, i64> {
         }
     };
     match op {
-        QUERY_PIDS => Ok(ids(&mut t.procs.keys().copied())),
+        QUERY_PIDS => ids(&mut t.procs.keys().copied()),
         QUERY_THREADS => {
             let p = t.procs.get(&owner()?).ok_or(ESRCH)?;
-            let mut tids = p.threads.clone();
+            let mut tids = heap::try_to_vec(&p.threads)?;
             tids.sort_unstable();
-            Ok(ids(&mut tids.into_iter()))
+            ids(&mut tids.into_iter())
         }
         QUERY_CMDLINE => text(&t.procs[&owner()?].cmdline),
         QUERY_EXE => text(t.procs[&owner()?].exe.as_bytes()),

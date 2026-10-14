@@ -49,12 +49,17 @@ fn priority(which: u64, who: u64, set: Option<i64>) -> Result<i64, i64> {
     const PRIO_USER: u64 = 2;
     let who = who as u32;
     let keys: Vec<u64> = match which {
-        PRIO_PROCESS => alloc::vec![process::key_of(who as Pid).ok_or(ESRCH)?],
+        PRIO_PROCESS => {
+            let key = process::key_of(who as Pid).ok_or(ESRCH)?;
+            let mut one = crate::heap::try_vec(1)?;
+            one.push(key);
+            one
+        }
         PRIO_PGRP => {
             let pgid = if who == 0 { process::ids_of(0).map_or(0, |ids| ids.1) } else { who };
-            process::keys_where(|p| p.pgid == pgid)
+            process::keys_where(|p| p.pgid == pgid)?
         }
-        PRIO_USER if who == 0 => process::keys_where(|_| true),
+        PRIO_USER if who == 0 => process::keys_where(|_| true)?,
         PRIO_USER => return Err(ESRCH),
         _ => return Err(EINVAL),
     };
