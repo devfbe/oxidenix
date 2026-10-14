@@ -104,13 +104,14 @@ impl Setting {
         }
     }
 
-    /// The first expiry after `now` (0: none).
+    /// The first expiry after `now` (0: none). Saturating: a program's start and interval
+    /// may be as large as a timespec allows, and one beyond the clock's range never comes.
     fn next(&self, now: u64) -> u64 {
         match (self.at, self.every) {
             (0, _) => 0,
             (at, _) if now < at => at,
             (_, 0) => 0,
-            (at, every) => at + ((now - at) / every + 1) * every,
+            (at, every) => at.saturating_add(((now - at) / every + 1).saturating_mul(every)),
         }
     }
 

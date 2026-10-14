@@ -206,6 +206,19 @@ int main(void) {
     errno = 0;
     check("a write is EINVAL", write(fd, &v, sizeof v) < 0 && errno == EINVAL);
 
+    /* The largest interval a timespec holds: the expiry after the first lies beyond the
+     * clock's range and never comes (no overflow in the server). */
+    int huge = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
+    struct itimerspec far = {{INT64_MAX, 999999999}, {0, 1}};
+    struct itimerspec got;
+    int armed = timerfd_settime(huge, 0, &far, NULL) == 0;
+    sleep_ms(2);
+    int64_t first = count(huge);
+    int64_t again = count(huge);
+    check("the largest interval: one expiry, then none", armed && first == 1 && again == -EAGAIN);
+    check("... and its time left is reported", timerfd_gettime(huge, &got) == 0 && got.it_value.tv_sec > 0 && got.it_interval.tv_sec > 0);
+    close(huge);
+
     if (failures) {
         printf("timerfdtest: %d FAILED\n", failures);
         return 1;
