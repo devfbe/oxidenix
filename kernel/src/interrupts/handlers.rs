@@ -18,7 +18,10 @@ pub extern "sysv64" fn trap(frame: &mut Frame) {
             apic::eoi();
             // The kernel is not preemptive: the switch waits for the
             // return to user space (below, or that of the running syscall).
-            if crate::timer::interrupt(frame.from_user()) {
+            // User time is a program's (a Linux program's server counts as the kernel
+            // of its calls). The interrupted task is in user mode: its state is free.
+            let program = frame.from_user() && crate::process::linux::mode() != Some(false);
+            if crate::timer::interrupt(program) {
                 crate::process::sched::set_need_resched();
             }
         }
@@ -38,6 +41,8 @@ pub extern "sysv64" fn trap(frame: &mut Frame) {
     // native task whose process ends; a Linux program that was kicked goes
     // back to its server, which delivers its signals.
     if frame.from_user() {
+        // The CPU-time alarms a tick may have brought due (`cputimer`).
+        crate::process::cputimer::check(crate::process::sched::current());
         crate::process::sched::resched_on_return();
         match crate::process::linux::mode() {
             None => kill::exit_if_dying(frame),
