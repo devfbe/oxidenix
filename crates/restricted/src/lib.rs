@@ -358,8 +358,15 @@ pub const TEST_PAGED_FAIL: u64 = 1508;
 /// committed then, and the caller decommits the range to know its state.
 /// A page is committed exactly while it is mapped: the kernel never commits
 /// one by itself, and a server access to a page that is not committed is
-/// a fault in the server (the instance breaks, `break_instance`).
+/// a fault in the server (the instance breaks, `break_instance`). The
+/// third argument holds flags (`COMMIT_NO_RESERVE`).
 pub const SYS_SHARED_COMMIT: u64 = 1169;
+/// `SYS_SHARED_COMMIT` flag: commit against the limit only, never from the
+/// instance's reserve. The server's allocations that may fail (those a
+/// program drives, answered with ENOMEM) commit so: no program can take the
+/// reserve the server's other allocations, which cannot fail without
+/// breaking the instance, rely on.
+pub const COMMIT_NO_RESERVE: u64 = 1;
 /// `shared_decommit(addr, len) -> pages`: gives back the committed pages of
 /// [`addr`, `addr + len`) (same range rules): unmapped from every view of
 /// the region (TLBs shot down), their frames freed and their commitment
@@ -1025,3 +1032,10 @@ pub const TEST_FILL_GONE: u64 = 1525;
 /// then how many shrinks (`EVENT_SHRINK`) it made.
 /// Test mode only.
 pub const TEST_HEAP_STATS: u64 = 1526;
+/// `(n)`: the calling thread's n-th allocation in the Linux server that the
+/// server may fail (those a program drives, answered with ENOMEM or
+/// ENOBUFS) from now fails, as Linux's `/proc/thread-self/fail-nth`; 0
+/// disarms. Returns what was left of the previous count: 0 if it fired (or
+/// none was armed), so a test fails each allocation of a call in turn until
+/// the call makes fewer. The server's own call, test mode only.
+pub const TEST_FAIL_NTH: u64 = 1527;
