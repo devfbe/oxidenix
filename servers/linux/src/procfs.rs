@@ -528,7 +528,7 @@ pub fn list(dir: &ProcNode) -> Result<Vec<(String, u64, u8)>, i64> {
             Ok(out)
         }
         ProcNode::Pid { pid, file: PidFile::Fd } => {
-            let fds = table(*pid)?.open_fds();
+            let fds = table(*pid)?.open_fds()?;
             let mut out = alloc::vec![entry(".", dir), entry("..", &ProcNode::Pid { pid: *pid, file: PidFile::Dir })];
             for fd in fds {
                 out.push(entry(&format!("{fd}"), &ProcNode::Fd { pid: *pid, fd }));

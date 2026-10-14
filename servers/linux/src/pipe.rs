@@ -20,6 +20,7 @@
 //! written), a read without writers returns 0, O_NONBLOCK gives EAGAIN.
 
 use crate::files::{self, EFAULT};
+use crate::heap::{self, NoMem, TryGrow};
 use crate::sync::Mutex;
 use crate::syscall;
 use crate::unix::Sink;
@@ -99,21 +100,24 @@ pub struct PipeEnd {
     writes: bool,
 }
 
-/// A new pipe: (read end, write end).
-pub fn new() -> (Arc<PipeEnd>, Arc<PipeEnd>) {
+/// A new pipe: (read end, write end); ENOMEM if it cannot be had (a
+/// program makes as many as its descriptors allow).
+pub fn new() -> Result<(Arc<PipeEnd>, Arc<PipeEnd>), NoMem> {
     let (rid, wid) = (files::new_id(), files::new_id());
     // (Nobody can change the pipe before both are installed: no report is lost.)
-    let ends = alloc::vec![
-        Reported { id: rid, reads: true, writes: false, ready: 0, installed: true },
-        Reported { id: wid, reads: false, writes: true, ready: POLLOUT, installed: true },
-    ];
-    let shared = Arc::new(Shared {
+    let mut ends = heap::try_vec(2)?;
+    ends.push(Reported { id: rid, reads: true, writes: false, ready: 0, installed: true });
+    ends.push(Reported { id: wid, reads: false, writes: true, ready: POLLOUT, installed: true });
+    let shared = heap::try_arc(Shared {
         inner: Mutex::new(Inner { buf: VecDeque::new(), readers: 1, writers: 1, ends }),
         rlock: crate::sync::SleepLock::new(()),
         seq: AtomicU32::new(0),
         ino: rid,
-    });
-    (Arc::new(PipeEnd { shared: shared.clone(), id: rid, reads: true, writes: false }), Arc::new(PipeEnd { shared, id: wid, reads: false, writes: true }))
+    })?;
+    // (A failure drops what was made: no end was counted yet, nothing to report.)
+    let read_end = heap::try_arc(PipeEnd { shared: shared.clone(), id: rid, reads: true, writes: false })?;
+    let write_end = heap::try_arc(PipeEnd { shared, id: wid, reads: false, writes: true })?;
+    Ok((read_end, write_end))
 }
 
 /// The pipe itself, apart from its ends (what /proc/<pid>/fd/N of an end
@@ -130,14 +134,17 @@ impl Pipe {
     /// failed): the end's watch takes readiness reports only once its
     /// description exists, so the end gets them from then on, and its
     /// readiness is reported again then (a change between the two is not
-    /// lost).
-    pub fn reopen(&self, flags: u32) -> Arc<PipeEnd> {
+    /// lost). ENOMEM (nothing changed) if the end cannot be had.
+    pub fn reopen(&self, flags: u32) -> Result<Arc<PipeEnd>, NoMem> {
         let mode = flags & files::O_ACCMODE;
         let (reads, writes) = (mode != files::O_WRONLY, mode != 0);
         let id = files::new_id();
         let shared = self.0.clone();
+        let end = heap::try_arc(PipeEnd { shared: shared.clone(), id, reads, writes })?;
         {
             let mut inner = shared.inner.lock();
+            // Room for its report first: nothing is counted if there is none.
+            inner.ends.try_grow(1)?;
             inner.readers += reads as u32;
             inner.writers += writes as u32;
             let ready = inner.readiness(reads, writes);
@@ -145,7 +152,7 @@ impl Pipe {
             // A pipe that had no reader or no writer has one now.
             shared.changed(&mut inner, false, false);
         }
-        Arc::new(PipeEnd { shared, id, reads, writes })
+        Ok(end)
     }
 
     /// Its `struct stat`: a FIFO of its own inode, as each end's.
@@ -324,11 +331,15 @@ impl PipeEnd {
     pub fn write(&self, src: Src, nonblock: bool) -> Result<i64, i64> {
         let mut written: u64 = 0;
         let mut chunk = [0u8; CHUNK];
-        let pieces: alloc::vec::Vec<(u64, u64)> = match &src {
-            Src::Program(vecs) => vecs.to_vec(),
-            Src::Server(buf) => alloc::vec![(0, buf.len() as u64)],
+        let whole;
+        let pieces: &[(u64, u64)] = match &src {
+            Src::Program(vecs) => vecs,
+            Src::Server(buf) => {
+                whole = [(0, buf.len() as u64)];
+                &whole
+            }
         };
-        for (base, len) in pieces {
+        for &(base, len) in pieces {
             let mut at = 0;
             while at < len {
                 // A chunk never crosses a page of the program's buffer, so a
@@ -359,8 +370,11 @@ impl PipeEnd {
                         }
                         let room = CAPACITY.saturating_sub(inner.buf.len()).min(n - pushed);
                         if room > 0 {
-                            if inner.buf.try_reserve(room).is_err() {
-                                return if written > 0 { Ok(written as i64) } else { Err(EAGAIN) };
+                            // No memory for the data: ENOMEM, as Linux's
+                            // pipe_write when it gets no page (unless some
+                            // was written).
+                            if inner.buf.try_grow(room).is_err() {
+                                return if written > 0 { Ok(written as i64) } else { Err(heap::ENOMEM) };
                             }
                             inner.buf.extend(&chunk[pushed..pushed + room]);
                             pushed += room;
