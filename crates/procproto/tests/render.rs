@@ -30,6 +30,9 @@ fn process() -> Process {
     p.stime = 500;
     p.start = 100;
     p.pages = 10;
+    p.anon_pages = 6;
+    p.shmem_pages = 1;
+    p.table_pages = 2;
     p.virt_pages = 300;
     p.nice = 5;
     p.threads = 3;
@@ -103,7 +106,8 @@ fn pid_stat_has_52_fields() {
 fn statm_status_and_counters() {
     let m = Machine::of(&system());
     let p = process();
-    assert_eq!(pid_statm(&p), "300 10 0 0 0 10 0\n");
+    // Shared: the resident file and shmem pages.
+    assert_eq!(pid_statm(&p), "300 10 4 0 0 10 0\n");
     let status = pid_status(&p, &m, &Linux::default());
     assert!(status.starts_with("Name:\tsome name\nState:"), "no Umask line without one known");
     let p2 = Process { sig_blocked: 1 << 1, sig_ignored: 1 << 12, sig_caught: 1 << 16, peak_pages: 20, virt_peak: 400, ..p };
@@ -115,6 +119,10 @@ fn statm_status_and_counters() {
     assert!(status.contains("\nPid:\t42\n") && status.contains("\nTgid:\t42\n") && status.contains("\nPPid:\t1\n"));
     assert!(status.contains("\nThreads:\t3\n") && status.contains("\nVmRSS:\t      40 kB\n"));
     assert!(status.contains("\nCpus_allowed_list:\t0-1\n"));
+    // Resident pages by kind, and the page tables, in Linux's order.
+    assert!(status.contains(
+        "\nVmRSS:\t      40 kB\nRssAnon:\t      24 kB\nRssFile:\t      12 kB\nRssShmem:\t       4 kB\nVmPTE:\t       8 kB\nVmSwap:\t       0 kB\n"
+    ));
     let c = counters(&Counters { syscalls: 5, ..Default::default() });
     assert!(c.starts_with("syscalls 5\nipc_calls 0\n") && c.lines().count() == 6);
 }
@@ -123,4 +131,50 @@ fn statm_status_and_counters() {
 fn cpu_lists() {
     assert_eq!(cpu_list(1), "0");
     assert_eq!(cpu_list(4), "0-3");
+}
+
+#[test]
+fn oom_score_scales_the_badness_as_linux() {
+    // Never chosen: 0.
+    assert_eq!(oom_score(None, 65536), 0);
+    // Nothing resident: the middle of the scale, times 2/3.
+    assert_eq!(oom_score(Some(0), 65536), 666);
+    // All memory resident: 2000 * 2/3; with oom_score_adj 1000 on top: 2000.
+    assert_eq!(oom_score(Some(65536), 65536), 1333);
+    assert_eq!(oom_score(Some(2 * 65536), 65536), 2000);
+    // A small process with oom_score_adj -999 (its points less 999 * 65):
+    // nearly 0, and never below.
+    assert_eq!(oom_score(Some(10 - 999 * 65), 65536), 6);
+    assert_eq!(oom_score(Some(-3 * 65536), 65536), 0);
+    // Larger processes score higher.
+    assert!(oom_score(Some(8192), 65536) > oom_score(Some(2048), 65536));
+}
+
+#[test]
+fn legacy_oom_adj_converts_as_linux() {
+    assert_eq!(oom_adj(1000), 15);
+    assert_eq!(oom_adj(-1000), -17);
+    assert_eq!(oom_adj(0), 0);
+    assert_eq!(oom_adj(500), 8);
+    assert_eq!(oom_adj(-500), -8);
+    assert_eq!(score_adj_of_oom_adj(15), Some(1000));
+    assert_eq!(score_adj_of_oom_adj(-17), Some(-1000));
+    assert_eq!(score_adj_of_oom_adj(-16), Some(-941));
+    assert_eq!(score_adj_of_oom_adj(8), Some(470));
+    assert_eq!(score_adj_of_oom_adj(16), None);
+    assert_eq!(score_adj_of_oom_adj(-18), None);
+}
+
+#[test]
+fn numbers_written_to_proc() {
+    assert_eq!(parse_int(b"500\n"), Some(500));
+    assert_eq!(parse_int(b"  -1000 \n"), Some(-1000));
+    assert_eq!(parse_int(b"+7"), Some(7));
+    assert_eq!(parse_int(b"0x10"), Some(16));
+    assert_eq!(parse_int(b"010"), Some(8));
+    assert_eq!(parse_int(b"0"), Some(0));
+    assert_eq!(parse_int(b"-9223372036854775808"), Some(i64::MIN));
+    for bad in [&b""[..], b"\n", b"-", b"12a", b"1 2", b"08", b"0x", b"9223372036854775808", b"--1"] {
+        assert_eq!(parse_int(bad), None, "{:?}", core::str::from_utf8(bad));
+    }
 }

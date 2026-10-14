@@ -1,7 +1,8 @@
 //! The text formats of Linux's /proc files (proc(5)): the system-wide ones
 //! procfs serves (`stat`, `meminfo`, `loadavg`, `uptime`, `counters`) and a
-//! process's own the Linux server makes (`<pid>/stat`, `statm`, `status`),
-//! from the kernel's records. Pure functions, tested on the
+//! process's own the Linux server makes (`<pid>/stat`, `statm`, `status`,
+//! `oom_score`, `oom_adj`), from the kernel's records, and how the numbers
+//! written to /proc are read (`parse_int`). Pure functions, tested on the
 //! host (`cargo test -p procproto`).
 
 use crate::*;
@@ -200,15 +201,16 @@ pub fn pid_stat(p: &Process, m: &Machine, l: &Linux) -> String {
     )
 }
 
-/// /proc/<pid>/statm: size resident shared text lib data dt (pages).
+/// /proc/<pid>/statm: size resident shared text lib data dt (pages); shared
+/// are the resident file and shmem pages, as Linux counts them.
 pub fn pid_statm(p: &Process) -> String {
-    format!("{} {} 0 0 0 {} 0\n", p.virt_pages, p.pages, p.pages)
+    format!("{} {} {} 0 0 {} 0\n", p.virt_pages, p.pages, p.pages.saturating_sub(p.anon_pages), p.pages)
 }
 
 /// /proc/<pid>/status: the fields programs read, in Linux's order. (The
 /// kernel keeps no split of the address space by kind, so VmData, VmStk,
 /// VmExe and VmLib are not shown, nor the context switches it does not
-/// count per thread.)
+/// count per thread; resident pages are split by kind.)
 pub fn pid_status(p: &Process, m: &Machine, l: &Linux) -> String {
     let state = match p.state as u8 {
         STATE_RUNNING => "R (running)",
@@ -227,7 +229,7 @@ pub fn pid_status(p: &Process, m: &Machine, l: &Linux) -> String {
         "State:\t{state}\nTgid:\t{tgid}\nNgid:\t0\nPid:\t{pid}\nPPid:\t{ppid}\nTracerPid:\t0\n\
          Uid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nFDSize:\t256\nGroups:\t\nNStgid:\t{tgid}\nNSpid:\t{pid}\nNSpgid:\t{pgid}\nNSsid:\t{sid}\n\
          VmPeak:\t{peak:>8} kB\nVmSize:\t{virt:>8} kB\nVmLck:\t       0 kB\nVmPin:\t       0 kB\nVmHWM:\t{hwm:>8} kB\n\
-         VmRSS:\t{rss:>8} kB\nRssAnon:\t{rss:>8} kB\nRssFile:\t       0 kB\nRssShmem:\t       0 kB\nVmSwap:\t       0 kB\n\
+         VmRSS:\t{rss:>8} kB\nRssAnon:\t{anon:>8} kB\nRssFile:\t{file:>8} kB\nRssShmem:\t{shmem:>8} kB\nVmPTE:\t{pte:>8} kB\nVmSwap:\t       0 kB\n\
          Threads:\t{threads}\nSigPnd:\t{pnd:016x}\nShdPnd:\t{shd:016x}\nSigBlk:\t{blk:016x}\nSigIgn:\t{ign:016x}\nSigCgt:\t{cgt:016x}\n\
          CapInh:\t0000000000000000\nCapPrm:\t{caps:016x}\nCapEff:\t{caps:016x}\nCapBnd:\t{caps:016x}\nCapAmb:\t0000000000000000\n\
          Cpus_allowed_list:\t{cpus}\n",
@@ -240,6 +242,10 @@ pub fn pid_status(p: &Process, m: &Machine, l: &Linux) -> String {
         virt = kb(p.virt_pages),
         hwm = kb(p.peak_pages.max(p.pages)),
         rss = kb(p.pages),
+        anon = kb(p.anon_pages.min(p.pages)),
+        file = kb(p.pages.saturating_sub(p.anon_pages).saturating_sub(p.shmem_pages)),
+        shmem = kb(p.shmem_pages.min(p.pages.saturating_sub(p.anon_pages))),
+        pte = kb(p.table_pages),
         threads = p.threads,
         pnd = p.sig_pending,
         shd = p.sig_shared,
@@ -250,5 +256,67 @@ pub fn pid_status(p: &Process, m: &Machine, l: &Linux) -> String {
         cpus = cpu_list(m.cpus),
     );
     out
+}
+
+/// /proc/<pid>/oom_score from the OOM killer's badness `points` (None: it
+/// would not choose the process) against `total` pages, as Linux's
+/// `proc_oom_score`: 0 for a process it never chooses, else the badness
+/// scaled into 0..=2000 (1000 + thousandths of memory, times 2/3: the badness
+/// is at most twice all memory, with oom_score_adj 1000).
+pub fn oom_score(points: Option<i64>, total: u64) -> u64 {
+    match points {
+        None => 0,
+        Some(points) => {
+            let total = total.max(1) as i128;
+            ((1000 + points as i128 * 1000 / total) * 2 / 3).clamp(0, 2000) as u64
+        }
+    }
+}
+
+/// The legacy /proc/<pid>/oom_adj (-17..=15) from oom_score_adj
+/// (-1000..=1000), as Linux reads it: 15 for 1000, else scaled by 17/1000.
+pub fn oom_adj(score_adj: i64) -> i64 {
+    if score_adj == 1000 { 15 } else { score_adj * 17 / 1000 }
+}
+
+/// The oom_score_adj a write of the legacy oom_adj sets (None: EINVAL, outside
+/// -16..=15 and not -17, `OOM_DISABLE`): 1000 for 15, else scaled by 1000/17.
+pub fn score_adj_of_oom_adj(oom_adj: i64) -> Option<i64> {
+    match oom_adj {
+        15 => Some(1000),
+        -17 | -16..=14 => Some(oom_adj * 1000 / 17),
+        _ => None,
+    }
+}
+
+/// A number written to /proc (Linux's `kstrtoint` after `strstrip`, as
+/// oom_score_adj and the sysctls read it): whitespace around it, an optional
+/// sign, then decimal, octal with a leading 0, or hexadecimal with 0x. None
+/// for anything else, or beyond i64.
+pub fn parse_int(text: &[u8]) -> Option<i64> {
+    let text = text.trim_ascii();
+    let (negative, digits) = match text.first()? {
+        b'-' => (true, &text[1..]),
+        b'+' => (false, &text[1..]),
+        _ => (false, text),
+    };
+    let (radix, digits) = match digits {
+        [b'0', b'x' | b'X', rest @ ..] => (16, rest),
+        [b'0', rest @ ..] if !rest.is_empty() => (8, rest),
+        _ => (10, digits),
+    };
+    if digits.is_empty() {
+        return None;
+    }
+    let mut value: i128 = 0;
+    for &b in digits {
+        let d = (b as char).to_digit(radix)? as i128;
+        value = value * radix as i128 + d;
+        if value > i64::MAX as i128 + 1 {
+            return None;
+        }
+    }
+    let value = if negative { -value } else { value };
+    i64::try_from(value).ok()
 }
 

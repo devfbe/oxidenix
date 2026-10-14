@@ -1657,6 +1657,9 @@ pub fn query(op: u64, arg: u64, cap: usize) -> Result<Vec<u8>, i64> {
                 sig_ignored: ignored,
                 sig_caught: caught,
                 name: comm,
+                anon_pages: info.anon_pages,
+                shmem_pages: info.shmem_pages,
+                table_pages: info.table_pages,
             };
             text(as_bytes(&record))
         }
@@ -1673,4 +1676,35 @@ pub fn brk_of(pid: Pid) -> Option<Arc<Mutex<Brk>>> {
 /// The kernel's handle on process `pid`.
 pub fn handle_of(pid: Pid) -> Option<u64> {
     PROCS.lock().procs.get(&pid).map(|p| p.handle)
+}
+
+/// The kernel's record of process `pid` (or of the process of the thread `pid`), for its
+/// memory and the OOM killer's view of it (`/proc/<pid>/oom_score`; a zombie's says the
+/// killer would not choose it); ESRCH if there is none. Asked under the table's lock, so
+/// the handle names that very process.
+pub fn kernel_info(pid: Pid) -> Result<ProcInfo, i64> {
+    let t = PROCS.lock();
+    let owner = if t.procs.contains_key(&pid) { pid } else { t.threads.get(&pid).ok_or(ESRCH)?.pid };
+    let p = t.procs.get(&owner).ok_or(ESRCH)?;
+    let mut info = ProcInfo::default();
+    let r = syscall(SYS_PROC_INFO, [p.handle, &mut info as *mut ProcInfo as u64, 0, 0, 0, 0]);
+    if r < 0 {
+        return Err(-r);
+    }
+    Ok(info)
+}
+
+/// The OOM killer's adjustment of process `pid` (or of the process of the thread `pid`):
+/// read (`flags` 0) or set to `value` (`restricted::SYS_OOM_SCORE_ADJ`'s flags; the kernel
+/// checks the range and the host grant). The value before; ESRCH if there is no such
+/// process.
+pub fn oom_score_adj(pid: Pid, flags: u64, value: i64) -> Result<i64, i64> {
+    let t = PROCS.lock();
+    let owner = if t.procs.contains_key(&pid) { pid } else { t.threads.get(&pid).ok_or(ESRCH)?.pid };
+    let p = t.procs.get(&owner).ok_or(ESRCH)?;
+    let r = syscall(SYS_OOM_SCORE_ADJ, [p.handle, flags, value as u64, 0, 0, 0]);
+    if r < 0 {
+        return Err(-r);
+    }
+    Ok(r - 1000)
 }

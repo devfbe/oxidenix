@@ -12,9 +12,11 @@
 //!   when the old one died).
 //! - **The server** makes each process's own part: `/proc/<pid>` (its
 //!   files, `task/<tid>`, `fd/<n>`, `cwd`, `root`, `exe`, `mounts`),
-//!   `self`, `thread-self` and `mounts`, merged into procfs's root. The
-//!   records come from the server's process table (`process::query`, R8,
-//!   with the kernel's accounts of CPU time and memory); the descriptors of
+//!   `self`, `thread-self` and `mounts`, merged into procfs's root, and
+//!   `sys/vm` (the kernel's overcommit policy, ADR 0013) in procfs's
+//!   `sys`. The records come from the server's process table
+//!   (`process::query`, R8, with the kernel's accounts of CPU time and
+//!   memory, and of the OOM killer's badness); the descriptors of
 //!   `fd` from the process's descriptor table (`fdtable`, R6e;
 //!   `process::files_of`). The text formats are `procproto::render`'s,
 //!   shared with procfs.
@@ -60,6 +62,7 @@ const MAX_REMOTE: usize = 1 << 20;
 
 const ENOENT: i64 = 2;
 const ESRCH: i64 = 3;
+const EACCES: i64 = 13;
 const EIO: i64 = 5;
 const ENOTDIR: i64 = 20;
 const EISDIR: i64 = 21;
@@ -75,8 +78,8 @@ pub const DT_DIR: u8 = 4;
 pub const DT_REG: u8 = 8;
 pub const DT_LNK: u8 = 10;
 
-/// The files of a process's directory (and, the first five, of a
-/// thread's, `task/<tid>`).
+/// The files of a process's directory (and of a thread's, `task/<tid>`,
+/// those of `TASK_FILES`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PidFile {
     Dir = 0,
@@ -91,6 +94,11 @@ pub enum PidFile {
     Fd,
     Cwd,
     Root,
+    /// The OOM killer's view of the process (`oom_score`), and its
+    /// adjustment, new (`oom_score_adj`) and legacy (`oom_adj`): writable.
+    OomScore,
+    OomScoreAdj,
+    OomAdj,
 }
 
 const PID_FILES: &[(&str, PidFile)] = &[
@@ -105,6 +113,9 @@ const PID_FILES: &[(&str, PidFile)] = &[
     ("fd", PidFile::Fd),
     ("cwd", PidFile::Cwd),
     ("root", PidFile::Root),
+    ("oom_score", PidFile::OomScore),
+    ("oom_score_adj", PidFile::OomScoreAdj),
+    ("oom_adj", PidFile::OomAdj),
 ];
 const TASK_FILES: &[(&str, PidFile)] = &[
     ("stat", PidFile::Stat),
@@ -112,7 +123,38 @@ const TASK_FILES: &[(&str, PidFile)] = &[
     ("status", PidFile::Status),
     ("cmdline", PidFile::Cmdline),
     ("comm", PidFile::Comm),
+    ("oom_score", PidFile::OomScore),
+    ("oom_score_adj", PidFile::OomScoreAdj),
+    ("oom_adj", PidFile::OomAdj),
 ];
+
+/// /proc/sys/vm, the server's within procfs's /proc/sys: the kernel's
+/// overcommit policy (`restricted::SYS_OVERCOMMIT`), the machine's, so
+/// writable by a tree with the host grant only.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VmFile {
+    Dir = 0,
+    OvercommitMemory,
+    OvercommitRatio,
+    OvercommitKbytes,
+}
+
+const VM_FILES: &[(&str, VmFile)] = &[
+    ("overcommit_kbytes", VmFile::OvercommitKbytes),
+    ("overcommit_memory", VmFile::OvercommitMemory),
+    ("overcommit_ratio", VmFile::OvercommitRatio),
+];
+
+impl VmFile {
+    /// Which of the policy's values it is (`SYS_OVERCOMMIT`'s `which`).
+    fn which(self) -> u64 {
+        match self {
+            VmFile::OvercommitMemory | VmFile::Dir => OVERCOMMIT_MODE,
+            VmFile::OvercommitRatio => OVERCOMMIT_RATIO,
+            VmFile::OvercommitKbytes => OVERCOMMIT_KBYTES,
+        }
+    }
+}
 
 /// A node of /proc or /sys.
 #[derive(Clone)]
@@ -130,6 +172,8 @@ pub enum ProcNode {
     Task { pid: u64, tid: u64, file: PidFile },
     /// /proc/<pid>/fd/<fd>: a magic link.
     Fd { pid: u64, fd: u32 },
+    /// /proc/sys/vm and its files.
+    Vm(VmFile),
     /// The open file a magic link led to that is no filesystem's node (a
     /// pipe, a socket, an eventfd, an epoll instance).
     Open(Opened),
@@ -398,8 +442,21 @@ fn pid_mode(file: PidFile) -> u32 {
         PidFile::Dir | PidFile::Task => S_IFDIR | 0o555,
         PidFile::Fd => S_IFDIR | 0o500,
         PidFile::Exe | PidFile::Cwd | PidFile::Root => S_IFLNK | 0o777,
+        PidFile::OomScoreAdj | PidFile::OomAdj => S_IFREG | 0o644,
         _ => S_IFREG | 0o444,
     }
+}
+
+fn vm_mode(file: VmFile) -> u32 {
+    match file {
+        VmFile::Dir => S_IFDIR | 0o555,
+        _ => S_IFREG | 0o644,
+    }
+}
+
+/// The node of /proc/sys (procfs's directory, which `vm` is merged into).
+fn proc_sys() -> ProcNode {
+    ProcNode::Remote { sys: false, ino: PROC_SYS, mode: S_IFDIR | 0o555 }
 }
 
 /// A node's mode (of an open file: its status's).
@@ -409,6 +466,7 @@ pub fn mode(node: &ProcNode) -> u32 {
         ProcNode::SelfLink | ProcNode::ThreadSelf | ProcNode::MountsLink => S_IFLNK | 0o777,
         ProcNode::Pid { file, .. } | ProcNode::Task { file, .. } => pid_mode(*file),
         ProcNode::Fd { .. } => S_IFLNK | 0o700,
+        ProcNode::Vm(file) => vm_mode(*file),
         ProcNode::Open(_) => stat(node).map_or(0, |st| namespace::mode_of(&st)),
     }
 }
@@ -441,9 +499,28 @@ pub fn may_open(node: &ProcNode) -> Result<(), i64> {
     }
 }
 
+/// Whether the caller may open the node for writing (it exists): a process's
+/// oom_score_adj and oom_adj, and with the host grant the overcommit policy (Linux's
+/// sysctl permission for a namespace whose root does not own the machine: EACCES);
+/// EACCES for every other node.
+pub fn may_write(node: &ProcNode) -> Result<(), i64> {
+    match node {
+        ProcNode::Pid { file: PidFile::OomScoreAdj | PidFile::OomAdj, .. } | ProcNode::Task { file: PidFile::OomScoreAdj | PidFile::OomAdj, .. } => check(node),
+        ProcNode::Vm(file) if *file != VmFile::Dir => {
+            if syscall(SYS_HOST_GRANTED, [0; 6]) < 0 {
+                return Err(EACCES);
+            }
+            Ok(())
+        }
+        _ => Err(EACCES),
+    }
+}
+
 /// `name` in the directory `dir`.
 pub fn lookup(dir: &ProcNode, name: &str) -> Result<ProcNode, i64> {
     match dir {
+        ProcNode::Remote { sys: false, ino: PROC_SYS, .. } if name == "vm" => Ok(ProcNode::Vm(VmFile::Dir)),
+        ProcNode::Vm(VmFile::Dir) => VM_FILES.iter().find(|(n, _)| *n == name).map(|&(_, f)| ProcNode::Vm(f)).ok_or(ENOENT),
         ProcNode::Remote { sys: false, ino: PROC_ROOT, .. } => match name {
             "self" => Ok(ProcNode::SelfLink),
             "thread-self" => Ok(ProcNode::ThreadSelf),
@@ -492,6 +569,7 @@ fn ino(node: &ProcNode) -> u64 {
         ProcNode::Pid { pid, file } => (pid + 1) << 20 | *file as u64,
         ProcNode::Task { tid, file, .. } => (tid + 1) << 20 | 1 << 12 | *file as u64,
         ProcNode::Fd { pid, fd } => (pid + 1) << 20 | 2 << 12 | *fd as u64,
+        ProcNode::Vm(file) => 0x1_0010 + *file as u64,
         ProcNode::Open(_) => 0,
     }
 }
@@ -551,6 +629,20 @@ pub fn list(dir: &ProcNode) -> Result<Vec<(String, u64, u8)>, i64> {
             }
             for pid in ids(QUERY_PIDS, 0)?.into_iter().filter(|&p| p != 0) {
                 add_id(&mut out, pid, &ProcNode::Pid { pid, file: PidFile::Dir })?;
+            }
+            Ok(out)
+        }
+        ProcNode::Remote { sys: false, ino: PROC_SYS, .. } => {
+            let mut out = remote_readdir(PROC_SYS)?;
+            add(&mut out, "vm", &ProcNode::Vm(VmFile::Dir))?;
+            Ok(out)
+        }
+        ProcNode::Vm(VmFile::Dir) => {
+            let mut out = try_vec(VM_FILES.len() + 2)?;
+            add(&mut out, ".", dir)?;
+            add(&mut out, "..", &proc_sys())?;
+            for &(n, file) in VM_FILES {
+                add(&mut out, n, &ProcNode::Vm(file))?;
             }
             Ok(out)
         }
@@ -694,6 +786,14 @@ pub fn follow(node: &ProcNode) -> Result<Option<Follow>, i64> {
 pub fn contents(node: &ProcNode) -> Result<Vec<u8>, i64> {
     let (id, file) = match node {
         ProcNode::Remote { ino, mode, .. } if mode & vfs::S_IFMT == S_IFREG => return remote_read(*ino),
+        ProcNode::Vm(VmFile::Dir) => return Err(EISDIR),
+        ProcNode::Vm(file) => {
+            let value = syscall(SYS_OVERCOMMIT, [file.which(), 0, 0, 0, 0, 0]);
+            if value < 0 {
+                return Err(-value);
+            }
+            return Ok(try_format!("{value}\n")?.into_bytes());
+        }
         ProcNode::Pid { pid, file } => (*pid, *file),
         ProcNode::Task { tid, file, .. } => {
             check(node)?;
@@ -710,10 +810,57 @@ pub fn contents(node: &ProcNode) -> Result<Vec<u8>, i64> {
         PidFile::Cmdline => return text(QUERY_CMDLINE, id),
         PidFile::Comm => try_format!("{}\n", fmt::name(&p))?,
         PidFile::Mounts => namespace::mounts_text()?,
+        PidFile::OomScore => {
+            let info = crate::process::kernel_info(id as crate::process::Pid).map_err(|_| ENOENT)?;
+            let points = (info.oom_points != i64::MIN).then_some(info.oom_points);
+            try_format!("{}\n", fmt::oom_score(points, info.total_pages))?
+        }
+        PidFile::OomScoreAdj => try_format!("{}\n", oom_adj_of(id, 0, 0)?)?,
+        PidFile::OomAdj => try_format!("{}\n", fmt::oom_adj(oom_adj_of(id, 0, 0)?))?,
         PidFile::Dir | PidFile::Task | PidFile::Fd => return Err(EISDIR),
         PidFile::Exe | PidFile::Cwd | PidFile::Root => return Err(EINVAL),
     };
     Ok(text.into_bytes())
+}
+
+/// The oom_score_adj of process (or thread) `pid`, read (`flags` 0) or set
+/// (`process::oom_score_adj`): the value before; ENOENT once the process is gone.
+fn oom_adj_of(pid: u64, flags: u64, value: i64) -> Result<i64, i64> {
+    crate::process::oom_score_adj(pid as crate::process::Pid, flags, value).map_err(|e| if e == ESRCH { ENOENT } else { e })
+}
+
+/// The most a write to a writable file of /proc takes in (Linux's PROC_NUMBUF less one,
+/// for oom_score_adj and oom_adj: more is cut off and not counted).
+const NUMBER_MAX: usize = 12;
+
+/// A write of `data` to a node opened for writing (`may_write`), as Linux's: a process's
+/// oom_score_adj (-1000..=1000) or legacy oom_adj (-17..=15) from at most `NUMBER_MAX`
+/// bytes, or a value of the overcommit policy (`SYS_OVERCOMMIT`: the kernel checks the
+/// value and the host grant). EINVAL for what is no number in range, EACCES below the
+/// least oom_score_adj the process may set without the host grant. The bytes taken.
+pub fn write(node: &ProcNode, data: &[u8]) -> Result<usize, i64> {
+    match node {
+        ProcNode::Pid { pid: id, file: file @ (PidFile::OomScoreAdj | PidFile::OomAdj) }
+        | ProcNode::Task { tid: id, file: file @ (PidFile::OomScoreAdj | PidFile::OomAdj), .. } => {
+            let data = &data[..data.len().min(NUMBER_MAX)];
+            let value = fmt::parse_int(data).ok_or(EINVAL)?;
+            let (adj, flags) = match file {
+                PidFile::OomScoreAdj => (value, OOM_ADJ_SET),
+                _ => (fmt::score_adj_of_oom_adj(value).ok_or(EINVAL)?, OOM_ADJ_SET | OOM_ADJ_LEGACY),
+            };
+            oom_adj_of(*id, flags, adj)?;
+            Ok(data.len())
+        }
+        ProcNode::Vm(file) if *file != VmFile::Dir => {
+            let value = fmt::parse_int(data).filter(|&v| v >= 0).ok_or(EINVAL)?;
+            let r = syscall(SYS_OVERCOMMIT, [file.which(), 1, value as u64, 0, 0, 0]);
+            if r < 0 {
+                return Err(-r);
+            }
+            Ok(data.len())
+        }
+        _ => Err(EINVAL),
+    }
 }
 
 /// The `struct statfs` (120 bytes) of /proc or /sys, as Linux's: no blocks,
