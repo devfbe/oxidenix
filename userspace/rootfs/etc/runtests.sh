@@ -91,5 +91,14 @@ echo "PASS pid 1 survives SIGKILL from its own tree"
 echo "=== lxtest crashloop"
 if lxtest crashloop; then echo "PASS lxtest crashloop"; else fail "lxtest crashloop"; fi
 
+# The builder boots once more with this disk read-only (/etc/rotests.sh), which
+# reads this file back.
+echo "=== a file for the read-only boot"
+if mkdir -p /data/rotest && echo "written by the self-tests" > /data/rotest/written && sync; then
+    echo "PASS /data/rotest/written"
+else
+    fail "/data/rotest/written"
+fi
+
 echo "=== summary: $failed failed"
 [ "$failed" -eq 0 ]

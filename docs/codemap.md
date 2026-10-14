@@ -64,8 +64,8 @@ module comment, and the public types it defines. Where to start for common tasks
 
 - `servers/linux/src/chantest.rs` (374) `TEST_CHANNEL`: the client's side of channels to the test service (servers/ringtest, protocol `ring::selftest`), as the page cache will use them with diskfs: create, connect, grant, move descriptors through the rings...
 - `servers/linux/src/console.rs` (96) The console's terminal (phase R6d, ADR 0007): the kernel's console device (a VT100 on the framebuffer, mirrored to the serial port, and the keyboard) driven by a terminal of the server (`tty`).
-- `servers/linux/src/datafile.rs` (316) Open files of /data (phase R6c.3): what an open file description of the server's names (offset, the directory cursor, write access, O_DIRECT and O_SYNC); the calls on it are the server's (`datafs`), as for the... Types: `DataOpen`.
-- `servers/linux/src/datafs.rs` (1622) /data in the server (phase R6c.3, I/O rings step 4): diskfs's ext2 filesystem through the file protocol (`fsring`, over `fsclient`'s channel), with the server's own page cache. Types: `DInode`, `New`, `HoldKind`.
+- `servers/linux/src/datafile.rs` (319) Open files of /data (phase R6c.3): what an open file description of the server's names (offset, the directory cursor, write access, O_DIRECT and O_SYNC); the calls on it are the server's (`datafs`), as for the... Types: `DataOpen`.
+- `servers/linux/src/datafs.rs` (1648) /data in the server (phase R6c.3, I/O rings step 4): diskfs's ext2 filesystem through the file protocol (`fsring`, over `fsclient`'s channel), with the server's own page cache. Types: `DInode`, `New`, `HoldKind`.
 - `servers/linux/src/devices.rs` (103) Null and zero (phase R6d; /dev's since R9): a character device node names its driver by its number wherever it is (ADR 0007), so a node (1,3) or (1,5) in /dev, on the server's tmpfs or /data is null or zero, served here. Types: `Kind`, `DevOpen`.
 - `servers/linux/src/disktest.rs` (577) `TEST_DISKRING`: the client's side of the file protocol (`fsring`) against diskfs, as the page cache will use it in step 4: a channel to diskfs, grants of memory objects, files on /data read and written by DMA into...
 - `servers/linux/src/epoll.rs` (532) epoll (phase R6e): an interest list of open file descriptions and a ready list, the event loop interface of libuv (and so of Node.js), as Linux's fs/eventpoll.c has it. Types: `Epoll`, `Item`.
@@ -84,12 +84,12 @@ module comment, and the public types it defines. Where to start for common tasks
 - `servers/linux/src/local.rs` (74) The server's data for the thread it runs on (phases R6e, R8): a block in the thread's State page (`restricted::SERVER_LOCAL_OFFSET`, which the kernel never touches), found from the stack as the lock count is (`sync`;... Types: `Local`.
 - `servers/linux/src/main.rs` (503) The Linux server (docs/design/linux-server.md).
 - `servers/linux/src/mm.rs` (183) Memory system calls (phase R4): Linux's semantics of mmap, munmap, mprotect, mremap, madvise, msync and the mlock family, and brk (with the process model, R8), over the kernel's mapping calls.
-- `servers/linux/src/namespace.rs` (303) The server's namespace (phase R6c.2): mounts and path resolution. Types: `Node`, `Origin`, `Resolved`.
+- `servers/linux/src/namespace.rs` (305) The server's namespace (phase R6c.2): mounts and path resolution. Types: `Node`, `Origin`, `Resolved`.
 - `servers/linux/src/netclient.rs` (391) The instance's channel to netd (phase R7b, ADR 0008, the protocol `netring`): requests (`ringclient`'s slots), the shared area with a control block per socket, the buffer pool the sockets' rings live in, and the net... Types: `Futex`, `Rings`, `Net`.
 - `servers/linux/src/netdev.rs` (148) The network interfaces as Linux programs see them: netd's description (`LINKS` over the instance's channel, `netring::Link`) with Linux's names and flags, for rtnetlink (`netlink`) and for the interface requests...
 - `servers/linux/src/netlink.rs` (547) Netlink sockets (netlink(7)), protocol NETLINK_ROUTE: files of the server, as pipes. Types: `NetlinkSocket`.
 - `servers/linux/src/pathfile.rs` (22) O_PATH descriptors (open(2) with O_PATH; phase R6d, for any node of the namespace): the descriptor names a node and opens nothing, no driver, no file. Types: `PathOpen`.
-- `servers/linux/src/paths.rs` (638) The system calls that take a path (phase R6c.2b), and the working directory and umask, which live in the caller's record (`records`).
+- `servers/linux/src/paths.rs` (649) The system calls that take a path (phase R6c.2b), and the working directory and umask, which live in the caller's record (`records`).
 - `servers/linux/src/pipe.rs` (308) Pipes (phase R6a): a 64 KiB buffer shared by a read end and a write end, each a file of the server (an open file description of its own). Types: `Dst`, `Src`, `Shared`, `PipeEnd`, `Pipe`.
 - `servers/linux/src/poll.rs` (440) Readiness and waiting for many files at once (phase R6e): the watch lists of the server's open file descriptions, poll, ppoll, select, pselect6 (epoll is `epoll`'s; restart_syscall `signal`'s). Types: `Waiter`, `Sub`, `Watch`.
 - `servers/linux/src/process.rs` (1266) Processes (phase R8, docs/design/linux-server.md "Processes and signals", ADR 0010): the instance's pid namespace, the process tree, sessions and process groups, fork, vfork, clone and clone3, exit and exit_group,... Types: `Words`, `Usage`, `Report`, `Brk`, `Proc`, `Thread`, `Table`, `Birth`, `After`.
@@ -116,7 +116,7 @@ module comment, and the public types it defines. Where to start for common tasks
 
 - `servers/diskfs/src/blk.rs` (276) virtio-blk driver on the shared virtio transport (crates/virtio). Types: `Kind`, `SubmitError`, `VirtioBlk`.
 - `servers/diskfs/src/main.rs` (98) diskfs: the ext2 filesystem server.
-- `servers/diskfs/src/service.rs` (1026) The ring service: diskfs's end of the data plane (docs/design/io-rings.md, the file protocol `fsring`). Types: `Service`.
+- `servers/diskfs/src/service.rs` (1027) The ring service: diskfs's end of the data plane (docs/design/io-rings.md, the file protocol `fsring`). Types: `Service`.
 - `servers/netd/src/main.rs` (204) netd: the network server.
 - `servers/netd/src/nic.rs` (114) smoltcp's view of the network card, with loopback: frames addressed to this host (its own address or 127.0.0.0/8) never reach the wire but come back as received frames, and ARP requests for those addresses are... Types: `Nic`, `RxToken`, `TxToken`.
 - `servers/netd/src/service.rs` (1863) The socket service: netd's end of the instances' channels (phase R7b, ADR 0008, the protocol `netring`), mapped onto smoltcp's sockets. Types: `Config`, `Service`.
@@ -133,9 +133,9 @@ module comment, and the public types it defines. Where to start for common tasks
 - `crates/ext2fs/src/blockset.rs` (64) A set of block numbers kept as ranges, for sets that follow a file's blocks: freeing a 2 GiB file frees two million mostly contiguous blocks, which as single entries would take more memory than diskfs has, and as... Types: `BlockSet`.
 - `crates/ext2fs/src/cache.rs` (86) The metadata block cache: inode tables, bitmaps, group descriptors, directories, symlink and indirect blocks. Types: `BlockCache`.
 - `crates/ext2fs/src/journal.rs` (321) The JBD2 journal format (ext3's, docs/design/ext3-journal.md): the journal superblock, the log blocks a transaction is written as (descriptors with their tags, the logged blocks, revoke blocks, the commit block with... Types: `Superblock`, `Log`, `Recovery`.
-- `crates/ext2fs/src/lib.rs` (2698) ext2 with an ext3 journal on the data disk (any `Device`): revision 1 with the `filetype` feature, 1/2/4 KiB blocks, direct and single/double/triple indirect blocks, and a JBD2 journal in inode 8 (`journal.rs`;... Types: `Device`, `NewNode`, `RawInode`, `Extent`, `Run`, `Reservation`, `Stat`, `Ext2`.
+- `crates/ext2fs/src/lib.rs` (2701) ext2 with an ext3 journal on the data disk (any `Device`): revision 1 with the `filetype` feature, 1/2/4 KiB blocks, direct and single/double/triple indirect blocks, and a JBD2 journal in inode 8 (`journal.rs`;... Types: `Device`, `NewNode`, `RawInode`, `Extent`, `Run`, `Reservation`, `Stat`, `Ext2`.
 - `crates/ext2fs/tests/io.rs` (1878) ext2fs on a RAM disk that counts device requests: large reads and writes take few requests, a write flushes twice (data, then its transaction), and the filesystem stays consistent for e2fsck; on the ring path,...
-- `crates/fsring/src/lib.rs` (426) The file protocol of the data plane: the requests the Linux server (the client) sends diskfs (the service) through a channel's submission ring, and their completions (docs/design/io-rings.md, "The file protocol"). Types: `Buf`, `Kind`, `Node`, `Request`, `Stat`, `Usage`.
+- `crates/fsring/src/lib.rs` (427) The file protocol of the data plane: the requests the Linux server (the client) sends diskfs (the service) through a channel's submission ring, and their completions (docs/design/io-rings.md, "The file protocol"). Types: `Buf`, `Kind`, `Node`, `Request`, `Stat`, `Usage`.
 - `crates/fsring/tests/protocol.rs` (169) The file protocol's encodings: every request survives encode and decode (inode handles with their generations), malformed descriptors are refused with the right errno (unknown operations, stray fields, lengths,...
 - `crates/ldisc/src/lib.rs` (527) Linux's N_TTY line discipline as a library, for the Linux server's terminals (docs/design/linux-server.md, "The terminal"): input mapping, signals from the keyboard, flow control, canonical line editing with echo,... Types: `Received`, `Take`, `ReadMode`, `Ldisc`.
 - `crates/ldisc/src/termios.rs` (139) Terminal settings as Linux keeps them: `struct termios` and `struct termios2` in x86-64's layout (tcgetattr's TCGETS, TCGETS2), their flags and control characters, and the defaults of Linux's `tty_std_termios`. Types: `Termios`.
@@ -162,7 +162,7 @@ module comment, and the public types it defines. Where to start for common tasks
 - `crates/slab/src/lib.rs` (139) Size classes for small allocations: objects of up to 2 KiB come from slabs (4 KiB, aligned to 4 KiB) cut into equal slots, and a class's free slots form an intrusive list, so allocating and freeing one is O(1). Types: `FreeList`.
 - `crates/slab/tests/classes.rs` (163) Size classes and free lists of the slab allocator.
 - `crates/vfs/src/cpio.rs` (80) The initramfs: a cpio archive in "newc" format. Types: `Header`, `Entry`, `Entries`.
-- `crates/vfs/src/lib.rs` (12) The pure parts of the Linux server's namespace (docs/design/linux-server.md, R6c): path arithmetic, the initramfs format and where reads and writes go.
+- `crates/vfs/src/lib.rs` (14) The pure parts of the Linux server's namespace (docs/design/linux-server.md, R6c): path arithmetic, the initramfs format and where reads and writes go.
 - `crates/vfs/src/path.rs` (28) Path arithmetic.
 - `crates/vfs/src/rw.rs` (30) Where a read or write goes: the file position or an offset, and whether a write appends. Types: `Plan`.
 - `crates/vfs/src/stat.rs` (294) File status as Linux reports it: `struct stat` (stat, fstat, newfstatat) and `struct statx` (statx(2)), both in x86-64's layout, and the arguments statx checks. Types: `Time`, `Stat`, `SetTime`, `Times`.
@@ -173,7 +173,7 @@ module comment, and the public types it defines. Where to start for common tasks
 
 ## Host builder
 
-- `builder/src/main.rs` (420) The host-side builder (`cargo run` in kernel/ runs it): builds the root filesystem and its cpio initramfs, the data disk and the UEFI or BIOS boot image, then starts QEMU.
+- `builder/src/main.rs` (504) The host-side builder (`cargo run` in kernel/ runs it): builds the root filesystem and its cpio initramfs, the data disk and the UEFI or BIOS boot image, then starts QEMU.
 
 ## User-space programs and tests
 
@@ -204,6 +204,7 @@ module comment, and the public types it defines. Where to start for common tasks
 - `userspace/proctest.c` (434) Process information: prctl, capabilities and /proc: procfs's system-wide files and /sys, the Linux server's per-process part (/proc/<pid>, self, thread-self, mounts) and its magic links (/proc/self/fd).
 - `userspace/randtest.c` (64) getrandom(2) and AT_RANDOM: the kernel's generator (ChaCha20 seeded from the CPU's entropy source and timing jitter).
 - `userspace/reclaimtest.c` (200) Reclaim under stress: processes that map a disk file (shared, and private with copies of their own of some pages) and read it keep checking every page they touch while other processes commit and use all the memory...
+- `userspace/rotest.c` (117) A read-only data disk (run by /etc/rotests.sh in the builder's read-only boot): /data mounted read-only as Linux mounts a filesystem whose device takes no writes.
 - `userspace/rwtest.h` (50) Positional and vectored reads and writes with preadv2/pwritev2's flags, on a file at `path` (fstest runs them on /data, the kernel's files; lxtest on /tmp, the Linux server's): the offset -1 means the file position,...
 - `userspace/sigframetest.c` (198) Signal delivery by the Linux server (R8): Linux's x86-64 signal frame (siginfo and ucontext as a handler sees them), who sent a signal (SI_USER, SI_TKILL, SI_QUEUE with its value), real-time signals queued in order,...
 - `userspace/sigmasktest.c` (102) Calls that wait with a temporary signal mask (sigsuspend, ppoll, pselect): the mask applies while they wait and to a handler that interrupts them; afterwards the caller's own mask is back.
@@ -228,6 +229,7 @@ module comment, and the public types it defines. Where to start for common tasks
 
 - `userspace/rootfs/etc/bench.sh` Benchmark mode (OXIDENIX_BENCH=1, see docs/benchmarks/README.md): runs the I/O benchmarks on the data disk; the exit status ends QEMU as in test mode.
 - `userspace/rootfs/etc/disktest.sh` Exercises the ext2 driver on /data; every line should end in "ok".
+- `userspace/rootfs/etc/rotests.sh` The self-tests on a read-only data disk: OXIDENIX_TEST=1 boots a second time with the disk the first boot wrote (QEMU's readonly=on, which virtio-blk reports as VIRTIO_BLK_F_RO), OXIDENIX_TEST=readonly boots so alone...
 - `userspace/rootfs/etc/runtests.sh` Runs every self-test and exits non-zero if any fails.
 - `userspace/rootfs/etc/test.sh` A quick manual tour of the shell: files, pipes and a few commands.
 

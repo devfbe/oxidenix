@@ -51,19 +51,23 @@ fn main() {
     std::env::set_var("NIX_PATH", format!("nixpkgs={}", pin.canonicalize().expect("nix/nixpkgs.nix is missing").display()));
 
     let kernel_path = Path::new(&args[1]);
-    let img_path = kernel_path.with_extension("img");
     let rootfs = kernel_path.with_extension("rootfs");
-    let cpio_path = kernel_path.with_extension("cpio");
 
     // OXIDENIX_TEST=1: boot straight into the self-tests and let their result
-    // become QEMU's exit status (1 = success, 3 = failure).
+    // become QEMU's exit status (1 = success, 3 = failure); after they passed,
+    // boot again with the disk they wrote read-only (QEMU's readonly=on: the
+    // device says VIRTIO_BLK_F_RO) into /etc/rotests.sh.
+    // OXIDENIX_TEST=readonly: that read-only boot alone, on a fresh disk.
     // OXIDENIX_BENCH=1: the same, with the benchmarks (/etc/bench.sh,
     // docs/benchmarks) instead of the tests.
     // OXIDENIX_AUTORUN=<host file>: the same with that shell script (say, a
     // program under development and the calls it makes in the kernel log).
     let bench_mode = std::env::var_os("OXIDENIX_BENCH").is_some();
     let autorun = std::env::var_os("OXIDENIX_AUTORUN").map(PathBuf::from);
-    let test_mode = bench_mode || autorun.is_some() || std::env::var_os("OXIDENIX_TEST").is_some();
+    let test_var = std::env::var_os("OXIDENIX_TEST");
+    let test_mode = bench_mode || autorun.is_some() || test_var.is_some();
+    let self_tests = test_var.is_some() && autorun.is_none() && !bench_mode;
+    let readonly_only = self_tests && test_var.as_deref() == Some("readonly".as_ref());
     println!("Building root filesystem...");
     build_rootfs(&rootfs).expect("Failed to build root filesystem");
     // With Node.js, its smoke tests (userspace/node/tests, run by
@@ -74,22 +78,29 @@ fn main() {
         fs::create_dir_all(&dest).expect("Failed to create /usr/lib/node-tests");
         copy_tree(&tests, &dest).expect("Failed to copy the Node.js tests");
     }
-    if let Some(script) = &autorun {
-        fs::copy(script, rootfs.join("etc/autorun")).expect("Failed to copy OXIDENIX_AUTORUN to /etc/autorun");
-    } else if test_mode {
-        let script = if bench_mode { "bench.sh" } else { "runtests.sh" };
-        std::os::unix::fs::symlink(script, rootfs.join("etc/autorun")).expect("Failed to link /etc/autorun");
-    }
-    let mut cpio = io::BufWriter::new(fs::File::create(&cpio_path).expect("Failed to create cpio"));
-    write_cpio(&rootfs, &mut cpio).expect("Failed to write cpio");
-    drop(cpio);
+    // The boots of this run, in order: what /etc/autorun is in each, and
+    // whether the data disk is read-only there.
+    let boots: Vec<Boot> = if let Some(script) = &autorun {
+        vec![Boot { suffix: "", autorun: Autorun::Copy(script.clone()), read_only: false }]
+    } else if bench_mode {
+        vec![Boot { suffix: "", autorun: Autorun::Link("bench.sh"), read_only: false }]
+    } else if readonly_only {
+        vec![Boot { suffix: "readonly", autorun: Autorun::Script("exec sh /etc/rotests.sh\n"), read_only: true }]
+    } else if self_tests {
+        vec![
+            Boot { suffix: "", autorun: Autorun::Link("runtests.sh"), read_only: false },
+            // (The disk the first boot wrote: its last file is checked too.)
+            Boot { suffix: "readonly", autorun: Autorun::Script("exec sh /etc/rotests.sh after-rw\n"), read_only: true },
+        ]
+    } else {
+        vec![Boot { suffix: "", autorun: Autorun::None, read_only: false }]
+    };
 
     // The data disk: OXIDENIX_DISK=<path> (created if missing; the
     // benchmarks use a fresh one); in test mode a fresh small one of its own
     // on every run (target/test-disk.img), so the tests (which fill the disk
     // to the last block) neither touch the persistent disk.img nor depend on
     // what earlier runs left; else the persistent disk.img.
-    let self_tests = std::env::var_os("OXIDENIX_TEST").is_some() && autorun.is_none() && !bench_mode;
     let data_disk = match std::env::var_os("OXIDENIX_DISK") {
         Some(path) => PathBuf::from(path),
         None if self_tests => Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/test-disk.img"),
@@ -115,6 +126,11 @@ fn main() {
         println!("Installing {} as /bin/node on {}...", node.display(), data_disk.display());
         install_on_disk(&data_disk, &node, "bin/node").expect("Failed to put node on the data disk");
     }
+    // The self-tests' read-only boot reads a file the builder put on the
+    // disk (/data/rotest/hello, a copy of /bin/hello).
+    if self_tests {
+        install_on_disk(&data_disk, &rootfs.join("bin/hello"), "rotest/hello").expect("Failed to put rotest/hello on the data disk");
+    }
 
     // Most of a debug build is DWARF debug information the kernel never
     // uses, and the BIOS bootloader copies the whole ELF through real-mode
@@ -122,25 +138,92 @@ fn main() {
     // ELF stays next to it for debuggers.
     let boot_kernel = strip_debug_info(kernel_path);
 
+    // An initramfs and a boot image per boot (`<kernel>.img`, the read-only
+    // boot's `<kernel>.readonly.img`): the same root filesystem with its own
+    // /etc/autorun.
     let firmware = Firmware::from_env();
-    println!("Building {} disk image...", firmware.name());
-    match firmware {
-        Firmware::Uefi => bootloader::UefiBoot::new(&boot_kernel)
-            .set_ramdisk(&cpio_path)
-            .create_disk_image(&img_path),
-        Firmware::Bios => bootloader::BiosBoot::new(&boot_kernel)
-            .set_ramdisk(&cpio_path)
-            .create_disk_image(&img_path),
+    let mut images = Vec::new();
+    for boot in &boots {
+        let name = |ext: &str| if boot.suffix.is_empty() { kernel_path.with_extension(ext) } else { kernel_path.with_extension(format!("{}.{ext}", boot.suffix)) };
+        let (cpio_path, img_path) = (name("cpio"), name("img"));
+        boot.autorun.install(&rootfs.join("etc/autorun")).expect("Failed to make /etc/autorun");
+        let mut cpio = io::BufWriter::new(fs::File::create(&cpio_path).expect("Failed to create cpio"));
+        write_cpio(&rootfs, &mut cpio).expect("Failed to write cpio");
+        drop(cpio);
+        println!("Building {} disk image {}...", firmware.name(), img_path.display());
+        match firmware {
+            Firmware::Uefi => bootloader::UefiBoot::new(&boot_kernel)
+                .set_ramdisk(&cpio_path)
+                .create_disk_image(&img_path),
+            Firmware::Bios => bootloader::BiosBoot::new(&boot_kernel)
+                .set_ramdisk(&cpio_path)
+                .create_disk_image(&img_path),
+        }
+        .expect("Failed to create disk image");
+        images.push(img_path);
     }
-    .expect("Failed to create disk image");
 
     // OXIDENIX_BUILD_ONLY=1: produce the images without starting QEMU.
     if std::env::var_os("OXIDENIX_BUILD_ONLY").is_some() {
-        println!("Images ready: {} and {}", img_path.display(), data_disk.display());
+        for img in &images {
+            println!("Image ready: {}", img.display());
+        }
+        println!("Data disk: {}", data_disk.display());
         return;
     }
 
-    println!("Starting QEMU ({}) with {}", firmware.name(), img_path.display());
+    // One boot after the other; in test mode a boot that did not succeed
+    // (QEMU's 1) ends the run with its status.
+    let mut code = 0;
+    for (boot, img) in boots.iter().zip(&images) {
+        code = qemu(firmware, kernel_path, img, &data_disk, boot.read_only, test_mode, &args[2..]);
+        if test_mode && code != 1 {
+            break;
+        }
+    }
+    process::exit(code);
+}
+
+/// One boot of a run: its images' suffix (none for the first), what its
+/// /etc/autorun is, and whether it has the data disk read-only.
+struct Boot {
+    suffix: &'static str,
+    autorun: Autorun,
+    read_only: bool,
+}
+
+/// What /etc/autorun is in a boot's root filesystem (the kernel runs it
+/// with `sh` and powers off with its status: test mode).
+enum Autorun {
+    None,
+    /// A link to a script of /etc.
+    Link(&'static str),
+    /// A host file (OXIDENIX_AUTORUN).
+    Copy(PathBuf),
+    /// These commands.
+    Script(&'static str),
+}
+
+impl Autorun {
+    fn install(&self, at: &Path) -> io::Result<()> {
+        if fs::symlink_metadata(at).is_ok() {
+            fs::remove_file(at)?;
+        }
+        match self {
+            Autorun::None => Ok(()),
+            Autorun::Link(script) => std::os::unix::fs::symlink(script, at),
+            Autorun::Copy(file) => fs::copy(file, at).map(|_| ()),
+            Autorun::Script(text) => fs::write(at, text),
+        }
+    }
+}
+
+/// Boots `img` in QEMU with `data_disk` (read-only: QEMU's readonly=on,
+/// which virtio-blk reports as VIRTIO_BLK_F_RO) and the user's `extra`
+/// arguments; QEMU's exit status.
+fn qemu(firmware: Firmware, kernel_path: &Path, img: &Path, data_disk: &Path, read_only: bool, test_mode: bool, extra: &[String]) -> i32 {
+    let mode = if read_only { ", the data disk read-only" } else { "" };
+    println!("Starting QEMU ({}) with {}{}", firmware.name(), img.display(), mode);
     let mut qemu = Command::new("qemu-system-x86_64");
     if firmware == Firmware::Uefi {
         // OVMF: its code read-only, its variable store a fresh copy per run
@@ -164,12 +247,12 @@ fn main() {
             qemu.args(["-display", "none"]);
         }
     }
-    let exit_status = qemu
-        .args([
+    let readonly = if read_only { ",readonly=on" } else { "" };
+    qemu.args([
             "-drive",
-            &format!("format=raw,file={},if=ide,index=0", img_path.display()),
+            &format!("format=raw,file={},if=ide,index=0", img.display()),
             "-drive",
-            &format!("format=raw,file={},if=none,id=data", data_disk.display()),
+            &format!("format=raw,file={},if=none,id=data{}", data_disk.display(), readonly),
             "-device",
             "virtio-blk-pci,drive=data,disable-modern=on",
             // q35 (ICH9) rather than the default i440fx: it can have an IOMMU.
@@ -204,12 +287,45 @@ fn main() {
             // Scale the guest picture with the window (resize or fullscreen).
             &["-display", "gtk,zoom-to-fit=on"][..]
         })
-        .args(&args[2..])
-        .status()
-        .expect("Failed to run QEMU");
-
-    process::exit(exit_status.code().unwrap_or(0));
+        .args(extra);
+    if !test_mode {
+        return qemu.status().expect("Failed to run QEMU").code().unwrap_or(0);
+    }
+    // Test mode: the serial output passes through here, and the shutdown
+    // after the script (`shell::settle`: every instance's write-back, its
+    // end, the channels' close) must go without a complaint, or the boot
+    // failed whatever the script said.
+    let mut child = qemu.stdout(process::Stdio::piped()).spawn().expect("Failed to run QEMU");
+    let mut serial = io::BufReader::new(child.stdout.take().expect("piped"));
+    let (mut line, mut ended, mut complaint) = (Vec::new(), false, None);
+    let mut out = io::stdout();
+    while io::BufRead::read_until(&mut serial, b'\n', &mut line).is_ok_and(|n| n > 0) {
+        let _ = out.write_all(&line).and_then(|_| out.flush());
+        let text = String::from_utf8_lossy(&line);
+        if text.starts_with("[autorun] ") && !text.starts_with("[autorun] running") {
+            ended = true;
+        } else if ended && SHUTDOWN_COMPLAINTS.iter().any(|c| text.contains(c)) && complaint.is_none() {
+            complaint = Some(text.trim_end().to_string());
+        }
+        line.clear();
+    }
+    let code = child.wait().expect("Failed to wait for QEMU").code().unwrap_or(0);
+    match complaint {
+        Some(c) if code == 1 => {
+            println!("builder: the shutdown after the tests went wrong ({c}): failure");
+            3
+        }
+        _ => code,
+    }
 }
+
+/// What the kernel and the Linux server say when the shutdown does not go as it should.
+const SHUTDOWN_COMPLAINTS: [&str; 4] = [
+    "did not write its caches back",
+    "Linux server instance did not end",
+    "a channel did not close",
+    "writing the cache back failed",
+];
 
 /// The firmware the image boots with: `OXIDENIX_FIRMWARE=uefi` (the
 /// default, OVMF under QEMU) or `bios` (SeaBIOS).
