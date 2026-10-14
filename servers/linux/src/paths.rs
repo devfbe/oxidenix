@@ -238,33 +238,36 @@ fn create(dir: &Node, name: &str, kind: u64, perm: u32) -> Result<Node, i64> {
 
 /// The program `path` names (relative to the absolute directory `base`; `follow`: a
 /// symlink as the last name is followed, else ELOOP), opened for execve (`exec`): a handle
-/// on its file object that holds it (nobody may write it while it runs: ETXTBSY), and its
-/// absolute path.
-pub fn exec_open(base: &str, path: &str, follow: bool) -> Result<(u64, String), i64> {
+/// on its file object that holds it (nobody may write it while it runs: ETXTBSY), and the
+/// node with its absolute path (what /proc/<pid>/exe leads to).
+pub fn exec_open(base: &str, path: &str, follow: bool) -> Result<(u64, Origin), i64> {
     let r = resolve(base, path, follow)?;
-    exec_node(&r.node, join(&r.path)?)
+    let path = join(&r.path)?;
+    exec_node(r.node, path)
 }
 
 /// The program a descriptor names (execveat with AT_EMPTY_PATH).
-pub fn exec_open_fd(fd: u64) -> Result<(u64, String), i64> {
+pub fn exec_open_fd(fd: u64) -> Result<(u64, Origin), i64> {
     let (node, path) = fd_node(fd)?;
-    exec_node(&node, path)
+    exec_node(node, path)
 }
 
-fn exec_node(node: &Node, path: String) -> Result<(u64, String), i64> {
+fn exec_node(node: Node, path: String) -> Result<(u64, Origin), i64> {
     const EACCES: i64 = 13;
     let mode = mode_of(&node.stat()?);
+    // (From here on let go of as an open file's node, `Origin`'s drop.)
+    let origin = Origin::new(node, path, mode);
     if mode & vfs::S_IFMT == vfs::S_IFLNK {
         return Err(ELOOP);
     }
     crate::exec::check_mode(mode)?;
-    let held = match node {
+    let held = match &origin.node {
         Node::Tmp(t) => tmpfile::exec_hold(t)?,
         Node::Data(d) => datafile::exec_hold(d)?,
         // /proc and /sys hold no programs.
         Node::Proc(_) => return Err(EACCES),
     };
-    Ok((held, path))
+    Ok((held, origin))
 }
 
 /// The directory a relative path of an *at call (execveat) starts from.

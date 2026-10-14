@@ -24,6 +24,7 @@
 use crate::fdtable;
 use crate::heap::{self, TryExtend, TryGrow};
 use crate::local;
+use crate::namespace::Origin;
 use crate::process::{self, PROCS};
 use crate::signal;
 use crate::syscall;
@@ -270,6 +271,19 @@ impl Elf {
         Ok(bias)
     }
 
+    /// The pages of its code, as Linux's start_code and end_code span them: from the lowest
+    /// executable segment's first page to the end of the highest one's file part (0 without
+    /// one).
+    fn text_pages(&self) -> u64 {
+        let code = || self.loads().filter(|s| s.flags & PF_X != 0);
+        let start = code().map(|s| s.vaddr & !(PAGE - 1)).min();
+        let end = code().map(|s| page_up(s.vaddr + s.filesz)).max();
+        match (start, end) {
+            (Some(start), Some(end)) => end.saturating_sub(start) / PAGE,
+            _ => 0,
+        }
+    }
+
     /// Where the program header table lies in memory (AT_PHDR), without the bias.
     fn phdr(&self) -> u64 {
         if let Some(p) = self.segments.iter().find(|s| s.kind == PT_PHDR) {
@@ -388,10 +402,13 @@ struct Prepared {
     interp: Option<(File, Elf)>,
     args: Strings,
     envs: Strings,
-    /// The path execve was given (AT_EXECFN, the name), and the program's absolute path
-    /// (/proc's exe).
+    /// The path execve was given (AT_EXECFN, the name), and the program's node with its
+    /// absolute path (/proc/<pid>/exe's target, the process's from the point of no return
+    /// on; taken by `finish`).
     filename: String,
-    exe: String,
+    exe: Option<Arc<Origin>>,
+    /// Pages of its code (/proc's VmExe and statm's text).
+    text_pages: u64,
     /// /proc's command line (`Proc::cmdline`), made before the point of no return.
     cmdline: Vec<u8>,
     /// The room kept for its stack (`stack_ceiling`).
@@ -460,11 +477,11 @@ fn read_strings(addr: u64, total: &mut usize, max: usize, account: &Arc<AtomicUs
     }
 }
 
-/// Opens the program `path` (relative to `base`) for running: its held file object and its
-/// absolute path.
-fn open(base: &str, path: &str, follow: bool) -> Result<(File, String), i64> {
-    let (handle, abs) = crate::paths::exec_open(base, path, follow)?;
-    Ok((File { handle }, abs))
+/// Opens the program `path` (relative to `base`) for running: its held file object, and its
+/// node with its absolute path.
+fn open(base: &str, path: &str, follow: bool) -> Result<(File, Origin), i64> {
+    let (handle, exe) = crate::paths::exec_open(base, path, follow)?;
+    Ok((File { handle }, exe))
 }
 
 /// execve(path, argv, envp) and execveat(dirfd, path, argv, envp, flags).
@@ -482,13 +499,13 @@ fn execveat(s: &mut State, dirfd: u64, path: u64, argv: u64, envp: u64, flags: u
         if flags & AT_EMPTY_PATH == 0 {
             return Err(ENOENT);
         }
-        let (handle, abs) = crate::paths::exec_open_fd(dirfd)?;
-        (File { handle }, abs)
+        let (handle, exe) = crate::paths::exec_open_fd(dirfd)?;
+        (File { handle }, exe)
     } else {
         let base = crate::paths::base_dir_of(dirfd, &filename)?;
         open(&base, &filename, flags & AT_SYMLINK_NOFOLLOW == 0)?
     };
-    let shown = if filename.is_empty() { heap::try_string(&exe)? } else { filename };
+    let shown = if filename.is_empty() { heap::try_string(&exe.path)? } else { filename };
     let prepared = prepare(file, exe, shown, args, envs, stack_ceiling(stack), 0)?;
     // What the point of no return will need of the heap, before it (`preload`): an own copy
     // of shared signal actions (`finish`), and a thread that is not the main one moves its
@@ -515,7 +532,7 @@ fn execveat(s: &mut State, dirfd: u64, path: u64, argv: u64, envp: u64, flags: u
 
 /// Reads the program's first bytes and follows a `#!` line (`depth`: how many were
 /// followed), until an ELF image with its interpreter is ready.
-fn prepare(file: File, exe: String, filename: String, args: Strings, envs: Strings, stack: u64, depth: u32) -> Result<Prepared, i64> {
+fn prepare(file: File, exe: Origin, filename: String, args: Strings, envs: Strings, stack: u64, depth: u32) -> Result<Prepared, i64> {
     let size = file.size()?;
     // (On the stack: the first bytes, a `#!` line's at most.)
     let mut head = [0u8; 256];
@@ -551,6 +568,8 @@ fn prepare(file: File, exe: String, filename: String, args: Strings, envs: Strin
         }
         drop(args);
         drop(file);
+        // (/proc/<pid>/exe is the interpreter, as Linux's bprm->file.)
+        drop(exe);
         let interp = core::str::from_utf8(interp).map_err(|_| ENOEXEC)?;
         let cwd = cwd()?;
         let (ifile, iexe) = open(&cwd, interp, true)?;
@@ -598,7 +617,9 @@ fn prepare(file: File, exe: String, filename: String, args: Strings, envs: Strin
         cmdline.extend_from_slice(a);
         cmdline.push(0);
     }
-    Ok(Prepared { file, elf, interp, args, envs, filename, exe, cmdline, stack })
+    let exe = Some(heap::try_arc(exe)?);
+    let text_pages = elf.text_pages();
+    Ok(Prepared { file, elf, interp, args, envs, filename, exe, text_pages, cmdline, stack })
 }
 
 /// A copy of the calling thread's working directory (ENOMEM without room).
@@ -945,17 +966,20 @@ fn finish(p: &mut Prepared, comm: [u8; 16], brk: u64) {
             *a = signal::SigAction::default();
         }
     }
-    let words = {
+    // (The old program's node is let go of after the lock: it may be a removed file's last
+    // reference.)
+    let (words, _old_exe) = {
         let proc = t.procs.get_mut(&pid).expect("listed");
         proc.sig.hand = own;
         proc.execing = false;
         proc.did_exec = true;
         proc.dumpable = true;
         proc.cmdline = cmdline;
-        proc.exe = exe;
+        proc.text_pages = p.text_pages;
+        let old_exe = core::mem::replace(&mut proc.exe, exe);
         *proc.brk.lock() = process::Brk { start: brk, end: brk, limit: (STACK_TOP - p.stack).saturating_sub(STACK_GUARD_GAP) };
         // A vfork parent goes on: the child no longer uses its memory.
-        core::mem::replace(&mut proc.vfork, false).then(|| proc.words.clone())
+        (core::mem::replace(&mut proc.vfork, false).then(|| proc.words.clone()), old_exe)
     };
     drop(t);
     if let Some(w) = words {

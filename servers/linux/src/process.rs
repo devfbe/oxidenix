@@ -173,9 +173,14 @@ pub struct Proc {
     pub subreaper: bool,
     /// Its parent waits until it execs or ends (vfork).
     pub vfork: bool,
-    /// The program's arguments (NUL-terminated, at most 4 KiB) and its path, for /proc.
+    /// The program's arguments (NUL-terminated, at most 4 KiB), for /proc.
     pub cmdline: Vec<u8>,
-    pub exe: String,
+    /// The program's file: its node and the path it was run by (Linux's mm->exe_file,
+    /// /proc/<pid>/exe's target), from its execve until it ends (None before the first
+    /// execve and for a zombie).
+    pub exe: Option<Arc<crate::namespace::Origin>>,
+    /// Pages of the program's code (Linux's end_code - start_code: VmExe, statm's text).
+    pub text_pages: u64,
     pub sig: signal::ProcSignals,
     /// A stop or continue not yet reported to `wait`.
     pub report: Option<Report>,
@@ -502,7 +507,8 @@ pub fn register_init(key: u64) {
             subreaper: false,
             vfork: false,
             cmdline: Vec::new(),
-            exe: String::new(),
+            exe: None,
+            text_pages: 0,
             sig: signal::ProcSignals::new(hand),
             report: None,
             children_usage: Usage::default(),
@@ -773,7 +779,7 @@ fn clone(s: &State, c: Clone) -> Result<i64, i64> {
         }
         // The copies and the tables' room, before anything changes.
         let ppid = if flags & CLONE_PARENT != 0 { t.procs[&my_pid].ppid } else { my_pid };
-        let room = (|| -> Result<Option<(Vec<Pid>, Vec<u8>, String)>, NoMem> {
+        let room = (|| -> Result<Option<(Vec<Pid>, Vec<u8>)>, NoMem> {
             // (One preload for all the inserts: each alone would find the others' pages.)
             let hand = if flags & CLONE_SIGHAND == 0 { heap::map_insert_bytes::<u64, signal::Hand>() } else { 0 };
             if thread {
@@ -788,7 +794,7 @@ fn clone(s: &State, c: Clone) -> Result<i64, i64> {
             let parent = &t.procs[&my_pid];
             let mut threads = heap::try_vec(1)?;
             threads.push(tid);
-            Ok(Some((threads, heap::try_to_vec(&parent.cmdline)?, heap::try_string(&parent.exe)?)))
+            Ok(Some((threads, heap::try_to_vec(&parent.cmdline)?)))
         })();
         let copies = match room {
             Ok(r) => r,
@@ -801,7 +807,7 @@ fn clone(s: &State, c: Clone) -> Result<i64, i64> {
         let me_thread = &t.threads[&my_tid];
         let thread_sig = me_thread.sig.for_child(flags & CLONE_VM != 0 && flags & CLONE_VFORK == 0);
         let comm = me_thread.comm;
-        if let (Some((threads, cmdline, exe)), Some((own_brk, words, exec_bytes))) = (copies, own) {
+        if let (Some((threads, cmdline)), Some((own_brk, words, exec_bytes))) = (copies, own) {
             let parent_hand = t.procs[&my_pid].sig.hand;
             let hand = if flags & CLONE_SIGHAND != 0 {
                 t.hands.get_mut(&parent_hand).expect("the caller's actions").refs += 1;
@@ -851,7 +857,9 @@ fn clone(s: &State, c: Clone) -> Result<i64, i64> {
                 subreaper: false,
                 vfork: flags & CLONE_VFORK != 0,
                 cmdline,
-                exe,
+                // (The same program file: Linux's dup_mm keeps mm->exe_file.)
+                exe: parent.exe.clone(),
+                text_pages: parent.text_pages,
                 sig: signal::ProcSignals::new(hand),
                 report: None,
                 children_usage: Usage::default(),
@@ -1088,10 +1096,14 @@ pub struct After {
     sessions: Vec<Pid>,
     /// Kernel handles of processes reaped.
     handles: Vec<u64>,
+    /// The program file of a process that ended (`Proc::exe`): perhaps a removed file's
+    /// last reference.
+    exe: Option<Arc<crate::namespace::Origin>>,
 }
 
 impl After {
     pub fn run(self) {
+        drop(self.exe);
         for h in self.handles {
             close_handle(h);
         }
@@ -1114,6 +1126,10 @@ fn process_end(t: &mut Table, pid: Pid, after: &mut After) {
         // A group exit's status, else the kernel's kill, else the main thread's own.
         let status = p.exiting.or((killed != 0).then_some(killed)).or(p.main_status).unwrap_or(0);
         p.zombie = Some(status);
+        // A zombie runs no program (Linux's exit_mm lets go of mm->exe_file): its exe is
+        // ENOENT. (One process ends per `After`.)
+        debug_assert!(after.exe.is_none());
+        after.exe = p.exe.take();
         // A zombie takes no signals: its pending ones go (and the instance's count of queued
         // real-time ones).
         p.sig.shared.flush(!0, &mut t.rt_queued);
@@ -1579,6 +1595,14 @@ pub fn cwd_of(pid: Pid) -> Option<String> {
     Some(cwd)
 }
 
+/// The program file process (or thread) `id` runs (/proc/<pid>/exe): None for none, a
+/// zombie or a process that has not exec'd.
+pub fn exe_of(id: Pid) -> Option<Arc<crate::namespace::Origin>> {
+    let t = PROCS.lock();
+    let pid = if t.procs.contains_key(&id) { id } else { t.threads.get(&id)?.pid };
+    t.procs.get(&pid)?.exe.clone()
+}
+
 /// The umask of process `pid` (its main thread's record).
 pub fn umask_of(pid: Pid) -> Option<u32> {
     let fs = {
@@ -1591,7 +1615,7 @@ pub fn umask_of(pid: Pid) -> Option<u32> {
 }
 
 /// /proc's records of the instance's processes (`procproto`'s `QUERY_PIDS`,
-/// `QUERY_THREADS`, `QUERY_PROCESS`, `QUERY_CMDLINE`, `QUERY_EXE`), from the process table
+/// `QUERY_THREADS`, `QUERY_PROCESS`, `QUERY_CMDLINE`), from the process table
 /// and the kernel's accounts (`proc_info`, `thread_info`): the bytes of the answer, at most
 /// `cap` (lists of ids: what fits; ERANGE for a record that does not fit), ESRCH for no
 /// such process (or thread).
@@ -1624,7 +1648,6 @@ pub fn query(op: u64, arg: u64, cap: usize) -> Result<Vec<u8>, i64> {
             ids(&mut tids.into_iter())
         }
         QUERY_CMDLINE => text(&t.procs[&owner()?].cmdline),
-        QUERY_EXE => text(t.procs[&owner()?].exe.as_bytes()),
         QUERY_PROCESS => {
             let pid = owner()?;
             let p = &t.procs[&pid];
@@ -1675,7 +1698,12 @@ pub fn query(op: u64, arg: u64, cap: usize) -> Result<Vec<u8>, i64> {
                 cpu: tinfo.cpu,
                 flags: 0,
                 peak_pages: info.peak_pages,
-                virt_peak: info.virt_pages,
+                virt_peak: info.virt_peak.max(info.virt_pages),
+                exec_pages: info.exec_pages,
+                stack_pages: info.stack_pages,
+                data_pages: info.data_pages,
+                // (A zombie's memory is gone, its code with it.)
+                text_pages: if p.zombie.is_some() { 0 } else { p.text_pages },
                 sig_pending: th.map_or(0, |th| th.sig.pending.set),
                 sig_shared: p.sig.shared.set,
                 sig_blocked: th.map_or(0, |th| th.sig.mask),

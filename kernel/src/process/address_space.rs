@@ -237,6 +237,21 @@ impl Vma {
         matches!(self.backing, Backing::Anon | Backing::File { shared: false, .. })
     }
 
+    /// What /proc counts it as (Linux's vm_stat_account): a stack, else
+    /// code (executable and not writable), else data (private and
+    /// writable), else none of them.
+    fn kind(&self) -> Option<Kind> {
+        if self.stack_limit != 0 {
+            Some(Kind::Stack)
+        } else if self.prot.exec && !self.prot.write {
+            Some(Kind::Exec)
+        } else if self.prot.write && self.private() {
+            Some(Kind::Data)
+        } else {
+            None
+        }
+    }
+
     /// The cache of a file area and the file page of `start`.
     fn file(&self) -> Option<(&Arc<PageCache>, u64)> {
         match &self.backing {
@@ -244,6 +259,15 @@ impl Vma {
             _ => None,
         }
     }
+}
+
+/// The kinds of area /proc tells apart (`Vma::kind`): Linux's exec_vm,
+/// stack_vm and data_vm.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Kind {
+    Exec,
+    Stack,
+    Data,
 }
 
 /// Mapped (resident) and virtual pages, and the most pages ever resident,
@@ -255,6 +279,12 @@ pub struct MemStats {
     pub peak_pages: AtomicU64,
     /// The most pages of address space it had (Linux's VmPeak).
     pub virt_peak: AtomicU64,
+    /// Pages of address space by kind (`Vma::kind`): executable and not
+    /// writable, stacks, private and writable (Linux's exec_vm, stack_vm,
+    /// data_vm). Kept in step with the areas by `tally`.
+    pub exec_pages: AtomicU64,
+    pub stack_pages: AtomicU64,
+    pub data_pages: AtomicU64,
 }
 
 impl MemStats {
@@ -263,9 +293,21 @@ impl MemStats {
         self.peak_pages.fetch_max(now, Ordering::Relaxed);
     }
 
-    fn add_virt(&self, pages: u64) {
-        let now = self.virt_pages.fetch_add(pages, Ordering::Relaxed) + pages;
-        self.virt_peak.fetch_max(now, Ordering::Relaxed);
+    /// `pages` pages of area `v` came (positive) or went (negative): its
+    /// address space and its kind's.
+    fn tally(&self, v: &Vma, pages: i64) {
+        if pages >= 0 {
+            let now = self.virt_pages.fetch_add(pages as u64, Ordering::Relaxed) + pages as u64;
+            self.virt_peak.fetch_max(now, Ordering::Relaxed);
+        } else {
+            count(&self.virt_pages, pages);
+        }
+        match v.kind() {
+            Some(Kind::Exec) => count(&self.exec_pages, pages),
+            Some(Kind::Stack) => count(&self.stack_pages, pages),
+            Some(Kind::Data) => count(&self.data_pages, pages),
+            None => {}
+        }
     }
 }
 
@@ -641,7 +683,7 @@ impl AddressSpace {
     }
 
     fn insert(&mut self, vma: Vma) {
-        self.stats.add_virt(vma.pages());
+        self.stats.tally(&vma, vma.pages() as i64);
         self.vmas.insert(vma.start, vma);
     }
 
@@ -734,8 +776,11 @@ impl AddressSpace {
     pub fn map_stack(&mut self, top: u64, initial: u64, limit: u64) -> Result<(), Fault> {
         let start = top - initial;
         self.map(start, initial, Prot::RW, Backing::Anon, false)?;
-        if let Some(v) = self.vmas.get_mut(&start) {
+        if let Some(mut v) = self.vmas.remove(&start) {
+            // (Counted as data by `map`, as a stack from now on.)
+            self.stats.tally(&v, -(v.pages() as i64));
             v.stack_limit = limit.max(initial);
+            self.insert(v);
         }
         Ok(())
     }
@@ -749,7 +794,7 @@ impl AddressSpace {
         let gone: alloc::vec::Vec<u64> = self.vmas.range(start..end).map(|(&s, _)| s).collect();
         for s in gone {
             let v = self.vmas.remove(&s).expect("listed above");
-            count(&self.stats.virt_pages, -(v.pages() as i64));
+            self.stats.tally(&v, -(v.pages() as i64));
             if v.charged {
                 memory::uncommit(v.pages());
             }
@@ -827,7 +872,10 @@ impl AddressSpace {
         let mut now_charged = alloc::vec::Vec::new();
         for s in keys {
             let v = self.vmas.get_mut(&s).expect("listed above");
+            // (Its kind may change with its rights.)
+            self.stats.tally(v, -(v.pages() as i64));
             v.prot = prot;
+            self.stats.tally(v, v.pages() as i64);
             if prot.write && v.private() && !v.charged && !v.noreserve {
                 v.charged = true;
                 now_charged.push((v.start, v.end));
@@ -920,7 +968,7 @@ impl AddressSpace {
         self.split_at(old);
         self.split_at(old_end);
         let old_vma = self.vmas.remove(&old).expect("split above");
-        count(&self.stats.virt_pages, -(old_vma.pages() as i64));
+        self.stats.tally(&old_vma, -(old_vma.pages() as i64));
         let keep = old_len.min(new_len);
         self.move_pages(old, target, keep);
         if new_len < old_len {
@@ -1365,7 +1413,7 @@ impl AddressSpace {
         }
         let mut v = self.vmas.remove(&start).expect("found above");
         v.start = page;
-        self.stats.add_virt(grow);
+        self.stats.tally(&v, grow as i64);
         self.vmas.insert(page, v);
         Ok(())
     }
@@ -1683,9 +1731,9 @@ impl AddressSpace {
         }
         // From here on the areas' commit is released with the space.
         self.vmas = vmas;
-        let virt = self.vmas.values().map(|v| v.pages()).sum();
-        self.stats.virt_pages.store(virt, Ordering::Relaxed);
-        self.stats.virt_peak.fetch_max(virt, Ordering::Relaxed);
+        for v in self.vmas.values() {
+            self.stats.tally(v, v.pages() as i64);
+        }
         let mut mapper = self.mapper();
         let table_flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
         let (vmas, stats) = (&parent.vmas, &self.stats);

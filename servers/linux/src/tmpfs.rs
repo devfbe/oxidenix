@@ -289,18 +289,20 @@ impl Inode {
     /// Its status: every field of `struct stat`, and the birth time (one
     /// snapshot, under one lock).
     pub fn status(&self) -> Stat {
-        let (perm, size, times, rdev) = {
+        let (perm, size, times, rdev, removed) = {
             let st = self.state.lock();
             let rdev = match st.kind.get() {
                 Kind::Device(rdev) => *rdev,
                 _ => 0,
             };
-            (st.perm, stat_size(st.kind.get()), st.times, rdev)
+            (st.perm, stat_size(st.kind.get()), st.times, rdev, st.removed)
         };
         Stat {
             dev: self.dev,
             ino: self.ino,
-            nlink: if self.file_type == vfs::S_IFDIR { 2 } else { 1 },
+            // (An inode has one name at most: removed, it has none, as an open file's or a
+            // running program's that was unlinked on Linux.)
+            nlink: if removed { 0 } else if self.file_type == vfs::S_IFDIR { 2 } else { 1 },
             mode: self.file_type | perm,
             rdev,
             size,

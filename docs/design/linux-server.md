@@ -631,7 +631,7 @@ memory counts. Decisions in ADR 0010.
 | `thread_kill(key)` | the thread dies: its waits end, its next `restricted_enter` returns `REASON_EXIT` (the server ends it), the one after ends it |
 | `thread_exit(status, flags)` | the caller ends; with `EXIT_GROUP` its process (`exit_group`: the others are killed) |
 | `exec_space(exe, name, len)` | the point of no return of `execve`: the caller's process gets a new, empty address space (attached to the instance, `exe`'s hold kept while it runs), the FPU state and FS base reset, `CLONE_CHILD_CLEARTID` done for the old one, close-on-exec descriptors closed (the table's part goes with R6e) |
-| `proc_info(handle, out)`, `thread_info(key, out)` | CPU time, memory, state, start, last CPU, nice, the kernel's own end of a process it killed (out of memory, the monitor's `kill`) |
+| `proc_info(handle, out)`, `thread_info(key, out)` | CPU time, memory (by kind of area: code, stack, data), state, start, last CPU, nice, the kernel's own end of a process it killed (out of memory, the monitor's `kill`) |
 | `thread_nice(key, set, nice)`, `thread_affinity(key, set, mask)` | per thread; the server picks the threads (process groups, users) |
 | `thread_cleartid(addr)` | the caller's `CLONE_CHILD_CLEARTID` word (`set_tid_address`) |
 | `thread_name(key, name, len)` | the kernel's name of a thread (its monitor and messages) |
@@ -1201,8 +1201,32 @@ its threads' ids names it), and what `fd` lists is the calling thread's descript
 (the server's, R6e): the process's, unless a thread made its own with `clone` without
 `CLONE_FILES` (then `/proc/<pid>/fd` shows the caller's table, not the main thread's, as
 `/proc/thread-self/fd` would on Linux). A child after `fork` sees its own copy. R8 (the
-process model) makes this exact. `exe` is an ordinary link to the
-program's path.
+process model) makes this exact.
+
+`/proc/<pid>/exe` is a magic link too (Linux's `proc_exe_link`): each process keeps the
+program file it runs (`process::Proc::exe`, Linux's `mm->exe_file`): the node `execve`
+resolved, with the absolute path it was run by, taken at the point of no return (for a
+`#!` script the interpreter's, as Linux's `bprm->file`), shared by `fork` and let go of
+when the process becomes a zombie (its `exe` is ENOENT then, as for no process; the link
+itself stays, `lstat`). Following it reaches that node, a tmpfs or `/data` inode, also
+after the file was renamed or removed: `open` opens it, `stat` is its status (no links
+once removed), `execve("/proc/self/exe")` runs it again. `readlink` gives the path with
+" (deleted)" once its name went; a rename's new name is not known (the server's
+filesystems keep no path of an inode, as for `fd/N`), so it reads as the old one. The
+kernel's hold of the file (`exec_space`'s `exe`, ETXTBSY) is separate: the node is the
+server's own reference, a removed `/data` file's last user lets it go as an open file's
+last close does.
+
+**Memory by kind.** `statm` and `status` split the address space as Linux's `task_mem`
+and `task_statm`: the kernel counts each space's pages by kind of area as Linux's
+`vm_stat_account` (`MemStats` in `address_space.rs`: `exec_vm` executable and not
+writable, `stack_vm` the growing-down stack, `data_vm` private and writable; kept in step
+by `MemStats::tally` wherever an area comes, goes, grows or changes its rights), reported
+by `proc_info` (`ProcInfo`, with VmPeak). The program's code span is the server's (its ELF
+headers: Linux's `end_code - start_code`, kept per process). `VmData` is `data_vm`,
+`VmStk` `stack_vm`, `VmExe` the code (at most `exec_vm`), `VmLib` the rest of `exec_vm`;
+`statm`'s text is the code, its data `data_vm + stack_vm`, its shared, lib and dt 0 (the
+resident pages are not split by file and anonymous). `VmPTE` is not shown.
 
 **The kernel** keeps no part of `/proc`: its static `/proc` of the early boot, its mount
 table, its `RemoteFs` (IPC requests to procfs in `fsproto`) and its procfs mounts are gone;

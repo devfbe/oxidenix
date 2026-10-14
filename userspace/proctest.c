@@ -1,6 +1,7 @@
 /* Process information: prctl, capabilities and /proc: procfs's system-wide
  * files and /sys, the Linux server's per-process part (/proc/<pid>, self,
- * thread-self, mounts) and its magic links (/proc/self/fd). */
+ * thread-self, mounts, the memory figures of statm and status) and its magic
+ * links (/proc/self/fd, /proc/<pid>/exe). */
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -12,6 +13,7 @@
 #include <poll.h>
 #include <sys/epoll.h>
 #include <sys/inotify.h>
+#include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/resource.h>
@@ -369,7 +371,224 @@ static void other_descriptors(void) {
     check("a thread's id names its process's RLIMIT_NOFILE, which bounds the descriptors", set && got && emfile);
 }
 
-int main(void) {
+/* Whether `s` ends with `end`. */
+static int ends_with(const char *s, const char *end) {
+    size_t n = strlen(s), m = strlen(end);
+    return n >= m && strcmp(s + n - m, end) == 0;
+}
+
+/* readlink into `buf` (NUL-terminated), its result. */
+static ssize_t link_of(const char *path, char *buf, size_t size) {
+    ssize_t n = readlink(path, buf, size - 1);
+    buf[n > 0 ? n : 0] = 0;
+    return n;
+}
+
+/* Whether the program file `path` leads to, opened for reading, is an ELF image with
+ * inode `ino` and `links` links. */
+static int opens_program(const char *path, ino_t ino, nlink_t links) {
+    int fd = open(path, O_RDONLY);
+    char magic[4] = {0};
+    struct stat st;
+    int ok = fd >= 0 && read(fd, magic, 4) == 4 && memcmp(magic, "\177ELF", 4) == 0 && fstat(fd, &st) == 0
+             && st.st_ino == ino && st.st_nlink == links && S_ISREG(st.st_mode);
+    if (fd >= 0) close(fd);
+    return ok;
+}
+
+/* The program copy's modes (`exe_links`): "--exe-child <fd>" waits for a byte on fd, then
+ * runs /proc/self/exe again (its file is removed by then) as "--exe-removed", which exits
+ * 7 if its exe reads " (deleted)" and opens the program, unlinked. */
+static int exe_mode(int argc, char **argv) {
+    char buf[512];
+    if (strcmp(argv[1], "--exe-removed") == 0) {
+        struct stat st;
+        int ok = link_of("/proc/self/exe", buf, sizeof buf) > 0 && ends_with(buf, " (deleted)")
+                 && stat("/proc/self/exe", &st) == 0 && opens_program("/proc/self/exe", st.st_ino, 0);
+        return ok ? 7 : 8;
+    }
+    if (strcmp(argv[1], "--exe-child") == 0 && argc > 2) {
+        char c;
+        if (read(atoi(argv[2]), &c, 1) != 1) return 10;
+        char *args[] = {"exe-removed", "--exe-removed", NULL}, *env[] = {NULL};
+        execve("/proc/self/exe", args, env);
+        return 9;
+    }
+    return 11;
+}
+
+/* Copies the running program (read through /proc/self/exe) to `to`, executable: 0, or -1
+ * with errno set. */
+static int copy_self(const char *to) {
+    int in = open("/proc/self/exe", O_RDONLY);
+    if (in < 0) return -1;
+    int out = open(to, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+    if (out < 0) {
+        close(in);
+        return -1;
+    }
+    static char buf[65536];
+    ssize_t n;
+    int ok = 1;
+    while ((n = read(in, buf, sizeof buf)) > 0) ok &= write(out, buf, n) == n;
+    close(in);
+    close(out);
+    return ok && n == 0 ? 0 : -1;
+}
+
+/* /proc/<pid>/exe is a magic link to the program file itself (Linux's mm->exe_file): it
+ * reads as the path the program was run by, opens and stats that file also after it was
+ * renamed and removed (" (deleted)" then), runs it again (/proc/self/exe), and is ENOENT
+ * for a zombie. On tmpfs and on /data. */
+static void exe_links(const char *dir) {
+    char prog[64], moved[64], path[64], buf[512], label[96];
+    snprintf(prog, sizeof prog, "%s/exe-prog", dir);
+    snprintf(moved, sizeof moved, "%s/exe-moved", dir);
+    unlink(prog);
+    unlink(moved);
+    if (copy_self(prog) != 0) {
+        if (errno == EROFS) {
+            printf("  %s is read-only: its exe checks are skipped\n", dir);
+            return;
+        }
+        snprintf(label, sizeof label, "%s: the program copied through /proc/self/exe", dir);
+        check(label, 0);
+        return;
+    }
+    struct stat want, got, link;
+    stat(prog, &want);
+    int p[2];
+    pipe(p);
+    pid_t kid = fork();
+    if (kid == 0) {
+        close(p[1]);
+        char fd[16];
+        snprintf(fd, sizeof fd, "%d", p[0]);
+        execl(prog, "exe-prog", "--exe-child", fd, (char *)NULL);
+        _exit(12);
+    }
+    close(p[0]);
+    /* Until the child runs the copy, its exe is this program's. */
+    snprintf(path, sizeof path, "/proc/%d/exe", kid);
+    for (int i = 0; i < 5000 && !(link_of(path, buf, sizeof buf) > 0 && strcmp(buf, prog) == 0); i++) usleep(1000);
+    snprintf(label, sizeof label, "%s: /proc/<pid>/exe names the program run", dir);
+    check(label, strcmp(buf, prog) == 0);
+    snprintf(label, sizeof label, "%s: ... stat follows it, lstat is the link", dir);
+    check(label, stat(path, &got) == 0 && got.st_ino == want.st_ino && got.st_dev == want.st_dev
+                     && lstat(path, &link) == 0 && S_ISLNK(link.st_mode));
+    snprintf(label, sizeof label, "%s: ... opens the program after a rename", dir);
+    check(label, rename(prog, moved) == 0 && opens_program(path, want.st_ino, 1));
+    snprintf(label, sizeof label, "%s: ... reads \" (deleted)\" once it is removed", dir);
+    check(label, unlink(moved) == 0 && link_of(path, buf, sizeof buf) > 0 && ends_with(buf, " (deleted)"));
+    snprintf(label, sizeof label, "%s: ... and opens the removed program", dir);
+    check(label, stat(path, &got) == 0 && got.st_nlink == 0 && opens_program(path, want.st_ino, 0));
+    /* The child runs the removed program again through /proc/self/exe. */
+    write(p[1], "x", 1);
+    close(p[1]);
+    siginfo_t si = {0};
+    waitid(P_PID, kid, &si, WEXITED | WNOWAIT);
+    snprintf(label, sizeof label, "%s: exec of /proc/self/exe runs the removed program", dir);
+    check(label, si.si_code == CLD_EXITED && si.si_status == 7);
+    errno = 0;
+    int gone = readlink(path, buf, sizeof buf) == -1 && errno == ENOENT;
+    errno = 0;
+    gone &= stat(path, &got) == -1 && errno == ENOENT && lstat(path, &link) == 0 && S_ISLNK(link.st_mode);
+    snprintf(label, sizeof label, "%s: a zombie's exe is ENOENT (the link is there)", dir);
+    check(label, gone);
+    waitpid(kid, NULL, 0);
+}
+
+/* The figures of /proc/self/status (kB) and /proc/self/statm (pages) by kind of memory. */
+struct vm {
+    long size, rss, data, stk, exe, lib;
+    long statm[7];
+    int fields;
+};
+
+static long status_field(const char *status, const char *key) {
+    const char *at = strstr(status, key);
+    long v = -1;
+    if (at) sscanf(at + strlen(key), " %ld", &v);
+    return v;
+}
+
+static void vm_now(struct vm *v) {
+    char buf[4096];
+    memset(v, 0, sizeof *v);
+    slurp("/proc/self/statm", buf, sizeof buf);
+    v->fields = count_fields(buf);
+    sscanf(buf, "%ld %ld %ld %ld %ld %ld %ld", &v->statm[0], &v->statm[1], &v->statm[2], &v->statm[3], &v->statm[4],
+           &v->statm[5], &v->statm[6]);
+    slurp("/proc/self/status", buf, sizeof buf);
+    v->size = status_field(buf, "\nVmSize:");
+    v->rss = status_field(buf, "\nVmRSS:");
+    v->data = status_field(buf, "\nVmData:");
+    v->stk = status_field(buf, "\nVmStk:");
+    v->exe = status_field(buf, "\nVmExe:");
+    v->lib = status_field(buf, "\nVmLib:");
+}
+
+/* Grows the stack by about `bytes`, touching it from the top down. */
+static void __attribute__((noinline)) deep(size_t bytes) {
+    volatile char big[2 << 20];
+    for (size_t i = bytes < sizeof big ? bytes : sizeof big; i > 0; i -= 4096) big[i - 1] = 1;
+    big[0] = 1;
+}
+
+/* statm's seven fields and status's VmData, VmStk, VmExe and VmLib as Linux's: private
+ * writable memory is data (also brk and what mprotect made writable), shared or
+ * read-only memory is not, executable memory that is not the program's code is VmLib, a
+ * grown stack VmStk; statm's data is VmData + VmStk, its text VmExe; fork copies them. */
+static void memory_kinds(void) {
+    struct vm a, b;
+    vm_now(&a);
+    check("statm has 7 fields, lib and dt 0", a.fields == 7 && a.statm[4] == 0 && a.statm[6] == 0);
+    check("statm's size and resident are VmSize and VmRSS", a.statm[0] * 4 == a.size && a.statm[1] * 4 == a.rss);
+    check("statm's text is VmExe, its data VmData + VmStk", a.statm[3] * 4 == a.exe && a.statm[5] * 4 == a.data + a.stk);
+    check("a static program: VmExe > 0, VmLib 0, VmStk > 0, VmData > 0", a.exe > 0 && a.lib == 0 && a.stk > 0 && a.data > 0);
+    const size_t len = 16 << 20;
+    char *m = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    vm_now(&b);
+    check("private writable memory is VmData (and statm's data)", m != MAP_FAILED && b.data == a.data + 16384 && b.statm[5] == a.statm[5] + 4096);
+    munmap(m, len);
+    vm_now(&b);
+    check("... and goes with munmap", b.data == a.data && b.size == a.size);
+    m = mmap(NULL, len, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    vm_now(&b);
+    check("read-only memory is no data, but address space", m != MAP_FAILED && b.data == a.data && b.size == a.size + 16384);
+    mprotect(m, len / 2, PROT_READ | PROT_WRITE);
+    vm_now(&b);
+    check("mprotect to writable makes it data", b.data == a.data + 8192);
+    mprotect(m, len, PROT_READ | PROT_EXEC);
+    vm_now(&b);
+    check("executable memory beside the program's code is VmLib", b.data == a.data && b.lib == a.lib + 16384 && b.exe == a.exe && b.statm[3] == a.statm[3]);
+    munmap(m, len);
+    m = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    vm_now(&b);
+    check("shared memory is no data", m != MAP_FAILED && b.data == a.data && b.size == a.size + 16384);
+    munmap(m, len);
+    long brk0 = syscall(SYS_brk, 0);
+    long brk1 = syscall(SYS_brk, brk0 + (1 << 20));
+    vm_now(&b);
+    check("the heap (brk) is data", brk1 == brk0 + (1 << 20) && b.data == a.data + 1024);
+    syscall(SYS_brk, brk0);
+    vm_now(&a);
+    deep(2 << 20);
+    vm_now(&b);
+    check("a grown stack is VmStk (and statm's data), not VmData", b.stk >= a.stk + 1024 && b.data == a.data && b.statm[5] * 4 == b.data + b.stk);
+    pid_t kid = fork();
+    if (kid == 0) {
+        struct vm c;
+        vm_now(&c);
+        _exit(c.data == b.data && c.stk == b.stk && c.exe == b.exe && c.lib == b.lib && c.size == b.size ? 0 : 1);
+    }
+    int status = 0;
+    waitpid(kid, &status, 0);
+    check("a child after fork has its parent's figures", WIFEXITED(status) && WEXITSTATUS(status) == 0);
+}
+
+int main(int argc, char **argv) {
+    if (argc > 1) return exe_mode(argc, argv);
     char name[16] = {0};
     prctl(PR_SET_NAME, "renamed-process");
     prctl(PR_GET_NAME, name);
@@ -512,6 +731,12 @@ int main(void) {
     the_servers_part();
     descriptors();
     other_descriptors();
+    exe_links("/tmp");
+    exe_links("/data");
+    errno = 0;
+    char none[64];
+    check("/proc/<pid>/exe of no process: ENOENT", readlink("/proc/999999/exe", none, sizeof none) == -1 && errno == ENOENT);
+    memory_kinds();
     printf("proctest: %s\n", failures ? "FAILED" : "all passed");
     return failures;
 }

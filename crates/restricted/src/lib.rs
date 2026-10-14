@@ -1027,6 +1027,14 @@ pub struct ProcInfo {
     pub killed: u64,
     /// The kernel's id of it (for its monitor and messages).
     pub kernel_pid: u64,
+    /// The most pages of address space it had (VmPeak).
+    pub virt_peak: u64,
+    /// Pages of address space by kind of area (Linux's exec_vm, stack_vm
+    /// and data_vm, as its vm_stat_account tells them apart): executable
+    /// and not writable; stacks (growing down); private and writable.
+    pub exec_pages: u64,
+    pub stack_pages: u64,
+    pub data_pages: u64,
 }
 
 /// What `thread_info` tells about a thread.
