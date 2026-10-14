@@ -13,6 +13,7 @@
 //! description's offset (which only its own calls take, never the pager).
 
 use crate::files::{self, File, EBADF, EINVAL, O_ACCMODE, O_WRONLY};
+use crate::heap::{try_arc, try_vec};
 use crate::procfs::{self, Opened, ProcNode};
 use crate::sync::Mutex;
 use crate::usercopy;
@@ -62,7 +63,7 @@ pub fn open(node: ProcNode, flags: u32, path: String) -> Result<i64, i64> {
     // It must exist now (a process may have ended since the walk), and be
     // the caller's to open.
     procfs::may_open(&node)?;
-    let open = Arc::new(ProcOpen { node, path, dir, offset: crate::sync::SleepMutex::new(0), contents: Mutex::new(None), entries: Mutex::new(None) });
+    let open = try_arc(ProcOpen { node, path, dir, offset: crate::sync::SleepMutex::new(0), contents: Mutex::new(None), entries: Mutex::new(None) })?;
     let kept = flags & (O_ACCMODE | files::O_NONBLOCK | files::O_CLOEXEC);
     files::install(files::new_id(), File::Proc(open), kept)
 }
@@ -123,7 +124,7 @@ impl ProcOpen {
                 return Ok(c);
             }
         }
-        let made = Arc::new(procfs::contents(&self.node)?);
+        let made = try_arc(procfs::contents(&self.node)?)?;
         *self.contents.lock() = Some(made.clone());
         Ok(made)
     }
@@ -198,17 +199,20 @@ impl ProcOpen {
             match kept {
                 Some(e) if *off != 0 => e,
                 _ => {
-                    let e = Arc::new(procfs::list(&self.node)?);
+                    let e = try_arc(procfs::list(&self.node)?)?;
                     *self.entries.lock() = Some(e.clone());
                     e
                 }
             }
         };
-        let mut out = Vec::new();
+        // At most `GETDENTS_MAX` bytes a call, reserved first: the program's buffer size
+        // sets no allocation.
+        let room = (len as usize).min(files::GETDENTS_MAX);
+        let mut out: Vec<u8> = try_vec(room)?;
         let mut next = *off;
         while let Some((name, ino, dtype)) = entries.get(next as usize) {
             let reclen = (19 + name.len() + 1).next_multiple_of(8);
-            if out.len() + reclen > len as usize {
+            if out.len() + reclen > room {
                 if out.is_empty() {
                     return Err(EINVAL);
                 }

@@ -63,13 +63,23 @@ pub fn open(inode: Arc<Inode>, flags: u32, path: String) -> Result<i64, i64> {
         return Err(ENOTDIR);
     }
     let regular = inode.file_type() == vfs::S_IFREG;
+    // Its memory first (ENOMEM before the write access and the open count, which its drop
+    // would give back with a close event).
+    let mut slot = crate::heap::fallible(Arc::<TmpOpen>::try_new_uninit).map_err(|_| crate::heap::ENOMEM)?;
     // Not while it runs as a program (ETXTBSY).
     let write = writable && regular;
     if write {
         inode.get_write()?;
     }
     inode.opens.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
-    let open = Arc::new(TmpOpen { inode, path, offset: crate::sync::SleepMutex::new(0), snapshot: crate::sync::SleepMutex::new(None), write });
+    Arc::get_mut(&mut slot).expect("not shared yet").write(TmpOpen {
+        inode,
+        path,
+        offset: crate::sync::SleepMutex::new(0),
+        snapshot: crate::sync::SleepMutex::new(None),
+        write,
+    });
+    let open = unsafe { slot.assume_init() };
     if write && flags & O_TRUNC != 0 {
         check(syscall(SYS_MO_TRUNCATE, [open.inode.object()?, 0, 0, 0, 0, 0]))?;
         open.inode.modified();
@@ -273,8 +283,7 @@ impl TmpOpen {
         // At most `GETDENTS_MAX` bytes a call (a short getdents64 is a valid one: the program
         // asks again), reserved first: the program's buffer size sets no allocation.
         let room = (len as usize).min(crate::files::GETDENTS_MAX);
-        let mut out = Vec::new();
-        out.try_reserve_exact(room).map_err(|_| 12i64)?;
+        let mut out: Vec<u8> = crate::heap::try_vec(room)?;
         let mut next = *off;
         while let Some((name, ino, dtype)) = entries.get(next as usize) {
             let reclen = (19 + name.len() + 1).next_multiple_of(8);

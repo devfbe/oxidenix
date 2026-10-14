@@ -109,6 +109,7 @@
 //! the next sync, reports EIO once.
 
 use crate::fsclient::{self, Client, Next, PAGE};
+use crate::heap::{preload, try_string, try_to_vec, TryGrow};
 use crate::sync::Mutex;
 use crate::syscall;
 use crate::usercopy;
@@ -210,7 +211,10 @@ impl DInode {
     /// The directory (its number and generation) and the name it was last
     /// found by.
     pub fn link(&self) -> Option<(u32, u32, String)> {
-        self.link.lock().clone()
+        let l = self.link.lock();
+        let (dir, generation, name) = l.as_ref()?;
+        // (Without memory for the copy, as without a name.)
+        Some((*dir, *generation, try_string(name).ok()?))
     }
 
     /// Its ext2 generation.
@@ -234,17 +238,30 @@ pub fn cached(ino: u32) -> Option<Arc<DInode>> {
     TABLE.lock().inodes.get(&ino).cloned()
 }
 
+/// The memory a recorded name takes (`Names::insert`'s key and the inode's link), had
+/// fallibly before anything changes: None without it, and the inode then keeps no name
+/// (as one whose name went: its events go to its own watches only). A name is recorded
+/// after diskfs made or found it, where failing the call would leave the disk changed.
+fn name_copies(name: &str) -> Option<(String, String)> {
+    let copies = (try_string(name).ok()?, try_string(name).ok()?);
+    preload().ok()?;
+    Some(copies)
+}
+
 /// Records that `inode` was found as `name` in `dir` (`Table::names`).
 fn set_link(inode: &DInode, dir: &DInode, name: &str) {
+    let copies = name_copies(name);
     let mut t = TABLE.lock();
     let mut l = inode.link.lock();
     if let Some((d, _, n)) = l.take() {
-        if t.names.get(&(d, n.clone())) == Some(&inode.ino) {
-            t.names.remove(&(d, n));
+        if t.names.get(d, &n) == Some(inode.ino) {
+            t.names.remove(d, &n);
         }
     }
-    t.names.insert((dir.ino, String::from(name)), inode.ino);
-    *l = Some((dir.ino, dir.generation, String::from(name)));
+    if let Some((key, link)) = copies {
+        t.names.insert(dir.ino, key, inode.ino);
+        *l = Some((dir.ino, dir.generation, link));
+    }
 }
 
 /// The names of the table's inodes after a name changed: the inode found
@@ -252,25 +269,54 @@ fn set_link(inode: &DInode, dir: &DInode, name: &str) {
 /// found by `to` before lost it. The inode that had `from`, if cached.
 /// (By the index of names: a removal costs no walk over the cache.)
 fn relink(from: (u32, &str), to: Option<(&DInode, &str)>) -> Option<u32> {
+    let copies = to.and_then(|(_, name)| name_copies(name));
     let mut t = TABLE.lock();
     if let Some((dir, name)) = to {
-        if let Some(old) = t.names.remove(&(dir.ino, String::from(name))) {
+        if let Some(old) = t.names.remove(dir.ino, name) {
             if let Some(i) = t.inodes.get(&old) {
                 *i.link.lock() = None;
             }
         }
     }
-    let moved = t.names.remove(&(from.0, String::from(from.1)))?;
+    let moved = t.names.remove(from.0, from.1)?;
     let inode = t.inodes.get(&moved).cloned();
-    match (to, inode) {
-        (Some((dir, name)), Some(i)) => {
-            t.names.insert((dir.ino, String::from(name)), moved);
-            *i.link.lock() = Some((dir.ino, dir.generation, String::from(name)));
+    match (to, inode, copies) {
+        (Some((dir, _)), Some(i), Some((key, link))) => {
+            t.names.insert(dir.ino, key, moved);
+            *i.link.lock() = Some((dir.ino, dir.generation, link));
         }
-        (None, Some(i)) => *i.link.lock() = None,
+        (_, Some(i), _) => *i.link.lock() = None,
         _ => {}
     }
     Some(moved)
+}
+
+/// The index of the cached inodes' names: by directory, then name, so that lookups and
+/// removals borrow the name (they run after diskfs changed the disk: nothing may fail
+/// there); an insert takes a key copied and nodes preloaded before (`name_copies`).
+struct Names(BTreeMap<u32, BTreeMap<String, u32>>);
+
+impl Names {
+    const fn new() -> Names {
+        Names(BTreeMap::new())
+    }
+
+    fn get(&self, dir: u32, name: &str) -> Option<u32> {
+        self.0.get(&dir)?.get(name).copied()
+    }
+
+    fn remove(&mut self, dir: u32, name: &str) -> Option<u32> {
+        let names = self.0.get_mut(&dir)?;
+        let ino = names.remove(name);
+        if names.is_empty() {
+            self.0.remove(&dir);
+        }
+        ino
+    }
+
+    fn insert(&mut self, dir: u32, name: String, ino: u32) {
+        self.0.entry(dir).or_default().insert(name, ino);
+    }
 }
 
 /// A file's times as the server set them (seconds: ext2 keeps no more),
@@ -423,11 +469,11 @@ struct Table {
     dirty: BTreeMap<u32, (u64, u64)>,
     /// The inodes' names (directory, name) as last found (`DInode::link`),
     /// indexed: renames and removals find what they move or drop by name.
-    names: BTreeMap<(u32, String), u32>,
+    names: Names,
 }
 
 static TABLE: Mutex<Table> =
-    Mutex::new(Table { inodes: BTreeMap::new(), keys: BTreeMap::new(), check: Vec::new(), orphans: Vec::new(), dirty: BTreeMap::new(), names: BTreeMap::new() });
+    Mutex::new(Table { inodes: BTreeMap::new(), keys: BTreeMap::new(), check: Vec::new(), orphans: Vec::new(), dirty: BTreeMap::new(), names: Names::new() });
 /// Name operations (shared) against a reconnection's revalidation and an eviction or an
 /// orphan's release (alone); held across diskfs's requests: a sleeping lock.
 static NAMES: crate::sync::SleepRwLock = crate::sync::SleepRwLock::new();
@@ -723,8 +769,8 @@ fn live(inode: &DInode) -> Result<(), i64> {
 /// The inode `ino` of type `mode` and generation `generation` that a
 /// request returned (held now). A stale inode of that number, or one of
 /// another generation, is another file now: it leaves the table (its users
-/// keep it, failing), a new one takes its place.
-fn found(ino: u64, mode: u64, generation: u64) -> Result<Arc<DInode>, i64> {
+/// keep it, failing), a new one takes its place, in `spare`'s memory.
+fn found(spare: Spare, ino: u64, mode: u64, generation: u64) -> Result<Arc<DInode>, i64> {
     let ino = u32::try_from(ino).ok().filter(|&i| i != 0).ok_or(EIO)?;
     let kind = mode as u32 & vfs::S_IFMT;
     let generation = generation as u32;
@@ -759,7 +805,8 @@ fn found(ino: u64, mode: u64, generation: u64) -> Result<Arc<DInode>, i64> {
         None => {}
     }
     let key = NEXT_KEY.fetch_add(1, Ordering::Relaxed);
-    let inode = Arc::new(DInode {
+    let Spare(mut slot) = spare;
+    Arc::get_mut(&mut slot).expect("not shared").write(DInode {
         ino,
         kind,
         generation,
@@ -780,6 +827,7 @@ fn found(ino: u64, mode: u64, generation: u64) -> Result<Arc<DInode>, i64> {
         link: Mutex::new(None),
         opens: AtomicUsize::new(0),
     });
+    let inode = unsafe { slot.assume_init() };
     t.inodes.insert(ino, inode.clone());
     if orphaned {
         t.check.push((ino, inode.key));
@@ -795,19 +843,30 @@ fn found(ino: u64, mode: u64, generation: u64) -> Result<Arc<DInode>, i64> {
     Ok(inode)
 }
 
+/// The memory of an inode a request may return (`found`), had before the request: a create
+/// that diskfs made is never answered ENOMEM. The table's nodes for it are preloaded too.
+struct Spare(Arc<core::mem::MaybeUninit<DInode>>);
+
+fn spare() -> Result<Spare, i64> {
+    let slot = crate::heap::fallible(Arc::<DInode>::try_new_uninit).map_err(|_| crate::heap::ENOMEM)?;
+    preload()?;
+    Ok(Spare(slot))
+}
+
 /// The root of /data.
 pub fn root() -> Result<Arc<DInode>, i64> {
     if let Some(r) = TABLE.lock().inodes.get(&ROOT_INO) {
         return Ok(r.clone());
     }
     let c = client()?;
+    let spare = spare()?;
     let _names = NAMES.read()?;
     let r = call(&c, Request::Root.encode(0))?;
     status(&r)?;
     if r.values[0] != ROOT_INO as u64 {
         return Err(EIO);
     }
-    found(r.values[0], r.values[1], r.values[2])
+    found(spare, r.values[0], r.values[1], r.values[2])
 }
 
 /// The inode by its object's key.
@@ -831,10 +890,11 @@ pub fn lookup(dir: &Arc<DInode>, name: &str) -> Result<Arc<DInode>, i64> {
     let c = client()?;
     let scratch = c.scratch(1);
     scratch.put(0, name.as_bytes());
+    let spare = spare()?;
     let _names = NAMES.read()?;
     let r = call(&c, Request::Lookup { dir: dir.node(), name: scratch.buf(0, name.len() as u64) }.encode(0))?;
     status(&r)?;
-    let inode = found(r.values[0], r.values[1], r.values[2])?;
+    let inode = found(spare, r.values[0], r.values[1], r.values[2])?;
     set_link(&inode, dir, name);
     Ok(inode)
 }
@@ -867,10 +927,11 @@ pub fn create(dir: &Arc<DInode>, name: &str, new: New, perm: u32) -> Result<Arc<
             Kind::Symlink(scratch.buf(n, target.len() as u64))
         }
     };
+    let spare = spare()?;
     let _names = NAMES.read()?;
     let r = call(&c, Request::Create { dir: dir.node(), name: scratch.buf(0, n), kind, perm: perm & 0o7777 }.encode(0))?;
     status(&r)?;
-    let inode = found(r.values[0], r.values[1], r.values[2])?;
+    let inode = found(spare, r.values[0], r.values[1], r.values[2])?;
     set_link(&inode, dir, name);
     Ok(inode)
 }
@@ -977,7 +1038,7 @@ pub fn readlink(inode: &Arc<DInode>) -> Result<String, i64> {
     if n == 0 || n > PAGE {
         return Err(EIO);
     }
-    String::from_utf8(scratch.get(0, n)).map_err(|_| EIO)
+    String::from_utf8(scratch.get(0, n)?).map_err(|_| EIO)
 }
 
 pub fn chmod(inode: &Arc<DInode>, perm: u32) -> Result<(), i64> {
@@ -1142,19 +1203,18 @@ pub fn readdir(dir: &Arc<DInode>, cursor: u64) -> Result<(Vec<(u32, u8, Vec<u8>)
     if n > PAGE {
         return Err(EIO);
     }
-    let bytes = scratch.get(0, n);
-    let entries: Vec<(u32, u8, Vec<u8>)> = fsring::dirents(&bytes)
-        .map(|(ino, kind, name)| {
-            let dtype = match kind {
-                fsring::TYPE_DIR => 4,
-                fsring::TYPE_FILE => 8,
-                fsring::TYPE_SYMLINK => 10,
-                fsring::TYPE_SOCKET => 12,
-                _ => 0,
-            };
-            (ino, dtype, Vec::from(name))
-        })
-        .collect();
+    let bytes = scratch.get(0, n)?;
+    let mut entries: Vec<(u32, u8, Vec<u8>)> = Vec::new();
+    for (ino, kind, name) in fsring::dirents(&bytes) {
+        let dtype = match kind {
+            fsring::TYPE_DIR => 4,
+            fsring::TYPE_FILE => 8,
+            fsring::TYPE_SYMLINK => 10,
+            fsring::TYPE_SOCKET => 12,
+            _ => 0,
+        };
+        entries.try_push((ino, dtype, try_to_vec(name)?))?;
+    }
     let next = r.values[0];
     // A cursor that does not move on would list the same entries forever.
     if next != 0 && next <= cursor {
@@ -1773,7 +1833,11 @@ pub fn read_direct(inode: &Arc<DInode>, off: u64, buf: u64, len: u64) -> Result<
             Err(e) if done == 0 => return Err(e),
             Err(_) => break,
         };
-        let data = scratch.get(0, got);
+        let data = match scratch.get(0, got) {
+            Ok(data) => data,
+            Err(e) if done == 0 => return Err(e.into()),
+            Err(_) => break,
+        };
         if let Err(e) = usercopy::to_program(buf + done, &data) {
             return if done == 0 { Err(e) } else { Ok(done) };
         }
@@ -1937,12 +2001,14 @@ pub const HOLD_TAG: u64 = 2;
 /// programs.
 pub fn hold(inode: &Arc<DInode>, kind: HoldKind) -> Result<u64, i64> {
     let object = object(inode)?;
+    // (Its memory first: a mapping or an exec a program makes as often as it likes.)
+    let hold = crate::heap::try_box(Hold { inode: inode.clone(), kind })?;
     match kind {
         HoldKind::Plain => {}
         HoldKind::Write => get_write(inode)?,
         HoldKind::Run => deny_write(inode)?,
     }
-    let word = Box::into_raw(Box::new(Hold { inode: inode.clone(), kind })) as u64 | HOLD_TAG;
+    let word = Box::into_raw(hold) as u64 | HOLD_TAG;
     let h = syscall(SYS_MO_HOLD, [object, word, 0, 0, 0, 0]);
     if h < 0 {
         // Never handed over.
@@ -2097,8 +2163,8 @@ fn evict(ino: u32, key: u64) {
         let _ = FAIL_MKWRITE.compare_exchange(ino as u64, 0, Ordering::Relaxed, Ordering::Relaxed);
         let _ = FAIL_FILL.compare_exchange(ino as u64, 0, Ordering::Relaxed, Ordering::Relaxed);
         if let Some((d, _, n)) = inode.link.lock().take() {
-            if t.names.get(&(d, n.clone())) == Some(&ino) {
-                t.names.remove(&(d, n));
+            if t.names.get(d, &n) == Some(ino) {
+                t.names.remove(d, &n);
             }
         }
 

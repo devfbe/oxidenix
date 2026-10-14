@@ -16,6 +16,7 @@
 //! /proc are walked in the server, /data one `LOOKUP` per name.
 
 use crate::datafs::{self, DInode};
+use crate::heap::{try_string, TryGrow};
 use crate::procfs::{self, ProcNode};
 use crate::sync::Mutex;
 use crate::tmpfs;
@@ -23,7 +24,17 @@ use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use vfs::path::{join, normalize};
+
+/// `vfs::path::normalize`: ENOMEM without memory for it (paths are what
+/// programs choose).
+pub fn normalize(cwd: &str, path: &str) -> Result<Vec<String>, i64> {
+    crate::heap::fallible(|| vfs::path::try_normalize(cwd, path)).map_err(|_| crate::heap::ENOMEM)
+}
+
+/// `vfs::path::join`: ENOMEM without memory for it.
+pub fn join(components: &[String]) -> Result<String, i64> {
+    crate::heap::fallible(|| vfs::path::try_join(components)).map_err(|_| crate::heap::ENOMEM)
+}
 
 pub const ENOENT: i64 = 2;
 pub const EEXIST: i64 = 17;
@@ -252,13 +263,14 @@ fn dev() -> Arc<tmpfs::Inode> {
 }
 
 /// The mount table as /proc/<pid>/mounts shows it (proc_pid_mounts(5)).
-pub fn mounts_text() -> String {
+pub fn mounts_text() -> Result<String, i64> {
+    use crate::heap::TryPushStr;
     with_mounts(|mounts| {
         let mut out = String::new();
         for m in mounts {
-            out.push_str(&alloc::format!("{} {} {} rw 0 0\n", m.source, join(&m.at), m.fstype));
+            out.try_push_str(&crate::try_format!("{} {} {} rw 0 0\n", m.source, join(&m.at)?, m.fstype)?)?;
         }
-        out
+        Ok(out)
     })
 }
 
@@ -352,7 +364,7 @@ pub fn resolve(base: &str, path: &str, follow: bool) -> Result<Resolved, i64> {
     if path.is_empty() {
         return Err(ENOENT);
     }
-    let given = normalize(base, path);
+    let given = normalize(base, path)?;
     // The components with the symlinks met so far replaced; None while
     // there were none (then they are `given`, which needs no copy).
     let mut replaced: Option<Vec<String>> = None;
@@ -387,7 +399,10 @@ pub fn resolve(base: &str, path: &str, follow: bool) -> Result<Resolved, i64> {
         let target = match &link {
             Node::Proc(p) => match procfs::follow(p)? {
                 Some(procfs::Follow { node, mode, path }) if walked == all.len() => {
-                    let path = path.map(|p| normalize("/", &p)).unwrap_or(given);
+                    let path = match path {
+                        Some(p) => normalize("/", &p)?,
+                        None => given,
+                    };
                     return Ok(Resolved { node, mode, path });
                 }
                 Some(procfs::Follow { path: Some(path), .. }) => path,
@@ -396,8 +411,11 @@ pub fn resolve(base: &str, path: &str, follow: bool) -> Result<Resolved, i64> {
             },
             _ => link.readlink()?,
         };
-        let mut next = normalize(&join(&all[..walked - 1]), &target);
-        next.extend(all[walked..].iter().cloned());
+        let mut next = normalize(&join(&all[..walked - 1])?, &target)?;
+        next.try_grow(all.len() - walked)?;
+        for name in &all[walked..] {
+            next.push(try_string(name)?);
+        }
         replaced = Some(next);
     }
 }
@@ -408,12 +426,12 @@ pub fn resolve_parent(base: &str, path: &str) -> Result<(Resolved, String), i64>
     if path.is_empty() {
         return Err(ENOENT);
     }
-    let mut comps = normalize(base, path);
+    let mut comps = normalize(base, path)?;
     if is_mount_point(&comps) {
         return Err(EBUSY);
     }
     let name = comps.pop().ok_or(EEXIST)?;
-    let parent = resolve("/", &join(&comps), true)?;
+    let parent = resolve("/", &join(&comps)?, true)?;
     if parent.mode & vfs::S_IFMT != vfs::S_IFDIR {
         return Err(ENOTDIR);
     }
