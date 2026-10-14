@@ -208,3 +208,27 @@ There is no regression of cached reads: `pread_4k_cached` of one commit spreads 
 between boots (two runs of `905c1d0`: 3565 and 4201), which a bisect with one run per step
 had taken for one. Only `fstat_disk` stays about 6 % above r6e in every pairing. Compare
 several boots per commit, in turn, before calling a difference of less than about 20 %.
+
+## A/B of one page cache for every process tree (ADR 0014, 2026-10-15)
+
+The cost of the shared page cache for a file one tree alone uses, measured A/B: the commit
+before (`a3f96ce`) and the branch (`4122c21`) booted in turn, three times each, on a host busy
+with another agent's builds (`2026-10-15-a3f96ce-ab-base-1.md` is one of the base runs,
+`2026-10-15-4122c21-ab-coherence-*.md` the branch's). Medians of the p50s:
+
+| p50 | base | ADR 0014 |
+|---|---|---|
+| `fstat_disk` (cycles) | 13037 (12943–13108) | 13208 (13194–13253) |
+| `read_4k_cached` (ns) | 2002 | 1990 |
+| `pread_4k_cached` (cycles) | 2674 | 2702 |
+| `read_4k_disk` (ns) | 27488 | 27384 |
+| `write_fsync_4k` (ns) | 4724550 | 4660560 |
+| `seq_write` (MB/s) | 122.2 | 122.0 |
+| `create_disk`, `rename_disk`, `unlink_disk` | | within 0.3 % |
+
+The kernel calls per operation are the same, but for O_DIRECT reads of a file the tree does
+not cache (`read_4k_disk`, `seq_read_disk`: one registry query each, no measurable time
+beside the disk read). `fstat` asks the registry only when diskfs says another client holds
+the inode; its remaining 1.3 % is within the spread between boots. A first version that
+always asked the registry (`2026-10-15-9fe966d-ab-coherence-*.md`) cost `fstat_disk` 4 %
+(13573 against 13051), one kernel call more.
