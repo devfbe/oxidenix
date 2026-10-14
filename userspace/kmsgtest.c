@@ -203,6 +203,22 @@ int main(void) {
     printf("  (%d of 30 writes kept)\n", kept);
     check("... writes succeed, at most 10 per 5 s reach the log", writes == 30 && kept >= 1 && kept <= 10);
 
+    /* The server's own messages are ratelimited too without the grant: 30 calls it does
+     * not implement (each said once, "syscall N not implemented") in a new interval. */
+    sleep(6);
+    syscall(1522, 0);
+    for (long nr = 340; nr < 370; nr++) syscall(nr);
+    syscall(1522, 1);
+    read_all();
+    int said = 0;
+    for (long nr = 340; nr < 370; nr++) {
+        char text[64];
+        snprintf(text, sizeof text, "syscall %ld not implemented", nr);
+        said += strstr(all, text) != NULL;
+    }
+    printf("  (%d of 30 server messages kept)\n", said);
+    check("... and so are the server's messages", said >= 1 && said <= 10);
+
     /* busybox's dmesg reads it all with READ_ALL. */
     log_line("kmsgtest: for dmesg\n");
     check("busybox dmesg shows the log", system("dmesg | grep -q 'kmsgtest: for dmesg'") == 0);

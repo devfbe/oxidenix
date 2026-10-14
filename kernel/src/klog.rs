@@ -308,6 +308,24 @@ pub fn forget(instance: u64) {
     }
 }
 
+/// Text someone else chose (a server's log line, a thread's name) in a kernel message:
+/// control characters (C0, DEL and C1) as `\xNN`, as Linux's `%pE`, so it cannot move
+/// the console's cursor, change its palette or make it scroll.
+pub struct Escaped<'a>(pub &'a str);
+
+impl core::fmt::Display for Escaped<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        for c in self.0.chars() {
+            if c.is_control() {
+                write!(f, "\\x{:02x}", c as u32)?;
+            } else {
+                core::fmt::Write::write_char(f, c)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Linux's ratelimit of writes to /dev/kmsg (`printk.devkmsg=ratelimit`): `BURST` records
 /// per `INTERVAL`, the rest dropped and counted, their number logged when the next interval
 /// starts. Per instance, for trees without the host grant (a tree cannot flood the log

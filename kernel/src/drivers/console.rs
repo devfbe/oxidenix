@@ -699,16 +699,6 @@ impl Console {
     pub fn redraw_pending(&self) -> bool {
         self.redraw_next.is_some()
     }
-
-    /// The kernel's own text (printk): answers to queries in it go nowhere.
-    pub fn write_bytes(&mut self, bytes: &[u8]) {
-        let mut rest = bytes;
-        while !rest.is_empty() || self.redraw_pending() {
-            let n = self.write_some(rest);
-            self.reply_len = 0;
-            rest = &rest[n..];
-        }
-    }
 }
 
 /// Minimal `fmt::Write` sink over a fixed buffer.
@@ -831,12 +821,35 @@ pub fn _print_at(level: u16, args: fmt::Arguments) {
     if !crate::klog::on_console(level) {
         return;
     }
-    let _ = Text(super::serial::write_bytes).write_fmt(args);
-    without_interrupts(|| {
-        if let Some(c) = CONSOLE.lock().as_mut() {
-            let _ = Text(|b: &[u8]| c.write_bytes(b)).write_fmt(args);
+    // In budgeted pieces, the console's lock and interrupts let go in between (as
+    // `write_with_replies`, but never rescheduling: printk runs in any context), so
+    // no message, however much drawing it asks for (a server's log line full of
+    // newlines or palette changes), holds other CPUs or interrupts off for long.
+    let _ = Text(|b: &[u8]| {
+        for chunk in b.chunks(SERIAL_CHUNK) {
+            super::serial::write_bytes(chunk);
         }
-    });
+    })
+    .write_fmt(args);
+    let _ = Text(|b: &[u8]| {
+        let mut rest = b;
+        loop {
+            // (Answers to queries in the kernel's own text go nowhere.)
+            let step = without_interrupts(|| {
+                CONSOLE.lock().as_mut().map(|c| {
+                    let used = c.write_some(rest);
+                    c.reply_len = 0;
+                    (used, c.redraw_pending())
+                })
+            });
+            let Some((used, pending)) = step else { return };
+            rest = &rest[used..];
+            if rest.is_empty() && !pending {
+                return;
+            }
+        }
+    })
+    .write_fmt(args);
 }
 
 /// Writes text of the kernel's (the monitor's echo, the native servers' output):

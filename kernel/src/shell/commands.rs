@@ -224,7 +224,8 @@ pub fn run_program(args: &[&str]) -> Option<crate::process::WaitStatus> {
 fn cmd_ps() {
     crate::printkln!("  PID  CPU  THR  STATE     NAME");
     for (pid, name, state, server, cpu, threads) in crate::process::list() {
-        crate::printkln!("{:5}  {:3}  {:3}  {:9} {}{}", pid, cpu, threads, state, name, if server { " (server)" } else { "" });
+        // (A program chose its name: escaped.)
+        crate::printkln!("{:5}  {:3}  {:3}  {:9} {}{}", pid, cpu, threads, state, crate::klog::Escaped(&name), if server { " (server)" } else { "" });
     }
 }
 

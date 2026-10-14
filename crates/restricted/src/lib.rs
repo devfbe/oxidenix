@@ -664,7 +664,9 @@ pub const SYS_MO_UNBACK: u64 = 1084;
 /// `server_log(buf, len)`: prints the server's message (UTF-8, at most
 /// `SERVER_LOG_MAX` bytes) on the kernel's console: what a program cannot
 /// be told any more (a final write-back that failed), and the Linux calls
-/// the server does not implement.
+/// the server does not implement. Its control characters are escaped
+/// (`\xNN`); without the host grant at most 10 messages per 5 s go (the
+/// instance's ratelimit of `klog_write`), the rest are dropped (still 0).
 pub const SYS_SERVER_LOG: u64 = 1085;
 pub const SERVER_LOG_MAX: u64 = 256;
 

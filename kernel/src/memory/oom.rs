@@ -108,8 +108,10 @@ impl Name {
 }
 
 impl core::fmt::Display for Name {
+    /// Escaped (a program chose it: PR_SET_NAME, its program's name).
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
-        f.write_str(core::str::from_utf8(&self.bytes[..self.len]).unwrap_or("?"))
+        let s = core::str::from_utf8(&self.bytes[..self.len]).unwrap_or("?");
+        core::fmt::Display::fmt(&crate::klog::Escaped(s), f)
     }
 }
 

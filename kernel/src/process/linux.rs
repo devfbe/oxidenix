@@ -2349,7 +2349,12 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             let mut text = [0u8; SERVER_LOG_MAX as usize];
             super::uaccess::copy_from_server(a[0], &mut text[..len as usize])?;
             let text = core::str::from_utf8(&text[..len as usize]).map_err(|_| EINVAL)?;
-            crate::printkln!("[linux] {}", text.trim_end());
+            // Any server may call it, a hostile one in a loop: ratelimited without the host
+            // grant (as its /dev/kmsg writes), its control characters escaped.
+            if !instance.host.load(core::sync::atomic::Ordering::Acquire) && !instance.klog_limit.allow() {
+                return Ok(0);
+            }
+            crate::printkln!("[linux] {}", crate::klog::Escaped(text.trim_end()));
             Ok(0)
         }
         // The log is the machine's: read by trees with the host grant only (Linux's

@@ -28,6 +28,9 @@ done, delete it here in the same commit.
   another tree unlinked keeps its blocks while any instance caches its inode (fsring's holds;
   `treetest` checks only what holds). Coherence needs diskfs to call back its clients
   (invalidate pages and sizes, report a last link gone).
+- **The task table (`MAX_PROCS`, 256) has no share per tree**: one tree can take every slot
+  (and with it the PI table's room) and starve the others' fork, clone and exec. A reserve per
+  instance (as netd's budgets, ADR 0008) would keep each tree a minimum.
 - `RLIMIT_NPROC` is not enforced (Linux exempts root; the kernel's process table is the bound).
 
 ## Linux features not implemented
