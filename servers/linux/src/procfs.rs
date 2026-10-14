@@ -654,7 +654,15 @@ fn describe(f: &FileRef) -> Result<String, i64> {
         File::Tmp(t) => path(&t.path, t.inode.removed()),
         File::Data(d) => path(&d.path, d.inode.unlinked()),
         File::Proc(p) => path(&p.path, false),
-        File::Pipe(end) => Ok(try_format!("pipe:[{}]", end.ino())?),
+        // A FIFO's end: its node's path.
+        File::Pipe(end) => match end.named().map(|n| n.origin()) {
+            Some(o) => path(&o.path, match &o.node {
+                Node::Tmp(t) => t.removed(),
+                Node::Data(d) => d.unlinked(),
+                Node::Proc(_) => false,
+            }),
+            None => Ok(try_format!("pipe:[{}]", end.ino())?),
+        },
         File::Socket(_) | File::Inet(_) | File::Netlink(_) => Ok(try_format!("socket:[{}]", ino(files::stat_file(&f.file)))?),
         File::EventFd(_) => anon("[eventfd]"),
         File::Inotify(_) => anon("inotify"),
@@ -680,6 +688,12 @@ pub fn follow(node: &ProcNode) -> Result<Option<Follow>, i64> {
         File::Tmp(t) => Follow { mode: t.inode.mode(), node: Node::Tmp(t.inode.clone()), path: Some(try_string(&t.path)?) },
         File::Data(d) => Follow { mode: d.inode.kind | 0o777, node: Node::Data(d.inode.clone()), path: Some(try_string(&d.path)?) },
         File::Proc(p) => Follow { mode: mode(&p.node), node: Node::Proc(p.node.clone()), path: Some(try_string(&p.path)?) },
+        // A FIFO's end leads to its node (opening it is a FIFO open, `fifo`).
+        File::Pipe(end) if end.named().is_some() => {
+            let o = end.named().expect("named").origin();
+            let node = o.node.duplicate()?;
+            Follow { mode: namespace::mode_of(&node.stat()?), node, path: Some(try_string(&o.path)?) }
+        }
         file @ (File::Pipe(_) | File::Socket(_) | File::Inet(_) | File::Netlink(_) | File::EventFd(_) | File::Inotify(_) | File::Epoll(_)) => open(file.clone())?,
         File::Tty(_) | File::PtyMaster(_) | File::Dev(_) | File::Kmsg(_) | File::Path(_) => {
             let o = files::origin_of_file(&f).ok_or(ENOENT)?;

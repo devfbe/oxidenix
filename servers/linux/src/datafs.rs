@@ -207,6 +207,9 @@ pub struct DInode {
     /// Open file descriptions of it: an unlinked file's last close is when
     /// it goes (inotify's IN_DELETE_SELF).
     pub opens: AtomicUsize,
+    /// A FIFO's pipe while anyone has it open (`fifo_pipe`): every opener's, whatever
+    /// path or process it came by (the inode stays cached while one is open).
+    fifo: Mutex<alloc::sync::Weak<crate::pipe::Shared>>,
 }
 
 impl DInode {
@@ -376,6 +379,44 @@ pub fn modified(inode: &DInode) {
     let mut t = inode.times.lock();
     t.mtime = Some(now);
     t.ctime = Some(now);
+    t.pending = true;
+    t.seq += 1;
+}
+
+/// A FIFO's pipe: the one its openers share, or a new one if nobody has it open
+/// (`pipe::fifo_pipe`); ENOMEM without memory.
+pub fn fifo_pipe(inode: &DInode) -> Result<Arc<crate::pipe::Shared>, i64> {
+    Ok(crate::pipe::fifo_pipe(&mut inode.fifo.lock())?)
+}
+
+/// A FIFO was read from (`modify`: written to): its access time (as `relatime` moves it,
+/// against the times set here) or its modification and change times are now, as Linux's
+/// pipe_read and pipe_write set them. Kept here and sent to diskfs with the next
+/// write-back of the inode (sync, its eviction), as the times of written data wait: a
+/// FIFO's reads and writes ask diskfs nothing. Nothing on a read-only disk (Linux skips
+/// the update when it cannot write the inode).
+pub fn fifo_used(inode: &DInode, modify: bool) {
+    if read_only() {
+        return;
+    }
+    let now = now_secs();
+    let mut t = inode.times.lock();
+    if modify {
+        if t.mtime == Some(now) && t.ctime == Some(now) {
+            return;
+        }
+        t.mtime = Some(now);
+        t.ctime = Some(now);
+    } else {
+        let stale = match t.atime {
+            None => true,
+            Some(a) => [t.mtime, t.ctime].iter().any(|c| c.is_some_and(|c| from_ext2(a) <= from_ext2(c))) || from_ext2(now) - from_ext2(a) >= 24 * 60 * 60,
+        };
+        if !stale || t.atime == Some(now) {
+            return;
+        }
+        t.atime = Some(now);
+    }
     t.pending = true;
     t.seq += 1;
 }
@@ -837,6 +878,7 @@ fn found(spare: Spare, ino: u64, mode: u64, generation: u64) -> Result<Arc<DInod
         times: Mutex::new(Times::default()),
         link: Mutex::new(None),
         opens: AtomicUsize::new(0),
+        fifo: Mutex::new(alloc::sync::Weak::new()),
     });
     let inode = unsafe { slot.assume_init() };
     t.inodes.insert(ino, inode.clone());
@@ -935,8 +977,12 @@ pub enum New<'a> {
     File,
     Dir,
     Symlink(&'a str),
-    /// A socket's name (bind(2)).
+    /// A socket's name (bind(2), mknod(2)).
     Socket,
+    /// mknod(2)'s: a FIFO, a character or block device with its number (`st_rdev`'s).
+    Fifo,
+    CharDev(u64),
+    BlockDev(u64),
 }
 
 pub fn create(dir: &Arc<DInode>, name: &str, new: New, perm: u32) -> Result<Arc<DInode>, i64> {
@@ -959,6 +1005,9 @@ pub fn create(dir: &Arc<DInode>, name: &str, new: New, perm: u32) -> Result<Arc<
         New::File => Kind::File,
         New::Dir => Kind::Dir,
         New::Socket => Kind::Socket,
+        New::Fifo => Kind::Fifo,
+        New::CharDev(rdev) => Kind::CharDev(rdev),
+        New::BlockDev(rdev) => Kind::BlockDev(rdev),
         New::Symlink(target) => {
             if target.len() > fsring::TARGET_MAX as usize {
                 return Err(ENAMETOOLONG);
@@ -1108,6 +1157,7 @@ pub fn stat(inode: &Arc<DInode>) -> Result<[u8; 144], i64> {
     st[8..16].copy_from_slice(&(inode.ino as u64).to_le_bytes());
     st[16..24].copy_from_slice(&(s.links as u64).to_le_bytes());
     st[24..28].copy_from_slice(&(inode.kind | s.mode & 0o7777).to_le_bytes());
+    st[40..48].copy_from_slice(&s.rdev.to_le_bytes());
     st[48..56].copy_from_slice(&size.to_le_bytes());
     st[56..64].copy_from_slice(&4096u64.to_le_bytes());
     st[64..72].copy_from_slice(&size.div_ceil(512).to_le_bytes());
@@ -1251,7 +1301,10 @@ pub fn readdir(dir: &Arc<DInode>, cursor: u64) -> Result<(Vec<(u32, u8, Vec<u8>)
     let mut entries: Vec<(u32, u8, Vec<u8>)> = Vec::new();
     for (ino, kind, name) in fsring::dirents(&bytes) {
         let dtype = match kind {
+            fsring::TYPE_FIFO => 1,
+            fsring::TYPE_CHRDEV => 2,
             fsring::TYPE_DIR => 4,
+            fsring::TYPE_BLKDEV => 6,
             fsring::TYPE_FILE => 8,
             fsring::TYPE_SYMLINK => 10,
             fsring::TYPE_SOCKET => 12,
@@ -1646,7 +1699,13 @@ pub fn write_server(inode: &Arc<DInode>, off: u64, data: &[u8]) -> Result<usize,
 /// wrote; the error of a write that failed (its pages are dirty again:
 /// ENOSPC for a full disk, EIO).
 pub fn writeback(inode: &Arc<DInode>, pages: core::ops::Range<u64>) -> Result<u64, i64> {
-    let Some(object) = *inode.object.lock() else { return Ok(0) };
+    let Some(object) = *inode.object.lock() else {
+        // No data, but a FIFO's times may wait (`fifo_used`).
+        if inode.times.lock().pending && !inode.stale.load(Ordering::Relaxed) {
+            send_times(&*client()?, inode, true)?;
+        }
+        return Ok(0);
+    };
     if inode.stale.load(Ordering::Relaxed) {
         return Err(EIO);
     }

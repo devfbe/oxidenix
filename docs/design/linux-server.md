@@ -1133,6 +1133,38 @@ select with the wait queues' callbacks. Calls on descriptors no longer pass thro
 kernel; the kernel's descriptor tables, open files, pipes and eventfds stayed for its native
 servers until R9 (which gave them a console log call instead and removed them).
 
+### FIFOs and device nodes (`mknod`)
+
+`mknod` and `mknodat` (`paths.rs`) make regular files, FIFOs, character and block devices
+and socket names on the server's tmpfs (`tmpfs::Special`, `socket`) and on `/data`
+(`fsring`'s `KIND_FIFO`, `KIND_CHRDEV`, `KIND_BLKDEV`, `KIND_SOCKET`; ext2 keeps a device's
+number in the block pointers as Linux's ext2 does, the old 16-bit encoding below 256, the new
+one beyond, and `STAT` reports it), in Linux's order: the type first (a directory's `EPERM`,
+an unknown one `EINVAL`), then the name (`EEXIST`, `ENOENT`, `ENOTDIR`, a trailing slash),
+then the filesystem (`EROFS`; `/proc`'s `ENOENT`, `/sys`'s and devpts' `EPERM`). `dev` is
+Linux's unsigned int (`new_decode_dev`). Everyone is root, so devices may be made; a character
+node opens its driver by number wherever it is (`devices`, `tty`, `kmsg`; "Devices by number"
+above), a block node has none (`ENXIO`).
+
+A FIFO's pipe is the server's (`fifo.rs`, `pipe.rs`): the node keeps it while anyone has it
+open (tmpfs's inode, `/data`'s `DInode`, whose inode stays cached meanwhile; a weak slot, the
+ends holding it), so every opener of the inode, by any path or process tree, gets the same
+buffer, and with the last close it goes, as Linux's `i_pipe`. ext2 keeps only the node. The
+open is Linux's `fifo_open`: readers and writers counted (and the counters of their opens), a
+reader without `O_NONBLOCK` waiting until a writer *opened* (the writer counter moved), a
+writer likewise for a reader, `O_NONBLOCK` writers without readers `ENXIO`, `O_RDWR` never
+waiting; the wait is the pipe's interruptible futex, so a signal ends it with `EINTR`
+(`ERESTARTSYS`: restarted under `SA_RESTART`) and the end is uncounted. A reader opened
+`O_NONBLOCK` before any writer gets no `POLLHUP` until one came (Linux's `f_pipe`). The
+descriptor and its watch are had before the open waits, so no partner ever sees an end that
+then fails to be installed. In all else an end is a pipe end (`File::Pipe`): reads, writes,
+`EPIPE`/`SIGPIPE`, poll, select, epoll. It keeps its node (`fifo::Named`, an `Origin`): fstat
+and fchmod are the node's, `/proc/<pid>/fd/N` shows the path and leads to the node, inotify
+sees the opens, reads, writes and closes, and reads and writes move the node's times (on
+`/data` kept by the server and sent with the inode's next write-back, so a FIFO's traffic asks
+diskfs nothing). On a read-only `/data` a FIFO and a device node still open for writing, as
+Linux asks for write access only for files, directories and symlinks.
+
 ## /proc and /sys (I/O rings step 5)
 
 `/proc` and `/sys` are mounts of the server's namespace (`namespace.rs`: `Fs::Proc`,
@@ -1175,7 +1207,7 @@ directory's entries are taken at a read from the start. Copies to the program ar
 no lock held but the description's offset, which the pager never takes.
 
 **Magic links.** `/proc/<pid>/fd/<n>` reads as the path the descriptor was opened by (with
-" (deleted)" for a file unlinked since), `pipe:[ino]`, `socket:[ino]` or
+" (deleted)" for a file unlinked since; a FIFO's end too, which leads to its node), `pipe:[ino]`, `socket:[ino]` or
 `anon_inode:[eventfd]`, `anon_inode:inotify`, `anon_inode:[eventpoll]`. Following it does
 not read it: resolution goes to the open file itself (`procfs::follow`, Linux's
 `proc_fd_link`), as the last name its node (a tmpfs or `/data` inode, also unlinked; a

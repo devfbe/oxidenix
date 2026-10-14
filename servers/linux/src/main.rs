@@ -28,6 +28,7 @@ mod epoll;
 mod eventfd;
 mod exec;
 mod fdtable;
+mod fifo;
 mod files;
 mod fsclient;
 mod futex;
