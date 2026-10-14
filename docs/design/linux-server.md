@@ -697,9 +697,10 @@ program memory, so the service thread may take it (exit events) without waiting 
   state (alive, zombie with its wait status), the group exit, the stop in progress and the
   report for `wait` (stopped, continued), `exit_signal`, `pdeath_signal`, dumpable,
   no_new_privs, child subreaper, name, command line and program path (for `/proc`), the CPU
-  time and peak memory of reaped children, the interval timer, the break (shared by
-  `CLONE_VM` processes), the signal actions (shared with `CLONE_SIGHAND`) and the pending
-  process signals.
+  time and peak memory of reaped children, the interval and POSIX timers and the deadlines
+  armed in the kernel for its CPU clocks, the break (shared by `CLONE_VM` processes), the
+  signal actions (shared with `CLONE_SIGHAND`), the pending process signals, and the words
+  its waiters and pidfds hold (its state for pidfds, their ids).
 - **Threads**: tid, key, process, mask, pending thread signals, the alternate signal stack,
   the mask to restore after `sigsuspend`/`ppoll`/`pselect`/`epoll_pwait`, the signals a
   `sigtimedwait` waits for, a restart block (`restart_syscall`), the working-directory record
@@ -719,7 +720,26 @@ shares the record, `CLONE_SIGHAND` the actions (also between processes, with `CL
 `CLONE_FILES` the descriptor table (else the child gets `FilesContext::fork`'s copy),
 `CLONE_PARENT` makes the caller's parent the parent (with the caller's exit signal),
 `CLONE_VFORK` makes the caller wait (killable only) until the child execs or exits.
-`CLONE_PIDFD` and namespaces are EINVAL (no pidfds yet).
+`CLONE_PIDFD` puts a pidfd of the child into the caller's table (after the child's copy of
+it) and its number into the caller's memory (clone: at `parent_tid`, so not with
+`CLONE_PARENT_SETTID`; clone3: at `pidfd`) before the child runs; a fault there undoes the
+clone (EFAULT). With `CLONE_THREAD` it is EINVAL (thread pidfds are Linux 6.9's), as
+`CLONE_DETACHED` with it. Namespaces are EINVAL.
+
+### pidfds
+
+A pidfd (`pidfd.rs`: `pidfd_open`, `CLONE_PIDFD`) is a file of the server's that names a
+process. Pids are reused, so it holds the process's words (`Words`, kept by an `Arc` after
+the reap): its pid names its process only while the table's process of that number has
+them. The words carry the process's state (alive, exited, reaped), set under the process
+lock, and the ids of its pidfds, which the process's end and reap report to after the lock
+(`After`): readable (`POLLIN`) once exited, hung up too (`POLLHUP`) once reaped, for poll,
+select and epoll. `pidfd_send_signal` posts as `kill` (or, with a siginfo, as
+`rt_sigqueueinfo`; `PIDFD_SIGNAL_THREAD`, `_THREAD_GROUP`, `_PROCESS_GROUP` pick the main
+thread, the process, its group); a zombie takes it silently, a reaped process is ESRCH.
+`pidfd_getfd` installs another process's open file description (close-on-exec); `waitid`'s
+`P_PIDFD` waits for that child (`ECHILD` if it is none or was reaped); a `PIDFD_NONBLOCK`
+pidfd's wait answers EAGAIN while the child runs (unless the caller asked for `WNOHANG`).
 
 ### execve
 
@@ -800,13 +820,46 @@ each stops in the server (a futex of the process) until SIGCONT or SIGKILL; the 
 reports `CLD_STOPPED` to the parent (SIGCHLD unless `SA_NOCLDSTOP`, a report for `WUNTRACED`).
 SIGCONT reports `CLD_CONTINUED`.
 
-**Interval timers** (`alarm`, `setitimer`'s `ITIMER_REAL`) are the instance's **timer thread**
-(`ROLE_TIMER`, a fourth service thread of the pager's process): it sleeps until the earliest
-deadline and sends SIGALRM. A periodic timer reloads when its signal is taken (delivered or
-returned by `sigtimedwait`), so a tiny interval costs one expiry per signal handled.
-
 The server's terminals, pipes and sockets use the same tables: a background read gets SIGTTIN
 for its group (`tty`), a write to a pipe or socket without a reader SIGPIPE for the thread.
+
+### Timers
+
+Interval timers (`alarm`, `setitimer`: `ITIMER_REAL`, `ITIMER_VIRTUAL`, `ITIMER_PROF`) and
+POSIX timers (`timer_create` and its calls; `timer.rs`) are run by the instance's **timer
+thread** (`ROLE_TIMER`, a fourth service thread of the pager's process), which also reports
+timerfds' expiries to their pollers (`timerfd.rs`).
+
+- **Wall and monotonic clocks**: the thread sleeps until the earliest deadline (an absolute
+  one of the wall clock is converted when it goes to sleep, and the instance's
+  `clock_settime` wakes it).
+- **CPU clocks** (`ITIMER_VIRTUAL`: user time; `ITIMER_PROF`, `CLOCK_PROCESS_CPUTIME_ID`:
+  user and system time; `CLOCK_THREAD_CPUTIME_ID`; another process's or thread's clock as
+  `clock_getcpuclockid` and `pthread_getcpuclockid` encode them) need no polling: the thread
+  keeps, per process and thread, the earliest deadline of the timers on each of its two
+  clocks armed in the kernel (`cpu_alarm`, 1190). The kernel looks at a thread's clocks and
+  its process's when a scheduler tick found the thread running (on its way back to user
+  mode, or at its next call), as Linux's tick looks at the CPU timers of the task it
+  interrupted; a deadline reached disarms and advances and wakes the timer thread's word.
+  The kernel knows no timer, interval or signal (R9). User time is the program's: the
+  server's time on a thread is the system time of its calls, as Linux's kernel time.
+- **Signals**: `ITIMER_REAL` and the POSIX timers reload when their signal is taken
+  (delivered or returned by `sigtimedwait`), so a tiny interval costs one expiry per signal
+  handled; a POSIX timer's signal tells the periods missed meanwhile (`si_overrun`,
+  `timer_getoverrun`). A timer's signal is an instance of its own (`SI_TIMER`, its id and
+  value), queued with a tag of the timer's setting: setting it again or deleting it drops
+  it (Linux 6.13), and a flushed one (SIGCONT, an action now ignored) lets the timer go on.
+  A timer whose signal was dropped as ignored waits until a handler is installed or
+  `sigtimedwait` waits for it. `ITIMER_VIRTUAL` and `ITIMER_PROF` reload at once (SIGVTALRM,
+  SIGPROF). `SIGEV_THREAD_ID` signals one thread of the process (musl's `SIGEV_THREAD`
+  builds on it); `SIGEV_NONE` only counts down. Each POSIX timer counts against
+  `RLIMIT_SIGPENDING` (EAGAIN), as Linux's preallocated signal.
+- **Inheritance**: none by fork; execve keeps the interval timers and deletes the POSIX
+  timers.
+- **timerfd**: the count of expiries is computed from the setting when read (a read with
+  none sleeps until the next expiry); the timer thread reports each expiry to pollers (an
+  edge for EPOLLET). A `TFD_TIMER_CANCEL_ON_SET` timer is canceled (`ECANCELED`) by the
+  instance's settings of the wall clock (another tree's are not seen).
 
 ### /proc
 
@@ -1332,8 +1385,9 @@ is gone) and of the calls R9 moved; fdtest's and ttytest's `/dev` checks hold fo
   in byte rings in granted memory, and netd answers every request at once (ADR 0008).
 - Processes and signals: the kernel keeps processes and threads as containers driven by kicks,
   kills and exit events; the server builds Linux's signal frames itself, `fork` clones the
-  address space in one call, the ELF loader is the server's, and a tree's first process
-  starts in the server (ADR 0010).
+  address space in one call, the ELF loader is the server's, a tree's first process
+  starts in the server, and timers on CPU clocks rest on the kernel's CPU-time alarms
+  (ADR 0010).
 - The descriptor table is the server's, shared as its process model decides (R8; until then
   the kernel's clone, with records), the kernel's files were held by handle (until R9),
   readiness goes through the server's watch lists over one kernel wait for any of several

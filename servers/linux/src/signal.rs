@@ -56,6 +56,7 @@ pub const SA_RESETHAND: u64 = 0x8000_0000;
 pub const SI_USER: i32 = 0;
 pub const SI_KERNEL: i32 = 0x80;
 pub const SI_TKILL: i32 = -6;
+pub const SI_TIMER: i32 = -2;
 pub const CLD_EXITED: i32 = 1;
 pub const CLD_KILLED: i32 = 2;
 pub const CLD_STOPPED: i32 = 5;
@@ -174,14 +175,41 @@ impl SigInfo {
         s.0[2] = addr;
         s
     }
+
+    /// The expiry of POSIX timer `id` (`SI_TIMER`, its value; the overrun is filled in when
+    /// it is taken, `set_overrun`).
+    pub fn timer(sig: u32, id: i32, value: u64) -> SigInfo {
+        let mut s = SigInfo::new(sig, SI_TIMER);
+        s.0[2] = id as u32 as u64;
+        s.0[3] = value;
+        s
+    }
+
+    /// si_overrun of a timer's signal.
+    pub fn set_overrun(&mut self, overrun: i32) {
+        self.0[2] = (self.0[2] & 0xffff_ffff) | (overrun as u32 as u64) << 32;
+    }
+}
+
+/// The tag a POSIX timer's signal is queued with (never 0): which timer of the process it
+/// is and its setting (`timer`'s serial, which changes when it is set again or deleted), so
+/// that a signal of a setting that is gone is dropped (as Linux since 6.13).
+pub fn timer_tag(id: i32, serial: u32) -> u64 {
+    1 << 31 | (id as u32 as u64 & 0x7fff_ffff) | (serial as u64) << 32
+}
+
+/// A tag's timer id and serial.
+pub fn timer_of(tag: u64) -> (i32, u32) {
+    ((tag & 0x7fff_ffff) as i32, (tag >> 32) as u32)
 }
 
 /// Pending signals: their set and the `siginfo` of each instance (a standard signal pends
-/// once; a real-time one queues every instance).
+/// once; a real-time one queues every instance), each with its timer's tag (0: not a
+/// timer's).
 #[derive(Default)]
 pub struct Queue {
     pub set: u64,
-    list: VecDeque<SigInfo>,
+    list: VecDeque<(SigInfo, u64)>,
 }
 
 impl Queue {
@@ -209,39 +237,73 @@ impl Queue {
             self.set |= bit(sig);
             return Ok(true);
         }
-        self.list.push_back(info);
+        self.list.push_back((info, 0));
         self.set |= bit(sig);
         Ok(true)
     }
 
+    /// Queues a timer's signal with its tag: always an instance of its own (a standard
+    /// signal too, as Linux's preallocated sigqueue of a timer), counted when the timer was
+    /// made. Whether it went with its data (without memory for it, it pends without).
+    fn push_timer(&mut self, info: SigInfo, tag: u64) -> bool {
+        self.set |= bit(info.signo());
+        if self.list.try_grow(1).is_err() {
+            return false;
+        }
+        self.list.push_back((info, tag));
+        true
+    }
+
     /// Takes the first pending instance of `sig` (one without data, if it was queued
-    /// without: a zeroed siginfo as Linux's collect_signal gives).
-    fn take(&mut self, sig: u32, rt_queued: &mut usize) -> SigInfo {
-        let info = match self.list.iter().position(|i| i.signo() == sig) {
+    /// without: a zeroed siginfo as Linux's collect_signal gives), with its timer's tag.
+    fn take(&mut self, sig: u32, rt_queued: &mut usize) -> (SigInfo, u64) {
+        let taken = match self.list.iter().position(|(i, _)| i.signo() == sig) {
             Some(at) => {
-                if sig >= SIGRTMIN {
+                let (info, tag) = self.list.remove(at).expect("found");
+                if sig >= SIGRTMIN && tag == 0 {
                     *rt_queued -= 1;
                 }
-                self.list.remove(at).expect("found")
+                (info, tag)
             }
-            None => SigInfo::new(sig, SI_USER),
+            None => (SigInfo::new(sig, SI_USER), 0),
         };
-        if !self.list.iter().any(|i| i.signo() == sig) {
+        if !self.list.iter().any(|(i, _)| i.signo() == sig) {
             self.set &= !bit(sig);
         }
-        info
+        taken
     }
 
     /// Drops every pending signal of `mask` (`!0`: all, as a thread's or process's end does,
-    /// so the instance's count of queued real-time signals drops with them).
-    pub fn flush(&mut self, mask: u64, rt_queued: &mut usize) {
+    /// so the instance's count of queued real-time signals drops with them). Whether a
+    /// timer's signal went (its timer is no longer waiting for it to be taken:
+    /// `timer::unpark_lost`).
+    pub fn flush(&mut self, mask: u64, rt_queued: &mut usize) -> bool {
         if self.set & mask == 0 {
-            return;
+            return false;
         }
-        let rt_gone = self.list.iter().filter(|i| mask & bit(i.signo()) != 0 && i.signo() >= SIGRTMIN).count();
-        self.list.retain(|i| mask & bit(i.signo()) == 0);
+        let gone = |i: &SigInfo| mask & bit(i.signo()) != 0;
+        let rt_gone = self.list.iter().filter(|(i, tag)| gone(i) && i.signo() >= SIGRTMIN && *tag == 0).count();
+        let timers = self.list.iter().any(|(i, tag)| gone(i) && *tag != 0);
+        self.list.retain(|(i, _)| !gone(i));
         *rt_queued -= rt_gone.min(*rt_queued);
         self.set &= !mask;
+        timers
+    }
+
+    /// Drops the signal queued with timer tag `tag`, if it is there (its timer was set
+    /// again or deleted).
+    pub fn remove_tag(&mut self, tag: u64) {
+        let Some(at) = self.list.iter().position(|&(_, t)| t == tag) else { return };
+        let (info, _) = self.list.remove(at).expect("found");
+        let sig = info.signo();
+        if !self.list.iter().any(|(i, _)| i.signo() == sig) {
+            self.set &= !bit(sig);
+        }
+    }
+
+    /// Whether the signal of timer tag `tag` is queued here.
+    pub fn has_tag(&self, tag: u64) -> bool {
+        self.list.iter().any(|&(_, t)| t == tag)
     }
 }
 
@@ -367,37 +429,32 @@ fn prepare(t: &mut Table, pid: Pid, thread: Option<Pid>, sig: u32, force: bool) 
     if p.zombie.is_some() || p.exiting.is_some() {
         return false;
     }
-    if sig == SIGCONT {
-        let p = t.procs.get_mut(&pid).expect("checked");
+    if sig == SIGCONT || is_stop(sig) {
+        // (By index, with no copy of the list: a post cannot fail for memory.)
+        let mask = if sig == SIGCONT { STOP_SIGNALS } else { bit(SIGCONT) };
         let mut rt = t.rt_queued;
-        p.sig.shared.flush(STOP_SIGNALS, &mut rt);
-        let threads = p.threads.clone();
-        let stop = core::mem::take(&mut p.sig.stop);
-        let words = p.words.clone();
-        for tid in &threads {
-            if let Some(th) = t.threads.get_mut(tid) {
-                th.sig.pending.flush(STOP_SIGNALS, &mut rt);
-                th.sig.must_stop = false;
+        let p = t.procs.get_mut(&pid).expect("checked");
+        let mut timers = p.sig.shared.flush(mask, &mut rt);
+        let (stop, words) = if sig == SIGCONT { (core::mem::take(&mut p.sig.stop), Some(p.words.clone())) } else { (Stop::default(), None) };
+        for i in 0..t.procs[&pid].threads.len() {
+            let tid = t.procs[&pid].threads[i];
+            if let Some(th) = t.threads.get_mut(&tid) {
+                timers |= th.sig.pending.flush(mask, &mut rt);
+                if sig == SIGCONT {
+                    th.sig.must_stop = false;
+                }
             }
         }
         t.rt_queued = rt;
-        if stop.sig != 0 {
+        if timers {
+            crate::timer::unpark_lost(t, pid);
+        }
+        if let Some(words) = words.filter(|_| stop.sig != 0) {
             process::wake_word(&words.stop);
             if stop.stopped {
                 notify_parent_stop(t, pid, Report::Continued);
             }
         }
-    } else if is_stop(sig) {
-        let mut rt = t.rt_queued;
-        let p = t.procs.get_mut(&pid).expect("checked");
-        p.sig.shared.flush(bit(SIGCONT), &mut rt);
-        let threads = p.threads.clone();
-        for tid in &threads {
-            if let Some(th) = t.threads.get_mut(tid) {
-                th.sig.pending.flush(bit(SIGCONT), &mut rt);
-            }
-        }
-        t.rt_queued = rt;
     }
     let p = &t.procs[&pid];
     let action = t.hands[&p.sig.hand].actions[sig as usize - 1];
@@ -420,6 +477,60 @@ pub fn post_process(t: &mut Table, pid: Pid, info: SigInfo, force: bool) -> bool
 /// Sends `info` to thread `tid` of process `pid`.
 pub fn post_thread(t: &mut Table, pid: Pid, tid: Pid, info: SigInfo) -> bool {
     post(t, pid, Some(tid), info, false, false).is_ok()
+}
+
+/// What became of a timer's signal (`post_timer`).
+pub enum TimerPost {
+    /// Queued with its tag: the timer waits until it is taken.
+    Queued,
+    /// Dropped as ignored: the timer waits until someone can take it (`timer::handled`).
+    Ignored,
+    /// Not queued with its data (its thread is gone, its process ends, no memory): the
+    /// timer goes on.
+    Lost,
+}
+
+/// Sends a POSIX timer's signal `info`, tagged `tag`, to process `pid` or its thread
+/// `thread` (SIGEV_THREAD_ID): as Linux's posixtimer_send_sigqueue, an instance of its own
+/// even of a standard signal that pends already.
+pub fn post_timer(t: &mut Table, pid: Pid, thread: Option<Pid>, info: SigInfo, tag: u64) -> TimerPost {
+    let Some(p) = t.procs.get(&pid) else { return TimerPost::Lost };
+    if p.zombie.is_some() || p.exiting.is_some() {
+        return TimerPost::Lost;
+    }
+    if let Some(tid) = thread {
+        if !t.threads.get(&tid).is_some_and(|th| th.pid == pid && !th.exited) {
+            return TimerPost::Lost;
+        }
+    }
+    let sig = info.signo();
+    if !prepare(t, pid, thread, sig, false) {
+        return TimerPost::Ignored;
+    }
+    let queued = match thread {
+        Some(tid) => t.threads.get_mut(&tid).expect("checked").sig.pending.push_timer(info, tag),
+        None => t.procs.get_mut(&pid).expect("checked").sig.shared.push_timer(info, tag),
+    };
+    complete(t, pid, thread, sig);
+    if queued { TimerPost::Queued } else { TimerPost::Lost }
+}
+
+/// Drops the queued signal of timer tag `tag` of process `pid`, wherever it pends.
+pub fn remove_timer_signal(t: &mut Table, pid: Pid, tag: u64) {
+    let Some(p) = t.procs.get_mut(&pid) else { return };
+    p.sig.shared.remove_tag(tag);
+    for i in 0..t.procs[&pid].threads.len() {
+        let tid = t.procs[&pid].threads[i];
+        if let Some(th) = t.threads.get_mut(&tid) {
+            th.sig.pending.remove_tag(tag);
+        }
+    }
+}
+
+/// Whether the signal of timer tag `tag` of process `pid` is still queued.
+pub fn timer_signal_queued(t: &Table, pid: Pid, tag: u64) -> bool {
+    let Some(p) = t.procs.get(&pid) else { return false };
+    p.sig.shared.has_tag(tag) || p.threads.iter().filter_map(|tid| t.threads.get(tid)).any(|th| th.sig.pending.has_tag(tag))
 }
 
 fn post(t: &mut Table, pid: Pid, thread: Option<Pid>, info: SigInfo, force: bool, may_fail: bool) -> Result<(), i64> {
@@ -803,19 +914,7 @@ fn next_action(tid: Pid, pid: Pid) -> Next {
             return Next::Done;
         }
         let sig = pick(set);
-        let mut rt = t.rt_queued;
-        let info = {
-            let th = t.threads.get_mut(&tid).expect("checked");
-            if th.sig.pending.set & bit(sig) != 0 {
-                th.sig.pending.take(sig, &mut rt)
-            } else {
-                t.procs.get_mut(&pid).expect("checked").sig.shared.take(sig, &mut rt)
-            }
-        };
-        t.rt_queued = rt;
-        if sig == SIGALRM {
-            crate::timer::taken(t, pid);
-        }
+        let Some(info) = take(t, tid, pid, sig) else { continue };
         let action = t.actions(pid)[sig as usize - 1];
         if action.handler == SIG_IGN {
             continue;
@@ -855,6 +954,29 @@ fn next_action(tid: Pid, pid: Pid) -> Next {
         }
         return Next::Handle(sig, action, info, old_mask, alt, trap);
     }
+}
+
+/// Takes pending signal `sig` for thread `tid` of `pid` (its own first, then its process's),
+/// as it is delivered or returned by sigtimedwait: a timer's signal tells its timer (which
+/// goes on, and gives the signal its overrun) or, of a setting that is gone, is dropped
+/// (None); the interval timer's SIGALRM lets it go on.
+fn take(t: &mut Table, tid: Pid, pid: Pid, sig: u32) -> Option<SigInfo> {
+    let mut rt = t.rt_queued;
+    let (mut info, tag) = {
+        let th = t.threads.get_mut(&tid).expect("checked");
+        if th.sig.pending.set & bit(sig) != 0 {
+            th.sig.pending.take(sig, &mut rt)
+        } else {
+            t.procs.get_mut(&pid).expect("checked").sig.shared.take(sig, &mut rt)
+        }
+    };
+    t.rt_queued = rt;
+    if tag != 0 {
+        info.set_overrun(crate::timer::taken_posix(t, pid, tag)?);
+    } else if sig == SIGALRM {
+        crate::timer::taken(t, pid);
+    }
+    Some(info)
 }
 
 /// Starts (or joins) the group stop for `sig`: every thread of the process stops.
@@ -1339,21 +1461,26 @@ fn sigaction(sig: u64, act: u64, oldact: u64, size: u64) -> Result<i64, i64> {
             let now_ignored = new.handler == SIG_IGN || (new.handler == SIG_DFL && ignored_by_default(sig));
             if now_ignored {
                 let hand = t.procs[&pid].sig.hand;
-                let mut rt = t.rt_queued;
                 let mut from = 0;
                 while let Some(p) = next_proc(&t, from, |q| q.sig.hand == hand) {
-                    t.procs.get_mut(&p).expect("listed").sig.shared.flush(bit(sig), &mut rt);
+                    let mut rt = t.rt_queued;
+                    let mut timers = t.procs.get_mut(&p).expect("listed").sig.shared.flush(bit(sig), &mut rt);
                     for i in 0..t.procs[&p].threads.len() {
                         let tid = t.procs[&p].threads[i];
                         if let Some(th) = t.threads.get_mut(&tid) {
-                            th.sig.pending.flush(bit(sig), &mut rt);
+                            timers |= th.sig.pending.flush(bit(sig), &mut rt);
                         }
+                    }
+                    t.rt_queued = rt;
+                    // Its timers' signals that went: they go on, and their next is dropped
+                    // as ignored until someone can take it.
+                    if timers {
+                        crate::timer::unpark_lost(&mut t, p);
                     }
                     from = p + 1;
                 }
-                t.rt_queued = rt;
-            } else if sig == SIGALRM {
-                crate::timer::handled(&mut t, pid);
+            } else {
+                crate::timer::handled(&mut t, pid, bit(sig));
             }
         }
         old
@@ -1444,9 +1571,8 @@ fn sigtimedwait(set: u64, info: u64, timeout: u64, size: u64) -> Result<i64, i64
         None
     };
     let (tid, pid) = process::me();
-    if wanted & bit(SIGALRM) != 0 {
-        crate::timer::handled(&mut PROCS.lock(), pid);
-    }
+    // Timers whose signals were dropped as ignored go on: this call takes them.
+    crate::timer::handled(&mut PROCS.lock(), pid, wanted);
     let found = loop {
         {
             let mut t = PROCS.lock();
@@ -1454,21 +1580,12 @@ fn sigtimedwait(set: u64, info: u64, timeout: u64, size: u64) -> Result<i64, i64
             let ready = (th.sig.pending.set | t.procs[&pid].sig.shared.set) & wanted;
             if ready != 0 {
                 let sig = pick(ready);
-                let mut rt = t.rt_queued;
-                let info = {
-                    let th = t.threads.get_mut(&tid).expect("checked");
-                    th.sig.waiting_for = 0;
-                    if th.sig.pending.set & bit(sig) != 0 {
-                        th.sig.pending.take(sig, &mut rt)
-                    } else {
-                        t.procs.get_mut(&pid).expect("listed").sig.shared.take(sig, &mut rt)
-                    }
-                };
-                t.rt_queued = rt;
-                if sig == SIGALRM {
-                    crate::timer::taken(&mut t, pid);
+                t.threads.get_mut(&tid).expect("checked").sig.waiting_for = 0;
+                match take(&mut t, tid, pid, sig) {
+                    Some(info) => break Ok(info),
+                    // A stale timer's: another look.
+                    None => continue,
                 }
-                break Ok(info);
             }
             let p = &t.procs[&pid];
             let interrupted = deliverable(th, p) != 0 || p.exiting.is_some();

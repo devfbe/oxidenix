@@ -163,7 +163,14 @@ fn set_time(ns: Option<u64>, tz: Option<[i32; 2]>) -> Result<i64, i64> {
         return Err(EINVAL);
     }
     let r = syscall(SYS_CLOCK_SET, [ns, 0, 0, 0, 0, 0]);
-    if r < 0 { Err(-r) } else { Ok(0) }
+    if r < 0 {
+        return Err(-r);
+    }
+    // Absolute timers of the wall clock wait for its new time; cancelable timerfds are
+    // canceled.
+    crate::timerfd::clock_set();
+    crate::timer::changed();
+    Ok(0)
 }
 
 /// settimeofday(tv, tz): the wall clock from a timeval, and the time zone (`set_time`);

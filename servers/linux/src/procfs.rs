@@ -659,6 +659,8 @@ fn describe(f: &FileRef) -> Result<String, i64> {
         File::EventFd(_) => anon("[eventfd]"),
         File::Inotify(_) => anon("inotify"),
         File::Epoll(_) => anon("[eventpoll]"),
+        File::TimerFd(_) => anon("[timerfd]"),
+        File::PidFd(_) => anon("[pidfd]"),
         File::Tty(_) | File::PtyMaster(_) | File::Dev(_) | File::Kmsg(_) | File::Path(_) => files::origin_of_file(f).map(|o| o.path).ok_or(ENOENT),
     }
 }
@@ -680,7 +682,7 @@ pub fn follow(node: &ProcNode) -> Result<Option<Follow>, i64> {
         File::Tmp(t) => Follow { mode: t.inode.mode(), node: Node::Tmp(t.inode.clone()), path: Some(try_string(&t.path)?) },
         File::Data(d) => Follow { mode: d.inode.kind | 0o777, node: Node::Data(d.inode.clone()), path: Some(try_string(&d.path)?) },
         File::Proc(p) => Follow { mode: mode(&p.node), node: Node::Proc(p.node.clone()), path: Some(try_string(&p.path)?) },
-        file @ (File::Pipe(_) | File::Socket(_) | File::Inet(_) | File::Netlink(_) | File::EventFd(_) | File::Inotify(_) | File::Epoll(_)) => open(file.clone())?,
+        file @ (File::Pipe(_) | File::Socket(_) | File::Inet(_) | File::Netlink(_) | File::EventFd(_) | File::Inotify(_) | File::Epoll(_) | File::TimerFd(_) | File::PidFd(_)) => open(file.clone())?,
         File::Tty(_) | File::PtyMaster(_) | File::Dev(_) | File::Kmsg(_) | File::Path(_) => {
             let o = files::origin_of_file(&f).ok_or(ENOENT)?;
             let node = o.node()?;
