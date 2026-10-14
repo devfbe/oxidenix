@@ -13,6 +13,7 @@
 //! server uses none), so the server saves and restores them itself (`fxsave64`,
 //! `fxrstor64`).
 
+use crate::heap::TryGrow;
 use crate::local;
 use crate::process::{self, Pid, Proc, Report, Table, Thread, PROCS};
 use crate::syscall;
@@ -193,7 +194,7 @@ impl Queue {
             return Ok(false);
         }
         if sig >= SIGRTMIN {
-            if *rt_queued as u64 >= max || self.list.try_reserve(1).is_err() {
+            if *rt_queued as u64 >= max || self.list.try_grow(1).is_err() {
                 // Out of queue space: sigqueue fails, kill pends without its data.
                 if may_fail {
                     return Err(EAGAIN);
@@ -202,7 +203,9 @@ impl Queue {
                 return Ok(true);
             }
             *rt_queued += 1;
-        } else if self.list.try_reserve(1).is_err() {
+        } else if self.list.try_grow(1).is_err() {
+            // (Without room for its data a standard signal still pends, as without memory
+            // for a sigqueue entry on Linux.)
             self.set |= bit(sig);
             return Ok(true);
         }
@@ -465,11 +468,21 @@ fn complete(t: &mut Table, pid: Pid, thread: Option<Pid>, sig: u32) {
 
 /// Sends `info` to every process of group `pgid`; whether there was one.
 pub fn post_pgrp(t: &mut Table, pgid: Pid, info: SigInfo) -> bool {
-    let members: alloc::vec::Vec<Pid> = t.procs.values().filter(|p| p.pgid == pgid && p.zombie.is_none()).map(|p| p.pid).collect();
-    for &pid in &members {
+    let mut any = false;
+    let mut from = 0;
+    while let Some(pid) = next_proc(t, from, |p| p.pgid == pgid && p.zombie.is_none()) {
         post_process(t, pid, info, false);
+        any = true;
+        from = pid + 1;
     }
-    !members.is_empty()
+    any
+}
+
+/// The first process from pid `from` on that `select` picks: walks the table while posting
+/// changes it, with no list to allocate (a post must not fail for memory; posting changes no
+/// process's membership, and a new one is not looked for, as one forked meanwhile on Linux).
+fn next_proc(t: &Table, from: Pid, select: impl Fn(&Proc) -> bool) -> Option<Pid> {
+    t.procs.range(from..).map(|(_, p)| p).find(|p| select(p)).map(|p| p.pid)
 }
 
 /// SIGHUP and SIGCONT to a process group that became orphaned with stopped members.
@@ -856,18 +869,19 @@ fn start_stop(t: &mut Table, pid: Pid, me: Pid, sig: u32) {
         }
         return;
     }
-    let threads = p.threads.clone();
-    let live: alloc::vec::Vec<Pid> = threads.into_iter().filter(|tid| t.threads.get(tid).is_some_and(|th| !th.exited)).collect();
-    let p = t.procs.get_mut(&pid).expect("listed");
-    p.sig.stop = Stop { sig, pending: live.len() as u32, stopped: false };
-    for tid in live {
-        if let Some(th) = t.threads.get_mut(&tid) {
-            th.sig.must_stop = true;
-        }
+    // (By index, with no list: a delivery cannot fail for memory.)
+    let n = p.threads.len();
+    let mut live = 0;
+    for i in 0..n {
+        let tid = t.procs[&pid].threads[i];
+        let Some(th) = t.threads.get_mut(&tid).filter(|th| !th.exited) else { continue };
+        th.sig.must_stop = true;
+        live += 1;
         if tid != me {
             t.kick(tid);
         }
     }
+    t.procs.get_mut(&pid).expect("listed").sig.stop = Stop { sig, pending: live, stopped: false };
 }
 
 /// The restart of an interrupted call no handler took (Linux's restart codes without a
@@ -1240,9 +1254,10 @@ pub fn exception(s: &State) {
             (13, _) => "general protection fault",
             _ => "exception",
         };
-        let mut msg = alloc::string::String::new();
-        let _ = core::fmt::Write::write_fmt(&mut msg, format_args!("{} at {:#x} (rip {:#x}, error {:#x}, kind {}) in pid {}: process killed", what, addr, s.rip, error, kind, pid));
-        syscall(SYS_SERVER_LOG, [msg.as_ptr() as u64, msg.len() as u64, 0, 0, 0, 0]);
+        // (Said if there is memory for it: a program may crash at will.)
+        if let Ok(msg) = crate::try_format!("{} at {:#x} (rip {:#x}, error {:#x}, kind {}) in pid {}: process killed", what, addr, s.rip, error, kind, pid) {
+            syscall(SYS_SERVER_LOG, [msg.as_ptr() as u64, msg.len() as u64, 0, 0, 0, 0]);
+        }
     }
     force(&mut t, tid, info);
 }
@@ -1324,16 +1339,17 @@ fn sigaction(sig: u64, act: u64, oldact: u64, size: u64) -> Result<i64, i64> {
             let now_ignored = new.handler == SIG_IGN || (new.handler == SIG_DFL && ignored_by_default(sig));
             if now_ignored {
                 let hand = t.procs[&pid].sig.hand;
-                let pids: alloc::vec::Vec<Pid> = t.procs.values().filter(|p| p.sig.hand == hand).map(|p| p.pid).collect();
                 let mut rt = t.rt_queued;
-                for p in pids {
-                    let threads = t.procs[&p].threads.clone();
+                let mut from = 0;
+                while let Some(p) = next_proc(&t, from, |q| q.sig.hand == hand) {
                     t.procs.get_mut(&p).expect("listed").sig.shared.flush(bit(sig), &mut rt);
-                    for tid in threads {
+                    for i in 0..t.procs[&p].threads.len() {
+                        let tid = t.procs[&p].threads[i];
                         if let Some(th) = t.threads.get_mut(&tid) {
                             th.sig.pending.flush(bit(sig), &mut rt);
                         }
                     }
+                    from = p + 1;
                 }
                 t.rt_queued = rt;
             } else if sig == SIGALRM {
@@ -1620,7 +1636,9 @@ fn kill(pid: i32, sig: u64) -> Result<i64, i64> {
     let sig = sig as u32;
     let me = local::pid();
     let mut t = PROCS.lock();
-    let targets: alloc::vec::Vec<Pid> = match pid {
+    let info = SigInfo::user(sig, SI_USER, me);
+    // Which processes (as many as there are: walked, no list).
+    let pgid = match pid {
         p if p > 0 => {
             let p = p as Pid;
             let target = if t.procs.contains_key(&p) { p } else { t.threads.get(&p).map(|th| th.pid).ok_or(ESRCH)? };
@@ -1628,28 +1646,28 @@ fn kill(pid: i32, sig: u64) -> Result<i64, i64> {
                 // A zombie takes no signal (but exists).
                 return Ok(0);
             }
-            alloc::vec![target]
+            if sig != 0 {
+                post_process(&mut t, target, info, false);
+            }
+            return Ok(0);
         }
-        0 => {
-            let pgid = t.procs[&me].pgid;
-            t.procs.values().filter(|p| p.pgid == pgid && p.zombie.is_none()).map(|p| p.pid).collect()
-        }
-        -1 => t.procs.values().filter(|p| p.pid > 1 && p.pid != me && p.zombie.is_none()).map(|p| p.pid).collect(),
+        0 => Some(t.procs[&me].pgid),
+        -1 => None,
         i32::MIN => return Err(ESRCH),
-        p => {
-            let pgid = p.unsigned_abs();
-            t.procs.values().filter(|q| q.pgid == pgid && q.zombie.is_none()).map(|q| q.pid).collect()
-        }
+        p => Some(p.unsigned_abs()),
     };
-    if targets.is_empty() {
-        return Err(ESRCH);
-    }
-    if sig != 0 {
-        for target in targets {
-            post_process(&mut t, target, SigInfo::user(sig, SI_USER, me), false);
+    let select = |p: &Proc| p.zombie.is_none() && pgid.map_or(p.pid > 1 && p.pid != me, |g| p.pgid == g);
+    let mut any = false;
+    let mut from = 0;
+    while let Some(target) = next_proc(&t, from, select) {
+        any = true;
+        if sig == 0 {
+            break;
         }
+        post_process(&mut t, target, info, false);
+        from = target + 1;
     }
-    Ok(0)
+    if any { Ok(0) } else { Err(ESRCH) }
 }
 
 /// tgkill(tgid, tid, sig) and tkill (`tgid` None): a signal for one thread.

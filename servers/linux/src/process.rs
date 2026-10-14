@@ -371,6 +371,8 @@ impl Table {
         }
         th.key = key;
         let killed = th.exited;
+        // (Infallible: the thread runs already. One entry per thread, whose records the
+        // clone made fallibly.)
         self.keys.insert(key, tid);
         if killed {
             syscall(SYS_THREAD_KILL, [key, 0, 0, 0, 0, 0]);
@@ -403,8 +405,9 @@ impl Table {
             return;
         }
         p.exiting = Some(status);
-        let threads = p.threads.clone();
-        for tid in threads {
+        // (By index, with no copy of the list: an exit cannot fail for memory.)
+        for i in 0..p.threads.len() {
+            let tid = self.procs[&pid].threads[i];
             if Some(tid) != except {
                 self.kill_thread(tid);
             }
