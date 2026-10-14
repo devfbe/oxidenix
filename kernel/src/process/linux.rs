@@ -2480,6 +2480,10 @@ fn process_call(instance: &Arc<Instance>, nr: u64, a: [u64; 6]) -> SysResult {
                     out.pages = mem.pages.load(Relaxed);
                     out.virt_pages = mem.virt_pages.load(Relaxed);
                     out.peak_pages = mem.peak_pages.load(Relaxed);
+                    out.virt_peak = mem.virt_peak.load(Relaxed);
+                    out.exec_pages = mem.exec_pages.load(Relaxed);
+                    out.stack_pages = mem.stack_pages.load(Relaxed);
+                    out.data_pages = mem.data_pages.load(Relaxed);
                 }
                 out.peak_pages = out.peak_pages.max(info.peak_pages);
                 out.threads = info.threads.len() as u64;

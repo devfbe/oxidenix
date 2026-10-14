@@ -25,8 +25,8 @@ pub const QUERY_PIDS: u64 = 1;
 pub const QUERY_PROCESS: u64 = 2;
 /// The command line of pid `arg` (NUL-terminated arguments).
 pub const QUERY_CMDLINE: u64 = 3;
-/// The absolute path of the program pid `arg` runs.
-pub const QUERY_EXE: u64 = 4;
+// 4 was the path of the program a process runs: /proc/<pid>/exe is a magic
+// link to the Linux server's node of the file.
 // 5 was the kernel's mount table: the mounts are the Linux server's.
 /// The thread ids of the process pid `arg` names, as `u64`s (as many as
 /// fit), its main thread first.
@@ -150,6 +150,14 @@ pub struct Process {
     /// The most resident pages and pages of address space it had.
     pub peak_pages: u64,
     pub virt_peak: u64,
+    /// Pages of address space by kind (Linux's exec_vm, stack_vm, data_vm):
+    /// executable and not writable, stacks, private and writable.
+    pub exec_pages: u64,
+    pub stack_pages: u64,
+    pub data_pages: u64,
+    /// Pages of the program's code (Linux's end_code - start_code, page
+    /// aligned: the span of its executable segments).
+    pub text_pages: u64,
     /// Signal masks (bit n-1 for signal n): pending for the thread asked
     /// for (its main thread for a process id) and for the process, blocked
     /// by that thread, ignored and caught by the process.
