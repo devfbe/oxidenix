@@ -36,6 +36,12 @@ pub struct Local {
     pub limits: AtomicPtr<Limits>,
     /// The status the thread's process ends with (`EXIT_PENDING`).
     pub exit_status: AtomicU32,
+    /// How deep the thread is in `heap::fallible` scopes: while not 0, its
+    /// heap commits leave the instance's reserve alone (`COMMIT_NO_RESERVE`).
+    pub fallible: AtomicU32,
+    /// The test hook `TEST_FAIL_NTH`: the thread's fallible allocations
+    /// still to come before the one that fails (0: none armed).
+    pub fail_nth: AtomicU32,
 }
 
 const _: () = assert!(SERVER_LOCAL_OFFSET as usize + core::mem::size_of::<Local>() <= 4096);
@@ -99,6 +105,8 @@ pub fn start(role: u64) {
     l.files.store(core::ptr::null_mut(), Ordering::Relaxed);
     l.limits.store(core::ptr::null_mut(), Ordering::Relaxed);
     l.exit_status.store(0, Ordering::Relaxed);
+    l.fallible.store(0, Ordering::Relaxed);
+    l.fail_nth.store(0, Ordering::Relaxed);
 }
 
 /// Whether the calling thread is one of the instance's service threads (the pager, the

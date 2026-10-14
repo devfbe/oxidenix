@@ -37,6 +37,7 @@
 //! it: `epoll`) → ... ; no lock is held while program memory is copied.
 
 use crate::files::{self, FileRef, POLLERR, POLLHUP, POLLIN, POLLNVAL, POLLOUT};
+use crate::heap::{self, NoMem, TryGrow};
 use crate::signal::{self, RestartBlock, ERESTARTNOHAND, ERESTART_RESTARTBLOCK};
 use crate::sync::Mutex;
 use crate::syscall;
@@ -49,7 +50,6 @@ use restricted::*;
 
 const EINTR: i64 = 4;
 const EAGAIN: i64 = 11;
-const ENOMEM: i64 = 12;
 const EINVAL: i64 = 22;
 const EPIPE: i64 = 32;
 const ETIMEDOUT: i64 = 110;
@@ -76,8 +76,8 @@ pub struct Waiter {
 }
 
 impl Waiter {
-    fn new() -> Arc<Waiter> {
-        Arc::new(Waiter { word: AtomicU32::new(0), sleeping: AtomicU32::new(0) })
+    fn new() -> Result<Arc<Waiter>, NoMem> {
+        heap::try_arc(Waiter { word: AtomicU32::new(0), sleeping: AtomicU32::new(0) })
     }
 
     fn wake(&self) {
@@ -115,16 +115,17 @@ fn shard(id: u64) -> &'static Mutex<BTreeMap<u64, Weak<Watch>>> {
 }
 
 impl Watch {
-    /// The watch of a new description `id`.
-    pub fn new(id: u64) -> Arc<Watch> {
-        let watch = Arc::new(Watch { subs: Mutex::new(Vec::new()), count: AtomicUsize::new(0) });
+    /// The watch of a new description `id` (ENOMEM: nothing registered).
+    pub fn new(id: u64) -> Result<Arc<Watch>, NoMem> {
+        let watch = heap::try_arc(Watch { subs: Mutex::new(Vec::new()), count: AtomicUsize::new(0) })?;
+        heap::preload()?;
         shard(id).lock().insert(id, Arc::downgrade(&watch));
-        watch
+        Ok(watch)
     }
 
     pub fn subscribe(&self, sub: Sub) -> Result<(), i64> {
         let mut subs = self.subs.lock();
-        subs.try_reserve(1).map_err(|_| ENOMEM)?;
+        subs.try_grow(1)?;
         if subs.is_empty() {
             WATCHED.fetch_add(1, SeqCst);
         }
@@ -153,9 +154,18 @@ impl Watch {
         self.count.load(SeqCst) != 0
     }
 
-    /// Who listens (a poller's or epoll's waiters).
-    pub fn subscribers(&self) -> Vec<Sub> {
-        self.subs.lock().clone()
+    /// Who listens (a poller's or epoll's waiters); ENOMEM without room for the list.
+    pub fn subscribers(&self) -> Result<Vec<Sub>, NoMem> {
+        let mut out = Vec::new();
+        loop {
+            let len = self.subs.lock().len();
+            out.try_grow(len)?;
+            let subs = self.subs.lock();
+            if subs.len() <= out.capacity() {
+                out.extend(subs.iter().cloned());
+                return Ok(out);
+            }
+        }
     }
 
     /// A report: pollers wake; epoll interests that want the events
@@ -207,19 +217,22 @@ pub fn report(id: u64, ready: i16) {
 /// the description).
 pub fn forget(id: u64, watch: &Arc<Watch>) {
     shard(id).lock().remove(&id);
-    let items: Vec<Arc<crate::epoll::Item>> = {
-        let mut subs = watch.subs.lock();
-        let had = !subs.is_empty();
-        let items = subs.iter().filter_map(|s| if let Sub::Item(i) = s { Some(i.clone()) } else { None }).collect();
-        subs.retain(|s| matches!(s, Sub::Waiter(_)));
-        if had && subs.is_empty() {
-            WATCHED.fetch_sub(1, SeqCst);
+    // One interest at a time, taken out under the lock and told after it:
+    // a description's end allocates nothing (it must not fail).
+    loop {
+        let item = {
+            let mut subs = watch.subs.lock();
+            let item = subs.iter().position(|s| matches!(s, Sub::Item(_))).map(|i| subs.remove(i));
+            if item.is_some() && subs.is_empty() {
+                WATCHED.fetch_sub(1, SeqCst);
+            }
+            watch.count.store(subs.len(), SeqCst);
+            item
+        };
+        match item {
+            Some(Sub::Item(item)) => item.file_gone(),
+            _ => break,
         }
-        watch.count.store(subs.len(), SeqCst);
-        items
-    };
-    for item in items {
-        item.file_gone();
     }
 }
 
@@ -231,8 +244,12 @@ pub type Word = (u64, u32);
 /// of an object that was hung up (netd died: such words wake nobody any
 /// more, the caller stops waiting on them).
 pub fn wait(words: &[Word], deadline: Option<u64>) -> Result<(), i64> {
-    let list: Vec<[u64; 2]> = words.iter().take(WAIT_MAX as usize).map(|&(a, v)| [a, v as u64]).collect();
-    let r = syscall(SYS_SERVER_WAIT, [list.as_ptr() as u64, list.len() as u64, deadline.unwrap_or(0), FUTEX_INTERRUPTIBLE, 0, 0]);
+    let mut list = [[0u64; 2]; WAIT_MAX as usize];
+    let n = words.len().min(list.len());
+    for (to, &(a, v)) in list.iter_mut().zip(words) {
+        *to = [a, v as u64];
+    }
+    let r = syscall(SYS_SERVER_WAIT, [list.as_ptr() as u64, n as u64, deadline.unwrap_or(0), FUTEX_INTERRUPTIBLE, 0, 0]);
     match r {
         r if r == -EINTR => Err(EINTR),
         r if r == -ETIMEDOUT => Err(ETIMEDOUT),
@@ -293,8 +310,8 @@ struct Listening {
 }
 
 impl Listening {
-    fn new() -> Listening {
-        Listening { waiter: Waiter::new(), files: Vec::new(), inet: Vec::new() }
+    fn new() -> Result<Listening, NoMem> {
+        Ok(Listening { waiter: Waiter::new()?, files: Vec::new(), inet: Vec::new() })
     }
 
     fn listen(&mut self, f: &FileRef) -> Result<(), i64> {
@@ -302,11 +319,12 @@ impl Listening {
         if self.files.iter().any(|g| g.ptr() == f.ptr()) {
             return Ok(());
         }
-        self.files.try_reserve(1).map_err(|_| ENOMEM)?;
+        self.files.try_grow(1)?;
         watch.subscribe(Sub::Waiter(self.waiter.clone()))?;
         self.files.push(f.clone());
         if let files::File::Inet(s) = &f.file {
-            if self.inet.len() + 1 < WAIT_MAX as usize && self.inet.try_reserve(1).is_ok() {
+            // (Without room it is still heard of, through its watch.)
+            if self.inet.len() + 1 < WAIT_MAX as usize && self.inet.try_grow(1).is_ok() {
                 s.watch_ctl();
                 self.inet.push(s.clone());
             }
@@ -332,13 +350,13 @@ impl Listening {
     }
 
     /// The words to wait on, read before readiness is checked.
-    fn words(&self) -> Vec<Word> {
-        let mut words = Vec::with_capacity(1 + self.inet.len());
+    fn words(&self) -> Result<Vec<Word>, NoMem> {
+        let mut words = heap::try_vec(1 + self.inet.len())?;
         words.push((&self.waiter.word as *const AtomicU32 as u64, self.waiter.word.load(SeqCst)));
         for s in &self.inet {
             words.push(s.ctl_word());
         }
-        words
+        Ok(words)
     }
 }
 
@@ -370,7 +388,7 @@ struct PollFd {
 /// entries, or EINTR if a signal came first.
 fn do_poll(entries: &mut [PollFd], deadline: Option<u64>) -> Result<i64, i64> {
     let table = crate::fdtable::current();
-    let mut listening = Listening::new();
+    let mut listening = Listening::new()?;
     for e in entries.iter().filter(|e| e.fd >= 0) {
         if let Ok(f) = table.get(e.fd as u64) {
             listening.listen(&f)?;
@@ -378,7 +396,7 @@ fn do_poll(entries: &mut [PollFd], deadline: Option<u64>) -> Result<i64, i64> {
     }
     let mut timed_out = deadline.is_some_and(|d| now() >= d);
     loop {
-        let words = listening.words();
+        let words = listening.words()?;
         let mut ready = 0;
         for e in entries.iter_mut() {
             e.revents = if e.fd < 0 {
@@ -415,8 +433,7 @@ fn read_pollfds(fds: u64, nfds: u64) -> Result<Vec<PollFd>, i64> {
     if nfds > crate::fdtable::nofile() {
         return Err(EINVAL);
     }
-    let mut entries = Vec::new();
-    entries.try_reserve_exact(nfds as usize).map_err(|_| ENOMEM)?;
+    let mut entries = heap::try_vec(nfds as usize)?;
     entries.resize(nfds as usize, PollFd::default());
     let bytes = unsafe { core::slice::from_raw_parts_mut(entries.as_mut_ptr() as *mut u8, nfds as usize * 8) };
     usercopy::from_program(fds, bytes)?;
@@ -484,10 +501,13 @@ fn do_select(nfds: u64, sets: [u64; 3], deadline: Option<u64>) -> Result<i64, i6
     // size, at least 64).
     let nfds = nfds.min(table.size().next_multiple_of(64).max(64) as u64);
     let words = nfds.div_ceil(64) as usize;
-    let load = |ptr: u64| -> Result<Vec<u64>, i64> {
-        let mut set = Vec::new();
-        set.try_reserve_exact(words).map_err(|_| ENOMEM)?;
+    let zeroed = || -> Result<Vec<u64>, NoMem> {
+        let mut set = heap::try_vec(words)?;
         set.resize(words, 0);
+        Ok(set)
+    };
+    let load = |ptr: u64| -> Result<Vec<u64>, i64> {
+        let mut set = zeroed()?;
         if ptr != 0 {
             let bytes = unsafe { core::slice::from_raw_parts_mut(set.as_mut_ptr() as *mut u8, words * 8) };
             usercopy::from_program(ptr, bytes)?;
@@ -501,7 +521,7 @@ fn do_select(nfds: u64, sets: [u64; 3], deadline: Option<u64>) -> Result<i64, i6
     };
     // Every descriptor asked about must be open (Linux's max_select_fd);
     // an O_PATH one is, but never ready (its fdget finds no file).
-    let mut listening = Listening::new();
+    let mut listening = Listening::new()?;
     for fd in 0..nfds {
         if wanted(fd) != 0 {
             let f = files::lookup_raw(fd)?;
@@ -510,8 +530,8 @@ fn do_select(nfds: u64, sets: [u64; 3], deadline: Option<u64>) -> Result<i64, i6
     }
     let mut timed_out = deadline.is_some_and(|d| now() >= d);
     loop {
-        let words_now = listening.words();
-        let mut got = [alloc::vec![0u64; words], alloc::vec![0u64; words], alloc::vec![0u64; words]];
+        let words_now = listening.words()?;
+        let mut got = [zeroed()?, zeroed()?, zeroed()?];
         let mut ready = 0;
         for fd in 0..nfds {
             let asked = wanted(fd);

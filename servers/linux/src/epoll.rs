@@ -32,6 +32,7 @@
 //! instance's ready list → ...
 
 use crate::files::{self, Description, File, FileRef, O_CLOEXEC, O_RDWR};
+use crate::heap::{self, NoMem, TryGrow};
 use crate::poll::{self, Sub, Watch};
 use crate::sync::Mutex;
 use crate::syscall;
@@ -44,7 +45,6 @@ use restricted::*;
 
 const EPERM: i64 = 1;
 const ENOENT: i64 = 2;
-const ENOMEM: i64 = 12;
 const EFAULT: i64 = 14;
 const EEXIST: i64 = 17;
 const EINVAL: i64 = 22;
@@ -206,8 +206,8 @@ impl Item {
 const POLLIN_NOW: i16 = EPOLLIN as i16;
 
 impl Epoll {
-    fn new(id: u64) -> Arc<Epoll> {
-        Arc::new(Epoll {
+    fn new(id: u64) -> Result<Arc<Epoll>, NoMem> {
+        heap::try_arc(Epoll {
             id,
             interest: Mutex::new(BTreeMap::new()),
             ready: Mutex::new(Ready { list: VecDeque::new(), overflow: false }),
@@ -274,9 +274,10 @@ impl Epoll {
 
     /// Its description went: every interest goes.
     pub fn closed(&self) {
-        let items: Vec<Arc<Item>> = core::mem::take(&mut *self.interest.lock()).into_values().collect();
-        for item in &items {
-            self.unlist(item);
+        // (Taken out whole, then walked: an end allocates nothing.)
+        let interest = core::mem::take(&mut *self.interest.lock());
+        for item in interest.into_values() {
+            self.unlist(&item);
         }
     }
 
@@ -302,7 +303,7 @@ impl Epoll {
                 // A chain of watching instances stays short in both
                 // directions: what watches this one, it, and what the
                 // target watches.
-                if levels_above(self) + 1 + levels_below(inner, self, &mut reached)? > MAX_NESTING + 1 {
+                if levels_above(self)? + 1 + levels_below(inner, self, &mut reached)? > MAX_NESTING + 1 {
                     return Err(ELOOP);
                 }
                 Some(guard)
@@ -317,11 +318,11 @@ impl Epoll {
         // (Files that are always ready have no watch: EPERM before.)
         let watch = target.watch.clone().ok_or(EPERM)?;
         // Counted from here; the item value owns it and its drop gives it back, exactly once
-        // (also when no memory is found for it: `Arc::try_new` drops the value).
+        // (also when no memory is found for it: `try_arc` drops the value).
         if WATCHES.try_update(SeqCst, SeqCst, |c| (c < MAX_WATCHES).then_some(c + 1)).is_err() {
             return Err(ENOSPC);
         }
-        let item = Arc::try_new(Item {
+        let item = heap::try_arc(Item {
             key,
             file: Arc::downgrade(target.arc()),
             watch: watch.clone(),
@@ -330,15 +331,15 @@ impl Epoll {
             data: AtomicU64::new(data),
             queued: AtomicBool::new(false),
             removed: AtomicBool::new(false),
-        })
-        .map_err(|_| ENOMEM)?;
-        // Room for every item on the ready list before anything can fail
-        // halfway.
+        })?;
+        // Room for every item on the ready list, and for the interest's
+        // node, before anything can fail halfway.
         {
             let mut ready = self.ready.lock();
             let room = (interest.len() + 1).saturating_sub(ready.list.len());
-            ready.list.try_reserve(room).map_err(|_| ENOMEM)?;
+            ready.list.try_grow(room)?;
         }
+        heap::preload()?;
         watch.subscribe(Sub::Item(item.clone()))?;
         interest.insert(key, item.clone());
         drop(interest);
@@ -365,8 +366,17 @@ impl Epoll {
         Ok(())
     }
 
-    fn items(&self) -> Vec<Arc<Item>> {
-        self.interest.lock().values().cloned().collect()
+    fn items(&self) -> Result<Vec<Arc<Item>>, NoMem> {
+        let mut out = Vec::new();
+        loop {
+            let len = self.interest.lock().len();
+            out.try_grow(len)?;
+            let interest = self.interest.lock();
+            if interest.len() <= out.capacity() {
+                out.extend(interest.values().cloned());
+                return Ok(out);
+            }
+        }
     }
 
     /// Takes up to `max` events off the ready list: (events, data, item).
@@ -376,8 +386,14 @@ impl Epoll {
         // A report that found no room: check every item.
         let overflow = core::mem::replace(&mut self.ready.lock().overflow, false);
         if overflow {
-            for item in self.items() {
-                self.enqueue(&item);
+            match self.items() {
+                Ok(items) => {
+                    for item in items {
+                        self.enqueue(&item);
+                    }
+                }
+                // Checked at a later call (its events wait, none is lost).
+                Err(NoMem) => self.ready.lock().overflow = true,
             }
         }
         let mut out = Vec::new();
@@ -396,7 +412,7 @@ impl Epoll {
             if events == 0 {
                 continue;
             }
-            if out.try_reserve(1).is_err() {
+            if out.try_grow(1).is_err() {
                 self.enqueue(&item);
                 break;
             }
@@ -451,13 +467,33 @@ impl Epoll {
 
     /// Whether an epoll_wait would report something now (a poll on the
     /// instance itself, or an instance watching it).
+    /// Without memory for the candidates' list it says yes: a readiness
+    /// that is not there costs the poller a look, a lost one its wakeup.
     pub fn has_events(&self) -> bool {
-        let listed: Option<Vec<Arc<Item>>> = {
-            let ready = self.ready.lock();
-            (!ready.overflow).then(|| ready.list.iter().cloned().collect())
+        let listed = |out: &mut Vec<Arc<Item>>| -> Result<bool, NoMem> {
+            loop {
+                let len = self.ready.lock().list.len();
+                out.try_grow(len)?;
+                let ready = self.ready.lock();
+                if ready.overflow {
+                    return Ok(false);
+                }
+                if ready.list.len() <= out.capacity() {
+                    out.extend(ready.list.iter().cloned());
+                    return Ok(true);
+                }
+            }
         };
-        // (Overflowed: every item is a candidate.)
-        let candidates = listed.unwrap_or_else(|| self.items());
+        let mut candidates = Vec::new();
+        let candidates = match listed(&mut candidates) {
+            Ok(true) => candidates,
+            // (Overflowed: every item is a candidate.)
+            Ok(false) => match self.items() {
+                Ok(all) => all,
+                Err(NoMem) => return true,
+            },
+            Err(NoMem) => return true,
+        };
         candidates.iter().any(|i| i.file.upgrade().is_some_and(|f| i.check(&f) != 0))
     }
 
@@ -495,9 +531,10 @@ fn levels_below_from(
         return Ok(levels);
     }
     let mut levels = 1;
-    for inner in watched_instances(target, reached) {
+    for inner in watched_instances(target, reached)? {
         levels = levels.max(1 + levels_below_from(&inner, epoll, depth + 1, seen, reached)?);
     }
+    heap::preload()?;
     seen.insert(key, levels);
     Ok(levels)
 }
@@ -507,45 +544,59 @@ fn levels_below_from(
 /// meanwhile takes that lock to forget it), and kept in `reached`: the
 /// caller lets go of them once it holds no lock (one may be the last
 /// reference, whose close may wait for netd).
-fn watched_instances(epoll: &Epoll, reached: &mut Vec<Arc<Description>>) -> Vec<Arc<Epoll>> {
-    let files: Vec<Weak<Description>> = epoll.interest.lock().values().map(|i| i.file.clone()).collect();
+fn watched_instances(epoll: &Epoll, reached: &mut Vec<Arc<Description>>) -> Result<Vec<Arc<Epoll>>, NoMem> {
+    let mut files: Vec<Weak<Description>> = Vec::new();
+    loop {
+        let len = epoll.interest.lock().len();
+        files.try_grow(len)?;
+        let interest = epoll.interest.lock();
+        if interest.len() <= files.capacity() {
+            files.extend(interest.values().map(|i| i.file.clone()));
+            break;
+        }
+    }
     let mut instances = Vec::new();
-    for f in files.iter().filter_map(Weak::upgrade) {
+    for w in &files {
+        // Room first: a description reached is never let go of here.
+        reached.try_grow(1)?;
+        instances.try_grow(1)?;
+        let Some(f) = w.upgrade() else { continue };
         if let File::Epoll(inner) = &f.file {
             instances.push(inner.clone());
         }
         reached.push(f);
     }
-    instances
+    Ok(instances)
 }
 
 /// The instances in the longest chain of instances that watch `epoll`,
 /// one watching the next (`epoll` not included).
-fn levels_above(epoll: &Epoll) -> usize {
+fn levels_above(epoll: &Epoll) -> Result<usize, NoMem> {
     levels_above_from(epoll, 0, &mut BTreeMap::new())
 }
 
-fn levels_above_from(epoll: &Epoll, depth: usize, seen: &mut BTreeMap<usize, usize>) -> usize {
+fn levels_above_from(epoll: &Epoll, depth: usize, seen: &mut BTreeMap<usize, usize>) -> Result<usize, NoMem> {
     let key = epoll as *const Epoll as usize;
     if let Some(&levels) = seen.get(&key) {
-        return levels;
+        return Ok(levels);
     }
     // Bounded by the checks; the cut-off only guards the stack.
     if depth > MAX_NESTING {
-        return depth;
+        return Ok(depth);
     }
-    let Some(watch) = epoll.own_watch() else { return 0 };
-    let owners: Vec<Arc<Epoll>> = watch
-        .subscribers()
-        .into_iter()
-        .filter_map(|s| match s {
-            Sub::Item(i) if !i.removed.load(SeqCst) => i.epoll.upgrade(),
-            _ => None,
-        })
-        .collect();
-    let levels = owners.iter().map(|owner| 1 + levels_above_from(owner, depth + 1, seen)).max().unwrap_or(0);
+    let Some(watch) = epoll.own_watch() else { return Ok(0) };
+    // (The subscribers' list is turned into the owners' in place.)
+    let mut levels = 0;
+    for s in watch.subscribers()? {
+        if let Sub::Item(i) = s {
+            if let Some(owner) = i.epoll.upgrade().filter(|_| !i.removed.load(SeqCst)) {
+                levels = levels.max(1 + levels_above_from(&owner, depth + 1, seen)?);
+            }
+        }
+    }
+    heap::preload()?;
     seen.insert(key, levels);
-    levels
+    Ok(levels)
 }
 
 /// The calls on an epoll instance's descriptor that are file calls.
@@ -576,9 +627,9 @@ fn epoll_create1(flags: u64) -> Result<i64, i64> {
         return Err(EINVAL);
     }
     let id = files::new_id();
-    let ep = Epoll::new(id);
+    let ep = Epoll::new(id)?;
     // Its own watch before anything can report it.
-    let watch = Watch::new(id);
+    let watch = Watch::new(id)?;
     *ep.watch.lock() = Arc::downgrade(&watch);
     files::install_watched(id, File::Epoll(ep), O_RDWR | flags as u32, Some(watch))
 }

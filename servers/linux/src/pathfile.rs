@@ -27,7 +27,8 @@ pub struct PathOpen {
 /// An O_PATH descriptor for `origin` (`flags` as open(2) had them).
 pub fn open(flags: u32, origin: Origin) -> Result<i64, i64> {
     let kept = flags & (O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
-    files::install(files::new_id(), File::Path(Arc::new(PathOpen { origin })), kept | O_PATH)
+    let open: Arc<PathOpen> = crate::heap::try_arc(PathOpen { origin })?;
+    files::install(files::new_id(), File::Path(open), kept | O_PATH)
 }
 
 /// The calls on one that reach the server.

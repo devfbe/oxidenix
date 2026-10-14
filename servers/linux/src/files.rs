@@ -16,6 +16,7 @@
 use crate::datafile::{self, DataOpen};
 use crate::eventfd::EventFd;
 use crate::fdtable;
+use crate::heap;
 use crate::inotify::{self, Inotify};
 use crate::netlink::{self, NetlinkSocket};
 use crate::pipe::{self, Dst, PipeEnd, Src};
@@ -301,25 +302,61 @@ pub fn new_id() -> u64 {
 /// If no descriptor can be had, nothing was made: the file is the caller's
 /// to undo (no close happens for it).
 pub fn install(id: u64, file: File, flags: u32) -> Result<i64, i64> {
-    let watch = (!file.always_ready()).then(|| crate::poll::Watch::new(id));
+    let watch = match file.always_ready() {
+        true => None,
+        false => Some(crate::poll::Watch::new(id)?),
+    };
     install_watched(id, file, flags, watch)
 }
 
 /// `install` with the description's watch made by the caller (an epoll
 /// instance knows its own before it is installed). Without a descriptor
-/// the watch goes again.
+/// the watch goes again. The description's memory is had first (ENOMEM),
+/// and filled only with the descriptor: a description that could not be
+/// installed never existed (its end would close the file).
 pub fn install_watched(id: u64, file: File, flags: u32, watch: Option<Arc<crate::poll::Watch>>) -> Result<i64, i64> {
     let kept = watch.clone();
-    let r = fdtable::current().install_new(
-        || FileRef::new(Arc::new(Description { id, file, flags: AtomicU32::new(flags & !O_CLOEXEC), watch, inflight: AtomicUsize::new(0) })),
-        flags & O_CLOEXEC != 0,
-    );
+    let r = match crate::heap::fallible(Arc::<Description>::try_new_uninit) {
+        Ok(memory) => install_into(memory, id, file, flags, watch),
+        Err(_) => Err(crate::heap::ENOMEM),
+    };
     if r.is_err() {
         if let Some(w) = &kept {
             crate::poll::forget(id, w);
         }
     }
     r
+}
+
+fn install_into(mut memory: Arc<core::mem::MaybeUninit<Description>>, id: u64, file: File, flags: u32, watch: Option<Arc<crate::poll::Watch>>) -> Result<i64, i64> {
+    fdtable::current().install_new(
+        || {
+            let description = Description { id, file, flags: AtomicU32::new(flags & !O_CLOEXEC), watch, inflight: AtomicUsize::new(0) };
+            Arc::get_mut(&mut memory).expect("a new Arc is unique").write(description);
+            FileRef::new(unsafe { memory.assume_init() })
+        },
+        flags & O_CLOEXEC != 0,
+    )
+}
+
+/// What a descriptor for a new description of an always-ready file needs from the heap
+/// (the description's memory, the table's room for the lowest free descriptor), had before
+/// the file is made: an open that creates its file fails before the create, never after
+/// (as Linux's, which gets its `struct file` and the descriptor first).
+pub struct Room(Arc<core::mem::MaybeUninit<Description>>);
+
+/// A `Room`: ENOMEM without memory for it (EMFILE with no descriptor free).
+pub fn room() -> Result<Room, i64> {
+    let memory = crate::heap::fallible(Arc::<Description>::try_new_uninit).map_err(|_| crate::heap::ENOMEM)?;
+    fdtable::current().make_room()?;
+    Ok(Room(memory))
+}
+
+/// `install` of an always-ready file (a tmpfs or /data file) into a `Room`: fails only if
+/// another thread of the process took the descriptors meanwhile.
+pub fn install_in(room: Room, id: u64, file: File, flags: u32) -> Result<i64, i64> {
+    debug_assert!(file.always_ready());
+    install_into(room.0, id, file, flags, None)
 }
 
 /// File `id` changed its readiness (now `ready`), or had an event that
@@ -633,7 +670,7 @@ pub fn iovecs(iov: u64, count: u64) -> Result<alloc::vec::Vec<(u64, u64)>, i64> 
     if count > 1024 {
         return Err(EINVAL);
     }
-    let mut out = alloc::vec::Vec::new();
+    let mut out = heap::try_vec(count as usize)?;
     for i in 0..count {
         let pair: [u64; 2] = crate::usercopy::read(iov + i * 16)?;
         if (pair[1] as i64) < 0 {
@@ -650,7 +687,7 @@ fn pipe2(fds: u64, flags: u64) -> Result<i64, i64> {
     if flags & !(O_CLOEXEC | O_NONBLOCK | O_DIRECT) != 0 {
         return Err(EINVAL);
     }
-    let (read_end, write_end) = pipe::new();
+    let (read_end, write_end) = pipe::new()?;
     let (rid, wid) = (read_end.id(), write_end.id());
     let common = flags & (O_CLOEXEC | O_NONBLOCK);
     let table = fdtable::current();
@@ -698,7 +735,7 @@ fn sendfile(out_fd: u64, in_fd: u64, offset: u64, count: u64) -> Result<i64, i64
         return Err(EBADF);
     }
     let (in_flags, out_flags) = (input.flags(), out.flags());
-    let mut buf = alloc::vec![0u8; 4096];
+    let mut buf = zeroed(4096)?;
     let mut total = 0u64;
     while total < count {
         let want = (count - total).min(buf.len() as u64) as usize;
@@ -883,7 +920,7 @@ fn copy_file_range(fd_in: u64, off_in: u64, fd_out: u64, off_out: u64, len: u64,
     if same_inode && len > 0 && start_in < start_out.saturating_add(len) && start_out < start_in.saturating_add(len) {
         return Err(EINVAL);
     }
-    let mut buf = alloc::vec![0u8; 64 * 1024];
+    let mut buf = zeroed(64 * 1024)?;
     let mut done = 0u64;
     while done < len {
         let want = (len - done).min(buf.len() as u64) as usize;
@@ -921,9 +958,16 @@ fn eventfd2(initval: u64, flags: u64) -> Result<i64, i64> {
     if flags & !(EFD_SEMAPHORE | (O_NONBLOCK | O_CLOEXEC) as u64) != 0 {
         return Err(EINVAL);
     }
-    let e = Arc::new(EventFd::new(initval as u32 as u64, flags & EFD_SEMAPHORE != 0));
+    let e = heap::try_arc(EventFd::new(initval as u32 as u64, flags & EFD_SEMAPHORE != 0))?;
     let open = O_RDWR | (flags as u32 & (O_NONBLOCK | O_CLOEXEC));
     install(e.id(), File::EventFd(e.clone()), open)
+}
+
+/// A zeroed buffer of the server's for a copy between files (ENOMEM).
+fn zeroed(len: usize) -> Result<alloc::vec::Vec<u8>, heap::NoMem> {
+    let mut buf = heap::try_vec(len)?;
+    buf.resize(len, 0);
+    Ok(buf)
 }
 
 /// sync(2) of /data: this instance's caches and, at the same time, every

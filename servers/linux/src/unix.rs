@@ -47,8 +47,16 @@
 //! A call on a socket keeps it open while it lasts (it holds a reference
 //! to the description until it returns, Linux's fdget): another thread's
 //! close does not end a blocked receive or accept, as on Linux.
+//!
+//! Memory (`heap`'s rule): what a program makes the server hold is
+//! allocated fallibly before anything changes: a socket (ENOMEM), a name
+//! and its binding (ENOMEM), a message and its place in the queue (ENOBUFS,
+//! as Linux's failed skb), a pending connection (ENOMEM). Options are a
+//! fixed table. Closing and the collector's purge take whole queues
+//! without allocating.
 
 use crate::files;
+use crate::heap::{self, NoMem, TryGrow};
 use crate::namespace::Node;
 use crate::scm::Passed;
 use crate::sync::Mutex;
@@ -75,6 +83,12 @@ pub const EPROTOTYPE: i64 = 91;
 pub const EOPNOTSUPP: i64 = 95;
 pub const ECONNRESET: i64 = 104;
 pub const ENOBUFS: i64 = 105;
+
+/// A send's error: no memory for the data is ENOBUFS (Linux's sock_alloc_send_pskb).
+fn nobufs(e: i64) -> i64 {
+    if e == heap::ENOMEM { ENOBUFS } else { e }
+}
+
 pub const EISCONN: i64 = 106;
 pub const ENOTCONN: i64 = 107;
 pub const ETIMEDOUT: i64 = 110;
@@ -107,6 +121,10 @@ const MAX_DGRAM_QLEN: usize = 10;
 pub const SOMAXCONN: usize = 4096;
 /// The largest piece one stream write queues.
 const MAX_PIECE: usize = 32 * 1024;
+/// The options a socket keeps only for getsockopt (sockcalls': SO_LINGER,
+/// SO_RCVLOWAT, and those kept as plain ints: reuseaddr, dontroute,
+/// broadcast, keepalive, oobinline, priority, timestamp).
+pub const KEPT_OPTS: [u64; 9] = [13, 18, 2, 5, 6, 9, 10, 12, 29];
 
 /// Credentials as SCM_CREDENTIALS and SO_PEERCRED carry them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -147,23 +165,56 @@ pub enum Name {
 
 pub const AF_UNIX: u16 = 1;
 
+/// A sockaddr_un in the caller's stack: a name is at most 108 bytes
+/// (sockcalls' `SOCKADDR_UN_MAX` less the family), with the family and a
+/// NUL at most 111.
+pub struct SockAddr {
+    buf: [u8; 112],
+    len: usize,
+}
+
+impl SockAddr {
+    pub fn bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+
+    fn put(&mut self, b: &[u8]) {
+        // (Longer names are never made: bind and connect read at most 110 bytes.)
+        let n = b.len().min(self.buf.len() - self.len);
+        self.buf[self.len..self.len + n].copy_from_slice(&b[..n]);
+        self.len += n;
+    }
+}
+
 impl Name {
     /// The sockaddr_un of a name (just the family for none), as long as it
     /// is: a path with its NUL, an abstract name without one.
-    pub fn sockaddr(name: Option<&Name>) -> Vec<u8> {
-        let mut out = alloc::vec::Vec::from(AF_UNIX.to_le_bytes());
+    pub fn sockaddr(name: Option<&Name>) -> SockAddr {
+        let mut out = SockAddr { buf: [0; 112], len: 0 };
+        out.put(&AF_UNIX.to_le_bytes());
         match name {
             None => {}
             Some(Name::Path(p)) => {
-                out.extend_from_slice(p);
-                out.push(0);
+                out.put(p);
+                out.put(&[0]);
             }
             Some(Name::Abstract(a)) => {
-                out.push(0);
-                out.extend_from_slice(a);
+                out.put(&[0]);
+                out.put(a);
             }
         }
         out
+    }
+}
+
+impl Key {
+    /// A copy (an abstract name's bytes are the program's choice).
+    pub fn try_clone(&self) -> Result<Key, NoMem> {
+        Ok(match self {
+            Key::Tmp(i) => Key::Tmp(*i),
+            Key::Data(i) => Key::Data(*i),
+            Key::Abstract(a) => Key::Abstract(heap::try_to_vec(a)?),
+        })
     }
 }
 
@@ -280,8 +331,9 @@ struct Inner {
     /// Its last reference is gone.
     dead: bool,
     /// Options kept for getsockopt that change nothing here (SO_LINGER,
-    /// SO_RCVLOWAT, SO_KEEPALIVE, ...).
-    opts: BTreeMap<u64, i32>,
+    /// SO_RCVLOWAT, SO_KEEPALIVE, ...), by their place in `KEPT_OPTS`:
+    /// a fixed table, nothing allocated.
+    opts: [Option<i32>; KEPT_OPTS.len()],
 }
 
 pub struct Sock {
@@ -348,7 +400,9 @@ pub struct RecvOpts {
 /// Installs copies of a peeked message's descriptors, as many as there is
 /// room for (`gc` holds the collector off).
 fn peek_fds(fds: &[Passed], gc: &crate::sync::ReadGuard, o: &RecvOpts) -> Fds {
-    let mut out = Vec::new();
+    // No room for the list: none are installed (MSG_CTRUNC), as when the
+    // table is full.
+    let Ok(mut out) = heap::try_vec(fds.len().min(o.fd_room)) else { return Fds::Installed(Vec::new(), fds.len()) };
     for p in fds.iter().take(o.fd_room) {
         match p.install_copy(gc, o.cloexec) {
             Ok(fd) => out.push(fd),
@@ -476,10 +530,11 @@ impl Source<'_> {
         }
     }
 
-    /// Up to `n` bytes, fewer at a fault (EFAULT if none could be read).
+    /// Up to `n` bytes, fewer at a fault (EFAULT if none could be read;
+    /// ENOMEM if the server has no memory for them: a socket's send answers
+    /// ENOBUFS instead, `nobufs`).
     pub fn take(&mut self, n: usize) -> Result<Vec<u8>, i64> {
-        let mut out = Vec::new();
-        out.try_reserve_exact(n).map_err(|_| ENOBUFS)?;
+        let mut out = heap::try_vec(n)?;
         match self {
             Source::Server { buf, at } => {
                 let n = n.min(buf.len() - *at);
@@ -528,8 +583,11 @@ fn deadline(ns: u64) -> u64 {
 }
 
 impl Sock {
-    pub fn new(ty: u32) -> Arc<Sock> {
-        Arc::new_cyclic(|me| Sock {
+    /// A new socket (ENOMEM: `Arc::new_cyclic` has no fallible form, so the
+    /// heap is preloaded for it).
+    pub fn new(ty: u32) -> Result<Arc<Sock>, NoMem> {
+        heap::preload()?;
+        Ok(Arc::new_cyclic(|me| Sock {
             ty,
             me: me.clone(),
             id: AtomicU64::new(0),
@@ -561,15 +619,15 @@ impl Sock {
                 listen_cred: Cred::NONE,
                 reported: 0,
                 dead: false,
-                opts: BTreeMap::new(),
+                opts: [None; KEPT_OPTS.len()],
             }),
-        })
+        }))
     }
 
     /// Two connected sockets (socketpair), each with the caller's
     /// credentials for the other.
-    pub fn pair(ty: u32) -> (Arc<Sock>, Arc<Sock>) {
-        let (a, b) = (Sock::new(ty), Sock::new(ty));
+    pub fn pair(ty: u32) -> Result<(Arc<Sock>, Arc<Sock>), NoMem> {
+        let (a, b) = (Sock::new(ty)?, Sock::new(ty)?);
         let cred = Cred::current();
         for (me, other) in [(&a, &b), (&b, &a)] {
             let mut i = me.inner.lock();
@@ -577,7 +635,7 @@ impl Sock {
             i.peercred = Some(cred);
             me.set_peer(&mut i, Some(other.clone()));
         }
-        (a, b)
+        Ok((a, b))
     }
 
     pub fn id(&self) -> u64 {
@@ -603,11 +661,10 @@ impl Sock {
         self.peer_addr.load(Ordering::Acquire) != sender as *const Sock as usize && self.qlen.load(Ordering::Acquire) > MAX_DGRAM_QLEN
     }
 
-    fn add_waiter(&self, w: Weak<Sock>) {
+    /// Whether `w` is on the list now (false: no memory for it).
+    fn add_waiter(&self, w: Weak<Sock>) -> bool {
         let mut ws = self.waiters.lock();
-        if !ws.iter().any(|x| x.ptr_eq(&w)) {
-            ws.push(w);
-        }
+        ws.iter().any(|x| x.ptr_eq(&w)) || ws.try_push(w).is_ok()
     }
 
     /// Room in the queue, or the socket gone: the senders held back may
@@ -644,9 +701,10 @@ impl Sock {
             let mut writable = self.writable();
             if writable {
                 if let Some(p) = &i.peer {
-                    if p.holds_back(self) {
+                    // Not on the peer's list (no memory), nothing would
+                    // wake it: writable then, a send says EAGAIN.
+                    if p.holds_back(self) && p.add_waiter(self.me.clone()) {
                         writable = false;
-                        p.add_waiter(self.me.clone());
                     }
                 }
             }
@@ -746,12 +804,28 @@ impl Sock {
         Ok(())
     }
 
-    /// Ends a bind: `name` at `key` (EADDRINUSE if the key is bound), or,
-    /// with `None`, nothing (it failed).
-    pub fn end_bind(&self, bound: Option<(Name, Key, Option<Node>)>) -> Result<(), i64> {
+    /// A name to bind, with the heap preloaded for its binding: made before
+    /// a path's socket inode, so that nothing after it needs memory.
+    pub fn bind_name(name: Name) -> Result<Arc<Name>, NoMem> {
+        heap::preload()?;
+        heap::try_arc(name)
+    }
+
+    /// Ends a bind: `name` (`bind_name`'s) at `key` (EADDRINUSE if the key
+    /// is bound, ENOMEM without memory for an abstract key's copy: unbound
+    /// either way), or, with `None`, nothing (it failed).
+    pub fn end_bind(&self, bound: Option<(Arc<Name>, Key, Option<Node>)>) -> Result<(), i64> {
         let Some((name, key, node)) = bound else {
             self.inner.lock().binding = false;
             return Ok(());
+        };
+        // (A path's key is two numbers: nothing to allocate.)
+        let map_key = match matches!(key, Key::Abstract(_)).then(heap::preload).transpose().and_then(|_| key.try_clone()) {
+            Ok(k) => k,
+            Err(NoMem) => {
+                self.inner.lock().binding = false;
+                return Err(heap::ENOMEM);
+            }
         };
         {
             let mut b = BINDINGS.lock();
@@ -760,11 +834,11 @@ impl Sock {
                 self.inner.lock().binding = false;
                 return Err(EADDRINUSE);
             }
-            b.insert(key.clone(), self.me.clone());
+            b.insert(map_key, self.me.clone());
         }
         let mut i = self.inner.lock();
         i.binding = false;
-        i.name = Some(Arc::new(name));
+        i.name = Some(name);
         i.bound = Some(Binding { key, _node: node });
         Ok(())
     }
@@ -782,11 +856,16 @@ impl Sock {
         }
         for _ in 0..0x10_0000 {
             let n = NEXT.fetch_add(1, Ordering::Relaxed) & 0xf_ffff;
-            let mut text = Vec::with_capacity(5);
-            for shift in (0..5).rev() {
-                text.push(b"0123456789abcdef"[(n >> (shift * 4)) as usize & 0xf]);
+            let mut text = [0u8; 5];
+            for (k, shift) in (0..5).rev().enumerate() {
+                text[k] = b"0123456789abcdef"[(n >> (shift * 4)) as usize & 0xf];
             }
-            match self.end_bind(Some((Name::Abstract(text.clone()), Key::Abstract(text), None))) {
+            let named = heap::try_to_vec(&text).and_then(|t| Ok((Sock::bind_name(Name::Abstract(t))?, Key::Abstract(heap::try_to_vec(&text)?))));
+            let Ok((name, key)) = named else {
+                self.end_bind(None)?;
+                return Err(heap::ENOMEM);
+            };
+            match self.end_bind(Some((name, key, None))) {
                 Err(EADDRINUSE) => {
                     self.begin_bind()?;
                 }
@@ -858,7 +937,7 @@ impl Sock {
             return Err(EPROTOTYPE);
         }
         // The server's end, with the client's credentials.
-        let embryo = Sock::new(self.ty);
+        let embryo = Sock::new(self.ty)?;
         let listen_cred = loop {
             let mut t = target.inner.lock();
             if t.dead || t.state != State::Listening {
@@ -873,6 +952,8 @@ impl Sock {
                 target.wait(seen, deadline)?;
                 continue;
             }
+            // Its place in the queue before anything refers to it.
+            t.pending.try_grow(1)?;
             {
                 let mut e = embryo.inner.lock();
                 e.state = State::Connected;
@@ -929,7 +1010,9 @@ impl Sock {
     /// Puts back a connection accept() could not give a descriptor.
     pub fn unaccept(&self, e: Arc<Sock>) {
         let mut i = self.inner.lock();
-        if i.state == State::Listening && !i.dead {
+        // (Without room, as when the listener is gone: the client sees the
+        // connection reset.)
+        if i.state == State::Listening && !i.dead && i.pending.try_grow(1).is_ok() {
             i.pending.push_front(e);
             self.changed(&mut i, true);
             return;
@@ -1006,10 +1089,11 @@ impl Sock {
             }
             i.dead = true;
             i.shut = RCV | SEND;
-            let msgs: Vec<Msg> = i.queue.drain(..).collect();
+            // (Whole queues taken: closing allocates nothing.)
+            let msgs = core::mem::take(&mut i.queue);
             i.bytes = 0;
             self.qlen.store(0, Ordering::Release);
-            let pending: Vec<Arc<Sock>> = i.pending.drain(..).collect();
+            let pending = core::mem::take(&mut i.pending);
             let peer = i.peer.take();
             self.peer_addr.store(0, Ordering::Release);
             let bound = i.bound.take();
@@ -1041,34 +1125,44 @@ impl Sock {
 
     /// Takes every message out of its queues (its own and, a listener's,
     /// those of its unaccepted connections): the collector found it
-    /// unreachable. The caller drops them once it holds no lock.
-    pub fn purge(&self) -> Vec<Msg> {
-        let (mut msgs, pending) = {
+    /// unreachable. The caller drops them once it holds no lock. Its queue
+    /// goes to `out` whole; without memory for the list (or for its
+    /// unaccepted connections') what is not taken stays, for a later
+    /// collection (each queue is taken whole or not at all).
+    pub fn purge(&self, out: &mut Vec<VecDeque<Msg>>) -> Result<(), NoMem> {
+        let pending = {
+            out.try_grow(1)?;
             let mut i = self.inner.lock();
-            let msgs: Vec<Msg> = i.queue.drain(..).collect();
+            let mut pending = heap::try_vec(i.pending.len())?;
+            out.push(core::mem::take(&mut i.queue));
             i.bytes = 0;
             self.qlen.store(0, Ordering::Release);
             self.changed(&mut i, false);
-            (msgs, i.pending.iter().cloned().collect::<Vec<_>>())
+            pending.extend(i.pending.iter().cloned());
+            pending
         };
         for e in pending {
-            msgs.extend(e.purge());
+            e.purge(out)?;
         }
-        msgs
+        Ok(())
     }
 
-    /// The ids of the server's sockets the descriptors in its queues (and
-    /// those of its unaccepted connections) name.
-    pub fn passed_sockets(&self) -> Vec<u64> {
-        let (mut out, pending) = {
+    /// Appends to `out` the ids of the server's sockets the descriptors in
+    /// its queues (and those of its unaccepted connections) name.
+    pub fn passed_sockets(&self, out: &mut Vec<u64>) -> Result<(), NoMem> {
+        let pending = {
             let i = self.inner.lock();
-            let out: Vec<u64> = i.queue.iter().flat_map(|m| m.fds.iter()).filter_map(|p| p.sock().map(|s| s.id())).collect();
-            (out, i.pending.iter().cloned().collect::<Vec<_>>())
+            for id in i.queue.iter().flat_map(|m| m.fds.iter()).filter_map(|p| p.sock().map(|s| s.id())) {
+                out.try_push(id)?;
+            }
+            let mut pending = heap::try_vec(i.pending.len())?;
+            pending.extend(i.pending.iter().cloned());
+            pending
         };
         for e in pending {
-            out.extend(e.passed_sockets());
+            e.passed_sockets(out)?;
         }
-        out
+        Ok(())
     }
 
     // Sending and receiving.
@@ -1125,19 +1219,24 @@ impl Sock {
             }
             let data = match src.take(src.left().min(piece_max)) {
                 Ok(d) => d,
-                Err(e) => return if sent > 0 { Ok(sent) } else { Err(e) },
+                Err(e) => return if sent > 0 { Ok(sent) } else { Err(nobufs(e)) },
             };
             let n = data.len();
             if n == 0 {
                 break;
             }
+            let Ok(data) = heap::try_arc(data) else {
+                return if sent > 0 { Ok(sent) } else { Err(ENOBUFS) };
+            };
             let charge = n + OVERHEAD;
             self.charge(charge, sndbuf);
-            let msg = Msg { id: NEXT_MSG.fetch_add(1, Ordering::Relaxed), data: Arc::new(data), off: 0, fds: core::mem::take(&mut fds), cred, from: name.clone(), sender: self.clone(), charge };
+            let msg = Msg { id: NEXT_MSG.fetch_add(1, Ordering::Relaxed), data, off: 0, fds: core::mem::take(&mut fds), cred, from: name.clone(), sender: self.clone(), charge };
             let refused = {
                 let mut p = peer.inner.lock();
                 if p.dead || p.shut & RCV != 0 {
-                    Some(msg)
+                    Some((msg, EPIPE))
+                } else if p.queue.try_grow(1).is_err() {
+                    Some((msg, ENOBUFS))
                 } else {
                     p.bytes += n;
                     p.queue.push_back(msg);
@@ -1146,9 +1245,10 @@ impl Sock {
                     None
                 }
             };
-            if let Some(msg) = refused {
+            if let Some((msg, e)) = refused {
+                // (Its descriptors go back with it: the caller still has them.)
                 drop(msg);
-                return if sent > 0 { Ok(sent) } else { Err(EPIPE) };
+                return if sent > 0 { Ok(sent) } else { Err(e) };
             }
             sent += n;
         }
@@ -1186,12 +1286,13 @@ impl Sock {
         }
         let deadline = deadline(timeout);
         self.wait_room(nonblock, deadline)?;
-        let data = if len == 0 { Vec::new() } else { src.take(len)? };
+        let data = if len == 0 { Vec::new() } else { src.take(len).map_err(nobufs)? };
         let n = data.len();
+        let data = heap::try_arc(data).map_err(|_| ENOBUFS)?;
         let charge = n + OVERHEAD;
         self.charge(charge, sndbuf);
         let name = self.name();
-        let mut msg = Some(Msg { id: NEXT_MSG.fetch_add(1, Ordering::Relaxed), data: Arc::new(data), off: 0, fds, cred, from: name, sender: self.clone(), charge });
+        let mut msg = Some(Msg { id: NEXT_MSG.fetch_add(1, Ordering::Relaxed), data, off: 0, fds, cred, from: name, sender: self.clone(), charge });
         loop {
             let seen;
             {
@@ -1202,6 +1303,8 @@ impl Sock {
                     Some(EPERM)
                 } else if t.shut & RCV != 0 {
                     Some(EPIPE)
+                } else if t.queue.try_grow(1).is_err() {
+                    Some(ENOBUFS)
                 } else {
                     None
                 };
@@ -1220,7 +1323,9 @@ impl Sock {
                 }
                 if self.ty == DGRAM && target.holds_back(self) {
                     seen = target.seq.load(Ordering::Acquire);
-                    target.add_waiter(self.me.clone());
+                    // (Off the list without memory: its poll then says
+                    // writable; a blocked send waits on the sequence word.)
+                    let _ = target.add_waiter(self.me.clone());
                 } else {
                     t.bytes += n;
                     t.queue.push_back(msg.take().expect("sent once"));
@@ -1314,6 +1419,14 @@ impl Sock {
                     continue;
                 }
             };
+            // Room to keep the piece once it is read (dropped after the
+            // locks), before anything is taken.
+            if gone.try_grow(1).is_err() {
+                if out.copied == 0 {
+                    result = Err(heap::ENOMEM);
+                }
+                break;
+            }
             // The copy, with no lock held: a fault may wait for the pager.
             let n = match dst.put(&plan.data[plan.off..]) {
                 Ok(n) => n,
@@ -1350,6 +1463,7 @@ impl Sock {
                     let done = m.left() == 0;
                     i.bytes -= n;
                     if done {
+                        // (Within the room made above.)
                         gone.extend(i.queue.pop_front());
                     }
                     self.qlen.store(i.queue.len(), Ordering::Release);
@@ -1513,12 +1627,17 @@ impl Sock {
         (i.rcvtimeo, i.sndtimeo)
     }
 
+    /// A kept option's value (one of `KEPT_OPTS`), if it was set.
     pub fn opt(&self, name: u64) -> Option<i32> {
-        self.inner.lock().opts.get(&name).copied()
+        let k = KEPT_OPTS.iter().position(|&n| n == name)?;
+        self.inner.lock().opts[k]
     }
 
+    /// Keeps an option's value (one of `KEPT_OPTS`; another is not kept).
     pub fn set_opt(&self, name: u64, value: i32) {
-        self.inner.lock().opts.insert(name, value);
+        if let Some(k) = KEPT_OPTS.iter().position(|&n| n == name) {
+            self.inner.lock().opts[k] = Some(value);
+        }
     }
 
     pub fn set_timeout(&self, send: bool, ns: u64) {

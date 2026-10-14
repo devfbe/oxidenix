@@ -31,6 +31,7 @@
 //! readable to its pollers (`event`). No lock is held while program memory is copied.
 
 use crate::devices::{checked_iovecs, one_buffer};
+use crate::heap::{try_arc, try_vec, TryGrow};
 use crate::files::{self, File, EINVAL, ESPIPE, ENOTTY, O_ACCMODE, O_CLOEXEC, O_NONBLOCK, O_WRONLY, POLLERR, POLLIN, POLLNVAL, POLLRDNORM};
 use crate::namespace::Origin;
 use crate::signal::ERESTARTSYS;
@@ -98,9 +99,8 @@ fn window() -> Result<(u64, u64), i64> {
 /// Calls `each` with the records from `from` on, oldest first, until it returns false or
 /// the newest is passed; the window as it was at the last read.
 fn records(from: u64, mut each: impl FnMut(&Record) -> bool) -> Result<(u64, u64), i64> {
-    let mut buf = Vec::new();
-    buf.try_reserve_exact(KLOG_READ_MAX as usize).map_err(|_| ENOMEM)?;
-    buf.resize(KLOG_READ_MAX as usize, 0u8);
+    let mut buf: Vec<u8> = try_vec(KLOG_READ_MAX as usize)?;
+    buf.resize(KLOG_READ_MAX as usize, 0);
     let mut seq = from;
     loop {
         let mut out = [0u64; 2];
@@ -139,8 +139,8 @@ fn kmsg_line(seq: u64) -> Result<(Option<Vec<u8>>, u64), i64> {
     let head: KlogRecord = unsafe { core::ptr::read_unaligned(buf.as_ptr() as *const KlogRecord) };
     let start = core::mem::size_of::<KlogRecord>();
     let text = &buf[start..start + head.len as usize];
-    let mut line = Vec::new();
-    line.try_reserve(32 + 4 * text.len()).map_err(|_| ENOMEM)?;
+    // (Room for all of it: the header's three numbers, each byte escaped, the newline.)
+    let mut line = try_vec(64 + 4 * text.len())?;
     let _ = write!(Bytes(&mut line), "{},{},{},-;", head.prio, head.seq, head.ts_ns / 1000);
     for &b in text {
         if b < b' ' || b >= 0x7f || b == b'\\' {
@@ -153,7 +153,7 @@ fn kmsg_line(seq: u64) -> Result<(Option<Vec<u8>>, u64), i64> {
     Ok((Some(line), head.seq))
 }
 
-/// `fmt::Write` into a byte vector.
+/// `fmt::Write` into a byte vector (whose room the caller made).
 struct Bytes<'a>(&'a mut Vec<u8>);
 
 impl Write for Bytes<'_> {
@@ -163,7 +163,8 @@ impl Write for Bytes<'_> {
     }
 }
 
-/// A record as syslog's lines: `<prio>[seconds.micros] ` before each of its lines.
+/// A record as syslog's lines: `<prio>[seconds.micros] ` before each of its lines (`out`
+/// has room for `syslog_len(r)` more).
 fn syslog_text(r: &Record, out: &mut Vec<u8>) {
     let (secs, micros) = (r.ts_ns / 1_000_000_000, r.ts_ns % 1_000_000_000 / 1000);
     for line in r.text.split(|&b| b == b'\n') {
@@ -175,9 +176,18 @@ fn syslog_text(r: &Record, out: &mut Vec<u8>) {
 
 /// The length of `syslog_text` of `r`.
 fn syslog_len(r: &Record) -> usize {
-    let mut v = Vec::new();
-    syslog_text(r, &mut v);
-    v.len()
+    let digits = |mut n: u64| {
+        let mut d = 1;
+        while n >= 10 {
+            n /= 10;
+            d += 1;
+        }
+        d
+    };
+    // "<prio>" "[" seconds (at least 5 wide) "." micros "] " ... "\n", per line.
+    let prefix = digits(r.prio as u64) + 2 + 1 + digits(r.ts_ns / 1_000_000_000).max(5) + 1 + 6 + 2;
+    let lines = r.text.iter().filter(|&&b| b == b'\n').count() + 1;
+    lines * (prefix + 1) + r.text.len() - (lines - 1)
 }
 
 /// Sleeps until the log may have a record of sequence `seq` or later (at once if it
@@ -199,8 +209,8 @@ pub fn event() {
     SEQ.fetch_add(1, Ordering::Release);
     let word = &SEQ as *const AtomicU32 as u64;
     syscall(SYS_SERVER_FUTEX_WAKE, [word, i32::MAX as u64, 0, 0, 0, 0]);
-    let ids: Vec<u64> = OPENS.lock().iter().map(|&(id, _)| id).collect();
-    for id in ids {
+    // (Under the list's lock: nothing to allocate; a report takes no lock of this module's.)
+    for &(id, _) in OPENS.lock().iter() {
         files::ready(id, POLLIN | POLLRDNORM);
     }
 }
@@ -234,7 +244,7 @@ pub fn syslog(action: u64, buf: u64, len: u64) -> Result<i64, i64> {
             let mut ends: Vec<usize> = Vec::new();
             let mut failed = false;
             let (_, next) = records(from, |r| {
-                if text.try_reserve(syslog_len(r)).is_err() || ends.try_reserve(1).is_err() {
+                if text.try_grow(syslog_len(r)).is_err() || ends.try_grow(1).is_err() {
                     failed = true;
                     return false;
                 }
@@ -288,19 +298,17 @@ fn syslog_read(buf: u64, len: usize) -> Result<i64, i64> {
         let out = {
             let mut s = SYSLOG.lock();
             let (seq, partial) = (s.seq, s.partial);
-            let mut out = Vec::new();
             // (The log's text as lines is at most a few times its size.)
-            out.try_reserve(len.min(4 * KLOG_BYTES as usize)).map_err(|_| ENOMEM)?;
             let len = len.min(4 * KLOG_BYTES as usize);
+            let mut out: Vec<u8> = try_vec(len)?;
             let mut position = (seq, partial);
             let mut failed = false;
             let (first, _) = records(seq, |r| {
                 let skip = if r.seq == seq { partial } else { 0 };
-                let mut text = Vec::new();
-                if text.try_reserve(syslog_len(r)).is_err() {
+                let Ok(mut text) = try_vec(syslog_len(r)) else {
                     failed = true;
                     return false;
-                }
+                };
                 syslog_text(r, &mut text);
                 let rest = &text[skip.min(text.len())..];
                 let n = rest.len().min(len - out.len());
@@ -351,12 +359,8 @@ pub fn open(flags: u32, origin: Origin) -> Result<i64, i64> {
     // check at open); a write-only open does not.
     let readable = kept & O_ACCMODE != O_WRONLY;
     let first = if readable { window()?.0 } else { 0 };
-    let k = Arc::new(KmsgOpen { id: files::new_id(), origin, seq: Mutex::new(first), readable });
-    {
-        let mut opens = OPENS.lock();
-        opens.try_reserve(1).map_err(|_| ENOMEM)?;
-        opens.push((k.id, Arc::downgrade(&k)));
-    }
+    let k = try_arc(KmsgOpen { id: files::new_id(), origin, seq: Mutex::new(first), readable })?;
+    OPENS.lock().try_push((k.id, Arc::downgrade(&k)))?;
     files::install(k.id, File::Kmsg(k.clone()), kept)
 }
 

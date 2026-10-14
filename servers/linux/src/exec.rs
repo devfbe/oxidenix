@@ -22,6 +22,7 @@
 //! (`SYS_STACK_LIMIT`, set by `ids` whenever it changes).
 
 use crate::fdtable;
+use crate::heap::{self, TryExtend, TryGrow};
 use crate::local;
 use crate::process::{self, PROCS};
 use crate::signal;
@@ -187,13 +188,12 @@ impl Elf {
             return Err(ENOEXEC);
         }
         let table_end = phoff.checked_add(phentsize as u64 * phnum as u64).filter(|&e| e <= MAX_HEADERS).ok_or(ENOEXEC)?;
-        let mut table = Vec::new();
-        table.try_reserve_exact(table_end as usize).map_err(|_| ENOMEM)?;
+        let mut table = heap::try_vec(table_end as usize)?;
         table.resize(table_end as usize, 0);
         if file.read(0, &mut table)? < table.len() {
             return Err(ENOEXEC);
         }
-        let mut segments = Vec::new();
+        let mut segments = heap::try_vec(phnum as usize)?;
         let mut interp = None;
         for i in 0..phnum as usize {
             let o = phoff as usize + i * phentsize as usize;
@@ -217,7 +217,8 @@ impl Elf {
                 if seg.filesz == 0 || seg.filesz > 4096 || interp.is_some() {
                     return Err(ENOEXEC);
                 }
-                let mut name = vec![0u8; seg.filesz as usize];
+                let mut name = heap::try_vec(seg.filesz as usize)?;
+                name.resize(seg.filesz as usize, 0u8);
                 if file.read(seg.offset, &mut name)? < name.len() {
                     return Err(ENOEXEC);
                 }
@@ -227,6 +228,7 @@ impl Elf {
                 }
                 interp = Some(String::from_utf8(name).map_err(|_| ENOEXEC)?);
             }
+            // (Room made for all of them above.)
             segments.push(seg);
         }
         if !segments.iter().any(|s| s.kind == PT_LOAD) {
@@ -337,7 +339,7 @@ impl Strings {
             return Err(ENOMEM);
         }
         let len = self.bytes.len();
-        if self.bytes.try_reserve_exact(new_cap - len).is_err() {
+        if heap::fallible(|| self.bytes.try_reserve_exact(new_cap - len)).is_err() {
             // Nothing taken: nothing charged.
             EXEC_STRINGS_INSTANCE.fetch_sub(more, Ordering::Relaxed);
             self.account.fetch_sub(more, Ordering::Relaxed);
@@ -390,6 +392,8 @@ struct Prepared {
     /// (/proc's exe).
     filename: String,
     exe: String,
+    /// /proc's command line (`Proc::cmdline`), made before the point of no return.
+    cmdline: Vec<u8>,
     /// The room kept for its stack (`stack_ceiling`).
     stack: u64,
 }
@@ -403,10 +407,10 @@ fn read_string(addr: u64, max: usize) -> Result<Vec<u8>, i64> {
         let n = chunk.len().min(4096 - (at % 4096) as usize);
         usercopy::from_program(at, &mut chunk[..n])?;
         if let Some(end) = chunk[..n].iter().position(|&b| b == 0) {
-            out.extend_from_slice(&chunk[..end]);
+            out.try_extend(&chunk[..end])?;
             return Ok(out);
         }
-        out.extend_from_slice(&chunk[..n]);
+        out.try_extend(&chunk[..n])?;
         if out.len() >= max {
             return Err(E2BIG);
         }
@@ -484,11 +488,26 @@ fn execveat(s: &mut State, dirfd: u64, path: u64, argv: u64, envp: u64, flags: u
         let base = crate::paths::base_dir_of(dirfd, &filename)?;
         open(&base, &filename, flags & AT_SYMLINK_NOFOLLOW == 0)?
     };
-    let shown = if filename.is_empty() { exe.clone() } else { filename };
+    let shown = if filename.is_empty() { heap::try_string(&exe)? } else { filename };
     let prepared = prepare(file, exe, shown, args, envs, stack_ceiling(stack), 0)?;
+    // What the point of no return will need of the heap, before it (`preload`): an own copy
+    // of shared signal actions (`finish`), and a thread that is not the main one moves its
+    // record to the process's id (`de_thread`).
+    let (tid, pid) = process::me();
+    let shared = {
+        let t = PROCS.lock();
+        t.procs.get(&pid).is_some_and(|p| t.hands.get(&p.sig.hand).is_some_and(|h| h.refs > 1))
+    };
+    let hand = if shared { crate::heap::map_insert_bytes::<u64, signal::Hand>() } else { 0 };
+    let thread = if tid != pid { crate::heap::map_insert_bytes::<process::Pid, process::Thread>() } else { 0 };
+    if hand + thread > 0 {
+        crate::heap::preload_bytes(hand + thread)?;
+    }
+    // And the memory of the new program's descriptor table.
+    let files = fdtable::current().copy_room()?;
     // Past the point of no return a failure ends the process; it does so once this call
     // returned and let go of everything (`local::exit_pending`, carried out by `serve`).
-    if let Err(status) = run(s, prepared) {
+    if let Err(status) = run(s, prepared, files) {
         local::exit_pending(status);
     }
     Ok(0)
@@ -498,9 +517,10 @@ fn execveat(s: &mut State, dirfd: u64, path: u64, argv: u64, envp: u64, flags: u
 /// followed), until an ELF image with its interpreter is ready.
 fn prepare(file: File, exe: String, filename: String, args: Strings, envs: Strings, stack: u64, depth: u32) -> Result<Prepared, i64> {
     let size = file.size()?;
-    let mut head = vec![0u8; size.min(256) as usize];
-    let n = file.read(0, &mut head)?;
-    head.truncate(n);
+    // (On the stack: the first bytes, a `#!` line's at most.)
+    let mut head = [0u8; 256];
+    let n = file.read(0, &mut head[..size.min(256) as usize])?;
+    let head = &mut head[..n.min(256)];
     if head.starts_with(b"#!") {
         if depth >= MAX_SCRIPT_DEPTH {
             return Err(ELOOP);
@@ -508,20 +528,22 @@ fn prepare(file: File, exe: String, filename: String, args: Strings, envs: Strin
         // binfmt_script: the interpreter and one optional argument, then the script's path,
         // then the arguments after the first.
         let line_end = head.iter().position(|&b| b == b'\n').unwrap_or(head.len());
-        let line = &head[2..line_end];
-        let line: Vec<u8> = line.iter().copied().map(|b| if b == b'\t' { b' ' } else { b }).collect();
-        let trimmed = trim(&line);
+        let line = &mut head[2..line_end];
+        for b in line.iter_mut().filter(|b| **b == b'\t') {
+            *b = b' ';
+        }
+        let trimmed = trim(line);
         if trimmed.is_empty() {
             return Err(ENOEXEC);
         }
         let (interp, arg) = match trimmed.iter().position(|&b| b == b' ') {
-            Some(at) => (trimmed[..at].to_vec(), Some(trim(&trimmed[at..]).to_vec())),
-            None => (trimmed.to_vec(), None),
+            Some(at) => (&trimmed[..at], Some(trim(&trimmed[at..]))),
+            None => (trimmed, None),
         };
         let mut new_args = Strings::new(&args.account, args.limit);
-        new_args.push(&interp)?;
+        new_args.push(interp)?;
         if let Some(a) = arg.filter(|a| !a.is_empty()) {
-            new_args.push(&a)?;
+            new_args.push(a)?;
         }
         new_args.push(filename.as_bytes())?;
         for a in args.iter().skip(1) {
@@ -529,25 +551,23 @@ fn prepare(file: File, exe: String, filename: String, args: Strings, envs: Strin
         }
         drop(args);
         drop(file);
-        let interp = String::from_utf8(interp).map_err(|_| ENOEXEC)?;
-        let cwd = crate::records::current().state.lock().cwd.clone();
-        let (ifile, iexe) = open(&cwd, &interp, true)?;
+        let interp = core::str::from_utf8(interp).map_err(|_| ENOEXEC)?;
+        let cwd = cwd()?;
+        let (ifile, iexe) = open(&cwd, interp, true)?;
         // (AT_EXECFN and the name stay the script's, as Linux's bprm->filename.)
         return prepare(ifile, iexe, filename, new_args, envs, stack, depth + 1);
     }
-    let elf = Elf::load(&file, &head)?;
+    let elf = Elf::load(&file, head)?;
     // (The image ends below the stack's room, and below the stack it starts with.)
     let stack = stack.max(stack_need(&args, &envs, &filename));
     elf.bias(stack)?;
     let interp = match &elf.interp {
         Some(name) => {
-            let cwd = crate::records::current().state.lock().cwd.clone();
-            let (ifile, _) = open(&cwd, name, true)?;
+            let (ifile, _) = open(&cwd()?, name, true)?;
             let size = ifile.size()?;
-            let mut ihead = vec![0u8; size.min(256) as usize];
-            let n = ifile.read(0, &mut ihead)?;
-            ihead.truncate(n);
-            let ielf = Elf::load(&ifile, &ihead)?;
+            let mut ihead = [0u8; 256];
+            let n = ifile.read(0, &mut ihead[..size.min(256) as usize])?;
+            let ielf = Elf::load(&ifile, &ihead[..n.min(256)])?;
             // An interpreter has none of its own, and goes wherever there is room: it must
             // be position-independent.
             if ielf.interp.is_some() {
@@ -560,7 +580,32 @@ fn prepare(file: File, exe: String, filename: String, args: Strings, envs: Strin
         }
         None => None,
     };
-    Ok(Prepared { file, elf, interp, args, envs, filename, exe, stack })
+    // /proc's command line (the arguments, as far as 4 KiB holds whole ones), made now: past
+    // the point of no return nothing may fail.
+    let mut cmdline = Vec::new();
+    let mut len = 0;
+    for a in args.iter() {
+        if len + a.len() + 1 > 4096 {
+            break;
+        }
+        len += a.len() + 1;
+    }
+    cmdline.try_grow(len)?;
+    for a in args.iter() {
+        if cmdline.len() + a.len() + 1 > len {
+            break;
+        }
+        cmdline.extend_from_slice(a);
+        cmdline.push(0);
+    }
+    Ok(Prepared { file, elf, interp, args, envs, filename, exe, cmdline, stack })
+}
+
+/// A copy of the calling thread's working directory (ENOMEM without room).
+fn cwd() -> Result<String, i64> {
+    let fs = crate::records::current();
+    let state = fs.state.lock();
+    Ok(heap::try_string(&state.cwd)?)
 }
 
 fn trim(s: &[u8]) -> &[u8] {
@@ -573,17 +618,17 @@ fn trim(s: &[u8]) -> &[u8] {
 /// the program is mapped and started. A failure from here on ends the process: the status
 /// it ends with (SIGKILL if it was killed meanwhile, else SIGSEGV), for the caller to carry
 /// out once everything here is let go of.
-fn run(s: &mut State, p: Prepared) -> Result<(), i32> {
+fn run(s: &mut State, mut p: Prepared, files: fdtable::CopyRoom) -> Result<(), i32> {
     if de_thread().is_err() {
         // Killed meanwhile: the process ends anyway.
         return Err(signal::SIGKILL as i32);
     }
     // The new program's descriptor table: the old one's descriptors without the close-on-exec
-    // ones (Linux's unshare_files and do_close_on_exec). The old table goes now: its
-    // close-on-exec descriptors close before the new program runs (if no other process
-    // shares it).
+    // ones (Linux's unshare_files and do_close_on_exec), in memory had before. The old table
+    // goes now: its close-on-exec descriptors close before the new program runs (if no
+    // other process shares it).
     let old = fdtable::current();
-    let new = old.for_exec();
+    let new = old.for_exec_in(files);
     drop(old);
     match new {
         Ok(files) => drop(process::set_files(files)),
@@ -596,7 +641,7 @@ fn run(s: &mut State, p: Prepared) -> Result<(), i32> {
         return Err(signal::SIGSEGV as i32);
     }
     let (entry, sp, brk) = load(&p).map_err(|_| signal::SIGSEGV as i32)?;
-    finish(&p, comm, brk);
+    finish(&mut p, comm, brk);
     *s = State { rip: entry, rsp: sp, rflags: 0x202, ..State::default() };
     Ok(())
 }
@@ -613,9 +658,13 @@ fn de_thread() -> Result<(), i64> {
         }
         p.execing = true;
         let words = p.words.clone();
-        let others: Vec<process::Pid> = p.threads.iter().copied().filter(|&x| x != tid).collect();
-        for other in others {
-            t.kill_thread(other);
+        // (By index: nothing allocates past the point of no return.)
+        let n = p.threads.len();
+        for i in 0..n {
+            let other = t.procs[&pid].threads[i];
+            if other != tid {
+                t.kill_thread(other);
+            }
         }
         words
     };
@@ -636,7 +685,9 @@ fn de_thread() -> Result<(), i64> {
                     t.threads.insert(pid, th);
                     t.keys.insert(key, pid);
                     let p = t.procs.get_mut(&pid).expect("checked");
-                    p.threads = vec![pid];
+                    // (In place: its one entry's room is there.)
+                    p.threads.clear();
+                    p.threads.push(pid);
                     let l = local::get();
                     l.tid.store(pid, core::sync::atomic::Ordering::Relaxed);
                 }
@@ -864,18 +915,13 @@ fn syscall_ok(nr: u64, a: [u64; 6]) -> Result<i64, i64> {
 }
 
 /// After the program is in place: the process's records (name, command line, break, its
-/// signal actions reset, the vfork parent let go).
-fn finish(p: &Prepared, comm: [u8; 16], brk: u64) {
+/// signal actions reset, the vfork parent let go). Nothing here allocates but an own copy of
+/// shared actions, whose room `execveat` made (`preload`) before the point of no return.
+fn finish(p: &mut Prepared, comm: [u8; 16], brk: u64) {
     let (tid, pid) = process::me();
     syscall(SYS_VM_FLOOR, [brk, 0, 0, 0, 0, 0]);
-    let mut cmdline = Vec::new();
-    for a in p.args.iter() {
-        if cmdline.len() + a.len() + 1 > 4096 {
-            break;
-        }
-        cmdline.extend_from_slice(a);
-        cmdline.push(0);
-    }
+    let cmdline = core::mem::take(&mut p.cmdline);
+    let exe = core::mem::take(&mut p.exe);
     let mut t = PROCS.lock();
     if let Some(th) = t.threads.get_mut(&tid) {
         th.comm = comm;
@@ -903,7 +949,7 @@ fn finish(p: &Prepared, comm: [u8; 16], brk: u64) {
         proc.did_exec = true;
         proc.dumpable = true;
         proc.cmdline = cmdline;
-        proc.exe = p.exe.clone();
+        proc.exe = exe;
         *proc.brk.lock() = process::Brk { start: brk, end: brk, limit: (STACK_TOP - p.stack).saturating_sub(STACK_GUARD_GAP) };
         // A vfork parent goes on: the child no longer uses its memory.
         core::mem::replace(&mut proc.vfork, false).then(|| proc.words.clone())
@@ -941,10 +987,12 @@ pub fn init(s: &mut State) {
         }
         Ok((args, envs))
     };
-    let result = strings().and_then(|(args, envs)| open("/", &path, true).and_then(|(file, exe)| prepare(file, exe, path.clone(), args, envs, stack_ceiling(crate::ids::soft(crate::ids::RLIMIT_STACK)), 0)));
+    let result = strings()
+        .and_then(|(args, envs)| open("/", &path, true).and_then(|(file, exe)| prepare(file, exe, path.clone(), args, envs, stack_ceiling(crate::ids::soft(crate::ids::RLIMIT_STACK)), 0)))
+        .and_then(|prepared| Ok((prepared, fdtable::current().copy_room()?)));
     drop(buf);
     let status = match result {
-        Ok(prepared) => match run(s, prepared) {
+        Ok((prepared, files)) => match run(s, prepared, files) {
             Ok(()) => return,
             Err(status) => status,
         },

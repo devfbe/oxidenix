@@ -44,7 +44,8 @@ pub fn tty() -> Option<Arc<Tty>> {
         return None;
     }
     let winsize = [size[1].min(u16::MAX as u64) as u16, size[0].min(u16::MAX as u64) as u16, 0, 0];
-    let t = Tty::new(Driver::Console, termios(), winsize, None);
+    // (Without memory: not yet, ENXIO for this open; the next one tries again.)
+    let t = Tty::new(Driver::Console, termios(), winsize, None).ok()?;
     *console = Some(t.clone());
     Some(t)
 }

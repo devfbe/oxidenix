@@ -15,7 +15,8 @@ use crate::datafile;
 use crate::datafs;
 use crate::files;
 use crate::inotify;
-use crate::namespace::{check, mode_of, resolve, resolve_parent, Node, Origin, Resolved, EBUSY, ENOENT, ENOTDIR, EXDEV};
+use crate::heap::{try_string, TryGrow};
+use crate::namespace::{check, join, mode_of, normalize, resolve, resolve_parent, Node, Origin, Resolved, EBUSY, ENOENT, ENOTDIR, EXDEV};
 use crate::records;
 use crate::syscall;
 use crate::tmpfile;
@@ -23,7 +24,6 @@ use crate::tmpfs;
 use crate::usercopy::{self, read_cstr};
 use alloc::string::String;
 use restricted::*;
-use vfs::path::join;
 use vfs::stat::SetTime;
 
 const EPERM: i64 = 1;
@@ -152,7 +152,7 @@ fn path_is_empty(addr: u64) -> bool {
 /// The directory a relative path of an *at call starts from.
 fn base_dir(dirfd: u64, path: &str) -> Result<String, i64> {
     if path.starts_with('/') || dirfd as i32 == AT_FDCWD {
-        return Ok(records::current().state.lock().cwd.clone());
+        return cwd();
     }
     // A descriptor that keeps its origin: its path, without another reference to
     // the node; ENOTDIR unless it is a directory (an O_PATH|O_NOFOLLOW symlink's
@@ -161,6 +161,11 @@ fn base_dir(dirfd: u64, path: &str) -> Result<String, i64> {
         return if o.kind == vfs::S_IFDIR { Ok(o.path) } else { Err(ENOTDIR) };
     }
     Ok(fd_node(dirfd)?.1)
+}
+
+/// A copy of the working directory's path (ENOMEM without memory for it).
+fn cwd() -> Result<String, i64> {
+    Ok(try_string(&records::current().state.lock().cwd)?)
 }
 
 /// The inode behind a descriptor and the path it was opened by (ENOTDIR
@@ -172,13 +177,13 @@ fn fd_node(fd: u64) -> Result<(Node, String), i64> {
 /// `fd_node`, and whether the descriptor is an O_PATH one.
 fn fd_node_of(fd: u64) -> Result<(Node, String, bool), i64> {
     if let Some(f) = files::tmp_of(fd) {
-        return Ok((Node::Tmp(f.inode.clone()), f.path.clone(), false));
+        return Ok((Node::Tmp(f.inode.clone()), try_string(&f.path)?, false));
     }
     if let Some(f) = files::data_of(fd) {
-        return Ok((Node::Data(f.inode.clone()), f.path.clone(), false));
+        return Ok((Node::Data(f.inode.clone()), try_string(&f.path)?, false));
     }
     if let Some(f) = files::proc_of(fd) {
-        return Ok((Node::Proc(f.node.clone()), f.path.clone(), false));
+        return Ok((Node::Proc(f.node.clone()), try_string(&f.path)?, false));
     }
     // Terminals, null and zero, O_PATH: the node they were opened by; any
     // other file has none.
@@ -237,7 +242,7 @@ fn create(dir: &Node, name: &str, kind: u64, perm: u32) -> Result<Node, i64> {
 /// absolute path.
 pub fn exec_open(base: &str, path: &str, follow: bool) -> Result<(u64, String), i64> {
     let r = resolve(base, path, follow)?;
-    exec_node(&r.node, join(&r.path))
+    exec_node(&r.node, join(&r.path)?)
 }
 
 /// The program a descriptor names (execveat with AT_EMPTY_PATH).
@@ -278,13 +283,16 @@ fn openat(dirfd: u64, addr: u64, flags: u32, mode: u32) -> Result<i64, i64> {
         if flags & O_DIRECTORY != 0 && r.mode & vfs::S_IFMT != vfs::S_IFDIR {
             return Err(ENOTDIR);
         }
-        let path = join(&r.path);
+        let path = join(&r.path)?;
         return crate::pathfile::open(flags, Origin::new(r.node, path, r.mode));
     }
     // A name created by someone else between our lookup and our create is
     // opened instead, once: a name that exists but does not resolve (a
     // dangling symlink) stays EEXIST, as with the kernel's VFS.
     let mut retried = false;
+    // What the open of a file it creates needs from the heap, had before the create: its
+    // path and its open file and descriptor (ENOMEM, EMFILE with nothing created).
+    let mut ready: Option<(Prepared, String)> = None;
     let resolved = loop {
         match resolve(&base, &path, !nofollow) {
             Ok(_) if flags & O_CREAT != 0 && flags & O_EXCL != 0 => return Err(EEXIST),
@@ -292,10 +300,25 @@ fn openat(dirfd: u64, addr: u64, flags: u32, mode: u32) -> Result<i64, i64> {
             Err(ENOENT) if flags & O_CREAT != 0 => {
                 let (dir, name) = resolve_parent(&base, &path).map_err(|e| if e == EBUSY { EEXIST } else { e })?;
                 let perm = mode & !umask_now() & 0o7777;
+                let created = normalize(&base, &path)?;
+                if ready.is_none() {
+                    let prepared = match &dir.node {
+                        Node::Tmp(_) => Prepared::Tmp(tmpfile::prepare()?),
+                        Node::Data(_) => Prepared::Data(datafile::prepare()?),
+                        Node::Proc(_) => Prepared::None,
+                    };
+                    ready = Some((prepared, join(&created)?));
+                }
                 match create(&dir.node, &name, NEW_FILE, perm) {
                     Ok(node) => {
                         inotify::child(&dir.node, inotify::IN_CREATE, &name, false);
-                        break Resolved { node, mode: vfs::S_IFREG | perm, path: vfs::path::normalize(&base, &path) };
+                        let (prepared, abs) = ready.take().expect("prepared above");
+                        // (Only one of the kind the directory gave: created there.)
+                        return match (prepared, node) {
+                            (Prepared::Tmp(p), Node::Tmp(t)) => tmpfile::open_in(p, t, flags, abs),
+                            (Prepared::Data(p), Node::Data(d)) => datafile::open_in(p, d, flags, abs),
+                            (_, node) => open_node(Resolved { node, mode: vfs::S_IFREG | perm, path: created }, flags),
+                        };
                     }
                     Err(EEXIST) if flags & O_EXCL == 0 && !retried => {
                         retried = true;
@@ -307,6 +330,19 @@ fn openat(dirfd: u64, addr: u64, flags: u32, mode: u32) -> Result<i64, i64> {
             Err(e) => return Err(e),
         }
     };
+    open_node(resolved, flags)
+}
+
+/// What `openat` has ready for the open of a file it creates (`tmpfile::prepare`,
+/// `datafile::prepare`; nothing for a filesystem it cannot create in).
+enum Prepared {
+    Tmp(tmpfile::Prepared),
+    Data(datafile::Prepared),
+    None,
+}
+
+/// open(2) of a resolved node (not O_PATH).
+fn open_node(resolved: Resolved, flags: u32) -> Result<i64, i64> {
     // Opening a symlink itself would hand out its target bytes as a file:
     // one named with O_NOFOLLOW, or one a magic link led to (an O_PATH
     // descriptor of a symlink, /proc/self/fd/N), is ELOOP (O_PATH alone
@@ -314,7 +350,7 @@ fn openat(dirfd: u64, addr: u64, flags: u32, mode: u32) -> Result<i64, i64> {
     if resolved.mode & vfs::S_IFMT == vfs::S_IFLNK {
         return Err(ELOOP);
     }
-    let abs = join(&resolved.path);
+    let abs = join(&resolved.path)?;
     // A character device node names its driver by its number, wherever the
     // node is (/dev, devpts, any tmpfs or /data): the terminals are `tty`'s,
     // null (1,3) and zero (1,5) `devices`', kmsg (1,11) `kmsg`'s; any other number has no driver
@@ -361,7 +397,7 @@ fn inotify_add_watch(fd: u64, addr: u64, mask: u32) -> Result<i64, i64> {
 /// `dirfd` itself (any kind), or the working directory for AT_FDCWD.
 fn stat_dirfd(dirfd: u64) -> Result<vfs::stat::Stat, i64> {
     if dirfd as i32 == AT_FDCWD {
-        let cwd = records::current().state.lock().cwd.clone();
+        let cwd = cwd()?;
         return resolve(&cwd, &cwd, true)?.node.status();
     }
     files::stat_of(dirfd)
@@ -390,12 +426,12 @@ fn statx(dirfd: u64, addr: u64, flags: u32, mask: u32, buf: u64) -> Result<i64, 
 }
 
 fn getcwd(buf: u64, size: u64) -> Result<i64, i64> {
-    let cwd = records::current().state.lock().cwd.clone();
+    let cwd = cwd()?;
     if (size as usize) < cwd.len() + 1 {
         return Err(ERANGE);
     }
     let mut out = cwd.into_bytes();
-    out.push(0);
+    out.try_push(0)?;
     usercopy::to_program(buf, &out)?;
     Ok(out.len() as i64)
 }
@@ -410,7 +446,7 @@ fn chdir(addr: u64) -> Result<i64, i64> {
     if r.mode & vfs::S_IFMT != vfs::S_IFDIR {
         return Err(ENOTDIR);
     }
-    let cwd = join(&r.path);
+    let cwd = join(&r.path)?;
     if cwd.len() > CWD_MAX {
         return Err(ENAMETOOLONG);
     }
@@ -592,8 +628,9 @@ fn readlinkat(dirfd: u64, addr: u64, buf: u64, size: u64) -> Result<i64, i64> {
 
 fn chmodat(dirfd: u64, addr: u64, mode: u64) -> Result<i64, i64> {
     let r = at(dirfd, addr, true)?;
+    let path = join(&r.path)?;
     chmod_node(&r.node, mode)?;
-    attrib(&r.node, &join(&r.path));
+    attrib(&r.node, &path);
     Ok(0)
 }
 
@@ -633,7 +670,7 @@ fn fd_inode(fd: u64, path_ok: bool) -> Result<Option<(Node, String)>, i64> {
 
 /// The working directory and its path.
 fn cwd_inode() -> Result<(Node, String), i64> {
-    let cwd = records::current().state.lock().cwd.clone();
+    let cwd = cwd()?;
     let node = resolve(&cwd, &cwd, true)?.node;
     Ok((node, cwd))
 }
@@ -672,7 +709,7 @@ fn fchmodat2(dirfd: u64, addr: u64, mode: u64, flags: u64) -> Result<i64, i64> {
     if r.mode & vfs::S_IFMT == vfs::S_IFLNK {
         return Err(EOPNOTSUPP);
     }
-    chmod_target(Some((r.node, join(&r.path))), mode)
+    chmod_target(Some((r.node, join(&r.path)?)), mode)
 }
 
 /// Sets the times of a target. /proc and /sys keep no times that change:
@@ -703,7 +740,7 @@ fn times_target(dirfd: u64, addr: u64, follow: bool) -> Result<Option<(Node, Str
         return fd_inode(dirfd, false);
     }
     let r = at(dirfd, addr, follow)?;
-    Ok(Some((r.node, join(&r.path))))
+    Ok(Some((r.node, join(&r.path)?)))
 }
 
 /// utimes(path, tv) and futimesat(dirfd, path, tv): microseconds; no
@@ -757,7 +794,7 @@ fn chownat(dirfd: u64, addr: u64, flags: u64) -> Result<i64, i64> {
         empty_path_target(dirfd)?
     } else {
         let r = at(dirfd, addr, flags & AT_SYMLINK_NOFOLLOW == 0)?;
-        Some((r.node, join(&r.path)))
+        Some((r.node, join(&r.path)?))
     };
     chown_target(target)
 }

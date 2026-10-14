@@ -16,9 +16,6 @@ done, delete it here in the same commit.
 
 ## Robustness
 
-- **A failed allocation in the Linux server breaks its whole tree** (panic → `ud2` →
-  `break_instance`). Paths a program can drive (socket queues, pipes, directory snapshots,
-  epoll, inotify) should use fallible allocation and answer `ENOMEM`.
 - **No OOM killer that picks a victim by size.** Strict commit accounting stays the default;
   thread stacks (musl commits 8 MiB per thread on `mprotect`) leave Node little headroom. A
   heuristic overcommit mode needs the OOM killer first.

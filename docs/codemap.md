@@ -42,7 +42,7 @@ module comment, and the public types it defines. Where to start for common tasks
 - `kernel/src/process/ipc.rs` (282) Synchronous message passing between the kernel and user-space servers: the control plane of the I/O rings. Types: `Instance`.
 - `kernel/src/process/irq.rs` (52) Device interrupts for user-space drivers.
 - `kernel/src/process/kill.rs` (93) Killing threads and processes, and what the kernel's waits ask about it (`interrupted`, `dying`). Types: `GroupExit`.
-- `kernel/src/process/linux.rs` (2215) Restricted mode: a Linux program and the Linux server on one thread (docs/design/linux-server.md; the interface is `crates/restricted`). Types: `HeapArea`, `Instance`, `Object`, `Container`, `Record`, `LinuxThread`.
+- `kernel/src/process/linux.rs` (2220) Restricted mode: a Linux program and the Linux server on one thread (docs/design/linux-server.md; the interface is `crates/restricted`). Types: `HeapArea`, `Instance`, `Object`, `Container`, `Record`, `LinuxThread`.
 - `kernel/src/process/loader.rs` (182) Loading a static ELF program into a new address space: its segments are mapped from the file's page cache (demand-paged, private), so every process running a program shares its unchanged pages. Types: `Image`.
 - `kernel/src/process/mod.rs` (519) Processes and threads: the process table, the current task, the servers the kernel starts and the process trees it starts with their Linux server instance; the submodules hold scheduling, address spaces, exit and... Types: `Server`, `Tree`.
 - `kernel/src/process/native.rs` (128) The system calls of the kernel's native servers (diskfs, netd, procfs, ringtest; `oxrt::sys`): the kernel's own interface, numbered as the Linux server's (`restricted`) where a call is the same mechanism (memory,...
@@ -65,54 +65,54 @@ module comment, and the public types it defines. Where to start for common tasks
 
 - `servers/linux/src/chantest.rs` (374) `TEST_CHANNEL`: the client's side of channels to the test service (servers/ringtest, protocol `ring::selftest`), as the page cache will use them with diskfs: create, connect, grant, move descriptors through the rings...
 - `servers/linux/src/console.rs` (96) The console's terminal (phase R6d, ADR 0007): the kernel's console device (a VT100 on the framebuffer, mirrored to the serial port, and the keyboard) driven by a terminal of the server (`tty`).
-- `servers/linux/src/datafile.rs` (316) Open files of /data (phase R6c.3): what an open file description of the server's names (offset, the directory cursor, write access, O_DIRECT and O_SYNC); the calls on it are the server's (`datafs`), as for the... Types: `DataOpen`.
-- `servers/linux/src/datafs.rs` (1622) /data in the server (phase R6c.3, I/O rings step 4): diskfs's ext2 filesystem through the file protocol (`fsring`, over `fsclient`'s channel), with the server's own page cache. Types: `DInode`, `New`, `HoldKind`.
-- `servers/linux/src/devices.rs` (103) Null and zero (phase R6d; /dev's since R9): a character device node names its driver by its number wherever it is (ADR 0007), so a node (1,3) or (1,5) in /dev, on the server's tmpfs or /data is null or zero, served here. Types: `Kind`, `DevOpen`.
+- `servers/linux/src/datafile.rs` (325) Open files of /data (phase R6c.3): what an open file description of the server's names (offset, the directory cursor, write access, O_DIRECT and O_SYNC); the calls on it are the server's (`datafs`), as for the... Types: `DataOpen`, `Prepared`.
+- `servers/linux/src/datafs.rs` (1669) /data in the server (phase R6c.3, I/O rings step 4): diskfs's ext2 filesystem through the file protocol (`fsring`, over `fsclient`'s channel), with the server's own page cache. Types: `DInode`, `New`, `HoldKind`.
+- `servers/linux/src/devices.rs` (104) Null and zero (phase R6d; /dev's since R9): a character device node names its driver by its number wherever it is (ADR 0007), so a node (1,3) or (1,5) in /dev, on the server's tmpfs or /data is null or zero, served here. Types: `Kind`, `DevOpen`.
 - `servers/linux/src/disktest.rs` (577) `TEST_DISKRING`: the client's side of the file protocol (`fsring`) against diskfs, as the page cache will use it in step 4: a channel to diskfs, grants of memory objects, files on /data read and written by DMA into...
-- `servers/linux/src/epoll.rs` (532) epoll (phase R6e): an interest list of open file descriptions and a ready list, the event loop interface of libuv (and so of Node.js), as Linux's fs/eventpoll.c has it. Types: `Epoll`, `Item`.
+- `servers/linux/src/epoll.rs` (577) epoll (phase R6e): an interest list of open file descriptions and a ready list, the event loop interface of libuv (and so of Node.js), as Linux's fs/eventpoll.c has it. Types: `Epoll`, `Item`.
 - `servers/linux/src/eventfd.rs` (102) eventfd (phase R6b): a counter that reads take and writes add to, a file of the server (an open file description of its table's, `files`). Types: `EventFd`.
-- `servers/linux/src/exec.rs` (768) execve and execveat (phase R8, ADR 0010): the ELF loader is the server's.
-- `servers/linux/src/fdtable.rs` (361) The descriptor table (phase R6e, docs/design/linux-server.md "The descriptor table"): per process, the server's. Types: `FilesContext`.
-- `servers/linux/src/files.rs` (720) The server's open files (phase R6, the descriptor table since R6e): an open file description (`Description`) is a file the server implements (`File`: a pipe end, a socket, an open file of tmpfs or /data, a terminal,... Types: `File`, `Description`, `FileRef`, `SnapshotCharge`, `OriginOf`, `Mapping`.
-- `servers/linux/src/fsclient.rs` (122) The server's end of the file protocol (`fsring`, docs/design/io-rings.md) to a filesystem service: diskfs for /data (`datafs`), procfs for /proc's system-wide files and /sys (`procfs`). Types: `Client`, `Scratch`.
+- `servers/linux/src/exec.rs` (801) execve and execveat (phase R8, ADR 0010): the ELF loader is the server's.
+- `servers/linux/src/fdtable.rs` (380) The descriptor table (phase R6e, docs/design/linux-server.md "The descriptor table"): per process, the server's. Types: `FilesContext`, `CopyRoom`.
+- `servers/linux/src/files.rs` (749) The server's open files (phase R6, the descriptor table since R6e): an open file description (`Description`) is a file the server implements (`File`: a pipe end, a socket, an open file of tmpfs or /data, a terminal,... Types: `File`, `Description`, `FileRef`, `SnapshotCharge`, `Room`, `OriginOf`, `Mapping`.
+- `servers/linux/src/fsclient.rs` (125) The server's end of the file protocol (`fsring`, docs/design/io-rings.md) to a filesystem service: diskfs for /data (`datafs`), procfs for /proc's system-wide files and /sys (`procfs`). Types: `Client`, `Scratch`.
 - `servers/linux/src/futex.rs` (100) futex(2) (phase R9): Linux's operations over the kernel's futexes on the program's memory (`restricted::SYS_FUTEX_WAIT`, `SYS_FUTEX_WAKE`, `SYS_FUTEX_REQUEUE`: wait, wake and requeue by key, as the kernel keys a...
-- `servers/linux/src/heap.rs` (86) The server's heap: one allocator for every thread of the instance, in the heap area of the shared region (`pageheap`: page runs and slabs of size classes over an arena whose pages are committed and decommitted with... Types: `Kernel`, `ServerHeap`.
+- `servers/linux/src/heap.rs` (235) The server's heap: one allocator for every thread of the instance, in the heap area of the shared region (`pageheap`: page runs and slabs of size classes over an arena whose pages are committed and decommitted with... Types: `Kernel`, `ServerHeap`, `NoMem`, `TryGrow`, `TryExtend`, `TryPushStr`.
 - `servers/linux/src/ids.rs` (394) Credentials and process attributes (phase R8): the user and group ids, supplementary groups, capabilities, prctl, the resource usage calls (getrusage, times), the calls that name a thread or process for the kernel... Types: `Limits`.
-- `servers/linux/src/inet.rs` (843) Internet sockets (phase R7b, ADR 0008): TCP, UDP and raw ICMP sockets of the server, each a file of its own, as AF_UNIX ones are; netd runs the protocols. Types: `RecvOpts`, `Received`, `Local`, `Opts`, `InetSock`.
-- `servers/linux/src/inetcalls.rs` (493) The system calls of internet sockets (phase R7b): socket(2) for the AF_INET family, and every call on a descriptor of one of the server's internet sockets: addresses (`sockaddr_in`), message headers, flags, options,...
+- `servers/linux/src/inet.rs` (858) Internet sockets (phase R7b, ADR 0008): TCP, UDP and raw ICMP sockets of the server, each a file of its own, as AF_UNIX ones are; netd runs the protocols. Types: `RecvOpts`, `Received`, `Local`, `Opts`, `InetSock`.
+- `servers/linux/src/inetcalls.rs` (525) The system calls of internet sockets (phase R7b): socket(2) for the AF_INET family, and every call on a descriptor of one of the server's internet sockets: addresses (`sockaddr_in`), message headers, flags, options,...
 - `servers/linux/src/initramfs.rs` (65) The instance's root tmpfs from the boot image's initramfs (phase R6c.2c): the server reads the archive's headers and names from the kernel's image object (`SYS_INITRAMFS`) and makes each regular file a file object...
-- `servers/linux/src/inotify.rs` (431) inotify(7): watches on the files of the server's filesystems (tmpfs and /data) and the queue of their events, a file of the server, as eventfd. Types: `Key`, `Inotify`.
+- `servers/linux/src/inotify.rs` (515) inotify(7): watches on the files of the server's filesystems (tmpfs and /data) and the queue of their events, a file of the server, as eventfd. Types: `Key`, `Inotify`.
 - `servers/linux/src/kmsg.rs` (387) The kernel's log as Linux programs see it: `syslog(2)` (busybox's dmesg and klogd) and `/dev/kmsg` (1,11; util-linux's dmesg, systemd), over the kernel's log of records (`SYS_KLOG_*`, `kernel/src/klog.rs`). Types: `KmsgOpen`.
-- `servers/linux/src/local.rs` (74) The server's data for the thread it runs on (phases R6e, R8): a block in the thread's State page (`restricted::SERVER_LOCAL_OFFSET`, which the kernel never touches), found from the stack as the lock count is (`sync`;... Types: `Local`.
-- `servers/linux/src/main.rs` (471) The Linux server (docs/design/linux-server.md).
+- `servers/linux/src/local.rs` (78) The server's data for the thread it runs on (phases R6e, R8): a block in the thread's State page (`restricted::SERVER_LOCAL_OFFSET`, which the kernel never touches), found from the stack as the lock count is (`sync`;... Types: `Local`.
+- `servers/linux/src/main.rs` (473) The Linux server (docs/design/linux-server.md).
 - `servers/linux/src/mm.rs` (183) Memory system calls (phase R4): Linux's semantics of mmap, munmap, mprotect, mremap, madvise, msync and the mlock family, and brk (with the process model, R8), over the kernel's mapping calls.
-- `servers/linux/src/namespace.rs` (304) The server's namespace (phase R6c.2): mounts and path resolution. Types: `Node`, `Origin`, `Resolved`.
-- `servers/linux/src/netclient.rs` (391) The instance's channel to netd (phase R7b, ADR 0008, the protocol `netring`): requests (`ringclient`'s slots), the shared area with a control block per socket, the buffer pool the sockets' rings live in, and the net... Types: `Futex`, `Rings`, `Net`.
-- `servers/linux/src/netdev.rs` (148) The network interfaces as Linux programs see them: netd's description (`LINKS` over the instance's channel, `netring::Link`) with Linux's names and flags, for rtnetlink (`netlink`) and for the interface requests...
-- `servers/linux/src/netlink.rs` (547) Netlink sockets (netlink(7)), protocol NETLINK_ROUTE: files of the server, as pipes. Types: `NetlinkSocket`.
-- `servers/linux/src/pathfile.rs` (22) O_PATH descriptors (open(2) with O_PATH; phase R6d, for any node of the namespace): the descriptor names a node and opens nothing, no driver, no file. Types: `PathOpen`.
-- `servers/linux/src/paths.rs` (639) The system calls that take a path (phase R6c.2b), and the working directory and umask, which live in the caller's record (`records`).
-- `servers/linux/src/pipe.rs` (308) Pipes (phase R6a): a 64 KiB buffer shared by a read end and a write end, each a file of the server (an open file description of its own). Types: `Dst`, `Src`, `Shared`, `PipeEnd`, `Pipe`.
-- `servers/linux/src/poll.rs` (440) Readiness and waiting for many files at once (phase R6e): the watch lists of the server's open file descriptions, poll, ppoll, select, pselect6 (epoll is `epoll`'s; restart_syscall `signal`'s). Types: `Waiter`, `Sub`, `Watch`.
-- `servers/linux/src/process.rs` (1266) Processes (phase R8, docs/design/linux-server.md "Processes and signals", ADR 0010): the instance's pid namespace, the process tree, sessions and process groups, fork, vfork, clone and clone3, exit and exit_group,... Types: `Words`, `Usage`, `Report`, `Brk`, `Proc`, `Thread`, `Table`, `Birth`, `After`.
-- `servers/linux/src/procfile.rs` (177) Open files of /proc and /sys (I/O rings step 5): what an open file description of the server's names (the node, its offset and a snapshot of its contents); the calls on it are the server's (`procfs` makes the contents). Types: `ProcOpen`.
-- `servers/linux/src/procfs.rs` (532) /proc and /sys in the server (I/O rings step 5, docs/design/linux-server.md "/proc and /sys"). Types: `PidFile`, `ProcNode`, `Opened`, `Follow`.
-- `servers/linux/src/pty.rs` (267) Pseudo-terminals (phase R6d, docs/design/linux-server.md "Pseudo-terminals"): opening /dev/ptmx makes a pair, a master (`PtyMaster`, a file of the server) and a slave (a terminal, `tty`, whose driver hands its output... Types: `PtyMaster`.
-- `servers/linux/src/records.rs` (51) Records per working-directory context: the cwd and umask of the threads that share them (`CLONE_FS`; phase R6c, the server's own since R8). Types: `FsState`, `FsContext`.
+- `servers/linux/src/namespace.rs` (317) The server's namespace (phase R6c.2): mounts and path resolution. Types: `Node`, `Origin`, `Resolved`.
+- `servers/linux/src/netclient.rs` (405) The instance's channel to netd (phase R7b, ADR 0008, the protocol `netring`): requests (`ringclient`'s slots), the shared area with a control block per socket, the buffer pool the sockets' rings live in, and the net... Types: `Futex`, `Rings`, `Net`.
+- `servers/linux/src/netdev.rs` (150) The network interfaces as Linux programs see them: netd's description (`LINKS` over the instance's channel, `netring::Link`) with Linux's names and flags, for rtnetlink (`netlink`) and for the interface requests...
+- `servers/linux/src/netlink.rs` (553) Netlink sockets (netlink(7)), protocol NETLINK_ROUTE: files of the server, as pipes. Types: `NetlinkSocket`.
+- `servers/linux/src/pathfile.rs` (23) O_PATH descriptors (open(2) with O_PATH; phase R6d, for any node of the namespace): the descriptor names a node and opens nothing, no driver, no file. Types: `PathOpen`.
+- `servers/linux/src/paths.rs` (666) The system calls that take a path (phase R6c.2b), and the working directory and umask, which live in the caller's record (`records`).
+- `servers/linux/src/pipe.rs` (316) Pipes (phase R6a): a 64 KiB buffer shared by a read end and a write end, each a file of the server (an open file description of its own). Types: `Dst`, `Src`, `Shared`, `PipeEnd`, `Pipe`.
+- `servers/linux/src/poll.rs` (456) Readiness and waiting for many files at once (phase R6e): the watch lists of the server's open file descriptions, poll, ppoll, select, pselect6 (epoll is `epoll`'s; restart_syscall `signal`'s). Types: `Waiter`, `Sub`, `Watch`.
+- `servers/linux/src/process.rs` (1337) Processes (phase R8, docs/design/linux-server.md "Processes and signals", ADR 0010): the instance's pid namespace, the process tree, sessions and process groups, fork, vfork, clone and clone3, exit and exit_group,... Types: `Words`, `Usage`, `Report`, `Brk`, `Proc`, `Thread`, `Table`, `Birth`, `After`.
+- `servers/linux/src/procfile.rs` (179) Open files of /proc and /sys (I/O rings step 5): what an open file description of the server's names (the node, its offset and a snapshot of its contents); the calls on it are the server's (`procfs` makes the contents). Types: `ProcOpen`.
+- `servers/linux/src/procfs.rs` (572) /proc and /sys in the server (I/O rings step 5, docs/design/linux-server.md "/proc and /sys"). Types: `PidFile`, `ProcNode`, `Opened`, `Follow`.
+- `servers/linux/src/pty.rs` (272) Pseudo-terminals (phase R6d, docs/design/linux-server.md "Pseudo-terminals"): opening /dev/ptmx makes a pair, a master (`PtyMaster`, a file of the server) and a slave (a terminal, `tty`, whose driver hands its output... Types: `PtyMaster`.
+- `servers/linux/src/records.rs` (53) Records per working-directory context: the cwd and umask of the threads that share them (`CLONE_FS`; phase R6c, the server's own since R8). Types: `FsState`, `FsContext`.
 - `servers/linux/src/ringclient.rs` (339) The server's end of a channel to a service (docs/design/io-rings.md): request slots and the reaper, for any protocol whose completions are `ring::Completion`s (`fsclient` to diskfs, `netclient` to netd). Types: `Doorbell`, `Ticket`, `RingClient`, `Next`.
-- `servers/linux/src/sched.rs` (68) Scheduling policy: sched_getscheduler and sched_getparam, getpriority and setpriority.
-- `servers/linux/src/scm.rs` (168) Descriptors in flight (SCM_RIGHTS over AF_UNIX sockets, phase R7a; in the server's own memory since R6e): a descriptor a message carries is a reference to its open file description (`Passed`), whatever the file is... Types: `Passed`.
-- `servers/linux/src/signal.rs` (1355) Signals (phase R8, docs/design/linux-server.md "Processes and signals", ADR 0010): actions, pending signals with their `siginfo`, masks, the alternate stack, posting (kill, tkill, tgkill, sigqueue, the terminals,... Types: `SigAction`, `Hand`, `SigInfo`, `Queue`, `Stop`, `ProcSignals`, `AltStack`, `RestartBlock`, `ThreadSignals`, `Restart`.
-- `servers/linux/src/sockcalls.rs` (725) The system calls of AF_UNIX sockets (phase R7a): socket and socketpair for the AF_UNIX family, and every call on a descriptor of one of the server's AF_UNIX sockets: addresses (sockaddr_un, paths in the server's... Types: `MsgHdr`.
+- `servers/linux/src/sched.rs` (73) Scheduling policy: sched_getscheduler and sched_getparam, getpriority and setpriority.
+- `servers/linux/src/scm.rs` (195) Descriptors in flight (SCM_RIGHTS over AF_UNIX sockets, phase R7a; in the server's own memory since R6e): a descriptor a message carries is a reference to its open file description (`Passed`), whatever the file is... Types: `Passed`.
+- `servers/linux/src/signal.rs` (1364) Signals (phase R8, docs/design/linux-server.md "Processes and signals", ADR 0010): actions, pending signals with their `siginfo`, masks, the alternate stack, posting (kill, tkill, tgkill, sigqueue, the terminals,... Types: `SigAction`, `Hand`, `SigInfo`, `Queue`, `Stop`, `ProcSignals`, `AltStack`, `RestartBlock`, `ThreadSignals`, `Restart`.
+- `servers/linux/src/sockcalls.rs` (758) The system calls of AF_UNIX sockets (phase R7a): socket and socketpair for the AF_UNIX family, and every call on a descriptor of one of the server's AF_UNIX sockets: addresses (sockaddr_un, paths in the server's... Types: `MsgHdr`.
 - `servers/linux/src/sync.rs` (296) A mutex for the server's data, shared by every thread of the instance (all the tree's processes run the server in the same shared region). Types: `RawMutex`, `Mutex`, `MutexGuard`, `SleepMutex`, `SleepMutexGuard`, `RwLock`, `ReadGuard`, `WriteGuard`, `SleepRwLock`, `SleepReadGuard`, `SleepWriteGuard`.
 - `servers/linux/src/system.rs` (164) Calls about the machine and the calling thread's CPU state (phase R9, from the kernel's Linux code): uname, sysinfo, reboot, getrandom, getcpu, arch_prctl, syslog (`kmsg`'s), and ioperm and iopl, over the kernel's...
 - `servers/linux/src/time.rs` (216) Clocks and sleeping (phase R5): clock_gettime, clock_getres, gettimeofday, time, nanosleep, clock_nanosleep and sched_yield, over the kernel's clocks (`SYS_CLOCK_READ`: wall, monotonic, the caller's own CPU time;...
-- `servers/linux/src/timer.rs` (137) Interval timers (phase R8): alarm, setitimer and getitimer of `ITIMER_REAL`, run by the instance's timer thread (`ROLE_TIMER`, a service thread of the pager's process), which sleeps until the earliest deadline of the... Types: `ITimer`.
-- `servers/linux/src/tmpfile.rs` (301) Open files of the server's tmpfs (phase R6c.2c): what an open file description of the server's names (offset, directory snapshot, write access); the calls on it are the server's. Types: `TmpOpen`.
-- `servers/linux/src/tmpfs.rs` (560) The server's tmpfs (phase R6c.2c): directories, files, symlinks, socket inodes (AF_UNIX names, `unix`) and device nodes (devpts's, `pty`) in the server's memory; a file's contents are a file object of the kernel's... Types: `Object`, `Kind`, `Content`, `State`, `Inode`.
-- `servers/linux/src/tty.rs` (1015) Terminals (phase R6d, docs/design/linux-server.md "The terminal", ADR 0007): a line discipline (`ldisc`), the job control state of a terminal (the session it controls, its foreground process group, its window size),... Types: `Driver`, `PtyState`, `Inner`, `Tty`, `Turn`, `TtyOpen`, `Ids`.
-- `servers/linux/src/unix.rs` (1184) AF_UNIX sockets (phase R7a): stream, datagram and sequenced-packet sockets of the server, each a file of its own, as pipes are. Types: `Cred`, `Name`, `Key`, `Msg`, `Sock`, `Received`, `Fds`, `RecvOpts`, `Sink`, `Source`.
-- `servers/linux/src/usercopy.rs` (73) Copies between the server's memory and the program's (which the server sees in its view of the address space).
+- `servers/linux/src/timer.rs` (143) Interval timers (phase R8): alarm, setitimer and getitimer of `ITIMER_REAL`, run by the instance's timer thread (`ROLE_TIMER`, a service thread of the pager's process), which sleeps until the earliest deadline of the... Types: `ITimer`.
+- `servers/linux/src/tmpfile.rs` (316) Open files of the server's tmpfs (phase R6c.2c): what an open file description of the server's names (offset, directory snapshot, write access); the calls on it are the server's. Types: `TmpOpen`, `Prepared`.
+- `servers/linux/src/tmpfs.rs` (563) The server's tmpfs (phase R6c.2c): directories, files, symlinks, socket inodes (AF_UNIX names, `unix`) and device nodes (devpts's, `pty`) in the server's memory; a file's contents are a file object of the kernel's... Types: `Object`, `Kind`, `Content`, `State`, `Inode`.
+- `servers/linux/src/tty.rs` (1039) Terminals (phase R6d, docs/design/linux-server.md "The terminal", ADR 0007): a line discipline (`ldisc`), the job control state of a terminal (the session it controls, its foreground process group, its window size),... Types: `Driver`, `PtyState`, `Inner`, `Tty`, `Turn`, `TtyOpen`, `Ids`.
+- `servers/linux/src/unix.rs` (1251) AF_UNIX sockets (phase R7a): stream, datagram and sequenced-packet sockets of the server, each a file of its own, as pipes are. Types: `Cred`, `Name`, `SockAddr`, `Key`, `Msg`, `Sock`, `Received`, `Fds`, `RecvOpts`, `Sink`, `Source`.
+- `servers/linux/src/usercopy.rs` (74) Copies between the server's memory and the program's (which the server sees in its view of the address space).
 
 ## Other servers
 
@@ -146,17 +146,17 @@ module comment, and the public types it defines. Where to start for common tasks
 - `crates/netring/src/lib.rs` (829) The socket protocol of the data plane (phase R7b, ADR 0008): what the Linux server (the client) and netd (the service) share over a channel (`ring::channel`) for the instance's internet sockets. Types: `Kind`, `Line`, `Bitmap`, `ArenaHeader`, `NetdLine`, `ClientLine`, `Ctl`, `SharedArea`, `Area`, `Buf`, `Endpoint`, `Request`, `Budget`, `PortHolder`, `PortClaim`, `IcmpKey`, `EchoIds`, `Record`, `Link`.
 - `crates/netring/tests/protocol.rs` (597) The socket protocol's encodings and its shared memory: every request survives encode and decode, malformed descriptors are refused with the right errno (unknown operations, stray fields, areas, endpoints and sockets...
 - `crates/oxrt/src/lib.rs` (310) Minimal runtime for oxidenix's native servers: entry point, raw system calls (the kernel's own interface: no Linux call, the kernel implements none), a heap, printing and port I/O. Types: `Event`, `Stdout`.
-- `crates/pageheap/src/charge.rs` (171) The kernel's account of one heap area's commitment (`SYS_SHARED_COMMIT`, `SYS_SHARED_DECOMMIT`): its mapped pages and its reserve (commitment held beyond them, so that a server can allocate when the commit limit is... Types: `Pool`, `Error`, `Plan`, `Charge`.
-- `crates/pageheap/src/lib.rs` (269) A heap that gives memory back: the Linux server's (docs/design/linux-server.md, "The server's heap"). Types: `Backing`, `RawLock`, `Stats`, `Heap`.
+- `crates/pageheap/src/charge.rs` (178) The kernel's account of one heap area's commitment (`SYS_SHARED_COMMIT`, `SYS_SHARED_DECOMMIT`): its mapped pages and its reserve (commitment held beyond them, so that a server can allocate when the commit limit is... Types: `Pool`, `Error`, `Plan`, `Charge`.
+- `crates/pageheap/src/lib.rs` (280) A heap that gives memory back: the Linux server's (docs/design/linux-server.md, "The server's heap"). Types: `Backing`, `RawLock`, `Stats`, `Heap`.
 - `crates/pageheap/src/pages.rs` (474) The page allocator under the heap: runs of pages of the arena, each page allocated or free and committed or not, in bitmaps outside the arena, and a radix tree of summaries over them that finds the lowest run of free... Types: `Sum`, `ChunkMeta`, `Run`, `Plan`, `Pages`.
 - `crates/pageheap/src/slabs.rs` (145) Slabs of the size classes (`slab::class`): a slab is one page of the arena cut into slots of its class's size. Types: `Place`, `Class`.
-- `crates/pageheap/tests/heap.rs` (342) The heap over a model of the kernel's commits: objects keep their contents, runs are the lowest that fit, free memory goes back when trimmed, a decommitted page is never written (its poison is checked when it is...
+- `crates/pageheap/tests/heap.rs` (359) The heap over a model of the kernel's commits: objects keep their contents, runs are the lowest that fit, free memory goes back when trimmed, a decommitted page is never written (its poison is checked when it is...
 - `crates/procproto/src/admission.rs` (63) What procfs gives each client (docs/design/io-rings.md, "procfs over the rings"): procfs is one service for every Linux server instance, so no instance may take what the others need. Types: `Channels`, `Grants`.
 - `crates/procproto/src/lib.rs` (90) The kernel's native process and system information (syscall 1005, `proc_query`, for the procfs server; `restricted::SYS_PROC_INFO` for the Linux server), from which Linux's /proc is built: the records are plain... Types: `CpuTimes`, `System`, `Counters`, `Process`.
 - `crates/procproto/src/render.rs` (197) The text formats of Linux's /proc files (proc(5)): the system-wide ones procfs serves (`stat`, `meminfo`, `loadavg`, `uptime`, `counters`) and a process's own the Linux server makes (`<pid>/stat`, `statm`, `status`),... Types: `Machine`, `Linux`.
 - `crates/procproto/tests/admission.rs` (57) What procfs gives each client: one instance cannot take the channels or the mapped grants the others need, and what goes is given back.
 - `crates/procproto/tests/render.rs` (101) The text formats of /proc against what Linux programs parse: the field counts and orders of /proc/stat, /proc/<pid>/stat, statm and status, the units of meminfo, the fixed-point load averages, times in USER_HZ.
-- `crates/restricted/src/lib.rs` (260) The interface between the kernel and the Linux server for restricted mode (docs/design/linux-server.md): the layout of the server's shared region, the per-thread register block, and the kernel calls the server makes... Types: `State`, `Event`, `KlogRecord`, `ProcInfo`, `ThreadInfo`.
+- `crates/restricted/src/lib.rs` (262) The interface between the kernel and the Linux server for restricted mode (docs/design/linux-server.md): the layout of the server's shared region, the per-thread register block, and the kernel calls the server makes... Types: `State`, `Event`, `KlogRecord`, `ProcInfo`, `ThreadInfo`.
 - `crates/ring/src/channel.rs` (151) A channel: the memory object both ends of a data-plane connection map (docs/design/io-rings.md). Types: `Layout`, `Header`, `Offer`.
 - `crates/ring/src/lib.rs` (205) Single-producer single-consumer rings of fixed-size descriptors in shared memory: the data plane between the Linux server and the device servers (docs/design/io-rings.md, ADR 0005). Types: `Desc`, `Completion`, `RingMemory`, `Wait`, `Ring`, `Producer`, `Consumer`.
 - `crates/ring/src/selftest.rs` (21) The protocol of the self-tests' channel service (servers/ringtest), which the Linux server's test calls (`restricted::TEST_CHANNEL`) drive.
@@ -165,7 +165,7 @@ module comment, and the public types it defines. Where to start for common tasks
 - `crates/slab/tests/classes.rs` (163) Size classes and free lists of the slab allocator.
 - `crates/vfs/src/cpio.rs` (80) The initramfs: a cpio archive in "newc" format. Types: `Header`, `Entry`, `Entries`.
 - `crates/vfs/src/lib.rs` (12) The pure parts of the Linux server's namespace (docs/design/linux-server.md, R6c): path arithmetic, the initramfs format and where reads and writes go.
-- `crates/vfs/src/path.rs` (28) Path arithmetic.
+- `crates/vfs/src/path.rs` (57) Path arithmetic.
 - `crates/vfs/src/rw.rs` (30) Where a read or write goes: the file position or an offset, and whether a write appends. Types: `Plan`.
 - `crates/vfs/src/stat.rs` (294) File status as Linux reports it: `struct stat` (stat, fstat, newfstatat) and `struct statx` (statx(2)), both in x86-64's layout, and the arguments statx checks. Types: `Time`, `Stat`, `SetTime`, `Times`.
 - `crates/vfs/tests/cpio.rs` (64) Parsing newc cpio archives (the initramfs format).
@@ -202,6 +202,7 @@ module comment, and the public types it defines. Where to start for common tasks
 - `userspace/mmaptest.c` (135) File mappings through the page cache: shared mappings see write() and read() sees stores through them, across processes; private mappings see the file until they write; truncation and the end of the file give SIGBUS;...
 - `userspace/nettest.c` (675) Socket tests: TCP and UDP over loopback and through QEMU's user network (10.0.2.100:7 is an echo service, see builder/src/main.rs), with the Linux semantics of the server's internet sockets (R7b): bulk data intact,...
 - `userspace/node/run-node.sh` (16) Runs the Node.js smoke tests (userspace/node/tests, in the root filesystem as /usr/lib/node-tests) with /data/bin/node and exits non-zero if any fails.
+- `userspace/nomemtest.c` (618) The Linux server out of memory: a failed allocation a program drives is answered (ENOMEM, ENOBUFS for a send, EAGAIN where Linux says so) and leaves nothing behind, instead of breaking the whole tree.
 - `userspace/oomtest.c` (433) Running out of resources: fork bombs, memory hogs, full pipes and full descriptor tables fail with errors (EAGAIN, ENOMEM, EMFILE) instead of bringing the kernel down, and a process touching uncommitted...
 - `userspace/polltest.c` (305) poll and select (the Linux server's, phase R6e) wake up when a descriptor becomes ready, not at the next scheduler tick: the waiter is subscribed to the watch lists of the files it polls (and waits on the words netd...
 - `userspace/proctest.c` (434) Process information: prctl, capabilities and /proc: procfs's system-wide files and /sys, the Linux server's per-process part (/proc/<pid>, self, thread-self, mounts) and its magic links (/proc/self/fd).
@@ -231,6 +232,8 @@ module comment, and the public types it defines. Where to start for common tasks
 - `userspace/rootfs/etc/bench.sh` Benchmark mode (OXIDENIX_BENCH=1, see docs/benchmarks/README.md): runs the I/O benchmarks on the data disk; the exit status ends QEMU as in test mode.
 - `userspace/rootfs/etc/disktest.sh` Exercises the ext2 driver on /data; every line should end in "ok".
 - `userspace/rootfs/etc/runtests.sh` Runs every self-test and exits non-zero if any fails.
+- `userspace/rootfs/etc/runtests.sh` Runs every self-test and exits non-zero if any fails.
+- `userspace/rootfs/etc/runtests.sh` Runs every self-test and exits non-zero if any fails.
 - `userspace/rootfs/etc/test.sh` A quick manual tour of the shell: files, pipes and a few commands.
 
 ## Kernel ABI of the Linux server
@@ -241,87 +244,87 @@ kernel that handle them.
 | nr | call | handled at |
 |---|---|---|
 | 1010 | `SYS_RESTRICTED_ENTER` | kernel/src/process/syscall.rs:165 |
-| 1012 | `SYS_HANDLE_CLOSE` | kernel/src/process/linux.rs:1582 |
-| 1013 | `SYS_MO_CREATE` | kernel/src/process/linux.rs:1598 |
-| 1014 | `SYS_MO_MAP` | kernel/src/process/linux.rs:1606, kernel/src/process/native.rs:71 |
-| 1015 | `SYS_MO_UNMAP` | kernel/src/process/linux.rs:2245, kernel/src/process/native.rs:72 |
-| 1016 | `SYS_MO_PROTECT` | kernel/src/process/linux.rs:2246, kernel/src/process/native.rs:73 |
-| 1017 | `SYS_MO_READ` | kernel/src/process/linux.rs:2247, kernel/src/process/linux.rs:2262 |
-| 1018 | `SYS_MO_WRITE` | kernel/src/process/linux.rs:2247 |
-| 1019 | `SYS_MO_CREATE_PAGED` | kernel/src/process/linux.rs:1658 |
-| 1020 | `SYS_EVENT_WAIT` | kernel/src/process/linux.rs:1667 |
-| 1021 | `SYS_MO_SUPPLY` | kernel/src/process/linux.rs:1736 |
-| 1022 | `SYS_MO_FAIL` | kernel/src/process/linux.rs:1746 |
-| 1024 | `SYS_SERVER_FUTEX_WAIT` | kernel/src/process/linux.rs:1926 |
-| 1025 | `SYS_SERVER_FUTEX_WAKE` | kernel/src/process/linux.rs:1952 |
-| 1026 | `SYS_VM_REMAP` | kernel/src/process/linux.rs:1655 |
-| 1027 | `SYS_VM_DISCARD` | kernel/src/process/linux.rs:1656 |
-| 1028 | `SYS_VM_SYNC` | kernel/src/process/linux.rs:1657 |
-| 1030 | `SYS_CLOCK_READ` | kernel/src/process/linux.rs:1854, kernel/src/process/native.rs:75 |
-| 1031 | `SYS_SLEEP_UNTIL` | kernel/src/process/linux.rs:1910 |
-| 1032 | `SYS_YIELD` | kernel/src/process/linux.rs:1922, kernel/src/process/native.rs:76 |
-| 1033 | `SYS_SET_USERCOPY` | kernel/src/process/linux.rs:1841 |
-| 1055 | `SYS_MO_CREATE_FILE` | kernel/src/process/linux.rs:1769 |
-| 1056 | `SYS_MO_HOLD` | kernel/src/process/linux.rs:1773 |
-| 1057 | `SYS_MO_FILE_READ` | kernel/src/process/linux.rs:1793, kernel/src/process/linux.rs:1813 |
-| 1058 | `SYS_MO_FILE_WRITE` | kernel/src/process/linux.rs:1793, kernel/src/process/linux.rs:1817 |
-| 1059 | `SYS_MO_FILE_SIZE` | kernel/src/process/linux.rs:1793, kernel/src/process/linux.rs:1833 |
-| 1060 | `SYS_MO_TRUNCATE` | kernel/src/process/linux.rs:1793 |
-| 1061 | `SYS_INITRAMFS` | kernel/src/process/linux.rs:1758 |
-| 1062 | `SYS_MO_FROM_IMAGE` | kernel/src/process/linux.rs:1763 |
-| 1063 | `SYS_EVENT_RELEASES` | kernel/src/process/linux.rs:1678 |
-| 1064 | `SYS_CHAN_CREATE` | kernel/src/process/linux.rs:1959 |
-| 1065 | `SYS_CHAN_CONNECT` | kernel/src/process/linux.rs:1979 |
-| 1066 | `SYS_GRANT` | kernel/src/process/linux.rs:1990 |
-| 1067 | `SYS_REVOKE` | kernel/src/process/linux.rs:2241 |
-| 1076 | `SYS_MO_CREATE_CACHED` | kernel/src/process/linux.rs:2025 |
-| 1077 | `SYS_MO_FILLED` | kernel/src/process/linux.rs:2031 |
-| 1078 | `SYS_MO_REDIRTY` | kernel/src/process/linux.rs:2031 |
-| 1079 | `SYS_MO_MAP_SERVER` | kernel/src/process/linux.rs:2232 |
-| 1080 | `SYS_MO_UNMAP_SERVER` | kernel/src/process/linux.rs:2240 |
-| 1081 | `SYS_SYNC_OTHERS` | kernel/src/process/linux.rs:1679 |
-| 1082 | `SYS_SYNC_DONE` | kernel/src/process/linux.rs:1689 |
-| 1083 | `SYS_MO_BACKED` | kernel/src/process/linux.rs:2051 |
-| 1084 | `SYS_MO_UNBACK` | kernel/src/process/linux.rs:2056 |
-| 1085 | `SYS_SERVER_LOG` | kernel/src/process/linux.rs:2182 |
-| 1095 | `SYS_THREAD_NICE` | kernel/src/process/linux.rs:2075 |
-| 1110 | `SYS_CONSOLE_READ` | kernel/src/process/linux.rs:2083 |
-| 1111 | `SYS_CONSOLE_WRITE` | kernel/src/process/linux.rs:2094 |
-| 1112 | `SYS_CONSOLE_INFO` | kernel/src/process/linux.rs:2118 |
-| 1116 | `SYS_SYSTEM_INFO` | kernel/src/process/linux.rs:2129 |
-| 1118 | `SYS_TEST_MODE` | kernel/src/process/linux.rs:2181 |
-| 1133 | `SYS_SERVER_WAIT` | kernel/src/process/linux.rs:1699 |
-| 1140 | `SYS_PROC_SELF` | kernel/src/process/linux.rs:1840, kernel/src/process/linux.rs:2383 |
-| 1141 | `SYS_PROC_CREATE` | kernel/src/process/linux.rs:2388 |
-| 1142 | `SYS_THREAD_CREATE` | kernel/src/process/linux.rs:2409 |
-| 1143 | `SYS_THREAD_KICK` | kernel/src/process/linux.rs:2410 |
-| 1144 | `SYS_THREAD_KILL` | kernel/src/process/linux.rs:2414 |
+| 1012 | `SYS_HANDLE_CLOSE` | kernel/src/process/linux.rs:1584 |
+| 1013 | `SYS_MO_CREATE` | kernel/src/process/linux.rs:1600 |
+| 1014 | `SYS_MO_MAP` | kernel/src/process/linux.rs:1608, kernel/src/process/native.rs:71 |
+| 1015 | `SYS_MO_UNMAP` | kernel/src/process/linux.rs:2252, kernel/src/process/native.rs:72 |
+| 1016 | `SYS_MO_PROTECT` | kernel/src/process/linux.rs:2253, kernel/src/process/native.rs:73 |
+| 1017 | `SYS_MO_READ` | kernel/src/process/linux.rs:2254, kernel/src/process/linux.rs:2269 |
+| 1018 | `SYS_MO_WRITE` | kernel/src/process/linux.rs:2254 |
+| 1019 | `SYS_MO_CREATE_PAGED` | kernel/src/process/linux.rs:1660 |
+| 1020 | `SYS_EVENT_WAIT` | kernel/src/process/linux.rs:1669 |
+| 1021 | `SYS_MO_SUPPLY` | kernel/src/process/linux.rs:1738 |
+| 1022 | `SYS_MO_FAIL` | kernel/src/process/linux.rs:1748 |
+| 1024 | `SYS_SERVER_FUTEX_WAIT` | kernel/src/process/linux.rs:1933 |
+| 1025 | `SYS_SERVER_FUTEX_WAKE` | kernel/src/process/linux.rs:1959 |
+| 1026 | `SYS_VM_REMAP` | kernel/src/process/linux.rs:1657 |
+| 1027 | `SYS_VM_DISCARD` | kernel/src/process/linux.rs:1658 |
+| 1028 | `SYS_VM_SYNC` | kernel/src/process/linux.rs:1659 |
+| 1030 | `SYS_CLOCK_READ` | kernel/src/process/linux.rs:1861, kernel/src/process/native.rs:75 |
+| 1031 | `SYS_SLEEP_UNTIL` | kernel/src/process/linux.rs:1917 |
+| 1032 | `SYS_YIELD` | kernel/src/process/linux.rs:1929, kernel/src/process/native.rs:76 |
+| 1033 | `SYS_SET_USERCOPY` | kernel/src/process/linux.rs:1848 |
+| 1055 | `SYS_MO_CREATE_FILE` | kernel/src/process/linux.rs:1776 |
+| 1056 | `SYS_MO_HOLD` | kernel/src/process/linux.rs:1780 |
+| 1057 | `SYS_MO_FILE_READ` | kernel/src/process/linux.rs:1800, kernel/src/process/linux.rs:1820 |
+| 1058 | `SYS_MO_FILE_WRITE` | kernel/src/process/linux.rs:1800, kernel/src/process/linux.rs:1824 |
+| 1059 | `SYS_MO_FILE_SIZE` | kernel/src/process/linux.rs:1800, kernel/src/process/linux.rs:1840 |
+| 1060 | `SYS_MO_TRUNCATE` | kernel/src/process/linux.rs:1800 |
+| 1061 | `SYS_INITRAMFS` | kernel/src/process/linux.rs:1765 |
+| 1062 | `SYS_MO_FROM_IMAGE` | kernel/src/process/linux.rs:1770 |
+| 1063 | `SYS_EVENT_RELEASES` | kernel/src/process/linux.rs:1680 |
+| 1064 | `SYS_CHAN_CREATE` | kernel/src/process/linux.rs:1966 |
+| 1065 | `SYS_CHAN_CONNECT` | kernel/src/process/linux.rs:1986 |
+| 1066 | `SYS_GRANT` | kernel/src/process/linux.rs:1997 |
+| 1067 | `SYS_REVOKE` | kernel/src/process/linux.rs:2248 |
+| 1076 | `SYS_MO_CREATE_CACHED` | kernel/src/process/linux.rs:2032 |
+| 1077 | `SYS_MO_FILLED` | kernel/src/process/linux.rs:2038 |
+| 1078 | `SYS_MO_REDIRTY` | kernel/src/process/linux.rs:2038 |
+| 1079 | `SYS_MO_MAP_SERVER` | kernel/src/process/linux.rs:2239 |
+| 1080 | `SYS_MO_UNMAP_SERVER` | kernel/src/process/linux.rs:2247 |
+| 1081 | `SYS_SYNC_OTHERS` | kernel/src/process/linux.rs:1681 |
+| 1082 | `SYS_SYNC_DONE` | kernel/src/process/linux.rs:1691 |
+| 1083 | `SYS_MO_BACKED` | kernel/src/process/linux.rs:2058 |
+| 1084 | `SYS_MO_UNBACK` | kernel/src/process/linux.rs:2063 |
+| 1085 | `SYS_SERVER_LOG` | kernel/src/process/linux.rs:2189 |
+| 1095 | `SYS_THREAD_NICE` | kernel/src/process/linux.rs:2082 |
+| 1110 | `SYS_CONSOLE_READ` | kernel/src/process/linux.rs:2090 |
+| 1111 | `SYS_CONSOLE_WRITE` | kernel/src/process/linux.rs:2101 |
+| 1112 | `SYS_CONSOLE_INFO` | kernel/src/process/linux.rs:2125 |
+| 1116 | `SYS_SYSTEM_INFO` | kernel/src/process/linux.rs:2136 |
+| 1118 | `SYS_TEST_MODE` | kernel/src/process/linux.rs:2188 |
+| 1133 | `SYS_SERVER_WAIT` | kernel/src/process/linux.rs:1701 |
+| 1140 | `SYS_PROC_SELF` | kernel/src/process/linux.rs:1847, kernel/src/process/linux.rs:2390 |
+| 1141 | `SYS_PROC_CREATE` | kernel/src/process/linux.rs:2395 |
+| 1142 | `SYS_THREAD_CREATE` | kernel/src/process/linux.rs:2416 |
+| 1143 | `SYS_THREAD_KICK` | kernel/src/process/linux.rs:2417 |
+| 1144 | `SYS_THREAD_KILL` | kernel/src/process/linux.rs:2421 |
 | 1145 | `SYS_THREAD_EXIT` | kernel/src/process/native.rs:81 |
-| 1146 | `SYS_EXEC_SPACE` | kernel/src/process/linux.rs:2421 |
-| 1147 | `SYS_PROC_INFO` | kernel/src/process/linux.rs:2422 |
-| 1148 | `SYS_THREAD_INFO` | kernel/src/process/linux.rs:2441 |
-| 1149 | `SYS_THREAD_AFFINITY` | kernel/src/process/linux.rs:2456 |
-| 1150 | `SYS_THREAD_CLEARTID` | kernel/src/process/linux.rs:2472 |
-| 1151 | `SYS_THREAD_NAME` | kernel/src/process/linux.rs:2479 |
-| 1152 | `SYS_INIT_ARGS` | kernel/src/process/linux.rs:2488 |
-| 1153 | `SYS_VM_FLOOR` | kernel/src/process/linux.rs:2496 |
-| 1154 | `SYS_RANDOM` | kernel/src/process/linux.rs:1840, kernel/src/process/linux.rs:2503, kernel/src/process/native.rs:80 |
-| 1160 | `SYS_FUTEX_WAIT` | kernel/src/process/linux.rs:1856, kernel/src/process/native.rs:74, kernel/src/process/native.rs:111 |
-| 1161 | `SYS_FUTEX_WAKE` | kernel/src/process/linux.rs:1856, kernel/src/process/native.rs:74, kernel/src/process/native.rs:118 |
-| 1162 | `SYS_FUTEX_REQUEUE` | kernel/src/process/linux.rs:1856, kernel/src/process/native.rs:74 |
-| 1163 | `SYS_THREAD_FS` | kernel/src/process/linux.rs:1862 |
-| 1164 | `SYS_CLOCK_SET` | kernel/src/process/linux.rs:1875 |
-| 1165 | `SYS_POWER` | kernel/src/process/linux.rs:1882 |
-| 1166 | `SYS_FILE_PAGES` | kernel/src/process/linux.rs:1902 |
-| 1167 | `SYS_HOST_GRANTED` | kernel/src/process/linux.rs:1898 |
-| 1168 | `SYS_STACK_LIMIT` | kernel/src/process/linux.rs:1893 |
-| 1169 | `SYS_SHARED_COMMIT` | kernel/src/process/linux.rs:1755 |
-| 1170 | `SYS_SHARED_DECOMMIT` | kernel/src/process/linux.rs:1756 |
-| 1171 | `SYS_SHARED_DECOMMIT_RUNS` | kernel/src/process/linux.rs:1757 |
-| 1172 | `SYS_KLOG_READ` | kernel/src/process/linux.rs:2193, kernel/src/process/linux.rs:2194 |
-| 1173 | `SYS_KLOG_WRITE` | kernel/src/process/linux.rs:2207 |
-| 1174 | `SYS_KLOG_ARM` | kernel/src/process/linux.rs:2193, kernel/src/process/linux.rs:2224 |
-| 1175 | `SYS_KLOG_CONSOLE` | kernel/src/process/linux.rs:2225 |
+| 1146 | `SYS_EXEC_SPACE` | kernel/src/process/linux.rs:2428 |
+| 1147 | `SYS_PROC_INFO` | kernel/src/process/linux.rs:2429 |
+| 1148 | `SYS_THREAD_INFO` | kernel/src/process/linux.rs:2448 |
+| 1149 | `SYS_THREAD_AFFINITY` | kernel/src/process/linux.rs:2463 |
+| 1150 | `SYS_THREAD_CLEARTID` | kernel/src/process/linux.rs:2479 |
+| 1151 | `SYS_THREAD_NAME` | kernel/src/process/linux.rs:2486 |
+| 1152 | `SYS_INIT_ARGS` | kernel/src/process/linux.rs:2495 |
+| 1153 | `SYS_VM_FLOOR` | kernel/src/process/linux.rs:2503 |
+| 1154 | `SYS_RANDOM` | kernel/src/process/linux.rs:1847, kernel/src/process/linux.rs:2510, kernel/src/process/native.rs:80 |
+| 1160 | `SYS_FUTEX_WAIT` | kernel/src/process/linux.rs:1863, kernel/src/process/native.rs:74, kernel/src/process/native.rs:111 |
+| 1161 | `SYS_FUTEX_WAKE` | kernel/src/process/linux.rs:1863, kernel/src/process/native.rs:74, kernel/src/process/native.rs:118 |
+| 1162 | `SYS_FUTEX_REQUEUE` | kernel/src/process/linux.rs:1863, kernel/src/process/native.rs:74 |
+| 1163 | `SYS_THREAD_FS` | kernel/src/process/linux.rs:1869 |
+| 1164 | `SYS_CLOCK_SET` | kernel/src/process/linux.rs:1882 |
+| 1165 | `SYS_POWER` | kernel/src/process/linux.rs:1889 |
+| 1166 | `SYS_FILE_PAGES` | kernel/src/process/linux.rs:1909 |
+| 1167 | `SYS_HOST_GRANTED` | kernel/src/process/linux.rs:1905 |
+| 1168 | `SYS_STACK_LIMIT` | kernel/src/process/linux.rs:1900 |
+| 1169 | `SYS_SHARED_COMMIT` | kernel/src/process/linux.rs:1757 |
+| 1170 | `SYS_SHARED_DECOMMIT` | kernel/src/process/linux.rs:1763 |
+| 1171 | `SYS_SHARED_DECOMMIT_RUNS` | kernel/src/process/linux.rs:1764 |
+| 1172 | `SYS_KLOG_READ` | kernel/src/process/linux.rs:2200, kernel/src/process/linux.rs:2201 |
+| 1173 | `SYS_KLOG_WRITE` | kernel/src/process/linux.rs:2214 |
+| 1174 | `SYS_KLOG_ARM` | kernel/src/process/linux.rs:2200, kernel/src/process/linux.rs:2231 |
+| 1175 | `SYS_KLOG_CONSOLE` | kernel/src/process/linux.rs:2232 |
 
 ## Documents
 

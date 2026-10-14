@@ -13,7 +13,6 @@ use crate::files::{self, File, EINVAL, O_ACCMODE, O_CLOEXEC, O_NONBLOCK};
 use crate::namespace::Origin;
 use crate::unix::Sink;
 use crate::usercopy;
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 use restricted::*;
 
@@ -39,7 +38,7 @@ pub struct DevOpen {
 pub fn open(kind: Kind, flags: u32, origin: Origin) -> Result<i64, i64> {
     let kept = flags & (O_ACCMODE | O_NONBLOCK | O_CLOEXEC);
     // Always ready (`File::always_ready`: epoll refuses it with EPERM, as Linux's).
-    files::install(files::new_id(), File::Dev(Arc::new(DevOpen { kind, origin })), kept)
+    files::install(files::new_id(), File::Dev(crate::heap::try_arc(DevOpen { kind, origin })?), kept)
 }
 
 /// Whether `[addr, addr + len)` lies in the program's memory (Linux's access_ok).
@@ -55,7 +54,9 @@ pub fn one_buffer(addr: u64, len: u64) -> Result<Vec<(u64, u64)>, i64> {
     if !access_ok(addr, len) {
         return Err(EFAULT);
     }
-    Ok(alloc::vec![(addr, len.min(MAX_RW_COUNT))])
+    let mut one = crate::heap::try_vec(1)?;
+    one.push((addr, len.min(MAX_RW_COUNT)));
+    Ok(one)
 }
 
 /// An iovec array, checked and clamped as Linux's `import_iovec`: a length above

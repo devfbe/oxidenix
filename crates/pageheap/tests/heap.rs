@@ -316,6 +316,28 @@ fn a_failed_commit_is_out_of_memory_and_nothing_else() {
 }
 
 #[test]
+fn ensure_free_commits_what_is_missing_or_fails() {
+    let h = heap(4);
+    // An empty heap has nothing free: a run is committed and freed.
+    assert!(h.ensure_free(3));
+    let s = agrees(h);
+    assert!(s.free >= 3 * PAGE && s.in_use == 0, "{s:?}");
+    // Free pages there: no commit (even when commits fail).
+    h.backing().budget.store(0, Ordering::Relaxed);
+    assert!(h.ensure_free(3));
+    // Taken by an allocation, they cannot be had again.
+    let big = Layout::from_size_align(s.free, PAGE).unwrap();
+    let p = h.alloc(big);
+    assert!(!p.is_null());
+    assert!(!h.ensure_free(1));
+    agrees(h);
+    h.backing().budget.store(usize::MAX, Ordering::Relaxed);
+    assert!(h.ensure_free(1));
+    unsafe { h.dealloc(p, big) };
+    assert_eq!(agrees(h).in_use, 0);
+}
+
+#[test]
 fn over_aligned_blocks() {
     let h = heap(8);
     let mut blocks = Vec::new();

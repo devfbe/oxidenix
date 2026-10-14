@@ -9,7 +9,6 @@ use crate::sockcalls::{self, MsgHdr};
 use crate::unix::{Sink, Source};
 use crate::usercopy;
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 use netring::{opt, Endpoint, Kind};
 
 pub const AF_INET: u16 = 2;
@@ -90,6 +89,33 @@ const IP_MTU: u64 = 14;
 const PLAIN_IP: [u64; 12] = [3, 6, 7, 8, 10, 11, 12, 13, 15, 33, 34, 24];
 /// UDP options kept as an int (cork, segment, gro).
 const PLAIN_UDP: [u64; 3] = [1, 103, 104];
+
+/// The slot of plain option (`level`, `name`) in `Opts::plain`: the
+/// lists above one after the other, IP_TOS after PLAIN_IP's.
+fn plain_slot(level: i32, name: u64) -> Option<usize> {
+    let at = |list: &[u64], base: usize| list.iter().position(|&n| n == name).map(|k| base + k);
+    match level {
+        SOL_SOCKET => at(&PLAIN_SOCKET, 0),
+        SOL_TCP => at(&PLAIN_TCP, 8),
+        SOL_IP if name == IP_TOS => Some(30),
+        SOL_IP => at(&PLAIN_IP, 18),
+        SOL_UDP => at(&PLAIN_UDP, 31),
+        _ => None,
+    }
+}
+const _: () = assert!(PLAIN_SOCKET.len() + PLAIN_TCP.len() + PLAIN_IP.len() + 1 + PLAIN_UDP.len() == PLAIN_SLOTS);
+
+/// Keeps plain option (`level`, `name`) of `sock` (one of the lists').
+fn set_plain(sock: &InetSock, level: i32, name: u64, v: i32) {
+    if let Some(k) = plain_slot(level, name) {
+        sock.st.lock().opts.plain[k] = v;
+    }
+}
+
+/// A plain option's value (0 until set).
+fn plain(o: &Opts, level: i32, name: u64) -> i32 {
+    plain_slot(level, name).map_or(0, |k| o.plain[k])
+}
 
 /// The bounds Linux applies to SO_SNDBUF and SO_RCVBUF (wmem_max,
 /// rmem_max, and the minimums), which it doubles.
@@ -280,7 +306,9 @@ fn check_control(control: u64, len: u64) -> Result<(), i64> {
     if len > 20480 {
         return Err(ENOBUFS);
     }
-    let mut buf = alloc::vec![0u8; len as usize];
+    // (ENOBUFS without memory for it too, as Linux's sock_kmalloc.)
+    let mut buf = crate::heap::try_vec(len as usize).map_err(|_| ENOBUFS)?;
+    buf.resize(len as usize, 0);
     usercopy::from_program(control, &mut buf)?;
     let mut off = 0usize;
     while off + 16 <= buf.len() {
@@ -397,7 +425,7 @@ fn setsockopt(sock: &Arc<InetSock>, level: u64, name: u64, val: u64, len: u64) -
         }
         (SOL_SOCKET, n) if PLAIN_SOCKET.contains(&n) => {
             let v = int()?;
-            sock.st.lock().opts.plain.insert((level, n), v);
+            set_plain(sock, level, n, v);
         }
         (SOL_TCP, _) if !tcp => return Err(ENOPROTOOPT),
         (SOL_TCP, TCP_NODELAY) => {
@@ -428,7 +456,7 @@ fn setsockopt(sock: &Arc<InetSock>, level: u64, name: u64, val: u64, len: u64) -
         }
         (SOL_TCP, n) if PLAIN_TCP.contains(&n) => {
             let v = int()?;
-            sock.st.lock().opts.plain.insert((level, n), v);
+            set_plain(sock, level, n, v);
         }
         (SOL_IP, IP_TTL) => {
             let v = int()?;
@@ -442,15 +470,15 @@ fn setsockopt(sock: &Arc<InetSock>, level: u64, name: u64, val: u64, len: u64) -
         }
         (SOL_IP, IP_TOS) => {
             let v = int()?;
-            sock.st.lock().opts.plain.insert((level, name), v & 0xff);
+            set_plain(sock, level, name, v & 0xff);
         }
         (SOL_IP, n) if PLAIN_IP.contains(&n) => {
             let v = int()?;
-            sock.st.lock().opts.plain.insert((level, n), v);
+            set_plain(sock, level, n, v);
         }
         (SOL_UDP, n) if sock.kind == Kind::Udp && PLAIN_UDP.contains(&n) => {
             let v = int()?;
-            sock.st.lock().opts.plain.insert((level, n), v);
+            set_plain(sock, level, n, v);
         }
         (SOL_SOCKET, _) => return Err(ENOPROTOOPT),
         _ => return Err(ENOPROTOOPT),
@@ -464,16 +492,28 @@ fn getsockopt(sock: &Arc<InetSock>, level: u64, name: u64, val: u64, lenp: u64) 
     if cap < 0 {
         return Err(EINVAL);
     }
-    let int = |v: i64| (v as i32).to_le_bytes().to_vec();
+    // (At most 16 bytes, in the stack.)
+    struct Opt([u8; 16], usize);
+    impl Opt {
+        fn extend_from_slice(&mut self, b: &[u8]) {
+            self.0[self.1..self.1 + b.len()].copy_from_slice(b);
+            self.1 += b.len();
+        }
+    }
+    let int = |v: i64| {
+        let mut b = Opt([0; 16], 0);
+        b.extend_from_slice(&(v as i32).to_le_bytes());
+        b
+    };
     let timeval = |ns: u64| {
-        let mut b = Vec::with_capacity(16);
+        let mut b = Opt([0; 16], 0);
         b.extend_from_slice(&((ns / 1_000_000_000) as i64).to_le_bytes());
         b.extend_from_slice(&((ns % 1_000_000_000 / 1000) as i64).to_le_bytes());
         b
     };
     let tcp = sock.kind == Kind::Tcp;
-    let o = sock.st.lock().opts.clone();
-    let bytes = match (level, name) {
+    let o = sock.st.lock().opts;
+    let opt = match (level, name) {
         (SOL_SOCKET, SO_TYPE) => int(match sock.kind {
             Kind::Tcp => SOCK_STREAM,
             Kind::Udp => SOCK_DGRAM,
@@ -500,7 +540,7 @@ fn getsockopt(sock: &Arc<InetSock>, level: u64, name: u64, val: u64, lenp: u64) 
             b.extend_from_slice(&o.linger.unwrap_or(0).to_le_bytes());
             b
         }
-        (SOL_SOCKET, n) if PLAIN_SOCKET.contains(&n) => int(o.plain.get(&(level, n)).copied().unwrap_or(0) as i64),
+        (SOL_SOCKET, n) if PLAIN_SOCKET.contains(&n) => int(plain(&o, level, n) as i64),
         (SOL_TCP, _) if !tcp => return Err(ENOPROTOOPT),
         (SOL_TCP, TCP_NODELAY) => int(o.nodelay as i64),
         (SOL_TCP, TCP_KEEPIDLE) => int(o.keepidle as i64),
@@ -508,19 +548,20 @@ fn getsockopt(sock: &Arc<InetSock>, level: u64, name: u64, val: u64, lenp: u64) 
         (SOL_TCP, TCP_KEEPCNT) => int(o.keepcnt as i64),
         // The MSS of a connection on the 1500-byte links; 536 before one.
         (SOL_TCP, TCP_MAXSEG) => int(if sock.name(true).is_ok() { 1460 } else { 536 }),
-        (SOL_TCP, n) if PLAIN_TCP.contains(&n) => int(o.plain.get(&(level, n)).copied().unwrap_or(0) as i64),
+        (SOL_TCP, n) if PLAIN_TCP.contains(&n) => int(plain(&o, level, n) as i64),
         (SOL_IP, IP_TTL) => int(o.ttl as i64),
-        (SOL_IP, IP_TOS) => int(o.plain.get(&(level, name)).copied().unwrap_or(0) as i64),
+        (SOL_IP, IP_TOS) => int(plain(&o, level, name) as i64),
         (SOL_IP, IP_MTU) => {
             if sock.name(true).is_err() {
                 return Err(ENOTCONN);
             }
             int(1500)
         }
-        (SOL_IP, n) if PLAIN_IP.contains(&n) => int(o.plain.get(&(level, n)).copied().unwrap_or(0) as i64),
-        (SOL_UDP, n) if sock.kind == Kind::Udp && PLAIN_UDP.contains(&n) => int(o.plain.get(&(level, n)).copied().unwrap_or(0) as i64),
+        (SOL_IP, n) if PLAIN_IP.contains(&n) => int(plain(&o, level, n) as i64),
+        (SOL_UDP, n) if sock.kind == Kind::Udp && PLAIN_UDP.contains(&n) => int(plain(&o, level, n) as i64),
         _ => return Err(ENOPROTOOPT),
     };
+    let bytes = &opt.0[..opt.1];
     let n = bytes.len().min(cap as usize);
     usercopy::to_program(val, &bytes[..n])?;
     usercopy::write(lenp, &(n as i32))?;

@@ -783,20 +783,22 @@ impl Instance {
     /// batches of `COMMIT_BATCH` pages, each one's frames gotten first with
     /// no lock held, then committed and mapped under the area's lock (never
     /// a wait for memory under it: a decommit, which gives memory back,
-    /// never waits behind a commit that waits for memory).
-    fn commit_heap(&self, addr: u64, len: u64) -> Result<u64, i64> {
+    /// never waits behind a commit that waits for memory). Without
+    /// `use_reserve` (`COMMIT_NO_RESERVE`) all of it is committed against
+    /// the limit, the instance's reserve left as it is.
+    fn commit_heap(&self, addr: u64, len: u64, use_reserve: bool) -> Result<u64, i64> {
         let end = heap_range(addr, len)?;
         let mut total = 0;
         let mut at = addr;
         while at < end {
             let to = (at + COMMIT_BATCH * PAGE).min(end);
-            total += self.commit_batch(at, to)?;
+            total += self.commit_batch(at, to, use_reserve)?;
             at = to;
         }
         Ok(total)
     }
 
-    fn commit_batch(&self, from: u64, to: u64) -> Result<u64, i64> {
+    fn commit_batch(&self, from: u64, to: u64, use_reserve: bool) -> Result<u64, i64> {
         let mapper = unsafe { OffsetPageTable::new(table_at(self.view), memory::phys_offset()) };
         let missing = || (from..to).step_by(PAGE as usize).filter(|&at| mapper.translate_page(heap_page(at)).is_err()).count();
         let want = missing();
@@ -829,9 +831,9 @@ impl Instance {
             free(&mut frames);
             return Err(ENOMEM);
         }
-        // From the instance's own reserve first (committed already), the
-        // rest as any commitment.
-        let plan = area.charge.begin(missing, &HEAP_POOL);
+        // From the instance's own reserve first (committed already, unless
+        // the server may fail the allocation), the rest as any commitment.
+        let plan = area.charge.begin(missing, &HEAP_POOL, use_reserve);
         if plan.fresh > 0 && !memory::commit(plan.fresh) {
             memory::uncommit(area.charge.abort(plan, &HEAP_POOL, HEAP_RESERVE));
             // Said once per instance (a tree can make it happen at will).
@@ -1752,7 +1754,12 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             cache.fail(offset / PAGE)?;
             Ok(0)
         }
-        SYS_SHARED_COMMIT => Ok(instance.commit_heap(a[0], a[1])? as i64),
+        SYS_SHARED_COMMIT => {
+            if a[2] & !COMMIT_NO_RESERVE != 0 {
+                return Err(EINVAL);
+            }
+            Ok(instance.commit_heap(a[0], a[1], a[2] & COMMIT_NO_RESERVE == 0)? as i64)
+        }
         SYS_SHARED_DECOMMIT => Ok(instance.decommit_heap(a[0], a[1])? as i64),
         SYS_SHARED_DECOMMIT_RUNS => Ok(instance.decommit_list(a[0], a[1])? as i64),
         SYS_INITRAMFS => {

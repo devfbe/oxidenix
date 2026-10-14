@@ -237,8 +237,9 @@ fn dispatch(s: &mut State) -> i64 {
         // The test hooks reach beyond the caller (the instance's test
         // objects, the test service, /data files, the server's heap and
         // locks): only for the self-tests.
-        TEST_MAP..=TEST_HEAP_STATS if !test_mode() => -ENOSYS,
+        TEST_MAP..=TEST_FAIL_NTH if !test_mode() => -ENOSYS,
         TEST_MAP..=TEST_CACHED => test(s.rax, s.rdi),
+        TEST_FAIL_NTH => heap::fail_nth(s.rdi),
         TEST_MKWRITE_FAIL => datafs::fail_next_mkwrite(s.rdi),
         TEST_FILL_GONE => datafs::fail_next_fill(s.rdi, s.rsi),
         TEST_SLEEP_LOCKED => match TEST_SLEEP_LOCK.lock() {
@@ -283,8 +284,10 @@ fn dispatch(s: &mut State) -> i64 {
             static SAID: [AtomicU64; (FIRST_NON_LINUX as usize).div_ceil(64)] = [const { AtomicU64::new(0) }; (FIRST_NON_LINUX as usize).div_ceil(64)];
             let bit = 1u64 << (nr % 64);
             if SAID[(nr / 64) as usize].fetch_or(bit, Ordering::Relaxed) & bit == 0 {
-                let text = alloc::format!("syscall {} not implemented", nr);
-                syscall(SYS_SERVER_LOG, [text.as_ptr() as u64, text.len() as u64, 0, 0, 0, 0]);
+                // (Said if there is memory for it.)
+                if let Ok(text) = try_format!("syscall {} not implemented", nr) {
+                    syscall(SYS_SERVER_LOG, [text.as_ptr() as u64, text.len() as u64, 0, 0, 0, 0]);
+                }
             }
             -ENOSYS
         }

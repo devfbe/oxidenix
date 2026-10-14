@@ -310,6 +310,23 @@ impl<L: RawLock, B: Backing> Heap<L, B> {
         true
     }
 
+    /// Makes sure at least `n` free pages are committed (a run of `n`
+    /// committed and freed again if fewer are): whether they are. Allocations
+    /// that cannot fail are served from them without a commit, as far as no
+    /// other thread takes them first (the caller's "preload" before an
+    /// insert into a structure that has no fallible form).
+    pub fn ensure_free(&self, n: usize) -> bool {
+        if self.pages.lock().free_committed >= n {
+            return true;
+        }
+        let p = self.alloc_pages(n);
+        if p.is_null() {
+            return false;
+        }
+        self.free_pages(p as usize, n);
+        true
+    }
+
     /// Gives free committed memory back, down to what the heap keeps
     /// (`KEEP_FLOOR` pages, or an eighth of what is allocated if more). From
     /// a thread that holds none of the heap's locks.

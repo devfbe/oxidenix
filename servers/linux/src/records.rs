@@ -7,6 +7,7 @@
 //! vfork, a thread without it) gets a copy made at the call: the child sees the directory of
 //! the moment of the fork, whatever its parent does next.
 
+use crate::heap::NoMem;
 use crate::local;
 use crate::sync::Mutex;
 use alloc::string::String;
@@ -30,12 +31,14 @@ pub fn root() -> Arc<FsContext> {
     Arc::new(FsContext { state: Mutex::new(FsState { cwd: String::from("/"), umask: 0o022, test: 0 }) })
 }
 
-/// A copy of `of` (a clone without `CLONE_FS`).
-pub fn copy(of: &FsContext) -> Arc<FsContext> {
+/// A copy of `of` (a clone without `CLONE_FS`); ENOMEM without memory for it (the cwd may
+/// be up to PATH_MAX long, and every fork makes one).
+pub fn copy(of: &FsContext) -> Result<Arc<FsContext>, NoMem> {
     let st = of.state.lock();
-    let copy = FsState { cwd: st.cwd.clone(), umask: st.umask, test: st.test };
+    let cwd = crate::heap::try_string(&st.cwd);
+    let (umask, test) = (st.umask, st.test);
     drop(st);
-    Arc::new(FsContext { state: Mutex::new(copy) })
+    crate::heap::try_arc(FsContext { state: Mutex::new(FsState { cwd: cwd?, umask, test }) })
 }
 
 /// The calling thread's record (a service thread, which has none, gets a new one at the

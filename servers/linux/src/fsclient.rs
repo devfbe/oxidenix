@@ -155,12 +155,16 @@ impl Scratch<'_> {
         unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), self.base().add(offset as usize), n) };
     }
 
-    /// A copy of `len` bytes at `offset` (as many as there are).
-    pub fn get(&self, offset: u64, len: u64) -> alloc::vec::Vec<u8> {
+    /// A copy of `len` bytes at `offset` (as many as there are; ENOMEM
+    /// without memory for it: what a program reads).
+    pub fn get(&self, offset: u64, len: u64) -> Result<alloc::vec::Vec<u8>, crate::heap::NoMem> {
         let n = len.min(self.len().saturating_sub(offset)) as usize;
-        let mut out = alloc::vec![0u8; n];
-        unsafe { core::ptr::copy_nonoverlapping(self.base().add(offset as usize), out.as_mut_ptr(), n) };
-        out
+        let mut out = crate::heap::try_vec(n)?;
+        unsafe {
+            core::ptr::copy_nonoverlapping(self.base().add(offset as usize), out.as_mut_ptr(), n);
+            out.set_len(n);
+        }
+        Ok(out)
     }
 }
 
