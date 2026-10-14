@@ -47,6 +47,7 @@ mod netdev;
 mod netlink;
 mod pathfile;
 mod paths;
+mod pidfd;
 mod pipe;
 mod process;
 mod poll;
@@ -63,6 +64,7 @@ mod sync;
 mod system;
 mod time;
 mod timer;
+mod timerfd;
 mod tmpfile;
 mod tmpfs;
 mod tty;
@@ -220,6 +222,8 @@ fn dispatch(s: &mut State) -> i64 {
         .or_else(|| signal::handle(s))
         .or_else(|| exec::handle(s))
         .or_else(|| timer::handle(s))
+        .or_else(|| timerfd::handle(s))
+        .or_else(|| pidfd::handle(s))
         .or_else(|| time::handle(s))
         .or_else(|| fdtable::handle(s))
         .or_else(|| files::handle(s))

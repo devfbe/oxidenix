@@ -153,6 +153,9 @@ pub unsafe extern "C" fn user_return() {
 
 extern "sysv64" fn dispatch(f: &mut Frame) {
     crate::counters::add(|c| &c.syscalls, 1);
+    // The CPU-time alarms a tick in the kernel brought due (`cputimer`; one in user
+    // mode was looked at on its way out of the interrupt).
+    super::cputimer::check(super::sched::current());
     match super::linux::mode() {
         // A Linux program's system call goes to its server.
         Some(true) => {

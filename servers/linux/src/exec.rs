@@ -981,6 +981,8 @@ fn finish(p: &mut Prepared, comm: [u8; 16], brk: u64) {
         // A vfork parent goes on: the child no longer uses its memory.
         (core::mem::replace(&mut proc.vfork, false).then(|| proc.words.clone()), old_exe)
     };
+    // POSIX timers are deleted (interval timers stay).
+    crate::timer::exec(&mut t, pid);
     drop(t);
     if let Some(w) = words {
         w.vfork.store(1, core::sync::atomic::Ordering::Release);

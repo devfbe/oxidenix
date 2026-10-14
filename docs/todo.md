@@ -28,8 +28,10 @@ done, delete it here in the same commit.
 
 ## Linux features not implemented
 
-- Processes and signals: pidfds (`CLONE_PIDFD`, `P_PIDFD`), POSIX timers, `ITIMER_VIRTUAL` and
-  `ITIMER_PROF`, core files, `ptrace`, a vDSO.
+- Processes and signals: thread pidfds (`PIDFD_THREAD`, `CLONE_PIDFD` with `CLONE_THREAD`;
+  Linux 6.9), `/proc/<pid>/fdinfo` (a pidfd's `Pid:` line), `clock_nanosleep` on CPU clocks
+  (`EOPNOTSUPP`; the CPU-time alarms would carry it), core files, `ptrace`, a vDSO.
+  `TFD_TIMER_CANCEL_ON_SET` sees only the tree's own settings of the wall clock.
 - Files: owners and groups are accepted but not stored (everyone is root), `io_uring`
   (`ENOSYS`).
 - Terminal: packet mode (`TIOCPKT`), the Linux console's VT and keyboard ioctls, serial input.

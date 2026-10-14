@@ -7,6 +7,7 @@
 pub mod address_space;
 pub mod channel;
 mod clock;
+pub mod cputimer;
 pub mod elf;
 pub mod errno;
 mod exec;

@@ -139,6 +139,8 @@ pub struct ThreadGroup {
     /// stack's ceiling): unbounded until the Linux server sets it, copied
     /// by a fork.
     pub stack_soft: AtomicU64,
+    /// Deadlines on its CPU clocks the Linux server armed (`super::cputimer`).
+    pub alarms: super::cputimer::Alarms,
 }
 
 impl ThreadGroup {
@@ -153,6 +155,7 @@ impl ThreadGroup {
             server_reaps: AtomicBool::new(false),
             killed_by_kernel: AtomicU64::new(0),
             stack_soft: AtomicU64::new(u64::MAX),
+            alarms: super::cputimer::Alarms::new(),
         })
         .ok()
     }
@@ -243,9 +246,18 @@ pub struct Task {
     pub pi_wait: AtomicU8,
     pub pi_gone: AtomicBool,
     /// Timer ticks that found it in user mode and in the kernel: they
-    /// split its exactly measured run time into user and system time.
+    /// split its exactly measured run time into user and system time. A
+    /// Linux program's thread is in user mode while its program runs; its
+    /// server's time, though in user mode, is the system time of the program's
+    /// calls (as Linux's kernel time is).
     pub utime: AtomicU64,
     pub stime: AtomicU64,
+    /// Deadlines on its CPU clocks the Linux server armed, and its ticks when it last
+    /// looked at them and its process's (`super::cputimer`; only the task itself writes it).
+    pub alarms: super::cputimer::Alarms,
+    pub alarm_ticks: AtomicU64,
+    /// The (user, system) split `cputime` reported last.
+    cputime_prev: IrqSpinLock<(u64, u64)>,
     /// Run time: nanoseconds of finished time slices, and the start of the
     /// current one (0 while not running), written by the CPU switching it
     /// under a sequence counter that readers on other CPUs retry on.
@@ -301,6 +313,9 @@ impl Task {
             pi_gone: AtomicBool::new(false),
             utime: AtomicU64::new(0),
             stime: AtomicU64::new(0),
+            alarms: super::cputimer::Alarms::new(),
+            alarm_ticks: AtomicU64::new(0),
+            cputime_prev: IrqSpinLock::new((0, 0)),
             run_seq: AtomicU64::new(0),
             run_ns: AtomicU64::new(0),
             run_since: AtomicU64::new(0),
@@ -392,9 +407,23 @@ impl Task {
         }
     }
 
-    /// (user, system) CPU time in nanoseconds.
+    /// (user, system) CPU time in nanoseconds: the run time split in the ratio of its ticks,
+    /// neither part ever less than it was reported before (Linux's `cputime_adjust`: a
+    /// sampled ratio moves both ways, the clocks timers count on must not).
     pub fn cputime(&self) -> (u64, u64) {
-        crate::time::split(self.runtime(), self.utime.load(Ordering::Relaxed), self.stime.load(Ordering::Relaxed))
+        let run = self.runtime();
+        let mut prev = self.cputime_prev.lock();
+        let (_, sampled) = crate::time::split(run, self.utime.load(Ordering::Relaxed), self.stime.load(Ordering::Relaxed));
+        // (The run time never goes back, so the reported parts fit in it.)
+        let run = run.max(prev.0 + prev.1);
+        let mut system = sampled.max(prev.1);
+        let mut user = run - system;
+        if user < prev.0 {
+            user = prev.0;
+            system = run - user;
+        }
+        *prev = (user, system);
+        (user, system)
     }
 
     /// The task's own state.

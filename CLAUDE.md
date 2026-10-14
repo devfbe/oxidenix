@@ -99,7 +99,9 @@ An AI research project; see README.md.
     `inet.rs`/`inetcalls.rs`/`netclient.rs` (internet sockets over the channel to netd, the net
     thread), `netdev.rs`/`netlink.rs` + `crates/netlink` (interfaces, `NETLINK_ROUTE`),
     `procfs.rs`/`procfile.rs` (`/proc` and `/sys`: procfs's files over the rings, the
-    per-process part and the magic links), `inotify.rs`.
+    per-process part and the magic links), `inotify.rs`, `timer.rs`/`timerfd.rs` (interval
+    and POSIX timers, timerfds; timers on CPU clocks over the kernel's CPU-time alarms,
+    `kernel/src/process/cputimer.rs`), `pidfd.rs`.
   - Node.js: `userspace/node` (build, smoke tests `tests/*.test.mjs`, runner `run-node.sh`).
   - Memory: `kernel/src/memory/`, `kernel/src/process/address_space.rs`, page cache
     `kernel/src/fs/cache.rs`.

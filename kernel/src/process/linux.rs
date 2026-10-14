@@ -378,6 +378,9 @@ pub struct Instance {
     /// A thread of the server failed (`break_instance`):
     /// the server's state is lost, its lock waits end (`FUTEX_LOCK`).
     broken: core::sync::atomic::AtomicBool,
+    /// The word of the server's that a CPU-time alarm advances and wakes when it fires
+    /// (`SYS_CPU_ALARM`; 0: none yet).
+    cpu_word: core::sync::atomic::AtomicU64,
 }
 
 /// A memory object mapped into the region (`Instance::map_object`).
@@ -530,6 +533,7 @@ impl Instance {
             tasks: spin::Mutex::new(BTreeMap::new()),
             init_args: spin::Mutex::new(Vec::new()),
             broken: core::sync::atomic::AtomicBool::new(false),
+            cpu_word: core::sync::atomic::AtomicU64::new(0),
         };
         instance.entry = instance.load(image)?;
         // The heap's reserve as far as there is room (none: the tree starts
@@ -1534,6 +1538,22 @@ pub fn mode() -> Option<bool> {
     with_current(|p| p.linux.as_ref().map(|l| l.restricted))
 }
 
+/// A CPU-time alarm of the calling thread or its process fired (`cputimer::check`): its
+/// server's word for them advances and is woken (the server's timer thread looks at its
+/// timers on CPU clocks). Only where the thread's own state may be used.
+pub fn cpu_alarm_fired() {
+    use core::sync::atomic::Ordering;
+    let Some(instance) = with_current(|p| p.linux.as_ref().map(|l| l.instance.clone())) else { return };
+    let addr = instance.cpu_word.load(Ordering::Acquire);
+    if addr == 0 {
+        return;
+    }
+    if let Ok(word) = instance.word(addr) {
+        word.get().fetch_add(1, Ordering::Release);
+    }
+    super::futex::server_wake(Arc::as_ptr(&instance) as usize, addr, u32::MAX as u64);
+}
+
 /// Whether the calling thread runs its Linux server (the normal view
 /// loaded).
 pub fn in_server() -> bool {
@@ -1844,7 +1864,7 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
                 }
             }
         }
-        SYS_PROC_SELF..=SYS_RANDOM => process_call(&instance, nr, a),
+        SYS_PROC_SELF..=SYS_RANDOM | SYS_CPU_ALARM => process_call(&instance, nr, a),
         SYS_SET_USERCOPY => {
             let (insn, fixup) = (a[0], a[1]);
             let code = IMAGE_BASE..THREADS_BASE;
@@ -2482,7 +2502,7 @@ fn process_call(instance: &Arc<Instance>, nr: u64, a: [u64; 6]) -> SysResult {
     use core::sync::atomic::Ordering::{Acquire, Relaxed, Release};
     // Service threads serve no program: they may only look at threads and
     // processes, and kick or kill them.
-    let service = matches!(nr, SYS_THREAD_KICK | SYS_THREAD_KILL | SYS_PROC_INFO | SYS_THREAD_INFO | SYS_THREAD_AFFINITY | SYS_THREAD_NAME);
+    let service = matches!(nr, SYS_THREAD_KICK | SYS_THREAD_KILL | SYS_PROC_INFO | SYS_THREAD_INFO | SYS_THREAD_AFFINITY | SYS_THREAD_NAME | SYS_CPU_ALARM);
     if is_pager() && !service {
         return Err(EPERM);
     }
@@ -2563,6 +2583,28 @@ fn process_call(instance: &Arc<Instance>, nr: u64, a: [u64; 6]) -> SysResult {
             };
             super::uaccess::copy_to_server(a[1], as_bytes(&out))?;
             Ok(0)
+        }
+        SYS_CPU_ALARM => {
+            use super::cputimer::{TOTAL, USER};
+            let (target, flags, deadline, word) = (a[0], a[1], a[2], a[3]);
+            if flags & !(CPU_ALARM_THREAD | CPU_ALARM_USER) != 0 {
+                return Err(EINVAL);
+            }
+            if deadline != 0 {
+                instance.word_mapped(word)?;
+                instance.cpu_word.store(word, Release);
+            }
+            let clock = if flags & CPU_ALARM_USER != 0 { USER } else { TOTAL };
+            let pick = |(user, system): (u64, u64)| if clock == USER { user } else { user + system };
+            let past = if flags & CPU_ALARM_THREAD != 0 {
+                let t = thread_by_key(instance, target)?;
+                t.alarms.arm(clock, deadline, pick(t.cputime()))
+            } else {
+                let group = if target == 0 { super::sched::current().group.clone() } else { container(instance, target)?.group.clone() };
+                let now = pick(group.info.lock().cputime());
+                group.alarms.arm(clock, deadline, now)
+            };
+            Ok(past as i64)
         }
         SYS_THREAD_AFFINITY => {
             let t = thread_by_key(instance, a[0])?;

@@ -83,6 +83,10 @@ pub enum File {
     Epoll(Arc<crate::epoll::Epoll>),
     /// An open file of /proc or /sys.
     Proc(Arc<crate::procfile::ProcOpen>),
+    /// A timerfd.
+    TimerFd(Arc<crate::timerfd::TimerFd>),
+    /// A pidfd (a process).
+    PidFd(Arc<crate::pidfd::PidFd>),
 }
 
 impl File {
@@ -154,6 +158,8 @@ impl Description {
                     0
                 }
             }
+            File::TimerFd(t) => t.ready(),
+            File::PidFd(p) => p.ready(),
             File::Path(_) => POLLNVAL,
             File::Tmp(_) | File::Data(_) | File::Dev(_) | File::Proc(_) => ALWAYS_READY,
         }
@@ -493,6 +499,8 @@ pub fn stat_file(file: &File) -> Result<vfs::stat::Stat, i64> {
         File::Path(p) => p.origin.stat()?,
         File::Epoll(e) => e.stat(),
         File::Proc(p) => crate::procfs::stat(&p.node)?,
+        File::TimerFd(t) => t.stat(),
+        File::PidFd(p) => p.stat(),
     };
     Ok(vfs::stat::Stat::from_bytes(&bytes))
 }
@@ -651,6 +659,8 @@ fn on_file(nr: u64, file: &File, flags: u32, a1: u64, a2: u64, a3: u64) -> Resul
         File::Path(p) => return crate::pathfile::call(nr, p, a1),
         File::Epoll(e) => return crate::epoll::on_file(nr, e, a1),
         File::Proc(p) => return crate::procfile::call(nr, p, flags, a1, a2, a3),
+        File::TimerFd(t) => return crate::timerfd::call(nr, t, flags, a1, a2),
+        File::PidFd(p) => return crate::pidfd::call(nr, p, a1),
     };
     let readable = flags & O_ACCMODE != O_WRONLY;
     let writable = flags & O_ACCMODE != 0;
@@ -731,7 +741,7 @@ fn sendfile(out_fd: u64, in_fd: u64, offset: u64, count: u64) -> Result<i64, i64
     // An eventfd moves 8-byte values, not data; a directory none; a
     // netlink socket datagrams; an epoll instance nothing.
     // (/dev/kmsg moves whole records, not a stream: Linux's has no splice either.)
-    let unfit = |f: &File| matches!(f, File::EventFd(_) | File::Netlink(_) | File::Inotify(_) | File::Epoll(_) | File::Kmsg(_));
+    let unfit = |f: &File| matches!(f, File::EventFd(_) | File::Netlink(_) | File::Inotify(_) | File::Epoll(_) | File::Kmsg(_) | File::TimerFd(_) | File::PidFd(_));
     if unfit(&out.file) || unfit(&input.file) {
         return Err(EINVAL);
     }
@@ -763,7 +773,7 @@ fn sendfile(out_fd: u64, in_fd: u64, offset: u64, count: u64) -> Result<i64, i64
             File::PtyMaster(m) => m.read(crate::unix::Sink::Server { buf: &mut buf[..want], at: 0 }, in_flags & O_NONBLOCK != 0),
             File::Dev(d) => crate::devices::read(d, crate::unix::Sink::Server { buf: &mut buf[..want], at: 0 }),
             File::Proc(f) => f.read_server(&mut buf[..want]).map(|n| n as i64),
-            File::EventFd(_) | File::Netlink(_) | File::Inotify(_) | File::Epoll(_) | File::Kmsg(_) | File::Path(_) => Err(EINVAL),
+            File::EventFd(_) | File::Netlink(_) | File::Inotify(_) | File::Epoll(_) | File::Kmsg(_) | File::Path(_) | File::TimerFd(_) | File::PidFd(_) => Err(EINVAL),
         };
         let n = match n {
             Ok(n) => n as usize,
@@ -783,7 +793,7 @@ fn sendfile(out_fd: u64, in_fd: u64, offset: u64, count: u64) -> Result<i64, i64
             File::PtyMaster(m) => m.write(crate::unix::Source::Server { buf: &buf[..n], at: 0 }, out_flags & O_NONBLOCK != 0),
             File::Dev(_) => Ok(n as i64),
             File::Path(_) | File::Proc(_) => Err(EBADF),
-            File::EventFd(_) | File::Netlink(_) | File::Inotify(_) | File::Epoll(_) | File::Kmsg(_) => Err(EINVAL),
+            File::EventFd(_) | File::Netlink(_) | File::Inotify(_) | File::Epoll(_) | File::Kmsg(_) | File::TimerFd(_) | File::PidFd(_) => Err(EINVAL),
         };
         match wrote {
             Ok(_) => total += n as u64,

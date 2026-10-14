@@ -85,6 +85,26 @@ Interval timers get a service thread of their own (`ROLE_TIMER`): the kernel's t
 mechanism (deadline sleeps), the timer's semantics (SIGALRM, reloading when the signal is
 taken) are the server's.
 
+**Timers on CPU clocks** (added 2026-10-14: `ITIMER_VIRTUAL`, `ITIMER_PROF`, POSIX timers on
+CPU clocks) rest on one more mechanism, **CPU-time alarms** (`cpu_alarm`): the server arms,
+per process and thread, a deadline on its user-time clock and one on its user-and-system
+clock (the earliest of its timers on each), and the kernel, which accounts CPU time per
+thread anyway, disarms one its clock reached and advances and wakes the timer thread's
+word. It looks when a scheduler tick found a thread of the clock running, on the thread's
+way back to user mode or at its next call (Linux's tick runs the CPU timers of the task it
+interrupted, their expiry on its way back to user space since 5.11), so an alarm is at
+most a tick late and costs nothing while none is armed (two loads per tick and call).
+*Alternatives:* the timer thread polling the clocks: a wake-up per tick per process for
+nothing, and late by its own period; the kernel sending the signal: Linux semantics in the
+kernel (R9); a precise one-shot hardware timer per running thread at its slice start: exact
+to the nanosecond, but a timer reprogram per context switch of every armed thread, for a
+precision Linux does not give either. So that `ITIMER_VIRTUAL` counts the program's time
+only, a tick in user mode counts as user time for a Linux thread only while its program
+runs; the server's time on the thread is the system time of the program's calls (as
+Linux's kernel time), also in `getrusage`, `times` and `/proc`; and neither part of a
+thread's split goes back (the sampled ratio moves both ways; Linux's `cputime_adjust`), so
+the user-time clock is one a deadline can be set on.
+
 ## Consequences
 
 - The kernel loses `exec.rs`'s and `loader.rs`'s Linux side, the Linux parts of `signal.rs`,
@@ -100,5 +120,7 @@ taken) are the server's.
   loader with a few mapping calls. `iobench` measures fork, exec and wait.
 - Real-time signals are queued up to 4096 per instance: as Linux's RLIMIT_SIGPENDING per
   user, since everyone in a tree is root.
-- Not done: pidfds (`CLONE_PIDFD`, `P_PIDFD`), POSIX timers (`timer_create`),
-  `ITIMER_VIRTUAL`/`ITIMER_PROF`, core files, ptrace, a vDSO.
+- pidfds (2026-10-14) name a process by its words (`process::Words`, kept by an `Arc`), not
+  by its pid alone, which is reused after the reap; the words carry the process's state for
+  them and the ids its end reports to.
+- Not done: thread pidfds (`PIDFD_THREAD`, Linux 6.9), core files, ptrace, a vDSO.

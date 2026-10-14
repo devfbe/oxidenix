@@ -82,13 +82,14 @@ const CLONE_IO: u64 = 0x8000_0000;
 const CLONE_CLEAR_SIGHAND: u64 = 0x1_0000_0000;
 const CLONE_INTO_CGROUP: u64 = 0x2_0000_0000;
 
-/// What clone accepts: namespaces, pidfds and cgroups are EINVAL; SYSVSEM, PTRACE, UNTRACED,
+/// What clone accepts: namespaces and cgroups are EINVAL; SYSVSEM, PTRACE, UNTRACED,
 /// DETACHED and IO change nothing here.
 const CLONE_SUPPORTED: u64 = CSIGNAL
     | CLONE_VM
     | CLONE_FS
     | CLONE_FILES
     | CLONE_SIGHAND
+    | CLONE_PIDFD
     | CLONE_PTRACE
     | CLONE_VFORK
     | CLONE_PARENT
@@ -115,6 +116,26 @@ pub struct Words {
     pub stop: AtomicU32,
     /// 1 once the process (a vfork child) exec'd or ended: its parent waits for it.
     pub vfork: AtomicU32,
+    /// For its pidfds (`pidfd`): `ALIVE`, `EXITED` (a zombie) or `REAPED`.
+    pub state: AtomicU32,
+    /// Its pidfds (their descriptions' ids), which hear of its end.
+    pub pidfds: Mutex<Vec<u64>>,
+}
+
+/// `Words::state`.
+pub const ALIVE: u32 = 0;
+pub const EXITED: u32 = 1;
+pub const REAPED: u32 = 2;
+
+impl Words {
+    /// Its pidfds' pollers hear of its state (it exited, or was reaped): after the process
+    /// lock (the reports take the pollers' locks).
+    fn report(&self) {
+        let ready = crate::pidfd::readiness(self.state.load(Ordering::Acquire));
+        for &id in self.pidfds.lock().iter() {
+            crate::files::ready(id, ready);
+        }
+    }
 }
 
 /// CPU time in nanoseconds and the most pages resident.
@@ -186,7 +207,9 @@ pub struct Proc {
     pub report: Option<Report>,
     /// What its reaped children used (with their reaped children).
     pub children_usage: Usage,
-    pub itimer: crate::timer::ITimer,
+    /// Its interval and POSIX timers, and its CPU clocks' alarms in the kernel.
+    pub timers: crate::timer::Timers,
+    pub cpu: crate::timer::CpuAlarm,
     pub brk: Arc<Mutex<Brk>>,
     pub words: Arc<Words>,
     /// Descriptor tables of its threads handed to the worker and not let go of yet
@@ -226,6 +249,8 @@ pub struct Thread {
     /// Its robust futex list's head in the program's memory (set_robust_list; 0: none),
     /// walked when it exits or execs (`futex::exit_robust`).
     pub robust: u64,
+    /// Its CPU clock's alarms in the kernel (`timer`).
+    pub cpu: crate::timer::CpuAlarm,
 }
 
 pub struct Table {
@@ -512,7 +537,8 @@ pub fn register_init(key: u64) {
             sig: signal::ProcSignals::new(hand),
             report: None,
             children_usage: Usage::default(),
-            itimer: Default::default(),
+            timers: Default::default(),
+            cpu: Default::default(),
             brk: Arc::new(Mutex::new(Brk::default())),
             words: Arc::new(Words::default()),
             tables_out: 0,
@@ -521,7 +547,7 @@ pub fn register_init(key: u64) {
         };
         t.procs.insert(pid, p);
         let serial = t.new_serial();
-        t.threads.insert(pid, Thread { tid: pid, pid, key, fs, files: Some(files), limits, comm: comm_from("init"), sig: signal::ThreadSignals::default(), exited: false, serial, reserved, robust: 0 });
+        t.threads.insert(pid, Thread { tid: pid, pid, key, fs, files: Some(files), limits, comm: comm_from("init"), sig: signal::ThreadSignals::default(), exited: false, serial, reserved, robust: 0, cpu: Default::default() });
         t.keys.insert(key, pid);
         local::set(pid, pid, key, fs_ptr, files_ptr, limits_ptr);
     }
@@ -553,8 +579,10 @@ pub fn handle(s: &mut State) -> Option<i64> {
         SYS_VFORK => clone(s, Clone { flags: CLONE_VM | CLONE_VFORK, exit_signal: signal::SIGCHLD as u64, legacy: true, ..Clone::default() }),
         SYS_CLONE => {
             // x86-64's order: flags, stack, parent_tid, child_tid, tls.
+            // (CLONE_PIDFD's descriptor goes where CLONE_PARENT_SETTID's tid would.)
             let flags = a0 & 0xffff_ffff;
-            clone(s, Clone { flags: flags & !CSIGNAL, exit_signal: flags & CSIGNAL, stack: a1, ptid: a2, ctid: a3, tls: a4, legacy: true })
+            let pidfd = if flags & CLONE_PIDFD != 0 { a2 } else { 0 };
+            clone(s, Clone { flags: flags & !CSIGNAL, exit_signal: flags & CSIGNAL, stack: a1, ptid: a2, ctid: a3, tls: a4, pidfd, legacy: true })
         }
         SYS_CLONE3 => clone3(s, a0, a1),
         SYS_EXIT => exit(((a0 & 0xff) << 8) as i32, false),
@@ -589,6 +617,8 @@ struct Clone {
     ptid: u64,
     ctid: u64,
     tls: u64,
+    /// Where CLONE_PIDFD's descriptor goes (an int).
+    pidfd: u64,
     /// clone(2) rather than clone3 (whose stack is a base and a size, checked stricter).
     legacy: bool,
 }
@@ -616,8 +646,9 @@ fn clone3(s: &State, args: u64, size: u64) -> Result<i64, i64> {
         at += n as u64;
     }
     let [flags, pidfd, child_tid, parent_tid, exit_signal, stack, stack_size, tls, set_tid, set_tid_size, cgroup] = raw;
-    let _ = (pidfd, cgroup);
-    if set_tid != 0 || set_tid_size != 0 || flags & (CLONE_PIDFD | CLONE_INTO_CGROUP) != 0 {
+    let _ = cgroup;
+    // (CLONE_DETACHED's bit is kept for pidfds' future in clone3.)
+    if set_tid != 0 || set_tid_size != 0 || flags & (CLONE_INTO_CGROUP | CLONE_DETACHED) != 0 {
         return Err(EINVAL);
     }
     if exit_signal & !CSIGNAL != 0 || flags & CSIGNAL != 0 {
@@ -630,7 +661,8 @@ fn clone3(s: &State, args: u64, size: u64) -> Result<i64, i64> {
         return Err(EINVAL);
     }
     let top = if stack == 0 { 0 } else { stack.checked_add(stack_size).ok_or(EINVAL)? };
-    clone(s, Clone { flags, exit_signal, stack: top, ptid: parent_tid, ctid: child_tid, tls, legacy: false })
+    let pidfd = if flags & CLONE_PIDFD != 0 { pidfd } else { 0 };
+    clone(s, Clone { flags, exit_signal, stack: top, ptid: parent_tid, ctid: child_tid, tls, pidfd, legacy: false })
 }
 
 /// clone and its relatives: a new process (fork) or thread (CLONE_THREAD).
@@ -648,6 +680,11 @@ fn clone(s: &State, c: Clone) -> Result<i64, i64> {
         return Err(EINVAL);
     }
     if flags & CLONE_CLEAR_SIGHAND != 0 && flags & CLONE_SIGHAND != 0 {
+        return Err(EINVAL);
+    }
+    // A pidfd names a process (thread pidfds are Linux 6.9's); clone's goes where the
+    // parent's tid would, and CLONE_DETACHED's bit is kept for pidfds' future.
+    if flags & CLONE_PIDFD != 0 && (flags & CLONE_THREAD != 0 || (c.legacy && flags & (CLONE_PARENT_SETTID | CLONE_DETACHED) != 0)) {
         return Err(EINVAL);
     }
     if c.exit_signal > signal::NSIG as u64 {
@@ -863,7 +900,9 @@ fn clone(s: &State, c: Clone) -> Result<i64, i64> {
                 sig: signal::ProcSignals::new(hand),
                 report: None,
                 children_usage: Usage::default(),
-                itimer: Default::default(),
+                // Timers are not inherited.
+                timers: Default::default(),
+                cpu: Default::default(),
                 brk,
                 words,
                 tables_out: 0,
@@ -880,9 +919,33 @@ fn clone(s: &State, c: Clone) -> Result<i64, i64> {
         }
         let serial = t.new_serial();
         // (No robust list: a fork's or a thread's starts without one, as Linux's copy_process.)
-        t.threads.insert(tid, Thread { tid, pid, key: 0, fs, files: Some(files), limits, comm, sig: thread_sig, exited: false, serial, reserved: true, robust: 0 });
+        t.threads.insert(tid, Thread { tid, pid, key: 0, fs, files: Some(files), limits, comm, sig: thread_sig, exited: false, serial, reserved: true, robust: 0, cpu: Default::default() });
         serial
     };
+    // CLONE_PIDFD: the child's pidfd in the caller's table, its number in the caller's
+    // memory, before the child runs (a fork's child has the table copied before: it has
+    // none).
+    let mut pidfd = None;
+    if flags & CLONE_PIDFD != 0 {
+        let words = PROCS.lock().procs.get(&pid).map(|p| p.words.clone());
+        let installed = words.ok_or(ESRCH).and_then(|w| crate::pidfd::install(pid, &w, false)).and_then(|fd| {
+            pidfd = Some(fd);
+            usercopy::write(c.pidfd, &(fd as i32))
+        });
+        if let Err(e) = installed {
+            if let Some(fd) = pidfd {
+                drop(fdtable::current().take(fd as u64));
+            }
+            drop(birth);
+            let mut t = PROCS.lock();
+            let undone = undo_clone(&mut t, tid, pid, thread);
+            drop(t);
+            drop(undone);
+            fdtable::unreserve_end();
+            close_handle(handle);
+            return Err(e);
+        }
+    }
     // The child's registers: the caller's, returning 0, on the new stack.
     let mut child = *s;
     child.rax = 0;
@@ -896,6 +959,9 @@ fn clone(s: &State, c: Clone) -> Result<i64, i64> {
     let key = syscall(SYS_THREAD_CREATE, [handle, &child as *const State as u64, tflags, c.tls, ctid, cookie]);
     if key < 0 {
         drop(unsafe { alloc::boxed::Box::from_raw(cookie as *mut Birth) });
+        if let Some(fd) = pidfd {
+            drop(fdtable::current().take(fd as u64));
+        }
         let mut t = PROCS.lock();
         let undone = undo_clone(&mut t, tid, pid, thread);
         drop(t);
@@ -1099,6 +1165,8 @@ pub struct After {
     /// The program file of a process that ended (`Proc::exe`): perhaps a removed file's
     /// last reference.
     exe: Option<Arc<crate::namespace::Origin>>,
+    /// Processes that exited or were reaped, whose pidfds hear of it.
+    pidfds: Vec<Arc<Words>>,
 }
 
 impl After {
@@ -1106,6 +1174,9 @@ impl After {
         drop(self.exe);
         for h in self.handles {
             close_handle(h);
+        }
+        for w in self.pidfds {
+            w.report();
         }
         for sid in self.sessions {
             crate::tty::session_ended(sid as u64);
@@ -1130,13 +1201,14 @@ fn process_end(t: &mut Table, pid: Pid, after: &mut After) {
         // ENOENT. (One process ends per `After`.)
         debug_assert!(after.exe.is_none());
         after.exe = p.exe.take();
+        tell_pidfds(&p.words, EXITED, after);
         // A zombie takes no signals: its pending ones go (and the instance's count of queued
         // real-time ones).
         p.sig.shared.flush(!0, &mut t.rt_queued);
-        p.itimer = Default::default();
         (p.ppid, p.sid, p.pgid, core::mem::replace(&mut p.vfork, false))
     };
-    crate::timer::changed();
+    // Its timers go (and what their signals were counted as).
+    crate::timer::process_ended(t, pid);
     if vfork {
         let w = t.procs[&pid].words.clone();
         w.vfork.store(1, Ordering::Release);
@@ -1227,11 +1299,22 @@ fn notify_parent_exit(t: &mut Table, pid: Pid) -> bool {
 /// wait), its handle is closed after the lock.
 fn reap(t: &mut Table, pid: Pid, after: &mut After) {
     let Some(p) = t.procs.remove(&pid) else { return };
+    tell_pidfds(&p.words, REAPED, after);
     t.put_hand(p.sig.hand);
     if let Some(pp) = t.procs.get_mut(&p.ppid) {
         pp.children.retain(|&c| c != pid);
     }
     after.handles.push(p.handle);
+}
+
+/// The process of `words` exited or was reaped (`state`, lock held): its pidfds see it at
+/// once and their pollers hear of it after the lock.
+fn tell_pidfds(words: &Arc<Words>, state: u32, after: &mut After) {
+    words.state.store(state, Ordering::Release);
+    if !words.pidfds.lock().is_empty() {
+        // (Infallible: an end must not fail for memory; one entry per process end.)
+        after.pidfds.push(words.clone());
+    }
 }
 
 /// What a child used: its own CPU time and memory and its reaped children's.
@@ -1261,6 +1344,8 @@ const WCLONE: u64 = 0x8000_0000;
 #[derive(Clone, Copy)]
 enum Which {
     Pid(Pid),
+    /// The process of a pidfd: that pid while it has those words (`pidfd`).
+    PidFd(Pid, *const Words),
     Pgrp(Pid),
     Any,
 }
@@ -1296,6 +1381,7 @@ fn wait_child(which: Which, options: u64) -> Result<Option<Found>, i64> {
                 let Some(child) = t.procs.get(&c) else { continue };
                 let selected = match which {
                     Which::Pid(p) => c == p,
+                    Which::PidFd(p, words) => c == p && Arc::as_ptr(&child.words) == words,
                     Which::Pgrp(g) => child.pgid == g,
                     Which::Any => true,
                 };
@@ -1398,21 +1484,37 @@ fn waitid(idtype: u64, id: u32, infop: u64, options: u64, rusage: u64) -> Result
     const P_ALL: u64 = 0;
     const P_PID: u64 = 1;
     const P_PGID: u64 = 2;
+    const P_PIDFD: u64 = 3;
     if options & !(WNOHANG | WSTOPPED | WEXITED | WCONTINUED | WNOWAIT | WNOTHREAD | WALL | WCLONE) != 0 {
         return Err(EINVAL);
     }
     if options & (WEXITED | WSTOPPED | WCONTINUED) == 0 {
         return Err(EINVAL);
     }
+    // (Kept until the wait ends: the words a pidfd names its process by.)
+    let mut pidfd_words = None;
+    let mut nonblock = false;
     let which = match idtype {
         P_ALL => Which::Any,
         P_PID if id as i32 > 0 => Which::Pid(id),
         P_PGID if id == 0 => Which::Pgrp(PROCS.lock().procs.get(&local::pid()).map_or(0, |p| p.pgid)),
         P_PGID if (id as i32) > 0 => Which::Pgrp(id),
-        // P_PIDFD: there are no pidfds yet.
+        P_PIDFD if (id as i32) >= 0 => {
+            let (pid, words, nb) = crate::pidfd::wait_target(id as u64)?;
+            nonblock = nb;
+            let which = Which::PidFd(pid, Arc::as_ptr(&words));
+            pidfd_words = Some(words);
+            which
+        }
         _ => return Err(EINVAL),
     };
-    let found = wait_child(which, options)?;
+    // A nonblocking pidfd's wait does not wait: EAGAIN while its process is not ready
+    // (unless the caller asked for WNOHANG itself), as Linux's.
+    let found = wait_child(which, if nonblock { options | WNOHANG } else { options })?;
+    drop(pidfd_words);
+    if found.is_none() && nonblock && options & WNOHANG == 0 {
+        return Err(EAGAIN);
+    }
     if infop != 0 {
         let mut info = [0u64; 16];
         if let Some(f) = &found {

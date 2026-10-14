@@ -1005,6 +1005,21 @@ pub const SYS_HOST_GRANTED: u64 = 1167;
 /// Unbounded until set; a process `proc_create` makes starts with its
 /// creator's.
 pub const SYS_STACK_LIMIT: u64 = 1168;
+/// `cpu_alarm(target, flags, deadline, word) -> past`: arms the CPU clock of the process
+/// `target` (a handle; 0: the caller's) or, with `CPU_ALARM_THREAD`, of the thread `target`
+/// (a key; 0: the caller) for `deadline` nanoseconds of it (0: disarms): user time with
+/// `CPU_ALARM_USER`, else user and system time (as `proc_info` and `thread_info` count
+/// them). One deadline per clock: an arm replaces the last. When the clock reaches it, the
+/// kernel disarms it and advances and wakes (`server_futex_wake`) the u32 `word` in the
+/// server's memory (the instance's one word for its alarms: the latest arm's), at most a
+/// scheduler tick late (the clock is looked at when a tick finds one of the threads it
+/// counts running). Returns 1, arming nothing, if the clock is at the deadline already
+/// (the caller acts at once), else 0. ESRCH for a thread that is gone. The mechanism under
+/// the server's timers on CPU clocks (`ITIMER_VIRTUAL`, `ITIMER_PROF`, POSIX timers on CPU
+/// clocks): the kernel knows no timer, interval or signal.
+pub const SYS_CPU_ALARM: u64 = 1190;
+pub const CPU_ALARM_THREAD: u64 = 1;
+pub const CPU_ALARM_USER: u64 = 2;
 
 /// What `proc_info` tells about a process.
 #[repr(C)]
