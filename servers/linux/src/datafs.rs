@@ -355,8 +355,9 @@ pub fn set_times(inode: &Arc<DInode>, atime: vfs::stat::SetTime, mtime: vfs::sta
     }
     let now = crate::time::realtime();
     let secs = |t: vfs::stat::Time| ext2_time(t.sec);
-    let request = {
+    let (request, seq, before) = {
         let mut t = inode.times.lock();
+        let before = *t;
         if let Some(a) = atime.resolve(now) {
             t.atime = Some(secs(a));
         }
@@ -365,13 +366,20 @@ pub fn set_times(inode: &Arc<DInode>, atime: vfs::stat::SetTime, mtime: vfs::sta
         }
         t.ctime = Some(secs(now));
         t.seq += 1;
-        (t.request(inode.node()), t.seq)
+        (t.request(inode.node()), t.seq, before)
     };
-    let c = client()?;
-    status(&call(&c, request.0.encode(0))?)?;
-    // Nothing waits for a write-back: diskfs has them now.
+    let sent = client().and_then(|c| status(&call(&c, request.encode(0))?));
     let mut t = inode.times.lock();
-    if !t.pending && t.seq == request.1 {
+    if let Err(e) = sent {
+        // Refused: the times are what they were (else stat would report them, and the
+        // next write-back send them again), unless they changed since.
+        if t.seq == seq {
+            *t = Times { seq, ..before };
+        }
+        return Err(e);
+    }
+    // Nothing waits for a write-back: diskfs has them now.
+    if !t.pending && t.seq == seq {
         *t = Times { seq: t.seq, ..Times::default() };
     }
     Ok(())
