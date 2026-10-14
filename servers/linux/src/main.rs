@@ -70,6 +70,7 @@ mod tmpfs;
 mod tty;
 mod unix;
 mod usercopy;
+mod vdso;
 
 use alloc::collections::BTreeMap;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -155,9 +156,11 @@ pub extern "C" fn _start(state: *mut State, role: u64, cookie: u64, key: u64) ->
     let s = unsafe { &mut *state };
     if role == ROLE_INIT {
         // The tree's first thread: pid 1, its standard descriptors on the
-        // console, then the program the kernel started the tree with.
+        // console, the instance's vDSO, then the program the kernel started
+        // the tree with.
         process::register_init(key);
         console::setup_stdio();
+        vdso::init();
         exec::init(s);
     } else {
         process::start_thread(cookie, key);

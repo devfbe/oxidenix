@@ -885,25 +885,27 @@ int main(int argc, char **argv) {
     }
     check("mmap, mprotect and munmap are the server's", mem_ok);
 
-    /* Time is the server's too (R5), and it writes the program's memory
-     * directly: faults there are the program's, bad addresses EFAULT. */
+    /* Time's system calls are the server's too (R5; the C library's calls
+     * go to the vDSO, so these make them themselves), and it writes the
+     * program's memory directly: faults there are the program's, bad
+     * addresses EFAULT. */
     struct timespec ts, z = {0, 0};
     struct timeval tv;
     for (int i = 0; i < 100; i++) {
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        gettimeofday(&tv, NULL);
+        syscall(SYS_clock_gettime, CLOCK_MONOTONIC, &ts);
+        syscall(SYS_gettimeofday, &tv, NULL);
         nanosleep(&z, NULL);
     }
     check("clock_gettime, gettimeofday and nanosleep are the server's", ts.tv_sec >= 0 && tv.tv_sec > 1000000000);
     char *fresh = mmap(NULL, 2 * PG, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    check("the server writes a page the program never touched", clock_gettime(CLOCK_REALTIME, (struct timespec *)(fresh + PG)) == 0 && *(long *)(fresh + PG) > 1000000000);
+    check("the server writes a page the program never touched", syscall(SYS_clock_gettime, CLOCK_REALTIME, (struct timespec *)(fresh + PG)) == 0 && *(long *)(fresh + PG) > 1000000000);
     mprotect(fresh, PG, PROT_READ);
     errno = 0;
-    check("a read-only page is EFAULT, not death", clock_gettime(CLOCK_MONOTONIC, (struct timespec *)fresh) == -1 && errno == EFAULT);
+    check("a read-only page is EFAULT, not death", syscall(SYS_clock_gettime, CLOCK_MONOTONIC, (struct timespec *)fresh) == -1 && errno == EFAULT);
     errno = 0;
-    check("an unmapped address is EFAULT", clock_gettime(CLOCK_MONOTONIC, (struct timespec *)16) == -1 && errno == EFAULT);
+    check("an unmapped address is EFAULT", syscall(SYS_clock_gettime, CLOCK_MONOTONIC, (struct timespec *)16) == -1 && errno == EFAULT);
     errno = 0;
-    check("the server's own memory is EFAULT", clock_gettime(CLOCK_MONOTONIC, (struct timespec *)0x404000009000) == -1 && errno == EFAULT);
+    check("the server's own memory is EFAULT", syscall(SYS_clock_gettime, CLOCK_MONOTONIC, (struct timespec *)0x404000009000) == -1 && errno == EFAULT);
     errno = 0;
     check("... and across the 64 TiB line", syscall(TEST_USERCOPY, 0x400000000000 - 4) == -1 && errno == EFAULT);
     char *none = mmap(NULL, PG, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
