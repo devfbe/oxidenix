@@ -21,7 +21,7 @@
 //! | `READ` | `object` inode, `offset`, buffer (a writable grant) | bytes read (short at the end of the file), v0 = file size |
 //! | `WRITE` | `object` inode, `offset`, buffer | bytes written (all of them), v0 = file size |
 //! | `FLUSH` | - | 0 once every write completed before it is durable |
-//! | `STAT` | `object` inode | 0, `Stat` in v0..v3 (a device's number in place of its size, which is 0) |
+//! | `STAT` | `object` inode | 0, `Stat` in v0..v3 (a device's number in place of its size, which is 0; whether another client holds the inode) |
 //! | `ROOT` | - | the root directory: v0 = inode, v1 = its mode, v2 = its generation; v3 = the mount's flags (`ROOT_READ_ONLY`) |
 //! | `LOOKUP` | `object` directory, buffer = name | v0 = inode, v1 = its mode, v2 = its generation |
 //! | `CREATE` | `object` directory, buffer = name, `arg` = [kind, permissions, target length or device number]; a symlink's target follows the name in the grant, a device's number is as `st_rdev` has it (EINVAL for one the filesystem cannot keep) | v0 = new inode, v1 = its mode, v2 = its generation |
@@ -625,7 +625,13 @@ pub struct Stat {
     pub generation: u32,
     /// A character or block device's number (as `st_rdev` has it); 0 for any other inode.
     pub rdev: u64,
+    /// Another client holds the inode too (diskfs; a client that caches
+    /// what it holds looks for another's cache of the file then, ADR 0014).
+    pub shared: bool,
 }
+
+/// `Stat::shared` in v0 (above the mode's bits).
+const STAT_SHARED: u64 = 1 << 31;
 
 /// Whether `mode` is a character or block device's (`S_IFCHR`, `S_IFBLK`).
 pub fn is_device(mode: u32) -> bool {
@@ -633,11 +639,11 @@ pub fn is_device(mode: u32) -> bool {
 }
 
 impl Stat {
-    /// v0 = mode | links << 32, v1 = size (a device's: its number; its size is 0),
-    /// v2 = atime | mtime << 32, v3 = ctime | generation << 32.
+    /// v0 = mode | shared << 31 | links << 32, v1 = size (a device's: its number; its
+    /// size is 0), v2 = atime | mtime << 32, v3 = ctime | generation << 32.
     pub fn to_values(&self) -> [u64; 4] {
         [
-            self.mode as u64 | (self.links as u64) << 32,
+            (self.mode as u64 & (STAT_SHARED - 1)) | if self.shared { STAT_SHARED } else { 0 } | (self.links as u64) << 32,
             if is_device(self.mode) { self.rdev } else { self.size },
             self.atime as u64 | (self.mtime as u64) << 32,
             self.ctime as u64 | (self.generation as u64) << 32,
@@ -645,9 +651,10 @@ impl Stat {
     }
 
     pub fn from_values(v: &[u64; 4]) -> Stat {
-        let mode = v[0] as u32;
+        let mode = (v[0] & (STAT_SHARED - 1)) as u32;
         let (size, rdev) = if is_device(mode) { (0, v[1]) } else { (v[1], 0) };
         Stat {
+            shared: v[0] & STAT_SHARED != 0,
             mode,
             links: (v[0] >> 32) as u32,
             size,

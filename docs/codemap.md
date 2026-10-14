@@ -69,7 +69,7 @@ module comment, and the public types it defines. Where to start for common tasks
 - `servers/linux/src/chantest.rs` (374) `TEST_CHANNEL`: the client's side of channels to the test service (servers/ringtest, protocol `ring::selftest`), as the page cache will use them with diskfs: create, connect, grant, move descriptors through the rings...
 - `servers/linux/src/console.rs` (96) The console's terminal (phase R6d, ADR 0007): the kernel's console device (a VT100 on the framebuffer, mirrored to the serial port, and the keyboard) driven by a terminal of the server (`tty`).
 - `servers/linux/src/datafile.rs` (332) Open files of /data (phase R6c.3): what an open file description of the server's names (offset, the directory cursor, write access, O_DIRECT and O_SYNC); the calls on it are the server's (`datafs`), as for the... Types: `DataOpen`, `Prepared`.
-- `servers/linux/src/datafs.rs` (1884) /data in the server (phase R6c.3, I/O rings step 4): diskfs's ext2 filesystem through the file protocol (`fsring`, over `fsclient`'s channel), with the server's own page cache. Types: `DInode`, `New`, `HoldKind`.
+- `servers/linux/src/datafs.rs` (1891) /data in the server (phase R6c.3, I/O rings step 4): diskfs's ext2 filesystem through the file protocol (`fsring`, over `fsclient`'s channel), with the server's own page cache. Types: `DInode`, `New`, `HoldKind`.
 - `servers/linux/src/devices.rs` (104) Null and zero (phase R6d; /dev's since R9): a character device node names its driver by its number wherever it is (ADR 0007), so a node (1,3) or (1,5) in /dev, on the server's tmpfs or /data is null or zero, served here. Types: `Kind`, `DevOpen`.
 - `servers/linux/src/disktest.rs` (577) `TEST_DISKRING`: the client's side of the file protocol (`fsring`) against diskfs, as the page cache will use it in step 4: a channel to diskfs, grants of memory objects, files on /data read and written by DMA into...
 - `servers/linux/src/epoll.rs` (577) epoll (phase R6e): an interest list of open file descriptions and a ready list, the event loop interface of libuv (and so of Node.js), as Linux's fs/eventpoll.c has it. Types: `Epoll`, `Item`.
@@ -88,7 +88,7 @@ module comment, and the public types it defines. Where to start for common tasks
 - `servers/linux/src/inotify.rs` (515) inotify(7): watches on the files of the server's filesystems (tmpfs and /data) and the queue of their events, a file of the server, as eventfd. Types: `Key`, `Inotify`.
 - `servers/linux/src/kmsg.rs` (387) The kernel's log as Linux programs see it: `syslog(2)` (busybox's dmesg and klogd) and `/dev/kmsg` (1,11; util-linux's dmesg, systemd), over the kernel's log of records (`SYS_KLOG_*`, `kernel/src/klog.rs`). Types: `KmsgOpen`.
 - `servers/linux/src/local.rs` (78) The server's data for the thread it runs on (phases R6e, R8): a block in the thread's State page (`restricted::SERVER_LOCAL_OFFSET`, which the kernel never touches), found from the stack as the lock count is (`sync`;... Types: `Local`.
-- `servers/linux/src/main.rs` (519) The Linux server (docs/design/linux-server.md).
+- `servers/linux/src/main.rs` (542) The Linux server (docs/design/linux-server.md).
 - `servers/linux/src/mm.rs` (183) Memory system calls (phase R4): Linux's semantics of mmap, munmap, mprotect, mremap, madvise, msync and the mlock family, and brk (with the process model, R8), over the kernel's mapping calls.
 - `servers/linux/src/namespace.rs` (319) The server's namespace (phase R6c.2): mounts and path resolution. Types: `Node`, `Origin`, `Resolved`.
 - `servers/linux/src/netclient.rs` (405) The instance's channel to netd (phase R7b, ADR 0008, the protocol `netring`): requests (`ringclient`'s slots), the shared area with a control block per socket, the buffer pool the sockets' rings live in, and the net... Types: `Futex`, `Rings`, `Net`.
@@ -124,7 +124,7 @@ module comment, and the public types it defines. Where to start for common tasks
 
 - `servers/diskfs/src/blk.rs` (276) virtio-blk driver on the shared virtio transport (crates/virtio). Types: `Kind`, `SubmitError`, `VirtioBlk`.
 - `servers/diskfs/src/main.rs` (98) diskfs: the ext2 filesystem server.
-- `servers/diskfs/src/service.rs` (1088) The ring service: diskfs's end of the data plane (docs/design/io-rings.md, the file protocol `fsring`). Types: `Service`.
+- `servers/diskfs/src/service.rs` (1089) The ring service: diskfs's end of the data plane (docs/design/io-rings.md, the file protocol `fsring`). Types: `Service`.
 - `servers/netd/src/main.rs` (204) netd: the network server.
 - `servers/netd/src/nic.rs` (114) smoltcp's view of the network card, with loopback: frames addressed to this host (its own address or 127.0.0.0/8) never reach the wire but come back as received frames, and ARP requests for those addresses are... Types: `Nic`, `RxToken`, `TxToken`.
 - `servers/netd/src/service.rs` (1863) The socket service: netd's end of the instances' channels (phase R7b, ADR 0008, the protocol `netring`), mapped onto smoltcp's sockets. Types: `Config`, `Service`.
@@ -143,7 +143,7 @@ module comment, and the public types it defines. Where to start for common tasks
 - `crates/ext2fs/src/journal.rs` (321) The JBD2 journal format (ext3's, docs/design/ext3-journal.md): the journal superblock, the log blocks a transaction is written as (descriptors with their tags, the logged blocks, revoke blocks, the commit block with... Types: `Superblock`, `Log`, `Recovery`.
 - `crates/ext2fs/src/lib.rs` (3008) ext2 with an ext3 journal on the data disk (any `Device`): revision 1 with the `filetype` feature, 1/2/4 KiB blocks, direct and single/double/triple indirect blocks, and a JBD2 journal in inode 8 (`journal.rs`;... Types: `Device`, `NewNode`, `RawInode`, `Extent`, `Run`, `Reservation`, `Stat`, `Ext2`.
 - `crates/ext2fs/tests/io.rs` (2686) ext2fs on a RAM disk that counts device requests: large reads and writes take few requests, a write flushes twice (data, then its transaction), and the filesystem stays consistent for e2fsck; on the ring path,...
-- `crates/fsring/src/lib.rs` (475) The file protocol of the data plane: the requests the Linux server (the client) sends diskfs (the service) through a channel's submission ring, and their completions (docs/design/io-rings.md, "The file protocol"). Types: `Note`, `Buf`, `Kind`, `Node`, `Request`, `Stat`, `Usage`.
+- `crates/fsring/src/lib.rs` (478) The file protocol of the data plane: the requests the Linux server (the client) sends diskfs (the service) through a channel's submission ring, and their completions (docs/design/io-rings.md, "The file protocol"). Types: `Note`, `Buf`, `Kind`, `Node`, `Request`, `Stat`, `Usage`.
 - `crates/fsring/tests/protocol.rs` (200) The file protocol's encodings: every request survives encode and decode (inode handles with their generations), malformed descriptors are refused with the right errno (unknown operations, stray fields, lengths,...
 - `crates/ldisc/src/lib.rs` (527) Linux's N_TTY line discipline as a library, for the Linux server's terminals (docs/design/linux-server.md, "The terminal"): input mapping, signals from the keyboard, flow control, canonical line editing with echo,... Types: `Received`, `Take`, `ReadMode`, `Ldisc`.
 - `crates/ldisc/src/termios.rs` (139) Terminal settings as Linux keeps them: `struct termios` and `struct termios2` in x86-64's layout (tcgetattr's TCGETS, TCGETS2), their flags and control characters, and the defaults of Linux's `tty_std_termios`. Types: `Termios`.
@@ -400,6 +400,7 @@ kernel that handle them.
 - `docs/decisions/0011-a-kernel-without-linux.md` ADR 0011: A kernel without Linux: the last calls in the server, natives on the kernel's own interface
 - `docs/decisions/0012-an-ext3-journal-for-the-data-disk.md` ADR 0012: An ext3 journal for the data disk
 - `docs/decisions/0013-an-oom-killer-and-overcommit-modes.md` ADR 0013: An OOM killer by badness, and Linux's overcommit modes
+- `docs/decisions/0014-one-page-cache-for-every-process-tree.md` ADR 0014: One page cache per file of /data for every process tree
 - `docs/design/ext3-journal.md` The ext3 journal of the data disk
 - `docs/design/io-rings.md` I/O rings: the data plane between the Linux server and the device servers
 - `docs/design/iommu.md` DMA isolation with an IOMMU

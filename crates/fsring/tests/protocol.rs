@@ -191,14 +191,14 @@ fn names_are_utf8_without_slashes_or_nuls() {
 fn completions_stats_and_usage_round_trip() {
     let c = Completion { tag: 0xdead_beef, op: op::READ, status: -5, values: [1, u64::MAX, 3, 1 << 63] };
     assert_eq!(Completion::from_desc(&c.to_desc()), c);
-    let s = Stat { mode: 0o100644, links: 3, size: 1 << 40, atime: 1, mtime: u32::MAX, ctime: 7, generation: u32::MAX - 1, rdev: 0 };
+    let s = Stat { mode: 0o100644, links: 3, size: 1 << 40, atime: 1, mtime: u32::MAX, ctime: 7, generation: u32::MAX - 1, rdev: 0, shared: false };
     assert_eq!(Stat::from_values(&s.to_values()), s);
     // A device's number travels in place of its size (0); only a device has one.
     for mode in [0o020666, 0o060660] {
-        let d = Stat { mode, links: 1, size: 0, atime: 1, mtime: 2, ctime: 3, generation: 4, rdev: 0xffff_ffff_0000_0103 };
+        let d = Stat { mode, links: 1, size: 0, atime: 1, mtime: 2, ctime: 3, generation: 4, rdev: 0xffff_ffff_0000_0103, shared: true };
         assert_eq!(Stat::from_values(&d.to_values()), d);
     }
-    let fifo = Stat { mode: 0o010600, links: 1, size: 0, atime: 1, mtime: 2, ctime: 3, generation: 4, rdev: 7 };
+    let fifo = Stat { mode: 0o010600, links: 1, size: 0, atime: 1, mtime: 2, ctime: 3, generation: 4, rdev: 7, shared: false };
     assert_eq!(Stat::from_values(&fifo.to_values()), Stat { rdev: 0, ..fifo });
     let u = Usage { block_size: 1024, blocks: 65536, free_blocks: 100, inodes: 16384, free_inodes: u32::MAX, max_file_size: 16 << 30 };
     assert_eq!(Usage::from_values(&u.to_values()), u);

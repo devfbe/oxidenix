@@ -1258,12 +1258,20 @@ pub fn chmod(inode: &Arc<DInode>, perm: u32) -> Result<(), i64> {
 pub fn stat(inode: &Arc<DInode>) -> Result<[u8; 144], i64> {
     live(inode)?;
     let c = client()?;
-    // The cache's before diskfs's: a cached object that goes meanwhile had its data
-    // written back first, so diskfs's answer has it.
-    let cached = attrs(inode);
-    let r = call(&c, Request::Stat { ino: inode.node() }.encode(0))?;
-    status(&r)?;
-    let s = fsring::Stat::from_values(&r.values);
+    let own = inode.object.lock().is_some();
+    let ask = || -> Result<fsring::Stat, i64> {
+        let r = call(&c, Request::Stat { ino: inode.node() }.encode(0))?;
+        status(&r)?;
+        Ok(fsring::Stat::from_values(&r.values))
+    };
+    let mut s = ask()?;
+    // Another instance's cached object only if another holds the inode (diskfs says): a
+    // file this tree alone uses costs nothing more. One that goes between the two
+    // answers had its data written back first: diskfs is asked again then.
+    let cached = if own || s.shared { attrs(inode) } else { None };
+    if !own && s.shared && cached.is_none() {
+        s = ask()?;
+    }
     let size = cached.map_or(s.size, |a| a.size);
     let time = |bit: u64, v: i64| cached.filter(|a| a.flags & bit != 0).map(|_| ext2_time(v));
     let local = *inode.times.lock();

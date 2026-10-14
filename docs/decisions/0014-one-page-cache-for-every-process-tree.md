@@ -84,8 +84,9 @@ file used by one tree only must cost nothing extra.
    when it reaches it, so whichever instance writes the file back sends the object's times
    after the data (`SETTIMES`) and clears them unless they changed meanwhile (`mo_attrs`,
    1212). `stat` overlays them, and the object's size, on diskfs's answer, from the object if
-   the instance holds it, else from the object another instance holds (`SHARED_QUERY`; asked
-   before diskfs, so an object that goes meanwhile had its data written back). `utimensat`,
+   the instance holds it, else, if diskfs says another client holds the inode (`STAT`'s
+   `shared`), from the object another instance holds (`SHARED_QUERY`; if that went meanwhile,
+   its data was written back first, and diskfs is asked again). `utimensat`,
    `chmod` and truncation change them there too. (A FIFO's times stay its instance's: its
    traffic asks diskfs nothing, and its pipe is the instance's own.)
 5. **Appends.** `mo_file_append` (1213) finds the end and writes there in one step for every
@@ -112,9 +113,10 @@ file used by one tree only must cost nothing extra.
 
 - **A file used by one tree only:** no extra request to diskfs anywhere. Opening a file's
   object is one kernel call as before (`mo_shared` for `mo_create_cached`, the same `STAT`).
-  `stat` of a regular file that no instance caches costs one more kernel call (the registry
-  query, hundreds of cycles beside the `STAT` round trip of ~13 000); with an object it costs
-  what it did (`mo_attrs` for `mo_file_size`). An O_APPEND write takes one kernel call fewer
+  `stat` costs what it did: diskfs's `STAT` says whether another client holds the inode, and
+  only then is the registry asked (a kernel call); with an object here `mo_attrs` replaces
+  `mo_file_size`. An O_DIRECT read of a file this tree does not cache asks the registry
+  whether another does (one kernel call beside a disk read). An O_APPEND write takes one kernel call fewer
   (the append finds the end itself). A write takes the object's state lock once more to set
   the times, and no longer the server's lock of the inode's times. Measured: docs/benchmarks
   (`2026-10-15-*-coherence-*` against `*-base-*`, in turn on a host busy with another agent).

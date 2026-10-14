@@ -1294,7 +1294,9 @@ impl Service {
             Request::Stat { ino } => {
                 let ino = Self::node(fs, ino)?;
                 let s = fs.stat(ino)?;
-                let stat = fsring::Stat { mode: s.mode, links: s.links, size: s.size, atime: s.atime, mtime: s.mtime, ctime: s.ctime, generation: s.generation, rdev: s.rdev };
+                // (Another client holds it: it may cache it, ADR 0014.)
+                let shared = self.chans.iter().enumerate().any(|(o, ch)| o != c && ch.as_ref().is_some_and(|ch| ch.held.has(ino)));
+                let stat = fsring::Stat { mode: s.mode, links: s.links, size: s.size, atime: s.atime, mtime: s.mtime, ctime: s.ctime, generation: s.generation, rdev: s.rdev, shared };
                 Ok((0, stat.to_values()))
             }
             Request::Statfs => {
