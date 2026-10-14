@@ -659,7 +659,32 @@ fn test(nr: u64, addr: u64) -> i64 {
 }
 
 #[panic_handler]
-fn panic(_: &core::panic::PanicInfo) -> ! {
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    // Where, on the console (the binary has no symbols): "panic at file:line", made on the
+    // stack (the heap may be what failed).
+    if let Some(l) = info.location() {
+        let mut buf = [0u8; SERVER_LOG_MAX as usize];
+        let mut n = 0;
+        let mut put = |bytes: &[u8]| {
+            let k = bytes.len().min(buf.len() - n);
+            buf[n..n + k].copy_from_slice(&bytes[..k]);
+            n += k;
+        };
+        put(b"panic at ");
+        put(l.file().as_bytes());
+        put(b":");
+        let (mut line, mut digits, mut d) = (l.line(), [0u8; 10], 10);
+        loop {
+            d -= 1;
+            digits[d] = b'0' + (line % 10) as u8;
+            line /= 10;
+            if line == 0 {
+                break;
+            }
+        }
+        put(&digits[d..]);
+        syscall(SYS_SERVER_LOG, [buf.as_ptr() as u64, n as u64, 0, 0, 0, 0]);
+    }
     // An invalid opcode: the kernel ends the process.
     loop {
         unsafe { core::arch::asm!("ud2") };
