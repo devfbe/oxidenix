@@ -26,12 +26,16 @@
 //! socket lock does, and released while a call sleeps), never the state
 //! lock: a copy may fault on a page the pager must bring, and the net
 //! thread and the pager take state locks.
+//!
+//! **Memory** (`heap`'s rule): a socket's record is allocated before netd
+//! is asked for the socket (or the connection to accept), ENOMEM with
+//! nothing to undo; options are a fixed table.
 
 use crate::files;
+use crate::heap;
 use crate::netclient::{self, Net, Rings};
 use crate::sync::Mutex;
 use crate::unix::{Sink, Source};
-use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering::SeqCst};
 use netring::{fill, pieces, state, Ctl, Endpoint, Kind, Record, Request, RECORD_HEADER};
@@ -97,7 +101,10 @@ pub struct Local {
 }
 
 /// Options: what has an effect, and the rest as Linux reads them back.
-#[derive(Clone)]
+/// Plain options of all levels (`inetcalls::plain_slot`).
+pub const PLAIN_SLOTS: usize = 34;
+
+#[derive(Clone, Copy)]
 pub struct Opts {
     pub rcvtimeo: u64,
     pub sndtimeo: u64,
@@ -114,8 +121,9 @@ pub struct Opts {
     pub rcvbuf: i32,
     pub sndbuf: i32,
     pub rcvlowat: i32,
-    /// Plain options kept as ints, by (level, name).
-    pub plain: BTreeMap<(i32, u64), i32>,
+    /// Plain options kept as ints (0 until set), by their slot
+    /// (`inetcalls::plain_slot`): a fixed table, nothing allocated.
+    pub plain: [i32; PLAIN_SLOTS],
 }
 
 pub struct InetSock {
@@ -152,11 +160,11 @@ struct Snap {
 }
 
 impl InetSock {
-    fn new(kind: Kind, net: Arc<Net>, index: u32, rings: Option<Rings>, rings_sent: bool) -> Arc<InetSock> {
+    fn new(kind: Kind, net: Arc<Net>, index: u32, rings: Option<Rings>, rings_sent: bool) -> Result<Arc<InetSock>, heap::NoMem> {
         // Linux's defaults: tcp_rmem/tcp_wmem's middle values for TCP,
         // rmem_default/wmem_default for the others.
         let (rcvbuf, sndbuf) = if kind == Kind::Tcp { (131072, 16384) } else { (212992, 212992) };
-        Arc::new(InetSock {
+        heap::try_arc(InetSock {
             kind,
             net,
             index,
@@ -190,7 +198,7 @@ impl InetSock {
                     rcvbuf,
                     sndbuf,
                     rcvlowat: 1,
-                    plain: BTreeMap::new(),
+                    plain: [0; PLAIN_SLOTS],
                 },
             }),
         })
@@ -220,16 +228,20 @@ impl InetSock {
         } else {
             None
         };
-        if let Err(e) = net.status(Request::Socket { sock: index, kind, area: rings.map(|r| r.area) }) {
+        // Its record before netd makes the socket. A datagram socket's
+        // rings go with SOCKET, a TCP socket's with its first connect.
+        let made = InetSock::new(kind, net.clone(), index, rings, kind.datagrams());
+        let result = match made {
+            Ok(s) => net.status(Request::Socket { sock: index, kind, area: rings.map(|r| r.area) }).map(|_| s),
+            Err(heap::NoMem) => Err(heap::ENOMEM),
+        };
+        if result.is_err() {
             if let Some(r) = rings {
                 net.put_rings(r);
             }
             net.put_index(index);
-            return Err(e);
         }
-        // A datagram socket's rings went with SOCKET, a TCP socket's go
-        // with its first connect.
-        let s = InetSock::new(kind, net.clone(), index, rings, kind.datagrams());
+        let s = result?;
         net.register(index, &s);
         Ok(s)
     }
@@ -557,12 +569,22 @@ impl InetSock {
                         return Err(e);
                     }
                 };
+                // Its record before netd hands the connection over (the
+                // connection stays in the backlog without it).
+                let s = match InetSock::new(Kind::Tcp, self.net.clone(), index, Some(rings), true) {
+                    Ok(s) => s,
+                    Err(heap::NoMem) => {
+                        self.net.put_rings(rings);
+                        self.net.put_index(index);
+                        return Err(heap::ENOMEM);
+                    }
+                };
                 match self.net.status(Request::Accept { sock: self.index, new: index, area: rings.area }) {
                     Ok(c) => {
                         let peer = Endpoint { addr: c.values[0] as u32, port: c.values[1] as u16 };
-                        let s = InetSock::new(Kind::Tcp, self.net.clone(), index, Some(rings), true);
                         // Its options as the listener's (Linux copies them).
-                        s.st.lock().opts = self.st.lock().opts.clone();
+                        let opts = self.st.lock().opts;
+                        s.st.lock().opts = opts;
                         self.net.register(index, &s);
                         self.changed();
                         return Ok((s, peer));
@@ -779,11 +801,15 @@ impl InetSock {
                 continue;
             }
             // Waiting (interruptibly) without the writer lock: other
-            // threads' sends do not wait behind this one's.
+            // threads' sends do not wait behind this one's. Without memory
+            // to keep the datagram it waits with the lock (the ring keeps
+            // it): slower for the others, never a failed send.
             if kept.is_none() {
-                kept = Some(buf.to_vec());
+                kept = heap::try_to_vec(buf).ok();
             }
-            drop(writer.take());
+            if kept.is_some() {
+                drop(writer.take());
+            }
             self.wait(seen, deadline)?;
         }
     }

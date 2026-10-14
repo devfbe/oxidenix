@@ -31,6 +31,7 @@
 //! page netd writes the answer into), never across a copy of program
 //! memory, and nothing is taken under it.
 
+use crate::heap::{self, NoMem, TryGrow};
 use crate::inet::InetSock;
 use crate::ringclient::{futex_wake, RingClient};
 use crate::sync::Mutex;
@@ -181,7 +182,7 @@ pub fn net() -> Result<Arc<Net>, i64> {
     if let Some(n) = NET.lock().as_ref().filter(|n| !n.ring.is_dead()) {
         return Ok(n.clone());
     }
-    let n = Arc::new(Net::connect()?);
+    let n = heap::try_arc(Net::connect()?)?;
     *NET.lock() = Some(n.clone());
     GENERATION.fetch_add(1, Ordering::SeqCst);
     futex_wake(&GENERATION, u32::MAX as u64);
@@ -195,6 +196,12 @@ fn current() -> Option<Arc<Net>> {
 
 impl Net {
     fn connect() -> Result<Net, i64> {
+        // The tables first (ENOMEM with nothing to undo): a program's
+        // socket call makes the channel.
+        let mut free = heap::try_vec(MAX_SOCKETS)?;
+        free.extend((0..MAX_SOCKETS as u32).rev());
+        let mut socks = heap::try_vec(MAX_SOCKETS)?;
+        socks.resize_with(MAX_SOCKETS, Weak::new);
         // No service (no network card, netd never started): the network
         // is down.
         let ring = RingClient::connect(SERVICE, SHARED_PAGES).map_err(|e| if e == 2 { ENETDOWN } else { e })?;
@@ -218,8 +225,9 @@ impl Net {
         Ok(Net {
             ring,
             area,
-            free: Mutex::new((0..MAX_SOCKETS as u32).rev().collect()),
-            socks: Mutex::new((0..MAX_SOCKETS).map(|_| Weak::new()).collect()),
+            // (`put_index` never grows it: it holds every index there is.)
+            free: Mutex::new(free),
+            socks: Mutex::new(socks),
             pool: Mutex::new(Pool { chunks: Vec::new(), spare: None }),
             closing: Mutex::new(Vec::new()),
             links: crate::sync::SleepMutex::new(links),
@@ -288,6 +296,8 @@ impl Net {
                 return Ok(Self::rings_of(chunk, k, slot));
             }
         }
+        // Its place in the list before the chunk is made and granted.
+        pool.chunks.try_grow(1).map_err(|_| ENOBUFS)?;
         let chunk = Chunk::new(self.ring.handle())?;
         let k = match pool.chunks.iter().position(Option::is_none) {
             Some(k) => k,
@@ -381,10 +391,15 @@ impl Net {
         let c = self.status(Request::Links { buf: Buf { grant, offset: 0, len: PAGE as u32 } })?;
         let n = (c.status as usize).min(PAGE as usize);
         // Copied out once, then decoded (netd may write it any time).
-        let mut bytes = alloc::vec![0u8; n];
+        let mut bytes = heap::try_vec(n)?;
+        bytes.resize(n, 0);
         unsafe { core::ptr::copy_nonoverlapping(addr as *const u8, bytes.as_mut_ptr(), n) };
         drop(page);
-        Ok(Link::decode_all(&bytes).collect())
+        let mut out = Vec::new();
+        for link in Link::decode_all(&bytes) {
+            out.try_push(link)?;
+        }
+        Ok(out)
     }
 
     /// Queues socket `index` (with its rings) for the net thread to close.
@@ -392,6 +407,8 @@ impl Net {
     /// have moved on to the next channel).
     pub fn queue_close(&self, index: u32, rings: Option<Rings>, abort: bool) {
         CLOSES.fetch_add(1, Ordering::SeqCst);
+        // (A close cannot fail: at most `MAX_SOCKETS` small entries, from
+        // the reserve if need be.)
         self.closing.lock().push(Closing { index, rings, abort });
         if self.is_dead() {
             self.close_queued();
@@ -469,18 +486,21 @@ impl Drop for Chunk {
     }
 }
 
-/// netd's interfaces (none without netd).
-pub fn links() -> Vec<Link> {
+/// netd's interfaces (none without netd; ENOMEM without memory for them).
+pub fn links() -> Result<Vec<Link>, NoMem> {
     // A channel that died meanwhile (netd went, or gave an idle channel's
     // slot away) is made again, once.
     let ask = || -> Result<Vec<Link>, i64> {
         let n = net()?;
         match n.links() {
-            Err(_) if n.is_dead() => net()?.links(),
+            Err(e) if e != heap::ENOMEM && n.is_dead() => net()?.links(),
             r => r,
         }
     };
-    ask().unwrap_or_default()
+    match ask() {
+        Err(heap::ENOMEM) => Err(NoMem),
+        r => Ok(r.unwrap_or_default()),
+    }
 }
 
 /// Waits (at most a few seconds) until the closes queued so far are done:

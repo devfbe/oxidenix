@@ -51,8 +51,9 @@
 //! Memory (`heap`'s rule): what a program makes the server hold is
 //! allocated fallibly before anything changes: a socket (ENOMEM), a name
 //! and its binding (ENOMEM), a message and its place in the queue (ENOBUFS,
-//! as Linux's failed skb), a pending connection (ENOMEM), an option.
-//! Closing and the collector's purge take whole queues without allocating.
+//! as Linux's failed skb), a pending connection (ENOMEM). Options are a
+//! fixed table. Closing and the collector's purge take whole queues
+//! without allocating.
 
 use crate::files;
 use crate::heap::{self, NoMem, TryGrow};
@@ -114,6 +115,10 @@ const MAX_DGRAM_QLEN: usize = 10;
 pub const SOMAXCONN: usize = 4096;
 /// The largest piece one stream write queues.
 const MAX_PIECE: usize = 32 * 1024;
+/// The options a socket keeps only for getsockopt (sockcalls': SO_LINGER,
+/// SO_RCVLOWAT, and those kept as plain ints: reuseaddr, dontroute,
+/// broadcast, keepalive, oobinline, priority, timestamp).
+pub const KEPT_OPTS: [u64; 9] = [13, 18, 2, 5, 6, 9, 10, 12, 29];
 
 /// Credentials as SCM_CREDENTIALS and SO_PEERCRED carry them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -320,8 +325,9 @@ struct Inner {
     /// Its last reference is gone.
     dead: bool,
     /// Options kept for getsockopt that change nothing here (SO_LINGER,
-    /// SO_RCVLOWAT, SO_KEEPALIVE, ...).
-    opts: BTreeMap<u64, i32>,
+    /// SO_RCVLOWAT, SO_KEEPALIVE, ...), by their place in `KEPT_OPTS`:
+    /// a fixed table, nothing allocated.
+    opts: [Option<i32>; KEPT_OPTS.len()],
 }
 
 pub struct Sock {
@@ -606,7 +612,7 @@ impl Sock {
                 listen_cred: Cred::NONE,
                 reported: 0,
                 dead: false,
-                opts: BTreeMap::new(),
+                opts: [None; KEPT_OPTS.len()],
             }),
         }))
     }
@@ -1614,20 +1620,17 @@ impl Sock {
         (i.rcvtimeo, i.sndtimeo)
     }
 
+    /// A kept option's value (one of `KEPT_OPTS`), if it was set.
     pub fn opt(&self, name: u64) -> Option<i32> {
-        self.inner.lock().opts.get(&name).copied()
+        let k = KEPT_OPTS.iter().position(|&n| n == name)?;
+        self.inner.lock().opts[k]
     }
 
-    /// Keeps an option's value (ENOMEM: no memory for a new one).
-    pub fn set_opt(&self, name: u64, value: i32) -> Result<(), NoMem> {
-        let mut i = self.inner.lock();
-        if let Some(v) = i.opts.get_mut(&name) {
-            *v = value;
-            return Ok(());
+    /// Keeps an option's value (one of `KEPT_OPTS`; another is not kept).
+    pub fn set_opt(&self, name: u64, value: i32) {
+        if let Some(k) = KEPT_OPTS.iter().position(|&n| n == name) {
+            self.inner.lock().opts[k] = Some(value);
         }
-        heap::preload()?;
-        i.opts.insert(name, value);
-        Ok(())
     }
 
     pub fn set_timeout(&self, send: bool, ns: u64) {

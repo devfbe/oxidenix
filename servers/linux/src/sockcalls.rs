@@ -778,16 +778,16 @@ fn setsockopt(sock: &Arc<Sock>, level: u64, name: u64, val: u64, len: u64) -> Re
         SO_RCVLOWAT => {
             // Linux's rule; reads here wait for one byte whatever it is.
             let v = opt_int(val, len)?;
-            sock.set_opt(name, if v < 0 { i32::MAX } else { v.max(1) })?;
+            sock.set_opt(name, if v < 0 { i32::MAX } else { v.max(1) });
         }
         SO_LINGER => {
             if len < 8 {
                 return Err(EINVAL);
             }
             let l: [i32; 2] = usercopy::read(val)?;
-            sock.set_opt(name, if l[0] != 0 { l[1].max(0) } else { -1 })?;
+            sock.set_opt(name, if l[0] != 0 { l[1].max(0) } else { -1 });
         }
-        n if PLAIN_OPTS.contains(&n) => sock.set_opt(n, opt_int(val, len)?)?,
+        n if PLAIN_OPTS.contains(&n) => sock.set_opt(n, opt_int(val, len)?),
         _ => return Err(ENOPROTOOPT),
     }
     Ok(0)
