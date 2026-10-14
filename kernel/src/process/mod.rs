@@ -602,6 +602,7 @@ fn start_tree(path: &str, args: &[String], grants: bool) -> Result<(Pid, alloc::
         own.linux = Some(thread);
         let group = ThreadGroup::new(pid, info).ok_or(ENOMEM)?;
         group.instance.store(instance.id, Ordering::Release);
+        group.host_init.call_once(|| linux::host_flag(&instance));
         let t = new_task(pid, group, name, own, start)?;
         unsafe { t.own() }.linux.as_mut().expect("set above").announce(&t)?;
         Ok::<_, i64>(t)

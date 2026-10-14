@@ -1,8 +1,10 @@
 //! Kernel memory: the frame allocator, the kernel heap (slab size classes over a first-fit heap),
-//! mappings of physical memory, and the commit and page-cache accounting.
+//! mappings of physical memory, the commit and page-cache accounting with the overcommit
+//! policy, and the OOM killer.
 
 pub mod frame;
 pub mod kstack;
+pub mod oom;
 
 use bootloader_api::info::MemoryRegion;
 use core::alloc::{GlobalAlloc, Layout};
@@ -114,7 +116,7 @@ impl GrowingHeap {
             unsafe { heap.extend(want as usize) };
             // The heap never gives memory back: these frames are no longer
             // there for programs, so less can be promised to them.
-            let _ = COMMIT_LIMIT.try_update(core::sync::atomic::Ordering::Relaxed, core::sync::atomic::Ordering::Relaxed, |l| {
+            let _ = USER_PAGES.try_update(core::sync::atomic::Ordering::Relaxed, core::sync::atomic::Ordering::Relaxed, |l| {
                 Some(l.saturating_sub(want / PAGE))
             });
             // The heap took from the free frames (the kernel's reserve if
@@ -199,10 +201,11 @@ pub fn init(regions: &'static [MemoryRegion], phys_offset: u64) {
     kstack::init(Cr3::read().0, &mut frames);
     unsafe { HEAP.0.lock().init(HEAP_START as *mut u8, HEAP_INITIAL as usize) };
     frames.enable_refcounts();
-    COMMIT_LIMIT.store(
+    USER_PAGES.store(
         frames.free_frames().saturating_sub(frame::KERNEL_RESERVE_FRAMES),
         core::sync::atomic::Ordering::Relaxed,
     );
+    TOTAL_PAGES.store(frames.total_frames, core::sync::atomic::Ordering::Relaxed);
     *FRAMES.lock() = Some(frames);
 }
 
@@ -278,10 +281,13 @@ pub fn phys_to_virt(addr: u64) -> *mut u8 {
 
 /// Pages of memory promised to processes (writable private mappings, see
 /// process::address_space; tmpfs pages, the Linux servers' heaps, paged
-/// objects' pages), and the most that may be: all usable frames except
-/// the kernel's reserve (Linux's `overcommit_memory=2` with a ratio of
-/// 100%). Committing up front makes running out of memory an ENOMEM at
-/// mmap/brk/fork time instead of a fault.
+/// objects' pages: Linux's Committed_AS), counted in every overcommit mode
+/// (`Overcommit`). In the strict mode, the default, they may be at most
+/// the commit limit (`commit_limit`: all usable frames except the kernel's
+/// reserve, Linux's `overcommit_memory=2` with a ratio of 100%), so running
+/// out of memory is an ENOMEM at mmap/brk/fork time instead of a fault; in
+/// the others a fault that finds no frame after reclaim calls the OOM
+/// killer (`oom`), which ends the process its badness picks.
 ///
 /// Pages of the file cache (`cached`) are counted, not committed, as on
 /// Linux, where they are no part of Committed_AS: they live in the frames
@@ -290,9 +296,9 @@ pub fn phys_to_virt(addr: u64) -> *mut u8 {
 /// commitment claims one and none is free, clean cache pages are reclaimed
 /// for it (`user_frame`), those that programs map included. What cannot be
 /// dropped at once, dirty and pinned cache pages
-/// (`fs::cache::unavailable_pages`), counts against the limit as taken:
-/// a commit fails while committed and those together would exceed it, and
-/// a store that makes them exceed it waits for write-back
+/// (`fs::cache::unavailable_pages`), counts against the limit as taken
+/// (strict mode): a commit fails while committed and those together would
+/// exceed it, and a store that makes them exceed it waits for write-back
 /// (`fs::cache::balance_dirty`). So every committed page has a frame: free,
 /// or a clean cache page's, which reclaim can always take (the fault that
 /// needs it waits for write-back meanwhile, `reclaim_retry`).
@@ -302,7 +308,104 @@ struct Account {
 }
 
 static ACCOUNT: IrqSpinLock<Account> = IrqSpinLock::new(Account { committed: 0, cached: 0 });
-static COMMIT_LIMIT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// The frames user memory may have: all usable ones but the kernel's
+/// reserve, less what the kernel heap took since (it never gives frames
+/// back). The base of the commit limit and of what is scaled by memory
+/// (the dirty ratios, tmpfs's size, the instances' heap reserves).
+static USER_PAGES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The overcommit policy, as Linux's `vm.overcommit_memory`,
+/// `vm.overcommit_ratio` and `vm.overcommit_kbytes` (the machine's state:
+/// set through `/proc/sys/vm` by a tree with the host grant only, ADR 0013).
+pub mod overcommit {
+    use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    /// Heuristic: a commit fails only if it alone is more than all memory
+    /// (Linux's `OVERCOMMIT_GUESS`, its default).
+    pub const GUESS: u64 = 0;
+    /// Every commit succeeds (`OVERCOMMIT_ALWAYS`).
+    pub const ALWAYS: u64 = 1;
+    /// Strict: committed memory stays within the commit limit
+    /// (`OVERCOMMIT_NEVER`), oxidenix's default (ADR 0013).
+    pub const NEVER: u64 = 2;
+
+    static MODE: AtomicU64 = AtomicU64::new(NEVER);
+    /// The commit limit in percent of user memory (Linux's default is 50;
+    /// without swap that would leave half of memory unpromised: 100).
+    static RATIO: AtomicU64 = AtomicU64::new(100);
+    /// The commit limit in KiB instead (0: the ratio applies).
+    static KBYTES: AtomicU64 = AtomicU64::new(0);
+
+    pub fn mode() -> u64 {
+        MODE.load(Relaxed)
+    }
+
+    pub fn ratio() -> u64 {
+        RATIO.load(Relaxed)
+    }
+
+    pub fn kbytes() -> u64 {
+        KBYTES.load(Relaxed)
+    }
+
+    /// Whether the strict mode holds: then every committed page has a
+    /// frame, and what serves that promise (counting dirty and pinned
+    /// cache pages as taken, waiting for their write-back) applies.
+    pub fn strict() -> bool {
+        mode() == NEVER
+    }
+
+    /// Sets the mode (0..=2, else EINVAL); the old one.
+    pub fn set_mode(mode: u64) -> Result<u64, i64> {
+        if mode > NEVER {
+            return Err(crate::process::errno::EINVAL);
+        }
+        Ok(MODE.swap(mode, Relaxed))
+    }
+
+    /// Sets the ratio (at most `i32::MAX`, Linux's int, else EINVAL), which
+    /// then applies: the KiB go to 0, as Linux's handlers do. The old ratio.
+    pub fn set_ratio(ratio: u64) -> Result<u64, i64> {
+        if ratio > i32::MAX as u64 {
+            return Err(crate::process::errno::EINVAL);
+        }
+        KBYTES.store(0, Relaxed);
+        Ok(RATIO.swap(ratio, Relaxed))
+    }
+
+    /// Sets the limit in KiB, which then applies (the ratio goes to 0);
+    /// the old value. (0 leaves both at 0: a limit of nothing, as on Linux.)
+    pub fn set_kbytes(kbytes: u64) -> Result<u64, i64> {
+        RATIO.store(0, Relaxed);
+        Ok(KBYTES.swap(kbytes, Relaxed))
+    }
+}
+
+/// The commit limit (Linux's CommitLimit, which it shows in every mode):
+/// `overcommit_kbytes` if set, else `overcommit_ratio` percent of user
+/// memory (there is no swap).
+pub fn commit_limit() -> u64 {
+    let kbytes = overcommit::kbytes();
+    if kbytes != 0 {
+        return kbytes / (PAGE / 1024);
+    }
+    let base = USER_PAGES.load(core::sync::atomic::Ordering::Relaxed);
+    (base as u128 * overcommit::ratio() as u128 / 100).min(u64::MAX as u128) as u64
+}
+
+/// The frames user memory may have (`USER_PAGES`): what the dirty
+/// ratios, tmpfs's size and other shares of memory are taken of.
+pub fn user_pages() -> u64 {
+    USER_PAGES.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// All usable frames (Linux's totalram_pages: what the heuristic mode
+/// and the OOM killer's badness are measured against).
+static TOTAL_PAGES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+pub fn total_pages() -> u64 {
+    TOTAL_PAGES.load(core::sync::atomic::Ordering::Relaxed)
+}
 /// Drops up to the given number of reclaimable cache pages, with `true`
 /// also those used lately (no second chance); returns how many it dropped
 /// (set by the file cache).
@@ -312,34 +415,50 @@ pub fn set_reclaim(f: fn(u64, bool) -> u64) {
     RECLAIM.call_once(|| f);
 }
 
-/// Promises `pages` pages; false (nothing promised) if over the limit.
+/// Promises `pages` pages; false (nothing promised) if the overcommit
+/// mode refuses them: strict, over the limit; heuristic, more than all
+/// memory at once (Linux's `__vm_enough_memory`, without swap); never when
+/// overcommitting always.
 pub fn commit(pages: u64) -> bool {
-    // Cache pages reclaim cannot drop now (dirty, pinned) are not there for
-    // the commitment: they count as taken until write-back or the grant
-    // ends (stores wait meanwhile rather than crowd out what was promised,
-    // `fs::cache::balance_dirty`).
-    let unavailable = crate::fs::cache::unavailable_pages();
-    let mut a = ACCOUNT.lock();
-    let limit = COMMIT_LIMIT.load(core::sync::atomic::Ordering::Relaxed);
-    if a.committed.saturating_add(pages).saturating_add(unavailable) > limit {
-        drop(a);
+    let refused = match overcommit::mode() {
+        overcommit::ALWAYS => false,
+        overcommit::GUESS => pages > total_pages(),
+        _ => {
+            // Cache pages reclaim cannot drop now (dirty, pinned) are not
+            // there for the commitment: they count as taken until
+            // write-back or the grant ends (stores wait meanwhile rather
+            // than crowd out what was promised, `fs::cache::balance_dirty`).
+            let unavailable = crate::fs::cache::unavailable_pages();
+            let mut a = ACCOUNT.lock();
+            if a.committed.saturating_add(pages).saturating_add(unavailable) <= commit_limit() {
+                a.committed += pages;
+                return true;
+            }
+            true
+        }
+    };
+    if refused {
         // The Linux servers give back what they keep committed and free
         // (as much as this commit lacked, at least).
         SHRINK_PAGES.fetch_max(pages.max(1), core::sync::atomic::Ordering::Relaxed);
         wake_reclaimer();
         return false;
     }
-    a.committed += pages;
+    ACCOUNT.lock().committed += pages;
     true
 }
 
 /// Promises as many as `max` pages as fit now (none: no sign of pressure,
-/// nobody is asked to shrink); how many. For speculative reserves.
+/// nobody is asked to shrink); how many. For speculative reserves (all of
+/// them unless strict: what fits then is no promise of frames anyway).
 pub fn commit_some(max: u64) -> u64 {
+    if !overcommit::strict() {
+        ACCOUNT.lock().committed += max;
+        return max;
+    }
     let unavailable = crate::fs::cache::unavailable_pages();
     let mut a = ACCOUNT.lock();
-    let limit = COMMIT_LIMIT.load(core::sync::atomic::Ordering::Relaxed);
-    let n = limit.saturating_sub(a.committed.saturating_add(unavailable)).min(max);
+    let n = commit_limit().saturating_sub(a.committed.saturating_add(unavailable)).min(max);
     a.committed += n;
     n
 }
@@ -351,11 +470,11 @@ static SHRINK_PAGES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU
 
 /// Whether a commit of `pages` failed only for the cache pages that are
 /// dirty or pinned now (write-back will make room), not for memory
-/// promised.
+/// promised. (Only the strict mode counts those pages.)
 pub fn commit_blocked_by_cache(pages: u64) -> bool {
     let unavailable = crate::fs::cache::unavailable_pages();
     let (committed, limit) = commit_stats();
-    unavailable > 0 && committed.saturating_add(pages) <= limit
+    overcommit::strict() && unavailable > 0 && committed.saturating_add(pages) <= limit
 }
 
 /// Whether a commit of `pages` would fit now (the cache's dirty and
@@ -415,7 +534,7 @@ pub fn cache_uncharge(pages: u64) {
 
 /// (committed, limit) in pages.
 pub fn commit_stats() -> (u64, u64) {
-    (ACCOUNT.lock().committed, COMMIT_LIMIT.load(core::sync::atomic::Ordering::Relaxed))
+    (ACCOUNT.lock().committed, commit_limit())
 }
 
 /// Pages of the file cache (disk files').
@@ -489,9 +608,29 @@ pub fn user_frame() -> Option<PhysFrame> {
             return frame;
         }
         if reclaim_for(1, false) == 0 {
-            return with_frames(|f| frame::UserFrames(f).allocate_frame());
+            // (An OOM victim's own faults may go into the reserve, so it
+            // gets to its end: Linux's TIF_MEMDIE.)
+            return with_frames(|f| frame::UserFrames(f).allocate_frame())
+                .or_else(|| crate::process::sched::current().group.oom_victim.load(core::sync::atomic::Ordering::Acquire).then(emergency_frame).flatten());
         }
     }
+}
+
+/// A frame of the kernel's reserve for an allocation that must not fail
+/// when user memory is exhausted (Linux's memory reserves): the Linux
+/// server's allocations that cannot fail (its heap's commits from the
+/// instance's reserve, `linux::heap_frame`) and an OOM victim's faults.
+/// Only the reserve's upper half: the lower is the kernel heap's alone.
+/// The background reclaimer calls the OOM killer when user memory stays
+/// exhausted (`reclaimer`), which refills it.
+pub fn emergency_frame() -> Option<PhysFrame> {
+    with_frames(|f| if f.free_frames() > frame::KERNEL_RESERVE_FRAMES / 2 { f.allocate_frame() } else { None })
+}
+
+/// Wakes the allocations throttled in `reclaim_retry` (memory came back:
+/// an OOM victim's).
+pub fn wake_throttled() {
+    crate::process::sched::wakeup(reclaim_chan());
 }
 
 /// The background reclaimer (Linux's kswapd): woken when the free frames
@@ -501,7 +640,9 @@ pub fn user_frame() -> Option<PhysFrame> {
 /// locked, a fork's copies, kernel stacks, anything with interrupts off)
 /// find frames without depending on direct reclaim, which a fruitless
 /// reclaim pauses for a moment. It holds no lock while it reclaims, so it
-/// can unmap pages from every address space that is not busy.
+/// can unmap pages from every address space that is not busy. When user
+/// memory stays exhausted with nothing to reclaim, it calls the OOM killer
+/// for those allocations (`oom`).
 static RECLAIMER_WANTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 fn reclaimer_chan() -> usize {
@@ -553,6 +694,8 @@ fn reclaimer() -> ! {
         // still low. A kick (a deferred reference, a new shortage) ends a
         // rest at once.
         let (mut force, mut fruitless, mut failures) = (false, 0u64, 0u32);
+        // Since when user memory is exhausted with nothing to reclaim.
+        let mut starved_since: Option<u64> = None;
         loop {
             crate::fs::cache::drop_deferred();
             let (short, low) = with_frames(|f| {
@@ -597,6 +740,23 @@ fn reclaimer() -> ! {
             // before: their caches are worth more than clean file pages).
             let lacking = with_frames(|f| (2 * low_watermark(f) + frame::KERNEL_RESERVE_FRAMES).saturating_sub(f.free_frames()));
             crate::process::linux::post_shrink(lacking.max(1));
+            // User memory exhausted (no frame above the kernel's reserve)
+            // for as long as an allocation retries reclaim before it calls
+            // the OOM killer (`reclaim_retry`): the allocations that cannot
+            // wait for memory (page tables made with the frames locked, the
+            // kernel heap, the Linux servers' own, which take from the
+            // reserve) have nobody else to call it.
+            let now = crate::time::now();
+            if with_frames(|f| f.user_may_take(1)) {
+                starved_since = None;
+            } else {
+                let since = *starved_since.get_or_insert(now);
+                let retries = if crate::fs::cache::unavailable_pages() > 0 { RECLAIM_RETRIES_IO } else { RECLAIM_RETRIES };
+                if now - since >= retries as u64 * RECLAIM_THROTTLE {
+                    oom::out_of_memory(1);
+                    starved_since = None;
+                }
+            }
             let rest = (RECLAIM_THROTTLE << failures.min(4)).min(RECLAIMER_REST_MAX);
             failures = failures.saturating_add(1);
             let wait = crate::process::sched::prepare_to_wait(reclaimer_chan());
@@ -634,7 +794,7 @@ pub fn ensure_user_frames(n: u64) -> bool {
 /// dropped nothing (Linux's MAX_RECLAIM_RETRIES), and how long it waits
 /// before each try (for write-back to clean dirty pages, for a busy
 /// address space, for programs to end): about 1.6 s without any progress
-/// before the allocation fails (and its process is killed).
+/// before the OOM killer is called (`oom::out_of_memory`).
 pub const RECLAIM_RETRIES: u32 = 16;
 /// The same while dirty or pinned cache pages may still become droppable
 /// (write-back in progress): about 30 s.
@@ -644,8 +804,10 @@ const RECLAIM_THROTTLE: u64 = 100_000_000;
 /// For an allocation that failed for want of a frame, with no lock held:
 /// reclaims cache pages for `n` frames, waiting a little for write-back
 /// or busy address spaces if nothing could be dropped now (as Linux's
-/// reclaim throttling). Whether the allocation should be tried again:
-/// false once `tries` rounds made no progress, or the thread is dying.
+/// reclaim throttling). Once `tries` rounds made no progress, the OOM
+/// killer ends a process (`oom::out_of_memory`) and the rounds start anew.
+/// Whether the allocation should be tried again: false if no process could
+/// be killed, or the thread is dying (also by the OOM killer's choice).
 /// After a round without progress, pages used lately go too (as Linux's
 /// reclaim raises its priority): a committed page needs its frame more
 /// than a cached page that is in use (which is read again when used).
@@ -660,8 +822,16 @@ pub fn reclaim_retry(n: u64, tries: &mut u32) -> bool {
         // pager's thread, which may be the one to write them.
         let waiting_for_io = crate::fs::cache::unavailable_pages() > 0 && !crate::process::linux::is_pager();
         let most = if waiting_for_io { RECLAIM_RETRIES_IO } else { RECLAIM_RETRIES };
-        if crate::process::kill::dying() || *tries >= most {
+        if crate::process::kill::dying() {
             return false;
+        }
+        if *tries >= most {
+            // Reclaim gave up: a process's end must make room (Linux's
+            // `__alloc_pages_may_oom`), after which reclaim goes on.
+            if !oom::out_of_memory(n) {
+                return false;
+            }
+            *tries = 0;
         }
         if with_frames(|f| f.user_may_take(n)) || reclaim_for(n, force) > 0 {
             return true;

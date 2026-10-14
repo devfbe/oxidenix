@@ -387,15 +387,16 @@ About 13,100 lines of Rust (without comments and blank lines) in the kernel (16,
   makes it writable. Write-back takes the dirty marks of a run of pages, write-protects them in
   every address space that maps them, then has them written; a store in between faults, marks
   the page again and is written next time, so none is lost. Reclaim cannot drop dirty pages:
-  above a tenth of the commit limit (or when reclaim finds them in its way) the server is asked
+  above a tenth of user memory (or when reclaim finds them in its way) the server is asked
   to write back, above a fifth a storing thread waits for it. A fault that needs a page from
   the server waits for it with the address space unlocked.
 - **Protection**: `mprotect` really changes the rights (including `PROT_NONE`, which keeps the
   pages' contents in entries marked by a software bit) and execution is denied by NX unless an
   area is executable, so JIT compilers can write code and then make it executable (W^X).
-- **Commit accounting** (like Linux's `overcommit_memory=2`): writable private memory is
-  promised when it is mapped, against all usable RAM except the kernel's reserve. Running out is
-  an `ENOMEM` from `mmap`, `brk`, `mprotect`, `mremap` or `fork`, not a killed process.
+- **Commit accounting** (by default as Linux's `overcommit_memory=2`, strict; the modes below):
+  writable private memory is promised when it is mapped, against all usable RAM except the
+  kernel's reserve. Running out is an `ENOMEM` from `mmap`, `brk`, `mprotect`, `mremap` or
+  `fork`, not a killed process.
   `PROT_NONE` mappings promise nothing until they become writable, so huge reservations are
   cheap. `MAP_NORESERVE` mappings are not committed as a whole, also after `mprotect` makes them
   writable (as Linux's `VM_NORESERVE`): V8 reserves its code range (512 MiB, more than the
@@ -421,15 +422,15 @@ About 13,100 lines of Rust (without comments and blank lines) in the kernel (16,
   fault that finds none reclaims again with its address space unlocked (so its own mappings
   can go too), then also pages used lately (as Linux raises its reclaim priority), and waits
   for write-back meanwhile; only reclaim that makes no progress for about 1.6 s (30 s while
-  write-back may still make room) kills the toucher. Every such wait is killable and bounded,
-  one reclaim pass looks at a bounded number of pages, and each Linux server instance may hold
-  at most a tenth of the commit limit in dirty pages (its writers wait beyond) and a quarter
-  pinned. A commit that only dirty or pinned pages block waits for their write-back with the
-  address space unlocked (mmap, mprotect, mremap, faults). A background reclaimer (a kernel
-  thread, Linux's kswapd) keeps free memory above the low watermark for allocations that
-  cannot reclaim themselves. A heuristic overcommit mode would need a real OOM killer first.
+  write-back may still make room) calls the OOM killer (below). Every such wait is killable
+  and bounded, one reclaim pass looks at a bounded number of pages, and each Linux server
+  instance may hold at most a tenth of user memory in dirty pages (its writers wait beyond)
+  and a quarter pinned. A commit that only dirty or pinned pages block waits for their
+  write-back with the address space unlocked (mmap, mprotect, mremap, faults). A background
+  reclaimer (a kernel thread, Linux's kswapd) keeps free memory above the low watermark for
+  allocations that cannot reclaim themselves.
   Each Linux server instance holds up to 2 MiB of commitment for its heap beyond what is mapped
-  there when there is room (its own reserve, all together at most a 16th of the limit: a server
+  there when there is room (its own reserve, all together at most a 16th of user memory: a server
   cannot fail most of its allocations but by breaking its instance). What a program's call makes
   the server hold, in amounts the program drives (socket queues, pipes, directory listings,
   watches, copies of arguments), is allocated fallibly and answered with `ENOMEM` (`ENOBUFS`
@@ -437,6 +438,32 @@ About 13,100 lines of Rust (without comments and blank lines) in the kernel (16,
   `/proc/meminfo` shows `Committed_AS`, `CommitLimit`, `Cached` (with tmpfs), `Shmem` (tmpfs and
   shared memory), `Writeback` (pinned for the disk server) and a `MemAvailable` that includes
   the droppable pages.
+- **Overcommit modes** (ADR 0013): Linux's `vm.overcommit_memory` 0 (heuristic: a commit fails
+  only if it alone is more than all memory), 1 (always) and 2 (strict, the default), with
+  `vm.overcommit_ratio` (percent of user memory, 100 by default: there is no swap) and
+  `vm.overcommit_kbytes`, in `/proc/sys/vm` (the Linux server's, over the kernel's
+  `overcommit` call): readable by every tree, writable by a tree with the host grant only,
+  since the policy is the machine's. `Committed_AS` is counted and `CommitLimit` shown in every
+  mode. The heuristic mode is for programs that promise much and touch little (Node.js: musl
+  commits 8 MiB per thread stack); an overcommitment that comes due is settled by the OOM
+  killer.
+- **OOM killer** (`memory/oom.rs`, Linux's mm/oom_kill.c): when an allocation finds no frame
+  after reclaim gave up (a fault, a copy into program memory, a cache fill; for allocations that
+  cannot wait, the background reclaimer when memory stays exhausted), the process of the
+  highest badness is killed with SIGKILL: its resident pages and page tables plus
+  `oom_score_adj` thousandths of memory, across all process trees. Never the kernel's threads,
+  the native servers, an instance's service process, the first process of the tree with the
+  host grant, nor a process with `oom_score_adj` -1000; the processes sharing the victim's
+  address space die with it. One victim at a time; its faults (and the Linux server's
+  allocations that cannot fail) may take frames of the kernel's reserve, and the OOM reaper (a
+  kernel thread) frees its private memory at once. Only if nobody may be killed does the
+  allocating process die. The kernel's log (`dmesg`) gets Linux's messages (`Out of memory:
+  Killed process N (name) total-vm:... anon-rss:... file-rss:... shmem-rss:...`, the table of
+  candidates, the reaper's line). `/proc/<pid>/oom_score`, `oom_score_adj` and the legacy
+  `oom_adj` are Linux's (the score in 0..2000; lowering `oom_score_adj` below what a process
+  was given needs the host grant), and `/proc/<pid>/status` splits `VmRSS` into `RssAnon`,
+  `RssFile` and `RssShmem` and shows `VmPTE`: the kernel counts resident pages by kind (two
+  software bits in the page table entries) and page tables per address space.
 - **Copy-on-write**: `fork` shares all private frames. Writable pages become read-only in both
   processes and are tagged with an OS-available page table bit. A write fault either copies the
   frame or, for the last owner, just restores write access. Shared memory stays shared.
@@ -466,8 +493,8 @@ About 13,100 lines of Rust (without comments and blank lines) in the kernel (16,
   `EDEADLK`, and the owner runs with the largest weight of the threads waiting for it, along a
   chain of locks (priority inheritance on the fair scheduler).
 - **Out of memory is an error, not a panic**: the kernel heap grows by mapping more frames
-  when an allocation fails. It never shrinks, so each growth lowers the commit limit by as
-  much (`Slab` in `/proc/meminfo` is what of it is in use); before it grows, the size
+  when an allocation fails. It never shrinks, so each growth lowers user memory (and with it
+  the commit limit) by as much (`Slab` in `/proc/meminfo` is what of it is in use); before it grows, the size
   classes give back the slabs whose slots are all free
   (`slab::FreeList::reclaim`; the Linux server's heap returns empty slabs at once and
   decommits its free pages, `crates/pageheap`), so a burst of many
@@ -630,7 +657,7 @@ call into a device:
 ### Restricted mode and the Linux server
 
 The kernel's Linux implementation moved out into a user-space **Linux server**
-(`servers/linux`; `docs/design/linux-server.md`, ADRs 0001-0011 in `docs/decisions/`). Phase
+(`servers/linux`; `docs/design/linux-server.md`, ADRs 0001-0013 in `docs/decisions/`). Phase
 R1 put the mechanism in place, with every system call passed through; the phases since moved
 memory, time, files, terminals, sockets, processes and signals into the server, and R9 removed
 the pass-through: the kernel implements no Linux system call.
@@ -916,8 +943,8 @@ Linux server above for the details).
   page is written; then it gets its own frame. The kernel reads its own programs (the servers)
   from the same archive by name.
 - **tmpfs**: a file's contents are a file object of the kernel's (as Linux's tmpfs, pages in
-  memory). The pages are committed memory, and all of them together may take half of the
-  commit limit (`ENOSPC` beyond, as Linux's default tmpfs size).
+  memory). The pages are committed memory, and all of them together may take half of user
+  memory (`ENOSPC` beyond, as Linux's default tmpfs size).
 - **Open files** are the server's shared descriptions with offset and flags, so `dup`, `fork`
   and close-on-exec behave as on Linux; pipes (64 KiB, blocking, EOF and `EPIPE`) and
   `eventfd` are files of the server's.
@@ -1003,7 +1030,8 @@ dispatch; drivers, filesystems, the network stack and Linux itself are user-spac
   program file the process runs, kept from its `execve` (also renamed or removed, then read
   with " (deleted)"; `execve("/proc/self/exe")` runs it again). `statm` and `status` split
   the address space by kind as Linux does (`VmData`, `VmStk`, `VmExe`, `VmLib`), from the
-  kernel's per-space counts by kind of area. A non-Linux userland would simply not run
+  kernel's per-space counts by kind of area, and the resident pages by what they are
+  (`RssAnon`, `RssFile`, `RssShmem`, with `VmPTE`). A non-Linux userland would simply not run
   procfs.
 - What stays in the kernel: the console and keyboard as a raw device (the terminals are the
   Linux server's, R6d); no VFS, no descriptor tables, no signals, no Linux system call (R9,
@@ -1280,6 +1308,7 @@ Each of these programs and scripts lives in the root filesystem and runs inside 
 | `metatest` | file times on tmpfs (nanoseconds) and `/data` (seconds): `utimensat`, `futimens` with `UTIME_OMIT`/`UTIME_NOW`, `utimes`, `EINVAL` for nanoseconds out of range; a write moving mtime and ctime (and the times staying after `fsync`, the write-back), `ftruncate`, `chmod` (ctime only), a new and a removed name moving their directory's mtime; tmpfs's birth time in `statx`, none on ext2; `fchmod`, `fchmodat2` with `AT_EMPTY_PATH`, `EOPNOTSUPP` on a symlink, the chown family, `getgroups`/`setgroups`; times before 1970, `EINVAL` for flags with a null path, times set on `/dev/null` and on `/proc` reading back |
 | `inotifytest` | inotify on tmpfs and `/data`: a directory's watch seeing create, merged modifies, attrib, mkdir, a move's two events with one cookie, delete; a file's own modify, close-write, open, access, close-nowrite; its removal (attrib, delete, delete-self, ignored); `IN_ONESHOT`, `IN_ONLYDIR` (`ENOTDIR`), `IN_MASK_CREATE` (`EEXIST`), `rm_watch` (`IN_IGNORED`, then `EINVAL`); `FIONREAD`, `EINVAL` for a buffer too small, names padded to 16 bytes, poll and a blocking read woken by another thread, `EINVAL`/`EBADF` for other descriptors; a file removed while open (`IN_DELETE_SELF` at its last close); the limits: 128 instances (`EMFILE`), 8192 watches (`ENOSPC`), 16384 events then one `IN_Q_OVERFLOW`; one watch for a pseudo file named twice |
 | `treetest` | two process trees at once: the suite's tree starts a second one (`TEST_TREE_START`: its own Linux server instance, neither the console nor the host grant; `EINVAL`, `ECHILD`, `ETIMEDOUT` of the test calls) running `treetest peer`, and each step between them is a command and an answer over TCP on loopback with a deadline; the second tree's program is pid 1 without a parent or standard descriptors; each `/proc` lists only its own tree's processes (`/proc/self` 1 there); each tree's own `/tmp` and root tmpfs; signals stay in their tree (`kill(-1)` reaches only its own, the other's pids `ESRCH`); netd between them: 1 MiB each way over TCP, connections both ways, a datagram, a TCP or UDP port the other tree holds `EADDRINUSE` even with `SO_REUSEADDR` (also on the wildcard address, also while it is only in `TIME-WAIT` there), shared within one tree, free once closed; one tree using up its share of netd's buffers (`ENOBUFS` after about 130 UDP sockets) leaves the other its reserve (a datagram, a listener, a connection, 32 KiB); one tree holding all memory (`ENOMEM`) leaves the other's server working from its heap's reserve (a file, a pipe, an `AF_UNIX` pair, `epoll`, a directory listing, a fork or its `ENOMEM`); `/data` shared through diskfs: a new name, a rename and a directory seen at once, fsync'ed data, data the other tree wrote without fsync after a `sync(2)` here, a file the other tree unlinks still readable from a descriptor open here; the second tree ending with status 0, its handle gone after the wait |
+| `oomkilltest` | the OOM killer and the overcommit modes (ADR 0013): `/proc/sys/vm/overcommit_{memory,ratio,kbytes}` (strict, 100 and 0 by default; `/proc/sys` lists `vm`; a ratio of 50 halves `CommitLimit`, KiB set it and zero the ratio and back; `EINVAL` for mode 3, -1 and junk), without the host grant (`TEST_HOST`) `EACCES` to open them for writing and to lower `oom_score_adj` below its least, raising it still allowed; `oom_score` orders a 4 MiB and a 32 MiB process, `RssAnon` counts the 32 MiB, `oom_score_adj` 500 lifts the small one above, `oom_adj` reads and writes Linux's scale (15 is 1000, -17 is -1000, which scores 0), `EINVAL` beyond, the thread's directory showing the process's, a fork inheriting it; strict mode refuses a commit beyond the limit, heuristic grants it (`Committed_AS` above `CommitLimit` then) but not one larger than all memory, always grants that too; in the heuristic mode a toucher of all memory makes the killer end first a 2 MiB process with `oom_score_adj` 1000, then the toucher (the biggest), both with `SIGKILL`, while the test (`oom_score_adj` -1000, holding 32 MiB, intact), a 16 MiB process and a second tree live on, the kernel's log naming both kills (`Out of memory: Killed process`, who invoked the killer, its table), fork, exec and commits working afterwards; strict mode restored |
 | `fifotest` | `mknod`/`mknodat` and FIFOs on tmpfs and `/data`, checked against Linux: regular files, FIFOs (`mkfifo`), character and block devices and sockets with the umask applied, `S_IFIFO`, `st_rdev` (also beyond 8 bits of major and minor), `statx`'s device numbers and `d_type`; a character node opening null or zero by number, a block or unknown one `ENXIO`, a socket node `ECONNREFUSED`; `EEXIST` (also a dangling symlink, a mount point, a trailing slash), `ENOENT`, `ENOTDIR`, `EINVAL` for an unknown type, `EPERM` for a directory's (before the name), in `/sys` and devpts, `ENOENT` in `/proc`, devices in `/dev`; FIFOs as named pipes: a non-blocking reader at once (no `POLLHUP` before a writer came), a non-blocking writer without readers `ENXIO`, `O_RDWR` never waiting, blocking readers and writers waiting for a partner of another process and path, `EINVAL` for access mode 3, a waiting open ended by a signal (`EINTR`, restarted with `SA_RESTART`, the interrupted reader counted no more), data, end of file, `EPIPE` and `SIGPIPE`, the buffer going with the last close, `/proc/self/fd/N` (the path, another end), `fstat`, `fchmod`, `ESPIPE`, poll, select and epoll, the times a read and a write move, inotify's events, a FIFO removed while open |
 | `kmsgtest` | the kernel's log: `syslog`'s `SIZE_BUFFER`, `READ_ALL` with the kernel's own records and a record written to `/dev/kmsg` (`<prio>[seconds.micros] text`, the user facility for a prefix without one), its newest records that fit a small buffer, `CLEAR` and `READ_CLEAR`, `READ` taking records (split across short reads, `SIZE_UNREAD` counting the rest) and waiting for the next one, the argument checks (`EINVAL` for no buffer, a negative length, an unknown action, console level 9); `/dev/kmsg`: one record a read (`prio,seq,micros,-;text`, control bytes and `\` escaped, sequence numbers counting on), `EINVAL` for a buffer too small (the record kept), `lseek` to the end (`EAGAIN`, not readable) and the oldest record, `ESPIPE` and `EINVAL` for other seeks, poll and epoll woken by a write, a blocking read woken by another process's write, `EINVAL` beyond 1024 bytes, `EBADF` reading a write-only open; without the host grant (`TEST_HOST`) `EPERM` for reading, clearing, the console's level and a readable open of `/dev/kmsg` (not for `SIZE_BUFFER`), and of 30 writes at once at most 10 reaching the log (the kernel's ratelimit); BusyBox's `dmesg` |
 | `vmtest` | demand paging (a 64 MiB mapping costs nothing until touched), `SIGSEGV` on read-only and `PROT_NONE` pages with contents kept, split areas after a partial `munmap`, NX and the JIT pattern (1 GiB `PROT_NONE` reservation, write code, `mprotect` to executable, call it), commit limit and `MAP_NORESERVE` (also a 4 GiB reservation made writable and executable at once, as V8's code range, and forked counting only its touched pages, while the same without it is `ENOMEM`; 40 rounds of partial `munmap`, `MADV_DONTNEED`, `mremap`, `mprotect`, `fork` with copy-on-write on both sides and `exec` leave `Committed_AS` unchanged; a read-only area read in completely becomes writable with nothing left to commit), `mremap` in place and moving, `MADV_DONTNEED`, shared vs. private memory across `fork`, lazy file mappings and `SIGBUS` beyond the end, `MAP_FIXED_NOREPLACE`, stack growth to 4 MiB and overflow beyond 8 MiB, nothing mapped at or above 64 TiB (fixed mappings fail, hints and the stack stay below), the Linux server's memory out of the program's reach and its kernel calls `ENOSYS` for a program |

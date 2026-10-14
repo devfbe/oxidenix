@@ -85,6 +85,10 @@ fn start_servers() {
     if let Err(e) = memory::start_reclaimer() {
         panic!("cannot start the background reclaimer (errno {})", e);
     }
+    // Frees the OOM killer's victims' memory (memory::oom).
+    if let Err(e) = memory::oom::start_reaper() {
+        panic!("cannot start the OOM reaper (errno {})", e);
+    }
     start_diskfs();
     start_netd();
     start_procfs();

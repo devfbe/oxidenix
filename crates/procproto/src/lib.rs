@@ -39,6 +39,9 @@ pub const SERVICE: &str = "procfs";
 /// and /sys.
 pub const PROC_ROOT: u32 = 1;
 pub const SYSFS_ROOT: u32 = 100;
+/// /proc/sys, procfs's directory, into which the Linux server merges `vm`
+/// (the overcommit policy is the kernel's, set through the server).
+pub const PROC_SYS: u32 = 10;
 
 pub const MAX_CPUS: usize = 16;
 
@@ -168,6 +171,12 @@ pub struct Process {
     pub sig_caught: u64,
     /// Name (comm), NUL-padded.
     pub name: [u8; 16],
+    /// Of `pages`: private ones (anonymous memory, private copies of file
+    /// pages) and those of memory-only files (tmpfs, shared anonymous
+    /// memory); the rest are file pages. Its page tables, in pages.
+    pub anon_pages: u64,
+    pub shmem_pages: u64,
+    pub table_pages: u64,
 }
 
 /// The bytes of a record.

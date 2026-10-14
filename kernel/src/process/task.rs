@@ -23,7 +23,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, AtomicI8, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI64, AtomicI8, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 pub use crate::memory::kstack::KernelStack;
 
@@ -141,6 +141,19 @@ pub struct ThreadGroup {
     pub stack_soft: AtomicU64,
     /// Deadlines on its CPU clocks the Linux server armed (`super::cputimer`).
     pub alarms: super::cputimer::Alarms,
+    /// Linux's oom_score_adj (-1000..=1000: added to its badness in
+    /// thousandths of memory, -1000 exempts it from the OOM killer) and the
+    /// least its tree may set without the host grant (oom_score_adj_min),
+    /// copied by a fork, kept by exec (`memory::oom`).
+    pub oom_score_adj: AtomicI64,
+    pub oom_score_adj_min: AtomicI64,
+    /// The OOM killer killed it (Linux's TIF_MEMDIE): its threads' faults
+    /// may take frames of the kernel's reserve, so it can get to its end.
+    pub oom_victim: AtomicBool,
+    /// The first process of a tree: its instance's host grant (while it
+    /// holds, the process is Linux's global init, which the OOM killer
+    /// never chooses). Unset for every other process.
+    pub host_init: spin::Once<Arc<AtomicBool>>,
 }
 
 impl ThreadGroup {
@@ -156,6 +169,10 @@ impl ThreadGroup {
             killed_by_kernel: AtomicU64::new(0),
             stack_soft: AtomicU64::new(u64::MAX),
             alarms: super::cputimer::Alarms::new(),
+            oom_score_adj: AtomicI64::new(0),
+            oom_score_adj_min: AtomicI64::new(0),
+            oom_victim: AtomicBool::new(false),
+            host_init: spin::Once::new(),
         })
         .ok()
     }

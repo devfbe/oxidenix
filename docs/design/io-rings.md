@@ -413,8 +413,8 @@ pages and dirty marks the kernel keeps and whose data the server moves:
   they use the frames commitments have not claimed yet, and clean ones that nothing pins are
   reclaimed when memory for programs (or another cache page) needs their frames, mapped ones
   after reclaim removed them from the mappings that did not use them since its last look
-  (docs/design/page-cache.md, "Memory accounting"); pending and dirty ones are not. Dirty pages of all caches count in `Dirty:`; above a tenth of the commit
-  limit, or when reclaim finds them in its way, the pagers get `EVENT_WRITEBACK` (one queued at a
+  (docs/design/page-cache.md, "Memory accounting"); pending and dirty ones are not. Dirty pages of all caches count in `Dirty:`; above a tenth of user
+  memory, or when reclaim finds them in its way, the pagers get `EVENT_WRITEBACK` (one queued at a
   time), and above a fifth a thread that stores waits up to a second for them (Linux's dirty
   ratios; never the pager, which does the writing). `event_wait` takes a deadline (`EVENT_TIMER`,
   for the server's periodic write-back) and delivers `EVENT_CLOSING` once when the instance's

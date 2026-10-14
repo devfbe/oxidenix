@@ -7,8 +7,9 @@
 //! accesses to user memory (`uaccess`) are handled the same way.
 //!
 //! Writable private memory is committed when it is mapped, against a
-//! system-wide limit (`memory::commit`), so running out of memory is an
-//! ENOMEM from `mmap`, `brk`, `mprotect` or `fork`, not a killed process.
+//! system-wide limit (`memory::commit`; in the strict overcommit mode, the
+//! default), so running out of memory is an ENOMEM from `mmap`, `brk`,
+//! `mprotect` or `fork`, not a killed process.
 //! Private areas that are not committed as a whole (`MAP_NORESERVE` ones,
 //! also after `mprotect` made them writable, as on Linux, and areas that
 //! are not writable) commit page by page instead: a page that gets a
@@ -25,12 +26,20 @@
 //! frames that commitments have not claimed yet. A fault that finds no
 //! frame reclaims again with the space unlocked (`Mm::retrying`), so the
 //! space's own mappings of cache pages can be removed too
-//! (`reclaim_file_pages`), and gives up (the toucher is killed) only when
-//! reclaim makes no more progress.
+//! (`reclaim_file_pages`); when reclaim makes no more progress the OOM
+//! killer ends the process of the highest badness (`memory::oom`, which
+//! reaps a victim's private pages with `reap`), and only if none may be
+//! killed does the fault fail (the toucher is killed).
 //!
-//! Page table entries carry three software bits: COW (a shared frame that
+//! Page table entries carry five software bits: COW (a shared frame that
 //! is copied on the first write), PROT_NONE (a frame kept while its area
-//! denies all access) and CHARGED (a page committed on its own, above).
+//! denies all access), CHARGED (a page committed on its own, above), and
+//! what kind of resident page it is, ANON (the mapping's private page:
+//! anonymous memory or a private copy of a file page) or SHMEM (a page of a
+//! memory-only file: tmpfs, anonymous shared memory), neither for a file
+//! page. The counts of each kind and of the page tables (`MemStats`) are
+//! what the OOM killer weighs (`memory::oom`) and `/proc/<pid>/status`
+//! shows.
 //!
 //! File mappings map the frames of the file's page cache (`fs::cache`):
 //! shared ones the cache frame itself, private ones the cache frame
@@ -72,6 +81,13 @@ const PROT_NONE: PageTableFlags = PageTableFlags::BIT_10;
 /// A private frame of an area not committed as a whole, committed on its
 /// own (one page) when it was made; uncommitted when the entry goes.
 const CHARGED: PageTableFlags = PageTableFlags::BIT_11;
+/// The mapping's private page (Linux's MM_ANONPAGES); bits 52-58 are the
+/// software's too.
+const ANON: PageTableFlags = PageTableFlags::BIT_52;
+/// A page of a memory-only file (Linux's MM_SHMEMPAGES).
+const SHMEM: PageTableFlags = PageTableFlags::BIT_53;
+/// The bits an entry keeps whatever its rights become.
+const KEPT: PageTableFlags = CHARGED.union(ANON).union(SHMEM);
 
 /// Highest address `mmap` hands out; the stack lives above.
 pub const MMAP_TOP: u64 = restricted::MMAP_TOP;
@@ -271,20 +287,36 @@ enum Kind {
 }
 
 /// Mapped (resident) and virtual pages, and the most pages ever resident,
-/// readable by anyone (procfs) while only the owning process changes them.
+/// readable by anyone (procfs, the OOM killer) while only the owning
+/// process changes them.
 #[derive(Default)]
 pub struct MemStats {
     pub pages: AtomicU64,
+    /// Of `pages`: private ones (ANON) and memory-only files' (SHMEM); the
+    /// rest are file pages.
+    pub anon_pages: AtomicU64,
+    pub shmem_pages: AtomicU64,
+    /// Page tables, all levels, the views' top-level tables included
+    /// (they go only with the space).
+    pub table_pages: AtomicU64,
     pub virt_pages: AtomicU64,
     pub peak_pages: AtomicU64,
     /// The most pages of address space it had (Linux's VmPeak).
     pub virt_peak: AtomicU64,
     /// Pages of address space by kind (`Vma::kind`): executable and not
     /// writable, stacks, private and writable (Linux's exec_vm, stack_vm,
-    /// data_vm). Kept in step with the areas by `tally`.
+    /// data_vm). Kept in step with the areas by `tally`. (The resident
+    /// pages' kinds above are what the pages are; these, what the areas
+    /// are for.)
     pub exec_pages: AtomicU64,
     pub stack_pages: AtomicU64,
     pub data_pages: AtomicU64,
+    /// The address space these are of, once it is an `Mm` (the OOM
+    /// killer's reaper reaches it so).
+    owner: spin::Once<Weak<Mm>>,
+    /// Its memory was reaped, or the reaper gave up on it: the OOM killer
+    /// neither waits for it nor chooses it again (Linux's MMF_OOM_SKIP).
+    pub oom_skip: core::sync::atomic::AtomicBool,
 }
 
 impl MemStats {
@@ -308,6 +340,82 @@ impl MemStats {
             Some(Kind::Data) => count(&self.data_pages, pages),
             None => {}
         }
+    }
+
+    /// A page mapped with the entry flags `flags` (its kind bits).
+    fn mapped(&self, flags: PageTableFlags) {
+        self.add_resident(1);
+        if flags.contains(ANON) {
+            self.anon_pages.fetch_add(1, Ordering::Relaxed);
+        }
+        if flags.contains(SHMEM) {
+            self.shmem_pages.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// The pages `gone` counted were unmapped.
+    fn unmapped(&self, gone: &Kinds) {
+        count(&self.pages, -(gone.all as i64));
+        count(&self.anon_pages, -(gone.anon as i64));
+        count(&self.shmem_pages, -(gone.shmem as i64));
+    }
+
+    /// An entry with the flags `old` now maps a private page (a copy, or
+    /// a frame that became its own): it counts as anonymous.
+    fn privatized(&self, old: PageTableFlags) {
+        if !old.contains(ANON) {
+            self.anon_pages.fetch_add(1, Ordering::Relaxed);
+        }
+        if old.contains(SHMEM) {
+            count(&self.shmem_pages, -1);
+        }
+    }
+
+    /// The address space (None once it is gone).
+    pub fn mm(&self) -> Option<Arc<Mm>> {
+        self.owner.get().and_then(Weak::upgrade)
+    }
+
+    /// Whether the address space is still there (without a reference: the
+    /// caller may hold spinlocks its teardown must not run under).
+    pub fn mm_alive(&self) -> bool {
+        self.owner.get().is_some_and(|w| w.strong_count() > 0)
+    }
+}
+
+/// Entries taken out of a page table, counted by kind.
+#[derive(Default)]
+struct Kinds {
+    all: u64,
+    anon: u64,
+    shmem: u64,
+}
+
+impl Kinds {
+    fn add(&mut self, flags: PageTableFlags) {
+        self.all += 1;
+        self.anon += flags.contains(ANON) as u64;
+        self.shmem += flags.contains(SHMEM) as u64;
+    }
+}
+
+/// The frames for new page tables of a space (user frames), counted.
+struct Tables<'a> {
+    frames: UserFrames<'a>,
+    made: u64,
+}
+
+impl<'a> Tables<'a> {
+    fn new(frames: &'a mut memory::frame::PhysFrameAllocator) -> Self {
+        Tables { frames: UserFrames(frames), made: 0 }
+    }
+}
+
+unsafe impl FrameAllocator<Size4KiB> for Tables<'_> {
+    fn allocate_frame(&mut self) -> Option<PhysFrame> {
+        let frame = self.frames.allocate_frame();
+        self.made += frame.is_some() as u64;
+        frame
     }
 }
 
@@ -387,6 +495,10 @@ pub struct AddressSpace {
     /// The disk file whose page a store made dirty last, for the writer's
     /// throttling by its owner's share (`handle_fault`).
     dirtied: Option<Arc<PageCache>>,
+    /// The OOM killer's reaper took its private pages (`reap`): its
+    /// process is dying, and no fault makes new ones (Linux's
+    /// MMF_UNSTABLE).
+    reaped: bool,
 }
 
 /// An address space as tasks hold it: shared by the threads of a process
@@ -409,6 +521,7 @@ impl Mm {
     pub fn new(space: AddressSpace) -> Option<Arc<Mm>> {
         let (tlb, stats) = (space.tlb.clone(), space.stats.clone());
         let mm = Arc::try_new(Mm { tlb, stats, space: Mutex::new(space) }).ok()?;
+        mm.stats.owner.call_once(|| Arc::downgrade(&mm));
         let mut space = mm.lock();
         space.owner = Arc::downgrade(&mm);
         let files: alloc::vec::Vec<Arc<PageCache>> = space.vmas.values().filter_map(|v| v.file().map(|(c, _)| c.clone())).collect();
@@ -603,6 +716,7 @@ impl AddressSpace {
             memory::with_frames(|f| unsafe { f.deallocate_frame(l4) });
             return None;
         };
+        stats.table_pages.store(1, Ordering::Relaxed);
         Some(AddressSpace {
             l4,
             normal: None,
@@ -620,6 +734,7 @@ impl AddressSpace {
             short_commit: 0,
             commit_waits: false,
             dirtied: None,
+            reaped: false,
         })
     }
 
@@ -636,6 +751,7 @@ impl AddressSpace {
             table[i] = mine[i].clone();
         }
         table[super::linux::SHARED_SLOT].set_frame(instance.pdpt(), super::linux::table_flags());
+        self.stats.table_pages.fetch_add(1, Ordering::Relaxed);
         self.normal = Some(normal);
         self.tlb.set_normal(normal);
         if program {
@@ -805,16 +921,16 @@ impl AddressSpace {
     /// Frees the frames mapped in [start, end) (the areas stay).
     fn clear_pages(&mut self, start: u64, end: u64) {
         let mut gather = Gather::new(&self.tlb);
-        let (mut freed, mut charged) = (0i64, 0u64);
+        let (mut freed, mut charged) = (Kinds::default(), 0u64);
         for_each_leaf(self.l4, start, end, |va, e| {
             let frame = PhysFrame::containing_address(e.addr());
             charged += e.flags().contains(CHARGED) as u64;
+            freed.add(e.flags());
             e.set_unused();
             gather.add(va, frame);
-            freed += 1;
         });
         gather.finish();
-        count(&self.stats.pages, -freed);
+        self.stats.unmapped(&freed);
         memory::uncommit(charged);
     }
 
@@ -989,15 +1105,15 @@ impl AddressSpace {
         let parent = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
         // (Nothing here may allocate from the heap: the frame allocator's
         // lock is held, and a growing heap takes it.)
-        memory::with_frames(|frames| {
+        let tables = memory::with_frames(|frames| {
+            let mut tables = Tables::new(frames);
             for_each_leaf(l4, from, from + len, |va, e| {
                 let (frame, flags) = (PhysFrame::containing_address(e.addr()), e.flags());
                 let page = Page::<Size4KiB>::containing_address(VirtAddr::new(to + (va - from)));
-                let mut user = UserFrames(frames);
                 // The target range was unmapped, so this cannot collide. A
                 // page that cannot be mapped there (no frame for a page
                 // table) keeps its old entry for now.
-                match unsafe { mapper.map_to_with_table_flags(page, frame, flags, parent, &mut user) } {
+                match unsafe { mapper.map_to_with_table_flags(page, frame, flags, parent, &mut tables) } {
                     Ok(f) => {
                         f.ignore();
                         e.set_unused();
@@ -1005,7 +1121,9 @@ impl AddressSpace {
                     Err(_) => lost = true,
                 }
             });
+            tables.made
         });
+        self.stats.table_pages.fetch_add(tables, Ordering::Relaxed);
         self.sync_views(to..to + len);
         tlb::shootdown(&self.tlb, from, from + len);
         // The pages that could not move go as munmap's do: frames after the
@@ -1027,7 +1145,9 @@ impl AddressSpace {
     /// (`Mm::retrying`): a pager may need to lock it meanwhile (write-back
     /// write-protects every mapping of a file).
     fn fault_or_retry(&mut self, va: u64, access: Access, wait: bool) -> Result<(), Fault> {
-        if va >= USER_END {
+        // (A reaped space's process dies: nothing is made for it any more,
+        // a copy into it fails.)
+        if va >= USER_END || self.reaped {
             return Err(Fault::Segv);
         }
         let page = page_down(va);
@@ -1083,6 +1203,11 @@ impl AddressSpace {
             }
             if charge {
                 flags.insert(CHARGED);
+            }
+            if private_frame {
+                flags.insert(ANON);
+            } else if v.file().is_some_and(|(cache, _)| cache.is_shmem()) {
+                flags.insert(SHMEM);
             }
             self.install(page, frame, flags)
         });
@@ -1170,29 +1295,33 @@ impl AddressSpace {
         e
     }
 
+    /// Maps `frame` at `page` with `flags` (its kind bits included, for the
+    /// counts), making the page tables it needs.
     fn install(&mut self, page: u64, frame: PhysFrame, flags: PageTableFlags) -> Result<(), Fault> {
         let mut mapper = self.mapper();
         let parent = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
         let p = Page::<Size4KiB>::containing_address(VirtAddr::new(page));
-        let mapped = memory::with_frames(|frames| {
-            let mut user = UserFrames(frames);
-            match unsafe { mapper.map_to_with_table_flags(p, frame, flags, parent, &mut user) } {
+        let (mapped, tables) = memory::with_frames(|frames| {
+            let mut tables = Tables::new(frames);
+            let mapped = match unsafe { mapper.map_to_with_table_flags(p, frame, flags, parent, &mut tables) } {
                 Ok(f) => {
                     f.ignore();
                     true
                 }
                 Err(_) => {
-                    unsafe { user.0.deallocate_frame(frame) };
+                    unsafe { tables.frames.0.deallocate_frame(frame) };
                     false
                 }
-            }
+            };
+            (mapped, tables.made)
         });
+        self.stats.table_pages.fetch_add(tables, Ordering::Relaxed);
         if !mapped {
             return Err(self.no_frame(Fault::Oom));
         }
         self.sync_views(page..page + PAGE);
         // The entry was not present before, so no TLB holds it.
-        self.stats.add_resident(1);
+        self.stats.mapped(flags);
         Ok(())
     }
 
@@ -1214,6 +1343,9 @@ impl AddressSpace {
             return Err(self.commit_failed(1, Fault::Oom));
         }
         let writable = if charge { writable | CHARGED } else { writable };
+        // A private area's page becomes its own: a copy, or the frame it is
+        // the last user of.
+        let writable = if shared_area { writable } else { (writable | ANON) - SHMEM };
         // A copy if others share the frame: its frame from free memory or
         // reclaim (`user_frame`, not with the frames locked), filled
         // outside the frame allocator's lock (others only copy from the
@@ -1254,6 +1386,9 @@ impl AddressSpace {
                 false
             }
         });
+        if !shared_area {
+            self.stats.privatized(flags);
+        }
         if copied {
             // Other threads must stop reading the old frame before this
             // mapping lets go of it.
@@ -1355,12 +1490,12 @@ impl AddressSpace {
         if charge && !memory::commit(1) {
             return Err(self.commit_failed(1, Fault::Oom));
         }
+        let before = e.flags();
         let copied = memory::with_frames(|frames| {
             if frames.refcount(old) <= 1 {
                 // Its own meanwhile: kept, with the commit made for it.
-                if charge {
-                    e.set_flags(e.flags() | CHARGED);
-                }
+                let flags = (e.flags() | ANON) - SHMEM;
+                e.set_flags(if charge { flags | CHARGED } else { flags });
                 return Ok(false);
             }
             let new = UserFrames(frames).allocate_frame().ok_or(Fault::Oom)?;
@@ -1371,14 +1506,15 @@ impl AddressSpace {
                     PAGE as usize,
                 );
             }
-            let flags = if charge { (e.flags() - COW) | CHARGED } else { e.flags() - COW };
-            e.set_addr(new.start_address(), flags);
+            let flags = ((e.flags() - COW) | ANON) - SHMEM;
+            e.set_addr(new.start_address(), if charge { flags | CHARGED } else { flags });
             Ok(true)
         });
         if copied.is_err() && charge {
             memory::uncommit(1);
         }
         let copied = copied.map_err(|e| self.no_frame(e))?;
+        self.stats.privatized(before);
         if copied {
             let mut gather = Gather::new(&self.tlb);
             gather.add(page, old);
@@ -1564,6 +1700,25 @@ impl AddressSpace {
         Ok(())
     }
 
+    /// The OOM reaper's part (Linux's `__oom_reap_task_mm`): frees the
+    /// private pages of this space, whose process the OOM killer ended
+    /// (anonymous memory, private copies of file pages and the file pages
+    /// private mappings show, with the commitment of those committed one by
+    /// one; shared memory stays, others may use it), so the memory comes
+    /// back even while a thread of the victim is held up in the kernel. No
+    /// fault makes a page in it afterwards (`reaped`: the victim dies, a
+    /// copy into its memory fails). Returns the pages taken off.
+    pub fn reap(&mut self) -> u64 {
+        self.reaped = true;
+        let before = self.stats.pages.load(Ordering::Relaxed);
+        let mut at = 0;
+        while let Some((start, end)) = self.vmas.range(at..).map(|(_, v)| v).find(|v| v.private()).map(|v| (v.start, v.end)) {
+            self.clear_pages(start, end);
+            at = end;
+        }
+        before.saturating_sub(self.stats.pages.load(Ordering::Relaxed))
+    }
+
     /// Removes this space's mappings of `cache`'s pages from `index` on
     /// (a truncated file), private copies included.
     pub fn unmap_file(&mut self, cache: &PageCache, index: u64) {
@@ -1605,7 +1760,7 @@ impl AddressSpace {
         }
         areas.extend(self.vmas.values().filter_map(ours));
         let mut gather = Gather::new(&self.tlb);
-        let (mut removed, mut charged) = (0u64, 0u64);
+        let (mut removed, mut charged) = (Kinds::default(), 0u64);
         for (start, len, first) in areas {
             let from = pages.partition_point(|&(index, _)| index < first);
             for (i, &(index, frame)) in pages.iter().enumerate().skip(from) {
@@ -1628,15 +1783,15 @@ impl AddressSpace {
                 }
                 let flags = e.flags();
                 charged += flags.contains(CHARGED) as u64;
+                removed.add(flags);
                 e.set_unused();
                 gather.add(va, frame);
-                removed += 1;
             }
         }
         gather.finish();
-        count(&self.stats.pages, -(removed as i64));
+        self.stats.unmapped(&removed);
         memory::uncommit(charged);
-        removed
+        removed.all
     }
 
     /// The shared file mappings in [start, end) with the file pages they
@@ -1740,10 +1895,11 @@ impl AddressSpace {
         // The CHARGED entries the child got: a partial copy (Oom) gives back
         // the commit of those it did not (its space releases the others).
         let mut copied_charged = 0;
-        let result = memory::with_frames(|frames| {
-            let mut frames = UserFrames(frames);
+        let (result, tables) = memory::with_frames(|frames| {
+            let mut frames = Tables::new(frames);
             let l4 = table_at(parent.l4);
-            for i4 in 0..256 {
+            let mut result = Ok(());
+            'copy: for i4 in 0..256 {
                 for (i3, l3e) in children(&l4[i4]) {
                     for (i2, l2e) in children(l3e) {
                         let l1 = table_at(PhysFrame::containing_address(l2e.addr()));
@@ -1762,19 +1918,24 @@ impl AddressSpace {
                             }
                             let frame = PhysFrame::containing_address(leaf.addr());
                             let page = Page::<Size4KiB>::containing_address(VirtAddr::new(va));
-                            unsafe { mapper.map_to_with_table_flags(page, frame, flags, table_flags, &mut frames) }
-                                .map_err(|_| Fault::Oom)?
-                                .ignore();
+                            match unsafe { mapper.map_to_with_table_flags(page, frame, flags, table_flags, &mut frames) } {
+                                Ok(flush) => flush.ignore(),
+                                Err(_) => {
+                                    result = Err(Fault::Oom);
+                                    break 'copy;
+                                }
+                            }
                             // Only a successful mapping owns a reference.
-                            frames.0.share(frame);
-                            stats.add_resident(1);
+                            frames.frames.0.share(frame);
+                            stats.mapped(flags);
                             copied_charged += flags.contains(CHARGED) as u64;
                         }
                     }
                 }
             }
-            Ok(())
+            (result, frames.made)
         });
+        self.stats.table_pages.fetch_add(tables, Ordering::Relaxed);
         // The parent's pages just lost their write permission, also for
         // its other threads.
         tlb::shootdown(&parent.tlb, 0, USER_END);
@@ -1815,6 +1976,8 @@ impl Drop for AddressSpace {
                 instance.program_gone();
             }
         }
+        // (An OOM victim's memory came back: who waits for it looks again.)
+        memory::oom::space_gone();
     }
 }
 
@@ -1917,7 +2080,7 @@ fn for_each_leaf(l4: PhysFrame, start: u64, end: u64, mut f: impl FnMut(u64, &'s
 ///   the stored data.
 /// - Other shared memory: writable as the area allows.
 fn leaf_flags(backing: Option<&Backing>, prot: Prot, old: PageTableFlags, refs: u32) -> PageTableFlags {
-    let mut flags = prot.flags() | (old & CHARGED);
+    let mut flags = prot.flags() | (old & KEPT);
     let was_cow = old.contains(COW);
     let must_fault = match backing {
         Some(b) if b.shared() => b.tracks_dirty() && !old.contains(PageTableFlags::WRITABLE),

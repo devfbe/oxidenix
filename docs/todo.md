@@ -15,9 +15,9 @@ done, delete it here in the same commit.
 
 ## Robustness
 
-- **No OOM killer that picks a victim by size.** Strict commit accounting stays the default;
-  thread stacks (musl commits 8 MiB per thread on `mprotect`) leave Node little headroom. A
-  heuristic overcommit mode needs the OOM killer first.
+- **No per-tree memory limits.** The OOM killer chooses across all trees (ADR 0013); a tree
+  with a limit of its own (as Linux's memory cgroups) would need every frame charged to its
+  tree, with an OOM within the tree when it exceeds its limit.
 - **/data across process trees is shared through the disk only.** Each instance caches
   `/data` on its own (io-rings.md, step 4): contents another tree changed are seen after its
   write-back (fsync, a `sync(2)` anywhere) and only for pages not cached here, and a file

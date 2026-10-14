@@ -8,9 +8,13 @@
 //! nothing was), so a file read in pieces is consistent, and a program that
 //! reads it again from the start (top, htop: `pread(fd, buf, n, 0)`) sees
 //! it current. A directory likewise: its entries are taken when it is read
-//! from the start. Files are read-only (open for writing: EACCES); the
-//! copies to the program are made with no lock of the server held but the
-//! description's offset (which only its own calls take, never the pager).
+//! from the start. Files are read-only (open for writing: EACCES) but a
+//! process's oom_score_adj and oom_adj and, for a tree with the host grant,
+//! /proc/sys/vm's overcommit files (`procfs::may_write`): each write is one
+//! value (`procfs::write`) wherever the offset is, as Linux's for them, and
+//! `O_TRUNC` changes nothing there. The copies to the program are made with
+//! no lock of the server held but the description's offset (which only its
+//! own calls take, never the pager).
 
 use crate::files::{self, File, EBADF, EINVAL, O_ACCMODE, O_WRONLY};
 use crate::heap::{try_arc, try_vec};
@@ -21,13 +25,14 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-const EACCES: i64 = 13;
 const ENXIO: i64 = 6;
 const ENOTDIR: i64 = 20;
 const EISDIR: i64 = 21;
 const O_CREAT: u32 = 0o100;
 const O_TRUNC: u32 = 0o1000;
 const O_DIRECTORY: u32 = 0o200000;
+/// The most one write to a /proc file takes (a page).
+const WRITE_MAX: usize = 4096;
 
 pub struct ProcOpen {
     pub node: ProcNode,
@@ -58,7 +63,8 @@ pub fn open(node: ProcNode, flags: u32, path: String) -> Result<i64, i64> {
         return Err(ENOTDIR);
     }
     if writable || flags & (O_CREAT | O_TRUNC) != 0 {
-        return Err(EACCES);
+        // (Only what may be written: EACCES for the rest.)
+        procfs::may_write(&node)?;
     }
     // It must exist now (a process may have ended since the walk), and be
     // the caller's to open.
@@ -98,7 +104,9 @@ pub fn call(nr: u64, f: &ProcOpen, flags: u32, a1: u64, a2: u64, a3: u64) -> Res
         files::SYS_READV => f.read_at_offset(&files::iovecs(a1, a2)?),
         files::SYS_PREAD64 => f.read(&[(a1, a2)], signed(a3)?),
         files::SYS_PREADV => f.read(&files::iovecs(a1, a2)?, signed(a3)?),
-        files::SYS_WRITE | files::SYS_WRITEV | files::SYS_PWRITE64 | files::SYS_PWRITEV => Err(EBADF),
+        files::SYS_WRITE | files::SYS_WRITEV | files::SYS_PWRITE64 | files::SYS_PWRITEV if flags & O_ACCMODE == 0 => Err(EBADF),
+        files::SYS_WRITE | files::SYS_PWRITE64 => f.write(&[(a1, a2)]),
+        files::SYS_WRITEV | files::SYS_PWRITEV => f.write(&files::iovecs(a1, a2)?),
         files::SYS_LSEEK => f.lseek(a1 as i64, a2),
         files::SYS_FSTAT => usercopy::to_program(a1, &procfs::stat(&f.node)?).map(|_| 0),
         files::SYS_FTRUNCATE => Err(EINVAL),
@@ -148,6 +156,20 @@ impl ProcOpen {
             done += n;
         }
         Ok(done as i64)
+    }
+
+    /// write and its kin: the bytes at `vecs` (at most `WRITE_MAX` of them,
+    /// what Linux's handlers of these files take at most) as one value
+    /// (`procfs::write`); how many it took. The offset stays.
+    fn write(&self, vecs: &[(u64, u64)]) -> Result<i64, i64> {
+        let mut buf = [0u8; WRITE_MAX];
+        let mut at = 0;
+        for &(addr, len) in vecs {
+            let n = (len as usize).min(WRITE_MAX - at);
+            usercopy::from_program(addr, &mut buf[at..at + n])?;
+            at += n;
+        }
+        Ok(procfs::write(&self.node, &buf[..at])? as i64)
     }
 
     /// read/readv: at the description's offset, which moves by what was
