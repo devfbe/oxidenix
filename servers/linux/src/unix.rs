@@ -83,6 +83,12 @@ pub const EPROTOTYPE: i64 = 91;
 pub const EOPNOTSUPP: i64 = 95;
 pub const ECONNRESET: i64 = 104;
 pub const ENOBUFS: i64 = 105;
+
+/// A send's error: no memory for the data is ENOBUFS (Linux's sock_alloc_send_pskb).
+fn nobufs(e: i64) -> i64 {
+    if e == heap::ENOMEM { ENOBUFS } else { e }
+}
+
 pub const EISCONN: i64 = 106;
 pub const ENOTCONN: i64 = 107;
 pub const ETIMEDOUT: i64 = 110;
@@ -525,9 +531,10 @@ impl Source<'_> {
     }
 
     /// Up to `n` bytes, fewer at a fault (EFAULT if none could be read;
-    /// ENOBUFS if the server has no memory for them).
+    /// ENOMEM if the server has no memory for them: a socket's send answers
+    /// ENOBUFS instead, `nobufs`).
     pub fn take(&mut self, n: usize) -> Result<Vec<u8>, i64> {
-        let mut out = heap::try_vec(n).map_err(|_| ENOBUFS)?;
+        let mut out = heap::try_vec(n)?;
         match self {
             Source::Server { buf, at } => {
                 let n = n.min(buf.len() - *at);
@@ -1212,7 +1219,7 @@ impl Sock {
             }
             let data = match src.take(src.left().min(piece_max)) {
                 Ok(d) => d,
-                Err(e) => return if sent > 0 { Ok(sent) } else { Err(e) },
+                Err(e) => return if sent > 0 { Ok(sent) } else { Err(nobufs(e)) },
             };
             let n = data.len();
             if n == 0 {
@@ -1279,7 +1286,7 @@ impl Sock {
         }
         let deadline = deadline(timeout);
         self.wait_room(nonblock, deadline)?;
-        let data = if len == 0 { Vec::new() } else { src.take(len)? };
+        let data = if len == 0 { Vec::new() } else { src.take(len).map_err(nobufs)? };
         let n = data.len();
         let data = heap::try_arc(data).map_err(|_| ENOBUFS)?;
         let charge = n + OVERHEAD;

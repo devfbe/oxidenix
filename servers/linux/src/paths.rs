@@ -290,6 +290,9 @@ fn openat(dirfd: u64, addr: u64, flags: u32, mode: u32) -> Result<i64, i64> {
     // opened instead, once: a name that exists but does not resolve (a
     // dangling symlink) stays EEXIST, as with the kernel's VFS.
     let mut retried = false;
+    // What the open of a file it creates needs from the heap, had before the create: its
+    // path and its open file and descriptor (ENOMEM, EMFILE with nothing created).
+    let mut ready: Option<(Prepared, String)> = None;
     let resolved = loop {
         match resolve(&base, &path, !nofollow) {
             Ok(_) if flags & O_CREAT != 0 && flags & O_EXCL != 0 => return Err(EEXIST),
@@ -297,12 +300,25 @@ fn openat(dirfd: u64, addr: u64, flags: u32, mode: u32) -> Result<i64, i64> {
             Err(ENOENT) if flags & O_CREAT != 0 => {
                 let (dir, name) = resolve_parent(&base, &path).map_err(|e| if e == EBUSY { EEXIST } else { e })?;
                 let perm = mode & !umask_now() & 0o7777;
-                // (Its path before the file is made: ENOMEM with nothing created.)
                 let created = normalize(&base, &path)?;
+                if ready.is_none() {
+                    let prepared = match &dir.node {
+                        Node::Tmp(_) => Prepared::Tmp(tmpfile::prepare()?),
+                        Node::Data(_) => Prepared::Data(datafile::prepare()?),
+                        Node::Proc(_) => Prepared::None,
+                    };
+                    ready = Some((prepared, join(&created)?));
+                }
                 match create(&dir.node, &name, NEW_FILE, perm) {
                     Ok(node) => {
                         inotify::child(&dir.node, inotify::IN_CREATE, &name, false);
-                        break Resolved { node, mode: vfs::S_IFREG | perm, path: created };
+                        let (prepared, abs) = ready.take().expect("prepared above");
+                        // (Only one of the kind the directory gave: created there.)
+                        return match (prepared, node) {
+                            (Prepared::Tmp(p), Node::Tmp(t)) => tmpfile::open_in(p, t, flags, abs),
+                            (Prepared::Data(p), Node::Data(d)) => datafile::open_in(p, d, flags, abs),
+                            (_, node) => open_node(Resolved { node, mode: vfs::S_IFREG | perm, path: created }, flags),
+                        };
                     }
                     Err(EEXIST) if flags & O_EXCL == 0 && !retried => {
                         retried = true;
@@ -314,6 +330,19 @@ fn openat(dirfd: u64, addr: u64, flags: u32, mode: u32) -> Result<i64, i64> {
             Err(e) => return Err(e),
         }
     };
+    open_node(resolved, flags)
+}
+
+/// What `openat` has ready for the open of a file it creates (`tmpfile::prepare`,
+/// `datafile::prepare`; nothing for a filesystem it cannot create in).
+enum Prepared {
+    Tmp(tmpfile::Prepared),
+    Data(datafile::Prepared),
+    None,
+}
+
+/// open(2) of a resolved node (not O_PATH).
+fn open_node(resolved: Resolved, flags: u32) -> Result<i64, i64> {
     // Opening a symlink itself would hand out its target bytes as a file:
     // one named with O_NOFOLLOW, or one a magic link led to (an O_PATH
     // descriptor of a symlink, /proc/self/fd/N), is ELOOP (O_PATH alone

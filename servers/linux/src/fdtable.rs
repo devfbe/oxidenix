@@ -125,6 +125,14 @@ impl FilesContext {
 
     /// A descriptor (the lowest free one) for the description `make` makes
     /// once there is room for it (nothing is made without one).
+    /// Makes room for the lowest free descriptor now (EMFILE, ENOMEM), so that an
+    /// `install_new` after it needs none (`files::room`).
+    pub fn make_room(&self) -> Result<(), i64> {
+        let mut t = self.table.lock();
+        let fd = t.free_slot(0)?;
+        t.reserve(fd)
+    }
+
     pub fn install_new(&self, make: impl FnOnce() -> FileRef, cloexec: bool) -> Result<i64, i64> {
         let mut t = self.table.lock();
         let fd = t.free_slot(0)?;
@@ -147,20 +155,31 @@ impl FilesContext {
 
     /// The table a process that executes a program gets: its descriptors
     /// without the close-on-exec ones (and their slots free).
-    pub fn for_exec(&self) -> Result<Arc<FilesContext>, i64> {
-        self.copy(true)
+    /// `for_exec` into memory had before (`copy_room`): execve has it before its point of
+    /// no return, past which a failure ends the process. ENOMEM only if the table grew
+    /// meanwhile and no more memory can be had (Linux's unshare_files fails there too).
+    pub fn for_exec_in(&self, room: CopyRoom) -> Result<Arc<FilesContext>, i64> {
+        self.copy_in(room, true)
+    }
+
+    /// The memory a copy of the table as it is now needs (ENOMEM).
+    pub fn copy_room(&self) -> Result<CopyRoom, i64> {
+        let len = self.table.lock().slots.len();
+        let mut slots = Vec::new();
+        slots.try_grow(len)?;
+        // (Made before the copy: a failure leaves every description's count as it was.)
+        let context = heap::try_arc(FilesContext { table: Mutex::new(Table { slots: Vec::new(), free_from: 0 }) })?;
+        Ok(CopyRoom { slots, context })
     }
 
     fn copy(&self, exec: bool) -> Result<Arc<FilesContext>, i64> {
-        // Room is reserved outside the lock, for the table as it was; if it
-        // grew meanwhile, again.
-        let mut slots: Vec<Option<Slot>> = Vec::new();
+        self.copy_in(self.copy_room()?, exec)
+    }
+
+    fn copy_in(&self, room: CopyRoom, exec: bool) -> Result<Arc<FilesContext>, i64> {
+        // Room is had outside the lock, for the table as it was; if it grew meanwhile, more.
+        let CopyRoom { mut slots, context } = room;
         loop {
-            let len = self.table.lock().slots.len();
-            slots.try_grow(len)?;
-            // (Made before the copy: a failure leaves every description's
-            // count as it was.)
-            let context = heap::try_arc(FilesContext { table: Mutex::new(Table { slots: Vec::new(), free_from: 0 }) })?;
             let t = self.table.lock();
             if t.slots.len() <= slots.capacity() {
                 slots.extend(t.slots.iter().map(|s| s.as_ref().filter(|s| !(exec && s.cloexec)).cloned()));
@@ -168,8 +187,17 @@ impl FilesContext {
                 *context.table.lock() = Table { slots, free_from };
                 return Ok(context);
             }
+            let len = t.slots.len();
+            drop(t);
+            slots.try_grow(len)?;
         }
     }
+}
+
+/// The memory for a copy of a descriptor table (`FilesContext::copy_room`).
+pub struct CopyRoom {
+    slots: Vec<Option<Slot>>,
+    context: Arc<FilesContext>,
 }
 
 /// The calling thread's descriptor table (an empty one for a thread without one: a service

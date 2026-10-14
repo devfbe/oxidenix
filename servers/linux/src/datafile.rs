@@ -56,6 +56,21 @@ impl Drop for DataOpen {
 
 /// open(2) of a resolved /data inode: a descriptor of the calling process.
 pub fn open(inode: Arc<DInode>, flags: u32, path: String) -> Result<i64, i64> {
+    open_in(prepare()?, inode, flags, path)
+}
+
+/// What an open of a /data file needs from the heap (its open file and descriptor), had
+/// before anything changes: open(2) with O_CREAT has it before it creates the file.
+pub struct Prepared(Arc<core::mem::MaybeUninit<DataOpen>>, files::Room);
+
+/// A `Prepared`: ENOMEM (EMFILE) if it cannot be had.
+pub fn prepare() -> Result<Prepared, i64> {
+    let slot = crate::heap::fallible(Arc::<DataOpen>::try_new_uninit).map_err(|_| crate::heap::ENOMEM)?;
+    Ok(Prepared(slot, files::room()?))
+}
+
+/// `open` with its memory had (`prepare`).
+pub fn open_in(prepared: Prepared, inode: Arc<DInode>, flags: u32, path: String) -> Result<i64, i64> {
     const ENXIO: i64 = 6;
     // A socket is connected to, not opened.
     if inode.kind == vfs::S_IFSOCK {
@@ -69,9 +84,9 @@ pub fn open(inode: Arc<DInode>, flags: u32, path: String) -> Result<i64, i64> {
     if flags & O_DIRECTORY != 0 && !dir {
         return Err(ENOTDIR);
     }
-    // Its memory first (ENOMEM before the write access and the open count, which its drop
-    // would give back with a close event).
-    let mut slot = crate::heap::fallible(Arc::<DataOpen>::try_new_uninit).map_err(|_| crate::heap::ENOMEM)?;
+    // Its memory is had (before the write access and the open count, which its drop would
+    // give back with a close event).
+    let Prepared(mut slot, room) = prepared;
     // Not while it runs as a program (ETXTBSY).
     let write = writable && inode.kind == vfs::S_IFREG;
     if write {
@@ -94,7 +109,7 @@ pub fn open(inode: Arc<DInode>, flags: u32, path: String) -> Result<i64, i64> {
     }
     open.notify(inotify::IN_OPEN);
     let kept = flags & (O_ACCMODE | files::O_NONBLOCK | O_APPEND | files::O_CLOEXEC);
-    files::install(files::new_id(), File::Data(open), kept)
+    files::install_in(room, files::new_id(), File::Data(open), kept)
 }
 
 /// The calls on an open /data file (`a1`..`a3`: the call's arguments after

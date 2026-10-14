@@ -314,14 +314,7 @@ pub fn install(id: u64, file: File, flags: u32) -> Result<i64, i64> {
 pub fn install_watched(id: u64, file: File, flags: u32, watch: Option<Arc<crate::poll::Watch>>) -> Result<i64, i64> {
     let kept = watch.clone();
     let r = match crate::heap::fallible(Arc::<Description>::try_new_uninit) {
-        Ok(mut memory) => fdtable::current().install_new(
-            || {
-                let description = Description { id, file, flags: AtomicU32::new(flags & !O_CLOEXEC), watch, inflight: AtomicUsize::new(0) };
-                Arc::get_mut(&mut memory).expect("a new Arc is unique").write(description);
-                FileRef::new(unsafe { memory.assume_init() })
-            },
-            flags & O_CLOEXEC != 0,
-        ),
+        Ok(memory) => install_into(memory, id, file, flags, watch),
         Err(_) => Err(crate::heap::ENOMEM),
     };
     if r.is_err() {
@@ -330,6 +323,37 @@ pub fn install_watched(id: u64, file: File, flags: u32, watch: Option<Arc<crate:
         }
     }
     r
+}
+
+fn install_into(mut memory: Arc<core::mem::MaybeUninit<Description>>, id: u64, file: File, flags: u32, watch: Option<Arc<crate::poll::Watch>>) -> Result<i64, i64> {
+    fdtable::current().install_new(
+        || {
+            let description = Description { id, file, flags: AtomicU32::new(flags & !O_CLOEXEC), watch, inflight: AtomicUsize::new(0) };
+            Arc::get_mut(&mut memory).expect("a new Arc is unique").write(description);
+            FileRef::new(unsafe { memory.assume_init() })
+        },
+        flags & O_CLOEXEC != 0,
+    )
+}
+
+/// What a descriptor for a new description of an always-ready file needs from the heap
+/// (the description's memory, the table's room for the lowest free descriptor), had before
+/// the file is made: an open that creates its file fails before the create, never after
+/// (as Linux's, which gets its `struct file` and the descriptor first).
+pub struct Room(Arc<core::mem::MaybeUninit<Description>>);
+
+/// A `Room`: ENOMEM without memory for it (EMFILE with no descriptor free).
+pub fn room() -> Result<Room, i64> {
+    let memory = crate::heap::fallible(Arc::<Description>::try_new_uninit).map_err(|_| crate::heap::ENOMEM)?;
+    fdtable::current().make_room()?;
+    Ok(Room(memory))
+}
+
+/// `install` of an always-ready file (a tmpfs or /data file) into a `Room`: fails only if
+/// another thread of the process took the descriptors meanwhile.
+pub fn install_in(room: Room, id: u64, file: File, flags: u32) -> Result<i64, i64> {
+    debug_assert!(file.always_ready());
+    install_into(room.0, id, file, flags, None)
 }
 
 /// File `id` changed its readiness (now `ready`), or had an event that

@@ -503,9 +503,11 @@ fn execveat(s: &mut State, dirfd: u64, path: u64, argv: u64, envp: u64, flags: u
     if hand + thread > 0 {
         crate::heap::preload_bytes(hand + thread)?;
     }
+    // And the memory of the new program's descriptor table.
+    let files = fdtable::current().copy_room()?;
     // Past the point of no return a failure ends the process; it does so once this call
     // returned and let go of everything (`local::exit_pending`, carried out by `serve`).
-    if let Err(status) = run(s, prepared) {
+    if let Err(status) = run(s, prepared, files) {
         local::exit_pending(status);
     }
     Ok(0)
@@ -616,17 +618,17 @@ fn trim(s: &[u8]) -> &[u8] {
 /// the program is mapped and started. A failure from here on ends the process: the status
 /// it ends with (SIGKILL if it was killed meanwhile, else SIGSEGV), for the caller to carry
 /// out once everything here is let go of.
-fn run(s: &mut State, mut p: Prepared) -> Result<(), i32> {
+fn run(s: &mut State, mut p: Prepared, files: fdtable::CopyRoom) -> Result<(), i32> {
     if de_thread().is_err() {
         // Killed meanwhile: the process ends anyway.
         return Err(signal::SIGKILL as i32);
     }
     // The new program's descriptor table: the old one's descriptors without the close-on-exec
-    // ones (Linux's unshare_files and do_close_on_exec). The old table goes now: its
-    // close-on-exec descriptors close before the new program runs (if no other process
-    // shares it).
+    // ones (Linux's unshare_files and do_close_on_exec), in memory had before. The old table
+    // goes now: its close-on-exec descriptors close before the new program runs (if no
+    // other process shares it).
     let old = fdtable::current();
-    let new = old.for_exec();
+    let new = old.for_exec_in(files);
     drop(old);
     match new {
         Ok(files) => drop(process::set_files(files)),
@@ -985,10 +987,12 @@ pub fn init(s: &mut State) {
         }
         Ok((args, envs))
     };
-    let result = strings().and_then(|(args, envs)| open("/", &path, true).and_then(|(file, exe)| prepare(file, exe, path.clone(), args, envs, stack_ceiling(crate::ids::soft(crate::ids::RLIMIT_STACK)), 0)));
+    let result = strings()
+        .and_then(|(args, envs)| open("/", &path, true).and_then(|(file, exe)| prepare(file, exe, path.clone(), args, envs, stack_ceiling(crate::ids::soft(crate::ids::RLIMIT_STACK)), 0)))
+        .and_then(|prepared| Ok((prepared, fdtable::current().copy_room()?)));
     drop(buf);
     let status = match result {
-        Ok(prepared) => match run(s, prepared) {
+        Ok((prepared, files)) => match run(s, prepared, files) {
             Ok(()) => return,
             Err(status) => status,
         },
