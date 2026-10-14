@@ -110,11 +110,13 @@ impl Charge {
         self.reserve += n;
     }
 
-    /// Plans mapping `missing` pages: from the reserve first; the rest
-    /// (`fresh`) the caller commits. The reserve pages are spoken for until
-    /// `end` (or `abort`).
-    pub fn begin(&mut self, missing: u64, pool: &Pool) -> Plan {
-        let reserve = missing.min(self.reserve);
+    /// Plans mapping `missing` pages: from the reserve first if
+    /// `use_reserve` (else none of it: an allocation the server may fail,
+    /// which must not take what its others rely on); the rest (`fresh`)
+    /// the caller commits. The reserve pages are spoken for until `end`
+    /// (or `abort`).
+    pub fn begin(&mut self, missing: u64, pool: &Pool, use_reserve: bool) -> Plan {
+        let reserve = if use_reserve { missing.min(self.reserve) } else { 0 };
         self.reserve -= reserve;
         pool.give(reserve);
         Plan { missing, reserve, fresh: missing - reserve }
@@ -187,18 +189,27 @@ mod tests {
         }
         assert_eq!((a.reserve(), b.reserve(), pool.used()), (512, 88, 600));
         // A commit within the reserve: nothing fresh.
-        let plan = a.begin(100, &pool);
+        let plan = a.begin(100, &pool, true);
         assert_eq!(plan.fresh, 0);
         books.committed = books.committed.checked_sub(a.end(plan, 100, &pool, target)).expect("refund beyond charge");
         assert_eq!((a.mapped(), a.reserve()), (100, 412));
+        // One that must not use the reserve: all of it fresh, the reserve
+        // untouched (and full: nothing of the commit stays in it).
+        let plan = a.begin(50, &pool, false);
+        assert_eq!((plan.reserve, plan.fresh), (0, 50));
+        books.committed += plan.fresh;
+        books.committed = books.committed.checked_sub(a.end(plan, 50, &pool, target)).expect("refund beyond charge");
+        assert_eq!((a.mapped(), a.reserve()), (150, 412));
+        books.committed = books.committed.checked_sub(a.unmapped(50, &pool, target).unwrap()).expect("refund beyond charge");
+        assert_eq!((a.mapped(), a.reserve()), (100, 462));
         // Beyond it, half mapped: the rest refills the reserve.
-        let plan = a.begin(1000, &pool);
-        assert_eq!((plan.reserve, plan.fresh), (412, 588));
+        let plan = a.begin(1000, &pool, true);
+        assert_eq!((plan.reserve, plan.fresh), (462, 538));
         books.committed += plan.fresh;
         books.committed = books.committed.checked_sub(a.end(plan, 500, &pool, target)).expect("refund beyond charge");
         assert_eq!(a.charged(), books.committed - b.charged());
         // A failed fresh commit: the reserve back.
-        let plan = b.begin(200, &pool);
+        let plan = b.begin(200, &pool, true);
         books.committed = books.committed.checked_sub(b.abort(plan, &pool, target)).expect("refund beyond charge");
         assert_eq!(b.reserve(), 88);
         // Unmaps refill, then refund; too many are refused.
@@ -232,7 +243,7 @@ mod tests {
                     a.grow_reserve(got, target);
                 }
                 1 => {
-                    let plan = a.begin(n, &pool);
+                    let plan = a.begin(n, &pool, (seed >> 28) % 2 == 0);
                     if (seed >> 20) % 3 == 0 {
                         committed = committed.checked_sub(a.abort(plan, &pool, target)).expect("refund beyond charge");
                     } else {
