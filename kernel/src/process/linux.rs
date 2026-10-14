@@ -2142,6 +2142,50 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             }
             super::futex::test_watch(a[0], a[1] != 0)
         }
+        TEST_TREE_START => {
+            if !crate::TEST_MODE.load(core::sync::atomic::Ordering::Relaxed) {
+                return Err(ENOSYS);
+            }
+            // Starting trees is the machine's business, as the clock is.
+            if !instance.host.load(core::sync::atomic::Ordering::Acquire) {
+                return Err(EPERM);
+            }
+            const MAX: u64 = 4096;
+            if a[1] == 0 || a[1] > MAX {
+                return Err(EINVAL);
+            }
+            let mut buf = Vec::new();
+            buf.try_reserve_exact(a[1] as usize).map_err(|_| ENOMEM)?;
+            buf.resize(a[1] as usize, 0);
+            super::uaccess::copy_from_server(a[0], &mut buf)?;
+            // Every string ends with its NUL: the path, then the arguments.
+            let Some((&0, strings)) = buf.split_last() else { return Err(EINVAL) };
+            let mut parts = strings.split(|&b| b == 0).map(|s| core::str::from_utf8(s).map_err(|_| EINVAL));
+            let path = parts.next().ok_or(EINVAL)??;
+            let mut args = Vec::new();
+            for arg in parts {
+                let arg = arg?;
+                let mut s = alloc::string::String::new();
+                s.try_reserve_exact(arg.len()).map_err(|_| ENOMEM)?;
+                s.push_str(arg);
+                args.try_reserve(1).map_err(|_| ENOMEM)?;
+                args.push(s);
+            }
+            super::test_tree_start(instance.id, path, &args).map(|pid| pid as i64)
+        }
+        TEST_TREE_WAIT => {
+            if !crate::TEST_MODE.load(core::sync::atomic::Ordering::Relaxed) {
+                return Err(ENOSYS);
+            }
+            let deadline = crate::time::now().saturating_add(a[1]);
+            super::test_tree_wait(instance.id, a[0], deadline).map(|status| status as i64)
+        }
+        TEST_TREE_KILL => {
+            if !crate::TEST_MODE.load(core::sync::atomic::Ordering::Relaxed) {
+                return Err(ENOSYS);
+            }
+            super::test_tree_kill(instance.id, a[0]).map(|_| 0)
+        }
         TEST_SERVER_TICKS => {
             if !crate::TEST_MODE.load(core::sync::atomic::Ordering::Relaxed) {
                 return Err(ENOSYS);

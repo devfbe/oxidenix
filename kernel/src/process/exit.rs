@@ -169,6 +169,29 @@ pub fn wait_for(pid: Pid) -> Result<i32, i64> {
     }
 }
 
+/// As `wait_for`, for a Linux program's call (`TEST_TREE_WAIT`): until
+/// `deadline` at most (ETIMEDOUT), and ended by the caller's signals
+/// (EINTR).
+pub fn wait_until(pid: Pid, deadline: u64) -> Result<i32, i64> {
+    loop {
+        let wait = prepare_to_wait(ended_chan());
+        if let Some(status) = reap(pid) {
+            return Ok(status);
+        }
+        let known = TABLE.lock().groups.get(&pid).is_some_and(|g| !g.server_reaps.load(Ordering::Relaxed));
+        if !known {
+            return Err(ECHILD);
+        }
+        if crate::time::now() >= deadline {
+            return Err(ETIMEDOUT);
+        }
+        if super::kill::interrupted() {
+            return Err(EINTR);
+        }
+        wait.sleep_until(deadline);
+    }
+}
+
 /// Reaps the kernel's processes that ended (servers, service processes,
 /// what is left of a process tree).
 pub fn reap_orphans() {

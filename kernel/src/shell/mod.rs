@@ -9,7 +9,14 @@ pub fn run() -> ! {
     // status becomes QEMU's (1 = success, 3 = failure).
     if crate::fs::program("/etc/autorun").is_some() {
         crate::printkln!("[autorun] running /etc/autorun");
-        let ok = matches!(commands::run_program(&["sh", "/etc/autorun"]), Some(crate::process::WaitStatus::Exited(0)));
+        let mut ok = matches!(commands::run_program(&["sh", "/etc/autorun"]), Some(crate::process::WaitStatus::Exited(0)));
+        // Trees the tests started (`TEST_TREE_START`) end with them; one
+        // still running is a test that lost track of it.
+        let left = crate::process::end_test_trees();
+        if left > 0 {
+            crate::printkln!("[autorun] {} process tree(s) the tests started still ran: killed", left);
+            ok = false;
+        }
         crate::printkln!("[autorun] {}", if ok { "success" } else { "failure" });
         settle();
         crate::power_off(if ok { 0 } else { 1 });

@@ -663,6 +663,11 @@ process group leader with the console as its controlling terminal, and runs `exe
 itself. The kernel's ELF loader stays only for its native servers. The kernel still waits for
 the tree's first process (the monitor), so that process alone is a zombie of the kernel's
 too; the processes the server makes leave the kernel's table when their last thread ends.
+In test mode the self-tests' tree (it holds the host grant) may have the kernel start
+another tree beside itself (`TEST_TREE_START`, `TEST_TREE_WAIT`, `TEST_TREE_KILL`;
+`treetest`): the same start without the console and the host grant, so its init has no
+standard descriptors (`console::setup_stdio` finds no terminal); the starter reaps it, and
+the monitor kills one still running when the self-tests end.
 
 ### The server's tables (`process.rs`)
 

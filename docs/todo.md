@@ -27,8 +27,12 @@ done, delete it here in the same commit.
 - **No OOM killer that picks a victim by size.** Strict commit accounting stays the default;
   thread stacks (musl commits 8 MiB per thread on `mprotect`) leave Node little headroom. A
   heuristic overcommit mode needs the OOM killer first.
-- **No test with two process trees at once.** Isolation between instances (netd ports and
-  budgets, procfs, the heap reserve pool) is covered by host tests only.
+- **/data across process trees is shared through the disk only.** Each instance caches
+  `/data` on its own (io-rings.md, step 4): contents another tree changed are seen after its
+  write-back (fsync, a `sync(2)` anywhere) and only for pages not cached here, and a file
+  another tree unlinked keeps its blocks while any instance caches its inode (fsring's holds;
+  `treetest` checks only what holds). Coherence needs diskfs to call back its clients
+  (invalidate pages and sizes, report a last link gone).
 - **No QEMU test with a read-only data disk** (covered by an `ext2fs` host test).
 - `RLIMIT_NPROC` is not enforced (Linux exempts root; the kernel's process table is the bound).
 
