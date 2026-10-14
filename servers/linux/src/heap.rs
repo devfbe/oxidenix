@@ -329,12 +329,37 @@ macro_rules! try_format {
 
 /// Before an insert into a structure with no fallible form (`BTreeMap`,
 /// `BTreeSet`) that a program drives: makes sure the heap has a free page
-/// committed beyond the instance's reserve for its nodes (a node is at most
-/// a few hundred bytes, an insert allocates at most one per level). The
-/// insert itself is infallible: it takes the reserve only if another thread
-/// took the page in between.
+/// committed beyond the instance's reserve for its nodes (enough for maps of
+/// small entries, whose nodes are a few hundred bytes; an insert allocates
+/// at most one per level and rarely more than one). The insert itself is
+/// infallible: it takes the reserve only if another thread took the page in
+/// between.
 pub fn preload() -> Result<(), NoMem> {
-    if fallible(|| !injected_failure() && crate::HEAP.0.ensure_free(1)) {
+    preload_bytes(pageheap::PAGE)
+}
+
+/// `preload` for an insert into a `BTreeMap<K, V>` of any entry size.
+pub fn preload_map<K, V>() -> Result<(), NoMem> {
+    preload_bytes(map_insert_bytes::<K, V>())
+}
+
+/// What an insert into a `BTreeMap<K, V>` allocates when it splits a leaf
+/// and the node above it (11 entries a node, an internal one with 12 edges,
+/// and their headers): a map of large entries (a process's record) has
+/// nodes of several pages.
+pub const fn map_insert_bytes<K, V>() -> usize {
+    let node = 11 * (core::mem::size_of::<K>() + core::mem::size_of::<V>()) + 64;
+    2 * node + 12 * 8
+}
+
+/// `preload` for inserts (several, summed by the caller) that allocate
+/// `bytes`: that many free pages committed beyond the reserve (a run of
+/// them committed if fewer are free; a node larger than a page needs its
+/// pages in one run, which the free ones need not be: then its insert
+/// commits, from the reserve at worst).
+pub fn preload_bytes(bytes: usize) -> Result<(), NoMem> {
+    let pages = bytes.div_ceil(pageheap::PAGE).max(1);
+    if fallible(|| !injected_failure() && crate::HEAP.0.ensure_free(pages)) {
         Ok(())
     } else {
         Err(NoMem)

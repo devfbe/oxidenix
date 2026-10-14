@@ -498,11 +498,10 @@ fn execveat(s: &mut State, dirfd: u64, path: u64, argv: u64, envp: u64, flags: u
         let t = PROCS.lock();
         t.procs.get(&pid).is_some_and(|p| t.hands.get(&p.sig.hand).is_some_and(|h| h.refs > 1))
     };
-    if shared {
-        process::preload_map::<u64, signal::Hand>()?;
-    }
-    if tid != pid {
-        process::preload_map::<process::Pid, process::Thread>()?;
+    let hand = if shared { crate::heap::map_insert_bytes::<u64, signal::Hand>() } else { 0 };
+    let thread = if tid != pid { crate::heap::map_insert_bytes::<process::Pid, process::Thread>() } else { 0 };
+    if hand + thread > 0 {
+        crate::heap::preload_bytes(hand + thread)?;
     }
     // Past the point of no return a failure ends the process; it does so once this call
     // returned and let go of everything (`local::exit_pending`, carried out by `serve`).

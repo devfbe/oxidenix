@@ -248,19 +248,6 @@ pub static PROCS: Mutex<Table> = Mutex::new(Table {
     pending: alloc::collections::BTreeSet::new(),
 });
 
-/// `heap::preload` before an insert into a `BTreeMap<K, V>` a program drives, for maps whose
-/// nodes are larger than a slab's objects too (11 entries a node: a `Proc`, a `Thread` or a
-/// `Hand` makes a node of several pages): a run of one node's size is committed fallibly and
-/// given back to the heap's free pages, where the insert's split finds it.
-pub fn preload_map<K, V>() -> Result<(), NoMem> {
-    heap::preload()?;
-    let node = 11 * (core::mem::size_of::<K>() + core::mem::size_of::<V>()) + 12 * 8 + 64;
-    if node > 2048 {
-        drop(heap::try_vec::<u8>(node)?);
-    }
-    Ok(())
-}
-
 /// A child's start: what its server needs before the program runs (`thread_create`'s
 /// cookie points at it; the child takes it).
 pub struct Birth {
@@ -719,7 +706,14 @@ fn clone(s: &State, c: Clone) -> Result<i64, i64> {
     let pid = if thread { my_pid } else { tid };
     let fs = {
         let mine = records::current();
-        if flags & CLONE_FS != 0 { mine } else { records::copy(&mine) }
+        if flags & CLONE_FS != 0 {
+            mine
+        } else {
+            match records::copy(&mine) {
+                Ok(f) => f,
+                Err(e) => return Err(fail(e.into(), handle)),
+            }
+        }
     };
     let fs_ptr = Arc::as_ptr(&fs);
     let files = if flags & CLONE_FILES != 0 {
@@ -777,15 +771,14 @@ fn clone(s: &State, c: Clone) -> Result<i64, i64> {
         // The copies and the tables' room, before anything changes.
         let ppid = if flags & CLONE_PARENT != 0 { t.procs[&my_pid].ppid } else { my_pid };
         let room = (|| -> Result<Option<(Vec<Pid>, Vec<u8>, String)>, NoMem> {
-            preload_map::<Pid, Thread>()?;
+            // (One preload for all the inserts: each alone would find the others' pages.)
+            let hand = if flags & CLONE_SIGHAND == 0 { heap::map_insert_bytes::<u64, signal::Hand>() } else { 0 };
             if thread {
+                heap::preload_map::<Pid, Thread>()?;
                 t.procs.get_mut(&pid).expect("checked above").threads.try_grow(1)?;
                 return Ok(None);
             }
-            preload_map::<Pid, Proc>()?;
-            if flags & CLONE_SIGHAND == 0 {
-                preload_map::<u64, signal::Hand>()?;
-            }
+            heap::preload_bytes(heap::map_insert_bytes::<Pid, Thread>() + heap::map_insert_bytes::<Pid, Proc>() + hand)?;
             if let Some(pp) = t.procs.get_mut(&ppid) {
                 pp.children.try_grow(1)?;
             }
