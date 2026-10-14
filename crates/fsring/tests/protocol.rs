@@ -2,7 +2,7 @@
 //! (inode handles with their generations),
 //! malformed descriptors are refused with the right errno (unknown
 //! operations, stray fields, lengths, promises and names out of range), and the
-//! completion, stat, usage and directory entry encodings round-trip.
+//! completion, stat (a device's number), usage and directory entry encodings round-trip.
 
 use fsring::errno::*;
 use fsring::*;
@@ -27,6 +27,10 @@ fn every_request() -> Vec<Request> {
         Request::Create { dir: n(2), name: buf(4, 0, 5), kind: Kind::File, perm: 0o644 },
         Request::Create { dir: n(2), name: buf(4, 0, 5), kind: Kind::Dir, perm: 0o7777 },
         Request::Create { dir: n(2), name: buf(4, 0, 5), kind: Kind::Socket, perm: 0o755 },
+        Request::Create { dir: n(2), name: buf(4, 0, 5), kind: Kind::Fifo, perm: 0o600 },
+        Request::Create { dir: n(2), name: buf(4, 0, 5), kind: Kind::CharDev(0x103), perm: 0o666 },
+        Request::Create { dir: n(2), name: buf(4, 0, 5), kind: Kind::CharDev(0), perm: 0 },
+        Request::Create { dir: n(2), name: buf(4, 0, 5), kind: Kind::BlockDev(u64::MAX), perm: 0o660 },
         Request::Create { dir: n(2), name: buf(4, 10, 5), kind: Kind::Symlink(buf(4, 15, TARGET_MAX)), perm: 0 },
         Request::Unlink { dir: n(2), name: buf(4, 0, 3), is_dir: true },
         Request::Rename { from: n(2), name: buf(4, 0, 3), to: n(11), new_name: buf(4, 3, 9) },
@@ -155,9 +159,9 @@ fn names_and_targets_are_bounded() {
     // The target follows the name: it must stay addressable in the grant.
     let d = Desc { op: op::CREATE, object: 2, grant: 1, buf_off: u32::MAX - 1, len: 3, arg: [KIND_SYMLINK, 0, 1], ..Desc::default() };
     assert_eq!(Request::decode(&d), Err(EINVAL));
-    // A file, directory or socket has no target; kinds and permissions
-    // are known.
-    for arg in [[KIND_FILE, 0, 1], [KIND_DIR, 0, 1], [KIND_SOCKET, 0, 1], [0, 0, 0], [5, 0, 0], [KIND_FILE, 0o10000, 0]] {
+    // A file, directory, socket or FIFO has no target (a device's number is any);
+    // kinds and permissions are known.
+    for arg in [[KIND_FILE, 0, 1], [KIND_DIR, 0, 1], [KIND_SOCKET, 0, 1], [KIND_FIFO, 0, 1], [0, 0, 0], [8, 0, 0], [KIND_FILE, 0o10000, 0], [KIND_CHRDEV, 0o10000, 1]] {
         let d = Desc { op: op::CREATE, object: 2, grant: 1, len: 3, arg, ..Desc::default() };
         assert_eq!(Request::decode(&d), Err(EINVAL), "{arg:?}");
     }
@@ -186,8 +190,15 @@ fn names_are_utf8_without_slashes_or_nuls() {
 fn completions_stats_and_usage_round_trip() {
     let c = Completion { tag: 0xdead_beef, op: op::READ, status: -5, values: [1, u64::MAX, 3, 1 << 63] };
     assert_eq!(Completion::from_desc(&c.to_desc()), c);
-    let s = Stat { mode: 0o100644, links: 3, size: 1 << 40, atime: 1, mtime: u32::MAX, ctime: 7, generation: u32::MAX - 1 };
+    let s = Stat { mode: 0o100644, links: 3, size: 1 << 40, atime: 1, mtime: u32::MAX, ctime: 7, generation: u32::MAX - 1, rdev: 0 };
     assert_eq!(Stat::from_values(&s.to_values()), s);
+    // A device's number travels in place of its size (0); only a device has one.
+    for mode in [0o020666, 0o060660] {
+        let d = Stat { mode, links: 1, size: 0, atime: 1, mtime: 2, ctime: 3, generation: 4, rdev: 0xffff_ffff_0000_0103 };
+        assert_eq!(Stat::from_values(&d.to_values()), d);
+    }
+    let fifo = Stat { mode: 0o010600, links: 1, size: 0, atime: 1, mtime: 2, ctime: 3, generation: 4, rdev: 7 };
+    assert_eq!(Stat::from_values(&fifo.to_values()), Stat { rdev: 0, ..fifo });
     let u = Usage { block_size: 1024, blocks: 65536, free_blocks: 100, inodes: 16384, free_inodes: u32::MAX, max_file_size: 16 << 30 };
     assert_eq!(Usage::from_values(&u.to_values()), u);
 }
