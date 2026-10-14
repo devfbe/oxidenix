@@ -26,6 +26,7 @@
 //! reported until then (`settle`): once a program has ended and was
 //! reaped, its file can be written, as on Linux.
 
+use crate::heap::{preload, try_arc, try_box, try_string, try_vec, TryGrow};
 use crate::namespace::{check, ENOENT, ENOTDIR};
 use crate::sync::Mutex;
 use crate::syscall;
@@ -45,7 +46,6 @@ pub const EXDEV: i64 = 18;
 pub const EISDIR: i64 = 21;
 pub const EINVAL: i64 = 22;
 pub const ENOSPC: i64 = 28;
-const ENOMEM: i64 = 12;
 pub const ENAMETOOLONG: i64 = 36;
 pub const ENOTEMPTY: i64 = 39;
 pub const ETXTBSY: i64 = 26;
@@ -209,7 +209,7 @@ impl Inode {
             return Err(ENOSPC);
         }
         // Charged: from here on the inode value owns the charge, and its drop gives it back
-        // (also when no memory is found for it: `Arc::try_new` drops the value).
+        // (also when no memory is found for it: `try_arc` drops the value).
         Inode::make(kind, perm, dev, meta)
     }
 
@@ -221,7 +221,7 @@ impl Inode {
     fn make(kind: Kind, perm: u32, dev: u64, charged: usize) -> Result<Arc<Inode>, i64> {
         let file_type = kind_bits(&kind);
         let state = State { perm, kind: content::Content::new(kind), sealed: false, times: Times::new(now()), writers: 0, removed: false, link: None };
-        Arc::try_new(Inode {
+        Ok(try_arc(Inode {
             ino: NEXT_INO.fetch_add(1, Ordering::Relaxed),
             dev,
             file_type,
@@ -229,14 +229,16 @@ impl Inode {
             append: crate::sync::SleepLock::new(()),
             opens: AtomicUsize::new(0),
             charged,
-        })
-        .map_err(|_| ENOMEM)
+        })?)
     }
 
     /// The directory it is in and its name there (None: removed, or the
     /// root).
     pub fn link(&self) -> Option<(u64, String)> {
-        self.state.lock().link.clone()
+        let st = self.state.lock();
+        let (dir, name) = st.link.as_ref()?;
+        // (Without memory for the copy, as without a name.)
+        Some((*dir, try_string(name).ok()?))
     }
 
     /// Whether its name went.
@@ -275,7 +277,7 @@ impl Inode {
 
     pub fn readlink(&self) -> Result<String, i64> {
         match self.state.lock().kind.get() {
-            Kind::Symlink(t) => Ok(t.clone()),
+            Kind::Symlink(t) => Ok(try_string(t)?),
             _ => Err(EINVAL),
         }
     }
@@ -346,21 +348,14 @@ impl Inode {
         let st = self.state.lock();
         let Kind::Dir(m) = st.kind.get() else { return Err(ENOTDIR) };
         charge.add(m.keys().map(|n| n.len() + 48).sum::<usize>() + 2 * 48)?;
-        let mut out = Vec::new();
-        out.try_reserve_exact(m.len() + 2).map_err(|_| ENOMEM)?;
+        let mut out = try_vec(m.len() + 2)?;
         // Each name copied into room reserved first (ENOMEM without it).
-        let copy = |n: &str| -> Result<String, i64> {
-            let mut s = String::new();
-            s.try_reserve_exact(n.len()).map_err(|_| ENOMEM)?;
-            s.push_str(n);
-            Ok(s)
-        };
         // ".." is the directory it is in (the root's, and a removed one's, itself).
         let parent = st.link.as_ref().map_or(self.ino, |&(p, _)| p);
-        out.push((copy(".")?, self.ino, 4));
-        out.push((copy("..")?, parent, 4));
+        out.push((try_string(".")?, self.ino, 4));
+        out.push((try_string("..")?, parent, 4));
         for (n, c) in m.iter() {
-            out.push((copy(n)?, c.ino, dtype(c.file_type())));
+            out.push((try_string(n)?, c.ino, dtype(c.file_type())));
         }
         Ok(out)
     }
@@ -452,8 +447,13 @@ impl Inode {
     /// Inserts `inode` as `name`; `server`: the server's own name, which a
     /// sealed directory takes.
     fn insert_as(&self, name: &str, inode: Arc<Inode>, server: bool) -> Result<(), i64> {
+        // The memory first (the entry's key, the link, the map's nodes):
+        // ENOMEM before anything changed.
+        let key = try_string(name)?;
+        let link = try_string(name)?;
+        preload()?;
         // (Not visible to anyone else yet: its lock is not nested.)
-        inode.state.lock().link = Some((self.ino, String::from(name)));
+        inode.state.lock().link = Some((self.ino, link));
         let mut st = self.state.lock();
         if st.removed {
             return Err(ENOENT);
@@ -464,7 +464,7 @@ impl Inode {
         match st.kind.dir_mut() {
             Some(m) if m.contains_key(name) => Err(EEXIST),
             Some(m) => {
-                m.insert(String::from(name), inode);
+                m.insert(key, inode);
                 st.times.modified(now());
                 Ok(())
             }
@@ -543,8 +543,10 @@ impl Inode {
     /// returned to the inode when the kernel lets the hold go.
     pub fn hold(self: &Arc<Self>, run: bool) -> Result<u64, i64> {
         let object = self.object()?;
+        // (Its memory first: a mapping or an exec a program makes as often as it likes.)
+        let hold = try_box(Hold { inode: self.clone(), run })?;
         if run { self.deny_write()? } else { self.get_write()? }
-        let word = Box::into_raw(Box::new(Hold { inode: self.clone(), run })) as u64 | 1;
+        let word = Box::into_raw(hold) as u64 | 1;
         match check(syscall(SYS_MO_HOLD, [object, word, 0, 0, 0, 0])) {
             Ok(h) => Ok(h as u64),
             Err(e) => {
@@ -614,12 +616,17 @@ pub fn rename(odir: &Arc<Inode>, oname: &str, ndir: &Arc<Inode>, nname: &str) ->
     if odir.dev != ndir.dev {
         return Err(EXDEV);
     }
+    // The memory first (the new entry's key, the link, the map's nodes):
+    // ENOMEM before anything changed.
+    let key = try_string(nname)?;
+    let link = try_string(nname)?;
+    preload()?;
     let _shape = RENAME.lock();
     let node = odir.lookup(oname)?;
     // Moving a directory below itself would detach it in a reference cycle.
     // (The tree's shape cannot change meanwhile: renames wait for RENAME,
     // and creating or removing names moves no directory.)
-    if contains(&node, ndir) {
+    if contains(&node, ndir)? {
         return Err(EINVAL);
     }
     let node_dir = node.is_dir();
@@ -641,14 +648,14 @@ pub fn rename(odir: &Arc<Inode>, oname: &str, ndir: &Arc<Inode>, nname: &str) ->
         Some(sm) if Arc::ptr_eq(first, odir) => (Some(first_map), sm),
         Some(sm) => (Some(sm), first_map),
     };
-    let replaced = move_entry(om, nm, oname, nname, &node, node_dir, odir)?;
+    let replaced = move_entry(om, nm, oname, key, &node, node_dir, odir)?;
     // Both directories' entries changed (their locks are held), and the
     // inode moved (nested, as above).
     let now = now();
     {
         let mut nst = node.state.lock();
         nst.times.changed(now);
-        nst.link = Some((ndir.ino, String::from(nname)));
+        nst.link = Some((ndir.ino, link));
     }
     first_guard.times.modified(now);
     if let Some(g) = second_guard.as_mut() {
@@ -664,12 +671,13 @@ fn dir_map(st: &mut State) -> Result<&mut BTreeMap<String, Arc<Inode>>, i64> {
 }
 
 /// The move itself, under both directories' locks: `om` is the old
-/// directory's map (None: the same as `nm`). Returns what it replaced.
+/// directory's map (None: the same as `nm`); `key` is the new name (its
+/// memory had before). Returns what it replaced.
 fn move_entry(
     om: Option<&mut BTreeMap<String, Arc<Inode>>>,
     nm: &mut BTreeMap<String, Arc<Inode>>,
     oname: &str,
-    nname: &str,
+    key: String,
     node: &Arc<Inode>,
     node_dir: bool,
     odir: &Arc<Inode>,
@@ -682,7 +690,7 @@ fn move_entry(
     if !source_ok {
         return Err(ENOENT);
     }
-    if let Some(existing) = nm.get(nname) {
+    if let Some(existing) = nm.get(key.as_str()) {
         if Arc::ptr_eq(existing, node) {
             return Ok(None);
         }
@@ -713,22 +721,25 @@ fn move_entry(
         Some(om) => om.remove(oname),
         None => nm.remove(oname),
     };
-    Ok(moved.and_then(|m| nm.insert(String::from(nname), m)))
+    Ok(moved.and_then(|m| nm.insert(key, m)))
 }
 
 /// Whether `target` is `dir` or lies below it (iterative: directories nest
-/// deeper than a stack).
-fn contains(dir: &Arc<Inode>, target: &Arc<Inode>) -> bool {
-    let mut stack = alloc::vec![dir.clone()];
+/// deeper than a stack; ENOMEM without room for the walk's stack, which
+/// grows with the tree the programs made).
+fn contains(dir: &Arc<Inode>, target: &Arc<Inode>) -> Result<bool, i64> {
+    let mut stack = try_vec(1)?;
+    stack.push(dir.clone());
     while let Some(d) = stack.pop() {
         if Arc::ptr_eq(&d, target) {
-            return true;
+            return Ok(true);
         }
         if let Kind::Dir(m) = d.state.lock().kind.get() {
+            stack.try_grow(m.len())?;
             stack.extend(m.values().cloned());
         }
     }
-    false
+    Ok(false)
 }
 
 fn check_name(name: &str) -> Result<(), i64> {

@@ -5,6 +5,7 @@
 
 use crate::datafs::{self, DInode, HoldKind, EISDIR};
 use crate::files::{self, File, EBADF, EINVAL, O_ACCMODE, O_WRONLY};
+use crate::heap::TryGrow;
 use crate::inotify;
 use crate::namespace::ENOTDIR;
 use crate::usercopy;
@@ -68,13 +69,16 @@ pub fn open(inode: Arc<DInode>, flags: u32, path: String) -> Result<i64, i64> {
     if flags & O_DIRECTORY != 0 && !dir {
         return Err(ENOTDIR);
     }
+    // Its memory first (ENOMEM before the write access and the open count, which its drop
+    // would give back with a close event).
+    let mut slot = crate::heap::fallible(Arc::<DataOpen>::try_new_uninit).map_err(|_| crate::heap::ENOMEM)?;
     // Not while it runs as a program (ETXTBSY).
     let write = writable && inode.kind == vfs::S_IFREG;
     if write {
         datafs::get_write(&inode)?;
     }
     inode.opens.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
-    let open = Arc::new(DataOpen {
+    Arc::get_mut(&mut slot).expect("not shared yet").write(DataOpen {
         inode,
         path,
         offset: crate::sync::SleepMutex::new(0),
@@ -83,6 +87,7 @@ pub fn open(inode: Arc<DInode>, flags: u32, path: String) -> Result<i64, i64> {
         direct: flags & O_DIRECT != 0,
         sync: flags & O_DSYNC != 0 || flags & O_SYNC == O_SYNC,
     });
+    let open = unsafe { slot.assume_init() };
     if write && flags & O_TRUNC != 0 {
         datafs::truncate(&open.inode, 0)?;
         open.notify(inotify::IN_MODIFY);
@@ -271,8 +276,7 @@ impl DataOpen {
         // At most `GETDENTS_MAX` bytes a call (a short getdents64 is a valid one: the program
         // asks again), reserved first: the program's buffer size sets no allocation.
         let room = (len as usize).min(crate::files::GETDENTS_MAX);
-        let mut out = Vec::new();
-        out.try_reserve_exact(room).map_err(|_| 12i64)?;
+        let mut out: Vec<u8> = crate::heap::try_vec(room)?;
         let mut next = *off;
         while let Some((ino, dtype, name)) = entries.get(next as usize) {
             let reclen = (19 + name.len() + 1).next_multiple_of(8);
@@ -304,16 +308,15 @@ impl DataOpen {
     /// is not trusted to end).
     fn list(&self, charge: &mut crate::files::SnapshotCharge) -> Result<Vec<(u32, u8, Vec<u8>)>, i64> {
         const MAX_ENTRIES: usize = 1 << 20;
-        const ENOMEM: i64 = 12;
         let mut all = Vec::new();
         let mut cursor = 0;
         loop {
             let (entries, next) = datafs::readdir(&self.inode, cursor)?;
             charge.add(entries.iter().map(|(_, _, n)| n.len() + 48).sum())?;
-            all.try_reserve(entries.len()).map_err(|_| ENOMEM)?;
+            all.try_grow(entries.len())?;
             all.extend(entries);
             if all.len() > MAX_ENTRIES {
-                return Err(ENOMEM);
+                return Err(crate::heap::ENOMEM);
             }
             if next == 0 {
                 return Ok(all);

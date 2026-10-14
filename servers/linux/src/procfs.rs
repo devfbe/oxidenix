@@ -31,10 +31,11 @@
 
 use crate::files::{self, File, FileRef};
 use crate::fsclient::Client;
+use crate::heap::{try_string, try_vec, TryExtend, TryGrow, TryPushStr};
 use crate::namespace::{self, Node};
 use crate::sync::Mutex;
 use crate::syscall;
-use alloc::format;
+use crate::try_format;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -222,7 +223,7 @@ fn remote_read(ino: u32) -> Result<Vec<u8>, i64> {
         if n > len {
             return Err(EIO);
         }
-        data.extend_from_slice(&scratch.get(0, n));
+        data.try_extend(&scratch.get(0, n)?)?;
         let size = done.values[0] as usize;
         if n < len || data.len() >= size {
             return Ok(data);
@@ -246,13 +247,21 @@ fn remote_readdir(dir: u32) -> Result<Vec<(String, u64, u8)>, i64> {
         if n > len {
             return Err(EIO);
         }
-        for (ino, kind, name) in fsring::dirents(&scratch.get(0, n)) {
+        for (ino, kind, name) in fsring::dirents(&scratch.get(0, n)?) {
             let dtype = match kind {
                 fsring::TYPE_DIR => DT_DIR,
                 fsring::TYPE_SYMLINK => DT_LNK,
                 _ => DT_REG,
             };
-            out.push((String::from_utf8_lossy(name).into_owned(), ino as u64, dtype));
+            // (procfs's names are ASCII; another byte is replaced, as the lossy conversion would.)
+            let mut s = String::new();
+            for chunk in name.utf8_chunks() {
+                s.try_push_str(chunk.valid())?;
+                if !chunk.invalid().is_empty() {
+                    s.try_push_str("\u{FFFD}")?;
+                }
+            }
+            out.try_push((s, ino as u64, dtype))?;
         }
         cursor = done.values[0];
         if cursor == 0 {
@@ -272,7 +281,8 @@ fn proc_info(op: u64, arg: u64, cap: usize) -> Result<Vec<u8>, i64> {
     if op != QUERY_SYSTEM {
         return crate::process::query(op, arg, cap);
     }
-    let mut buf = alloc::vec![0u8; cap];
+    let mut buf = try_vec(cap)?;
+    buf.resize(cap, 0u8);
     let n = syscall(SYS_SYSTEM_INFO, [op, arg, buf.as_mut_ptr() as u64, cap as u64, 0, 0]);
     if n < 0 {
         return Err(-n);
@@ -288,7 +298,9 @@ fn ids(op: u64, arg: u64) -> Result<Vec<u64>, i64> {
     loop {
         let bytes = proc_info(op, arg, cap * 8)?;
         if bytes.len() < cap * 8 || cap >= 1 << 16 {
-            return Ok(bytes.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().expect("8 bytes"))).collect());
+            let mut out = try_vec(bytes.len() / 8)?;
+            out.extend(bytes.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().expect("8 bytes"))));
+            return Ok(out);
         }
         cap *= 2;
     }
@@ -493,45 +505,77 @@ fn dtype(mode: u32) -> u8 {
 }
 
 /// A directory's entries (`.` and `..` first) as (name, inode, d_type).
+/// Its listing grows with what the programs made (processes, threads, descriptors): ENOMEM
+/// without memory for it.
 pub fn list(dir: &ProcNode) -> Result<Vec<(String, u64, u8)>, i64> {
-    let entry = |name: &str, node: &ProcNode| (String::from(name), ino(node), dtype(mode(node)));
+    type Entries = Vec<(String, u64, u8)>;
+    let add = |out: &mut Entries, name: &str, node: &ProcNode| -> Result<(), i64> {
+        let entry = (try_string(name)?, ino(node), dtype(mode(node)));
+        Ok(out.try_push(entry)?)
+    };
+    // An id's entry, its name formatted without the heap.
+    let add_id = |out: &mut Entries, id: u64, node: &ProcNode| -> Result<(), i64> {
+        let mut digits = [0u8; 20];
+        let mut at = digits.len();
+        let mut n = id;
+        loop {
+            at -= 1;
+            digits[at] = b'0' + (n % 10) as u8;
+            n /= 10;
+            if n == 0 {
+                break;
+            }
+        }
+        add(out, core::str::from_utf8(&digits[at..]).expect("digits"), node)
+    };
+    // "." and "..", then the fixed names of `files` (as nodes of `make`).
+    let fixed = |up: &ProcNode, files: &[(&str, PidFile)], make: &dyn Fn(PidFile) -> ProcNode| -> Result<Entries, i64> {
+        let mut out = try_vec(files.len() + 2)?;
+        add(&mut out, ".", dir)?;
+        add(&mut out, "..", up)?;
+        for &(n, file) in files {
+            add(&mut out, n, &make(file))?;
+        }
+        Ok(out)
+    };
     match dir {
         ProcNode::Remote { sys: false, ino: PROC_ROOT, .. } => {
             // Without procfs, the processes are still there.
-            let mut out = remote_readdir(PROC_ROOT).unwrap_or_else(|_| alloc::vec![entry(".", dir), entry("..", dir)]);
+            let mut out = match remote_readdir(PROC_ROOT) {
+                Ok(out) => out,
+                Err(crate::heap::ENOMEM) => return Err(crate::heap::ENOMEM),
+                Err(_) => fixed(dir, &[], &|_| root(false))?,
+            };
             for (name, node) in [("self", ProcNode::SelfLink), ("thread-self", ProcNode::ThreadSelf), ("mounts", ProcNode::MountsLink)] {
-                out.push(entry(name, &node));
+                add(&mut out, name, &node)?;
             }
             for pid in ids(QUERY_PIDS, 0)?.into_iter().filter(|&p| p != 0) {
-                out.push(entry(&format!("{pid}"), &ProcNode::Pid { pid, file: PidFile::Dir }));
+                add_id(&mut out, pid, &ProcNode::Pid { pid, file: PidFile::Dir })?;
             }
             Ok(out)
         }
         ProcNode::Remote { ino, mode, .. } if mode & vfs::S_IFMT == S_IFDIR => remote_readdir(*ino),
         ProcNode::Pid { pid, file: PidFile::Dir } => {
             process(*pid)?;
-            let mut out = alloc::vec![entry(".", dir), entry("..", &root(false))];
-            out.extend(PID_FILES.iter().map(|&(n, file)| entry(n, &ProcNode::Pid { pid: *pid, file })));
-            Ok(out)
+            fixed(&root(false), PID_FILES, &|file| ProcNode::Pid { pid: *pid, file })
         }
         ProcNode::Pid { pid, file: PidFile::Task } => {
-            let mut out = alloc::vec![entry(".", dir), entry("..", &ProcNode::Pid { pid: *pid, file: PidFile::Dir })];
-            for tid in ids(QUERY_THREADS, *pid).map_err(|_| ENOENT)? {
-                out.push(entry(&format!("{tid}"), &ProcNode::Task { pid: *pid, tid, file: PidFile::Dir }));
+            let tids = ids(QUERY_THREADS, *pid).map_err(|e| if e == crate::heap::ENOMEM { e } else { ENOENT })?;
+            let mut out = fixed(&ProcNode::Pid { pid: *pid, file: PidFile::Dir }, &[], &|file| ProcNode::Pid { pid: *pid, file })?;
+            for tid in tids {
+                add_id(&mut out, tid, &ProcNode::Task { pid: *pid, tid, file: PidFile::Dir })?;
             }
             Ok(out)
         }
         ProcNode::Task { pid, tid, file: PidFile::Dir } => {
             check(dir)?;
-            let mut out = alloc::vec![entry(".", dir), entry("..", &ProcNode::Pid { pid: *pid, file: PidFile::Task })];
-            out.extend(TASK_FILES.iter().map(|&(n, file)| entry(n, &ProcNode::Task { pid: *pid, tid: *tid, file })));
-            Ok(out)
+            fixed(&ProcNode::Pid { pid: *pid, file: PidFile::Task }, TASK_FILES, &|file| ProcNode::Task { pid: *pid, tid: *tid, file })
         }
         ProcNode::Pid { pid, file: PidFile::Fd } => {
             let fds = table(*pid)?.open_fds();
-            let mut out = alloc::vec![entry(".", dir), entry("..", &ProcNode::Pid { pid: *pid, file: PidFile::Dir })];
+            let mut out = fixed(&ProcNode::Pid { pid: *pid, file: PidFile::Dir }, &[], &|file| ProcNode::Pid { pid: *pid, file })?;
             for fd in fds {
-                out.push(entry(&format!("{fd}"), &ProcNode::Fd { pid: *pid, fd }));
+                add_id(&mut out, fd as u64, &ProcNode::Fd { pid: *pid, fd })?;
             }
             Ok(out)
         }
@@ -576,12 +620,12 @@ pub fn stat(node: &ProcNode) -> Result<[u8; 144], i64> {
 /// The target of one of the symlinks.
 pub fn readlink(node: &ProcNode) -> Result<String, i64> {
     match node {
-        ProcNode::SelfLink => Ok(format!("{}", caller().0)),
+        ProcNode::SelfLink => Ok(try_format!("{}", caller().0)?),
         ProcNode::ThreadSelf => {
             let (pid, tid) = caller();
-            Ok(format!("{pid}/task/{tid}"))
+            Ok(try_format!("{pid}/task/{tid}")?)
         }
-        ProcNode::MountsLink => Ok(String::from("self/mounts")),
+        ProcNode::MountsLink => Ok(try_string("self/mounts")?),
         ProcNode::Pid { pid, file: PidFile::Exe } => {
             let exe = text(QUERY_EXE, *pid).map_err(|e| if e == ERANGE { ENOENT } else { e })?;
             if exe.is_empty() {
@@ -592,7 +636,7 @@ pub fn readlink(node: &ProcNode) -> Result<String, i64> {
         ProcNode::Pid { pid, file: PidFile::Cwd } => crate::process::cwd_of(process(*pid)?.tgid as u32).ok_or(ENOENT),
         ProcNode::Pid { pid, file: PidFile::Root } => {
             process(*pid)?;
-            Ok(String::from("/"))
+            Ok(try_string("/")?)
         }
         ProcNode::Fd { pid, fd } => describe(&fd_file(*pid, *fd)?),
         _ => Err(EINVAL),
@@ -603,14 +647,15 @@ pub fn readlink(node: &ProcNode) -> Result<String, i64> {
 /// (" (deleted)" after it, for one unlinked meanwhile), or its kind and
 /// inode for a file without a path.
 fn describe(f: &FileRef) -> Result<String, i64> {
-    let anon = |kind: &str| Ok(format!("anon_inode:{kind}"));
+    let anon = |kind: &str| Ok(try_format!("anon_inode:{kind}")?);
     let ino = |st: Result<vfs::stat::Stat, i64>| st.map(|s| s.ino).unwrap_or(0);
+    let path = |path: &str, gone: bool| Ok(if gone { try_format!("{} (deleted)", path)? } else { try_string(path)? });
     match &f.file {
-        File::Tmp(t) => Ok(if t.inode.removed() { format!("{} (deleted)", t.path) } else { t.path.clone() }),
-        File::Data(d) => Ok(if d.inode.unlinked() { format!("{} (deleted)", d.path) } else { d.path.clone() }),
-        File::Proc(p) => Ok(p.path.clone()),
-        File::Pipe(end) => Ok(format!("pipe:[{}]", end.ino())),
-        File::Socket(_) | File::Inet(_) | File::Netlink(_) => Ok(format!("socket:[{}]", ino(files::stat_file(&f.file)))),
+        File::Tmp(t) => path(&t.path, t.inode.removed()),
+        File::Data(d) => path(&d.path, d.inode.unlinked()),
+        File::Proc(p) => path(&p.path, false),
+        File::Pipe(end) => Ok(try_format!("pipe:[{}]", end.ino())?),
+        File::Socket(_) | File::Inet(_) | File::Netlink(_) => Ok(try_format!("socket:[{}]", ino(files::stat_file(&f.file)))?),
         File::EventFd(_) => anon("[eventfd]"),
         File::Inotify(_) => anon("inotify"),
         File::Epoll(_) => anon("[eventpoll]"),
@@ -632,9 +677,9 @@ pub fn follow(node: &ProcNode) -> Result<Option<Follow>, i64> {
         Ok(Follow { node: Node::Proc(ProcNode::Open(opened)), mode: st.mode, path: None })
     };
     let found = match &f.file {
-        File::Tmp(t) => Follow { mode: t.inode.mode(), node: Node::Tmp(t.inode.clone()), path: Some(t.path.clone()) },
-        File::Data(d) => Follow { mode: d.inode.kind | 0o777, node: Node::Data(d.inode.clone()), path: Some(d.path.clone()) },
-        File::Proc(p) => Follow { mode: mode(&p.node), node: Node::Proc(p.node.clone()), path: Some(p.path.clone()) },
+        File::Tmp(t) => Follow { mode: t.inode.mode(), node: Node::Tmp(t.inode.clone()), path: Some(try_string(&t.path)?) },
+        File::Data(d) => Follow { mode: d.inode.kind | 0o777, node: Node::Data(d.inode.clone()), path: Some(try_string(&d.path)?) },
+        File::Proc(p) => Follow { mode: mode(&p.node), node: Node::Proc(p.node.clone()), path: Some(try_string(&p.path)?) },
         file @ (File::Pipe(_) | File::Socket(_) | File::Inet(_) | File::Netlink(_) | File::EventFd(_) | File::Inotify(_) | File::Epoll(_)) => open(file.clone())?,
         File::Tty(_) | File::PtyMaster(_) | File::Dev(_) | File::Path(_) => {
             let o = files::origin_of_file(&f).ok_or(ENOENT)?;
@@ -663,8 +708,8 @@ pub fn contents(node: &ProcNode) -> Result<Vec<u8>, i64> {
         PidFile::Statm => fmt::pid_statm(&p),
         PidFile::Status => fmt::pid_status(&p, &machine(), &linux(&p)),
         PidFile::Cmdline => return text(QUERY_CMDLINE, id),
-        PidFile::Comm => format!("{}\n", fmt::name(&p)),
-        PidFile::Mounts => namespace::mounts_text(),
+        PidFile::Comm => try_format!("{}\n", fmt::name(&p))?,
+        PidFile::Mounts => namespace::mounts_text()?,
         PidFile::Dir | PidFile::Task | PidFile::Fd => return Err(EISDIR),
         PidFile::Exe | PidFile::Cwd | PidFile::Root => return Err(EINVAL),
     };
