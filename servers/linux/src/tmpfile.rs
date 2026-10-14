@@ -135,7 +135,7 @@ pub fn statfs(dev: u64, buf: u64) -> Result<i64, i64> {
     check(syscall(SYS_FILE_PAGES, [pages.as_mut_ptr() as u64, 0, 0, 0, 0, 0]))?;
     let [used, limit] = pages;
     let free = limit.saturating_sub(used);
-    let words: [u64; 15] = [magic, 4096, limit, free, free, 0, 0, 0, NAME_MAX, 4096, 0, 0, 0, 0, 0];
+    let words: [u64; 15] = [magic, 4096, limit, free, free, 0, 0, 0, NAME_MAX, 4096, vfs::ST_VALID, 0, 0, 0, 0];
     let mut bytes = [0u8; 120];
     for (chunk, w) in bytes.chunks_exact_mut(8).zip(words) {
         chunk.copy_from_slice(&w.to_le_bytes());

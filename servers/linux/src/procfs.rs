@@ -675,7 +675,7 @@ pub fn contents(node: &ProcNode) -> Result<Vec<u8>, i64> {
 /// no inodes counted.
 pub fn statfs(node: &ProcNode) -> [u8; 120] {
     let sys = matches!(node, ProcNode::Remote { sys: true, .. });
-    let words: [u64; 15] = [if sys { SYSFS_MAGIC } else { PROC_SUPER_MAGIC }, 4096, 0, 0, 0, 0, 0, 0, vfs::NAME_MAX as u64, 4096, 0, 0, 0, 0, 0];
+    let words: [u64; 15] = [if sys { SYSFS_MAGIC } else { PROC_SUPER_MAGIC }, 4096, 0, 0, 0, 0, 0, 0, vfs::NAME_MAX as u64, 4096, vfs::ST_VALID, 0, 0, 0, 0];
     let mut out = [0u8; 120];
     for (i, w) in words.iter().enumerate() {
         out[i * 8..i * 8 + 8].copy_from_slice(&w.to_le_bytes());

@@ -22,7 +22,7 @@
 //! | `WRITE` | `object` inode, `offset`, buffer | bytes written (all of them), v0 = file size |
 //! | `FLUSH` | - | 0 once every write completed before it is durable |
 //! | `STAT` | `object` inode | 0, `Stat` in v0..v3 |
-//! | `ROOT` | - | the root directory: v0 = inode, v1 = its mode, v2 = its generation |
+//! | `ROOT` | - | the root directory: v0 = inode, v1 = its mode, v2 = its generation; v3 = the mount's flags (`ROOT_READ_ONLY`) |
 //! | `LOOKUP` | `object` directory, buffer = name | v0 = inode, v1 = its mode, v2 = its generation |
 //! | `CREATE` | `object` directory, buffer = name, `arg` = [kind, permissions, target length]; a symlink's target follows the name in the grant | v0 = new inode, v1 = its mode, v2 = its generation |
 //! | `UNLINK` | `object` directory, buffer = name, `arg[0]` = 1 for a directory | v0 = inode whose last link went and that the client holds (0: none), v1 = its generation |
@@ -137,6 +137,11 @@ pub mod op {
 pub const TIME_ATIME: u64 = 1;
 pub const TIME_MTIME: u64 = 2;
 pub const TIME_CTIME: u64 = 4;
+
+/// `ROOT`'s v3: the filesystem is mounted read-only (its device takes no writes): every
+/// change completes with EROFS, and the client says so (statfs's ST_RDONLY, Linux's EROFS
+/// before it asks).
+pub const ROOT_READ_ONLY: u64 = 1;
 
 /// The errors the protocol itself gives (others come from the filesystem).
 pub mod errno {

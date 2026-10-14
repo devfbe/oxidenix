@@ -68,6 +68,11 @@ pub fn open(inode: Arc<DInode>, flags: u32, path: String) -> Result<i64, i64> {
     if flags & O_DIRECTORY != 0 && !dir {
         return Err(ENOTDIR);
     }
+    // A read-only disk opens nothing for writing and truncates nothing (Linux's may_open
+    // and do_open: O_TRUNC of a regular file asks for write access whatever the mode).
+    if writable || flags & O_TRUNC != 0 && inode.kind == vfs::S_IFREG {
+        datafs::writable()?;
+    }
     // Not while it runs as a program (ETXTBSY).
     let write = writable && inode.kind == vfs::S_IFREG;
     if write {

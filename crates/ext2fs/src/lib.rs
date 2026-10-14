@@ -3177,6 +3177,11 @@ impl<D: Device> Ext2<D> {
         self.st.broken
     }
 
+    /// Whether it is mounted read-only (`Device::read_only`): every change fails (EROFS).
+    pub fn read_only(&self) -> bool {
+        self.st.read_only
+    }
+
     pub fn write(&mut self, ino: u32, off: u64, data: &[u8]) -> Result<usize, i64> {
         self.op(|st| st.write(ino, off, data))
     }

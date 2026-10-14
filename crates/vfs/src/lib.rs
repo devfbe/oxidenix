@@ -20,3 +20,7 @@ pub const S_IFLNK: u32 = 0o120000;
 pub const S_IFCHR: u32 = 0o020000;
 pub const S_IFSOCK: u32 = 0o140000;
 pub const NAME_MAX: usize = 255;
+/// statfs(2)'s `f_flags`: Linux sets ST_VALID on every answer (since 2.6.36), and a
+/// read-only mount's ST_RDONLY.
+pub const ST_RDONLY: u64 = 0x0001;
+pub const ST_VALID: u64 = 0x0020;
