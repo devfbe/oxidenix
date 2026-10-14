@@ -266,10 +266,13 @@ fn dev() -> Arc<tmpfs::Inode> {
 /// The mount table as /proc/<pid>/mounts shows it (proc_pid_mounts(5)).
 pub fn mounts_text() -> Result<String, i64> {
     use crate::heap::TryPushStr;
+    // (Asked before the table's lock: it may ask diskfs.)
+    let data_ro = datafs::read_only();
     with_mounts(|mounts| {
         let mut out = String::new();
         for m in mounts {
-            out.try_push_str(&crate::try_format!("{} {} {} rw 0 0\n", m.source, join(&m.at)?, m.fstype)?)?;
+            let mode = if matches!(m.fs, Fs::Data) && data_ro { "ro" } else { "rw" };
+            out.try_push_str(&crate::try_format!("{} {} {} {} 0 0\n", m.source, join(&m.at)?, m.fstype, mode)?)?;
         }
         Ok(out)
     })

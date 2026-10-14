@@ -104,8 +104,8 @@ pub fn handle(s: &State) -> Option<i64> {
                 fstatat(a0, a1, a2, a3)
             }
         }
-        SYS_ACCESS => at(CWD, a0, true).map(|_| 0),
-        SYS_FACCESSAT | SYS_FACCESSAT2 => at(a0, a1, true).map(|_| 0),
+        SYS_ACCESS => at(CWD, a0, true).and_then(|r| access(&r.node, a1)),
+        SYS_FACCESSAT | SYS_FACCESSAT2 => at(a0, a1, true).and_then(|r| access(&r.node, a2)),
         SYS_TRUNCATE => at(CWD, a0, true).and_then(|r| {
             truncate(&r.node, a1)?;
             inotify::node_event(&r.node, inotify::IN_MODIFY);
@@ -801,9 +801,24 @@ fn chownat(dirfd: u64, addr: u64, flags: u64) -> Result<i64, i64> {
 
 fn chown_target(target: Option<(Node, String)>) -> Result<i64, i64> {
     if let Some((node, path)) = target {
+        // (Owners are not stored, but a read-only disk takes no change.)
+        if let Node::Data(_) = node {
+            datafs::writable()?;
+        }
         attrib(&node, &path);
     }
     Ok(0)
+}
+
+/// access(2) of an existing `node` for `mode`: everyone is root, so only a read-only
+/// filesystem says no, to writing a file, a directory or a symlink (Linux's
+/// sb_permission: EROFS).
+fn access(node: &Node, mode: u64) -> Result<i64, i64> {
+    const W_OK: u64 = 2;
+    match node {
+        Node::Data(d) if mode & W_OK != 0 && matches!(d.kind, vfs::S_IFREG | vfs::S_IFDIR | vfs::S_IFLNK) => datafs::writable().map(|_| 0),
+        _ => Ok(0),
+    }
 }
 
 /// truncate(2): with the right to write, as through a writable descriptor.
@@ -823,6 +838,7 @@ fn truncate(node: &Node, len: u64) -> Result<i64, i64> {
             if d.kind == vfs::S_IFDIR {
                 return Err(datafs::EISDIR);
             }
+            datafs::writable()?;
             datafs::get_write(d)?;
             let r = datafs::truncate(d, len).map(|_| 0);
             datafs::put_write(d);

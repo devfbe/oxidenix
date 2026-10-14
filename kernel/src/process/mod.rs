@@ -573,6 +573,16 @@ fn start_env() -> Vec<String> {
 pub fn spawn(name: &str, args: &[&str]) -> Result<Tree, i64> {
     let path = if name.contains('/') { name.to_string() } else { alloc::format!("/bin/{name}") };
     let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    let (pid, instance) = start_tree(&path, &args, true)?;
+    Ok(Tree { pid, instance })
+}
+
+/// Starts the tree of `spawn` running `path` with `args`; with `grants`,
+/// the console and the host grant go to it before it runs. Its first
+/// process's id and its instance.
+fn start_tree(path: &str, args: &[String], grants: bool) -> Result<(Pid, alloc::sync::Weak<linux::Instance>), i64> {
+    let path = path.to_string();
+    let args = args.to_vec();
     let slot = sched::reserve_pid()?;
     let pid = slot.pid;
     let instance = linux::Instance::new()?;
@@ -603,12 +613,75 @@ pub fn spawn(name: &str, args: &[&str]) -> Result<Tree, i64> {
             return Err(e);
         }
     };
-    // The tree the kernel starts gets the console (ADR 0007) and, the only
-    // tree the machine runs at a time, the host grant (ADR 0011).
-    linux::host_grant(&instance, true);
-    linux::console_grant(Some(&instance));
+    // The tree the monitor starts gets the console (ADR 0007) and, the only
+    // tree it runs at a time, the host grant (ADR 0011).
+    if grants {
+        linux::host_grant(&instance, true);
+        linux::console_grant(Some(&instance));
+    }
     sched::start(t);
-    Ok(Tree { pid, instance: Arc::downgrade(&instance) })
+    Ok((pid, Arc::downgrade(&instance)))
+}
+
+/// The trees the self-tests started (`TEST_TREE_START`): the starter's
+/// instance and the tree's first process. The kernel is their parent, as
+/// of every tree; the starter reaps them (`test_tree_wait`), the monitor
+/// kills those left running before the shutdown (`end_test_trees`).
+static TEST_TREES: spin::Mutex<Vec<(u64, Pid)>> = spin::Mutex::new(Vec::new());
+
+/// `TEST_TREE_START` for instance `starter`: a tree without the console
+/// and the host grant, running `path` (absolute) with `args`.
+pub fn test_tree_start(starter: u64, path: &str, args: &[String]) -> Result<Pid, i64> {
+    if !path.starts_with('/') || args.is_empty() {
+        return Err(EINVAL);
+    }
+    TEST_TREES.lock().try_reserve(1).map_err(|_| ENOMEM)?;
+    let (pid, _) = start_tree(path, args, false)?;
+    // (Room was reserved above; a race that took it only grows the list.)
+    TEST_TREES.lock().push((starter, pid));
+    Ok(pid)
+}
+
+/// Whether `pid` is a tree `starter` started and has not reaped.
+fn test_tree_of(starter: u64, pid: Pid) -> bool {
+    TEST_TREES.lock().contains(&(starter, pid))
+}
+
+/// `TEST_TREE_WAIT`: the wait status of `starter`'s tree `pid` once its
+/// first process ended (reaped then), waiting until `deadline` at most.
+pub fn test_tree_wait(starter: u64, pid: Pid, deadline: u64) -> Result<i32, i64> {
+    if !test_tree_of(starter, pid) {
+        return Err(ECHILD);
+    }
+    let status = exit::wait_until(pid, deadline)?;
+    TEST_TREES.lock().retain(|&t| t != (starter, pid));
+    Ok(status)
+}
+
+/// `TEST_TREE_KILL`: the kernel kills the first process of `starter`'s
+/// tree `pid` (its server then ends the rest: pid 1 of the tree).
+pub fn test_tree_kill(starter: u64, pid: Pid) -> Result<(), i64> {
+    if !test_tree_of(starter, pid) {
+        return Err(ECHILD);
+    }
+    match kill::kill_pid(pid) {
+        // (Ended already: nothing to kill, its status waits.)
+        Ok(()) | Err(ESRCH) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// The monitor, once the self-tests' tree ended: the trees it started and
+/// left running are killed (the shutdown reaps them); how many.
+pub fn end_test_trees() -> usize {
+    let trees: Vec<(u64, Pid)> = core::mem::take(&mut *TEST_TREES.lock());
+    let mut killed = 0;
+    for (_, pid) in trees {
+        if kill::kill_pid(pid).is_ok() {
+            killed += 1;
+        }
+    }
+    killed
 }
 
 /// A process tree the kernel started (`spawn`): its first process, and

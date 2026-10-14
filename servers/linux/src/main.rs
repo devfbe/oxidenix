@@ -237,7 +237,7 @@ fn dispatch(s: &mut State) -> i64 {
         // The test hooks reach beyond the caller (the instance's test
         // objects, the test service, /data files, the server's heap and
         // locks): only for the self-tests.
-        TEST_MAP..=TEST_FAIL_NTH if !test_mode() => -ENOSYS,
+        TEST_MAP..=TEST_TREE_KILL if !test_mode() => -ENOSYS,
         TEST_MAP..=TEST_CACHED => test(s.rax, s.rdi),
         TEST_FAIL_NTH => heap::fail_nth(s.rdi),
         TEST_MKWRITE_FAIL => datafs::fail_next_mkwrite(s.rdi),
@@ -268,6 +268,13 @@ fn dispatch(s: &mut State) -> i64 {
         },
         TEST_HOST => syscall(TEST_HOST, [s.rdi, 0, 0, 0, 0, 0]),
         TEST_FUTEX_WATCH => syscall(TEST_FUTEX_WATCH, [s.rdi, s.rsi, 0, 0, 0, 0]),
+        // The kernel's to answer, with the path and argv packed in the server's memory.
+        TEST_TREE_START => match tree_command(s.rdi, s.rsi) {
+            Ok(packed) => syscall(TEST_TREE_START, [packed.as_ptr() as u64, packed.len() as u64, 0, 0, 0, 0]),
+            Err(e) => -e,
+        },
+        TEST_TREE_WAIT => syscall(TEST_TREE_WAIT, [s.rdi, s.rsi, 0, 0, 0, 0]),
+        TEST_TREE_KILL => syscall(TEST_TREE_KILL, [s.rdi, 0, 0, 0, 0, 0]),
         TEST_HEAP_STATS => test(s.rax, s.rdi),
         // Not offered, as by a Linux built without io_uring: libuv (and
         // so Node.js) probes io_uring_setup at start and uses epoll
@@ -459,6 +466,41 @@ static COUNTER: sync::Mutex<u64> = sync::Mutex::new(0);
 
 /// Allocates `n` blocks of many sizes, fills, checks and frees them (in an
 /// order that leaves holes); 0 if every block kept its contents.
+/// `TEST_TREE_START`'s `(path, argv)` of the program's, packed for the kernel: each
+/// string with its NUL, the path first (at most 4096 bytes in all, E2BIG beyond; at
+/// most 64 arguments, at least argv[0]).
+fn tree_command(path: u64, argv: u64) -> Result<alloc::vec::Vec<u8>, i64> {
+    const E2BIG: i64 = 7;
+    const EINVAL: i64 = 22;
+    const MAX: usize = 4096;
+    let mut out = alloc::vec::Vec::new();
+    let mut put = |s: &str| {
+        if out.len() + s.len() + 1 > MAX {
+            return Err(E2BIG);
+        }
+        out.extend_from_slice(s.as_bytes());
+        out.push(0);
+        Ok(())
+    };
+    put(&usercopy::read_cstr(path)?)?;
+    let mut n = 0u64;
+    loop {
+        let ptr: u64 = usercopy::read(argv.checked_add(n * 8).ok_or(EINVAL)?)?;
+        if ptr == 0 {
+            break;
+        }
+        if n == 64 {
+            return Err(E2BIG);
+        }
+        put(&usercopy::read_cstr(ptr)?)?;
+        n += 1;
+    }
+    if n == 0 {
+        return Err(EINVAL);
+    }
+    Ok(out)
+}
+
 fn test_alloc(n: u64) -> i32 {
     use alloc::vec::Vec;
     let mut blocks: Vec<Vec<u8>> = Vec::new();

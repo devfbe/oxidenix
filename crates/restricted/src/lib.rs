@@ -1098,3 +1098,29 @@ pub const TEST_HEAP_STATS: u64 = 1526;
 /// none was armed), so a test fails each allocation of a call in turn until
 /// the call makes fewer. The server's own call, test mode only.
 pub const TEST_FAIL_NTH: u64 = 1527;
+/// `(buf, len) -> handle`: the kernel starts another process tree, as its
+/// monitor does (ADR 0002: its own instance of the Linux server), running
+/// the program whose absolute path and arguments `buf` holds, each ended by
+/// a NUL (the path, then argv, argv[0] first); the handle names the tree for
+/// `TEST_TREE_WAIT` and `TEST_TREE_KILL` (the kernel's id of its first
+/// process). The new tree gets neither the console nor the host grant: its
+/// init has no standard descriptors. Only a tree holding the host grant may
+/// start one (EPERM). Test mode only (ENOSYS otherwise); a program's call
+/// `(path, argv)` is the server's to pass on (`treetest`: two trees at
+/// once). A tree started so and still running when the self-tests end is
+/// killed before the machine goes off.
+pub const TEST_TREE_START: u64 = 1528;
+/// `(handle, ns) -> status`: waits up to `ns` nanoseconds until the first
+/// process of a tree the caller's instance started (`TEST_TREE_START`) has
+/// ended, and returns its wait status (Linux's encoding) once: its handle
+/// is gone then. ETIMEDOUT if it still runs (`ns` 0 only looks), EINTR if
+/// the caller has a signal to take, ECHILD if the handle names no tree of
+/// the caller's. Test mode only; a program's call is the server's to pass
+/// on.
+pub const TEST_TREE_WAIT: u64 = 1529;
+/// `(handle)`: kills the first process of a tree the caller's instance
+/// started (the monitor's `kill`), whose end ends the whole tree (pid 1 of
+/// its namespace); its handle stays for `TEST_TREE_WAIT`. ECHILD if the
+/// handle names no tree of the caller's. Test mode only; a program's call
+/// is the server's to pass on.
+pub const TEST_TREE_KILL: u64 = 1530;

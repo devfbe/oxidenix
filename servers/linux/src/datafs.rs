@@ -134,6 +134,8 @@ pub const EINVAL: i64 = 22;
 pub const EFBIG: i64 = 27;
 pub const ENOSPC: i64 = 28;
 pub const ENAMETOOLONG: i64 = 36;
+pub const EROFS: i64 = 30;
+const EEXIST: i64 = 17;
 /// (Internal: diskfs died under a request; never reaches a program.)
 const ENOTCONN: i64 = 107;
 
@@ -399,10 +401,12 @@ pub fn set_times(inode: &Arc<DInode>, atime: vfs::stat::SetTime, mtime: vfs::sta
     if atime == vfs::stat::SetTime::Omit && mtime == vfs::stat::SetTime::Omit {
         return Ok(());
     }
+    writable()?;
     let now = crate::time::realtime();
     let secs = |t: vfs::stat::Time| ext2_time(t.sec);
-    let request = {
+    let (request, seq, before) = {
         let mut t = inode.times.lock();
+        let before = *t;
         if let Some(a) = atime.resolve(now) {
             t.atime = Some(secs(a));
         }
@@ -411,13 +415,20 @@ pub fn set_times(inode: &Arc<DInode>, atime: vfs::stat::SetTime, mtime: vfs::sta
         }
         t.ctime = Some(secs(now));
         t.seq += 1;
-        (t.request(inode.node()), t.seq)
+        (t.request(inode.node()), t.seq, before)
     };
-    let c = client()?;
-    status(&call(&c, request.0.encode(0))?)?;
-    // Nothing waits for a write-back: diskfs has them now.
+    let sent = client().and_then(|c| status(&call(&c, request.encode(0))?));
     let mut t = inode.times.lock();
-    if !t.pending && t.seq == request.1 {
+    if let Err(e) = sent {
+        // Refused: the times are what they were (else stat would report them, and the
+        // next write-back send them again), unless they changed since.
+        if t.seq == seq {
+            *t = Times { seq, ..before };
+        }
+        return Err(e);
+    }
+    // Nothing waits for a write-back: diskfs has them now.
+    if !t.pending && t.seq == seq {
         *t = Times { seq: t.seq, ..Times::default() };
     }
     Ok(())
@@ -866,7 +877,27 @@ pub fn root() -> Result<Arc<DInode>, i64> {
     if r.values[0] != ROOT_INO as u64 {
         return Err(EIO);
     }
+    READ_ONLY.store(r.values[3] & fsring::ROOT_READ_ONLY != 0, Ordering::Relaxed);
     found(spare, r.values[0], r.values[1], r.values[2])
+}
+
+/// The disk is mounted read-only (`ROOT` says so; the device does not change while the
+/// machine runs).
+static READ_ONLY: AtomicBool = AtomicBool::new(false);
+
+/// Whether /data is mounted read-only (asks for the root first if it is not known yet;
+/// without a disk, no).
+pub fn read_only() -> bool {
+    root().is_ok() && READ_ONLY.load(Ordering::Relaxed)
+}
+
+/// EROFS if /data is mounted read-only (Linux's `mnt_want_write`): for the changes the
+/// server decides without diskfs (opening for writing, owners, access(2)), before it asks
+/// (a truncation, which goes through the page cache first) and where Linux says EROFS
+/// before it looks a name up (unlink, rename); diskfs refuses every change of its own in
+/// any case.
+pub fn writable() -> Result<(), i64> {
+    if read_only() { Err(EROFS) } else { Ok(()) }
 }
 
 /// The inode by its object's key.
@@ -911,6 +942,15 @@ pub enum New<'a> {
 pub fn create(dir: &Arc<DInode>, name: &str, new: New, perm: u32) -> Result<Arc<DInode>, i64> {
     live(dir)?;
     name_ok(name)?;
+    // A read-only disk: a name that exists is EEXIST first (Linux's filename_create
+    // looks it up before it asks for write access).
+    if read_only() {
+        return Err(match lookup(dir, name) {
+            Ok(_) => EEXIST,
+            Err(ENOENT) => EROFS,
+            Err(e) => e,
+        });
+    }
     let c = client()?;
     let scratch = c.scratch(2);
     scratch.put(0, name.as_bytes());
@@ -940,6 +980,8 @@ pub fn create(dir: &Arc<DInode>, name: &str, new: New, perm: u32) -> Result<Arc<
 pub fn unlink(dir: &Arc<DInode>, name: &str, dir_only: bool) -> Result<Option<u32>, i64> {
     live(dir)?;
     name_ok(name)?;
+    // (Linux asks for write access before it looks the name up: EROFS before ENOENT.)
+    writable()?;
     let c = client()?;
     let scratch = c.scratch(1);
     scratch.put(0, name.as_bytes());
@@ -965,6 +1007,7 @@ pub fn rename(odir: &Arc<DInode>, oname: &str, ndir: &Arc<DInode>, nname: &str) 
     live(ndir)?;
     name_ok(oname)?;
     name_ok(nname)?;
+    writable()?;
     let c = client()?;
     let scratch = c.scratch(1);
     scratch.put(0, oname.as_bytes());
@@ -1184,7 +1227,8 @@ fn max_file() -> Result<u64, i64> {
 pub fn statfs() -> Result<[u8; 120], i64> {
     let u = usage()?;
     let bs = u.block_size as u64;
-    let words = [EXT2_MAGIC, bs, u.blocks as u64, u.free_blocks as u64, u.free_blocks as u64, u.inodes as u64, u.free_inodes as u64, 0, vfs::NAME_MAX as u64, bs, 0, 0, 0, 0, 0];
+    let flags = vfs::ST_VALID | if read_only() { vfs::ST_RDONLY } else { 0 };
+    let words = [EXT2_MAGIC, bs, u.blocks as u64, u.free_blocks as u64, u.free_blocks as u64, u.inodes as u64, u.free_inodes as u64, 0, vfs::NAME_MAX as u64, bs, flags, 0, 0, 0, 0];
     let mut out = [0u8; 120];
     for (i, w) in words.iter().enumerate() {
         out[i * 8..i * 8 + 8].copy_from_slice(&w.to_le_bytes());

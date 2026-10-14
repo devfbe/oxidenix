@@ -1225,7 +1225,8 @@ impl Service {
             }
             Request::Root => {
                 let s = fs.stat(ext2fs::ROOT_INO)?;
-                Ok((0, [ext2fs::ROOT_INO as u64, s.mode as u64, s.generation as u64, 0]))
+                let flags = if fs.read_only() { fsring::ROOT_READ_ONLY } else { 0 };
+                Ok((0, [ext2fs::ROOT_INO as u64, s.mode as u64, s.generation as u64, flags]))
             }
             Request::Lookup { dir, name } => {
                 let dir = Self::node(fs, dir)?;

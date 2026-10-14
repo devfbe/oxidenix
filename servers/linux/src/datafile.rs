@@ -84,6 +84,11 @@ pub fn open_in(prepared: Prepared, inode: Arc<DInode>, flags: u32, path: String)
     if flags & O_DIRECTORY != 0 && !dir {
         return Err(ENOTDIR);
     }
+    // A read-only disk opens nothing for writing and truncates nothing (Linux's may_open
+    // and do_open: O_TRUNC of a regular file asks for write access whatever the mode).
+    if writable || flags & O_TRUNC != 0 && inode.kind == vfs::S_IFREG {
+        datafs::writable()?;
+    }
     // Its memory is had (before the write access and the open count, which its drop would
     // give back with a close event).
     let Prepared(mut slot, room) = prepared;

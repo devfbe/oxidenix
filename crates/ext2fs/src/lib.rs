@@ -3564,6 +3564,11 @@ impl<D: Device> Ext2<D> {
         self.st.broken
     }
 
+    /// Whether it is mounted read-only (`Device::read_only`): every change fails (EROFS).
+    pub fn read_only(&self) -> bool {
+        self.st.read_only
+    }
+
     /// Whether the filesystem has errors: corruption was found (an operation failed with
     /// EUCLEAN, or went on past it: "Corruption"), or the disk said so at mount. The disk
     /// says so too once a commit wrote it, until e2fsck.

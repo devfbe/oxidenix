@@ -50,7 +50,8 @@ of the kernel's tree that `/dev` still was. Four questions decided the shape:
 5. **The machine's state is a capability** (added in review). Setting the wall clock
    (`clock_set`) and powering off or restarting (`power`) act on the whole machine, not one
    tree: they need the instance's **host grant**, which the kernel gives when it starts a
-   tree itself (the monitor's `run`, autorun: today the only trees there are), as it grants
+   tree itself (the monitor's `run`, autorun; a tree the self-tests have it start beside
+   theirs, `TEST_TREE_START`, gets neither grant: `treetest`), as it grants
    the console, and takes back with the console once the tree's first process has ended
    (what is left of the tree runs on without either). Without it both are EPERM, and the
    server acts as Linux in a pid namespace that is not the initial one: `clock_settime` and
