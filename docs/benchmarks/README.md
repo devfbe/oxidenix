@@ -191,3 +191,20 @@ measures 1022 ns, and `-cpu max` alone changes nothing (978 ns at the baseline).
 map of physical memory uses 2 MiB pages, so direct-map TLB misses do not explain it. Since
 R1, the figure is dominated by forwarding instead (pread 3932 cycles, `clock_gettime` 1770,
 p50, at `92bb179`; without PCIDs 5689 and 2573).
+
+## A/B of R8's cached-read regression (2026-10-14)
+
+The single runs after R8 showed random cached reads 30–46 % slower than r6e (`read_4k_cached`,
+`pread_4k_cached`). Measured A/B on an idle host, r6e (`27a096a`) and main (`61e79d0`) booted
+in turn, three times each (`2026-10-14-61e79d0-ab-main.md` is one of main's runs):
+
+| p50 | r6e | main |
+|---|---|---|
+| `pread_4k_cached` (cycles) | 3273, 3052, 3771 | 2952, 2956, 2962 |
+| `read_4k_cached` (ns) | 2312, 2349, 2318 | 2458, 2261, 2265 |
+| `fstat_disk` (cycles) | 14504, 13709, 13976 | 15072, 15227, 14809 |
+
+There is no regression of cached reads: `pread_4k_cached` of one commit spreads by up to 18 %
+between boots (two runs of `905c1d0`: 3565 and 4201), which a bisect with one run per step
+had taken for one. Only `fstat_disk` stays about 6 % above r6e in every pairing. Compare
+several boots per commit, in turn, before calling a difference of less than about 20 %.

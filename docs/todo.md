@@ -6,9 +6,8 @@ done, delete it here in the same commit.
 
 ## Performance
 
-- **Cached 4 KiB reads got slower with R8** (`read_4k_cached` about +30–46 %, `fstat_disk`
-  +14 % against r6e). Not measured A/B on a quiet host yet; candidates are in
-  `kernel/src/process/linux.rs` `enter()` (per-entry `dying()` and `kicked` checks).
+- **`fstat_disk` about 6 % slower than r6e** (A/B, three boots each, 2026-10-14:
+  docs/benchmarks/README.md); cached reads are not (the R8 figures were noise between boots).
 - **Forwarding cost.** A null system call costs ~1 450–1 700 cycles against 269 on Linux,
   `fstat` on `/data` ~14 000 against 409. A faster path for calls the Linux server answers
   without the kernel is the largest open lever.
