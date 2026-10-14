@@ -71,7 +71,13 @@ Five questions shaped the design:
 3. **A victim gets to its end.** Its faults may take frames of the upper half of the
    kernel's reserve (Linux's TIF_MEMDIE; the lower half is the kernel heap's alone), as may
    the Linux server's allocations that cannot fail (its heap's commits from the instance's
-   reserve: in a mode that overcommits, a commitment is no frame). A kernel thread, the **OOM
+   reserve: in a mode that overcommits, a commitment is no frame), at most as many frames as
+   that reserve holds commitment for (a commit beyond it, which an overcommitting mode grants
+   at will, never reaches the kernel's reserve). Every doubtful case fails closed: a tree's
+   first process whose grant cannot be looked up (no memory) counts as the host's and is not
+   killed, a victim that could not be queued still holds the next choice off, and lowering
+   oom_score_adj without the grant is refused if any process sharing the address space would
+   go below its own least. A kernel thread, the **OOM
    reaper**, frees the victim's private memory (anonymous pages, private copies, with their
    commitment) as soon as it gets the victim's address space (ten tries, 100 ms apart), so
    memory comes back even while a thread of the victim is held up; a reaped space makes no

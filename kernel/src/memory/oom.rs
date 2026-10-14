@@ -124,10 +124,18 @@ fn next_group(at: &mut Option<u64>) -> Option<Arc<ThreadGroup>> {
 }
 
 /// Whether `group` is the first process of a tree that holds the host grant (Linux's
-/// global init, which is never killed).
+/// global init, which is never killed). A tree's first process counts as one when the
+/// instances cannot be looked at (no memory): protected rather than killed by mistake.
 fn host_init(group: &ThreadGroup) -> bool {
     let instance = group.instance.load(Ordering::Acquire);
-    instance != 0 && !group.server_reaps.load(Ordering::Relaxed) && crate::process::linux::host_granted(instance)
+    instance != 0 && !group.server_reaps.load(Ordering::Relaxed) && crate::process::linux::host_granted(instance).unwrap_or(true)
+}
+
+/// Whether `group` is a victim whose memory has not come back yet (killed, its address
+/// space alive and neither reaped nor given up on), whether or not it is in `VICTIMS`.
+fn unresolved_victim(group: &ThreadGroup) -> bool {
+    group.oom_victim.load(Ordering::Acquire)
+        && group.info.lock().mem.as_ref().is_some_and(|m| m.mm_alive() && !m.oom_skip.load(Ordering::Acquire))
 }
 
 /// What the OOM killer weighs `group` at (Linux's `oom_badness`) against `total` pages of
@@ -193,10 +201,9 @@ pub fn out_of_memory(n: u64) -> bool {
     if crate::process::kill::dying() {
         return false;
     }
-    let Some(_choosing) = CHOOSING.try_lock() else {
-        // Another thread chooses now: its victim's memory is for this one too.
-        return true;
-    };
+    // One chooser at a time; who waited looks again at what it left (its holder does
+    // bounded work and never waits for memory).
+    let _choosing = CHOOSING.lock();
     // Memory came back meanwhile, or a victim's is on its way.
     if super::with_frames(|f| f.user_may_take(n)) || victim_pending() {
         return true;
@@ -205,6 +212,11 @@ pub fn out_of_memory(n: u64) -> bool {
     let mut best: Option<(Arc<ThreadGroup>, Arc<MemStats>, i64)> = None;
     let mut at = None;
     while let Some(group) = next_group(&mut at) {
+        // A victim not waited for (`VICTIMS` was full) still holds the choice off, as
+        // Linux's `oom_evaluate_task` aborts at one: no second kill for memory on its way.
+        if unresolved_victim(&group) {
+            return true;
+        }
         if let Some((stats, points)) = badness(&group, total) {
             if best.as_ref().is_none_or(|b| points > b.2) {
                 best = Some((group, stats, points));
@@ -297,7 +309,9 @@ fn kill(victim: &Arc<ThreadGroup>, stats: &Arc<MemStats>) {
         if Arc::ptr_eq(&group, victim) || !group.info.lock().mem.as_ref().is_some_and(|m| Arc::ptr_eq(m, stats)) {
             continue;
         }
-        if group.instance.load(Ordering::Acquire) == 0 || group.oom_score_adj.load(Ordering::Relaxed) == ADJ_MIN || host_init(&group) {
+        // (Another tree's process never shares one: left alone all the same.)
+        let foreign = group.instance.load(Ordering::Acquire) != victim.instance.load(Ordering::Acquire);
+        if foreign || group.instance.load(Ordering::Acquire) == 0 || group.oom_score_adj.load(Ordering::Relaxed) == ADJ_MIN || host_init(&group) {
             reapable = false;
             crate::printkln_at!(LEVEL_INFO, "oom killer {} ({}) has mm pinned by {} ({})", victim.tgid, name, group.tgid, Name::group(&group));
             continue;
@@ -333,7 +347,8 @@ pub fn set_score_adj(group: &Arc<ThreadGroup>, adj: i64, privileged: bool, legac
     if !(ADJ_MIN..=ADJ_MAX).contains(&adj) {
         return Err(crate::process::errno::EINVAL);
     }
-    if adj < group.oom_score_adj_min.load(Ordering::Relaxed) && !privileged {
+    let below = |g: &ThreadGroup| adj < g.oom_score_adj_min.load(Ordering::Relaxed) && !privileged;
+    if below(group) {
         return Err(crate::process::errno::EACCES);
     }
     let set = |g: &ThreadGroup| {
@@ -343,11 +358,27 @@ pub fn set_score_adj(group: &Arc<ThreadGroup>, adj: i64, privileged: bool, legac
         }
         old
     };
-    let old = set(group);
-    let Some(stats) = group.info.lock().mem.clone() else { return Ok(old) };
+    let stats = group.info.lock().mem.clone();
+    // The other processes of its address space: of its own tree only (an address space
+    // is never shared across trees; checked all the same), never a host tree's first
+    // process. Each must allow the value too: none is lowered below its own least
+    // without the grant, whatever the process asked for.
+    let instance = group.instance.load(Ordering::Acquire);
+    let sharer = |other: &ThreadGroup| {
+        stats.as_ref().is_some_and(|s| other.info.lock().mem.as_ref().is_some_and(|m| Arc::ptr_eq(m, s)))
+            && other.instance.load(Ordering::Acquire) == instance
+            && !host_init(other)
+    };
     let mut at = None;
     while let Some(other) = next_group(&mut at) {
-        if !Arc::ptr_eq(&other, group) && other.info.lock().mem.as_ref().is_some_and(|m| Arc::ptr_eq(m, &stats)) && !host_init(&other) {
+        if !Arc::ptr_eq(&other, group) && sharer(&other) && below(&other) {
+            return Err(crate::process::errno::EACCES);
+        }
+    }
+    let old = set(group);
+    let mut at = None;
+    while let Some(other) = next_group(&mut at) {
+        if !Arc::ptr_eq(&other, group) && sharer(&other) {
             set(&other);
         }
     }

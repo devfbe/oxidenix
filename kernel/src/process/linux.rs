@@ -83,11 +83,17 @@ fn sync_chan() -> usize {
 /// and references are dropped only after it (a drop may be the instance's
 /// teardown).
 fn instances(except: Option<&Instance>) -> Vec<Arc<Instance>> {
+    try_instances(except).unwrap_or_default()
+}
+
+/// `instances`, or None if there is no memory for the list (for a caller
+/// that must not take an empty list for the truth).
+fn try_instances(except: Option<&Instance>) -> Option<Vec<Arc<Instance>>> {
     let mut out: Vec<Arc<Instance>> = Vec::new();
     loop {
         let want = INSTANCES.lock().len();
         if out.try_reserve_exact(want).is_err() {
-            return out;
+            return None;
         }
         let all = INSTANCES.lock();
         if all.len() <= out.capacity() {
@@ -96,7 +102,7 @@ fn instances(except: Option<&Instance>) -> Vec<Arc<Instance>> {
         }
     }
     out.retain(|i| !except.is_some_and(|e| core::ptr::eq(Arc::as_ptr(i), e)));
-    out
+    Some(out)
 }
 
 /// When `post_shrink` last went through the instances (`time::now`), and
@@ -267,20 +273,21 @@ const UNMAP_BATCH: usize = 64;
 /// else one clean cache pages give back (those used lately too); never a
 /// wait (for write-back, for an address space): the server may be the one
 /// to write back, and its heap fails fast (ENOMEM) rather than wait for
-/// itself. For a commit from the instance's reserve (an allocation the
-/// server cannot fail, `use_reserve`) one of the kernel's reserve if user
+/// itself. If `emergency` (a commit the instance's reserve covers: an
+/// allocation the server cannot fail) one of the kernel's reserve when user
 /// memory is exhausted (`memory::emergency_frame`: possible when memory is
-/// overcommitted, until the OOM killer made room).
-fn heap_frame(use_reserve: bool) -> Result<PhysFrame, i64> {
+/// overcommitted, until the OOM killer made room). With whether it is one.
+fn heap_frame(emergency: bool) -> Result<(PhysFrame, bool), i64> {
     if let Ok(frame) = zeroed_frame() {
-        return Ok(frame);
+        return Ok((frame, false));
     }
     memory::reclaim_forced(1);
-    zeroed_frame().or_else(|e| {
-        let frame = use_reserve.then(memory::emergency_frame).flatten().ok_or(e)?;
-        unsafe { core::ptr::write_bytes(memory::phys_to_virt(frame.start_address().as_u64()), 0, 4096) };
-        Ok(frame)
-    })
+    if let Ok(frame) = zeroed_frame() {
+        return Ok((frame, false));
+    }
+    let frame = emergency.then(memory::emergency_frame).flatten().ok_or(ENOMEM)?;
+    unsafe { core::ptr::write_bytes(memory::phys_to_virt(frame.start_address().as_u64()), 0, 4096) };
+    Ok((frame, true))
 }
 
 /// Pages `Instance::commit_heap` takes frames for at a time (on the stack,
@@ -820,9 +827,18 @@ impl Instance {
                 }
             })
         };
+        // Frames of the kernel's reserve only for what the instance's own
+        // reserve covers (commitment it holds without frames): a commit
+        // beyond it, which an overcommitting mode grants at will, never
+        // reaches the kernel's reserve.
+        let mut emergency = if use_reserve { self.heap.lock().charge.reserve() } else { 0 };
         for slot in frames.iter_mut().take(want) {
-            match heap_frame(use_reserve) {
-                Ok(frame) => *slot = Some(frame),
+            let may = emergency > 0;
+            match heap_frame(may) {
+                Ok((frame, from_reserve)) => {
+                    emergency -= from_reserve as u64;
+                    *slot = Some(frame)
+                }
                 Err(e) => {
                     free(&mut frames);
                     return Err(e);
@@ -1311,9 +1327,10 @@ pub fn host_grant(instance: &Instance, on: bool) {
 }
 
 /// Whether the instance `id` (`ThreadGroup::instance`) holds the host grant
-/// (false if it is gone, or there is no memory to look). With no lock held.
-pub fn host_granted(id: u64) -> bool {
-    instances(None).iter().any(|i| i.id == id && i.host.load(core::sync::atomic::Ordering::Acquire))
+/// (false if it is gone); None if there is no memory to look, which a
+/// caller deciding what to protect must take as granted. With no lock held.
+pub fn host_granted(id: u64) -> Option<bool> {
+    Some(try_instances(None)?.iter().any(|i| i.id == id && i.host.load(core::sync::atomic::Ordering::Acquire)))
 }
 
 /// Grants the console device to `instance` (None: the kernel's monitor, which
