@@ -4,9 +4,11 @@
 //! blocks stay out of the metadata until linked and `sync` flushes data
 //! before metadata; a crash at any point never exposes a deleted file's
 //! blocks; promised blocks are kept for the writes that promised them;
-//! orphans outlive a mount until `recover_orphans`; and after a crash at any point, or a
+//! orphans outlive a mount until `recover_orphans`; after a crash at any point, or a
 //! device request failing anywhere, the journal's replay leaves a filesystem e2fsck finds
-//! nothing wrong with. Needs mke2fs, e2fsck and debugfs (e2fsprogs) in PATH:
+//! nothing wrong with; and a corrupt or hostile disk is refused at mount or fails the
+//! operations that need what is corrupt (EUCLEAN), never panicking, hanging, allocating
+//! beyond the disk, or giving metadata to a file. Needs mke2fs, e2fsck and debugfs (e2fsprogs) in PATH:
 //! `nix-shell -p e2fsprogs --run "cargo test -p ext2fs"`.
 
 use ext2fs::{Device, Ext2, NewNode, ROOT_INO};
@@ -180,7 +182,7 @@ const MIB: usize = 1024 * 1024;
 /// The chunk size of the kernel's requests to diskfs.
 const CHUNK: usize = 32 * 1024;
 
-fn write_file(fs: &mut Ext2<RamDisk>, ino: u32, len: usize) {
+fn write_file<D: Device>(fs: &mut Ext2<D>, ino: u32, len: usize) {
     let mut buf = vec![0u8; CHUNK];
     for off in (0..len).step_by(CHUNK) {
         for (i, b) in buf.iter_mut().enumerate() {
@@ -190,7 +192,7 @@ fn write_file(fs: &mut Ext2<RamDisk>, ino: u32, len: usize) {
     }
 }
 
-fn check_file(fs: &mut Ext2<RamDisk>, ino: u32, len: usize) {
+fn check_file<D: Device>(fs: &mut Ext2<D>, ino: u32, len: usize) {
     let mut buf = vec![0u8; CHUNK];
     for off in (0..len).step_by(CHUNK) {
         assert_eq!(fs.read(ino, off as u64, &mut buf).unwrap(), CHUNK);
@@ -328,7 +330,7 @@ fn block_pointer(disk: &RamDisk, ino: u32, i: usize) -> usize {
 }
 
 /// A block pointer on the disk beyond the end of the filesystem (or near
-/// the end of the 32-bit range) is an I/O error, never a crash.
+/// the end of the 32-bit range) is corruption (EUCLEAN), never a crash.
 #[test]
 fn block_pointers_out_of_range_are_errors() {
     for bad in [u32::MAX, u32::MAX - 3, 1 << 30] {
@@ -342,8 +344,8 @@ fn block_pointers_out_of_range_are_errors() {
         disk.data[single..single + 4].copy_from_slice(&bad.to_le_bytes());
         let mut fs = Ext2::mount(disk).unwrap();
         let mut buf = vec![0u8; CHUNK];
-        assert_eq!(fs.read(ino, 0, &mut buf), Err(ext2fs::errno::EIO), "direct pointer {:#x}", bad);
-        assert_eq!(fs.read(ino, 16 * 1024, &mut buf), Err(ext2fs::errno::EIO), "indirect pointer {:#x}", bad);
+        assert_eq!(fs.read(ino, 0, &mut buf), Err(ext2fs::errno::EUCLEAN), "direct pointer {:#x}", bad);
+        assert_eq!(fs.read(ino, 16 * 1024, &mut buf), Err(ext2fs::errno::EUCLEAN), "indirect pointer {:#x}", bad);
         assert!(fs.write(ino, 0, &buf).is_err());
         assert!(fs.write(ino, 20 * 1024, &buf).is_err());
         assert!(fs.truncate(ino, 0).is_err() || fs.truncate(ino, 0).is_ok());
@@ -2342,4 +2344,893 @@ fn targeted_hostile_journals_end() {
     let mut disk = crashed(&fs);
     disk.lose_writes = true;
     assert!(Ext2::mount(disk).is_err());
+}
+
+// ------------------------------------------------------- corrupt and hostile disks
+
+/// Counts each thread's heap bytes and their peak, so that the corruption tests can bound
+/// what the filesystem allocates for a hostile disk (an allocation sized by a count read
+/// from the disk shows as a peak far beyond the disk's own size).
+struct CountingHeap;
+
+thread_local! {
+    /// (bytes now, peak) of this thread's allocations.
+    static HEAP: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+fn heap_count(delta: isize) {
+    // (No allocation and no destructor here: safe inside the allocator.)
+    let _ = HEAP.try_with(|h| {
+        let (now, peak) = h.get();
+        let now = (now as isize + delta).max(0) as usize;
+        h.set((now, peak.max(now)));
+    });
+}
+
+/// Starts a new peak; this thread's heap bytes now.
+fn heap_reset() -> usize {
+    HEAP.with(|h| {
+        let (now, _) = h.get();
+        h.set((now, now));
+        now
+    })
+}
+
+fn heap_peak() -> usize {
+    HEAP.with(|h| h.get().1)
+}
+
+unsafe impl std::alloc::GlobalAlloc for CountingHeap {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let p = unsafe { std::alloc::System.alloc(layout) };
+        if !p.is_null() {
+            heap_count(layout.size() as isize);
+        }
+        p
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let p = unsafe { std::alloc::System.alloc_zeroed(layout) };
+        if !p.is_null() {
+            heap_count(layout.size() as isize);
+        }
+        p
+    }
+
+    unsafe fn dealloc(&self, p: *mut u8, layout: std::alloc::Layout) {
+        unsafe { std::alloc::System.dealloc(p, layout) };
+        heap_count(-(layout.size() as isize));
+    }
+
+    unsafe fn realloc(&self, p: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
+        let q = unsafe { std::alloc::System.realloc(p, layout, size) };
+        if !q.is_null() {
+            heap_count(size as isize - layout.size() as isize);
+        }
+        q
+    }
+}
+
+#[global_allocator]
+static HEAP_COUNTER: CountingHeap = CountingHeap;
+
+fn ram(data: Vec<u8>) -> RamDisk {
+    RamDisk { data, counts: Counts::default(), fail_at: None, fail_count: 0, fail_flush: None, fail_read: None, log: None, read_only: false, lose_writes: false }
+}
+
+/// A RAM disk for corrupt filesystems: without the free invariant's checks
+/// (`Device::checks`), which a corrupt disk breaks by itself and which panic by design.
+struct Unchecked(RamDisk);
+
+impl Device for Unchecked {
+    fn read(&mut self, lba: u64, buf: &mut [u8]) -> Result<(), ()> {
+        self.0.read(lba, buf)
+    }
+
+    fn write(&mut self, lba: u64, buf: &[u8]) -> Result<(), ()> {
+        self.0.write(lba, buf)
+    }
+
+    fn flush(&mut self) -> Result<(), ()> {
+        self.0.flush()
+    }
+
+    fn now(&self) -> u32 {
+        self.0.now()
+    }
+}
+
+/// An image made by mke2fs (1 KiB blocks, 128-byte inodes) with `features` and `extra`
+/// arguments.
+fn mke2fs(name: &str, kib: usize, features: &str, extra: &[&str]) -> RamDisk {
+    let path = scratch(name);
+    let ok = Command::new("mke2fs")
+        .args(["-q", "-t", "ext2", "-b", "1024", "-I", "128", "-O", features, "-F"])
+        .args(extra)
+        .arg(&path)
+        .arg(kib.to_string())
+        .env_remove("SOURCE_DATE_EPOCH")
+        .status()
+        .expect("mke2fs not found (run under nix-shell -p e2fsprogs)")
+        .success();
+    assert!(ok, "mke2fs failed");
+    let data = std::fs::read(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    ram(data)
+}
+
+fn le16_at(data: &[u8], o: usize) -> usize {
+    u16::from_le_bytes([data[o], data[o + 1]]) as usize
+}
+
+fn le32_at(data: &[u8], o: usize) -> usize {
+    u32::from_le_bytes(data[o..o + 4].try_into().unwrap()) as usize
+}
+
+fn put32_at(data: &mut [u8], o: usize, v: u32) {
+    data[o..o + 4].copy_from_slice(&v.to_le_bytes());
+}
+
+/// The metadata of a 1 KiB-block image, read from the image itself: the blocks of each
+/// kind, and the inodes in use (number, byte offset on the disk).
+#[derive(Default)]
+struct Metadata {
+    superblocks: Vec<usize>,
+    descriptors: Vec<usize>,
+    bitmaps: Vec<usize>,
+    tables: Vec<usize>,
+    dirs: Vec<usize>,
+    indirect: Vec<usize>,
+    symlinks: Vec<usize>,
+    journal: Vec<usize>,
+    inodes: Vec<(u32, usize)>,
+}
+
+impl Metadata {
+    fn read(data: &[u8]) -> Metadata {
+        let sb = 1024;
+        let (blocks, fdb, bpg, ipg, isz) = (le32_at(data, sb + 4), le32_at(data, sb + 20), le32_at(data, sb + 32), le32_at(data, sb + 40), le16_at(data, sb + 88));
+        let groups = (blocks - fdb).div_ceil(bpg);
+        let gdt_blocks = (groups * 32).div_ceil(1024);
+        let power = |g: usize, p: usize| {
+            let mut n = p;
+            while n < g {
+                n *= p;
+            }
+            n == g
+        };
+        let mut m = Metadata::default();
+        let children = |t: usize| (0..256).map(|k| le32_at(data, t * 1024 + 4 * k)).filter(|&b| b != 0).collect::<Vec<_>>();
+        for g in 0..groups {
+            let first = fdb + g * bpg;
+            if g <= 1 || power(g, 3) || power(g, 5) || power(g, 7) {
+                m.superblocks.push(first);
+                m.descriptors.extend(first + 1..first + 1 + gdt_blocks);
+            }
+            let d = (fdb + 1) * 1024 + g * 32;
+            let (bb, ib, it) = (le32_at(data, d), le32_at(data, d + 4), le32_at(data, d + 8));
+            m.bitmaps.extend([bb, ib]);
+            m.tables.extend(it..it + (ipg * isz).div_ceil(1024));
+            for i in 0..ipg {
+                let at = it * 1024 + i * isz;
+                let ino = (g * ipg + i + 1) as u32;
+                let used = data[ib * 1024 + i / 8] & (1 << (i % 8)) != 0;
+                let mode = le16_at(data, at);
+                if mode == 0 || !used || (ino < 11 && ino != 2 && ino != 8) {
+                    continue;
+                }
+                m.inodes.push((ino, at));
+                let ptr = |k: usize| le32_at(data, at + 40 + 4 * k);
+                match mode & 0o170000 {
+                    0o040000 => m.dirs.extend((0..12).map(ptr).filter(|&b| b != 0)),
+                    0o120000 if le32_at(data, at + 28) != 0 => m.symlinks.push(ptr(0)),
+                    0o100000 => {
+                        if ino == 8 {
+                            m.journal.push(ptr(0));
+                        }
+                        for (root, depth) in [(12, 1), (13, 2), (14, 3)] {
+                            let mut level = if ptr(root) != 0 { vec![ptr(root)] } else { Vec::new() };
+                            for h in 0..depth {
+                                m.indirect.extend(&level);
+                                if h + 1 < depth {
+                                    level = level.iter().flat_map(|&t| children(t)).collect();
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        m
+    }
+
+    /// Every metadata block.
+    fn all(&self) -> Vec<usize> {
+        [&self.superblocks, &self.descriptors, &self.bitmaps, &self.tables, &self.dirs, &self.indirect, &self.symlinks, &self.journal]
+            .into_iter()
+            .flatten()
+            .copied()
+            .collect()
+    }
+}
+
+/// The image the corruption tests start from: four groups (backups in groups 1 and 3), a
+/// journal, directories of several blocks and levels, small files, a file with double
+/// indirect blocks, a sparse one with triple indirect blocks, fast and slow symlinks, a
+/// socket, and an orphan (an unlinked file still open). `crash`: the disk as a crash
+/// leaves it (the journal to replay).
+fn hostile_base(crash: bool) -> Vec<u8> {
+    let disk = mke2fs("hostile", 8 * 1024, "none,has_journal,filetype,sparse_super,large_file", &["-g", "2048", "-N", "512"]);
+    let mut fs = Ext2::mount(disk).unwrap();
+    let d = fs.create(ROOT_INO, "d", &NewNode::Dir, 0o755).unwrap();
+    let e = fs.create(d, "e", &NewNode::Dir, 0o755).unwrap();
+    let small = fs.create(ROOT_INO, "small", &NewNode::File, 0o644).unwrap();
+    fs.write(small, 0, &[7u8; 3000]).unwrap();
+    let big = fs.create(d, "big", &NewNode::File, 0o644).unwrap();
+    write_file(&mut fs, big, 320 * 1024);
+    let sparse = fs.create(e, "sparse", &NewNode::File, 0o644).unwrap();
+    fs.write(sparse, 80 * MIB as u64, b"far away").unwrap();
+    fs.create(ROOT_INO, "fast", &NewNode::Symlink("small".into()), 0).unwrap();
+    fs.create(e, "slow", &NewNode::Symlink("s".repeat(200)), 0).unwrap();
+    fs.create(ROOT_INO, "sock", &NewNode::Socket, 0o644).unwrap();
+    for i in 0..60 {
+        fs.create(d, &format!("name-{i:02}-padding"), &NewNode::File, 0o644).unwrap();
+    }
+    let open = fs.create(ROOT_INO, "open", &NewNode::File, 0o644).unwrap();
+    write_file(&mut fs, open, 32 * 1024);
+    fs.unlink(ROOT_INO, "open", false).unwrap();
+    if crash {
+        fs.create(e, "late", &NewNode::Dir, 0o755).unwrap();
+        fs.truncate(big, 100_000).unwrap();
+        return crashed(&fs).data;
+    }
+    fs.into_device().data
+}
+
+/// A value for a corrupted field: the edges, small numbers, block and inode numbers (of
+/// metadata, of the end of the filesystem), powers of two, anything.
+fn hostile_value(rng: &mut Rng, m: &Metadata, blocks: u32) -> u32 {
+    match rng.below(11) {
+        0 => 0,
+        1 => 1,
+        2 => u32::MAX,
+        3 => rng.below(16) as u32,
+        4 => blocks.wrapping_sub(rng.below(3) as u32),
+        5 => {
+            let all = m.all();
+            all[rng.below(all.len() as u64) as usize] as u32
+        }
+        6 => rng.below(blocks as u64) as u32,
+        7 => 1 << rng.below(32),
+        8 => rng.below(4096) as u32,
+        9 => m.inodes[rng.below(m.inodes.len() as u64) as usize].0,
+        _ => rng.next() as u32,
+    }
+}
+
+/// Corrupts one place of the image's metadata: an inode's field, a superblock or
+/// descriptor field, a directory entry's, an indirect pointer, a bitmap or inode table
+/// byte, a journal superblock field.
+fn corrupt(data: &mut [u8], m: &Metadata, rng: &mut Rng) {
+    let blocks = le32_at(data, 1024 + 4) as u32;
+    let pick = |rng: &mut Rng, v: &Vec<usize>| v[rng.below(v.len() as u64) as usize];
+    let v = hostile_value(rng, m, blocks);
+    // (Mostly where a mount still succeeds: inodes, directories, indirect blocks.)
+    match [0, 0, 0, 0, 1, 1, 2, 2, 3, 4, 5, 6, 7][rng.below(13) as usize] {
+        0 => {
+            let (_, at) = m.inodes[rng.below(m.inodes.len() as u64) as usize];
+            // mode, size, dtime, links, blocks, the pointers, size_high.
+            let fields = [0usize, 4, 20, 26, 28, 40, 44, 48, 84, 88, 92, 96, 108];
+            let o = at + fields[rng.below(fields.len() as u64) as usize];
+            if o == at || o == at + 26 {
+                data[o..o + 2].copy_from_slice(&(v as u16).to_le_bytes());
+            } else {
+                put32_at(data, o, v);
+            }
+        }
+        5 => {
+            let fields = [4usize, 8, 12, 16, 20, 24, 32, 40, 58, 76, 84, 88, 92, 96, 100, 224, 232];
+            let o = 1024 + fields[rng.below(fields.len() as u64) as usize];
+            if o == 1024 + 58 || o == 1024 + 88 {
+                data[o..o + 2].copy_from_slice(&(v as u16).to_le_bytes());
+            } else {
+                put32_at(data, o, v);
+            }
+        }
+        6 => {
+            let groups = m.bitmaps.len() / 2;
+            let o = 2 * 1024 + rng.below(groups as u64) as usize * 32 + [0, 4, 8, 12, 14, 16][rng.below(6) as usize];
+            if o % 32 >= 12 {
+                data[o..o + 2].copy_from_slice(&(v as u16).to_le_bytes());
+            } else {
+                put32_at(data, o, v);
+            }
+        }
+        1 => {
+            let b = pick(rng, &m.dirs);
+            let o = b * 1024 + (rng.below(1024) as usize & !3);
+            match rng.below(3) {
+                0 => put32_at(data, o, v),
+                1 => data[o + 4..o + 6].copy_from_slice(&(v as u16).to_le_bytes()),
+                _ => data[o + 6] = v as u8,
+            }
+        }
+        2 => {
+            let kind = [&m.indirect, &m.symlinks][rng.below(2) as usize];
+            let b = pick(rng, kind);
+            put32_at(data, b * 1024 + (rng.below(1024) as usize & !3), v);
+        }
+        3 | 4 => {
+            let b = pick(rng, &[&m.bitmaps[..], &m.tables[..]].concat());
+            data[b * 1024 + rng.below(1024) as usize] ^= 1 << rng.below(8);
+        }
+        _ => {
+            let b = pick(rng, &m.journal);
+            let o = b * 1024 + [12usize, 16, 20, 24, 28, 36, 40][rng.below(7) as usize];
+            data[o..o + 4].copy_from_slice(&v.to_be_bytes());
+        }
+    }
+}
+
+/// Every kind of operation on a (possibly corrupt) filesystem, errors ignored: a walk of
+/// the tree (lists, lookups, stats, reads, read maps, readlinks), creations, writes,
+/// truncations, renames and removals of new and found names, the ring path, orphans'
+/// recovery and release, commits.
+fn sweep(fs: &mut Ext2<Unchecked>, rng: &mut Rng) {
+    use ext2fs::{S_IFDIR, S_IFLNK, S_IFMT, S_IFREG};
+    let mut buf = vec![0u8; 64 * 1024];
+    let (mut dirs, mut found) = (vec![ROOT_INO], Vec::new());
+    let mut listed = 0;
+    while let Some(d) = dirs.pop() {
+        listed += 1;
+        if listed > 32 {
+            break;
+        }
+        let Ok(entries) = fs.list(d) else { continue };
+        for (name, _, _) in entries.into_iter().take(80) {
+            if name == "." || name == ".." {
+                continue;
+            }
+            let Ok(ino) = fs.lookup(d, &name) else { continue };
+            let Ok(st) = fs.stat(ino) else { continue };
+            match st.mode & S_IFMT {
+                S_IFDIR => dirs.push(ino),
+                S_IFREG => {
+                    let _ = fs.read(ino, 0, &mut buf);
+                    let _ = fs.read(ino, st.size.saturating_sub(100), &mut buf[..4096]);
+                    let _ = fs.read_map(ino, 0, 1 << 20);
+                }
+                S_IFLNK => {
+                    let _ = fs.readlink(ino);
+                }
+                _ => {}
+            }
+            found.push((d, name, ino, st.mode & S_IFMT));
+        }
+    }
+    let data: Vec<u8> = (0..70 * 1024).map(|i| i as u8).collect();
+    let found_dirs: Vec<u32> = found.iter().filter(|f| f.3 == S_IFDIR).map(|f| f.2).take(2).collect();
+    for dir in [ROOT_INO].into_iter().chain(found_dirs) {
+        if let Ok(f) = fs.create(dir, "fz", &NewNode::File, 0o644) {
+            let _ = fs.write(f, 0, &data[..3000]);
+            let _ = fs.write(f, 200 * 1024, &data);
+            let _ = fs.truncate(f, 1000);
+            let _ = fs.rename(dir, "fz", ROOT_INO, "fz2");
+        }
+        let _ = fs.create(dir, "fzd", &NewNode::Dir, 0o755);
+        let _ = fs.create(dir, "fzl", &NewNode::Symlink("x".repeat(100)), 0);
+        let _ = fs.unlink(dir, "fzd", true);
+    }
+    for (d, name, ino, kind) in found.iter().take(40) {
+        match rng.below(7) {
+            0 => {
+                let _ = fs.write(*ino, rng.below(1 << 20), &data[..1 + rng.below(8192) as usize]);
+            }
+            1 => {
+                let _ = fs.truncate(*ino, rng.below(1 << 19));
+            }
+            2 => {
+                let _ = fs.rename(*d, name, ROOT_INO, &format!("r{}", rng.below(4)));
+            }
+            3 => {
+                let keep = rng.below(2) == 0;
+                let _ = fs.unlink_unless(*d, name, *kind == S_IFDIR, |_| keep);
+            }
+            4 => {
+                let _ = fs.promise(1, *ino, 0, 8192);
+                if let Ok(r) = fs.reserve(*ino, 0, 4096) {
+                    let _ = fs.link(&r, 4096);
+                }
+                fs.forget_promises(1);
+            }
+            5 if *kind == S_IFDIR => {
+                let _ = fs.rename(ROOT_INO, "d", *ino, "moved");
+            }
+            _ => {
+                let _ = fs.set_perm(*ino, 0o600);
+            }
+        }
+    }
+    let _ = fs.recover_orphans(|_| false);
+    for o in fs.orphans() {
+        let _ = fs.release(o);
+    }
+    let _ = fs.set_in_use(true);
+    let _ = fs.sync();
+    let _ = fs.set_in_use(false);
+    let _ = fs.usage();
+}
+
+/// One corrupted image (by `seed`) mounted, swept, unmounted, mounted and swept again.
+/// Whether it mounted; panics if what the filesystem allocated went far beyond the disk.
+fn hostile_round(image: &[u8], m: &Metadata, seed: u64) -> bool {
+    let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1);
+    let mut data = image.to_vec();
+    for _ in 0..1 + rng.below(6) {
+        corrupt(&mut data, m, &mut rng);
+    }
+    let base = heap_reset();
+    let Ok(mut fs) = Ext2::mount(Unchecked(ram(data))) else { return false };
+    sweep(&mut fs, &mut rng);
+    let disk = fs.into_device();
+    if let Ok(mut fs) = Ext2::mount(disk) {
+        sweep(&mut fs, &mut rng);
+        drop(fs.into_device());
+    }
+    let peak = heap_peak() - base;
+    assert!(peak < 48 * MIB, "{} MiB allocated", peak / MIB);
+    true
+}
+
+/// Disks whose metadata was corrupted at random (superblock, group descriptors, bitmaps,
+/// inode tables, directories, indirect blocks, symlinks, the journal's superblock; clean
+/// and needing a replay), many seeds: a mount is refused or succeeds, and then no
+/// operation panics, none runs long, and the filesystem never allocates far beyond the
+/// disk's size. (`EXT2FS_HOSTILE_SEEDS` asks for more seeds.)
+#[test]
+fn corrupt_disks_never_panic_hang_or_balloon() {
+    let seeds: u64 = std::env::var("EXT2FS_HOSTILE_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(600);
+    let mut failures = Vec::new();
+    let (mut mounted, mut refused) = (0, 0);
+    let started = std::time::Instant::now();
+    for crash in [false, true] {
+        let image = std::sync::Arc::new(hostile_base(crash));
+        let m = std::sync::Arc::new(Metadata::read(&image));
+        assert!(!m.dirs.is_empty() && !m.indirect.is_empty() && !m.symlinks.is_empty() && !m.journal.is_empty());
+        for seed in 0..seeds / 2 {
+            let seed = seed * 2 + crash as u64;
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (image, m) = (image.clone(), m.clone());
+            std::thread::spawn(move || {
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hostile_round(&image, &m, seed)));
+                let _ = tx.send(r.map_err(|e| e.downcast_ref::<String>().cloned().or(e.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default()));
+            });
+            match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+                Ok(Ok(true)) => mounted += 1,
+                Ok(Ok(false)) => refused += 1,
+                Ok(Err(why)) => failures.push(format!("seed {seed}: panic: {why}")),
+                Err(_) => {
+                    failures.push(format!("seed {seed}: still running after 30 s"));
+                    break;
+                }
+            }
+        }
+    }
+    eprintln!("{mounted} mounted, {refused} refused, {:?}", started.elapsed());
+    assert!(failures.is_empty(), "{} failures:\n{}", failures.len(), failures.join("\n"));
+    // (Both happen: the operations get their share of corrupt disks.)
+    assert!(mounted > refused && refused > 0, "{mounted} mounted, {refused} refused");
+}
+
+use ext2fs::errno::{EINVAL, EMLINK, ENAMETOOLONG, ENOENT, EUCLEAN};
+
+/// Byte offset of inode `ino` on a 1 KiB-block image with 128-byte inodes.
+fn inode_offset(data: &[u8], ino: u32) -> usize {
+    let ipg = le32_at(data, 1024 + 40);
+    let g = (ino as usize - 1) / ipg;
+    let table = le32_at(data, 2 * 1024 + g * 32 + 8);
+    table * 1024 + (ino as usize - 1) % ipg * 128
+}
+
+/// Inode `ino`'s block pointer `i`.
+fn ptr_of(data: &[u8], ino: u32, i: usize) -> usize {
+    le32_at(data, inode_offset(data, ino) + 40 + 4 * i)
+}
+
+fn set_ptr(data: &mut [u8], ino: u32, i: usize, v: u32) {
+    let at = inode_offset(data, ino) + 40 + 4 * i;
+    put32_at(data, at, v);
+}
+
+/// Sets inode `ino`'s mode, or its size (low 32 bits).
+fn set_mode(data: &mut [u8], ino: u32, mode: u16) {
+    let at = inode_offset(data, ino);
+    data[at..at + 2].copy_from_slice(&mode.to_le_bytes());
+}
+
+fn set_size(data: &mut [u8], ino: u32, size: u32) {
+    let at = inode_offset(data, ino) + 4;
+    put32_at(data, at, size);
+}
+
+/// Whether the disk's superblock says the filesystem has errors (`EXT2_ERROR_FS`).
+fn disk_errors(data: &[u8]) -> bool {
+    le16_at(data, 1024 + 58) & 2 != 0
+}
+
+/// Mounts a (corrupt) image on a device without the free invariant's checks.
+fn mount_unchecked(data: Vec<u8>) -> Ext2<Unchecked> {
+    Ext2::mount(Unchecked(ram(data))).unwrap_or_else(|e| panic!("refused: {e}"))
+}
+
+/// Superblocks and group descriptors that contradict themselves or the disk are refused at
+/// mount, each by its own check: a revision we do not know, a wrong first data block, an
+/// inode count the groups do not have, a first inode among the reserved ones or beyond
+/// the inodes, descriptors that do not fit the first group, a filesystem larger than its
+/// device, bitmaps or an inode table outside their group or on each other or the
+/// descriptors, counts beyond a group, a root that is no directory, a journal larger than
+/// half the filesystem, with a block twice or in an inode table.
+#[test]
+fn inconsistent_geometry_is_refused_at_mount() {
+    let good = mkfs_journal("geometry", 4 * 1024).data;
+    assert!(Ext2::mount(ram(good.clone())).is_ok());
+    let sb = 1024;
+    let (inodes, blocks, ipg) = (le32_at(&good, sb) as u32, le32_at(&good, sb + 4) as u32, le32_at(&good, sb + 40) as u32);
+    let gd = 2 * 1024;
+    let (bb, it) = (le32_at(&good, gd) as u32, le32_at(&good, gd + 8) as u32);
+    let (journal, journal0) = (inode_offset(&good, 8), ptr_of(&good, 8, 0) as u32);
+    let root = inode_offset(&good, 2);
+    let w32 = |o: usize, v: u32| (o, v.to_le_bytes().to_vec());
+    let w16 = |o: usize, v: u16| (o, v.to_le_bytes().to_vec());
+    let outside = "corrupt group descriptor: its bitmaps or inode table are not its group's";
+    let cases: Vec<(&str, Vec<(usize, Vec<u8>)>)> = vec![
+        ("unsupported ext2 revision", vec![w32(sb + 76, 2)]),
+        ("corrupt superblock: its first data block or block count", vec![w32(sb + 20, 0)]),
+        ("corrupt superblock: the inode count does not match the groups", vec![w32(sb, inodes + ipg)]),
+        ("corrupt superblock: the first inode", vec![w32(sb + 84, 3)]),
+        ("corrupt superblock: the first inode", vec![w32(sb + 84, inodes + 1)]),
+        // Groups of 16 blocks: 256 of them, whose descriptors and one inode table do not fit
+        // 16 blocks.
+        ("corrupt superblock: the group descriptors do not fit the first group", vec![w32(sb + 32, 16), w32(sb, (blocks - 1).div_ceil(16) * ipg)]),
+        ("the filesystem is larger than the device", vec![w32(sb + 4, blocks * 2)]),
+        (outside, vec![w32(gd, 1)]),
+        (outside, vec![w32(gd, 2)]),
+        (outside, vec![w32(gd + 4, bb)]),
+        (outside, vec![w32(gd + 4, it + 1)]),
+        (outside, vec![w32(gd + 8, blocks - 4)]),
+        (outside, vec![w32(gd + 8, bb)]),
+        ("corrupt group descriptor: its counts exceed its group", vec![w16(gd + 12, u16::MAX)]),
+        ("corrupt group descriptor: its counts exceed its group", vec![w16(gd + 14, ipg as u16 + 1)]),
+        ("corrupt group descriptor: its counts exceed its group", vec![w16(gd + 16, ipg as u16 + 1)]),
+        ("corrupt root directory", vec![w16(root, 0o100644)]),
+        ("corrupt root directory", vec![w32(root + 4, 1000)]),
+        ("the journal inode is not a journal", vec![w32(journal + 4, blocks / 2 * 1024 + 1024)]),
+        ("the journal's blocks repeat", vec![w32(journal + 44, journal0)]),
+        ("cannot map the journal", vec![w32(journal + 40, it)]),
+    ];
+    for (want, patches) in cases {
+        let mut data = good.clone();
+        for (at, bytes) in &patches {
+            data[*at..*at + bytes.len()].copy_from_slice(bytes);
+        }
+        assert_eq!(Ext2::mount(ram(data)).err(), Some(want), "{patches:?}");
+    }
+}
+
+/// The superblock's free counts are the descriptors' sums (as Linux counts them): a stale
+/// one is corrected, and e2fsck finds nothing after.
+#[test]
+fn stale_superblock_counts_are_the_descriptors() {
+    let mut data = mkfs_journal("stale-counts", 4 * 1024).data;
+    let (free, free_inodes) = (le32_at(&data, 1024 + 12), le32_at(&data, 1024 + 16));
+    put32_at(&mut data, 1024 + 12, 5);
+    put32_at(&mut data, 1024 + 16, 1_000_000);
+    let mut fs = Ext2::mount(ram(data)).unwrap();
+    let (_, _, f, _, fi) = fs.usage();
+    assert_eq!((f, fi), (free as u64, free_inodes as u64));
+    let ino = fs.create(ROOT_INO, "f", &NewNode::File, 0o644).unwrap();
+    write_file(&mut fs, ino, 64 * 1024);
+    assert!(!fs.errors());
+    fsck("stale-counts", &take(fs));
+}
+
+/// An image with directory `d` holding "a", "b" and "c" (one block: ".", "..", then 12
+/// bytes each, "c" the rest), file `f` of 32 KiB (an indirect block), a fast and a slow
+/// symlink, a socket, all in the root. (disk, d, f)
+fn small_tree(name: &str) -> (Vec<u8>, u32, u32) {
+    let mut fs = Ext2::mount(mkfs_journal(name, 4 * 1024)).unwrap();
+    let d = fs.create(ROOT_INO, "d", &NewNode::Dir, 0o755).unwrap();
+    for n in ["a", "b", "c"] {
+        fs.create(d, n, &NewNode::File, 0o644).unwrap();
+    }
+    let f = fs.create(ROOT_INO, "f", &NewNode::File, 0o644).unwrap();
+    write_file(&mut fs, f, 32 * 1024);
+    fs.create(ROOT_INO, "fast", &NewNode::Symlink("abc".into()), 0).unwrap();
+    fs.create(ROOT_INO, "slow", &NewNode::Symlink("s".repeat(200)), 0).unwrap();
+    fs.create(ROOT_INO, "sock", &NewNode::Socket, 0o644).unwrap();
+    (take(fs).data, d, f)
+}
+
+/// Corrupt directories (as ext4's `ext4_check_dir_entry` and its lookup see them): a
+/// record length not a multiple of 4, too short, past the block, a name past its record,
+/// an inode number beyond the inodes or a reserved one (the journal's), a '/' in a name,
+/// a size that is no number of blocks, a hole, a block twice, a block of the inode table.
+/// Every operation on the directory fails with EUCLEAN, the rest of the filesystem works,
+/// and the disk says it has errors after.
+#[test]
+fn corrupt_directories_fail_with_euclean() {
+    let (good, d, f) = small_tree("corrupt-dirs");
+    let blk = ptr_of(&good, d, 0);
+    let entry = blk * 1024 + 24; // "a"
+    let inodes = le32_at(&good, 1024) as u32;
+    let it = le32_at(&good, 2 * 1024 + 8) as u32;
+    let cases: Vec<(&str, Box<dyn Fn(&mut Vec<u8>)>)> = vec![
+        ("record length 13", Box::new(move |b| b[entry + 4..entry + 6].copy_from_slice(&13u16.to_le_bytes()))),
+        ("record length 8", Box::new(move |b| b[entry + 4..entry + 6].copy_from_slice(&8u16.to_le_bytes()))),
+        ("record past the block", Box::new(move |b| b[entry + 4..entry + 6].copy_from_slice(&2000u16.to_le_bytes()))),
+        ("name past the record", Box::new(move |b| b[entry + 6] = 200)),
+        ("inode beyond the inodes", Box::new(move |b| put32_at(b, entry, inodes + 1))),
+        ("the journal's inode", Box::new(move |b| put32_at(b, entry, 8))),
+        ("a slash", Box::new(move |b| b[entry + 8] = b'/')),
+        ("size of no blocks", Box::new(move |b| set_size(b, d, 1500))),
+        ("a hole", Box::new(move |b| set_size(b, d, 2048))),
+        ("a block twice", Box::new(move |b| {
+            set_size(b, d, 2048);
+            set_ptr(b, d, 1, blk as u32);
+        })),
+        ("the inode table", Box::new(move |b| set_ptr(b, d, 0, it))),
+    ];
+    for (what, corrupt) in cases {
+        let mut data = good.clone();
+        corrupt(&mut data);
+        let mut fs = mount_unchecked(data);
+        assert_eq!(fs.list(d).err(), Some(EUCLEAN), "{what}: list");
+        assert_eq!(fs.lookup(d, "b").err(), Some(EUCLEAN), "{what}: lookup");
+        assert_eq!(fs.create(d, "new", &NewNode::File, 0o644).err(), Some(EUCLEAN), "{what}: create");
+        assert!(fs.unlink(ROOT_INO, "d", true).is_err(), "{what}: rmdir");
+        assert!(fs.errors(), "{what}");
+        // The rest works.
+        assert!(fs.list(ROOT_INO).is_ok(), "{what}");
+        let g = fs.create(ROOT_INO, "g", &NewNode::File, 0o644).unwrap();
+        fs.write(g, 0, b"fine").unwrap();
+        let mut buf = vec![0u8; 32 * 1024];
+        assert_eq!(fs.read(f, 0, &mut buf).unwrap(), buf.len(), "{what}");
+        let data = fs.into_device().0.data;
+        assert!(disk_errors(&data), "{what}: the disk does not say it has errors");
+        let fs = mount_unchecked(data);
+        assert!(fs.errors());
+    }
+}
+
+/// A name of a freed inode (its bitmap bit clear) is corruption: lookups and an unlink
+/// fail with EUCLEAN, and nothing is freed a second time.
+#[test]
+fn a_name_of_a_freed_inode_frees_nothing() {
+    let (mut data, _, f) = small_tree("freed-name");
+    let ib = le32_at(&data, 2 * 1024 + 4);
+    data[ib * 1024 + (f as usize - 1) / 8] &= !(1 << ((f - 1) % 8));
+    let mut fs = mount_unchecked(data);
+    let free = fs.usage().2;
+    assert_eq!(fs.lookup(ROOT_INO, "f").err(), Some(EUCLEAN));
+    assert_eq!(fs.unlink(ROOT_INO, "f", false).err(), Some(EUCLEAN));
+    assert_eq!(fs.rename(ROOT_INO, "fast", ROOT_INO, "f").err(), Some(EUCLEAN));
+    assert_eq!(fs.check(f).err(), Some(ENOENT));
+    assert_eq!(fs.usage().2, free);
+    assert!(fs.errors());
+}
+
+/// Block pointers into the system zone (an inode table, a bitmap): reads and writes through
+/// them fail with EUCLEAN, and removing the file frees the rest of its blocks but never
+/// those (the filesystem stays usable).
+#[test]
+fn pointers_into_metadata_are_never_followed() {
+    let (mut data, _, f) = small_tree("system-zone");
+    let (bb, it) = (le32_at(&data, 2 * 1024) as u32, le32_at(&data, 2 * 1024 + 8) as u32);
+    set_ptr(&mut data, f, 0, it);
+    set_ptr(&mut data, f, 12, bb);
+    let mut fs = mount_unchecked(data);
+    let mut buf = vec![0u8; 1024];
+    assert_eq!(fs.read(f, 0, &mut buf).err(), Some(EUCLEAN));
+    assert_eq!(fs.read(f, 13 * 1024, &mut buf).err(), Some(EUCLEAN));
+    assert_eq!(fs.write(f, 0, &buf).err(), Some(EUCLEAN));
+    assert_eq!(fs.read_map(f, 0, 1024).err(), Some(EUCLEAN));
+    let free = fs.usage().2;
+    fs.unlink_unless(ROOT_INO, "f", false, |_| false).unwrap();
+    // Its 11 other direct blocks; not the inode table's, the bitmap, or what was below it.
+    assert_eq!(fs.usage().2, free + 11);
+    assert!(fs.errors());
+    let g = fs.create(ROOT_INO, "g", &NewNode::File, 0o644).unwrap();
+    write_file(&mut fs, g, 64 * 1024);
+    let disk = fs.into_device().0;
+    let mut fs = mount_unchecked(disk.data);
+    check_file(&mut fs, g, 64 * 1024);
+    assert!(fs.list(ROOT_INO).unwrap().iter().any(|(n, _, _)| n == "slow"));
+}
+
+/// Bitmaps that say a block of the system zone (an inode table's), a reserved inode (the
+/// journal's) or an inode in use is free: allocations skip the group (as ext4 marks its
+/// bitmap corrupt) and go elsewhere, so no file gets metadata or another file's inode.
+#[test]
+fn lying_bitmaps_give_out_no_metadata_and_no_inode_in_use() {
+    let disk = mke2fs("lying-bitmaps", 8 * 1024, "none,has_journal,filetype,sparse_super,large_file", &["-g", "2048", "-N", "512"]);
+    let mut fs = Ext2::mount(disk).unwrap();
+    let f = fs.create(ROOT_INO, "f", &NewNode::File, 0o644).unwrap();
+    let h = fs.create(ROOT_INO, "h", &NewNode::File, 0o644).unwrap();
+    write_file(&mut fs, h, 32 * 1024);
+    let good = take(fs).data;
+    let (bb, ib, it) = (le32_at(&good, 2 * 1024), le32_at(&good, 2 * 1024 + 4), le32_at(&good, 2 * 1024 + 8));
+    // Group 0's first inode table block (group-relative bit) free, and inode 8 or f.
+    for free in [8, f] {
+        let mut data = good.clone();
+        let bit = it - 1;
+        data[bb * 1024 + bit / 8] &= !(1 << (bit % 8));
+        data[ib * 1024 + (free as usize - 1) / 8] &= !(1 << ((free - 1) % 8));
+        let mut fs = mount_unchecked(data);
+        let g = fs.create(ROOT_INO, "g", &NewNode::File, 0o644).unwrap();
+        assert!(g != free && g >= 11, "inode {g} given out");
+        // h (in group 0) grows: its new blocks come from elsewhere.
+        let mut buf = vec![0u8; CHUNK];
+        for off in (32 * 1024..96 * 1024).step_by(CHUNK) {
+            buf.iter_mut().enumerate().for_each(|(i, b)| *b = pattern(off + i));
+            fs.write(h, off as u64, &buf).unwrap();
+        }
+        let (_, extents) = fs.read_map(h, 0, 96 * 1024).unwrap();
+        for e in extents {
+            let disk = e.disk.expect("written");
+            assert!(!(disk..disk + e.len).contains(&(it as u64 * 1024)), "the inode table given out");
+        }
+        assert!(fs.errors());
+        let disk = fs.into_device().0;
+        let mut fs = mount_unchecked(disk.data);
+        check_file(&mut fs, h, 96 * 1024);
+        assert_eq!(fs.stat(f).unwrap().mode, 0o100644);
+        assert!(fs.lookup(ROOT_INO, "g").is_ok());
+    }
+}
+
+/// Indirect blocks shared at every level (a triple indirect block whose pointers all lead
+/// to one double one, whose pointers all lead to one single one, whose pointers all lead
+/// to one block): removing the file takes linear time, not 256³ steps; a directory whose
+/// size says 4 GiB through shared tables ends at the first repeat.
+#[test]
+fn shared_indirect_blocks_take_linear_time() {
+    let mut fs = Ext2::mount(mkfs_journal("shared-tables", 8 * 1024)).unwrap();
+    let s = fs.create(ROOT_INO, "s", &NewNode::File, 0o644).unwrap();
+    fs.write(s, 80 * MIB as u64, b"far away").unwrap();
+    let f = fs.create(ROOT_INO, "f", &NewNode::File, 0o644).unwrap();
+    write_file(&mut fs, f, 32 * 1024);
+    let d = fs.create(ROOT_INO, "d", &NewNode::Dir, 0o755).unwrap();
+    let mut data = take(fs).data;
+    let below = |data: &[u8], t: usize| (0..256).map(|k| le32_at(data, t * 1024 + 4 * k)).find(|&b| b != 0).unwrap() as u32;
+    let t3 = ptr_of(&data, s, 14);
+    let t2 = below(&data, t3);
+    let t1 = below(&data, t2 as usize);
+    let x = below(&data, t1 as usize);
+    for (table, to) in [(t3, t2), (t2 as usize, t1), (t1 as usize, x)] {
+        for k in 0..256 {
+            put32_at(&mut data, table * 1024 + 4 * k, to);
+        }
+    }
+    // d: f's direct blocks, then f's indirect block whose pointers all lead to one block.
+    for i in 1..13 {
+        let p = ptr_of(&data, f, i) as u32;
+        set_ptr(&mut data, d, i, p);
+    }
+    let fi = ptr_of(&data, f, 12);
+    let first = le32_at(&data, fi * 1024) as u32;
+    for k in 0..256 {
+        put32_at(&mut data, fi * 1024 + 4 * k, first);
+    }
+    set_size(&mut data, d, u32::MAX & !1023);
+    let mut fs = mount_unchecked(data);
+    let (started, reads) = (std::time::Instant::now(), fs.device().0.counts.reads);
+    assert_eq!(fs.list(d).err(), Some(EUCLEAN));
+    fs.unlink_unless(ROOT_INO, "s", false, |_| false).unwrap();
+    // (A freed table read again for each pointer to it: 65 536 reads of the single one.)
+    let reads = fs.device().0.counts.reads - reads;
+    assert!(reads < 100, "{reads} reads");
+    assert!(started.elapsed() < std::time::Duration::from_secs(5), "{:?}", started.elapsed());
+    assert!(fs.errors());
+}
+
+/// A device's block pointers hold its number, not blocks: removing a device inode frees
+/// nothing (here its "pointer" is another file's block, which stays that file's).
+#[test]
+fn removing_a_device_frees_no_blocks() {
+    let (mut data, _, f) = small_tree("device");
+    let mut fs = mount_unchecked(data.clone());
+    let sock = fs.lookup(ROOT_INO, "sock").unwrap();
+    drop(fs);
+    set_mode(&mut data, sock, 0o020644);
+    let block = ptr_of(&data, f, 0) as u32;
+    set_ptr(&mut data, sock, 0, block);
+    let mut fs = mount_unchecked(data);
+    let free = fs.usage().2;
+    fs.unlink_unless(ROOT_INO, "sock", false, |_| false).unwrap();
+    assert_eq!(fs.usage().2, free);
+    let g = fs.create(ROOT_INO, "g", &NewNode::File, 0o644).unwrap();
+    write_file(&mut fs, g, 32 * 1024);
+    check_file(&mut fs, f, 32 * 1024);
+    assert!(!fs.errors());
+    fsck("device", &fs.into_device().0);
+}
+
+/// Symlinks whose size does not fit their form are corrupt; a slow one without its block
+/// too. A new symlink's target is shorter than a block (as Linux and e2fsck want).
+#[test]
+fn symlink_sizes_are_checked() {
+    let (good, _, _) = small_tree("symlinks");
+    let mut fs = mount_unchecked(good.clone());
+    let (fast, slow) = (fs.lookup(ROOT_INO, "fast").unwrap(), fs.lookup(ROOT_INO, "slow").unwrap());
+    assert_eq!(fs.readlink(slow).unwrap(), "s".repeat(200));
+    assert_eq!(fs.create(ROOT_INO, "long", &NewNode::Symlink("l".repeat(1024)), 0).err(), Some(ENAMETOOLONG));
+    let l = fs.create(ROOT_INO, "long", &NewNode::Symlink("l".repeat(1023)), 0).unwrap();
+    assert_eq!(fs.readlink(l).unwrap().len(), 1023);
+    drop(fs);
+    let cases: [(&str, u32, fn(&mut Vec<u8>, u32)); 3] = [
+        ("fast, 100 bytes", fast, |b, i| set_size(b, i, 100)),
+        ("slow, a block's", slow, |b, i| set_size(b, i, 1024)),
+        ("slow, no block", slow, |b, i| set_ptr(b, i, 0, 0)),
+    ];
+    for (what, ino, corrupt) in cases {
+        let mut data = good.clone();
+        corrupt(&mut data, ino);
+        let mut fs = mount_unchecked(data);
+        assert_eq!(fs.readlink(ino).err(), Some(EUCLEAN), "{what}");
+        assert!(fs.errors(), "{what}");
+    }
+}
+
+/// Names a directory entry cannot hold are refused (empty, '/', NUL), and a directory with
+/// `LINK_MAX` links takes no subdirectory (EMLINK), neither made nor moved in.
+#[test]
+fn names_and_link_counts_are_bounded() {
+    let (mut data, d, _) = small_tree("names");
+    let root = inode_offset(&data, ROOT_INO);
+    data[root + 26..root + 28].copy_from_slice(&ext2fs::LINK_MAX.to_le_bytes());
+    let mut fs = mount_unchecked(data);
+    assert_eq!(fs.create(ROOT_INO, "", &NewNode::File, 0o644).err(), Some(ENOENT));
+    assert_eq!(fs.create(ROOT_INO, "a/b", &NewNode::File, 0o644).err(), Some(EINVAL));
+    assert_eq!(fs.create(ROOT_INO, "a\0b", &NewNode::File, 0o644).err(), Some(EINVAL));
+    assert_eq!(fs.rename(ROOT_INO, "f", ROOT_INO, "x/y").err(), Some(EINVAL));
+    assert_eq!(fs.create(ROOT_INO, "sub", &NewNode::Dir, 0o755).err(), Some(EMLINK));
+    fs.create(ROOT_INO, "file", &NewNode::File, 0o644).unwrap();
+    fs.create(d, "sub", &NewNode::Dir, 0o755).unwrap();
+    assert_eq!(fs.rename(d, "sub", ROOT_INO, "sub").err(), Some(EMLINK));
+    assert!(!fs.errors());
+}
+
+/// A directory without ".." cannot be moved (its ".." is to be set): EUCLEAN, and nothing
+/// moved.
+#[test]
+fn a_directory_without_dotdot_is_not_moved() {
+    let (mut data, d, _) = small_tree("dotdot");
+    let blk = ptr_of(&data, d, 0);
+    data[blk * 1024 + 12 + 8] = b'x';
+    let mut fs = mount_unchecked(data);
+    let e = fs.create(ROOT_INO, "e", &NewNode::Dir, 0o755).unwrap();
+    assert_eq!(fs.rename(ROOT_INO, "d", e, "d").err(), Some(EUCLEAN));
+    assert_eq!(fs.lookup(ROOT_INO, "d"), Ok(d));
+    assert_eq!(fs.lookup(e, "d").err(), Some(ENOENT));
+}
+
+/// A directory whose next block (past its size) is another file's: a new name that needs
+/// a new block fails (EUCLEAN) instead of writing over that block.
+#[test]
+fn a_directory_never_grows_onto_a_block_past_its_end() {
+    let (mut data, d, f) = small_tree("past-end");
+    let block = ptr_of(&data, f, 0) as u32;
+    set_ptr(&mut data, d, 1, block);
+    let mut fs = mount_unchecked(data);
+    let long = |i: usize| format!("{i}{}", "n".repeat(199));
+    let mut failed = None;
+    for i in 0..8 {
+        if let Err(e) = fs.create(d, &long(i), &NewNode::File, 0o644) {
+            failed = Some(e);
+            break;
+        }
+    }
+    assert_eq!(failed, Some(EUCLEAN));
+    check_file(&mut fs, f, 32 * 1024);
 }
