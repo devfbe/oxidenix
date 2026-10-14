@@ -359,6 +359,17 @@ pub fn install_in(room: Room, id: u64, file: File, flags: u32) -> Result<i64, i6
     install_into(room.0, id, file, flags, None)
 }
 
+/// `install_in` of a file with readiness, whose watch `watch` (for `id`) the caller made
+/// with the room (a FIFO's end, which may wait for a partner before it is installed):
+/// without a descriptor the watch goes again.
+pub fn install_in_watched(room: Room, id: u64, file: File, flags: u32, watch: Arc<crate::poll::Watch>) -> Result<i64, i64> {
+    let r = install_into(room.0, id, file, flags, Some(watch.clone()));
+    if r.is_err() {
+        crate::poll::forget(id, &watch);
+    }
+    r
+}
+
 /// File `id` changed its readiness (now `ready`), or had an event that
 /// counts as an edge for EPOLLET (new data, room): its pollers and epoll
 /// interests hear of it. Each file reports under its own lock, so reports
@@ -401,7 +412,8 @@ pub fn data_of(fd: u64) -> Option<Arc<DataOpen>> {
 }
 
 /// What a descriptor of the server's that keeps its origin (a terminal, a pty's master,
-/// null or zero, an O_PATH descriptor) was opened by; None for other descriptors.
+/// null or zero, a FIFO's end, an O_PATH descriptor) was opened by; None for other
+/// descriptors.
 pub struct OriginOf {
     pub path: alloc::string::String,
     /// The node's file type (`S_IFMT` bits).
@@ -424,6 +436,7 @@ impl OriginOf {
             File::Dev(d) => &d.origin,
             File::Kmsg(k) => &k.origin,
             File::Path(p) => &p.origin,
+            File::Pipe(end) => end.named().expect("only a FIFO's end").origin(),
             _ => unreachable!("only files with an origin"),
         }
     }
@@ -438,6 +451,7 @@ pub fn origin_of_file(f: &FileRef) -> Option<OriginOf> {
     let file = f.file.clone();
     let o_path = match &file {
         File::Tty(_) | File::PtyMaster(_) | File::Dev(_) | File::Kmsg(_) => false,
+        File::Pipe(end) if end.named().is_some() => false,
         File::Path(_) => true,
         _ => return None,
     };
@@ -464,7 +478,7 @@ pub fn proc_of(fd: u64) -> Option<Arc<crate::procfile::ProcOpen>> {
 /// The status of an open file.
 pub fn stat_file(file: &File) -> Result<vfs::stat::Stat, i64> {
     let bytes = match file {
-        File::Pipe(end) => end.stat(),
+        File::Pipe(end) => end.stat()?,
         File::EventFd(e) => e.stat(),
         File::Tmp(t) => return Ok(t.inode.status()),
         File::Data(d) => crate::datafs::stat(&d.inode)?,

@@ -68,6 +68,8 @@ const SYS_LCHOWN: u64 = 94;
 const SYS_FCHOWNAT: u64 = 260;
 const SYS_FCHMODAT2: u64 = 452;
 const SYS_UMASK: u64 = 95;
+const SYS_MKNOD: u64 = 133;
+const SYS_MKNODAT: u64 = 259;
 const SYS_STATFS: u64 = 137;
 const SYS_UTIMES: u64 = 235;
 const SYS_OPENAT: u64 = 257;
@@ -121,6 +123,8 @@ pub fn handle(s: &State) -> Option<i64> {
         SYS_RMDIR => unlinkat(CWD, a0, AT_REMOVEDIR),
         SYS_UNLINK => unlinkat(CWD, a0, 0),
         SYS_UNLINKAT => unlinkat(a0, a1, a2),
+        SYS_MKNOD => mknodat(CWD, a0, a1 as u32, a2),
+        SYS_MKNODAT => mknodat(a0, a1, a2 as u32, a3),
         SYS_SYMLINK => symlinkat(a0, CWD, a1),
         SYS_SYMLINKAT => symlinkat(a0, a1, a2),
         SYS_READLINK => readlinkat(CWD, a0, a1, a2),
@@ -238,33 +242,36 @@ fn create(dir: &Node, name: &str, kind: u64, perm: u32) -> Result<Node, i64> {
 
 /// The program `path` names (relative to the absolute directory `base`; `follow`: a
 /// symlink as the last name is followed, else ELOOP), opened for execve (`exec`): a handle
-/// on its file object that holds it (nobody may write it while it runs: ETXTBSY), and its
-/// absolute path.
-pub fn exec_open(base: &str, path: &str, follow: bool) -> Result<(u64, String), i64> {
+/// on its file object that holds it (nobody may write it while it runs: ETXTBSY), and the
+/// node with its absolute path (what /proc/<pid>/exe leads to).
+pub fn exec_open(base: &str, path: &str, follow: bool) -> Result<(u64, Origin), i64> {
     let r = resolve(base, path, follow)?;
-    exec_node(&r.node, join(&r.path)?)
+    let path = join(&r.path)?;
+    exec_node(r.node, path)
 }
 
 /// The program a descriptor names (execveat with AT_EMPTY_PATH).
-pub fn exec_open_fd(fd: u64) -> Result<(u64, String), i64> {
+pub fn exec_open_fd(fd: u64) -> Result<(u64, Origin), i64> {
     let (node, path) = fd_node(fd)?;
-    exec_node(&node, path)
+    exec_node(node, path)
 }
 
-fn exec_node(node: &Node, path: String) -> Result<(u64, String), i64> {
+fn exec_node(node: Node, path: String) -> Result<(u64, Origin), i64> {
     const EACCES: i64 = 13;
     let mode = mode_of(&node.stat()?);
+    // (From here on let go of as an open file's node, `Origin`'s drop.)
+    let origin = Origin::new(node, path, mode);
     if mode & vfs::S_IFMT == vfs::S_IFLNK {
         return Err(ELOOP);
     }
     crate::exec::check_mode(mode)?;
-    let held = match node {
+    let held = match &origin.node {
         Node::Tmp(t) => tmpfile::exec_hold(t)?,
         Node::Data(d) => datafile::exec_hold(d)?,
         // /proc and /sys hold no programs.
         Node::Proc(_) => return Err(EACCES),
     };
-    Ok((held, path))
+    Ok((held, origin))
 }
 
 /// The directory a relative path of an *at call (execveat) starts from.
@@ -369,6 +376,15 @@ fn open_node(resolved: Resolved, flags: u32) -> Result<i64, i64> {
             (1, 11) => crate::kmsg::open(flags, origin),
             _ => crate::tty::open_device(rdev, flags, origin).unwrap_or(Err(crate::tty::ENXIO)),
         };
+    }
+    match resolved.mode & vfs::S_IFMT {
+        // A FIFO opens an end of the pipe its node keeps (`fifo`). (A pipe a magic link
+        // of /proc led to is `procfile`'s: another end of that pipe.)
+        vfs::S_IFIFO if !matches!(resolved.node, Node::Proc(_)) => return crate::fifo::open(resolved.node, flags, abs),
+        // The server drives no block device: none has a driver (Linux's blkdev_open
+        // without a disk of the number). O_DIRECTORY is ENOTDIR.
+        vfs::S_IFBLK => return Err(if flags & O_DIRECTORY != 0 { ENOTDIR } else { crate::tty::ENXIO }),
+        _ => {}
     }
     match resolved.node {
         Node::Tmp(t) => tmpfile::open(t, flags, abs),
@@ -563,6 +579,75 @@ fn mkdirat(dirfd: u64, addr: u64, mode: u32) -> Result<i64, i64> {
     create(&dir.node, &name, NEW_DIR, perm)?;
     inotify::child(&dir.node, inotify::IN_CREATE, &name, true);
     Ok(0)
+}
+
+/// mknod(path, mode, dev) and mknodat(dirfd, path, mode, dev): a regular file (type 0 or
+/// `S_IFREG`), a FIFO, a character or block device or a socket's name (an inode nothing
+/// is bound to: connecting is ECONNREFUSED), with `mode`'s permissions less the umask, on
+/// tmpfs or /data. As Linux's do_mknodat: the type is checked first (a directory's is
+/// EPERM, an unknown one EINVAL), then the name (EEXIST, also for a dangling symlink;
+/// ENOENT, ENOTDIR; a trailing slash on a new name ENOENT), then the filesystem's leave
+/// (/data read-only: EROFS; /proc's lookups fail a new name with ENOENT; /sys and devpts
+/// make no nodes: EPERM, /sys EACCES for a regular file). Everyone is root (CAP_MKNOD): devices may be made. `dev` is an unsigned
+/// int, Linux's new encoding (`new_decode_dev`: 12 bits of major, 20 of minor), which is
+/// `st_rdev`'s for those numbers; FIFOs, sockets and files ignore it.
+fn mknodat(dirfd: u64, addr: u64, mode: u32, dev: u64) -> Result<i64, i64> {
+    use datafs::New;
+    use tmpfs::Special;
+    let rdev = dev & 0xffff_ffff;
+    let kind = mode & vfs::S_IFMT;
+    match kind {
+        0 | vfs::S_IFREG | vfs::S_IFIFO | vfs::S_IFCHR | vfs::S_IFBLK | vfs::S_IFSOCK => {}
+        vfs::S_IFDIR => return Err(EPERM),
+        _ => return Err(EINVAL),
+    }
+    let path = read_cstr(addr)?;
+    // A mount point exists.
+    let (dir, name) = resolve_parent(&base_dir(dirfd, &path)?, &path).map_err(|e| if e == EBUSY { EEXIST } else { e })?;
+    // A new name with a trailing slash asks for a directory (Linux's filename_create).
+    if path.ends_with('/') {
+        return Err(if resolve(&base_dir(dirfd, &path)?, &path, false).is_ok() { EEXIST } else { ENOENT });
+    }
+    let perm = mode & !umask_now() & 0o7777;
+    match (&dir.node, kind) {
+        // /proc's lookups fail a missing name (ENOENT) before anything is asked of the
+        // directory; /sys has neither create nor mknod.
+        (Node::Proc(p), _) if crate::procfs::lookup(p, &name).is_ok() => return Err(EEXIST),
+        (Node::Proc(p), _) if !crate::procfs::same_fs(p, &crate::procfs::root(true)) => return Err(ENOENT),
+        (Node::Proc(_), 0 | vfs::S_IFREG) => return Err(EACCES),
+        (Node::Proc(_), _) => return Err(EPERM),
+        (_, 0 | vfs::S_IFREG) => {
+            create(&dir.node, &name, NEW_FILE, perm)?;
+        }
+        (Node::Tmp(d), vfs::S_IFSOCK) => {
+            d.socket(&name, perm).map_err(sealed_eperm)?;
+        }
+        (Node::Tmp(d), _) => {
+            let special = match kind {
+                vfs::S_IFIFO => Special::Fifo,
+                vfs::S_IFCHR => Special::Char(rdev),
+                _ => Special::Block(rdev),
+            };
+            d.special(&name, special, perm).map_err(sealed_eperm)?;
+        }
+        (Node::Data(d), _) => {
+            let new = match kind {
+                vfs::S_IFIFO => New::Fifo,
+                vfs::S_IFCHR => New::CharDev(rdev),
+                vfs::S_IFBLK => New::BlockDev(rdev),
+                _ => New::Socket,
+            };
+            datafs::create(d, &name, new, perm)?;
+        }
+    }
+    inotify::child(&dir.node, inotify::IN_CREATE, &name, false);
+    Ok(0)
+}
+
+/// A tmpfs directory whose names only the server makes (devpts) refuses a create with
+/// EACCES, a mknod with EPERM (Linux's devpts has neither).
+fn sealed_eperm(e: i64) -> i64 {
+    if e == EACCES { EPERM } else { e }
 }
 
 fn unlinkat(dirfd: u64, addr: u64, flags: u64) -> Result<i64, i64> {
@@ -837,6 +922,10 @@ fn truncate(node: &Node, len: u64) -> Result<i64, i64> {
         Node::Data(d) => {
             if d.kind == vfs::S_IFDIR {
                 return Err(datafs::EISDIR);
+            }
+            // (Linux's vfs_truncate: a FIFO, a socket or a device is EINVAL before EROFS.)
+            if d.kind != vfs::S_IFREG {
+                return Err(EINVAL);
             }
             datafs::writable()?;
             datafs::get_write(d)?;

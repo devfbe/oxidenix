@@ -28,6 +28,7 @@ mod epoll;
 mod eventfd;
 mod exec;
 mod fdtable;
+mod fifo;
 mod files;
 mod fsclient;
 mod futex;
@@ -276,6 +277,11 @@ fn dispatch(s: &mut State) -> i64 {
         TEST_TREE_WAIT => syscall(TEST_TREE_WAIT, [s.rdi, s.rsi, 0, 0, 0, 0]),
         TEST_TREE_KILL => syscall(TEST_TREE_KILL, [s.rdi, 0, 0, 0, 0, 0]),
         TEST_HEAP_STATS => test(s.rax, s.rdi),
+        // The kernel's to answer, for the thread's key.
+        TEST_PI_WEIGHT if test_mode() => match process::key_of(s.rdi as u32) {
+            Some(key) => syscall(TEST_PI_WEIGHT, [key, 0, 0, 0, 0, 0]),
+            None => -3,
+        },
         // Not offered, as by a Linux built without io_uring: libuv (and
         // so Node.js) probes io_uring_setup at start and uses epoll
         // instead. Answered here, so the kernel does not log them as

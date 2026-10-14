@@ -64,6 +64,9 @@ pub fn exit_thread(status: i32) -> ! {
     if ctid != 0 && uaccess::write(ctid, 0u32).is_ok() {
         let _ = futex::wake_one(ctid);
     }
+    // The PI locks it owns go to their top waiters, which learn of its death
+    // (Linux's exit_pi_state_list); none is attached to it any more.
+    futex::pi::release_all(me, true);
     // Shared state goes before interrupts are disabled.
     let server = with_current(|p| p.server.take());
     drop(server);

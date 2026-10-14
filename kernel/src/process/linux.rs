@@ -1860,11 +1860,17 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
         }
         SYS_CLOCK_READ => super::clock::read(a[0]).map(|ns| ns as i64),
         // On the program's memory (in this view, below 64 TiB).
-        SYS_FUTEX_WAIT | SYS_FUTEX_WAKE | SYS_FUTEX_REQUEUE => {
+        SYS_FUTEX_WAIT | SYS_FUTEX_WAKE | SYS_FUTEX_REQUEUE | SYS_FUTEX_WAKE_OP | SYS_FUTEX_OWNER_DIED => {
             if is_pager() {
                 return Err(EPERM);
             }
             super::native::futex_call(nr, a)
+        }
+        SYS_FUTEX_LOCK_PI..=SYS_FUTEX_CMP_REQUEUE_PI => {
+            if !serves_program() {
+                return Err(EPERM);
+            }
+            pi_call(&instance, nr, a)
         }
         SYS_THREAD_FS => {
             use x86_64::registers::model_specific::FsBase;
@@ -2084,6 +2090,8 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             let old = t.nice.load(core::sync::atomic::Ordering::Relaxed);
             if a[1] != 0 {
                 t.nice.store((a[2] as i64).clamp(-20, 19) as i8, core::sync::atomic::Ordering::Relaxed);
+                // What it lends the owner of a PI lock it waits for changed.
+                super::futex::pi::nice_changed(&t);
             }
             Ok(old as i64 + 20)
         }
@@ -2152,6 +2160,13 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
                 return Err(ENOSYS);
             }
             super::futex::test_watch(a[0], a[1] != 0)
+        }
+        TEST_PI_WEIGHT => {
+            if !crate::TEST_MODE.load(core::sync::atomic::Ordering::Relaxed) {
+                return Err(ENOSYS);
+            }
+            let t = thread_by_key(&instance, a[0])?;
+            Ok(super::sched::effective_weight(&t) as i64)
         }
         TEST_TREE_START => {
             if !crate::TEST_MODE.load(core::sync::atomic::Ordering::Relaxed) {
@@ -2354,6 +2369,47 @@ fn thread_by_key(instance: &Instance, key: u64) -> Result<Arc<super::task::Task>
     instance.task_of(key).ok_or(ESRCH)
 }
 
+/// The PI lock calls (`restricted::SYS_FUTEX_LOCK_PI` to
+/// `SYS_FUTEX_CMP_REQUEUE_PI`) on the program's memory: the owner the
+/// server names goes by its thread's key (0: none).
+fn pi_call(instance: &Instance, nr: u64, a: [u64; 6]) -> SysResult {
+    use super::futex::pi;
+    let owner = |id: u64, key: u64| pi::Owner { id: id as u32, task: if key == 0 { None } else { instance.task_of(key) } };
+    let deadline = |d: u64| (d != 0).then_some(d);
+    match nr {
+        SYS_FUTEX_LOCK_PI => {
+            let (addr, id, owner_id, owner_key, at, flags) = (a[0], a[1] as u32, a[2], a[3], a[4], a[5]);
+            if flags & !(FUTEX_PRIVATE | FUTEX_TRY) != 0 || owner_id > PI_ID_MASK as u64 {
+                return Err(EINVAL);
+            }
+            pi::lock(addr, id, owner(owner_id, owner_key), deadline(at), flags & FUTEX_PRIVATE != 0, flags & FUTEX_TRY != 0)
+        }
+        SYS_FUTEX_UNLOCK_PI => {
+            if a[2] & !FUTEX_PRIVATE != 0 {
+                return Err(EINVAL);
+            }
+            pi::unlock(a[0], a[1] as u32, a[2] & FUTEX_PRIVATE != 0)
+        }
+        SYS_FUTEX_WAIT_REQUEUE_PI => {
+            let (addr, val, at, addr2, id, flags) = (a[0], a[1] as u32, a[2], a[3], a[4] as u32, a[5]);
+            if flags & !FUTEX_PRIVATE != 0 {
+                return Err(EINVAL);
+            }
+            pi::wait_requeue_pi(addr, val, deadline(at), addr2, id, flags & FUTEX_PRIVATE != 0)
+        }
+        SYS_FUTEX_CMP_REQUEUE_PI => {
+            let (addr, n_move, addr2, val, owner_key, flags) = (a[0], a[1], a[2], a[3] as u32, a[4], a[5]);
+            // The owner's id rides in the flags' high half.
+            let (flags, owner_id) = (flags & 0xffff_ffff, flags >> 32);
+            if flags & !FUTEX_PRIVATE != 0 || owner_id > PI_ID_MASK as u64 {
+                return Err(EINVAL);
+            }
+            pi::cmp_requeue_pi(addr, n_move, addr2, val, owner(owner_id, owner_key), flags & FUTEX_PRIVATE != 0)
+        }
+        _ => Err(ENOSYS),
+    }
+}
+
 /// The process behind the handle `handle`.
 fn container(instance: &Instance, handle: u64) -> Result<Arc<Container>, i64> {
     match instance.object(handle)? {
@@ -2480,6 +2536,10 @@ fn process_call(instance: &Arc<Instance>, nr: u64, a: [u64; 6]) -> SysResult {
                     out.pages = mem.pages.load(Relaxed);
                     out.virt_pages = mem.virt_pages.load(Relaxed);
                     out.peak_pages = mem.peak_pages.load(Relaxed);
+                    out.virt_peak = mem.virt_peak.load(Relaxed);
+                    out.exec_pages = mem.exec_pages.load(Relaxed);
+                    out.stack_pages = mem.stack_pages.load(Relaxed);
+                    out.data_pages = mem.data_pages.load(Relaxed);
                 }
                 out.peak_pages = out.peak_pages.max(info.peak_pages);
                 out.threads = info.threads.len() as u64;
@@ -2664,6 +2724,9 @@ fn exec_space(instance: &Arc<Instance>, exe: u64, name: u64, len: u64) -> SysRes
     if ctid != 0 && super::uaccess::write(ctid, 0u32).is_ok() {
         let _ = super::futex::wake_one(ctid);
     }
+    // The PI locks it owns go to their waiters, as at an exit
+    // (futex_exec_release; the robust list was the server's to walk).
+    super::futex::pi::release_all(me, false);
     {
         let mut info = me.group.info.lock();
         let old_name = core::mem::replace(&mut info.name, name);

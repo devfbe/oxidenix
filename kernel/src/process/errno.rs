@@ -22,6 +22,7 @@ pub const EFBIG: i64 = 27;
 pub const ENOSPC: i64 = 28;
 pub const EPIPE: i64 = 32;
 pub const ERANGE: i64 = 34;
+pub const EDEADLK: i64 = 35;
 pub const ENAMETOOLONG: i64 = 36;
 pub const ENOSYS: i64 = 38;
 pub const ENODATA: i64 = 61;

@@ -122,7 +122,7 @@ pub fn futex_call(nr: u64, a: [u64; 6]) -> SysResult {
             }
             super::futex::wake(addr, n, bitset, flags & FUTEX_PRIVATE != 0)
         }
-        _ => {
+        SYS_FUTEX_REQUEUE => {
             let (addr, n_wake, n_move, addr2, val, flags) = (a[0], a[1], a[2], a[3], a[4] as u32, a[5]);
             if flags & !(FUTEX_PRIVATE | FUTEX_CMP) != 0 {
                 return Err(EINVAL);
@@ -130,6 +130,21 @@ pub fn futex_call(nr: u64, a: [u64; 6]) -> SysResult {
             let cmp = (flags & FUTEX_CMP != 0).then_some(val);
             super::futex::requeue(addr, n_wake, n_move, addr2, cmp, flags & FUTEX_PRIVATE != 0)
         }
+        SYS_FUTEX_WAKE_OP => {
+            let (addr, n, addr2, n2, op, flags) = (a[0], a[1], a[2], a[3], a[4] as u32, a[5]);
+            if flags & !FUTEX_PRIVATE != 0 {
+                return Err(EINVAL);
+            }
+            super::futex::wake_op(addr, n, addr2, n2, op, flags & FUTEX_PRIVATE != 0)
+        }
+        SYS_FUTEX_OWNER_DIED => {
+            let (addr, id, flags) = (a[0], a[1] as u32, a[2]);
+            if flags & !(FUTEX_PI | FUTEX_PENDING) != 0 {
+                return Err(EINVAL);
+            }
+            super::futex::owner_died(addr, id, flags & FUTEX_PI != 0, flags & FUTEX_PENDING != 0)
+        }
+        _ => Err(ENOSYS),
     }
 }
 

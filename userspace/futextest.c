@@ -1,6 +1,7 @@
 /* futex(2): waiting and waking on private and shared words, timeouts,
- * bitsets, requeueing and interruption by signals. Uses processes with
- * shared memory, so it works without threads. */
+ * bitsets, requeueing, FUTEX_WAKE_OP and interruption by signals. Uses
+ * processes with shared memory, so it works without threads (the PI
+ * operations and robust lists are pitest's). */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <linux/futex.h>
@@ -133,6 +134,64 @@ int main(void) {
     }
     check("FUTEX_CMP_REQUEUE fails with EAGAIN on a changed value", stale == -1 && stale_errno == EAGAIN);
     check("FUTEX_CMP_REQUEUE wakes one and moves one", moved == 2 && left == 0 && on_f2 == 1 && ok);
+
+    /* FUTEX_WAKE_OP: f2 changes as one step with the wakes; the waiters of
+     * f2 are woken only if its old value passes the comparison. */
+    *f1 = 0;
+    *f2 = 0;
+    *counter = 0;
+    for (int i = 0; i < 2; i++) {
+        kids[i] = fork();
+        if (kids[i] == 0) {
+            __atomic_add_fetch(counter, 1, __ATOMIC_SEQ_CST);
+            long r = futex(i == 0 ? f1 : f2, FUTEX_WAIT, 0, NULL, NULL, 0);
+            _exit(r == 0 ? 0 : 1);
+        }
+    }
+    await_sleepers(counter, 2);
+    n = futex(f1, FUTEX_WAKE_OP, 1, (void *)1, f2, FUTEX_OP(FUTEX_OP_SET, 5, FUTEX_OP_CMP_EQ, 0));
+    ok = 1;
+    for (int i = 0; i < 2; i++) {
+        waitpid(kids[i], &st, 0);
+        ok = ok && WIFEXITED(st) && WEXITSTATUS(st) == 0;
+    }
+    check("FUTEX_WAKE_OP sets the word and wakes on both (old == 0)", n == 2 && *f2 == 5 && ok);
+    *counter = 0;
+    kids[0] = fork();
+    if (kids[0] == 0) {
+        __atomic_add_fetch(counter, 1, __ATOMIC_SEQ_CST);
+        struct timespec t = {0, 300 * 1000 * 1000};
+        long r = futex(f2, FUTEX_WAIT, 5, &t, NULL, 0);
+        _exit(r == -1 && errno == ETIMEDOUT ? 0 : 1);
+    }
+    await_sleepers(counter, 1);
+    n = futex(f1, FUTEX_WAKE_OP, 1, (void *)1, f2, FUTEX_OP(FUTEX_OP_ADD, 1, FUTEX_OP_CMP_GT, 10));
+    waitpid(kids[0], &st, 0);
+    check("FUTEX_WAKE_OP adds, and wakes nobody on a failed comparison", n == 0 && *f2 == 6 && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    n = futex(f1, FUTEX_WAKE_OP, 1, (void *)1, f2, FUTEX_OP(FUTEX_OP_OR | FUTEX_OP_OPARG_SHIFT, 3, FUTEX_OP_CMP_EQ, 0));
+    check("FUTEX_WAKE_OP with FUTEX_OP_OPARG_SHIFT ors in 1 << 3", n == 0 && *f2 == 14);
+    n = futex(f1, FUTEX_WAKE_OP, 1, (void *)1, f2, FUTEX_OP(FUTEX_OP_ADD, 0xfff, FUTEX_OP_CMP_EQ, 0));
+    check("FUTEX_WAKE_OP's operand is a signed 12-bit field (-1)", n == 0 && *f2 == 13);
+    n = futex(f1, FUTEX_WAKE_OP, 1, (void *)1, f2, FUTEX_OP(FUTEX_OP_ANDN, 1, FUTEX_OP_CMP_NE, 13));
+    check("FUTEX_WAKE_OP clears with FUTEX_OP_ANDN", n == 0 && *f2 == 12);
+    n = futex(f1, FUTEX_WAKE_OP, 1, (void *)1, f2, FUTEX_OP(FUTEX_OP_XOR, 0xf, FUTEX_OP_CMP_LE, 12));
+    check("FUTEX_WAKE_OP flips with FUTEX_OP_XOR", n == 0 && *f2 == 3);
+    n = futex(f1, FUTEX_WAKE_OP, 1, (void *)1, f2, 7u << 28);
+    check("FUTEX_WAKE_OP with an unknown operation: ENOSYS", n == -1 && errno == ENOSYS && *f2 == 3);
+    n = futex(f1, FUTEX_WAKE_OP, 1, (void *)1, (uint32_t *)8, FUTEX_OP(FUTEX_OP_SET, 1, FUTEX_OP_CMP_EQ, 0));
+    check("FUTEX_WAKE_OP on an unmapped word: EFAULT", n == -1 && errno == EFAULT);
+    volatile uint32_t *ro = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    n = futex(f1, FUTEX_WAKE_OP, 1, (void *)1, ro, FUTEX_OP(FUTEX_OP_SET, 1, FUTEX_OP_CMP_EQ, 0));
+    check("FUTEX_WAKE_OP on a read-only word: EFAULT", n == -1 && errno == EFAULT && *ro == 0);
+    static uint32_t cow = 1;
+    child = fork();
+    if (child == 0) {
+        /* A private word after fork: the change breaks copy-on-write. */
+        long r = futex(&cow, FUTEX_WAKE_OP_PRIVATE, 1, (void *)1, &cow, FUTEX_OP(FUTEX_OP_ADD, 1, FUTEX_OP_CMP_EQ, 0));
+        _exit(r == 0 && cow == 2 ? 0 : 1);
+    }
+    waitpid(child, &st, 0);
+    check("FUTEX_WAKE_OP on a copy-on-write word changes only the child's", WIFEXITED(st) && WEXITSTATUS(st) == 0 && cow == 1);
 
     printf("futextest: %s\n", failures ? "FAILED" : "all passed");
     return failures;

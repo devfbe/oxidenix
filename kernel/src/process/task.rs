@@ -23,7 +23,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, AtomicI8, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI8, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 pub use crate::memory::kstack::KernelStack;
 
@@ -233,6 +233,15 @@ pub struct Task {
     /// it waits in (a requeue may move it).
     pub futex_woken: AtomicBool,
     pub futex_bucket: AtomicUsize,
+    /// Priority inheritance (`futex::pi`, written under its lock): the
+    /// largest weight of the tasks waiting, directly or along a chain, for
+    /// the PI locks it owns (0: none; the scheduler runs it with this weight
+    /// if it is more than its own), where its own wait for one stands
+    /// (`futex::pi::NONE`, `QUEUED`, `GRANTED`, ...), and whether it ended
+    /// (no lock is attached to it any more).
+    pub pi_weight: AtomicU32,
+    pub pi_wait: AtomicU8,
+    pub pi_gone: AtomicBool,
     /// Timer ticks that found it in user mode and in the kernel: they
     /// split its exactly measured run time into user and system time.
     pub utime: AtomicU64,
@@ -287,6 +296,9 @@ impl Task {
             wake_lock: IrqSpinLock::new(()),
             futex_woken: AtomicBool::new(false),
             futex_bucket: AtomicUsize::new(0),
+            pi_weight: AtomicU32::new(0),
+            pi_wait: AtomicU8::new(0),
+            pi_gone: AtomicBool::new(false),
             utime: AtomicU64::new(0),
             stime: AtomicU64::new(0),
             run_seq: AtomicU64::new(0),

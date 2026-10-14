@@ -200,15 +200,25 @@ pub fn pid_stat(p: &Process, m: &Machine, l: &Linux) -> String {
     )
 }
 
-/// /proc/<pid>/statm: size resident shared text lib data dt (pages).
+/// /proc/<pid>/statm: size resident shared text lib data dt (pages), as
+/// Linux's task_statm: text is the program's code (`text_pages`), data its
+/// private writable memory and its stacks; lib and dt are always 0. (The
+/// resident pages are not split by file and anonymous: shared is 0.)
 pub fn pid_statm(p: &Process) -> String {
-    format!("{} {} 0 0 0 {} 0\n", p.virt_pages, p.pages, p.pages)
+    format!("{} {} 0 {} 0 {} 0\n", p.virt_pages, p.pages, p.text_pages, p.data_pages + p.stack_pages)
 }
 
-/// /proc/<pid>/status: the fields programs read, in Linux's order. (The
-/// kernel keeps no split of the address space by kind, so VmData, VmStk,
-/// VmExe and VmLib are not shown, nor the context switches it does not
-/// count per thread.)
+/// The program's code and the other executable memory (libraries, an
+/// interpreter, JIT code), in pages: Linux's VmExe (the code's span, at
+/// most what is mapped executable) and VmLib (the rest).
+fn exe_and_lib(p: &Process) -> (u64, u64) {
+    let exe = p.text_pages.min(p.exec_pages);
+    (exe, p.exec_pages - exe)
+}
+
+/// /proc/<pid>/status: the fields programs read, in Linux's order. (Not
+/// shown: VmPTE, and the context switches the kernel does not count per
+/// thread.)
 pub fn pid_status(p: &Process, m: &Machine, l: &Linux) -> String {
     let state = match p.state as u8 {
         STATE_RUNNING => "R (running)",
@@ -218,6 +228,7 @@ pub fn pid_status(p: &Process, m: &Machine, l: &Linux) -> String {
         _ => "? (unknown)",
     };
     let kb = |pages: u64| pages * m.page_size / 1024;
+    let (exe, lib) = exe_and_lib(p);
     let mut out = format!("Name:\t{}\n", name(p));
     if let Some(umask) = l.umask {
         let _ = writeln!(out, "Umask:\t{umask:04o}");
@@ -227,7 +238,8 @@ pub fn pid_status(p: &Process, m: &Machine, l: &Linux) -> String {
         "State:\t{state}\nTgid:\t{tgid}\nNgid:\t0\nPid:\t{pid}\nPPid:\t{ppid}\nTracerPid:\t0\n\
          Uid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nFDSize:\t256\nGroups:\t\nNStgid:\t{tgid}\nNSpid:\t{pid}\nNSpgid:\t{pgid}\nNSsid:\t{sid}\n\
          VmPeak:\t{peak:>8} kB\nVmSize:\t{virt:>8} kB\nVmLck:\t       0 kB\nVmPin:\t       0 kB\nVmHWM:\t{hwm:>8} kB\n\
-         VmRSS:\t{rss:>8} kB\nRssAnon:\t{rss:>8} kB\nRssFile:\t       0 kB\nRssShmem:\t       0 kB\nVmSwap:\t       0 kB\n\
+         VmRSS:\t{rss:>8} kB\nRssAnon:\t{rss:>8} kB\nRssFile:\t       0 kB\nRssShmem:\t       0 kB\n\
+         VmData:\t{data:>8} kB\nVmStk:\t{stack:>8} kB\nVmExe:\t{exe:>8} kB\nVmLib:\t{lib:>8} kB\nVmSwap:\t       0 kB\n\
          Threads:\t{threads}\nSigPnd:\t{pnd:016x}\nShdPnd:\t{shd:016x}\nSigBlk:\t{blk:016x}\nSigIgn:\t{ign:016x}\nSigCgt:\t{cgt:016x}\n\
          CapInh:\t0000000000000000\nCapPrm:\t{caps:016x}\nCapEff:\t{caps:016x}\nCapBnd:\t{caps:016x}\nCapAmb:\t0000000000000000\n\
          Cpus_allowed_list:\t{cpus}\n",
@@ -240,6 +252,10 @@ pub fn pid_status(p: &Process, m: &Machine, l: &Linux) -> String {
         virt = kb(p.virt_pages),
         hwm = kb(p.peak_pages.max(p.pages)),
         rss = kb(p.pages),
+        data = kb(p.data_pages),
+        stack = kb(p.stack_pages),
+        exe = kb(exe),
+        lib = kb(lib),
         threads = p.threads,
         pnd = p.sig_pending,
         shd = p.sig_shared,

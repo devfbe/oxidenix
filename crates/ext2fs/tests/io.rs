@@ -1071,6 +1071,72 @@ fn socket_inodes() {
     fsck("socket-gone", &take(fs));
 }
 
+/// FIFOs and devices (mknod(2) on /data): inodes without data, listed with their types,
+/// a device's number kept as Linux's ext2 keeps it (the old encoding for numbers below
+/// 256, the new one beyond), which debugfs reads back and whose nodes made by debugfs read
+/// here; renames keep the type, e2fsck finds nothing wrong, and they go like files.
+#[test]
+fn fifos_and_device_nodes() {
+    use ext2fs::dev_make;
+    let mut fs = Ext2::mount(mkfs("special", 1024)).unwrap();
+    let nodes = [
+        ("fifo", NewNode::Fifo, 0o010640, 0, 5u8),
+        ("null", NewNode::CharDev(dev_make(1, 3)), 0o020640, dev_make(1, 3), 3),
+        ("sda", NewNode::BlockDev(dev_make(8, 300)), 0o060640, dev_make(8, 300), 4),
+        ("wide", NewNode::CharDev(dev_make(4095, (1 << 20) - 1)), 0o020640, dev_make(4095, (1 << 20) - 1), 3),
+        ("loop", NewNode::BlockDev(dev_make(259, 7)), 0o060640, dev_make(259, 7), 4),
+    ];
+    let mut inos = Vec::new();
+    for (name, kind, mode, rdev, _) in &nodes {
+        let ino = fs.create(ROOT_INO, name, kind, 0o640).unwrap();
+        let st = fs.stat(ino).unwrap();
+        assert_eq!((st.mode, st.size, st.links, st.rdev), (*mode, 0, 1, *rdev), "{name}");
+        // No data: reads, writes and truncations are refused.
+        assert_eq!(fs.read(ino, 0, &mut [0u8; 16]), Err(22), "{name}");
+        assert_eq!(fs.write(ino, 0, b"x").map(|_| ()), Err(22), "{name}");
+        assert_eq!(fs.truncate(ino, 100), Err(22), "{name}");
+        inos.push(ino);
+    }
+    // Numbers ext2 cannot keep.
+    assert_eq!(fs.create(ROOT_INO, "big-major", &NewNode::CharDev(dev_make(4096, 0)), 0o600), Err(22));
+    assert_eq!(fs.create(ROOT_INO, "big-minor", &NewNode::BlockDev(dev_make(1, 1 << 20)), 0o600), Err(22));
+    assert_eq!(fs.lookup(ROOT_INO, "big-major"), Err(2));
+    assert_eq!(fs.create(ROOT_INO, "null", &NewNode::Fifo, 0o600), Err(17));
+    fs.rename(ROOT_INO, "fifo", ROOT_INO, "moved").unwrap();
+    let listed = fs.list(ROOT_INO).unwrap();
+    for ((name, _, _, _, ftype), ino) in nodes.iter().zip(&inos) {
+        let name = if *name == "fifo" { "moved" } else { name };
+        let entry = listed.iter().find(|e| e.0 == name).expect("listed");
+        assert_eq!((entry.1, entry.2), (*ino, *ftype), "{name}");
+    }
+    fs.sync().unwrap();
+    let disk = take(fs);
+    fsck("special", &disk);
+    // debugfs reads the numbers as Linux would, and makes nodes this reads back.
+    let (data, out) = debugfs(&disk.data, "special-debugfs", "stat null\nstat sda\nstat wide\nstat moved\nmknod dfifo p\nmknod dchr c 10 200\nmknod dblk b 300 5\n");
+    for want in ["major/minor number: 01:03", "major/minor number: 08:300", "major/minor number: 4095:1048575", "Type: FIFO"] {
+        assert!(out.contains(want), "debugfs: no '{want}' in {out}");
+    }
+    let disk = RamDisk { data, ..disk };
+    fsck("special-debugfs", &disk);
+    let mut fs = Ext2::mount(disk).unwrap();
+    for (name, mode, rdev) in [("dfifo", 0o010000, 0), ("dchr", 0o020000, dev_make(10, 200)), ("dblk", 0o060000, dev_make(300, 5))] {
+        let ino = fs.lookup(ROOT_INO, name).unwrap();
+        let st = fs.stat(ino).unwrap();
+        assert_eq!((st.mode & 0o170000, st.rdev), (mode, rdev), "{name}");
+    }
+    // They go like files: nothing of theirs is taken for a block.
+    let free_before = fs.usage().2;
+    for name in ["moved", "null", "sda", "wide", "loop", "dfifo", "dchr", "dblk"] {
+        for gone in fs.unlink(ROOT_INO, name, false).unwrap() {
+            fs.release(gone).unwrap();
+        }
+    }
+    assert_eq!(fs.usage().2, free_before);
+    fs.sync().unwrap();
+    fsck("special-gone", &take(fs));
+}
+
 #[test]
 fn orphans_outlive_a_mount_kept_on_restart_and_freed_at_boot() {
     let mut fs = Ext2::mount(mkfs("orphans", 16 * 1024)).unwrap();
@@ -2558,7 +2624,7 @@ impl Metadata {
 /// The image the corruption tests start from: four groups (backups in groups 1 and 3), a
 /// journal, directories of several blocks and levels, small files, a file with double
 /// indirect blocks, a sparse one with triple indirect blocks, fast and slow symlinks, a
-/// socket, and an orphan (an unlinked file still open). `crash`: the disk as a crash
+/// socket, a FIFO and devices, and an orphan (an unlinked file still open). `crash`: the disk as a crash
 /// leaves it (the journal to replay).
 fn hostile_base(crash: bool) -> Vec<u8> {
     let disk = mke2fs("hostile", 8 * 1024, "none,has_journal,filetype,sparse_super,large_file", &["-g", "2048", "-N", "512"]);
@@ -2574,6 +2640,12 @@ fn hostile_base(crash: bool) -> Vec<u8> {
     fs.create(ROOT_INO, "fast", &NewNode::Symlink("small".into()), 0).unwrap();
     fs.create(e, "slow", &NewNode::Symlink("s".repeat(200)), 0).unwrap();
     fs.create(ROOT_INO, "sock", &NewNode::Socket, 0o644).unwrap();
+    // A FIFO, and devices whose numbers in the block pointers would read as block numbers
+    // (259 and 2049, in use; the new encoding's (8,300), 0x10082c, beyond the disk).
+    fs.create(ROOT_INO, "fifo", &NewNode::Fifo, 0o644).unwrap();
+    fs.create(ROOT_INO, "null", &NewNode::CharDev(ext2fs::dev_make(1, 3)), 0o644).unwrap();
+    fs.create(e, "sda1", &NewNode::BlockDev(ext2fs::dev_make(8, 1)), 0o644).unwrap();
+    fs.create(e, "wide", &NewNode::BlockDev(ext2fs::dev_make(8, 300)), 0o644).unwrap();
     for i in 0..60 {
         fs.create(d, &format!("name-{i:02}-padding"), &NewNode::File, 0o644).unwrap();
     }

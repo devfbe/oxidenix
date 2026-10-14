@@ -1,9 +1,11 @@
 //! Futexes: sleeping on a word of user memory, the mechanism under every
 //! pthread mutex, condition variable and join. Linux's futex(2) is the
 //! Linux server's (its operations, timeouts and restarts); the kernel
-//! offers waiting, waking and requeueing by key (`restricted::SYS_FUTEX_*`,
-//! for a Linux program's memory through its server and for a native
-//! server's own), and the server's own words (`server_wait`).
+//! offers waiting, waking, requeueing and wake-op by key
+//! (`restricted::SYS_FUTEX_*`, for a Linux program's memory through its
+//! server and for a native server's own), the owner-died marking of a
+//! robust list's word, priority-inheritance locks (`pi`), and the server's
+//! own words (`server_wait`).
 //!
 //! A futex is identified by a key: for private futexes (and futexes in
 //! private memory) the address space and the address, for futexes in shared
@@ -54,6 +56,8 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+pub mod pi;
+
 const FUTEX_BITSET_MATCH_ANY: u32 = u32::MAX;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -88,6 +92,11 @@ struct Waiter {
     /// must not take a server thread off it, and a vectored wait finds its
     /// entries again only where it put them.
     movable: bool,
+    /// A wait of `futex_wait_requeue_pi`: the PI lock it is to be moved to
+    /// (`pi::Target`). Only `pi::cmp_requeue_pi` takes it off its word: a
+    /// plain wake, wake-op or requeue that meets it is EINVAL (as Linux's,
+    /// which keeps the two operations paired).
+    requeue_pi: Option<pi::Target>,
 }
 
 enum Sleeper {
@@ -356,7 +365,7 @@ fn wait_on(
                 }
                 me.futex_woken.store(false, Ordering::Relaxed);
                 me.futex_bucket.store(index, Ordering::Relaxed);
-                b.push(Waiter { key, sleeper: Sleeper::Task(current_arc()), bitset, seq: next_seq(), movable });
+                b.push(Waiter { key, sleeper: Sleeper::Task(current_arc()), bitset, seq: next_seq(), movable, requeue_pi: None });
                 drop(b);
                 // (The old buffer, after the lock, before the sleep.)
                 drop(core::mem::take(&mut spare));
@@ -481,7 +490,165 @@ pub fn wake(uaddr: u64, n: u64, bitset: u32, private: bool) -> Result<i64, i64> 
         return Err(EINVAL);
     }
     let (key, _) = key_of(uaddr, private)?;
+    // A wait of `futex_wait_requeue_pi` on the word is for a requeue only.
+    if BUCKETS_[bucket_of(&key)].lock().iter().any(|w| w.key == key && w.requeue_pi.is_some()) {
+        return Err(EINVAL);
+    }
     Ok(wake_key(&key, n, bitset) as i64)
+}
+
+/// Linux's FUTEX_OP encoding of `futex_wake_op`'s change and comparison.
+const OP_SET: u32 = 0;
+const OP_ADD: u32 = 1;
+const OP_OR: u32 = 2;
+const OP_ANDN: u32 = 3;
+const OP_XOR: u32 = 4;
+/// The operand is `1 << oparg`.
+const OP_ARG_SHIFT: u32 = 8;
+
+/// `restricted::SYS_FUTEX_WAKE_OP`: changes the word at `uaddr2` by `op`
+/// and wakes up to `n` waiters of `uaddr` and, if the old value passes
+/// `op`'s comparison, up to `n2` of `uaddr2`, with both words' buckets
+/// locked throughout (as Linux's futex_wake_op: no wait on either word
+/// comes between the change and the wakes). The change is a
+/// compare-and-swap loop on the program's memory that never resolves a
+/// fault under the locks: a page that cannot be written now is faulted in
+/// with them released, and the whole step tried again.
+pub fn wake_op(uaddr: u64, n: u64, uaddr2: u64, n2: u64, op: u32, private: bool) -> Result<i64, i64> {
+    let (k1, _) = key_of(uaddr, private)?;
+    let (k2, _) = key_of(uaddr2, private)?;
+    let kind = (op >> 28) & 7;
+    let cmp = (op >> 24) & 15;
+    // 12-bit signed fields.
+    let mut oparg = (((op >> 12) & 0xfff) << 20) as i32 >> 20;
+    let cmparg = ((op & 0xfff) << 20) as i32 >> 20;
+    if op >> 28 & OP_ARG_SHIFT != 0 {
+        // (Linux takes an out-of-range shift modulo 32.)
+        oparg = 1i32.wrapping_shl(oparg as u32 & 31);
+    }
+    let apply = |old: u32| -> u32 {
+        let arg = oparg as u32;
+        match kind {
+            OP_SET => arg,
+            OP_ADD => old.wrapping_add(arg),
+            OP_OR => old | arg,
+            OP_ANDN => old & !arg,
+            _ => old ^ arg,
+        }
+    };
+    if kind > OP_XOR {
+        return Err(ENOSYS);
+    }
+    let (i1, i2) = (bucket_of(&k1), bucket_of(&k2));
+    // The woken tasks' references, dropped after the locks (room reserved
+    // with them released, declared first: dropped after the guards).
+    let mut out: Vec<Arc<Task>> = Vec::new();
+    loop {
+        let mut first = BUCKETS_[i1.min(i2)].lock();
+        let mut second = (i1 != i2).then(|| BUCKETS_[i1.max(i2)].lock());
+        let (b1, b2): (&mut Vec<Waiter>, Option<&mut Vec<Waiter>>) = match second.as_mut() {
+            None => (&mut *first, None),
+            Some(s) if i1 < i2 => (&mut *first, Some(&mut **s)),
+            Some(s) => (&mut **s, Some(&mut *first)),
+        };
+        let (requeue_pi, entries) = {
+            let mine = |b: &Vec<Waiter>, k: &Key| b.iter().filter(|w| w.key == *k).count();
+            let pi_waiter = |b: &Vec<Waiter>, k: &Key| b.iter().any(|w| w.key == *k && w.requeue_pi.is_some());
+            let b2r: &Vec<Waiter> = match &b2 {
+                Some(b) => b,
+                None => b1,
+            };
+            (pi_waiter(b1, &k1) || pi_waiter(b2r, &k2), mine(b1, &k1) + mine(b2r, &k2))
+        };
+        if requeue_pi {
+            return Err(EINVAL);
+        }
+        if out.capacity() < entries {
+            drop(second);
+            drop(first);
+            out.try_reserve_exact(entries).map_err(|_| ENOMEM)?;
+            continue;
+        }
+        // The change, as one compare-and-swap of the value it read.
+        let old = match uaccess::read_u32_atomic(uaddr2) {
+            Some(old) => old,
+            None => {
+                drop(second);
+                drop(first);
+                uaccess::fault_in_writable(uaddr2)?;
+                continue;
+            }
+        };
+        match uaccess::cmpxchg_u32_atomic(uaddr2, old, apply(old)) {
+            Some(v) if v == old => {}
+            // Changed meanwhile by the program: again.
+            Some(_) => continue,
+            None => {
+                drop(second);
+                drop(first);
+                uaccess::fault_in_writable(uaddr2)?;
+                continue;
+            }
+        }
+        let old = old as i32;
+        let pass = match cmp {
+            0 => old == cmparg,
+            1 => old != cmparg,
+            2 => old < cmparg,
+            3 => old <= cmparg,
+            4 => old > cmparg,
+            5 => old >= cmparg,
+            // (As Linux: the change is made, the comparison is refused.)
+            _ => return Err(ENOSYS),
+        };
+        let (mut woken, _) = wake_in(b1, &k1, n, FUTEX_BITSET_MATCH_ANY, u64::MAX, &mut out);
+        if pass {
+            let b2 = match b2 {
+                Some(b) => b,
+                None => b1,
+            };
+            woken += wake_in(b2, &k2, n2, FUTEX_BITSET_MATCH_ANY, u64::MAX, &mut out).0;
+        }
+        return Ok(woken as i64);
+    }
+}
+
+/// `restricted::SYS_FUTEX_OWNER_DIED`: the owner `id` of the robust lock at
+/// `uaddr` died holding it (Linux's handle_futex_death, for the Linux
+/// server's walk of a dead thread's robust list): the owner bits give way
+/// to `PI_OWNER_DIED` (`PI_WAITERS` kept), and a lock that is no PI lock
+/// wakes a waiter, by the word's shared key. (A PI lock's waiters are
+/// handed the lock when the owner's task ends, `pi::release_all`.)
+/// `pending`: the list's pending entry, whose non-PI word of 0 (an unlock
+/// cut short) wakes a waiter too. Whether it marked the word.
+pub fn owner_died(uaddr: u64, id: u32, pi: bool, pending: bool) -> Result<i64, i64> {
+    use restricted::{PI_ID_MASK, PI_OWNER_DIED, PI_WAITERS};
+    if uaddr % 4 != 0 {
+        return Err(EINVAL);
+    }
+    loop {
+        let word = uaccess::read::<u32>(uaddr)?;
+        // (Wakes that find a requeue's waiter wake nothing, as Linux's.)
+        if pending && !pi && word == 0 {
+            let _ = wake(uaddr, 1, FUTEX_BITSET_MATCH_ANY, false);
+            return Ok(0);
+        }
+        if word & PI_ID_MASK != id {
+            return Ok(0);
+        }
+        match uaccess::cmpxchg_u32_atomic(uaddr, word, (word & PI_WAITERS) | PI_OWNER_DIED) {
+            Some(v) if v == word => {}
+            Some(_) => continue,
+            None => {
+                uaccess::fault_in_writable(uaddr)?;
+                continue;
+            }
+        }
+        if !pi && word & PI_WAITERS != 0 {
+            let _ = wake(uaddr, 1, FUTEX_BITSET_MATCH_ANY, false);
+        }
+        return Ok(1);
+    }
 }
 
 /// Wakes up to `n_wake` waiters of `uaddr` and moves up to `n_move` more
@@ -517,6 +684,10 @@ pub fn requeue(uaddr: u64, n_wake: u64, n_move: u64, uaddr2: u64, cmp: Option<u3
             Some(s) if i1 < i2 => (&mut *first, Some(&mut **s)),
             Some(s) => (&mut **s, Some(&mut *first)),
         };
+        // A wait for a PI requeue is `pi::cmp_requeue_pi`'s only.
+        if src.iter().any(|w| w.key == from && w.requeue_pi.is_some()) {
+            return Err(EINVAL);
+        }
         let entries = src.iter().filter(|w| w.key == from).count();
         if out.capacity() < entries {
             drop(second);
@@ -651,7 +822,7 @@ pub fn server_waitv(words: &[WaitWord], deadline: Option<u64>, ends: Ends) -> Re
             early = Some(EAGAIN);
             break;
         }
-        b.push(Waiter { key: w.key, sleeper: Sleeper::Task(current_arc()), bitset: FUTEX_BITSET_MATCH_ANY, seq: next_seq(), movable: false });
+        b.push(Waiter { key: w.key, sleeper: Sleeper::Task(current_arc()), bitset: FUTEX_BITSET_MATCH_ANY, seq: next_seq(), movable: false, requeue_pi: None });
         queued += 1;
         drop(b);
         drop(core::mem::take(&mut spare));
@@ -742,7 +913,7 @@ pub fn object_watch(
     }
     let armed = |w: &Waiter| w.key == key && matches!(&w.sleeper, Sleeper::Watch(_, p) if *p == pid);
     if !b.iter().any(armed) {
-        b.push(Waiter { key, sleeper: Sleeper::Watch(doorbell.clone(), pid), bitset: FUTEX_BITSET_MATCH_ANY, seq: next_seq(), movable: false });
+        b.push(Waiter { key, sleeper: Sleeper::Watch(doorbell.clone(), pid), bitset: FUTEX_BITSET_MATCH_ANY, seq: next_seq(), movable: false, requeue_pi: None });
     }
     Ok(0)
 }
@@ -781,7 +952,7 @@ pub fn test_watch(uaddr: u64, arm: bool) -> Result<i64, i64> {
             spare = spare_for(len, 1)?;
             continue;
         }
-        b.push(Waiter { key, sleeper: Sleeper::Watch(d.clone(), super::current_pid()), bitset: FUTEX_BITSET_MATCH_ANY, seq: next_seq(), movable: false });
+        b.push(Waiter { key, sleeper: Sleeper::Watch(d.clone(), super::current_pid()), bitset: FUTEX_BITSET_MATCH_ANY, seq: next_seq(), movable: false, requeue_pi: None });
         *slot = Some((d, key));
         return Ok(b.iter().filter(|w| w.key == key).count() as i64);
     }
