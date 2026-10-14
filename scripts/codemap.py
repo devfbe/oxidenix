@@ -36,7 +36,8 @@ SUMMARY_LEN = 220
 
 
 def tracked_files():
-    out = subprocess.run(["git", "ls-files"], cwd=ROOT, capture_output=True, text=True, check=True).stdout
+    # (--deduplicate: during a merge an unmerged file is listed once per stage.)
+    out = subprocess.run(["git", "ls-files", "--deduplicate"], cwd=ROOT, capture_output=True, text=True, check=True).stdout
     return [p for p in out.splitlines() if (ROOT / p).is_file()]
 
 
