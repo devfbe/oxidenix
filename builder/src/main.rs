@@ -323,7 +323,9 @@ fn qemu(firmware: Firmware, img: &Path, data_disk: &Path, read_only: bool, test_
     while io::BufRead::read_until(&mut serial, b'\n', &mut line).is_ok_and(|n| n > 0) {
         let _ = out.write_all(&line).and_then(|_| out.flush());
         let text = String::from_utf8_lossy(&line);
-        if text.starts_with("[autorun] ") && !text.starts_with("[autorun] running") {
+        // (The tree's own end, with its final write-back, may come before
+        // the monitor's word on the script: from the scripts' last line.)
+        if text.starts_with("=== summary:") || text.starts_with("[autorun] ") && !text.starts_with("[autorun] running") {
             ended = true;
         } else if ended && SHUTDOWN_COMPLAINTS.iter().any(|c| text.contains(c)) && complaint.is_none() {
             complaint = Some(text.trim_end().to_string());
