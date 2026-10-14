@@ -6,12 +6,6 @@ done, delete it here in the same commit.
 
 ## Filesystem hardening
 
-- **Sequence after replay** (`crates/ext2fs` `replay`): Linux skips one transaction id after
-  recovery; we continue at the scan's next sequence, so only the v1 checksum separates a torn
-  old transaction of the same id at the new log start (a 2^-32 collision). Use
-  `next_sequence + 1` when the scan stopped on a torn or foreign block.
-- **`Ext2::reserve`** allocates indirect blocks without an `over_limit` check; an oversized
-  request ends in EFBIG and a broken filesystem (availability, not integrity).
 - The ext2 code trusts other on-disk metadata (directory sizes, group counts) bounded only by
   the device.
 

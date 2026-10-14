@@ -1973,6 +1973,65 @@ fn the_journal_is_ext3s() {
     assert_eq!(fsck_findings(&disk, "replayed"), None);
 }
 
+/// The sequence a journal superblock names, as debugfs's `logdump` reads it.
+fn journal_sequence(disk: &RamDisk, name: &str) -> u32 {
+    let (_, dump) = debugfs(&disk.data, name, "logdump\n");
+    let at = dump.find("transaction ").unwrap_or_else(|| panic!("{dump}")) + "transaction ".len();
+    dump[at..].split(|c: char| !c.is_ascii_digit()).next().unwrap().parse().unwrap()
+}
+
+/// After a replay the log restarts one sequence past the last complete transaction (as
+/// JBD2's recovery): a torn transaction of that next sequence left in the log is never
+/// taken for the first new one.
+#[test]
+fn a_replay_skips_one_sequence() {
+    let mut fs = Ext2::mount(mkfs_journal("seq-skip", 8 * 1024)).unwrap();
+    let f = fs.create(ROOT_INO, "f", &NewNode::File, 0o644).unwrap();
+    write_file(&mut fs, f, 64 * 1024);
+    let disk = crashed(&fs);
+    drop(fs);
+    let (_, dump) = debugfs(&disk.data, "seq-skip-dump", "logdump\n");
+    let last = dump
+        .lines()
+        .filter(|l| l.contains("(commit block)"))
+        .filter_map(|l| l.split("sequence ").nth(1))
+        .map(|s| s.split(|c: char| !c.is_ascii_digit()).next().unwrap().parse::<u32>().unwrap())
+        .max()
+        .unwrap_or_else(|| panic!("{dump}"));
+    let fs = Ext2::mount(disk).unwrap();
+    let disk = take(fs);
+    assert_eq!(journal_sequence(&disk, "seq-skip-after"), last + 2);
+    assert_eq!(fsck_findings(&disk, "seq-skip"), None);
+}
+
+/// Reservations that need many indirect blocks commit part way at the transaction's limit,
+/// one larger than the free space fails whole: the filesystem goes on, e2fsck finds nothing.
+#[test]
+fn long_reservations_stay_within_a_transaction() {
+    for limit in [None, Some(4)] {
+        let mut fs = Ext2::mount(mkfs_journal("reserve-long", 8 * 1024)).unwrap();
+        if let Some(limit) = limit {
+            fs.limit_transactions(limit);
+        }
+        let f = fs.create(ROOT_INO, "f", &NewNode::File, 0o644).unwrap();
+        // Deep in the double-indirect range: two dozen new indirect blocks.
+        let base = 300 * 1024 * 1024;
+        let r = fs.reserve(f, base, 6 * 1024 * 1024).unwrap();
+        fs.unreserve(&r);
+        // More than the disk has.
+        assert_eq!(fs.reserve(f, base, 64 * 1024 * 1024).map(|_| ()), Err(ext2fs::errno::ENOSPC));
+        let r = fs.reserve(f, 0, 1024 * 1024).unwrap();
+        dma_write(&mut fs, &r, 0, &vec![b'r'; 1024 * 1024]);
+        fs.link(&r, 1024 * 1024).unwrap();
+        fs.sync().unwrap();
+        let mut back = vec![0u8; 1024 * 1024];
+        assert_eq!(fs.read(f, 0, &mut back).unwrap(), back.len());
+        assert!(back.iter().all(|&b| b == b'r'));
+        let disk = take(fs);
+        assert_eq!(fsck_findings(&disk, "reserve-long"), None, "limit {limit:?}");
+    }
+}
+
 /// A tiny xorshift generator for the fuzz tests.
 struct Rng(u64);
 

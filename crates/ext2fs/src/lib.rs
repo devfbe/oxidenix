@@ -1223,7 +1223,10 @@ impl<D: Device> State<D> {
         let rec = journal::recover(&j.sb, self.blocks_count, &mut log)?;
         self.dev.flush().map_err(|_| "cannot flush the replayed blocks")?;
         j.sb.start = 0;
-        j.sb.sequence = rec.next_sequence;
+        // One sequence skipped (as JBD2's recovery): blocks of a torn or stale transaction
+        // the scan stopped at may carry `next_sequence` and lie where the new log starts, so
+        // only a checksum would tell them from the next transaction's.
+        j.sb.sequence = rec.next_sequence.wrapping_add(1);
         let jsb = j.sb.encode();
         self.dev.write(self.lba(j.map[0]), &jsb).map_err(|_| "cannot write the journal superblock")?;
         self.dev.flush().map_err(|_| "cannot flush the journal superblock")?;
