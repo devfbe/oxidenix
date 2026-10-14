@@ -7,10 +7,9 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{self, Command};
 
-/// A copy of `kernel` without debug information (`<kernel>.boot`), made
+/// A copy of `kernel` without debug information (at `stripped`), made
 /// with the toolchain's llvm-objcopy; the original if that is unavailable.
-fn strip_debug_info(kernel: &Path) -> PathBuf {
-    let stripped = kernel.with_extension("boot");
+fn strip_debug_info(kernel: &Path, stripped: &Path) -> PathBuf {
     let objcopy = Command::new("rustc")
         .args(["--print", "sysroot"])
         .output()
@@ -28,11 +27,11 @@ fn strip_debug_info(kernel: &Path) -> PathBuf {
     let ok = Command::new(&objcopy)
         .arg("--strip-debug")
         .arg(kernel)
-        .arg(&stripped)
+        .arg(stripped)
         .status()
         .is_ok_and(|s| s.success());
     if ok {
-        stripped
+        stripped.to_path_buf()
     } else {
         eprintln!("warning: stripping the kernel failed; booting the unstripped kernel");
         kernel.to_path_buf()
@@ -51,7 +50,6 @@ fn main() {
     std::env::set_var("NIX_PATH", format!("nixpkgs={}", pin.canonicalize().expect("nix/nixpkgs.nix is missing").display()));
 
     let kernel_path = Path::new(&args[1]);
-    let rootfs = kernel_path.with_extension("rootfs");
 
     // OXIDENIX_TEST=1: boot straight into the self-tests and let their result
     // become QEMU's exit status (1 = success, 3 = failure); after they passed,
@@ -68,6 +66,28 @@ fn main() {
     let test_mode = bench_mode || autorun.is_some() || test_var.is_some();
     let self_tests = test_var.is_some() && autorun.is_none() && !bench_mode;
     let readonly_only = self_tests && test_var.as_deref() == Some("readonly".as_ref());
+
+    // Each mode has artifacts of its own (`<kernel>.img`, `<kernel>.test.img`, ...): a test
+    // run neither rewrites the image nor the root filesystem an interactive QEMU has open
+    // (whose write lock on the image would stop the run).
+    let mode = if bench_mode {
+        Some("bench")
+    } else if autorun.is_some() {
+        Some("autorun")
+    } else if test_mode {
+        Some("test")
+    } else {
+        None
+    };
+    let artifact = |ext: &str| {
+        let mut name = kernel_path.as_os_str().to_owned();
+        for part in mode.iter().chain([&ext]) {
+            name.push(".");
+            name.push(part);
+        }
+        PathBuf::from(name)
+    };
+    let rootfs = artifact("rootfs");
     println!("Building root filesystem...");
     build_rootfs(&rootfs).expect("Failed to build root filesystem");
     // With Node.js, its smoke tests (userspace/node/tests, run by
@@ -136,15 +156,15 @@ fn main() {
     // uses, and the BIOS bootloader copies the whole ELF through real-mode
     // disk reads (about 1 MB/s under QEMU). Boot a stripped copy; the full
     // ELF stays next to it for debuggers.
-    let boot_kernel = strip_debug_info(kernel_path);
+    let boot_kernel = strip_debug_info(kernel_path, &artifact("boot"));
 
-    // An initramfs and a boot image per boot (`<kernel>.img`, the read-only
-    // boot's `<kernel>.readonly.img`): the same root filesystem with its own
-    // /etc/autorun.
+    // An initramfs and a boot image per boot (the mode's, `<kernel>.test.img`
+    // say, and the read-only boot's `<kernel>.test.readonly.img`): the same
+    // root filesystem with its own /etc/autorun.
     let firmware = Firmware::from_env();
     let mut images = Vec::new();
     for boot in &boots {
-        let name = |ext: &str| if boot.suffix.is_empty() { kernel_path.with_extension(ext) } else { kernel_path.with_extension(format!("{}.{ext}", boot.suffix)) };
+        let name = |ext: &str| if boot.suffix.is_empty() { artifact(ext) } else { artifact(&format!("{}.{ext}", boot.suffix)) };
         let (cpio_path, img_path) = (name("cpio"), name("img"));
         boot.autorun.install(&rootfs.join("etc/autorun")).expect("Failed to make /etc/autorun");
         let mut cpio = io::BufWriter::new(fs::File::create(&cpio_path).expect("Failed to create cpio"));
@@ -176,7 +196,7 @@ fn main() {
     // (QEMU's 1) ends the run with its status.
     let mut code = 0;
     for (boot, img) in boots.iter().zip(&images) {
-        code = qemu(firmware, kernel_path, img, &data_disk, boot.read_only, test_mode, &args[2..]);
+        code = qemu(firmware, img,&data_disk, boot.read_only, test_mode, &args[2..]);
         if test_mode && code != 1 {
             break;
         }
@@ -221,7 +241,7 @@ impl Autorun {
 /// Boots `img` in QEMU with `data_disk` (read-only: QEMU's readonly=on,
 /// which virtio-blk reports as VIRTIO_BLK_F_RO) and the user's `extra`
 /// arguments; QEMU's exit status.
-fn qemu(firmware: Firmware, kernel_path: &Path, img: &Path, data_disk: &Path, read_only: bool, test_mode: bool, extra: &[String]) -> i32 {
+fn qemu(firmware: Firmware, img: &Path, data_disk: &Path, read_only: bool, test_mode: bool, extra: &[String]) -> i32 {
     let mode = if read_only { ", the data disk read-only" } else { "" };
     println!("Starting QEMU ({}) with {}{}", firmware.name(), img.display(), mode);
     let mut qemu = Command::new("qemu-system-x86_64");
@@ -229,7 +249,8 @@ fn qemu(firmware: Firmware, kernel_path: &Path, img: &Path, data_disk: &Path, re
         // OVMF: its code read-only, its variable store a fresh copy per run
         // (the boot is reproducible: no boot entries left from earlier runs).
         let ovmf = ovmf_dir();
-        let vars = kernel_path.with_extension("ovmf-vars.fd");
+        // (Next to the image: each mode and boot has its own.)
+        let vars = img.with_extension("ovmf-vars.fd");
         fs::copy(ovmf.join("OVMF_VARS.fd"), &vars).expect("Failed to copy the OVMF variable store");
         fs::set_permissions(&vars, fs::Permissions::from_mode(0o644)).expect("Failed to make the OVMF variable store writable");
         qemu.args([

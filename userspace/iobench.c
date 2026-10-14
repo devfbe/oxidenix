@@ -248,14 +248,14 @@ static void ipc_round_trip(void) {
 
 /* -------------------------------------------------------------- /proc */
 
-#define PROC_SAMPLES 2000
+#define PROCFS_SAMPLES 2000
 
 /* Reading /proc: a system-wide file (procfs's, /proc/meminfo) and a
  * process's own (/proc/self/stat) from the start with pread on an open
  * descriptor, as top and htop re-read them, and /proc/self/stat opened,
  * read and closed by path. */
 static void proc_reads(void) {
-    static uint64_t t[PROC_SAMPLES];
+    static uint64_t t[PROCFS_SAMPLES];
     static char text[8192];
     const char *files[] = {"/proc/meminfo", "/proc/self/stat"};
     const char *names[] = {"proc_meminfo_pread", "proc_self_stat_pread"};
@@ -263,25 +263,25 @@ static void proc_reads(void) {
         int fd = open(files[f], O_RDONLY);
         if (fd < 0) return;
         start_counting();
-        for (int i = 0; i < PROC_SAMPLES; i++) {
+        for (int i = 0; i < PROCFS_SAMPLES; i++) {
             uint64_t a = rdtsc();
             pread(fd, text, sizeof text, 0);
             t[i] = rdtsc() - a;
         }
-        per_op(names[f], PROC_SAMPLES);
-        percentiles(names[f], t, PROC_SAMPLES, "cycles");
+        per_op(names[f], PROCFS_SAMPLES);
+        percentiles(names[f], t, PROCFS_SAMPLES, "cycles");
         close(fd);
     }
     start_counting();
-    for (int i = 0; i < PROC_SAMPLES; i++) {
+    for (int i = 0; i < PROCFS_SAMPLES; i++) {
         uint64_t a = rdtsc();
         int fd = open("/proc/self/stat", O_RDONLY);
         read(fd, text, sizeof text);
         close(fd);
         t[i] = rdtsc() - a;
     }
-    per_op("proc_self_stat_open_read_close", PROC_SAMPLES);
-    percentiles("proc_self_stat_open_read_close", t, PROC_SAMPLES, "cycles");
+    per_op("proc_self_stat_open_read_close", PROCFS_SAMPLES);
+    percentiles("proc_self_stat_open_read_close", t, PROCFS_SAMPLES, "cycles");
 }
 
 /* ------------------------------------------------------------- block */

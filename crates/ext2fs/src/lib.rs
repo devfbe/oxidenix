@@ -63,6 +63,33 @@
 //! changes fail with EROFS, nothing is written (no journal is added, and one that needs
 //! recovery cannot be mounted).
 //!
+//! **Corruption.** The disk may be corrupt or hostile: nothing read from it panics, loops
+//! or allocates by a number it holds beyond what the disk has, and no change goes through
+//! metadata that is corrupt to other data. `mount` refuses a superblock or group
+//! descriptors that contradict themselves or the device (a revision, first data block,
+//! inode count or first inode that is wrong, descriptors that do not fit the first group,
+//! a filesystem larger than the device, a group's bitmaps or inode table outside it or on
+//! each other, counts beyond a group, a root that is no sound directory, a journal larger
+//! than half the filesystem, with holes, a block twice or one of the metadata); the
+//! superblock's free counts are the descriptors' sums (as Linux counts them). Later,
+//! corruption fails the operation that needs it with EUCLEAN (ext4's `EFSCORRUPTED`) and
+//! marks the filesystem as having errors (`STATE_ERROR` in `s_state`, written with the
+//! next commit, `Ext2::errors`), so that e2fsck checks it; the rest goes on (ext4's
+//! `errors=continue`). Checked: block pointers (ext4's `block_validity`: none into the
+//! "system zone", each group's superblock copy, descriptors, bitmaps and inode table and
+//! the journal: `State::is_system`), inodes before anything is done by them (a known type,
+//! sizes their type allows: `State::check_inode`), directories (whole blocks, no holes, no
+//! block twice: work bounded by blocks the disk has; records as ext4's
+//! `ext4_check_dir_entry` checks them, names without '/', inode numbers neither reserved
+//! nor beyond the inodes: `parse_entries`), an inode a name leads to (in use, with a
+//! link), symlinks (their size within their form). Allocation never takes the system zone
+//! or an inode reserved or in use that a bitmap calls free: that group's bitmap is corrupt
+//! and allocations skip the group. Removing a corrupt file goes on past what is corrupt (a
+//! pointer to the system zone or to a block not allocated is noted and not followed,
+//! nothing freed twice), so a truncation walks each indirect block at most twice however
+//! they are shared. What no check short of e2fsck sees stays: a block two files share, a
+//! bitmap that calls a file's block free.
+//!
 //! **Clean.** The superblock's state (`s_state`) says "not cleanly unmounted" while the
 //! filesystem is in use (`set_in_use`: diskfs, while any client is connected) and anything
 //! has been changed, so after a crash a host's `e2fsck -p` (and Linux's mount) knows to
@@ -121,12 +148,17 @@ pub mod errno {
     pub const EFBIG: i64 = 27;
     pub const ENOSPC: i64 = 28;
     pub const EROFS: i64 = 30;
+    /// A directory has as many subdirectories as a link count may say (`LINK_MAX`).
+    pub const EMLINK: i64 = 31;
     pub const ENAMETOOLONG: i64 = 36;
     pub const ENOTEMPTY: i64 = 39;
     pub const ELOOP: i64 = 40;
     /// A handle (number and generation) of an inode that is gone, or whose
     /// number is another file's now.
     pub const ESTALE: i64 = 116;
+    /// The metadata an operation needs is corrupt (ext4's `EFSCORRUPTED`; see the crate's
+    /// "Corruption").
+    pub const EUCLEAN: i64 = 117;
 }
 use errno::*;
 
@@ -135,7 +167,13 @@ pub const S_IFDIR: u32 = 0o040000;
 pub const S_IFREG: u32 = 0o100000;
 pub const S_IFLNK: u32 = 0o120000;
 pub const S_IFSOCK: u32 = 0o140000;
+pub const S_IFCHR: u32 = 0o020000;
+pub const S_IFBLK: u32 = 0o060000;
+pub const S_IFIFO: u32 = 0o010000;
 pub const NAME_MAX: usize = 255;
+/// The most links an inode may have (ext2's `EXT2_LINK_MAX`): a directory with this many
+/// takes no more subdirectories (EMLINK).
+pub const LINK_MAX: u16 = 32000;
 const SECTOR_SIZE: usize = 512;
 
 /// The disk and the clock the filesystem lives on.
@@ -179,6 +217,16 @@ pub const ROOT_INO: u32 = 2;
 const MAGIC: u16 = 0xef53;
 /// `s_state`: cleanly unmounted (`EXT2_VALID_FS`).
 const STATE_VALID: u16 = 1;
+/// `s_state`: errors were detected (`EXT2_ERROR_FS`): e2fsck checks the filesystem.
+const STATE_ERROR: u16 = 2;
+/// `resize_inode`: reserved descriptor blocks (`s_reserved_gdt_blocks`) follow each copy
+/// of the group descriptors.
+const COMPAT_RESIZE_INODE: u32 = 0x10;
+const RO_COMPAT_SPARSE_SUPER: u32 = 0x1;
+/// The first inode number mke2fs gives files in revision 0 (`EXT2_GOOD_OLD_FIRST_INO`).
+const GOOD_OLD_FIRST_INO: u32 = 11;
+/// The most blocks a journal may have (mke2fs and tune2fs make none larger).
+const MAX_JOURNAL_BLOCKS: u64 = 10_240_000;
 const INCOMPAT_FILETYPE: u32 = 0x2;
 /// `needs_recovery`: the journal may hold transactions not yet at their places.
 const INCOMPAT_RECOVER: u32 = 0x4;
@@ -304,6 +352,20 @@ impl RawInode {
     fn fast_symlink(&self) -> bool {
         self.mode() as u32 & S_IFMT == S_IFLNK && self.sectors() == 0
     }
+    /// Whether the block pointers point to blocks: a regular file's, a directory's, a
+    /// slow symlink's. (A fast symlink's hold its target; a device's, its number; a
+    /// socket's and a FIFO's, nothing.)
+    fn has_blocks(&self) -> bool {
+        match self.mode() as u32 & S_IFMT {
+            S_IFREG | S_IFDIR => true,
+            S_IFLNK => !self.fast_symlink(),
+            _ => false,
+        }
+    }
+    /// The deletion time (`i_dtime`); on the orphan list, the next orphan.
+    fn dtime(&self) -> u32 {
+        le32(&self.0, 20)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -328,6 +390,20 @@ struct State<D: Device> {
     free_inodes: u32,
     gdt_block: u32,
     groups: Vec<Group>,
+    /// The blocks a group with a copy of the superblock starts with: the superblock, the
+    /// group descriptors and the descriptor blocks reserved for growth (`resize_inode`).
+    super_len: u32,
+    /// The blocks of a group's inode table.
+    table_blocks: u32,
+    /// Only groups 0, 1 and powers of 3, 5 and 7 have a copy of the superblock.
+    sparse_super: bool,
+    /// The journal's blocks (none before it is opened): with each group's own (`super_len`,
+    /// bitmaps, inode table), the blocks no file may have (ext4's "system zone").
+    journal_blocks: BlockSet,
+    /// Groups whose block or inode bitmap was found corrupt (it says a block of the system
+    /// zone, or a reserved or used inode, is free): allocations skip them until e2fsck.
+    bad_block_bitmaps: BTreeSet<usize>,
+    bad_inode_bitmaps: BTreeSet<usize>,
     cache: BlockCache,
     /// What `cache` was made with (a mount after replay makes it again).
     cache_bytes: usize,
@@ -359,8 +435,9 @@ struct State<D: Device> {
     limit: Option<usize>,
     /// The superblock has the orphan list's field (revision 1).
     has_orphan_list: bool,
-    /// `s_state` as it was at mount (`set_in_use`); whether the filesystem is in use, and
-    /// whether the disk says so now (not clean).
+    /// `s_state` as it was at mount (`set_in_use`), with `STATE_ERROR` once corruption was
+    /// found (`State::corrupt`); whether the filesystem is in use, and whether the disk
+    /// says so now (not clean).
     mount_state: u16,
     in_use: bool,
     marked: bool,
@@ -588,19 +665,68 @@ struct Entry {
     ftype: u8,
 }
 
-fn parse_entries(block: &[u8]) -> Result<Vec<Entry>, i64> {
+/// The smallest directory record (`EXT2_DIR_REC_LEN(1)`): its header and a name's 4 bytes.
+const MIN_REC_LEN: usize = 12;
+
+/// The entries of directory block `block`, checked as ext4's `ext4_check_dir_entry` checks
+/// them, and more: each record at least `MIN_REC_LEN` bytes, a multiple of 4, inside the
+/// block and long enough for its name, the records covering the block exactly; a used
+/// one with a name (no '/', no NUL) naming the root or an inode from `first_ino` to
+/// `inodes` (no reserved one: the journal's, say). EUCLEAN otherwise (the caller notes the
+/// corruption: `State::entries`).
+fn parse_entries(block: &[u8], first_ino: u32, inodes: u32) -> Result<Vec<Entry>, i64> {
     let mut out = Vec::new();
     let mut pos = 0;
-    while pos + 8 <= block.len() {
+    while pos < block.len() {
+        if pos + MIN_REC_LEN > block.len() {
+            return Err(EUCLEAN);
+        }
         let rec_len = le16(block, pos + 4) as usize;
         let name_len = block[pos + 6] as usize;
-        if rec_len < 8 || pos + rec_len > block.len() || 8 + name_len > rec_len {
-            return Err(EIO);
+        // (A multiple of 4 holds the name's padding too: `dir_add` takes the rest.)
+        if rec_len < MIN_REC_LEN || rec_len % 4 != 0 || pos + rec_len > block.len() || 8 + name_len > rec_len {
+            return Err(EUCLEAN);
         }
-        out.push(Entry { pos, inode: le32(block, pos), rec_len, name_len, ftype: block[pos + 7] });
+        let inode = le32(block, pos);
+        if inode != 0 {
+            let name = &block[pos + 8..pos + 8 + name_len];
+            let numbered = inode == ROOT_INO || (inode >= first_ino && inode <= inodes);
+            if name.is_empty() || name.iter().any(|&c| c == b'/' || c == 0) || !numbered {
+                return Err(EUCLEAN);
+            }
+        }
+        out.push(Entry { pos, inode, rec_len, name_len, ftype: block[pos + 7] });
         pos += rec_len;
     }
     Ok(out)
+}
+
+/// A name a new entry may have (what `parse_entries` takes): 1 to `NAME_MAX` bytes, no '/'
+/// or NUL (EINVAL; ENOENT for an empty one, as Linux says for an empty path).
+fn check_name(name: &str) -> Result<(), i64> {
+    if name.is_empty() {
+        return Err(ENOENT);
+    }
+    if name.len() > NAME_MAX {
+        return Err(ENAMETOOLONG);
+    }
+    if name.bytes().any(|c| c == b'/' || c == 0) {
+        return Err(EINVAL);
+    }
+    Ok(())
+}
+
+/// Whether group `g` has a copy of the superblock and the group descriptors: every group,
+/// or with `sparse_super` groups 0, 1 and the powers of 3, 5 and 7.
+fn has_super(sparse: bool, g: usize) -> bool {
+    let power = |p: usize| {
+        let mut n = p;
+        while n < g {
+            n *= p;
+        }
+        n == g
+    };
+    !sparse || g <= 1 || power(3) || power(5) || power(7)
 }
 
 fn write_entry(block: &mut [u8], pos: usize, inode: u32, rec_len: usize, name: &[u8], ftype: u8) {
@@ -824,13 +950,113 @@ impl<D: Device> State<D> {
         Ok(())
     }
 
-    /// Block pointer `b` read from the disk: 0 (a hole) or a block of the
-    /// filesystem; anything else is corruption.
-    fn check_block(&self, b: u32) -> Result<u32, i64> {
-        if b != 0 && (b < self.first_data_block || b >= self.blocks_count) {
-            return Err(EIO);
+    // ------------------------------------------- corruption (see the module comment)
+
+    /// Corruption was found: the filesystem has errors from now on (`STATE_ERROR`, on the
+    /// disk with the next commit, so that e2fsck checks it, as ext2's `ext2_error` marks
+    /// it). EUCLEAN, for the operation that needed what is corrupt.
+    fn corrupt(&mut self) -> i64 {
+        self.mount_state |= STATE_ERROR;
+        EUCLEAN
+    }
+
+    /// The first block of group `g`, and how many it has (the last may have fewer).
+    fn group_first(&self, g: usize) -> u32 {
+        self.first_data_block + g as u32 * self.blocks_per_group
+    }
+
+    fn group_len(&self, g: usize) -> u32 {
+        self.blocks_per_group.min(self.blocks_count - self.group_first(g))
+    }
+
+    /// Whether block `b` is the filesystem's own (ext4's "system zone"): before the first
+    /// data block or beyond the last, a group's copy of the superblock and descriptors,
+    /// its bitmaps, its inode table, or the journal's. No file may point to one, and no
+    /// allocation may take one.
+    fn is_system(&self, b: u32) -> bool {
+        if b < self.first_data_block || b >= self.blocks_count {
+            return true;
+        }
+        let g = ((b - self.first_data_block) / self.blocks_per_group) as usize;
+        let gr = &self.groups[g];
+        (has_super(self.sparse_super, g) && b - self.group_first(g) < self.super_len)
+            || b == gr.block_bitmap
+            || b == gr.inode_bitmap
+            || (b >= gr.inode_table && b - gr.inode_table < self.table_blocks)
+            || self.journal_blocks.contains(b)
+    }
+
+    /// Block pointer `b` read from the disk: 0 (a hole) or a block a file may have (not
+    /// the system zone's: `is_system`); anything else is corruption (as ext4's
+    /// `block_validity`), so that no change through a pointer reaches metadata.
+    fn check_block(&mut self, b: u32) -> Result<u32, i64> {
+        if b != 0 && self.is_system(b) {
+            return Err(self.corrupt());
         }
         Ok(b)
+    }
+
+    /// Whether block `b` (of the filesystem) is allocated in its group's bitmap.
+    fn block_in_use(&mut self, b: u32) -> Result<bool, i64> {
+        let rel = b - self.first_data_block;
+        let g = (rel / self.blocks_per_group) as usize;
+        self.test_bit(self.groups[g].block_bitmap, rel % self.blocks_per_group)
+    }
+
+    /// Checks inode `inode` (in use) before anything is done by it, as ext4's
+    /// `__ext4_iget` does: a known type, and a size its type allows (a regular file's
+    /// within `max_file_size`; a directory's whole blocks, at least one; a fast symlink's
+    /// within its block pointers, a slow one's within its block, short of it as Linux and
+    /// e2fsck want). EUCLEAN otherwise.
+    fn check_inode(&mut self, inode: &RawInode) -> Result<(), i64> {
+        let (size, bs) = (inode.size(), self.block_size as u64);
+        let sound = match inode.mode() as u32 & S_IFMT {
+            S_IFREG => size <= self.max_file_size(),
+            S_IFDIR => size > 0 && size % bs == 0,
+            S_IFLNK if inode.fast_symlink() => size < FAST_SYMLINK_MAX as u64,
+            S_IFLNK => size > 0 && size < bs,
+            S_IFSOCK | S_IFCHR | S_IFBLK | S_IFIFO => true,
+            _ => false,
+        };
+        if !sound {
+            return Err(self.corrupt());
+        }
+        Ok(())
+    }
+
+    /// Directory `dir`'s inode, checked (`check_inode`); ENOTDIR if it is none.
+    fn dir_inode(&mut self, dir: u32) -> Result<RawInode, i64> {
+        let inode = self.read_inode(dir)?;
+        if !inode.is_dir() {
+            return Err(ENOTDIR);
+        }
+        self.check_inode(&inode)?;
+        Ok(inode)
+    }
+
+    /// The blocks of directory `dir` (as `inode`), in order: no hole (ext2 makes none in a
+    /// directory, as ext4 checks), none twice, none of the system zone (`check_block`);
+    /// EUCLEAN otherwise. So the work and memory a directory takes are bounded by blocks
+    /// the disk has, each once, whatever its size says.
+    fn dir_block_list(&mut self, dir: u32, inode: &mut RawInode) -> Result<Vec<u32>, i64> {
+        let (mut blocks, mut seen) = (Vec::new(), BlockSet::new());
+        for fb in 0..self.dir_blocks(inode) {
+            let b = self.bmap(dir, inode, fb, false)?;
+            // (A repeat is found at once: tables shared down a size of gigabytes end the
+            // walk at the first.)
+            if b == 0 || seen.contains(b) {
+                return Err(self.corrupt());
+            }
+            seen.insert(b);
+            blocks.push(b);
+        }
+        Ok(blocks)
+    }
+
+    /// The entries of directory block `block` (`parse_entries`: corruption noted).
+    fn entries(&mut self, block: &[u8]) -> Result<Vec<Entry>, i64> {
+        let (first, count) = (self.first_ino(), self.inode_count());
+        parse_entries(block, first, count).map_err(|_| self.corrupt())
     }
 
     fn write_super(&mut self) -> Result<(), i64> {
@@ -873,6 +1099,12 @@ impl<D: Device> State<D> {
     fn commit(&mut self) -> Result<(), i64> {
         if self.broken {
             return Err(EIO);
+        }
+        // Corruption found (`corrupt`) goes to the disk's state with this transaction.
+        let state = le16(&self.sb, 58);
+        if self.mount_state & STATE_ERROR != 0 && state & STATE_ERROR == 0 {
+            put16(&mut self.sb, 58, state | STATE_ERROR);
+            self.super_dirty = true;
         }
         if self.journal.is_some() {
             // A transaction that cannot be written stops the filesystem (ADR 0012).
@@ -1160,19 +1392,30 @@ impl<D: Device> State<D> {
         let mut inode = self.read_inode(JOURNAL_INO).map_err(|_| "cannot read the journal inode")?;
         let bs = self.block_size as u64;
         let blocks = inode.size().div_ceil(bs);
-        // (Its size is the disk's word: bounded by the filesystem before anything is
-        // allocated by it.)
-        if !inode.is_reg() || blocks < journal::MIN_BLOCKS as u64 || blocks >= self.blocks_count as u64 {
+        // (Its size is the disk's word: bounded, as e2fsprogs makes journals, by half the
+        // filesystem and their largest, before anything is allocated by it.)
+        let most = (self.blocks_count as u64 / 2).min(MAX_JOURNAL_BLOCKS);
+        if !inode.is_reg() || blocks < journal::MIN_BLOCKS as u64 || blocks > most {
             return Err("the journal inode is not a journal");
         }
         let mut map = Vec::with_capacity(blocks as usize);
         for fb in 0..blocks {
+            // (Outside the system zone, the journal's own not counted yet: `check_block`.)
             let b = self.bmap(JOURNAL_INO, &mut inode, fb, false).map_err(|_| "cannot map the journal")?;
             if b == 0 {
                 return Err("the journal has holes");
             }
             map.push(b);
         }
+        // Its blocks join the system zone; one twice would be two places of the log.
+        let mut zone = BlockSet::new();
+        for &b in &map {
+            if zone.contains(b) {
+                return Err("the journal's blocks repeat");
+            }
+            zone.insert(b);
+        }
+        self.journal_blocks = zone;
         let mut raw = vec![0u8; self.block_size];
         self.dev.read(self.lba(map[0]), &mut raw).map_err(|_| "cannot read the journal")?;
         let sb = journal::Superblock::parse(&raw)?;
@@ -1346,8 +1589,10 @@ impl<D: Device> State<D> {
         self.write_block(block, &buf)
     }
 
+    /// The group of inode `ino` (a number from 1 to `inode_count`; for others an allocation
+    /// goal at most, which the allocators clamp).
     fn group_of(&self, ino: u32) -> usize {
-        ((ino - 1) / self.inodes_per_group) as usize
+        (ino.saturating_sub(1) / self.inodes_per_group) as usize
     }
 
     /// A clear bit of a bitmap block below `limit`, searched from `start`
@@ -1373,18 +1618,8 @@ impl<D: Device> State<D> {
         self.write_block(bitmap_block, &bitmap)
     }
 
-    /// Finds and sets a clear bit in a bitmap block (see `find_bit`);
-    /// returns its index.
-    fn take_bit(&mut self, bitmap_block: u32, limit: u32, first: Option<u32>) -> Result<Option<u32>, i64> {
-        let bit = self.find_bit(bitmap_block, limit, 0, first)?;
-        if let Some(bit) = bit {
-            self.set_bit(bitmap_block, bit)?;
-        }
-        Ok(bit)
-    }
-
     /// Clears a bit; whether it was set (a free counts only then: a bit
-    /// cleared twice never makes the free counts drift).
+    /// cleared twice, which is corruption, never makes the free counts drift).
     fn clear_bit(&mut self, bitmap_block: u32, bit: u32) -> Result<bool, i64> {
         let mut bitmap = self.read_block(bitmap_block)?;
         let mask = 1u8 << (bit % 8);
@@ -1601,31 +1836,54 @@ impl<D: Device> State<D> {
             return Err(ENOSPC);
         }
         let n = self.groups.len();
+        let goal = if goal < n { goal } else { 0 };
         for g in (goal..n).chain(0..goal) {
-            if self.groups[g].free_blocks == 0 {
+            if self.groups[g].free_blocks == 0 || self.bad_block_bitmaps.contains(&g) {
                 continue;
             }
-            let first = self.first_data_block + g as u32 * self.blocks_per_group;
-            let limit = self.blocks_per_group.min(self.blocks_count - first);
-            if let Some(bit) = self.take_bit(self.groups[g].block_bitmap, limit, Some(first))? {
-                self.groups[g].free_blocks -= 1;
-                self.free_blocks -= 1;
-                self.write_group(g)?;
-                self.write_super()?;
-                let block = first + bit;
-                // Metadata unless `alloc_data` makes it a fresh data block.
-                self.new_meta.insert(block);
-                if zero {
-                    self.write_block(block, &vec![0u8; self.block_size])?;
-                }
-                return Ok(block);
+            let (first, limit) = (self.group_first(g), self.group_len(g));
+            let bitmap = self.groups[g].block_bitmap;
+            let Some(bit) = self.find_bit(bitmap, limit, 0, Some(first))? else { continue };
+            let block = first + bit;
+            if self.system_free(g, block) {
+                continue;
             }
+            self.set_bit(bitmap, bit)?;
+            self.groups[g].free_blocks -= 1;
+            self.free_blocks = self.free_blocks.saturating_sub(1);
+            self.write_group(g)?;
+            self.write_super()?;
+            // Metadata unless `alloc_data` makes it a fresh data block.
+            self.new_meta.insert(block);
+            if zero {
+                self.write_block(block, &vec![0u8; self.block_size])?;
+            }
+            return Ok(block);
         }
         Err(ENOSPC)
     }
 
-    fn free_block(&mut self, block: u32) -> Result<(), i64> {
-        self.check_block(block)?;
+    /// Whether free block `block` of group `g`'s bitmap is the system zone's: the bitmap is
+    /// corrupt, and the group takes no more allocations (as ext4 marks a block bitmap
+    /// corrupt), so that no file is given metadata.
+    fn system_free(&mut self, g: usize, block: u32) -> bool {
+        if !self.is_system(block) {
+            return false;
+        }
+        self.bad_block_bitmaps.insert(g);
+        self.corrupt();
+        true
+    }
+
+    /// Frees block `block`; whether it was the file's (allocated). One of the system zone
+    /// (`is_system`), or not allocated (freed twice: two pointers to it, or never
+    /// allocated), is corruption: noted (`corrupt`), nothing freed or counted (as ext4
+    /// frees no block outside the data zone), so that a corrupt file can still be removed.
+    fn free_block(&mut self, block: u32) -> Result<bool, i64> {
+        if self.is_system(block) {
+            self.corrupt();
+            return Ok(false);
+        }
         self.revoke(block);
         // (A data block is not cached: nothing to keep.)
         if self.cache.contains(block) {
@@ -1639,30 +1897,48 @@ impl<D: Device> State<D> {
         let rel = block - self.first_data_block;
         let g = (rel / self.blocks_per_group) as usize;
         if !self.clear_bit(self.groups[g].block_bitmap, rel % self.blocks_per_group)? {
-            return Ok(());
+            self.corrupt();
+            return Ok(false);
         }
-        self.groups[g].free_blocks += 1;
-        self.free_blocks += 1;
+        // (Counts the disk had wrong stay within their group and the filesystem.)
+        let len = self.group_len(g) as u16;
+        self.groups[g].free_blocks = self.groups[g].free_blocks.saturating_add(1).min(len);
+        self.free_blocks = self.free_blocks.saturating_add(1).min(self.blocks_count);
         self.write_group(g)?;
-        self.write_super()
+        self.write_super()?;
+        Ok(true)
     }
 
+    /// Allocates an inode, preferring group `goal`. A bitmap that says a reserved inode or
+    /// one in use (a mode, links and no deletion time, or on the orphan list) is free is
+    /// corrupt (as ext4's "reserved inode found cleared"): its group gives no more inodes,
+    /// so that no file's inode is given to another.
     fn alloc_inode(&mut self, dir: bool, goal: usize) -> Result<u32, i64> {
         let n = self.groups.len();
+        let goal = if goal < n { goal } else { 0 };
         for g in (goal..n).chain(0..goal) {
-            if self.groups[g].free_inodes == 0 {
+            if self.groups[g].free_inodes == 0 || self.bad_inode_bitmaps.contains(&g) {
                 continue;
             }
-            if let Some(bit) = self.take_bit(self.groups[g].inode_bitmap, self.inodes_per_group, None)? {
-                self.groups[g].free_inodes -= 1;
-                if dir {
-                    self.groups[g].used_dirs += 1;
-                }
-                self.free_inodes -= 1;
-                self.write_group(g)?;
-                self.write_super()?;
-                return Ok(g as u32 * self.inodes_per_group + bit + 1);
+            let bitmap = self.groups[g].inode_bitmap;
+            let Some(bit) = self.find_bit(bitmap, self.inodes_per_group, 0, None)? else { continue };
+            let ino = g as u32 * self.inodes_per_group + bit + 1;
+            let old = self.read_inode(ino)?;
+            let used = old.mode() != 0 && old.links() != 0 && old.dtime() == 0;
+            if ino < self.first_ino() || used || self.orphans.contains_key(&ino) {
+                self.bad_inode_bitmaps.insert(g);
+                self.corrupt();
+                continue;
             }
+            self.set_bit(bitmap, bit)?;
+            self.groups[g].free_inodes -= 1;
+            if dir {
+                self.groups[g].used_dirs = self.groups[g].used_dirs.saturating_add(1).min(self.inodes_per_group as u16);
+            }
+            self.free_inodes = self.free_inodes.saturating_sub(1);
+            self.write_group(g)?;
+            self.write_super()?;
+            return Ok(ino);
         }
         Err(ENOSPC)
     }
@@ -1670,13 +1946,15 @@ impl<D: Device> State<D> {
     fn free_inode(&mut self, ino: u32, dir: bool) -> Result<(), i64> {
         let g = self.group_of(ino);
         if !self.clear_bit(self.groups[g].inode_bitmap, (ino - 1) % self.inodes_per_group)? {
+            self.corrupt();
             return Ok(());
         }
-        self.groups[g].free_inodes += 1;
+        let ipg = self.inodes_per_group as u16;
+        self.groups[g].free_inodes = self.groups[g].free_inodes.saturating_add(1).min(ipg);
         if dir {
             self.groups[g].used_dirs = self.groups[g].used_dirs.saturating_sub(1);
         }
-        self.free_inodes += 1;
+        self.free_inodes = self.free_inodes.saturating_add(1).min(self.inode_count());
         self.write_group(g)?;
         self.write_super()
     }
@@ -1796,14 +2074,24 @@ impl<D: Device> State<D> {
     /// (`depth` 0 is a data block). Returns whether `blk` itself was freed. A long cut
     /// stops to commit at consistent states (`cut_pause`): a table's pointers to what was
     /// freed are cleared before.
+    ///
+    /// A table of the system zone, or one the bitmap does not have allocated (freed already
+    /// through another pointer to it, or never allocated), is not the file's: corruption,
+    /// noted; it counts as freed (its pointer goes) and nothing below it is. So a cut walks
+    /// each table once at most (twice: once in part), however tables are shared: linear in
+    /// the blocks freed, where a triple indirect block whose pointers all lead to one table
+    /// would take p³ steps. (Data blocks: `free_block`.)
     fn trunc_tree(&mut self, cut: &mut Cut, inode: &mut RawInode, blk: u32, depth: u32, from: u64) -> Result<bool, i64> {
         if blk == 0 {
             return Ok(true);
         }
+        if depth > 0 && (self.is_system(blk) || !self.block_in_use(blk)?) {
+            self.corrupt();
+            return Ok(true);
+        }
         if depth == 0 {
             if from == 0 {
-                self.free_block(blk)?;
-                cut.freed += 1;
+                cut.freed += self.free_block(blk)? as i64;
                 return Ok(true);
             }
             return Ok(false);
@@ -1813,7 +2101,8 @@ impl<D: Device> State<D> {
         let mut table = self.read_block(blk)?;
         let (mut changed, mut empty) = (false, true);
         for i in 0..p {
-            let entry = self.check_block(le32(&table, i as usize * 4))?;
+            // (Checked below: a pointer to the system zone is dropped, not followed.)
+            let entry = le32(&table, i as usize * 4);
             if entry == 0 {
                 continue;
             }
@@ -1834,8 +2123,7 @@ impl<D: Device> State<D> {
             }
         }
         if empty {
-            self.free_block(blk)?;
-            cut.freed += 1;
+            cut.freed += self.free_block(blk)? as i64;
             return Ok(true);
         }
         if changed {
@@ -1866,8 +2154,7 @@ impl<D: Device> State<D> {
         for i in keep.min(DIRECT as u64)..DIRECT as u64 {
             let b = inode.block(i as usize);
             if b != 0 {
-                self.free_block(b)?;
-                cut.freed += 1;
+                cut.freed += self.free_block(b)? as i64;
                 inode.set_block(i as usize, 0);
                 if self.over_limit() {
                     self.cut_pause(&mut cut, inode)?;
@@ -2070,19 +2357,14 @@ impl<D: Device> State<D> {
         inode.size() / self.block_size as u64
     }
 
+    /// The entries of directory `dir` (its inode, blocks and records checked:
+    /// `dir_inode`, `dir_block_list`, `parse_entries`).
     fn list(&mut self, dir: u32) -> Result<Vec<(String, u32, u8)>, i64> {
-        let mut inode = self.read_inode(dir)?;
-        if !inode.is_dir() {
-            return Err(ENOTDIR);
-        }
+        let mut inode = self.dir_inode(dir)?;
         let mut out = Vec::new();
-        for fb in 0..self.dir_blocks(&inode) {
-            let blk = self.bmap(dir, &mut inode, fb, false)?;
-            if blk == 0 {
-                continue;
-            }
+        for blk in self.dir_block_list(dir, &mut inode)? {
             let block = self.read_block(blk)?;
-            for e in parse_entries(&block)? {
+            for e in self.entries(&block)? {
                 if e.inode != 0 {
                     let name = String::from_utf8_lossy(&block[e.pos + 8..e.pos + 8 + e.name_len]).into_owned();
                     out.push((name, e.inode, e.ftype));
@@ -2092,25 +2374,26 @@ impl<D: Device> State<D> {
         Ok(out)
     }
 
+    /// The inode `name` in `dir` names. It must be in use, with a link, and sound (as
+    /// ext4's lookup checks the inode it gets): a name of a freed inode is corruption, which
+    /// must not lead an unlink to free its blocks (another file's now) again.
     fn lookup(&mut self, dir: u32, name: &str) -> Result<u32, i64> {
-        self.list(dir)?
-            .into_iter()
-            .find(|(n, _, _)| n == name)
-            .map(|(_, ino, _)| ino)
-            .ok_or(ENOENT)
+        let ino = self.list(dir)?.into_iter().find(|(n, _, _)| n == name).map(|(_, ino, _)| ino).ok_or(ENOENT)?;
+        match self.live_inode(ino) {
+            Ok(inode) if inode.links() != 0 => Ok(ino),
+            Ok(_) | Err(ENOENT) => Err(self.corrupt()),
+            Err(e) => Err(e),
+        }
     }
 
     fn dir_add(&mut self, dir: u32, name: &str, ino: u32, ftype: u8) -> Result<(), i64> {
         let name = name.as_bytes();
         let need = 8 + align4(name.len());
-        let mut inode = self.read_inode(dir)?;
-        for fb in 0..self.dir_blocks(&inode) {
-            let blk = self.bmap(dir, &mut inode, fb, false)?;
-            if blk == 0 {
-                continue;
-            }
+        let mut inode = self.dir_inode(dir)?;
+        let blocks = self.dir_block_list(dir, &mut inode)?;
+        for &blk in &blocks {
             let mut block = self.read_block(blk)?;
-            for e in parse_entries(&block)? {
+            for e in self.entries(&block)? {
                 let used = if e.inode == 0 { 0 } else { 8 + align4(e.name_len) };
                 if e.rec_len - used < need {
                     continue;
@@ -2127,26 +2410,31 @@ impl<D: Device> State<D> {
                 return self.write_inode(dir, &inode);
             }
         }
-        // No room: append a block holding just the new entry.
-        let fb = self.dir_blocks(&inode);
-        let blk = self.bmap(dir, &mut inode, fb, true)?;
+        // No room: append a block holding just the new entry (a directory's size has 32
+        // bits: ENOSPC at 4 GiB, as ext4's limit on a directory's size).
+        let fb = blocks.len() as u64;
+        let size = (fb + 1) * self.block_size as u64;
+        if size > u32::MAX as u64 {
+            return Err(ENOSPC);
+        }
+        let (blk, new) = self.map(dir, &mut inode, fb, Some(true))?;
+        if !new {
+            // A block past the directory's end: not the directory's to write over.
+            return Err(self.corrupt());
+        }
         let mut block = vec![0u8; self.block_size];
         write_entry(&mut block, 0, ino, self.block_size, name, ftype);
         self.write_block(blk, &block)?;
-        inode.set_size((fb + 1) * self.block_size as u64);
+        inode.set_size(size);
         inode.touch(self.dev.now(), false, true);
         self.write_inode(dir, &inode)
     }
 
     fn dir_remove(&mut self, dir: u32, name: &str) -> Result<(), i64> {
-        let mut inode = self.read_inode(dir)?;
-        for fb in 0..self.dir_blocks(&inode) {
-            let blk = self.bmap(dir, &mut inode, fb, false)?;
-            if blk == 0 {
-                continue;
-            }
+        let mut inode = self.dir_inode(dir)?;
+        for blk in self.dir_block_list(dir, &mut inode)? {
             let mut block = self.read_block(blk)?;
-            let entries = parse_entries(&block)?;
+            let entries = self.entries(&block)?;
             for (i, e) in entries.iter().enumerate() {
                 if e.inode == 0 || &block[e.pos + 8..e.pos + 8 + e.name_len] != name.as_bytes() {
                     continue;
@@ -2166,14 +2454,10 @@ impl<D: Device> State<D> {
 
     /// Points the entry `name` of `dir` at `ino` (of type `ftype`), in place.
     fn dir_set(&mut self, dir: u32, name: &str, ino: u32, ftype: u8) -> Result<(), i64> {
-        let mut inode = self.read_inode(dir)?;
-        for fb in 0..self.dir_blocks(&inode) {
-            let blk = self.bmap(dir, &mut inode, fb, false)?;
-            if blk == 0 {
-                continue;
-            }
+        let mut inode = self.dir_inode(dir)?;
+        for blk in self.dir_block_list(dir, &mut inode)? {
             let mut block = self.read_block(blk)?;
-            let entries = parse_entries(&block)?;
+            let entries = self.entries(&block)?;
             if let Some(e) = entries.iter().find(|e| e.inode != 0 && &block[e.pos + 8..e.pos + 8 + e.name_len] == name.as_bytes()) {
                 let pos = e.pos;
                 put32(&mut block, pos, ino);
@@ -2190,18 +2474,22 @@ impl<D: Device> State<D> {
         Ok(self.list(dir)?.iter().all(|(n, _, _)| n == "." || n == ".."))
     }
 
-    /// Points the ".." entry of directory `dir` at `parent`.
+    /// Points the ".." entry of directory `dir` (in its first block) at `parent`; a
+    /// directory without one is corrupt.
     fn set_dotdot(&mut self, dir: u32, parent: u32) -> Result<(), i64> {
-        let mut inode = self.read_inode(dir)?;
+        let mut inode = self.dir_inode(dir)?;
         let blk = self.bmap(dir, &mut inode, 0, false)?;
+        if blk == 0 {
+            return Err(self.corrupt());
+        }
         let mut block = self.read_block(blk)?;
-        for e in parse_entries(&block)? {
-            if &block[e.pos + 8..e.pos + 8 + e.name_len] == b".." {
+        for e in self.entries(&block)? {
+            if e.inode != 0 && &block[e.pos + 8..e.pos + 8 + e.name_len] == b".." {
                 put32(&mut block, e.pos, parent);
                 return self.write_block(blk, &block);
             }
         }
-        Err(EIO)
+        Err(self.corrupt())
     }
 
     fn adjust_links(&mut self, ino: u32, delta: i32) -> Result<(), i64> {
@@ -2214,9 +2502,7 @@ impl<D: Device> State<D> {
     /// A new inode named `name` in `dir`: the inode (a directory's parent counts its ".."),
     /// and its name, in the running transaction. Its number.
     fn create(&mut self, dir: u32, name: &str, kind: &NewNode, perm: u32) -> Result<u32, i64> {
-        if name.len() > NAME_MAX {
-            return Err(ENAMETOOLONG);
-        }
+        check_name(name)?;
         // (Only "no such name" lets it be made: a failed lookup is no proof of none.)
         match self.lookup(dir, name) {
             Ok(_) => return Err(EEXIST),
@@ -2224,6 +2510,9 @@ impl<D: Device> State<D> {
             Err(e) => return Err(e),
         }
         let is_dir = matches!(kind, NewNode::Dir);
+        if is_dir && self.read_inode(dir)?.links() >= LINK_MAX {
+            return Err(EMLINK);
+        }
         let ino = self.alloc_inode(is_dir, self.group_of(dir))?;
         let ftype = self.init_inode(dir, ino, kind, perm)?;
         self.dir_add(dir, name, ino, ftype)?;
@@ -2266,7 +2555,8 @@ impl<D: Device> State<D> {
                 if target.len() < FAST_SYMLINK_MAX {
                     inode.0[40..40 + target.len()].copy_from_slice(target.as_bytes());
                 } else {
-                    if target.len() > self.block_size {
+                    // (Short of the block, as Linux's ext2 and e2fsck want: `check_inode`.)
+                    if target.len() >= self.block_size {
                         return Err(ENAMETOOLONG);
                     }
                     let blk = self.alloc_block(goal, false)?;
@@ -2299,7 +2589,8 @@ impl<D: Device> State<D> {
     /// number is reused.)
     fn release(&mut self, ino: u32, mut inode: RawInode) -> Result<(), i64> {
         let dir = inode.is_dir();
-        if !inode.fast_symlink() {
+        // (Only pointers to blocks: a device's hold its number.)
+        if inode.has_blocks() {
             self.cut_blocks(ino, &mut inode, 0)?;
         }
         // Its promises go with it.
@@ -2374,7 +2665,11 @@ impl<D: Device> State<D> {
             if dir == ROOT_INO {
                 return Ok(false);
             }
-            dir = self.lookup(dir, "..")?;
+            // (A directory without "..", or whose ".." is no directory, is corrupt.)
+            dir = match self.lookup(dir, "..") {
+                Err(ENOENT | ENOTDIR) => return Err(self.corrupt()),
+                r => r?,
+            };
         }
         Err(ELOOP)
     }
@@ -2384,9 +2679,7 @@ impl<D: Device> State<D> {
     /// removal, a moved directory's ".." and its parents' counts, and the replaced inode's
     /// lost link (`gone` if its last). The inodes to hold until their release.
     fn rename(&mut self, odir: u32, oname: &str, ndir: u32, nname: &str, in_use: &dyn Fn(u32) -> bool) -> Result<Vec<(u32, u32)>, i64> {
-        if nname.len() > NAME_MAX {
-            return Err(ENAMETOOLONG);
-        }
+        check_name(nname)?;
         if [oname, nname].iter().any(|n| *n == "." || *n == "..") {
             return Err(EINVAL);
         }
@@ -2422,7 +2715,12 @@ impl<D: Device> State<D> {
                 }
                 self.dir_set(ndir, nname, ino, ftype)?;
             }
-            None => self.dir_add(ndir, nname, ino, ftype)?,
+            None => {
+                if is_dir && odir != ndir && self.read_inode(ndir)?.links() >= LINK_MAX {
+                    return Err(EMLINK);
+                }
+                self.dir_add(ndir, nname, ino, ftype)?
+            }
         }
         self.dir_remove(odir, oname)?;
         if is_dir && odir != ndir {
@@ -2447,12 +2745,17 @@ impl<D: Device> State<D> {
         if inode.mode() as u32 & S_IFMT != S_IFLNK {
             return Err(EINVAL);
         }
+        // (Its size within its form, `check_inode`; a slow one without its block is corrupt.)
+        self.check_inode(&inode)?;
         let len = inode.size() as usize;
         let bytes = if inode.fast_symlink() {
-            inode.0[40..40 + len.min(FAST_SYMLINK_MAX)].to_vec()
+            inode.0[40..40 + len].to_vec()
         } else {
             let blk = self.bmap(ino, &mut inode, 0, false)?;
-            self.read_block(blk)?[..len.min(self.block_size)].to_vec()
+            if blk == 0 {
+                return Err(self.corrupt());
+            }
+            self.read_block(blk)?[..len].to_vec()
         };
         String::from_utf8(bytes).map_err(|_| EIO)
     }
@@ -2461,7 +2764,7 @@ impl<D: Device> State<D> {
 
     /// Inode `ino` if it is in use: in range, allocated (it has a mode) and
     /// not freed (no deletion time; an unlinked inode still open is in
-    /// use). ENOENT otherwise.
+    /// use). ENOENT otherwise; EUCLEAN if it is corrupt (`check_inode`).
     fn live_inode(&mut self, ino: u32) -> Result<RawInode, i64> {
         let count = self.inodes_per_group as u64 * self.groups.len() as u64;
         if ino == 0 || ino as u64 > count {
@@ -2476,6 +2779,7 @@ impl<D: Device> State<D> {
         if !self.test_bit(self.groups[g].inode_bitmap, (ino - 1) % self.inodes_per_group)? {
             return Err(ENOENT);
         }
+        self.check_inode(&inode)?;
         Ok(inode)
     }
 
@@ -2505,7 +2809,7 @@ impl<D: Device> State<D> {
 
     /// Whether `ino` may be on the orphan list: a file's number, allocated in the inode
     /// bitmap, with a mode, and no links unless a regular file (a cut's, `cut_pause`: cut to
-    /// its size by recovery), as e2fsck and ext4 check an entry.
+    /// its size by recovery), as e2fsck and ext4 check an entry; and sound (`check_inode`).
     fn may_be_orphan(&mut self, ino: u32) -> Result<bool, i64> {
         if ino < self.first_ino().max(1) || ino > self.inode_count() {
             return Ok(false);
@@ -2515,7 +2819,7 @@ impl<D: Device> State<D> {
             return Ok(false);
         }
         let inode = self.read_inode(ino)?;
-        Ok(inode.mode() != 0 && (inode.links() == 0 || inode.is_reg()))
+        Ok(inode.mode() != 0 && (inode.links() == 0 || inode.is_reg()) && self.check_inode(&inode).is_ok())
     }
 
     /// At mount: reads the list into `orphans`. The list is cut before the first entry
@@ -2678,16 +2982,17 @@ impl<D: Device> State<D> {
         };
         let n = self.groups.len();
         for (i, g) in (goal..n).chain(0..goal).enumerate() {
-            if self.groups[g].free_blocks == 0 {
+            if self.groups[g].free_blocks == 0 || self.bad_block_bitmaps.contains(&g) {
                 continue;
             }
-            let first = fdb + g as u32 * bpg;
-            let limit = bpg.min(self.blocks_count - first);
+            let (first, limit) = (self.group_first(g), self.group_len(g));
             let from = if i == 0 { start } else { 0 };
-            if let Some(bit) = self.find_bit(self.groups[g].block_bitmap, limit, from, Some(first))? {
-                self.reserved.insert(first + bit);
-                return Ok(first + bit);
+            let Some(bit) = self.find_bit(self.groups[g].block_bitmap, limit, from, Some(first))? else { continue };
+            if self.system_free(g, first + bit) {
+                continue;
             }
+            self.reserved.insert(first + bit);
+            return Ok(first + bit);
         }
         Err(ENOSPC)
     }
@@ -2937,10 +3242,13 @@ impl<D: Device> Ext2<D> {
             return Err("not an ext2 filesystem");
         }
         let rev = le32(&sb, 76);
-        let (inode_size, incompat, ro_compat) = if rev >= 1 {
-            (le16(&sb, 88) as usize, le32(&sb, 96), le32(&sb, 100))
+        if rev > 1 {
+            return Err("unsupported ext2 revision");
+        }
+        let (inode_size, first_ino, compat, incompat, ro_compat) = if rev == 1 {
+            (le16(&sb, 88) as usize, le32(&sb, 84), le32(&sb, 92), le32(&sb, 96), le32(&sb, 100))
         } else {
-            (128, 0, 0)
+            (128, GOOD_OLD_FIRST_INO, 0, 0, 0)
         };
         if incompat & !(INCOMPAT_FILETYPE | INCOMPAT_RECOVER) != 0 || ro_compat & !RO_COMPAT_SUPPORTED != 0 {
             return Err("unsupported ext2 features");
@@ -2954,16 +3262,49 @@ impl<D: Device> Ext2<D> {
         let blocks_count = le32(&sb, 4);
         let blocks_per_group = le32(&sb, 32);
         let inodes_per_group = le32(&sb, 40);
+        // (The superblock is at byte 1024: the descriptors follow it, in block 2 with 1 KiB
+        // blocks, where the first data block is 1, else in block 1, after block 0.)
+        if first_data_block != (block_size == 1024) as u32 || blocks_count <= first_data_block {
+            return Err("corrupt superblock: its first data block or block count");
+        }
         // A group's bitmaps are one block each: its sizes must fit one, and
         // an inode must fit a block (or the bitmap and table arithmetic
         // would index past them).
         let bits = 8 * block_size as u32;
-        if blocks_per_group == 0 || inodes_per_group == 0 || blocks_count <= first_data_block {
+        if blocks_per_group == 0 || inodes_per_group == 0 {
             return Err("corrupt superblock");
         }
         if blocks_per_group > bits || inodes_per_group > bits || inode_size > block_size || !inode_size.is_power_of_two() {
             return Err("corrupt superblock: group or inode sizes do not fit a block");
         }
+        // The groups the blocks make have the inodes the superblock counts (as ext4 checks),
+        // from `s_first_ino` (past the reserved ones) on.
+        let count = (blocks_count - first_data_block).div_ceil(blocks_per_group) as usize;
+        let inodes = count as u64 * inodes_per_group as u64;
+        if inodes != le32(&sb, 0) as u64 {
+            return Err("corrupt superblock: the inode count does not match the groups");
+        }
+        if first_ino < GOOD_OLD_FIRST_INO || first_ino as u64 > inodes {
+            return Err("corrupt superblock: the first inode");
+        }
+        // Every group begins with a copy of the superblock and the descriptors, or none
+        // (`has_super`); the first group holds that, two bitmaps and an inode table (no
+        // meta_bg, no flex_bg): so the descriptors, and the memory they take, are bounded
+        // by a group's blocks.
+        let reserved_gdt = if compat & COMPAT_RESIZE_INODE != 0 { le16(&sb, 206) as u64 } else { 0 };
+        let super_len = 1 + (count as u64 * 32).div_ceil(block_size as u64) + reserved_gdt;
+        let table_blocks = (inodes_per_group as u64 * inode_size as u64).div_ceil(block_size as u64);
+        if super_len + 2 + table_blocks > blocks_per_group.min(blocks_count - first_data_block) as u64 {
+            return Err("corrupt superblock: the group descriptors do not fit the first group");
+        }
+        // The device has the filesystem's last block: nothing the counts drive goes beyond
+        // the disk there is.
+        let mut last = vec![0u8; block_size];
+        dev.read((blocks_count - 1) as u64 * (block_size / SECTOR_SIZE) as u64, &mut last)
+            .map_err(|_| "the filesystem is larger than the device")?;
+        drop(last);
+        let mut groups = Vec::new();
+        groups.try_reserve_exact(count).map_err(|_| "no memory for the group descriptors")?;
         let mut st = State {
             dev,
             block_size,
@@ -2975,7 +3316,13 @@ impl<D: Device> Ext2<D> {
             free_blocks: le32(&sb, 12),
             free_inodes: le32(&sb, 16),
             gdt_block: first_data_block + 1,
-            groups: Vec::new(),
+            groups,
+            super_len: super_len as u32,
+            table_blocks: table_blocks as u32,
+            sparse_super: ro_compat & RO_COMPAT_SPARSE_SUPER != 0,
+            journal_blocks: BlockSet::new(),
+            bad_block_bitmaps: BTreeSet::new(),
+            bad_inode_bitmaps: BTreeSet::new(),
             cache: BlockCache::new(cache_bytes / block_size),
             cache_bytes,
             sb,
@@ -3004,23 +3351,53 @@ impl<D: Device> Ext2<D> {
             journal: None,
             read_only: false,
         };
-        let count = (blocks_count - first_data_block).div_ceil(blocks_per_group) as usize;
+        let (mut free_blocks, mut free_inodes) = (0u64, 0u64);
         for g in 0..count {
             let byte = g * 32;
             let block = st.gdt_block + (byte / block_size) as u32;
             let buf = st.read_block(block).map_err(|_| "cannot read the group descriptors")?;
             let o = byte % block_size;
-            st.groups.push(Group {
+            let group = Group {
                 block_bitmap: le32(&buf, o),
                 inode_bitmap: le32(&buf, o + 4),
                 inode_table: le32(&buf, o + 8),
                 free_blocks: le16(&buf, o + 12),
                 free_inodes: le16(&buf, o + 14),
                 used_dirs: le16(&buf, o + 16),
-            });
+            };
+            // Its bitmaps and inode table inside the group, after its copy of the superblock
+            // and descriptors, apart (as ext4's `ext4_check_descriptors`); its counts within
+            // its blocks and inodes.
+            let first = st.group_first(g) as u64 + if has_super(st.sparse_super, g) { super_len } else { 0 };
+            let end = st.group_first(g) as u64 + st.group_len(g) as u64;
+            let inside = |b: u32, len: u64| b as u64 >= first && b as u64 + len <= end;
+            let table = group.inode_table as u64..group.inode_table as u64 + table_blocks;
+            let apart = group.block_bitmap != group.inode_bitmap
+                && !table.contains(&(group.block_bitmap as u64))
+                && !table.contains(&(group.inode_bitmap as u64));
+            if !inside(group.block_bitmap, 1) || !inside(group.inode_bitmap, 1) || !inside(group.inode_table, table_blocks) || !apart {
+                return Err("corrupt group descriptor: its bitmaps or inode table are not its group's");
+            }
+            let ipg = inodes_per_group as u16;
+            if group.free_blocks as u32 > st.group_len(g) || group.free_inodes > ipg || group.used_dirs > ipg {
+                return Err("corrupt group descriptor: its counts exceed its group");
+            }
+            free_blocks += group.free_blocks as u64;
+            free_inodes += group.free_inodes as u64;
+            st.groups.push(group);
+        }
+        // The superblock's totals are the descriptors' (as Linux counts them at mount: the
+        // superblock's may be stale), written with the next commit if they differ.
+        let (free_blocks, free_inodes) = (free_blocks as u32, free_inodes as u32);
+        if (st.free_blocks, st.free_inodes) != (free_blocks, free_inodes) {
+            (st.free_blocks, st.free_inodes) = (free_blocks, free_inodes);
+            put32(&mut st.sb, 12, free_blocks);
+            put32(&mut st.sb, 16, free_inodes);
+            st.super_dirty = true;
         }
         st.read_only = st.dev.read_only();
-        if le32(&st.sb, 92) & COMPAT_HAS_JOURNAL != 0 {
+        let journaled = le32(&st.sb, 92) & COMPAT_HAS_JOURNAL != 0;
+        if journaled {
             if le32(&st.sb, 224) != JOURNAL_INO {
                 return Err("an external journal");
             }
@@ -3039,9 +3416,15 @@ impl<D: Device> Ext2<D> {
                 return Self::mount_replayed(st.dev, cache_bytes, true);
             }
             st.journal = Some(j);
-            if !st.read_only {
-                st.adopt_journal_features().map_err(|_| "cannot write the journal superblock")?;
-            }
+        }
+        // The root: a sound directory in use (as ext4 refuses a root that is none), before
+        // anything is written.
+        match st.live_inode(ROOT_INO) {
+            Ok(root) if root.is_dir() && root.links() != 0 => {}
+            _ => return Err("corrupt root directory"),
+        }
+        if journaled && !st.read_only {
+            st.adopt_journal_features().map_err(|_| "cannot write the journal superblock")?;
         } else if !st.read_only {
             st.add_journal()?;
         }
@@ -3060,8 +3443,12 @@ impl<D: Device> Ext2<D> {
         Ok(fs)
     }
 
+    /// Inode `ino`'s metadata; EUCLEAN if it is in use (a mode) and corrupt.
     pub fn stat(&mut self, ino: u32) -> Result<Stat, i64> {
         let i = self.st.read_inode(ino)?;
+        if i.mode() != 0 {
+            self.st.check_inode(&i)?;
+        }
         Ok(Stat {
             mode: i.mode() as u32,
             size: i.size(),
@@ -3180,6 +3567,13 @@ impl<D: Device> Ext2<D> {
     /// Whether it is mounted read-only (`Device::read_only`): every change fails (EROFS).
     pub fn read_only(&self) -> bool {
         self.st.read_only
+    }
+
+    /// Whether the filesystem has errors: corruption was found (an operation failed with
+    /// EUCLEAN, or went on past it: "Corruption"), or the disk said so at mount. The disk
+    /// says so too once a commit wrote it, until e2fsck.
+    pub fn errors(&self) -> bool {
+        self.st.mount_state & STATE_ERROR != 0
     }
 
     pub fn write(&mut self, ino: u32, off: u64, data: &[u8]) -> Result<usize, i64> {

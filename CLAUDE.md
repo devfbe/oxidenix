@@ -38,7 +38,7 @@ An AI research project; see README.md.
   exits QEMU with 1 on success, 3 on failure; CI runs the same on every push. The tests get a
   fresh 64 MiB data disk of their own, `target/test-disk.img` (never `disk.img`); check it
   afterwards with `nix-shell -p e2fsprogs --run "e2fsck -fn target/test-disk.img"` (CI does).
-  After they passed, the builder boots a second time (`<kernel>.readonly.img`) with that disk
+  After they passed, the builder boots a second time (`<kernel>.test.readonly.img`) with that disk
   read-only (QEMU's `readonly=on`: virtio-blk's `VIRTIO_BLK_F_RO`) into `/etc/rotests.sh`
   (`rotest`: `EROFS`, `ST_RDONLY`, the data still readable); `OXIDENIX_TEST=readonly` runs
   only that boot, on a fresh disk. In test mode a boot whose shutdown complains (an instance

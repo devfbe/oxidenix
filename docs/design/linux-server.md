@@ -943,8 +943,9 @@ pipe's end is.
   memory, EACCES as Linux's for a descriptor not open for reading or a shared writable
   mapping of one not open for writing, read-only for good then; reads fill the whole count
   unless a signal comes; counts and buffers checked as Linux's `rw_verify_area` and
-  `import_iovec`); any other number has no driver (ENXIO). `O_DIRECTORY` is ENOTDIR. The
-  server's terminal, null and zero descriptors keep the node they were opened by (`Origin`):
+  `import_iovec`); (1,11) is `/dev/kmsg`, the kernel's log (`kmsg.rs`, over `SYS_KLOG_*`;
+  `syslog(2)` too); any other number has no driver (ENXIO). `O_DIRECTORY` is ENOTDIR. The
+  server's terminal, null, zero and kmsg descriptors keep the node they were opened by (`Origin`):
   fstat is the node's, live, and fchmod, fchown and futimens change it. The kernel's `/dev`
   gives its nodes their numbers (`st_rdev`).
 - **O_PATH** (`pathfile.rs`, any node of the namespace): the descriptor names the node and

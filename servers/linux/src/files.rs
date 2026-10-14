@@ -74,6 +74,8 @@ pub enum File {
     PtyMaster(Arc<crate::pty::PtyMaster>),
     /// Null or zero on a node of the server's.
     Dev(Arc<crate::devices::DevOpen>),
+    /// The kernel's log (/dev/kmsg).
+    Kmsg(Arc<crate::kmsg::KmsgOpen>),
     /// An O_PATH descriptor (of any node).
     Path(Arc<crate::pathfile::PathOpen>),
     /// An epoll instance.
@@ -143,6 +145,7 @@ impl Description {
             File::Inet(s) => s.readiness_now(),
             File::Tty(t) => t.readiness_now(),
             File::PtyMaster(m) => m.readiness_now(),
+            File::Kmsg(k) => k.readiness_now(),
             File::Epoll(e) => {
                 if e.has_events() {
                     POLLIN | POLLRDNORM
@@ -382,6 +385,7 @@ impl OriginOf {
             File::Tty(t) => &t.origin,
             File::PtyMaster(m) => &m.origin,
             File::Dev(d) => &d.origin,
+            File::Kmsg(k) => &k.origin,
             File::Path(p) => &p.origin,
             _ => unreachable!("only files with an origin"),
         }
@@ -396,7 +400,7 @@ pub fn origin_of(fd: u64) -> Option<OriginOf> {
 pub fn origin_of_file(f: &FileRef) -> Option<OriginOf> {
     let file = f.file.clone();
     let o_path = match &file {
-        File::Tty(_) | File::PtyMaster(_) | File::Dev(_) => false,
+        File::Tty(_) | File::PtyMaster(_) | File::Dev(_) | File::Kmsg(_) => false,
         File::Path(_) => true,
         _ => return None,
     };
@@ -434,6 +438,7 @@ pub fn stat_file(file: &File) -> Result<vfs::stat::Stat, i64> {
         File::Tty(t) => t.origin.stat()?,
         File::PtyMaster(m) => m.origin.stat()?,
         File::Dev(d) => d.origin.stat()?,
+        File::Kmsg(k) => k.origin.stat()?,
         File::Path(p) => p.origin.stat()?,
         File::Epoll(e) => e.stat(),
         File::Proc(p) => crate::procfs::stat(&p.node)?,
@@ -591,6 +596,7 @@ fn on_file(nr: u64, file: &File, flags: u32, a1: u64, a2: u64, a3: u64) -> Resul
         File::Tty(t) => return crate::tty::call(nr, t, flags, a1, a2),
         File::PtyMaster(m) => return crate::pty::call(nr, m, flags, a1, a2),
         File::Dev(d) => return crate::devices::call(nr, d, flags, a1, a2),
+        File::Kmsg(k) => return crate::kmsg::call(nr, k, flags, a1, a2),
         File::Path(p) => return crate::pathfile::call(nr, p, a1),
         File::Epoll(e) => return crate::epoll::on_file(nr, e, a1),
         File::Proc(p) => return crate::procfile::call(nr, p, flags, a1, a2, a3),
@@ -673,7 +679,8 @@ fn sendfile(out_fd: u64, in_fd: u64, offset: u64, count: u64) -> Result<i64, i64
     }
     // An eventfd moves 8-byte values, not data; a directory none; a
     // netlink socket datagrams; an epoll instance nothing.
-    let unfit = |f: &File| matches!(f, File::EventFd(_) | File::Netlink(_) | File::Inotify(_) | File::Epoll(_));
+    // (/dev/kmsg moves whole records, not a stream: Linux's has no splice either.)
+    let unfit = |f: &File| matches!(f, File::EventFd(_) | File::Netlink(_) | File::Inotify(_) | File::Epoll(_) | File::Kmsg(_));
     if unfit(&out.file) || unfit(&input.file) {
         return Err(EINVAL);
     }
@@ -705,7 +712,7 @@ fn sendfile(out_fd: u64, in_fd: u64, offset: u64, count: u64) -> Result<i64, i64
             File::PtyMaster(m) => m.read(crate::unix::Sink::Server { buf: &mut buf[..want], at: 0 }, in_flags & O_NONBLOCK != 0),
             File::Dev(d) => crate::devices::read(d, crate::unix::Sink::Server { buf: &mut buf[..want], at: 0 }),
             File::Proc(f) => f.read_server(&mut buf[..want]).map(|n| n as i64),
-            File::EventFd(_) | File::Netlink(_) | File::Inotify(_) | File::Epoll(_) | File::Path(_) => Err(EINVAL),
+            File::EventFd(_) | File::Netlink(_) | File::Inotify(_) | File::Epoll(_) | File::Kmsg(_) | File::Path(_) => Err(EINVAL),
         };
         let n = match n {
             Ok(n) => n as usize,
@@ -725,7 +732,7 @@ fn sendfile(out_fd: u64, in_fd: u64, offset: u64, count: u64) -> Result<i64, i64
             File::PtyMaster(m) => m.write(crate::unix::Source::Server { buf: &buf[..n], at: 0 }, out_flags & O_NONBLOCK != 0),
             File::Dev(_) => Ok(n as i64),
             File::Path(_) | File::Proc(_) => Err(EBADF),
-            File::EventFd(_) | File::Netlink(_) | File::Inotify(_) | File::Epoll(_) => Err(EINVAL),
+            File::EventFd(_) | File::Netlink(_) | File::Inotify(_) | File::Epoll(_) | File::Kmsg(_) => Err(EINVAL),
         };
         match wrote {
             Ok(_) => total += n as u64,

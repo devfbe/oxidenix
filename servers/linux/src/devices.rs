@@ -48,7 +48,7 @@ fn access_ok(addr: u64, len: u64) -> bool {
 }
 
 /// A read's or write's buffer, checked and clamped as Linux's (`rw_verify_area`).
-fn one_buffer(addr: u64, len: u64) -> Result<Vec<(u64, u64)>, i64> {
+pub fn one_buffer(addr: u64, len: u64) -> Result<Vec<(u64, u64)>, i64> {
     if len > isize::MAX as u64 {
         return Err(EINVAL);
     }

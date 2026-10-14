@@ -4,11 +4,6 @@ What is known to be missing or unfinished, collected from the reviews and agent 
 2026-10-10 (main after the ext3 journal). Items that are being worked on name their branch. When an item is
 done, delete it here in the same commit.
 
-## Filesystem hardening
-
-- The ext2 code trusts other on-disk metadata (directory sizes, group counts) bounded only by
-  the device.
-
 ## Performance
 
 - **Cached 4 KiB reads got slower with R8** (`read_4k_cached` about +30–46 %, `fstat_disk`
