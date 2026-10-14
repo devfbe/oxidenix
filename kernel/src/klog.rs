@@ -38,6 +38,10 @@ const HEADER: usize = 8 + 8 + 2 + 2;
 
 /// `KERN_INFO`: the level of the kernel's own messages (facility 0, the kernel's).
 pub const LEVEL_INFO: u16 = 6;
+/// `KERN_ERR` and `KERN_WARNING`, for messages that say as much on Linux (the OOM
+/// killer's).
+pub const LEVEL_ERR: u16 = 3;
+pub const LEVEL_WARNING: u16 = 4;
 /// Linux's default console level: levels 0-6 are printed.
 const CONSOLE_DEFAULT: u32 = 7;
 /// The lowest level `CONSOLE_OFF` and `CONSOLE_LEVEL` leave (Linux's `minimum_console_loglevel`).

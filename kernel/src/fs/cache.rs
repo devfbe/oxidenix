@@ -97,13 +97,13 @@ impl CacheCounts {
     /// its write-back (half the global hard ratio: Linux bounds each
     /// device's share of the dirty pages the same way).
     fn dirty_limit() -> u64 {
-        memory::commit_stats().1 / HARD / 2
+        memory::user_pages() / HARD / 2
     }
 
     /// The most pages an instance may have pinned (filled or written back
-    /// at once): a quarter of the commit limit.
+    /// at once): a quarter of user memory.
     fn pinned_limit() -> u64 {
-        memory::commit_stats().1 / 4
+        memory::user_pages() / 4
     }
 }
 
@@ -138,10 +138,10 @@ static TMPFS_LIMIT: AtomicU64 = AtomicU64::new(0);
 static CACHES: IrqSpinLock<Vec<Weak<PageCache>>> = IrqSpinLock::new(Vec::new());
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
-/// Sets the tmpfs limit from the commit limit (after memory::init) and
+/// Sets the tmpfs limit from user memory (after memory::init) and
 /// lets commits reclaim cached pages.
 pub fn init() {
-    TMPFS_LIMIT.store(memory::commit_stats().1 / 2, Ordering::Relaxed);
+    TMPFS_LIMIT.store(memory::user_pages() / 2, Ordering::Relaxed);
     memory::set_reclaim(reclaim);
 }
 
@@ -261,7 +261,7 @@ pub enum Fill {
 /// for one read or write of the disk server: `fsring::MAX_TRANSFER`).
 pub const MAX_RUN: u64 = 256;
 
-/// The dirty pages of every cache, in pages of the commit limit: above
+/// The dirty pages of every cache, in pages of user memory: above
 /// `1 / BACKGROUND` the pagers are asked to write back, above `1 / HARD` a
 /// thread that stores waits for them (as Linux's dirty ratios).
 const BACKGROUND: u64 = 10;
@@ -287,7 +287,7 @@ fn undirty(pages: u64) {
     }
     CLEANED.fetch_add(pages, Ordering::Relaxed);
     let before = DIRTY.fetch_sub(pages, Ordering::Relaxed);
-    let hard = memory::commit_stats().1 / HARD;
+    let hard = memory::user_pages() / HARD;
     if before > hard && before - pages <= hard {
         crate::process::sched::wakeup(dirty_chan());
     }
@@ -681,6 +681,12 @@ impl PageCache {
     /// Whether this is a cached store's object.
     pub fn is_cached(&self) -> bool {
         matches!(self.store, Store::Cached { .. })
+    }
+
+    /// Whether its pages are memory only (tmpfs, anonymous shared memory):
+    /// what Linux counts as shmem in a process's resident pages.
+    pub fn is_shmem(&self) -> bool {
+        matches!(self.store, Store::Memory { .. })
     }
 
     /// Wakes the threads waiting for this object's pages if `wake` says a
@@ -2220,7 +2226,7 @@ impl Mappers {
 
 /// Called after a store made a page of `dirtied` dirty, with no lock held,
 /// so dirty pages (which reclaim cannot drop) never crowd out memory: above
-/// a tenth of the commit limit the pagers of the cached objects are asked
+/// a tenth of user memory the pagers of the cached objects are asked
 /// to write back; above a fifth the storing thread waits for them (up to
 /// `THROTTLE` at a time; never a pager's own thread, which does the
 /// writing).
@@ -2236,17 +2242,18 @@ pub fn balance_dirty(dirtied: &PageCache) {
     if unavailable_pages() == 0 {
         return;
     }
-    let limit = memory::commit_stats().1;
-    let (background, hard) = (limit / BACKGROUND, limit / HARD);
+    let memory = memory::user_pages();
+    let (background, hard) = (memory / BACKGROUND, memory / HARD);
     // The share of the instance that owns the file the store dirtied (it
     // was charged for the page, whoever stored).
     let own = dirtied.counts();
     let own_over = || own.is_some_and(|c| c.dirty.load(Ordering::Relaxed) > CacheCounts::dirty_limit());
     // Committed memory and the cache pages reclaim cannot drop together
-    // beyond the limit: the frames promised could not all be had.
+    // beyond the limit: the frames promised could not all be had (a
+    // promise only the strict overcommit mode makes).
     let crowding = || {
         let (committed, limit) = memory::commit_stats();
-        committed + unavailable_pages() > limit
+        memory::overcommit::strict() && committed + unavailable_pages() > limit
     };
     if dirty_pages() <= background && !crowding() && !own_over() {
         return;

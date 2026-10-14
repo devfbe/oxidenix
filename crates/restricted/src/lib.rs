@@ -263,7 +263,7 @@ pub const EVENT_RELEASE: u64 = 3;
 /// is its key. (Again once all were written back and one is dirtied.)
 pub const EVENT_DIRTY: u64 = 4;
 /// Dirty pages crowd out memory (reclaim cannot drop them, or more than a
-/// tenth of the commit limit is dirty): write back about `a` pages. One is
+/// tenth of user memory is dirty): write back about `a` pages. One is
 /// queued at a time.
 pub const EVENT_WRITEBACK: u64 = 5;
 /// `event_wait`'s deadline passed.
@@ -582,8 +582,8 @@ pub const GRANT_FILL: u64 = 2;
 /// a page dirty and the file longer at once). One call looks at a bounded
 /// number of present pages: EAGAIN with the page to go on from at `out`
 /// if it found no run among them. EBUSY if the instance's cached objects
-/// have as many pages pinned as one instance may (a quarter of the commit
-/// limit): the server asks again once its transfers in flight ended.
+/// have as many pages pinned as one instance may (a quarter of user
+/// memory): the server asks again once its transfers in flight ended.
 pub const GRANT_DIRTY: u64 = 4;
 /// `revoke(handle, grant) -> 0 | REVOKE_DRAINING`: takes a grant back. Its
 /// mappings in the service are gone when the call returns. If the service
@@ -918,6 +918,34 @@ pub const SYS_FILE_PAGES: u64 = 1166;
 /// before it looks at the arguments (`reboot` in a pid namespace that is
 /// not the initial one, `settimeofday` with only a time zone).
 pub const SYS_HOST_GRANTED: u64 = 1167;
+/// `oom_score_adj(handle, set, value) -> old + 1000`: the OOM killer's
+/// adjustment of process `handle` (0: the caller's), -1000..=1000 (Linux's
+/// oom_score_adj: thousandths of all memory added to its badness; -1000
+/// exempts it), before a change. With `set` `OOM_ADJ_SET` it becomes
+/// `value` (EINVAL outside the range) for the process and every other
+/// process sharing its address space (but a host tree's first process);
+/// below the least the process may set (its oom_score_adj_min, 0 unless set
+/// so) only with the host grant (EACCES: Linux's CAP_SYS_RESOURCE, the
+/// memory being the machine's), which also makes `value` the new least,
+/// unless `OOM_ADJ_LEGACY` is set too (a write of the old oom_adj). A
+/// process `proc_create` makes starts with its creator's; exec keeps it.
+pub const SYS_OOM_SCORE_ADJ: u64 = 1176;
+pub const OOM_ADJ_SET: u64 = 1;
+pub const OOM_ADJ_LEGACY: u64 = 2;
+/// `overcommit(which, set, value) -> old`: the machine's overcommit policy,
+/// as Linux's vm sysctls (ADR 0013): `OVERCOMMIT_MODE` (0 heuristic: a
+/// commit fails only if it alone is more than all memory; 1 always; 2
+/// strict, oxidenix's default: committed memory stays within the commit
+/// limit), `OVERCOMMIT_RATIO` (the commit limit in percent of user memory,
+/// 100 by default) or `OVERCOMMIT_KBYTES` (the commit limit in KiB instead;
+/// 0: the ratio applies; setting either sets the other to 0), before a
+/// change. With `set` 1 it becomes `value`: EINVAL for a mode above 2, a
+/// ratio above `i32::MAX` or KiB above `i64::MAX`; EPERM without the host
+/// grant (see `SYS_CLOCK_SET`). EINVAL for another `which`.
+pub const SYS_OVERCOMMIT: u64 = 1177;
+pub const OVERCOMMIT_MODE: u64 = 0;
+pub const OVERCOMMIT_RATIO: u64 = 1;
+pub const OVERCOMMIT_KBYTES: u64 = 2;
 /// `stack_limit(handle, limit)`: how far the stack of process `handle` (0:
 /// the caller's) may grow below its top, its soft RLIMIT_STACK, read at
 /// each growth within the stack's ceiling (`MO_GROWSDOWN`'s offset).
@@ -946,6 +974,20 @@ pub struct ProcInfo {
     pub killed: u64,
     /// The kernel's id of it (for its monitor and messages).
     pub kernel_pid: u64,
+    /// Of `pages`: private ones (anonymous memory, private copies of file
+    /// pages) and those of memory-only files (tmpfs, shared anonymous
+    /// memory); the rest are file pages. And its page tables, in pages.
+    pub anon_pages: u64,
+    pub shmem_pages: u64,
+    pub table_pages: u64,
+    /// Its oom_score_adj (`SYS_OOM_SCORE_ADJ`), and its badness as the OOM
+    /// killer weighs it now (resident pages and page tables, plus
+    /// oom_score_adj thousandths of `total_pages`): `i64::MIN` if the
+    /// killer would not choose it (/proc/<pid>/oom_score shows 0 then).
+    pub oom_score_adj: i64,
+    pub oom_points: i64,
+    /// All memory, in pages (what the badness is measured against).
+    pub total_pages: u64,
 }
 
 /// What `thread_info` tells about a thread.

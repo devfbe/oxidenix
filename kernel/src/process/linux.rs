@@ -225,7 +225,7 @@ fn zeroed_frame() -> Result<PhysFrame, i64> {
 /// for everyone (the commit guarantee holds); commits beyond it are
 /// ordinary ones. It is had when there is room (never at the cost of a
 /// tree's start or of another commit) and all instances' together are at
-/// most `HEAP_POOL_SHARE` of the commit limit (`pageheap::charge`, whose
+/// most `HEAP_POOL_SHARE` of user memory (`pageheap::charge`, whose
 /// arithmetic is host-tested).
 const HEAP_RESERVE: u64 = 512;
 const HEAP_POOL_SHARE: u64 = 16;
@@ -243,7 +243,7 @@ impl HeapArea {
     /// Tops the reserve up as far as the pool and the commit limit allow
     /// now (failing nothing).
     fn grow_reserve(&mut self) {
-        HEAP_POOL.set_max(memory::commit_stats().1 / HEAP_POOL_SHARE);
+        HEAP_POOL.set_max(memory::user_pages() / HEAP_POOL_SHARE);
         let want = HEAP_POOL.take(self.charge.deficit(HEAP_RESERVE));
         if want == 0 {
             return;
@@ -267,13 +267,20 @@ const UNMAP_BATCH: usize = 64;
 /// else one clean cache pages give back (those used lately too); never a
 /// wait (for write-back, for an address space): the server may be the one
 /// to write back, and its heap fails fast (ENOMEM) rather than wait for
-/// itself.
-fn heap_frame() -> Result<PhysFrame, i64> {
+/// itself. For a commit from the instance's reserve (an allocation the
+/// server cannot fail, `use_reserve`) one of the kernel's reserve if user
+/// memory is exhausted (`memory::emergency_frame`: possible when memory is
+/// overcommitted, until the OOM killer made room).
+fn heap_frame(use_reserve: bool) -> Result<PhysFrame, i64> {
     if let Ok(frame) = zeroed_frame() {
         return Ok(frame);
     }
     memory::reclaim_forced(1);
-    zeroed_frame()
+    zeroed_frame().or_else(|e| {
+        let frame = use_reserve.then(memory::emergency_frame).flatten().ok_or(e)?;
+        unsafe { core::ptr::write_bytes(memory::phys_to_virt(frame.start_address().as_u64()), 0, 4096) };
+        Ok(frame)
+    })
 }
 
 /// Pages `Instance::commit_heap` takes frames for at a time (on the stack,
@@ -814,7 +821,7 @@ impl Instance {
             })
         };
         for slot in frames.iter_mut().take(want) {
-            match heap_frame() {
+            match heap_frame(use_reserve) {
                 Ok(frame) => *slot = Some(frame),
                 Err(e) => {
                     free(&mut frames);
@@ -1301,6 +1308,12 @@ impl Drop for Record {
 /// Gives `instance` the host grant (see `Instance::host`), or takes it.
 pub fn host_grant(instance: &Instance, on: bool) {
     instance.host.store(on, core::sync::atomic::Ordering::Release);
+}
+
+/// Whether the instance `id` (`ThreadGroup::instance`) holds the host grant
+/// (false if it is gone, or there is no memory to look). With no lock held.
+pub fn host_granted(id: u64) -> bool {
+    instances(None).iter().any(|i| i.id == id && i.host.load(core::sync::atomic::Ordering::Acquire))
 }
 
 /// Grants the console device to `instance` (None: the kernel's monitor, which
@@ -1906,6 +1919,37 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             true => Ok(0),
             false => Err(EPERM),
         },
+        SYS_OOM_SCORE_ADJ => {
+            let group = if a[0] == 0 { super::sched::current().group.clone() } else { container(&instance, a[0])?.group.clone() };
+            let old = match a[1] {
+                0 => group.oom_score_adj.load(core::sync::atomic::Ordering::Relaxed),
+                set if set & !OOM_ADJ_LEGACY == OOM_ADJ_SET => {
+                    let host = instance.host.load(core::sync::atomic::Ordering::Acquire);
+                    crate::memory::oom::set_score_adj(&group, a[2] as i64, host, a[1] & OOM_ADJ_LEGACY != 0)?
+                }
+                _ => return Err(EINVAL),
+            };
+            Ok(old + 1000)
+        }
+        SYS_OVERCOMMIT => {
+            use crate::memory::overcommit;
+            if a[1] > 1 {
+                return Err(EINVAL);
+            }
+            if a[1] == 1 && !instance.host.load(core::sync::atomic::Ordering::Acquire) {
+                return Err(EPERM);
+            }
+            let old = match (a[0], a[1] == 1) {
+                (OVERCOMMIT_MODE, false) => overcommit::mode(),
+                (OVERCOMMIT_RATIO, false) => overcommit::ratio(),
+                (OVERCOMMIT_KBYTES, false) => overcommit::kbytes(),
+                (OVERCOMMIT_MODE, true) => overcommit::set_mode(a[2])?,
+                (OVERCOMMIT_RATIO, true) => overcommit::set_ratio(a[2])?,
+                (OVERCOMMIT_KBYTES, true) if a[2] <= i64::MAX as u64 => overcommit::set_kbytes(a[2])?,
+                _ => return Err(EINVAL),
+            };
+            Ok(old as i64)
+        }
         SYS_FILE_PAGES => {
             let (used, limit) = crate::fs::cache::tmpfs_usage();
             let mut out = [0u8; 16];
@@ -2451,7 +2495,11 @@ fn process_call(instance: &Arc<Instance>, nr: u64, a: [u64; 6]) -> SysResult {
             info.mem = Some(mm.stats.clone());
             let group = ThreadGroup::new(pid.pid, info).ok_or(ENOMEM)?;
             // (A default: the server sets the new process's own, from its copy of the limits.)
-            group.stack_soft.store(super::sched::current().group.stack_soft.load(Relaxed), Relaxed);
+            let parent = &super::sched::current().group;
+            group.stack_soft.store(parent.stack_soft.load(Relaxed), Relaxed);
+            // The OOM killer's adjustment is inherited (Linux's signal_struct).
+            group.oom_score_adj.store(parent.oom_score_adj.load(Relaxed), Relaxed);
+            group.oom_score_adj_min.store(parent.oom_score_adj_min.load(Relaxed), Relaxed);
             group.instance.store(instance.id, Release);
             group.server_reaps.store(true, Relaxed);
             let c = Arc::try_new(Container { group, fresh: spin::Mutex::new(Some(Fresh { mm, pid })) }).map_err(|_| ENOMEM)?;
@@ -2478,6 +2526,9 @@ fn process_call(instance: &Arc<Instance>, nr: u64, a: [u64; 6]) -> SysResult {
                 (out.user_ns, out.system_ns) = info.cputime();
                 if let Some(mem) = &info.mem {
                     out.pages = mem.pages.load(Relaxed);
+                    out.anon_pages = mem.anon_pages.load(Relaxed).min(out.pages);
+                    out.shmem_pages = mem.shmem_pages.load(Relaxed).min(out.pages - out.anon_pages);
+                    out.table_pages = mem.table_pages.load(Relaxed);
                     out.virt_pages = mem.virt_pages.load(Relaxed);
                     out.peak_pages = mem.peak_pages.load(Relaxed);
                 }
@@ -2486,6 +2537,9 @@ fn process_call(instance: &Arc<Instance>, nr: u64, a: [u64; 6]) -> SysResult {
                 out.running = info.threads.iter().filter(|t| matches!(t.state(), super::task::State::Running | super::task::State::Runnable)).count() as u64;
             }
             out.killed = group.killed_by_kernel.load(Acquire);
+            out.oom_score_adj = group.oom_score_adj.load(Relaxed);
+            out.oom_points = crate::memory::oom::points(&group).unwrap_or(i64::MIN);
+            out.total_pages = crate::memory::total_pages();
             super::uaccess::copy_to_server(a[1], as_bytes(&out))?;
             Ok(0)
         }

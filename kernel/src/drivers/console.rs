@@ -803,9 +803,21 @@ macro_rules! printkln {
     ($($arg:tt)*) => ($crate::printk!("{}\n", format_args!($($arg)*)));
 }
 
+/// `printkln` at a level of the kernel's log (`klog::LEVEL_*`): `printkln_at!(level, ...)`.
+#[macro_export]
+macro_rules! printkln_at {
+    ($level:expr, $($arg:tt)*) => ($crate::drivers::console::_print_at($level, format_args!("{}\n", format_args!($($arg)*))));
+}
+
 /// `printk`: the kernel's message to its log (`KERN_INFO`) and, unless the console's
 /// level hides it, to the console.
 pub fn _print(args: fmt::Arguments) {
+    _print_at(crate::klog::LEVEL_INFO, args);
+}
+
+/// The kernel's message at `level` (facility 0) to its log and, unless the console's
+/// level hides it, to the console.
+pub fn _print_at(level: u16, args: fmt::Arguments) {
     use core::fmt::Write;
     /// The text as it is (lines end in `\n`).
     struct Raw<F: FnMut(&[u8])>(F);
@@ -815,8 +827,8 @@ pub fn _print(args: fmt::Arguments) {
             Ok(())
         }
     }
-    let _ = Raw(|b: &[u8]| crate::klog::log(crate::klog::LEVEL_INFO, b)).write_fmt(args);
-    if !crate::klog::on_console(crate::klog::LEVEL_INFO) {
+    let _ = Raw(|b: &[u8]| crate::klog::log(level, b)).write_fmt(args);
+    if !crate::klog::on_console(level) {
         return;
     }
     let _ = Text(super::serial::write_bytes).write_fmt(args);
