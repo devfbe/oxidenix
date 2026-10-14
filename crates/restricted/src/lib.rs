@@ -891,6 +891,87 @@ pub const SYS_FUTEX_REQUEUE: u64 = 1162;
 pub const FUTEX_PRIVATE: u64 = 1;
 /// `futex_requeue` compares the word first (FUTEX_CMP_REQUEUE).
 pub const FUTEX_CMP: u64 = 2;
+/// `futex_wake_op(addr, n, addr2, n2, op, flags) -> woken`: as one step
+/// under the words' locks, changes the u32 at `addr2` by the operation `op`
+/// encodes (Linux's FUTEX_OP encoding: operation, operand, comparison,
+/// comparand; ENOSYS for an operation or comparison it does not define),
+/// wakes at most `n` waiters of `addr`, and, if the old value of `addr2`
+/// passes the comparison, at most `n2` of `addr2`; returns how many it
+/// woke. EFAULT if `addr2` cannot be written, EINVAL if a waiter of either
+/// word waits in `futex_wait_requeue_pi` (as `futex_wake`).
+pub const SYS_FUTEX_WAKE_OP: u64 = 1180;
+/// `futex_owner_died(addr, id, flags) -> marked`: a robust lock's owner
+/// `id` died (or exec'd) holding the word at `addr` (the Linux server walks
+/// the thread's robust list): if the word's owner bits (`PI_ID_MASK`) hold
+/// `id`, they are cleared and `PI_OWNER_DIED` set, `PI_WAITERS` kept, as
+/// one atomic step; then, for a word that is no PI lock (`FUTEX_PI` unset)
+/// and had waiters, one waiter is woken (by the shared key). With
+/// `FUTEX_PENDING` (the list's pending entry) a non-PI word of 0 is woken
+/// too. Returns 1 if it marked the word, else 0; EFAULT if it cannot be
+/// read or written.
+pub const SYS_FUTEX_OWNER_DIED: u64 = 1181;
+/// `futex_lock_pi(addr, id, owner_id, owner_key, deadline, flags)`: takes
+/// the priority-inheritance lock at `addr` for the caller, whose id is
+/// `id` (its Linux tid; the word's format: `PI_ID_MASK`, `PI_WAITERS`,
+/// `PI_OWNER_DIED`). A word without owner is taken at once (`id`, keeping
+/// `PI_OWNER_DIED`). Otherwise `PI_WAITERS` is set and the caller sleeps
+/// until the lock is handed to it (`futex_unlock_pi`, or its owner's end),
+/// the deadline (monotonic nanoseconds; 0: none; ETIMEDOUT) or a kick
+/// (EINTR); returns 0 once it owns the lock (the word holds `id`). While
+/// it waits its owner runs with the largest weight of its own and the
+/// waiters' (theirs inherited from the locks they own in turn: the
+/// scheduler's priority inheritance, docs/design/linux-server.md). The
+/// first waiter names the owner: the server looks the word's id up and
+/// passes it (`owner_id`) with the thread's key (`owner_key`; 0: no such
+/// thread, ESRCH); if the word names another owner by the time the kernel
+/// looks, `PI_RETRY` asks the server to look again. Later waiters wait on
+/// the kernel's record of the lock. EDEADLK if the caller owns the lock or
+/// waiting would close a cycle of owners and waiters, EINVAL if a waiter
+/// of `futex_wait` waits on the word or the word's owner is not the one
+/// the kernel's record names, ESRCH if the owner is gone. With `FUTEX_TRY`
+/// it never sleeps: EAGAIN if the lock is owned.
+pub const SYS_FUTEX_LOCK_PI: u64 = 1182;
+/// `futex_unlock_pi(addr, id, flags)`: the caller (`id`) lets go of the PI
+/// lock at `addr`: the waiter of the largest weight (the first of equals)
+/// gets it (the word holds its id and `PI_WAITERS`), or the word becomes 0.
+/// EPERM if the word does not hold `id`, EINVAL if the kernel's record
+/// names another owner.
+pub const SYS_FUTEX_UNLOCK_PI: u64 = 1183;
+/// `futex_wait_requeue_pi(addr, val, deadline, addr2, id, flags)`: waits as
+/// `futex_wait` on `addr` (any bitset), to be moved by
+/// `futex_cmp_requeue_pi` onto the PI lock `addr2` (a distinct word,
+/// EINVAL otherwise) for the caller `id`. Returns 0 once the caller owns
+/// `addr2`. Before a requeue it ends as `futex_wait` does (EAGAIN,
+/// ETIMEDOUT, EINTR); after one as `futex_lock_pi` waits, except that a
+/// kick ends it with EAGAIN (it cannot restart: it no longer waits on
+/// `addr`); EDEADLK if the requeue found that it would deadlock.
+pub const SYS_FUTEX_WAIT_REQUEUE_PI: u64 = 1184;
+/// `futex_cmp_requeue_pi(addr, n_move, addr2, val, owner_key, flags) -> n`:
+/// if the word at `addr` holds `val` (else EAGAIN), the PI lock at `addr2`
+/// is taken for the first waiter of `addr` if it is free (that waiter
+/// wakes owning it), then up to `n_move` more waiters (one more if none
+/// took the lock) are moved to wait for the lock: returns how many were
+/// woken and moved. Each must wait in `futex_wait_requeue_pi` for `addr2`
+/// (EINVAL otherwise). The owner the server found in the word at `addr2`
+/// is passed as for `futex_lock_pi`: its id in bits 32..64 of `flags`, its
+/// thread's key in `owner_key` (`PI_RETRY` if the word names another).
+pub const SYS_FUTEX_CMP_REQUEUE_PI: u64 = 1185;
+/// `futex_lock_pi` only tries (FUTEX_TRYLOCK_PI).
+pub const FUTEX_TRY: u64 = 4;
+/// `futex_owner_died`: the word is a PI lock (the robust list entry's bit 0).
+pub const FUTEX_PI: u64 = 8;
+/// `futex_owner_died`: the word is the robust list's pending entry.
+pub const FUTEX_PENDING: u64 = 16;
+/// A PI lock's word (Linux's PI futex format): the owner's id, ...
+pub const PI_ID_MASK: u32 = 0x3fff_ffff;
+/// ... set while threads wait for it (an unlock must go through the kernel),
+pub const PI_WAITERS: u32 = 0x8000_0000;
+/// ... and set when its owner died holding it.
+pub const PI_OWNER_DIED: u32 = 0x4000_0000;
+/// Not an errno: the PI calls' answer when the word's owner is not the one
+/// the server named (it reads the word and looks the owner up again).
+/// Never reaches a program.
+pub const PI_RETRY: i64 = 4096;
 /// `thread_fs(set, base) -> old`: the calling thread's program's FS base
 /// (its thread pointer), which stays in the CPU while the server runs:
 /// returns it, and with `set` 1 replaces it by `base` (below 64 TiB, else
@@ -1124,3 +1205,9 @@ pub const TEST_TREE_WAIT: u64 = 1529;
 /// handle names no tree of the caller's. Test mode only; a program's call
 /// is the server's to pass on.
 pub const TEST_TREE_KILL: u64 = 1530;
+/// `(tid) -> weight`: the weight the kernel's scheduler gives the caller's
+/// thread `tid` (0: the caller) now: its nice value's, or more while it
+/// owns a PI lock others wait for (`SYS_FUTEX_LOCK_PI`) or holds a server
+/// lock. ESRCH for no such thread. Test mode only; the server passes the
+/// thread's key on (`futextest`: priority inheritance along a chain).
+pub const TEST_PI_WEIGHT: u64 = 1550;

@@ -30,7 +30,6 @@ done, delete it here in the same commit.
 
 - Processes and signals: pidfds (`CLONE_PIDFD`, `P_PIDFD`), POSIX timers, `ITIMER_VIRTUAL` and
   `ITIMER_PROF`, core files, `ptrace`, a vDSO.
-- Futexes: `FUTEX_WAKE_OP`, the priority-inheritance operations (`ENOSYS`).
 - Files: `mknod`/`mknodat`, owners and groups are accepted but not stored (everyone is root),
   `io_uring` (`ENOSYS`), `/proc/<pid>/exe` is a path link, not a magic link; `statm`'s data
   field and `VmData`/`VmStk`/`VmExe`/`VmLib` are missing.

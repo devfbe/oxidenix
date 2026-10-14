@@ -123,6 +123,7 @@ processes, threads, memory objects and the services it uses.
 | devices | interrupts, I/O ports, PCI functions, DMA areas (as today; IOMMU per `iommu.md`) |
 | console | the framebuffer console and keyboard as a raw device the server's tty layer drives, held by one instance at a time (ADR 0004; `console_read`, `console_write`, `console_info`, `EVENT_CONSOLE`; R6d) |
 | the last mechanisms (R9) | `futex_wait`, `futex_wake`, `futex_requeue` on the program's memory; `thread_fs` (the FS base); `clock_set`; `power`; `host_granted`; `file_pages` (tmpfs's statfs) |
+| futexes beyond R9 | `futex_wake_op`; `futex_owner_died` (a robust list's entry); PI locks: `futex_lock_pi`, `futex_unlock_pi`, `futex_wait_requeue_pi`, `futex_cmp_requeue_pi` (see "PI futexes and robust lists") |
 
 What left the kernel over the migration (the last of it with R9, "Removing the
 pass-through" below): `process/syscall.rs`'s Linux dispatch, `sys_*.rs`, `signal.rs`,
@@ -1288,6 +1289,32 @@ affinity and getcpu calls in `mod.rs`; `timer.rs`'s interval timers; the per-pro
   the tree's first process ends (dropping its `process::Tree`); without it the server acts as a
   non-initial pid namespace (EPERM for setting the clock, `reboot` ends the tree with SIGHUP
   or SIGINT for its init). A `futex_requeue` moves only waits of `futex_wait` (decision 6).
+- **PI futexes and robust lists.** Linux's priority-inheritance operations (FUTEX_LOCK_PI,
+  LOCK_PI2, TRYLOCK_PI, UNLOCK_PI, WAIT_REQUEUE_PI, CMP_REQUEUE_PI) are the server's to decode
+  (timeouts: LOCK_PI's on the wall clock, the others' monotonic unless FUTEX_CLOCK_REALTIME;
+  an interrupted lock wait restarts with ERESTARTNOINTR, as its deadline is absolute) over
+  the kernel's PI locks (`kernel/src/process/futex/pi.rs`): the word holds the owner's
+  Linux tid, which the kernel only compares and copies. The kernel keeps a record of a lock
+  only while somebody waits for it; the first waiter names the owner, which the server
+  looks up in its thread table and passes by its thread's key (if the word names another
+  owner by the time the kernel looks, `PI_RETRY` makes the server look again). An unlock
+  hands the lock to the waiter of the largest weight, writing its tid into the word; an
+  owner's end (or exec) hands each lock on with `FUTEX_OWNER_DIED`, the new owner fixing the
+  word in its own address space. Priority inheritance on the fair scheduler: the priority is
+  the weight, so an owner runs with the largest weight of its waiters, theirs including what
+  they inherit, along the whole chain (`Task::pi_weight`, recomputed at every change and at
+  a waiter's nice change); a wait that would close a cycle is EDEADLK (Linux's full chain
+  walk). The kernel's PI state is one table under one lock (as FreeBSD's umtx PI chains):
+  PI operations serialize machine-wide, for work linear in the waiters, which costs nothing
+  for uncontended locks (user space's) and buys a chain walk that never drops locks;
+  Linux's per-lock and per-task locks would scale across many CPUs at the price of its
+  lock-dropping walk. Robust lists (set_robust_list, get_robust_list) are the server's: a
+  thread's head is kept in its record (none after clone or fork), and when it exits or
+  execs the server walks the list in the program's memory as Linux's exit_robust_list (at
+  most 2048 entries, the pending one last), marking each word the thread still holds with
+  `futex_owner_died` (an atomic step on the program's word: the owner bits give way to
+  FUTEX_OWNER_DIED, a non-PI word with waiters wakes one by its shared key). FUTEX_WAKE_OP's
+  change is a compare-and-swap under both words' bucket locks (`futex_wake_op`).
 - **The kernel's clocks** have the kernel's ids (`CLOCK_WALL`, `CLOCK_MONO`,
   `CLOCK_PROCESS_CPU`, `CLOCK_THREAD_CPU`); Linux's ids and their aliases map to them in the
   server.

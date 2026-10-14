@@ -218,6 +218,9 @@ pub struct Thread {
     pub serial: u64,
     /// Room for its table's hand-over to the worker is reserved (`fdtable::reserve_end`).
     pub reserved: bool,
+    /// Its robust futex list's head in the program's memory (set_robust_list; 0: none),
+    /// walked when it exits or execs (`futex::exit_robust`).
+    pub robust: u64,
 }
 
 pub struct Table {
@@ -512,7 +515,7 @@ pub fn register_init(key: u64) {
         };
         t.procs.insert(pid, p);
         let serial = t.new_serial();
-        t.threads.insert(pid, Thread { tid: pid, pid, key, fs, files: Some(files), limits, comm: comm_from("init"), sig: signal::ThreadSignals::default(), exited: false, serial, reserved });
+        t.threads.insert(pid, Thread { tid: pid, pid, key, fs, files: Some(files), limits, comm: comm_from("init"), sig: signal::ThreadSignals::default(), exited: false, serial, reserved, robust: 0 });
         t.keys.insert(key, pid);
         local::set(pid, pid, key, fs_ptr, files_ptr, limits_ptr);
     }
@@ -868,7 +871,8 @@ fn clone(s: &State, c: Clone) -> Result<i64, i64> {
             t.procs.get_mut(&pid).expect("checked above").threads.push(tid);
         }
         let serial = t.new_serial();
-        t.threads.insert(tid, Thread { tid, pid, key: 0, fs, files: Some(files), limits, comm, sig: thread_sig, exited: false, serial, reserved: true });
+        // (No robust list: a fork's or a thread's starts without one, as Linux's copy_process.)
+        t.threads.insert(tid, Thread { tid, pid, key: 0, fs, files: Some(files), limits, comm, sig: thread_sig, exited: false, serial, reserved: true, robust: 0 });
         serial
     };
     // The child's registers: the caller's, returning 0, on the new stack.
@@ -941,22 +945,25 @@ fn close_handle(handle: u64) {
 /// thread of its process.
 pub fn exit(status: i32, group: bool) -> ! {
     let (tid, pid) = me();
-    let files = {
+    let (files, robust) = {
         let mut t = PROCS.lock();
         if group {
             t.group_exit(pid, status, Some(tid));
         }
-        let files = t.threads.get_mut(&tid).and_then(|th| {
+        let (files, robust) = t.threads.get_mut(&tid).map_or((None, 0), |th| {
             th.exited = true;
-            th.files.take()
+            (th.files.take(), core::mem::take(&mut th.robust))
         });
         if let Some(p) = t.procs.get_mut(&pid) {
             if tid == pid {
                 p.main_status = Some(status);
             }
         }
-        files
+        (files, robust)
     };
+    // The robust futexes it holds learn of its death (Linux's exit_robust_list; its PI locks
+    // go to their waiters as the kernel ends the thread).
+    crate::futex::exit_robust(robust, tid);
     // Its descriptor table goes here, on the exiting thread (Linux's exit_files: before its
     // parent learns of the end): with its last reference its descriptors close.
     local::get().files.store(core::ptr::null_mut(), Ordering::Relaxed);
@@ -1517,6 +1524,24 @@ pub fn pgrp_orphaned(pgid: Pid) -> bool {
 pub fn exists(pid: Pid) -> bool {
     let t = PROCS.lock();
     t.procs.contains_key(&pid) || t.threads.contains_key(&pid)
+}
+
+/// set_robust_list: the calling thread's robust list head (`Thread::robust`).
+pub fn set_robust(head: u64) {
+    if let Some(th) = PROCS.lock().threads.get_mut(&local::tid()) {
+        th.robust = head;
+    }
+}
+
+/// The robust list head of thread `tid` (0: the caller), if it lives.
+pub fn robust_of(tid: Pid) -> Option<u64> {
+    let tid = if tid == 0 { local::tid() } else { tid };
+    PROCS.lock().threads.get(&tid).filter(|th| !th.exited).map(|th| th.robust)
+}
+
+/// Takes the calling thread's robust list head (an exec walks it and forgets it).
+pub fn take_robust() -> u64 {
+    PROCS.lock().threads.get_mut(&local::tid()).map_or(0, |th| core::mem::take(&mut th.robust))
 }
 
 /// The key of thread `tid` (0: the caller), if it lives.

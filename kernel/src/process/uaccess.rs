@@ -24,6 +24,8 @@ unsafe extern "C" {
     static uaccess_copy_fixup: u8;
     static uaccess_load32_insn: u8;
     static uaccess_load32_fixup: u8;
+    static uaccess_cmpxchg32_insn: u8;
+    static uaccess_cmpxchg32_fixup: u8;
 }
 
 /// Copies `len` bytes and returns how many were *not* copied (0: all).
@@ -62,6 +64,27 @@ unsafe extern "sysv64" fn load32(src: *const u32, out: *mut u32) -> u64 {
     );
 }
 
+/// Compares the u32 at `ptr` with `old` and stores `new` there if they are
+/// equal, as one locked instruction; the value found goes to `*out` (`old`
+/// if it stored). Returns 1 (and leaves `out`) on a fault, which is never
+/// resolved (see `cmpxchg_u32_atomic`).
+#[unsafe(naked)]
+unsafe extern "sysv64" fn cmpxchg32(ptr: *mut u32, old: u32, new: u32, out: *mut u32) -> u64 {
+    core::arch::naked_asm!(
+        "mov eax, esi",
+        ".globl uaccess_cmpxchg32_insn",
+        "uaccess_cmpxchg32_insn:",
+        "lock cmpxchg dword ptr [rdi], edx",
+        "mov dword ptr [rcx], eax",
+        "xor eax, eax",
+        "ret",
+        ".globl uaccess_cmpxchg32_fixup",
+        "uaccess_cmpxchg32_fixup:",
+        "mov eax, 1",
+        "ret",
+    );
+}
+
 /// A kernel access to user memory that faulted: where to resume if the
 /// fault is not satisfied, and whether to try (faults in `read_u32_atomic`
 /// are not resolved: it runs with spinlocks held).
@@ -77,6 +100,8 @@ pub fn fixup(rip: u64) -> Option<Fixup> {
         Some(Fixup { to: &raw const uaccess_copy_fixup as u64, resolve: true })
     } else if rip == &raw const uaccess_load32_insn as u64 {
         Some(Fixup { to: &raw const uaccess_load32_fixup as u64, resolve: false })
+    } else if rip == &raw const uaccess_cmpxchg32_insn as u64 {
+        Some(Fixup { to: &raw const uaccess_cmpxchg32_fixup as u64, resolve: false })
     } else {
         None
     }
@@ -92,6 +117,30 @@ pub fn read_u32_atomic(ptr: u64) -> Option<u32> {
     }
     let mut v = 0u32;
     (unsafe { load32(ptr as *const u32, &mut v) } == 0).then_some(v)
+}
+
+/// Compares the aligned u32 at `ptr` with `old` and, if equal, replaces it
+/// by `new`, atomically and without resolving page faults (as
+/// `read_u32_atomic`, under a spinlock: the PI futexes and the futex
+/// operations that change their word do so under their locks). The value
+/// found (`old` if it stored), or None if the page is not writable right
+/// now: the caller drops its locks, makes it so with `fault_in_writable`
+/// and retries.
+pub fn cmpxchg_u32_atomic(ptr: u64, old: u32, new: u32) -> Option<u32> {
+    if ptr % 4 != 0 || range_ok(ptr, 4).is_err() {
+        return None;
+    }
+    let mut v = 0u32;
+    (unsafe { cmpxchg32(ptr as *mut u32, old, new, &mut v) } == 0).then_some(v)
+}
+
+/// Makes the page of the u32 at `ptr` present and writable for the
+/// program (demand paging, copy-on-write, as a store of its own would);
+/// EFAULT if the program may not write it.
+pub fn fault_in_writable(ptr: u64) -> Result<(), i64> {
+    use super::address_space::{handle_fault, Access};
+    range_ok(ptr, 4)?;
+    handle_fault(ptr, Access { write: true, exec: false }).map_err(|_| EFAULT)
 }
 
 fn range_ok(ptr: u64, len: usize) -> Result<(), i64> {

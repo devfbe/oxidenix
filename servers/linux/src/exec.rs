@@ -623,6 +623,9 @@ fn run(s: &mut State, mut p: Prepared, files: fdtable::CopyRoom) -> Result<(), i
         // Killed meanwhile: the process ends anyway.
         return Err(signal::SIGKILL as i32);
     }
+    // The robust futexes the old program holds learn that it is gone, and the list with it
+    // (Linux's exec_mm_release; the kernel hands its PI locks on with the old address space).
+    crate::futex::exit_robust(process::take_robust(), local::tid());
     // The new program's descriptor table: the old one's descriptors without the close-on-exec
     // ones (Linux's unshare_files and do_close_on_exec), in memory had before. The old table
     // goes now: its close-on-exec descriptors close before the new program runs (if no
