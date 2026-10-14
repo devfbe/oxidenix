@@ -572,7 +572,7 @@ pub fn list(dir: &ProcNode) -> Result<Vec<(String, u64, u8)>, i64> {
             fixed(&ProcNode::Pid { pid: *pid, file: PidFile::Task }, TASK_FILES, &|file| ProcNode::Task { pid: *pid, tid: *tid, file })
         }
         ProcNode::Pid { pid, file: PidFile::Fd } => {
-            let fds = table(*pid)?.open_fds();
+            let fds = table(*pid)?.open_fds()?;
             let mut out = fixed(&ProcNode::Pid { pid: *pid, file: PidFile::Dir }, &[], &|file| ProcNode::Pid { pid: *pid, file })?;
             for fd in fds {
                 add_id(&mut out, fd as u64, &ProcNode::Fd { pid: *pid, fd })?;

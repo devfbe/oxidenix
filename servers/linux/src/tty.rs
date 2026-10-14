@@ -29,6 +29,7 @@
 //! whose session is the process's (ADR 0007).
 
 use crate::files::{self, File, EFAULT, EINVAL, ENOTTY, O_ACCMODE, O_CLOEXEC, O_NONBLOCK};
+use crate::heap::{self, NoMem, TryExtend, TryGrow};
 use crate::namespace::Origin;
 use crate::sync::Mutex;
 use crate::syscall;
@@ -73,6 +74,8 @@ const HELD_ECHO: usize = 4096;
 pub const ECHO_ROOM: usize = 4096;
 /// Bytes of a write processed at once (output processing may make 8 times as many).
 const WRITE_CHUNK: usize = 1024;
+/// The most bytes output processing makes of one (a tab as spaces: `Ldisc::output`).
+const OUTPUT_GROWTH: usize = 8;
 
 // ioctl requests (asm-generic/ioctls.h); compared as the kernel's `unsigned int cmd`.
 const TCGETS: u32 = 0x5401;
@@ -309,18 +312,27 @@ fn now() -> u64 {
     syscall(SYS_CLOCK_READ, [1, 0, 0, 0, 0, 0]).max(0) as u64
 }
 
-/// Every terminal of the instance.
-pub fn all() -> Vec<Arc<Tty>> {
-    let mut ttys: Vec<Arc<Tty>> = crate::pty::all();
+/// The first terminal of the instance `f` is true for, asked one after the other with no
+/// lock held and none listed (a session's end allocates nothing).
+pub fn find(mut f: impl FnMut(&Arc<Tty>) -> bool) -> Option<Arc<Tty>> {
     if let Some(c) = crate::console::current() {
-        ttys.push(c);
+        if f(&c) {
+            return Some(c);
+        }
     }
-    ttys
+    let mut after = None;
+    while let Some((index, tty)) = crate::pty::next(after) {
+        if f(&tty) {
+            return Some(tty);
+        }
+        after = Some(index);
+    }
+    None
 }
 
 /// The controlling terminal of session `sid`.
 pub fn ctty_of(sid: u64) -> Option<Arc<Tty>> {
-    all().into_iter().find(|t| t.inner.lock().session == Some(sid))
+    find(|t| t.inner.lock().session == Some(sid))
 }
 
 /// The controlling terminal of session `sid` as /proc/<pid>/stat shows it:
@@ -362,6 +374,9 @@ pub fn open(tty: &Arc<Tty>, flags: u32, origin: Origin, ctty: bool) -> Result<i6
         let mut inner = tty.inner.lock();
         let gen = inner.gen;
         let ready = tty.readiness(&inner, gen);
+        // Its memory first (ENOMEM: nothing changed).
+        let open = heap::try_arc(TtyOpen { tty: tty.clone(), gen, id, origin })?;
+        heap::preload()?;
         inner.opens.insert(id, (gen, ready));
         let mut was_closed = false;
         if let Some(p) = inner.pty.as_mut() {
@@ -369,7 +384,7 @@ pub fn open(tty: &Arc<Tty>, flags: u32, origin: Origin, ctty: bool) -> Result<i6
             was_closed = core::mem::replace(&mut p.slave_closed, false);
         }
         tty.changed(&mut inner, false, false);
-        (Arc::new(TtyOpen { tty: tty.clone(), gen, id, origin }), was_closed)
+        (open, was_closed)
     };
     let fd = match files::install(id, File::Tty(open.clone()), flags & (O_ACCMODE | O_NONBLOCK | O_CLOEXEC)) {
         Ok(fd) => fd,
@@ -404,9 +419,9 @@ pub fn open(tty: &Arc<Tty>, flags: u32, origin: Origin, ctty: bool) -> Result<i6
 /// dissociated (Linux's `disassociate_ctty(1)`): the console is hung up, a pty's
 /// foreground group gets SIGHUP.
 pub fn session_ended(sid: u64) {
-    for tty in all() {
+    find(|tty| {
         if tty.inner.lock().session != Some(sid) {
-            continue;
+            return false;
         }
         match tty.driver {
             Driver::Console => tty.hangup(true),
@@ -414,7 +429,7 @@ pub fn session_ended(sid: u64) {
                 let fg = {
                     let mut inner = tty.inner.lock();
                     if inner.session != Some(sid) {
-                        continue;
+                        return false;
                     }
                     inner.session = None;
                     inner.pgrp.take()
@@ -424,12 +439,13 @@ pub fn session_ended(sid: u64) {
                 }
             }
         }
-    }
+        false
+    });
 }
 
 impl Tty {
-    pub fn new(driver: Driver, init: Termios, winsize: [u16; 4], pty: Option<PtyState>) -> Arc<Tty> {
-        Arc::new(Tty {
+    pub fn new(driver: Driver, init: Termios, winsize: [u16; 4], pty: Option<PtyState>) -> Result<Arc<Tty>, NoMem> {
+        heap::try_arc(Tty {
             driver,
             inner: Mutex::new(Inner {
                 ld: Ldisc::new(init),
@@ -593,8 +609,9 @@ impl Tty {
             return None;
         }
         if inner.ld.stopped() {
+            // (Without memory for them they are dropped, as those beyond the room.)
             let room = HELD_ECHO.saturating_sub(inner.held_echo.len());
-            inner.held_echo.extend_from_slice(&echo[..echo.len().min(room)]);
+            let _ = inner.held_echo.try_extend(&echo[..echo.len().min(room)]);
             return None;
         }
         match inner.pty.as_mut() {
@@ -603,7 +620,10 @@ impl Tty {
                 // further: the rest is dropped (Linux's echo buffer is 4 KiB), so a
                 // master that writes but never reads cannot grow the buffer.
                 let room = (MASTER_CAP + ECHO_ROOM).saturating_sub(p.out.len());
-                p.out.extend(&echo[..echo.len().min(room)]);
+                let n = echo.len().min(room);
+                if p.out.try_grow(n).is_ok() {
+                    p.out.extend(&echo[..n]);
+                }
                 None
             }
             None => Some(echo),
@@ -876,7 +896,17 @@ impl Tty {
                         return if written > 0 { Ok(written as i64) } else { Err(EIO) };
                     }
                     if Self::writable(&inner) {
-                        let mut out = Vec::with_capacity(chunk.len() + chunk.len() / 4);
+                        // Room for the most the chunk can become, had before it is processed
+                        // (ENOMEM: neither the output nor the line discipline's column moved).
+                        let most = chunk.len() * OUTPUT_GROWTH;
+                        let room = heap::try_vec(most).and_then(|out| match inner.pty.as_mut() {
+                            Some(p) => p.out.try_grow(most).map(|()| out),
+                            None => Ok(out),
+                        });
+                        let mut out = match room {
+                            Ok(out) => out,
+                            Err(NoMem) => return if written > 0 { Ok(written as i64) } else { Err(heap::ENOMEM) },
+                        };
                         inner.ld.output(&chunk, &mut out);
                         match inner.pty.as_mut() {
                             Some(p) => {
@@ -967,7 +997,7 @@ impl Tty {
             let out = match inner.pty.as_mut() {
                 Some(p) => {
                     // Within the room echoes have (TCXONC in a loop does not grow it).
-                    if p.out.len() < MASTER_CAP + ECHO_ROOM && p.out.try_reserve(1).is_ok() {
+                    if p.out.len() < MASTER_CAP + ECHO_ROOM && p.out.try_grow(1).is_ok() {
                         p.out.push_back(c);
                     }
                     None

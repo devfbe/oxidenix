@@ -73,7 +73,7 @@ fn reopen(opened: &Opened, flags: u32) -> Result<i64, i64> {
     if flags & O_DIRECTORY != 0 {
         return Err(ENOTDIR);
     }
-    let new = pipe.reopen(flags);
+    let new = pipe.reopen(flags)?;
     let kept = flags & (O_ACCMODE | files::O_NONBLOCK | files::O_CLOEXEC);
     match files::install(new.id(), File::Pipe(new.clone()), kept) {
         Ok(fd) => {

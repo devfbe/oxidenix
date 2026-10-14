@@ -30,6 +30,7 @@
 
 use crate::datafs::DInode;
 use crate::files::{self, File, EFAULT, EINVAL, O_NONBLOCK, O_RDWR};
+use crate::heap::{self, NoMem, TryGrow};
 use crate::namespace::Node;
 use crate::sync::Mutex;
 use crate::syscall;
@@ -38,7 +39,7 @@ use crate::usercopy;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use restricted::*;
 
 pub const IN_ACCESS: u32 = 0x1;
@@ -180,6 +181,9 @@ pub struct Inotify {
     state: Mutex<State>,
     /// Bumped on every new event; readers sleep on it.
     seq: AtomicU32,
+    /// Events were lost without the instance's lock (no memory to find
+    /// their watches, `send`): an IN_Q_OVERFLOW is queued at the next look.
+    lost: AtomicBool,
 }
 
 /// Every watch of the instance by inode: (instance, watch descriptor).
@@ -205,15 +209,15 @@ pub fn init(flags: u64) -> Result<i64, i64> {
     }
     INSTANCES.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| (n < MAX_INSTANCES).then_some(n + 1)).map_err(|_| EMFILE)?;
     let state = State { watches: BTreeMap::new(), next_wd: 1, queue: VecDeque::new(), overflowed: false, reported: 0 };
-    let i = Arc::new(Inotify { id: files::new_id(), state: Mutex::new(state), seq: AtomicU32::new(0) });
-    // (Dropping `i` on failure gives the instance back.)
+    // (Dropping `i`, also the value `try_arc` could not place, gives the instance back.)
+    let i = heap::try_arc(Inotify { id: files::new_id(), state: Mutex::new(state), seq: AtomicU32::new(0), lost: AtomicBool::new(false) })?;
     files::install(i.id, File::Inotify(i.clone()), O_RDWR | flags as u32)
 }
 
 impl Inotify {
     /// Its readiness for poll and epoll now: readable with events queued.
     pub fn readiness_now(&self) -> i16 {
-        if self.state.lock().queue.is_empty() { 0 } else { POLLIN }
+        if self.state.lock().queue.is_empty() && !self.lost.load(Ordering::Acquire) { 0 } else { POLLIN }
     }
 
     /// inotify_add_watch on the resolved `node` (a directory if `is_dir`).
@@ -246,11 +250,15 @@ impl Inotify {
             while st.watches.contains_key(&wd) {
                 wd = if wd == i32::MAX { 1 } else { wd + 1 };
             }
+            // In the registry under the instance's lock (instance, then
+            // registry: the only nesting), so rm_watch never misses it;
+            // memory for it and the watch first (ENOMEM: nothing added).
+            if let Err(e) = register(key, self, wd) {
+                WATCHES.fetch_sub(1, Ordering::Relaxed);
+                return Err(e.into());
+            }
             st.next_wd = if wd == i32::MAX { 1 } else { wd + 1 };
             st.watches.insert(wd, Watch { key, mask: events });
-            // In the registry under the instance's lock (instance, then
-            // registry: the only nesting), so rm_watch never misses it.
-            REGISTRY.lock().entry(key).or_default().push((Arc::downgrade(self), wd));
             wd
         };
         Ok(wd as i64)
@@ -268,6 +276,8 @@ impl Inotify {
     /// Queues `e` (lock held), merged with an equal last one, and wakes the
     /// readers.
     fn queue(&self, st: &mut State, e: Event) {
+        // Events lost before come first.
+        self.take_lost(st);
         if st.queue.back() == Some(&e) {
             return;
         }
@@ -276,27 +286,44 @@ impl Inotify {
         let n = cost(&e);
         let mut room = st.queue.len() < MAX_EVENTS
             && QUEUED_BYTES.try_update(Ordering::Relaxed, Ordering::Relaxed, |c| (c + n <= MAX_QUEUED_BYTES).then_some(c + n)).is_ok();
-        if room && st.queue.try_reserve(1).is_err() {
+        if room && st.queue.try_grow(1).is_err() {
             QUEUED_BYTES.fetch_sub(n, Ordering::Relaxed);
             room = false;
         }
-        let e = if room {
-            e
+        if room {
+            self.push(st, e);
         } else {
-            if st.overflowed {
-                return;
-            }
-            st.overflowed = true;
-            // (The overflow event's room: within the reservation the bounds above leave, or
-            // none: then it is dropped too, and the reader sees the overflow as the queue's end.)
-            if st.queue.try_reserve(1).is_err() {
-                return;
-            }
-            // (An overflow event goes beyond the bytes' bound: one per instance at most.)
-            let o = Event { wd: -1, mask: IN_Q_OVERFLOW, cookie: 0, name: Vec::new() };
-            QUEUED_BYTES.fetch_add(cost(&o), Ordering::Relaxed);
-            o
-        };
+            self.overflow(st);
+        }
+    }
+
+    /// Events were lost (no room for them, or no memory): one IN_Q_OVERFLOW
+    /// stands for them until it is read (lock held).
+    fn overflow(&self, st: &mut State) {
+        if st.overflowed {
+            return;
+        }
+        st.overflowed = true;
+        // (The overflow event's room: within the reservation the bounds above leave, or
+        // none: then it is dropped too, and the reader sees the overflow as the queue's end.)
+        if st.queue.try_grow(1).is_err() {
+            return;
+        }
+        // (An overflow event goes beyond the bytes' bound: one per instance at most.)
+        let o = Event { wd: -1, mask: IN_Q_OVERFLOW, cookie: 0, name: Vec::new() };
+        QUEUED_BYTES.fetch_add(cost(&o), Ordering::Relaxed);
+        self.push(st, o);
+    }
+
+    /// Events lost without the lock (`lost`) become the overflow (lock held).
+    fn take_lost(&self, st: &mut State) {
+        if self.lost.swap(false, Ordering::AcqRel) {
+            self.overflow(st);
+        }
+    }
+
+    /// Queues `e` within the room made for it, and wakes the readers (lock held).
+    fn push(&self, st: &mut State, e: Event) {
         st.queue.push_back(e);
         self.seq.fetch_add(1, Ordering::Release);
         let word = &self.seq as *const AtomicU32 as u64;
@@ -316,7 +343,11 @@ impl Inotify {
         }
         let oneshot = w.mask & IN_ONESHOT != 0;
         let key = w.key;
-        self.queue(&mut st, Event { wd, mask, cookie, name: name.to_vec() });
+        match heap::try_to_vec(name) {
+            Ok(name) => self.queue(&mut st, Event { wd, mask, cookie, name }),
+            // No memory for the event: lost, as one beyond the queue's bound.
+            Err(NoMem) => self.overflow(&mut st),
+        }
         if oneshot {
             st.watches.remove(&wd);
             self.queue(&mut st, Event { wd, mask: IN_IGNORED, cookie: 0, name: Vec::new() });
@@ -341,8 +372,18 @@ impl Inotify {
             let seen;
             {
                 let mut st = self.state.lock();
+                self.take_lost(&mut st);
                 if !st.queue.is_empty() {
-                    let mut out = Vec::new();
+                    // The whole events that fit, their room had before one is taken
+                    // (ENOMEM: all stay queued).
+                    let mut fit = 0;
+                    for e in st.queue.iter() {
+                        if fit + e.size() > len as usize {
+                            break;
+                        }
+                        fit += e.size();
+                    }
+                    let mut out = heap::try_vec(fit)?;
                     while let Some(e) = st.queue.front() {
                         if out.len() + e.size() > len as usize {
                             break;
@@ -400,9 +441,11 @@ impl Drop for Inotify {
         INSTANCES.fetch_sub(1, Ordering::Relaxed);
         let queued: usize = self.state.lock().queue.iter().map(cost).sum();
         QUEUED_BYTES.fetch_sub(queued, Ordering::Relaxed);
-        let keys: Vec<Key> = self.state.lock().watches.values().map(|w| w.key).collect();
+        // (Both locks, in their order, rather than a list of the keys: an
+        // end allocates nothing.)
+        let st = self.state.lock();
         let mut r = REGISTRY.lock();
-        for k in keys {
+        for k in st.watches.values().map(|w| w.key) {
             if let Some(list) = r.get_mut(&k) {
                 let before = list.len();
                 list.retain(|(w, _)| w.strong_count() > 0);
@@ -427,13 +470,81 @@ fn unregister(key: Key, instance: &Inotify, wd: i32) {
     }
 }
 
-/// The watches of `key` (taken out of the registry's lock).
-fn watchers(key: Key) -> Vec<(Arc<Inotify>, i32)> {
-    REGISTRY.lock().get(&key).map(|l| l.iter().filter_map(|(w, wd)| Some((w.upgrade()?, *wd))).collect()).unwrap_or_default()
+/// Watch `wd` of `instance` on `key` into the registry (ENOMEM: nothing
+/// added), with memory for the instance's own entry of it too (`preload`).
+fn register(key: Key, instance: &Arc<Inotify>, wd: i32) -> Result<(), NoMem> {
+    heap::preload()?;
+    let mut r = REGISTRY.lock();
+    let list = r.entry(key).or_default();
+    if let Err(e) = list.try_grow(1) {
+        if list.is_empty() {
+            r.remove(&key);
+        }
+        return Err(e);
+    }
+    list.push((Arc::downgrade(instance), wd));
+    Ok(())
+}
+
+/// The watches of `key` (taken out of the registry's lock). Without memory
+/// for the list, the events are lost for each of them (`lost`).
+fn watchers(key: Key) -> Option<Vec<(Arc<Inotify>, i32)>> {
+    let mut out = Vec::new();
+    loop {
+        let len = REGISTRY.lock().get(&key).map_or(0, Vec::len);
+        if out.try_grow(len).is_err() {
+            break;
+        }
+        let r = REGISTRY.lock();
+        let Some(list) = r.get(&key) else { return Some(out) };
+        if list.len() <= out.capacity() {
+            out.extend(list.iter().filter_map(|(w, wd)| Some((w.upgrade()?, *wd))));
+            return Some(out);
+        }
+    }
+    lost(key);
+    None
+}
+
+/// The events about `key` are lost for every watch of it (no memory to
+/// list them): each instance is told without its lock (`Inotify::lost`,
+/// the readers' word, a readiness report), in batches taken out of the
+/// registry's lock on the stack (an instance's last reference may go with
+/// one, whose end takes that lock). Telling is idempotent: a list that
+/// shrank meanwhile is gone through again from its start, so no watch is
+/// missed.
+fn lost(key: Key) {
+    const BATCH: usize = 16;
+    let (mut at, mut len) = (0, usize::MAX);
+    loop {
+        let mut batch: [Option<Arc<Inotify>>; BATCH] = Default::default();
+        {
+            let r = REGISTRY.lock();
+            let Some(list) = r.get(&key) else { return };
+            if list.len() < len {
+                at = 0;
+            }
+            len = list.len();
+            if at >= len {
+                return;
+            }
+            for (slot, (w, _)) in batch.iter_mut().zip(&list[at..]) {
+                *slot = w.upgrade();
+            }
+            at += BATCH;
+        }
+        for i in batch.iter().flatten() {
+            i.lost.store(true, Ordering::Release);
+            i.seq.fetch_add(1, Ordering::Release);
+            let word = &i.seq as *const AtomicU32 as u64;
+            syscall(SYS_SERVER_FUTEX_WAKE, [word, i32::MAX as u64, 0, 0, 0, 0]);
+            files::ready(i.id, POLLIN);
+        }
+    }
 }
 
 fn send(key: Key, mask: u32, cookie: u32, name: &[u8]) {
-    for (i, wd) in watchers(key) {
+    for (i, wd) in watchers(key).into_iter().flatten() {
         i.deliver(key, wd, mask, cookie, name);
     }
 }
@@ -513,11 +624,15 @@ pub fn deleted(key: Key, dir: bool) {
         return;
     }
     let isdir = if dir { IN_ISDIR } else { 0 };
-    let keys: Vec<Key> = match key {
-        Key::DataAny(ino) => REGISTRY.lock().keys().filter(|k| matches!(k, Key::Data(i, _) if *i == ino)).copied().collect(),
-        k => alloc::vec![k],
-    };
-    for key in keys {
+    // One key after the other, each found again (it leaves the registry
+    // below): an inode's end allocates nothing.
+    let mut single = Some(key).filter(|k| !matches!(k, Key::DataAny(_)));
+    loop {
+        let next = match key {
+            Key::DataAny(ino) => REGISTRY.lock().keys().find(|k| matches!(k, Key::Data(i, _) if *i == ino)).copied(),
+            _ => single.take(),
+        };
+        let Some(key) = next else { break };
         send(key, IN_DELETE_SELF | isdir, 0, &[]);
         let gone = REGISTRY.lock().remove(&key).unwrap_or_default();
         WATCHES.fetch_sub(gone.len(), Ordering::Relaxed);

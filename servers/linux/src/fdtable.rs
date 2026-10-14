@@ -27,6 +27,7 @@
 //! dropped after it.
 
 use crate::files::{self, FileRef, O_APPEND, O_CLOEXEC, O_NONBLOCK};
+use crate::heap::{self, NoMem, TryGrow};
 use crate::sync::Mutex;
 use crate::syscall;
 use crate::local;
@@ -38,7 +39,6 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use restricted::*;
 
 const EBADF: i64 = 9;
-const ENOMEM: i64 = 12;
 const EINVAL: i64 = 22;
 const EMFILE: i64 = 24;
 
@@ -75,7 +75,7 @@ impl Table {
     fn reserve(&mut self, fd: usize) -> Result<(), i64> {
         if fd >= self.slots.len() {
             let more = fd + 1 - self.slots.len();
-            self.slots.try_reserve(more).map_err(|_| ENOMEM)?;
+            self.slots.try_grow(more)?;
             self.slots.resize(fd + 1, None);
         }
         Ok(())
@@ -103,13 +103,10 @@ impl Table {
 }
 
 impl FilesContext {
-    fn new(table: Table) -> Arc<FilesContext> {
-        Arc::new(FilesContext { table: Mutex::new(table) })
-    }
-
-    /// A table without descriptors (the tree's first process starts with one).
+    /// A table without descriptors (the tree's first process starts with
+    /// one; a service thread's: neither grows with what programs do).
     pub fn empty() -> Arc<FilesContext> {
-        FilesContext::new(Table { slots: Vec::new(), free_from: 0 })
+        Arc::new(FilesContext { table: Mutex::new(Table { slots: Vec::new(), free_from: 0 }) })
     }
 
     /// The description behind descriptor `fd` (EBADF).
@@ -160,12 +157,16 @@ impl FilesContext {
         let mut slots: Vec<Option<Slot>> = Vec::new();
         loop {
             let len = self.table.lock().slots.len();
-            slots.try_reserve_exact(len).map_err(|_| ENOMEM)?;
+            slots.try_grow(len)?;
+            // (Made before the copy: a failure leaves every description's
+            // count as it was.)
+            let context = heap::try_arc(FilesContext { table: Mutex::new(Table { slots: Vec::new(), free_from: 0 }) })?;
             let t = self.table.lock();
             if t.slots.len() <= slots.capacity() {
                 slots.extend(t.slots.iter().map(|s| s.as_ref().filter(|s| !(exec && s.cloexec)).cloned()));
                 let free_from = if exec { slots.iter().position(|s| s.is_none()).unwrap_or(slots.len()) } else { t.free_from };
-                return Ok(FilesContext::new(Table { slots, free_from }));
+                *context.table.lock() = Table { slots, free_from };
+                return Ok(context);
             }
         }
     }
@@ -211,7 +212,7 @@ impl Ended {
     /// `reserved + extra`.
     fn ensure(&mut self) -> Result<(), i64> {
         let need = (self.reserved + self.extra).saturating_sub(self.items.len());
-        self.items.try_reserve(need).map_err(|_| ENOMEM)
+        Ok(self.items.try_grow(need)?)
     }
 }
 
@@ -390,7 +391,7 @@ fn close_range(first: u64, last: u64, flags: u64) -> Result<i64, i64> {
             } else if let Some(s) = t.take(fd) {
                 // Closed after the lock; without room to keep it, now (it
                 // has been taken out, which is what counts for the table).
-                if gone.try_reserve(1).is_ok() {
+                if gone.try_grow(1).is_ok() {
                     gone.push(s.file);
                 } else {
                     drop(t);
@@ -493,10 +494,12 @@ fn ioctl(fd: u64, request: u64, arg: u64) -> Result<i64, i64> {
 }
 
 impl FilesContext {
-    /// The open descriptors, ascending (/proc/<pid>/fd).
-    pub fn open_fds(&self) -> Vec<u32> {
+    /// The open descriptors, ascending (/proc/<pid>/fd); ENOMEM without room for them.
+    pub fn open_fds(&self) -> Result<Vec<u32>, NoMem> {
         let t = self.table.lock();
-        t.slots.iter().enumerate().filter(|(_, s)| s.is_some()).map(|(fd, _)| fd as u32).collect()
+        let mut fds = heap::try_vec(t.slots.iter().filter(|s| s.is_some()).count())?;
+        fds.extend(t.slots.iter().enumerate().filter(|(_, s)| s.is_some()).map(|(fd, _)| fd as u32));
+        Ok(fds)
     }
 
     /// How many descriptors the table has room for now (select's max_fds).
