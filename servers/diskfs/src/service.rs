@@ -45,6 +45,17 @@
 //! inode is gone or another file's completes with ESTALE and holds
 //! nothing.
 //!
+//! **Notes.** A client that holds an inode whose last link another client
+//! took (or that it comes to hold without links) gets a `GONE` note in its
+//! channel's notes ring (`fsring`, "Notes"), so that it lets go of the
+//! inode once it does not use it and the inode is freed at its last close
+//! in any client, not when the client's cache happens to evict it. A note
+//! waits in the channel's `noting` bitmap (one bit per inode) while the
+//! ring is full; the client rings the submission doorbell once it took
+//! notes. When a channel goes, its promises of files another channel holds
+//! pass to that one (`Ext2::pass_promises`: the clients share their page
+//! cache, the other writes those pages back now).
+//!
 //! **Restarts.** The holds are diskfs's memory, but the clients' open files
 //! outlive a diskfs that dies: the kernel restarts it, and each client
 //! connects again and names every inode it holds (`STAT`) before anything
@@ -253,6 +264,13 @@ struct Chan {
     gone: bool,
     /// The inodes the client holds (see `Holds`).
     held: Bitmap,
+    /// The notes' ring in the channel's shared area (`fsring`, "Notes"; a
+    /// channel without one gets none), and the inodes whose `GONE` note
+    /// waits for room there (one bit per inode: cleared when it went out
+    /// or the client released the inode).
+    notes: Option<Producer<'static, { fsring::NOTE_SLOTS }>>,
+    noting: Bitmap,
+    noted: bool,
 }
 
 /// Whether a channel of `chans` holds `ino`.
@@ -456,7 +474,8 @@ impl Service {
     /// to answer with. The channel is attached unless it is refused here.
     pub fn offer(&mut self, fs: &mut Fs, message: &[u8]) -> i64 {
         let Some(offer) = Offer::decode(message) else { return -EINVAL };
-        if offer.slots != fsring::SLOTS {
+        // (A shared area is the notes' ring: `fsring::SHARED_PAGES`, or none.)
+        if offer.slots != fsring::SLOTS || (offer.shared != 0 && offer.shared != fsring::SHARED_PAGES) {
             return -EINVAL;
         }
         // The first client: the filesystem is in use (the disk says "not clean" before the
@@ -469,9 +488,10 @@ impl Service {
             Ok(base) => base,
             Err(e) => return e,
         };
-        let layout = Layout::new(fsring::SLOTS).expect("a valid slot count");
+        let layout = Layout::with_shared(fsring::SLOTS, offer.shared).expect("a valid slot count");
         // Mapped until chan_detach, which comes after the Chan is dropped.
         let (sub, comp) = unsafe { (layout.ring::<N>(base, layout.submission), layout.ring::<N>(base, layout.completion)) };
+        let notes = (offer.shared != 0).then(|| Ring::new(unsafe { fsring::notes(base.add(layout.shared)) }).producer());
         self.chans[slot] = Some(Chan {
             id: offer.channel,
             header: unsafe { Header::at(base) },
@@ -485,6 +505,9 @@ impl Service {
             rang: false,
             gone: false,
             held: Bitmap::new(self.inodes),
+            notes,
+            noting: Bitmap::new(self.inodes),
+            noted: false,
         });
         0
     }
@@ -566,7 +589,9 @@ impl Service {
             return true;
         }
         self.chans.iter_mut().flatten().any(|c| {
-            c.stalled.is_some() || c.gone || c.header.state() != 0 || (!c.unposted.is_empty() && c.completions.room() > 0) || c.ready()
+            // (Notes waiting for room the client has not made: it rings when it does.)
+            let notes = c.noted && c.notes.as_mut().is_some_and(|n| n.room() > 0);
+            c.stalled.is_some() || c.gone || c.header.state() != 0 || (!c.unposted.is_empty() && c.completions.room() > 0) || c.ready() || notes
         })
     }
 
@@ -636,7 +661,7 @@ impl Service {
         progress |= self.submit(fs);
         progress |= self.take(fs);
         progress |= self.submit(fs);
-        progress |= self.post();
+        progress |= self.post(fs);
         progress
     }
 
@@ -862,8 +887,42 @@ impl Service {
         };
         for node in named.into_iter().flatten() {
             if let Ok(ino) = Self::node(fs, node) {
-                self.chan(c).held.set(ino);
+                let chan = self.chan(c);
+                if chan.held.has(ino) {
+                    continue;
+                }
+                chan.held.set(ino);
+                // Held from now on, without links (it went before, a restart of
+                // diskfs say): the client is told (`fsring`, "Notes").
+                if fs.stat(ino).is_ok_and(|s| s.links == 0) {
+                    self.note(c, ino);
+                }
             }
+        }
+    }
+
+    /// The last links of `gone` went through channel `c`'s request: every
+    /// other channel that holds one of them is told (`fsring`, "Notes");
+    /// `c` learns the first from the completion, the others (none in
+    /// practice) by notes too.
+    fn note_gone(&mut self, c: usize, gone: &[(u32, u32)]) {
+        for (i, &(ino, _)) in gone.iter().enumerate() {
+            for other in 0..self.chans.len() {
+                let holds = self.chans[other].as_ref().is_some_and(|ch| ch.held.has(ino));
+                if holds && (other != c || i > 0) {
+                    self.note(other, ino);
+                }
+            }
+        }
+    }
+
+    /// A `GONE` note for inode `ino` waits for room in channel `c`'s ring
+    /// (`post`); none for a channel without notes.
+    fn note(&mut self, c: usize, ino: u32) {
+        let chan = self.chan(c);
+        if chan.notes.is_some() {
+            chan.noting.set(ino);
+            chan.noted = true;
         }
     }
 
@@ -938,7 +997,10 @@ impl Service {
     /// Channel `c` ends: diskfs lets go of it and its client's inodes.
     fn close(&mut self, fs: &mut Fs, c: usize) {
         let chan = self.chans[c].take().expect("a channel in use");
-        fs.forget_promises(chan.id);
+        // Its promises of files another client holds pass to that client (the
+        // clients share their page cache: it writes those pages back now).
+        let chans = &self.chans;
+        fs.pass_promises(chan.id, |ino| chans.iter().flatten().find(|o| o.held.has(ino)).map(|o| o.id));
         for ino in chan.held.inodes() {
             self.try_free(fs, ino);
         }
@@ -956,9 +1018,33 @@ impl Service {
         let _ = oxrt::chan_detach(chan.id);
     }
 
-    fn post(&mut self) -> bool {
+    fn post(&mut self, fs: &mut Fs) -> bool {
         let mut any = false;
         for chan in self.chans.iter_mut().flatten() {
+            // The notes that wait, as far as the ring has room (the client rings the
+            // submission doorbell once it took some: `fsring`, "Notes").
+            if chan.noted && !chan.gone {
+                let waiting: Vec<u32> = chan.noting.inodes().collect();
+                let Some(notes) = chan.notes.as_mut() else { continue };
+                let mut pushed = false;
+                let mut full = false;
+                for ino in waiting {
+                    // (Held, so in use: its generation is the one the client knows.)
+                    if let Ok(s) = fs.stat(ino) {
+                        if !notes.push(&fsring::Note::Gone(Node::new(ino, s.generation)).encode()) {
+                            full = true;
+                            break;
+                        }
+                        pushed = true;
+                    }
+                    chan.noting.clear(ino);
+                }
+                chan.noted = full;
+                if pushed {
+                    notes.ring_doorbell(&Futex);
+                    any = true;
+                }
+            }
             while let Some(d) = chan.unposted.front() {
                 if !chan.completions.push(d) {
                     break;
@@ -1262,6 +1348,7 @@ impl Service {
                 // An inode no one may use is freed at once; one in use is orphaned, and
                 // the client gets it to hold and release.
                 let gone = fs.unlink_unless(dir, &name, is_dir, |ino| self.in_use(ino))?;
+                self.note_gone(c, &gone);
                 self.gone(fs, &gone)
             }
             Request::Rename { from, name, to, new_name } => {
@@ -1270,6 +1357,7 @@ impl Service {
                 Self::live_dir(fs, to)?;
                 let (old, new) = (self.name(c, &name)?, self.name(c, &new_name)?);
                 let gone = fs.rename_unless(from, &old, to, &new, |ino| self.in_use(ino))?;
+                self.note_gone(c, &gone);
                 self.gone(fs, &gone)
             }
             Request::Truncate { ino, len } => {
@@ -1280,7 +1368,10 @@ impl Service {
                 // The client lets go of it: freed if its last link is gone
                 // and no other client holds it.
                 let ino = Self::node(fs, ino)?;
-                self.chan(c).held.clear(ino);
+                let chan = self.chan(c);
+                chan.held.clear(ino);
+                // (Nothing to tell it any more.)
+                chan.noting.clear(ino);
                 self.try_free(fs, ino);
                 Ok((0, none))
             }

@@ -31,6 +31,7 @@ pub const EISCONN: i64 = 106;
 pub const ENOTCONN: i64 = 107;
 pub const ETIMEDOUT: i64 = 110;
 pub const ECONNREFUSED: i64 = 111;
+pub const EALREADY: i64 = 114;
 
 /// Syscall result: Ok(return value) or Err(positive errno).
 pub type SysResult = Result<i64, i64>;

@@ -20,9 +20,22 @@
 //! later re-establishes the hold.
 //!
 //! **The page cache.** A regular file the server reads, writes, maps or
-//! runs has a cached object of the kernel's (`SYS_MO_CREATE_CACHED`, made
-//! on first use, kept with the inode): one set of pages for every
-//! descriptor, mapping and program, whose size is the file's size here.
+//! runs has a cached object of the kernel's (`SYS_MO_SHARED`, joined or
+//! made on first use, kept with the inode): one set of pages for every
+//! descriptor, mapping and program of every process tree (ADR 0014: each
+//! instance joins the object another made, so the trees see each other's
+//! writes, sizes, times and shared mappings at once), whose size is the
+//! file's size. A new object's size comes from diskfs, asked once the
+//! object is there for every instance (`open_object`). `stat` takes the
+//! size and the times from the object, this instance's or another's
+//! (`attrs`); truncation and O_DIRECT reach another's too
+//! (`shared_object`); O_APPEND writes find the end in the kernel, one step
+//! for every appender of every tree (`append`). The times data changed are
+//! the kernel's (it sets them as the data enters the cache), sent to
+//! diskfs by whichever instance writes the file back (`send_times`).
+//! diskfs's notes (`take_notes`, on the worker) say when another tree took
+//! the last link of an inode this instance holds: it goes once nothing
+//! here uses it, so its blocks are freed at its last close in any tree.
 //! Reads and writes copy between the object and the program in the kernel
 //! (`SYS_MO_FILE_READ`/`WRITE` with `MO_NOFILL`); a missing page they meet
 //! is filled here and the call repeated; a fault on a mapping (or the
@@ -325,14 +338,17 @@ impl Names {
 }
 
 /// A file's times as the server set them (seconds: ext2 keeps no more),
-/// over diskfs's, while written data waits in the cache: a write sets the
-/// modification and change times when it enters the cache, as on Linux,
-/// but diskfs records its own time when the data reaches it; so after
-/// each write-back these go to diskfs (`SETTIMES`, which follows the
-/// `WRITE`s) and are forgotten, and until then stat reports them, and
-/// what changes times meanwhile (utimensat, chmod, truncation) changes
-/// them too. Without data waiting, diskfs's times are the file's
-/// (utimensat sends its times at once).
+/// over diskfs's, while written data waits for a write-back. A regular
+/// file's are kept with its cached object for every instance
+/// (`SYS_MO_ATTRS`, ADR 0014: the kernel sets the modification and change
+/// times when data enters the cache, as Linux's `file_update_time`); these
+/// are a FIFO's, whose traffic asks diskfs nothing (`fifo_used`): diskfs
+/// records its own time when data reaches it, so after each write-back
+/// these go to diskfs (`SETTIMES`, which follows the `WRITE`s) and are
+/// forgotten, and until then stat reports them, and what changes times
+/// meanwhile (utimensat, chmod, truncation) changes them too. Without data
+/// waiting, diskfs's times are the file's (utimensat sends its times at
+/// once).
 #[derive(Clone, Copy, Default)]
 struct Times {
     atime: Option<u32>,
@@ -370,17 +386,6 @@ fn ext2_time(sec: i64) -> u32 {
 /// An ext2 time field read back: signed.
 fn from_ext2(t: u32) -> i64 {
     t as i32 as i64
-}
-
-/// The contents of `inode` changed (a write, a truncation, a store through
-/// a mapping): its modification and change times are now.
-pub fn modified(inode: &DInode) {
-    let now = now_secs();
-    let mut t = inode.times.lock();
-    t.mtime = Some(now);
-    t.ctime = Some(now);
-    t.pending = true;
-    t.seq += 1;
 }
 
 /// A FIFO's pipe: the one its openers share, or a new one if nobody has it open
@@ -423,8 +428,15 @@ pub fn fifo_used(inode: &DInode, modify: bool) {
 
 /// What diskfs did to the times itself (a truncation, a change of
 /// permissions: `mtime` too or only the change time), also over times
-/// that wait for a write-back.
-fn changed_on_disk(inode: &DInode, mtime: bool) {
+/// that wait for a write-back (a regular file's in its cached object,
+/// whichever instance holds it).
+fn changed_on_disk(inode: &Arc<DInode>, mtime: bool) {
+    if let Ok(Some(object)) = shared_object(inode) {
+        let now = crate::time::realtime().sec;
+        let a = FileAttrs { flags: ATTR_CTIME | if mtime { ATTR_MTIME } else { 0 }, mtime: now, ctime: now, ..FileAttrs::default() };
+        syscall(SYS_MO_ATTRS, [object, ATTRS_SET_IF_PENDING, &a as *const FileAttrs as u64, 0, 0, 0]);
+        return;
+    }
     let mut t = inode.times.lock();
     if t.pending {
         let now = now_secs();
@@ -444,6 +456,32 @@ pub fn set_times(inode: &Arc<DInode>, atime: vfs::stat::SetTime, mtime: vfs::sta
     }
     writable()?;
     let now = crate::time::realtime();
+    // A regular file's cached object, whichever instance holds it: the times go there
+    // first (a write-back of data waiting there sends them after its own), then to
+    // diskfs, and are forgotten there if no data waits.
+    if let Some(object) = shared_object(inode)? {
+        let (a, m) = (atime.resolve(now), mtime.resolve(now));
+        let mut set = FileAttrs { flags: ATTR_CTIME, ctime: now.sec, ..FileAttrs::default() };
+        if let Some(a) = a {
+            set.flags |= ATTR_ATIME;
+            set.atime = a.sec;
+        }
+        if let Some(m) = m {
+            set.flags |= ATTR_MTIME;
+            set.mtime = m.sec;
+        }
+        let seq = syscall(SYS_MO_ATTRS, [object, ATTRS_SET, &set as *const FileAttrs as u64, 0, 0, 0]);
+        if seq < 0 {
+            return Err(-seq);
+        }
+        let ext2 = |t: Option<vfs::stat::Time>| t.map(|t| ext2_time(t.sec));
+        let request = Request::SetTimes { ino: inode.node(), atime: ext2(a), mtime: ext2(m), ctime: Some(ext2_time(now.sec)) };
+        let sent = client().and_then(|c| status(&call(&c, request.encode(0))?));
+        // Sent (or refused: then what diskfs has stays the file's, unless data waits).
+        let clear = FileAttrs { seq: seq as u64, ..FileAttrs::default() };
+        syscall(SYS_MO_ATTRS, [object, ATTRS_CLEAR_IF_IDLE, &clear as *const FileAttrs as u64, 0, 0, 0]);
+        return sent.map(|_| ());
+    }
     let secs = |t: vfs::stat::Time| ext2_time(t.sec);
     let (request, seq, before) = {
         let mut t = inode.times.lock();
@@ -478,8 +516,22 @@ pub fn set_times(inode: &Arc<DInode>, atime: vfs::stat::SetTime, mtime: vfs::sta
 /// After a write-back: the times set here go to diskfs (after the data,
 /// whose `WRITE`s made diskfs record its own), and are forgotten unless
 /// they changed meanwhile or the write-back covered only part of the file
-/// (`whole`: all of it).
+/// (`whole`: all of it). A regular file's are its cached object's (every
+/// instance's writes', ADR 0014); a FIFO's this instance's own.
 fn send_times(c: &Client, inode: &DInode, whole: bool) -> Result<(), i64> {
+    if let Some(object) = *inode.object.lock() {
+        let mut a = FileAttrs::default();
+        if syscall(SYS_MO_ATTRS, [object, ATTRS_GET, &mut a as *mut FileAttrs as u64, 0, 0, 0]) < 0 || a.flags & (ATTR_ATIME | ATTR_MTIME | ATTR_CTIME) == 0 {
+            return Ok(());
+        }
+        let time = |bit: u64, v: i64| (a.flags & bit != 0).then(|| ext2_time(v));
+        let request = Request::SetTimes { ino: inode.node(), atime: time(ATTR_ATIME, a.atime), mtime: time(ATTR_MTIME, a.mtime), ctime: time(ATTR_CTIME, a.ctime) };
+        status(&call(&c, request.encode(0))?)?;
+        if whole {
+            syscall(SYS_MO_ATTRS, [object, ATTRS_CLEAR, &a as *const FileAttrs as u64, 0, 0, 0]);
+        }
+        return Ok(());
+    }
     let t = *inode.times.lock();
     if t.is_empty() {
         return Ok(());
@@ -605,7 +657,7 @@ pub fn client() -> Result<Arc<Client>, i64> {
         return Ok(c.clone());
     }
     let generation = GENERATION.fetch_add(1, Ordering::Relaxed) + 1;
-    let c = Arc::new(Client::connect(fsring::SERVICE, generation, fsclient::SCRATCH_PAGES).map_err(|_| EIO)?);
+    let c = Arc::new(Client::connect(fsring::SERVICE, generation, fsclient::SCRATCH_PAGES, true).map_err(|_| EIO)?);
     // Before anyone uses the new channel (they wait for RECONNECT): no
     // request names an inode diskfs may have freed meanwhile, and the
     // dirty pages have their disk space promised again.
@@ -619,7 +671,66 @@ pub fn client() -> Result<Arc<Client>, i64> {
         return Err(EIO);
     }
     *CLIENT.lock() = Some(c.clone());
+    // The worker takes the new channel's notes from now on (it may sleep on the old one's).
+    crate::scm::request();
     Ok(c)
+}
+
+/// On the worker: takes diskfs's notes about the inodes the instance holds
+/// (`fsring`, "Notes"): a file whose last link another process tree (or a
+/// diskfs before) took is unlinked here too and goes once nothing here uses
+/// it, so its blocks are freed at its last close in any tree. Whether there
+/// were any.
+pub fn take_notes() -> bool {
+    let Some(c) = CLIENT.lock().clone().filter(|c| !c.is_dead()) else { return false };
+    let mut any = false;
+    while let Some(d) = c.note() {
+        any = true;
+        match fsring::Note::decode(&d) {
+            Some(fsring::Note::Gone(node)) => gone(node),
+            // (Malformed: dropped.)
+            None => {}
+        }
+    }
+    if any {
+        // Notes that waited for room may come now.
+        c.doorbell();
+        reap();
+    }
+    any
+}
+
+/// On the worker, with no notes left: the word and value to sleep on for the
+/// next (None: no channel, or one came meanwhile); `notes_awake` after.
+pub fn notes_sleep() -> Option<(u64, u32)> {
+    CLIENT.lock().clone().filter(|c| !c.is_dead())?.notes_sleep()
+}
+
+pub fn notes_awake() {
+    if let Some(c) = CLIENT.lock().clone() {
+        c.notes_awake();
+    }
+}
+
+/// diskfs says the last link of `node` went: if it is cached here, it is
+/// unlinked, its name forgotten, and it goes as soon as nothing uses it
+/// (`reap`).
+fn gone(node: Node) {
+    let mut t = TABLE.lock();
+    let Some(inode) = t.inodes.get(&node.ino).filter(|i| i.generation == node.generation && !i.stale.load(Ordering::Relaxed)).cloned() else { return };
+    if inode.unlinked.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    if let Some((d, _, n)) = inode.link.lock().take() {
+        if t.names.get(d, &n) == Some(inode.ino) {
+            t.names.remove(d, &n);
+        }
+    }
+    t.check.push((inode.ino, inode.key));
+    REAP.store(true, Ordering::Relaxed);
+    drop(t);
+    // (Its last open file's close, if one is open, is when it goes: `let_go`.)
+    drop(inode);
 }
 
 /// The instance ends (`EVENT_CLOSING`): no program waits for a page any more.
@@ -1141,16 +1252,24 @@ pub fn chmod(inode: &Arc<DInode>, perm: u32) -> Result<(), i64> {
     Ok(())
 }
 
-/// Its `struct stat`: diskfs's, with the size the cache has.
+/// Its `struct stat`: diskfs's, with the size and the times the cache has
+/// (the file's cached object, whichever instance holds it: its writes are
+/// the file's at once, as on Linux).
 pub fn stat(inode: &Arc<DInode>) -> Result<[u8; 144], i64> {
     live(inode)?;
     let c = client()?;
+    // The cache's before diskfs's: a cached object that goes meanwhile had its data
+    // written back first, so diskfs's answer has it.
+    let cached = attrs(inode);
     let r = call(&c, Request::Stat { ino: inode.node() }.encode(0))?;
     status(&r)?;
     let s = fsring::Stat::from_values(&r.values);
-    let size = match *inode.object.lock() {
-        Some(h) => syscall(SYS_MO_FILE_SIZE, [h, 0, 0, 0, 0, 0]).max(0) as u64,
-        None => s.size,
+    let size = cached.map_or(s.size, |a| a.size);
+    let time = |bit: u64, v: i64| cached.filter(|a| a.flags & bit != 0).map(|_| ext2_time(v));
+    let local = *inode.times.lock();
+    let (atime, mtime, ctime) = match cached {
+        Some(a) => (time(ATTR_ATIME, a.atime), time(ATTR_MTIME, a.mtime), time(ATTR_CTIME, a.ctime)),
+        None => (local.atime, local.mtime, local.ctime),
     };
     let mut st = [0u8; 144];
     st[0..8].copy_from_slice(&DEV.to_le_bytes());
@@ -1161,10 +1280,9 @@ pub fn stat(inode: &Arc<DInode>) -> Result<[u8; 144], i64> {
     st[48..56].copy_from_slice(&size.to_le_bytes());
     st[56..64].copy_from_slice(&4096u64.to_le_bytes());
     st[64..72].copy_from_slice(&size.div_ceil(512).to_le_bytes());
-    let t = *inode.times.lock();
-    st[72..80].copy_from_slice(&from_ext2(t.atime.unwrap_or(s.atime)).to_le_bytes());
-    st[88..96].copy_from_slice(&from_ext2(t.mtime.unwrap_or(s.mtime)).to_le_bytes());
-    st[104..112].copy_from_slice(&from_ext2(t.ctime.unwrap_or(s.ctime)).to_le_bytes());
+    st[72..80].copy_from_slice(&from_ext2(atime.unwrap_or(s.atime)).to_le_bytes());
+    st[88..96].copy_from_slice(&from_ext2(mtime.unwrap_or(s.mtime)).to_le_bytes());
+    st[104..112].copy_from_slice(&from_ext2(ctime.unwrap_or(s.ctime)).to_le_bytes());
     Ok(st)
 }
 
@@ -1260,9 +1378,7 @@ pub fn mkwrite(key: u64, offset: u64) {
         Ok(end) => (end, true),
         Err(_) => (offset, false),
     };
-    if ok {
-        modified(&inode);
-    }
+    // (The store that follows sets the file's times: the kernel's, `SYS_MO_ATTRS`.)
     syscall(SYS_MO_BACKED, [object, offset, end, ok as u64, 0, 0]);
 }
 
@@ -1322,11 +1438,32 @@ pub fn readdir(dir: &Arc<DInode>, cursor: u64) -> Result<(Vec<(u32, u8, Vec<u8>)
 
 // ------------------------------------------------------------ contents
 
-/// The file's cached object (made on first use; regular files only).
+/// The file's cached object (joined, or made on first use; regular files
+/// only).
 pub fn object(inode: &Arc<DInode>) -> Result<u64, i64> {
+    open_object(inode, true)?.ok_or(EIO)
+}
+
+/// The file's cached object if this instance holds it, or joins it because
+/// another instance does (None: nobody caches the file, diskfs has all of
+/// it): for what must reach every instance's view of the file (truncation,
+/// times set, O_DIRECT reads of what another may have written).
+fn shared_object(inode: &Arc<DInode>) -> Result<Option<u64>, i64> {
+    if inode.kind != vfs::S_IFREG {
+        return Ok(None);
+    }
+    open_object(inode, false)
+}
+
+/// The file's cached object: the one for every instance (`SYS_MO_SHARED`,
+/// ADR 0014), joined, or with `create` made if nobody has one: then its
+/// size comes from diskfs, asked after the object is there for everyone
+/// (so it is the file's size: an object that went before had its data
+/// written back), and is told before anyone else uses the object.
+fn open_object(inode: &Arc<DInode>, create: bool) -> Result<Option<u64>, i64> {
     live(inode)?;
     if let Some(h) = *inode.object.lock() {
-        return Ok(h);
+        return Ok(Some(h));
     }
     match inode.kind {
         vfs::S_IFREG => {}
@@ -1337,19 +1474,54 @@ pub fn object(inode: &Arc<DInode>) -> Result<u64, i64> {
     // takes it for every inode while it holds `RECONNECT`).
     let _making = inode.making.lock()?;
     if let Some(h) = *inode.object.lock() {
-        return Ok(h);
+        return Ok(Some(h));
     }
     let limit = max_file()?;
     let c = client()?;
-    let r = call(&c, Request::Stat { ino: inode.node() }.encode(0))?;
-    status(&r)?;
-    let size = fsring::Stat::from_values(&r.values).size.min(limit);
-    let h = syscall(SYS_MO_CREATE_CACHED, [size, inode.key, limit, 0, 0, 0]);
-    if h < 0 {
-        return Err(-h);
+    let mut made = 0u64;
+    let flags = if create { SHARED_CREATE } else { 0 };
+    let h = syscall(SYS_MO_SHARED, [c.handle(), inode.node().to_object(), inode.key, limit, flags, &mut made as *mut u64 as u64]);
+    match h {
+        h if h == -ENOENT && !create => return Ok(None),
+        // (The channel's service went: diskfs restarts, the next use connects again.)
+        h if h < 0 && h > -4096 && h != -ENOTCONN => return Err(-h),
+        h if h < 0 => return Err(EIO),
+        _ => {}
     }
-    *inode.object.lock() = Some(h as u64);
-    Ok(h as u64)
+    let h = h as u64;
+    if made == 1 {
+        let size = call(&c, Request::Stat { ino: inode.node() }.encode(0))
+            .and_then(|r| status(&r).map(|_| fsring::Stat::from_values(&r.values).size.min(limit)));
+        let size = match size {
+            Ok(size) => size,
+            Err(e) => {
+                // (The others wait for its size a minute at most, then ask themselves.)
+                syscall(SYS_HANDLE_CLOSE, [h, 0, 0, 0, 0, 0]);
+                return Err(e);
+            }
+        };
+        // (EALREADY: another instance told it meanwhile, after our time was up.)
+        syscall(SYS_MO_SHARED_INIT, [h, size, 0, 0, 0, 0]);
+    }
+    *inode.object.lock() = Some(h);
+    Ok(Some(h))
+}
+
+/// The size and times of the file's cached object, ours or another
+/// instance's (None: nobody caches it).
+fn attrs(inode: &Arc<DInode>) -> Option<FileAttrs> {
+    let mut a = FileAttrs::default();
+    let p = &mut a as *mut FileAttrs as u64;
+    let own = *inode.object.lock();
+    let r = match own {
+        Some(h) => syscall(SYS_MO_ATTRS, [h, ATTRS_GET, p, 0, 0, 0]),
+        None if inode.kind == vfs::S_IFREG => {
+            let c = CLIENT.lock().clone().filter(|c| !c.is_dead())?;
+            syscall(SYS_MO_SHARED, [c.handle(), inode.node().to_object(), 0, 0, SHARED_QUERY, p])
+        }
+        None => return None,
+    };
+    (r == 0).then_some(a)
 }
 
 pub fn size(inode: &Arc<DInode>) -> Result<u64, i64> {
@@ -1652,10 +1824,63 @@ pub fn write(inode: &Arc<DInode>, off: u64, buf: u64, len: u64) -> Result<u64, i
             _ => break,
         }
     }
-    if done > 0 {
-        modified(inode);
-    }
+    // (The kernel set the file's times with the data: `SYS_MO_ATTRS`.)
     Ok(done)
+}
+
+/// Rounds an append makes ready (fills the page holding the end, secures
+/// the space) before it gives up: each round that does not go in is one
+/// in which another appender's went in first.
+const APPEND_ROUNDS: u32 = 64;
+
+/// An O_APPEND write of the program's buffers `vecs`: at the end of the
+/// file, found and written in one step for every appender of every
+/// instance (`SYS_MO_FILE_APPEND`, as Linux's inode lock makes it), the
+/// whole of it or nothing (short only for a fault in the program's memory
+/// or no memory). The offset it went to and the bytes written. The server
+/// makes the end ready first (its page filled, the space promised) and
+/// tries again when another appender moved the end meanwhile.
+pub fn append(inode: &Arc<DInode>, vecs: &[(u64, u64)]) -> Result<(u64, u64), i64> {
+    let object = object(inode)?;
+    let total = vecs.iter().try_fold(0u64, |t, &(_, l)| t.checked_add(l)).ok_or(EINVAL)?;
+    let max = max_file()?;
+    let pairs: Vec<u64> = {
+        let mut p = Vec::new();
+        p.try_grow(2 * vecs.len())?;
+        for &(base, len) in vecs {
+            p.push(base);
+            p.push(len);
+        }
+        p
+    };
+    // Where this append's space is promised up to (`secure`), so far.
+    let mut upto = 0u64;
+    let mut written_back = false;
+    for _ in 0..APPEND_ROUNDS {
+        let backing = if upto > 0 { MO_BACKED } else { MO_CHECK_BACKED };
+        let mut at = 0u64;
+        let r = syscall(SYS_MO_FILE_APPEND, [object, &mut at as *mut u64 as u64, pairs.as_ptr() as u64, vecs.len() as u64, MO_NOFILL | MO_IOV | backing, upto]);
+        match r {
+            n if n >= 0 => return Ok((at, n as u64)),
+            r if r == -ENOSPC => {
+                // The space from `at` to the end as the append leaves it.
+                let end = at.saturating_add(total).max(size(inode)?.saturating_add(total)).min(max);
+                upto = secure(inode, object, at, end)?;
+            }
+            // The page holding the end keeps its data: it comes first.
+            r if r == -EAGAIN => {
+                fill(inode, at / PAGE, 1)?;
+            }
+            r if r == -ENOMEM && !written_back => {
+                // No room for a new page: dirty ones go to the disk first.
+                written_back = true;
+                write_back_dirty();
+            }
+            e => return Err(-e),
+        }
+    }
+    // (Others kept appending first, every round.)
+    Err(EIO)
 }
 
 /// Reads into the server's memory at `off` (sendfile): the missing pages
@@ -1687,9 +1912,6 @@ pub fn write_server(inode: &Arc<DInode>, off: u64, data: &[u8]) -> Result<usize,
     let n = syscall(SYS_MO_WRITE, [object, off, data.as_ptr() as u64, data.len() as u64, 0, 0]);
     if n < 0 {
         return Err(-n);
-    }
-    if n > 0 {
-        modified(inode);
     }
     Ok(n as usize)
 }
@@ -1873,9 +2095,10 @@ fn truncate_file(inode: &Arc<DInode>, len: u64) -> Result<(), i64> {
     }
     let _wb = inode.wb.lock()?;
     let c = client()?;
-    // A file with nothing cached: diskfs's size is all (its object, made
-    // later, starts from it).
-    let Some(object) = *inode.object.lock() else {
+    // A file nobody caches (in any instance): diskfs's size is all (its
+    // object, made later, starts from it). One another instance caches is
+    // cut there too (joined: every instance's view of it is that object).
+    let Some(object) = shared_object(inode)? else {
         return status(&call(&c, Request::Truncate { ino: inode.node(), len }.encode(0))?).map(|_| ());
     };
     // Growing: diskfs first (it refuses what it cannot hold), then the
@@ -1921,7 +2144,8 @@ pub fn read_direct(inode: &Arc<DInode>, off: u64, buf: u64, len: u64) -> Result<
     if inode.kind != vfs::S_IFREG {
         return Err(if inode.kind == vfs::S_IFDIR { EISDIR } else { EINVAL });
     }
-    if inode.object.lock().is_some() {
+    // What any instance has cached of the range goes to the disk first.
+    if shared_object(inode)?.is_some() {
         writeback(inode, off / PAGE..off.saturating_add(len).div_ceil(PAGE))?;
     }
     let c = client()?;

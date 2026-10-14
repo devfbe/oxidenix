@@ -12,6 +12,11 @@
 //! contents and O_DIRECT reads travel in a scratch buffer: a memory object
 //! mapped into the server's region (`SYS_MO_MAP_SERVER`) and granted to the
 //! service once, handed out in page runs (`scratch`).
+//!
+//! **Notes.** A channel to diskfs has one page of shared area with the
+//! ring of diskfs's notes about inodes the instance holds (`fsring`,
+//! "Notes"): the worker thread takes them (`note`) and sleeps on the ring
+//! beside its own requests (`notes_sleep`, `notes_awake`).
 
 use crate::ringclient::{self, futex_wait, futex_wake, RingClient};
 use crate::sync::Mutex;
@@ -20,6 +25,7 @@ use core::ops::Deref;
 use core::sync::atomic::{AtomicU32, Ordering};
 use fsring::{Buf, Completion};
 use restricted::*;
+use ring::{Consumer, Ring};
 
 pub use crate::ringclient::Next;
 
@@ -37,6 +43,10 @@ pub struct Client {
     /// Which connection this is (`datafs` counts them).
     pub generation: u64,
     scratch: ScratchArea,
+    /// The service's notes about inodes the instance holds (`fsring`,
+    /// "Notes"), in the channel's shared area; taken by one thread (the
+    /// worker's `datafs::take_notes`). None for a channel without them.
+    notes: Option<Mutex<Consumer<'static, { fsring::NOTE_SLOTS }>>>,
 }
 
 impl Deref for Client {
@@ -65,11 +75,34 @@ fn mask(pages: u64) -> u64 {
 impl Client {
     /// A new channel to `service` (started again if it died), connected,
     /// with a scratch buffer of `scratch_pages` pages (at most
-    /// `SCRATCH_PAGES`) mapped and granted.
-    pub fn connect(service: &str, generation: u64, scratch_pages: u64) -> Result<Client, i64> {
-        let ring = RingClient::connect(service, 0)?;
+    /// `SCRATCH_PAGES`) mapped and granted, and with `notes` the notes'
+    /// ring (diskfs's).
+    pub fn connect(service: &str, generation: u64, scratch_pages: u64, notes: bool) -> Result<Client, i64> {
+        let ring = RingClient::connect(service, if notes { fsring::SHARED_PAGES } else { 0 })?;
         let scratch = ScratchArea::new(ring.handle(), scratch_pages.clamp(1, SCRATCH_PAGES))?;
-        Ok(Client { ring, generation, scratch })
+        // (The shared area is mapped while the client lives.)
+        let notes = notes.then(|| Mutex::new(Ring::new(unsafe { fsring::notes(ring.shared()) }).consumer()));
+        Ok(Client { ring, generation, scratch, notes })
+    }
+
+    /// The next note, if one came.
+    pub fn note(&self) -> Option<ring::Desc> {
+        self.notes.as_ref()?.lock().pop()
+    }
+
+    /// Announces a sleep on the notes' ring (`ring::Consumer::prepare_sleep`):
+    /// the word and the value to sleep on, None if a note came meanwhile (or
+    /// the channel has none). `notes_awake` once the thread runs again.
+    pub fn notes_sleep(&self) -> Option<(u64, u32)> {
+        let notes = self.notes.as_ref()?;
+        let value = notes.lock().prepare_sleep()?;
+        Some((self.ring.shared() as u64 + ring::TAIL_OFFSET as u64, value))
+    }
+
+    pub fn notes_awake(&self) {
+        if let Some(notes) = self.notes.as_ref() {
+            notes.lock().awake();
+        }
     }
 
     /// The scratch buffer's size in pages.

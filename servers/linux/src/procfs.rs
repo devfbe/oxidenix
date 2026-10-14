@@ -217,7 +217,7 @@ fn client() -> Result<Arc<Client>, i64> {
     if let Some(c) = CLIENT.lock().clone().filter(|c| !c.is_dead()) {
         return Ok(c);
     }
-    let c = Arc::new(Client::connect(procproto::SERVICE, 0, SCRATCH_PAGES).map_err(|_| EIO)?);
+    let c = Arc::new(Client::connect(procproto::SERVICE, 0, SCRATCH_PAGES, false).map_err(|_| EIO)?);
     *CLIENT.lock() = Some(c.clone());
     Ok(c)
 }

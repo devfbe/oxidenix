@@ -21,12 +21,9 @@ done, delete it here in the same commit.
 - **No per-tree memory limits.** The OOM killer chooses across all trees (ADR 0013); a tree
   with a limit of its own (as Linux's memory cgroups) would need every frame charged to its
   tree, with an OOM within the tree when it exceeds its limit.
-- **/data across process trees is shared through the disk only.** Each instance caches
-  `/data` on its own (io-rings.md, step 4): contents another tree changed are seen after its
-  write-back (fsync, a `sync(2)` anywhere) and only for pages not cached here, and a file
-  another tree unlinked keeps its blocks while any instance caches its inode (fsring's holds;
-  `treetest` checks only what holds). Coherence needs diskfs to call back its clients
-  (invalidate pages and sizes, report a last link gone).
+- **/data across process trees: what stays per tree** (ADR 0014 made the page cache one per
+  file for every tree): a FIFO's pipe and times, inotify events of other trees' changes, and
+  `sendfile`/`copy_file_range` into an `O_APPEND` file are atomic within their tree only.
 - `RLIMIT_NPROC` is not enforced (Linux exempts root; the kernel's process table is the bound).
 
 ## Linux features not implemented

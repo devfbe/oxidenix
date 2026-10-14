@@ -192,9 +192,10 @@ pub const SYS_VM_REMAP: u64 = 1026;
 pub const SYS_VM_DISCARD: u64 = 1027;
 /// `vm_sync(addr, len, flags, out, cap) -> n`: msync's contract (flags and
 /// range checked). With MS_SYNC, the shared mappings of cached objects
-/// (`SYS_MO_CREATE_CACHED`) in the range are the server's to write back:
-/// `n` of them, the first `cap` stored at `out` as (key, first page, end
-/// page) triples of u64s.
+/// (`SYS_MO_SHARED`) in the range are the server's to write back: `n` of
+/// them, the first `cap` stored at `out` as (key, first page, end page)
+/// triples of u64s (the key the calling instance knows the object by; one
+/// it does not hold is not counted).
 pub const SYS_VM_SYNC: u64 = 1028;
 // 1029 was `kfile_object`, a handle on an open file of the kernel's
 // descriptor table: the table is the server's since R6e (and the kernel has
@@ -259,8 +260,10 @@ pub const EVENT_PAGE: u64 = 1;
 /// `fs_record` and `files_record`, went with R8: the server's thread table
 /// holds them.)
 pub const EVENT_RELEASE: u64 = 3;
-/// A cached object (`SYS_MO_CREATE_CACHED`) got its first dirty page: `a`
-/// is its key. (Again once all were written back and one is dirtied.)
+/// A cached object (`SYS_MO_SHARED`) got its first dirty page through a
+/// store of the instance's, or the dirty pages of another instance that let
+/// go of it passed to this one: it answers for them (writes them back).
+/// `a` is its key. (Again once all were written back and one is dirtied.)
 pub const EVENT_DIRTY: u64 = 4;
 /// Dirty pages crowd out memory (reclaim cannot drop them, or more than a
 /// tenth of user memory is dirty): write back about `a` pages. One is
@@ -596,22 +599,100 @@ pub const GRANT_DIRTY: u64 = 4;
 pub const SYS_REVOKE: u64 = 1067;
 pub const REVOKE_DRAINING: u64 = 1;
 
-// The server's page cache of disk files (I/O rings step 4, phase R6c.3):
-// one cached object per file the server uses, filled and written back by
-// the server over its channel to the disk server.
+// The page cache of disk files (I/O rings step 4, phase R6c.3; ADR 0014):
+// one cached object per file of a disk server for every instance that
+// uses it (`mo_shared`), filled and written back by the instances over
+// their channels to the disk server.
 
-/// `mo_create_cached(size, key, limit) -> handle`: a file object for the
-/// server's cache of a file of `size` bytes that may grow to `limit` (the
-/// filesystem's largest file: EFBIG beyond). Reads, writes (`mo_file_*`,
-/// `mo_read`/`mo_write`), mappings and programs use it as a file object;
-/// a missing page is asked for with `EVENT_PAGE` (`key`), and the server
-/// fills it by DMA into the pages it grants (`GRANT_FILL`, `mo_filled`).
-/// Stores (writes, shared mappings) mark pages dirty (`EVENT_DIRTY`); the
-/// server writes them back (`GRANT_DIRTY`, `mo_redirty`). Its pages are
-/// cached memory, not committed: clean ones nothing pins are reclaimed
-/// when memory is short (mapped ones after reclaim removed them from the
-/// mappings that did not use them lately).
-pub const SYS_MO_CREATE_CACHED: u64 = 1076;
+// 1076 was `mo_create_cached`, an instance's own cache of a file: the
+// cache is one per file for all instances since ADR 0014 (`mo_shared`).
+
+/// `mo_shared(channel, file, key, limit, flags, out) -> handle`: the
+/// cached object of file `file` (the disk server's id of it) of the
+/// service the channel is connected to, which may grow to `limit` bytes
+/// (the filesystem's largest file: EFBIG beyond): one object per file for
+/// every instance that uses it, so each sees the others' writes, sizes and
+/// stores at once. The instance knows it by `key` (its events name it).
+/// The one that exists is joined; with `SHARED_CREATE` a new one is made
+/// if there is none (ENOENT without), and `out` (a u64) gets 1: the caller
+/// asks its disk server for the size and tells it (`mo_shared_init`)
+/// before anyone uses the object (other instances wait for that, a minute
+/// at most, then do it themselves); else 0. With `SHARED_QUERY` no handle
+/// is made: the existing object's `FileAttrs` go to `out` (ENOENT: none).
+/// Reads, writes (`mo_file_*`, `mo_read`/`mo_write`), mappings and
+/// programs use it as a file object; a missing page is asked of the pager
+/// of the instance that wants it (`EVENT_PAGE`), which fills it by DMA into
+/// the pages it grants (`GRANT_FILL`, `mo_filled`). Stores (writes, shared
+/// mappings) mark pages dirty; the instance whose store made the object
+/// dirty answers for its dirty pages (`EVENT_DIRTY`; another takes over
+/// when it lets go), and any instance writes them back (`GRANT_DIRTY`,
+/// `mo_redirty`). Its pages are cached memory, not committed: clean ones
+/// nothing pins are reclaimed when memory is short (mapped ones after
+/// reclaim removed them from the mappings that did not use them lately).
+/// The instance lets go of it with its last handle; the object goes with
+/// its last instance.
+pub const SYS_MO_SHARED: u64 = 1210;
+pub const SHARED_CREATE: u64 = 1;
+pub const SHARED_QUERY: u64 = 2;
+/// `mo_shared_init(handle, size)`: the size of a cached object the caller
+/// made (`mo_shared`'s `out`), as its disk server has it; the others may
+/// use it now. EALREADY if its size was told before (nothing changes).
+pub const SYS_MO_SHARED_INIT: u64 = 1211;
+/// `mo_attrs(handle, op, attrs) -> n`: the times a cached object's data
+/// changed, kept with it for every instance (`FileAttrs`): a write or a
+/// store to a clean page sets the modification and change times to now
+/// (the wall clock's seconds) and marks them pending (data waits for a
+/// write-back, which makes the disk server stamp its own time: the
+/// instance that writes the file back sends these after the data and
+/// clears them). `ATTRS_GET` stores them and the size at `attrs`;
+/// `ATTRS_SET` sets those `attrs.flags` names to `attrs`' values and
+/// returns the new sequence number (`ATTRS_SET_IF_PENDING`: only while
+/// pending); `ATTRS_CLEAR` forgets them unless they changed since
+/// `attrs.seq` (`ATTRS_CLEAR_IF_IDLE`: nor while pending), returning 1 if
+/// it did.
+pub const SYS_MO_ATTRS: u64 = 1212;
+pub const ATTRS_GET: u64 = 0;
+pub const ATTRS_SET: u64 = 1;
+pub const ATTRS_SET_IF_PENDING: u64 = 2;
+pub const ATTRS_CLEAR: u64 = 3;
+pub const ATTRS_CLEAR_IF_IDLE: u64 = 4;
+/// `FileAttrs::flags`: which times are set, and whether data waits for a
+/// write-back.
+pub const ATTR_ATIME: u64 = 1;
+pub const ATTR_MTIME: u64 = 2;
+pub const ATTR_CTIME: u64 = 4;
+pub const ATTR_PENDING: u64 = 8;
+
+/// A cached object's size and times (`mo_attrs`, `mo_shared`'s query).
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct FileAttrs {
+    pub size: u64,
+    pub flags: u64,
+    /// Seconds since 1970.
+    pub atime: i64,
+    pub mtime: i64,
+    pub ctime: i64,
+    /// Counts the changes of the times.
+    pub seq: u64,
+}
+
+/// `mo_file_append(handle, out, buf, len, flags, upto) -> n`: writes the
+/// program's memory at `buf` at the end of a cached object, as
+/// `mo_file_write` (`flags`, `upto`), finding the end and writing there in
+/// one step for every appender of every instance (as Linux's O_APPEND under
+/// its inode lock); the offset it wrote at goes to `out` (a u64). The
+/// write goes in whole or not at all: EAGAIN if the page holding the end
+/// must be filled first, ENOSPC if the space from there on is not backed
+/// (`out`: the byte to make ready from; the server fills or promises, then
+/// appends again). With `MO_IOV`, `buf` is an array of `len` (address,
+/// length) pairs of u64s in the server's memory (at most `MO_IOV_MAX`),
+/// the program's buffers written one after the other (writev). Cached
+/// objects only (EINVAL).
+pub const SYS_MO_FILE_APPEND: u64 = 1213;
+pub const MO_IOV: u64 = 8;
+pub const MO_IOV_MAX: u64 = 1024;
+
 /// `mo_filled(handle, offset, pages, status)`: the pending pages among
 /// `pages` (at most 256) from `offset` hold the file's data now
 /// (`FILL_OK`), or could not be read (`FILL_FAILED`) or not be had for
@@ -621,7 +702,9 @@ pub const SYS_MO_CREATE_CACHED: u64 = 1076;
 /// killer); nothing is kept for later accesses, which ask again. Or they
 /// were not read for a reason that says nothing about the file
 /// (`FILL_AGAIN`: the filesystem's server died): they go, and whoever waits
-/// for them asks again. Wakes the waiters. EINVAL for another status.
+/// for them asks again. Wakes the waiters. EINVAL for another status. Only
+/// the pages the caller's instance made pending count: one another instance
+/// fills, or took over after a minute without an answer, is left alone.
 pub const SYS_MO_FILLED: u64 = 1077;
 /// `mo_filled`'s statuses.
 pub const FILL_FAILED: u64 = 0;
@@ -1178,7 +1261,7 @@ pub const TEST_DISKRING: u64 = 1515;
 /// idleness with it: /proc shows only the caller's instance's processes.
 pub const TEST_SERVER_TICKS: u64 = 1518;
 /// `(scenario)`: the server checks the kernel's interface of its page cache
-/// (`SYS_MO_CREATE_CACHED`) on a file of /data: 1 a failed fill beyond the
+/// (`SYS_MO_SHARED`) on a file of /data: 1 a failed fill beyond the
 /// end of the file or over 256 pages leaves no trace (the file grown later
 /// reads as zeros), 2 a write-back grant over more pages than one call
 /// looks at goes on where the kernel says (`EAGAIN`) and finds the dirty

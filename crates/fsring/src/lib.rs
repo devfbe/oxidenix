@@ -98,10 +98,78 @@
 //! device addresses of its pages) until `FORGET`: the client sends it
 //! before it revokes the grant, so that the revoke never waits for the
 //! service (`restricted::SYS_REVOKE`, `REVOKE_DRAINING`).
+//!
+//! **Notes.** The service's word to a client about inodes the client holds,
+//! for clients that keep what they hold cached (the Linux server instances
+//! share their page cache, ADR 0014, but each holds its own inodes): a
+//! channel with `SHARED_PAGES` of shared area carries a ring of
+//! `NOTE_SLOTS` notes there (`notes`), the service the producer, the client
+//! the consumer, which sleeps on its tail as on any ring's (`ring`,
+//! invariant 4). A `GONE` note says the last link of an inode the client
+//! holds went (`Note`): through another client's `UNLINK` or `RENAME`, or
+//! before the client came to hold it (a client that names an inode without
+//! links, after a restart of the service, say): the client lets go of it
+//! (`RELEASE`) once it does not use it, so that its blocks are freed at its
+//! last close in any client. The requesting client of an `UNLINK` or
+//! `RENAME` learns it from the completion instead. A note finding the ring
+//! full waits in the service (one per inode and channel, none once the
+//! client released the inode) until the client took notes and rang the
+//! submission doorbell. A channel without shared area gets no notes.
+//!
+//! **Promises across clients.** A block another client promised needs no
+//! promise of this one's (one promise per block, whoever asks), and when a
+//! client goes, its promises of a file another client holds pass to that
+//! client (the clients share their cache: the other writes the pages back
+//! now); the others end.
 
 #![no_std]
 
 pub use ring::Desc;
+use ring::RingMemory;
+
+/// Pages of shared area a channel to diskfs has: the notes' ring.
+pub const SHARED_PAGES: u32 = 1;
+/// Notes in the ring.
+pub const NOTE_SLOTS: usize = 32;
+
+/// The notes' ring of a channel whose shared area starts at `shared`.
+///
+/// # Safety
+/// `shared` is the channel's shared area (at least `SHARED_PAGES` pages,
+/// page-aligned), mapped for `'a`.
+pub unsafe fn notes<'a>(shared: *const u8) -> &'a RingMemory<NOTE_SLOTS> {
+    unsafe { RingMemory::from_ptr(shared as *const RingMemory<NOTE_SLOTS>) }
+}
+
+/// A note's kinds (`Desc::op`).
+pub mod note {
+    /// The last link of the inode in `object` went.
+    pub const GONE: u16 = 1;
+}
+
+/// A note (see "Notes"), as the client checks it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Note {
+    Gone(Node),
+}
+
+impl Note {
+    pub fn encode(&self) -> Desc {
+        match *self {
+            Note::Gone(node) => Desc { op: note::GONE, object: node.to_object(), ..Desc::default() },
+        }
+    }
+
+    /// A note copied out of the ring; None for anything malformed (an
+    /// unknown kind, a field set that the kind does not use).
+    pub fn decode(d: &Desc) -> Option<Note> {
+        let clean = d.flags == 0 && d.len == 0 && d.tag == 0 && d.offset == 0 && d.grant == 0 && d.buf_off == 0 && d.arg == [0; 3];
+        match d.op {
+            note::GONE if clean && d.object as u32 != 0 => Some(Note::Gone(Node::from_object(d.object))),
+            _ => None,
+        }
+    }
+}
 
 /// The service's IPC name, and the slots per ring of its channels.
 pub const SERVICE: &str = "diskfs";

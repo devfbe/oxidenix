@@ -388,8 +388,10 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
        trees run are not shared between them.
      - **c3 — `/data` in the server** (done; I/O rings step 4, `io-rings.md`, ADR 0005): the
        server is diskfs's client over shared-memory rings with granted buffers
-       (`servers/linux/src/datafs.rs`, `fsclient.rs`, `datafile.rs`), with its own page cache:
-       one cached object of the kernel's per file (`SYS_MO_CREATE_CACHED`), filled and written
+       (`servers/linux/src/datafs.rs`, `fsclient.rs`, `datafile.rs`), with a page cache of
+       the kernel's: one cached object per file for every instance (`SYS_MO_SHARED`, ADR 0014:
+       process trees see each other's writes, sizes, times and shared mappings at once, and
+       diskfs's notes free an unlinked file at its last close in any tree), filled and written
        back by DMA into and out of granted pages, write-back instead of write-through. The
        kernel's `/data` (its remote store, write-through, flusher, `O_DIRECT` path and diskfs's
        IPC protocol) is gone; the kernel only starts diskfs and, before it powers off, waits

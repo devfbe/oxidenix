@@ -2,7 +2,8 @@
 //! (inode handles with their generations),
 //! malformed descriptors are refused with the right errno (unknown
 //! operations, stray fields, lengths, promises and names out of range), and the
-//! completion, stat (a device's number), usage and directory entry encodings round-trip.
+//! completion, stat (a device's number), usage and directory entry encodings round-trip,
+//! as do the service's notes, whose ring fits a channel's shared area.
 
 use fsring::errno::*;
 use fsring::*;
@@ -216,4 +217,32 @@ fn directory_entries_pack_and_parse() {
     assert_eq!(parsed, vec![(2, TYPE_DIR, &b"."[..]), (12, TYPE_FILE, &b"README.txt"[..])]);
     // A truncated entry ends the list.
     assert_eq!(dirents(&out[..a + 10]).count(), 1);
+}
+
+/// Notes (the service's word to a client about inodes it holds): a `GONE`
+/// note round-trips with its handle, anything else is dropped, and the
+/// notes' ring fits the channel's shared area and works there (a full ring
+/// refuses, taking one makes room).
+#[test]
+fn notes_round_trip_and_fit_the_shared_area() {
+    let gone = Note::Gone(n(77));
+    assert_eq!(Note::decode(&gone.encode()), Some(gone));
+    let d = gone.encode();
+    assert_eq!(Note::decode(&Desc { op: 9, ..d }), None);
+    assert_eq!(Note::decode(&Desc { tag: 1, ..d }), None);
+    assert_eq!(Note::decode(&Desc { arg: [0, 1, 0], ..d }), None);
+    assert_eq!(Note::decode(&Desc { object: 0, ..d }), None);
+    let bytes = core::mem::size_of::<ring::RingMemory<NOTE_SLOTS>>();
+    assert!(bytes <= SHARED_PAGES as usize * 4096, "{bytes}");
+    // A page-aligned zeroed area, as the kernel makes a channel's.
+    let area = vec![0u64; 512 * SHARED_PAGES as usize];
+    let notes = unsafe { notes(area.as_ptr() as *const u8) };
+    let mut producer = ring::Ring::new(notes).producer();
+    let mut consumer = ring::Ring::new(notes).consumer();
+    for i in 0..NOTE_SLOTS as u32 {
+        assert!(producer.push(&Note::Gone(n(i + 1)).encode()));
+    }
+    assert!(!producer.push(&gone.encode()));
+    assert_eq!(consumer.pop().as_ref().and_then(Note::decode), Some(Note::Gone(n(1))));
+    assert!(producer.push(&gone.encode()));
 }
