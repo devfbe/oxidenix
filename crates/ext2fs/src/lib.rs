@@ -99,6 +99,14 @@
 //! at mount stays so until e2fsck). A filesystem without a journal (too small for one, or
 //! of revision 0) is plain ext2: its commits write in place, and a crash is e2fsck's.
 //!
+//! **Special files.** Sockets, FIFOs and character and block devices are inodes without
+//! data (no blocks, size 0), listed with their types (`FT_SOCK`, `FT_FIFO`, `FT_CHRDEV`,
+//! `FT_BLKDEV`). A device's number is in its block pointers as Linux's ext2 keeps it: a
+//! major and minor below 256 each in `i_block[0]` (`old_encode_dev`), any other in
+//! `i_block[1]` with `i_block[0]` 0 (`new_encode_dev`: 12 bits of major, 20 of minor);
+//! the rest of the pointers are 0, as e2fsck wants them. What the filesystem takes and
+//! gives is the number as `st_rdev` has it (`dev_make`).
+//!
 //! On a host: Linux's ext3/ext4 driver replays the journal and frees the listed inodes at
 //! mount (also read-only, unless the device itself is read-only); `e2fsck -fy` does both,
 //! `e2fsck -fn` reports a journal that needs recovery and a non-empty list. A cleanly
@@ -211,6 +219,51 @@ pub enum NewNode {
     /// A socket's name (bind(2) of an AF_UNIX socket): an inode without
     /// data.
     Socket,
+    /// A FIFO (mknod(2), mkfifo(3)): an inode without data; its pipe is the opener's.
+    Fifo,
+    /// A character or block device with its number (as `st_rdev` has it, `dev_make`;
+    /// EINVAL for a major from 4096 or a minor from 2^20 on, which ext2 cannot keep).
+    CharDev(u64),
+    BlockDev(u64),
+}
+
+/// A device number as `st_rdev` has it (glibc's and musl's `makedev`, Linux's
+/// `new_encode_dev` for numbers ext2 can keep).
+pub fn dev_make(major: u32, minor: u32) -> u64 {
+    let (major, minor) = (major as u64, minor as u64);
+    (minor & 0xff) | ((major & 0xfff) << 8) | ((minor & !0xff) << 12) | ((major & !0xfff) << 32)
+}
+
+/// `dev_make`'s inverse: (major, minor).
+pub fn dev_split(dev: u64) -> (u32, u32) {
+    let major = ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff);
+    let minor = (dev & 0xff) | ((dev >> 12) & !0xff);
+    (major as u32, minor as u32)
+}
+
+/// A device number's block pointers 0 and 1, as Linux's ext2 writes them
+/// (`ext2_set_inode`): the old 16-bit encoding when major and minor fit a byte each, else
+/// the new 32-bit one in the second pointer. EINVAL for a number ext2 cannot keep.
+fn dev_to_blocks(rdev: u64) -> Result<[u32; 2], i64> {
+    let (major, minor) = dev_split(rdev);
+    if major >= 1 << 12 || minor >= 1 << 20 {
+        return Err(EINVAL);
+    }
+    if major < 256 && minor < 256 {
+        Ok([major << 8 | minor, 0])
+    } else {
+        Ok([0, (minor & 0xff) | major << 8 | (minor & !0xff) << 12])
+    }
+}
+
+/// A device's number from its block pointers 0 and 1 (Linux's `ext2_iget`: the old
+/// encoding if the first is not 0, else the new one).
+fn dev_from_blocks(b0: u32, b1: u32) -> u64 {
+    if b0 != 0 {
+        dev_make(b0 >> 8 & 0xff, b0 & 0xff)
+    } else {
+        dev_make(b1 >> 8 & 0xfff, (b1 & 0xff) | (b1 >> 12 & 0xfff00))
+    }
 }
 
 pub const ROOT_INO: u32 = 2;
@@ -243,8 +296,24 @@ const CACHE_BYTES: usize = 1024 * 1024;
 
 const FT_REG: u8 = 1;
 const FT_DIR: u8 = 2;
+const FT_CHRDEV: u8 = 3;
+const FT_BLKDEV: u8 = 4;
+const FT_FIFO: u8 = 5;
 const FT_SOCK: u8 = 6;
 const FT_SYMLINK: u8 = 7;
+
+/// A directory entry's type for an inode of `mode`.
+fn ftype(mode: u32) -> u8 {
+    match mode & S_IFMT {
+        S_IFDIR => FT_DIR,
+        S_IFLNK => FT_SYMLINK,
+        S_IFSOCK => FT_SOCK,
+        S_IFIFO => FT_FIFO,
+        S_IFCHR => FT_CHRDEV,
+        S_IFBLK => FT_BLKDEV,
+        _ => FT_REG,
+    }
+}
 
 fn io(_: ()) -> i64 {
     EIO
@@ -2503,6 +2572,9 @@ impl<D: Device> State<D> {
     /// and its name, in the running transaction. Its number.
     fn create(&mut self, dir: u32, name: &str, kind: &NewNode, perm: u32) -> Result<u32, i64> {
         check_name(name)?;
+        if let NewNode::CharDev(rdev) | NewNode::BlockDev(rdev) = kind {
+            dev_to_blocks(*rdev)?;
+        }
         // (Only "no such name" lets it be made: a failed lookup is no proof of none.)
         match self.lookup(dir, name) {
             Ok(_) => return Err(EEXIST),
@@ -2569,10 +2641,21 @@ impl<D: Device> State<D> {
                 inode.set_size(target.len() as u64);
                 FT_SYMLINK
             }
-            NewNode::Socket => {
-                inode.set_mode((S_IFSOCK | perm & 0o7777) as u16);
+            NewNode::Socket | NewNode::Fifo | NewNode::CharDev(_) | NewNode::BlockDev(_) => {
+                let (kind, rdev) = match *kind {
+                    NewNode::Fifo => (S_IFIFO, None),
+                    NewNode::CharDev(rdev) => (S_IFCHR, Some(rdev)),
+                    NewNode::BlockDev(rdev) => (S_IFBLK, Some(rdev)),
+                    _ => (S_IFSOCK, None),
+                };
+                if let Some(rdev) = rdev {
+                    let [b0, b1] = dev_to_blocks(rdev)?;
+                    inode.set_block(0, b0);
+                    inode.set_block(1, b1);
+                }
+                inode.set_mode((kind | perm & 0o7777) as u16);
                 inode.set_links(1);
-                FT_SOCK
+                ftype(kind)
             }
         };
         self.write_inode(ino, &inode)?;
@@ -2689,12 +2772,7 @@ impl<D: Device> State<D> {
         if is_dir && self.is_ancestor(ino, ndir)? {
             return Err(EINVAL);
         }
-        let ftype = match inode.mode() as u32 & S_IFMT {
-            S_IFDIR => FT_DIR,
-            S_IFLNK => FT_SYMLINK,
-            S_IFSOCK => FT_SOCK,
-            _ => FT_REG,
-        };
+        let ftype = ftype(inode.mode() as u32);
         // (Only "no such name" means none: another failure is the rename's.)
         let existing = match self.lookup(ndir, nname) {
             Ok(existing) => Some(existing),
@@ -3214,6 +3292,8 @@ pub struct Stat {
     pub ctime: u32,
     /// i_generation (a new one for each new file of the number).
     pub generation: u32,
+    /// A character or block device's number (as `st_rdev`, `dev_make`); 0 for any other.
+    pub rdev: u64,
 }
 
 /// A mounted ext2 filesystem on device `D`. Single-threaded: the owner
@@ -3457,6 +3537,10 @@ impl<D: Device> Ext2<D> {
             mtime: i.mtime(),
             ctime: i.ctime(),
             generation: i.generation(),
+            rdev: match i.mode() as u32 & S_IFMT {
+                S_IFCHR | S_IFBLK => dev_from_blocks(i.block(0), i.block(1)),
+                _ => 0,
+            },
         })
     }
 
@@ -3601,7 +3685,7 @@ impl<D: Device> Ext2<D> {
         self.st.lookup(dir, name)
     }
 
-    /// Makes a file, directory, symlink or socket named `name` in `dir`: one transaction.
+    /// Makes a file, directory, symlink, socket, FIFO or device named `name` in `dir`: one transaction.
     pub fn create(&mut self, dir: u32, name: &str, kind: &NewNode, perm: u32) -> Result<u32, i64> {
         self.op(|st| st.create(dir, name, kind, perm))
     }
