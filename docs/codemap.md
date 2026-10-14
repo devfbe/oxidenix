@@ -66,10 +66,6 @@ module comment, and the public types it defines. Where to start for common tasks
 - `servers/linux/src/chantest.rs` (374) `TEST_CHANNEL`: the client's side of channels to the test service (servers/ringtest, protocol `ring::selftest`), as the page cache will use them with diskfs: create, connect, grant, move descriptors through the rings...
 - `servers/linux/src/console.rs` (96) The console's terminal (phase R6d, ADR 0007): the kernel's console device (a VT100 on the framebuffer, mirrored to the serial port, and the keyboard) driven by a terminal of the server (`tty`).
 - `servers/linux/src/datafile.rs` (328) Open files of /data (phase R6c.3): what an open file description of the server's names (offset, the directory cursor, write access, O_DIRECT and O_SYNC); the calls on it are the server's (`datafs`), as for the... Types: `DataOpen`, `Prepared`.
-- `servers/linux/src/datafile.rs` (328) Open files of /data (phase R6c.3): what an open file description of the server's names (offset, the directory cursor, write access, O_DIRECT and O_SYNC); the calls on it are the server's (`datafs`), as for the... Types: `DataOpen`, `Prepared`.
-- `servers/linux/src/datafile.rs` (328) Open files of /data (phase R6c.3): what an open file description of the server's names (offset, the directory cursor, write access, O_DIRECT and O_SYNC); the calls on it are the server's (`datafs`), as for the... Types: `DataOpen`, `Prepared`.
-- `servers/linux/src/datafs.rs` (1695) /data in the server (phase R6c.3, I/O rings step 4): diskfs's ext2 filesystem through the file protocol (`fsring`, over `fsclient`'s channel), with the server's own page cache. Types: `DInode`, `New`, `HoldKind`.
-- `servers/linux/src/datafs.rs` (1695) /data in the server (phase R6c.3, I/O rings step 4): diskfs's ext2 filesystem through the file protocol (`fsring`, over `fsclient`'s channel), with the server's own page cache. Types: `DInode`, `New`, `HoldKind`.
 - `servers/linux/src/datafs.rs` (1695) /data in the server (phase R6c.3, I/O rings step 4): diskfs's ext2 filesystem through the file protocol (`fsring`, over `fsclient`'s channel), with the server's own page cache. Types: `DInode`, `New`, `HoldKind`.
 - `servers/linux/src/devices.rs` (104) Null and zero (phase R6d; /dev's since R9): a character device node names its driver by its number wherever it is (ADR 0007), so a node (1,3) or (1,5) in /dev, on the server's tmpfs or /data is null or zero, served here. Types: `Kind`, `DevOpen`.
 - `servers/linux/src/disktest.rs` (577) `TEST_DISKRING`: the client's side of the file protocol (`fsring`) against diskfs, as the page cache will use it in step 4: a channel to diskfs, grants of memory objects, files on /data read and written by DMA into...
@@ -89,11 +85,7 @@ module comment, and the public types it defines. Where to start for common tasks
 - `servers/linux/src/kmsg.rs` (387) The kernel's log as Linux programs see it: `syslog(2)` (busybox's dmesg and klogd) and `/dev/kmsg` (1,11; util-linux's dmesg, systemd), over the kernel's log of records (`SYS_KLOG_*`, `kernel/src/klog.rs`). Types: `KmsgOpen`.
 - `servers/linux/src/local.rs` (78) The server's data for the thread it runs on (phases R6e, R8): a block in the thread's State page (`restricted::SERVER_LOCAL_OFFSET`, which the kernel never touches), found from the stack as the lock count is (`sync`;... Types: `Local`.
 - `servers/linux/src/main.rs` (510) The Linux server (docs/design/linux-server.md).
-- `servers/linux/src/main.rs` (510) The Linux server (docs/design/linux-server.md).
-- `servers/linux/src/main.rs` (510) The Linux server (docs/design/linux-server.md).
 - `servers/linux/src/mm.rs` (183) Memory system calls (phase R4): Linux's semantics of mmap, munmap, mprotect, mremap, madvise, msync and the mlock family, and brk (with the process model, R8), over the kernel's mapping calls.
-- `servers/linux/src/namespace.rs` (319) The server's namespace (phase R6c.2): mounts and path resolution. Types: `Node`, `Origin`, `Resolved`.
-- `servers/linux/src/namespace.rs` (319) The server's namespace (phase R6c.2): mounts and path resolution. Types: `Node`, `Origin`, `Resolved`.
 - `servers/linux/src/namespace.rs` (319) The server's namespace (phase R6c.2): mounts and path resolution. Types: `Node`, `Origin`, `Resolved`.
 - `servers/linux/src/netclient.rs` (405) The instance's channel to netd (phase R7b, ADR 0008, the protocol `netring`): requests (`ringclient`'s slots), the shared area with a control block per socket, the buffer pool the sockets' rings live in, and the net... Types: `Futex`, `Rings`, `Net`.
 - `servers/linux/src/netdev.rs` (150) The network interfaces as Linux programs see them: netd's description (`LINKS` over the instance's channel, `netring::Link`) with Linux's names and flags, for rtnetlink (`netlink`) and for the interface requests...
@@ -164,8 +156,6 @@ module comment, and the public types it defines. Where to start for common tasks
 - `crates/procproto/src/render.rs` (197) The text formats of Linux's /proc files (proc(5)): the system-wide ones procfs serves (`stat`, `meminfo`, `loadavg`, `uptime`, `counters`) and a process's own the Linux server makes (`<pid>/stat`, `statm`, `status`),... Types: `Machine`, `Linux`.
 - `crates/procproto/tests/admission.rs` (57) What procfs gives each client: one instance cannot take the channels or the mapped grants the others need, and what goes is given back.
 - `crates/procproto/tests/render.rs` (101) The text formats of /proc against what Linux programs parse: the field counts and orders of /proc/stat, /proc/<pid>/stat, statm and status, the units of meminfo, the fixed-point load averages, times in USER_HZ.
-- `crates/restricted/src/lib.rs` (265) The interface between the kernel and the Linux server for restricted mode (docs/design/linux-server.md): the layout of the server's shared region, the per-thread register block, and the kernel calls the server makes... Types: `State`, `Event`, `KlogRecord`, `ProcInfo`, `ThreadInfo`.
-- `crates/restricted/src/lib.rs` (265) The interface between the kernel and the Linux server for restricted mode (docs/design/linux-server.md): the layout of the server's shared region, the per-thread register block, and the kernel calls the server makes... Types: `State`, `Event`, `KlogRecord`, `ProcInfo`, `ThreadInfo`.
 - `crates/restricted/src/lib.rs` (265) The interface between the kernel and the Linux server for restricted mode (docs/design/linux-server.md): the layout of the server's shared region, the per-thread register block, and the kernel calls the server makes... Types: `State`, `Event`, `KlogRecord`, `ProcInfo`, `ThreadInfo`.
 - `crates/ring/src/channel.rs` (151) A channel: the memory object both ends of a data-plane connection map (docs/design/io-rings.md). Types: `Layout`, `Header`, `Offer`.
 - `crates/ring/src/lib.rs` (205) Single-producer single-consumer rings of fixed-size descriptors in shared memory: the data plane between the Linux server and the device servers (docs/design/io-rings.md, ADR 0005). Types: `Desc`, `Completion`, `RingMemory`, `Wait`, `Ring`, `Producer`, `Consumer`.
@@ -244,8 +234,6 @@ module comment, and the public types it defines. Where to start for common tasks
 - `userspace/rootfs/etc/bench.sh` Benchmark mode (OXIDENIX_BENCH=1, see docs/benchmarks/README.md): runs the I/O benchmarks on the data disk; the exit status ends QEMU as in test mode.
 - `userspace/rootfs/etc/disktest.sh` Exercises the ext2 driver on /data; every line should end in "ok".
 - `userspace/rootfs/etc/rotests.sh` The self-tests on a read-only data disk: OXIDENIX_TEST=1 boots a second time with the disk the first boot wrote (QEMU's readonly=on, which virtio-blk reports as VIRTIO_BLK_F_RO), OXIDENIX_TEST=readonly boots so alone...
-- `userspace/rootfs/etc/runtests.sh` Runs every self-test and exits non-zero if any fails.
-- `userspace/rootfs/etc/runtests.sh` Runs every self-test and exits non-zero if any fails.
 - `userspace/rootfs/etc/runtests.sh` Runs every self-test and exits non-zero if any fails.
 - `userspace/rootfs/etc/test.sh` A quick manual tour of the shell: files, pipes and a few commands.
 
