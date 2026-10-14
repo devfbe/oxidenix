@@ -377,6 +377,7 @@ kernel that handle them.
 - `docs/decisions/0010-processes-and-signals-in-the-linux-server.md` ADR 0010: Processes and signals in the Linux server: containers, kicks, frames by the server
 - `docs/decisions/0011-a-kernel-without-linux.md` ADR 0011: A kernel without Linux: the last calls in the server, natives on the kernel's own interface
 - `docs/decisions/0012-an-ext3-journal-for-the-data-disk.md` ADR 0012: An ext3 journal for the data disk
+- `docs/decisions/0013-an-oom-killer-and-overcommit-modes.md` ADR 0013: An OOM killer by badness, and Linux's overcommit modes
 - `docs/design/ext3-journal.md` The ext3 journal of the data disk
 - `docs/design/io-rings.md` I/O rings: the data plane between the Linux server and the device servers
 - `docs/design/iommu.md` DMA isolation with an IOMMU
