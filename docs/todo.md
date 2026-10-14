@@ -33,7 +33,10 @@ done, delete it here in the same commit.
 
 - Processes and signals: thread pidfds (`PIDFD_THREAD`, `CLONE_PIDFD` with `CLONE_THREAD`;
   Linux 6.9), `/proc/<pid>/fdinfo` (a pidfd's `Pid:` line), `clock_nanosleep` on CPU clocks
-  (`EOPNOTSUPP`; the CPU-time alarms would carry it), core files, `ptrace`, a vDSO.
+  (`EOPNOTSUPP`; the CPU-time alarms would carry it), core files, `ptrace`.
+  `/proc/<pid>/maps` names the program file, the vDSO, the stack and the heap, but not other
+  mapped files (it would need the server to know which file each mapped object is); no
+  `smaps`.
   `TFD_TIMER_CANCEL_ON_SET` sees only the tree's own settings of the wall clock.
 - Files: owners and groups are accepted but not stored (everyone is root), `io_uring`
   (`ENOSYS`).

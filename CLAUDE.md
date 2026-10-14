@@ -56,6 +56,8 @@ An AI research project; see README.md.
   Linux server's terminals, `cargo test -p procproto` the text formats of `/proc` (procfs's
   and the Linux server's) and what procfs gives each client, `cargo test -p csprng` the
   kernel's random generator (ChaCha20) and the keyed hash (SipHash) against their test vectors,
+  `cargo test --release -p clockpage` the clock page under the vDSO (the kernel's clock
+  formulas, per-CPU offsets, no torn reading while a writer changes it, with threads),
   `cargo test --manifest-path third_party/smoltcp/Cargo.toml --lib`
   netd's smoltcp (vendored with patches, its own workspace; the patches are listed in its
   `Cargo.toml` and marked `oxidenix:`).
@@ -101,7 +103,9 @@ An AI research project; see README.md.
     `procfs.rs`/`procfile.rs` (`/proc` and `/sys`: procfs's files over the rings, the
     per-process part and the magic links), `inotify.rs`, `timer.rs`/`timerfd.rs` (interval
     and POSIX timers, timerfds; timers on CPU clocks over the kernel's CPU-time alarms,
-    `kernel/src/process/cputimer.rs`), `pidfd.rs`.
+    `kernel/src/process/cputimer.rs`), `pidfd.rs`, `vdso.rs` (maps the vDSO, whose source is
+    `servers/linux/vdso/`, built by `servers/linux/build.rs`, reading the kernel's clock page
+    `crates/clockpage`: ADR 0014).
   - Node.js: `userspace/node` (build, smoke tests `tests/*.test.mjs`, runner `run-node.sh`).
   - Memory: `kernel/src/memory/`, `kernel/src/process/address_space.rs`, page cache
     `kernel/src/fs/cache.rs`.
