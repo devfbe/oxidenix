@@ -34,6 +34,7 @@ virtio-net with user networking and the echo service at 10.0.2.100:7.
 | `read_4k_cached` | 2000 random 4 KiB `pread`s from the page cache; ns, p50/p99 |
 | `pread_4k_cached` | random 4 KiB `pread`s from the page cache alone, in cycles (no clock calls around each) |
 | `clock_gettime` | `clock_gettime(CLOCK_MONOTONIC)` alone, cycles |
+| `gettimeofday` | `gettimeofday(&tv, NULL)` alone, cycles (musl's: `clock_gettime(CLOCK_REALTIME)`) |
 | `read_4k_disk` | the same with `O_DIRECT`; ns, p50/p99 |
 | `create_disk`, `rename_disk`, `unlink_disk` | 500 files created (`open` with `O_CREAT`, `close`), renamed and removed in a directory on the disk, each durable when it returns (diskfs commits a transaction); ns, p50/p99 |
 | `write_fsync_4k` | a 4 KiB overwrite of a file on the disk and `fsync`, 200 times; ns, p50/p99 |
@@ -208,3 +209,21 @@ There is no regression of cached reads: `pread_4k_cached` of one commit spreads 
 between boots (two runs of `905c1d0`: 3565 and 4201), which a bisect with one run per step
 had taken for one. Only `fstat_disk` stays about 6 % above r6e in every pairing. Compare
 several boots per commit, in turn, before calling a difference of less than about 20 %.
+
+## The vDSO (ADR 0014, 2026-10-15)
+
+`2026-10-15-c12ae4f-vdso-after-1.md` against `2026-10-15-9b2c6be-vdso-before-1.md` (the commit
+before, with the `gettimeofday` benchmark). Three boots each, in turn, p50 in cycles (the
+third run after was taken while the host got busy: every figure of it, the forwarded call's
+included, is 10-100 % higher):
+
+| p50 (cycles) | before | after |
+|---|---|---|
+| `clock_gettime` | 1536, 1544, 1554 | 79, 82, (104) |
+| `gettimeofday` | 1546, 1509, 1559 | 85, 85, (110) |
+| `forwarded_null_syscall` | 1330, 1330, 1332 | 1334, 1337, (1481) |
+| `fork_exec_wait` (µs) | 152, 153, 152 | 153, 154, (351) |
+
+The clock calls no longer leave user mode: about 19 times faster, the figure including the
+two RDTSCs around the call and musl's wrapper. Forwarded calls and exec (which now maps the
+clock page and the vDSO) are unchanged.

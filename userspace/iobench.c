@@ -24,6 +24,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/time.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -356,6 +357,13 @@ static void block_io(void) {
         cyc[i] = rdtsc() - a;
     }
     percentiles("clock_gettime", cyc, N, "cycles");
+    struct timeval tv;
+    for (int i = 0; i < N; i++) {
+        uint64_t a = rdtsc();
+        gettimeofday(&tv, NULL);
+        cyc[i] = rdtsc() - a;
+    }
+    percentiles("gettimeofday", cyc, N, "cycles");
     close(fd);
 
     fd = open(path, O_RDONLY | O_DIRECT);

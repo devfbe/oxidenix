@@ -7,12 +7,13 @@
 //! checked (ENOEXEC), and the arguments and environment are copied (E2BIG). Then the
 //! process's other threads end, the kernel swaps in a fresh address space
 //! (`SYS_EXEC_SPACE`), and the server maps the segments, zeroes the tail of the last file
-//! page, maps the bss and the stack (growing down), writes the strings, `AT_RANDOM`, the
-//! platform name, the vectors and the auxiliary vector, and starts the program. A failure
-//! after the point of no return kills the process with SIGSEGV, as on Linux.
+//! page, maps the bss, the vDSO with the kernel's clock page (`vdso`) and the stack
+//! (growing down), writes the strings, `AT_RANDOM`, the platform name, the vectors and the
+//! auxiliary vector (`AT_SYSINFO_EHDR` the vDSO), and starts the program. A failure after
+//! the point of no return kills the process with SIGSEGV, as on Linux.
 //!
 //! `ET_EXEC` programs go where they say; `ET_DYN` ones (PIE) at `DYN_BASE`; a `PT_INTERP`
-//! interpreter where the kernel finds room for it. There is no vDSO.
+//! interpreter and the vDSO where the kernel finds room for them.
 //!
 //! The caller's soft RLIMIT_STACK at the call (Linux's bprm->rlim_stack) sets the room kept
 //! for the new stack (`stack_ceiling`, as Linux's mmap gap: at least 128 MiB; the kernel's
@@ -743,7 +744,8 @@ fn load(p: &Prepared) -> Result<(u64, u64, u64), i64> {
         }
         None => (bias.wrapping_add(p.elf.entry), 0),
     };
-    let sp = build_stack(p, bias, interp_base, bias.wrapping_add(p.elf.entry))?;
+    let vdso = crate::vdso::map()?;
+    let sp = build_stack(p, bias, interp_base, bias.wrapping_add(p.elf.entry), vdso)?;
     Ok((entry, sp, brk))
 }
 
@@ -825,13 +827,14 @@ const AT_SECURE: u64 = 23;
 const AT_RANDOM: u64 = 25;
 const AT_HWCAP2: u64 = 26;
 const AT_EXECFN: u64 = 31;
+const AT_SYSINFO_EHDR: u64 = 33;
 const AT_MINSIGSTKSZ: u64 = 51;
 
 /// Linux's initial stack, from the top: the end marker, the file name (AT_EXECFN), the
 /// environment's strings, the arguments' (back to back, in order: programs rely on it,
 /// libuv's process title overwrites them), the platform name, 16 random bytes, then
 /// argc, argv, envp and the auxiliary vector. Returns the stack pointer.
-fn build_stack(p: &Prepared, bias: u64, interp_base: u64, entry: u64) -> Result<u64, i64> {
+fn build_stack(p: &Prepared, bias: u64, interp_base: u64, entry: u64, vdso: Option<u64>) -> Result<u64, i64> {
     let need = stack_need(&p.args, &p.envs, &p.filename);
     syscall_ok(SYS_MO_MAP, [0, STACK_TOP - need, need, p.stack, 3, MO_FIXED | MO_GROWSDOWN])?;
     // Nothing here allocates (past the point of no return, with as many strings as the
@@ -861,7 +864,9 @@ fn build_stack(p: &Prepared, bias: u64, interp_base: u64, entry: u64) -> Result<
     syscall(SYS_RANDOM, [bytes.as_mut_ptr() as u64, bytes.len() as u64, 0, 0, 0, 0]);
     usercopy::to_program(random, &bytes)?;
     let hwcap = core::arch::x86_64::__cpuid(1).edx as u64;
-    let auxv = [
+    // (First, as Linux's ARCH_DLINFO; left out without a vDSO.)
+    let all = [
+        (AT_SYSINFO_EHDR, vdso.unwrap_or(0)),
         (AT_MINSIGSTKSZ, 2048),
         (AT_HWCAP, hwcap),
         (AT_PAGESZ, PAGE),
@@ -883,6 +888,7 @@ fn build_stack(p: &Prepared, bias: u64, interp_base: u64, entry: u64) -> Result<
         (AT_PLATFORM, platform),
         (AT_NULL, 0),
     ];
+    let auxv = &all[vdso.is_none() as usize..];
     let n = 1 + p.args.len() + 1 + p.envs.len() + 1 + 2 * auxv.len();
     sp = (sp - n as u64 * 8) & !15;
     let mut out = Words { at: sp, buf: [0; 64], used: 0 };
@@ -899,7 +905,7 @@ fn build_stack(p: &Prepared, bias: u64, interp_base: u64, entry: u64) -> Result<
         ptr += e.len() as u64 + 1;
     }
     out.put(0)?;
-    for (k, v) in auxv {
+    for &(k, v) in auxv {
         out.put(k)?;
         out.put(v)?;
     }
@@ -976,6 +982,7 @@ fn finish(p: &mut Prepared, comm: [u8; 16], brk: u64) {
         proc.dumpable = true;
         proc.cmdline = cmdline;
         proc.text_pages = p.text_pages;
+        proc.exe_object = syscall(SYS_MO_ID, [p.file.handle, 0, 0, 0, 0, 0]).max(0) as u64;
         let old_exe = core::mem::replace(&mut proc.exe, exe);
         *proc.brk.lock() = process::Brk { start: brk, end: brk, limit: (STACK_TOP - p.stack).saturating_sub(STACK_GUARD_GAP) };
         // A vfork parent goes on: the child no longer uses its memory.

@@ -59,6 +59,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     timer::init(interrupts::apic::timer_hz());
     timer::init_cpu();
     fs::init(ramdisk);
+    time::init_page();
     if fs::program("/etc/autorun").is_some() {
         TEST_MODE.store(true, core::sync::atomic::Ordering::Relaxed);
     }

@@ -123,4 +123,4 @@ the user-time clock is one a deadline can be set on.
 - pidfds (2026-10-14) name a process by its words (`process::Words`, kept by an `Arc`), not
   by its pid alone, which is reused after the reap; the words carry the process's state for
   them and the ids its end reports to.
-- Not done: thread pidfds (`PIDFD_THREAD`, Linux 6.9), core files, ptrace, a vDSO.
+- Not done: thread pidfds (`PIDFD_THREAD`, Linux 6.9), core files, ptrace, a vDSO (since done: ADR 0014).

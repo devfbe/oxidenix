@@ -453,6 +453,9 @@ pub(super) enum Object {
     File(Arc<PageCache>, Option<Arc<Record>>),
     /// The initramfs of the boot image, read-only (`SYS_INITRAMFS`).
     Image(&'static [u8]),
+    /// The clock page (`SYS_CLOCK_PAGE`, `time::clock_page`): mapped shared and
+    /// read-only only, never written through the handle.
+    ClockPage(Arc<PageCache>),
     /// The client's end of a channel to a device server (`SYS_CHAN_CREATE`).
     Channel(Arc<super::channel::ClientEnd>),
     /// A process of the instance (`SYS_PROC_SELF`, `SYS_PROC_CREATE`).
@@ -1690,6 +1693,13 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
                         Backing::File { cache, offset, shared, may_write, _hold: None }
                     }
                     Object::Image(_) | Object::Channel(_) | Object::Process(_) => return Err(EINVAL),
+                    // Shared and never writable, by everyone the same.
+                    Object::ClockPage(cache) => {
+                        if !shared || may_write || offset != 0 || len != PAGE || a[4] & !super::address_space::Prot::READ != 0 {
+                            return Err(EINVAL);
+                        }
+                        Backing::File { cache, offset, shared, may_write, _hold: None }
+                    }
                     // As a file's mapping: it may reach beyond the end (SIGBUS
                     // there), and keeps the handle's hold while it exists.
                     Object::File(cache, hold) => {
@@ -1814,6 +1824,12 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
         }
         SYS_SHARED_DECOMMIT => Ok(instance.decommit_heap(a[0], a[1])? as i64),
         SYS_SHARED_DECOMMIT_RUNS => Ok(instance.decommit_list(a[0], a[1])? as i64),
+        SYS_CLOCK_PAGE => Ok(instance.insert(Object::ClockPage(crate::time::clock_page().ok_or(ENOENT)?))? as i64),
+        SYS_MO_ID => match instance.object(a[0])? {
+            Object::Memory(cache) | Object::File(cache, _) | Object::ClockPage(cache) => Ok(object_id(&cache) as i64),
+            _ => Err(EINVAL),
+        },
+        SYS_VM_AREAS => vm_areas(&instance, a[0], a[1], a[2], a[3]),
         SYS_INITRAMFS => {
             let image = crate::fs::initramfs().ok_or(ENOENT)?;
             super::uaccess::copy_to_server(a[0], &(image.len() as u64).to_le_bytes())?;
@@ -2404,7 +2420,11 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
                 super::uaccess::copy_to_server(buf, &image[offset as usize..end as usize])?;
                 return Ok(len as i64);
             }
-            let cache = instance.memory(handle)?;
+            let cache = match &object {
+                Object::ClockPage(_) if nr == SYS_MO_WRITE => return Err(EACCES),
+                Object::ClockPage(cache) => cache.clone(),
+                _ => instance.memory(handle)?,
+            };
             // Within the object (a file object: a read up to its end, a
             // write as far as it goes), a page-sized piece at a time.
             let end = match object {
@@ -2491,6 +2511,72 @@ fn pi_call(instance: &Instance, nr: u64, a: [u64; 6]) -> SysResult {
         }
         _ => Err(ENOSYS),
     }
+}
+
+/// The number `mo_id` and `vm_areas` name a memory object by: a keyed hash of where it
+/// lies (the key random from boot, so the number tells nothing of the kernel's memory),
+/// never 0 and positive as an `i64`.
+fn object_id(cache: &Arc<PageCache>) -> u64 {
+    static KEY: spin::Once<[u8; 16]> = spin::Once::new();
+    let key = KEY.call_once(|| {
+        let mut key = [0u8; 16];
+        crate::random::fill(&mut key);
+        key
+    });
+    let at = Arc::as_ptr(cache) as usize as u64;
+    csprng::siphash(key, &at.to_le_bytes()) >> 1 | 1
+}
+
+/// `SYS_VM_AREAS`: up to `cap` records of the mappings of process `handle` (0: the
+/// caller's) from the first that ends above `from`, at `out`; how many.
+fn vm_areas(instance: &Instance, handle: u64, from: u64, out: u64, cap: u64) -> SysResult {
+    use super::address_space::Backing;
+    let mm = if handle == 0 {
+        super::current_mm()
+    } else {
+        let group = container(instance, handle)?.group.clone();
+        let stats = group.info.lock().mem.clone();
+        stats.and_then(|s| s.mm())
+    }
+    .ok_or(ESRCH)?;
+    // A batch at a time on the stack: the records go to the server's memory with the space
+    // unlocked (a copy may fault, and its fault takes the lock).
+    const BATCH: usize = 16;
+    let (mut done, mut from) = (0u64, from);
+    while done < cap {
+        let mut batch = [VmArea::default(); BATCH];
+        let mut n = 0;
+        {
+            let space = mm.lock();
+            for v in space.areas_from(from).take(BATCH.min((cap - done) as usize)) {
+                let mut flags = 0;
+                flags |= if v.prot.read { VMA_READ } else { 0 };
+                flags |= if v.prot.write { VMA_WRITE } else { 0 };
+                flags |= if v.prot.exec { VMA_EXEC } else { 0 };
+                flags |= if v.backing.shared() { VMA_SHARED } else { 0 };
+                flags |= if v.stack_limit != 0 { VMA_STACK } else { 0 };
+                let (offset, object) = match &v.backing {
+                    Backing::File { cache, offset, .. } => (*offset, object_id(cache)),
+                    Backing::Anon => (0, 0),
+                    Backing::Device | Backing::Granted { .. } | Backing::Revoked { .. } => {
+                        flags |= VMA_DEVICE;
+                        (0, 0)
+                    }
+                };
+                batch[n] = VmArea { start: v.start, end: v.end, offset, object, flags };
+                n += 1;
+            }
+        }
+        if n == 0 {
+            break;
+        }
+        let bytes = unsafe { core::slice::from_raw_parts(batch.as_ptr() as *const u8, n * core::mem::size_of::<VmArea>()) };
+        let at = out.checked_add(done * core::mem::size_of::<VmArea>() as u64).ok_or(EFAULT)?;
+        super::uaccess::copy_to_server(at, bytes)?;
+        done += n as u64;
+        from = batch[n - 1].end;
+    }
+    Ok(done as i64)
 }
 
 /// The process behind the handle `handle`.

@@ -12,8 +12,9 @@ done, delete it here in the same commit.
   since 2026-10-15; 1 460 before) against 269 on Linux, `fstat` on `/data` ~13 000 against
   409. The floor of the design is two kernel round trips and two CR3 loads; what lies above
   it (the entry and return paths' checks, register copies, the view switch's PCID lookup)
-  needs a profile per step before it is cut. A faster path for calls the Linux server
-  answers without the kernel is the largest open lever.
+  needs a profile per step before it is cut. The clock calls no longer pay it (the vDSO,
+  ADR 0014: `clock_gettime` 1 540 → 80 cycles); a faster path for other calls the Linux
+  server answers without the kernel is the largest open lever.
 - **TCP loopback** is at about 20 % of Linux (smoltcp's per-segment work and netd's two copies).
 
 ## Robustness
@@ -33,7 +34,10 @@ done, delete it here in the same commit.
 
 - Processes and signals: thread pidfds (`PIDFD_THREAD`, `CLONE_PIDFD` with `CLONE_THREAD`;
   Linux 6.9), `/proc/<pid>/fdinfo` (a pidfd's `Pid:` line), `clock_nanosleep` on CPU clocks
-  (`EOPNOTSUPP`; the CPU-time alarms would carry it), core files, `ptrace`, a vDSO.
+  (`EOPNOTSUPP`; the CPU-time alarms would carry it), core files, `ptrace`.
+  `/proc/<pid>/maps` names the program file, the vDSO, the stack and the heap, but not other
+  mapped files (it would need the server to know which file each mapped object is); no
+  `smaps`.
   `TFD_TIMER_CANCEL_ON_SET` sees only the tree's own settings of the wall clock.
 - Files: owners and groups are accepted but not stored (everyone is root), `io_uring`
   (`ENOSYS`).

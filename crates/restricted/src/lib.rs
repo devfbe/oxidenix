@@ -1049,6 +1049,54 @@ pub const SYS_CPU_ALARM: u64 = 1190;
 pub const CPU_ALARM_THREAD: u64 = 1;
 pub const CPU_ALARM_USER: u64 = 2;
 
+// The vDSO's clock page and /proc/<pid>/maps (ADR 0014).
+
+/// `clock_page() -> handle`: the kernel's clock page (`crates/clockpage`): one page the
+/// kernel keeps current with what a reader in user mode needs to compute the wall and the
+/// monotonic clock itself (the TSC's scale, the boot counter, the wall clock's starting
+/// point, each CPU's offset, under a sequence count), the same page for every instance,
+/// for the server's vDSO (its `[vvar]`). It maps only shared and never writable
+/// (`mo_map` with `MO_SHARED | MO_READONLY`, PROT_READ alone: EINVAL otherwise); `mo_read`
+/// reads it, `mo_write` is EACCES. ENOENT if the kernel has none (no memory at boot):
+/// programs then read the clocks by system call. Each CPU's `IA32_TSC_AUX` holds its
+/// index (RDTSCP, RDPID; `getcpu`'s and `thread_info`'s CPU).
+pub const SYS_CLOCK_PAGE: u64 = 1200;
+/// `vm_areas(handle, from, out, cap) -> n`: the mappings of process `handle` (0: the
+/// caller's) in address order from the first that ends above `from`: up to `cap`
+/// `VmArea` records at `out` in the server's memory, `n` of them (0: none left; a caller
+/// goes on from the last one's end). ESRCH for a process without an address space (a
+/// zombie). For /proc/<pid>/maps.
+pub const SYS_VM_AREAS: u64 = 1201;
+/// `mo_id(handle) -> id`: the number that names memory object `handle` in `vm_areas`'
+/// records while the object exists (never 0; another object may get it once this one is
+/// gone). EINVAL for a handle that is no memory object.
+pub const SYS_MO_ID: u64 = 1202;
+
+/// A mapping, as `vm_areas` reports it.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct VmArea {
+    pub start: u64,
+    pub end: u64,
+    /// The object's offset of `start` (0 for anonymous memory).
+    pub offset: u64,
+    /// The memory object mapped (`mo_id`'s number), 0 for anonymous private memory.
+    pub object: u64,
+    /// `VMA_*`.
+    pub flags: u64,
+}
+
+/// `VmArea::flags`: the access the mapping allows.
+pub const VMA_READ: u64 = 1;
+pub const VMA_WRITE: u64 = 2;
+pub const VMA_EXEC: u64 = 4;
+/// Stores reach the object (else copy-on-write, or anonymous).
+pub const VMA_SHARED: u64 = 8;
+/// A stack that grows down (`MO_GROWSDOWN`).
+pub const VMA_STACK: u64 = 16;
+/// Device memory or a channel's grant (no object a program mapped).
+pub const VMA_DEVICE: u64 = 32;
+
 /// What `proc_info` tells about a process.
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug)]

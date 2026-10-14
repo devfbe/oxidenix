@@ -761,9 +761,11 @@ no return: the process's other threads are killed and waited for (a clone under 
 rechecks under the lock and fails with EAGAIN; a thread that is not the
 leader takes the leader's pid), `exec_space` swaps the address space, and the server maps
 the segments (`ET_EXEC` where they say, `ET_DYN` at a fixed base, with its `PT_INTERP`
-interpreter beside it), zeroes the tail of the last file page, maps the bss and a stack that
-grows down (`MO_GROWSDOWN`), writes the strings (arguments, then environment, back to back),
-`AT_RANDOM`, the platform name, the vectors and the auxiliary vector, and starts the program.
+interpreter beside it), zeroes the tail of the last file page, maps the bss, the kernel's
+clock page (`[vvar]`, shared and read-only) with the instance's vDSO one page above it
+(`[vdso]`, private; `vdso.rs`, ADR 0014) and a stack that grows down (`MO_GROWSDOWN`),
+writes the strings (arguments, then environment, back to back), `AT_RANDOM`, the platform
+name, the vectors and the auxiliary vector (`AT_SYSINFO_EHDR` first), and starts the program.
 A failure after the point of no return kills the process with SIGSEGV, as on Linux (SIGKILL
 if it was killed meanwhile), once the call returned and let go of everything it held
 (`local::exit_pending`, carried out by the thread's loop). Handlers
@@ -871,7 +873,9 @@ timerfds' expiries to their pollers (`timerfd.rs`).
 
 `/proc/<pid>` (also for a thread's tid, as Linux), `/proc/self` and `/proc/thread-self` are
 the server's, from its tables and the kernel's `proc_info`/`thread_info`: `stat`, `statm`,
-`status`, `cmdline`, `comm`, `exe`, `cwd`, `oom_score`, `oom_score_adj`, `oom_adj`,
+`status`, `cmdline`, `comm`, `exe`, `cwd`, `oom_score`, `oom_score_adj`, `oom_adj`, `maps`
+(the kernel's `vm_areas`; the vDSO, the clock page, the stack, the heap and the program file
+named, ADR 0014),
 `task/<tid>/...` (oxidenix's `counters`, the calls the server passed through for the process,
 went with the pass-through in R9). The system's files (`stat`, `meminfo`,
 `uptime`, `loadavg`, `cpuinfo`, `mounts`, `counters`, `sys/`) stay procfs's, but for
@@ -1238,8 +1242,8 @@ Linux asks for write access only for files, directories and symlinks.
   through its scratch grant. Nothing of it is cached; a procfs that died is started again
   for a new channel and serves the same inodes.
 - **The server's own part**, each process's: `/proc/<pid>` with `stat`, `statm`, `status`,
-  `cmdline`, `comm`, `exe`, `mounts`, `oom_score`, `oom_score_adj`, `oom_adj`,
-  `task/<tid>/{stat,statm,status,cmdline,comm,oom_score,oom_score_adj,oom_adj}`, `fd/<n>`,
+  `cmdline`, `comm`, `exe`, `mounts`, `oom_score`, `oom_score_adj`, `oom_adj`, `maps`,
+  `task/<tid>/{stat,statm,status,cmdline,comm,oom_score,oom_score_adj,oom_adj,maps}`, `fd/<n>`,
   `cwd` and `root`; `/proc/self`, `/proc/thread-self` and
   `/proc/mounts` (a link to `self/mounts`), merged into procfs's root listing; and
   `/proc/sys/vm/overcommit_{memory,ratio,kbytes}` (the kernel's overcommit policy, ADR 0013),

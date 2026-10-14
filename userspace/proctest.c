@@ -539,13 +539,26 @@ static void __attribute__((noinline)) deep(size_t bytes) {
  * writable memory is data (also brk and what mprotect made writable), shared or
  * read-only memory is not, executable memory that is not the program's code is VmLib, a
  * grown stack VmStk; statm's data is VmData + VmStk, its text VmExe; fork copies them. */
+static long vdso_kb(void) {
+    char line[256];
+    FILE *f = fopen("/proc/self/maps", "r");
+    long kb = -1;
+    unsigned long start, end;
+    while (f && fgets(line, sizeof line, f)) {
+        if (strstr(line, "[vdso]") && sscanf(line, "%lx-%lx", &start, &end) == 2) kb = (long)((end - start) / 1024);
+    }
+    if (f) fclose(f);
+    return kb;
+}
+
 static void memory_kinds(void) {
     struct vm a, b;
     vm_now(&a);
     check("statm has 7 fields, lib and dt 0", a.fields == 7 && a.statm[4] == 0 && a.statm[6] == 0);
     check("statm's size and resident are VmSize and VmRSS", a.statm[0] * 4 == a.size && a.statm[1] * 4 == a.rss);
     check("statm's text is VmExe, its data VmData + VmStk", a.statm[3] * 4 == a.exe && a.statm[5] * 4 == a.data + a.stk);
-    check("a static program: VmExe > 0, VmLib 0, VmStk > 0, VmData > 0", a.exe > 0 && a.lib == 0 && a.stk > 0 && a.data > 0);
+    /* (VmLib is the vDSO's size, as on Linux: its executable pages are not the program's.) */
+    check("a static program: VmExe > 0, VmLib the vDSO, VmStk > 0, VmData > 0", a.exe > 0 && a.lib == vdso_kb() && a.lib > 0 && a.stk > 0 && a.data > 0);
     const size_t len = 16 << 20;
     char *m = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     vm_now(&b);

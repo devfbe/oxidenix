@@ -102,9 +102,12 @@ pub enum PidFile {
     OomScore,
     OomScoreAdj,
     OomAdj,
+    /// The mappings of its address space (`maps`).
+    Maps,
 }
 
 const PID_FILES: &[(&str, PidFile)] = &[
+    ("maps", PidFile::Maps),
     ("stat", PidFile::Stat),
     ("statm", PidFile::Statm),
     ("status", PidFile::Status),
@@ -121,6 +124,7 @@ const PID_FILES: &[(&str, PidFile)] = &[
     ("oom_adj", PidFile::OomAdj),
 ];
 const TASK_FILES: &[(&str, PidFile)] = &[
+    ("maps", PidFile::Maps),
     ("stat", PidFile::Stat),
     ("statm", PidFile::Statm),
     ("status", PidFile::Status),
@@ -870,6 +874,7 @@ pub fn contents(node: &ProcNode) -> Result<Vec<u8>, i64> {
         }
         PidFile::OomScoreAdj => try_format!("{}\n", oom_adj_of(id, 0, 0)?)?,
         PidFile::OomAdj => try_format!("{}\n", fmt::oom_adj(oom_adj_of(id, 0, 0)?))?,
+        PidFile::Maps => maps(id)?,
         PidFile::Dir | PidFile::Task | PidFile::Fd => return Err(EISDIR),
         PidFile::Exe | PidFile::Cwd | PidFile::Root => return Err(EINVAL),
     };
@@ -880,6 +885,83 @@ pub fn contents(node: &ProcNode) -> Result<Vec<u8>, i64> {
 /// (`process::oom_score_adj`): the value before; ENOENT once the process is gone.
 fn oom_adj_of(pid: u64, flags: u64, value: i64) -> Result<i64, i64> {
     crate::process::oom_score_adj(pid as crate::process::Pid, flags, value).map_err(|e| if e == ESRCH { ENOENT } else { e })
+}
+
+/// /proc/<pid>/maps (proc(5)): every mapping of the process's address space as the kernel
+/// records it (`SYS_VM_AREAS`), in Linux's format (`show_map_vma`: addresses, access,
+/// `p` or `s`, the offset, the file's device and inode, the name from column 74). Named
+/// are the vDSO and the clock page (`vdso::name_of`, by their objects), the stack, the
+/// break's anonymous memory (`[heap]`, by Linux's rule: an area between start_brk and brk)
+/// and the program file's mappings (its path, " (deleted)" once removed); another mapped
+/// file shows no name yet (docs/todo.md). A zombie has none.
+fn maps(pid: u64) -> Result<String, i64> {
+    let (handle, exe, exe_object, (brk_start, brk)) = crate::process::maps_view(pid as u32).ok_or(ENOENT)?;
+    let exe = match &exe {
+        Some(o) => {
+            let st = o.node.stat()?;
+            let word = |at: usize| u64::from_le_bytes(st[at..at + 8].try_into().expect("8 bytes"));
+            Some((named(&o.path, removed(&o.node))?, word(0), word(8)))
+        }
+        None => None,
+    };
+    let mut out = String::new();
+    let mut from = 0;
+    loop {
+        let mut batch = [VmArea::default(); 32];
+        let n = syscall(SYS_VM_AREAS, [handle, from, batch.as_mut_ptr() as u64, batch.len() as u64, 0, 0]);
+        if n == -ESRCH {
+            break;
+        }
+        if n < 0 {
+            return Err(-n);
+        }
+        if n == 0 {
+            break;
+        }
+        for a in &batch[..n as usize] {
+            let file = exe.as_ref().filter(|_| a.object != 0 && a.object == exe_object);
+            let name = if let Some(special) = crate::vdso::name_of(a.object) {
+                Some(special)
+            } else if let Some((path, _, _)) = file {
+                Some(path.as_str())
+            } else if a.flags & VMA_STACK != 0 {
+                Some("[stack]")
+            } else if a.object == 0 && a.flags & VMA_DEVICE == 0 && a.start <= brk && a.end >= brk_start && brk_start != 0 {
+                Some("[heap]")
+            } else {
+                None
+            };
+            let (dev, ino) = file.map_or((0, 0), |&(_, dev, ino)| (dev, ino));
+            // glibc's gnu_dev_major and gnu_dev_minor.
+            let (major, minor) = ((dev >> 8) & 0xfff | (dev >> 32) & !0xfff, (dev & 0xff) | (dev >> 12) & !0xff);
+            let bit = |flag: u64, c: char| if a.flags & flag != 0 { c } else { '-' };
+            let line = try_format!(
+                "{:08x}-{:08x} {}{}{}{} {:08x} {:02x}:{:02x} {} ",
+                a.start,
+                a.end,
+                bit(VMA_READ, 'r'),
+                bit(VMA_WRITE, 'w'),
+                bit(VMA_EXEC, 'x'),
+                if a.flags & VMA_SHARED != 0 { 's' } else { 'p' },
+                a.offset,
+                major,
+                minor,
+                ino
+            )?;
+            out.try_push_str(&line)?;
+            if let Some(name) = name {
+                // Padded to column 73, then a space (Linux's seq_setwidth and seq_pad).
+                for _ in line.len()..72 {
+                    out.try_push_str(" ")?;
+                }
+                out.try_push_str(" ")?;
+                out.try_push_str(name)?;
+            }
+            out.try_push_str("\n")?;
+        }
+        from = batch[n as usize - 1].end;
+    }
+    Ok(out)
 }
 
 /// The most a write to a writable file of /proc takes in (Linux's PROC_NUMBUF less one,

@@ -13,9 +13,21 @@
 //!
 //! Wall-clock time is the RTC's reading at boot plus the monotonic clock;
 //! clock_settime moves it by changing that starting point.
+//!
+//! **The clock page** (`clockpage`, ADR 0014): what a reader needs to compute
+//! these clocks itself (the scale, the boot counter, the wall clock's
+//! starting point, each CPU's offset) is published in one page that the Linux
+//! server maps read-only into its programs (`SYS_CLOCK_PAGE`, under its vDSO),
+//! changed under a sequence count whenever it changes (`set_realtime`, a CPU's
+//! offset). Each CPU's `IA32_TSC_AUX` holds its index, so RDTSCP and RDPID in
+//! user mode tell which CPU a counter value came from. The kernel implements
+//! no clock call: it only keeps the page current.
 
 use crate::interrupts::apic::pit_delay_us;
 use crate::smp::{self, Cpu};
+use crate::sync::IrqSpinLock;
+use alloc::sync::Arc;
+use clockpage::ClockPage;
 use core::arch::x86_64::{__cpuid, _mm_lfence, _rdtsc};
 use core::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use x86_64::registers::model_specific::Msr;
@@ -40,10 +52,10 @@ fn rdtsc() -> u64 {
 
 /// Nanoseconds since boot (CLOCK_MONOTONIC). The kernel does not preempt
 /// itself, so the CPU cannot change between the offset and the counter.
+/// (The clock page's formula, so the vDSO's readings agree with it.)
 pub fn now() -> u64 {
     let tsc = rdtsc().wrapping_add_signed(smp::cpu().tsc_offset.load(Ordering::Relaxed));
-    let delta = tsc.saturating_sub(BOOT_TSC.load(Ordering::Relaxed));
-    ((delta as u128 * MULT.load(Ordering::Relaxed) as u128) >> 32) as u64
+    clockpage::mono(tsc, BOOT_TSC.load(Ordering::Relaxed), MULT.load(Ordering::Relaxed))
 }
 
 /// The value this CPU's TSC has at `ns` nanoseconds since boot (for the
@@ -55,13 +67,106 @@ pub fn tsc_at(ns: u64) -> u64 {
 
 /// Nanoseconds since the epoch (CLOCK_REALTIME).
 pub fn realtime() -> u64 {
-    WALL_AT_BOOT.load(Ordering::Relaxed).saturating_add(now() as i64).max(0) as u64
+    clockpage::wall(WALL_AT_BOOT.load(Ordering::Relaxed), now())
 }
 
 /// Sets the wall clock (clock_settime): the monotonic clock is unaffected.
+/// The clock page has the new starting point before this returns.
 pub fn set_realtime(ns: u64) {
     let ns = ns.min(i64::MAX as u64) as i64;
-    WALL_AT_BOOT.store(ns.saturating_sub(now() as i64), Ordering::Relaxed);
+    let _writer = PAGE_WRITER.lock();
+    let at_boot = ns.saturating_sub(now() as i64);
+    WALL_AT_BOOT.store(at_boot, Ordering::Relaxed);
+    if let Some((_, page)) = CLOCK_PAGE.get() {
+        page.update(|p| p.wall_at_boot.store(at_boot, Ordering::Relaxed));
+    }
+}
+
+// ---------------------------------------------------------- the clock page
+
+/// The clock page: its memory object (the handle the Linux server gets) and
+/// its contents in the direct map.
+static CLOCK_PAGE: spin::Once<(Arc<crate::fs::cache::PageCache>, &'static ClockPage)> = spin::Once::new();
+/// Serializes the page's writers (and the wall clock's with them).
+static PAGE_WRITER: IrqSpinLock<()> = IrqSpinLock::new(());
+
+const IA32_TSC_AUX: u32 = 0xc000_0103;
+
+/// What the CPUs offer a reader in user mode (`clockpage::HAS_*`): RDTSCP
+/// (CPUID 0x8000_0001 EDX bit 27), RDPID (CPUID 7 ECX bit 22).
+fn reader_features() -> u32 {
+    let mut features = 0;
+    if __cpuid(0x8000_0000).eax >= 0x8000_0001 && __cpuid(0x8000_0001).edx & 1 << 27 != 0 {
+        features |= clockpage::HAS_RDTSCP;
+    }
+    if __cpuid(0).eax >= 7 && __cpuid(7).ecx & 1 << 22 != 0 {
+        features |= clockpage::HAS_RDPID;
+    }
+    features
+}
+
+/// Puts the calling CPU's index into its TSC_AUX, where RDTSCP and RDPID
+/// read it (Linux's encoding: the CPU in bits 0-11, the node, 0, above).
+fn set_tsc_aux(cpu: &Cpu) {
+    if reader_features() != 0 {
+        unsafe { Msr::new(IA32_TSC_AUX).write(cpu.index as u64 & clockpage::AUX_CPU_MASK as u64) };
+    }
+}
+
+/// How a reader takes the counter, from the CPUs' offsets: plain RDTSC when
+/// none is corrected, else RDTSCP with the offset of the CPU it names, or
+/// not at all without RDTSCP.
+fn reader_mode(page: &ClockPage) -> u32 {
+    if page.tsc_offset.iter().all(|o| o.load(Ordering::Relaxed) == 0) {
+        clockpage::MODE_TSC
+    } else if page.features.load(Ordering::Relaxed) & clockpage::HAS_RDTSCP != 0 {
+        clockpage::MODE_TSC_PER_CPU
+    } else {
+        clockpage::MODE_NONE
+    }
+}
+
+/// Makes the clock page and publishes the clocks in it (after `init`, with
+/// the kernel heap; before the other CPUs start, which add their offsets).
+pub fn init_page() {
+    const _: () = assert!(smp::MAX_CPUS <= clockpage::CPUS);
+    set_tsc_aux(smp::cpu());
+    let made = crate::fs::cache::PageCache::anonymous(1).ok().and_then(|cache| {
+        // The page's frame stays mapped by this reference for good.
+        let frame = cache.map_page(0).ok()?;
+        let page = unsafe { &*(crate::memory::phys_to_virt(frame.start_address().as_u64()) as *const ClockPage) };
+        Some((cache, page))
+    });
+    let Some((cache, page)) = made else {
+        return crate::printkln!("[time] no memory for the clock page; programs read the clocks by system call");
+    };
+    let _writer = PAGE_WRITER.lock();
+    page.update(|p| {
+        p.mult.store(MULT.load(Ordering::Relaxed), Ordering::Relaxed);
+        p.boot_tsc.store(BOOT_TSC.load(Ordering::Relaxed), Ordering::Relaxed);
+        p.wall_at_boot.store(WALL_AT_BOOT.load(Ordering::Relaxed), Ordering::Relaxed);
+        p.features.store(reader_features(), Ordering::Relaxed);
+        p.tsc_offset[0].store(smp::cpu().tsc_offset.load(Ordering::Relaxed), Ordering::Relaxed);
+        p.mode.store(reader_mode(p), Ordering::Relaxed);
+    });
+    CLOCK_PAGE.call_once(|| (cache, page));
+}
+
+/// The clock page's memory object (None if there is none), for the Linux
+/// server to map read-only into its programs.
+pub fn clock_page() -> Option<Arc<crate::fs::cache::PageCache>> {
+    CLOCK_PAGE.get().map(|(cache, _)| cache.clone())
+}
+
+/// Publishes CPU `cpu`'s counter offset (and how a reader takes the
+/// counter now).
+fn publish_offset(cpu: &Cpu) {
+    let Some((_, page)) = CLOCK_PAGE.get() else { return };
+    let _writer = PAGE_WRITER.lock();
+    page.update(|p| {
+        p.tsc_offset[cpu.index].store(cpu.tsc_offset.load(Ordering::Relaxed), Ordering::Relaxed);
+        p.mode.store(reader_mode(p), Ordering::Relaxed);
+    });
 }
 
 /// Wall-clock time of the boot, in seconds since the epoch.
@@ -218,6 +323,8 @@ pub fn sync_ap(cpu: &Cpu) {
         core::hint::spin_loop();
     }
     cpu.tsc_offset.store(SYNC_OFFSET.load(Ordering::Relaxed), Ordering::Relaxed);
+    set_tsc_aux(cpu);
+    publish_offset(cpu);
     SYNC_ANSWER.store(SYNC_DONE, Ordering::Release);
 }
 

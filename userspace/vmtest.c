@@ -162,7 +162,10 @@ int main(void) {
     munmap(big, 64 * MIB);
 
     /* Protection. */
-    char *p = mmap(NULL, 3 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    /* Four pages, the last unmapped again: a hole right after the three (whatever lies
+     * beyond, the vDSO for one). */
+    char *p = mmap(NULL, 4 * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    munmap(p + 3 * 4096, 4096);
     p[0] = 'a';
     p[4096] = 'b';
     mprotect(p, 4096, PROT_READ);

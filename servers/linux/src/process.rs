@@ -200,6 +200,9 @@ pub struct Proc {
     /// /proc/<pid>/exe's target), from its execve until it ends (None before the first
     /// execve and for a zombie).
     pub exe: Option<Arc<crate::namespace::Origin>>,
+    /// The program file's memory object as the kernel names it (`SYS_MO_ID`; 0: none):
+    /// /proc/<pid>/maps names its mappings by `exe`.
+    pub exe_object: u64,
     /// Pages of the program's code (Linux's end_code - start_code: VmExe, statm's text).
     pub text_pages: u64,
     pub sig: signal::ProcSignals,
@@ -533,6 +536,7 @@ pub fn register_init(key: u64) {
             vfork: false,
             cmdline: Vec::new(),
             exe: None,
+            exe_object: 0,
             text_pages: 0,
             sig: signal::ProcSignals::new(hand),
             report: None,
@@ -896,6 +900,7 @@ fn clone(s: &State, c: Clone) -> Result<i64, i64> {
                 cmdline,
                 // (The same program file: Linux's dup_mm keeps mm->exe_file.)
                 exe: parent.exe.clone(),
+                exe_object: parent.exe_object,
                 text_pages: parent.text_pages,
                 sig: signal::ProcSignals::new(hand),
                 report: None,
@@ -1829,6 +1834,17 @@ pub fn brk_of(pid: Pid) -> Option<Arc<Mutex<Brk>>> {
 }
 
 /// The kernel's handle on process `pid`.
+/// What /proc/<pid>/maps of process (or thread) `pid` needs of its record: the kernel's
+/// handle, its program file with the file's object number (`Proc::exe_object`), and its
+/// break (Linux's start_brk and brk). None for no such process.
+pub fn maps_view(id: Pid) -> Option<(u64, Option<Arc<crate::namespace::Origin>>, u64, (u64, u64))> {
+    let t = PROCS.lock();
+    let pid = if t.procs.contains_key(&id) { id } else { t.threads.get(&id)?.pid };
+    let p = t.procs.get(&pid)?;
+    let brk = p.brk.lock();
+    Some((p.handle, p.exe.clone(), p.exe_object, (brk.start, brk.end)))
+}
+
 pub fn handle_of(pid: Pid) -> Option<u64> {
     PROCS.lock().procs.get(&pid).map(|p| p.handle)
 }

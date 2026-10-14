@@ -190,7 +190,7 @@ impl Backing {
     }
 
     /// Shared memory (or device memory): never copied on write or fork.
-    fn shared(&self) -> bool {
+    pub fn shared(&self) -> bool {
         matches!(self, Backing::File { shared: true, .. } | Backing::Device | Backing::Granted { .. } | Backing::Revoked { .. })
     }
 
@@ -736,6 +736,12 @@ impl AddressSpace {
             dirtied: None,
             reaped: false,
         })
+    }
+
+    /// The areas that end above `from`, in address order (/proc/<pid>/maps).
+    pub fn areas_from(&self, from: u64) -> impl Iterator<Item = &Vma> {
+        let first = self.vmas.range(..=from).next_back().filter(|(_, v)| v.end > from).map_or(from, |(&start, _)| start);
+        self.vmas.range(first..).map(|(_, v)| v)
     }
 
     /// Makes this the address space of a Linux process served by
