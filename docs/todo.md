@@ -41,6 +41,12 @@ done, delete it here in the same commit.
   `TFD_TIMER_CANCEL_ON_SET` sees only the tree's own settings of the wall clock.
 - Files: owners and groups are accepted but not stored (everyone is root), `io_uring`
   (`ENOSYS`).
+- Credentials: everyone in a tree is root with every capability, so the checks Linux makes
+  between processes of different users always pass and are not written yet: `kill`'s and
+  `pidfd_send_signal`'s permission check, ptrace access mode (`PTRACE_MODE_READ` for
+  `/proc/<pid>/maps`, `environ`, `mem`, the fd links; `PTRACE_MODE_ATTACH` for
+  `pidfd_getfd`), the dumpable flag's effect on them. Users of their own need them all at
+  once (a tree's processes see no other tree's).
 - Terminal: packet mode (`TIOCPKT`), the Linux console's VT and keyboard ioctls, serial input.
 - Network: IPv6, `MSG_OOB`, `SO_LINGER` with a non-zero time does not block `close`,
   `SO_REUSEPORT` is stored but unused, netlink multicast is never delivered, raw ICMP is shared
