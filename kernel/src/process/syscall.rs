@@ -115,13 +115,88 @@ unsafe extern "C" fn syscall_entry() {
         kernel_stack = const crate::smp::KERNEL_STACK_OFFSET,
         vector = const SYSCALL_VECTOR,
         dispatch = sym dispatch,
-        ret = sym user_return,
+        ret = sym syscall_return,
     );
 }
 
-/// Restores the `Frame` at rsp and returns with iretq. Used after syscalls,
-/// after interrupts and exceptions, and as the first entry of new
-/// processes. Returning to ring 3 swaps the user's GS base back in.
+/// Byte offsets in `Frame` that `syscall_return` checks.
+const FRAME_RCX: usize = core::mem::offset_of!(Frame, rcx);
+const FRAME_R11: usize = core::mem::offset_of!(Frame, r11);
+const FRAME_RIP: usize = core::mem::offset_of!(Frame, rip);
+const FRAME_RFLAGS: usize = core::mem::offset_of!(Frame, rflags);
+const FRAME_RSP: usize = core::mem::offset_of!(Frame, rsp);
+const FRAME_SS: usize = core::mem::offset_of!(Frame, ss);
+/// RFLAGS' trap and resume flags: sysret cannot restore RF, and a TF the frame
+/// asks for must trap after the return, not on it (as Linux's check).
+const RFLAGS_TF_RF: u64 = 0x100 | 0x10000;
+
+/// The return from a system call (`syscall_entry`): with sysretq when the frame
+/// allows it (as Linux's syscall return): a 64-bit user frame whose rcx is its rip
+/// and r11 its rflags, as `syscall` left them (also when the frame is now another
+/// context's that entered by `syscall`: a Linux program's or its server's, which
+/// restricted mode swaps), with a canonical lower-half rip (sysret with a
+/// non-canonical rcx faults in ring 0 on Intel) and neither TF nor RF set. Any other
+/// frame (a server changed the program's rip or registers: a signal frame, exec)
+/// returns through `user_return`'s iretq. Interrupts stay off from the check to
+/// sysretq; between `swapgs` and sysretq the kernel runs on the user's stack with
+/// the user's GS base, which only an NMI could see (NMIs are fatal here, never
+/// used).
+#[unsafe(naked)]
+unsafe extern "C" fn syscall_return() {
+    core::arch::naked_asm!(
+        "cli",
+        "mov rcx, [rsp + {rip}]",
+        "cmp rcx, [rsp + {rcx}]",
+        "jne 2f",
+        "mov r11, [rsp + {rflags}]",
+        "cmp r11, [rsp + {r11}]",
+        "jne 2f",
+        "test r11, {tf_rf}",
+        "jnz 2f",
+        "shr rcx, 47",
+        "jnz 2f",
+        "cmp qword ptr [rsp + {cs}], {user_cs}",
+        "jne 2f",
+        "cmp qword ptr [rsp + {ss}], {user_ss}",
+        "jne 2f",
+        "pop rax",
+        "pop rbx",
+        "pop rcx",
+        "pop rdx",
+        "pop rsi",
+        "pop rdi",
+        "pop rbp",
+        "pop r8",
+        "pop r9",
+        "pop r10",
+        "pop r11",
+        "pop r12",
+        "pop r13",
+        "pop r14",
+        "pop r15",
+        // Past the vector and error code: rsp at rip; the user's stack pointer.
+        "mov rsp, [rsp + {user_rsp}]",
+        "swapgs",
+        "sysretq",
+        "2:",
+        "jmp {slow}",
+        rip = const FRAME_RIP,
+        rcx = const FRAME_RCX,
+        rflags = const FRAME_RFLAGS,
+        r11 = const FRAME_R11,
+        tf_rf = const RFLAGS_TF_RF,
+        cs = const crate::interrupts::entry::FRAME_CS_OFFSET,
+        user_cs = const gdt::USER_CS,
+        ss = const FRAME_SS,
+        user_ss = const gdt::USER_SS,
+        user_rsp = const FRAME_RSP - FRAME_RIP + 16,
+        slow = sym user_return,
+    );
+}
+
+/// Restores the `Frame` at rsp and returns with iretq. Used after interrupts
+/// and exceptions, after syscalls whose frame sysretq cannot return to
+/// (`syscall_return`), and as the first entry of new processes. Returning to ring 3 swaps the user's GS base back in.
 #[unsafe(naked)]
 pub unsafe extern "C" fn user_return() {
     core::arch::naked_asm!(

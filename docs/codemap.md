@@ -51,7 +51,7 @@ module comment, and the public types it defines. Where to start for common tasks
 - `kernel/src/process/native.rs` (143) The system calls of the kernel's native servers (diskfs, netd, procfs, ringtest; `oxrt::sys`): the kernel's own interface, numbered as the Linux server's (`restricted`) where a call is the same mechanism (memory,...
 - `kernel/src/process/query.rs` (67) proc_query (syscall 1005): the kernel's native process and system information for the procfs server (records in `procproto`): the system-wide record only, for it and for the Linux server...
 - `kernel/src/process/sched.rs` (737) The SMP scheduler: per-CPU run queues, wait queues, context switches. Types: `Table`, `PidReservation`, `CpuSched`, `CpuStats`, `WaitQueue`, `Wait`.
-- `kernel/src/process/syscall.rs` (159) The system call entry: the register `Frame` of every kernel entry, the `syscall` MSR setup, and the dispatch by who calls: a Linux program's call goes to its server (restricted mode), the Linux server's calls are the... Types: `Frame`.
+- `kernel/src/process/syscall.rs` (216) The system call entry: the register `Frame` of every kernel entry, the `syscall` MSR setup, and the dispatch by who calls: a Linux program's call goes to its server (restricted mode), the Linux server's calls are the... Types: `Frame`.
 - `kernel/src/process/task.rs` (287) Tasks and thread groups. Types: `FpuState`, `State`, `Info`, `ThreadGroup`, `CpuState`, `Process`, `Task`.
 - `kernel/src/process/tlb.rs` (251) TLB coherence: which CPUs use an address space, and shootdowns. Types: `Tlb`, `AsidCache`.
 - `kernel/src/process/uaccess.rs` (252) Access to the current process's user memory. Types: `Fixup`.
@@ -257,7 +257,7 @@ kernel that handle them.
 
 | nr | call | handled at |
 |---|---|---|
-| 1010 | `SYS_RESTRICTED_ENTER` | kernel/src/process/syscall.rs:168 |
+| 1010 | `SYS_RESTRICTED_ENTER` | kernel/src/process/syscall.rs:243 |
 | 1012 | `SYS_HANDLE_CLOSE` | kernel/src/process/linux.rs:1636 |
 | 1013 | `SYS_MO_CREATE` | kernel/src/process/linux.rs:1652 |
 | 1014 | `SYS_MO_MAP` | kernel/src/process/linux.rs:1660, kernel/src/process/native.rs:71 |

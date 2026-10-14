@@ -647,9 +647,16 @@ call into a device:
   Linux program's CPU exceptions go to its server, which raises Linux's signal (`SIGSEGV`,
   `SIGFPE`, `SIGILL`, `SIGBUS`, `SIGTRAP`); a native server's end it. In the kernel they panic
   with the faulting address. In test mode a panic ends QEMU with a failure.
-- All paths return through `user_return`, which uses **`iretq`** (not `sysret`). A signal can
-  therefore interrupt user code at any instruction and `rt_sigreturn` restores every register
-  exactly, and the classic `sysret` non-canonical-address problem cannot occur.
+- Interrupts and exceptions return through `user_return`, which uses **`iretq`**. A system call
+  returns with **`sysretq`** (`syscall_return`, as Linux's fast path) when its frame is one
+  sysretq restores exactly: a 64-bit user frame whose `rcx` is its `rip` and `r11` its
+  `rflags` (as `syscall` left them; restricted mode swaps in another context that entered by
+  `syscall`, the program's or its server's), a canonical lower-half `rip`, neither TF nor RF
+  set; every other frame (a signal frame, `rt_sigreturn`'s registers, exec's start) goes
+  through `iretq`. So a signal still interrupts user code at any instruction and
+  `rt_sigreturn` restores every register exactly, and the classic `sysret`
+  non-canonical-address problem cannot occur (checked before). It saves about 130 cycles per
+  forwarded system call (two returns; `forwarded_null_syscall` p50 1460 → 1330).
 - Dispatch is by caller: a Linux program's `syscall` goes to its server (restricted mode), the
   server's calls are the kernel's interface for it (`crates/restricted`, `linux::server_call`),
   a native server's are `process/native.rs`'s. The kernel has no table of Linux numbers.
@@ -1360,7 +1367,8 @@ fixed:
 - directory cycles through `rename` (also via symlinks) and recursion deep enough to overflow
   the kernel stack
 - spinlock self-deadlocks and sleeping while holding an inode lock
-- the `sysret` non-canonical return problem, which the `iretq` return path avoids entirely
+- the `sysret` non-canonical return problem: `sysretq` is taken only for a canonical
+  lower-half `rip` (and a frame it restores exactly), `iretq` otherwise
 
 Known open issues: any process may
 call `reboot` or set the wall clock (everything runs as root), the kernel heap
