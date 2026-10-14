@@ -74,7 +74,3 @@ PS/2 keyboard behind the embedded controller, Samsung NVMe, Intel Wi-Fi 7, xHCI 
 3. **`/data` on the stick** (large): an xHCI driver plus USB mass storage. An NVMe driver would
    be simpler but would touch the internal SSD; only with a dedicated partition, if at all.
 4. **Network**: a USB Ethernet adapter after the xHCI driver; Wi-Fi is out of reach.
-
-## Housekeeping
-
-- About 15 finished agent worktrees remain under `.claude/worktrees`.
