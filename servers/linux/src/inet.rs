@@ -20,6 +20,13 @@
 //! interruptible (EINTR, restarted under SA_RESTART as on Linux for calls
 //! without a timeout) and end at SO_RCVTIMEO and SO_SNDTIMEO (EAGAIN).
 //!
+//! **Urgent data** (MSG_OOB, Linux's tcp_recvmsg and tcp_recv_urg): netd
+//! marks the receive ring's position of the urgent byte, which stays in
+//! the ring; reads stop at the mark and skip the byte there unless
+//! SO_OOBINLINE, `recv_oob` takes it once, SIOCATMARK says whether the read
+//! is at the mark, POLLPRI that the byte waits, and the net thread sends
+//! SIGURG to the F_SETOWN owner for each new pointer (`Urg`).
+//!
 //! **Data** moves between the program and the socket's rings in the
 //! server's pool (`netclient::Rings`): one copy, with only the socket's
 //! receive or send lock held (receives and sends are serialized, as Linux's
@@ -54,6 +61,7 @@ pub const EALREADY: i64 = 114;
 pub const EINPROGRESS: i64 = 115;
 
 pub const POLLIN: i16 = 0x1;
+pub const POLLPRI: i16 = 0x2;
 pub const POLLOUT: i16 = 0x4;
 pub const POLLERR: i16 = 0x8;
 pub const POLLHUP: i16 = 0x10;
@@ -70,11 +78,24 @@ pub struct RecvOpts {
 }
 
 /// What a receive got: bytes copied, the datagram's length (larger with
-/// MSG_TRUNC), its source.
+/// MSG_TRUNC), its source, whether it is urgent data (MSG_OOB).
 pub struct Received {
     pub copied: usize,
     pub len: usize,
     pub from: Option<Endpoint>,
+    pub oob: bool,
+}
+
+/// Urgent data received (TCP's urgent pointer, MSG_OOB), as Linux's
+/// urg_data and urg_seq: the pointer of netd's (`netring::Urgent`) last
+/// taken, the receive ring's position of its urgent byte while the reader
+/// has not passed it (Linux clears urg_data then), and whether a MSG_OOB
+/// receive took the byte (TCP_URG_READ).
+#[derive(Clone, Copy, Default)]
+struct Urg {
+    seen: u16,
+    mark: Option<u32>,
+    read: bool,
 }
 
 /// The program's side of a socket.
@@ -97,12 +118,13 @@ pub struct Local {
     seen_rx: u32,
     seen_tx: u32,
     seen_backlog: u32,
+    urg: Urg,
     pub opts: Opts,
 }
 
 /// Options: what has an effect, and the rest as Linux reads them back.
 /// Plain options of all levels (`inetcalls::plain_slot`).
-pub const PLAIN_SLOTS: usize = 33;
+pub const PLAIN_SLOTS: usize = 32;
 
 #[derive(Clone, Copy)]
 pub struct Opts {
@@ -111,6 +133,8 @@ pub struct Opts {
     pub reuseaddr: bool,
     /// SO_REUSEPORT.
     pub reuseport: bool,
+    /// SO_OOBINLINE: urgent data stays in the stream.
+    pub oobinline: bool,
     pub nodelay: bool,
     pub keepalive: bool,
     /// TCP_KEEPIDLE, TCP_KEEPINTVL, TCP_KEEPCNT (seconds, count).
@@ -138,6 +162,10 @@ pub struct InetSock {
     rlock: crate::sync::SleepLock,
     wlock: crate::sync::SleepLock,
     pub st: Mutex<Local>,
+    /// Who gets SIGURG (F_SETOWN, `files::Owner` encoded: its description's
+    /// copy), and the count of netd's urgent pointers it was sent for.
+    owner: AtomicU64,
+    urg_signalled: core::sync::atomic::AtomicU16,
 }
 
 /// Monotonic nanoseconds.
@@ -159,6 +187,9 @@ struct Snap {
     tx_head: u32,
     backlog: u32,
     err_seq: u32,
+    /// The urgent data netd announced (read after `rx_tail`: a byte in the
+    /// ring comes with its mark).
+    urg: netring::Urgent,
 }
 
 impl InetSock {
@@ -174,6 +205,8 @@ impl InetSock {
             rings: Mutex::new(rings),
             rlock: crate::sync::SleepLock::new(()),
             wlock: crate::sync::SleepLock::new(()),
+            owner: AtomicU64::new(0),
+            urg_signalled: core::sync::atomic::AtomicU16::new(0),
             st: Mutex::new(Local {
                 connecting: false,
                 rings_sent,
@@ -186,11 +219,13 @@ impl InetSock {
                 seen_rx: 0,
                 seen_tx: 0,
                 seen_backlog: 0,
+                urg: Urg::default(),
                 opts: Opts {
                     rcvtimeo: 0,
                     sndtimeo: 0,
                     reuseaddr: false,
                     reuseport: false,
+                    oobinline: false,
                     nodelay: false,
                     keepalive: false,
                     keepidle: 7200,
@@ -269,7 +304,37 @@ impl InetSock {
     fn snap(&self) -> Snap {
         let n = &self.ctl().netd;
         let state = n.state.load(SeqCst);
-        Snap { state, rx_tail: n.rx_tail.load(SeqCst), tx_head: n.tx_head.load(SeqCst), backlog: n.backlog.load(SeqCst), err_seq: n.err_seq.load(SeqCst) }
+        let rx_tail = n.rx_tail.load(SeqCst);
+        let (tx_head, backlog, err_seq) = (n.tx_head.load(SeqCst), n.backlog.load(SeqCst), n.err_seq.load(SeqCst));
+        Snap { state, rx_tail, tx_head, backlog, err_seq, urg: netring::Urgent::unpack(n.urg.load(SeqCst)) }
+    }
+
+    /// Takes netd's urgent data in `snap` (state lock held): a new
+    /// pointer marks its byte (an earlier mark goes, as Linux's
+    /// tcp_check_urg replaces urg_seq), and a mark the reader passed goes
+    /// (Linux clears urg_data once copied_seq is beyond urg_seq).
+    fn sync_urg(&self, l: &mut Local, snap: &Snap) {
+        if snap.urg.count != l.urg.seen {
+            l.urg = Urg { seen: snap.urg.count, mark: Some(snap.urg.pos), read: false };
+        }
+        if let Some(m) = l.urg.mark {
+            let head = self.ctl().client.rx_head.load(SeqCst);
+            if (head.wrapping_sub(m) as i32) > 0 {
+                l.urg.mark = None;
+            }
+        }
+    }
+
+    /// Whether urgent data waits to be taken by a MSG_OOB receive (Linux's
+    /// TCP_URG_VALID: POLLPRI).
+    fn urgent_byte(&self, l: &Local, snap: &Snap) -> Option<u8> {
+        let current = snap.urg.count == l.urg.seen && l.urg.mark.is_some() && !l.urg.read;
+        snap.urg.byte.filter(|_| current)
+    }
+
+    /// F_SETOWN (`files::Description::set_owner`): who gets SIGURG.
+    pub fn set_owner(&self, owner: files::Owner) {
+        self.owner.store(owner.encode(), SeqCst);
     }
 
     /// The pending error, if any (taken with `take`).
@@ -331,6 +396,14 @@ impl InetSock {
             }
             return m;
         }
+        self.sync_urg(l, &snap);
+        if self.urgent_byte(l, &snap).is_some() {
+            m |= POLLPRI;
+        }
+        // At the mark, an urgent byte that is not part of the stream does
+        // not count (Linux's tcp_poll: one byte more is needed).
+        let head = self.ctl().client.rx_head.load(SeqCst);
+        let skipped = (l.urg.mark == Some(head) && !l.opts.oobinline) as u32;
         let established = snap.state & state::ESTABLISHED != 0;
         let connecting = snap.state & state::CONNECTING != 0;
         let closed = snap.state & state::CLOSED != 0 || (!established && !connecting);
@@ -343,7 +416,7 @@ impl InetSock {
             m |= POLLIN | POLLRDHUP;
         }
         if !connecting {
-            if avail > 0 && avail >= l.opts.rcvlowat.max(1) as u32 {
+            if avail > skipped && avail - skipped >= l.opts.rcvlowat.max(1) as u32 {
                 m |= POLLIN;
             }
             if snd_shut {
@@ -419,6 +492,11 @@ impl InetSock {
         l.seen_backlog = snap.backlog;
         self.report(&mut l, event);
         drop(l);
+        // New urgent data: SIGURG to the owner (Linux's sk_send_sigurg, when
+        // the pointer arrives, before its byte perhaps).
+        if self.urg_signalled.swap(snap.urg.count, SeqCst) != snap.urg.count {
+            files::Owner::decode(self.owner.load(SeqCst)).signal(crate::signal::SIGURG);
+        }
         if self.net.is_dead() {
             // Waiters sleep on the dead channel's memory: they wake, as
             // every futex wait there fails now.
@@ -671,18 +749,26 @@ impl InetSock {
     /// send(2) and friends: from `src`, to `to` (datagrams; None: the
     /// peer). EPIPE once the connection cannot send (the caller raises
     /// SIGPIPE).
-    pub fn send(&self, src: &mut Source, to: Option<Endpoint>, nonblock: bool) -> Result<usize, i64> {
+    /// `oob`: MSG_OOB, the data sent is urgent (TCP only: EOPNOTSUPP for
+    /// the others, as Linux).
+    pub fn send(&self, src: &mut Source, to: Option<Endpoint>, nonblock: bool, oob: bool) -> Result<usize, i64> {
         if self.kind == Kind::Tcp {
             if to.is_some() {
                 let snap = self.snap();
                 return Err(if snap.state & state::ESTABLISHED != 0 { EISCONN } else { ENOTCONN });
             }
-            return self.send_stream(src, nonblock);
+            return self.send_stream(src, nonblock, oob);
+        }
+        if oob {
+            return Err(EOPNOTSUPP);
         }
         self.send_datagram(src, to, nonblock)
     }
 
-    fn send_stream(&self, src: &mut Source, nonblock: bool) -> Result<usize, i64> {
+    /// With `oob` every part written marks its end as the end of urgent
+    /// data (Linux's tcp_mark_urg at each push: the last byte of the call
+    /// is the urgent one).
+    fn send_stream(&self, src: &mut Source, nonblock: bool, oob: bool) -> Result<usize, i64> {
         let timeout = self.st.lock().opts.sndtimeo;
         let deadline = deadline(timeout);
         let mut sent = 0usize;
@@ -736,7 +822,14 @@ impl InetSock {
                 if got == 0 {
                     break;
                 }
-                ctl.client.tx_tail.store(tail.wrapping_add(got as u32), SeqCst);
+                let end = tail.wrapping_add(got as u32);
+                if oob {
+                    // The mark before the bytes it ends (netd that sees them
+                    // sees it).
+                    let count = netring::UrgentMark::unpack(ctl.client.tx_urg.load(SeqCst)).count.wrapping_add(1);
+                    ctl.client.tx_urg.store(netring::UrgentMark { count, end }.pack(), SeqCst);
+                }
+                ctl.client.tx_tail.store(end, SeqCst);
                 self.net.kick(self.index);
                 sent += got;
                 if src.left() == 0 || nonblock {
@@ -838,21 +931,50 @@ impl InetSock {
         // Linux's sock_rcvlowat: MSG_WAITALL wants all, else SO_RCVLOWAT.
         let target = if o.waitall && !o.peek { want } else { want.min(lowat) };
         let mut copied = 0usize;
+        // How far a peek got beyond the head (it takes nothing).
+        let mut peeked = 0u32;
         let mut reader = Some(self.rlock.lock()?);
         loop {
             let seen = self.ctl().seen();
             let snap = self.snap();
             let rings = self.rings();
             let avail = match &rings {
-                Some(r) => self.available(&snap, r)?,
+                Some(r) => self.available(&snap, r)?.saturating_sub(peeked),
                 None => 0,
             };
+            let ctl = self.ctl();
+            let head = ctl.client.rx_head.load(SeqCst);
+            let at = head.wrapping_add(peeked);
+            // Urgent data (Linux's tcp_recvmsg): a read stops at its mark,
+            // and at the mark its byte is skipped unless SO_OOBINLINE.
+            let (to_mark, inline) = {
+                let mut l = self.st.lock();
+                self.sync_urg(&mut l, &snap);
+                (l.urg.mark.map(|m| m.wrapping_sub(at) as i32).filter(|&d| d >= 0), l.opts.oobinline)
+            };
+            if to_mark == Some(0) {
+                if copied > 0 {
+                    break;
+                }
+                if !inline && avail > 0 {
+                    if o.peek {
+                        peeked += 1;
+                    } else {
+                        ctl.client.rx_head.store(head.wrapping_add(1), SeqCst);
+                        if ctl.netd.rx_wait.load(SeqCst) != 0 {
+                            self.net.kick(self.index);
+                        }
+                    }
+                    continue;
+                }
+            }
             if avail > 0 && dst.room() > 0 {
                 let r = rings.expect("data needs rings");
-                let ctl = self.ctl();
-                let head = ctl.client.rx_head.load(SeqCst);
-                let n = (avail as usize).min(dst.room()) as u32;
-                let [(a, k), (b, m)] = pieces(head, n, r.size());
+                let mut n = (avail as usize).min(dst.room()) as u32;
+                if let Some(d) = to_mark.filter(|&d| d > 0) {
+                    n = n.min(d as u32);
+                }
+                let [(a, k), (b, m)] = pieces(at, n, r.size());
                 let first = unsafe { core::slice::from_raw_parts(r.rx().add(a as usize), k as usize) };
                 let mut got = match dst.put(first) {
                     Ok(got) => got,
@@ -864,7 +986,9 @@ impl InetSock {
                     got += dst.put(second).unwrap_or(0);
                 }
                 copied += got;
-                if !o.peek {
+                if o.peek {
+                    peeked += got as u32;
+                } else {
                     ctl.client.rx_head.store(head.wrapping_add(got as u32), SeqCst);
                     // netd waits for room only if it said so (Dekker:
                     // our head, then its flag).
@@ -922,7 +1046,48 @@ impl InetSock {
         if !o.peek {
             self.changed();
         }
-        Ok(Received { copied, len: copied, from: None })
+        Ok(Received { copied, len: copied, from: None, oob: false })
+    }
+
+    /// recv(2) with MSG_OOB (Linux's tcp_recv_urg): the urgent byte, once;
+    /// EINVAL without urgent data to take (none, taken, passed, or
+    /// SO_OOBINLINE); never waits (EAGAIN while the byte has not come).
+    pub fn recv_oob(&self, dst: &mut Sink, peek: bool) -> Result<Received, i64> {
+        if self.kind != Kind::Tcp {
+            return Err(EOPNOTSUPP);
+        }
+        let snap = self.snap();
+        let byte = {
+            let mut l = self.st.lock();
+            self.sync_urg(&mut l, &snap);
+            if l.opts.oobinline || l.urg.mark.is_none() || l.urg.read {
+                return Err(EINVAL);
+            }
+            let byte = self.urgent_byte(&l, &snap);
+            if byte.is_some() && !peek {
+                l.urg.read = true;
+                self.report(&mut l, false);
+            }
+            byte
+        };
+        if let Some(b) = byte {
+            // (Copied without the state lock: the copy may fault.)
+            let copied = if dst.room() > 0 { dst.put(&[b])? } else { 0 };
+            return Ok(Received { copied, len: 1, from: None, oob: true });
+        }
+        if snap.state & (state::CLOSED | state::RECV_EOF) != 0 || self.st.lock().shut_rd {
+            return Ok(Received { copied: 0, len: 0, from: None, oob: false });
+        }
+        Err(EAGAIN)
+    }
+
+    /// SIOCATMARK: whether the next byte read is the urgent byte's (the
+    /// read is at the mark).
+    pub fn at_mark(&self) -> bool {
+        let snap = self.snap();
+        let mut l = self.st.lock();
+        self.sync_urg(&mut l, &snap);
+        l.urg.mark == Some(self.ctl().client.rx_head.load(SeqCst))
     }
 
     fn recv_datagram(&self, dst: &mut Sink, o: RecvOpts) -> Result<Received, i64> {
@@ -962,7 +1127,7 @@ impl InetSock {
                 if !o.peek {
                     self.changed();
                 }
-                return Ok(Received { copied: got, len: rec.len as usize, from: Some(rec.from) });
+                return Ok(Received { copied: got, len: rec.len as usize, from: Some(rec.from), oob: false });
             }
             {
                 let mut l = self.st.lock();
@@ -971,7 +1136,7 @@ impl InetSock {
                     return Err(e);
                 }
                 if l.shut_rd {
-                    return Ok(Received { copied: 0, len: 0, from: None });
+                    return Ok(Received { copied: 0, len: 0, from: None, oob: false });
                 }
                 if self.net.is_dead() {
                     return Err(netclient::ENETDOWN);

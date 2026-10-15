@@ -563,6 +563,27 @@ pub struct Socket<'a> {
     /// oxidenix: its place in an SO_REUSEPORT group while it listens
     /// (`set_shard`); kept across connections.
     shard: Option<crate::iface::Shard>,
+    /// oxidenix: urgent data (`mark_urgent`, `urgent`): the sequence
+    /// number after the last urgent byte sent until the peer acknowledged
+    /// it (Linux's snd_up), and of the urgent byte the peer announced
+    /// last (urg_seq), how many it announced, and the byte once it came.
+    snd_up: Option<TcpSeqNumber>,
+    rcv_up: Option<TcpSeqNumber>,
+    rcv_up_count: u32,
+    rcv_up_byte: Option<u8>,
+}
+
+/// oxidenix: the urgent data the peer announced last (`Socket::urgent`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Urgent {
+    /// How many urgent pointers beyond the one before the peer announced
+    /// so far (each is new urgent data: SIGURG).
+    pub count: u32,
+    /// Where the urgent byte is in the stream, from the first byte not yet
+    /// received by `recv` (negative once `recv` took it).
+    pub offset: i64,
+    /// The urgent byte, once it arrived.
+    pub byte: Option<u8>,
 }
 
 const DEFAULT_MSS: usize = 536;
@@ -643,6 +664,10 @@ impl<'a> Socket<'a> {
             rx_capacity_max: 0,
             timed_out: false,
             shard: None,
+            snd_up: None,
+            rcv_up: None,
+            rcv_up_count: 0,
+            rcv_up_byte: None,
         }
     }
 
@@ -710,6 +735,29 @@ impl<'a> Socket<'a> {
     /// them. Kept until set again (not by `listen`, `abort` or a reset).
     pub fn set_shard(&mut self, shard: Option<crate::iface::Shard>) {
         self.shard = shard;
+    }
+
+    /// oxidenix: the data queued so far ends with urgent data (send(2)
+    /// with MSG_OOB): segments carry the URG flag and an urgent pointer to
+    /// the byte after it (as BSD and Linux, tcp_stdurg off) until the peer
+    /// acknowledged it. A later mark moves the pointer on (Linux's
+    /// tcp_mark_urg).
+    pub fn mark_urgent(&mut self) {
+        let first = self.local_seq_no + matches!(self.state, State::SynSent | State::SynReceived) as usize;
+        self.snd_up = Some(first + self.tx_buffer.len());
+    }
+
+    /// oxidenix: the urgent data the peer announced last, as Linux's
+    /// tcp_urg keeps it: a pointer to data already received or to no later
+    /// byte than the last one is no news; the urgent byte is taken from the
+    /// segment that carries it. None if none was announced since the
+    /// connection began.
+    pub fn urgent(&self) -> Option<Urgent> {
+        let up = self.rcv_up?;
+        // `remote_seq_no` is the first byte `recv` has not taken (one more
+        // once the FIN came).
+        let read = self.remote_seq_no.0.wrapping_sub(self.rx_fin_received as i32);
+        Some(Urgent { count: self.rcv_up_count, offset: up.0.wrapping_sub(read) as i64, byte: self.rcv_up_byte })
     }
 
     /// oxidenix: whether the socket holds a connection (or a connection
@@ -1030,6 +1078,11 @@ impl<'a> Socket<'a> {
         self.remote_last_ts = None;
         self.ack_delay_timer = AckDelayTimer::Idle;
         self.challenge_ack_timer = Instant::from_secs(0);
+        // oxidenix: no urgent data of an earlier connection.
+        self.snd_up = None;
+        self.rcv_up = None;
+        self.rcv_up_count = 0;
+        self.rcv_up_byte = None;
 
         #[cfg(feature = "async")]
         {
@@ -1553,6 +1606,7 @@ impl<'a> Socket<'a> {
             sack_permitted: false,
             sack_ranges: [None, None, None],
             timestamp: None,
+            urgent: None,
             payload: &[],
         };
         let ip_reply_repr = IpRepr::new(
@@ -1973,6 +2027,22 @@ impl<'a> Socket<'a> {
             }
         };
 
+        // oxidenix: the urgent pointer of an acceptable segment (Linux's
+        // tcp_check_urg): it points past the urgent byte; one into data
+        // already received, or no later than the one known, is no news.
+        if let Some(ptr) = repr.urgent
+            && ptr != 0
+            && repr.control != TcpControl::Rst
+            && matches!(self.state, State::SynReceived | State::Established | State::FinWait1 | State::FinWait2)
+        {
+            let up = repr.seq_number + (ptr as usize - 1);
+            if up >= window_start && self.rcv_up.is_none_or(|known| up > known) {
+                self.rcv_up = Some(up);
+                self.rcv_up_count = self.rcv_up_count.wrapping_add(1);
+                self.rcv_up_byte = None;
+            }
+        }
+
         // Compute the amount of acknowledged octets, removing the SYN and FIN bits
         // from the sequence space.
         let mut ack_len = 0;
@@ -2301,6 +2371,10 @@ impl<'a> Socket<'a> {
             // We've processed everything in the incoming segment, so advance the local
             // sequence number past it.
             self.local_seq_no = ack_number;
+            // oxidenix: the urgent data was acknowledged: urgent mode ends.
+            if self.snd_up.is_some_and(|up| ack_number >= up) {
+                self.snd_up = None;
+            }
 
             // During retransmission, if an earlier segment got lost but later was
             // successfully received, self.local_seq_no can move past self.remote_last_seq.
@@ -2378,6 +2452,17 @@ impl<'a> Socket<'a> {
         );
         let len_written = self.rx_buffer.write_unallocated(payload_offset, payload);
         debug_assert!(len_written == payload_len);
+
+        // oxidenix: the urgent byte, from the segment that carries it (in
+        // order or not).
+        if let Some(up) = self.rcv_up
+            && self.rcv_up_byte.is_none()
+        {
+            let start = window_start + payload_offset;
+            if up >= start && up < start + len_written {
+                self.rcv_up_byte = Some(payload[up - start]);
+            }
+        }
 
         if contig_len != 0 {
             // Enqueue the contiguous data octets in front of the buffer.
@@ -2720,6 +2805,7 @@ impl<'a> Socket<'a> {
                 self.tsval_generator,
                 self.last_remote_tsval,
             ),
+            urgent: None,
             payload: &[],
         };
 
@@ -2936,6 +3022,16 @@ impl<'a> Socket<'a> {
         // Bailing out if the packet isn't placed in the device buffer allows us
         // to not waste time waiting for the retransmit timer on packets that we know
         // for sure will not be successfully transmitted.
+        // oxidenix: while urgent data waits for its acknowledgement, every
+        // segment before it says where it ends (Linux's tcp_options_write
+        // part of tcp_transmit_skb: an offset beyond 16 bits is cut).
+        if let Some(up) = self.snd_up
+            && !matches!(repr.control, TcpControl::Syn | TcpControl::Rst)
+            && up > repr.seq_number
+        {
+            repr.urgent = Some((up - repr.seq_number).min(0xffff) as u16);
+        }
+
         ip_repr.set_payload_len(repr.buffer_len());
         emit(cx, packet_meta, (ip_repr, repr))?;
 
@@ -3162,6 +3258,7 @@ mod test {
         sack_permitted: false,
         sack_ranges: [None, None, None],
         timestamp: None,
+        urgent: None,
         payload: &[],
     };
     const _RECV_IP_TEMPL: IpRepr = IpReprIpvX(IpvXRepr {
@@ -3183,6 +3280,7 @@ mod test {
         sack_permitted: false,
         sack_ranges: [None, None, None],
         timestamp: None,
+        urgent: None,
         payload: &[],
     };
 
@@ -10516,6 +10614,86 @@ mod test {
         let syn = TcpRepr { control: TcpControl::Syn, ack_number: None, ..SEND_TEMPL };
         let TestSocket { socket, cx } = &mut s[1];
         assert!(socket.accepts(cx, &ip, &syn));
+    }
+
+    /// Urgent data sent: segments point past it until it is acknowledged.
+    #[test]
+    fn test_oxidenix_urgent_sent() {
+        let mut s = socket_established();
+        s.set_nagle_enabled(false);
+        s.send_slice(b"abc").unwrap();
+        s.mark_urgent();
+        recv!(s, time 0, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"abc"[..],
+            urgent:     Some(3),
+            ..RECV_TEMPL
+        }));
+        // More data after it: the pointer stays where the urgent data ends.
+        s.send_slice(b"de").unwrap();
+        recv!(s, time 0, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 3,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"de"[..],
+            ..RECV_TEMPL
+        }));
+        // Acknowledged: urgent mode ends.
+        send!(s, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1 + 5),
+            ..SEND_TEMPL
+        });
+        assert_eq!(s.snd_up, None);
+        s.send_slice(b"f").unwrap();
+        recv!(s, time 0, Ok(TcpRepr {
+            seq_number: LOCAL_SEQ + 1 + 5,
+            ack_number: Some(REMOTE_SEQ + 1),
+            payload:    &b"f"[..],
+            ..RECV_TEMPL
+        }));
+    }
+
+    /// Urgent data received: the pointer marks the byte before it; the
+    /// byte is taken when it arrives; the same pointer again is no news.
+    #[test]
+    fn test_oxidenix_urgent_received() {
+        let mut s = socket_established();
+        assert_eq!(s.urgent(), None);
+        // The pointer comes before its byte.
+        send!(s, TcpRepr {
+            seq_number: REMOTE_SEQ + 1,
+            ack_number: Some(LOCAL_SEQ + 1),
+            payload:    &b"ab"[..],
+            urgent:     Some(4),
+            ..SEND_TEMPL
+        });
+        assert_eq!(s.urgent(), Some(Urgent { count: 1, offset: 3, byte: None }));
+        send!(s, TcpRepr {
+            seq_number: REMOTE_SEQ + 1 + 2,
+            ack_number: Some(LOCAL_SEQ + 1),
+            payload:    &b"cdef"[..],
+            urgent:     Some(2),
+            ..SEND_TEMPL
+        });
+        assert_eq!(s.urgent(), Some(Urgent { count: 1, offset: 3, byte: Some(b'd') }));
+        // Read past it: the offset goes negative.
+        let mut buf = [0u8; 5];
+        assert_eq!(s.recv_slice(&mut buf), Ok(5));
+        assert_eq!(s.urgent(), Some(Urgent { count: 1, offset: -2, byte: Some(b'd') }));
+        // A pointer into data already received is no news; a later one is.
+        send!(s, TcpRepr {
+            seq_number: REMOTE_SEQ + 1 + 6,
+            ack_number: Some(LOCAL_SEQ + 1),
+            payload:    &b"gh"[..],
+            urgent:     Some(1),
+            ..SEND_TEMPL
+        });
+        assert_eq!(s.urgent(), Some(Urgent { count: 2, offset: 1, byte: Some(b'g') }));
+        // A new connection forgets it.
+        s.abort();
+        s.listen(LISTEN_END).unwrap();
+        assert_eq!(s.urgent(), None);
     }
 
     #[test]

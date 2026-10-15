@@ -542,6 +542,18 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
      (Linux's `tcp_close` and `sk_stream_wait_close`: no reset at the end of the time,
      `O_NONBLOCK` does not shorten the wait, a process's exit and `shutdown` never linger;
      data that arrives meanwhile resets the connection).
+     **Urgent data** (`MSG_OOB`, Linux's reading of the urgent pointer: it points past the
+     urgent byte): a send with `MSG_OOB` marks the end of what it wrote in the control block
+     (`netring::UrgentMark`, stored before the tail), netd takes the send ring up to it and
+     marks smoltcp's urgent pointer there (a vendored patch: every segment before it carries
+     `URG` until the peer acknowledged it). The peer's pointer comes back as the receive
+     ring's position of the urgent byte, with the byte once its segment came
+     (`netring::Urgent`, one word, published before `rx_tail`); the byte stays in the ring,
+     and the server does what Linux's `tcp_recvmsg` does with it: a read stops at the mark,
+     skips the byte there unless `SO_OOBINLINE`, `recv(MSG_OOB)` takes it once (never
+     waits: `EAGAIN` until it came, `EINVAL` once taken or passed), `SIOCATMARK`, `POLLPRI`
+     while it waits, and the net thread sends `SIGURG` to the `F_SETOWN` owner when a new
+     pointer arrives.
      **Closing**: `close(2)` sends `CLOSE` before it returns, so the port is free then, as
      on Linux; what the pager learns (a process's exit closing its descriptors) it hands to
      the net thread, never waiting for netd itself. netd then copies what the send ring

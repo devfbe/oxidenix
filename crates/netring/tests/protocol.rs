@@ -791,3 +791,28 @@ fn ephemeral_ports_follow_rfc6056s_fourth_algorithm() {
     let mut other = [0u32; 1024];
     assert_ne!(port_start(&[3; 16], &k2, &mut other, 1, 0x0a00_0202, 80, true), a);
 }
+
+#[test]
+fn urgent_marks_pack_into_one_word() {
+    for u in [
+        Urgent { count: 0, pos: 0, byte: None },
+        Urgent { count: 1, pos: 0xffff_ffff, byte: Some(0) },
+        Urgent { count: u16::MAX, pos: 12345, byte: Some(0xff) },
+        Urgent { count: 7, pos: 1 << 31, byte: None },
+    ] {
+        assert_eq!(Urgent::unpack(u.pack()), u);
+    }
+    // A zeroed word (a new control block): no pointer, no byte.
+    assert_eq!(Urgent::unpack(0), Urgent::default());
+    for m in [UrgentMark { count: 0, end: 0 }, UrgentMark { count: u32::MAX, end: u32::MAX }, UrgentMark { count: 3, end: 65536 }] {
+        assert_eq!(UrgentMark::unpack(m.pack()), m);
+    }
+    // Both live in the control block and start over with a new socket.
+    let ctl: Box<Ctl> = Box::new(unsafe { core::mem::zeroed() });
+    ctl.netd.urg.store(Urgent { count: 2, pos: 99, byte: Some(b'!') }.pack(), Ordering::SeqCst);
+    ctl.client.tx_urg.store(UrgentMark { count: 1, end: 5 }.pack(), Ordering::SeqCst);
+    ctl.reset_netd(0);
+    ctl.reset_client();
+    assert_eq!(Urgent::unpack(ctl.netd.urg.load(Ordering::SeqCst)), Urgent::default());
+    assert_eq!(UrgentMark::unpack(ctl.client.tx_urg.load(Ordering::SeqCst)), UrgentMark::default());
+}

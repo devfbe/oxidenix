@@ -28,6 +28,12 @@
 //!   the end as bytes do). netd puts in only whole records.
 //! - A stream's send ring holds bytes; a datagram is sent by `SEND` from the
 //!   start of the send ring (which is a plain buffer for a datagram socket).
+//! - Urgent data (TCP's urgent pointer, MSG_OOB) is marked by ring
+//!   positions, each packed with a count in one word: the client's
+//!   `tx_urg` (`UrgentMark`: after the urgent byte it wrote), netd's `urg`
+//!   (`Urgent`: of the urgent byte received, which stays in the stream,
+//!   and the byte itself). Each is stored before the position that
+//!   publishes the bytes, so whoever sees the bytes sees their mark.
 //!
 //! **Waking.** Each control block has an event counter `seq` that both
 //! sides advance after a change, and a count of the client's threads that
@@ -358,6 +364,53 @@ pub struct NetdLine {
     /// 1: netd holds received data the receive ring had no room for (the
     /// client rings after it made room).
     pub rx_wait: AtomicU32,
+    /// Urgent data the peer announced last (TCP, MSG_OOB), an `Urgent`
+    /// packed in one word (read and written whole: never torn). Published
+    /// before `rx_tail`: the client that sees a byte in the ring sees its
+    /// mark.
+    pub urg: AtomicU64,
+}
+
+/// Urgent data the peer announced (`NetdLine::urg`): how many urgent
+/// pointers so far (modulo 2^16: a new one is news, SIGURG), the receive
+/// ring's position of the urgent byte (which may not have come yet; it
+/// stays in the stream), and the byte once it came.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Urgent {
+    pub count: u16,
+    pub pos: u32,
+    pub byte: Option<u8>,
+}
+
+impl Urgent {
+    pub fn pack(&self) -> u64 {
+        let byte = self.byte.map_or(0, |b| 0x100 | b as u64);
+        self.pos as u64 | (self.count as u64) << 32 | byte << 48
+    }
+
+    pub fn unpack(v: u64) -> Urgent {
+        let byte = (v >> 48) as u16;
+        Urgent { count: (v >> 32) as u16, pos: v as u32, byte: (byte & 0x100 != 0).then_some(byte as u8) }
+    }
+}
+
+/// Urgent data sent (`ClientLine::tx_urg`): the send ring's position after
+/// the urgent byte, and how many marks the client made (modulo 2^32: a new
+/// one is news).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UrgentMark {
+    pub count: u32,
+    pub end: u32,
+}
+
+impl UrgentMark {
+    pub fn pack(&self) -> u64 {
+        self.end as u64 | (self.count as u64) << 32
+    }
+
+    pub fn unpack(v: u64) -> UrgentMark {
+        UrgentMark { count: (v >> 32) as u32, end: v as u32 }
+    }
 }
 
 /// The client's half.
@@ -369,6 +422,11 @@ pub struct ClientLine {
     pub tx_tail: AtomicU32,
     /// The client's threads waiting on `seq`.
     pub waiters: AtomicU32,
+    /// Urgent data sent (send(2) with MSG_OOB), an `UrgentMark` packed in
+    /// one word: netd marks smoltcp's urgent pointer when it took the bytes
+    /// up to its end. Stored before `tx_tail`: netd that sees the bytes
+    /// sees the mark.
+    pub tx_urg: AtomicU64,
 }
 
 /// A socket's control block.
@@ -409,6 +467,7 @@ impl Ctl {
         for w in [&n.rx_tail, &n.tx_head, &n.error, &n.err_seq, &n.backlog, &n.rx_wait] {
             w.store(0, SeqCst);
         }
+        n.urg.store(0, SeqCst);
         n.state.store(state, SeqCst);
     }
 
@@ -416,6 +475,7 @@ impl Ctl {
     pub fn reset_client(&self) {
         self.client.rx_head.store(0, SeqCst);
         self.client.tx_tail.store(0, SeqCst);
+        self.client.tx_urg.store(0, SeqCst);
     }
 }
 

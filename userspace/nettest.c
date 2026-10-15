@@ -2,7 +2,7 @@
  * (10.0.2.100:7 is an echo service, see builder/src/main.rs), with the
  * Linux semantics of the server's internet sockets (R7b): bulk data
  * intact, MSG_PEEK, MSG_DONTWAIT, MSG_WAITALL, MSG_TRUNC, timeouts,
- * half-close, EPIPE and SIGPIPE, SO_ERROR, SO_REUSEADDR, SO_REUSEPORT, SO_LINGER, options,
+ * half-close, EPIPE and SIGPIPE, SO_ERROR, SO_REUSEADDR, SO_REUSEPORT, SO_LINGER, MSG_OOB, options,
  * epoll's edges. */
 #define _GNU_SOURCE
 #include <arpa/inet.h>
@@ -328,6 +328,103 @@ static void reuseport(void) {
     check("a connected member gets every datagram of its peer", mine == 8 && others == 0);
     close(peer);
     for (int i = 0; i < 3; i++) close(u[i]);
+}
+
+static volatile int sigurgs;
+static void on_sigurg(int sig) {
+    (void)sig;
+    sigurgs++;
+}
+
+/* Whether SIOCATMARK says `fd` reads at the urgent mark. */
+static int at_mark(int fd) {
+    int v = -1;
+    return ioctl(fd, SIOCATMARK, &v) == 0 ? v : -1;
+}
+
+/* MSG_OOB (TCP's urgent data, Linux's semantics): the last byte of a send with MSG_OOB is
+ * urgent; the reader gets it with recv(MSG_OOB) (once), POLLPRI/EPOLLPRI and SIGURG to the
+ * F_SETOWN owner tell of it, a read stops at its mark (SIOCATMARK), and the byte is not in
+ * the stream unless SO_OOBINLINE. */
+static void urgent_data(void) {
+    int p[2];
+    char buf[16], c = 0;
+    if (tcp_pair(p) < 0) {
+        check("tcp pair for MSG_OOB", 0);
+        return;
+    }
+    struct sigaction sa = {0};
+    sa.sa_handler = on_sigurg;
+    sigaction(SIGURG, &sa, NULL);
+    sigurgs = 0;
+    check("F_SETOWN to this process", fcntl(p[1], F_SETOWN, getpid()) == 0 && fcntl(p[1], F_GETOWN) == getpid());
+    check("F_SETOWN to nobody: ESRCH", fcntl(p[0], F_SETOWN, 999999) == -1 && errno == ESRCH);
+    struct f_owner_ex ex = {F_OWNER_PGRP, getpgrp()}, back = {0, 0};
+    check("F_SETOWN_EX and F_GETOWN_EX", fcntl(p[0], F_SETOWN_EX, &ex) == 0 && fcntl(p[0], F_GETOWN_EX, &back) == 0 &&
+                                            back.type == F_OWNER_PGRP && back.pid == getpgrp() && fcntl(p[0], F_GETOWN) == -getpgrp());
+    fcntl(p[0], F_SETOWN, 0);
+    check("recv(MSG_OOB) without urgent data: EINVAL", recv(p[1], buf, 1, MSG_OOB | MSG_DONTWAIT) == -1 && errno == EINVAL);
+
+    send(p[0], "ab", 2, 0);
+    check("send with MSG_OOB", send(p[0], "c", 1, MSG_OOB) == 1);
+    send(p[0], "de", 2, 0);
+    struct pollfd pf = {p[1], POLLPRI, 0};
+    check("POLLPRI tells of urgent data", poll(&pf, 1, 2000) == 1 && (pf.revents & POLLPRI));
+    for (int i = 0; i < 100 && !sigurgs; i++) usleep(10000);
+    check("SIGURG to the F_SETOWN owner", sigurgs == 1);
+    int ep = epoll_create1(0);
+    struct epoll_event ev = {.events = EPOLLPRI, .data.fd = p[1]}, out;
+    epoll_ctl(ep, EPOLL_CTL_ADD, p[1], &ev);
+    check("EPOLLPRI too", epoll_wait(ep, &out, 1, 1000) == 1 && (out.events & EPOLLPRI));
+    check("not at the mark before the data before it", at_mark(p[1]) == 0);
+    check("recv(MSG_OOB | MSG_PEEK) shows the urgent byte", recv(p[1], &c, 1, MSG_OOB | MSG_PEEK) == 1 && c == 'c');
+    char cbuf[1];
+    struct iovec iov = {cbuf, 1};
+    struct msghdr m = {0};
+    m.msg_iov = &iov;
+    m.msg_iovlen = 1;
+    check("recvmsg(MSG_OOB) takes it, with MSG_OOB", recvmsg(p[1], &m, MSG_OOB) == 1 && cbuf[0] == 'c' && (m.msg_flags & MSG_OOB));
+    check("... once: then EINVAL", recv(p[1], &c, 1, MSG_OOB) == -1 && errno == EINVAL);
+    pf.revents = 0;
+    check("... and POLLPRI is gone", poll(&pf, 1, 0) == 0);
+    check("a read stops at the mark", recv(p[1], buf, sizeof buf, 0) == 2 && memcmp(buf, "ab", 2) == 0);
+    check("SIOCATMARK there", at_mark(p[1]) == 1);
+    usleep(50000);
+    check("the urgent byte is not in the stream", recv(p[1], buf, sizeof buf, MSG_DONTWAIT) == 2 && memcmp(buf, "de", 2) == 0);
+    check("past the mark", at_mark(p[1]) == 0);
+    close(ep);
+
+    /* Read past the mark without taking it: the byte is gone (EINVAL). */
+    send(p[0], "x", 1, MSG_OOB);
+    send(p[0], "yz", 2, 0);
+    pf.revents = 0;
+    poll(&pf, 1, 2000);
+    usleep(50000);
+    check("at the mark at once (nothing before it)", at_mark(p[1]) == 1);
+    check("a read skips it", recv(p[1], buf, sizeof buf, 0) == 2 && memcmp(buf, "yz", 2) == 0);
+    check("... and then it is lost", recv(p[1], &c, 1, MSG_OOB) == -1 && errno == EINVAL);
+
+    /* SO_OOBINLINE: the urgent byte stays in the stream, the read still stops at its mark. */
+    int one = 1;
+    setsockopt(p[1], SOL_SOCKET, SO_OOBINLINE, &one, sizeof one);
+    send(p[0], "12", 2, 0);
+    send(p[0], "3", 1, MSG_OOB);
+    send(p[0], "4", 1, 0);
+    pf.revents = 0;
+    poll(&pf, 1, 2000);
+    usleep(50000);
+    check("SO_OOBINLINE: recv(MSG_OOB) is EINVAL", recv(p[1], &c, 1, MSG_OOB) == -1 && errno == EINVAL);
+    check("... the read stops before the urgent byte", recv(p[1], buf, sizeof buf, 0) == 2 && memcmp(buf, "12", 2) == 0);
+    check("... which comes inline", at_mark(p[1]) == 1 && recv(p[1], buf, sizeof buf, 0) == 2 && memcmp(buf, "34", 2) == 0);
+    check("SIGURG for each", sigurgs == 3);
+
+    int u = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in a = addr("127.0.0.1", 9);
+    check("UDP: MSG_OOB is EOPNOTSUPP", sendto(u, "x", 1, MSG_OOB, (struct sockaddr *)&a, sizeof a) == -1 && errno == EOPNOTSUPP);
+    close(u);
+    signal(SIGURG, SIG_DFL);
+    close(p[0]);
+    close(p[1]);
 }
 
 /* Byte `i` of the bulk transfer's pattern. */
@@ -997,6 +1094,7 @@ int main(void) {
     stream_semantics();
     lingering_close();
     reuseport();
+    urgent_data();
     killed_while_waiting_on_netd();
     datagram_semantics();
     many_sockets();

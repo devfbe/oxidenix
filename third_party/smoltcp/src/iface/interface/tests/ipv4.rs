@@ -980,6 +980,7 @@ fn test_raw_socket_no_reply_tcp(#[case] medium: Medium) {
         sack_permitted: false,
         sack_ranges: [None, None, None],
         timestamp: None,
+        urgent: None,
         payload: &PAYLOAD,
     };
     let ipv4_repr = Ipv4Repr {
@@ -1619,6 +1620,7 @@ fn test_oxidenix_tcp_listener_order(#[case] medium: Medium) {
         sack_permitted: false,
         sack_ranges: [None, None, None],
         timestamp: None,
+        urgent: None,
         payload: &[],
     };
     let mut bytes = vec![0u8; syn.buffer_len()];

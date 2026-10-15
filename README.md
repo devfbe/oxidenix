@@ -1093,6 +1093,9 @@ dispatch; drivers, filesystems, the network stack and Linux itself are user-spac
   hash of its 4-tuple), `listen`, `accept`/`accept4`,
   `connect` (`EINPROGRESS`, `EALREADY`, `SO_ERROR`), `send*`/`recv*` with `MSG_PEEK`,
   `MSG_DONTWAIT`, `MSG_WAITALL`, `MSG_TRUNC` and `MSG_NOSIGNAL` (`EPIPE` raises `SIGPIPE`),
+  `MSG_OOB` (TCP's urgent data, as Linux: the byte comes once by `recv(MSG_OOB)`, a read stops
+  at its mark, `SIOCATMARK`, `SO_OOBINLINE`, `POLLPRI`/`EPOLLPRI`, `SIGURG` to the
+  `F_SETOWN` owner),
   `shutdown` (half-close), `SO_RCVTIMEO`/`SO_SNDTIMEO`, `SO_RCVLOWAT`, `TCP_NODELAY` (Nagle's
   algorithm is on by default), `SO_KEEPALIVE`, `IP_TTL`, `SO_LINGER` (a zero time resets; a
   time makes `close` wait until the peer acknowledged everything, the time ran out or a signal
