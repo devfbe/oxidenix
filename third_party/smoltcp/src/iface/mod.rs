@@ -22,6 +22,7 @@ mod packet;
 pub use self::interface::multicast::MulticastError;
 pub use self::interface::{
     Config, Interface, InterfaceInner as Context, IsnGenerator, PollIngressSingleResult, PollResult,
+    ReuseportHash, Shard,
 };
 
 pub use self::route::{Route, RouteTableFull, Routes};

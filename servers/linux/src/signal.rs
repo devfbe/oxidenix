@@ -305,6 +305,11 @@ impl Queue {
     pub fn has_tag(&self, tag: u64) -> bool {
         self.list.iter().any(|&(_, t)| t == tag)
     }
+
+    /// The queued instances' siginfos, in order (`PTRACE_PEEKSIGINFO`).
+    pub fn infos(&self) -> impl Iterator<Item = &SigInfo> {
+        self.list.iter().map(|(i, _)| i)
+    }
 }
 
 /// A group stop: the stop signal (0: none), how many threads have yet to stop, and whether
@@ -426,10 +431,22 @@ fn kills_by_default(sig: u32) -> bool {
 /// SIGCONT and the stop signals act when they are sent (Linux's prepare_signal): SIGCONT
 /// ends a stop at once and drops pending stops; a stop signal drops a pending SIGCONT.
 /// Whether the signal is to be queued at all (an ignored one is dropped unless the thread
-/// it is for blocks it; the instance's init gets only signals it handles).
+/// it is for blocks it or is traced: its tracer sees every signal but SIGKILL; the
+/// instance's init gets only signals it handles).
 fn prepare(t: &mut Table, pid: Pid, thread: Option<Pid>, sig: u32, force: bool) -> bool {
     let Some(p) = t.procs.get(&pid) else { return false };
     if p.zombie.is_some() || p.exiting.is_some() {
+        // A SIGKILL still ends the traced threads of an ending process: one stopped for its
+        // tracer on its way out (PTRACE_EVENT_EXIT) goes on for it (Linux's TASK_TRACED is
+        // killable).
+        if sig == SIGKILL && p.zombie.is_none() {
+            for i in 0..p.threads.len() {
+                let tid = t.procs[&pid].threads[i];
+                if crate::ptrace::traced(t, tid) {
+                    t.kill_thread(tid);
+                }
+            }
+        }
         return false;
     }
     if sig == SIGCONT || is_stop(sig) {
@@ -458,6 +475,19 @@ fn prepare(t: &mut Table, pid: Pid, thread: Option<Pid>, sig: u32, force: bool) 
                 notify_parent_stop(t, pid, Report::Continued);
             }
         }
+        // Seized tracees trap to tell their tracers (Linux's ptrace_trap_notify).
+        if sig == SIGCONT {
+            crate::ptrace::group_notify(t, pid);
+        }
+    }
+    // A tracer sees even an ignored signal (but SIGKILL), init's too.
+    let traced = sig != SIGKILL
+        && match thread {
+            Some(tid) => crate::ptrace::traced(t, tid),
+            None => crate::ptrace::process_traced(t, pid),
+        };
+    if traced {
+        return true;
     }
     let p = &t.procs[&pid];
     let action = t.hands[&p.sig.hand].actions[sig as usize - 1];
@@ -480,6 +510,12 @@ pub fn post_process(t: &mut Table, pid: Pid, info: SigInfo, force: bool) -> bool
 /// Sends `info` to thread `tid` of process `pid`.
 pub fn post_thread(t: &mut Table, pid: Pid, tid: Pid, info: SigInfo) -> bool {
     post(t, pid, Some(tid), info, false, false).is_ok()
+}
+
+/// `post_thread` from the kernel's side (Linux's SEND_SIG_PRIV): the instance's init gets it
+/// too (ptrace's SIGSTOP of an attach, its SIGKILL of `PTRACE_O_EXITKILL`).
+pub fn post_thread_forced(t: &mut Table, pid: Pid, tid: Pid, info: SigInfo) -> bool {
+    post(t, pid, Some(tid), info, true, false).is_ok()
 }
 
 /// What became of a timer's signal (`post_timer`).
@@ -572,7 +608,9 @@ fn complete(t: &mut Table, pid: Pid, thread: Option<Pid>, sig: u32) {
     let Some(tid) = chosen else { return };
     let action = t.hands[&p.sig.hand].actions[sig as usize - 1];
     let waited_for = t.threads.get(&tid).is_some_and(|th| th.sig.waiting_for & bit(sig) != 0);
-    if sig == SIGKILL || (action.handler == SIG_DFL && kills_by_default(sig) && !waited_for) {
+    // (A tracee's fatal signal goes through its signal-delivery-stop first.)
+    let traced = crate::ptrace::traced(t, tid);
+    if sig == SIGKILL || (action.handler == SIG_DFL && kills_by_default(sig) && !waited_for && !traced) {
         // A fatal signal kills every thread now, wherever it waits.
         t.group_exit(pid, sig as i32, None);
         return;
@@ -603,6 +641,11 @@ fn next_proc(t: &Table, from: Pid, select: impl Fn(&Proc) -> bool) -> Option<Pid
 pub fn hup_and_continue(t: &mut Table, pgid: Pid) {
     post_pgrp(t, pgid, SigInfo::kernel(SIGHUP));
     post_pgrp(t, pgid, SigInfo::kernel(SIGCONT));
+}
+
+/// `force` for ptrace's single-step report.
+pub fn force_thread(t: &mut Table, tid: Pid, info: SigInfo) {
+    force(t, tid, info);
 }
 
 /// Raises a fault's signal for the calling thread (Linux's force_sig_info): one it blocks
@@ -711,6 +754,14 @@ pub fn send_pgrp(pgid: Pid, sig: u32) -> bool {
     post_pgrp(&mut t, pgid, SigInfo::kernel(sig))
 }
 
+/// Sends `sig` (SI_KERNEL) to thread `tid` alone (F_SETOWN_EX's
+/// F_OWNER_TID); whether it exists.
+pub fn send_tid(tid: Pid, sig: u32) -> bool {
+    let mut t = PROCS.lock();
+    let Some(pid) = t.threads.get(&tid).map(|th| th.pid) else { return false };
+    post_thread(&mut t, pid, tid, SigInfo::kernel(sig))
+}
+
 /// Sends `sig` from a terminal to process `pid`; whether it exists.
 pub fn send_process(pid: Pid, sig: u32) -> bool {
     let mut t = PROCS.lock();
@@ -763,6 +814,33 @@ fn restart_of(nr: u64, result: i64) -> Option<Restart> {
     }
 }
 
+/// The result of call `nr` as a tracer sees it at its syscall-exit stop: an interruptible
+/// wait's EINTR is the restart code it stands for (`ERESTARTSYS`), as on Linux.
+pub fn shown_result(nr: u64, result: i64) -> i64 {
+    if result == -EINTR && restart_of(nr, result) == Some(Restart::Sys) { -ERESTARTSYS } else { result }
+}
+
+/// The restart code a tracer sees in rax for `how` (Linux keeps it there until delivery).
+fn restart_code(how: Restart) -> i64 {
+    match how {
+        Restart::Sys => ERESTARTSYS,
+        Restart::Always => ERESTARTNOINTR,
+        Restart::NoHand => ERESTARTNOHAND,
+        Restart::Block => ERESTART_RESTARTBLOCK,
+    }
+}
+
+/// How a restart code in rax (as a tracer may leave it) restarts.
+fn restart_from(rax: i64) -> Option<Restart> {
+    match -rax {
+        ERESTARTSYS => Some(Restart::Sys),
+        ERESTARTNOINTR => Some(Restart::Always),
+        ERESTARTNOHAND => Some(Restart::NoHand),
+        ERESTART_RESTARTBLOCK => Some(Restart::Block),
+        _ => None,
+    }
+}
+
 /// Makes the program run its system call `nr` again.
 fn rewind(s: &mut State, nr: u64) {
     s.rax = nr;
@@ -793,6 +871,12 @@ enum Next {
     /// A handler runs: (signal, action, siginfo, the mask its frame restores, the stack
     /// it runs on, the trap of a fault).
     Handle(u32, SigAction, SigInfo, u64, AltStack, (u64, u64, u64)),
+    /// A traced thread's job-control trap (Linux's do_jobctl_trap: its part in a group
+    /// stop, `PTRACE_INTERRUPT`, a notice to a seized tracer): what `wait` reports, and the
+    /// siginfo of a `PTRACE_EVENT_STOP`.
+    Trap(u32, Option<SigInfo>),
+    /// A signal for a traced thread: its tracer sees it first (signal-delivery-stop).
+    Traced(u32, SigInfo),
 }
 
 /// Delivers the calling thread's signals before its program runs again (`s`: its
@@ -807,16 +891,23 @@ pub fn deliver(s: &mut State, call: Option<(u64, i64)>) {
         let mut t = PROCS.lock();
         let Some(th) = t.threads.get_mut(&tid) else { return };
         // rt_sigreturn's "result" is the restored rax of the interrupted context, never a
-        // code of its own: nothing to restart.
-        th.sig.interrupted = if nr == SYS_RT_SIGRETURN { None } else { restart_of(nr, result).map(|how| (nr, how)) };
+        // code of its own: nothing to restart; nor a call its tracer skipped (-1).
+        th.sig.interrupted = if nr == SYS_RT_SIGRETURN || nr as i32 == -1 { None } else { restart_of(nr, result).map(|how| (nr, how)) };
         // What restart_syscall would go on with lasts only until the next call (a handler's
         // rt_sigreturn included, as Linux's).
         if !matches!(th.sig.interrupted, Some((_, Restart::Block))) {
             th.sig.block = None;
         }
     }
+    // A trace record its tracer let go of while the thread ran goes now.
+    crate::ptrace::settle();
+    // What a signal-delivery-stop's signal does, decided after the stop.
+    let mut carried: Option<Next> = None;
     loop {
-        let next = next_action(tid, pid);
+        let next = match carried.take() {
+            Some(next) => next,
+            None => next_action(tid, pid),
+        };
         match next {
             Next::Done => {
                 // An interrupted call no handler took goes on.
@@ -825,7 +916,15 @@ pub fn deliver(s: &mut State, call: Option<(u64, i64)>) {
             }
             // (Its descriptor table goes on this thread: `process::exit`.)
             Next::Exit(status) => process::exit(status, false),
-            Next::Die(sig) => process::die(sig as i32),
+            Next::Die(sig) => process::die_traced(s, sig as i32),
+            Next::Trap(code, info) => {
+                trace_stop(s, crate::ptrace::Stop::Group, code, CLD_STOPPED, info);
+            }
+            Next::Traced(sig, info) => {
+                if let Some((sig, info)) = signal_stop(s, tid, pid, sig, info) {
+                    carried = act(&mut PROCS.lock(), tid, pid, sig, info);
+                }
+            }
             Next::Stop(words, seen) => {
                 // Until SIGCONT or a kill; a kick ends the wait too: the kernel's
                 // restricted_enter then clears it and the thread comes back here (with the
@@ -861,11 +960,66 @@ pub fn deliver(s: &mut State, call: Option<(u64, i64)>) {
                         t.actions_mut(pid)[SIGSEGV as usize - 1] = SigAction::default();
                     }
                     force(&mut t, tid, SigInfo::kernel(SIGSEGV));
+                } else if local::get().flags.load(Ordering::Relaxed) & local::TRACE_STEP != 0 {
+                    // Single-stepped into the handler: its tracer sees it there.
+                    crate::ptrace::stepped_into_handler(s);
                 }
             }
         }
     }
     // (Each pass of the loop above returns or goes on.)
+}
+
+/// A stop for the calling thread's tracer during delivery (`ptrace::stop`): rax and
+/// orig_rax show the call a signal interrupted as Linux's do there (the restart code and
+/// the call; orig_rax -1 outside a call), and what the tracer leaves in them decides the
+/// restart, as Linux decides it from the registers after the stop.
+fn trace_stop(s: &mut State, kind: crate::ptrace::Stop, code: u32, why: i32, info: Option<SigInfo>) -> Option<crate::ptrace::Resumed> {
+    let tid = local::tid();
+    let interrupted = PROCS.lock().threads.get(&tid).and_then(|th| th.sig.interrupted);
+    let saved = s.rax;
+    let (orig, shown) = match interrupted {
+        Some((nr, how)) => (nr, (-restart_code(how)) as u64),
+        None => (u64::MAX, s.rax),
+    };
+    s.rax = shown;
+    let resumed = crate::ptrace::stop(s, orig, kind, code, why, info, 0);
+    match &resumed {
+        None => s.rax = saved,
+        Some(r) => {
+            let now = if r.orig_rax as i64 == -1 { None } else { restart_from(s.rax as i64).map(|how| (r.orig_rax, how)) };
+            if now.is_some() && s.rax == shown && r.orig_rax == orig {
+                // As it was: the call's own result goes on to its restart.
+                s.rax = saved;
+            } else if let Some(th) = PROCS.lock().threads.get_mut(&tid) {
+                th.sig.interrupted = now;
+            }
+        }
+    }
+    resumed
+}
+
+/// A traced thread's signal-delivery-stop for `sig` (Linux's ptrace_signal): the signal its
+/// tracer resumed it with and its siginfo (as `PTRACE_SETSIGINFO` left it, or a new one
+/// from the tracer for another signal), or None if the tracer suppressed it or it was
+/// queued again (blocked now, or the process ends).
+fn signal_stop(s: &mut State, tid: Pid, pid: Pid, sig: u32, info: SigInfo) -> Option<(u32, SigInfo)> {
+    let Some(r) = trace_stop(s, crate::ptrace::Stop::Signal, sig, crate::ptrace::CLD_TRAPPED, Some(info)) else {
+        // No stop (its tracer let go of it): as without one.
+        return Some((sig, info));
+    };
+    if r.sig == 0 {
+        return None;
+    }
+    let info = r.info.unwrap_or(info);
+    let info = if info.signo() == r.sig { info } else { SigInfo::user(r.sig, SI_USER, r.tracer) };
+    let mut t = PROCS.lock();
+    let blocked = t.threads.get(&tid).is_some_and(|th| th.sig.mask & bit(r.sig) != 0);
+    if blocked || t.procs.get(&pid).is_none_or(|p| p.exiting.is_some()) {
+        post(&mut t, pid, Some(tid), info, false, false).ok();
+        return None;
+    }
+    Some((r.sig, info))
 }
 
 /// Decides the thread's next step under the lock (see `Next`).
@@ -877,8 +1031,10 @@ fn next_action(tid: Pid, pid: Pid) -> Next {
         if p.exiting.is_some() || th.exited {
             return Next::Exit(p.exiting.unwrap_or(SIGKILL as i32));
         }
-        // A group stop.
+        // A group stop. A traced thread takes part in it by a trap for its tracer, which
+        // may let it run on (Linux's JOBCTL_TRAP_STOP).
         if th.sig.must_stop {
+            let traced = crate::ptrace::traced(t, tid);
             let p = t.procs.get_mut(&pid).expect("checked");
             p.sig.stop.pending = p.sig.stop.pending.saturating_sub(1);
             let complete = p.sig.stop.pending == 0 && !p.sig.stop.stopped;
@@ -888,11 +1044,24 @@ fn next_action(tid: Pid, pid: Pid) -> Next {
             let sig = p.sig.stop.sig;
             let th = t.threads.get_mut(&tid).expect("checked");
             th.sig.must_stop = false;
-            th.sig.stopped = true;
-            if complete {
+            th.sig.stopped = !traced;
+            // Its real parent hears of the completed stop, unless its tracer is in the
+            // parent's process (which sees the trap instead: Linux's ptrace_reparented).
+            if complete && (!traced || crate::ptrace::reparented(t, tid)) {
                 notify_parent_stop(t, pid, Report::Stopped(sig));
             }
+            if traced {
+                let (code, info) = crate::ptrace::jobctl_trap(t, tid, pid);
+                return Next::Trap(code, info);
+            }
             continue;
+        }
+        // A trap its tracer asked for: PTRACE_INTERRUPT, a notice of a group stop's start
+        // or end to a seized tracer, an attach to a stopped thread.
+        if th.trace.as_deref().is_some_and(|r| r.tracer != 0 && (r.trap_stop || r.trap_notify)) {
+            t.threads.get_mut(&tid).expect("checked").sig.stopped = false;
+            let (code, info) = crate::ptrace::jobctl_trap(t, tid, pid);
+            return Next::Trap(code, info);
         }
         if th.sig.stopped {
             if p.sig.stop.sig != 0 && deliverable(th, p) & bit(SIGKILL) == 0 {
@@ -918,45 +1087,63 @@ fn next_action(tid: Pid, pid: Pid) -> Next {
         }
         let sig = pick(set);
         let Some(info) = take(t, tid, pid, sig) else { continue };
-        let action = t.actions(pid)[sig as usize - 1];
-        if action.handler == SIG_IGN {
-            continue;
+        // A tracee's signal: its tracer sees it first (SIGKILL never).
+        if sig != SIGKILL && crate::ptrace::traced(t, tid) {
+            return Next::Traced(sig, info);
         }
-        if action.handler == SIG_DFL {
-            if ignored_by_default(sig) {
-                continue;
-            }
-            if is_stop(sig) {
-                // A stop of an orphaned process group would never be continued (but
-                // SIGSTOP, which is not the terminal's).
-                let pgid = t.procs[&pid].pgid;
-                if sig != SIGSTOP && t.pgrp_orphaned(pgid, None) {
-                    continue;
-                }
-                start_stop(t, pid, tid, sig);
-                continue;
-            }
-            return Next::Die(sig);
+        if let Some(next) = act(t, tid, pid, sig, info) {
+            return next;
         }
-        // A handler: its mask, and the frame's (the caller's own after a temporary one).
-        // The handler runs with the mask in force (a temporary one, if a call set it)
-        // and the action's; its frame restores the caller's own.
-        let th = t.threads.get_mut(&tid).expect("checked");
-        let old_mask = th.sig.restore.take().unwrap_or(th.sig.mask);
-        local::get().flags.fetch_and(!local::RESTORE_MASK, Ordering::Relaxed);
-        let mut block = action.mask;
-        if action.flags & SA_NODEFER == 0 {
-            block |= bit(sig);
-        }
-        th.sig.mask = (th.sig.mask | block) & !UNBLOCKABLE;
-        // (An SS_AUTODISARM stack is disarmed when a frame goes onto it: `setup_frame`.)
-        let alt = th.sig.alt;
-        let trap = core::mem::take(&mut th.sig.trap);
-        if action.flags & SA_RESETHAND != 0 {
-            t.actions_mut(pid)[sig as usize - 1] = SigAction::default();
-        }
-        return Next::Handle(sig, action, info, old_mask, alt, trap);
     }
+}
+
+/// What dequeued signal `sig` does to thread `tid` of `pid` (lock held): None if nothing
+/// (ignored, or a group stop it started), else the thread's next step.
+fn act(t: &mut Table, tid: Pid, pid: Pid, sig: u32, info: SigInfo) -> Option<Next> {
+    let action = t.actions(pid)[sig as usize - 1];
+    if action.handler == SIG_IGN {
+        return None;
+    }
+    if action.handler == SIG_DFL {
+        if ignored_by_default(sig) {
+            return None;
+        }
+        // Init gets signals it does not handle only through its tracer: they do nothing
+        // to it but SIGKILL and SIGSTOP (Linux's SIGNAL_UNKILLABLE at delivery); a fault
+        // still kills it.
+        if pid == 1 && sig != SIGKILL && sig != SIGSTOP && bit(sig) & SYNCHRONOUS == 0 && crate::ptrace::traced(t, tid) {
+            return None;
+        }
+        if is_stop(sig) {
+            // A stop of an orphaned process group would never be continued (but
+            // SIGSTOP, which is not the terminal's).
+            let pgid = t.procs[&pid].pgid;
+            if sig != SIGSTOP && t.pgrp_orphaned(pgid, None) {
+                return None;
+            }
+            start_stop(t, pid, tid, sig);
+            return None;
+        }
+        return Some(Next::Die(sig));
+    }
+    // A handler: its mask, and the frame's (the caller's own after a temporary one).
+    // The handler runs with the mask in force (a temporary one, if a call set it)
+    // and the action's; its frame restores the caller's own.
+    let th = t.threads.get_mut(&tid)?;
+    let old_mask = th.sig.restore.take().unwrap_or(th.sig.mask);
+    local::get().flags.fetch_and(!local::RESTORE_MASK, Ordering::Relaxed);
+    let mut block = action.mask;
+    if action.flags & SA_NODEFER == 0 {
+        block |= bit(sig);
+    }
+    th.sig.mask = (th.sig.mask | block) & !UNBLOCKABLE;
+    // (An SS_AUTODISARM stack is disarmed when a frame goes onto it: `setup_frame`.)
+    let alt = th.sig.alt;
+    let trap = core::mem::take(&mut th.sig.trap);
+    if action.flags & SA_RESETHAND != 0 {
+        t.actions_mut(pid)[sig as usize - 1] = SigAction::default();
+    }
+    Some(Next::Handle(sig, action, info, old_mask, alt, trap))
 }
 
 /// Takes pending signal `sig` for thread `tid` of `pid` (its own first, then its process's),
@@ -1007,6 +1194,8 @@ fn start_stop(t: &mut Table, pid: Pid, me: Pid, sig: u32) {
         }
     }
     t.procs.get_mut(&pid).expect("listed").sig.stop = Stop { sig, pending: live, stopped: false };
+    // Seized tracees trap to tell their tracers (a listening one wakes for it).
+    crate::ptrace::group_notify(t, pid);
 }
 
 /// The restart of an interrupted call no handler took (Linux's restart codes without a
@@ -1101,10 +1290,10 @@ const FPU_SIZE: u64 = 512;
 const FIX_EFLAGS: u64 = 0x40000 | 0x800 | 0x400 | 0x100 | 0x80 | 0x40 | 0x10 | 0x4 | 0x1 | 0x10000;
 
 #[repr(C, align(64))]
-struct FxArea([u8; 512]);
+pub struct FxArea(pub [u8; 512]);
 
 /// The program's FPU and SSE registers (live in the CPU while the server runs).
-fn fxsave() -> FxArea {
+pub fn fxsave() -> FxArea {
     let mut area = FxArea([0; 512]);
     unsafe { core::arch::asm!("fxsave64 [{}]", in(reg) area.0.as_mut_ptr(), options(nostack)) };
     // Bytes 464.. are free for software; Linux's fxsave frames carry no magic there.
@@ -1114,7 +1303,7 @@ fn fxsave() -> FxArea {
 
 /// The CPU's MXCSR_MASK (the bits MXCSR may have), from an fxsave image of its own: never
 /// the program's word in a frame, which could claim reserved bits.
-fn mxcsr_mask() -> u32 {
+pub fn mxcsr_mask() -> u32 {
     static MASK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
     let known = MASK.load(Ordering::Relaxed);
     if known != 0 {
@@ -1133,7 +1322,7 @@ fn mxcsr_mask() -> u32 {
 
 /// Loads an FPU image (from the program: MXCSR's reserved bits are cleared first, they
 /// would fault).
-fn fxrstor(mut area: FxArea) {
+pub fn fxrstor(mut area: FxArea) {
     let mask = mxcsr_mask();
     let mxcsr = u32::from_le_bytes(area.0[24..28].try_into().expect("4 bytes")) & mask & 0xffff;
     area.0[24..28].copy_from_slice(&mxcsr.to_le_bytes());
@@ -1337,7 +1526,6 @@ const FPE_FLTUND: i32 = 5;
 const FPE_FLTRES: i32 = 6;
 const FPE_FLTINV: i32 = 7;
 const ILL_ILLOPN: i32 = 2;
-const TRAP_TRACE: i32 = 2;
 
 /// The program raised an exception (`REASON_EXCEPTION`): its signal, as Linux's traps
 /// give it, forced on the thread.
@@ -1345,7 +1533,8 @@ pub fn exception(s: &State) {
     let (vector, error, addr, kind) = (s.trap_vector, s.trap_error, s.trap_addr, s.trap_kind);
     let info = match vector {
         0 => SigInfo::fault(SIGFPE, FPE_INTDIV, s.rip),
-        1 => SigInfo::fault(SIGTRAP, TRAP_TRACE, s.rip),
+        // A single step (TF), a hardware breakpoint or int1: what DR6 said.
+        1 => SigInfo::fault(SIGTRAP, crate::ptrace::debug_trap(error), s.rip),
         3 => SigInfo::kernel(SIGTRAP),
         4 | 5 | 13 => SigInfo::kernel(SIGSEGV),
         6 => SigInfo::fault(SIGILL, ILL_ILLOPN, s.rip),
@@ -1370,7 +1559,8 @@ pub fn exception(s: &State) {
     let sig = info.signo();
     let action = t.actions(pid)[sig as usize - 1];
     let blocked = t.threads.get(&tid).is_some_and(|th| th.sig.mask & bit(sig) != 0);
-    if action.handler == SIG_DFL || action.handler == SIG_IGN || blocked {
+    // (A tracee's goes to its tracer first, which may well handle it.)
+    if (action.handler == SIG_DFL || action.handler == SIG_IGN || blocked) && !crate::ptrace::traced(&t, tid) {
         let what = match (vector, sig) {
             (14, SIGBUS) => "bus error",
             (14, _) => "segmentation fault",

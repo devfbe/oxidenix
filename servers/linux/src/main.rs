@@ -51,6 +51,7 @@ mod pidfd;
 mod pipe;
 mod process;
 mod poll;
+mod ptrace;
 mod procfile;
 mod procfs;
 mod pty;
@@ -89,6 +90,7 @@ const PROT_RW: u64 = 3;
 const SYS_IO_URING_SETUP: u64 = 425;
 const SYS_IO_URING_ENTER: u64 = 426;
 const SYS_IO_URING_REGISTER: u64 = 427;
+const SYS_RSEQ: u64 = 334;
 
 /// Whether the kernel runs the self-tests (`SYS_TEST_MODE`), asked once:
 /// 0 not yet known, 1 no, 2 yes.
@@ -181,6 +183,9 @@ pub extern "C" fn _start(state: *mut State, role: u64, cookie: u64, key: u64) ->
 /// runs again.
 fn serve(s: &mut State) -> ! {
     loop {
+        // Lingering closes left by anything but a system call (none
+        // expected: the safety net before the program runs again).
+        inet::run_deferred(true);
         let reason = state_call(s, SYS_RESTRICTED_ENTER, [0; 6]);
         if reason < 0 {
             // The kernel refuses the registers (they never come from the
@@ -189,9 +194,26 @@ fn serve(s: &mut State) -> ! {
         }
         match reason as u64 {
             REASON_SYSCALL => {
-                let nr = s.rax;
-                let result = dispatch(s);
+                let mut nr = s.rax;
+                let traced = local::get().flags.load(Ordering::Relaxed) & (local::TRACE_SYSCALL | local::TRACE_SYSEMU) != 0;
+                // A tracer's syscall-entry stop first: it may change the call or skip it.
+                let result = match traced.then(|| ptrace::syscall_entry(s)) {
+                    Some(ptrace::Entry::Skip(call)) => {
+                        nr = call;
+                        s.rax as i64
+                    }
+                    Some(ptrace::Entry::Run(call)) => {
+                        nr = call;
+                        s.rax = call;
+                        dispatch(s)
+                    }
+                    None => dispatch(s),
+                };
                 s.rax = result as u64;
+                // Lingering closes (SO_LINGER) wait now, with nothing held
+                // (Linux's __fput task work), before the program runs on; a
+                // signal ends the wait and is delivered below.
+                inet::run_deferred(true);
                 // /data inodes the call let go of go now, before it returns
                 // (an unlink's blocks are free when it returns).
                 datafs::reap();
@@ -200,10 +222,15 @@ fn serve(s: &mut State) -> ! {
                 if let Some(status) = local::pending_exit() {
                     process::die(status);
                 }
+                // Its syscall-exit stop (the tracer may change the result), or a single
+                // step's report.
+                let flags = local::get().flags.load(Ordering::Relaxed);
+                let reported = flags & (local::TRACE_SYSCALL | local::TRACE_STEP) != 0 && ptrace::syscall_exit(s, nr);
+                let result = s.rax as i64;
                 // The fast path: the program runs on, unless the call was
                 // interrupted or changed the thread's mask (a kick makes
                 // restricted_enter come back at once).
-                if signal::interrupted(result) || nr == signal::SYS_RT_SIGRETURN || local::get().flags.load(Ordering::Relaxed) & local::RESTORE_MASK != 0 {
+                if reported || signal::interrupted(result) || nr == signal::SYS_RT_SIGRETURN || local::get().flags.load(Ordering::Relaxed) & local::RESTORE_MASK != 0 {
                     signal::deliver(s, Some((nr, result)));
                 }
             }
@@ -224,6 +251,7 @@ fn serve(s: &mut State) -> ! {
 fn dispatch(s: &mut State) -> i64 {
     if let Some(result) = mm::handle(s)
         .or_else(|| process::handle(s))
+        .or_else(|| ptrace::handle(s))
         .or_else(|| signal::handle(s))
         .or_else(|| exec::handle(s))
         .or_else(|| timer::handle(s))
@@ -295,6 +323,12 @@ fn dispatch(s: &mut State) -> i64 {
         TEST_TREE_WAIT => syscall(TEST_TREE_WAIT, [s.rdi, s.rsi, 0, 0, 0, 0]),
         TEST_TREE_KILL => syscall(TEST_TREE_KILL, [s.rdi, 0, 0, 0, 0, 0]),
         TEST_HEAP_STATS => test(s.rax, s.rdi),
+        TEST_BARRIERS if test_mode() => syscall(TEST_BARRIERS, [s.rdi, 0, 0, 0, 0, 0]),
+        // netd's lease goes and comes back (netlink's notifications).
+        TEST_NET_RENEW if test_mode() => match netclient::net().and_then(|n| n.status(netring::Request::Renew)) {
+            Ok(_) => 0,
+            Err(e) => -e,
+        },
         // The kernel's to answer, for the thread's key.
         TEST_PI_WEIGHT if test_mode() => match process::key_of(s.rdi as u32) {
             Some(key) => syscall(TEST_PI_WEIGHT, [key, 0, 0, 0, 0, 0]),
@@ -305,6 +339,10 @@ fn dispatch(s: &mut State) -> i64 {
         // instead. Answered here, so the kernel does not log them as
         // unknown calls.
         SYS_IO_URING_SETUP | SYS_IO_URING_ENTER | SYS_IO_URING_REGISTER => -ENOSYS,
+        // Not offered either, as by a Linux built without CONFIG_RSEQ (ADR 0021): glibc
+        // registers each thread's rseq area at its start and goes on without one on ENOSYS
+        // (__rseq_size 0; sched_getcpu asks the vDSO's getcpu).
+        SYS_RSEQ => -ENOSYS,
         nr if nr >= FIRST_NON_LINUX => -ENOSYS,
         // Nothing passes through (R9): a Linux call the server does not
         // implement is ENOSYS, said on the console (scripted runs read

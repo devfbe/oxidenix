@@ -4,8 +4,9 @@
 //! both so that its encodings and memory ordering are tested on the host.
 //!
 //! **The channel** has `SLOTS` slots per ring and a shared area of
-//! `SHARED_PAGES` pages (`SharedArea`): a header page with two bitmaps and
-//! the net thread's doorbell, then a control block (`Ctl`, 128 bytes) per
+//! `SHARED_PAGES` pages (`SharedArea`): a header page with two bitmaps,
+//! the net thread's doorbell and the count of netd's configuration changes
+//! (`links_seq`: the instance's netlink notifications), then a control block (`Ctl`, 128 bytes) per
 //! socket, at most `MAX_SOCKETS`. The client names a socket by the index
 //! of its control block. The shared area stays mapped in netd whatever the
 //! client does, so netd may use atomics there; granted memory it touches
@@ -28,6 +29,12 @@
 //!   the end as bytes do). netd puts in only whole records.
 //! - A stream's send ring holds bytes; a datagram is sent by `SEND` from the
 //!   start of the send ring (which is a plain buffer for a datagram socket).
+//! - Urgent data (TCP's urgent pointer, MSG_OOB) is marked by ring
+//!   positions, each packed with a count in one word: the client's
+//!   `tx_urg` (`UrgentMark`: after the urgent byte it wrote), netd's `urg`
+//!   (`Urgent`: of the urgent byte received, which stays in the stream,
+//!   and the byte itself). Each is stored before the position that
+//!   publishes the bytes, so whoever sees the bytes sees their mark.
 //!
 //! **Waking.** Each control block has an event counter `seq` that both
 //! sides advance after a change, and a count of the client's threads that
@@ -50,8 +57,8 @@
 //! | op | request | completion |
 //! |----|---------|------------|
 //! | `SOCKET` | `object` socket, `arg[0]` kind, the area (datagram sockets: required; TCP: none) | 0 |
-//! | `BIND` | socket, `offset` endpoint (address 0: any; port 0: an ephemeral one), `arg[0]` `BIND_REUSEADDR` | v0 = the port |
-//! | `LISTEN` | socket, `arg[0]` backlog, `arg[1]` `BIND_REUSEADDR` (as at listen) | 0 |
+//! | `BIND` | socket, `offset` endpoint (address 0: any; port 0: an ephemeral one), `arg[0]` `BIND_REUSEADDR`, `BIND_REUSEPORT` | v0 = the port |
+//! | `LISTEN` | socket, `arg[0]` backlog, `arg[1]` `BIND_REUSEADDR`, `BIND_REUSEPORT` (as at listen) | 0 |
 //! | `CONNECT` | socket, endpoint; TCP: the area (unless it has one) | 0 once started (TCP: the outcome comes in the control block); a datagram socket's peer is set (endpoint 0: none) |
 //! | `ACCEPT` | listener, `arg[0]` the new socket, its area | v0 = peer address, v1 = peer port; `EAGAIN` |
 //! | `SEND` | socket, endpoint (0: the peer), `len` bytes at the start of the send ring | bytes; `EAGAIN` if smoltcp's buffer is full |
@@ -61,6 +68,7 @@
 //! | `SETOPT` | socket, `arg[0]` option (`opt`; another is `ENOPROTOOPT`), `arg[1]` value (in its range: `opt::valid`, else `EINVAL`) | 0 |
 //! | `LINKS` | a buffer | bytes of `Link` records |
 //! | `FORGET` | `grant` | 0 once netd let go of the grant |
+//! | `RENEW` | none | 0: netd drops its DHCP lease and asks for one again a second later (test mode only, else `EPERM`) |
 //!
 //! Every field an operation does not use must be 0 (`EINVAL`), an unknown
 //! operation is `ENOSYS`. An endpoint is an IPv4 address and a port in host
@@ -105,6 +113,7 @@ pub mod op {
     pub const SETOPT: u16 = 10;
     pub const LINKS: u16 = 11;
     pub const FORGET: u16 = 12;
+    pub const RENEW: u16 = 13;
 }
 
 /// The errors the protocol itself gives (the others are the stack's).
@@ -118,6 +127,7 @@ pub mod errno {
     pub const ENOSPC: i64 = 28;
     pub const EPIPE: i64 = 32;
     pub const ENOSYS: i64 = 38;
+    pub const EPERM: i64 = 1;
     pub const EDESTADDRREQ: i64 = 89;
     pub const EMSGSIZE: i64 = 90;
     pub const ENOPROTOOPT: i64 = 92;
@@ -162,8 +172,14 @@ impl Kind {
     }
 }
 
-/// `BIND`'s flags.
+/// `BIND`'s and `LISTEN`'s flags: SO_REUSEADDR, SO_REUSEPORT.
 pub const BIND_REUSEADDR: u64 = 1;
+pub const BIND_REUSEPORT: u64 = 2;
+
+/// The flags of `reuse` and `reuseport`.
+fn reuse_flags(reuse: bool, reuseport: bool) -> u64 {
+    (if reuse { BIND_REUSEADDR } else { 0 }) | if reuseport { BIND_REUSEPORT } else { 0 }
+}
 /// `SHUTDOWN`'s bits.
 pub const SHUT_RD: u64 = 1;
 pub const SHUT_WR: u64 = 2;
@@ -210,6 +226,10 @@ pub mod state {
     pub const CLOSED: u32 = 32;
     /// A datagram of the largest size fits smoltcp's send buffer now.
     pub const WRITABLE: u32 = 64;
+    /// Its FIN went and the peer acknowledged it, and with it everything
+    /// sent before (TCP: no longer FIN-WAIT-1, CLOSING or LAST-ACK after
+    /// the FIN): what a lingering close waits for (SO_LINGER).
+    pub const FIN_ACKED: u32 = 128;
 }
 
 /// A word on a cache line of its own.
@@ -263,6 +283,9 @@ pub struct ArenaHeader {
     pub client_dirty: Bitmap,
     /// Sockets the client changed, for netd.
     pub service_dirty: Bitmap,
+    /// Advanced by netd whenever its configuration (`LINKS`) changed; it
+    /// pokes the net thread then (`ArenaHeader::poke_client`).
+    pub links_seq: Line,
 }
 
 impl ArenaHeader {
@@ -348,6 +371,53 @@ pub struct NetdLine {
     /// 1: netd holds received data the receive ring had no room for (the
     /// client rings after it made room).
     pub rx_wait: AtomicU32,
+    /// Urgent data the peer announced last (TCP, MSG_OOB), an `Urgent`
+    /// packed in one word (read and written whole: never torn). Published
+    /// before `rx_tail`: the client that sees a byte in the ring sees its
+    /// mark.
+    pub urg: AtomicU64,
+}
+
+/// Urgent data the peer announced (`NetdLine::urg`): how many urgent
+/// pointers so far (modulo 2^16: a new one is news, SIGURG), the receive
+/// ring's position of the urgent byte (which may not have come yet; it
+/// stays in the stream), and the byte once it came.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Urgent {
+    pub count: u16,
+    pub pos: u32,
+    pub byte: Option<u8>,
+}
+
+impl Urgent {
+    pub fn pack(&self) -> u64 {
+        let byte = self.byte.map_or(0, |b| 0x100 | b as u64);
+        self.pos as u64 | (self.count as u64) << 32 | byte << 48
+    }
+
+    pub fn unpack(v: u64) -> Urgent {
+        let byte = (v >> 48) as u16;
+        Urgent { count: (v >> 32) as u16, pos: v as u32, byte: (byte & 0x100 != 0).then_some(byte as u8) }
+    }
+}
+
+/// Urgent data sent (`ClientLine::tx_urg`): the send ring's position after
+/// the urgent byte, and how many marks the client made (modulo 2^32: a new
+/// one is news).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UrgentMark {
+    pub count: u32,
+    pub end: u32,
+}
+
+impl UrgentMark {
+    pub fn pack(&self) -> u64 {
+        self.end as u64 | (self.count as u64) << 32
+    }
+
+    pub fn unpack(v: u64) -> UrgentMark {
+        UrgentMark { count: (v >> 32) as u32, end: v as u32 }
+    }
 }
 
 /// The client's half.
@@ -359,6 +429,11 @@ pub struct ClientLine {
     pub tx_tail: AtomicU32,
     /// The client's threads waiting on `seq`.
     pub waiters: AtomicU32,
+    /// Urgent data sent (send(2) with MSG_OOB), an `UrgentMark` packed in
+    /// one word: netd marks smoltcp's urgent pointer when it took the bytes
+    /// up to its end. Stored before `tx_tail`: netd that sees the bytes
+    /// sees the mark.
+    pub tx_urg: AtomicU64,
 }
 
 /// A socket's control block.
@@ -399,6 +474,7 @@ impl Ctl {
         for w in [&n.rx_tail, &n.tx_head, &n.error, &n.err_seq, &n.backlog, &n.rx_wait] {
             w.store(0, SeqCst);
         }
+        n.urg.store(0, SeqCst);
         n.state.store(state, SeqCst);
     }
 
@@ -406,6 +482,7 @@ impl Ctl {
     pub fn reset_client(&self) {
         self.client.rx_head.store(0, SeqCst);
         self.client.tx_tail.store(0, SeqCst);
+        self.client.tx_urg.store(0, SeqCst);
     }
 }
 
@@ -518,9 +595,11 @@ impl Endpoint {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Request {
     Socket { sock: u32, kind: Kind, area: Option<Area> },
-    Bind { sock: u32, at: Endpoint, reuse: bool },
-    /// `reuse`: SO_REUSEADDR as it is at listen (Linux reads it then).
-    Listen { sock: u32, backlog: u32, reuse: bool },
+    /// `reuse`: SO_REUSEADDR, `reuseport`: SO_REUSEPORT.
+    Bind { sock: u32, at: Endpoint, reuse: bool, reuseport: bool },
+    /// `reuse`, `reuseport`: the options as they are at listen (Linux
+    /// reads them then).
+    Listen { sock: u32, backlog: u32, reuse: bool, reuseport: bool },
     Connect { sock: u32, to: Endpoint, area: Option<Area> },
     Accept { sock: u32, new: u32, area: Area },
     Send { sock: u32, to: Endpoint, len: u32 },
@@ -530,6 +609,7 @@ pub enum Request {
     SetOpt { sock: u32, opt: u32, value: u64 },
     Links { buf: Buf },
     Forget { grant: u32 },
+    Renew,
 }
 
 fn sock(object: u64) -> Result<u32, i64> {
@@ -573,18 +653,20 @@ impl Request {
                 (Request::Socket { sock: sock(d.object)?, kind, area }, Used { buf: true, args: 1, ..with_sock })
             }
             op::BIND => {
-                if d.arg[0] & !BIND_REUSEADDR != 0 {
+                if d.arg[0] & !(BIND_REUSEADDR | BIND_REUSEPORT) != 0 {
                     return Err(EINVAL);
                 }
-                let r = Request::Bind { sock: sock(d.object)?, at: Endpoint::unpack(d.offset)?, reuse: d.arg[0] != 0 };
+                let (reuse, reuseport) = (d.arg[0] & BIND_REUSEADDR != 0, d.arg[0] & BIND_REUSEPORT != 0);
+                let r = Request::Bind { sock: sock(d.object)?, at: Endpoint::unpack(d.offset)?, reuse, reuseport };
                 (r, Used { offset: true, args: 1, ..with_sock })
             }
             op::LISTEN => {
                 let backlog = u32::try_from(d.arg[0]).map_err(|_| EINVAL)?;
-                if d.arg[1] & !BIND_REUSEADDR != 0 {
+                if d.arg[1] & !(BIND_REUSEADDR | BIND_REUSEPORT) != 0 {
                     return Err(EINVAL);
                 }
-                (Request::Listen { sock: sock(d.object)?, backlog, reuse: d.arg[1] != 0 }, Used { args: 2, ..with_sock })
+                let (reuse, reuseport) = (d.arg[1] & BIND_REUSEADDR != 0, d.arg[1] & BIND_REUSEPORT != 0);
+                (Request::Listen { sock: sock(d.object)?, backlog, reuse, reuseport }, Used { args: 2, ..with_sock })
             }
             op::CONNECT => {
                 let r = Request::Connect { sock: sock(d.object)?, to: Endpoint::unpack(d.offset)?, area: Area::from_desc(d)? };
@@ -650,6 +732,7 @@ impl Request {
                 }
                 (Request::Forget { grant: d.grant }, Used { grant: true, ..NONE })
             }
+            op::RENEW => (Request::Renew, NONE),
             _ => return Err(ENOSYS),
         };
         let unused = d.flags != 0
@@ -674,14 +757,14 @@ impl Request {
                 d.arg[0] = kind as u64;
                 Area::to_desc(area, &mut d);
             }
-            Request::Bind { sock, at, reuse } => {
+            Request::Bind { sock, at, reuse, reuseport } => {
                 d.object = sock as u64;
                 d.offset = at.pack();
-                d.arg[0] = if reuse { BIND_REUSEADDR } else { 0 };
+                d.arg[0] = reuse_flags(reuse, reuseport);
             }
-            Request::Listen { sock, backlog, reuse } => {
+            Request::Listen { sock, backlog, reuse, reuseport } => {
                 d.object = sock as u64;
-                d.arg = [backlog as u64, if reuse { BIND_REUSEADDR } else { 0 }, 0];
+                d.arg = [backlog as u64, reuse_flags(reuse, reuseport), 0];
             }
             Request::Connect { sock, to, area } => {
                 d.object = sock as u64;
@@ -720,6 +803,7 @@ impl Request {
                 d.len = buf.len;
             }
             Request::Forget { grant } => d.grant = grant,
+            Request::Renew => {}
         }
         d
     }
@@ -738,6 +822,7 @@ impl Request {
             Request::SetOpt { .. } => op::SETOPT,
             Request::Links { .. } => op::LINKS,
             Request::Forget { .. } => op::FORGET,
+            Request::Renew => op::RENEW,
         }
     }
 }
@@ -880,7 +965,9 @@ pub struct PortHolder {
     pub port: u16,
     /// Its address (None: any).
     pub addr: Option<u32>,
+    /// SO_REUSEADDR, SO_REUSEPORT.
     pub reuse: bool,
+    pub reuseport: bool,
     pub listening: bool,
     /// A connection (connected or accepted): matched by both endpoints,
     /// it never receives what is meant for a new socket.
@@ -896,6 +983,7 @@ pub struct PortClaim {
     pub port: u16,
     pub addr: Option<u32>,
     pub reuse: bool,
+    pub reuseport: bool,
 }
 
 fn overlaps(a: Option<u32>, b: Option<u32>) -> bool {
@@ -904,8 +992,10 @@ fn overlaps(a: Option<u32>, b: Option<u32>) -> bool {
 
 /// Whether a TCP claim conflicts with a holder (EADDRINUSE). Linux's rule
 /// (inet_csk_bind_conflict): a socket on an overlapping address conflicts
-/// unless both allow reuse (SO_REUSEADDR) and it does not listen; netd
-/// checks it at bind and again at listen. Across instances it is stricter:
+/// unless both allow reuse (SO_REUSEADDR) and it does not listen, or both
+/// set SO_REUSEPORT (and belong to the same user: here everyone is root,
+/// so the same instance); netd checks it at bind and again at listen.
+/// Across instances it is stricter:
 /// a port another instance holds in any way (bound, listening, a
 /// connection, closing or in TIME-WAIT) is never shared, so one instance
 /// can neither take over a port another one serves nor learn, by a
@@ -914,15 +1004,17 @@ pub fn tcp_port_conflict(claim: &PortClaim, other: &PortHolder) -> bool {
     if claim.port != other.port || !overlaps(claim.addr, other.addr) {
         return false;
     }
-    claim.owner != other.owner || !(claim.reuse && other.reuse && !other.listening)
+    claim.owner != other.owner || !((claim.reuse && other.reuse && !other.listening) || (claim.reuseport && other.reuseport))
 }
 
 /// Whether a UDP claim conflicts with a holder: a socket on an overlapping
-/// address conflicts unless both allow reuse and both are the same
+/// address conflicts unless both allow reuse (both SO_REUSEADDR or both
+/// SO_REUSEPORT, Linux's udp_lib_lport_inuse) and both are the same
 /// instance's (a datagram goes to one of them: never to another
 /// instance's).
 pub fn udp_port_conflict(claim: &PortClaim, other: &PortHolder) -> bool {
-    claim.port == other.port && overlaps(claim.addr, other.addr) && !(claim.reuse && other.reuse && claim.owner == other.owner)
+    let shared = (claim.reuse && other.reuse) || (claim.reuseport && other.reuseport);
+    claim.port == other.port && overlaps(claim.addr, other.addr) && !(shared && claim.owner == other.owner)
 }
 
 /// The pieces of the ring range [`pos`, `pos + len`) in a ring of `size`
@@ -1234,11 +1326,13 @@ pub struct Link {
     pub prefix: u8,
     /// Its IPv4 address in host order, 0 for none (no DHCP lease yet).
     pub address: u32,
+    /// The default route's gateway through it, 0 for none.
+    pub gateway: u32,
 }
 
 impl Link {
     /// The size of one encoded record.
-    pub const SIZE: usize = 24;
+    pub const SIZE: usize = 28;
 
     pub fn encode(&self) -> [u8; Self::SIZE] {
         let mut r = [0u8; Self::SIZE];
@@ -1249,6 +1343,7 @@ impl Link {
         r[12..18].copy_from_slice(&self.mac);
         r[18] = self.prefix;
         r[20..24].copy_from_slice(&self.address.to_le_bytes());
+        r[24..28].copy_from_slice(&self.gateway.to_le_bytes());
         r
     }
 
@@ -1263,6 +1358,7 @@ impl Link {
             mac: r[12..18].try_into().expect("6 bytes"),
             prefix: r[18],
             address: u32::from_le_bytes(r[20..24].try_into().expect("4 bytes")),
+            gateway: u32::from_le_bytes(r[24..28].try_into().expect("4 bytes")),
         })
     }
 }

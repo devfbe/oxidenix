@@ -116,7 +116,9 @@ An AI research project; see README.md.
     + `crates/ldisc` + `crates/kbd` (terminals: ptys, the console's VT and Linux keyboard,
     /dev/ttyS*; ADR 0007, 0020), `inotify.rs`, `timer.rs`/`timerfd.rs` (interval
     and POSIX timers, timerfds; timers on CPU clocks over the kernel's CPU-time alarms,
-    `kernel/src/process/cputimer.rs`), `pidfd.rs`, `vdso.rs` (maps the vDSO, whose source is
+    `kernel/src/process/cputimer.rs`), `pidfd.rs`, `ptrace.rs` (ptrace, `process_vm_readv`,
+    `/proc/<pid>/mem` over the kernel's `vm_access`; hardware breakpoints
+    `kernel/src/process/debugreg.rs`: ADR 0019), `vdso.rs` (maps the vDSO, whose source is
     `servers/linux/vdso/`, built by `servers/linux/build.rs`, reading the kernel's clock page
     `crates/clockpage`: ADR 0014).
   - Node.js: `userspace/node` (build, smoke tests `tests/*.test.mjs`, runner `run-node.sh`).
@@ -126,7 +128,9 @@ An AI research project; see README.md.
     `servers/netd` + `crates/netring`, `servers/procfs` + `crates/procproto` (+ `crates/fsring`,
     the same file protocol, read-only); I/O rings `crates/ring`, `docs/design/io-rings.md`.
   - Tests: C programs in `userspace/*.c` (built by `userspace/build.sh`), run by the list in
-    `userspace/rootfs/etc/runtests.sh`; benchmarks `userspace/iobench.c`, `scripts/bench.sh`,
+    `userspace/rootfs/etc/runtests.sh`; dynamically linked ones (glibc, musl's loader, C++) in
+    `userspace/dynamic/` (built by its `default.nix`; the builder puts the store files they
+    need on the data disk, `/nix` links to `/data/nix`: ADR 0021); benchmarks `userspace/iobench.c`, `scripts/bench.sh`,
     `docs/benchmarks/README.md`. Decisions: `docs/decisions/`.
 
 ## Engineering standard

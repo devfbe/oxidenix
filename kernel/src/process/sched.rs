@@ -322,6 +322,14 @@ pub fn set_initial(task: Arc<Task>, idle: Arc<Task>) {
 
 // ---------------------------------------------------------------- queues
 
+/// Whether `cpu` is in its idle loop, halted or about to halt (it runs no
+/// task; leaving the loop goes through `schedule`): membarrier's quiescent
+/// state (`membarrier::global`). A CPU claimed for new work meanwhile says
+/// no until its next tick.
+pub fn halted(cpu: &Cpu) -> bool {
+    cpu.sched.halted.load(Ordering::SeqCst)
+}
+
 /// Claims a halted CPU for new work: the first enqueuer to clear its flag
 /// wakes it, the next one picks another idle CPU instead of piling on.
 fn claim(cpu: &Cpu) -> bool {
@@ -975,6 +983,12 @@ fn context_switch(next: Arc<Task>) {
         let restored = next.cpu_state();
         FsBase::write(VirtAddr::new(restored.fs_base));
         fxrstor(&restored.fpu);
+        // Hardware breakpoints are armed only for a Linux program that runs (`debugreg`):
+        // the next task's, if it was interrupted in its program.
+        super::debugreg::disarm();
+        if let Some(l) = n.linux.as_ref().filter(|l| l.restricted && l.debug.armed()) {
+            l.debug.load();
+        }
     }
     let prev_rsp = prev.kernel_rsp.get();
     let next_rsp = unsafe { *next.kernel_rsp.get() };

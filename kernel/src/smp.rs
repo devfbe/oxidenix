@@ -4,7 +4,7 @@
 
 use crate::interrupts::gdt::CpuTables;
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use x86_64::registers::model_specific::{GsBase, KernelGsBase};
 use x86_64::VirtAddr;
 
@@ -35,6 +35,8 @@ pub struct Cpu {
     pub counters: crate::counters::PerCpu,
     /// Address spaces tagged in this CPU's TLB (see `tlb`).
     pub asids: crate::process::tlb::AsidCache,
+    /// DR7 holds a Linux program thread's hardware breakpoints (`process::debugreg`).
+    pub dr7_live: AtomicBool,
 }
 
 /// Offsets for the assembly entry code.
@@ -59,6 +61,7 @@ impl Cpu {
             timers: crate::sync::IrqSpinLock::new(crate::timer::Queue::new()),
             counters: crate::counters::PerCpu::new(),
             asids: crate::process::tlb::AsidCache::new(),
+            dr7_live: AtomicBool::new(false),
         }
     }
 

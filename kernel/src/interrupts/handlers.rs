@@ -16,6 +16,8 @@ pub extern "sysv64" fn trap(frame: &mut Frame) {
         0..=31 => exception(frame),
         apic::TIMER_VECTOR => {
             apic::eoi();
+            // A quiescent state for membarrier's global barriers.
+            crate::process::membarrier::tick();
             // The kernel is not preemptive: the switch waits for the
             // return to user space (below, or that of the running syscall).
             // User time is a program's (a Linux program's server counts as the kernel
@@ -105,6 +107,9 @@ fn exception(frame: &mut Frame) {
     let vector = frame.vector as u8;
     // Read now: resolving the fault may sleep, and CR2 changes meanwhile.
     let fault_addr = if vector == 14 { Cr2::read_raw() } else { 0 };
+    // A debug exception from ring 3 (ring 0's is `debug_kernel`): what DR6 says of it
+    // (reset for the next one).
+    let dr6 = if vector == 1 { crate::process::debugreg::take_dr6() } else { 0 };
     // A fault of the Linux server on the program's memory (it reads and
     // writes that directly): resolved as the program's own fault would be,
     // else its copy routine reports EFAULT.
@@ -217,7 +222,9 @@ fn exception(frame: &mut Frame) {
     }
     // A Linux program's exception is its server's to turn into a signal.
     if frame.from_user() && vector != 18 && crate::process::linux::mode() == Some(true) {
-        crate::process::linux::trap_exception(frame, vector as u64, frame.error, fault_addr, kind);
+        // A debug exception has no error code: the server learns what DR6 said.
+        let error = if vector == 1 { crate::process::linux::debug_trap(frame, dr6) } else { frame.error };
+        crate::process::linux::trap_exception(frame, vector as u64, error, fault_addr, kind);
         return;
     }
     // A native server's: it dies of it (it has no signal handlers).
@@ -239,6 +246,23 @@ fn exception(frame: &mut Frame) {
         frame.rsp,
         cr2
     );
+}
+
+/// A debug exception in ring 0 (`entry::debug_entry`, on its own stack, GS the kernel's):
+/// the kernel uses neither breakpoints nor single steps, so it is a program's: a data
+/// breakpoint or a single step that `mov ss`/`pop ss` held off over the first instruction
+/// of a kernel entry (CVE-2018-8897), or a data breakpoint on program memory the kernel
+/// touched while the program's breakpoints were armed (between its return to the program
+/// and its next entry, where it touches no program memory: only in such a case). It is
+/// acknowledged and goes nowhere (as Linux's exc_debug_kernel for a user breakpoint, no
+/// signal): DR6 cleared, TF taken off the interrupted kernel code's flags, and the
+/// program's breakpoints disarmed for the rest of the kernel's work (armed again when it
+/// returns to its program through `restricted_enter` or a switch to it: `debugreg`). Never
+/// sleeps (it runs on the CPU's #DB stack).
+pub extern "sysv64" fn debug_kernel(frame: &mut Frame) {
+    crate::process::debugreg::take_dr6();
+    crate::process::debugreg::disarm();
+    frame.rflags &= !0x100;
 }
 
 pub extern "x86-interrupt" fn double_fault_handler(stack_frame: InterruptStackFrame, _error_code: u64) -> ! {

@@ -1,7 +1,8 @@
 /* execve maps programs from the page cache: processes running the same
  * program share its pages, a program file cannot be written while it runs
- * (ETXTBSY) nor run while it is open for writing, and changing a program
- * file between runs takes effect. */
+ * (ETXTBSY) nor run while it is open for writing, changing a program file
+ * between runs takes effect, and a vfork child's execve leaves its parent's
+ * program break alone. */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
@@ -121,6 +122,25 @@ int main(int argc, char **argv, char **envp) {
     check("copying busybox to /tmp", copy_file(busybox, "/tmp/bb") == 0);
     char *t[] = {"true", NULL};
     check("a program in /tmp runs", run("/tmp/bb", t) == 0);
+
+    /* A vfork child's execve gives it an address space of its own, with a program break of
+     * its own: the parent's break stays where it was and goes on growing from there. */
+    {
+        long b0 = syscall(SYS_brk, 0);
+        int grew = syscall(SYS_brk, b0 + 8192) == b0 + 8192;
+        pid_t v = vfork();
+        if (v == 0) {
+            execl(busybox, "true", (char *)NULL);
+            _exit(127);
+        }
+        int vst = -1;
+        waitpid(v, &vst, 0);
+        long b1 = syscall(SYS_brk, 0);
+        int more = syscall(SYS_brk, b1 + 4096) == b1 + 4096;
+        if (more) ((volatile char *)b1)[4095] = 1;
+        check("a vfork child's execve leaves the parent's break", grew && WIFEXITED(vst) && WEXITSTATUS(vst) == 0 && b1 == b0 + 8192 && more);
+        syscall(SYS_brk, b0);
+    }
 
     pid_t sleeper = fork();
     if (sleeper == 0) {

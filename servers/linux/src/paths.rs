@@ -9,7 +9,8 @@
 //! a descriptor's or the working directory's path is the one it was
 //! opened by (normalized, symlinks not replaced). New: umask(2) is real,
 //! and so are the files' times (utimensat and the calls that change them),
-//! statx, and the inotify events of what the calls do.
+//! statx, and the inotify events of what the calls do. The extended attribute
+//! calls answer as on a filesystem without extended attributes (`xattr`).
 
 use crate::datafile;
 use crate::datafs;
@@ -86,6 +87,11 @@ const SYS_UTIMENSAT: u64 = 280;
 const SYS_RENAMEAT2: u64 = 316;
 const SYS_STATX: u64 = 332;
 const SYS_FACCESSAT2: u64 = 439;
+/// The extended attribute calls, 188 to 199: setxattr, getxattr, listxattr and removexattr
+/// (in this order), each as the call on a path, the `l` call (a final symlink not
+/// followed) and the `f` call (on a descriptor).
+const SYS_SETXATTR: u64 = 188;
+const SYS_FREMOVEXATTR: u64 = 199;
 
 const CWD: u64 = AT_FDCWD as i64 as u64;
 
@@ -144,6 +150,8 @@ pub fn handle(s: &State) -> Option<i64> {
         SYS_UTIMES => utimes(CWD, a0, a1),
         SYS_FUTIMESAT => utimes(a0, a1, a2),
         SYS_UTIMENSAT => utimensat(a0, a1, a2, a3),
+        // (setxattr's value is never read: there is nowhere to keep it.)
+        SYS_SETXATTR..=SYS_FREMOVEXATTR => xattr(s.rax, a0, a1, a3, s.r8),
         _ => return None,
     };
     Some(result.unwrap_or_else(|e| -e))
@@ -958,5 +966,74 @@ pub fn statfs_node(node: &Node, buf: u64) -> Result<i64, i64> {
             Ok(0)
         }
     }
+}
+
+/// The extended attribute calls (getxattr(2), setxattr(2), listxattr(2), removexattr(2),
+/// each on a path, on a path without following a final symlink, and on a descriptor). No
+/// filesystem here keeps extended attributes (tmpfs, /data's ext2 without the xattr
+/// feature, /proc), so the answers are Linux's for a filesystem without xattr handlers: a
+/// list is empty (0), getting, setting and removing one is EOPNOTSUPP, after the checks
+/// Linux makes first: the arguments (a name of 1 to 255 bytes, ERANGE; setxattr's flags,
+/// EINVAL; a value beyond 64 KiB, E2BIG), the target (ENOENT and the like; EBADF for no
+/// descriptor or an O_PATH one) and, for a change, a read-only /data (EROFS). A pipe, a
+/// socket or another file without a path has no attributes either.
+fn xattr(nr: u64, target: u64, name: u64, size: u64, flags: u64) -> Result<i64, i64> {
+    const EBADF: i64 = 9;
+    const E2BIG: i64 = 7;
+    const XATTR_CREATE: u64 = 1;
+    const XATTR_REPLACE: u64 = 2;
+    const XATTR_SIZE_MAX: u64 = 65536;
+    // (The operation and the kind of target, by Linux's numbering: `SYS_SETXATTR`.)
+    let (op, kind) = ((nr - SYS_SETXATTR) / 3, (nr - SYS_SETXATTR) % 3);
+    let (set, list, remove) = (op == 0, op == 2, op == 3);
+    // The arguments (Linux's setxattr_copy and import_xattr_name), before the target.
+    if set {
+        // (`flags` is an int.)
+        if (flags as u32 as u64) & !(XATTR_CREATE | XATTR_REPLACE) != 0 {
+            return Err(EINVAL);
+        }
+        if size > XATTR_SIZE_MAX {
+            return Err(E2BIG);
+        }
+    }
+    if !list {
+        xattr_name(name)?;
+    }
+    let node = match kind {
+        2 => match fd_node_of(target) {
+            Ok((_, _, true)) => return Err(EBADF),
+            Ok((node, _, _)) => Some(node),
+            // A file without a path (a pipe, a socket).
+            Err(ENOTDIR) => None,
+            Err(e) => return Err(e),
+        },
+        // (The `l` calls do not follow a final symlink.)
+        _ => Some(at(CWD, target, kind == 0)?.node),
+    };
+    // (Linux's mnt_want_write.)
+    if set || remove {
+        if let Some(Node::Data(_)) = node {
+            datafs::writable()?;
+        }
+    }
+    if list { Ok(0) } else { Err(EOPNOTSUPP) }
+}
+
+/// Checks an extended attribute's name at `addr`: 1 to 255 bytes (XATTR_NAME_MAX), else
+/// ERANGE (EFAULT if it cannot be read).
+fn xattr_name(addr: u64) -> Result<(), i64> {
+    const XATTR_NAME_MAX: usize = 255;
+    let mut buf = [0u8; XATTR_NAME_MAX + 1];
+    let mut len = 0;
+    while len < buf.len() {
+        let at = addr.checked_add(len as u64).ok_or(EFAULT)?;
+        let n = (buf.len() - len).min(4096 - (at % 4096) as usize);
+        usercopy::from_program(at, &mut buf[len..len + n])?;
+        if let Some(end) = buf[len..len + n].iter().position(|&b| b == 0) {
+            return if len + end == 0 { Err(ERANGE) } else { Ok(()) };
+        }
+        len += n;
+    }
+    Err(ERANGE)
 }
 

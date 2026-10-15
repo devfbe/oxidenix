@@ -11,7 +11,8 @@
 //!   procfs that restarted serves them as before (a new channel is made
 //!   when the old one died).
 //! - **The server** makes each process's own part: `/proc/<pid>` (its
-//!   files, `task/<tid>`, `fd/<n>`, `fdinfo/<n>`, `cwd`, `root`, `exe`, `mounts`),
+//!   files, `task/<tid>`, `fd/<n>`, `fdinfo/<n>`, `cwd`, `root`, `exe`, `mounts`,
+//!   `mountinfo`),
 //!   `self`, `thread-self` and `mounts`, merged into procfs's root, and
 //!   `sys/vm` (the kernel's overcommit policy, ADR 0013) in procfs's
 //!   `sys`. The records come from the server's process table
@@ -106,11 +107,17 @@ pub enum PidFile {
     Maps,
     /// What each descriptor's open file is at (`fdinfo/<fd>`).
     FdInfo,
+    /// Its memory, read and written at its addresses (`mem`: `procfile`, ADR 0019).
+    Mem,
+    /// The mount table with ids and device numbers (`mountinfo`).
+    MountInfo,
 }
 
 const PID_FILES: &[(&str, PidFile)] = &[
+    ("mountinfo", PidFile::MountInfo),
     ("fdinfo", PidFile::FdInfo),
     ("maps", PidFile::Maps),
+    ("mem", PidFile::Mem),
     ("stat", PidFile::Stat),
     ("statm", PidFile::Statm),
     ("status", PidFile::Status),
@@ -128,6 +135,7 @@ const PID_FILES: &[(&str, PidFile)] = &[
 ];
 const TASK_FILES: &[(&str, PidFile)] = &[
     ("maps", PidFile::Maps),
+    ("mem", PidFile::Mem),
     ("stat", PidFile::Stat),
     ("statm", PidFile::Statm),
     ("status", PidFile::Status),
@@ -456,6 +464,7 @@ fn pid_mode(file: PidFile) -> u32 {
         PidFile::Fd | PidFile::FdInfo => S_IFDIR | 0o500,
         PidFile::Exe | PidFile::Cwd | PidFile::Root => S_IFLNK | 0o777,
         PidFile::OomScoreAdj | PidFile::OomAdj => S_IFREG | 0o644,
+        PidFile::Mem => S_IFREG | 0o600,
         _ => S_IFREG | 0o444,
     }
 }
@@ -515,12 +524,12 @@ pub fn may_open(node: &ProcNode) -> Result<(), i64> {
 }
 
 /// Whether the caller may open the node for writing (it exists): a process's
-/// oom_score_adj and oom_adj, and with the host grant the overcommit policy (Linux's
+/// oom_score_adj, oom_adj and mem, and with the host grant the overcommit policy (Linux's
 /// sysctl permission for a namespace whose root does not own the machine: EACCES);
 /// EACCES for every other node.
 pub fn may_write(node: &ProcNode) -> Result<(), i64> {
     match node {
-        ProcNode::Pid { file: PidFile::OomScoreAdj | PidFile::OomAdj, .. } | ProcNode::Task { file: PidFile::OomScoreAdj | PidFile::OomAdj, .. } => check(node),
+        ProcNode::Pid { file: PidFile::OomScoreAdj | PidFile::OomAdj | PidFile::Mem, .. } | ProcNode::Task { file: PidFile::OomScoreAdj | PidFile::OomAdj | PidFile::Mem, .. } => check(node),
         ProcNode::Vm(file) if *file != VmFile::Dir => {
             if syscall(SYS_HOST_GRANTED, [0; 6]) < 0 {
                 return Err(EACCES);
@@ -890,6 +899,7 @@ pub fn contents(node: &ProcNode) -> Result<Vec<u8>, i64> {
         PidFile::Cmdline => return text(QUERY_CMDLINE, id),
         PidFile::Comm => try_format!("{}\n", fmt::name(&p))?,
         PidFile::Mounts => namespace::mounts_text()?,
+        PidFile::MountInfo => namespace::mountinfo_text()?,
         PidFile::OomScore => {
             let info = crate::process::kernel_info(id as crate::process::Pid).map_err(|_| ENOENT)?;
             let points = (info.oom_points != i64::MIN).then_some(info.oom_points);
@@ -899,7 +909,8 @@ pub fn contents(node: &ProcNode) -> Result<Vec<u8>, i64> {
         PidFile::OomAdj => try_format!("{}\n", fmt::oom_adj(oom_adj_of(id, 0, 0)?))?,
         PidFile::Maps => maps(id)?,
         PidFile::Dir | PidFile::Task | PidFile::Fd | PidFile::FdInfo => return Err(EISDIR),
-        PidFile::Exe | PidFile::Cwd | PidFile::Root => return Err(EINVAL),
+        // (mem has no contents of its own: its open file reads the process's memory.)
+        PidFile::Exe | PidFile::Cwd | PidFile::Root | PidFile::Mem => return Err(EINVAL),
     };
     Ok(text.into_bytes())
 }

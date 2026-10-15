@@ -414,6 +414,9 @@ struct Prepared {
     cmdline: Vec<u8>,
     /// The room kept for its stack (`stack_ceiling`).
     stack: u64,
+    /// The record of its new address space (`process::Mm`; taken by `finish`): its own,
+    /// never the one a vfork parent shares.
+    mm: Option<Arc<crate::sync::Mutex<process::Mm>>>,
 }
 
 /// A NUL-terminated string of the program's, at most `max` bytes (E2BIG beyond).
@@ -525,8 +528,10 @@ fn execveat(s: &mut State, dirfd: u64, path: u64, argv: u64, envp: u64, flags: u
     let files = fdtable::current().copy_room()?;
     // Past the point of no return a failure ends the process; it does so once this call
     // returned and let go of everything (`local::exit_pending`, carried out by `serve`).
-    if let Err(status) = run(s, prepared, files) {
-        local::exit_pending(status);
+    match run(s, prepared, files) {
+        Err(status) => local::exit_pending(status),
+        // Its tracer hears of the exec (the message: the id it had before).
+        Ok(()) => crate::ptrace::exec_event(s, tid),
     }
     Ok(0)
 }
@@ -619,8 +624,9 @@ fn prepare(file: File, exe: Origin, filename: String, args: Strings, envs: Strin
         cmdline.push(0);
     }
     let exe = Some(heap::try_arc(exe)?);
+    let mm = Some(heap::try_arc(crate::sync::Mutex::new(process::Mm::default()))?);
     let text_pages = elf.text_pages();
-    Ok(Prepared { file, elf, interp, args, envs, filename, exe, text_pages, cmdline, stack })
+    Ok(Prepared { file, elf, interp, args, envs, filename, exe, text_pages, cmdline, stack, mm })
 }
 
 /// A copy of the calling thread's working directory (ENOMEM without room).
@@ -724,6 +730,9 @@ fn de_thread() -> Result<(), i64> {
                     // (In place: its one entry's room is there.)
                     p.threads.clear();
                     p.threads.push(pid);
+                    // Its tracees follow it; the old main thread's trace record goes
+                    // unreported (Linux's de_thread).
+                    crate::ptrace::exec_moved(&mut t, tid, pid);
                     let l = local::get();
                     l.tid.store(pid, core::sync::atomic::Ordering::Relaxed);
                 }
@@ -967,6 +976,9 @@ fn finish(p: &mut Prepared, comm: [u8; 16], brk: u64) {
     syscall(SYS_VM_FLOOR, [brk, 0, 0, 0, 0, 0]);
     let cmdline = core::mem::take(&mut p.cmdline);
     let exe = core::mem::take(&mut p.exe);
+    let mm = p.mm.take().expect("made by prepare");
+    // The new address space's break; no membarrier registrations (Linux's exec_mmap).
+    mm.lock().brk = process::Brk { start: brk, end: brk, limit: (STACK_TOP - p.stack).saturating_sub(STACK_GUARD_GAP) };
     let mut t = PROCS.lock();
     if let Some(th) = t.threads.get_mut(&tid) {
         th.comm = comm;
@@ -988,8 +1000,8 @@ fn finish(p: &mut Prepared, comm: [u8; 16], brk: u64) {
         }
     }
     // (The old program's node is let go of after the lock: it may be a removed file's last
-    // reference.)
-    let (words, _old_exe) = {
+    // reference; the old address space record with it.)
+    let (words, _old_exe, _old_mm) = {
         let proc = t.procs.get_mut(&pid).expect("listed");
         proc.sig.hand = own;
         proc.execing = false;
@@ -999,9 +1011,9 @@ fn finish(p: &mut Prepared, comm: [u8; 16], brk: u64) {
         proc.text_pages = p.text_pages;
         proc.exe_object = syscall(SYS_MO_ID, [p.file.handle, 0, 0, 0, 0, 0]).max(0) as u64;
         let old_exe = core::mem::replace(&mut proc.exe, exe);
-        *proc.brk.lock() = process::Brk { start: brk, end: brk, limit: (STACK_TOP - p.stack).saturating_sub(STACK_GUARD_GAP) };
+        let old_mm = core::mem::replace(&mut proc.mm, mm);
         // A vfork parent goes on: the child no longer uses its memory.
-        (core::mem::replace(&mut proc.vfork, false).then(|| proc.words.clone()), old_exe)
+        (core::mem::replace(&mut proc.vfork, false).then(|| proc.words.clone()), old_exe, old_mm)
     };
     // POSIX timers are deleted (interval timers stay).
     crate::timer::exec(&mut t, pid);

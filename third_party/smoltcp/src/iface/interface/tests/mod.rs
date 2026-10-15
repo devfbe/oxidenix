@@ -172,6 +172,7 @@ pub fn tcp_not_accepted() {
         sack_permitted: false,
         sack_ranges: [None, None, None],
         timestamp: None,
+        urgent: None,
         payload: &[],
     };
 
@@ -217,6 +218,7 @@ pub fn tcp_not_accepted() {
                 sack_permitted: false,
                 sack_ranges: [None, None, None],
                 timestamp: None,
+                urgent: None,
                 payload: &[],
             })
         ))
@@ -272,6 +274,7 @@ pub fn tcp_listen_drops_unspecified_src() {
         sack_permitted: false,
         sack_ranges: [None, None, None],
         timestamp: None,
+        urgent: None,
         payload: &[],
     };
 

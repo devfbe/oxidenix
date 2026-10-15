@@ -10,6 +10,11 @@ use x86_64::structures::tss::TaskStateSegment;
 use x86_64::{PrivilegeLevel, VirtAddr};
 
 pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
+/// The debug exception's stack: a #DB may come at the first instruction of a kernel entry
+/// (a data breakpoint or single step held off by `mov ss`, CVE-2018-8897), still on the
+/// user's stack and with the user's GS (`entry::debug_entry`).
+pub const DEBUG_IST_INDEX: u16 = 1;
+const DEBUG_STACK: usize = 4096 * 4;
 pub const KERNEL_CS: u16 = 0x08;
 pub const KERNEL_SS: u16 = 0x10;
 /// Order is dictated by sysret: user data directly before user code.
@@ -23,6 +28,9 @@ const DOUBLE_FAULT_STACK: usize = 4096 * 5;
 
 #[repr(C, align(16))]
 struct Stack([u8; DOUBLE_FAULT_STACK]);
+
+#[repr(C, align(16))]
+struct DebugStack([u8; DEBUG_STACK]);
 
 /// The TSS with its I/O permission bitmap right behind it (where
 /// `iomap_base` points). The extra byte must stay 0xff.
@@ -41,6 +49,7 @@ pub struct CpuTables {
     /// Whether the bitmap currently grants any port (to skip resetting it).
     iomap_open: bool,
     double_fault_stack: Stack,
+    debug_stack: DebugStack,
 }
 
 impl CpuTables {
@@ -50,6 +59,7 @@ impl CpuTables {
             tss: TssWithIoMap { tss: TaskStateSegment::new(), iomap: [0xff; IOMAP_BYTES + 1] },
             iomap_open: false,
             double_fault_stack: Stack([0; DOUBLE_FAULT_STACK]),
+            debug_stack: DebugStack([0; DEBUG_STACK]),
         }
     }
 
@@ -70,6 +80,8 @@ impl CpuTables {
     pub fn load(&'static mut self) {
         let df_top = VirtAddr::from_ptr(&self.double_fault_stack) + DOUBLE_FAULT_STACK as u64;
         self.tss.tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = df_top;
+        let db_top = VirtAddr::from_ptr(&self.debug_stack) + DEBUG_STACK as u64;
+        self.tss.tss.interrupt_stack_table[DEBUG_IST_INDEX as usize] = db_top;
         let tss: &'static TssWithIoMap = unsafe { &*(&raw const self.tss) };
         let gdt = &mut self.gdt;
         let selectors = [

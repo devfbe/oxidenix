@@ -292,6 +292,10 @@ fn serve_here() {
         return;
     }
     let l4 = REQUEST.l4.load(Ordering::Relaxed);
+    if REQUEST.start.load(Ordering::Relaxed) == REQUEST.end.load(Ordering::Relaxed) {
+        // An empty range: a barrier (`barrier_on`; shootdowns of nothing send no request).
+        BARRIERS[smp::cpu().index].fetch_add(1, Ordering::Relaxed);
+    }
     let cr3 = Cr3::read().0.start_address().as_u64();
     if l4 == KERNEL || l4 == ANY || cr3 == l4 || cr3 == REQUEST.normal.load(Ordering::Relaxed) {
         flush_local(REQUEST.start.load(Ordering::Relaxed), REQUEST.end.load(Ordering::Relaxed));
@@ -360,6 +364,38 @@ pub fn shootdown_kernel(start: u64, end: u64) {
     fence(Ordering::SeqCst);
     let all = (0..smp::MAX_CPUS).filter(|&i| smp::by_index(i).is_some()).fold(0u64, |m, i| m | 1 << i);
     request(KERNEL, KERNEL, all & !my_bit(), start, end);
+}
+
+impl Tlb {
+    /// The CPUs that have this address space loaded (either view), read
+    /// after a full fence: a CPU missing from it that loads the space later
+    /// joins the set first (`switch`'s SeqCst fetch_or), so it runs the
+    /// space after the caller's fence (`membarrier`).
+    pub fn cpus(&self) -> u64 {
+        fence(Ordering::SeqCst);
+        self.cpus.load(Ordering::SeqCst)
+    }
+}
+
+/// A memory barrier on the CPUs in `targets` (this one left out), for
+/// membarrier(2)'s expedited commands (`membarrier`): when it returns, each
+/// of them has taken an interrupt (`request` with an empty range, which
+/// flushes nothing and which `serve_here` counts as a barrier),
+/// acknowledged it with a locked instruction and returned with `iret`, so
+/// everything its threads did before is visible and its instruction stream
+/// is serialized.
+pub fn barrier_on(targets: u64) {
+    fence(Ordering::SeqCst);
+    request(ANY, ANY, targets & !my_bit(), 0, 0);
+    fence(Ordering::SeqCst);
+}
+
+/// How many barriers (`barrier_on`) each CPU served, by index (`restricted::TEST_BARRIERS`).
+static BARRIERS: [AtomicU64; smp::MAX_CPUS] = [const { AtomicU64::new(0) }; smp::MAX_CPUS];
+
+/// How many barriers CPU `index` served since boot (None: no such CPU).
+pub fn barriers_served(index: usize) -> Option<u64> {
+    BARRIERS.get(index).map(|n| n.load(Ordering::Relaxed))
 }
 
 /// Has the CPUs in `targets` flush [start, end) of the address space

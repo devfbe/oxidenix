@@ -16,6 +16,10 @@ lazy_static! {
             idt.double_fault
                 .set_handler_fn(handlers::double_fault_handler)
                 .set_stack_index(gdt::DOUBLE_FAULT_IST_INDEX);
+            // #DB on its own stack, with an entry safe in any state (`entry::debug_entry`).
+            idt.debug
+                .set_handler_addr(x86_64::VirtAddr::new(entry::debug_entry as *const () as u64))
+                .set_stack_index(gdt::DEBUG_IST_INDEX);
         }
         idt.non_maskable_interrupt.set_handler_fn(handlers::nmi_handler);
         for &(vector, stub) in entry::stubs() {

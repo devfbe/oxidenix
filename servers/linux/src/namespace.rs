@@ -285,6 +285,50 @@ pub fn mounts_text() -> Result<String, i64> {
     })
 }
 
+/// The mount table as /proc/<pid>/mountinfo shows it (proc_pid_mountinfo(5)): each mount's
+/// id (`mount_id`'s), its parent's (the root's is 1, Linux's initial rootfs outside the
+/// namespace), the device number its files have (`st_dev`), the root of the mount in its
+/// filesystem (each shows the whole), the mount point, its options, no optional fields, then
+/// the filesystem's type, the source and the superblock's options. coreutils' df, findmnt
+/// and libmount read it.
+pub fn mountinfo_text() -> Result<String, i64> {
+    use crate::heap::TryPushStr;
+    let data_ro = datafs::read_only();
+    with_mounts(|mounts| {
+        let mut out = String::new();
+        for (i, m) in mounts.iter().enumerate() {
+            // The parent: the mount with the longest mount point that is a proper prefix.
+            let parent = mounts
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.at.len() < m.at.len() && m.at.starts_with(&p.at))
+                .max_by_key(|(_, p)| p.at.len())
+                .map_or(1, |(j, _)| FIRST_MOUNT_ID + j as u32);
+            let dev = match &m.fs {
+                Fs::Tmpfs(root) => root.dev,
+                Fs::Data => datafs::DEV,
+                Fs::Proc => crate::procfs::PROC_DEV,
+                Fs::Sys => crate::procfs::SYS_DEV,
+            };
+            let (major, minor) = vfs::stat::dev_split(dev);
+            let mode = if matches!(m.fs, Fs::Data) && data_ro { "ro" } else { "rw" };
+            out.try_push_str(&crate::try_format!(
+                "{} {} {}:{} / {} {} - {} {} {}\n",
+                FIRST_MOUNT_ID + i as u32,
+                parent,
+                major,
+                minor,
+                join(&m.at)?,
+                mode,
+                m.fstype,
+                m.source,
+                mode
+            )?)?;
+        }
+        Ok(out)
+    })
+}
+
 /// The id of the mount table's first mount (the root); the others follow in the table's
 /// order (it never changes once made). Below it the ids of the filesystems no path reaches
 /// (Linux's kernel-internal mounts, also never in a mount table): sockets', pipes' and the
