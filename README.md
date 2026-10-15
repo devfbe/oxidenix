@@ -663,7 +663,10 @@ call into a device:
   stub (`interrupts/entry.rs`) that builds the same frame and calls one dispatcher, `trap`. A
   Linux program's CPU exceptions go to its server, which raises Linux's signal (`SIGSEGV`,
   `SIGFPE`, `SIGILL`, `SIGBUS`, `SIGTRAP`); a native server's end it. In the kernel they panic
-  with the faulting address. In test mode a panic ends QEMU with a failure.
+  with the faulting address. In test mode a panic ends QEMU with a failure. A panic stops the
+  other CPUs and takes over the console's and the serial port's locks if they stay held, so
+  its message reaches the screen even on a machine without a serial port (which the kernel
+  detects at start-up and then leaves alone).
 - Interrupts and exceptions return through `user_return`, which uses **`iretq`**. A system call
   returns with **`sysretq`** (`syscall_return`, as Linux's fast path) when its frame is one
   sysretq restores exactly: a 64-bit user frame whose `rcx` is its `rip` and `r11` its

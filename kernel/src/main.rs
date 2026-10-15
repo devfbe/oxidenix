@@ -43,6 +43,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     if let Some(fb) = boot_info.framebuffer.as_mut() {
         drivers::console::init(fb);
     }
+    if !drivers::serial::exists() {
+        printkln!("[boot] no serial port: the kernel's messages are on the screen only");
+    }
     interrupts::init();
     let phys_offset = boot_info
         .physical_memory_offset
@@ -214,8 +217,10 @@ pub static TEST_MODE: core::sync::atomic::AtomicBool = core::sync::atomic::Atomi
 fn panic(info: &PanicInfo) -> ! {
     // Stop the other CPUs first, so the message is the last word.
     interrupts::apic::ipi::halt_others();
-    // (The stopped CPUs may hold the log's locks: the message goes to the console only.)
+    // (The stopped CPUs may hold the log's locks: the message goes to the console only,
+    // whose locks it takes over.)
     klog::panic();
+    drivers::console::take_over_for_panic();
     printkln!("KERNEL PANIC (CPU {}): {}", smp::cpu().index, info);
     if TEST_MODE.load(core::sync::atomic::Ordering::Relaxed) {
         power_off(1);
