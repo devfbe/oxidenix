@@ -731,23 +731,35 @@ shares the record, `CLONE_SIGHAND` the actions (also between processes, with `CL
 `CLONE_PIDFD` puts a pidfd of the child into the caller's table (after the child's copy of
 it) and its number into the caller's memory (clone: at `parent_tid`, so not with
 `CLONE_PARENT_SETTID`; clone3: at `pidfd`) before the child runs; a fault there undoes the
-clone (EFAULT). With `CLONE_THREAD` it is EINVAL (thread pidfds are Linux 6.9's), as
-`CLONE_DETACHED` with it. Namespaces are EINVAL.
+clone (EFAULT). With `CLONE_THREAD` it is a thread pidfd of the new thread (Linux 6.9);
+`CLONE_DETACHED` with it is EINVAL. Namespaces are EINVAL.
 
 ### pidfds
 
 A pidfd (`pidfd.rs`: `pidfd_open`, `CLONE_PIDFD`) is a file of the server's that names a
-process. Pids are reused, so it holds the process's words (`Words`, kept by an `Arc` after
-the reap): its pid names its process only while the table's process of that number has
-them. The words carry the process's state (alive, exited, reaped), set under the process
-lock, and the ids of its pidfds, which the process's end and reap report to after the lock
-(`After`): readable (`POLLIN`) once exited, hung up too (`POLLHUP`) once reaped, for poll,
+process, or with `PIDFD_THREAD` (`CLONE_PIDFD` with `CLONE_THREAD`) one thread (Linux 6.9).
+Pids are reused, so it holds the process's words (`Words`, kept by an `Arc` after the reap):
+its pid names its process only while the table's process of that number has them. What a
+pidfd watches (`Watch`: the state, alive, exited or reaped, set under the process lock, and
+the ids of its pidfds, which the changes report to after the lock, `After`) is the
+process's in its words, or a thread's: the main thread's in its process record (exited when
+the main thread ended, whether the process lives on or not; reaped with the process),
+another thread's in its record (gone when the thread is: as Linux, which releases a thread
+that does not lead its process at once), made with the first thread pidfd of it. An exec
+by a thread that is not the main one moves it to the main thread's id (Linux's
+`exchange_tids`): its old id's pidfds see it gone, the main thread's name it, alive again.
+Readable (`POLLIN`) once exited, hung up too (`POLLHUP`) once reaped or gone, for poll,
 select and epoll. `pidfd_send_signal` posts as `kill` (or, with a siginfo, as
-`rt_sigqueueinfo`; `PIDFD_SIGNAL_THREAD`, `_THREAD_GROUP`, `_PROCESS_GROUP` pick the main
-thread, the process, its group); a zombie takes it silently, a reaped process is ESRCH.
-`pidfd_getfd` installs another process's open file description (close-on-exec); `waitid`'s
-`P_PIDFD` waits for that child (`ECHILD` if it is none or was reaped); a `PIDFD_NONBLOCK`
-pidfd's wait answers EAGAIN while the child runs (unless the caller asked for `WNOHANG`).
+`rt_sigqueueinfo`: a code of the kernel's or kill's only towards the calling thread's own
+id) to the thread of a thread pidfd or the process of a process pidfd;
+`PIDFD_SIGNAL_THREAD`, `_THREAD_GROUP`, `_PROCESS_GROUP` pick the thread of its id, that
+thread's process, the process group of its id. A zombie, or a thread that exited, takes
+it silently; a task that is gone is ESRCH. `pidfd_getfd` installs an open file description
+of the named thread's table (a process pidfd's: the main thread's, EBADF once it exited, as
+Linux's task of the pid; close-on-exec); `waitid`'s `P_PIDFD` waits for the child of that
+id (`ECHILD` if it is none or was reaped, and for a thread that is no process); a
+`PIDFD_NONBLOCK` pidfd's wait answers EAGAIN while the child runs (unless the caller asked
+for `WNOHANG`).
 
 ### execve
 

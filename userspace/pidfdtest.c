@@ -1,11 +1,15 @@
 /* pidfds (the Linux server's): pidfd_open, clone's and clone3's CLONE_PIDFD,
  * pidfd_send_signal (as kill and as rt_sigqueueinfo), pidfd_getfd, waitid(P_PIDFD) with
  * PIDFD_NONBLOCK, readiness for poll and epoll when the process exits (POLLIN) and is
- * reaped (POLLHUP), and the errors. */
+ * reaped (POLLHUP), and the errors; thread pidfds (PIDFD_THREAD, CLONE_PIDFD with
+ * CLONE_THREAD: Linux 6.9): signals to the thread or by flags to its process, readiness
+ * when the thread exits (the main thread too, its process living on), an exec by another
+ * thread. */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
 #include <sched.h>
 #include <signal.h>
 #include <stdint.h>
@@ -36,6 +40,10 @@
 #define P_PIDFD 3
 #endif
 #define PIDFD_NONBLOCK O_NONBLOCK
+#define PIDFD_THREAD O_EXCL
+#define PIDFD_SIGNAL_THREAD 1
+#define PIDFD_SIGNAL_THREAD_GROUP 2
+#define PIDFD_SIGNAL_PROCESS_GROUP 4
 
 struct clone_args {
     uint64_t flags, pidfd, child_tid, parent_tid, exit_signal, stack, stack_size, tls;
@@ -282,9 +290,6 @@ static void clone_pidfd(void) {
     errno = 0;
     check("clone(CLONE_PIDFD | CLONE_PARENT_SETTID) is EINVAL",
           syscall(SYS_clone, CLONE_PIDFD | CLONE_PARENT_SETTID | SIGCHLD, 0, &pidfd, 0, 0) < 0 && errno == EINVAL);
-    errno = 0;
-    check("clone(CLONE_PIDFD | CLONE_THREAD) is EINVAL",
-          syscall(SYS_clone, CLONE_PIDFD | CLONE_THREAD | CLONE_SIGHAND | CLONE_VM, 0, &pidfd, 0, 0) < 0 && errno == EINVAL);
     args.flags = CLONE_PIDFD | 0x00400000; /* CLONE_DETACHED */
     errno = 0;
     check("clone3 with CLONE_DETACHED is EINVAL", syscall(SYS_clone3, &args, sizeof args) < 0 && errno == EINVAL);
@@ -296,12 +301,259 @@ static void clone_pidfd(void) {
     check("... and leaves no child behind", waitpid(-1, NULL, WNOHANG) < 0 && errno == ECHILD);
 }
 
+/* Which thread took the last SIGUSR1 or SIGUSR2. */
+static volatile pid_t sig_tid;
+
+static void on_thread_signal(int sig) {
+    (void)sig;
+    sig_tid = (pid_t)syscall(SYS_gettid);
+}
+
+static void wait_signal(void) {
+    for (int i = 0; i < 2000 && sig_tid == 0; i++) sleep_ms(1);
+}
+
+static void read_byte(int fd) {
+    char c;
+    while (read(fd, &c, 1) < 0 && errno == EINTR) {
+    }
+}
+
+/* A thread that blocks SIGUSR2, reports its id and waits for a byte. */
+struct worker {
+    int report[2], go[2];
+};
+
+static void *worker_main(void *arg) {
+    struct worker *w = arg;
+    sigset_t usr2;
+    sigemptyset(&usr2);
+    sigaddset(&usr2, SIGUSR2);
+    pthread_sigmask(SIG_BLOCK, &usr2, NULL);
+    pid_t tid = (pid_t)syscall(SYS_gettid);
+    write(w->report[1], &tid, sizeof tid);
+    read_byte(w->go[0]);
+    return NULL;
+}
+
+static void thread_pidfds(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_thread_signal;
+    sigaction(SIGUSR1, &sa, NULL);
+    sigaction(SIGUSR2, &sa, NULL);
+    struct worker w;
+    pipe(w.report);
+    pipe(w.go);
+    pthread_t th;
+    pthread_create(&th, NULL, worker_main, &w);
+    pid_t tid;
+    read(w.report[0], &tid, sizeof tid);
+
+    errno = 0;
+    check("pidfd_open of a thread not the main one is EINVAL", pidfd_open(tid, 0) < 0 && errno == EINVAL);
+    int tfd = pidfd_open(tid, PIDFD_THREAD);
+    check("pidfd_open(PIDFD_THREAD) of another thread", tfd >= 0);
+    check("... shows PIDFD_THREAD (O_EXCL) in its status flags", (fcntl(tfd, F_GETFL) & O_EXCL) != 0);
+    check("... and is not readable while the thread runs", revents(tfd, 0) == 0);
+    sig_tid = 0;
+    check("pidfd_send_signal on a thread pidfd", pidfd_send_signal(tfd, SIGUSR1, NULL, 0) == 0);
+    wait_signal();
+    check("... signals that thread", sig_tid == tid);
+    sig_tid = 0;
+    check("PIDFD_SIGNAL_THREAD_GROUP on it", pidfd_send_signal(tfd, SIGUSR2, NULL, PIDFD_SIGNAL_THREAD_GROUP) == 0);
+    wait_signal();
+    check("... signals its process (the thread that does not block it)", sig_tid == getpid());
+    errno = 0;
+    check("PIDFD_SIGNAL_PROCESS_GROUP of a thread's id is ESRCH",
+          pidfd_send_signal(tfd, SIGUSR1, NULL, PIDFD_SIGNAL_PROCESS_GROUP) < 0 && errno == ESRCH);
+    errno = 0;
+    check("two pidfd_send_signal flags at once are EINVAL",
+          pidfd_send_signal(tfd, 0, NULL, PIDFD_SIGNAL_THREAD | PIDFD_SIGNAL_THREAD_GROUP) < 0 && errno == EINVAL);
+    int dup = pidfd_getfd(tfd, w.go[1], 0);
+    check("pidfd_getfd through a thread pidfd", dup >= 0);
+    close(dup);
+    siginfo_t si;
+    errno = 0;
+    check("waitid(P_PIDFD) of a thread pidfd is ECHILD", waitid(P_PIDFD, tfd, &si, WEXITED | WNOHANG) < 0 && errno == ECHILD);
+
+    /* The calling thread's own: kill's code is its own to claim. */
+    int self = pidfd_open(getpid(), PIDFD_THREAD);
+    siginfo_t info;
+    memset(&info, 0, sizeof info);
+    info.si_signo = SIGUSR1;
+    info.si_code = SI_USER;
+    sig_tid = 0;
+    check("SI_USER through the calling thread's own thread pidfd", self >= 0 && pidfd_send_signal(self, SIGUSR1, &info, 0) == 0);
+    wait_signal();
+    check("... reaches it", sig_tid == getpid());
+    errno = 0;
+    check("... but towards another thread is EPERM", pidfd_send_signal(tfd, SIGUSR1, &info, 0) < 0 && errno == EPERM);
+    close(self);
+
+    write(w.go[1], "x", 1);
+    pthread_join(th, NULL);
+    check("a thread pidfd is readable and hung up once its thread is gone", (revents(tfd, 5000) & (POLLIN | POLLHUP)) == (POLLIN | POLLHUP));
+    errno = 0;
+    check("... then pidfd_send_signal is ESRCH", pidfd_send_signal(tfd, 0, NULL, 0) < 0 && errno == ESRCH);
+    errno = 0;
+    check("... and pidfd_getfd ESRCH", pidfd_getfd(tfd, 0, 0) < 0 && errno == ESRCH);
+    close(tfd);
+    errno = 0;
+    check("pidfd_open(PIDFD_THREAD) of a thread gone is ESRCH", pidfd_open(tid, PIDFD_THREAD) < 0 && errno == ESRCH);
+    close(w.report[0]);
+    close(w.report[1]);
+    close(w.go[0]);
+    close(w.go[1]);
+    signal(SIGUSR1, SIG_DFL);
+    signal(SIGUSR2, SIG_DFL);
+}
+
+static void *idle_main(void *arg) {
+    read_byte(*(int *)arg);
+    return NULL;
+}
+
+/* The main thread ends before its process: its thread pidfd is readable at once, the
+ * process's only when the last thread ended. */
+static void main_thread_exits(void) {
+    int ready[2], step[2], go[2];
+    pipe(ready);
+    pipe(step);
+    pipe(go);
+    pid_t child = fork();
+    if (child == 0) {
+        pthread_t th;
+        pthread_create(&th, NULL, idle_main, &go[0]);
+        write(ready[1], "r", 1);
+        read_byte(step[0]);
+        pthread_exit(NULL);
+    }
+    read_byte(ready[0]);
+    int tfd = pidfd_open(child, PIDFD_THREAD);
+    int pfd = pidfd_open(child, 0);
+    check("thread and process pidfds of a main thread", tfd >= 0 && pfd >= 0 && revents(tfd, 0) == 0 && revents(pfd, 0) == 0);
+    write(step[1], "s", 1);
+    short re = revents(tfd, 5000);
+    check("the main thread's ends: its thread pidfd is readable, not hung up", (re & POLLIN) && !(re & POLLHUP));
+    check("... the process's is not (a thread lives on)", revents(pfd, 0) == 0);
+    int late = pidfd_open(child, PIDFD_THREAD);
+    check("... a thread pidfd opened after it ended is readable", late >= 0 && (revents(late, 0) & POLLIN));
+    check("... a signal to the exited main thread does nothing", pidfd_send_signal(tfd, SIGTERM, NULL, 0) == 0);
+    errno = 0;
+    check("... pidfd_getfd of its process is EBADF (the main thread's table)", pidfd_getfd(pfd, 0, 0) < 0 && errno == EBADF);
+    write(go[1], "g", 1);
+    check("the last thread's end makes the process pidfd readable", revents(pfd, 5000) & POLLIN);
+    check("... the thread pidfd still not hung up (a zombie)", !(revents(tfd, 0) & POLLHUP));
+    int status = 0;
+    check("... it exited normally (the signal did nothing)", waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    check("reaped: both hung up", (revents(tfd, 0) & POLLHUP) && (revents(pfd, 0) & POLLHUP) && (revents(late, 0) & POLLHUP));
+    close(late);
+    close(tfd);
+    close(pfd);
+    int all[] = {ready[0], ready[1], step[0], step[1], go[0], go[1]};
+    for (unsigned i = 0; i < sizeof all / sizeof all[0]; i++) close(all[i]);
+}
+
+struct execer {
+    int report, go;
+};
+
+static void *exec_main(void *arg) {
+    struct execer *e = arg;
+    pid_t tid = (pid_t)syscall(SYS_gettid);
+    write(e->report, &tid, sizeof tid);
+    read_byte(e->go);
+    execl("/bin/sleep", "sleep", "30", (char *)NULL);
+    _exit(127);
+}
+
+/* Another thread execs: it takes the main thread's id (Linux's exchange_tids). */
+static void exec_by_a_thread(void) {
+    int report[2], go[2];
+    pipe(report);
+    pipe(go);
+    pid_t child = fork();
+    if (child == 0) {
+        struct execer e = {report[1], go[0]};
+        pthread_t th;
+        pthread_create(&th, NULL, exec_main, &e);
+        for (;;) pause();
+    }
+    pid_t tid;
+    read(report[0], &tid, sizeof tid);
+    int old = pidfd_open(tid, PIDFD_THREAD);
+    int main_fd = pidfd_open(child, PIDFD_THREAD);
+    write(go[1], "x", 1);
+    check("an exec by another thread hangs up that thread's pidfd", (revents(old, 5000) & POLLHUP) != 0);
+    check("... the main thread's names the thread that exec'd (not readable)", revents(main_fd, 0) == 0);
+    check("... SIGKILL through it", pidfd_send_signal(main_fd, SIGKILL, NULL, 0) == 0);
+    int status = 0;
+    check("... ends the process", waitpid(child, &status, 0) == child && WIFSIGNALED(status) && WTERMSIG(status) == SIGKILL);
+    close(old);
+    close(main_fd);
+    int all[] = {report[0], report[1], go[0], go[1]};
+    for (unsigned i = 0; i < sizeof all / sizeof all[0]; i++) close(all[i]);
+}
+
+static int clone_main(void *arg) {
+    read_byte(*(int *)arg);
+    return 0;
+}
+
+static char clone_stack[64 * 1024] __attribute__((aligned(16)));
+
+/* clone(2) of a thread that runs fn(arg) on stack_top and exits with its result (musl's
+ * clone() refuses CLONE_THREAD); the parent's tid argument is ptid. */
+static long thread_clone(unsigned long flags, void *stack_top, int *ptid, int (*fn)(void *), void *arg) {
+    void **sp = (void **)stack_top;
+    *--sp = arg;
+    *--sp = (void *)fn;
+    long ret;
+    register long r10 __asm__("r10") = 0;
+    register long r8 __asm__("r8") = 0;
+    __asm__ volatile("syscall\n\t"
+                     "test %%rax, %%rax\n\t"
+                     "jnz 1f\n\t"
+                     "pop %%rax\n\t"
+                     "pop %%rdi\n\t"
+                     "call *%%rax\n\t"
+                     "mov %%eax, %%edi\n\t"
+                     "mov $60, %%eax\n\t"
+                     "syscall\n\t"
+                     "hlt\n\t"
+                     "1:\n\t"
+                     : "=a"(ret)
+                     : "a"(56L), "D"(flags), "S"(sp), "d"(ptid), "r"(r10), "r"(r8)
+                     : "rcx", "r11", "memory");
+    return ret;
+}
+
+static void clone_thread_pidfd(void) {
+    int go[2];
+    pipe(go);
+    int tpidfd = -1;
+    unsigned long flags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM | CLONE_PIDFD;
+    long tid = thread_clone(flags, clone_stack + sizeof clone_stack, &tpidfd, clone_main, &go[0]);
+    check("clone(CLONE_PIDFD | CLONE_THREAD) gives a thread pidfd", tid > 0 && tpidfd >= 0 && (fcntl(tpidfd, F_GETFL) & O_EXCL));
+    check("... not readable while the thread runs", revents(tpidfd, 0) == 0);
+    write(go[1], "x", 1);
+    check("... readable and hung up once the thread is gone", (revents(tpidfd, 5000) & (POLLIN | POLLHUP)) == (POLLIN | POLLHUP));
+    close(tpidfd);
+    close(go[0]);
+    close(go[1]);
+}
+
 int main(void) {
     basics();
     open_errors();
     nonblock();
     getfd();
     clone_pidfd();
+    thread_pidfds();
+    main_thread_exits();
+    exec_by_a_thread();
+    clone_thread_pidfd();
     if (failures) {
         printf("pidfdtest: %d FAILED\n", failures);
         return 1;
