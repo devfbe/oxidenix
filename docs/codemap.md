@@ -9,25 +9,26 @@ module comment, and the public types it defines. Where to start for common tasks
 ## Kernel
 
 - `kernel/src/counters.rs` (28) Event counters of the hot paths, for the benchmarks (`docs/benchmarks/`): how many system calls, IPC round trips, bytes through IPC, address space switches, bytes copied to or from user memory and kernel heap... Types: `PerCpu`.
-- `kernel/src/drivers/acpi.rs` (94) ACPI, as far as SMP needs it: the MADT ("APIC" table) lists the CPUs, the I/O APIC and how ISA interrupts are wired to it. Types: `Override`, `Madt`.
-- `kernel/src/drivers/console.rs` (779) Framebuffer text console with a cell grid, 16 colors and a visible cursor. Types: `Console`.
+- `kernel/src/drivers/acpi.rs` (154) ACPI's static tables, as far as the kernel needs them: the MADT ("APIC") lists the CPUs (local APIC and x2APIC entries), the I/O APIC and how ISA interrupts are wired to it; the HPET table and the FADT ("FACP") say... Types: `Override`, `Madt`, `PmTimer`.
+- `kernel/src/drivers/console.rs` (796) Framebuffer text console with a cell grid, 16 colors and a visible cursor. Types: `Console`.
 - `kernel/src/drivers/console_device.rs` (214) The console as a device of the Linux server (ADR 0004, ADR 0007): the bytes typed on the keyboard and the console's answers to queries go into a ring, the bytes written go to the screen and the serial mirror as they... Types: `Writer`.
 - `kernel/src/drivers/glyphs.rs` (202) Characters the console draws geometrically instead of from the font: box drawing (U+2500-257F), block elements (U+2580-259F), geometric shapes, arrows and the VT100 scan lines.
 - `kernel/src/drivers/keyboard.rs` (74) PS/2 keyboard: decodes scancodes in interrupt context and feeds the resulting bytes (UTF-8 text, control characters, the Linux console's key sequences) into the console device, whose holder's line discipline...
-- `kernel/src/drivers/mod.rs` (8) Device drivers the kernel keeps: ACPI tables, the framebuffer console and the console device the Linux server's terminals drive, the keyboard, PCI enumeration, the CMOS clock and the serial port.
+- `kernel/src/drivers/mod.rs` (9) Device drivers the kernel keeps: ACPI tables, the framebuffer console and the console device the Linux server's terminals drive, the keyboard, PCI enumeration, the CMOS clock, the reference clocks the TSC is measured...
 - `kernel/src/drivers/pci.rs` (89) PCI enumeration through configuration mechanism #1 (ports 0xcf8/0xcfc). Types: `Device`.
+- `kernel/src/drivers/refclock.rs` (128) Reference clocks of known frequency that the TSC is measured against when neither the CPU nor a hypervisor states its frequency (`time::init`, ADR 0016): the HPET, then the ACPI PM timer, both found in the ACPI...
 - `kernel/src/drivers/rtc.rs` (43) CMOS real-time clock: read once at boot; wall-clock time afterwards is kept by `time` (the boot time plus the monotonic clock).
-- `kernel/src/drivers/serial.rs` (38) COM1 serial port (output only).
+- `kernel/src/drivers/serial.rs` (54) COM1 serial port (output only).
 - `kernel/src/fs/cache.rs` (1994) The page cache: the pages of a regular file in physical frames, shared by `read`, `write` and every mapping of the file (see docs/design/page-cache.md). Types: `CacheCounts`, `Pager`, `Sharer`, `FileTimes`, `Backing`, `Dirtied`, `Fill`, `Lookup`, `PageWait`, `Scan`, `Filled`, `PageCache`, `Opened`.
 - `kernel/src/fs/cpio.rs` (75) Finds a file in a cpio archive in "newc" format (the boot image's initramfs), following the archive's symlinks.
 - `kernel/src/fs/mod.rs` (16) The boot image and the kernel's memory objects.
-- `kernel/src/interrupts/apic.rs` (210) Local APIC (one per CPU: timer, end of interrupt, inter-processor interrupts) and I/O APIC (routes device interrupts to CPUs).
+- `kernel/src/interrupts/apic.rs` (256) Local APIC (one per CPU: timer, end of interrupt, inter-processor interrupts) and I/O APIC (routes device interrupts to CPUs).
 - `kernel/src/interrupts/entry.rs` (66) Uniform entry for every interrupt and exception (except NMI and double fault): a per-vector stub pushes the vector (and a dummy error code where the CPU pushes none), the common path saves all registers into a...
 - `kernel/src/interrupts/gdt.rs` (92) Per-CPU GDT and TSS. Types: `CpuTables`.
 - `kernel/src/interrupts/handlers.rs` (207) Interrupt and exception handlers: every vector from `entry::common_entry` lands in `trap`, which dispatches CPU exceptions (page faults; a Linux program's other faults go to its server, a native server dies of its...
 - `kernel/src/interrupts/mod.rs` (72) Interrupt setup: the IDT, the interrupt controllers (local and I/O APIC from ACPI, the 8259 PICs masked) and the per-CPU setup of the other CPUs.
 - `kernel/src/klog.rs` (298) The kernel's log: a ring of records (Linux's printk buffer) that `printk`, the Linux servers' messages and the native servers' output go to, read by the Linux server for `syslog(2)` and `/dev/kmsg` (`dmesg`). Types: `Escaped`, `RateLimit`.
-- `kernel/src/main.rs` (167) The kernel's entry point: `kernel_main` takes the boot information from the bootloader (UEFI or BIOS) and brings up the console, interrupts, memory, ACPI, time, the boot image, processes, the other CPUs and the...
+- `kernel/src/main.rs` (171) The kernel's entry point: `kernel_main` takes the boot information from the bootloader (UEFI or BIOS) and brings up the console, interrupts, memory, ACPI, time, the boot image, processes, the other CPUs and the...
 - `kernel/src/memory/frame.rs` (148) The physical frame allocator: fresh frames from the bootloader's usable regions, freed ones on an intrusive free list, with reference counts for shared and copy-on-write frames. Types: `PhysFrameAllocator`, `UserFrames`.
 - `kernel/src/memory/kstack.rs` (127) Kernel stacks. Types: `KernelStack`.
 - `kernel/src/memory/mod.rs` (563) Kernel memory: the frame allocator, the kernel heap (slab size classes over a first-fit heap), mappings of physical memory, the commit and page-cache accounting with the overcommit policy, and the OOM killer. Types: `Caching`, `Stats`.
@@ -59,10 +60,10 @@ module comment, and the public types it defines. Where to start for common tasks
 - `kernel/src/random.rs` (115) The kernel's randomness: a ChaCha20 generator (`csprng::ChaCha`, fast key erasure) seeded at boot from the CPU's entropy source (RDSEED, else RDRAND, when it has one) and from timing jitter of the time stamp counter,...
 - `kernel/src/shell/commands.rs` (221) The commands of the kernel's built-in fallback shell (help, mem, run, kill, ...).
 - `kernel/src/shell/mod.rs` (130) Kernel monitor: starts a shell at boot and takes over when it exits.
-- `kernel/src/smp.rs` (263) Per-CPU data. Types: `Cpu`.
-- `kernel/src/sync.rs` (134) Kernel locking primitives that are correct on several CPUs. Types: `IrqSpinLock`, `IrqSpinLockGuard`, `Mutex`, `MutexGuard`.
-- `kernel/src/time.rs` (243) Time keeping.
-- `kernel/src/timer.rs` (163) Timers: per-CPU queues of deadlines on the monotonic clock, and the local APIC timer programmed for the earliest one. Types: `Queue`.
+- `kernel/src/smp.rs` (268) Per-CPU data. Types: `Cpu`.
+- `kernel/src/sync.rs` (137) Kernel locking primitives that are correct on several CPUs. Types: `IrqSpinLock`, `IrqSpinLockGuard`, `Mutex`, `MutexGuard`.
+- `kernel/src/time.rs` (280) Time keeping.
+- `kernel/src/timer.rs` (168) Timers: per-CPU queues of deadlines on the monotonic clock, and the local APIC timer programmed for the earliest one. Types: `Queue`.
 
 ## Linux server
 
@@ -185,7 +186,7 @@ module comment, and the public types it defines. Where to start for common tasks
 
 ## Host builder
 
-- `builder/src/main.rs` (520) The host-side builder (`cargo run` in kernel/ runs it): builds the root filesystem and its cpio initramfs, the data disk and the UEFI or BIOS boot image, then starts QEMU.
+- `builder/src/main.rs` (523) The host-side builder (`cargo run` in kernel/ runs it): builds the root filesystem and its cpio initramfs, the data disk and the UEFI or BIOS boot image, then starts QEMU.
 
 ## User-space programs and tests
 
@@ -419,6 +420,7 @@ kernel that handle them.
 - `docs/decisions/0013-an-oom-killer-and-overcommit-modes.md` ADR 0013: An OOM killer by badness, and Linux's overcommit modes
 - `docs/decisions/0014-a-vdso-over-the-kernels-clock-page.md` ADR 0014: A vDSO over the kernel's clock page
 - `docs/decisions/0015-one-page-cache-for-every-process-tree.md` ADR 0015: One page cache per file of /data for every process tree
+- `docs/decisions/0016-time-sources-and-x2apic-for-real-hardware.md` ADR 0016: Time sources and x2APIC for real hardware
 - `docs/design/ext3-journal.md` The ext3 journal of the data disk
 - `docs/design/io-rings.md` I/O rings: the data plane between the Linux server and the device servers
 - `docs/design/iommu.md` DMA isolation with an IOMMU

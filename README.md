@@ -143,7 +143,9 @@ On the first run it also creates `disk.img`, a 2 GiB ext2 data disk with an ext3
 mount). This file is
 kept between runs; delete it for a fresh disk. A `disk.img` from before the disk grew from 64 MiB
 to 2 GiB stays 64 MiB (the builder points it out): delete it to get the bigger one.
-Extra arguments after `--` are passed to QEMU; `OXIDENIX_BUILD_ONLY=1 cargo run` only builds the images.
+Extra arguments after `--` are passed to QEMU, in test mode too (say, `-cpu max,-x2apic` or
+`-machine hpet=off` for the other APIC mode and time source, ADR 0016); `OXIDENIX_ACCEL=tcg`
+emulates even where KVM is available; `OXIDENIX_BUILD_ONLY=1 cargo run` only builds the images.
 `OXIDENIX_DISK=<path>` uses another data disk image (created if missing). Test mode
 (`OXIDENIX_TEST=1`) never touches `disk.img`: it boots with a fresh 64 MiB disk of its own,
 `target/test-disk.img`, made anew on every run.
@@ -242,8 +244,8 @@ oxidenix/
 │       ├── main.rs              entry point, boot configuration, init order
 │       ├── smp.rs               per-CPU blocks (GS base), CPU start-up trampoline
 │       ├── interrupts/          per-CPU GDT/TSS (gdt.rs), IDT (mod.rs), entry stubs and
-│       │                        the trap dispatcher (entry.rs, handlers.rs), local and I/O APIC
-│       │                        with timer calibration (apic.rs),
+│       │                        the trap dispatcher (entry.rs, handlers.rs), local (xAPIC or
+│       │                        x2APIC) and I/O APIC (apic.rs),
 │       │                        exception, timer and keyboard handlers (handlers.rs)
 │       ├── memory/              physical frame allocator with refcounts (frame.rs), kernel stacks (kstack.rs),
 │       │                        kernel heap and page table access (mod.rs)
@@ -274,7 +276,8 @@ oxidenix/
 │       │                        device the server's terminals drive (console_device.rs),
 │       │                        PS/2 keyboard (keyboard.rs), CMOS clock (rtc.rs),
 │       │                        serial port mirror (serial.rs), PCI scan (pci.rs),
-│       │                        ACPI MADT (acpi.rs)
+│       │                        ACPI tables (acpi.rs), the HPET, PM timer and PIT as
+│       │                        references for the TSC (refclock.rs)
 │       ├── sync.rs              IrqSpinLock: fair, interrupt-safe ticket lock
 │       ├── time.rs              TSC clock source, clock synchronization between CPUs
 │       ├── timer.rs             per-CPU timer queues on the local APIC timer
@@ -318,9 +321,10 @@ About 13,100 lines of Rust (without comments and blank lines) in the kernel (16,
    the upper half (`dynamic_range_start = 0xffff_8000_0000_0000`). It maps all physical
    memory at a dynamic offset, sets up a framebuffer (UEFI GOP or VESA) and loads the initramfs as a ramdisk.
 2. `kernel_main` runs these steps in order: framebuffer console and boot logo → GDT/TSS/IDT
-   (interrupts still off) → frame allocator and 16 MiB kernel heap → ACPI tables (MADT), the
-   local APIC with its calibrated timer and the I/O APIC (the 8259 PICs are masked) → the TSC
-   clock (see Time) → the boot image (the ramdisk) → process subsystem (SSE, syscall MSRs, process 0) → the other
+   (interrupts still off) → frame allocator and 16 MiB kernel heap → ACPI tables (MADT, HPET,
+   FADT), the local APIC (x2APIC mode where the CPU has it) and the I/O APIC (the 8259 PICs
+   are masked) → the TSC clock (see Time) → the local APIC timer's mode (TSC-deadline, else
+   one-shot measured against the TSC) → the boot image (the ramdisk) → process subsystem (SSE, syscall MSRs, process 0) → the other
    CPUs (INIT and STARTUP IPIs; each runs a real-mode trampoline from a page below 1 MiB into
    long mode, then compares its TSC with the bootstrap CPU's and sets up its GDT, TSS, GS
    block, local APIC timer and idle task) →
@@ -598,9 +602,15 @@ The scheduler is built for several CPUs (`process/sched.rs`, design in
 `time.rs` keeps time with the TSC, which every CPU reads in a few cycles without a system
 call into a device:
 
-- **Frequency**: from CPUID leaf 0x15 where the CPU states it, else from KVM's paravirtual
-  clock (its published TSC scaling), else measured against the PIT (two intervals, so the
-  fixed cost of starting the PIT cancels out). Nanoseconds since boot are
+- **Frequency** (ADR 0016): where it is stated, from a hypervisor (KVM's paravirtual clock,
+  its published TSC scaling, or the timing leaf 0x4000_0010), else from the CPU (CPUID leaf
+  0x15, the crystal's frequency from that leaf, the CPU model or leaf 0x16, as Linux reads
+  them); else measured against a reference clock from the ACPI tables (`refclock.rs`: the
+  HPET, else the ACPI PM timer, the PIT only as the last resort; the median of three 50 ms
+  runs, each end bracketed by TSC reads, and a reference that does not count is given up on
+  instead of hanging the boot). The boot log names the source and whether the TSC is
+  invariant. Every busy-wait of the kernel (`time::delay_us`: the CPU start-up's pauses)
+  runs on the TSC, so nothing needs the PIT. Nanoseconds since boot are
   `(tsc - boot_tsc) * mult >> 32`.
 - **Synchronized CPUs**: a starting CPU answers 64 requests from the bootstrap CPU with its
   counter; the answer belongs to the middle of the request's round trip, as when clocks are
@@ -640,7 +650,7 @@ call into a device:
 - **Timers** (`timer.rs`): sleeps with a timeout, interval timers and the scheduler tick are
   deadlines in nanoseconds in a queue of the CPU that armed them, and that CPU's local APIC
   interrupts exactly when the first is due: in TSC-deadline mode where the CPU has it, else
-  with a one-shot count (its frequency measured against the PIT). `nanosleep`, `poll`,
+  with a one-shot count (its frequency measured against the TSC). `nanosleep`, `poll`,
   `select`, `futex`, `sigtimedwait` and `setitimer` therefore keep microsecond precision.
   Cancelling is lazy (an entry whose sequence number its owner no longer holds is skipped),
   entries hold their owner weakly, and the queues never allocate after start-up: a full
@@ -667,7 +677,10 @@ call into a device:
   stub (`interrupts/entry.rs`) that builds the same frame and calls one dispatcher, `trap`. A
   Linux program's CPU exceptions go to its server, which raises Linux's signal (`SIGSEGV`,
   `SIGFPE`, `SIGILL`, `SIGBUS`, `SIGTRAP`); a native server's end it. In the kernel they panic
-  with the faulting address. In test mode a panic ends QEMU with a failure.
+  with the faulting address. In test mode a panic ends QEMU with a failure. A panic stops the
+  other CPUs and takes over the console's and the serial port's locks if they stay held, so
+  its message reaches the screen even on a machine without a serial port (which the kernel
+  detects at start-up and then leaves alone).
 - Interrupts and exceptions return through `user_return`, which uses **`iretq`**. A system call
   returns with **`sysretq`** (`syscall_return`, as Linux's fast path) when its frame is one
   sysretq restores exactly: a 64-bit user frame whose `rcx` is its `rip` and `r11` its
