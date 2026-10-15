@@ -1088,7 +1088,9 @@ dispatch; drivers, filesystems, the network stack and Linux itself are user-spac
   sockets (`SOCK_RAW`, `IPPROTO_ICMP`) for `ping` (the program writes the ICMP message, netd
   adds the IPv4 header, reads return whole IPv4 packets, as on Linux; netd answers echo
   requests itself). Every socket call is the server's, with Linux's semantics: `bind`
-  (`EADDRNOTAVAIL`, `EADDRINUSE` with `SO_REUSEADDR`'s rule), `listen`, `accept`/`accept4`,
+  (`EADDRNOTAVAIL`, `EADDRINUSE` with `SO_REUSEADDR`'s rule; `SO_REUSEPORT` lets sockets of
+  the instance share a port, each new connection or datagram going to one of them by a keyed
+  hash of its 4-tuple), `listen`, `accept`/`accept4`,
   `connect` (`EINPROGRESS`, `EALREADY`, `SO_ERROR`), `send*`/`recv*` with `MSG_PEEK`,
   `MSG_DONTWAIT`, `MSG_WAITALL`, `MSG_TRUNC` and `MSG_NOSIGNAL` (`EPIPE` raises `SIGPIPE`),
   `shutdown` (half-close), `SO_RCVTIMEO`/`SO_SNDTIMEO`, `SO_RCVLOWAT`, `TCP_NODELAY` (Nagle's

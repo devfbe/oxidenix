@@ -1548,3 +1548,83 @@ fn test_ipv4_fragment_size() {
         );
     }
 }
+
+/// oxidenix: a datagram goes to the connected socket of its 4-tuple, else
+/// to one bound to its address, else to one bound to any address,
+/// wherever they are in the set.
+#[rstest]
+#[case(Medium::Ip)]
+#[cfg(all(feature = "medium-ip", feature = "socket-udp"))]
+fn test_oxidenix_udp_lookup_order(#[case] medium: Medium) {
+    use crate::socket::udp;
+    let (mut iface, mut sockets, _device) = setup(medium);
+    let src_addr = Ipv4Address::new(192, 168, 1, 2);
+    let dst_addr = Ipv4Address::new(192, 168, 1, 1);
+    let buffer = || udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 4], vec![0; 256]);
+    let mut any = udp::Socket::new(buffer(), buffer());
+    any.bind(68).unwrap();
+    let mut specific = udp::Socket::new(buffer(), buffer());
+    specific.bind(IpListenEndpoint { addr: Some(dst_addr.into()), port: 68 }).unwrap();
+    let mut connected = udp::Socket::new(buffer(), buffer());
+    connected.bind(68).unwrap();
+    connected.set_remote(Some(IpEndpoint::new(src_addr.into(), 67)));
+    let any = sockets.add(any);
+    let specific = sockets.add(specific);
+    let connected = sockets.add(connected);
+
+    let send = |iface: &mut Interface, sockets: &mut SocketSet, src_port: u16| {
+        let udp_repr = UdpRepr { src_port, dst_port: 68 };
+        let mut bytes = vec![0u8; udp_repr.header_len() + 4];
+        let mut packet = UdpPacket::new_unchecked(&mut bytes[..]);
+        udp_repr.emit(&mut packet, &src_addr.into(), &dst_addr.into(), 4, |buf| buf.copy_from_slice(b"ping"), &ChecksumCapabilities::default());
+        let ip_repr = Ipv4Repr { src_addr, dst_addr, next_header: IpProtocol::Udp, hop_limit: 64, payload_len: bytes.len() };
+        iface.inner.process_udp(sockets, PacketMeta::default(), false, ip_repr.into(), &bytes);
+    };
+    send(&mut iface, &mut sockets, 67);
+    assert!(sockets.get_mut::<udp::Socket>(connected).recv().is_ok(), "the connected socket");
+    send(&mut iface, &mut sockets, 99);
+    assert!(sockets.get_mut::<udp::Socket>(specific).recv().is_ok(), "the specific one");
+    assert!(sockets.get_mut::<udp::Socket>(any).recv().is_err());
+    sockets.remove(specific);
+    send(&mut iface, &mut sockets, 99);
+    assert!(sockets.get_mut::<udp::Socket>(any).recv().is_ok(), "then any");
+}
+
+/// oxidenix: a SYN goes to the listener on its address before one on any
+/// address, wherever they are in the set.
+#[rstest]
+#[case(Medium::Ip)]
+#[cfg(all(feature = "medium-ip", feature = "socket-tcp"))]
+fn test_oxidenix_tcp_listener_order(#[case] medium: Medium) {
+    use crate::socket::tcp;
+    let (mut iface, mut sockets, _device) = setup(medium);
+    let src_addr = Ipv4Address::new(192, 168, 1, 2);
+    let dst_addr = Ipv4Address::new(192, 168, 1, 1);
+    let socket = || tcp::Socket::new(tcp::SocketBuffer::new(vec![0; 256]), tcp::SocketBuffer::new(vec![0; 256]));
+    let mut any = socket();
+    any.listen(80).unwrap();
+    let mut specific = socket();
+    specific.listen(IpListenEndpoint { addr: Some(dst_addr.into()), port: 80 }).unwrap();
+    let any = sockets.add(any);
+    let specific = sockets.add(specific);
+    let syn = TcpRepr {
+        src_port: 4000,
+        dst_port: 80,
+        control: TcpControl::Syn,
+        seq_number: TcpSeqNumber(100),
+        ack_number: None,
+        window_len: 1000,
+        window_scale: None,
+        max_seg_size: None,
+        sack_permitted: false,
+        sack_ranges: [None, None, None],
+        timestamp: None,
+        payload: &[],
+    };
+    let mut bytes = vec![0u8; syn.buffer_len()];
+    syn.emit(&mut TcpPacket::new_unchecked(&mut bytes[..]), &src_addr.into(), &dst_addr.into(), &ChecksumCapabilities::default());
+    let ip_repr = Ipv4Repr { src_addr, dst_addr, next_header: IpProtocol::Tcp, hop_limit: 64, payload_len: bytes.len() };
+    iface.inner.process_tcp(&mut sockets, false, ip_repr.into(), &bytes);
+    assert_eq!(sockets.get::<tcp::Socket>(specific).state(), tcp::State::SynReceived);
+    assert_eq!(sockets.get::<tcp::Socket>(any).state(), tcp::State::Listen);
+}

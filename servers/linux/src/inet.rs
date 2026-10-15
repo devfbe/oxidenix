@@ -102,13 +102,15 @@ pub struct Local {
 
 /// Options: what has an effect, and the rest as Linux reads them back.
 /// Plain options of all levels (`inetcalls::plain_slot`).
-pub const PLAIN_SLOTS: usize = 34;
+pub const PLAIN_SLOTS: usize = 33;
 
 #[derive(Clone, Copy)]
 pub struct Opts {
     pub rcvtimeo: u64,
     pub sndtimeo: u64,
     pub reuseaddr: bool,
+    /// SO_REUSEPORT.
+    pub reuseport: bool,
     pub nodelay: bool,
     pub keepalive: bool,
     /// TCP_KEEPIDLE, TCP_KEEPINTVL, TCP_KEEPCNT (seconds, count).
@@ -188,6 +190,7 @@ impl InetSock {
                     rcvtimeo: 0,
                     sndtimeo: 0,
                     reuseaddr: false,
+                    reuseport: false,
                     nodelay: false,
                     keepalive: false,
                     keepidle: 7200,
@@ -445,8 +448,11 @@ impl InetSock {
     // Addresses and connections.
 
     pub fn bind(&self, at: Endpoint) -> Result<(), i64> {
-        let reuse = self.st.lock().opts.reuseaddr;
-        self.net.status(Request::Bind { sock: self.index, at, reuse }).map(|_| ())
+        let (reuse, reuseport) = {
+            let o = &self.st.lock().opts;
+            (o.reuseaddr, o.reuseport)
+        };
+        self.net.status(Request::Bind { sock: self.index, at, reuse, reuseport }).map(|_| ())
     }
 
     pub fn listen(&self, backlog: i32) -> Result<(), i64> {
@@ -457,8 +463,11 @@ impl InetSock {
         if snap.state & (state::ESTABLISHED | state::CONNECTING) != 0 {
             return Err(EINVAL);
         }
-        let reuse = self.st.lock().opts.reuseaddr;
-        self.net.status(Request::Listen { sock: self.index, backlog: backlog.clamp(0, i32::MAX) as u32, reuse })?;
+        let (reuse, reuseport) = {
+            let o = &self.st.lock().opts;
+            (o.reuseaddr, o.reuseport)
+        };
+        self.net.status(Request::Listen { sock: self.index, backlog: backlog.clamp(0, i32::MAX) as u32, reuse, reuseport })?;
         let mut l = self.st.lock();
         l.listening = true;
         self.report(&mut l, false);

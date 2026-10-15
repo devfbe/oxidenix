@@ -17,6 +17,14 @@
 #   that keeps the refused connection's window and receive state.
 # - The window a SYN announced is remembered in scaled units like every other segment's
 #   (a fix: else a receive buffer that grows before the first data is never announced).
+# - SO_REUSEPORT: `Shard` (`tcp::Socket::set_shard`, `udp::Socket::set_shard`) gives a
+#   listener or a bound UDP socket its share of a group's new connections and datagrams by a
+#   hash of the 4-tuple (`Interface::set_reuseport_hash`, keyed by netd), as Linux's
+#   `reuseport_select_sock`.
+# - Lookups as Linux scores them: a TCP segment goes to the socket of its 4-tuple, else to a
+#   listener on its address, else to one on any address; a datagram to a connected UDP
+#   socket (`udp::Socket::set_remote`, which then hears its peer only), else to one bound to
+#   its address, else to one bound to any; wherever they are in the set.
 # Its own workspace, so that its tests run on the host:
 # `cargo test --manifest-path third_party/smoltcp/Cargo.toml --lib`.
 [workspace]

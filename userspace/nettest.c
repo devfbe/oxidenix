@@ -2,7 +2,7 @@
  * (10.0.2.100:7 is an echo service, see builder/src/main.rs), with the
  * Linux semantics of the server's internet sockets (R7b): bulk data
  * intact, MSG_PEEK, MSG_DONTWAIT, MSG_WAITALL, MSG_TRUNC, timeouts,
- * half-close, EPIPE and SIGPIPE, SO_ERROR, SO_REUSEADDR, SO_LINGER, options,
+ * half-close, EPIPE and SIGPIPE, SO_ERROR, SO_REUSEADDR, SO_REUSEPORT, SO_LINGER, options,
  * epoll's edges. */
 #define _GNU_SOURCE
 #include <arpa/inet.h>
@@ -242,6 +242,92 @@ static void lingering_close(void) {
     int r2 = r == 1 ? read(p[1], &c, 1) : r;
     check("SO_LINGER 0: close resets the connection", r2 == -1 && errno == ECONNRESET);
     close(p[1]);
+}
+
+/* A socket of `type` with SO_REUSEPORT (`rp`) bound to 127.0.0.1:`port`; -1 if the bind
+ * failed (errno kept). */
+static int bound(int type, int port, int rp) {
+    int fd = socket(AF_INET, type, 0);
+    setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &rp, sizeof rp);
+    struct sockaddr_in a = addr("127.0.0.1", port);
+    if (bind(fd, (struct sockaddr *)&a, sizeof a) < 0) {
+        int e = errno;
+        close(fd);
+        errno = e;
+        return -1;
+    }
+    return fd;
+}
+
+/* SO_REUSEPORT: sockets that all set it before bind share a port, and the connections and
+ * datagrams that come are spread over them (each to exactly one); one without it conflicts. */
+static void reuseport(void) {
+    const int port = 47123, n = 48;
+    int got = 0;
+    socklen_t len = sizeof got;
+    int a = bound(SOCK_STREAM, port, 1), b = bound(SOCK_STREAM, port, 1);
+    getsockopt(a, SOL_SOCKET, SO_REUSEPORT, &got, &len);
+    check("SO_REUSEPORT reads back", got == 1);
+    check("two TCP sockets with SO_REUSEPORT bind one port", a >= 0 && b >= 0);
+    check("... and both listen", listen(a, 64) == 0 && listen(b, 64) == 0);
+    check("a third without it: EADDRINUSE", bound(SOCK_STREAM, port, 0) < 0 && errno == EADDRINUSE);
+    int conns[48], at_a = 0, at_b = 0;
+    for (int i = 0; i < n; i++) conns[i] = tcp_connect("127.0.0.1", port);
+    fcntl(a, F_SETFL, O_NONBLOCK);
+    fcntl(b, F_SETFL, O_NONBLOCK);
+    usleep(200000);
+    for (int c; (c = accept(a, NULL, NULL)) >= 0; at_a++) close(c);
+    for (int c; (c = accept(b, NULL, NULL)) >= 0; at_b++) close(c);
+    char name[96];
+    snprintf(name, sizeof name, "%d connections spread over both listeners (%d, %d)", n, at_a, at_b);
+    check(name, at_a > 0 && at_b > 0 && at_a + at_b == n);
+    for (int i = 0; i < n; i++) close(conns[i]);
+    /* One leaves: the other takes every connection. */
+    close(a);
+    at_b = 0;
+    for (int i = 0; i < 8; i++) conns[i] = tcp_connect("127.0.0.1", port);
+    usleep(200000);
+    for (int c; (c = accept(b, NULL, NULL)) >= 0; at_b++) close(c);
+    check("after one listener closed, the other takes them all", at_b == 8);
+    for (int i = 0; i < 8; i++) close(conns[i]);
+    close(b);
+
+    /* UDP: every datagram to exactly one of the group. */
+    int u[3];
+    for (int i = 0; i < 3; i++) u[i] = bound(SOCK_DGRAM, port, 1);
+    check("three UDP sockets with SO_REUSEPORT bind one port", u[0] >= 0 && u[1] >= 0 && u[2] >= 0);
+    check("... one without it: EADDRINUSE", bound(SOCK_DGRAM, port, 0) < 0 && errno == EADDRINUSE);
+    struct sockaddr_in to = addr("127.0.0.1", port);
+    for (int i = 0; i < n; i++) {
+        int s = socket(AF_INET, SOCK_DGRAM, 0);
+        sendto(s, "d", 1, 0, (struct sockaddr *)&to, sizeof to);
+        close(s);
+    }
+    usleep(200000);
+    int counts[3] = {0}, total = 0;
+    char c;
+    for (int i = 0; i < 3; i++) {
+        while (recv(u[i], &c, 1, MSG_DONTWAIT) == 1) counts[i]++;
+        total += counts[i];
+    }
+    snprintf(name, sizeof name, "%d datagrams from %d ports spread (%d, %d, %d)", n, n, counts[0], counts[1], counts[2]);
+    check(name, total == n && counts[0] > 0 && counts[1] > 0 && counts[2] > 0);
+    /* A connected member hears its peer, and only it. */
+    int peer = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in pa = addr("127.0.0.1", 0);
+    bind(peer, (struct sockaddr *)&pa, sizeof pa);
+    socklen_t pl = sizeof pa;
+    getsockname(peer, (struct sockaddr *)&pa, &pl);
+    connect(u[0], (struct sockaddr *)&pa, sizeof pa);
+    for (int i = 0; i < 8; i++) sendto(peer, "p", 1, 0, (struct sockaddr *)&to, sizeof to);
+    usleep(100000);
+    int mine = 0, others = 0;
+    while (recv(u[0], &c, 1, MSG_DONTWAIT) == 1) mine++;
+    for (int i = 1; i < 3; i++)
+        while (recv(u[i], &c, 1, MSG_DONTWAIT) == 1) others++;
+    check("a connected member gets every datagram of its peer", mine == 8 && others == 0);
+    close(peer);
+    for (int i = 0; i < 3; i++) close(u[i]);
 }
 
 /* Byte `i` of the bulk transfer's pattern. */
@@ -910,6 +996,7 @@ int main(void) {
 
     stream_semantics();
     lingering_close();
+    reuseport();
     killed_while_waiting_on_netd();
     datagram_semantics();
     many_sockets();

@@ -560,6 +560,9 @@ pub struct Socket<'a> {
     rx_capacity_max: usize,
     /// oxidenix: the connection ended because its timeout expired.
     timed_out: bool,
+    /// oxidenix: its place in an SO_REUSEPORT group while it listens
+    /// (`set_shard`); kept across connections.
+    shard: Option<crate::iface::Shard>,
 }
 
 const DEFAULT_MSS: usize = 536;
@@ -639,6 +642,7 @@ impl<'a> Socket<'a> {
 
             rx_capacity_max: 0,
             timed_out: false,
+            shard: None,
         }
     }
 
@@ -698,6 +702,20 @@ impl<'a> Socket<'a> {
         S: Into<ManagedSlice<'a, u8>>,
     {
         self.tx_buffer.replace_storage(storage)
+    }
+
+    /// oxidenix: while it listens, the socket takes only the new
+    /// connections whose 4-tuple hashes into its share of an SO_REUSEPORT
+    /// group (`Shard`, `Interface::set_reuseport_hash`); None: all of
+    /// them. Kept until set again (not by `listen`, `abort` or a reset).
+    pub fn set_shard(&mut self, shard: Option<crate::iface::Shard>) {
+        self.shard = shard;
+    }
+
+    /// oxidenix: whether the socket holds a connection (or a connection
+    /// attempt) of its own 4-tuple, rather than listening.
+    pub fn has_tuple(&self) -> bool {
+        self.tuple.is_some()
     }
 
     /// oxidenix: whether the connection ended because its timeout expired
@@ -1660,7 +1678,7 @@ impl<'a> Socket<'a> {
         self.reset();
     }
 
-    pub(crate) fn accepts(&self, _cx: &mut Context, ip_repr: &IpRepr, repr: &TcpRepr) -> bool {
+    pub(crate) fn accepts(&self, cx: &mut Context, ip_repr: &IpRepr, repr: &TcpRepr) -> bool {
         if self.state == State::Closed {
             return false;
         }
@@ -1686,7 +1704,13 @@ impl<'a> Socket<'a> {
                 Some(addr) => ip_repr.dst_addr() == addr,
                 None => true,
             };
-            addr_ok && repr.dst_port != 0 && repr.dst_port == self.listen_endpoint.port
+            let ok = addr_ok && repr.dst_port != 0 && repr.dst_port == self.listen_endpoint.port;
+            // oxidenix: a member of an SO_REUSEPORT group takes its share.
+            ok && self.shard.is_none_or(|s| {
+                let local = IpEndpoint::new(ip_repr.dst_addr(), repr.dst_port);
+                let remote = IpEndpoint::new(ip_repr.src_addr(), repr.src_port);
+                s.takes(cx.reuseport_hash(local, remote))
+            })
         }
     }
 
@@ -10453,6 +10477,45 @@ mod test {
         // A new connection did not time out.
         s.listen(LISTEN_END).unwrap();
         assert!(!s.ended_by_timeout());
+    }
+
+    /// Listeners of an SO_REUSEPORT group each take their share of new
+    /// connections: exactly one of them takes each SYN.
+    #[test]
+    fn test_oxidenix_shard_splits_syns() {
+        let mut s = [socket_listen(), socket_listen(), socket_listen()];
+        for (k, t) in s.iter_mut().enumerate() {
+            t.socket.set_shard(Some(crate::iface::Shard { index: k as u32, count: 3 }));
+        }
+        let ip = IpReprIpvX(IpvXRepr {
+            src_addr: REMOTE_ADDR,
+            dst_addr: LOCAL_ADDR,
+            next_header: IpProtocol::Tcp,
+            payload_len: 0,
+            hop_limit: 64,
+        });
+        let mut taken = [0; 3];
+        for port in 1000..1600u16 {
+            let syn = TcpRepr { control: TcpControl::Syn, src_port: port, ack_number: None, ..SEND_TEMPL };
+            let takers: std::vec::Vec<usize> = (0..3)
+                .filter(|&k| {
+                    let TestSocket { socket, cx } = &mut s[k];
+                    socket.accepts(cx, &ip, &syn)
+                })
+                .collect();
+            assert_eq!(takers.len(), 1, "port {port}: {takers:?}");
+            taken[takers[0]] += 1;
+        }
+        assert!(taken.iter().all(|&n| n > 100), "{taken:?}");
+        // The shard stays across a reset and a new listen.
+        s[0].socket.abort();
+        s[0].socket.listen(LOCAL_END).unwrap();
+        assert_eq!(s[0].socket.shard, Some(crate::iface::Shard { index: 0, count: 3 }));
+        // Without one, a listener takes them all.
+        s[1].socket.set_shard(None);
+        let syn = TcpRepr { control: TcpControl::Syn, ack_number: None, ..SEND_TEMPL };
+        let TestSocket { socket, cx } = &mut s[1];
+        assert!(socket.accepts(cx, &ip, &syn));
     }
 
     #[test]

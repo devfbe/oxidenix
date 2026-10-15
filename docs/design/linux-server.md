@@ -522,7 +522,13 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
      is local (`EADDRNOTAVAIL`) and the port, and `listen` checks the port again (Linux's
      `inet_csk_bind_conflict`, `netring::tcp_port_conflict`): a socket on an overlapping
      address conflicts unless both have `SO_REUSEADDR` and it does not listen
-     (`EADDRINUSE`), so of two sockets sharing a port only one may listen; port 0 takes an
+     (`EADDRINUSE`), so of two sockets sharing a port only one may listen, unless both set
+     `SO_REUSEPORT` (then any number of the instance's listeners or UDP sockets share it:
+     netd gives each member of the group its share, smoltcp's `Shard`, and a keyed hash of
+     a new connection's or a datagram's 4-tuple picks exactly one, as Linux's
+     `reuseport_select_sock`; a connected UDP socket hears its peer only, before the
+     others, and a listener or socket bound to the address before one bound to any, as
+     Linux's lookup scores them); port 0 takes an
      ephemeral port; connections inherit their listener's. `EPIPE` with `SIGPIPE`
      (unless `MSG_NOSIGNAL`) once the connection cannot send, after a pending error
      (`ECONNRESET`) is reported once; `MSG_PEEK`, `MSG_WAITALL`, `MSG_TRUNC` (datagrams),

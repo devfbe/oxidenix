@@ -124,6 +124,7 @@ fn main(args: Vec<&'static str>) -> i32 {
     let mut iface = Interface::new(config, &mut nic, now());
     service::init_secrets();
     iface.set_isn_generator(service::isn);
+    iface.set_reuseport_hash(service::reuseport_hash);
     iface.update_ip_addrs(|addrs| {
         let _ = addrs.push(IpCidr::Ipv4(LOOPBACK));
     });

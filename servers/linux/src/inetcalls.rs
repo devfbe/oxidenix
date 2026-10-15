@@ -48,6 +48,7 @@ const SOL_TCP: i32 = 6;
 const SOL_UDP: i32 = 17;
 
 const SO_REUSEADDR: u64 = 2;
+const SO_REUSEPORT: u64 = 15;
 const SO_TYPE: u64 = 3;
 const SO_ERROR: u64 = 4;
 const SO_SNDBUF: u64 = 7;
@@ -66,9 +67,9 @@ const SO_DOMAIN: u64 = 39;
 const SO_RCVTIMEO_NEW: u64 = 66;
 const SO_SNDTIMEO_NEW: u64 = 67;
 /// Socket options kept as an int and otherwise without effect here
-/// (dontroute, broadcast, oobinline, no_check, priority, reuseport,
-/// timestamp, busy_poll).
-const PLAIN_SOCKET: [u64; 8] = [5, 6, 10, 11, 12, 15, 29, 46];
+/// (dontroute, broadcast, oobinline, no_check, priority, timestamp,
+/// busy_poll).
+const PLAIN_SOCKET: [u64; 7] = [5, 6, 10, 11, 12, 29, 46];
 
 const TCP_NODELAY: u64 = 1;
 const TCP_MAXSEG: u64 = 2;
@@ -93,13 +94,16 @@ const PLAIN_UDP: [u64; 3] = [1, 103, 104];
 /// The slot of plain option (`level`, `name`) in `Opts::plain`: the
 /// lists above one after the other, IP_TOS after PLAIN_IP's.
 fn plain_slot(level: i32, name: u64) -> Option<usize> {
+    const TCP: usize = PLAIN_SOCKET.len();
+    const IP: usize = TCP + PLAIN_TCP.len();
+    const TOS: usize = IP + PLAIN_IP.len();
     let at = |list: &[u64], base: usize| list.iter().position(|&n| n == name).map(|k| base + k);
     match level {
         SOL_SOCKET => at(&PLAIN_SOCKET, 0),
-        SOL_TCP => at(&PLAIN_TCP, 8),
-        SOL_IP if name == IP_TOS => Some(30),
-        SOL_IP => at(&PLAIN_IP, 18),
-        SOL_UDP => at(&PLAIN_UDP, 31),
+        SOL_TCP => at(&PLAIN_TCP, TCP),
+        SOL_IP if name == IP_TOS => Some(TOS),
+        SOL_IP => at(&PLAIN_IP, IP),
+        SOL_UDP => at(&PLAIN_UDP, TOS + 1),
         _ => None,
     }
 }
@@ -398,6 +402,9 @@ fn setsockopt(sock: &Arc<InetSock>, level: u64, name: u64, val: u64, len: u64) -
     let tcp = sock.kind == Kind::Tcp;
     match (level, name) {
         (SOL_SOCKET, SO_REUSEADDR) => sock.st.lock().opts.reuseaddr = int()? != 0,
+        // Read at bind and listen (netd shares the port with the other
+        // sockets of the instance that set it, `netring::tcp_port_conflict`).
+        (SOL_SOCKET, SO_REUSEPORT) => sock.st.lock().opts.reuseport = int()? != 0,
         (SOL_SOCKET, SO_KEEPALIVE) => {
             let on = int()? != 0;
             if tcp {
@@ -528,6 +535,7 @@ fn getsockopt(sock: &Arc<InetSock>, level: u64, name: u64, val: u64, lenp: u64) 
         (SOL_SOCKET, SO_ERROR) => int(sock.take_error()),
         (SOL_SOCKET, SO_ACCEPTCONN) => int(sock.listening() as i64),
         (SOL_SOCKET, SO_REUSEADDR) => int(o.reuseaddr as i64),
+        (SOL_SOCKET, SO_REUSEPORT) => int(o.reuseport as i64),
         (SOL_SOCKET, SO_KEEPALIVE) => int(o.keepalive as i64),
         (SOL_SOCKET, SO_SNDBUF) => int(o.sndbuf as i64),
         (SOL_SOCKET, SO_RCVBUF) => int(o.rcvbuf as i64),

@@ -40,15 +40,33 @@ impl InterfaceInner {
             }
         }
 
-        for tcp_socket in sockets
-            .items_mut()
-            .filter_map(|i| Socket::downcast_mut(&mut i.socket))
-        {
+        // oxidenix: the socket of the segment's own 4-tuple first, then a
+        // listener on its address, then one on any address (as Linux's
+        // lookup scores them), wherever they are in the set: of listeners
+        // sharing a port (SO_REUSEPORT) the most specific takes it.
+        let mut listener: Option<(bool, SocketHandle)> = None;
+        for item in sockets.items_mut() {
+            let handle = item.meta.handle;
+            let Some(tcp_socket) = Socket::downcast_mut(&mut item.socket) else {
+                continue;
+            };
             if tcp_socket.accepts(self, &ip_repr, &tcp_repr) {
-                return tcp_socket
-                    .process(self, &ip_repr, &tcp_repr)
-                    .map(|(ip, tcp)| Packet::new(ip, IpPayload::Tcp(tcp)));
+                if tcp_socket.has_tuple() {
+                    return tcp_socket
+                        .process(self, &ip_repr, &tcp_repr)
+                        .map(|(ip, tcp)| Packet::new(ip, IpPayload::Tcp(tcp)));
+                }
+                let specific = tcp_socket.listen_endpoint().addr.is_some();
+                if listener.is_none_or(|(s, _)| specific && !s) {
+                    listener = Some((specific, handle));
+                }
             }
+        }
+        if let Some((_, handle)) = listener {
+            return sockets
+                .get_mut::<Socket>(handle)
+                .process(self, &ip_repr, &tcp_repr)
+                .map(|(ip, tcp)| Packet::new(ip, IpPayload::Tcp(tcp)));
         }
 
         if tcp_repr.control == TcpControl::Rst

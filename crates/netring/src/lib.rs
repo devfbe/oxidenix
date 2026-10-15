@@ -50,8 +50,8 @@
 //! | op | request | completion |
 //! |----|---------|------------|
 //! | `SOCKET` | `object` socket, `arg[0]` kind, the area (datagram sockets: required; TCP: none) | 0 |
-//! | `BIND` | socket, `offset` endpoint (address 0: any; port 0: an ephemeral one), `arg[0]` `BIND_REUSEADDR` | v0 = the port |
-//! | `LISTEN` | socket, `arg[0]` backlog, `arg[1]` `BIND_REUSEADDR` (as at listen) | 0 |
+//! | `BIND` | socket, `offset` endpoint (address 0: any; port 0: an ephemeral one), `arg[0]` `BIND_REUSEADDR`, `BIND_REUSEPORT` | v0 = the port |
+//! | `LISTEN` | socket, `arg[0]` backlog, `arg[1]` `BIND_REUSEADDR`, `BIND_REUSEPORT` (as at listen) | 0 |
 //! | `CONNECT` | socket, endpoint; TCP: the area (unless it has one) | 0 once started (TCP: the outcome comes in the control block); a datagram socket's peer is set (endpoint 0: none) |
 //! | `ACCEPT` | listener, `arg[0]` the new socket, its area | v0 = peer address, v1 = peer port; `EAGAIN` |
 //! | `SEND` | socket, endpoint (0: the peer), `len` bytes at the start of the send ring | bytes; `EAGAIN` if smoltcp's buffer is full |
@@ -162,8 +162,14 @@ impl Kind {
     }
 }
 
-/// `BIND`'s flags.
+/// `BIND`'s and `LISTEN`'s flags: SO_REUSEADDR, SO_REUSEPORT.
 pub const BIND_REUSEADDR: u64 = 1;
+pub const BIND_REUSEPORT: u64 = 2;
+
+/// The flags of `reuse` and `reuseport`.
+fn reuse_flags(reuse: bool, reuseport: bool) -> u64 {
+    (if reuse { BIND_REUSEADDR } else { 0 }) | if reuseport { BIND_REUSEPORT } else { 0 }
+}
 /// `SHUTDOWN`'s bits.
 pub const SHUT_RD: u64 = 1;
 pub const SHUT_WR: u64 = 2;
@@ -522,9 +528,11 @@ impl Endpoint {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Request {
     Socket { sock: u32, kind: Kind, area: Option<Area> },
-    Bind { sock: u32, at: Endpoint, reuse: bool },
-    /// `reuse`: SO_REUSEADDR as it is at listen (Linux reads it then).
-    Listen { sock: u32, backlog: u32, reuse: bool },
+    /// `reuse`: SO_REUSEADDR, `reuseport`: SO_REUSEPORT.
+    Bind { sock: u32, at: Endpoint, reuse: bool, reuseport: bool },
+    /// `reuse`, `reuseport`: the options as they are at listen (Linux
+    /// reads them then).
+    Listen { sock: u32, backlog: u32, reuse: bool, reuseport: bool },
     Connect { sock: u32, to: Endpoint, area: Option<Area> },
     Accept { sock: u32, new: u32, area: Area },
     Send { sock: u32, to: Endpoint, len: u32 },
@@ -577,18 +585,20 @@ impl Request {
                 (Request::Socket { sock: sock(d.object)?, kind, area }, Used { buf: true, args: 1, ..with_sock })
             }
             op::BIND => {
-                if d.arg[0] & !BIND_REUSEADDR != 0 {
+                if d.arg[0] & !(BIND_REUSEADDR | BIND_REUSEPORT) != 0 {
                     return Err(EINVAL);
                 }
-                let r = Request::Bind { sock: sock(d.object)?, at: Endpoint::unpack(d.offset)?, reuse: d.arg[0] != 0 };
+                let (reuse, reuseport) = (d.arg[0] & BIND_REUSEADDR != 0, d.arg[0] & BIND_REUSEPORT != 0);
+                let r = Request::Bind { sock: sock(d.object)?, at: Endpoint::unpack(d.offset)?, reuse, reuseport };
                 (r, Used { offset: true, args: 1, ..with_sock })
             }
             op::LISTEN => {
                 let backlog = u32::try_from(d.arg[0]).map_err(|_| EINVAL)?;
-                if d.arg[1] & !BIND_REUSEADDR != 0 {
+                if d.arg[1] & !(BIND_REUSEADDR | BIND_REUSEPORT) != 0 {
                     return Err(EINVAL);
                 }
-                (Request::Listen { sock: sock(d.object)?, backlog, reuse: d.arg[1] != 0 }, Used { args: 2, ..with_sock })
+                let (reuse, reuseport) = (d.arg[1] & BIND_REUSEADDR != 0, d.arg[1] & BIND_REUSEPORT != 0);
+                (Request::Listen { sock: sock(d.object)?, backlog, reuse, reuseport }, Used { args: 2, ..with_sock })
             }
             op::CONNECT => {
                 let r = Request::Connect { sock: sock(d.object)?, to: Endpoint::unpack(d.offset)?, area: Area::from_desc(d)? };
@@ -678,14 +688,14 @@ impl Request {
                 d.arg[0] = kind as u64;
                 Area::to_desc(area, &mut d);
             }
-            Request::Bind { sock, at, reuse } => {
+            Request::Bind { sock, at, reuse, reuseport } => {
                 d.object = sock as u64;
                 d.offset = at.pack();
-                d.arg[0] = if reuse { BIND_REUSEADDR } else { 0 };
+                d.arg[0] = reuse_flags(reuse, reuseport);
             }
-            Request::Listen { sock, backlog, reuse } => {
+            Request::Listen { sock, backlog, reuse, reuseport } => {
                 d.object = sock as u64;
-                d.arg = [backlog as u64, if reuse { BIND_REUSEADDR } else { 0 }, 0];
+                d.arg = [backlog as u64, reuse_flags(reuse, reuseport), 0];
             }
             Request::Connect { sock, to, area } => {
                 d.object = sock as u64;
@@ -884,7 +894,9 @@ pub struct PortHolder {
     pub port: u16,
     /// Its address (None: any).
     pub addr: Option<u32>,
+    /// SO_REUSEADDR, SO_REUSEPORT.
     pub reuse: bool,
+    pub reuseport: bool,
     pub listening: bool,
     /// A connection (connected or accepted): matched by both endpoints,
     /// it never receives what is meant for a new socket.
@@ -900,6 +912,7 @@ pub struct PortClaim {
     pub port: u16,
     pub addr: Option<u32>,
     pub reuse: bool,
+    pub reuseport: bool,
 }
 
 fn overlaps(a: Option<u32>, b: Option<u32>) -> bool {
@@ -908,8 +921,10 @@ fn overlaps(a: Option<u32>, b: Option<u32>) -> bool {
 
 /// Whether a TCP claim conflicts with a holder (EADDRINUSE). Linux's rule
 /// (inet_csk_bind_conflict): a socket on an overlapping address conflicts
-/// unless both allow reuse (SO_REUSEADDR) and it does not listen; netd
-/// checks it at bind and again at listen. Across instances it is stricter:
+/// unless both allow reuse (SO_REUSEADDR) and it does not listen, or both
+/// set SO_REUSEPORT (and belong to the same user: here everyone is root,
+/// so the same instance); netd checks it at bind and again at listen.
+/// Across instances it is stricter:
 /// a port another instance holds in any way (bound, listening, a
 /// connection, closing or in TIME-WAIT) is never shared, so one instance
 /// can neither take over a port another one serves nor learn, by a
@@ -918,15 +933,17 @@ pub fn tcp_port_conflict(claim: &PortClaim, other: &PortHolder) -> bool {
     if claim.port != other.port || !overlaps(claim.addr, other.addr) {
         return false;
     }
-    claim.owner != other.owner || !(claim.reuse && other.reuse && !other.listening)
+    claim.owner != other.owner || !((claim.reuse && other.reuse && !other.listening) || (claim.reuseport && other.reuseport))
 }
 
 /// Whether a UDP claim conflicts with a holder: a socket on an overlapping
-/// address conflicts unless both allow reuse and both are the same
+/// address conflicts unless both allow reuse (both SO_REUSEADDR or both
+/// SO_REUSEPORT, Linux's udp_lib_lport_inuse) and both are the same
 /// instance's (a datagram goes to one of them: never to another
 /// instance's).
 pub fn udp_port_conflict(claim: &PortClaim, other: &PortHolder) -> bool {
-    claim.port == other.port && overlaps(claim.addr, other.addr) && !(claim.reuse && other.reuse && claim.owner == other.owner)
+    let shared = (claim.reuse && other.reuse) || (claim.reuseport && other.reuseport);
+    claim.port == other.port && overlaps(claim.addr, other.addr) && !(shared && claim.owner == other.owner)
 }
 
 /// The pieces of the ring range [`pos`, `pos + len`) in a ring of `size`

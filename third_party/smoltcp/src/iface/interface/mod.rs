@@ -38,6 +38,8 @@ use super::fragmentation::{Fragmenter, FragmentsBuffer};
 #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
 use super::neighbor::{Answer as NeighborAnswer, Cache as NeighborCache};
 use super::socket_set::SocketSet;
+#[allow(unused)] // oxidenix: the socket lookups of tcp.rs and udp.rs
+use super::socket_set::SocketHandle;
 use crate::config::{
     IFACE_MAX_ADDR_COUNT, IFACE_MAX_PREFIX_COUNT, IFACE_MAX_SIXLOWPAN_ADDRESS_CONTEXT_COUNT,
 };
@@ -56,6 +58,32 @@ use crate::wire::*;
 /// endpoint (local) to the second (remote) at a time
 /// (`Interface::set_isn_generator`).
 pub type IsnGenerator = fn(IpEndpoint, IpEndpoint, Instant) -> u32;
+
+/// oxidenix: the hash of a packet's 4-tuple, local endpoint first, that
+/// chooses among the sockets of an SO_REUSEPORT group (`Shard`,
+/// `Interface::set_reuseport_hash`): keyed, so that nobody can aim
+/// packets at one member.
+pub type ReuseportHash = fn(IpEndpoint, IpEndpoint) -> u32;
+
+/// oxidenix: a socket's place in an SO_REUSEPORT group of `count` sockets
+/// that share a local endpoint (`tcp::Socket::set_shard`,
+/// `udp::Socket::set_shard`): it takes a new connection or a datagram
+/// only if the hash of its 4-tuple falls in its share, as Linux's
+/// `reuseport_select_sock` (`reciprocal_scale(hash, count) == index`), so
+/// that exactly one member of the group takes each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct Shard {
+    pub index: u32,
+    pub count: u32,
+}
+
+impl Shard {
+    /// Whether the member takes what hashes to `hash`.
+    pub fn takes(&self, hash: u32) -> bool {
+        ((hash as u64 * self.count as u64) >> 32) as u32 == self.index
+    }
+}
 
 macro_rules! check {
     ($e:expr) => {
@@ -137,6 +165,9 @@ pub struct InterfaceInner {
     /// oxidenix: how TCP chooses its initial sequence numbers
     /// (`Interface::set_isn_generator`); None: at random from `rand`.
     isn: Option<IsnGenerator>,
+    /// oxidenix: the hash that spreads packets over an SO_REUSEPORT group
+    /// (`Interface::set_reuseport_hash`); None: an unkeyed mix.
+    reuseport_hash: Option<ReuseportHash>,
 
     #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
     neighbor_cache: NeighborCache,
@@ -280,6 +311,7 @@ impl Interface {
             inner: InterfaceInner {
                 now,
                 isn: None,
+                reuseport_hash: None,
                 caps,
                 hardware_addr: config.hardware_addr,
                 ip_addrs: Vec::new(),
@@ -323,6 +355,12 @@ impl Interface {
     /// guess them. Without it they are drawn from the interface's PRNG.
     pub fn set_isn_generator(&mut self, f: IsnGenerator) {
         self.inner.isn = Some(f);
+    }
+
+    /// oxidenix: the members of SO_REUSEPORT groups (`Shard`) are chosen
+    /// by `f`, a keyed hash of a packet's 4-tuple (local endpoint first).
+    pub fn set_reuseport_hash(&mut self, f: ReuseportHash) {
+        self.inner.reuseport_hash = Some(f);
     }
 
     /// Get the HardwareAddress address of the interface.
@@ -889,6 +927,34 @@ impl InterfaceInner {
             Some(f) => f(local, remote, self.now),
             None => self.rand.rand_u32(),
         }
+    }
+
+    /// oxidenix: the hash of the 4-tuple from `remote` to `local` that
+    /// picks an SO_REUSEPORT group's member (`Shard`).
+    #[allow(unused)]
+    pub(crate) fn reuseport_hash(&self, local: IpEndpoint, remote: IpEndpoint) -> u32 {
+        if let Some(f) = self.reuseport_hash {
+            return f(local, remote);
+        }
+        // Unkeyed (FNV-1a over the ports and addresses): even, but
+        // predictable.
+        let mut h: u32 = 0x811c_9dc5;
+        let mut mix = |b: &[u8]| {
+            for &x in b {
+                h = (h ^ x as u32).wrapping_mul(0x0100_0193);
+            }
+        };
+        mix(&local.port.to_be_bytes());
+        mix(&remote.port.to_be_bytes());
+        for addr in [local.addr, remote.addr] {
+            match addr {
+                #[cfg(feature = "proto-ipv4")]
+                IpAddress::Ipv4(a) => mix(&a.octets()),
+                #[cfg(feature = "proto-ipv6")]
+                IpAddress::Ipv6(a) => mix(&a.octets()),
+            }
+        }
+        h
     }
 
     #[allow(unused)] // unused depending on which sockets are enabled
