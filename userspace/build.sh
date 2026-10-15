@@ -19,10 +19,15 @@ nix-shell -p pkgsStatic.stdenv.cc --run "$cmds"
 
 ROOT="$(dirname "$OUT")"
 mkdir -p "$ROOT/sbin"
+# The servers keep their symbols and line tables in target/servers (to
+# resolve a panic's backtrace: CLAUDE.md); the initramfs gets them stripped
+# by the toolchain's llvm-strip (rust-toolchain.toml's llvm-tools).
+STRIP="$(cd "$SRC/.." && rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin/llvm-strip"
 for server in "$SRC"/../servers/*/; do
     name="$(basename "$server")"
     (cd "$server" && CARGO_TARGET_DIR="$SRC/../target/servers" "${CARGO:-cargo}" build --release -q)
-    install -m 755 "$SRC/../target/servers/x86_64-unknown-none/release/$name" "$ROOT/sbin/$name"
+    "$STRIP" --strip-all -o "$ROOT/sbin/$name" "$SRC/../target/servers/x86_64-unknown-none/release/$name"
+    chmod 755 "$ROOT/sbin/$name"
 done
 
 BASH_BIN="$(nix-build '<nixpkgs>' -A pkgsStatic.bash --no-out-link)/bin/bash"

@@ -661,33 +661,70 @@ fn test(nr: u64, addr: u64) -> i64 {
     }
 }
 
+/// A line for the console, made on the stack (the heap may be what failed):
+/// what does not fit is cut off.
+struct PanicLine {
+    buf: [u8; SERVER_LOG_MAX as usize],
+    len: usize,
+}
+
+impl PanicLine {
+    fn new() -> PanicLine {
+        PanicLine { buf: [0; SERVER_LOG_MAX as usize], len: 0 }
+    }
+
+    fn log(&self) {
+        syscall(SYS_SERVER_LOG, [self.buf.as_ptr() as u64, self.len as u64, 0, 0, 0, 0]);
+    }
+}
+
+impl core::fmt::Write for PanicLine {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let k = s.len().min(self.buf.len() - self.len);
+        self.buf[self.len..self.len + k].copy_from_slice(&s.as_bytes()[..k]);
+        self.len += k;
+        Ok(())
+    }
+}
+
+/// Return addresses a backtrace prints at most.
+const BACKTRACE_DEPTH: usize = 16;
+
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    // Where, on the console (the binary has no symbols): "panic at file:line", made on the
-    // stack (the heap may be what failed).
+    use core::fmt::Write;
+    // On the console (the shipped binary has no symbols): "panic at
+    // file:line: message", then the return addresses of the calls that led
+    // here, which the unstripped binary resolves on the host (CLAUDE.md).
+    let mut line = PanicLine::new();
+    let _ = write!(line, "panic");
     if let Some(l) = info.location() {
-        let mut buf = [0u8; SERVER_LOG_MAX as usize];
-        let mut n = 0;
-        let mut put = |bytes: &[u8]| {
-            let k = bytes.len().min(buf.len() - n);
-            buf[n..n + k].copy_from_slice(&bytes[..k]);
-            n += k;
-        };
-        put(b"panic at ");
-        put(l.file().as_bytes());
-        put(b":");
-        let (mut line, mut digits, mut d) = (l.line(), [0u8; 10], 10);
-        loop {
-            d -= 1;
-            digits[d] = b'0' + (line % 10) as u8;
-            line /= 10;
-            if line == 0 {
-                break;
-            }
-        }
-        put(&digits[d..]);
-        syscall(SYS_SERVER_LOG, [buf.as_ptr() as u64, n as u64, 0, 0, 0, 0]);
+        let _ = write!(line, " at {}:{}", l.file(), l.line());
     }
+    let _ = write!(line, ": {}", info.message());
+    line.log();
+    let mut line = PanicLine::new();
+    let _ = write!(line, "backtrace:");
+    // The chain of frame pointers (the server is built with them): each
+    // frame holds the caller's frame pointer and the return address above
+    // it. It ends where a frame pointer does not lead up the same stack.
+    let mut fp: u64;
+    unsafe { core::arch::asm!("mov {}, rbp", out(reg) fp) };
+    for _ in 0..BACKTRACE_DEPTH {
+        if fp == 0 || fp % 8 != 0 {
+            break;
+        }
+        let (next, ret) = unsafe { (*(fp as *const u64), *((fp + 8) as *const u64)) };
+        if ret == 0 {
+            break;
+        }
+        let _ = write!(line, " {ret:#x}");
+        if next <= fp || next - fp > 1 << 20 {
+            break;
+        }
+        fp = next;
+    }
+    line.log();
     // An invalid opcode: the kernel ends the process.
     loop {
         unsafe { core::arch::asm!("ud2") };

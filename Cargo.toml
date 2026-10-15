@@ -11,5 +11,7 @@ opt-level = 2
 
 [profile.release]
 panic = "abort"
-# Servers ship in the initramfs, which the bootloader reads slowly.
-strip = "symbols"
+# Symbols and line tables stay in target/ (a server's panic backtrace is
+# resolved with them: CLAUDE.md); userspace/build.sh strips the copies
+# that ship in the initramfs, which the bootloader reads slowly.
+debug = "line-tables-only"
