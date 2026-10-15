@@ -525,8 +525,10 @@ fn execveat(s: &mut State, dirfd: u64, path: u64, argv: u64, envp: u64, flags: u
     let files = fdtable::current().copy_room()?;
     // Past the point of no return a failure ends the process; it does so once this call
     // returned and let go of everything (`local::exit_pending`, carried out by `serve`).
-    if let Err(status) = run(s, prepared, files) {
-        local::exit_pending(status);
+    match run(s, prepared, files) {
+        Err(status) => local::exit_pending(status),
+        // Its tracer hears of the exec (the message: the id it had before).
+        Ok(()) => crate::ptrace::exec_event(s, tid),
     }
     Ok(0)
 }
@@ -724,6 +726,9 @@ fn de_thread() -> Result<(), i64> {
                     // (In place: its one entry's room is there.)
                     p.threads.clear();
                     p.threads.push(pid);
+                    // Its tracees follow it; the old main thread's trace record goes
+                    // unreported (Linux's de_thread).
+                    crate::ptrace::exec_moved(&mut t, tid, pid);
                     let l = local::get();
                     l.tid.store(pid, core::sync::atomic::Ordering::Relaxed);
                 }

@@ -60,6 +60,13 @@ pub const RESTORE_MASK: u32 = 1;
 pub const EXIT_PENDING: u32 = 2;
 /// The thread is exiting: its closes never linger (Linux's PF_EXITING).
 pub const EXITING: u32 = 4;
+/// The thread's tracer asked for syscall stops (PTRACE_SYSCALL), for PTRACE_SYSEMU's, or
+/// single-steps it: its loop asks `ptrace` at a call's entry and end. Set by the thread
+/// itself when its tracer resumes it (`ptrace::stop`), from its trace record, which
+/// `ptrace` looks at again (a tracer gone since leaves a flag that finds no record).
+pub const TRACE_SYSCALL: u32 = 8;
+pub const TRACE_SYSEMU: u32 = 16;
+pub const TRACE_STEP: u32 = 32;
 
 /// Whether the calling thread is exiting (`EXITING`).
 pub fn exiting() -> bool {

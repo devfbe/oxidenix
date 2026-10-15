@@ -29,7 +29,18 @@ done, delete it here in the same commit.
 
 ## Linux features not implemented
 
-- Processes and signals: core files, `ptrace`.
+- Processes and signals: core files.
+- ptrace (ADR 0019): `PTRACE_SINGLEBLOCK` (`EIO`: block steps would need the thread's
+  `DEBUGCTL.BTF` switched like its debug registers), `NT_X86_XSTATE` (`ENODEV`, as Linux on
+  a CPU without XSAVE: the kernel enables no AVX state; it comes with XSAVE), 32-bit tracees
+  and `PTRACE_GET_THREAD_AREA`/`SET_THREAD_AREA`, seccomp and its requests and
+  `PTRACE_O_SUSPEND_SECCOMP`, `PTRACE_SET_SYSCALL_USER_DISPATCH_CONFIG`; `FOLL_FORCE`
+  access to `PROT_NONE` mappings (Linux reads and writes them; here `EIO`/`EFAULT`); a
+  real parent learns of a process's end once its tracer reaped the traced main thread, but
+  not after the other traced threads (Linux waits for all); hardware breakpoints are cleared
+  at detach (Linux keeps them until exec or exit); a watchpoint on memory the server or the
+  kernel touches for the program (a read(2) buffer) leaves no mark in the tracer's DR6
+  (Linux records it there, without a signal).
   `/proc/<pid>/maps` names the program file, the vDSO, the stack and the heap, but not other
   mapped files (it would need the server to know which file each mapped object is); no
   `smaps`.
@@ -39,8 +50,9 @@ done, delete it here in the same commit.
 - Credentials: everyone in a tree is root with every capability, so the checks Linux makes
   between processes of different users always pass and are not written yet: `kill`'s and
   `pidfd_send_signal`'s permission check, ptrace access mode (`PTRACE_MODE_READ` for
-  `/proc/<pid>/maps`, `environ`, `mem`, the fd links; `PTRACE_MODE_ATTACH` for
-  `pidfd_getfd`), the dumpable flag's effect on them. Users of their own need them all at
+  `/proc/<pid>/maps`, `environ`, the fd links; `PTRACE_MODE_ATTACH` for `ptrace`'s attach,
+  `process_vm_readv`/`writev`, `/proc/<pid>/mem` and `pidfd_getfd`; Yama's scope), the
+  dumpable flag's effect on them. Users of their own need them all at
   once (a tree's processes see no other tree's).
 - Terminal: packet mode (`TIOCPKT`), the Linux console's VT and keyboard ioctls, serial input.
 - Network: IPv6, `O_ASYNC` (`SIGIO`; `F_SETOWN` is kept and used for `SIGURG`), raw ICMP is shared

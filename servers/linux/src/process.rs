@@ -116,6 +116,9 @@ pub struct Words {
     pub stop: AtomicU32,
     /// 1 once the process (a vfork child) exec'd or ended: its parent waits for it.
     pub vfork: AtomicU32,
+    /// Advances when a tracer resumed or let go of one of its traced threads (`ptrace`):
+    /// its stopped tracees sleep on it.
+    pub trace: AtomicU32,
     /// What the process's pidfds watch: `EXITED` once it is a zombie, `REAPED` once reaped.
     pub watch: Watch,
 }
@@ -239,6 +242,12 @@ pub struct Proc {
     pub exec_bytes: Arc<core::sync::atomic::AtomicUsize>,
     /// Its resource limits (`ids::Limits`), its threads' too.
     pub limits: Arc<crate::ids::Limits>,
+    /// Its main thread ended traced while other threads lived on: the trace record its
+    /// tracer gets as the process's zombie once the process has ended (`ptrace`).
+    pub leader_trace: Option<alloc::boxed::Box<crate::ptrace::Tracee>>,
+    /// A zombie whose tracer (not in its parent's process) has not reaped it: its parent
+    /// hears of the end only then (`ptrace::release_zombie`).
+    pub trace_zombie: bool,
 }
 
 pub struct Thread {
@@ -275,6 +284,12 @@ pub struct Thread {
     pub watch: Option<Arc<Watch>>,
     /// Its sleep on a CPU clock (clock_nanosleep), which the timer thread ends.
     pub cpu_sleep: Option<crate::timer::CpuSleep>,
+    /// Its tracer's record of it (`ptrace`; None: not traced).
+    pub trace: Option<alloc::boxed::Box<crate::ptrace::Tracee>>,
+    /// As a tracer: its tracees' zombies it has not reaped, a list through their records.
+    pub dead: Option<alloc::boxed::Box<crate::ptrace::Tracee>>,
+    /// The wait status it ended with (exit, exit_group, a fatal signal), once it did.
+    pub exit_status: Option<i32>,
 }
 
 pub struct Table {
@@ -291,6 +306,9 @@ pub struct Table {
     next_serial: u64,
     /// Ids a clone under way took (its records come later, in a second lock section).
     pending: alloc::collections::BTreeSet<Pid>,
+    /// Zombies of traced threads on their tracers' lists (`Thread::dead`), whose ids are
+    /// not reused until reaped.
+    pub trace_zombies: usize,
 }
 
 pub static PROCS: Mutex<Table> = Mutex::new(Table {
@@ -303,6 +321,7 @@ pub static PROCS: Mutex<Table> = Mutex::new(Table {
     rt_queued: 0,
     next_serial: 1,
     pending: alloc::collections::BTreeSet::new(),
+    trace_zombies: 0,
 });
 
 /// A child's start: what its server needs before the program runs (`thread_create`'s
@@ -327,7 +346,7 @@ impl Table {
         groups.extend(self.procs.values().flat_map(|q| [q.pgid, q.sid]));
         groups.sort_unstable();
         let used = |t: &Table, p: Pid| {
-            t.procs.contains_key(&p) || t.threads.contains_key(&p) || t.pending.contains(&p) || groups.binary_search(&p).is_ok()
+            t.procs.contains_key(&p) || t.threads.contains_key(&p) || t.pending.contains(&p) || groups.binary_search(&p).is_ok() || crate::ptrace::zombie_holds(t, p)
         };
         let mut candidate = self.next_pid;
         for _ in 0..PID_MAX {
@@ -570,10 +589,34 @@ pub fn register_init(key: u64) {
             tables_out: 0,
             exec_bytes: Arc::new(core::sync::atomic::AtomicUsize::new(0)),
             limits: limits.clone(),
+            leader_trace: None,
+            trace_zombie: false,
         };
         t.procs.insert(pid, p);
         let serial = t.new_serial();
-        t.threads.insert(pid, Thread { tid: pid, pid, key, fs, files: Some(files), limits, comm: comm_from("init"), sig: signal::ThreadSignals::default(), exited: false, serial, reserved, robust: 0, cpu: Default::default(), watch: None, cpu_sleep: None });
+        t.threads.insert(
+            pid,
+            Thread {
+                tid: pid,
+                pid,
+                key,
+                fs,
+                files: Some(files),
+                limits,
+                comm: comm_from("init"),
+                sig: signal::ThreadSignals::default(),
+                exited: false,
+                serial,
+                reserved,
+                robust: 0,
+                cpu: Default::default(),
+                watch: None,
+                cpu_sleep: None,
+                trace: None,
+                dead: None,
+                exit_status: None,
+            },
+        );
         t.keys.insert(key, pid);
         local::set(pid, pid, key, fs_ptr, files_ptr, limits_ptr);
     }
@@ -611,8 +654,8 @@ pub fn handle(s: &mut State) -> Option<i64> {
             clone(s, Clone { flags: flags & !CSIGNAL, exit_signal: flags & CSIGNAL, stack: a1, ptid: a2, ctid: a3, tls: a4, pidfd, legacy: true })
         }
         SYS_CLONE3 => clone3(s, a0, a1),
-        SYS_EXIT => exit(((a0 & 0xff) << 8) as i32, false),
-        SYS_EXIT_GROUP => exit(((a0 & 0xff) << 8) as i32, true),
+        SYS_EXIT => exit_call(s, ((a0 & 0xff) << 8) as i32, false),
+        SYS_EXIT_GROUP => exit_call(s, ((a0 & 0xff) << 8) as i32, true),
         SYS_WAIT4 => wait4(a0 as i32, a1, a2, a3),
         SYS_WAITID => waitid(a0, a1 as u32, a2, a3, a4),
         SYS_SETPGID => setpgid(a0 as i32, a1 as i32),
@@ -651,7 +694,7 @@ struct Clone {
 
 /// clone3(args, size): `struct clone_args` (at least its first 64 bytes, CLONE_ARGS_SIZE_VER0;
 /// bytes beyond what is known must be zero, E2BIG).
-fn clone3(s: &State, args: u64, size: u64) -> Result<i64, i64> {
+fn clone3(s: &mut State, args: u64, size: u64) -> Result<i64, i64> {
     const E2BIG: i64 = 7;
     if size < 64 || size > 4096 {
         return Err(EINVAL);
@@ -691,8 +734,10 @@ fn clone3(s: &State, args: u64, size: u64) -> Result<i64, i64> {
     clone(s, Clone { flags, exit_signal, stack: top, ptid: parent_tid, ctid: child_tid, tls, pidfd, legacy: false })
 }
 
-/// clone and its relatives: a new process (fork) or thread (CLONE_THREAD).
-fn clone(s: &State, c: Clone) -> Result<i64, i64> {
+/// clone and its relatives: a new process (fork) or thread (CLONE_THREAD). A traced caller
+/// reports the event its tracer asked for (`PTRACE_EVENT_FORK`, `_VFORK`, `_CLONE`, then
+/// `_VFORK_DONE`), and the child is traced too then, or with `CLONE_PTRACE` (`ptrace`).
+fn clone(s: &mut State, c: Clone) -> Result<i64, i64> {
     let flags = c.flags;
     let supported = CLONE_SUPPORTED | if c.legacy { 0 } else { CLONE_CLEAR_SIGHAND };
     if flags & !supported & !CSIGNAL != 0 {
@@ -723,7 +768,7 @@ fn clone(s: &State, c: Clone) -> Result<i64, i64> {
     let thread = flags & CLONE_THREAD != 0;
     let (my_tid, my_pid) = me();
     // The new ids and records, before the kernel's thread exists.
-    let (tid, settid_in_child) = {
+    let (tid, settid_in_child, plan) = {
         let mut t = PROCS.lock();
         let p = t.procs.get(&my_pid).ok_or(ESRCH)?;
         // Nothing new comes out of a process that is ending or exec'ing.
@@ -738,7 +783,8 @@ fn clone(s: &State, c: Clone) -> Result<i64, i64> {
         let tid = t.alloc_pid()?;
         heap::preload()?;
         t.pending.insert(tid);
-        (tid, !thread && flags & CLONE_VM == 0 && flags & CLONE_CHILD_SETTID != 0)
+        let plan = crate::ptrace::clone_plan(&t, my_tid, flags, c.exit_signal);
+        (tid, !thread && flags & CLONE_VM == 0 && flags & CLONE_CHILD_SETTID != 0, plan)
     };
     // Room for the thread's table at its end (`fdtable::end_later`).
     if let Err(e) = fdtable::reserve_end() {
@@ -826,13 +872,18 @@ fn clone(s: &State, c: Clone) -> Result<i64, i64> {
         Ok(f) => f,
         Err(e) => return Err(fail(e.into(), handle)),
     };
+    // The child's trace record, if it is to be traced.
+    let child_trace = match plan.as_ref().map(|p| p.child_record()).transpose() {
+        Ok(r) => r.flatten(),
+        Err(e) => return Err(fail(e, handle)),
+    };
     if !thread {
         // The kernel's bound on its stack's growth, from the copy (no one else sees it
         // yet: a change of the caller's limit meanwhile is the caller's alone).
         syscall(SYS_STACK_LIMIT, [handle, limits.soft(crate::ids::RLIMIT_STACK), 0, 0, 0, 0]);
     }
     // The records.
-    let serial = {
+    let (serial, unadopted) = {
         let mut t = PROCS.lock();
         // Nothing new comes out of a process that began to end or exec meanwhile (Linux's
         // copy_process checks under the lock that de_thread and the group exit take): a
@@ -937,6 +988,8 @@ fn clone(s: &State, c: Clone) -> Result<i64, i64> {
                 tables_out: 0,
                 exec_bytes,
                 limits: limits.clone(),
+                leader_trace: None,
+                trace_zombie: false,
             };
             t.procs.insert(pid, p);
             if let Some(pp) = t.procs.get_mut(&ppid) {
@@ -948,9 +1001,35 @@ fn clone(s: &State, c: Clone) -> Result<i64, i64> {
         }
         let serial = t.new_serial();
         // (No robust list: a fork's or a thread's starts without one, as Linux's copy_process.)
-        t.threads.insert(tid, Thread { tid, pid, key: 0, fs, files: Some(files), limits, comm, sig: thread_sig, exited: false, serial, reserved: true, robust: 0, cpu: Default::default(), watch: None, cpu_sleep: None });
-        serial
+        t.threads.insert(
+            tid,
+            Thread {
+                tid,
+                pid,
+                key: 0,
+                fs,
+                files: Some(files),
+                limits,
+                comm,
+                sig: thread_sig,
+                exited: false,
+                serial,
+                reserved: true,
+                robust: 0,
+                cpu: Default::default(),
+                watch: None,
+                cpu_sleep: None,
+                trace: None,
+                dead: None,
+                exit_status: None,
+            },
+        );
+        // Traced from its start if the caller's tracer asked for it (and still traces the
+        // caller): a SIGSTOP or a first PTRACE_EVENT_STOP waits for it.
+        let unadopted = crate::ptrace::adopt(&mut t, my_tid, tid, child_trace);
+        (serial, unadopted)
     };
+    drop(unadopted);
     // CLONE_PIDFD: the child's pidfd in the caller's table (with CLONE_THREAD a thread
     // pidfd), its number in the caller's memory, before the child runs (a fork's child has
     // the table copied before: it has none).
@@ -985,6 +1064,10 @@ fn clone(s: &State, c: Clone) -> Result<i64, i64> {
     if c.stack != 0 {
         child.rsp = c.stack;
     }
+    // A single step of the caller's is not the child's (Linux's user_disable_single_step).
+    if plan.as_ref().is_some_and(|p| p.forced_tf) {
+        child.rflags &= !0x100;
+    }
     birth.serial = serial;
     let cookie = alloc::boxed::Box::into_raw(birth) as u64;
     let tflags = if flags & CLONE_SETTLS != 0 { THREAD_SETTLS } else { 0 };
@@ -1010,14 +1093,23 @@ fn clone(s: &State, c: Clone) -> Result<i64, i64> {
         name_kernel_thread(key as u64, &t.threads.get(&tid).map_or([0; 16], |th| th.comm));
         (flags & CLONE_VFORK != 0).then(|| t.procs.get(&pid).map(|p| p.words.clone())).flatten()
     };
+    // The tracer hears of the child (its id the event's message).
+    if let Some(event) = plan.as_ref().map(|p| p.event).filter(|&e| e != 0) {
+        crate::ptrace::event(s, event, tid as u64);
+    }
     if let Some(words) = vfork_words {
         // Until the child execs or ends; only a kill ends the wait (the child runs on the
         // caller's stack, which the caller must not touch meanwhile).
+        let mut done = true;
         while words.vfork.load(Ordering::Acquire) == 0 {
             // (An uninterruptible wait ends early only for a thread that dies.)
             if wait_word(&words.vfork, 0, 0, false) == -EINTR {
+                done = false;
                 break;
             }
+        }
+        if done {
+            crate::ptrace::event(s, crate::ptrace::EVENT_VFORK_DONE, tid as u64);
         }
     }
     Ok(tid as i64)
@@ -1059,6 +1151,7 @@ pub fn exit(status: i32, group: bool) -> ! {
         }
         let (files, robust) = t.threads.get_mut(&tid).map_or((None, 0), |th| {
             th.exited = true;
+            th.exit_status = Some(status);
             (th.files.take(), core::mem::take(&mut th.robust))
         });
         if let Some(p) = t.procs.get_mut(&pid) {
@@ -1083,11 +1176,33 @@ pub fn exit(status: i32, group: bool) -> ! {
     unreachable!("thread_exit returned")
 }
 
+/// exit and exit_group, the system calls (`s`: the caller's registers): a traced thread
+/// stops for `PTRACE_EVENT_EXIT` first, once exit_group has ended the others (Linux's
+/// do_group_exit, then do_exit's ptrace_event).
+fn exit_call(s: &mut State, status: i32, group: bool) -> ! {
+    if group {
+        let (tid, pid) = me();
+        PROCS.lock().group_exit(pid, status, Some(tid));
+    }
+    crate::ptrace::exit_event(s, status, true);
+    exit(status, group)
+}
+
+/// The process ends by a fatal signal delivered to the calling thread (`s`: its registers):
+/// as `die`, after its tracer saw `PTRACE_EVENT_EXIT`.
+pub fn die_traced(s: &mut State, status: i32) -> ! {
+    let (tid, pid) = me();
+    PROCS.lock().group_exit(pid, status, Some(tid));
+    crate::ptrace::exit_event(s, status, false);
+    exit(status, true)
+}
+
 /// The calling thread was killed (`REASON_EXIT`): it ends with its process's exit status
-/// (a group exit's, else SIGKILL's; a kill by the kernel is the kernel's to report).
+/// (a group exit's; 0 for one an exec ended, as Linux's de_thread; else SIGKILL's; a kill
+/// by the kernel is the kernel's to report). (A tracer sees the thread's.)
 pub fn exit_killed() -> ! {
     let pid = local::pid();
-    let status = PROCS.lock().procs.get(&pid).and_then(|p| p.exiting).unwrap_or(signal::SIGKILL as i32);
+    let status = PROCS.lock().procs.get(&pid).map_or(signal::SIGKILL as i32, |p| p.exiting.unwrap_or(if p.execing { 0 } else { signal::SIGKILL as i32 }));
     exit(status, false)
 }
 
@@ -1153,6 +1268,8 @@ pub fn thread_ended(key: u64) {
             // An exec waits for the others to be gone.
             wake_word(&p.words.threads);
         }
+        // Its tracees go free, and it becomes its tracer's zombie (`ptrace`).
+        crate::ptrace::thread_gone(&mut t, &mut th, pid, &mut after);
         // A thread the kernel ended without the server (a server that did not end it on
         // `REASON_EXIT`) still has its table: the worker lets go of it (closing sockets takes
         // their locks, which the service thread must never wait for). Its process ends only
@@ -1278,12 +1395,12 @@ fn process_end(t: &mut Table, pid: Pid, after: &mut After) {
     let children = core::mem::take(&mut t.procs.get_mut(&pid).expect("listed").children);
     let reaper = t.reaper_for(pid);
     for child in children {
-        let (cpgid, csid, pdeath, zombie) = {
+        let (cpgid, csid, pdeath, zombie, traced_zombie) = {
             let Some(c) = t.procs.get_mut(&child) else { continue };
             c.ppid = reaper;
             // The new parent hears of the end the ordinary way.
             c.exit_signal = signal::SIGCHLD;
-            (c.pgid, c.sid, c.pdeath, c.zombie.is_some())
+            (c.pgid, c.sid, c.pdeath, c.zombie.is_some(), c.trace_zombie)
         };
         if let Some(r) = t.procs.get_mut(&reaper) {
             r.children.push(child);
@@ -1291,7 +1408,9 @@ fn process_end(t: &mut Table, pid: Pid, after: &mut After) {
         if pdeath != 0 && !zombie {
             signal::post_process(t, child, SigInfo::kernel(pdeath), false);
         }
-        if zombie {
+        if traced_zombie {
+            // Its tracer reaps it first; the new parent hears of it then.
+        } else if zombie {
             // A zombie the new parent may reap (or that nobody will: gone now).
             if reaper == 0 || notify_parent_exit(t, child) {
                 reap(t, child, after);
@@ -1307,6 +1426,20 @@ fn process_end(t: &mut Table, pid: Pid, after: &mut After) {
             t.group_exit(other, signal::SIGKILL as i32, None);
         }
     }
+    // A main thread traced from outside its parent's process: its tracer reaps it first.
+    let status = t.procs.get(&pid).and_then(|p| p.zombie).unwrap_or(0);
+    if crate::ptrace::leader_ended(t, pid, status) {
+        return;
+    }
+    if ppid == 0 || !t.procs.contains_key(&ppid) || notify_parent_exit(t, pid) {
+        reap(t, pid, after);
+    }
+}
+
+/// The tracer of zombie `pid`'s main thread reaped it (`ptrace::release_zombie`; lock
+/// held): its parent hears of the end now, as at `process_end`.
+pub fn zombie_released(t: &mut Table, pid: Pid, after: &mut After) {
+    let Some(ppid) = t.procs.get(&pid).filter(|p| p.zombie.is_some()).map(|p| p.ppid) else { return };
     if ppid == 0 || !t.procs.contains_key(&ppid) || notify_parent_exit(t, pid) {
         reap(t, pid, after);
     }
@@ -1479,6 +1612,10 @@ fn wait_child(which: Which, options: u64) -> Result<Option<Found>, i64> {
                     continue;
                 }
                 any = true;
+                // Its main thread's tracer (in another process) reaps it first.
+                if child.trace_zombie {
+                    continue;
+                }
                 if let Some(status) = child.zombie {
                     if options & WEXITED != 0 {
                         let (code, value) =
@@ -1517,10 +1654,32 @@ fn wait_child(which: Which, options: u64) -> Result<Option<Found>, i64> {
                     }
                 }
                 (Some(f), words, seen)
-            } else if !any {
-                return Err(ECHILD);
             } else {
-                (None, words, seen)
+                // The stops and ends of the tracees of the caller (__WNOTHREAD) or of its
+                // process's threads (Linux's ptrace_do_wait), whatever WSTOPPED and the
+                // clone flags say.
+                let my_tid = local::tid();
+                let mine = |t: &Table, tracer: Pid| if options & WNOTHREAD != 0 { tracer == my_tid } else { t.threads.get(&tracer).is_some_and(|th| th.pid == pid) };
+                let select = |t: &Table, tid: Pid, tpid: Pid| match which {
+                    Which::Pid(p) => tid == p,
+                    Which::PidFd(p, words) => tid == p && t.procs.get(&tpid).is_some_and(|q| Arc::as_ptr(&q.words) == words),
+                    Which::Pgrp(g) => t.procs.get(&tpid).is_some_and(|q| q.pgid == g),
+                    Which::Any => true,
+                };
+                let (traced, report) = crate::ptrace::wait_scan(&mut t, mine, select, options & WEXITED != 0, options & WNOWAIT != 0, &mut after);
+                match report {
+                    Some(r) => {
+                        let usage = t.procs.get(&r.pid).map(usage_of).unwrap_or_default();
+                        let (code, value) = match r.stop {
+                            Some(code) => (crate::ptrace::CLD_TRAPPED, code as i32),
+                            None if r.status & 0x7f == 0 => (signal::CLD_EXITED, (r.status >> 8) & 0xff),
+                            None => (signal::CLD_KILLED, r.status & 0x7f),
+                        };
+                        (Some(Found { pid: r.tid, status: r.status, code, value, usage }), words, seen)
+                    }
+                    None if !any && !traced => return Err(ECHILD),
+                    None => (None, words, seen),
+                }
             }
         };
         after.run();
@@ -1851,8 +2010,11 @@ pub fn query(op: u64, arg: u64, cap: usize) -> Result<Vec<u8>, i64> {
             }
             const TICK_NS: u64 = 10_000_000;
             let (user, system) = if t.threads.contains_key(&id) && id != pid { (tinfo.user_ns, tinfo.system_ns) } else { (info.user_ns, info.system_ns) };
+            let trace = th.and_then(crate::ptrace::record);
             let state = if p.zombie.is_some() {
                 STATE_ZOMBIE
+            } else if trace.is_some_and(|r| r.stop.is_some()) {
+                STATE_TRACED
             } else if p.sig.stop.stopped {
                 STATE_STOPPED
             } else if (if id != pid { tinfo.running } else { info.running }) > 0 {
@@ -1902,6 +2064,7 @@ pub fn query(op: u64, arg: u64, cap: usize) -> Result<Vec<u8>, i64> {
                 anon_pages: info.anon_pages,
                 shmem_pages: info.shmem_pages,
                 table_pages: info.table_pages,
+                tracer: trace.and_then(|r| t.threads.get(&r.tracer)).map_or(0, |tracer| tracer.pid as u64),
             };
             text(as_bytes(&record))
         }

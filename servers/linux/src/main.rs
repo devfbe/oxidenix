@@ -51,6 +51,7 @@ mod pidfd;
 mod pipe;
 mod process;
 mod poll;
+mod ptrace;
 mod procfile;
 mod procfs;
 mod pty;
@@ -190,8 +191,21 @@ fn serve(s: &mut State) -> ! {
         }
         match reason as u64 {
             REASON_SYSCALL => {
-                let nr = s.rax;
-                let result = dispatch(s);
+                let mut nr = s.rax;
+                let traced = local::get().flags.load(Ordering::Relaxed) & (local::TRACE_SYSCALL | local::TRACE_SYSEMU) != 0;
+                // A tracer's syscall-entry stop first: it may change the call or skip it.
+                let result = match traced.then(|| ptrace::syscall_entry(s)) {
+                    Some(ptrace::Entry::Skip(call)) => {
+                        nr = call;
+                        s.rax as i64
+                    }
+                    Some(ptrace::Entry::Run(call)) => {
+                        nr = call;
+                        s.rax = call;
+                        dispatch(s)
+                    }
+                    None => dispatch(s),
+                };
                 s.rax = result as u64;
                 // Lingering closes (SO_LINGER) wait now, with nothing held
                 // (Linux's __fput task work), before the program runs on; a
@@ -205,10 +219,15 @@ fn serve(s: &mut State) -> ! {
                 if let Some(status) = local::pending_exit() {
                     process::die(status);
                 }
+                // Its syscall-exit stop (the tracer may change the result), or a single
+                // step's report.
+                let flags = local::get().flags.load(Ordering::Relaxed);
+                let reported = flags & (local::TRACE_SYSCALL | local::TRACE_STEP) != 0 && ptrace::syscall_exit(s, nr);
+                let result = s.rax as i64;
                 // The fast path: the program runs on, unless the call was
                 // interrupted or changed the thread's mask (a kick makes
                 // restricted_enter come back at once).
-                if signal::interrupted(result) || nr == signal::SYS_RT_SIGRETURN || local::get().flags.load(Ordering::Relaxed) & local::RESTORE_MASK != 0 {
+                if reported || signal::interrupted(result) || nr == signal::SYS_RT_SIGRETURN || local::get().flags.load(Ordering::Relaxed) & local::RESTORE_MASK != 0 {
                     signal::deliver(s, Some((nr, result)));
                 }
             }
@@ -229,6 +248,7 @@ fn serve(s: &mut State) -> ! {
 fn dispatch(s: &mut State) -> i64 {
     if let Some(result) = mm::handle(s)
         .or_else(|| process::handle(s))
+        .or_else(|| ptrace::handle(s))
         .or_else(|| signal::handle(s))
         .or_else(|| exec::handle(s))
         .or_else(|| timer::handle(s))
