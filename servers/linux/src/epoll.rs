@@ -497,6 +497,15 @@ impl Epoll {
         candidates.iter().any(|i| i.file.upgrade().is_some_and(|f| i.check(&f) != 0))
     }
 
+    /// For /proc/<pid>/fdinfo: its interests by descriptor number (the number, the events
+    /// and flags, the data, and the file while it is there).
+    pub fn interests(&self) -> Result<Vec<(i32, u32, u64, Option<Arc<Description>>)>, NoMem> {
+        let items = self.items()?;
+        let mut out = heap::try_vec(items.len())?;
+        out.extend(items.iter().map(|i| (i.key.0, i.events.load(SeqCst), i.data.load(SeqCst), i.file.upgrade())));
+        Ok(out)
+    }
+
     /// fstat: an anonymous inode (no file type), as on Linux.
     pub fn stat(&self) -> [u8; 144] {
         let mut st = [0u8; 144];
@@ -656,6 +665,9 @@ fn epoll_ctl(epfd: u64, op: u64, fd: u64, event: u64) -> Result<i64, i64> {
     if epfile.ptr() == target.ptr() {
         return Err(EINVAL);
     }
+    // An interest always takes errors and hangups (Linux's do_epoll_ctl adds them: also one
+    // that asked for nothing else reports them, and its fdinfo shows them).
+    let events = events | EPOLLERR | EPOLLHUP;
     match op {
         EPOLL_CTL_ADD => epoll.add(fd as i32, &target, events, data)?,
         EPOLL_CTL_MOD => epoll.modify(fd as i32, &target, events, data)?,

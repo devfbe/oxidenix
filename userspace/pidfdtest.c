@@ -66,6 +66,18 @@ static void sleep_ms(long ms) {
     }
 }
 
+/* Whether /proc/self/fdinfo/<fd> has "Pid:\t<pid>\nNSpid:\t<pid>\n". */
+static int fdinfo_pid(int fd, int pid) {
+    char path[64], buf[512] = {0}, want[64];
+    snprintf(path, sizeof path, "/proc/self/fdinfo/%d", fd);
+    int f = open(path, O_RDONLY);
+    if (f < 0) return 0;
+    read(f, buf, sizeof buf - 1);
+    close(f);
+    snprintf(want, sizeof want, "\nPid:\t%d\nNSpid:\t%d\n", pid, pid);
+    return strstr(buf, want) != NULL;
+}
+
 static short revents(int fd, int timeout_ms) {
     struct pollfd p = {fd, POLLIN, 0};
     return poll(&p, 1, timeout_ms) == 1 ? p.revents : 0;
@@ -113,6 +125,7 @@ static void basics(void) {
     int fd = pidfd_open(child, 0);
     check("pidfd_open of a child", fd >= 0);
     check("... is close-on-exec", (fcntl(fd, F_GETFD) & FD_CLOEXEC) != 0);
+    check("... its fdinfo says Pid: and NSpid:", fdinfo_pid(fd, child));
     check("... and not readable while it runs", revents(fd, 0) == 0);
     check("pidfd_send_signal(0) of a live process", pidfd_send_signal(fd, 0, NULL, 0) == 0);
 
@@ -160,6 +173,7 @@ static void basics(void) {
     memset(&si, 0, sizeof si);
     check("waitid(P_PIDFD) reaps it", waitid(P_PIDFD, fd, &si, WEXITED) == 0 && si.si_pid == child && si.si_code == CLD_KILLED && si.si_status == SIGTERM);
     check("poll: POLLHUP once it is reaped", (revents(fd, 0) & (POLLIN | POLLHUP)) == (POLLIN | POLLHUP));
+    check("... its fdinfo says Pid: -1", fdinfo_pid(fd, -1));
     errno = 0;
     check("pidfd_send_signal after it was reaped is ESRCH", pidfd_send_signal(fd, 0, NULL, 0) < 0 && errno == ESRCH);
     errno = 0;
@@ -356,6 +370,7 @@ static void thread_pidfds(void) {
     check("pidfd_open(PIDFD_THREAD) of another thread", tfd >= 0);
     check("... shows PIDFD_THREAD (O_EXCL) in its status flags", (fcntl(tfd, F_GETFL) & O_EXCL) != 0);
     check("... and is not readable while the thread runs", revents(tfd, 0) == 0);
+    check("... its fdinfo names the thread", fdinfo_pid(tfd, tid));
     sig_tid = 0;
     check("pidfd_send_signal on a thread pidfd", pidfd_send_signal(tfd, SIGUSR1, NULL, 0) == 0);
     wait_signal();
@@ -396,6 +411,7 @@ static void thread_pidfds(void) {
     check("a thread pidfd is readable and hung up once its thread is gone", (revents(tfd, 5000) & (POLLIN | POLLHUP)) == (POLLIN | POLLHUP));
     errno = 0;
     check("... then pidfd_send_signal is ESRCH", pidfd_send_signal(tfd, 0, NULL, 0) < 0 && errno == ESRCH);
+    check("... and its fdinfo says Pid: -1", fdinfo_pid(tfd, -1));
     errno = 0;
     check("... and pidfd_getfd ESRCH", pidfd_getfd(tfd, 0, 0) < 0 && errno == ESRCH);
     close(tfd);

@@ -114,6 +114,11 @@ impl FilesContext {
         self.table.lock().get(fd).map(|s| s.file.clone()).ok_or(EBADF)
     }
 
+    /// `get`, and whether the descriptor is close-on-exec (/proc/<pid>/fdinfo).
+    pub fn get_with_cloexec(&self, fd: u64) -> Result<(FileRef, bool), i64> {
+        self.table.lock().get(fd).map(|s| (s.file.clone(), s.cloexec)).ok_or(EBADF)
+    }
+
     /// A descriptor (the lowest free one at or above `min`) for `file`.
     pub fn install(&self, file: FileRef, cloexec: bool, min: u64) -> Result<i64, i64> {
         let mut t = self.table.lock();

@@ -1,7 +1,8 @@
 //! The text formats of Linux's /proc files (proc(5)): the system-wide ones
 //! procfs serves (`stat`, `meminfo`, `loadavg`, `uptime`, `counters`) and a
 //! process's own the Linux server makes (`<pid>/stat`, `statm`, `status`,
-//! `oom_score`, `oom_adj`), from the kernel's records, and how the numbers
+//! `oom_score`, `oom_adj`), from the kernel's records, a descriptor's
+//! `fdinfo` (`FdInfo`, from the Linux server's files), and how the numbers
 //! written to /proc are read (`parse_int`). Pure functions, tested on the
 //! host (`cargo test -p procproto`).
 
@@ -339,5 +340,102 @@ pub fn parse_int(text: &[u8]) -> Option<i64> {
     }
     let value = if negative { -value } else { value };
     i64::try_from(value).ok()
+}
+
+/// What /proc/<pid>/fdinfo/<fd> shows of a descriptor (proc(5); Linux's `seq_show` in
+/// fs/proc/fd.c and the files' `show_fdinfo`): the file position, the status flags
+/// (`O_CLOEXEC` for a close-on-exec descriptor; octal with a leading 0), the id of the
+/// mount the file is on, its inode number, then what its kind of file adds.
+#[derive(Clone, Copy, Debug)]
+pub struct FdInfo<'a> {
+    pub pos: i64,
+    pub flags: u32,
+    pub mnt_id: u32,
+    pub ino: u64,
+    pub kind: FdKind<'a>,
+}
+
+/// The lines a kind of file adds to its fdinfo.
+#[derive(Clone, Copy, Debug)]
+pub enum FdKind<'a> {
+    Plain,
+    /// A pidfd: the id of its process or thread, -1 once that is gone (`Pid:` and the
+    /// one-level `NSpid:`).
+    PidFd { pid: i64 },
+    /// An eventfd: its count, its id, whether it is a semaphore.
+    EventFd { count: u64, id: u64, semaphore: bool },
+    /// A timerfd: its clock id, the expiries not read yet, the flags of its last
+    /// timerfd_settime, the time left and the interval in nanoseconds (shown as
+    /// `(seconds, nanoseconds)`).
+    TimerFd { clockid: i32, ticks: u64, settime_flags: u32, value: u64, interval: u64 },
+    /// An epoll instance: its interests (`tfd:` lines).
+    Epoll(&'a [EpollTarget]),
+    /// An inotify instance: its watches (`inotify wd:` lines).
+    Inotify(&'a [InotifyMark]),
+}
+
+/// An interest of an epoll instance: the descriptor number it was added by, its events
+/// and flags, its data, and of the file: its position, inode number and device (`sdev`,
+/// the kernel's encoding, `kernel_dev`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EpollTarget {
+    pub fd: i32,
+    pub events: u32,
+    pub data: u64,
+    pub pos: i64,
+    pub ino: u64,
+    pub sdev: u32,
+}
+
+/// A watch of an inotify instance: its descriptor, the watched inode's number and device
+/// (the kernel's encoding), its mask.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct InotifyMark {
+    pub wd: i32,
+    pub ino: u64,
+    pub sdev: u32,
+    pub mask: u32,
+}
+
+/// A device number in the kernel's own encoding (`MKDEV`: the major above bit 20), as
+/// fdinfo's `sdev` shows a superblock's `s_dev`.
+pub fn kernel_dev(major: u32, minor: u32) -> u32 {
+    major << 20 | minor & 0xf_ffff
+}
+
+impl core::fmt::Display for FdInfo<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "pos:\t{}\nflags:\t0{:o}\nmnt_id:\t{}\nino:\t{}\n", self.pos, self.flags, self.mnt_id, self.ino)?;
+        const NS: u64 = 1_000_000_000;
+        match self.kind {
+            FdKind::Plain => Ok(()),
+            FdKind::PidFd { pid } => write!(f, "Pid:\t{pid}\nNSpid:\t{pid}\n"),
+            FdKind::EventFd { count, id, semaphore } => {
+                write!(f, "eventfd-count: {count:16x}\neventfd-id: {id}\neventfd-semaphore: {}\n", semaphore as u8)
+            }
+            FdKind::TimerFd { clockid, ticks, settime_flags, value, interval } => write!(
+                f,
+                "clockid: {clockid}\nticks: {ticks}\nsettime flags: 0{settime_flags:o}\nit_value: ({}, {})\nit_interval: ({}, {})\n",
+                value / NS,
+                value % NS,
+                interval / NS,
+                interval % NS
+            ),
+            FdKind::Epoll(targets) => {
+                for t in targets {
+                    writeln!(f, "tfd: {:8} events: {:8x} data: {:16x}  pos:{} ino:{:x} sdev:{:x}", t.fd, t.events, t.data, t.pos, t.ino, t.sdev)?;
+                }
+                Ok(())
+            }
+            FdKind::Inotify(marks) => {
+                for m in marks {
+                    // (The trailing space: Linux's line leaves room for a file handle, which
+                    // these filesystems do not export.)
+                    writeln!(f, "inotify wd:{:x} ino:{:x} sdev:{:x} mask:{:x} ignored_mask:0 ", m.wd, m.ino, m.sdev, m.mask)?;
+                }
+                Ok(())
+            }
+        }
+    }
 }
 

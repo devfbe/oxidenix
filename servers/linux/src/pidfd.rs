@@ -119,6 +119,15 @@ impl PidFd {
         let th = t.threads.get(&self.pid).filter(|th| th.watch.as_ref().is_some_and(|w| Arc::ptr_eq(w, mine)))?;
         Some(Task { pid: th.pid, zombie: false, running: !th.exited })
     }
+
+    /// What /proc/<pid>/fdinfo says of it (`Pid:`): its id while its task is there, -1
+    /// once it is gone (Linux's pidfd_show_fdinfo).
+    pub fn shown_pid(&self) -> i64 {
+        match self.task(&PROCS.lock()) {
+            Some(_) => self.pid as i64,
+            None => -1,
+        }
+    }
 }
 
 impl Drop for PidFd {

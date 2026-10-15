@@ -41,6 +41,21 @@ pub const O_APPEND: u32 = 0o2000;
 pub const O_CLOEXEC: u32 = 0o2000000;
 pub const O_PATH: u32 = 0o10000000;
 const O_DIRECT: u32 = 0o40000;
+/// What open(2) always adds on a 64-bit machine (Linux's force_o_largefile).
+pub const O_LARGEFILE: u32 = 0o100000;
+/// The flags of open(2) that act on the open only (Linux's do_dentry_open drops them from
+/// the file's status flags).
+const O_OPEN_ONLY: u32 = 0o100 | 0o200 | 0o400 | 0o1000; // O_CREAT O_EXCL O_NOCTTY O_TRUNC
+/// Linux's VALID_OPEN_FLAGS (without __O_TMPFILE, which no open here takes): what
+/// open(2) looks at, the rest is ignored.
+const VALID_OPEN_FLAGS: u32 = 0o3 | O_OPEN_ONLY | O_APPEND | O_NONBLOCK | 0o4010000 | 0o20000 | O_DIRECT | O_LARGEFILE | 0o200000 | 0o400000 | 0o1000000 | O_CLOEXEC | O_PATH;
+
+/// The status flags of a description made by open(2) with `flags` (F_GETFL's, fdinfo's), as
+/// Linux's file's f_flags: what was asked for, without what acts on the open only
+/// (O_CLOEXEC is the descriptor's: `install` takes it off).
+pub fn status_flags(flags: u32) -> u32 {
+    flags & VALID_OPEN_FLAGS & !O_OPEN_ONLY
+}
 
 pub const POLLIN: i16 = 0x1;
 pub const POLLOUT: i16 = 0x4;
@@ -853,7 +868,7 @@ impl Regular {
         }
     }
 
-    fn position(&self) -> Result<crate::sync::SleepMutexGuard<'_, u64>, i64> {
+    fn position(&self) -> Result<crate::sync::PositionGuard<'_>, i64> {
         match self {
             Regular::Tmp(f) => f.position(),
             Regular::Data(f) => f.position(),

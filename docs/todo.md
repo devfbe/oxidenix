@@ -32,7 +32,7 @@ done, delete it here in the same commit.
 
 ## Linux features not implemented
 
-- Processes and signals: `/proc/<pid>/fdinfo` (a pidfd's `Pid:` line), `clock_nanosleep` on CPU clocks
+- Processes and signals: `clock_nanosleep` on CPU clocks
   (`EOPNOTSUPP`; the CPU-time alarms would carry it), core files, `ptrace`.
   `/proc/<pid>/maps` names the program file, the vDSO, the stack and the heap, but not other
   mapped files (it would need the server to know which file each mapped object is); no

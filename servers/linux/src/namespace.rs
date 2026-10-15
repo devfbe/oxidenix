@@ -278,6 +278,30 @@ pub fn mounts_text() -> Result<String, i64> {
     })
 }
 
+/// The id of the mount table's first mount (the root); the others follow in the table's
+/// order (it never changes once made). Below it the ids of the filesystems no path reaches
+/// (Linux's kernel-internal mounts, also never in a mount table): sockets', pipes' and the
+/// anonymous inodes' (eventfd, epoll, inotify, timerfd, pidfd).
+const FIRST_MOUNT_ID: u32 = 21;
+pub const SOCKFS_MOUNT_ID: u32 = 8;
+pub const PIPEFS_MOUNT_ID: u32 = 12;
+pub const ANON_INODE_MOUNT_ID: u32 = 14;
+
+/// The id of the mount absolute path `path` lies in (/proc/<pid>/fdinfo's `mnt_id`).
+pub fn mount_id(path: &str) -> u32 {
+    let comps = || path.split('/').filter(|c| !c.is_empty());
+    with_mounts(|mounts| {
+        let mut best = (0, 0);
+        for (i, m) in mounts.iter().enumerate() {
+            let n = m.at.len();
+            if n >= best.1 && comps().take(n).count() == n && comps().zip(m.at.iter()).all(|(a, b)| a == b.as_str()) {
+                best = (i, n);
+            }
+        }
+        FIRST_MOUNT_ID + best.0 as u32
+    })
+}
+
 /// The mount `comps` lies in: its filesystem and how many of `comps` name
 /// the mount point.
 fn mount_of(comps: &[String]) -> (Fs, usize) {

@@ -23,7 +23,7 @@ pub struct TmpOpen {
     pub inode: Arc<Inode>,
     /// The path it was opened by (for *at calls and fchdir).
     pub path: String,
-    offset: crate::sync::SleepMutex<u64>,
+    offset: crate::sync::Position,
     /// A directory's entries, taken when it is read from the start.
     snapshot: crate::sync::SleepMutex<Option<(Vec<(String, u64, u8)>, crate::files::SnapshotCharge)>>,
     /// Holds write access (opened for writing).
@@ -90,7 +90,7 @@ pub fn open_in(prepared: Prepared, inode: Arc<Inode>, flags: u32, path: String) 
     Arc::get_mut(&mut slot).expect("not shared yet").write(TmpOpen {
         inode,
         path,
-        offset: crate::sync::SleepMutex::new(0),
+        offset: crate::sync::Position::new(),
         snapshot: crate::sync::SleepMutex::new(None),
         write,
     });
@@ -101,7 +101,7 @@ pub fn open_in(prepared: Prepared, inode: Arc<Inode>, flags: u32, path: String) 
         open.notify(inotify::IN_MODIFY);
     }
     open.notify(inotify::IN_OPEN);
-    let kept = flags & (O_ACCMODE | files::O_NONBLOCK | O_APPEND | files::O_CLOEXEC);
+    let kept = files::status_flags(flags);
     files::install_in(room, files::new_id(), File::Tmp(open), kept)
 }
 
@@ -266,6 +266,12 @@ impl TmpOpen {
         Ok(n as i64)
     }
 
+    /// Its file position as the last call that moved it left it (/proc/<pid>/fdinfo's
+    /// `pos`), without its lock.
+    pub fn shown_position(&self) -> u64 {
+        self.offset.get()
+    }
+
     fn lseek(&self, offset: i64, whence: u64) -> Result<i64, i64> {
         let mut off = self.offset.lock()?;
         let base = match whence {
@@ -337,7 +343,7 @@ impl TmpOpen {
 
     /// The description's file position (for the calls that take one; EINTR if the thread
     /// dies while it waits for it).
-    pub fn position(&self) -> Result<crate::sync::SleepMutexGuard<'_, u64>, i64> {
+    pub fn position(&self) -> Result<crate::sync::PositionGuard<'_>, i64> {
         self.offset.lock()
     }
 

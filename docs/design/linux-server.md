@@ -1258,7 +1258,7 @@ Linux asks for write access only for files, directories and symlinks.
 - **The server's own part**, each process's: `/proc/<pid>` with `stat`, `statm`, `status`,
   `cmdline`, `comm`, `exe`, `mounts`, `oom_score`, `oom_score_adj`, `oom_adj`, `maps`,
   `task/<tid>/{stat,statm,status,cmdline,comm,oom_score,oom_score_adj,oom_adj,maps}`, `fd/<n>`,
-  `cwd` and `root`; `/proc/self`, `/proc/thread-self` and
+  `fdinfo/<n>`, `cwd` and `root`; `/proc/self`, `/proc/thread-self` and
   `/proc/mounts` (a link to `self/mounts`), merged into procfs's root listing; and
   `/proc/sys/vm/overcommit_{memory,ratio,kbytes}` (the kernel's overcommit policy, ADR 0013),
   merged into procfs's `/proc/sys`. The server
@@ -1316,6 +1316,22 @@ its threads' ids names it), and what `fd` lists is the calling thread's descript
 `CLONE_FILES` (then `/proc/<pid>/fd` shows the caller's table, not the main thread's, as
 `/proc/thread-self/fd` would on Linux). A child after `fork` sees its own copy. R8 (the
 process model) makes this exact.
+
+**fdinfo.** `/proc/<pid>/fdinfo/<n>` (mode 0400, listed as `fd` is) is made when it is
+read, in Linux's format (`procproto::render::FdInfo`, host-tested): `pos` (the position as
+the last call that moved it left it, `sync::Position`, read without the description's
+offset lock, so also of the description whose read asks), `flags` (the status flags, as
+F_GETFL's: open(2)'s as Linux's f_flags, `O_LARGEFILE` added and `O_CREAT`, `O_EXCL`,
+`O_NOCTTY`, `O_TRUNC` gone, `files::status_flags`; `O_CLOEXEC` for a close-on-exec
+descriptor), `mnt_id` (the mount the file's path lies in, ids from 21 in the mount table's
+order; sockets', pipes' and anonymous inodes' internal mounts 8, 12 and 14, which no mount
+table lists), `ino`, then what the kind of file adds: a pidfd's `Pid:` and `NSpid:` (-1
+once its task is gone), an eventfd's `eventfd-count`, `-id`, `-semaphore`, a timerfd's
+`clockid`, `ticks`, `settime flags`, `it_value` (the time left) and `it_interval`, an epoll
+instance's `tfd:` line per interest (its events with `EPOLLERR|EPOLLHUP`, which epoll_ctl
+adds as Linux's; the file's position, inode and device in the kernel's encoding), an
+inotify instance's `inotify wd:` line per watch (no file handle: no filesystem here exports
+one). There is no signalfd to show.
 
 `/proc/<pid>/exe` is a magic link too (Linux's `proc_exe_link`): each process keeps the
 program file it runs (`process::Proc::exe`, Linux's `mm->exe_file`): the node `execve`
