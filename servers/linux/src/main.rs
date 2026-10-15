@@ -179,6 +179,9 @@ pub extern "C" fn _start(state: *mut State, role: u64, cookie: u64, key: u64) ->
 /// runs again.
 fn serve(s: &mut State) -> ! {
     loop {
+        // Lingering closes left by anything but a system call (none
+        // expected: the safety net before the program runs again).
+        inet::run_deferred(true);
         let reason = state_call(s, SYS_RESTRICTED_ENTER, [0; 6]);
         if reason < 0 {
             // The kernel refuses the registers (they never come from the
@@ -190,6 +193,10 @@ fn serve(s: &mut State) -> ! {
                 let nr = s.rax;
                 let result = dispatch(s);
                 s.rax = result as u64;
+                // Lingering closes (SO_LINGER) wait now, with nothing held
+                // (Linux's __fput task work), before the program runs on; a
+                // signal ends the wait and is delivered below.
+                inet::run_deferred(true);
                 // /data inodes the call let go of go now, before it returns
                 // (an unlink's blocks are free when it returns).
                 datafs::reap();
@@ -285,6 +292,11 @@ fn dispatch(s: &mut State) -> i64 {
         TEST_TREE_KILL => syscall(TEST_TREE_KILL, [s.rdi, 0, 0, 0, 0, 0]),
         TEST_HEAP_STATS => test(s.rax, s.rdi),
         // The kernel's to answer, for the thread's key.
+        // netd's lease goes and comes back (netlink's notifications).
+        TEST_NET_RENEW if test_mode() => match netclient::net().and_then(|n| n.status(netring::Request::Renew)) {
+            Ok(_) => 0,
+            Err(e) => -e,
+        },
         TEST_PI_WEIGHT if test_mode() => match process::key_of(s.rdi as u32) {
             Some(key) => syscall(TEST_PI_WEIGHT, [key, 0, 0, 0, 0, 0]),
             None => -3,

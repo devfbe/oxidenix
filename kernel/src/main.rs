@@ -172,6 +172,8 @@ fn start_netd() {
         return printkln!("[boot] the network card has no I/O ports");
     };
     nic.enable_io_and_dma();
+    // In test mode netd takes the self-tests' requests (a DHCP renewal).
+    let test = TEST_MODE.load(core::sync::atomic::Ordering::Relaxed) as u8;
     let server = match process::Server::load("net", "/sbin/netd") {
         Ok(server) => server
             .ports(io as u64..io as u64 + len as u64)
@@ -180,6 +182,7 @@ fn start_netd() {
             .arg(alloc::format!("io={io:#x}"))
             .arg(alloc::format!("iolen={len}"))
             .arg(alloc::format!("irq={}", nic.irq))
+            .arg(alloc::format!("test={test}"))
             // netd registers once DHCP is done, or after three seconds.
             .start_timeout(5 * time::NSEC_PER_SEC),
         Err(e) => return printkln!("[boot] cannot load /sbin/netd (errno {})", e),

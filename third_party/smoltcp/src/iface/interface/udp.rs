@@ -24,13 +24,41 @@ impl InterfaceInner {
             &self.caps.checksum
         ));
 
+        // oxidenix: a connected socket of the datagram's 4-tuple first,
+        // then one bound to its address, then one bound to any (as
+        // Linux's lookup scores them), wherever they are in the set.
         #[cfg(feature = "socket-udp")]
-        for udp_socket in sockets
-            .items_mut()
-            .filter_map(|i| UdpSocket::downcast_mut(&mut i.socket))
         {
-            if udp_socket.accepts(self, &ip_repr, &udp_repr) {
-                udp_socket.process(self, meta, &ip_repr, &udp_repr, udp_packet.payload());
+            let mut best: Option<(u8, SocketHandle)> = None;
+            for item in sockets.items_mut() {
+                let handle = item.meta.handle;
+                let Some(udp_socket) = UdpSocket::downcast_mut(&mut item.socket) else {
+                    continue;
+                };
+                if udp_socket.accepts(self, &ip_repr, &udp_repr) {
+                    let rank = if udp_socket.remote().is_some() {
+                        2
+                    } else if udp_socket.endpoint().addr.is_some() {
+                        1
+                    } else {
+                        0
+                    };
+                    if best.is_none_or(|(r, _)| rank > r) {
+                        best = Some((rank, handle));
+                    }
+                    if rank == 2 {
+                        break;
+                    }
+                }
+            }
+            if let Some((_, handle)) = best {
+                sockets.get_mut::<UdpSocket>(handle).process(
+                    self,
+                    meta,
+                    &ip_repr,
+                    &udp_repr,
+                    udp_packet.payload(),
+                );
                 return None;
             }
         }

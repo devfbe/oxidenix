@@ -2,26 +2,33 @@
  * (10.0.2.100:7 is an echo service, see builder/src/main.rs), with the
  * Linux semantics of the server's internet sockets (R7b): bulk data
  * intact, MSG_PEEK, MSG_DONTWAIT, MSG_WAITALL, MSG_TRUNC, timeouts,
- * half-close, EPIPE and SIGPIPE, SO_ERROR, SO_REUSEADDR, options, epoll's
- * edges. */
+ * half-close, EPIPE and SIGPIPE, SO_ERROR, SO_REUSEADDR, SO_REUSEPORT, SO_LINGER, MSG_OOB, options,
+ * epoll's edges, netlink's routes and multicast notifications. */
 #define _GNU_SOURCE
 #include <arpa/inet.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/sockios.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+
+/* restricted::TEST_NET_RENEW (test mode): netd drops its DHCP lease and asks again. */
+#define TEST_NET_RENEW 1600
 
 static int failures;
 
@@ -133,6 +140,476 @@ static void killed_while_waiting_on_netd(void) {
     close(l);
     close(fds[0]);
     close(fds[1]);
+}
+
+/* Writes to non-blocking `fd` until nothing more goes for a while (the peer reads nothing:
+ * every buffer on the way is full); the bytes written. */
+static long fill_connection(int fd) {
+    static char chunk[16384];
+    long total = 0;
+    for (;;) {
+        long n = write(fd, chunk, sizeof chunk);
+        if (n > 0) {
+            total += n;
+            continue;
+        }
+        struct pollfd pf = {fd, POLLOUT, 0};
+        if (poll(&pf, 1, 300) != 1) return total;
+    }
+}
+
+/* Reads `fd` to its end; the bytes read (-1 for an error). */
+static long drain(int fd) {
+    static char sink[65536];
+    long total = 0, n;
+    while ((n = read(fd, sink, sizeof sink)) > 0) total += n;
+    return n < 0 ? -1 : total;
+}
+
+static int linger_unix;
+static long linger_took;
+static void *close_unix(void *arg) {
+    (void)arg;
+    long t0 = now_ms();
+    close(linger_unix);
+    linger_took = now_ms() - t0;
+    return NULL;
+}
+
+/* A lingering socket's last reference in an AF_UNIX socket's queue (SCM_RIGHTS): the
+ * thread whose close drops the queue lingers after its call, holding nothing, so another
+ * thread using the AF_UNIX pair (and the tree) goes on meanwhile. */
+static void lingering_in_flight(void) {
+    int p[2], u[2];
+    if (tcp_pair(p) < 0 || socketpair(AF_UNIX, SOCK_STREAM, 0, u) < 0) {
+        check("pairs for a lingering socket in flight", 0);
+        return;
+    }
+    fcntl(p[0], F_SETFL, O_NONBLOCK);
+    long sent = fill_connection(p[0]);
+    struct linger lg = {1, 2};
+    setsockopt(p[0], SOL_SOCKET, SO_LINGER, &lg, sizeof lg);
+    char cbuf[CMSG_SPACE(sizeof(int))] = {0};
+    struct iovec iov = {"x", 1};
+    struct msghdr m = {.msg_iov = &iov, .msg_iovlen = 1, .msg_control = cbuf, .msg_controllen = sizeof cbuf};
+    struct cmsghdr *c = CMSG_FIRSTHDR(&m);
+    c->cmsg_level = SOL_SOCKET;
+    c->cmsg_type = SCM_RIGHTS;
+    c->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(c), &p[0], sizeof(int));
+    check("a lingering socket goes in flight", sendmsg(u[0], &m, 0) == 1);
+    close(p[0]);
+    linger_unix = u[1];
+    pthread_t t;
+    long t0 = now_ms();
+    pthread_create(&t, NULL, close_unix, NULL);
+    usleep(300000);
+    /* Meanwhile: the other end of the pair and the tree go on. */
+    long t1 = now_ms();
+    int r = send(u[0], "y", 1, MSG_NOSIGNAL);
+    struct pollfd pf = {u[0], POLLOUT, 0};
+    poll(&pf, 1, 0);
+    pid_t kid = fork();
+    if (kid == 0) _exit(7);
+    int st = 0;
+    waitpid(kid, &st, 0);
+    long busy = now_ms() - t1;
+    char name[100];
+    snprintf(name, sizeof name, "others go on while a close lingers (%ld ms)", busy);
+    check(name, r == -1 && errno == EPIPE && WIFEXITED(st) && WEXITSTATUS(st) == 7 && busy < 1000 && now_ms() - t0 < 1500);
+    pthread_join(t, NULL);
+    snprintf(name, sizeof name, "... and that close returns after the linger time (%ld ms)", linger_took);
+    check(name, linger_took >= 1900 && linger_took < 4000);
+    check("... the data still arrives in full", drain(p[1]) == sent);
+    close(p[1]);
+    close(u[0]);
+}
+
+/* SO_LINGER with a time: close(2) waits until the peer acknowledged everything (and the
+ * FIN), at most the time, and a signal ends the wait (Linux's tcp_close); either way the
+ * data still arrives afterwards (no reset), and close returns 0. */
+static void lingering_close(void) {
+    struct linger lg = {1, 1};
+    int p[2];
+    char name[96], c;
+
+    /* A peer that reads nothing: the wait lasts the time (O_NONBLOCK does not shorten it). */
+    if (tcp_pair(p) < 0) {
+        check("tcp pair for SO_LINGER", 0);
+        return;
+    }
+    fcntl(p[0], F_SETFL, O_NONBLOCK);
+    long sent = fill_connection(p[0]);
+    setsockopt(p[0], SOL_SOCKET, SO_LINGER, &lg, sizeof lg);
+    long t0 = now_ms();
+    int r = close(p[0]);
+    long took = now_ms() - t0;
+    snprintf(name, sizeof name, "SO_LINGER 1 s: close waits for a stuck peer (%ld ms)", took);
+    check(name, r == 0 && took >= 900 && took < 3000);
+    check("... and the data still arrives in full, then end of file", drain(p[1]) == sent);
+    close(p[1]);
+
+    /* A signal ends the wait; close still returns 0. */
+    tcp_pair(p);
+    fcntl(p[0], F_SETFL, O_NONBLOCK);
+    sent = fill_connection(p[0]);
+    lg.l_linger = 30;
+    setsockopt(p[0], SOL_SOCKET, SO_LINGER, &lg, sizeof lg);
+    struct sigaction sa = {0};
+    sa.sa_handler = on_alarm;
+    sigaction(SIGALRM, &sa, NULL);
+    alarm(1);
+    t0 = now_ms();
+    r = close(p[0]);
+    took = now_ms() - t0;
+    snprintf(name, sizeof name, "SO_LINGER 30 s: a signal ends the wait (%ld ms)", took);
+    check(name, r == 0 && took >= 900 && took < 5000);
+    check("... and the data still arrives in full", drain(p[1]) == sent);
+    close(p[1]);
+
+    /* A peer that reads: close returns once everything was acknowledged. */
+    tcp_pair(p);
+    fcntl(p[0], F_SETFL, O_NONBLOCK);
+    sent = fill_connection(p[0]);
+    /* (The child lets go of its copy first: the parent's close is the last.) */
+    int sync[2];
+    pipe(sync);
+    pid_t reader = fork();
+    if (reader == 0) {
+        close(p[0]);
+        write(sync[1], "x", 1);
+        usleep(300000);
+        _exit(drain(p[1]) == sent ? 0 : 1);
+    }
+    close(p[1]);
+    read(sync[0], &c, 1);
+    close(sync[0]);
+    close(sync[1]);
+    lg.l_linger = 20;
+    setsockopt(p[0], SOL_SOCKET, SO_LINGER, &lg, sizeof lg);
+    t0 = now_ms();
+    r = close(p[0]);
+    took = now_ms() - t0;
+    int st = -1;
+    waitpid(reader, &st, 0);
+    snprintf(name, sizeof name, "SO_LINGER 20 s: close returns once all is acked (%ld ms)", took);
+    check(name, r == 0 && took >= 250 && took < 10000 && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+
+    /* SO_LINGER with a zero time resets: the peer reads ECONNRESET. */
+    tcp_pair(p);
+    write(p[0], "x", 1);
+    lg.l_linger = 0;
+    setsockopt(p[0], SOL_SOCKET, SO_LINGER, &lg, sizeof lg);
+    close(p[0]);
+    struct pollfd pf = {p[1], POLLIN, 0};
+    poll(&pf, 1, 2000);
+    usleep(100000);
+    r = read(p[1], &c, 1);
+    int r2 = r == 1 ? read(p[1], &c, 1) : r;
+    check("SO_LINGER 0: close resets the connection", r2 == -1 && errno == ECONNRESET);
+    close(p[1]);
+}
+
+/* A socket of `type` with SO_REUSEPORT (`rp`) bound to 127.0.0.1:`port`; -1 if the bind
+ * failed (errno kept). */
+static int bound(int type, int port, int rp) {
+    int fd = socket(AF_INET, type, 0);
+    setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &rp, sizeof rp);
+    struct sockaddr_in a = addr("127.0.0.1", port);
+    if (bind(fd, (struct sockaddr *)&a, sizeof a) < 0) {
+        int e = errno;
+        close(fd);
+        errno = e;
+        return -1;
+    }
+    return fd;
+}
+
+/* SO_REUSEPORT: sockets that all set it before bind share a port, and the connections and
+ * datagrams that come are spread over them (each to exactly one); one without it conflicts. */
+static void reuseport(void) {
+    const int port = 47123, n = 48;
+    int got = 0;
+    socklen_t len = sizeof got;
+    int a = bound(SOCK_STREAM, port, 1), b = bound(SOCK_STREAM, port, 1);
+    getsockopt(a, SOL_SOCKET, SO_REUSEPORT, &got, &len);
+    check("SO_REUSEPORT reads back", got == 1);
+    check("two TCP sockets with SO_REUSEPORT bind one port", a >= 0 && b >= 0);
+    check("... and both listen", listen(a, 64) == 0 && listen(b, 64) == 0);
+    check("a third without it: EADDRINUSE", bound(SOCK_STREAM, port, 0) < 0 && errno == EADDRINUSE);
+    int conns[48], at_a = 0, at_b = 0;
+    for (int i = 0; i < n; i++) conns[i] = tcp_connect("127.0.0.1", port);
+    fcntl(a, F_SETFL, O_NONBLOCK);
+    fcntl(b, F_SETFL, O_NONBLOCK);
+    usleep(200000);
+    for (int c; (c = accept(a, NULL, NULL)) >= 0; at_a++) close(c);
+    for (int c; (c = accept(b, NULL, NULL)) >= 0; at_b++) close(c);
+    char name[96];
+    snprintf(name, sizeof name, "%d connections spread over both listeners (%d, %d)", n, at_a, at_b);
+    check(name, at_a > 0 && at_b > 0 && at_a + at_b == n);
+    for (int i = 0; i < n; i++) close(conns[i]);
+    /* One leaves: the other takes every connection. */
+    close(a);
+    at_b = 0;
+    for (int i = 0; i < 8; i++) conns[i] = tcp_connect("127.0.0.1", port);
+    usleep(200000);
+    for (int c; (c = accept(b, NULL, NULL)) >= 0; at_b++) close(c);
+    check("after one listener closed, the other takes them all", at_b == 8);
+    for (int i = 0; i < 8; i++) close(conns[i]);
+    close(b);
+
+    /* UDP: every datagram to exactly one of the group. */
+    int u[3];
+    for (int i = 0; i < 3; i++) u[i] = bound(SOCK_DGRAM, port, 1);
+    check("three UDP sockets with SO_REUSEPORT bind one port", u[0] >= 0 && u[1] >= 0 && u[2] >= 0);
+    check("... one without it: EADDRINUSE", bound(SOCK_DGRAM, port, 0) < 0 && errno == EADDRINUSE);
+    struct sockaddr_in to = addr("127.0.0.1", port);
+    for (int i = 0; i < n; i++) {
+        int s = socket(AF_INET, SOCK_DGRAM, 0);
+        sendto(s, "d", 1, 0, (struct sockaddr *)&to, sizeof to);
+        close(s);
+    }
+    usleep(200000);
+    int counts[3] = {0}, total = 0;
+    char c;
+    for (int i = 0; i < 3; i++) {
+        while (recv(u[i], &c, 1, MSG_DONTWAIT) == 1) counts[i]++;
+        total += counts[i];
+    }
+    snprintf(name, sizeof name, "%d datagrams from %d ports spread (%d, %d, %d)", n, n, counts[0], counts[1], counts[2]);
+    check(name, total == n && counts[0] > 0 && counts[1] > 0 && counts[2] > 0);
+    /* A connected member hears its peer, and only it. */
+    int peer = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in pa = addr("127.0.0.1", 0);
+    bind(peer, (struct sockaddr *)&pa, sizeof pa);
+    socklen_t pl = sizeof pa;
+    getsockname(peer, (struct sockaddr *)&pa, &pl);
+    connect(u[0], (struct sockaddr *)&pa, sizeof pa);
+    for (int i = 0; i < 8; i++) sendto(peer, "p", 1, 0, (struct sockaddr *)&to, sizeof to);
+    usleep(100000);
+    int mine = 0, others = 0;
+    while (recv(u[0], &c, 1, MSG_DONTWAIT) == 1) mine++;
+    for (int i = 1; i < 3; i++)
+        while (recv(u[i], &c, 1, MSG_DONTWAIT) == 1) others++;
+    check("a connected member gets every datagram of its peer", mine == 8 && others == 0);
+    close(peer);
+    for (int i = 0; i < 3; i++) close(u[i]);
+}
+
+static volatile int sigurgs;
+static void on_sigurg(int sig) {
+    (void)sig;
+    sigurgs++;
+}
+
+/* Whether SIOCATMARK says `fd` reads at the urgent mark. */
+static int at_mark(int fd) {
+    int v = -1;
+    return ioctl(fd, SIOCATMARK, &v) == 0 ? v : -1;
+}
+
+/* MSG_OOB (TCP's urgent data, Linux's semantics): the last byte of a send with MSG_OOB is
+ * urgent; the reader gets it with recv(MSG_OOB) (once), POLLPRI/EPOLLPRI and SIGURG to the
+ * F_SETOWN owner tell of it, a read stops at its mark (SIOCATMARK), and the byte is not in
+ * the stream unless SO_OOBINLINE. */
+static void urgent_data(void) {
+    int p[2];
+    char buf[16], c = 0;
+    if (tcp_pair(p) < 0) {
+        check("tcp pair for MSG_OOB", 0);
+        return;
+    }
+    struct sigaction sa = {0};
+    sa.sa_handler = on_sigurg;
+    sigaction(SIGURG, &sa, NULL);
+    sigurgs = 0;
+    check("F_SETOWN to this process", fcntl(p[1], F_SETOWN, getpid()) == 0 && fcntl(p[1], F_GETOWN) == getpid());
+    check("F_SETOWN to nobody: ESRCH", fcntl(p[0], F_SETOWN, 999999) == -1 && errno == ESRCH);
+    struct f_owner_ex ex = {F_OWNER_PGRP, getpgrp()}, back = {0, 0};
+    check("F_SETOWN_EX and F_GETOWN_EX", fcntl(p[0], F_SETOWN_EX, &ex) == 0 && fcntl(p[0], F_GETOWN_EX, &back) == 0 &&
+                                            back.type == F_OWNER_PGRP && back.pid == getpgrp() && fcntl(p[0], F_GETOWN) == -getpgrp());
+    fcntl(p[0], F_SETOWN, 0);
+    check("recv(MSG_OOB) without urgent data: EINVAL", recv(p[1], buf, 1, MSG_OOB | MSG_DONTWAIT) == -1 && errno == EINVAL);
+
+    send(p[0], "ab", 2, 0);
+    check("send with MSG_OOB", send(p[0], "c", 1, MSG_OOB) == 1);
+    send(p[0], "de", 2, 0);
+    struct pollfd pf = {p[1], POLLPRI, 0};
+    check("POLLPRI tells of urgent data", poll(&pf, 1, 2000) == 1 && (pf.revents & POLLPRI));
+    for (int i = 0; i < 100 && !sigurgs; i++) usleep(10000);
+    check("SIGURG to the F_SETOWN owner", sigurgs == 1);
+    int ep = epoll_create1(0);
+    struct epoll_event ev = {.events = EPOLLPRI, .data.fd = p[1]}, out;
+    epoll_ctl(ep, EPOLL_CTL_ADD, p[1], &ev);
+    check("EPOLLPRI too", epoll_wait(ep, &out, 1, 1000) == 1 && (out.events & EPOLLPRI));
+    check("not at the mark before the data before it", at_mark(p[1]) == 0);
+    check("recv(MSG_OOB | MSG_PEEK) shows the urgent byte", recv(p[1], &c, 1, MSG_OOB | MSG_PEEK) == 1 && c == 'c');
+    char cbuf[1];
+    struct iovec iov = {cbuf, 1};
+    struct msghdr m = {0};
+    m.msg_iov = &iov;
+    m.msg_iovlen = 1;
+    check("recvmsg(MSG_OOB) takes it, with MSG_OOB", recvmsg(p[1], &m, MSG_OOB) == 1 && cbuf[0] == 'c' && (m.msg_flags & MSG_OOB));
+    check("... once: then EINVAL", recv(p[1], &c, 1, MSG_OOB) == -1 && errno == EINVAL);
+    pf.revents = 0;
+    check("... and POLLPRI is gone", poll(&pf, 1, 0) == 0);
+    check("a read stops at the mark", recv(p[1], buf, sizeof buf, 0) == 2 && memcmp(buf, "ab", 2) == 0);
+    check("SIOCATMARK there", at_mark(p[1]) == 1);
+    usleep(50000);
+    check("the urgent byte is not in the stream", recv(p[1], buf, sizeof buf, MSG_DONTWAIT) == 2 && memcmp(buf, "de", 2) == 0);
+    check("past the mark", at_mark(p[1]) == 0);
+    close(ep);
+
+    /* Read past the mark without taking it: the byte is gone (EINVAL). */
+    send(p[0], "x", 1, MSG_OOB);
+    send(p[0], "yz", 2, 0);
+    pf.revents = 0;
+    poll(&pf, 1, 2000);
+    usleep(50000);
+    check("at the mark at once (nothing before it)", at_mark(p[1]) == 1);
+    check("a read skips it", recv(p[1], buf, sizeof buf, 0) == 2 && memcmp(buf, "yz", 2) == 0);
+    check("... and then it is lost", recv(p[1], &c, 1, MSG_OOB) == -1 && errno == EINVAL);
+
+    /* SO_OOBINLINE: the urgent byte stays in the stream, the read still stops at its mark. */
+    int one = 1;
+    setsockopt(p[1], SOL_SOCKET, SO_OOBINLINE, &one, sizeof one);
+    send(p[0], "12", 2, 0);
+    send(p[0], "3", 1, MSG_OOB);
+    send(p[0], "4", 1, 0);
+    pf.revents = 0;
+    poll(&pf, 1, 2000);
+    usleep(50000);
+    check("SO_OOBINLINE: recv(MSG_OOB) is EINVAL", recv(p[1], &c, 1, MSG_OOB) == -1 && errno == EINVAL);
+    check("... the read stops before the urgent byte", recv(p[1], buf, sizeof buf, 0) == 2 && memcmp(buf, "12", 2) == 0);
+    check("... which comes inline", at_mark(p[1]) == 1 && recv(p[1], buf, sizeof buf, 0) == 2 && memcmp(buf, "34", 2) == 0);
+    check("SIGURG for each", sigurgs == 3);
+
+    int u = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in a = addr("127.0.0.1", 9);
+    check("UDP: MSG_OOB is EOPNOTSUPP", sendto(u, "x", 1, MSG_OOB, (struct sockaddr *)&a, sizeof a) == -1 && errno == EOPNOTSUPP);
+    close(u);
+    signal(SIGURG, SIG_DFL);
+    close(p[0]);
+    close(p[1]);
+}
+
+/* A NETLINK_ROUTE socket bound to the multicast groups `groups` (RTMGRP_* bits). */
+static int nl_socket(unsigned groups) {
+    int fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    struct sockaddr_nl a = {.nl_family = AF_NETLINK, .nl_groups = groups};
+    bind(fd, (struct sockaddr *)&a, sizeof a);
+    return fd;
+}
+
+/* An IFA_LOCAL or RTA_GATEWAY-like IPv4 attribute `type` of a message whose fixed part is
+ * `fixed` bytes; 0 if it has none. */
+static unsigned nl_ipv4(struct nlmsghdr *h, size_t fixed, unsigned short type) {
+    struct rtattr *rta = (struct rtattr *)((char *)NLMSG_DATA(h) + NLMSG_ALIGN(fixed));
+    int len = h->nlmsg_len - NLMSG_LENGTH(fixed);
+    for (; RTA_OK(rta, len); rta = RTA_NEXT(rta, len))
+        if (rta->rta_type == type && RTA_PAYLOAD(rta) == 4) return *(unsigned *)RTA_DATA(rta);
+    return 0;
+}
+
+/* What a netlink socket heard: the messages of each kind about 10.0.2.15 and the default
+ * route, and the groups their datagrams came to. */
+struct heard {
+    int del_addr, new_addr, del_default, new_default, other_routes, groups;
+};
+
+/* Takes what `fd` receives within `ms` (or until the default route came back). */
+static void listen_nl(int fd, struct heard *h, int ms) {
+    static char buf[16384];
+    long until = now_ms() + ms;
+    unsigned eth0 = inet_addr("10.0.2.15"), gw = inet_addr("10.0.2.2");
+    while (now_ms() < until && !h->new_default) {
+        struct pollfd pf = {fd, POLLIN, 0};
+        if (poll(&pf, 1, (int)(until - now_ms())) != 1) break;
+        struct sockaddr_nl from;
+        struct iovec iov = {buf, sizeof buf};
+        struct msghdr m = {.msg_name = &from, .msg_namelen = sizeof from, .msg_iov = &iov, .msg_iovlen = 1};
+        int n = recvmsg(fd, &m, 0);
+        if (n <= 0) break;
+        h->groups |= from.nl_groups;
+        for (struct nlmsghdr *nh = (struct nlmsghdr *)buf; NLMSG_OK(nh, (unsigned)n); nh = NLMSG_NEXT(nh, n)) {
+            switch (nh->nlmsg_type) {
+            case RTM_NEWADDR:
+            case RTM_DELADDR:
+                if (nl_ipv4(nh, sizeof(struct ifaddrmsg), IFA_LOCAL) == eth0) {
+                    if (nh->nlmsg_type == RTM_NEWADDR) h->new_addr++;
+                    else h->del_addr++;
+                }
+                break;
+            case RTM_NEWROUTE:
+            case RTM_DELROUTE: {
+                struct rtmsg *r = NLMSG_DATA(nh);
+                int def = r->rtm_dst_len == 0 && nl_ipv4(nh, sizeof *r, RTA_GATEWAY) == gw;
+                if (def && nh->nlmsg_type == RTM_NEWROUTE) h->new_default++;
+                else if (def) h->del_default++;
+                else h->other_routes++;
+                break;
+            }
+            }
+        }
+    }
+}
+
+/* Netlink: the routes (RTM_GETROUTE), and netd's configuration changes announced to the
+ * multicast groups (a DHCP lease that goes and comes back: TEST_NET_RENEW), to members by
+ * bind and by NETLINK_ADD_MEMBERSHIP, each only its groups'; datagrams between sockets by
+ * group. */
+static void netlink_multicast(void) {
+    static char buf[16384];
+    int fd = nl_socket(0);
+    struct {
+        struct nlmsghdr h;
+        struct rtmsg r;
+    } req = {{sizeof req, RTM_GETROUTE, NLM_F_REQUEST | NLM_F_DUMP, 1, 0}, {.rtm_family = AF_INET}};
+    send(fd, &req, sizeof req, 0);
+    int found = 0, done = 0;
+    while (!done) {
+        int n = recv(fd, buf, sizeof buf, 0);
+        if (n <= 0) break;
+        for (struct nlmsghdr *nh = (struct nlmsghdr *)buf; NLMSG_OK(nh, (unsigned)n); nh = NLMSG_NEXT(nh, n)) {
+            if (nh->nlmsg_type == NLMSG_DONE) done = 1;
+            if (nh->nlmsg_type != RTM_NEWROUTE) continue;
+            struct rtmsg *r = NLMSG_DATA(nh);
+            if (r->rtm_dst_len == 0 && r->rtm_table == RT_TABLE_MAIN && nl_ipv4(nh, sizeof *r, RTA_GATEWAY) == inet_addr("10.0.2.2")) found = 1;
+        }
+    }
+    check("RTM_GETROUTE lists the default route via 10.0.2.2", found && done);
+    close(fd);
+
+    int all = nl_socket(RTMGRP_LINK | RTMGRP_IPV4_IFADDR | RTMGRP_IPV4_ROUTE);
+    int addrs = nl_socket(0);
+    int group = RTNLGRP_IPV4_IFADDR;
+    check("NETLINK_ADD_MEMBERSHIP", setsockopt(addrs, SOL_NETLINK, NETLINK_ADD_MEMBERSHIP, &group, sizeof group) == 0);
+    check("TEST_NET_RENEW: netd renews its DHCP lease", syscall(TEST_NET_RENEW) == 0);
+    struct heard a = {0}, b = {0};
+    listen_nl(all, &a, 15000);
+    char name[120];
+    snprintf(name, sizeof name, "members hear the lease go and come back (%d %d %d %d)", a.del_addr, a.del_default, a.new_addr, a.new_default);
+    check(name, a.del_addr == 1 && a.del_default == 1 && a.new_addr == 1 && a.new_default == 1 && a.other_routes >= 2);
+    check("... from the groups they joined", a.groups == (RTMGRP_IPV4_IFADDR | RTMGRP_IPV4_ROUTE));
+    listen_nl(addrs, &b, 300);
+    check("a member of one group hears only its messages", b.del_addr == 1 && b.new_addr == 1 && b.del_default == 0 && b.other_routes == 0 &&
+                                                               b.groups == RTMGRP_IPV4_IFADDR);
+    close(all);
+    close(addrs);
+
+    /* A datagram to a group reaches its members, not the sender. */
+    int x = nl_socket(1u << 19), y = nl_socket(1u << 19);
+    struct sockaddr_nl to = {.nl_family = AF_NETLINK, .nl_groups = 1u << 19}, from;
+    socklen_t fl = sizeof from;
+    sendto(y, "hello", 5, 0, (struct sockaddr *)&to, sizeof to);
+    struct sockaddr_nl yname;
+    socklen_t yl = sizeof yname;
+    getsockname(y, (struct sockaddr *)&yname, &yl);
+    int n = recvfrom(x, buf, sizeof buf, MSG_DONTWAIT, (struct sockaddr *)&from, &fl);
+    check("a datagram to a group reaches a member", n == 5 && memcmp(buf, "hello", 5) == 0 && from.nl_pid == yname.nl_pid && from.nl_groups == 1u << 19);
+    check("... but not its sender", recv(y, buf, sizeof buf, MSG_DONTWAIT) == -1 && errno == EAGAIN);
+    close(x);
+    close(y);
 }
 
 /* Byte `i` of the bulk transfer's pattern. */
@@ -800,9 +1277,14 @@ int main(void) {
     check("AF_INET6 sockets are not supported", socket(AF_INET6, SOCK_STREAM, 0) < 0 && errno == EAFNOSUPPORT);
 
     stream_semantics();
+    lingering_close();
+    lingering_in_flight();
+    reuseport();
+    urgent_data();
     killed_while_waiting_on_netd();
     datagram_semantics();
     many_sockets();
+    netlink_multicast();
 
     printf("nettest: %s\n", failures ? "FAILED" : "all passed");
     return failures;

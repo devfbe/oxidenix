@@ -52,7 +52,7 @@ Alternatives considered:
   turns the bitmap netd marks into `kfd_ready` reports, so the kernel's `poll` and `epoll` see
   every change without any thread of the program in the server.
 - **One netd for all instances**, ports global in its stack; a channel names only its own
-  control blocks, and port sharing (`SO_REUSEADDR`) never lets one instance take a port
+  control blocks, and port sharing (`SO_REUSEADDR`, `SO_REUSEPORT`: whose groups never span instances) never lets one instance take a port
   another one serves (`netring`'s port rules, tested on the host); netd accounts per instance
   (the kernel's offer names it), whatever number of channels it opens: at most two channels,
   and of every other resource a reserve kept for each instance with a channel, the rest to
@@ -134,5 +134,7 @@ time) and so may anything on the network.
   `Cargo.toml` and tested with smoltcp's own tests).
 - The control block's layout and its memory ordering become part of the ABI between the server
   and netd (`crates/netring`, tested on the host).
-- `SO_LINGER` with a timeout does not block `close` (the close reaches the server after the
-  descriptor is gone); a zero timeout aborts as on Linux.
+- `SO_LINGER` with a timeout blocks `close(2)` in the server (after the call, with nothing
+  held, as Linux's `__fput` task work), before `CLOSE` goes: it asks
+  for the `FIN` and waits on the control block for netd's `FIN_ACKED` (netd still answers
+  every request at once); a zero timeout aborts as on Linux.

@@ -120,6 +120,10 @@ pub struct Socket<'a> {
     tx_buffer: PacketBuffer<'a>,
     /// The time-to-live (IPv4) or hop limit (IPv6) value used in outgoing packets.
     hop_limit: Option<u8>,
+    /// oxidenix: the peer of a connected socket (`set_remote`).
+    remote: Option<IpEndpoint>,
+    /// oxidenix: its place in an SO_REUSEPORT group (`set_shard`).
+    shard: Option<crate::iface::Shard>,
     #[cfg(feature = "async")]
     rx_waker: WakerRegistration,
     #[cfg(feature = "async")]
@@ -134,6 +138,8 @@ impl<'a> Socket<'a> {
             rx_buffer,
             tx_buffer,
             hop_limit: None,
+            remote: None,
+            shard: None,
             #[cfg(feature = "async")]
             rx_waker: WakerRegistration::new(),
             #[cfg(feature = "async")]
@@ -180,6 +186,27 @@ impl<'a> Socket<'a> {
     #[inline]
     pub fn endpoint(&self) -> IpListenEndpoint {
         self.endpoint
+    }
+
+    /// oxidenix: a connected socket (connect(2)) takes datagrams from
+    /// `remote` only, and before any socket that is not connected (as
+    /// Linux's lookup scores an exact match higher); None: from anyone.
+    /// Kept until set again (`close` too ends it).
+    pub fn set_remote(&mut self, remote: Option<IpEndpoint>) {
+        self.remote = remote;
+    }
+
+    /// oxidenix: the peer set by `set_remote`.
+    pub fn remote(&self) -> Option<IpEndpoint> {
+        self.remote
+    }
+
+    /// oxidenix: the socket takes only the datagrams whose 4-tuple hashes
+    /// into its share of an SO_REUSEPORT group (`Shard`,
+    /// `Interface::set_reuseport_hash`); None: all of them. A connected
+    /// socket (`set_remote`) is no member of one.
+    pub fn set_shard(&mut self, shard: Option<crate::iface::Shard>) {
+        self.shard = shard;
     }
 
     /// Return the time-to-live (IPv4) or hop limit (IPv6) value used in outgoing packets.
@@ -239,6 +266,9 @@ impl<'a> Socket<'a> {
     pub fn close(&mut self) {
         // Clear the bound endpoint of the socket.
         self.endpoint = IpListenEndpoint::default();
+        // oxidenix: and its peer and group.
+        self.remote = None;
+        self.shard = None;
 
         // Reset the RX and TX buffers of the socket.
         self.tx_buffer.reset();
@@ -486,6 +516,16 @@ impl<'a> Socket<'a> {
             return false;
         }
 
+        // oxidenix: a connected socket hears its peer only; a member of an
+        // SO_REUSEPORT group its share.
+        let src = IpEndpoint::new(ip_repr.src_addr(), repr.src_port);
+        if let Some(remote) = self.remote {
+            return remote == src;
+        }
+        if let Some(shard) = self.shard {
+            let local = IpEndpoint::new(ip_repr.dst_addr(), repr.dst_port);
+            return shard.takes(cx.reuseport_hash(local, src));
+        }
         true
     }
 
@@ -1084,5 +1124,47 @@ mod test {
         assert!(socket.is_open());
         socket.close();
         assert!(!socket.is_open());
+    }
+
+    /// oxidenix: a connected socket hears its peer only.
+    #[test]
+    fn test_oxidenix_remote_filters() {
+        let (mut iface, _, _) = setup(Medium::Ip);
+        let cx = iface.context();
+        let mut socket = socket(buffer(1), buffer(0));
+        assert_eq!(socket.bind(LOCAL_PORT), Ok(()));
+        socket.set_remote(Some(REMOTE_END));
+        assert!(socket.accepts(cx, &REMOTE_IP_REPR, &REMOTE_UDP_REPR));
+        let other = UdpRepr { src_port: REMOTE_PORT + 1, ..REMOTE_UDP_REPR };
+        assert!(!socket.accepts(cx, &REMOTE_IP_REPR, &other));
+        socket.close();
+        assert_eq!(socket.remote(), None);
+    }
+
+    /// oxidenix: the members of an SO_REUSEPORT group take exactly one
+    /// datagram each between them.
+    #[test]
+    fn test_oxidenix_shard_splits_datagrams() {
+        let (mut iface, _, _) = setup(Medium::Ip);
+        let cx = iface.context();
+        let mut members: Vec<Socket> = (0..4)
+            .map(|k| {
+                let mut s = socket(buffer(1), buffer(0));
+                s.bind(LOCAL_PORT).unwrap();
+                s.set_shard(Some(crate::iface::Shard { index: k, count: 4 }));
+                s
+            })
+            .collect();
+        let mut taken = [0; 4];
+        for port in 2000..2800u16 {
+            let repr = UdpRepr { src_port: port, ..REMOTE_UDP_REPR };
+            let takers: Vec<usize> = (0..4).filter(|&k| members[k].accepts(cx, &REMOTE_IP_REPR, &repr)).collect();
+            assert_eq!(takers.len(), 1, "port {port}");
+            taken[takers[0]] += 1;
+        }
+        assert!(taken.iter().all(|&n| n > 100), "{taken:?}");
+        members[0].close();
+        members[0].bind(LOCAL_PORT).unwrap();
+        assert!(members[0].accepts(cx, &REMOTE_IP_REPR, &REMOTE_UDP_REPR), "close ends the membership");
     }
 }
