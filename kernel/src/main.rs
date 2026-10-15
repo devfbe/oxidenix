@@ -59,7 +59,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     interrupts::init_controllers(rsdp);
     time::init();
     random::init();
-    timer::init(interrupts::apic::timer_hz());
+    timer::init();
     timer::init_cpu();
     fs::init(ramdisk);
     time::init_page();

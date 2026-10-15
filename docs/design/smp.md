@@ -45,13 +45,15 @@ and dispatches by vector.
 
 ### Interrupt controllers
 
-- ACPI: the RSDP from the boot info leads to the MADT, which lists the CPUs (local APIC ids),
-  the I/O APIC and the interrupt source overrides (IRQ 0 is GSI 2 on QEMU, PCI lines are
-  level-triggered).
-- The 8259 PICs are masked. Each CPU uses its local APIC (xAPIC, MMIO mapped uncached), whose
-  timer is programmed for the next deadline of the CPU's timer queue (`timer.rs`): in
-  TSC-deadline mode where available, else one-shot with a frequency calibrated against the
-  PIT. The scheduler tick (preemption every 10 ms) is one of those deadlines.
+- ACPI: the RSDP from the boot info leads to the MADT, which lists the CPUs (local APIC and
+  local x2APIC entries, merged; ids are 32 bits), the I/O APIC and the interrupt source
+  overrides (IRQ 0 is GSI 2 on QEMU, PCI lines are level-triggered).
+- The 8259 PICs are masked (where the MADT says the machine has them). Each CPU uses its
+  local APIC in x2APIC mode (MSRs) where the CPU has it or the firmware handed over in it,
+  else as xAPIC (MMIO mapped uncached); ADR 0016. Its timer is programmed for the next
+  deadline of the CPU's timer queue (`timer.rs`): in TSC-deadline mode where available, else
+  one-shot with a frequency measured against the TSC. The scheduler tick (preemption every
+  10 ms) is one of those deadlines.
 - The I/O APIC routes ISA and PCI interrupts. Device lines handed to user-space drivers are
   masked in their redirection entry when they fire and unmasked by `irq_enable`.
 - Inter-processor interrupts: reschedule (wake an idle CPU), panic (stop all CPUs).
