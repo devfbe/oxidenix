@@ -105,6 +105,14 @@ fn exception(frame: &mut Frame) {
     let vector = frame.vector as u8;
     // Read now: resolving the fault may sleep, and CR2 changes meanwhile.
     let fault_addr = if vector == 14 { Cr2::read_raw() } else { 0 };
+    // A debug exception: what DR6 says of it (reset for the next one).
+    let dr6 = if vector == 1 { crate::process::debugreg::take_dr6() } else { 0 };
+    if vector == 1 && !frame.from_user() {
+        // A Linux program's data breakpoint (`process::debugreg`), armed while the kernel
+        // runs between the program and its server, where it touches no program memory;
+        // should the kernel touch one there, the access goes on and nothing is reported.
+        return;
+    }
     // A fault of the Linux server on the program's memory (it reads and
     // writes that directly): resolved as the program's own fault would be,
     // else its copy routine reports EFAULT.
@@ -217,7 +225,9 @@ fn exception(frame: &mut Frame) {
     }
     // A Linux program's exception is its server's to turn into a signal.
     if frame.from_user() && vector != 18 && crate::process::linux::mode() == Some(true) {
-        crate::process::linux::trap_exception(frame, vector as u64, frame.error, fault_addr, kind);
+        // A debug exception has no error code: the server learns what DR6 said.
+        let error = if vector == 1 { crate::process::linux::debug_trap(frame, dr6) } else { frame.error };
+        crate::process::linux::trap_exception(frame, vector as u64, error, fault_addr, kind);
         return;
     }
     // A native server's: it dies of it (it has no signal handlers).

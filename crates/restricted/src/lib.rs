@@ -81,6 +81,11 @@ pub struct State {
     /// `REASON_EXCEPTION`: the CPU's vector, its error code, the address
     /// (a page fault's) and, for a page fault, what the kernel found
     /// (`FAULT_*`). Written by the kernel with the registers; never read.
+    /// A debug exception (vector 1) has no error code: `trap_error` holds
+    /// what DR6 said of it (`DR6_*`: a single step, which of the thread's
+    /// hardware breakpoints hit), and the kernel has set RF in `rflags` if
+    /// one of them is an instruction breakpoint, so the program goes on
+    /// past it.
     pub trap_vector: u64,
     pub trap_error: u64,
     pub trap_addr: u64,
@@ -104,6 +109,11 @@ pub const SYS_RESTRICTED_ENTER: u64 = 1010;
 
 /// The program executed `syscall`; `State::rax` holds its number.
 pub const REASON_SYSCALL: u64 = 1;
+/// The rflags bits a program may have (`State::rflags`): CF PF AF ZF SF TF
+/// DF OF, and RF (a debugger resumes an instruction past its hardware
+/// breakpoint with it); the kernel drops the others and sets IF. (TF makes
+/// the program trap after its next instruction: a single step.)
+pub const USER_RFLAGS: u64 = 0x1 | 0x4 | 0x10 | 0x40 | 0x80 | 0x100 | 0x400 | 0x800 | 0x1_0000;
 /// The thread was kicked (`thread_kick`): a signal or a stop for it, or its
 /// process ends.
 pub const REASON_KICK: u64 = 2;
@@ -1409,3 +1419,51 @@ pub const TEST_TREE_KILL: u64 = 1530;
 /// lock. ESRCH for no such thread. Test mode only; the server passes the
 /// thread's key on (`futextest`: priority inheritance along a chain).
 pub const TEST_PI_WEIGHT: u64 = 1550;
+
+// Debugging (ADR 0019): ptrace, process_vm_readv and /proc/<pid>/mem are the
+// server's; the kernel gives it another process's memory and the thread's
+// hardware breakpoints. A stopped tracee's registers need no call: its own
+// server thread keeps them (and its FPU state, saved with fxsave) while it
+// stops in the server.
+
+/// `vm_access(target, addr, buf, len, flags) -> n`: copies between the memory
+/// of `target` at `addr` (below 64 TiB) and `buf` in the server's memory, at
+/// most `VM_ACCESS_MAX` bytes: from the target with 0, to it with
+/// `VM_ACCESS_WRITE`. `target` is a process handle (its address space as it
+/// is now) or a space handle (`SYS_VM_SPACE`; 0 bytes once that space is
+/// gone, as Linux's /proc/<pid>/mem after the exec or the end). Pages are
+/// faulted in as the target's own access would (a page a pager must bring is
+/// waited for); the target's other threads may run meanwhile. Without
+/// `VM_ACCESS_FORCE` the mapping must allow the access (process_vm_readv,
+/// process_vm_writev); with it (Linux's FOLL_FORCE: ptrace's peeks and pokes,
+/// /proc/<pid>/mem) a read needs no read right and a write into a private
+/// mapping needs no write right: the page becomes the target's own copy
+/// (copy-on-write broken, keeping the mapping's rights), never a store
+/// through to a file's page cache. A shared mapping is written only if it is
+/// writable; a mapping without any access (PROT_NONE), device memory and
+/// granted pages are never reached. Returns how many bytes were copied
+/// before the first page that could not be (EFAULT if that was the first;
+/// ENOMEM if memory ran out; ESRCH for a process without an address space).
+pub const SYS_VM_ACCESS: u64 = 1250;
+pub const VM_ACCESS_WRITE: u64 = 1;
+pub const VM_ACCESS_FORCE: u64 = 2;
+pub const VM_ACCESS_MAX: u64 = 64 * 4096;
+/// `vm_space(process) -> handle`: a handle on the address space process
+/// `process` (a handle) has now, which does not keep it (`SYS_VM_ACCESS`):
+/// /proc/<pid>/mem opens one. ESRCH for a process without one.
+pub const SYS_VM_SPACE: u64 = 1251;
+/// `thread_debug(regs)`: the calling thread's program's hardware
+/// breakpoints, five u64s at `regs` in the server's memory: DR0 to DR3 and
+/// DR7 as x86 defines them (a slot's local or global enable bit, its RW and
+/// LEN fields; the other bits are ignored). Each enabled slot must be an
+/// instruction breakpoint of length 1 or a data breakpoint (write, or read
+/// and write) of length 1, 2, 4 or 8 at an address below 64 TiB aligned to
+/// its length (EINVAL otherwise, nothing changed). They are armed only while
+/// the program runs (never while the server or the kernel does), on the
+/// CPU it runs on; a hit is a debug exception (`State::trap_error`). A new
+/// thread and an exec start with none.
+pub const SYS_THREAD_DEBUG: u64 = 1252;
+/// DR6 bits in `State::trap_error` of a debug exception: breakpoint slot `n`
+/// hit (`DR6_HIT << n`), a single step (TF).
+pub const DR6_HIT: u64 = 1;
+pub const DR6_STEP: u64 = 0x4000;
