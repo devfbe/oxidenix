@@ -54,8 +54,11 @@ done, delete it here in the same commit.
   `pidfd_send_signal`'s permission check, ptrace access mode (`PTRACE_MODE_READ` for
   `/proc/<pid>/maps`, `environ`, the fd links; `PTRACE_MODE_ATTACH` for `ptrace`'s attach,
   `process_vm_readv`/`writev`, `/proc/<pid>/mem` and `pidfd_getfd`; Yama's scope), the
-  dumpable flag's effect on them. Users of their own need them all at
-  once (a tree's processes see no other tree's).
+  dumpable flag's effect on them; the console's (Linux's `vt_ioctl`: the KD/VT setters only
+  from a process whose controlling terminal it is or with `CAP_SYS_TTY_CONFIG`, the keymap,
+  function string, accent and keycode setters only with `CAP_SYS_TTY_CONFIG`; today each
+  tree's VT state is its server's own and only the console's holder gets keys). Users of
+  their own need them all at once (a tree's processes see no other tree's).
 - Terminal (ADR 0020): one virtual terminal only (more need a screen per VT in the kernel's
   console), no console fonts, screen or color maps (`GIO_SCRNMAP`, `PIO_CMAP`), blanking or
   scrollback; serial lines without carrier detection, `TIOCMIWAIT`, `TIOCGICOUNT`, received
