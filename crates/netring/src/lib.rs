@@ -210,6 +210,10 @@ pub mod state {
     pub const CLOSED: u32 = 32;
     /// A datagram of the largest size fits smoltcp's send buffer now.
     pub const WRITABLE: u32 = 64;
+    /// Its FIN went and the peer acknowledged it, and with it everything
+    /// sent before (TCP: no longer FIN-WAIT-1, CLOSING or LAST-ACK after
+    /// the FIN): what a lingering close waits for (SO_LINGER).
+    pub const FIN_ACKED: u32 = 128;
 }
 
 /// A word on a cache line of its own.

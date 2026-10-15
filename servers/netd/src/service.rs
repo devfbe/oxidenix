@@ -2204,6 +2204,12 @@ fn pump_one(s: &mut Sock, ctl: &Ctl, rings: Option<Rings>, sockets: &mut SocketS
                 if !socket.may_recv() {
                     b |= state::RECV_EOF;
                 }
+                // The FIN went and the peer took it (and all before it):
+                // a lingering close is done (Linux's sk_stream_closing no
+                // longer holds).
+                if t.fin_sent && !matches!(st, tcp::State::FinWait1 | tcp::State::Closing | tcp::State::LastAck) {
+                    b |= state::FIN_ACKED;
+                }
                 if st == tcp::State::Closed {
                     b |= state::CLOSED | state::RECV_EOF;
                     if open(t.last) && *st_bits & state::CLOSED == 0 {

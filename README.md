@@ -1092,8 +1092,9 @@ dispatch; drivers, filesystems, the network stack and Linux itself are user-spac
   `connect` (`EINPROGRESS`, `EALREADY`, `SO_ERROR`), `send*`/`recv*` with `MSG_PEEK`,
   `MSG_DONTWAIT`, `MSG_WAITALL`, `MSG_TRUNC` and `MSG_NOSIGNAL` (`EPIPE` raises `SIGPIPE`),
   `shutdown` (half-close), `SO_RCVTIMEO`/`SO_SNDTIMEO`, `SO_RCVLOWAT`, `TCP_NODELAY` (Nagle's
-  algorithm is on by default), `SO_KEEPALIVE`, `IP_TTL`, `SO_LINGER` with a zero time (a reset),
-  `FIONREAD`, `SIOCOUTQ`; `AF_INET6` and other families are `EAFNOSUPPORT`. A socket is an
+  algorithm is on by default), `SO_KEEPALIVE`, `IP_TTL`, `SO_LINGER` (a zero time resets; a
+  time makes `close` wait until the peer acknowledged everything, the time ran out or a signal
+  came, as Linux's `tcp_close`), `FIONREAD`, `SIOCOUTQ`; `AF_INET6` and other families are `EAFNOSUPPORT`. A socket is an
   open file description of the server's, so `read`, `write`, `poll`, `select`, `epoll`,
   `fcntl(O_NONBLOCK)`, `dup`, `fork` and descriptor passing work as usual.
 - **The channel** to netd (one per instance) has a shared area with a control block per

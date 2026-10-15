@@ -2,8 +2,8 @@
  * (10.0.2.100:7 is an echo service, see builder/src/main.rs), with the
  * Linux semantics of the server's internet sockets (R7b): bulk data
  * intact, MSG_PEEK, MSG_DONTWAIT, MSG_WAITALL, MSG_TRUNC, timeouts,
- * half-close, EPIPE and SIGPIPE, SO_ERROR, SO_REUSEADDR, options, epoll's
- * edges. */
+ * half-close, EPIPE and SIGPIPE, SO_ERROR, SO_REUSEADDR, SO_LINGER, options,
+ * epoll's edges. */
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
@@ -133,6 +133,115 @@ static void killed_while_waiting_on_netd(void) {
     close(l);
     close(fds[0]);
     close(fds[1]);
+}
+
+/* Writes to non-blocking `fd` until nothing more goes for a while (the peer reads nothing:
+ * every buffer on the way is full); the bytes written. */
+static long fill_connection(int fd) {
+    static char chunk[16384];
+    long total = 0;
+    for (;;) {
+        long n = write(fd, chunk, sizeof chunk);
+        if (n > 0) {
+            total += n;
+            continue;
+        }
+        struct pollfd pf = {fd, POLLOUT, 0};
+        if (poll(&pf, 1, 300) != 1) return total;
+    }
+}
+
+/* Reads `fd` to its end; the bytes read (-1 for an error). */
+static long drain(int fd) {
+    static char sink[65536];
+    long total = 0, n;
+    while ((n = read(fd, sink, sizeof sink)) > 0) total += n;
+    return n < 0 ? -1 : total;
+}
+
+/* SO_LINGER with a time: close(2) waits until the peer acknowledged everything (and the
+ * FIN), at most the time, and a signal ends the wait (Linux's tcp_close); either way the
+ * data still arrives afterwards (no reset), and close returns 0. */
+static void lingering_close(void) {
+    struct linger lg = {1, 1};
+    int p[2];
+    char name[96], c;
+
+    /* A peer that reads nothing: the wait lasts the time (O_NONBLOCK does not shorten it). */
+    if (tcp_pair(p) < 0) {
+        check("tcp pair for SO_LINGER", 0);
+        return;
+    }
+    fcntl(p[0], F_SETFL, O_NONBLOCK);
+    long sent = fill_connection(p[0]);
+    setsockopt(p[0], SOL_SOCKET, SO_LINGER, &lg, sizeof lg);
+    long t0 = now_ms();
+    int r = close(p[0]);
+    long took = now_ms() - t0;
+    snprintf(name, sizeof name, "SO_LINGER 1 s: close waits for a stuck peer (%ld ms)", took);
+    check(name, r == 0 && took >= 900 && took < 3000);
+    check("... and the data still arrives in full, then end of file", drain(p[1]) == sent);
+    close(p[1]);
+
+    /* A signal ends the wait; close still returns 0. */
+    tcp_pair(p);
+    fcntl(p[0], F_SETFL, O_NONBLOCK);
+    sent = fill_connection(p[0]);
+    lg.l_linger = 30;
+    setsockopt(p[0], SOL_SOCKET, SO_LINGER, &lg, sizeof lg);
+    struct sigaction sa = {0};
+    sa.sa_handler = on_alarm;
+    sigaction(SIGALRM, &sa, NULL);
+    alarm(1);
+    t0 = now_ms();
+    r = close(p[0]);
+    took = now_ms() - t0;
+    snprintf(name, sizeof name, "SO_LINGER 30 s: a signal ends the wait (%ld ms)", took);
+    check(name, r == 0 && took >= 900 && took < 5000);
+    check("... and the data still arrives in full", drain(p[1]) == sent);
+    close(p[1]);
+
+    /* A peer that reads: close returns once everything was acknowledged. */
+    tcp_pair(p);
+    fcntl(p[0], F_SETFL, O_NONBLOCK);
+    sent = fill_connection(p[0]);
+    /* (The child lets go of its copy first: the parent's close is the last.) */
+    int sync[2];
+    pipe(sync);
+    pid_t reader = fork();
+    if (reader == 0) {
+        close(p[0]);
+        write(sync[1], "x", 1);
+        usleep(300000);
+        _exit(drain(p[1]) == sent ? 0 : 1);
+    }
+    close(p[1]);
+    read(sync[0], &c, 1);
+    close(sync[0]);
+    close(sync[1]);
+    lg.l_linger = 20;
+    setsockopt(p[0], SOL_SOCKET, SO_LINGER, &lg, sizeof lg);
+    t0 = now_ms();
+    r = close(p[0]);
+    took = now_ms() - t0;
+    int st = -1;
+    waitpid(reader, &st, 0);
+    snprintf(name, sizeof name, "SO_LINGER 20 s: close returns once all is acked (%ld ms)", took);
+    check(name, r == 0 && took >= 250 && took < 10000 && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+
+    /* SO_LINGER with a zero time resets: the peer reads ECONNRESET. */
+    tcp_pair(p);
+    write(p[0], "x", 1);
+    lg.l_linger = 0;
+    setsockopt(p[0], SOL_SOCKET, SO_LINGER, &lg, sizeof lg);
+    close(p[0]);
+    struct pollfd pf = {p[1], POLLIN, 0};
+    poll(&pf, 1, 2000);
+    usleep(100000);
+    r = read(p[1], &c, 1);
+    int r2 = r == 1 ? read(p[1], &c, 1) : r;
+    check("SO_LINGER 0: close resets the connection", r2 == -1 && errno == ECONNRESET);
+    close(p[1]);
 }
 
 /* Byte `i` of the bulk transfer's pattern. */
@@ -800,6 +909,7 @@ int main(void) {
     check("AF_INET6 sockets are not supported", socket(AF_INET6, SOCK_STREAM, 0) < 0 && errno == EAFNOSUPPORT);
 
     stream_semantics();
+    lingering_close();
     killed_while_waiting_on_netd();
     datagram_semantics();
     many_sockets();

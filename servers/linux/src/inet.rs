@@ -1028,15 +1028,67 @@ impl InetSock {
     /// (a reset if data it received is unread, or SO_LINGER with a zero
     /// time), `now` before this returns (its port is free then), else by
     /// the net thread (the caller may not wait for netd: the pager).
+    ///
+    /// SO_LINGER with a time (`now` only: a close(2), as Linux lingers
+    /// only for a process that is not exiting, and a service thread may
+    /// not wait) first waits, as Linux's tcp_close and
+    /// sk_stream_wait_close, until the connection's FIN went and the peer
+    /// acknowledged it with everything before it, the time ran out, or a
+    /// signal came; the close then goes on in the background as without
+    /// lingering (Linux does not reset the connection at the end of the
+    /// time) and close(2) returns 0. As on Linux, O_NONBLOCK does not
+    /// shorten the wait, and shutdown(2) never lingers.
     pub fn release(&self, now: bool) {
+        let linger = self.st.lock().opts.linger.filter(|&s| s > 0);
+        let mut aborted = false;
+        if let (true, Some(secs)) = (now, linger) {
+            aborted = self.linger(secs as u64 * 1_000_000_000);
+        }
         let snap = self.snap();
         let rings = self.rings.lock().take();
         let unread = rings.is_some_and(|r| self.kind == Kind::Tcp && self.available(&snap, &r).unwrap_or(0) > 0);
-        let abort = unread || self.st.lock().opts.linger == Some(0);
+        let abort = aborted || unread || self.st.lock().opts.linger == Some(0);
         if now {
             self.net.close_now(self.index, rings, abort);
         } else {
             self.net.queue_close(self.index, rings, abort);
+        }
+    }
+
+    /// A lingering close's wait (`release`), for at most `ns`: the FIN
+    /// after what the send ring holds, then until netd says the peer
+    /// acknowledged it (`state::FIN_ACKED`), the connection is over, the
+    /// time is up or a signal comes. True if the connection must be reset
+    /// instead: data it received is unread, or came during the wait (as
+    /// Linux resets a connection closed for reading when data arrives).
+    fn linger(&self, ns: u64) -> bool {
+        let snap = self.snap();
+        let rings = self.rings();
+        let connected = snap.state & state::ESTABLISHED != 0 && snap.state & state::CLOSED == 0;
+        if self.kind != Kind::Tcp || !connected || self.net.is_dead() || self.st.lock().listening {
+            return false;
+        }
+        if rings.is_some_and(|r| self.available(&snap, &r).unwrap_or(0) > 0) {
+            return true;
+        }
+        if self.net.status(Request::Shutdown { sock: self.index, how: netring::SHUT_WR }).is_err() {
+            return false;
+        }
+        let deadline = deadline(ns);
+        loop {
+            let seen = self.ctl().seen();
+            let snap = self.snap();
+            if snap.state & (state::FIN_ACKED | state::CLOSED) != 0 || self.net.is_dead() {
+                return false;
+            }
+            if rings.is_some_and(|r| self.available(&snap, &r).unwrap_or(0) > 0) {
+                return true;
+            }
+            // The time ran out (EAGAIN) or a signal came (EINTR): close(2)
+            // returns, the connection finishes in the background.
+            if self.wait(seen, deadline).is_err() {
+                return false;
+            }
         }
     }
 }

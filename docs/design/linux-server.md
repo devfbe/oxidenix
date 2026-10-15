@@ -530,6 +530,12 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
      (`SHUT_WR` sends `FIN` after what is queued), `TCP_NODELAY` (Nagle's algorithm is on
      by default, as Linux), `SO_KEEPALIVE`, `IP_TTL`, `FIONREAD`, `SIOCOUTQ`, `SO_LINGER`
      with a zero time (close sends `RST`), and close with unread data sends `RST`.
+     `SO_LINGER` with a time: `close(2)` asks for the `FIN` (`SHUTDOWN`) and waits on the
+     control block until netd reports it acknowledged with everything before it
+     (`state::FIN_ACKED`), the time ran out or a signal came, then closes as without it
+     (Linux's `tcp_close` and `sk_stream_wait_close`: no reset at the end of the time,
+     `O_NONBLOCK` does not shorten the wait, a process's exit and `shutdown` never linger;
+     data that arrives meanwhile resets the connection).
      **Closing**: `close(2)` sends `CLOSE` before it returns, so the port is free then, as
      on Linux; what the pager learns (a process's exit closing its descriptors) it hands to
      the net thread, never waiting for netd itself. netd then copies what the send ring
