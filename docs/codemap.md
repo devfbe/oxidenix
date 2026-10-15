@@ -385,7 +385,14 @@ kernel that handle them.
 - `docs/benchmarks/2026-10-10-7c6ebd0-main.md` Benchmark 7c6ebd0 (main)
 - `docs/benchmarks/2026-10-10-b1fea5d-memfix.md` Benchmark b1fea5d (memfix)
 - `docs/benchmarks/2026-10-14-61e79d0-ab-main.md` Benchmark 61e79d0 (ab-main)
+- `docs/benchmarks/2026-10-15-4122c21-ab-coherence-1.md` Benchmark 4122c21 (ab-coherence-1)
+- `docs/benchmarks/2026-10-15-4122c21-ab-coherence-2.md` Benchmark 4122c21 (ab-coherence-2)
+- `docs/benchmarks/2026-10-15-4122c21-ab-coherence-3.md` Benchmark 4122c21 (ab-coherence-3)
 - `docs/benchmarks/2026-10-15-725b380-dirty-fwd-sysret.md` Benchmark 725b380-dirty (fwd-sysret)
+- `docs/benchmarks/2026-10-15-9fe966d-ab-coherence-1.md` Benchmark 9fe966d (ab-coherence-1)
+- `docs/benchmarks/2026-10-15-9fe966d-ab-coherence-2.md` Benchmark 9fe966d (ab-coherence-2)
+- `docs/benchmarks/2026-10-15-9fe966d-ab-coherence-3.md` Benchmark 9fe966d (ab-coherence-3)
+- `docs/benchmarks/2026-10-15-a3f96ce-ab-base-1.md` Benchmark a3f96ce (ab-base-1)
 - `docs/benchmarks/README.md` Benchmarks
 - `docs/decisions/0001-linux-abi-in-a-user-space-server.md` ADR 0001: The Linux ABI moves out of the kernel, into a server in restricted mode
 - `docs/decisions/0002-one-linux-server-per-process-tree.md` ADR 0002: One Linux server instance per process tree
