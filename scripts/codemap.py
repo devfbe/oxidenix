@@ -29,7 +29,7 @@ AREAS = [
     ("Scripts", "scripts/"),
 ]
 
-SOURCE = re.compile(r"\.(rs|c|h|sh|py)$")
+SOURCE = re.compile(r"\.(rs|c|cc|h|sh|py|nix)$")
 PUB_TYPE = re.compile(r"^pub(?:\([a-z]+\))? (?:unsafe )?(struct|enum|trait|union) ([A-Za-z_][A-Za-z0-9_]*)")
 ABI_CONST = re.compile(r"^pub const (SYS_[A-Z0-9_]+): u64 = (\d+);")
 SUMMARY_LEN = 220
@@ -61,13 +61,13 @@ def summary(path, lines):
             elif doc or (s and not s.startswith("#!") and not s.startswith("//")):
                 break
         return first_sentence(" ".join(doc)) if doc else ""
-    if path.endswith((".c", ".h")):
+    if path.endswith((".c", ".cc", ".h")):
         text = "\n".join(lines[:40])
         m = re.match(r"\s*/\*(.*?)\*/", text, re.S)
         if not m:
             return ""
         return first_sentence(re.sub(r"^\s*\*", "", m.group(1), flags=re.M))
-    if path.endswith((".sh", ".py")):
+    if path.endswith((".sh", ".py", ".nix")):
         doc = []
         body = lines[1:] if lines and lines[0].startswith("#!") else lines
         if path.endswith(".py") and body and body[0].startswith('"""'):

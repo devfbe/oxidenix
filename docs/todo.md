@@ -46,7 +46,9 @@ done, delete it here in the same commit.
   `smaps`.
   `TFD_TIMER_CANCEL_ON_SET` sees only the tree's own settings of the wall clock.
 - Files: owners and groups are accepted but not stored (everyone is root), `io_uring`
-  (`ENOSYS`).
+  (`ENOSYS`), extended attributes (no filesystem keeps them: the calls answer as on a Linux
+  filesystem without them; Linux's tmpfs keeps `user.`, `trusted.` and `security.` ones),
+  `posix_fadvise`'s advice is checked but not acted on (no readahead, no dropping of pages).
 - Credentials: everyone in a tree is root with every capability, so the checks Linux makes
   between processes of different users always pass and are not written yet: `kill`'s and
   `pidfd_send_signal`'s permission check, ptrace access mode (`PTRACE_MODE_READ` for
@@ -57,7 +59,12 @@ done, delete it here in the same commit.
 - Terminal: packet mode (`TIOCPKT`), the Linux console's VT and keyboard ioctls, serial input.
 - Network: IPv6, `O_ASYNC` (`SIGIO`; `F_SETOWN` is kept and used for `SIGURG`), raw ICMP is shared
   between instances (documented in ADR 0008).
-- Dynamic linking with glibc is untested (the ELF loader handles `PT_INTERP`).
+- `rseq` is `ENOSYS` (ADR 0021: glibc goes on without it). A real one needs the kernel to
+  update the registered area's CPU number and abort a critical section on every return to
+  user mode after a preemption or migration, and the server on signal delivery.
+- Dynamically linked programs (ADR 0021) need their store paths on `/data/nix/store`; nothing
+  in the guest installs a Nix closure there, and the builder's copies of earlier nixpkgs pins
+  stay on the persistent `disk.img` (no garbage collection).
 
 ## Real hardware
 

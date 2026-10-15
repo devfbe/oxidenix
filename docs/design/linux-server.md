@@ -819,7 +819,10 @@ A failure after the point of no return kills the process with SIGSEGV, as on Lin
 if it was killed meanwhile), once the call returned and let go of everything it held
 (`local::exit_pending`, carried out by the thread's loop). Handlers
 go back to their default (ignored signals stay ignored), the alternate stack goes, the mask
-and pending signals stay; a vfork parent goes on.
+and pending signals stay; the process gets a new address space record (`process::Mm`, made
+before the point of no return: the break and the membarrier registrations, which a vfork
+child shared with its parent until now); a vfork parent goes on. glibc's and musl's dynamic
+loaders run on this as on Linux (ADR 0021).
 
 ### exit and wait
 
@@ -1323,7 +1326,8 @@ Linux asks for write access only for files, directories and symlinks.
   through its scratch grant. Nothing of it is cached; a procfs that died is started again
   for a new channel and serves the same inodes.
 - **The server's own part**, each process's: `/proc/<pid>` with `stat`, `statm`, `status`,
-  `cmdline`, `comm`, `exe`, `mounts`, `oom_score`, `oom_score_adj`, `oom_adj`, `maps`, `mem`,
+  `cmdline`, `comm`, `exe`, `mounts`, `mountinfo` (ids, parents, device numbers),
+  `oom_score`, `oom_score_adj`, `oom_adj`, `maps`, `mem`,
   `task/<tid>/{stat,statm,status,cmdline,comm,oom_score,oom_score_adj,oom_adj,maps,mem}`, `fd/<n>`,
   `fdinfo/<n>`, `cwd` and `root`; `/proc/self`, `/proc/thread-self` and
   `/proc/mounts` (a link to `self/mounts`), merged into procfs's root listing; and

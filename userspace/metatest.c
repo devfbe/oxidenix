@@ -2,7 +2,8 @@
  * timestamps (set by utimensat, futimens, utimes; moved by writes,
  * truncation, chmod, directory changes; statx's birth time; on /data the
  * times a write set survive the write-back), modes through descriptors
- * (fchmod, fchmodat2), the chown family, and supplementary groups. */
+ * (fchmod, fchmodat2), the chown family, extended attributes (none: as on a
+ * filesystem without them), and supplementary groups. */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
@@ -13,6 +14,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
+#include <sys/xattr.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -148,6 +150,49 @@ int main(void) {
                                                                       fstat(dn, &ds) == 0 && ds.st_mtim.tv_sec == 1234567890);
     close(dn);
     check("... and on a /proc file", utimensat(AT_FDCWD, "/proc/uptime", dev_times, 0) == 0 && stat("/proc/uptime", &ds) == 0 && ds.st_mtim.tv_sec == 1234567890);
+
+    /* Extended attributes: no filesystem here keeps them, so as on a Linux
+     * filesystem without them (coreutils' ls asks for ACLs and SELinux labels
+     * with lgetxattr and llistxattr): lists are empty, the rest EOPNOTSUPP,
+     * after the arguments' and the target's checks. */
+    {
+        char xbuf[64], longname[300];
+        memset(longname, 'a', sizeof longname - 1);
+        longname[sizeof longname - 1] = 0;
+        int ok = 1;
+        const char *targets[] = {"/tmp", "/data", "/proc/self/status", "/dev/null"};
+        for (int i = 0; i < 4; i++) {
+            ok &= listxattr(targets[i], xbuf, sizeof xbuf) == 0 && llistxattr(targets[i], NULL, 0) == 0;
+            errno = 0;
+            ok &= getxattr(targets[i], "user.x", xbuf, sizeof xbuf) == -1 && errno == EOPNOTSUPP;
+            errno = 0;
+            ok &= lgetxattr(targets[i], "system.posix_acl_access", NULL, 0) == -1 && errno == EOPNOTSUPP;
+        }
+        check("listxattr is empty and getxattr EOPNOTSUPP on tmpfs, /data, /proc, /dev", ok);
+        check("setxattr and removexattr: EOPNOTSUPP",
+              setxattr("/tmp", "user.x", "v", 1, 0) == -1 && errno == EOPNOTSUPP && lremovexattr("/data", "user.x") == -1 && errno == EOPNOTSUPP);
+        check("... a missing file: ENOENT", getxattr("/tmp/no-such-file", "user.x", xbuf, sizeof xbuf) == -1 && errno == ENOENT &&
+                                                listxattr("/tmp/no-such-file", NULL, 0) == -1 && errno == ENOENT);
+        check("... an empty or too long name: ERANGE",
+              getxattr("/tmp", "", xbuf, sizeof xbuf) == -1 && errno == ERANGE && getxattr("/tmp", longname, xbuf, sizeof xbuf) == -1 && errno == ERANGE);
+        check("... unknown setxattr flags: EINVAL; a value beyond 64 KiB: E2BIG",
+              setxattr("/tmp", "user.x", "v", 1, 4) == -1 && errno == EINVAL && setxattr("/tmp", "user.x", "v", 65537, 0) == -1 && errno == E2BIG);
+        symlink("/tmp/no-such-file", "/tmp/xattr-link");
+        check("... lgetxattr does not follow a symlink, getxattr does",
+              lgetxattr("/tmp/xattr-link", "user.x", NULL, 0) == -1 && errno == EOPNOTSUPP && getxattr("/tmp/xattr-link", "user.x", NULL, 0) == -1 && errno == ENOENT);
+        unlink("/tmp/xattr-link");
+        int pfd[2];
+        pipe(pfd);
+        int fd = open("/data", O_RDONLY | O_DIRECTORY), opath = open("/tmp", O_PATH);
+        check("... on descriptors: a directory, a pipe; EBADF for O_PATH and closed ones",
+              flistxattr(fd, NULL, 0) == 0 && fgetxattr(fd, "user.x", NULL, 0) == -1 && errno == EOPNOTSUPP && flistxattr(pfd[0], NULL, 0) == 0 &&
+                  fsetxattr(pfd[1], "user.x", "v", 1, 0) == -1 && errno == EOPNOTSUPP && flistxattr(opath, NULL, 0) == -1 && errno == EBADF &&
+                  fremovexattr(999, "user.x") == -1 && errno == EBADF);
+        close(fd);
+        close(opath);
+        close(pfd[0]);
+        close(pfd[1]);
+    }
 
     /* Supplementary groups: none (root, started by init). */
     gid_t groups[4];

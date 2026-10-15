@@ -169,8 +169,18 @@ pub enum Report {
     Continued,
 }
 
-/// The program break (brk), shared by the processes sharing an address space.
+/// What the server keeps of an address space (Linux's mm_struct): shared by the processes
+/// sharing it (CLONE_VM, vfork), copied by fork, new with each execve (which gives the
+/// process a new address space: a vfork child's execve leaves its parent's as it was).
 #[derive(Default)]
+pub struct Mm {
+    pub brk: Brk,
+    /// The membarrier(2) commands registered for it (`membarrier`).
+    pub membarrier: u32,
+}
+
+/// The program break (brk).
+#[derive(Default, Clone, Copy)]
 pub struct Brk {
     pub start: u64,
     pub end: u64,
@@ -229,7 +239,7 @@ pub struct Proc {
     /// Its interval and POSIX timers, and its CPU clocks' alarms in the kernel.
     pub timers: crate::timer::Timers,
     pub cpu: crate::timer::CpuAlarm,
-    pub brk: Arc<Mutex<Brk>>,
+    pub mm: Arc<Mutex<Mm>>,
     pub words: Arc<Words>,
     /// What the thread pidfds of its main thread (of its id) watch, made with the first
     /// (`thread_watch`).
@@ -583,7 +593,7 @@ pub fn register_init(key: u64) {
             children_usage: Usage::default(),
             timers: Default::default(),
             cpu: Default::default(),
-            brk: Arc::new(Mutex::new(Brk::default())),
+            mm: Arc::new(Mutex::new(Mm::default())),
             words: Arc::new(Words::default()),
             main_watch: None,
             tables_out: 0,
@@ -856,13 +866,14 @@ fn clone(s: &mut State, c: Clone) -> Result<i64, i64> {
     let limits_ptr = Arc::as_ptr(&limits);
     // What else the records need from the heap, before anything changes (a clone without
     // memory is ENOMEM with nothing of it left, as Linux's copy_process): a new process's
-    // shared words, exec account and (without CLONE_VM) break, and the child's birth record.
+    // shared words, exec account and (without CLONE_VM) address space record, and the child's
+    // birth record.
     let fresh = (|| -> Result<_, NoMem> {
         let own = if thread {
             None
         } else {
-            let brk = if flags & CLONE_VM != 0 { None } else { Some(heap::try_arc(Mutex::new(Brk::default()))?) };
-            Some((brk, heap::try_arc(Words::default())?, heap::try_arc(core::sync::atomic::AtomicUsize::new(0))?))
+            let mm = if flags & CLONE_VM != 0 { None } else { Some(heap::try_arc(Mutex::new(Mm::default()))?) };
+            Some((mm, heap::try_arc(Words::default())?, heap::try_arc(core::sync::atomic::AtomicUsize::new(0))?))
         };
         let settid = if settid_in_child { c.ctid } else { 0 };
         let birth = heap::try_box(Birth { tid, pid, settid, fs: fs_ptr, files: files_ptr, limits: limits_ptr, serial: 0 })?;
@@ -922,7 +933,7 @@ fn clone(s: &mut State, c: Clone) -> Result<i64, i64> {
         let me_thread = &t.threads[&my_tid];
         let thread_sig = me_thread.sig.for_child(flags & CLONE_VM != 0 && flags & CLONE_VFORK == 0);
         let comm = me_thread.comm;
-        if let (Some((threads, cmdline)), Some((own_brk, words, exec_bytes))) = (copies, own) {
+        if let (Some((threads, cmdline)), Some((own_mm, words, exec_bytes))) = (copies, own) {
             let parent_hand = t.procs[&my_pid].sig.hand;
             let hand = if flags & CLONE_SIGHAND != 0 {
                 t.hands.get_mut(&parent_hand).expect("the caller's actions").refs += 1;
@@ -943,11 +954,12 @@ fn clone(s: &mut State, c: Clone) -> Result<i64, i64> {
             // With CLONE_PARENT the caller's parent is the parent, and gets the caller's exit
             // signal, as on Linux.
             let exit_signal = if flags & CLONE_PARENT != 0 { parent.exit_signal } else { c.exit_signal as u32 };
-            let brk = match own_brk {
-                None => parent.brk.clone(),
+            // (A copy, as Linux's dup_mm: the break and the membarrier registrations.)
+            let mm = match own_mm {
+                None => parent.mm.clone(),
                 Some(own) => {
-                    let b = parent.brk.lock();
-                    *own.lock() = Brk { start: b.start, end: b.end, limit: b.limit };
+                    let m = parent.mm.lock();
+                    *own.lock() = Mm { brk: m.brk, membarrier: m.membarrier };
                     own
                 }
             };
@@ -982,7 +994,7 @@ fn clone(s: &mut State, c: Clone) -> Result<i64, i64> {
                 // Timers are not inherited.
                 timers: Default::default(),
                 cpu: Default::default(),
-                brk,
+                mm,
                 words,
                 main_watch: None,
                 tables_out: 0,
@@ -2072,10 +2084,10 @@ pub fn query(op: u64, arg: u64, cap: usize) -> Result<Vec<u8>, i64> {
     }
 }
 
-/// The program break of process `pid` (shared by the processes sharing its address
-/// space).
-pub fn brk_of(pid: Pid) -> Option<Arc<Mutex<Brk>>> {
-    PROCS.lock().procs.get(&pid).map(|p| p.brk.clone())
+/// The address space record of process `pid` (shared by the processes sharing its
+/// address space).
+pub fn mm_of(pid: Pid) -> Option<Arc<Mutex<Mm>>> {
+    PROCS.lock().procs.get(&pid).map(|p| p.mm.clone())
 }
 
 /// The kernel's handle on process `pid`.
@@ -2086,7 +2098,7 @@ pub fn maps_view(id: Pid) -> Option<(u64, Option<Arc<crate::namespace::Origin>>,
     let t = PROCS.lock();
     let pid = if t.procs.contains_key(&id) { id } else { t.threads.get(&id)?.pid };
     let p = t.procs.get(&pid)?;
-    let brk = p.brk.lock();
+    let brk = p.mm.lock().brk;
     Some((p.handle, p.exe.clone(), p.exe_object, (brk.start, brk.end)))
 }
 

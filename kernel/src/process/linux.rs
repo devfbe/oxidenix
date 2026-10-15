@@ -1913,6 +1913,21 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             _ => Err(EINVAL),
         },
         SYS_VM_AREAS => vm_areas(&instance, a[0], a[1], a[2], a[3]),
+        SYS_MEMBARRIER => {
+            // (A service thread has no program whose CPUs it could name.)
+            if is_pager() {
+                return Err(EPERM);
+            }
+            use super::membarrier;
+            match a[0] {
+                MEMBARRIER_SPACE => membarrier::private(&super::current_mm().ok_or(EINVAL)?.tlb),
+                MEMBARRIER_GLOBAL_EXPEDITED => membarrier::global_expedited(),
+                MEMBARRIER_GLOBAL => membarrier::global(),
+                MEMBARRIER_REGISTER_GLOBAL => membarrier::register_global(&super::current_mm().ok_or(EINVAL)?.tlb).map_err(|_| ENOMEM)?,
+                _ => return Err(EINVAL),
+            }
+            Ok(0)
+        }
         SYS_VM_ACCESS => vm_access(&instance, a[0], a[1], a[2], a[3], a[4]),
         SYS_VM_SPACE => {
             let mm = container(&instance, a[0])?.group.info.lock().mem.clone().and_then(|s| s.mm()).ok_or(ESRCH)?;
@@ -2495,6 +2510,16 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             }
             let t = thread_by_key(&instance, a[0])?;
             Ok(super::sched::effective_weight(&t) as i64)
+        }
+        TEST_BARRIERS => {
+            if !crate::TEST_MODE.load(core::sync::atomic::Ordering::Relaxed) {
+                return Err(ENOSYS);
+            }
+            let cpu = usize::try_from(a[0]).map_err(|_| EINVAL)?;
+            if crate::smp::by_index(cpu).is_none() {
+                return Err(EINVAL);
+            }
+            super::tlb::barriers_served(cpu).map(|n| n as i64).ok_or(EINVAL)
         }
         TEST_TREE_START => {
             if !crate::TEST_MODE.load(core::sync::atomic::Ordering::Relaxed) {

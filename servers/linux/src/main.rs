@@ -88,6 +88,7 @@ const PROT_RW: u64 = 3;
 const SYS_IO_URING_SETUP: u64 = 425;
 const SYS_IO_URING_ENTER: u64 = 426;
 const SYS_IO_URING_REGISTER: u64 = 427;
+const SYS_RSEQ: u64 = 334;
 
 /// Whether the kernel runs the self-tests (`SYS_TEST_MODE`), asked once:
 /// 0 not yet known, 1 no, 2 yes.
@@ -311,12 +312,13 @@ fn dispatch(s: &mut State) -> i64 {
         TEST_TREE_WAIT => syscall(TEST_TREE_WAIT, [s.rdi, s.rsi, 0, 0, 0, 0]),
         TEST_TREE_KILL => syscall(TEST_TREE_KILL, [s.rdi, 0, 0, 0, 0, 0]),
         TEST_HEAP_STATS => test(s.rax, s.rdi),
-        // The kernel's to answer, for the thread's key.
+        TEST_BARRIERS if test_mode() => syscall(TEST_BARRIERS, [s.rdi, 0, 0, 0, 0, 0]),
         // netd's lease goes and comes back (netlink's notifications).
         TEST_NET_RENEW if test_mode() => match netclient::net().and_then(|n| n.status(netring::Request::Renew)) {
             Ok(_) => 0,
             Err(e) => -e,
         },
+        // The kernel's to answer, for the thread's key.
         TEST_PI_WEIGHT if test_mode() => match process::key_of(s.rdi as u32) {
             Some(key) => syscall(TEST_PI_WEIGHT, [key, 0, 0, 0, 0, 0]),
             None => -3,
@@ -326,6 +328,10 @@ fn dispatch(s: &mut State) -> i64 {
         // instead. Answered here, so the kernel does not log them as
         // unknown calls.
         SYS_IO_URING_SETUP | SYS_IO_URING_ENTER | SYS_IO_URING_REGISTER => -ENOSYS,
+        // Not offered either, as by a Linux built without CONFIG_RSEQ (ADR 0021): glibc
+        // registers each thread's rseq area at its start and goes on without one on ENOSYS
+        // (__rseq_size 0; sched_getcpu asks the vDSO's getcpu).
+        SYS_RSEQ => -ENOSYS,
         nr if nr >= FIRST_NON_LINUX => -ENOSYS,
         // Nothing passes through (R9): a Linux call the server does not
         // implement is ENOSYS, said on the console (scripted runs read

@@ -22,6 +22,7 @@
 #include <sys/statvfs.h>
 #include <sys/sysmacros.h>
 #include <sys/un.h>
+#include <sys/xattr.h>
 #include <unistd.h>
 
 static int failures;
@@ -161,6 +162,8 @@ int main(int argc, char **argv) {
     check("chmod: EROFS", fails(chmod(hello, 0600), EROFS));
     check("chown: EROFS", fails(chown(hello, 0, 0), EROFS));
     check("utimensat: EROFS", fails(utimensat(AT_FDCWD, hello, NULL, 0), EROFS));
+    check("setxattr and removexattr: EROFS; getxattr still EOPNOTSUPP",
+          fails(setxattr(hello, "user.x", "v", 1, 0), EROFS) && fails(removexattr(hello, "user.x"), EROFS) && fails(getxattr(hello, "user.x", NULL, 0), EOPNOTSUPP));
     int s = socket(AF_UNIX, SOCK_STREAM, 0);
     struct sockaddr_un un = {.sun_family = AF_UNIX};
     strcpy(un.sun_path, "/data/rotest/sock");

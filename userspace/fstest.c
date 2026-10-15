@@ -1,5 +1,5 @@
 /* Filesystem semantics on /data: symlinks and O_NOFOLLOW, unlinked files that stay open,
- * file size limits, the access modes of descriptors, and preadv2/pwritev2's flags. */
+ * file size limits, the access modes of descriptors, posix_fadvise, and preadv2/pwritev2's flags. */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
@@ -169,6 +169,21 @@ int main(void) {
     check("ftruncate on a read-only fd fails with EINVAL", ftruncate(fd, 0) < 0 && errno == EINVAL);
     memset(buf, 0, sizeof buf);
     check("the file is unchanged", pread(fd, buf, 8, 0) == 4 && strcmp(buf, "data") == 0);
+    /* posix_fadvise: advice taken (on a read-only descriptor too), Linux's
+     * checks kept (it returns the error number). */
+    check("posix_fadvise: every advice is taken",
+          posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL) == 0 && posix_fadvise(fd, 0, 4096, POSIX_FADV_WILLNEED) == 0 &&
+              posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED) == 0 && posix_fadvise(fd, 0, 0, POSIX_FADV_NOREUSE) == 0);
+    check("... unknown advice or a negative length: EINVAL", posix_fadvise(fd, 0, 0, 6) == EINVAL && posix_fadvise(fd, 0, -1, POSIX_FADV_NORMAL) == EINVAL);
+    int fadv_pipe[2];
+    pipe(fadv_pipe);
+    int fadv_path = open(path, O_PATH);
+    check("... a pipe: ESPIPE; O_PATH or closed: EBADF",
+          posix_fadvise(fadv_pipe[0], 0, 0, POSIX_FADV_NORMAL) == ESPIPE && posix_fadvise(fadv_path, 0, 0, POSIX_FADV_NORMAL) == EBADF &&
+              posix_fadvise(999, 0, 0, POSIX_FADV_NORMAL) == EBADF);
+    close(fadv_pipe[0]);
+    close(fadv_pipe[1]);
+    close(fadv_path);
     close(fd);
     unlink(path);
 
