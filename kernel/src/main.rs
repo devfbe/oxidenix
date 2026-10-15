@@ -43,7 +43,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     if let Some(fb) = boot_info.framebuffer.as_mut() {
         drivers::console::init(fb);
     }
-    if !drivers::serial::exists() {
+    if !drivers::serial::exists_console() {
         printkln!("[boot] no serial port: the kernel's messages are on the screen only");
     }
     interrupts::init();

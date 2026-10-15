@@ -1,8 +1,9 @@
-//! Terminals (phase R6d, docs/design/linux-server.md "The terminal", ADR 0007): a line
-//! discipline (`ldisc`), the job control state of a terminal (the session it controls,
+//! Terminals (phase R6d, docs/design/linux-server.md "The terminal", ADR 0007, ADR 0020): a
+//! line discipline (`ldisc`), the job control state of a terminal (the session it controls,
 //! its foreground process group, its window size), its hangups, and its driver: the
-//! console (`console`) or a pseudo-terminal's slave (`pty`). Each open of a terminal is an
-//! open file description of the server's (`TtyOpen`), as a pipe's end is.
+//! console (`console`, its virtual terminal's requests `vt`), a pseudo-terminal's slave
+//! (`pty`) or a serial port (`serial`). Each open of a terminal is an open file description
+//! of the server's (`TtyOpen`), as a pipe's end is.
 //!
 //! Locks: `inner` holds the state and is never held across a copy to or from program
 //! memory, nor across a wait or the console's write. A read or a write takes its turn
@@ -113,9 +114,12 @@ const TIOCGEXCL: u32 = 0x8004_5440;
 /// What drives a terminal.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Driver {
+    /// The console, the one virtual terminal (/dev/console, /dev/tty0, /dev/tty1; `vt`).
     Console,
     /// A pseudo-terminal's slave, by its index (`/dev/pts/n`).
     Pty(u32),
+    /// A serial port, by its index (`/dev/ttyS<n>`, `serial`).
+    Serial(u8),
 }
 
 /// A pty's master side, in its terminal's state.
@@ -368,7 +372,8 @@ fn signal(scope: Scope, id: u64, sig: u64) {
     }
 }
 
-fn now() -> u64 {
+/// The monotonic clock (nanoseconds).
+pub fn now() -> u64 {
     syscall(SYS_CLOCK_READ, [1, 0, 0, 0, 0, 0]).max(0) as u64
 }
 
@@ -378,6 +383,13 @@ pub fn find(mut f: impl FnMut(&Arc<Tty>) -> bool) -> Option<Arc<Tty>> {
     if let Some(c) = crate::console::current() {
         if f(&c) {
             return Some(c);
+        }
+    }
+    for port in 0..crate::serial::PORTS {
+        if let Some(t) = crate::serial::current(port) {
+            if f(&t) {
+                return Some(t);
+            }
         }
     }
     let mut after = None;
@@ -400,26 +412,37 @@ pub fn ctty_of(sid: u64) -> Option<Arc<Tty>> {
 /// group (`tpgid`, -1 for none).
 pub fn proc_fields(sid: u64) -> (u64, i64) {
     let Some(tty) = ctty_of(sid) else { return (0, -1) };
-    let rdev = match tty.driver {
-        Driver::Console => vfs::stat::dev_make(5, 1),
-        Driver::Pty(n) => vfs::stat::dev_make(crate::pty::SLAVE_MAJOR, n),
-    };
     let fg = tty.inner.lock().pgrp.map_or(-1, |g| g as i64);
-    (rdev, fg)
+    (tty.rdev(), fg)
 }
 
+/// The tty driver's major number (TTY_MAJOR): the virtual terminals (minor 0 the current
+/// one, 1-63 tty1-tty63) and the serial ports (64 and up, ttyS0-ttyS3).
+pub const TTY_MAJOR: u32 = 4;
+/// ttyS0's minor.
+pub const SERIAL_MINOR: u32 = 64;
+
 /// Opens the terminal device with number `rdev` (the character device node `origin`), if
-/// it is one: (5,0) /dev/tty, (5,1) /dev/console, (5,2) /dev/ptmx, (136,n) /dev/pts/n.
-/// None for another device.
+/// it is one: (5,0) /dev/tty, (5,1) /dev/console, (5,2) /dev/ptmx, (136,n) /dev/pts/n,
+/// (4,0) /dev/tty0 and (4,1) /dev/tty1 (the one virtual terminal: tty2 and up ENXIO),
+/// (4,64+n) /dev/ttyS<n>. None for another device.
 pub fn open_device(rdev: u64, flags: u32, origin: Origin) -> Option<Result<i64, i64>> {
     Some(match vfs::stat::dev_split(rdev) {
         (5, 0) => ids(0, 0).and_then(|me| {
             let tty = ctty_of(me.sid).ok_or(ENXIO)?;
             open(&tty, flags, origin, false)
         }),
-        (5, 1) => crate::console::open(flags, origin),
+        (5, 1) => crate::console::open(flags, origin, false),
         (5, 2) => crate::pty::open_master(flags, origin),
         (136, n) => crate::pty::open_slave(n, flags, origin),
+        // tty0 is the current virtual terminal, never a controlling terminal by opening
+        // (as /dev/console); tty1 may become one.
+        (TTY_MAJOR, 0) => crate::console::open(flags, origin, false),
+        (TTY_MAJOR, 1) => crate::console::open(flags, origin, true),
+        (TTY_MAJOR, n) if (SERIAL_MINOR..SERIAL_MINOR + crate::serial::PORTS as u32).contains(&n) => {
+            crate::serial::open((n - SERIAL_MINOR) as u8, flags, origin)
+        }
+        (TTY_MAJOR, _) => Err(ENXIO),
         _ => return None,
     })
 }
@@ -443,6 +466,9 @@ pub fn open(tty: &Arc<Tty>, flags: u32, origin: Origin, ctty: bool) -> Result<i6
             p.slaves += 1;
             was_closed = core::mem::replace(&mut p.slave_closed, false);
         }
+        if inner.opens.len() == 1 {
+            tty.first_open(&mut inner);
+        }
         tty.changed(&mut inner, false, false);
         (open, was_closed)
     };
@@ -456,6 +482,9 @@ pub fn open(tty: &Arc<Tty>, flags: u32, origin: Origin, ctty: bool) -> Result<i6
             if let Some(p) = inner.pty.as_mut() {
                 p.slaves = p.slaves.saturating_sub(1);
                 p.slave_closed = was_closed;
+            }
+            if inner.opens.is_empty() {
+                tty.last_close(&mut inner);
             }
             tty.changed(&mut inner, false, false);
             return Err(e);
@@ -484,7 +513,8 @@ pub fn session_ended(sid: u64) {
             return false;
         }
         match tty.driver {
-            Driver::Console => tty.hangup(true),
+            // (Linux's `disassociate_ctty`: a hangup unless it is a pty.)
+            Driver::Console | Driver::Serial(_) => tty.hangup(true),
             Driver::Pty(_) => {
                 let fg = {
                     let mut inner = tty.inner.lock();
@@ -574,6 +604,10 @@ impl Tty {
     /// changed; `input` (new input for the readers) and `output` (new output for a pty's
     /// master) are events even if readiness stays (an edge for EPOLLET).
     pub fn changed(&self, inner: &mut Inner, input: bool, output: bool) {
+        if self.driver == Driver::Console {
+            // The Scroll Lock LED shows whether the console's output is stopped.
+            crate::vt::output_stopped(inner.ld.stopped());
+        }
         self.seq.fetch_add(1, Ordering::Release);
         let word = &self.seq as *const AtomicU32 as u64;
         syscall(SYS_SERVER_FUTEX_WAKE, [word, i32::MAX as u64, 0, 0, 0, 0]);
@@ -698,11 +732,14 @@ impl Tty {
         }
     }
 
-    /// Writes to the console device, no lock held (the flow control characters of TCIOFF
-    /// and TCION; a dying thread's or a lost device's bytes go).
-    fn console_write(&self, bytes: &[u8]) {
-        if !bytes.is_empty() {
-            let _ = crate::console::device_write(bytes);
+    /// Writes processed output to the device (the console, a serial port; a pty's goes to
+    /// its master's buffer, not here), no lock held: Ok, or the bytes that went out before
+    /// an error.
+    fn device_write(&self, bytes: &[u8]) -> Result<(), (usize, i64)> {
+        match self.driver {
+            Driver::Console => crate::console::device_write(bytes),
+            Driver::Serial(n) => crate::serial::device_write(n, bytes),
+            Driver::Pty(_) => Ok(()),
         }
     }
 
@@ -753,11 +790,16 @@ impl Tty {
         syscall(SYS_SERVER_FUTEX_WAKE, [word as *const AtomicU32 as u64, i32::MAX as u64, 0, 0, 0, 0]);
     }
 
-    /// Echoes to the console device: never waits (the service thread processes the
-    /// keyboard's input; see `console::device_echo`).
-    fn console_echo(&self, bytes: &[u8]) {
-        if !bytes.is_empty() {
-            crate::console::device_echo(bytes);
+    /// Echoes to the device: never waits (the service thread processes the keyboard's and
+    /// the serial ports' input; see `console::device_echo`, `serial::device_echo`).
+    fn device_echo(&self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        match self.driver {
+            Driver::Console => crate::console::device_echo(bytes),
+            Driver::Serial(n) => crate::serial::device_echo(n, bytes),
+            Driver::Pty(_) => {}
         }
     }
 
@@ -784,7 +826,7 @@ impl Tty {
         };
         Self::send(signals);
         if let Some(out) = out {
-            self.console_echo(&out);
+            self.device_echo(&out);
         }
     }
 
@@ -938,7 +980,7 @@ impl Tty {
         }
         // One write at a time, for the whole write (Linux's atomic_write_lock): its
         // output processing and the device's write keep their order. Not a lock the
-        // service thread takes (its echoes never wait, `console_echo`).
+        // service thread takes (its echoes never wait, `device_echo`).
         let _turn = self.turn(TURN_WRITE, nonblock)?;
         let mut written = 0usize;
         while src.left() > 0 {
@@ -983,7 +1025,7 @@ impl Tty {
                             }
                             None => {
                                 drop(inner);
-                                if let Err((went, e)) = crate::console::device_write(&out) {
+                                if let Err((went, e)) = self.device_write(&out) {
                                     // Part of this chunk's output went out: the chunk
                                     // counts (the rest is lost with the device).
                                     let written = if went > 0 { written + chunk.len() } else { written };
@@ -1017,7 +1059,90 @@ impl Tty {
                 p.slave_closed = true;
             }
         }
+        if inner.opens.is_empty() {
+            self.last_close(&mut inner);
+        }
         self.changed(&mut inner, false, false);
+    }
+
+    /// The terminal's first open file description (lock held): a serial port is claimed
+    /// and set up.
+    fn first_open(&self, inner: &mut Inner) {
+        if let Driver::Serial(n) = self.driver {
+            crate::serial::first_open(n, &inner.ld.termios());
+        }
+    }
+
+    /// Its last open file description went (lock held; Linux's tty is released then): a
+    /// serial port's input goes back to the kernel, its input buffer and its session go.
+    fn last_close(&self, inner: &mut Inner) {
+        if let Driver::Serial(n) = self.driver {
+            crate::serial::last_close(n, &inner.ld.termios());
+            inner.ld.flush_input();
+            inner.epoch += 1;
+            inner.session = None;
+            inner.pgrp = None;
+        }
+    }
+
+    /// Its open file descriptions (of every generation).
+    pub fn open_count(&self) -> usize {
+        self.inner.lock().opens.len()
+    }
+
+    /// The device number /proc shows for it: the console is tty1 (4,1), as on Linux
+    /// where /dev/console leads to it.
+    pub fn rdev(&self) -> u64 {
+        match self.driver {
+            Driver::Console => vfs::stat::dev_make(TTY_MAJOR, 1),
+            Driver::Pty(n) => vfs::stat::dev_make(crate::pty::SLAVE_MAJOR, n),
+            Driver::Serial(n) => vfs::stat::dev_make(TTY_MAJOR, SERIAL_MINOR + n as u32),
+        }
+    }
+
+    /// Scroll Lock (Linux's `fn_hold`): output stops, or starts again (not a stop of
+    /// tcflow's).
+    pub fn hold(&self) {
+        let out = {
+            let mut inner = self.inner.lock();
+            let was_stopped = inner.ld.stopped();
+            if was_stopped {
+                inner.ld.start(false);
+            } else {
+                inner.ld.stop(false);
+            }
+            inner.packet_flow(was_stopped);
+            let mut out = None;
+            if was_stopped && !inner.ld.stopped() {
+                let held = core::mem::take(&mut inner.held_echo);
+                out = self.place_echo(&mut inner, held);
+            }
+            self.changed(&mut inner, false, true);
+            out
+        };
+        if let Some(out) = out {
+            self.device_echo(&out);
+        }
+    }
+
+    /// A break on the input (Break, a serial line's): Linux's `n_tty_receive_break`.
+    pub fn input_break(&self) {
+        let mut signals = Vec::new();
+        {
+            let mut inner = self.inner.lock();
+            let mut echo = Vec::new();
+            let r = inner.ld.receive_break(&mut echo);
+            if r.flushed {
+                inner.epoch += 1;
+                inner.held_echo.clear();
+                inner.packet_status(TIOCPKT_FLUSHWRITE | TIOCPKT_FLUSHREAD, 0);
+            }
+            if let (Some(sig), Some(fg)) = (r.signal, inner.pgrp) {
+                signals.push((fg, sig as u64));
+            }
+            self.changed(&mut inner, true, false);
+        }
+        Self::send(signals);
     }
 
     /// Hangs the terminal up (Linux's `__tty_hangup`): its open file descriptions so far
@@ -1076,13 +1201,14 @@ impl Tty {
             out
         };
         if let Some(out) = out {
-            self.console_write(&out);
+            // (A dying thread's or a lost device's bytes go.)
+            let _ = self.device_write(&out);
         }
     }
 
     /// Discards input (`input`) and the output the driver holds (`output`: a pty's
     /// unread output).
-    fn flush(&self, input: bool, output: bool) {
+    pub fn flush(&self, input: bool, output: bool) {
         let mut inner = self.inner.lock();
         if input {
             inner.ld.flush_input();
@@ -1132,6 +1258,10 @@ impl Tty {
                     inner.packet_status(TIOCPKT_IOCTL, 0);
                 }
             }
+            if let Driver::Serial(n) = self.driver {
+                // The UART's speed and format (the speeds it really runs at recorded).
+                crate::serial::set_termios(n, &old, &mut new);
+            }
             let was_stopped = inner.ld.stopped();
             inner.ld.set_termios(new);
             inner.packet_flow(was_stopped);
@@ -1144,7 +1274,7 @@ impl Tty {
             out
         };
         if let Some(out) = out {
-            self.console_echo(&out);
+            self.device_echo(&out);
         }
         Ok(0)
     }
@@ -1169,7 +1299,7 @@ impl Tty {
             out
         };
         if let Some(out) = out {
-            self.console_echo(&out);
+            self.device_echo(&out);
         }
     }
 
@@ -1193,11 +1323,15 @@ impl Tty {
             }
             TCSETS | TCSETSW | TCSETSF => self.set_termios(arg, TERMIOS_SIZE, request == TCSETSF),
             TCSETS2 | TCSETSW2 | TCSETSF2 => self.set_termios(arg, TERMIOS2_SIZE, request == TCSETSF2),
-            // No breaks to send, nothing to drain: the console's output is written when
-            // the write returns, a pty's is the master's to read.
+            // Nothing to drain (the console's and a serial port's output are written
+            // when the write returns, a pty's is the master's to read); only a serial
+            // port sends breaks.
             TCSBRK | TCSBRKP | TIOCSBRK | TIOCCBRK => {
                 self.job_check(SIGTTOU)?;
-                Ok(0)
+                match self.driver {
+                    Driver::Serial(n) => crate::serial::send_break(self, n, request, arg),
+                    _ => Ok(0),
+                }
             }
             TCXONC => {
                 self.job_check(SIGTTOU)?;
@@ -1304,7 +1438,25 @@ impl Tty {
                 self.hangup(false);
                 Ok(0)
             }
-            _ => Err(ENOTTY),
+            // The driver's own: the console's VT and keyboard requests, a serial port's
+            // modem lines.
+            _ => match self.driver {
+                Driver::Console => crate::vt::ioctl(self, request, arg),
+                Driver::Serial(n) => crate::serial::ioctl(self, n, request, arg),
+                Driver::Pty(_) => Err(ENOTTY),
+            },
+        }
+    }
+
+    /// Sleeps until `deadline` (the clock's nanoseconds; 0: for ever), EINTR if a signal
+    /// comes first (a break's length, VT_WAITACTIVE for a console that never comes).
+    pub fn sleep_until(&self, deadline: u64) -> Result<(), i64> {
+        loop {
+            if deadline != 0 && now() >= deadline {
+                return Ok(());
+            }
+            let seen = self.seen();
+            self.wait(seen, deadline)?;
         }
     }
 

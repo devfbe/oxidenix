@@ -261,9 +261,12 @@ fn qemu(firmware: Firmware, img: &Path, data_disk: &Path, read_only: bool, test_
         ]);
     }
     if test_mode {
-        // The serial port carries the kernel's output to stdout. CI has no
+        // The serial port carries the kernel's output to stdout (and takes
+        // nothing in: the tests' input is their own). A second one, COM2 with
+        // nothing attached, is ttytest's to loop back (/dev/ttyS1). CI has no
         // display; locally the window stays.
-        qemu.args(["-serial", "stdio", "-no-reboot"]);
+        qemu.args(["-serial", "stdio", "-serial", "null", "-no-reboot"]);
+        qemu.stdin(process::Stdio::null());
         if std::env::var_os("CI").is_some() {
             qemu.args(["-display", "none"]);
         }

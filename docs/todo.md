@@ -42,7 +42,10 @@ done, delete it here in the same commit.
   `/proc/<pid>/maps`, `environ`, `mem`, the fd links; `PTRACE_MODE_ATTACH` for
   `pidfd_getfd`), the dumpable flag's effect on them. Users of their own need them all at
   once (a tree's processes see no other tree's).
-- Terminal: packet mode (`TIOCPKT`), the Linux console's VT and keyboard ioctls, serial input.
+- Terminal (ADR 0020): one virtual terminal only (more need a screen per VT in the kernel's
+  console), no console fonts, screen or color maps (`GIO_SCRNMAP`, `PIO_CMAP`), blanking or
+  scrollback; serial lines without carrier detection, `TIOCMIWAIT`, `TIOCGICOUNT`, received
+  breaks and parity errors, and with polled output.
 - Network: IPv6, `MSG_OOB`, `SO_LINGER` with a non-zero time does not block `close`,
   `SO_REUSEPORT` is stored but unused, netlink multicast is never delivered, raw ICMP is shared
   between instances (documented in ADR 0008).

@@ -98,6 +98,33 @@ fn encode_baud_rate_prefers_bfoo_within_two_percent() {
 }
 
 #[test]
+fn breaks() {
+    let mut echo = Vec::new();
+    // A NUL by default (no BRKINT in tty_std_termios), no echo.
+    let mut l = with(|t| t.lflag &= !ICANON);
+    assert_eq!(l.receive_break(&mut echo), Received::default());
+    assert!(echo.is_empty());
+    assert_eq!(read(&mut l, 10).unwrap(), b"\0");
+    // PARMRK marks it.
+    let mut l = with(|t| {
+        t.lflag &= !ICANON;
+        t.iflag |= PARMRK;
+    });
+    l.receive_break(&mut echo);
+    assert_eq!(read(&mut l, 10).unwrap(), b"\xff\0\0");
+    // IGNBRK: nothing; BRKINT: SIGINT and a flush.
+    let mut l = with(|t| t.iflag |= IGNBRK);
+    l.receive_break(&mut echo);
+    assert_eq!(l.available(), 0);
+    let mut l = with(|t| t.iflag |= BRKINT);
+    feed(&mut l, b"half");
+    let r = l.receive_break(&mut echo);
+    assert_eq!((r.signal, r.flushed), (Some(SIGINT), true));
+    feed(&mut l, b"\n");
+    assert_eq!(read(&mut l, 10).unwrap(), b"\n");
+}
+
+#[test]
 fn extproc_stores_input_as_it_comes() {
     let mut l = with(|t| t.lflag |= EXTPROC);
     // No editing, no echo, no signals, no flow control: the bytes as they are,

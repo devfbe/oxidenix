@@ -157,6 +157,16 @@ pub struct Console {
     redraw_next: Option<usize>,
     /// Cells drawn during the current lock hold.
     work: usize,
+    /// KD_GRAPHICS (KDSETMODE): a program draws on the screen; the text is kept but not
+    /// drawn, and redrawn in KD_TEXT (`set_graphics`).
+    graphics: bool,
+    /// The keyboard's modes the escape sequences set (`kbd_modes`): DECKPAM (ESC =),
+    /// DECCKM (ESC [ ? 1 h), LNM (ESC [ 20 h: a line feed also returns, Enter sends CR
+    /// LF) and DECARM (ESC [ ? 8 h, autorepeat).
+    applic: bool,
+    ckmode: bool,
+    lnm: bool,
+    decarm: bool,
 }
 
 /// Cells drawn per lock hold (well under a millisecond on hardware, a few
@@ -185,6 +195,9 @@ impl Console {
 
     fn draw_cell(&mut self, col: usize, row: usize, invert: bool) {
         self.work += 1;
+        if self.graphics {
+            return;
+        }
         let cell = self.cells[row][col];
         let (mut fg, mut bg) = (self.palette[cell.fg as usize], self.palette[cell.bg as usize]);
         if invert {
@@ -249,7 +262,9 @@ impl Console {
         }
         let n = n.min(last - first + 1);
         let line = LINE_HEIGHT * self.info.stride * self.info.bytes_per_pixel;
-        self.fb.copy_within((first + n) * line..(last + 1) * line, first * line);
+        if !self.graphics {
+            self.fb.copy_within((first + n) * line..(last + 1) * line, first * line);
+        }
         for r in first..=last - n {
             self.cells[r] = self.cells[r + n];
         }
@@ -268,7 +283,9 @@ impl Console {
         }
         let n = n.min(last - first + 1);
         let line = LINE_HEIGHT * self.info.stride * self.info.bytes_per_pixel;
-        self.fb.copy_within(first * line..(last + 1 - n) * line, (first + n) * line);
+        if !self.graphics {
+            self.fb.copy_within(first * line..(last + 1 - n) * line, (first + n) * line);
+        }
         for r in (first + n..=last).rev() {
             self.cells[r] = self.cells[r - n];
         }
@@ -496,6 +513,9 @@ impl Console {
             b'T' if !self.private => self.scroll_down(self.top, self.bottom, n),
             b'h' | b'l' if self.private && self.param(0, 0) == 7 => self.autowrap = final_byte == b'h',
             b'h' | b'l' if !self.private && self.param(0, 0) == 4 => self.insert_mode = final_byte == b'h',
+            b'h' | b'l' if self.private && self.param(0, 0) == 1 => self.ckmode = final_byte == b'h',
+            b'h' | b'l' if self.private && self.param(0, 0) == 8 => self.decarm = final_byte == b'h',
+            b'h' | b'l' if !self.private && self.param(0, 0) == 20 => self.lnm = final_byte == b'h',
             // Device attributes: a VT102, as the Linux console answers.
             b'c' if !self.private && self.param(0, 0) == 0 => self.push_reply(b"\x1b[?6c"),
             _ => {}
@@ -529,6 +549,9 @@ impl Console {
             b'\n' | 0x0b | 0x0c => {
                 self.wrap_pending = false;
                 self.line_feed();
+                if self.lnm {
+                    self.move_to(0, self.row);
+                }
             }
             b'\r' => self.move_to(0, self.row),
             0x08 => self.move_to(self.col.min(self.cols - 1).saturating_sub(1), self.row),
@@ -561,6 +584,8 @@ impl Console {
                         self.line_feed();
                     }
                     b'M' => self.reverse_index(),
+                    b'=' => self.applic = true,
+                    b'>' => self.applic = false,
                     b'(' => self.parse = Parse::Charset(0),
                     b')' => self.parse = Parse::Charset(1),
                     b']' => {
@@ -578,6 +603,10 @@ impl Console {
                         self.insert_mode = false;
                         self.autowrap = true;
                         self.underline = false;
+                        self.applic = false;
+                        self.ckmode = false;
+                        self.lnm = false;
+                        self.decarm = true;
                         self.reset_palette();
                         self.clear_screen();
                     }
@@ -774,6 +803,11 @@ pub fn init(fb: &'static mut FrameBuffer) {
         osc_len: 0,
         redraw_next: None,
         work: 0,
+        graphics: false,
+        applic: false,
+        ckmode: false,
+        lnm: false,
+        decarm: true,
     };
     console.bottom = console.rows - 1;
     console.fb.fill(0);
@@ -932,6 +966,51 @@ pub fn write_with_replies(bytes: &[u8], replies: &mut dyn FnMut(&[u8])) {
             return;
         }
         crate::process::sched::cond_resched();
+    }
+}
+
+/// The keyboard's modes the console's escape sequences set (the Linux keyboard keeps
+/// them; ADR 0020).
+pub fn kbd_modes() -> kbd::ConsoleModes {
+    without_interrupts(|| {
+        CONSOLE.lock().as_ref().map_or(kbd::ConsoleModes::default(), |c| kbd::ConsoleModes {
+            applic: c.applic,
+            ckmode: c.ckmode,
+            crlf: c.lnm,
+            repeat: c.decarm,
+        })
+    })
+}
+
+/// KDSETMODE: KD_GRAPHICS (`on`) stops drawing the text (a program draws on the
+/// screen); KD_TEXT redraws it, in budgeted pieces as a write's (never rescheduling: the
+/// console's holder may change under a spinning lock).
+pub fn set_graphics(on: bool) {
+    let back = without_interrupts(|| {
+        let mut console = CONSOLE.lock();
+        let Some(c) = console.as_mut() else { return false };
+        let back = c.graphics && !on;
+        c.graphics = on;
+        if back {
+            c.cursor_drawn = None;
+            c.redraw_next = Some(0);
+        }
+        back
+    });
+    if !back {
+        return;
+    }
+    loop {
+        let pending = without_interrupts(|| {
+            CONSOLE.lock().as_mut().is_some_and(|c| {
+                c.write_some(&[]);
+                c.reply_len = 0;
+                c.redraw_pending()
+            })
+        });
+        if !pending {
+            return;
+        }
     }
 }
 

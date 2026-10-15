@@ -121,7 +121,7 @@ processes, threads, memory objects and the services it uses.
 | descriptor tables | the server's, per thread as its process model shares them (R6e, R8); the kernel has none (R9) |
 | IPC | today's services, and shared-memory rings for the I/O paths (separate design) |
 | devices | interrupts, I/O ports, PCI functions, DMA areas (as today; IOMMU per `iommu.md`) |
-| console | the framebuffer console and keyboard as a raw device the server's tty layer drives, held by one instance at a time (ADR 0004; `console_read`, `console_write`, `console_info`, `EVENT_CONSOLE`; R6d) |
+| console | the framebuffer console, the keyboard's scancodes and the serial ports as raw devices the server's tty layer drives, held by one instance at a time (ADR 0004, ADR 0020; `console_read`, `console_write`, `console_info`, `console_ctl`, `kbd_read`, `serial_read`, `serial_write`, `serial_ctl`, `EVENT_CONSOLE`; R6d) |
 | the last mechanisms (R9) | `futex_wait`, `futex_wake`, `futex_requeue` on the program's memory; `thread_fs` (the FS base); `clock_set`; `power`; `host_granted`; `file_pages` (tmpfs's statfs) |
 | futexes beyond R9 | `futex_wake_op`; `futex_owner_died` (a robust list's entry); PI locks: `futex_lock_pi`, `futex_unlock_pi`, `futex_wait_requeue_pi`, `futex_cmp_requeue_pi` (see "PI futexes and robust lists") |
 
@@ -132,8 +132,8 @@ pass-through" below): `process/syscall.rs`'s Linux dispatch, `sys_*.rs`, `signal
 reader of the boot image), `net.rs`, `drivers/tty.rs`, procfs's data source. What stays:
 `address_space.rs` (as memory objects and mappings), `sched.rs`, `task.rs` (threads),
 `futex.rs`, `ipc.rs`, `irq.rs`, `channel.rs`, `tlb.rs`, `memory/`, `interrupts/`, `smp.rs`,
-timers, time, the loader and `exec.rs` for the native servers, drivers for console and
-keyboard input, PCI and ACPI.
+timers, time, the loader and `exec.rs` for the native servers, drivers for the console, the
+keyboard's scancodes and the serial ports, PCI and ACPI.
 
 ### Priority and the server's locks
 
@@ -932,9 +932,16 @@ device. Decisions in ADR 0007.
   as they are. A line feed is a line feed only (as on a VT: the cursor keeps its column);
   turning `\n` into `\r\n` is the terminal's `ONLCR`. The kernel's own messages (`printk`,
   the native servers' standard output) add their carriage returns themselves.
-- **Input**: the keyboard's bytes (UTF-8, control characters, the Linux console's key
-  sequences) and the console's answers to queries a program writes (a cursor position
-  report, device attributes), in a 4 KiB ring. Nothing is interpreted.
+- **Input**: the console's answers to queries a program writes (a cursor position report,
+  device attributes), and COM1's input while no terminal holds that port, in a 4 KiB ring;
+  the keyboard's scancodes (set 1) in another (`kbd_read`), untranslated: Linux's keyboard
+  is the server's (`vt.rs`, `crates/kbd`, ADR 0020). Nothing is interpreted. The kernel sets
+  the keyboard's LEDs and autorepeat and reports the console's VT100 modes the keyboard
+  depends on (`console_ctl`); `KD_GRAPHICS` stops its text drawing.
+- **Serial ports** (COM1-COM4, granted with the console): receive interrupts into a ring per
+  port a terminal claimed (`serial_read`), polled output (`serial_write`), speed, format,
+  breaks and modem lines (`serial_ctl`). COM1 also carries the console's mirror and the
+  kernel's messages.
 - **One holder**: the kernel grants the device to the process tree it starts (at boot, by
   autorun, by the monitor's `run`) and takes it back when that tree's first process has ended
   (the monitor reads its commands from it then); an instance that ends lets it go. Only the
@@ -992,9 +999,9 @@ input waits (a pty master's write) or is dropped (the keyboard).
 
 A terminal is a line discipline, its job control state (session, foreground group, window
 size), its hangup generation, the readiness it reported to each of its open file
-descriptions, and a driver: the console (`console.rs`) or a pseudo-terminal's slave
-(`pty.rs`). Each open of a terminal is an open file description of the server's, as a
-pipe's end is.
+descriptions, and a driver: the console (`console.rs`, `vt.rs`), a pseudo-terminal's slave
+(`pty.rs`) or a serial port (`serial.rs`). Each open of a terminal is an open file
+description of the server's, as a pipe's end is.
 
 - **Reading** (`n_tty_read`'s rules): canonical reads end at a line's end (an `VEOF` at the
   start of a line reads 0); noncanonical reads follow `VMIN`/`VTIME` (with `VTIME` an
@@ -1048,7 +1055,9 @@ pipe's end is.
   opening it gives ENXIO); a pty's slave when its master closes.
 - **Devices by number**: a character device node names its driver by its device number, as on
   Linux: (5,0) `/dev/tty` (the caller's controlling terminal, ENXIO without one), (5,1)
-  `/dev/console`, (5,2) `/dev/ptmx`, (136,n) `/dev/pts/n` are the server's, whatever
+  `/dev/console`, (5,2) `/dev/ptmx`, (136,n) `/dev/pts/n`, (4,0) `/dev/tty0` and (4,1)
+  `/dev/tty1` (the console's one virtual terminal; (4,2-63) ENXIO), (4,64-67)
+  `/dev/ttyS0-3` are the server's, whatever
   filesystem holds the node; (1,3) and (1,5) are null and zero: the kernel's for its own
   nodes, the server's (`devices.rs`) for nodes of its filesystems (zero maps anonymous
   memory, EACCES as Linux's for a descriptor not open for reading or a shared writable
@@ -1080,8 +1089,9 @@ pipe's end is.
   `TIOCGSID`, `TIOCSCTTY`, `TIOCNOTTY`, `TIOCSTI` (everyone is root), `FIONREAD`,
   `TIOCOUTQ`, `TIOCEXCL`/`TIOCNXCL`/`TIOCGEXCL`, `TIOCGETD`/`TIOCSETD` (N_TTY only),
   `TIOCVHANGUP`; on a pty master also `TIOCGPTN`, `TIOCSPTLCK`/`TIOCGPTLCK`, `TIOCGPTPEER`,
-  `TIOCSIG` and `TIOCPKT`/`TIOCGPKT`. Not done: the VT and keyboard ioctls of the Linux
-  console (`KDGKBTYPE`, `VT_*`), modem lines (ENOTTY, as for a pty).
+  `TIOCSIG` and `TIOCPKT`/`TIOCGPKT`; on the console the KD, VT and `TIOCLINUX` requests
+  (`vt.rs`, below); on a serial terminal its modem lines and breaks (`serial.rs`, below);
+  modem lines elsewhere are ENOTTY.
 - **Settings as Linux's `set_termios` takes them**: the speeds follow `CBAUD` and `CIBAUD`
   (`c_ispeed`/`c_ospeed` of `termios2` only with `BOTHER`); a pty keeps `CS8 | CREAD` without
   `PARENB` (`pty_set_termios`). `EXTPROC` (external processing: the master edits, as
@@ -1113,18 +1123,60 @@ flush), `_STOP` and `_START` (^S/^Q, `tcflow`, IXON going off; one clears the ot
 master polls POLLPRI (select's exceptional set) and readable; turning the mode on starts
 without status.
 
+### The console's virtual terminal (`servers/linux/src/vt.rs`, `crates/kbd`)
+
+ADR 0020. The console is the one virtual terminal, tty1 (/dev/tty0, the current VT, and
+/dev/console lead to it). Its keyboard is Linux's, as a library tested on the host (`cargo
+test -p kbd`): the kernel's scancodes become keycodes (a table `KDGETKEYCODE`/`KDSETKEYCODE`
+change) and those the terminal's input by the keyboard mode (`KDGKBMODE`/`KDSKBMODE`:
+`K_RAW` the scancodes, `K_MEDIUMRAW` the keycodes, `K_XLATE` Latin-1, `K_UNICODE` UTF-8 (the
+default), `K_OFF`; a change flushes the input) and 256 keymaps of keysyms
+(`KDGKBENT`/`KDSKBENT`, the default German): modifiers, locks and sticky keys, Caps and Num
+Lock (`KDGKBLED`/`KDSKBLED`; the LEDs follow, `KDGETLED`/`KDSETLED`), the keypad (cursor
+keys without Num Lock, the application keypad), dead keys and Compose with the accent table
+(`KDGKBDIACR(UC)`/`KDSKBDIACR(UC)`), Alt-numpad entry, function strings
+(`KDGKBSENT`/`KDSKBSENT`), Alt as ESC or the meta bit (`KDGKBMETA`/`KDSKBMETA`), autorepeat
+(`KDKBDREP`, the keyboard's steps; DECARM). Scroll Lock holds the console's output and its
+LED shows a stopped console, Ctrl-Alt-Del restarts (CAD_OFF: SIGINT to init), Alt+Up sends
+`KDSIGACCEPT`'s signal. The console's VT100 modes (application keypad, DECCKM, LNM) are the
+kernel's, asked per batch of scancodes. `KDGKBTYPE` is `KB_101`; `KIOCSOUND`/`KDMKTONE` are
+silent (no speaker); `KDSETMODE` `KD_GRAPHICS` stops the kernel's text drawing until
+`KD_TEXT`. One VT: `VT_GETSTATE`, `VT_OPENQRY` (none free), `VT_GETMODE`/`VT_SETMODE`/
+`VT_SETACTIVATE` (the mode kept; no switch ever signals), `VT_RELDISP` (only `VT_ACKACQ`),
+`VT_ACTIVATE`/`VT_WAITACTIVE` (tty1 at once, others ENXIO or a wait for a signal),
+`VT_WAITEVENT`, `VT_DISALLOCATE` (tty1 busy), `VT_RESIZE(X)` (only the console's size),
+`VT_(UN)LOCKSWITCH`, `VT_GETHIFONTMASK`, `TIOCLINUX` (the shift state, the foreground
+console, the kmsg redirect). No loadable font: the font requests are ENOSYS (EINVAL in
+`KD_GRAPHICS`). Not done: more VTs, the screen and color maps, blanking, scrollback.
+
+### Serial terminals (`servers/linux/src/serial.rs`)
+
+/dev/ttyS0-3 on the kernel's UARTs (a missing port opens EIO), with Linux's serial defaults
+at 115200 baud (8N1, `CREAD`, `HUPCL`, `CLOCAL`; no window size). The first open claims the
+port's input and raises DTR and RTS; the last close gives the input back (COM1's to the
+console) and with `HUPCL` drops them (not COM1's). The settings program the UART as Linux's
+8250 driver: speed by divisor (one beyond the port keeps the old speed; the speed asked for
+is recorded, a Bfoo value within 2%), word length, stop bits, parity; B0 drops DTR and RTS;
+`CREAD` off drops the input. `TIOCMGET`/`TIOCMSET`/`TIOCMBIS`/`TIOCMBIC` (DTR, RTS, OUT1,
+OUT2, loopback; CTS, DSR, CD, RI from the port), `TIOCGSERIAL` (`TIOCSSERIAL` cannot move
+the port), `TIOCSERGETLSR`, breaks (`TCSBRK`, `TCSBRKP`, `TIOCSBRK`, `TIOCCBRK`). A session
+leader opening one gets it as its controlling terminal; its session's end hangs it up. Not
+done: carrier detection (`CLOCAL` off waits for nothing), `TIOCMIWAIT`, `TIOCGICOUNT`,
+received breaks and parity errors.
+
 ### What is tested where
 
 `userspace/ttytest.c` drives terminals through ptys, which is everything the server's tty
 layer does: termios round trips, canonical and raw reads, `VMIN`/`VTIME`, echo and editing,
 output processing, ^C/^Z/^\ reaching the foreground group, SIGTTIN and SIGTTOU for a
 background group, the controlling terminal, hangups, window sizes and SIGWINCH, poll, the
-turns of readers, bounded echoes, orphaned stopped jobs. An echo through the console's
-`TIOCSTI` (the keyboard's path) while another process floods the console checks that echoes
-never wait for a writer. The console's own input is the keyboard's (QEMU's serial port is
-output only), so the console
-driver's input path is checked interactively (bash, busybox, htop); its output path carries
-the whole test suite's output.
+turns of readers, bounded echoes, orphaned stopped jobs, packet mode. An echo through the
+console's `TIOCSTI` while another process floods the console checks that echoes never wait
+for a writer. The keyboard's path is driven from the kernel's scancode queue on by
+`TEST_KBD_INPUT` (the keyboard modes, keymaps, LEDs, Scroll Lock, the keyboard signal); the
+serial path on QEMU's second port (COM2, nothing attached in test mode) in the UART's
+loopback mode, through its real interrupt. The console's output path carries the whole test
+suite's output.
 
 ## The descriptor table (R6e)
 

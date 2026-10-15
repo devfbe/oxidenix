@@ -29,7 +29,8 @@ fn set_masked(line: u8, masked: bool) {
 /// irq_enable(line): takes the line on first use and unmasks it.
 pub fn enable(line: u64) -> SysResult {
     let allowed = with_current(|p| p.server.as_ref().and_then(|s| s.irq)).ok_or(EPERM)?;
-    if line >= LINES as u64 || RESERVED & 1 << line != 0 || allowed as u64 != line {
+    // (A present serial port's line is the kernel's too.)
+    if line >= LINES as u64 || RESERVED & 1 << line != 0 || crate::drivers::serial::uses_irq(line as u8) || allowed as u64 != line {
         return Err(EPERM);
     }
     let me = current_pid();

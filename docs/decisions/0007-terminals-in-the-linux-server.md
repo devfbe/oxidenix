@@ -50,6 +50,12 @@ leader exits. Programs that drive the console with `\n` in raw mode (ncurses wit
 the console's VT ioctls and serial input are not done; serial input would be a second input
 source of the same device.
 
+## Update (ADR 0020)
+
+Packet mode came with the pty's master; the console's VT and keyboard requests and serial
+terminals with ADR 0020: the kernel delivers the keyboard's scancodes and the serial ports'
+bytes raw, the server translates (Linux's keyboard, `crates/kbd`) and drives /dev/ttyS0-3.
+
 ## Update (R8, ADR 0010)
 
 The transitional calls went with R8: the terminal asks the server's process table for

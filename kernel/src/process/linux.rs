@@ -2443,6 +2443,112 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             super::uaccess::copy_to_server(a[0], &out)?;
             Ok(0)
         }
+        SYS_KBD_READ => {
+            if crate::drivers::console_device::holder() != instance.id {
+                return Err(EIO);
+            }
+            let mut buf = [0u8; 256];
+            let n = crate::drivers::keyboard::read(&mut buf[..(a[1] as usize).min(256)]);
+            // (A bad buffer of the server's loses the scancodes.)
+            super::uaccess::copy_to_server(a[0], &buf[..n])?;
+            Ok(n as i64)
+        }
+        SYS_CONSOLE_CTL => {
+            use crate::drivers::console;
+            if crate::drivers::console_device::holder() != instance.id {
+                return Err(EIO);
+            }
+            match a[0] {
+                CONSOLE_LEDS => crate::drivers::keyboard::set_leds(a[1] as u8 & 7),
+                CONSOLE_TYPEMATIC => crate::drivers::keyboard::set_typematic(a[1] as u8 & 0x7f),
+                CONSOLE_GRAPHICS => console::set_graphics(a[1] != 0),
+                CONSOLE_MODES => {
+                    let m = console::kbd_modes();
+                    let bit = |on: bool, b: u64| if on { b } else { 0 };
+                    return Ok((bit(m.applic, CONSOLE_MODE_APPLIC)
+                        | bit(m.ckmode, CONSOLE_MODE_CKMODE)
+                        | bit(m.crlf, CONSOLE_MODE_CRLF)
+                        | bit(m.repeat, CONSOLE_MODE_REPEAT)) as i64);
+                }
+                _ => return Err(EINVAL),
+            }
+            Ok(0)
+        }
+        SYS_SERIAL_READ | SYS_SERIAL_WRITE | SYS_SERIAL_CTL => {
+            use crate::drivers::serial;
+            if nr == SYS_SERIAL_CTL && a[1] == SERIAL_PORTS {
+                if crate::drivers::console_device::holder() != instance.id {
+                    return Err(EIO);
+                }
+                return Ok(serial::present_mask() as i64);
+            }
+            let port = a[0] as usize;
+            if !serial::exists(port) {
+                return Err(ENXIO);
+            }
+            if crate::drivers::console_device::holder() != instance.id {
+                return Err(EIO);
+            }
+            match nr {
+                SYS_SERIAL_READ => {
+                    let mut buf = [0u8; 512];
+                    let n = serial::read(port, &mut buf[..(a[2] as usize).min(512)]);
+                    super::uaccess::copy_to_server(a[1], &buf[..n])?;
+                    Ok(n as i64)
+                }
+                SYS_SERIAL_WRITE => {
+                    // The bytes first, into the kernel's memory, no lock held.
+                    let n = a[2].min(SERIAL_WRITE_MAX) as usize;
+                    let mut buf = Vec::new();
+                    buf.try_reserve_exact(n).map_err(|_| ENOMEM)?;
+                    buf.resize(n, 0);
+                    super::uaccess::copy_from_server(a[1], &mut buf)?;
+                    // In pieces, a chance to switch tasks between them.
+                    for piece in buf.chunks(256) {
+                        serial::write_port(port, piece);
+                        super::sched::cond_resched();
+                    }
+                    Ok(n as i64)
+                }
+                _ => match a[1] {
+                    SERIAL_CLAIM => {
+                        serial::claim(port, a[2] != 0);
+                        Ok(0)
+                    }
+                    SERIAL_LINE => {
+                        let divisor = a[2] as u16;
+                        if divisor == 0 || a[2] >> 22 != 0 {
+                            return Err(EINVAL);
+                        }
+                        serial::set_line(port, divisor, (a[2] >> 16) as u8 & 0x3f);
+                        Ok(0)
+                    }
+                    SERIAL_BREAK => {
+                        serial::set_break(port, a[2] != 0);
+                        Ok(0)
+                    }
+                    SERIAL_MODEM => {
+                        serial::set_modem(port, a[2] as u8);
+                        Ok(0)
+                    }
+                    SERIAL_STATUS => Ok(serial::status(port) as i64),
+                    _ => Err(EINVAL),
+                },
+            }
+        }
+        TEST_KBD_INPUT => {
+            if !crate::TEST_MODE.load(core::sync::atomic::Ordering::Relaxed) {
+                return Err(ENOSYS);
+            }
+            if crate::drivers::console_device::holder() != instance.id {
+                return Err(EIO);
+            }
+            let mut buf = [0u8; 256];
+            let n = (a[1] as usize).min(buf.len());
+            super::uaccess::copy_from_server(a[0], &mut buf[..n])?;
+            crate::drivers::keyboard::queue(&buf[..n]);
+            Ok(0)
+        }
         SYS_SYSTEM_INFO => {
             // The system's records only: the processes are the server's (R8).
             if a[0] != procproto::QUERY_SYSTEM {

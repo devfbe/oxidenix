@@ -236,7 +236,8 @@ fn with_mounts<R>(f: impl FnOnce(&Vec<Mount>) -> R) -> R {
 }
 
 /// The instance's /dev, as Linux's devtmpfs with udev's links: the
-/// terminals (`tty`: the controlling terminal, the console, ptmx), null
+/// terminals (`tty`: the controlling terminal, the console, ptmx, the
+/// virtual terminal tty0 and tty1, the serial ports ttyS0-ttyS3), null
 /// and zero (`devices`), `fd`, `stdin`, `stdout` and `stderr` as links into
 /// /proc/self/fd, the mount point of devpts and `shm` for POSIX shared
 /// memory. A tmpfs like the root (root may make files and directories in it).
@@ -248,6 +249,12 @@ fn dev() -> Arc<tmpfs::Inode> {
         ("console", dev_make(5, 1), 0o600),
         ("tty", dev_make(5, 0), 0o666),
         ("ptmx", dev_make(5, 2), 0o666),
+        ("tty0", dev_make(4, 0), 0o620),
+        ("tty1", dev_make(4, 1), 0o620),
+        ("ttyS0", dev_make(4, 64), 0o660),
+        ("ttyS1", dev_make(4, 65), 0o660),
+        ("ttyS2", dev_make(4, 66), 0o660),
+        ("ttyS3", dev_make(4, 67), 0o660),
         ("null", dev_make(1, 3), 0o666),
         ("zero", dev_make(1, 5), 0o666),
         ("kmsg", dev_make(1, 11), 0o644),

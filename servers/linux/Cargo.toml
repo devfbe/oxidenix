@@ -20,3 +20,4 @@ procproto = { path = "../../crates/procproto" }
 netlink = { path = "../../crates/netlink" }
 netring = { path = "../../crates/netring" }
 ldisc = { path = "../../crates/ldisc" }
+kbd = { path = "../../crates/kbd" }

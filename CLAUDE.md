@@ -45,6 +45,8 @@ An AI research project; see README.md.
   (`rotest`: `EROFS`, `ST_RDONLY`, the data still readable); `OXIDENIX_TEST=readonly` runs
   only that boot, on a fresh disk. In test mode a boot whose shutdown complains (an instance
   that did not write back or end, a channel that did not close) fails, whatever the script said.
+  Test mode gives QEMU no standard input and a second serial port (COM2, nothing attached:
+  ttytest's loopback /dev/ttyS1).
 - `nix-shell -p e2fsprogs --run "cargo test -p ext2fs"` (workspace root) tests the ext2
   library on the host against a RAM disk; CI runs it too. `cargo test -p vfs` tests the pure
   parts of the Linux server's namespace (paths, cpio) on the host, `cargo test -p slab` the
@@ -55,7 +57,8 @@ An AI research project; see README.md.
   test -p netlink` rtnetlink's messages (the Linux server's netlink sockets), `cargo test
   --release -p netring` the socket protocol (Linux server <-> netd: encodings, validation, the
   shared area's wake protocols with threads), `cargo test -p ldisc` the line discipline of the
-  Linux server's terminals, `cargo test -p procproto` the text formats of `/proc` (procfs's
+  Linux server's terminals, `cargo test -p kbd` Linux's console keyboard (keymaps, modes,
+  scancodes; the server's VT and the kernel's monitor), `cargo test -p procproto` the text formats of `/proc` (procfs's
   and the Linux server's) and what procfs gives each client, `cargo test -p csprng` the
   kernel's random generator (ChaCha20) and the keyed hash (SipHash) against their test vectors,
   `cargo test --release -p clockpage` the clock page under the vDSO (the kernel's clock
@@ -109,7 +112,9 @@ An AI research project; see README.md.
     `inet.rs`/`inetcalls.rs`/`netclient.rs` (internet sockets over the channel to netd, the net
     thread), `netdev.rs`/`netlink.rs` + `crates/netlink` (interfaces, `NETLINK_ROUTE`),
     `procfs.rs`/`procfile.rs` (`/proc` and `/sys`: procfs's files over the rings, the
-    per-process part and the magic links), `inotify.rs`, `timer.rs`/`timerfd.rs` (interval
+    per-process part and the magic links), `tty.rs`/`pty.rs`/`console.rs`/`vt.rs`/`serial.rs`
+    + `crates/ldisc` + `crates/kbd` (terminals: ptys, the console's VT and Linux keyboard,
+    /dev/ttyS*; ADR 0007, 0020), `inotify.rs`, `timer.rs`/`timerfd.rs` (interval
     and POSIX timers, timerfds; timers on CPU clocks over the kernel's CPU-time alarms,
     `kernel/src/process/cputimer.rs`), `pidfd.rs`, `vdso.rs` (maps the vDSO, whose source is
     `servers/linux/vdso/`, built by `servers/linux/build.rs`, reading the kernel's clock page

@@ -7,6 +7,7 @@
 
 use crate::syscall;
 use crate::usercopy;
+use core::sync::atomic::{AtomicBool, Ordering};
 use restricted::*;
 
 const EPERM: i64 = 1;
@@ -77,12 +78,38 @@ fn sysinfo(buf: u64) -> Result<i64, i64> {
     Ok(0)
 }
 
+/// Ctrl-Alt-Del restarts the machine (LINUX_REBOOT_CMD_CAD_ON, Linux's default), or
+/// sends SIGINT to init (CAD_OFF).
+static CAD: AtomicBool = AtomicBool::new(true);
+/// A Ctrl-Alt-Del restart the worker thread is to carry out.
+static CAD_ASKED: AtomicBool = AtomicBool::new(false);
+
+/// The console's Ctrl-Alt-Del (`vt`, on the service thread; Linux's `ctrl_alt_del`): the
+/// restart is the worker thread's (`cad_if_asked`: the service thread must stay free for
+/// the write-back it waits for), or init gets SIGINT.
+pub fn ctrl_alt_del() {
+    if CAD.load(Ordering::Acquire) {
+        CAD_ASKED.store(true, Ordering::Release);
+        crate::scm::request();
+    } else {
+        crate::signal::send_process(1, SIGINT as u32);
+    }
+}
+
+/// On the worker thread: the restart Ctrl-Alt-Del asked for, as reboot(2)'s RESTART
+/// (nothing without the host grant: the console is the initial tree's).
+pub fn cad_if_asked() {
+    if CAD_ASKED.swap(false, Ordering::AcqRel) {
+        syscall(SYS_POWER, [POWER_RESTART, 0, 0, 0, 0, 0]);
+    }
+}
+
 /// reboot(2): power off (QEMU exits) or restart the machine, after every instance of the
 /// server wrote its caches back (`SYS_POWER`). The magic numbers are checked as Linux does;
 /// LINUX_REBOOT_CMD_HALT powers off too, RESTART2 restarts (its command string is
-/// checked, not used); CAD_ON and CAD_OFF are accepted (there is no Ctrl-Alt-Del to
-/// configure). Without the host grant the tree is a pid namespace that is not the initial
-/// one, and the command goes to `reboot_pid_ns` once the magic numbers are right.
+/// checked, not used); CAD_ON and CAD_OFF set what Ctrl-Alt-Del does (`ctrl_alt_del`).
+/// Without the host grant the tree is a pid namespace that is not the initial one, and
+/// the command goes to `reboot_pid_ns` once the magic numbers are right.
 fn reboot(magic: u64, magic2: u64, cmd: u64, arg: u64) -> Result<i64, i64> {
     const MAGIC: u64 = 0xfee1_dead;
     const MAGIC2: [u64; 4] = [0x2812_1969, 0x0512_1996, 0x1604_1998, 0x2011_2000];
@@ -103,7 +130,10 @@ fn reboot(magic: u64, magic2: u64, cmd: u64, arg: u64) -> Result<i64, i64> {
         });
     }
     let how = match cmd as u32 as u64 {
-        CAD_ON | CAD_OFF => return Ok(0),
+        c @ (CAD_ON | CAD_OFF) => {
+            CAD.store(c == CAD_ON, Ordering::Release);
+            return Ok(0);
+        }
         RESTART => POWER_RESTART,
         RESTART2 => {
             usercopy::read_cstr(arg)?;

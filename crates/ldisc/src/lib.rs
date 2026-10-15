@@ -324,6 +324,37 @@ impl Ldisc {
         r
     }
 
+    /// Receives a break (the console's Break key, a serial line's): Linux's
+    /// `n_tty_receive_break`: nothing with IGNBRK, SIGINT with BRKINT (flushing as the
+    /// signal characters do), else a NUL, after `\377 \0` with PARMRK. No echo.
+    pub fn receive_break(&mut self, echo: &mut Vec<u8>) -> Received {
+        let t = self.t;
+        let mut r = Received::default();
+        if t.i(IGNBRK) {
+            return r;
+        }
+        if t.i(BRKINT) {
+            r.signal = Some(SIGINT);
+            if !t.l(NOFLSH) {
+                self.flush_input();
+                echo.clear();
+                r.flushed = true;
+            }
+            return r;
+        }
+        let bytes: &[u8] = if t.i(PARMRK) { b"\xff\0\0" } else { b"\0" };
+        if self.total() + bytes.len() > BUF_SIZE - 1 {
+            r.dropped = true;
+            return r;
+        }
+        if self.canonical() {
+            self.line.extend_from_slice(bytes);
+        } else {
+            self.buf.extend(bytes);
+        }
+        r
+    }
+
     /// Stores an ordinary byte (Linux's `n_tty_receive_char`).
     fn put(&mut self, c: u8, special: bool, echo: &mut Vec<u8>, r: &mut Received) {
         let t = self.t;

@@ -58,6 +58,7 @@ mod records;
 mod ringclient;
 mod sched;
 mod scm;
+mod serial;
 mod signal;
 mod sockcalls;
 mod sync;
@@ -71,6 +72,7 @@ mod tty;
 mod unix;
 mod usercopy;
 mod vdso;
+mod vt;
 
 use alloc::collections::BTreeMap;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -275,6 +277,15 @@ fn dispatch(s: &mut State) -> i64 {
             Err(e) => -e,
         },
         TEST_HOST => syscall(TEST_HOST, [s.rdi, 0, 0, 0, 0, 0]),
+        // The kernel's to take, with the scancodes in the server's memory.
+        TEST_KBD_INPUT if test_mode() => {
+            let mut codes = [0u8; 256];
+            let n = (s.rsi as usize).min(codes.len());
+            match usercopy::from_program(s.rdi, &mut codes[..n]) {
+                Ok(()) => syscall(TEST_KBD_INPUT, [codes.as_ptr() as u64, n as u64, 0, 0, 0, 0]),
+                Err(e) => -e,
+            }
+        }
         TEST_FUTEX_WATCH => syscall(TEST_FUTEX_WATCH, [s.rdi, s.rsi, 0, 0, 0, 0]),
         // The kernel's to answer, with the path and argv packed in the server's memory.
         TEST_TREE_START => match tree_command(s.rdi, s.rsi) {
