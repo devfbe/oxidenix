@@ -3,9 +3,11 @@
  * Linux semantics of the server's internet sockets (R7b): bulk data
  * intact, MSG_PEEK, MSG_DONTWAIT, MSG_WAITALL, MSG_TRUNC, timeouts,
  * half-close, EPIPE and SIGPIPE, SO_ERROR, SO_REUSEADDR, SO_REUSEPORT, SO_LINGER, MSG_OOB, options,
- * epoll's edges. */
+ * epoll's edges, netlink's routes and multicast notifications. */
 #define _GNU_SOURCE
 #include <arpa/inet.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/sockios.h>
@@ -18,10 +20,14 @@
 #include <sys/epoll.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+
+/* restricted::TEST_NET_RENEW (test mode): netd drops its DHCP lease and asks again. */
+#define TEST_NET_RENEW 1600
 
 static int failures;
 
@@ -425,6 +431,125 @@ static void urgent_data(void) {
     signal(SIGURG, SIG_DFL);
     close(p[0]);
     close(p[1]);
+}
+
+/* A NETLINK_ROUTE socket bound to the multicast groups `groups` (RTMGRP_* bits). */
+static int nl_socket(unsigned groups) {
+    int fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    struct sockaddr_nl a = {.nl_family = AF_NETLINK, .nl_groups = groups};
+    bind(fd, (struct sockaddr *)&a, sizeof a);
+    return fd;
+}
+
+/* An IFA_LOCAL or RTA_GATEWAY-like IPv4 attribute `type` of a message whose fixed part is
+ * `fixed` bytes; 0 if it has none. */
+static unsigned nl_ipv4(struct nlmsghdr *h, size_t fixed, unsigned short type) {
+    struct rtattr *rta = (struct rtattr *)((char *)NLMSG_DATA(h) + NLMSG_ALIGN(fixed));
+    int len = h->nlmsg_len - NLMSG_LENGTH(fixed);
+    for (; RTA_OK(rta, len); rta = RTA_NEXT(rta, len))
+        if (rta->rta_type == type && RTA_PAYLOAD(rta) == 4) return *(unsigned *)RTA_DATA(rta);
+    return 0;
+}
+
+/* What a netlink socket heard: the messages of each kind about 10.0.2.15 and the default
+ * route, and the groups their datagrams came to. */
+struct heard {
+    int del_addr, new_addr, del_default, new_default, other_routes, groups;
+};
+
+/* Takes what `fd` receives within `ms` (or until the default route came back). */
+static void listen_nl(int fd, struct heard *h, int ms) {
+    static char buf[16384];
+    long until = now_ms() + ms;
+    unsigned eth0 = inet_addr("10.0.2.15"), gw = inet_addr("10.0.2.2");
+    while (now_ms() < until && !h->new_default) {
+        struct pollfd pf = {fd, POLLIN, 0};
+        if (poll(&pf, 1, (int)(until - now_ms())) != 1) break;
+        struct sockaddr_nl from;
+        struct iovec iov = {buf, sizeof buf};
+        struct msghdr m = {.msg_name = &from, .msg_namelen = sizeof from, .msg_iov = &iov, .msg_iovlen = 1};
+        int n = recvmsg(fd, &m, 0);
+        if (n <= 0) break;
+        h->groups |= from.nl_groups;
+        for (struct nlmsghdr *nh = (struct nlmsghdr *)buf; NLMSG_OK(nh, (unsigned)n); nh = NLMSG_NEXT(nh, n)) {
+            switch (nh->nlmsg_type) {
+            case RTM_NEWADDR:
+            case RTM_DELADDR:
+                if (nl_ipv4(nh, sizeof(struct ifaddrmsg), IFA_LOCAL) == eth0) {
+                    if (nh->nlmsg_type == RTM_NEWADDR) h->new_addr++;
+                    else h->del_addr++;
+                }
+                break;
+            case RTM_NEWROUTE:
+            case RTM_DELROUTE: {
+                struct rtmsg *r = NLMSG_DATA(nh);
+                int def = r->rtm_dst_len == 0 && nl_ipv4(nh, sizeof *r, RTA_GATEWAY) == gw;
+                if (def && nh->nlmsg_type == RTM_NEWROUTE) h->new_default++;
+                else if (def) h->del_default++;
+                else h->other_routes++;
+                break;
+            }
+            }
+        }
+    }
+}
+
+/* Netlink: the routes (RTM_GETROUTE), and netd's configuration changes announced to the
+ * multicast groups (a DHCP lease that goes and comes back: TEST_NET_RENEW), to members by
+ * bind and by NETLINK_ADD_MEMBERSHIP, each only its groups'; datagrams between sockets by
+ * group. */
+static void netlink_multicast(void) {
+    static char buf[16384];
+    int fd = nl_socket(0);
+    struct {
+        struct nlmsghdr h;
+        struct rtmsg r;
+    } req = {{sizeof req, RTM_GETROUTE, NLM_F_REQUEST | NLM_F_DUMP, 1, 0}, {.rtm_family = AF_INET}};
+    send(fd, &req, sizeof req, 0);
+    int found = 0, done = 0;
+    while (!done) {
+        int n = recv(fd, buf, sizeof buf, 0);
+        if (n <= 0) break;
+        for (struct nlmsghdr *nh = (struct nlmsghdr *)buf; NLMSG_OK(nh, (unsigned)n); nh = NLMSG_NEXT(nh, n)) {
+            if (nh->nlmsg_type == NLMSG_DONE) done = 1;
+            if (nh->nlmsg_type != RTM_NEWROUTE) continue;
+            struct rtmsg *r = NLMSG_DATA(nh);
+            if (r->rtm_dst_len == 0 && r->rtm_table == RT_TABLE_MAIN && nl_ipv4(nh, sizeof *r, RTA_GATEWAY) == inet_addr("10.0.2.2")) found = 1;
+        }
+    }
+    check("RTM_GETROUTE lists the default route via 10.0.2.2", found && done);
+    close(fd);
+
+    int all = nl_socket(RTMGRP_LINK | RTMGRP_IPV4_IFADDR | RTMGRP_IPV4_ROUTE);
+    int addrs = nl_socket(0);
+    int group = RTNLGRP_IPV4_IFADDR;
+    check("NETLINK_ADD_MEMBERSHIP", setsockopt(addrs, SOL_NETLINK, NETLINK_ADD_MEMBERSHIP, &group, sizeof group) == 0);
+    check("TEST_NET_RENEW: netd renews its DHCP lease", syscall(TEST_NET_RENEW) == 0);
+    struct heard a = {0}, b = {0};
+    listen_nl(all, &a, 15000);
+    char name[120];
+    snprintf(name, sizeof name, "members hear the lease go and come back (%d %d %d %d)", a.del_addr, a.del_default, a.new_addr, a.new_default);
+    check(name, a.del_addr == 1 && a.del_default == 1 && a.new_addr == 1 && a.new_default == 1 && a.other_routes >= 2);
+    check("... from the groups they joined", a.groups == (RTMGRP_IPV4_IFADDR | RTMGRP_IPV4_ROUTE));
+    listen_nl(addrs, &b, 300);
+    check("a member of one group hears only its messages", b.del_addr == 1 && b.new_addr == 1 && b.del_default == 0 && b.other_routes == 0 &&
+                                                               b.groups == RTMGRP_IPV4_IFADDR);
+    close(all);
+    close(addrs);
+
+    /* A datagram to a group reaches its members, not the sender. */
+    int x = nl_socket(1u << 19), y = nl_socket(1u << 19);
+    struct sockaddr_nl to = {.nl_family = AF_NETLINK, .nl_groups = 1u << 19}, from;
+    socklen_t fl = sizeof from;
+    sendto(y, "hello", 5, 0, (struct sockaddr *)&to, sizeof to);
+    struct sockaddr_nl yname;
+    socklen_t yl = sizeof yname;
+    getsockname(y, (struct sockaddr *)&yname, &yl);
+    int n = recvfrom(x, buf, sizeof buf, MSG_DONTWAIT, (struct sockaddr *)&from, &fl);
+    check("a datagram to a group reaches a member", n == 5 && memcmp(buf, "hello", 5) == 0 && from.nl_pid == yname.nl_pid && from.nl_groups == 1u << 19);
+    check("... but not its sender", recv(y, buf, sizeof buf, MSG_DONTWAIT) == -1 && errno == EAGAIN);
+    close(x);
+    close(y);
 }
 
 /* Byte `i` of the bulk transfer's pattern. */
@@ -1098,6 +1223,7 @@ int main(void) {
     killed_while_waiting_on_netd();
     datagram_semantics();
     many_sockets();
+    netlink_multicast();
 
     printf("nettest: %s\n", failures ? "FAILED" : "all passed");
     return failures;

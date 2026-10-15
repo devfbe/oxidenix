@@ -43,6 +43,7 @@ fn every_request() -> Vec<Request> {
         Request::SetOpt { sock: 11, opt: opt::NODELAY, value: 1 },
         Request::Links { buf: Buf { grant: 1, offset: 100, len: MAX_LINKS_BUF } },
         Request::Forget { grant: 4095 },
+        Request::Renew,
     ]
 }
 
@@ -58,7 +59,7 @@ fn every_request_round_trips() {
 
 #[test]
 fn unknown_operations_are_refused() {
-    for op in [0, 13, 99, u16::MAX] {
+    for op in [0, 14, 99, u16::MAX] {
         assert_eq!(Request::decode(&Desc { op, ..Desc::default() }), Err(ENOSYS));
     }
 }
@@ -181,8 +182,8 @@ fn records_round_trip_and_stay_aligned() {
 #[test]
 fn links_round_trip() {
     let links = [
-        Link { index: 1, kind: LINK_LOOPBACK, state: LINK_UP | LINK_RUNNING, mtu: 1500, mac: [0; 6], prefix: 8, address: 0x7f00_0001 },
-        Link { index: 2, kind: LINK_ETHERNET, state: LINK_UP, mtu: 1500, mac: [0x52, 0x54, 0, 0x12, 0x34, 0x56], prefix: 24, address: 0x0a00_020f },
+        Link { index: 1, kind: LINK_LOOPBACK, state: LINK_UP | LINK_RUNNING, mtu: 1500, mac: [0; 6], prefix: 8, address: 0x7f00_0001, gateway: 0 },
+        Link { index: 2, kind: LINK_ETHERNET, state: LINK_UP, mtu: 1500, mac: [0x52, 0x54, 0, 0x12, 0x34, 0x56], prefix: 24, address: 0x0a00_020f, gateway: 0x0a00_0202 },
     ];
     let mut payload: Vec<u8> = links.iter().flat_map(|l| l.encode()).collect();
     payload.push(0xff);

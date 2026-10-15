@@ -4,8 +4,9 @@
 //! both so that its encodings and memory ordering are tested on the host.
 //!
 //! **The channel** has `SLOTS` slots per ring and a shared area of
-//! `SHARED_PAGES` pages (`SharedArea`): a header page with two bitmaps and
-//! the net thread's doorbell, then a control block (`Ctl`, 128 bytes) per
+//! `SHARED_PAGES` pages (`SharedArea`): a header page with two bitmaps,
+//! the net thread's doorbell and the count of netd's configuration changes
+//! (`links_seq`: the instance's netlink notifications), then a control block (`Ctl`, 128 bytes) per
 //! socket, at most `MAX_SOCKETS`. The client names a socket by the index
 //! of its control block. The shared area stays mapped in netd whatever the
 //! client does, so netd may use atomics there; granted memory it touches
@@ -67,6 +68,7 @@
 //! | `SETOPT` | socket, `arg[0]` option (`opt`; another is `ENOPROTOOPT`), `arg[1]` value (in its range: `opt::valid`, else `EINVAL`) | 0 |
 //! | `LINKS` | a buffer | bytes of `Link` records |
 //! | `FORGET` | `grant` | 0 once netd let go of the grant |
+//! | `RENEW` | none | 0: netd drops its DHCP lease and asks for one again a second later (test mode only, else `EPERM`) |
 //!
 //! Every field an operation does not use must be 0 (`EINVAL`), an unknown
 //! operation is `ENOSYS`. An endpoint is an IPv4 address and a port in host
@@ -111,6 +113,7 @@ pub mod op {
     pub const SETOPT: u16 = 10;
     pub const LINKS: u16 = 11;
     pub const FORGET: u16 = 12;
+    pub const RENEW: u16 = 13;
 }
 
 /// The errors the protocol itself gives (the others are the stack's).
@@ -124,6 +127,7 @@ pub mod errno {
     pub const ENOSPC: i64 = 28;
     pub const EPIPE: i64 = 32;
     pub const ENOSYS: i64 = 38;
+    pub const EPERM: i64 = 1;
     pub const EDESTADDRREQ: i64 = 89;
     pub const EMSGSIZE: i64 = 90;
     pub const ENOPROTOOPT: i64 = 92;
@@ -279,6 +283,9 @@ pub struct ArenaHeader {
     pub client_dirty: Bitmap,
     /// Sockets the client changed, for netd.
     pub service_dirty: Bitmap,
+    /// Advanced by netd whenever its configuration (`LINKS`) changed; it
+    /// pokes the net thread then (`ArenaHeader::poke_client`).
+    pub links_seq: Line,
 }
 
 impl ArenaHeader {
@@ -602,6 +609,7 @@ pub enum Request {
     SetOpt { sock: u32, opt: u32, value: u64 },
     Links { buf: Buf },
     Forget { grant: u32 },
+    Renew,
 }
 
 fn sock(object: u64) -> Result<u32, i64> {
@@ -724,6 +732,7 @@ impl Request {
                 }
                 (Request::Forget { grant: d.grant }, Used { grant: true, ..NONE })
             }
+            op::RENEW => (Request::Renew, NONE),
             _ => return Err(ENOSYS),
         };
         let unused = d.flags != 0
@@ -794,6 +803,7 @@ impl Request {
                 d.len = buf.len;
             }
             Request::Forget { grant } => d.grant = grant,
+            Request::Renew => {}
         }
         d
     }
@@ -812,6 +822,7 @@ impl Request {
             Request::SetOpt { .. } => op::SETOPT,
             Request::Links { .. } => op::LINKS,
             Request::Forget { .. } => op::FORGET,
+            Request::Renew => op::RENEW,
         }
     }
 }
@@ -1315,11 +1326,13 @@ pub struct Link {
     pub prefix: u8,
     /// Its IPv4 address in host order, 0 for none (no DHCP lease yet).
     pub address: u32,
+    /// The default route's gateway through it, 0 for none.
+    pub gateway: u32,
 }
 
 impl Link {
     /// The size of one encoded record.
-    pub const SIZE: usize = 24;
+    pub const SIZE: usize = 28;
 
     pub fn encode(&self) -> [u8; Self::SIZE] {
         let mut r = [0u8; Self::SIZE];
@@ -1330,6 +1343,7 @@ impl Link {
         r[12..18].copy_from_slice(&self.mac);
         r[18] = self.prefix;
         r[20..24].copy_from_slice(&self.address.to_le_bytes());
+        r[24..28].copy_from_slice(&self.gateway.to_le_bytes());
         r
     }
 
@@ -1344,6 +1358,7 @@ impl Link {
             mac: r[12..18].try_into().expect("6 bytes"),
             prefix: r[18],
             address: u32::from_le_bytes(r[20..24].try_into().expect("4 bytes")),
+            gateway: u32::from_le_bytes(r[24..28].try_into().expect("4 bytes")),
         })
     }
 }

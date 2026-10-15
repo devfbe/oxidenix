@@ -136,7 +136,12 @@ fn main(args: Vec<&'static str>) -> i32 {
     // order: register once DHCP is done, or after DHCP_WAIT_MS without it.
     let register_at = oxrt::uptime_ms() + DHCP_WAIT_MS;
     let mut registered = false;
-    let mut service = service::Service::new();    service.config.mac = mac.0;
+    let mut service = service::Service::new();
+    service.config.mac = mac.0;
+    // The kernel runs the self-tests: their requests are taken (`RENEW`).
+    service.test_mode = args.contains(&"test=1");
+    // A renewal the tests asked for: DHCP starts again then.
+    let mut renew_at: Option<u64> = None;
 
     // The only messages netd takes are the kernel's channel offers (a
     // longer one fails in the kernel).
@@ -175,22 +180,31 @@ fn main(args: Vec<&'static str>) -> i32 {
                     Some(router) => println!("netd: {} via DHCP, gateway {} (virtio-net {})", c.address, router, mac),
                     None => println!("netd: {} via DHCP, no gateway (virtio-net {})", c.address, mac),
                 }
+                // The instances hear of it (netlink's notifications).
+                service.links_changed();
                 progress = true;
             }
             Some(dhcpv4::Event::Deconfigured) => {
                 if nic.address != 0 {
                     println!("netd: lost the DHCP lease");
                 }
-                nic.address = 0;
-                iface.update_ip_addrs(|addrs| {
-                    addrs.clear();
-                    let _ = addrs.push(IpCidr::Ipv4(LOOPBACK));
-                });
-                iface.routes_mut().remove_default_ipv4_route();
-                service.config = service::Config { mac: mac.0, ..Default::default() };
+                deconfigure(&mut iface, &mut nic, &mut service, mac.0);
                 progress = true;
             }
             None => {}
+        }
+        // The tests' renewal: the lease goes now, DHCP asks again a second
+        // later (so that the instances see it go and come back).
+        if service.take_renew() {
+            println!("netd: dropping the DHCP lease (test)");
+            deconfigure(&mut iface, &mut nic, &mut service, mac.0);
+            renew_at = Some(oxrt::uptime_ms() + RENEW_DELAY_MS);
+            progress = true;
+        }
+        if renew_at.is_some_and(|at| oxrt::uptime_ms() >= at) {
+            renew_at = None;
+            sockets.get_mut::<dhcpv4::Socket>(dhcp).reset();
+            progress = true;
         }
         service.flush();
         if !registered && (nic.address != 0 || oxrt::uptime_ms() >= register_at) {
@@ -229,6 +243,10 @@ fn main(args: Vec<&'static str>) -> i32 {
             let left = register_at.saturating_sub(oxrt::uptime_ms());
             timeout = Some(timeout.map_or(left, |t| t.min(left)));
         }
+        if let Some(at) = renew_at {
+            let left = at.saturating_sub(oxrt::uptime_ms());
+            timeout = Some(timeout.map_or(left, |t| t.min(left)));
+        }
         // Marks that keep coming for nothing: a brief sleep only.
         if let Some(cap) = service.sleep_cap() {
             timeout = Some(timeout.map_or(cap, |t| t.min(cap)));
@@ -259,6 +277,24 @@ fn main(args: Vec<&'static str>) -> i32 {
 }
 
 const DHCP_WAIT_MS: u64 = 3000;
+/// How long a renewal the tests asked for leaves netd without a lease.
+const RENEW_DELAY_MS: u64 = 1000;
+
+/// The lease went: only the loopback's address is left, no default route;
+/// the instances hear of it.
+fn deconfigure(iface: &mut Interface, nic: &mut Nic, service: &mut service::Service, mac: [u8; 6]) {
+    nic.address = 0;
+    iface.update_ip_addrs(|addrs| {
+        addrs.clear();
+        let _ = addrs.push(IpCidr::Ipv4(LOOPBACK));
+    });
+    iface.routes_mut().remove_default_ipv4_route();
+    let before = service.config;
+    service.config = service::Config { mac, ..Default::default() };
+    if before.address != 0 || before.gateway != 0 {
+        service.links_changed();
+    }
+}
 const LOOPBACK: Ipv4Cidr = Ipv4Cidr::new(Ipv4Address::new(127, 0, 0, 1), 8);
 
 /// Must match the kernel's NETD_DMA_PAGES.

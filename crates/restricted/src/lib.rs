@@ -1409,3 +1409,9 @@ pub const TEST_TREE_KILL: u64 = 1530;
 /// lock. ESRCH for no such thread. Test mode only; the server passes the
 /// thread's key on (`futextest`: priority inheritance along a chain).
 pub const TEST_PI_WEIGHT: u64 = 1550;
+/// `()`: netd drops its DHCP lease and asks for a new one a second later
+/// (`netring::op::RENEW`), so that the instances see the address, its
+/// routes and their netlink notifications go and come back. The Linux
+/// server's alone (it asks netd over its channel); test mode only, and
+/// netd takes it only when the kernel started it in test mode.
+pub const TEST_NET_RENEW: u64 = 1600;

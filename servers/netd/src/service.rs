@@ -673,6 +673,10 @@ pub struct Service {
     /// A datagram on its way out.
     scratch: Vec<u8>,
     pub config: Config,
+    /// The kernel runs its self-tests (netd's `test=1`): `RENEW` is taken.
+    pub test_mode: bool,
+    /// A `RENEW` came (`take_renew`).
+    renew: bool,
 }
 
 type Reply = Result<(i64, [u64; 4]), i64>;
@@ -734,6 +738,8 @@ impl Service {
             brief: false,
             scratch: vec![0; MAX_UDP.max(RAW_BUFFER)],
             config: Config::default(),
+            test_mode: false,
+            renew: false,
         }
     }
 
@@ -896,6 +902,20 @@ impl Service {
         progress
     }
 
+    /// The configuration (`LINKS`) changed: every instance's net thread
+    /// hears of it (`ArenaHeader::links_seq`), for netlink's notifications.
+    pub fn links_changed(&mut self) {
+        for chan in self.chans.iter().flatten() {
+            chan.area.header.links_seq.0.fetch_add(1, SeqCst);
+            chan.area.header.poke_client(&WakeAll);
+        }
+    }
+
+    /// Whether a `RENEW` came since the last call (the main loop renews).
+    pub fn take_renew(&mut self) -> bool {
+        core::mem::take(&mut self.renew)
+    }
+
     /// The end of a round: completions and marks reach the clients.
     pub fn flush(&mut self) {
         for chan in self.chans.iter_mut().flatten() {
@@ -985,6 +1005,13 @@ impl Service {
             Request::Name { sock, peer } => self.name(c, sock, peer, iface, sockets),
             Request::SetOpt { sock, opt, value } => self.setopt(c, sock, opt, value, sockets),
             Request::Links { buf } => self.links(c, buf),
+            // A test's request only: in production one instance must not
+            // take the others' network away.
+            Request::Renew if !self.test_mode => Err(EPERM),
+            Request::Renew => {
+                self.renew = true;
+                done(0)
+            }
             Request::Forget { grant } => {
                 let chan = self.chan(c);
                 if chan.socks.values().any(|s| s.area.is_some_and(|a| a.grant == grant)) {
@@ -1915,8 +1942,8 @@ impl Service {
         let cfg = self.config;
         let up = netring::LINK_UP | netring::LINK_RUNNING;
         let (address, prefix) = (crate::LOOPBACK.address().to_bits(), crate::LOOPBACK.prefix_len());
-        let lo = Link { index: 1, kind: netring::LINK_LOOPBACK, state: up, mtu, mac: [0; 6], prefix, address };
-        let card = Link { index: 2, kind: netring::LINK_ETHERNET, state: up, mtu, mac: cfg.mac, prefix: cfg.prefix, address: cfg.address };
+        let lo = Link { index: 1, kind: netring::LINK_LOOPBACK, state: up, mtu, mac: [0; 6], prefix, address, gateway: 0 };
+        let card = Link { index: 2, kind: netring::LINK_ETHERNET, state: up, mtu, mac: cfg.mac, prefix: cfg.prefix, address: cfg.address, gateway: cfg.gateway };
         let mut out = Vec::with_capacity(2 * Link::SIZE);
         out.extend_from_slice(&lo.encode());
         out.extend_from_slice(&card.encode());

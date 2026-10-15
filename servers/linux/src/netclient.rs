@@ -529,9 +529,17 @@ pub fn thread() -> ! {
     }
 }
 
+/// How often the net thread looks for netd again while it is away and a
+/// netlink socket waits for configuration changes.
+const NETD_AGAIN_NS: u64 = 1_000_000_000;
+
 /// Serves channel `net` until it dies or a new one replaced it.
 fn serve(net: &Arc<Net>, generation: u32) {
     let header = &net.area.header;
+    // A new channel: netd's configuration may differ from what netlink's
+    // members last heard (netd started again, or the channel was given up).
+    let mut links = header.links_seq.0.load(Ordering::SeqCst);
+    crate::netlink::configuration_changed();
     loop {
         if net.is_dead() {
             // netd went: every socket of the channel fails; closes need no
@@ -540,9 +548,14 @@ fn serve(net: &Arc<Net>, generation: u32) {
             for s in net.live() {
                 s.netd_changed();
             }
+            // netlink's members hear what changed: a new channel's
+            // configuration, or (netd gone) its interfaces gone.
+            crate::netlink::configuration_changed();
             if GENERATION.load(Ordering::SeqCst) == generation {
-                // Until the next socket makes a new channel.
-                syscall(SYS_SERVER_FUTEX_WAIT, [&GENERATION as *const AtomicU32 as u64, generation as u64, 0, 0, 0, 0]);
+                // Until the next socket makes a new channel, or (members
+                // waiting for changes) for a while before looking again.
+                let deadline = if crate::netlink::has_members() { crate::ringclient::now() + NETD_AGAIN_NS } else { 0 };
+                syscall(SYS_SERVER_FUTEX_WAIT, [&GENERATION as *const AtomicU32 as u64, generation as u64, deadline, 0, 0, 0]);
             }
             // Closes queued meanwhile still need doing.
             net.close_queued();
@@ -553,6 +566,13 @@ fn serve(net: &Arc<Net>, generation: u32) {
         }
         let seen = header.client_seen();
         let mut any = false;
+        // netd's configuration changed: netlink's members hear of it.
+        let now = header.links_seq.0.load(Ordering::SeqCst);
+        if now != links {
+            links = now;
+            crate::netlink::configuration_changed();
+            any = true;
+        }
         header.take_client(|i| {
             any = true;
             let s = net.socks.lock().get(i).and_then(Weak::upgrade);

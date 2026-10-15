@@ -285,6 +285,11 @@ fn dispatch(s: &mut State) -> i64 {
         TEST_TREE_KILL => syscall(TEST_TREE_KILL, [s.rdi, 0, 0, 0, 0, 0]),
         TEST_HEAP_STATS => test(s.rax, s.rdi),
         // The kernel's to answer, for the thread's key.
+        // netd's lease goes and comes back (netlink's notifications).
+        TEST_NET_RENEW if test_mode() => match netclient::net().and_then(|n| n.status(netring::Request::Renew)) {
+            Ok(_) => 0,
+            Err(e) => -e,
+        },
         TEST_PI_WEIGHT if test_mode() => match process::key_of(s.rdi as u32) {
             Some(key) => syscall(TEST_PI_WEIGHT, [key, 0, 0, 0, 0, 0]),
             None => -3,

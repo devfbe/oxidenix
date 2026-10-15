@@ -74,6 +74,7 @@ pub fn interfaces() -> Result<Vec<Interface>, NoMem> {
                 mac: l.mac,
                 broadcast_mac: if loopback { [0; 6] } else { [0xff; 6] },
                 ipv4,
+                gateway: (l.gateway != 0 && l.address != 0).then_some(l.gateway),
             }
         });
     }

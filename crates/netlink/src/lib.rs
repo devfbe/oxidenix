@@ -6,11 +6,15 @@
 //! datagrams that answer it.
 //!
 //! What it answers: the interfaces (`RTM_GETLINK`, dumped or one by index
-//! or name) and their IPv4 addresses (`RTM_GETADDR`, dumped), which is
+//! or name), their IPv4 addresses (`RTM_GETADDR`, dumped), which is
 //! what getifaddrs(3) asks, and with it libuv's interface list (Node.js's
-//! `os.networkInterfaces()`). Every other routing request is refused with
-//! `EOPNOTSUPP`, as Linux refuses requests a family does not implement.
-//! Nothing changes the configuration (that is netd's, by DHCP).
+//! `os.networkInterfaces()`), and the IPv4 routes that follow from them
+//! (`RTM_GETROUTE`, dumped: `routes`). Every other routing request is
+//! refused with `EOPNOTSUPP`, as Linux refuses requests a family does not
+//! implement. Nothing changes the configuration (that is netd's, by DHCP);
+//! its changes are announced to the multicast groups (`changes`: the
+//! messages Linux sends to RTNLGRP_LINK, RTNLGRP_IPV4_IFADDR and
+//! RTNLGRP_IPV4_ROUTE).
 
 #![no_std]
 
@@ -31,9 +35,34 @@ pub const NLMSG_MIN_TYPE: u16 = 0x10;
 
 // rtnetlink's types.
 pub const RTM_NEWLINK: u16 = 16;
+pub const RTM_DELLINK: u16 = 17;
 pub const RTM_GETLINK: u16 = 18;
 pub const RTM_NEWADDR: u16 = 20;
+pub const RTM_DELADDR: u16 = 21;
 pub const RTM_GETADDR: u16 = 22;
+pub const RTM_NEWROUTE: u16 = 24;
+pub const RTM_DELROUTE: u16 = 25;
+pub const RTM_GETROUTE: u16 = 26;
+
+// Multicast groups (`RTNLGRP_*`; group n is bit n - 1 of a bind's
+// `nl_groups`, `RTMGRP_*`).
+pub const RTNLGRP_LINK: u32 = 1;
+pub const RTNLGRP_IPV4_IFADDR: u32 = 5;
+pub const RTNLGRP_IPV4_ROUTE: u32 = 7;
+
+// Routes (`struct rtmsg`'s fields, `RTA_*` attributes).
+pub const RT_TABLE_MAIN: u8 = 254;
+pub const RT_TABLE_LOCAL: u8 = 255;
+pub const RTPROT_KERNEL: u8 = 2;
+pub const RTPROT_DHCP: u8 = 16;
+pub const RT_SCOPE_LINK: u8 = 253;
+pub const RTN_UNICAST: u8 = 1;
+pub const RTN_LOCAL: u8 = 2;
+pub const RTA_DST: u16 = 1;
+pub const RTA_OIF: u16 = 4;
+pub const RTA_GATEWAY: u16 = 5;
+pub const RTA_PREFSRC: u16 = 7;
+pub const RTA_TABLE: u16 = 15;
 
 // Flags.
 pub const NLM_F_REQUEST: u16 = 0x1;
@@ -120,6 +149,58 @@ pub struct Interface {
     pub mac: [u8; 6],
     pub broadcast_mac: [u8; 6],
     pub ipv4: Option<Ipv4>,
+    /// The default route's gateway through it (in host order), if any.
+    pub gateway: Option<u32>,
+}
+
+/// An IPv4 route, as rtnetlink describes it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Route {
+    /// `RT_TABLE_MAIN` or `RT_TABLE_LOCAL`.
+    pub table: u8,
+    /// The destination and its prefix length (0/0: the default route).
+    pub dst: u32,
+    pub dst_len: u8,
+    pub gateway: Option<u32>,
+    /// The interface it leaves by.
+    pub oif: u32,
+    /// The source address it prefers.
+    pub prefsrc: u32,
+    /// `RTPROT_*`, `RT_SCOPE_*`, `RTN_*`.
+    pub protocol: u8,
+    pub scope: u8,
+    pub kind: u8,
+}
+
+fn netmask(prefix: u8) -> u32 {
+    if prefix == 0 { 0 } else { u32::MAX << (32 - prefix.min(32) as u32) }
+}
+
+/// The IPv4 routes that follow from the interfaces, as Linux makes them:
+/// in the main table each address's subnet (the kernel's, scope link; not
+/// the loopback's) and the default route through a gateway (DHCP's); in the
+/// local table each address itself (scope host) and the loopback's whole
+/// subnet. (Linux's broadcast routes of the local table are left out.)
+pub fn routes(interfaces: &[Interface]) -> Vec<Route> {
+    let mut out = Vec::new();
+    for i in interfaces {
+        let Some(a) = i.ipv4 else { continue };
+        let loopback = i.flags & IFF_LOOPBACK != 0;
+        let route = |table, dst, dst_len, gateway, protocol, scope, kind| Route { table, dst, dst_len, gateway, oif: i.index, prefsrc: a.address, protocol, scope, kind };
+        if !loopback && a.prefix < 32 {
+            out.push(route(RT_TABLE_MAIN, a.address & netmask(a.prefix), a.prefix, None, RTPROT_KERNEL, RT_SCOPE_LINK, RTN_UNICAST));
+        }
+        if let Some(gw) = i.gateway {
+            out.push(route(RT_TABLE_MAIN, 0, 0, Some(gw), RTPROT_DHCP, RT_SCOPE_UNIVERSE, RTN_UNICAST));
+        }
+        if loopback {
+            out.push(route(RT_TABLE_LOCAL, a.address & netmask(a.prefix), a.prefix, None, RTPROT_KERNEL, RT_SCOPE_HOST, RTN_LOCAL));
+        }
+        if !loopback || a.prefix < 32 {
+            out.push(route(RT_TABLE_LOCAL, a.address, 32, None, RTPROT_KERNEL, RT_SCOPE_HOST, RTN_LOCAL));
+        }
+    }
+    out
 }
 
 /// A message being built: header first, its length set by `finish`.
@@ -199,9 +280,13 @@ fn attributes(mut b: &[u8]) -> impl Iterator<Item = (u16, &[u8])> {
     })
 }
 
-/// `RTM_NEWLINK` describing `i`.
+/// `RTM_NEWLINK` (or `ty`) describing `i`.
 fn link_message(i: &Interface, flags: u16, seq: u32, port: u32) -> Vec<u8> {
-    let mut m = Message::new(RTM_NEWLINK, flags, seq, port);
+    link_message_as(RTM_NEWLINK, i, flags, seq, port)
+}
+
+fn link_message_as(ty: u16, i: &Interface, flags: u16, seq: u32, port: u32) -> Vec<u8> {
+    let mut m = Message::new(ty, flags, seq, port);
     // struct ifinfomsg: family, pad, type, index, flags, change.
     m.put(&[AF_UNSPEC, 0]);
     m.put(&i.hw_type.to_le_bytes());
@@ -226,9 +311,13 @@ fn link_message(i: &Interface, flags: u16, seq: u32, port: u32) -> Vec<u8> {
     m.finish()
 }
 
-/// `RTM_NEWADDR` describing `i`'s address `a`.
+/// `RTM_NEWADDR` (or `ty`) describing `i`'s address `a`.
 fn address_message(i: &Interface, a: &Ipv4, flags: u16, seq: u32, port: u32) -> Vec<u8> {
-    let mut m = Message::new(RTM_NEWADDR, flags, seq, port);
+    address_message_as(RTM_NEWADDR, i, a, flags, seq, port)
+}
+
+fn address_message_as(ty: u16, i: &Interface, a: &Ipv4, flags: u16, seq: u32, port: u32) -> Vec<u8> {
+    let mut m = Message::new(ty, flags, seq, port);
     let ifa_flags = if a.permanent { IFA_F_PERMANENT } else { 0 };
     // struct ifaddrmsg: family, prefix length, flags, scope, index.
     m.put(&[AF_INET, a.prefix, ifa_flags as u8, a.scope]);
@@ -245,6 +334,77 @@ fn address_message(i: &Interface, a: &Ipv4, flags: u16, seq: u32, port: u32) -> 
     m.attr(IFA_LABEL, &name);
     m.attr(IFA_FLAGS, &ifa_flags.to_le_bytes());
     m.finish()
+}
+
+/// `RTM_NEWROUTE` (or `ty`) describing `r`.
+fn route_message(ty: u16, r: &Route, flags: u16, seq: u32, port: u32) -> Vec<u8> {
+    let mut m = Message::new(ty, flags, seq, port);
+    // struct rtmsg: family, dst_len, src_len, tos, table, protocol, scope,
+    // type, flags.
+    m.put(&[AF_INET, r.dst_len, 0, 0, r.table, r.protocol, r.scope, r.kind]);
+    m.put(&0u32.to_le_bytes());
+    m.attr(RTA_TABLE, &(r.table as u32).to_le_bytes());
+    if r.dst_len > 0 {
+        m.attr(RTA_DST, &r.dst.to_be_bytes());
+    }
+    m.attr(RTA_PREFSRC, &r.prefsrc.to_be_bytes());
+    if let Some(gw) = r.gateway {
+        m.attr(RTA_GATEWAY, &gw.to_be_bytes());
+    }
+    m.attr(RTA_OIF, &r.oif.to_le_bytes());
+    m.finish()
+}
+
+/// A message for a multicast group (`changes`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Notification {
+    /// `RTNLGRP_*`.
+    pub group: u32,
+    pub message: Vec<u8>,
+}
+
+/// What Linux announces when the interfaces go from `old` to `new`, one
+/// message each (port 0, sequence number 0), in the order it would: the
+/// routes that went (`RTM_DELROUTE`), the addresses that went or changed
+/// (`RTM_DELADDR` with the old one), the interfaces that went
+/// (`RTM_DELLINK`), the interfaces that came or changed (`RTM_NEWLINK`),
+/// the addresses that came or changed (`RTM_NEWADDR`), the routes that
+/// came (`RTM_NEWROUTE`). Interfaces are the same by their index.
+pub fn changes(old: &[Interface], new: &[Interface]) -> Vec<Notification> {
+    let mut out = Vec::new();
+    let mut note = |group, message| out.push(Notification { group, message });
+    let find = |list: &[Interface], index: u32| list.iter().find(|i| i.index == index).cloned();
+    let (old_routes, new_routes) = (routes(old), routes(new));
+    for r in old_routes.iter().filter(|r| !new_routes.contains(r)) {
+        note(RTNLGRP_IPV4_ROUTE, route_message(RTM_DELROUTE, r, 0, 0, 0));
+    }
+    for i in old {
+        let now = find(new, i.index);
+        if let Some(a) = i.ipv4.filter(|a| now.as_ref().is_none_or(|n| n.ipv4 != Some(*a))) {
+            note(RTNLGRP_IPV4_IFADDR, address_message_as(RTM_DELADDR, i, &a, 0, 0, 0));
+        }
+    }
+    for i in old.iter().filter(|i| find(new, i.index).is_none()) {
+        note(RTNLGRP_LINK, link_message_as(RTM_DELLINK, i, 0, 0, 0));
+    }
+    // A link's own part: everything but its address and gateway.
+    let link = |i: &Interface| Interface { ipv4: None, gateway: None, ..i.clone() };
+    for i in new {
+        let before = find(old, i.index);
+        if before.as_ref().is_none_or(|b| link(b) != link(i)) {
+            note(RTNLGRP_LINK, link_message_as(RTM_NEWLINK, i, 0, 0, 0));
+        }
+    }
+    for i in new {
+        let before = find(old, i.index);
+        if let Some(a) = i.ipv4.filter(|a| before.as_ref().is_none_or(|b| b.ipv4 != Some(*a))) {
+            note(RTNLGRP_IPV4_IFADDR, address_message_as(RTM_NEWADDR, i, &a, 0, 0, 0));
+        }
+    }
+    for r in new_routes.iter().filter(|r| !old_routes.contains(r)) {
+        note(RTNLGRP_IPV4_ROUTE, route_message(RTM_NEWROUTE, r, 0, 0, 0));
+    }
+    out
 }
 
 /// `NLMSG_ERROR` for request `req` (its bytes, header included): `error`
@@ -273,6 +433,8 @@ enum Listing {
     Links,
     /// Addresses of the family (`AF_UNSPEC`: all).
     Addresses(u8),
+    /// Routes of the family (`AF_UNSPEC`: all), of every table.
+    Routes(u8),
 }
 
 /// A dump in progress: `answer` starts it, and `next` produces its
@@ -304,11 +466,17 @@ impl Dump {
             return None;
         }
         let mut out: Vec<u8> = Vec::new();
-        while self.at < interfaces.len() {
-            let i = &interfaces[self.at];
+        let routes = match self.listing {
+            Listing::Routes(f) if f == AF_UNSPEC || f == AF_INET => routes(interfaces),
+            _ => Vec::new(),
+        };
+        let count = if matches!(self.listing, Listing::Routes(_)) { routes.len() } else { interfaces.len() };
+        while self.at < count {
             let m = match self.listing {
-                Listing::Links => Some(link_message(i, NLM_F_MULTI, self.seq, self.port)),
+                Listing::Routes(_) => Some(route_message(RTM_NEWROUTE, &routes[self.at], NLM_F_MULTI, self.seq, self.port)),
+                Listing::Links => Some(link_message(&interfaces[self.at], NLM_F_MULTI, self.seq, self.port)),
                 Listing::Addresses(f) if f == AF_UNSPEC || f == AF_INET => {
+                    let i = &interfaces[self.at];
                     i.ipv4.as_ref().map(|a| address_message(i, a, NLM_F_MULTI, self.seq, self.port))
                 }
                 Listing::Addresses(_) => None,
@@ -349,6 +517,8 @@ fn request(req: &[u8], h: &Header, port: u32, interfaces: &[Interface], dumping:
         RTM_GETLINK if dump => Listing::Links,
         // struct ifaddrmsg's (or rtgenmsg's) family: IPv4 or any.
         RTM_GETADDR if dump => Listing::Addresses(body.first().copied().unwrap_or(AF_UNSPEC)),
+        // struct rtmsg's family.
+        RTM_GETROUTE if dump => Listing::Routes(body.first().copied().unwrap_or(AF_UNSPEC)),
         RTM_GETLINK => {
             // struct ifinfomsg, then attributes: by index, else by name.
             if body.len() < 16 {
@@ -503,6 +673,75 @@ mod tests {
         assert!(overrun && used <= 4096 && !replies.is_empty());
     }
 
+    #[test]
+    fn routes_follow_from_the_addresses() {
+        let r = routes(&interfaces());
+        let main: Vec<&Route> = r.iter().filter(|r| r.table == RT_TABLE_MAIN).collect();
+        assert_eq!(main.len(), 2, "{r:?}");
+        assert_eq!((main[0].dst, main[0].dst_len, main[0].scope, main[0].protocol, main[0].oif), (0x0a00_0200, 24, RT_SCOPE_LINK, RTPROT_KERNEL, 2));
+        assert_eq!((main[1].dst_len, main[1].gateway, main[1].protocol, main[1].prefsrc), (0, Some(0x0a00_0202), RTPROT_DHCP, 0x0a00_020f));
+        let local: Vec<(u32, u8)> = r.iter().filter(|r| r.table == RT_TABLE_LOCAL).map(|r| (r.dst, r.dst_len)).collect();
+        assert_eq!(local, vec![(0x7f00_0000, 8), (0x7f00_0001, 32), (0x0a00_020f, 32)]);
+        // A dump lists them, then NLMSG_DONE; the default route has no
+        // RTA_DST but its gateway.
+        let out = run(&request(RTM_GETROUTE, NLM_F_REQUEST | NLM_F_DUMP, 3, &[AF_INET]), 5, &interfaces(), false);
+        let all: Vec<_> = out.iter().flat_map(|d| messages(d)).collect();
+        assert_eq!(all.len(), r.len() + 1);
+        assert!(all[..r.len()].iter().all(|m| m.0.ty == RTM_NEWROUTE && m.0.seq == 3 && m.0.flags == NLM_F_MULTI));
+        let default = &all.iter().find(|m| m.1[1] == 0 && m.1[4] == RT_TABLE_MAIN).expect("the default route").1;
+        assert_eq!((default[0], default[5], default[6], default[7]), (AF_INET, RTPROT_DHCP, RT_SCOPE_UNIVERSE, RTN_UNICAST));
+        assert_eq!(attr(default, 12, RTA_DST), None);
+        assert_eq!(attr(default, 12, RTA_GATEWAY), Some(vec![10, 0, 2, 2]));
+        assert_eq!(attr(default, 12, RTA_OIF), Some(2u32.to_le_bytes().to_vec()));
+        // Another family: none.
+        let out = run(&request(RTM_GETROUTE, NLM_F_REQUEST | NLM_F_DUMP, 4, &[10]), 5, &interfaces(), false);
+        assert_eq!(messages(&out[0]).len(), 1);
+    }
+
+    #[test]
+    fn a_lost_lease_and_a_new_one_are_announced() {
+        let up = interfaces();
+        let mut down = interfaces();
+        down[1].ipv4 = None;
+        down[1].gateway = None;
+        let gone = changes(&up, &down);
+        let kinds: Vec<(u32, u16)> = gone.iter().map(|n| (n.group, header(&n.message).ty)).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                (RTNLGRP_IPV4_ROUTE, RTM_DELROUTE),
+                (RTNLGRP_IPV4_ROUTE, RTM_DELROUTE),
+                (RTNLGRP_IPV4_ROUTE, RTM_DELROUTE),
+                (RTNLGRP_IPV4_IFADDR, RTM_DELADDR),
+            ]
+        );
+        // The old address, as it was.
+        let m = &messages(&gone[3].message)[0];
+        assert_eq!((m.0.seq, m.2), (0, 0));
+        assert_eq!(attr(&m.1, 8, IFA_LOCAL), Some(vec![10, 0, 2, 15]));
+        let back = changes(&down, &up);
+        let kinds: Vec<(u32, u16)> = back.iter().map(|n| (n.group, header(&n.message).ty)).collect();
+        assert_eq!(kinds, vec![(RTNLGRP_IPV4_IFADDR, RTM_NEWADDR), (RTNLGRP_IPV4_ROUTE, RTM_NEWROUTE), (RTNLGRP_IPV4_ROUTE, RTM_NEWROUTE), (RTNLGRP_IPV4_ROUTE, RTM_NEWROUTE)]);
+        // Nothing changed: nothing said.
+        assert!(changes(&up, &up).is_empty());
+    }
+
+    #[test]
+    fn links_that_come_go_or_change_are_announced() {
+        let all = interfaces();
+        let only_lo = &all[..1];
+        let kinds = |n: Vec<Notification>| n.iter().map(|n| (n.group, header(&n.message).ty)).collect::<Vec<_>>();
+        let came = kinds(changes(only_lo, &all));
+        assert_eq!(came[0], (RTNLGRP_LINK, RTM_NEWLINK));
+        assert!(came.contains(&(RTNLGRP_IPV4_IFADDR, RTM_NEWADDR)));
+        let went = kinds(changes(&all, only_lo));
+        assert_eq!(went.last(), Some(&(RTNLGRP_LINK, RTM_DELLINK)));
+        // The carrier goes: a new RTM_NEWLINK, nothing else.
+        let mut down = all.clone();
+        down[1].flags &= !(IFF_RUNNING | IFF_LOWER_UP);
+        assert_eq!(kinds(changes(&all, &down)), vec![(RTNLGRP_LINK, RTM_NEWLINK)]);
+    }
+
     fn interfaces() -> Vec<Interface> {
         vec![
             Interface {
@@ -514,6 +753,7 @@ mod tests {
                 mac: [0; 6],
                 broadcast_mac: [0; 6],
                 ipv4: Some(Ipv4 { address: 0x7f00_0001, prefix: 8, scope: RT_SCOPE_HOST, permanent: true }),
+                gateway: None,
             },
             Interface {
                 index: 2,
@@ -524,6 +764,7 @@ mod tests {
                 mac: [0x52, 0x54, 0, 0x12, 0x34, 0x56],
                 broadcast_mac: [0xff; 6],
                 ipv4: Some(Ipv4 { address: 0x0a00_020f, prefix: 24, scope: RT_SCOPE_UNIVERSE, permanent: false }),
+                gateway: Some(0x0a00_0202),
             },
         ]
     }

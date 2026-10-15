@@ -48,7 +48,7 @@ done, delete it here in the same commit.
   `pidfd_getfd`), the dumpable flag's effect on them. Users of their own need them all at
   once (a tree's processes see no other tree's).
 - Terminal: packet mode (`TIOCPKT`), the Linux console's VT and keyboard ioctls, serial input.
-- Network: IPv6, `O_ASYNC` (`SIGIO`; `F_SETOWN` is kept and used for `SIGURG`), netlink multicast is never delivered, raw ICMP is shared
+- Network: IPv6, `O_ASYNC` (`SIGIO`; `F_SETOWN` is kept and used for `SIGURG`), raw ICMP is shared
   between instances (documented in ADR 0008).
 - Dynamic linking with glibc is untested (the ELF loader handles `PT_INTERP`).
 
