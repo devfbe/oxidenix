@@ -10,6 +10,12 @@
 //! the slave's last descriptor went and nothing is left; its close hangs the slave up and
 //! removes its node. The master's termios, window size and process group requests act on
 //! the slave, as Linux's.
+//!
+//! Packet mode (TIOCPKT, for rlogind and telnetd): the master reads the slave's status
+//! changes (its input or output flushed, output stopped or started, whether ^S and ^Q
+//! are its flow control characters, and with EXTPROC any change of its settings) as a
+//! packet of one status byte, polling POLLPRI while one waits, and its data behind a
+//! TIOCPKT_DATA byte (`tty::PtyState::pktstatus`).
 
 use crate::files::{self, File, EINVAL, O_ACCMODE, O_CLOEXEC, O_NONBLOCK};
 use crate::heap::{self, TryGrow};
@@ -19,7 +25,7 @@ use crate::tmpfs;
 use crate::tty::{self, Driver, PtyState, Tty, EAGAIN, EIO, ENXIO};
 use crate::unix::{Sink, Source};
 use crate::usercopy;
-use alloc::collections::{BTreeMap, VecDeque};
+use alloc::collections::BTreeMap;
 use alloc::string::ToString;
 use alloc::sync::Arc;
 use ldisc::Termios;
@@ -36,6 +42,8 @@ const TCFLSH: u32 = 0x540b;
 const TIOCOUTQ: u32 = 0x5411;
 const TIOCSTI: u32 = 0x5412;
 const FIONREAD: u32 = 0x541b;
+const TIOCPKT: u32 = 0x5420;
+const TIOCGPKT: u32 = 0x8004_5438;
 const TIOCGPTN: u32 = 0x8004_5430;
 const TIOCSPTLCK: u32 = 0x4004_5431;
 const TIOCSIG: u32 = 0x4004_5436;
@@ -84,16 +92,7 @@ pub fn open_master(flags: u32, origin: Origin) -> Result<i64, i64> {
     let (index, master) = {
         let mut ptys = PTYS.lock();
         let index = (0..MAX_PTYS).find(|i| !ptys.contains_key(i)).ok_or(ENOSPC)?;
-        let state = PtyState {
-            out: VecDeque::new(),
-            out_epoch: 0,
-            locked: true,
-            master_open: true,
-            slaves: 0,
-            slave_closed: false,
-            master_id: id,
-            master_reported: 0,
-        };
+        let state = PtyState::new(id);
         // The pair and its master's memory before it is listed (ENOMEM: nothing made).
         let tty = Tty::new(Driver::Pty(index), Termios::default(), [0; 4], Some(state))?;
         let master = heap::try_arc(PtyMaster { tty: tty.clone(), index, origin })?;
@@ -168,9 +167,31 @@ impl PtyMaster {
         let mut done = 0usize;
         let mut chunk = [0u8; 2048];
         loop {
-            let (n, epoch) = {
-                let inner = self.tty.inner.lock();
-                let p = inner.pty.as_ref().ok_or(EIO)?;
+            let (n, epoch, prefix) = {
+                let mut inner = self.tty.inner.lock();
+                let p = inner.pty.as_mut().ok_or(EIO)?;
+                // Packet mode: a status change is a packet of its own, before any data
+                // (Linux's `n_tty_read`); one that comes after data waits for the next read.
+                if p.packet && p.pktstatus != 0 {
+                    if done > 0 {
+                        return Ok(done as i64);
+                    }
+                    let status = core::mem::take(&mut p.pktstatus);
+                    self.tty.changed(&mut inner, false, false);
+                    drop(inner);
+                    return match sink.put(&[status]) {
+                        Ok(k) => Ok(k as i64),
+                        Err(e) => {
+                            // Not read: still there for the next read.
+                            let mut inner = self.tty.inner.lock();
+                            if let Some(p) = inner.pty.as_mut() {
+                                p.pktstatus |= status;
+                            }
+                            self.tty.changed(&mut inner, false, false);
+                            Err(e)
+                        }
+                    };
+                }
                 if p.out.is_empty() {
                     if done > 0 {
                         return Ok(done as i64);
@@ -186,27 +207,31 @@ impl PtyMaster {
                     self.tty.wait(seen, 0)?;
                     continue;
                 }
-                let n = p.out.len().min(chunk.len()).min(sink.room());
-                for (d, s) in chunk[..n].iter_mut().zip(p.out.iter()) {
+                // Packet mode: the read's data follows a TIOCPKT_DATA byte.
+                let prefix = (p.packet && done == 0) as usize;
+                chunk[0] = tty::TIOCPKT_DATA;
+                let n = p.out.len().min(chunk.len() - prefix).min(sink.room() - prefix);
+                for (d, s) in chunk[prefix..prefix + n].iter_mut().zip(p.out.iter()) {
                     *d = *s;
                 }
-                (n, p.out_epoch)
+                (n, p.out_epoch, prefix)
             };
-            let k = match sink.put(&chunk[..n]) {
+            let k = match sink.put(&chunk[..prefix + n]) {
                 Ok(k) => k,
                 Err(e) => return if done > 0 { Ok(done as i64) } else { Err(e) },
             };
+            let data = k.saturating_sub(prefix);
             {
                 let mut inner = self.tty.inner.lock();
                 if let Some(p) = inner.pty.as_mut() {
                     if p.out_epoch == epoch {
-                        p.out.drain(..k.min(p.out.len()));
+                        p.out.drain(..data.min(p.out.len()));
                     }
                 }
                 self.tty.changed(&mut inner, false, false);
             }
             done += k;
-            if k < n || sink.room() == 0 {
+            if data < n || sink.room() == 0 {
                 return Ok(done as i64);
             }
         }
@@ -229,6 +254,24 @@ impl PtyMaster {
                 if let Some(p) = self.tty.inner.lock().pty.as_mut() {
                     p.locked = lock != 0;
                 }
+                Ok(0)
+            }
+            TIOCPKT => {
+                // Turned on, it starts without status (Linux's `pty_set_pktmode`).
+                let on: i32 = usercopy::read(arg)?;
+                let mut inner = self.tty.inner.lock();
+                if let Some(p) = inner.pty.as_mut() {
+                    if on != 0 && !p.packet {
+                        p.pktstatus = 0;
+                    }
+                    p.packet = on != 0;
+                }
+                self.tty.changed(&mut inner, false, false);
+                Ok(0)
+            }
+            TIOCGPKT => {
+                let on = self.tty.inner.lock().pty.as_ref().is_some_and(|p| p.packet) as i32;
+                usercopy::write(arg, &on)?;
                 Ok(0)
             }
             TIOCGPTLCK => {

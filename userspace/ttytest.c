@@ -2,7 +2,8 @@
  * round trips, canonical and raw reads with VMIN and VTIME, echo and line editing,
  * output processing, flow control, poll, window sizes, the controlling terminal, the
  * foreground process group and the signals of ^C, ^\ and ^Z, SIGTTIN and SIGTTOU for a
- * background group, hangups, devpts, and the console's device node. (The console's own
+ * background group, hangups, devpts, packet mode and EXTPROC, and the console's device
+ * node. (The console's own
  * input is the keyboard's: checked interactively, not here.) */
 #define _GNU_SOURCE
 #include <dirent.h>
@@ -972,10 +973,146 @@ static void job_control(void) {
     check("a hung-up slave cannot be opened again", open(path, O_RDWR | O_NOCTTY) == -1);
 }
 
+/* One read of the master: its bytes into `buf`, their count (-1 on an error). */
+static int read_master(int m, unsigned char *buf, int cap) {
+    struct pollfd p = {m, POLLIN, 0};
+    if (poll(&p, 1, 1000) != 1) return -1;
+    return read(m, buf, cap);
+}
+
+/* struct termios2, for the speeds (TCGETS2). */
+struct termios2_ {
+    tcflag_t c_iflag, c_oflag, c_cflag, c_lflag;
+    cc_t c_line, c_cc[19];
+    speed_t c_ispeed, c_ospeed;
+};
+#define TCGETS2_ _IOR('T', 0x2a, struct termios2_)
+
+/* Packet mode (TIOCPKT): the slave's status changes as packets of one byte, data behind
+ * TIOCPKT_DATA, POLLPRI and select's exceptional set while status waits; EXTPROC (input
+ * stored as it comes, its changes reported as TIOCPKT_IOCTL); a pty's settings keep eight
+ * bits, and the speeds follow CBAUD. */
+static void packet_mode(void) {
+    char path[64];
+    unsigned char buf[64];
+    int m = new_pty(path, sizeof path);
+    int s = open(path, O_RDWR | O_NOCTTY);
+    int on = -1;
+    check("TIOCGPKT: packet mode starts off", ioctl(m, TIOCGPKT, &on) == 0 && on == 0);
+    on = 1;
+    check("TIOCPKT on the slave: ENOTTY", ioctl(s, TIOCPKT, &on) == -1 && errno == ENOTTY);
+    check("TIOCPKT turns it on", ioctl(m, TIOCPKT, &on) == 0 && ioctl(m, TIOCGPKT, &on) == 0 && on == 1);
+    write(s, "hi", 2);
+    struct pollfd pf = {m, POLLIN | POLLPRI, 0};
+    check("data alone polls POLLIN, not POLLPRI", poll(&pf, 1, 1000) == 1 && (pf.revents & (POLLIN | POLLPRI)) == POLLIN);
+    int n = read_master(m, buf, sizeof buf);
+    check("data comes behind TIOCPKT_DATA", n == 3 && buf[0] == TIOCPKT_DATA && memcmp(buf + 1, "hi", 2) == 0);
+    write(s, "x", 1);
+    n = read(m, buf, 1);
+    check("a read of one byte takes the TIOCPKT_DATA byte alone", n == 1 && buf[0] == TIOCPKT_DATA);
+    tcflush(m, TCIFLUSH);
+
+    tcflow(s, TCOOFF);
+    pf.revents = 0;
+    check("stopped output polls POLLPRI and POLLIN", poll(&pf, 1, 1000) == 1 && (pf.revents & (POLLPRI | POLLIN)) == (POLLPRI | POLLIN));
+    fd_set ex;
+    FD_ZERO(&ex);
+    FD_SET(m, &ex);
+    struct timeval tv = {1, 0};
+    check("select reports it as exceptional", select(m + 1, NULL, NULL, &ex, &tv) == 1 && FD_ISSET(m, &ex));
+    n = read_master(m, buf, sizeof buf);
+    check("tcflow(TCOOFF): TIOCPKT_STOP", n == 1 && buf[0] == TIOCPKT_STOP);
+    pf.revents = 0;
+    check("read, the status is gone", poll(&pf, 1, 0) == 0);
+    tcflow(s, TCOON);
+    n = read_master(m, buf, sizeof buf);
+    check("tcflow(TCOON): TIOCPKT_START", n == 1 && buf[0] == TIOCPKT_START);
+    tcflow(s, TCOOFF);
+    tcflow(s, TCOON);
+    n = read_master(m, buf, sizeof buf);
+    check("stopped and started before a read: TIOCPKT_START alone", n == 1 && buf[0] == TIOCPKT_START);
+    write(m, "\x13", 1);
+    n = read_master(m, buf, sizeof buf);
+    check("^S from the master: TIOCPKT_STOP", n == 1 && buf[0] == TIOCPKT_STOP);
+    write(m, "\x11", 1);
+    n = read_master(m, buf, sizeof buf);
+    check("^Q: TIOCPKT_START", n == 1 && buf[0] == TIOCPKT_START);
+
+    tcflush(s, TCIFLUSH);
+    n = read_master(m, buf, sizeof buf);
+    check("tcflush(TCIFLUSH) on the slave: TIOCPKT_FLUSHREAD", n == 1 && buf[0] == TIOCPKT_FLUSHREAD);
+    tcflush(s, TCOFLUSH);
+    n = read_master(m, buf, sizeof buf);
+    check("tcflush(TCOFLUSH): TIOCPKT_FLUSHWRITE", n == 1 && buf[0] == TIOCPKT_FLUSHWRITE);
+    write(s, "data", 4);
+    tcflush(s, TCIOFLUSH);
+    n = read_master(m, buf, sizeof buf);
+    check("tcflush(TCIOFLUSH): both, the data gone", n == 1 && buf[0] == (TIOCPKT_FLUSHREAD | TIOCPKT_FLUSHWRITE));
+    write(m, "\x03", 1);
+    n = read_master(m, buf, sizeof buf);
+    int n2 = read_master(m, buf + 8, sizeof buf - 8);
+    check("^C flushes both ways (a status packet), then its echo",
+          n == 1 && buf[0] == (TIOCPKT_FLUSHREAD | TIOCPKT_FLUSHWRITE) && n2 == 3 && buf[8] == 0 && memcmp(buf + 9, "^C", 2) == 0);
+
+    struct termios t;
+    tcgetattr(s, &t);
+    t.c_iflag &= ~IXON;
+    tcsetattr(s, TCSANOW, &t);
+    n = read_master(m, buf, sizeof buf);
+    check("IXON off: TIOCPKT_NOSTOP", n == 1 && buf[0] == TIOCPKT_NOSTOP);
+    t.c_iflag |= IXON;
+    tcsetattr(m, TCSANOW, &t);
+    n = read_master(m, buf, sizeof buf);
+    check("on again (through the master): TIOCPKT_DOSTOP", n == 1 && buf[0] == TIOCPKT_DOSTOP);
+
+    /* EXTPROC: input as it comes, no echo, no signals; every change is reported. */
+    t.c_lflag |= EXTPROC;
+    tcsetattr(s, TCSANOW, &t);
+    n = read_master(m, buf, sizeof buf);
+    check("EXTPROC set: TIOCPKT_IOCTL", n == 1 && buf[0] == TIOCPKT_IOCTL);
+    write(m, "ab\x7f\x03\r", 5);
+    sleep_ms(20);
+    int avail = -1;
+    ioctl(s, FIONREAD, &avail);
+    n = read(s, buf, sizeof buf);
+    pf.revents = 0;
+    check("EXTPROC: the bytes as they came, readable at once, nothing echoed",
+          avail == 5 && n == 5 && memcmp(buf, "ab\x7f\x03\r", 5) == 0 && poll(&pf, 1, 50) == 0);
+    t.c_lflag &= ~ECHO;
+    tcsetattr(s, TCSANOW, &t);
+    n = read_master(m, buf, sizeof buf);
+    check("with EXTPROC any change is TIOCPKT_IOCTL", n == 1 && buf[0] == TIOCPKT_IOCTL);
+    t.c_lflag &= ~EXTPROC;
+    tcsetattr(s, TCSANOW, &t);
+    n = read_master(m, buf, sizeof buf);
+    check("so is EXTPROC's end", n == 1 && buf[0] == TIOCPKT_IOCTL);
+
+    on = 0;
+    ioctl(m, TIOCPKT, &on);
+    write(s, "plain", 5);
+    n = read_master(m, buf, sizeof buf);
+    check("packet mode off: data alone", n == 5 && memcmp(buf, "plain", 5) == 0);
+
+    /* A pty keeps eight bits and the receiver on (Linux's pty_set_termios). */
+    tcgetattr(s, &t);
+    t.c_cflag = (t.c_cflag & ~CSIZE) | CS7 | PARENB;
+    t.c_cflag &= ~CREAD;
+    tcsetattr(s, TCSANOW, &t);
+    tcgetattr(s, &t);
+    check("a pty's c_cflag stays CS8 | CREAD without PARENB", (t.c_cflag & (CSIZE | CREAD | PARENB)) == (CS8 | CREAD));
+    cfsetspeed(&t, B9600);
+    tcsetattr(s, TCSANOW, &t);
+    struct termios2_ t2;
+    check("TCGETS2 shows the speed CBAUD says", ioctl(s, TCGETS2_, &t2) == 0 && t2.c_ospeed == 9600 && t2.c_ispeed == 9600);
+    close(s);
+    close(m);
+}
+
 int main(void) {
     signal(SIGTTOU, SIG_IGN);
     devices();
     termios_and_reads();
+    packet_mode();
     console_flood();
     pty_bounds();
     read_rules();

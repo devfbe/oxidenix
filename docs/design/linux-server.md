@@ -1079,9 +1079,14 @@ pipe's end is.
   `TCSBRKP`, `TCXONC`, `TCFLSH`, `TIOCGWINSZ`/`TIOCSWINSZ`, `TIOCGPGRP`/`TIOCSPGRP`,
   `TIOCGSID`, `TIOCSCTTY`, `TIOCNOTTY`, `TIOCSTI` (everyone is root), `FIONREAD`,
   `TIOCOUTQ`, `TIOCEXCL`/`TIOCNXCL`/`TIOCGEXCL`, `TIOCGETD`/`TIOCSETD` (N_TTY only),
-  `TIOCVHANGUP`; on a pty master also `TIOCGPTN`, `TIOCSPTLCK`/`TIOCGPTLCK`, `TIOCGPTPEER`
-  and `TIOCSIG`. Not done: packet mode (`TIOCPKT`), the VT and keyboard ioctls of the Linux
+  `TIOCVHANGUP`; on a pty master also `TIOCGPTN`, `TIOCSPTLCK`/`TIOCGPTLCK`, `TIOCGPTPEER`,
+  `TIOCSIG` and `TIOCPKT`/`TIOCGPKT`. Not done: the VT and keyboard ioctls of the Linux
   console (`KDGKBTYPE`, `VT_*`), modem lines (ENOTTY, as for a pty).
+- **Settings as Linux's `set_termios` takes them**: the speeds follow `CBAUD` and `CIBAUD`
+  (`c_ispeed`/`c_ospeed` of `termios2` only with `BOTHER`); a pty keeps `CS8 | CREAD` without
+  `PARENB` (`pty_set_termios`). `EXTPROC` (external processing: the master edits, as
+  telnetd's LINEMODE) stores input as it comes (after `ISTRIP`/`IUCLC`): no special
+  characters, echo or signals, read as noncanonical input (with `ICANON` a byte, no timer).
 
 ### Pseudo-terminals (`servers/linux/src/pty.rs`)
 
@@ -1097,6 +1102,16 @@ fill it 4 KiB further, the rest is dropped, so a master that never reads cannot 
 reads EIO once the slave's last descriptor went (after what was left), and polls with
 POLLHUP; the master's last close hangs the slave up and removes its node. The master's
 termios, window size and process group ioctls act on the slave, as on Linux.
+
+Packet mode (`TIOCPKT` on the master, ENOTTY on the slave; `TIOCGPKT`), for rlogind and
+telnetd: the slave's status changes are kept as Linux's `pktstatus` bits and read by the
+master as a packet of that one byte, before any data (data comes behind a `TIOCPKT_DATA`
+byte): `TIOCPKT_FLUSHREAD` and `_FLUSHWRITE` (the slave's `tcflush`, a signal character's
+flush), `_STOP` and `_START` (^S/^Q, `tcflow`, IXON going off; one clears the other),
+`_NOSTOP` and `_DOSTOP` (whether IXON with ^S/^Q is on, at each settings change) and
+`_IOCTL` (any settings change while `EXTPROC` is or was on). While status waits the
+master polls POLLPRI (select's exceptional set) and readable; turning the mode on starts
+without status.
 
 ### What is tested where
 

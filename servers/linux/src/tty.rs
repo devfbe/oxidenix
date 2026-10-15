@@ -52,6 +52,7 @@ pub const EAGAIN: i64 = 11;
 pub const O_NOCTTY: u32 = 0o400;
 
 const POLLIN: i16 = 0x1;
+const POLLPRI: i16 = 0x2;
 const POLLOUT: i16 = 0x4;
 const POLLERR: i16 = 0x8;
 const POLLHUP: i16 = 0x10;
@@ -135,6 +136,65 @@ pub struct PtyState {
     /// The master's open file description, and the readiness last reported for it.
     pub master_id: u64,
     pub master_reported: i16,
+    /// Packet mode (TIOCPKT): the master reads the slave's status changes (`pktstatus`,
+    /// `TIOCPKT_*`, Linux's `ctrl.pktstatus` of the slave) as packets of their own, its
+    /// data with a leading TIOCPKT_DATA. `pkt_new`: a change not reported yet (an event
+    /// for the master's readiness even if it stays).
+    pub packet: bool,
+    pub pktstatus: u8,
+    pub pkt_new: bool,
+}
+
+/// Packet mode's status bits (`TIOCPKT_*`).
+pub const TIOCPKT_DATA: u8 = 0;
+pub const TIOCPKT_FLUSHREAD: u8 = 1;
+pub const TIOCPKT_FLUSHWRITE: u8 = 2;
+pub const TIOCPKT_STOP: u8 = 4;
+pub const TIOCPKT_START: u8 = 8;
+pub const TIOCPKT_NOSTOP: u8 = 16;
+pub const TIOCPKT_DOSTOP: u8 = 32;
+pub const TIOCPKT_IOCTL: u8 = 64;
+
+impl PtyState {
+    /// A pair whose master was just opened (index-free state).
+    pub fn new(master_id: u64) -> PtyState {
+        PtyState {
+            out: VecDeque::new(),
+            out_epoch: 0,
+            locked: true,
+            master_open: true,
+            slaves: 0,
+            slave_closed: false,
+            master_id,
+            master_reported: 0,
+            packet: false,
+            pktstatus: 0,
+            pkt_new: false,
+        }
+    }
+}
+
+impl Inner {
+    /// A status change of the slave for a master in packet mode: `clear`'s bits go,
+    /// `set`'s come (Linux's `pty_stop`, `pty_start`, `pty_flush_buffer`,
+    /// `n_tty_packet_mode_flush`, `pty_set_termios`).
+    fn packet_status(&mut self, set: u8, clear: u8) {
+        if let Some(p) = self.pty.as_mut() {
+            if p.packet {
+                p.pktstatus = (p.pktstatus & !clear) | set;
+                p.pkt_new = true;
+            }
+        }
+    }
+
+    /// Output stopped or started since `was_stopped` was seen: TIOCPKT_STOP or _START.
+    fn packet_flow(&mut self, was_stopped: bool) {
+        match (was_stopped, self.ld.stopped()) {
+            (false, true) => self.packet_status(TIOCPKT_STOP, TIOCPKT_START),
+            (true, false) => self.packet_status(TIOCPKT_START, TIOCPKT_STOP),
+            _ => {}
+        }
+    }
 }
 
 pub struct Inner {
@@ -503,6 +563,10 @@ impl Tty {
         if p.slave_closed {
             ready |= POLLHUP;
         }
+        // A status packet to read (Linux's `n_tty_poll`: exceptional, and readable).
+        if p.packet && p.pktstatus != 0 {
+            ready |= POLLPRI | POLLIN | POLLRDNORM;
+        }
         ready
     }
 
@@ -524,7 +588,8 @@ impl Tty {
         }
         let master = Self::master_readiness(inner);
         if let Some(p) = inner.pty.as_mut() {
-            if p.master_open && (master != p.master_reported || output) {
+            let status = core::mem::take(&mut p.pkt_new);
+            if p.master_open && (master != p.master_reported || output || status) {
                 p.master_reported = master;
                 files::ready(p.master_id, master);
             }
@@ -592,7 +657,10 @@ impl Tty {
                 p.out.clear();
                 p.out_epoch += 1;
             }
+            // (Linux's `isig`: the driver's buffer, then the input.)
+            inner.packet_status(TIOCPKT_FLUSHWRITE | TIOCPKT_FLUSHREAD, 0);
         }
+        inner.packet_flow(was_stopped);
         if let (Some(sig), Some(fg)) = (r.signal, inner.pgrp) {
             signals.push((fg, sig as u64));
         }
@@ -1019,6 +1087,7 @@ impl Tty {
         if input {
             inner.ld.flush_input();
             inner.epoch += 1;
+            inner.packet_status(TIOCPKT_FLUSHREAD, 0);
         }
         if output {
             inner.held_echo.clear();
@@ -1026,6 +1095,7 @@ impl Tty {
                 p.out.clear();
                 p.out_epoch += 1;
             }
+            inner.packet_status(TIOCPKT_FLUSHWRITE, 0);
         }
         self.changed(&mut inner, false, false);
     }
@@ -1040,13 +1110,31 @@ impl Tty {
         let out = {
             let _reader = self.rlock.lock()?;
             let mut inner = self.inner.lock();
-            let new = inner.ld.termios().with_bytes(&bytes[..size]);
+            let old = inner.ld.termios();
+            let mut new = old.with_bytes(&bytes[..size]);
             if flush {
                 inner.ld.flush_input();
                 inner.epoch += 1;
+                inner.packet_status(TIOCPKT_FLUSHREAD, 0);
+            }
+            if let Driver::Pty(_) = self.driver {
+                // Linux's `pty_set_termios`: eight bits, no parity, the receiver on.
+                new.cflag = (new.cflag & !(CSIZE | PARENB)) | CS8 | CREAD;
+                // Packet mode learns whether ^S and ^Q stop and start output, and with
+                // EXTPROC (before or now) of every change.
+                let flow = |t: &Termios| t.i(IXON) && t.cc[VSTOP] == 0x13 && t.cc[VSTART] == 0x11;
+                let (old_flow, new_flow) = (flow(&old), flow(&new));
+                if old_flow != new_flow {
+                    let now = if new_flow { TIOCPKT_DOSTOP } else { TIOCPKT_NOSTOP };
+                    inner.packet_status(now, TIOCPKT_DOSTOP | TIOCPKT_NOSTOP);
+                }
+                if old.l(EXTPROC) || new.l(EXTPROC) {
+                    inner.packet_status(TIOCPKT_IOCTL, 0);
+                }
             }
             let was_stopped = inner.ld.stopped();
             inner.ld.set_termios(new);
+            inner.packet_flow(was_stopped);
             let mut out = None;
             if was_stopped && !inner.ld.stopped() {
                 let held = core::mem::take(&mut inner.held_echo);
@@ -1071,6 +1159,7 @@ impl Tty {
             } else {
                 inner.ld.start(true);
             }
+            inner.packet_flow(was_stopped);
             let mut out = None;
             if was_stopped && !inner.ld.stopped() {
                 let held = core::mem::take(&mut inner.held_echo);
