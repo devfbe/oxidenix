@@ -231,6 +231,7 @@ pub fn pid_status(p: &Process, m: &Machine, l: &Linux) -> String {
         STATE_RUNNING => "R (running)",
         STATE_SLEEPING => "S (sleeping)",
         STATE_STOPPED => "T (stopped)",
+        STATE_TRACED => "t (tracing stop)",
         STATE_ZOMBIE => "Z (zombie)",
         _ => "? (unknown)",
     };
@@ -242,7 +243,7 @@ pub fn pid_status(p: &Process, m: &Machine, l: &Linux) -> String {
     }
     let _ = write!(
         out,
-        "State:\t{state}\nTgid:\t{tgid}\nNgid:\t0\nPid:\t{pid}\nPPid:\t{ppid}\nTracerPid:\t0\n\
+        "State:\t{state}\nTgid:\t{tgid}\nNgid:\t0\nPid:\t{pid}\nPPid:\t{ppid}\nTracerPid:\t{tracer}\n\
          Uid:\t0\t0\t0\t0\nGid:\t0\t0\t0\t0\nFDSize:\t256\nGroups:\t\nNStgid:\t{tgid}\nNSpid:\t{pid}\nNSpgid:\t{pgid}\nNSsid:\t{sid}\n\
          VmPeak:\t{peak:>8} kB\nVmSize:\t{virt:>8} kB\nVmLck:\t       0 kB\nVmPin:\t       0 kB\nVmHWM:\t{hwm:>8} kB\n\
          VmRSS:\t{rss:>8} kB\nRssAnon:\t{anon:>8} kB\nRssFile:\t{file:>8} kB\nRssShmem:\t{shmem:>8} kB\n\
@@ -253,6 +254,7 @@ pub fn pid_status(p: &Process, m: &Machine, l: &Linux) -> String {
         pid = p.pid,
         tgid = p.tgid,
         ppid = p.ppid,
+        tracer = p.tracer,
         pgid = p.pgid,
         sid = p.sid,
         peak = kb(p.virt_peak.max(p.virt_pages)),

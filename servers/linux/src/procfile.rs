@@ -8,11 +8,13 @@
 //! nothing was), so a file read in pieces is consistent, and a program that
 //! reads it again from the start (top, htop: `pread(fd, buf, n, 0)`) sees
 //! it current. A directory likewise: its entries are taken when it is read
-//! from the start. Files are read-only (open for writing: EACCES) but a
-//! process's oom_score_adj and oom_adj and, for a tree with the host grant,
-//! /proc/sys/vm's overcommit files (`procfs::may_write`): each write is one
-//! value (`procfs::write`) wherever the offset is, as Linux's for them, and
-//! `O_TRUNC` changes nothing there. The copies to the program are made with
+//! from the start. A process's `mem` is no snapshot: it reads and writes the
+//! process's memory at the position (`ptrace::mem_rw`, ADR 0019). Files are
+//! read-only (open for writing: EACCES) but a process's mem, its
+//! oom_score_adj and oom_adj and, for a tree with the host grant,
+//! /proc/sys/vm's overcommit files (`procfs::may_write`): each write to the
+//! latter is one value (`procfs::write`) wherever the offset is, as Linux's
+//! for them, and `O_TRUNC` changes nothing there. The copies to the program are made with
 //! no lock of the server held but the description's offset (which only its
 //! own calls take, never the pager).
 
@@ -45,6 +47,17 @@ pub struct ProcOpen {
     contents: Mutex<Option<Arc<Vec<u8>>>>,
     /// The entries (a directory) as of the last read from the start.
     entries: Mutex<Option<Arc<Vec<(String, u64, u8)>>>>,
+    /// /proc/<pid>/mem's: the kernel's handle on the address space the process had when
+    /// it was opened (`ptrace::mem_open`; 0 for other files).
+    space: u64,
+}
+
+impl Drop for ProcOpen {
+    fn drop(&mut self) {
+        if self.space != 0 {
+            crate::syscall(restricted::SYS_HANDLE_CLOSE, [self.space, 0, 0, 0, 0, 0]);
+        }
+    }
 }
 
 /// open(2) of a resolved node of /proc or /sys: a descriptor of the calling
@@ -69,7 +82,15 @@ pub fn open(node: ProcNode, flags: u32, path: String) -> Result<i64, i64> {
     // It must exist now (a process may have ended since the walk), and be
     // the caller's to open.
     procfs::may_open(&node)?;
-    let open = try_arc(ProcOpen { node, path, dir, offset: crate::sync::SleepMutex::new(0), contents: Mutex::new(None), entries: Mutex::new(None) })?;
+    // mem reads the address space the process has now, also after its exec (as Linux's).
+    let space = match &node {
+        ProcNode::Pid { pid: id, file: procfs::PidFile::Mem } | ProcNode::Task { tid: id, file: procfs::PidFile::Mem, .. } => {
+            crate::ptrace::mem_open(*id as crate::process::Pid).map_err(|e| if e == crate::process::ESRCH { crate::namespace::ENOENT } else { e })?
+        }
+        _ => 0,
+    };
+    let open = ProcOpen { node, path, dir, offset: crate::sync::SleepMutex::new(0), contents: Mutex::new(None), entries: Mutex::new(None), space };
+    let open = try_arc(open)?;
     let kept = flags & (O_ACCMODE | files::O_NONBLOCK | files::O_CLOEXEC);
     files::install(files::new_id(), File::Proc(open), kept)
 }
@@ -97,6 +118,11 @@ fn reopen(opened: &Opened, flags: u32) -> Result<i64, i64> {
 /// arguments after the descriptor).
 pub fn call(nr: u64, f: &ProcOpen, flags: u32, a1: u64, a2: u64, a3: u64) -> Result<i64, i64> {
     let readable = flags & O_ACCMODE != O_WRONLY;
+    if f.space != 0 {
+        if let Some(result) = f.mem_call(nr, readable, flags & O_ACCMODE != 0, a1, a2, a3) {
+            return result;
+        }
+    }
     match nr {
         files::SYS_READ | files::SYS_READV | files::SYS_PREAD64 | files::SYS_PREADV if !readable => Err(EBADF),
         files::SYS_READ | files::SYS_READV | files::SYS_PREAD64 | files::SYS_PREADV if f.dir => Err(EISDIR),
@@ -124,6 +150,40 @@ fn signed(offset: u64) -> Result<u64, i64> {
 }
 
 impl ProcOpen {
+    /// /proc/<pid>/mem's reads, writes and seeks (Linux's mem_rw and mem_lseek): at the
+    /// position, an address in the process, which may take any value; through the space
+    /// it was opened on (`ptrace::mem_rw`). None for the calls it shares with other files.
+    fn mem_call(&self, nr: u64, readable: bool, writable: bool, a1: u64, a2: u64, a3: u64) -> Option<Result<i64, i64>> {
+        let at_offset = |vecs: &[(u64, u64)], write: bool| -> Result<i64, i64> {
+            let mut off = self.offset.lock()?;
+            let n = crate::ptrace::mem_rw(self.space, *off, vecs, write)?;
+            *off = off.wrapping_add(n as u64);
+            Ok(n)
+        };
+        Some(match nr {
+            files::SYS_READ | files::SYS_READV | files::SYS_PREAD64 | files::SYS_PREADV if !readable => Err(EBADF),
+            files::SYS_WRITE | files::SYS_WRITEV | files::SYS_PWRITE64 | files::SYS_PWRITEV if !writable => Err(EBADF),
+            files::SYS_READ => at_offset(&[(a1, a2)], false),
+            files::SYS_WRITE => at_offset(&[(a1, a2)], true),
+            files::SYS_READV => files::iovecs(a1, a2).and_then(|v| at_offset(&v, false)),
+            files::SYS_WRITEV => files::iovecs(a1, a2).and_then(|v| at_offset(&v, true)),
+            files::SYS_PREAD64 => crate::ptrace::mem_rw(self.space, a3, &[(a1, a2)], false),
+            files::SYS_PWRITE64 => crate::ptrace::mem_rw(self.space, a3, &[(a1, a2)], true),
+            files::SYS_PREADV => files::iovecs(a1, a2).and_then(|v| crate::ptrace::mem_rw(self.space, a3, &v, false)),
+            files::SYS_PWRITEV => files::iovecs(a1, a2).and_then(|v| crate::ptrace::mem_rw(self.space, a3, &v, true)),
+            files::SYS_LSEEK => (|| {
+                let mut off = self.offset.lock()?;
+                *off = match a2 {
+                    0 => a1,
+                    1 => off.wrapping_add(a1),
+                    _ => return Err(EINVAL),
+                };
+                Ok(*off as i64)
+            })(),
+            _ => return None,
+        })
+    }
+
     /// The contents to read at `offset`: made now for a read from the
     /// start (or the first read), else those kept.
     fn snapshot(&self, offset: u64) -> Result<Arc<Vec<u8>>, i64> {

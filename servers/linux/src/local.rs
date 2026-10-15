@@ -52,6 +52,13 @@ pub const RESTORE_MASK: u32 = 1;
 /// The process must end (a failure past an execve's point of no return): the thread's loop
 /// ends it once the call returned (`exit_pending`), on a stack that holds nothing more.
 pub const EXIT_PENDING: u32 = 2;
+/// The thread's tracer asked for syscall stops (PTRACE_SYSCALL), for PTRACE_SYSEMU's, or
+/// single-steps it: its loop asks `ptrace` at a call's entry and end. Set by the thread
+/// itself when its tracer resumes it (`ptrace::stop`), from its trace record, which
+/// `ptrace` looks at again (a tracer gone since leaves a flag that finds no record).
+pub const TRACE_SYSCALL: u32 = 4;
+pub const TRACE_SYSEMU: u32 = 8;
+pub const TRACE_STEP: u32 = 16;
 
 /// Asks the thread's loop to end the process with `status` once the current call returned.
 pub fn exit_pending(status: i32) {

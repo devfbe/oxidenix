@@ -117,6 +117,10 @@ fn statm_status_and_counters() {
     assert!(full.contains("\nVmPeak:\t    1600 kB\n") && full.contains("\nVmHWM:\t      80 kB\n") && full.contains("\nNSpid:\t42\n"));
     assert!(full.contains("\nCapEff:\t000001ffffffffff\n") && full.contains("\nCapInh:\t0000000000000000\n"));
     assert!(status.contains("\nPid:\t42\n") && status.contains("\nTgid:\t42\n") && status.contains("\nPPid:\t1\n"));
+    assert!(status.contains("\nPPid:\t1\nTracerPid:\t0\n"));
+    // A ptrace stop, and its tracer's process id.
+    let traced = pid_status(&Process { state: STATE_TRACED as u64, tracer: 7, ..p }, &m, &Linux::default());
+    assert!(traced.contains("\nState:\tt (tracing stop)\n") && traced.contains("\nTracerPid:\t7\n"));
     assert!(status.contains("\nThreads:\t3\n") && status.contains("\nVmRSS:\t      40 kB\n"));
     assert!(status.contains("\nCpus_allowed_list:\t0-1\n"));
     // Resident pages by kind, the areas by kind, the page tables: Linux's order.

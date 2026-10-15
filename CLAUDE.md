@@ -104,7 +104,9 @@ An AI research project; see README.md.
     `procfs.rs`/`procfile.rs` (`/proc` and `/sys`: procfs's files over the rings, the
     per-process part and the magic links), `inotify.rs`, `timer.rs`/`timerfd.rs` (interval
     and POSIX timers, timerfds; timers on CPU clocks over the kernel's CPU-time alarms,
-    `kernel/src/process/cputimer.rs`), `pidfd.rs`, `vdso.rs` (maps the vDSO, whose source is
+    `kernel/src/process/cputimer.rs`), `pidfd.rs`, `ptrace.rs` (ptrace, `process_vm_readv`,
+    `/proc/<pid>/mem` over the kernel's `vm_access`; hardware breakpoints
+    `kernel/src/process/debugreg.rs`: ADR 0019), `vdso.rs` (maps the vDSO, whose source is
     `servers/linux/vdso/`, built by `servers/linux/build.rs`, reading the kernel's clock page
     `crates/clockpage`: ADR 0014).
   - Node.js: `userspace/node` (build, smoke tests `tests/*.test.mjs`, runner `run-node.sh`).
