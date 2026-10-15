@@ -8,7 +8,11 @@
 //! server (whose copies to program memory would hit a data breakpoint), the kernel nor
 //! another thread ever runs with them; a CPU knows whether its DR7 is armed (`Cpu::dr7_live`)
 //! and disarms it before anything else runs there. DR6 is read and reset at each debug
-//! exception (`take_dr6`), for the server's SIGTRAP.
+//! exception (`take_dr6`), for the server's SIGTRAP. The kernel itself runs with them armed
+//! only on its way into the program and when interrupted from it, where it touches no
+//! program memory; a #DB it still takes in ring 0 (a breakpoint `mov ss` held off over a
+//! kernel entry, CVE-2018-8897) comes on its own stack and is only acknowledged
+//! (`interrupts::entry::debug_entry`, `handlers::debug_kernel`).
 
 use super::address_space::USER_END;
 use super::errno::EINVAL;

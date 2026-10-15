@@ -572,6 +572,121 @@ static int hw_body(void) {
     return target_fn(one) == 42 ? 0 : 1;
 }
 
+/* CVE-2018-8897: a debug exception `mov ss` holds off over the next instruction comes at
+ * the first instruction of the kernel's entry that instruction makes (still on the user's
+ * stack, with the user's GS). A watchpoint on the value loaded into SS, then `syscall`,
+ * `int3` and `int $0x80` (no such gate here: #GP) right after the load; and a single step
+ * over `mov ss` and `syscall`. The kernel survives, the tracee goes on as on Linux. */
+static volatile unsigned short ss_value __attribute__((aligned(8)));
+extern char int80_at[], movss_step[], movss_after[];
+
+static int movss_body(void) {
+    __asm__ volatile("mov %%ss, %0" : "=m"(ss_value));
+    long r;
+    __asm__ volatile("mov $39, %%eax\n mov %1, %%ss\n syscall" : "=a"(r) : "m"(ss_value) : "rcx", "r11", "memory");
+    if (r != getpid()) return 1;
+    __asm__ volatile("mov %0, %%ss\n int3" ::"m"(ss_value) : "memory");
+    __asm__ volatile("mov %0, %%ss\n .globl int80_at\n int80_at: int $0x80" ::"m"(ss_value) : "memory");
+    return 0;
+}
+
+__attribute__((noinline)) static int movss_step_body(void) {
+    long r;
+    __asm__ volatile("mov %%ss, %0" : "=m"(ss_value));
+    __asm__ volatile("int3\n mov $39, %%eax\n .globl movss_step\n movss_step: mov %1, %%ss\n syscall\n .globl movss_after\n movss_after: nop"
+                     : "=a"(r)
+                     : "m"(ss_value)
+                     : "rcx", "r11", "memory");
+    return r == getpid() ? 0 : 1;
+}
+
+static void mov_ss(void) {
+    pid_t pid = traced_child(movss_body);
+    long dr = offsetof(struct user, u_debugreg);
+    /* DR0: a 2-byte read-write watchpoint on ss_value. */
+    ptrace(PTRACE_POKEUSER, pid, dr, (void *)&ss_value);
+    long a = ptrace(PTRACE_POKEUSER, pid, dr + 7 * 8, (void *)(1ul | (3ul << 16) | (1ul << 18)));
+    ptrace(PTRACE_CONT, pid, 0, 0);
+    int st, watch_hits = 0, int3s = 0, segvs = 0, final = -1;
+    for (;;) {
+        if (wait_for(pid, &st, 0) != pid) break;
+        if (WIFEXITED(st)) {
+            final = WEXITSTATUS(st);
+            break;
+        }
+        if (WIFSIGNALED(st)) {
+            final = 128 + WTERMSIG(st);
+            break;
+        }
+        siginfo_t si;
+        memset(&si, 0, sizeof si);
+        ptrace(PTRACE_GETSIGINFO, pid, 0, &si);
+        if (stopped_with(st, SIGTRAP) && si.si_code == TRAP_HWBKPT) watch_hits++;
+        if (stopped_with(st, SIGTRAP) && si.si_code == SI_KERNEL) int3s++;
+        if (stopped_with(st, SIGSEGV)) {
+            struct user_regs_struct regs;
+            ptrace(PTRACE_GETREGS, pid, 0, &regs);
+            if (regs.rip == (unsigned long)int80_at) {
+                regs.rip += 2;
+                ptrace(PTRACE_SETREGS, pid, 0, &regs);
+                segvs++;
+            }
+        }
+        ptrace(PTRACE_CONT, pid, 0, 0);
+    }
+    check("mov ss from a watched value, then syscall/int3/int $0x80: the kernel survives", a == 0 && final == 0 && watch_hits >= 1 && int3s == 1 && segvs == 1);
+
+    pid = traced_child(movss_step_body);
+    ptrace(PTRACE_CONT, pid, 0, 0);
+    wait_for(pid, &st, 0);
+    ptrace(PTRACE_SINGLESTEP, pid, 0, 0);
+    wait_for(pid, &st, 0);
+    struct user_regs_struct regs;
+    ptrace(PTRACE_GETREGS, pid, 0, &regs);
+    int at_movss = regs.rip == (unsigned long)movss_step;
+    ptrace(PTRACE_SINGLESTEP, pid, 0, 0);
+    wait_for(pid, &st, 0);
+    siginfo_t si;
+    memset(&si, 0, sizeof si);
+    ptrace(PTRACE_GETSIGINFO, pid, 0, &si);
+    ptrace(PTRACE_GETREGS, pid, 0, &regs);
+    if (!(at_movss && stopped_with(st, SIGTRAP) && regs.rip == (unsigned long)movss_after && (long)regs.rax == pid))
+        printf("  at_movss %d status %#x code %d rip %#lx after %p rax %ld\n", at_movss, st, si.si_code, regs.rip, (void *)movss_after, (long)regs.rax);
+    check("a single step over mov ss and syscall: reported after the call", at_movss && stopped_with(st, SIGTRAP) && regs.rip == (unsigned long)movss_after && (long)regs.rax == pid);
+    check("the stepped tracee runs on", finish(pid) == 0);
+}
+
+/* A watchpoint on a buffer read(2) fills: the server's copy into it does not trigger it
+ * (the program's breakpoints are armed only while it runs), the program's own store does. */
+static char read_buf[8] __attribute__((aligned(8)));
+
+static int read_body(void) {
+    int fds[2];
+    if (pipe(fds) < 0 || write(fds[1], "abcdefgh", 8) != 8) return 2;
+    if (read(fds[0], read_buf, 8) != 8 || memcmp(read_buf, "abcdefgh", 8) != 0) return 1;
+    read_buf[0] = 'x';
+    return 0;
+}
+
+static void read_watch(void) {
+    pid_t pid = traced_child(read_body);
+    long dr = offsetof(struct user, u_debugreg);
+    ptrace(PTRACE_POKEUSER, pid, dr, (void *)read_buf);
+    ptrace(PTRACE_POKEUSER, pid, dr + 7 * 8, (void *)(1ul | (1ul << 16) | (2ul << 18)));
+    ptrace(PTRACE_CONT, pid, 0, 0);
+    int st, hits = 0, final = -1;
+    for (;;) {
+        if (wait_for(pid, &st, 0) != pid) break;
+        if (WIFEXITED(st) || WIFSIGNALED(st)) {
+            final = WIFEXITED(st) ? WEXITSTATUS(st) : 128 + WTERMSIG(st);
+            break;
+        }
+        hits += stopped_with(st, SIGTRAP);
+        ptrace(PTRACE_CONT, pid, 0, 0);
+    }
+    check("a watched read(2) buffer: the server's copy passes, the program's store hits", final == 0 && hits == 1);
+}
+
 static void hw_breakpoints(void) {
     pid_t pid = traced_child(hw_body);
     long dr = offsetof(struct user, u_debugreg);
@@ -602,6 +717,8 @@ static void hw_breakpoints(void) {
     dr6 = ptrace(PTRACE_PEEKUSER, pid, dr + 6 * 8, 0);
     check("an instruction breakpoint: SIGTRAP before the instruction, DR6 slot 1", stopped_with(st, SIGTRAP) && regs.rip == (unsigned long)target_fn && (dr6 & 0xf) == 2);
     check("resumed past it (RF): the call runs and the tracee exits", finish(pid) == 0);
+    mov_ss();
+    read_watch();
 }
 
 /* ------------------------------------------------------------------ events */

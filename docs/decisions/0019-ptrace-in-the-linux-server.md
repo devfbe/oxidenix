@@ -95,7 +95,19 @@ shaped the design:
    (`kernel/src/process/debugreg.rs`). A debug exception hands the server DR6 (in
    `State::trap_error`; `SIGTRAP` with `TRAP_HWBKPT`, and the tracer's view of DR6), and the
    kernel sets RF for an instruction breakpoint's hit so that the instruction runs on
-   resume. *Alternative:* `EIO` for debug registers, as a kernel without
+   resume. **A #DB in ring 0 is safe in any state** (CVE-2018-8897): a data breakpoint or
+   single step that `mov ss`/`pop ss` holds off over the next instruction is delivered at
+   the first instruction of the kernel entry that instruction makes (`syscall`, `int3`, a
+   fault), still on the user's stack and with the user's GS. So #DB has its own IST stack
+   and entry (`entry::debug_entry`): from ring 3 it moves to the task's kernel stack and
+   goes the common way; from ring 0 it takes GS by IA32_GS_BASE (the user cannot set a
+   kernel address there: FSGSBASE is off), acknowledges the exception (DR6 cleared, TF
+   taken off the kernel's flags, the program's breakpoints disarmed until it is entered
+   again) and never signals anyone. `syscall` masks TF, DF, AC and NT. Breakpoint addresses
+   end below 64 TiB (never the server's region or the kernel), DR7 reaches the CPU only as
+   the kernel builds it (local enables, RW, LEN; never GD; I/O breakpoints refused; other
+   bits a tracer pokes are ignored, as Linux's `ptrace_write_dr7` masks them).
+   *Alternative:* `EIO` for debug registers, as a kernel without
    `CONFIG_HAVE_HW_BREAKPOINT`: gdb's watchpoints would be software ones (a single step per
    instruction); the per-thread switch costs nothing for threads without breakpoints (one
    flag test per switch).
@@ -132,7 +144,8 @@ stop only if its tracer is in another process) are the server's signal code's
   access to `PROT_NONE` mappings (Linux reads them; here `EIO`/`EFAULT`); the real
   parent's notice of a process end waits for the tracer's reaping of a traced main thread
   but not of other traced threads (Linux waits for all); hardware breakpoints are cleared
-  at detach (Linux keeps them until exec or exit); a watchpoint the kernel itself touches
-  between the program and its server is not reported; core files.
+  at detach (Linux keeps them until exec or exit); a watchpoint on memory the server or the
+  kernel touches for the program (a read(2) buffer) does not fire (Linux's kernel accesses
+  record it in the tracer's DR6 without a signal); core files.
 - Credentials (`docs/todo.md`, "Credentials"): Yama, `PTRACE_MODE_*` by uid, the dumpable
   flag's effect on access are not modeled: everyone in a tree is root.

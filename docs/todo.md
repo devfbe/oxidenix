@@ -38,8 +38,9 @@ done, delete it here in the same commit.
   access to `PROT_NONE` mappings (Linux reads and writes them; here `EIO`/`EFAULT`); a
   real parent learns of a process's end once its tracer reaped the traced main thread, but
   not after the other traced threads (Linux waits for all); hardware breakpoints are cleared
-  at detach (Linux keeps them until exec or exit); a watchpoint the kernel itself touches
-  between the program and its server is not reported.
+  at detach (Linux keeps them until exec or exit); a watchpoint on memory the server or the
+  kernel touches for the program (a read(2) buffer) leaves no mark in the tracer's DR6
+  (Linux records it there, without a signal).
   `/proc/<pid>/maps` names the program file, the vDSO, the stack and the heap, but not other
   mapped files (it would need the server to know which file each mapped object is); no
   `smaps`.

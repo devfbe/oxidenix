@@ -64,9 +64,14 @@ pub fn init() {
     Star::write(gdt::user_code(), gdt::user_data(), gdt::kernel_code(), gdt::kernel_data())
         .expect("GDT layout does not match syscall/sysret");
     LStar::write(VirtAddr::new(syscall_entry as *const () as u64));
-    // Clear IF on entry; `syscall_entry` enables interrupts once it is on
-    // the kernel stack.
-    SFMask::write(RFlags::INTERRUPT_FLAG | RFlags::DIRECTION_FLAG | RFlags::TRAP_FLAG);
+    // Clear IF on entry (`syscall_entry` enables interrupts once it is on the
+    // kernel stack), and what of the user's flags the kernel must not run with
+    // (as Linux's): TF (a single step; one a `mov ss` held off over the
+    // `syscall` comes as a #DB at its first instruction, `entry::debug_entry`),
+    // DF, AC and NT.
+    SFMask::write(
+        RFlags::INTERRUPT_FLAG | RFlags::DIRECTION_FLAG | RFlags::TRAP_FLAG | RFlags::ALIGNMENT_CHECK | RFlags::NESTED_TASK,
+    );
     unsafe { Efer::update(|f| *f |= EferFlags::SYSTEM_CALL_EXTENSIONS) };
 }
 
