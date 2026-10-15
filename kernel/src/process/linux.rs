@@ -230,7 +230,9 @@ fn zeroed_frame() -> Result<PhysFrame, i64> {
 /// the instance's own (no other tree can take it) and counted as committed
 /// for everyone (the commit guarantee holds); commits beyond it are
 /// ordinary ones. It is had when there is room (never at the cost of a
-/// tree's start or of another commit) and all instances' together are at
+/// tree's start or of another commit); what a commit used of it stays owed
+/// to it, kept from every other commit until the instance takes it back
+/// (`memory::commit_owed`), and all instances' together are at
 /// most `HEAP_POOL_SHARE` of user memory (`pageheap::charge`, whose
 /// arithmetic is host-tested).
 const HEAP_RESERVE: u64 = 512;
@@ -241,14 +243,21 @@ static HEAP_POOL: pageheap::charge::Pool = pageheap::charge::Pool::new();
 pub struct HeapArea {
     /// Its mapped pages and its reserve: what it holds of the commit limit.
     charge: pageheap::charge::Charge,
+    /// The reserve pages owed to it as the commit account counts them
+    /// (`memory::set_owed`): always `charge.owed()` once a change of the
+    /// charge is through (`sync_owed`).
+    owed: u64,
     /// A refused commit or a broken account was logged (once per instance).
     refused_told: bool,
 }
 
 impl HeapArea {
     /// Tops the reserve up as far as the pool and the commit limit allow
-    /// now (failing nothing).
+    /// now (failing nothing): first with the pages owed to it, which no
+    /// other commit could take, then with new ones where there is room.
     fn grow_reserve(&mut self) {
+        let back = memory::commit_owed(&mut self.owed, self.charge.owed());
+        self.charge.repay(back);
         HEAP_POOL.set_max(memory::user_pages() / HEAP_POOL_SHARE);
         let want = HEAP_POOL.take(self.charge.deficit(HEAP_RESERVE));
         if want == 0 {
@@ -259,6 +268,46 @@ impl HeapArea {
         let got = memory::commit_some(want);
         HEAP_POOL.give(want - got);
         self.charge.grow_reserve(got, HEAP_RESERVE);
+    }
+
+    /// The commit account learns what the charge owes its reserve now.
+    fn sync_owed(&mut self) {
+        memory::set_owed(&mut self.owed, self.charge.owed());
+    }
+
+    /// `Charge::begin`, the pages it takes of the reserve owed from then on.
+    fn begin(&mut self, missing: u64, use_reserve: bool) -> pageheap::charge::Plan {
+        let plan = self.charge.begin(missing, use_reserve);
+        self.sync_owed();
+        plan
+    }
+
+    /// `Charge::abort`: the pages to uncommit.
+    fn abort(&mut self, plan: pageheap::charge::Plan) -> u64 {
+        let back = self.charge.abort(plan, &HEAP_POOL, HEAP_RESERVE);
+        self.sync_owed();
+        back
+    }
+
+    /// `Charge::end`: the pages to uncommit.
+    fn end(&mut self, plan: pageheap::charge::Plan, done: u64) -> u64 {
+        let back = self.charge.end(plan, done, &HEAP_POOL, HEAP_RESERVE);
+        self.sync_owed();
+        back
+    }
+
+    /// `Charge::unmapped`: the pages to uncommit.
+    fn unmapped(&mut self, gone: u64) -> Result<u64, pageheap::charge::Error> {
+        let back = self.charge.unmapped(gone, &HEAP_POOL, HEAP_RESERVE);
+        self.sync_owed();
+        back
+    }
+
+    /// The instance goes: nothing is owed to it any more; the pages to
+    /// uncommit.
+    fn close(&mut self) -> u64 {
+        memory::set_owed(&mut self.owed, 0);
+        self.charge.close(&HEAP_POOL)
     }
 }
 
@@ -548,7 +597,7 @@ impl Instance {
                 announced: 0,
             }),
             programs: core::sync::atomic::AtomicUsize::new(0),
-            heap: crate::sync::Mutex::new(HeapArea { charge: pageheap::charge::Charge::new(), refused_told: false }),
+            heap: crate::sync::Mutex::new(HeapArea { charge: pageheap::charge::Charge::new(), owed: 0, refused_told: false }),
             shrink: core::sync::atomic::AtomicU64::new(0),
             shrunk_at: core::sync::atomic::AtomicU64::new(0),
             cache_counts,
@@ -847,7 +896,15 @@ impl Instance {
         // reserve covers (commitment it holds without frames): a commit
         // beyond it, which an overcommitting mode grants at will, never
         // reaches the kernel's reserve.
-        let mut emergency = if use_reserve { self.heap.lock().charge.reserve() } else { 0 };
+        // (The reserve topped up first with what is owed to it: pages a
+        // burst used, which no other commit could take since.)
+        let mut emergency = if use_reserve {
+            let mut area = self.heap.lock();
+            area.grow_reserve();
+            area.charge.reserve()
+        } else {
+            0
+        };
         for slot in frames.iter_mut().take(want) {
             let may = emergency > 0;
             match heap_frame(may) {
@@ -872,9 +929,10 @@ impl Instance {
         }
         // From the instance's own reserve first (committed already, unless
         // the server may fail the allocation), the rest as any commitment.
-        let plan = area.charge.begin(missing, &HEAP_POOL, use_reserve);
+        let plan = area.begin(missing, use_reserve);
         if plan.fresh > 0 && !memory::commit(plan.fresh) {
-            memory::uncommit(area.charge.abort(plan, &HEAP_POOL, HEAP_RESERVE));
+            let back = area.abort(plan);
+            memory::uncommit(back);
             // Said once per instance (a tree can make it happen at will).
             let tell = !core::mem::replace(&mut area.refused_told, true);
             drop(area);
@@ -909,7 +967,8 @@ impl Instance {
             }
             done += 1;
         }
-        memory::uncommit(area.charge.end(plan, done, &HEAP_POOL, HEAP_RESERVE));
+        let back = area.end(plan, done);
+        memory::uncommit(back);
         if result.is_ok() {
             area.grow_reserve();
         }
@@ -952,7 +1011,7 @@ impl Instance {
         // The heap area is mapped only by `commit_heap`, which counts each
         // page: more cannot go than it counted. Were the account broken,
         // the commitment stays held (never refunded twice).
-        match area.charge.unmapped(gone, &HEAP_POOL, HEAP_RESERVE) {
+        match area.unmapped(gone) {
             Ok(back) => memory::uncommit(back),
             Err(_) => {
                 if !core::mem::replace(&mut area.refused_told, true) {
@@ -1371,7 +1430,7 @@ impl Drop for Instance {
     fn drop(&mut self) {
         crate::drivers::console_device::release(self.id);
         crate::klog::forget(self.id);
-        memory::uncommit(self.heap.get_mut().charge.close(&HEAP_POOL));
+        memory::uncommit(self.heap.get_mut().close());
         memory::with_frames(|frames| unsafe {
             free_level(frames, self.pdpt, 3);
             frames.deallocate_frame(self.view);

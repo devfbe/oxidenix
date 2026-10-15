@@ -434,7 +434,8 @@ About 13,100 lines of Rust (without comments and blank lines) in the kernel (16,
   allocations that cannot reclaim themselves.
   Each Linux server instance holds up to 2 MiB of commitment for its heap beyond what is mapped
   there when there is room (its own reserve, all together at most a 16th of user memory: a server
-  cannot fail most of its allocations but by breaking its instance). What a program's call makes
+  cannot fail most of its allocations but by breaking its instance); what a burst used of it stays
+  owed to it, the first pages to come free anywhere, so the next burst finds it whole. What a program's call makes
   the server hold, in amounts the program drives (socket queues, pipes, directory listings,
   watches, copies of arguments), is allocated fallibly and answered with `ENOMEM` (`ENOBUFS`
   for a send), committed against the limit only, never from that reserve.

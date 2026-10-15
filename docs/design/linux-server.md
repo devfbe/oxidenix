@@ -221,14 +221,20 @@ a heap commit takes from it first and is an ordinary commit (counting dirty and 
 only beyond it; a decommit, or a commit's pages that could not be mapped, refill it before
 commitment is returned. The reserve is had only when there is room: a tree whose instance is
 made near the limit starts with less or none (never refused for it), and it is topped up after
-each successful commit as far as there is room then. All instances' reserves together are at
+each successful commit as far as there is room then. Reserve pages a commit used stay **owed**
+to it: the commit account keeps them from every other commit (as if committed), so the first
+pages that come free anywhere are the reserve's, and the instance takes them back before its
+next commit that may use the reserve. (Refilling only at its own commits once left the reserve
+empty for the next burst: nomemtest's second run in a row filled memory before the server
+committed anything, and an allocation the server cannot fail broke the instance.) All
+instances' reserves together are at
 most a 16th of user memory (a pool), so many trees cannot crowd out programs with them. When
 memory is overcommitted (ADR 0013) a commitment is no frame: a commit from the reserve (the
 allocations the server cannot fail) may then take frames of the kernel's reserve, until the
 OOM killer made room.
 The account (`pageheap::charge`: `Charge`, `Pool`) is pure arithmetic, host-tested over random
 operations: an instance holds exactly its mapped pages plus its reserve, the pool's count is
-the sum of the reserves, no refund exceeds what was charged (an unmap of more pages than are
+the sum of the reserves and of what is owed to them, no refund exceeds what was charged (an unmap of more pages than are
 mapped is refused; the heap area is mapped only by `shared_commit`), and closing the instance
 returns all of it. The commit guarantee holds: the reserve counts as committed for everyone. A
 heap commit refused beyond the reserve is logged once per instance (a tree can cause it at

@@ -305,9 +305,22 @@ pub fn phys_to_virt(addr: u64) -> *mut u8 {
 struct Account {
     committed: u64,
     cached: u64,
+    /// Pages owed to the Linux servers' heap reserves (`pageheap::charge`:
+    /// reserve pages a commit used): not committed, but kept from every
+    /// other commit, so the reserves get the first pages that come free
+    /// (`commit_owed`).
+    owed: u64,
 }
 
-static ACCOUNT: IrqSpinLock<Account> = IrqSpinLock::new(Account { committed: 0, cached: 0 });
+impl Account {
+    /// What no ordinary commit may take: the committed pages and those
+    /// owed to the reserves.
+    fn promised(&self) -> u64 {
+        self.committed.saturating_add(self.owed)
+    }
+}
+
+static ACCOUNT: IrqSpinLock<Account> = IrqSpinLock::new(Account { committed: 0, cached: 0, owed: 0 });
 /// The frames user memory may have: all usable ones but the kernel's
 /// reserve, less what the kernel heap took since (it never gives frames
 /// back). The base of the commit limit and of what is scaled by memory
@@ -430,7 +443,7 @@ pub fn commit(pages: u64) -> bool {
             // than crowd out what was promised, `fs::cache::balance_dirty`).
             let unavailable = crate::fs::cache::unavailable_pages();
             let mut a = ACCOUNT.lock();
-            if a.committed.saturating_add(pages).saturating_add(unavailable) <= commit_limit() {
+            if a.promised().saturating_add(pages).saturating_add(unavailable) <= commit_limit() {
                 a.committed += pages;
                 return true;
             }
@@ -458,8 +471,37 @@ pub fn commit_some(max: u64) -> u64 {
     }
     let unavailable = crate::fs::cache::unavailable_pages();
     let mut a = ACCOUNT.lock();
-    let n = commit_limit().saturating_sub(a.committed.saturating_add(unavailable)).min(max);
+    let n = commit_limit().saturating_sub(a.promised().saturating_add(unavailable)).min(max);
     a.committed += n;
+    n
+}
+
+/// Pages now owed to a heap reserve: `owed` (the caller's count, which the
+/// account holds) becomes `now`. Owed pages are kept from every other
+/// commit until the reserve takes them back (`commit_owed`) or no longer
+/// wants them.
+pub fn set_owed(owed: &mut u64, now: u64) {
+    let mut a = ACCOUNT.lock();
+    a.owed = a.owed - *owed + now;
+    *owed = now;
+}
+
+/// Commits up to `max` of the `*owed` pages owed to the caller's reserve,
+/// as far as the limit allows them without the pages owed to the others
+/// (all of them unless strict); how many. They are no longer owed.
+pub fn commit_owed(owed: &mut u64, max: u64) -> u64 {
+    let max = max.min(*owed);
+    let unavailable = if overcommit::strict() { crate::fs::cache::unavailable_pages() } else { 0 };
+    let mut a = ACCOUNT.lock();
+    let n = if overcommit::strict() {
+        let others = a.committed.saturating_add(a.owed - *owed).saturating_add(unavailable);
+        commit_limit().saturating_sub(others).min(max)
+    } else {
+        max
+    };
+    a.committed += n;
+    a.owed -= n;
+    *owed -= n;
     n
 }
 
@@ -532,9 +574,10 @@ pub fn cache_uncharge(pages: u64) {
     ACCOUNT.lock().cached -= pages;
 }
 
-/// (committed, limit) in pages.
+/// (promised, limit) in pages: what is committed and what is owed to the
+/// heap reserves (`set_owed`), which no ordinary commit may take either.
 pub fn commit_stats() -> (u64, u64) {
-    (ACCOUNT.lock().committed, commit_limit())
+    (ACCOUNT.lock().promised(), commit_limit())
 }
 
 /// Pages of the file cache (disk files').
