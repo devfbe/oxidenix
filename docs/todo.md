@@ -46,7 +46,12 @@ done, delete it here in the same commit.
 - Network: IPv6, `MSG_OOB`, `SO_LINGER` with a non-zero time does not block `close`,
   `SO_REUSEPORT` is stored but unused, netlink multicast is never delivered, raw ICMP is shared
   between instances (documented in ADR 0008).
-- Dynamic linking with glibc is untested (the ELF loader handles `PT_INTERP`).
+- `rseq` is `ENOSYS` (ADR 0021: glibc goes on without it). A real one needs the kernel to
+  update the registered area's CPU number and abort a critical section on every return to
+  user mode after a preemption or migration, and the server on signal delivery.
+- Dynamically linked programs (ADR 0021) need their store paths on `/data/nix/store`; nothing
+  in the guest installs a Nix closure there, and the builder's copies of earlier nixpkgs pins
+  stay on the persistent `disk.img` (no garbage collection).
 
 ## Real hardware
 

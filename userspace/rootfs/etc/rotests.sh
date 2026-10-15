@@ -27,6 +27,11 @@ else
     fail "/data/rotest/hello: $status '$out'"
 fi
 if timeout 10 sync; then echo "PASS sync"; else fail sync; fi
+# Dynamically linked programs with their interpreter and libraries on the
+# read-only disk (/nix/store, ADR 0021).
+for t in dyntest dynmusl; do
+    if out=$(timeout 60 $t 2>&1); then echo "PASS $t from a read-only store"; else echo "$out"; fail "$t from a read-only store"; fi
+done
 
 echo "=== summary: $failed failed"
 [ "$failed" -eq 0 ]

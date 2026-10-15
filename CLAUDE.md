@@ -121,7 +121,9 @@ An AI research project; see README.md.
     `servers/netd` + `crates/netring`, `servers/procfs` + `crates/procproto` (+ `crates/fsring`,
     the same file protocol, read-only); I/O rings `crates/ring`, `docs/design/io-rings.md`.
   - Tests: C programs in `userspace/*.c` (built by `userspace/build.sh`), run by the list in
-    `userspace/rootfs/etc/runtests.sh`; benchmarks `userspace/iobench.c`, `scripts/bench.sh`,
+    `userspace/rootfs/etc/runtests.sh`; dynamically linked ones (glibc, musl's loader, C++) in
+    `userspace/dynamic/` (built by its `default.nix`; the builder puts the store files they
+    need on the data disk, `/nix` links to `/data/nix`: ADR 0021); benchmarks `userspace/iobench.c`, `scripts/bench.sh`,
     `docs/benchmarks/README.md`. Decisions: `docs/decisions/`.
 
 ## Engineering standard

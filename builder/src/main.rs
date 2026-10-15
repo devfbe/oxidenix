@@ -90,6 +90,11 @@ fn main() {
     let rootfs = artifact("rootfs");
     println!("Building root filesystem...");
     build_rootfs(&rootfs).expect("Failed to build root filesystem");
+    // The dynamically linked programs: in /bin, their store paths on the data
+    // disk (below).
+    println!("Building the dynamically linked programs...");
+    let dynamic = dynamic_programs();
+    install_dynamic(&rootfs, &dynamic).expect("Failed to put the dynamic programs in the root filesystem");
     // With Node.js, its smoke tests (userspace/node/tests, run by
     // userspace/node/run-node.sh) go along, as /usr/lib/node-tests.
     if std::env::var_os("OXIDENIX_NODE").is_some_and(|v| !v.is_empty()) {
@@ -142,15 +147,19 @@ fn main() {
     }
     // OXIDENIX_NODE=1 (or the path of a static node binary): Node.js on the
     // data disk as /bin/node (/data/bin/node in oxidenix).
+    // The store paths of the dynamic programs (/nix/store, /data/nix/store in
+    // oxidenix).
+    let mut files = store_files(&dynamic).expect("Failed to list the dynamic programs' store paths");
     if let Some(node) = node_binary() {
         println!("Installing {} as /bin/node on {}...", node.display(), data_disk.display());
-        install_on_disk(&data_disk, &node, "bin/node").expect("Failed to put node on the data disk");
+        files.push(Install { src: node, dest: "bin/node".into(), mode: 0o755 });
     }
     // The self-tests' read-only boot reads a file the builder put on the
     // disk (/data/rotest/hello, a copy of /bin/hello).
     if self_tests {
-        install_on_disk(&data_disk, &rootfs.join("bin/hello"), "rotest/hello").expect("Failed to put rotest/hello on the data disk");
+        files.push(Install { src: rootfs.join("bin/hello"), dest: "rotest/hello".into(), mode: 0o755 });
     }
+    install_on_disk(&data_disk, &files).expect("Failed to put the files on the data disk");
 
     // Most of a debug build is DWARF debug information the kernel never
     // uses, and the BIOS bootloader copies the whole ELF through real-mode
@@ -557,54 +566,157 @@ fn same_contents(a: &Path, b: &Path) -> io::Result<bool> {
     }
 }
 
-/// Puts the host file `src` on the ext2 image `disk` as `dest` (relative to
-/// its root, in an existing or new directory), mode 0755 and owned by root,
-/// replacing an older version; nothing if the disk has these contents there
-/// already. debugfs edits the image in place, so the rest of the persistent
-/// disk stays as it is. Afterwards the file is read back and compared.
-fn install_on_disk(disk: &Path, src: &Path, dest: &str) -> io::Result<()> {
-    // `dest` goes into debugfs's commands: a plain relative path only.
-    assert!(
-        !dest.is_empty() && dest.split('/').all(|c| !c.is_empty() && c != ".." && c.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))),
-        "install_on_disk: unusual destination {dest}"
-    );
+/// A file for `install_on_disk`: the host file, where it goes on the disk
+/// (relative to its root) and its permission bits.
+struct Install {
+    src: PathBuf,
+    dest: String,
+    mode: u32,
+}
+
+/// Puts the host files `files` on the ext2 image `disk` (each in an existing
+/// or new directory, owned by root), replacing older versions; a file the
+/// disk has with these contents already stays as it is. debugfs edits the
+/// image in place, so the rest of the persistent disk stays as it is.
+/// Afterwards every file written is read back and compared. Three debugfs
+/// runs however many files: one reads the disk's versions, one writes what
+/// differs, one reads that back.
+fn install_on_disk(disk: &Path, files: &[Install]) -> io::Result<()> {
+    for f in files {
+        // `dest` goes into debugfs's commands: a plain relative path only.
+        let dest = &f.dest;
+        assert!(
+            !dest.is_empty() && dest.split('/').all(|c| !c.is_empty() && c != ".." && c.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-+".contains(&b))),
+            "install_on_disk: unusual destination {dest}"
+        );
+    }
     let work = disk.with_extension("install");
     let _ = fs::remove_dir_all(&work);
     fs::create_dir_all(&work)?;
-    let result = install_in(&work, disk, &fs::canonicalize(src)?, dest);
+    let result = install_in(&work, disk, files);
     let _ = fs::remove_dir_all(&work);
     result
 }
 
-fn install_in(work: &Path, disk: &Path, src: &Path, dest: &str) -> io::Result<()> {
-    // debugfs reads the source as `new` and dumps the disk's file as `old`.
-    std::os::unix::fs::symlink(src, work.join("new"))?;
-    let dump = format!("dump /{dest} old");
-    debugfs(work, disk, &["-R", &dump])?;
-    if work.join("old").exists() && same_contents(&work.join("old"), src)? {
-        println!("/{dest} on {} is up to date", disk.display());
+fn install_in(work: &Path, disk: &Path, files: &[Install]) -> io::Result<()> {
+    // debugfs reads source i as `new<i>` and dumps the disk's version as
+    // `old<i>`, then what it wrote as `check<i>` (names of its own, in `work`).
+    let mut dumps = String::new();
+    for (i, f) in files.iter().enumerate() {
+        std::os::unix::fs::symlink(fs::canonicalize(&f.src)?, work.join(format!("new{i}")))?;
+        dumps += &format!("dump /{} old{i}\n", f.dest);
+    }
+    fs::write(work.join("dumps"), dumps)?;
+    debugfs(work, disk, &["-f", "dumps"])?;
+    let mut changed = Vec::new();
+    for (i, f) in files.iter().enumerate() {
+        let old = work.join(format!("old{i}"));
+        if !(old.exists() && same_contents(&old, &f.src)?) {
+            changed.push(i);
+        }
+    }
+    println!("{} of {} files to write on {}", changed.len(), files.len(), disk.display());
+    if changed.is_empty() {
         return Ok(());
     }
-    let mut script = String::new();
     // debugfs goes on after a failing command: the directories that exist
-    // already and a missing old version are no errors here.
-    let mut dir = String::new();
-    for part in dest.split('/').take(dest.matches('/').count()) {
-        dir = format!("{dir}/{part}");
-        script += &format!("mkdir {dir}\n");
+    // already and a missing old version are no errors here. (Sorted, a
+    // directory comes before what it holds.)
+    let mut dirs = std::collections::BTreeSet::new();
+    for &i in &changed {
+        let dest = &files[i].dest;
+        let mut dir = String::new();
+        for part in dest.split('/').take(dest.matches('/').count()) {
+            dir = format!("{dir}/{part}");
+            dirs.insert(dir.clone());
+        }
     }
-    script += &format!("rm /{dest}\nwrite new /{dest}\n");
-    script += &format!("sif /{dest} mode 0100755\nsif /{dest} uid 0\nsif /{dest} gid 0\n");
+    let mut script: String = dirs.iter().map(|d| format!("mkdir {d}\n")).collect();
+    let mut checks = String::new();
+    for &i in &changed {
+        let Install { dest, mode, .. } = &files[i];
+        script += &format!("rm /{dest}\nwrite new{i} /{dest}\n");
+        script += &format!("sif /{dest} mode 0100{:o}\nsif /{dest} uid 0\nsif /{dest} gid 0\n", mode & 0o7777);
+        checks += &format!("dump /{dest} check{i}\n");
+    }
     fs::write(work.join("cmds"), script)?;
+    fs::write(work.join("checks"), checks)?;
     let wrote = debugfs(work, disk, &["-w", "-f", "cmds"])?;
-    // The file must now be there with the source's contents.
-    let check = format!("dump /{dest} check");
-    debugfs(work, disk, &["-R", &check])?;
-    if !wrote.status.success() || !work.join("check").exists() || !same_contents(&work.join("check"), src)? {
-        let log = String::from_utf8_lossy(&wrote.stderr);
-        return Err(io::Error::other(format!("/{dest} is not on the disk as it should be after debugfs:\n{log}")));
+    // Each file must now be there with its source's contents.
+    debugfs(work, disk, &["-f", "checks"])?;
+    for &i in &changed {
+        let check = work.join(format!("check{i}"));
+        if !wrote.status.success() || !check.exists() || !same_contents(&check, &files[i].src)? {
+            let log = String::from_utf8_lossy(&wrote.stderr);
+            return Err(io::Error::other(format!("/{} is not on the disk as it should be after debugfs:\n{log}", files[i].dest)));
+        }
     }
     Ok(())
+}
+
+/// The dynamically linked programs (userspace/dynamic/default.nix, ADR 0021),
+/// built by Nix and kept from garbage collection by the link target/dynamic:
+/// their store path.
+fn dynamic_programs() -> PathBuf {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let link = root.join("target/dynamic");
+    let status = Command::new("nix-build")
+        .arg(root.join("userspace/dynamic/default.nix"))
+        .arg("-o")
+        .arg(&link)
+        .stdout(process::Stdio::null())
+        .status()
+        .expect("Failed to run nix-build for userspace/dynamic");
+    if !status.success() {
+        eprintln!("nix-build userspace/dynamic failed");
+        process::exit(2);
+    }
+    fs::canonicalize(&link).expect("nix-build made no target/dynamic")
+}
+
+/// The dynamic programs in the root filesystem: copies of their files in
+/// /bin (links stay links: gnu-hello points into the store), and /nix, a
+/// link to /data/nix, where the data disk holds the store paths they need
+/// (`store_files`) under their own names: the interpreter and the libraries
+/// are found as Nix built the programs, unmodified.
+fn install_dynamic(rootfs: &Path, dynamic: &Path) -> io::Result<()> {
+    for entry in fs::read_dir(dynamic.join("bin"))? {
+        let entry = entry?;
+        let target = rootfs.join("bin").join(entry.file_name());
+        if entry.file_type()?.is_symlink() {
+            std::os::unix::fs::symlink(fs::read_link(entry.path())?, &target)?;
+        } else {
+            fs::copy(entry.path(), &target)?;
+        }
+    }
+    std::os::unix::fs::symlink("/data/nix", rootfs.join("nix"))
+}
+
+/// The files of the store paths `dynamic/closure` lists (files or whole
+/// directories, links followed), each to go on the data disk under its own
+/// path (as `nix/store/...`), with its execute bits.
+fn store_files(dynamic: &Path) -> io::Result<Vec<Install>> {
+    fn walk(path: &Path, out: &mut Vec<Install>) -> io::Result<()> {
+        let meta = fs::metadata(path)?;
+        if meta.is_dir() {
+            let mut entries: Vec<_> = fs::read_dir(path)?.collect::<Result<_, _>>()?;
+            entries.sort_by_key(|e| e.file_name());
+            for e in entries {
+                walk(&e.path(), out)?;
+            }
+        } else {
+            let dest = path.strip_prefix("/").expect("absolute").to_str().expect("UTF-8 store path").to_string();
+            let mode = if meta.permissions().mode() & 0o111 != 0 { 0o755 } else { 0o644 };
+            out.push(Install { src: path.to_path_buf(), dest, mode });
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    for line in fs::read_to_string(dynamic.join("closure"))?.lines() {
+        assert!(line.starts_with("/nix/store/"), "closure: not a store path: {line}");
+        walk(Path::new(line), &mut out)?;
+    }
+    Ok(out)
 }
 
 fn copy_tree(from: &Path, to: &Path) -> io::Result<()> {

@@ -4,7 +4,7 @@
 failed=0
 fail() { echo "FAIL $1"; failed=$((failed + 1)); }
 
-for t in forktest waittest pidfdtest leaktest sigtest sigframetest jobtest cowtest fstest oomtest nomemtest nettest smptest proctest vmtest futextest pitest threadtest timetest vdsotest randtest timertest cputimertest posixtimertest timerfdtest fdtest polltest eventfdtest sigmasktest epolltest unixtest mmaptest exectest cachetest reclaimtest writebacktest datatest ttytest lxtest libuvtest metatest inotifytest kmsgtest treetest fifotest oomkilltest; do
+for t in forktest waittest pidfdtest leaktest sigtest sigframetest jobtest cowtest fstest oomtest nomemtest nettest smptest proctest vmtest futextest pitest threadtest timetest vdsotest randtest timertest cputimertest posixtimertest timerfdtest fdtest polltest eventfdtest sigmasktest epolltest unixtest mmaptest exectest cachetest reclaimtest writebacktest datatest ttytest lxtest libuvtest metatest inotifytest kmsgtest treetest fifotest oomkilltest membarriertest; do
     echo "=== $t"
     if $t; then echo "PASS $t"; else fail "$t"; fi
 done
@@ -26,6 +26,17 @@ kill $busy
 wait $busy 2>/dev/null
 rm -f /tmp/lxtest.out
 if [ $runs -eq 3 ]; then echo "PASS lxtest x3"; else fail "lxtest x3 ($runs of 3 passed)"; fi
+
+# Dynamically linked programs as Nix built them (ADR 0021): their interpreters
+# (glibc's ld-linux-x86-64.so.2, musl's ld-musl-x86_64.so.1) and libraries come
+# from the data disk's /nix/store (/nix is a link to /data/nix).
+for t in dyntest dynmusl dyncxx; do
+    echo "=== $t"
+    if $t; then echo "PASS $t"; else fail "$t"; fi
+done
+echo "=== gnu-hello"
+out=$(gnu-hello 2>&1)
+if [ "$out" = "Hello, world!" ]; then echo "PASS nixpkgs' GNU hello runs"; else fail "gnu-hello: '$out'"; fi
 
 echo "=== mmaptest /data"
 if mmaptest /data; then echo "PASS mmaptest /data"; else fail "mmaptest /data"; fi

@@ -1156,6 +1156,16 @@ pub const SYS_VM_AREAS: u64 = 1201;
 /// records while the object exists (never 0; another object may get it once this one is
 /// gone). EINVAL for a handle that is no memory object.
 pub const SYS_MO_ID: u64 = 1202;
+/// `membarrier(scope)`: a memory barrier on other CPUs, membarrier(2)'s mechanism (the
+/// commands and their registrations are the server's, ADR 0021): every CPU that has the
+/// caller's program's address space loaded (`MEMBARRIER_SPACE`), or every CPU
+/// (`MEMBARRIER_ALL`), takes an interrupt before the call returns, so that whatever the
+/// threads there did before is visible to the caller and their instruction streams are
+/// serialized (`iret`); a CPU that loads the space meanwhile runs it after a full barrier.
+/// EINVAL for another scope; EPERM for a service thread (it serves no program).
+pub const SYS_MEMBARRIER: u64 = 1270;
+pub const MEMBARRIER_SPACE: u64 = 0;
+pub const MEMBARRIER_ALL: u64 = 1;
 
 /// A mapping, as `vm_areas` reports it.
 #[repr(C)]
@@ -1409,3 +1419,7 @@ pub const TEST_TREE_KILL: u64 = 1530;
 /// lock. ESRCH for no such thread. Test mode only; the server passes the
 /// thread's key on (`futextest`: priority inheritance along a chain).
 pub const TEST_PI_WEIGHT: u64 = 1550;
+/// `(cpu) -> n`: how many `SYS_MEMBARRIER` interrupts CPU `cpu` (its index, a program's
+/// CPU number) has served since boot. EINVAL for no such CPU. Test mode only; the server
+/// passes a program's call on (`membarriertest`: which CPUs a barrier reaches).
+pub const TEST_BARRIERS: u64 = 1640;

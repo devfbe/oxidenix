@@ -1,6 +1,6 @@
 //! Memory system calls (phase R4): Linux's semantics of mmap, munmap,
-//! mprotect, mremap, madvise, msync and the mlock family, and brk (with the
-//! process model, R8), over the kernel's mapping calls. The kernel keeps the page tables and the areas; this is
+//! mprotect, mremap, madvise, msync and the mlock family, brk (with the
+//! process model, R8) and membarrier (ADR 0021), over the kernel's mapping calls. The kernel keeps the page tables and the areas; this is
 //! where the arguments are checked and turned into mappings.
 
 use restricted::*;
@@ -35,6 +35,8 @@ const SYS_MADVISE: u64 = 28;
 const SYS_MLOCK: u64 = 149;
 const SYS_MUNLOCKALL: u64 = 152;
 const SYS_MLOCK2: u64 = 325;
+/// (Linux's number; the kernel's mechanism is `restricted::SYS_MEMBARRIER`.)
+const SYS_MEMBARRIER_LINUX: u64 = 324;
 
 fn page_up(x: u64) -> Option<u64> {
     x.checked_add(PAGE - 1).map(|v| v & !(PAGE - 1))
@@ -57,6 +59,7 @@ pub fn handle(s: &State) -> Option<i64> {
         SYS_MADVISE => madvise(a0, a1, a2),
         // Nothing is ever swapped out.
         SYS_MLOCK..=SYS_MUNLOCKALL | SYS_MLOCK2 => 0,
+        SYS_MEMBARRIER_LINUX => membarrier(a0, a1),
         _ => return None,
     })
 }
@@ -140,8 +143,9 @@ fn mmap(addr: u64, len: u64, prot: u64, flags: u64, fd: u64, mut offset: u64) ->
 /// the break stays). The kernel places mappings above the break (`SYS_VM_FLOOR`). Returns
 /// the (possibly unchanged) break.
 fn brk(addr: u64) -> i64 {
-    let Some(brk) = crate::process::brk_of(crate::local::pid()) else { return 0 };
-    let mut b = brk.lock();
+    let Some(mm) = crate::process::mm_of(crate::local::pid()) else { return 0 };
+    let mut m = mm.lock();
+    let b = &mut m.brk;
     if addr < b.start || addr > USER_END {
         return b.end as i64;
     }
@@ -209,6 +213,65 @@ fn msync(addr: u64, len: u64, flags: u64) -> i64 {
         }
     }
     result
+}
+
+const EPERM: i64 = 1;
+
+/// membarrier(2)'s commands (its `cmd`, and the registration bits `GET_REGISTRATIONS`
+/// reports: each REGISTER_* command's own value).
+const MEMBARRIER_CMD_QUERY: u32 = 0;
+const MEMBARRIER_CMD_GLOBAL: u32 = 1;
+const MEMBARRIER_CMD_GLOBAL_EXPEDITED: u32 = 2;
+const MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED: u32 = 4;
+const MEMBARRIER_CMD_PRIVATE_EXPEDITED: u32 = 8;
+const MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED: u32 = 16;
+const MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE: u32 = 32;
+const MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE: u32 = 64;
+const MEMBARRIER_CMD_GET_REGISTRATIONS: u32 = 512;
+/// What QUERY reports: everything but the rseq commands (128 and 256), as a Linux without
+/// CONFIG_RSEQ (there is no rseq, ADR 0021).
+const MEMBARRIER_SUPPORTED: u32 = MEMBARRIER_CMD_GLOBAL
+    | MEMBARRIER_CMD_GLOBAL_EXPEDITED
+    | MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED
+    | MEMBARRIER_CMD_PRIVATE_EXPEDITED
+    | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED
+    | MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE
+    | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE
+    | MEMBARRIER_CMD_GET_REGISTRATIONS;
+
+/// membarrier(cmd, flags, cpu_id): the barriers are the kernel's (`SYS_MEMBARRIER`: an
+/// interrupt on each CPU that runs the address space, or on every CPU), the registrations
+/// the address space's (`process::Mm`: copied by fork, shared by CLONE_VM, none after
+/// execve). The private expedited commands need their registration (EPERM); the global
+/// ones reach every CPU, which covers every registered process (and is what GLOBAL asks:
+/// every running thread passes a barrier, the others do when they are switched in). Only
+/// the rseq command takes a flag, and there is no rseq: a flag, the rseq commands and
+/// unknown ones are EINVAL; `cpu_id` matters only with the flag.
+fn membarrier(cmd: u64, flags: u64) -> i64 {
+    // (`cmd` is an int.)
+    let cmd = cmd as u32;
+    if flags as u32 != 0 {
+        return -EINVAL;
+    }
+    let barrier = |scope| crate::syscall(SYS_MEMBARRIER, [scope, 0, 0, 0, 0, 0]);
+    let Some(mm) = crate::process::mm_of(crate::local::pid()) else { return -EINVAL };
+    match cmd {
+        MEMBARRIER_CMD_QUERY => MEMBARRIER_SUPPORTED as i64,
+        MEMBARRIER_CMD_GLOBAL | MEMBARRIER_CMD_GLOBAL_EXPEDITED => barrier(MEMBARRIER_ALL),
+        MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE => {
+            mm.lock().membarrier |= cmd;
+            0
+        }
+        MEMBARRIER_CMD_PRIVATE_EXPEDITED | MEMBARRIER_CMD_PRIVATE_EXPEDITED_SYNC_CORE => {
+            // (Each command's registration is the command's value shifted once.)
+            if mm.lock().membarrier & (cmd << 1) == 0 {
+                return -EPERM;
+            }
+            barrier(MEMBARRIER_SPACE)
+        }
+        MEMBARRIER_CMD_GET_REGISTRATIONS => mm.lock().membarrier as i64,
+        _ => -EINVAL,
+    }
 }
 
 /// DONTNEED and FREE drop private pages; other advice is accepted.

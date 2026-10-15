@@ -1908,6 +1908,18 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             _ => Err(EINVAL),
         },
         SYS_VM_AREAS => vm_areas(&instance, a[0], a[1], a[2], a[3]),
+        SYS_MEMBARRIER => {
+            // (A service thread has no program whose CPUs it could name.)
+            if is_pager() {
+                return Err(EPERM);
+            }
+            match a[0] {
+                MEMBARRIER_SPACE => super::tlb::barrier(Some(&super::current_mm().ok_or(EINVAL)?.tlb)),
+                MEMBARRIER_ALL => super::tlb::barrier(None),
+                _ => return Err(EINVAL),
+            }
+            Ok(0)
+        }
         SYS_INITRAMFS => {
             let image = crate::fs::initramfs().ok_or(ENOENT)?;
             super::uaccess::copy_to_server(a[0], &(image.len() as u64).to_le_bytes())?;
@@ -2469,6 +2481,16 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             }
             let t = thread_by_key(&instance, a[0])?;
             Ok(super::sched::effective_weight(&t) as i64)
+        }
+        TEST_BARRIERS => {
+            if !crate::TEST_MODE.load(core::sync::atomic::Ordering::Relaxed) {
+                return Err(ENOSYS);
+            }
+            let cpu = usize::try_from(a[0]).map_err(|_| EINVAL)?;
+            if crate::smp::by_index(cpu).is_none() {
+                return Err(EINVAL);
+            }
+            super::tlb::barriers_served(cpu).map(|n| n as i64).ok_or(EINVAL)
         }
         TEST_TREE_START => {
             if !crate::TEST_MODE.load(core::sync::atomic::Ordering::Relaxed) {
