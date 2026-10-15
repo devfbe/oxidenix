@@ -930,13 +930,36 @@ timerfds' expiries to their pollers (`timerfd.rs`).
   edge for EPOLLET). A `TFD_TIMER_CANCEL_ON_SET` timer is canceled (`ECANCELED`) by the
   instance's settings of the wall clock (another tree's are not seen).
 
+### ptrace (ADR 0019)
+
+`ptrace`, `process_vm_readv`, `process_vm_writev` and `/proc/<pid>/mem` are the server's
+(`ptrace.rs`). A trace relation is per thread (a `Tracee` record in the traced thread's entry,
+naming its tracer thread); the tracer's process's `wait` sees the stops and ends of its
+tracees. Every stop happens in the tracee's own server thread (`ptrace::stop`): it copies its
+program's `State`, an `fxsave` image and its FS base into its record, reports the stop
+(`SIGCHLD` with `CLD_TRAPPED`, its process's child word) and sleeps, killable only, on its
+process's trace word; the tracer's requests read and change the record, and the tracee loads
+it back when resumed. Syscall stops come from `serve` (a flag in the thread's own block says
+whether to look), signal-delivery-stops and group-stop traps from `signal::deliver`, the
+events from clone, exec and exit. A traced thread's end turns its record into the zombie its
+tracer reaps (on the tracer thread's list: no allocation at exit); a traced main thread whose
+tracer is not in its parent's process is the tracer's to reap first, and its parent hears of
+the end only then.
+
+| call | what it does |
+|---|---|
+| `vm_access(target, addr, buf, len, flags) -> n` | copies between a process's address space (by its handle, or a space handle) and the server's memory, page by page; `VM_ACCESS_FORCE` is Linux's `FOLL_FORCE` (a read without the read right, a write into a private copy of a read-only page) |
+| `vm_space(process) -> handle` | a handle on the address space a process has now, which does not keep it (`/proc/<pid>/mem`: nothing once the process exec'd or ended) |
+| `thread_debug(regs)` | the calling thread's hardware breakpoints (DR0-DR3, DR7), armed only while its program runs; a debug exception's DR6 comes in `State::trap_error` |
+
 ### /proc
 
 `/proc/<pid>` (also for a thread's tid, as Linux), `/proc/self` and `/proc/thread-self` are
 the server's, from its tables and the kernel's `proc_info`/`thread_info`: `stat`, `statm`,
 `status`, `cmdline`, `comm`, `exe`, `cwd`, `oom_score`, `oom_score_adj`, `oom_adj`, `maps`
 (the kernel's `vm_areas`; the vDSO, the clock page, the stack, the heap and the program file
-named, ADR 0014),
+named, ADR 0014), `mem` (the process's memory at its addresses, `vm_access` with
+`FOLL_FORCE` through the space it had when opened: ADR 0019),
 `task/<tid>/...` (oxidenix's `counters`, the calls the server passed through for the process,
 went with the pass-through in R9). The system's files (`stat`, `meminfo`,
 `uptime`, `loadavg`, `cpuinfo`, `mounts`, `counters`, `sys/`) stay procfs's, but for
@@ -1304,8 +1327,8 @@ Linux asks for write access only for files, directories and symlinks.
   for a new channel and serves the same inodes.
 - **The server's own part**, each process's: `/proc/<pid>` with `stat`, `statm`, `status`,
   `cmdline`, `comm`, `exe`, `mounts`, `mountinfo` (ids, parents, device numbers),
-  `oom_score`, `oom_score_adj`, `oom_adj`, `maps`,
-  `task/<tid>/{stat,statm,status,cmdline,comm,oom_score,oom_score_adj,oom_adj,maps}`, `fd/<n>`,
+  `oom_score`, `oom_score_adj`, `oom_adj`, `maps`, `mem`,
+  `task/<tid>/{stat,statm,status,cmdline,comm,oom_score,oom_score_adj,oom_adj,maps,mem}`, `fd/<n>`,
   `fdinfo/<n>`, `cwd` and `root`; `/proc/self`, `/proc/thread-self` and
   `/proc/mounts` (a link to `self/mounts`), merged into procfs's root listing; and
   `/proc/sys/vm/overcommit_{memory,ratio,kbytes}` (the kernel's overcommit policy, ADR 0013),
@@ -1327,7 +1350,8 @@ Linux asks for write access only for files, directories and symlinks.
 **Rules** (Linux's): nothing can be created (`open` with `O_CREAT`: EACCES; `mkdir`,
 `symlink`: EPERM, EEXIST for a name that exists), removed, renamed (EPERM; EXDEV across
 `/proc` and `/sys`) or chmodded (EPERM); files open read-only (for writing: EACCES; directories
-EISDIR) but `oom_score_adj`, `oom_adj` and, for a tree with the host grant, the overcommit
+EISDIR) but `mem` (reads and writes at the position, an address; `lseek` from the start or
+the position), `oom_score_adj`, `oom_adj` and, for a tree with the host grant, the overcommit
 files, each write one number as Linux reads it (`kstrtoint`: `EINVAL` otherwise; at most 12
 bytes taken for the two per process), nothing executes (EACCES), `statfs` says `PROC_SUPER_MAGIC` and `SYSFS_MAGIC`; times
 set with `utimensat` are kept by the server per device and inode, as for the kernel's `/dev`
@@ -1566,6 +1590,9 @@ is gone) and of the calls R9 moved; fdtest's and ttytest's `/dev` checks hold fo
   address space in one call, the ELF loader is the server's, a tree's first process
   starts in the server, and timers on CPU clocks rest on the kernel's CPU-time alarms
   (ADR 0010).
+- ptrace is the server's: a tracee stops in its own server thread, its registers kept in its
+  trace record; the kernel gives another process's memory (with `FOLL_FORCE`) and a thread's
+  hardware breakpoints, armed only while its program runs (ADR 0019).
 - The descriptor table is the server's, shared as its process model decides (R8; until then
   the kernel's clone, with records), the kernel's files were held by handle (until R9),
   readiness goes through the server's watch lists over one kernel wait for any of several

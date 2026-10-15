@@ -119,6 +119,8 @@ pub struct Counters {
 pub const STATE_RUNNING: u8 = b'R';
 pub const STATE_SLEEPING: u8 = b'S';
 pub const STATE_STOPPED: u8 = b'T';
+/// Stopped for its tracer (a ptrace stop).
+pub const STATE_TRACED: u8 = b't';
 pub const STATE_ZOMBIE: u8 = b'Z';
 
 /// Flags of a process.
@@ -177,6 +179,8 @@ pub struct Process {
     pub anon_pages: u64,
     pub shmem_pages: u64,
     pub table_pages: u64,
+    /// The process id of the thread's tracer (0: not traced).
+    pub tracer: u64,
 }
 
 /// The bytes of a record.

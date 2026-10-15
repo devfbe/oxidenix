@@ -983,6 +983,12 @@ fn context_switch(next: Arc<Task>) {
         let restored = next.cpu_state();
         FsBase::write(VirtAddr::new(restored.fs_base));
         fxrstor(&restored.fpu);
+        // Hardware breakpoints are armed only for a Linux program that runs (`debugreg`):
+        // the next task's, if it was interrupted in its program.
+        super::debugreg::disarm();
+        if let Some(l) = n.linux.as_ref().filter(|l| l.restricted && l.debug.armed()) {
+            l.debug.load();
+        }
     }
     let prev_rsp = prev.kernel_rsp.get();
     let next_rsp = unsafe { *next.kernel_rsp.get() };

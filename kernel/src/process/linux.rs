@@ -46,8 +46,6 @@ pub fn table_flags() -> PageTableFlags {
     PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE
 }
 
-/// rflags bits a program may set: CF PF AF ZF SF TF DF OF (as sigreturn).
-const USER_FLAGS: u64 = 0xcd5;
 /// The server's program in the boot image.
 const SERVER_PATH: &str = "/sbin/linux";
 /// The largest server program accepted.
@@ -512,6 +510,9 @@ pub(super) enum Object {
     Channel(Arc<super::channel::ClientEnd>),
     /// A process of the instance (`SYS_PROC_SELF`, `SYS_PROC_CREATE`).
     Process(Arc<Container>),
+    /// The address space a process had (`SYS_VM_SPACE`), which the handle
+    /// does not keep: /proc/<pid>/mem's.
+    Space(Weak<super::address_space::Mm>),
 }
 
 /// A process as the Linux server holds it: the kernel's thread group, and
@@ -1464,6 +1465,9 @@ pub struct LinuxThread {
     exit_told: bool,
     /// The server's registers while the program runs.
     normal: Frame,
+    /// The program's hardware breakpoints (`SYS_THREAD_DEBUG`), armed
+    /// while it runs.
+    pub debug: super::debugreg::DebugRegs,
 }
 
 impl LinuxThread {
@@ -1497,6 +1501,7 @@ impl LinuxThread {
             announced: false,
             exit_told: false,
             normal: Frame::default(),
+            debug: Default::default(),
         }
     }
 
@@ -1632,7 +1637,7 @@ fn load(s: &State, f: &mut Frame) -> Result<(), i64> {
     frame.r13 = s.r13;
     frame.r14 = s.r14;
     frame.r15 = s.r15;
-    frame.rflags = (s.rflags & USER_FLAGS) | 0x202;
+    frame.rflags = (s.rflags & USER_RFLAGS) | 0x202;
     *f = frame;
     Ok(())
 }
@@ -1770,7 +1775,7 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
                         offset.checked_add(len).filter(|&e| e <= cache.size()).ok_or(EINVAL)?;
                         Backing::File { cache, offset, shared, may_write, _hold: None }
                     }
-                    Object::Image(_) | Object::Channel(_) | Object::Process(_) => return Err(EINVAL),
+                    Object::Image(_) | Object::Channel(_) | Object::Process(_) | Object::Space(_) => return Err(EINVAL),
                     // Shared and never writable, by everyone the same.
                     Object::ClockPage(cache) => {
                         if !shared || may_write || offset != 0 || len != PAGE || a[4] & !super::address_space::Prot::READ != 0 {
@@ -1921,6 +1926,27 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
                 MEMBARRIER_REGISTER_GLOBAL => membarrier::register_global(&super::current_mm().ok_or(EINVAL)?.tlb).map_err(|_| ENOMEM)?,
                 _ => return Err(EINVAL),
             }
+            Ok(0)
+        }
+        SYS_VM_ACCESS => vm_access(&instance, a[0], a[1], a[2], a[3], a[4]),
+        SYS_VM_SPACE => {
+            let mm = container(&instance, a[0])?.group.info.lock().mem.clone().and_then(|s| s.mm()).ok_or(ESRCH)?;
+            Ok(instance.insert(Object::Space(Arc::downgrade(&mm)))? as i64)
+        }
+        SYS_THREAD_DEBUG => {
+            if !serves_program() {
+                return Err(EPERM);
+            }
+            let mut bytes = [0u8; 40];
+            super::uaccess::copy_from_server(a[0], &mut bytes)?;
+            let raw: [u64; 5] = core::array::from_fn(|i| u64::from_le_bytes(bytes[i * 8..i * 8 + 8].try_into().expect("8 bytes")));
+            let debug = super::debugreg::DebugRegs::from_raw(raw)?;
+            // (The server runs: nothing is armed now; `enter` arms them.)
+            with_current(|p| {
+                if let Some(l) = p.linux.as_mut() {
+                    l.debug = debug;
+                }
+            });
             Ok(0)
         }
         SYS_INITRAMFS => {
@@ -2776,6 +2802,62 @@ fn object_id(cache: &Arc<PageCache>) -> u64 {
 
 /// `SYS_VM_AREAS`: up to `cap` records of the mappings of process `handle` (0: the
 /// caller's) from the first that ends above `from`, at `out`; how many.
+/// `SYS_VM_ACCESS`: another process's memory (see `restricted::SYS_VM_ACCESS`), a page at
+/// a time through a buffer of the kernel's: the target's space is locked only for the
+/// page's own copy (`Mm::access`), never across a copy from or to the server's memory.
+fn vm_access(instance: &Instance, target: u64, addr: u64, buf: u64, len: u64, flags: u64) -> SysResult {
+    use super::address_space::Fault;
+    if flags & !(VM_ACCESS_WRITE | VM_ACCESS_FORCE) != 0 {
+        return Err(EINVAL);
+    }
+    let mm = match instance.object(target)? {
+        Object::Process(c) => c.group.info.lock().mem.clone().and_then(|s| s.mm()).ok_or(ESRCH)?,
+        // A space that is gone reads and writes nothing.
+        Object::Space(space) => match space.upgrade() {
+            Some(mm) => mm,
+            None => return Ok(0),
+        },
+        _ => return Err(EINVAL),
+    };
+    let (write, force) = (flags & VM_ACCESS_WRITE != 0, flags & VM_ACCESS_FORCE != 0);
+    let len = len.min(VM_ACCESS_MAX);
+    let mut page: Vec<u8> = Vec::new();
+    page.try_reserve_exact(PAGE as usize).map_err(|_| ENOMEM)?;
+    page.resize(PAGE as usize, 0);
+    let mut done = 0u64;
+    while done < len {
+        let Some(va) = addr.checked_add(done).filter(|&va| va < USER_END) else { break };
+        let n = (PAGE - va % PAGE).min(len - done) as usize;
+        let chunk = &mut page[..n];
+        let step = (|| {
+            if write {
+                super::uaccess::copy_from_server(buf + done, chunk)?;
+            }
+            mm.access(va, chunk, write, force).map_err(|f| match f {
+                Fault::Oom | Fault::CommitWait => ENOMEM,
+                _ => EFAULT,
+            })?;
+            if !write {
+                super::uaccess::copy_to_server(buf + done, chunk)?;
+            }
+            Ok::<_, i64>(())
+        })();
+        match step {
+            Ok(()) => done += n as u64,
+            Err(e) if done == 0 => return Err(e),
+            Err(_) => break,
+        }
+        // A dying caller stops (what it copied so far is its answer).
+        if dying() {
+            break;
+        }
+    }
+    if done == 0 && len != 0 {
+        return Err(EFAULT);
+    }
+    Ok(done as i64)
+}
+
 fn vm_areas(instance: &Instance, handle: u64, from: u64, out: u64, cap: u64) -> SysResult {
     use super::address_space::Backing;
     let mm = if handle == 0 {
@@ -3191,6 +3273,11 @@ fn exec_space(instance: &Arc<Instance>, exe: u64, name: u64, len: u64) -> SysRes
         // shows the same region.
         super::tlb::switch(p.mm.as_ref().map(|m| &*m.tlb), Some(&mm.tlb), true);
         p.copy_fixup = None;
+        // The old program's hardware breakpoints go with it (Linux's
+        // flush_ptrace_hw_breakpoint).
+        if let Some(l) = p.linux.as_mut() {
+            l.debug = Default::default();
+        }
         p.mm.replace(mm)
     });
     // The old address space goes here (unless a vfork parent shares it).
@@ -3224,8 +3311,21 @@ pub fn trap_exception(f: &mut Frame, vector: u64, error: u64, addr: u64, kind: u
     trap_with(f, REASON_EXCEPTION, [vector, error, addr, kind]);
 }
 
+/// A debug exception of the program (`dr6`: what DR6 said of it, `debugreg::take_dr6`): a
+/// hit of one of its instruction breakpoints resumes past the instruction (RF; the server
+/// keeps it unless it changes the registers), and the server learns `dr6`
+/// (`State::trap_error`).
+pub fn debug_trap(f: &mut Frame, dr6: u64) -> u64 {
+    if with_current(|p| p.linux.as_ref().is_some_and(|l| l.debug.exec_hit(dr6))) {
+        f.rflags |= 0x10000;
+    }
+    dr6
+}
+
 fn trap_with(f: &mut Frame, reason: u64, detail: [u64; 4]) {
     x86_64::instructions::interrupts::without_interrupts(|| {
+        // The program's breakpoints are not the server's.
+        super::debugreg::disarm();
         with_current(|p| {
             let l = p.linux.as_mut().expect("a Linux thread");
             let state = l.state();
@@ -3278,6 +3378,9 @@ pub fn enter(f: &mut Frame) -> Result<(), i64> {
             l.normal = *f;
             *f = program;
             l.restricted = true;
+            if l.debug.armed() {
+                l.debug.load();
+            }
             Ok::<_, i64>(())
         })
         .inspect(|_| switch_view(false))

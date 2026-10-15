@@ -586,6 +586,18 @@ impl Mm {
         Ok(child)
     }
 
+    /// Another process's access to this space at `va`, within one page
+    /// (`AddressSpace::access_page`): a page a pager must bring is waited
+    /// for with the space unlocked, and a store that made a disk file's page
+    /// dirty is throttled as the space's own would be.
+    pub fn access(&self, va: u64, buf: &mut [u8], write: bool, force: bool) -> Result<(), Fault> {
+        let (result, dirtied) = self.retrying(|space| space.access_page(va, buf, write, force));
+        if let (Some(cache), Ok(())) = (dirtied, &result) {
+            crate::fs::cache::balance_dirty(&cache);
+        }
+        result
+    }
+
     /// Runs `op` on the locked space until it no longer asks for a page
     /// (`Fault::Retry`, the page in `awaited`), which is waited for with
     /// the space unlocked: a pager may need to lock it meanwhile
@@ -1674,6 +1686,50 @@ impl AddressSpace {
     /// (`Mm::write_user` writes into a space others can reach.)
     pub fn write(&mut self, addr: u64, data: &[u8]) -> Result<(), Fault> {
         self.write_as(addr, data, false, true)
+    }
+
+    /// Another process's access to this space (`restricted::SYS_VM_ACCESS`:
+    /// ptrace, process_vm_readv and process_vm_writev, /proc/<pid>/mem) of
+    /// `buf.len()` bytes at `va`, within one page: a read into `buf`, or with
+    /// `write` a store of it. The page is faulted in as the space's own
+    /// access would (`fault_or_retry`; without `wait`, so the caller waits for
+    /// a pager's page with the space unlocked: `Mm::access`), but a stack does
+    /// not grow for it (as Linux's get_user_pages). The area must allow the
+    /// access, unless `force` (Linux's FOLL_FORCE): then a read needs no read
+    /// right, and a store into a private area needs no write right: the page
+    /// becomes the area's own copy first (`privatize`, keeping its rights), so
+    /// the store never reaches a file's page cache or a fork relative. A
+    /// shared area is stored to only as a writable one; an area without any
+    /// access (PROT_NONE), device memory and granted pages are never reached.
+    fn access_page(&mut self, va: u64, buf: &mut [u8], write: bool, force: bool) -> Result<(), Fault> {
+        let page = page_down(va);
+        if self.reaped || va.checked_add(buf.len() as u64).is_none_or(|end| end > USER_END || end > page + PAGE) {
+            return Err(Fault::Segv);
+        }
+        let v = self.vma(page).cloned().ok_or(Fault::Segv)?;
+        if v.prot.none() || matches!(v.backing, Backing::Device | Backing::Granted { .. } | Backing::Revoked { .. }) {
+            return Err(Fault::Segv);
+        }
+        if write {
+            if v.prot.write {
+                // A store as the space's own (copy-on-write, a disk file's
+                // page backed and marked dirty).
+                return self.write_as(va, buf, true, false);
+            }
+            if !force || v.backing.shared() {
+                return Err(Fault::Segv);
+            }
+            // Into the area's own copy of the page, its rights kept.
+            return self.write_as(va, buf, false, false);
+        }
+        if !v.prot.read && !force {
+            return Err(Fault::Segv);
+        }
+        self.fault_or_retry(va, Access { write: false, exec: false }, false)?;
+        let e = leaf_entry(self.l4, page).filter(|e| e.flags().contains(PageTableFlags::PRESENT)).ok_or(Fault::Segv)?;
+        let phys = e.addr().as_u64() + va % PAGE;
+        unsafe { core::ptr::copy_nonoverlapping(memory::phys_to_virt(phys) as *const u8, buf.as_mut_ptr(), buf.len()) };
+        Ok(())
     }
 
     /// `write`, as a user write if `user` (the area must be writable);
