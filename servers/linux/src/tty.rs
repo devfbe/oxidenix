@@ -1156,6 +1156,10 @@ impl Tty {
             inner.epoch += 1;
             inner.held_echo.clear();
             inner.ld = Ldisc::new(self.init);
+            if let Driver::Serial(n) = self.driver {
+                // The UART runs as the settings now say.
+                crate::serial::reset(n, &self.init);
+            }
             // What was on its way to a pty's master goes too (Linux flushes the
             // driver's buffer).
             if let Some(p) = inner.pty.as_mut() {

@@ -210,6 +210,13 @@ fn program(n: u8, old: Option<&Termios>, new: &mut Termios) {
     ctl(n, SERIAL_LINE, divisor as u64 | (format as u64) << 16);
 }
 
+/// A hangup restored the port's first settings (terminal's lock held): the UART follows
+/// (the lost instance's calls fail and change nothing).
+pub fn reset(n: u8, t: &Termios) {
+    let mut cur = *t;
+    program(n, None, &mut cur);
+}
+
 /// New settings (terminal's lock held): the UART follows; a change to B0 drops DTR and
 /// RTS, one from B0 raises them (Linux's `uart_set_termios`).
 pub fn set_termios(n: u8, old: &Termios, new: &mut Termios) {

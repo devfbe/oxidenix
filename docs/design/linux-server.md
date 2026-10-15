@@ -1197,7 +1197,9 @@ LED shows a stopped console, Ctrl-Alt-Del restarts (CAD_OFF: SIGINT to init), Al
 kernel's, asked per batch of scancodes. `KDGKBTYPE` is `KB_101`; `KIOCSOUND`/`KDMKTONE` are
 silent (no speaker); `KDSETMODE` `KD_GRAPHICS` stops the kernel's text drawing until
 `KD_TEXT`. One VT: `VT_GETSTATE`, `VT_OPENQRY` (none free), `VT_GETMODE`/`VT_SETMODE`/
-`VT_SETACTIVATE` (the mode kept; no switch ever signals), `VT_RELDISP` (only `VT_ACKACQ`),
+`VT_SETACTIVATE` (the mode kept, VT_AUTO again once its owner is gone; no switch ever
+signals; the owner and `KDSIGACCEPT`'s process are held by identity as pidfds hold theirs,
+never by a pid a later process may get), `VT_RELDISP` (only `VT_ACKACQ`),
 `VT_ACTIVATE`/`VT_WAITACTIVE` (tty1 at once, others ENXIO or a wait for a signal),
 `VT_WAITEVENT`, `VT_DISALLOCATE` (tty1 busy), `VT_RESIZE(X)` (only the console's size),
 `VT_(UN)LOCKSWITCH`, `VT_GETHIFONTMASK`, `TIOCLINUX` (the shift state, the foreground

@@ -7,13 +7,16 @@
 //! follow the flags (`SYS_CONSOLE_CTL`; Scroll Lock shows the console's output stopped),
 //! and what a key asks beyond input is done here: Scroll Lock holds output, Break breaks,
 //! Ctrl-Alt-Del restarts (`system::ctrl_alt_del`), the keyboard signal goes to the process
-//! KDSIGACCEPT named. The console's modes the keyboard depends on (application keypad,
-//! cursor keys, new line mode, autorepeat) are the kernel's VT100's, asked per scancode
-//! batch.
+//! KDSIGACCEPT named, while it lives. The console's modes the keyboard depends on
+//! (application keypad, cursor keys, new line mode, autorepeat) are the kernel's VT100's,
+//! asked per scancode batch.
 //!
 //! One VT: VT_ACTIVATE and VT_WAITACTIVE for tty1 are done at once, others are ENXIO;
 //! VT_OPENQRY finds none free; VT_GETSTATE shows tty1; VT_SETMODE keeps the mode (no
-//! switch ever asks a VT_PROCESS owner to release). KD_GRAPHICS stops the console's text
+//! switch ever asks a VT_PROCESS owner to release) until its owner is gone, then it is
+//! VT_AUTO again (Linux's `reset_vc`). The processes the VT remembers (the VT_PROCESS
+//! owner, KDSIGACCEPT's) are held by their identity, as pidfds hold theirs (`ProcRef`):
+//! a later process with the same pid is not them. KD_GRAPHICS stops the console's text
 //! drawing (the kernel's); the console has no loadable font, so the font requests are
 //! ENOSYS (EINVAL in KD_GRAPHICS), as Linux's for a console driver without font
 //! operations.
@@ -21,13 +24,16 @@
 use crate::files::{EINVAL, ENOTTY};
 use crate::sync::Mutex;
 use crate::syscall;
-use crate::tty::{self, Tty, ENXIO};
+use crate::tty::{Tty, ENXIO};
 use crate::usercopy;
 use alloc::sync::Arc;
 use kbd::{Action, ConsoleModes, Diacr, Keyboard, Mode};
 use restricted::*;
 
+use crate::process::{self, Pid, Table, Words, PROCS};
+
 const ENOSYS: i64 = 38;
+const ESRCH: i64 = 3;
 const EBUSY: i64 = 16;
 const EFAULT: i64 = 14;
 
@@ -118,10 +124,12 @@ struct Vt {
     kbd: Option<Keyboard>,
     /// KD_GRAPHICS.
     graphics: bool,
-    /// `struct vt_mode` as VT_SETMODE set it (mode, waitv, relsig, acqsig; frsig 0).
+    /// `struct vt_mode` as VT_SETMODE set it (mode, waitv, relsig, acqsig; frsig 0), and
+    /// with VT_PROCESS the process that set it (Linux's `vt_pid`).
     mode: [u8; 8],
+    owner: Option<ProcRef>,
     /// KDSIGACCEPT's process and signal for the keyboard signal.
-    spawn: Option<(u32, u32)>,
+    spawn: Option<(ProcRef, u32)>,
     /// The LEDs last lit, and whether the console's output was stopped when last seen.
     leds: Option<u8>,
     stopped: bool,
@@ -135,6 +143,7 @@ static VT: Mutex<Vt> = Mutex::new(Vt {
     kbd: None,
     graphics: false,
     mode: [0; 8],
+    owner: None,
     spawn: None,
     leds: None,
     stopped: false,
@@ -142,7 +151,58 @@ static VT: Mutex<Vt> = Mutex::new(Vt {
     kmsg_redirect: 0,
 });
 
+/// A process as the VT remembers it (Linux's counted `struct pid`): its pid and its words
+/// (`process::Words`, the identity pidfds use), so a later process that gets the pid is not
+/// it.
+#[derive(Clone)]
+struct ProcRef {
+    pid: Pid,
+    words: Arc<Words>,
+}
+
+impl ProcRef {
+    /// The calling process.
+    fn caller() -> Result<ProcRef, i64> {
+        let (_, pid) = process::me();
+        let t = PROCS.lock();
+        let p = t.procs.get(&pid).ok_or(ESRCH)?;
+        Ok(ProcRef { pid, words: p.words.clone() })
+    }
+
+    /// Whether it is still there and has not exited.
+    fn alive(&self, t: &Table) -> bool {
+        t.procs.get(&self.pid).is_some_and(|p| Arc::ptr_eq(&p.words, &self.words) && p.zombie.is_none())
+    }
+
+    fn same(&self, other: &ProcRef) -> bool {
+        self.pid == other.pid && Arc::ptr_eq(&self.words, &other.words)
+    }
+
+    /// Sends it `sig` (from the kernel, as the keyboard's), if it is still there: whether it
+    /// was.
+    fn signal(&self, sig: u32) -> bool {
+        let mut t = PROCS.lock();
+        if !self.alive(&t) {
+            return false;
+        }
+        crate::signal::post_process(&mut t, self.pid, crate::signal::SigInfo::kernel(sig), false)
+    }
+}
+
 impl Vt {
+    /// The VT's mode: a VT_PROCESS mode whose owner is gone is VT_AUTO again (Linux resets
+    /// it, `reset_vc`, when it finds the owner gone; no switch ever comes here to find it).
+    fn current_mode(&mut self) -> [u8; 8] {
+        if self.mode[0] == VT_PROCESS {
+            let gone = self.owner.as_ref().is_none_or(|o| !o.alive(&PROCS.lock()));
+            if gone {
+                self.mode = [0; 8];
+                self.owner = None;
+            }
+        }
+        self.mode
+    }
+
     /// The keyboard (made now if it was not), or ENOMEM.
     fn kbd(&mut self) -> Result<&mut Keyboard, i64> {
         if self.kbd.is_none() {
@@ -225,11 +285,14 @@ fn act(a: Action, terminal: Option<&Arc<Tty>>) {
         }
         Action::Boot => crate::system::ctrl_alt_del(),
         Action::Spawn => {
-            let spawn = VT.lock().spawn;
-            if let Some((pid, sig)) = spawn {
-                if !crate::signal::send_process(pid, sig) {
+            let spawn = VT.lock().spawn.clone();
+            if let Some((who, sig)) = spawn {
+                if !who.signal(sig) {
                     // Gone: the request goes with it (Linux's `fn_spawn_con`).
-                    VT.lock().spawn = None;
+                    let mut vt = VT.lock();
+                    if vt.spawn.as_ref().is_some_and(|(w, _)| w.same(&who)) {
+                        vt.spawn = None;
+                    }
                 }
             }
         }
@@ -394,8 +457,8 @@ pub fn ioctl(t: &Tty, request: u32, arg: u64) -> Result<i64, i64> {
             if arg < 1 || arg > NSIG || arg == SIGKILL {
                 return Err(EINVAL);
             }
-            let me = tty::ids(0, 0)?;
-            VT.lock().spawn = Some((me.pid as u32, arg as u32));
+            let me = ProcRef::caller()?;
+            VT.lock().spawn = Some((me, arg as u32));
             Ok(0)
         }
         KDKBDREP => {
@@ -460,7 +523,7 @@ pub fn ioctl(t: &Tty, request: u32, arg: u64) -> Result<i64, i64> {
             Ok(0)
         }
         VT_GETMODE => {
-            let mode = VT.lock().mode;
+            let mode = VT.lock().current_mode();
             usercopy::to_program(arg, &mode)?;
             Ok(0)
         }
@@ -480,7 +543,7 @@ pub fn ioctl(t: &Tty, request: u32, arg: u64) -> Result<i64, i64> {
         }
         VT_RELDISP => {
             // No switch is ever pending: only an acquisition's acknowledgement.
-            if VT.lock().mode[0] != VT_PROCESS || arg != VT_ACKACQ {
+            if VT.lock().current_mode()[0] != VT_PROCESS || arg != VT_ACKACQ {
                 return Err(EINVAL);
             }
             Ok(0)
@@ -538,7 +601,10 @@ fn set_mode(mut m: [u8; 8]) -> Result<i64, i64> {
     }
     m[6] = 0;
     m[7] = 0;
-    VT.lock().mode = m;
+    let owner = if m[0] == VT_PROCESS { Some(ProcRef::caller()?) } else { None };
+    let mut vt = VT.lock();
+    vt.mode = m;
+    vt.owner = owner;
     Ok(0)
 }
 

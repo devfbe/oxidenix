@@ -1491,6 +1491,24 @@ static void console_vt(void) {
     check("VT_SETMODE with another mode: EINVAL", ioctl(c, VT_SETMODE, &vm) == -1 && errno == EINVAL);
     vm = (typeof(vm)){0, 0, 0, 0, 0};
     ioctl(c, VT_SETMODE, &vm);
+    /* The processes the VT remembers are held by identity, not by pid: a VT_PROCESS
+     * owner that is gone leaves VT_AUTO; KDSIGACCEPT's process gone, the keyboard signal
+     * goes nowhere (not to whoever has its pid, not to us). */
+    pid_t owner = fork();
+    if (owner == 0) {
+        typeof(vm) mine = {1, 0, SIGUSR1, SIGUSR2, 0};
+        ioctl(c, VT_SETMODE, &mine);
+        ioctl(c, KDSIGACCEPT, SIGUSR1);
+        _exit(0);
+    }
+    waitpid(owner, NULL, 0);
+    check("a VT_PROCESS owner gone: VT_AUTO again, VT_RELDISP EINVAL",
+          ioctl(c, VT_GETMODE, &vm2) == 0 && vm2.mode == 0 && ioctl(c, VT_RELDISP, 2) == -1 && errno == EINVAL);
+    sigprocmask(SIG_BLOCK, &usr1, &old);
+    typed((unsigned char[]){0x38, 0xe0, 0x48, 0xe0, 0xc8, 0xb8}, 6);
+    struct timespec brief = {0, 300 * 1000000L};
+    check("KDSIGACCEPT's process gone: Alt+Up signals nobody", sigtimedwait(&usr1, NULL, &brief) == -1 && errno == EAGAIN);
+    sigprocmask(SIG_SETMASK, &old, NULL);
     check("VT_ACTIVATE 1 is done, 2 and 0 are ENXIO",
           ioctl(c, VT_ACTIVATE, 1) == 0 && ioctl(c, VT_ACTIVATE, 2) == -1 && errno == ENXIO && ioctl(c, VT_ACTIVATE, 0) == -1 && errno == ENXIO);
     check("VT_WAITACTIVE 1 returns at once", ioctl(c, VT_WAITACTIVE, 1) == 0);

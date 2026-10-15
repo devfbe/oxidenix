@@ -76,6 +76,14 @@ static HOLDER_GEN: AtomicU64 = AtomicU64::new(0);
 /// Makes `id` (0: the monitor) the holder, whose service thread waits on `chan`;
 /// returns the previous holder. Input already there is the new holder's.
 pub fn set_holder(id: u64, chan: usize) -> u64 {
+    let old = set_holder_locked(id, chan);
+    if old != id {
+        holder_changed();
+    }
+    old
+}
+
+fn set_holder_locked(id: u64, chan: usize) -> u64 {
     let _change = CHANGE.lock();
     HOLDER_CHAN.store(chan, Ordering::Release);
     // Echoes of the previous holder's input are not the new one's: those queued go,
@@ -92,13 +100,17 @@ pub fn set_holder(id: u64, chan: usize) -> u64 {
 
 /// Instance `id` is gone: if it still held the device, the monitor does.
 pub fn release(id: u64) {
-    let _change = CHANGE.lock();
-    if HOLDER.load(Ordering::Acquire) == id {
+    {
+        let _change = CHANGE.lock();
+        if HOLDER.load(Ordering::Acquire) != id {
+            return;
+        }
         HOLDER_CHAN.store(0, Ordering::Release);
         change_holder(0);
         wakeup(TURN_CHAN);
         wakeup(MONITOR_CHAN);
     }
+    holder_changed();
 }
 
 /// For the event wait of instance `id`'s service thread: whether input came for it
@@ -258,12 +270,16 @@ fn change_holder(id: u64) -> u64 {
         old
     };
     if old != id {
-        // What the old holder set up goes with it: its terminals' claims of the serial
-        // ports, a graphics mode of its programs (as Linux's `reset_vc`).
+        // The old holder's terminals' claims of the serial ports go with it.
         super::serial::release_all();
-        super::console::set_graphics(false);
     }
     old
+}
+
+/// After a change of the holder (no lock held: a redraw takes a while): a graphics mode of
+/// the old holder's programs ends (as Linux's `reset_vc`).
+fn holder_changed() {
+    super::console::set_graphics(false);
 }
 
 /// Writes the queued echoes (the writer's turn held). A batch is taken with the holder
