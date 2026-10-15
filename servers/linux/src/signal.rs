@@ -350,6 +350,9 @@ pub enum RestartBlock {
     Poll { fds: u64, nfds: u64, deadline: Option<u64> },
     /// A futex wait with a timeout: on to its monotonic deadline (`futex`).
     Futex { uaddr: u64, val: u32, deadline: u64, bitset: u64, private: u64 },
+    /// A relative sleep on a CPU clock (Linux's clock id): on to its deadline on that clock
+    /// (`timer::cpu_sleep_rest`), the time left at `rem` if interrupted again.
+    CpuSleep { clock: i32, deadline: u64, rem: u64 },
 }
 
 /// Linux's kernel-internal restart codes, which a call the server handles may return when
@@ -1695,7 +1698,8 @@ fn pause() -> Result<i64, i64> {
 }
 
 /// restart_syscall: the interrupted call goes on with what it kept (a relative sleep to its
-/// first deadline, a poll or a futex wait with its deadline); EINTR for nothing kept.
+/// first deadline, also on a CPU clock, a poll or a futex wait with its deadline); EINTR
+/// for nothing kept.
 fn restart_syscall() -> Result<i64, i64> {
     let block = {
         let mut t = PROCS.lock();
@@ -1705,6 +1709,7 @@ fn restart_syscall() -> Result<i64, i64> {
         Some(b @ RestartBlock::Sleep { .. }) => crate::time::sleep_rest(b),
         Some(RestartBlock::Poll { fds, nfds, deadline }) => crate::poll::poll_until(fds, nfds, deadline),
         Some(b @ RestartBlock::Futex { .. }) => crate::futex::wait_rest(b),
+        Some(RestartBlock::CpuSleep { clock, deadline, rem }) => crate::timer::cpu_sleep_rest(clock, deadline, rem),
         None => Err(EINTR),
     }
 }

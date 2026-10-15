@@ -43,6 +43,11 @@ impl EventFd {
         Self::readiness(*self.count.lock())
     }
 
+    /// For /proc/<pid>/fdinfo: its count, its id, whether it is a semaphore.
+    pub fn fdinfo(&self) -> (u64, u64, bool) {
+        (*self.count.lock(), self.id, self.semaphore)
+    }
+
     /// After a change (lock held): wake the waiters and report, every time
     /// (each change is an event for EPOLLET).
     fn changed(&self, count: u64) {

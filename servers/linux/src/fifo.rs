@@ -16,7 +16,7 @@
 //! close.
 
 use crate::datafs;
-use crate::files::{self, File, O_ACCMODE, O_CLOEXEC, O_NONBLOCK};
+use crate::files::{self, File, O_ACCMODE};
 use crate::inotify;
 use crate::namespace::{Node, Origin};
 use crate::pipe;
@@ -120,7 +120,7 @@ pub fn open(node: Node, flags: u32, path: String) -> Result<i64, i64> {
             return Err(e);
         }
     };
-    let kept = flags & (O_ACCMODE | O_NONBLOCK | O_CLOEXEC);
+    let kept = files::status_flags(flags);
     match files::install_in_watched(room, id, File::Pipe(end.clone()), kept, watch) {
         Ok(fd) => {
             end.installed();

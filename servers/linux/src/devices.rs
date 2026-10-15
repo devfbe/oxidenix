@@ -9,7 +9,7 @@
 //! a call moves at most `MAX_RW_COUNT` bytes. A read of zero fills the whole count, and
 //! returns what it filled when a signal comes.
 
-use crate::files::{self, File, EINVAL, O_ACCMODE, O_CLOEXEC, O_NONBLOCK};
+use crate::files::{self, File, EINVAL, O_ACCMODE};
 use crate::namespace::Origin;
 use crate::unix::Sink;
 use crate::usercopy;
@@ -36,7 +36,7 @@ pub struct DevOpen {
 
 /// Opens the node `origin` as `kind`.
 pub fn open(kind: Kind, flags: u32, origin: Origin) -> Result<i64, i64> {
-    let kept = flags & (O_ACCMODE | O_NONBLOCK | O_CLOEXEC);
+    let kept = files::status_flags(flags);
     // Always ready (`File::always_ready`: epoll refuses it with EPERM, as Linux's).
     files::install(files::new_id(), File::Dev(crate::heap::try_arc(DevOpen { kind, origin })?), kept)
 }

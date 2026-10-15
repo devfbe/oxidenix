@@ -73,6 +73,11 @@ An AI research project; see README.md.
 - `OXIDENIX_AUTORUN=<host script> cargo run > log` boots into that script like test mode
   (exit status to QEMU, serial to stdout): for scripted experiments, e.g. running node and
   reading "syscall N not implemented" from the console log (the Linux server says it).
+  While another QEMU uses `disk.img`, give it a disk of its own: `OXIDENIX_DISK=<scratch file>`.
+- A panic of the Linux server prints `[linux] panic at file:line: message` and
+  `[linux] backtrace: <return addresses>` (frame pointers). The initramfs's servers are
+  stripped; resolve the addresses with the unstripped build:
+  `addr2line -e target/servers/x86_64-unknown-none/release/linux -f -C -i <addresses>`.
 
 ## Finding code
 

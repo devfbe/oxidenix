@@ -25,16 +25,11 @@ done, delete it here in the same commit.
 - **/data across process trees: what stays per tree** (ADR 0015 made the page cache one per
   file for every tree): a FIFO's pipe and times, inotify events of other trees' changes, and
   `sendfile`/`copy_file_range` into an `O_APPEND` file are atomic within their tree only.
-- **The task table (`MAX_PROCS`, 256) has no share per tree**: one tree can take every slot
-  (and with it the PI table's room) and starve the others' fork, clone and exec. A reserve per
-  instance (as netd's budgets, ADR 0008) would keep each tree a minimum.
 - `RLIMIT_NPROC` is not enforced (Linux exempts root; the kernel's process table is the bound).
 
 ## Linux features not implemented
 
-- Processes and signals: thread pidfds (`PIDFD_THREAD`, `CLONE_PIDFD` with `CLONE_THREAD`;
-  Linux 6.9), `/proc/<pid>/fdinfo` (a pidfd's `Pid:` line), `clock_nanosleep` on CPU clocks
-  (`EOPNOTSUPP`; the CPU-time alarms would carry it), core files, `ptrace`.
+- Processes and signals: core files, `ptrace`.
   `/proc/<pid>/maps` names the program file, the vDSO, the stack and the heap, but not other
   mapped files (it would need the server to know which file each mapped object is); no
   `smaps`.

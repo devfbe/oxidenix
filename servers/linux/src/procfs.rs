@@ -11,7 +11,7 @@
 //!   procfs that restarted serves them as before (a new channel is made
 //!   when the old one died).
 //! - **The server** makes each process's own part: `/proc/<pid>` (its
-//!   files, `task/<tid>`, `fd/<n>`, `cwd`, `root`, `exe`, `mounts`),
+//!   files, `task/<tid>`, `fd/<n>`, `fdinfo/<n>`, `cwd`, `root`, `exe`, `mounts`),
 //!   `self`, `thread-self` and `mounts`, merged into procfs's root, and
 //!   `sys/vm` (the kernel's overcommit policy, ADR 0013) in procfs's
 //!   `sys`. The records come from the server's process table
@@ -104,9 +104,12 @@ pub enum PidFile {
     OomAdj,
     /// The mappings of its address space (`maps`).
     Maps,
+    /// What each descriptor's open file is at (`fdinfo/<fd>`).
+    FdInfo,
 }
 
 const PID_FILES: &[(&str, PidFile)] = &[
+    ("fdinfo", PidFile::FdInfo),
     ("maps", PidFile::Maps),
     ("stat", PidFile::Stat),
     ("statm", PidFile::Statm),
@@ -179,6 +182,9 @@ pub enum ProcNode {
     Task { pid: u64, tid: u64, file: PidFile },
     /// /proc/<pid>/fd/<fd>: a magic link.
     Fd { pid: u64, fd: u32 },
+    /// /proc/<pid>/fdinfo/<fd>: the descriptor's position, flags, mount, inode and what
+    /// its kind of file adds.
+    FdInfo { pid: u64, fd: u32 },
     /// /proc/sys/vm and its files.
     Vm(VmFile),
     /// The open file a magic link led to that is no filesystem's node (a
@@ -447,7 +453,7 @@ fn id_name(name: &str) -> Option<u64> {
 fn pid_mode(file: PidFile) -> u32 {
     match file {
         PidFile::Dir | PidFile::Task => S_IFDIR | 0o555,
-        PidFile::Fd => S_IFDIR | 0o500,
+        PidFile::Fd | PidFile::FdInfo => S_IFDIR | 0o500,
         PidFile::Exe | PidFile::Cwd | PidFile::Root => S_IFLNK | 0o777,
         PidFile::OomScoreAdj | PidFile::OomAdj => S_IFREG | 0o644,
         _ => S_IFREG | 0o444,
@@ -473,6 +479,8 @@ pub fn mode(node: &ProcNode) -> u32 {
         ProcNode::SelfLink | ProcNode::ThreadSelf | ProcNode::MountsLink => S_IFLNK | 0o777,
         ProcNode::Pid { file, .. } | ProcNode::Task { file, .. } => pid_mode(*file),
         ProcNode::Fd { .. } => S_IFLNK | 0o700,
+        // (Linux's proc_fdinfo_instantiate: S_IRUSR.)
+        ProcNode::FdInfo { .. } => S_IFREG | 0o400,
         ProcNode::Vm(file) => vm_mode(*file),
         ProcNode::Open(_) => stat(node).map_or(0, |st| namespace::mode_of(&st)),
     }
@@ -492,7 +500,7 @@ fn check(node: &ProcNode) -> Result<(), i64> {
             }
             Ok(())
         }
-        ProcNode::Fd { pid, fd } => fd_file(*pid, *fd).map(|_| ()),
+        ProcNode::Fd { pid, fd } | ProcNode::FdInfo { pid, fd } => fd_file(*pid, *fd).map(|_| ()),
         _ => Ok(()),
     }
 }
@@ -501,7 +509,7 @@ fn check(node: &ProcNode) -> Result<(), i64> {
 /// process has a descriptor table).
 pub fn may_open(node: &ProcNode) -> Result<(), i64> {
     match node {
-        ProcNode::Pid { pid, file: PidFile::Fd } => table(*pid).map(|_| ()),
+        ProcNode::Pid { pid, file: PidFile::Fd | PidFile::FdInfo } => table(*pid).map(|_| ()),
         _ => check(node),
     }
 }
@@ -562,6 +570,11 @@ pub fn lookup(dir: &ProcNode, name: &str) -> Result<ProcNode, i64> {
             fd_file(*pid, fd)?;
             Ok(ProcNode::Fd { pid: *pid, fd })
         }
+        ProcNode::Pid { pid, file: PidFile::FdInfo } => {
+            let fd = id_name(name).and_then(|n| u32::try_from(n).ok()).ok_or(ENOENT)?;
+            fd_file(*pid, fd)?;
+            Ok(ProcNode::FdInfo { pid: *pid, fd })
+        }
         _ => Err(ENOTDIR),
     }
 }
@@ -576,6 +589,7 @@ fn ino(node: &ProcNode) -> u64 {
         ProcNode::Pid { pid, file } => (pid + 1) << 20 | *file as u64,
         ProcNode::Task { tid, file, .. } => (tid + 1) << 20 | 1 << 12 | *file as u64,
         ProcNode::Fd { pid, fd } => (pid + 1) << 20 | 2 << 12 | *fd as u64,
+        ProcNode::FdInfo { pid, fd } => (pid + 1) << 20 | 3 << 12 | *fd as u64,
         ProcNode::Vm(file) => 0x1_0010 + *file as u64,
         ProcNode::Open(_) => 0,
     }
@@ -675,6 +689,14 @@ pub fn list(dir: &ProcNode) -> Result<Vec<(String, u64, u8)>, i64> {
             let mut out = fixed(&ProcNode::Pid { pid: *pid, file: PidFile::Dir }, &[], &|file| ProcNode::Pid { pid: *pid, file })?;
             for fd in fds {
                 add_id(&mut out, fd as u64, &ProcNode::Fd { pid: *pid, fd })?;
+            }
+            Ok(out)
+        }
+        ProcNode::Pid { pid, file: PidFile::FdInfo } => {
+            let fds = table(*pid)?.open_fds()?;
+            let mut out = fixed(&ProcNode::Pid { pid: *pid, file: PidFile::Dir }, &[], &|file| ProcNode::Pid { pid: *pid, file })?;
+            for fd in fds {
+                add_id(&mut out, fd as u64, &ProcNode::FdInfo { pid: *pid, fd })?;
             }
             Ok(out)
         }
@@ -851,6 +873,7 @@ pub fn contents(node: &ProcNode) -> Result<Vec<u8>, i64> {
             }
             return Ok(try_format!("{value}\n")?.into_bytes());
         }
+        ProcNode::FdInfo { pid, fd } => return Ok(fdinfo(*pid, *fd)?.into_bytes()),
         ProcNode::Pid { pid, file } => (*pid, *file),
         ProcNode::Task { tid, file, .. } => {
             check(node)?;
@@ -875,10 +898,87 @@ pub fn contents(node: &ProcNode) -> Result<Vec<u8>, i64> {
         PidFile::OomScoreAdj => try_format!("{}\n", oom_adj_of(id, 0, 0)?)?,
         PidFile::OomAdj => try_format!("{}\n", fmt::oom_adj(oom_adj_of(id, 0, 0)?))?,
         PidFile::Maps => maps(id)?,
-        PidFile::Dir | PidFile::Task | PidFile::Fd => return Err(EISDIR),
+        PidFile::Dir | PidFile::Task | PidFile::Fd | PidFile::FdInfo => return Err(EISDIR),
         PidFile::Exe | PidFile::Cwd | PidFile::Root => return Err(EINVAL),
     };
     Ok(text.into_bytes())
+}
+
+/// A file's position (/proc/<pid>/fdinfo's `pos`): the files with one (tmpfs, /data,
+/// /proc and /sys), 0 for the rest, as Linux's that never move f_pos.
+fn position(file: &File) -> i64 {
+    match file {
+        File::Tmp(t) => t.shown_position() as i64,
+        File::Data(d) => d.shown_position() as i64,
+        File::Proc(p) => p.shown_position() as i64,
+        _ => 0,
+    }
+}
+
+/// The id of the mount a description's file is on (fdinfo's `mnt_id`): the mount its path
+/// lies in, the internal ones of sockets, pipes and anonymous inodes (`namespace`).
+fn mount_of(f: &FileRef) -> u32 {
+    match &f.file {
+        File::Tmp(t) => namespace::mount_id(&t.path),
+        File::Data(d) => namespace::mount_id(&d.path),
+        File::Proc(p) => namespace::mount_id(&p.path),
+        File::Pipe(end) => end.named().map_or(namespace::PIPEFS_MOUNT_ID, |n| namespace::mount_id(&n.origin().path)),
+        File::Socket(_) | File::Inet(_) | File::Netlink(_) => namespace::SOCKFS_MOUNT_ID,
+        File::EventFd(_) | File::Inotify(_) | File::Epoll(_) | File::TimerFd(_) | File::PidFd(_) => namespace::ANON_INODE_MOUNT_ID,
+        File::Tty(_) | File::PtyMaster(_) | File::Dev(_) | File::Kmsg(_) | File::Path(_) => {
+            files::origin_of_file(f).map_or(namespace::ANON_INODE_MOUNT_ID, |o| namespace::mount_id(&o.path))
+        }
+    }
+}
+
+/// A device number (`st_dev`) in the kernel's encoding, as fdinfo shows it.
+fn kernel_dev(dev: u64) -> u32 {
+    let (major, minor) = vfs::stat::dev_split(dev);
+    fmt::kernel_dev(major, minor)
+}
+
+/// /proc/<pid>/fdinfo/<fd> (proc(5)): the descriptor's position, status flags (with
+/// O_CLOEXEC for a close-on-exec descriptor), mount and inode, and what its kind of file
+/// adds, as Linux's: a pidfd's `Pid:`, an eventfd's count, a timerfd's setting, an epoll
+/// instance's interests, an inotify instance's watches.
+fn fdinfo(pid: u64, fd: u32) -> Result<String, i64> {
+    let (f, cloexec) = table(pid)?.get_with_cloexec(fd as u64).map_err(|_| ENOENT)?;
+    let ino_of = |file: &File| files::stat_file(file).map_or((0, 0), |s| (s.ino, s.dev));
+    let info = |kind| fmt::FdInfo {
+        pos: position(&f.file),
+        flags: f.flags() | if cloexec { files::O_CLOEXEC } else { 0 },
+        mnt_id: mount_of(&f),
+        ino: ino_of(&f.file).0,
+        kind,
+    };
+    let text = match &f.file {
+        File::PidFd(p) => try_format!("{}", info(fmt::FdKind::PidFd { pid: p.shown_pid() }))?,
+        File::EventFd(e) => {
+            let (count, id, semaphore) = e.fdinfo();
+            try_format!("{}", info(fmt::FdKind::EventFd { count, id, semaphore }))?
+        }
+        File::TimerFd(t) => {
+            let (clockid, ticks, settime_flags, value, interval) = t.fdinfo();
+            try_format!("{}", info(fmt::FdKind::TimerFd { clockid, ticks, settime_flags, value, interval }))?
+        }
+        File::Epoll(e) => {
+            let interests = e.interests()?;
+            let mut targets = try_vec(interests.len())?;
+            for (fd, events, data, file) in interests {
+                let (pos, (ino, dev)) = file.as_ref().map_or((0, (0, 0)), |d| (position(&d.file), ino_of(&d.file)));
+                targets.push(fmt::EpollTarget { fd, events, data, pos, ino, sdev: kernel_dev(dev) });
+            }
+            try_format!("{}", info(fmt::FdKind::Epoll(&targets)))?
+        }
+        File::Inotify(i) => {
+            let marks = i.marks()?;
+            let mut out = try_vec(marks.len())?;
+            out.extend(marks.iter().map(|&(wd, ino, dev, mask)| fmt::InotifyMark { wd, ino, sdev: kernel_dev(dev), mask }));
+            try_format!("{}", info(fmt::FdKind::Inotify(&out)))?
+        }
+        _ => try_format!("{}", info(fmt::FdKind::Plain))?,
+    };
+    Ok(text)
 }
 
 /// The oom_score_adj of process (or thread) `pid`, read (`flags` 0) or set

@@ -71,6 +71,8 @@ struct Setting {
     cancel: Option<u64>,
     /// The latest expiry the timer thread reported to pollers.
     reported: u64,
+    /// The flags of the timerfd_settime that set it (fdinfo's `settime flags`).
+    flags: u32,
 }
 
 impl Setting {
@@ -139,6 +141,8 @@ struct Timer {
     id: u64,
     /// A clock of the wall's (CLOCK_REALTIME, CLOCK_REALTIME_ALARM).
     realtime: bool,
+    /// Its clock as the program named it (fdinfo's `clockid`).
+    clockid: i32,
     setting: Mutex<Setting>,
     /// Advances when the setting changes (or the clock is set): readers look again.
     seq: AtomicU32,
@@ -166,6 +170,15 @@ pub struct TimerFd {
 impl TimerFd {
     pub fn ready(&self) -> i16 {
         Timer::readiness(&self.timer.setting.lock())
+    }
+
+    /// For /proc/<pid>/fdinfo: its clock id, the expiries not read yet, the flags of its
+    /// setting, the time left and the interval (nanoseconds).
+    pub fn fdinfo(&self) -> (i32, u64, u32, u64, u64) {
+        let s = self.timer.setting.lock();
+        let now = s.now();
+        let (left, every) = s.left(now);
+        (self.timer.clockid, s.expired(now), s.flags, left, every)
     }
 
     /// Takes the count of expiries into 8 bytes at `buf`; waits while there is none.
@@ -291,7 +304,7 @@ fn create(clock: u64, flags: u64) -> Result<i64, i64> {
     if flags & !((files::O_NONBLOCK | files::O_CLOEXEC) as u64) != 0 {
         return Err(EINVAL);
     }
-    let timer = heap::try_arc(Timer { id: files::new_id(), realtime, setting: Mutex::new(Setting::default()), seq: AtomicU32::new(0) })?;
+    let timer = heap::try_arc(Timer { id: files::new_id(), realtime, clockid: clock as i32, setting: Mutex::new(Setting::default()), seq: AtomicU32::new(0) })?;
     let file = heap::try_arc(TimerFd { timer: timer.clone() })?;
     {
         // Known to the timer thread before it can be set; forgotten again if no
@@ -332,7 +345,7 @@ fn settime(fd: u64, flags: u64, new: u64, old: u64) -> Result<i64, i64> {
             _ => mono().saturating_add(value),
         };
         let cancel = (wall && flags & TFD_TIMER_CANCEL_ON_SET != 0).then(|| CLOCK_SETS.load(Ordering::Acquire));
-        *s = Setting { at, wall, every: if at == 0 { 0 } else { interval }, ticks: 0, cancel, reported: 0 };
+        *s = Setting { at, wall, every: if at == 0 { 0 } else { interval }, ticks: 0, cancel, reported: 0, flags: flags as u32 };
         timer.changed(&s);
         was
     };

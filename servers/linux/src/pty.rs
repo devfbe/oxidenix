@@ -110,7 +110,7 @@ pub fn open_master(flags: u32, origin: Origin) -> Result<i64, i64> {
             p.master_reported = ready;
         }
     }
-    let fd = node.and_then(|_| files::install(id, File::PtyMaster(master.clone()), flags & (O_ACCMODE | O_NONBLOCK | O_CLOEXEC)));
+    let fd = node.and_then(|_| files::install(id, File::PtyMaster(master.clone()), files::status_flags(flags)));
     match fd {
         Ok(fd) => Ok(fd),
         Err(e) => {

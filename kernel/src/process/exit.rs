@@ -97,9 +97,13 @@ pub fn exit_thread(status: i32) -> ! {
             // a zombie only of its own.
             if group.server_reaps.load(Ordering::Relaxed) {
                 table.groups.remove(&group.tgid);
-            } else {
-                table.zombies += 1;
             }
+        }
+        // The thread's slot of the task table comes back, unless it is the
+        // last one of a process the kernel keeps a zombie of: that holds
+        // the slot until it is reaped.
+        if !last || group.server_reaps.load(Ordering::Relaxed) {
+            super::sched::share_of(&group.share).give();
         }
         last
     };
@@ -151,8 +155,9 @@ fn process_exit(group: &Arc<ThreadGroup>, status: i32) {
 fn reap(pid: Pid) -> Option<i32> {
     let mut table = TABLE.lock();
     let status = table.groups.get(&pid)?.info.lock().exit_status?;
-    table.groups.remove(&pid);
-    table.zombies -= 1;
+    let group = table.groups.remove(&pid)?;
+    drop(table);
+    super::sched::share_of(&group.share).give();
     Some(status)
 }
 

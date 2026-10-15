@@ -2,7 +2,9 @@
  * and system time), POSIX timers on the process's and a thread's CPU clocks and on another
  * process's: they expire once their clock has counted the time they were set for, never
  * before, not while the process sleeps, and soon after (the kernel's CPU-time alarms tell
- * the Linux server's timer thread; nothing polls a clock). */
+ * the Linux server's timer thread; nothing polls a clock); clock_nanosleep on the CPU
+ * clocks of the process, another thread and another process (relative, absolute, EINTR
+ * with the time left, restarted with SA_RESTART). */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <pthread.h>
@@ -296,9 +298,123 @@ static void posix_cpu_timers(void) {
     check("timer_create on a CPU clock of no process is EINVAL", timer_create((clockid_t)((-30000 - 1) * 8 + 2), &sev, &t) < 0 && errno == EINVAL);
 }
 
+static struct timespec ts_of(int64_t ns) {
+    return (struct timespec){ns / 1000000000, ns % 1000000000};
+}
+
+static volatile sig_atomic_t alarms;
+
+static void on_alarm(int sig) {
+    (void)sig;
+    alarms++;
+}
+
+/* A one-shot ITIMER_REAL after `ms` of wall time. */
+static void alarm_in(long ms) {
+    struct itimerval it = {{0, 0}, {ms / 1000, (ms % 1000) * 1000}};
+    setitimer(ITIMER_REAL, &it, NULL);
+}
+
+/* clock_nanosleep on CPU clocks: the sleeper sleeps, the clock's owner runs. */
+static void cpu_sleeps(void) {
+    pthread_t th;
+    spin_flag = 0;
+    pthread_create(&th, NULL, spinner, (void *)20000L);
+
+    /* The process's clock, relative: the other thread's time ends it. */
+    int64_t start = cpu_ns();
+    struct timespec t = ts_of(100000000);
+    int r = clock_nanosleep(CLOCK_PROCESS_CPUTIME_ID, 0, &t, NULL);
+    check("clock_nanosleep(CLOCK_PROCESS_CPUTIME_ID, 100 ms)", r == 0 && cpu_ns() - start >= 100000000);
+
+    /* Absolute, on the clock's own scale; in the past; zero. */
+    int64_t target = cpu_ns() + 50000000;
+    t = ts_of(target);
+    r = clock_nanosleep(CLOCK_PROCESS_CPUTIME_ID, TIMER_ABSTIME, &t, NULL);
+    check("... TIMER_ABSTIME ends at its time", r == 0 && cpu_ns() >= target);
+    t = ts_of(1000);
+    int64_t wall = wall_ns();
+    check("... an absolute time past returns at once", clock_nanosleep(CLOCK_PROCESS_CPUTIME_ID, TIMER_ABSTIME, &t, NULL) == 0);
+    t = ts_of(0);
+    check("... and so does a zero time", clock_nanosleep(CLOCK_PROCESS_CPUTIME_ID, 0, &t, NULL) == 0 && wall_ns() - wall < 1000000000);
+
+    /* Another thread's clock (pthread_getcpuclockid). */
+    clockid_t thread_clock;
+    pthread_getcpuclockid(th, &thread_clock);
+    int64_t thread_start = ns_of(thread_clock);
+    t = ts_of(100000000);
+    r = clock_nanosleep(thread_clock, 0, &t, NULL);
+    check("clock_nanosleep on another thread's clock", r == 0 && ns_of(thread_clock) - thread_start >= 100000000);
+    spin_flag = 1;
+    pthread_join(th, NULL);
+
+    /* The calling thread's own clock: it would never advance. */
+    clockid_t own;
+    pthread_getcpuclockid(pthread_self(), &own);
+    check("... on the calling thread's own clock is EINVAL", clock_nanosleep(own, 0, &t, NULL) == EINVAL);
+    check("... on a CPU clock of no process is EINVAL", clock_nanosleep((clockid_t)((-30000 - 1) * 8 + 2), 0, &t, NULL) == EINVAL);
+    check("... on CLOCK_MONOTONIC_RAW is EOPNOTSUPP", clock_nanosleep(CLOCK_MONOTONIC_RAW, 0, &t, NULL) == EOPNOTSUPP);
+    t.tv_nsec = 1000000000;
+    check("... with a bad timespec is EINVAL", clock_nanosleep(CLOCK_PROCESS_CPUTIME_ID, 0, &t, NULL) == EINVAL);
+
+    /* Another process's clock (clock_getcpuclockid). */
+    pid_t child = fork();
+    if (child == 0) {
+        spin_cpu(20000);
+        _exit(0);
+    }
+    clockid_t child_clock;
+    clock_getcpuclockid(child, &child_clock);
+    int64_t own_start = cpu_ns(), child_start = ns_of(child_clock);
+    t = ts_of(100000000);
+    r = clock_nanosleep(child_clock, 0, &t, NULL);
+    check("clock_nanosleep on another process's clock", r == 0 && ns_of(child_clock) - child_start >= 100000000 && cpu_ns() - own_start < 100000000);
+    kill(child, SIGKILL);
+    waitpid(child, NULL, 0);
+
+    /* A signal ends it: EINTR and the CPU time left (the process sleeps, nothing runs). */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_alarm;
+    sigaction(SIGALRM, &sa, NULL);
+    alarm_in(100);
+    t = ts_of(10000000000LL);
+    struct timespec left = {0, 0};
+    r = clock_nanosleep(CLOCK_PROCESS_CPUTIME_ID, 0, &t, &left);
+    check("a handler interrupts it: EINTR", r == EINTR && alarms == 1);
+    check("... with the CPU time left", left.tv_sec == 9 && left.tv_nsec > 0);
+    alarm_in(100);
+    t = ts_of(cpu_ns() + 10000000000LL);
+    r = clock_nanosleep(CLOCK_PROCESS_CPUTIME_ID, TIMER_ABSTIME, &t, NULL);
+    check("... an absolute one too", r == EINTR && alarms == 2);
+
+    signal(SIGALRM, SIG_DFL);
+
+    /* A stop without a handler: it goes on to the same deadline (restart_syscall). */
+    spin_flag = 0;
+    pthread_create(&th, NULL, spinner, (void *)20000L);
+    pid_t stopper = fork();
+    if (stopper == 0) {
+        sleep_ms(30);
+        kill(getppid(), SIGSTOP);
+        sleep_ms(50);
+        kill(getppid(), SIGCONT);
+        _exit(0);
+    }
+    start = cpu_ns();
+    t = ts_of(300000000);
+    r = clock_nanosleep(CLOCK_PROCESS_CPUTIME_ID, 0, &t, NULL);
+    int status = 0;
+    waitpid(stopper, &status, 0);
+    check("stopped and continued, it sleeps its whole CPU time", r == 0 && cpu_ns() - start >= 300000000 && WIFEXITED(status));
+    spin_flag = 1;
+    pthread_join(th, NULL);
+}
+
 int main(void) {
     itimers();
     posix_cpu_timers();
+    cpu_sleeps();
     if (failures) {
         printf("cputimertest: %d FAILED\n", failures);
         return 1;

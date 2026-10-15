@@ -9,8 +9,10 @@
  * port one tree holds, in TIME-WAIT too, is EADDRINUSE for the other and
  * never taken over; SO_REUSEADDR shares only within a tree), TCP and UDP
  * between the trees, the reserve of netd's budget (one tree that used up
- * its share leaves the other its reserve), the reserve of the server's
- * heap (one tree that took all memory leaves the other's server working),
+ * its share leaves the other its reserve), the reserve of the task table
+ * (one tree that took every slot it could with threads, until EAGAIN,
+ * leaves the other its reserve), the reserve of the server's heap (one
+ * tree that took all memory leaves the other's server working),
  * and /data shared as on one Linux machine (ADR 0015: one page cache per
  * file for both trees): names at once, data written in one tree read in
  * the other at once without fsync, also over pages it had cached, appends
@@ -28,7 +30,9 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <linux/futex.h>
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -425,6 +429,61 @@ static void net_reserve(void) {
     close(srv);
 }
 
+/* Slots of the task table taken by threads that wait until released
+ * (threads take them as processes do, and cost little memory: a fork of
+ * this program commits its writable memory, so memory would run out long
+ * before the table). */
+static volatile int holders_go;
+
+static void *holder(void *arg) {
+    (void)arg;
+    while (!holders_go) syscall(SYS_futex, &holders_go, FUTEX_WAIT_PRIVATE, 0, NULL, NULL, 0);
+    return NULL;
+}
+
+/* Starts threads until pthread_create fails or `cap` of them run: how
+ * many, the error in *err (0: none). */
+static int hold_tasks(pthread_t *threads, int cap, int *err) {
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 16384);
+    holders_go = 0;
+    int n = 0;
+    *err = 0;
+    while (n < cap) {
+        int e = pthread_create(&threads[n], &attr, holder, NULL);
+        if (e) {
+            *err = e;
+            break;
+        }
+        n++;
+    }
+    pthread_attr_destroy(&attr);
+    return n;
+}
+
+/* Releases and joins them: whether all were joined. */
+static int release_tasks(pthread_t *threads, int n) {
+    holders_go = 1;
+    syscall(SYS_futex, &holders_go, FUTEX_WAKE_PRIVATE, 0x7fffffff, NULL, NULL, 0);
+    int joined = 0;
+    for (int i = 0; i < n; i++) joined += pthread_join(threads[i], NULL) == 0;
+    return joined == n;
+}
+
+/* The reserve of the task table while the other tree took every slot it
+ * could: this tree still makes processes (its reserve, less its pager's
+ * process with its three threads and this one). */
+static void task_reserve(void) {
+    static pthread_t threads[256];
+    int err;
+    int n = hold_tasks(threads, 256, &err);
+    printf("treetest peer: %d threads, then %s\n", n, strerror(err));
+    check("task table full elsewhere: threads of this tree's reserve", n >= 8);
+    check("and no more than it: EAGAIN", err == EAGAIN && n < 32);
+    check("they end", release_tasks(threads, n));
+}
+
 /* ------------------------------------------------- /data coherence (ADR 0015) */
 
 /* Both trees use one page cache per file: what one writes the other reads
@@ -647,6 +706,9 @@ static int peer(int argc, char **argv) {
         } else if (strcmp(cmd, "NETRESERVE") == 0) {
             net_reserve();
             answer("NETRESERVE");
+        } else if (strcmp(cmd, "TASKRESERVE") == 0) {
+            task_reserve();
+            answer("TASKRESERVE");
         } else if (strcmp(cmd, "MEMRESERVE") == 0) {
             holding = 1;
             heap_reserve();
@@ -1079,6 +1141,20 @@ int main(int argc, char **argv) {
             int s = bound(SOCK_DGRAM, "127.0.0.1", 0);
             check("its sockets closed, this tree has sockets again", s >= 0);
             if (s >= 0) close(s);
+        }
+
+        /* The task table: this tree takes every slot it can, the other keeps its reserve. */
+        if (alive) {
+            static pthread_t threads[256];
+            int err;
+            int n = hold_tasks(threads, 256, &err);
+            printf("treetest: %d threads, then %s\n", n, strerror(err));
+            check("this tree takes the task table's free slots: EAGAIN", err == EAGAIN && n >= 64);
+            alive = step("TASKRESERVE", "TASKRESERVE");
+            check("its threads end", release_tasks(threads, n));
+            pid_t c = fork();
+            if (c == 0) _exit(0);
+            check("then this tree forks again", c > 0 && waitpid(c, NULL, 0) == c);
         }
 
         /* The server's heap: this tree takes all memory, the other's server keeps its reserve. */

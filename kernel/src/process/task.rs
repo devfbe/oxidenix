@@ -154,10 +154,14 @@ pub struct ThreadGroup {
     /// holds, the process is Linux's global init, which the OOM killer
     /// never chooses). Unset for every other process.
     pub host_init: spin::Once<Arc<AtomicBool>>,
+    /// What its slots of the task table are charged to (`sched::Share`;
+    /// `None`: the kernel's): its tree's instance for a Linux program's
+    /// process and for the instance's pager process.
+    pub share: Option<Arc<super::sched::Share>>,
 }
 
 impl ThreadGroup {
-    pub fn new(tgid: Pid, info: Info) -> Option<Arc<ThreadGroup>> {
+    pub fn new(tgid: Pid, info: Info, share: Option<Arc<super::sched::Share>>) -> Option<Arc<ThreadGroup>> {
         Arc::try_new(ThreadGroup {
             tgid,
             privileged: AtomicBool::new(false),
@@ -173,6 +177,7 @@ impl ThreadGroup {
             oom_score_adj_min: AtomicI64::new(0),
             oom_victim: AtomicBool::new(false),
             host_init: spin::Once::new(),
+            share,
         })
         .ok()
     }
@@ -349,7 +354,7 @@ impl Task {
     pub fn idle_task(cpu: usize, kstack: Option<KernelStack>, kernel_rsp: u64) -> Task {
         let id = u64::MAX - cpu as u64;
         let name = alloc::format!("idle/{cpu}");
-        let group = ThreadGroup::new(id, Info::new(name.clone())).expect("idle task at boot");
+        let group = ThreadGroup::new(id, Info::new(name.clone()), None).expect("idle task at boot");
         let mut t = Task::new(id, group, name, Process::empty(), kstack, kernel_rsp);
         t.idle = true;
         t.state = AtomicU8::new(State::Running as u8);
@@ -358,7 +363,7 @@ impl Task {
 
     /// A kernel thread (see `sched::spawn_kernel_thread`).
     pub fn kernel_thread(id: u64, name: &str, kstack: KernelStack, kernel_rsp: u64) -> Option<Arc<Task>> {
-        let group = ThreadGroup::new(id, Info::new(name.into()))?;
+        let group = ThreadGroup::new(id, Info::new(name.into()), None)?;
         Arc::try_new(Task::new(id, group, name.into(), Process::empty(), Some(kstack), kernel_rsp)).ok()
     }
 
