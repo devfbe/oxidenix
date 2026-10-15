@@ -1274,7 +1274,8 @@ Linux asks for write access only for files, directories and symlinks.
   through its scratch grant. Nothing of it is cached; a procfs that died is started again
   for a new channel and serves the same inodes.
 - **The server's own part**, each process's: `/proc/<pid>` with `stat`, `statm`, `status`,
-  `cmdline`, `comm`, `exe`, `mounts`, `oom_score`, `oom_score_adj`, `oom_adj`, `maps`,
+  `cmdline`, `comm`, `exe`, `mounts`, `mountinfo` (ids, parents, device numbers),
+  `oom_score`, `oom_score_adj`, `oom_adj`, `maps`,
   `task/<tid>/{stat,statm,status,cmdline,comm,oom_score,oom_score_adj,oom_adj,maps}`, `fd/<n>`,
   `fdinfo/<n>`, `cwd` and `root`; `/proc/self`, `/proc/thread-self` and
   `/proc/mounts` (a link to `self/mounts`), merged into procfs's root listing; and

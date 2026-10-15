@@ -1,6 +1,6 @@
 /* Process information: prctl, capabilities and /proc: procfs's system-wide
  * files and /sys, the Linux server's per-process part (/proc/<pid>, self,
- * thread-self, mounts, the memory figures of statm and status), its magic
+ * thread-self, mounts, mountinfo, the memory figures of statm and status), its magic
  * links (/proc/self/fd, /proc/<pid>/exe) and /proc/<pid>/fdinfo. */
 #include <dirent.h>
 #include <errno.h>
@@ -21,6 +21,7 @@
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
+#include <sys/sysmacros.h>
 #include <sys/sysinfo.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
@@ -93,6 +94,45 @@ static void *read_thread_self(void *arg) {
     return arg;
 }
 
+/* The line of /proc/self/mountinfo for mount point `at`: its id, its
+ * parent's, its device numbers and its type (0 if there is none). */
+struct mountinfo_line {
+    int id, parent;
+    unsigned major, minor;
+    char type[32];
+};
+
+static int mountinfo_find(const char *text, const char *at, struct mountinfo_line *out) {
+    for (const char *line = text; line && *line; line = strchr(line, '\n') ? strchr(line, '\n') + 1 : NULL) {
+        char point[128], type[32];
+        int id, parent;
+        unsigned major, minor;
+        if (sscanf(line, "%d %d %u:%u / %127s %*s - %31s", &id, &parent, &major, &minor, point, type) == 6 && strcmp(point, at) == 0) {
+            *out = (struct mountinfo_line){id, parent, major, minor, ""};
+            strcpy(out->type, type);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* /proc/self/mountinfo (proc_pid_mountinfo(5), what coreutils' df reads):
+ * each mount point's line has the device numbers stat gives its files, the
+ * parent is the mount it lies in, and the types are /proc/mounts'. */
+static int mountinfo_ok(void) {
+    static char text[4096];
+    slurp("/proc/self/mountinfo", text, sizeof text);
+    const char *points[] = {"/", "/dev", "/proc", "/sys", "/data", "/dev/pts"};
+    const char *types[] = {"tmpfs", "devtmpfs", "proc", "sysfs", "ext2", "devpts"};
+    struct mountinfo_line m[6];
+    for (int i = 0; i < 6; i++) {
+        struct stat st;
+        if (!mountinfo_find(text, points[i], &m[i]) || stat(points[i], &st) != 0) return 0;
+        if (m[i].major != major(st.st_dev) || m[i].minor != minor(st.st_dev) || strcmp(m[i].type, types[i]) != 0) return 0;
+    }
+    return m[0].parent != m[0].id && m[1].parent == m[0].id && m[4].parent == m[0].id && m[5].parent == m[1].id;
+}
+
 /* What the Linux server makes of /proc itself (I/O rings step 5): the
  * mounts, the threads, the working directory, and /proc's rules: nothing
  * can be created, removed, written or chmodded; reads from the start are
@@ -103,6 +143,7 @@ static void the_servers_part(void) {
     check("/proc/mounts lists the namespace's mounts",
           strstr(buf, "proc /proc proc rw") && strstr(buf, "sysfs /sys sysfs rw") && strstr(buf, " /data ext2 rw") && strstr(buf, "devpts /dev/pts devpts rw"));
     check("/proc/mounts is a link to self/mounts", readlink("/proc/mounts", link, sizeof link - 1) == 11 && strcmp(link, "self/mounts") == 0);
+    check("/proc/self/mountinfo: each mount's device and parent", mountinfo_ok());
 
     pthread_t t[2];
     pthread_create(&t[0], NULL, read_thread_self, NULL);

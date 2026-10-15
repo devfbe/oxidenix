@@ -37,6 +37,29 @@ done
 echo "=== gnu-hello"
 out=$(gnu-hello 2>&1)
 if [ "$out" = "Hello, world!" ]; then echo "PASS nixpkgs' GNU hello runs"; else fail "gnu-hello: '$out'"; fi
+# nixpkgs' coreutils as shipped (glibc, libacl, libattr, libgmp): one binary
+# that is each tool by the name it runs as, in /usr/gnu/bin (a link into the
+# store). Each command's output against BusyBox's or the expected, and nothing
+# on stderr (df reads /proc/self/mountinfo, ls asks for ACLs with lgetxattr).
+echo "=== GNU coreutils"
+G=/usr/gnu/bin
+gnu() {
+    name=$1; want=$2; shift 2
+    got=$("$@" 2>/tmp/gnu.err)
+    if [ "$got" = "$want" ] && [ ! -s /tmp/gnu.err ]; then echo "PASS coreutils $name"; else fail "coreutils $name: '$got' (stderr: $(cat /tmp/gnu.err))"; fi
+}
+gnu "ls -d" /etc $G/ls -d /etc
+gnu "ls -l" "$(ls -l /etc/passwd | sed 's/  */ /g' | cut -d' ' -f1,5)" sh -c "$G/ls -l /etc/passwd | $G/tr -s ' ' | $G/cut -d' ' -f1,5"
+gnu "ls -la /data" ok sh -c "$G/ls -la /data > /dev/null && echo ok"
+gnu sort "3 2 1" sh -c "$G/seq 1 3 | $G/sort -rn | $G/tr '\n' ' ' | sed 's/ \$//'"
+gnu sha256sum "$(sha256sum /etc/passwd)" $G/sha256sum /etc/passwd
+gnu stat "$(stat -c '%s %i %F' /etc/passwd)" $G/stat -c '%s %i %F' /etc/passwd
+gnu "df /data" "/data" sh -c "$G/df /data | $G/tail -n 1 | $G/tr -s ' ' | $G/cut -d' ' -f6"
+gnu "date -d @0" 1970-01-01 $G/date -u -d @0 +%F
+gnu "cp, mv, cat, rm on /data" "$(cat /etc/passwd)" sh -c "$G/cp /etc/passwd /data/gnu.cp && $G/mv /data/gnu.cp /data/gnu.mv && $G/cat /data/gnu.mv && $G/rm /data/gnu.mv"
+gnu "timeout" 124 sh -c "$G/timeout 0.2 $G/sleep 5; echo \$?"
+gnu "id" "uid=0(root) gid=0(root) groups=0(root)" $G/id
+rm -f /tmp/gnu.err
 
 echo "=== mmaptest /data"
 if mmaptest /data; then echo "PASS mmaptest /data"; else fail "mmaptest /data"; fi

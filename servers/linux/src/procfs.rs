@@ -11,7 +11,8 @@
 //!   procfs that restarted serves them as before (a new channel is made
 //!   when the old one died).
 //! - **The server** makes each process's own part: `/proc/<pid>` (its
-//!   files, `task/<tid>`, `fd/<n>`, `fdinfo/<n>`, `cwd`, `root`, `exe`, `mounts`),
+//!   files, `task/<tid>`, `fd/<n>`, `fdinfo/<n>`, `cwd`, `root`, `exe`, `mounts`,
+//!   `mountinfo`),
 //!   `self`, `thread-self` and `mounts`, merged into procfs's root, and
 //!   `sys/vm` (the kernel's overcommit policy, ADR 0013) in procfs's
 //!   `sys`. The records come from the server's process table
@@ -106,9 +107,12 @@ pub enum PidFile {
     Maps,
     /// What each descriptor's open file is at (`fdinfo/<fd>`).
     FdInfo,
+    /// The mount table with ids and device numbers (`mountinfo`).
+    MountInfo,
 }
 
 const PID_FILES: &[(&str, PidFile)] = &[
+    ("mountinfo", PidFile::MountInfo),
     ("fdinfo", PidFile::FdInfo),
     ("maps", PidFile::Maps),
     ("stat", PidFile::Stat),
@@ -890,6 +894,7 @@ pub fn contents(node: &ProcNode) -> Result<Vec<u8>, i64> {
         PidFile::Cmdline => return text(QUERY_CMDLINE, id),
         PidFile::Comm => try_format!("{}\n", fmt::name(&p))?,
         PidFile::Mounts => namespace::mounts_text()?,
+        PidFile::MountInfo => namespace::mountinfo_text()?,
         PidFile::OomScore => {
             let info = crate::process::kernel_info(id as crate::process::Pid).map_err(|_| ENOENT)?;
             let points = (info.oom_points != i64::MIN).then_some(info.oom_points);

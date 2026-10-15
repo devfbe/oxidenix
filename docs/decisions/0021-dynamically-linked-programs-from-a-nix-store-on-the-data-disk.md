@@ -32,16 +32,18 @@ Four questions:
    `userspace/dynamic/default.nix` builds the test programs with nixpkgs' glibc and musl
    toolchains (no patchelf) and lists in `closure` exactly the store files they need: what
    each dynamic loader resolves (`ld.so --list`), what they open beyond that (`libm.so.6` by
-   `dlopen`, glibc's `C.utf8` locale), and the programs' own outputs; not the packages' whole
-   closures (glibc's output alone is 30 MB, mostly gconv modules and headers). The builder
-   (`builder/src/main.rs`) copies these files onto the data disk under their own paths
-   (`/nix/store/...`, with debugfs, compared with what is there and read back, so the
-   persistent disk gets what changed only), puts copies of the programs in the initramfs's
-   `/bin` (40 to 60 KB each) and makes `/nix` a link to `/data/nix`. A real program from
-   nixpkgs runs as it is (GNU hello, `/bin/gnu-hello` a link into the store), and a store
-   path copied from any Nix machine onto `/data/nix/store` would too. The initramfs grows by
-   the three test programs and a link (about 150 KB); the data disk by about 9 MB (of the
-   test disk's 64 MiB). Without a data disk dynamic programs do not run (ENOENT for their
+   `dlopen`, glibc's `C.utf8` locale), the programs' own outputs and coreutils' `bin`; not
+   the packages' whole closures (glibc's output alone is 30 MB, mostly gconv modules and
+   headers). The builder (`builder/src/main.rs`) copies these files and links onto the data
+   disk under their own paths (`/nix/store/...`, links as links with what they point to,
+   with debugfs, compared with what is there and read back, so the persistent disk gets what
+   changed only), and copies `rootfs/` of the same output into the initramfs: the programs
+   in `/bin` (25 to 35 KB each), `/nix`, a link to `/data/nix`, and links into the store.
+   Real programs from nixpkgs run as they are: GNU hello (`/bin/gnu-hello`) and coreutils
+   (`/usr/gnu/bin`, a link to its `bin`, whose tools are links to one binary that is each
+   tool by the name it runs as), and a store path copied from any Nix machine onto
+   `/data/nix/store` would too. The initramfs grows by about 90 KB (the three test programs
+   and links); the data disk by about 12 MB (of the test disk's 64 MiB). Without a data disk dynamic programs do not run (ENOENT for their
    interpreter), as on Linux without `/nix`.
 
    Rejected: patching the programs to `/lib` (patchelf) would test something other than the
@@ -62,6 +64,13 @@ Four questions:
      return). glibc's `system(3)` and `posix_spawn` are such vforks, and glibc's malloc
      grows its main arena with brk.
    - `rseq` (334) and `membarrier` (324) were logged as not implemented.
+   - coreutils needed the extended attribute calls (188 to 199: `ls -l` asks for ACLs and
+     SELinux labels), `fadvise64` (221: `cat`, `cp`, `sha256sum`) and
+     `/proc/self/mountinfo` (`df`). No filesystem here keeps extended attributes, so they
+     answer as Linux on a filesystem without xattr handlers (lists empty, the rest
+     EOPNOTSUPP, after the arguments', the target's and a read-only mount's checks);
+     `fadvise64` keeps Linux's checks and takes the advice without acting on it;
+     `mountinfo` gives each mount's id (fdinfo's `mnt_id`), parent and device number.
 
 3. **rseq: ENOSYS, as a Linux built without `CONFIG_RSEQ`.** glibc then sets `__rseq_size`
    to 0 and goes on (`sched_getcpu` asks the vDSO's `getcpu`); the server answers without
@@ -94,8 +103,8 @@ Four questions:
   (also in threads that ran before it was loaded), threads, C.UTF-8, the vDSO's clocks
   without system calls, fork and exec of `/proc/self/exe`, posix_spawn, `system(3)`, the
   break across them, and the interpreter run as a program; `dyncxx` C++ exceptions,
-  `std::thread` and `thread_local` destructors with the shared libstdc++; GNU hello from
-  nixpkgs runs. All of them pass on Linux too. The read-only boot runs the first two from
+  `std::thread` and `thread_local` destructors with the shared libstdc++; GNU hello and
+  coreutils from nixpkgs run (their output against BusyBox's, nothing on stderr). All of them pass on Linux too. The read-only boot runs the first two from
   the read-only store.
 - The builder needs Nix for the data disk's store, as it does for the toolchains already.
 - The persistent `disk.img` keeps the store paths of earlier nixpkgs pins (store paths never

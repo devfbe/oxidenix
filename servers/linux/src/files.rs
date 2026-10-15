@@ -574,6 +574,7 @@ const SYS_PREADV2: u64 = 327;
 const SYS_PWRITEV2: u64 = 328;
 pub const SYS_GETDENTS64: u64 = 217;
 pub const SYS_FSTATFS: u64 = 138;
+const SYS_FADVISE64: u64 = 221;
 
 /// The result of a file system call in `s` the server handles, or None.
 pub fn handle(s: &State) -> Option<i64> {
@@ -631,9 +632,26 @@ pub fn handle(s: &State) -> Option<i64> {
             }
         }
         SYS_PREADV2 | SYS_PWRITEV2 => lookup(a0).and_then(|f| rw2(s.rax == SYS_PWRITEV2, &f.file, f.flags(), a1, a2, a3 as i64, s.r9)),
+        SYS_FADVISE64 => lookup(a0).and_then(|f| fadvise(&f.file, a2, a3)),
         _ => return None,
     };
     Some(result.unwrap_or_else(|e| -e))
+}
+
+/// posix_fadvise(2) (fadvise64): advice about the access to come, which the page cache
+/// does not act on (it reads what is read, and gives pages up under pressure anyway), so
+/// what is left is Linux's checks (generic_fadvise): EBADF for no descriptor (an O_PATH
+/// one too), ESPIPE for a pipe or FIFO, EINVAL for a negative length or unknown advice.
+fn fadvise(file: &File, len: u64, advice: u64) -> Result<i64, i64> {
+    const POSIX_FADV_NOREUSE: u64 = 5;
+    if let File::Pipe(_) = file {
+        return Err(ESPIPE);
+    }
+    // (`advice` is an int.)
+    if (len as i64) < 0 || advice as u32 as u64 > POSIX_FADV_NOREUSE {
+        return Err(EINVAL);
+    }
+    Ok(0)
 }
 
 /// preadv2/pwritev2: the vectored call at the file position (offset -1) or
