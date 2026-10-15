@@ -162,6 +162,9 @@ pub struct InetSock {
     rlock: crate::sync::SleepLock,
     wlock: crate::sync::SleepLock,
     pub st: Mutex<Local>,
+    /// The next socket of its thread's list of lingering closes
+    /// (`closed`, `run_deferred`): a reference of the list's.
+    deferred_next: core::sync::atomic::AtomicPtr<InetSock>,
     /// Who gets SIGURG (F_SETOWN, `files::Owner` encoded: its description's
     /// copy), and the count of netd's urgent pointers it was sent for.
     owner: AtomicU64,
@@ -205,6 +208,7 @@ impl InetSock {
             rings: Mutex::new(rings),
             rlock: crate::sync::SleepLock::new(()),
             wlock: crate::sync::SleepLock::new(()),
+            deferred_next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
             owner: AtomicU64::new(0),
             urg_signalled: core::sync::atomic::AtomicU16::new(0),
             st: Mutex::new(Local {
@@ -1198,24 +1202,48 @@ impl InetSock {
         self.net.status(Request::SetOpt { sock: self.index, opt: option, value }).map(|_| ())
     }
 
-    /// The description's last reference went: the socket closes in netd
-    /// (a reset if data it received is unread, or SO_LINGER with a zero
-    /// time), `now` before this returns (its port is free then), else by
-    /// the net thread (the caller may not wait for netd: the pager).
+    /// Its open file description's last reference went (`files`), on
+    /// whatever thread let go of it, perhaps with locks held: a service
+    /// thread hands the close to the net thread (it may not wait for netd);
+    /// a program's thread closes it now, unless it lingers (SO_LINGER with
+    /// a time): then the close waits until the thread's system call is
+    /// done and nothing is held (`run_deferred`, as Linux lingers in
+    /// __fput's task work on the way back to user space), and the
+    /// program's thread returns to the program only after it. A thread
+    /// that is exiting never lingers (Linux: PF_EXITING).
+    pub fn closed(self: &Arc<Self>) {
+        if crate::local::is_service() {
+            return self.release(false, false);
+        }
+        let lingers = self.kind == Kind::Tcp && self.st.lock().opts.linger.is_some_and(|s| s > 0);
+        if lingers && !crate::local::exiting() {
+            // (No memory needed: the list runs through the sockets.)
+            let me = Arc::into_raw(self.clone()) as *mut InetSock;
+            let local = crate::local::get();
+            self.deferred_next.store(local.deferred.load(SeqCst) as *mut InetSock, SeqCst);
+            local.deferred.store(me as *mut (), SeqCst);
+            return;
+        }
+        self.release(true, false);
+    }
+
+    /// The socket closes in netd (a reset if data it received is unread,
+    /// or SO_LINGER with a zero time), `now` before this returns (its port
+    /// is free then), else by the net thread (the caller may not wait for
+    /// netd: the pager).
     ///
-    /// SO_LINGER with a time (`now` only: a close(2), as Linux lingers
-    /// only for a process that is not exiting, and a service thread may
-    /// not wait) first waits, as Linux's tcp_close and
+    /// `linger` (a program's thread with nothing held, `run_deferred`):
+    /// SO_LINGER with a time first waits, as Linux's tcp_close and
     /// sk_stream_wait_close, until the connection's FIN went and the peer
     /// acknowledged it with everything before it, the time ran out, or a
     /// signal came; the close then goes on in the background as without
     /// lingering (Linux does not reset the connection at the end of the
     /// time) and close(2) returns 0. As on Linux, O_NONBLOCK does not
     /// shorten the wait, and shutdown(2) never lingers.
-    pub fn release(&self, now: bool) {
-        let linger = self.st.lock().opts.linger.filter(|&s| s > 0);
+    pub fn release(&self, now: bool, linger: bool) {
+        let time = self.st.lock().opts.linger.filter(|&s| s > 0);
         let mut aborted = false;
-        if let (true, Some(secs)) = (now, linger) {
+        if let (true, true, Some(secs)) = (now, linger, time) {
             aborted = self.linger(secs as u64 * 1_000_000_000);
         }
         let snap = self.snap();
@@ -1263,6 +1291,27 @@ impl InetSock {
             if self.wait(seen, deadline).is_err() {
                 return false;
             }
+        }
+    }
+}
+
+/// The calling program thread's lingering closes (`InetSock::closed`), run
+/// when its system call is done and it holds nothing: each waits as
+/// SO_LINGER says (`linger`; a signal ends the wait, as on Linux) and
+/// closes; without `linger` (the thread exits) they close at once.
+pub fn run_deferred(linger: bool) {
+    let local = crate::local::get();
+    loop {
+        let head = local.deferred.swap(core::ptr::null_mut(), SeqCst) as *const InetSock;
+        if head.is_null() {
+            return;
+        }
+        let mut at = head;
+        while !at.is_null() {
+            // The list's reference, taken back.
+            let sock = unsafe { Arc::from_raw(at) };
+            at = sock.deferred_next.swap(core::ptr::null_mut(), SeqCst);
+            sock.release(true, linger);
         }
     }
 }

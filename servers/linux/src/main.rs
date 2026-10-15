@@ -179,6 +179,9 @@ pub extern "C" fn _start(state: *mut State, role: u64, cookie: u64, key: u64) ->
 /// runs again.
 fn serve(s: &mut State) -> ! {
     loop {
+        // Lingering closes left by anything but a system call (none
+        // expected: the safety net before the program runs again).
+        inet::run_deferred(true);
         let reason = state_call(s, SYS_RESTRICTED_ENTER, [0; 6]);
         if reason < 0 {
             // The kernel refuses the registers (they never come from the
@@ -190,6 +193,10 @@ fn serve(s: &mut State) -> ! {
                 let nr = s.rax;
                 let result = dispatch(s);
                 s.rax = result as u64;
+                // Lingering closes (SO_LINGER) wait now, with nothing held
+                // (Linux's __fput task work), before the program runs on; a
+                // signal ends the wait and is delivered below.
+                inet::run_deferred(true);
                 // /data inodes the call let go of go now, before it returns
                 // (an unlink's blocks are free when it returns).
                 datafs::reap();

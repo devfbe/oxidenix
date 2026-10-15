@@ -249,7 +249,6 @@ impl Drop for Description {
         if let Some(watch) = &self.watch {
             crate::poll::forget(self.id, watch);
         }
-        let service = crate::local::is_service();
         match &self.file {
             File::Pipe(end) => end.close(),
             File::Socket(sock) => {
@@ -260,9 +259,10 @@ impl Drop for Description {
                 }
             }
             // Closed in netd before close(2) returns (its port is free then,
-            // as on Linux); by the net thread for a service thread, which
-            // may not wait for netd.
-            File::Inet(sock) => sock.release(!service),
+            // as on Linux; a lingering close after the call, with nothing
+            // held: `inet::run_deferred`); by the net thread for a service
+            // thread, which may not wait for netd.
+            File::Inet(sock) => sock.closed(),
             File::Tty(open) => open.tty.closed(open),
             File::PtyMaster(m) => crate::pty::master_closed(m),
             File::Epoll(e) => e.closed(),

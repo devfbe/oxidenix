@@ -14,6 +14,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
@@ -163,6 +164,65 @@ static long drain(int fd) {
     long total = 0, n;
     while ((n = read(fd, sink, sizeof sink)) > 0) total += n;
     return n < 0 ? -1 : total;
+}
+
+static int linger_unix;
+static long linger_took;
+static void *close_unix(void *arg) {
+    (void)arg;
+    long t0 = now_ms();
+    close(linger_unix);
+    linger_took = now_ms() - t0;
+    return NULL;
+}
+
+/* A lingering socket's last reference in an AF_UNIX socket's queue (SCM_RIGHTS): the
+ * thread whose close drops the queue lingers after its call, holding nothing, so another
+ * thread using the AF_UNIX pair (and the tree) goes on meanwhile. */
+static void lingering_in_flight(void) {
+    int p[2], u[2];
+    if (tcp_pair(p) < 0 || socketpair(AF_UNIX, SOCK_STREAM, 0, u) < 0) {
+        check("pairs for a lingering socket in flight", 0);
+        return;
+    }
+    fcntl(p[0], F_SETFL, O_NONBLOCK);
+    long sent = fill_connection(p[0]);
+    struct linger lg = {1, 2};
+    setsockopt(p[0], SOL_SOCKET, SO_LINGER, &lg, sizeof lg);
+    char cbuf[CMSG_SPACE(sizeof(int))] = {0};
+    struct iovec iov = {"x", 1};
+    struct msghdr m = {.msg_iov = &iov, .msg_iovlen = 1, .msg_control = cbuf, .msg_controllen = sizeof cbuf};
+    struct cmsghdr *c = CMSG_FIRSTHDR(&m);
+    c->cmsg_level = SOL_SOCKET;
+    c->cmsg_type = SCM_RIGHTS;
+    c->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(c), &p[0], sizeof(int));
+    check("a lingering socket goes in flight", sendmsg(u[0], &m, 0) == 1);
+    close(p[0]);
+    linger_unix = u[1];
+    pthread_t t;
+    long t0 = now_ms();
+    pthread_create(&t, NULL, close_unix, NULL);
+    usleep(300000);
+    /* Meanwhile: the other end of the pair and the tree go on. */
+    long t1 = now_ms();
+    int r = send(u[0], "y", 1, MSG_NOSIGNAL);
+    struct pollfd pf = {u[0], POLLOUT, 0};
+    poll(&pf, 1, 0);
+    pid_t kid = fork();
+    if (kid == 0) _exit(7);
+    int st = 0;
+    waitpid(kid, &st, 0);
+    long busy = now_ms() - t1;
+    char name[100];
+    snprintf(name, sizeof name, "others go on while a close lingers (%ld ms)", busy);
+    check(name, r == -1 && errno == EPIPE && WIFEXITED(st) && WEXITSTATUS(st) == 7 && busy < 1000 && now_ms() - t0 < 1500);
+    pthread_join(t, NULL);
+    snprintf(name, sizeof name, "... and that close returns after the linger time (%ld ms)", linger_took);
+    check(name, linger_took >= 1900 && linger_took < 4000);
+    check("... the data still arrives in full", drain(p[1]) == sent);
+    close(p[1]);
+    close(u[0]);
 }
 
 /* SO_LINGER with a time: close(2) waits until the peer acknowledged everything (and the
@@ -1218,6 +1278,7 @@ int main(void) {
 
     stream_semantics();
     lingering_close();
+    lingering_in_flight();
     reuseport();
     urgent_data();
     killed_while_waiting_on_netd();

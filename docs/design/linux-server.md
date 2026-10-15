@@ -547,7 +547,12 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
      (`state::FIN_ACKED`), the time ran out or a signal came, then closes as without it
      (Linux's `tcp_close` and `sk_stream_wait_close`: no reset at the end of the time,
      `O_NONBLOCK` does not shorten the wait, a process's exit and `shutdown` never linger;
-     data that arrives meanwhile resets the connection).
+     data that arrives meanwhile resets the connection). The wait never happens where the
+     last reference dropped (that may be under a lock: an `AF_UNIX` queue holding the socket
+     in flight, an epoll set, an exec's close-on-exec): the program's thread puts the socket on
+     a list of its own (through the sockets, no allocation) and waits after its system call,
+     holding nothing, before the program runs again (`inet::run_deferred`, Linux's `__fput`
+     task work); an exiting thread closes without waiting.
      **Urgent data** (`MSG_OOB`, Linux's reading of the urgent pointer: it points past the
      urgent byte): a send with `MSG_OOB` marks the end of what it wrote in the control block
      (`netring::UrgentMark`, stored before the tail), netd takes the send ring up to it and

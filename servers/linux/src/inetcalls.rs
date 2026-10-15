@@ -163,7 +163,7 @@ fn install(sock: &Arc<InetSock>, flags: u64) -> Result<i64, i64> {
             Ok(fd)
         }
         Err(e) => {
-            sock.release(true);
+            sock.release(true, false);
             Err(e)
         }
     }
@@ -269,7 +269,7 @@ fn accept4(sock: &Arc<InetSock>, nonblock: bool, addr: u64, len: u64, aflags: u6
     // is handed out (else it is closed, as on Linux).
     if addr != 0 {
         if let Err(e) = put_addr(peer, addr, len) {
-            conn.release(true);
+            conn.release(true, false);
             return Err(e);
         }
     }

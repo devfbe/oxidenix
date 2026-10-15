@@ -134,6 +134,7 @@ time) and so may anything on the network.
   `Cargo.toml` and tested with smoltcp's own tests).
 - The control block's layout and its memory ordering become part of the ABI between the server
   and netd (`crates/netring`, tested on the host).
-- `SO_LINGER` with a timeout blocks `close(2)` in the server, before `CLOSE` goes: it asks
+- `SO_LINGER` with a timeout blocks `close(2)` in the server (after the call, with nothing
+  held, as Linux's `__fput` task work), before `CLOSE` goes: it asks
   for the `FIN` and waits on the control block for netd's `FIN_ACKED` (netd still answers
   every request at once); a zero timeout aborts as on Linux.

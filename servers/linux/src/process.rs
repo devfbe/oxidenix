@@ -1072,9 +1072,12 @@ pub fn exit(status: i32, group: bool) -> ! {
     // go to their waiters as the kernel ends the thread).
     crate::futex::exit_robust(robust, tid);
     // Its descriptor table goes here, on the exiting thread (Linux's exit_files: before its
-    // parent learns of the end): with its last reference its descriptors close.
+    // parent learns of the end): with its last reference its descriptors close, none
+    // lingering (Linux's PF_EXITING), nor those a call of the thread's had left to linger.
+    local::get().flags.fetch_or(local::EXITING, Ordering::Relaxed);
     local::get().files.store(core::ptr::null_mut(), Ordering::Relaxed);
     drop(files);
+    crate::inet::run_deferred(false);
     let flags = if group { EXIT_GROUP } else { 0 };
     syscall(SYS_THREAD_EXIT, [status as u32 as u64, flags, 0, 0, 0, 0]);
     unreachable!("thread_exit returned")
