@@ -292,8 +292,10 @@ pub const EVENT_SYNC: u64 = 8;
 /// disk space is not secured (`a` key, `b` byte offset of the page): the
 /// server promises it and answers with `mo_backed`.
 pub const EVENT_MKWRITE: u64 = 9;
-/// Input came to the console the instance holds: the service thread takes
-/// it (`console_read` until it returns 0). Queued once until taken.
+/// Input came to the console the instance holds, its keyboard or a serial
+/// port it claimed: the service thread takes it (`console_read`,
+/// `kbd_read` and `serial_read` until they return 0). Queued once until
+/// taken.
 pub const EVENT_CONSOLE: u64 = 20;
 /// The instance no longer holds the console (the kernel's monitor took it
 /// back): its terminal on it hangs up.
@@ -862,6 +864,70 @@ pub const CONSOLE_ECHO_MAX: u64 = 512;
 /// `console_info(out)`: the console's size, two u64s at `out` (columns,
 /// rows). EIO unless the instance holds the console.
 pub const SYS_CONSOLE_INFO: u64 = 1112;
+
+// The keyboard and the serial ports (ADR 0020): granted with the console,
+// raw: the keyboard's scancodes and the ports' bytes; their input wakes the
+// service thread with `EVENT_CONSOLE` too. The Linux keyboard (keymaps,
+// modes, LEDs: crates/kbd) and the serial terminals are the server's.
+
+/// `serial_read(port, buf, cap) -> n`: takes up to `cap` bytes of serial
+/// port `port`'s input (COM1 is port 0), 0 when there is none: what came
+/// while the port was claimed (`SERIAL_CLAIM`). ENXIO for a port the machine
+/// lacks, EIO unless the instance holds the console.
+pub const SYS_SERIAL_READ: u64 = 1260;
+/// `serial_write(port, buf, len) -> n`: writes the first `n` (at most
+/// `SERIAL_WRITE_MAX`) of `len` bytes to port `port` as they are, polled:
+/// it returns when they went to the UART (another write's pieces, an echo or
+/// a kernel message on COM1 may come between its pieces of 16 bytes).
+/// ENXIO, EIO as `serial_read`.
+pub const SYS_SERIAL_WRITE: u64 = 1261;
+pub const SERIAL_WRITE_MAX: u64 = 4096;
+/// `serial_ctl(port, op, arg) -> value`: `SERIAL_*` below. ENXIO, EIO as
+/// `serial_read`; EINVAL for another op.
+pub const SYS_SERIAL_CTL: u64 = 1262;
+/// `arg` 1: a terminal of the instance holds the port open, its input goes
+/// to the port's buffer for `serial_read` (what was there goes); 0: no
+/// longer (COM1's input goes to the console's input again, the others' is
+/// dropped). A change of the console's holder ends every claim.
+pub const SERIAL_CLAIM: u64 = 1;
+/// `arg`: the divisor of 115200 baud (bits 0-15, not 0) and the line
+/// control register's format bits (16-21: word length, stop bits, parity).
+pub const SERIAL_LINE: u64 = 2;
+/// `arg` 1: sends a break until 0.
+pub const SERIAL_BREAK: u64 = 3;
+/// `arg`: the modem control lines (DTR 1, RTS 2, OUT1 4, loopback 0x10).
+pub const SERIAL_MODEM: u64 = 4;
+/// Returns the line status, modem status and modem control registers:
+/// `lsr << 16 | msr << 8 | mcr`.
+pub const SERIAL_STATUS: u64 = 5;
+/// Returns the ports the machine has, a bit each (`port` is ignored).
+pub const SERIAL_PORTS: u64 = 6;
+/// `kbd_read(buf, cap) -> n`: takes up to `cap` of the keyboard's
+/// scancodes (set 1, as typed, untranslated), 0 when there are none. EIO
+/// unless the instance holds the console.
+pub const SYS_KBD_READ: u64 = 1263;
+/// `console_ctl(op, arg) -> value`: `CONSOLE_*` below. EIO unless the
+/// instance holds the console, EINVAL for another op.
+pub const SYS_CONSOLE_CTL: u64 = 1264;
+/// `arg`: the keyboard's LEDs (Scroll Lock 1, Num Lock 2, Caps Lock 4).
+pub const CONSOLE_LEDS: u64 = 1;
+/// `arg` 1: KD_GRAPHICS, the console draws no text; 0: KD_TEXT, it redraws
+/// it. A change of the console's holder returns to text.
+pub const CONSOLE_GRAPHICS: u64 = 2;
+/// Returns the keyboard's modes the console's escape sequences set:
+/// `CONSOLE_MODE_*`.
+pub const CONSOLE_MODES: u64 = 3;
+pub const CONSOLE_MODE_APPLIC: u64 = 1;
+pub const CONSOLE_MODE_CKMODE: u64 = 2;
+pub const CONSOLE_MODE_CRLF: u64 = 4;
+pub const CONSOLE_MODE_REPEAT: u64 = 8;
+/// `arg`: the keyboard's autorepeat (the typematic byte of the PS/2
+/// command 0xF3: bits 0-4 the period's step, 5-6 the delay's).
+pub const CONSOLE_TYPEMATIC: u64 = 4;
+/// `(codes, len)`: the keyboard's scancodes, as if typed (at most 256; test
+/// mode only, ENOSYS otherwise; EIO unless the caller's instance holds the
+/// console).
+pub const TEST_KBD_INPUT: u64 = 1630;
 // 1113-1115 were `proc_ids`, `signal_group` and `signal_state`: process
 // groups, sessions and signals are the server's since R8.
 

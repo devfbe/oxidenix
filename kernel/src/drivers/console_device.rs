@@ -1,14 +1,17 @@
-//! The console as a device of the Linux server (ADR 0004, ADR 0007): the bytes typed on
-//! the keyboard and the console's answers to queries go into a ring, the bytes written go
-//! to the screen and the serial mirror as they are; nothing is interpreted (the line
-//! discipline is the server's, docs/design/linux-server.md "The terminal").
+//! The console as a device of the Linux server (ADR 0004, ADR 0007, ADR 0020): the
+//! console's answers to queries (and COM1's input while no terminal holds that port) go
+//! into a ring, the bytes written go to the screen and the serial mirror as they are;
+//! nothing is interpreted (the line discipline is the server's, docs/design/linux-server.md
+//! "The terminal"). The keyboard's scancodes (`keyboard`) and the serial ports (`serial`)
+//! are granted with it.
 //!
 //! One holder at a time: a Linux server instance (by id) or, with none, the kernel's
-//! monitor. Input wakes the holder: the keyboard interrupt sets `PENDING` and wakes the
-//! holder's service thread's channel (`HOLDER_CHAN`, the instance's pager channel), whose
+//! monitor. Input wakes the holder: an interrupt sets `PENDING` and wakes the holder's
+//! service thread's channel (`HOLDER_CHAN`, the instance's pager channel; `notify`), whose
 //! event wait checks the flag (`take_event`). No lock of an instance is taken in interrupt
 //! context. Who becomes the holder and the events about it are `process::linux`'s
-//! (`console_grant`).
+//! (`console_grant`); a change of the holder ends the old one's serial claims and graphics
+//! mode.
 //!
 //! Writes: a write of the holder's goes out whole in a writer's turn (`writer`, a fair
 //! sleeping lock of the kernel's), its pieces interleaved with echoes. Echoes (the line
@@ -38,8 +41,8 @@ static PENDING: AtomicBool = AtomicBool::new(false);
 /// The monitor waits here for input.
 const MONITOR_CHAN: usize = 0x6_0000_0001;
 
-/// Feeds bytes into the device (the keyboard's, from its interrupt; the console's
-/// answers). What does not fit is dropped.
+/// Feeds bytes into the device's input (the console's answers to queries; COM1's input
+/// while no terminal holds it, from its interrupt). What does not fit is dropped.
 pub fn input(bytes: &[u8]) {
     {
         let mut ring = INPUT.lock();
@@ -49,6 +52,12 @@ pub fn input(bytes: &[u8]) {
             }
         }
     }
+    notify();
+}
+
+/// Input came for the holder (here, the keyboard's scancodes, a serial port's): its
+/// service thread is told (`take_event`), or the monitor woken.
+pub fn notify() {
     PENDING.store(true, Ordering::Release);
     let chan = HOLDER_CHAN.load(Ordering::Acquire);
     wakeup(if chan != 0 { chan } else { MONITOR_CHAN });
@@ -67,6 +76,14 @@ static HOLDER_GEN: AtomicU64 = AtomicU64::new(0);
 /// Makes `id` (0: the monitor) the holder, whose service thread waits on `chan`;
 /// returns the previous holder. Input already there is the new holder's.
 pub fn set_holder(id: u64, chan: usize) -> u64 {
+    let old = set_holder_locked(id, chan);
+    if old != id {
+        holder_changed();
+    }
+    old
+}
+
+fn set_holder_locked(id: u64, chan: usize) -> u64 {
     let _change = CHANGE.lock();
     HOLDER_CHAN.store(chan, Ordering::Release);
     // Echoes of the previous holder's input are not the new one's: those queued go,
@@ -75,22 +92,25 @@ pub fn set_holder(id: u64, chan: usize) -> u64 {
     let old = change_holder(id);
     // Writers of the old holder waiting for a turn give up (EIO).
     wakeup(TURN_CHAN);
-    if !INPUT.lock().is_empty() {
-        PENDING.store(true, Ordering::Release);
-        wakeup(if chan != 0 { chan } else { MONITOR_CHAN });
+    if !INPUT.lock().is_empty() || super::keyboard::pending() {
+        notify();
     }
     old
 }
 
 /// Instance `id` is gone: if it still held the device, the monitor does.
 pub fn release(id: u64) {
-    let _change = CHANGE.lock();
-    if HOLDER.load(Ordering::Acquire) == id {
+    {
+        let _change = CHANGE.lock();
+        if HOLDER.load(Ordering::Acquire) != id {
+            return;
+        }
         HOLDER_CHAN.store(0, Ordering::Release);
         change_holder(0);
         wakeup(TURN_CHAN);
         wakeup(MONITOR_CHAN);
     }
+    holder_changed();
 }
 
 /// For the event wait of instance `id`'s service thread: whether input came for it
@@ -242,11 +262,24 @@ fn out(bytes: &[u8]) {
 /// Makes `id` the holder and forgets the old holder's echoes: the holder, the generation
 /// and the queue change together, under the queue's lock. The old holder.
 fn change_holder(id: u64) -> u64 {
-    let mut q = ECHO.lock();
-    let old = HOLDER.swap(id, Ordering::AcqRel);
-    HOLDER_GEN.fetch_add(1, Ordering::AcqRel);
-    q.clear();
+    let old = {
+        let mut q = ECHO.lock();
+        let old = HOLDER.swap(id, Ordering::AcqRel);
+        HOLDER_GEN.fetch_add(1, Ordering::AcqRel);
+        q.clear();
+        old
+    };
+    if old != id {
+        // The old holder's terminals' claims of the serial ports go with it.
+        super::serial::release_all();
+    }
     old
+}
+
+/// After a change of the holder (no lock held: a redraw takes a while): a graphics mode of
+/// the old holder's programs ends (as Linux's `reset_vc`).
+fn holder_changed() {
+    super::console::set_graphics(false);
 }
 
 /// Writes the queued echoes (the writer's turn held). A batch is taken with the holder
@@ -305,13 +338,19 @@ pub fn echo(holder: u64, bytes: &[u8]) -> Result<usize, i64> {
     Ok(n)
 }
 
-/// The monitor's blocking read of one byte, while it holds the device.
+/// The monitor's blocking read of one byte, while it holds the device: the console's
+/// answers and COM1's input, then the keys typed (`keyboard::monitor_byte`).
 pub fn monitor_read() -> u8 {
     loop {
         let wait = prepare_to_wait(MONITOR_CHAN);
         let mut b = [0u8; 1];
-        if HOLDER.load(Ordering::Acquire) == 0 && read(&mut b) == 1 {
-            return b[0];
+        if HOLDER.load(Ordering::Acquire) == 0 {
+            if read(&mut b) == 1 {
+                return b[0];
+            }
+            if let Some(b) = super::keyboard::monitor_byte() {
+                return b;
+            }
         }
         wait.sleep();
     }

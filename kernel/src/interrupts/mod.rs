@@ -64,8 +64,8 @@ pub fn init() {
     unsafe { drain_ps2_output() };
 }
 
-/// Local and I/O APIC; the keyboard interrupt is routed and unmasked, the
-/// other ISA lines are routed but stay masked until a driver enables them.
+/// Local and I/O APIC; the keyboard's and the serial ports' interrupts are routed and
+/// unmasked, the other ISA lines are routed but stay masked until a driver enables them.
 pub fn init_controllers(rsdp: u64) {
     crate::drivers::acpi::init(rsdp).expect("ACPI");
     apic::init().expect("APIC");
@@ -74,6 +74,7 @@ pub fn init_controllers(rsdp: u64) {
             apic::route_isa(irq, irq != KEYBOARD_IRQ);
         }
     }
+    crate::drivers::serial::enable_interrupts();
 }
 
 pub const KEYBOARD_IRQ: u8 = 1;

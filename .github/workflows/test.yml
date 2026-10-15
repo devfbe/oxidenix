@@ -84,6 +84,10 @@ jobs:
         if: matrix.firmware == 'uefi'
         run: cargo test -p ldisc
 
+      - name: Test the console keyboard (keymaps, modes, scancodes) on the host
+        if: matrix.firmware == 'uefi'
+        run: cargo test -p kbd
+
       - name: Test the formats of /proc on the host
         if: matrix.firmware == 'uefi'
         run: cargo test -p procproto

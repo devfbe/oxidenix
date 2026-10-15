@@ -47,13 +47,115 @@ fn termios_bytes_round_trip() {
     let mut t = Termios::default();
     t.lflag &= !ECHO;
     t.cc[VMIN] = 5;
-    t.ospeed = 9600;
     let b = t.to_bytes();
     assert_eq!(Termios::default().with_bytes(&b), t);
-    // struct termios keeps the speeds it had.
     let short = Termios::default().with_bytes(&b[..TERMIOS_SIZE]);
     assert_eq!(short.ospeed, 38400);
     assert_eq!(short.cc[VMIN], 5);
+}
+
+#[test]
+fn speeds_follow_cbaud_as_linux_set_termios() {
+    // struct termios: the speeds from CBAUD (and CIBAUD: B0 is the output's).
+    let mut t = Termios::default();
+    t.cflag = (t.cflag & !CBAUD) | B9600;
+    let got = Termios::default().with_bytes(&t.to_bytes()[..TERMIOS_SIZE]);
+    assert_eq!((got.ispeed, got.ospeed), (9600, 9600));
+    t.cflag = (t.cflag & !CBAUD) | B115200 | (B9600 << IBSHIFT);
+    let got = Termios::default().with_bytes(&t.to_bytes()[..TERMIOS_SIZE]);
+    assert_eq!((got.ispeed, got.ospeed), (9600, 115200));
+    // termios2: a Bfoo value wins over the structure's speed, BOTHER takes it.
+    t.cflag = (t.cflag & !CBAUD & !CIBAUD) | B38400;
+    t.ospeed = 9600;
+    assert_eq!(Termios::default().with_bytes(&t.to_bytes()).ospeed, 38400);
+    t.cflag = (t.cflag & !CBAUD) | BOTHER;
+    t.ospeed = 12345;
+    let got = Termios::default().with_bytes(&t.to_bytes());
+    assert_eq!((got.ispeed, got.ospeed), (12345, 12345));
+}
+
+#[test]
+fn encode_baud_rate_prefers_bfoo_within_two_percent() {
+    let mut t = Termios::default();
+    t.encode_baud_rate(115200, 115200);
+    assert_eq!(t.cflag & (CBAUD | CIBAUD), B115200);
+    // 115200 / 12 = 9600 exactly; 115200 / 13 = 8861: no Bfoo near it.
+    t.encode_baud_rate(8861, 8861);
+    assert_eq!(t.cflag & (CBAUD | CIBAUD), BOTHER);
+    assert_eq!((t.ispeed, t.ospeed), (8861, 8861));
+    // Within 2%: 9700 reports B9600, the speed as it is.
+    t.cflag &= !(CBAUD | CIBAUD);
+    t.encode_baud_rate(9700, 9700);
+    assert_eq!(t.cflag & (CBAUD | CIBAUD), B9600);
+    assert_eq!(t.ospeed, 9700);
+    // Different input and output speeds: CIBAUD too.
+    t.encode_baud_rate(9600, 115200);
+    assert_eq!(t.cflag & (CBAUD | CIBAUD), B115200 | (B9600 << IBSHIFT));
+    // A hangup: B0.
+    t.cflag &= !(CBAUD | CIBAUD);
+    t.encode_baud_rate(0, 0);
+    assert_eq!(t.cflag & (CBAUD | CIBAUD), B0);
+}
+
+#[test]
+fn breaks() {
+    let mut echo = Vec::new();
+    // A NUL by default (no BRKINT in tty_std_termios), no echo.
+    let mut l = with(|t| t.lflag &= !ICANON);
+    assert_eq!(l.receive_break(&mut echo), Received::default());
+    assert!(echo.is_empty());
+    assert_eq!(read(&mut l, 10).unwrap(), b"\0");
+    // PARMRK marks it.
+    let mut l = with(|t| {
+        t.lflag &= !ICANON;
+        t.iflag |= PARMRK;
+    });
+    l.receive_break(&mut echo);
+    assert_eq!(read(&mut l, 10).unwrap(), b"\xff\0\0");
+    // IGNBRK: nothing; BRKINT: SIGINT and a flush.
+    let mut l = with(|t| t.iflag |= IGNBRK);
+    l.receive_break(&mut echo);
+    assert_eq!(l.available(), 0);
+    let mut l = with(|t| t.iflag |= BRKINT);
+    feed(&mut l, b"half");
+    let r = l.receive_break(&mut echo);
+    assert_eq!((r.signal, r.flushed), (Some(SIGINT), true));
+    feed(&mut l, b"\n");
+    assert_eq!(read(&mut l, 10).unwrap(), b"\n");
+}
+
+#[test]
+fn extproc_stores_input_as_it_comes() {
+    let mut l = with(|t| t.lflag |= EXTPROC);
+    // No editing, no echo, no signals, no flow control: the bytes as they are,
+    // readable at once (canonical mode reads as noncanonical: a byte, no timer).
+    let (echo, rs) = feed(&mut l, b"ab\x7fc\x03\x13\r");
+    assert!(echo.is_empty());
+    assert!(rs.iter().all(|r| r.signal.is_none() && !r.flushed));
+    assert!(!l.stopped());
+    assert_eq!(l.mode(), ReadMode::Raw { min: 1, time: 0 });
+    assert!(l.readable(true));
+    assert_eq!(l.available(), 7);
+    assert_eq!(read(&mut l, 100).unwrap(), b"ab\x7fc\x03\x13\r");
+    // ISTRIP still applies.
+    let mut l = with(|t| {
+        t.lflag |= EXTPROC;
+        t.iflag |= ISTRIP;
+    });
+    feed(&mut l, &[0xe1]);
+    assert_eq!(read(&mut l, 10).unwrap(), b"a");
+    // Turning EXTPROC on hands a half-typed line over; off again, what is there is a line.
+    let mut l = std();
+    feed(&mut l, b"half");
+    let mut t = l.termios();
+    t.lflag |= EXTPROC;
+    l.set_termios(t);
+    assert_eq!(read(&mut l, 100).unwrap(), b"half");
+    feed(&mut l, b"xy");
+    t.lflag &= !EXTPROC;
+    l.set_termios(t);
+    assert_eq!(l.mode(), ReadMode::Canonical);
+    assert_eq!(read(&mut l, 100).unwrap(), b"xy");
 }
 
 #[test]

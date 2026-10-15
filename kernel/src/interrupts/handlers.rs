@@ -276,18 +276,21 @@ pub extern "x86-interrupt" fn nmi_handler(stack_frame: InterruptStackFrame) {
 fn keyboard_interrupt() {
     let mut port = Port::new(0x60);
     let scancode: u8 = unsafe { port.read() };
-    crate::drivers::keyboard::handle_scancode(scancode);
+    crate::drivers::keyboard::interrupt(scancode);
     apic::eoi();
 }
 
-/// An I/O APIC interrupt: the keyboard, or a line owned by a user-space
-/// driver (see process::irq).
+/// An I/O APIC interrupt: the keyboard, a serial port, or a line owned by a
+/// user-space driver (see process::irq).
 fn gsi_interrupt(gsi: u32) {
     let Some(irq) = (0..16u8).find(|&irq| apic::gsi_of(irq) == gsi) else {
         return apic::eoi();
     };
     if irq == super::KEYBOARD_IRQ {
         keyboard_interrupt();
+    } else if crate::drivers::serial::uses_irq(irq) {
+        crate::drivers::serial::interrupt(irq);
+        apic::eoi();
     } else {
         crate::process::irq::fire(irq);
     }

@@ -32,10 +32,53 @@ pub const XTABS: u32 = 0o14000;
 
 // c_cflag
 pub const CBAUD: u32 = 0o10017;
+pub const B0: u32 = 0;
+pub const B9600: u32 = 0o15;
 pub const B38400: u32 = 0o17;
+pub const B115200: u32 = 0o10002;
+/// The speeds beyond B38400 (with CBAUD's low bits), and alone an exact speed in
+/// `c_ispeed`/`c_ospeed` (BOTHER, termios2).
+pub const CBAUDEX: u32 = 0o10000;
+pub const BOTHER: u32 = 0o10000;
+pub const CSIZE: u32 = 0o60;
+pub const CS5: u32 = 0;
+pub const CS6: u32 = 0o20;
+pub const CS7: u32 = 0o40;
 pub const CS8: u32 = 0o60;
+pub const CSTOPB: u32 = 0o100;
 pub const CREAD: u32 = 0o200;
+pub const PARENB: u32 = 0o400;
+pub const PARODD: u32 = 0o1000;
 pub const HUPCL: u32 = 0o2000;
+pub const CLOCAL: u32 = 0o4000;
+/// The input speed's CBAUD bits, `IBSHIFT` up (B0 there: as the output speed).
+pub const CIBAUD: u32 = 0o2003600000;
+pub const IBSHIFT: u32 = 16;
+/// Stick parity (mark or space).
+pub const CMSPAR: u32 = 0o10000000000;
+pub const CRTSCTS: u32 = 0o20000000000;
+
+/// The speeds of the Bfoo values, by index (Linux's `baud_table`): B0 to B38400 are
+/// indices 0 to 15, B57600 (CBAUDEX | 1) to B4000000 (CBAUDEX | 15) 16 to 30.
+const BAUD_TABLE: [u32; 31] = [
+    0, 50, 75, 110, 134, 150, 200, 300, 600, 1200, 1800, 2400, 4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800,
+    500000, 576000, 921600, 1000000, 1152000, 1500000, 2000000, 2500000, 3000000, 3500000, 4000000,
+];
+
+/// The Bfoo value of `BAUD_TABLE`'s index `i`.
+fn baud_bits(i: usize) -> u32 {
+    if i < 16 { i as u32 } else { CBAUDEX | (i as u32 - 15) }
+}
+
+/// The speed of CBAUD bits `cbaud` (not BOTHER): Linux's table lookup, where a CBAUDEX
+/// value beyond the table counts as its low bits alone.
+fn table_speed(cbaud: u32) -> u32 {
+    let mut i = (cbaud & !CBAUDEX) as usize;
+    if cbaud & CBAUDEX != 0 && (1..16).contains(&i) {
+        i += 15;
+    }
+    BAUD_TABLE[i.min(BAUD_TABLE.len() - 1)]
+}
 
 // c_lflag
 pub const ISIG: u32 = 0o1;
@@ -145,14 +188,79 @@ impl Termios {
         b
     }
 
-    /// Settings from `struct termios` (36 bytes: the speeds stay `self`'s) or
-    /// `struct termios2` (44 bytes).
+    /// Settings from `struct termios` (36 bytes) or `struct termios2` (44 bytes), with
+    /// the speeds as Linux's `set_termios` makes them: from CBAUD and CIBAUD, the
+    /// structure's own only for BOTHER (termios2; `struct termios` keeps `self`'s).
     pub fn with_bytes(&self, b: &[u8]) -> Termios {
         let u32_at = |at: usize| u32::from_le_bytes([b[at], b[at + 1], b[at + 2], b[at + 3]]);
         let mut cc = [0u8; NCCS];
         cc.copy_from_slice(&b[17..36]);
         let (ispeed, ospeed) = if b.len() >= TERMIOS2_SIZE { (u32_at(36), u32_at(40)) } else { (self.ispeed, self.ospeed) };
-        Termios { iflag: u32_at(0), oflag: u32_at(4), cflag: u32_at(8), lflag: u32_at(12), line: b[16], cc, ispeed, ospeed }
+        let mut t = Termios { iflag: u32_at(0), oflag: u32_at(4), cflag: u32_at(8), lflag: u32_at(12), line: b[16], cc, ispeed, ospeed };
+        t.ispeed = t.input_baud_rate();
+        t.ospeed = t.baud_rate();
+        t
+    }
+
+    /// The output speed (Linux's `tty_termios_baud_rate`).
+    pub fn baud_rate(&self) -> u32 {
+        let cbaud = self.cflag & CBAUD;
+        if cbaud == BOTHER { self.ospeed } else { table_speed(cbaud) }
+    }
+
+    /// The input speed (Linux's `tty_termios_input_baud_rate`): CIBAUD's, the output
+    /// speed where it is B0.
+    pub fn input_baud_rate(&self) -> u32 {
+        let cbaud = (self.cflag >> IBSHIFT) & CBAUD;
+        match cbaud {
+            B0 => self.baud_rate(),
+            BOTHER => self.ispeed,
+            _ => table_speed(cbaud),
+        }
+    }
+
+    /// Records the speeds a driver really runs at (Linux's
+    /// `tty_termios_encode_baud_rate`): a Bfoo value for a speed within 2% of one
+    /// (unless BOTHER asked for exactness), BOTHER otherwise; an input speed of its own
+    /// only if it differs or one was asked for.
+    pub fn encode_baud_rate(&mut self, ibaud: u32, obaud: u32) {
+        let mut iclose = ibaud / 50;
+        let mut oclose = obaud / 50;
+        if obaud == 0 {
+            iclose = 0;
+        }
+        self.ispeed = ibaud;
+        self.ospeed = obaud;
+        let ibinput = (self.cflag >> IBSHIFT) & CBAUD != B0;
+        if self.cflag & CBAUD == BOTHER {
+            oclose = 0;
+            if !ibinput {
+                iclose = 0;
+            }
+        }
+        if (self.cflag >> IBSHIFT) & CBAUD == BOTHER {
+            iclose = 0;
+        }
+        self.cflag &= !CBAUD & !(CBAUD << IBSHIFT);
+        let (mut ifound, mut ofound) = (None, None);
+        for (i, &speed) in BAUD_TABLE.iter().enumerate() {
+            if obaud.saturating_sub(oclose) <= speed && obaud + oclose >= speed {
+                self.cflag |= baud_bits(i);
+                ofound = Some(i);
+            }
+            if ibaud.saturating_sub(iclose) <= speed && ibaud + iclose >= speed {
+                ifound = Some(i);
+                if !(ofound == Some(i) && !ibinput) {
+                    self.cflag |= baud_bits(i) << IBSHIFT;
+                }
+            }
+        }
+        if ofound.is_none() {
+            self.cflag |= BOTHER;
+        }
+        if ifound.is_none() && (ibaud != obaud || ibinput) {
+            self.cflag |= BOTHER << IBSHIFT;
+        }
     }
 
     pub fn i(&self, flag: u32) -> bool {

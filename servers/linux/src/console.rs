@@ -1,9 +1,11 @@
-//! The console's terminal (phase R6d, ADR 0007): the kernel's console device (a VT100 on
-//! the framebuffer, mirrored to the serial port, and the keyboard) driven by a terminal of
-//! the server (`tty`). The kernel grants the device to the tree it starts until that tree's
-//! first process ends: meanwhile its input wakes the service thread (`EVENT_CONSOLE`,
-//! `input`), and its loss (`EVENT_CONSOLE_LOST`, `lost`) hangs the terminal up, after which
-//! opening /dev/console gives ENXIO.
+//! The console's terminal (phase R6d, ADR 0007, ADR 0020): the kernel's console device (a
+//! VT100 on the framebuffer, mirrored to the serial port, and the keyboard, whose
+//! scancodes the virtual terminal's keyboard translates, `vt`) driven by a terminal of the
+//! server (`tty`): /dev/console, /dev/tty0 and /dev/tty1. The kernel grants the device
+//! (with the serial ports, `serial`) to the tree it starts until that tree's first process
+//! ends: meanwhile its input wakes the service thread (`EVENT_CONSOLE`, `input`), and its
+//! loss (`EVENT_CONSOLE_LOST`, `lost`) hangs the terminals up, after which opening
+//! /dev/console gives ENXIO.
 //!
 //! The tree's first thread gets its standard descriptors here (`setup_stdio`, as Linux's
 //! init gets /dev/console), and its process the console as its controlling terminal (there
@@ -55,10 +57,16 @@ pub fn current() -> Option<Arc<Tty>> {
     CONSOLE.lock().clone()
 }
 
-/// Opens /dev/console (never the caller's controlling terminal by opening, as on Linux).
-pub fn open(flags: u32, origin: Origin) -> Result<i64, i64> {
+/// Opens the console: /dev/console and /dev/tty0 (never the caller's controlling terminal
+/// by opening, as on Linux), /dev/tty1 (`ctty`: it may become one).
+pub fn open(flags: u32, origin: Origin, ctty: bool) -> Result<i64, i64> {
     let t = tty().ok_or(ENXIO)?;
-    tty::open(&t, flags, origin, false)
+    tty::open(&t, flags, origin, ctty)
+}
+
+/// Whether the instance holds the console's device (the serial ports go with it).
+pub fn held() -> bool {
+    !GONE.load(Ordering::Acquire)
 }
 
 /// Writes to the device (a call per `CONSOLE_WRITE_MAX` bytes, each whole). A signal does
@@ -88,27 +96,40 @@ pub fn device_echo(bytes: &[u8]) {
     }
 }
 
-/// `EVENT_CONSOLE`: the device's input into the terminal (service thread).
+/// `EVENT_CONSOLE`: the device's input into the terminal (service thread): the console's
+/// answers to queries (and COM1's input while no terminal holds it) as they are, the
+/// keyboard's scancodes through the virtual terminal's keyboard (`vt`), then the serial
+/// ports' input into their terminals.
 pub fn input() {
     let terminal = tty();
     let mut buf = [0u8; 256];
     loop {
         let n = syscall(SYS_CONSOLE_READ, [buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0, 0, 0]);
         if n <= 0 {
-            return;
+            break;
         }
         if let Some(t) = &terminal {
             t.input(&buf[..n as usize]);
         }
     }
+    loop {
+        let n = syscall(SYS_KBD_READ, [buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0, 0, 0]);
+        if n <= 0 {
+            break;
+        }
+        crate::vt::keyboard(&buf[..n as usize], terminal.as_ref());
+    }
+    crate::serial::input();
 }
 
-/// `EVENT_CONSOLE_LOST`: the kernel's monitor took the device back; the terminal hangs up.
+/// `EVENT_CONSOLE_LOST`: the kernel's monitor took the device back; the terminal hangs up,
+/// and so do the serial ports' (granted with it).
 pub fn lost() {
     GONE.store(true, Ordering::Release);
     if let Some(t) = current() {
         t.hangup(false);
     }
+    crate::serial::lost();
 }
 
 /// `ROLE_INIT`: the first thread of the tree's first program gets descriptors 0, 1 and 2

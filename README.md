@@ -111,8 +111,10 @@ Its [commit history](#development-history) records every step.
 - **Terminal**: Linux's N_TTY line discipline in the Linux server (canonical and raw mode,
   VMIN/VTIME, echo and line editing, signals from ^C/^Z/^\, flow control, output processing),
   the controlling terminal and job control's terminal side, pseudo-terminals (`/dev/ptmx`,
-  devpts), the ANSI escape sequences BusyBox, readline and ncurses use, a German keyboard
-  layout and UTF-8. The kernel keeps the console as a raw device.
+  devpts, packet mode), the ANSI escape sequences BusyBox, readline and ncurses use, Linux's
+  console keyboard (keymaps, a German default layout, UTF-8, the KD and VT requests on one
+  virtual terminal) and serial terminals (`/dev/ttyS0-3`). The kernel keeps the console, the
+  keyboard's scancodes and the serial ports as raw devices.
 - **~120 Linux system calls**, all implemented by the Linux server, enough for Bash, BusyBox
   and Node.js (see [System calls](#system-calls)).
 
@@ -246,7 +248,7 @@ The window scales when it is resized (`zoom-to-fit`), and Ctrl+Alt+F toggles ful
  │  threads           processes as containers, SMP fair scheduler, timers, clocks, kill      │
  │  IPC and channels  service registry, channel offers, grants, doorbells                    │
  │  devices           I/O ports, IRQ lines and DMA areas for servers; PCI, ACPI              │
- │  console device    raw bytes: framebuffer (ANSI) and keyboard (the terminals: the server) │
+ │  console device    raw: framebuffer (ANSI), scancodes, serial ports (terminals: server) │
  │  CPU               GDT, TSS + I/O bitmap, IDT, local + I/O APIC, SSE; the boot image      │
  └──────────────────────────────────────────────────────────────────────────────────────────┘
       bootloader 0.11 (UEFI/BIOS), QEMU q35, 4 CPUs, 256 MiB RAM, AHCI boot disk, virtio-blk data disk, virtio-net
@@ -293,8 +295,8 @@ oxidenix/
 │       │                        memory objects: page cache, paged and file objects (cache.rs)
 │       ├── drivers/             framebuffer console (console.rs, glyphs.rs), the console
 │       │                        device the server's terminals drive (console_device.rs),
-│       │                        PS/2 keyboard (keyboard.rs), CMOS clock (rtc.rs),
-│       │                        serial port mirror (serial.rs), PCI scan (pci.rs),
+│       │                        PS/2 keyboard's scancodes (keyboard.rs), CMOS clock (rtc.rs),
+│       │                        serial ports and mirror (serial.rs), PCI scan (pci.rs),
 │       │                        ACPI tables (acpi.rs), the HPET, PM timer and PIT as
 │       │                        references for the TSC (refclock.rs)
 │       ├── sync.rs              IrqSpinLock: fair, interrupt-safe ticket lock
@@ -1131,9 +1133,9 @@ dispatch; drivers, filesystems, the network stack and Linux itself are user-spac
   kernel's per-space counts by kind of area, and the resident pages by what they are
   (`RssAnon`, `RssFile`, `RssShmem`, with `VmPTE`). A non-Linux userland would simply not run
   procfs.
-- What stays in the kernel: the console and keyboard as a raw device (the terminals are the
-  Linux server's, R6d); no VFS, no descriptor tables, no signals, no Linux system call (R9,
-  ADR 0011).
+- What stays in the kernel: the console, the keyboard's scancodes and the serial ports as raw
+  devices (the terminals and Linux's keyboard are the Linux server's, R6d, ADR 0020); no VFS,
+  no descriptor tables, no signals, no Linux system call (R9, ADR 0011).
 
 ### Networking
 
@@ -1305,10 +1307,12 @@ dispatch; drivers, filesystems, the network stack and Linux itself are user-spac
   build time, so the kernel needs no image decoder. Like on Linux, the logo is plain pixels and
   scrolls away with the text.
 - **Console device**: the kernel moves bytes only: output to the screen and the serial mirror
-  as they are (a line feed keeps the column, as on a VT), input from the keyboard and the
-  console's answers to queries into a ring. It is granted to the process tree the kernel
-  starts until that tree's first process ends; the monitor edits its command line on it
-  otherwise (docs/design/linux-server.md, ADR 0007).
+  as they are (a line feed keeps the column, as on a VT), the console's answers to queries
+  (and COM1's input while no terminal holds that port) into a ring, the keyboard's scancodes
+  into another, untranslated. It is granted, with the serial ports, to the process tree the
+  kernel starts until that tree's first process ends; the monitor edits its command line on
+  it otherwise (docs/design/linux-server.md, ADR 0007, ADR 0020). `KD_GRAPHICS` stops its
+  text drawing (redrawn in `KD_TEXT`).
 - **Kernel log** (`kernel/src/klog.rs`): every `printk`, the native servers' output and the
   Linux servers' messages also go to a ring of records (sequence number, time since boot,
   priority, text; 128 KiB, the oldest evicted first). The Linux server reads it for
@@ -1322,13 +1326,24 @@ dispatch; drivers, filesystems, the network stack and Linux itself are user-spac
   line discipline (termios and termios2, canonical editing with `ERASE`/`KILL`/`WERASE`/
   `REPRINT`/`LNEXT`, `VMIN`/`VTIME`, echo, `ISIG`, `IXON`, `OPOST`/`ONLCR`/`XTABS`, ...), the
   controlling terminal, `TIOCSPGRP`/`TIOCGPGRP`, `TIOCSCTTY`/`TIOCNOTTY`, `SIGTTIN`/`SIGTTOU`,
-  window sizes with `SIGWINCH`, hangups, `TIOCSTI`, and pseudo-terminals (`/dev/ptmx`,
-  `/dev/pts/n` in devpts). Device nodes name their driver by number (5,0 `/dev/tty`, 5,1
-  `/dev/console`, 5,2 `/dev/ptmx`, 136,n).
-- **Keyboard**: PS/2 scancodes are decoded in the IRQ handler with the German (`De105Key`)
-  layout and translated to terminal bytes: CR, DEL, and the Linux console's sequences for
-  arrows, editing keys and F1-F12. The AltGr characters the crate's layout lacks
-  (`{ [ ] } \ ² ³ µ`) are added by the driver.
+  window sizes with `SIGWINCH`, hangups, `TIOCSTI`, `EXTPROC`, pseudo-terminals (`/dev/ptmx`,
+  `/dev/pts/n` in devpts, packet mode `TIOCPKT`), the console's virtual terminal
+  (`servers/linux/src/vt.rs`: `/dev/tty1`, with `/dev/tty0` and `/dev/console` leading to
+  it; the KD, VT and `TIOCLINUX` requests of console_ioctl(4) for one VT, `KD_GRAPHICS`) and
+  serial terminals (`servers/linux/src/serial.rs`: `/dev/ttyS0-3` on the kernel's UARTs,
+  speeds and formats programmed, `TIOCM*` modem lines, breaks, `TIOCGSERIAL`). Device nodes
+  name their driver by number (5,0 `/dev/tty`, 5,1 `/dev/console`, 5,2 `/dev/ptmx`, 136,n,
+  4,0 and 4,1, 4,64-67). With `-serial stdio` COM1 types into the console it mirrors; a
+  terminal of its own: `setsid -c sh -l <>/dev/ttyS0 >&0 2>&0` (ADR 0020).
+- **Keyboard** (`crates/kbd`, ADR 0020): the kernel queues the PS/2 scancodes untranslated;
+  the server's virtual terminal makes input of them as Linux's keyboard does: the keyboard
+  modes (`K_RAW` scancodes, `K_MEDIUMRAW` keycodes, `K_XLATE` Latin-1, `K_UNICODE` UTF-8,
+  `K_OFF`), 256 keymaps of Linux keysyms (`KDGKBENT`/`KDSKBENT`: dumpkmap, loadkmap; the
+  default German, as `de-latin1-nodeadkeys`), modifiers and locks with their LEDs (Scroll
+  Lock holds output), the keypad with Num Lock, dead keys and Compose (`KDGKBDIACR`),
+  Alt-numpad entry, function strings (`KDGKBSENT`), Alt as ESC (`KDGKBMETA`), the scancode
+  table (`KDGETKEYCODE`), autorepeat (`KDKBDREP`), Ctrl-Alt-Del and `KDSIGACCEPT`'s
+  keyboard signal. The kernel's monitor uses the same library with the default keymap.
 
 ### Userland build
 
@@ -1434,7 +1449,7 @@ Each of these programs and scripts lives in the root filesystem and runs inside 
 | `reclaimtest` | reclaim under stress: processes mapping a disk file (shared, and private with copies of their own of some pages) and reading it check every page they touch while two others commit and use all the memory left, three times over; every page holds its data, committed memory is always usable, nobody is killed |
 | `writebacktest` | stores through a shared mapping of a `/data` file: reading makes nothing dirty, a store makes its page dirty (`Dirty` in `/proc/meminfo`), `msync`, `fsync` and `fdatasync` write it back (also a page stored to again afterwards), `write` and a store in one page both arrive, the server's write-back takes a store to the disk on its own after `munmap`, a store of a process that exited, dirty pages surviving reclaim, truncation of a file with dirty pages, 1 MiB of stores; `O_DIRECT` reads as the view of the disk |
 | `mmaptest /data` | all of `mmaptest` on a disk file |
-| `ttytest` | the Linux server's terminals through pseudo-terminals: `/dev/ptmx`, `TIOCGPTN`, a locked slave (`EIO`), `unlockpt`, `TIOCGPTPEER`, devpts's nodes (136, n) and its refusals (`EACCES`, `EPERM`), the node gone with the master; `/dev/console` and `/dev/tty`; termios defaults and round trips (also through the master); canonical reads a line at a time with echo, partial lines, `FIONREAD`, erase/kill/werase and their echo, `^D`, `^V`, `TIOCSTI`; `ONLCR`, `XTABS`, no `OPOST`; `VMIN`/`VTIME` (0/0, 0/2, 3/0 with poll, 5/1's inter-byte timer); raw input, leaving canonical mode; `^S`/`^Q` and `tcflow`; poll and `tcflush`; window sizes; the master's `EIO` and `POLLHUP` after the slave's close; a session with the slave as controlling terminal: `^C`, `^\`, `^Z` and `SIGWINCH` for the foreground job, `SIGTTIN` and `SIGTTOU` (`TOSTOP`, `tcsetattr`) for background jobs, `EIO` with `SIGTTIN` ignored, `TIOCSPGRP`'s `EPERM`/`ESRCH`, `TIOCSCTTY`/`TIOCNOTTY`; the terminal freed when its session's leader ends; a hangup by the master's close (`SIGHUP`, end of file, `EIO`); `O_PATH` and `O_DIRECTORY` on device nodes; echoes of console input not waiting behind a process flooding the console; echoes into a master that never reads bounded, `TIOCSTI` on a full master, `TIOCSIG`'s signals; a waiting canonical read taking the half line when the mode goes raw, two readers each getting a whole line, a failed slave open leaving the master usable; an orphaned stopped job getting `SIGHUP` and `SIGCONT` |
+| `ttytest` | the Linux server's terminals through pseudo-terminals: `/dev/ptmx`, `TIOCGPTN`, a locked slave (`EIO`), `unlockpt`, `TIOCGPTPEER`, devpts's nodes (136, n) and its refusals (`EACCES`, `EPERM`), the node gone with the master; `/dev/console` and `/dev/tty`; termios defaults and round trips (also through the master); canonical reads a line at a time with echo, partial lines, `FIONREAD`, erase/kill/werase and their echo, `^D`, `^V`, `TIOCSTI`; `ONLCR`, `XTABS`, no `OPOST`; `VMIN`/`VTIME` (0/0, 0/2, 3/0 with poll, 5/1's inter-byte timer); raw input, leaving canonical mode; `^S`/`^Q` and `tcflow`; poll and `tcflush`; window sizes; the master's `EIO` and `POLLHUP` after the slave's close; a session with the slave as controlling terminal: `^C`, `^\`, `^Z` and `SIGWINCH` for the foreground job, `SIGTTIN` and `SIGTTOU` (`TOSTOP`, `tcsetattr`) for background jobs, `EIO` with `SIGTTIN` ignored, `TIOCSPGRP`'s `EPERM`/`ESRCH`, `TIOCSCTTY`/`TIOCNOTTY`; the terminal freed when its session's leader ends; a hangup by the master's close (`SIGHUP`, end of file, `EIO`); `O_PATH` and `O_DIRECTORY` on device nodes; echoes of console input not waiting behind a process flooding the console; echoes into a master that never reads bounded, `TIOCSTI` on a full master, `TIOCSIG`'s signals; a waiting canonical read taking the half line when the mode goes raw, two readers each getting a whole line, a failed slave open leaving the master usable; an orphaned stopped job getting `SIGHUP` and `SIGCONT`; packet mode (`TIOCPKT`, `TIOCGPKT`: `TIOCPKT_DATA` before data, the flush, stop/start, `DOSTOP`/`NOSTOP` and `IOCTL` status packets, `POLLPRI` and select's exceptional set), `EXTPROC`, a pty's `CS8 | CREAD`, speeds following `CBAUD` (`TCGETS2`); serial terminals: `/dev/ttyS0-3`'s nodes, ttyS0's defaults (115200 8N1, `CLOCAL`, no window size) and `TIOCGSERIAL`, `EIO` for a port the machine lacks, on ttyS1 (QEMU's COM2) in loopback mode (`TIOCMBIS TIOCM_LOOP`): DTR and RTS raised by the open and seen as DSR and CTS, raw and canonical input coming back through the UART's interrupt, 2000 bytes round, `CREAD` off, 9600 7O2 kept and working, a speed beyond the port falling back, `BOTHER` kept, B0 dropping DTR and RTS, `tcsendbreak`'s quarter second, `TIOCSERGETLSR`, `TIOCSSERIAL`, settings outliving the last close, a session leader's controlling terminal; the console's virtual terminal: `/dev/tty0` and `/dev/tty1`, tty2 `ENXIO`, `KDGKBTYPE` (`ENOTTY` on a pty), keys typed through `TEST_KBD_INPUT` (the German layout, UTF-8, the Linux console's sequences, Alt as ESC, AltGr's euro sign), the keyboard modes (`K_RAW`, `K_MEDIUMRAW`, `K_XLATE`, `K_OFF`), `KDGKBENT`/`KDSKBENT`, `KDGKBSENT`/`KDSKBSENT`, the accent tables, `KDGETKEYCODE`, Caps Lock and the LEDs (`KDGKBLED`, `KDGETLED`, `KDSETLED`), Scroll Lock holding the console's output, `KDSIGACCEPT`'s signal on Alt+Up, `KDKBDREP`, `KDSETMODE`/`KDGETMODE` and the font requests (`ENOSYS`, `EINVAL` in `KD_GRAPHICS`), `VT_GETSTATE`, `VT_OPENQRY`, `VT_GETMODE`/`VT_SETMODE`, `VT_RELDISP`, a VT_PROCESS owner and `KDSIGACCEPT`'s process held by identity (gone: `VT_AUTO`, no signal), `VT_ACTIVATE`, `VT_WAITACTIVE` (a VT that never comes: `EINTR`), `VT_DISALLOCATE`, `TIOCLINUX` |
 | `datatest` | `/data` in the Linux server: reads, writes, `lseek`, `stat`, `fsync`, its own device and ext2's `statfs`; two descriptors, a mapping and another process's mapping sharing one page cache; `write` leaving dirty pages, `fsync` writing them (`Dirty` back, the data on the device: `O_DIRECT`), an `O_SYNC` write clean when it returns, a write past the end and its hole, `sync`; truncation with dirty mapped pages (`SIGBUS` beyond, the tail zero, the size on the device); 100 children storing into an inherited mapping while a thread writes it back, every store on the device; 400 forks racing a truncation of a mapped file, every child getting `SIGBUS` beyond the new end; 8 processes reading one uncached file at random offsets at once; 4 threads writing parts of one file; a 32 MiB file written and read back with 12 MiB left to cache it; a read while dirty pages fill memory; a full disk: `write` itself failing with `ENOSPC` (the space promised as data enters the cache), everything accepted on the device after `fsync`, `statfs` counting promised space, a store into a hole raising `SIGBUS`, and going through once there is room again; an open file unlinked whose diskfs is killed twice (`TEST_KILL_SERVER`): the Linux server connects to the next diskfs without a use of `/data` (`EVENT_SERVICE_GONE`), the file stays allocated, the open descriptor reads its data back from the device and writes on, and its blocks come back after the last close; a mapping read by another process while diskfs is killed, its faults on pages not in the cache and a store into a clean page right after, all going through, and a fill that fails as if diskfs went (`TEST_FILL_GONE`) tried again (the pager leaves them to the worker, which connects; pages a dying diskfs did not read are asked for again), the store on the device after `msync`; the 32 MiB file with 12 MiB to cache it again, written back by a freshly started diskfs (its stores to its own untouched heap and stack are never throttled for write-back, which waits for it) |
 | `bash -c` (in `runtests.sh`) | Bash itself: functions, arrays, arithmetic, `[[ ]]`, a pipe into `grep`, a here-document into a `/tmp` file read back, a subshell's `cd`, command substitution |
 | `sh /etc/test.sh` | files, pipes, `cd`, `mkdir`/`touch`/`rm`, rename cycles via symlinks, the tmpfs size limit |
@@ -1447,6 +1462,7 @@ Each of these programs and scripts lives in the root filesystem and runs inside 
 | `cargo test -p netlink` (host) | rtnetlink's answers: link and address dumps (`NLM_F_MULTI`, `NLMSG_DONE`, sequence numbers and port ids, the attributes getifaddrs reads), one link by index or by name with its acknowledgement, `ENODEV`, `EINVAL` for a short request, `EOPNOTSUPP` for other requests (capped with `NETLINK_CAP_ACK`), no answer for control messages and non-requests, a malformed length ending the datagram, two requests in one datagram, dumps split into page-sized datagrams; dumps produced a datagram at a time, one dump at a time (`EBUSY`), answers stopped at the room left |
 | `cargo test --release -p netring` (host) | the socket protocol between the Linux server and netd: every request survives encode and decode, `ENOSYS` for unknown operations, `EINVAL` for stray fields, malformed areas (two power-of-two rings on a page), sockets, endpoints and values out of range; the shared area's layout; ring arithmetic across the wrap; datagram records and interface records round-trip; netd's port rules (Linux's `SO_REUSEADDR` rule within an instance, never a port another instance serves, UDP reuse within an instance only); netd's budgets (a cap per instance however it asks, a reserve kept for every instance with a channel, refused charges take nothing, given back only to the instance charged, a flood against one instance leaving the others theirs); ICMP messages told apart by what they concern, malformed ones (every truncation, changed bytes) never a panic; echo identifiers rewritten with their checksum and kept apart per instance; 4 MiB streamed through a ring between two threads (the reader sleeping on the control block, the writer waiting for room) and 100000 marks handed to a sleeping net thread, with no wakeup lost |
 | `cargo test -p vfs` (host) | paths and cpio; `struct stat` round-trips, every `struct statx` field and `stx_mask` (with and without a birth time), device numbers, statx's checks of flags and mask |
+| `cargo test -p kbd` (host) | Linux's console keyboard: the German layout, Shift, AltGr, Control, Alt as ESC or the meta bit, Ctrl-Alt-Del and console switches as actions, cursor and function keys (DECCKM, Shift+F1 as F11, LNM's CR LF), Caps and Num Lock with their LEDs, the keypad (cursor keys without Num Lock, the application keypad), Alt-numpad entry, dead keys, Compose and the accent table, `K_RAW`, `K_MEDIUMRAW` (three bytes beyond keycode 127, Pause's E1 sequence), `K_XLATE`, `K_OFF`, shifts tracked in the raw modes, autorepeat with DECARM, keymap entries (`K_NOSUCHMAP`, `K_HOLE`, Unicode keysyms only in Unicode mode, values checked by type, new keymaps of holes, removal, the shift state recomputed), function strings, the LED flags and `KDSETLED`, the scancode table, output bounded by its room |
 | `timeout 1 sleep 5` | `vfork` and `SIGTERM` after the time limit (exit status 143) |
 | `kill -9 1` in Bash | user space cannot kill a server (`EPERM`) |
 | `kill diskfs` in the kernel monitor | the next `/data` access connects a new channel, which restarts the server; open files survive (an unlinked one fails with `EIO`), dirty pages whose write-back failed are written again; a diskfs in a crash loop is down for a while (`EIO`) and then tried again (ADR 0006); a restart still runs the boot-time program even after `/sbin/diskfs` was overwritten |
@@ -1554,7 +1570,7 @@ Run `git log` for the full history, including the security fixes between these s
 oxidenix builds on excellent open source work: the
 [`bootloader`](https://github.com/rust-osdev/bootloader) and
 [`x86_64`](https://github.com/rust-osdev/x86_64) crates of the rust-osdev community,
-`pc-keyboard`, `pic8259`, `linked_list_allocator`, `heapless`, `spin`,
+`pic8259`, `linked_list_allocator`, `heapless`, `spin`,
 `noto-sans-mono-bitmap`, and in user space [musl](https://musl.libc.org/),
 [BusyBox](https://busybox.net/) and [GNU Bash](https://www.gnu.org/software/bash/) as packaged
 by [nixpkgs](https://github.com/NixOS/nixpkgs).

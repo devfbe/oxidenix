@@ -2,7 +2,9 @@
 //! (docs/design/linux-server.md, "The terminal"): input mapping, signals from the
 //! keyboard, flow control, canonical line editing with echo, the rules of
 //! noncanonical reads, and output processing with Linux's column bookkeeping.
-//! It only computes: the waiting, the locks and the devices are the server's.
+//! With EXTPROC (external processing: a pty's master does the editing, telnetd's
+//! LINEMODE) input is stored as it comes and read as noncanonical input, whatever
+//! ICANON says. It only computes: the waiting, the locks and the devices are the server's.
 //!
 //! The input buffer holds at most `BUF_SIZE - 1` bytes: complete lines in `buf`
 //! (canonical mode; noncanonical: all input) and, in canonical mode, the line
@@ -123,11 +125,15 @@ impl Ldisc {
     /// IXON went off, which restarts it.
     pub fn set_termios(&mut self, new: Termios) -> bool {
         let old = self.t;
+        let was_canonical = self.canonical();
         self.t = new;
-        if (old.lflag ^ new.lflag) & ICANON != 0 {
+        // (Linux's `n_tty_set_termios` acts on a change of ICANON or EXTPROC.)
+        if (old.lflag ^ new.lflag) & (ICANON | EXTPROC) != 0 {
             self.erasing = false;
             self.lnext = false;
-            if new.l(ICANON) {
+        }
+        if was_canonical != self.canonical() {
+            if self.canonical() {
                 if !self.buf.is_empty() {
                     self.ends.push_back((self.base + self.buf.len() as u64 - 1, false));
                 }
@@ -160,8 +166,9 @@ impl Ldisc {
         });
     }
 
+    /// Whether input is edited and read in lines: ICANON without EXTPROC.
     fn canonical(&self) -> bool {
-        self.t.l(ICANON)
+        self.t.l(ICANON) && !self.t.l(EXTPROC)
     }
 
     fn total(&self) -> usize {
@@ -200,6 +207,16 @@ impl Ldisc {
         if self.lnext {
             self.lnext = false;
             self.put(c, false, echo, &mut r);
+            return r;
+        }
+        if t.l(EXTPROC) {
+            // Stored as it is: no special characters, no echo, no signals (Linux's
+            // `n_tty_receive_buf_standard` queues it right after ISTRIP and IUCLC).
+            if self.total() >= BUF_SIZE - 1 {
+                r.dropped = true;
+            } else {
+                self.buf.push_back(c);
+            }
             return r;
         }
         if t.i(IXON) {
@@ -304,6 +321,37 @@ impl Ldisc {
             }
         }
         self.put(c, special, echo, &mut r);
+        r
+    }
+
+    /// Receives a break (the console's Break key, a serial line's): Linux's
+    /// `n_tty_receive_break`: nothing with IGNBRK, SIGINT with BRKINT (flushing as the
+    /// signal characters do), else a NUL, after `\377 \0` with PARMRK. No echo.
+    pub fn receive_break(&mut self, echo: &mut Vec<u8>) -> Received {
+        let t = self.t;
+        let mut r = Received::default();
+        if t.i(IGNBRK) {
+            return r;
+        }
+        if t.i(BRKINT) {
+            r.signal = Some(SIGINT);
+            if !t.l(NOFLSH) {
+                self.flush_input();
+                echo.clear();
+                r.flushed = true;
+            }
+            return r;
+        }
+        let bytes: &[u8] = if t.i(PARMRK) { b"\xff\0\0" } else { b"\0" };
+        if self.total() + bytes.len() > BUF_SIZE - 1 {
+            r.dropped = true;
+            return r;
+        }
+        if self.canonical() {
+            self.line.extend_from_slice(bytes);
+        } else {
+            self.buf.extend(bytes);
+        }
         r
     }
 
@@ -579,10 +627,13 @@ impl Ldisc {
         }
     }
 
-    /// How reads wait.
+    /// How reads wait: with ICANON and EXTPROC for a byte, without a timer (Linux's
+    /// `n_tty_read` takes VMIN and VTIME only without ICANON).
     pub fn mode(&self) -> ReadMode {
         if self.canonical() {
             ReadMode::Canonical
+        } else if self.t.l(ICANON) {
+            ReadMode::Raw { min: 1, time: 0 }
         } else {
             ReadMode::Raw { min: self.t.cc[VMIN], time: self.t.cc[VTIME] }
         }
@@ -594,7 +645,10 @@ impl Ldisc {
         if self.canonical() {
             return !self.ends.is_empty();
         }
-        let (min, time) = (self.t.cc[VMIN] as usize, self.t.cc[VTIME]);
+        let (min, time) = match self.mode() {
+            ReadMode::Raw { min, time } => (min as usize, time),
+            ReadMode::Canonical => (1, 0),
+        };
         let amount = if poll && time == 0 && min > 0 { min } else { 1 };
         self.buf.len() >= amount
     }

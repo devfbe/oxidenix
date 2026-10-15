@@ -13,7 +13,7 @@ bench = false
 bootloader_api = "0.11"
 x86_64 = "0.15"
 pic8259 = "0.10"
-pc-keyboard = "0.7"
+kbd = { path = "../crates/kbd" }
 spin = "0.9"
 heapless = "0.9"
 procproto = { path = "../crates/procproto" }

@@ -2,7 +2,8 @@
  * round trips, canonical and raw reads with VMIN and VTIME, echo and line editing,
  * output processing, flow control, poll, window sizes, the controlling terminal, the
  * foreground process group and the signals of ^C, ^\ and ^Z, SIGTTIN and SIGTTOU for a
- * background group, hangups, devpts, and the console's device node. (The console's own
+ * background group, hangups, devpts, packet mode and EXTPROC, and the console's device
+ * node. (The console's own
  * input is the keyboard's: checked interactively, not here.) */
 #define _GNU_SOURCE
 #include <dirent.h>
@@ -972,10 +973,574 @@ static void job_control(void) {
     check("a hung-up slave cannot be opened again", open(path, O_RDWR | O_NOCTTY) == -1);
 }
 
+/* One read of the master: its bytes into `buf`, their count (-1 on an error). */
+static int read_master(int m, unsigned char *buf, int cap) {
+    struct pollfd p = {m, POLLIN, 0};
+    if (poll(&p, 1, 1000) != 1) return -1;
+    return read(m, buf, cap);
+}
+
+/* struct termios2, for the speeds (TCGETS2). */
+struct termios2_ {
+    tcflag_t c_iflag, c_oflag, c_cflag, c_lflag;
+    cc_t c_line, c_cc[19];
+    speed_t c_ispeed, c_ospeed;
+};
+#define TCGETS2_ _IOR('T', 0x2a, struct termios2_)
+
+/* Packet mode (TIOCPKT): the slave's status changes as packets of one byte, data behind
+ * TIOCPKT_DATA, POLLPRI and select's exceptional set while status waits; EXTPROC (input
+ * stored as it comes, its changes reported as TIOCPKT_IOCTL); a pty's settings keep eight
+ * bits, and the speeds follow CBAUD. */
+static void packet_mode(void) {
+    char path[64];
+    unsigned char buf[64];
+    int m = new_pty(path, sizeof path);
+    int s = open(path, O_RDWR | O_NOCTTY);
+    int on = -1;
+    check("TIOCGPKT: packet mode starts off", ioctl(m, TIOCGPKT, &on) == 0 && on == 0);
+    on = 1;
+    check("TIOCPKT on the slave: ENOTTY", ioctl(s, TIOCPKT, &on) == -1 && errno == ENOTTY);
+    check("TIOCPKT turns it on", ioctl(m, TIOCPKT, &on) == 0 && ioctl(m, TIOCGPKT, &on) == 0 && on == 1);
+    write(s, "hi", 2);
+    struct pollfd pf = {m, POLLIN | POLLPRI, 0};
+    check("data alone polls POLLIN, not POLLPRI", poll(&pf, 1, 1000) == 1 && (pf.revents & (POLLIN | POLLPRI)) == POLLIN);
+    int n = read_master(m, buf, sizeof buf);
+    check("data comes behind TIOCPKT_DATA", n == 3 && buf[0] == TIOCPKT_DATA && memcmp(buf + 1, "hi", 2) == 0);
+    write(s, "x", 1);
+    n = read(m, buf, 1);
+    check("a read of one byte takes the TIOCPKT_DATA byte alone", n == 1 && buf[0] == TIOCPKT_DATA);
+    tcflush(m, TCIFLUSH);
+
+    tcflow(s, TCOOFF);
+    pf.revents = 0;
+    check("stopped output polls POLLPRI and POLLIN", poll(&pf, 1, 1000) == 1 && (pf.revents & (POLLPRI | POLLIN)) == (POLLPRI | POLLIN));
+    fd_set ex;
+    FD_ZERO(&ex);
+    FD_SET(m, &ex);
+    struct timeval tv = {1, 0};
+    check("select reports it as exceptional", select(m + 1, NULL, NULL, &ex, &tv) == 1 && FD_ISSET(m, &ex));
+    n = read_master(m, buf, sizeof buf);
+    check("tcflow(TCOOFF): TIOCPKT_STOP", n == 1 && buf[0] == TIOCPKT_STOP);
+    pf.revents = 0;
+    check("read, the status is gone", poll(&pf, 1, 0) == 0);
+    tcflow(s, TCOON);
+    n = read_master(m, buf, sizeof buf);
+    check("tcflow(TCOON): TIOCPKT_START", n == 1 && buf[0] == TIOCPKT_START);
+    tcflow(s, TCOOFF);
+    tcflow(s, TCOON);
+    n = read_master(m, buf, sizeof buf);
+    check("stopped and started before a read: TIOCPKT_START alone", n == 1 && buf[0] == TIOCPKT_START);
+    write(m, "\x13", 1);
+    n = read_master(m, buf, sizeof buf);
+    check("^S from the master: TIOCPKT_STOP", n == 1 && buf[0] == TIOCPKT_STOP);
+    write(m, "\x11", 1);
+    n = read_master(m, buf, sizeof buf);
+    check("^Q: TIOCPKT_START", n == 1 && buf[0] == TIOCPKT_START);
+
+    tcflush(s, TCIFLUSH);
+    n = read_master(m, buf, sizeof buf);
+    check("tcflush(TCIFLUSH) on the slave: TIOCPKT_FLUSHREAD", n == 1 && buf[0] == TIOCPKT_FLUSHREAD);
+    tcflush(s, TCOFLUSH);
+    n = read_master(m, buf, sizeof buf);
+    check("tcflush(TCOFLUSH): TIOCPKT_FLUSHWRITE", n == 1 && buf[0] == TIOCPKT_FLUSHWRITE);
+    write(s, "data", 4);
+    tcflush(s, TCIOFLUSH);
+    n = read_master(m, buf, sizeof buf);
+    check("tcflush(TCIOFLUSH): both, the data gone", n == 1 && buf[0] == (TIOCPKT_FLUSHREAD | TIOCPKT_FLUSHWRITE));
+    write(m, "\x03", 1);
+    n = read_master(m, buf, sizeof buf);
+    int n2 = read_master(m, buf + 8, sizeof buf - 8);
+    check("^C flushes both ways (a status packet), then its echo",
+          n == 1 && buf[0] == (TIOCPKT_FLUSHREAD | TIOCPKT_FLUSHWRITE) && n2 == 3 && buf[8] == 0 && memcmp(buf + 9, "^C", 2) == 0);
+
+    struct termios t;
+    tcgetattr(s, &t);
+    t.c_iflag &= ~IXON;
+    tcsetattr(s, TCSANOW, &t);
+    n = read_master(m, buf, sizeof buf);
+    check("IXON off: TIOCPKT_NOSTOP", n == 1 && buf[0] == TIOCPKT_NOSTOP);
+    t.c_iflag |= IXON;
+    tcsetattr(m, TCSANOW, &t);
+    n = read_master(m, buf, sizeof buf);
+    check("on again (through the master): TIOCPKT_DOSTOP", n == 1 && buf[0] == TIOCPKT_DOSTOP);
+
+    /* EXTPROC: input as it comes, no echo, no signals; every change is reported. */
+    t.c_lflag |= EXTPROC;
+    tcsetattr(s, TCSANOW, &t);
+    n = read_master(m, buf, sizeof buf);
+    check("EXTPROC set: TIOCPKT_IOCTL", n == 1 && buf[0] == TIOCPKT_IOCTL);
+    write(m, "ab\x7f\x03\r", 5);
+    sleep_ms(20);
+    int avail = -1;
+    ioctl(s, FIONREAD, &avail);
+    n = read(s, buf, sizeof buf);
+    pf.revents = 0;
+    check("EXTPROC: the bytes as they came, readable at once, nothing echoed",
+          avail == 5 && n == 5 && memcmp(buf, "ab\x7f\x03\r", 5) == 0 && poll(&pf, 1, 50) == 0);
+    t.c_lflag &= ~ECHO;
+    tcsetattr(s, TCSANOW, &t);
+    n = read_master(m, buf, sizeof buf);
+    check("with EXTPROC any change is TIOCPKT_IOCTL", n == 1 && buf[0] == TIOCPKT_IOCTL);
+    t.c_lflag &= ~EXTPROC;
+    tcsetattr(s, TCSANOW, &t);
+    n = read_master(m, buf, sizeof buf);
+    check("so is EXTPROC's end", n == 1 && buf[0] == TIOCPKT_IOCTL);
+
+    on = 0;
+    ioctl(m, TIOCPKT, &on);
+    write(s, "plain", 5);
+    n = read_master(m, buf, sizeof buf);
+    check("packet mode off: data alone", n == 5 && memcmp(buf, "plain", 5) == 0);
+
+    /* A pty keeps eight bits and the receiver on (Linux's pty_set_termios). */
+    tcgetattr(s, &t);
+    t.c_cflag = (t.c_cflag & ~CSIZE) | CS7 | PARENB;
+    t.c_cflag &= ~CREAD;
+    tcsetattr(s, TCSANOW, &t);
+    tcgetattr(s, &t);
+    check("a pty's c_cflag stays CS8 | CREAD without PARENB", (t.c_cflag & (CSIZE | CREAD | PARENB)) == (CS8 | CREAD));
+    cfsetspeed(&t, B9600);
+    tcsetattr(s, TCSANOW, &t);
+    struct termios2_ t2;
+    check("TCGETS2 shows the speed CBAUD says", ioctl(s, TCGETS2_, &t2) == 0 && t2.c_ospeed == 9600 && t2.c_ispeed == 9600);
+    close(s);
+    close(m);
+}
+
+/* Serial ports (struct serial_struct's head, the modem lines). */
+#define TIOCM_LOOP_ 0x8000
+#ifndef BOTHER
+#define BOTHER 0010000
+#endif
+struct serial_head {
+    int type, line;
+    unsigned port;
+    int irq;
+};
+
+/* Reads what the terminal has within a second (poll, then reads until a pause). */
+static int read_some(int fd, char *buf, int cap) {
+    int got = 0;
+    struct pollfd p = {fd, POLLIN, 0};
+    int wait = 1000;
+    while (got < cap && poll(&p, 1, wait) == 1 && (p.revents & POLLIN)) {
+        int n = read(fd, buf + got, cap - got);
+        if (n <= 0) break;
+        got += n;
+        wait = 100;
+    }
+    return got;
+}
+
+/* /dev/ttyS<n>: COM1 is the console's mirror (only looked at), COM2 (QEMU's second
+ * port in test mode, nothing attached) is driven in loopback mode, TIOCM_LOOP: what it
+ * sends comes back as its input, through the UART, the kernel and the line discipline. */
+static void serial(void) {
+    struct stat st;
+    check("/dev/ttyS0-3 are character devices (4, 64-67)",
+          stat("/dev/ttyS0", &st) == 0 && S_ISCHR(st.st_mode) && st.st_rdev == makedev(4, 64) && stat("/dev/ttyS3", &st) == 0 &&
+              st.st_rdev == makedev(4, 67));
+    int s0 = open("/dev/ttyS0", O_RDWR | O_NOCTTY | O_NONBLOCK);
+    struct termios t;
+    struct termios2_ t2;
+    check("ttyS0 opens, a terminal", s0 >= 0 && isatty(s0));
+    check("its settings: 115200 baud 8N1, CREAD, HUPCL, CLOCAL",
+          tcgetattr(s0, &t) == 0 && cfgetospeed(&t) == B115200 && (t.c_cflag & (CSIZE | PARENB | CSTOPB)) == CS8 &&
+              (t.c_cflag & (CREAD | HUPCL | CLOCAL)) == (CREAD | HUPCL | CLOCAL) && ioctl(s0, TCGETS2_, &t2) == 0 &&
+              t2.c_ospeed == 115200);
+    struct winsize ws = {1, 1, 0, 0};
+    check("a serial line has no window size", ioctl(s0, TIOCGWINSZ, &ws) == 0 && ws.ws_row == 0 && ws.ws_col == 0);
+    struct serial_head sh = {0};
+    char sbuf[72];
+    check("TIOCGSERIAL: a 16550A at 0x3f8, IRQ 4",
+          ioctl(s0, TIOCGSERIAL, sbuf) == 0 && (memcpy(&sh, sbuf, sizeof sh), sh.type == 4 && sh.port == 0x3f8 && sh.irq == 4));
+    close(s0);
+    check("a port the machine lacks opens EIO", open("/dev/ttyS3", O_RDWR | O_NOCTTY) == -1 && errno == EIO);
+    check("a pty has no modem lines (ENOTTY)", ({
+              char p[64];
+              int m = new_pty(p, sizeof p);
+              int bits, r = ioctl(m, TIOCMGET, &bits);
+              int e = errno;
+              close(m);
+              r == -1 && e == ENOTTY;
+          }));
+
+    int s = open("/dev/ttyS1", O_RDWR | O_NOCTTY | O_NONBLOCK);
+    check("ttyS1 opens", s >= 0);
+    int bits = 0;
+    check("opening raised DTR and RTS", ioctl(s, TIOCMGET, &bits) == 0 && (bits & (TIOCM_DTR | TIOCM_RTS)) == (TIOCM_DTR | TIOCM_RTS));
+    int loop = TIOCM_LOOP_;
+    check("TIOCMBIS sets loopback", ioctl(s, TIOCMBIS, &loop) == 0 && ioctl(s, TIOCMGET, &bits) == 0 && (bits & TIOCM_LOOP_));
+    check("looped back, RTS shows as CTS and DTR as DSR", (bits & (TIOCM_CTS | TIOCM_DSR)) == (TIOCM_CTS | TIOCM_DSR));
+    tcgetattr(s, &t);
+    cfmakeraw(&t);
+    t.c_cc[VMIN] = 1;
+    t.c_cc[VTIME] = 0;
+    tcsetattr(s, TCSANOW, &t);
+    tcflush(s, TCIOFLUSH);
+    char buf[256];
+    int n = write(s, "hello", 5);
+    int got = read_some(s, buf, sizeof buf);
+    check("raw: what it sends comes back as its input", n == 5 && got == 5 && memcmp(buf, "hello", 5) == 0);
+    /* A long write: every byte comes back (the receiver keeps up, the ring holds it). */
+    char big[2000];
+    for (int i = 0; i < (int)sizeof big; i++) big[i] = 'a' + i % 26;
+    n = write(s, big, sizeof big);
+    static char back[4096];
+    got = read_some(s, back, sizeof back);
+    check("2000 bytes go round", n == (int)sizeof big && got == (int)sizeof big && memcmp(back, big, sizeof big) == 0);
+    /* Canonical, no echo (an echo would go round for ever): ONLCR's CR LF comes back,
+     * ICRNL makes it two lines. */
+    t.c_lflag |= ICANON;
+    t.c_iflag |= ICRNL;
+    t.c_oflag |= OPOST | ONLCR;
+    tcsetattr(s, TCSANOW, &t);
+    write(s, "line\n", 5);
+    n = read_some(s, buf, sizeof buf);
+    check("canonical: a line comes back (CR LF in, two lines)", n == 6 && memcmp(buf, "line\n\n", 6) == 0);
+    t.c_lflag &= ~ICANON;
+    t.c_cflag &= ~CREAD;
+    tcsetattr(s, TCSANOW, &t);
+    write(s, "x", 1);
+    n = read_some(s, buf, sizeof buf);
+    check("CREAD off: nothing is received", n == 0);
+    t.c_cflag |= CREAD;
+    tcsetattr(s, TCSANOW, &t);
+
+    /* Speeds and formats: the UART follows; a speed beyond it falls back; B0 hangs up. */
+    cfsetspeed(&t, B9600);
+    t.c_cflag = (t.c_cflag & ~CSIZE) | CS7 | PARENB | PARODD | CSTOPB;
+    tcsetattr(s, TCSANOW, &t);
+    struct termios r;
+    tcgetattr(s, &r);
+    check("9600 baud 7O2: kept", cfgetospeed(&r) == B9600 && (r.c_cflag & (CSIZE | PARENB | PARODD | CSTOPB)) == (CS7 | PARENB | PARODD | CSTOPB) &&
+                                     ioctl(s, TCGETS2_, &t2) == 0 && t2.c_ospeed == 9600);
+    write(s, "slow", 4);
+    n = read_some(s, buf, sizeof buf);
+    check("and the line still goes round", n == 4 && memcmp(buf, "slow", 4) == 0);
+    cfsetspeed(&t, B230400);
+    tcsetattr(s, TCSANOW, &t);
+    tcgetattr(s, &r);
+    check("230400 baud is beyond the port: the old speed stays", cfgetospeed(&r) == B9600);
+    t2.c_cflag = (t2.c_cflag & ~(CBAUD | (CBAUD << 16))) | BOTHER;
+    t2.c_ospeed = t2.c_ispeed = 50000;
+    ioctl(s, _IOW('T', 0x2b, struct termios2_), &t2);
+    struct termios2_ r2;
+    check("an exact speed (BOTHER) is kept as asked", ioctl(s, TCGETS2_, &r2) == 0 && (r2.c_cflag & CBAUD) == BOTHER && r2.c_ospeed == 50000);
+    cfsetspeed(&t, B0);
+    tcsetattr(s, TCSANOW, &t);
+    check("B0 drops DTR and RTS", ioctl(s, TIOCMGET, &bits) == 0 && !(bits & (TIOCM_DTR | TIOCM_RTS)));
+    cfsetspeed(&t, B115200);
+    t.c_cflag = (t.c_cflag & ~(CSIZE | PARENB | PARODD | CSTOPB)) | CS8;
+    tcsetattr(s, TCSANOW, &t);
+    check("and a speed again raises them", ioctl(s, TIOCMGET, &bits) == 0 && (bits & (TIOCM_DTR | TIOCM_RTS)) == (TIOCM_DTR | TIOCM_RTS));
+
+    int64_t t0 = now_ms();
+    int brk = tcsendbreak(s, 0);
+    int64_t took = now_ms() - t0;
+    check("tcsendbreak: a quarter second", brk == 0 && took >= 200 && took < 2000);
+    int lsr = 0;
+    check("TIOCSERGETLSR: the transmitter is empty", ioctl(s, TIOCSERGETLSR, &lsr) == 0 && lsr == 1);
+    char sbuf2[72];
+    ioctl(s, TIOCGSERIAL, sbuf2);
+    memcpy(sbuf, sbuf2, sizeof sbuf);
+    sbuf[12] = 7;
+    check("TIOCSSERIAL cannot move the port (EINVAL), the same is fine",
+          ioctl(s, TIOCSSERIAL, sbuf) == -1 && errno == EINVAL && ioctl(s, TIOCSSERIAL, sbuf2) == 0);
+    loop = TIOCM_LOOP_;
+    ioctl(s, TIOCMBIC, &loop);
+    close(s);
+    s = open("/dev/ttyS1", O_RDWR | O_NOCTTY | O_NONBLOCK);
+    tcgetattr(s, &r);
+    check("the settings outlive the last close", (r.c_lflag & ICANON) == 0 && cfgetospeed(&r) == B115200);
+
+    /* A session leader opening it gets it as its controlling terminal. */
+    int res[2];
+    pipe(res);
+    pid_t c = fork();
+    if (c == 0) {
+        setsid();
+        int fd = open("/dev/ttyS1", O_RDWR | O_NONBLOCK);
+        int ok = fd >= 0 && tcgetsid(fd) == getsid(0) && tcgetpgrp(fd) == getpgrp();
+        write(res[1], &ok, sizeof ok);
+        _exit(0);
+    }
+    int ok = 0;
+    read(res[0], &ok, sizeof ok);
+    waitpid(c, NULL, 0);
+    close(res[0]);
+    close(res[1]);
+    check("ttyS1 becomes a session leader's controlling terminal", ok);
+    close(s);
+}
+
+/* The console's KD, VT and keyboard requests, and its keyboard: scancodes typed by the
+ * test hook (TEST_KBD_INPUT) go the way the keyboard's do (the kernel's queue, the
+ * server's Linux keyboard, the console's terminal). */
+#define TEST_KBD_INPUT 1630
+#define KDGETLED 0x4b31
+#define KDSETLED 0x4b32
+#define KDGKBTYPE 0x4b33
+#define KDSETMODE 0x4b3a
+#define KDGETMODE 0x4b3b
+#define KDGKBMODE 0x4b44
+#define KDSKBMODE 0x4b45
+#define KDGKBENT 0x4b46
+#define KDSKBENT 0x4b47
+#define KDGKBSENT 0x4b48
+#define KDSKBSENT 0x4b49
+#define KDGKBDIACR 0x4b4a
+#define KDGETKEYCODE 0x4b4c
+#define KDSIGACCEPT 0x4b4e
+#define KDKBDREP 0x4b52
+#define GIO_FONT 0x4b60
+#define KDGKBMETA 0x4b62
+#define KDGKBLED 0x4b64
+#define KDGKBDIACRUC 0x4bfa
+#define VT_OPENQRY 0x5600
+#define VT_GETMODE 0x5601
+#define VT_SETMODE 0x5602
+#define VT_GETSTATE 0x5603
+#define VT_RELDISP 0x5605
+#define VT_ACTIVATE 0x5606
+#define VT_WAITACTIVE 0x5607
+#define VT_DISALLOCATE 0x5608
+
+static int typed(const unsigned char *codes, int n) {
+    return syscall(TEST_KBD_INPUT, codes, n);
+}
+
+/* The bytes keys make on the console (raw, no echo) within a second. */
+static int keys(int c, const unsigned char *codes, int n, char *buf, int cap) {
+    if (typed(codes, n) != 0) return -1;
+    return read_some(c, buf, cap);
+}
+
+static void console_vt(void) {
+    struct stat st;
+    check("/dev/tty0 and /dev/tty1 are (4, 0) and (4, 1)",
+          stat("/dev/tty0", &st) == 0 && st.st_rdev == makedev(4, 0) && stat("/dev/tty1", &st) == 0 && st.st_rdev == makedev(4, 1));
+    if (mknod("/tmp/tty2", S_IFCHR | 0600, makedev(4, 2)) == 0) {
+        check("tty2: there is one virtual terminal (ENXIO)", open("/tmp/tty2", O_RDWR) == -1 && errno == ENXIO);
+        unlink("/tmp/tty2");
+    }
+    int c = open("/dev/tty1", O_RDWR | O_NOCTTY | O_NONBLOCK);
+    int c0 = open("/dev/tty0", O_RDWR | O_NOCTTY);
+    char type = 0;
+    check("KDGKBTYPE: a 101-key keyboard on tty1, tty0 and the console", ({
+              int con = open("/dev/console", O_RDWR | O_NOCTTY);
+              char t0 = 0, t1 = 0;
+              int ok = ioctl(c, KDGKBTYPE, &type) == 0 && type == 2 && ioctl(c0, KDGKBTYPE, &t0) == 0 && t0 == 2 &&
+                       ioctl(con, KDGKBTYPE, &t1) == 0 && t1 == 2;
+              close(con);
+              ok;
+          }));
+    char p[64];
+    int m = new_pty(p, sizeof p);
+    check("KDGKBTYPE on a pty: ENOTTY", ioctl(m, KDGKBTYPE, &type) == -1 && errno == ENOTTY);
+    close(m);
+    struct termios saved, t;
+    tcgetattr(c, &saved);
+    t = saved;
+    t.c_lflag &= ~(ICANON | ECHO | ISIG);
+    t.c_iflag &= ~(ICRNL | IXON);
+    t.c_cc[VMIN] = 1;
+    t.c_cc[VTIME] = 0;
+    tcsetattr(c, TCSAFLUSH, &t);
+    char buf[256];
+    int n;
+    int mode = -1;
+    check("KDGKBMODE: K_UNICODE", ioctl(c, KDGKBMODE, &mode) == 0 && mode == 3);
+    n = keys(c, (unsigned char[]){0x1e, 0x9e, 0x15, 0x95, 0x2c, 0xac}, 6, buf, sizeof buf);
+    check("keys: a z y (the German layout)", n == 3 && memcmp(buf, "azy", 3) == 0);
+    n = keys(c, (unsigned char[]){0x2a, 0x1e, 0x9e, 0xaa, 0x28, 0xa8, 0x0c, 0x8c}, 8, buf, sizeof buf);
+    check("Shift+a, ä and ß in UTF-8", n == 5 && memcmp(buf, "A\xc3\xa4\xc3\x9f", 5) == 0);
+    n = keys(c, (unsigned char[]){0xe0, 0x48, 0xe0, 0xc8, 0x3b, 0xbb, 0x1c, 0x9c, 0x0e, 0x8e}, 10, buf, sizeof buf);
+    check("Up, F1, Enter, Backspace: the Linux console's", n == 9 && memcmp(buf, "\033[A\033[[A\r\177", 9) == 0);
+    int meta = 0;
+    n = keys(c, (unsigned char[]){0x38, 0x30, 0xb0, 0xb8}, 4, buf, sizeof buf);
+    check("KDGKBMETA: K_ESCPREFIX, Alt+b sends ESC b", ioctl(c, KDGKBMETA, &meta) == 0 && meta == 4 && n == 2 && memcmp(buf, "\033b", 2) == 0);
+    n = keys(c, (unsigned char[]){0xe0, 0x38, 0x12, 0x92, 0xe0, 0xb8}, 6, buf, sizeof buf);
+    check("AltGr+e: the euro sign", n == 3 && memcmp(buf, "\xe2\x82\xac", 3) == 0);
+
+    /* The keyboard modes. */
+    ioctl(c, KDSKBMODE, 0);
+    n = keys(c, (unsigned char[]){0x1e, 0x9e, 0xe0, 0x48, 0xe0, 0xc8}, 6, buf, sizeof buf);
+    check("K_RAW: the scancodes", n == 6 && memcmp(buf, "\x1e\x9e\xe0\x48\xe0\xc8", 6) == 0);
+    ioctl(c, KDSKBMODE, 2);
+    n = keys(c, (unsigned char[]){0x1e, 0x9e, 0xe0, 0x48, 0xe0, 0xc8}, 6, buf, sizeof buf);
+    check("K_MEDIUMRAW: the keycodes", n == 4 && memcmp(buf, "\x1e\x9e\x67\xe7", 4) == 0);
+    ioctl(c, KDSKBMODE, 1);
+    n = keys(c, (unsigned char[]){0x0c, 0x8c}, 2, buf, sizeof buf);
+    check("K_XLATE: ß in Latin-1", n == 1 && (unsigned char)buf[0] == 0xdf);
+    ioctl(c, KDSKBMODE, 4);
+    n = keys(c, (unsigned char[]){0x1e, 0x9e}, 2, buf, sizeof buf);
+    check("K_OFF: nothing", n == 0);
+    check("KDSKBMODE 9: EINVAL", ioctl(c, KDSKBMODE, 9) == -1 && errno == EINVAL);
+    check("KDSKBMODE back to K_UNICODE", ioctl(c, KDSKBMODE, 3) == 0 && ioctl(c, KDGKBMODE, &mode) == 0 && mode == 3);
+
+    /* Keymaps, function strings, accents, scancodes. */
+    struct {
+        unsigned char table, index;
+        unsigned short value;
+    } e = {0, 30, 0};
+    check("KDGKBENT: a is K(KT_LETTER, 'a')", ioctl(c, KDGKBENT, &e) == 0 && e.value == 0x0b61);
+    e.value = 0x0071;
+    ioctl(c, KDSKBENT, &e);
+    n = keys(c, (unsigned char[]){0x1e, 0x9e}, 2, buf, sizeof buf);
+    check("KDSKBENT: the key now types q", n == 1 && buf[0] == 'q');
+    e.value = 0x0b61;
+    ioctl(c, KDSKBENT, &e);
+    e.table = 3;
+    e.index = 0;
+    check("KDGKBENT of a keymap that does not exist: K_NOSUCHMAP", ioctl(c, KDGKBENT, &e) == 0 && e.value == 0x027f);
+    e = (typeof(e)){0, 30, 0x0214};
+    check("KDSKBENT with a value beyond its type: EINVAL", ioctl(c, KDSKBENT, &e) == -1 && errno == EINVAL);
+    struct {
+        unsigned char func;
+        char s[512];
+    } kbs = {0};
+    check("KDGKBSENT: F1 is ESC [ [ A", ioctl(c, KDGKBSENT, &kbs) == 0 && strcmp(kbs.s, "\033[[A") == 0);
+    strcpy(kbs.s, "F1!");
+    ioctl(c, KDSKBSENT, &kbs);
+    n = keys(c, (unsigned char[]){0x3b, 0xbb}, 2, buf, sizeof buf);
+    check("KDSKBSENT: F1 types the new string", n == 3 && memcmp(buf, "F1!", 3) == 0);
+    strcpy(kbs.s, "\033[[A");
+    ioctl(c, KDSKBSENT, &kbs);
+    static struct {
+        unsigned cnt;
+        unsigned char d[256][3];
+    } dia;
+    static struct {
+        unsigned cnt;
+        unsigned d[256][3];
+    } diauc;
+    check("KDGKBDIACR and KDGKBDIACRUC: Linux's 68 accents",
+          ioctl(c, KDGKBDIACR, &dia) == 0 && dia.cnt == 68 && dia.d[0][0] == '`' && dia.d[0][1] == 'A' && dia.d[0][2] == 0xc0 &&
+              ioctl(c, KDGKBDIACRUC, &diauc) == 0 && diauc.cnt == 68 && diauc.d[0][2] == 0xc0);
+    unsigned kc[2] = {0x80 | 0x48, 0};
+    check("KDGETKEYCODE: E0 48 is KEY_UP", ioctl(c, KDGETKEYCODE, kc) == 0 && kc[1] == 103);
+
+    /* Locks and LEDs. */
+    char leds = 0, flags = 0;
+    n = keys(c, (unsigned char[]){0x3a, 0xba, 0x1e, 0x9e}, 4, buf, sizeof buf);
+    check("Caps Lock: capitals, its flag and LED",
+          n == 1 && buf[0] == 'A' && ioctl(c, KDGKBLED, &flags) == 0 && (flags & 4) && ioctl(c, KDGETLED, &leds) == 0 && leds == 4);
+    n = keys(c, (unsigned char[]){0x3a, 0xba, 0x1e, 0x9e}, 4, buf, sizeof buf);
+    check("Caps Lock again: small letters", n == 1 && buf[0] == 'a');
+    ioctl(c, KDSETLED, 1);
+    check("KDSETLED lights what it says", ioctl(c, KDGETLED, &leds) == 0 && leds == 1);
+    ioctl(c, KDSETLED, 0xff);
+    check("a value beyond the LEDs gives them back to the flags", ioctl(c, KDGETLED, &leds) == 0 && leds == 0);
+    /* (Nothing is printed while the console's output is stopped: stdout is the console.) */
+    n = keys(c, (unsigned char[]){0x46, 0xc6, 0x1e, 0x9e}, 4, buf, sizeof buf);
+    int stopped = n == 1 && write(c, "x", 1) == -1 && errno == EAGAIN && ioctl(c, KDGETLED, &leds) == 0 && leds == 1;
+    n = keys(c, (unsigned char[]){0x46, 0xc6, 0x1e, 0x9e}, 4, buf, sizeof buf);
+    int started = n == 1 && write(c, "", 1) == 1 && ioctl(c, KDGETLED, &leds) == 0 && leds == 0;
+    if (!started) tcflow(c, TCOON);
+    check("Scroll Lock stops the console's output, its LED shows it", stopped);
+    check("and again starts it", started);
+    struct sigaction sa = {0};
+    sa.sa_handler = on_signal;
+    sigaction(SIGUSR1, &sa, NULL);
+    sigaction(SIGALRM, &sa, NULL);
+    sigset_t usr1, old;
+    sigemptyset(&usr1);
+    sigaddset(&usr1, SIGUSR1);
+    sigprocmask(SIG_BLOCK, &usr1, &old);
+    check("KDSIGACCEPT refuses SIGKILL", ioctl(c, KDSIGACCEPT, SIGKILL) == -1 && errno == EINVAL);
+    ioctl(c, KDSIGACCEPT, SIGUSR1);
+    typed((unsigned char[]){0x38, 0xe0, 0x48, 0xe0, 0xc8, 0xb8}, 6);
+    struct timespec wait = {2, 0};
+    check("Alt+Up sends KDSIGACCEPT's signal", sigtimedwait(&usr1, NULL, &wait) == SIGUSR1);
+    sigprocmask(SIG_SETMASK, &old, NULL);
+    int rep[2] = {500, 100};
+    check("KDKBDREP: the keyboard's steps", ioctl(c, KDKBDREP, rep) == 0 && rep[0] == 500 && rep[1] == 100);
+    rep[0] = rep[1] = 0;
+    check("KDKBDREP with zeros reads them", ioctl(c, KDKBDREP, rep) == 0 && rep[0] == 500 && rep[1] == 100);
+    rep[0] = 250;
+    rep[1] = 33;
+    ioctl(c, KDKBDREP, rep);
+
+    /* Text and graphics, fonts. */
+    char font[8192];
+    check("KDGETMODE: KD_TEXT", ioctl(c, KDGETMODE, &mode) == 0 && mode == 0);
+    check("no loadable font: GIO_FONT is ENOSYS", ioctl(c, GIO_FONT, font) == -1 && errno == ENOSYS);
+    ioctl(c, KDSETMODE, 1);
+    check("KD_GRAPHICS: KDGETMODE says so, a font request is EINVAL",
+          ioctl(c, KDGETMODE, &mode) == 0 && mode == 1 && ioctl(c, GIO_FONT, font) == -1 && errno == EINVAL);
+    check("KDSETMODE 7: EINVAL", ioctl(c, KDSETMODE, 7) == -1 && errno == EINVAL);
+    check("back to KD_TEXT", ioctl(c, KDSETMODE, 0) == 0 && ioctl(c, KDGETMODE, &mode) == 0 && mode == 0);
+
+    /* The VT requests: one VT. */
+    unsigned short vs[3] = {0};
+    check("VT_GETSTATE: tty1 active and in use", ioctl(c, VT_GETSTATE, vs) == 0 && vs[0] == 1 && (vs[2] & 3) == 3);
+    int free_vt = 0;
+    check("VT_OPENQRY: no free VT", ioctl(c, VT_OPENQRY, &free_vt) == 0 && free_vt == -1);
+    struct {
+        char mode, waitv;
+        short relsig, acqsig, frsig;
+    } vm = {0}, vm2 = {0};
+    check("VT_GETMODE: VT_AUTO", ioctl(c, VT_GETMODE, &vm) == 0 && vm.mode == 0);
+    vm = (typeof(vm)){1, 0, SIGUSR1, SIGUSR2, 5};
+    check("VT_SETMODE VT_PROCESS: kept, frsig not",
+          ioctl(c, VT_SETMODE, &vm) == 0 && ioctl(c, VT_GETMODE, &vm2) == 0 && vm2.mode == 1 && vm2.relsig == SIGUSR1 && vm2.frsig == 0);
+    check("VT_RELDISP: only VT_ACKACQ, no switch pending", ioctl(c, VT_RELDISP, 2) == 0 && ioctl(c, VT_RELDISP, 1) == -1 && errno == EINVAL);
+    vm.mode = 7;
+    check("VT_SETMODE with another mode: EINVAL", ioctl(c, VT_SETMODE, &vm) == -1 && errno == EINVAL);
+    vm = (typeof(vm)){0, 0, 0, 0, 0};
+    ioctl(c, VT_SETMODE, &vm);
+    /* The processes the VT remembers are held by identity, not by pid: a VT_PROCESS
+     * owner that is gone leaves VT_AUTO; KDSIGACCEPT's process gone, the keyboard signal
+     * goes nowhere (not to whoever has its pid, not to us). */
+    pid_t owner = fork();
+    if (owner == 0) {
+        typeof(vm) mine = {1, 0, SIGUSR1, SIGUSR2, 0};
+        ioctl(c, VT_SETMODE, &mine);
+        ioctl(c, KDSIGACCEPT, SIGUSR1);
+        _exit(0);
+    }
+    waitpid(owner, NULL, 0);
+    check("a VT_PROCESS owner gone: VT_AUTO again, VT_RELDISP EINVAL",
+          ioctl(c, VT_GETMODE, &vm2) == 0 && vm2.mode == 0 && ioctl(c, VT_RELDISP, 2) == -1 && errno == EINVAL);
+    sigprocmask(SIG_BLOCK, &usr1, &old);
+    typed((unsigned char[]){0x38, 0xe0, 0x48, 0xe0, 0xc8, 0xb8}, 6);
+    struct timespec brief = {0, 300 * 1000000L};
+    check("KDSIGACCEPT's process gone: Alt+Up signals nobody", sigtimedwait(&usr1, NULL, &brief) == -1 && errno == EAGAIN);
+    sigprocmask(SIG_SETMASK, &old, NULL);
+    check("VT_ACTIVATE 1 is done, 2 and 0 are ENXIO",
+          ioctl(c, VT_ACTIVATE, 1) == 0 && ioctl(c, VT_ACTIVATE, 2) == -1 && errno == ENXIO && ioctl(c, VT_ACTIVATE, 0) == -1 && errno == ENXIO);
+    check("VT_WAITACTIVE 1 returns at once", ioctl(c, VT_WAITACTIVE, 1) == 0);
+    alarm(1);
+    int64_t t0 = now_ms();
+    int w = ioctl(c, VT_WAITACTIVE, 2);
+    int werr = errno;
+    alarm(0);
+    /* (The handler's mark is the job control test's to set.) */
+    got = 0;
+    signal(SIGALRM, SIG_DFL);
+    signal(SIGUSR1, SIG_DFL);
+    check("VT_WAITACTIVE 2 waits until a signal (EINTR)", w == -1 && werr == EINTR && now_ms() - t0 >= 800);
+    check("VT_DISALLOCATE: tty1 is busy, others are not there",
+          ioctl(c, VT_DISALLOCATE, 1) == -1 && errno == EBUSY && ioctl(c, VT_DISALLOCATE, 5) == 0);
+    char sub = 12;
+    check("TIOCLINUX: the foreground console is VT 0", ioctl(c, TIOCLINUX, &sub) == 0);
+    sub = 6;
+    check("TIOCLINUX: no modifier held", ioctl(c, TIOCLINUX, &sub) == 0 && sub == 0);
+
+    tcsetattr(c, TCSAFLUSH, &saved);
+    close(c0);
+    close(c);
+}
+
 int main(void) {
     signal(SIGTTOU, SIG_IGN);
     devices();
     termios_and_reads();
+    packet_mode();
+    serial();
+    console_vt();
     console_flood();
     pty_bounds();
     read_rules();
