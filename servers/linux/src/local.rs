@@ -42,6 +42,12 @@ pub struct Local {
     /// The test hook `TEST_FAIL_NTH`: the thread's fallible allocations
     /// still to come before the one that fails (0: none armed).
     pub fail_nth: AtomicU32,
+    /// Advanced by the timer thread when the thread's sleep on a CPU clock is over
+    /// (`timer::CpuSleep`); the thread sleeps on it.
+    pub cpu_sleep: AtomicU32,
+    /// The thread's lingering closes, run when its system call is done
+    /// (`inet::run_deferred`): the first socket of the list, or null.
+    pub deferred: AtomicPtr<()>,
 }
 
 const _: () = assert!(SERVER_LOCAL_OFFSET as usize + core::mem::size_of::<Local>() <= 4096);
@@ -52,13 +58,20 @@ pub const RESTORE_MASK: u32 = 1;
 /// The process must end (a failure past an execve's point of no return): the thread's loop
 /// ends it once the call returned (`exit_pending`), on a stack that holds nothing more.
 pub const EXIT_PENDING: u32 = 2;
+/// The thread is exiting: its closes never linger (Linux's PF_EXITING).
+pub const EXITING: u32 = 4;
 /// The thread's tracer asked for syscall stops (PTRACE_SYSCALL), for PTRACE_SYSEMU's, or
 /// single-steps it: its loop asks `ptrace` at a call's entry and end. Set by the thread
 /// itself when its tracer resumes it (`ptrace::stop`), from its trace record, which
 /// `ptrace` looks at again (a tracer gone since leaves a flag that finds no record).
-pub const TRACE_SYSCALL: u32 = 4;
-pub const TRACE_SYSEMU: u32 = 8;
-pub const TRACE_STEP: u32 = 16;
+pub const TRACE_SYSCALL: u32 = 8;
+pub const TRACE_SYSEMU: u32 = 16;
+pub const TRACE_STEP: u32 = 32;
+
+/// Whether the calling thread is exiting (`EXITING`).
+pub fn exiting() -> bool {
+    get().flags.load(Ordering::Relaxed) & EXITING != 0
+}
 
 /// Asks the thread's loop to end the process with `status` once the current call returned.
 pub fn exit_pending(status: i32) {
@@ -114,6 +127,7 @@ pub fn start(role: u64) {
     l.exit_status.store(0, Ordering::Relaxed);
     l.fallible.store(0, Ordering::Relaxed);
     l.fail_nth.store(0, Ordering::Relaxed);
+    l.deferred.store(core::ptr::null_mut(), Ordering::Relaxed);
 }
 
 /// Whether the calling thread is one of the instance's service threads (the pager, the

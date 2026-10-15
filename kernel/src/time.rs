@@ -1,8 +1,13 @@
 //! Time keeping. The clock source is the timestamp counter (TSC), read in
 //! a few cycles without leaving the CPU: nanoseconds since boot are
-//! `(tsc - boot_tsc) * mult >> 32`. Its frequency comes from the hardware
-//! where it states it (CPUID leaf 0x15, or the hypervisor's kvmclock), and
-//! is measured against the PIT otherwise.
+//! `(tsc - boot_tsc) * mult >> 32`. Its frequency is taken where it is
+//! stated (ADR 0016): from a hypervisor (kvmclock, or the timing leaf
+//! 0x4000_0010), else from the CPU (CPUID leaf 0x15, with the crystal's
+//! frequency from leaf 0x15, the CPU model or leaf 0x16); else it is
+//! measured against a reference clock (`refclock`: the HPET, the ACPI PM
+//! timer, last the PIT). Every busy-wait of the kernel (`delay_us`) and the
+//! local APIC timer's calibration run on the TSC, so nothing depends on the
+//! PIT, which recent chipsets may no longer clock.
 //!
 //! Each CPU has its own counter. When another CPU starts, it measures how
 //! far its counter is off the bootstrap CPU's, the way a clock is compared
@@ -23,7 +28,6 @@
 //! user mode tell which CPU a counter value came from. The kernel implements
 //! no clock call: it only keeps the page current.
 
-use crate::interrupts::apic::pit_delay_us;
 use crate::smp::{self, Cpu};
 use crate::sync::IrqSpinLock;
 use alloc::sync::Arc;
@@ -43,7 +47,7 @@ static BOOT_TSC: AtomicU64 = AtomicU64::new(0);
 static WALL_AT_BOOT: AtomicI64 = AtomicI64::new(0);
 
 /// The counter, not reordered before earlier loads.
-fn rdtsc() -> u64 {
+pub fn rdtsc() -> u64 {
     unsafe {
         _mm_lfence();
         _rdtsc()
@@ -56,6 +60,15 @@ fn rdtsc() -> u64 {
 pub fn now() -> u64 {
     let tsc = rdtsc().wrapping_add_signed(smp::cpu().tsc_offset.load(Ordering::Relaxed));
     clockpage::mono(tsc, BOOT_TSC.load(Ordering::Relaxed), MULT.load(Ordering::Relaxed))
+}
+
+/// Busy-waits at least `us` microseconds (after `init`), for hardware that
+/// needs a pause (the start-up of the other CPUs).
+pub fn delay_us(us: u64) {
+    let end = now() + us * 1000;
+    while now() < end {
+        core::hint::spin_loop();
+    }
 }
 
 /// The value this CPU's TSC has at `ns` nanoseconds since boot (for the
@@ -182,10 +195,10 @@ pub fn boot_time() -> u64 {
 /// Determines the TSC frequency and starts the clocks. Needs the frame
 /// allocator and runs before interrupts are enabled.
 pub fn init() {
-    let (hz, source) = match from_cpuid().map(|hz| (hz, "CPUID")).or_else(|| from_kvmclock().map(|hz| (hz, "kvmclock"))) {
-        Some(found) => found,
-        None => (measure_with_pit(), "measured against the PIT"),
-    };
+    let (hz, source) = from_hypervisor()
+        .or_else(from_cpuid)
+        .or_else(crate::drivers::refclock::measure_tsc)
+        .expect("no clock to measure the TSC against (no HPET, ACPI PM timer or PIT)");
     TSC_HZ.store(hz, Ordering::Relaxed);
     MULT.store(((NSEC_PER_SEC as u128) << 32).div_ceil(hz as u128) as u64, Ordering::Relaxed);
     BOOT_TSC.store(rdtsc(), Ordering::Relaxed);
@@ -193,21 +206,81 @@ pub fn init() {
     const INVARIANT_TSC: u32 = 1 << 8;
     let invariant = __cpuid(0x8000_0000).eax >= 0x8000_0007 && __cpuid(0x8000_0007).edx & INVARIANT_TSC != 0;
     crate::printkln!(
-        "[time] TSC at {}.{:03} MHz ({}){}",
+        "[time] clock source: TSC at {}.{:03} MHz ({}), {}",
         hz / 1_000_000,
         hz / 1000 % 1000,
         source,
-        if invariant { "" } else { ", not marked invariant" }
+        if invariant { "invariant" } else { "not marked invariant" }
     );
 }
 
-/// CPUID leaf 0x15: the core crystal's frequency and the TSC's ratio to it.
-fn from_cpuid() -> Option<u64> {
-    if __cpuid(0).eax < 0x15 {
+/// The frequency a hypervisor states: KVM's paravirtual clock, else the
+/// timing leaf 0x4000_0010 (VMware's, which QEMU and others offer too:
+/// the TSC's kHz in EAX). Only under a hypervisor (CPUID 1 ECX bit 31).
+fn from_hypervisor() -> Option<(u64, &'static str)> {
+    const HYPERVISOR: u32 = 1 << 31;
+    if __cpuid(1).ecx & HYPERVISOR == 0 {
         return None;
     }
-    let r = __cpuid(0x15);
-    (r.eax != 0 && r.ebx != 0 && r.ecx != 0).then(|| r.ecx as u64 * r.ebx as u64 / r.eax as u64)
+    if let Some(hz) = from_kvmclock() {
+        return Some((hz, "kvmclock"));
+    }
+    const TIMING_LEAF: u32 = 0x4000_0010;
+    if __cpuid(0x4000_0000).eax >= TIMING_LEAF {
+        let khz = __cpuid(TIMING_LEAF).eax as u64;
+        if khz != 0 {
+            return Some((khz * 1000, "hypervisor's CPUID leaf 0x40000010"));
+        }
+    }
+    None
+}
+
+/// What the CPU states, as Linux's `native_calibrate_tsc` reads it (Intel
+/// only): leaf 0x15 gives the TSC's ratio to the core crystal and, mostly,
+/// the crystal's frequency; where it does not, the crystal is known from
+/// the CPU model, else derived from leaf 0x16's base frequency (which the
+/// TSC runs at: crystal = base * denominator / numerator).
+fn from_cpuid() -> Option<(u64, &'static str)> {
+    let vendor = __cpuid(0);
+    let intel = [vendor.ebx, vendor.edx, vendor.ecx] == [0x756e_6547, 0x4965_6e69, 0x6c65_746e];
+    if !intel || vendor.eax < 0x15 {
+        return None;
+    }
+    let leaf = __cpuid(0x15);
+    let (denominator, numerator) = (leaf.eax as u64, leaf.ebx as u64);
+    if denominator == 0 || numerator == 0 {
+        return None;
+    }
+    let (crystal, source) = if leaf.ecx != 0 {
+        (leaf.ecx as u64, "CPUID leaf 0x15")
+    } else if let Some(hz) = known_crystal() {
+        (hz, "CPUID leaf 0x15, crystal by CPU model")
+    } else if vendor.eax >= 0x16 && __cpuid(0x16).eax != 0 {
+        (__cpuid(0x16).eax as u64 * 1_000_000 * denominator / numerator, "CPUID leaves 0x15 and 0x16")
+    } else {
+        return None;
+    };
+    Some((crystal * numerator / denominator, source))
+}
+
+/// The core crystal of Intel models whose leaf 0x15 leaves it out (the
+/// table of Linux's `native_calibrate_tsc`).
+fn known_crystal() -> Option<u64> {
+    let signature = __cpuid(1).eax;
+    let family = (signature >> 8) & 0xf;
+    if family != 6 {
+        return None;
+    }
+    let model = (signature >> 4) & 0xf | (signature >> 12) & 0xf0;
+    match model {
+        // Skylake and Kaby Lake, mobile and desktop.
+        0x4e | 0x5e | 0x8e | 0x9e => Some(24_000_000),
+        // Atom Goldmont (Denverton).
+        0x5f => Some(25_000_000),
+        // Atom Goldmont (Apollo Lake).
+        0x5c => Some(19_200_000),
+        _ => None,
+    }
 }
 
 /// The hypervisor's TSC scaling, as KVM publishes it for its paravirtual
@@ -249,23 +322,6 @@ fn from_kvmclock() -> Option<u64> {
     let hz = ((NSEC_PER_SEC as u128) << 32) / mul as u128;
     let hz = if shift >= 0 { hz >> shift } else { hz << -shift };
     u64::try_from(hz).ok().filter(|&hz| hz > 0)
-}
-
-/// Counts TSC cycles over two PIT intervals; their difference cancels the
-/// fixed cost of starting and polling the PIT. Best of three for each.
-fn measure_with_pit() -> u64 {
-    let cycles = |us: u64| {
-        (0..3)
-            .map(|_| {
-                let start = rdtsc();
-                pit_delay_us(us);
-                rdtsc() - start
-            })
-            .min()
-            .unwrap_or(0)
-    };
-    let (short, long) = (cycles(5_000), cycles(50_000));
-    (long.saturating_sub(short) * 1_000_000 / 45_000).max(1)
 }
 
 // ------------------------------------------------- synchronizing CPUs

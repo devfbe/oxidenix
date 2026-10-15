@@ -4,8 +4,9 @@
 //! close-on-exec bit. A new descriptor is below the caller's process's soft RLIMIT_NOFILE
 //! (`ids::soft`: a table may be shared by processes with limits of their own, as on Linux).
 //! The calls on descriptors as such are here: close, close_range, dup, dup2, dup3,
-//! fcntl's F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_SETFD, F_GETFL and
-//! F_SETFL, the ioctls FIONBIO, FIOCLEX and FIONCLEX. F_SETFL changes O_APPEND and O_NONBLOCK; of the rest of
+//! fcntl's F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_SETFD, F_GETFL,
+//! F_SETFL, F_SETOWN, F_GETOWN, F_SETOWN_EX and F_GETOWN_EX (the
+//! description's owner: a socket's SIGURG goes there), the ioctls FIONBIO, FIOCLEX and FIONCLEX. F_SETFL changes O_APPEND and O_NONBLOCK; of the rest of
 //! Linux's SETFL_MASK it ignores O_DIRECT (kept as opened), O_NOATIME (no
 //! access times are kept apart) and O_ASYNC (no SIGIO), as the kernel did.
 //!
@@ -112,6 +113,11 @@ impl FilesContext {
     /// The description behind descriptor `fd` (EBADF).
     pub fn get(&self, fd: u64) -> Result<FileRef, i64> {
         self.table.lock().get(fd).map(|s| s.file.clone()).ok_or(EBADF)
+    }
+
+    /// `get`, and whether the descriptor is close-on-exec (/proc/<pid>/fdinfo).
+    pub fn get_with_cloexec(&self, fd: u64) -> Result<(FileRef, bool), i64> {
+        self.table.lock().get(fd).map(|s| (s.file.clone(), s.cloexec)).ok_or(EBADF)
     }
 
     /// A descriptor (the lowest free one at or above `min`) for `file`.
@@ -360,6 +366,15 @@ const F_GETFD: u64 = 1;
 const F_SETFD: u64 = 2;
 const F_GETFL: u64 = 3;
 const F_SETFL: u64 = 4;
+const F_SETOWN: u64 = 8;
+const F_GETOWN: u64 = 9;
+const F_SETOWN_EX: u64 = 15;
+const F_GETOWN_EX: u64 = 16;
+/// `struct f_owner_ex`'s types.
+const F_OWNER_TID: i32 = 0;
+const F_OWNER_PID: i32 = 1;
+const F_OWNER_PGRP: i32 = 2;
+const ESRCH: i64 = 3;
 const F_DUPFD_CLOEXEC: u64 = 1030;
 const FD_CLOEXEC: u64 = 1;
 
@@ -495,8 +510,64 @@ fn fcntl(fd: u64, cmd: u64, arg: u64) -> Result<i64, i64> {
             file.set_flags(O_APPEND | O_NONBLOCK, arg as u32);
             Ok(0)
         }
+        // Who gets the file's signals (Linux's f_setown: a process, or a
+        // process group for a negative id; 0 for nobody; ESRCH for an id
+        // nobody has).
+        F_SETOWN => {
+            let who = arg as i32;
+            if who == i32::MIN {
+                return Err(EINVAL);
+            }
+            let owner = match who {
+                0 => files::Owner::None,
+                w if w < 0 => files::Owner::Group(w.unsigned_abs()),
+                w => files::Owner::Process(w as u32),
+            };
+            set_owner(&file, owner)
+        }
+        F_GETOWN => Ok(match file.owner() {
+            files::Owner::None => 0,
+            files::Owner::Group(g) => -(g as i64),
+            files::Owner::Thread(id) | files::Owner::Process(id) => id as i64,
+        }),
+        F_SETOWN_EX => {
+            let ex: [i32; 2] = usercopy::read(arg)?;
+            let id = u32::try_from(ex[1]).map_err(|_| EINVAL)?;
+            let owner = match (ex[0], id) {
+                (_, 0) if (F_OWNER_TID..=F_OWNER_PGRP).contains(&ex[0]) => files::Owner::None,
+                (F_OWNER_TID, id) => files::Owner::Thread(id),
+                (F_OWNER_PID, id) => files::Owner::Process(id),
+                (F_OWNER_PGRP, id) => files::Owner::Group(id),
+                _ => return Err(EINVAL),
+            };
+            set_owner(&file, owner)
+        }
+        F_GETOWN_EX => {
+            let ex: [i32; 2] = match file.owner() {
+                files::Owner::None => [F_OWNER_PID, 0],
+                files::Owner::Thread(id) => [F_OWNER_TID, id as i32],
+                files::Owner::Process(id) => [F_OWNER_PID, id as i32],
+                files::Owner::Group(id) => [F_OWNER_PGRP, id as i32],
+            };
+            usercopy::write(arg, &ex).map(|_| 0)
+        }
         _ => Err(EINVAL),
     }
+}
+
+/// F_SETOWN and F_SETOWN_EX: `owner` gets the file's signals if it exists
+/// (ESRCH, as Linux's f_setown).
+fn set_owner(file: &FileRef, owner: files::Owner) -> Result<i64, i64> {
+    let exists = match owner {
+        files::Owner::None => true,
+        files::Owner::Thread(id) | files::Owner::Process(id) => crate::process::exists(id),
+        files::Owner::Group(id) => crate::process::pgrp_session(id).is_some(),
+    };
+    if !exists {
+        return Err(ESRCH);
+    }
+    file.set_owner(owner);
+    Ok(0)
 }
 
 /// The requests on the descriptor rather than the file, which every

@@ -80,6 +80,16 @@ impl<T: ?Sized> IrqSpinLock<T> {
     pub fn is_locked(&self) -> bool {
         self.next.load(Ordering::Relaxed) != self.serving.load(Ordering::Relaxed)
     }
+
+    /// Frees the lock whoever holds it, and voids every waiting ticket.
+    ///
+    /// # Safety
+    /// Only for a panic, once no other CPU runs: the holder (this CPU,
+    /// interrupted mid-way, or a stopped one) never finishes, and its data
+    /// may be half-changed.
+    pub unsafe fn force_unlock(&self) {
+        self.serving.store(self.next.load(Ordering::Relaxed), Ordering::Release);
+    }
 }
 
 impl<T: ?Sized> Deref for IrqSpinLockGuard<'_, T> {

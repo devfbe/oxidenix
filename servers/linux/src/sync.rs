@@ -258,6 +258,56 @@ impl<T> Drop for SleepMutexGuard<'_, T> {
 /// iolock and pipe mutex).
 pub type SleepLock = SleepMutex<()>;
 
+/// An open file description's position (Linux's f_pos): a `SleepMutex` that serializes the
+/// calls that use and move it (held across their copies), and its value as of the last
+/// such call's end, which anyone may read without the lock (`get`: /proc/<pid>/fdinfo's
+/// `pos`, as Linux reads f_pos; also of a description whose read is the one asking).
+pub struct Position {
+    lock: SleepMutex<u64>,
+    seen: core::sync::atomic::AtomicU64,
+}
+
+impl Position {
+    pub const fn new() -> Position {
+        Position { lock: SleepMutex::new(0), seen: core::sync::atomic::AtomicU64::new(0) }
+    }
+
+    /// Takes the lock; EINTR if the thread dies while it waits.
+    pub fn lock(&self) -> Result<PositionGuard<'_>, i64> {
+        Ok(PositionGuard { guard: self.lock.lock()?, seen: &self.seen })
+    }
+
+    /// The position as the last call that held the lock left it.
+    pub fn get(&self) -> u64 {
+        self.seen.load(Ordering::Relaxed)
+    }
+}
+
+pub struct PositionGuard<'a> {
+    guard: SleepMutexGuard<'a, u64>,
+    seen: &'a core::sync::atomic::AtomicU64,
+}
+
+impl Deref for PositionGuard<'_> {
+    type Target = u64;
+    fn deref(&self) -> &u64 {
+        &self.guard
+    }
+}
+
+impl DerefMut for PositionGuard<'_> {
+    fn deref_mut(&mut self) -> &mut u64 {
+        &mut self.guard
+    }
+}
+
+impl Drop for PositionGuard<'_> {
+    /// (Before the lock goes: the next holder's value is never overwritten.)
+    fn drop(&mut self) {
+        self.seen.store(*self.guard, Ordering::Relaxed);
+    }
+}
+
 /// The state of a reader-writer lock: any number of readers or one writer, under a
 /// `Mutex`; a waiter sleeps on `changed`, which every unlock that may let someone in
 /// advances (read under the state lock before sleeping, so no wakeup is lost). Once a

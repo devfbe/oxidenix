@@ -43,6 +43,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     if let Some(fb) = boot_info.framebuffer.as_mut() {
         drivers::console::init(fb);
     }
+    if !drivers::serial::exists() {
+        printkln!("[boot] no serial port: the kernel's messages are on the screen only");
+    }
     interrupts::init();
     let phys_offset = boot_info
         .physical_memory_offset
@@ -56,7 +59,7 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     interrupts::init_controllers(rsdp);
     time::init();
     random::init();
-    timer::init(interrupts::apic::timer_hz());
+    timer::init();
     timer::init_cpu();
     fs::init(ramdisk);
     time::init_page();
@@ -169,6 +172,8 @@ fn start_netd() {
         return printkln!("[boot] the network card has no I/O ports");
     };
     nic.enable_io_and_dma();
+    // In test mode netd takes the self-tests' requests (a DHCP renewal).
+    let test = TEST_MODE.load(core::sync::atomic::Ordering::Relaxed) as u8;
     let server = match process::Server::load("net", "/sbin/netd") {
         Ok(server) => server
             .ports(io as u64..io as u64 + len as u64)
@@ -177,6 +182,7 @@ fn start_netd() {
             .arg(alloc::format!("io={io:#x}"))
             .arg(alloc::format!("iolen={len}"))
             .arg(alloc::format!("irq={}", nic.irq))
+            .arg(alloc::format!("test={test}"))
             // netd registers once DHCP is done, or after three seconds.
             .start_timeout(5 * time::NSEC_PER_SEC),
         Err(e) => return printkln!("[boot] cannot load /sbin/netd (errno {})", e),
@@ -214,8 +220,10 @@ pub static TEST_MODE: core::sync::atomic::AtomicBool = core::sync::atomic::Atomi
 fn panic(info: &PanicInfo) -> ! {
     // Stop the other CPUs first, so the message is the last word.
     interrupts::apic::ipi::halt_others();
-    // (The stopped CPUs may hold the log's locks: the message goes to the console only.)
+    // (The stopped CPUs may hold the log's locks: the message goes to the console only,
+    // whose locks it takes over.)
     klog::panic();
+    drivers::console::take_over_for_panic();
     printkln!("KERNEL PANIC (CPU {}): {}", smp::cpu().index, info);
     if TEST_MODE.load(core::sync::atomic::Ordering::Relaxed) {
         power_off(1);

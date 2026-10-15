@@ -136,6 +136,18 @@ impl Key {
 struct Watch {
     key: Key,
     mask: u32,
+    /// The watched inode's device (`st_dev`), for /proc/<pid>/fdinfo.
+    dev: u64,
+}
+
+impl Key {
+    /// The inode number it names (`st_ino`).
+    fn ino(&self) -> u64 {
+        match *self {
+            Key::Tmp(ino) | Key::Pseudo(_, ino) => ino,
+            Key::Data(ino, _) | Key::DataAny(ino) => ino as u64,
+        }
+    }
 }
 
 #[derive(PartialEq, Eq)]
@@ -232,6 +244,12 @@ impl Inotify {
             return Err(ENOTDIR);
         }
         let key = Key::of(node).ok_or(EINVAL)?;
+        let dev = match (node, key) {
+            (Node::Tmp(t), _) => t.status().dev,
+            (Node::Data(_), _) => crate::datafs::DEV,
+            (_, Key::Pseudo(dev, _)) => dev,
+            _ => 0,
+        };
         let events = mask & (IN_ALL_EVENTS | IN_EXCL_UNLINK | IN_ONESHOT);
         let wd = {
             let mut st = self.state.lock();
@@ -258,10 +276,19 @@ impl Inotify {
                 return Err(e.into());
             }
             st.next_wd = if wd == i32::MAX { 1 } else { wd + 1 };
-            st.watches.insert(wd, Watch { key, mask: events });
+            st.watches.insert(wd, Watch { key, mask: events, dev });
             wd
         };
         Ok(wd as i64)
+    }
+
+    /// For /proc/<pid>/fdinfo: its watches by descriptor (the descriptor, the inode's
+    /// number and device, the mask).
+    pub fn marks(&self) -> Result<Vec<(i32, u64, u64, u32)>, NoMem> {
+        let st = self.state.lock();
+        let mut out = heap::try_vec(st.watches.len())?;
+        out.extend(st.watches.iter().map(|(&wd, w)| (wd, w.key.ino(), w.dev, w.mask)));
+        Ok(out)
     }
 
     /// inotify_rm_watch: the watch goes, with an IN_IGNORED.

@@ -852,6 +852,33 @@ pub fn _print_at(level: u16, args: fmt::Arguments) {
     .write_fmt(args);
 }
 
+/// For a panic, after the other CPUs were told to stop: makes sure its
+/// message reaches the screen (on a machine without a serial port the only
+/// place it can go). A CPU holding the console's or the serial port's lock
+/// with interrupts off finishes its piece and lets go before it stops; if
+/// the lock stays taken (this CPU panicked while drawing, or a stopped CPU
+/// holds it), it is freed by force after about a tenth of a second.
+pub fn take_over_for_panic() {
+    const PATIENCE_CYCLES: u64 = 1 << 28;
+    let serial = super::serial::lock_for_panic();
+    // (The TSC counts whether or not the clocks are set up yet.)
+    let tsc = || unsafe { core::arch::x86_64::_rdtsc() };
+    let start = tsc();
+    while (CONSOLE.is_locked() || serial.is_locked()) && tsc().wrapping_sub(start) < PATIENCE_CYCLES {
+        core::hint::spin_loop();
+    }
+    // Safety: the other CPUs are stopped or stop when they let go; whatever
+    // a holder left half-done, the screen is still the best place to say why.
+    unsafe {
+        if CONSOLE.is_locked() {
+            CONSOLE.force_unlock();
+        }
+        if serial.is_locked() {
+            serial.force_unlock();
+        }
+    }
+}
+
 /// Writes text of the kernel's (the monitor's echo, the native servers' output):
 /// newlines become CR LF.
 pub fn write_text(bytes: &[u8]) {

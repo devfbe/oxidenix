@@ -1,7 +1,7 @@
 /* Process information: prctl, capabilities and /proc: procfs's system-wide
  * files and /sys, the Linux server's per-process part (/proc/<pid>, self,
- * thread-self, mounts, the memory figures of statm and status) and its magic
- * links (/proc/self/fd, /proc/<pid>/exe). */
+ * thread-self, mounts, the memory figures of statm and status), its magic
+ * links (/proc/self/fd, /proc/<pid>/exe) and /proc/<pid>/fdinfo. */
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -12,7 +12,9 @@
 #include <string.h>
 #include <poll.h>
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <sys/inotify.h>
+#include <sys/timerfd.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
@@ -600,6 +602,106 @@ static void memory_kinds(void) {
     check("a child after fork has its parent's figures", WIFEXITED(status) && WEXITSTATUS(status) == 0);
 }
 
+/* /proc/self/fdinfo/<fd> into buf (NUL-terminated); -1 if it cannot be read. */
+static int fdinfo_of(int fd, char *buf, int size) {
+    char path[64];
+    snprintf(path, sizeof path, "/proc/self/fdinfo/%d", fd);
+    return slurp(path, buf, size);
+}
+
+/* The number after "key" in an fdinfo text (base 10, 16 or 8). */
+static long long fdinfo_field(const char *text, const char *key, int base) {
+    const char *at = strstr(text, key);
+    return at ? strtoll(at + strlen(key), NULL, base) : -12345;
+}
+
+/* /proc/<pid>/fdinfo (proc(5)): Linux's lines for every descriptor and its kind's. */
+static void fdinfo(void) {
+    char buf[1024];
+    int fd = open("/tmp/fdinfo-test", O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    write(fd, "hello", 5);
+    struct stat st;
+    fstat(fd, &st);
+    int n = fdinfo_of(fd, buf, sizeof buf);
+    check("fdinfo: pos of a file written to", n > 0 && strncmp(buf, "pos:\t5\n", 7) == 0);
+    /* As Linux's f_flags: O_LARGEFILE (0100000) added, O_CREAT and O_TRUNC gone. */
+    check("fdinfo: flags in octal, with O_CLOEXEC", strstr(buf, "\nflags:\t02100002\n") != NULL);
+    check("F_GETFL: the same status flags", fcntl(fd, F_GETFL) == (O_RDWR | 0100000));
+    check("fdinfo: ino is the file's", fdinfo_field(buf, "\nino:\t", 10) == (long long)st.st_ino);
+    long long tmp_mnt = fdinfo_field(buf, "\nmnt_id:\t", 10);
+    int other = open("/tmp", O_RDONLY | O_DIRECTORY);
+    fdinfo_of(other, buf, sizeof buf);
+    check("fdinfo: a directory's flags (O_DIRECTORY), its mount the same", strstr(buf, "\nflags:\t0300000\n") != NULL && fdinfo_field(buf, "\nmnt_id:\t", 10) == tmp_mnt);
+    close(other);
+    other = open("/proc/self/stat", O_RDONLY);
+    fdinfo_of(other, buf, sizeof buf);
+    check("fdinfo: a file of /proc is on another mount", tmp_mnt > 0 && fdinfo_field(buf, "\nmnt_id:\t", 10) != tmp_mnt);
+    close(other);
+    lseek(fd, 2, SEEK_SET);
+    fdinfo_of(fd, buf, sizeof buf);
+    check("fdinfo: pos follows lseek", strncmp(buf, "pos:\t2\n", 7) == 0);
+
+    /* Its own description: the read that asks is the one at that position. */
+    int spare = dup(0);
+    char path[64];
+    snprintf(path, sizeof path, "/proc/self/fdinfo/%d", spare);
+    int self = open(path, O_RDONLY);
+    dup2(self, spare);
+    memset(buf, 0, sizeof buf);
+    n = read(self, buf, sizeof buf - 1);
+    check("fdinfo of the description that reads it", n > 0 && strncmp(buf, "pos:\t0\nflags:\t0100000\n", 22) == 0);
+    close(self);
+    close(spare);
+
+    DIR *d = opendir("/proc/self/fdinfo");
+    int listed = 0;
+    struct dirent *e;
+    while (d && (e = readdir(d))) listed |= atoi(e->d_name) == fd && e->d_type == DT_REG;
+    if (d) closedir(d);
+    check("fdinfo: the directory lists the descriptors", listed);
+    errno = 0;
+    check("fdinfo of no descriptor is ENOENT", open("/proc/self/fdinfo/999", O_RDONLY) < 0 && errno == ENOENT);
+
+    int efd = eventfd(7, EFD_SEMAPHORE | EFD_NONBLOCK);
+    fdinfo_of(efd, buf, sizeof buf);
+    check("fdinfo of an eventfd: count, semaphore, O_NONBLOCK|O_RDWR",
+          strstr(buf, "\neventfd-count:                7\n") && strstr(buf, "\neventfd-semaphore: 1\n") && strstr(buf, "\nflags:\t04002\n") &&
+              strstr(buf, "\neventfd-id: "));
+
+    int tfd = timerfd_create(CLOCK_MONOTONIC, 0);
+    struct itimerspec its = {{1, 0}, {10, 0}};
+    timerfd_settime(tfd, 0, &its, NULL);
+    fdinfo_of(tfd, buf, sizeof buf);
+    long long left = fdinfo_field(buf, "\nit_value: (", 10);
+    check("fdinfo of a timerfd: clock, ticks, flags, value, interval",
+          strstr(buf, "\nclockid: 1\nticks: 0\nsettime flags: 00\nit_value: (") && (left == 9 || left == 10) && strstr(buf, "\nit_interval: (1, 0)\n"));
+    close(tfd);
+
+    int ep = epoll_create1(0);
+    struct epoll_event ev = {.events = EPOLLIN | EPOLLET, .data.u64 = 0x1234};
+    epoll_ctl(ep, EPOLL_CTL_ADD, efd, &ev);
+    struct stat est;
+    fstat(efd, &est);
+    fdinfo_of(ep, buf, sizeof buf);
+    char line[160];
+    snprintf(line, sizeof line, "\ntfd: %8d events: %8x data: %16llx  pos:0 ino:%llx sdev:", efd, EPOLLIN | EPOLLET | EPOLLERR | EPOLLHUP, 0x1234ULL,
+             (unsigned long long)est.st_ino);
+    check("fdinfo of epoll: a tfd line per interest", strstr(buf, line) != NULL);
+    close(ep);
+    close(efd);
+
+    int in = inotify_init1(0);
+    int wd = inotify_add_watch(in, "/tmp", IN_CREATE | IN_DELETE);
+    struct stat tst;
+    stat("/tmp", &tst);
+    fdinfo_of(in, buf, sizeof buf);
+    snprintf(line, sizeof line, "\ninotify wd:%x ino:%llx sdev:", wd, (unsigned long long)tst.st_ino);
+    check("fdinfo of inotify: a line per watch", strstr(buf, line) != NULL && strstr(buf, " mask:300 ignored_mask:0 \n") != NULL);
+    close(in);
+    close(fd);
+    unlink("/tmp/fdinfo-test");
+}
+
 int main(int argc, char **argv) {
     if (argc > 1) return exe_mode(argc, argv);
     char name[16] = {0};
@@ -744,6 +846,7 @@ int main(int argc, char **argv) {
     the_servers_part();
     descriptors();
     other_descriptors();
+    fdinfo();
     exe_links("/tmp");
     exe_links("/data");
     errno = 0;

@@ -293,6 +293,8 @@ fn openat(dirfd: u64, addr: u64, flags: u32, mode: u32) -> Result<i64, i64> {
         let path = join(&r.path)?;
         return crate::pathfile::open(flags, Origin::new(r.node, path, r.mode));
     }
+    // A 64-bit machine's open: every file is a large one (its status flags show it).
+    let flags = flags | crate::files::O_LARGEFILE;
     // A name created by someone else between our lookup and our create is
     // opened instead, once: a name that exists but does not resolve (a
     // dangling symlink) stays EEXIST, as with the kernel's VFS.

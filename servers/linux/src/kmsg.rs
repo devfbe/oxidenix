@@ -32,7 +32,7 @@
 
 use crate::devices::{checked_iovecs, one_buffer};
 use crate::heap::{try_arc, try_vec, TryGrow};
-use crate::files::{self, File, EINVAL, ESPIPE, ENOTTY, O_ACCMODE, O_CLOEXEC, O_NONBLOCK, O_WRONLY, POLLERR, POLLIN, POLLNVAL, POLLRDNORM};
+use crate::files::{self, File, EINVAL, ESPIPE, ENOTTY, O_ACCMODE, O_NONBLOCK, O_WRONLY, POLLERR, POLLIN, POLLNVAL, POLLRDNORM};
 use crate::namespace::Origin;
 use crate::signal::ERESTARTSYS;
 use crate::sync::Mutex;
@@ -354,7 +354,7 @@ impl Drop for KmsgOpen {
 
 /// Opens /dev/kmsg by the node `origin`.
 pub fn open(flags: u32, origin: Origin) -> Result<i64, i64> {
-    let kept = flags & (O_ACCMODE | O_NONBLOCK | O_CLOEXEC);
+    let kept = crate::files::status_flags(flags);
     // Reading needs the log's read permission (EPERM without the host grant, as Linux's
     // check at open); a write-only open does not.
     let readable = kept & O_ACCMODE != O_WRONLY;

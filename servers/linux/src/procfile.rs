@@ -42,7 +42,7 @@ pub struct ProcOpen {
     pub path: String,
     dir: bool,
     /// The file position; for a directory, the index of the next entry.
-    offset: crate::sync::SleepMutex<u64>,
+    offset: crate::sync::Position,
     /// The contents (a file) as of the last read from the start.
     contents: Mutex<Option<Arc<Vec<u8>>>>,
     /// The entries (a directory) as of the last read from the start.
@@ -89,9 +89,9 @@ pub fn open(node: ProcNode, flags: u32, path: String) -> Result<i64, i64> {
         }
         _ => 0,
     };
-    let open = ProcOpen { node, path, dir, offset: crate::sync::SleepMutex::new(0), contents: Mutex::new(None), entries: Mutex::new(None), space };
+    let open = ProcOpen { node, path, dir, offset: crate::sync::Position::new(), contents: Mutex::new(None), entries: Mutex::new(None), space };
     let open = try_arc(open)?;
-    let kept = flags & (O_ACCMODE | files::O_NONBLOCK | files::O_CLOEXEC);
+    let kept = files::status_flags(flags);
     files::install(files::new_id(), File::Proc(open), kept)
 }
 
@@ -101,7 +101,7 @@ fn reopen(opened: &Opened, flags: u32) -> Result<i64, i64> {
         return Err(ENOTDIR);
     }
     let new = pipe.reopen(flags)?;
-    let kept = flags & (O_ACCMODE | files::O_NONBLOCK | files::O_CLOEXEC);
+    let kept = files::status_flags(flags);
     match files::install(new.id(), File::Pipe(new.clone()), kept) {
         Ok(fd) => {
             new.installed();
@@ -253,6 +253,12 @@ impl ProcOpen {
         buf[..n].copy_from_slice(&data[at..at + n]);
         *off += n as u64;
         Ok(n)
+    }
+
+    /// Its file position as the last call that moved it left it (/proc/<pid>/fdinfo's
+    /// `pos`), without its lock: also of the description whose read asks.
+    pub fn shown_position(&self) -> u64 {
+        self.offset.get()
     }
 
     /// As Linux's seq_lseek: from the start or the position, not the end

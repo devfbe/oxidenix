@@ -112,14 +112,21 @@ static DEADLINE_MODE: core::sync::atomic::AtomicBool = core::sync::atomic::Atomi
 /// Local APIC timer counts per second (one-shot mode).
 static APIC_HZ: AtomicU64 = AtomicU64::new(0);
 
-/// Chooses the timer mode; `apic_hz` is the local APIC timer's measured
-/// frequency. Called once on the bootstrap CPU.
-pub fn init(apic_hz: u64) {
+/// Chooses the timer mode: TSC-deadline where the CPU has it, else
+/// one-shot with the local APIC timer's frequency measured against the TSC
+/// (all CPUs' timers run at the same rate). Called once on the bootstrap
+/// CPU, after `time::init`.
+pub fn init() {
     const TSC_DEADLINE: u32 = 1 << 24;
     let deadline = core::arch::x86_64::__cpuid(1).ecx & TSC_DEADLINE != 0;
     DEADLINE_MODE.store(deadline, Ordering::Relaxed);
-    APIC_HZ.store(apic_hz.max(1), Ordering::Relaxed);
-    crate::printkln!("[time] timers: local APIC in {} mode", if deadline { "TSC-deadline" } else { "one-shot" });
+    if deadline {
+        crate::printkln!("[time] timers: local APIC in TSC-deadline mode");
+    } else {
+        let hz = apic::measure_timer();
+        APIC_HZ.store(hz, Ordering::Relaxed);
+        crate::printkln!("[time] timers: local APIC in one-shot mode at {}.{:03} MHz (measured against the TSC)", hz / 1_000_000, hz / 1000 % 1000);
+    }
 }
 
 /// Starts this CPU's timers: its queue gets its fixed capacity, the

@@ -1467,3 +1467,10 @@ pub const SYS_THREAD_DEBUG: u64 = 1252;
 /// hit (`DR6_HIT << n`), a single step (TF).
 pub const DR6_HIT: u64 = 1;
 pub const DR6_STEP: u64 = 0x4000;
+
+/// `()`: netd drops its DHCP lease and asks for a new one a second later
+/// (`netring::op::RENEW`), so that the instances see the address, its
+/// routes and their netlink notifications go and come back. The Linux
+/// server's alone (it asks netd over its channel); test mode only, and
+/// netd takes it only when the kernel started it in test mode.
+pub const TEST_NET_RENEW: u64 = 1600;

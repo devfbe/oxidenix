@@ -221,14 +221,20 @@ a heap commit takes from it first and is an ordinary commit (counting dirty and 
 only beyond it; a decommit, or a commit's pages that could not be mapped, refill it before
 commitment is returned. The reserve is had only when there is room: a tree whose instance is
 made near the limit starts with less or none (never refused for it), and it is topped up after
-each successful commit as far as there is room then. All instances' reserves together are at
+each successful commit as far as there is room then. Reserve pages a commit used stay **owed**
+to it: the commit account keeps them from every other commit (as if committed), so the first
+pages that come free anywhere are the reserve's, and the instance takes them back before its
+next commit that may use the reserve. (Refilling only at its own commits once left the reserve
+empty for the next burst: nomemtest's second run in a row filled memory before the server
+committed anything, and an allocation the server cannot fail broke the instance.) All
+instances' reserves together are at
 most a 16th of user memory (a pool), so many trees cannot crowd out programs with them. When
 memory is overcommitted (ADR 0013) a commitment is no frame: a commit from the reserve (the
 allocations the server cannot fail) may then take frames of the kernel's reserve, until the
 OOM killer made room.
 The account (`pageheap::charge`: `Charge`, `Pool`) is pure arithmetic, host-tested over random
 operations: an instance holds exactly its mapped pages plus its reserve, the pool's count is
-the sum of the reserves, no refund exceeds what was charged (an unmap of more pages than are
+the sum of the reserves and of what is owed to them, no refund exceeds what was charged (an unmap of more pages than are
 mapped is refused; the heap area is mapped only by `shared_commit`), and closing the instance
 returns all of it. The commit guarantee holds: the reserve counts as committed for everyone. A
 heap commit refused beyond the reserve is logged once per instance (a tree can cause it at
@@ -522,7 +528,13 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
      is local (`EADDRNOTAVAIL`) and the port, and `listen` checks the port again (Linux's
      `inet_csk_bind_conflict`, `netring::tcp_port_conflict`): a socket on an overlapping
      address conflicts unless both have `SO_REUSEADDR` and it does not listen
-     (`EADDRINUSE`), so of two sockets sharing a port only one may listen; port 0 takes an
+     (`EADDRINUSE`), so of two sockets sharing a port only one may listen, unless both set
+     `SO_REUSEPORT` (then any number of the instance's listeners or UDP sockets share it:
+     netd gives each member of the group its share, smoltcp's `Shard`, and a keyed hash of
+     a new connection's or a datagram's 4-tuple picks exactly one, as Linux's
+     `reuseport_select_sock`; a connected UDP socket hears its peer only, before the
+     others, and a listener or socket bound to the address before one bound to any, as
+     Linux's lookup scores them); port 0 takes an
      ephemeral port; connections inherit their listener's. `EPIPE` with `SIGPIPE`
      (unless `MSG_NOSIGNAL`) once the connection cannot send, after a pending error
      (`ECONNRESET`) is reported once; `MSG_PEEK`, `MSG_WAITALL`, `MSG_TRUNC` (datagrams),
@@ -530,6 +542,29 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
      (`SHUT_WR` sends `FIN` after what is queued), `TCP_NODELAY` (Nagle's algorithm is on
      by default, as Linux), `SO_KEEPALIVE`, `IP_TTL`, `FIONREAD`, `SIOCOUTQ`, `SO_LINGER`
      with a zero time (close sends `RST`), and close with unread data sends `RST`.
+     `SO_LINGER` with a time: `close(2)` asks for the `FIN` (`SHUTDOWN`) and waits on the
+     control block until netd reports it acknowledged with everything before it
+     (`state::FIN_ACKED`), the time ran out or a signal came, then closes as without it
+     (Linux's `tcp_close` and `sk_stream_wait_close`: no reset at the end of the time,
+     `O_NONBLOCK` does not shorten the wait, a process's exit and `shutdown` never linger;
+     data that arrives meanwhile resets the connection). The wait never happens where the
+     last reference dropped (that may be under a lock: an `AF_UNIX` queue holding the socket
+     in flight, an epoll set, an exec's close-on-exec): the program's thread puts the socket on
+     a list of its own (through the sockets, no allocation) and waits after its system call,
+     holding nothing, before the program runs again (`inet::run_deferred`, Linux's `__fput`
+     task work); an exiting thread closes without waiting.
+     **Urgent data** (`MSG_OOB`, Linux's reading of the urgent pointer: it points past the
+     urgent byte): a send with `MSG_OOB` marks the end of what it wrote in the control block
+     (`netring::UrgentMark`, stored before the tail), netd takes the send ring up to it and
+     marks smoltcp's urgent pointer there (a vendored patch: every segment before it carries
+     `URG` until the peer acknowledged it). The peer's pointer comes back as the receive
+     ring's position of the urgent byte, with the byte once its segment came
+     (`netring::Urgent`, one word, published before `rx_tail`); the byte stays in the ring,
+     and the server does what Linux's `tcp_recvmsg` does with it: a read stops at the mark,
+     skips the byte there unless `SO_OOBINLINE`, `recv(MSG_OOB)` takes it once (never
+     waits: `EAGAIN` until it came, `EINVAL` once taken or passed), `SIOCATMARK`, `POLLPRI`
+     while it waits, and the net thread sends `SIGURG` to the `F_SETOWN` owner when a new
+     pointer arrives.
      **Closing**: `close(2)` sends `CLOSE` before it returns, so the port is free then, as
      on Linux; what the pager learns (a process's exit closing its descriptors) it hands to
      the net thread, never waiting for netd itself. netd then copies what the send ring
@@ -731,23 +766,35 @@ shares the record, `CLONE_SIGHAND` the actions (also between processes, with `CL
 `CLONE_PIDFD` puts a pidfd of the child into the caller's table (after the child's copy of
 it) and its number into the caller's memory (clone: at `parent_tid`, so not with
 `CLONE_PARENT_SETTID`; clone3: at `pidfd`) before the child runs; a fault there undoes the
-clone (EFAULT). With `CLONE_THREAD` it is EINVAL (thread pidfds are Linux 6.9's), as
-`CLONE_DETACHED` with it. Namespaces are EINVAL.
+clone (EFAULT). With `CLONE_THREAD` it is a thread pidfd of the new thread (Linux 6.9);
+`CLONE_DETACHED` with it is EINVAL. Namespaces are EINVAL.
 
 ### pidfds
 
 A pidfd (`pidfd.rs`: `pidfd_open`, `CLONE_PIDFD`) is a file of the server's that names a
-process. Pids are reused, so it holds the process's words (`Words`, kept by an `Arc` after
-the reap): its pid names its process only while the table's process of that number has
-them. The words carry the process's state (alive, exited, reaped), set under the process
-lock, and the ids of its pidfds, which the process's end and reap report to after the lock
-(`After`): readable (`POLLIN`) once exited, hung up too (`POLLHUP`) once reaped, for poll,
+process, or with `PIDFD_THREAD` (`CLONE_PIDFD` with `CLONE_THREAD`) one thread (Linux 6.9).
+Pids are reused, so it holds the process's words (`Words`, kept by an `Arc` after the reap):
+its pid names its process only while the table's process of that number has them. What a
+pidfd watches (`Watch`: the state, alive, exited or reaped, set under the process lock, and
+the ids of its pidfds, which the changes report to after the lock, `After`) is the
+process's in its words, or a thread's: the main thread's in its process record (exited when
+the main thread ended, whether the process lives on or not; reaped with the process),
+another thread's in its record (gone when the thread is: as Linux, which releases a thread
+that does not lead its process at once), made with the first thread pidfd of it. An exec
+by a thread that is not the main one moves it to the main thread's id (Linux's
+`exchange_tids`): its old id's pidfds see it gone, the main thread's name it, alive again.
+Readable (`POLLIN`) once exited, hung up too (`POLLHUP`) once reaped or gone, for poll,
 select and epoll. `pidfd_send_signal` posts as `kill` (or, with a siginfo, as
-`rt_sigqueueinfo`; `PIDFD_SIGNAL_THREAD`, `_THREAD_GROUP`, `_PROCESS_GROUP` pick the main
-thread, the process, its group); a zombie takes it silently, a reaped process is ESRCH.
-`pidfd_getfd` installs another process's open file description (close-on-exec); `waitid`'s
-`P_PIDFD` waits for that child (`ECHILD` if it is none or was reaped); a `PIDFD_NONBLOCK`
-pidfd's wait answers EAGAIN while the child runs (unless the caller asked for `WNOHANG`).
+`rt_sigqueueinfo`: a code of the kernel's or kill's only towards the calling thread's own
+id) to the thread of a thread pidfd or the process of a process pidfd;
+`PIDFD_SIGNAL_THREAD`, `_THREAD_GROUP`, `_PROCESS_GROUP` pick the thread of its id, that
+thread's process, the process group of its id. A zombie, or a thread that exited, takes
+it silently; a task that is gone is ESRCH. `pidfd_getfd` installs an open file description
+of the named thread's table (a process pidfd's: the main thread's, EBADF once it exited, as
+Linux's task of the pid; close-on-exec); `waitid`'s `P_PIDFD` waits for the child of that
+id (`ECHILD` if it is none or was reaped, and for a thread that is no process); a
+`PIDFD_NONBLOCK` pidfd's wait answers EAGAIN while the child runs (unless the caller asked
+for `WNOHANG`).
 
 ### execve
 
@@ -853,6 +900,15 @@ timerfds' expiries to their pollers (`timerfd.rs`).
   interrupted; a deadline reached disarms and advances and wakes the timer thread's word.
   The kernel knows no timer, interval or signal (R9). User time is the program's: the
   server's time on a thread is the system time of its calls, as Linux's kernel time.
+- **Sleeps on CPU clocks** (`clock_nanosleep` on `CLOCK_PROCESS_CPUTIME_ID` or another
+  process's or thread's clock; the calling thread's own is EINVAL, as Linux's
+  posix_cpu_nsleep: it would never advance) are Linux's temporary CPU timer: the sleeper's
+  thread record names the clock and the deadline (`timer::CpuSleep`), the timer thread
+  wants that clock's alarm like a timer's and, once the clock reached it, wakes the
+  sleeper's word (in its server block). Interrupted, a relative sleep stores the CPU time
+  left and goes on to the same deadline by `restart_syscall`; an absolute one restarts as
+  it is. A sleep on the clock of a process or thread that ended waits for a signal, then
+  answers 0, as Linux's.
 - **Signals**: `ITIMER_REAL` and the POSIX timers reload when their signal is taken
   (delivered or returned by `sigtimedwait`), so a tiny interval costs one expiry per signal
   handled; a POSIX timer's signal tells the periods missed meanwhile (`si_overrun`,
@@ -1269,7 +1325,7 @@ Linux asks for write access only for files, directories and symlinks.
 - **The server's own part**, each process's: `/proc/<pid>` with `stat`, `statm`, `status`,
   `cmdline`, `comm`, `exe`, `mounts`, `oom_score`, `oom_score_adj`, `oom_adj`, `maps`, `mem`,
   `task/<tid>/{stat,statm,status,cmdline,comm,oom_score,oom_score_adj,oom_adj,maps,mem}`, `fd/<n>`,
-  `cwd` and `root`; `/proc/self`, `/proc/thread-self` and
+  `fdinfo/<n>`, `cwd` and `root`; `/proc/self`, `/proc/thread-self` and
   `/proc/mounts` (a link to `self/mounts`), merged into procfs's root listing; and
   `/proc/sys/vm/overcommit_{memory,ratio,kbytes}` (the kernel's overcommit policy, ADR 0013),
   merged into procfs's `/proc/sys`. The server
@@ -1328,6 +1384,22 @@ its threads' ids names it), and what `fd` lists is the calling thread's descript
 `CLONE_FILES` (then `/proc/<pid>/fd` shows the caller's table, not the main thread's, as
 `/proc/thread-self/fd` would on Linux). A child after `fork` sees its own copy. R8 (the
 process model) makes this exact.
+
+**fdinfo.** `/proc/<pid>/fdinfo/<n>` (mode 0400, listed as `fd` is) is made when it is
+read, in Linux's format (`procproto::render::FdInfo`, host-tested): `pos` (the position as
+the last call that moved it left it, `sync::Position`, read without the description's
+offset lock, so also of the description whose read asks), `flags` (the status flags, as
+F_GETFL's: open(2)'s as Linux's f_flags, `O_LARGEFILE` added and `O_CREAT`, `O_EXCL`,
+`O_NOCTTY`, `O_TRUNC` gone, `files::status_flags`; `O_CLOEXEC` for a close-on-exec
+descriptor), `mnt_id` (the mount the file's path lies in, ids from 21 in the mount table's
+order; sockets', pipes' and anonymous inodes' internal mounts 8, 12 and 14, which no mount
+table lists), `ino`, then what the kind of file adds: a pidfd's `Pid:` and `NSpid:` (-1
+once its task is gone), an eventfd's `eventfd-count`, `-id`, `-semaphore`, a timerfd's
+`clockid`, `ticks`, `settime flags`, `it_value` (the time left) and `it_interval`, an epoll
+instance's `tfd:` line per interest (its events with `EPOLLERR|EPOLLHUP`, which epoll_ctl
+adds as Linux's; the file's position, inode and device in the kernel's encoding), an
+inotify instance's `inotify wd:` line per watch (no file handle: no filesystem here exports
+one). There is no signalfd to show.
 
 `/proc/<pid>/exe` is a magic link too (Linux's `proc_exe_link`): each process keeps the
 program file it runs (`process::Proc::exe`, Linux's `mm->exe_file`): the node `execve`

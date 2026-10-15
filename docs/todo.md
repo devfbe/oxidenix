@@ -29,9 +29,7 @@ done, delete it here in the same commit.
 
 ## Linux features not implemented
 
-- Processes and signals: thread pidfds (`PIDFD_THREAD`, `CLONE_PIDFD` with `CLONE_THREAD`;
-  Linux 6.9), `/proc/<pid>/fdinfo` (a pidfd's `Pid:` line), `clock_nanosleep` on CPU clocks
-  (`EOPNOTSUPP`; the CPU-time alarms would carry it), core files.
+- Processes and signals: core files.
 - ptrace (ADR 0019): `PTRACE_SINGLEBLOCK` (`EIO`: block steps would need the thread's
   `DEBUGCTL.BTF` switched like its debug registers), `NT_X86_XSTATE` (`ENODEV`, as Linux on
   a CPU without XSAVE: the kernel enables no AVX state; it comes with XSAVE), 32-bit tracees
@@ -56,8 +54,7 @@ done, delete it here in the same commit.
   dumpable flag's effect on them. Users of their own need them all at
   once (a tree's processes see no other tree's).
 - Terminal: packet mode (`TIOCPKT`), the Linux console's VT and keyboard ioctls, serial input.
-- Network: IPv6, `MSG_OOB`, `SO_LINGER` with a non-zero time does not block `close`,
-  `SO_REUSEPORT` is stored but unused, netlink multicast is never delivered, raw ICMP is shared
+- Network: IPv6, `O_ASYNC` (`SIGIO`; `F_SETOWN` is kept and used for `SIGURG`), raw ICMP is shared
   between instances (documented in ADR 0008).
 - Dynamic linking with glibc is untested (the ELF loader handles `PT_INTERP`).
 
@@ -65,19 +62,34 @@ done, delete it here in the same commit.
 
 The kernel has only run in QEMU. Booting it on a real machine (for example from a USB stick)
 needs at least: a UEFI boot medium without Secure Boot, delays and timer calibration that do
-not depend on the PIT (often gated on recent Intel chipsets; use the TSC frequency from CPUID
-leaf 0x15), x2APIC support if the firmware hands over in x2APIC mode, and drivers for real
-storage and network (NVMe or USB mass storage via xHCI, a wired NIC) instead of virtio. Without
-them it boots to the shell on the framebuffer with the PS/2 keyboard and runs from the
-initramfs, without `/data` and without network.
+not depend on the PIT, x2APIC support if the firmware hands over in x2APIC mode (both done,
+ADR 0016), and drivers for real storage and network (NVMe or USB mass storage via xHCI, a
+wired NIC) instead of virtio. Without the drivers it boots to the shell on the framebuffer
+with the PS/2 keyboard and runs from the initramfs, without `/data` and without network.
 
 Planned target: the development machine, a Framework Laptop (12th Gen Intel, i5-1240P, UEFI,
 PS/2 keyboard behind the embedded controller, Samsung NVMe, Intel Wi-Fi 7, xHCI USB). Steps:
 
-1. **Live USB stick to the shell** (small, about half a day plus test rounds on the machine):
-   TSC-based delays and APIC timer calibration (no PIT), x2APIC mode, Secure Boot off, the UEFI
-   image written to a stick, boot via the firmware's boot menu. No serial port there, so boot
-   messages must be readable on the framebuffer.
+1. **Live USB stick to the shell**. The kernel's part is done (ADR 0016): the TSC's frequency
+   from CPUID leaf 0x15 (on the i5-1240P 38.4 MHz × 110 / 2 = 2112 MHz, checked against the
+   host's leaves), else measured against the HPET or the ACPI PM timer, the PIT only as the last
+   resort and never waited on without a bound; every delay and the APIC timer on the TSC
+   (TSC-deadline mode on the target); x2APIC mode (also when handed over by the firmware) with
+   the MADT's x2APIC entries; the boot log names the time source and the APIC mode; no serial
+   port is detected, and boot and panic messages reach the framebuffer (a panic takes over the
+   console's lock). All of it is tested in QEMU (KVM and emulation, xAPIC and x2APIC, x2APIC
+   from OVMF, HPET, PM timer, PIT, kvmclock). What is left needs the machine:
+   - Secure Boot off in the firmware setup (the image is unsigned).
+   - The UEFI image (`cd kernel && OXIDENIX_BUILD_ONLY=1 cargo run`, then
+     `target/x86_64-unknown-none/debug/oxidenix.img`) written to a stick
+     (`dd if=... of=/dev/sdX bs=4M conv=fsync`), booted from the firmware's boot menu (F12 on
+     the Framework).
+   - Check on the screen: `[apic]` and `[time] clock source` lines, `[smp] 16 of 16 CPUs`
+     (12 cores, 16 threads; `smp::MAX_CPUS` is 16), the keyboard at the shell. A hang before
+     the first line or a panic photographed is the report to bring back. Untested in QEMU and
+     to watch there: the I/O APIC (one with 120 pins; the kernel programs the first 24), the
+     keyboard behind the embedded controller (PS/2 emulation, IRQ 1), the framebuffer's size
+     (2256×1504) and stride.
 2. **Node.js on the stick**: put the static `node` into the initramfs (about 100 MB), since
    there is no `/data` without a disk driver.
 3. **`/data` on the stick** (large): an xHCI driver plus USB mass storage. An NVMe driver would

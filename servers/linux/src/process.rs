@@ -116,24 +116,37 @@ pub struct Words {
     pub stop: AtomicU32,
     /// 1 once the process (a vfork child) exec'd or ended: its parent waits for it.
     pub vfork: AtomicU32,
-    /// For its pidfds (`pidfd`): `ALIVE`, `EXITED` (a zombie) or `REAPED`.
-    pub state: AtomicU32,
     /// Advances when a tracer resumed or let go of one of its traced threads (`ptrace`):
     /// its stopped tracees sleep on it.
     pub trace: AtomicU32,
-    /// Its pidfds (their descriptions' ids), which hear of its end.
+    /// What the process's pidfds watch: `EXITED` once it is a zombie, `REAPED` once reaped.
+    pub watch: Watch,
+}
+
+/// What the pidfds of a process or of a thread watch (Linux's `struct pid`'s pidfd wait
+/// queue and the task state its pidfd_poll looks at): the state, and the pidfds (their
+/// descriptions' ids), which hear when it changes. A process's is in its `Words`; a
+/// thread's (Linux 6.9's thread pidfds, `PIDFD_THREAD`) is made with the first pidfd of
+/// it: the main thread's is its process's (`Proc::main_watch`: `EXITED` once the main
+/// thread ended, the process living on or not, `REAPED` with the process), another
+/// thread's its record's (`Thread::watch`: `REAPED` when it is gone, as Linux releases a
+/// thread that does not lead its process at once).
+#[derive(Default)]
+pub struct Watch {
+    /// `ALIVE`, `EXITED` or `REAPED`.
+    pub state: AtomicU32,
     pub pidfds: Mutex<Vec<u64>>,
 }
 
-/// `Words::state`.
+/// `Watch::state`.
 pub const ALIVE: u32 = 0;
 pub const EXITED: u32 = 1;
 pub const REAPED: u32 = 2;
 
-impl Words {
+impl Watch {
     /// Its pidfds' pollers hear of its state (it exited, or was reaped): after the process
     /// lock (the reports take the pollers' locks).
-    fn report(&self) {
+    pub fn report(&self) {
         let ready = crate::pidfd::readiness(self.state.load(Ordering::Acquire));
         for &id in self.pidfds.lock().iter() {
             crate::files::ready(id, ready);
@@ -218,6 +231,9 @@ pub struct Proc {
     pub cpu: crate::timer::CpuAlarm,
     pub brk: Arc<Mutex<Brk>>,
     pub words: Arc<Words>,
+    /// What the thread pidfds of its main thread (of its id) watch, made with the first
+    /// (`thread_watch`).
+    pub main_watch: Option<Arc<Watch>>,
     /// Descriptor tables of its threads handed to the worker and not let go of yet
     /// (`fdtable::end_later`): its end waits until there are none.
     pub tables_out: u32,
@@ -263,6 +279,11 @@ pub struct Thread {
     pub robust: u64,
     /// Its CPU clock's alarms in the kernel (`timer`).
     pub cpu: crate::timer::CpuAlarm,
+    /// What its thread pidfds watch, made with the first; a thread that does not lead its
+    /// process only (the main thread's is `Proc::main_watch`).
+    pub watch: Option<Arc<Watch>>,
+    /// Its sleep on a CPU clock (clock_nanosleep), which the timer thread ends.
+    pub cpu_sleep: Option<crate::timer::CpuSleep>,
     /// Its tracer's record of it (`ptrace`; None: not traced).
     pub trace: Option<alloc::boxed::Box<crate::ptrace::Tracee>>,
     /// As a tracer: its tracees' zombies it has not reaped, a list through their records.
@@ -564,6 +585,7 @@ pub fn register_init(key: u64) {
             cpu: Default::default(),
             brk: Arc::new(Mutex::new(Brk::default())),
             words: Arc::new(Words::default()),
+            main_watch: None,
             tables_out: 0,
             exec_bytes: Arc::new(core::sync::atomic::AtomicUsize::new(0)),
             limits: limits.clone(),
@@ -588,6 +610,8 @@ pub fn register_init(key: u64) {
                 reserved,
                 robust: 0,
                 cpu: Default::default(),
+                watch: None,
+                cpu_sleep: None,
                 trace: None,
                 dead: None,
                 exit_status: None,
@@ -729,9 +753,10 @@ fn clone(s: &mut State, c: Clone) -> Result<i64, i64> {
     if flags & CLONE_CLEAR_SIGHAND != 0 && flags & CLONE_SIGHAND != 0 {
         return Err(EINVAL);
     }
-    // A pidfd names a process (thread pidfds are Linux 6.9's); clone's goes where the
-    // parent's tid would, and CLONE_DETACHED's bit is kept for pidfds' future.
-    if flags & CLONE_PIDFD != 0 && (flags & CLONE_THREAD != 0 || (c.legacy && flags & (CLONE_PARENT_SETTID | CLONE_DETACHED) != 0)) {
+    // A pidfd of a thread made with CLONE_THREAD names that thread (Linux 6.9's thread
+    // pidfds); clone's goes where the parent's tid would, and CLONE_DETACHED's bit is kept
+    // for pidfds' future.
+    if flags & CLONE_PIDFD != 0 && c.legacy && flags & (CLONE_PARENT_SETTID | CLONE_DETACHED) != 0 {
         return Err(EINVAL);
     }
     if c.exit_signal > signal::NSIG as u64 {
@@ -959,6 +984,7 @@ fn clone(s: &mut State, c: Clone) -> Result<i64, i64> {
                 cpu: Default::default(),
                 brk,
                 words,
+                main_watch: None,
                 tables_out: 0,
                 exec_bytes,
                 limits: limits.clone(),
@@ -991,6 +1017,8 @@ fn clone(s: &mut State, c: Clone) -> Result<i64, i64> {
                 reserved: true,
                 robust: 0,
                 cpu: Default::default(),
+                watch: None,
+                cpu_sleep: None,
                 trace: None,
                 dead: None,
                 exit_status: None,
@@ -1002,13 +1030,17 @@ fn clone(s: &mut State, c: Clone) -> Result<i64, i64> {
         (serial, unadopted)
     };
     drop(unadopted);
-    // CLONE_PIDFD: the child's pidfd in the caller's table, its number in the caller's
-    // memory, before the child runs (a fork's child has the table copied before: it has
-    // none).
+    // CLONE_PIDFD: the child's pidfd in the caller's table (with CLONE_THREAD a thread
+    // pidfd), its number in the caller's memory, before the child runs (a fork's child has
+    // the table copied before: it has none).
     let mut pidfd = None;
     if flags & CLONE_PIDFD != 0 {
-        let words = PROCS.lock().procs.get(&pid).map(|p| p.words.clone());
-        let installed = words.ok_or(ESRCH).and_then(|w| crate::pidfd::install(pid, &w, false)).and_then(|fd| {
+        let made = if thread {
+            heap::try_arc(Watch::default()).map_err(i64::from).and_then(|fresh| thread_watch(tid, fresh)).map(|(words, w)| (words, Some(w)))
+        } else {
+            PROCS.lock().procs.get(&pid).map(|p| (p.words.clone(), None)).ok_or(ESRCH)
+        };
+        let installed = made.and_then(|(words, w)| crate::pidfd::install(tid, &words, w, false)).and_then(|fd| {
             pidfd = Some(fd);
             usercopy::write(c.pidfd, &(fd as i32))
         });
@@ -1133,9 +1165,12 @@ pub fn exit(status: i32, group: bool) -> ! {
     // go to their waiters as the kernel ends the thread).
     crate::futex::exit_robust(robust, tid);
     // Its descriptor table goes here, on the exiting thread (Linux's exit_files: before its
-    // parent learns of the end): with its last reference its descriptors close.
+    // parent learns of the end): with its last reference its descriptors close, none
+    // lingering (Linux's PF_EXITING), nor those a call of the thread's had left to linger.
+    local::get().flags.fetch_or(local::EXITING, Ordering::Relaxed);
     local::get().files.store(core::ptr::null_mut(), Ordering::Relaxed);
     drop(files);
+    crate::inet::run_deferred(false);
     let flags = if group { EXIT_GROUP } else { 0 };
     syscall(SYS_THREAD_EXIT, [status as u32 as u64, flags, 0, 0, 0, 0]);
     unreachable!("thread_exit returned")
@@ -1217,6 +1252,15 @@ pub fn thread_ended(key: u64) {
         th.sig.pending.flush(!0, &mut rt);
         t.rt_queued = rt;
         let pid = th.pid;
+        // Its thread pidfds: the main thread's see it exited (its process may live on), another
+        // thread's see it gone.
+        if tid == pid {
+            if let Some(w) = t.procs.get(&pid).and_then(|p| p.main_watch.clone()) {
+                tell_watch(w, EXITED, &mut after);
+            }
+        } else if let Some(w) = th.watch.take() {
+            tell_watch(w, REAPED, &mut after);
+        }
         let mut last = false;
         if let Some(p) = t.procs.get_mut(&pid) {
             p.threads.retain(|&x| x != tid);
@@ -1285,6 +1329,8 @@ pub struct After {
     exe: Option<Arc<crate::namespace::Origin>>,
     /// Processes that exited or were reaped, whose pidfds hear of it.
     pidfds: Vec<Arc<Words>>,
+    /// Threads that exited or are gone, whose thread pidfds hear of it.
+    watches: Vec<Arc<Watch>>,
 }
 
 impl After {
@@ -1294,6 +1340,9 @@ impl After {
             close_handle(h);
         }
         for w in self.pidfds {
+            w.watch.report();
+        }
+        for w in self.watches {
             w.report();
         }
         for sid in self.sessions {
@@ -1434,6 +1483,9 @@ fn notify_parent_exit(t: &mut Table, pid: Pid) -> bool {
 fn reap(t: &mut Table, pid: Pid, after: &mut After) {
     let Some(p) = t.procs.remove(&pid) else { return };
     tell_pidfds(&p.words, REAPED, after);
+    if let Some(w) = p.main_watch.clone() {
+        tell_watch(w, REAPED, after);
+    }
     t.put_hand(p.sig.hand);
     if let Some(pp) = t.procs.get_mut(&p.ppid) {
         pp.children.retain(|&c| c != pid);
@@ -1444,11 +1496,45 @@ fn reap(t: &mut Table, pid: Pid, after: &mut After) {
 /// The process of `words` exited or was reaped (`state`, lock held): its pidfds see it at
 /// once and their pollers hear of it after the lock.
 fn tell_pidfds(words: &Arc<Words>, state: u32, after: &mut After) {
-    words.state.store(state, Ordering::Release);
-    if !words.pidfds.lock().is_empty() {
+    words.watch.state.store(state, Ordering::Release);
+    if !words.watch.pidfds.lock().is_empty() {
         // (Infallible: an end must not fail for memory; one entry per process end.)
         after.pidfds.push(words.clone());
     }
+}
+
+/// A thread's watch (`Watch`) changed to `state` (lock held): its thread pidfds see it at
+/// once and their pollers hear of it after the lock.
+pub fn tell_watch(w: Arc<Watch>, state: u32, after: &mut After) {
+    w.state.store(state, Ordering::Release);
+    if !w.pidfds.lock().is_empty() {
+        // (Infallible, as `tell_pidfds`: one entry per thread end.)
+        after.watches.push(w);
+    }
+}
+
+/// For a thread pidfd of thread `tid` (pidfd_open's `PIDFD_THREAD`, CLONE_PIDFD with
+/// CLONE_THREAD): its process's words and what the pidfd watches, `fresh` if the thread
+/// has no watch yet. The main thread is there while its process is (also once it exited,
+/// as Linux's zombie leader is: its watch says `EXITED` then); another thread while its
+/// record is. ESRCH for neither.
+pub fn thread_watch(tid: Pid, fresh: Arc<Watch>) -> Result<(Arc<Words>, Arc<Watch>), i64> {
+    let mut t = PROCS.lock();
+    let main_gone = !t.threads.contains_key(&tid);
+    if let Some(p) = t.procs.get_mut(&tid) {
+        let w = p.main_watch.get_or_insert_with(|| {
+            if main_gone {
+                fresh.state.store(EXITED, Ordering::Relaxed);
+            }
+            fresh
+        });
+        return Ok((p.words.clone(), w.clone()));
+    }
+    let th = t.threads.get_mut(&tid).ok_or(ESRCH)?;
+    let pid = th.pid;
+    let w = th.watch.get_or_insert(fresh).clone();
+    let words = t.procs.get(&pid).ok_or(ESRCH)?.words.clone();
+    Ok((words, w))
 }
 
 /// What a child used: its own CPU time and memory and its reaped children's.

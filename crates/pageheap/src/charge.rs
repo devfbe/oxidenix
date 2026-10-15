@@ -1,18 +1,28 @@
 //! The kernel's account of one heap area's commitment (`SYS_SHARED_COMMIT`,
 //! `SYS_SHARED_DECOMMIT`): its mapped pages and its reserve (commitment held
 //! beyond them, so that a server can allocate when the commit limit is
-//! reached), and a pool bounding the reserves of all instances together.
-//! Pure arithmetic, host-tested: the kernel keeps a `Charge` under the
-//! area's lock and calls the commit limit only with the amounts it returns.
+//! reached), what of the reserve was used and is owed to it, and a pool
+//! bounding the reserves of all instances together. Pure arithmetic,
+//! host-tested: the kernel keeps a `Charge` under the area's lock and calls
+//! the commit limit only with the amounts it returns.
+//!
+//! **Owed pages.** Reserve pages a commit used are not lost to the reserve:
+//! they stay owed to it, and the kernel keeps the owed pages of all areas
+//! from every other commit (`memory::commit_owed`), so pages that come free
+//! anywhere are the reserve's first, and the area takes them back
+//! (`repay`) before it needs them again, whatever took memory meanwhile.
+//! (Refilling only at the area's own commits left a reserve that a burst
+//! had used empty when the next one came before such a commit.)
 //!
 //! **Invariant.** What the area holds of the commit limit is exactly
-//! `mapped + reserve`, `reserve <= target`, and `reserve` pages are taken
-//! from the `Pool` (so the reserves of all areas together never exceed its
-//! bound). Every method keeps it: each says how many pages the caller must
-//! commit (charge) or uncommit (refund), and nothing else changes the
-//! commit limit's count. No subtraction can underflow: a refund is never
-//! more than was charged (an unmap of more pages than are mapped is refused,
-//! `Error`), so dropping the area refunds `charged()` and the books balance.
+//! `mapped + reserve`; `reserve + owed <= target`, and `reserve + owed`
+//! pages are taken from the `Pool` (so the reserves of all areas together
+//! never exceed its bound). Every method keeps it: each says how many pages
+//! the caller must commit (charge) or uncommit (refund), and nothing else
+//! changes the commit limit's count. No subtraction can underflow: a refund
+//! is never more than was charged (an unmap of more pages than are mapped is
+//! refused, `Error`), so dropping the area refunds `charged()` and the books
+//! balance.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -78,11 +88,13 @@ pub struct Plan {
 pub struct Charge {
     mapped: u64,
     reserve: u64,
+    /// Reserve pages used and not yet replaced (not committed: a claim).
+    owed: u64,
 }
 
 impl Charge {
     pub const fn new() -> Charge {
-        Charge { mapped: 0, reserve: 0 }
+        Charge { mapped: 0, reserve: 0, owed: 0 }
     }
 
     /// What the area holds of the commit limit.
@@ -98,9 +110,15 @@ impl Charge {
         self.reserve
     }
 
-    /// Pages the reserve lacks of `target`.
+    /// Reserve pages used and owed to the reserve.
+    pub fn owed(&self) -> u64 {
+        self.owed
+    }
+
+    /// Pages the reserve lacks of `target` beyond those owed to it: what it
+    /// may take of the pool.
     pub fn deficit(&self, target: u64) -> u64 {
-        target.saturating_sub(self.reserve)
+        target.saturating_sub(self.reserve + self.owed)
     }
 
     /// Grows the reserve by `n` pages the caller just committed and took
@@ -110,15 +128,23 @@ impl Charge {
         self.reserve += n;
     }
 
+    /// `n` owed pages are back in the reserve: the caller just committed
+    /// them (against the area's claim, `memory::commit_owed`).
+    pub fn repay(&mut self, n: u64) {
+        assert!(n <= self.owed, "more repaid than owed");
+        self.owed -= n;
+        self.reserve += n;
+    }
+
     /// Plans mapping `missing` pages: from the reserve first if
     /// `use_reserve` (else none of it: an allocation the server may fail,
     /// which must not take what its others rely on); the rest (`fresh`)
-    /// the caller commits. The reserve pages are spoken for until `end`
-    /// (or `abort`).
-    pub fn begin(&mut self, missing: u64, pool: &Pool, use_reserve: bool) -> Plan {
+    /// the caller commits. The reserve pages it takes are owed to the
+    /// reserve from then on.
+    pub fn begin(&mut self, missing: u64, use_reserve: bool) -> Plan {
         let reserve = if use_reserve { missing.min(self.reserve) } else { 0 };
         self.reserve -= reserve;
-        pool.give(reserve);
+        self.owed += reserve;
         Plan { missing, reserve, fresh: missing - reserve }
     }
 
@@ -146,19 +172,23 @@ impl Charge {
         Ok(self.refill(gone, pool, target))
     }
 
-    /// `pages` of this area's charge come back: as reserve up to the target
-    /// and as the pool grants, the rest to be uncommitted (returned).
+    /// `pages` of this area's charge come back: first for what is owed to
+    /// the reserve, then as reserve up to the target and as the pool
+    /// grants, the rest to be uncommitted (returned).
     fn refill(&mut self, pages: u64, pool: &Pool, target: u64) -> u64 {
-        let keep = pool.take(pages.min(self.deficit(target)));
+        let repaid = pages.min(self.owed);
+        self.repay(repaid);
+        let keep = pool.take((pages - repaid).min(self.deficit(target)));
         self.reserve += keep;
-        pages - keep
+        pages - repaid - keep
     }
 
     /// The area goes: everything it holds is to be uncommitted (returned),
-    /// its reserve given back to the pool.
+    /// its reserve and what is owed to it given back to the pool (the
+    /// caller drops its claim of `owed()` pages first).
     pub fn close(&mut self, pool: &Pool) -> u64 {
         let all = self.charged();
-        pool.give(self.reserve);
+        pool.give(self.reserve + self.owed);
         *self = Charge::new();
         all
     }
@@ -188,38 +218,82 @@ mod tests {
             c.grow_reserve(want, target);
         }
         assert_eq!((a.reserve(), b.reserve(), pool.used()), (512, 88, 600));
-        // A commit within the reserve: nothing fresh.
-        let plan = a.begin(100, &pool, true);
+        // A commit within the reserve: nothing fresh; the pages it used are
+        // owed to the reserve (still the area's share of the pool).
+        let plan = a.begin(100, true);
         assert_eq!(plan.fresh, 0);
         books.committed = books.committed.checked_sub(a.end(plan, 100, &pool, target)).expect("refund beyond charge");
-        assert_eq!((a.mapped(), a.reserve()), (100, 412));
+        assert_eq!((a.mapped(), a.reserve(), a.owed(), a.deficit(target)), (100, 412, 100, 0));
         // One that must not use the reserve: all of it fresh, the reserve
-        // untouched (and full: nothing of the commit stays in it).
-        let plan = a.begin(50, &pool, false);
+        // untouched (nothing of the commit stays in it).
+        let plan = a.begin(50, false);
         assert_eq!((plan.reserve, plan.fresh), (0, 50));
         books.committed += plan.fresh;
         books.committed = books.committed.checked_sub(a.end(plan, 50, &pool, target)).expect("refund beyond charge");
-        assert_eq!((a.mapped(), a.reserve()), (150, 412));
+        assert_eq!((a.mapped(), a.reserve(), a.owed()), (150, 412, 100));
+        // An unmap pays back what is owed first.
         books.committed = books.committed.checked_sub(a.unmapped(50, &pool, target).unwrap()).expect("refund beyond charge");
-        assert_eq!((a.mapped(), a.reserve()), (100, 462));
-        // Beyond it, half mapped: the rest refills the reserve.
-        let plan = a.begin(1000, &pool, true);
-        assert_eq!((plan.reserve, plan.fresh), (462, 538));
+        assert_eq!((a.mapped(), a.reserve(), a.owed()), (100, 462, 50));
+        // The rest of the claim, committed by the kernel for it.
+        books.committed += 50;
+        a.repay(50);
+        assert_eq!((a.reserve(), a.owed()), (512, 0));
+        // Beyond it, half mapped: the rest pays back the reserve.
+        let plan = a.begin(1000, true);
+        assert_eq!((plan.reserve, plan.fresh), (512, 488));
         books.committed += plan.fresh;
         books.committed = books.committed.checked_sub(a.end(plan, 500, &pool, target)).expect("refund beyond charge");
+        assert_eq!((a.reserve(), a.owed()), (500, 12));
         assert_eq!(a.charged(), books.committed - b.charged());
-        // A failed fresh commit: the reserve back.
-        let plan = b.begin(200, &pool, true);
+        // A failed fresh commit: the reserve back, nothing owed.
+        let plan = b.begin(200, true);
         books.committed = books.committed.checked_sub(b.abort(plan, &pool, target)).expect("refund beyond charge");
-        assert_eq!(b.reserve(), 88);
+        assert_eq!((b.reserve(), b.owed()), (88, 0));
         // Unmaps refill, then refund; too many are refused.
         books.committed = books.committed.checked_sub(a.unmapped(600, &pool, target).unwrap()).expect("refund beyond charge");
+        assert_eq!((a.reserve(), a.owed()), (512, 0));
         assert_eq!(a.unmapped(1, &pool, target), Err(Error));
         assert_eq!(a.charged() + b.charged(), books.committed);
         assert!(pool.used() <= 600);
         books.committed = books.committed.checked_sub(a.close(&pool)).expect("refund beyond charge");
         books.committed = books.committed.checked_sub(b.close(&pool)).expect("refund beyond charge");
         assert_eq!((books.committed, pool.used()), (0, 0));
+    }
+
+    /// The reserve a burst used is whole again for the next burst, though
+    /// the area made no commit in between (something else took all memory
+    /// meanwhile): what it owed was kept from the other commits.
+    #[test]
+    fn a_used_reserve_is_whole_for_the_next_burst() {
+        let pool = Pool::new();
+        pool.set_max(1000);
+        let target = 512;
+        let limit = 10_000u64;
+        let mut a = Charge::new();
+        let mut committed = 0u64;
+        let got = pool.take(a.deficit(target));
+        committed += got;
+        a.grow_reserve(got, target);
+        // A burst at the limit: all of it from the reserve.
+        let other = limit - committed;
+        committed += other;
+        let plan = a.begin(400, true);
+        assert_eq!(plan.fresh, 0);
+        assert_eq!(a.end(plan, 400, &pool, target), 0);
+        // The other memory comes free, and is taken again by everyone but
+        // the area: the room left keeps what is owed.
+        committed -= other;
+        let room = limit - committed - a.owed();
+        committed += room;
+        assert_eq!(committed + a.owed(), limit);
+        // The area's claim: exactly what it owes fits.
+        let claim = limit - committed;
+        assert_eq!(claim, 400);
+        committed += claim;
+        a.repay(claim);
+        assert_eq!((a.reserve(), a.owed(), committed), (512, 0, limit));
+        let plan = a.begin(512, true);
+        assert_eq!(plan.fresh, 0);
     }
 
     #[test]
@@ -236,14 +310,14 @@ mod tests {
             seed ^= seed << 17;
             let a = &mut areas[(seed % 4) as usize];
             let n = (seed >> 8) % 700;
-            match (seed >> 4) % 4 {
+            match (seed >> 4) % 5 {
                 0 => {
                     let got = pool.take(n.min(a.deficit(target)));
                     committed += got;
                     a.grow_reserve(got, target);
                 }
                 1 => {
-                    let plan = a.begin(n, &pool, (seed >> 28) % 2 == 0);
+                    let plan = a.begin(n, (seed >> 28) % 2 == 0);
                     if (seed >> 20) % 3 == 0 {
                         committed = committed.checked_sub(a.abort(plan, &pool, target)).expect("refund beyond charge");
                     } else {
@@ -256,11 +330,16 @@ mod tests {
                     Ok(back) => committed = committed.checked_sub(back).expect("refund beyond charge"),
                     Err(Error) => assert!(n > a.mapped()),
                 },
+                3 => {
+                    let claim = n.min(a.owed());
+                    committed += claim;
+                    a.repay(claim);
+                }
                 _ => committed = committed.checked_sub(a.close(&pool)).expect("refund beyond charge"),
             }
             assert_eq!(areas.iter().map(Charge::charged).sum::<u64>(), committed);
-            assert_eq!(areas.iter().map(Charge::reserve).sum::<u64>(), pool.used());
-            assert!(pool.used() <= 1000 && areas.iter().all(|a| a.reserve() <= target));
+            assert_eq!(areas.iter().map(|a| a.reserve() + a.owed()).sum::<u64>(), pool.used());
+            assert!(pool.used() <= 1000 && areas.iter().all(|a| a.reserve() + a.owed() <= target));
         }
     }
 }

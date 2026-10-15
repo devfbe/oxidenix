@@ -289,12 +289,9 @@ fn qemu(firmware: Firmware, img: &Path, data_disk: &Path, read_only: bool, test_
             "256M",
             "-smp",
             "4",
-            // Hardware virtualization where available (about 10x faster,
-            // the boot included); QEMU falls back to emulation otherwise.
-            "-accel",
-            "kvm",
-            "-accel",
-            "tcg",
+        ])
+        .args(accelerators())
+        .args([
             // User-mode networking (10.0.2.0/24, DHCP, DNS at 10.0.2.3) and a
             // TCP echo service at 10.0.2.100:7 for the self-tests.
             "-netdev",
@@ -340,6 +337,15 @@ fn qemu(firmware: Firmware, img: &Path, data_disk: &Path, read_only: bool, test_
         }
         _ => code,
     }
+}
+
+/// QEMU's accelerators: hardware virtualization where available (about 10x
+/// faster, the boot included), falling back to emulation; `OXIDENIX_ACCEL=tcg`
+/// emulates even where KVM is there (QEMU's own devices and CPU model: the
+/// time sources and APIC modes a KVM guest does not use).
+fn accelerators() -> Vec<String> {
+    let list = std::env::var("OXIDENIX_ACCEL").unwrap_or_else(|_| "kvm,tcg".into());
+    list.split(',').filter(|a| !a.is_empty()).flat_map(|a| ["-accel".to_string(), a.to_string()]).collect()
 }
 
 /// What the kernel and the Linux server say when the shutdown does not go as it should.

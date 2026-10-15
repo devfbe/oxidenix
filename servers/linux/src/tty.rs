@@ -28,7 +28,7 @@
 //! a session leader's end (`session_ended`). A process's controlling terminal is the one
 //! whose session is the process's (ADR 0007).
 
-use crate::files::{self, File, EFAULT, EINVAL, ENOTTY, O_ACCMODE, O_CLOEXEC, O_NONBLOCK};
+use crate::files::{self, File, EFAULT, EINVAL, ENOTTY, O_ACCMODE, O_NONBLOCK};
 use crate::heap::{self, NoMem, TryExtend, TryGrow};
 use crate::namespace::Origin;
 use crate::sync::Mutex;
@@ -386,7 +386,7 @@ pub fn open(tty: &Arc<Tty>, flags: u32, origin: Origin, ctty: bool) -> Result<i6
         tty.changed(&mut inner, false, false);
         (open, was_closed)
     };
-    let fd = match files::install(id, File::Tty(open.clone()), flags & (O_ACCMODE | O_NONBLOCK | O_CLOEXEC)) {
+    let fd = match files::install(id, File::Tty(open.clone()), files::status_flags(flags)) {
         Ok(fd) => fd,
         Err(e) => {
             // Never opened: the slave is as it was (a slave never opened is not

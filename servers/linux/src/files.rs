@@ -41,6 +41,21 @@ pub const O_APPEND: u32 = 0o2000;
 pub const O_CLOEXEC: u32 = 0o2000000;
 pub const O_PATH: u32 = 0o10000000;
 const O_DIRECT: u32 = 0o40000;
+/// What open(2) always adds on a 64-bit machine (Linux's force_o_largefile).
+pub const O_LARGEFILE: u32 = 0o100000;
+/// The flags of open(2) that act on the open only (Linux's do_dentry_open drops them from
+/// the file's status flags).
+const O_OPEN_ONLY: u32 = 0o100 | 0o200 | 0o400 | 0o1000; // O_CREAT O_EXCL O_NOCTTY O_TRUNC
+/// Linux's VALID_OPEN_FLAGS (without __O_TMPFILE, which no open here takes): what
+/// open(2) looks at, the rest is ignored.
+const VALID_OPEN_FLAGS: u32 = 0o3 | O_OPEN_ONLY | O_APPEND | O_NONBLOCK | 0o4010000 | 0o20000 | O_DIRECT | O_LARGEFILE | 0o200000 | 0o400000 | 0o1000000 | O_CLOEXEC | O_PATH;
+
+/// The status flags of a description made by open(2) with `flags` (F_GETFL's, fdinfo's), as
+/// Linux's file's f_flags: what was asked for, without what acts on the open only
+/// (O_CLOEXEC is the descriptor's: `install` takes it off).
+pub fn status_flags(flags: u32) -> u32 {
+    flags & VALID_OPEN_FLAGS & !O_OPEN_ONLY
+}
 
 pub const POLLIN: i16 = 0x1;
 pub const POLLOUT: i16 = 0x4;
@@ -113,6 +128,53 @@ pub struct Description {
     /// References in flight (SCM_RIGHTS messages, `scm::Passed`): the
     /// collector of sockets in flight compares them with all references.
     pub inflight: AtomicUsize,
+    /// Who gets the file's signals (F_SETOWN: SIGURG of a socket's urgent
+    /// data), `Owner::encode`d.
+    owner: AtomicU64,
+}
+
+/// Who gets an open file description's signals (fcntl's F_SETOWN,
+/// F_SETOWN_EX; Linux's f_owner): none, a thread, a process, or a
+/// process group.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Owner {
+    #[default]
+    None,
+    Thread(u32),
+    Process(u32),
+    Group(u32),
+}
+
+impl Owner {
+    pub fn encode(self) -> u64 {
+        match self {
+            Owner::None => 0,
+            Owner::Thread(id) => 1 << 32 | id as u64,
+            Owner::Process(id) => 2 << 32 | id as u64,
+            Owner::Group(id) => 3 << 32 | id as u64,
+        }
+    }
+
+    pub fn decode(v: u64) -> Owner {
+        let id = v as u32;
+        match v >> 32 {
+            1 => Owner::Thread(id),
+            2 => Owner::Process(id),
+            3 => Owner::Group(id),
+            _ => Owner::None,
+        }
+    }
+
+    /// Sends `sig` to it (SI_KERNEL, as Linux's send_sigurg); whether
+    /// anyone was there.
+    pub fn signal(self, sig: u32) -> bool {
+        match self {
+            Owner::None => false,
+            Owner::Thread(tid) => crate::signal::send_tid(tid, sig),
+            Owner::Process(pid) => crate::signal::send_process(pid, sig),
+            Owner::Group(pgid) => crate::signal::send_pgrp(pgid, sig),
+        }
+    }
 }
 
 impl Description {
@@ -131,6 +193,19 @@ impl Description {
                 Ok(_) => break,
                 Err(seen) => old = seen,
             }
+        }
+    }
+
+    pub fn owner(&self) -> Owner {
+        Owner::decode(self.owner.load(Ordering::Relaxed))
+    }
+
+    /// F_SETOWN: a socket keeps its own copy (its signals come from the
+    /// net thread, which knows the socket, not the description).
+    pub fn set_owner(&self, owner: Owner) {
+        self.owner.store(owner.encode(), Ordering::Relaxed);
+        if let File::Inet(s) = &self.file {
+            s.set_owner(owner);
         }
     }
 
@@ -174,7 +249,6 @@ impl Drop for Description {
         if let Some(watch) = &self.watch {
             crate::poll::forget(self.id, watch);
         }
-        let service = crate::local::is_service();
         match &self.file {
             File::Pipe(end) => end.close(),
             File::Socket(sock) => {
@@ -185,9 +259,10 @@ impl Drop for Description {
                 }
             }
             // Closed in netd before close(2) returns (its port is free then,
-            // as on Linux); by the net thread for a service thread, which
-            // may not wait for netd.
-            File::Inet(sock) => sock.release(!service),
+            // as on Linux; a lingering close after the call, with nothing
+            // held: `inet::run_deferred`); by the net thread for a service
+            // thread, which may not wait for netd.
+            File::Inet(sock) => sock.closed(),
             File::Tty(open) => open.tty.closed(open),
             File::PtyMaster(m) => crate::pty::master_closed(m),
             File::Epoll(e) => e.closed(),
@@ -337,7 +412,7 @@ pub fn install_watched(id: u64, file: File, flags: u32, watch: Option<Arc<crate:
 fn install_into(mut memory: Arc<core::mem::MaybeUninit<Description>>, id: u64, file: File, flags: u32, watch: Option<Arc<crate::poll::Watch>>) -> Result<i64, i64> {
     fdtable::current().install_new(
         || {
-            let description = Description { id, file, flags: AtomicU32::new(flags & !O_CLOEXEC), watch, inflight: AtomicUsize::new(0) };
+            let description = Description { id, file, flags: AtomicU32::new(flags & !O_CLOEXEC), watch, inflight: AtomicUsize::new(0), owner: AtomicU64::new(0) };
             Arc::get_mut(&mut memory).expect("a new Arc is unique").write(description);
             FileRef::new(unsafe { memory.assume_init() })
         },
@@ -853,7 +928,7 @@ impl Regular {
         }
     }
 
-    fn position(&self) -> Result<crate::sync::SleepMutexGuard<'_, u64>, i64> {
+    fn position(&self) -> Result<crate::sync::PositionGuard<'_>, i64> {
         match self {
             Regular::Tmp(f) => f.position(),
             Regular::Data(f) => f.position(),

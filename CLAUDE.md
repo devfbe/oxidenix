@@ -16,7 +16,9 @@ An AI research project; see README.md.
 - Build the kernel from `kernel/` (`cd kernel && cargo build`); building from
   the workspace root lacks the kernel's `build-std`/target config.
 - `cd kernel && cargo run` builds the rootfs, the disk image and starts QEMU
-  (extra arguments after `--` are passed to QEMU).
+  (extra arguments after `--` are passed to QEMU, in test mode too: e.g. `-cpu max,-x2apic`
+  for xAPIC mode, `-cpu max,-kvmclock -machine hpet=off` for the PM timer as the TSC's
+  reference, ADR 0016; `OXIDENIX_ACCEL=tcg` emulates even where KVM is available).
 - `cargo` lives in `~/.cargo/bin`; a fresh (background) shell may lack it, so
   `export PATH=$HOME/.cargo/bin:$PATH`, or run commands in the dev shell
   (`nix develop --command ...`, `flake.nix`; direnv loads it via `.envrc`), which has
@@ -73,6 +75,11 @@ An AI research project; see README.md.
 - `OXIDENIX_AUTORUN=<host script> cargo run > log` boots into that script like test mode
   (exit status to QEMU, serial to stdout): for scripted experiments, e.g. running node and
   reading "syscall N not implemented" from the console log (the Linux server says it).
+  While another QEMU uses `disk.img`, give it a disk of its own: `OXIDENIX_DISK=<scratch file>`.
+- A panic of the Linux server prints `[linux] panic at file:line: message` and
+  `[linux] backtrace: <return addresses>` (frame pointers). The initramfs's servers are
+  stripped; resolve the addresses with the unstripped build:
+  `addr2line -e target/servers/x86_64-unknown-none/release/linux -f -C -i <addresses>`.
 
 ## Finding code
 

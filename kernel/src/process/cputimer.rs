@@ -1,7 +1,7 @@
 //! CPU-time alarms: the mechanism under the Linux server's timers on CPU clocks
 //! (`ITIMER_VIRTUAL`, `ITIMER_PROF`, POSIX timers on `CLOCK_PROCESS_CPUTIME_ID`,
-//! `CLOCK_THREAD_CPUTIME_ID` and the CPU clocks of other processes and threads;
-//! `restricted::SYS_CPU_ALARM`). The kernel knows no timer, signal or interval: the server
+//! `CLOCK_THREAD_CPUTIME_ID` and the CPU clocks of other processes and threads, and
+//! clock_nanosleep on those clocks; `restricted::SYS_CPU_ALARM`). The kernel knows no timer, signal or interval: the server
 //! arms one deadline per clock of a process or thread (the earliest of its timers on it), and
 //! the kernel tells it when the clock reaches it, once, by advancing and waking a word of
 //! the server's (the timer thread sleeps on it), so the server never polls a CPU clock.

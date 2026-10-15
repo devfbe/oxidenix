@@ -204,3 +204,40 @@ fn numbers_written_to_proc() {
         assert_eq!(parse_int(bad), None, "{:?}", core::str::from_utf8(bad));
     }
 }
+
+fn fdinfo(kind: FdKind) -> String {
+    FdInfo { pos: 5, flags: 0o2000002, mnt_id: 14, ino: 77, kind }.to_string()
+}
+
+#[test]
+fn fdinfo_head_as_linux_seq_show() {
+    assert_eq!(fdinfo(FdKind::Plain), "pos:\t5\nflags:\t02000002\nmnt_id:\t14\nino:\t77\n");
+    // A read-only descriptor without flags: "00", as Linux's "0%o".
+    let ro = FdInfo { pos: 0, flags: 0, mnt_id: 1, ino: 2, kind: FdKind::Plain }.to_string();
+    assert!(ro.starts_with("pos:\t0\nflags:\t00\n"));
+}
+
+#[test]
+fn fdinfo_of_a_pidfd() {
+    assert!(fdinfo(FdKind::PidFd { pid: 42 }).ends_with("ino:\t77\nPid:\t42\nNSpid:\t42\n"));
+    assert!(fdinfo(FdKind::PidFd { pid: -1 }).ends_with("Pid:\t-1\nNSpid:\t-1\n"));
+}
+
+#[test]
+fn fdinfo_of_an_eventfd_and_a_timerfd() {
+    let e = fdinfo(FdKind::EventFd { count: 0x2a, id: 3, semaphore: true });
+    assert!(e.ends_with("eventfd-count:               2a\neventfd-id: 3\neventfd-semaphore: 1\n"), "{e}");
+    let t = fdinfo(FdKind::TimerFd { clockid: 1, ticks: 2, settime_flags: 1, value: 1_500_000_000, interval: 250_000_000 });
+    assert!(t.ends_with("clockid: 1\nticks: 2\nsettime flags: 01\nit_value: (1, 500000000)\nit_interval: (0, 250000000)\n"), "{t}");
+}
+
+#[test]
+fn fdinfo_of_epoll_and_inotify() {
+    let targets = [EpollTarget { fd: 7, events: 0x8000_0019, data: 0xabc, pos: 0, ino: 0x1f, sdev: kernel_dev(0, 0xe) }];
+    let e = fdinfo(FdKind::Epoll(&targets));
+    assert!(e.ends_with("ino:\t77\ntfd:        7 events: 80000019 data:              abc  pos:0 ino:1f sdev:e\n"), "{e}");
+    let marks = [InotifyMark { wd: 1, ino: 0x10, sdev: kernel_dev(0xfe, 0), mask: 0x300 }];
+    let i = fdinfo(FdKind::Inotify(&marks));
+    assert!(i.ends_with("inotify wd:1 ino:10 sdev:fe00000 mask:300 ignored_mask:0 \n"), "{i}");
+    assert_eq!(kernel_dev(8, 1), 0x80_0001);
+}

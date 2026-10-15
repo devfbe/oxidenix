@@ -704,14 +704,25 @@ fn de_thread() -> Result<(), i64> {
                 return Err(EINTR);
             }
             if p.threads.len() == 1 {
+                let mut gone = None;
                 if tid != pid {
-                    // The old main thread is gone: this one takes its id.
+                    // The old main thread is gone: this one takes its id. As Linux's
+                    // exchange_tids: the thread pidfds of the main thread's id name this
+                    // one now (alive again), those of its old id see that thread gone.
                     let mut th = t.threads.remove(&tid).ok_or(EINVAL)?;
                     th.tid = pid;
+                    // (Reported after the lock, without the heap.)
+                    gone = th.watch.take();
+                    if let Some(w) = &gone {
+                        w.state.store(process::REAPED, core::sync::atomic::Ordering::Release);
+                    }
                     let key = th.key;
                     t.threads.insert(pid, th);
                     t.keys.insert(key, pid);
                     let p = t.procs.get_mut(&pid).expect("checked");
+                    if let Some(w) = &p.main_watch {
+                        w.state.store(process::ALIVE, core::sync::atomic::Ordering::Release);
+                    }
                     // (In place: its one entry's room is there.)
                     p.threads.clear();
                     p.threads.push(pid);
@@ -720,6 +731,10 @@ fn de_thread() -> Result<(), i64> {
                     crate::ptrace::exec_moved(&mut t, tid, pid);
                     let l = local::get();
                     l.tid.store(pid, core::sync::atomic::Ordering::Relaxed);
+                }
+                drop(t);
+                if let Some(w) = gone {
+                    w.report();
                 }
                 return Ok(());
             }

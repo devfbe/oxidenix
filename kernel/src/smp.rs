@@ -23,7 +23,8 @@ pub struct Cpu {
     pub kernel_stack: UnsafeCell<u64>,
     /// Index in `CPUS` (0 = bootstrap CPU).
     pub index: usize,
-    pub apic_id: UnsafeCell<u8>,
+    /// Its local APIC id (32 bits in x2APIC mode).
+    pub apic_id: UnsafeCell<u32>,
     tables: UnsafeCell<CpuTables>,
     pub sched: crate::process::sched::CpuSched,
     /// Added to this CPU's TSC to match the bootstrap CPU's (see `time`).
@@ -70,7 +71,7 @@ impl Cpu {
         unsafe { &mut *self.tables.get() }
     }
 
-    pub fn apic_id(&self) -> u8 {
+    pub fn apic_id(&self) -> u32 {
         unsafe { *self.apic_id.get() }
     }
 
@@ -113,7 +114,7 @@ pub fn init_bsp() {
 }
 
 /// Records the bootstrap CPU's local APIC id once the APIC is up.
-pub fn set_apic_id(id: u8) {
+pub fn set_apic_id(id: u32) {
     unsafe { *cpu().apic_id.get() = id };
 }
 
@@ -265,6 +266,11 @@ fn start_all() {
         if apic_id == bsp_id {
             continue;
         }
+        // (0xff is the xAPIC's broadcast; larger ids need x2APIC mode.)
+        if apic_id >= 0xff && !crate::interrupts::apic::is_x2apic() {
+            crate::printkln!("[smp] CPU with APIC id {} needs x2APIC mode; it stays off", apic_id);
+            continue;
+        }
         if index >= MAX_CPUS {
             crate::printkln!("[smp] more than {} CPUs; the rest stay off", MAX_CPUS);
             break;
@@ -284,12 +290,15 @@ fn start_all() {
             (field(&raw const ap_arg) as *mut u64).write(block as *mut Cpu as u64);
         }
         let before = online();
-        use crate::interrupts::apic::{ipi, pit_delay_us};
+        // The INIT-SIPI-SIPI sequence with the pauses Intel's MP
+        // specification asks for, timed on the TSC.
+        use crate::interrupts::apic::ipi;
+        use crate::time::delay_us;
         ipi::send_init(apic_id);
-        pit_delay_us(10_000);
+        delay_us(10_000);
         for _ in 0..2 {
             ipi::send_startup(apic_id, (low >> 12) as u8);
-            pit_delay_us(200);
+            delay_us(200);
             if online() > before {
                 break;
             }
@@ -299,7 +308,7 @@ fn start_all() {
             if online() > before {
                 break;
             }
-            pit_delay_us(1_000);
+            delay_us(1_000);
         }
         if online() > before {
             let offset = crate::time::sync_bsp();
