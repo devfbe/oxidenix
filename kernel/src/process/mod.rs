@@ -14,6 +14,7 @@ mod exec;
 mod exit;
 mod futex;
 pub mod ipc;
+pub mod membarrier;
 pub mod irq;
 pub mod kill;
 mod loader;

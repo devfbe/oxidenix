@@ -239,26 +239,36 @@ const MEMBARRIER_SUPPORTED: u32 = MEMBARRIER_CMD_GLOBAL
     | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE
     | MEMBARRIER_CMD_GET_REGISTRATIONS;
 
-/// membarrier(cmd, flags, cpu_id): the barriers are the kernel's (`SYS_MEMBARRIER`: an
-/// interrupt on each CPU that runs the address space, or on every CPU), the registrations
-/// the address space's (`process::Mm`: copied by fork, shared by CLONE_VM, none after
-/// execve). The private expedited commands need their registration (EPERM); the global
-/// ones reach every CPU, which covers every registered process (and is what GLOBAL asks:
-/// every running thread passes a barrier, the others do when they are switched in). Only
-/// the rseq command takes a flag, and there is no rseq: a flag, the rseq commands and
-/// unknown ones are EINVAL; `cpu_id` matters only with the flag.
+/// membarrier(cmd, flags, cpu_id): the barriers are the kernel's (`SYS_MEMBARRIER`, as
+/// Linux's: private expedited an interrupt on each CPU that runs the address space, global
+/// expedited on each CPU that runs a registered one, global none: a wait for every CPU's
+/// quiescent state), the registrations the address space's (`process::Mm`: copied by fork,
+/// shared by CLONE_VM, none after execve; the global one the kernel's too, which
+/// interrupts only registered spaces). The private expedited commands need their
+/// registration (EPERM); the global expedited one needs none (it reaches the registered
+/// processes, if any). Only the rseq command takes a flag, and there is no rseq: a flag,
+/// the rseq commands and unknown ones are EINVAL; `cpu_id` matters only with the flag.
 fn membarrier(cmd: u64, flags: u64) -> i64 {
     // (`cmd` is an int.)
     let cmd = cmd as u32;
     if flags as u32 != 0 {
         return -EINVAL;
     }
-    let barrier = |scope| crate::syscall(SYS_MEMBARRIER, [scope, 0, 0, 0, 0, 0]);
+    let barrier = |op| crate::syscall(SYS_MEMBARRIER, [op, 0, 0, 0, 0, 0]);
     let Some(mm) = crate::process::mm_of(crate::local::pid()) else { return -EINVAL };
     match cmd {
         MEMBARRIER_CMD_QUERY => MEMBARRIER_SUPPORTED as i64,
-        MEMBARRIER_CMD_GLOBAL | MEMBARRIER_CMD_GLOBAL_EXPEDITED => barrier(MEMBARRIER_ALL),
-        MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE => {
+        MEMBARRIER_CMD_GLOBAL => barrier(MEMBARRIER_GLOBAL),
+        MEMBARRIER_CMD_GLOBAL_EXPEDITED => barrier(MEMBARRIER_GLOBAL_EXPEDITED),
+        MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED => {
+            let r = barrier(MEMBARRIER_REGISTER_GLOBAL);
+            if r < 0 {
+                return r;
+            }
+            mm.lock().membarrier |= cmd;
+            0
+        }
+        MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED | MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED_SYNC_CORE => {
             mm.lock().membarrier |= cmd;
             0
         }

@@ -293,7 +293,7 @@ fn serve_here() {
     }
     let l4 = REQUEST.l4.load(Ordering::Relaxed);
     if REQUEST.start.load(Ordering::Relaxed) == REQUEST.end.load(Ordering::Relaxed) {
-        // An empty range: a barrier (`barrier`; shootdowns of nothing send no request).
+        // An empty range: a barrier (`barrier_on`; shootdowns of nothing send no request).
         BARRIERS[smp::cpu().index].fetch_add(1, Ordering::Relaxed);
     }
     let cr3 = Cr3::read().0.start_address().as_u64();
@@ -366,27 +366,31 @@ pub fn shootdown_kernel(start: u64, end: u64) {
     request(KERNEL, KERNEL, all & !my_bit(), start, end);
 }
 
-/// A memory barrier on every CPU that has `space` loaded (every CPU for
-/// None), membarrier(2)'s (`restricted::SYS_MEMBARRIER`): when it returns,
-/// each of them has taken an interrupt (`request` with an empty range, which
-/// flushes nothing), acknowledged it with a locked instruction and returned
-/// with `iret`, so everything its threads did before is visible and its
-/// instruction stream is serialized. A CPU that is not in the set but loads
-/// the space meanwhile joins it before it loads CR3 (`switch`'s SeqCst
-/// fetch_or, paired with the fence here): its threads run after a full
-/// barrier that follows this call's start.
-pub fn barrier(space: Option<&Tlb>) {
-    // (An empty range: `serve_here` counts it as a barrier.)
+impl Tlb {
+    /// The CPUs that have this address space loaded (either view), read
+    /// after a full fence: a CPU missing from it that loads the space later
+    /// joins the set first (`switch`'s SeqCst fetch_or), so it runs the
+    /// space after the caller's fence (`membarrier`).
+    pub fn cpus(&self) -> u64 {
+        fence(Ordering::SeqCst);
+        self.cpus.load(Ordering::SeqCst)
+    }
+}
+
+/// A memory barrier on the CPUs in `targets` (this one left out), for
+/// membarrier(2)'s expedited commands (`membarrier`): when it returns, each
+/// of them has taken an interrupt (`request` with an empty range, which
+/// flushes nothing and which `serve_here` counts as a barrier),
+/// acknowledged it with a locked instruction and returned with `iret`, so
+/// everything its threads did before is visible and its instruction stream
+/// is serialized.
+pub fn barrier_on(targets: u64) {
     fence(Ordering::SeqCst);
-    let targets = match space {
-        Some(space) => space.cpus.load(Ordering::SeqCst),
-        None => (0..smp::MAX_CPUS).filter(|&i| smp::by_index(i).is_some()).fold(0u64, |m, i| m | 1 << i),
-    };
     request(ANY, ANY, targets & !my_bit(), 0, 0);
     fence(Ordering::SeqCst);
 }
 
-/// How many barriers (`barrier`) each CPU served, by index (`restricted::TEST_BARRIERS`).
+/// How many barriers (`barrier_on`) each CPU served, by index (`restricted::TEST_BARRIERS`).
 static BARRIERS: [AtomicU64; smp::MAX_CPUS] = [const { AtomicU64::new(0) }; smp::MAX_CPUS];
 
 /// How many barriers CPU `index` served since boot (None: no such CPU).

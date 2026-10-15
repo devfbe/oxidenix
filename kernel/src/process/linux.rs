@@ -1913,9 +1913,12 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             if is_pager() {
                 return Err(EPERM);
             }
+            use super::membarrier;
             match a[0] {
-                MEMBARRIER_SPACE => super::tlb::barrier(Some(&super::current_mm().ok_or(EINVAL)?.tlb)),
-                MEMBARRIER_ALL => super::tlb::barrier(None),
+                MEMBARRIER_SPACE => membarrier::private(&super::current_mm().ok_or(EINVAL)?.tlb),
+                MEMBARRIER_GLOBAL_EXPEDITED => membarrier::global_expedited(),
+                MEMBARRIER_GLOBAL => membarrier::global(),
+                MEMBARRIER_REGISTER_GLOBAL => membarrier::register_global(&super::current_mm().ok_or(EINVAL)?.tlb).map_err(|_| ENOMEM)?,
                 _ => return Err(EINVAL),
             }
             Ok(0)

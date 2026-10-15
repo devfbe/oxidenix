@@ -16,6 +16,8 @@ pub extern "sysv64" fn trap(frame: &mut Frame) {
         0..=31 => exception(frame),
         apic::TIMER_VECTOR => {
             apic::eoi();
+            // A quiescent state for membarrier's global barriers.
+            crate::process::membarrier::tick();
             // The kernel is not preemptive: the switch waits for the
             // return to user space (below, or that of the running syscall).
             // User time is a program's (a Linux program's server counts as the kernel

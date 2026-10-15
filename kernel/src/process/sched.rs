@@ -322,6 +322,14 @@ pub fn set_initial(task: Arc<Task>, idle: Arc<Task>) {
 
 // ---------------------------------------------------------------- queues
 
+/// Whether `cpu` is in its idle loop, halted or about to halt (it runs no
+/// task; leaving the loop goes through `schedule`): membarrier's quiescent
+/// state (`membarrier::global`). A CPU claimed for new work meanwhile says
+/// no until its next tick.
+pub fn halted(cpu: &Cpu) -> bool {
+    cpu.sched.halted.load(Ordering::SeqCst)
+}
+
 /// Claims a halted CPU for new work: the first enqueuer to clear its flag
 /// wakes it, the next one picks another idle CPU instead of piling on.
 fn claim(cpu: &Cpu) -> bool {

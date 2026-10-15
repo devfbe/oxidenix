@@ -581,6 +581,8 @@ impl Mm {
         // On failure the child goes; caches skip (and later drop) its
         // registrations, which no longer reach an address space.
         child.lock().copy_from(parent)?;
+        // (membarrier's global registration is the address space's, as Linux's mm flags.)
+        super::membarrier::inherit(&parent.tlb, &child.tlb).map_err(|_| Fault::Oom)?;
         Ok(child)
     }
 

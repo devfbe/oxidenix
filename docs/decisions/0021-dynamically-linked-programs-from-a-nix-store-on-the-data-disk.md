@@ -83,18 +83,46 @@ Four questions:
    (tcmalloc, liburcu's per-CPU flavor); `docs/todo.md` lists it. membarrier's rseq
    commands are EINVAL accordingly.
 
-4. **membarrier: the barrier is the kernel's, the commands are the server's.** The kernel
-   gets one mechanism, `SYS_MEMBARRIER` (1270): an interrupt on every CPU that has the
-   caller's address space loaded (or on every CPU), acknowledged before the call returns,
-   over the TLB shootdown's IPI protocol (`kernel/src/process/tlb.rs`, `barrier`: a request
-   with an empty range). The IPI, its locked acknowledgement and `iret` give the full
-   barrier and the core serialization `SYNC_CORE` asks for; a CPU that loads the address
-   space meanwhile joins its CPU set with a SeqCst operation before it loads CR3. The server
-   (`servers/linux/src/mm.rs`) keeps Linux's commands: QUERY, the registrations per address
-   space (EPERM for an unregistered private command, `GET_REGISTRATIONS`), fork and execve,
-   and the global commands as an interrupt on every CPU (which covers every registered
-   process, and GLOBAL's every running thread). `TEST_BARRIERS` (1640) counts the barrier
-   interrupts each CPU served, for `membarriertest` to check which CPUs a barrier reaches.
+4. **membarrier: the barriers are the kernel's, as Linux's; the commands are the
+   server's.** The kernel's `SYS_MEMBARRIER` (1270, `kernel/src/process/membarrier.rs`) has
+   one operation per kind of barrier, each reaching only whom Linux's reaches, so that no
+   program can interrupt CPUs that run nothing of its (another tree's programs, the native
+   servers) at will:
+   - **Private expedited** (`MEMBARRIER_SPACE`): an interrupt on every CPU that has the
+     caller's address space loaded, acknowledged before the call returns, over the TLB
+     shootdown's IPI protocol (`tlb::barrier_on`: a request with an empty range). The IPI,
+     its locked acknowledgement and `iret` give the full barrier and the core serialization
+     `SYNC_CORE` asks for; a CPU that loads the address space meanwhile joins its CPU set
+     with a SeqCst operation before it loads CR3.
+   - **Global expedited** (`MEMBARRIER_GLOBAL_EXPEDITED`): the same on every CPU that has an
+     address space loaded that registered (`MEMBARRIER_REGISTER_GLOBAL`), of any process
+     tree (trees share memory through /data's shared mappings, ADR 0015), and on no other:
+     Linux's membarrier_global_expedited interrupts the CPUs whose current mm registered
+     (kernel threads and idle CPUs never). The registration is the kernel's address space's
+     (a list of the registered ones, pruned as they go): fork copies it (Linux's mm flags),
+     a process sharing the space shares it, execve's new space has none.
+   - **Global** (`MEMBARRIER_GLOBAL`): no interrupt, as Linux's synchronize_rcu. The caller
+     sleeps until every other CPU has passed a quiescent state since the call began: its
+     timer interrupt, which every CPU takes each tick (10 ms) whether busy or idle and whose
+     handler counts it with a locked instruction (everything the interrupted code did is
+     ordered before), or being in the idle loop (it runs no task; leaving it goes through
+     the scheduler's locked operations). That is the cleanest quiescent state the scheduler
+     offers: the kernel is not preemptive, so context switches can wait arbitrarily long
+     behind a busy program, while the tick never does. A call takes at most about a tick.
+     Linux's waits as long as it takes and is not interruptible; this one is not either
+     (a signal does not end its naps), but it is bounded: a CPU that has not passed a
+     quiescent state after a second (interrupts off that long would be a kernel bug) gets
+     the interrupt after all.
+
+   The server (`servers/linux/src/mm.rs`) keeps Linux's commands: QUERY, the registrations
+   per address space (EPERM for an unregistered private command, `GET_REGISTRATIONS`; the
+   global one passed on to the kernel), fork and execve. `TEST_BARRIERS` (1640) counts the
+   barrier interrupts each CPU served: `membarriertest` checks that the private commands
+   reach the CPU running a thread of the process and not those running others, that global
+   expedited reaches CPUs running registered processes (also a child that inherited the
+   registration) and not one running an unregistered program, and that global interrupts
+   no CPU, returns within a few ticks and still orders (each kind of barrier in a
+   store-buffering race).
 
 ## Consequences
 
