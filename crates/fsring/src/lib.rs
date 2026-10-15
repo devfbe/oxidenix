@@ -21,7 +21,7 @@
 //! | `READ` | `object` inode, `offset`, buffer (a writable grant) | bytes read (short at the end of the file), v0 = file size |
 //! | `WRITE` | `object` inode, `offset`, buffer | bytes written (all of them), v0 = file size |
 //! | `FLUSH` | - | 0 once every write completed before it is durable |
-//! | `STAT` | `object` inode | 0, `Stat` in v0..v3 (a device's number in place of its size, which is 0) |
+//! | `STAT` | `object` inode | 0, `Stat` in v0..v3 (a device's number in place of its size, which is 0; whether another client holds the inode) |
 //! | `ROOT` | - | the root directory: v0 = inode, v1 = its mode, v2 = its generation; v3 = the mount's flags (`ROOT_READ_ONLY`) |
 //! | `LOOKUP` | `object` directory, buffer = name | v0 = inode, v1 = its mode, v2 = its generation |
 //! | `CREATE` | `object` directory, buffer = name, `arg` = [kind, permissions, target length or device number]; a symlink's target follows the name in the grant, a device's number is as `st_rdev` has it (EINVAL for one the filesystem cannot keep) | v0 = new inode, v1 = its mode, v2 = its generation |
@@ -98,10 +98,78 @@
 //! device addresses of its pages) until `FORGET`: the client sends it
 //! before it revokes the grant, so that the revoke never waits for the
 //! service (`restricted::SYS_REVOKE`, `REVOKE_DRAINING`).
+//!
+//! **Notes.** The service's word to a client about inodes the client holds,
+//! for clients that keep what they hold cached (the Linux server instances
+//! share their page cache, ADR 0015, but each holds its own inodes): a
+//! channel with `SHARED_PAGES` of shared area carries a ring of
+//! `NOTE_SLOTS` notes there (`notes`), the service the producer, the client
+//! the consumer, which sleeps on its tail as on any ring's (`ring`,
+//! invariant 4). A `GONE` note says the last link of an inode the client
+//! holds went (`Note`): through another client's `UNLINK` or `RENAME`, or
+//! before the client came to hold it (a client that names an inode without
+//! links, after a restart of the service, say): the client lets go of it
+//! (`RELEASE`) once it does not use it, so that its blocks are freed at its
+//! last close in any client. The requesting client of an `UNLINK` or
+//! `RENAME` learns it from the completion instead. A note finding the ring
+//! full waits in the service (one per inode and channel, none once the
+//! client released the inode) until the client took notes and rang the
+//! submission doorbell. A channel without shared area gets no notes.
+//!
+//! **Promises across clients.** A block another client promised needs no
+//! promise of this one's (one promise per block, whoever asks), and when a
+//! client goes, its promises of a file another client holds pass to that
+//! client (the clients share their cache: the other writes the pages back
+//! now); the others end.
 
 #![no_std]
 
 pub use ring::Desc;
+use ring::RingMemory;
+
+/// Pages of shared area a channel to diskfs has: the notes' ring.
+pub const SHARED_PAGES: u32 = 1;
+/// Notes in the ring.
+pub const NOTE_SLOTS: usize = 32;
+
+/// The notes' ring of a channel whose shared area starts at `shared`.
+///
+/// # Safety
+/// `shared` is the channel's shared area (at least `SHARED_PAGES` pages,
+/// page-aligned), mapped for `'a`.
+pub unsafe fn notes<'a>(shared: *const u8) -> &'a RingMemory<NOTE_SLOTS> {
+    unsafe { RingMemory::from_ptr(shared as *const RingMemory<NOTE_SLOTS>) }
+}
+
+/// A note's kinds (`Desc::op`).
+pub mod note {
+    /// The last link of the inode in `object` went.
+    pub const GONE: u16 = 1;
+}
+
+/// A note (see "Notes"), as the client checks it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Note {
+    Gone(Node),
+}
+
+impl Note {
+    pub fn encode(&self) -> Desc {
+        match *self {
+            Note::Gone(node) => Desc { op: note::GONE, object: node.to_object(), ..Desc::default() },
+        }
+    }
+
+    /// A note copied out of the ring; None for anything malformed (an
+    /// unknown kind, a field set that the kind does not use).
+    pub fn decode(d: &Desc) -> Option<Note> {
+        let clean = d.flags == 0 && d.len == 0 && d.tag == 0 && d.offset == 0 && d.grant == 0 && d.buf_off == 0 && d.arg == [0; 3];
+        match d.op {
+            note::GONE if clean && d.object as u32 != 0 => Some(Note::Gone(Node::from_object(d.object))),
+            _ => None,
+        }
+    }
+}
 
 /// The service's IPC name, and the slots per ring of its channels.
 pub const SERVICE: &str = "diskfs";
@@ -557,7 +625,13 @@ pub struct Stat {
     pub generation: u32,
     /// A character or block device's number (as `st_rdev` has it); 0 for any other inode.
     pub rdev: u64,
+    /// Another client holds the inode too (diskfs; a client that caches
+    /// what it holds looks for another's cache of the file then, ADR 0015).
+    pub shared: bool,
 }
+
+/// `Stat::shared` in v0 (above the mode's bits).
+const STAT_SHARED: u64 = 1 << 31;
 
 /// Whether `mode` is a character or block device's (`S_IFCHR`, `S_IFBLK`).
 pub fn is_device(mode: u32) -> bool {
@@ -565,11 +639,11 @@ pub fn is_device(mode: u32) -> bool {
 }
 
 impl Stat {
-    /// v0 = mode | links << 32, v1 = size (a device's: its number; its size is 0),
-    /// v2 = atime | mtime << 32, v3 = ctime | generation << 32.
+    /// v0 = mode | shared << 31 | links << 32, v1 = size (a device's: its number; its
+    /// size is 0), v2 = atime | mtime << 32, v3 = ctime | generation << 32.
     pub fn to_values(&self) -> [u64; 4] {
         [
-            self.mode as u64 | (self.links as u64) << 32,
+            (self.mode as u64 & (STAT_SHARED - 1)) | if self.shared { STAT_SHARED } else { 0 } | (self.links as u64) << 32,
             if is_device(self.mode) { self.rdev } else { self.size },
             self.atime as u64 | (self.mtime as u64) << 32,
             self.ctime as u64 | (self.generation as u64) << 32,
@@ -577,9 +651,10 @@ impl Stat {
     }
 
     pub fn from_values(v: &[u64; 4]) -> Stat {
-        let mode = v[0] as u32;
+        let mode = (v[0] & (STAT_SHARED - 1)) as u32;
         let (size, rdev) = if is_device(mode) { (0, v[1]) } else { (v[1], 0) };
         Stat {
+            shared: v[0] & STAT_SHARED != 0,
             mode,
             links: (v[0] >> 32) as u32,
             size,

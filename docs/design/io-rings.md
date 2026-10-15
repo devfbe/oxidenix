@@ -322,6 +322,18 @@ diskfs exits to be restarted; its mount replays the journal and goes on from the
 (`ext2fs`, "Failures"). New inodes get random generations. (Until step 4
 the kernel's IPC client held inodes too; it is gone.)
 
+**Notes.** A channel with one page of shared area (`fsring::SHARED_PAGES`; the Linux server's
+are) carries a ring of 32 notes there, diskfs the producer: when the last link of an inode goes
+through one client's `UNLINK` or `RENAME`, every other client that holds it gets a `GONE` note
+(its handle), and so does a client that comes to hold an inode without links (after a restart
+of diskfs); the requester learns it from the completion. The client lets go of the inode once
+it does not use it, so the inode is freed at its last close in any client (the Linux server's
+worker thread sleeps on the ring's tail beside its own requests, `server_wait`). A note that
+finds the ring full waits in diskfs (a bit per inode and channel, cleared by a `RELEASE`) until
+the client took notes and rang the submission doorbell. A block one client promised needs no
+other's promise, and a client that goes passes its promises of files another client holds to
+that client (they share the page cache: ADR 0015).
+
 **Restarts of diskfs.** Holds are diskfs's memory, but the clients' open files outlive a diskfs
 that dies. The kernel binds a channel to the server whose process attached it until its client
 end goes or the service detaches it, also after that process died; a restarted diskfs asks how
@@ -353,10 +365,31 @@ over a page, is refused at start.
 
 ### The page cache's kernel interface (step 4)
 
-The Linux server's page cache of a disk file is a **cached object**
-(`mo_create_cached(size, key, limit)`, 1076; `kernel/src/fs/cache.rs`, the cached store): a
-file object (reads, writes, mappings, programs use it like a tmpfs file object) whose size,
-pages and dirty marks the kernel keeps and whose data the server moves:
+The page cache of a disk file is a **cached object** (`kernel/src/fs/cache.rs`, the cached
+store): a file object (reads, writes, mappings, programs use it like a tmpfs file object) whose
+size, pages, dirty marks and the times its data changed the kernel keeps and whose data the
+Linux server instances move. There is **one per file for every instance** (ADR 0015; until
+then one per instance and file, `mo_create_cached`, 1076):
+
+- **Sharing.** `mo_shared(channel, file, key, limit, flags, out)` (1210) joins the object of
+  the file (fsring's handle) of the channel's service, or makes it (`SHARED_CREATE`); the
+  maker asks diskfs for the size after the object is registered and tells it
+  (`mo_shared_init`, 1211) before anyone else uses it (others wait, a minute at most). Every
+  instance with a handle is a *sharer*: a page one of its threads wants is asked of its own
+  pager, any instance writes back any dirty page, and the instance whose store made the
+  object dirty answers for the dirty pages (its counts, `EVENT_DIRTY`, the requests to write
+  back) until it lets go (the next sharer takes over). A fill or backing of another instance
+  not done within a minute is taken over (`FILL_DEADLINE`); an instance whose pager ended
+  lets go of every object (its fills go as missing again). `SHARED_QUERY` reads the size and
+  times of the object another instance holds (`stat` of a file without one here).
+- **Times.** A write or a store to a clean page sets the modification and change times
+  (seconds of the wall clock) in the object, pending until a write-back, which sends them
+  after its `WRITE`s (`SETTIMES`) and clears them unless they changed (`mo_attrs`, 1212).
+- **Appends.** `mo_file_append` (1213) finds the end and writes there under the object's
+  append lock, whole or not at all (EAGAIN: fill the end's page; ENOSPC: promise from the
+  byte in `out`), one step for every appender of every instance.
+
+The rest is as for one instance:
 
 - **Fill.** A missing page is asked for with `EVENT_PAGE` (a fault, or the kernel reading the
   object) or reported missing to the server's own reads and writes (`MO_NOFILL`: the call stops
@@ -419,8 +452,8 @@ pages and dirty marks the kernel keeps and whose data the server moves:
   ratios; never the pager, which does the writing). `event_wait` takes a deadline (`EVENT_TIMER`,
   for the server's periodic write-back) and delivers `EVENT_CLOSING` once when the instance's
   last program is gone, for its final write-back.
-- **Syncs across instances.** Each instance caches /data on its own, so `sync(2)` and `syncfs`
-  ask every other instance too: `sync_others(0)` (1081) queues `EVENT_SYNC` for each other
+- **Syncs across instances.** Each instance writes back the files it answers for (and those it
+  holds), so `sync(2)` and `syncfs` ask every other instance too: `sync_others(0)` (1081) queues `EVENT_SYNC` for each other
   instance's pager and returns a ticket, the caller writes its own caches back meanwhile, and
   `sync_others(ticket)` waits until each asked pager wrote back and flushed and answered
   `sync_done(ticket)` (1082), or is gone. `reboot(2)` does the same for every instance (60 s at
@@ -584,10 +617,11 @@ for `mprotect`, `ENOMEM` once the service unmapped it).
 4. The Linux server: `/data` through its page cache over the ring; the bridge to the kernel's
    `/data` goes. Done: see "The page cache's kernel interface" and "Paths built on it". The
    kernel's remote store, its flusher and diskfs's IPC protocol are gone (procfs kept the
-   kernel's `RemoteFs` until step 5). Each instance caches `/data` on its own: two process trees
-   writing one file see each other's changes only through the disk (after write-back), for
-   pages the other has not cached, as two machines sharing a disk without a lock manager would.
-   Benchmarks: sequential and random reads and writes, `fstat`, against the numbers in the
+   kernel's `RemoteFs` until step 5). Since ADR 0015 the instances share one cached object per
+   file (until then each cached `/data` on its own, and two process trees saw each other's
+   changes only through the disk), and diskfs's notes tell an instance when another took the
+   last link of an inode it holds (`fsring`, "Notes"); `treetest` checks the coherence across
+   trees. Benchmarks: sequential and random reads and writes, `fstat`, against the numbers in the
    audit and Linux (`datatest` checks the semantics: no pass-through, shared pages, write-back
    and durability, truncation, concurrent readers and writers, a file larger than the memory
    left for the cache).

@@ -867,9 +867,9 @@ fn fill_to(fs: &mut Ext2<RamDisk>, name: &str, leave: u64) -> u32 {
 }
 
 /// A promise counts the data blocks a range lacks and the indirect blocks
-/// they need, once per owner; what it covers is written even when the
-/// disk is otherwise full, and what it does not cover cannot take its
-/// blocks.
+/// they need, once whoever promises them; what it covers is written even
+/// when the disk is otherwise full, and what it does not cover cannot take
+/// its blocks.
 #[test]
 fn promised_blocks_are_kept_for_their_write() {
     let mut fs = Ext2::mount(mkfs("promise", 4 * 1024)).unwrap();
@@ -879,11 +879,12 @@ fn promised_blocks_are_kept_for_their_write() {
     fs.promise(1, a, 0, 32 * 1024).unwrap();
     assert_eq!(fs.promised(), 32 + 1);
     assert_eq!(before - free(&fs), 33);
-    // Again by the same owner: nothing more; by another: counted again.
+    // Again, by the same owner or another (the owners share a cache):
+    // nothing more; another's end leaves it.
     fs.promise(1, a, 4096, 8192).unwrap();
     assert_eq!(fs.promised(), 33);
     fs.promise(2, a, 0, 4096).unwrap();
-    assert_eq!(fs.promised(), 37);
+    assert_eq!(fs.promised(), 33);
     fs.forget_promises(2);
     assert_eq!(fs.promised(), 33);
     // Everything else fills the disk: allocations not promised fail.
@@ -946,6 +947,29 @@ fn promises_end_with_truncation_release_and_owner() {
     assert_eq!(fs.promised(), 0);
     assert_eq!(free(&fs), total);
     fsck("promise-end", &take(fs));
+}
+
+/// An owner that goes passes its promises of a file to an heir (another
+/// owner that holds the file: diskfs's clients share their cache), merged
+/// with the heir's own; without an heir they end.
+#[test]
+fn promises_pass_to_an_heir() {
+    let mut fs = Ext2::mount(mkfs("promise-pass", 4 * 1024)).unwrap();
+    let a = fs.create(ROOT_INO, "a", &NewNode::File, 0o644).unwrap();
+    let b = fs.create(ROOT_INO, "b", &NewNode::File, 0o644).unwrap();
+    fs.promise(1, a, 0, 8 * 1024).unwrap();
+    fs.promise(2, a, 8 * 1024, 4 * 1024).unwrap();
+    fs.promise(1, b, 0, 4 * 1024).unwrap();
+    assert_eq!(fs.promised(), 16);
+    // a's pass to owner 2, b's (no heir) end.
+    fs.pass_promises(1, |ino| (ino == a).then_some(2));
+    assert_eq!(fs.promised(), 12);
+    // Owner 2 holds all of a's: promising them again costs nothing, its end ends them.
+    fs.promise(2, a, 0, 12 * 1024).unwrap();
+    assert_eq!(fs.promised(), 12);
+    fs.forget_promises(2);
+    assert_eq!(fs.promised(), 0);
+    fsck("promise-pass", &take(fs));
 }
 
 /// A write in flight for promised blocks (reserved, not linked yet) holds

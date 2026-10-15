@@ -102,8 +102,9 @@ pub fn request() {
 /// The worker thread: lets go of the descriptor tables whose processes
 /// ended (`fdtable::end_later`), connects to a restarted diskfs
 /// (`datafs::reconnect_later`), shrinks the heap and /data's inode cache
-/// when memory is short (`heap::shrink_if_asked`) and collects whenever
-/// asked.
+/// when memory is short (`heap::shrink_if_asked`), collects whenever
+/// asked, and takes diskfs's notes (`datafs::take_notes`: it sleeps on
+/// their ring too).
 pub fn worker() -> ! {
     let mut done = 0;
     loop {
@@ -116,7 +117,21 @@ pub fn worker() -> ! {
             collect();
             continue;
         }
-        syscall(SYS_SERVER_FUTEX_WAIT, [&REQUESTED as *const AtomicU32 as u64, asked as u64, 0, 0, 0, 0]);
+        if crate::datafs::take_notes() {
+            continue;
+        }
+        let requested = (&REQUESTED as *const AtomicU32 as u64, asked as u64);
+        match crate::datafs::notes_sleep() {
+            Some((word, value)) => {
+                // Either word: a request, or a note (a channel that went ends the wait too).
+                let list = [requested.0, requested.1, word, value as u64];
+                syscall(SYS_SERVER_WAIT, [list.as_ptr() as u64, 2, 0, 0, 0, 0]);
+                crate::datafs::notes_awake();
+            }
+            None => {
+                syscall(SYS_SERVER_FUTEX_WAIT, [requested.0, requested.1, 0, 0, 0, 0]);
+            }
+        }
     }
 }
 

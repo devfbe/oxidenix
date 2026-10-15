@@ -11,10 +11,17 @@
  * between the trees, the reserve of netd's budget (one tree that used up
  * its share leaves the other its reserve), the reserve of the server's
  * heap (one tree that took all memory leaves the other's server working),
- * and /data shared through diskfs: names at once, data through the disk
- * (after fsync, or another tree's sync(2), which writes back every
- * instance), an unlinked file another tree holds open readable until it
- * closes it. */
+ * and /data shared as on one Linux machine (ADR 0015: one page cache per
+ * file for both trees): names at once, data written in one tree read in
+ * the other at once without fsync, also over pages it had cached, appends
+ * of both trees at once (none lost or torn), truncation, size and times
+ * before any write-back, MAP_SHARED stores seen across the trees, an
+ * unlinked file another tree holds open readable until it closes it and its
+ * blocks free at that close, a file only cached in the other tree freed at
+ * once when unlinked here; and a third tree killed while it owns a file's
+ * dirty pages, whose data the first tree reads and writes back without
+ * waiting for anything of the dead tree's. sync(2) writes back every
+ * instance's dirty files. */
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <dirent.h>
@@ -32,6 +39,7 @@
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/syscall.h>
 #include <sys/epoll.h>
 #include <sys/wait.h>
@@ -417,6 +425,118 @@ static void net_reserve(void) {
     close(srv);
 }
 
+/* ------------------------------------------------- /data coherence (ADR 0015) */
+
+/* Both trees use one page cache per file: what one writes the other reads
+ * at once, without fsync, as two processes on one Linux machine. */
+
+#define RECORD 32
+#define RECORDS 200
+
+static char *at_dir(const char *name) {
+    static char paths[4][192];
+    static int next;
+    char *p = paths[next++ % 4];
+    snprintf(p, sizeof paths[0], "%s/%s", dir, name);
+    return p;
+}
+
+/* Appends `n` records of `who` (one write(2) each, O_APPEND). */
+static int append_records(const char *path, char who, int n) {
+    int fd = open(path, O_WRONLY | O_APPEND);
+    if (fd < 0) return -1;
+    int ok = 1;
+    for (int i = 0; i < n && ok; i++) {
+        char rec[RECORD + 1];
+        snprintf(rec, sizeof rec, "%c%05d-------------------------\n", who, i);
+        ok = write(fd, rec, RECORD) == RECORD;
+    }
+    return close(fd) == 0 && ok ? 0 : -1;
+}
+
+/* Free blocks of /data, in KiB. */
+static long free_kib(void) {
+    struct statvfs s;
+    if (statvfs(dir, &s) < 0) return -1;
+    return (long)(s.f_bfree * s.f_bsize / 1024);
+}
+
+/* Waits up to `ms` until /data has at least `kib` KiB free: whether it did. */
+static int free_reaches(long kib, long ms) {
+    long until = now_ms() + ms;
+    while (free_kib() < kib) {
+        if (now_ms() >= until) return 0;
+        usleep(20000);
+    }
+    return 1;
+}
+
+static int kept = -1, hold5 = -1;
+static unsigned char *peer_map;
+
+/* The peer's side of the coherence steps. */
+static void coherent_peer(const char *cmd) {
+    static char buf[4096];
+    if (strcmp(cmd, "C_SEE1") == 0) {
+        struct stat st;
+        check("another tree's write, not fsync'ed, is read here at once",
+              read_file(at_dir("c1"), buf, sizeof buf) == 26 && memcmp(buf, "written by main, no fsync\n", 26) == 0);
+        check("... and its size", stat(at_dir("c1"), &st) == 0 && st.st_size == 26);
+        fill(big, 65536, 11);
+        check("write a file here without fsync", write_file(at_dir("c2"), big, 65536, 0) == 0);
+    } else if (strcmp(cmd, "C_KEEP") == 0) {
+        kept = open(at_dir("c1"), O_RDWR);
+        check("open and read a file (its pages cached here)", kept >= 0 && pread(kept, buf, 26, 0) == 26);
+    } else if (strcmp(cmd, "C_SEE2") == 0) {
+        check("the other tree's overwrite reaches the pages read here before",
+              pread(kept, buf, 26, 0) == 26 && memcmp(buf, "MAIN WROTE AGAIN", 16) == 0 && memcmp(buf + 16, " no fsync\n", 10) == 0);
+        check("overwrite them here", pwrite(kept, "PEER WROTE BACK", 15, 0) == 15);
+        close(kept);
+    } else if (strncmp(cmd, "C_APPEND", 8) == 0) {
+        check("200 appends (O_APPEND) while the other tree appends", append_records(at_dir("c_app"), 'P', RECORDS) == 0);
+    } else if (strcmp(cmd, "C_TRUNC") == 0) {
+        struct stat st;
+        check("the other tree's truncation: its size here", stat(at_dir("c2"), &st) == 0 && st.st_size == 1000);
+        check("... and its end", read_file(at_dir("c2"), big, 65536) == 1000 && matches(big, 1000, 11));
+        check("truncate it to nothing here", truncate(at_dir("c2"), 0) == 0);
+    } else if (strncmp(cmd, "C_TIMES ", 8) == 0) {
+        struct stat st;
+        long mtime = atol(cmd + 8);
+        check("the other tree's write: size and mtime here before any write-back",
+              stat(at_dir("c3"), &st) == 0 && st.st_size == 4096 && st.st_mtime == mtime);
+        struct timespec ts[2] = {{0, UTIME_OMIT}, {1000000000, 0}};
+        check("set its mtime here (utimensat)", utimensat(AT_FDCWD, at_dir("c3"), ts, 0) == 0);
+    } else if (strcmp(cmd, "C_MAP") == 0) {
+        int fd = open(at_dir("c4"), O_RDWR);
+        peer_map = fd < 0 ? MAP_FAILED : mmap(NULL, 8192, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (fd >= 0) close(fd);
+        check("map the other tree's file shared", peer_map != MAP_FAILED);
+        if (peer_map == MAP_FAILED) return;
+        check("its store through its mapping is seen in this mapping", memcmp(peer_map, "mapped by main", 14) == 0);
+        memcpy(peer_map + 4096, "mapped by peer", 14);
+    } else if (strcmp(cmd, "C_MAP2") == 0) {
+        if (peer_map == MAP_FAILED || !peer_map) return;
+        check("its next store is seen here at once", memcmp(peer_map, "changed by main", 15) == 0);
+        munmap(peer_map, 8192);
+    } else if (strcmp(cmd, "C_HOLD") == 0) {
+        hold5 = open(at_dir("c5"), O_RDONLY);
+        check("open the other tree's file and keep it open", hold5 >= 0 && read(hold5, buf, 16) == 16);
+    } else if (strcmp(cmd, "C_DROP") == 0) {
+        check("the other tree's unlink is seen here", access(at_dir("c5"), F_OK) < 0 && errno == ENOENT);
+        check("the file open here still reads", pread(hold5, big, MIB, 0) == MIB && matches(big, MIB, 12));
+        check("close it (its last close anywhere)", close(hold5) == 0);
+    } else if (strcmp(cmd, "C_GONE6") == 0) {
+        long before = free_kib();
+        check("unlink a file the other tree has cached (closed)", unlink(at_dir("c6")) == 0);
+        check("its blocks are free at once (the other tree lets go of it)", before > 0 && free_reaches(before + 900, 10000));
+        if (free_kib() < before + 900) printf("treetest peer: %ld KiB free before, %ld after\n", before, free_kib());
+    } else {
+        say("FAIL unknown command '%s'", cmd);
+        return;
+    }
+    answer(cmd);
+}
+
 static int peer(int argc, char **argv) {
     who = "treetest peer";
     /* Started by the kernel without the console: no standard descriptors.
@@ -563,6 +683,8 @@ static int peer(int argc, char **argv) {
             snprintf(p, sizeof p, "%s/p4", dir);
             check("unlink the file the other tree holds open", unlink(p) == 0);
             answer("UNLINK4");
+        } else if (strncmp(cmd, "C_", 2) == 0) {
+            coherent_peer(cmd);
         } else if (strcmp(cmd, "PING") == 0) {
             /* Memory is back: the results of MEMRESERVE into the log. */
             release_held();
@@ -642,8 +764,149 @@ static int end_tree(long ms) {
     return status;
 }
 
+/* Checks a file of the two trees' records: every record whole, each
+ * tree's in its order and all of them there. */
+static int records_ok(const char *path) {
+    static char data[2 * RECORDS * RECORD + 1];
+    long n = read_file(path, data, sizeof data);
+    if (n != 2 * RECORDS * RECORD) {
+        printf("treetest: the appended file has %ld bytes, not %d\n", n, 2 * RECORDS * RECORD);
+        return 0;
+    }
+    int next[2] = {0, 0};
+    for (long at = 0; at < n; at += RECORD) {
+        char *rec = data + at;
+        int who = rec[0] == 'M' ? 0 : rec[0] == 'P' ? 1 : -1;
+        if (who < 0 || atoi(rec + 1) != next[who] || rec[RECORD - 1] != '\n') {
+            printf("treetest: a broken record at %ld: %.31s\n", at, rec);
+            return 0;
+        }
+        next[who]++;
+    }
+    return next[0] == RECORDS && next[1] == RECORDS;
+}
+
+/* The main tree's side of the coherence steps (ADR 0015): writes seen both
+ * ways without fsync, by cached pages too, appends of both trees, a
+ * truncation, size and times, MAP_SHARED, and an unlinked file's blocks
+ * freed at its last close in either tree. */
+static int coherent_main(void) {
+    static char buf[4096];
+    int alive;
+    check("write a file without fsync", write_file(at_dir("c1"), "written by main, no fsync\n", 26, 0) == 0);
+    if (!(alive = step("C_SEE1", "C_SEE1"))) return 0;
+    check("the other tree's write, not fsync'ed, is read here at once", read_file(at_dir("c2"), big, 2 * 65536) == 65536 && matches(big, 65536, 11));
+
+    /* Pages cached in both trees. */
+    if (!(alive = step("C_KEEP", "C_KEEP"))) return 0;
+    int fd = open(at_dir("c1"), O_RDWR);
+    check("overwrite the file the other tree has cached", fd >= 0 && pwrite(fd, "MAIN WROTE AGAIN", 16, 0) == 16);
+    if (!(alive = step("C_SEE2", "C_SEE2"))) return 0;
+    check("its overwrite reaches the pages cached here", fd >= 0 && pread(fd, buf, 26, 0) == 26 && memcmp(buf, "PEER WROTE BACKN no fsync\n", 26) == 0);
+    if (fd >= 0) close(fd);
+
+    /* Appends of both trees at once: none lost, none torn. */
+    close(open(at_dir("c_app"), O_WRONLY | O_CREAT | O_TRUNC, 0644));
+    say("C_APPEND %d", RECORDS);
+    check("200 appends (O_APPEND) while the other tree appends", append_records(at_dir("c_app"), 'M', RECORDS) == 0);
+    if (!(alive = step("C_APPEND 200", NULL))) return 0;
+    check("... every record of both trees there, whole and in order", records_ok(at_dir("c_app")));
+
+    /* A truncation either way. */
+    fd = open(at_dir("c2"), O_RDWR);
+    check("truncate the other tree's file", fd >= 0 && ftruncate(fd, 1000) == 0);
+    if (!(alive = step("C_TRUNC", "C_TRUNC"))) return 0;
+    struct stat st;
+    check("its truncation is seen here: size and end", fd >= 0 && fstat(fd, &st) == 0 && st.st_size == 0 && pread(fd, buf, 16, 0) == 0);
+    if (fd >= 0) close(fd);
+
+    /* Size and times before any write-back. */
+    fill(big, 4096, 14);
+    check("write a file without fsync", write_file(at_dir("c3"), big, 4096, 0) == 0);
+    check("... its mtime", stat(at_dir("c3"), &st) == 0);
+    char name[64];
+    snprintf(name, sizeof name, "C_TIMES %ld", (long)st.st_mtime);
+    if (!(alive = step(name, "%s", name))) return 0;
+    check("the mtime the other tree set is seen here", stat(at_dir("c3"), &st) == 0 && st.st_mtime == 1000000000);
+    check("... and stays after fsync", (fd = open(at_dir("c3"), O_RDONLY)) >= 0 && fsync(fd) == 0 && stat(at_dir("c3"), &st) == 0 && st.st_mtime == 1000000000);
+    if (fd >= 0) close(fd);
+
+    /* MAP_SHARED in both trees: one page, each store seen at once. */
+    fd = open(at_dir("c4"), O_RDWR | O_CREAT | O_TRUNC, 0644);
+    unsigned char *map = fd >= 0 && ftruncate(fd, 8192) == 0 ? mmap(NULL, 8192, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0) : MAP_FAILED;
+    if (fd >= 0) close(fd);
+    check("map a file shared", map != MAP_FAILED);
+    if (map != MAP_FAILED) {
+        memcpy(map, "mapped by main", 14);
+        if (!(alive = step("C_MAP", "C_MAP"))) return 0;
+        check("the other tree's store through its mapping is seen here at once", memcmp(map + 4096, "mapped by peer", 14) == 0);
+        memcpy(map, "changed by main", 15);
+        if (!(alive = step("C_MAP2", "C_MAP2"))) return 0;
+        munmap(map, 8192);
+    }
+
+    /* An unlinked file's blocks: kept while the other tree has it open, free
+     * at its last close there. */
+    fill(big, MIB, 12);
+    check("a 1 MiB file, fsync'ed", write_file(at_dir("c5"), big, MIB, 1) == 0);
+    if (!(alive = step("C_HOLD", "C_HOLD"))) return 0;
+    long before = free_kib();
+    check("unlink it while the other tree has it open", unlink(at_dir("c5")) == 0);
+    usleep(200000);
+    check("... its blocks stay meanwhile", free_kib() < before + 900);
+    if (!(alive = step("C_DROP", "C_DROP"))) return 0;
+    check("... and are free at its last close there", free_reaches(before + 900, 10000));
+
+    /* And a file only cached here (read and closed) that the other tree unlinks. */
+    fill(big, MIB, 15);
+    check("a 1 MiB file, fsync'ed, read and closed here", write_file(at_dir("c6"), big, MIB, 1) == 0 && read_file(at_dir("c6"), big, MIB) == MIB);
+    return step("C_GONE6", "C_GONE6");
+}
+
+/* A third tree that becomes the owner of a file's dirty pages (it writes
+ * without fsync, and stores through a shared mapping) and is killed while
+ * it is: the main tree, which shares the file, reads the data, writes it
+ * back, and nothing of it waits for the dead tree. */
+static int victim(int argc, char **argv) {
+    if (argc < 3) return 2;
+    snprintf(dir, sizeof dir, "%s", argv[2]);
+    fill(big, 65536, 13);
+    int fd = open(at_dir("c7"), O_RDWR);
+    if (fd < 0 || write(fd, big, 65536) != 65536) return 2;
+    unsigned char *map = mmap(NULL, 65536 + 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (map == MAP_FAILED) return 2;
+    memcpy(map + 65536, "stored by the victim", 20);
+    close(open(at_dir("c7.ready"), O_WRONLY | O_CREAT, 0644));
+    for (;;) pause();
+}
+
+static void killed_tree(void) {
+    /* The file, cached here first (so this tree shares its object). */
+    int fd = open(at_dir("c7"), O_RDWR | O_CREAT | O_TRUNC, 0644);
+    check("a file for the tree to be killed, cached here", fd >= 0 && ftruncate(fd, 65536 + 4096) == 0 && pread(fd, big, 16, 0) == 16);
+    if (fd < 0) return;
+    char *args[] = {"treetest", "victim", dir, NULL};
+    long victim_tree = syscall(TEST_TREE_START, "/bin/treetest", args);
+    check("a third tree starts", victim_tree > 0);
+    if (victim_tree <= 0) return;
+    long until = now_ms() + STEP_MS;
+    while (access(at_dir("c7.ready"), F_OK) < 0 && now_ms() < until) usleep(20000);
+    check("it wrote and stored into the file (no fsync)", access(at_dir("c7.ready"), F_OK) == 0);
+    check("kill it while its writes are dirty", syscall(TEST_TREE_KILL, victim_tree) == 0);
+    long status = syscall(TEST_TREE_WAIT, victim_tree, 30000000000L);
+    check("... it ends", status >= 0);
+    static char tail[32];
+    long start = now_ms();
+    check("its writes are read here", pread(fd, big, 65536, 0) == 65536 && matches(big, 65536, 13));
+    check("... and its store through its mapping", pread(fd, tail, 20, 65536) == 20 && memcmp(tail, "stored by the victim", 20) == 0);
+    check("fsync here writes them back, waiting for nothing of the dead tree's", fsync(fd) == 0);
+    check("... and so does an append", write(fd, "more", 4) == 4 && fsync(fd) == 0);
+    check("... in a few seconds", now_ms() - start < 10000);
+    close(fd);
+}
+
 static void cleanup(void) {
-    static const char *names[] = {"m1", "p1", "p2", "m3", "p4", "peer.log"};
+    static const char *names[] = {"m1", "p1", "p2", "m3", "p4", "peer.log", "c1", "c2", "c3", "c4", "c5", "c6", "c7", "c7.ready", "c_app"};
     char p[192];
     for (unsigned i = 0; i < sizeof names / sizeof *names; i++) {
         snprintf(p, sizeof p, "%s/%s", dir, names[i]);
@@ -656,6 +919,7 @@ static void cleanup(void) {
 
 int main(int argc, char **argv) {
     if (argc > 1 && strcmp(argv[1], "peer") == 0) return peer(argc, argv);
+    if (argc > 1 && strcmp(argv[1], "victim") == 0) return victim(argc, argv);
     setvbuf(stdout, NULL, _IOLBF, 0);
     signal(SIGALRM, main_alarm);
     alarm(600);
@@ -865,10 +1129,10 @@ int main(int argc, char **argv) {
             check("its unlink is seen here", access(p, F_OK) < 0 && errno == ENOENT);
             check("the open file is still readable here, intact",
                   fd >= 0 && read_full(fd, big, 262144 + 1) == 262144 && matches(big, 262144, 8));
-            /* (Its blocks stay allocated while this tree's server caches
-             * the inode: fsring's holds, docs/todo.md.) */
+            /* (Its blocks go with this close: C_DROP and C_GONE6 check.) */
             if (fd >= 0) close(fd);
         }
+        if (alive) alive = coherent_main();
 
         if (alive) {
             say("BYE");
@@ -882,6 +1146,7 @@ int main(int argc, char **argv) {
     if (status >= 0 && !(WIFEXITED(status) && WEXITSTATUS(status) == 0)) printf("treetest: its wait status: %#x\n", status);
     check("its handle is gone after the wait", syscall(TEST_TREE_WAIT, tree, 0L) < 0 && errno == ECHILD);
     check("... and kills nothing", syscall(TEST_TREE_KILL, tree) < 0 && errno == ECHILD);
+    killed_tree();
     print_log();
     cleanup();
     printf("treetest: %s\n", failures ? "FAILED" : "all passed");

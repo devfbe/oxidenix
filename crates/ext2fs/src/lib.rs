@@ -123,10 +123,12 @@
 //! counted against the free blocks, so the write that comes later finds
 //! room, and `write(2)` can fail with ENOSPC up front instead of the
 //! write-back later. Allocations a promise does not cover never take the
-//! promised blocks; one it covers spends its promise. A promise ends when
-//! its blocks are allocated, truncated away or freed with the file, or
-//! when its owner goes (`forget_promises`); free space reported by `usage`
-//! excludes it.
+//! promised blocks; one it covers spends its promise. A block one owner
+//! promised needs no other's promise (owners that share a cache write each
+//! other's pages back). A promise ends when its blocks are allocated,
+//! truncated away or freed with the file, or when its owner goes
+//! (`forget_promises`), unless it passes to another owner then
+//! (`pass_promises`); free space reported by `usage` excludes it.
 
 #![no_std]
 
@@ -1868,17 +1870,16 @@ impl<D: Device> State<D> {
         let mut data = Vec::new();
         let mut tables = BTreeSet::new();
         for fb in off / bs..=(end - 1) / bs {
-            let mine = self.promises.get(&ino).and_then(|m| m.get(&owner));
-            if mine.is_some_and(|p| p.has(fb)) {
+            // (Promised by any owner: one promise per block, `pass_promises` keeps it.)
+            if self.data_promised(ino, fb) {
                 continue;
             }
             let (allocated, missing) = self.probe(&inode, fb)?;
             if allocated {
                 continue;
             }
-            let mine = self.promises.get(&ino).and_then(|m| m.get(&owner));
             for id in missing {
-                if !mine.is_some_and(|p| p.tables.contains(&id)) {
+                if !self.table_promised(ino, id) {
                     tables.insert(id);
                 }
             }
@@ -3844,9 +3845,26 @@ impl<D: Device> Ext2<D> {
 
     /// `owner` goes: its promises end.
     pub fn forget_promises(&mut self, owner: u64) {
+        self.pass_promises(owner, |_| None);
+    }
+
+    /// `owner` goes: its promises of each file pass to `heir(ino)` (another
+    /// owner that holds the file: with a cache the owners share, its
+    /// write-back writes those pages now), or end.
+    pub fn pass_promises(&mut self, owner: u64, heir: impl Fn(u32) -> Option<u64>) {
         let st = &mut self.st;
-        for m in st.promises.values_mut() {
-            m.remove(&owner);
+        for (&ino, m) in st.promises.iter_mut() {
+            let Some(p) = m.remove(&owner) else { continue };
+            let Some(h) = heir(ino).filter(|&h| h != owner) else { continue };
+            let to = m.entry(h).or_default();
+            for (&s, &e) in &p.blocks {
+                for fb in s..e {
+                    if !to.has(fb) {
+                        to.add(fb);
+                    }
+                }
+            }
+            to.tables.extend(p.tables);
         }
         st.promises.retain(|_, m| !m.is_empty());
         st.promised = st.promises.values().flat_map(|m| m.values()).map(Promise::total).sum();

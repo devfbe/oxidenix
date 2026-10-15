@@ -205,6 +205,9 @@ pub struct Grant {
     first: u64,
     /// The pinned frames (one reference each, the grant's).
     frames: Vec<PhysFrame>,
+    /// A cached object's run (`grant_run`): the counts of the instance
+    /// whose pins they are (`PageCache::unpin`).
+    counts: Option<Arc<crate::fs::cache::CacheCounts>>,
     writable: bool,
     /// Held (sleeping) across the changes of the service's mappings, so a
     /// mapping or a device address can never be made after the revoke.
@@ -223,7 +226,7 @@ struct GrantState {
 impl Drop for Grant {
     fn drop(&mut self) {
         for (i, &frame) in self.frames.iter().enumerate() {
-            self.object.unpin(self.first + i as u64, frame);
+            self.object.unpin(self.first + i as u64, frame, self.counts.as_deref());
         }
     }
 }
@@ -334,6 +337,13 @@ impl Channel {
 
     pub fn pages(&self) -> u64 {
         self.layout.pages as u64
+    }
+
+    /// The server the channel is attached to, by identity (a service keeps
+    /// it across restarts: its files' ids mean the same, `PageCache::shared`
+    /// scopes them by it); None while no service has it.
+    pub fn service_id(&self) -> Option<usize> {
+        self.inner.lock().service.as_ref().map(|s| Arc::as_ptr(&s.server) as usize)
     }
 
     /// The submission ring's `tail` (the client rings the service's
@@ -462,22 +472,33 @@ impl Channel {
                 Ok(frame) => frames.push(frame),
                 Err(e) => {
                     for (j, frame) in frames.into_iter().enumerate() {
-                        object.unpin(first + j as u64, frame);
+                        object.unpin(first + j as u64, frame, None);
                     }
                     self.unreserve(pages);
                     return Err(e);
                 }
             }
         }
-        self.enter(object, first, frames, writable, pages)
+        self.enter(object, first, frames, None, writable, pages)
     }
 
     /// Grants a run of a cached object's pages to be filled (`fill`:
     /// missing ones, made pending, `PageCache::pin_fill`) or written back
     /// (dirty ones, `pin_dirty`) among the `pages` from byte `offset` (see
     /// `restricted::GRANT_FILL`): the grant's id, the run's first page, its
-    /// length and the file's size then.
-    pub fn grant_run(&self, object: &Arc<PageCache>, offset: u64, pages: u64, fill: bool, writable: bool) -> Result<(u32, u64, u64, u64), crate::fs::cache::Scan> {
+    /// length and the file's size then. For the instance `me` (its pins
+    /// counted in its `counts`; the pages it fills are its own to declare
+    /// filled).
+    pub fn grant_run(
+        &self,
+        object: &Arc<PageCache>,
+        offset: u64,
+        pages: u64,
+        fill: bool,
+        writable: bool,
+        me: usize,
+        counts: &Arc<crate::fs::cache::CacheCounts>,
+    ) -> Result<(u32, u64, u64, u64), crate::fs::cache::Scan> {
         use crate::fs::cache::Scan;
         if offset % PAGE != 0 || pages == 0 {
             return Err(Scan::Errno(EINVAL));
@@ -485,7 +506,7 @@ impl Channel {
         let window = pages;
         let pages = pages.min(crate::fs::cache::MAX_RUN);
         self.reserve(pages).map_err(Scan::Errno)?;
-        let pinned = if fill { object.pin_fill(offset / PAGE, window) } else { object.pin_dirty(offset / PAGE, window) };
+        let pinned = if fill { object.pin_fill(offset / PAGE, window, me, counts) } else { object.pin_dirty(offset / PAGE, window, counts) };
         let (first, frames, size) = match pinned {
             Ok(run) => run,
             Err(e) => {
@@ -496,14 +517,14 @@ impl Channel {
         let count = frames.len() as u64;
         // Only what the run took stays reserved.
         self.inner.lock().pages -= pages - count;
-        match self.enter(object, first, frames, writable, count) {
+        match self.enter(object, first, frames, Some(counts.clone()), writable, count) {
             Ok(id) => Ok((id, first, count, size)),
             Err(e) => {
                 // Nobody will fill or write them: pending pages go again (missing, to be
                 // asked for again, when the service is gone: that says nothing about the
                 // file), dirty ones are dirty again.
                 let outcome = if e == EPIPE { crate::fs::cache::Filled::Again } else { crate::fs::cache::Filled::Failed(EIO) };
-                let _ = if fill { object.filled(first, count, outcome) } else { object.redirty(first, count) };
+                let _ = if fill { object.filled(first, count, outcome, me) } else { object.redirty(first, count) };
                 Err(Scan::Errno(e))
             }
         }
@@ -537,11 +558,20 @@ impl Channel {
     /// Makes the pinned `frames` (pages from `first` of `object`) a grant
     /// under the slot and `pages` pages reserved for it; on failure they
     /// are unpinned and the reservation goes.
-    fn enter(&self, object: &Arc<PageCache>, first: u64, frames: Vec<PhysFrame>, writable: bool, pages: u64) -> Result<u32, i64> {
+    fn enter(
+        &self,
+        object: &Arc<PageCache>,
+        first: u64,
+        frames: Vec<PhysFrame>,
+        counts: Option<Arc<crate::fs::cache::CacheCounts>>,
+        writable: bool,
+        pages: u64,
+    ) -> Result<u32, i64> {
         let grant = Grant {
             object: object.clone(),
             first,
             frames,
+            counts,
             writable,
             state: Mutex::new(GrantState::default()),
             quarantined: spin::Mutex::new(None),

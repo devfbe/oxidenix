@@ -210,11 +210,17 @@ impl DataOpen {
                 Err(_) => break,
             }
         }
+        self.written(offset, done, sync)?;
+        Ok(done)
+    }
+
+    /// `done` bytes were written at `offset`: inotify's event, and with
+    /// O_SYNC, O_DSYNC, RWF_(D)SYNC durable now; with O_DIRECT on the disk
+    /// (not flushed), as Linux.
+    fn written(&self, offset: u64, done: u64, sync: bool) -> Result<(), i64> {
         if done > 0 {
             self.notify(inotify::IN_MODIFY);
         }
-        // O_SYNC, O_DSYNC, RWF_(D)SYNC: durable now; O_DIRECT: on the disk
-        // (not flushed), as Linux.
         if done > 0 && (sync || self.direct) {
             let end = offset + done;
             if sync {
@@ -223,18 +229,22 @@ impl DataOpen {
                 datafs::writeback(&self.inode, offset / 4096..end.div_ceil(4096))?;
             }
         }
-        Ok(done)
+        Ok(())
+    }
+
+    /// An O_APPEND write: at the end of the file, found and written in one
+    /// step for every appender of every process tree (`datafs::append`).
+    /// Where it went, and the bytes.
+    fn append(&self, vecs: &[(u64, u64)], sync: bool) -> Result<(u64, u64), i64> {
+        let (at, done) = datafs::append(&self.inode, vecs)?;
+        self.written(at, done, sync)?;
+        Ok((at, done))
     }
 
     /// pwrite/pwritev: at `offset`, or with O_APPEND (as on Linux) at the
     /// end; the description's offset stays.
     fn write_positional(&self, vecs: &[(u64, u64)], offset: u64, append: bool, sync: bool) -> Result<i64, i64> {
-        let n = if append {
-            let _append = self.inode.append.lock()?;
-            self.write(vecs, datafs::size(&self.inode)?, sync)?
-        } else {
-            self.write(vecs, offset, sync)?
-        };
+        let n = if append { self.append(vecs, sync)?.1 } else { self.write(vecs, offset, sync)? };
         Ok(n as i64)
     }
 
@@ -247,15 +257,15 @@ impl DataOpen {
         Ok(n as i64)
     }
 
-    /// write/writev: at the offset, or with O_APPEND at the end (the
-    /// inode's append lock makes finding the end and writing there one
-    /// step for every appender).
+    /// write/writev: at the offset, or with O_APPEND at the end (found and
+    /// written in one step for every appender: `append`); the offset moves
+    /// past what was written.
     fn write_at_offset(&self, vecs: &[(u64, u64)], append: bool, sync: bool) -> Result<i64, i64> {
         let mut off = self.offset.lock()?;
         let n = if append {
-            let _append = self.inode.append.lock()?;
-            *off = datafs::size(&self.inode)?;
-            self.write(vecs, *off, sync)?
+            let (at, n) = self.append(vecs, sync)?;
+            *off = at;
+            n
         } else {
             self.write(vecs, *off, sync)?
         };

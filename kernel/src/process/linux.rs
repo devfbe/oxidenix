@@ -1175,7 +1175,7 @@ impl Instance {
         let handle = h.next;
         h.next += 1;
         if let Object::Memory(cache) | Object::File(cache, _) = &object {
-            cache.handle_opened();
+            cache.handle_opened(self as *const Instance as usize);
         }
         h.objects.insert(handle, object);
         Ok(handle)
@@ -1609,6 +1609,13 @@ fn instance() -> Result<Arc<Instance>, i64> {
     with_current(|p| p.linux.as_ref().map(|l| l.instance.clone())).ok_or(EPERM)
 }
 
+/// The calling thread's instance, by its identity (its address, as a
+/// cached object's sharers name it: `fs::cache::Sharer::id`), if it serves
+/// one.
+pub fn current_instance() -> Option<usize> {
+    with_current(|p| p.linux.as_ref().map(|l| Arc::as_ptr(&l.instance) as usize))
+}
+
 /// The kernel calls of the Linux server beyond entering restricted mode
 /// (see `restricted::SYS_*`). Mappings go into the calling thread's
 /// program view.
@@ -1638,10 +1645,11 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
     match nr {
         SYS_HANDLE_CLOSE => {
             let object = instance.handles.lock().objects.remove(&a[0]).ok_or(EBADF)?;
-            // At a paged or cached object's last handle the server can no
-            // longer answer for it (`PageCache::orphan`).
+            // At a paged object's last handle the server can no longer
+            // answer for it (`PageCache::orphan`); at the instance's last
+            // handle of a cached object it lets go of it (`leave`).
             if let Object::Memory(cache) | Object::File(cache, _) = &object {
-                cache.handle_closed();
+                cache.handle_closed(Arc::as_ptr(&instance) as usize);
             }
             // Released outside the lock. A channel's end goes now, unless a
             // call of another thread still uses it (then with that call).
@@ -1912,6 +1920,70 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
                 }
             }
         }
+        SYS_MO_FILE_APPEND => {
+            use crate::fs::cache::{Backing, Fill};
+            let Object::File(cache, _) = instance.object(a[0])? else { return Err(EINVAL) };
+            let (out, buf, len, flags, upto) = (a[1], a[2], a[3], a[4], a[5]);
+            if !cache.is_cached() || flags & !(MO_NOFILL | MO_CHECK_BACKED | MO_BACKED | MO_IOV) != 0 || flags & (MO_CHECK_BACKED | MO_BACKED) == MO_CHECK_BACKED | MO_BACKED {
+                return Err(EINVAL);
+            }
+            // The program's buffers: one, or the server's array of them (writev).
+            let mut vecs = Vec::new();
+            if flags & MO_IOV != 0 {
+                if len > MO_IOV_MAX {
+                    return Err(EINVAL);
+                }
+                let mut raw = Vec::new();
+                raw.try_reserve_exact(16 * len as usize).map_err(|_| ENOMEM)?;
+                raw.resize(16 * len as usize, 0u8);
+                super::uaccess::copy_from_server(buf, &mut raw)?;
+                vecs.try_reserve_exact(len as usize).map_err(|_| ENOMEM)?;
+                for pair in raw.chunks_exact(16) {
+                    let word = |b: &[u8]| u64::from_le_bytes(b.try_into().unwrap_or_default());
+                    vecs.push((word(&pair[..8]), word(&pair[8..])));
+                }
+            } else {
+                vecs.try_reserve_exact(1).map_err(|_| ENOMEM)?;
+                vecs.push((buf, len));
+            }
+            let total = vecs.iter().try_fold(0u64, |t, &(_, l)| t.checked_add(l)).ok_or(EINVAL)?;
+            let fill = if flags & MO_NOFILL != 0 { Fill::No } else { Fill::Yes };
+            let backing = match flags {
+                f if f & MO_CHECK_BACKED != 0 => Backing::Check,
+                f if f & MO_BACKED != 0 => Backing::Vouched(upto),
+                _ => Backing::Ignore,
+            };
+            // Finding the end and writing there: one step for every appender.
+            let _append = cache.append_lock();
+            let off = cache.size();
+            if let Err((e, at)) = cache.check_append(off, total, backing, fill) {
+                super::uaccess::copy_to_server(out, &at.to_le_bytes())?;
+                return Err(e);
+            }
+            // (Before the data goes in: a caller that cannot learn where gets nothing written.)
+            super::uaccess::copy_to_server(out, &off.to_le_bytes())?;
+            let mut written = 0u64;
+            for &(base, l) in &vecs {
+                let n = super::uaccess::write_from_user(base, l, |chunk, done| {
+                    if written + done > 0 {
+                        crate::fs::cache::balance_dirty(&cache);
+                    }
+                    cache.write_with(off + written + done, chunk, fill, backing)
+                });
+                match n {
+                    Ok(n) => {
+                        written += n as u64;
+                        if (n as u64) < l {
+                            break;
+                        }
+                    }
+                    Err(e) if written == 0 => return Err(e),
+                    Err(_) => break,
+                }
+            }
+            crate::fs::cache::balance_dirty(&cache);
+            Ok(written as i64)
+        }
         SYS_PROC_SELF..=SYS_RANDOM | SYS_CPU_ALARM => process_call(&instance, nr, a),
         SYS_SET_USERCOPY => {
             let (insn, fixup) = (a[0], a[1]);
@@ -2108,7 +2180,8 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
                 // A cached object's pages: to fill (into a writable grant)
                 // or to write back (read-only).
                 mode @ (GRANT_FILL | GRANT_DIRTY) if (mode == GRANT_FILL) == writable => {
-                    let (id, first, count, size) = match end.channel.grant_run(&object, a[2], a[3], mode == GRANT_FILL, writable) {
+                    let me = Arc::as_ptr(&instance) as usize;
+                    let (id, first, count, size) = match end.channel.grant_run(&object, a[2], a[3], mode == GRANT_FILL, writable, me, &instance.cache_counts) {
                         Ok(run) => run,
                         Err(crate::fs::cache::Scan::Errno(e)) => return Err(e),
                         Err(crate::fs::cache::Scan::Resume(at)) => {
@@ -2126,7 +2199,7 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
                     if let Err(e) = super::uaccess::copy_to_server(a[5], &info) {
                         // The caller cannot know the run: it goes again.
                         let _ = end.channel.revoke(id);
-                        let _ = if mode == GRANT_FILL { object.filled(first, count, crate::fs::cache::Filled::Failed(EIO)) } else { object.redirty(first, count) };
+                        let _ = if mode == GRANT_FILL { object.filled(first, count, crate::fs::cache::Filled::Failed(EIO), me) } else { object.redirty(first, count) };
                         return Err(e);
                     }
                     Ok(id as i64)
@@ -2134,11 +2207,71 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
                 _ => Err(EINVAL),
             }
         }
-        SYS_MO_CREATE_CACHED => {
-            let (size, key, limit) = (a[0], a[1], a[2]);
-            let pager: alloc::sync::Weak<dyn crate::fs::cache::Pager> = Arc::downgrade(&instance) as _;
-            let cache = PageCache::cached(size, limit, pager, key, instance.cache_counts.clone())?;
-            Ok(instance.insert(Object::File(cache, None))? as i64)
+        SYS_MO_SHARED => {
+            use crate::fs::cache::{Opened, Sharer};
+            let (channel, file, key, limit, flags, out) = (a[0], a[1], a[2], a[3], a[4], a[5]);
+            if flags & !(SHARED_CREATE | SHARED_QUERY) != 0 || flags == SHARED_CREATE | SHARED_QUERY {
+                return Err(EINVAL);
+            }
+            // The file ids are the service's: scoped by it.
+            let service = instance.channel(channel)?.channel.service_id().ok_or(ENOTCONN)?;
+            if flags & SHARED_QUERY != 0 {
+                let cache = PageCache::find_shared(service, file).ok_or(ENOENT)?;
+                super::uaccess::copy_to_server(out, &file_attrs(&cache))?;
+                return Ok(0);
+            }
+            let me = Sharer { pager: Arc::downgrade(&instance) as alloc::sync::Weak<dyn crate::fs::cache::Pager>, key, counts: instance.cache_counts.clone() };
+            let id = me.id();
+            let (cache, made) = match PageCache::shared(service, file, limit, &me, flags & SHARED_CREATE != 0)? {
+                Opened::Joined(cache) => (cache, false),
+                Opened::Made(cache) => (cache, true),
+            };
+            let handle = match instance.insert(Object::File(cache.clone(), None)) {
+                Ok(h) => h,
+                Err(e) => {
+                    // No handle came of it: the instance lets go again.
+                    cache.unjoin(id);
+                    return Err(e);
+                }
+            };
+            if let Err(e) = super::uaccess::copy_to_server(out, &(made as u64).to_le_bytes()) {
+                // The caller cannot know whether to tell the size: undone.
+                instance.handles.lock().objects.remove(&handle);
+                cache.handle_closed(id);
+                return Err(e);
+            }
+            Ok(handle as i64)
+        }
+        SYS_MO_SHARED_INIT => {
+            let Object::File(cache, _) = instance.object(a[0])? else { return Err(EINVAL) };
+            cache.init(a[1])?;
+            Ok(0)
+        }
+        SYS_MO_ATTRS => {
+            let Object::File(cache, _) = instance.object(a[0])? else { return Err(EINVAL) };
+            if !cache.is_cached() {
+                return Err(EINVAL);
+            }
+            let (op, at) = (a[1], a[2]);
+            if op == ATTRS_GET {
+                super::uaccess::copy_to_server(at, &file_attrs(&cache))?;
+                return Ok(0);
+            }
+            let mut raw = [0u8; core::mem::size_of::<FileAttrs>()];
+            super::uaccess::copy_from_server(at, &mut raw)?;
+            let word = |i: usize| u64::from_le_bytes(raw[i * 8..i * 8 + 8].try_into().unwrap_or_default());
+            let (flags, seq) = (word(1), word(5));
+            let time = |bit: u64, i: usize| (flags & bit != 0).then(|| word(i) as i64);
+            match op {
+                ATTRS_SET | ATTRS_SET_IF_PENDING => {
+                    if flags & !(ATTR_ATIME | ATTR_MTIME | ATTR_CTIME) != 0 {
+                        return Err(EINVAL);
+                    }
+                    Ok(cache.set_times(time(ATTR_ATIME, 2), time(ATTR_MTIME, 3), time(ATTR_CTIME, 4), op == ATTRS_SET_IF_PENDING) as i64)
+                }
+                ATTRS_CLEAR | ATTRS_CLEAR_IF_IDLE => Ok(cache.clear_times(seq, op == ATTRS_CLEAR_IF_IDLE) as i64),
+                _ => Err(EINVAL),
+            }
         }
         SYS_MO_FILLED | SYS_MO_REDIRTY => {
             let Object::File(cache, _) = instance.object(a[0])? else { return Err(EINVAL) };
@@ -2154,7 +2287,7 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
                     FILL_AGAIN => crate::fs::cache::Filled::Again,
                     _ => return Err(EINVAL),
                 };
-                cache.filled(first, count, outcome)?;
+                cache.filled(first, count, outcome, Arc::as_ptr(&instance) as usize)?;
             } else {
                 cache.redirty(first, count)?;
             }
@@ -2467,6 +2600,20 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
         }
         _ => Err(ENOSYS),
     }
+}
+
+/// A cached object's size and times as `restricted::FileAttrs` (for
+/// `SYS_MO_ATTRS`, `SYS_MO_SHARED`'s query).
+fn file_attrs(cache: &PageCache) -> [u8; core::mem::size_of::<FileAttrs>()] {
+    let (t, size) = cache.times();
+    let set = |time: Option<i64>, bit: u64| if time.is_some() { bit } else { 0 };
+    let flags = set(t.atime, ATTR_ATIME) | set(t.mtime, ATTR_MTIME) | set(t.ctime, ATTR_CTIME) | if t.pending { ATTR_PENDING } else { 0 };
+    let words = [size, flags, t.atime.unwrap_or(0) as u64, t.mtime.unwrap_or(0) as u64, t.ctime.unwrap_or(0) as u64, t.seq];
+    let mut out = [0u8; core::mem::size_of::<FileAttrs>()];
+    for (i, w) in words.iter().enumerate() {
+        out[i * 8..i * 8 + 8].copy_from_slice(&w.to_le_bytes());
+    }
+    out
 }
 
 /// The thread `key` of `instance`'s programs (0: the caller).

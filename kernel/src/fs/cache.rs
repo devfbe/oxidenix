@@ -19,16 +19,29 @@
 //! program or the kernel (copying from a mapping). Supplied pages are
 //! committed and stay until the object goes.
 //!
-//! The cached store is a file the Linux server caches (its page cache of
-//! a disk file, `restricted::SYS_MO_CREATE_CACHED`): the file's size, its
-//! pages and which of them are dirty are kept here, the data comes from
-//! and goes to the disk through the server. A missing page is requested
-//! from the pager (or, for the server's own reads and writes, reported
-//! missing: `Fill::No`); the pager makes it *pending* (`pin_fill`: a zeroed
-//! frame, pinned for a grant, which no reader sees), has the disk server
-//! read into it by DMA and then declares it filled or failed (`filled`).
+//! The cached store is a disk file the Linux server instances cache (the
+//! page cache of a file of /data, `restricted::SYS_MO_SHARED`, ADR 0015):
+//! one object per file for the whole system, as Linux has one page cache
+//! per inode, shared by every instance that uses the file (its
+//! *sharers*), so that each tree sees the others' writes, sizes and
+//! stores through shared mappings at once. The objects are found by the
+//! file's id within its disk server (`shared`); a new one is made by its
+//! first sharer, which tells its size (`init`) before anyone else uses it.
+//! The file's size, its pages, which of them are dirty and the times its
+//! data changed (`FileTimes`) are kept here, the data comes from and goes
+//! to the disk through the instances. A missing page is requested from
+//! the pager of the instance that wants it (or, for the server's own reads
+//! and writes, reported missing: `Fill::No`); the pager makes it *pending*
+//! (`pin_fill`: a zeroed frame, pinned for a grant, which no reader sees),
+//! has the disk server read into it by DMA and then declares it filled or
+//! failed (`filled`); a fill another instance does not finish within
+//! `FILL_DEADLINE` is taken from it (its waiters ask their own pager), so
+//! no instance holds another's page for ever.
 //! Stores (writes, shared mappings) mark pages dirty, the object's first
-//! one tells the pager (`Pager::dirty`). A shared mapping maps a page
+//! one tells the pager of the sharer that made it dirty, which answers for
+//! the dirty pages (their count, their write-back: the *owner*) until the
+//! object is clean again or it lets go of the object (another sharer then
+//! takes them over, `Pager::dirty`). A shared mapping maps a page
 //! read-only until the first store, which marks it dirty (`set_dirty`).
 //! A store needs the page's disk space secured up to the file's end
 //! (`Page::backed`, delayed allocation): the server's writes check it
@@ -49,10 +62,13 @@
 //! to write back (`Pager::writeback`), and so do too many dirty pages
 //! (`balance_dirty`).
 //!
-//! Lock order: address space (sleeping) → `io` (sleeping) → `state` →
-//! frames. `io` serializes what changes contents or size (`write`,
-//! `truncate`); it is never held while an address space is locked. Cache
-//! hits only take `state`.
+//! Lock order: `append` (sleeping) → address space (sleeping) → `io`
+//! (sleeping) → `state` → frames. `append` makes an appending write one
+//! step for every appender of every instance (`append_lock`); `io`
+//! serializes what changes contents or size (`write`, `truncate`); it is
+//! never held while an address space is locked. Cache hits only take
+//! `state`. The registry of shared objects (`SHARED`, sleeping) is taken
+//! before any of them.
 
 use crate::memory;
 use crate::process::address_space::{Fault, Mm, PAGE};
@@ -179,9 +195,63 @@ enum Store {
     Memory { image: &'static [u8], prepaid: u64 },
     /// A pager in user space, which knows the object by `key`.
     Paged { pager: Weak<dyn Pager>, key: u64 },
-    /// A file the pager caches (see the module comment), known to it as
-    /// `key`, which may grow to `limit` bytes.
-    Cached { pager: Weak<dyn Pager>, key: u64, limit: u64, counts: Arc<CacheCounts> },
+    /// A file the instances cache (see the module comment), which may grow
+    /// to `limit` bytes (found by its disk server and id: `SHARED`). Its
+    /// sharers are in `State::sharers`.
+    Cached { limit: u64 },
+}
+
+/// A Linux server instance as a caller of the cached store's calls: its
+/// pager (the instance, whose address is its identity), the key it knows
+/// the object by (its events name it), and its counts of dirty and pinned
+/// pages (`CacheCounts`).
+#[derive(Clone)]
+pub struct Sharer {
+    pub pager: Weak<dyn Pager>,
+    pub key: u64,
+    pub counts: Arc<CacheCounts>,
+}
+
+impl Sharer {
+    /// The instance's identity (its address, as `pager_gone` names it).
+    pub fn id(&self) -> usize {
+        self.pager.as_ptr() as *const () as usize
+    }
+}
+
+/// An instance that holds a cached object (`State::sharers`): how many of
+/// its handles name the object. At the last one it lets go (`leave`).
+struct Member {
+    sharer: Sharer,
+    handles: usize,
+}
+
+/// How long the others wait for a fill or a backing an instance took on
+/// (or for a new object's size, `init`) before they do it themselves
+/// (ns): the instances answer in milliseconds, one that takes a minute
+/// hangs or withholds (as `fsclient`'s `REQUEST_TIMEOUT`).
+pub const FILL_DEADLINE: u64 = 60_000_000_000;
+
+/// The times a cached file's data changed, kept with its pages for every
+/// instance (`restricted::SYS_MO_ATTRS`): its disk server stamps its own
+/// time on the data when it reaches it, so these are what the file's
+/// times are until a write-back sent them (`SETTIMES`) and cleared them
+/// (`clear_times`). Seconds since 1970; None: not set here.
+#[derive(Clone, Copy, Default)]
+pub struct FileTimes {
+    pub atime: Option<i64>,
+    pub mtime: Option<i64>,
+    pub ctime: Option<i64>,
+    /// Data changed since the last whole write-back (the times wait for
+    /// it).
+    pub pending: bool,
+    /// Counts every change (a write-back clears only what it sent).
+    pub seq: u64,
+}
+
+/// The wall clock's seconds (the files' times).
+fn wall_secs() -> i64 {
+    (crate::time::realtime() / 1_000_000_000) as i64
 }
 
 struct Page {
@@ -206,11 +276,22 @@ struct Page {
     /// isolated pages): other reclaims leave it alone meanwhile (their own
     /// reference would keep each other from dropping it).
     isolated: bool,
+    /// Cached store: the instance filling it while `pending` (only its
+    /// answer counts, `filled`), and when the fill or the backing asked
+    /// for (`mkwrite`) began (`time::now`): past `FILL_DEADLINE` the
+    /// others stop waiting for it (`expired`).
+    filler: usize,
+    since: u64,
 }
 
 impl Page {
     fn new(frame: PhysFrame) -> Page {
-        Page { frame, referenced: true, dirty: false, pins: 0, pending: false, backed: 0, mkwrite: false, isolated: false }
+        Page { frame, referenced: true, dirty: false, pins: 0, pending: false, backed: 0, mkwrite: false, isolated: false, filler: 0, since: 0 }
+    }
+
+    /// Whether its fill or backing began longer than `FILL_DEADLINE` ago.
+    fn expired(&self, now: u64) -> bool {
+        now >= self.since.saturating_add(FILL_DEADLINE)
     }
 }
 
@@ -505,9 +586,21 @@ struct State {
     waits: Vec<Waiters>,
     /// Dirty pages (cached store).
     dirty: u64,
-    /// The pager let go of its last handle (`orphan`): it cannot answer
-    /// any more, so what is missing or unbacked never comes.
+    /// The pager let go of its last handle (`orphan`; a cached object: its
+    /// last sharer let go, `leave`): it cannot answer any more, so what is
+    /// missing or unbacked never comes.
     orphaned: bool,
+    /// Cached store: the instances holding it, in the order they came.
+    sharers: Vec<Member>,
+    /// The sharer that answers for the dirty pages (see the module
+    /// comment); after the last sharer left, the last one (its counts keep
+    /// what is left dirty until the object goes).
+    owner: Option<Sharer>,
+    /// A new object whose size is not known yet (`init`): who tells it,
+    /// and until when the others wait for it (`shared`).
+    init: Option<(usize, u64)>,
+    /// The times its data changed (`FileTimes`).
+    times: FileTimes,
 }
 
 /// The address spaces that map an object, in the order they registered
@@ -526,14 +619,32 @@ struct Mappers {
 pub struct PageCache {
     state: IrqSpinLock<State>,
     io: Mutex<()>,
+    /// Held by an appending write for the whole call (`append_lock`).
+    append: Mutex<()>,
     store: Store,
     /// Address spaces that map this file (see `register`).
     mappers: IrqSpinLock<Mappers>,
     /// Set once by `hang_up`: futex waits on this object fail (EPIPE).
     hung_up: core::sync::atomic::AtomicBool,
     /// The pager's handles that name this object (`handle_opened`): at
-    /// none left, it is orphaned (`orphan`).
+    /// none left, it is orphaned (`orphan`). (A cached object counts each
+    /// sharer's: `Member::handles`.)
     handles: AtomicUsize,
+}
+
+/// The cached objects by (disk server, file id): how instances find the
+/// one of a file another instance made (`PageCache::shared`). An entry
+/// whose object has no sharer left is as good as none (it is replaced);
+/// entries whose objects went are pruned as the map grows.
+static SHARED: Mutex<BTreeMap<(usize, u64), Weak<PageCache>>> = Mutex::new(BTreeMap::new());
+
+/// What `PageCache::shared` found or made.
+pub enum Opened {
+    /// The file's object, ready.
+    Joined(Arc<PageCache>),
+    /// A new object (or one whose maker did not tell its size in time):
+    /// the caller tells its size (`init`) before anyone uses it.
+    Made(Arc<PageCache>),
 }
 
 /// A tmpfs page charged to commit and tmpfs, released on drop unless kept.
@@ -609,8 +720,13 @@ impl PageCache {
                 waits: Vec::new(),
                 dirty: 0,
                 orphaned: false,
+                sharers: Vec::new(),
+                owner: None,
+                init: None,
+                times: FileTimes::default(),
             }),
             io: Mutex::new(()),
+            append: Mutex::new(()),
             store,
             mappers: IrqSpinLock::new(Mappers { list: Vec::new(), next: 0 }),
             hung_up: core::sync::atomic::AtomicBool::new(false),
@@ -658,24 +774,143 @@ impl PageCache {
         Ok(())
     }
 
-    /// A file of `size` bytes (at most `limit`) that `pager` caches and
-    /// knows as `key` (see the module comment).
-    pub fn cached(size: u64, limit: u64, pager: Weak<dyn Pager>, key: u64, counts: Arc<CacheCounts>) -> Result<Arc<PageCache>, i64> {
+    /// The cached object of file `file` of the disk server `service` (at
+    /// most `limit` bytes) for `me` (see the module comment): the one that
+    /// exists, joined, or (with `create`) a new one, which `me` must
+    /// `init`; ENOENT without `create` if there is none. A new object is
+    /// in the registry before its maker asks for its size, so a size read
+    /// after this call is the file's (an object that went before had its
+    /// data written back, or was not wanted), and nobody else uses it
+    /// before `init` (they wait here, up to `FILL_DEADLINE`, then make its
+    /// size known themselves). `me` is a sharer from here on (with no
+    /// handle yet: `handle_opened`, or `leave` if none comes). EINTR if the
+    /// thread dies while it waits.
+    pub fn shared(service: usize, file: u64, limit: u64, me: &Sharer, create: bool) -> Result<Opened, i64> {
         let limit = limit.min(MAX_SIZE);
-        if size > limit {
-            return Err(EFBIG);
+        let name = (service, file);
+        loop {
+            let mut registry = SHARED.lock();
+            let found = registry.get(&name).and_then(Weak::upgrade);
+            if let Some(cache) = found {
+                let wait = crate::process::sched::prepare_to_wait(cache.chan());
+                match cache.join(me) {
+                    Ok(Some(made)) => {
+                        drop(wait);
+                        return Ok(if made { Opened::Made(cache) } else { Opened::Joined(cache) });
+                    }
+                    // Its size is being made known: looked at again once it is (or the
+                    // maker's time is up).
+                    Ok(None) => {
+                        drop(registry);
+                        if crate::process::kill::dying() {
+                            return Err(EINTR);
+                        }
+                        let until = cache.state.lock().init.map_or(0, |(_, until)| until);
+                        drop(cache);
+                        wait.sleep_until(until);
+                        continue;
+                    }
+                    // No sharer left: a new one takes its place.
+                    Err(()) => {}
+                }
+            }
+            if !create {
+                return Err(ENOENT);
+            }
+            let cache = Self::new(Store::Cached { limit }, 0, 0)?;
+            {
+                let mut st = cache.state.lock();
+                st.sharers.try_reserve_exact(1).map_err(|_| ENOMEM)?;
+                st.sharers.push(Member { sharer: me.clone(), handles: 0 });
+                st.owner = Some(me.clone());
+                st.init = Some((me.id(), crate::time::now().saturating_add(FILL_DEADLINE)));
+            }
+            if registry.len() >= 64 && registry.len().is_power_of_two() {
+                registry.retain(|_, w| w.strong_count() > 0);
+            }
+            registry.insert(name, Arc::downgrade(&cache));
+            drop(registry);
+            Self::reclaimable(&cache)?;
+            return Ok(Opened::Made(cache));
         }
-        let cache = Self::new(Store::Cached { pager, key, limit, counts }, size, 0)?;
-        Self::reclaimable(&cache)?;
-        Ok(cache)
     }
 
-    /// A cached object's key.
-    pub fn cached_key(&self) -> Option<u64> {
-        match self.store {
-            Store::Cached { key, .. } => Some(key),
-            _ => None,
+    /// `me` joins the object: Some(whether it is to make the size known,
+    /// the maker's time being up), None while its maker does, Err if it has
+    /// no sharer left (gone for the registry).
+    fn join(&self, me: &Sharer) -> Result<Option<bool>, ()> {
+        let mut st = self.state.lock();
+        if st.orphaned || st.sharers.is_empty() {
+            return Err(());
         }
+        let mut made = false;
+        if let Some((maker, until)) = st.init {
+            if maker != me.id() && crate::time::now() < until {
+                return Ok(None);
+            }
+            st.init = Some((me.id(), crate::time::now().saturating_add(FILL_DEADLINE)));
+            made = true;
+        }
+        if !st.sharers.iter().any(|m| m.sharer.id() == me.id()) {
+            // (No memory for the entry: none taken.)
+            if st.sharers.try_reserve(1).is_err() {
+                return Err(());
+            }
+            st.sharers.push(Member { sharer: me.clone(), handles: 0 });
+        }
+        Ok(Some(made))
+    }
+
+    /// The size of a new object (`shared`'s `Made`), from its disk server;
+    /// the others may use it from now on. EALREADY (nothing changed) if it
+    /// was made known already.
+    pub fn init(&self, size: u64) -> Result<(), i64> {
+        let Store::Cached { limit, .. } = self.store else { return Err(EINVAL) };
+        {
+            let mut st = self.state.lock();
+            if st.init.is_none() {
+                return Err(EALREADY);
+            }
+            st.size = size.min(limit);
+            st.init = None;
+        }
+        crate::process::sched::wakeup(self.chan());
+        Ok(())
+    }
+
+    /// The cached object of file `file` of the disk server `service` if an
+    /// instance holds one and told its size (for the attributes of a file an
+    /// instance has no object of: `restricted::SHARED_QUERY`).
+    pub fn find_shared(service: usize, file: u64) -> Option<Arc<PageCache>> {
+        let cache = SHARED.lock().get(&(service, file)).and_then(Weak::upgrade)?;
+        let live = {
+            let st = cache.state.lock();
+            !st.orphaned && !st.sharers.is_empty() && st.init.is_none()
+        };
+        live.then_some(cache)
+    }
+
+    /// Instance `id` came to no handle of the object it joined (`shared`):
+    /// it lets go again, unless it holds the object through other handles.
+    pub fn unjoin(&self, id: usize) {
+        let unheld = self.state.lock().sharers.iter().any(|m| m.sharer.id() == id && m.handles == 0);
+        if unheld {
+            self.leave(id, false);
+        }
+    }
+
+    /// The key the calling instance knows a cached object by (vm_sync's
+    /// report), if it holds it.
+    pub fn cached_key(&self) -> Option<u64> {
+        let me = crate::process::linux::current_instance()?;
+        let st = self.state.lock();
+        st.sharers.iter().find(|m| m.sharer.id() == me).map(|m| m.sharer.key)
+    }
+
+    /// Where the threads waiting for a cached object's pages, backings or
+    /// size sleep (they come from any of its sharers).
+    fn chan(&self) -> usize {
+        &self.state as *const IrqSpinLock<State> as usize
     }
 
     /// Whether this is a cached store's object.
@@ -697,20 +932,47 @@ impl PageCache {
         }
     }
 
-    /// Wakes the threads waiting for this object's pages (they sleep on
-    /// the pager's channel, `Pager::wait_chan`).
+    /// Wakes the threads waiting for this object's pages (they sleep on a
+    /// paged object's pager's channel, `Pager::wait_chan`, or a cached
+    /// object's own, `chan`).
     fn wake_waiters(&self) {
-        if let Some(pager) = self.pager().and_then(|(p, _)| p.upgrade()) {
-            crate::process::sched::wakeup(pager.wait_chan());
+        match &self.store {
+            Store::Paged { pager, .. } => {
+                if let Some(pager) = pager.upgrade() {
+                    crate::process::sched::wakeup(pager.wait_chan());
+                }
+            }
+            Store::Cached { .. } => crate::process::sched::wakeup(self.chan()),
+            Store::Memory { .. } => {}
         }
     }
 
-    /// The pager of a paged or cached object, and its key.
-    fn pager(&self) -> Option<(&Weak<dyn Pager>, u64)> {
+    /// Whether its pages come from a pager (a paged or cached object).
+    fn has_pager(&self) -> bool {
+        !matches!(self.store, Store::Memory { .. })
+    }
+
+    /// The pager to ask for this object's pages and backings, and the key
+    /// it knows the object by: a paged object's; for a cached object that
+    /// of the calling instance `me` if it holds the object, else its first
+    /// sharer's (None: it has none left).
+    fn route(&self, st: &State, me: Option<usize>) -> Option<(Weak<dyn Pager>, u64)> {
         match &self.store {
-            Store::Paged { pager, key } | Store::Cached { pager, key, .. } => Some((pager, *key)),
+            Store::Paged { pager, key } => Some((pager.clone(), *key)),
+            Store::Cached { .. } => {
+                let own = me.and_then(|me| st.sharers.iter().find(|m| m.sharer.id() == me));
+                own.or(st.sharers.first()).map(|m| (m.sharer.pager.clone(), m.sharer.key))
+            }
             Store::Memory { .. } => None,
         }
+    }
+
+    /// `route` for the calling thread, with the pager taken (outside the
+    /// state's lock: the reference may be the instance's last).
+    fn route_now(&self) -> Option<(Arc<dyn Pager>, u64)> {
+        let me = crate::process::linux::current_instance();
+        let (pager, key) = self.route(&self.state.lock(), me)?;
+        Some((pager.upgrade()?, key))
     }
 
     /// A memory object of `pages` pages whose contents `pager` supplies
@@ -720,17 +982,107 @@ impl PageCache {
         Self::new(Store::Paged { pager, key }, size, 0)
     }
 
-    /// A handle of the pager's names this object (the Linux server's
+    /// A handle of instance `id` names this object (the Linux server's
     /// handle table holds it).
-    pub fn handle_opened(&self) {
+    pub fn handle_opened(&self, id: usize) {
+        if let Store::Cached { .. } = self.store {
+            if let Some(m) = self.state.lock().sharers.iter_mut().find(|m| m.sharer.id() == id) {
+                m.handles += 1;
+            }
+            return;
+        }
         self.handles.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// A handle of the pager's that named this object went: at the last,
-    /// a paged or cached object is orphaned (`orphan`).
-    pub fn handle_closed(&self) {
+    /// A handle of instance `id` that named this object went: at the
+    /// last, a paged object is orphaned (`orphan`), a cached object's
+    /// sharer lets go of it (`leave`).
+    pub fn handle_closed(&self, id: usize) {
+        if let Store::Cached { .. } = self.store {
+            let last = match self.state.lock().sharers.iter_mut().find(|m| m.sharer.id() == id) {
+                Some(m) => {
+                    m.handles = m.handles.saturating_sub(1);
+                    m.handles == 0
+                }
+                None => false,
+            };
+            if last {
+                self.leave(id, false);
+            }
+            return;
+        }
         if self.handles.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.orphan();
+        }
+    }
+
+    /// Instance `id` lets go of a cached object: its last handle went
+    /// (`dead`: its pager's process ended), or a `shared` it called came to
+    /// no handle. The dirty pages it answered for pass to the next sharer,
+    /// which is told (`Pager::dirty`); with `dead`, its fills in flight go
+    /// (missing again: their waiters ask their own pagers) and the
+    /// backings any pager was asked for are asked again (it may have been
+    /// asked: a living instance lets go only of objects it does not use,
+    /// so none of its fills or backings is in flight then). The object is
+    /// orphaned when its last sharer goes (no answer can come any more).
+    pub fn leave(&self, id: usize, dead: bool) {
+        let mut gone = Vec::new();
+        let (member, old_owner, notify, wake) = {
+            let mut st = self.state.lock();
+            let Some(at) = st.sharers.iter().position(|m| m.sharer.id() == id) else { return };
+            let member = st.sharers.remove(at);
+            let mut notify = None;
+            let mut old_owner = None;
+            if st.owner.as_ref().is_some_and(|o| o.id() == id) {
+                if let Some(next) = st.sharers.first() {
+                    let next = next.sharer.clone();
+                    if st.dirty > 0 {
+                        member.sharer.counts.dirty.fetch_sub(st.dirty, Ordering::Relaxed);
+                        next.counts.dirty.fetch_add(st.dirty, Ordering::Relaxed);
+                        notify = Some((next.pager.clone(), next.key));
+                    }
+                    old_owner = st.owner.replace(next);
+                }
+            }
+            let last = st.sharers.is_empty();
+            if last {
+                // (The dirty pages stay counted to the last owner's instance until the
+                // object goes: nobody writes them back, as after a crash.)
+                st.orphaned = true;
+            }
+            let mut wake = Wake(last && !st.waits.is_empty());
+            if dead || last {
+                let pending: Vec<u64> = st.pages.iter().filter(|(_, p)| p.pending && (last || p.filler == id)).map(|(&i, _)| i).collect();
+                for index in pending {
+                    if let Some(page) = st.pages.remove(&index) {
+                        if page.pins > 0 {
+                            PINNED.fetch_sub(1, Ordering::Relaxed);
+                        }
+                        gone.push(page.frame);
+                    }
+                    wake = wake.and(if last { st.fail_waiters(index, index + 1, EIO) } else { st.changed(index, index + 1) });
+                }
+                st.charged -= gone.len() as u64;
+            }
+            if dead && !last {
+                let asked: Vec<u64> = st.pages.iter().filter(|(_, p)| p.mkwrite).map(|(&i, _)| i).collect();
+                for index in asked {
+                    if let Some(page) = st.pages.get_mut(&index) {
+                        page.mkwrite = false;
+                    }
+                    wake = wake.and(st.changed(index, index + 1));
+                }
+            }
+            (member, old_owner, notify, wake)
+        };
+        drop((member, old_owner));
+        self.uncharge(gone.len() as u64);
+        free_frames(gone);
+        // (Waiters for its size, `shared`, look again too: the object they
+        // waited for may be gone for them.)
+        self.wake(wake.and(Wake(true)));
+        if let Some(pager) = notify.and_then(|(p, key)| p.upgrade().map(|p| (p, key))) {
+            pager.0.dirty(pager.1);
         }
     }
 
@@ -748,7 +1100,7 @@ impl PageCache {
     /// if the thread is dying (a pager that
     /// never answers must not leave it unkillable).
     fn wait_paged(&self, index: u64, backed: bool) -> Result<(), i64> {
-        if self.pager().is_none() {
+        if !self.has_pager() {
             return Ok(());
         }
         let seen = self.state.lock().enter_wait(index)?;
@@ -765,9 +1117,18 @@ impl PageCache {
     /// entered does (a fill's, or a backing's for a wait for the backing
     /// too, never another's: a reader does not fail for a store's full
     /// disk). The pager is asked for the page only if no request of this
-    /// thread is outstanding (one was answered or overtaken since).
+    /// thread is outstanding (one was answered or overtaken since). A
+    /// cached object's pager is the calling thread's instance's (`route`);
+    /// a fill or backing another instance took on and did not finish
+    /// within `FILL_DEADLINE` is taken from it (the page goes as missing
+    /// again, or its backing is asked again), so no instance keeps
+    /// another's thread waiting for ever.
     fn wait_registered(&self, index: u64, backed: bool, seen: Seen, mut asked: Option<u32>) -> Result<(), i64> {
-        let Some((pager, key)) = self.pager() else { return Ok(()) };
+        if !self.has_pager() {
+            return Ok(());
+        }
+        let cached = self.is_cached();
+        let me = crate::process::linux::current_instance();
         // What the pager is to be asked for.
         enum Ask {
             Nothing,
@@ -775,10 +1136,16 @@ impl PageCache {
             Backing,
         }
         loop {
+            // (Its last reference may go here: outside the state's lock.)
+            let route = self.route(&self.state.lock(), me);
+            let Some((pager, key)) = route.and_then(|(p, key)| Some((p.upgrade()?, key))) else { return Err(EIO) };
+            let mut taken = None;
             let done = x86_64::instructions::interrupts::without_interrupts(|| {
-                let Some(pager) = pager.upgrade() else { return Err(EIO) };
                 // Registered before looking, so an answer cannot slip by.
-                let wait = crate::process::sched::prepare_to_wait(pager.wait_chan());
+                let wait = crate::process::sched::prepare_to_wait(if cached { self.chan() } else { pager.wait_chan() });
+                let now = crate::time::now();
+                // When another instance's fill or backing is up (`FILL_DEADLINE`).
+                let mut until = None;
                 let ask = {
                     let mut st = self.state.lock();
                     let need = backing_need(st.size, index);
@@ -799,12 +1166,40 @@ impl PageCache {
                         return Err(st.waits.iter().find(|w| w.index == index).map_or(EIO, |w| w.fill_errno));
                     }
                     match st.pages.get_mut(&index) {
+                        // Another instance's fill that is up: the page goes as missing
+                        // again (its pin keeps the frame for that fill's grant; its
+                        // late answer finds the page gone or another's, `filled`), and
+                        // is asked for. (Its own instance's fills it waits for: a late
+                        // answer of its own could not be told from the new fill's.)
+                        Some(p) if cached && p.pending && Some(p.filler) != me && p.expired(now) => {
+                            let page = st.pages.remove(&index).expect("found above");
+                            if page.pins > 0 {
+                                PINNED.fetch_sub(1, Ordering::Relaxed);
+                            }
+                            st.charged -= 1;
+                            // (The other waiters look again: woken below.)
+                            let Wake(_) = st.changed(index, index + 1);
+                            taken = Some(page.frame);
+                            asked = Some(st.waited(index).1);
+                            Ask::Page
+                        }
+                        // A backing asked for longer ago than that: asked again.
+                        Some(p) if cached && p.mkwrite && p.expired(now) => {
+                            p.since = now;
+                            Ask::Backing
+                        }
                         // Being filled or backed: its answer comes without
-                        // asking, unless the pager is gone meanwhile.
-                        Some(p) if (p.pending || p.mkwrite) && !pager.alive() => return Err(EIO),
-                        Some(p) if p.pending || p.mkwrite => Ask::Nothing,
+                        // asking, unless the pager is gone meanwhile (a
+                        // cached object's: until its time is up).
+                        Some(p) if (p.pending || p.mkwrite) && !cached && !pager.alive() => return Err(EIO),
+                        Some(p) if p.pending || p.mkwrite => {
+                            let others = p.mkwrite || Some(p.filler) != me;
+                            until = (cached && others).then(|| p.since.saturating_add(FILL_DEADLINE));
+                            Ask::Nothing
+                        }
                         Some(p) => {
                             p.mkwrite = true;
+                            p.since = now;
                             Ask::Backing
                         }
                         // Its own request is still outstanding: the answer
@@ -817,6 +1212,11 @@ impl PageCache {
                         }
                     }
                 };
+                if let Some(frame) = taken.take() {
+                    memory::cache_uncharge(1);
+                    free_frames([frame]);
+                    self.wake_waiters();
+                }
                 if crate::process::kill::dying() {
                     if let Ask::Backing = ask {
                         if let Some(p) = self.state.lock().pages.get_mut(&index) {
@@ -833,10 +1233,13 @@ impl PageCache {
                 if !asked {
                     return Err(EIO);
                 }
-                drop(pager);
-                wait.sleep();
+                match until {
+                    Some(until) => wait.sleep_until(until),
+                    None => wait.sleep(),
+                }
                 Ok(false)
             });
+            drop(pager);
             match done {
                 Ok(false) => {}
                 Ok(true) => return Ok(()),
@@ -1049,7 +1452,7 @@ impl PageCache {
     /// `wait_paged` for page `index`, which returns its frame with a
     /// reference (None if it was cut off meanwhile).
     fn wait_frame(&self, index: u64) -> Result<Option<PhysFrame>, i64> {
-        if self.pager().is_none() {
+        if !self.has_pager() {
             return Ok(None);
         }
         let seen = self.state.lock().enter_wait(index)?;
@@ -1106,6 +1509,7 @@ impl PageCache {
     /// zeroed where the write covers all of its data, or filled by the
     /// pager), checked for its backing, written and marked dirty.
     fn write_cached(&self, off: u64, data: &[u8], fill: Fill, backing: Backing) -> Result<usize, i64> {
+        let me = crate::process::linux::current_instance();
         let io = self.io.lock();
         let end = off + data.len() as u64;
         let mut pos = off;
@@ -1143,9 +1547,7 @@ impl PageCache {
                         page.referenced = true;
                         if !page.dirty {
                             page.dirty = true;
-                            st.dirty += 1;
-                            first_dirty |= st.dirty == 1;
-                            self.dirty_added(1);
+                            first_dirty |= Self::add_dirty(&mut st, me, 1);
                         }
                         if pos > size {
                             Self::grow(&mut st, pos);
@@ -1191,6 +1593,9 @@ impl PageCache {
             }
         };
         drop(io);
+        if pos > off {
+            self.touch();
+        }
         if first_dirty {
             self.notify_dirty();
         }
@@ -1201,6 +1606,111 @@ impl PageCache {
             Err(e) if done == 0 => Err(e),
             Err(_) => Ok(done),
         }
+    }
+
+    /// The lock an appending write of a cached object holds for its whole
+    /// call (`restricted::SYS_MO_FILE_APPEND`): finding the end and writing
+    /// there is one step for every appender of every instance, as Linux's
+    /// inode lock makes it. Taken before anything else of the object's (and
+    /// the address space's, which copying the data may lock).
+    pub fn append_lock(&self) -> crate::sync::MutexGuard<'_, ()> {
+        self.append.lock()
+    }
+
+    /// Whether `len` bytes can be appended at `off` (the end, under the
+    /// append lock) with `backing` without asking a pager, so that the
+    /// write goes in whole: else the error and the byte to make ready from,
+    /// EAGAIN if the page holding the end must be filled first (its data
+    /// stays; with `Fill::Yes` the write waits for it instead), ENOSPC if
+    /// the space from there on is not secured (the caller secures it, as
+    /// for a write there, and appends again).
+    pub fn check_append(&self, off: u64, len: u64, backing: Backing, fill: Fill) -> Result<(), (i64, u64)> {
+        let Store::Cached { limit, .. } = self.store else { return Err((EINVAL, off)) };
+        let end = off.checked_add(len).filter(|&e| e <= limit).ok_or((EFBIG, off))?;
+        if len == 0 {
+            return Ok(());
+        }
+        let upto = match backing {
+            Backing::Vouched(upto) => upto,
+            _ => 0,
+        };
+        // Whether page `index` is backed for the write (the bytes of it that
+        // are file data once written).
+        let covered = |index: u64, backed: u64| {
+            let wanted = backing_need(end, index);
+            backing == Backing::Ignore || backed >= wanted || upto.saturating_sub(index * PAGE).min(PAGE) >= wanted
+        };
+        let st = self.state.lock();
+        let (first, last) = (page_of(off), page_of(end - 1));
+        for (&index, page) in st.pages.range(first..=last) {
+            // (A page being filled is written once it is.)
+            if !page.pending && !covered(index, page.backed as u64) {
+                return Err((ENOSPC, index * PAGE));
+            }
+        }
+        // The page holding the end keeps its data: it must be there.
+        if fill == Fill::No && off % PAGE != 0 && !st.pages.contains_key(&first) {
+            return Err((EAGAIN, first * PAGE));
+        }
+        // The pages to be made (absent ones beyond the end) are backed only
+        // as far as the caller vouches.
+        let made = if off % PAGE != 0 { first + 1 } else { first };
+        let absent = made <= last && (st.pages.range(made..=last).count() as u64) < last + 1 - made;
+        if absent && !covered(last, 0) {
+            return Err((ENOSPC, made * PAGE));
+        }
+        Ok(())
+    }
+
+    /// The file's data changed (a write, a store through a mapping): its
+    /// modification and change times are now, until a write-back gives
+    /// them to the disk (`FileTimes`), as Linux's `file_update_time`.
+    fn touch(&self) {
+        let now = wall_secs();
+        let mut st = self.state.lock();
+        let t = &mut st.times;
+        t.mtime = Some(now);
+        t.ctime = Some(now);
+        t.pending = true;
+        t.seq += 1;
+    }
+
+    /// The file's times as its data changed them (`FileTimes`), and its
+    /// size.
+    pub fn times(&self) -> (FileTimes, u64) {
+        let st = self.state.lock();
+        (st.times, st.size)
+    }
+
+    /// Sets the times given (`atime`, `mtime`, `ctime`; None: kept), with
+    /// `if_pending` only while data waits for a write-back (a change the
+    /// disk server made itself is the file's time otherwise). The new
+    /// sequence number.
+    pub fn set_times(&self, atime: Option<i64>, mtime: Option<i64>, ctime: Option<i64>, if_pending: bool) -> u64 {
+        let mut st = self.state.lock();
+        let t = &mut st.times;
+        if if_pending && !t.pending {
+            return t.seq;
+        }
+        t.atime = atime.or(t.atime);
+        t.mtime = mtime.or(t.mtime);
+        t.ctime = ctime.or(t.ctime);
+        t.seq += 1;
+        t.seq
+    }
+
+    /// A write-back gave the times to the disk server as they were at
+    /// `seq`: they are forgotten (and nothing waits for a write-back any
+    /// more), unless they changed since or, with `if_idle`, data waits for
+    /// a write-back. Whether they were.
+    pub fn clear_times(&self, seq: u64, if_idle: bool) -> bool {
+        let mut st = self.state.lock();
+        let t = &mut st.times;
+        if t.seq != seq || (if_idle && t.pending) {
+            return false;
+        }
+        *t = FileTimes { seq: t.seq, ..FileTimes::default() };
+        true
     }
 
     /// The file grew from `old_size`: the page that held its end may now
@@ -1296,56 +1806,50 @@ impl PageCache {
         Ok(())
     }
 
-    /// The instance's counts of a cached object.
-    fn counts(&self) -> Option<&CacheCounts> {
-        match &self.store {
-            Store::Cached { counts, .. } => Some(counts),
-            _ => None,
+    /// `pages` pages became dirty under `st`: counted for the instance
+    /// that answers for them (the owner, which the instance `me` that made
+    /// a clean object dirty becomes, if it holds the object) and for all.
+    /// Whether they are the object's first (the owner is to be told:
+    /// `notify_dirty`).
+    fn add_dirty(st: &mut State, me: Option<usize>, pages: u64) -> bool {
+        if pages == 0 {
+            return false;
         }
-    }
-
-    fn dirty_added(&self, pages: u64) {
+        let first = st.dirty == 0;
+        if first && st.owner.as_ref().map(Sharer::id) != me {
+            if let Some(m) = me.and_then(|me| st.sharers.iter().find(|m| m.sharer.id() == me)) {
+                // (The old owner's counts hold none of this object's pages now.)
+                st.owner = Some(m.sharer.clone());
+            }
+        }
+        st.dirty += pages;
+        if let Some(o) = &st.owner {
+            o.counts.dirty.fetch_add(pages, Ordering::Relaxed);
+        }
         DIRTY.fetch_add(pages, Ordering::Relaxed);
-        if let Some(c) = self.counts() {
-            c.dirty.fetch_add(pages, Ordering::Relaxed);
+        first
+    }
+
+    /// `pages` dirty pages were written back or cut off under `st`: no
+    /// longer counted for the owner; the caller counts them for all once
+    /// `st` is unlocked (`undirty`, which may wake throttled writers).
+    fn remove_dirty(st: &mut State, pages: u64) {
+        let pages = pages.min(st.dirty);
+        st.dirty -= pages;
+        if let Some(o) = &st.owner {
+            o.counts.dirty.fetch_sub(pages, Ordering::Relaxed);
         }
     }
 
-    fn dirty_removed(&self, pages: u64) {
-        if let Some(c) = self.counts() {
-            c.dirty.fetch_sub(pages, Ordering::Relaxed);
-        }
-        undirty(pages);
-    }
-
-    /// `pages` pages became pinned under a reservation (`reserve_pins`),
-    /// which already counts them for the instance.
-    fn pinned_added(&self, pages: u64) {
-        PINNED.fetch_add(pages, Ordering::Relaxed);
-    }
-
-    /// Returns the part of a reservation that was not pinned.
-    fn unreserve_pins(&self, pages: u64) {
-        if let Some(c) = self.counts() {
-            c.pinned.fetch_sub(pages, Ordering::Relaxed);
-        }
-    }
-
-    fn pinned_removed(&self, pages: u64) {
-        PINNED.fetch_sub(pages, Ordering::Relaxed);
-        if let Some(c) = self.counts() {
-            c.pinned.fetch_sub(pages, Ordering::Relaxed);
-        }
-    }
-
-    /// Reserves up to `want` pages of this object's instance's pins
-    /// (`pin_fill`, `pin_dirty`) in one atomic step, so concurrent fills
-    /// cannot together pass the limit; the caller returns what it did not
-    /// pin (`unreserve_pins`). EBUSY if none are left: never a wait here
-    /// (the caller may hold pins of its own in flight, which only it can
-    /// let go of); the server waits for its transfers and asks again.
-    fn reserve_pins(&self, want: u64) -> Result<u64, Scan> {
-        let Some(counts) = self.counts() else { return Ok(want) };
+    /// Reserves up to `want` pins of the instance whose `counts` they are
+    /// (`pin_fill`, `pin_dirty`: one per page a grant pins, wherever the
+    /// page is) in one atomic step, so concurrent fills cannot together
+    /// pass the limit; the caller returns what it did not pin
+    /// (`unreserve_pins`), the grant the rest when it ends (`unpin`).
+    /// EBUSY if none are left: never a wait here (the caller may hold pins
+    /// of its own in flight, which only it can let go of); the server
+    /// waits for its transfers and asks again.
+    fn reserve_pins(counts: &CacheCounts, want: u64) -> Result<u64, Scan> {
         let limit = CacheCounts::pinned_limit();
         let mut room = 0;
         let _ = counts.pinned.try_update(Ordering::AcqRel, Ordering::Acquire, |pinned| {
@@ -1358,12 +1862,17 @@ impl PageCache {
         Ok(room)
     }
 
-    /// Tells the pager that this object has a dirty page now (its first).
+    /// Returns the part of a reservation that was not pinned.
+    fn unreserve_pins(counts: &CacheCounts, pages: u64) {
+        counts.pinned.fetch_sub(pages, Ordering::Relaxed);
+    }
+
+    /// Tells the owner that this object has a dirty page now (its first,
+    /// or the dirty pages passed to it).
     fn notify_dirty(&self) {
-        if let Store::Cached { pager, key, .. } = &self.store {
-            if let Some(pager) = pager.upgrade() {
-                pager.dirty(*key);
-            }
+        let owner = self.state.lock().owner.clone();
+        if let Some(pager) = owner.as_ref().and_then(|o| o.pager.upgrade()) {
+            pager.dirty(owner.as_ref().map_or(0, |o| o.key));
         }
     }
 
@@ -1423,7 +1932,7 @@ impl PageCache {
             let gone = st.pages.split_off(&first_gone);
             debug_assert!(gone.values().all(|p| p.pins == 0), "truncation took a pinned page");
             let dirty = gone.values().filter(|p| p.dirty).count() as u64;
-            st.dirty -= dirty.min(st.dirty);
+            Self::remove_dirty(&mut st, dirty);
             let prepaid = self.prepaid();
             let charged = gone.keys().filter(|&&i| i >= prepaid).count() as u64;
             st.charged -= charged;
@@ -1431,7 +1940,7 @@ impl PageCache {
             st.image_len = st.image_len.min(len);
             let wake = st.changed(first_gone, u64::MAX);
             drop(st);
-            self.dirty_removed(dirty);
+            undirty(dirty);
             free_frames(gone.into_values().map(|p| p.frame));
             self.uncharge(charged);
             (first_gone, wake)
@@ -1478,7 +1987,7 @@ impl PageCache {
     /// once it holds no lock the pager may need (the address space's),
     /// then tries again.
     pub fn try_map_page(self: &Arc<Self>, index: u64, wait: bool) -> Result<Lookup, Fault> {
-        if wait || self.pager().is_none() {
+        if wait || !self.has_pager() {
             return self.map_page(index).map(Lookup::Frame);
         }
         if index >= page_of(self.size().saturating_add(PAGE - 1)) {
@@ -1519,9 +2028,11 @@ impl PageCache {
     /// asks is among the page's waiters already (`PageWait`), so a failed
     /// fill fails its wait.
     fn request_page(&self, index: u64) -> Result<(), i64> {
-        let Some((pager, key)) = self.pager() else { return Ok(()) };
-        match pager.upgrade() {
-            Some(pager) if pager.request(key, index) => Ok(()),
+        if !self.has_pager() {
+            return Ok(());
+        }
+        match self.route_now() {
+            Some((pager, key)) if pager.request(key, index) => Ok(()),
             _ => Err(EIO),
         }
     }
@@ -1594,16 +2105,21 @@ impl PageCache {
     }
 
     /// Ends a pin of `pin`, `pin_fill` or `pin_dirty` (with the frame it
-    /// returned). A failed fill's page may be gone already (`filled`): then
-    /// only the pin's reference goes.
-    pub fn unpin(&self, index: u64, frame: PhysFrame) {
+    /// returned; the latter two with the `counts` of the instance that
+    /// pinned, `reserve_pins`). A failed fill's page may be gone already
+    /// (`filled`, a fill taken over, its filler gone): then only the pin's
+    /// reference goes.
+    pub fn unpin(&self, index: u64, frame: PhysFrame, counts: Option<&CacheCounts>) {
+        if let Some(c) = counts {
+            c.pinned.fetch_sub(1, Ordering::Relaxed);
+        }
         {
             let mut st = self.state.lock();
             match st.pages.get_mut(&index) {
                 Some(page) if page.frame == frame && page.pins > 0 => {
                     page.pins -= 1;
                     if page.pins == 0 && self.is_cached() {
-                        self.pinned_removed(1);
+                        PINNED.fetch_sub(1, Ordering::Relaxed);
                     }
                 }
                 _ => debug_assert!(self.is_cached(), "unpinning a page that is not pinned"),
@@ -1618,7 +2134,9 @@ impl PageCache {
     /// and pinned. Returns the run's first page, its frames (each with a
     /// reference for the grant) and the file's size; ENOENT if no page of
     /// the window is missing, ENOMEM if not even one page can be cached.
-    pub fn pin_fill(&self, first: u64, window: u64) -> Result<(u64, Vec<PhysFrame>, u64), Scan> {
+    /// The pages are the instance `me`'s to fill (only its `filled` counts
+    /// for them), their pins counted in its `counts`.
+    pub fn pin_fill(&self, first: u64, window: u64, me: usize, counts: &CacheCounts) -> Result<(u64, Vec<PhysFrame>, u64), Scan> {
         if !self.is_cached() {
             return Err(Scan::Errno(EINVAL));
         }
@@ -1673,7 +2191,7 @@ impl PageCache {
             }
         }
         // The pins for what it got; frames beyond the instance's room go.
-        let reserved = match self.reserve_pins(frames.len() as u64) {
+        let reserved = match Self::reserve_pins(counts, frames.len() as u64) {
             // (No frame: ENOMEM below, no pins.)
             _ if frames.is_empty() => 0,
             Ok(reserved) => reserved,
@@ -1686,6 +2204,7 @@ impl PageCache {
         memory::cache_charge(frames.len() as u64);
         let count = frames.len() as u64;
         // The run as it is now: a page may have come or the file shrunk.
+        let now = crate::time::now();
         let mut st = self.state.lock();
         let size = st.size;
         let last = page_of(st.size.saturating_add(PAGE - 1));
@@ -1695,11 +2214,11 @@ impl PageCache {
             if index >= last || st.pages.contains_key(&index) {
                 break;
             }
-            st.pages.insert(index, Page { pins: 1, pending: true, ..Page::new(frame) });
+            st.pages.insert(index, Page { pins: 1, pending: true, filler: me, since: now, ..Page::new(frame) });
             taken += 1;
         }
-        self.pinned_added(taken as u64);
-        self.unreserve_pins(reserved - taken as u64);
+        PINNED.fetch_add(taken as u64, Ordering::Relaxed);
+        Self::unreserve_pins(counts, reserved - taken as u64);
         st.charged += taken as u64;
         let wake = st.changed(start, start + taken as u64);
         drop(st);
@@ -1727,8 +2246,11 @@ impl PageCache {
     /// (whoever waits for them gets the error, EIO or ENOMEM, a later
     /// access asks again; so a pager that cannot even start a fill
     /// answers), or, `Again`, go as missing (their waiters ask again).
-    /// Present pages are left alone. Wakes the waiters.
-    pub fn filled(&self, first: u64, count: u64, outcome: Filled) -> Result<(), i64> {
+    /// Present pages are left alone, and so are pages another instance
+    /// fills (only the answer of `filler`, which made them pending, counts:
+    /// a fill taken from it, `wait_registered`, is another's now). Wakes
+    /// the waiters.
+    pub fn filled(&self, first: u64, count: u64, outcome: Filled, filler: usize) -> Result<(), i64> {
         let ok = outcome == Filled::Ok;
         let Store::Cached { .. } = &self.store else { return Err(EINVAL) };
         if count > MAX_RUN {
@@ -1741,7 +2263,7 @@ impl PageCache {
             let st = &mut *st;
             // Only pages of the file: none lives beyond, nobody waits there.
             let end = end.min(page_of(st.size.saturating_add(PAGE - 1)));
-            let pending: Vec<u64> = st.pages.range(first..end.max(first)).filter(|(_, p)| p.pending).map(|(&i, _)| i).collect();
+            let pending: Vec<u64> = st.pages.range(first..end.max(first)).filter(|(_, p)| p.pending && p.filler == filler).map(|(&i, _)| i).collect();
             for index in pending {
                 if ok {
                     if let Some(page) = st.pages.get_mut(&index) {
@@ -1751,7 +2273,7 @@ impl PageCache {
                     // A pin keeps its own reference (`unpin`, which finds
                     // the page gone: it is no longer pinned memory).
                     if page.pins > 0 {
-                        self.pinned_removed(1);
+                        PINNED.fetch_sub(1, Ordering::Relaxed);
                     }
                     gone.push(page.frame);
                 }
@@ -1779,16 +2301,17 @@ impl PageCache {
     /// reference each for the grant, and the file's size then (their data
     /// ends there: a write extends the size as it dirties a page, so a
     /// size read before the run could cut off data); ENOENT if none is
-    /// dirty.
-    pub fn pin_dirty(&self, first: u64, window: u64) -> Result<(u64, Vec<PhysFrame>, u64), Scan> {
+    /// dirty. Any sharer writes back any dirty page (its pins counted in
+    /// its `counts`).
+    pub fn pin_dirty(&self, first: u64, window: u64, counts: &CacheCounts) -> Result<(u64, Vec<PhysFrame>, u64), Scan> {
         if !self.is_cached() {
             return Err(Scan::Errno(EINVAL));
         }
         let end = first.saturating_add(window);
-        let room = self.reserve_pins(window.min(MAX_RUN))?;
+        let room = Self::reserve_pins(counts, window.min(MAX_RUN))?;
         let mut frames = Vec::new();
         if frames.try_reserve_exact(room as usize).is_err() {
-            self.unreserve_pins(room);
+            Self::unreserve_pins(counts, room);
             return Err(Scan::Errno(ENOMEM));
         }
         let mut newly = 0;
@@ -1815,15 +2338,16 @@ impl PageCache {
                 frames.push(page.frame);
             }
             let Some(start) = start else { return Err(Scan::Errno(ENOENT)) };
-            st.dirty -= (frames.len() as u64).min(st.dirty);
+            Self::remove_dirty(&mut st, frames.len() as u64);
             Ok((start, size))
         })();
-        // Pinned now: the pages that were not before (the reservation
-        // counted them for the instance); the rest of it goes back.
-        self.pinned_added(newly);
-        self.unreserve_pins(room - newly);
+        // Pinned now: each page is a pin of the instance's (the rest of the
+        // reservation goes back), the pages that were not pinned before are
+        // more pinned memory.
+        PINNED.fetch_add(newly, Ordering::Relaxed);
+        Self::unreserve_pins(counts, room - frames.len() as u64);
         let (start, size) = run?;
-        self.dirty_removed(frames.len() as u64);
+        undirty(frames.len() as u64);
         memory::with_frames(|f| frames.iter().for_each(|&frame| f.share(frame)));
         let pages: Vec<u64> = (start..start + frames.len() as u64).collect();
         self.write_protect(&pages);
@@ -1841,7 +2365,7 @@ impl PageCache {
             for index in pending {
                 if let Some(page) = st.pages.remove(&index) {
                     if page.pins > 0 {
-                        self.pinned_removed(1);
+                        PINNED.fetch_sub(1, Ordering::Relaxed);
                     }
                     gone.push(page.frame);
                 }
@@ -1854,14 +2378,14 @@ impl PageCache {
         self.wake(wake);
     }
 
-    /// The pager let go of its last handle to this paged or cached object
-    /// (the Linux server dropped the file's inode, which nothing maps or
-    /// holds any more): no answer can come for it, since every answer
-    /// names a handle. A thread still waiting for one of its pages or
-    /// their backing (a fault whose mapping went meanwhile) gets EIO
-    /// instead of sleeping on; so do later waits, and pending fills go.
+    /// The pager let go of its last handle to this paged object: no answer
+    /// can come for it, since every answer names a handle. A thread still
+    /// waiting for one of its pages (a fault whose mapping went meanwhile)
+    /// gets EIO instead of sleeping on; so do later waits, and pending
+    /// fills go. (A cached object is orphaned when its last sharer lets go,
+    /// `leave`.)
     pub fn orphan(&self) {
-        if self.pager().is_none() {
+        if !self.has_pager() {
             return;
         }
         let wake = {
@@ -1882,6 +2406,7 @@ impl PageCache {
             return Err(EINVAL);
         }
         first.checked_add(count).ok_or(EINVAL)?;
+        let me = crate::process::linux::current_instance();
         let first_dirty = {
             let mut st = self.state.lock();
             let mut marked = 0;
@@ -1891,20 +2416,12 @@ impl PageCache {
                     marked += 1;
                 }
             }
-            let was = st.dirty;
-            st.dirty += marked;
-            self.dirty_added(marked);
-            was == 0 && marked > 0
+            Self::add_dirty(&mut st, me, marked)
         };
         if first_dirty {
             self.notify_dirty();
         }
         Ok(())
-    }
-
-    /// Dirty pages of this object (cached store).
-    pub fn dirty_pages(&self) -> u64 {
-        self.state.lock().dirty
     }
 
     /// Ends futex waits on this object for good: waiters wake (the caller
@@ -2063,13 +2580,15 @@ impl PageCache {
     /// mark is set (for a page whose store was backed before:
     /// `AddressSpace::store_to_file`).
     pub fn set_dirty(self: &Arc<Self>, index: u64, backed: bool) -> Dirtied {
-        let Store::Cached { pager, key, .. } = &self.store else { return Dirtied::Gone };
+        let Store::Cached { .. } = &self.store else { return Dirtied::Gone };
         enum Step {
-            Dirty { first: bool },
+            /// Marked dirty (`newly`: it was clean), the object's `first`.
+            Dirty { newly: bool, first: bool },
             /// Not backed; whether the pager must be asked (it was not
             /// yet), and the failures the store has seen as a waiter.
             Unbacked { ask: bool, seen: Seen },
         }
+        let me = crate::process::linux::current_instance();
         let step = {
             let mut st = self.state.lock();
             let need = backing_need(st.size, index);
@@ -2080,19 +2599,25 @@ impl PageCache {
                 let Ok(seen) = st.enter_wait(index) else { return Dirtied::Oom };
                 let page = st.pages.get_mut(&index).expect("found above");
                 let ask = !page.mkwrite;
-                page.mkwrite = true;
+                if ask {
+                    page.mkwrite = true;
+                    page.since = crate::time::now();
+                }
                 Step::Unbacked { ask, seen }
             } else if page.dirty {
-                Step::Dirty { first: false }
+                Step::Dirty { newly: false, first: false }
             } else {
                 st.pages.get_mut(&index).expect("found above").dirty = true;
-                self.dirty_added(1);
-                st.dirty += 1;
-                Step::Dirty { first: st.dirty == 1 }
+                Step::Dirty { newly: true, first: Self::add_dirty(&mut st, me, 1) }
             }
         };
         match step {
-            Step::Dirty { first } => {
+            Step::Dirty { newly, first } => {
+                // A store to a clean page: the file changed (Linux's
+                // `page_mkwrite` updates the times there too).
+                if newly {
+                    self.touch();
+                }
                 if first {
                     self.notify_dirty();
                 }
@@ -2101,7 +2626,7 @@ impl PageCache {
             Step::Unbacked { ask, seen } => {
                 // Made with the state unlocked: dropping it locks it.
                 let wait = PageWait { cache: self.clone(), index, backed: true, seen, asked: None };
-                if !ask || pager.upgrade().is_some_and(|p| p.mkwrite(*key, index)) {
+                if !ask || self.route_now().is_some_and(|(p, key)| p.mkwrite(key, index)) {
                     return Dirtied::Unbacked(wait);
                 }
                 if let Some(page) = self.state.lock().pages.get_mut(&index) {
@@ -2244,10 +2769,10 @@ pub fn balance_dirty(dirtied: &PageCache) {
     }
     let memory = memory::user_pages();
     let (background, hard) = (memory / BACKGROUND, memory / HARD);
-    // The share of the instance that owns the file the store dirtied (it
-    // was charged for the page, whoever stored).
-    let own = dirtied.counts();
-    let own_over = || own.is_some_and(|c| c.dirty.load(Ordering::Relaxed) > CacheCounts::dirty_limit());
+    // The share of the instance that answers for the dirty pages of the
+    // file the store dirtied (it was charged for the page, whoever stored).
+    let own = dirtied.state.lock().owner.as_ref().map(|o| o.counts.clone());
+    let own_over = || own.as_ref().is_some_and(|c| c.dirty.load(Ordering::Relaxed) > CacheCounts::dirty_limit());
     // Committed memory and the cache pages reclaim cannot drop together
     // beyond the limit: the frames promised could not all be had (a
     // promise only the strict overcommit mode makes).
@@ -2283,19 +2808,17 @@ pub fn balance_dirty(dirtied: &PageCache) {
     }
 }
 
-/// The pager at `pager` (its data pointer) is gone: the pending pages of
-/// its cached objects will never be filled (their waiters fail).
+/// The pager at `pager` (its data pointer, an instance's identity) is
+/// gone: it lets go of every cached object it shared (`leave`: its fills
+/// in flight go, their waiters ask their own pagers or, where no sharer is
+/// left, fail; its dirty pages pass to another sharer).
 pub fn pager_gone(pager: *const ()) {
     let mut i = CACHES.lock().len();
     while i > 0 {
         i -= 1;
         let cache = CACHES.lock().get(i).and_then(Weak::upgrade);
         if let Some(cache) = cache {
-            if let Store::Cached { pager: p, .. } = &cache.store {
-                if p.as_ptr() as *const () == pager {
-                    cache.abandon_pending();
-                }
-            }
+            cache.leave(pager as usize, true);
         }
     }
 }
@@ -2308,18 +2831,21 @@ pub fn ask_writeback(pages: u64) {
     }
 }
 
-/// Asks the pagers whose cached objects have dirty pages to write back
-/// about `pages` of them (each pager queues one request at a time).
+/// Asks the pagers that answer for cached objects with dirty pages (their
+/// owners) to write back about `pages` of them (each pager queues one
+/// request at a time).
 fn ask_pagers(pages: u64) {
     let mut i = CACHES.lock().len();
     while i > 0 {
         i -= 1;
         let cache = CACHES.lock().get(i).and_then(Weak::upgrade);
         if let Some(cache) = cache {
-            if let (Store::Cached { pager, .. }, true) = (&cache.store, cache.dirty_pages() > 0) {
-                if let Some(pager) = pager.upgrade() {
-                    pager.writeback(pages);
-                }
+            let owner = {
+                let st = cache.state.lock();
+                if st.dirty == 0 { None } else { st.owner.as_ref().map(|o| o.pager.clone()) }
+            };
+            if let Some(pager) = owner.and_then(|p| p.upgrade()) {
+                pager.writeback(pages);
             }
         }
     }
@@ -2436,18 +2962,21 @@ fn reclaim(want: u64, force: bool) -> u64 {
 
 impl Drop for PageCache {
     fn drop(&mut self) {
-        let (pages, charged) = {
+        let (pages, charged, dirty) = {
             let mut st = self.state.lock();
-            (core::mem::take(&mut st.pages), st.charged)
+            let pages = core::mem::take(&mut st.pages);
+            let dirty = pages.values().filter(|p| p.dirty).count() as u64;
+            Self::remove_dirty(&mut st, dirty);
+            (pages, st.charged, dirty)
         };
         // Dirty pages go with the object: the Linux server writes a file
         // back before it lets go of its object (`datafs::evict`, at the
         // instance's end), or does not want the data (an unlinked file);
-        // what an instance that died without writing back left is lost, as
+        // what instances that died without writing back left is lost, as
         // on a crash.
-        self.dirty_removed(pages.values().filter(|p| p.dirty).count() as u64);
+        undirty(dirty);
         if self.is_cached() {
-            self.pinned_removed(pages.values().filter(|p| p.pins > 0).count() as u64);
+            PINNED.fetch_sub(pages.values().filter(|p| p.pins > 0).count() as u64, Ordering::Relaxed);
         }
         free_frames(pages.into_values().map(|p| p.frame));
         self.uncharge(charged);
