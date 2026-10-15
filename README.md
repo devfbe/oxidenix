@@ -143,7 +143,9 @@ On the first run it also creates `disk.img`, a 2 GiB ext2 data disk with an ext3
 mount). This file is
 kept between runs; delete it for a fresh disk. A `disk.img` from before the disk grew from 64 MiB
 to 2 GiB stays 64 MiB (the builder points it out): delete it to get the bigger one.
-Extra arguments after `--` are passed to QEMU; `OXIDENIX_BUILD_ONLY=1 cargo run` only builds the images.
+Extra arguments after `--` are passed to QEMU, in test mode too (say, `-cpu max,-x2apic` or
+`-machine hpet=off` for the other APIC mode and time source, ADR 0016); `OXIDENIX_ACCEL=tcg`
+emulates even where KVM is available; `OXIDENIX_BUILD_ONLY=1 cargo run` only builds the images.
 `OXIDENIX_DISK=<path>` uses another data disk image (created if missing). Test mode
 (`OXIDENIX_TEST=1`) never touches `disk.img`: it boots with a fresh 64 MiB disk of its own,
 `target/test-disk.img`, made anew on every run.
