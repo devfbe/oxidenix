@@ -240,17 +240,25 @@ fn time(tloc: u64) -> Result<i64, i64> {
 /// clock_nanosleep(clock, flags, request, remain), and nanosleep (on the
 /// monotonic clock). An absolute sleep on the wall clock ends at the
 /// monotonic time that corresponds to it when the sleep starts. A
-/// relative sleep cut short by a signal stores the time left.
+/// relative sleep cut short by a signal stores the time left. A sleep on a
+/// CPU clock (the process's, another process's or another thread's) is the
+/// timer thread's to end (`timer::cpu_nanosleep`).
 fn clock_nanosleep(id: u64, flags: u64, req: u64, rem: u64) -> Result<i64, i64> {
+    /// Linux's CLOCKFD: a negative id of a dynamic (posix_clock) clock, which no sleep has.
+    const CLOCKFD: i64 = 3;
     let realtime = match id as i32 as i64 {
         CLOCK_REALTIME | CLOCK_REALTIME_ALARM | CLOCK_TAI => true,
         CLOCK_MONOTONIC | CLOCK_BOOTTIME | CLOCK_BOOTTIME_ALARM => false,
+        // (No sleep on the calling thread's own clock: clock_nanosleep(2).)
         CLOCK_THREAD_CPUTIME_ID => return Err(EINVAL),
-        _ => {
-            // Valid clocks without sleeps (CPU time, coarse, raw).
-            clock(id)?;
-            return Err(EOPNOTSUPP);
+        cpu if cpu == CLOCK_PROCESS_CPUTIME_ID || (cpu < 0 && cpu & 7 != CLOCKFD) => {
+            let t = read_timespec(req)?;
+            return crate::timer::cpu_nanosleep(cpu as i32, flags & TIMER_ABSTIME != 0, t, rem);
         }
+        // The coarse and raw clocks and dynamic clocks have no sleep.
+        CLOCK_MONOTONIC_RAW | CLOCK_REALTIME_COARSE | CLOCK_MONOTONIC_COARSE => return Err(EOPNOTSUPP),
+        id if id < 0 => return Err(EOPNOTSUPP),
+        _ => return Err(EINVAL),
     };
     let t = read_timespec(req)?;
     let now = clock(CLOCK_MONOTONIC as u64)?;

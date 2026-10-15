@@ -865,6 +865,15 @@ timerfds' expiries to their pollers (`timerfd.rs`).
   interrupted; a deadline reached disarms and advances and wakes the timer thread's word.
   The kernel knows no timer, interval or signal (R9). User time is the program's: the
   server's time on a thread is the system time of its calls, as Linux's kernel time.
+- **Sleeps on CPU clocks** (`clock_nanosleep` on `CLOCK_PROCESS_CPUTIME_ID` or another
+  process's or thread's clock; the calling thread's own is EINVAL, as Linux's
+  posix_cpu_nsleep: it would never advance) are Linux's temporary CPU timer: the sleeper's
+  thread record names the clock and the deadline (`timer::CpuSleep`), the timer thread
+  wants that clock's alarm like a timer's and, once the clock reached it, wakes the
+  sleeper's word (in its server block). Interrupted, a relative sleep stores the CPU time
+  left and goes on to the same deadline by `restart_syscall`; an absolute one restarts as
+  it is. A sleep on the clock of a process or thread that ended waits for a signal, then
+  answers 0, as Linux's.
 - **Signals**: `ITIMER_REAL` and the POSIX timers reload when their signal is taken
   (delivered or returned by `sigtimedwait`), so a tiny interval costs one expiry per signal
   handled; a POSIX timer's signal tells the periods missed meanwhile (`si_overrun`,

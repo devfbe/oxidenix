@@ -273,6 +273,8 @@ pub struct Thread {
     /// What its thread pidfds watch, made with the first; a thread that does not lead its
     /// process only (the main thread's is `Proc::main_watch`).
     pub watch: Option<Arc<Watch>>,
+    /// Its sleep on a CPU clock (clock_nanosleep), which the timer thread ends.
+    pub cpu_sleep: Option<crate::timer::CpuSleep>,
 }
 
 pub struct Table {
@@ -571,7 +573,7 @@ pub fn register_init(key: u64) {
         };
         t.procs.insert(pid, p);
         let serial = t.new_serial();
-        t.threads.insert(pid, Thread { tid: pid, pid, key, fs, files: Some(files), limits, comm: comm_from("init"), sig: signal::ThreadSignals::default(), exited: false, serial, reserved, robust: 0, cpu: Default::default(), watch: None });
+        t.threads.insert(pid, Thread { tid: pid, pid, key, fs, files: Some(files), limits, comm: comm_from("init"), sig: signal::ThreadSignals::default(), exited: false, serial, reserved, robust: 0, cpu: Default::default(), watch: None, cpu_sleep: None });
         t.keys.insert(key, pid);
         local::set(pid, pid, key, fs_ptr, files_ptr, limits_ptr);
     }
@@ -946,7 +948,7 @@ fn clone(s: &State, c: Clone) -> Result<i64, i64> {
         }
         let serial = t.new_serial();
         // (No robust list: a fork's or a thread's starts without one, as Linux's copy_process.)
-        t.threads.insert(tid, Thread { tid, pid, key: 0, fs, files: Some(files), limits, comm, sig: thread_sig, exited: false, serial, reserved: true, robust: 0, cpu: Default::default(), watch: None });
+        t.threads.insert(tid, Thread { tid, pid, key: 0, fs, files: Some(files), limits, comm, sig: thread_sig, exited: false, serial, reserved: true, robust: 0, cpu: Default::default(), watch: None, cpu_sleep: None });
         serial
     };
     // CLONE_PIDFD: the child's pidfd in the caller's table (with CLONE_THREAD a thread

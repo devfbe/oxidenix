@@ -137,7 +137,7 @@ int main(void) {
     start = ns(CLOCK_MONOTONIC);
     r = clock_nanosleep(CLOCK_BOOTTIME, 0, &rel, NULL);
     check("clock_nanosleep(CLOCK_BOOTTIME) sleeps", r == 0 && ns(CLOCK_MONOTONIC) - start >= 2000000);
-    check("clock_nanosleep on a CPU clock is refused", clock_nanosleep(CLOCK_THREAD_CPUTIME_ID, 0, &rel, NULL) == EINVAL);
+    check("clock_nanosleep on the thread's CPU clock is refused", clock_nanosleep(CLOCK_THREAD_CPUTIME_ID, 0, &rel, NULL) == EINVAL);
     struct timespec bad = {0, 1000000000};
     check("nanosleep with tv_nsec >= 1e9 fails with EINVAL", nanosleep(&bad, NULL) == -1 && errno == EINVAL);
 

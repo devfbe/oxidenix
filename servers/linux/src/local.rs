@@ -42,6 +42,9 @@ pub struct Local {
     /// The test hook `TEST_FAIL_NTH`: the thread's fallible allocations
     /// still to come before the one that fails (0: none armed).
     pub fail_nth: AtomicU32,
+    /// Advanced by the timer thread when the thread's sleep on a CPU clock is over
+    /// (`timer::CpuSleep`); the thread sleeps on it.
+    pub cpu_sleep: AtomicU32,
 }
 
 const _: () = assert!(SERVER_LOCAL_OFFSET as usize + core::mem::size_of::<Local>() <= 4096);
