@@ -170,11 +170,14 @@ pub fn has_members() -> bool {
 /// for a member without room (or memory) for it.
 fn broadcast(group: u32, from: u32, data: &[u8]) {
     let bit = group_bit(group);
-    let members: Vec<Arc<NetlinkSocket>> = {
+    // (Room for them first, outside the lock; without it nobody hears it,
+    // as when no member has room.)
+    let Ok(mut members) = heap::try_vec::<Arc<NetlinkSocket>>(MEMBERS.lock().len()) else { return };
+    {
         let mut list = MEMBERS.lock();
         list.retain(|w| w.strong_count() > 0);
-        list.iter().filter_map(Weak::upgrade).collect()
-    };
+        members.extend(list.iter().filter_map(Weak::upgrade).take(members.capacity()));
+    }
     for m in members {
         let (member, port) = {
             let st = m.state.lock();
