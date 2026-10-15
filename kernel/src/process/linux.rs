@@ -397,6 +397,9 @@ pub struct Instance {
     /// The word of the server's that a CPU-time alarm advances and wakes when it fires
     /// (`SYS_CPU_ALARM`; 0: none yet).
     cpu_word: core::sync::atomic::AtomicU64,
+    /// The tree's share of the task table, with its reserve
+    /// (`sched::TREE_RESERVE`): its programs' processes and its pager's.
+    task_share: super::sched::OpenShare,
 }
 
 /// A memory object mapped into the region (`Instance::map_object`).
@@ -499,6 +502,8 @@ impl Instance {
     /// A new instance with the server's program loaded.
     pub fn new() -> Result<Arc<Instance>, i64> {
         let image = IMAGE.get().ok_or(ENOEXEC)?;
+        // No tree starts that could not have its reserve of the task table.
+        let task_share = super::sched::OpenShare::open(super::sched::TREE_RESERVE)?;
         let host = Arc::try_new(core::sync::atomic::AtomicBool::new(false)).map_err(|_| ENOMEM)?;
         let view = zeroed_frame()?;
         let pdpt = match zeroed_frame() {
@@ -554,6 +559,7 @@ impl Instance {
             init_args: spin::Mutex::new(Vec::new()),
             broken: core::sync::atomic::AtomicBool::new(false),
             cpu_word: core::sync::atomic::AtomicU64::new(0),
+            task_share,
         };
         instance.entry = instance.load(image)?;
         // The heap's reserve as far as there is room (none: the tree starts
@@ -1233,6 +1239,11 @@ impl Instance {
         if self.programs.fetch_sub(1, core::sync::atomic::Ordering::AcqRel) == 1 {
             self.close();
         }
+    }
+
+    /// The tree's share of the task table, which its processes charge.
+    pub fn task_share(&self) -> Arc<super::sched::Share> {
+        self.task_share.share()
     }
 
     /// Ends the pager's process (no program will ask it for pages).
@@ -2820,13 +2831,13 @@ fn process_call(instance: &Arc<Instance>, nr: u64, a: [u64; 6]) -> SysResult {
             if flags & !(PROC_FORK | PROC_SHARE_VM) != 0 || (vm != PROC_FORK && vm != PROC_SHARE_VM) {
                 return Err(EINVAL);
             }
-            let pid = super::sched::reserve_pid()?;
+            let pid = super::sched::reserve_pid(Some(instance.task_share()))?;
             let mm = with_current(|p| p.mm.clone()).ok_or(EINVAL)?;
             let mm = if vm == PROC_SHARE_VM { mm } else { super::address_space::Mm::fork(&mm.lock()).map_err(|_| ENOMEM)? };
             let name = super::sched::current().group.info.lock().name.clone();
             let mut info = Info::new(name);
             info.mem = Some(mm.stats.clone());
-            let group = ThreadGroup::new(pid.pid, info).ok_or(ENOMEM)?;
+            let group = ThreadGroup::new(pid.pid, info, Some(instance.task_share())).ok_or(ENOMEM)?;
             // (A default: the server sets the new process's own, from its copy of the limits.)
             let parent = &super::sched::current().group;
             group.stack_soft.store(parent.stack_soft.load(Relaxed), Relaxed);
@@ -3009,7 +3020,7 @@ fn thread_create(instance: &Arc<Instance>, a: [u64; 6]) -> SysResult {
     let me = super::sched::current();
     let (group, mm, pid) = if process == 0 {
         let mm = with_current(|p| p.mm.clone());
-        (me.group.clone(), mm.ok_or(EINVAL)?, super::sched::reserve_pid()?)
+        (me.group.clone(), mm.ok_or(EINVAL)?, super::sched::reserve_pid(me.group.share.clone())?)
     } else {
         let c = container(instance, process)?;
         let fresh = c.fresh.lock().take().ok_or(EBUSY)?;

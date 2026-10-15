@@ -31,8 +31,8 @@ on several CPUs, so these are the parts that change.
 - No lock is held across a context switch, except the run-queue lock, which `schedule`
   hands over to the next task and releases in `finish_switch`.
 - Lock order (outer to inner): process table → process info → process signal state → thread
-  signal state → wait-queue bucket → task wake lock → run queue. IPC, TTY, console, frames and
-  heap are leaves.
+  signal state → wait-queue bucket → task wake lock → run queue. IPC, TTY, console, frames,
+  heap and the task table's slot accounts (`sched::Share`) are leaves.
 
 ### Per-CPU data
 

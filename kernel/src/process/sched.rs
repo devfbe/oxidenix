@@ -1,8 +1,8 @@
 //! The SMP scheduler: per-CPU run queues, wait queues, context switches.
 //!
 //! Lock order (outer to inner): process table → group info → group exit →
-//! wait queue → task wake_lock → run queue. The heap and the frame
-//! allocator are leaves.
+//! wait queue → task wake_lock → run queue. The heap, the frame
+//! allocator and the task table's slot accounts (`Share`) are leaves.
 //!
 //! Sleeping uses the classic protocol that cannot lose a wakeup:
 //!
@@ -28,34 +28,142 @@ use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
-use core::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{fence, AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use x86_64::instructions::interrupts;
 use x86_64::registers::model_specific::FsBase;
 use x86_64::VirtAddr;
 
 pub const MAX_PROCS: usize = 256;
 
+/// Slots of the task table kept for each process tree (`TREE_RESERVE`) and
+/// for the kernel's own processes, the native servers (`KERNEL_RESERVE`):
+/// however many tasks one tree makes, every other one can still make this
+/// many (its server's pager process with its three service threads counts
+/// in it) and a server that failed can be started again. The rest of the
+/// table goes to whoever asks first.
+pub const TREE_RESERVE: usize = 16;
+pub const KERNEL_RESERVE: usize = 16;
+
+/// The task table's slots: every task, every zombie of the kernel's and
+/// every id being built holds one (`Share::take` to `Share::give`).
+///
+/// **Invariant.** `taken + held <= MAX_PROCS`: the slots taken and the
+/// reserves kept for owners that hold fewer never exceed the table, so an
+/// owner can always take what is left of its reserve.
+///
+/// A leaf lock: taken under the process table's or none, nothing is taken
+/// or dropped under it (so an owner can close its share from anywhere).
+struct Slots {
+    taken: usize,
+    /// The slots kept for the owners' reserves that they do not hold: the
+    /// sum of their `Share::unused`.
+    held: usize,
+}
+
+static SLOTS: IrqSpinLock<Slots> = IrqSpinLock::new(Slots { taken: 0, held: KERNEL_RESERVE });
+
+/// The slots of the task table one owner holds and the reserve kept for
+/// it: a tree's (its instance's, `linux::Instance`, while it lives:
+/// `OpenShare`) or the kernel's (`KERNEL_SHARE`). A thread group charges the slots of its tasks, its
+/// zombie and its ids being built to one (`ThreadGroup::share`). Changed
+/// only under `SLOTS`'s lock (atomics only so it can be shared).
+pub struct Share {
+    /// Slots it holds.
+    used: AtomicUsize,
+    /// Slots kept for it while it holds fewer (0 once it was closed).
+    reserve: AtomicUsize,
+}
+
+/// The kernel's share: its servers' processes and their threads.
+pub static KERNEL_SHARE: Share = Share { used: AtomicUsize::new(0), reserve: AtomicUsize::new(KERNEL_RESERVE) };
+
+/// An owner's share while the owner lives: dropping it keeps no more
+/// slots for it (those it still holds come back as its tasks end, whatever
+/// outlives the owner of them).
+pub struct OpenShare(Arc<Share>);
+
+impl OpenShare {
+    /// A new owner's share with `reserve` slots kept for it, or EAGAIN if
+    /// the table has not that many to spare (they are kept from then on).
+    pub fn open(reserve: usize) -> Result<OpenShare, i64> {
+        let share = Arc::try_new(Share { used: AtomicUsize::new(0), reserve: AtomicUsize::new(reserve) }).map_err(|_| super::errno::ENOMEM)?;
+        let mut slots = SLOTS.lock();
+        if slots.taken + slots.held + reserve > MAX_PROCS {
+            return Err(super::errno::EAGAIN);
+        }
+        slots.held += reserve;
+        Ok(OpenShare(share))
+    }
+
+    /// The share, for the thread groups that charge it.
+    pub fn share(&self) -> Arc<Share> {
+        self.0.clone()
+    }
+}
+
+impl Drop for OpenShare {
+    fn drop(&mut self) {
+        let mut slots = SLOTS.lock();
+        slots.held -= self.0.unused();
+        self.0.reserve.store(0, Ordering::Relaxed);
+    }
+}
+
+impl Share {
+    /// Slots of its reserve it does not hold (under `SLOTS`'s lock).
+    fn unused(&self) -> usize {
+        self.reserve.load(Ordering::Relaxed).saturating_sub(self.used.load(Ordering::Relaxed))
+    }
+
+    /// Takes a slot for it if one is free beyond the reserves kept for the
+    /// others (one of its own reserve, else one nobody's is kept for).
+    pub fn take(&self) -> bool {
+        let mut slots = SLOTS.lock();
+        if self.unused() > 0 {
+            slots.held -= 1;
+        } else if slots.taken + slots.held >= MAX_PROCS {
+            return false;
+        }
+        slots.taken += 1;
+        self.used.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    /// Gives back a slot it took.
+    pub fn give(&self) {
+        let mut slots = SLOTS.lock();
+        let used = self.used.fetch_sub(1, Ordering::Relaxed);
+        assert!(used > 0 && slots.taken > 0, "task table: a slot given back that was not taken");
+        slots.taken -= 1;
+        if self.unused() > 0 {
+            slots.held += 1;
+        }
+    }
+}
+
+/// The share `share` names: `None` is the kernel's.
+pub fn share_of(share: &Option<Arc<Share>>) -> &Share {
+    share.as_deref().unwrap_or(&KERNEL_SHARE)
+}
+
 /// All threads by thread id and all processes (live and zombies) by
 /// process id; idle tasks are not listed. Thread and process ids share
-/// one number space: a process's id is its main thread's.
+/// one number space: a process's id is its main thread's. How many there
+/// may be is `Share`'s (each holds a slot).
 pub struct Table {
     pub tasks: BTreeMap<Pid, Arc<Task>>,
     pub groups: BTreeMap<Pid, Arc<ThreadGroup>>,
     pub next_pid: Pid,
-    /// Ids handed out whose task is still being built: they count against
-    /// the limit, so concurrent forks on several CPUs cannot exceed it.
-    pub reserved: usize,
-    /// Processes whose threads all exited and that wait to be reaped.
-    pub zombies: usize,
 }
 
-pub static TABLE: IrqSpinLock<Table> =
-    IrqSpinLock::new(Table { tasks: BTreeMap::new(), groups: BTreeMap::new(), next_pid: 1, reserved: 0, zombies: 0 });
+pub static TABLE: IrqSpinLock<Table> = IrqSpinLock::new(Table { tasks: BTreeMap::new(), groups: BTreeMap::new(), next_pid: 1 });
 
-/// An id taken under the task limit; `insert` turns it into a listed
-/// task, dropping it gives the slot back.
+/// An id taken under the task limit, its slot charged to `share`; `insert`
+/// turns it into a listed task (its group's share holds the slot from then
+/// on: the same), dropping it gives the slot back.
 pub struct PidReservation {
     pub pid: Pid,
+    share: Option<Arc<Share>>,
     done: bool,
 }
 
@@ -66,18 +174,18 @@ pub fn forks() -> u64 {
     FORKS.load(Ordering::Relaxed)
 }
 
-/// Takes the next id, or EAGAIN at the limit of tasks (threads and
-/// zombies).
-pub fn reserve_pid() -> Result<PidReservation, i64> {
+/// Takes the next id for a task charged to `share` (`None`: the kernel's),
+/// or EAGAIN at the limit of tasks (threads and zombies): when the table
+/// has no slot left beyond the reserves kept for the other owners.
+pub fn reserve_pid(share: Option<Arc<Share>>) -> Result<PidReservation, i64> {
     FORKS.fetch_add(1, Ordering::Relaxed);
-    let mut table = TABLE.lock();
-    if table.tasks.len() + table.zombies + table.reserved >= MAX_PROCS {
+    if !share_of(&share).take() {
         return Err(super::errno::EAGAIN);
     }
+    let mut table = TABLE.lock();
     let pid = table.next_pid;
     table.next_pid += 1;
-    table.reserved += 1;
-    Ok(PidReservation { pid, done: false })
+    Ok(PidReservation { pid, share, done: false })
 }
 
 impl PidReservation {
@@ -85,8 +193,12 @@ impl PidReservation {
     /// one). A new thread of a process that is already ending is refused
     /// (EAGAIN), so no thread outlives a group exit or exec.
     pub fn insert(mut self, task: Arc<Task>) -> Result<(), i64> {
-        let mut table = TABLE.lock();
         let group = task.group.clone();
+        assert!(
+            core::ptr::eq(share_of(&self.share), share_of(&group.share)),
+            "task table: a task charged to another share than its group's"
+        );
+        let mut table = TABLE.lock();
         // Nothing new comes out of a process that is ending or exec'ing:
         // neither a thread nor a forked child.
         if *current().group.exit.lock() != super::kill::GroupExit::None {
@@ -100,7 +212,6 @@ impl PidReservation {
         if self.pid == group.tgid {
             table.groups.insert(self.pid, group);
         }
-        table.reserved -= 1;
         self.done = true;
         Ok(())
     }
@@ -109,7 +220,7 @@ impl PidReservation {
 impl Drop for PidReservation {
     fn drop(&mut self) {
         if !self.done {
-            TABLE.lock().reserved -= 1;
+            share_of(&self.share).give();
         }
     }
 }

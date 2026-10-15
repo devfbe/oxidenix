@@ -82,9 +82,10 @@ pub fn init() {
     enable_sse();
     tlb::init_cpu(true);
     syscall::init();
-    let group = ThreadGroup::new(0, Info::new("kernel".to_string())).expect("boot");
+    let group = ThreadGroup::new(0, Info::new("kernel".to_string()), None).expect("boot");
     let kernel = Arc::new(Task::new(0, group.clone(), "kernel".to_string(), Process::empty(), None, 0));
     group.info.lock().threads.push(kernel.clone());
+    assert!(sched::KERNEL_SHARE.take(), "boot: no slot for the kernel's task");
     {
         let mut table = TABLE.lock();
         table.tasks.insert(0, kernel.clone());
@@ -584,11 +585,17 @@ pub fn spawn(name: &str, args: &[&str]) -> Result<Tree, i64> {
 fn start_tree(path: &str, args: &[String], grants: bool) -> Result<(Pid, alloc::sync::Weak<linux::Instance>), i64> {
     let path = path.to_string();
     let args = args.to_vec();
-    let slot = sched::reserve_pid()?;
-    let pid = slot.pid;
+    // The instance first: it brings the tree's share of the task table,
+    // which its pager and its first process take their slots from.
     let instance = linux::Instance::new()?;
+    let slot = sched::reserve_pid(Some(instance.task_share()))?;
+    let pid = slot.pid;
     instance.set_init_args(&path, &args, &start_env())?;
-    spawn_pager(&instance)?;
+    if let Err(e) = spawn_pager(&instance) {
+        // The pager's process may have started without all its threads.
+        instance.close();
+        return Err(e);
+    }
     let task = (|| {
         let mut space = address_space::AddressSpace::new().ok_or(ENOMEM)?;
         space.attach(instance.clone(), true).map_err(|e| if e == address_space::Fault::Oom { ENOMEM } else { EINVAL })?;
@@ -600,7 +607,7 @@ fn start_tree(path: &str, args: &[String], grants: bool) -> Result<(Pid, alloc::
         let mut own = Process::empty();
         own.mm = Some(address_space::Mm::new(space).ok_or(ENOMEM)?);
         own.linux = Some(thread);
-        let group = ThreadGroup::new(pid, info).ok_or(ENOMEM)?;
+        let group = ThreadGroup::new(pid, info, Some(instance.task_share())).ok_or(ENOMEM)?;
         group.instance.store(instance.id, Ordering::Release);
         group.host_init.call_once(|| linux::host_flag(&instance));
         let t = new_task(pid, group, name, own, start)?;
@@ -722,7 +729,9 @@ pub fn spawn_server(server: &Arc<Server>) -> Result<Pid, i64> {
 /// and the net thread). It belongs to the kernel, like the servers, and
 /// ends when the instance's last program is gone.
 fn spawn_pager(instance: &Arc<linux::Instance>) -> Result<Pid, i64> {
-    let slot = sched::reserve_pid()?;
+    // Its slots are the tree's (its reserve has room for them).
+    let share = Some(instance.task_share());
+    let slot = sched::reserve_pid(share.clone())?;
     let pid = slot.pid;
     let mut space = address_space::AddressSpace::new().ok_or(ENOMEM)?;
     space.attach(instance.clone(), false).map_err(|_| ENOMEM)?;
@@ -732,7 +741,7 @@ fn spawn_pager(instance: &Arc<linux::Instance>) -> Result<Pid, i64> {
     own.linux = Some(thread);
     let mut info = Info::new("linux-pager".to_string());
     info.exe = String::from("/sbin/linux");
-    let group = ThreadGroup::new(pid, info).ok_or(ENOMEM)?;
+    let group = ThreadGroup::new(pid, info, share.clone()).ok_or(ENOMEM)?;
     // A process of the kernel's, as the servers are.
     group.privileged.store(true, Ordering::Relaxed);
     let mm = own.mm.clone();
@@ -742,7 +751,7 @@ fn spawn_pager(instance: &Arc<linux::Instance>) -> Result<Pid, i64> {
     // The worker, the net thread and the timer thread: threads of the
     // pager's process (they end with it).
     for (role, name) in [(restricted::ROLE_WORKER, "linux-worker"), (restricted::ROLE_NET, "linux-net"), (restricted::ROLE_TIMER, "linux-timer")] {
-        let wslot = sched::reserve_pid()?;
+        let wslot = sched::reserve_pid(share.clone())?;
         let (thread, start) = linux::LinuxThread::service(instance.clone(), role)?;
         let mut own = Process::empty();
         own.mm = mm.clone();
@@ -756,7 +765,7 @@ fn spawn_pager(instance: &Arc<linux::Instance>) -> Result<Pid, i64> {
 
 /// Starts the native server `server` from its loaded `image`.
 fn spawn_with(path: &str, image: loader::Image, server: &Arc<Server>, args: &[String]) -> Result<Pid, i64> {
-    let slot = sched::reserve_pid()?;
+    let slot = sched::reserve_pid(None)?;
     let pid = slot.pid;
     // Servers belong to the kernel, even when a program's request
     // (re)started them: only the kernel waits for them or ends them.
@@ -769,7 +778,7 @@ fn spawn_with(path: &str, image: loader::Image, server: &Arc<Server>, args: &[St
     let frame = Frame::user_start(image.entry, image.sp);
     own.mm = Some(address_space::Mm::new(image.space).ok_or(ENOMEM)?);
     own.server = Some(server.clone());
-    let group = ThreadGroup::new(pid, info).ok_or(ENOMEM)?;
+    let group = ThreadGroup::new(pid, info, None).ok_or(ENOMEM)?;
     group.privileged.store(true, Ordering::Relaxed);
     let t = new_task(pid, group, name, own, frame)?;
     slot.insert(t.clone())?;
