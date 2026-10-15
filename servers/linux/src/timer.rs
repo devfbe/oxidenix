@@ -3,7 +3,7 @@
 //! POSIX timers (timer_create, timer_settime, timer_gettime, timer_getoverrun,
 //! timer_delete) of the instance's processes, run by its timer thread (`ROLE_TIMER`, a
 //! service thread of the pager's process), which also tells timerfds' pollers of their
-//! expiries (`timerfd`).
+//! expiries (`timerfd`) and ends the sleeps on CPU clocks (clock_nanosleep: `CpuSleep`).
 //!
 //! **Clocks.** A timer on the wall or the monotonic clock is a deadline the timer thread
 //! sleeps until (an absolute one on the wall clock stays one of the wall clock: setting the
@@ -44,6 +44,7 @@ use restricted::*;
 const EINVAL: i64 = 22;
 const EAGAIN: i64 = 11;
 const ESRCH: i64 = 3;
+const EFAULT: i64 = 14;
 const EOPNOTSUPP: i64 = 95;
 const NSEC_PER_SEC: u64 = 1_000_000_000;
 /// The scheduler's tick: what a CPU interval timer about to expire reports left (Linux's
@@ -146,6 +147,18 @@ pub struct Timers {
 pub struct CpuAlarm {
     armed: [u64; 2],
     want: [u64; 2],
+}
+
+/// A thread's sleep on a CPU clock (clock_nanosleep: Linux's do_cpu_nanosleep, a temporary
+/// CPU timer): the clock, its deadline on it, whether the timer thread saw the clock reach
+/// it, and the sleeper's word (in its block, `local::Local::cpu_sleep`), which the timer
+/// thread advances and wakes then.
+#[derive(Clone, Copy)]
+pub struct CpuSleep {
+    clock: Clock,
+    at: u64,
+    done: bool,
+    word: &'static AtomicU32,
 }
 
 /// Advances when a timer changed or the kernel's CPU alarm fired: the timer thread looks
@@ -267,7 +280,50 @@ fn scan(t: &mut Table) -> (u64, bool) {
             id_from = n;
         }
     }
+    scan_sleeps(t);
     (next, arm_alarms(t))
+}
+
+/// The CPU time of `clock` (a process's or a thread's) now; None once its owner ended.
+fn cpu_now(t: &Table, clock: Clock) -> Option<u64> {
+    match clock {
+        Clock::Process(pid, which) => process_cpu(t, pid, which),
+        Clock::Thread(tid, which) => thread_cpu(t, tid, which),
+        Clock::Mono | Clock::Wall => None,
+    }
+}
+
+/// The sleeps on CPU clocks: those whose clock reached their deadline end (their sleepers
+/// are woken), the others want the alarm of their clock. A sleep on the clock of a process
+/// or thread that ended goes on until a signal ends it, as Linux's (whose timer then never
+/// fires).
+fn scan_sleeps(t: &mut Table) {
+    let mut from: Pid = 0;
+    while let Some((tid, s)) = t.threads.range(from..).find_map(|(&tid, th)| th.cpu_sleep.filter(|s| !s.done).map(|s| (tid, s))) {
+        from = tid + 1;
+        match cpu_now(t, s.clock) {
+            Some(now) if now >= s.at => {
+                if let Some(sleep) = t.threads.get_mut(&tid).and_then(|th| th.cpu_sleep.as_mut()) {
+                    sleep.done = true;
+                }
+                process::wake_word(s.word);
+            }
+            Some(_) => match s.clock {
+                Clock::Process(pid, which) => {
+                    if let Some(p) = t.procs.get_mut(&pid) {
+                        earliest(&mut p.cpu.want[which], s.at);
+                    }
+                }
+                Clock::Thread(other, which) => {
+                    if let Some(th) = t.threads.get_mut(&other) {
+                        earliest(&mut th.cpu.want[which], s.at);
+                    }
+                }
+                Clock::Mono | Clock::Wall => {}
+            },
+            None => {}
+        }
+    }
 }
 
 /// Process `pid`'s `ITIMER_REAL`: SIGALRM if it expired.
@@ -831,4 +887,112 @@ fn timer_delete(id: i32) -> Result<i64, i64> {
     }
     changed();
     Ok(0)
+}
+
+// ------------------------------------------------------------------ sleeps on CPU clocks
+
+/// clock_nanosleep on a CPU clock (`id`: CLOCK_PROCESS_CPUTIME_ID, or Linux's encoding of a
+/// process's or thread's clock, `timer_clock`) for `value` nanoseconds of it, or with
+/// `absolute` until it reads `value` (Linux's posix_cpu_nsleep): the calling thread's own
+/// thread clock is EINVAL (it would never advance while it sleeps), a clock of no process
+/// or thread EINVAL. The timer thread ends the sleep when the clock reaches the deadline
+/// (`scan_sleeps`, through the kernel's CPU-time alarms). Interrupted, an absolute sleep
+/// restarts as it was (ERESTARTNOHAND), a relative one stores the time left on its clock at
+/// `rem` and goes on to the same deadline by restart_syscall.
+pub fn cpu_nanosleep(id: i32, absolute: bool, value: u64, rem: u64) -> Result<i64, i64> {
+    let tid = crate::local::tid();
+    if id < 0 && id & 4 != 0 {
+        let target = !(id >> 3) as u32;
+        if target == 0 || target == tid {
+            return Err(EINVAL);
+        }
+    }
+    let at = {
+        let mut t = PROCS.lock();
+        let clock = timer_clock(&t, id as u32 as u64)?;
+        let now = cpu_now(&t, clock).ok_or(EINVAL)?;
+        let at = if absolute { value } else { now.saturating_add(value) };
+        // A zero time disarms Linux's timer: nothing to wait for; nor for a time past.
+        if value == 0 || at <= now {
+            return Ok(0);
+        }
+        arm_sleep(&mut t, tid, clock, at)?;
+        at
+    };
+    changed();
+    cpu_sleep_wait(tid, id, at, !absolute, rem)
+}
+
+/// restart_syscall of an interrupted relative sleep on CPU clock `id`: on to `deadline`
+/// (Linux's posix_cpu_nsleep_restart); EINVAL once the clock's owner is gone.
+pub fn cpu_sleep_rest(id: i32, deadline: u64, rem: u64) -> Result<i64, i64> {
+    let tid = crate::local::tid();
+    {
+        let mut t = PROCS.lock();
+        let clock = timer_clock(&t, id as u32 as u64)?;
+        if cpu_now(&t, clock).ok_or(EINVAL)? >= deadline {
+            return Ok(0);
+        }
+        arm_sleep(&mut t, tid, clock, deadline)?;
+    }
+    changed();
+    cpu_sleep_wait(tid, id, deadline, true, rem)
+}
+
+/// The calling thread `tid` sleeps until `clock` reads `at` (lock held): its record says so.
+fn arm_sleep(t: &mut Table, tid: Pid, clock: Clock, at: u64) -> Result<(), i64> {
+    let word = &crate::local::get().cpu_sleep;
+    t.threads.get_mut(&tid).ok_or(ESRCH)?.cpu_sleep = Some(CpuSleep { clock, at, done: false, word });
+    Ok(())
+}
+
+/// The calling thread `tid`'s armed sleep (`arm_sleep`) on clock `id` until it is over or a
+/// signal comes: 0 once its clock reached `at` (also when a signal came just after, and when
+/// the clock's owner ended meanwhile: Linux's timer of a task gone reports nothing left);
+/// interrupted, with `relative` the time left at `rem` and ERESTART_RESTARTBLOCK (the rest
+/// kept for restart_syscall), else ERESTARTNOHAND.
+fn cpu_sleep_wait(tid: Pid, id: i32, at: u64, relative: bool, rem: u64) -> Result<i64, i64> {
+    let word = &crate::local::get().cpu_sleep;
+    let state = |t: &Table| t.threads.get(&tid).and_then(|th| th.cpu_sleep).map(|s| (s.done, s.clock));
+    let clock = loop {
+        let seen = word.load(Ordering::Acquire);
+        {
+            let mut t = PROCS.lock();
+            match state(&t) {
+                Some((false, _)) => {}
+                _ => {
+                    if let Some(th) = t.threads.get_mut(&tid) {
+                        th.cpu_sleep = None;
+                    }
+                    return Ok(0);
+                }
+            }
+        }
+        if process::wait_word(word, seen, 0, true) == -process::EINTR {
+            let mut t = PROCS.lock();
+            let Some((done, clock)) = state(&t) else { return Ok(0) };
+            if let Some(th) = t.threads.get_mut(&tid) {
+                th.cpu_sleep = None;
+            }
+            if done {
+                return Ok(0);
+            }
+            break cpu_now(&t, clock);
+        }
+    };
+    // (Its want goes with the next look.)
+    changed();
+    let left = match clock {
+        Some(now) if now < at => at - now,
+        _ => return Ok(0),
+    };
+    if !relative {
+        return Err(signal::ERESTARTNOHAND);
+    }
+    if rem != 0 {
+        // As Linux's nanosleep_copyout.
+        usercopy::write(rem, &[left / NSEC_PER_SEC, left % NSEC_PER_SEC]).map_err(|_| EFAULT)?;
+    }
+    signal::save_block(signal::RestartBlock::CpuSleep { clock: id, deadline: at, rem });
+    Err(signal::ERESTART_RESTARTBLOCK)
 }
