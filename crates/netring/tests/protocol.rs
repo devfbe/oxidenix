@@ -25,9 +25,11 @@ fn every_request() -> Vec<Request> {
         Request::Socket { sock: 0, kind: Kind::Tcp, area: None },
         Request::Socket { sock: 7, kind: Kind::Udp, area: Some(area(1, 0, 65536)) },
         Request::Socket { sock: MAX_SOCKETS as u32 - 1, kind: Kind::RawIcmp, area: Some(area(3, 4096, MIN_RING)) },
-        Request::Bind { sock: 1, at: ep(0x7f00_0001, 8080), reuse: true },
-        Request::Bind { sock: 1, at: ep(0, 0), reuse: false },
-        Request::Listen { sock: 2, backlog: 511, reuse: true },
+        Request::Bind { sock: 1, at: ep(0x7f00_0001, 8080), reuse: true, reuseport: false },
+        Request::Bind { sock: 1, at: ep(0, 0), reuse: false, reuseport: true },
+        Request::Bind { sock: 1, at: ep(0, 80), reuse: true, reuseport: true },
+        Request::Listen { sock: 2, backlog: 511, reuse: true, reuseport: false },
+        Request::Listen { sock: 2, backlog: 1, reuse: false, reuseport: true },
         Request::Connect { sock: 3, to: ep(0x0a00_0264, 7), area: Some(area(2, 1 << 21, MAX_RING)) },
         Request::Connect { sock: 3, to: ep(0, 0), area: None },
         Request::Accept { sock: 4, new: 5, area: area(9, 8192, 65536) },
@@ -41,6 +43,7 @@ fn every_request() -> Vec<Request> {
         Request::SetOpt { sock: 11, opt: opt::NODELAY, value: 1 },
         Request::Links { buf: Buf { grant: 1, offset: 100, len: MAX_LINKS_BUF } },
         Request::Forget { grant: 4095 },
+        Request::Renew,
     ]
 }
 
@@ -56,7 +59,7 @@ fn every_request_round_trips() {
 
 #[test]
 fn unknown_operations_are_refused() {
-    for op in [0, 13, 99, u16::MAX] {
+    for op in [0, 14, 99, u16::MAX] {
         assert_eq!(Request::decode(&Desc { op, ..Desc::default() }), Err(ENOSYS));
     }
 }
@@ -110,10 +113,10 @@ fn areas_must_be_two_rings_of_a_power_of_two_on_a_page() {
 
 #[test]
 fn sockets_endpoints_and_values_must_be_in_range() {
-    let bind = Request::Bind { sock: 1, at: ep(1, 1), reuse: false }.encode(1);
+    let bind = Request::Bind { sock: 1, at: ep(1, 1), reuse: false, reuseport: false }.encode(1);
     assert_eq!(Request::decode(&Desc { object: MAX_SOCKETS as u64, ..bind }), Err(EINVAL));
     assert_eq!(Request::decode(&Desc { offset: 1 << 48, ..bind }), Err(EINVAL));
-    assert_eq!(Request::decode(&Desc { arg: [2, 0, 0], ..bind }), Err(EINVAL));
+    assert_eq!(Request::decode(&Desc { arg: [4, 0, 0], ..bind }), Err(EINVAL));
     let accept = Request::Accept { sock: 4, new: 5, area: area(1, 0, 4096) }.encode(1);
     assert_eq!(Request::decode(&Desc { arg: [MAX_SOCKETS as u64, 0, 0], ..accept }), Err(EINVAL));
     let send = Request::Send { sock: 1, to: ep(0, 0), len: 1 }.encode(1);
@@ -130,9 +133,9 @@ fn sockets_endpoints_and_values_must_be_in_range() {
     assert_eq!(Request::decode(&Desc { len: 0, ..links }), Err(EINVAL));
     assert_eq!(Request::decode(&Desc { len: MAX_LINKS_BUF + 1, ..links }), Err(EINVAL));
     assert_eq!(Request::decode(&Desc { grant: 0, ..links }), Err(EINVAL));
-    let listen = Request::Listen { sock: 1, backlog: 1, reuse: false }.encode(1);
+    let listen = Request::Listen { sock: 1, backlog: 1, reuse: false, reuseport: false }.encode(1);
     assert_eq!(Request::decode(&Desc { arg: [1 << 32, 0, 0], ..listen }), Err(EINVAL));
-    assert_eq!(Request::decode(&Desc { arg: [1, 2, 0], ..listen }), Err(EINVAL));
+    assert_eq!(Request::decode(&Desc { arg: [1, 4, 0], ..listen }), Err(EINVAL));
 }
 
 #[test]
@@ -179,8 +182,8 @@ fn records_round_trip_and_stay_aligned() {
 #[test]
 fn links_round_trip() {
     let links = [
-        Link { index: 1, kind: LINK_LOOPBACK, state: LINK_UP | LINK_RUNNING, mtu: 1500, mac: [0; 6], prefix: 8, address: 0x7f00_0001 },
-        Link { index: 2, kind: LINK_ETHERNET, state: LINK_UP, mtu: 1500, mac: [0x52, 0x54, 0, 0x12, 0x34, 0x56], prefix: 24, address: 0x0a00_020f },
+        Link { index: 1, kind: LINK_LOOPBACK, state: LINK_UP | LINK_RUNNING, mtu: 1500, mac: [0; 6], prefix: 8, address: 0x7f00_0001, gateway: 0 },
+        Link { index: 2, kind: LINK_ETHERNET, state: LINK_UP, mtu: 1500, mac: [0x52, 0x54, 0, 0x12, 0x34, 0x56], prefix: 24, address: 0x0a00_020f, gateway: 0x0a00_0202 },
     ];
     let mut payload: Vec<u8> = links.iter().flat_map(|l| l.encode()).collect();
     payload.push(0xff);
@@ -189,11 +192,20 @@ fn links_round_trip() {
 }
 
 fn holder(owner: u64, addr: Option<u32>, reuse: bool) -> PortHolder {
-    PortHolder { owner, port: 8080, addr, reuse, listening: false, connected: false, closing: false }
+    PortHolder { owner, port: 8080, addr, reuse, reuseport: false, listening: false, connected: false, closing: false }
 }
 
 fn claim(owner: u64, addr: Option<u32>, reuse: bool) -> PortClaim {
-    PortClaim { owner, port: 8080, addr, reuse }
+    PortClaim { owner, port: 8080, addr, reuse, reuseport: false }
+}
+
+/// A holder and a claim with SO_REUSEPORT (and SO_REUSEADDR as `reuse`).
+fn holder_rp(owner: u64, addr: Option<u32>, reuse: bool) -> PortHolder {
+    PortHolder { reuseport: true, ..holder(owner, addr, reuse) }
+}
+
+fn claim_rp(owner: u64, addr: Option<u32>, reuse: bool) -> PortClaim {
+    PortClaim { reuseport: true, ..claim(owner, addr, reuse) }
 }
 
 const LO: Option<u32> = Some(0x7f00_0001);
@@ -222,6 +234,33 @@ fn tcp_ports_follow_linux_within_an_instance() {
     let closing = PortHolder { closing: true, ..holder(1, LO, true) };
     assert!(!tcp_port_conflict(&claim(1, LO, true), &closing));
     assert!(tcp_port_conflict(&claim(1, LO, false), &closing));
+}
+
+#[test]
+fn reuseport_shares_ports_within_an_instance() {
+    // TCP: both with SO_REUSEPORT share a port, listening or not, in
+    // TIME-WAIT or not (inet_bind_conflict's reuseport branch).
+    assert!(!tcp_port_conflict(&claim_rp(1, LO, false), &holder_rp(1, LO, false)));
+    assert!(!tcp_port_conflict(&claim_rp(1, LO, false), &PortHolder { listening: true, ..holder_rp(1, LO, false) }));
+    assert!(!tcp_port_conflict(&claim_rp(1, None, false), &PortHolder { listening: true, ..holder_rp(1, LO, false) }));
+    assert!(!tcp_port_conflict(&claim_rp(1, LO, false), &PortHolder { closing: true, ..holder_rp(1, LO, false) }));
+    assert!(!tcp_port_conflict(&claim_rp(1, LO, false), &PortHolder { connected: true, ..holder_rp(1, LO, false) }));
+    // Only if both set it (before bind: a later socket without it
+    // conflicts, and so does one with it beside one without).
+    assert!(tcp_port_conflict(&claim(1, LO, false), &PortHolder { listening: true, ..holder_rp(1, LO, false) }));
+    assert!(tcp_port_conflict(&claim_rp(1, LO, false), &PortHolder { listening: true, ..holder(1, LO, false) }));
+    // SO_REUSEADDR on one side does not stand in for it at a listener.
+    assert!(tcp_port_conflict(&claim_rp(1, LO, true), &PortHolder { listening: true, ..holder(1, LO, true) }));
+    // Never across instances (whatever both set).
+    assert!(tcp_port_conflict(&claim_rp(2, LO, true), &holder_rp(1, LO, true)));
+    assert!(tcp_port_conflict(&claim_rp(2, LO, true), &PortHolder { listening: true, ..holder_rp(1, LO, true) }));
+    assert!(tcp_port_conflict(&claim_rp(2, LO, true), &PortHolder { closing: true, ..holder_rp(1, LO, true) }));
+    // UDP: both SO_REUSEPORT (or both SO_REUSEADDR), one instance.
+    assert!(!udp_port_conflict(&claim_rp(1, LO, false), &holder_rp(1, LO, false)));
+    assert!(!udp_port_conflict(&claim_rp(1, None, false), &holder_rp(1, LO, false)));
+    assert!(udp_port_conflict(&claim_rp(1, LO, false), &holder(1, LO, true)));
+    assert!(udp_port_conflict(&claim(1, LO, true), &holder_rp(1, LO, false)));
+    assert!(udp_port_conflict(&claim_rp(2, LO, true), &holder_rp(1, LO, true)));
 }
 
 #[test]
@@ -752,4 +791,29 @@ fn ephemeral_ports_follow_rfc6056s_fourth_algorithm() {
     // Other keys, another start.
     let mut other = [0u32; 1024];
     assert_ne!(port_start(&[3; 16], &k2, &mut other, 1, 0x0a00_0202, 80, true), a);
+}
+
+#[test]
+fn urgent_marks_pack_into_one_word() {
+    for u in [
+        Urgent { count: 0, pos: 0, byte: None },
+        Urgent { count: 1, pos: 0xffff_ffff, byte: Some(0) },
+        Urgent { count: u16::MAX, pos: 12345, byte: Some(0xff) },
+        Urgent { count: 7, pos: 1 << 31, byte: None },
+    ] {
+        assert_eq!(Urgent::unpack(u.pack()), u);
+    }
+    // A zeroed word (a new control block): no pointer, no byte.
+    assert_eq!(Urgent::unpack(0), Urgent::default());
+    for m in [UrgentMark { count: 0, end: 0 }, UrgentMark { count: u32::MAX, end: u32::MAX }, UrgentMark { count: 3, end: 65536 }] {
+        assert_eq!(UrgentMark::unpack(m.pack()), m);
+    }
+    // Both live in the control block and start over with a new socket.
+    let ctl: Box<Ctl> = Box::new(unsafe { core::mem::zeroed() });
+    ctl.netd.urg.store(Urgent { count: 2, pos: 99, byte: Some(b'!') }.pack(), Ordering::SeqCst);
+    ctl.client.tx_urg.store(UrgentMark { count: 1, end: 5 }.pack(), Ordering::SeqCst);
+    ctl.reset_netd(0);
+    ctl.reset_client();
+    assert_eq!(Urgent::unpack(ctl.netd.urg.load(Ordering::SeqCst)), Urgent::default());
+    assert_eq!(UrgentMark::unpack(ctl.client.tx_urg.load(Ordering::SeqCst)), UrgentMark::default());
 }

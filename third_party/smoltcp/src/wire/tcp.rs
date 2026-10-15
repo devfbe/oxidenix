@@ -865,6 +865,10 @@ pub struct Repr<'a> {
     pub sack_permitted: bool,
     pub sack_ranges: [Option<(u32, u32)>; 3],
     pub timestamp: Option<TcpTimestampRepr>,
+    /// oxidenix: the urgent pointer (RFC 9293 3.8.5) when the URG flag is
+    /// set: the offset from the segment's sequence number of the byte
+    /// after the urgent data (as BSD and Linux read it).
+    pub urgent: Option<u16>,
     pub payload: &'a [u8],
 }
 
@@ -931,9 +935,10 @@ impl<'a> Repr<'a> {
             false => None,
         };
         // The PSH flag is ignored.
-        // The URG flag and the urgent field is ignored. This behavior is standards-compliant,
-        // however, most deployed systems (e.g. Linux) are *not* standards-compliant, and would
-        // cut the byte at the urgent pointer from the stream.
+        // oxidenix: the URG flag and the urgent field are kept (`urgent`):
+        // the socket marks the urgent byte, its user decides whether to cut
+        // it from the stream (Linux does unless SO_OOBINLINE).
+        let urgent = packet.urg().then(|| packet.urgent_at());
 
         let mut max_seg_size = None;
         let mut window_scale = None;
@@ -987,6 +992,7 @@ impl<'a> Repr<'a> {
             sack_permitted: sack_permitted,
             sack_ranges: sack_ranges,
             timestamp: timestamp,
+            urgent,
             payload: packet.payload(),
         })
     }
@@ -1083,7 +1089,9 @@ impl<'a> Repr<'a> {
                 TcpOption::EndOfList.emit(options);
             }
         }
-        packet.set_urgent_at(0);
+        // oxidenix: the urgent pointer, if any.
+        packet.set_urg(self.urgent.is_some());
+        packet.set_urgent_at(self.urgent.unwrap_or(0));
         packet.payload_mut()[..self.payload.len()].copy_from_slice(self.payload);
 
         if checksum_caps.tcp.tx() {
@@ -1337,6 +1345,7 @@ mod test {
             sack_permitted: false,
             sack_ranges: [None, None, None],
             timestamp: None,
+            urgent: None,
             payload: &PAYLOAD_BYTES,
         }
     }

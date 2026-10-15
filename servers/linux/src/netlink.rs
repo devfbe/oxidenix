@@ -10,8 +10,19 @@
 //! when it first sends (autobind), and answers that do not fit the
 //! receive buffer are dropped with ENOBUFS at the next receive. Port ids
 //! are the ones Linux gives when the process id is taken (-4096 and down):
-//! the server learns process ids with R8. No multicast group ever carries
-//! a message here (netd's configuration changes are not announced).
+//! the server learns process ids with R8.
+//!
+//! **Multicast.** A socket joins groups by bind's `nl_groups` or
+//! NETLINK_ADD_MEMBERSHIP (bound or not, as on Linux); a datagram a
+//! program sends to groups reaches their members (and the kernel's end, for
+//! port 0). netd's configuration changes reach RTNLGRP_LINK,
+//! RTNLGRP_IPV4_IFADDR and RTNLGRP_IPV4_ROUTE as Linux announces them
+//! (`configuration_changed`, `netlink::changes`): while any socket is a
+//! member, the instance keeps the interfaces it last saw, and the net thread
+//! compares them with netd's whenever netd says its configuration changed or
+//! the channel came or went (a netd that went: its interfaces went; while it
+//! is away the net thread looks for it again each second). Changes that
+//! come and go between two looks are not seen.
 
 use crate::files::{self, File, EBADF, EFAULT, EINVAL, O_ACCMODE, O_NONBLOCK, O_RDWR, O_WRONLY};
 use crate::heap::{self, TryGrow};
@@ -94,10 +105,12 @@ const MIN_SNDBUF: u32 = 4608;
 /// `struct sockaddr_nl`: family, padding, port id, groups.
 const SOCKADDR_NL: usize = 12;
 
-/// A datagram waiting to be received, and the port it came from (0: the
-/// kernel's end).
+/// A datagram waiting to be received, the port it came from (0: the
+/// kernel's end), and the group it was sent to (0: none; for the sender's
+/// address's `nl_groups`).
 struct Datagram {
     from: u32,
+    group: u32,
     data: Vec<u8>,
 }
 
@@ -106,8 +119,9 @@ struct State {
     port: u32,
     /// Multicast groups subscribed to (bit n-1 for group n).
     groups: u32,
-    /// connect's default destination.
+    /// connect's default destination (a port, groups).
     dst_port: u32,
+    dst_groups: u32,
     queue: VecDeque<Datagram>,
     queued: usize,
     /// An error for the next receive (ENOBUFS after a dropped answer).
@@ -134,6 +148,92 @@ pub struct NetlinkSocket {
 static PORTS: Mutex<BTreeMap<u32, Weak<NetlinkSocket>>> = Mutex::new(BTreeMap::new());
 /// The next port id autobind tries (Linux's rover).
 static ROVER: Mutex<i32> = Mutex::new(-4096);
+/// The sockets that joined a multicast group (or did once: gone and left
+/// ones are dropped as they are met).
+static MEMBERS: Mutex<Vec<Weak<NetlinkSocket>>> = Mutex::new(Vec::new());
+/// The interfaces as the members were last told of them (None while there
+/// are none); held across netd's answer.
+static KNOWN: crate::sync::SleepMutex<Option<Vec<netlink::Interface>>> = crate::sync::SleepMutex::new(None);
+
+/// A group's bit in `nl_groups` (groups 1 to 32).
+fn group_bit(group: u32) -> u32 {
+    if (1..=32).contains(&group) { 1 << (group - 1) } else { 0 }
+}
+
+/// Whether any socket is a member of a group.
+pub fn has_members() -> bool {
+    MEMBERS.lock().iter().any(|w| w.upgrade().is_some_and(|s| s.state.lock().groups != 0))
+}
+
+/// Sends `data` from port `from` to the members of `group` but `from`
+/// (Linux's netlink_broadcast): each its own copy, dropped with ENOBUFS
+/// for a member without room (or memory) for it.
+fn broadcast(group: u32, from: u32, data: &[u8]) {
+    let bit = group_bit(group);
+    // (Room for them first, outside the lock; without it nobody hears it,
+    // as when no member has room.)
+    let Ok(mut members) = heap::try_vec::<Arc<NetlinkSocket>>(MEMBERS.lock().len()) else { return };
+    {
+        let mut list = MEMBERS.lock();
+        list.retain(|w| w.strong_count() > 0);
+        members.extend(list.iter().filter_map(Weak::upgrade).take(members.capacity()));
+    }
+    for m in members {
+        let (member, port) = {
+            let st = m.state.lock();
+            (st.groups & bit != 0, st.port)
+        };
+        if !member || (from != 0 && port == from) {
+            continue;
+        }
+        match heap::try_to_vec(data) {
+            Ok(copy) => m.deliver_to(from, group, copy),
+            Err(_) => {
+                let mut st = m.state.lock();
+                NetlinkSocket::overrun(&mut st);
+                m.changed(&mut st, false);
+            }
+        }
+    }
+}
+
+/// netd's configuration may have changed (the net thread: netd said so, or
+/// the channel came or went): the members hear what changed since they
+/// last heard (`netlink::changes`). Without members nothing is kept.
+pub fn configuration_changed() {
+    let Ok(mut known) = KNOWN.lock() else { return };
+    if !has_members() {
+        *known = None;
+        return;
+    }
+    // (Without memory for them, the members are told later.)
+    let Ok(now) = crate::netdev::interfaces() else { return };
+    if let Some(old) = known.as_ref() {
+        for n in netlink::changes(old, &now) {
+            broadcast(n.group, 0, &n.message);
+        }
+    }
+    *known = Some(now);
+}
+
+/// A socket joined a group: it is a member, and the interfaces it will
+/// hear changes of are the ones there are now (unless others already
+/// listen).
+fn joined(sock: &Arc<NetlinkSocket>) -> Result<(), i64> {
+    {
+        let mut list = MEMBERS.lock();
+        if !list.iter().any(|w| core::ptr::eq(w.as_ptr(), Arc::as_ptr(sock))) {
+            list.retain(|w| w.strong_count() > 0);
+            list.try_grow(1)?;
+            list.push(Arc::downgrade(sock));
+        }
+    }
+    let mut known = KNOWN.lock()?;
+    if known.is_none() {
+        *known = Some(crate::netdev::interfaces()?);
+    }
+    Ok(())
+}
 
 /// socket(AF_NETLINK, type, protocol).
 pub fn socket(ty: u64, protocol: u64) -> Result<i64, i64> {
@@ -151,6 +251,7 @@ pub fn socket(ty: u64, protocol: u64) -> Result<i64, i64> {
         port: 0,
         groups: 0,
         dst_port: 0,
+        dst_groups: 0,
         queue: VecDeque::new(),
         queued: 0,
         error: 0,
@@ -251,12 +352,17 @@ impl NetlinkSocket {
     /// NETLINK_NO_ENOBUFS). A datagram counts with what it takes besides its
     /// bytes (`cost`), so even empty ones fill the buffer.
     fn deliver(&self, from: u32, data: Vec<u8>) {
+        self.deliver_to(from, 0, data);
+    }
+
+    /// `deliver`, of a datagram sent to `group` (0: to the port).
+    fn deliver_to(&self, from: u32, group: u32, data: Vec<u8>) {
         let mut st = self.state.lock();
         if st.queued + cost(data.len()) > st.rcvbuf as usize || st.queue.try_grow(1).is_err() {
             Self::overrun(&mut st);
         } else {
             st.queued += cost(data.len());
-            st.queue.push_back(Datagram { from, data });
+            st.queue.push_back(Datagram { from, group, data });
         }
         self.changed(&mut st, true);
     }
@@ -284,7 +390,7 @@ impl NetlinkSocket {
                         break;
                     }
                     st.queued += cost(data.len());
-                    st.queue.push_back(Datagram { from: 0, data });
+                    st.queue.push_back(Datagram { from: 0, group: 0, data });
                     added = true;
                 }
                 None => {}
@@ -339,11 +445,16 @@ impl NetlinkSocket {
     }
 
     /// Sends `data` to port `to` (0: the kernel's end, which answers it:
-    /// no more than its receive buffer has room for, a dump as it reads).
-    fn send(self: &Arc<Self>, data: Vec<u8>, to: u32) -> Result<i64, i64> {
+    /// no more than its receive buffer has room for, a dump as it reads),
+    /// and to the members of the lowest group of `groups` first (Linux's
+    /// netlink_sendmsg: everyone is root here).
+    fn send(self: &Arc<Self>, data: Vec<u8>, to: u32, groups: u32) -> Result<i64, i64> {
         self.fits(data.len() as u64)?;
         let port = self.bind_port(0)?;
         let len = data.len() as i64;
+        if groups != 0 {
+            broadcast(groups.trailing_zeros() + 1, port, &data);
+        }
         if to == 0 {
             // (The replies themselves are the `netlink` crate's, at most the
             // receive buffer's room.)
@@ -363,7 +474,7 @@ impl NetlinkSocket {
                                 continue;
                             }
                             st.queued += cost(d.len());
-                            st.queue.push_back(Datagram { from: 0, data: d });
+                            st.queue.push_back(Datagram { from: 0, group: 0, data: d });
                             added = true;
                         }
                         netlink::Reply::Dump(d) => st.dump = Some(d),
@@ -389,7 +500,7 @@ impl NetlinkSocket {
     /// MSG_PEEK, copied) under the lock and copied to the program after it
     /// (a fault there may need the pager); a copy that faults loses it, as
     /// on Linux.
-    fn recv(&self, iov: &[(u64, u64)], flags: u64, nonblock: bool) -> Result<(usize, usize, u32), i64> {
+    fn recv(&self, iov: &[(u64, u64)], flags: u64, nonblock: bool) -> Result<(usize, usize, u32, u32), i64> {
         let (d, more) = loop {
             let seen;
             {
@@ -401,7 +512,7 @@ impl NetlinkSocket {
                 }
                 if flags & MSG_PEEK != 0 {
                     if let Some(d) = st.queue.front() {
-                        break (Datagram { from: d.from, data: heap::try_to_vec(&d.data)? }, false);
+                        break (Datagram { from: d.from, group: d.group, data: heap::try_to_vec(&d.data)? }, false);
                     }
                 } else if let Some(d) = st.queue.pop_front() {
                     st.queued -= cost(d.data.len());
@@ -436,7 +547,7 @@ impl NetlinkSocket {
             usercopy::to_program(base, &d.data[done..done + n])?;
             done += n;
         }
-        Ok((done, d.data.len(), d.from))
+        Ok((done, d.data.len(), d.from, group_bit(d.group)))
     }
 
     fn sockopt_u32(&self, level: u64, name: u64) -> Result<u32, i64> {
@@ -460,7 +571,7 @@ impl NetlinkSocket {
         })
     }
 
-    fn setsockopt(&self, level: u64, name: u64, val: u64, len: u64) -> Result<i64, i64> {
+    fn setsockopt(self: &Arc<Self>, level: u64, name: u64, val: u64, len: u64) -> Result<i64, i64> {
         let value: u32 = if len >= 4 { usercopy::read(val)? } else { 0 };
         let mut st = self.state.lock();
         match (level, name) {
@@ -483,16 +594,24 @@ impl NetlinkSocket {
                 if len < 4 {
                     return Err(EINVAL);
                 }
-                // rtnetlink's groups go up to 32 here; none carries a message.
+                // rtnetlink's groups go up to 32 here.
                 if value == 0 || value > 32 {
                     return Err(EINVAL);
                 }
-                let bit = 1u32 << (value - 1);
+                let bit = group_bit(value);
                 if name == NETLINK_ADD_MEMBERSHIP {
+                    let had = st.groups & bit != 0;
                     st.groups |= bit;
-                } else {
-                    st.groups &= !bit;
+                    drop(st);
+                    if let Err(e) = joined(self) {
+                        if !had {
+                            self.state.lock().groups &= !bit;
+                        }
+                        return Err(e);
+                    }
+                    return Ok(0);
                 }
+                st.groups &= !bit;
             }
             (SOL_NETLINK, NETLINK_PKTINFO | NETLINK_BROADCAST_ERROR | NETLINK_NO_ENOBUFS | NETLINK_LISTEN_ALL_NSID | NETLINK_CAP_ACK | NETLINK_EXT_ACK | NETLINK_GET_STRICT_CHK) => {
                 if len < 4 {
@@ -566,7 +685,7 @@ pub fn call(nr: u64, sock: &Arc<NetlinkSocket>, flags: u32, a: [u64; 6]) -> Resu
                     (h.iov, a[2], h.name, a[1] + 8, a[1])
                 }
             };
-            let (done, full, from) = sock.recv(&iov, rflags, nonblock)?;
+            let (done, full, from, groups) = sock.recv(&iov, rflags, nonblock)?;
             if msg != 0 {
                 // msg_namelen as Linux sets it, no control data, and
                 // MSG_TRUNC for a datagram longer than the buffers.
@@ -576,6 +695,7 @@ pub fn call(nr: u64, sock: &Arc<NetlinkSocket>, flags: u32, a: [u64; 6]) -> Resu
                     let mut raw = [0u8; SOCKADDR_NL];
                     raw[0..2].copy_from_slice(&(AF_NETLINK as u16).to_le_bytes());
                     raw[4..8].copy_from_slice(&from.to_le_bytes());
+                    raw[8..12].copy_from_slice(&groups.to_le_bytes());
                     usercopy::to_program(h.name, &raw[..room])?;
                 }
                 usercopy::write(name_len, &(SOCKADDR_NL as u32))?;
@@ -583,7 +703,7 @@ pub fn call(nr: u64, sock: &Arc<NetlinkSocket>, flags: u32, a: [u64; 6]) -> Resu
                 let out_flags: u32 = if done < full { MSG_TRUNC as u32 } else { 0 };
                 usercopy::write(msg + 48, &out_flags)?;
             } else if name != 0 {
-                write_addr(name, name_len, from, 0)?;
+                write_addr(name, name_len, from, groups)?;
             }
             Ok(if rflags & MSG_TRUNC != 0 { full } else { done } as i64)
         }
@@ -600,10 +720,11 @@ pub fn call(nr: u64, sock: &Arc<NetlinkSocket>, flags: u32, a: [u64; 6]) -> Resu
                     (h.iov, h.name, h.namelen as u64)
                 }
             };
-            let to = if name != 0 && namelen != 0 {
-                read_addr(name, namelen)?.0
+            let (to, groups) = if name != 0 && namelen != 0 {
+                read_addr(name, namelen)?
             } else {
-                sock.state.lock().dst_port
+                let st = sock.state.lock();
+                (st.dst_port, st.dst_groups)
             };
             let total = iov.iter().try_fold(0u64, |sum, &(_, len)| sum.checked_add(len)).ok_or(EINVAL)?;
             // EMSGSIZE beyond the send buffer, before anything is allocated.
@@ -616,18 +737,28 @@ pub fn call(nr: u64, sock: &Arc<NetlinkSocket>, flags: u32, a: [u64; 6]) -> Resu
                 usercopy::from_program(base, &mut data[at..at + len as usize])?;
                 at += len as usize;
             }
-            sock.send(data, to)
+            sock.send(data, to, groups)
         }
         SYS_BIND => {
             let (port, groups) = read_addr(a[1], a[2])?;
             sock.bind_port(port)?;
-            sock.state.lock().groups = groups;
+            // A member first, then known as one (a change in between is
+            // heard).
+            let before = core::mem::replace(&mut sock.state.lock().groups, groups);
+            if groups != 0 {
+                if let Err(e) = joined(sock) {
+                    sock.state.lock().groups = before;
+                    return Err(e);
+                }
+            }
             Ok(0)
         }
         SYS_CONNECT => {
-            let (port, _) = read_addr(a[1], a[2])?;
+            let (port, groups) = read_addr(a[1], a[2])?;
             sock.bind_port(0)?;
-            sock.state.lock().dst_port = port;
+            let mut st = sock.state.lock();
+            st.dst_port = port;
+            st.dst_groups = groups;
             Ok(0)
         }
         SYS_GETSOCKNAME => {

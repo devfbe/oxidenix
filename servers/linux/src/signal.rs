@@ -711,6 +711,14 @@ pub fn send_pgrp(pgid: Pid, sig: u32) -> bool {
     post_pgrp(&mut t, pgid, SigInfo::kernel(sig))
 }
 
+/// Sends `sig` (SI_KERNEL) to thread `tid` alone (F_SETOWN_EX's
+/// F_OWNER_TID); whether it exists.
+pub fn send_tid(tid: Pid, sig: u32) -> bool {
+    let mut t = PROCS.lock();
+    let Some(pid) = t.threads.get(&tid).map(|th| th.pid) else { return false };
+    post_thread(&mut t, pid, tid, SigInfo::kernel(sig))
+}
+
 /// Sends `sig` from a terminal to process `pid`; whether it exists.
 pub fn send_process(pid: Pid, sig: u32) -> bool {
     let mut t = PROCS.lock();

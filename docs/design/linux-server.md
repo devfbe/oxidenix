@@ -528,7 +528,13 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
      is local (`EADDRNOTAVAIL`) and the port, and `listen` checks the port again (Linux's
      `inet_csk_bind_conflict`, `netring::tcp_port_conflict`): a socket on an overlapping
      address conflicts unless both have `SO_REUSEADDR` and it does not listen
-     (`EADDRINUSE`), so of two sockets sharing a port only one may listen; port 0 takes an
+     (`EADDRINUSE`), so of two sockets sharing a port only one may listen, unless both set
+     `SO_REUSEPORT` (then any number of the instance's listeners or UDP sockets share it:
+     netd gives each member of the group its share, smoltcp's `Shard`, and a keyed hash of
+     a new connection's or a datagram's 4-tuple picks exactly one, as Linux's
+     `reuseport_select_sock`; a connected UDP socket hears its peer only, before the
+     others, and a listener or socket bound to the address before one bound to any, as
+     Linux's lookup scores them); port 0 takes an
      ephemeral port; connections inherit their listener's. `EPIPE` with `SIGPIPE`
      (unless `MSG_NOSIGNAL`) once the connection cannot send, after a pending error
      (`ECONNRESET`) is reported once; `MSG_PEEK`, `MSG_WAITALL`, `MSG_TRUNC` (datagrams),
@@ -536,6 +542,29 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
      (`SHUT_WR` sends `FIN` after what is queued), `TCP_NODELAY` (Nagle's algorithm is on
      by default, as Linux), `SO_KEEPALIVE`, `IP_TTL`, `FIONREAD`, `SIOCOUTQ`, `SO_LINGER`
      with a zero time (close sends `RST`), and close with unread data sends `RST`.
+     `SO_LINGER` with a time: `close(2)` asks for the `FIN` (`SHUTDOWN`) and waits on the
+     control block until netd reports it acknowledged with everything before it
+     (`state::FIN_ACKED`), the time ran out or a signal came, then closes as without it
+     (Linux's `tcp_close` and `sk_stream_wait_close`: no reset at the end of the time,
+     `O_NONBLOCK` does not shorten the wait, a process's exit and `shutdown` never linger;
+     data that arrives meanwhile resets the connection). The wait never happens where the
+     last reference dropped (that may be under a lock: an `AF_UNIX` queue holding the socket
+     in flight, an epoll set, an exec's close-on-exec): the program's thread puts the socket on
+     a list of its own (through the sockets, no allocation) and waits after its system call,
+     holding nothing, before the program runs again (`inet::run_deferred`, Linux's `__fput`
+     task work); an exiting thread closes without waiting.
+     **Urgent data** (`MSG_OOB`, Linux's reading of the urgent pointer: it points past the
+     urgent byte): a send with `MSG_OOB` marks the end of what it wrote in the control block
+     (`netring::UrgentMark`, stored before the tail), netd takes the send ring up to it and
+     marks smoltcp's urgent pointer there (a vendored patch: every segment before it carries
+     `URG` until the peer acknowledged it). The peer's pointer comes back as the receive
+     ring's position of the urgent byte, with the byte once its segment came
+     (`netring::Urgent`, one word, published before `rx_tail`); the byte stays in the ring,
+     and the server does what Linux's `tcp_recvmsg` does with it: a read stops at the mark,
+     skips the byte there unless `SO_OOBINLINE`, `recv(MSG_OOB)` takes it once (never
+     waits: `EAGAIN` until it came, `EINVAL` once taken or passed), `SIOCATMARK`, `POLLPRI`
+     while it waits, and the net thread sends `SIGURG` to the `F_SETOWN` owner when a new
+     pointer arrives.
      **Closing**: `close(2)` sends `CLOSE` before it returns, so the port is free then, as
      on Linux; what the pager learns (a process's exit closing its descriptors) it hands to
      the net thread, never waiting for netd itself. netd then copies what the send ring
