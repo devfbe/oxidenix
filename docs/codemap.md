@@ -8,7 +8,7 @@ module comment, and the public types it defines. Where to start for common tasks
 
 ## Kernel
 
-- `kernel/src/counters.rs` (28) Event counters of the hot paths, for the benchmarks (`docs/benchmarks/`): how many system calls, IPC round trips, bytes through IPC, address space switches, bytes copied to or from user memory and kernel heap... Types: `PerCpu`.
+- `kernel/src/counters.rs` (29) Event counters of the hot paths, for the benchmarks (`docs/benchmarks/`): how many system calls, IPC round trips, bytes through IPC, address space switches, bytes copied to or from user memory and kernel heap... Types: `PerCpu`.
 - `kernel/src/drivers/acpi.rs` (154) ACPI's static tables, as far as the kernel needs them: the MADT ("APIC") lists the CPUs (local APIC and x2APIC entries), the I/O APIC and how ISA interrupts are wired to it; the HPET table and the FADT ("FACP") say... Types: `Override`, `Madt`, `PmTimer`.
 - `kernel/src/drivers/console.rs` (863) Framebuffer text console with a cell grid, 16 colors and a visible cursor. Types: `Console`.
 - `kernel/src/drivers/console_device.rs` (241) The console as a device of the Linux server (ADR 0004, ADR 0007, ADR 0020): the console's answers to queries (and COM1's input while no terminal holds that port) go into a ring, the bytes written go to the screen and... Types: `Writer`.
@@ -42,20 +42,20 @@ module comment, and the public types it defines. Where to start for common tasks
 - `kernel/src/process/elf.rs` (81) Parsing ELF64 headers and program headers of static executables (for `loader`). Types: `Elf`, `ProgramHeader`, `Header`.
 - `kernel/src/process/errno.rs` (33) The kernel's error numbers, as its calls return them (negated): Linux's values, which the Linux server passes on to its programs unchanged.
 - `kernel/src/process/exec.rs` (50) A native server running its program anew (`oxrt::sys::EXEC`): the calling process gets a fresh address space with the server's program (the image the kernel read at boot; the kernel has no paths) and the given...
-- `kernel/src/process/exit.rs` (170) Ending threads and processes, and the kernel's wait for its own. Types: `WaitStatus`.
+- `kernel/src/process/exit.rs` (168) Ending threads and processes, and the kernel's wait for its own. Types: `WaitStatus`.
 - `kernel/src/process/futex.rs` (717) Futexes: sleeping on a word of user memory, the mechanism under every pthread mutex, condition variable and join. Types: `Ends`, `WaitWord`.
 - `kernel/src/process/futex/pi.rs` (620) Priority-inheritance locks on futex words: the mechanism under Linux's PI futexes (FUTEX_LOCK_PI, FUTEX_UNLOCK_PI, FUTEX_TRYLOCK_PI, FUTEX_WAIT_REQUEUE_PI, FUTEX_CMP_REQUEUE_PI), whose decoding, timeouts and restarts... Types: `Target`, `Owner`.
 - `kernel/src/process/ipc.rs` (282) Synchronous message passing between the kernel and user-space servers: the control plane of the I/O rings. Types: `Instance`.
 - `kernel/src/process/irq.rs` (52) Device interrupts for user-space drivers.
-- `kernel/src/process/kill.rs` (93) Killing threads and processes, and what the kernel's waits ask about it (`interrupted`, `dying`). Types: `GroupExit`.
-- `kernel/src/process/linux.rs` (2948) Restricted mode: a Linux program and the Linux server on one thread (docs/design/linux-server.md; the interface is `crates/restricted`). Types: `HeapArea`, `Instance`, `Object`, `Container`, `Record`, `LinuxThread`.
+- `kernel/src/process/kill.rs` (110) Killing threads and processes, and what the kernel's waits ask about it (`interrupted`, `dying`). Types: `GroupExit`, `ExitCell`.
+- `kernel/src/process/linux.rs` (2961) Restricted mode: a Linux program and the Linux server on one thread (docs/design/linux-server.md; the interface is `crates/restricted`). Types: `HeapArea`, `Instance`, `Object`, `Container`, `Record`, `LinuxThread`.
 - `kernel/src/process/loader.rs` (182) Loading a static ELF program into a new address space: its segments are mapped from the file's page cache (demand-paged, private), so every process running a program shares its unchanged pages. Types: `Image`.
 - `kernel/src/process/membarrier.rs` (77) membarrier(2)'s mechanisms (`restricted::SYS_MEMBARRIER`, ADR 0021): barriers on other CPUs, as Linux's kernel/sched/membarrier.c makes them.
 - `kernel/src/process/mod.rs` (579) Processes and threads: the process table, the current task, the servers the kernel starts and the process trees it starts with their Linux server instance; the submodules hold scheduling, address spaces, exit and... Types: `Server`, `Tree`.
 - `kernel/src/process/native.rs` (143) The system calls of the kernel's native servers (diskfs, netd, procfs, ringtest; `oxrt::sys`): the kernel's own interface, numbered as the Linux server's (`restricted`) where a call is the same mechanism (memory,...
 - `kernel/src/process/query.rs` (67) proc_query (syscall 1005): the kernel's native process and system information for the procfs server (records in `procproto`): the system-wide record only, for it and for the Linux server...
 - `kernel/src/process/sched.rs` (811) The SMP scheduler: per-CPU run queues, wait queues, context switches. Types: `Share`, `OpenShare`, `Table`, `PidReservation`, `CpuSched`, `CpuStats`, `WaitQueue`, `Wait`.
-- `kernel/src/process/syscall.rs` (221) The system call entry: the register `Frame` of every kernel entry, the `syscall` MSR setup, and the dispatch by who calls: a Linux program's call goes to its server (restricted mode), the Linux server's calls are the... Types: `Frame`.
+- `kernel/src/process/syscall.rs` (230) The system call entry: the register `Frame` of every kernel entry, the `syscall` MSR setup, and the dispatch by who calls: a Linux program's call goes to its server (restricted mode), the Linux server's calls are the... Types: `Frame`.
 - `kernel/src/process/task.rs` (303) Tasks and thread groups. Types: `FpuState`, `State`, `Info`, `ThreadGroup`, `CpuState`, `Process`, `Task`.
 - `kernel/src/process/tlb.rs` (269) TLB coherence: which CPUs use an address space, and shootdowns. Types: `Tlb`, `AsidCache`.
 - `kernel/src/process/uaccess.rs` (252) Access to the current process's user memory. Types: `Fixup`.
@@ -88,7 +88,7 @@ module comment, and the public types it defines. Where to start for common tasks
 - `servers/linux/src/futex.rs` (216) futex(2) (phase R9), set_robust_list and get_robust_list: Linux's operations over the kernel's futexes on the program's memory (`restricted::SYS_FUTEX_WAIT`, `SYS_FUTEX_WAKE`, `SYS_FUTEX_REQUEUE`,...
 - `servers/linux/src/heap.rs` (235) The server's heap: one allocator for every thread of the instance, in the heap area of the shared region (`pageheap`: page runs and slabs of size classes over an arena whose pages are committed and decommitted with... Types: `Kernel`, `ServerHeap`, `NoMem`, `TryGrow`, `TryExtend`, `TryPushStr`.
 - `servers/linux/src/ids.rs` (394) Credentials and process attributes (phase R8): the user and group ids, supplementary groups, capabilities, prctl, the resource usage calls (getrusage, times), the calls that name a thread or process for the kernel... Types: `Limits`.
-- `servers/linux/src/inet.rs` (1107) Internet sockets (phase R7b, ADR 0008): TCP, UDP and raw ICMP sockets of the server, each a file of its own, as AF_UNIX ones are; netd runs the protocols. Types: `RecvOpts`, `Received`, `Local`, `Opts`, `InetSock`.
+- `servers/linux/src/inet.rs` (1110) Internet sockets (phase R7b, ADR 0008): TCP, UDP and raw ICMP sockets of the server, each a file of its own, as AF_UNIX ones are; netd runs the protocols. Types: `RecvOpts`, `Received`, `Local`, `Opts`, `InetSock`.
 - `servers/linux/src/inetcalls.rs` (538) The system calls of internet sockets (phase R7b): socket(2) for the AF_INET family, and every call on a descriptor of one of the server's internet sockets: addresses (`sockaddr_in`), message headers, flags, options,...
 - `servers/linux/src/initramfs.rs` (65) The instance's root tmpfs from the boot image's initramfs (phase R6c.2c): the server reads the archive's headers and names from the kernel's image object (`SYS_INITRAMFS`) and makes each regular file a file object...
 - `servers/linux/src/inotify.rs` (541) inotify(7): watches on the files of the server's filesystems (tmpfs and /data) and the queue of their events, a file of the server, as eventfd. Types: `Key`, `Inotify`.
@@ -289,7 +289,7 @@ kernel that handle them.
 
 | nr | call | handled at |
 |---|---|---|
-| 1010 | `SYS_RESTRICTED_ENTER` | kernel/src/process/syscall.rs:253 |
+| 1010 | `SYS_RESTRICTED_ENTER` | kernel/src/process/syscall.rs:251, kernel/src/process/syscall.rs:267 |
 | 1012 | `SYS_HANDLE_CLOSE` | kernel/src/process/linux.rs:1757 |
 | 1013 | `SYS_MO_CREATE` | kernel/src/process/linux.rs:1774 |
 | 1014 | `SYS_MO_MAP` | kernel/src/process/linux.rs:1782, kernel/src/process/native.rs:71 |
