@@ -5,10 +5,12 @@
 //! (`ids::soft`: a table may be shared by processes with limits of their own, as on Linux).
 //! The calls on descriptors as such are here: close, close_range, dup, dup2, dup3,
 //! fcntl's F_DUPFD, F_DUPFD_CLOEXEC, F_GETFD, F_SETFD, F_GETFL,
-//! F_SETFL, F_SETOWN, F_GETOWN, F_SETOWN_EX and F_GETOWN_EX (the
-//! description's owner: a socket's SIGURG goes there), the ioctls FIONBIO, FIOCLEX and FIONCLEX. F_SETFL changes O_APPEND and O_NONBLOCK; of the rest of
-//! Linux's SETFL_MASK it ignores O_DIRECT (kept as opened), O_NOATIME (no
-//! access times are kept apart) and O_ASYNC (no SIGIO), as the kernel did.
+//! F_SETFL, F_SETOWN, F_GETOWN, F_SETOWN_EX, F_GETOWN_EX (the description's owner: its
+//! SIGIO and a socket's SIGURG go there), F_SETSIG and F_GETSIG (signal-driven I/O's
+//! signal, ADR 0023), the ioctls FIONBIO, FIOASYNC, FIOCLEX and FIONCLEX. F_SETFL changes
+//! O_APPEND, O_NONBLOCK and O_ASYNC (`files::Description::set_async`); of the rest of
+//! Linux's SETFL_MASK it ignores O_DIRECT (kept as opened) and O_NOATIME (no
+//! access times are kept apart), as the kernel did.
 //!
 //! **Which table.** Each thread of a program has one (`process::Thread::files`), shared by
 //! the threads and processes made with CLONE_FILES; the thread finds its own without a lock
@@ -358,6 +360,7 @@ const SYS_DUP3: u64 = 292;
 const SYS_CLOSE_RANGE: u64 = 436;
 
 const FIONBIO: u64 = 0x5421;
+const FIOASYNC: u64 = 0x5452;
 const FIONCLEX: u64 = 0x5450;
 const FIOCLEX: u64 = 0x5451;
 
@@ -368,6 +371,8 @@ const F_GETFL: u64 = 3;
 const F_SETFL: u64 = 4;
 const F_SETOWN: u64 = 8;
 const F_GETOWN: u64 = 9;
+const F_SETSIG: u64 = 10;
+const F_GETSIG: u64 = 11;
 const F_SETOWN_EX: u64 = 15;
 const F_GETOWN_EX: u64 = 16;
 /// `struct f_owner_ex`'s types.
@@ -388,7 +393,7 @@ pub fn handle(s: &State) -> Option<i64> {
         SYS_DUP3 => dup3(a0, a1, a2, false),
         SYS_FCNTL => fcntl(a0, a1, a2),
         SYS_CLOSE_RANGE => close_range(a0 as u32 as u64, a1 as u32 as u64, a2),
-        SYS_IOCTL if matches!(a1 as u32 as u64, FIONBIO | FIOCLEX | FIONCLEX) => ioctl(a0, a1 as u32 as u64, a2),
+        SYS_IOCTL if matches!(a1 as u32 as u64, FIONBIO | FIOASYNC | FIOCLEX | FIONCLEX) => ioctl(a0, a1 as u32 as u64, a2),
         _ => return None,
     };
     Some(result.unwrap_or_else(|e| -e))
@@ -502,34 +507,31 @@ fn fcntl(fd: u64, cmd: u64, arg: u64) -> Result<i64, i64> {
             slot.cloexec = arg & FD_CLOEXEC != 0;
             Ok(0)
         }
-        F_GETFL => Ok(file.flags() as i64),
+        F_GETFL => Ok(file.status_flags() as i64),
         F_SETFL => {
-            // O_APPEND and O_NONBLOCK change (Linux's SETFL_MASK has
+            // O_ASYNC, O_APPEND and O_NONBLOCK change (Linux's SETFL_MASK has
             // O_DIRECT and O_NOATIME too: O_DIRECT is kept as opened here,
-            // O_NOATIME means nothing without access times kept apart).
+            // O_NOATIME means nothing without access times kept apart). O_ASYNC first:
+            // a hung-up terminal refuses it (ENOTTY), and then nothing changes.
+            file.set_async(fd as i32, arg as u32 & files::O_ASYNC != 0, false)?;
             file.set_flags(O_APPEND | O_NONBLOCK, arg as u32);
             Ok(0)
         }
+        // The signal of signal-driven I/O: 0 for SIGIO without siginfo, else any signal,
+        // queued with its siginfo (Linux's valid_signal: up to 64).
+        F_SETSIG => {
+            if arg > crate::signal::NSIG as u64 {
+                return Err(EINVAL);
+            }
+            file.set_signum(arg as u32);
+            Ok(0)
+        }
+        F_GETSIG => Ok(file.signum() as i64),
         // Who gets the file's signals (Linux's f_setown: a process, or a
         // process group for a negative id; 0 for nobody; ESRCH for an id
         // nobody has).
-        F_SETOWN => {
-            let who = arg as i32;
-            if who == i32::MIN {
-                return Err(EINVAL);
-            }
-            let owner = match who {
-                0 => files::Owner::None,
-                w if w < 0 => files::Owner::Group(w.unsigned_abs()),
-                w => files::Owner::Process(w as u32),
-            };
-            set_owner(&file, owner)
-        }
-        F_GETOWN => Ok(match file.owner() {
-            files::Owner::None => 0,
-            files::Owner::Group(g) => -(g as i64),
-            files::Owner::Thread(id) | files::Owner::Process(id) => id as i64,
-        }),
+        F_SETOWN => set_owner_of(&file, arg as i32),
+        F_GETOWN => Ok(owner_id(&file)),
         F_SETOWN_EX => {
             let ex: [i32; 2] = usercopy::read(arg)?;
             let id = u32::try_from(ex[1]).map_err(|_| EINVAL)?;
@@ -542,16 +544,54 @@ fn fcntl(fd: u64, cmd: u64, arg: u64) -> Result<i64, i64> {
             };
             set_owner(&file, owner)
         }
+        // Its kind, and its id while it is there (Linux's f_getown_ex).
         F_GETOWN_EX => {
-            let ex: [i32; 2] = match file.owner() {
+            let owner = file.owner();
+            let id = |id: u32| if owner_alive(owner) { id as i32 } else { 0 };
+            let ex: [i32; 2] = match owner {
                 files::Owner::None => [F_OWNER_PID, 0],
-                files::Owner::Thread(id) => [F_OWNER_TID, id as i32],
-                files::Owner::Process(id) => [F_OWNER_PID, id as i32],
-                files::Owner::Group(id) => [F_OWNER_PGRP, id as i32],
+                files::Owner::Thread(t) => [F_OWNER_TID, id(t)],
+                files::Owner::Process(p) => [F_OWNER_PID, id(p)],
+                files::Owner::Group(g) => [F_OWNER_PGRP, id(g)],
             };
             usercopy::write(arg, &ex).map(|_| 0)
         }
         _ => Err(EINVAL),
+    }
+}
+
+/// Whether the owner `owner` names is there (Linux's pid_task of the owner's pid and type).
+fn owner_alive(owner: files::Owner) -> bool {
+    match owner {
+        files::Owner::None => false,
+        files::Owner::Thread(tid) => crate::process::task_exists(tid, true),
+        files::Owner::Process(pid) => crate::process::task_exists(pid, false),
+        files::Owner::Group(pgid) => crate::process::pgrp_session(pgid).is_some(),
+    }
+}
+
+/// F_SETOWN's `who` (FIOSETOWN's, SIOCSPGRP's): a process, a process group for a negative
+/// id, nobody for 0 (Linux's f_setown); EINVAL for INT_MIN, ESRCH for an id nobody has.
+pub fn set_owner_of(file: &FileRef, who: i32) -> Result<i64, i64> {
+    if who == i32::MIN {
+        return Err(EINVAL);
+    }
+    let owner = match who {
+        0 => files::Owner::None,
+        w if w < 0 => files::Owner::Group(w.unsigned_abs()),
+        w => files::Owner::Process(w as u32),
+    };
+    set_owner(file, owner)
+}
+
+/// F_GETOWN's answer (FIOGETOWN's, SIOCGPGRP's): the owner's id, negative for a process
+/// group; 0 for none, or once it is gone (Linux's f_getown, by pid_task).
+pub fn owner_id(file: &FileRef) -> i64 {
+    match file.owner() {
+        o if !owner_alive(o) => 0,
+        files::Owner::None => 0,
+        files::Owner::Group(g) => -(g as i64),
+        files::Owner::Thread(id) | files::Owner::Process(id) => id as i64,
     }
 }
 
@@ -582,6 +622,12 @@ fn ioctl(fd: u64, request: u64, arg: u64) -> Result<i64, i64> {
             let on: i32 = usercopy::read(arg)?;
             file.set_flags(O_NONBLOCK, if on != 0 { O_NONBLOCK } else { 0 });
             Ok(0)
+        }
+        // O_ASYNC (Linux's ioctl_fioasync): ENOTTY for a file without signal-driven I/O
+        // (if the flag would change).
+        FIOASYNC => {
+            let on: i32 = usercopy::read(arg)?;
+            file.set_async(fd as i32, on != 0, true).map(|_| 0)
         }
         _ => {
             let mut t = context.table.lock();

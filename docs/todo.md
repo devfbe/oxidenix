@@ -63,8 +63,7 @@ done, delete it here in the same commit.
   console), no console fonts, screen or color maps (`GIO_SCRNMAP`, `PIO_CMAP`), blanking or
   scrollback; serial lines without carrier detection, `TIOCMIWAIT`, `TIOCGICOUNT`, received
   breaks and parity errors, and with polled output.
-- Network: IPv6, `O_ASYNC` (`SIGIO`; `F_SETOWN` is kept and used for `SIGURG`), raw ICMP is shared
-  between instances (documented in ADR 0008).
+- Network: IPv6, raw ICMP is shared between instances (documented in ADR 0008).
 - `rseq` is `ENOSYS` (ADR 0021: glibc goes on without it). A real one needs the kernel to
   update the registered area's CPU number and abort a critical section on every return to
   user mode after a preemption or migration, and the server on signal delivery.

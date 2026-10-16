@@ -27,6 +27,10 @@
 //! is at the mark, POLLPRI that the byte waits, and the net thread sends
 //! SIGURG to the F_SETOWN owner for each new pointer (`Urg`).
 //!
+//! **Signal-driven I/O** (O_ASYNC, ADR 0023): the net thread tells the owner what netd
+//! changed as Linux's TCP and UDP do (`async_events`: data, a connection to accept, a
+//! connect done, room after a send found none, the peer's FIN, an error).
+//!
 //! **Data** moves between the program and the socket's rings in the
 //! server's pool (`netclient::Rings`): one copy, with only the socket's
 //! receive or send lock held (receives and sends are serialized, as Linux's
@@ -118,6 +122,11 @@ pub struct Local {
     seen_rx: u32,
     seen_tx: u32,
     seen_backlog: u32,
+    /// netd's state bits, its count of errors and whether the channel was dead when the net
+    /// thread last looked (`netd_changed`: what changed since signals the O_ASYNC owner).
+    seen_state: u32,
+    seen_err: u32,
+    seen_dead: bool,
     urg: Urg,
     pub opts: Opts,
 }
@@ -169,6 +178,12 @@ pub struct InetSock {
     /// copy), and the count of netd's urgent pointers it was sent for.
     owner: AtomicU64,
     urg_signalled: core::sync::atomic::AtomicU16,
+    /// TCP receives sleeping for data (Linux's SOCKWQ_ASYNC_WAITDATA, set by sk_wait_data):
+    /// while there are any, new data signals no O_ASYNC owner.
+    waitdata: core::sync::atomic::AtomicU32,
+    /// A send found no room, or poll found the socket not writable (Linux's
+    /// SOCKWQ_ASYNC_NOSPACE): room signals the O_ASYNC owner once then.
+    nospace: core::sync::atomic::AtomicBool,
 }
 
 /// Monotonic nanoseconds.
@@ -211,6 +226,8 @@ impl InetSock {
             deferred_next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
             owner: AtomicU64::new(0),
             urg_signalled: core::sync::atomic::AtomicU16::new(0),
+            waitdata: core::sync::atomic::AtomicU32::new(0),
+            nospace: core::sync::atomic::AtomicBool::new(false),
             st: Mutex::new(Local {
                 connecting: false,
                 rings_sent,
@@ -223,6 +240,9 @@ impl InetSock {
                 seen_rx: 0,
                 seen_tx: 0,
                 seen_backlog: 0,
+                seen_state: 0,
+                seen_err: 0,
+                seen_dead: false,
                 urg: Urg::default(),
                 opts: Opts {
                     rcvtimeo: 0,
@@ -464,8 +484,56 @@ impl InetSock {
         files::ready(self.id(), now);
     }
 
+    /// Poll's readiness (Linux's tcp_poll, udp_poll): a socket found not writable (a TCP
+    /// socket only while connected and open for sending) signals its O_ASYNC owner when
+    /// room comes (`nospace`).
     pub fn readiness_now(&self) -> i16 {
-        self.readiness(&mut self.st.lock())
+        let mut l = self.st.lock();
+        let m = self.readiness(&mut l);
+        if m & POLLOUT == 0 {
+            let s = self.snap().state;
+            let sending = s & state::ESTABLISHED != 0 && s & state::SEND_OPEN != 0 && !l.shut_wr;
+            if self.kind != Kind::Tcp || sending {
+                self.nospace.store(true, SeqCst);
+            }
+        }
+        m
+    }
+
+    /// What netd's change from `l`'s last look to `snap` tells the O_ASYNC owner (state
+    /// lock held; Linux's sk_wake_async calls of TCP and UDP): new data or a connection
+    /// (POLL_IN, unless a TCP receive sleeps for it), a connection made (POLL_OUT), room
+    /// after a send found none (POLL_OUT, once), the peer's FIN (POLL_IN, or POLL_HUP once
+    /// both ways are shut), an error (POLL_ERR). In that order; at most five.
+    fn async_events(&self, l: &mut Local, snap: &Snap, data: bool, room: bool, now: i16) -> [Option<files::Io>; 5] {
+        use files::Io;
+        let (was, is) = (l.seen_state, snap.state);
+        let dead = self.net.is_dead();
+        let waitd = self.waitdata.load(SeqCst) == 0;
+        let mut out = [None; 5];
+        if data && waitd {
+            out[0] = Some(Io::In);
+        }
+        // (Linux's tcp_finish_connect; an accepted socket starts out established.)
+        if self.kind == Kind::Tcp && was & state::ESTABLISHED == 0 && is & state::ESTABLISHED != 0 {
+            out[1] = Some(Io::Out);
+        }
+        // (A datagram socket's room is netd's WRITABLE coming back.)
+        let room = room || (was & state::WRITABLE == 0 && is & state::WRITABLE != 0);
+        if room && now & POLLOUT != 0 && !l.shut_wr && self.nospace.swap(false, SeqCst) {
+            out[2] = Some(Io::Out);
+        }
+        if self.kind == Kind::Tcp && was & state::RECV_EOF == 0 && is & state::RECV_EOF != 0 && waitd {
+            let both = l.shut_wr || is & state::SEND_OPEN == 0 || is & state::CLOSED != 0;
+            out[3] = Some(if both { Io::Hup } else { Io::In });
+        }
+        if snap.err_seq != l.seen_err || (dead && !l.seen_dead) {
+            out[4] = Some(Io::Err);
+        }
+        l.seen_state = is;
+        l.seen_err = snap.err_seq;
+        l.seen_dead = dead;
+        out
     }
 
     /// For poll and select: counts the caller among the waiters netd wakes
@@ -490,16 +558,27 @@ impl InetSock {
     pub fn netd_changed(&self) {
         let snap = self.snap();
         let mut l = self.st.lock();
-        let event = snap.rx_tail != l.seen_rx || snap.tx_head != l.seen_tx || snap.backlog > l.seen_backlog;
+        let (data, room) = (snap.rx_tail != l.seen_rx || snap.backlog > l.seen_backlog, snap.tx_head != l.seen_tx);
         l.seen_rx = snap.rx_tail;
         l.seen_tx = snap.tx_head;
         l.seen_backlog = snap.backlog;
-        self.report(&mut l, event);
+        self.report(&mut l, data || room);
+        let now = l.reported;
+        let ios = self.async_events(&mut l, &snap, data, room, now);
         drop(l);
+        let id = self.id();
+        for io in ios.into_iter().flatten() {
+            files::sigio(id, io);
+        }
         // New urgent data: SIGURG to the owner (Linux's sk_send_sigurg, when
-        // the pointer arrives, before its byte perhaps).
+        // the pointer arrives, before its byte perhaps), and with O_ASYNC an F_SETSIG
+        // signal with POLL_PRI.
         if self.urg_signalled.swap(snap.urg.count, SeqCst) != snap.urg.count {
-            files::Owner::decode(self.owner.load(SeqCst)).signal(crate::signal::SIGURG);
+            let owner = files::Owner::decode(self.owner.load(SeqCst));
+            if owner != files::Owner::None {
+                owner.signal(crate::signal::SIGURG);
+                files::sigio_urgent(id);
+            }
         }
         if self.net.is_dead() {
             // Waiters sleep on the dead channel's memory: they wake, as
@@ -675,7 +754,12 @@ impl InetSock {
                         let peer = Endpoint { addr: c.values[0] as u32, port: c.values[1] as u16 };
                         // Its options as the listener's (Linux copies them).
                         let opts = self.st.lock().opts;
-                        s.st.lock().opts = opts;
+                        {
+                            let mut l = s.st.lock();
+                            l.opts = opts;
+                            // Connected when it came: no connection of its own to signal.
+                            l.seen_state = state::ESTABLISHED;
+                        }
                         self.net.register(index, &s);
                         self.changed();
                         return Ok((s, peer));
@@ -841,6 +925,10 @@ impl InetSock {
                 }
                 continue;
             }
+            if room == 0 {
+                // (Linux's sk_stream_wait_memory: room will signal the O_ASYNC owner.)
+                self.nospace.store(true, SeqCst);
+            }
             if nonblock {
                 if sent > 0 {
                     break;
@@ -898,7 +986,13 @@ impl InetSock {
             let seen = self.ctl().seen();
             match self.net.status(Request::Send { sock: self.index, to: to.unwrap_or_default(), len: len as u32 }) {
                 Ok(c) => return Ok(c.status as usize),
-                Err(EAGAIN) if !nonblock => {}
+                Err(EAGAIN) => {
+                    // (Linux's sock_alloc_send_pskb: room will signal the O_ASYNC owner.)
+                    self.nospace.store(true, SeqCst);
+                    if nonblock {
+                        return Err(EAGAIN);
+                    }
+                }
                 Err(e) => return Err(e),
             }
             let snap = self.snap();
@@ -1038,7 +1132,10 @@ impl InetSock {
             }
             // Not holding the other readers off while it sleeps.
             reader = None;
-            if let Err(e) = self.wait(seen, deadline) {
+            self.waitdata.fetch_add(1, SeqCst);
+            let woken = self.wait(seen, deadline);
+            self.waitdata.fetch_sub(1, SeqCst);
+            if let Err(e) = woken {
                 if copied > 0 {
                     break;
                 }

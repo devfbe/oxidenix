@@ -1260,7 +1260,9 @@ the kernel keeps descriptor tables for its native servers only. Decisions in ADR
   process's soft RLIMIT_NOFILE (`ids::Limits`: 4096 by default, at most 2^20, Linux's
   fs.nr_open). Its calls: close, close_range (with `CLOSE_RANGE_CLOEXEC` and
   `CLOSE_RANGE_UNSHARE`), dup, dup2, dup3, fcntl's `F_DUPFD`, `F_DUPFD_CLOEXEC`, `F_GETFD`,
-  `F_SETFD`, `F_GETFL` and `F_SETFL` (O_APPEND, O_NONBLOCK; O_DIRECT, O_NOATIME and O_ASYNC are ignored), the ioctls `FIONBIO`, `FIOCLEX`
+  `F_SETFD`, `F_GETFL` and `F_SETFL` (O_APPEND, O_NONBLOCK, O_ASYNC; O_DIRECT and O_NOATIME are ignored),
+  the owner and signal of signal-driven I/O (`F_SETOWN`, `F_GETOWN`, `F_SETOWN_EX`,
+  `F_GETOWN_EX`, `F_SETSIG`, `F_GETSIG`), the ioctls `FIONBIO`, `FIOASYNC`, `FIOCLEX`
   and `FIONCLEX`. No lock of a table is held
   while program memory is copied or a description is let go of.
 - **Which threads share a table** is the process model's (R8; until then the kernel's clone
@@ -1322,6 +1324,18 @@ the server's own tmpfs and removed all of it: every file a program opens is the 
   (restarted unless a handler ran, with the time left, which they write back first, Linux's
   poll_select_finish), epoll_wait EINTR. The server's signal delivery maps these codes
   (`signal::ERESTARTSYS` and the others), as Linux's does.
+- **Signal-driven I/O** (ADR 0023): `O_ASYNC` (F_SETFL, `FIOASYNC`) on a pipe or FIFO, a
+  socket, a terminal or pty master, or an inotify instance puts an entry in the
+  description's watch (`poll::Watch::set_async`, Linux's fasync_struct: the descriptor),
+  which also keeps the description's owner and F_SETSIG signal (`files::Fown`, Linux's
+  fown_struct). Each file calls `files::sigio(id, Io::...)` where Linux's driver calls
+  kill_fasync, with the same reason (POLL_IN, POLL_OUT, POLL_ERR, POLL_PRI, POLL_HUP) and
+  the same gates (a socket's SOCKWQ_ASYNC_WAITDATA and SOCKWQ_ASYNC_NOSPACE, a terminal's
+  TTY_DO_WRITE_WAKEUP); the call finds the watch by id as reports do, costs a load while no
+  description in the instance has O_ASYNC, and sends after the entry's lock
+  (`signal::send_sigio`): SIGIO, or the F_SETSIG signal with si_code, si_band and si_fd,
+  SIGIO again when that real-time signal cannot be queued; to a thread, a process or each
+  process of a group. The process lock comes after every file's lock.
 
 ### epoll
 

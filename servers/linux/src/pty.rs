@@ -338,6 +338,7 @@ impl PtyMaster {
                     // (Without memory: dropped, as when it is full.)
                     if p.out.len() < tty::MASTER_CAP && p.out.try_grow(1).is_ok() {
                         p.out.push_back(b);
+                        p.out_new = true;
                     }
                 }
                 self.tty.changed(&mut inner, false, true);

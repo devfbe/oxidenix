@@ -39,6 +39,8 @@ pub const SIGTTIN: u32 = 21;
 pub const SIGTTOU: u32 = 22;
 pub const SIGURG: u32 = 23;
 pub const SIGWINCH: u32 = 28;
+/// SIGIO, also SIGPOLL.
+pub const SIGIO: u32 = 29;
 pub const SIGSYS: u32 = 31;
 pub const SIGRTMIN: u32 = 32;
 pub const NSIG: u32 = 64;
@@ -57,6 +59,8 @@ pub const SI_USER: i32 = 0;
 pub const SI_KERNEL: i32 = 0x80;
 pub const SI_TKILL: i32 = -6;
 pub const SI_TIMER: i32 = -2;
+/// Signal-driven I/O's code for a signal whose own codes would make POLL_* ambiguous.
+pub const SI_SIGIO: i32 = -5;
 pub const CLD_EXITED: i32 = 1;
 pub const CLD_KILLED: i32 = 2;
 pub const CLD_STOPPED: i32 = 5;
@@ -182,6 +186,15 @@ impl SigInfo {
         let mut s = SigInfo::new(sig, SI_TIMER);
         s.0[2] = id as u32 as u64;
         s.0[3] = value;
+        s
+    }
+
+    /// Signal-driven I/O on descriptor `fd` (an F_SETSIG signal): `code` (POLL_IN ..
+    /// POLL_HUP, or SI_SIGIO), the poll events of the reason in si_band, si_fd.
+    pub fn poll(sig: u32, code: i32, band: i64, fd: i32) -> SigInfo {
+        let mut s = SigInfo::new(sig, code);
+        s.0[2] = band as u64;
+        s.0[3] = fd as u32 as u64;
         s
     }
 
@@ -766,6 +779,51 @@ pub fn send_tid(tid: Pid, sig: u32) -> bool {
 pub fn send_process(pid: Pid, sig: u32) -> bool {
     let mut t = PROCS.lock();
     post_process(&mut t, pid, SigInfo::kernel(sig), false)
+}
+
+/// The signals with codes of their own, among which signal-driven I/O's POLL_* codes would
+/// be ambiguous: an F_SETSIG signal of these but SIGIO gets SI_SIGIO (Linux's
+/// SIG_SPECIFIC_SICODES_MASK).
+const SIG_SPECIFIC_SICODES: u64 =
+    (1 << (SIGILL - 1)) | (1 << (SIGFPE - 1)) | (1 << (SIGSEGV - 1)) | (1 << (SIGBUS - 1)) | (1 << (SIGTRAP - 1)) | (1 << (SIGCHLD - 1)) | (1 << (SIGIO - 1)) | (1 << (SIGSYS - 1));
+
+/// Signal-driven I/O (Linux's send_sigio): `io` happened on descriptor `fd` of a
+/// description with O_ASYNC, whose owner (a thread, a process, or each process of a group)
+/// gets SIGIO (SI_KERNEL) without F_SETSIG, else the F_SETSIG signal `signum` with its
+/// siginfo (si_code the reason, si_band its poll events, si_fd), and SIGIO instead when that
+/// cannot be queued (a real-time signal beyond RLIMIT_SIGPENDING, or no memory for it).
+/// Everyone is root: the permission check (Linux's sigio_perm) always passes.
+pub fn send_sigio(owner: crate::files::Owner, signum: u32, fd: i32, io: crate::files::Io) {
+    use crate::files::Owner;
+    let mut t = PROCS.lock();
+    match owner {
+        Owner::None => {}
+        Owner::Thread(tid) => {
+            if let Some(pid) = t.threads.get(&tid).map(|th| th.pid) {
+                sigio_to(&mut t, pid, Some(tid), signum, fd, io);
+            }
+        }
+        Owner::Process(pid) => sigio_to(&mut t, pid, None, signum, fd, io),
+        Owner::Group(pgid) => {
+            let mut from = 0;
+            while let Some(pid) = next_proc(&t, from, |p| p.pgid == pgid && p.zombie.is_none()) {
+                sigio_to(&mut t, pid, None, signum, fd, io);
+                from = pid + 1;
+            }
+        }
+    }
+}
+
+/// `send_sigio` to process `pid` or its thread `thread` (Linux's send_sigio_to_task).
+fn sigio_to(t: &mut Table, pid: Pid, thread: Option<Pid>, signum: u32, fd: i32, io: crate::files::Io) {
+    if signum != 0 {
+        let code = if signum != SIGIO && SIG_SPECIFIC_SICODES & bit(signum) != 0 { SI_SIGIO } else { io as i32 };
+        if post(t, pid, thread, SigInfo::poll(signum, code, io.band() as i64, fd), false, true).is_ok() {
+            return;
+        }
+    }
+    // Plain SIGIO (no F_SETSIG, or its signal could not be queued).
+    let _ = post(t, pid, thread, SigInfo::kernel(SIGIO), false, false);
 }
 
 // ------------------------------------------------------------------ delivery

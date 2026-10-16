@@ -1902,6 +1902,13 @@ pub fn exists(pid: Pid) -> bool {
     t.procs.contains_key(&pid) || t.threads.contains_key(&pid)
 }
 
+/// Whether thread `tid` (`thread`) or process `pid` is there, a zombie too (Linux's
+/// pid_task of a PIDTYPE_PID or PIDTYPE_TGID: until it is reaped).
+pub fn task_exists(id: Pid, thread: bool) -> bool {
+    let t = PROCS.lock();
+    if thread { t.threads.contains_key(&id) } else { t.procs.contains_key(&id) }
+}
+
 /// set_robust_list: the calling thread's robust list head (`Thread::robust`).
 pub fn set_robust(head: u64) {
     if let Some(th) = PROCS.lock().threads.get_mut(&local::tid()) {
