@@ -113,6 +113,44 @@ fn is_stop(sig: u32) -> bool {
     STOP_SIGNALS & bit(sig) != 0
 }
 
+/// The signals whose default action dumps core (Linux's SIG_KERNEL_COREDUMP_MASK): SIGQUIT,
+/// SIGILL, SIGTRAP, SIGABRT, SIGBUS, SIGFPE, SIGSEGV, SIGXCPU, SIGXFSZ, SIGSYS.
+const COREDUMP: u64 = {
+    const SIGQUIT: u32 = 3;
+    const SIGABRT: u32 = 6;
+    const SIGXCPU: u32 = 24;
+    const SIGXFSZ: u32 = 25;
+    let sigs = [SIGQUIT, SIGILL, SIGTRAP, SIGABRT, SIGBUS, SIGFPE, SIGSEGV, SIGXCPU, SIGXFSZ, SIGSYS];
+    let mut mask = 0;
+    let mut i = 0;
+    while i < sigs.len() {
+        mask |= 1 << (sigs[i] - 1);
+        i += 1;
+    }
+    mask
+};
+
+/// Whether the default action of `sig` dumps core.
+pub fn dumps_core(sig: u32) -> bool {
+    (1..=NSIG).contains(&sig) && COREDUMP & bit(sig) != 0
+}
+
+/// `CLD_DUMPED`: a child ended by a signal and dumped core.
+pub const CLD_DUMPED: i32 = 3;
+/// The core dump flag of a wait status (WCOREDUMP).
+pub const WCOREFLAG: i32 = 0x80;
+
+/// What waitid's siginfo and SIGCHLD say of a child that ended with wait status `status`:
+/// its `si_code` (`CLD_EXITED`, `CLD_KILLED`, or `CLD_DUMPED` with the core flag) and
+/// `si_status` (the exit code, or the signal).
+pub fn exit_code_of(status: i32) -> (i32, i32) {
+    match status & 0x7f {
+        0 => (CLD_EXITED, (status >> 8) & 0xff),
+        sig if status & WCOREFLAG != 0 => (CLD_DUMPED, sig),
+        sig => (CLD_KILLED, sig),
+    }
+}
+
 /// Linux's `struct sigaction` as rt_sigaction takes it.
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug)]
@@ -436,9 +474,15 @@ fn kills_by_default(sig: u32) -> bool {
 fn prepare(t: &mut Table, pid: Pid, thread: Option<Pid>, sig: u32, force: bool) -> bool {
     let Some(p) = t.procs.get(&pid) else { return false };
     if p.zombie.is_some() || p.exiting.is_some() {
+        // A SIGKILL ends a core dump under way: the process ends by it, without a core
+        // (Linux's dump_interrupted).
+        if sig == SIGKILL && p.zombie.is_none() {
+            crate::coredump::interrupt(t, pid);
+        }
         // A SIGKILL still ends the traced threads of an ending process: one stopped for its
         // tracer on its way out (PTRACE_EVENT_EXIT) goes on for it (Linux's TASK_TRACED is
         // killable).
+        let p = &t.procs[&pid];
         if sig == SIGKILL && p.zombie.is_none() {
             for i in 0..p.threads.len() {
                 let tid = t.procs[&pid].threads[i];
@@ -610,7 +654,9 @@ fn complete(t: &mut Table, pid: Pid, thread: Option<Pid>, sig: u32) {
     let waited_for = t.threads.get(&tid).is_some_and(|th| th.sig.waiting_for & bit(sig) != 0);
     // (A tracee's fatal signal goes through its signal-delivery-stop first.)
     let traced = crate::ptrace::traced(t, tid);
-    if sig == SIGKILL || (action.handler == SIG_DFL && kills_by_default(sig) && !waited_for && !traced) {
+    // (One that dumps core is the chosen thread's to take: it dumps, then ends the process,
+    // as Linux's complete_signal leaves it to get_signal.)
+    if sig == SIGKILL || (action.handler == SIG_DFL && kills_by_default(sig) && !dumps_core(sig) && !waited_for && !traced) {
         // A fatal signal kills every thread now, wherever it waits.
         t.group_exit(pid, sig as i32, None);
         return;
@@ -866,8 +912,8 @@ enum Next {
     Exit(i32),
     /// It stops until SIGCONT: it waits on the word (`seen`: its value before).
     Stop(alloc::sync::Arc<process::Words>, u32),
-    /// A fatal signal: the process ends with it.
-    Die(u32),
+    /// A fatal signal (and its siginfo): the process ends with it.
+    Die(u32, SigInfo),
     /// A handler runs: (signal, action, siginfo, the mask its frame restores, the stack
     /// it runs on, the trap of a fault).
     Handle(u32, SigAction, SigInfo, u64, AltStack, (u64, u64, u64)),
@@ -914,9 +960,24 @@ pub fn deliver(s: &mut State, call: Option<(u64, i64)>) {
                 finish(s);
                 return;
             }
-            // (Its descriptor table goes on this thread: `process::exit`.)
-            Next::Exit(status) => process::exit(status, false),
-            Next::Die(sig) => process::die_traced(s, sig as i32),
+            // (Its descriptor table goes on this thread: `process::exit`.) A core dump under
+            // way takes its registers first and holds it until the file is written.
+            Next::Exit(status) => {
+                let (regs, orig_rax) = shown_registers(s, call);
+                let status = crate::coredump::park(&regs, orig_rax).unwrap_or(status);
+                process::exit(status, false)
+            }
+            // A signal that dumps core does so before the process ends (Linux's get_signal:
+            // do_coredump, then do_group_exit), its status with the core flag if it did.
+            Next::Die(sig, info) => {
+                let status = if dumps_core(sig) {
+                    let (regs, orig_rax) = shown_registers(s, call);
+                    crate::coredump::dump(&regs, orig_rax, &info)
+                } else {
+                    sig as i32
+                };
+                process::die_traced(s, status)
+            }
             Next::Trap(code, info) => {
                 trace_stop(s, crate::ptrace::Stop::Group, code, CLD_STOPPED, info);
             }
@@ -997,6 +1058,23 @@ fn trace_stop(s: &mut State, kind: crate::ptrace::Stop, code: u32, why: i32, inf
         }
     }
     resumed
+}
+
+/// The calling thread's registers as a core file shows them during delivery after `call`
+/// (the system call it returned from, if it did), as Linux's are then: orig_rax the call
+/// (-1 outside one and after rt_sigreturn), rax the restart code of a call a signal
+/// interrupted: (registers, orig_rax).
+fn shown_registers(s: &State, call: Option<(u64, i64)>) -> (State, u64) {
+    let interrupted = PROCS.lock().threads.get(&local::tid()).and_then(|th| th.sig.interrupted);
+    let mut regs = *s;
+    match (interrupted, call) {
+        (Some((nr, how)), _) => {
+            regs.rax = (-restart_code(how)) as u64;
+            (regs, nr)
+        }
+        (None, Some((nr, _))) if nr != SYS_RT_SIGRETURN && nr as i32 != -1 => (regs, nr),
+        _ => (regs, u64::MAX),
+    }
 }
 
 /// A traced thread's signal-delivery-stop for `sig` (Linux's ptrace_signal): the signal its
@@ -1124,7 +1202,7 @@ fn act(t: &mut Table, tid: Pid, pid: Pid, sig: u32, info: SigInfo) -> Option<Nex
             start_stop(t, pid, tid, sig);
             return None;
         }
-        return Some(Next::Die(sig));
+        return Some(Next::Die(sig, info));
     }
     // A handler: its mask, and the frame's (the caller's own after a temporary one).
     // The handler runs with the mask in force (a temporary one, if a call set it)

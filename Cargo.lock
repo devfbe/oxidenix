@@ -190,6 +190,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "elfcore"
+version = "0.1.0"
+
+[[package]]
 name = "errno"
 version = "0.3.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -372,6 +376,7 @@ dependencies = [
 name = "linux"
 version = "0.1.0"
 dependencies = [
+ "elfcore",
  "fsring",
  "kbd",
  "ldisc",

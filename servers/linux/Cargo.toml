@@ -21,3 +21,4 @@ netlink = { path = "../../crates/netlink" }
 netring = { path = "../../crates/netring" }
 ldisc = { path = "../../crates/ldisc" }
 kbd = { path = "../../crates/kbd" }
+elfcore = { path = "../../crates/elfcore" }

@@ -146,6 +146,7 @@ stop only if its tracer is in another process) are the server's signal code's
   but not of other traced threads (Linux waits for all); hardware breakpoints are cleared
   at detach (Linux keeps them until exec or exit); a watchpoint on memory the server or the
   kernel touches for the program (a read(2) buffer) does not fire (Linux's kernel accesses
-  record it in the tracer's DR6 without a signal); core files.
+  record it in the tracer's DR6 without a signal); core files (since done: ADR 0022, over
+  the same `vm_access`).
 - Credentials (`docs/todo.md`, "Credentials"): Yama, `PTRACE_MODE_*` by uid, the dumpable
   flag's effect on access are not modeled: everyone in a tree is root.

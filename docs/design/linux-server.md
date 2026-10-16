@@ -836,8 +836,12 @@ gets its exit signal with `CLD_EXITED`/`CLD_KILLED` and is woken; a parent that 
 SIGCHLD or set `SA_NOCLDWAIT` reaps it at once. `wait4` and `waitid` select by pid, process
 group or any (`__WCLONE`, `__WALL`), report exits, stops (`WUNTRACED`/`WSTOPPED`) and
 continues (`WCONTINUED`), with `WNOHANG` and `WNOWAIT`, the child's usage (CPU time and peak
-memory, with its reaped children) and `siginfo`. The default action "core" ends the process
-like "terminate" (no core files: `RLIMIT_CORE` is 0, so the status has no core flag).
+memory, with its reaped children) and `siginfo`. The default action "core" writes a core file
+first (ADR 0022, `coredump`): the thread that takes the signal ends the others, which park
+with their registers in the dump's record (a wait their death does not end) until it has
+written the file, and the status gets the core flag (`CLD_DUMPED`) only if the file was
+written whole; with `RLIMIT_CORE` 0 (the default) or `PR_SET_DUMPABLE` 0 it ends the process
+like "terminate".
 
 ### Signals
 
@@ -1580,7 +1584,8 @@ affinity and getcpu calls in `mod.rs`; `timer.rs`'s interval timers; the per-pro
   environment; a growth into the 256-page guard gap above another mapping, or one that cannot
   be committed, is SIGSEGV, EFAULT for a copy), RLIMIT_NOFILE, RLIMIT_SIGPENDING (against the
   target's limit, the instance's count: Linux counts per user, the one user is root) and
-  RLIMIT_CORE; RLIMIT_NPROC is not enforced, as Linux does not for root.
+  RLIMIT_CORE (the bytes a core dump writes, ADR 0022); RLIMIT_NPROC is not enforced, as
+  Linux does not for root.
 - **The host grant** (ADR 0011, decision 5): `clock_set` and `power` need the instance's
   grant, which the kernel gives the trees it starts and takes back with the console when
   the tree's first process ends (dropping its `process::Tree`); without it the server acts as a

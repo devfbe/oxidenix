@@ -100,6 +100,10 @@ jobs:
         if: matrix.firmware == 'uefi'
         run: cargo test --release -p clockpage
 
+      - name: Test the core file's format, filter and names on the host
+        if: matrix.firmware == 'uefi'
+        run: cargo test -p elfcore
+
       - name: Test netd's patched smoltcp on the host
         if: matrix.firmware == 'uefi'
         run: cargo test --manifest-path third_party/smoltcp/Cargo.toml --lib

@@ -29,7 +29,16 @@ done, delete it here in the same commit.
 
 ## Linux features not implemented
 
-- Processes and signals: core files.
+- Core dumps (ADR 0022): a pipe in `core_pattern` (`|program`) runs no helper (nothing is
+  written, a line in the kernel's log; Linux runs the program as root in the initial
+  namespaces with the dump on its standard input, `core_pipe_limit`, `%F`); `NT_FILE` names
+  only the program file's mappings (as `/proc/<pid>/maps`: the server does not know which
+  file another mapped object is) and anonymous shared memory is told from a file only by
+  the kernel's object (an unlinked tmpfs file counts as a file, Linux's `i_nlink == 0` as
+  anonymous); `MADV_DONTDUMP` is accepted but not kept (its areas are dumped);
+  `PROT_NONE` pages are holes (no `FOLL_FORCE` read of them, as for ptrace);
+  `/proc/sys/fs/suid_dumpable` and the dumpable flag's other effects wait for credentials;
+  a SIGKILL that ends a dump under way is not covered by the self-tests (its timing).
 - ptrace (ADR 0019): `PTRACE_SINGLEBLOCK` (`EIO`: block steps would need the thread's
   `DEBUGCTL.BTF` switched like its debug registers), `NT_X86_XSTATE` (`ENODEV`, as Linux on
   a CPU without XSAVE: the kernel enables no AVX state; it comes with XSAVE), 32-bit tracees

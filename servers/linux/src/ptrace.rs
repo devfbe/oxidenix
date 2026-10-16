@@ -293,8 +293,10 @@ fn notify_tracer(t: &mut Table, tracer: Pid, tid: Pid, pid: Pid, why: i32, code:
             syscall(SYS_PROC_INFO, [p.handle, &mut info as *mut ProcInfo as u64, 0, 0, 0, 0]);
         }
         let si = match exited {
-            Some(status) if status & 0x7f == 0 => SigInfo::chld(signal::SIGCHLD, signal::CLD_EXITED, tid, (status >> 8) & 0xff, info.user_ns, info.system_ns),
-            Some(status) => SigInfo::chld(signal::SIGCHLD, signal::CLD_KILLED, tid, status & 0x7f, info.user_ns, info.system_ns),
+            Some(status) => {
+                let (code, value) = signal::exit_code_of(status);
+                SigInfo::chld(signal::SIGCHLD, code, tid, value, info.user_ns, info.system_ns)
+            }
             None => SigInfo::chld(signal::SIGCHLD, why, tid, (code & 0x7f) as i32, info.user_ns, info.system_ns),
         };
         signal::post_process(t, tracer_pid, si, false);
@@ -1406,7 +1408,21 @@ impl UserRegs {
 }
 
 fn get_regs(r: &Tracee) -> UserRegs {
-    let s = &r.regs;
+    let mut regs = user_regs(&r.regs, r.orig_rax, r.fs_base);
+    if r.forced_tf {
+        regs.eflags &= !TF;
+    }
+    regs
+}
+
+/// A thread's `user_regs_struct` from its program's registers `s`, the call it is in
+/// (`orig_rax`, -1 outside one) and its FS base: what `PTRACE_GETREGS` shows and a core
+/// file's `NT_PRSTATUS` holds (`coredump`).
+pub fn user_regs_words(s: &State, orig_rax: u64, fs_base: u64) -> [u64; USER_REGS] {
+    user_regs(s, orig_rax, fs_base).words()
+}
+
+fn user_regs(s: &State, orig_rax: u64, fs_base: u64) -> UserRegs {
     UserRegs {
         r15: s.r15,
         r14: s.r14,
@@ -1423,13 +1439,13 @@ fn get_regs(r: &Tracee) -> UserRegs {
         rdx: s.rdx,
         rsi: s.rsi,
         rdi: s.rdi,
-        orig_rax: r.orig_rax,
+        orig_rax,
         rip: s.rip,
         cs: USER_CS,
-        eflags: if r.forced_tf { s.rflags & !TF } else { s.rflags },
+        eflags: s.rflags,
         rsp: s.rsp,
         ss: USER_SS,
-        fs_base: r.fs_base,
+        fs_base,
         gs_base: 0,
         ds: 0,
         es: 0,

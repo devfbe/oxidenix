@@ -913,6 +913,16 @@ fn build_stack(p: &Prepared, bias: u64, interp_base: u64, entry: u64, vdso: Opti
         (AT_NULL, 0),
     ];
     let auxv = &all[vdso.is_none() as usize..];
+    // Kept for a core file's NT_AUXV (Linux's mm->saved_auxv).
+    if let Some(mm) = &p.mm {
+        let mut saved = process::Auxv::default();
+        for (i, &(k, v)) in auxv.iter().enumerate() {
+            saved.words[2 * i] = k;
+            saved.words[2 * i + 1] = v;
+        }
+        saved.len = 2 * auxv.len();
+        mm.lock().auxv = saved;
+    }
     let n = 1 + p.args.len() + 1 + p.envs.len() + 1 + 2 * auxv.len();
     sp = (sp - n as u64 * 8) & !15;
     let mut out = Words { at: sp, buf: [0; 64], used: 0 };

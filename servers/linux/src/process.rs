@@ -177,6 +177,32 @@ pub struct Mm {
     pub brk: Brk,
     /// The membarrier(2) commands registered for it (`membarrier`).
     pub membarrier: u32,
+    /// The auxiliary vector execve gave the program (Linux's `mm->saved_auxv`: a core
+    /// file's `NT_AUXV`).
+    pub auxv: Auxv,
+}
+
+/// An auxiliary vector: (type, value) pairs up to and with the `AT_NULL` pair.
+#[derive(Clone, Copy)]
+pub struct Auxv {
+    pub words: [u64; Auxv::MAX],
+    pub len: usize,
+}
+
+impl Auxv {
+    /// Room for every pair execve writes (`exec::build_stack`).
+    pub const MAX: usize = 48;
+
+    /// Its words.
+    pub fn as_slice(&self) -> &[u64] {
+        &self.words[..self.len]
+    }
+}
+
+impl Default for Auxv {
+    fn default() -> Auxv {
+        Auxv { words: [0; Auxv::MAX], len: 0 }
+    }
 }
 
 /// The program break (brk).
@@ -216,6 +242,12 @@ pub struct Proc {
     /// PR_SET_PDEATHSIG, PR_SET_DUMPABLE, PR_SET_NO_NEW_PRIVS, PR_SET_CHILD_SUBREAPER.
     pub pdeath: u32,
     pub dumpable: bool,
+    /// /proc/<pid>/coredump_filter: which mappings a core dump writes (`elfcore::filter`'s
+    /// bits), copied by fork, kept by execve (Linux keeps it in the mm's flags).
+    pub coredump_filter: u32,
+    /// The core dump under way: the process's other threads leave their registers in it
+    /// and wait for its end (`coredump`).
+    pub core: Option<Arc<crate::coredump::Dump>>,
     pub no_new_privs: bool,
     pub subreaper: bool,
     /// Its parent waits until it execs or ends (vfork).
@@ -581,6 +613,8 @@ pub fn register_init(key: u64) {
             exit_signal: signal::SIGCHLD,
             pdeath: 0,
             dumpable: true,
+            coredump_filter: elfcore::filter::DEFAULT,
+            core: None,
             no_new_privs: false,
             subreaper: false,
             vfork: false,
@@ -959,7 +993,7 @@ fn clone(s: &mut State, c: Clone) -> Result<i64, i64> {
                 None => parent.mm.clone(),
                 Some(own) => {
                     let m = parent.mm.lock();
-                    *own.lock() = Mm { brk: m.brk, membarrier: m.membarrier };
+                    *own.lock() = Mm { brk: m.brk, membarrier: m.membarrier, auxv: m.auxv };
                     own
                 }
             };
@@ -980,6 +1014,8 @@ fn clone(s: &mut State, c: Clone) -> Result<i64, i64> {
                 // The parent-death signal is not inherited, as on Linux.
                 pdeath: 0,
                 dumpable: parent.dumpable,
+                coredump_filter: parent.coredump_filter,
+                core: None,
                 no_new_privs: parent.no_new_privs,
                 subreaper: false,
                 vfork: flags & CLONE_VFORK != 0,
@@ -1209,10 +1245,13 @@ pub fn die_traced(s: &mut State, status: i32) -> ! {
     exit(status, true)
 }
 
-/// The calling thread was killed (`REASON_EXIT`): it ends with its process's exit status
-/// (a group exit's; 0 for one an exec ended, as Linux's de_thread; else SIGKILL's; a kill
-/// by the kernel is the kernel's to report). (A tracer sees the thread's.)
-pub fn exit_killed() -> ! {
+/// The calling thread was killed (`REASON_EXIT`; `s`: its program's registers): it ends
+/// with its process's exit status (a group exit's; 0 for one an exec ended, as Linux's
+/// de_thread; else SIGKILL's; a kill by the kernel is the kernel's to report). (A tracer
+/// sees the thread's.) A core dump under way takes its registers first and holds it until
+/// the file is written.
+pub fn exit_killed(s: &State) -> ! {
+    crate::coredump::park(s, u64::MAX);
     let pid = local::pid();
     let status = PROCS.lock().procs.get(&pid).map_or(signal::SIGKILL as i32, |p| p.exiting.unwrap_or(if p.execing { 0 } else { signal::SIGKILL as i32 }));
     exit(status, false)
@@ -1482,7 +1521,7 @@ fn notify_parent_exit(t: &mut Table, pid: Pid) -> bool {
     if sig != 0 {
         let mut info = ProcInfo::default();
         syscall(SYS_PROC_INFO, [handle, &mut info as *mut ProcInfo as u64, 0, 0, 0, 0]);
-        let (code, value) = if status & 0x7f == 0 { (signal::CLD_EXITED, (status >> 8) & 0xff) } else { (signal::CLD_KILLED, status & 0x7f) };
+        let (code, value) = signal::exit_code_of(status);
         let si = SigInfo::chld(sig, code, pid, value, info.user_ns, info.system_ns);
         signal::post_process(t, ppid, si, false);
     }
@@ -1630,8 +1669,7 @@ fn wait_child(which: Which, options: u64) -> Result<Option<Found>, i64> {
                 }
                 if let Some(status) = child.zombie {
                     if options & WEXITED != 0 {
-                        let (code, value) =
-                            if status & 0x7f == 0 { (signal::CLD_EXITED, (status >> 8) & 0xff) } else { (signal::CLD_KILLED, status & 0x7f) };
+                        let (code, value) = signal::exit_code_of(status);
                         found = Some((c, Found { pid: c, status, code, value, usage: usage_of(child) }, true));
                         break;
                     }
@@ -1684,8 +1722,7 @@ fn wait_child(which: Which, options: u64) -> Result<Option<Found>, i64> {
                         let usage = t.procs.get(&r.pid).map(usage_of).unwrap_or_default();
                         let (code, value) = match r.stop {
                             Some(code) => (crate::ptrace::CLD_TRAPPED, code as i32),
-                            None if r.status & 0x7f == 0 => (signal::CLD_EXITED, (r.status >> 8) & 0xff),
-                            None => (signal::CLD_KILLED, r.status & 0x7f),
+                            None => signal::exit_code_of(r.status),
                         };
                         (Some(Found { pid: r.tid, status: r.status, code, value, usage }), words, seen)
                     }
@@ -2126,6 +2163,20 @@ pub fn kernel_info(pid: Pid) -> Result<ProcInfo, i64> {
 /// read (`flags` 0) or set to `value` (`restricted::SYS_OOM_SCORE_ADJ`'s flags; the kernel
 /// checks the range and the host grant). The value before; ESRCH if there is no such
 /// process.
+/// The coredump_filter of process `pid` (or of the process of thread `pid`), set to `new`
+/// if given: the value before. ESRCH for none, or for a zombie (no address space: Linux's
+/// file has no mm then).
+pub fn coredump_filter(pid: Pid, new: Option<u32>) -> Result<u32, i64> {
+    let mut t = PROCS.lock();
+    let owner = if t.procs.contains_key(&pid) { pid } else { t.threads.get(&pid).ok_or(ESRCH)?.pid };
+    let p = t.procs.get_mut(&owner).filter(|p| p.zombie.is_none()).ok_or(ESRCH)?;
+    let old = p.coredump_filter;
+    if let Some(new) = new {
+        p.coredump_filter = new;
+    }
+    Ok(old)
+}
+
 pub fn oom_score_adj(pid: Pid, flags: u64, value: i64) -> Result<i64, i64> {
     let t = PROCS.lock();
     let owner = if t.procs.contains_key(&pid) { pid } else { t.threads.get(&pid).ok_or(ESRCH)?.pid };

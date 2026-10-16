@@ -20,6 +20,7 @@ extern crate alloc;
 
 mod chantest;
 mod console;
+mod coredump;
 mod datafile;
 mod datafs;
 mod devices;
@@ -237,7 +238,7 @@ fn serve(s: &mut State) -> ! {
             REASON_KICK => signal::deliver(s, None),
             // Killed (by the process model or the kernel): the thread ends here, on a clean
             // stack, letting go of what it holds first.
-            REASON_EXIT => process::exit_killed(),
+            REASON_EXIT => process::exit_killed(s),
             REASON_EXCEPTION => {
                 signal::exception(s);
                 signal::deliver(s, None);

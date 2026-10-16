@@ -42,6 +42,9 @@ pub const SYSFS_ROOT: u32 = 100;
 /// /proc/sys, procfs's directory, into which the Linux server merges `vm`
 /// (the overcommit policy is the kernel's, set through the server).
 pub const PROC_SYS: u32 = 10;
+/// /proc/sys/kernel, procfs's directory, into which the Linux server merges the core
+/// dump's settings (`core_pattern`, `core_uses_pid`: each process tree's own).
+pub const PROC_SYS_KERNEL: u32 = 11;
 
 pub const MAX_CPUS: usize = 16;
 

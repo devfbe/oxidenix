@@ -765,6 +765,12 @@ impl PageCache {
         })
     }
 
+    /// Whether this is anonymous shared memory (`anonymous`'s: no file's, its
+    /// pages committed when it was made), as a core dump's filter asks.
+    pub fn is_anonymous(&self) -> bool {
+        matches!(self.store, Store::Memory { image, prepaid } if image.is_empty() && prepaid > 0)
+    }
+
     /// Enters a cache whose pages reclaim may drop into its list.
     fn reclaimable(cache: &Arc<PageCache>) -> Result<(), i64> {
         let mut list = CACHES.lock();

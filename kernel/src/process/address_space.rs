@@ -1701,6 +1701,32 @@ impl AddressSpace {
     /// the store never reaches a file's page cache or a fork relative. A
     /// shared area is stored to only as a writable one; an area without any
     /// access (PROT_NONE), device memory and granted pages are never reached.
+    /// The runs of resident pages in [start, end), at most `out.len()` of
+    /// them, in `out` (`restricted::SYS_VM_RESIDENT`): adjacent pages with a
+    /// frame (mapped, or kept for a PROT_NONE area), split where the kind
+    /// changes (the mapping's own page, `ANON`, or an object's). Faults
+    /// nothing in. How many runs.
+    pub fn resident(&self, start: u64, end: u64, out: &mut [restricted::VmRun]) -> usize {
+        let mut n = 0;
+        leaves_until(self.l4, start, end.min(USER_END), |va, e| {
+            let flags = if e.flags().contains(ANON) { restricted::VM_RUN_PRIVATE } else { 0 };
+            if n > 0 {
+                let last = &mut out[n - 1];
+                if last.flags == flags && last.start + last.pages * PAGE == va {
+                    last.pages += 1;
+                    return true;
+                }
+            }
+            if n == out.len() {
+                return false;
+            }
+            out[n] = restricted::VmRun { start: va, pages: 1, flags };
+            n += 1;
+            true
+        });
+        n
+    }
+
     fn access_page(&mut self, va: u64, buf: &mut [u8], write: bool, force: bool) -> Result<(), Fault> {
         let page = page_down(va);
         if self.reaped || va.checked_add(buf.len() as u64).is_none_or(|end| end > USER_END || end > page + PAGE) {
@@ -2102,6 +2128,15 @@ fn leaf_entry(l4: PhysFrame, va: u64) -> Option<&'static mut PageTableEntry> {
 /// in [start, end), skipping whole tables that are not there, so sparse
 /// huge ranges (reservations of gigabytes) cost what is mapped in them.
 fn for_each_leaf(l4: PhysFrame, start: u64, end: u64, mut f: impl FnMut(u64, &'static mut PageTableEntry)) {
+    leaves_until(l4, start, end, |va, e| {
+        f(va, e);
+        true
+    });
+}
+
+/// `for_each_leaf` until `f` returns false: the address of the entry it
+/// stopped at, None if it went through the range.
+fn leaves_until(l4: PhysFrame, start: u64, end: u64, mut f: impl FnMut(u64, &'static mut PageTableEntry) -> bool) -> Option<u64> {
     let mut va = page_down(start);
     'outer: while va < end {
         let v = VirtAddr::new(va);
@@ -2117,12 +2152,13 @@ fn for_each_leaf(l4: PhysFrame, start: u64, end: u64, mut f: impl FnMut(u64, &'s
         let stop = end.min(((va >> 21) + 1) << 21);
         while va < stop {
             let e = &mut table_at(frame)[((va >> 12) & 511) as usize];
-            if !e.is_unused() {
-                f(va, e);
+            if !e.is_unused() && !f(va, e) {
+                return Some(va);
             }
             va += PAGE;
         }
     }
+    None
 }
 
 /// The leaf flags for an area's page under `prot`, replacing an entry

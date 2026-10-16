@@ -350,6 +350,58 @@ fn openat(dirfd: u64, addr: u64, flags: u32, mode: u32) -> Result<i64, i64> {
     open_node(resolved, flags)
 }
 
+/// The file a core dump of the calling process goes to (core(5), Linux's do_coredump):
+/// `path`, relative to the caller's working directory unless absolute, opened for writing
+/// without a descriptor and without following a final symlink (ELOOP; Linux's
+/// `O_CREAT | O_RDWR | O_NOFOLLOW`), made with mode 0600 less the umask if it is missing.
+/// It is kept only if it is a regular file with one link and mode 0600 (Linux refuses a
+/// file whose permissions it cannot preserve; everyone is root, so its owner is the
+/// dumper's), and truncated only then. /proc and /sys hold none (EACCES).
+pub fn core_file(path: &str) -> Result<crate::coredump::Output, i64> {
+    const EMLINK: i64 = 31;
+    let flags = files::O_RDWR | O_CREAT | O_NOFOLLOW | files::O_LARGEFILE;
+    let base = cwd()?;
+    // A name made by someone else between the lookup and the create is opened instead, once.
+    let mut retried = false;
+    let (node, abs) = loop {
+        match resolve(&base, path, false) {
+            Ok(r) => break (r.node, join(&r.path)?),
+            Err(ENOENT) => {
+                let (dir, name) = resolve_parent(&base, path).map_err(|e| if e == EBUSY { EEXIST } else { e })?;
+                let created = normalize(&base, path)?;
+                match create(&dir.node, &name, NEW_FILE, 0o600 & !umask_now()) {
+                    Ok(node) => {
+                        inotify::child(&dir.node, inotify::IN_CREATE, &name, false);
+                        break (node, join(&created)?);
+                    }
+                    Err(EEXIST) if !retried => retried = true,
+                    Err(e) => return Err(e),
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    };
+    let st = vfs::stat::Stat::from_bytes(&node.stat()?);
+    match st.mode & vfs::S_IFMT {
+        vfs::S_IFLNK => return Err(ELOOP),
+        vfs::S_IFREG => {}
+        _ => return Err(EACCES),
+    }
+    if st.nlink > 1 {
+        return Err(EMLINK);
+    }
+    if st.mode & 0o677 != 0o600 {
+        return Err(EPERM);
+    }
+    let out = match node {
+        Node::Tmp(t) => crate::coredump::Output::Tmp(tmpfile::open_server(t, flags, abs)?),
+        Node::Data(d) => crate::coredump::Output::Data(datafile::open_server(d, flags, abs)?),
+        Node::Proc(_) => return Err(EACCES),
+    };
+    out.truncate(0)?;
+    Ok(out)
+}
+
 /// What `openat` has ready for the open of a file it creates (`tmpfile::prepare`,
 /// `datafile::prepare`; nothing for a filesystem it cannot create in).
 enum Prepared {
