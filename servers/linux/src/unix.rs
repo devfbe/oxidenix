@@ -65,7 +65,7 @@ use crate::usercopy;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use restricted::*;
 
 pub const STREAM: u32 = 1;
@@ -360,6 +360,12 @@ pub struct Sock {
     /// Never taken by a service thread.
     rlock: crate::sync::SleepLock,
     inner: Mutex<Inner>,
+    /// Stream receives sleeping for data (Linux's SOCKWQ_ASYNC_WAITDATA): while there are
+    /// any, new data signals no O_ASYNC owner (`sigio_waitd`).
+    waitdata: AtomicU32,
+    /// A send found no room, or a datagram socket polled not writable (Linux's
+    /// SOCKWQ_ASYNC_NOSPACE): room signals the O_ASYNC owner once then (`uncharge`).
+    nospace: AtomicBool,
 }
 
 /// Received: bytes copied, the message's length (datagrams), whether it
@@ -621,6 +627,8 @@ impl Sock {
                 dead: false,
                 opts: [None; KEPT_OPTS.len()],
             }),
+            waitdata: AtomicU32::new(0),
+            nospace: AtomicBool::new(false),
         }))
     }
 
@@ -756,8 +764,24 @@ impl Sock {
         files::ready(self.id(), now);
     }
 
+    /// Poll's readiness (Linux's unix_poll, unix_dgram_poll): a datagram or packet socket
+    /// found not writable will signal its O_ASYNC owner when room comes (`nospace`).
     pub fn readiness_now(&self) -> i16 {
-        self.readiness(&self.inner.lock())
+        let i = self.inner.lock();
+        let m = self.readiness(&i);
+        if self.ty != STREAM && m & POLLOUT == 0 && !(self.ty == SEQPACKET && i.connecting) {
+            self.nospace.store(true, Ordering::Release);
+        }
+        m
+    }
+
+    /// Signal-driven I/O for its readers (Linux's sk_wake_async with SOCK_WAKE_WAITD): none
+    /// while a stream receive sleeps for data, which reads it anyway.
+    fn sigio_waitd(&self, io: files::Io) {
+        let id = self.id();
+        if id != 0 && self.waitdata.load(Ordering::Acquire) == 0 {
+            files::sigio(id, io);
+        }
     }
 
     /// Sleeps while the sequence word is `seen`, until `deadline` (0: none):
@@ -783,12 +807,19 @@ impl Sock {
     /// A message of its own was read (or dropped): writers waiting for
     /// room go on once it is below the send buffer, and while it is
     /// writable each freed message is room for poll (an edge for EPOLLET),
-    /// as Linux's unix_write_space.
+    /// as Linux's unix_write_space; while it is writable, the first freed message after a
+    /// send found no room signals the O_ASYNC owner (Linux's SOCK_WAKE_SPACE).
     fn uncharge(&self, n: usize) {
         let old = self.wmem.fetch_sub(n, Ordering::AcqRel);
         let (new, sndbuf) = (old - n, self.sndbuf.load(Ordering::Acquire));
         if new * 4 <= sndbuf || (old >= sndbuf && new < sndbuf) {
             self.notify(true);
+        }
+        if new * 4 <= sndbuf && self.nospace.load(Ordering::Acquire) && self.nospace.swap(false, Ordering::AcqRel) {
+            let id = self.id();
+            if id != 0 {
+                files::sigio(id, files::Io::Out);
+            }
         }
     }
 
@@ -964,6 +995,7 @@ impl Sock {
             }
             t.pending.push_back(embryo.clone());
             target.changed(&mut t, true);
+            target.sigio_waitd(files::Io::In);
             break t.listen_cred;
         };
         let mut i = self.inner.lock();
@@ -1053,6 +1085,7 @@ impl Sock {
             i.err = ECONNRESET;
         }
         self.changed(&mut i, true);
+        self.sigio_waitd(files::Io::Hup);
     }
 
     /// shutdown(how): 0 no more receiving, 1 no more sending, 2 both.
@@ -1075,6 +1108,12 @@ impl Sock {
             let mut pi = p.inner.lock();
             pi.shut |= mirrored;
             p.changed(&mut pi, true);
+            // (Linux's unix_shutdown: the peer hung up both ways, or ends its input.)
+            if mirrored == RCV | SEND {
+                p.sigio_waitd(files::Io::Hup);
+            } else if mirrored & RCV != 0 {
+                p.sigio_waitd(files::Io::In);
+            }
         }
         Ok(())
     }
@@ -1191,6 +1230,8 @@ impl Sock {
                 }
                 seen = self.seq.load(Ordering::Acquire);
             }
+            // (Linux's sock_alloc_send_pskb: room will signal the O_ASYNC owner.)
+            self.nospace.store(true, Ordering::Release);
             if nonblock {
                 return Err(EAGAIN);
             }
@@ -1242,6 +1283,7 @@ impl Sock {
                     p.queue.push_back(msg);
                     peer.qlen.store(p.queue.len(), Ordering::Release);
                     peer.changed(&mut p, true);
+                    peer.sigio_waitd(files::Io::In);
                     None
                 }
             };
@@ -1331,6 +1373,7 @@ impl Sock {
                     t.queue.push_back(msg.take().expect("sent once"));
                     target.qlen.store(t.queue.len(), Ordering::Release);
                     target.changed(&mut t, true);
+                    target.sigio_waitd(files::Io::In);
                     return Ok(n);
                 }
             }
@@ -1409,7 +1452,10 @@ impl Sock {
                 Next::Wait(seen) => {
                     // Not holding the other readers off while it sleeps.
                     reader = None;
-                    if let Err(e) = self.wait(seen, deadline) {
+                    self.waitdata.fetch_add(1, Ordering::AcqRel);
+                    let woken = self.wait(seen, deadline);
+                    self.waitdata.fetch_sub(1, Ordering::AcqRel);
+                    if let Err(e) = woken {
                         if out.copied == 0 {
                             result = Err(e);
                         }

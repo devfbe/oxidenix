@@ -195,6 +195,13 @@ pub struct Proc {
     pub ppid: Pid,
     pub pgid: Pid,
     pub sid: Pid,
+    /// Its identity (a serial no other process or thread of the instance gets): a process
+    /// given its pid again later is another one (Linux's counted `struct pid`; F_SETOWN's
+    /// owners hold it, `files::Owner`).
+    pub serial: u64,
+    /// The identity of its process group: the serial of the process that made the group
+    /// (whose pid the group's id is; no process gets that pid while the group lives).
+    pub pgrp_serial: u64,
     /// The kernel's handle on the process.
     pub handle: u64,
     /// Live threads, the main one first while it lives.
@@ -565,11 +572,14 @@ pub fn register_init(key: u64) {
         let mut t = PROCS.lock();
         let pid = t.alloc_pid().unwrap_or(1);
         let hand = t.new_hand(None);
+        let proc_serial = t.new_serial();
         let p = Proc {
             pid,
             ppid: 0,
             pgid: pid,
             sid: pid,
+            serial: proc_serial,
+            pgrp_serial: proc_serial,
             handle: handle as u64,
             threads: alloc::vec![pid],
             children: Vec::new(),
@@ -950,6 +960,7 @@ fn clone(s: &mut State, c: Clone) -> Result<i64, i64> {
                 }
                 h
             };
+            let proc_serial = t.new_serial();
             let parent = &t.procs[&my_pid];
             // With CLONE_PARENT the caller's parent is the parent, and gets the caller's exit
             // signal, as on Linux.
@@ -968,6 +979,8 @@ fn clone(s: &mut State, c: Clone) -> Result<i64, i64> {
                 ppid,
                 pgid: parent.pgid,
                 sid: parent.sid,
+                serial: proc_serial,
+                pgrp_serial: parent.pgrp_serial,
                 handle,
                 threads,
                 children: Vec::new(),
@@ -1856,10 +1869,18 @@ fn setpgid(pid: i32, pgid: i32) -> Result<i64, i64> {
     if p.sid == target {
         return Err(EPERM);
     }
-    if pgid != target && !t.procs.values().any(|q| q.pgid == pgid && q.sid == my_sid && q.zombie.is_none()) {
-        return Err(EPERM);
-    }
-    t.procs.get_mut(&target).expect("found above").pgid = pgid;
+    // The group's identity: its maker's (the process itself for a group of its own).
+    let pgrp_serial = if pgid == target {
+        p.serial
+    } else {
+        match t.procs.values().find(|q| q.pgid == pgid && q.sid == my_sid && q.zombie.is_none()) {
+            Some(q) => q.pgrp_serial,
+            None => return Err(EPERM),
+        }
+    };
+    let p = t.procs.get_mut(&target).expect("found above");
+    p.pgid = pgid;
+    p.pgrp_serial = pgrp_serial;
     Ok(0)
 }
 
@@ -1873,6 +1894,7 @@ fn setsid() -> Result<i64, i64> {
     let p = t.procs.get_mut(&me).ok_or(ESRCH)?;
     p.sid = me;
     p.pgid = me;
+    p.pgrp_serial = p.serial;
     Ok(me as i64)
 }
 
@@ -1900,6 +1922,55 @@ pub fn pgrp_orphaned(pgid: Pid) -> bool {
 pub fn exists(pid: Pid) -> bool {
     let t = PROCS.lock();
     t.procs.contains_key(&pid) || t.threads.contains_key(&pid)
+}
+
+/// What an F_SETOWN owner is (`owner_of`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum OwnerKind {
+    Thread,
+    Process,
+    Group,
+}
+
+/// F_SETOWN's and F_SETOWN_EX's owner `id` of `kind`, held by identity, as Linux's f_setown
+/// holds a counted `struct pid`: a thread's or a process's serial, a process group's
+/// maker's. An id the instance has for something else (a thread named as a process, or as
+/// a group) is an owner that is never there, as Linux's pid_task finds no task of that
+/// type; a process named as a group is its group to be (Linux: the same `struct pid`).
+/// ESRCH for an id nobody has.
+pub fn owner_of(kind: OwnerKind, id: Pid) -> Result<crate::files::Owner, i64> {
+    use crate::files::Owner;
+    // (Serials start at 1: 0 matches nothing.)
+    const NOTHING: u64 = 0;
+    let t = PROCS.lock();
+    let thread = t.threads.get(&id).map(|th| th.serial);
+    let process = t.procs.get(&id).map(|p| p.serial);
+    let group = t.procs.values().find(|p| p.pgid == id).map(|p| p.pgrp_serial);
+    if thread.is_none() && process.is_none() && group.is_none() {
+        return Err(ESRCH);
+    }
+    Ok(match kind {
+        OwnerKind::Thread => Owner::Thread(id, thread.unwrap_or(NOTHING)),
+        OwnerKind::Process => Owner::Process(id, process.unwrap_or(NOTHING)),
+        OwnerKind::Group => Owner::Group(id, group.or(process).unwrap_or(NOTHING)),
+    })
+}
+
+/// Whether owner `o` is still there (Linux's pid_task of the owner's pid and type): the
+/// thread or process of that identity until it is reaped, a member of that group.
+pub fn owner_alive(t: &Table, o: crate::files::Owner) -> bool {
+    use crate::files::Owner;
+    match o {
+        Owner::None => false,
+        Owner::Thread(tid, serial) => t.threads.get(&tid).is_some_and(|th| th.serial == serial),
+        Owner::Process(pid, serial) => t.procs.get(&pid).is_some_and(|p| p.serial == serial),
+        Owner::Group(pgid, serial) => t.procs.values().any(|p| p.pgid == pgid && p.pgrp_serial == serial),
+    }
+}
+
+/// `owner_alive`, with the process lock taken.
+pub fn owner_exists(o: crate::files::Owner) -> bool {
+    owner_alive(&PROCS.lock(), o)
 }
 
 /// set_robust_list: the calling thread's robust list head (`Thread::robust`).

@@ -37,6 +37,10 @@ pub struct Received {
     /// The byte did not fit and was dropped (noncanonical mode with a full
     /// buffer, or a canonical line that is full).
     pub dropped: bool,
+    /// The byte ended a canonical line (a newline, VEOF, VEOL, VEOL2): readers can
+    /// take it now (Linux's `n_tty_receive_handle_newline` wakes them and signals
+    /// O_ASYNC owners).
+    pub line_end: bool,
 }
 
 /// How a read takes the next bytes: `copy` bytes from the front go to the reader,
@@ -401,6 +405,7 @@ impl Ldisc {
         self.buf.extend(line);
         self.buf.push_back(c);
         self.ends.push_back((self.base + self.buf.len() as u64 - 1, eof));
+        r.line_end = true;
     }
 
     /// VERASE, VWERASE and VKILL (Linux's `eraser`).

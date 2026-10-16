@@ -13,6 +13,12 @@
 //! No lost wakeup: a poller subscribes before it checks readiness, and a
 //! file reports after it changed under the lock the check takes.
 //!
+//! **Signal-driven I/O** (O_ASYNC, ADR 0023) lives in the watch too: a description with
+//! O_ASYNC on has an entry there (`Watch::set_async`, Linux's fasync_struct), and a file
+//! tells of an event where Linux's driver calls kill_fasync (`files::sigio`, by id, as
+//! reports): the entry's owner gets its signal (`sigio`), sent after the entry's leaf lock.
+//! While no description of the instance has O_ASYNC, that costs a load (`ASYNC`).
+//!
 //! **Readiness** is asked of each file when it is checked
 //! (`Description::poll_mask`, Linux's poll methods), never taken from the
 //! reports, which only say that something happened.
@@ -34,7 +40,9 @@
 //!
 //! Lock order: a file's own lock → its watch's subscribers → an epoll
 //! instance's ready list → (that instance's watch, for instances watching
-//! it: `epoll`) → ... ; no lock is held while program memory is copied.
+//! it: `epoll`) → ... ; a file's own lock → its watch's O_ASYNC entry (a leaf), and a
+//! file's own lock → the process lock (`sigio` sends there, never under a watch's lock);
+//! no lock is held while program memory is copied.
 
 use crate::files::{self, FileRef, POLLERR, POLLHUP, POLLIN, POLLNVAL, POLLOUT};
 use crate::heap::{self, NoMem, TryGrow};
@@ -101,10 +109,20 @@ pub struct Watch {
     /// How many there are (read without the lock: an epoll instance
     /// reports itself only while something watches it).
     count: AtomicUsize,
+    /// Signal-driven I/O, while the description has O_ASYNC on (Linux's fasync_struct, a
+    /// leaf lock): the descriptor it was turned on with (si_fd).
+    fasync: Mutex<Option<i32>>,
+    /// The description's owner and F_SETSIG signal, which its signal-driven I/O reads here
+    /// (by the description's id, from any thread).
+    pub fown: files::Fown,
 }
 
 /// Watches with subscribers, anywhere in the instance.
 static WATCHED: AtomicUsize = AtomicUsize::new(0);
+
+/// Descriptions with O_ASYNC on, anywhere in the instance: while there are none, a file's
+/// `sigio` costs a load.
+static ASYNC: AtomicUsize = AtomicUsize::new(0);
 
 const SHARDS: usize = 32;
 /// The watches by their description's id.
@@ -117,7 +135,7 @@ fn shard(id: u64) -> &'static Mutex<BTreeMap<u64, Weak<Watch>>> {
 impl Watch {
     /// The watch of a new description `id` (ENOMEM: nothing registered).
     pub fn new(id: u64) -> Result<Arc<Watch>, NoMem> {
-        let watch = heap::try_arc(Watch { subs: Mutex::new(Vec::new()), count: AtomicUsize::new(0) })?;
+        let watch = heap::try_arc(Watch { subs: Mutex::new(Vec::new()), count: AtomicUsize::new(0), fasync: Mutex::new(None), fown: files::Fown::default() })?;
         heap::preload()?;
         shard(id).lock().insert(id, Arc::downgrade(&watch));
         Ok(watch)
@@ -147,6 +165,33 @@ impl Watch {
         };
         // Its last reference may go here, after the lock.
         drop(removed);
+    }
+
+    /// O_ASYNC of `file`, this watch's description, goes on (with descriptor `fd`) or off,
+    /// and its flag with it, under the entry's lock: concurrent changes of the same
+    /// description take turns. As Linux's fasync_helper, the flag goes off only with an
+    /// entry (O_ASYNC given to open(2) made none: it stays).
+    pub fn set_async(&self, file: &files::Description, fd: i32, on: bool) {
+        let mut fasync = self.fasync.lock();
+        if (file.flags() & files::O_ASYNC != 0) == on {
+            return;
+        }
+        if on {
+            *fasync = Some(fd);
+            ASYNC.fetch_add(1, SeqCst);
+            file.set_flags(files::O_ASYNC, files::O_ASYNC);
+        } else if fasync.take().is_some() {
+            ASYNC.fetch_sub(1, SeqCst);
+            file.set_flags(files::O_ASYNC, 0);
+        }
+    }
+
+    /// Its O_ASYNC entry goes, if there is one (the description's end, a terminal's
+    /// hangup, whose files show O_ASYNC off from then on: `Description::status_flags`).
+    fn async_off(&self) {
+        if self.fasync.lock().take().is_some() {
+            ASYNC.fetch_sub(1, SeqCst);
+        }
     }
 
     /// Whether anybody listens.
@@ -212,11 +257,62 @@ pub fn report(id: u64, ready: i16) {
     }
 }
 
-/// Description `id` went: its watch is no longer found, and the epoll
+/// `files::sigio`: `io` happened on description `id`; with O_ASYNC on, its owner gets its
+/// signal (`signal::send_sigio`). The descriptor is read under the entry's lock, the owner
+/// and the signal from the watch, and the signal is sent after it: under the file's own
+/// lock perhaps (as Linux's kill_fasync), never under a watch's (the process lock comes
+/// after the files' locks, and the process code reports to the watches only after the
+/// process lock).
+pub fn sigio(id: u64, io: files::Io) {
+    if ASYNC.load(SeqCst) == 0 {
+        return;
+    }
+    let watch = shard(id).lock().get(&id).and_then(Weak::upgrade);
+    let Some(watch) = watch else { return };
+    let fd = *watch.fasync.lock();
+    if let Some(fd) = fd {
+        signal::send_sigio(watch.fown.owner(), watch.fown.signum(), fd, io);
+    }
+}
+
+/// `files::sigurg`: urgent data came to socket `id`: its owner, if it has one, gets SIGURG
+/// (Linux's send_sigurg), and with O_ASYNC and an F_SETSIG signal that signal with
+/// POLL_PRI as well (its kill_fasync with SIGURG, which sends no plain SIGIO).
+pub fn sigurg(id: u64) {
+    let watch = shard(id).lock().get(&id).and_then(Weak::upgrade);
+    let Some(watch) = watch else { return };
+    let owner = watch.fown.owner();
+    if owner == files::Owner::None {
+        return;
+    }
+    signal::send_owner(owner, signal::SIGURG);
+    let (fd, signum) = (*watch.fasync.lock(), watch.fown.signum());
+    if let (Some(fd), 1..) = (fd, signum) {
+        signal::send_sigio(owner, signum, fd, files::Io::Pri);
+    }
+}
+
+/// Whether any description of the instance has O_ASYNC on (a file whose `sigio` calls take
+/// work of their own to prepare skips it otherwise).
+pub fn async_in_use() -> bool {
+    ASYNC.load(SeqCst) != 0
+}
+
+/// Description `id` lost its signal-driven I/O (a terminal hung up: Linux's `__tty_hangup`
+/// turns FASYNC off for every file of the terminal).
+pub fn async_off(id: u64) {
+    let watch = shard(id).lock().get(&id).and_then(Weak::upgrade);
+    if let Some(watch) = watch {
+        watch.async_off();
+    }
+}
+
+/// Description `id` went: its watch is no longer found, its O_ASYNC goes, and the epoll
 /// interests in it go (as Linux's eventpoll_release: interests belong to
 /// the description).
 pub fn forget(id: u64, watch: &Arc<Watch>) {
     shard(id).lock().remove(&id);
+    watch.async_off();
     // One interest at a time, taken out under the lock and told after it:
     // a description's end allocates nothing (it must not fail).
     loop {

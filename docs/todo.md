@@ -60,8 +60,7 @@ done, delete it here in the same commit.
   console), no console fonts, screen or color maps (`GIO_SCRNMAP`, `PIO_CMAP`), blanking or
   scrollback; serial lines without carrier detection, `TIOCMIWAIT`, `TIOCGICOUNT`, received
   breaks and parity errors, and with polled output.
-- Network: IPv6, `O_ASYNC` (`SIGIO`; `F_SETOWN` is kept and used for `SIGURG`), raw ICMP is shared
-  between instances (documented in ADR 0008).
+- Network: IPv6, raw ICMP is shared between instances (documented in ADR 0008).
 - Memory groups (ADR 0024): one per tree, no sub-groups (`mkdir` in /sys/fs/cgroup is EPERM)
   and no other controllers; no `memory.stat`, `memory.swap.*`, `memory.oom.group`,
   `memory.reclaim` or pressure files; kernel heap objects are not charged; an allocation of

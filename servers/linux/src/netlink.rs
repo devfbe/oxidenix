@@ -190,8 +190,11 @@ fn broadcast(group: u32, from: u32, data: &[u8]) {
             Ok(copy) => m.deliver_to(from, group, copy),
             Err(_) => {
                 let mut st = m.state.lock();
-                NetlinkSocket::overrun(&mut st);
+                let new = NetlinkSocket::overrun(&mut st);
                 m.changed(&mut st, false);
+                if new {
+                    files::sigio(m.id, files::Io::Err);
+                }
             }
         }
     }
@@ -358,21 +361,29 @@ impl NetlinkSocket {
     /// `deliver`, of a datagram sent to `group` (0: to the port).
     fn deliver_to(&self, from: u32, group: u32, data: Vec<u8>) {
         let mut st = self.state.lock();
-        if st.queued + cost(data.len()) > st.rcvbuf as usize || st.queue.try_grow(1).is_err() {
-            Self::overrun(&mut st);
+        // Signal-driven I/O: a datagram is input (Linux's sock_def_readable), an overrun
+        // an error (its sk_error_report).
+        let io = if st.queued + cost(data.len()) > st.rcvbuf as usize || st.queue.try_grow(1).is_err() {
+            Self::overrun(&mut st).then_some(files::Io::Err)
         } else {
             st.queued += cost(data.len());
             st.queue.push_back(Datagram { from, group, data });
-        }
+            Some(files::Io::In)
+        };
         self.changed(&mut st, true);
+        if let Some(io) = io {
+            files::sigio(self.id, io);
+        }
     }
 
     /// Answers were dropped for want of room: ENOBUFS at the next receive
-    /// (unless NETLINK_NO_ENOBUFS).
-    fn overrun(st: &mut State) {
-        if st.options & (1 << NETLINK_NO_ENOBUFS) == 0 {
+    /// (unless NETLINK_NO_ENOBUFS); whether that error is new.
+    fn overrun(st: &mut State) -> bool {
+        if st.options & (1 << NETLINK_NO_ENOBUFS) == 0 && st.error != ENOBUFS {
             st.error = ENOBUFS;
+            return true;
         }
+        false
     }
 
     /// Goes on with a running dump while the receive buffer has room (as
@@ -386,7 +397,10 @@ impl NetlinkSocket {
             match dump.next(interfaces) {
                 Some(data) => {
                     if st.queue.try_grow(1).is_err() {
-                        Self::overrun(&mut st);
+                        if Self::overrun(&mut st) {
+                            self.changed(&mut st, false);
+                            files::sigio(self.id, files::Io::Err);
+                        }
                         break;
                     }
                     st.queued += cost(data.len());
@@ -401,6 +415,7 @@ impl NetlinkSocket {
         }
         if added {
             self.changed(&mut st, true);
+            files::sigio(self.id, files::Io::In);
         }
     }
 
@@ -538,6 +553,7 @@ impl NetlinkSocket {
                     st.dump = None;
                     st.error = ENOBUFS;
                     self.changed(&mut st, false);
+                    files::sigio(self.id, files::Io::Err);
                 }
             }
         }

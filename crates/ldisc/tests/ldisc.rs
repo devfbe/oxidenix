@@ -34,6 +34,22 @@ fn with(f: impl FnOnce(&mut Termios)) -> Ldisc {
 }
 
 #[test]
+fn line_ends_are_reported_in_canonical_mode_only() {
+    // A newline, VEOF and VEOL end a line (O_ASYNC's POLL_IN); other bytes do not.
+    let mut l = with(|t| t.cc[VEOL] = b';');
+    let (_, rs) = feed(&mut l, b"ab\n");
+    assert_eq!(rs.iter().map(|r| r.line_end).collect::<Vec<_>>(), [false, false, true]);
+    let (_, rs) = feed(&mut l, b"c\x04;");
+    assert_eq!(rs.iter().map(|r| r.line_end).collect::<Vec<_>>(), [false, true, true]);
+    // An erased line ends nothing; noncanonical input is never a line's end.
+    let (_, rs) = feed(&mut l, b"x\x7f");
+    assert!(rs.iter().all(|r| !r.line_end));
+    let mut raw = with(|t| t.lflag &= !ICANON);
+    let (_, rs) = feed(&mut raw, b"a\n");
+    assert!(rs.iter().all(|r| !r.line_end));
+}
+
+#[test]
 fn defaults_are_linux_tty_std_termios() {
     let t = Termios::default();
     assert_eq!(t.iflag, ICRNL | IXON);
@@ -255,7 +271,7 @@ fn signals_flush_unless_noflsh() {
     let mut l = std();
     feed(&mut l, b"abc\ndef");
     let (echo, rs) = feed(&mut l, b"\x03");
-    assert_eq!(rs[0], Received { signal: Some(SIGINT), flushed: true, dropped: false });
+    assert_eq!(rs[0], Received { signal: Some(SIGINT), flushed: true, dropped: false, line_end: false });
     assert_eq!(echo, b"^C");
     assert!(!l.readable(false));
     let (_, rs) = feed(&mut l, b"\x1c\x1a");

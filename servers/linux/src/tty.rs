@@ -147,6 +147,11 @@ pub struct PtyState {
     pub packet: bool,
     pub pktstatus: u8,
     pub pkt_new: bool,
+    /// Signal-driven I/O of the master (`Tty::changed`): new output came for it (its
+    /// POLL_IN, as its line discipline's on Linux), and a write of its left input undone
+    /// (Linux's TTY_DO_WRITE_WAKEUP of the master: room signals POLL_OUT).
+    pub out_new: bool,
+    pub master_write_wakeup: bool,
 }
 
 /// Packet mode's status bits (`TIOCPKT_*`).
@@ -174,6 +179,8 @@ impl PtyState {
             packet: false,
             pktstatus: 0,
             pkt_new: false,
+            out_new: false,
+            master_write_wakeup: false,
         }
     }
 }
@@ -221,6 +228,11 @@ pub struct Inner {
     /// reported.
     opens: BTreeMap<u64, (u32, i16)>,
     pub pty: Option<PtyState>,
+    /// Signal-driven I/O (`changed`): input came that readers may take (a canonical
+    /// line's end, any byte otherwise: Linux's n_tty signals POLL_IN then), and a write
+    /// left output undone (Linux's TTY_DO_WRITE_WAKEUP: room signals POLL_OUT).
+    sigio_in: bool,
+    write_wakeup: bool,
 }
 
 pub struct Tty {
@@ -549,6 +561,8 @@ impl Tty {
                 held_echo: Vec::new(),
                 opens: BTreeMap::new(),
                 pty,
+                sigio_in: false,
+                write_wakeup: false,
             }),
             seq: AtomicU32::new(0),
             turn_words: Default::default(),
@@ -628,6 +642,40 @@ impl Tty {
                 files::ready(p.master_id, master);
             }
         }
+        self.signal_io(inner);
+    }
+
+    /// Signal-driven I/O after a change (lock held): the terminal's open file descriptions
+    /// (not those hung up) get POLL_IN for input they may take now (Linux's n_tty receive
+    /// path) and POLL_OUT for room after a write left output undone (its tty_wakeup); a
+    /// pty's master likewise for the slave's output and for room in the slave's input.
+    fn signal_io(&self, inner: &mut Inner) {
+        let readers = core::mem::take(&mut inner.sigio_in) && inner.ld.readable(false);
+        let writers = inner.write_wakeup && Self::writable(inner);
+        if writers {
+            inner.write_wakeup = false;
+        }
+        if readers || writers {
+            let gen = inner.gen;
+            for &id in inner.opens.iter().filter(|(_, o)| o.0 == gen).map(|(id, _)| id) {
+                if readers {
+                    files::sigio(id, files::Io::In);
+                }
+                if writers {
+                    files::sigio(id, files::Io::Out);
+                }
+            }
+        }
+        let room = inner.ld.room();
+        if let Some(p) = inner.pty.as_mut().filter(|p| p.master_open) {
+            if core::mem::take(&mut p.out_new) && !p.out.is_empty() {
+                files::sigio(p.master_id, files::Io::In);
+            }
+            if p.master_write_wakeup && room {
+                p.master_write_wakeup = false;
+                files::sigio(p.master_id, files::Io::Out);
+            }
+        }
     }
 
     /// Sleeps while `seq` is `seen`, until `deadline` (0: none); EINTR for a signal.
@@ -644,8 +692,13 @@ impl Tty {
         self.seq.load(Ordering::Acquire)
     }
 
-    fn hung_up(&self, open: &TtyOpen) -> bool {
+    pub fn hung_up(&self, open: &TtyOpen) -> bool {
         self.inner.lock().gen != open.gen
+    }
+
+    /// Its foreground process group, if it has one (O_ASYNC's default owner).
+    pub fn foreground(&self) -> Option<u64> {
+        self.inner.lock().pgrp
     }
 
     /// Linux's `tty_check_change` (`sig` SIGTTOU) and `job_control` (SIGTTIN): a process
@@ -684,6 +737,9 @@ impl Tty {
     fn receive(&self, inner: &mut Inner, b: u8, echo: &mut Vec<u8>, signals: &mut Vec<(u64, u64)>) {
         let was_stopped = inner.ld.stopped();
         let r = inner.ld.receive(b, echo);
+        // Readers may take it (a line's end, or any byte outside canonical mode): POLL_IN
+        // for O_ASYNC once the batch is in (`signal_io`).
+        inner.sigio_in |= r.line_end || inner.ld.mode() != ReadMode::Canonical;
         if r.flushed {
             inner.epoch += 1;
             inner.held_echo.clear();
@@ -723,8 +779,9 @@ impl Tty {
                 // master that writes but never reads cannot grow the buffer.
                 let room = (MASTER_CAP + ECHO_ROOM).saturating_sub(p.out.len());
                 let n = echo.len().min(room);
-                if p.out.try_grow(n).is_ok() {
+                if n > 0 && p.out.try_grow(n).is_ok() {
                     p.out.extend(&echo[..n]);
+                    p.out_new = true;
                 }
                 None
             }
@@ -866,9 +923,11 @@ impl Tty {
                 if i < chunk.len() {
                     let done = written + i;
                     if nonblock {
+                        self.write_undone(true);
                         return if done > 0 { Ok(done as i64) } else { Err(EAGAIN) };
                     }
                     if let Err(e) = self.wait(seen, 0) {
+                        self.write_undone(true);
                         return if done > 0 { Ok(done as i64) } else { Err(e) };
                     }
                 }
@@ -1020,6 +1079,7 @@ impl Tty {
                         inner.ld.output(&chunk, &mut out);
                         match inner.pty.as_mut() {
                             Some(p) => {
+                                p.out_new |= !out.is_empty();
                                 p.out.extend(out);
                                 self.changed(&mut inner, false, true);
                             }
@@ -1038,15 +1098,30 @@ impl Tty {
                     self.seen()
                 };
                 if nonblock {
+                    self.write_undone(false);
                     return if written > 0 { Ok(written as i64) } else { Err(EAGAIN) };
                 }
                 if let Err(e) = self.wait(seen, 0) {
+                    self.write_undone(false);
                     return if written > 0 { Ok(written as i64) } else { Err(e) };
                 }
             }
             written += chunk.len();
         }
         Ok(written as i64)
+    }
+
+    /// A write (of the slave or the console, or with `master` of a pty's master) ends with
+    /// bytes it could not write (Linux's n_tty_write sets TTY_DO_WRITE_WAKEUP then): room
+    /// signals the O_ASYNC owners POLL_OUT, at once if it came meanwhile.
+    fn write_undone(&self, master: bool) {
+        let mut inner = self.inner.lock();
+        if !master {
+            inner.write_wakeup = true;
+        } else if let Some(p) = inner.pty.as_mut() {
+            p.master_write_wakeup = true;
+        }
+        self.signal_io(&mut inner);
     }
 
     /// The last descriptor of an open file description went.
@@ -1140,6 +1215,8 @@ impl Tty {
             if let (Some(sig), Some(fg)) = (r.signal, inner.pgrp) {
                 signals.push((fg, sig as u64));
             }
+            // (A NUL it put in noncanonical input is for the readers.)
+            inner.sigio_in |= inner.ld.mode() != ReadMode::Canonical;
             self.changed(&mut inner, true, false);
         }
         Self::send(signals);
@@ -1152,6 +1229,11 @@ impl Tty {
     pub fn hangup(&self, exit_session: bool) {
         let (leader, fg) = {
             let mut inner = self.inner.lock();
+            // Its files lose O_ASYNC, which they cannot have again (Linux's
+            // `__tty_hangup`: FASYNC off, then hung_up_tty_fops).
+            for &id in inner.opens.iter().filter(|(_, o)| o.0 == inner.gen).map(|(id, _)| id) {
+                crate::poll::async_off(id);
+            }
             inner.gen = inner.gen.wrapping_add(1);
             inner.epoch += 1;
             inner.held_echo.clear();
@@ -1196,6 +1278,7 @@ impl Tty {
                     // Within the room echoes have (TCXONC in a loop does not grow it).
                     if p.out.len() < MASTER_CAP + ECHO_ROOM && p.out.try_grow(1).is_ok() {
                         p.out.push_back(c);
+                        p.out_new = true;
                     }
                     None
                 }

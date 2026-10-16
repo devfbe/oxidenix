@@ -1075,7 +1075,7 @@ fn fdinfo(pid: u64, fd: u32) -> Result<String, i64> {
     let ino_of = |file: &File| files::stat_file(file).map_or((0, 0), |s| (s.ino, s.dev));
     let info = |kind| fmt::FdInfo {
         pos: position(&f.file),
-        flags: f.flags() | if cloexec { files::O_CLOEXEC } else { 0 },
+        flags: f.status_flags() | if cloexec { files::O_CLOEXEC } else { 0 },
         mnt_id: mount_of(&f),
         ino: ino_of(&f.file).0,
         kind,

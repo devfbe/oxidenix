@@ -103,7 +103,7 @@ An AI research project; see README.md.
   - The Linux server: `servers/linux/src/main.rs` (dispatch order mm → time → fdtable → files →
     poll → epoll → paths → sched → ids → futex → system → sockets → ENOSYS), `fdtable.rs`/`files.rs`
     (the descriptor table, open file descriptions), `poll.rs`/`epoll.rs` (watch lists, poll,
-    select, epoll), `futex.rs`, `system.rs` (uname, sysinfo, reboot, getrandom, getcpu,
+    select, epoll; O_ASYNC's signal-driven I/O, `files::sigio`: ADR 0023), `futex.rs`, `system.rs` (uname, sysinfo, reboot, getrandom, getcpu,
     arch_prctl), `local.rs` (per-thread
     block), `namespace.rs`/`paths.rs` (paths, mounts),
     `tmpfs.rs`/`tmpfile.rs` (root fs and /dev), `datafs.rs`/`datafile.rs`/`fsclient.rs` (`/data` and its

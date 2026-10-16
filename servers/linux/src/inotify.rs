@@ -319,14 +319,17 @@ impl Inotify {
         }
         if room {
             self.push(st, e);
+            // (Linux's fsnotify_add_event: each event queued, not merged, signals.)
+            files::sigio(self.id, files::Io::In);
         } else {
-            self.overflow(st);
+            self.overflow(st, true);
         }
     }
 
     /// Events were lost (no room for them, or no memory): one IN_Q_OVERFLOW
-    /// stands for them until it is read (lock held).
-    fn overflow(&self, st: &mut State) {
+    /// stands for them until it is read (lock held); queued now, it signals the O_ASYNC
+    /// owner with `announce` (one taken from `lost` was announced there).
+    fn overflow(&self, st: &mut State, announce: bool) {
         if st.overflowed {
             return;
         }
@@ -340,12 +343,15 @@ impl Inotify {
         let o = Event { wd: -1, mask: IN_Q_OVERFLOW, cookie: 0, name: Vec::new() };
         QUEUED_BYTES.fetch_add(cost(&o), Ordering::Relaxed);
         self.push(st, o);
+        if announce {
+            files::sigio(self.id, files::Io::In);
+        }
     }
 
     /// Events lost without the lock (`lost`) become the overflow (lock held).
     fn take_lost(&self, st: &mut State) {
         if self.lost.swap(false, Ordering::AcqRel) {
-            self.overflow(st);
+            self.overflow(st, false);
         }
     }
 
@@ -373,7 +379,7 @@ impl Inotify {
         match heap::try_to_vec(name) {
             Ok(name) => self.queue(&mut st, Event { wd, mask, cookie, name }),
             // No memory for the event: lost, as one beyond the queue's bound.
-            Err(NoMem) => self.overflow(&mut st),
+            Err(NoMem) => self.overflow(&mut st, true),
         }
         if oneshot {
             st.watches.remove(&wd);
@@ -566,6 +572,8 @@ fn lost(key: Key) {
             let word = &i.seq as *const AtomicU32 as u64;
             syscall(SYS_SERVER_FUTEX_WAKE, [word, i32::MAX as u64, 0, 0, 0, 0]);
             files::ready(i.id, POLLIN);
+            // (The overflow event, queued when it is read, signals now.)
+            files::sigio(i.id, files::Io::In);
         }
     }
 }

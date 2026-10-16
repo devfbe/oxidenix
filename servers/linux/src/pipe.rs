@@ -310,6 +310,25 @@ impl Shared {
         }
     }
 
+    /// Signal-driven I/O (lock held): the ends that read (`readers`) or that write get `io`
+    /// (Linux's kill_fasync of the pipe's fasync_readers or fasync_writers).
+    fn sigio(inner: &Inner, readers: bool, io: files::Io) {
+        for e in inner.ends.iter().filter(|e| e.installed && if readers { e.reads } else { e.writes }) {
+            files::sigio(e.id, io);
+        }
+    }
+
+    /// A read or write call is done, or about to wait: as Linux's pipe_read and pipe_write
+    /// at their end and before they sleep, a write signals the readers (POLL_IN) and a read
+    /// the writers (POLL_OUT), whatever it moved.
+    fn call_done(&self, write: bool) {
+        if !crate::poll::async_in_use() {
+            return;
+        }
+        let inner = self.inner.lock();
+        Self::sigio(&inner, write, if write { files::Io::In } else { files::Io::Out });
+    }
+
     /// Sleeps while the sequence word is `seen`; EINTR for a signal.
     fn wait(&self, seen: u32) -> Result<(), i64> {
         let word = &self.seq as *const AtomicU32 as u64;
@@ -365,6 +384,12 @@ impl PipeEnd {
         inner.writers -= self.writes as u32;
         inner.ends.retain(|e| e.id != self.id);
         self.shared.changed(&mut inner, false, false);
+        // The last reader or the last writer went (Linux's pipe_release): the readers
+        // learn of the end of file, the writers of EPIPE.
+        if (inner.readers == 0) != (inner.writers == 0) {
+            Shared::sigio(&inner, true, files::Io::In);
+            Shared::sigio(&inner, false, files::Io::Out);
+        }
     }
 
     /// Reads into `dst`: what is there, waiting while the pipe is empty and
@@ -385,6 +410,12 @@ impl PipeEnd {
         if sink.room() == 0 {
             return Ok(0);
         }
+        let r = self.read_waiting(&mut sink, nonblock);
+        self.shared.call_done(false);
+        r
+    }
+
+    fn read_waiting(&self, sink: &mut Sink, nonblock: bool) -> Result<i64, i64> {
         let mut reader = Some(self.shared.rlock.lock()?);
         loop {
             let seen;
@@ -392,7 +423,7 @@ impl PipeEnd {
                 let inner = self.shared.inner.lock();
                 if !inner.buf.is_empty() {
                     drop(inner);
-                    let r = self.drain(&mut sink);
+                    let r = self.drain(sink);
                     drop(reader);
                     return r;
                 }
@@ -406,6 +437,7 @@ impl PipeEnd {
             }
             // Not holding the other readers off while it sleeps.
             drop(reader.take());
+            self.shared.call_done(false);
             self.shared.wait(seen)?;
             reader = Some(self.shared.rlock.lock()?);
         }
@@ -460,6 +492,19 @@ impl PipeEnd {
     }
 
     fn write_data(&self, src: Src, nonblock: bool) -> Result<i64, i64> {
+        let empty = match &src {
+            Src::Program(vecs) => vecs.iter().all(|&(_, len)| len == 0),
+            Src::Server(buf) => buf.is_empty(),
+        };
+        if empty {
+            return Ok(0);
+        }
+        let r = self.write_waiting(src, nonblock);
+        self.shared.call_done(true);
+        r
+    }
+
+    fn write_waiting(&self, src: Src, nonblock: bool) -> Result<i64, i64> {
         let mut written: u64 = 0;
         let mut chunk = [0u8; CHUNK];
         let whole;
@@ -518,6 +563,7 @@ impl PipeEnd {
                     if nonblock {
                         return if written > 0 { Ok(written as i64) } else { Err(EAGAIN) };
                     }
+                    self.shared.call_done(true);
                     if let Err(e) = self.shared.wait(seen) {
                         return if written > 0 { Ok(written as i64) } else { Err(e) };
                     }

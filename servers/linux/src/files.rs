@@ -11,7 +11,9 @@
 //! pipe2, eventfd, netlink sockets; terminals are opened by their device
 //! numbers, `tty::open_device`); the descriptor table's own calls (dup,
 //! close, fcntl, ...) are `fdtable`'s, poll and select `poll`'s, epoll
-//! `epoll`'s. Readiness changes reach them through `ready`.
+//! `epoll`'s. Readiness changes reach them through `ready`; the events of signal-driven
+//! I/O (O_ASYNC, ADR 0023) reach a description's owner through `sigio`, which each file
+//! calls where Linux's driver calls kill_fasync.
 
 use crate::datafile::{self, DataOpen};
 use crate::eventfd::EventFd;
@@ -128,53 +130,83 @@ pub struct Description {
     /// References in flight (SCM_RIGHTS messages, `scm::Passed`): the
     /// collector of sockets in flight compares them with all references.
     pub inflight: AtomicUsize,
-    /// Who gets the file's signals (F_SETOWN: SIGURG of a socket's urgent
-    /// data), `Owner::encode`d.
-    owner: AtomicU64,
+    /// Its owner and signal, for a description without a watch (one with a watch keeps
+    /// them there, where its signal-driven I/O reads them: `fown`).
+    own_fown: Fown,
 }
+
+/// Who gets an open file description's signals and which (Linux's fown_struct): the owner
+/// (F_SETOWN, F_SETOWN_EX: SIGIO with O_ASYNC, SIGURG of a socket's urgent data; a leaf
+/// lock), and the signal of signal-driven I/O (F_SETSIG; 0: SIGIO without siginfo).
+pub struct Fown {
+    owner: crate::sync::Mutex<Owner>,
+    signum: AtomicU32,
+}
+
+impl Default for Fown {
+    fn default() -> Fown {
+        Fown { owner: crate::sync::Mutex::new(Owner::None), signum: AtomicU32::new(0) }
+    }
+}
+
+impl Fown {
+    pub fn owner(&self) -> Owner {
+        *self.owner.lock()
+    }
+
+    pub fn signum(&self) -> u32 {
+        self.signum.load(Ordering::Relaxed)
+    }
+}
+
+/// What happened on a file, for signal-driven I/O (O_ASYNC): the reasons Linux's drivers
+/// give kill_fasync, which are the si_code of an F_SETSIG signal (POLL_IN .. POLL_HUP;
+/// POLL_MSG, 3, no file here gives).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(i32)]
+pub enum Io {
+    /// Input came (data, a connection, an event).
+    In = 1,
+    /// Room came for output.
+    Out = 2,
+    /// An error.
+    Err = 4,
+    /// Urgent input (a socket's urgent data, with F_SETSIG only).
+    Pri = 5,
+    /// The other end hung up.
+    Hup = 6,
+}
+
+impl Io {
+    /// The poll events of the reason (si_band; Linux's band_table).
+    pub fn band(self) -> i16 {
+        const POLLPRI: i16 = 0x2;
+        const POLLRDBAND: i16 = 0x80;
+        const POLLWRBAND: i16 = 0x200;
+        match self {
+            Io::In => POLLIN | POLLRDNORM,
+            Io::Out => POLLOUT | POLLWRNORM | POLLWRBAND,
+            Io::Err => POLLERR,
+            Io::Pri => POLLPRI | POLLRDBAND,
+            Io::Hup => POLLHUP | POLLERR,
+        }
+    }
+}
+
+/// O_ASYNC, Linux's FASYNC.
+pub const O_ASYNC: u32 = 0o20000;
 
 /// Who gets an open file description's signals (fcntl's F_SETOWN,
 /// F_SETOWN_EX; Linux's f_owner): none, a thread, a process, or a
-/// process group.
+/// process group, each by its id and its identity (`process::owner_of`: a thread's or
+/// process's serial, a group's maker's), so that a later one with the same id is not it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Owner {
     #[default]
     None,
-    Thread(u32),
-    Process(u32),
-    Group(u32),
-}
-
-impl Owner {
-    pub fn encode(self) -> u64 {
-        match self {
-            Owner::None => 0,
-            Owner::Thread(id) => 1 << 32 | id as u64,
-            Owner::Process(id) => 2 << 32 | id as u64,
-            Owner::Group(id) => 3 << 32 | id as u64,
-        }
-    }
-
-    pub fn decode(v: u64) -> Owner {
-        let id = v as u32;
-        match v >> 32 {
-            1 => Owner::Thread(id),
-            2 => Owner::Process(id),
-            3 => Owner::Group(id),
-            _ => Owner::None,
-        }
-    }
-
-    /// Sends `sig` to it (SI_KERNEL, as Linux's send_sigurg); whether
-    /// anyone was there.
-    pub fn signal(self, sig: u32) -> bool {
-        match self {
-            Owner::None => false,
-            Owner::Thread(tid) => crate::signal::send_tid(tid, sig),
-            Owner::Process(pid) => crate::signal::send_process(pid, sig),
-            Owner::Group(pgid) => crate::signal::send_pgrp(pgid, sig),
-        }
-    }
+    Thread(u32, u64),
+    Process(u32, u64),
+    Group(u32, u64),
 }
 
 impl Description {
@@ -196,17 +228,88 @@ impl Description {
         }
     }
 
-    pub fn owner(&self) -> Owner {
-        Owner::decode(self.owner.load(Ordering::Relaxed))
+    /// Its owner and signal: its watch's, or its own without one.
+    fn fown(&self) -> &Fown {
+        self.watch.as_ref().map_or(&self.own_fown, |w| &w.fown)
     }
 
-    /// F_SETOWN: a socket keeps its own copy (its signals come from the
-    /// net thread, which knows the socket, not the description).
+    pub fn owner(&self) -> Owner {
+        self.fown().owner()
+    }
+
+    /// F_SETOWN, F_SETOWN_EX.
     pub fn set_owner(&self, owner: Owner) {
-        self.owner.store(owner.encode(), Ordering::Relaxed);
-        if let File::Inet(s) = &self.file {
-            s.set_owner(owner);
+        *self.fown().owner.lock() = owner;
+    }
+
+    /// F_GETSIG.
+    pub fn signum(&self) -> u32 {
+        self.fown().signum()
+    }
+
+    /// F_SETSIG (a valid signal number or 0).
+    pub fn set_signum(&self, sig: u32) {
+        self.fown().signum.store(sig, Ordering::Relaxed);
+    }
+
+    /// Its status flags as F_GETFL and fdinfo show them: a hung-up terminal's O_ASYNC went
+    /// with the hangup (Linux's `__tty_hangup` turns FASYNC off; its entry is gone,
+    /// `tty::Tty::hangup`).
+    pub fn status_flags(&self) -> u32 {
+        let flags = self.flags();
+        match &self.file {
+            File::Tty(t) if flags & O_ASYNC != 0 && t.tty.hung_up(t) => flags & !O_ASYNC,
+            _ => flags,
         }
+    }
+
+    /// Whether its file has signal-driven I/O (Linux's `fasync` method): pipes and FIFOs,
+    /// sockets, terminals and ptys' masters, inotify instances. For the others F_SETFL
+    /// leaves O_ASYNC as it is (Linux's SETFL_MASK has no FASYNC: the method sets it), and
+    /// FIOASYNC is ENOTTY. A terminal hung up has none (ENOTTY, Linux's
+    /// hung_up_tty_fasync).
+    fn has_fasync(&self) -> Result<bool, i64> {
+        Ok(match &self.file {
+            File::Pipe(_) | File::Socket(_) | File::Inet(_) | File::Netlink(_) | File::PtyMaster(_) | File::Inotify(_) => true,
+            File::Tty(t) if t.tty.hung_up(t) => return Err(ENOTTY),
+            File::Tty(_) => true,
+            _ => false,
+        })
+    }
+
+    /// Turns O_ASYNC on or off (F_SETFL, FIOASYNC with `ioctl`), for descriptor `fd`: the
+    /// file's events signal the owner from now on (`sigio`), with `fd` as si_fd. Only a
+    /// change does anything (as Linux calls the file's `fasync` method only then: O_ASYNC
+    /// given to open(2) is a flag without signals, as on Linux). A terminal's owner, if it
+    /// has none, becomes its foreground process group, or the caller (Linux's
+    /// `__tty_fasync`). Without signal-driven I/O nothing changes; FIOASYNC (`ioctl`) is
+    /// ENOTTY then.
+    pub fn set_async(&self, fd: i32, on: bool, ioctl: bool) -> Result<(), i64> {
+        if (self.status_flags() & O_ASYNC != 0) == on {
+            return Ok(());
+        }
+        let watch = match (self.has_fasync()?, &self.watch) {
+            (true, Some(w)) => w,
+            _ if ioctl => return Err(ENOTTY),
+            _ => return Ok(()),
+        };
+        if on && self.owner() == Owner::None {
+            let fg = match &self.file {
+                File::Tty(t) => t.tty.foreground(),
+                _ => None,
+            };
+            use crate::process::{owner_of, OwnerKind};
+            let owner = match (&self.file, fg) {
+                (File::Tty(_), Some(pgrp)) => owner_of(OwnerKind::Group, pgrp as u32).ok(),
+                (File::Tty(_) | File::PtyMaster(_), None) => owner_of(OwnerKind::Process, crate::local::pid()).ok(),
+                _ => None,
+            };
+            if let Some(owner) = owner {
+                self.set_owner(owner);
+            }
+        }
+        watch.set_async(self, fd, on);
+        Ok(())
     }
 
     pub fn is_path(&self) -> bool {
@@ -412,7 +515,7 @@ pub fn install_watched(id: u64, file: File, flags: u32, watch: Option<Arc<crate:
 fn install_into(mut memory: Arc<core::mem::MaybeUninit<Description>>, id: u64, file: File, flags: u32, watch: Option<Arc<crate::poll::Watch>>) -> Result<i64, i64> {
     fdtable::current().install_new(
         || {
-            let description = Description { id, file, flags: AtomicU32::new(flags & !O_CLOEXEC), watch, inflight: AtomicUsize::new(0), owner: AtomicU64::new(0) };
+            let description = Description { id, file, flags: AtomicU32::new(flags & !O_CLOEXEC), watch, inflight: AtomicUsize::new(0), own_fown: Fown::default() };
             Arc::get_mut(&mut memory).expect("a new Arc is unique").write(description);
             FileRef::new(unsafe { memory.assume_init() })
         },
@@ -457,6 +560,19 @@ pub fn install_in_watched(room: Room, id: u64, file: File, flags: u32, watch: Ar
 /// keep their order.
 pub fn ready(id: u64, ready: i16) {
     crate::poll::report(id, ready);
+}
+
+/// Signal-driven I/O (Linux's kill_fasync): `io` happened on file `id`, whose owner gets
+/// its signal if the description has O_ASYNC on (`poll::sigio`). Each file calls it where
+/// Linux's driver calls kill_fasync, under its own lock or after it.
+pub fn sigio(id: u64, io: Io) {
+    crate::poll::sigio(id, io);
+}
+
+/// Urgent data came to socket `id`: SIGURG to its owner, and with O_ASYNC and an F_SETSIG
+/// signal that signal with POLL_PRI as well (`poll::sigurg`).
+pub fn sigurg(id: u64) {
+    crate::poll::sigurg(id);
 }
 
 /// The description behind descriptor `fd` (EBADF), O_PATH ones too (for
@@ -635,6 +751,11 @@ const SYS_PWRITEV2: u64 = 328;
 pub const SYS_GETDENTS64: u64 = 217;
 pub const SYS_FSTATFS: u64 = 138;
 const SYS_FADVISE64: u64 = 221;
+/// A socket's owner (`sockios.h`).
+const FIOSETOWN: u64 = 0x8901;
+const SIOCSPGRP: u64 = 0x8902;
+const FIOGETOWN: u64 = 0x8903;
+const SIOCGPGRP: u64 = 0x8904;
 
 /// The result of a file system call in `s` the server handles, or None.
 pub fn handle(s: &State) -> Option<i64> {
@@ -681,6 +802,15 @@ pub fn handle(s: &State) -> Option<i64> {
         }),
         // The interface requests every socket takes.
         SYS_IOCTL if crate::netdev::is_request(a1) => crate::netdev::ioctl(a0, a1, a2),
+        // A socket's owner as F_SETOWN and F_GETOWN set and get it (Linux's sock_ioctl).
+        SYS_IOCTL if matches!(a1 as u32 as u64, FIOSETOWN | SIOCSPGRP | FIOGETOWN | SIOCGPGRP)
+            && lookup(a0).is_ok_and(|f| matches!(f.file, File::Socket(_) | File::Inet(_) | File::Netlink(_))) =>
+        {
+            lookup(a0).and_then(|f| match a1 as u32 as u64 {
+                FIOSETOWN | SIOCSPGRP => fdtable::set_owner_of(&f, crate::usercopy::read::<i32>(a2)?),
+                _ => crate::usercopy::write(a2, &(fdtable::owner_id(&f) as i32)).map(|_| 0),
+            })
+        }
         SYS_READ | SYS_WRITE | SYS_READV | SYS_WRITEV | SYS_FSTAT | SYS_LSEEK | SYS_IOCTL | SYS_PREAD64 | SYS_PWRITE64
         | SYS_PREADV | SYS_PWRITEV | SYS_FSYNC | SYS_FDATASYNC | SYS_FTRUNCATE | SYS_GETDENTS64 | SYS_FSTATFS => {
             // fstat and fstatfs take an O_PATH descriptor (they describe its
