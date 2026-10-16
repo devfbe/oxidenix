@@ -23,10 +23,14 @@ impl PerCpu {
     }
 }
 
-/// Adds `n` to one of the calling CPU's counters.
+/// Adds `n` to one of the calling CPU's counters: one `add` without the `lock` prefix (as
+/// Linux's `this_cpu_add`), indivisible for this CPU's interrupts, which are the only other
+/// writers (the kernel never moves a running task to another CPU in the middle of kernel
+/// code); readers on other CPUs see the old or the new value of the aligned word.
 #[inline]
 pub fn add(counter: impl FnOnce(&PerCpu) -> &AtomicU64, n: u64) {
-    counter(&crate::smp::cpu().counters).fetch_add(n, Ordering::Relaxed);
+    let word = counter(&crate::smp::cpu().counters).as_ptr();
+    unsafe { core::arch::asm!("add qword ptr [{}], {}", in(reg) word, in(reg) n, options(nostack)) };
 }
 
 pub static HEAP_ALLOCS: AtomicU64 = AtomicU64::new(0);

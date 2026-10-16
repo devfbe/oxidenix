@@ -37,6 +37,35 @@ pub enum GroupExit {
     Exiting(i32),
 }
 
+/// A process's `GroupExit`: set once, read without a lock (every return to a Linux program
+/// asks whether its process is ending).
+pub struct ExitCell(core::sync::atomic::AtomicU64);
+
+/// `ExitCell`'s word of `GroupExit::Exiting`: this bit and the status.
+const EXITING: u64 = 1 << 32;
+
+impl ExitCell {
+    pub const fn new() -> Self {
+        ExitCell(core::sync::atomic::AtomicU64::new(0))
+    }
+
+    pub fn get(&self) -> GroupExit {
+        match self.0.load(Ordering::Acquire) {
+            0 => GroupExit::None,
+            word => GroupExit::Exiting(word as u32 as i32),
+        }
+    }
+
+    pub fn is_exiting(&self) -> bool {
+        self.0.load(Ordering::Acquire) != 0
+    }
+
+    /// The process ends with `status` unless it already does: whether this call made it end.
+    pub fn begin(&self, status: i32) -> bool {
+        self.0.compare_exchange(0, EXITING | status as u32 as u64, Ordering::AcqRel, Ordering::Acquire).is_ok()
+    }
+}
+
 /// Whether a Linux program's process (its threads are its server's to
 /// kick and kill).
 fn linux_process(group: &ThreadGroup) -> bool {
@@ -59,7 +88,7 @@ pub fn dying() -> bool {
     if super::linux::serves_program() {
         return super::linux::dying();
     }
-    *current().group.exit.lock() != GroupExit::None
+    current().group.exit.is_exiting()
 }
 
 /// The kernel kills the calling thread's process (out of memory, a failed
@@ -103,10 +132,7 @@ pub fn kill_process(group: &Arc<ThreadGroup>, status: i32) {
         if linux_process(group) {
             let _ = group.killed_by_kernel.compare_exchange(0, status as u64, Ordering::AcqRel, Ordering::Acquire);
         }
-        let mut exit = group.exit.lock();
-        if *exit == GroupExit::None {
-            *exit = GroupExit::Exiting(status);
-        }
+        group.exit.begin(status);
         info.threads.clone()
     };
     for t in &threads {
@@ -136,8 +162,7 @@ pub fn exit_if_dying(frame: &Frame) {
     if !frame.from_user() || super::linux::mode().is_some() {
         return;
     }
-    let exit = *current().group.exit.lock();
-    if let GroupExit::Exiting(status) = exit {
+    if let GroupExit::Exiting(status) = current().group.exit.get() {
         super::exit_thread(status);
     }
 }

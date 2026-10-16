@@ -32,14 +32,11 @@ pub fn exit_group(status: i32) -> ! {
     let me = current();
     let others: Vec<Arc<Task>> = {
         let info = me.group.info.lock();
-        let mut exit = me.group.exit.lock();
-        match *exit {
+        if me.group.exit.begin(status) {
+            info.threads.iter().filter(|t| !core::ptr::eq(&***t, me)).cloned().collect()
+        } else {
             // Already ending: just this thread.
-            GroupExit::Exiting(_) => Vec::new(),
-            GroupExit::None => {
-                *exit = GroupExit::Exiting(status);
-                info.threads.iter().filter(|t| !core::ptr::eq(&***t, me)).cloned().collect()
-            }
+            Vec::new()
         }
     };
     for t in &others {
@@ -109,7 +106,7 @@ pub fn exit_thread(status: i32) -> ! {
     };
     if last {
         let main_status = group.info.lock().main_status;
-        let status = match *group.exit.lock() {
+        let status = match group.exit.get() {
             GroupExit::Exiting(s) => s,
             GroupExit::None => main_status.unwrap_or(status),
         };

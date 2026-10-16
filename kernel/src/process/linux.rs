@@ -3174,7 +3174,7 @@ pub fn kicked() -> bool {
 /// or its process is ending (`exit_group`, the kernel's kill).
 pub fn dying() -> bool {
     let me = super::sched::current();
-    me.killed.load(core::sync::atomic::Ordering::SeqCst) || *me.group.exit.lock() != super::kill::GroupExit::None
+    me.killed.load(core::sync::atomic::Ordering::SeqCst) || me.group.exit.is_exiting()
 }
 
 /// Whether the calling thread serves a program (not a service thread, not a
@@ -3579,20 +3579,43 @@ pub fn enter(f: &mut Frame) -> Result<(), i64> {
         f.rax = REASON_KICK;
         return Ok(());
     }
-    x86_64::instructions::interrupts::without_interrupts(|| {
-        with_current(|p| {
-            let l = p.linux.as_mut().expect("a Linux thread");
-            let mut program = Frame::default();
-            load(l.state(), &mut program)?;
-            l.normal = *f;
-            *f = program;
-            l.restricted = true;
-            if l.debug.armed() {
-                l.debug.load();
-            }
-            Ok::<_, i64>(())
-        })
-        .inspect(|_| switch_view(false))
+    x86_64::instructions::interrupts::without_interrupts(|| run_program(f))
+}
+
+/// restricted_enter()'s common case, from `syscall::dispatch` with interrupts off: the program
+/// runs (true) unless anything `enter` and its caller look at first is due (false, `f`
+/// untouched): the caller is the instance's pager, the thread must die or was kicked, or it
+/// charged above its tree's memory.high (ADR 0024). Interrupts stay off up to sysretq; a kick
+/// that comes meanwhile is an IPI pending until then, which brings the program back at once
+/// (`kick_pending`).
+pub fn enter_fast(f: &mut Frame) -> bool {
+    use core::sync::atomic::Ordering::Relaxed;
+    let me = super::sched::current();
+    let usual = with_current(|p| p.linux.as_ref().is_some_and(|l| !l.pager))
+        && !me.killed.load(Relaxed)
+        && !me.group.exit.is_exiting()
+        && !me.kicked.load(Relaxed)
+        && me.memcg_high_pages.load(Relaxed) == 0;
+    usual && run_program(f).is_ok()
+}
+
+/// Runs the program of the calling thread, which runs its server (`f`, its registers, are
+/// kept for the program's next trap): its registers from the State page, its breakpoints, the
+/// restricted view. With interrupts off. `f` is untouched if the State is refused.
+fn run_program(f: &mut Frame) -> Result<(), i64> {
+    with_current(|p| {
+        let l = p.linux.as_mut().expect("a Linux thread");
+        let normal = *f;
+        load(l.state(), f)?;
+        l.normal = normal;
+        l.restricted = true;
+        if l.debug.armed() {
+            l.debug.load();
+        }
+        if let Some(mm) = &p.mm {
+            super::tlb::switch(Some(&mm.tlb), Some(&mm.tlb), false);
+        }
+        Ok(())
     })
 }
 

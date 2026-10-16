@@ -201,7 +201,7 @@ impl PidReservation {
         let mut table = TABLE.lock();
         // Nothing new comes out of a process that is ending or exec'ing:
         // neither a thread nor a forked child.
-        if *current().group.exit.lock() != super::kill::GroupExit::None {
+        if current().group.exit.is_exiting() {
             return Err(super::errno::EAGAIN);
         }
         let mut info = group.info.lock();

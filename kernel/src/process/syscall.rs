@@ -78,9 +78,10 @@ pub fn init() {
 /// Builds a `Frame` on the kernel stack (iret part first, as an interrupt
 /// would) and dispatches the syscall. Interrupts are off on entry (SFMASK),
 /// so nothing runs between `swapgs` and the switch to the kernel stack;
-/// once the frame is saved they are enabled for the syscall itself. The
-/// kernel stays non-preemptive (an interrupt in kernel mode never
-/// schedules), but long syscalls no longer delay timer ticks and device
+/// `dispatch` enables them for the syscall itself, except for the switches
+/// between a Linux program and its server, which keep them off up to
+/// sysretq. The kernel stays non-preemptive (an interrupt in kernel mode
+/// never schedules), but long syscalls do not delay timer ticks and device
 /// interrupts on their CPU.
 #[unsafe(naked)]
 unsafe extern "C" fn syscall_entry() {
@@ -110,7 +111,6 @@ unsafe extern "C" fn syscall_entry() {
         "push rcx",
         "push rbx",
         "push rax",
-        "sti",
         "mov rdi, rsp",
         "call {dispatch}",
         "jmp {ret}",
@@ -231,19 +231,33 @@ pub unsafe extern "C" fn user_return() {
     );
 }
 
+/// Interrupts are off (SFMASK) on entry: the switches between a Linux program and its server
+/// (a program's call, the server's `restricted_enter` in the common case) run with them off up
+/// to sysretq, which turns them on with the user's flags; every other call turns them on first.
 extern "sysv64" fn dispatch(f: &mut Frame) {
     crate::counters::add(|c| &c.syscalls, 1);
     // The CPU-time alarms a tick in the kernel brought due (`cputimer`; one in user
     // mode was looked at on its way out of the interrupt).
     super::cputimer::check(super::sched::current());
-    match super::linux::mode() {
+    let mode = super::linux::mode();
+    match mode {
         // A Linux program's system call goes to its server.
         Some(true) => {
             super::linux::trap(f, restricted::REASON_SYSCALL);
             super::sched::resched_on_return();
+            return;
         }
-        // The server's own calls.
-        Some(false) => {
+        // Back to the program, unless something is due first (`enter`).
+        Some(false) if f.rax == restricted::SYS_RESTRICTED_ENTER && super::linux::enter_fast(f) => {
+            super::sched::resched_on_return();
+            return;
+        }
+        _ => {}
+    }
+    x86_64::instructions::interrupts::enable();
+    match mode {
+        // The server's own calls (a program's returned above).
+        Some(_) => {
             if f.rax == restricted::SYS_RESTRICTED_ENTER {
                 // Back to the program: a thread that charged above its
                 // tree's memory.high is throttled first (ADR 0024).

@@ -14,7 +14,7 @@
 //! - The scheduling fields are atomics, written under `wake_lock`.
 
 use super::address_space::Mm;
-use super::kill::GroupExit;
+use super::kill::ExitCell;
 use super::{Pid, Server};
 use crate::interrupts::gdt;
 use crate::sync::IrqSpinLock;
@@ -120,8 +120,8 @@ pub struct ThreadGroup {
     pub privileged: AtomicBool,
     pub start_ticks: u64,
     pub info: IrqSpinLock<Info>,
-    /// Whether it is ending (taken after `info`).
-    pub exit: IrqSpinLock<GroupExit>,
+    /// Whether it is ending (set under `info`, read without it).
+    pub exit: ExitCell,
     /// The id of the Linux server instance whose tree the process belongs
     /// to (`linux::Instance::id`; 0: none, a server of the kernel's or the
     /// instance's pager). Set when its first thread is made.
@@ -176,7 +176,7 @@ impl ThreadGroup {
             privileged: AtomicBool::new(false),
             start_ticks: super::sched::ticks(),
             info: IrqSpinLock::new(info),
-            exit: IrqSpinLock::new(GroupExit::None),
+            exit: ExitCell::new(),
             instance: AtomicU64::new(0),
             server_reaps: AtomicBool::new(false),
             killed_by_kernel: AtomicU64::new(0),
