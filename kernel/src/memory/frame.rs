@@ -1,6 +1,8 @@
 //! The physical frame allocator: fresh frames from the bootloader's usable regions, freed ones
-//! on an intrusive free list, with reference counts for shared and copy-on-write frames.
+//! on an intrusive free list, with reference counts for shared and copy-on-write frames and
+//! the memory group each frame is charged to (ADR 0024).
 
+use super::memcg;
 use alloc::vec;
 use alloc::vec::Vec;
 use bootloader_api::info::{MemoryRegion, MemoryRegionKind};
@@ -16,6 +18,9 @@ pub const KERNEL_RESERVE_FRAMES: u64 = 4096;
 ///
 /// Once `enable_refcounts` ran, every frame carries a reference count so that
 /// copy-on-write pages can be shared; `deallocate_frame` drops one reference.
+/// It also carries the memory group it is charged to (`memcg`; the root for
+/// none): set when it is allocated for a group (`UserFrames`, `charge`),
+/// uncharged when its last reference goes.
 pub struct PhysFrameAllocator {
     regions: &'static [MemoryRegion],
     region_idx: usize,
@@ -23,6 +28,7 @@ pub struct PhysFrameAllocator {
     free_head: u64,
     phys_offset: VirtAddr,
     refs: Vec<u32>,
+    owners: Vec<memcg::Id>,
     pub total_frames: u64,
     pub used_frames: u64,
 }
@@ -41,6 +47,7 @@ impl PhysFrameAllocator {
             free_head: 0,
             phys_offset,
             refs: Vec::new(),
+            owners: Vec::new(),
             total_frames,
             used_frames: 0,
         }
@@ -77,10 +84,48 @@ impl PhysFrameAllocator {
             .max()
             .unwrap_or(0);
         self.refs = vec![0; (max / FRAME_SIZE) as usize];
+        self.owners = vec![memcg::ROOT; (max / FRAME_SIZE) as usize];
     }
 
     fn index(frame: PhysFrame) -> usize {
         (frame.start_address().as_u64() / FRAME_SIZE) as usize
+    }
+
+    /// The memory group an allocated frame is charged to (`memcg::ROOT`: none).
+    pub fn owner(&self, frame: PhysFrame) -> memcg::Id {
+        self.owners.get(Self::index(frame)).copied().unwrap_or(memcg::ROOT)
+    }
+
+    /// Charges a frame just allocated (not charged yet) to group `id`; the
+    /// limit is the caller's to have checked (`memcg::may_charge`).
+    pub fn charge(&mut self, frame: PhysFrame, id: memcg::Id) {
+        if id == memcg::ROOT {
+            return;
+        }
+        if let Some(owner) = self.owners.get_mut(Self::index(frame)) {
+            debug_assert_eq!(*owner, memcg::ROOT, "a frame charged twice");
+            *owner = id;
+            memcg::charged(id, 1);
+        }
+    }
+
+    /// How many frames could carry a group (the range `reparent` walks).
+    pub fn frame_slots(&self) -> usize {
+        self.owners.len()
+    }
+
+    /// Moves the frames of [from, to) charged to `id` to the root (a dying
+    /// group's: `memcg::collect`).
+    pub fn reparent(&mut self, id: memcg::Id, from: usize, to: usize) {
+        let to = to.min(self.owners.len());
+        let mut moved = 0;
+        for owner in self.owners[from.min(to)..to].iter_mut().filter(|o| **o == id) {
+            *owner = memcg::ROOT;
+            moved += 1;
+        }
+        if moved > 0 {
+            memcg::uncharged(id, moved);
+        }
     }
 
     /// Adds a reference to an allocated frame (it is now shared).
@@ -163,6 +208,11 @@ impl FrameDeallocator<Size4KiB> for PhysFrameAllocator {
             }
             *r = 0;
         }
+        if let Some(owner) = self.owners.get_mut(Self::index(frame)) {
+            if *owner != memcg::ROOT {
+                memcg::uncharged(core::mem::replace(owner, memcg::ROOT), 1);
+            }
+        }
         let addr = frame.start_address().as_u64();
         unsafe { self.slot(addr).write(self.free_head) };
         self.free_head = addr;
@@ -170,16 +220,39 @@ impl FrameDeallocator<Size4KiB> for PhysFrameAllocator {
     }
 }
 
-/// Frame source for user memory: refuses to dip into the kernel reserve.
-pub struct UserFrames<'a>(pub &'a mut PhysFrameAllocator);
+/// Frame source for user memory: refuses to dip into the kernel reserve, and
+/// charges each frame to a memory group, within its limit unless forced
+/// (`memcg::Target`).
+pub struct UserFrames<'a> {
+    frames: &'a mut PhysFrameAllocator,
+    target: memcg::Target,
+}
+
+impl<'a> UserFrames<'a> {
+    /// Frames for the running task, charged to its group (`memcg::Target::current`).
+    pub fn new(frames: &'a mut PhysFrameAllocator) -> Self {
+        Self::charging(frames, memcg::Target::current())
+    }
+
+    /// Frames charged to `target`.
+    pub fn charging(frames: &'a mut PhysFrameAllocator, target: memcg::Target) -> Self {
+        UserFrames { frames, target }
+    }
+
+    /// The allocator itself (to free or share frames meanwhile).
+    pub fn allocator(&mut self) -> &mut PhysFrameAllocator {
+        self.frames
+    }
+}
 
 unsafe impl FrameAllocator<Size4KiB> for UserFrames<'_> {
     fn allocate_frame(&mut self) -> Option<PhysFrame> {
-        if self.0.user_may_take(1) {
-            self.0.allocate_frame()
-        } else {
-            None
+        if !self.frames.user_may_take(1) || !memcg::may_charge(self.target, 1) {
+            return None;
         }
+        let frame = self.frames.allocate_frame()?;
+        self.frames.charge(frame, self.target.id());
+        Some(frame)
     }
 }
 

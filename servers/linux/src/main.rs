@@ -320,6 +320,11 @@ fn dispatch(s: &mut State) -> i64 {
             Ok(packed) => syscall(TEST_TREE_START, [packed.as_ptr() as u64, packed.len() as u64, 0, 0, 0, 0]),
             Err(e) => -e,
         },
+        // The same with the new tree's memory boundaries, four u64s the server copies in.
+        TEST_TREE_START_MEMCG => match (tree_command(s.rdi, s.rsi), usercopy::read::<[u64; 4]>(s.rdx)) {
+            (Ok(packed), Ok(limits)) => syscall(TEST_TREE_START_MEMCG, [packed.as_ptr() as u64, packed.len() as u64, limits.as_ptr() as u64, 0, 0, 0]),
+            (Err(e), _) | (_, Err(e)) => -e,
+        },
         TEST_TREE_WAIT => syscall(TEST_TREE_WAIT, [s.rdi, s.rsi, 0, 0, 0, 0]),
         TEST_TREE_KILL => syscall(TEST_TREE_KILL, [s.rdi, 0, 0, 0, 0, 0]),
         TEST_HEAP_STATS => test(s.rax, s.rdi),

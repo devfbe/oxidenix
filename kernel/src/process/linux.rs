@@ -130,6 +130,23 @@ pub fn post_shrink(pages: u64) -> bool {
     true
 }
 
+/// A tree's memory group `id` is at its limit (or above its memory.high)
+/// and reclaim found none of its cache pages to drop: its own instance's
+/// service thread gets `EVENT_SHRINK` for `pages` pages (ADR 0024: what the
+/// server keeps for the tree is the tree's), at most once per
+/// `SHRINK_INTERVAL` as `post_shrink`'s. From a thread that holds no lock
+/// (the reclaimer: the instances' references may be their last).
+pub fn post_shrink_group(id: crate::memory::memcg::Id, pages: u64) {
+    let instance = crate::memory::memcg::instance_of(id);
+    if instance == 0 {
+        return;
+    }
+    for i in instances(None).into_iter().filter(|i| i.id == instance) {
+        i.shrink.fetch_max(pages, core::sync::atomic::Ordering::AcqRel);
+        super::wakeup(i.pager_chan());
+    }
+}
+
 /// Asks every instance's pager but `except`'s to write its caches back
 /// and flush (`EVENT_SYNC`); the ticket to wait for (`sync_wait`).
 pub fn sync_start(except: Option<&Instance>) -> u64 {
@@ -317,13 +334,15 @@ const DECOMMIT_RUNS_MAX: u64 = 16;
 const UNMAP_BATCH: usize = 64;
 
 /// A zeroed frame for the server's heap (`SYS_SHARED_COMMIT`): a free one,
-/// else one clean cache pages give back (those used lately too); never a
-/// wait (for write-back, for an address space): the server may be the one
-/// to write back, and its heap fails fast (ENOMEM) rather than wait for
-/// itself. If `emergency` (a commit the instance's reserve covers: an
-/// allocation the server cannot fail) one of the kernel's reserve when user
-/// memory is exhausted (`memory::emergency_frame`: possible when memory is
-/// overcommitted, until the OOM killer made room). With whether it is one.
+/// else one clean cache pages give back (those used lately too: the tree's
+/// own if its memory group is at its limit); never a wait (for write-back,
+/// for an address space): the server may be the one to write back, and its
+/// heap fails fast (ENOMEM) rather than wait for itself. If `emergency` (a
+/// commit the instance's reserve covers: an allocation the server cannot
+/// fail) one charged over the tree's limit, or one of the kernel's reserve
+/// when user memory is exhausted (`memory::emergency_frame`: possible when
+/// memory is overcommitted, until the OOM killer made room). With whether
+/// it is one.
 fn heap_frame(emergency: bool) -> Result<(PhysFrame, bool), i64> {
     if let Ok(frame) = zeroed_frame() {
         return Ok((frame, false));
@@ -447,6 +466,10 @@ pub struct Instance {
     /// The tree's share of the task table, with its reserve
     /// (`sched::TREE_RESERVE`): its programs' processes and its pager's.
     task_share: super::sched::OpenShare,
+    /// The tree's memory group (ADR 0024): every frame of the tree's is
+    /// charged to it, its programs' processes and its pager's name it.
+    /// (Dropped after the instance's own frames are freed.)
+    memcg: Arc<crate::memory::memcg::MemCg>,
 }
 
 /// A memory object mapped into the region (`Instance::map_object`).
@@ -550,7 +573,9 @@ struct Slots {
 
 impl Instance {
     /// A new instance with the server's program loaded.
-    pub fn new() -> Result<Arc<Instance>, i64> {
+    /// A new instance for the tree whose memory group is `memcg` (its
+    /// frames are charged to the group the caller charges: `memcg::Charging`).
+    pub fn new(memcg: Arc<crate::memory::memcg::MemCg>) -> Result<Arc<Instance>, i64> {
         let image = IMAGE.get().ok_or(ENOEXEC)?;
         // No tree starts that could not have its reserve of the task table.
         let task_share = super::sched::OpenShare::open(super::sched::TREE_RESERVE)?;
@@ -610,7 +635,9 @@ impl Instance {
             broken: core::sync::atomic::AtomicBool::new(false),
             cpu_word: core::sync::atomic::AtomicU64::new(0),
             task_share,
+            memcg,
         };
+        instance.memcg.set_instance(instance.id);
         instance.entry = instance.load(image)?;
         // The heap's reserve as far as there is room (none: the tree starts
         // anyway, the reserve comes with later commits). Dropping the
@@ -655,7 +682,10 @@ impl Instance {
         self.pdpt
     }
 
-    fn map(&self, addr: u64, frame: PhysFrame, flags: PageTableFlags) -> Result<(), i64> {
+    /// Maps `frame` at `addr` of the region; the tables it needs are charged
+    /// to the caller's memory group, over its limit with `force` (for what
+    /// the server cannot fail: its heap's pages the reserve covers).
+    fn map(&self, addr: u64, frame: PhysFrame, flags: PageTableFlags, force: bool) -> Result<(), i64> {
         // Only the shared slot is part of the views.
         assert!((SHARED_BASE..SHARED_END).contains(&addr), "outside the shared region");
         let mut mapper = unsafe { OffsetPageTable::new(table_at(self.view), memory::phys_offset()) };
@@ -663,8 +693,9 @@ impl Instance {
         let flags = flags | PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE;
         // Frames for the tables it may need, reclaimed if none are free.
         memory::ensure_user_frames(3);
+        let target = if force { memory::memcg::Target::current().forced() } else { memory::memcg::Target::current() };
         let mapped = memory::with_frames(|f| {
-            let mut user = UserFrames(f);
+            let mut user = UserFrames::charging(f, target);
             unsafe { mapper.map_to_with_table_flags(page, frame, flags, table_flags(), &mut user) }.map(|m| m.ignore())
         });
         mapped.map_err(|_| {
@@ -727,7 +758,7 @@ impl Instance {
                 if !x {
                     flags |= PageTableFlags::NO_EXECUTE;
                 }
-                if let Err(e) = self.map(page, frame, flags) {
+                if let Err(e) = self.map(page, frame, flags, false) {
                     // The rest were never mapped: free them here.
                     for (_, (frame, _, _)) in all {
                         memory::with_frames(|f| unsafe { f.deallocate_frame(frame) });
@@ -854,7 +885,7 @@ impl Instance {
             return Ok(frame);
         }
         let frame = zeroed_frame()?;
-        self.map(addr, frame, PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE)?;
+        self.map(addr, frame, PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE, false)?;
         Ok(frame)
     }
 
@@ -962,7 +993,7 @@ impl Instance {
             }
             let frame = frames[next].take().expect("a frame for each missing page");
             next += 1;
-            if let Err(e) = self.map(at, frame, PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE) {
+            if let Err(e) = self.map(at, frame, PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE, use_reserve) {
                 result = Err(e);
                 break;
             }
@@ -1106,7 +1137,7 @@ impl Instance {
         maps.insert(start, RegionMap { pages, object: object.clone(), server });
         for i in 0..pages {
             let flags = if i < read_only { PageTableFlags::NO_EXECUTE } else { PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE };
-            let mapped = object.map_page(i).map_err(|_| ENOMEM).and_then(|frame| self.map(start + i * PAGE, frame, flags));
+            let mapped = object.map_page(i).map_err(|_| ENOMEM).and_then(|frame| self.map(start + i * PAGE, frame, flags, false));
             if let Err(e) = mapped {
                 self.unmap_pages(start, i);
                 maps.remove(&start);
@@ -1304,6 +1335,11 @@ impl Instance {
     /// The tree's share of the task table, which its processes charge.
     pub fn task_share(&self) -> Arc<super::sched::Share> {
         self.task_share.share()
+    }
+
+    /// The tree's memory group, for the thread groups that charge it.
+    pub fn memcg(&self) -> Arc<crate::memory::memcg::MemCg> {
+        self.memcg.clone()
     }
 
     /// Ends the pager's process (no program will ask it for pages).
@@ -2194,6 +2230,25 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             };
             Ok(old as i64)
         }
+        SYS_MEMCG_STAT => {
+            let stat = instance.memcg.stat();
+            let bytes = unsafe { core::slice::from_raw_parts(&stat as *const MemCgStat as *const u8, core::mem::size_of::<MemCgStat>()) };
+            super::uaccess::copy_to_server(a[0], bytes)?;
+            Ok(0)
+        }
+        SYS_MEMCG_SET => {
+            // The tree's boundaries are its starter's (a delegated cgroup's
+            // are its parent's): changed from within only with the host grant.
+            if !instance.host.load(core::sync::atomic::Ordering::Acquire) {
+                return Err(EPERM);
+            }
+            let memcg = instance.memcg();
+            // (No reference to the instance held across the reclaim and the
+            // OOM kills it may wait for.)
+            drop(instance);
+            memcg.set(a[0], crate::memory::memcg::pages_of(a[1]))?;
+            Ok(0)
+        }
         SYS_FILE_PAGES => {
             let (used, limit) = crate::fs::cache::tmpfs_usage();
             let mut out = [0u8; 16];
@@ -2627,7 +2682,7 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             }
             super::tlb::barriers_served(cpu).map(|n| n as i64).ok_or(EINVAL)
         }
-        TEST_TREE_START => {
+        TEST_TREE_START | TEST_TREE_START_MEMCG => {
             if !crate::TEST_MODE.load(core::sync::atomic::Ordering::Relaxed) {
                 return Err(ENOSYS);
             }
@@ -2639,6 +2694,15 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             if a[1] == 0 || a[1] > MAX {
                 return Err(EINVAL);
             }
+            // The new tree's memory boundaries (ADR 0024): max, high, low, min in bytes.
+            let limits = if nr == TEST_TREE_START_MEMCG {
+                let mut raw = [0u8; 32];
+                super::uaccess::copy_from_server(a[2], &mut raw)?;
+                let word = |i: usize| u64::from_le_bytes(raw[i * 8..i * 8 + 8].try_into().unwrap_or_default());
+                crate::memory::memcg::Limits::from_bytes(word(0), word(1), word(2), word(3))
+            } else {
+                crate::memory::memcg::Limits::NONE
+            };
             let mut buf = Vec::new();
             buf.try_reserve_exact(a[1] as usize).map_err(|_| ENOMEM)?;
             buf.resize(a[1] as usize, 0);
@@ -2656,7 +2720,7 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
                 args.try_reserve(1).map_err(|_| ENOMEM)?;
                 args.push(s);
             }
-            super::test_tree_start(instance.id, path, &args).map(|pid| pid as i64)
+            super::test_tree_start(instance.id, path, &args, limits).map(|pid| pid as i64)
         }
         TEST_TREE_WAIT => {
             if !crate::TEST_MODE.load(core::sync::atomic::Ordering::Relaxed) {
@@ -3109,7 +3173,7 @@ fn process_call(instance: &Arc<Instance>, nr: u64, a: [u64; 6]) -> SysResult {
             let name = super::sched::current().group.info.lock().name.clone();
             let mut info = Info::new(name);
             info.mem = Some(mm.stats.clone());
-            let group = ThreadGroup::new(pid.pid, info, Some(instance.task_share())).ok_or(ENOMEM)?;
+            let group = ThreadGroup::new(pid.pid, info, Some(instance.task_share()), Some(instance.memcg())).ok_or(ENOMEM)?;
             // (A default: the server sets the new process's own, from its copy of the limits.)
             let parent = &super::sched::current().group;
             group.stack_soft.store(parent.stack_soft.load(Relaxed), Relaxed);

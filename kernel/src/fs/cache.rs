@@ -2444,7 +2444,15 @@ impl PageCache {
     /// waits for a space whose holder may be waiting for memory). Returns
     /// how many it dropped.
     /// Looks at no more pages than `budget` allows (and takes them off).
-    fn shrink(&self, want: u64, unmap: bool, force: bool, budget: &mut usize) -> u64 {
+    /// Only pages `scope` takes (ADR 0024: those charged to one memory
+    /// group, or none of a group's that memory.min or memory.low protects);
+    /// notes in `seen_busy` whether pages of the scope were dirty, being
+    /// filled or pinned, and in `low_breached` the groups whose pages went
+    /// while memory.low protected them.
+    fn shrink(&self, want: u64, unmap: bool, force: bool, budget: &mut usize, scope: memory::Scope, seen_busy: &mut bool, low_breached: &mut u64) -> u64 {
+        // A page of a group within its memory.low (taken only by a pass
+        // that may breach it).
+        let protected = |owner| matches!(scope, memory::Scope::All { breach_low: true }) && !memory::memcg::reclaimable(owner, false);
         let mut freed = 0;
         let mut seen = 0;
         loop {
@@ -2473,12 +2481,23 @@ impl PageCache {
                     if page.isolated {
                         continue;
                     }
+                    let owner = frames.owner(page.frame);
+                    if !scope.takes(owner) {
+                        continue;
+                    }
                     if page.referenced && !force {
                         page.referenced = false;
                         continue;
                     }
-                    if page.dirty || page.pending || page.pins > 0 || freed + ((gone.len() + mapped.len()) as u64) >= want {
+                    if page.dirty || page.pending || page.pins > 0 {
+                        *seen_busy = true;
                         continue;
+                    }
+                    if freed + ((gone.len() + mapped.len()) as u64) >= want {
+                        continue;
+                    }
+                    if protected(owner) {
+                        *low_breached |= 1u64 << owner;
                     }
                     if frames.refcount(page.frame) == 1 {
                         gone.push(index);
@@ -2914,8 +2933,10 @@ pub fn drop_deferred() {
 /// The pages only the caches use go first; then, if that was not enough,
 /// those that programs map too (unmapped where unused, `shrink`), unless
 /// interrupts are off: unmapping needs TLB shootdowns, which must not be
-/// waited for there. With `force`, pages used lately go too.
-fn reclaim(want: u64, force: bool) -> u64 {
+/// waited for there. With `force`, pages used lately go too. Only the pages
+/// `scope` takes (`shrink`).
+fn reclaim(want: u64, force: bool, scope: memory::Scope) -> memory::Reclaimed {
+    let (mut busy, mut low_breached) = (false, 0);
     let mut freed = 0;
     let may_unmap = x86_64::instructions::interrupts::are_enabled();
     for unmap in [false, true] {
@@ -2930,7 +2951,7 @@ fn reclaim(want: u64, force: bool) -> u64 {
         for _ in 0..caches {
             // (A slot for the reference first: `defer_drop`.)
             if !defer_slot() {
-                return freed;
+                return memory::Reclaimed { freed, busy, low_breached };
             }
             let cache = {
                 let list = CACHES.lock();
@@ -2944,7 +2965,7 @@ fn reclaim(want: u64, force: bool) -> u64 {
                 defer_unslot();
             }
             if let Some(cache) = cache {
-                freed += cache.shrink(want - freed, unmap, force, &mut budget);
+                freed += cache.shrink(want - freed, unmap, force, &mut budget, scope, &mut busy, &mut low_breached);
                 defer_drop(Deferred::Cache(cache));
             }
             if freed >= want {
@@ -2957,7 +2978,7 @@ fn reclaim(want: u64, force: bool) -> u64 {
     if freed < want && dirty_pages() > 0 {
         ask_pagers(want - freed);
     }
-    freed
+    memory::Reclaimed { freed, busy, low_breached }
 }
 
 impl Drop for PageCache {

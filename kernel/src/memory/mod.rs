@@ -1,9 +1,10 @@
 //! Kernel memory: the frame allocator, the kernel heap (slab size classes over a first-fit heap),
 //! mappings of physical memory, the commit and page-cache accounting with the overcommit
-//! policy, and the OOM killer.
+//! policy, the process trees' memory groups, and the OOM killer.
 
 pub mod frame;
 pub mod kstack;
+pub mod memcg;
 pub mod oom;
 
 use bootloader_api::info::MemoryRegion;
@@ -419,13 +420,122 @@ static TOTAL_PAGES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU6
 pub fn total_pages() -> u64 {
     TOTAL_PAGES.load(core::sync::atomic::Ordering::Relaxed)
 }
-/// Drops up to the given number of reclaimable cache pages, with `true`
-/// also those used lately (no second chance); returns how many it dropped
-/// (set by the file cache).
-static RECLAIM: Once<fn(u64, bool) -> u64> = Once::new();
+/// Whose cache pages a reclaim may drop (ADR 0024).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Scope {
+    /// Any tree's (memory ran short), but those of a memory group within
+    /// its memory.min, and within its memory.low unless `breach_low`
+    /// (`memcg::reclaimable`).
+    All { breach_low: bool },
+    /// Only those charged to this memory group (it is at its limit).
+    Group(memcg::Id),
+}
 
-pub fn set_reclaim(f: fn(u64, bool) -> u64) {
+impl Scope {
+    /// Whether a page charged to `owner` may go.
+    pub fn takes(self, owner: memcg::Id) -> bool {
+        match self {
+            Scope::All { breach_low } => memcg::reclaimable(owner, breach_low),
+            Scope::Group(id) => owner == id,
+        }
+    }
+}
+
+/// What a reclaim did.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct Reclaimed {
+    /// Pages dropped.
+    pub freed: u64,
+    /// Pages of the scope that write-back or a pin kept (dirty, being
+    /// filled, pinned): they may go later.
+    pub busy: bool,
+    /// The memory groups (a bit per id) whose pages went while they were
+    /// within their memory.low (`Scope::All { breach_low: true }`).
+    pub low_breached: u64,
+}
+
+/// Drops up to the given number of reclaimable cache pages of a scope,
+/// with `true` also those used lately (no second chance) (set by the file
+/// cache).
+static RECLAIM: Once<fn(u64, bool, Scope) -> Reclaimed> = Once::new();
+
+pub fn set_reclaim(f: fn(u64, bool, Scope) -> Reclaimed) {
     RECLAIM.call_once(|| f);
+}
+
+/// One reclaim of all memory: the pages no memory group protects first,
+/// then, if that dropped nothing, those memory.low protects (Linux's
+/// best-effort protection: a group within its low is reclaimed only when
+/// nothing else is left, which counts as its `low` event).
+fn reclaim_all(n: u64, force: bool) -> u64 {
+    let Some(reclaim) = RECLAIM.get() else { return 0 };
+    let freed = reclaim(n, force, Scope::All { breach_low: false }).freed;
+    if freed > 0 || !memcg::low_protects() {
+        return freed;
+    }
+    let r = reclaim(n, force, Scope::All { breach_low: true });
+    memcg::low_breached(r.low_breached);
+    r.freed
+}
+
+/// Reclaims up to `n` (at least `RECLAIM_BATCH`) cache pages charged to
+/// memory group `id` (at or above its limit or its memory.high), with
+/// `force` those used lately too; when it finds none to drop, the tree's
+/// Linux server is asked to give back what it can do without (by the
+/// background reclaimer: `memcg::request_shrink`). Only with interrupts on
+/// (it may unmap pages); the caller holds no page cache lock. One that
+/// cannot wait (without `force`) skips a group whose last reclaim found
+/// nothing just now.
+pub fn reclaim_group(id: memcg::Id, n: u64, force: bool) -> Reclaimed {
+    if !x86_64::instructions::interrupts::are_enabled() || id == memcg::ROOT {
+        return Reclaimed::default();
+    }
+    let now = crate::time::now();
+    if !force && memcg::fruitless(id, now) {
+        return Reclaimed::default();
+    }
+    let r = RECLAIM.get().map_or(Reclaimed::default(), |reclaim| reclaim(n.max(RECLAIM_BATCH), force, Scope::Group(id)));
+    if r.freed == 0 {
+        memcg::note_fruitless(id, now + FRUITLESS_PAUSE);
+        memcg::request_shrink(id, n.max(1));
+        wake_reclaimer();
+    }
+    r
+}
+
+/// For a memory group whose boundary was lowered to `pages` (a write of
+/// memory.max with `oom`, of memory.high without): reclaims its cache pages
+/// until its usage fits and, with `oom`, once reclaim stops making progress,
+/// has the OOM killer end its processes until it fits (Linux's
+/// `memory_max_write` and `memory_high_write`). Stops once the caller has a
+/// signal to take or is dying (its own process may be a victim), or, for
+/// `high`, once reclaim gave up. With no lock held.
+pub fn shrink_group_to(id: memcg::Id, pages: u64, oom: bool) {
+    let mut fruitless = 0;
+    loop {
+        let (usage, _) = memcg::usage(id);
+        if usage <= pages || crate::process::kill::interrupted() {
+            return;
+        }
+        if reclaim_group(id, usage - pages, fruitless > 0).freed > 0 {
+            fruitless = 0;
+            continue;
+        }
+        fruitless += 1;
+        if fruitless < RECLAIM_RETRIES {
+            // (Write-back may make pages droppable; the server shrinks.)
+            crate::fs::cache::ask_writeback(usage - pages);
+            crate::process::sched::prepare_to_wait(reclaim_chan()).sleep_until(crate::time::now() + RECLAIM_THROTTLE);
+            continue;
+        }
+        if !oom || !oom::out_of_memory_memcg(id, 0) {
+            return;
+        }
+        // A victim was killed (or one's memory is on its way): its memory
+        // comes back before the next look.
+        fruitless = 0;
+        crate::process::sched::prepare_to_wait(reclaim_chan()).sleep_until(crate::time::now() + RECLAIM_THROTTLE);
+    }
 }
 
 /// Promises `pages` pages; false (nothing promised) if the overcommit
@@ -606,7 +716,7 @@ fn reclaim_for(n: u64, force: bool) -> u64 {
     if !force && now < FRUITLESS_UNTIL.load(Relaxed) {
         return 0;
     }
-    let freed = RECLAIM.get().map_or(0, |reclaim| reclaim(n.max(RECLAIM_BATCH), force));
+    let freed = reclaim_all(n.max(RECLAIM_BATCH), force);
     if freed == 0 {
         FRUITLESS_UNTIL.store(now + FRUITLESS_PAUSE, Relaxed);
     }
@@ -614,8 +724,14 @@ fn reclaim_for(n: u64, force: bool) -> u64 {
 }
 
 /// One reclaim for `n` frames that takes pages used lately too (with no
-/// lock held: the pager's thread before it is told to write back).
+/// lock held: the pager's thread before it is told to write back, the
+/// server's heap): of the caller's memory group if that is at its limit
+/// (what is short is the group's room, not memory), else of all memory.
 pub fn reclaim_forced(n: u64) -> u64 {
+    let target = memcg::Target::current();
+    if memcg::over(target, n) {
+        return reclaim_group(target.id(), n, true).freed;
+    }
     reclaim_for(n, true)
 }
 
@@ -634,15 +750,21 @@ fn low_watermark(f: &PhysFrameAllocator) -> u64 {
 }
 
 /// A frame for user memory (or memory a user can demand: page tables,
-/// cache pages): a free one above the kernel's reserve and the low
-/// watermark, else one that reclaiming cache pages gives back, else one
-/// of the watermark's. None if there is none at all and reclaim found
-/// nothing to drop now. Never called with the frames locked.
+/// cache pages), charged to the running task's memory group
+/// (`memcg::Target::current`): a free one above the kernel's reserve and
+/// the low watermark, else one that reclaiming cache pages gives back, else
+/// one of the watermark's. None if there is none at all and reclaim found
+/// nothing to drop now, or if the group is at its limit and none of its own
+/// cache pages could be dropped now (the callers that may wait try again:
+/// `reclaim_retry`, which calls the group's OOM killer). Never called with
+/// the frames locked.
 pub fn user_frame() -> Option<PhysFrame> {
+    let target = memcg::Target::current();
     loop {
-        let (frame, low) = with_frames(|f| {
-            let frame = if f.user_may_take(1 + low_watermark(f)) { frame::UserFrames(f).allocate_frame() } else { None };
-            (frame, !f.user_may_take(low_watermark(f)))
+        let (frame, low, limited) = with_frames(|f| {
+            let limited = !memcg::may_charge(target, 1);
+            let frame = if !limited && f.user_may_take(1 + low_watermark(f)) { frame::UserFrames::charging(f, target).allocate_frame() } else { None };
+            (frame, !f.user_may_take(low_watermark(f)), limited)
         });
         if low {
             wake_reclaimer();
@@ -650,24 +772,46 @@ pub fn user_frame() -> Option<PhysFrame> {
         if frame.is_some() {
             return frame;
         }
+        if limited {
+            // The tree's own room is what is short (ADR 0024): its own
+            // cache pages make room, never another tree's.
+            memcg::event(target.id(), memcg::Event::Max);
+            if reclaim_group(target.id(), 1, false).freed == 0 {
+                return None;
+            }
+            continue;
+        }
         if reclaim_for(1, false) == 0 {
             // (An OOM victim's own faults may go into the reserve, so it
             // gets to its end: Linux's TIF_MEMDIE.)
-            return with_frames(|f| frame::UserFrames(f).allocate_frame())
+            return with_frames(|f| frame::UserFrames::charging(f, target).allocate_frame())
                 .or_else(|| crate::process::sched::current().group.oom_victim.load(core::sync::atomic::Ordering::Acquire).then(emergency_frame).flatten());
         }
     }
 }
 
-/// A frame of the kernel's reserve for an allocation that must not fail
-/// when user memory is exhausted (Linux's memory reserves): the Linux
-/// server's allocations that cannot fail (its heap's commits from the
-/// instance's reserve, `linux::heap_frame`) and an OOM victim's faults.
-/// Only the reserve's upper half: the lower is the kernel heap's alone.
-/// The background reclaimer calls the OOM killer when user memory stays
-/// exhausted (`reclaimer`), which refills it.
+/// A frame for an allocation that must not fail (Linux's memory reserves
+/// and force charge): the Linux server's allocations that cannot fail (its
+/// heap's commits from the instance's reserve, `linux::heap_frame`) and an
+/// OOM victim's faults. Charged to the running task's memory group over its
+/// limit if need be; a free frame above the kernel's reserve if there is
+/// one, else one of the reserve when user memory is exhausted, of its upper
+/// half only: the lower is the kernel heap's alone. The background
+/// reclaimer calls the OOM killer when user memory stays exhausted
+/// (`reclaimer`), which refills it.
 pub fn emergency_frame() -> Option<PhysFrame> {
-    with_frames(|f| if f.free_frames() > frame::KERNEL_RESERVE_FRAMES / 2 { f.allocate_frame() } else { None })
+    let target = memcg::Target::current().forced();
+    with_frames(|f| {
+        if let Some(frame) = frame::UserFrames::charging(f, target).allocate_frame() {
+            return Some(frame);
+        }
+        if f.free_frames() <= frame::KERNEL_RESERVE_FRAMES / 2 {
+            return None;
+        }
+        let frame = f.allocate_frame()?;
+        f.charge(frame, target.id());
+        Some(frame)
+    })
 }
 
 /// Wakes the allocations throttled in `reclaim_retry` (memory came back:
@@ -695,6 +839,13 @@ fn reclaimer_chan() -> usize {
 /// A wakeup of the background reclaimer asked for where it could not be
 /// made (the kernel heap's growth): the timer tick makes it.
 static RECLAIM_KICK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Asks for a wakeup of the background reclaimer from where it cannot be
+/// made (any lock may be held): the next timer tick makes it (a dying
+/// memory group to collect, `memcg::collect`).
+pub fn kick_reclaimer() {
+    RECLAIM_KICK.store(true, core::sync::atomic::Ordering::Release);
+}
 
 /// Called by the timer tick (interrupt context): makes a wakeup asked for
 /// by the kernel heap's growth.
@@ -728,6 +879,14 @@ fn reclaimer() -> ! {
             continue;
         }
         drop(wait);
+        // Memory groups whose trees are gone: the frames still charged to
+        // them (cache pages, grants) go to the root, their slots free.
+        if memcg::dying() {
+            memcg::collect();
+        }
+        // Trees at their limit with no cache page of their own left to
+        // drop: their servers give back what they can do without.
+        memcg::take_shrink_requests(crate::process::linux::post_shrink_group);
         // Up to the high watermark, giving pages used lately their second
         // chance. Only below the low watermark, and only after a whole
         // sweep of the cache without it dropped anything, it takes those
@@ -756,7 +915,7 @@ fn reclaimer() -> ! {
             if !short {
                 break;
             }
-            let freed = RECLAIM.get().map_or(0, |reclaim| reclaim(RECLAIM_BATCH * 4, force));
+            let freed = reclaim_all(RECLAIM_BATCH * 4, force);
             if freed > 0 {
                 (force, fruitless, failures) = (false, 0, 0);
                 continue;
@@ -854,10 +1013,43 @@ const RECLAIM_THROTTLE: u64 = 100_000_000;
 /// After a round without progress, pages used lately go too (as Linux's
 /// reclaim raises its priority): a committed page needs its frame more
 /// than a cached page that is in use (which is read again when used).
+///
+/// If the caller's memory group is at its limit (ADR 0024), the same
+/// happens within the group: its own cache pages are reclaimed (waiting
+/// while write-back may make some droppable), then the OOM killer ends a
+/// process of the group (`oom::out_of_memory_memcg`), never of another
+/// tree.
 pub fn reclaim_retry(n: u64, tries: &mut u32) -> bool {
     debug_assert!(x86_64::instructions::interrupts::are_enabled(), "waiting for reclaim with a spinlock held");
+    let target = memcg::Target::current();
     let mut force = false;
     loop {
+        if memcg::over(target, n) {
+            if crate::process::kill::dying() {
+                return false;
+            }
+            let id = target.id();
+            let r = reclaim_group(id, n, force);
+            if r.freed > 0 || !memcg::over(target, n) {
+                return true;
+            }
+            // The group's own dirty or pinned pages may become droppable;
+            // else the group has nothing reclaim can give.
+            let most = if r.busy && !crate::process::linux::is_pager() { RECLAIM_RETRIES_IO } else { RECLAIM_RETRIES };
+            if *tries >= most {
+                if !oom::out_of_memory_memcg(id, n) {
+                    return false;
+                }
+                *tries = 0;
+            } else if r.busy {
+                crate::fs::cache::ask_writeback(n);
+            }
+            force = true;
+            *tries += 1;
+            let deadline = crate::time::now() + RECLAIM_THROTTLE;
+            crate::process::sched::prepare_to_wait(reclaim_chan()).sleep_until(deadline);
+            continue;
+        }
         // Dirty or pinned cache pages become droppable once written back
         // or ungranted: while there are some, more tries are allowed
         // (commit counted them as taken, so what was promised is there

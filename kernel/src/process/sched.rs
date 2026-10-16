@@ -297,6 +297,13 @@ pub fn current() -> &'static Task {
     unsafe { &*t }
 }
 
+/// The running task, None at boot before the first one (`process::init`).
+pub fn try_current() -> Option<&'static Task> {
+    let cs = &smp::cpu().sched;
+    let t: *const Task = unsafe { (*cs.current.get()).as_deref()? };
+    Some(unsafe { &*t })
+}
+
 /// A counted reference to the running task (for storing it elsewhere).
 pub fn current_arc() -> Arc<Task> {
     let cs = &smp::cpu().sched;

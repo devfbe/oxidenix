@@ -19,9 +19,6 @@ done, delete it here in the same commit.
 
 ## Robustness
 
-- **No per-tree memory limits.** The OOM killer chooses across all trees (ADR 0013); a tree
-  with a limit of its own (as Linux's memory cgroups) would need every frame charged to its
-  tree, with an OOM within the tree when it exceeds its limit.
 - **/data across process trees: what stays per tree** (ADR 0015 made the page cache one per
   file for every tree): a FIFO's pipe and times, inotify events of other trees' changes, and
   `sendfile`/`copy_file_range` into an `O_APPEND` file are atomic within their tree only.
@@ -65,6 +62,12 @@ done, delete it here in the same commit.
   breaks and parity errors, and with polled output.
 - Network: IPv6, `O_ASYNC` (`SIGIO`; `F_SETOWN` is kept and used for `SIGURG`), raw ICMP is shared
   between instances (documented in ADR 0008).
+- Memory groups (ADR 0024): one per tree, no sub-groups (`mkdir` in /sys/fs/cgroup is EPERM)
+  and no other controllers; no `memory.stat`, `memory.swap.*`, `memory.oom.group`,
+  `memory.reclaim` or pressure files; kernel heap objects are not charged; an allocation of
+  a system call that finds the tree at its limit fails with ENOMEM after reclaim within the
+  tree (Linux would invoke the group's OOM killer; page faults and copies into program memory
+  do); no per-group dirty limits (a tree's writer is throttled by the machine's).
 - `rseq` is `ENOSYS` (ADR 0021: glibc goes on without it). A real one needs the kernel to
   update the registered area's CPU number and abort a critical section on every return to
   user mode after a preemption or migration, and the server on signal delivery.

@@ -84,7 +84,7 @@ pub fn init() {
     enable_sse();
     tlb::init_cpu(true);
     syscall::init();
-    let group = ThreadGroup::new(0, Info::new("kernel".to_string()), None).expect("boot");
+    let group = ThreadGroup::new(0, Info::new("kernel".to_string()), None, None).expect("boot");
     let kernel = Arc::new(Task::new(0, group.clone(), "kernel".to_string(), Process::empty(), None, 0));
     group.info.lock().threads.push(kernel.clone());
     assert!(sched::KERNEL_SHARE.take(), "boot: no slot for the kernel's task");
@@ -573,23 +573,29 @@ fn start_env() -> Vec<String> {
 /// makes it pid 1 of the tree, gives it standard input, output and error
 /// on the console and execs the program; if that fails, it exits with 127.
 /// The starter ends the grants by dropping the `Tree` once the first
-/// process is gone.
-pub fn spawn(name: &str, args: &[&str]) -> Result<Tree, i64> {
+/// process is gone. The tree's memory group has the boundaries `limits`
+/// (ADR 0024: the monitor's `run -m`).
+pub fn spawn(name: &str, args: &[&str], limits: memory::memcg::Limits) -> Result<Tree, i64> {
     let path = if name.contains('/') { name.to_string() } else { alloc::format!("/bin/{name}") };
     let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
-    let (pid, instance) = start_tree(&path, &args, true)?;
+    let (pid, instance) = start_tree(&path, &args, true, limits)?;
     Ok(Tree { pid, instance })
 }
 
 /// Starts the tree of `spawn` running `path` with `args`; with `grants`,
 /// the console and the host grant go to it before it runs. Its first
 /// process's id and its instance.
-fn start_tree(path: &str, args: &[String], grants: bool) -> Result<(Pid, alloc::sync::Weak<linux::Instance>), i64> {
+fn start_tree(path: &str, args: &[String], grants: bool, limits: memory::memcg::Limits) -> Result<(Pid, alloc::sync::Weak<linux::Instance>), i64> {
     let path = path.to_string();
     let args = args.to_vec();
-    // The instance first: it brings the tree's share of the task table,
+    // Its memory group first: everything made for the tree from here on
+    // (its instance's region, its address spaces and page tables, its
+    // threads' kernel stacks) is charged to it, not to the starter's.
+    let memcg = memory::memcg::MemCg::new(limits)?;
+    let _charging = memory::memcg::Charging::to(&memcg);
+    // The instance next: it brings the tree's share of the task table,
     // which its pager and its first process take their slots from.
-    let instance = linux::Instance::new()?;
+    let instance = linux::Instance::new(memcg)?;
     let slot = sched::reserve_pid(Some(instance.task_share()))?;
     let pid = slot.pid;
     instance.set_init_args(&path, &args, &start_env())?;
@@ -609,7 +615,7 @@ fn start_tree(path: &str, args: &[String], grants: bool) -> Result<(Pid, alloc::
         let mut own = Process::empty();
         own.mm = Some(address_space::Mm::new(space).ok_or(ENOMEM)?);
         own.linux = Some(thread);
-        let group = ThreadGroup::new(pid, info, Some(instance.task_share())).ok_or(ENOMEM)?;
+        let group = ThreadGroup::new(pid, info, Some(instance.task_share()), Some(instance.memcg())).ok_or(ENOMEM)?;
         group.instance.store(instance.id, Ordering::Release);
         group.host_init.call_once(|| linux::host_flag(&instance));
         let t = new_task(pid, group, name, own, start)?;
@@ -641,13 +647,14 @@ fn start_tree(path: &str, args: &[String], grants: bool) -> Result<(Pid, alloc::
 static TEST_TREES: spin::Mutex<Vec<(u64, Pid)>> = spin::Mutex::new(Vec::new());
 
 /// `TEST_TREE_START` for instance `starter`: a tree without the console
-/// and the host grant, running `path` (absolute) with `args`.
-pub fn test_tree_start(starter: u64, path: &str, args: &[String]) -> Result<Pid, i64> {
+/// and the host grant, running `path` (absolute) with `args`, its memory
+/// group's boundaries `limits` (`TEST_TREE_START_MEMCG`).
+pub fn test_tree_start(starter: u64, path: &str, args: &[String], limits: memory::memcg::Limits) -> Result<Pid, i64> {
     if !path.starts_with('/') || args.is_empty() {
         return Err(EINVAL);
     }
     TEST_TREES.lock().try_reserve(1).map_err(|_| ENOMEM)?;
-    let (pid, _) = start_tree(path, args, false)?;
+    let (pid, _) = start_tree(path, args, false, limits)?;
     // (Room was reserved above; a race that took it only grows the list.)
     TEST_TREES.lock().push((starter, pid));
     Ok(pid)
@@ -719,6 +726,9 @@ impl Drop for Tree {
 /// Starts a privileged server process: it may register IPC services and
 /// request its I/O ports, and it does not take over the terminal.
 pub fn spawn_server(server: &Arc<Server>) -> Result<Pid, i64> {
+    // A server's memory is the kernel's (the root group, ADR 0024), also
+    // when a tree's request starts it again.
+    let _kernel = memory::memcg::Charging::kernel();
     let mut args = alloc::vec![server.path.to_string()];
     args.extend(server.args.iter().cloned());
     let image = loader::load(&server.image, None, None, &args, &start_env())?;
@@ -743,7 +753,8 @@ fn spawn_pager(instance: &Arc<linux::Instance>) -> Result<Pid, i64> {
     own.linux = Some(thread);
     let mut info = Info::new("linux-pager".to_string());
     info.exe = String::from("/sbin/linux");
-    let group = ThreadGroup::new(pid, info, share.clone()).ok_or(ENOMEM)?;
+    // (Its memory is the tree's, as its slots are.)
+    let group = ThreadGroup::new(pid, info, share.clone(), Some(instance.memcg())).ok_or(ENOMEM)?;
     // A process of the kernel's, as the servers are.
     group.privileged.store(true, Ordering::Relaxed);
     let mm = own.mm.clone();
@@ -780,7 +791,7 @@ fn spawn_with(path: &str, image: loader::Image, server: &Arc<Server>, args: &[St
     let frame = Frame::user_start(image.entry, image.sp);
     own.mm = Some(address_space::Mm::new(image.space).ok_or(ENOMEM)?);
     own.server = Some(server.clone());
-    let group = ThreadGroup::new(pid, info, None).ok_or(ENOMEM)?;
+    let group = ThreadGroup::new(pid, info, None, None).ok_or(ENOMEM)?;
     group.privileged.store(true, Ordering::Relaxed);
     let t = new_task(pid, group, name, own, frame)?;
     slot.insert(t.clone())?;

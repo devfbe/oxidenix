@@ -187,7 +187,14 @@ fn exception(frame: &mut Frame) {
                 x86_64::instructions::interrupts::enable();
             }
             match handle_fault(addr, access) {
-                Ok(()) => return,
+                Ok(()) => {
+                    // Back to the program: a thread that charged above its
+                    // tree's memory.high is throttled first (ADR 0024).
+                    if fixup.is_none() {
+                        crate::memory::memcg::over_high_return();
+                    }
+                    return;
+                }
                 // The wait for the page ended because the thread dies: the
                 // return to user mode carries out the exit.
                 Err(_) if fixup.is_none() && kill::dying() => return,

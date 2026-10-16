@@ -37,12 +37,22 @@
 //! apart, while a thread of the victim holds it), so memory comes back even while a thread
 //! of the victim is held up somewhere; then the victim counts no more (MMF_OOM_SKIP).
 //!
+//! **Within a tree** (ADR 0024): a tree whose memory group reached its limit
+//! (memory.max) invokes the killer for the group only (`out_of_memory_memcg`, Linux's
+//! `mem_cgroup_out_of_memory`): the same badness, among the processes of that tree alone
+//! (its first process too unless it holds the host grant: a container's init is no
+//! global init), scaled by the group's limit; a victim of the group whose memory is on its
+//! way holds the choice off, one of another tree does not. The machine's killer stays as
+//! it is; every kill counts in the victim's group's memory.events (`oom_kill`).
+//!
 //! **Messages** as Linux's, in the kernel's log: who invoked the killer, the table of the
 //! processes it weighed, `Out of memory: Killed process N (name) total-vm:...kB,
-//! anon-rss:...kB, file-rss:...kB, shmem-rss:...kB, UID:0 pgtables:...kB oom_score_adj:N`,
+//! anon-rss:...kB, file-rss:...kB, shmem-rss:...kB, UID:0 pgtables:...kB oom_score_adj:N`
+//! (`Memory cgroup out of memory: ...` within a tree, after its usage and limit),
 //! and the reaper's `oom_reaper: reaped process N (name), now anon-rss:...`. The pids are
 //! the kernel's: the log is the machine's, a tree's own pids are its server's.
 
+use super::memcg;
 use crate::klog::{LEVEL_ERR, LEVEL_INFO, LEVEL_WARNING};
 use crate::process::address_space::MemStats;
 use crate::process::sched;
@@ -228,17 +238,70 @@ pub fn out_of_memory(n: u64) -> bool {
     }
     let comm = Name::of(&me.comm.lock());
     crate::printkln_at!(LEVEL_WARNING, "{} invoked oom-killer: order=0, oom_score_adj={}", comm, me.group.oom_score_adj.load(Ordering::Relaxed));
-    dump_tasks();
+    dump_tasks(None);
     let Some((victim, stats, _)) = best else {
         crate::printkln_at!(LEVEL_ERR, "Out of memory and no killable processes...");
         return false;
     };
-    kill(&victim, &stats);
+    kill(&victim, &stats, None);
     !crate::process::kill::dying()
 }
 
-/// The table of the processes the killer weighs (Linux's `dump_tasks`), in pages.
-fn dump_tasks() {
+/// A tree's memory group `id` is at its limit for a charge of `n` pages (ADR 0024) and
+/// reclaim within it stopped making progress, with no lock held: kills the process of the
+/// group with the highest badness (see the module comment) unless a victim of the group's
+/// is still on its way or the charge fits now. Whether the caller should try again: false
+/// if no process of the group may be killed, or the caller's own was (it dies).
+pub fn out_of_memory_memcg(id: memcg::Id, n: u64) -> bool {
+    let me = sched::current();
+    if crate::process::kill::dying() {
+        return false;
+    }
+    let _choosing = CHOOSING.lock();
+    // Room came meanwhile.
+    if !memcg::over(memcg::Target::of(id), n) {
+        return true;
+    }
+    // (Forgets the victims whose memory came back, so the list has room.)
+    victim_pending();
+    memcg::event(id, memcg::Event::Oom);
+    let (usage, max) = memcg::usage(id);
+    // The badness's scale is what the group may have (Linux's `mem_cgroup_get_max`).
+    let total = max.min(super::total_pages());
+    let mut best: Option<(Arc<ThreadGroup>, Arc<MemStats>, i64)> = None;
+    let mut at = None;
+    while let Some(group) = next_group(&mut at) {
+        if group.memcg_id() != id {
+            continue;
+        }
+        // A victim of the group's whose memory is on its way: no second kill for it.
+        if unresolved_victim(&group) {
+            return true;
+        }
+        if let Some((stats, points)) = badness(&group, total) {
+            if best.as_ref().is_none_or(|b| points > b.2) {
+                best = Some((group, stats, points));
+            }
+        }
+    }
+    let comm = Name::of(&me.comm.lock());
+    let kb = super::PAGE / 1024;
+    crate::printkln_at!(LEVEL_WARNING, "{} invoked oom-killer: order=0, oom_score_adj={}", comm, me.group.oom_score_adj.load(Ordering::Relaxed));
+    let failcnt = memcg::events(id, memcg::Event::Max);
+    crate::printkln_at!(LEVEL_INFO, "memory: usage {}kB, limit {}kB, failcnt {}", usage * kb, max.saturating_mul(kb), failcnt);
+    crate::printkln_at!(LEVEL_INFO, "Memory cgroup stats for {}:", memcg::Path(id));
+    dump_tasks(Some(id));
+    let Some((victim, stats, _)) = best else {
+        crate::printkln_at!(LEVEL_ERR, "Memory cgroup out of memory and no killable processes in {}", memcg::Path(id));
+        return false;
+    };
+    kill(&victim, &stats, Some(id));
+    !crate::process::kill::dying()
+}
+
+/// The table of the processes the killer weighs (Linux's `dump_tasks`), in pages: of the
+/// memory group `within`, or all.
+fn dump_tasks(within: Option<memcg::Id>) {
     crate::printkln_at!(LEVEL_INFO, "Tasks state (memory values in pages):");
     crate::printkln_at!(
         LEVEL_INFO,
@@ -246,7 +309,7 @@ fn dump_tasks() {
     );
     let mut at = None;
     while let Some(group) = next_group(&mut at) {
-        if group.instance.load(Ordering::Acquire) == 0 {
+        if group.instance.load(Ordering::Acquire) == 0 || within.is_some_and(|id| group.memcg_id() != id) {
             continue;
         }
         let Some(stats) = group.info.lock().mem.clone() else { continue };
@@ -279,20 +342,34 @@ fn counts(stats: &MemStats) -> (u64, u64, u64) {
     (pages, anon, shmem)
 }
 
-/// Kills `victim` (and every process sharing its address space) and has its memory reaped.
-fn kill(victim: &Arc<ThreadGroup>, stats: &Arc<MemStats>) {
+/// Kills `victim` (and every process sharing its address space) and has its memory reaped;
+/// `within` the memory group whose limit the kill is for (None: the machine's memory).
+fn kill(victim: &Arc<ThreadGroup>, stats: &Arc<MemStats>, within: Option<memcg::Id>) {
     let name = Name::group(victim);
     let kb = super::PAGE / 1024;
     let (pages, anon, shmem) = counts(stats);
-    crate::printkln_at!(
-        LEVEL_INFO,
-        "oom-kill:constraint=CONSTRAINT_NONE,nodemask=(null),cpuset=/,mems_allowed=0,global_oom,task_memcg=/,task={},pid={},uid=0",
-        name,
-        victim.tgid
-    );
+    let task_memcg = memcg::Path(victim.memcg_id());
+    match within {
+        None => crate::printkln_at!(
+            LEVEL_INFO,
+            "oom-kill:constraint=CONSTRAINT_NONE,nodemask=(null),cpuset=/,mems_allowed=0,global_oom,task_memcg={},task={},pid={},uid=0",
+            task_memcg,
+            name,
+            victim.tgid
+        ),
+        Some(id) => crate::printkln_at!(
+            LEVEL_INFO,
+            "oom-kill:constraint=CONSTRAINT_MEMCG,nodemask=(null),cpuset=/,mems_allowed=0,oom_memcg={},task_memcg={},task={},pid={},uid=0",
+            memcg::Path(id),
+            task_memcg,
+            name,
+            victim.tgid
+        ),
+    }
     crate::printkln_at!(
         LEVEL_ERR,
-        "Out of memory: Killed process {} ({}) total-vm:{}kB, anon-rss:{}kB, file-rss:{}kB, shmem-rss:{}kB, UID:0 pgtables:{}kB oom_score_adj:{}",
+        "{}: Killed process {} ({}) total-vm:{}kB, anon-rss:{}kB, file-rss:{}kB, shmem-rss:{}kB, UID:0 pgtables:{}kB oom_score_adj:{}",
+        if within.is_some() { "Memory cgroup out of memory" } else { "Out of memory" },
         victim.tgid,
         name,
         stats.virt_pages.load(Ordering::Relaxed) * kb,
@@ -304,6 +381,7 @@ fn kill(victim: &Arc<ThreadGroup>, stats: &Arc<MemStats>) {
     );
     victim.oom_victim.store(true, Ordering::Release);
     crate::process::kill::kill_process(victim, crate::process::kill::SIGKILL as i32);
+    memcg::event(victim.memcg_id(), memcg::Event::OomKill);
     // Every other process of its address space dies with it (its memory would not come
     // back otherwise); one that may not be killed keeps it, unreaped.
     let mut reapable = true;

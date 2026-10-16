@@ -679,6 +679,7 @@ memory counts. Decisions in ADR 0010.
 | `vm_floor(addr)` | the lowest address a mapping without `MO_FIXED` is placed at (the break: `brk` is the server's) |
 | `oom_score_adj(handle, set, value)` | the OOM killer's adjustment of a process (and of those sharing its address space): read, or set within -1000..=1000, below its least only with the host grant (ADR 0013); `proc_info` reports the killer's badness of it and its resident pages by kind |
 | `overcommit(which, set, value)` | the machine's overcommit policy (mode, ratio, KiB), set with the host grant only (ADR 0013) |
+| `memcg_stat(buf)`, `memcg_set(which, bytes)` | the tree's memory group (usage, peak, boundaries, events), its boundaries set with the host grant only (ADR 0024) |
 
 A thread's **key** is its thread area's number and a generation (`slot | gen << 32`): the
 server names threads by it, and a key outlives no thread (a reused area gets a new
@@ -963,7 +964,9 @@ named, ADR 0014), `mem` (the process's memory at its addresses, `vm_access` with
 `task/<tid>/...` (oxidenix's `counters`, the calls the server passed through for the process,
 went with the pass-through in R9). The system's files (`stat`, `meminfo`,
 `uptime`, `loadavg`, `cpuinfo`, `mounts`, `counters`, `sys/`) stay procfs's, but for
-`/proc/sys/vm` (the overcommit policy, the server's over the kernel's `overcommit` call).
+`/proc/sys/vm` (the overcommit policy, the server's over the kernel's `overcommit` call),
+`/proc/<pid>/cgroup` and `/sys/fs/cgroup` (the tree's memory group, over `memcg_stat` and
+`memcg_set`: ADR 0024).
 
 ### Calls that name a pid
 
@@ -1396,12 +1399,16 @@ Linux asks for write access only for files, directories and symlinks.
   for a new channel and serves the same inodes.
 - **The server's own part**, each process's: `/proc/<pid>` with `stat`, `statm`, `status`,
   `cmdline`, `comm`, `exe`, `mounts`, `mountinfo` (ids, parents, device numbers),
-  `oom_score`, `oom_score_adj`, `oom_adj`, `maps`, `mem`,
-  `task/<tid>/{stat,statm,status,cmdline,comm,oom_score,oom_score_adj,oom_adj,maps,mem}`, `fd/<n>`,
+  `oom_score`, `oom_score_adj`, `oom_adj`, `maps`, `mem`, `cgroup`,
+  `task/<tid>/{stat,statm,status,cmdline,comm,oom_score,oom_score_adj,oom_adj,maps,mem,cgroup}`, `fd/<n>`,
   `fdinfo/<n>`, `cwd` and `root`; `/proc/self`, `/proc/thread-self` and
-  `/proc/mounts` (a link to `self/mounts`), merged into procfs's root listing; and
+  `/proc/mounts` (a link to `self/mounts`), merged into procfs's root listing;
   `/proc/sys/vm/overcommit_{memory,ratio,kbytes}` (the kernel's overcommit policy, ADR 0013),
-  merged into procfs's `/proc/sys`. The server
+  merged into procfs's `/proc/sys`; and `/sys/fs` (merged into procfs's `/sys`) with the
+  tree's memory group mounted on `/sys/fs/cgroup` as cgroup2 (`Fs::Cgroup`, ADR 0024: the
+  group is the root of the tree's view, as in a container with its own cgroup namespace;
+  `cgroup.controllers`, `cgroup.procs`, `memory.{current,peak,max,high,low,min,events,
+  events.local}`; every process's `cgroup` is `0::/`). The server
   knows its mounts, its descriptors (any process's table, R6e) and its processes (R8:
   `process::query` answers `procproto`'s records from the server's process table, with the
   kernel's accounts of CPU time and memory, `proc_info` and `thread_info` of a process's
@@ -1422,7 +1429,10 @@ Linux asks for write access only for files, directories and symlinks.
 EISDIR) but `mem` (reads and writes at the position, an address; `lseek` from the start or
 the position), `oom_score_adj`, `oom_adj` and, for a tree with the host grant, the overcommit
 files, each write one number as Linux reads it (`kstrtoint`: `EINVAL` otherwise; at most 12
-bytes taken for the two per process), nothing executes (EACCES), `statfs` says `PROC_SUPER_MAGIC` and `SYSFS_MAGIC`; times
+bytes taken for the two per process), and the memory group's boundaries and `cgroup.procs`
+(a size as Linux's `memparse` reads it, or "max"; a delegated cgroup's own files are its
+parent's: EACCES without the host grant), nothing executes (EACCES), `statfs` says
+`PROC_SUPER_MAGIC`, `SYSFS_MAGIC` and `CGROUP2_SUPER_MAGIC`; times
 set with `utimensat` are kept by the server per device and inode, as for the kernel's `/dev`
 (`namespace::set_pseudo_times`). An open file (`procfile.rs`) keeps a snapshot of its
 contents as Linux's `seq_file` does: a read from offset 0 makes them anew, reads further on

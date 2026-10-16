@@ -49,7 +49,8 @@ Five questions shaped the design:
    the machine runs out. The equivalent here, a per-tree memory limit with an OOM within the
    tree, needs per-tree charging of every frame (anonymous pages, page tables, the cache's
    pages by owner) and is left for when trees get limits; the global killer stays its
-   fallback then too. Isolation between trees is kept where it matters: a tree without the
+   fallback then too. (Trees got them: ADR 0024, each tree a memory group with its own
+   limit and a killer confined to it; this killer is unchanged and stays the machine's.) Isolation between trees is kept where it matters: a tree without the
    host grant cannot shield its processes (lowering oom_score_adj below the least it was
    given needs the grant, Linux's CAP_SYS_RESOURCE), can only make its own processes more
    likely victims, and cannot change the overcommit policy.
@@ -141,8 +142,9 @@ Five questions shaped the design:
 - In the strict mode nothing changes for programs: commits are refused as before, and the
   killer acts only when memory nobody committed (page tables, the kernel's own) runs out,
   where the toucher used to die.
-- Not done: per-tree memory limits (decision 1), `oom_kill_allocating_task`, `panic_on_oom`
-  and the other vm sysctls, the OOM notifier interfaces (memory pressure files, PSI).
+- Not done: per-tree memory limits (decision 1; since done in ADR 0024),
+  `oom_kill_allocating_task`, `panic_on_oom` and the other vm sysctls, the OOM notifier
+  interfaces (memory pressure files, PSI).
 
 Tested by `userspace/oomkilltest.c` (in the self-tests): the sysctls and CommitLimit, the
 grant checks, oom_score's order and oom_score_adj/oom_adj, the modes' answers to a commit, and

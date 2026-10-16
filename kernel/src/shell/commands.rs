@@ -27,7 +27,7 @@ fn cmd_help() {
     crate::printkln!("  echo <text>   - print text");
     crate::printkln!("  info          - CPU info");
     crate::printkln!("  mem           - memory statistics + self-test");
-    crate::printkln!("  run <prog>    - start a program from /bin");
+    crate::printkln!("  run [-m size] <prog> - start a program from /bin (-m: its tree's memory limit)");
     crate::printkln!("  ps            - list processes");
     crate::printkln!("  lspci         - list PCI devices");
     crate::printkln!("  cpus          - CPUs with load and context switches");
@@ -178,18 +178,42 @@ fn cmd_mem() {
 }
 
 fn cmd_run(args: &Vec<&str, 8>) {
-    if args.is_empty() {
-        crate::printkln!("usage: run <program> [args...]  (looked up in /bin, e.g. run ls -l /)");
-        return;
+    let usage = || crate::printkln!("usage: run [-m <size>[K|M|G]] <program> [args...]  (looked up in /bin, e.g. run -m 64M bash)");
+    let mut limits = crate::memory::memcg::Limits::NONE;
+    let mut args: &[&str] = args;
+    // The tree's memory.max (ADR 0024).
+    if args.first() == Some(&"-m") {
+        let Some(max) = args.get(1).and_then(|s| parse_size(s)) else { return usage() };
+        limits.max = crate::memory::memcg::pages_of(max);
+        args = &args[2..];
     }
-    run_program(args);
+    if args.is_empty() {
+        return usage();
+    }
+    run_limited(args, limits);
+}
+
+/// A size in bytes with an optional K, M or G suffix (powers of 1024).
+fn parse_size(s: &str) -> Option<u64> {
+    let (digits, shift) = match s.as_bytes().last()? {
+        b'K' | b'k' => (&s[..s.len() - 1], 10),
+        b'M' | b'm' => (&s[..s.len() - 1], 20),
+        b'G' | b'g' => (&s[..s.len() - 1], 30),
+        _ => (s, 0),
+    };
+    digits.parse::<u64>().ok()?.checked_mul(1 << shift)
 }
 
 /// Starts `args[0]` (from /bin unless it contains a '/') in the foreground
 /// and waits for it; returns how it ended.
 pub fn run_program(args: &[&str]) -> Option<crate::process::WaitStatus> {
+    run_limited(args, crate::memory::memcg::Limits::NONE)
+}
+
+/// `run_program` with the tree's memory group bounded by `limits`.
+fn run_limited(args: &[&str], limits: crate::memory::memcg::Limits) -> Option<crate::process::WaitStatus> {
     let name = args[0];
-    let tree = match crate::process::spawn(name, args) {
+    let tree = match crate::process::spawn(name, args, limits) {
         Ok(tree) => tree,
         Err(errno) => {
             crate::printkln!("run: cannot start {} (errno {})", name, errno);
