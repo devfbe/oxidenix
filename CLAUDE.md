@@ -122,7 +122,8 @@ An AI research project; see README.md.
     `servers/linux/vdso/`, built by `servers/linux/build.rs`, reading the kernel's clock page
     `crates/clockpage`: ADR 0014).
   - Node.js: `userspace/node` (build, smoke tests `tests/*.test.mjs`, runner `run-node.sh`).
-  - Memory: `kernel/src/memory/`, `kernel/src/process/address_space.rs`, page cache
+  - Memory: `kernel/src/memory/` (the OOM killer `oom.rs`, the trees' memory groups and
+    their limits `memcg.rs`: ADR 0024), `kernel/src/process/address_space.rs`, page cache
     `kernel/src/fs/cache.rs`.
   - Other servers and their protocols: `servers/diskfs` + `crates/fsring` + `crates/ext2fs`,
     `servers/netd` + `crates/netring`, `servers/procfs` + `crates/procproto` (+ `crates/fsring`,

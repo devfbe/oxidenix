@@ -1253,6 +1253,56 @@ pub const MEMBARRIER_GLOBAL: u64 = 1;
 pub const MEMBARRIER_GLOBAL_EXPEDITED: u64 = 2;
 pub const MEMBARRIER_REGISTER_GLOBAL: u64 = 3;
 
+// Memory control groups (ADR 0024): every process tree is one memory group, Linux's
+// cgroup v2 memory controller with one group per container. Every frame the tree uses is
+// charged to it (its programs' pages and page tables, the file cache pages it brought in
+// first, its server's heap and region, its threads' kernel stacks), and the kernel enforces
+// its limits: at `max` the tree's own cache pages are reclaimed and then the OOM killer ends
+// a process of the tree, never of another. The server shows it as /sys/fs/cgroup.
+
+/// `memcg_stat(buf)`: the caller's tree's memory group into `buf` (a `MemCgStat`).
+pub const SYS_MEMCG_STAT: u64 = 1290;
+/// `memcg_set(which, bytes)`: sets one of the caller's tree's boundaries (`MEMCG_MAX`,
+/// `MEMCG_HIGH`, `MEMCG_LOW`, `MEMCG_MIN`) to `bytes`, rounded down to pages
+/// (`MEMCG_UNLIMITED`: none), as a write of Linux's memory.max, memory.high, memory.low or
+/// memory.min: a `max` below the usage reclaims the tree's cache pages and then has the OOM
+/// killer end processes of the tree until the usage fits (the caller's own process may be
+/// the one); a `high` below it reclaims what it can. Either stops early, the boundary set,
+/// once the caller has a signal to take. EPERM without the host grant (see
+/// `SYS_CLOCK_SET`: a tree's boundaries are its starter's to set, as a delegated cgroup's
+/// are its parent's); EINVAL for another `which`.
+pub const SYS_MEMCG_SET: u64 = 1291;
+pub const MEMCG_MAX: u64 = 0;
+pub const MEMCG_HIGH: u64 = 1;
+pub const MEMCG_LOW: u64 = 2;
+pub const MEMCG_MIN: u64 = 3;
+/// No boundary (Linux's "max").
+pub const MEMCG_UNLIMITED: u64 = u64::MAX;
+
+/// A tree's memory group, as `memcg_stat` reports it: sizes in bytes.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug)]
+pub struct MemCgStat {
+    /// Charged now (memory.current) and the most ever (memory.peak).
+    pub current: u64,
+    pub peak: u64,
+    /// The boundaries (`MEMCG_UNLIMITED` for none; low and min 0 for none).
+    pub max: u64,
+    pub high: u64,
+    pub low: u64,
+    pub min: u64,
+    /// memory.events: reclaim took pages of the group while it was below `low`; the usage
+    /// went above `high`; a charge found the group at `max`; the OOM killer was invoked for
+    /// it; processes of the group the OOM killer (the group's or the machine's) ended;
+    /// group kills (memory.oom.group: none here).
+    pub ev_low: u64,
+    pub ev_high: u64,
+    pub ev_max: u64,
+    pub ev_oom: u64,
+    pub ev_oom_kill: u64,
+    pub ev_oom_group_kill: u64,
+}
+
 /// A mapping, as `vm_areas` reports it.
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug)]
@@ -1509,6 +1559,12 @@ pub const TEST_PI_WEIGHT: u64 = 1550;
 /// CPU number) has served since boot. EINVAL for no such CPU. Test mode only; the server
 /// passes a program's call on (`membarriertest`: which CPUs a barrier reaches).
 pub const TEST_BARRIERS: u64 = 1640;
+/// `(buf, len, limits) -> handle`: `TEST_TREE_START` for a tree with memory boundaries
+/// (ADR 0024): `limits` points to four u64s in the caller's memory, the new tree's
+/// memory.max, memory.high, memory.low and memory.min in bytes (`MEMCG_UNLIMITED`: none),
+/// set by its starter as a parent sets a delegated cgroup's. Test mode only; a program's
+/// call `(path, argv, limits)` is the server's to pass on (`memcgtest`).
+pub const TEST_TREE_START_MEMCG: u64 = 1670;
 
 // Debugging (ADR 0019): ptrace, process_vm_readv and /proc/<pid>/mem are the
 // server's; the kernel gives it another process's memory and the thread's

@@ -244,6 +244,11 @@ extern "sysv64" fn dispatch(f: &mut Frame) {
         }
         // The server's own calls.
         Some(false) => {
+            if f.rax == restricted::SYS_RESTRICTED_ENTER {
+                // Back to the program: a thread that charged above its
+                // tree's memory.high is throttled first (ADR 0024).
+                crate::memory::memcg::over_high_return();
+            }
             let result = match f.rax {
                 restricted::SYS_RESTRICTED_ENTER => match super::linux::enter(f) {
                     // `f` is the program's now (or the server's with

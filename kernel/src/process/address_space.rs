@@ -407,7 +407,7 @@ struct Tables<'a> {
 
 impl<'a> Tables<'a> {
     fn new(frames: &'a mut memory::frame::PhysFrameAllocator) -> Self {
-        Tables { frames: UserFrames(frames), made: 0 }
+        Tables { frames: UserFrames::new(frames), made: 0 }
     }
 }
 
@@ -765,7 +765,7 @@ impl AddressSpace {
         // Known to the instance before anyone can load the view, so its
         // shootdowns of the region reach this space.
         instance.add_space(&self.tlb)?;
-        let normal = memory::with_frames(|f| UserFrames(f).allocate_frame()).ok_or(Fault::Oom)?;
+        let normal = memory::with_frames(|f| UserFrames::new(f).allocate_frame()).ok_or(Fault::Oom)?;
         let (table, mine) = (table_at(normal), table_at(self.l4));
         for i in 0..512 {
             table[i] = mine[i].clone();
@@ -1329,7 +1329,7 @@ impl AddressSpace {
                     true
                 }
                 Err(_) => {
-                    unsafe { tables.frames.0.deallocate_frame(frame) };
+                    unsafe { tables.frames.allocator().deallocate_frame(frame) };
                     false
                 }
             };
@@ -1518,7 +1518,7 @@ impl AddressSpace {
                 e.set_flags(if charge { flags | CHARGED } else { flags });
                 return Ok(false);
             }
-            let new = UserFrames(frames).allocate_frame().ok_or(Fault::Oom)?;
+            let new = UserFrames::new(frames).allocate_frame().ok_or(Fault::Oom)?;
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     memory::phys_to_virt(old.start_address().as_u64()),
@@ -1990,7 +1990,7 @@ impl AddressSpace {
                                 }
                             }
                             // Only a successful mapping owns a reference.
-                            frames.frames.0.share(frame);
+                            frames.frames.allocator().share(frame);
                             stats.mapped(flags);
                             copied_charged += flags.contains(CHARGED) as u64;
                         }

@@ -13,9 +13,10 @@
 //! - **The server** makes each process's own part: `/proc/<pid>` (its
 //!   files, `task/<tid>`, `fd/<n>`, `fdinfo/<n>`, `cwd`, `root`, `exe`, `mounts`,
 //!   `mountinfo`),
-//!   `self`, `thread-self` and `mounts`, merged into procfs's root, and
+//!   `self`, `thread-self` and `mounts`, merged into procfs's root,
 //!   `sys/vm` (the kernel's overcommit policy, ADR 0013) in procfs's
-//!   `sys`. The records come from the server's process table
+//!   `sys`, and `/sys/fs` with the tree's memory group at `/sys/fs/cgroup`
+//!   (cgroup2, its own mount: `CgFile`, ADR 0024). The records come from the server's process table
 //!   (`process::query`, R8, with the kernel's accounts of CPU time and
 //!   memory, and of the OOM killer's badness); the descriptors of
 //!   `fd` from the process's descriptor table (`fdtable`, R6e;
@@ -111,9 +112,12 @@ pub enum PidFile {
     Mem,
     /// The mount table with ids and device numbers (`mountinfo`).
     MountInfo,
+    /// Its control group (`cgroup`: its tree's, the root of the tree's view, ADR 0024).
+    Cgroup,
 }
 
 const PID_FILES: &[(&str, PidFile)] = &[
+    ("cgroup", PidFile::Cgroup),
     ("mountinfo", PidFile::MountInfo),
     ("fdinfo", PidFile::FdInfo),
     ("maps", PidFile::Maps),
@@ -134,6 +138,7 @@ const PID_FILES: &[(&str, PidFile)] = &[
     ("oom_adj", PidFile::OomAdj),
 ];
 const TASK_FILES: &[(&str, PidFile)] = &[
+    ("cgroup", PidFile::Cgroup),
     ("maps", PidFile::Maps),
     ("mem", PidFile::Mem),
     ("stat", PidFile::Stat),
@@ -174,6 +179,61 @@ impl VmFile {
     }
 }
 
+/// /sys/fs and the tree's control group at /sys/fs/cgroup (ADR 0024), the server's: Linux's
+/// cgroup v2 as a container with its own cgroup namespace sees it, its group the root of the
+/// hierarchy, with the memory controller's files over the kernel's memory group of the tree
+/// (`restricted::SYS_MEMCG_STAT`, `SYS_MEMCG_SET`). The boundaries are the starter's to set
+/// (a delegated cgroup's are its parent's): writable by a tree with the host grant only. No
+/// sub-groups (mkdir: EPERM), no other controllers.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CgFile {
+    /// /sys/fs (in procfs's /sys).
+    SysFs = 0,
+    /// /sys/fs/cgroup, the cgroup2 mount's root.
+    Dir,
+    Controllers,
+    Procs,
+    Current,
+    Events,
+    EventsLocal,
+    High,
+    Low,
+    Max,
+    Min,
+    Peak,
+}
+
+const CG_FILES: &[(&str, CgFile)] = &[
+    ("cgroup.controllers", CgFile::Controllers),
+    ("cgroup.procs", CgFile::Procs),
+    ("memory.current", CgFile::Current),
+    ("memory.events", CgFile::Events),
+    ("memory.events.local", CgFile::EventsLocal),
+    ("memory.high", CgFile::High),
+    ("memory.low", CgFile::Low),
+    ("memory.max", CgFile::Max),
+    ("memory.min", CgFile::Min),
+    ("memory.peak", CgFile::Peak),
+];
+
+impl CgFile {
+    /// The boundary it sets (`SYS_MEMCG_SET`'s `which`), if it is one.
+    fn which(self) -> Option<u64> {
+        match self {
+            CgFile::Max => Some(MEMCG_MAX),
+            CgFile::High => Some(MEMCG_HIGH),
+            CgFile::Low => Some(MEMCG_LOW),
+            CgFile::Min => Some(MEMCG_MIN),
+            _ => None,
+        }
+    }
+}
+
+/// st_dev of the cgroup2 mount's files (an anonymous device, 0:26) and its statfs f_type
+/// (Linux's CGROUP2_SUPER_MAGIC).
+pub const CGROUP_DEV: u64 = 0x1a;
+const CGROUP2_SUPER_MAGIC: u64 = 0x6367_7270;
+
 /// A node of /proc or /sys.
 #[derive(Clone)]
 pub enum ProcNode {
@@ -195,6 +255,8 @@ pub enum ProcNode {
     FdInfo { pid: u64, fd: u32 },
     /// /proc/sys/vm and its files.
     Vm(VmFile),
+    /// /sys/fs, /sys/fs/cgroup and its files.
+    Cgroup(CgFile),
     /// The open file a magic link led to that is no filesystem's node (a
     /// pipe, a socket, an eventfd, an epoll instance).
     Open(Opened),
@@ -476,6 +538,19 @@ fn vm_mode(file: VmFile) -> u32 {
     }
 }
 
+fn cg_mode(file: CgFile) -> u32 {
+    match file {
+        CgFile::SysFs | CgFile::Dir => S_IFDIR | 0o755,
+        CgFile::Procs | CgFile::High | CgFile::Low | CgFile::Max | CgFile::Min => S_IFREG | 0o644,
+        _ => S_IFREG | 0o444,
+    }
+}
+
+/// The root of the cgroup2 mount at /sys/fs/cgroup (`namespace`'s walk starts there).
+pub fn cgroup_root() -> ProcNode {
+    ProcNode::Cgroup(CgFile::Dir)
+}
+
 /// The node of /proc/sys (procfs's directory, which `vm` is merged into).
 fn proc_sys() -> ProcNode {
     ProcNode::Remote { sys: false, ino: PROC_SYS, mode: S_IFDIR | 0o555 }
@@ -491,6 +566,7 @@ pub fn mode(node: &ProcNode) -> u32 {
         // (Linux's proc_fdinfo_instantiate: S_IRUSR.)
         ProcNode::FdInfo { .. } => S_IFREG | 0o400,
         ProcNode::Vm(file) => vm_mode(*file),
+        ProcNode::Cgroup(file) => cg_mode(*file),
         ProcNode::Open(_) => stat(node).map_or(0, |st| namespace::mode_of(&st)),
     }
 }
@@ -525,11 +601,18 @@ pub fn may_open(node: &ProcNode) -> Result<(), i64> {
 
 /// Whether the caller may open the node for writing (it exists): a process's
 /// oom_score_adj, oom_adj and mem, and with the host grant the overcommit policy (Linux's
-/// sysctl permission for a namespace whose root does not own the machine: EACCES);
-/// EACCES for every other node.
+/// sysctl permission for a namespace whose root does not own the machine: EACCES) and the
+/// tree's memory boundaries and cgroup.procs (a delegated cgroup's own interface files are
+/// its parent's: EACCES); EACCES for every other node.
 pub fn may_write(node: &ProcNode) -> Result<(), i64> {
     match node {
         ProcNode::Pid { file: PidFile::OomScoreAdj | PidFile::OomAdj | PidFile::Mem, .. } | ProcNode::Task { file: PidFile::OomScoreAdj | PidFile::OomAdj | PidFile::Mem, .. } => check(node),
+        ProcNode::Cgroup(file) if cg_mode(*file) & 0o200 != 0 && *file != CgFile::Dir && *file != CgFile::SysFs => {
+            if syscall(SYS_HOST_GRANTED, [0; 6]) < 0 {
+                return Err(EACCES);
+            }
+            Ok(())
+        }
         ProcNode::Vm(file) if *file != VmFile::Dir => {
             if syscall(SYS_HOST_GRANTED, [0; 6]) < 0 {
                 return Err(EACCES);
@@ -545,6 +628,10 @@ pub fn lookup(dir: &ProcNode, name: &str) -> Result<ProcNode, i64> {
     match dir {
         ProcNode::Remote { sys: false, ino: PROC_SYS, .. } if name == "vm" => Ok(ProcNode::Vm(VmFile::Dir)),
         ProcNode::Vm(VmFile::Dir) => VM_FILES.iter().find(|(n, _)| *n == name).map(|&(_, f)| ProcNode::Vm(f)).ok_or(ENOENT),
+        ProcNode::Remote { sys: true, ino: SYSFS_ROOT, .. } if name == "fs" => Ok(ProcNode::Cgroup(CgFile::SysFs)),
+        ProcNode::Cgroup(CgFile::SysFs) if name == "cgroup" => Ok(cgroup_root()),
+        ProcNode::Cgroup(CgFile::SysFs) => Err(ENOENT),
+        ProcNode::Cgroup(CgFile::Dir) => CG_FILES.iter().find(|(n, _)| *n == name).map(|&(_, f)| ProcNode::Cgroup(f)).ok_or(ENOENT),
         ProcNode::Remote { sys: false, ino: PROC_ROOT, .. } => match name {
             "self" => Ok(ProcNode::SelfLink),
             "thread-self" => Ok(ProcNode::ThreadSelf),
@@ -600,6 +687,7 @@ fn ino(node: &ProcNode) -> u64 {
         ProcNode::Fd { pid, fd } => (pid + 1) << 20 | 2 << 12 | *fd as u64,
         ProcNode::FdInfo { pid, fd } => (pid + 1) << 20 | 3 << 12 | *fd as u64,
         ProcNode::Vm(file) => 0x1_0010 + *file as u64,
+        ProcNode::Cgroup(file) => 0x1_0020 + *file as u64,
         ProcNode::Open(_) => 0,
     }
 }
@@ -676,6 +764,27 @@ pub fn list(dir: &ProcNode) -> Result<Vec<(String, u64, u8)>, i64> {
             }
             Ok(out)
         }
+        ProcNode::Remote { sys: true, ino: SYSFS_ROOT, .. } => {
+            let mut out = remote_readdir(SYSFS_ROOT)?;
+            add(&mut out, "fs", &ProcNode::Cgroup(CgFile::SysFs))?;
+            Ok(out)
+        }
+        ProcNode::Cgroup(CgFile::SysFs) => {
+            let mut out = try_vec(3)?;
+            add(&mut out, ".", dir)?;
+            add(&mut out, "..", &root(true))?;
+            add(&mut out, "cgroup", &cgroup_root())?;
+            Ok(out)
+        }
+        ProcNode::Cgroup(CgFile::Dir) => {
+            let mut out = try_vec(CG_FILES.len() + 2)?;
+            add(&mut out, ".", dir)?;
+            add(&mut out, "..", &ProcNode::Cgroup(CgFile::SysFs))?;
+            for &(n, file) in CG_FILES {
+                add(&mut out, n, &ProcNode::Cgroup(file))?;
+            }
+            Ok(out)
+        }
         ProcNode::Remote { ino, mode, .. } if mode & vfs::S_IFMT == S_IFDIR => remote_readdir(*ino),
         ProcNode::Pid { pid, file: PidFile::Dir } => {
             process(*pid)?;
@@ -740,7 +849,12 @@ pub fn stat(node: &ProcNode) -> Result<[u8; 144], i64> {
             check(node)?;
             let mode = mode(node);
             let nlink = if mode & vfs::S_IFMT == S_IFDIR { 2 } else { 1 };
-            vfs::stat::Stat { dev: PROC_DEV, ino: ino(node), nlink, mode, blksize: 1024, atime: now, mtime: now, ctime: now, ..Default::default() }.to_bytes()
+            let dev = match fs_of(node) {
+                Fs::Proc => PROC_DEV,
+                Fs::Sys => SYS_DEV,
+                Fs::Cgroup => CGROUP_DEV,
+            };
+            vfs::stat::Stat { dev, ino: ino(node), nlink, mode, blksize: 1024, atime: now, mtime: now, ctime: now, ..Default::default() }.to_bytes()
         }
     };
     namespace::pseudo_times(&mut st);
@@ -882,6 +996,7 @@ pub fn contents(node: &ProcNode) -> Result<Vec<u8>, i64> {
             }
             return Ok(try_format!("{value}\n")?.into_bytes());
         }
+        ProcNode::Cgroup(file) => return cgroup_contents(*file),
         ProcNode::FdInfo { pid, fd } => return Ok(fdinfo(*pid, *fd)?.into_bytes()),
         ProcNode::Pid { pid, file } => (*pid, *file),
         ProcNode::Task { tid, file, .. } => {
@@ -908,6 +1023,9 @@ pub fn contents(node: &ProcNode) -> Result<Vec<u8>, i64> {
         PidFile::OomScoreAdj => try_format!("{}\n", oom_adj_of(id, 0, 0)?)?,
         PidFile::OomAdj => try_format!("{}\n", fmt::oom_adj(oom_adj_of(id, 0, 0)?))?,
         PidFile::Maps => maps(id)?,
+        // Every process is in its tree's group, the root of the tree's view (Linux's
+        // cgroup namespace): cgroup v2's one line.
+        PidFile::Cgroup => try_string("0::/\n")?,
         PidFile::Dir | PidFile::Task | PidFile::Fd | PidFile::FdInfo => return Err(EISDIR),
         // (mem has no contents of its own: its open file reads the process's memory.)
         PidFile::Exe | PidFile::Cwd | PidFile::Root | PidFile::Mem => return Err(EINVAL),
@@ -990,6 +1108,82 @@ fn fdinfo(pid: u64, fd: u32) -> Result<String, i64> {
         _ => try_format!("{}", info(fmt::FdKind::Plain))?,
     };
     Ok(text)
+}
+
+/// The tree's memory group as the kernel keeps it (`SYS_MEMCG_STAT`).
+fn memcg_stat() -> Result<MemCgStat, i64> {
+    let mut stat = MemCgStat::default();
+    let r = syscall(SYS_MEMCG_STAT, [&mut stat as *mut MemCgStat as u64, 0, 0, 0, 0, 0]);
+    if r < 0 {
+        return Err(-r);
+    }
+    Ok(stat)
+}
+
+/// A file of /sys/fs/cgroup, as Linux's cgroup v2 memory controller shows it: sizes in
+/// bytes, a boundary that is none as "max", memory.events in its order.
+fn cgroup_contents(file: CgFile) -> Result<Vec<u8>, i64> {
+    let boundary = |bytes: u64| if bytes == MEMCG_UNLIMITED { try_string("max\n") } else { try_format!("{bytes}\n") };
+    let text = match file {
+        CgFile::SysFs | CgFile::Dir => return Err(EISDIR),
+        CgFile::Controllers => try_string("memory\n")?,
+        CgFile::Procs => {
+            let mut out = String::new();
+            for pid in ids(QUERY_PIDS, 0)?.into_iter().filter(|&p| p != 0) {
+                out.try_push_str(&try_format!("{pid}\n")?)?;
+            }
+            out
+        }
+        file => {
+            let s = memcg_stat()?;
+            match file {
+                CgFile::Current => try_format!("{}\n", s.current)?,
+                CgFile::Peak => try_format!("{}\n", s.peak)?,
+                CgFile::Max => boundary(s.max)?,
+                CgFile::High => boundary(s.high)?,
+                CgFile::Low => boundary(s.low)?,
+                CgFile::Min => boundary(s.min)?,
+                // (One group without children: the local events are its own.)
+                _ => try_format!(
+                    "low {}\nhigh {}\nmax {}\noom {}\noom_kill {}\noom_group_kill {}\n",
+                    s.ev_low,
+                    s.ev_high,
+                    s.ev_max,
+                    s.ev_oom,
+                    s.ev_oom_kill,
+                    s.ev_oom_group_kill
+                )?,
+            }
+        }
+    };
+    Ok(text.into_bytes())
+}
+
+/// A size as a write of memory.max and its kin takes it (Linux's `page_counter_memparse`):
+/// "max", or a number of bytes with an optional K, M, G, T, P or E suffix (powers of 1024),
+/// surrounding white space ignored. None for anything else.
+fn memparse(data: &[u8]) -> Option<u64> {
+    let s = core::str::from_utf8(data).ok()?.trim();
+    if s == "max" {
+        return Some(MEMCG_UNLIMITED);
+    }
+    let digits = s.bytes().take_while(|b| b.is_ascii_digit()).count();
+    if digits == 0 {
+        return None;
+    }
+    let n: u64 = s[..digits].parse().ok()?;
+    let shift = match &s[digits..] {
+        "" => 0,
+        "k" | "K" => 10,
+        "m" | "M" => 20,
+        "g" | "G" => 30,
+        "t" | "T" => 40,
+        "p" | "P" => 50,
+        "e" | "E" => 60,
+        _ => return None,
+    };
+    // (Linux's memparse wraps; a size beyond the counters is no boundary at all.)
+    Some(n.checked_shl(shift).filter(|v| v >> shift == n).unwrap_or(MEMCG_UNLIMITED))
 }
 
 /// The oom_score_adj of process (or thread) `pid`, read (`flags` 0) or set
@@ -1105,15 +1299,54 @@ pub fn write(node: &ProcNode, data: &[u8]) -> Result<usize, i64> {
             }
             Ok(data.len())
         }
+        // A boundary of the tree's memory group (the kernel reclaims and, for memory.max,
+        // kills within the tree until the usage fits).
+        ProcNode::Cgroup(file) if file.which().is_some() => {
+            let bytes = memparse(data).ok_or(EINVAL)?;
+            let r = syscall(SYS_MEMCG_SET, [file.which().expect("a boundary"), bytes, 0, 0, 0, 0]);
+            if r < 0 {
+                return Err(-r);
+            }
+            Ok(data.len())
+        }
+        // Moving a process into the group it is in (the only one: no sub-groups) changes
+        // nothing; one the tree does not have is ESRCH, as Linux's for a pid it cannot see.
+        ProcNode::Cgroup(CgFile::Procs) => {
+            let pid = fmt::parse_int(data).filter(|&p| p >= 0).ok_or(EINVAL)?;
+            if pid != 0 {
+                process(pid as u64).map_err(|_| ESRCH)?;
+            }
+            Ok(data.len())
+        }
         _ => Err(EINVAL),
     }
 }
 
-/// The `struct statfs` (120 bytes) of /proc or /sys, as Linux's: no blocks,
-/// no inodes counted.
+/// Which filesystem a node is of: /proc, /sys or the cgroup2 mount at /sys/fs/cgroup.
+#[derive(PartialEq, Eq)]
+enum Fs {
+    Proc,
+    Sys,
+    Cgroup,
+}
+
+fn fs_of(node: &ProcNode) -> Fs {
+    match node {
+        ProcNode::Remote { sys: true, .. } | ProcNode::Cgroup(CgFile::SysFs) => Fs::Sys,
+        ProcNode::Cgroup(_) => Fs::Cgroup,
+        _ => Fs::Proc,
+    }
+}
+
+/// The `struct statfs` (120 bytes) of /proc, /sys or the cgroup2 mount, as Linux's: no
+/// blocks, no inodes counted.
 pub fn statfs(node: &ProcNode) -> [u8; 120] {
-    let sys = matches!(node, ProcNode::Remote { sys: true, .. });
-    let words: [u64; 15] = [if sys { SYSFS_MAGIC } else { PROC_SUPER_MAGIC }, 4096, 0, 0, 0, 0, 0, 0, vfs::NAME_MAX as u64, 4096, vfs::ST_VALID, 0, 0, 0, 0];
+    let magic = match fs_of(node) {
+        Fs::Proc => PROC_SUPER_MAGIC,
+        Fs::Sys => SYSFS_MAGIC,
+        Fs::Cgroup => CGROUP2_SUPER_MAGIC,
+    };
+    let words: [u64; 15] = [magic, 4096, 0, 0, 0, 0, 0, 0, vfs::NAME_MAX as u64, 4096, vfs::ST_VALID, 0, 0, 0, 0];
     let mut out = [0u8; 120];
     for (i, w) in words.iter().enumerate() {
         out[i * 8..i * 8 + 8].copy_from_slice(&w.to_le_bytes());
@@ -1121,9 +1354,7 @@ pub fn statfs(node: &ProcNode) -> [u8; 120] {
     out
 }
 
-/// Whether two nodes are of one filesystem (both of /proc or both of
-/// /sys).
+/// Whether two nodes are of one filesystem (/proc, /sys or the cgroup2 mount).
 pub fn same_fs(a: &ProcNode, b: &ProcNode) -> bool {
-    let sys = |n: &ProcNode| matches!(n, ProcNode::Remote { sys: true, .. });
-    sys(a) == sys(b)
+    fs_of(a) == fs_of(b)
 }

@@ -5,7 +5,8 @@
 //! links, made when the instance starts; R9, until then the kernel's tree)
 //! and as devpts at /dev/pts (`pty`), diskfs's disk at /data (`datafs`,
 //! over the rings), /proc and /sys (`procfs`: procfs's files over the
-//! rings and the server's own per-process part). Mounts are found by
+//! rings and the server's own per-process part) and the tree's control
+//! group as cgroup2 at /sys/fs/cgroup (`procfs`, ADR 0024). Mounts are found by
 //! name, as everything here: ".." is resolved
 //! lexically before symlinks are looked at (as the kernel's VFS did:
 //! "/a/link/.." is "/a"), so the longest mount whose path begins a
@@ -190,6 +191,8 @@ enum Fs {
     /// ones), or /sys (procfs's).
     Proc,
     Sys,
+    /// The tree's control group at /sys/fs/cgroup (the server's, ADR 0024).
+    Cgroup,
 }
 
 struct Mount {
@@ -202,7 +205,7 @@ struct Mount {
 
 /// The mount table: the instance's own tmpfs at the root, unpacked from
 /// the initramfs when the instance first resolves a path, /dev (`dev`),
-/// /proc and /sys, /data and devpts.
+/// /proc and /sys, /data, devpts and cgroup2 (/sys/fs/cgroup).
 static MOUNTS: Mutex<Vec<Mount>> = Mutex::new(Vec::new());
 
 fn with_mounts<R>(f: impl FnOnce(&Vec<Mount>) -> R) -> R {
@@ -231,6 +234,9 @@ fn with_mounts<R>(f: impl FnOnce(&Vec<Mount>) -> R) -> R {
         // devpts (the ptys' nodes, `pty`), on /dev/pts.
         let at = alloc::vec![String::from("dev"), String::from("pts")];
         m.push(Mount { at, fs: Fs::Tmpfs(crate::pty::devpts()), source: "devpts", fstype: "devpts" });
+        // cgroup2 on /sys/fs/cgroup (its mount point is the server's /sys/fs).
+        let at = alloc::vec![String::from("sys"), String::from("fs"), String::from("cgroup")];
+        m.push(Mount { at, fs: Fs::Cgroup, source: "cgroup2", fstype: "cgroup2" });
     }
     f(&m)
 }
@@ -309,6 +315,7 @@ pub fn mountinfo_text() -> Result<String, i64> {
                 Fs::Data => datafs::DEV,
                 Fs::Proc => crate::procfs::PROC_DEV,
                 Fs::Sys => crate::procfs::SYS_DEV,
+                Fs::Cgroup => crate::procfs::CGROUP_DEV,
             };
             let (major, minor) = vfs::stat::dev_split(dev);
             let mode = if matches!(m.fs, Fs::Data) && data_ro { "ro" } else { "rw" };
@@ -422,10 +429,10 @@ fn walk_data(names: &[String], follow: bool) -> Result<Step, i64> {
     Ok(Step::Done(Node::Data(cur), mode))
 }
 
-/// Walks `names` in /proc or /sys from its root; `follow`: also at the
-/// last name.
-fn walk_proc(sys: bool, names: &[String], follow: bool) -> Result<Step, i64> {
-    let mut cur = procfs::root(sys);
+/// Walks `names` in /proc, /sys or the cgroup2 mount from its root `root`;
+/// `follow`: also at the last name.
+fn walk_proc(root: ProcNode, names: &[String], follow: bool) -> Result<Step, i64> {
+    let mut cur = root;
     for (i, name) in names.iter().enumerate() {
         let child = procfs::lookup(&cur, name)?;
         if procfs::mode(&child) & vfs::S_IFMT == vfs::S_IFLNK && (follow || i + 1 < names.len()) {
@@ -455,8 +462,9 @@ pub fn resolve(base: &str, path: &str, follow: bool) -> Result<Resolved, i64> {
         let step = match &fs {
             Fs::Tmpfs(root) => walk_tmpfs(root, names, follow)?,
             Fs::Data => walk_data(names, follow)?,
-            Fs::Proc => walk_proc(false, names, follow)?,
-            Fs::Sys => walk_proc(true, names, follow)?,
+            Fs::Proc => walk_proc(procfs::root(false), names, follow)?,
+            Fs::Sys => walk_proc(procfs::root(true), names, follow)?,
+            Fs::Cgroup => walk_proc(procfs::cgroup_root(), names, follow)?,
         };
         let (link, walked) = match step {
             Step::Done(node, mode) => return Ok(Resolved { node, mode, path: given }),

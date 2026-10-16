@@ -7,7 +7,9 @@
 //! back to the frame allocator when the task is gone, rather than staying
 //! in the kernel heap, which never shrinks. Stacks of user tasks are
 //! charged to the commit limit, so creating threads and processes fails
-//! with ENOMEM before memory promised to programs runs out.
+//! with ENOMEM before memory promised to programs runs out, and to the
+//! creating task's memory group (ADR 0024: Linux's kernel_stack in
+//! memory.stat), within its limit.
 //!
 //! A freed slot's address range may still be cached in TLBs of CPUs that
 //! ran the task. Nothing touches it there, but a new stack in the same slot
@@ -64,25 +66,32 @@ pub struct KernelStack {
 }
 
 impl KernelStack {
-    /// A new stack; `charge` counts it against the commit limit (stacks
-    /// of user tasks). None if memory or slots run out.
+    /// A new stack; `charge` counts it against the commit limit and the
+    /// running task's memory group (stacks of user tasks). None if memory
+    /// or slots run out, or the group is at its limit (after its own cache
+    /// pages were reclaimed).
     pub fn new(charge: bool) -> Option<KernelStack> {
         if charge && !super::commit(PAGES) {
             return None;
         }
+        let target = if charge { super::memcg::Target::current() } else { super::memcg::Target::ROOT };
         // (Mapped with the frames locked: free frames made first, by
-        // reclaim if need be.)
+        // reclaim if need be; room in the group too.)
         if charge {
             super::ensure_user_frames(PAGES + 3);
+            if super::memcg::over(target, PAGES) {
+                super::memcg::event(target.id(), super::memcg::Event::Max);
+                super::reclaim_group(target.id(), PAGES, false);
+            }
         }
-        let stack = Self::map(charge);
+        let stack = Self::map(charge, target);
         if stack.is_none() && charge {
             super::uncommit(PAGES);
         }
         stack
     }
 
-    fn map(charged: bool) -> Option<KernelStack> {
+    fn map(charged: bool, target: super::memcg::Target) -> Option<KernelStack> {
         let mut flushed = false;
         loop {
             let mut slots = SLOTS_.lock();
@@ -107,13 +116,14 @@ impl KernelStack {
             let mut mapper = mapper();
             let mut guard = FRAMES.lock();
             let frames = guard.as_mut()?;
-            if !frames.user_may_take(PAGES) {
+            if !frames.user_may_take(PAGES) || !super::memcg::may_charge(target, PAGES) {
                 return None;
             }
             let flags = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
             for i in 0..PAGES {
                 let page = Page::<Size4KiB>::containing_address(VirtAddr::new(stack_bottom(slot) + i * 4096));
                 let mapped = frames.allocate_frame().and_then(|frame| {
+                    frames.charge(frame, target.id());
                     unsafe { core::ptr::write_bytes(phys_to_virt(frame.start_address().as_u64()), 0, 4096) };
                     match unsafe { mapper.map_to(page, frame, flags, frames) } {
                         Ok(flush) => {

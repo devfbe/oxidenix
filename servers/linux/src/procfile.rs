@@ -12,7 +12,8 @@
 //! process's memory at the position (`ptrace::mem_rw`, ADR 0019). Files are
 //! read-only (open for writing: EACCES) but a process's mem, its
 //! oom_score_adj and oom_adj and, for a tree with the host grant,
-//! /proc/sys/vm's overcommit files (`procfs::may_write`): each write to the
+//! /proc/sys/vm's overcommit files and /sys/fs/cgroup's memory boundaries
+//! and cgroup.procs (`procfs::may_write`): each write to the
 //! latter is one value (`procfs::write`) wherever the offset is, as Linux's
 //! for them, and `O_TRUNC` changes nothing there. The copies to the program are made with
 //! no lock of the server held but the description's offset (which only its
