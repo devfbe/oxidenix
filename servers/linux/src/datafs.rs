@@ -2431,7 +2431,8 @@ pub fn let_go(inode: &Arc<DInode>) {
 /// Called where the calling thread holds no lock (the end of a system
 /// call, the pager between events).
 pub fn reap() {
-    if !REAP.swap(false, Ordering::AcqRel) {
+    // (A plain load first: this runs after every system call.)
+    if !REAP.load(Ordering::Relaxed) || !REAP.swap(false, Ordering::AcqRel) {
         return;
     }
     release_orphans();

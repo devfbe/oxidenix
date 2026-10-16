@@ -48,7 +48,7 @@ use crate::netclient::{self, Net, Rings};
 use crate::sync::Mutex;
 use crate::unix::{Sink, Source};
 use alloc::sync::Arc;
-use core::sync::atomic::{AtomicU64, Ordering::SeqCst};
+use core::sync::atomic::{AtomicU64, Ordering::{Acquire, SeqCst}};
 use netring::{fill, pieces, state, Ctl, Endpoint, Kind, Record, Request, RECORD_HEADER};
 
 pub const EIO: i64 = 5;
@@ -1388,6 +1388,11 @@ impl InetSock {
 pub fn run_deferred(linger: bool) {
     let local = crate::local::get();
     loop {
+        // (A plain load first: the list is almost always empty, and this runs around every
+        // system call.)
+        if local.deferred.load(Acquire).is_null() {
+            return;
+        }
         let head = local.deferred.swap(core::ptr::null_mut(), SeqCst) as *const InetSock;
         if head.is_null() {
             return;
