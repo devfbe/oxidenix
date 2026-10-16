@@ -44,10 +44,13 @@ pub fn handle(s: &State) -> Option<i64> {
     Some(result.unwrap_or_else(|e| -e))
 }
 
+/// The machine's host name (uname's nodename; core_pattern's `%h`).
+pub const NODENAME: &str = "oxidenix";
+
 /// uname(2): oxidenix speaks Linux's ABI but says what it is.
 fn uname(buf: u64) -> Result<i64, i64> {
     let mut uts = [0u8; 6 * 65];
-    let fields = ["oxidenix", "oxidenix", env!("CARGO_PKG_VERSION"), "#1 SMP", "x86_64", "(none)"];
+    let fields = ["oxidenix", NODENAME, env!("CARGO_PKG_VERSION"), "#1 SMP", "x86_64", "(none)"];
     for (i, field) in fields.iter().enumerate() {
         uts[i * 65..i * 65 + field.len()].copy_from_slice(field.as_bytes());
     }

@@ -1327,6 +1327,10 @@ pub const VMA_SHARED: u64 = 8;
 pub const VMA_STACK: u64 = 16;
 /// Device memory or a channel's grant (no object a program mapped).
 pub const VMA_DEVICE: u64 = 32;
+/// The object is anonymous shared memory (`mo_create`'s, no file's: Linux's
+/// shmem object without a link, which a core dump's filter tells from a
+/// file's mapping).
+pub const VMA_ANON_SHARED: u64 = 64;
 
 /// What `proc_info` tells about a process.
 #[repr(C)]
@@ -1613,6 +1617,38 @@ pub const SYS_THREAD_DEBUG: u64 = 1252;
 /// hit (`DR6_HIT << n`), a single step (TF).
 pub const DR6_HIT: u64 = 1;
 pub const DR6_STEP: u64 = 0x4000;
+
+// Core dumps (ADR 0022): the file, its format and which memory goes into it
+// are the server's; it reads the memory with `vm_access` and learns from
+// the kernel which pages exist at all.
+
+/// `vm_resident(target, start, end, out, cap) -> n`: the resident pages of
+/// `target` (a process or space handle, as `vm_access`'s) in [`start`,
+/// `end`) (page-aligned, below 64 TiB: EINVAL otherwise), as up to `cap`
+/// `VmRun` records at `out` in the server's memory, in address order, each
+/// a run of adjacent pages of one kind; `n` of them (0: none left; a
+/// caller goes on from the last one's end). A page is resident when its
+/// mapping has a frame for it (mapped, or kept while its area denies all
+/// access); `VM_RUN_PRIVATE` marks the mapping's own pages (anonymous
+/// memory and the private copies of file pages: Linux's anonymous pages),
+/// the others are an object's (a file's page cache, shared memory). Nothing
+/// is faulted in: a page no one touched is no run. A core dump skips such
+/// pages (Linux's `FOLL_DUMP`) and dumps the areas that were written to
+/// (Linux's `anon_vma`) without making either. The walk costs what is
+/// mapped, not the range's size. ESRCH for a process without an address
+/// space (0 records for a space that is gone).
+pub const SYS_VM_RESIDENT: u64 = 1280;
+pub const VM_RUN_PRIVATE: u64 = 1;
+
+/// A run of resident pages, as `vm_resident` reports it.
+#[repr(C)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub struct VmRun {
+    pub start: u64,
+    pub pages: u64,
+    /// `VM_RUN_*`.
+    pub flags: u64,
+}
 
 /// `()`: netd drops its DHCP lease and asks for a new one a second later
 /// (`netring::op::RENEW`), so that the instances see the address, its

@@ -85,7 +85,7 @@ pub fn handle(s: &State) -> Option<i64> {
 const RLIM_NLIMITS: u64 = 16;
 pub const RLIM_INFINITY: u64 = u64::MAX;
 pub const RLIMIT_STACK: u64 = 3;
-const RLIMIT_CORE: u64 = 4;
+pub const RLIMIT_CORE: u64 = 4;
 pub const RLIMIT_NOFILE: u64 = 7;
 const RLIMIT_MEMLOCK: u64 = 8;
 pub const RLIMIT_SIGPENDING: u64 = 11;
@@ -99,7 +99,7 @@ const NR_OPEN: u64 = 1 << 20;
 /// The (soft, hard) limit of `resource` a tree's first process starts with: Linux's
 /// defaults for a process init starts. The server holds to RLIMIT_STACK (how far the stack
 /// of the program execve starts may grow, and a quarter of it for the arguments and
-/// environment: `exec`), RLIMIT_CORE (no core file is ever written), RLIMIT_NOFILE (new
+/// environment: `exec`), RLIMIT_CORE (the bytes a core dump writes: `coredump`), RLIMIT_NOFILE (new
 /// descriptors: `fdtable`) and RLIMIT_SIGPENDING (real-time signals queued in the instance,
 /// against the target's limit: Linux counts per user, and the one user is root). The others
 /// are kept, not enforced: RLIMIT_NPROC as Linux for root, who is exempt (a fork bomb stops

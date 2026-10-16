@@ -1965,6 +1965,7 @@ pub fn server_call(nr: u64, a: [u64; 6]) -> SysResult {
             Ok(0)
         }
         SYS_VM_ACCESS => vm_access(&instance, a[0], a[1], a[2], a[3], a[4]),
+        SYS_VM_RESIDENT => vm_resident(&instance, a[0], a[1], a[2], a[3], a[4]),
         SYS_VM_SPACE => {
             let mm = container(&instance, a[0])?.group.info.lock().mem.clone().and_then(|s| s.mm()).ok_or(ESRCH)?;
             Ok(instance.insert(Object::Space(Arc::downgrade(&mm)))? as i64)
@@ -3028,6 +3029,41 @@ fn vm_access(instance: &Instance, target: u64, addr: u64, buf: u64, len: u64, fl
     Ok(done as i64)
 }
 
+/// `SYS_VM_RESIDENT`: the runs of resident pages of `target` in [start, end) (see
+/// `restricted::SYS_VM_RESIDENT`), a batch at a time on the stack: the space is locked for
+/// its walk only, never across the copy to the server's memory.
+fn vm_resident(instance: &Instance, target: u64, start: u64, end: u64, out: u64, cap: u64) -> SysResult {
+    if start % PAGE != 0 || end % PAGE != 0 || start > end || end > USER_END {
+        return Err(EINVAL);
+    }
+    let mm = match instance.object(target)? {
+        Object::Process(c) => c.group.info.lock().mem.clone().and_then(|s| s.mm()).ok_or(ESRCH)?,
+        Object::Space(space) => match space.upgrade() {
+            Some(mm) => mm,
+            None => return Ok(0),
+        },
+        _ => return Err(EINVAL),
+    };
+    const BATCH: usize = 32;
+    let size = core::mem::size_of::<VmRun>() as u64;
+    let (mut done, mut from) = (0u64, start);
+    while done < cap && from < end {
+        let mut batch = [VmRun::default(); BATCH];
+        let n = mm.lock().resident(from, end, &mut batch[..BATCH.min((cap - done) as usize)]);
+        if n == 0 {
+            break;
+        }
+        // (The last run may go on in the next batch: it is reported as far as it went, and
+        // the caller's next run starts where it ended.)
+        let bytes = unsafe { core::slice::from_raw_parts(batch.as_ptr() as *const u8, n * size as usize) };
+        let at = out.checked_add(done * size).ok_or(EFAULT)?;
+        super::uaccess::copy_to_server(at, bytes)?;
+        done += n as u64;
+        from = batch[n - 1].start + batch[n - 1].pages * PAGE;
+    }
+    Ok(done as i64)
+}
+
 fn vm_areas(instance: &Instance, handle: u64, from: u64, out: u64, cap: u64) -> SysResult {
     use super::address_space::Backing;
     let mm = if handle == 0 {
@@ -3055,7 +3091,10 @@ fn vm_areas(instance: &Instance, handle: u64, from: u64, out: u64, cap: u64) -> 
                 flags |= if v.backing.shared() { VMA_SHARED } else { 0 };
                 flags |= if v.stack_limit != 0 { VMA_STACK } else { 0 };
                 let (offset, object) = match &v.backing {
-                    Backing::File { cache, offset, .. } => (*offset, object_id(cache)),
+                    Backing::File { cache, offset, .. } => {
+                        flags |= if cache.is_anonymous() { VMA_ANON_SHARED } else { 0 };
+                        (*offset, object_id(cache))
+                    }
                     Backing::Anon => (0, 0),
                     Backing::Device | Backing::Granted { .. } | Backing::Revoked { .. } => {
                         flags |= VMA_DEVICE;

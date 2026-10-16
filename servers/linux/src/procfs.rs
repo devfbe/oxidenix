@@ -15,8 +15,10 @@
 //!   `mountinfo`),
 //!   `self`, `thread-self` and `mounts`, merged into procfs's root,
 //!   `sys/vm` (the kernel's overcommit policy, ADR 0013) in procfs's
-//!   `sys`, and `/sys/fs` with the tree's memory group at `/sys/fs/cgroup`
-//!   (cgroup2, its own mount: `CgFile`, ADR 0024). The records come from the server's process table
+//!   `sys`, `/sys/fs` with the tree's memory group at `/sys/fs/cgroup`
+//!   (cgroup2, its own mount: `CgFile`, ADR 0024), and the core dump's settings
+//!   (`core_pattern`, `core_uses_pid`: the tree's own, ADR 0022) in procfs's
+//!   `sys/kernel`. The records come from the server's process table
 //!   (`process::query`, R8, with the kernel's accounts of CPU time and
 //!   memory, and of the OOM killer's badness); the descriptors of
 //!   `fd` from the process's descriptor table (`fdtable`, R6e;
@@ -114,10 +116,13 @@ pub enum PidFile {
     MountInfo,
     /// Its control group (`cgroup`: its tree's, the root of the tree's view, ADR 0024).
     Cgroup,
+    /// Which mappings a core dump writes (`coredump_filter`, core(5)): writable.
+    CoredumpFilter,
 }
 
 const PID_FILES: &[(&str, PidFile)] = &[
     ("cgroup", PidFile::Cgroup),
+    ("coredump_filter", PidFile::CoredumpFilter),
     ("mountinfo", PidFile::MountInfo),
     ("fdinfo", PidFile::FdInfo),
     ("maps", PidFile::Maps),
@@ -167,6 +172,16 @@ const VM_FILES: &[(&str, VmFile)] = &[
     ("overcommit_memory", VmFile::OvercommitMemory),
     ("overcommit_ratio", VmFile::OvercommitRatio),
 ];
+
+/// The core dump's settings in /proc/sys/kernel (core(5)), the server's within procfs's
+/// directory: the tree's own (`coredump`), writable by its processes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum KernelFile {
+    CorePattern = 0,
+    CoreUsesPid,
+}
+
+const KERNEL_FILES: &[(&str, KernelFile)] = &[("core_pattern", KernelFile::CorePattern), ("core_uses_pid", KernelFile::CoreUsesPid)];
 
 impl VmFile {
     /// Which of the policy's values it is (`SYS_OVERCOMMIT`'s `which`).
@@ -257,6 +272,8 @@ pub enum ProcNode {
     Vm(VmFile),
     /// /sys/fs, /sys/fs/cgroup and its files.
     Cgroup(CgFile),
+    /// The core dump's files of /proc/sys/kernel.
+    Kernel(KernelFile),
     /// The open file a magic link led to that is no filesystem's node (a
     /// pipe, a socket, an eventfd, an epoll instance).
     Open(Opened),
@@ -525,7 +542,7 @@ fn pid_mode(file: PidFile) -> u32 {
         PidFile::Dir | PidFile::Task => S_IFDIR | 0o555,
         PidFile::Fd | PidFile::FdInfo => S_IFDIR | 0o500,
         PidFile::Exe | PidFile::Cwd | PidFile::Root => S_IFLNK | 0o777,
-        PidFile::OomScoreAdj | PidFile::OomAdj => S_IFREG | 0o644,
+        PidFile::OomScoreAdj | PidFile::OomAdj | PidFile::CoredumpFilter => S_IFREG | 0o644,
         PidFile::Mem => S_IFREG | 0o600,
         _ => S_IFREG | 0o444,
     }
@@ -567,6 +584,7 @@ pub fn mode(node: &ProcNode) -> u32 {
         ProcNode::FdInfo { .. } => S_IFREG | 0o400,
         ProcNode::Vm(file) => vm_mode(*file),
         ProcNode::Cgroup(file) => cg_mode(*file),
+        ProcNode::Kernel(_) => S_IFREG | 0o644,
         ProcNode::Open(_) => stat(node).map_or(0, |st| namespace::mode_of(&st)),
     }
 }
@@ -606,13 +624,15 @@ pub fn may_open(node: &ProcNode) -> Result<(), i64> {
 /// its parent's: EACCES); EACCES for every other node.
 pub fn may_write(node: &ProcNode) -> Result<(), i64> {
     match node {
-        ProcNode::Pid { file: PidFile::OomScoreAdj | PidFile::OomAdj | PidFile::Mem, .. } | ProcNode::Task { file: PidFile::OomScoreAdj | PidFile::OomAdj | PidFile::Mem, .. } => check(node),
+        ProcNode::Pid { file: PidFile::OomScoreAdj | PidFile::OomAdj | PidFile::Mem | PidFile::CoredumpFilter, .. }
+        | ProcNode::Task { file: PidFile::OomScoreAdj | PidFile::OomAdj | PidFile::Mem, .. } => check(node),
         ProcNode::Cgroup(file) if cg_mode(*file) & 0o200 != 0 && *file != CgFile::Dir && *file != CgFile::SysFs => {
             if syscall(SYS_HOST_GRANTED, [0; 6]) < 0 {
                 return Err(EACCES);
             }
             Ok(())
         }
+        ProcNode::Kernel(_) => Ok(()),
         ProcNode::Vm(file) if *file != VmFile::Dir => {
             if syscall(SYS_HOST_GRANTED, [0; 6]) < 0 {
                 return Err(EACCES);
@@ -632,6 +652,9 @@ pub fn lookup(dir: &ProcNode, name: &str) -> Result<ProcNode, i64> {
         ProcNode::Cgroup(CgFile::SysFs) if name == "cgroup" => Ok(cgroup_root()),
         ProcNode::Cgroup(CgFile::SysFs) => Err(ENOENT),
         ProcNode::Cgroup(CgFile::Dir) => CG_FILES.iter().find(|(n, _)| *n == name).map(|&(_, f)| ProcNode::Cgroup(f)).ok_or(ENOENT),
+        ProcNode::Remote { sys: false, ino: PROC_SYS_KERNEL, .. } if KERNEL_FILES.iter().any(|(n, _)| *n == name) => {
+            Ok(KERNEL_FILES.iter().find(|(n, _)| *n == name).map(|&(_, f)| ProcNode::Kernel(f)).ok_or(ENOENT)?)
+        }
         ProcNode::Remote { sys: false, ino: PROC_ROOT, .. } => match name {
             "self" => Ok(ProcNode::SelfLink),
             "thread-self" => Ok(ProcNode::ThreadSelf),
@@ -688,6 +711,7 @@ fn ino(node: &ProcNode) -> u64 {
         ProcNode::FdInfo { pid, fd } => (pid + 1) << 20 | 3 << 12 | *fd as u64,
         ProcNode::Vm(file) => 0x1_0010 + *file as u64,
         ProcNode::Cgroup(file) => 0x1_0020 + *file as u64,
+        ProcNode::Kernel(file) => 0x1_0030 + *file as u64,
         ProcNode::Open(_) => 0,
     }
 }
@@ -753,6 +777,13 @@ pub fn list(dir: &ProcNode) -> Result<Vec<(String, u64, u8)>, i64> {
         ProcNode::Remote { sys: false, ino: PROC_SYS, .. } => {
             let mut out = remote_readdir(PROC_SYS)?;
             add(&mut out, "vm", &ProcNode::Vm(VmFile::Dir))?;
+            Ok(out)
+        }
+        ProcNode::Remote { sys: false, ino: PROC_SYS_KERNEL, .. } => {
+            let mut out = remote_readdir(PROC_SYS_KERNEL)?;
+            for &(n, file) in KERNEL_FILES {
+                add(&mut out, n, &ProcNode::Kernel(file))?;
+            }
             Ok(out)
         }
         ProcNode::Vm(VmFile::Dir) => {
@@ -997,6 +1028,7 @@ pub fn contents(node: &ProcNode) -> Result<Vec<u8>, i64> {
             return Ok(try_format!("{value}\n")?.into_bytes());
         }
         ProcNode::Cgroup(file) => return cgroup_contents(*file),
+        ProcNode::Kernel(file) => return crate::coredump::setting(*file),
         ProcNode::FdInfo { pid, fd } => return Ok(fdinfo(*pid, *fd)?.into_bytes()),
         ProcNode::Pid { pid, file } => (*pid, *file),
         ProcNode::Task { tid, file, .. } => {
@@ -1026,6 +1058,8 @@ pub fn contents(node: &ProcNode) -> Result<Vec<u8>, i64> {
         // Every process is in its tree's group, the root of the tree's view (Linux's
         // cgroup namespace): cgroup v2's one line.
         PidFile::Cgroup => try_string("0::/\n")?,
+        // (Linux's "%08lx\n".)
+        PidFile::CoredumpFilter => try_format!("{:08x}\n", crate::process::coredump_filter(id as crate::process::Pid, None).map_err(|_| ENOENT)?)?,
         PidFile::Dir | PidFile::Task | PidFile::Fd | PidFile::FdInfo => return Err(EISDIR),
         // (mem has no contents of its own: its open file reads the process's memory.)
         PidFile::Exe | PidFile::Cwd | PidFile::Root | PidFile::Mem => return Err(EINVAL),
@@ -1275,9 +1309,10 @@ const NUMBER_MAX: usize = 12;
 
 /// A write of `data` to a node opened for writing (`may_write`), as Linux's: a process's
 /// oom_score_adj (-1000..=1000) or legacy oom_adj (-17..=15) from at most `NUMBER_MAX`
-/// bytes, or a value of the overcommit policy (`SYS_OVERCOMMIT`: the kernel checks the
-/// value and the host grant). EINVAL for what is no number in range, EACCES below the
-/// least oom_score_adj the process may set without the host grant. The bytes taken.
+/// bytes, its coredump_filter, a value of the overcommit policy (`SYS_OVERCOMMIT`: the
+/// kernel checks the value and the host grant), or a core dump setting (`coredump`).
+/// EINVAL for what is no number in range, EACCES below the least oom_score_adj the
+/// process may set without the host grant. The bytes taken.
 pub fn write(node: &ProcNode, data: &[u8]) -> Result<usize, i64> {
     match node {
         ProcNode::Pid { pid: id, file: file @ (PidFile::OomScoreAdj | PidFile::OomAdj) }
@@ -1291,6 +1326,14 @@ pub fn write(node: &ProcNode, data: &[u8]) -> Result<usize, i64> {
             oom_adj_of(*id, flags, adj)?;
             Ok(data.len())
         }
+        // (Linux's kstrtouint: decimal, octal or hexadecimal; the filter's bits kept.)
+        ProcNode::Pid { pid: id, file: PidFile::CoredumpFilter } => {
+            let data = &data[..data.len().min(NUMBER_MAX * 2)];
+            let value = fmt::parse_int(data).filter(|&v| (0..=u32::MAX as i64).contains(&v)).ok_or(EINVAL)?;
+            crate::process::coredump_filter(*id as crate::process::Pid, Some(value as u32 & elfcore::filter::MASK))?;
+            Ok(data.len())
+        }
+        ProcNode::Kernel(file) => crate::coredump::set_setting(*file, data),
         ProcNode::Vm(file) if *file != VmFile::Dir => {
             let value = fmt::parse_int(data).filter(|&v| v >= 0).ok_or(EINVAL)?;
             let r = syscall(SYS_OVERCOMMIT, [file.which(), 1, value as u64, 0, 0, 0]);

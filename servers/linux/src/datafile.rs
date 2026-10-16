@@ -71,6 +71,21 @@ pub fn prepare() -> Result<Prepared, i64> {
 
 /// `open` with its memory had (`prepare`).
 pub fn open_in(prepared: Prepared, inode: Arc<DInode>, flags: u32, path: String) -> Result<i64, i64> {
+    let Prepared(slot, room) = prepared;
+    let open = open_into(slot, inode, flags, path)?;
+    let kept = files::status_flags(flags);
+    files::install_in(room, files::new_id(), File::Data(open), kept)
+}
+
+/// An open of a resolved /data inode for the server itself, with no descriptor: a core
+/// file's (`coredump`), as Linux's filp_open.
+pub fn open_server(inode: Arc<DInode>, flags: u32, path: String) -> Result<Arc<DataOpen>, i64> {
+    let slot = crate::heap::fallible(Arc::<DataOpen>::try_new_uninit).map_err(|_| crate::heap::ENOMEM)?;
+    open_into(slot, inode, flags, path)
+}
+
+/// The open file in its memory had (`slot`).
+fn open_into(mut slot: Arc<core::mem::MaybeUninit<DataOpen>>, inode: Arc<DInode>, flags: u32, path: String) -> Result<Arc<DataOpen>, i64> {
     const ENXIO: i64 = 6;
     // A socket is connected to, not opened.
     if inode.kind == vfs::S_IFSOCK {
@@ -89,9 +104,8 @@ pub fn open_in(prepared: Prepared, inode: Arc<DInode>, flags: u32, path: String)
     if writable || flags & O_TRUNC != 0 && inode.kind == vfs::S_IFREG {
         datafs::writable()?;
     }
-    // Its memory is had (before the write access and the open count, which its drop would
-    // give back with a close event).
-    let Prepared(mut slot, room) = prepared;
+    // (Its memory is had before the write access and the open count, which its drop would
+    // give back with a close event.)
     // Not while it runs as a program (ETXTBSY).
     let write = writable && inode.kind == vfs::S_IFREG;
     if write {
@@ -113,8 +127,7 @@ pub fn open_in(prepared: Prepared, inode: Arc<DInode>, flags: u32, path: String)
         open.notify(inotify::IN_MODIFY);
     }
     open.notify(inotify::IN_OPEN);
-    let kept = files::status_flags(flags);
-    files::install_in(room, files::new_id(), File::Data(open), kept)
+    Ok(open)
 }
 
 /// The calls on an open /data file (`a1`..`a3`: the call's arguments after
@@ -393,6 +406,14 @@ impl DataOpen {
         let n = datafs::read_server(&self.inode, off, buf)?;
         self.notify(inotify::IN_ACCESS);
         Ok(n)
+    }
+
+    /// Truncates (or extends) the file to `size` (ftruncate's work; the caller opened it for
+    /// writing).
+    pub fn truncate(&self, size: u64) -> Result<(), i64> {
+        datafs::truncate(&self.inode, size)?;
+        self.notify(inotify::IN_MODIFY);
+        Ok(())
     }
 
     /// Writes the server's memory at `off` (sendfile, copy_file_range):
