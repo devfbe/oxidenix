@@ -258,13 +258,12 @@ pub fn report(id: u64, ready: i16) {
 }
 
 /// `files::sigio`: `io` happened on description `id`; with O_ASYNC on, its owner gets its
-/// signal (`signal::send_sigio`), with `urgent` (urgent data, SIGURG's companion) only an
-/// F_SETSIG signal (Linux's kill_fasync with SIGURG). The descriptor is read under the
-/// entry's lock, the owner and the signal from the watch, and the signal is sent after it:
-/// under the file's own lock perhaps (as Linux's kill_fasync), never under a watch's (the
-/// process lock comes after the files' locks, and the process code reports to the watches
-/// only after the process lock).
-pub fn sigio(id: u64, io: files::Io, urgent: bool) {
+/// signal (`signal::send_sigio`). The descriptor is read under the entry's lock, the owner
+/// and the signal from the watch, and the signal is sent after it: under the file's own
+/// lock perhaps (as Linux's kill_fasync), never under a watch's (the process lock comes
+/// after the files' locks, and the process code reports to the watches only after the
+/// process lock).
+pub fn sigio(id: u64, io: files::Io) {
     if ASYNC.load(SeqCst) == 0 {
         return;
     }
@@ -272,10 +271,24 @@ pub fn sigio(id: u64, io: files::Io, urgent: bool) {
     let Some(watch) = watch else { return };
     let fd = *watch.fasync.lock();
     if let Some(fd) = fd {
-        let signum = watch.fown.signum();
-        if !urgent || signum != 0 {
-            signal::send_sigio(watch.fown.owner(), signum, fd, io);
-        }
+        signal::send_sigio(watch.fown.owner(), watch.fown.signum(), fd, io);
+    }
+}
+
+/// `files::sigurg`: urgent data came to socket `id`: its owner, if it has one, gets SIGURG
+/// (Linux's send_sigurg), and with O_ASYNC and an F_SETSIG signal that signal with
+/// POLL_PRI as well (its kill_fasync with SIGURG, which sends no plain SIGIO).
+pub fn sigurg(id: u64) {
+    let watch = shard(id).lock().get(&id).and_then(Weak::upgrade);
+    let Some(watch) = watch else { return };
+    let owner = watch.fown.owner();
+    if owner == files::Owner::None {
+        return;
+    }
+    signal::send_owner(owner, signal::SIGURG);
+    let (fd, signum) = (*watch.fasync.lock(), watch.fown.signum());
+    if let (Some(fd), 1..) = (fd, signum) {
+        signal::send_sigio(owner, signum, fd, files::Io::Pri);
     }
 }
 

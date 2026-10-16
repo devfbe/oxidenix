@@ -767,14 +767,6 @@ pub fn send_pgrp(pgid: Pid, sig: u32) -> bool {
     post_pgrp(&mut t, pgid, SigInfo::kernel(sig))
 }
 
-/// Sends `sig` (SI_KERNEL) to thread `tid` alone (F_SETOWN_EX's
-/// F_OWNER_TID); whether it exists.
-pub fn send_tid(tid: Pid, sig: u32) -> bool {
-    let mut t = PROCS.lock();
-    let Some(pid) = t.threads.get(&tid).map(|th| th.pid) else { return false };
-    post_thread(&mut t, pid, tid, SigInfo::kernel(sig))
-}
-
 /// Sends `sig` from a terminal to process `pid`; whether it exists.
 pub fn send_process(pid: Pid, sig: u32) -> bool {
     let mut t = PROCS.lock();
@@ -794,20 +786,39 @@ const SIG_SPECIFIC_SICODES: u64 =
 /// cannot be queued (a real-time signal beyond RLIMIT_SIGPENDING, or no memory for it).
 /// Everyone is root: the permission check (Linux's sigio_perm) always passes.
 pub fn send_sigio(owner: crate::files::Owner, signum: u32, fd: i32, io: crate::files::Io) {
-    use crate::files::Owner;
     let mut t = PROCS.lock();
+    for_owner(&mut t, owner, |t, pid, thread| sigio_to(t, pid, thread, signum, fd, io));
+}
+
+/// Sends `sig` from the kernel's side (SI_KERNEL) to a file's owner (Linux's send_sigurg).
+pub fn send_owner(owner: crate::files::Owner, sig: u32) {
+    let mut t = PROCS.lock();
+    for_owner(&mut t, owner, |t, pid, thread| {
+        let _ = post(t, pid, thread, SigInfo::kernel(sig), false, false);
+    });
+}
+
+/// Calls `f` for each target of a file's owner that is still the one it names (by identity,
+/// `process::owner_of`): the thread (with its process), the process, or each live process of
+/// the group.
+fn for_owner(t: &mut Table, owner: crate::files::Owner, mut f: impl FnMut(&mut Table, Pid, Option<Pid>)) {
+    use crate::files::Owner;
     match owner {
         Owner::None => {}
-        Owner::Thread(tid) => {
-            if let Some(pid) = t.threads.get(&tid).map(|th| th.pid) {
-                sigio_to(&mut t, pid, Some(tid), signum, fd, io);
+        Owner::Thread(tid, serial) => {
+            if let Some(pid) = t.threads.get(&tid).filter(|th| th.serial == serial).map(|th| th.pid) {
+                f(t, pid, Some(tid));
             }
         }
-        Owner::Process(pid) => sigio_to(&mut t, pid, None, signum, fd, io),
-        Owner::Group(pgid) => {
+        Owner::Process(pid, serial) => {
+            if t.procs.get(&pid).is_some_and(|p| p.serial == serial) {
+                f(t, pid, None);
+            }
+        }
+        Owner::Group(pgid, serial) => {
             let mut from = 0;
-            while let Some(pid) = next_proc(&t, from, |p| p.pgid == pgid && p.zombie.is_none()) {
-                sigio_to(&mut t, pid, None, signum, fd, io);
+            while let Some(pid) = next_proc(t, from, |p| p.pgid == pgid && p.pgrp_serial == serial && p.zombie.is_none()) {
+                f(t, pid, None);
                 from = pid + 1;
             }
         }

@@ -30,6 +30,7 @@
 //! dropped after it.
 
 use crate::files::{self, FileRef, O_APPEND, O_CLOEXEC, O_NONBLOCK};
+use crate::process::OwnerKind;
 use crate::heap::{self, NoMem, TryGrow};
 use crate::sync::Mutex;
 use crate::syscall;
@@ -379,7 +380,6 @@ const F_GETOWN_EX: u64 = 16;
 const F_OWNER_TID: i32 = 0;
 const F_OWNER_PID: i32 = 1;
 const F_OWNER_PGRP: i32 = 2;
-const ESRCH: i64 = 3;
 const F_DUPFD_CLOEXEC: u64 = 1030;
 const FD_CLOEXEC: u64 = 1;
 
@@ -535,38 +535,28 @@ fn fcntl(fd: u64, cmd: u64, arg: u64) -> Result<i64, i64> {
         F_SETOWN_EX => {
             let ex: [i32; 2] = usercopy::read(arg)?;
             let id = u32::try_from(ex[1]).map_err(|_| EINVAL)?;
-            let owner = match (ex[0], id) {
-                (_, 0) if (F_OWNER_TID..=F_OWNER_PGRP).contains(&ex[0]) => files::Owner::None,
-                (F_OWNER_TID, id) => files::Owner::Thread(id),
-                (F_OWNER_PID, id) => files::Owner::Process(id),
-                (F_OWNER_PGRP, id) => files::Owner::Group(id),
+            let kind = match ex[0] {
+                F_OWNER_TID => OwnerKind::Thread,
+                F_OWNER_PID => OwnerKind::Process,
+                F_OWNER_PGRP => OwnerKind::Group,
                 _ => return Err(EINVAL),
             };
-            set_owner(&file, owner)
+            set_owner(&file, kind, id)
         }
         // Its kind, and its id while it is there (Linux's f_getown_ex).
         F_GETOWN_EX => {
             let owner = file.owner();
-            let id = |id: u32| if owner_alive(owner) { id as i32 } else { 0 };
+            let alive = crate::process::owner_exists(owner);
+            let id = |id: u32| if alive { id as i32 } else { 0 };
             let ex: [i32; 2] = match owner {
                 files::Owner::None => [F_OWNER_PID, 0],
-                files::Owner::Thread(t) => [F_OWNER_TID, id(t)],
-                files::Owner::Process(p) => [F_OWNER_PID, id(p)],
-                files::Owner::Group(g) => [F_OWNER_PGRP, id(g)],
+                files::Owner::Thread(t, _) => [F_OWNER_TID, id(t)],
+                files::Owner::Process(p, _) => [F_OWNER_PID, id(p)],
+                files::Owner::Group(g, _) => [F_OWNER_PGRP, id(g)],
             };
             usercopy::write(arg, &ex).map(|_| 0)
         }
         _ => Err(EINVAL),
-    }
-}
-
-/// Whether the owner `owner` names is there (Linux's pid_task of the owner's pid and type).
-fn owner_alive(owner: files::Owner) -> bool {
-    match owner {
-        files::Owner::None => false,
-        files::Owner::Thread(tid) => crate::process::task_exists(tid, true),
-        files::Owner::Process(pid) => crate::process::task_exists(pid, false),
-        files::Owner::Group(pgid) => crate::process::pgrp_session(pgid).is_some(),
     }
 }
 
@@ -576,36 +566,25 @@ pub fn set_owner_of(file: &FileRef, who: i32) -> Result<i64, i64> {
     if who == i32::MIN {
         return Err(EINVAL);
     }
-    let owner = match who {
-        0 => files::Owner::None,
-        w if w < 0 => files::Owner::Group(w.unsigned_abs()),
-        w => files::Owner::Process(w as u32),
-    };
-    set_owner(file, owner)
+    if who < 0 { set_owner(file, OwnerKind::Group, who.unsigned_abs()) } else { set_owner(file, OwnerKind::Process, who as u32) }
 }
 
 /// F_GETOWN's answer (FIOGETOWN's, SIOCGPGRP's): the owner's id, negative for a process
-/// group; 0 for none, or once it is gone (Linux's f_getown, by pid_task).
+/// group; 0 for none, or once it is gone (Linux's f_getown, by pid_task): a later process
+/// with its id is not it.
 pub fn owner_id(file: &FileRef) -> i64 {
     match file.owner() {
-        o if !owner_alive(o) => 0,
+        o if !crate::process::owner_exists(o) => 0,
         files::Owner::None => 0,
-        files::Owner::Group(g) => -(g as i64),
-        files::Owner::Thread(id) | files::Owner::Process(id) => id as i64,
+        files::Owner::Group(g, _) => -(g as i64),
+        files::Owner::Thread(id, _) | files::Owner::Process(id, _) => id as i64,
     }
 }
 
-/// F_SETOWN and F_SETOWN_EX: `owner` gets the file's signals if it exists
-/// (ESRCH, as Linux's f_setown).
-fn set_owner(file: &FileRef, owner: files::Owner) -> Result<i64, i64> {
-    let exists = match owner {
-        files::Owner::None => true,
-        files::Owner::Thread(id) | files::Owner::Process(id) => crate::process::exists(id),
-        files::Owner::Group(id) => crate::process::pgrp_session(id).is_some(),
-    };
-    if !exists {
-        return Err(ESRCH);
-    }
+/// F_SETOWN and F_SETOWN_EX: owner `id` of `kind` (0: nobody) gets the file's signals, held
+/// by identity (`process::owner_of`; ESRCH for an id nobody has, as Linux's f_setown).
+fn set_owner(file: &FileRef, kind: OwnerKind, id: u32) -> Result<i64, i64> {
+    let owner = if id == 0 { files::Owner::None } else { crate::process::owner_of(kind, id)? };
     file.set_owner(owner);
     Ok(0)
 }

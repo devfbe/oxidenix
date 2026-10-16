@@ -63,6 +63,20 @@ calling thread, the net thread, the service threads), which every file reports t
   `RLIMIT_SIGPENDING` (or without memory) the target gets `SIGIO` instead; a signal with
   codes of its own (`SIGCHLD`, the faults) gets `SI_SIGIO` as si_code. The permission check
   (`sigio_perm`) always passes: everyone is root.
+- **The owner is held by identity**, as Linux's f_setown holds a counted `struct pid`, not
+  by its number, which a later process may get (as the VT holds its processes, `vt.rs`):
+  every process has a serial no other process or thread gets
+  (`Proc::serial`), threads have theirs (`Thread::serial`), and a process group is
+  identified by the serial of the process that made it (`Proc::pgrp_serial`, inherited by
+  fork and copied by setpgid; the group's id is that process's pid, which no process gets
+  while the group lives). `files::Owner` keeps the id and the serial
+  (`process::owner_of`); sending (`signal::for_owner`, for SIGIO, the F_SETSIG signal and a
+  socket's SIGURG alike) and F_GETOWN/F_GETOWN_EX (`process::owner_alive`) find only that
+  identity: an owner reaped and its pid given out again gets nothing and reads as 0. An id
+  named as something it is not (a thread's id as a process) is an owner that is never there,
+  as Linux's pid_task of the wrong type; a process named as a group is the group it would
+  make (the same `struct pid` on Linux). The internet sockets keep no copy of the owner any
+  more: SIGURG goes through the description's watch (`files::sigurg`).
 - **fcntl and ioctl as Linux's**: `F_SETFL` turns `O_ASYNC` on or off only on a change, and
   only for a file with signal-driven I/O (for the others the flag stays as it is, as Linux's
   `SETFL_MASK` has no `FASYNC`; `O_ASYNC` given to open(2) is a flag without an entry);
@@ -77,8 +91,5 @@ calling thread, the net thread, the service threads), which every file reports t
 Signal-driven I/O works for every file Linux gives it to, with Linux's signals, codes and
 queueing (the test `sigiotest` runs unchanged on Linux and here). It costs nothing while no
 description has `O_ASYNC`; with one, an event costs a lookup in the watches' table and, for
-a description with the entry, the process lock. Not done: the owner is held by its number
-(as `SIGURG`'s was), not by identity as Linux's counted `struct pid`: once the owner is
-reaped and its number given out again (after the 32768 of `pid_max`), the new process would
-get the signals. `F_NOTIFY` (dnotify) and `F_SETLEASE`, which also signal the owner, and
-`POLL_MSG` (no file here sends it) are not implemented.
+a description with the entry, the process lock. Not done: `F_NOTIFY` (dnotify) and
+`F_SETLEASE`, which also signal the owner, and `POLL_MSG` (no file here sends it).

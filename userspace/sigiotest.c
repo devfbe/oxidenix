@@ -230,22 +230,33 @@ static void group_owner(void) {
     check("group owner: each process of the group gets SIGIO", got == 2);
     check("group owner: no one else", drain(SIGIO) == 0);
     check("F_GETOWN is 0 once the group is gone", fcntl(p[0], F_GETOWN) == 0);
+    write(p[1], "g", 1);
+    check("a write signals nobody once the group is gone", drain(SIGIO) == 0);
     close(p[0]);
     close(p[1]);
     close(ready[0]);
     close(ready[1]);
 
+    /* An owner process reaped: its pid names nobody for the file any more (Linux holds the
+     * owner's struct pid; a process given the pid again would not be it). */
+    pipe2(p, O_NONBLOCK);
     pid_t k = fork();
     if (k == 0) {
         pause();
         _exit(0);
     }
-    fcntl(ready[0] = eventfd(0, 0), F_SETOWN, k);
-    check("F_GETOWN of a process", fcntl(ready[0], F_GETOWN) == k);
+    fcntl(p[0], F_SETOWN, k);
+    fcntl(p[0], F_SETFL, fcntl(p[0], F_GETFL) | O_ASYNC);
+    check("F_GETOWN of a process", fcntl(p[0], F_GETOWN) == k);
     kill(k, SIGKILL);
     waitpid(k, NULL, 0);
-    check("F_GETOWN is 0 once it is reaped", fcntl(ready[0], F_GETOWN) == 0);
-    close(ready[0]);
+    check("F_GETOWN is 0 once it is reaped", fcntl(p[0], F_GETOWN) == 0);
+    struct f_owner_ex gone;
+    check("F_GETOWN_EX: its kind, id 0", fcntl(p[0], F_GETOWN_EX, &gone) == 0 && gone.type == F_OWNER_PID && gone.pid == 0);
+    write(p[1], "k", 1);
+    check("a write signals nobody once the owner is reaped", drain(SIGIO) == 0);
+    close(p[0]);
+    close(p[1]);
 }
 
 static void socket_pairs(void) {

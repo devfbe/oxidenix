@@ -174,9 +174,8 @@ pub struct InetSock {
     /// The next socket of its thread's list of lingering closes
     /// (`closed`, `run_deferred`): a reference of the list's.
     deferred_next: core::sync::atomic::AtomicPtr<InetSock>,
-    /// Who gets SIGURG (F_SETOWN, `files::Owner` encoded: its description's
-    /// copy), and the count of netd's urgent pointers it was sent for.
-    owner: AtomicU64,
+    /// The count of netd's urgent pointers SIGURG was sent for (to the description's
+    /// owner, `files::sigurg`).
     urg_signalled: core::sync::atomic::AtomicU16,
     /// TCP receives sleeping for data (Linux's SOCKWQ_ASYNC_WAITDATA, set by sk_wait_data):
     /// while there are any, new data signals no O_ASYNC owner.
@@ -224,7 +223,6 @@ impl InetSock {
             rlock: crate::sync::SleepLock::new(()),
             wlock: crate::sync::SleepLock::new(()),
             deferred_next: core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()),
-            owner: AtomicU64::new(0),
             urg_signalled: core::sync::atomic::AtomicU16::new(0),
             waitdata: core::sync::atomic::AtomicU32::new(0),
             nospace: core::sync::atomic::AtomicBool::new(false),
@@ -354,11 +352,6 @@ impl InetSock {
     fn urgent_byte(&self, l: &Local, snap: &Snap) -> Option<u8> {
         let current = snap.urg.count == l.urg.seen && l.urg.mark.is_some() && !l.urg.read;
         snap.urg.byte.filter(|_| current)
-    }
-
-    /// F_SETOWN (`files::Description::set_owner`): who gets SIGURG.
-    pub fn set_owner(&self, owner: files::Owner) {
-        self.owner.store(owner.encode(), SeqCst);
     }
 
     /// The pending error, if any (taken with `take`).
@@ -574,11 +567,7 @@ impl InetSock {
         // the pointer arrives, before its byte perhaps), and with O_ASYNC an F_SETSIG
         // signal with POLL_PRI.
         if self.urg_signalled.swap(snap.urg.count, SeqCst) != snap.urg.count {
-            let owner = files::Owner::decode(self.owner.load(SeqCst));
-            if owner != files::Owner::None {
-                owner.signal(crate::signal::SIGURG);
-                files::sigio_urgent(id);
-            }
+            files::sigurg(id);
         }
         if self.net.is_dead() {
             // Waiters sleep on the dead channel's memory: they wake, as

@@ -1335,7 +1335,10 @@ the server's own tmpfs and removed all of it: every file a program opens is the 
   description in the instance has O_ASYNC, and sends after the entry's lock
   (`signal::send_sigio`): SIGIO, or the F_SETSIG signal with si_code, si_band and si_fd,
   SIGIO again when that real-time signal cannot be queued; to a thread, a process or each
-  process of a group. The process lock comes after every file's lock.
+  process of a group, held by identity (`files::Owner`: the id and the thread's, process's
+  or group maker's serial, Linux's counted `struct pid`), so an owner reaped and its pid
+  given out again gets nothing (a socket's SIGURG goes the same way, `files::sigurg`). The
+  process lock comes after every file's lock.
 
 ### epoll
 
