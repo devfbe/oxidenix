@@ -29,10 +29,10 @@ module comment, and the public types it defines. Where to start for common tasks
 - `kernel/src/interrupts/mod.rs` (76) Interrupt setup: the IDT, the interrupt controllers (local and I/O APIC from ACPI, the 8259 PICs masked) and the per-CPU setup of the other CPUs.
 - `kernel/src/klog.rs` (298) The kernel's log: a ring of records (Linux's printk buffer) that `printk`, the Linux servers' messages and the native servers' output go to, read by the Linux server for `syslog(2)` and `/dev/kmsg` (`dmesg`). Types: `Escaped`, `RateLimit`.
 - `kernel/src/main.rs` (173) The kernel's entry point: `kernel_main` takes the boot information from the bootloader (UEFI or BIOS) and brings up the console, interrupts, memory, ACPI, time, the boot image, processes, the other CPUs and the...
-- `kernel/src/memory/frame.rs` (197) The physical frame allocator: fresh frames from the bootloader's usable regions, freed ones on an intrusive free list, with reference counts for shared and copy-on-write frames and the memory group each frame is... Types: `PhysFrameAllocator`, `UserFrames`.
+- `kernel/src/memory/frame.rs` (203) The physical frame allocator: fresh frames from the bootloader's usable regions, freed ones on an intrusive free list, with reference counts for shared and copy-on-write frames and the memory group each frame is... Types: `PhysFrameAllocator`, `UserFrames`.
 - `kernel/src/memory/kstack.rs` (133) Kernel stacks. Types: `KernelStack`.
 - `kernel/src/memory/memcg.rs` (369) Memory groups: one per process tree (ADR 0024), Linux's cgroup v2 memory controller with one group per container (the tree's instance holds it; its processes and threads name it, `ThreadGroup::memcg`). Types: `Event`, `Limits`, `MemCg`, `Target`, `Charging`, `Path`.
-- `kernel/src/memory/mod.rs` (685) Kernel memory: the frame allocator, the kernel heap (slab size classes over a first-fit heap), mappings of physical memory, the commit and page-cache accounting with the overcommit policy, the process trees' memory... Types: `Caching`, `Scope`, `Reclaimed`, `Stats`.
+- `kernel/src/memory/mod.rs` (684) Kernel memory: the frame allocator, the kernel heap (slab size classes over a first-fit heap), mappings of physical memory, the commit and page-cache accounting with the overcommit policy, the process trees' memory... Types: `Caching`, `Scope`, `Reclaimed`, `Stats`.
 - `kernel/src/memory/oom.rs` (374) The out-of-memory killer (Linux's mm/oom_kill.c): when memory cannot be had after reclaim stopped making progress, it ends the process whose end gives back the most (its badness) with SIGKILL and has its private...
 - `kernel/src/process/address_space.rs` (1536) A process's virtual memory: its page tables and the areas (VMAs) that say what each address range is. Types: `Prot`, `Backing`, `Vma`, `MemStats`, `Fault`, `Access`, `AddressSpace`, `Mm`.
 - `kernel/src/process/channel.rs` (795) Channels: the kernel's part of the data plane between the Linux server and the device servers (docs/design/io-rings.md, ADR 0005). Types: `Channel`, `Grant`, `DmaDomain`, `ClientEnd`.
@@ -271,6 +271,7 @@ module comment, and the public types it defines. Where to start for common tasks
 ## Scripts
 
 - `scripts/bench.sh` (75) Runs the I/O benchmarks (userspace/iobench.c) in oxidenix under QEMU/KVM with the fixed configuration of the builder (q35, 4 CPUs, 256 MiB, virtio-blk, virtio-net, user networking) on a fresh data disk, and writes...
+- `scripts/bigmem.sh` (4) Guest script (OXIDENIX_AUTORUN) for a boot with much more memory than the self-tests' 256 MiB (CI: `-m 12G`): the kernel's boot-time tables sized by the memory map (the frame table) must not depend on the initial...
 - `scripts/codemap.py` (157) Generates docs/codemap.md: every source file with its size and the first sentence of its module comment, the public types of each Rust file, the kernel ABI of the Linux server (crates/restricted) with the file that...
 - `scripts/linux-guest.nix` (52) A minimal Linux guest for comparing benchmarks (scripts/bench-linux.sh): the nixpkgs kernel and an initrd with BusyBox, the virtio and ext2 modules and the same static iobench, whose init mounts the data disk at...
 

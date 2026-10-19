@@ -123,9 +123,24 @@ jobs:
       - name: Check the ext2 disk written by oxidenix
         run: nix-shell -p e2fsprogs --run "e2fsck -fn target/test-disk.img"
 
+      - name: Boot with 12 GiB of memory
+        working-directory: kernel
+        shell: bash
+        run: |
+          set +e
+          # Absolute: the builder resolves the paths in a directory of its own.
+          OXIDENIX_AUTORUN="$GITHUB_WORKSPACE/scripts/bigmem.sh" OXIDENIX_DISK="$GITHUB_WORKSPACE/target/bigmem-disk.img" \
+            timeout 600 cargo run -- -m 12G < /dev/null 2>&1 | tee ../bigmem.log
+          code=${PIPESTATUS[0]}
+          set -e
+          echo "QEMU exit code: $code"
+          test "$code" -eq 1
+
       - name: Upload the serial log
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: qemu-log-${{ matrix.firmware }}
-          path: qemu.log
+          path: |
+            qemu.log
+            bigmem.log

@@ -3,8 +3,6 @@
 //! the memory group each frame is charged to (ADR 0024).
 
 use super::memcg;
-use alloc::vec;
-use alloc::vec::Vec;
 use bootloader_api::info::{MemoryRegion, MemoryRegionKind};
 use x86_64::structures::paging::{FrameAllocator, FrameDeallocator, PhysFrame, Size4KiB};
 use x86_64::{PhysAddr, VirtAddr};
@@ -16,40 +14,70 @@ pub const KERNEL_RESERVE_FRAMES: u64 = 4096;
 /// Hands out fresh frames from the usable regions first; freed frames go to
 /// a free list whose `next` pointer is stored in the frame itself.
 ///
-/// Once `enable_refcounts` ran, every frame carries a reference count so that
-/// copy-on-write pages can be shared; `deallocate_frame` drops one reference.
-/// It also carries the memory group it is charged to (`memcg`; the root for
-/// none): set when it is allocated for a group (`UserFrames`, `charge`),
-/// uncharged when its last reference goes.
+/// Every frame carries a reference count so that copy-on-write pages can be
+/// shared; `deallocate_frame` drops one reference. It also carries the
+/// memory group it is charged to (`memcg`; the root for none): set when it is
+/// allocated for a group (`UserFrames`, `charge`), uncharged when its last
+/// reference goes.
+///
+/// Both live in the frame table, physical memory the allocator reserves for
+/// itself at boot (as Linux's `mem_map`), not on the kernel heap: it is sized
+/// by the highest usable address (6 bytes per frame: 55 MiB on a machine with
+/// 32 GiB whose memory reaches up to 37 GiB), more than the initial heap
+/// holds, and the heap can grow only once the allocator exists.
 pub struct PhysFrameAllocator {
     regions: &'static [MemoryRegion],
     region_idx: usize,
     next: u64,
     free_head: u64,
     phys_offset: VirtAddr,
-    refs: Vec<u32>,
-    owners: Vec<memcg::Id>,
+    /// The frame table's physical range, which fresh frames skip.
+    table: core::ops::Range<u64>,
+    refs: &'static mut [u32],
+    owners: &'static mut [memcg::Id],
     pub total_frames: u64,
     pub used_frames: u64,
 }
 
 impl PhysFrameAllocator {
     pub fn new(regions: &'static [MemoryRegion], phys_offset: VirtAddr) -> Self {
-        let total_frames = regions
-            .iter()
-            .filter(|r| r.kind == MemoryRegionKind::Usable)
-            .map(|r| (align_down(r.end) - align_up(r.start)) / FRAME_SIZE)
-            .sum();
+        let usable = || regions.iter().filter(|r| r.kind == MemoryRegionKind::Usable);
+        let total_frames = usable().map(|r| (align_down(r.end) - align_up(r.start)) / FRAME_SIZE).sum();
+        let slots = usable().map(|r| align_down(r.end)).max().unwrap_or(0) / FRAME_SIZE;
+        let refs_len = slots * core::mem::size_of::<u32>() as u64;
+        let len = align_up(refs_len + slots * core::mem::size_of::<memcg::Id>() as u64);
+        // At the end of the highest region it fits in, which leaves low
+        // memory (the APs' start-up page below 1 MiB, DMA) alone.
+        let table_start = usable()
+            .filter(|r| align_down(r.end) >= len && align_down(r.end) - len >= align_up(r.start).max(FRAME_SIZE))
+            .map(|r| align_down(r.end) - len)
+            .max()
+            .unwrap_or_else(|| panic!("no usable memory region holds the frame table ({} bytes)", len));
+        // Zeroed: no references, every frame the root's.
+        const _: () = assert!(memcg::ROOT == 0);
+        let table = (phys_offset + table_start).as_mut_ptr::<u8>();
+        unsafe { core::ptr::write_bytes(table, 0, len as usize) };
+        // SAFETY: the range is usable RAM that no frame is handed out of
+        // (`next_fresh` skips it), mapped at `phys_offset`, and both slices
+        // are aligned (the table starts on a page, `refs_len` is a multiple
+        // of 4) and disjoint.
+        let (refs, owners) = unsafe {
+            (
+                core::slice::from_raw_parts_mut(table.cast::<u32>(), slots as usize),
+                core::slice::from_raw_parts_mut(table.add(refs_len as usize).cast::<memcg::Id>(), slots as usize),
+            )
+        };
         PhysFrameAllocator {
             regions,
             region_idx: 0,
             next: 0,
             free_head: 0,
             phys_offset,
-            refs: Vec::new(),
-            owners: Vec::new(),
+            table: table_start..table_start + len,
+            refs,
+            owners,
             total_frames,
-            used_frames: 0,
+            used_frames: len / FRAME_SIZE,
         }
     }
 
@@ -58,7 +86,10 @@ impl PhysFrameAllocator {
             if region.kind == MemoryRegionKind::Usable {
                 // Frame 0 stays reserved because 0 marks the end of the free list.
                 let start = align_up(region.start).max(FRAME_SIZE);
-                let addr = self.next.max(start);
+                let mut addr = self.next.max(start);
+                if self.table.contains(&addr) {
+                    addr = self.table.end;
+                }
                 if addr + FRAME_SIZE <= align_down(region.end) {
                     self.next = addr + FRAME_SIZE;
                     return Some(addr);
@@ -71,20 +102,6 @@ impl PhysFrameAllocator {
 
     fn slot(&self, frame_addr: u64) -> *mut u64 {
         (self.phys_offset + frame_addr).as_mut_ptr()
-    }
-
-    /// Needs the heap, so it runs after the heap has been mapped. Frames
-    /// handed out before keep a count of 0 and are never freed.
-    pub fn enable_refcounts(&mut self) {
-        let max = self
-            .regions
-            .iter()
-            .filter(|r| r.kind == MemoryRegionKind::Usable)
-            .map(|r| align_down(r.end))
-            .max()
-            .unwrap_or(0);
-        self.refs = vec![0; (max / FRAME_SIZE) as usize];
-        self.owners = vec![memcg::ROOT; (max / FRAME_SIZE) as usize];
     }
 
     fn index(frame: PhysFrame) -> usize {

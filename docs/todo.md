@@ -104,11 +104,17 @@ PS/2 keyboard behind the embedded controller, Samsung NVMe, Intel Wi-Fi 7, xHCI 
    port is detected, and boot and panic messages reach the framebuffer (a panic takes over the
    console's lock). All of it is tested in QEMU (KVM and emulation, xAPIC and x2APIC, x2APIC
    from OVMF, HPET, PM timer, PIT, kvmclock). What is left needs the machine:
-   - Secure Boot off in the firmware setup (the image is unsigned).
-   - The UEFI image (`cd kernel && OXIDENIX_BUILD_ONLY=1 cargo run`, then
-     `target/x86_64-unknown-none/debug/oxidenix.img`) written to a stick
-     (`dd if=... of=/dev/sdX bs=4M conv=fsync`), booted from the firmware's boot menu (F12 on
-     the Framework).
+   - Booted from the machine's own ESP: `just install` (`scripts/efi-install.sh`: a
+     systemd-boot entry for the next boot only, the loader signed with sbctl's keys where
+     Secure Boot has them; `just uninstall` afterwards, since the signed loader loads the
+     kernel and the initramfs unverified). Or the UEFI image
+     (`target/x86_64-unknown-none/debug/oxidenix.img`) written to a stick
+     (`dd if=... of=/dev/sdX bs=4M conv=fsync`) with Secure Boot off, booted from the
+     firmware's boot menu (F12 on the Framework).
+   - The first boot on the Framework (2026-10-19, 32 GiB) ended in a panic right after the
+     first line: the frame table (reference counts and memory groups per frame) came from the
+     initial 8 MiB heap, which a memory map up to 37 GiB outgrows. It is the allocator's own
+     memory now, and CI boots with 12 GiB (`scripts/bigmem.sh`).
    - Check on the screen: `[apic]` and `[time] clock source` lines, `[smp] 16 of 16 CPUs`
      (12 cores, 16 threads; `smp::MAX_CPUS` is 16), the keyboard at the shell. A hang before
      the first line or a panic photographed is the report to bring back. Untested in QEMU and

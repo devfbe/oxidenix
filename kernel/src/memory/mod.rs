@@ -201,7 +201,6 @@ pub fn init(regions: &'static [MemoryRegion], phys_offset: u64) {
     map_heap(HEAP_START, HEAP_INITIAL, &mut frames).expect("cannot map the initial kernel heap");
     kstack::init(Cr3::read().0, &mut frames);
     unsafe { HEAP.0.lock().init(HEAP_START as *mut u8, HEAP_INITIAL as usize) };
-    frames.enable_refcounts();
     USER_PAGES.store(
         frames.free_frames().saturating_sub(frame::KERNEL_RESERVE_FRAMES),
         core::sync::atomic::Ordering::Relaxed,
