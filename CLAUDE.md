@@ -72,6 +72,13 @@ An AI research project; see README.md.
   boots a BIOS image instead. CI runs the self-tests with both.
 - `cd kernel && OXIDENIX_BUILD_ONLY=1 cargo run` builds the boot image and data disk without
   starting QEMU.
+- `just install` (`scripts/efi-install.sh`, asks before it touches anything) puts the UEFI
+  image on this machine's ESP as a systemd-boot entry for the next boot only, signed with
+  sbctl's keys if Secure Boot has them; `just uninstall` removes it again (the signed loader
+  loads kernel and initramfs unverified: never leave it installed).
+- CI also boots with 12 GiB of memory into `scripts/bigmem.sh` (boot-time tables sized by the
+  memory map must not depend on the initial heap); locally with absolute paths:
+  `OXIDENIX_AUTORUN=$PWD/../scripts/bigmem.sh OXIDENIX_DISK=<scratch> cargo run -- -m 12G`.
 - The data disk `disk.img` (2 GiB ext2, sparse) is created only when missing; delete it for a
   fresh one. `OXIDENIX_NODE=1` puts a static Node.js (`userspace/node`, about an hour to
   build the first time) on it as `/data/bin/node` (`OXIDENIX_NODE=<path>`: another static

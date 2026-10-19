@@ -157,6 +157,8 @@ to 2 GiB stays 64 MiB (the builder points it out): delete it to get the bigger o
 Extra arguments after `--` are passed to QEMU, in test mode too (say, `-cpu max,-x2apic` or
 `-machine hpet=off` for the other APIC mode and time source, ADR 0016); `OXIDENIX_ACCEL=tcg`
 emulates even where KVM is available; `OXIDENIX_BUILD_ONLY=1 cargo run` only builds the images.
+On a machine with systemd-boot, `just install` puts the UEFI image on its EFI system partition
+for the next boot only (signed with sbctl's keys under Secure Boot; `just uninstall` removes it).
 `OXIDENIX_DISK=<path>` uses another data disk image (created if missing). Test mode
 (`OXIDENIX_TEST=1`) never touches `disk.img`: it boots with a fresh 64 MiB disk of its own,
 `target/test-disk.img`, made anew on every run.
