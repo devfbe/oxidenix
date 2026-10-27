@@ -54,7 +54,7 @@
 
 use super::address_space::{Backing, Hold, Mm, Prot, PAGE};
 use super::errno::*;
-use super::{ipc, Pid, Server};
+use super::{ipc, uaccess, Pid, Server};
 use crate::fs::cache::PageCache;
 use crate::memory;
 use crate::sync::{IrqSpinLock, Mutex};
@@ -120,6 +120,9 @@ pub struct Channel {
     /// The submission ring's first page, with a reference of ours (for its
     /// `tail`, the word a service's doorbell watch compares: `watch`).
     doorbell: PhysFrame,
+    /// The completion ring's first page, likewise (for its `tail`, the word
+    /// a native client's doorbell watch compares: `client_watch`).
+    answers: PhysFrame,
     inner: IrqSpinLock<Inner>,
 }
 
@@ -137,8 +140,8 @@ struct Inner {
     /// process died: see "Successors"); counted in its `Server::bound`.
     /// Changed with `CHANNELS` held (`predecessors` counts under it).
     bound: Option<Arc<Server>>,
-    /// The instance whose end it is (told when the service dies).
-    client: Weak<super::linux::Instance>,
+    /// Whose end it is (told when the service dies).
+    client: Client,
     /// Grants by id: live ones and revoked ones still draining.
     grants: Grants,
     /// Grants being made (`grant` reserves a slot before it pins).
@@ -189,6 +192,19 @@ impl Grants {
     fn iter(&self) -> impl Iterator<Item = (u32, &Arc<Grant>)> {
         self.slots.iter().enumerate().filter_map(|(i, g)| g.as_ref().map(|g| (i as u32 + 1, g)))
     }
+}
+
+/// The owner of a channel's client end.
+#[derive(Clone)]
+enum Client {
+    /// Not made yet.
+    None,
+    /// A Linux server instance (`linux::Object::Channel`): it hears of the
+    /// service's death as an `EVENT_SERVICE_GONE`.
+    Instance(Weak<super::linux::Instance>),
+    /// A native server's process (`native_create`): its server's doorbell
+    /// rings when the service dies, and it finds `SERVICE_GONE`.
+    Native(Arc<Server>),
 }
 
 #[derive(Clone)]
@@ -299,10 +315,24 @@ impl Channel {
         let layout = Layout::with_shared(slots, shared).ok_or(EINVAL)?;
         let memory = PageCache::anonymous(layout.pages as u64).map_err(|_| ENOMEM)?;
         let header = memory.map_page(0).map_err(|_| ENOMEM)?;
+        let release = |frames: &[PhysFrame]| {
+            memory::with_frames(|f| {
+                for &frame in frames {
+                    unsafe { x86_64::structures::paging::FrameDeallocator::deallocate_frame(f, frame) };
+                }
+            })
+        };
         let doorbell = match memory.map_page((layout.submission / PAGE as usize) as u64) {
             Ok(frame) => frame,
             Err(_) => {
-                memory::with_frames(|f| unsafe { x86_64::structures::paging::FrameDeallocator::deallocate_frame(f, header) });
+                release(&[header]);
+                return Err(ENOMEM);
+            }
+        };
+        let answers = match memory.map_page((layout.completion / PAGE as usize) as u64) {
+            Ok(frame) => frame,
+            Err(_) => {
+                release(&[header, doorbell]);
                 return Err(ENOMEM);
             }
         };
@@ -316,13 +346,13 @@ impl Channel {
             client_gone: false,
             service_gone: false,
             bound: None,
-            client: Weak::new(),
+            client: Client::None,
             grants: Grants::default(),
             reserved: 0,
             pages: 0,
         };
-        // From here on, dropping the channel releases both pages.
-        let channel = Channel { id, layout, memory, header, doorbell, inner: IrqSpinLock::new(inner) };
+        // From here on, dropping the channel releases the three pages.
+        let channel = Channel { id, layout, memory, header, doorbell, answers, inner: IrqSpinLock::new(inner) };
         let channel = Arc::try_new(channel).map_err(|_| ENOMEM)?;
         let mut channels = CHANNELS.lock();
         channels.try_reserve(1).map_err(|_| ENOMEM)?;
@@ -350,6 +380,13 @@ impl Channel {
     /// doorbell with a futex wake on it).
     fn submission_tail(&self) -> &AtomicU32 {
         let at = self.doorbell.start_address().as_u64() + (self.layout.submission % PAGE as usize + ring::TAIL_OFFSET) as u64;
+        unsafe { &*(memory::phys_to_virt(at) as *const AtomicU32) }
+    }
+
+    /// The completion ring's `tail` (the service rings a native client's
+    /// doorbell with a futex wake on it).
+    fn completion_tail(&self) -> &AtomicU32 {
+        let at = self.answers.start_address().as_u64() + (self.layout.completion % PAGE as usize + ring::TAIL_OFFSET) as u64;
         unsafe { &*(memory::phys_to_virt(at) as *const AtomicU32) }
     }
 
@@ -745,8 +782,14 @@ impl Channel {
         drop(registered);
         // The client connects again (and names what it holds) without waiting for its next
         // use of the service (after `SERVICE_GONE`: it sees the channel dead).
-        if let Some(instance) = client.and_then(|c| c.upgrade()) {
-            instance.queue_event(restricted::Event { kind: restricted::EVENT_SERVICE_GONE, a: self.id, b: 0 });
+        match client {
+            Some(Client::Instance(instance)) => {
+                if let Some(instance) = instance.upgrade() {
+                    instance.queue_event(restricted::Event { kind: restricted::EVENT_SERVICE_GONE, a: self.id, b: 0 });
+                }
+            }
+            Some(Client::Native(server)) => server.ring(),
+            Some(Client::None) | None => {}
         }
     }
 }
@@ -756,6 +799,7 @@ impl Drop for Channel {
         memory::with_frames(|f| unsafe {
             x86_64::structures::paging::FrameDeallocator::deallocate_frame(f, self.header);
             x86_64::structures::paging::FrameDeallocator::deallocate_frame(f, self.doorbell);
+            x86_64::structures::paging::FrameDeallocator::deallocate_frame(f, self.answers);
         });
         let mut channels = CHANNELS.lock();
         if let Ok(i) = channels.binary_search_by_key(&self.id, |e| e.id) {
@@ -777,12 +821,24 @@ pub struct ClientEnd {
     teardown: Option<Box<WorkNode>>,
 }
 
+/// Where a client end's mapping of the channel is.
+enum Mapping {
+    /// In the region of a Linux server instance.
+    Instance(Weak<super::linux::Instance>),
+    /// In a native server's address space, `len` bytes.
+    Native(Weak<Mm>, u64),
+}
+
 impl ClientEnd {
     /// The end of `channel` mapped at `addr` of `instance`'s region; if it
     /// cannot be made, the channel's client end goes now.
     pub fn new(channel: Arc<Channel>, instance: Weak<super::linux::Instance>, addr: u64) -> Result<ClientEnd, i64> {
-        channel.inner.lock().client = instance.clone();
-        let work = Work::ClientGone { channel: channel.clone(), instance, addr };
+        channel.inner.lock().client = Client::Instance(instance.clone());
+        Self::with(channel, Mapping::Instance(instance), addr)
+    }
+
+    fn with(channel: Arc<Channel>, mapping: Mapping, addr: u64) -> Result<ClientEnd, i64> {
+        let work = Work::ClientGone { channel: channel.clone(), mapping, addr };
         match Box::<WorkNode>::try_new_uninit() {
             Ok(node) => Ok(ClientEnd { channel, teardown: Some(Box::write(node, WorkNode { work, next: None })) }),
             Err(_) => {
@@ -810,12 +866,169 @@ impl Drop for ClientEnd {
     }
 }
 
-fn client_gone(channel: &Channel, instance: &Weak<super::linux::Instance>, addr: u64) {
-    if let Some(instance) = instance.upgrade() {
-        instance.unmap_object(addr);
-        instance.channel_gone();
+fn client_gone(channel: &Channel, mapping: &Mapping, addr: u64) {
+    match mapping {
+        Mapping::Instance(instance) => {
+            if let Some(instance) = instance.upgrade() {
+                instance.unmap_object(addr);
+                instance.channel_gone();
+            }
+        }
+        Mapping::Native(mm, len) => {
+            if let Some(mm) = mm.upgrade() {
+                mm.lock().unmap(addr, *len);
+            }
+        }
     }
     channel.client_gone();
+}
+
+// ------------------------------------------------ a native server's client end
+
+/// Channels a native server's process is the client of (`native_create`),
+/// by (process, handle). The kernel's servers offer each other channels
+/// this way (usbd its network functions to netd as links): a native
+/// client is a process of the kernel's, privileged, and offers with
+/// `Offer::instance` 0.
+static NATIVE: IrqSpinLock<Vec<NativeEnd>> = IrqSpinLock::new(Vec::new());
+
+struct NativeEnd {
+    pid: Pid,
+    handle: u32,
+    end: Arc<ClientEnd>,
+}
+
+/// Most channels one native process is the client of.
+const MAX_NATIVE_ENDS: usize = 64;
+
+fn native_end(handle: u64) -> Result<Arc<ClientEnd>, i64> {
+    let me = super::current_pid();
+    NATIVE.lock().iter().find(|e| e.pid == me && e.handle as u64 == handle).map(|e| e.end.clone()).ok_or(EBADF)
+}
+
+/// chan_create(slots, &addr, shared) -> handle, for a native server: a new
+/// channel (as `restricted::SYS_CHAN_CREATE`) mapped into the caller's
+/// address space, the header read-only, the rings and the shared area
+/// read and write.
+pub fn native_create(slots: u64, addr_out: u64, shared: u64) -> Result<i64, i64> {
+    let me = super::current_pid();
+    let server = super::with_current(|p| p.server.clone()).ok_or(EPERM)?;
+    let mm = super::current_mm().ok_or(EINVAL)?;
+    {
+        let ends = NATIVE.lock();
+        if ends.iter().filter(|e| e.pid == me).count() >= MAX_NATIVE_ENDS {
+            return Err(EMFILE);
+        }
+    }
+    let channel = Channel::new(slots, shared)?;
+    let len = channel.layout.bytes() as u64;
+    let addr = {
+        let mut space = mm.lock();
+        let floor = space.brk_end;
+        let start = space.find_free(len, floor).ok_or(ENOMEM)?;
+        let header = Backing::File { cache: channel.memory.clone(), offset: 0, shared: true, may_write: false, _hold: None };
+        let rings = Backing::File { cache: channel.memory.clone(), offset: PAGE, shared: true, may_write: true, _hold: None };
+        let read = Prot { read: true, write: false, exec: false };
+        let mapped = space
+            .map(start, PAGE, read, header, false)
+            .and_then(|_| space.map(start + PAGE, len - PAGE, Prot::RW, rings, false))
+            .and_then(|_| space.populate(start, PAGE, false))
+            .and_then(|_| space.populate(start + PAGE, len - PAGE, true));
+        if mapped.is_err() {
+            space.unmap(start, len);
+            return Err(ENOMEM);
+        }
+        start
+    };
+    channel.inner.lock().client = Client::Native(server);
+    // (Undone already if the end cannot be made.)
+    let end = ClientEnd::with(channel, Mapping::Native(Arc::downgrade(&mm), len), addr)?;
+    // From here on, dropping the end undoes it all.
+    let end = Arc::try_new(end).map_err(|_| {
+        run_deferred();
+        ENOMEM
+    })?;
+    let handle = {
+        let mut ends = NATIVE.lock();
+        let handle = (1..).find(|&h| !ends.iter().any(|e| e.pid == me && e.handle == h)).expect("fewer than u32::MAX ends");
+        match ends.try_reserve(1) {
+            Ok(()) => {
+                ends.push(NativeEnd { pid: me, handle, end });
+                Ok(handle)
+            }
+            Err(_) => Err(end),
+        }
+    };
+    let handle = match handle {
+        Ok(handle) => handle,
+        Err(end) => {
+            drop(end);
+            run_deferred();
+            return Err(ENOMEM);
+        }
+    };
+    if let Err(e) = uaccess::write(addr_out, addr) {
+        let _ = native_close(handle as u64);
+        return Err(e);
+    }
+    Ok(handle as i64)
+}
+
+/// chan_connect(handle, name, len), for a native server: offers the
+/// channel to the service `name` (`Offer::instance` 0) and waits until it
+/// attached it.
+pub fn native_connect(handle: u64, name: u64, len: u64) -> Result<i64, i64> {
+    let end = native_end(handle)?;
+    if len > 64 {
+        return Err(EINVAL);
+    }
+    let name = alloc::string::String::from_utf8(uaccess::read_vec(name, len)?).map_err(|_| EINVAL)?;
+    end.channel.connect(&name, super::current_pid(), 0)?;
+    Ok(0)
+}
+
+/// handle_close(handle), for a native server: its end of the channel goes
+/// now (the service sees `CLIENT_GONE`), with its mapping.
+pub fn native_close(handle: u64) -> Result<i64, i64> {
+    let me = super::current_pid();
+    let end = {
+        let mut ends = NATIVE.lock();
+        let i = ends.iter().position(|e| e.pid == me && e.handle as u64 == handle).ok_or(EBADF)?;
+        ends.swap_remove(i).end
+    };
+    match Arc::try_unwrap(end) {
+        Ok(end) => end.close(),
+        // (A connect in flight holds it: the end goes when that returns.)
+        Err(end) => drop(end),
+    }
+    run_deferred();
+    Ok(0)
+}
+
+/// chan_client_watch(handle, value), for a native server: arms its
+/// doorbell watch on the channel's completion ring: if its `tail` still
+/// holds `value`, the service's next futex wake on it (its doorbell for
+/// the client), or the service going, makes the caller's `ipc_receive`
+/// return `ipc::DOORBELL`. One-shot, as `watch` is.
+pub fn client_watch(handle: u64, value: u64) -> Result<i64, i64> {
+    let end = native_end(handle)?;
+    let server = super::with_current(|p| p.server.clone()).ok_or(EPERM)?;
+    let value = u32::try_from(value).map_err(|_| EINVAL)?;
+    let channel = &end.channel;
+    if channel.inner.lock().service_gone {
+        return Err(EPIPE);
+    }
+    let offset = (channel.layout.completion + ring::TAIL_OFFSET) as u64;
+    super::futex::object_watch(&channel.memory, offset, channel.completion_tail(), value, &server.doorbell, super::current_pid())
+}
+
+/// The process `pid` ended or executed a new program: the channels it was
+/// the client of lose their client. (Called where the kernel may not
+/// sleep: the teardowns are deferred, with the ends' last references.)
+pub fn native_client_exited(pid: Pid) {
+    // (A dropped end only queues its teardown: `defer` takes no lock that
+    // is held while `NATIVE` is taken.)
+    NATIVE.lock().retain(|e| e.pid != pid);
 }
 
 // ------------------------------------------------------- the service's calls
@@ -1082,7 +1295,7 @@ pub fn service_exited(pid: Pid) {
 // ------------------------------------------------------- deferred teardown
 
 enum Work {
-    ClientGone { channel: Arc<Channel>, instance: Weak<super::linux::Instance>, addr: u64 },
+    ClientGone { channel: Arc<Channel>, mapping: Mapping, addr: u64 },
     /// (The registry keeps the channel until this ran.)
     ServiceGone(Weak<Channel>),
 }
@@ -1090,7 +1303,7 @@ enum Work {
 impl Work {
     fn run(&self) {
         match self {
-            Work::ClientGone { channel, instance, addr } => client_gone(channel, instance, *addr),
+            Work::ClientGone { channel, mapping, addr } => client_gone(channel, mapping, *addr),
             Work::ServiceGone(channel) => {
                 if let Some(channel) = channel.upgrade() {
                     channel.service_gone(true);

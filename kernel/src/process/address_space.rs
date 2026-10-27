@@ -86,6 +86,9 @@ const CHARGED: PageTableFlags = PageTableFlags::BIT_11;
 const ANON: PageTableFlags = PageTableFlags::BIT_52;
 /// A page of a memory-only file (Linux's MM_SHMEMPAGES).
 const SHMEM: PageTableFlags = PageTableFlags::BIT_53;
+/// A device's registers (`Backing::Mmio`): the frame is no RAM, never
+/// referenced or freed.
+const MMIO: PageTableFlags = PageTableFlags::BIT_54;
 /// The bits an entry keeps whatever its rights become.
 const KEPT: PageTableFlags = CHARGED.union(ANON).union(SHMEM);
 
@@ -169,6 +172,11 @@ pub enum Backing {
     File { cache: Arc<PageCache>, offset: u64, shared: bool, may_write: bool, _hold: Option<Hold> },
     /// Device memory, mapped up front (DMA areas).
     Device,
+    /// A device's registers (a server's PCI memory BAR, `map_mmio`):
+    /// uncached, mapped up front, no RAM (nothing counted or freed), never
+    /// moved (mremap), made accessible otherwise (mprotect) or inherited by
+    /// fork.
+    Mmio,
     /// Pages granted to a channel's service (`channel`), mapped up front
     /// and owned by `grant`, which the kernel finds them by when it takes
     /// them back. Read-only unless `writable`, never executable, never
@@ -191,7 +199,7 @@ impl Backing {
 
     /// Shared memory (or device memory): never copied on write or fork.
     pub fn shared(&self) -> bool {
-        matches!(self, Backing::File { shared: true, .. } | Backing::Device | Backing::Granted { .. } | Backing::Revoked { .. })
+        matches!(self, Backing::File { shared: true, .. } | Backing::Device | Backing::Mmio | Backing::Granted { .. } | Backing::Revoked { .. })
     }
 
     /// Whether this is the grant `grant`'s mapping.
@@ -694,8 +702,15 @@ impl<'a> Gather<'a> {
         self.end = self.end.max(va + PAGE);
     }
 
+    /// An entry without a frame to free (`MMIO`) went: its page is shot
+    /// down with the others.
+    fn cover(&mut self, va: u64) {
+        self.start = self.start.min(va);
+        self.end = self.end.max(va + PAGE);
+    }
+
     fn finish(&mut self) {
-        if self.frames.is_empty() {
+        if self.frames.is_empty() && self.start >= self.end {
             return;
         }
         tlb::shootdown(self.tlb, self.start, self.end);
@@ -943,6 +958,12 @@ impl AddressSpace {
         let mut gather = Gather::new(&self.tlb);
         let (mut freed, mut charged) = (Kinds::default(), 0u64);
         for_each_leaf(self.l4, start, end, |va, e| {
+            if e.flags().contains(MMIO) {
+                // No frame to free: the TLBs only.
+                e.set_unused();
+                gather.cover(va);
+                return;
+            }
             let frame = PhysFrame::containing_address(e.addr());
             charged += e.flags().contains(CHARGED) as u64;
             freed.add(e.flags());
@@ -983,6 +1004,10 @@ impl AddressSpace {
                 }
             }
             if matches!(v.backing, Backing::Revoked { .. }) && (prot.read || prot.write || prot.exec) {
+                return Err(Fault::Access);
+            }
+            // (Its entries carry the caching bits the rights would lose.)
+            if matches!(v.backing, Backing::Mmio) && prot != v.prot {
                 return Err(Fault::Access);
             }
             at = v.end;
@@ -1061,7 +1086,7 @@ impl AddressSpace {
     pub fn remap(&mut self, old: u64, old_len: u64, new_len: u64, may_move: bool, fixed: Option<u64>, floor: u64) -> Result<u64, Fault> {
         let v = self.vma(old).cloned().ok_or(Fault::Segv)?;
         let old_end = old.checked_add(old_len).ok_or(Fault::Segv)?;
-        if old_end > v.end || matches!(v.backing, Backing::Device | Backing::Granted { .. } | Backing::Revoked { .. }) {
+        if old_end > v.end || matches!(v.backing, Backing::Device | Backing::Mmio | Backing::Granted { .. } | Backing::Revoked { .. }) {
             return Err(Fault::Segv);
         }
         if new_len <= old_len && fixed.is_none() {
@@ -1242,7 +1267,7 @@ impl AddressSpace {
     fn new_frame(&mut self, page: u64, v: &Vma, access: Access, wait: bool) -> Result<(PhysFrame, bool), Fault> {
         match &v.backing {
             Backing::Anon => Ok((zeroed_frame().map_err(|e| self.no_frame(e))?, true)),
-            Backing::Device | Backing::Granted { .. } | Backing::Revoked { .. } => Err(Fault::Segv),
+            Backing::Device | Backing::Mmio | Backing::Granted { .. } | Backing::Revoked { .. } => Err(Fault::Segv),
             Backing::File { cache, offset, shared, .. } => {
                 // Reading a missing page may sleep (a remote file): only the
                 // address space is locked. A pager's page is waited for
@@ -1615,6 +1640,39 @@ impl AddressSpace {
         Ok(())
     }
 
+    /// Maps `pages` pages of device registers from `phys` at `start`,
+    /// uncached, read and write, never executable (`Backing::Mmio`): no
+    /// frame is referenced (they are no RAM). Nothing is mapped on failure.
+    pub fn map_mmio(&mut self, start: u64, phys: u64, pages: u64) -> Result<(), Fault> {
+        let len = pages.checked_mul(PAGE).ok_or(Fault::Segv)?;
+        if len == 0 || start % PAGE != 0 || phys % PAGE != 0 || start.checked_add(len).is_none_or(|e| e > USER_END) || self.overlaps(start, start + len) {
+            return Err(Fault::Segv);
+        }
+        let prot = Prot::RW;
+        self.insert(Vma { start, end: start + len, prot, backing: Backing::Mmio, charged: false, noreserve: false, stack_limit: 0 });
+        // Strong uncacheable (PAT entry 3 with PCD and PWT): every access
+        // reaches the device in program order.
+        let flags = prot.flags() | PageTableFlags::NO_CACHE | PageTableFlags::WRITE_THROUGH | PageTableFlags::NO_EXECUTE | MMIO;
+        for i in 0..pages {
+            let page = Page::<Size4KiB>::containing_address(VirtAddr::new(start + i * PAGE));
+            let frame = PhysFrame::containing_address(PhysAddr::new(phys + i * PAGE));
+            let mut mapper = self.mapper();
+            let parent = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::USER_ACCESSIBLE;
+            let (mapped, tables) = memory::with_frames(|frames| {
+                let mut tables = Tables::new(frames);
+                let mapped = unsafe { mapper.map_to_with_table_flags(page, frame, flags, parent, &mut tables) }.map(|f| f.ignore()).is_ok();
+                (mapped, tables.made)
+            });
+            self.stats.table_pages.fetch_add(tables, Ordering::Relaxed);
+            if !mapped {
+                self.unmap(start, len);
+                return Err(self.no_frame(Fault::Oom));
+            }
+            self.sync_views(start + i * PAGE..start + (i + 1) * PAGE);
+        }
+        Ok(())
+    }
+
     /// Maps `frames` (pinned by `grant`) at `start` (see
     /// `Backing::Granted`); each entry holds a reference on its frame.
     /// Nothing is mapped on failure.
@@ -1733,7 +1791,7 @@ impl AddressSpace {
             return Err(Fault::Segv);
         }
         let v = self.vma(page).cloned().ok_or(Fault::Segv)?;
-        if v.prot.none() || matches!(v.backing, Backing::Device | Backing::Granted { .. } | Backing::Revoked { .. }) {
+        if v.prot.none() || matches!(v.backing, Backing::Device | Backing::Mmio | Backing::Granted { .. } | Backing::Revoked { .. }) {
             return Err(Fault::Segv);
         }
         if write {
@@ -1961,11 +2019,12 @@ impl AddressSpace {
         if !memory::commit(charged) {
             return Err(Fault::Oom);
         }
-        // Granted pages are the service's alone: a child does not get them.
+        // Granted pages are the service's alone, a device's registers its
+        // driver's: a child gets neither.
         let vmas: BTreeMap<u64, Vma> = parent
             .vmas
             .iter()
-            .filter(|(_, v)| !matches!(v.backing, Backing::Granted { .. } | Backing::Revoked { .. }))
+            .filter(|(_, v)| !matches!(v.backing, Backing::Granted { .. } | Backing::Revoked { .. } | Backing::Mmio))
             .map(|(&k, v)| (k, v.clone()))
             .collect();
         for (cache, _) in vmas.values().filter_map(Vma::file) {
@@ -1996,7 +2055,7 @@ impl AddressSpace {
                         for (i1, leaf) in l1.iter_mut().enumerate().filter(|(_, e)| !e.is_unused()) {
                             let va = (i4 as u64) << 39 | (i3 as u64) << 30 | (i2 as u64) << 21 | (i1 as u64) << 12;
                             let area = vmas.range(..=va).next_back().map(|(_, v)| v).filter(|v| va < v.end);
-                            if area.is_some_and(|v| matches!(v.backing, Backing::Granted { .. })) {
+                            if area.is_some_and(|v| matches!(v.backing, Backing::Granted { .. } | Backing::Mmio)) {
                                 continue;
                             }
                             let shared = area.is_some_and(|v| v.backing.shared());

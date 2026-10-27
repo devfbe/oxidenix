@@ -36,6 +36,10 @@ const CHAN_WATCH: u64 = 1073;
 const SET_COPY_FIXUP: u64 = 1074;
 const GRANT_DMA_PAGES: u64 = 1075;
 const CHAN_PREDECESSORS: u64 = 1086;
+/// `mmio_map(bar, &len) -> addr`: a memory BAR of the server's device.
+const MMIO_MAP: u64 = 1200;
+/// `chan_client_watch(handle, value)`: the client's doorbell watch.
+const CHAN_CLIENT_WATCH: u64 = 1201;
 /// Bytes of randomness one `SYS_RANDOM` gives at most.
 const RANDOM_MAX: usize = 256;
 
@@ -68,6 +72,12 @@ pub fn dispatch(f: &mut Frame) {
         SET_COPY_FIXUP => super::channel::set_copy_fixup(a0, a1),
         GRANT_DMA_PAGES => super::channel::grant_dma_pages(a0, a1, a2, a3, a4),
         CHAN_PREDECESSORS => super::channel::predecessors(),
+        MMIO_MAP => super::mmio_map(a0, a1),
+        // The client's end of a channel to another server.
+        SYS_CHAN_CREATE => super::channel::native_create(a0, a1, a2),
+        SYS_CHAN_CONNECT => super::channel::native_connect(a0, a1, a2),
+        SYS_HANDLE_CLOSE => super::channel::native_close(a0),
+        CHAN_CLIENT_WATCH => super::channel::client_watch(a0, a1),
         SYS_MO_MAP => map(a0, a1, a2, a3, a4, a5),
         SYS_MO_UNMAP => vm::unmap(a0, a1),
         SYS_MO_PROTECT => vm::protect(a0, a1, a2),

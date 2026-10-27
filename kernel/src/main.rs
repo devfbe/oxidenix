@@ -95,6 +95,8 @@ fn start_servers() {
     }
     start_diskfs();
     start_netd();
+    // (After netd: the network functions on USB are links of netd's.)
+    start_usbd();
     start_procfs();
     if TEST_MODE.load(core::sync::atomic::Ordering::Relaxed) {
         start_ringtest();
@@ -190,6 +192,71 @@ fn start_netd() {
     if let Err(e) = Arc::new(server).start() {
         printkln!("[boot] netd did not start (errno {}); networking is off", e);
     }
+}
+
+/// DMA memory for each usbd: the xHCI controller's tables and rings, the
+/// devices' contexts and transfer rings, and the transfers' buffers (see
+/// servers/usbd/src/dma.rs).
+const USBD_DMA_PAGES: u64 = 1024;
+
+/// Hands every xHCI controller (PCI class 0x0c, subclass 0x03,
+/// programming interface 0x30) to a usbd of its own ("usb0", "usb1", ...),
+/// which drives it and the devices behind it and offers the network
+/// functions it finds (USB tethering) to netd as links. The controller's
+/// registers are its memory BAR 0; its interrupt a message-signalled
+/// vector where the controller has MSI or MSI-X, else its legacy line.
+fn start_usbd() {
+    for (n, hc) in drivers::pci::find_class(0x0c, 0x03, 0x30).into_iter().enumerate() {
+        let Some(bar) = hc.memory_bar(0) else {
+            printkln!("[boot] xHCI controller {:02x}:{:02x}.{} has no register BAR", hc.bus, hc.slot, hc.func);
+            continue;
+        };
+        intel_xhci_take_ports(&hc);
+        hc.enable_memory_and_dma();
+        let line = match process::irq::alloc_msi() {
+            Some((line, vector)) if hc.enable_msi(vector, interrupts::apic::bsp_id()).is_some() => Some(line),
+            // A legacy line the I/O APIC routes (0xff, or 0 from firmware
+            // that set none: no line).
+            _ => (1..16).contains(&hc.irq).then_some(hc.irq),
+        };
+        let name: &'static str = alloc::boxed::Box::leak(alloc::format!("usb{n}").into_boxed_str());
+        let server = match process::Server::load(name, "/sbin/usbd") {
+            Ok(server) => {
+                let mut server = server
+                    .mmio(0, bar)
+                    .dma(USBD_DMA_PAGES)
+                    .arg(alloc::format!("name={name}"))
+                    .arg(alloc::format!("pci={:02x}:{:02x}.{}", hc.bus, hc.slot, hc.func))
+                    .arg(alloc::format!("vendor={:#x}", hc.vendor));
+                if let Some(line) = line {
+                    server = server.irq(line).arg(alloc::format!("irq={line}"));
+                }
+                Arc::new(server)
+            }
+            Err(e) => return printkln!("[boot] cannot load /sbin/usbd (errno {})", e),
+        };
+        if let Err(e) = server.start() {
+            printkln!("[boot] {} did not start (errno {}); its USB ports are off", name, e);
+        }
+    }
+}
+
+/// Intel's 7 and 8 series chipsets (and some of their successors) route
+/// their USB ports to the EHCI controllers until the operating system
+/// switches them to the xHCI controller (Linux's
+/// `usb_enable_intel_xhci_ports`): the ports the firmware allows
+/// (USB3PRM, USB2PRM) are switched (USB3_PSSEN, XUSB2PR).
+fn intel_xhci_take_ports(hc: &drivers::pci::Device) {
+    const SWITCHABLE: [u16; 6] = [0x1e31, 0x8c31, 0x8cb1, 0x9c31, 0x9cb1, 0x8d31];
+    const USB3_PSSEN: u8 = 0xd8;
+    const USB3PRM: u8 = 0xdc;
+    const XUSB2PR: u8 = 0xd0;
+    const USB2PRM: u8 = 0xd4;
+    if hc.vendor != 0x8086 || !SWITCHABLE.contains(&hc.device) {
+        return;
+    }
+    hc.write(USB3_PSSEN, hc.read(USB3PRM));
+    hc.write(XUSB2PR, hc.read(USB2PRM));
 }
 
 /// Leaves QEMU through its isa-debug-exit device; the exit status of QEMU

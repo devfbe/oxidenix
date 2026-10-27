@@ -106,6 +106,19 @@ pub mod sys {
     /// theirs: diskfs's holds). Only falls; each fall rings the doorbell
     /// (`Event::Doorbell`).
     pub const CHAN_PREDECESSORS: u64 = 1086;
+    /// (bar, &len) -> address: maps memory BAR `bar` of the server's PCI
+    /// device (uncached, read and write) whole; stores its length at `len`.
+    /// EPERM for a BAR the kernel did not assign to the server.
+    pub const MMIO_MAP: u64 = 1200;
+
+    // The client's end of a channel to another server: `restricted::
+    // SYS_CHAN_CREATE` (slots, &addr, shared) -> handle,
+    // `SYS_CHAN_CONNECT` (handle, name, len), `SYS_HANDLE_CLOSE` (handle),
+    // on this program's own memory, and:
+
+    /// (handle, value): arms the client's doorbell watch on the channel's
+    /// completion ring (as `CHAN_WATCH` on the submission ring).
+    pub const CHAN_CLIENT_WATCH: u64 = 1201;
 }
 
 /// `ipc_register` flag: the service accepts channel offers.
@@ -206,8 +219,9 @@ pub enum Event {
     /// `ring::channel::Offer`), only to services registered with
     /// `IPC_CHANNELS`: (request id, message length).
     Control(u64, usize),
-    /// Device interrupts fired; the bit mask of the lines.
-    Interrupt(u16),
+    /// Device interrupts fired; the bit mask of the lines (0-15 legacy,
+    /// 16-31 message-signalled).
+    Interrupt(u32),
     /// A doorbell the service watches rang (`chan_watch`): which one is for
     /// the service to find out (it polls its rings).
     Doorbell,
@@ -218,7 +232,7 @@ pub enum Event {
 pub const ETIMEDOUT: i64 = 110;
 pub const EAGAIN: i64 = 11;
 /// `ipc_receive`'s result (with request id 0) for a doorbell.
-const DOORBELL: i64 = 1 << 16;
+const DOORBELL: i64 = 1 << 32;
 
 /// Waits for the next request or device interrupt, at most `timeout_ms`
 /// milliseconds (None: forever).
@@ -230,7 +244,7 @@ pub fn ipc_receive(buf: &mut [u8], timeout_ms: Option<u64>) -> Result<Event, i64
         r if r == -ETIMEDOUT => Ok(Event::Timeout),
         r if r < 0 => Err(r),
         DOORBELL if id == 0 => Ok(Event::Doorbell),
-        r if id == 0 => Ok(Event::Interrupt(r as u16)),
+        r if id == 0 => Ok(Event::Interrupt(r as u32)),
         r if id & IPC_CONTROL != 0 => Ok(Event::Control(id, r as usize)),
         r => Ok(Event::Request(id, r as usize)),
     }
@@ -259,6 +273,15 @@ pub fn dma_map() -> Result<(*mut u8, u64), i64> {
     match syscall(sys::DMA_MAP, [&mut phys as *mut u64 as u64, 0, 0, 0, 0, 0]) {
         e if e < 0 => Err(e),
         addr => Ok((addr as *mut u8, phys)),
+    }
+}
+
+/// Maps memory BAR `bar` of the server's device: (address, length).
+pub fn mmio_map(bar: u8) -> Result<(*mut u8, u64), i64> {
+    let mut len = 0u64;
+    match syscall(sys::MMIO_MAP, [bar as u64, &mut len as *mut u64 as u64, 0, 0, 0, 0]) {
+        e if e < 0 => Err(e),
+        addr => Ok((addr as *mut u8, len)),
     }
 }
 
@@ -322,6 +345,40 @@ pub fn chan_predecessors() -> Result<u64, i64> {
 /// not sleep: there is work).
 pub fn chan_watch(channel: u64, value: u32) -> Result<bool, i64> {
     match syscall(sys::CHAN_WATCH, [channel, value as u64, 0, 0, 0, 0]) {
+        0 => Ok(true),
+        e if e == -EAGAIN => Ok(false),
+        e => Err(e),
+    }
+}
+
+/// The client's end of a channel to another server (the kernel's
+/// `channel::native_create`): (handle, address of the channel's mapping:
+/// the header read-only, the rings and `shared` pages of shared area read
+/// and write).
+pub fn chan_create(slots: u32, shared: u32) -> Result<(u64, *mut u8), i64> {
+    let mut addr = 0u64;
+    let handle = result(syscall(restricted::SYS_CHAN_CREATE, [slots as u64, &mut addr as *mut u64 as u64, shared as u64, 0, 0, 0]))?;
+    Ok((handle, addr as *mut u8))
+}
+
+/// Offers the channel `handle` to the service `name` (as a native server's:
+/// `Offer::instance` 0); returns once it attached it, or with its refusal.
+pub fn chan_connect(handle: u64, name: &str) -> Result<(), i64> {
+    result(syscall(restricted::SYS_CHAN_CONNECT, [handle, name.as_ptr() as u64, name.len() as u64, 0, 0, 0])).map(|_| ())
+}
+
+/// Closes the client's end `handle`: the service sees `CLIENT_GONE`, the
+/// mapping goes.
+pub fn chan_close(handle: u64) -> Result<(), i64> {
+    result(syscall(restricted::SYS_HANDLE_CLOSE, [handle, 0, 0, 0, 0, 0])).map(|_| ())
+}
+
+/// Arms the client's doorbell watch of channel `handle` if its completion
+/// `tail` still holds `value`: the service's next wake of it (or its end
+/// going) makes `ipc_receive` return `Event::Doorbell`. Ok(true) when
+/// armed, Ok(false) when the tail moved; EPIPE once the service is gone.
+pub fn chan_client_watch(handle: u64, value: u32) -> Result<bool, i64> {
+    match syscall(sys::CHAN_CLIENT_WATCH, [handle, value as u64, 0, 0, 0, 0]) {
         0 => Ok(true),
         e if e == -EAGAIN => Ok(false),
         e => Err(e),

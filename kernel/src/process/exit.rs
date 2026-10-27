@@ -134,8 +134,10 @@ fn process_exit(group: &Arc<ThreadGroup>, status: i32) {
     }
     ipc::on_exit(pid);
     irq::on_exit(pid);
-    // Channels it served lose their service (and their clients learn it).
+    // Channels it served lose their service (and their clients learn it);
+    // those it was the client of lose their client.
     super::channel::service_exited(pid);
+    super::channel::native_client_exited(pid);
     {
         let mut info = group.info.lock();
         info.exit_status = Some(status);

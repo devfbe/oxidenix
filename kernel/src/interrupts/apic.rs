@@ -18,11 +18,14 @@ use crate::sync::IrqSpinLock;
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use x86_64::registers::model_specific::Msr;
 
-/// Vectors: the local timer, the I/O APIC lines (GSI n at IRQ_BASE + n)
-/// and the spurious vector; IPIs are in `ipi`.
+/// Vectors: the local timer, the I/O APIC lines (GSI n at IRQ_BASE + n),
+/// the devices' message-signalled interrupts (MSI_BASE + n, `MSI_COUNT` of
+/// them: `process::irq`) and the spurious vector; IPIs are in `ipi`.
 pub const TIMER_VECTOR: u8 = 0x20;
 pub const IRQ_BASE: u8 = 0x30;
 pub const GSI_COUNT: u32 = 24;
+pub const MSI_BASE: u8 = 0x60;
+pub const MSI_COUNT: u8 = 16;
 pub const SPURIOUS_VECTOR: u8 = 0xff;
 
 // Local APIC registers (byte offsets in the xAPIC's page; the x2APIC's MSR
@@ -295,6 +298,11 @@ pub fn set_masked(irq: u8, masked: bool) {
 }
 
 static BSP_APIC_ID: AtomicU32 = AtomicU32::new(0);
+
+/// The bootstrap CPU's APIC id: where device interrupts go.
+pub fn bsp_id() -> u32 {
+    BSP_APIC_ID.load(Ordering::Relaxed)
+}
 
 /// Chooses the local APIC's mode and switches the bootstrap CPU from the
 /// PICs to the APICs. Every I/O APIC pin starts masked; `route_isa` opens

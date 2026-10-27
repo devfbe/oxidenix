@@ -157,7 +157,8 @@ pub fn receive(buf: u64, len: u64, id_out: u64, timeout_ms: i64) -> SysResult {
 }
 
 /// `ipc_receive`'s result (with request id 0) for a doorbell that rang.
-pub const DOORBELL: i64 = 1 << 16;
+/// (Above every line's bit: lines are 0-31, `irq`.)
+pub const DOORBELL: i64 = 1 << 32;
 
 fn receive_loop(buf: u64, len: u64, id_out: u64, deadline: Option<u64>) -> SysResult {
     let me = super::current_pid();

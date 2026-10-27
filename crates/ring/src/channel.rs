@@ -157,10 +157,11 @@ pub struct Offer {
     /// The process (pid) whose server instance connects, for the service's
     /// diagnostics.
     pub client: u64,
-    /// The Linux server instance that connects (never 0), as the kernel
-    /// knows it: a service accounts what it gives the instance's channels
-    /// together (an instance may connect several), and tells instances
-    /// apart (netd's ports).
+    /// The Linux server instance that connects, as the kernel knows it: a
+    /// service accounts what it gives the instance's channels together (an
+    /// instance may connect several), and tells instances apart (netd's
+    /// ports). 0: the client is a native server of the kernel's (usbd
+    /// offering a link to netd), never a Linux server instance.
     pub instance: u64,
 }
 
@@ -187,7 +188,15 @@ impl Offer {
         b
     }
 
+    /// An offer of a Linux server instance (one of a native server is
+    /// refused: None).
     pub fn decode(b: &[u8]) -> Option<Offer> {
+        Self::decode_any(b).filter(|offer| offer.instance != 0)
+    }
+
+    /// An offer of a Linux server instance or of a native server
+    /// (`instance` 0), for a service that takes both.
+    pub fn decode_any(b: &[u8]) -> Option<Offer> {
         let b: &[u8; OFFER_BYTES] = b.try_into().ok()?;
         let u32_at = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
         let u64_at = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
@@ -195,9 +204,6 @@ impl Offer {
             return None;
         }
         let offer = Offer { channel: u64_at(8), slots: u32_at(16), shared: u32_at(20), client: u64_at(24), instance: u64_at(32) };
-        if offer.instance == 0 {
-            return None;
-        }
         offer.layout().map(|_| offer)
     }
 }

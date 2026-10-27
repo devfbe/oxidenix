@@ -63,8 +63,9 @@ pub fn exec(frame: &mut Frame, argv: u64) -> Result<(), i64> {
     // No CPU has the old address space loaded for this task any more.
     drop(old_mm);
     // The channels the old program served lose their service: the new
-    // program must not reach their grants.
+    // program must not reach their grants; those it was the client of go.
     super::channel::service_exited(pid);
+    super::channel::native_client_exited(pid);
     FsBase::write(VirtAddr::new(0));
     let initial = task::FpuState::initial();
     unsafe { core::arch::asm!("fxrstor64 [{}]", in(reg) initial.0.as_ptr(), options(nostack)) };

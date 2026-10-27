@@ -219,7 +219,9 @@ pub struct Server {
     image: Arc<crate::fs::cache::PageCache>,
     /// I/O port ranges (start..end) the server may request with ioperm.
     ports: Vec<Range<u64>>,
-    /// Interrupt line it may enable.
+    /// The memory BARs of its device it may map (`mmio_map`), by number.
+    mmio: Vec<(u8, crate::drivers::pci::MemoryBar)>,
+    /// Interrupt line it may enable (16-31: message-signalled, `irq`).
     irq: Option<u8>,
     /// Size of its DMA area in pages, and the area once allocated. It
     /// outlives the process, so a restarted server gets the same memory.
@@ -386,6 +388,7 @@ impl Server {
             path,
             image,
             ports: Vec::new(),
+            mmio: Vec::new(),
             irq: None,
             dma_pages: 0,
             dma: spin::Mutex::new(None),
@@ -517,6 +520,12 @@ impl Server {
         self
     }
 
+    /// Memory BAR `n` of the server's device, `bar`, for `mmio_map`.
+    pub fn mmio(mut self, n: u8, bar: crate::drivers::pci::MemoryBar) -> Self {
+        self.mmio.push((n, bar));
+        self
+    }
+
     pub fn dma(mut self, pages: u64) -> Self {
         self.dma_pages = pages;
         self
@@ -558,6 +567,30 @@ pub fn dma_map(phys_out: u64) -> SysResult {
         start
     };
     uaccess::write(phys_out, phys)?;
+    Ok(start as i64)
+}
+
+/// mmio_map(bar, &len): maps memory BAR `bar` of the server's device,
+/// uncached, read and write (`Backing::Mmio`), and returns its address;
+/// its length is stored at `len`. A BAR is mapped whole and only if it
+/// spans whole pages (a smaller one could share its page with another
+/// device's registers). EPERM for a BAR not assigned to the caller's
+/// server.
+pub fn mmio_map(bar: u64, len_out: u64) -> SysResult {
+    let server = with_current(|p| p.server.clone()).ok_or(EPERM)?;
+    let (_, bar) = *server.mmio.iter().find(|(n, _)| *n as u64 == bar).ok_or(EPERM)?;
+    if bar.phys % address_space::PAGE != 0 || bar.len % address_space::PAGE != 0 {
+        return Err(EINVAL);
+    }
+    let start = {
+        let mm = with_current(|p| p.mm())?;
+        let mut space = mm.lock();
+        let floor = space.brk_end;
+        let start = space.find_free(bar.len, floor).ok_or(ENOMEM)?;
+        space.map_mmio(start, bar.phys, bar.len / address_space::PAGE).map_err(|_| ENOMEM)?;
+        start
+    };
+    uaccess::write(len_out, bar.len)?;
     Ok(start as i64)
 }
 

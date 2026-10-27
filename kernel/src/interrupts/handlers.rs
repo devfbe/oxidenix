@@ -30,6 +30,7 @@ pub extern "sysv64" fn trap(frame: &mut Frame) {
         v if (apic::IRQ_BASE..apic::IRQ_BASE + apic::GSI_COUNT as u8).contains(&v) => {
             gsi_interrupt((v - apic::IRQ_BASE) as u32)
         }
+        v if (apic::MSI_BASE..apic::MSI_BASE + apic::MSI_COUNT).contains(&v) => crate::process::irq::fire_msi(v - apic::MSI_BASE),
         apic::ipi::RESCHEDULE_VECTOR => apic::eoi(),
         apic::ipi::HALT_VECTOR => halt_forever(),
         apic::ipi::TLB_VECTOR => {

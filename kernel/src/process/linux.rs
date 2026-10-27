@@ -3096,7 +3096,7 @@ fn vm_areas(instance: &Instance, handle: u64, from: u64, out: u64, cap: u64) -> 
                         (*offset, object_id(cache))
                     }
                     Backing::Anon => (0, 0),
-                    Backing::Device | Backing::Granted { .. } | Backing::Revoked { .. } => {
+                    Backing::Device | Backing::Mmio | Backing::Granted { .. } | Backing::Revoked { .. } => {
                         flags |= VMA_DEVICE;
                         (0, 0)
                     }
