@@ -494,3 +494,27 @@ fn typematic_and_autorepeat() {
     assert_eq!(r.due(5000, 33), None);
     assert_eq!(hid::leds_from_ps2(0b110), hid::LED_NUM_LOCK | hid::LED_CAPS_LOCK);
 }
+
+#[test]
+fn ncm_ndps_are_aligned_as_the_function_asks() {
+    let mut p = params();
+    p.out_alignment = 16;
+    let mut buf = vec![0xffu8; 4096];
+    let mut b = ncm::Builder::new(&mut buf, p, 4, 0);
+    assert!(b.push_with(64, |d| d.fill(3)));
+    let len = b.finish();
+    let ndp = u16::from_le_bytes([buf[10], buf[11]]) as usize;
+    assert_eq!(ndp, 16);
+    assert!(buf[ncm::NTH16_BYTES..ndp].iter().all(|&b| b == 0), "the gap is zeroed");
+    let mut out = [(0, 0); ncm::MAX_DATAGRAMS];
+    assert_eq!(ncm::datagrams(&buf[..len], &mut out), Some(1));
+    // The smallest block NCM allows (2048 bytes) still takes a full frame
+    // with the most pointers.
+    p.out_max_size = 2048;
+    let mut small = vec![0u8; 4096];
+    let mut b = ncm::Builder::new(&mut small, p, 64, 0);
+    assert!(b.push_with(1514, |d| d.fill(1)));
+    let len = b.finish();
+    assert!(len <= 2048);
+    assert_eq!(ncm::datagrams(&small[..len], &mut out), Some(1));
+}

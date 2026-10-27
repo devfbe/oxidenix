@@ -206,7 +206,14 @@ const USBD_DMA_PAGES: u64 = 1024;
 /// registers are its memory BAR 0; its interrupt a message-signalled
 /// vector where the controller has MSI or MSI-X, else its legacy line.
 fn start_usbd() {
-    for (n, hc) in drivers::pci::find_class(0x0c, 0x03, 0x30).into_iter().enumerate() {
+    let controllers = drivers::pci::find_class(0x0c, 0x03, 0x30);
+    // Nobody connects to a usbd: the kernel starts one that died again.
+    if !controllers.is_empty() {
+        if let Err(e) = process::sched::spawn_kernel_thread("keeper", process::keeper) {
+            printkln!("[boot] cannot start the keeper (errno {}); a usbd that dies stays dead", e);
+        }
+    }
+    for (n, hc) in controllers.into_iter().enumerate() {
         let Some(bar) = hc.memory_bar(0) else {
             printkln!("[boot] xHCI controller {:02x}:{:02x}.{} has no register BAR", hc.bus, hc.slot, hc.func);
             continue;
@@ -227,6 +234,10 @@ fn start_usbd() {
                     .dma(USBD_DMA_PAGES)
                     // (Its USB keyboards type on the console.)
                     .keyboard()
+                    .kept()
+                    // It registers once the devices there at boot are
+                    // enumerated (and their links offered).
+                    .start_timeout(10 * time::NSEC_PER_SEC)
                     .arg(alloc::format!("name={name}"))
                     .arg(alloc::format!("pci={:02x}:{:02x}.{}", hc.bus, hc.slot, hc.func))
                     .arg(alloc::format!("vendor={:#x}", hc.vendor))

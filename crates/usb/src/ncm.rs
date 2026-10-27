@@ -42,6 +42,8 @@ pub struct Parameters {
 }
 
 pub const PARAMETERS_BYTES: usize = 28;
+/// The smallest NTB size a function may announce.
+pub const MIN_BLOCK: u32 = 2048;
 
 impl Parameters {
     /// The answer, checked for what usbd relies on (NTB16, the sizes and
@@ -65,9 +67,10 @@ impl Parameters {
             out_max_datagrams: w(26),
         };
         let power_of_two = |v: u16| v != 0 && v.is_power_of_two();
+        // (NCM 1.0, 6.2.1: blocks of at least 2048 bytes each way.)
         let usable = p.formats & 1 != 0
-            && p.in_max_size as usize >= NTH16_BYTES + NDP16_HEADER + 8
-            && p.out_max_size as usize >= NTH16_BYTES + NDP16_HEADER + 8 + 64
+            && p.in_max_size >= MIN_BLOCK
+            && p.out_max_size >= MIN_BLOCK
             && power_of_two(p.out_divisor)
             && p.out_remainder < p.out_divisor
             && (p.out_alignment == 0 || power_of_two(p.out_alignment) && p.out_alignment <= 64);
@@ -127,6 +130,8 @@ pub fn datagrams(b: &[u8], out: &mut [(usize, usize); MAX_DATAGRAMS]) -> Option<
 pub struct Builder<'a> {
     buf: &'a mut [u8],
     params: Parameters,
+    /// Where the NDP is.
+    ndp: usize,
     capacity: usize,
     count: usize,
     /// The end of what is written.
@@ -139,16 +144,15 @@ impl<'a> Builder<'a> {
     /// `out_max_datagrams`).
     pub fn new(buf: &'a mut [u8], params: Parameters, capacity: usize, sequence: u16) -> Builder<'a> {
         let limit = if params.out_max_datagrams == 0 { usize::MAX } else { params.out_max_datagrams as usize };
-        let capacity = capacity.min(limit).clamp(1, MAX_DATAGRAMS);
         let max = (params.out_max_size as usize).min(buf.len()).min(u16::MAX as usize);
         let buf = &mut buf[..max];
-        let end = Self::ndp_at() + NDP16_HEADER + 4 * (capacity + 1);
-        Builder { buf, params, capacity, count: 0, end, sequence }
-    }
-
-    /// Where the NDP goes: right after the header (4-aligned).
-    const fn ndp_at() -> usize {
-        NTH16_BYTES
+        // The NDP right after the header, as the function aligns NDPs (at
+        // least to 4), with as many pointers as fit (a terminator too).
+        let ndp = NTH16_BYTES.next_multiple_of((params.out_alignment as usize).max(4));
+        let fit = max.saturating_sub(ndp + NDP16_HEADER) / 4;
+        let capacity = capacity.min(limit).min(MAX_DATAGRAMS).min(fit.saturating_sub(1));
+        let end = ndp + NDP16_HEADER + 4 * (capacity + 1);
+        Builder { buf, params, ndp, capacity, count: 0, end, sequence }
     }
 
     /// Where a datagram after `end` starts: at an offset that is the
@@ -178,7 +182,7 @@ impl<'a> Builder<'a> {
         let at = self.place();
         self.buf[self.end..at].fill(0);
         fill(&mut self.buf[at..at + len]);
-        let p = Self::ndp_at() + NDP16_HEADER + 4 * self.count;
+        let p = self.ndp + NDP16_HEADER + 4 * self.count;
         self.buf[p..p + 2].copy_from_slice(&(at as u16).to_le_bytes());
         self.buf[p + 2..p + 4].copy_from_slice(&(len as u16).to_le_bytes());
         self.count += 1;
@@ -188,9 +192,10 @@ impl<'a> Builder<'a> {
 
     /// Writes the header and the NDP; the NTB's length.
     pub fn finish(self) -> usize {
-        let ndp = Self::ndp_at();
+        let ndp = self.ndp;
         let ndp_len = NDP16_HEADER + 4 * (self.capacity + 1);
         let b = &mut *self.buf;
+        b[NTH16_BYTES..ndp].fill(0);
         b[0..4].copy_from_slice(&NTH16_SIGNATURE.to_le_bytes());
         b[4..6].copy_from_slice(&(NTH16_BYTES as u16).to_le_bytes());
         b[6..8].copy_from_slice(&self.sequence.to_le_bytes());

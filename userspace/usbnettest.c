@@ -4,7 +4,8 @@
  * 10.0.3.0/24) and usb1 (RNDIS, behind a USB hub, on 10.0.4.0/24). Each
  * comes up with its DHCP lease, as Linux names and describes it, and
  * carries TCP to its network's echo service (.100:7) intact, also in bulk
- * and in both directions at once. */
+ * and in both directions at once; and both come back after usbd dies, and
+ * after netd dies. */
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
@@ -18,9 +19,13 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+
+/* restricted::TEST_KILL_SERVER (test mode): kills the kernel's server `name`. */
+#define TEST_KILL_SERVER 1523
 
 static int failures;
 
@@ -188,6 +193,34 @@ int main(void) {
     int st = 0;
     waitpid(kid, &st, 0);
     check("both links at once", mine && WIFEXITED(st) && WEXITSTATUS(st) == 0);
+
+    /* usbd dies (as a crash would): the kernel starts it again (its
+     * keeper), it finds the devices anew and offers netd new links, which
+     * get their leases again. Then netd dies: the next use starts it again
+     * and usbd offers it the links anew. Either way the links work after. */
+    const char *servers[] = {"usb0", "net"};
+    for (int i = 0; i < 2; i++) {
+        char name[96];
+        long t0 = now_ms();
+        long killed = syscall(TEST_KILL_SERVER, servers[i]);
+        snprintf(name, sizeof name, "the kernel's %s killed", servers[i]);
+        check(name, killed == 0);
+        /* The links go with it (the dead usbd's channels, or netd's). */
+        int gone = 0;
+        for (long until = now_ms() + 5000; !gone && now_ms() < until; usleep(20000)) {
+            char a[32];
+            address_of("usb0", a, sizeof a);
+            gone = a[0] == 0;
+        }
+        snprintf(name, sizeof name, "with %s, usb0's lease goes", servers[i]);
+        check(name, gone);
+        int back = wait_for_leases(30000);
+        long rate = 0;
+        snprintf(name, sizeof name, "after %s's death: both links and their leases back (%ld ms)", servers[i], now_ms() - t0);
+        check(name, back);
+        snprintf(name, sizeof name, "after %s's death: TCP through usb0 and usb1", servers[i]);
+        check(name, back && echo(links[0].echo, 64 << 10, &rate) && echo(links[1].echo, 64 << 10, &rate));
+    }
     if (failures) printf("usbnettest: %d FAILED\n", failures);
     else printf("usbnettest: all passed\n");
     return failures != 0;

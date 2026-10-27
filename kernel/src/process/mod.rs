@@ -224,6 +224,9 @@ pub struct Server {
     /// It may type on the console's keyboard (`kbd_input`: usbd's USB
     /// keyboards).
     keyboard: bool,
+    /// The kernel starts it again when it dies (`keeper`): a driver of
+    /// devices no client connects to, so no use would revive it.
+    kept: bool,
     /// Interrupt line it may enable (16-31: message-signalled, `irq`).
     irq: Option<u8>,
     /// Size of its DMA area in pages, and the area once allocated. It
@@ -378,8 +381,48 @@ impl Lives {
 /// so whoever finds them dead finds its death recorded).
 pub fn server_exited(pid: Pid) {
     let now = crate::time::now();
+    let mut kept = false;
     for server in SERVERS.lock().iter() {
-        server.lives.lock().exited(server.name, pid, now);
+        let mut lives = server.lives.lock();
+        kept |= server.kept && lives.pid == Some(pid);
+        lives.exited(server.name, pid, now);
+    }
+    if kept {
+        wakeup(keeper_chan());
+    }
+}
+
+fn keeper_chan() -> usize {
+    &SERVERS as *const _ as usize
+}
+
+/// The `keeper` kernel thread: starts the kept servers (`Server::kept`)
+/// again when they die, as the restart policy says (`revive`: at once
+/// after a stable life, else after its backoff; a crash loop is down for
+/// its cooldown, then tried again). Started with the first kept server.
+pub fn keeper() -> ! {
+    loop {
+        let wait = sched::prepare_to_wait(keeper_chan());
+        // (The registry's lock is not held for the lookups.)
+        let kept: Vec<Arc<Server>> = SERVERS.lock().iter().filter(|s| s.kept).cloned().collect();
+        let dead: Vec<Arc<Server>> = kept.into_iter().filter(|s| s.lives.lock().pid.is_none() && ipc::lookup(s.name).is_none()).collect();
+        if dead.is_empty() {
+            wait.sleep();
+            continue;
+        }
+        drop(wait);
+        let mut retry = None;
+        for server in dead {
+            if server.revive().is_err() {
+                // Down after a crash loop (or it did not come up): again at
+                // the end of the cooldown, or in a second.
+                let at = server.lives.lock().down_until.unwrap_or(crate::time::now() + crate::time::NSEC_PER_SEC);
+                retry = Some(retry.map_or(at, |r: u64| r.min(at)));
+            }
+        }
+        if let Some(at) = retry {
+            let _ = sleep_until(at);
+        }
     }
 }
 
@@ -393,6 +436,7 @@ impl Server {
             ports: Vec::new(),
             mmio: Vec::new(),
             keyboard: false,
+            kept: false,
             irq: None,
             dma_pages: 0,
             dma: spin::Mutex::new(None),
@@ -533,6 +577,13 @@ impl Server {
     /// The server's keyboards type on the console (`kbd_input`).
     pub fn keyboard(mut self) -> Self {
         self.keyboard = true;
+        self
+    }
+
+    /// The kernel starts the server again whenever it dies, as the restart
+    /// policy says (`keeper`).
+    pub fn kept(mut self) -> Self {
+        self.kept = true;
         self
     }
 
