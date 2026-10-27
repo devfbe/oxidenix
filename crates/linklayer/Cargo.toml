@@ -1,0 +1,9 @@
+[package]
+name = "linklayer"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+
+[dependencies]
+# The vendored smoltcp (netd's), for its DHCP, IPv4 and UDP wire formats.
+smoltcp = { path = "../../third_party/smoltcp", default-features = false, features = ["medium-ip", "proto-ipv4", "proto-dhcpv4", "socket-udp"] }

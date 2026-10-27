@@ -77,13 +77,16 @@ mod field {
 
 pub mod pretty_print;
 
-#[cfg(all(feature = "proto-ipv4", feature = "medium-ethernet"))]
+// oxidenix: the Ethernet and ARP wire formats come with DHCP too (its
+// packets carry Ethernet addresses), so that DHCP's wire format builds
+// over an IP medium, whose user does the Ethernet framing itself.
+#[cfg(all(feature = "proto-ipv4", any(feature = "medium-ethernet", feature = "proto-dhcpv4")))]
 mod arp;
 #[cfg(feature = "proto-dhcpv4")]
 pub(crate) mod dhcpv4;
 #[cfg(feature = "proto-dns")]
 pub(crate) mod dns;
-#[cfg(feature = "medium-ethernet")]
+#[cfg(any(feature = "medium-ethernet", feature = "proto-dhcpv4"))]
 mod ethernet;
 #[cfg(any(feature = "proto-ipv4", feature = "proto-ipv6"))]
 mod icmp;
@@ -141,13 +144,13 @@ use crate::phy::Medium;
 
 pub use self::pretty_print::PrettyPrinter;
 
-#[cfg(feature = "medium-ethernet")]
+#[cfg(any(feature = "medium-ethernet", feature = "proto-dhcpv4"))] // oxidenix: see `mod ethernet`
 pub use self::ethernet::{
     Address as EthernetAddress, EtherType as EthernetProtocol, Frame as EthernetFrame,
     HEADER_LEN as ETHERNET_HEADER_LEN, Repr as EthernetRepr,
 };
 
-#[cfg(all(feature = "proto-ipv4", feature = "medium-ethernet"))]
+#[cfg(all(feature = "proto-ipv4", any(feature = "medium-ethernet", feature = "proto-dhcpv4")))] // oxidenix
 pub use self::arp::{
     Hardware as ArpHardware, Operation as ArpOperation, Packet as ArpPacket, Repr as ArpRepr,
 };

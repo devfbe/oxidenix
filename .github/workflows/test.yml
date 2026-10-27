@@ -80,6 +80,10 @@ jobs:
         if: matrix.firmware == 'uefi'
         run: cargo test --release -p netring
 
+      - name: Test netd's link layer (ARP, DHCP, routing) on the host
+        if: matrix.firmware == 'uefi'
+        run: cargo test -p linklayer
+
       - name: Test the terminals' line discipline on the host
         if: matrix.firmware == 'uefi'
         run: cargo test -p ldisc

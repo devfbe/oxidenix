@@ -68,7 +68,7 @@
 //! | `SETOPT` | socket, `arg[0]` option (`opt`; another is `ENOPROTOOPT`), `arg[1]` value (in its range: `opt::valid`, else `EINVAL`) | 0 |
 //! | `LINKS` | a buffer | bytes of `Link` records |
 //! | `FORGET` | `grant` | 0 once netd let go of the grant |
-//! | `RENEW` | none | 0: netd drops its DHCP lease and asks for one again a second later (test mode only, else `EPERM`) |
+//! | `RENEW` | none | 0: netd drops the DHCP lease of its first Ethernet link (the virtio card's) and asks for one again a second later (test mode only, else `EPERM`) |
 //!
 //! Every field an operation does not use must be 0 (`EINVAL`), an unknown
 //! operation is `ENOSYS`. An endpoint is an IPv4 address and a port in host
@@ -1301,22 +1301,32 @@ impl Record {
 
 /// A link of the loopback kind: traffic to the host's own addresses.
 pub const LINK_LOOPBACK: u16 = 1;
-/// An Ethernet link (the network card).
+/// An Ethernet link (the network card, a USB network function).
 pub const LINK_ETHERNET: u16 = 2;
 /// Link state: configured up (it sends and receives).
 pub const LINK_UP: u16 = 1;
 /// Link state: the medium is there (a carrier).
 pub const LINK_RUNNING: u16 = 2;
+/// Link state: its gateway is the default route's (one link at most: of
+/// those with a gateway the one netd sends by when nothing else decides).
+pub const LINK_DEFAULT: u16 = 4;
+/// What an Ethernet link is on: the PCI bus (the virtio card; also the
+/// loopback's value), USB (a network function usbd drives). The Linux
+/// server names them as Linux does: eth0, eth1, ... and usb0, usb1, ...
+pub const LINK_BUS_PCI: u8 = 0;
+pub const LINK_BUS_USB: u8 = 1;
 
-/// A network interface as netd describes it (`LINKS`). netd speaks IPv4
-/// with one address per interface; the names are the Linux server's.
+/// A network interface as netd describes it (`LINKS`), in the order of
+/// their indexes. netd speaks IPv4 with one address per interface; the
+/// names are the Linux server's.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Link {
-    /// Its number, from 1, stable while netd runs.
+    /// Its number, from 1, stable while netd runs and never given to
+    /// another link meanwhile.
     pub index: u32,
     /// `LINK_LOOPBACK` or `LINK_ETHERNET`.
     pub kind: u16,
-    /// `LINK_UP`, `LINK_RUNNING`.
+    /// `LINK_UP`, `LINK_RUNNING`, `LINK_DEFAULT`.
     pub state: u16,
     /// The largest IP packet it carries.
     pub mtu: u32,
@@ -1324,15 +1334,20 @@ pub struct Link {
     pub mac: [u8; 6],
     /// The IPv4 address's prefix length (with `address` 0: none).
     pub prefix: u8,
+    /// `LINK_BUS_PCI` or `LINK_BUS_USB`.
+    pub bus: u8,
     /// Its IPv4 address in host order, 0 for none (no DHCP lease yet).
     pub address: u32,
-    /// The default route's gateway through it, 0 for none.
+    /// Its router (DHCP's), 0 for none; the default route's if the link is
+    /// `LINK_DEFAULT`.
     pub gateway: u32,
+    /// The DNS server its lease named, 0 for none.
+    pub dns: u32,
 }
 
 impl Link {
     /// The size of one encoded record.
-    pub const SIZE: usize = 28;
+    pub const SIZE: usize = 32;
 
     pub fn encode(&self) -> [u8; Self::SIZE] {
         let mut r = [0u8; Self::SIZE];
@@ -1342,8 +1357,10 @@ impl Link {
         r[8..12].copy_from_slice(&self.mtu.to_le_bytes());
         r[12..18].copy_from_slice(&self.mac);
         r[18] = self.prefix;
+        r[19] = self.bus;
         r[20..24].copy_from_slice(&self.address.to_le_bytes());
         r[24..28].copy_from_slice(&self.gateway.to_le_bytes());
+        r[28..32].copy_from_slice(&self.dns.to_le_bytes());
         r
     }
 
@@ -1357,8 +1374,10 @@ impl Link {
             mtu: u32::from_le_bytes(r[8..12].try_into().expect("4 bytes")),
             mac: r[12..18].try_into().expect("6 bytes"),
             prefix: r[18],
+            bus: r[19],
             address: u32::from_le_bytes(r[20..24].try_into().expect("4 bytes")),
             gateway: u32::from_le_bytes(r[24..28].try_into().expect("4 bytes")),
+            dns: u32::from_le_bytes(r[28..32].try_into().expect("4 bytes")),
         })
     }
 }

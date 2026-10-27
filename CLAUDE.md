@@ -59,7 +59,8 @@ An AI research project; see README.md.
   -p fsring` the file protocol's encodings and validation (Linux server <-> diskfs), `cargo
   test -p netlink` rtnetlink's messages (the Linux server's netlink sockets), `cargo test
   --release -p netring` the socket protocol (Linux server <-> netd: encodings, validation, the
-  shared area's wake protocols with threads), `cargo test -p ldisc` the line discipline of the
+  shared area's wake protocols with threads), `cargo test -p linklayer` netd's link layer
+  (routing between links, ARP, the DHCP client, a link on a simulated wire), `cargo test -p ldisc` the line discipline of the
   Linux server's terminals, `cargo test -p kbd` Linux's console keyboard (keymaps, modes,
   scancodes; the server's VT and the kernel's monitor), `cargo test -p procproto` the text formats of `/proc` (procfs's
   and the Linux server's) and what procfs gives each client, `cargo test -p csprng` the
@@ -156,7 +157,9 @@ An AI research project; see README.md.
     `process/irq.rs` (lines 16-31 are message-signalled), `channel::native_create` (a server
     as a channel's client), `process::keeper` (restarts usbd).
   - Other servers and their protocols: `servers/diskfs` + `crates/fsring` + `crates/ext2fs`,
-    `servers/netd` + `crates/netring`, `servers/procfs` + `crates/procproto` (+ `crates/fsring`,
+    `servers/netd` + `crates/netring` (netd's links under its one smoltcp interface:
+    `servers/netd/src/links.rs` + `crates/linklayer`; USB links from usbd over
+    `crates/linkring`), `servers/procfs` + `crates/procproto` (+ `crates/fsring`,
     the same file protocol, read-only); I/O rings `crates/ring`, `docs/design/io-rings.md`.
   - Tests: C programs in `userspace/*.c` (built by `userspace/build.sh`), run by the list in
     `userspace/rootfs/etc/runtests.sh`; dynamically linked ones (glibc, musl's loader, C++) in

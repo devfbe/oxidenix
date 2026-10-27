@@ -30,6 +30,11 @@
 #   segment before the end of what is queued carry it until the peer acknowledged that, and
 #   `tcp::Socket::urgent` says where the peer's urgent byte is in the stream and what it is
 #   (Linux's tcp_check_urg and tcp_urg: no news for a pointer into data already received).
+# - `Interface::set_max_transmission_unit`: the device's MTU may change after `new` (netd's
+#   device is all its links; the smallest link MTU changes as links come and go).
+# - The Ethernet and ARP wire formats build with `proto-dhcpv4` alone (DHCP's packets
+#   carry Ethernet addresses), so that netd's DHCP client parses and emits DHCP with
+#   smoltcp's wire format over `medium-ip` (netd does the Ethernet framing itself).
 # Its own workspace, so that its tests run on the host:
 # `cargo test --manifest-path third_party/smoltcp/Cargo.toml --lib`.
 [workspace]

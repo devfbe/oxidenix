@@ -373,6 +373,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "linklayer"
+version = "0.1.0"
+dependencies = [
+ "smoltcp",
+]
+
+[[package]]
 name = "linkring"
 version = "0.1.0"
 dependencies = [
@@ -474,6 +481,8 @@ name = "netd"
 version = "0.1.0"
 dependencies = [
  "csprng",
+ "linklayer",
+ "linkring",
  "netring",
  "oxrt",
  "ring",

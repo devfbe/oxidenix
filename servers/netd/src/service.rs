@@ -145,8 +145,6 @@ const MAX_HALF_OPEN: usize = 1024;
 /// The largest UDP payload (an IPv4 packet of 65535 bytes).
 const MAX_UDP: usize = 65507;
 const IPV4_HEADER: usize = 20;
-/// The Ethernet header a frame adds to an IP packet.
-const ETHERNET_HEADER: usize = 14;
 /// A connection attempt gives up after this (Linux's 6 SYN retries,
 /// tcp_syn_retries), a connection that arrived and is not completed
 /// after this (5 SYN-ACK retries, tcp_synack_retries), unacknowledged
@@ -264,9 +262,9 @@ pub const HEAP_WORST: usize = {
     // The listeners' backlogs (no more handles than sockets: shrunk to
     // what they hold), a round's sockets that finished closing.
     let lists = 2 * MAX_SMOLTCP * size_of::<SocketHandle>() + MAX_CHANNELS * 64;
-    // Frames: the loopback queue (twice `MAX_LOOPED` at most), one received,
-    // the datagram scratch, a LINKS answer.
-    let frames = (2 * 64 + 1) * (crate::virtio_net::MTU + 32) + if MAX_UDP > RAW_BUFFER { MAX_UDP } else { RAW_BUFFER } + 4096;
+    // Frames: the links' (the loopback queue, packets waiting for ARP, the
+    // ARP caches), one received, the datagram scratch, a LINKS answer.
+    let frames = crate::links::HEAP_WORST + linkring::MAX_FRAME + 32 + if MAX_UDP > RAW_BUFFER { MAX_UDP } else { RAW_BUFFER } + 4096;
     set + datagram + chans + closing + per_socket + owners + echo + budgets + lists + frames
 };
 
@@ -431,6 +429,10 @@ struct Tcp {
     handle: SocketHandle,
     /// Where it is bound (by bind, listen, connect or its listener).
     local: Option<IpListenEndpoint>,
+    /// The source address its last connect chose: its name's address
+    /// after the connection failed too, as Linux keeps the socket's
+    /// (smoltcp forgets it with the reset).
+    source: Option<IpAddress>,
     reuse: Reuse,
     /// Its place in an SO_REUSEPORT group of listeners (`Service::reshard`),
     /// given to every socket of its backlog.
@@ -625,16 +627,6 @@ struct Chan {
     futile: u32,
 }
 
-/// Network configuration (DHCP's).
-#[derive(Default, Clone, Copy)]
-pub struct Config {
-    pub address: u32,
-    pub prefix: u8,
-    pub gateway: u32,
-    pub dns: u32,
-    pub mac: [u8; 6],
-}
-
 pub struct Service {
     chans: Vec<Option<Chan>>,
     /// Closed connections finishing, being reset, or in TIME-WAIT.
@@ -672,7 +664,10 @@ pub struct Service {
     brief: bool,
     /// A datagram on its way out.
     scratch: Vec<u8>,
-    pub config: Config,
+    /// The interfaces as `LINKS` describes them (the loopback first; the
+    /// main loop keeps them, `crate::links`): their addresses are this
+    /// host's.
+    pub links: Vec<Link>,
     /// The kernel runs its self-tests (netd's `test=1`): `RENEW` is taken.
     pub test_mode: bool,
     /// A `RENEW` came (`take_renew`).
@@ -737,7 +732,7 @@ impl Service {
             half_open_budget: Budget::new(MAX_HALF_OPEN, MAX_HALF_OPEN / RESERVED_INSTANCES, MAX_HALF_OPEN / 2).for_instances(MAX_CHANNELS),
             brief: false,
             scratch: vec![0; MAX_UDP.max(RAW_BUFFER)],
-            config: Config::default(),
+            links: Vec::with_capacity(1 + crate::links::MAX_LINKS),
             test_mode: false,
             renew: false,
         }
@@ -902,8 +897,9 @@ impl Service {
         progress
     }
 
-    /// The configuration (`LINKS`) changed: every instance's net thread
-    /// hears of it (`ArenaHeader::links_seq`), for netlink's notifications.
+    /// The interfaces (`LINKS`) changed (a link came or went, a carrier, a
+    /// lease, the default link): every instance's net thread hears of it
+    /// (`ArenaHeader::links_seq`), for netlink's notifications.
     pub fn links_changed(&mut self) {
         for chan in self.chans.iter().flatten() {
             chan.area.header.links_seq.0.fetch_add(1, SeqCst);
@@ -1178,6 +1174,7 @@ impl Service {
                 let t = Tcp {
                     handle,
                     local: None,
+                    source: None,
                     reuse: Reuse::default(),
                     shard: None,
                     backlog: None,
@@ -1207,7 +1204,7 @@ impl Service {
     fn local_address(&self, addr: Option<IpAddress>) -> bool {
         match addr.map(bits) {
             None => true,
-            Some(a) => a >> 24 == 127 || (a != 0 && a == self.config.address),
+            Some(a) => a >> 24 == 127 || (a != 0 && self.links.iter().any(|l| l.address == a)),
         }
     }
 
@@ -1464,6 +1461,7 @@ impl Service {
                     tcp::ConnectError::Unaddressable => ENETUNREACH,
                 })?;
                 t.local = Some(local);
+                t.source = socket.local_endpoint().map(|e| e.addr);
                 t.connecting = Some(crate::now());
                 t.failed = false;
                 if area.is_some() {
@@ -1573,6 +1571,7 @@ impl Service {
         let t = Tcp {
             handle: conn,
             local: Some(local),
+            source: None,
             reuse,
             shard: None,
             backlog: None,
@@ -1869,7 +1868,7 @@ impl Service {
                     }
                     s.remote_endpoint().ok_or(ENOTCONN)?
                 } else {
-                    let bound = t.local.map(|l| IpEndpoint::new(l.addr.unwrap_or(ipv4(0)), l.port));
+                    let bound = t.local.map(|l| IpEndpoint::new(l.addr.or(t.source).unwrap_or(ipv4(0)), l.port));
                     let actual = if t.backlog.is_none() { s.local_endpoint() } else { None };
                     actual.or(bound).unwrap_or(IpEndpoint::new(ipv4(0), 0))
                 }
@@ -1935,18 +1934,10 @@ impl Service {
         if !g.writable || buf.offset as u64 + buf.len as u64 > g.bytes {
             return Err(EINVAL);
         }
-        // The loopback (frames to the host's own addresses come back in
-        // `Nic`) and the card, both with Ethernet framing: the card's MTU
-        // applies to both.
-        let mtu = (crate::virtio_net::MTU - ETHERNET_HEADER) as u32;
-        let cfg = self.config;
-        let up = netring::LINK_UP | netring::LINK_RUNNING;
-        let (address, prefix) = (crate::LOOPBACK.address().to_bits(), crate::LOOPBACK.prefix_len());
-        let lo = Link { index: 1, kind: netring::LINK_LOOPBACK, state: up, mtu, mac: [0; 6], prefix, address, gateway: 0 };
-        let card = Link { index: 2, kind: netring::LINK_ETHERNET, state: up, mtu, mac: cfg.mac, prefix: cfg.prefix, address: cfg.address, gateway: cfg.gateway };
-        let mut out = Vec::with_capacity(2 * Link::SIZE);
-        out.extend_from_slice(&lo.encode());
-        out.extend_from_slice(&card.encode());
+        let mut out = Vec::with_capacity(self.links.len() * Link::SIZE);
+        for l in &self.links {
+            out.extend_from_slice(&l.encode());
+        }
         let n = out.len().min(buf.len as usize);
         if !unsafe { oxrt::copy::copy(g.addr.add(buf.offset as usize), out.as_ptr(), n) } {
             return Err(EFAULT);

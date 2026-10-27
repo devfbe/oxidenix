@@ -36,17 +36,24 @@ const S_IFMT: u32 = 0o170000;
 const S_IFSOCK: u32 = 0o140000;
 
 /// The interfaces as netd describes them, named as Linux would: the
-/// loopback "lo", Ethernet cards "eth0" and up. None without netd (the
-/// lists are empty then, not an error; ENOMEM without memory for them).
+/// loopback "lo", Ethernet cards "eth0" and up, USB network functions
+/// "usb0" and up (usbnet's names), each in the order of their indexes.
+/// Only the default link's gateway makes a default route; every link with
+/// an address has its subnet's route. None without netd (the lists are
+/// empty then, not an error; ENOMEM without memory for them).
 pub fn interfaces() -> Result<Vec<Interface>, NoMem> {
-    let mut ethernet = 0;
-    let links = crate::netclient::links()?;
+    let (mut ethernet, mut usb) = (0, 0);
+    let mut links = crate::netclient::links()?;
+    links.sort_unstable_by_key(|l| l.index);
     let mut out = heap::try_vec(links.len())?;
     for l in links {
         out.push({
             let loopback = l.kind == netring::LINK_LOOPBACK;
             let name = if loopback {
                 heap::try_string("lo")?
+            } else if l.bus == netring::LINK_BUS_USB {
+                usb += 1;
+                crate::try_format!("usb{}", usb - 1)?
             } else {
                 ethernet += 1;
                 crate::try_format!("eth{}", ethernet - 1)?
@@ -74,7 +81,7 @@ pub fn interfaces() -> Result<Vec<Interface>, NoMem> {
                 mac: l.mac,
                 broadcast_mac: if loopback { [0; 6] } else { [0xff; 6] },
                 ipv4,
-                gateway: (l.gateway != 0 && l.address != 0).then_some(l.gateway),
+                gateway: (l.gateway != 0 && l.address != 0 && l.state & netring::LINK_DEFAULT != 0).then_some(l.gateway),
             }
         });
     }

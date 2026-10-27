@@ -96,8 +96,9 @@ Its [commit history](#development-history) records every step.
   the rest of the system keeps running.
 - **Networking**: TCP, UDP and raw ICMP sockets over IPv4 with DNS, so `wget`, `nc`, `ping` and
   `nslookup` from BusyBox reach the Internet through QEMU's user network. The driver for the virtio network
-  card and the TCP/IP stack (smoltcp) run in `netd`, a user-space server; the interface is
-  configured by DHCP, and loopback (`127.0.0.1`) works too.
+  card and the TCP/IP stack (smoltcp) run in `netd`, a user-space server, which routes between
+  several links: the card (`eth0`), USB tethering links (`usb0`, ...) and loopback (`127.0.0.1`);
+  each Ethernet link is configured by DHCP.
 - **Persistent storage**: the data disk is mounted at `/data`, survives reboots, and keeps its
   metadata in an ext3 (JBD2) journal: after a crash the journal's replay leaves it as the last
   completed operation left it, and `e2fsck` on the host finds nothing to fix. The Linux server serves it from a
@@ -314,14 +315,15 @@ oxidenix/
 │   ├── diskfs/                  user-space ext2 server with its virtio-blk driver (blk.rs)
 │   ├── procfs/                  /proc's system-wide files and /sys over the rings (main.rs:
 │   │                            the service, tree.rs: inodes, render.rs: cpuinfo, version)
-│   ├── netd/                    network server: virtio-net driver (virtio_net.rs), loopback
-│   │                            (nic.rs), the instances' sockets on smoltcp over their
-│   │                            channels (service.rs), DHCP
+│   ├── netd/                    network server: virtio-net driver (virtio_net.rs), the links
+│   │                            under smoltcp (links.rs: loopback, the card, USB links), the
+│   │                            instances' sockets on smoltcp over their channels (service.rs)
 │   └── ringtest/                the self-tests' channel service (test mode only)
 ├── crates/
 │   ├── ext2fs/                  ext2 as a library over a `Device` trait
 │   ├── netring/                 the socket protocol over a channel (Linux server <-> netd): requests,
 │   │                            control blocks in the shared area, byte rings, interface records
+│   ├── linklayer/               netd's link layer: routing between links, ARP, the DHCP client
 │   ├── netlink/                 rtnetlink's messages (the Linux server's NETLINK_ROUTE sockets)
 │   ├── procproto/               native process and system information, /proc's text formats
 │   ├── virtio/                  virtio legacy PCI transport and virtqueues (diskfs, netd)
@@ -359,8 +361,9 @@ About 13,100 lines of Rust (without comments and blank lines) in the kernel (16,
    and registers as service `diskfs` for channels (each Linux server instance connects one and
    mounts the disk at `/data`). Then the kernel
    scans PCI for a virtio network card and starts `/sbin/netd` with its ports, interrupt line
-   and a DMA area; netd registers as service `net` once DHCP has configured the interface
-   (or after three seconds without an answer). Last, `/sbin/procfs` registers as service
+   and a DMA area (without a card netd starts all the same, for loopback and USB links); netd
+   registers as service `net` once DHCP has configured the card (or after three seconds
+   without an answer; at once without a card). Last, `/sbin/procfs` registers as service
    `procfs` for channels (each Linux server instance connects one for `/proc` and `/sys`).
 4. Process 0 (the kernel monitor) spawns `/bin/bash` in a new process tree, which gets the
    console device; its Linux server gives Bash descriptors 0-2 on the console and makes the
@@ -1171,24 +1174,35 @@ dispatch; drivers, filesystems, the network stack and Linux itself are user-spac
 
 ### Networking
 
-- **netd** (`servers/netd`) owns the network card. The kernel finds it on PCI (a virtio-net
-  card in legacy mode, whose registers are all I/O ports) and hands netd its ports, its
-  interrupt line and a 512 KiB DMA area. netd sets up the two virtqueues with 64 fixed 2 KiB
-  buffers each and runs [smoltcp](https://github.com/smoltcp-rs/smoltcp) for ARP, IPv4,
-  ICMP, TCP, UDP and the DHCP client (0.14, vendored in `third_party/smoltcp` with a few
-  patches: connection buffers that grow, the window scale for the largest of them, a timeout
-  told from a reset). It serves the Linux server instances' sockets over the
+- **netd** (`servers/netd`) owns the network card, if there is one. The kernel finds it on
+  PCI (a virtio-net card in legacy mode, whose registers are all I/O ports) and hands netd
+  its ports, its interrupt line and a 512 KiB DMA area. netd sets up the two virtqueues with
+  64 fixed 2 KiB buffers each and runs [smoltcp](https://github.com/smoltcp-rs/smoltcp) for
+  IPv4, ICMP, TCP and UDP (0.14, vendored in `third_party/smoltcp` with a few patches:
+  connection buffers that grow, the window scale for the largest of them, a timeout told from
+  a reset, an MTU that may change). It serves the Linux server instances' sockets over the
   channels they offer it (one per instance, `servers/netd/src/service.rs`, the protocol
-  `crates/netring`): each round it takes their requests, polls the card and the stack, moves
+  `crates/netring`): each round it takes their requests, polls the links and the stack, moves
   the sockets' bytes between smoltcp and the instances' rings, and publishes what changed in
   the sockets' control blocks; while rounds make progress it polls, after a spin without any
   it arms the card's interrupt and every channel's doorbell and sleeps in `ipc_receive` (an
-  offer, a doorbell, an interrupt or the stack's next timer wakes it).
-- **Loopback**: frames to the host's own address or to `127.0.0.0/8` never reach the card;
-  netd's device layer feeds them back as received frames and answers ARP for those addresses
-  itself, so a program can talk to a server on the same machine. Frames from the wire that
-  claim a `127.0.0.0/8` address are dropped, so services on `127.0.0.1` are not reachable from
-  the network.
+  offer, a doorbell, an interrupt or the next timer wakes it).
+- **Links** (`servers/netd/src/links.rs`, `crates/linklayer`): smoltcp sees one interface of
+  IP packets; below it netd keeps its links, each with an index of its own (Linux's
+  interface index: `lo` 1, the card `eth0` 2, then each new link the next one) and does
+  their Ethernet itself: per link an ARP cache (requests, replies for its address, aging,
+  a bounded queue of packets waiting for resolution) and a DHCP client (RFC 2131: renewal
+  at T1 by unicast, rebinding at T2, the lease's end, retransmission with backoff and
+  jitter). A USB network function (tethering) comes as a link channel from usbd
+  (`crates/linkring`) and goes with it; without a carrier its lease goes. Routing: the
+  host's own addresses loop back, a link's subnet goes by that link, a packet from a link's
+  address by that link's router, anything else by the default link (of those with a router
+  the lowest metric: the card 100, USB links 200). smoltcp's addresses, its default route
+  and its MTU (the smallest link's) follow the links.
+- **Loopback**: packets to an address of the host or to `127.0.0.0/8` never reach a link;
+  netd feeds them back as received packets, so a program can talk to a server on the same
+  machine. Packets from a link that claim a `127.0.0.0/8` address (or the host's own) are
+  dropped, so services on `127.0.0.1` are not reachable from the network.
 - **Sockets** are the Linux server's (phase R7b, ADR 0008; `servers/linux/src/inet.rs`,
   `inetcalls.rs`, `netclient.rs`): `AF_INET` stream and datagram sockets, plus raw ICMP
   sockets (`SOCK_RAW`, `IPPROTO_ICMP`) for `ping` (the program writes the ICMP message, netd
@@ -1227,8 +1241,10 @@ dispatch; drivers, filesystems, the network stack and Linux itself are user-spac
   sockets of the old channel fail (`ECONNRESET`, `POLLERR`), the next one makes a new channel.
   netd gets the same DMA area, which it clears before handing it to the freshly reset card.
 - **Interfaces** (the Linux server's `netdev.rs`, `netlink.rs`): netd describes its interfaces
-  (`LINKS` over the channel, `netring::Link`: the loopback and the card, with MAC, MTU, state
-  and the DHCP address), and the server names them as Linux does (`lo`, `eth0`). It answers
+  (`LINKS` over the channel, `netring::Link`: the loopback, the card and the USB links, with
+  index, bus, MAC, MTU, state and the DHCP lease), and the server names them as Linux does
+  (`lo`, `eth0`, ... for PCI cards, `usb0`, ... for USB links, by index); only the default
+  link's router makes a default route. It answers
   `NETLINK_ROUTE` sockets of its own: `RTM_GETLINK` (dumped, or one interface by index or name)
   and `RTM_GETADDR` dumps with `NLM_F_MULTI`, `NLMSG_DONE`, the request's sequence number and
   the socket's port id, acknowledgements (`NLM_F_ACK`, `NETLINK_CAP_ACK`), `EOPNOTSUPP` for other
@@ -1239,7 +1255,8 @@ dispatch; drivers, filesystems, the network stack and Linux itself are user-spac
   with `ENOBUFS`, sends beyond the send buffer fail before anything is allocated, and the
   buffer options stop at Linux's `rmem_max`/`wmem_max`. `RTM_GETROUTE` dumps the IPv4 routes
   that follow from the addresses (the subnets, DHCP's default route, the local table's own
-  addresses). netd's configuration changes (a DHCP lease, netd going away) are announced to
+  addresses). netd's configuration changes (a link coming or going, a carrier, a DHCP lease,
+  netd going away) are announced to
   the multicast groups as Linux does (`RTM_NEWLINK`/`RTM_DELLINK`, `RTM_NEWADDR`/`RTM_DELADDR`,
   `RTM_NEWROUTE`/`RTM_DELROUTE` to `RTNLGRP_LINK`, `RTNLGRP_IPV4_IFADDR`,
   `RTNLGRP_IPV4_ROUTE`), joined by bind or `NETLINK_ADD_MEMBERSHIP`; programs can send to
@@ -1495,6 +1512,7 @@ Each of these programs and scripts lives in the root filesystem and runs inside 
 | `cargo test -p ext2fs` (host, needs e2fsprogs) | ext2 on a RAM disk that counts requests and can fail writes: 4 MiB read in about one device read per 32 KiB request, two flushes per write (data, then its transaction), one flush per create, rename, unlink and `rmdir` and one for a batch of them, nothing written by reads, blocks moving between directories and files, a file larger than the block cache, corrupt block pointers (`EUCLEAN`, no crash); corrupt disks: superblocks and group descriptors that contradict themselves or the device refused at mount (each check), stale free counts taken from the descriptors, corrupt directory records, sizes, holes and repeated blocks, names of freed inodes, pointers into metadata, lying bitmaps (no metadata or inode in use given out), indirect blocks shared at every level (removed in linear time), device inodes freeing no blocks, symlink sizes, names and link counts bounded; 600 randomly corrupted disks (clean and needing a replay; more with `EXT2FS_HOSTILE_SEEDS`) mounted and swept through every operation without a panic, a hang or memory beyond the disk's; every write of a commit failing in turn (the filesystem stops; the journal's replay keeps what was committed, each operation whole or not at all), operations failing part way (a read error in a truncation or rename: undone whole), failed data writes never exposing a deleted file's blocks; the journal: ext3's (debugfs's `logdump` reads it, `e2fsck -fy` replays a crashed disk's, ours replays one e2fsprogs wrote, revokes included), added to a disk without one, refused read-only when it needs recovery, its superblock's fields checked, hostile and randomly corrupted logs scanned safely (bounded, no panic, only the filesystem's blocks written), long operations committing part way and a crash in between finished at the next mount; after every crash point and every failed device request of unlinks, releases, renames and recoveries, `e2fsck -fn` finds nothing at all; the ring path: writes into reserved blocks read back through both paths, extents clipped at the end with holes, reserved blocks out of every bitmap and inode until linked (`e2fsck` clean meanwhile, other allocations never take them), `sync` flushing the data before the metadata, `ENOENT` for inodes not in use; crashes: every write and flush of IPC and ring operations replayed up to a crash in each flush epoch, with arbitrary losses of what came after the last flush and a two-block metadata cache evicting all the time, never showing a deleted file's data in a file, directory or symlink; blocks freed before a failed commit not reused (ring or IPC) until a commit succeeds; freed inodes refusing reads, writes, truncation, permission changes (`ENOENT`); superblocks whose group or inode sizes do not fit a block refused at mount; blocks in flight for a promise counted once (the rest of the disk stays promisable, also after the promise ends; 128 reservations of 64 blocks in flight, half linked, half cut off by a truncation); freed blocks kept as ranges (unit test); socket inodes (a socket's mode and directory entry type, kept by a rename, freed by an unlink); `e2fsck` after each |
 | `cargo test -p fsring` (host) | the file protocol: every request survives encode and decode (socket inodes too), `ENOSYS` for unknown operations, `EINVAL` for any field an operation does not use, transfers, names and targets bounded (`EINVAL`, `ENAMETOOLONG`), names without `/` or NUL, completions, stat, usage and directory entries round-trip; `SETTIMES` takes the chosen times in 32 bits only |
 | `cargo test -p netlink` (host) | rtnetlink's answers: link and address dumps (`NLM_F_MULTI`, `NLMSG_DONE`, sequence numbers and port ids, the attributes getifaddrs reads), one link by index or by name with its acknowledgement, `ENODEV`, `EINVAL` for a short request, `EOPNOTSUPP` for other requests (capped with `NETLINK_CAP_ACK`), no answer for control messages and non-requests, a malformed length ending the datagram, two requests in one datagram, dumps split into page-sized datagrams; dumps produced a datagram at a time, one dump at a time (`EBUSY`), answers stopped at the room left |
+| `cargo test -p linklayer` (host) | netd's link layer: routing (own addresses to the loopback, loopback sources nowhere, a link's subnet and its broadcast, overlapping subnets by source and prefix, source-based routing via a link's router, the default link by metric, broadcast and multicast by the source's link); ARP packets round-trip and malformed ones refused, the cache's resolution (requests at once and retransmitted, waiting frames released in order, a bounded queue dropping the oldest, giving up after three requests), aging (unicast probes of stale entries in use, unused ones collected), RFC 826's merge rule, eviction; the DHCP client's states (DISCOVER, OFFER, REQUEST, ACK; only its exchange's replies, an ACK or NAK only from the server of the offer), retransmissions doubling from 4 to 64 s with up to a second of jitter, a new exchange after four unanswered REQUESTs, NAKs, renewing by unicast at T1 and rebinding by broadcast at T2 with their retransmissions, the lease's end, quiet and changed renewals, carrier loss, lease times (T1/T2 defaults and orders, an hour without, infinite), unacceptable offers and malformed packets; a link on a simulated wire: DHCP's frames and checksums, ARP requests answered (probes too), resolution with waiting packets, broadcast and multicast addresses, the MTU, a full wire, martians and other hosts' frames dropped, carrier loss and return, renewal by unicast |
 | `cargo test --release -p netring` (host) | the socket protocol between the Linux server and netd: every request survives encode and decode, `ENOSYS` for unknown operations, `EINVAL` for stray fields, malformed areas (two power-of-two rings on a page), sockets, endpoints and values out of range; the shared area's layout; ring arithmetic across the wrap; datagram records and interface records round-trip; netd's port rules (Linux's `SO_REUSEADDR` rule within an instance, never a port another instance serves, UDP reuse within an instance only); netd's budgets (a cap per instance however it asks, a reserve kept for every instance with a channel, refused charges take nothing, given back only to the instance charged, a flood against one instance leaving the others theirs); ICMP messages told apart by what they concern, malformed ones (every truncation, changed bytes) never a panic; echo identifiers rewritten with their checksum and kept apart per instance; 4 MiB streamed through a ring between two threads (the reader sleeping on the control block, the writer waiting for room) and 100000 marks handed to a sleeping net thread, with no wakeup lost |
 | `cargo test -p vfs` (host) | paths and cpio; `struct stat` round-trips, every `struct statx` field and `stx_mask` (with and without a birth time), device numbers, statx's checks of flags and mask |
 | `cargo test -p kbd` (host) | Linux's console keyboard: the German layout, Shift, AltGr, Control, Alt as ESC or the meta bit, Ctrl-Alt-Del and console switches as actions, cursor and function keys (DECCKM, Shift+F1 as F11, LNM's CR LF), Caps and Num Lock with their LEDs, the keypad (cursor keys without Num Lock, the application keypad), Alt-numpad entry, dead keys, Compose and the accent table, `K_RAW`, `K_MEDIUMRAW` (three bytes beyond keycode 127, Pause's E1 sequence), `K_XLATE`, `K_OFF`, shifts tracked in the raw modes, autorepeat with DECARM, keymap entries (`K_NOSUCHMAP`, `K_HOLE`, Unicode keysyms only in Unicode mode, values checked by type, new keymaps of holes, removal, the shift state recomputed), function strings, the LED flags and `KDSETLED`, the scancode table, output bounded by its room |

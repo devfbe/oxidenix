@@ -15,7 +15,12 @@ virtio = { path = "../../crates/virtio" }
 netring = { path = "../../crates/netring" }
 ring = { path = "../../crates/ring" }
 csprng = { path = "../../crates/csprng" }
-# smoltcp 0.14 with netd's patches (third_party/smoltcp/Cargo.toml lists them).
+linkring = { path = "../../crates/linkring" }
+linklayer = { path = "../../crates/linklayer" }
+# smoltcp 0.14 with netd's patches (third_party/smoltcp/Cargo.toml lists them): one
+# interface of IP packets over all of netd's links (their Ethernet, ARP and DHCP are
+# netd's: linklayer), with an address for each link and the loopback's.
 smoltcp = { path = "../../third_party/smoltcp", default-features = false, features = [
-    "alloc", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-udp", "socket-dhcpv4", "socket-raw", "auto-icmp-echo-reply",
+    "alloc", "medium-ip", "proto-ipv4", "proto-dhcpv4", "socket-tcp", "socket-udp", "socket-raw", "auto-icmp-echo-reply",
+    "iface-max-addr-count-8",
 ] }
