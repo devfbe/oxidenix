@@ -196,10 +196,12 @@ int main(void) {
 
     /* usbd dies (as a crash would): the kernel starts it again (its
      * keeper), it finds the devices anew and offers netd new links, which
-     * get their leases again. Then netd dies: the next use starts it again
+     * get their leases again; twice (a server whose memory was handed out
+     * wrongly at its end shows at its next life). Then netd dies: the next
+     * use starts it again
      * and usbd offers it the links anew. Either way the links work after. */
-    const char *servers[] = {"usb0", "net"};
-    for (int i = 0; i < 2; i++) {
+    const char *servers[] = {"usb0", "usb0", "net"};
+    for (int i = 0; i < 3; i++) {
         char name[96];
         long t0 = now_ms();
         long killed = syscall(TEST_KILL_SERVER, servers[i]);

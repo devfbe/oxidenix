@@ -1006,8 +1006,9 @@ impl AddressSpace {
             if matches!(v.backing, Backing::Revoked { .. }) && (prot.read || prot.write || prot.exec) {
                 return Err(Fault::Access);
             }
-            // (Its entries carry the caching bits the rights would lose.)
-            if matches!(v.backing, Backing::Mmio) && prot != v.prot {
+            // (Its entries carry the caching and MMIO bits rewritten rights
+            // would lose.)
+            if matches!(v.backing, Backing::Mmio) {
                 return Err(Fault::Access);
             }
             at = v.end;
@@ -2149,7 +2150,10 @@ pub(super) unsafe fn free_level(frames: &mut memory::frame::PhysFrameAllocator, 
         }
         let frame = PhysFrame::containing_address(entry.addr());
         if level == 1 {
-            unsafe { frames.deallocate_frame(frame) };
+            // (A device's registers are no frame of the allocator's.)
+            if !entry.flags().contains(MMIO) {
+                unsafe { frames.deallocate_frame(frame) };
+            }
         } else {
             unsafe { free_level(frames, frame, level - 1) };
         }

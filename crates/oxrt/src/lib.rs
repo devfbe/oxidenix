@@ -532,9 +532,40 @@ impl fmt::Write for Stdout {
     }
 }
 
+/// A message's text, gathered so that it reaches the kernel's log in one
+/// `log` call (one record, not interleaved with another server's): what
+/// does not fit in the buffer goes in further calls.
+struct Line {
+    buf: [u8; 512],
+    len: usize,
+}
+
+impl fmt::Write for Line {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        for chunk in s.as_bytes().chunks(self.buf.len()) {
+            if self.len + chunk.len() > self.buf.len() {
+                log(&self.buf[..self.len]);
+                self.len = 0;
+            }
+            self.buf[self.len..self.len + chunk.len()].copy_from_slice(chunk);
+            self.len += chunk.len();
+        }
+        Ok(())
+    }
+}
+
+/// `print!`'s work: the message formatted, then logged at once.
+pub fn print_fmt(args: fmt::Arguments) {
+    let mut line = Line { buf: [0; 512], len: 0 };
+    let _ = fmt::Write::write_fmt(&mut line, args);
+    if line.len > 0 {
+        log(&line.buf[..line.len]);
+    }
+}
+
 #[macro_export]
 macro_rules! print {
-    ($($arg:tt)*) => ({ let _ = core::fmt::Write::write_fmt(&mut $crate::Stdout, format_args!($($arg)*)); });
+    ($($arg:tt)*) => ($crate::print_fmt(format_args!($($arg)*)));
 }
 
 #[macro_export]

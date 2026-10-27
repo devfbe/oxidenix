@@ -370,8 +370,8 @@ impl Links {
         let (area, header) = unsafe { (linkring::Area::new(base, &want).expect("a link channel's layout"), Header::at(base)) };
         let info = match area.info() {
             Ok(info) => info,
-            Err(_) => {
-                println!("netd: a link offer with a malformed description: refused");
+            Err(e) => {
+                println!("netd: a link offer of process {} with a malformed description ({:?}): refused", offer.client, e);
                 let _ = oxrt::chan_detach(offer.channel);
                 return -EINVAL;
             }
