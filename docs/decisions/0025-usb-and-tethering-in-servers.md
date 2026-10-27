@@ -63,12 +63,23 @@ Seven questions shaped the design:
    announced a sleep, so no wakeup is lost (tested with threads on the host). A link goes
    with its channel: the device's removal closes it, netd sees `CLIENT_GONE`.
 
-4. **netd routes between links itself** (see the netd commit that implements it): one
-   smoltcp interface with `Medium::Ip` over all links, ARP and a DHCP client per link in
-   netd (`crates/linklayer`), routes by destination subnet, by source address (a socket
-   bound to a link's address leaves through it) and else by the default link (PCI cards
-   before USB functions). Linux programs see one interface per link: `eth0`... for cards,
-   `usb0`... for USB functions, each with its lease.
+4. **netd routes between links itself.** smoltcp cannot route between interfaces that share
+   a socket set, so netd has one interface of `Medium::Ip` over a device that is all of its
+   links (`servers/netd/src/links.rs`): the loopback, the virtio card if there is one, and
+   the USB links. Each Ethernet link's own work is netd's, in a host-tested crate
+   (`crates/linklayer`): ARP (a cache with aging and probes, a bounded queue of packets
+   waiting for resolution), a DHCP client (RFC 2131 with renewing, rebinding and
+   retransmission; smoltcp's wire format), and the routing decision: the host's own
+   addresses to the loopback, a link's subnet to that link, else the link of the source
+   address (a socket bound to a link's address leaves through it), else the default link by
+   metric (PCI cards 100 before USB functions 200). smoltcp's addresses, its default route
+   and its MTU follow every change. netd runs without a card too (loopback, links later).
+   Linux programs see one interface per link (`netring::Link`, now with the bus and the
+   lease's DNS server): `eth0`... for cards, `usb0`... for USB functions, each with its
+   lease; only the default link's router is a default route. Name lookups follow the default
+   link: `/etc/resolv.conf` is a link to `/proc/net/pnp`, which the Linux server makes from
+   the leases' DNS servers as Linux's IP autoconfiguration writes it (resolv.conf's format,
+   the reason Linux systems link to it): a phone that tethers is its own DNS server.
 
 5. **CDC-NCM, CDC-ECM and RNDIS; the best function wins, then the first configuration.**
    Android tethers with RNDIS (and NCM on newer devices), Linux gadgets and many embedded

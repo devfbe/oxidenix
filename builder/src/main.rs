@@ -854,9 +854,13 @@ fn copy_tree(from: &Path, to: &Path) -> io::Result<()> {
     for entry in fs::read_dir(from)? {
         let entry = entry?;
         let target = to.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
             fs::create_dir_all(&target)?;
             copy_tree(&entry.path(), &target)?;
+        } else if kind.is_symlink() {
+            // (A link into the guest's tree, /etc/resolv.conf's: as it is.)
+            std::os::unix::fs::symlink(fs::read_link(entry.path())?, &target)?;
         } else {
             fs::copy(entry.path(), &target)?;
         }

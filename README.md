@@ -98,7 +98,15 @@ Its [commit history](#development-history) records every step.
   `nslookup` from BusyBox reach the Internet through QEMU's user network. The driver for the virtio network
   card and the TCP/IP stack (smoltcp) run in `netd`, a user-space server, which routes between
   several links: the card (`eth0`), USB tethering links (`usb0`, ...) and loopback (`127.0.0.1`);
-  each Ethernet link is configured by DHCP.
+  each Ethernet link is configured by DHCP, and `/etc/resolv.conf` (a link to `/proc/net/pnp`)
+  names the leases' DNS servers.
+- **USB** (ADR 0025): an xHCI driver in `usbd`, a user-space server per controller, with the
+  controller's registers mapped from its PCI BAR and message-signalled interrupts. It finds the
+  devices on the root ports and below USB 2 and USB 3 hubs, and drives **USB tethering**: the
+  Ethernet functions of phones and gadgets (CDC-NCM, CDC-ECM and RNDIS: Android's "USB
+  tethering"), each a link of netd's with its own DHCP lease, plugged in and out at any time;
+  and boot-protocol **USB keyboards** (the firmware's legacy emulation ends when usbd takes the
+  controller over). If usbd or netd dies, both come back and the links with them.
 - **Persistent storage**: the data disk is mounted at `/data`, survives reboots, and keeps its
   metadata in an ext3 (JBD2) journal: after a crash the journal's replay leaves it as the last
   completed operation left it, and `e2fsck` on the host finds nothing to fix. The Linux server serves it from a
@@ -242,7 +250,8 @@ The window scales when it is resized (`zoom-to-fit`), and Ctrl+Alt+F toggles ful
  │  Linux server instance (one per process tree, servers/linux): descriptors, VFS, tmpfs,    │
  │  /dev, pipes, terminals, sockets, processes, signals, futex, mmap, ELF loader, /proc/<pid>│
  │        │ kernel calls (crates/restricted)          │ I/O rings: shared memory, grants     │
- │  native servers (oxrt::sys): diskfs (ext2, virtio-blk)  netd (smoltcp, virtio-net) procfs │
+ │  native servers (oxrt::sys): diskfs (ext2, virtio-blk)  netd (smoltcp, links) procfs     │
+ │  usbd (xHCI, hubs, CDC-ECM/NCM, RNDIS, keyboards): its functions are netd's links         │
  └────────┬───────────────────────────────────────────┬──────────────────────┬──────────────┘
    kernel calls / faults / IRQs                 channels, IPC            in/out, DMA
  ┌────────▼───────────────────────────────────────────▼──────────────────────▼──────────────┐
@@ -251,11 +260,11 @@ The window scales when it is resized (`zoom-to-fit`), and Ctrl+Alt+F toggles ful
  │  address spaces    mappings, demand paging, COW, futex keys, TLB shootdowns (PCIDs)       │
  │  threads           processes as containers, SMP fair scheduler, timers, clocks, kill      │
  │  IPC and channels  service registry, channel offers, grants, doorbells                    │
- │  devices           I/O ports, IRQ lines and DMA areas for servers; PCI, ACPI              │
+ │  devices           I/O ports, memory BARs, IRQ lines, MSI and DMA areas for servers; PCI │
  │  console device    raw: framebuffer (ANSI), scancodes, serial ports (terminals: server) │
  │  CPU               GDT, TSS + I/O bitmap, IDT, local + I/O APIC, SSE; the boot image      │
  └──────────────────────────────────────────────────────────────────────────────────────────┘
-      bootloader 0.11 (UEFI/BIOS), QEMU q35, 4 CPUs, 256 MiB RAM, AHCI boot disk, virtio-blk data disk, virtio-net
+      bootloader 0.11 (UEFI/BIOS), QEMU q35, 4 CPUs, 256 MiB RAM, AHCI boot disk, virtio-blk data disk, virtio-net, xHCI
 ```
 
 ### Repository layout
@@ -318,12 +327,17 @@ oxidenix/
 │   ├── netd/                    network server: virtio-net driver (virtio_net.rs), the links
 │   │                            under smoltcp (links.rs: loopback, the card, USB links), the
 │   │                            instances' sockets on smoltcp over their channels (service.rs)
+│   ├── usbd/                    USB server, one per xHCI controller: the controller (xhci/),
+│   │                            devices and hubs, the Ethernet functions as netd's links (net/),
+│   │                            boot keyboards (kbd.rs)
 │   └── ringtest/                the self-tests' channel service (test mode only)
 ├── crates/
 │   ├── ext2fs/                  ext2 as a library over a `Device` trait
 │   ├── netring/                 the socket protocol over a channel (Linux server <-> netd): requests,
 │   │                            control blocks in the shared area, byte rings, interface records
 │   ├── linklayer/               netd's link layer: routing between links, ARP, the DHCP client
+│   ├── linkring/                the link protocol over a channel (usbd <-> netd): frame rings
+│   ├── usb/                     what usbd speaks with devices: descriptors, RNDIS, NCM, CDC, hubs, HID
 │   ├── netlink/                 rtnetlink's messages (the Linux server's NETLINK_ROUTE sockets)
 │   ├── procproto/               native process and system information, /proc's text formats
 │   ├── virtio/                  virtio legacy PCI transport and virtqueues (diskfs, netd)
@@ -1262,9 +1276,48 @@ dispatch; drivers, filesystems, the network stack and Linux itself are user-spac
   `RTNLGRP_IPV4_ROUTE`), joined by bind or `NETLINK_ADD_MEMBERSHIP`; programs can send to
   groups too. The netdevice(7) requests (`SIOCGIFCONF`, `SIOCGIFINDEX`, ...) work on any
   socket.
+- **DNS**: `/etc/resolv.conf` is a link to `/proc/net/pnp`, which the Linux server makes from
+  netd's links as Linux's IP autoconfiguration does (`#PROTO: DHCP`, a `nameserver` line per
+  lease's DNS server, the default link's first): lookups follow the link the machine reaches
+  the network through.
 - Not yet: IPv6, other raw protocols and interface configuration from user space
   (`ifconfig`). `AF_UNIX` sockets are the Linux server's (see "Restricted mode and the Linux
   server").
+
+### USB
+
+- **usbd** (`servers/usbd`, ADR 0025) drives an xHCI controller from user space, one process
+  per controller ("usb0", ...). The kernel finds the controllers on PCI (class 0c/03/30),
+  switches Intel's 7/8-series ports from EHCI to xHCI, programs the controller's MSI (or entry 0
+  of its MSI-X table; its legacy line otherwise) and hands usbd its register BAR (`mmio_map`,
+  uncached) and a 4 MiB DMA area. usbd takes the controller over from the firmware (USB legacy
+  support, its SMIs off), resets it and runs its command ring, its event ring and interrupter
+  0; one thread, one event loop, as netd's.
+- **Devices**: on a connect (and at a look at the root ports every second) usbd resets the
+  port, enables a slot, addresses the device, reads its descriptors and configurations, and
+  gives it a role: a hub (USB 2, with transaction translators for slow devices, and USB 3;
+  its ports powered and watched, its devices attached below it with their route strings), an
+  Ethernet function, or a boot keyboard. What a device says is parsed in `crates/usb`, tested
+  on the host against real devices' descriptors and malformed input.
+- **USB tethering**: CDC-NCM, CDC-ECM and RNDIS functions (the best of all configurations,
+  standard ones before RNDIS). Each is a link of netd's over a channel of its own
+  (`crates/linkring`: the description, two frame rings, doorbells): bulk IN transfers stay
+  queued, their frames go into the receive ring; frames from the send ring go out as one
+  transfer each (ECM), NCM transfer blocks, or RNDIS packet messages; the carrier comes from
+  the function's notifications. A device that goes takes its link with it; one that comes gets
+  a new one, with a DHCP lease of its own (`usb0`, `usb1`, ... by index).
+- **Keyboards**: boot-protocol reports become the PS/2 keyboard's scancodes in the kernel's
+  queue (`kbd_input`), with the host's autorepeat and the console's LEDs: USB keyboards keep
+  working once the firmware's legacy emulation is gone.
+- **Restarts**: the kernel's keeper starts a usbd that died again (by the restart policy);
+  netd's death kills the links' channels, and usbd offers new ones (which restarts netd).
+- **Trying it**: in QEMU, a function on the xHCI controller every boot has
+  (`cargo run -- -netdev user,id=u1,net=10.0.3.0/24 -device usb-net,netdev=u1,bus=xhci.0`),
+  or a real phone passed through (`-device usb-host,bus=xhci.0,vendorid=...,productid=...`;
+  switch on USB tethering on the phone); on real hardware with `just install`.
+- Not yet: Apple's iPhone tethering (ipheth: the phone needs the host paired through usbmux and
+  lockdown first), mass storage, other HID devices, isochronous transfers, USB 3 streams; the
+  controller's DMA is not confined (docs/design/iommu.md).
 
 ### Persistent storage
 
@@ -1441,7 +1494,11 @@ a fresh 64 MiB data disk of their own (`target/test-disk.img`, made anew on ever
 full-disk tests fill it to the last block), never on the persistent `disk.img`. When they
 passed, the builder boots a second time with that disk read-only (QEMU's `readonly=on`, which
 virtio-blk reports as `VIRTIO_BLK_F_RO`) into `/etc/rotests.sh`; `OXIDENIX_TEST=readonly` runs
-that boot alone on a fresh disk. A boot whose shutdown complains (an instance that did not
+that boot alone on a fresh disk. Then a third time on a machine without a network card, with
+USB Ethernet functions instead (QEMU's usb-net: CDC-ECM on a root port, RNDIS behind a hub),
+into `/etc/usbtests.sh` (`usbnettest`: both links' leases and names, TCP through each in bulk
+and both at once, usbd's and netd's deaths; `ip`, `/etc/resolv.conf`, what usbd found);
+`OXIDENIX_TEST=usb` runs that boot alone. A boot whose shutdown complains (an instance that did not
 write its caches back or end, a channel that did not close) fails too. GitHub Actions does
 exactly this on every push (without a display), then checks the test disk with `e2fsck`.
 

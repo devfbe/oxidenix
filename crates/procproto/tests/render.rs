@@ -241,3 +241,11 @@ fn fdinfo_of_epoll_and_inotify() {
     assert!(i.ends_with("inotify wd:1 ino:10 sdev:fe00000 mask:300 ignored_mask:0 \n"), "{i}");
     assert_eq!(kernel_dev(8, 1), 0x80_0001);
 }
+
+#[test]
+fn pnp_reads_as_resolv_conf() {
+    let ip = |a: u8, b: u8, c: u8, d: u8| u32::from_be_bytes([a, b, c, d]);
+    assert_eq!(pnp(&[ip(192, 168, 42, 129), 0, ip(10, 0, 2, 3), ip(192, 168, 42, 129)]), "#PROTO: DHCP\nnameserver 192.168.42.129\nnameserver 10.0.2.3\n");
+    assert_eq!(pnp(&[]), "#MANUAL\n");
+    assert_eq!(pnp(&[0, 0]), "#MANUAL\n");
+}

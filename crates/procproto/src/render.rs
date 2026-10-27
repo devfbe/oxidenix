@@ -11,6 +11,32 @@ use alloc::format;
 use alloc::string::String;
 use core::fmt::Write;
 
+/// /proc/net/pnp, as Linux's IP autoconfiguration writes it (ipconfig.c's
+/// `pnp_seq_show`, in resolv.conf's format, which is why /etc/resolv.conf
+/// may be a link to it): `#PROTO: DHCP` and a `nameserver` line for each of
+/// the leases' DNS servers (`servers`, IPv4 addresses in host order, the
+/// default link's first; zeros and repeats left out), or `#MANUAL` without
+/// one.
+pub fn pnp(servers: &[u32]) -> String {
+    let mut out = String::new();
+    let mut seen: alloc::vec::Vec<u32> = alloc::vec::Vec::new();
+    for &s in servers.iter().filter(|&&s| s != 0) {
+        if !seen.contains(&s) {
+            seen.push(s);
+        }
+    }
+    if seen.is_empty() {
+        out.push_str("#MANUAL\n");
+        return out;
+    }
+    out.push_str("#PROTO: DHCP\n");
+    for s in seen {
+        let b = s.to_be_bytes();
+        let _ = writeln!(out, "nameserver {}.{}.{}.{}", b[0], b[1], b[2], b[3]);
+    }
+    out
+}
+
 /// Linux reports times in USER_HZ = 100 ticks per second.
 pub const USER_HZ: u64 = 100;
 

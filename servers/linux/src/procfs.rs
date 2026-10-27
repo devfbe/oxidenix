@@ -183,6 +183,30 @@ pub enum KernelFile {
 
 const KERNEL_FILES: &[(&str, KernelFile)] = &[("core_pattern", KernelFile::CorePattern), ("core_uses_pid", KernelFile::CoreUsesPid)];
 
+/// /proc/net, the server's: `pnp`, the DNS servers of netd's leases in
+/// resolv.conf's format (`render::pnp`, as Linux's IP autoconfiguration
+/// writes it), which /etc/resolv.conf links to: a program's lookups go to
+/// the DNS server of the link it reaches the network through (the phone it
+/// tethers through, QEMU's 10.0.2.3), whichever that is now.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum NetFile {
+    Dir = 0,
+    Pnp,
+}
+
+const NET_FILES: &[(&str, NetFile)] = &[("pnp", NetFile::Pnp)];
+
+/// /proc/net/pnp's contents: the default link's DNS server first.
+fn pnp() -> Result<Vec<u8>, i64> {
+    let links = crate::netclient::links()?;
+    let mut servers = try_vec(links.len())?;
+    let default = links.iter().filter(|l| l.state & netring::LINK_DEFAULT != 0);
+    for l in default.chain(links.iter().filter(|l| l.state & netring::LINK_DEFAULT == 0)) {
+        servers.push(l.dns);
+    }
+    Ok(fmt::pnp(&servers).into_bytes())
+}
+
 impl VmFile {
     /// Which of the policy's values it is (`SYS_OVERCOMMIT`'s `which`).
     fn which(self) -> u64 {
@@ -274,6 +298,8 @@ pub enum ProcNode {
     Cgroup(CgFile),
     /// The core dump's files of /proc/sys/kernel.
     Kernel(KernelFile),
+    /// /proc/net and its files.
+    Net(NetFile),
     /// The open file a magic link led to that is no filesystem's node (a
     /// pipe, a socket, an eventfd, an epoll instance).
     Open(Opened),
@@ -585,6 +611,8 @@ pub fn mode(node: &ProcNode) -> u32 {
         ProcNode::Vm(file) => vm_mode(*file),
         ProcNode::Cgroup(file) => cg_mode(*file),
         ProcNode::Kernel(_) => S_IFREG | 0o644,
+        ProcNode::Net(NetFile::Dir) => S_IFDIR | 0o555,
+        ProcNode::Net(_) => S_IFREG | 0o444,
         ProcNode::Open(_) => stat(node).map_or(0, |st| namespace::mode_of(&st)),
     }
 }
@@ -659,6 +687,7 @@ pub fn lookup(dir: &ProcNode, name: &str) -> Result<ProcNode, i64> {
             "self" => Ok(ProcNode::SelfLink),
             "thread-self" => Ok(ProcNode::ThreadSelf),
             "mounts" => Ok(ProcNode::MountsLink),
+            "net" => Ok(ProcNode::Net(NetFile::Dir)),
             _ => match id_name(name) {
                 // Any thread's id has a directory, as on Linux, though the
                 // listing shows processes only.
@@ -666,6 +695,7 @@ pub fn lookup(dir: &ProcNode, name: &str) -> Result<ProcNode, i64> {
                 None => remote_lookup(false, PROC_ROOT, name),
             },
         },
+        ProcNode::Net(NetFile::Dir) => NET_FILES.iter().find(|(n, _)| *n == name).map(|&(_, f)| ProcNode::Net(f)).ok_or(ENOENT),
         ProcNode::Remote { sys, ino, mode } if mode & vfs::S_IFMT == S_IFDIR => remote_lookup(*sys, *ino, name),
         ProcNode::Pid { pid, file: PidFile::Dir } => {
             process(*pid)?;
@@ -712,6 +742,7 @@ fn ino(node: &ProcNode) -> u64 {
         ProcNode::Vm(file) => 0x1_0010 + *file as u64,
         ProcNode::Cgroup(file) => 0x1_0020 + *file as u64,
         ProcNode::Kernel(file) => 0x1_0030 + *file as u64,
+        ProcNode::Net(file) => 0x1_0040 + *file as u64,
         ProcNode::Open(_) => 0,
     }
 }
@@ -766,7 +797,7 @@ pub fn list(dir: &ProcNode) -> Result<Vec<(String, u64, u8)>, i64> {
                 Err(crate::heap::ENOMEM) => return Err(crate::heap::ENOMEM),
                 Err(_) => fixed(dir, &[], &|_| root(false))?,
             };
-            for (name, node) in [("self", ProcNode::SelfLink), ("thread-self", ProcNode::ThreadSelf), ("mounts", ProcNode::MountsLink)] {
+            for (name, node) in [("self", ProcNode::SelfLink), ("thread-self", ProcNode::ThreadSelf), ("mounts", ProcNode::MountsLink), ("net", ProcNode::Net(NetFile::Dir))] {
                 add(&mut out, name, &node)?;
             }
             for pid in ids(QUERY_PIDS, 0)?.into_iter().filter(|&p| p != 0) {
@@ -783,6 +814,15 @@ pub fn list(dir: &ProcNode) -> Result<Vec<(String, u64, u8)>, i64> {
             let mut out = remote_readdir(PROC_SYS_KERNEL)?;
             for &(n, file) in KERNEL_FILES {
                 add(&mut out, n, &ProcNode::Kernel(file))?;
+            }
+            Ok(out)
+        }
+        ProcNode::Net(NetFile::Dir) => {
+            let mut out = try_vec(NET_FILES.len() + 2)?;
+            add(&mut out, ".", dir)?;
+            add(&mut out, "..", &root(false))?;
+            for &(n, file) in NET_FILES {
+                add(&mut out, n, &ProcNode::Net(file))?;
             }
             Ok(out)
         }
@@ -1029,6 +1069,7 @@ pub fn contents(node: &ProcNode) -> Result<Vec<u8>, i64> {
         }
         ProcNode::Cgroup(file) => return cgroup_contents(*file),
         ProcNode::Kernel(file) => return crate::coredump::setting(*file),
+        ProcNode::Net(NetFile::Pnp) => return pnp(),
         ProcNode::FdInfo { pid, fd } => return Ok(fdinfo(*pid, *fd)?.into_bytes()),
         ProcNode::Pid { pid, file } => (*pid, *file),
         ProcNode::Task { tid, file, .. } => {
