@@ -40,6 +40,9 @@ const CHAN_PREDECESSORS: u64 = 1086;
 const MMIO_MAP: u64 = 1200;
 /// `chan_client_watch(handle, value)`: the client's doorbell watch.
 const CHAN_CLIENT_WATCH: u64 = 1201;
+/// `kbd_input(buf, len)`, `kbd_state()`: USB keyboards.
+const KBD_INPUT: u64 = 1202;
+const KBD_STATE: u64 = 1203;
 /// Bytes of randomness one `SYS_RANDOM` gives at most.
 const RANDOM_MAX: usize = 256;
 
@@ -78,6 +81,8 @@ pub fn dispatch(f: &mut Frame) {
         SYS_CHAN_CONNECT => super::channel::native_connect(a0, a1, a2),
         SYS_HANDLE_CLOSE => super::channel::native_close(a0),
         CHAN_CLIENT_WATCH => super::channel::client_watch(a0, a1),
+        KBD_INPUT => super::kbd_input(a0, a1),
+        KBD_STATE => super::kbd_state(),
         SYS_MO_MAP => map(a0, a1, a2, a3, a4, a5),
         SYS_MO_UNMAP => vm::unmap(a0, a1),
         SYS_MO_PROTECT => vm::protect(a0, a1, a2),

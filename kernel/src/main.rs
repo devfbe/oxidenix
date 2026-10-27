@@ -225,6 +225,8 @@ fn start_usbd() {
                 let mut server = server
                     .mmio(0, bar)
                     .dma(USBD_DMA_PAGES)
+                    // (Its USB keyboards type on the console.)
+                    .keyboard()
                     .arg(alloc::format!("name={name}"))
                     .arg(alloc::format!("pci={:02x}:{:02x}.{}", hc.bus, hc.slot, hc.func))
                     .arg(alloc::format!("vendor={:#x}", hc.vendor))

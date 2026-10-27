@@ -119,6 +119,14 @@ pub mod sys {
     /// (handle, value): arms the client's doorbell watch on the channel's
     /// completion ring (as `CHAN_WATCH` on the submission ring).
     pub const CHAN_CLIENT_WATCH: u64 = 1201;
+
+    /// (buf, len) -> n: scancodes (set 1) of this server's keyboards,
+    /// typed on the console as the PS/2 keyboard's (at most 256 a call);
+    /// EPERM unless the kernel lets the server.
+    pub const KBD_INPUT: u64 = 1202;
+    /// () -> leds | typematic << 8: the console keyboard's LEDs (bit 0
+    /// Scroll Lock, 1 Num Lock, 2 Caps Lock) and typematic byte.
+    pub const KBD_STATE: u64 = 1203;
 }
 
 /// `ipc_register` flag: the service accepts channel offers.
@@ -383,6 +391,16 @@ pub fn chan_client_watch(handle: u64, value: u32) -> Result<bool, i64> {
         e if e == -EAGAIN => Ok(false),
         e => Err(e),
     }
+}
+
+/// Types scancodes (set 1) on the console's keyboard.
+pub fn kbd_input(codes: &[u8]) -> Result<(), i64> {
+    result(syscall(sys::KBD_INPUT, [codes.as_ptr() as u64, codes.len() as u64, 0, 0, 0, 0])).map(|_| ())
+}
+
+/// The console keyboard's (LEDs, typematic byte).
+pub fn kbd_state() -> Result<(u8, u8), i64> {
+    result(syscall(sys::KBD_STATE, [0; 6])).map(|s| (s as u8, (s >> 8) as u8))
 }
 
 /// Copies to and from granted memory that a revoke may take away at any

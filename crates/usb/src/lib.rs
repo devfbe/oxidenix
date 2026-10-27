@@ -3,7 +3,8 @@
 //! (`SetupPacket`), descriptors (`descriptor`), which network function a
 //! device offers and how it is wired (`function`), the CDC class's
 //! notifications and requests (`cdc`), CDC-NCM's transfer blocks (`ncm`),
-//! Microsoft's RNDIS (`rndis`) and hubs (`hub`). Kept apart from usbd so
+//! Microsoft's RNDIS (`rndis`), hubs (`hub`) and boot keyboards (`hid`).
+//! Kept apart from usbd so
 //! that every parser is tested on the host against real devices'
 //! descriptors and malformed input: everything here comes from a device,
 //! and a device may be hostile.
@@ -15,6 +16,7 @@ extern crate alloc;
 pub mod cdc;
 pub mod descriptor;
 pub mod function;
+pub mod hid;
 pub mod hub;
 pub mod ncm;
 pub mod rndis;

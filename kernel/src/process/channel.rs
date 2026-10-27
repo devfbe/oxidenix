@@ -1349,13 +1349,27 @@ pub fn run_deferred() {
     }
 }
 
-/// Waits until no channel is left (every client's end went and each
-/// service let go of its channels: diskfs released what the clients held),
-/// at most until `deadline`: for a shutdown. Whether none is.
+/// Waits until no channel of a Linux server instance is left (every
+/// client's end went and each service let go of its channels: diskfs
+/// released what the clients held), at most until `deadline`: for a
+/// shutdown. Whether none is. (The channels between the kernel's servers,
+/// usbd's links to netd, live as long as the servers do.)
 pub fn settle(deadline: u64) -> bool {
     loop {
         run_deferred();
-        if CHANNELS.lock().iter().all(|e| e.channel.strong_count() == 0) {
+        // (Looked at outside the registry's lock: a channel whose last
+        // reference were ours would take the lock again as it goes.)
+        let mut channels: Vec<Weak<Channel>> = Vec::new();
+        let listed = {
+            let registry = CHANNELS.lock();
+            let listed = channels.try_reserve_exact(registry.len()).is_ok();
+            if listed {
+                channels.extend(registry.iter().map(|e| e.channel.clone()));
+            }
+            listed
+        };
+        // (Without memory for the list: looked at again in a moment.)
+        if listed && !channels.iter().filter_map(Weak::upgrade).any(|c| !matches!(c.inner.lock().client, Client::Native(_))) {
             return true;
         }
         if crate::time::now() >= deadline {

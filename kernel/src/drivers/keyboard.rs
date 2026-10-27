@@ -89,6 +89,13 @@ pub fn set_typematic(byte: u8) {
     next_command(&mut c);
 }
 
+/// The LEDs and the typematic byte the keyboard should have (USB keyboards follow them:
+/// the kernel's `kbd_state`).
+pub fn wanted() -> (u8, u8) {
+    let c = COMMANDS.lock();
+    (c.leds.0, c.typematic.0)
+}
+
 /// The keyboard's answer to the command in flight, if `b` is one (interrupt): after the
 /// command's acknowledgement its value goes, after the value's the setting is made.
 fn command_answer(b: u8) -> bool {

@@ -22,6 +22,7 @@ extern crate alloc;
 mod device;
 mod dma;
 mod hub;
+mod kbd;
 mod net;
 mod xhci;
 
@@ -67,6 +68,7 @@ const RESCAN_MS: u64 = 1000;
 enum Role {
     Net(Net),
     Hub(Hub),
+    Keyboard(kbd::Keyboard),
     /// Nothing usbd drives: it keeps its slot (to notice it go).
     Unused,
 }
@@ -85,6 +87,9 @@ struct Usbd {
     devices: BTreeMap<u8, Attached>,
     /// The device on each root port (by slot).
     roots: [Option<u8>; 256],
+    /// Root ports whose device did not come up: tried again only when
+    /// it is plugged in anew (a connect change), not at every look.
+    failed: [bool; 256],
     /// The kernel runs its self-tests: a device whose serial number is
     /// "rndis" gets its RNDIS function where it offers another too (QEMU's
     /// usb-net offers ECM first), so that both are tested.
@@ -119,7 +124,7 @@ fn main(args: Vec<&'static str>) -> i32 {
             return 1;
         }
     };
-    let mut usbd = Usbd { xhci, devices: BTreeMap::new(), roots: [None; 256], test: args.contains(&"test=1") };
+    let mut usbd = Usbd { xhci, devices: BTreeMap::new(), roots: [None; 256], failed: [false; 256], test: args.contains(&"test=1") };
     // The kernel waits for the registration: the devices there at boot
     // are enumerated first, so their links come before the programs.
     usbd.scan_roots();
@@ -139,11 +144,22 @@ impl Usbd {
                 self.event(e);
                 progress = true;
             }
+            let mut due = None::<u64>;
             for a in self.devices.values_mut() {
-                if let Role::Net(n) = &mut a.role {
-                    n.check_link();
-                    progress |= n.pump(&mut self.xhci, &mut a.dev);
-                    n.flush();
+                match &mut a.role {
+                    Role::Net(n) => {
+                        n.check_link();
+                        progress |= n.pump(&mut self.xhci, &mut a.dev);
+                        n.flush();
+                    }
+                    Role::Keyboard(k) => {
+                        k.tick(&mut self.xhci, &mut a.dev);
+                        due = match (due, k.deadline()) {
+                            (Some(a), Some(b)) => Some(a.min(b)),
+                            (a, b) => a.or(b),
+                        };
+                    }
+                    Role::Hub(_) | Role::Unused => {}
                 }
             }
             if oxrt::uptime_ms() >= last_scan + RESCAN_MS {
@@ -166,8 +182,9 @@ impl Usbd {
                 }
             }
             if armed && !self.xhci.has_events() {
-                let left = (last_scan + RESCAN_MS).saturating_sub(oxrt::uptime_ms());
-                self.xhci.sleep(Some(left.max(1)));
+                // Until the next look at the ports, or a keyboard's repeat.
+                let until = due.map_or(last_scan + RESCAN_MS, |d| d.min(last_scan + RESCAN_MS));
+                self.xhci.sleep(Some(until.saturating_sub(oxrt::uptime_ms()).max(1)));
             }
             for a in self.devices.values() {
                 if let Role::Net(n) = &a.role {
@@ -190,6 +207,7 @@ impl Usbd {
                 let Some(c) = a.dev.complete(&mut self.xhci, dci, trb, code, residual) else { return };
                 match &mut a.role {
                     Role::Net(n) => n.completed(&mut self.xhci, &mut a.dev, c),
+                    Role::Keyboard(k) if dci == k.dci() => k.completed(&mut self.xhci, &mut a.dev, c),
                     Role::Hub(h) if dci == h.status_dci() => {
                         let changed = h.changed(&mut self.xhci, &mut a.dev, c.result.is_ok());
                         self.hub_changed(slot, changed);
@@ -219,6 +237,13 @@ impl Usbd {
         let sc = self.xhci.clear_port_changes(port);
         let present = self.roots[port as usize];
         let connected = sc & PORT_CCS != 0;
+        let failed = &mut self.failed[port as usize];
+        if !connected || sc & PORT_CSC != 0 {
+            *failed = false;
+        }
+        if *failed {
+            return;
+        }
         match (connected, present) {
             (false, Some(slot)) => self.detach(slot),
             // A port that was reset or disabled under the device: it is
@@ -241,12 +266,14 @@ impl Usbd {
             Ok(speed) => speed,
             Err(e) => {
                 println!("usbd: port {}: the device does not come up ({})", port, e);
+                self.failed[port as usize] = true;
                 return;
             }
         };
         let position = Position { root_port: port, route: 0, tt: None, depth: 0 };
-        if let Some(slot) = self.attach(position, speed, None) {
-            self.roots[port as usize] = Some(slot);
+        match self.attach(position, speed, None) {
+            Some(slot) => self.roots[port as usize] = Some(slot),
+            None => self.failed[port as usize] = true,
         }
     }
 
@@ -342,6 +369,13 @@ impl Usbd {
             None => function::choose(&configs),
         };
         let Some((n, f)) = chosen else {
+            // A keyboard (in its first configuration, as every one has).
+            if let Some(interface) = configs.first().and_then(kbd::find).cloned() {
+                dev.control_out(&mut self.xhci, SetupPacket::set_configuration(configs[0].value), &[])?;
+                let k = kbd::Keyboard::bind(&mut self.xhci, dev, &interface)?;
+                println!("usbd: {}: {} ({}-speed): a keyboard", place, name, dev.speed.name());
+                return Ok(Role::Keyboard(k));
+            }
             println!("usbd: {}: {} ({}-speed): nothing usbd drives", place, name, dev.speed.name());
             return Ok(Role::Unused);
         };
@@ -373,6 +407,7 @@ impl Usbd {
         println!("usbd: {}: {} gone", a.dev.position.name(), a.name);
         match a.role {
             Role::Net(n) => n.release(&mut self.xhci),
+            Role::Keyboard(k) => k.release(&mut self.xhci),
             Role::Hub(h) => {
                 for child in h.children.iter().flatten() {
                     self.detach(*child);

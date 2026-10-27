@@ -56,6 +56,9 @@ fn main() {
     // boot again with the disk they wrote read-only (QEMU's readonly=on: the
     // device says VIRTIO_BLK_F_RO) into /etc/rotests.sh.
     // OXIDENIX_TEST=readonly: that read-only boot alone, on a fresh disk.
+    // After both passed, a third boot without the network card, with USB
+    // Ethernet functions instead (`Network::Usb`), into /etc/usbtests.sh;
+    // OXIDENIX_TEST=usb: that boot alone.
     // OXIDENIX_BENCH=1: the same, with the benchmarks (/etc/bench.sh,
     // docs/benchmarks) instead of the tests.
     // OXIDENIX_AUTORUN=<host file>: the same with that shell script (say, a
@@ -66,6 +69,7 @@ fn main() {
     let test_mode = bench_mode || autorun.is_some() || test_var.is_some();
     let self_tests = test_var.is_some() && autorun.is_none() && !bench_mode;
     let readonly_only = self_tests && test_var.as_deref() == Some("readonly".as_ref());
+    let usb_only = self_tests && test_var.as_deref() == Some("usb".as_ref());
 
     // Each mode has artifacts of its own (`<kernel>.img`, `<kernel>.test.img`, ...): a test
     // run neither rewrites the image nor the root filesystem an interactive QEMU has open
@@ -105,20 +109,27 @@ fn main() {
     }
     // The boots of this run, in order: what /etc/autorun is in each, and
     // whether the data disk is read-only there.
+    let plain = |suffix, autorun, read_only| Boot { suffix, autorun, read_only, network: Network::Virtio };
+    // The USB boot: no network card, USB Ethernet functions only (as a
+    // machine that tethers through a phone), into /etc/usbtests.sh.
+    let usb = || Boot { suffix: "usb", autorun: Autorun::Script("exec sh /etc/usbtests.sh\n"), read_only: false, network: Network::Usb };
     let boots: Vec<Boot> = if let Some(script) = &autorun {
-        vec![Boot { suffix: "", autorun: Autorun::Copy(script.clone()), read_only: false }]
+        vec![plain("", Autorun::Copy(script.clone()), false)]
     } else if bench_mode {
-        vec![Boot { suffix: "", autorun: Autorun::Link("bench.sh"), read_only: false }]
+        vec![plain("", Autorun::Link("bench.sh"), false)]
     } else if readonly_only {
-        vec![Boot { suffix: "readonly", autorun: Autorun::Script("exec sh /etc/rotests.sh\n"), read_only: true }]
+        vec![plain("readonly", Autorun::Script("exec sh /etc/rotests.sh\n"), true)]
+    } else if usb_only {
+        vec![usb()]
     } else if self_tests {
         vec![
-            Boot { suffix: "", autorun: Autorun::Link("runtests.sh"), read_only: false },
+            plain("", Autorun::Link("runtests.sh"), false),
             // (The disk the first boot wrote: its last file is checked too.)
-            Boot { suffix: "readonly", autorun: Autorun::Script("exec sh /etc/rotests.sh after-rw\n"), read_only: true },
+            plain("readonly", Autorun::Script("exec sh /etc/rotests.sh after-rw\n"), true),
+            usb(),
         ]
     } else {
-        vec![Boot { suffix: "", autorun: Autorun::None, read_only: false }]
+        vec![plain("", Autorun::None, false)]
     };
 
     // The data disk: OXIDENIX_DISK=<path> (created if missing; the
@@ -205,7 +216,7 @@ fn main() {
     // (QEMU's 1) ends the run with its status.
     let mut code = 0;
     for (boot, img) in boots.iter().zip(&images) {
-        code = qemu(firmware, img,&data_disk, boot.read_only, test_mode, &args[2..]);
+        code = qemu(firmware, img, &data_disk, boot, test_mode, &args[2..]);
         if test_mode && code != 1 {
             break;
         }
@@ -214,12 +225,43 @@ fn main() {
 }
 
 /// One boot of a run: its images' suffix (none for the first), what its
-/// /etc/autorun is, and whether it has the data disk read-only.
+/// /etc/autorun is, whether it has the data disk read-only, and its
+/// network.
 struct Boot {
     suffix: &'static str,
     autorun: Autorun,
     read_only: bool,
+    network: Network,
 }
+
+/// What a boot's machine has for a network.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Network {
+    /// The virtio network card on QEMU's user network (10.0.2.0/24), and
+    /// an xHCI controller with nothing on it.
+    Virtio,
+    /// No network card: USB Ethernet functions on the xHCI controller,
+    /// each on a user network of its own (`USB_NETWORK`).
+    Usb,
+}
+
+/// The USB boot's devices (QEMU's usb-net offers CDC-ECM and RNDIS): one
+/// on a root port, ECM, on 10.0.3.0/24; one behind a USB 2 hub, RNDIS
+/// (usbd takes its RNDIS function in test mode for the serial number
+/// "rndis"), on 10.0.4.0/24. Each network has a TCP echo service at
+/// .100:7 (as 10.0.2.100 is the card's).
+const USB_NETWORK: [&str; 10] = [
+    "-netdev",
+    "user,id=usb0,net=10.0.3.0/24,guestfwd=tcp:10.0.3.100:7-cmd:cat",
+    "-device",
+    "usb-net,netdev=usb0,bus=xhci.0,port=1,mac=52:54:00:aa:00:01",
+    "-device",
+    "usb-hub,bus=xhci.0,port=2",
+    "-netdev",
+    "user,id=usb1,net=10.0.4.0/24,guestfwd=tcp:10.0.4.100:7-cmd:cat",
+    "-device",
+    "usb-net,netdev=usb1,bus=xhci.0,port=2.1,serial=rndis,mac=52:54:00:aa:00:02",
+];
 
 /// What /etc/autorun is in a boot's root filesystem (the kernel runs it
 /// with `sh` and powers off with its status: test mode).
@@ -247,11 +289,16 @@ impl Autorun {
     }
 }
 
-/// Boots `img` in QEMU with `data_disk` (read-only: QEMU's readonly=on,
-/// which virtio-blk reports as VIRTIO_BLK_F_RO) and the user's `extra`
-/// arguments; QEMU's exit status.
-fn qemu(firmware: Firmware, img: &Path, data_disk: &Path, read_only: bool, test_mode: bool, extra: &[String]) -> i32 {
-    let mode = if read_only { ", the data disk read-only" } else { "" };
+/// Boots `img` in QEMU with `data_disk` (read-only if the boot says:
+/// QEMU's readonly=on, which virtio-blk reports as VIRTIO_BLK_F_RO), the
+/// boot's network and the user's `extra` arguments; QEMU's exit status.
+fn qemu(firmware: Firmware, img: &Path, data_disk: &Path, boot: &Boot, test_mode: bool, extra: &[String]) -> i32 {
+    let read_only = boot.read_only;
+    let mode = match (read_only, boot.network) {
+        (true, _) => ", the data disk read-only",
+        (false, Network::Usb) => ", USB Ethernet only",
+        (false, Network::Virtio) => "",
+    };
     println!("Starting QEMU ({}) with {}{}", firmware.name(), img.display(), mode);
     let mut qemu = Command::new("qemu-system-x86_64");
     if firmware == Firmware::Uefi {
@@ -303,14 +350,16 @@ fn qemu(firmware: Firmware, img: &Path, data_disk: &Path, read_only: bool, test_
             "4",
         ])
         .args(accelerators())
-        .args([
+        // An xHCI controller (usbd's): USB devices go on its bus `xhci.0`
+        // (`-device usb-host,...` passes one of the host's through, a phone
+        // to tether through, say).
+        .args(["-device", "qemu-xhci,id=xhci"])
+        .args(match boot.network {
             // User-mode networking (10.0.2.0/24, DHCP, DNS at 10.0.2.3) and a
             // TCP echo service at 10.0.2.100:7 for the self-tests.
-            "-netdev",
-            "user,id=net0,guestfwd=tcp:10.0.2.100:7-cmd:cat",
-            "-device",
-            "virtio-net-pci,netdev=net0,disable-modern=on",
-        ])
+            Network::Virtio => &["-netdev", "user,id=net0,guestfwd=tcp:10.0.2.100:7-cmd:cat", "-device", "virtio-net-pci,netdev=net0,disable-modern=on"][..],
+            Network::Usb => &USB_NETWORK[..],
+        })
         .args(if std::env::var_os("CI").is_some() && test_mode {
             &[][..]
         } else {

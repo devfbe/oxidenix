@@ -429,3 +429,68 @@ fn hub_descriptors_and_port_status() {
     assert_eq!(hub::changed_ports(&[0b0001_0110], 4).collect::<Vec<_>>(), vec![1, 2, 4]);
     assert_eq!(hub::changed_ports(&[0xff, 0xff], 3).collect::<Vec<_>>(), vec![1, 2, 3]);
 }
+
+use usb::hid;
+
+fn typed(k: &mut hid::Keyboard, report: [u8; 8]) -> (Vec<u8>, Option<u8>) {
+    let mut out = Vec::new();
+    let held = k.report(&report, |s| out.extend_from_slice(s));
+    (out, held)
+}
+
+#[test]
+fn boot_keyboard_reports_become_set_1_scancodes() {
+    let mut k = hid::Keyboard::default();
+    // 'a' down, then shift down beside it, then both up.
+    assert_eq!(typed(&mut k, [0, 0, 0x04, 0, 0, 0, 0, 0]), (vec![0x1e], Some(0x04)));
+    assert_eq!(typed(&mut k, [0x02, 0, 0x04, 0, 0, 0, 0, 0]), (vec![0x2a], Some(0x04)));
+    assert_eq!(typed(&mut k, [0, 0, 0, 0, 0, 0, 0, 0]), (vec![0xaa, 0x9e], None));
+    // An extended key (Up) and right Alt (AltGr) with their prefixes.
+    assert_eq!(typed(&mut k, [0x40, 0, 0x52, 0, 0, 0, 0, 0]).0, vec![0xe0, 0x38, 0xe0, 0x48]);
+    assert_eq!(typed(&mut k, [0, 0, 0, 0, 0, 0, 0, 0]).0, vec![0xe0, 0xb8, 0xe0, 0xc8]);
+    // The German <>| key, the keypad, Pause (a make without a break).
+    assert_eq!(typed(&mut k, [0, 0, 0x64, 0x59, 0x48, 0, 0, 0]).0, vec![0x56, 0x4f, 0xe1, 0x1d, 0x45, 0xe1, 0x9d, 0xc5]);
+    assert_eq!(typed(&mut k, [0; 8]).0, vec![0xd6, 0xcf]);
+    // A roll-over report changes nothing; a short one neither.
+    typed(&mut k, [0, 0, 0x04, 0, 0, 0, 0, 0]);
+    assert_eq!(typed(&mut k, [0, 0, 1, 1, 1, 1, 1, 1]), (vec![], Some(0x04)));
+    assert_eq!(k.report(&[0, 0, 5], |_| panic!("a short report")), Some(0x04));
+    // The keyboard goes: everything up.
+    let mut up = Vec::new();
+    k.release_all(|s| up.extend_from_slice(s));
+    assert_eq!(up, vec![0x9e]);
+}
+
+#[test]
+fn every_usage_has_a_sane_code() {
+    for usage in 0..=255u8 {
+        if let Some(make) = hid::make_code(usage) {
+            assert!(!make.is_empty() && make.len() <= 6, "usage {usage:#x}");
+            assert!(make.len() == 1 || make[0] == 0xe0 || make[0] == 0xe1, "usage {usage:#x}");
+            assert!(make[make.len() - 1] & 0x80 == 0 || make[0] == 0xe1, "usage {usage:#x}: a make with bit 7");
+        }
+    }
+    // Letters, digits, F-keys are all there.
+    for usage in (0x04..=0x27).chain(0x3a..=0x45) {
+        assert!(hid::make_code(usage).is_some(), "usage {usage:#x}");
+    }
+    assert!(!hid::repeats(0x39), "Caps Lock does not repeat");
+    assert!(hid::repeats(0x04));
+}
+
+#[test]
+fn typematic_and_autorepeat() {
+    assert_eq!(hid::typematic(0), (250, 33));
+    assert_eq!(hid::typematic(0x7f), (1000, 500));
+    let mut r = hid::Repeat::default();
+    r.held(Some(0x04), 1000, 250);
+    assert_eq!(r.due(1100, 33), None);
+    assert_eq!(r.due(1250, 33), Some(&[0x1e][..]));
+    assert_eq!(r.deadline(), Some(1283));
+    // Held on: no restart of the delay.
+    r.held(Some(0x04), 1260, 250);
+    assert_eq!(r.deadline(), Some(1283));
+    r.held(None, 1300, 250);
+    assert_eq!(r.due(5000, 33), None);
+    assert_eq!(hid::leds_from_ps2(0b110), hid::LED_NUM_LOCK | hid::LED_CAPS_LOCK);
+}

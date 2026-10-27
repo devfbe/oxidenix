@@ -221,6 +221,9 @@ pub struct Server {
     ports: Vec<Range<u64>>,
     /// The memory BARs of its device it may map (`mmio_map`), by number.
     mmio: Vec<(u8, crate::drivers::pci::MemoryBar)>,
+    /// It may type on the console's keyboard (`kbd_input`: usbd's USB
+    /// keyboards).
+    keyboard: bool,
     /// Interrupt line it may enable (16-31: message-signalled, `irq`).
     irq: Option<u8>,
     /// Size of its DMA area in pages, and the area once allocated. It
@@ -389,6 +392,7 @@ impl Server {
             image,
             ports: Vec::new(),
             mmio: Vec::new(),
+            keyboard: false,
             irq: None,
             dma_pages: 0,
             dma: spin::Mutex::new(None),
@@ -526,6 +530,12 @@ impl Server {
         self
     }
 
+    /// The server's keyboards type on the console (`kbd_input`).
+    pub fn keyboard(mut self) -> Self {
+        self.keyboard = true;
+        self
+    }
+
     pub fn dma(mut self, pages: u64) -> Self {
         self.dma_pages = pages;
         self
@@ -592,6 +602,36 @@ pub fn mmio_map(bar: u64, len_out: u64) -> SysResult {
     };
     uaccess::write(len_out, bar.len)?;
     Ok(start as i64)
+}
+
+/// Most scancodes one `kbd_input` takes.
+const KBD_INPUT_MAX: u64 = 256;
+
+/// kbd_input(buf, len): scancodes (set 1, as the PS/2 controller gives
+/// them) of the server's keyboards, queued as if the PS/2 keyboard typed
+/// them. EPERM for a server not allowed to (`Server::keyboard`).
+pub fn kbd_input(buf: u64, len: u64) -> SysResult {
+    let server = with_current(|p| p.server.clone()).ok_or(EPERM)?;
+    if !server.keyboard {
+        return Err(EPERM);
+    }
+    let mut codes = [0u8; KBD_INPUT_MAX as usize];
+    let n = len.min(KBD_INPUT_MAX) as usize;
+    uaccess::copy_from(buf, &mut codes[..n])?;
+    crate::drivers::keyboard::queue(&codes[..n]);
+    Ok(n as i64)
+}
+
+/// kbd_state() -> leds | typematic << 8: what the console's keyboard
+/// should show and do (`keyboard::set_leds`, `set_typematic`), for a
+/// server's keyboards to follow.
+pub fn kbd_state() -> SysResult {
+    let server = with_current(|p| p.server.clone()).ok_or(EPERM)?;
+    if !server.keyboard {
+        return Err(EPERM);
+    }
+    let (leds, typematic) = crate::drivers::keyboard::wanted();
+    Ok((leds as u64 | (typematic as u64) << 8) as i64)
 }
 
 fn start_env() -> Vec<String> {
