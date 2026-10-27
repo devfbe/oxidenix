@@ -1,0 +1,16 @@
+[package]
+name = "usbd"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+
+[[bin]]
+name = "usbd"
+test = false
+bench = false
+
+[dependencies]
+oxrt = { path = "../../crates/oxrt" }
+usb = { path = "../../crates/usb" }
+linkring = { path = "../../crates/linkring" }
+ring = { path = "../../crates/ring" }

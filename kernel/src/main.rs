@@ -227,7 +227,9 @@ fn start_usbd() {
                     .dma(USBD_DMA_PAGES)
                     .arg(alloc::format!("name={name}"))
                     .arg(alloc::format!("pci={:02x}:{:02x}.{}", hc.bus, hc.slot, hc.func))
-                    .arg(alloc::format!("vendor={:#x}", hc.vendor));
+                    .arg(alloc::format!("vendor={:#x}", hc.vendor))
+                    // In test mode usbd takes its test devices' hints.
+                    .arg(alloc::format!("test={}", TEST_MODE.load(core::sync::atomic::Ordering::Relaxed) as u8));
                 if let Some(line) = line {
                     server = server.irq(line).arg(alloc::format!("irq={line}"));
                 }
