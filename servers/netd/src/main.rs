@@ -1,37 +1,41 @@
 //! netd: the network server. It drives the virtio network card from user
-//! space, runs the TCP/IP stack (smoltcp), configures itself by DHCP, and
-//! serves the Linux server instances' sockets over the channels they offer
-//! (`service`, the protocol `netring`; docs/design/linux-server.md, R7b).
+//! space (if there is one), takes the USB links usbd offers (`linkring`),
+//! runs the TCP/IP stack (smoltcp) over all of them, configures each by
+//! DHCP, and serves the Linux server instances' sockets over the channels
+//! they offer (`service`, the protocol `netring`;
+//! docs/design/linux-server.md, R7b). smoltcp sees one interface of IP
+//! packets; the links below it (`links`: routing, ARP, DHCP) are netd's.
 //!
 //! One thread, one event loop: each round takes the channels' requests,
-//! polls the card and the stack, and moves the sockets' data between
+//! polls the links and the stack, and moves the sockets' data between
 //! smoltcp and the instances' rings. While rounds make progress it polls;
 //! after `SPIN` rounds without any it arms the card's interrupt and every
-//! channel's doorbell and sleeps in `ipc_receive` until one of them, a
-//! channel offer, or smoltcp's next timer.
+//! channel's doorbell (the instances' and the links') and sleeps in
+//! `ipc_receive` until one of them, a channel offer, or the next timer
+//! (smoltcp's, the service's, the links' ARP and DHCP ones).
 
 #![no_std]
 #![no_main]
 
 extern crate alloc;
 
-mod nic;
+mod links;
 mod service;
 mod virtio_net;
 
 use alloc::vec;
 use alloc::vec::Vec;
-use nic::Nic;
+use links::Links;
 use oxrt::println;
+use ring::channel::Offer;
 use smoltcp::iface::{Config, Interface, PollIngressSingleResult, PollResult, SocketSet};
-use smoltcp::socket::dhcpv4;
 use smoltcp::time::Instant;
-use smoltcp::wire::{EthernetAddress, IpCidr, Ipv4Address, Ipv4Cidr};
+use smoltcp::wire::HardwareAddress;
 use virtio_net::VirtioNet;
 
 /// The heap, sized from the worst case of everything on it
 /// (`service::HEAP_WORST`: smoltcp's socket set for `service::MAX_SMOLTCP`
-/// sockets, the service's tables at their limits, frames in flight).
+/// sockets, the service's tables at their limits, the links' frames).
 /// smoltcp's socket buffers are not in it: each is memory of its own, gone
 /// with the socket (`service::Region`).
 const HEAP: usize = service::HEAP;
@@ -44,21 +48,21 @@ fn now() -> Instant {
 }
 
 /// smoltcp's poll, with the connections that arrived given their buffers
-/// between taking the frames and sending (`Service::arrivals`): their
+/// between taking the packets and sending (`Service::arrivals`): their
 /// SYN-ACK offers a window. True if a socket's state may have changed.
-fn poll(iface: &mut Interface, nic: &mut Nic, sockets: &mut SocketSet<'static>, service: &mut service::Service) -> bool {
+fn poll(iface: &mut Interface, links: &mut Links, sockets: &mut SocketSet<'static>, service: &mut service::Service) -> bool {
     let t = now();
     let mut changed = false;
     iface.poll_maintenance(t);
     loop {
-        match iface.poll_ingress_single(t, nic, sockets) {
+        match iface.poll_ingress_single(t, links, sockets) {
             PollIngressSingleResult::None => break,
             PollIngressSingleResult::PacketProcessed => {}
             PollIngressSingleResult::SocketStateChanged => changed = true,
         }
     }
     service.arrivals(sockets);
-    while iface.poll_egress(t, nic, sockets) == PollResult::SocketStateChanged {
+    while iface.poll_egress(t, links, sockets) == PollResult::SocketStateChanged {
         changed = true;
     }
     changed
@@ -73,6 +77,31 @@ fn arg(args: &[&str], key: &str) -> Option<u64> {
     }
 }
 
+/// The virtio card the kernel handed over (`io=`, `iolen=`, `irq=`), set
+/// up, with its interrupt line; None without one. Err: there is one, but
+/// it cannot be driven.
+fn card(args: &[&str]) -> Result<Option<(VirtioNet, u8)>, ()> {
+    let (Some(io), Some(iolen), Some(irq)) = (arg(args, "io"), arg(args, "iolen"), arg(args, "irq")) else {
+        return Ok(None);
+    };
+    let (io, irq) = (io as u16, irq as u8);
+    if oxrt::ioperm(io, iolen as u16).is_err() {
+        println!("netd: no permission for the card's I/O ports");
+        return Err(());
+    }
+    let Ok((dma, phys)) = oxrt::dma_map() else {
+        println!("netd: no DMA memory");
+        return Err(());
+    };
+    match VirtioNet::new(io, dma, phys, DMA_BYTES) {
+        Ok(card) => Ok(Some((card, irq))),
+        Err(e) => {
+            println!("netd: {}", e);
+            Err(())
+        }
+    }
+}
+
 /// Rounds without progress before netd sleeps (it polls meanwhile: a
 /// client's next request or bytes usually come within them).
 const SPIN: u32 = 256;
@@ -80,68 +109,46 @@ const SPIN: u32 = 256;
 /// many rounds.
 const OFFERS_EVERY: u32 = 64;
 const ENOSYS: i64 = 38;
+const EINVAL: i64 = 22;
 
 fn main(args: Vec<&'static str>) -> i32 {
-    let (Some(io), Some(iolen), Some(irq)) = (arg(&args, "io"), arg(&args, "iolen"), arg(&args, "irq")) else {
-        println!("netd: started without a network card (io=, iolen=, irq=)");
-        return 1;
-    };
-    let (io, irq) = (io as u16, irq as u8);
-    if oxrt::ioperm(io, iolen as u16).is_err() {
-        println!("netd: no permission for the card's I/O ports");
-        return 1;
-    }
-    let Ok((dma, phys)) = oxrt::dma_map() else {
-        println!("netd: no DMA memory");
-        return 1;
-    };
-    let card = match VirtioNet::new(io, dma, phys, DMA_BYTES) {
-        Ok(card) => card,
-        Err(e) => {
-            println!("netd: {}", e);
-            return 1;
-        }
-    };
+    let Ok(card) = card(&args) else { return 1 };
     // Copies to and from grants fail instead of killing netd when a client
     // revokes one meanwhile.
     if let Err(e) = oxrt::copy::register() {
         println!("netd: cannot register the copy fixup: {}", e);
         return 1;
     }
-    let mac = EthernetAddress(card.mac);
-    let mut nic = Nic::new(card);
-    if oxrt::irq_enable(irq).is_err() {
-        println!("netd: cannot enable interrupt {}", irq);
-        return 1;
+    let irq = card.as_ref().map(|&(_, irq)| irq);
+    if let Some(irq) = irq {
+        if oxrt::irq_enable(irq).is_err() {
+            println!("netd: cannot enable interrupt {}", irq);
+            return 1;
+        }
     }
-    let mut config = Config::new(mac.into());
-    // smoltcp's own randomness (DHCP's transaction ids, its ports when it
-    // picks one) from the kernel's generator; TCP's initial sequence
-    // numbers are RFC 6528's (`service::isn`).
+    let mut links = Links::new(card.map(|(card, _)| card));
+    let mut config = Config::new(HardwareAddress::Ip);
+    // smoltcp's own randomness (its ports when it picks one) from the
+    // kernel's generator; TCP's initial sequence numbers are RFC 6528's
+    // (`service::isn`), DHCP's transaction ids netd's (`links`).
     let mut seed = [0u8; 8];
     oxrt::getrandom(&mut seed);
     config.random_seed = u64::from_le_bytes(seed);
-    let mut iface = Interface::new(config, &mut nic, now());
+    let mut iface = Interface::new(config, &mut links, now());
     service::init_secrets();
     iface.set_isn_generator(service::isn);
     iface.set_reuseport_hash(service::reuseport_hash);
-    iface.update_ip_addrs(|addrs| {
-        let _ = addrs.push(IpCidr::Ipv4(LOOPBACK));
-    });
-    // Room for every socket the service may make (and DHCP's) from the
-    // start: the set never moves to a larger allocation.
-    let mut sockets = SocketSet::new(Vec::with_capacity(service::MAX_SMOLTCP + 1));
-    let dhcp = sockets.add(dhcpv4::Socket::new());
+    // Room for every socket the service may make from the start: the set
+    // never moves to a larger allocation.
+    let mut sockets = SocketSet::new(Vec::with_capacity(service::MAX_SMOLTCP));
     // The kernel waits for the registration, so boot messages stay in
-    // order: register once DHCP is done, or after DHCP_WAIT_MS without it.
-    let register_at = oxrt::uptime_ms() + DHCP_WAIT_MS;
+    // order: with a card, register once its DHCP is done, or after
+    // DHCP_WAIT_MS without it; without one at once (links come later).
+    let register_at = oxrt::uptime_ms() + if links.has_card() { DHCP_WAIT_MS } else { 0 };
     let mut registered = false;
     let mut service = service::Service::new();
-    service.config.mac = mac.0;
     // The kernel runs the self-tests: their requests are taken (`RENEW`).
     service.test_mode = args.contains(&"test=1");
-    // A renewal the tests asked for: DHCP starts again then.
-    let mut renew_at: Option<u64> = None;
 
     // The only messages netd takes are the kernel's channel offers (a
     // longer one fails in the kernel).
@@ -149,66 +156,31 @@ fn main(args: Vec<&'static str>) -> i32 {
     let mut idle = 0u32;
     let mut busy = 0u32;
     loop {
+        links.round_start();
         let mut progress = service.serve(&mut iface, &mut sockets);
-        progress |= poll(&mut iface, &mut nic, &mut sockets, &mut service);
+        progress |= poll(&mut iface, &mut links, &mut sockets, &mut service);
         progress |= service.pump(&mut sockets);
         service.round_end();
-        match sockets.get_mut::<dhcpv4::Socket>(dhcp).poll() {
-            Some(dhcpv4::Event::Configured(c)) => {
-                // smoltcp sends from the first address unless the destination
-                // shares a subnet with another one, so loopback goes last.
-                iface.update_ip_addrs(|addrs| {
-                    addrs.clear();
-                    let _ = addrs.push(IpCidr::Ipv4(c.address));
-                    let _ = addrs.push(IpCidr::Ipv4(LOOPBACK));
-                });
-                nic.address = c.address.address().to_bits();
-                match c.router {
-                    Some(router) => {
-                        let _ = iface.routes_mut().add_default_ipv4_route(router);
-                    }
-                    None => {
-                        iface.routes_mut().remove_default_ipv4_route();
-                    }
-                }
-                service.config.address = c.address.address().to_bits();
-                service.config.prefix = c.address.prefix_len();
-                service.config.gateway = c.router.map_or(0, |r| r.to_bits());
-                service.config.dns = c.dns_servers.first().map_or(0, |d| d.to_bits());
-                let mac = mac.0.map(|b| alloc::format!("{b:02x}")).join(":");
-                match c.router {
-                    Some(router) => println!("netd: {} via DHCP, gateway {} (virtio-net {})", c.address, router, mac),
-                    None => println!("netd: {} via DHCP, no gateway (virtio-net {})", c.address, mac),
-                }
-                // The instances hear of it (netlink's notifications).
-                service.links_changed();
-                progress = true;
-            }
-            Some(dhcpv4::Event::Deconfigured) => {
-                if nic.address != 0 {
-                    println!("netd: lost the DHCP lease");
-                }
-                deconfigure(&mut iface, &mut nic, &mut service, mac.0);
-                progress = true;
-            }
-            None => {}
-        }
+        // The links' timers (ARP, DHCP), carriers, leases, gone links.
+        progress |= links.poll();
         // The tests' renewal: the lease goes now, DHCP asks again a second
         // later (so that the instances see it go and come back).
         if service.take_renew() {
             println!("netd: dropping the DHCP lease (test)");
-            deconfigure(&mut iface, &mut nic, &mut service, mac.0);
-            renew_at = Some(oxrt::uptime_ms() + RENEW_DELAY_MS);
+            links.renew(RENEW_DELAY_MS);
             progress = true;
         }
-        if renew_at.is_some_and(|at| oxrt::uptime_ms() >= at) {
-            renew_at = None;
-            sockets.get_mut::<dhcpv4::Socket>(dhcp).reset();
+        if links.take_changed() {
+            links.apply(&mut iface);
+            links.records(&mut service.links);
+            // The instances hear of it (netlink's notifications).
+            service.links_changed();
             progress = true;
         }
         service.flush();
-        if !registered && (nic.address != 0 || oxrt::uptime_ms() >= register_at) {
-            if nic.address == 0 {
+        links.flush();
+        if !registered && (links.card_configured() || oxrt::uptime_ms() >= register_at) {
+            if links.has_card() && !links.card_configured() {
                 println!("netd: no DHCP answer yet; continuing in the background");
             }
             if let Err(e) = oxrt::ipc_register_with(netring::SERVICE, 0, oxrt::IPC_CHANNELS) {
@@ -217,7 +189,7 @@ fn main(args: Vec<&'static str>) -> i32 {
             }
             registered = true;
         }
-        let sleep = if progress || nic.has_received() {
+        let sleep = if progress || links.has_received() {
             idle = 0;
             busy += 1;
             if busy % OFFERS_EVERY != 0 {
@@ -230,7 +202,7 @@ fn main(args: Vec<&'static str>) -> i32 {
                 continue;
             }
             idle = 0;
-            service.prepare_sleep()
+            service.prepare_sleep() && links.prepare_sleep()
         };
         let mut timeout = iface.poll_delay(now(), &sockets).map(|d| d.total_millis());
         // The service's own timers: orphans that make no progress, the end
@@ -239,11 +211,10 @@ fn main(args: Vec<&'static str>) -> i32 {
             let left = (at - now().min(at)).total_millis();
             timeout = Some(timeout.map_or(left, |t| t.min(left)));
         }
-        if !registered {
-            let left = register_at.saturating_sub(oxrt::uptime_ms());
-            timeout = Some(timeout.map_or(left, |t| t.min(left)));
-        }
-        if let Some(at) = renew_at {
+        // The links' (ARP's retransmissions, DHCP's messages and lease),
+        // and the registration's.
+        let at = links.deadline().into_iter().chain((!registered).then_some(register_at)).min();
+        if let Some(at) = at {
             let left = at.saturating_sub(oxrt::uptime_ms());
             timeout = Some(timeout.map_or(left, |t| t.min(left)));
         }
@@ -253,6 +224,7 @@ fn main(args: Vec<&'static str>) -> i32 {
         }
         let event = oxrt::ipc_receive(&mut message, if sleep { timeout } else { Some(0) });
         service.awake();
+        links.awake();
         if sleep && service.sleep_cap().is_some() {
             // Woken from a brief sleep that futile marks forced: one round,
             // then (without progress) asleep again, not a whole spin.
@@ -260,11 +232,19 @@ fn main(args: Vec<&'static str>) -> i32 {
         }
         match event {
             Ok(oxrt::Event::Interrupt(_)) => {
-                nic.card.ack_interrupt();
-                let _ = oxrt::irq_enable(irq);
+                links.card_interrupt();
+                if let Some(irq) = irq {
+                    let _ = oxrt::irq_enable(irq);
+                }
             }
             Ok(oxrt::Event::Control(id, len)) => {
-                let status = service.offer(&message[..len], &mut sockets);
+                // A link driver's offer (a native server's: instance 0), or
+                // an instance's.
+                let status = match Offer::decode_any(&message[..len]) {
+                    Some(offer) if offer.instance == 0 => links.offer(&offer),
+                    Some(_) => service.offer(&message[..len], &mut sockets),
+                    None => -EINVAL,
+                };
                 let _ = oxrt::ipc_reply(id, &status.to_le_bytes());
             }
             // No protocol besides the rings.
@@ -279,23 +259,6 @@ fn main(args: Vec<&'static str>) -> i32 {
 const DHCP_WAIT_MS: u64 = 3000;
 /// How long a renewal the tests asked for leaves netd without a lease.
 const RENEW_DELAY_MS: u64 = 1000;
-
-/// The lease went: only the loopback's address is left, no default route;
-/// the instances hear of it.
-fn deconfigure(iface: &mut Interface, nic: &mut Nic, service: &mut service::Service, mac: [u8; 6]) {
-    nic.address = 0;
-    iface.update_ip_addrs(|addrs| {
-        addrs.clear();
-        let _ = addrs.push(IpCidr::Ipv4(LOOPBACK));
-    });
-    iface.routes_mut().remove_default_ipv4_route();
-    let before = service.config;
-    service.config = service::Config { mac, ..Default::default() };
-    if before.address != 0 || before.gateway != 0 {
-        service.links_changed();
-    }
-}
-const LOOPBACK: Ipv4Cidr = Ipv4Cidr::new(Ipv4Address::new(127, 0, 0, 1), 8);
 
 /// Must match the kernel's NETD_DMA_PAGES.
 const DMA_BYTES: usize = 128 * 4096;

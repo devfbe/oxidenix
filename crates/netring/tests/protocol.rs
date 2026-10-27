@@ -182,13 +182,28 @@ fn records_round_trip_and_stay_aligned() {
 #[test]
 fn links_round_trip() {
     let links = [
-        Link { index: 1, kind: LINK_LOOPBACK, state: LINK_UP | LINK_RUNNING, mtu: 1500, mac: [0; 6], prefix: 8, address: 0x7f00_0001, gateway: 0 },
-        Link { index: 2, kind: LINK_ETHERNET, state: LINK_UP, mtu: 1500, mac: [0x52, 0x54, 0, 0x12, 0x34, 0x56], prefix: 24, address: 0x0a00_020f, gateway: 0x0a00_0202 },
+        Link { index: 1, kind: LINK_LOOPBACK, state: LINK_UP | LINK_RUNNING, mtu: 1500, mac: [0; 6], prefix: 8, bus: LINK_BUS_PCI, address: 0x7f00_0001, gateway: 0, dns: 0 },
+        Link {
+            index: 2,
+            kind: LINK_ETHERNET,
+            state: LINK_UP | LINK_RUNNING | LINK_DEFAULT,
+            mtu: 1500,
+            mac: [0x52, 0x54, 0, 0x12, 0x34, 0x56],
+            prefix: 24,
+            bus: LINK_BUS_PCI,
+            address: 0x0a00_020f,
+            gateway: 0x0a00_0202,
+            dns: 0x0a00_0203,
+        },
+        Link { index: 7, kind: LINK_ETHERNET, state: LINK_UP, mtu: 1400, mac: [2, 0, 0, 0, 0, 1], prefix: 24, bus: LINK_BUS_USB, address: 0xc0a8_2a05, gateway: 0xc0a8_2a81, dns: 0xc0a8_2a81 },
     ];
     let mut payload: Vec<u8> = links.iter().flat_map(|l| l.encode()).collect();
+    assert_eq!(payload.len(), 3 * Link::SIZE);
+    // Every field has bytes of its own.
+    assert_eq!(&payload[2 * Link::SIZE..3 * Link::SIZE], &[7, 0, 0, 0, 2, 0, 1, 0, 0x78, 5, 0, 0, 2, 0, 0, 0, 0, 1, 24, 1, 5, 0x2a, 0xa8, 0xc0, 0x81, 0x2a, 0xa8, 0xc0, 0x81, 0x2a, 0xa8, 0xc0]);
     payload.push(0xff);
     let back: Vec<Link> = Link::decode_all(&payload).collect();
-    assert_eq!(back, links);
+    assert_eq!(back, links, "a partial record at the end is ignored");
 }
 
 fn holder(owner: u64, addr: Option<u32>, reuse: bool) -> PortHolder {

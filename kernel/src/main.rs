@@ -167,26 +167,42 @@ const NETD_DMA_PAGES: u64 = 128;
 /// it (R7b); the kernel starts it again when an instance connects after it
 /// died (ADR 0006).
 fn start_netd() {
-    let Some(nic) = drivers::pci::find(0x1af4, 0x1000) else {
-        return printkln!("[boot] no virtio network card; networking is off");
+    // The virtio card, if there is one with I/O ports; without one netd
+    // still runs: the loopback, and the USB links usbd offers later.
+    let card = match drivers::pci::find(0x1af4, 0x1000) {
+        None => {
+            printkln!("[boot] no virtio network card");
+            None
+        }
+        Some(nic) => match nic.io_bar(0) {
+            None => {
+                printkln!("[boot] the network card has no I/O ports");
+                None
+            }
+            Some((io, len)) => {
+                nic.enable_io_and_dma();
+                Some((nic, io, len))
+            }
+        },
     };
-    let Some((io, len)) = nic.io_bar(0) else {
-        return printkln!("[boot] the network card has no I/O ports");
-    };
-    nic.enable_io_and_dma();
     // In test mode netd takes the self-tests' requests (a DHCP renewal).
     let test = TEST_MODE.load(core::sync::atomic::Ordering::Relaxed) as u8;
     let server = match process::Server::load("net", "/sbin/netd") {
-        Ok(server) => server
-            .ports(io as u64..io as u64 + len as u64)
-            .irq(nic.irq)
-            .dma(NETD_DMA_PAGES)
-            .arg(alloc::format!("io={io:#x}"))
-            .arg(alloc::format!("iolen={len}"))
-            .arg(alloc::format!("irq={}", nic.irq))
-            .arg(alloc::format!("test={test}"))
-            // netd registers once DHCP is done, or after three seconds.
-            .start_timeout(5 * time::NSEC_PER_SEC),
+        Ok(server) => {
+            let server = match card {
+                Some((nic, io, len)) => server
+                    .ports(io as u64..io as u64 + len as u64)
+                    .irq(nic.irq)
+                    .dma(NETD_DMA_PAGES)
+                    .arg(alloc::format!("io={io:#x}"))
+                    .arg(alloc::format!("iolen={len}"))
+                    .arg(alloc::format!("irq={}", nic.irq)),
+                None => server,
+            };
+            // netd registers once the card's DHCP is done, or after three
+            // seconds (at once without a card).
+            server.arg(alloc::format!("test={test}")).start_timeout(5 * time::NSEC_PER_SEC)
+        }
         Err(e) => return printkln!("[boot] cannot load /sbin/netd (errno {})", e),
     };
     if let Err(e) = Arc::new(server).start() {

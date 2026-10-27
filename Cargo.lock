@@ -481,6 +481,8 @@ name = "netd"
 version = "0.1.0"
 dependencies = [
  "csprng",
+ "linklayer",
+ "linkring",
  "netring",
  "oxrt",
  "ring",

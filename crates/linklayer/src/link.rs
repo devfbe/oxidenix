@@ -102,6 +102,9 @@ fn deliver(arp: &mut Cache, mac: [u8; 6], config: Option<Config>, frame: &mut [u
         BROADCAST_MAC
     } else if is_multicast(next_hop) {
         multicast_mac(next_hop)
+    } else if !is_unicast(next_hop) {
+        // (Routing never chooses one: nobody to ask for.)
+        return Output::Dropped(Drop::Unresolved);
     } else {
         match arp.lookup(next_hop, now) {
             Some(dst) => dst,

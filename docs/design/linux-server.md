@@ -625,8 +625,9 @@ Each phase keeps the suite green, has its benchmark numbers, and is a series of 
      takes its peer's datagrams only. At most 256 connections are half-open (SYN-RECEIVED)
      at once, each with a 4 KiB receive buffer and nothing to send until the peer completes
      the handshake; the loopback and the card push back on smoltcp (no token while their
-     queues are full) instead of dropping frames. Each round it takes requests (no more than the completion ring
-     has room for), the service bitmaps, polls the card and smoltcp, moves data between
+     queues are full) instead of dropping frames (a USB link's full send ring drops at the
+     tail: a stuck driver must not stop the other links). Each round it takes requests (no more than the completion ring
+     has room for), the service bitmaps, polls the links and smoltcp, moves data between
      smoltcp and the rings of the sockets that can move some, and publishes what changed;
      it sleeps (doorbells armed, `ipc_receive` with smoltcp's next deadline) after a spin
      without progress. When a channel's client goes, its sockets close (`FIN` after the data
